@@ -1,0 +1,346 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT c.Id) as Comments,
+        MAX(p.CreationDate) as LastPostDate,
+        CAST('2024-10-01 12:34:56' AS timestamp) - u.CreationDate AS AccountAgeInterval,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - u.CreationDate)) / 86400.0 AS AccountAgeDays,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+                COUNT(DISTINCT c.Id) * 1.0 / COUNT(DISTINCT p.Id)
+            ELSE 0 
+        END as CommentsPerPost,
+        ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) as PostRank,
+        NTILE(10) OVER (ORDER BY u.Reputation DESC) as ReputationDecile
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        TotalPosts,
+        Questions,
+        Answers,
+        Comments,
+        LastPostDate,
+        AccountAgeInterval,
+        AccountAgeDays,
+        CommentsPerPost,
+        PostRank,
+        ReputationDecile,
+        CASE 
+            WHEN Reputation > 10000 THEN 'Elite'
+            WHEN Reputation > 5000 THEN 'Senior'
+            WHEN Reputation > 1000 THEN 'Experienced'
+            ELSE 'Beginner'
+        END as UserTier,
+        DENSE_RANK() OVER (ORDER BY Reputation DESC) as ReputationRank
+    FROM UserActivityStats
+),
+QuestionMetrics AS (
+    SELECT 
+        p.Id as QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        CAST('2024-10-01 12:34:56' AS timestamp) - p.CreationDate AS AgeInterval,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - p.CreationDate)) / 86400.0 AS AgeInDays,
+        CASE 
+            WHEN p.AnswerCount > 0 THEN 
+                (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = p.Id AND a.PostTypeId = 2)
+            ELSE 0 
+        END as ActualAnswers,
+        CASE 
+            WHEN p.Score > 0 THEN 
+                (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2)
+            ELSE 0 
+        END as Upvotes,
+        CASE 
+            WHEN p.Score < 0 THEN 
+                (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3)
+            ELSE 0 
+        END as Downvotes,
+        p.Score * 1.0 / NULLIF(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - p.CreationDate)) / 86400.0, 0) as ScorePerDay,
+        COALESCE(p.Tags, '') as TagsString,
+        (SELECT COUNT(*) FROM Posts pp WHERE pp.ParentId = p.Id AND pp.PostTypeId = 2 AND pp.Score > 0) as PositiveAnswers,
+        (SELECT COUNT(*) FROM Posts pp WHERE pp.ParentId = p.Id AND pp.PostTypeId = 2 AND pp.Score < 0) as NegativeAnswers
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+TagAnalysis AS (
+    SELECT 
+        t.Id as TagId,
+        t.TagName,
+        t.Count as TagFrequency,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Trending'
+            WHEN t.Count > 500 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            ELSE 'Niche'
+        END as TagPopularity,
+        CAST('2024-10-01 12:34:56' AS timestamp) - (SELECT CreationDate FROM Posts WHERE Id = t.ExcerptPostId) AS ExcerptAgeInterval,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - (SELECT CreationDate FROM Posts WHERE Id = t.ExcerptPostId))) / 86400.0 AS ExcerptAgeDays,
+        (SELECT AVG(p.Score) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%') as AvgScoreForTag,
+        (SELECT COUNT(DISTINCT p.OwnerUserId) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%') as UniquePosters
+    FROM Tags t
+),
+PostHistoryAnalysis AS (
+    SELECT 
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.Comment,
+        ph.CreationDate,
+        ph.UserId,
+        ph.UserDisplayName,
+        CASE 
+            WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN 
+                (SELECT Name FROM PostHistoryTypes WHERE Id = ph.PostHistoryTypeId)
+            ELSE 'Other'
+        END as ActionCategory
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20)
+),
+ComplexQuestionAnalysis AS (
+    SELECT 
+        q.QuestionId,
+        q.Title,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.CommentCount,
+        q.CreationDate,
+        q.OwnerUserId,
+        q.Tags,
+        q.AgeInDays,
+        q.ActualAnswers,
+        q.Upvotes,
+        q.Downvotes,
+        q.ScorePerDay,
+        q.TagsString,
+        q.PositiveAnswers,
+        q.NegativeAnswers,
+        CASE 
+            WHEN q.AnswerCount > 0 AND q.PositiveAnswers > 0 THEN 
+                q.PositiveAnswers * 1.0 / q.AnswerCount
+            ELSE 0 
+        END as PositiveAnswerRate,
+        CASE 
+            WHEN q.Score < 0 THEN 'Negative'
+            WHEN q.Score > 10 THEN 'High'
+            WHEN q.Score > 0 THEN 'Positive'
+            ELSE 'Neutral'
+        END as ScoreCategory,
+        CASE 
+            WHEN q.ViewCount > 1000 AND q.Score > 0 THEN 'PopularPositive'
+            WHEN q.ViewCount > 1000 AND q.Score < 0 THEN 'PopularNegative'
+            WHEN q.ViewCount > 100 THEN 'Moderate'
+            ELSE 'LowView'
+        END as PopularityCategory,
+        CASE 
+            WHEN q.AnswerCount >= 5 AND q.Score > 5 THEN 'WellAnswered'
+            WHEN q.AnswerCount = 0 AND q.Score > 0 THEN 'UnansweredButValuable'
+            WHEN q.AnswerCount = 0 AND q.Score <= 0 THEN 'UnansweredNegative'
+            ELSE 'Other'
+        END as AnswerQuality,
+        ROW_NUMBER() OVER (ORDER BY q.Score DESC, q.ViewCount DESC) as Ranking
+    FROM QuestionMetrics q
+),
+FinalQuestionAnalysis AS (
+    SELECT 
+        cqa.QuestionId,
+        cqa.Title,
+        cqa.Score,
+        cqa.ViewCount,
+        cqa.AnswerCount,
+        cqa.CommentCount,
+        cqa.CreationDate,
+        cqa.OwnerUserId,
+        cqa.Tags,
+        cqa.AgeInDays,
+        cqa.ActualAnswers,
+        cqa.Upvotes,
+        cqa.Downvotes,
+        cqa.ScorePerDay,
+        cqa.TagsString,
+        cqa.PositiveAnswers,
+        cqa.NegativeAnswers,
+        cqa.PositiveAnswerRate,
+        cqa.ScoreCategory,
+        cqa.PopularityCategory,
+        cqa.AnswerQuality,
+        cqa.Ranking,
+        CASE 
+            WHEN cqa.Score > (
+                SELECT AVG(Score) FROM QuestionMetrics
+            ) * 1.5 THEN 'AboveAverage'
+            WHEN cqa.Score > (
+                SELECT AVG(Score) FROM QuestionMetrics
+            ) * 0.5 THEN 'BelowAverage'
+            ELSE 'Average'
+        END as ScorePerformance,
+        (SELECT DisplayName FROM Users u WHERE u.Id = cqa.OwnerUserId) as OwnerDisplayName,
+        (SELECT Reputation FROM Users u WHERE u.Id = cqa.OwnerUserId) as OwnerReputation,
+        (SELECT TotalPosts FROM TopUsers tu WHERE tu.UserId = cqa.OwnerUserId) as OwnerPostCount,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = cqa.OwnerUserId AND p.PostTypeId = 1) as OwnerQuestionCount,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = cqa.OwnerUserId AND p.PostTypeId = 2) as OwnerAnswerCount,
+        COALESCE((
+            SELECT COUNT(*) FROM Badges b 
+            WHERE b.UserId = cqa.OwnerUserId AND b.Name IN ('Nice Question', 'Good Question', 'Great Question')
+        ), 0) as QuestionBadges,
+        CASE 
+            WHEN cqa.AnswerCount = 0 AND cqa.Score > 0 THEN 
+                (SELECT COUNT(*) FROM Votes v WHERE v.PostId = cqa.QuestionId AND v.VoteTypeId = 5) 
+            ELSE NULL 
+        END as FavoriteCount
+    FROM ComplexQuestionAnalysis cqa
+    WHERE cqa.QuestionId IS NOT NULL
+)
+SELECT 
+    fqa.QuestionId,
+    fqa.Title,
+    fqa.Score,
+    fqa.ViewCount,
+    fqa.AnswerCount,
+    fqa.CommentCount,
+    fqa.CreationDate,
+    fqa.OwnerUserId,
+    fqa.OwnerDisplayName,
+    fqa.OwnerReputation,
+    fqa.OwnerPostCount,
+    fqa.OwnerQuestionCount,
+    fqa.OwnerAnswerCount,
+    fqa.QuestionBadges,
+    fqa.Tags,
+    fqa.AgeInDays,
+    fqa.ScorePerDay,
+    fqa.PositiveAnswerRate,
+    fqa.ScoreCategory,
+    fqa.PopularityCategory,
+    fqa.AnswerQuality,
+    fqa.Ranking,
+    fqa.ScorePerformance,
+    fqa.FavoriteCount,
+    CASE 
+        WHEN fqa.AnswerQuality = 'WellAnswered' AND fqa.ScoreCategory = 'High' THEN 
+            'Excellent'
+        WHEN fqa.AnswerQuality = 'UnansweredButValuable' AND fqa.ScoreCategory = 'Positive' THEN 
+            'UnansweredValuable'
+        ELSE 'Standard'
+    END as QuestionQuality,
+    COALESCE((
+        SELECT COUNT(*) FROM Posts p 
+        WHERE p.ParentId = fqa.QuestionId AND p.Score = (
+            SELECT MAX(p2.Score) FROM Posts p2 WHERE p2.ParentId = fqa.QuestionId AND p2.PostTypeId = 2
+        )
+    ), 0) as TopAnswerCount,
+    (SELECT COUNT(DISTINCT ph.PostId) FROM PostHistory ph 
+     WHERE ph.PostId = fqa.QuestionId AND ph.PostHistoryTypeId IN (10, 11, 12, 13)) as HistoryEvents,
+    (SELECT MAX(ph.CreationDate) FROM PostHistory ph 
+     WHERE ph.PostId = fqa.QuestionId) as LastHistoryAction,
+    DENSE_RANK() OVER (ORDER BY fqa.ViewCount DESC) as ViewRank,
+    DENSE_RANK() OVER (ORDER BY fqa.Score DESC) as ScoreRank,
+    CASE 
+        WHEN fqa.OwnerReputation > 10000 THEN 'Expert'
+        WHEN fqa.OwnerReputation > 5000 THEN 'Advanced'
+        WHEN fqa.OwnerReputation > 1000 THEN 'Intermediate'
+        ELSE 'Beginner'
+    END as OwnerSkillLevel,
+    COALESCE((SELECT AVG(AnswerCount) FROM FinalQuestionAnalysis fqa2), 0) as AverageAnswers,
+    COALESCE((SELECT AVG(Score) FROM FinalQuestionAnalysis fqa3), 0) as AverageScore,
+    CASE 
+        WHEN fqa.Score > (SELECT AVG(Score) + STDDEV(Score) FROM FinalQuestionAnalysis) THEN 'High'
+        WHEN fqa.Score < (SELECT AVG(Score) - STDDEV(Score) FROM FinalQuestionAnalysis) THEN 'Low'
+        ELSE 'Normal'
+    END as ScoreDeviation,
+    CASE 
+        WHEN fqa.ViewCount > (SELECT AVG(ViewCount) + 2 * STDDEV(ViewCount) FROM FinalQuestionAnalysis) THEN 'VeryHigh'
+        WHEN fqa.ViewCount > (SELECT AVG(ViewCount) + 1 * STDDEV(ViewCount) FROM FinalQuestionAnalysis) THEN 'High'
+        WHEN fqa.ViewCount < (SELECT AVG(ViewCount) - 1 * STDDEV(ViewCount) FROM FinalQuestionAnalysis) THEN 'Low'
+        ELSE 'Average'
+    END as ViewDeviation,
+    ROW_NUMBER() OVER (ORDER BY fqa.CreationDate DESC) as NewestQuestions,
+    RANK() OVER (ORDER BY fqa.Score DESC) as RankByScore,
+    NTH_VALUE(fqa.QuestionId, 1) OVER (ORDER BY fqa.Score DESC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) as HighestScoreQuestionId,
+    LAG(fqa.QuestionId, 1) OVER (ORDER BY fqa.Score DESC) as PrevScoreQuestionId,
+    LEAD(fqa.QuestionId, 1) OVER (ORDER BY fqa.Score DESC) as NextScoreQuestionId,
+    FIRST_VALUE(fqa.QuestionId) OVER (ORDER BY fqa.CreationDate) as OldestQuestion,
+    LAST_VALUE(fqa.QuestionId) OVER (ORDER BY fqa.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) as NewestQuestion,
+    COUNT(*) OVER() as TotalQuestions,
+    COUNT(DISTINCT fqa.OwnerUserId) OVER() as TotalUniqueOwners,
+    GROUPING_ID(fqa.ScoreCategory, fqa.PopularityCategory, 
+                CASE 
+                    WHEN fqa.OwnerReputation > 10000 THEN 'Expert'
+                    WHEN fqa.OwnerReputation > 5000 THEN 'Advanced'
+                    WHEN fqa.OwnerReputation > 1000 THEN 'Intermediate'
+                    ELSE 'Beginner'
+                END) as GroupingLevel,
+    NULLIF(fqa.ViewCount, 0) * fqa.Score as ViewScoreProduct,
+    CASE 
+        WHEN fqa.ViewCount = 0 THEN NULL
+        ELSE fqa.Score * 1.0 / fqa.ViewCount
+    END as ScorePerView,
+    CASE 
+        WHEN fqa.AnswerCount > 0 THEN 
+            fqa.ViewCount * 1.0 / fqa.AnswerCount
+        ELSE NULL
+    END as ViewsPerAnswer,
+    'Q' || fqa.QuestionId || '-' || fqa.ScoreCategory as QuestionLabel,
+    UPPER(fqa.Title) as TitleUpper,
+    LOWER(fqa.TagsString) as TagsLower,
+    REPLACE(fqa.TagsString, '<', '') as TagsNoBrackets,
+    LENGTH(fqa.Title) as TitleLength,
+    LENGTH(fqa.TagsString) as TagStringLength,
+    CASE 
+        WHEN fqa.Score > 0 THEN 'Positive'
+        WHEN fqa.Score < 0 THEN 'Negative'
+        ELSE 'Neutral'
+    END as ScoreSentiment,
+    CASE 
+        WHEN fqa.AnswerCount >= 1 THEN 'HasAnswers'
+        ELSE 'NoAnswers'
+    END as AnswerStatus,
+    CASE 
+        WHEN fqa.ViewCount > 100 THEN 'HighTraffic'
+        WHEN fqa.ViewCount > 10 THEN 'ModerateTraffic'
+        ELSE 'LowTraffic'
+    END as TrafficLevel
+FROM FinalQuestionAnalysis fqa
+WHERE fqa.QuestionId IS NOT NULL
+ AND fqa.Score BETWEEN -20 AND 100
+ AND fqa.ViewCount >= 0
+ AND fqa.AnswerCount >= 0
+ AND fqa.CommentCount >= 0
+ AND fqa.OwnerUserId IS NOT NULL
+ AND fqa.OwnerReputation IS NOT NULL
+ AND fqa.OwnerPostCount IS NOT NULL
+ AND fqa.OwnerQuestionCount IS NOT NULL
+ AND fqa.OwnerAnswerCount IS NOT NULL
+ AND fqa.QuestionBadges IS NOT NULL
+ AND fqa.Title IS NOT NULL
+ AND fqa.Title != ''
+ AND fqa.Tags IS NOT NULL
+ AND fqa.Tags != ''
+ AND fqa.OwnerDisplayName IS NOT NULL
+ AND fqa.OwnerDisplayName != ''
+ AND fqa.CreationDate IS NOT NULL
+ AND fqa.CreationDate >= TIMESTAMP '2010-01-01 00:00:00'
+ AND fqa.CreationDate <= TIMESTAMP '2024-12-31 23:59:59'
+ORDER BY fqa.Score DESC, fqa.ViewCount DESC, fqa.Ranking ASC
+LIMIT 1000 OFFSET 500;

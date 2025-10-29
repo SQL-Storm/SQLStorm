@@ -1,0 +1,130 @@
+WITH
+RecentActivePosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.OwnerDisplayName,
+        p.CommentCount,
+        p.AnswerCount,
+        p.FavoriteCount
+    FROM Posts p
+    WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days'
+),
+PostEditImpact AS (
+    SELECT
+        rap.PostId,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 5 THEN ph.CreationDate END) AS LastBodyEditDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 4 THEN ph.CreationDate END) AS LastTitleEditDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 6 THEN ph.CreationDate END) AS LastTagsEditDate
+    FROM RecentActivePosts rap
+    LEFT JOIN PostHistory ph ON ph.PostId = rap.PostId
+    GROUP BY rap.PostId
+),
+DistinctCommenters AS (
+    SELECT
+        c.PostId,
+        c.UserId,
+        MIN(c.CreationDate) AS FirstCommentDate
+    FROM Comments c
+    WHERE c.PostId IN (SELECT PostId FROM RecentActivePosts)
+    GROUP BY c.PostId, c.UserId
+),
+CommentersPerPost AS (
+    SELECT
+        dc.PostId,
+        SUM(CASE WHEN dc.FirstCommentDate <= cp.CreationDate THEN 1 ELSE 0 END) AS CumulativeCommenters,
+        cp.CreationDate
+    FROM DistinctCommenters dc
+    JOIN LATERAL (
+        SELECT x.CreateTime AS CreationDate
+        FROM (VALUES (dc.FirstCommentDate)) AS x(CreateTime)
+        LIMIT 1
+    ) AS cp ON true
+    GROUP BY dc.PostId, cp.CreationDate
+),
+CommentersPerPostFallback AS (
+    SELECT
+        dc.PostId,
+        COUNT(*) AS CumulativeCommenters
+    FROM DistinctCommenters dc
+    GROUP BY dc.PostId
+),
+TagScore AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        CASE
+            WHEN t.Count > 1000 THEN 'hot'
+            WHEN t.Count BETWEEN 100 AND 1000 THEN 'warm'
+            ELSE 'cold'
+        END AS TagTemperature,
+        CONCAT('tag/', LOWER(t.TagName)) AS TagPath
+    FROM Tags t
+    WHERE t.TagName IS NOT NULL
+),
+TagSummary AS (
+    SELECT TagName FROM Tags WHERE IsModeratorOnly = FALSE
+    UNION
+    SELECT 'all-tags' AS TagName
+),
+PostWithMetrics AS (
+    SELECT
+        rap.PostId,
+        rap.Title,
+        rap.Tags,
+        rap.CreationDate,
+        rap.LastActivityDate,
+        rap.Score,
+        rap.ViewCount,
+        COALESCE(pe.LastBodyEditDate, rap.CreationDate) AS LastBodyEditDate,
+        COALESCE(pe.LastTitleEditDate, rap.CreationDate) AS LastTitleEditDate,
+        COALESCE(pe.LastTagsEditDate, rap.CreationDate) AS LastTagsEditDate,
+        COALESCE(ccp.CumulativeCommenters, cpf.CumulativeCommenters, 0) AS CumulativeCommenters,
+        tp.Name AS PostTypeName
+    FROM RecentActivePosts rap
+    LEFT JOIN PostEditImpact pe ON pe.PostId = rap.PostId
+    LEFT JOIN CommentersPerPost ccp ON ccp.PostId = rap.PostId
+    LEFT JOIN CommentersPerPostFallback cpf ON cpf.PostId = rap.PostId AND ccp.PostId IS NULL
+    LEFT JOIN PostTypes tp ON tp.Id = rap.PostTypeId
+),
+FinalBenchmark AS (
+    SELECT
+        pwp.PostId,
+        pwp.PostTypeName,
+        pwp.Title,
+        pwp.Tags,
+        pwp.CreationDate,
+        pwp.LastActivityDate,
+        pwp.Score,
+        pwp.ViewCount,
+        pwp.LastBodyEditDate,
+        pwp.LastTitleEditDate,
+        pwp.LastTagsEditDate,
+        pwp.CumulativeCommenters,
+        CASE
+            WHEN pwp.Score >= 50 THEN TRUE
+            ELSE FALSE
+        END AS HighImpact,
+        CASE
+            WHEN pwp.Score = 0 THEN 'moderate'
+            WHEN pwp.Score <> 0 AND (pwp.ViewCount::numeric / pwp.Score) > 20 THEN 'heavy-traffic'
+            ELSE 'moderate'
+        END AS TrafficCategory,
+        CASE
+            WHEN pwp.Tags LIKE '%<python>%' OR pwp.Tags LIKE '%python%' THEN 'contains-python'
+            ELSE 'no-python'
+        END AS TagPresence
+    FROM PostWithMetrics pwp
+)
+SELECT
+    *
+FROM FinalBenchmark
+ORDER BY LastActivityDate DESC
+LIMIT 100;

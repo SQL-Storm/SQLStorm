@@ -1,0 +1,191 @@
+WITH UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.DisplayName AS UserDisplayName,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswers,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT ph.Id) AS TotalHistoryEvents,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        CAST(u.UpVotes AS NUMERIC) / NULLIF(u.DownVotes, 0) AS UpDownVoteRatio,
+        AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL) AS AvgPostScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.Reputation, u.CreationDate, u.DisplayName, u.UpVotes, u.DownVotes
+    HAVING
+        COUNT(DISTINCT p.Id) > 5
+        AND u.Reputation > 500
+),
+QuestionDetailedMetrics AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.OwnerUserId,
+        q.CreationDate AS QuestionCreationDate,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        q.FavoriteCount,
+        q.ClosedDate,
+        q.LastActivityDate,
+        q.Title AS QuestionTitle,
+        q.Tags AS RawTags,
+        COALESCE(q.AcceptedAnswerId, -1) AS AcceptedAnswerId,
+        COUNT(DISTINCT CASE WHEN ph_editors.UserId IS NOT NULL AND ph_editors.UserId <> q.OwnerUserId THEN ph_editors.UserId END) AS OtherEditorCount,
+        MAX(CASE WHEN ph_close.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS HasBeenClosed,
+        MAX(CASE WHEN ph_body_edit.PostHistoryTypeId = 5 THEN ph_body_edit.CreationDate ELSE NULL END) AS LastBodyEditDate,
+        AVG(a.Score) FILTER (WHERE a.Score IS NOT NULL) AS AvgAnswerScore,
+        (SELECT COUNT(c_sub.Id) FROM Comments c_sub WHERE c_sub.PostId = q.Id AND c_sub.CreationDate > q.LastActivityDate) AS CommentsAfterLastActivity
+    FROM Posts q
+    LEFT JOIN Posts a ON q.Id = a.ParentId AND a.PostTypeId = 2
+    LEFT JOIN PostHistory ph_editors ON q.Id = ph_editors.PostId AND ph_editors.PostHistoryTypeId IN (4, 5, 6)
+    LEFT JOIN PostHistory ph_close ON q.Id = ph_close.PostId AND ph_close.PostHistoryTypeId = 10
+    LEFT JOIN PostHistory ph_body_edit ON q.Id = ph_body_edit.PostId AND ph_body_edit.PostHistoryTypeId = 5
+    WHERE q.PostTypeId = 1
+    GROUP BY
+        q.Id, q.OwnerUserId, q.CreationDate, q.Score, q.ViewCount, q.AnswerCount,
+        q.FavoriteCount, q.ClosedDate, q.LastActivityDate, q.Title, q.Tags, q.AcceptedAnswerId
+),
+PostTagParsing AS (
+    SELECT
+        QuestionId,
+        UNNEST(string_to_array(SUBSTRING(RawTags FROM 2 FOR LENGTH(RawTags) - 2), '><')) AS TagName
+    FROM QuestionDetailedMetrics
+    WHERE RawTags IS NOT NULL AND LENGTH(RawTags) > 2
+),
+PostHistoryTimeline AS (
+    SELECT
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate AS HistoryDate,
+        ph.UserId AS HistoryUserId,
+        pht.Name AS HistoryTypeName,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn_latest_event,
+        LAG(ph.CreationDate, 1, ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS PreviousEventDate,
+        LEAD(pht.Name, 1, 'NoNextEvent') OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS NextEventType,
+        (ph.CreationDate - LAG(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate)) AS TimeSincePreviousEvent
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+),
+PrimaryTags AS (
+    -- emulate QUALIFY by ROW_NUMBER in a CTE and then filter
+    SELECT
+        pt.QuestionId AS PostId,
+        pt.TagName,
+        ROW_NUMBER() OVER (PARTITION BY pt.QuestionId ORDER BY
+            CASE WHEN pt.TagName IN ('sql', 'database', 'performance', 'query-optimization', 'data-modeling') THEN 0 ELSE 1 END,
+            pt.TagName
+        ) AS rn
+    FROM PostTagParsing pt
+),
+ph_latest_body_edit AS (
+    SELECT
+        ph.PostId,
+        ph.CreationDate AS HistoryDate,
+        ph.UserId,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 5
+),
+ph_latest_any_edit AS (
+    SELECT
+        ph.PostId,
+        ph.CreationDate AS HistoryDate,
+        pht.Name AS HistoryTypeName,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6)
+)
+SELECT
+    uas.UserDisplayName,
+    uas.Reputation,
+    uas.GoldBadges,
+    uas.TotalQuestions,
+    q.QuestionTitle,
+    q.QuestionScore,
+    q.ViewCount,
+    q.AnswerCount,
+    q.FavoriteCount,
+    (q.QuestionScore * 0.7 + q.ViewCount * 0.05 + q.AnswerCount * 3 + q.FavoriteCount * 5 + COALESCE(q.AvgAnswerScore, 0) * 1.5) AS QuestionQualityScore,
+    q.HasBeenClosed,
+    q.OtherEditorCount,
+    q.AvgAnswerScore,
+    q.CommentsAfterLastActivity,
+    phb.HistoryDate AS LatestBodyEditTimestamp,
+    phb.UserId AS LatestBodyEditorId,
+    pha.HistoryDate AS LatestAnyEditTimestamp,
+    pha.HistoryTypeName AS LatestAnyEditType,
+    t.TagName AS PrimaryQuestionTag,
+    COALESCE((SELECT ans.Score FROM Posts ans WHERE ans.Id = q.AcceptedAnswerId), 0) AS AcceptedAnswerScore,
+    EXTRACT(DAY FROM (COALESCE(q.ClosedDate, CAST('2024-10-01 12:34:56' AS timestamp)) - q.QuestionCreationDate)) AS DaysOpenSinceCreation,
+    CASE
+        WHEN uas.Reputation >= 20000 AND uas.GoldBadges >= 5 THEN 'Elite Influencer'
+        WHEN uas.Reputation >= 10000 AND uas.SilverBadges >= 10 THEN 'Senior Contributor'
+        WHEN uas.Reputation >= 5000 AND uas.BronzeBadges >= 20 THEN 'Active Community Member'
+        ELSE 'General Participant'
+    END AS UserEngagementTier,
+    (SELECT COUNT(b_sub.Id) FROM Badges b_sub WHERE b_sub.UserId = uas.UserId AND b_sub.Name = 'Great Question') > 0 AS HasGreatQuestionBadge,
+    (
+        SELECT STRING_AGG(
+            CASE
+                WHEN related_post_type = 'Original' THEN 'Original: ' || p_rel.Title || ' (ID: ' || CAST(p_rel.Id AS TEXT) || ')'
+                ELSE 'Duplicate Of: ' || p_rel.Title || ' (ID: ' || CAST(p_rel.Id AS TEXT) || ')'
+            END, '; ' ORDER BY related_post_type DESC
+        )
+        FROM (
+            SELECT 'Original' AS related_post_type, p_orig.Title, p_orig.Id
+            FROM Posts p_orig
+            WHERE p_orig.Id = q.QuestionId
+            UNION ALL
+            SELECT 'Duplicate Of' AS related_post_type, p_dup.Title, p_dup.Id
+            FROM PostLinks pl
+            JOIN Posts p_dup ON pl.RelatedPostId = p_dup.Id
+            WHERE pl.PostId = q.QuestionId AND pl.LinkTypeId = 3
+        ) AS sub_related_posts(p_rel_type, Title, Id)
+        JOIN LATERAL (
+            SELECT sub_related_posts.Title, sub_related_posts.Id, sub_related_posts.related_post_type AS related_post_type
+        ) p_rel ON TRUE
+    ) AS RelatedPostsSummary,
+    EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - q.LastActivityDate)) / 3600 AS HoursSinceLastActivity
+FROM UserActivitySummary uas
+JOIN QuestionDetailedMetrics q ON uas.UserId = q.OwnerUserId
+LEFT JOIN (
+    SELECT PostId, TagName
+    FROM PrimaryTags
+    WHERE rn = 1
+) t ON q.QuestionId = t.PostId
+LEFT JOIN (
+    SELECT PostId, HistoryDate, UserId
+    FROM ph_latest_body_edit
+    WHERE rn = 1
+) phb ON q.QuestionId = phb.PostId
+LEFT JOIN (
+    SELECT PostId, HistoryDate, HistoryTypeName
+    FROM ph_latest_any_edit
+    WHERE rn = 1
+) pha ON q.QuestionId = pha.PostId
+WHERE
+    q.QuestionScore > 15
+    AND q.ViewCount > 500
+    AND q.LastBodyEditDate IS NOT NULL
+    AND t.TagName IN ('sql', 'database', 'performance', 'query-optimization')
+    AND uas.TotalQuestions > 10
+    AND uas.UpDownVoteRatio > 3.0
+    AND (EXISTS (SELECT 1 FROM Badges b_inner WHERE b_inner.UserId = uas.UserId AND b_inner.Class = 1) OR uas.Reputation > 15000)
+    AND q.HasBeenClosed = 0
+    AND q.FavoriteCount > 2
+    AND (CAST('2024-10-01 12:34:56' AS timestamp) - q.LastActivityDate) < INTERVAL '30 days'
+ORDER BY
+    QuestionQualityScore DESC, uas.Reputation DESC, q.LastActivityDate DESC
+LIMIT 200;

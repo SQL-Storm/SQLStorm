@@ -1,0 +1,169 @@
+with RecursiveTagCTE as (
+    select
+        t.Id as TagId,
+        t.TagName,
+        p.Id as PostId,
+        p.CreationDate
+    from Tags t
+    left join Posts p on p.Tags like concat('%<', t.TagName, '>%')
+    where p.PostTypeId = 1
+    union all
+    select
+        r.TagId,
+        rt.TagName,
+        rp.Id as PostId,
+        rp.CreationDate
+    from RecursiveTagCTE r
+    join Posts rp on rp.ParentId = r.PostId and rp.PostTypeId = 2
+    join Tags rt on rp.Tags like concat('%<', rt.TagName, '>%')
+),
+UserBadgeSummary as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct b.Id) as TotalBadges,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostScoreRanks as (
+    select
+        p.Id,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Title,
+        p.Score,
+        p.CreationDate,
+        row_number() over (partition by p.PostTypeId order by p.Score desc, p.CreationDate asc) as ScoreRank,
+        dense_rank() over (partition by p.OwnerUserId order by p.Score desc) as UserScoreRank
+    from Posts p
+    where p.Score is not null
+),
+CorrelatedCommentsCount as (
+    select
+        p.Id as PostId,
+        (select count(*) from Comments c where c.PostId = p.Id and (c.Score > 0 or c.UserId is not null)) as PositiveCommentsCount,
+        (select count(*) from Comments c where c.PostId = p.Id and (c.Score <= 0 or c.UserId is null)) as NonPositiveCommentsCount
+    from Posts p
+),
+PostWithCloseInfo as (
+    select
+        p.Id,
+        p.Title,
+        p.ClosedDate,
+        pht.Name as CloseReason,
+        ph.UserId as ClosedByUserId,
+        u.DisplayName as ClosedByUserName,
+        p.Score,
+        p.ViewCount
+    from Posts p
+    left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 10
+    left join CloseReasonTypes pht on case when ph.Comment ~ '^[0-9]+$' then cast(ph.Comment as integer) end = pht.Id
+    left join Users u on u.Id = ph.UserId
+    where p.ClosedDate is not null
+),
+TopActiveUsers as (
+    select
+        u.Id,
+        u.DisplayName,
+        count(distinct ph.Id) as EditCount,
+        count(distinct p.Id) as PostCount,
+        count(distinct c.Id) as CommentCount,
+        dense_rank() over (order by count(distinct ph.Id) desc) as ActivityRank
+    from Users u
+    left join PostHistory ph on ph.UserId = u.Id
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    group by u.Id, u.DisplayName
+    having count(distinct ph.Id) > 5
+)
+select distinct
+    p.Id as PostId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.OwnerUserId,
+    u.DisplayName as OwnerName,
+    u.Reputation,
+    u.UpVotes,
+    u.DownVotes,
+    coalesce(ub.GoldBadges, 0) as GoldBadgesOwned,
+    coalesce(ub.SilverBadges, 0) as SilverBadgesOwned,
+    coalesce(ub.BronzeBadges, 0) as BronzeBadgesOwned,
+    pwr.ScoreRank,
+    pwr.UserScoreRank,
+    ccc.PositiveCommentsCount,
+    ccc.NonPositiveCommentsCount,
+    pti.ClosedDate,
+    pti.CloseReason,
+    pti.ClosedByUserName,
+    ta.TagName,
+    ta.CreationDate as TagLinkedPostDate,
+    tu.DisplayName as TopActiveUserName,
+    tu.EditCount,
+    tu.PostCount,
+    tu.CommentCount,
+    count(distinct pl.Id) over (partition by p.Id) as LinkedPostsCount,
+    concat(
+        substring(coalesce(p.Title, ''), 1, 20),
+        '...', 
+        case when p.ViewCount > 1000 then ' HighViews' else ' LowViews' end
+    ) as TitleSnippet,
+    case 
+        when p.Score >= 10 then 'HighlyPositive'
+        when p.Score between 0 and 9 then 'ModeratelyPositive'
+        when p.Score < 0 then 'NegativeScore'
+        else 'Neutral'
+    end as ScoreCategory
+from Posts p
+left join Users u on u.Id = p.OwnerUserId
+left join UserBadgeSummary ub on ub.UserId = u.Id
+left join PostScoreRanks pwr on pwr.Id = p.Id
+left join CorrelatedCommentsCount ccc on ccc.PostId = p.Id
+left join PostWithCloseInfo pti on pti.Id = p.Id
+left join RecursiveTagCTE ta on ta.PostId = p.Id
+left join PostLinks pl on pl.PostId = p.Id
+left join (
+    select * from TopActiveUsers where ActivityRank <= 10
+) tu on tu.Id = p.OwnerUserId
+where p.PostTypeId in (1, 2)
+  and (p.Score is not null and p.Score >= 0)
+  and (
+    (
+      select count(*) from PostLinks pl2 where pl2.RelatedPostId = p.Id
+    ) > 0
+  )
+group by
+    p.Id,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.OwnerUserId,
+    u.DisplayName,
+    u.Reputation,
+    u.UpVotes,
+    u.DownVotes,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    pwr.ScoreRank,
+    pwr.UserScoreRank,
+    ccc.PositiveCommentsCount,
+    ccc.NonPositiveCommentsCount,
+    pti.ClosedDate,
+    pti.CloseReason,
+    pti.ClosedByUserName,
+    ta.TagName,
+    ta.CreationDate,
+    tu.DisplayName,
+    tu.EditCount,
+    tu.PostCount,
+    tu.CommentCount
+order by p.Score desc, p.CreationDate asc
+limit 100;

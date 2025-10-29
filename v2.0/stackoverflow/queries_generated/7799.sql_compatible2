@@ -1,0 +1,221 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Elite'
+            WHEN u.Reputation > 5000 THEN 'Veteran'
+            WHEN u.Reputation > 1000 THEN 'Contributor'
+            ELSE 'Member'
+        END AS ReputationTier,
+        COALESCE(SUM(p.Score), 0) AS TotalScore,
+        COALESCE(SUM(p.ViewCount), 0) AS TotalViews
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.Tags,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            WHEN p.PostTypeId = 4 THEN 'TagWikiExcerpt'
+            WHEN p.PostTypeId = 5 THEN 'TagWiki'
+            ELSE 'Other'
+        END AS PostType,
+        COALESCE(p.AnswerCount, 0) + COALESCE(p.CommentCount, 0) AS EngagementCount,
+        CASE 
+            WHEN p.Score > 100 THEN 'HighlyVoted'
+            WHEN p.Score > 50 THEN 'ModeratelyVoted'
+            WHEN p.Score > 0 THEN 'LowVoted'
+            ELSE 'Unvoted'
+        END AS ScoreCategory,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS ScoreRankByType,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) AS OverallScoreRank,
+        PERCENT_RANK() OVER (ORDER BY p.Score) AS ScorePercentile,
+        LAG(p.Score, 1) OVER (ORDER BY p.Score DESC) - p.Score AS ScoreDifferenceFromPrevious,
+        AVG(p.Score) OVER (PARTITION BY p.PostTypeId) AS AvgScoreByType,
+        STDDEV(p.Score) OVER (PARTITION BY p.PostTypeId) AS StdDevScoreByType
+    FROM Posts p
+    WHERE p.Id IS NOT NULL
+),
+ComplexUserActivity AS (
+    SELECT 
+        us.Id,
+        us.DisplayName,
+        us.Reputation,
+        us.PostCount,
+        us.CommentCount,
+        us.BadgeCount,
+        us.TotalScore,
+        us.TotalViews,
+        ROW_NUMBER() OVER (ORDER BY us.TotalScore DESC, us.PostCount DESC) AS ActivityRank,
+        CASE 
+            WHEN us.PostCount > 50 AND us.TotalScore > 1000 THEN 'HighlyActive'
+            WHEN us.PostCount > 20 AND us.TotalScore > 500 THEN 'Active'
+            WHEN us.PostCount > 5 THEN 'Regular'
+            ELSE 'Occasional'
+        END AS ActivityLevel,
+        CASE 
+            WHEN us.ReputationTier = 'Elite' AND us.BadgeCount >= 20 THEN 'Legendary'
+            WHEN us.ReputationTier = 'Veteran' AND us.BadgeCount >= 15 THEN 'Veteran'
+            WHEN us.BadgeCount >= 10 THEN 'Achiever'
+            ELSE 'Beginner'
+        END AS AchievementLevel
+    FROM UserStats us
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            WHEN t.Count > 10 THEN 'Niche'
+            ELSE 'Rare'
+        END AS PopularityLevel,
+        RANK() OVER (ORDER BY t.Count DESC) AS PopularityRank,
+        AVG(t.Count) OVER () AS AvgTagCount,
+        STDDEV(t.Count) OVER () AS StdDevTagCount
+    FROM Tags t
+    WHERE t.TagName IS NOT NULL
+),
+UserPostEngagement AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        CASE 
+            WHEN p.OwnerUserId = u.Id THEN 'Owner'
+            WHEN EXISTS (SELECT 1 FROM Votes v WHERE v.PostId = p.Id AND v.UserId = u.Id) THEN 'Voter'
+            WHEN EXISTS (SELECT 1 FROM Comments c WHERE c.PostId = p.Id AND c.UserId = u.Id) THEN 'Commenter'
+            WHEN EXISTS (SELECT 1 FROM Posts p2 WHERE p2.ParentId = p.Id AND p2.OwnerUserId = u.Id) THEN 'Answerer'
+            ELSE 'Observer'
+        END AS RoleInPost,
+        CASE 
+            WHEN p.Score >= 100 THEN 'Controversial'
+            WHEN p.Score >= 50 THEN 'Interesting'
+            WHEN p.Score >= 10 THEN 'Moderate'
+            WHEN p.Score >= 1 THEN 'Minor'
+            ELSE 'Unremarkable'
+        END AS PostImpact,
+        EXTRACT(DAY FROM (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate)) AS DaysSincePost
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+        OR EXISTS (SELECT 1 FROM Votes v WHERE v.PostId = p.Id AND v.UserId = u.Id)
+        OR EXISTS (SELECT 1 FROM Comments c WHERE c.PostId = p.Id AND c.UserId = u.Id)
+    WHERE u.Id > 0
+      AND (p.OwnerUserId IS NOT NULL OR p.Id IN (SELECT DISTINCT PostId FROM Votes WHERE UserId = u.Id) OR p.Id IN (SELECT DISTINCT PostId FROM Comments WHERE UserId = u.Id))
+),
+DetailedAnalytics AS (
+    SELECT 
+        cua.Id,
+        cua.DisplayName,
+        cua.Reputation,
+        cua.PostCount,
+        cua.CommentCount,
+        cua.BadgeCount,
+        cua.TotalScore,
+        cua.TotalViews,
+        cua.ActivityRank,
+        cua.ActivityLevel,
+        cua.AchievementLevel,
+        COALESCE(STRING_AGG(DISTINCT upa.RoleInPost, ', '), 'None') AS RolesInPosts,
+        COUNT(DISTINCT upa.PostId) AS PostParticipationCount,
+        AVG(upa.Score) AS AvgParticipatedScore,
+        SUM(CASE WHEN upa.PostImpact = 'Controversial' THEN 1 ELSE 0 END) AS ControversialPosts,
+        SUM(CASE WHEN upa.PostImpact = 'Interesting' THEN 1 ELSE 0 END) AS InterestingPosts,
+        SUM(CASE WHEN upa.PostImpact = 'Moderate' THEN 1 ELSE 0 END) AS ModeratePosts,
+        SUM(CASE WHEN upa.PostImpact = 'Minor' THEN 1 ELSE 0 END) AS MinorPosts,
+        SUM(CASE WHEN upa.PostImpact = 'Unremarkable' THEN 1 ELSE 0 END) AS UnremarkablePosts
+    FROM ComplexUserActivity cua
+    LEFT JOIN UserPostEngagement upa ON cua.Id = upa.Id
+    GROUP BY cua.Id, cua.DisplayName, cua.Reputation, cua.PostCount, cua.CommentCount, cua.BadgeCount, cua.TotalScore, cua.TotalViews, cua.ActivityRank, cua.ActivityLevel, cua.AchievementLevel
+)
+SELECT 
+    da.Id,
+    da.DisplayName,
+    da.Reputation,
+    da.PostCount,
+    da.CommentCount,
+    da.BadgeCount,
+    da.TotalScore,
+    da.TotalViews,
+    da.ActivityRank,
+    da.ActivityLevel,
+    da.AchievementLevel,
+    da.RolesInPosts,
+    da.PostParticipationCount,
+    ROUND(CAST(da.AvgParticipatedScore AS DECIMAL), 2) AS AvgParticipatedScore,
+    da.ControversialPosts,
+    da.InterestingPosts,
+    da.ModeratePosts,
+    da.MinorPosts,
+    da.UnremarkablePosts,
+    ROW_NUMBER() OVER (ORDER BY da.TotalScore DESC, da.PostCount DESC) AS OverallRanking,
+    CASE 
+        WHEN da.PostParticipationCount > 0 THEN 
+            ROUND(
+                (COALESCE(da.ControversialPosts, 0) * 100.0 / NULLIF(da.PostParticipationCount, 0)) +
+                (COALESCE(da.InterestingPosts, 0) * 80.0 / NULLIF(da.PostParticipationCount, 0)) +
+                (COALESCE(da.ModeratePosts, 0) * 60.0 / NULLIF(da.PostParticipationCount, 0)) +
+                (COALESCE(da.MinorPosts, 0) * 40.0 / NULLIF(da.PostParticipationCount, 0)),
+                2
+            )
+        ELSE 0 
+    END AS EngagementIntensity,
+    COALESCE((SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = da.Id AND p.PostTypeId = 1), 0) AS QuestionCount,
+    COALESCE((SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = da.Id AND p.PostTypeId = 2), 0) AS AnswerCount,
+    COALESCE((SELECT COUNT(*) FROM Comments c WHERE c.UserId = da.Id), 0) AS CommentCountByUser,
+    COALESCE((SELECT COUNT(*) FROM Badges b WHERE b.UserId = da.Id AND b.Class = 1), 0) AS GoldBadgeCount,
+    COALESCE((SELECT COUNT(*) FROM Badges b WHERE b.UserId = da.Id AND b.Class = 2), 0) AS SilverBadgeCount,
+    COALESCE((SELECT COUNT(*) FROM Badges b WHERE b.UserId = da.Id AND b.Class = 3), 0) AS BronzeBadgeCount,
+    CASE 
+        WHEN da.Reputation >= 100000 THEN 'Grandmaster'
+        WHEN da.Reputation >= 50000 THEN 'Master'
+        WHEN da.Reputation >= 10000 THEN 'Expert'
+        WHEN da.Reputation >= 1000 THEN 'Enthusiast'
+        ELSE 'Newbie'
+    END AS RepLevel,
+    CASE 
+        WHEN da.ActivityLevel = 'HighlyActive' AND da.AchievementLevel = 'Legendary' THEN 'TopContributor'
+        WHEN da.ActivityLevel = 'Active' AND da.AchievementLevel IN ('Veteran', 'Achiever') THEN 'MidContributor'
+        ELSE 'RegularContributor'
+    END AS ContributionStatus
+FROM DetailedAnalytics da
+WHERE da.TotalScore >= 0
+ORDER BY da.TotalScore DESC, da.PostCount DESC, da.ActivityRank ASC
+LIMIT 500;

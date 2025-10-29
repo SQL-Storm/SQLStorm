@@ -1,0 +1,130 @@
+-- {"query": "3536.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2091} 
+WITH TopTags AS (
+    SELECT t.Id,
+           t.TagName,
+           t.Count
+    FROM   Tags t
+    ORDER BY t.Count DESC
+    LIMIT 10
+),
+
+TagQuestions AS (
+    SELECT p.Id                                 AS QuestionId,
+           tt.TagName,
+           p.OwnerUserId,
+           p.Score                               AS QuestionScore,
+           p.CreationDate,
+           p.ViewCount,
+           p.FavoriteCount,
+           /* correlated subqueries for answers and votes */
+           (SELECT COUNT(*) 
+            FROM   Posts a 
+            WHERE  a.ParentId = p.Id 
+              AND  a.PostTypeId = 2)            AS AnswerCount,
+           (SELECT COALESCE(SUM(v2.Score),0)
+            FROM   Votes v2
+            WHERE  v2.PostId = p.Id
+              AND  v2.VoteTypeId = 2)           AS UpVotes,
+           (SELECT COALESCE(SUM(v3.Score),0)
+            FROM   Votes v3
+            WHERE  v3.PostId = p.Id
+              AND  v3.VoteTypeId = 3)           AS DownVotes,
+           (SELECT MAX(v4.CreationDate)
+            FROM   Votes v4
+            WHERE  v4.PostId = p.Id)            AS LastVoteDate
+    FROM   Posts p
+    JOIN   TopTags tt
+           ON p.Tags LIKE CONCAT('%<',tt.TagName,'%>')   -- tag stored as <tag1><tag2>
+    WHERE  p.PostTypeId = 1                           -- only questions
+),
+
+UserStats AS (
+    SELECT u.Id,
+           u.DisplayName,
+           u.Reputation,
+           COALESCE(b.GoldCnt,0)   AS GoldBadges,
+           COALESCE(b.SilverCnt,0) AS SilverBadges,
+           COALESCE(b.BronzeCnt,0) AS BronzeBadges
+    FROM   Users u
+    LEFT JOIN (
+        SELECT UserId,
+               SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldCnt,
+               SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverCnt,
+               SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeCnt
+        FROM   Badges
+        GROUP BY UserId
+    ) b
+      ON u.Id = b.UserId
+),
+
+RankedQuestions AS (
+    SELECT q.*,
+           ROW_NUMBER() OVER (PARTITION BY q.TagName
+                              ORDER BY q.QuestionScore DESC,
+                                       q.ViewCount DESC)          AS RankInTag,
+           PERCENT_RANK() OVER (ORDER BY q.QuestionScore)                AS GlobalPercentile,
+           CASE 
+               WHEN q.AnswerCount = 0 THEN NULL
+               ELSE (SELECT AVG(a.Score)
+                     FROM   Posts a
+                     WHERE  a.ParentId = q.QuestionId
+                       AND  a.PostTypeId = 2)                           AS AvgAnswerScore,
+           COALESCE(u.Reputation,0)                                      AS OwnerReputation,
+           (COALESCE(u.GoldBadges,0)+COALESCE(u.SilverBadges,0)+COALESCE(u.BronzeBadges,0))
+                                                                      AS TotalBadges,
+           CASE 
+               WHEN q.FavoriteCount IS NULL THEN 0
+               ELSE q.FavoriteCount
+           END                                                          AS Favorites,
+           CASE 
+               WHEN q.LastVoteDate IS NULL THEN 'Never Voted'
+               WHEN q.LastVoteDate < DATEADD(day,-30,cast('2024-10-01 12:34:56' as timestamp)) THEN 'Stale'
+               ELSE 'Active'
+           END                                                          AS VoteRecency
+    FROM   TagQuestions q
+    LEFT JOIN UserStats u
+           ON q.OwnerUserId = u.Id
+)
+
+SELECT TagName,
+       QuestionId,
+       RankInTag,
+       QuestionScore,
+       ViewCount,
+       Favorites,
+       AnswerCount,
+       AvgAnswerScore,
+       OwnerReputation,
+       TotalBadges,
+       GlobalPercentile,
+       VoteRecency
+FROM   RankedQuestions
+WHERE  RankInTag <= 5
+
+UNION ALL
+
+/*  filler rows for tags that have no qualifying questions  */
+SELECT t.TagName,
+       NULL          AS QuestionId,
+       NULL          AS RankInTag,
+       NULL          AS QuestionScore,
+       NULL          AS ViewCount,
+       NULL          AS Favorites,
+       NULL          AS AnswerCount,
+       NULL          AS AvgAnswerScore,
+       NULL          AS OwnerReputation,
+       NULL          AS TotalBadges,
+       NULL          AS GlobalPercentile,
+       CASE 
+           WHEN t.Count > 10000 THEN 'Very Popular'
+           WHEN t.Count > 5000  THEN 'Popular'
+           ELSE 'Less Popular'
+       END           AS VoteRecency
+FROM   TopTags t
+WHERE  NOT EXISTS (SELECT 1
+                   FROM   RankedQuestions rq
+                   WHERE  rq.TagName = t.TagName
+                     AND  rq.RankInTag = 1)
+
+ORDER BY TagName,
+         RankInTag NULLS LAST;

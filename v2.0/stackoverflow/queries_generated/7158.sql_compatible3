@@ -1,0 +1,273 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT c.Id) as Comments,
+        COUNT(DISTINCT b.Id) as Badges,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        MAX(b.Date) as LastBadgeDate,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) as TotalQuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) as TotalAnswerScore,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END) as AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE NULL END) as AvgAnswerScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostStats AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        p.ParentId,
+        CASE WHEN p.PostTypeId = 1 THEN p.AcceptedAnswerId END as AcceptedAnswerId,
+        COALESCE(p.Tags, '') as TagString,
+        COALESCE(p.Title, '') as TitleString,
+        CASE WHEN p.PostTypeId = 1 AND EXISTS (SELECT 1 FROM Posts WHERE Id = p.AcceptedAnswerId) THEN 1 ELSE 0 END as HasAcceptedAnswer,
+        CASE WHEN p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END as IsClosed,
+        CAST((CAST(COALESCE(p.LastEditDate, p.CreationDate) AS DATE) - CAST(p.CreationDate AS DATE)) AS INTEGER) as DaysSinceCreation,
+        CASE
+            WHEN p.Score >= 100 THEN 'Gold'
+            WHEN p.Score >= 50 THEN 'Silver'
+            WHEN p.Score >= 10 THEN 'Bronze'
+            ELSE 'None'
+        END as ScoreTier
+    FROM Posts p
+),
+AnswerRankings AS (
+    SELECT 
+        p.Id as AnswerId,
+        p.ParentId,
+        p.Score,
+        p.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) as AnswerRank,
+        COUNT(*) OVER (PARTITION BY p.ParentId) as TotalAnswersToQuestion,
+        AVG(p.Score) OVER (PARTITION BY p.ParentId) as AvgScorePerQuestion,
+        COUNT(*) OVER () as TotalAnswers,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) as ScoreRank
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+),
+QuestionWithBestAnswer AS (
+    SELECT 
+        q.Id as QuestionId,
+        q.Title,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        q.CommentCount,
+        q.Tags,
+        q.OwnerUserId,
+        a.AnswerId as BestAnswerId,
+        a.Score as BestAnswerScore,
+        a.CreationDate as BestAnswerCreationDate,
+        CASE 
+            WHEN a.Score > q.Score THEN 'Answer Higher'
+            WHEN a.Score = q.Score THEN 'Score Equal'
+            ELSE 'Answer Lower'
+        END as ScoreComparison,
+        AVG(a.Score) OVER (PARTITION BY q.Id) as AvgScoreOfAllAnswers,
+        RANK() OVER (ORDER BY q.Score DESC, q.CreationDate ASC) as QuestionRank,
+        PERCENT_RANK() OVER (ORDER BY q.Score) as ScorePercentile,
+        -- replace ordered-set percentile_cont with an approximation: compute median using windowed row_number per question
+        (
+          SELECT AVG(t.score)
+          FROM (
+            SELECT p2.Score as score,
+                   ROW_NUMBER() OVER (PARTITION BY p2.ParentId ORDER BY p2.Score, p2.CreationDate) as rn_asc,
+                   ROW_NUMBER() OVER (PARTITION BY p2.ParentId ORDER BY p2.Score DESC, p2.CreationDate DESC) as rn_desc,
+                   COUNT(*) OVER (PARTITION BY p2.ParentId) as cnt
+            FROM Posts p2
+            WHERE p2.ParentId = q.Id AND p2.PostTypeId = 2
+          ) t
+          WHERE t.rn_asc = t.rn_desc OR t.rn_asc = t.rn_desc + 1 OR t.rn_desc = t.rn_asc + 1
+        ) as MedianScoreOfAnswers
+    FROM Posts q
+    LEFT JOIN AnswerRankings a ON q.Id = a.ParentId AND a.AnswerRank = 1
+    WHERE q.PostTypeId = 1
+    AND a.Score IS NOT NULL
+),
+UserPerformanceMetrics AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.Views,
+        uas.UpVotes,
+        uas.DownVotes,
+        uas.TotalPosts,
+        uas.Questions,
+        uas.Answers,
+        uas.Comments,
+        uas.Badges,
+        uas.LastPostDate,
+        uas.LastCommentDate,
+        uas.LastBadgeDate,
+        uas.TotalQuestionScore,
+        uas.TotalAnswerScore,
+        uas.AvgQuestionScore,
+        uas.AvgAnswerScore,
+        CASE 
+            WHEN uas.TotalPosts > 0 THEN (uas.Answers * 100.0 / uas.TotalPosts)
+            ELSE 0 
+        END as AnswerPercentage,
+        CASE 
+            WHEN uas.Questions > 0 THEN uas.TotalAnswerScore / uas.Questions
+            ELSE 0 
+        END as AvgAnswerScorePerQuestion,
+        ROW_NUMBER() OVER (ORDER BY uas.Reputation DESC, uas.Views DESC) as ReputationRank,
+        RANK() OVER (ORDER BY uas.TotalPosts DESC) as ActivityRank,
+        DENSE_RANK() OVER (ORDER BY uas.Badges DESC) as BadgeRank
+    FROM UserActivityStats uas
+)
+SELECT 
+    qwa.QuestionId,
+    qwa.Title,
+    qwa.QuestionScore,
+    qwa.ViewCount,
+    qwa.AnswerCount,
+    qwa.CommentCount,
+    qwa.Tags,
+    qwa.OwnerUserId,
+    qwa.BestAnswerId,
+    qwa.BestAnswerScore,
+    qwa.BestAnswerCreationDate,
+    qwa.ScoreComparison,
+    qwa.AvgScoreOfAllAnswers,
+    qwa.QuestionRank,
+    qwa.ScorePercentile,
+    qwa.MedianScoreOfAnswers,
+    upm.UserId,
+    upm.DisplayName,
+    upm.Reputation,
+    upm.Views,
+    upm.UpVotes,
+    upm.DownVotes,
+    upm.TotalPosts,
+    upm.Questions,
+    upm.Answers,
+    upm.Comments,
+    upm.Badges,
+    upm.LastPostDate,
+    upm.LastCommentDate,
+    upm.LastBadgeDate,
+    upm.TotalQuestionScore,
+    upm.TotalAnswerScore,
+    upm.AvgQuestionScore,
+    upm.AvgAnswerScore,
+    upm.AnswerPercentage,
+    upm.AvgAnswerScorePerQuestion,
+    upm.ReputationRank,
+    upm.ActivityRank,
+    upm.BadgeRank,
+    CASE 
+        WHEN upm.Reputation > 10000 AND upm.Answers > 100 THEN 'Top Contributor'
+        WHEN upm.Reputation > 5000 AND upm.Answers > 50 THEN 'Active Contributor'
+        WHEN upm.Reputation > 1000 THEN 'Regular Contributor'
+        ELSE 'New Contributor'
+    END as ContributionTier,
+    CASE 
+        WHEN qwa.ScoreComparison = 'Answer Higher' THEN 1
+        WHEN qwa.ScoreComparison = 'Score Equal' THEN 0
+        ELSE -1
+    END as ScoreComparisonIndicator,
+    ABS(qwa.QuestionScore - qwa.BestAnswerScore) as ScoreDifference,
+    COALESCE(STRING_AGG(SUBSTR(t.TagName, 1, 30), '; '), 'No Tags') as TagList,
+    CASE 
+        WHEN qwa.AnswerCount > 10 THEN 'Highly Active Question'
+        WHEN qwa.AnswerCount > 5 THEN 'Moderately Active Question'
+        WHEN qwa.AnswerCount > 0 THEN 'Low Active Question'
+        ELSE 'No Answers'
+    END as ActivityLevel,
+    ROW_NUMBER() OVER (PARTITION BY qwa.OwnerUserId ORDER BY qwa.QuestionScore DESC) as QuestionsPerUser,
+    DENSE_RANK() OVER (ORDER BY qwa.QuestionScore DESC) as OverallScoreRank
+FROM QuestionWithBestAnswer qwa
+JOIN UserPerformanceMetrics upm ON qwa.OwnerUserId = upm.UserId
+LEFT JOIN (
+    SELECT 
+        p.Id as PostId,
+        t.TagName
+    FROM Posts p
+    JOIN (
+        SELECT 
+            Id,
+            UNNEST(STRING_TO_ARRAY(SUBSTR(Tags, 2, LENGTH(Tags)-2), '><')) as TagName
+        FROM Posts 
+        WHERE Tags IS NOT NULL AND Tags != ''
+    ) t ON p.Id = t.Id
+) t ON qwa.QuestionId = t.PostId
+WHERE qwa.QuestionScore > 0
+AND qwa.ViewCount > 0
+AND qwa.Tags IS NOT NULL
+AND qwa.Tags != ''
+AND upm.Reputation > 0
+AND (upm.TotalPosts > 0 OR upm.Answers > 0 OR upm.Comments > 0 OR upm.Badges > 0)
+GROUP BY 
+    qwa.QuestionId,
+    qwa.Title,
+    qwa.QuestionScore,
+    qwa.ViewCount,
+    qwa.AnswerCount,
+    qwa.CommentCount,
+    qwa.Tags,
+    qwa.OwnerUserId,
+    qwa.BestAnswerId,
+    qwa.BestAnswerScore,
+    qwa.BestAnswerCreationDate,
+    qwa.ScoreComparison,
+    qwa.AvgScoreOfAllAnswers,
+    qwa.QuestionRank,
+    qwa.ScorePercentile,
+    qwa.MedianScoreOfAnswers,
+    upm.UserId,
+    upm.DisplayName,
+    upm.Reputation,
+    upm.Views,
+    upm.UpVotes,
+    upm.DownVotes,
+    upm.TotalPosts,
+    upm.Questions,
+    upm.Answers,
+    upm.Comments,
+    upm.Badges,
+    upm.LastPostDate,
+    upm.LastCommentDate,
+    upm.LastBadgeDate,
+    upm.TotalQuestionScore,
+    upm.TotalAnswerScore,
+    upm.AvgQuestionScore,
+    upm.AvgAnswerScore,
+    upm.AnswerPercentage,
+    upm.AvgAnswerScorePerQuestion,
+    upm.ReputationRank,
+    upm.ActivityRank,
+    upm.BadgeRank
+HAVING 
+    COUNT(*) > 0
+    AND COUNT(qwa.QuestionId) > 1
+    AND (MAX(upm.Reputation) > 1000 OR MAX(upm.TotalPosts) > 10)
+ORDER BY 
+    qwa.QuestionScore DESC,
+    qwa.ViewCount DESC,
+    upm.Reputation DESC,
+    upm.TotalPosts DESC
+LIMIT 1000 OFFSET 0;

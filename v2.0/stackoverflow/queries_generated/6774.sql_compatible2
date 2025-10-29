@@ -1,0 +1,50 @@
+SELECT 
+    u.DisplayName,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    SUM(CASE WHEN p.ViewCount > 1000 THEN 1 ELSE 0 END) AS PopularPosts,
+    COUNT(DISTINCT v.PostId) AS TotalVotes,
+    COUNT(DISTINCT CASE WHEN b.TagBased = 0 THEN b.Id ELSE NULL END) AS NamedBadges,
+    COUNT(DISTINCT CASE WHEN b.TagBased = 1 THEN b.Id ELSE NULL END) AS TagBadges,
+    MAX(u.Reputation) AS MaxReputation,
+    AVG(u.Views) AS AvgViews,
+    MIN(p.LastActivityDate) AS FirstActivityDate,
+    (
+        SELECT COUNT(*) 
+        FROM PostLinks pl2
+        WHERE pl2.PostId = p.Id AND pl2.LinkTypeId = 3
+    ) AS DuplicateCount,
+    (
+        SELECT STRING_AGG(DISTINCT t.TagName, ', ')
+        FROM Tags t
+        WHERE t.Id IN (
+            SELECT pt2.TagId 
+            FROM PostTags pt2 
+            WHERE pt2.PostId = p.Id
+        )
+    ) AS TagsList
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    PostLinks pl ON p.Id = pl.PostId
+LEFT JOIN 
+    PostTags pt ON p.Id = pt.PostId
+WHERE 
+    u.Id IS NOT NULL
+GROUP BY 
+    u.DisplayName,
+    u.Reputation,
+    u.Views,
+    p.LastActivityDate,
+    p.Id
+HAVING 
+    COUNT(DISTINCT p.Id) > 100
+ORDER BY 
+    TotalPosts DESC;

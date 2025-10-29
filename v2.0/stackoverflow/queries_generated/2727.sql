@@ -1,0 +1,191 @@
+-- {"query": "2727.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1739} 
+
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        1 AS Level,
+        ARRAY[t.TagName] AS Ancestry
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0
+
+    UNION ALL
+
+    SELECT
+        c.Id,
+        c.TagName,
+        p.Level + 1,
+        p.Ancestry || c.TagName
+    FROM Tags c
+    JOIN RecursiveTagHierarchy p ON c.WikiPostId = p.Id
+    WHERE c.IsModeratorOnly = 0 AND c.Id <> ALL(p.Ancestry)
+),
+UserPostStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COALESCE(SUM(p.Score),0) AS TotalScore,
+        COALESCE(MAX(p.CreationDate), u.CreationDate) AS LastPostDate,
+        ROW_NUMBER() OVER (ORDER BY COALESCE(SUM(p.Score),0) DESC, u.Reputation DESC) AS ScoreRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.CreationDate >= u.CreationDate
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+TopActiveQuestions AS (
+    SELECT
+        q.Id,
+        q.Title,
+        q.OwnerUserId,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.Tags,
+        ROW_NUMBER() OVER (PARTITION BY q.OwnerUserId ORDER BY q.Score DESC, q.CreationDate DESC) AS RankPerUser
+    FROM Posts q
+    WHERE q.PostTypeId = 1
+),
+LatestPostEdits AS (
+    SELECT DISTINCT ON (ph.PostId)
+        ph.PostId,
+        ph.CreationDate AS EditDate,
+        ph.UserId AS EditorUserId,
+        ph.UserDisplayName AS EditorName,
+        ph.PostHistoryTypeId,
+        ph.Comment,
+        ph.Text
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4,5,6,10,11)
+    ORDER BY ph.PostId, ph.CreationDate DESC
+),
+AnswerVotesSummary AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        COUNT(DISTINCT v.UserId) AS UniqueVoters
+    FROM Posts a
+    LEFT JOIN Votes v ON v.PostId = a.Id
+    WHERE a.PostTypeId = 2
+    GROUP BY a.Id, a.ParentId
+),
+DuplicateLinks AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate,
+        lt.Name AS LinkTypeName
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    WHERE lt.Name = 'Duplicate'
+),
+UserBadgeRanks AS (
+    SELECT
+        b.UserId,
+        b.Class,
+        COUNT(*) AS BadgeCount,
+        RANK() OVER (PARTITION BY b.Class ORDER BY COUNT(*) DESC) AS ClassRank
+    FROM Badges b
+    WHERE b.Date >= CURRENT_DATE - INTERVAL '1 year'
+    GROUP BY b.UserId, b.Class
+),
+UserCombinedRank AS (
+    SELECT
+        ups.UserId,
+        ups.DisplayName,
+        ups.QuestionCount,
+        ups.AnswerCount,
+        ups.TotalScore,
+        COALESCE(ubr.Gold,0) AS GoldBadges,
+        COALESCE(ubr.Silver,0) AS SilverBadges,
+        COALESCE(ubr.Bronze,0) AS BronzeBadges,
+        ups.ScoreRank,
+        (1000 * ups.TotalScore) + (500 * COALESCE(ubr.Gold,0)) + (100 * COALESCE(ubr.Silver,0)) + (10 * COALESCE(ubr.Bronze,0)) AS CompositeScore
+    FROM UserPostStats ups
+    LEFT JOIN (
+        SELECT
+            ub.UserId,
+            MAX(CASE WHEN ub.Class = 1 THEN ub.BadgeCount ELSE 0 END) AS Gold,
+            MAX(CASE WHEN ub.Class = 2 THEN ub.BadgeCount ELSE 0 END) AS Silver,
+            MAX(CASE WHEN ub.Class = 3 THEN ub.BadgeCount ELSE 0 END) AS Bronze
+        FROM UserBadgeRanks ub
+        GROUP BY ub.UserId
+    ) ubr ON ubr.UserId = ups.UserId
+),
+AnswersWithHighNegativeScore AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.OwnerUserId,
+        a.Score,
+        avs.UpVotes,
+        avs.DownVotes,
+        avs.UniqueVoters,
+        u.DisplayName AS AnswerOwnerName,
+        q.Title AS QuestionTitle,
+        q.OwnerUserId AS QuestionOwnerId,
+        q.Score AS QuestionScore
+    FROM Posts a
+    JOIN AnswerVotesSummary avs ON a.Id = avs.AnswerId
+    JOIN Posts q ON q.Id = a.ParentId
+    LEFT JOIN Users u ON u.Id = a.OwnerUserId
+    WHERE a.PostTypeId = 2
+      AND a.Score < -5
+      AND avs.DownVotes > avs.UpVotes
+),
+FinalResults AS (
+    SELECT
+        ucr.UserId,
+        ucr.DisplayName,
+        ucr.QuestionCount,
+        ucr.AnswerCount,
+        ucr.TotalScore,
+        ucr.GoldBadges,
+        ucr.SilverBadges,
+        ucr.BronzeBadges,
+        ucr.CompositeScore,
+        COUNT(DISTINCT q.Id) AS OpenQuestionsCount,
+        COUNT(DISTINCT dq.AnswerId) AS NegativelyScoredAnswers,
+        MAX(COALESCE(le.EditDate, '-infinity'::timestamp)) AS LastEditDate,
+        STRING_AGG(DISTINCT rt.TagName, ',' ORDER BY rt.TagName) FILTER (WHERE rt.TagName IS NOT NULL) AS AccessibleTags,
+        COUNT(DISTINCT dl.PostId) AS DuplicateLinkCount
+    FROM UserCombinedRank ucr
+    LEFT JOIN Posts q ON q.OwnerUserId = ucr.UserId AND q.PostTypeId = 1 AND q.ClosedDate IS NULL
+    LEFT JOIN AnswersWithHighNegativeScore dq ON dq.AnswerOwnerName = ucr.DisplayName
+    LEFT JOIN LatestPostEdits le ON le.EditorUserId = ucr.UserId
+    LEFT JOIN RecursiveTagHierarchy rt ON rt.Id = ANY(
+        ARRAY(
+            SELECT DISTINCT UNNEST(string_to_array(
+                regexp_replace(q.Tags, '[<>]', ' ' , 'g'), ' ')
+            )::int
+        )
+    )
+    LEFT JOIN DuplicateLinks dl ON dl.PostId = q.Id
+    GROUP BY ucr.UserId, ucr.DisplayName, ucr.QuestionCount, ucr.AnswerCount, ucr.TotalScore, ucr.GoldBadges, ucr.SilverBadges, ucr.BronzeBadges, ucr.CompositeScore
+)
+SELECT
+    fr.UserId,
+    fr.DisplayName,
+    fr.QuestionCount,
+    fr.AnswerCount,
+    fr.TotalScore,
+    fr.GoldBadges,
+    fr.SilverBadges,
+    fr.BronzeBadges,
+    fr.CompositeScore,
+    fr.OpenQuestionsCount,
+    fr.NegativelyScoredAnswers,
+    fr.LastEditDate,
+    fr.AccessibleTags,
+    fr.DuplicateLinkCount,
+    CASE
+        WHEN fr.NegativelyScoredAnswers > 10 THEN 'High Negative Impact'
+        WHEN fr.OpenQuestionsCount > 50 THEN 'Highly Active'
+        ELSE 'Moderate User'
+    END AS UserPerformanceCategory
+FROM FinalResults fr
+WHERE fr.CompositeScore > 5000
+ORDER BY fr.CompositeScore DESC, fr.GoldBadges DESC, fr.LastEditDate DESC
+LIMIT 100;

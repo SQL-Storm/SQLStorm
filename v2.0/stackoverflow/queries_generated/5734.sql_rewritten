@@ -1,0 +1,127 @@
+-- {"query": "5734.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 981} 
+WITH
+RecentActivePosts AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.ContentLicense,
+    p.OwnerDisplayName,
+    p.LastEditorDisplayName,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    COALESCE(p.AcceptedAnswerId, -1) AS AcceptedAnswerId
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId IN (1,2) -- questions and answers
+    AND p.LastActivityDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+),
+TopTags AS (
+  SELECT
+    t.TagName,
+    t.Count,
+    ROW_NUMBER() OVER (ORDER BY t.Count DESC, t.TagName) AS rn
+  FROM Tags t
+  WHERE t.IsModeratorOnly = 0 AND t.TagName IS NOT NULL
+),
+TagScore AS (
+  SELECT
+    nt.TagName,
+    nt.Count AS TagCount,
+    COALESCE(COUNT(v.Id),0) AS VotesOnTag
+  FROM TopTags nt
+  LEFT JOIN Posts p ON p.Tags LIKE '%' || '<' || nt.TagName || '>' || '%' -- rough match for tag in Tags field
+  LEFT JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId = 2
+  GROUP BY nt.TagName, nt.Count
+),
+ComplexQuery AS (
+  SELECT
+    rap.Id AS PostId,
+    rap.Title,
+    rap.PostTypeId,
+    rap.OwnerUserId,
+    rap.OwnerDisplayName,
+    rap.LastEditorDisplayName,
+    rap.CreationDate,
+    rap.LastActivityDate,
+    rap.Score,
+    rap.ViewCount,
+    rap.Tags,
+    rap.AnswerCount,
+    rap.CommentCount,
+    rap.FavoriteCount,
+    rap.AcceptedAnswerId,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY rap.Id) AS UpvotesOnPost,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) OVER (PARTITION BY rap.Id) AS DownvotesOnPost,
+    CASE
+      WHEN rap.PostTypeId = 1 THEN 'Question'
+      WHEN rap.PostTypeId = 2 THEN 'Answer'
+      ELSE 'Other'
+    END AS PostKind,
+    (SELECT ARRAY_AGG(t.TagName) FROM UNNEST(string_to_array(rap.Tags, ',') ) AS t(TagName)) AS TagList
+  FROM RecentActivePosts rap
+  LEFT JOIN Votes v ON v.PostId = rap.Id
+),
+PerTagAnalytics AS (
+  SELECT
+    ct.TagName,
+    COUNT(*) AS PostCount,
+    SUM(pk.UpvotesOnPost) AS SumUpvotes,
+    SUM(pk.DownvotesOnPost) AS SumDownvotes,
+    AVG(pk.Score) AS AvgScore,
+    MAX(pk.ViewCount) AS MaxViews
+  FROM (
+    SELECT
+      UNNEST(string_to_array(rap.Tags, '><')) AS TagName,
+      rap.*
+    FROM ComplexQuery rap
+  ) AS ct
+  LEFT JOIN ComplexQuery pk ON pk.Id = ct.Id
+  GROUP BY ct.TagName
+),
+FinalBridge AS (
+  SELECT
+    pq.PostId,
+    pq.Title,
+    pq.PostTypeId,
+    pq.OwnerUserId,
+    uq.DisplayName AS OwnerDisplayName,
+    pq.LastActivityDate,
+    pq.Score,
+    pq.ViewCount,
+    pq.Tags,
+    pq.AcceptedAnswerId,
+    pt.TagName,
+    pa.SumUpvotes,
+    pa.SumDownvotes,
+    pa.AvgScore
+  FROM ComplexQuery pq
+  LEFT JOIN (SELECT TagName, SUM(1) AS dummy FROM PerTagAnalytics GROUP BY TagName) AS t ON TRUE
+  LEFT JOIN PerTagAnalytics pa ON pa.TagName = (SELECT TagName FROM (VALUES (UNNEST(string_to_array(pq.Tags, '><')))) AS x(TagName))
+  LEFT JOIN Users uq ON pq.OwnerUserId = uq.Id
+)
+SELECT
+  fb.PostId,
+  fb.Title,
+  fb.PostTypeId,
+  fb.OwnerUserId,
+  fb.OwnerDisplayName,
+  fb.LastActivityDate,
+  fb.Score,
+  fb.ViewCount,
+  fb.Tags,
+  fb.AcceptedAnswerId,
+  fb.TagName,
+  fb.SumUpvotes,
+  fb.SumDownvotes,
+  fb.AvgScore
+FROM FinalBridge fb
+ORDER BY fb.LastActivityDate DESC
+LIMIT 100;

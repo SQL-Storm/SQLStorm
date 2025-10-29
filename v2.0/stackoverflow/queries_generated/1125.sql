@@ -1,0 +1,190 @@
+-- {"query": "1125.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3063} 
+
+WITH UserEngagementStats AS (
+    -- Aggregates user-level metrics: total posts, comments, received votes, and badge counts
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.UpVotes AS UserUpVotesGiven, -- Upvotes given by the user
+        u.DownVotes AS UserDownVotesGiven, -- Downvotes given by the user
+        COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswersOwned,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        -- Sum upvotes and downvotes received on *any* of the user's posts
+        SUM(CASE WHEN vp.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesReceivedOnPosts,
+        SUM(CASE WHEN vp.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesReceivedOnPosts,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    -- Join to Votes to count votes received on posts owned by the user
+    LEFT JOIN Votes vp ON p.Id = vp.PostId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.Reputation, u.CreationDate, u.UpVotes, u.DownVotes
+),
+PostComplexMetrics AS (
+    -- Calculates various performance and activity metrics for individual posts (Questions and Answers)
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.ParentId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.LastActivityDate,
+        p.ClosedDate,
+        p.AcceptedAnswerId,
+        p.Tags,
+        COALESCE(AVG(c.Score), 0) AS AvgCommentScore,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalPostUpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalPostDownVotes,
+        -- Count distinct users who edited this post (excluding the owner if possible, but schema doesn't differentiate easily here)
+        COUNT(DISTINCT ph.UserId) AS DistinctEditorsCount,
+        -- Find the last edit date based on PostHistory entries for edits
+        MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9)) AS LastEditHistoryDate,
+        -- Calculate the age of the post's last activity in days
+        COALESCE(EXTRACT(EPOCH FROM (NOW() - p.LastActivityDate)) / 86400, 0) AS DaysSinceLastActivity,
+        -- String processing for tags: count the number of tags on a post
+        ARRAY_LENGTH(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><'), 1) AS NumberOfTags
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    WHERE p.PostTypeId IN (1, 2) -- Focus only on Questions (1) and Answers (2)
+    GROUP BY
+        p.Id, p.PostTypeId, p.OwnerUserId, p.ParentId, p.CreationDate, p.Score, p.ViewCount,
+        p.AnswerCount, p.FavoriteCount, p.LastActivityDate, p.ClosedDate, p.AcceptedAnswerId, p.Tags
+),
+UserPostAggregates AS (
+    -- Aggregates post-related metrics for each user, including correlated subqueries and complex calculations
+    SELECT
+        ues.UserId,
+        ues.Reputation,
+        ues.TotalPostsOwned,
+        ues.TotalAnswersOwned,
+        ues.TotalCommentsMade,
+        ues.GoldBadges,
+        ues.SilverBadges,
+        ues.BronzeBadges,
+        ues.TotalUpVotesReceivedOnPosts,
+        ues.TotalDownVotesReceivedOnPosts,
+        SUM(CASE WHEN pcm.PostTypeId = 1 THEN pcm.PostScore ELSE 0 END) AS TotalQuestionScore,
+        SUM(CASE WHEN pcm.PostTypeId = 2 THEN pcm.PostScore ELSE 0 END) AS TotalAnswerScore,
+        SUM(CASE WHEN pcm.PostTypeId = 1 THEN pcm.ViewCount ELSE 0 END) AS TotalQuestionViewCount,
+        -- Count questions owned by the user that have an accepted answer
+        COUNT(DISTINCT CASE WHEN pcm.PostTypeId = 1 AND pcm.AcceptedAnswerId IS NOT NULL THEN pcm.Id END) AS QuestionsWithAcceptedAnswer,
+        -- Count answers owned by the user that were accepted for a question
+        COUNT(DISTINCT CASE WHEN pcm.PostTypeId = 2 AND pcm.Id = q.AcceptedAnswerId THEN pcm.Id END) AS AcceptedAnswersCount,
+        -- Correlated subquery to find the user's most active tag based on their questions' tags and scores
+        (
+            SELECT t.TagName
+            FROM Posts sqp
+            JOIN UNNEST(string_to_array(SUBSTRING(sqp.Tags FROM 2 FOR LENGTH(sqp.Tags) - 2), '><')) AS t(TagName)
+            WHERE sqp.OwnerUserId = ues.UserId
+              AND sqp.PostTypeId = 1
+              AND sqp.Tags IS NOT NULL
+            GROUP BY t.TagName
+            ORDER BY COUNT(sqp.Id) DESC, SUM(sqp.Score) DESC
+            LIMIT 1
+        ) AS MostActiveTag,
+        AVG(pcm.AvgCommentScore) AS AvgUserPostCommentScore,
+        MAX(pcm.DaysSinceLastActivity) AS MaxDaysSinceUserPostActivity
+    FROM UserEngagementStats ues
+    LEFT JOIN PostComplexMetrics pcm ON ues.UserId = pcm.OwnerUserId
+    -- Join to Posts again (q) to check if an answer (pcm) is an AcceptedAnswer of a question (q)
+    LEFT JOIN Posts q ON pcm.ParentId = q.Id AND pcm.PostTypeId = 2
+    GROUP BY
+        ues.UserId, ues.Reputation, ues.TotalPostsOwned, ues.TotalAnswersOwned, ues.TotalCommentsMade,
+        ues.GoldBadges, ues.SilverBadges, ues.BronzeBadges, ues.TotalUpVotesReceivedOnPosts, ues.TotalDownVotesReceivedOnPosts
+),
+RankedUsers AS (
+    -- Applies window functions to rank users based on various criteria
+    SELECT
+        upa.*,
+        ROW_NUMBER() OVER (ORDER BY upa.Reputation DESC, upa.TotalUpVotesReceivedOnPosts DESC, upa.AcceptedAnswersCount DESC) AS OverallUserRank,
+        RANK() OVER (PARTITION BY (upa.Reputation > 100000) ORDER BY upa.TotalQuestionScore DESC) AS HighRepQuestionScoreRank,
+        NTILE(10) OVER (ORDER BY upa.TotalAnswerScore DESC) AS AnswerScoreDecile, -- Divides users into 10 groups by answer score
+        -- Calculate Up/Down Vote Ratio, handling division by zero with NULLIF and NULL logic
+        (upa.TotalUpVotesReceivedOnPosts * 1.0 / NULLIF(upa.TotalDownVotesReceivedOnPosts, 0)) AS UpDownVoteRatio,
+        -- Compare reputation with the next highest-reputation user
+        LEAD(upa.Reputation, 1) OVER (ORDER BY upa.Reputation DESC) AS NextHighestReputation
+    FROM UserPostAggregates upa
+    WHERE upa.TotalPostsOwned > 0 OR upa.TotalCommentsMade > 0 OR upa.GoldBadges > 0 OR upa.SilverBadges > 0
+),
+RecentPostLinkAnalysis AS (
+    -- Analyzes recent post links for owners of posts created in the last year
+    SELECT
+        p.OwnerUserId AS LinkedPostOwnerId,
+        COUNT(DISTINCT pl.RelatedPostId) AS TotalLinkedPostsCount,
+        COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN pl.RelatedPostId END) AS TotalDuplicateLinkedPosts,
+        SUM(COALESCE(pr.Score, 0)) AS SumRelatedPostScores,
+        AVG(EXTRACT(EPOCH FROM (NOW() - pr.CreationDate)) / 86400) AS AvgAgeOfRelatedPostsInDays
+    FROM Posts p
+    JOIN PostLinks pl ON p.Id = pl.PostId
+    LEFT JOIN Posts pr ON pl.RelatedPostId = pr.Id
+    WHERE p.CreationDate >= NOW() - INTERVAL '1 year' -- Only consider recent posts for link analysis
+      AND p.OwnerUserId IS NOT NULL -- Exclude community/deleted users
+    GROUP BY p.OwnerUserId
+)
+-- Final selection and presentation of "Power Users"
+SELECT
+    ru.UserId,
+    u.DisplayName,
+    ru.Reputation,
+    ru.OverallUserRank,
+    ru.HighRepQuestionScoreRank,
+    ru.AnswerScoreDecile,
+    ru.TotalPostsOwned,
+    ru.TotalAnswersOwned,
+    ru.TotalCommentsMade,
+    ru.GoldBadges,
+    ru.SilverBadges,
+    ru.BronzeBadges,
+    -- Handle NULL ratio gracefully
+    COALESCE(ru.UpDownVoteRatio, 0.0) AS UpDownVoteRatio,
+    ru.MostActiveTag,
+    ru.TotalQuestionScore,
+    ru.TotalAnswerScore,
+    ru.TotalQuestionViewCount,
+    ru.AcceptedAnswersCount,
+    ru.AvgUserPostCommentScore,
+    ru.MaxDaysSinceUserPostActivity,
+    COALESCE(rpla.TotalLinkedPostsCount, 0) AS UserTotalLinkedPostsCount,
+    COALESCE(rpla.TotalDuplicateLinkedPosts, 0) AS UserTotalDuplicateLinkedPosts,
+    COALESCE(rpla.SumRelatedPostScores, 0) AS UserSumRelatedPostScores,
+    rpla.AvgAgeOfRelatedPostsInDays,
+    -- Categorize users into segments based on a complex set of criteria
+    CASE
+        WHEN ru.Reputation > 75000 AND ru.GoldBadges >= 3 AND ru.AcceptedAnswersCount >= 20 THEN 'Elite Contributor'
+        WHEN ru.Reputation > 25000 AND ru.TotalPostsOwned >= 100 AND ru.TotalCommentsMade >= 200 AND ru.UpDownVoteRatio > 3.0 THEN 'Highly Engaged Authority'
+        WHEN ru.Reputation > 5000 AND ru.TotalAnswersOwned >= 50 AND ru.UpDownVoteRatio > 1.5 AND COALESCE(rpla.TotalLinkedPostsCount, 0) > 5 THEN 'Valuable Interlinker'
+        WHEN ru.Reputation BETWEEN 1000 AND 5000 AND ru.TotalPostsOwned >= 20 AND ru.TotalCommentsMade >= 50 THEN 'Active Community Member'
+        WHEN ru.TotalPostsOwned = 0 AND ru.TotalCommentsMade > 0 AND ru.GoldBadges = 0 AND ru.SilverBadges = 0 THEN 'Commentator & Reviewer'
+        ELSE 'General Participant'
+    END AS UserSegment,
+    -- A composite score integrating various aspects, with NULL handling and weighted values
+    COALESCE(
+        (ru.TotalQuestionScore * 0.35 + ru.TotalAnswerScore * 0.45 + ru.TotalUpVotesReceivedOnPosts * 0.1) /
+        NULLIF(ru.TotalPostsOwned + ru.TotalAnswersOwned + ru.TotalCommentsMade, 0) *
+        (1 + COALESCE(rpla.TotalLinkedPostsCount, 0) * 0.05 + COALESCE(ru.GoldBadges, 0) * 0.1),
+        0.0
+    ) AS WeightedContributionScore
+FROM RankedUsers ru
+LEFT JOIN Users u ON ru.UserId = u.Id -- Join back to Users for DisplayName
+LEFT JOIN RecentPostLinkAnalysis rpla ON ru.UserId = rpla.LinkedPostOwnerId
+WHERE
+    ru.Reputation >= 500 -- Minimum reputation for consideration
+    AND (ru.TotalPostsOwned > 0 OR ru.TotalCommentsMade > 0 OR ru.GoldBadges > 0 OR ru.SilverBadges > 0)
+    AND ru.MaxDaysSinceUserPostActivity < 730 -- Active within the last two years based on posts
+    AND u.DisplayName IS NOT NULL -- Exclude users without a display name
+ORDER BY
+    ru.OverallUserRank ASC,
+    WeightedContributionScore DESC,
+    ru.Reputation DESC
+LIMIT 1000;

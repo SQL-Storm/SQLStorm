@@ -1,0 +1,386 @@
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        u.location,
+        coalesce(nullif(trim(u.websiteurl), ''), 'N/A') as websiteurl,
+        row_number() over (order by u.creationdate desc, u.id desc) as rn
+    from users u
+),
+active_questions as (
+    select
+        p.id as question_id,
+        p.creationdate,
+        p.title,
+        p.owneruserid,
+        p.score,
+        p.viewcount,
+        p.answercount,
+        p.closeddate,
+        p.tags
+    from posts p
+    where p.posttypeid = 1
+      and p.creationdate >= (select date_trunc('month', max(creationdate)) - interval '6 months' from posts where posttypeid = 1)
+),
+answerers as (
+    select
+        a.parentid as question_id,
+        a.owneruserid as answerer_id,
+        max(a.score) as max_answer_score,
+        count(*) as answers_count
+    from posts a
+    where a.posttypeid = 2
+    group by a.parentid, a.owneruserid
+),
+votes_agg as (
+    select
+        v.postid,
+        sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+        sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+        sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+        count(*) as total_votes
+    from votes v
+    group by v.postid
+),
+tag_expansion as (
+    select
+        q.question_id,
+        unnest(string_to_array(substring(q.tags, 2, length(q.tags)-2), '><')) as tagname
+    from active_questions q
+    where q.tags is not null and q.tags like '<%>'
+),
+top_tags as (
+    select
+        te.tagname,
+        count(distinct te.question_id) as questions_with_tag
+    from tag_expansion te
+    group by te.tagname
+    having count(distinct te.question_id) > 5
+),
+user_badge_scores as (
+    select
+        b.userid,
+        sum(case b.class when 1 then 5 when 2 then 2 when 3 then 1 else 0 end) as badge_score,
+        count(*) as badge_count,
+        sum(case when b.tagbased = true then 1 else 0 end) as tag_badges
+    from badges b
+    group by b.userid
+),
+post_history_flags as (
+    select
+        ph.postid,
+        max(case when ph.posthistorytypeid in (10,11,12,13,14,15,19,20,35,36,37,38) then 1 else 0 end) as has_moderation_events,
+        max(case when ph.posthistorytypeid = 10 then 1 else 0 end) as was_closed,
+        max(case when ph.posthistorytypeid = 11 then 1 else 0 end) as was_reopened,
+        max(case when ph.posthistorytypeid = 50 then 1 else 0 end) as community_bumped,
+        max(case when ph.posthistorytypeid in (52,53) then 1 else 0 end) as hot_network_event
+    from posthistory ph
+    group by ph.postid
+),
+dup_links as (
+    select
+        pl.postid as question_id,
+        count(*) filter (where pl.linktypeid = 3) as duplicate_refs,
+        count(*) filter (where pl.linktypeid = 1) as linked_refs
+    from postlinks pl
+    group by pl.postid
+),
+comment_sentiment as (
+    select
+        c.postid,
+        avg(case
+                when lower(c.text) like any (array['%thanks%','%great%','%good%','%nice%','%helpful%','%solved%']) then 1.0
+                when lower(c.text) like any (array['%bug%','%fail%','%bad%','%wrong%','%does not work%','%broken%']) then -1.0
+                else 0.0
+            end) as avg_sentiment,
+        count(*) as comments_count,
+        max(c.creationdate) as last_comment_at
+    from comments c
+    group by c.postid
+),
+question_metrics as (
+    select
+        q.question_id,
+        q.title,
+        q.creationdate,
+        q.owneruserid,
+        q.score,
+        q.viewcount,
+        q.answercount,
+        q.closeddate,
+        coalesce(va.upvotes,0) as upvotes,
+        coalesce(va.downvotes,0) as downvotes,
+        coalesce(va.favorites,0) as favorites,
+        coalesce(va.total_votes,0) as total_votes,
+        coalesce(dl.duplicate_refs,0) as duplicate_refs,
+        coalesce(dl.linked_refs,0) as linked_refs,
+        coalesce(ph.was_closed,0) as was_closed,
+        coalesce(ph.was_reopened,0) as was_reopened,
+        coalesce(ph.community_bumped,0) as community_bumped,
+        coalesce(ph.hot_network_event,0) as hot_network_event,
+        coalesce(cs.avg_sentiment,0.0) as avg_comment_sentiment,
+        coalesce(cs.comments_count,0) as comments_count,
+        cs.last_comment_at,
+        greatest(
+            coalesce(q.lastactivitydate, q.creationdate),
+            coalesce(cs.last_comment_at, q.creationdate),
+            q.creationdate
+        ) as last_engagement_at
+    from (
+        select
+            p.id as question_id,
+            p.title,
+            p.creationdate,
+            p.owneruserid,
+            p.score,
+            p.viewcount,
+            p.answercount,
+            p.closeddate,
+            p.lastactivitydate
+        from posts p
+        where p.posttypeid = 1
+    ) q
+    left join votes_agg va on va.postid = q.question_id
+    left join dup_links dl on dl.question_id = q.question_id
+    left join post_history_flags ph on ph.postid = q.question_id
+    left join comment_sentiment cs on cs.postid = q.question_id
+),
+owner_enriched as (
+    select
+        qm.*,
+        u.displayname as owner_displayname,
+        u.reputation as owner_reputation,
+        coalesce(ubs.badge_score,0) as owner_badge_score,
+        coalesce(ubs.badge_count,0) as owner_badge_count,
+        coalesce(ubs.tag_badges,0) as owner_tag_badges
+    from question_metrics qm
+    left join users u on u.id = qm.owneruserid
+    left join user_badge_scores ubs on ubs.userid = qm.owneruserid
+),
+tagged_questions as (
+    select
+        oe.question_id,
+        oe.title,
+        oe.creationdate,
+        oe.owneruserid,
+        oe.owner_displayname,
+        oe.owner_reputation,
+        oe.owner_badge_score,
+        oe.owner_badge_count,
+        oe.owner_tag_badges,
+        oe.score,
+        oe.viewcount,
+        oe.answercount,
+        oe.closeddate,
+        oe.upvotes,
+        oe.downvotes,
+        oe.favorites,
+        oe.total_votes,
+        oe.duplicate_refs,
+        oe.linked_refs,
+        oe.was_closed,
+        oe.was_reopened,
+        oe.community_bumped,
+        oe.hot_network_event,
+        oe.avg_comment_sentiment,
+        oe.comments_count,
+        oe.last_comment_at,
+        oe.last_engagement_at,
+        te.tagname
+    from owner_enriched oe
+    join tag_expansion te on te.question_id = oe.question_id
+),
+tag_rankings as (
+    select
+        tq.tagname,
+        tq.question_id,
+        tq.title,
+        tq.owneruserid,
+        tq.owner_displayname,
+        tq.owner_reputation,
+        tq.owner_badge_score,
+        tq.owner_badge_count,
+        tq.owner_tag_badges,
+        tq.score,
+        tq.viewcount,
+        tq.answercount,
+        tq.upvotes,
+        tq.downvotes,
+        tq.favorites,
+        tq.total_votes,
+        tq.duplicate_refs,
+        tq.linked_refs,
+        tq.was_closed,
+        tq.was_reopened,
+        tq.community_bumped,
+        tq.hot_network_event,
+        tq.avg_comment_sentiment,
+        tq.comments_count,
+        tq.last_engagement_at,
+        row_number() over (
+            partition by tq.tagname
+            order by
+                (tq.upvotes - tq.downvotes) * 2
+                + coalesce(tq.favorites,0)
+                + least(tq.viewcount, 10000) / 100
+                + greatest(tq.answercount,0) * 3
+                + case when tq.was_reopened = 1 then 2 else 0 end
+                + case when tq.hot_network_event = 1 then 5 else 0 end
+                + case when tq.duplicate_refs > 0 then -3 else 0 end
+                + (tq.avg_comment_sentiment * 2)
+                desc,
+                tq.last_engagement_at desc,
+                tq.question_id desc
+        ) as tag_rank
+    from tagged_questions tq
+),
+top_per_tag as (
+    select *
+    from tag_rankings tr
+    where tr.tag_rank <= 5
+),
+user_activity_window as (
+    select
+        u.id as user_id,
+        sum(case when p.posttypeid = 1 then 1 else 0 end) as q_count,
+        sum(case when p.posttypeid = 2 then 1 else 0 end) as a_count,
+        count(distinct date_trunc('day', p.creationdate)) as active_days,
+        max(p.creationdate) as last_post_at
+    from users u
+    left join posts p on p.owneruserid = u.id
+    group by u.id
+),
+final_scores as (
+    select
+        tpt.tagname,
+        tpt.question_id,
+        tpt.title,
+        tpt.owneruserid,
+        tpt.owner_displayname,
+        tpt.owner_reputation,
+        tpt.owner_badge_score,
+        tpt.owner_badge_count,
+        tpt.owner_tag_badges,
+        tpt.score as post_score,
+        tpt.viewcount,
+        tpt.answercount,
+        tpt.upvotes,
+        tpt.downvotes,
+        tpt.favorites,
+        tpt.total_votes,
+        tpt.duplicate_refs,
+        tpt.linked_refs,
+        tpt.was_closed,
+        tpt.was_reopened,
+        tpt.community_bumped,
+        tpt.hot_network_event,
+        tpt.avg_comment_sentiment,
+        tpt.comments_count,
+        coalesce(uaw.q_count,0) as user_q_count,
+        coalesce(uaw.a_count,0) as user_a_count,
+        coalesce(uaw.active_days,0) as user_active_days,
+        uaw.last_post_at,
+        tpt.tag_rank,
+        round(
+            (
+                (tpt.upvotes - tpt.downvotes) * 2
+                + coalesce(tpt.favorites,0)
+                + least(tpt.viewcount, 20000) / 200
+                + greatest(tpt.answercount,0) * 2
+                + coalesce(tpt.avg_comment_sentiment,0) * 3
+                + case when tpt.was_closed = 1 and tpt.was_reopened = 1 then 1 else 0 end
+                + case when tpt.hot_network_event = 1 then 5 else 0 end
+                - case when tpt.duplicate_refs > 0 then 2 else 0 end
+            )
+            * (1 + ln(1 + coalesce(nullif(tpt.owner_reputation,0),1)) / 10.0)
+            * (1 + coalesce(nullif(tpt.owner_badge_score,0),0) / 50.0)
+        , 2) as composite_score
+    from top_per_tag tpt
+    left join user_activity_window uaw on uaw.user_id = tpt.owneruserid
+),
+recent_dupe_activity as (
+    select
+        q.id as question_id,
+        count(*) filter (where pl.linktypeid = 3) as dup_in_last_90d
+    from posts q
+    left join postlinks pl
+        on pl.postid = q.id
+       and pl.linktypeid = 3
+       and pl.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '90 days'
+    where q.posttypeid = 1
+    group by q.id
+),
+correlated_metrics as (
+    select
+        f.*,
+        (select avg(a2.max_answer_score)
+         from answerers a2
+         where a2.question_id = f.question_id) as avg_top_answer_score,
+        (select count(*)
+         from comments c2
+         where c2.postid = f.question_id
+           and c2.creationdate >= f.last_post_at) as comments_after_last_user_post,
+        (select count(*) from tag_expansion te2 where te2.question_id = f.question_id) as tag_count
+    from final_scores f
+)
+select
+    cm.tagname,
+    cm.question_id,
+    cm.title,
+    cm.owneruserid,
+    coalesce(cm.owner_displayname, concat('user-', cast(cm.owneruserid as varchar))) as owner_displayname,
+    cm.owner_reputation,
+    cm.owner_badge_score,
+    cm.owner_badge_count,
+    cm.owner_tag_badges,
+    cm.post_score,
+    cm.viewcount,
+    cm.answercount,
+    cm.upvotes,
+    cm.downvotes,
+    cm.favorites,
+    cm.total_votes,
+    cm.duplicate_refs,
+    cm.linked_refs,
+    cm.was_closed,
+    cm.was_reopened,
+    cm.community_bumped,
+    cm.hot_network_event,
+    cm.avg_comment_sentiment,
+    cm.comments_count,
+    cm.user_q_count,
+    cm.user_a_count,
+    cm.user_active_days,
+    cm.last_post_at,
+    cm.tag_rank,
+    cm.composite_score,
+    coalesce(rda.dup_in_last_90d, 0) as dup_in_last_90d,
+    coalesce(cm.avg_top_answer_score, 0) as avg_top_answer_score,
+    coalesce(cm.comments_after_last_user_post, 0) as comments_after_last_user_post,
+    coalesce(cm.tag_count, 0) as tag_count,
+    case
+        when cm.composite_score >= percentile_disc(0.9) within group (order by cm.composite_score) over () then 'A'
+        when cm.composite_score >= percentile_disc(0.7) within group (order by cm.composite_score) over () then 'B'
+        when cm.composite_score >= percentile_disc(0.5) within group (order by cm.composite_score) over () then 'C'
+        else 'D'
+    end as perf_bucket
+from correlated_metrics cm
+left join recent_dupe_activity rda on rda.question_id = cm.question_id
+where
+    (
+        (cm.owner_reputation >= 1000 and cm.user_active_days >= 5)
+        or (cm.owner_badge_score >= 10 and coalesce(cm.avg_top_answer_score, 0) >= 2)
+        or (cm.hot_network_event = 1 and cm.viewcount > 1000)
+    )
+    and coalesce(cm.tag_count, 0) between 1 and 5
+    and not (cm.was_closed = 1 and cm.was_reopened = 0)
+    and (cm.duplicate_refs = 0 or cm.upvotes - cm.downvotes >= 5)
+order by
+    cm.perf_bucket,
+    cm.tagname,
+    cm.tag_rank,
+    cm.composite_score desc,
+    cm.question_id desc
+limit 500;

@@ -1,0 +1,115 @@
+WITH RankedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate AS PostCreationDate,
+        pt.Name AS PostTypeName,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS rn_score,
+        SUM(COALESCE(c.Score, 0)) OVER (PARTITION BY p.Id) AS TotalCommentScore,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+            ELSE 'Active'
+        END AS PostStatus,
+        u.DisplayName AS OwnerDisplayName,
+        u.Reputation AS OwnerReputation,
+        u.CreationDate AS UserCreationDate,
+        LEAST(p.ViewCount, COALESCE(p.AnswerCount, 0) * 1000, COALESCE(p.FavoriteCount, 0) * 5000) AS CalculatedMetric,
+        p.Tags,
+        p.Score,
+        p.ClosedDate,
+        p.CommunityOwnedDate,
+        u.DisplayName AS UserDisplayName_Dup,
+        u.Reputation AS UserReputation_Dup,
+        u.CreationDate AS UserCreationDate_Dup,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount
+    FROM Posts p
+    LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.OwnerUserId IS NOT NULL AND u.Id IS NOT NULL
+    GROUP BY
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate,
+        pt.Name,
+        p.Score,
+        p.ClosedDate,
+        p.CommunityOwnedDate,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.Tags
+),
+UserActivity AS (
+    SELECT
+        OwnerUserId AS UserId,
+        COUNT(Id) AS PostsCreated,
+        AVG(Score) AS AveragePostScore
+    FROM Posts
+    WHERE OwnerUserId IS NOT NULL
+    GROUP BY OwnerUserId
+),
+TagInfo AS (
+    SELECT
+        Tags,
+        COUNT(*) AS NumberOfQuestionsWithTag,
+        AVG(Score) AS AverageScoreForTag
+    FROM Posts
+    WHERE PostTypeId = 1 AND Tags IS NOT NULL
+    GROUP BY Tags
+)
+SELECT
+    rp.PostId,
+    rp.PostTypeName,
+    rp.Title,
+    rp.PostStatus,
+    rp.TotalCommentScore,
+    rp.CalculatedMetric,
+    rp.OwnerDisplayName,
+    rp.OwnerReputation,
+    rp.UserCreationDate,
+    ua.PostsCreated,
+    ua.AveragePostScore,
+    ti.NumberOfQuestionsWithTag,
+    ti.AverageScoreForTag,
+    (rp.OwnerReputation * (COALESCE(ua.PostsCreated, 0) + 1)) AS WeightedUserInfluence,
+    CASE
+        WHEN rp.PostCreationDate < (CAST('2024-10-01' AS date) - INTERVAL '365 days') AND rp.rn_score > 10 THEN 'Older, Less Popular'
+        WHEN rp.PostCreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '365 days') AND rp.rn_score <= 5 AND COALESCE(rp.TotalCommentScore, 0) > 0 THEN 'Recent, Popular, Commented'
+        ELSE 'Other'
+    END AS PerformanceCategory,
+    CASE
+        WHEN LOWER(rp.Title) LIKE '%performance%' OR LOWER(rp.Title) LIKE '%benchmark%' THEN 'Performance Related'
+        ELSE 'Other Topic'
+    END AS TopicIndicator,
+    u.DisplayName AS LastEditorName,
+    p.CreationDate AS PostHistoryDate,
+    ph.Comment AS PostHistoryComment,
+    ph.Text AS PostHistoryText,
+    COALESCE(p.AnswerCount, 0) AS PostAnswerCount,
+    COALESCE(p.CommentCount, 0) AS PostCommentCount
+FROM RankedPosts rp
+LEFT JOIN UserActivity ua ON rp.OwnerUserId = ua.UserId
+LEFT JOIN TagInfo ti ON rp.Tags = ti.Tags
+LEFT JOIN Posts p ON rp.PostId = p.Id
+LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId IN (4, 5, 6)
+LEFT JOIN Users u ON p.LastEditorUserId = u.Id
+WHERE rp.rn_score <= 10
+
+UNION ALL
+
+SELECT
+    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
+FROM Posts p
+WHERE p.Id NOT IN (SELECT PostId FROM RankedPosts)
+LIMIT 100;

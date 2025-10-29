@@ -1,0 +1,257 @@
+-- {"query": "738.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2775} 
+with recent_users as (
+    select u.id as user_id,
+           u.displayname,
+           u.reputation,
+           u.creationdate,
+           u.location,
+           u.websiteurl,
+           coalesce(nullif(trim(u.location), ''), 'Unknown') as norm_location,
+           date_trunc('month', u.creationdate) as signup_month,
+           row_number() over (partition by coalesce(nullif(trim(u.location), ''), 'Unknown') order by u.reputation desc, u.id) as rn_loc_rep
+    from users u
+    where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+questions as (
+    select p.id,
+           p.owneruserid,
+           p.creationdate,
+           p.score,
+           p.viewcount,
+           p.answercount,
+           p.favoritecount,
+           p.commentcount,
+           p.title,
+           p.tags,
+           p.closeddate,
+           p.acceptedanswerid,
+           p.lastactivitydate,
+           coalesce(p.viewcount, 0) as vc0,
+           case when p.closeddate is null then 0 else 1 end as is_closed
+    from posts p
+    where p.posttypeid = 1
+      and p.creationdate >= (select max(creationdate) - interval '365 days' from posts where posttypeid = 1)
+),
+answers as (
+    select a.id,
+           a.parentid as question_id,
+           a.owneruserid,
+           a.creationdate,
+           a.score,
+           row_number() over (partition by a.parentid order by a.score desc nulls last, a.creationdate asc, a.id) as rn_score,
+           rank() over (partition by a.parentid order by a.creationdate asc) as rk_first
+    from posts a
+    where a.posttypeid = 2
+),
+q_activity as (
+    select q.id as question_id,
+           q.owneruserid as q_owner_id,
+           q.creationdate as q_created,
+           q.score as q_score,
+           q.viewcount as q_views,
+           q.answercount as q_answers,
+           q.favoritecount as q_favs,
+           q.commentcount as q_comments,
+           q.title,
+           q.tags,
+           q.closeddate,
+           q.acceptedanswerid,
+           q.lastactivitydate,
+           coalesce(sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end), 0) as net_votes,
+           count(distinct case when v.votetypeid = 8 then v.userid end) as bounty_starters,
+           max(case when v.votetypeid = 9 then v.bountyamount end) as max_bounty_close,
+           count(distinct c.userid) as unique_commenters,
+           min(a.creationdate) as first_answer_time,
+           count(a.id) as total_answers,
+           count(distinct a.owneruserid) as unique_answerers
+    from questions q
+    left join votes v on v.postid = q.id and v.creationdate >= q.creationdate
+    left join comments c on c.postid = q.id
+    left join answers a on a.question_id = q.id
+    group by q.id, q.owneruserid, q.creationdate, q.score, q.viewcount, q.answercount, q.favoritecount, q.commentcount, q.title, q.tags, q.closeddate, q.acceptedanswerid, q.lastactivitydate
+),
+dup_links as (
+    select pl.postid as dup_post_id,
+           pl.relatedpostid as original_post_id,
+           pl.creationdate as dup_mark_date,
+           lt.name as link_type_name
+    from postlinks pl
+    join linktypes lt on lt.id = pl.linktypeid
+    where pl.linktypeid = 3
+),
+tag_explode as (
+    select q.question_id,
+           lower(trim(tg)) as tag
+    from q_activity qa
+    join questions q on q.id = qa.question_id
+    cross join lateral unnest(string_to_array(substring(q.tags from 2 for length(q.tags)-2), '><')) as tg
+),
+tag_stats as (
+    select te.tag,
+           count(*) as tag_q_cnt,
+           sum(case when qa.is_closed = 1 then 1 else 0 end) as tag_closed_cnt,
+           avg(qa.q_views::numeric) as avg_views,
+           avg(qa.q_score::numeric) as avg_q_score
+    from tag_explode te
+    join questions q on q.id = te.question_id
+    join q_activity qa on qa.question_id = te.question_id
+    group by te.tag
+),
+accepted_vs_top as (
+    select q.id as question_id,
+           q.acceptedanswerid,
+           a_top.id as top_answer_id,
+           a_top.score as top_answer_score,
+           a_acc.score as accepted_answer_score,
+           case
+               when q.acceptedanswerid is null then 'NoAccepted'
+               when q.acceptedanswerid = a_top.id then 'AcceptedIsTop'
+               when a_acc.score is null then 'AcceptedMissing'
+               when a_top.score is null then 'TopMissing'
+               when a_acc.score >= a_top.score then 'AcceptedNotWorse'
+               else 'AcceptedLowerScore'
+           end as accepted_vs_top_flag
+    from questions q
+    left join answers a_top on a_top.question_id = q.id and a_top.rn_score = 1
+    left join posts a_acc on a_acc.id = q.acceptedanswerid
+),
+first_answerers as (
+    select a.question_id,
+           a.owneruserid as first_answer_user_id
+    from answers a
+    where a.rk_first = 1
+),
+owner_badge_summary as (
+    select u.id as user_id,
+           count(*) filter (where b.class = 1) as gold_badges,
+           count(*) filter (where b.class = 2) as silver_badges,
+           count(*) filter (where b.class = 3) as bronze_badges,
+           count(*) as total_badges,
+           max(b.date) as last_badge_date
+    from users u
+    left join badges b on b.userid = u.id
+    group by u.id
+),
+close_reasons as (
+    select ph.postid as question_id,
+           max(ph.creationdate) filter (where ph.posthistorytypeid = 10) as closed_at,
+           max(case
+                   when ph.posthistorytypeid = 10 then
+                       nullif(regexp_replace(ph.comment, '[^0-9]', '', 'g'), '')
+               end) as raw_close_reason_code
+    from posthistory ph
+    where ph.posthistorytypeid in (10, 11)
+    group by ph.postid
+),
+user_post_mix as (
+    select u.id as user_id,
+           count(*) filter (where p.posttypeid = 1) as q_count,
+           count(*) filter (where p.posttypeid = 2) as a_count,
+           avg(nullif(p.score, 0)) as avg_nonzero_score,
+           avg(coalesce(p.viewcount, 0)) as avg_views_all_posts
+    from users u
+    left join posts p on p.owneruserid = u.id
+    group by u.id
+),
+monthly_user_activity as (
+    select u.id as user_id,
+           date_trunc('month', p.creationdate) as month_bucket,
+           count(*) as posts_in_month,
+           sum(case when p.posttypeid = 1 then 1 else 0 end) as questions_in_month,
+           sum(case when p.posttypeid = 2 then 1 else 0 end) as answers_in_month,
+           row_number() over (partition by u.id order by date_trunc('month', p.creationdate) desc) as rn_recent_month
+    from users u
+    join posts p on p.owneruserid = u.id
+    group by u.id, date_trunc('month', p.creationdate)
+),
+user_recent_pace as (
+    select m.user_id,
+           coalesce(sum(m.posts_in_month) filter (where m.rn_recent_month <= 3), 0) as posts_last_3_months,
+           coalesce(sum(m.questions_in_month) filter (where m.rn_recent_month <= 3), 0) as questions_last_3_months,
+           coalesce(sum(m.answers_in_month) filter (where m.rn_recent_month <= 3), 0) as answers_last_3_months
+    from monthly_user_activity m
+    group by m.user_id
+),
+question_quality as (
+    select qa.question_id,
+           qa.q_owner_id,
+           qa.q_views,
+           qa.q_score,
+           qa.net_votes,
+           qa.total_answers,
+           qa.unique_answerers,
+           qa.unique_commenters,
+           greatest(qa.q_views::numeric, 1) as views_nonzero,
+           (qa.q_score::numeric + qa.net_votes::numeric) as combined_score,
+           case
+             when qa.q_views is null or qa.q_views = 0 then null
+             else (qa.q_score::numeric + qa.net_votes::numeric) / qa.q_views::numeric
+           end as engagement_ratio,
+           percentile_disc(0.9) within group (order by qa.q_views) over () as p90_views_all
+    from q_activity qa
+),
+final as (
+    select
+        qa.question_id,
+        qa.q_owner_id,
+        coalesce(u.displayname, qa.title) as owner_or_title_hint,
+        u.reputation,
+        rs.norm_location,
+        rs.signup_month,
+        rs.rn_loc_rep,
+        u.views as user_profile_views,
+        ob.total_badges,
+        ob.gold_badges,
+        ob.silver_badges,
+        ob.bronze_badges,
+        upm.q_count,
+        upm.a_count,
+        urp.posts_last_3_months,
+        urp.questions_last_3_months,
+        urp.answers_last_3_months,
+        qa.q_views,
+        qa.q_score,
+        qa.net_votes,
+        qa.total_answers,
+        qa.unique_answerers,
+        qa.unique_commenters,
+        qq.combined_score,
+        qq.engagement_ratio,
+        case when qa.q_views >= qq.p90_views_all then 1 else 0 end as is_top10pct_views,
+        avs.accepted_vs_top_flag,
+        coalesce(cr.closed_at, qa.closeddate) as closed_at,
+        nullif(cr.raw_close_reason_code, '')::int as close_reason_code_num,
+        dl.original_post_id as duplicate_of,
+        ts.tag_q_cnt as tag_volume,
+        ts.tag_closed_cnt as tag_closed_total,
+        ts.avg_views as tag_avg_views,
+        ts.avg_q_score as tag_avg_q_score,
+        fa.first_answer_user_id,
+        case when fa.first_answer_user_id = qa.q_owner_id then 1 else 0 end as self_answer_flag,
+        greatest(qa.q_views, 0) + coalesce(qa.q_score, 0) * 10 + coalesce(qa.net_votes, 0) * 5
+            + coalesce(qa.total_answers, 0) * 3 + coalesce(ob.total_badges, 0) as synthetic_rank_score,
+        lag(qa.q_views) over (partition by rs.norm_location order by qa.q_created) as prev_loc_views,
+        lead(qa.q_views) over (partition by rs.norm_location order by qa.q_created) as next_loc_views,
+        sum(qa.q_score) over (partition by u.id rows between unbounded preceding and current row) as cum_user_qscore,
+        dense_rank() over (order by greatest(qa.q_views, 0) + coalesce(qa.q_score, 0) * 10 + coalesce(qa.net_votes, 0) * 5
+            + coalesce(qa.total_answers, 0) * 3 + coalesce(ob.total_badges, 0) desc, qa.question_id) as dr_synth_rank
+    from q_activity qa
+    left join users u on u.id = qa.q_owner_id
+    left join recent_users rs on rs.user_id = u.id
+    left join owner_badge_summary ob on ob.user_id = u.id
+    left join user_post_mix upm on upm.user_id = u.id
+    left join user_recent_pace urp on urp.user_id = u.id
+    left join accepted_vs_top avs on avs.question_id = qa.question_id
+    left join close_reasons cr on cr.question_id = qa.question_id
+    left join dup_links dl on dl.dup_post_id = qa.question_id
+    left join tag_explode te on te.question_id = qa.question_id
+    left join tag_stats ts on ts.tag = te.tag
+    left join first_answerers fa on fa.question_id = qa.question_id
+)
+select *
+from final
+where (coalesce(close_reason_code_num, 0) not in (103, 104) or close_reason_code_num is null)
+  and (accepted_vs_top_flag is distinct from 'AcceptedIsTop' or unique_answerers >= 3)
+  and (engagement_ratio is null or engagement_ratio > 0 or q_views = 0)
+order by dr_synth_rank, question_id
+limit 500;

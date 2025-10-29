@@ -1,0 +1,94 @@
+-- {"query": "3405.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2096} 
+
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.UpVotes,0) - COALESCE(u.DownVotes,0) AS NetVotes,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadges,
+        (SELECT MAX(p.CreationDate) FROM Posts p WHERE p.OwnerUserId = u.Id) AS LastPostDate
+    FROM Users u
+),
+TopUsers AS (
+    SELECT 
+        *,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, NetVotes DESC) AS RepRank,
+        ROW_NUMBER() OVER (ORDER BY GoldBadges DESC, SilverBadges DESC, BronzeBadges DESC) AS BadgeRank
+    FROM UserStats
+),
+RecentQuestions AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.CreationDate,
+        p.OwnerUserId,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1               -- only questions
+),
+TagStats AS (
+    SELECT 
+        t.TagName,
+        COUNT(p.Id) AS QuestionCount,
+        AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL) AS AvgScore,
+        MAX(p.CreationDate) AS LatestQuestion
+    FROM Tags t
+    LEFT JOIN Posts p 
+        ON p.PostTypeId = 1
+        AND p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+    GROUP BY t.TagName
+)
+SELECT
+    tu.Id,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.NetVotes,
+    tu.GoldBadges,
+    tu.SilverBadges,
+    tu.BronzeBadges,
+    tu.RepRank,
+    tu.BadgeRank,
+    COALESCE(rq.Title, 'No recent question')          AS RecentTitle,
+    COALESCE(rq.Score, 0)                            AS RecentScore,
+    COALESCE(rq.CreationDate, TIMESTAMP '1970-01-01') AS RecentDate,
+    COALESCE(ts.TagName, 'No tag')                   AS TopTag,
+    COALESCE(ts.QuestionCount, 0)                    AS TagQuestionCount,
+    COALESCE(ts.AvgScore, 0)                         AS TagAvgScore
+FROM TopUsers tu
+LEFT JOIN (
+    SELECT *
+    FROM RecentQuestions
+    WHERE rn = 1
+) rq ON rq.OwnerUserId = tu.Id
+LEFT JOIN LATERAL (
+    SELECT t.TagName, t.QuestionCount, t.AvgScore
+    FROM TagStats t
+    ORDER BY t.QuestionCount DESC, t.AvgScore DESC
+    LIMIT 1
+) ts ON TRUE
+WHERE tu.RepRank <= 100
+
+UNION ALL
+
+SELECT
+    NULL                                     AS Id,
+    'Aggregated Stats'                       AS DisplayName,
+    NULL                                     AS Reputation,
+    NULL                                     AS NetVotes,
+    NULL                                     AS GoldBadges,
+    NULL                                     AS SilverBadges,
+    NULL                                     AS BronzeBadges,
+    NULL                                     AS RepRank,
+    NULL                                     AS BadgeRank,
+    'Total Questions'                        AS RecentTitle,
+    CAST(COUNT(*) AS VARCHAR)                AS RecentScore,
+    NULL                                     AS RecentDate,
+    NULL                                     AS TopTag,
+    CAST(SUM(p.Score) AS VARCHAR)            AS TagQuestionCount,
+    CAST(AVG(p.Score) AS VARCHAR)            AS TagAvgScore
+FROM Posts p
+WHERE p.PostTypeId = 1;

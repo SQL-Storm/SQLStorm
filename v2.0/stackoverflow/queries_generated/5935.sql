@@ -1,0 +1,99 @@
+-- {"query": "5935.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 787} 
+WITH
+RecentClosed AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    pc.ClosedDate,
+    rt.Name AS CloseReason
+  FROM Posts p
+  JOIN PostHistory ph ON ph.PostId = p.Id
+  JOIN PostHistoryTypes pht ON pht.Id = ph.PostHistoryTypeId
+  LEFT JOIN CloseReasonTypes rt ON CAST(ph.Comment AS varchar(100)) LIKE '%' || CAST(rt.Id AS varchar) || '%'
+  LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId = 10
+  LEFT JOIN (SELECT PostId, MAX(CreationDate) AS md
+             FROM Votes
+             GROUP BY PostId) mv ON mv.PostId = p.Id
+  WHERE p.PostTypeId = 1 -- questions
+    AND p.ClosedDate IS NOT NULL
+    AND p.LastActivityDate > NOW() - INTERVAL '90 days'
+),
+TopTagBump AS (
+  SELECT
+    pg.PostId,
+    p.Title,
+    p.Tags,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    ROW_NUMBER() OVER (
+      PARTITION BY tag
+      ORDER BY p.Score DESC, p.LastActivityDate DESC
+    ) AS rn
+  FROM Posts p
+  JOIN Unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS tag ON true
+  WHERE p.PostTypeId = 1
+),
+UserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    COUNT(DISTINCT p.Id) AS PostsCreated,
+    SUM(p.ViewCount) AS TotalViews,
+    SUM(p.Score) AS TotalScore,
+    MAX(p.LastActivityDate) AS LastActive
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id, u.DisplayName
+),
+EngagedUsers AS (
+  SELECT
+    u1.UserId,
+    u1.DisplayName,
+    u1.TotalViews,
+    u1.TotalScore,
+    u1.PostsCreated,
+    u2.LastActive AS MostRecentCommentDate
+  FROM UserActivity u1
+  LEFT JOIN Comments c ON c.UserId = u1.UserId
+  GROUP BY u1.UserId, u1.DisplayName, u1.TotalViews, u1.TotalScore, u1.PostsCreated, u2.LastActive
+  ORDER BY u1.TotalScore DESC
+  LIMIT 100
+)
+SELECT
+  ro.PostId,
+  ro.Title AS QuestionTitle,
+  ro.OwnerUserId,
+  ro.ClosedDate,
+  ro.CloseReason,
+  ro.CreationDate,
+  ro.LastActivityDate,
+  ro.Score,
+  ro.ViewCount,
+  jsonb_build_object(
+    'mostActiveUser', au.DisplayName,
+    'activity', jsonb_build_object(
+      'totalViews', au.TotalViews,
+      'totalScore', au.TotalScore,
+      'postsCreated', au.PostsCreated
+    ),
+    'recentCommentDate', au.MostRecentCommentDate
+  ) AS ExtraMetrics,
+  tt.tags AS TopTags
+FROM RecentClosed ro
+LEFT JOIN LATERAL (
+  SELECT jsonb_agg(t.tag) AS tags
+  FROM TopTagBump t
+  WHERE t.PostId = ro.PostId
+) tt ON TRUE
+LEFT JOIN EngagedUsers au ON ro.OwnerUserId = au.UserId
+ORDER BY ro.ClosedDate DESC
+LIMIT 200;

@@ -1,0 +1,194 @@
+-- {"query": "7944.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2101} 
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ParentId,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) as avg_score_3_posts,
+        NTILE(4) OVER (ORDER BY p.Score) as score_quartile
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) 
+),
+UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as total_posts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as answers,
+        SUM(COALESCE(p.Score, 0)) as total_score,
+        AVG(COALESCE(p.Score, 0)) as avg_score,
+        MAX(p.CreationDate) as last_activity,
+        STDEV(p.Score) as score_stddev,
+        STRING_AGG(p.Title, '; ') as recent_titles,
+        COUNT(DISTINCT c.Id) as comment_count
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as tag_count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        COALESCE((SELECT COUNT(*) FROM Posts WHERE Tags LIKE '%' || t.TagName || '%'), 0) as posts_with_tag,
+        (CASE WHEN t.Count > 100 THEN 'High' 
+              WHEN t.Count > 50 THEN 'Medium' 
+              WHEN t.Count > 10 THEN 'Low'
+              ELSE 'Very Low' END) as tag_popularity_level,
+        CASE 
+            WHEN t.Count > 500 THEN 'Trending'
+            WHEN t.Count > 250 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Well-known'
+            WHEN t.Count > 10 THEN 'Obscure'
+            ELSE 'Rare'
+        END as tag_category
+    FROM Tags t
+    WHERE t.TagName IS NOT NULL
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        rp.Id as PostId,
+        rp.Title,
+        rp.Tags,
+        rp.OwnerUserId,
+        rp.Score,
+        rp.ViewCount,
+        rp.CreationDate,
+        rp.PostTypeId,
+        rp.prev_score,
+        rp.avg_score_3_posts,
+        rp.score_quartile,
+        CASE 
+            WHEN rp.prev_score IS NOT NULL AND rp.Score > rp.prev_score THEN 'Improving'
+            WHEN rp.prev_score IS NOT NULL AND rp.Score < rp.prev_score THEN 'Declining'
+            WHEN rp.Score > 0 THEN 'Neutral'
+            ELSE 'No previous data'
+        END as performance_trend,
+        CASE 
+            WHEN rp.Score > 100 THEN 'Hot'
+            WHEN rp.Score > 50 THEN 'Popular'
+            WHEN rp.Score > 10 THEN 'Moderate'
+            WHEN rp.Score > 0 THEN 'Low'
+            ELSE 'Unpopular'
+        END as popularity_status,
+        (rp.Score - COALESCE(rp.avg_score_3_posts, 0)) as score_deviation,
+        DATEDIFF('day', rp.CreationDate, cast('2024-10-01 12:34:56' as timestamp)) as days_since_creation,
+        CASE 
+            WHEN rp.PostTypeId = 1 AND rp.AnswerCount > 0 THEN 'Answered'
+            WHEN rp.PostTypeId = 1 AND rp.AnswerCount = 0 THEN 'Unanswered'
+            ELSE 'Not a question'
+        END as question_status
+    FROM RankedPosts rp
+),
+UserDetailedStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(ua.total_posts, 0) as total_posts,
+        COALESCE(ua.questions, 0) as questions,
+        COALESCE(ua.answers, 0) as answers,
+        COALESCE(ua.total_score, 0) as total_score,
+        COALESCE(ua.avg_score, 0) as avg_score,
+        COALESCE(ua.comment_count, 0) as comment_count,
+        CASE 
+            WHEN ua.total_posts > 100 THEN 'Legendary'
+            WHEN ua.total_posts > 50 THEN 'Expert'
+            WHEN ua.total_posts > 20 THEN 'Intermediate'
+            WHEN ua.total_posts > 5 THEN 'Novice'
+            ELSE 'Beginner'
+        END as user_level,
+        CASE 
+            WHEN ua.total_score > 10000 THEN 'High Achiever'
+            WHEN ua.total_score > 5000 THEN 'Mid Achiever'
+            WHEN ua.total_score > 1000 THEN 'Low Achiever'
+            ELSE 'Newbie'
+        END as achievement_level
+    FROM Users u
+    LEFT JOIN UserActivityStats ua ON u.Id = ua.UserId
+    WHERE u.Id IS NOT NULL
+)
+SELECT 
+    COUNT(*) as total_results,
+    COUNT(DISTINCT CASE WHEN cpa.question_status = 'Answered' THEN cpa.PostId END) as answered_questions,
+    COUNT(DISTINCT CASE WHEN cpa.question_status = 'Unanswered' THEN cpa.PostId END) as unanswered_questions,
+    COUNT(DISTINCT CASE WHEN cpa.popularity_status = 'Hot' THEN cpa.PostId END) as hot_posts,
+    COUNT(DISTINCT CASE WHEN cpa.performance_trend = 'Improving' THEN cpa.PostId END) as improving_posts,
+    SUM(COALESCE(cpa.Score, 0)) as total_score,
+    AVG(COALESCE(cpa.Score, 0)) as average_score,
+    AVG(COALESCE(cpa.ViewCount, 0)) as average_views,
+    AVG(COALESCE(cpa.days_since_creation, 0)) as average_days_old,
+    COUNT(DISTINCT CASE 
+        WHEN cpa.Question_status = 'Answered' 
+        AND cpa.Popularity_status IN ('Hot', 'Popular')
+        AND cpa.Score_deviation > 0
+        AND cpa.Score > 10 THEN cpa.PostId 
+    END) as high_scoring_answered_posts,
+    (SELECT COUNT(*) FROM Tags WHERE TagName IN ('python', 'java', 'javascript')) as popular_tag_count,
+    COUNT(DISTINCT CASE WHEN uds.user_level = 'Legendary' THEN uds.UserId END) as legendary_users,
+    COUNT(DISTINCT CASE WHEN uds.achievement_level = 'High Achiever' THEN uds.UserId END) as high_achievers,
+    STRING_AGG(DISTINCT CASE WHEN cpa.Question_status = 'Answered' THEN cpa.Title END, '; ') as sample_answered_titles,
+    STRING_AGG(DISTINCT CASE WHEN uds.achievement_level = 'High Achiever' THEN uds.DisplayName END, ', ') as high_achiever_names,
+    (SELECT AVG(reputation) FROM Users WHERE Id IN (SELECT UserId FROM UserDetailedStats WHERE achievement_level = 'High Achiever')) as avg_reputation_of_high_achievers,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p1 
+        INNER JOIN Posts p2 ON p1.ParentId = p2.Id 
+        WHERE p1.PostTypeId = 2 AND p2.PostTypeId = 1 AND p1.Score > 10
+    ) as high_scoring_answers_to_questions,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p1 
+        LEFT JOIN Posts p2 ON p1.Id = p2.ParentId 
+        WHERE p1.PostTypeId = 1 AND p2.Id IS NULL AND p1.ViewCount > 1000
+    ) as unvisited_unanswered_questions,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        LEFT JOIN Comments c ON p.Id = c.PostId 
+        WHERE p.PostTypeId = 1 AND c.Id IS NULL AND p.CreationDate > (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days')
+    ) as recent_uncommented_questions,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        INNER JOIN PostLinks pl ON p.Id = pl.PostId 
+        WHERE pl.LinkTypeId = 3 AND p.PostTypeId = 1 AND p.Score > 1000
+    ) as popular_duplicate_questions,
+    (
+        SELECT COUNT(*) 
+        FROM Users u 
+        INNER JOIN Badges b ON u.Id = b.UserId 
+        WHERE b.Class = 1 AND u.Reputation > 10000
+    ) as gold_badge_holders_with_high_rep,
+    COUNT(DISTINCT CASE 
+        WHEN cpa.Score_deviation > 50 
+        AND cpa.days_since_creation < 30 
+        AND cpa.Question_status = 'Answered' 
+        THEN cpa.PostId 
+    END) as rapidly_improving_questions
+FROM ComplexPostAnalysis cpa
+INNER JOIN UserDetailedStats uds ON cpa.OwnerUserId = uds.UserId
+WHERE 
+    cpa.Score IS NOT NULL 
+    AND cpa.ViewCount IS NOT NULL
+    AND cpa.creationdate > (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year')
+    AND (cpa.Question_status = 'Answered' OR cpa.Question_status = 'Unanswered')
+    AND uds.total_posts > 0
+ORDER BY cpa.CreationDate DESC
+LIMIT 1000;

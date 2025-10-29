@@ -1,0 +1,243 @@
+-- {"query": "1899.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3771} 
+WITH UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestionsOwned,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswersOwned,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COALESCE(SUM(p.Score), 0) + COALESCE(SUM(c.Score), 0) AS TotalContentScore,
+        RANK() OVER (ORDER BY u.Reputation DESC, COUNT(DISTINCT p.Id) DESC, COUNT(DISTINCT b.Id) DESC) AS UserRankOverall
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+PostActivitySummary AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS InitialScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount AS InitialCommentCount,
+        p.FavoriteCount AS InitialFavoriteCount,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.ClosedDate,
+        p.CommunityOwnedDate,
+        COUNT(ph.Id) AS TotalHistoryEvents,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS TotalEdits,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS ClosureVotes,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenVotes,
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.CreationDate END) AS LastActualEditDate,
+        MIN(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.CreationDate END) AS FirstActualEditDate,
+        STRING_AGG(DISTINCT ph.Comment, '; ') FILTER (WHERE ph.PostHistoryTypeId = 10 AND ph.Comment IS NOT NULL) AS ClosureReasons,
+        MAX(v_up.CreationDate) AS LastUpVoteDate,
+        MAX(v_down.CreationDate) AS LastDownVoteDate,
+        SUM(CASE WHEN v_up.VoteTypeId = 2 THEN 1 ELSE 0 END) AS ActualUpVotes,
+        SUM(CASE WHEN v_down.VoteTypeId = 3 THEN 1 ELSE 0 END) AS ActualDownVotes
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    LEFT JOIN Votes v_up ON p.Id = v_up.PostId AND v_up.VoteTypeId = 2
+    LEFT JOIN Votes v_down ON p.Id = v_down.PostId AND v_down.VoteTypeId = 3
+    GROUP BY
+        p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount,
+        p.CommentCount, p.FavoriteCount, p.LastEditDate, p.LastActivityDate, p.ClosedDate, p.CommunityOwnedDate
+),
+QuestionLinkMetrics AS (
+    SELECT
+        pl.PostId,
+        SUM(CASE WHEN pl.LinkTypeId = 1 THEN 1 ELSE 0 END) AS LinkedPostCount,
+        SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicateOfCount,
+        STRING_AGG(CAST(pl.RelatedPostId AS TEXT), ',') FILTER (WHERE pl.LinkTypeId = 3) AS DuplicatePostIds
+    FROM PostLinks pl
+    GROUP BY pl.PostId
+)
+SELECT
+    q.Id AS QuestionId,
+    q.Title,
+    q.CreationDate AS QuestionCreationDate,
+    ue.DisplayName AS OwnerDisplayName,
+    ue.Reputation AS OwnerReputation,
+    ue.TotalQuestionsOwned AS OwnerTotalQuestions,
+    pas.InitialScore AS QuestionScore,
+    pas.ViewCount,
+    pas.AnswerCount,
+    pas.InitialCommentCount AS CommentCount,
+    COALESCE(pas.InitialFavoriteCount, 0) AS FavoriteCount,
+    pas.TotalEdits AS TotalEditsOnQuestion,
+    COALESCE(qlm.LinkedPostCount, 0) AS LinkedQuestions,
+    COALESCE(qlm.DuplicateOfCount, 0) AS DuplicatedByQuestions,
+    qlm.DuplicatePostIds,
+    aa_owner.DisplayName AS AcceptedAnswerOwnerDisplayName,
+    COALESCE(aa_owner.Reputation, 0) AS AcceptedAnswerOwnerReputation,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = q.Id AND c.UserId = q.OwnerUserId AND c.CreationDate > q.CreationDate - INTERVAL '1 hour') AS OwnerCommentsOnOwnQuestionRecent,
+    CASE
+        WHEN q.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN q.AcceptedAnswerId IS NOT NULL THEN 'Answered & Accepted'
+        WHEN pas.AnswerCount > 0 THEN 'Has Answers'
+        WHEN q.LastActivityDate < cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '3 months' THEN 'Stale'
+        ELSE 'Active'
+    END AS QuestionStatus,
+    EXTRACT(EPOCH FROM (q.LastActivityDate - q.CreationDate)) / (60 * 60 * 24) AS DaysSinceCreationToLastActivity,
+    COALESCE(
+        pas.ActualUpVotes * 0.5 +
+        pas.ActualDownVotes * -1.0 +
+        q.ViewCount * 0.01 +
+        pas.AnswerCount * 2 +
+        pas.InitialCommentCount * 0.5 +
+        COALESCE(pas.InitialFavoriteCount, 0) * 3 +
+        pas.TotalEdits * 0.7 +
+        (SELECT COUNT(DISTINCT PostHistory.UserId) FROM PostHistory WHERE PostHistory.PostId = q.Id AND PostHistory.PostHistoryTypeId IN (4,5,6) AND PostHistory.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '6 months') * 5, -- Count distinct editors in last 6 months
+    0) AS EngagementMetric,
+    LAG(pas.LastActualEditDate) OVER (PARTITION BY q.OwnerUserId ORDER BY q.CreationDate) AS PreviousQuestionLastEditDate,
+    q.Tags,
+    ARRAY_LENGTH(string_to_array(SUBSTRING(q.Tags, 2, LENGTH(q.Tags)-2), '><'), 1) AS TagCount,
+    SUBSTRING(q.Body, 1, 200) AS BodyExcerpt,
+    RANK() OVER (PARTITION BY ue.UserRankOverall / 10 ORDER BY q.Score DESC, q.ViewCount DESC) AS RankWithinOwnerTier,
+    NTILE(5) OVER (ORDER BY (pas.ActualUpVotes - pas.ActualDownVotes) DESC, q.ViewCount DESC) AS QuestionPopularityTier,
+    CASE
+        WHEN q.Body LIKE '%<pre><code>%' AND LENGTH(q.Body) > 500 THEN 'Code Rich & Long'
+        WHEN q.Body LIKE '%<a href=%' THEN 'Contains Links'
+        WHEN LENGTH(q.Body) > 1000 THEN 'Very Long'
+        ELSE 'Normal'
+    END AS BodyComplexityCategory,
+    ph_owner_edit.UserDisplayName AS OwnerLastEditorDisplayName,
+    ph_owner_edit.CreationDate AS OwnerLastEditDate,
+    (
+        SELECT COUNT(DISTINCT ph_inner.PostId)
+        FROM PostHistory ph_inner
+        WHERE ph_inner.UserId = q.OwnerUserId
+          AND ph_inner.PostHistoryTypeId IN (1,2,3,4,5,6) -- Any creation or edit activity
+          AND ph_inner.CreationDate BETWEEN q.CreationDate - INTERVAL '1 day' AND q.CreationDate + INTERVAL '1 day'
+    ) AS OwnerRecentActivityAroundCreation
+FROM Posts q
+INNER JOIN UserEngagement ue ON q.OwnerUserId = ue.UserId
+INNER JOIN PostActivitySummary pas ON q.Id = pas.PostId
+LEFT JOIN QuestionLinkMetrics qlm ON q.Id = qlm.PostId
+LEFT JOIN Posts a ON q.AcceptedAnswerId = a.Id AND a.PostTypeId = 2
+LEFT JOIN Users aa_owner ON a.OwnerUserId = aa_owner.Id
+LEFT JOIN PostHistory ph_owner_edit ON ph_owner_edit.PostId = q.Id
+    AND ph_owner_edit.PostHistoryTypeId IN (4,5,6) -- Edits
+    AND ph_owner_edit.UserId = q.OwnerUserId
+    AND ph_owner_edit.CreationDate = pas.LastActualEditDate -- The actual last edit by the owner
+WHERE
+    q.PostTypeId = 1
+    AND q.CreationDate BETWEEN cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '2 years' AND cast('2024-10-01 12:34:56' as timestamp)
+    AND ue.Reputation > 5000
+    AND (
+        (q.AnswerCount > 2 AND pas.TotalEdits > 1 AND pas.ActualUpVotes > pas.ActualDownVotes)
+        OR
+        (q.ViewCount > 1000 AND q.FavoriteCount IS NOT NULL AND ue.GoldBadges > 0 AND q.Body LIKE '%Stack Overflow%')
+    )
+    AND NOT EXISTS (
+        SELECT 1 FROM PostHistory ph_closed
+        WHERE ph_closed.PostId = q.Id
+          AND ph_closed.PostHistoryTypeId = 10 -- Post Closed
+          AND ph_closed.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 month'
+          AND ph_closed.Comment IS NOT NULL
+          AND ph_closed.Comment LIKE '%101%' -- specifically duplicate (CloseReasonId = 101)
+    )
+    AND q.Body IS NOT NULL
+    AND q.Tags IS NOT NULL
+    AND q.OwnerUserId IS NOT NULL
+    AND q.Title IS NOT NULL
+    AND LENGTH(TRIM(q.Body)) > 50
+UNION ALL
+-- Second branch: Highly dynamic or controversial questions, regardless of owner influence
+SELECT
+    q.Id AS QuestionId,
+    q.Title,
+    q.CreationDate AS QuestionCreationDate,
+    ue.DisplayName AS OwnerDisplayName,
+    ue.Reputation AS OwnerReputation,
+    ue.TotalQuestionsOwned AS OwnerTotalQuestions,
+    pas.InitialScore AS QuestionScore,
+    pas.ViewCount,
+    pas.AnswerCount,
+    pas.InitialCommentCount AS CommentCount,
+    COALESCE(pas.InitialFavoriteCount, 0) AS FavoriteCount,
+    pas.TotalEdits AS TotalEditsOnQuestion,
+    COALESCE(qlm.LinkedPostCount, 0) AS LinkedQuestions,
+    COALESCE(qlm.DuplicateOfCount, 0) AS DuplicatedByQuestions,
+    qlm.DuplicatePostIds,
+    aa_owner.DisplayName AS AcceptedAnswerOwnerDisplayName,
+    COALESCE(aa_owner.Reputation, 0) AS AcceptedAnswerOwnerReputation,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = q.Id AND c.UserId IS NULL AND c.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '24 hours') AS AnonymousCommentsRecent,
+    CASE
+        WHEN pas.ClosureVotes > 0 AND pas.ReopenVotes > 0 THEN 'Closed & Reopened'
+        WHEN pas.ClosureVotes > 0 THEN 'Closed'
+        WHEN q.AcceptedAnswerId IS NOT NULL THEN 'Answered & Accepted'
+        WHEN pas.AnswerCount > 0 THEN 'Has Answers'
+        ELSE 'No Answers'
+    END AS QuestionStatus,
+    EXTRACT(EPOCH FROM (q.LastActivityDate - q.CreationDate)) / (60 * 60 * 24) AS DaysSinceCreationToLastActivity,
+    COALESCE(
+        pas.ActualUpVotes * 0.7 +
+        pas.ActualDownVotes * -1.5 + -- Downvotes make it more 'dynamic' or controversial
+        pas.ClosureVotes * 5 +
+        pas.ReopenVotes * 10 +
+        pas.TotalEdits * 1.5 +
+        (SELECT COUNT(*) FROM Votes v_spam WHERE v_spam.PostId = q.Id AND v_spam.VoteTypeId = 12) * -20, -- Penalize spam votes
+    0) AS EngagementMetric,
+    LAG(pas.LastActualEditDate) OVER (PARTITION BY q.OwnerUserId ORDER BY q.CreationDate) AS PreviousQuestionLastEditDate,
+    q.Tags,
+    ARRAY_LENGTH(string_to_array(SUBSTRING(q.Tags, 2, LENGTH(q.Tags)-2), '><'), 1) AS TagCount,
+    SUBSTRING(q.Body, 1, 200) AS BodyExcerpt,
+    RANK() OVER (PARTITION BY q.CreationDate::DATE ORDER BY (pas.ClosureVotes + pas.ReopenVotes) DESC, pas.TotalEdits DESC) AS RankWithinOwnerTier,
+    NTILE(5) OVER (ORDER BY pas.ActualDownVotes DESC, pas.TotalEdits DESC) AS QuestionPopularityTier,
+    CASE
+        WHEN q.Body LIKE '%<img src=%' THEN 'Image Rich'
+        WHEN q.Body LIKE '%<a href=%' THEN 'Contains Links'
+        WHEN LENGTH(q.Body) BETWEEN 500 AND 1000 THEN 'Medium Length'
+        ELSE 'Short'
+    END AS BodyComplexityCategory,
+    ph_owner_edit.UserDisplayName AS OwnerLastEditorDisplayName,
+    ph_owner_edit.CreationDate AS OwnerLastEditDate,
+    (
+        SELECT COUNT(DISTINCT ph_inner.PostId)
+        FROM PostHistory ph_inner
+        WHERE ph_inner.PostId = q.Id
+          AND ph_inner.PostHistoryTypeId IN (10, 11) -- Close/Reopen activities
+          AND ph_inner.CreationDate BETWEEN cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '6 months' AND cast('2024-10-01 12:34:56' as timestamp)
+    ) AS RecentlyDynamicActivityCount
+FROM Posts q
+INNER JOIN UserEngagement ue ON q.OwnerUserId = ue.UserId
+INNER JOIN PostActivitySummary pas ON q.Id = pas.PostId
+LEFT JOIN QuestionLinkMetrics qlm ON q.Id = qlm.PostId
+LEFT JOIN Posts a ON q.AcceptedAnswerId = a.Id AND a.PostTypeId = 2
+LEFT JOIN Users aa_owner ON a.OwnerUserId = aa_owner.Id
+LEFT JOIN PostHistory ph_owner_edit ON ph_owner_edit.PostId = q.Id
+    AND ph_owner_edit.PostHistoryTypeId IN (4,5,6) -- Edits
+    AND ph_owner_edit.UserId = q.OwnerUserId
+    AND ph_owner_edit.CreationDate = pas.LastActualEditDate
+WHERE
+    q.PostTypeId = 1
+    AND q.CreationDate BETWEEN cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '3 years' AND cast('2024-10-01 12:34:56' as timestamp)
+    AND (
+        (pas.ClosureVotes > 0 AND pas.ReopenVotes > 0)
+        OR
+        (pas.TotalEdits > 5 AND pas.ActualDownVotes > 3 AND q.AnswerCount IS NOT NULL AND q.AnswerCount > 0)
+    )
+    AND NOT EXISTS (
+        SELECT 1 FROM Badges b_filtered
+        WHERE b_filtered.UserId = q.OwnerUserId AND b_filtered.Name LIKE '%Constituent%'
+    )
+    AND q.Body IS NOT NULL
+    AND q.Tags IS NOT NULL
+    AND q.OwnerUserId IS NOT NULL
+    AND q.Title IS NOT NULL
+    AND LENGTH(TRIM(q.Title)) > 10
+ORDER BY
+    QuestionCreationDate DESC, EngagementMetric DESC;

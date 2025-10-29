@@ -1,0 +1,251 @@
+WITH UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        DATE_PART('day', u.LastAccessDate - u.CreationDate) AS AccountAgeDays,
+        COUNT(DISTINCT p.Id) AS TotalPostsContributed,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) FILTER (WHERE v.UserId = u.Id), 0) AS TotalUpVotesGiven,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) FILTER (WHERE v.UserId = u.Id), 0) AS TotalDownVotesGiven,
+        SUM(CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS AcceptedAnswersCount,
+        (u.Reputation * 1.2 + COALESCE(u.UpVotes, 0) * 0.5 - COALESCE(u.DownVotes, 0) * 0.3) AS UserInfluenceBaseScore,
+        u.UpVotes,
+        u.DownVotes
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.UpVotes, u.DownVotes
+),
+PostEngagementMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount AS PostViewCount,
+        p.CommentCount AS PostCommentCount,
+        COALESCE(p.FavoriteCount, 0) AS PostFavoriteCount,
+        p.AcceptedAnswerId,
+        (p.Score * 0.6 + p.ViewCount * 0.05 + p.CommentCount * 0.9 + COALESCE(p.FavoriteCount, 0) * 2.5) AS PostEngagementIndex,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6, 8, 9, 24) THEN 1 ELSE 0 END) AS TotalEditHistoryCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS TotalCloseVoteHistoryCount,
+        STRING_AGG(DISTINCT t.TagName, ',') FILTER (WHERE t.TagName IS NOT NULL AND CHAR_LENGTH(t.TagName) <= 20) AS AggregatedPostTags,
+        MAX(ph.CreationDate) AS LastPostHistoryActivityDate,
+        p.Tags
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    LEFT JOIN Tags t ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= DATE '2020-01-01'
+    GROUP BY
+        p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.CommentCount, p.FavoriteCount, p.AcceptedAnswerId, p.Tags
+),
+BadgeMilestones AS (
+    SELECT
+        b.UserId,
+        MIN(CASE WHEN b.Class = 1 THEN b.Date END) AS FirstGoldBadgeDate,
+        MIN(CASE WHEN b.Class = 2 THEN b.Date END) AS FirstSilverBadgeDate,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Name END) AS GoldBadgeCount,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Name END) AS SilverBadgeCount
+    FROM Badges b
+    WHERE b.TagBased IS FALSE
+    GROUP BY b.UserId
+    HAVING
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Name END) >= 1
+        AND COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Name END) >= 1
+),
+HighlyScoredCommentsByOwner AS (
+    SELECT DISTINCT p.Id AS PostId, p.OwnerUserId
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+      AND EXISTS (
+            SELECT 1
+            FROM Comments c
+            WHERE c.PostId = p.Id
+              AND c.Score > (
+                    SELECT AVG(c2.Score)
+                    FROM Comments c2
+                    WHERE c2.UserId = p.OwnerUserId
+                      AND c2.UserId IS NOT NULL
+              )
+              AND c.CreationDate > p.CreationDate
+        )
+),
+RankedUserPostData AS (
+    SELECT
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.UserCreationDate,
+        uas.AccountAgeDays,
+        uas.TotalPostsContributed,
+        uas.UserInfluenceBaseScore,
+        pem.PostId,
+        pem.PostCreationDate,
+        pem.PostScore,
+        pem.PostViewCount,
+        pem.PostEngagementIndex,
+        pem.TotalEditHistoryCount,
+        pem.TotalCloseVoteHistoryCount,
+        pem.AggregatedPostTags,
+        bm.FirstGoldBadgeDate,
+        bm.FirstSilverBadgeDate,
+        CASE
+            WHEN bm.FirstGoldBadgeDate IS NOT NULL AND bm.FirstSilverBadgeDate IS NOT NULL
+            THEN DATE_PART('day', bm.FirstGoldBadgeDate - bm.FirstSilverBadgeDate)
+            ELSE NULL
+        END AS DaysBetweenGoldSilverBadges,
+        ROW_NUMBER() OVER (PARTITION BY uas.UserId ORDER BY pem.PostEngagementIndex DESC, pem.PostCreationDate DESC) AS PostRankByUser,
+        AVG(pem.PostScore) OVER (PARTITION BY uas.UserId) AS AveragePostScoreForUser,
+        SUM(pem.PostEngagementIndex) OVER (PARTITION BY uas.UserId) AS TotalEngagementIndexForUser,
+        (hscbo.PostId IS NOT NULL) AS HasHighScoringRelatedComment,
+        pem.AcceptedAnswerId,
+        pem.TotalCloseVoteHistoryCount,
+        pem.TotalEditHistoryCount,
+        pem.LastPostHistoryActivityDate,
+        pem.Tags,
+        pem.OwnerUserId
+    FROM UserActivitySummary uas
+    INNER JOIN PostEngagementMetrics pem ON uas.UserId = pem.OwnerUserId
+    LEFT JOIN BadgeMilestones bm ON uas.UserId = bm.UserId
+    LEFT JOIN HighlyScoredCommentsByOwner hscbo ON pem.PostId = hscbo.PostId AND pem.OwnerUserId = hscbo.OwnerUserId
+    WHERE
+        uas.Reputation > 7500
+        AND pem.PostScore >= 20
+        AND pem.PostViewCount > 10000
+        AND (pem.AggregatedPostTags LIKE '%sql%' OR pem.AggregatedPostTags LIKE '%performance%')
+        AND (pem.AcceptedAnswerId IS NOT NULL OR pem.TotalCloseVoteHistoryCount = 0 OR pem.LastPostHistoryActivityDate < pem.PostCreationDate + INTERVAL '60 days')
+        AND uas.AccountAgeDays >= 1000
+        AND (bm.FirstGoldBadgeDate IS NULL OR bm.FirstGoldBadgeDate >= uas.UserCreationDate + INTERVAL '1 year')
+        AND NOT EXISTS (
+            SELECT 1
+            FROM PostLinks pl
+            WHERE pl.PostId = pem.PostId
+              AND pl.LinkTypeId = 3
+              AND pl.CreationDate < pem.PostCreationDate + INTERVAL '30 days'
+        )
+),
+TopInfluentialContributors AS (
+    SELECT
+        r.UserId,
+        r.DisplayName,
+        r.Reputation,
+        r.AccountAgeDays,
+        r.TotalPostsContributed,
+        r.PostId,
+        r.PostCreationDate,
+        r.PostScore,
+        r.PostEngagementIndex,
+        r.AggregatedPostTags,
+        r.FirstGoldBadgeDate,
+        r.FirstSilverBadgeDate,
+        ABS(r.DaysBetweenGoldSilverBadges) AS DaysBetweenBadgesAbs,
+        r.AveragePostScoreForUser,
+        r.TotalEngagementIndexForUser,
+        (r.UserInfluenceBaseScore * 0.2 + r.TotalEngagementIndexForUser * 0.4 + r.AveragePostScoreForUser * 0.4) AS OverallContributionScore,
+        'Top Influential Contributor' AS ContributorCategory,
+        r.HasHighScoringRelatedComment,
+        CASE
+            WHEN r.AcceptedAnswerId IS NOT NULL THEN 'Resolved_Question'
+            WHEN r.TotalCloseVoteHistoryCount > 0 THEN 'Closed_Question'
+            ELSE 'Active_Question'
+        END AS PostResolutionStatus,
+        r.TotalEditHistoryCount,
+        r.LastPostHistoryActivityDate,
+        r.Tags,
+        r.OwnerUserId
+    FROM RankedUserPostData r
+    WHERE
+        r.PostRankByUser <= 3
+        AND (r.DaysBetweenGoldSilverBadges IS NULL OR ABS(r.DaysBetweenGoldSilverBadges) > 30)
+        AND r.HasHighScoringRelatedComment IS TRUE
+        AND r.TotalEngagementIndexForUser > 1000
+),
+RisingStarPosts AS (
+    SELECT
+        r.UserId,
+        r.DisplayName,
+        r.Reputation,
+        r.AccountAgeDays,
+        r.TotalPostsContributed,
+        r.PostId,
+        r.PostCreationDate,
+        r.PostScore,
+        r.PostEngagementIndex,
+        r.AggregatedPostTags,
+        r.FirstGoldBadgeDate,
+        r.FirstSilverBadgeDate,
+        ABS(r.DaysBetweenGoldSilverBadges) AS DaysBetweenBadgesAbs,
+        r.AveragePostScoreForUser,
+        r.TotalEngagementIndexForUser,
+        (r.Reputation * 0.1 + r.PostEngagementIndex * 0.5 + r.AveragePostScoreForUser * 0.4) AS OverallContributionScore,
+        'Rising Star Post' AS ContributorCategory,
+        r.HasHighScoringRelatedComment,
+        CASE
+            WHEN r.AcceptedAnswerId IS NOT NULL THEN 'Resolved_Question'
+            WHEN r.TotalCloseVoteHistoryCount > 0 THEN 'Closed_Question'
+            ELSE 'Active_Question'
+        END AS PostResolutionStatus,
+        r.TotalEditHistoryCount,
+        r.LastPostHistoryActivityDate,
+        r.Tags,
+        r.OwnerUserId
+    FROM RankedUserPostData r
+    WHERE
+        r.PostRankByUser = 1
+        AND r.HasHighScoringRelatedComment IS FALSE
+        AND r.TotalEditHistoryCount >= 5
+        AND r.PostScore > r.AveragePostScoreForUser * 1.8
+        AND r.PostEngagementIndex > (SELECT AVG(PostEngagementIndex) FROM RankedUserPostData WHERE AccountAgeDays > 1500)
+        AND (r.AggregatedPostTags LIKE '%optimization%' OR r.AggregatedPostTags LIKE '%query%')
+)
+SELECT
+    UserId,
+    DisplayName,
+    Reputation,
+    AccountAgeDays,
+    TotalPostsContributed,
+    PostId,
+    PostCreationDate,
+    PostScore,
+    PostEngagementIndex,
+    AggregatedPostTags,
+    FirstGoldBadgeDate,
+    FirstSilverBadgeDate,
+    DaysBetweenBadgesAbs,
+    AveragePostScoreForUser,
+    TotalEngagementIndexForUser,
+    OverallContributionScore,
+    ContributorCategory,
+    HasHighScoringRelatedComment,
+    PostResolutionStatus
+FROM TopInfluentialContributors
+UNION ALL
+SELECT
+    UserId,
+    DisplayName,
+    Reputation,
+    AccountAgeDays,
+    TotalPostsContributed,
+    PostId,
+    PostCreationDate,
+    PostScore,
+    PostEngagementIndex,
+    AggregatedPostTags,
+    FirstGoldBadgeDate,
+    FirstSilverBadgeDate,
+    DaysBetweenBadgesAbs,
+    AveragePostScoreForUser,
+    TotalEngagementIndexForUser,
+    OverallContributionScore,
+    ContributorCategory,
+    HasHighScoringRelatedComment,
+    PostResolutionStatus
+FROM RisingStarPosts
+ORDER BY OverallContributionScore DESC, Reputation DESC, PostCreationDate DESC;

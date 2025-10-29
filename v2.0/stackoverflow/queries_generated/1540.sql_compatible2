@@ -1,0 +1,203 @@
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.UpVotes AS TotalUpVotesGiven,
+        U.DownVotes AS TotalDownVotesGiven,
+        COUNT(DISTINCT P.Id) AS TotalPostsCreated,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsAsked,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersPosted,
+        COUNT(B.Id) AS TotalBadgesCount,
+        MAX(U.LastAccessDate) AS LastSeen,
+        COUNT(DISTINCT PH.PostId) FILTER (WHERE PH.PostHistoryTypeId IN (4, 5, 6, 50)) AS TotalPostsEditedByThisUser,
+        AVG(CASE WHEN P.ViewCount IS NOT NULL AND P.PostTypeId = 1 THEN P.ViewCount ELSE NULL END) AS AvgQuestionViewCount
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN PostHistory PH ON U.Id = PH.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.UpVotes, U.DownVotes, U.LastAccessDate
+    HAVING COUNT(DISTINCT P.Id) > 10
+       AND U.Reputation > 5000
+       AND MAX(U.LastAccessDate) > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')
+),
+PostHistoricalMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        COUNT(PH_Edit.Id) AS EditCount,
+        MAX(PH_Edit.CreationDate) AS LastEditDateHistory,
+        MIN(PH_Initial.CreationDate) AS InitialCreationDateHistory,
+        MAX(CASE WHEN PH_Close.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS WasClosed,
+        MAX(CASE WHEN PH_Reopen.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS WasReopened,
+        COUNT(DISTINCT PH.UserId) AS UniqueEditors,
+        MAX(PH_Close.Comment) AS LastCloseReasonComment,
+        ARRAY_AGG(DISTINCT PH.PostHistoryTypeId) FILTER (WHERE PH.PostHistoryTypeId IN (10, 11, 12, 13, 19, 20, 35, 36)) AS SignificantHistoryEvents
+    FROM Posts P
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    LEFT JOIN PostHistory PH_Edit ON P.Id = PH_Edit.PostId AND PH_Edit.PostHistoryTypeId IN (4, 5, 6, 50)
+    LEFT JOIN PostHistory PH_Initial ON P.Id = PH_Initial.PostId AND PH_Initial.PostHistoryTypeId IN (1, 2, 3)
+    LEFT JOIN PostHistory PH_Close ON P.Id = PH_Close.PostId AND PH_Close.PostHistoryTypeId = 10
+    LEFT JOIN PostHistory PH_Reopen ON P.Id = PH_Reopen.PostId AND PH_Reopen.PostHistoryTypeId = 11
+    GROUP BY P.Id
+),
+QuestionDerivedStats AS (
+    SELECT
+        Q.Id AS QuestionId,
+        Q.OwnerUserId,
+        Q.Title,
+        Q.ViewCount,
+        Q.Score,
+        Q.AnswerCount,
+        Q.FavoriteCount,
+        Q.CreationDate AS QuestionCreationDate,
+        Q.LastActivityDate AS QuestionLastActivityDate,
+        COALESCE(Q.ClosedDate, CAST('1900-01-01' AS timestamp)) AS QuestionClosedDate,
+        SUM(V.BountyAmount) AS TotalBountyAmount,
+        COUNT(DISTINCT V.Id) FILTER (WHERE V.VoteTypeId = 2) AS UpVoteCount,
+        COUNT(DISTINCT V.Id) FILTER (WHERE V.VoteTypeId = 3) AS DownVoteCount,
+        COUNT(DISTINCT C.Id) AS CommentCountOnQuestion,
+        STRING_AGG(DISTINCT T.TagName, ',') FILTER (WHERE T.TagName IS NOT NULL) AS AssociatedTags,
+        (SELECT COUNT(DISTINCT P_Link.RelatedPostId) FROM PostLinks P_Link WHERE Q.Id = P_Link.PostId AND P_Link.LinkTypeId = 1) AS LinkedQuestionCount,
+        (SELECT COUNT(DISTINCT P_Link.RelatedPostId) FROM PostLinks P_Link WHERE Q.Id = P_Link.PostId AND P_Link.LinkTypeId = 3) AS DuplicateQuestionCount,
+        (SELECT AVG(CAST(A.Score AS numeric)) FROM Posts A WHERE A.ParentId = Q.Id AND A.PostTypeId = 2 AND A.Score IS NOT NULL) AS AvgAnswerScore,
+        MAX(B.Date) AS LastBadgeAwardedToOwner
+    FROM Posts Q
+    LEFT JOIN Votes V ON Q.Id = V.PostId AND V.VoteTypeId IN (2, 3, 8, 9)
+    LEFT JOIN Comments C ON Q.Id = C.PostId
+    LEFT JOIN Users U ON Q.OwnerUserId = U.Id
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN LATERAL (SELECT UNNEST(string_to_array(SUBSTRING(Q.Tags, 2, LENGTH(Q.Tags)-2), '><')) AS TagName) AS TagsRaw ON TRUE
+    LEFT JOIN Tags T ON TagsRaw.TagName = T.TagName
+    WHERE Q.PostTypeId = 1
+    GROUP BY Q.Id, Q.OwnerUserId, Q.Title, Q.ViewCount, Q.Score, Q.AnswerCount, Q.FavoriteCount, Q.CreationDate, Q.LastActivityDate, Q.ClosedDate
+    HAVING COUNT(C.Id) > 0 OR Q.AnswerCount > 0
+),
+HighlyEngagedQuestions AS (
+    SELECT
+        'High Engagement' AS QueryType,
+        UE.DisplayName AS QuestionOwnerName,
+        UE.Reputation AS OwnerReputation,
+        QDS.Title AS QuestionTitle,
+        QDS.QuestionId,
+        QDS.QuestionCreationDate,
+        QDS.ViewCount,
+        QDS.Score AS QuestionScore,
+        QDS.AnswerCount,
+        QDS.FavoriteCount,
+        QDS.UpVoteCount,
+        QDS.DownVoteCount,
+        QDS.CommentCountOnQuestion,
+        QDS.AvgAnswerScore,
+        PHM.EditCount,
+        PHM.UniqueEditors,
+        PHM.WasClosed,
+        PHM.WasReopened,
+        COALESCE(PHM.LastCloseReasonComment, 'N/A') AS LastCloseReasonComment,
+        QDS.AssociatedTags,
+        QDS.LinkedQuestionCount,
+        QDS.DuplicateQuestionCount,
+        (QDS.UpVoteCount - QDS.DownVoteCount) AS NetVotes,
+        (QDS.Score * 1.0 / GREATEST(COALESCE(QDS.ViewCount,0), 1)) AS ScorePerViewRatio,
+        (UE.TotalQuestionsAsked * UE.TotalPostsCreated) AS OwnerActivityIndex,
+        COALESCE(TO_CHAR(QDS.QuestionClosedDate::timestamp, 'YYYY-MM-DD HH24:MI:SS') , 'N/A') AS ClosedDateFormatted,
+        CASE
+            WHEN QDS.QuestionClosedDate > CAST('1900-01-01' AS timestamp) AND PHM.WasReopened = 0 THEN 'Closed_Unreopened'
+            WHEN QDS.QuestionClosedDate > CAST('1900-01-01' AS timestamp) AND PHM.WasReopened = 1 THEN 'Closed_Reopened'
+            WHEN QDS.AnswerCount > 5 AND QDS.Score > 50 THEN 'High_Impact_Question'
+            WHEN QDS.QuestionLastActivityDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 months') THEN 'Recently_Active'
+            ELSE 'Older_Or_Less_Active'
+        END AS QuestionCategory,
+        NTILE(5) OVER (ORDER BY QDS.Score DESC, QDS.ViewCount DESC) AS QuintileRankByEngagement,
+        LAG(QDS.QuestionCreationDate, 1, CAST('1900-01-01' AS timestamp)) OVER (PARTITION BY UE.UserId ORDER BY QDS.QuestionCreationDate) AS PreviousQuestionDateByOwner,
+        LEAD(QDS.QuestionCreationDate, 1, CAST('2100-01-01' AS timestamp)) OVER (PARTITION BY UE.UserId ORDER BY QDS.QuestionCreationDate) AS NextQuestionDateByOwner,
+        ARRAY_TO_STRING(PHM.SignificantHistoryEvents, ';') AS SignificantHistoryEventTypes,
+        (SELECT COUNT(DISTINCT A.OwnerUserId)
+         FROM Posts A
+         WHERE A.ParentId = QDS.QuestionId
+           AND A.PostTypeId = 2
+           AND A.OwnerUserId IS NOT NULL
+           AND EXISTS (
+               SELECT 1
+               FROM Users U2
+               WHERE U2.Id = A.OwnerUserId AND U2.Reputation > UE.Reputation * 1.5
+           )
+        ) AS CountOfHighReputationAnswerers
+    FROM QuestionDerivedStats QDS
+    INNER JOIN UserEngagement UE ON QDS.OwnerUserId = UE.UserId
+    LEFT JOIN PostHistoricalMetrics PHM ON QDS.QuestionId = PHM.PostId
+    WHERE
+        COALESCE(QDS.ViewCount, 0) > 5000
+        AND QDS.Score > 20
+        AND QDS.AnswerCount > 2
+        AND QDS.AvgAnswerScore IS NOT NULL AND QDS.AvgAnswerScore > 5
+        AND QDS.QuestionCreationDate BETWEEN CAST('2019-01-01' AS timestamp) AND CAST('2023-12-31' AS timestamp)
+),
+HistoricallyComplexQuestions AS (
+    SELECT
+        'Historical Complexity' AS QueryType,
+        UE.DisplayName AS QuestionOwnerName,
+        UE.Reputation AS OwnerReputation,
+        QDS.Title AS QuestionTitle,
+        QDS.QuestionId,
+        QDS.QuestionCreationDate,
+        QDS.ViewCount,
+        QDS.Score AS QuestionScore,
+        QDS.AnswerCount,
+        QDS.FavoriteCount,
+        QDS.UpVoteCount,
+        QDS.DownVoteCount,
+        QDS.CommentCountOnQuestion,
+        QDS.AvgAnswerScore,
+        PHM.EditCount,
+        PHM.UniqueEditors,
+        PHM.WasClosed,
+        PHM.WasReopened,
+        COALESCE(PHM.LastCloseReasonComment, 'N/A') AS LastCloseReasonComment,
+        QDS.AssociatedTags,
+        QDS.LinkedQuestionCount,
+        QDS.DuplicateQuestionCount,
+        (QDS.UpVoteCount - QDS.DownVoteCount) AS NetVotes,
+        (QDS.Score * 1.0 / GREATEST(COALESCE(QDS.ViewCount,0), 1)) AS ScorePerViewRatio,
+        (UE.TotalQuestionsAsked * UE.TotalPostsCreated) AS OwnerActivityIndex,
+        COALESCE(TO_CHAR(QDS.QuestionClosedDate::timestamp, 'YYYY-MM-DD HH24:MI:SS'), 'N/A') AS ClosedDateFormatted,
+        CASE
+            WHEN QDS.QuestionClosedDate > CAST('1900-01-01' AS timestamp) AND PHM.WasReopened = 0 THEN 'Closed_Unreopened'
+            WHEN QDS.QuestionClosedDate > CAST('1900-01-01' AS timestamp) AND PHM.WasReopened = 1 THEN 'Closed_Reopened'
+            WHEN QDS.AnswerCount > 5 AND QDS.Score > 50 THEN 'High_Impact_Question'
+            WHEN QDS.QuestionLastActivityDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 months') THEN 'Recently_Active'
+            ELSE 'Older_Or_Less_Active'
+        END AS QuestionCategory,
+        NTILE(5) OVER (ORDER BY PHM.EditCount DESC, PHM.UniqueEditors DESC) AS QuintileRankByEngagement,
+        LAG(QDS.QuestionCreationDate, 1, CAST('1900-01-01' AS timestamp)) OVER (PARTITION BY UE.UserId ORDER BY QDS.QuestionCreationDate) AS PreviousQuestionDateByOwner,
+        LEAD(QDS.QuestionCreationDate, 1, CAST('2100-01-01' AS timestamp)) OVER (PARTITION BY UE.UserId ORDER BY QDS.QuestionCreationDate) AS NextQuestionDateByOwner,
+        ARRAY_TO_STRING(PHM.SignificantHistoryEvents, ';') AS SignificantHistoryEventTypes,
+        (SELECT COUNT(DISTINCT A.OwnerUserId)
+         FROM Posts A
+         WHERE A.ParentId = QDS.QuestionId
+           AND A.PostTypeId = 2
+           AND A.OwnerUserId IS NOT NULL
+           AND EXISTS (
+               SELECT 1
+               FROM Users U2
+               WHERE U2.Id = A.OwnerUserId AND U2.Reputation > UE.Reputation * 1.5
+           )
+        ) AS CountOfHighReputationAnswerers
+    FROM QuestionDerivedStats QDS
+    INNER JOIN UserEngagement UE ON QDS.OwnerUserId = UE.UserId
+    INNER JOIN PostHistoricalMetrics PHM ON QDS.QuestionId = PHM.PostId
+    WHERE
+        PHM.EditCount > 5
+        AND PHM.UniqueEditors > 1
+        AND (PHM.WasClosed = 1 OR PHM.WasReopened = 1)
+        AND QDS.QuestionCreationDate BETWEEN CAST('2010-01-01' AS timestamp) AND CAST('2023-12-31' AS timestamp)
+)
+SELECT * FROM HighlyEngagedQuestions
+UNION ALL
+SELECT * FROM HistoricallyComplexQuestions
+ORDER BY
+    OwnerReputation DESC,
+    QuestionCreationDate DESC,
+    QuestionScore DESC
+LIMIT 2000;

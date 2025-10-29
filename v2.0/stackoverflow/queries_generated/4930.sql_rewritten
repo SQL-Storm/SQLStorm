@@ -1,0 +1,127 @@
+-- {"query": "4930.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1530} 
+WITH RankedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        pt.Name AS PostTypeName,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) as rn_desc,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate ASC) as rn_asc,
+        AVG(CAST(p.Score AS FLOAT)) OVER (PARTITION BY p.PostTypeId) as avg_score_per_type
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.OwnerUserId IS NOT NULL AND p.OwnerUserId <> -1
+),
+UserPostActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(rp.PostId) AS TotalPosts,
+        SUM(CASE WHEN rp.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN rp.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        SUM(rp.PostScore) AS TotalScoreReceived,
+        SUM(CASE WHEN rp.ClosedDate IS NOT NULL THEN 1 ELSE 0 END) AS ClosedPostsCount,
+        AVG(CAST(rp.PostScore AS FLOAT)) AS AvgScorePerPost,
+        MAX(rp.PostCreationDate) AS LatestPostDate
+    FROM Users u
+    LEFT JOIN RankedPosts rp ON u.Id = rp.OwnerUserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+RecentHighScoringQuestions AS (
+    SELECT
+        rp.PostId,
+        rp.OwnerUserId,
+        rp.PostTypeName,
+        rp.PostCreationDate,
+        rp.PostScore,
+        rp.AnswerCount,
+        rp.CommentCount,
+        rp.FavoriteCount,
+        rp.avg_score_per_type,
+        u.DisplayName AS OwnerDisplayName,
+        DATEDIFF(day, rp.PostCreationDate, cast('2024-10-01 12:34:56' as timestamp)) AS DaysSinceCreation
+    FROM RankedPosts rp
+    JOIN Users u ON rp.OwnerUserId = u.Id
+    WHERE rp.PostTypeId = 1
+      AND rp.rn_asc <= 100 -- Consider the first 100 questions chronologically for each type
+      AND rp.PostScore > rp.avg_score_per_type * 1.5 -- Score is significantly above average for its type
+      AND rp.PostScore > 10 -- Minimum score threshold
+      AND rp.DaysSinceCreation < 365 -- Created within the last year
+),
+UserCommentsOnHighScoringQuestions AS (
+    SELECT
+        c.UserId,
+        c.PostId,
+        c.CreationDate AS CommentCreationDate,
+        c.Score AS CommentScore,
+        c.Text AS CommentText,
+        CASE
+            WHEN CHARINDEX('best', LOWER(c.Text)) > 0 THEN 'Positive'
+            WHEN CHARINDEX('great', LOWER(c.Text)) > 0 THEN 'Positive'
+            WHEN CHARINDEX('excellent', LOWER(c.Text)) > 0 THEN 'Positive'
+            WHEN CHARINDEX('useful', LOWER(c.Text)) > 0 THEN 'Positive'
+            WHEN CHARINDEX('thank', LOWER(c.Text)) > 0 THEN 'Positive'
+            WHEN CHARINDEX('agree', LOWER(c.Text)) > 0 THEN 'Positive'
+            WHEN CHARINDEX('disagree', LOWER(c.Text)) > 0 THEN 'Negative'
+            WHEN CHARINDEX('wrong', LOWER(c.Text)) > 0 THEN 'Negative'
+            WHEN CHARINDEX('bad', LOWER(c.Text)) > 0 THEN 'Negative'
+            ELSE 'Neutral'
+        END AS Sentiment,
+        ROW_NUMBER() OVER (PARTITION BY c.PostId ORDER BY c.CreationDate ASC) as comment_rn_asc
+    FROM Comments c
+    JOIN RecentHighScoringQuestions rhsq ON c.PostId = rhsq.PostId
+    WHERE c.UserId IS NOT NULL AND c.UserId <> -1 AND c.CommentScore >= 0
+)
+SELECT
+    upa.DisplayName AS UserDisplayName,
+    upa.Reputation,
+    upa.UserCreationDate,
+    upa.TotalPosts,
+    upa.QuestionCount,
+    upa.AnswerCount,
+    upa.TotalScoreReceived,
+    upa.ClosedPostsCount,
+    upa.AvgScorePerPost,
+    upa.LatestPostDate,
+    rhsq.PostId AS TopQuestionId,
+    rhsq.PostTypeName,
+    rhsq.PostScore AS TopQuestionScore,
+    rhsq.AnswerCount AS TopQuestionAnswerCount,
+    rhsq.FavoriteCount AS TopQuestionFavoriteCount,
+    rhsq.DaysSinceCreation AS DaysSinceTopQuestionCreation,
+    ucc.UserId AS CommenterUserId,
+    ucc.CommenterDisplayName,
+    ucc.CommentCreationDate,
+    ucc.CommentScore AS CommentScoreOnTopQuestion,
+    ucc.Sentiment AS CommentSentiment,
+    ucc.CommentText AS CommentOnTopQuestion
+FROM UserPostActivity upa
+JOIN RecentHighScoringQuestions rhsq ON upa.UserId = rhsq.OwnerUserId
+LEFT JOIN (
+    SELECT
+        ucc.UserId,
+        u.DisplayName AS CommenterDisplayName,
+        ucc.PostId,
+        ucc.CommentCreationDate,
+        ucc.CommentScore,
+        ucc.Sentiment,
+        ucc.CommentText
+    FROM UserCommentsOnHighScoringQuestions ucc
+    JOIN Users u ON ucc.UserId = u.Id
+    WHERE ucc.comment_rn_asc = 1 -- Only consider the first comment made on a question by any user
+) ucc ON rhsq.PostId = ucc.PostId
+WHERE upa.TotalPosts > 50 -- Users with at least 50 posts
+  AND upa.Reputation > 1000 -- Users with a decent reputation
+  AND upa.UserCreationDate < DATEADD(year, -1, cast('2024-10-01 12:34:56' as timestamp)) -- Users created more than a year ago
+  AND rhsq.PostScore > 50 -- The high-scoring question must have a score greater than 50
+  ANDucc.UserId IS NOT NULL -- Ensure there's at least one comment on the high-scoring question by a different user
+ORDER BY upa.Reputation DESC, upa.TotalScoreReceived DESC, rhsq.PostScore DESC
+LIMIT 100;

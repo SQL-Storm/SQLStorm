@@ -1,0 +1,146 @@
+-- {"query": "2355.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1387} 
+with RecursiveTagCTE as (
+    select
+        t.Id as TagId,
+        t.TagName,
+        t.Count,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        p.Id as ExcerptPostId,
+        p.Title as ExcerptTitle,
+        p.CreationDate as ExcerptCreationDate
+    from Tags t
+    left join Posts p on p.Id = t.ExcerptPostId
+    where t.Count > 1000 and t.IsModeratorOnly = 0
+
+    union all
+
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.IsModeratorOnly,
+        t2.IsRequired,
+        p2.Id,
+        p2.Title,
+        p2.CreationDate
+    from Tags t2
+    inner join RecursiveTagCTE r on r.TagId != t2.Id
+    left join Posts p2 on p2.Id = t2.ExcerptPostId
+    where t2.Count > 1000 and t2.IsModeratorOnly = 0
+    and t2.Id > r.TagId
+    limit 50
+),
+LatestUserBadges as (
+    select
+        b.UserId,
+        b.Name,
+        b.Class,
+        b.Date,
+        row_number() over (partition by b.UserId order by b.Date desc, b.Id desc) as rn
+    from Badges b
+    where b.Class in (1,2,3)
+),
+UserStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        coalesce(u.Views, 0) as Views,
+        coalesce(u.UpVotes, 0) as UpVotes,
+        coalesce(u.DownVotes, 0) as DownVotes,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p2.Id) filter (where p2.PostTypeId = 2) as AnswerCount,
+        count(distinct c.Id) as CommentCount,
+        max(b.Date) as LastBadgeDate,
+        count(distinct b.Id) as TotalBadges
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 1
+    left join Posts p2 on p2.OwnerUserId = u.Id and p2.PostTypeId = 2
+    left join Comments c on c.UserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Views, u.UpVotes, u.DownVotes
+),
+TopPostsByUser as (
+    select
+        p.OwnerUserId as UserId,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc) as rn
+    from Posts p
+    where p.PostTypeId in (1, 2) and p.Score > 0
+),
+UserAcceptedAnswerCount as (
+    select
+        p.OwnerUserId as UserId,
+        count(1) as AcceptedAnswersCount
+    from Posts p
+    where p.PostTypeId = 2 and exists (
+        select 1 from Posts q where q.AcceptedAnswerId = p.Id
+    )
+    group by p.OwnerUserId
+)
+select
+    u.UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.QuestionCount,
+    u.AnswerCount,
+    u.CommentCount,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.TotalBadges,
+    coalesce(ua.AcceptedAnswersCount, 0) as AcceptedAnswersCount,
+    latestBadge.Name as LatestBadgeName,
+    latestBadge.Class as LatestBadgeClass,
+    case
+        when u.Reputation > 100000 then 'Legend'
+        when u.Reputation between 50000 and 100000 then 'Expert'
+        when u.Reputation between 10000 and 49999 then 'Intermediate'
+        else 'Novice'
+    end as ReputationCategory,
+    -- Aggregate tags this user has used in posts (questions only)
+    (
+        select string_agg(distinct substring(t.TagName from 1 for 10), ', ')
+        from Posts pq
+        cross join lateral unnest(string_to_array(substring(pq.Tags from 2 for char_length(pq.Tags)-2), '><')) as t(TagName)
+        where pq.OwnerUserId = u.UserId and pq.PostTypeId = 1 and pq.Tags is not null
+        and t.TagName is not null
+    ) as TopTagsSample,
+    -- Most recent question by user with its title and tags
+    recentQ.Title as RecentQuestionTitle,
+    recentQ.Tags as RecentQuestionTags,
+    -- Count of duplicates linked to their questions
+    (
+        select count(distinct pl.PostId)
+        from PostLinks pl
+        where pl.LinkTypeId = 3
+        and pl.PostId in (
+            select Id from Posts where OwnerUserId = u.UserId and PostTypeId = 1
+        )
+    ) as DuplicateQuestionsCount,
+    -- Compute score to view ratio averaged over top scored posts of user
+    avg(case when p.ViewCount > 0 then (p.Score::numeric / p.ViewCount) else null end) as AvgScoreViewRatio
+from UserStats u
+left join UserAcceptedAnswerCount ua on ua.UserId = u.UserId
+left join LatestUserBadges latestBadge on latestBadge.UserId = u.UserId and latestBadge.rn = 1
+left join (
+    select distinct on (OwnerUserId)
+        OwnerUserId,
+        Title,
+        Tags,
+        CreationDate
+    from Posts
+    where PostTypeId = 1
+    order by OwnerUserId, CreationDate desc
+) recentQ on recentQ.OwnerUserId = u.UserId
+left join Posts p on p.OwnerUserId = u.UserId and p.PostTypeId in (1,2)
+group by u.UserId, u.DisplayName, u.Reputation, u.QuestionCount, u.AnswerCount, u.CommentCount, u.Views, u.UpVotes, u.DownVotes, u.TotalBadges, ua.AcceptedAnswersCount, latestBadge.Name, latestBadge.Class, recentQ.Title, recentQ.Tags
+having count(distinct p.Id) > 5
+order by u.Reputation desc nulls last, AcceptedAnswersCount desc nulls last
+limit 100;

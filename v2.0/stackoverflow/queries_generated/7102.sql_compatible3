@@ -1,0 +1,524 @@
+WITH PostStats AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        COALESCE(p.AnswerCount, 0) AS AnswerCountCoalesced,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.Score > 100 THEN 'HighlyVotedQuestion'
+            WHEN p.PostTypeId = 1 AND p.Score <= 100 THEN 'RegularQuestion'
+            WHEN p.PostTypeId = 2 AND p.Score > 50 THEN 'HighlyVotedAnswer'
+            WHEN p.PostTypeId = 2 AND p.Score <= 50 THEN 'RegularAnswer'
+            ELSE 'Other'
+        END AS PostCategory,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevScore,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS UserPostRank,
+        RANK() OVER (ORDER BY p.Score DESC) AS GlobalScoreRank,
+        DENSE_RANK() OVER (ORDER BY p.ViewCount DESC) AS GlobalViewRank,
+        NTILE(10) OVER (ORDER BY p.Score) AS ScoreDecile,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags != '' THEN 
+                (SELECT COUNT(*) FROM unnest(string_to_array(trim(both '<' FROM trim(both '>' FROM p.Tags)), '><')) AS tag)
+            ELSE 0 
+        END AS TagCount,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.PostTypeId = 1 AND p.CommunityOwnedDate IS NOT NULL THEN 'CommunityOwned'
+            WHEN p.PostTypeId = 2 AND EXISTS (SELECT 1 FROM Posts WHERE ParentId = p.Id AND PostTypeId = 2 AND Score > 100) THEN 'AnswerWithHighScore'
+            ELSE 'Active'
+        END AS Status,
+        COALESCE(
+            (SELECT SUM(v.BountyAmount) 
+             FROM Votes v 
+             WHERE v.PostId = p.Id AND v.VoteTypeId = 8), 
+            0
+        ) AS TotalBounty,
+        COALESCE(
+            (SELECT AVG(v.BountyAmount) 
+             FROM Votes v 
+             WHERE v.PostId = p.Id AND v.VoteTypeId = 9), 
+            0
+        ) AS AverageBounty,
+        COALESCE(p.Body, '') AS CleanBody,
+        TRIM(LOWER(p.Title)) AS LowerTitle,
+        CASE 
+            WHEN LENGTH(p.Body) > 1000 THEN 'Long'
+            WHEN LENGTH(p.Body) > 500 THEN 'Medium'
+            WHEN LENGTH(p.Body) > 100 THEN 'Short'
+            ELSE 'VeryShort'
+        END AS BodyLengthCategory
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserPerformance AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT PostStats.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN PostStats.PostTypeId = 1 THEN PostStats.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN PostStats.PostTypeId = 2 THEN PostStats.Id END) AS TotalAnswers,
+        SUM(COALESCE(PostStats.Score, 0)) AS TotalScore,
+        AVG(COALESCE(PostStats.Score, 0)) AS AverageScore,
+        MAX(COALESCE(PostStats.Score, 0)) AS MaxScore,
+        MIN(COALESCE(PostStats.Score, 0)) AS MinScore,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY COALESCE(PostStats.Score, 0)) AS MedianScore,
+        STRING_AGG(PostStats.Title, ', ') AS AllTitles,
+        COUNT(DISTINCT PostStats.AnswerCountCoalesced) AS UniqueAnswerCounts,
+        SUM(CASE WHEN PostStats.Status = 'Closed' THEN 1 ELSE 0 END) AS ClosedPosts,
+        SUM(CASE WHEN PostStats.Status = 'CommunityOwned' THEN 1 ELSE 0 END) AS CommunityOwnedPosts,
+        SUM(CASE WHEN PostStats.Status = 'AnswerWithHighScore' THEN 1 ELSE 0 END) AS HighScoreAnswers,
+        ROUND(
+            (SUM(COALESCE(PostStats.Score, 0)) * 100.0) / NULLIF(SUM(COALESCE(PostStats.ViewCount, 0)), 0), 
+            2
+        ) AS ScorePerView,
+        CASE 
+            WHEN (COALESCE(u.UpVotes, 0) - COALESCE(u.DownVotes, 0)) >= 1000 THEN 'HighlyUpvoted'
+            WHEN (COALESCE(u.UpVotes, 0) - COALESCE(u.DownVotes, 0)) >= 500 THEN 'ModeratelyUpvoted'
+            ELSE 'LowUpvoted'
+        END AS ReputationCategory,
+        ROW_NUMBER() OVER (ORDER BY SUM(COALESCE(PostStats.Score, 0)) DESC) AS UserRank,
+        NTILE(5) OVER (ORDER BY SUM(COALESCE(PostStats.Score, 0)) DESC) AS UserScoreQuintile,
+        LAG(SUM(COALESCE(PostStats.Score, 0)), 1) OVER (ORDER BY SUM(COALESCE(PostStats.Score, 0)) DESC) AS PreviousUserScore,
+        (SUM(COALESCE(PostStats.Score, 0)) - LAG(SUM(COALESCE(PostStats.Score, 0)), 1) OVER (ORDER BY SUM(COALESCE(PostStats.Score, 0)) DESC)) AS ScoreDifference,
+        COALESCE(
+            (SELECT AVG(ps2.Score) 
+             FROM Posts ps2 
+             WHERE ps2.OwnerUserId = u.Id AND ps2.PostTypeId = 1), 
+            0
+        ) AS AvgQuestionScore,
+        COALESCE(
+            (SELECT AVG(ps2.Score) 
+             FROM Posts ps2 
+             WHERE ps2.OwnerUserId = u.Id AND ps2.PostTypeId = 2), 
+            0
+        ) AS AvgAnswerScore,
+        COALESCE(
+            (SELECT COUNT(v.Id) 
+             FROM Votes v 
+             WHERE v.UserId = u.Id AND v.VoteTypeId IN (2, 3)), 
+            0
+        ) AS TotalVotesCast
+    FROM Users u
+    LEFT JOIN PostStats ON PostStats.OwnerUserId = u.Id
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes
+),
+PostsWithComplexCalculations AS (
+    SELECT 
+        PostStats.Id AS PostId,
+        PostStats.Title,
+        PostStats.OwnerUserId,
+        PostStats.Score,
+        PostStats.ViewCount,
+        PostStats.AnswerCount,
+        PostStats.CommentCount,
+        PostStats.FavoriteCount,
+        PostStats.CreationDate,
+        PostStats.PostCategory,
+        PostStats.ScoreDecile,
+        PostStats.TagCount,
+        PostStats.BodyLengthCategory,
+        PostStats.TotalBounty,
+        PostStats.AverageBounty,
+        PostStats.Status,
+        PostStats.GlobalScoreRank,
+        PostStats.GlobalViewRank,
+        PostStats.PrevScore,
+        PostStats.UserPostRank,
+        CASE 
+            WHEN PostStats.PrevScore IS NOT NULL THEN 
+                CASE 
+                    WHEN PostStats.Score > PostStats.PrevScore THEN 'Increased'
+                    WHEN PostStats.Score < PostStats.PrevScore THEN 'Decreased'
+                    ELSE 'Unchanged'
+                END
+            ELSE 'New'
+        END AS ScoreChange,
+        CASE 
+            WHEN PostStats.AnswerCount > 0 and PostStats.AnswerCount >= 3 THEN 'WellAnswered'
+            WHEN PostStats.AnswerCount > 0 and PostStats.AnswerCount < 3 THEN 'PartiallyAnswered'
+            ELSE 'Unanswered'
+        END AS AnswerStatus,
+        CASE 
+            WHEN PostStats.CommentCount > 0 AND PostStats.CommentCount <= 3 THEN 'FewComments'
+            WHEN PostStats.CommentCount > 3 THEN 'ManyComments'
+            ELSE 'NoComments'
+        END AS CommentStatus,
+        PostStats.LowerTitle,
+        CASE 
+            WHEN PostStats.LowerTitle LIKE '%sql%' OR PostStats.LowerTitle LIKE '%query%' OR PostStats.LowerTitle LIKE '%database%' THEN 'Technical'
+            WHEN PostStats.LowerTitle LIKE '%how%' OR PostStats.LowerTitle LIKE '%what%' OR PostStats.LowerTitle LIKE '%why%' THEN 'Questionable'
+            ELSE 'General'
+        END AS QuestionType,
+        PostStats.CleanBody,
+        (CASE WHEN PostStats.CleanBody = '' THEN TRUE ELSE FALSE END) AS IsEmptyBody,
+        LENGTH(PostStats.CleanBody) AS BodyLength,
+        (PostStats.TagCount > 0) AS HasTags,
+        PostStats.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) AS AboveAverageScore,
+        CASE 
+            WHEN EXISTS (
+                SELECT 1 FROM PostHistory ph 
+                WHERE ph.PostId = PostStats.Id 
+                AND ph.PostHistoryTypeId IN (10, 11, 12, 13) 
+                AND ph.CreationDate > PostStats.CreationDate
+            ) THEN 'HasHistory'
+            ELSE 'NoHistory'
+        END AS HasEditHistory
+    FROM PostStats
+),
+CorrelatedSubqueryResults AS (
+    SELECT 
+        pwcc.PostId,
+        pwcc.OwnerUserId,
+        pwcc.Title,
+        pwcc.Score,
+        pwcc.ViewCount,
+        pwcc.TagCount,
+        pwcc.BodyLengthCategory,
+        pwcc.Status,
+        pwcc.QuestionType,
+        pwcc.ScoreChange,
+        pwcc.AnswerStatus,
+        pwcc.CommentStatus,
+        pwcc.HasEditHistory,
+        CASE 
+            WHEN EXISTS (
+                SELECT 1 
+                FROM Posts p 
+                WHERE p.ParentId = pwcc.PostId 
+                AND p.PostTypeId = 2 
+                AND p.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 2)
+            ) THEN 1
+            ELSE 0
+        END AS HasAboveAvgAnswer,
+        CASE 
+            WHEN (
+                SELECT COUNT(*) 
+                FROM Votes v 
+                WHERE v.PostId = pwcc.PostId AND v.VoteTypeId IN (2, 3)
+            ) > (
+                SELECT AVG(v2.Count) 
+                FROM (
+                    SELECT COUNT(*) AS Count 
+                    FROM Votes v3 
+                    WHERE v3.PostId IN (SELECT Id FROM Posts WHERE PostTypeId = 1) 
+                    AND v3.VoteTypeId IN (2, 3) 
+                    GROUP BY v3.PostId
+                ) v2
+            ) THEN 1
+            ELSE 0
+        END AS AboveAvgVotes,
+        COALESCE(
+            (SELECT COUNT(DISTINCT v1.UserId) 
+             FROM Votes v1 
+             WHERE v1.PostId = pwcc.PostId 
+             AND v1.VoteTypeId = 1
+            ), 
+            0
+        ) AS AcceptanceCount,
+        COALESCE(
+            (SELECT COUNT(DISTINCT vt2.Id) 
+             FROM VoteTypes vt2 
+             WHERE vt2.Id = 1
+            ), 
+            0
+        ) AS IsAcceptedVoteType,
+        COALESCE(
+            (SELECT MIN(p3.CreationDate) 
+             FROM Posts p3 
+             WHERE p3.OwnerUserId = pwcc.OwnerUserId 
+             AND p3.PostTypeId = 1
+            ), 
+            pwcc.CreationDate
+        ) AS FirstQuestionDate,
+        COALESCE(
+            (SELECT MAX(p4.CreationDate) 
+             FROM Posts p4 
+             WHERE p4.OwnerUserId = pwcc.OwnerUserId 
+             AND p4.PostTypeId = 2
+            ), 
+            pwcc.CreationDate
+        ) AS LastAnswerDate,
+        CASE 
+            WHEN pwcc.AnswerCount > 0 THEN 
+                (
+                    SELECT AVG(p5.Score) 
+                    FROM Posts p5 
+                    WHERE p5.ParentId = pwcc.PostId 
+                    AND p5.PostTypeId = 2
+                )
+            ELSE NULL
+        END AS AvgAnswerScore,
+        CASE 
+            WHEN pwcc.CommentCount > 0 THEN 
+                (
+                    SELECT AVG(c1.Score) 
+                    FROM Comments c1 
+                    WHERE c1.PostId = pwcc.PostId
+                )
+            ELSE NULL
+        END AS AvgCommentScore,
+        pwcc.GlobalScoreRank,
+        pwcc.GlobalViewRank,
+        pwcc.GlobalScoreRank - pwcc.GlobalViewRank AS ScoreViewRankDifference
+    FROM PostsWithComplexCalculations pwcc
+),
+FinalPostAnalysis AS (
+    SELECT 
+        csr.PostId,
+        csr.OwnerUserId,
+        csr.Title,
+        csr.Score,
+        csr.ViewCount,
+        csr.TagCount,
+        csr.BodyLengthCategory,
+        csr.Status,
+        csr.QuestionType,
+        csr.ScoreChange,
+        csr.AnswerStatus,
+        csr.CommentStatus,
+        csr.HasEditHistory,
+        csr.HasAboveAvgAnswer,
+        csr.AboveAvgVotes,
+        csr.AcceptanceCount,
+        csr.IsAcceptedVoteType,
+        csr.FirstQuestionDate,
+        csr.LastAnswerDate,
+        csr.AvgAnswerScore,
+        csr.AvgCommentScore,
+        csr.GlobalScoreRank,
+        csr.GlobalViewRank,
+        csr.ScoreViewRankDifference,
+        CASE 
+            WHEN csr.AvgAnswerScore IS NOT NULL AND csr.AvgAnswerScore > 50 THEN 'HighAvgAnswerScore'
+            WHEN csr.AvgAnswerScore IS NOT NULL AND csr.AvgAnswerScore > 20 THEN 'MediumAvgAnswerScore'
+            ELSE 'LowAvgAnswerScore'
+        END AS AnswerScoreCategory,
+        CASE 
+            WHEN csr.AvgCommentScore IS NOT NULL AND csr.AvgCommentScore > 10 THEN 'HighAvgCommentScore'
+            WHEN csr.AvgCommentScore IS NOT NULL AND csr.AvgCommentScore > 5 THEN 'MediumAvgCommentScore'
+            ELSE 'LowAvgCommentScore'
+        END AS CommentScoreCategory,
+        CASE 
+            WHEN csr.Score > 100 THEN 'VeryHighScore'
+            WHEN csr.Score > 50 THEN 'HighScore'
+            WHEN csr.Score > 10 THEN 'MediumScore'
+            ELSE 'LowScore'
+        END AS ScoreCategory
+    FROM CorrelatedSubqueryResults csr
+    WHERE csr.OwnerUserId IS NOT NULL
+),
+UserDetailAnalysis AS (
+    SELECT 
+        up.UserId,
+        up.Reputation,
+        up.DisplayName,
+        up.Views,
+        up.UpVotes,
+        up.DownVotes,
+        up.TotalPosts,
+        up.TotalQuestions,
+        up.TotalAnswers,
+        up.TotalScore,
+        up.AverageScore,
+        up.MaxScore,
+        up.MinScore,
+        up.MedianScore,
+        up.AllTitles,
+        up.UniqueAnswerCounts,
+        up.ClosedPosts,
+        up.CommunityOwnedPosts,
+        up.HighScoreAnswers,
+        up.ScorePerView,
+        up.ReputationCategory,
+        up.UserRank,
+        up.UserScoreQuintile,
+        up.ScoreDifference,
+        up.AvgQuestionScore,
+        up.AvgAnswerScore,
+        up.TotalVotesCast,
+        CASE 
+            WHEN up.TotalAnswers > 0 THEN 
+                (CAST(up.TotalScore AS NUMERIC) / up.TotalAnswers)
+            ELSE 0
+        END AS AvgScorePerAnswer,
+        CASE 
+            WHEN up.TotalQuestions > 0 THEN 
+                (CAST(up.TotalScore AS NUMERIC) / up.TotalQuestions)
+            ELSE 0
+        END AS AvgScorePerQuestion,
+        CASE 
+            WHEN up.TotalPosts > 0 THEN 
+                ROUND((CAST(up.UpVotes AS NUMERIC) / up.TotalPosts) * 100, 2)
+            ELSE 0
+        END AS UpVotePercentage,
+        CASE 
+            WHEN up.TotalPosts > 0 THEN 
+                ROUND((CAST(up.DownVotes AS NUMERIC) / up.TotalPosts) * 100, 2)
+            ELSE 0
+        END AS DownVotePercentage
+    FROM UserPerformance up
+),
+CombinedAnalysis AS (
+    SELECT 
+        fpa.PostId,
+        fpa.OwnerUserId,
+        fpa.Title,
+        fpa.Score,
+        fpa.ViewCount,
+        fpa.TagCount,
+        fpa.BodyLengthCategory,
+        fpa.Status,
+        fpa.QuestionType,
+        fpa.ScoreChange,
+        fpa.AnswerStatus,
+        fpa.CommentStatus,
+        fpa.HasEditHistory,
+        fpa.HasAboveAvgAnswer,
+        fpa.AboveAvgVotes,
+        fpa.AcceptanceCount,
+        fpa.IsAcceptedVoteType,
+        fpa.FirstQuestionDate,
+        fpa.LastAnswerDate,
+        fpa.AvgAnswerScore,
+        fpa.AvgCommentScore,
+        fpa.GlobalScoreRank,
+        fpa.GlobalViewRank,
+        fpa.ScoreViewRankDifference,
+        fpa.AnswerScoreCategory,
+        fpa.CommentScoreCategory,
+        fpa.ScoreCategory,
+        uda.Reputation,
+        uda.DisplayName,
+        uda.Views AS UserViews,
+        uda.UpVotes AS UserUpVotes,
+        uda.DownVotes AS UserDownVotes,
+        uda.TotalPosts AS UserTotalPosts,
+        uda.TotalQuestions AS UserTotalQuestions,
+        uda.TotalAnswers AS UserTotalAnswers,
+        uda.TotalScore AS UserTotalScore,
+        uda.AverageScore AS UserAverageScore,
+        uda.MaxScore AS UserMaxScore,
+        uda.MinScore AS UserMinScore,
+        uda.MedianScore AS UserMedianScore,
+        uda.AllTitles AS UserAllTitles,
+        uda.UniqueAnswerCounts AS UserUniqueAnswerCounts,
+        uda.ClosedPosts AS UserClosedPosts,
+        uda.CommunityOwnedPosts AS UserCommunityOwnedPosts,
+        uda.HighScoreAnswers AS UserHighScoreAnswers,
+        uda.ScorePerView AS UserScorePerView,
+        uda.ReputationCategory AS UserReputationCategory,
+        uda.UserRank,
+        uda.UserScoreQuintile,
+        uda.ScoreDifference AS UserScoreDifference,
+        uda.AvgQuestionScore AS UserAvgQuestionScore,
+        uda.AvgAnswerScore AS UserAvgAnswerScore,
+        uda.TotalVotesCast AS UserTotalVotesCast,
+        uda.AvgScorePerAnswer,
+        uda.AvgScorePerQuestion,
+        uda.UpVotePercentage,
+        uda.DownVotePercentage,
+        ROW_NUMBER() OVER (ORDER BY fpa.Score DESC, fpa.ViewCount DESC) AS CombinedRank,
+        PERCENT_RANK() OVER (ORDER BY fpa.Score DESC) AS ScorePercentileRank,
+        RANK() OVER (ORDER BY uda.TotalScore DESC) AS UserScoreRank,
+        CASE 
+            WHEN fpa.AvgAnswerScore > 20 THEN 'High'
+            WHEN fpa.AvgAnswerScore > 10 THEN 'Medium'
+            ELSE 'Low'
+        END AS AnswerQuality,
+        CASE 
+            WHEN fpa.AvgCommentScore > 5 THEN 'High'
+            WHEN fpa.AvgCommentScore > 2 THEN 'Medium'
+            ELSE 'Low'
+        END AS CommentQuality,
+        CASE 
+            WHEN uda.UserTotalPosts > 50 THEN 'HighActivity'
+            WHEN uda.UserTotalPosts > 20 THEN 'ModerateActivity'
+            ELSE 'LowActivity'
+        END AS UserActivityLevel,
+        CASE 
+            WHEN fpa.Status = 'Closed' THEN 'ClosedPost'
+            WHEN fpa.Status = 'CommunityOwned' THEN 'CommunityOwnedPost'
+            ELSE 'RegularPost'
+        END AS PostClassification,
+        CASE 
+            WHEN fpa.HasEditHistory = 'HasHistory' THEN 1
+            ELSE 0
+        END AS HasEditHistoryFlag,
+        CASE 
+            WHEN fpa.HasAboveAvgAnswer = 1 THEN 1
+            ELSE 0
+        END AS HasAboveAvgAnswerFlag,
+        CASE 
+            WHEN fpa.AboveAvgVotes = 1 THEN 1
+            ELSE 0
+        END AS AboveAvgVotesFlag
+    FROM FinalPostAnalysis fpa
+    JOIN UserDetailAnalysis uda ON fpa.OwnerUserId = uda.UserId
+)
+SELECT 
+    *
+FROM CombinedAnalysis
+WHERE 
+    ScoreCategory IN ('HighScore', 'VeryHighScore') 
+    AND AnswerStatus IN ('WellAnswered', 'PartiallyAnswered')
+    AND CommentStatus IN ('FewComments', 'ManyComments')
+    AND PostClassification IN ('RegularPost', 'ClosedPost')
+    AND UserActivityLevel IN ('HighActivity', 'ModerateActivity')
+    AND ScorePercentileRank > 0.9
+    AND (Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1))
+    AND (UserTotalScore > (SELECT AVG(UserTotalScore) FROM UserDetailAnalysis))
+    AND (UserTotalPosts > 0)
+    AND (UserTotalAnswers > 0)
+    AND (UserTotalQuestions > 0)
+    AND UserReputationCategory IN ('HighlyUpvoted', 'ModeratelyUpvoted')
+    AND EXISTS (
+        SELECT 1 
+        FROM Posts p 
+        WHERE p.OwnerUserId = CombinedAnalysis.OwnerUserId 
+        AND p.PostTypeId = 1 
+        AND p.Score > 100
+    )
+    AND EXISTS (
+        SELECT 1 
+        FROM Posts p 
+        WHERE p.OwnerUserId = CombinedAnalysis.OwnerUserId 
+        AND p.PostTypeId = 2 
+        AND p.Score > 50
+    )
+    AND (
+        CASE 
+            WHEN UserTotalAnswers = 0 THEN 0
+            ELSE (AvgScorePerAnswer / NULLIF((SELECT AVG(Score) FROM Posts WHERE PostTypeId = 2), 0))
+        END
+    ) > 1
+    AND (
+        CASE 
+            WHEN UserTotalQuestions = 0 THEN 0
+            ELSE (AvgScorePerQuestion / NULLIF((SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1), 0))
+        END
+    ) > 1
+    AND NOT EXISTS (
+        SELECT 1 
+        FROM Posts p 
+        WHERE p.OwnerUserId = CombinedAnalysis.OwnerUserId 
+        AND p.PostTypeId = 2 
+        AND p.Score < 0
+    )
+ORDER BY 
+    Score DESC, 
+    ViewCount DESC, 
+    UserTotalScore DESC
+LIMIT 1000;

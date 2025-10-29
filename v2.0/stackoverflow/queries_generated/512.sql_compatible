@@ -1,0 +1,377 @@
+with
+q_posts as (
+  select p.Id as QuestionId,
+         p.CreationDate as QuestionCreation,
+         p.Score as QScore,
+         p.ViewCount,
+         p.OwnerUserId as QOwnerId,
+         p.AcceptedAnswerId,
+         p.Title,
+         p.Tags,
+         p.ClosedDate,
+         p.CommunityOwnedDate
+  from Posts p
+  where p.PostTypeId = 1
+),
+a_posts as (
+  select a.Id as AnswerId,
+         a.ParentId as QuestionId,
+         a.OwnerUserId as AOwnerId,
+         a.Score as AScore,
+         a.CreationDate as AnswerCreation
+  from Posts a
+  where a.PostTypeId = 2
+),
+answers_enriched as (
+  select a.*,
+         case when a.AScore >= 10 then 'high'
+              when a.AScore between 1 and 9 then 'mid'
+              when a.AScore is null then 'none'
+              else 'low' end as score_bucket
+  from a_posts a
+),
+q_activity as (
+  select ph.PostId as QuestionId,
+         max(case when ph.PostHistoryTypeId in (10,35) then ph.CreationDate end) as LastCloseOrMigrate,
+         max(case when ph.PostHistoryTypeId in (11) then ph.CreationDate end) as LastReopen,
+         sum(case when ph.PostHistoryTypeId in (24) then 1 else 0 end) as SuggestedEditsApplied
+  from PostHistory ph
+  group by ph.PostId
+),
+q_votes as (
+  select v.PostId as QuestionId,
+         sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+         sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+         sum(case when v.VoteTypeId = 5 then 1 else 0 end) as Favorites,
+         sum(case when v.VoteTypeId in (8,9) then coalesce(v.BountyAmount,0) else 0 end) as BountyTotal,
+         min(case when v.VoteTypeId in (8,9) then v.CreationDate end) as FirstBountyDate
+  from Votes v
+  group by v.PostId
+),
+user_stats as (
+  select u.Id as UserId,
+         u.Reputation,
+         u.CreationDate as UserCreated,
+         u.LastAccessDate,
+         u.UpVotes as UserUpVotes,
+         u.DownVotes as UserDownVotes,
+         u.Views as ProfileViews,
+         coalesce(nullif(trim(u.Location),''),'Unknown') as LocationNorm
+  from Users u
+),
+badges_agg as (
+  select b.UserId,
+         sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+         sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+         sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+         sum(case when b.TagBased = 1 then 1 else 0 end) as TagBadges,
+         count(*) as TotalBadges,
+         max(b.Date) as LastBadgeDate
+  from Badges b
+  group by b.UserId
+),
+comment_sentiment as (
+  select c.PostId,
+         avg(c.Score) as AvgCommentScore,
+         sum(case when position('thanks' in lower(c.Text)) > 0 then 1 else 0 end) as ThanksCount,
+         sum(case when position('duplicate' in lower(c.Text)) > 0 then 1 else 0 end) as DuplicateWordCount,
+         count(*) as CommentCount
+  from Comments c
+  group by c.PostId
+),
+tag_expansion as (
+  select qp.QuestionId,
+         unnest(string_to_array(substring(qp.Tags, 2, length(qp.Tags)-2), '><')) as tagname
+  from q_posts qp
+  where qp.Tags is not null and length(qp.Tags) > 2
+),
+tag_stats as (
+  select te.QuestionId,
+         count(*) as TagCount,
+         sum(case when t.IsModeratorOnly = 1 then 1 else 0 end) as ModOnlyTagCount,
+         sum(case when t.IsRequired = 1 then 1 else 0 end) as RequiredTagCount,
+         sum(coalesce(t.Count,0)) as SumGlobalTagUsage
+  from tag_expansion te
+  left join Tags t on lower(t.TagName) = lower(te.tagname)
+  group by te.QuestionId
+),
+dupe_links as (
+  select pl.PostId as QuestionId,
+         count(*) filter (where pl.LinkTypeId = 3) as DuplicateLinks,
+         count(*) filter (where pl.LinkTypeId = 1) as LinkedLinks,
+         max(pl.CreationDate) as LastLinkDate
+  from PostLinks pl
+  group by pl.PostId
+),
+accepted_answer as (
+  select q.QuestionId,
+         aa.AnswerId,
+         aa.AOwnerId as AcceptedOwnerId,
+         aa.AScore as AcceptedScore,
+         aa.AnswerCreation as AcceptedCreation
+  from q_posts q
+  left join answers_enriched aa on aa.AnswerId = q.AcceptedAnswerId
+),
+best_non_accepted as (
+  select aa.QuestionId,
+         aa.AnswerId as BestNonAcceptedAnswerId,
+         aa.AOwnerId as BestNonAcceptedOwnerId,
+         aa.AScore as BestNonAcceptedScore,
+         aa.AnswerCreation as BestNonAcceptedCreation
+  from (
+    select a.*,
+           row_number() over (partition by a.QuestionId order by a.AScore desc nulls last, a.AnswerCreation asc) as rn
+    from answers_enriched a
+  ) aa
+  join q_posts q on q.QuestionId = aa.QuestionId
+  where aa.AnswerId <> coalesce(q.AcceptedAnswerId, -1)
+    and aa.rn = 1
+),
+answer_rollup as (
+  select a.QuestionId,
+         count(*) as AnswerCount,
+         sum(case when a.AScore > 0 then 1 else 0 end) as PosAnswers,
+         sum(case when a.AScore < 0 then 1 else 0 end) as NegAnswers,
+         avg(a.AScore) as AvgAnswerScore,
+         max(a.AScore) as MaxAnswerScore,
+         min(a.AScore) as MinAnswerScore,
+         max(a.AnswerCreation) as LastAnswerDate
+  from answers_enriched a
+  group by a.QuestionId
+),
+owner_activity as (
+  select q.QuestionId,
+         u.UserId as OwnerId,
+         u.Reputation as OwnerRep,
+         date_part('epoch', (q.QuestionCreation - u.UserCreated)) / 86400.0 as OwnerAgeAtPostDays,
+         coalesce(b.TotalBadges,0) as OwnerBadgeCount,
+         coalesce(b.GoldBadges,0) as OwnerGold,
+         coalesce(b.SilverBadges,0) as OwnerSilver,
+         coalesce(b.BronzeBadges,0) as OwnerBronze,
+         u.LocationNorm as OwnerLocation
+  from q_posts q
+  left join user_stats u on u.UserId = q.QOwnerId
+  left join badges_agg b on b.UserId = u.UserId
+),
+time_buckets as (
+  select q.QuestionId,
+         case
+           when q.QuestionCreation >= cast('2024-10-01 12:34:56' as timestamp) - interval '7 days' then 'last_7d'
+           when q.QuestionCreation >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days' then 'last_30d'
+           when q.QuestionCreation >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days' then 'last_365d'
+           else 'older'
+         end as recency_bucket
+  from q_posts q
+),
+normalized as (
+  select
+    q.QuestionId,
+    q.Title,
+    (lower(coalesce(q.Title,'')) like any (array['%how to%','%best way%','%why%']))::boolean as title_pattern_match_boolean,
+    coalesce(q.ViewCount,0) as views,
+    coalesce(q.QScore,0) as qscore,
+    case when q.ClosedDate is not null then 1 else 0 end as is_closed,
+    case when q.CommunityOwnedDate is not null then 1 else 0 end as is_community_owned
+  from q_posts q
+),
+calc as (
+  select
+    n.QuestionId,
+    n.Title,
+    n.title_pattern_match_boolean as title_pattern_match,
+    n.views,
+    n.qscore,
+    n.is_closed,
+    n.is_community_owned,
+    coalesce(av.AnswerCount,0) as answer_count,
+    coalesce(av.AvgAnswerScore,0) as avg_answer_score,
+    coalesce(av.MaxAnswerScore,0) as max_answer_score,
+    coalesce(av.MinAnswerScore,0) as min_answer_score,
+    coalesce(av.LastAnswerDate, null) as last_answer_date,
+    coalesce(qv.UpVotes,0) as upvotes,
+    coalesce(qv.DownVotes,0) as downvotes,
+    coalesce(qv.Favorites,0) as favorites,
+    coalesce(qv.BountyTotal,0) as bounty_total,
+    qa.LastCloseOrMigrate,
+    qa.LastReopen,
+    qa.SuggestedEditsApplied,
+    coalesce(cs.AvgCommentScore,0) as avg_comment_score,
+    coalesce(cs.ThanksCount,0) as thanks_comments,
+    coalesce(cs.DuplicateWordCount,0) as duplicate_word_comments,
+    coalesce(cs.CommentCount,0) as comment_count,
+    coalesce(ts.TagCount,0) as tag_count,
+    coalesce(ts.ModOnlyTagCount,0) as modonly_tag_count,
+    coalesce(ts.RequiredTagCount,0) as required_tag_count,
+    coalesce(ts.SumGlobalTagUsage,0) as sum_global_tag_usage,
+    coalesce(dl.DuplicateLinks,0) as dupe_links,
+    coalesce(dl.LinkedLinks,0) as linked_links,
+    dl.LastLinkDate,
+    oa.OwnerId,
+    oa.OwnerRep,
+    oa.OwnerAgeAtPostDays,
+    oa.OwnerBadgeCount,
+    oa.OwnerGold,
+    oa.OwnerSilver,
+    oa.OwnerBronze,
+    oa.OwnerLocation,
+    tb.recency_bucket,
+    aa.AcceptedScore,
+    bn.BestNonAcceptedScore,
+    case
+      when aa.AcceptedScore is null and bn.BestNonAcceptedScore is null then null
+      when aa.AcceptedScore is null then -bn.BestNonAcceptedScore
+      when bn.BestNonAcceptedScore is null then aa.AcceptedScore
+      else aa.AcceptedScore - bn.BestNonAcceptedScore
+    end as accepted_vs_best_gap,
+    case when coalesce(av.AnswerCount,0) = 0 then null
+         else (coalesce(qv.UpVotes,0) - coalesce(qv.DownVotes,0))::numeric / nullif(av.AnswerCount::numeric,0)
+    end as net_votes_per_answer,
+    case when n.views > 0 then coalesce(qv.Favorites,0)::numeric / n.views::numeric else 0 end as favorite_view_ratio,
+    case when n.views > 0 then coalesce(cs.CommentCount,0)::numeric / n.views::numeric else 0 end as comments_per_view
+  from normalized n
+  left join answer_rollup av on av.QuestionId = n.QuestionId
+  left join q_votes qv on qv.QuestionId = n.QuestionId
+  left join q_activity qa on qa.QuestionId = n.QuestionId
+  left join comment_sentiment cs on cs.PostId = n.QuestionId
+  left join tag_stats ts on ts.QuestionId = n.QuestionId
+  left join dupe_links dl on dl.QuestionId = n.QuestionId
+  left join owner_activity oa on oa.QuestionId = n.QuestionId
+  left join time_buckets tb on tb.QuestionId = n.QuestionId
+  left join accepted_answer aa on aa.QuestionId = n.QuestionId
+  left join best_non_accepted bn on bn.QuestionId = n.QuestionId
+),
+rankings as (
+  select
+    c.QuestionId,
+    c.Title,
+    c.title_pattern_match,
+    c.views,
+    c.qscore,
+    c.is_closed,
+    c.is_community_owned,
+    c.answer_count,
+    c.avg_answer_score,
+    c.max_answer_score,
+    c.min_answer_score,
+    c.last_answer_date,
+    c.upvotes,
+    c.downvotes,
+    c.favorites,
+    c.bounty_total,
+    c.LastCloseOrMigrate,
+    c.LastReopen,
+    c.SuggestedEditsApplied,
+    c.avg_comment_score,
+    c.thanks_comments,
+    c.duplicate_word_comments,
+    c.comment_count,
+    c.tag_count,
+    c.modonly_tag_count,
+    c.required_tag_count,
+    c.sum_global_tag_usage,
+    c.dupe_links,
+    c.linked_links,
+    c.LastLinkDate,
+    c.OwnerId,
+    c.OwnerRep,
+    c.OwnerAgeAtPostDays,
+    c.OwnerBadgeCount,
+    c.OwnerGold,
+    c.OwnerSilver,
+    c.OwnerBronze,
+    c.OwnerLocation,
+    c.recency_bucket,
+    c.AcceptedScore,
+    c.BestNonAcceptedScore,
+    c.accepted_vs_best_gap,
+    c.net_votes_per_answer,
+    c.favorite_view_ratio,
+    c.comments_per_view,
+    row_number() over (order by (c.qscore + coalesce(c.upvotes,0) - coalesce(c.downvotes,0)) desc nulls last, c.views desc) as rn_popularity,
+    dense_rank() over (partition by c.recency_bucket order by c.favorite_view_ratio desc nulls last) as dr_fav_view_by_recency,
+    ntile(10) over (order by coalesce(c.OwnerRep,0) desc nulls last) as owner_rep_decile,
+    sum(case when c.is_closed = 1 then 1 else 0 end) over (partition by c.OwnerLocation) as closed_by_location,
+    count(*) over (partition by c.tag_count) as questions_by_tagcount
+  from calc c
+),
+correlated as (
+  select r.QuestionId,
+         r.Title,
+         r.recency_bucket,
+         r.owner_rep_decile,
+         r.closed_by_location,
+         r.questions_by_tagcount,
+         r.rn_popularity,
+         r.favorite_view_ratio,
+         r.accepted_vs_best_gap,
+         (
+           select avg(coalesce(a2.AScore,0))
+           from a_posts a2
+           where a2.QuestionId = r.QuestionId
+         ) as corr_avg_answer_score,
+         (
+           select count(*)
+           from Comments c2
+           where c2.PostId = r.QuestionId
+             and c2.Score > coalesce((
+               select avg(Score) from Comments cx where cx.PostId = r.QuestionId
+             ),0)
+         ) as corr_high_scoring_comments
+  from rankings r
+),
+setops as (
+  select QuestionId, Title, 'high_fav_ratio' as flag
+  from rankings
+  where favorite_view_ratio > 0.05
+  union
+  select QuestionId, Title, 'controversial' as flag
+  from rankings
+  where coalesce(downvotes,0) > coalesce(upvotes,0)
+  union
+  select QuestionId, Title, 'high_dupe_links' as flag
+  from calc
+  where dupe_links >= 2
+),
+final as (
+  select
+    r.QuestionId,
+    r.Title,
+    r.recency_bucket,
+    r.owner_rep_decile,
+    r.closed_by_location,
+    r.questions_by_tagcount,
+    r.rn_popularity,
+    r.favorite_view_ratio,
+    r.accepted_vs_best_gap,
+    r.OwnerLocation,
+    r.tag_count,
+    r.modonly_tag_count,
+    r.required_tag_count,
+    r.sum_global_tag_usage,
+    r.comment_count,
+    r.avg_comment_score,
+    r.dupe_links,
+    r.linked_links,
+    r.upvotes,
+    r.downvotes,
+    r.favorites,
+    r.bounty_total,
+    c.corr_avg_answer_score,
+    c.corr_high_scoring_comments,
+    array_agg(s.flag order by s.flag) filter (where s.flag is not null) as flags
+  from rankings r
+  left join correlated c on c.QuestionId = r.QuestionId
+  left join setops s on s.QuestionId = r.QuestionId
+  group by
+    r.QuestionId, r.Title, r.recency_bucket, r.owner_rep_decile, r.closed_by_location,
+    r.questions_by_tagcount, r.rn_popularity, r.favorite_view_ratio, r.accepted_vs_best_gap,
+    r.OwnerLocation, r.tag_count, r.modonly_tag_count, r.required_tag_count, r.sum_global_tag_usage,
+    r.comment_count, r.avg_comment_score, r.dupe_links, r.linked_links, r.upvotes, r.downvotes,
+    r.favorites, r.bounty_total, c.corr_avg_answer_score, c.corr_high_scoring_comments
+)
+select *
+from final
+where (favorite_view_ratio > 0.01 or bounty_total > 0 or dupe_links > 0)
+  and coalesce(tag_count,0) >= 1
+order by rn_popularity asc, favorite_view_ratio desc
+limit 200;

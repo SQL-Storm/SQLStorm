@@ -1,0 +1,71 @@
+-- {"query": "5696.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 556} 
+WITH
+RecentPopular as (
+  SELECT
+    p.Id as PostId,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    u.DisplayName as Owner,
+    u.Reputation as OwnerReputation,
+    COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2) as UpVotes,
+    COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 3) as DownVotes,
+    CASE WHEN p.PostTypeId = 1 THEN 'Question' ELSE 'Other' END as PostKind,
+    ROW_NUMBER() OVER (
+      PARTITION BY p.PostTypeId
+      ORDER BY p.Score DESC, p.ViewCount DESC, p.CreationDate DESC
+    ) as rn
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  WHERE p.PostTypeId IN (1,2)
+    AND p.CreationDate >= NOW() - INTERVAL '90 days'
+    AND (p.ViewCount > 0 OR p.Score > 0)
+  GROUP BY
+    p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.Tags, u.DisplayName, u.Reputation
+),
+Tagged as (
+  SELECT
+    rp.*,
+    unnest(string_to_array(substring(rp.Tags, 2, length(rp.Tags)-2), '><')) as Tag
+  FROM RecentPopular rp
+),
+TagStats as (
+  SELECT
+    Tag,
+    COUNT(*) as PostsWithTag,
+    AVG(OwnerReputation) as AvgOwnerRep,
+    SUM(UpVotes) as TotalUpVotes,
+    SUM(DownVotes) as TotalDownVotes
+  FROM Tagged
+  GROUP BY Tag
+),
+TopTags as (
+  SELECT Tag
+  FROM TagStats
+  ORDER BY PostsWithTag DESC, TotalUpVotes DESC
+  LIMIT 10
+)
+SELECT
+  rp.PostId,
+  rp.Title,
+  rp.Owner,
+  rp.OwnerReputation,
+  rp.CreationDate,
+  rp.Score,
+  rp.ViewCount,
+  rp.Tags,
+  rp.UpVotes,
+  rp.DownVotes,
+  rp.PostKind,
+  ts.Tag as TrendingTag,
+  ts.PostsWithTag,
+  ts.AvgOwnerRep
+FROM RecentPopular rp
+LEFT JOIN Tagged t ON t.PostId = rp.PostId
+LEFT JOIN TopTags tt ON tt.Tag = t.Tag
+LEFT JOIN TagStats ts ON ts.Tag = t.Tag
+WHERE rp.rn = 1
+ORDER BY rp.Score DESC, rp.ViewCount DESC;

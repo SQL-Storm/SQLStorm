@@ -1,0 +1,159 @@
+WITH UserActivity AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Views AS UserViews,
+        U.UpVotes AS UserUpVotes,
+        U.DownVotes AS UserDownVotes,
+        U.Location,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(COALESCE(P.Score, 0)) AS TotalPostScore,
+        SUM(COALESCE(C.Score, 0)) AS TotalCommentScore,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        MAX(GREATEST(COALESCE(P.LastActivityDate, DATE '1900-01-01'), COALESCE(C.CreationDate, DATE '1900-01-01'), COALESCE(B.Date, DATE '1900-01-01'), U.LastAccessDate)) AS LatestActivity,
+        AVG(CASE WHEN P.PostTypeId = 1 THEN P.ViewCount ELSE NULL END) AS AvgQuestionViews,
+        ROW_NUMBER() OVER(PARTITION BY U.Location ORDER BY U.Reputation DESC, U.LastAccessDate DESC) AS RankInLocation
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    WHERE U.CreationDate >= DATE '2010-01-01'
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Views, U.UpVotes, U.DownVotes, U.Location
+    HAVING
+        COUNT(DISTINCT P.Id) > 5 AND SUM(COALESCE(P.Score, 0)) > 100
+),
+PostComplexMetrics AS (
+    SELECT
+        Q.Id AS QuestionId,
+        Q.Title AS QuestionTitle,
+        Q.CreationDate AS QuestionCreationDate,
+        Q.Score AS QuestionScore,
+        Q.ViewCount AS QuestionViewCount,
+        Q.AnswerCount AS NumAnswers,
+        Q.FavoriteCount,
+        Q.OwnerUserId,
+        Q.Tags,
+        MAX(PH.CreationDate) AS LastEditDate,
+        COUNT(DISTINCT PH.Id) AS EditCount,
+        SUM(CASE WHEN A.Id IS NOT NULL THEN A.Score ELSE 0 END) AS TotalAnswerScore,
+        AVG(CASE WHEN A.Id IS NOT NULL THEN A.Score ELSE NULL END) AS AvgAnswerScore,
+        (SELECT COUNT(DISTINCT C2.Id) FROM Comments C2 WHERE C2.PostId = Q.Id) AS QuestionCommentCount,
+        LAG(Q.CreationDate, 1, DATE '1900-01-01') OVER (PARTITION BY Q.OwnerUserId ORDER BY Q.CreationDate) AS PreviousQuestionDate,
+        COALESCE((SELECT CRT.Name FROM CloseReasonTypes CRT WHERE CRT.Id = CAST(PH_Close.Comment AS INTEGER)), 'Open') AS CloseStatusReason,
+        COUNT(DISTINCT PL_Dup.RelatedPostId) AS DuplicateCount
+    FROM Posts Q
+    LEFT JOIN Posts A ON Q.Id = A.ParentId AND A.PostTypeId = 2
+    LEFT JOIN PostHistory PH ON Q.Id = PH.PostId AND PH.PostHistoryTypeId IN (4, 5, 6)
+    LEFT JOIN PostHistory PH_Close ON Q.Id = PH_Close.PostId AND PH_Close.PostHistoryTypeId = 10 AND PH_Close.Comment ~ '^[0-9]+$'
+    LEFT JOIN PostLinks PL_Dup ON Q.Id = PL_Dup.PostId AND PL_Dup.LinkTypeId = 3
+    WHERE Q.PostTypeId = 1
+      AND Q.CreationDate BETWEEN DATE '2015-01-01' AND DATE '2023-12-31'
+      AND (Q.Tags IS NOT NULL AND (Q.Tags LIKE '%<sql>%' OR Q.Tags LIKE '%<database>%'))
+    GROUP BY
+        Q.Id, Q.Title, Q.CreationDate, Q.Score, Q.ViewCount, Q.AnswerCount, Q.FavoriteCount, Q.OwnerUserId, Q.Tags, Q.ClosedDate, PH_Close.Comment
+    HAVING
+        Q.Score >= 10 OR Q.ViewCount >= 500
+),
+TagAnalysis AS (
+    SELECT
+        T.TagName,
+        T.Id AS TagId,
+        T.Count AS GlobalTagCount,
+        SUM(CASE WHEN PCM.QuestionId IS NOT NULL THEN 1 ELSE 0 END) AS QuestionsWithTagInPeriod,
+        AVG(PCM.QuestionScore) AS AvgQuestionScoreForTag,
+        AVG(PCM.QuestionViewCount) AS AvgQuestionViewCountForTag,
+        MAX(PCM.QuestionCreationDate) AS LatestQuestionForTag,
+        (SELECT COUNT(DISTINCT B2.Id) FROM Badges B2 WHERE B2.Name = T.TagName) AS TagSpecificBadges
+    FROM Tags T
+    LEFT JOIN PostComplexMetrics PCM ON PCM.Tags LIKE ( '%' || '<' || T.TagName || '>' || '%' )
+    WHERE T.Count > 100
+    GROUP BY
+        T.Id, T.TagName, T.Count
+),
+CombinedAnalysis AS (
+    SELECT
+        UA.UserId,
+        UA.DisplayName,
+        UA.Reputation,
+        UA.Location,
+        UA.TotalPosts,
+        UA.LatestActivity,
+        PCM.QuestionId,
+        PCM.QuestionTitle,
+        PCM.QuestionCreationDate,
+        PCM.QuestionScore,
+        PCM.QuestionViewCount,
+        PCM.NumAnswers,
+        PCM.FavoriteCount,
+        PCM.LastEditDate,
+        PCM.EditCount,
+        PCM.TotalAnswerScore,
+        PCM.AvgAnswerScore,
+        PCM.QuestionCommentCount,
+        PCM.PreviousQuestionDate,
+        PCM.CloseStatusReason,
+        PCM.DuplicateCount,
+        TA.TagName AS PrimaryTagName,
+        TA.GlobalTagCount AS PrimaryTagGlobalCount,
+        TA.QuestionsWithTagInPeriod AS PrimaryTagQuestionsInPeriod,
+        (UA.Reputation * (UA.UserUpVotes - UA.UserDownVotes)) / NULLIF(UA.UserViews, 0) AS UserEngagementRatio,
+        CASE
+            WHEN PCM.QuestionScore > 50 AND PCM.NumAnswers > 5 THEN 'HighImpactQuestion'
+            WHEN PCM.QuestionScore > 20 AND PCM.AvgAnswerScore IS NOT NULL AND PCM.AvgAnswerScore > 5 THEN 'GoodQuestionWithGoodAnswers'
+            WHEN PCM.CloseStatusReason <> 'Open' THEN 'ClosedQuestion'
+            ELSE 'NormalQuestion'
+        END AS QuestionCategory,
+        COALESCE(U.AboutMe, 'No AboutMe provided') AS UserAboutMeSnippet,
+        (
+            SELECT SUM(V.BountyAmount)
+            FROM Votes V
+            WHERE V.PostId = PCM.QuestionId AND V.VoteTypeId = 8 AND V.UserId = UA.UserId
+        ) AS BountyStartedByOwner,
+        EXISTS (SELECT 1 FROM Badges B3 WHERE B3.UserId = UA.UserId AND B3.Name = 'Disciplined' AND B3.Class = 2) AS HasDisciplinedBadge
+    FROM UserActivity UA
+    INNER JOIN PostComplexMetrics PCM ON UA.UserId = PCM.OwnerUserId
+    LEFT JOIN Tags TA ON PCM.Tags LIKE ( '%' || '<' || TA.TagName || '>' || '%' )
+    LEFT JOIN Users U ON UA.UserId = U.Id
+    WHERE
+        UA.RankInLocation <= 10
+        AND PCM.EditCount > 0
+        AND (
+            PCM.QuestionViewCount > 1000
+            OR (PCM.FavoriteCount IS NOT NULL AND PCM.FavoriteCount > 10)
+        )
+        AND (PCM.QuestionCreationDate - UA.UserCreationDate) > INTERVAL '6 months'
+        AND (PCM.PreviousQuestionDate IS NULL OR PCM.QuestionCreationDate - PCM.PreviousQuestionDate > INTERVAL '1 month')
+        AND (PCM.CloseStatusReason = 'Open' OR PCM.DuplicateCount > 0)
+        AND UA.LatestActivity > DATE '2023-01-01'
+        AND EXISTS (SELECT 1 FROM PostLinks PL_Related WHERE PL_Related.PostId = PCM.QuestionId AND PL_Related.LinkTypeId = 1)
+        AND NOT EXISTS (SELECT 1 FROM PostHistory PH_Delete WHERE PH_Delete.PostId = PCM.QuestionId AND PH_Delete.PostHistoryTypeId = 12)
+    GROUP BY
+        UA.UserId, UA.DisplayName, UA.Reputation, UA.Location, UA.TotalPosts, UA.LatestActivity,
+        PCM.QuestionId, PCM.QuestionTitle, PCM.QuestionCreationDate, PCM.QuestionScore, PCM.QuestionViewCount,
+        PCM.NumAnswers, PCM.FavoriteCount, PCM.LastEditDate, PCM.EditCount, PCM.TotalAnswerScore, PCM.AvgAnswerScore,
+        PCM.QuestionCommentCount, PCM.PreviousQuestionDate, PCM.CloseStatusReason, PCM.DuplicateCount,
+        TA.TagName, TA.GlobalTagCount, TA.QuestionsWithTagInPeriod, U.AboutMe, UA.UserUpVotes, UA.UserDownVotes, UA.UserViews
+)
+SELECT * FROM (
+    SELECT
+        CA.*,
+        'High-ReputationUserQuestion' AS SegmentType
+    FROM CombinedAnalysis CA
+    WHERE UserEngagementRatio IS NOT NULL AND UserEngagementRatio > 0.5
+    ORDER BY Reputation DESC, QuestionScore DESC
+    LIMIT 500
+) AS Segment1
+UNION ALL
+SELECT * FROM (
+    SELECT
+        CA.*,
+        'HighlyViewedOrEditedQuestion' AS SegmentType
+    FROM CombinedAnalysis CA
+    WHERE QuestionViewCount > 5000 AND EditCount >= 3 AND CloseStatusReason = 'Open'
+    ORDER BY QuestionViewCount DESC, EditCount DESC
+    LIMIT 500
+) AS Segment2;

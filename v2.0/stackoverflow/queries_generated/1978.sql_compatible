@@ -1,0 +1,350 @@
+WITH UserAggregates AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.WebsiteUrl,
+        U.Location,
+        U.AboutMe,
+        U.Views AS UserViews,
+        U.UpVotes AS UserUpVotes,
+        U.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        AVG(CASE WHEN P.PostTypeId = 1 THEN P.Score ELSE NULL END) AS AvgQuestionScore,
+        AVG(CASE WHEN P.PostTypeId = 2 THEN P.Score ELSE NULL END) AS AvgAnswerScore,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MIN(P.CreationDate) AS FirstPostDate,
+        MAX(P.CreationDate) AS LastPostDate
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Badges AS B ON U.Id = B.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.WebsiteUrl, U.Location, U.AboutMe, U.Views, U.UpVotes, U.DownVotes
+),
+PostCommentActivity AS (
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        P.PostTypeId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.Title,
+        P.Tags,
+        P.LastEditDate,
+        P.AcceptedAnswerId,
+        COUNT(DISTINCT PH_Edit.Id) AS TotalEditRevisions,
+        MAX(PH_Edit.CreationDate) AS LastEditRevisionDate,
+        AVG(C.Score) AS AvgCommentScore,
+        MAX(C.Score) AS MaxCommentScore,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade
+    FROM Posts AS P
+    LEFT JOIN PostHistory AS PH_Edit
+        ON P.Id = PH_Edit.PostId
+        AND PH_Edit.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9, 24)
+    LEFT JOIN Comments AS C
+        ON P.Id = C.PostId
+    GROUP BY
+        P.Id, P.OwnerUserId, P.PostTypeId, P.CreationDate, P.Score, P.ViewCount, P.AnswerCount, P.CommentCount, P.Title, P.Tags, P.LastEditDate, P.AcceptedAnswerId
+),
+CorrelatedUserAvgCommentScore AS (
+    SELECT DISTINCT
+        P.OwnerUserId AS UserId,
+        (SELECT AVG(C_sub.Score) FROM Comments C_sub WHERE C_sub.UserId = P.OwnerUserId) AS OverallUserAvgCommentScore
+    FROM Posts P
+    WHERE P.OwnerUserId IS NOT NULL
+),
+RankedUserPosts AS (
+    SELECT
+        PCA.OwnerUserId AS UserId,
+        PCA.PostId,
+        PCA.PostTypeId,
+        PCA.PostScore,
+        PCA.ViewCount,
+        PCA.Title,
+        ROW_NUMBER() OVER (PARTITION BY PCA.OwnerUserId, PCA.PostTypeId ORDER BY PCA.PostScore DESC, PCA.ViewCount DESC, PCA.PostCreationDate DESC) AS RankByScoreAndViews,
+        DENSE_RANK() OVER (PARTITION BY PCA.OwnerUserId ORDER BY PCA.PostCreationDate DESC) AS RecentPostRank
+    FROM PostCommentActivity AS PCA
+    WHERE PCA.OwnerUserId IS NOT NULL
+),
+UserQuestionStats AS (
+    SELECT
+        PCA.OwnerUserId AS UserId,
+        COUNT(DISTINCT PCA.PostId) AS QuestionsWithAnswers,
+        SUM(CASE WHEN PCA.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS QuestionsWithAcceptedAnswer,
+        AVG(EXTRACT(EPOCH FROM (A.CreationDate - PCA.PostCreationDate))) AS AvgTimeToAcceptedAnswerSeconds
+    FROM PostCommentActivity AS PCA
+    LEFT JOIN Posts A ON PCA.AcceptedAnswerId = A.Id
+    WHERE PCA.PostTypeId = 1 AND PCA.AnswerCount > 0
+    GROUP BY PCA.OwnerUserId
+),
+UserTopTag AS (
+    SELECT
+        UserId,
+        TagName AS MostFrequentTag
+    FROM (
+        SELECT
+            P.OwnerUserId AS UserId,
+            T.TagName,
+            COUNT(*) AS TagCount,
+            ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY COUNT(*) DESC, T.TagName ASC) as rn
+        FROM Posts P
+        CROSS JOIN LATERAL UNNEST(string_to_array(substring(P.Tags, 2, length(P.Tags)-2), '><')) AS T(TagName)
+        WHERE P.OwnerUserId IS NOT NULL AND P.Tags IS NOT NULL AND P.Tags != '' AND P.PostTypeId = 1
+        GROUP BY P.OwnerUserId, T.TagName
+    ) AS RankedTagCounts
+    WHERE rn = 1
+),
+HighEngagementUsers AS (
+    SELECT
+        UA.UserId,
+        UA.DisplayName,
+        UA.Reputation,
+        UA.UserCreationDate,
+        UA.Location,
+        UA.WebsiteUrl,
+        UA.TotalPosts,
+        COALESCE(UA.TotalQuestions, 0) AS TotalQuestions,
+        COALESCE(UA.TotalAnswers, 0) AS TotalAnswers,
+        COALESCE(UA.AvgQuestionScore, 0.0) AS AvgQuestionScore,
+        COALESCE(UA.AvgAnswerScore, 0.0) AS AvgAnswerScore,
+        UA.GoldBadges,
+        UA.SilverBadges,
+        UA.BronzeBadges,
+        UA.TotalBadges,
+        AGE(CAST('2024-10-01 12:34:56' AS timestamp), UA.UserCreationDate) AS AccountAge,
+        CASE
+            WHEN UA.Reputation > 50000 AND UA.GoldBadges >= 5 THEN 'Legendary'
+            WHEN UA.Reputation > 10000 AND UA.TotalBadges >= 50 THEN 'Expert'
+            WHEN UA.Reputation > 1000 AND UA.TotalBadges >= 10 THEN 'Contributor'
+            ELSE 'Novice'
+        END AS UserTier,
+        COALESCE(CUA.OverallUserAvgCommentScore, 0.0) AS OverallUserAvgCommentScore,
+        HQ.PostId AS HighestQuestionId,
+        HQ.Title AS HighestQuestionTitle,
+        HQ.PostScore AS HighestQuestionScore,
+        HQ.ViewCount AS HighestQuestionViews,
+        COALESCE(PQC.AvgCommentScore, 0.0) AS HighestQuestionAvgCommentScore,
+        COALESCE(PQC.TotalEditRevisions, 0) AS HighestQuestionTotalEdits,
+        HA.PostId AS HighestAnswerId,
+        HA.Title AS HighestAnswerTitle,
+        HA.PostScore AS HighestAnswerScore,
+        COALESCE(PAC.AvgCommentScore, 0.0) AS HighestAnswerAvgCommentScore,
+        COALESCE(PAC.TotalEditRevisions, 0) AS HighestAnswerTotalEdits,
+        RP.PostId AS RecentPostId,
+        RP.PostTypeId AS RecentPostType,
+        RP.Title AS RecentPostTitle,
+        RP.PostScore AS RecentPostScore,
+        COALESCE(EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS timestamp) - P_Recent.PostCreationDate)), 0) AS DaysSinceRecentPost,
+        COALESCE(UQS.QuestionsWithAnswers, 0) AS QuestionsAnsweredByOthers,
+        COALESCE(UQS.QuestionsWithAcceptedAnswer, 0) AS QuestionsWithAcceptedAnswer,
+        COALESCE(UQS.AvgTimeToAcceptedAnswerSeconds, 0.0) AS AvgTimeToAcceptedAnswer,
+        UPPER(SUBSTRING(COALESCE(UA.Location, 'UNKNOWN_LOCATION') FROM 1 FOR 3)) AS LocationPrefix,
+        REPLACE(COALESCE(UA.AboutMe, ''), 'stackoverflow.com', '[SO_LINK_REMOVED]') AS FilteredAboutMeSnippet,
+        NULLIF(UA.UserViews, 0) AS UserViewsOrNull,
+        UA.UserUpVotes,
+        (SELECT AVG(U2.UpVotes) FROM Users U2 WHERE U2.Reputation > 1000) AS AvgUpvotesForHighRepUsers,
+        EXISTS (
+            SELECT 1
+            FROM Posts P_Controversial
+            WHERE P_Controversial.OwnerUserId = UA.UserId
+              AND P_Controversial.Score > 50
+              AND P_Controversial.DownVotes IS NOT NULL
+              AND P_Controversial.DownVotes > P_Controversial.Score * 0.2
+              AND P_Controversial.LastActivityDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+        ) AS HasPotentiallyControversialPost,
+        UTT.MostFrequentTag AS UsersMostFrequentTag,
+        'High Engagement' AS UserCategory
+    FROM UserAggregates AS UA
+    LEFT JOIN CorrelatedUserAvgCommentScore AS CUA
+        ON UA.UserId = CUA.UserId
+    LEFT JOIN RankedUserPosts AS HQ
+        ON UA.UserId = HQ.UserId AND HQ.PostTypeId = 1 AND HQ.RankByScoreAndViews = 1
+    LEFT JOIN PostCommentActivity AS PQC
+        ON HQ.PostId = PQC.PostId
+    LEFT JOIN RankedUserPosts AS HA
+        ON UA.UserId = HA.UserId AND HA.PostTypeId = 2 AND HA.RankByScoreAndViews = 1
+    LEFT JOIN PostCommentActivity AS PAC
+        ON HA.PostId = PAC.PostId
+    LEFT JOIN RankedUserPosts AS RP
+        ON UA.UserId = RP.UserId AND RP.RecentPostRank = 1
+    LEFT JOIN PostCommentActivity AS P_Recent
+        ON RP.PostId = P_Recent.PostId
+    LEFT JOIN UserQuestionStats AS UQS
+        ON UA.UserId = UQS.UserId
+    LEFT JOIN UserTopTag AS UTT
+        ON UA.UserId = UTT.UserId
+    WHERE
+        UA.Reputation >= 1000
+        AND COALESCE(UA.TotalPosts, 0) > 5
+        AND UA.DisplayName IS NOT NULL
+        AND UA.Location IS NOT NULL
+        AND UA.LastAccessDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '6 months'
+),
+NegativeVoterUsers AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.Location,
+        U.WebsiteUrl,
+        0 AS TotalPosts,
+        0 AS TotalQuestions,
+        0 AS TotalAnswers,
+        0.0 AS AvgQuestionScore,
+        0.0 AS AvgAnswerScore,
+        0 AS GoldBadges,
+        0 AS SilverBadges,
+        0 AS BronzeBadges,
+        0 AS TotalBadges,
+        AGE(CAST('2024-10-01 12:34:56' AS timestamp), U.CreationDate) AS AccountAge,
+        'Negative Voter' AS UserTier,
+        0.0 AS OverallUserAvgCommentScore,
+        NULL AS HighestQuestionId,
+        NULL AS HighestQuestionTitle,
+        0 AS HighestQuestionScore,
+        0 AS HighestQuestionViews,
+        0.0 AS HighestQuestionAvgCommentScore,
+        0 AS HighestQuestionTotalEdits,
+        NULL AS HighestAnswerId,
+        NULL AS HighestAnswerTitle,
+        0 AS HighestAnswerScore,
+        0.0 AS HighestAnswerAvgCommentScore,
+        0 AS HighestAnswerTotalEdits,
+        NULL AS RecentPostId,
+        NULL AS RecentPostType,
+        NULL AS RecentPostTitle,
+        0 AS RecentPostScore,
+        0 AS DaysSinceRecentPost,
+        0 AS QuestionsAnsweredByOthers,
+        0 AS QuestionsWithAcceptedAnswer,
+        0.0 AS AvgTimeToAcceptedAnswer,
+        UPPER(SUBSTRING(COALESCE(U.Location, 'UNKNOWN_LOCATION') FROM 1 FOR 3)) AS LocationPrefix,
+        REPLACE(COALESCE(U.AboutMe, ''), 'stackoverflow.com', '[SO_LINK_REMOVED]') AS FilteredAboutMeSnippet,
+        NULLIF(U.Views, 0) AS UserViewsOrNull,
+        U.UpVotes AS UserUpVotes,
+        (SELECT AVG(U2.UpVotes) FROM Users U2 WHERE U2.Reputation > 1000) AS AvgUpvotesForHighRepUsers,
+        FALSE AS HasPotentiallyControversialPost,
+        NULL AS UsersMostFrequentTag,
+        'Negative Voter' AS UserCategory
+    FROM Users AS U
+    WHERE U.Id IN (
+        SELECT V.UserId
+        FROM Votes V
+        WHERE V.UserId IS NOT NULL
+        GROUP BY V.UserId
+        HAVING
+            SUM(CASE WHEN V.VoteTypeId IN (3, 4) THEN 1 ELSE 0 END) > 0
+            AND SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) = 0
+    )
+    AND U.Reputation < 100
+    AND COALESCE(U.DisplayName, '') != ''
+    AND U.Id NOT IN (SELECT P.OwnerUserId FROM Posts P WHERE P.OwnerUserId IS NOT NULL)
+)
+SELECT
+    HEU.UserId,
+    HEU.DisplayName,
+    HEU.Reputation,
+    HEU.UserCreationDate,
+    HEU.Location,
+    HEU.WebsiteUrl,
+    HEU.TotalPosts,
+    HEU.TotalQuestions,
+    HEU.TotalAnswers,
+    HEU.AvgQuestionScore,
+    HEU.AvgAnswerScore,
+    HEU.GoldBadges,
+    HEU.SilverBadges,
+    HEU.BronzeBadges,
+    HEU.TotalBadges,
+    HEU.AccountAge,
+    HEU.UserTier,
+    HEU.OverallUserAvgCommentScore,
+    HEU.HighestQuestionId,
+    HEU.HighestQuestionTitle,
+    HEU.HighestQuestionScore,
+    HEU.HighestQuestionViews,
+    HEU.HighestQuestionAvgCommentScore,
+    HEU.HighestQuestionTotalEdits,
+    HEU.HighestAnswerId,
+    HEU.HighestAnswerTitle,
+    HEU.HighestAnswerScore,
+    HEU.HighestAnswerAvgCommentScore,
+    HEU.HighestAnswerTotalEdits,
+    HEU.RecentPostId,
+    HEU.RecentPostType,
+    HEU.RecentPostTitle,
+    HEU.RecentPostScore,
+    HEU.DaysSinceRecentPost,
+    HEU.QuestionsAnsweredByOthers,
+    HEU.QuestionsWithAcceptedAnswer,
+    HEU.AvgTimeToAcceptedAnswer,
+    HEU.LocationPrefix,
+    HEU.FilteredAboutMeSnippet,
+    HEU.UserViewsOrNull,
+    HEU.UserUpVotes,
+    HEU.AvgUpvotesForHighRepUsers,
+    HEU.HasPotentiallyControversialPost,
+    HEU.UsersMostFrequentTag,
+    HEU.UserCategory
+FROM HighEngagementUsers HEU
+UNION ALL
+SELECT
+    NVU.UserId,
+    NVU.DisplayName,
+    NVU.Reputation,
+    NVU.UserCreationDate,
+    NVU.Location,
+    NVU.WebsiteUrl,
+    NVU.TotalPosts,
+    NVU.TotalQuestions,
+    NVU.TotalAnswers,
+    NVU.AvgQuestionScore,
+    NVU.AvgAnswerScore,
+    NVU.GoldBadges,
+    NVU.SilverBadges,
+    NVU.BronzeBadges,
+    NVU.TotalBadges,
+    NVU.AccountAge,
+    NVU.UserTier,
+    NVU.OverallUserAvgCommentScore,
+    NVU.HighestQuestionId,
+    NVU.HighestQuestionTitle,
+    NVU.HighestQuestionScore,
+    NVU.HighestQuestionViews,
+    NVU.HighestQuestionAvgCommentScore,
+    NVU.HighestQuestionTotalEdits,
+    NVU.HighestAnswerId,
+    NVU.HighestAnswerTitle,
+    NVU.HighestAnswerScore,
+    NVU.HighestAnswerAvgCommentScore,
+    NVU.HighestAnswerTotalEdits,
+    NVU.RecentPostId,
+    NVU.RecentPostType,
+    NVU.RecentPostTitle,
+    NVU.RecentPostScore,
+    NVU.DaysSinceRecentPost,
+    NVU.QuestionsAnsweredByOthers,
+    NVU.QuestionsWithAcceptedAnswer,
+    NVU.AvgTimeToAcceptedAnswer,
+    NVU.LocationPrefix,
+    NVU.FilteredAboutMeSnippet,
+    NVU.UserViewsOrNull,
+    NVU.UserUpVotes,
+    NVU.AvgUpvotesForHighRepUsers,
+    NVU.HasPotentiallyControversialPost,
+    NVU.UsersMostFrequentTag,
+    NVU.UserCategory
+FROM NegativeVoterUsers NVU
+ORDER BY Reputation DESC, UserCategory ASC
+LIMIT 1000;

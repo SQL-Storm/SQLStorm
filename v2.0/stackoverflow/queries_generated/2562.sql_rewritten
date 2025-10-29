@@ -1,0 +1,191 @@
+-- {"query": "2562.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1896} 
+WITH RecentHighRepUsers AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.CreationDate) AS rn
+    FROM Users u
+    WHERE u.Reputation > 10000
+),
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        b.Class,
+        COUNT(*) AS BadgeCount
+    FROM Badges b
+    GROUP BY b.UserId, b.Class
+),
+UserBadgeSummary AS (
+    SELECT
+        ubc.UserId,
+        COALESCE(MAX(CASE WHEN ubc.Class = 1 THEN ubc.BadgeCount END), 0) AS GoldBadges,
+        COALESCE(MAX(CASE WHEN ubc.Class = 2 THEN ubc.BadgeCount END), 0) AS SilverBadges,
+        COALESCE(MAX(CASE WHEN ubc.Class = 3 THEN ubc.BadgeCount END), 0) AS BronzeBadges
+    FROM UserBadgeCounts ubc
+    GROUP BY ubc.UserId
+),
+UserPostStats AS (
+    SELECT
+        p.OwnerUserId,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId IN (1,2)) AS AvgPostScore,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+UserCloseReasonCounts AS (
+    SELECT
+        ph.UserId,
+        crt.Name AS CloseReason,
+        COUNT(*) AS CloseVotes
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS INT) AND ph.PostHistoryTypeId = 10
+    WHERE ph.PostHistoryTypeId = 10 AND ph.UserId IS NOT NULL
+    GROUP BY ph.UserId, crt.Name
+),
+UserCloseReasonsPivot AS (
+    SELECT
+        ucr.UserId,
+        MAX(CASE WHEN CloseReason = 'Duplicate' THEN CloseVotes ELSE 0 END) AS DuplicateCloseVotes,
+        MAX(CASE WHEN CloseReason = 'Off-topic' THEN CloseVotes ELSE 0 END) AS OffTopicCloseVotes,
+        MAX(CASE WHEN CloseReason = 'Needs details or clarity' THEN CloseVotes ELSE 0 END) AS NeedsDetailsCloseVotes,
+        MAX(CASE WHEN CloseReason = 'Needs more focus' THEN CloseVotes ELSE 0 END) AS NeedsMoreFocusCloseVotes,
+        MAX(CASE WHEN CloseReason = 'Opinion-based' THEN CloseVotes ELSE 0 END) AS OpinionBasedCloseVotes
+    FROM UserCloseReasonCounts ucr
+    GROUP BY ucr.UserId
+),
+TopQuestions AS (
+    SELECT
+        q.Id,
+        q.OwnerUserId,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.Tags,
+        ROW_NUMBER() OVER (PARTITION BY q.OwnerUserId ORDER BY q.Score DESC, q.CreationDate) AS rn
+    FROM Posts q
+    WHERE q.PostTypeId = 1 AND q.Score > 50
+),
+QuestionWithAcceptedAnswerInfo AS (
+    SELECT
+        tq.Id AS QuestionId,
+        tq.OwnerUserId,
+        tq.Title,
+        tq.CreationDate,
+        tq.Score,
+        tq.ViewCount,
+        tq.Tags,
+        a.Id AS AcceptedAnswerId,
+        a.Score AS AcceptedAnswerScore,
+        a.OwnerUserId AS AcceptedAnswerOwnerId,
+        a.CreationDate AS AcceptedAnswerDate
+    FROM TopQuestions tq
+    LEFT JOIN Posts a ON a.Id = tq.AcceptedAnswerId
+    WHERE tq.rn <= 3
+),
+UserRecentComments AS (
+    SELECT
+        c.UserId,
+        c.PostId,
+        c.CreationDate,
+        c.Text,
+        ROW_NUMBER() OVER (PARTITION BY c.UserId ORDER BY c.CreationDate DESC) AS rn
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+),
+RecentUserCommentsFiltered AS (
+    SELECT rc.UserId, rc.PostId, rc.CreationDate, rc.Text
+    FROM UserRecentComments rc
+    WHERE rc.rn <= 5
+),
+UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        COALESCE(ups.QuestionCount, 0) AS Questions,
+        COALESCE(ups.AnswerCount, 0) AS Answers,
+        COALESCE(ups.AvgPostScore, 0) AS AvgScore,
+        COALESCE(ubs.GoldBadges, 0) AS Gold,
+        COALESCE(ubs.SilverBadges, 0) AS Silver,
+        COALESCE(ubs.BronzeBadges, 0) AS Bronze,
+        COALESCE(u.Reputation, 0) AS Reputation,
+        COALESCE(u.Views, 0) AS ProfileViews,
+        COALESCE(u.UpVotes, 0) AS UpVotes,
+        COALESCE(u.DownVotes, 0) AS DownVotes,
+        COALESCE(ucl.DuplicateCloseVotes, 0) AS DuplicateCloses,
+        COALESCE(ucl.OffTopicCloseVotes, 0) AS OffTopicCloses,
+        COALESCE(ucl.NeedsDetailsCloseVotes, 0) AS NeedsDetailsCloses,
+        COALESCE(ucl.NeedsMoreFocusCloseVotes, 0) AS NeedsMoreFocusCloses,
+        COALESCE(ucl.OpinionBasedCloseVotes, 0) AS OpinionBasedCloses
+    FROM RecentHighRepUsers u
+    LEFT JOIN UserPostStats ups ON ups.OwnerUserId = u.Id
+    LEFT JOIN UserBadgeSummary ubs ON ubs.UserId = u.Id
+    LEFT JOIN UserCloseReasonsPivot ucl ON ucl.UserId = u.Id
+),
+UserEmailHashCheck AS (
+    SELECT
+        u.Id,
+        u.EmailHash,
+        -- Simple null and empty string logic with conditional masking
+        CASE 
+            WHEN u.EmailHash IS NULL THEN 'NoEmail'
+            WHEN u.EmailHash = '' THEN 'EmptyEmailHash'
+            ELSE SUBSTRING(u.EmailHash FROM 1 FOR 8) || '...' 
+        END AS EmailHashMasked
+    FROM Users u
+    WHERE u.Reputation > 10000
+)
+SELECT
+    uas.UserId,
+    ru.DisplayName,
+    uas.Reputation,
+    uas.Gold, uas.Silver, uas.Bronze,
+    uas.Questions, uas.Answers, ROUND(uas.AvgScore,2) AS AveragePostScore,
+    uas.ProfileViews, uas.UpVotes, uas.DownVotes,
+    uas.DuplicateCloses, uas.OffTopicCloses, uas.NeedsDetailsCloses, uas.NeedsMoreFocusCloses, uas.OpinionBasedCloses,
+    ueh.EmailHashMasked,
+    qwai.QuestionId,
+    qwai.Title,
+    qwai.Score AS QuestionScore,
+    qwai.ViewCount,
+    qwai.AcceptedAnswerId,
+    qwai.AcceptedAnswerScore,
+    ua.DisplayName AS AcceptedAnswerOwnerDisplayName,
+    ua.Reputation AS AcceptedAnswerOwnerReputation,
+    -- String expressions to extract and count tags
+    array_length(string_to_array(substring(qwai.Tags FROM 2 FOR length(qwai.Tags)-2), '><'), 1) AS TagCount,
+    -- Complex predicate: premium user defined by reputation and badge counts
+    CASE
+        WHEN uas.Reputation > 50000 AND uas.Gold >= 5 THEN 1 ELSE 0
+    END AS IsPremiumUser,
+    -- Correlated subquery: count of comments in last 30 days on user's posts
+    (
+        SELECT COUNT(*)
+        FROM Comments c
+        JOIN Posts p ON p.Id = c.PostId
+        WHERE p.OwnerUserId = uas.UserId
+        AND c.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+    ) AS RecentCommentsOnUserPosts,
+    -- Conditional window function example: ranking questions by score per user
+    RANK() OVER (PARTITION BY uas.UserId ORDER BY qwai.Score DESC) AS QuestionRank,
+    -- Outer join with recent comments excerpt
+    rc.Text AS RecentCommentExcerpt
+FROM UserActivitySummary uas
+JOIN RecentHighRepUsers ru ON ru.Id = uas.UserId
+LEFT JOIN QuestionWithAcceptedAnswerInfo qwai ON qwai.OwnerUserId = uas.UserId
+LEFT JOIN Users ua ON ua.Id = qwai.AcceptedAnswerOwnerId
+LEFT JOIN UserEmailHashCheck ueh ON ueh.Id = uas.UserId
+LEFT JOIN LATERAL (
+    SELECT rcf.Text
+    FROM RecentUserCommentsFiltered rcf
+    WHERE rcf.UserId = uas.UserId
+    ORDER BY rcf.CreationDate DESC
+    LIMIT 1
+) rc ON TRUE
+WHERE qwai.QuestionId IS NOT NULL
+ORDER BY uas.Reputation DESC, qwai.Score DESC
+LIMIT 50
+;

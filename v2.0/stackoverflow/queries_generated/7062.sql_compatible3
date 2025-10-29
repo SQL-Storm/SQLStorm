@@ -1,0 +1,226 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS PostRank,
+        ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT c.Id) DESC) AS CommentRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000 
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopQuestions AS (
+    -- Standard SQL split using a recursive CTE to emulate splitting tags like '<a><b><c>'
+    tags_source AS (
+      SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        CASE
+          WHEN p.Tags IS NULL THEN NULL
+          WHEN LEFT(p.Tags,1) = '<' AND RIGHT(p.Tags,1) = '>' THEN SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2)
+          ELSE p.Tags
+        END AS normalized_tags
+      FROM Posts p
+      JOIN Users u ON p.OwnerUserId = u.Id
+      WHERE p.PostTypeId = 1 
+        AND p.CreationDate > DATE '2020-01-01'
+        AND p.Score > 100
+    ),
+    recursive_split AS (
+      SELECT
+        QuestionId,
+        Title,
+        Score,
+        ViewCount,
+        AnswerCount,
+        CommentCount,
+        CreationDate,
+        OwnerUserId,
+        OwnerName,
+        normalized_tags AS remaining,
+        NULL::VARCHAR AS part, -- placeholder; will be replaced in dialects that support :: ; convert to standard CAST below
+        1 AS idx
+      FROM tags_source
+
+      UNION ALL
+
+      SELECT
+        rs.QuestionId,
+        rs.Title,
+        rs.Score,
+        rs.ViewCount,
+        rs.AnswerCount,
+        rs.CommentCount,
+        rs.CreationDate,
+        rs.OwnerUserId,
+        rs.OwnerName,
+        CASE
+          WHEN POSITION('><' IN rs.remaining) > 0 THEN SUBSTRING(rs.remaining FROM POSITION('><' IN rs.remaining) + 2)
+          ELSE NULL
+        END AS remaining,
+        CASE
+          WHEN POSITION('><' IN rs.remaining) > 0 THEN
+            SUBSTRING(rs.remaining FROM 1 FOR POSITION('><' IN rs.remaining) - 1)
+          ELSE
+            rs.remaining
+        END AS part,
+        idx + 1
+      FROM recursive_split rs
+      WHERE rs.remaining IS NOT NULL AND rs.remaining <> ''
+    )
+    -- Note: Some SQL dialects limit recursion depth; adjust max recursion as needed.
+    SELECT
+      QuestionId,
+      Title,
+      Score,
+      ViewCount,
+      AnswerCount,
+      CommentCount,
+      CreationDate,
+      OwnerUserId,
+      OwnerName,
+      STRING_AGG(part, ', ' ORDER BY idx) AS AllTags
+    FROM (
+      SELECT
+        QuestionId,
+        Title,
+        Score,
+        ViewCount,
+        AnswerCount,
+        CommentCount,
+        CreationDate,
+        OwnerUserId,
+        OwnerName,
+        TRIM(part) AS part,
+        idx
+      FROM recursive_split
+      WHERE part IS NOT NULL AND part <> ''
+    ) parts
+    GROUP BY QuestionId, Title, Score, ViewCount, AnswerCount, CommentCount, CreationDate, OwnerUserId, OwnerName
+),
+ComplexAnalytics AS (
+    SELECT 
+        ta.UserId,
+        ta.DisplayName,
+        ta.Reputation,
+        ta.PostCount,
+        ta.CommentCount,
+        ta.BadgeCount,
+        ta.PostRank,
+        ta.CommentRank,
+        COALESCE(tq.Score, 0) AS TopScore,
+        COALESCE(tq.ViewCount, 0) AS TopViewCount,
+        COALESCE(tq.AnswerCount, 0) AS TopAnswerCount,
+        COALESCE(tq.CommentCount, 0) AS TopCommentCount,
+        tq.Title AS TopQuestionTitle,
+        CASE 
+            WHEN ta.PostCount > 100 THEN 'Elite'
+            WHEN ta.PostCount > 50 THEN 'Advanced'
+            WHEN ta.PostCount > 10 THEN 'Regular'
+            ELSE 'Beginner'
+        END AS ExperienceLevel,
+        CASE 
+            WHEN ta.Reputation > 100000 THEN 'Legendary'
+            WHEN ta.Reputation > 50000 THEN 'Master'
+            WHEN ta.Reputation > 10000 THEN 'Expert'
+            ELSE 'Intermediate'
+        END AS ReputationLevel,
+        (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = ta.UserId AND p2.PostTypeId = 2) AS AnswerCount,
+        (SELECT COUNT(*) FROM Posts p3 WHERE p3.OwnerUserId = ta.UserId AND p3.PostTypeId = 1 AND p3.Score > 0) AS PositiveQuestionCount,
+        (SELECT AVG(Score) FROM Posts p4 WHERE p4.OwnerUserId = ta.UserId AND p4.PostTypeId = 1) AS AvgQuestionScore,
+        (SELECT MAX(Score) FROM Posts p5 WHERE p5.OwnerUserId = ta.UserId AND p5.PostTypeId = 1) AS MaxQuestionScore,
+        (ta.PostCount + ta.CommentCount) AS TotalActivity,
+        (ta.PostCount * 1.5 + ta.CommentCount * 0.5 + ta.BadgeCount * 10) AS ActivityWeightedScore
+    FROM UserActivityStats ta
+    LEFT JOIN TopQuestions tq ON ta.UserId = tq.OwnerUserId
+    WHERE ta.Reputation > 5000
+),
+FinalAnalysis AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        PostCount,
+        CommentCount,
+        BadgeCount,
+        PostRank,
+        CommentRank,
+        TopScore,
+        TopViewCount,
+        TopAnswerCount,
+        TopCommentCount,
+        TopQuestionTitle,
+        ExperienceLevel,
+        ReputationLevel,
+        AnswerCount,
+        PositiveQuestionCount,
+        AvgQuestionScore,
+        MaxQuestionScore,
+        TotalActivity,
+        ActivityWeightedScore,
+        RANK() OVER (ORDER BY ActivityWeightedScore DESC) AS ActivityRank,
+        DENSE_RANK() OVER (ORDER BY Reputation DESC) AS ReputationRank,
+        NTILE(4) OVER (ORDER BY ActivityWeightedScore DESC) AS Quartile,
+        ROW_NUMBER() OVER (ORDER BY TotalActivity DESC) AS ActivityOrder,
+        LAG(DisplayName, 1) OVER (ORDER BY ActivityWeightedScore DESC) AS PreviousTopUser,
+        LEAD(DisplayName, 1) OVER (ORDER BY ActivityWeightedScore DESC) AS NextTopUser,
+        AVG(ActivityWeightedScore) OVER (ORDER BY ActivityWeightedScore DESC ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING) AS MovingAvgScore,
+        MIN(ActivityWeightedScore) OVER (ORDER BY ActivityWeightedScore DESC) AS MinScore,
+        MAX(ActivityWeightedScore) OVER (ORDER BY ActivityWeightedScore DESC) AS MaxScore,
+        COUNT(*) OVER () AS TotalUsers,
+        (ActivityWeightedScore - MIN(ActivityWeightedScore) OVER ()) / 
+        NULLIF((MAX(ActivityWeightedScore) OVER () - MIN(ActivityWeightedScore) OVER ()),0) * 100 AS ScorePercentile
+    FROM ComplexAnalytics
+)
+SELECT 
+    DisplayName,
+    Reputation,
+    PostCount,
+    CommentCount,
+    BadgeCount,
+    ExperienceLevel,
+    ReputationLevel,
+    ActivityWeightedScore,
+    ActivityRank,
+    ReputationRank,
+    Quartile,
+    TotalActivity,
+    ScorePercentile,
+    CASE 
+        WHEN ScorePercentile > 90 THEN 'Top 10%'
+        WHEN ScorePercentile > 75 THEN 'Top 25%'
+        WHEN ScorePercentile > 50 THEN 'Top 50%'
+        ELSE 'Below Average'
+    END AS PerformanceTier,
+    COALESCE(TopQuestionTitle, 'No Top Question') AS TopQuestion,
+    COALESCE(TopScore, 0) AS TopScore,
+    COALESCE(TopViewCount, 0) AS TopViewCount,
+    PreviousTopUser,
+    NextTopUser,
+    MovingAvgScore
+FROM FinalAnalysis
+WHERE 
+    ActivityWeightedScore > (
+        SELECT AVG(ActivityWeightedScore) FROM FinalAnalysis
+    )
+    AND Reputation > (
+        SELECT AVG(Reputation) FROM FinalAnalysis
+    )
+    AND (PostCount > 0 OR CommentCount > 0 OR BadgeCount > 0)
+ORDER BY ActivityWeightedScore DESC
+FETCH FIRST 100 ROWS ONLY;

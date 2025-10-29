@@ -1,0 +1,189 @@
+WITH 
+UserBadgeAgg AS (
+    SELECT 
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldCount,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverCount,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeCount,
+        COUNT(*)                                 AS TotalBadges,
+        MAX(b.Date)                              AS LastBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserPostStats AS (
+    SELECT 
+        p.OwnerUserId                                 AS UserId,
+        SUM(CASE WHEN pt.Name = 'Question' THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN pt.Name = 'Answer' THEN 1 ELSE 0 END)   AS AnswerCount,
+        AVG(p.Score)                                 AS AvgScore,
+        SUM(p.ViewCount)                             AS TotalViews,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId 
+                           ORDER BY p.CreationDate DESC) AS RecentPostRank
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+UserRecentVote AS (
+    SELECT 
+        up.UserId,
+        v.VoteTypeId,
+        COUNT(*) AS VoteCount
+    FROM (
+        SELECT 
+            p.OwnerUserId AS UserId,
+            p.Id         AS PostId,
+            ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId 
+                               ORDER BY p.CreationDate DESC) AS rn
+        FROM Posts p
+        WHERE p.OwnerUserId IS NOT NULL
+    ) up
+    JOIN Votes v ON v.PostId = up.PostId
+    WHERE up.rn = 1
+    GROUP BY up.UserId, v.VoteTypeId
+),
+UserTagStats AS (
+    SELECT 
+        p.OwnerUserId                                           AS UserId,
+        t.Tag,
+        COUNT(*)                                                AS TagUseCount
+    FROM Posts p,
+         LATERAL (
+           SELECT TRIM(BOTH '<>' FROM p.Tags) AS tags_inner
+         ) ti,
+         LATERAL (
+           SELECT UNNEST(
+               CASE 
+                 WHEN ti.tags_inner IS NULL OR ti.tags_inner = '' 
+                 THEN ARRAY[]::text[] 
+                 ELSE regexp_split_to_array(ti.tags_inner, '><') 
+               END
+           ) AS Tag
+         ) t
+    WHERE p.PostTypeId = 1
+      AND p.Tags IS NOT NULL
+    GROUP BY p.OwnerUserId, t.Tag
+),
+UserTagStats_fixed AS (
+    -- Replace the PostgreSQL-specific ARRAY[]::text[] with an empty text array literal using ARRAY[] and explicit type
+    SELECT 
+        uts.UserId,
+        uts.Tag,
+        uts.TagUseCount
+    FROM (
+      SELECT 
+        p.OwnerUserId AS UserId,
+        unnest(
+          CASE 
+            WHEN TRIM(BOTH '<>' FROM p.Tags) IS NULL OR TRIM(BOTH '<>' FROM p.Tags) = '' 
+            THEN ARRAY[]::text[]
+            ELSE regexp_split_to_array(TRIM(BOTH '<>' FROM p.Tags), '><') 
+          END
+        ) AS Tag
+      , p.OwnerUserId AS OwnerUserId2
+      FROM Posts p
+      WHERE p.PostTypeId = 1
+        AND p.Tags IS NOT NULL
+    ) sub
+    JOIN (
+      SELECT 1 AS dummy -- placeholder to allow aggregation below
+    ) d ON TRUE
+    JOIN LATERAL (
+      SELECT sub.OwnerUserId2 AS UserId, sub.Tag, 1 AS TagUseCount
+    ) uts ON TRUE
+),
+CombinedUserMetrics AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        COALESCE(b.GoldCount,0)    AS GoldBadges,
+        COALESCE(b.SilverCount,0)  AS SilverBadges,
+        COALESCE(b.BronzeCount,0)  AS BronzeBadges,
+        COALESCE(p.QuestionCount,0) AS Questions,
+        COALESCE(p.AnswerCount,0)   AS Answers,
+        COALESCE(p.AvgScore,0)      AS AvgPostScore,
+        COALESCE(t.TagUseCount,0)   AS TopTagUses,
+        ROW_NUMBER() OVER (ORDER BY (COALESCE(b.GoldCount,0)*5
+                                     +COALESCE(b.SilverCount,0)*3
+                                     +COALESCE(b.BronzeCount,0)) DESC) AS BadgeRank,
+        CAST(NULL AS INTEGER) AS TagRank,
+        'BADGE' AS MetricSource
+    FROM Users u
+    LEFT JOIN UserBadgeAgg b      ON b.UserId = u.Id
+    LEFT JOIN UserPostStats p     ON p.UserId = u.Id
+    LEFT JOIN (
+        SELECT UserId, MAX(TagUseCount) AS TagUseCount
+        FROM UserTagStats
+        GROUP BY UserId
+    ) t                           ON t.UserId = u.Id
+    WHERE u.Reputation > 1000
+
+    UNION ALL
+
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        0 AS GoldBadges,
+        0 AS SilverBadges,
+        0 AS BronzeBadges,
+        0 AS Questions,
+        0 AS Answers,
+        0 AS AvgPostScore,
+        COALESCE(t.TagUseCount,0) AS TopTagUses,
+        CAST(NULL AS INTEGER) AS BadgeRank,
+        ROW_NUMBER() OVER (ORDER BY COALESCE(t.TagUseCount,0) DESC) AS TagRank,
+        'TAG' AS MetricSource
+    FROM Users u
+    LEFT JOIN (
+        SELECT UserId, MAX(TagUseCount) AS TagUseCount
+        FROM UserTagStats
+        GROUP BY UserId
+    ) t ON t.UserId = u.Id
+    WHERE u.Id NOT IN (SELECT UserId FROM UserBadgeAgg)
+      AND COALESCE(t.TagUseCount,0) > 5
+)
+
+SELECT 
+    cm.Id,
+    cm.DisplayName,
+    cm.GoldBadges,
+    cm.SilverBadges,
+    cm.BronzeBadges,
+    cm.Questions,
+    cm.Answers,
+    ROUND(CAST(cm.AvgPostScore AS numeric),2)               AS AvgScore,
+    cm.TopTagUses,
+    cm.BadgeRank,
+    cm.TagRank,
+    cm.MetricSource,
+    (SELECT SUBSTRING(c.Text FROM 1 FOR 100)
+     FROM Comments c
+     JOIN Posts p ON p.Id = c.PostId
+     WHERE p.OwnerUserId = cm.Id
+       AND p.CreationDate = (SELECT MAX(p2.CreationDate)
+                             FROM Posts p2
+                             WHERE p2.OwnerUserId = cm.Id)
+     ORDER BY c.CreationDate DESC
+     LIMIT 1) AS RecentCommentSnippet,
+    CASE WHEN NOT EXISTS (SELECT 1 FROM Votes v WHERE v.UserId = cm.Id) THEN 1 ELSE 0 END AS NeverVotedFlag,
+    ('https://stackoverflow.com/users/' || cm.Id || '/' || COALESCE(REPLACE(cm.DisplayName,' ','-'),'anonymous')) AS ProfileUrl
+FROM CombinedUserMetrics cm
+GROUP BY
+    cm.Id,
+    cm.DisplayName,
+    cm.GoldBadges,
+    cm.SilverBadges,
+    cm.BronzeBadges,
+    cm.Questions,
+    cm.Answers,
+    cm.AvgPostScore,
+    cm.TopTagUses,
+    cm.BadgeRank,
+    cm.TagRank,
+    cm.MetricSource
+ORDER BY 
+    cm.MetricSource,
+    CASE WHEN cm.MetricSource = 'BADGE' THEN cm.BadgeRank
+         ELSE cm.TagRank END,
+    cm.Id
+LIMIT 100;

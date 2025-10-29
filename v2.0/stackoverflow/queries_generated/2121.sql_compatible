@@ -1,0 +1,217 @@
+with RecursivePopularTags as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        dense_rank() over (order by t.Count desc) as RankByCount
+    from Tags t
+    where t.Count > 1000
+),
+UserPostSummary as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsPosted,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersPosted,
+        coalesce(sum(p.Score),0) as TotalPostScore,
+        count(distinct b.Id) as BadgeCount,
+        max(coalesce(b.Class,0)) as MaxBadgeClass,
+        coalesce(sum(v.VoteTypeWeight),0) as VoteWeightSum
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    left join (
+        select v.PostId, 
+            case v.VoteTypeId
+                when 2 then 1  -- UpMod
+                when 3 then -1 -- DownMod
+                else 0
+            end as VoteTypeWeight
+        from Votes v
+        where v.UserId is null or v.UserId != -1
+    ) v on v.PostId = p.Id
+    group by u.Id, u.DisplayName
+),
+PostWithAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.Tags,
+        q.CreationDate as QuestionCreation,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViews,
+        coalesce(ans.AnswerCount, 0) as AnswerCount,
+        coalesce(avg_ans.Score, 0) as AvgAnswerScore,
+        coalesce(max_ans.Score, 0) as MaxAnswerScore,
+        extract(epoch from (timestamp '2024-10-01 12:34:56' - q.CreationDate))/3600 as HoursSinceCreation
+    from Posts q
+    left join (
+        select ParentId, count(*) as AnswerCount
+        from Posts
+        where PostTypeId = 2
+        group by ParentId
+    ) ans on ans.ParentId = q.Id
+    left join (
+        select ParentId, avg(Score) as Score
+        from Posts
+        where PostTypeId = 2
+        group by ParentId
+    ) avg_ans on avg_ans.ParentId = q.Id
+    left join (
+        select ParentId, max(Score) as Score
+        from Posts
+        where PostTypeId = 2
+        group by ParentId
+    ) max_ans on max_ans.ParentId = q.Id
+    where q.PostTypeId = 1
+),
+DuplicateLinkCounts as (
+    select
+        pl.PostId,
+        count(*) filter (where lt.Name = 'Duplicate') as DuplicateLinksCount
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    group by pl.PostId
+),
+UserCommentActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(c.Id) as TotalComments,
+        count(distinct c.PostId) as UniquePostsCommented,
+        count(*) filter (where c.CreationDate > (timestamp '2024-10-01 12:34:56' - interval '30 days')) as CommentsLast30Days
+    from Users u
+    left join Comments c on c.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+HistoricalPostEdits as (
+    select
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        pht.Name as HistoryTypeName,
+        count(*) as TotalEdits,
+        max(ph.CreationDate) as LastEditDate
+    from PostHistory ph
+    join PostHistoryTypes pht on pht.Id = ph.PostHistoryTypeId
+    group by ph.PostId, ph.PostHistoryTypeId, pht.Name
+),
+RankedAnswers as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.Score,
+        a.CreationDate,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate) as AnswerRank,
+        count(*) over (partition by a.ParentId) as TotalAnswers
+    from Posts a
+    where a.PostTypeId = 2
+),
+TopAnswersWithUser as (
+    select
+        ra.AnswerId,
+        ra.QuestionId,
+        ra.Score as AnswerScore,
+        ra.CreationDate as AnswerCreation,
+        u.Id as AnswererUserId,
+        u.DisplayName as AnswererName,
+        u.Reputation,
+        us.BadgeCount,
+        us.MaxBadgeClass
+    from RankedAnswers ra
+    left join Users u on u.Id = (select p.OwnerUserId from Posts p where p.Id = ra.AnswerId)
+    left join UserPostSummary us on us.UserId = u.Id
+    where ra.AnswerRank = 1
+),
+QuestionsWithCloseReason as (
+    select
+        ph.PostId,
+        crt.Name as CloseReasonName,
+        count(*) as CloseVotesCount
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where ph.PostHistoryTypeId = 10 -- Post Closed
+    group by ph.PostId, crt.Name
+),
+QuestionsCombined as (
+    select
+        p.Id as QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.AnswerCount,
+        d.DuplicateLinksCount,
+        c.CloseReasonName,
+        c.CloseVotesCount,
+        hpe.TotalEdits,
+        hpe.LastEditDate,
+        psa.AvgAnswerScore,
+        psa.MaxAnswerScore,
+        tas.AnswerId as TopAnswerId,
+        tas.AnswerScore,
+        tas.AnswerCreation,
+        tas.AnswererUserId,
+        tas.AnswererName,
+        tas.Reputation as AnswererReputation,
+        tas.BadgeCount as AnswererBadgeCount,
+        tas.MaxBadgeClass as AnswererMaxBadgeClass
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    left join DuplicateLinkCounts d on d.PostId = p.Id
+    left join QuestionsWithCloseReason c on c.PostId = p.Id
+    left join HistoricalPostEdits hpe on hpe.PostId = p.Id and hpe.PostHistoryTypeId = 4 -- Edit Title
+    left join PostWithAnswerStats psa on psa.QuestionId = p.Id
+    left join TopAnswersWithUser tas on tas.QuestionId = p.Id
+    where p.PostTypeId = 1
+)
+select
+    qc.QuestionId,
+    qc.Title,
+    substring(qc.Tags from '<([^>]+)>') as PrimaryTag,
+    qc.OwnerName,
+    qc.CreationDate,
+    qc.Score,
+    qc.ViewCount,
+    coalesce(qc.DuplicateLinksCount,0) as DuplicateLinks,
+    coalesce(qc.CloseVotesCount,0) as CloseVotes,
+    qc.CloseReasonName,
+    qc.TotalEdits,
+    qc.LastEditDate,
+    qc.AvgAnswerScore,
+    qc.MaxAnswerScore,
+    qc.TopAnswerId,
+    qc.AnswerScore,
+    qc.AnswerCreation,
+    qc.AnswererName,
+    qc.AnswererReputation,
+    qc.AnswererBadgeCount,
+    qc.AnswererMaxBadgeClass,
+    case
+        when qc.Score > 100 then 'HighScore'
+        when qc.Score between 50 and 100 then 'MediumScore'
+        else 'LowScore'
+    end as ScoreCategory,
+    case 
+        when qc.ViewCount > 10000 then 'VeryPopular'
+        when qc.ViewCount between 1000 and 10000 then 'Popular'
+        else 'LessPopular'
+    end as PopularityCategory,
+    exists (
+        select 1 from Votes v2
+        where v2.PostId = qc.QuestionId and v2.VoteTypeId = 5
+    ) as HasFavorites,
+    ( 
+        select count(*) 
+        from Comments c2 
+        where c2.PostId = qc.QuestionId
+        and (c2.CreationDate > (timestamp '2024-10-01 12:34:56' - interval '7 days'))
+    ) as RecentCommentCount
+from QuestionsCombined qc
+where qc.Score > 10
+and qc.ViewCount > 500
+and (qc.CloseReasonName is null or qc.CloseVotesCount < 3)
+order by qc.ViewCount desc, qc.Score desc
+limit 50;

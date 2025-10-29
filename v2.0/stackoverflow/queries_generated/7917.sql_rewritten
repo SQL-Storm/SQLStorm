@@ -1,0 +1,209 @@
+-- {"query": "7917.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2202} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT c.Id) as Comments,
+        COUNT(DISTINCT b.Id) as Badges,
+        MAX(p.CreationDate) as LastPostDate,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Elite'
+            WHEN u.Reputation >= 1000 THEN 'Veteran'
+            WHEN u.Reputation >= 100 THEN 'Member'
+            ELSE 'Newbie'
+        END as ReputationTier,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) as ReputationRank,
+        ROW_NUMBER() OVER (PARTITION BY u.AccountId ORDER BY u.CreationDate) as AccountMemberOrder,
+        LAG(u.Reputation, 1, 0) OVER (ORDER BY u.CreationDate) as PreviousReputation
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= '2010-01-01'
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.AccountId, u.CreationDate
+),
+PostComplexityAnalysis AS (
+    SELECT 
+        p.PostTypeId,
+        p.Id as PostId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.ParentId,
+        p.Tags,
+        CASE 
+            WHEN p.Score > 100 THEN 'Highly Voted'
+            WHEN p.Score > 50 THEN 'Moderately Voted'
+            WHEN p.Score > 0 THEN 'Low Voted'
+            ELSE 'Not Voted'
+        END as VotingStatus,
+        CASE 
+            WHEN p.ViewCount > 10000 THEN 'Viral'
+            WHEN p.ViewCount > 1000 THEN 'Popular'
+            WHEN p.ViewCount > 100 THEN 'Noticeable'
+            ELSE 'Obscure'
+        END as PopularityStatus,
+        CASE 
+            WHEN p.AnswerCount > 10 THEN 'Highly Answered'
+            WHEN p.AnswerCount > 5 THEN 'Moderately Answered'
+            WHEN p.AnswerCount > 0 THEN 'Answered'
+            ELSE 'Unanswered'
+        END as AnswerStatus,
+        CASE 
+            WHEN CHAR_LENGTH(p.Body) > 5000 THEN 'Long Form'
+            WHEN CHAR_LENGTH(p.Body) > 1000 THEN 'Medium Form'
+            WHEN CHAR_LENGTH(p.Body) > 100 THEN 'Short Form'
+            ELSE 'Brief'
+        END as BodyLength,
+        COALESCE(p.Tags, '') as CleanTags,
+        SPLIT_PART(p.Tags, '><', 1) as FirstTag,
+        SPLIT_PART(p.Tags, '><', 2) as SecondTag,
+        ARRAY_LENGTH(STRING_TO_ARRAY(COALESCE(p.Tags, ''), '><'), 1) as TagCount,
+        DATEDIFF('day', p.CreationDate, cast('2024-10-01 12:34:56' as timestamp)) as DaysSinceCreation,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as UserPostOrder,
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PreviousScore,
+        NTILE(10) OVER (ORDER BY p.Score DESC) as ScoreDecile
+    FROM Posts p
+    WHERE p.CreationDate >= '2010-01-01'
+),
+PostTagRelations AS (
+    SELECT 
+        pa.PostId,
+        pa.Title,
+        pa.Tags,
+        pa.TagCount,
+        t.TagName,
+        t.Id as TagId,
+        t.Count as TagPopularity,
+        CASE 
+            WHEN t.Count >= 1000 THEN 'Trending'
+            WHEN t.Count >= 100 THEN 'Popular'
+            WHEN t.Count >= 10 THEN 'Notable'
+            ELSE 'Niche'
+        END as TagCategory,
+        ROW_NUMBER() OVER (PARTITION BY t.Id ORDER BY pa.CreationDate) as TagPostOrder
+    FROM PostComplexityAnalysis pa
+    LEFT JOIN (
+        SELECT Id, TagName, Count
+        FROM Tags
+        WHERE Count > 10
+    ) t ON POSITION('<' || t.TagName || '>' IN pa.Tags) > 0
+    WHERE pa.Tags IS NOT NULL AND pa.Tags != ''
+),
+UserPostPerformance AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.TotalPosts,
+        uas.Questions,
+        uas.Answers,
+        uas.Comments,
+        uas.ReputationTier,
+        uas.ReputationRank,
+        uas.AccountMemberOrder,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as UserQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as UserAnswers,
+        AVG(p.Score) as AverageScore,
+        MAX(p.Score) as MaxScore,
+        MIN(p.Score) as MinScore,
+        STDEV(p.Score) as ScoreDeviation,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) as MedianScore,
+        STRING_AGG(DISTINCT p.Title, ', ') as UserPostTitles,
+        STRING_AGG(DISTINCT t.TagName, ' | ') as UserRelatedTags
+    FROM UserActivityStats uas
+    LEFT JOIN Posts p ON uas.UserId = p.OwnerUserId
+    LEFT JOIN PostTagRelations t ON p.Id = t.PostId
+    GROUP BY uas.UserId, uas.DisplayName, uas.Reputation, uas.TotalPosts, 
+             uas.Questions, uas.Answers, uas.Comments, uas.ReputationTier,
+             uas.ReputationRank, uas.AccountMemberOrder
+)
+SELECT 
+    upp.UserId,
+    upp.DisplayName,
+    upp.Reputation,
+    upp.TotalPosts,
+    upp.UserQuestions,
+    upp.UserAnswers,
+    upp.AverageScore,
+    upp.MaxScore,
+    upp.MinScore,
+    upp.ScoreDeviation,
+    upp.MedianScore,
+    upp.ReputationTier,
+    upp.ReputationRank,
+    upp.AccountMemberOrder,
+    CASE 
+        WHEN upp.TotalPosts > 100 AND upp.MaxScore > 500 THEN 'Power User'
+        WHEN upp.TotalPosts > 50 AND upp.AverageScore > 50 THEN 'Active Contributor'
+        WHEN upp.TotalPosts > 20 AND upp.UserQuestions > 5 THEN 'Regular Poster'
+        ELSE 'Occasional Poster'
+    END as UserClassification,
+    STRING_AGG(DISTINCT upp.UserPostTitles, '; ') as PostHistory,
+    STRING_AGG(DISTINCT upp.UserRelatedTags, ' | ') as KnownDomains,
+    COUNT(DISTINCT CASE WHEN upp.MaxScore > 100 THEN upp.UserQuestions END) as HighValueQuestions,
+    COUNT(DISTINCT CASE WHEN upp.UserAnswers > 3 THEN upp.UserAnswers END) as MultipleAnswers,
+    COUNT(DISTINCT CASE WHEN upp.ScoreDeviation > 20 THEN upp.UserId END) as HighVarianceAuthor,
+    CASE 
+        WHEN upp.Reputation < 500 AND upp.TotalPosts < 10 THEN 'Low Engagement'
+        WHEN upp.Reputation >= 500 AND upp.TotalPosts >= 10 THEN 'High Engagement'
+        WHEN upp.Reputation >= 100 AND upp.TotalPosts >= 5 THEN 'Medium Engagement'
+        ELSE 'Average Engagement'
+    END as EngagementLevel,
+    COALESCE(
+        STRING_AGG(DISTINCT CASE 
+            WHEN upp.UserQuestions > 0 THEN CONCAT('Q', upp.UserQuestions, '@', upp.AverageScore)
+            WHEN upp.UserAnswers > 0 THEN CONCAT('A', upp.UserAnswers, '@', upp.AverageScore)
+        END, ' | '), 
+        'No Posts'
+    ) as ContributionProfile,
+    ROW_NUMBER() OVER (ORDER BY upp.Reputation DESC, upp.TotalPosts DESC) as OverallRanking,
+    EXISTS(
+        SELECT 1 FROM Posts p 
+        WHERE p.OwnerUserId = upp.UserId 
+        AND p.PostTypeId = 1 
+        AND p.Score > 1000
+    ) as HasHighVotedQuestion,
+    EXISTS(
+        SELECT 1 FROM Posts p 
+        WHERE p.OwnerUserId = upp.UserId 
+        AND p.PostTypeId = 2 
+        AND p.Score > 1000
+    ) as HasHighVotedAnswer,
+    CASE 
+        WHEN upp.TotalPosts > 0 THEN ROUND(upp.UserQuestions * 100.0 / upp.TotalPosts, 2)
+        ELSE 0
+    END as QuestionPercentage,
+    CASE 
+        WHEN upp.TotalPosts > 0 THEN ROUND(upp.UserAnswers * 100.0 / upp.TotalPosts, 2)
+        ELSE 0
+    END as AnswerPercentage,
+    DENSE_RANK() OVER (ORDER BY upp.Reputation DESC) as ReputationRankGlobal,
+    NTILE(5) OVER (ORDER BY upp.TotalPosts) as PostVolumeQuintile,
+    PERCENT_RANK() OVER (ORDER BY upp.Reputation) as ReputationPercentile
+FROM UserPostPerformance upp
+WHERE upp.Reputation > 1000
+GROUP BY 
+    upp.UserId, upp.DisplayName, upp.Reputation, upp.TotalPosts, 
+    upp.UserQuestions, upp.UserAnswers, upp.AverageScore, 
+    upp.MaxScore, upp.MinScore, upp.ScoreDeviation, upp.MedianScore, 
+    upp.ReputationTier, upp.ReputationRank, upp.AccountMemberOrder
+HAVING 
+    upp.Reputation > 5000 
+    OR upp.TotalPosts > 100 
+    OR upp.HighValueQuestions > 2
+ORDER BY 
+    upp.Reputation DESC, 
+    upp.TotalPosts DESC, 
+    upp.AverageScore DESC
+LIMIT 1000;

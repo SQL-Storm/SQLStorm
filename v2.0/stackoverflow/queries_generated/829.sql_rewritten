@@ -1,0 +1,326 @@
+-- {"query": "829.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3314} 
+with
+params as (
+    select
+        cast('2024-10-01 12:34:56' as timestamp) - interval '5 years' as start_date,
+        cast('2024-10-01 12:34:56' as timestamp) as end_date,
+        100 as min_rep,
+        0.15 as hot_outlier_pct
+),
+q_posts as (
+    select p.*
+    from Posts p
+    join PostTypes pt on pt.Id = p.PostTypeId and pt.Name = 'Question'
+    where p.CreationDate between (select start_date from params) and (select end_date from params)
+),
+a_posts as (
+    select p.*
+    from Posts p
+    join PostTypes pt on pt.Id = p.PostTypeId and pt.Name = 'Answer'
+),
+user_base as (
+    select u.*
+    from Users u
+    where u.Reputation >= (select min_rep from params)
+),
+-- explode question tags into rows
+q_tags as (
+    select
+        q.Id as QuestionId,
+        unnest(string_to_array(substring(q.Tags, 2, greatest(length(q.Tags)-2,0)), '><')) as TagName
+    from q_posts q
+    where q.Tags is not null
+),
+-- tag popularity snapshot (only tags that appear on questions in window)
+tag_stats as (
+    select
+        t.TagName,
+        count(*) as tag_q_count
+    from q_tags t
+    group by t.TagName
+),
+-- compute per-question aggregates and quality metrics
+question_agg as (
+    select
+        q.Id as QuestionId,
+        q.OwnerUserId,
+        q.CreationDate,
+        q.Score as QScore,
+        q.ViewCount,
+        coalesce(q.FavoriteCount, 0) as FavoriteCount,
+        q.AnswerCount,
+        q.AcceptedAnswerId,
+        count(distinct c.Id) as CommentCount,
+        -- has closure via PostHistory
+        max(case when ph.PostHistoryTypeId in (10,35) then 1 else 0 end) as WasClosed,
+        -- time to first answer
+        min(a.CreationDate) filter (where a.PostTypeId = 2) as FirstAnswerDate,
+        -- accepted answer lag
+        (select pa.CreationDate from Posts pa where pa.Id = q.AcceptedAnswerId) as AcceptedAnswerDate
+    from q_posts q
+    left join Comments c on c.PostId = q.Id
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join PostHistory ph on ph.PostId = q.Id and ph.PostHistoryTypeId in (10,11,35,36)
+    group by q.Id, q.OwnerUserId, q.CreationDate, q.Score, q.ViewCount, q.FavoriteCount, q.AnswerCount, q.AcceptedAnswerId
+),
+-- windowed metrics across questions to detect hot outliers
+question_window as (
+    select
+        qa.*,
+        extract(epoch from (coalesce(qa.FirstAnswerDate, qa.CreationDate) - qa.CreationDate))/60.0 as MinutesToFirstAnswer,
+        extract(epoch from (coalesce(qa.AcceptedAnswerDate, qa.CreationDate) - qa.CreationDate))/60.0 as MinutesToAccept,
+        percentile_disc((select hot_outlier_pct from params)) within group (order by qa.ViewCount) over () as p_view_low,
+        percentile_disc(1.0 - (select hot_outlier_pct from params)) within group (order by qa.ViewCount) over () as p_view_high,
+        avg(qa.ViewCount) over () as avg_views_all,
+        stddev_pop(qa.ViewCount) over () as std_views_all
+    from question_agg qa
+),
+-- user engagement and trust metrics
+user_agg as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate as UserCreated,
+        u.Location,
+        u.UpVotes,
+        u.DownVotes,
+        count(distinct b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(distinct b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(distinct b.Id) filter (where b.Class = 3) as BronzeBadges,
+        count(distinct q.QuestionId) as QuestionsAsked,
+        count(distinct a.Id) as AnswersPosted
+    from user_base u
+    left join Badges b on b.UserId = u.Id
+    left join question_agg q on q.OwnerUserId = u.Id
+    left join a_posts a on a.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location, u.UpVotes, u.DownVotes
+),
+-- voting aggregates on questions and answers
+post_votes as (
+    select
+        v.PostId,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+        sum(case when v.VoteTypeId = 5 then 1 else 0 end) as Favorites,
+        sum(case when v.VoteTypeId in (8,9) then coalesce(v.BountyAmount,0) else 0 end) as BountyTotal,
+        min(v.CreationDate) as FirstVoteAt,
+        max(v.CreationDate) as LastVoteAt
+    from Votes v
+    group by v.PostId
+),
+-- duplicate/related graph metrics
+q_link_agg as (
+    select
+        pl.PostId as QuestionId,
+        sum(case when pl.LinkTypeId = 3 then 1 else 0 end) as DuplicateLinks,
+        sum(case when pl.LinkTypeId = 1 then 1 else 0 end) as RelatedLinks
+    from PostLinks pl
+    join q_posts q on q.Id = pl.PostId
+    group by pl.PostId
+),
+-- combine question-level metrics with tag density and voting
+q_enriched as (
+    select
+        qw.*,
+        coalesce(pv.UpVotes,0) as QUpVotes,
+        coalesce(pv.DownVotes,0) as QDownVotes,
+        coalesce(pv.Favorites,0) as QFavoriteVotes,
+        coalesce(pv.BountyTotal,0) as QBounty,
+        coalesce(ql.DuplicateLinks,0) as DuplicateLinks,
+        coalesce(ql.RelatedLinks,0) as RelatedLinks,
+        -- dominant tag (first by popularity within the question's tags)
+        (
+            select qt.TagName
+            from q_tags qt
+            join tag_stats ts on ts.TagName = qt.TagName
+            where qt.QuestionId = qw.QuestionId
+            order by ts.tag_q_count desc, qt.TagName
+            limit 1
+        ) as DominantTag,
+        -- count tags
+        (
+            select count(*) from q_tags qt where qt.QuestionId = qw.QuestionId
+        ) as TagCount
+    from question_window qw
+    left join post_votes pv on pv.PostId = qw.QuestionId
+    left join q_link_agg ql on ql.QuestionId = qw.QuestionId
+),
+-- answer aggregates per question
+answer_agg as (
+    select
+        a.ParentId as QuestionId,
+        count(*) as Answers,
+        sum(case when a.Id = q.AcceptedAnswerId then 1 else 0 end) as HasAccepted,
+        avg(a.Score) as AvgAnswerScore,
+        max(a.Score) as MaxAnswerScore,
+        min(a.CreationDate) as FirstAnswerDate,
+        max(a.CreationDate) as LastAnswerDate,
+        count(*) filter (where a.OwnerUserId is null) as AnonymousAnswers
+    from a_posts a
+    join q_posts q on q.Id = a.ParentId
+    group by a.ParentId
+),
+-- compute a composite "question quality score"
+q_quality as (
+    select
+        qe.QuestionId,
+        qe.OwnerUserId,
+        qe.CreationDate,
+        qe.QScore,
+        qe.ViewCount,
+        qe.QUpVotes,
+        qe.QDownVotes,
+        qe.QFavoriteVotes,
+        qe.QBounty,
+        qe.MinutesToFirstAnswer,
+        qe.MinutesToAccept,
+        qe.WasClosed,
+        qe.DuplicateLinks,
+        qe.RelatedLinks,
+        qe.TagCount,
+        qe.DominantTag,
+        aa.Answers,
+        aa.HasAccepted,
+        aa.AvgAnswerScore,
+        -- logistic-like normalization for views
+        case
+            when qe.std_views_all is null or qe.std_views_all = 0 then 0.0
+            else (qe.ViewCount - qe.avg_views_all) / nullif(qe.std_views_all,0)
+        end as ViewsZ,
+        -- composite score
+        (
+            coalesce(qe.QUpVotes,0) * 1.0
+            - coalesce(qe.QDownVotes,0) * 1.5
+            + coalesce(qe.QFavoriteVotes,0) * 0.8
+            + coalesce(aa.AvgAnswerScore,0) * 0.7
+            + case when aa.HasAccepted > 0 then 2.5 else 0 end
+            + least(greatest(5.0 - coalesce(qe.MinutesToFirstAnswer, 1440)/60.0, -5.0), 5.0)
+            + least(greatest(5.0 - coalesce(qe.MinutesToAccept, 1440)/60.0, -5.0), 5.0)
+            + coalesce(qe.QBounty,0) / 100.0
+            - coalesce(qe.WasClosed,0) * 3.0
+            - coalesce(qe.DuplicateLinks,0) * 1.0
+            + coalesce(qe.RelatedLinks,0) * 0.2
+            + coalesce(qe.TagCount,0) * 0.1
+            + coalesce(aa.Answers,0) * 0.3
+            + coalesce(((case when qe.ViewCount >= qe.p_view_high then 1 when qe.ViewCount <= qe.p_view_low then -1 else 0 end) * 1.2),0)
+        ) as QualityScore
+    from q_enriched qe
+    left join answer_agg aa on aa.QuestionId = qe.QuestionId
+),
+-- correlate user quality with their question quality
+user_quality as (
+    select
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.GoldBadges,
+        ua.SilverBadges,
+        ua.BronzeBadges,
+        ua.QuestionsAsked,
+        ua.AnswersPosted,
+        avg(qq.QualityScore) as AvgQuestionQuality,
+        percentile_cont(0.5) within group (order by qq.QualityScore) as MedianQuestionQuality,
+        count(*) as QuestionsConsidered
+    from user_agg ua
+    left join q_quality qq on qq.OwnerUserId = ua.UserId
+    group by ua.UserId, ua.DisplayName, ua.Reputation, ua.GoldBadges, ua.SilverBadges, ua.BronzeBadges, ua.QuestionsAsked, ua.AnswersPosted
+),
+-- find similar questions by dominant tag and time proximity using self join + null-safe conditions
+similar_q as (
+    select
+        q1.QuestionId,
+        count(*) as NearNeighborCount,
+        avg(q2.QScore) as NeighborAvgQScore
+    from q_quality q1
+    left join q_quality q2
+        on q2.QuestionId <> q1.QuestionId
+        and coalesce(q1.DominantTag,'') = coalesce(q2.DominantTag,'')
+        and abs(extract(epoch from (q2.CreationDate - q1.CreationDate))) <= 86400
+    group by q1.QuestionId
+),
+-- label outliers and craft string summaries
+final_q as (
+    select
+        qq.*,
+        uq.UserId,
+        uq.DisplayName,
+        uq.Reputation,
+        uq.GoldBadges,
+        uq.SilverBadges,
+        uq.BronzeBadges,
+        uq.AvgQuestionQuality as UserAvgQQuality,
+        uq.MedianQuestionQuality as UserMedianQQuality,
+        uq.QuestionsConsidered as UserQuestionsConsidered,
+        sq.NearNeighborCount,
+        sq.NeighborAvgQScore,
+        case
+            when qq.QualityScore >= (select avg(QualityScore) + 2*stddev_pop(QualityScore) from q_quality) then 'Exceptional'
+            when qq.QualityScore <= (select avg(QualityScore) - 2*stddev_pop(QualityScore) from q_quality) then 'Poor'
+            else 'Normal'
+        end as QualityBand,
+        -- compact string summary with null handling and truncation
+        substring(
+            coalesce(uq.DisplayName,'(anon)') || ' | Rep:' || coalesce(uq.Reputation::text,'0')
+            || ' | Tag:' || coalesce(qq.DominantTag,'<none>')
+            || ' | Score:' || coalesce(qq.QScore::text,'0')
+            || ' | Views:' || coalesce(qq.ViewCount::text,'0')
+            || ' | Qual:' || round(qq.QualityScore::numeric,2)::text
+        from 1 for 200) as Summary
+    from q_quality qq
+    left join user_quality uq on uq.UserId = qq.OwnerUserId
+    left join similar_q sq on sq.QuestionId = qq.QuestionId
+),
+-- produce a union set with and without duplicates for set-operator benchmarking
+ranked as (
+    select
+        fq.*,
+        row_number() over (partition by coalesce(fq.DominantTag,'') order by fq.QualityScore desc, fq.ViewCount desc, fq.CreationDate asc) as tag_rank,
+        dense_rank() over (order by fq.QualityScore desc) as global_rank
+    from final_q fq
+),
+top_per_tag as (
+    select * from ranked where tag_rank <= 5
+),
+top_global as (
+    select * from ranked where global_rank <= 50
+),
+unioned as (
+    select * from top_per_tag
+    union all
+    select * from top_global
+),
+deduped as (
+    select distinct on (QuestionId) *
+    from unioned
+    order by QuestionId, global_rank
+)
+select
+    d.QuestionId,
+    d.DisplayName,
+    d.Reputation,
+    d.DominantTag,
+    d.QScore,
+    d.ViewCount,
+    d.QUpVotes,
+    d.QDownVotes,
+    d.QFavoriteVotes,
+    d.QBounty,
+    d.Answers,
+    d.HasAccepted,
+    d.MinutesToFirstAnswer,
+    d.MinutesToAccept,
+    d.WasClosed,
+    d.DuplicateLinks,
+    d.RelatedLinks,
+    round(d.QualityScore::numeric, 3) as QualityScore,
+    coalesce(d.UserAvgQQuality, 0)::numeric(10,3) as UserAvgQQuality,
+    coalesce(d.UserMedianQQuality, 0)::numeric(10,3) as UserMedianQQuality,
+    d.UserQuestionsConsidered,
+    d.NearNeighborCount,
+    round(coalesce(d.NeighborAvgQScore,0)::numeric, 2) as NeighborAvgQScore,
+    d.QualityBand,
+    d.Summary
+from deduped d
+order by d.QualityScore desc nulls last, d.ViewCount desc nulls last, d.QuestionId asc
+limit 200;

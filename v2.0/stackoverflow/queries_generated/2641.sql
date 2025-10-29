@@ -1,0 +1,147 @@
+-- {"query": "2641.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1591} 
+with RecursiveTagHierarchy as (
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 as Level,
+        array[t.Id] as Path
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+    union all
+    select 
+        c.Id,
+        c.TagName,
+        c.Count,
+        r.Level + 1,
+        r.Path || c.Id
+    from Tags c
+    join PostLinks pl on pl.PostId = c.ExcerptPostId
+    join RecursiveTagHierarchy r on pl.RelatedPostId = r.Id
+    where c.IsModeratorOnly = 0 and c.IsRequired = 0
+       and not c.Id = any(r.Path)
+       and r.Level < 3
+),
+UserPostStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        avg(p.Score) filter (where p.PostTypeId in (1,2)) as AvgPostScore,
+        max(p.Score) filter (where p.PostTypeId in (1,2)) as MaxPostScore,
+        sum(v.VoteTypeId = 2)::int as TotalUpVotes,
+        sum(v.VoteTypeId = 3)::int as TotalDownVotes,
+        count(distinct b.Id) as BadgeCount
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Votes v on v.PostId = p.Id
+    left join Badges b on b.UserId = u.Id
+    where u.Reputation > 1000 -- Filtering active users
+    group by u.Id, u.DisplayName
+),
+RankedPosts as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.Title,
+        row_number() over (partition by p.OwnerUserId, p.PostTypeId order by p.Score desc, p.ViewCount desc) as PostRank,
+        dense_rank() over (order by p.Score desc nulls last) as GlobalScoreRank,
+        rank() over (partition by p.PostTypeId order by p.CreationDate) as DateRank
+    from Posts p
+    where p.PostTypeId in (1, 2)
+),
+FilteredBadges as (
+    select b1.UserId, b1.Name, b1.Class, b1.Date,
+        lead(b1.Date) over (partition by b1.UserId order by b1.Date) as NextBadgeDate
+    from Badges b1
+    where b1.Class = 1 -- Gold badges only
+),
+UserBadgeDurations as (
+    select 
+        fb.UserId,
+        count(fb.Name) as GoldBadgeCount,
+        coalesce(avg(extract(epoch from (lead(fb.Date) over (partition by fb.UserId order by fb.Date) - fb.Date))/3600),0) as AvgHoursBetweenGoldBadges
+    from FilteredBadges fb
+    group by fb.UserId
+),
+PostsWithCloseInfo as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        ph.PostHistoryTypeId,
+        crt.Name as CloseReason,
+        ph.Comment as CloseReasonId,
+        ph.CreationDate as CloseDate
+    from Posts p
+    left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 10 -- Post Closed
+    left join CloseReasonTypes crt on crt.Id = try_cast(ph.Comment as smallint)
+    where p.PostTypeId = 1
+),
+ComplexAuthorStats as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) as TotalPosts,
+        sum(case when p.PostTypeId = 1 and p.Score > 10 then 1 else 0 end) as HighlyScoredQuestions,
+        sum(case when p.PostTypeId = 2 and p.Score > 20 then 1 else 0 end) as HighlyScoredAnswers,
+        sum(case when v.VoteTypeId = 5 then 1 else 0 end) as FavoritesReceived,
+        sum(case when v.VoteTypeId = 6 then 1 else 0 end) as CloseVotesCast,
+        max(p.Score) as MaxScore,
+        min(p.CreationDate) as FirstPostDate,
+        max(p.CreationDate) as LastPostDate,
+        count(distinct ph.Id) filter (where ph.PostHistoryTypeId in (10,11)) as CloseReopenEvents
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Votes v on v.PostId = p.Id
+    left join PostHistory ph on ph.PostId = p.Id
+    group by u.Id, u.DisplayName
+)
+select 
+    ups.UserId,
+    ups.DisplayName,
+    ups.QuestionCount,
+    ups.AnswerCount,
+    coalesce(ups.AvgPostScore,0) as AvgScore,
+    coalesce(ups.MaxPostScore,0) as MaxScore,
+    coalesce(ups.TotalUpVotes,0) as UpVotes,
+    coalesce(ups.TotalDownVotes,0) as DownVotes,
+    coalesce(ubd.GoldBadgeCount,0) as GoldBadges,
+    round(coalesce(ubd.AvgHoursBetweenGoldBadges,0),2) as AvgHoursBetweenGoldBadges,
+    cps.TotalPosts,
+    cps.HighlyScoredQuestions,
+    cps.HighlyScoredAnswers,
+    cps.FavoritesReceived,
+    cps.CloseVotesCast,
+    cps.CloseReopenEvents,
+    rp.Id as TopQuestionId,
+    rp.Title as TopQuestionTitle,
+    rp.Score as TopQuestionScore,
+    rt.Level as TagRelationLevel,
+    coalesce(pwc.CloseReason, 'Never Closed') as LastClosureReason,
+    coalesce(pwc.CloseDate, to_timestamp(0)) as LastClosureDate,
+    -- Complex string manipulation: construct a pseudo "summary"
+    concat_ws(' | ', 
+      'User: ' || coalesce(ups.DisplayName, 'unknown'),
+      'Reputation: ' || u.Reputation,
+      'Posts(Q/A): ' || concat(ups.QuestionCount, '/', ups.AnswerCount),
+      'TopScore: ' || coalesce(ups.MaxPostScore,'0'),
+      'GoldBadges: ' || coalesce(ubd.GoldBadgeCount, 0),
+      'LastClose: ' || coalesce(pwc.CloseReason, 'Never Closed')
+    ) as UserSummary
+from UserPostStats ups
+join Users u on u.Id = ups.UserId
+left join UserBadgeDurations ubd on ubd.UserId = ups.UserId
+left join ComplexAuthorStats cps on cps.UserId = ups.UserId
+left join RankedPosts rp on rp.OwnerUserId = ups.UserId and rp.PostTypeId = 1 and rp.PostRank = 1
+left join PostsWithCloseInfo pwc on pwc.Id = rp.Id
+left join RecursiveTagHierarchy rt on rt.TagName = (select unnest(string_to_array(substring(rp.Tags from 2 for char_length(rp.Tags)-2), '><')) limit 1)
+where ups.QuestionCount > 5
+order by ups.MaxPostScore desc, ups.TotalUpVotes desc
+limit 100;

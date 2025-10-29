@@ -1,0 +1,40 @@
+-- {"query": "5767.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 402} 
+SELECT
+    u.Id AS UserId,
+    u.DisplayName AS UserName,
+    u.Reputation,
+    COALESCE(u.Location, 'Unknown') AS Location,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS Questions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS Answers,
+    MAX(p.CreationDate) AS LastActive,
+    AVG(p.Score) AS AvgPostScore,
+    AVG(DATEDIFF(second, p.CreationDate, cast('2024-10-01 12:34:56' as timestamp))) AS AvgAgeSeconds,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS UpVotesReceived,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS DownVotesReceived,
+    STRING_AGG(DISTINCT b.Name, ',') AS BadgesEarned,
+    CASE
+        WHEN MIN(p.LastActivityDate) IS NULL THEN NULL
+        ELSE DATEDIFF(day, MIN(p.LastActivityDate), MAX(p.CreationDate))
+    END AS ActivitySpanDays
+FROM
+    Users u
+LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+LEFT JOIN Votes v ON v.PostId = p.Id
+LEFT JOIN Badges b ON b.UserId = u.Id
+LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+WHERE
+    u.Reputation > 1000
+    AND (p.PostTypeId IS NULL OR p.PostTypeId IN (1, 2))
+    AND ph.Id IS NOT NULL
+GROUP BY
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.Location
+HAVING
+    COUNT(DISTINCT p.Id) >= 5
+ORDER BY
+    TotalPosts DESC,
+    LastActive DESC
+LIMIT 100;

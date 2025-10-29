@@ -1,0 +1,164 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        Id,
+        TagName,
+        WikiPostId,
+        0 AS Depth,
+        CAST(TagName AS VARCHAR(1000)) AS Path
+    FROM Tags
+    WHERE Id IS NOT NULL
+
+    UNION ALL
+
+    SELECT
+        t.Id,
+        t.TagName,
+        t.WikiPostId,
+        r.Depth + 1,
+        CAST(r.Path || ' > ' || t.TagName AS VARCHAR(1000)) AS Path
+    FROM Tags t
+    INNER JOIN RecursiveTagHierarchy r ON t.ExcerptPostId = r.WikiPostId
+    WHERE r.Depth < 3
+), 
+UserActivitySummary AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsAsked,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersGiven,
+        COUNT(b.Id) AS TotalBadges,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        COALESCE(SUM(vt.Weight),0) AS VoteWeightSum
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    LEFT JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY u.Id, u.DisplayName
+), 
+PostScoresWithRank AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS ScoreRank,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS RecentPostNumber
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+ClosedQuestionsWithReasons AS (
+    SELECT
+        ph.PostId,
+        crt.Name AS CloseReason,
+        ph.CreationDate AS ClosedAt
+    FROM PostHistory ph
+    INNER JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS INTEGER)
+    WHERE ph.PostHistoryTypeId = 10
+),
+HighEngagementPosts AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        COALESCE(p.ViewCount, 0) AS Views,
+        COALESCE(p.Score, 0) AS Score,
+        COALESCE(p.FavoriteCount, 0) AS Favorites,
+        COALESCE((SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id), 0) AS CommentCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+), 
+UserVoteAgg AS (
+    SELECT
+        v.PostId,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVotes,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVotes,
+        COUNT(*) AS TotalVotes
+    FROM Votes v
+    GROUP BY v.PostId
+),
+TopLinkedPosts AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        COUNT(*) AS LinkCount
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId IN (1,3)
+    GROUP BY pl.PostId, pl.RelatedPostId
+    HAVING COUNT(*) > 1
+)
+
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.QuestionsAsked,
+    ua.AnswersGiven,
+    ua.TotalBadges,
+    ua.GoldBadges,
+    ua.SilverBadges,
+    ua.BronzeBadges,
+    ua.VoteWeightSum,
+    ps.Title AS TopQuestionTitle,
+    ps.Score AS TopQuestionScore,
+    cqr.CloseReason,
+    cqr.ClosedAt,
+    he.Views,
+    he.Favorites,
+    he.CommentCount,
+    uv.UpVotes,
+    uv.DownVotes,
+    uv.TotalVotes,
+    STRING_AGG(DISTINCT rth.Path, ' | ') FILTER (WHERE rth.Depth = 1) AS UserTagHierarchy,
+    CASE 
+        WHEN ua.QuestionsAsked = 0 THEN 'No questions asked'
+        WHEN ua.AnswersGiven = 0 THEN 'No answers given'
+        ELSE 'Active Q&A participant'
+    END AS UserEngagementStatus,
+    pl.PostId AS HighlyLinkedPostId,
+    pl.RelatedPostId AS HighlyLinkedRelatedPostId,
+    pl.LinkCount AS LinkFrequency
+FROM UserActivitySummary ua
+LEFT JOIN PostScoresWithRank ps ON ps.OwnerUserId = ua.UserId AND ps.ScoreRank = 1 AND ps.PostTypeId = 1
+LEFT JOIN ClosedQuestionsWithReasons cqr ON cqr.PostId = ps.Id
+LEFT JOIN HighEngagementPosts he ON he.Id = ps.Id
+LEFT JOIN UserVoteAgg uv ON uv.PostId = ps.Id
+LEFT JOIN LATERAL (
+    SELECT * FROM TopLinkedPosts tpl WHERE tpl.PostId = ps.Id LIMIT 1
+) pl ON TRUE
+LEFT JOIN RecursiveTagHierarchy rth ON rth.WikiPostId = (
+    SELECT p2.WikiPostId FROM Tags p2 WHERE p2.Id = rth.Id LIMIT 1
+)
+WHERE ua.TotalBadges > 0
+GROUP BY
+    ua.UserId,
+    ua.DisplayName,
+    ua.QuestionsAsked,
+    ua.AnswersGiven,
+    ua.TotalBadges,
+    ua.GoldBadges,
+    ua.SilverBadges,
+    ua.BronzeBadges,
+    ua.VoteWeightSum,
+    ps.Title,
+    ps.Score,
+    cqr.CloseReason,
+    cqr.ClosedAt,
+    he.Views,
+    he.Favorites,
+    he.CommentCount,
+    uv.UpVotes,
+    uv.DownVotes,
+    uv.TotalVotes,
+    CASE 
+        WHEN ua.QuestionsAsked = 0 THEN 'No questions asked'
+        WHEN ua.AnswersGiven = 0 THEN 'No answers given'
+        ELSE 'Active Q&A participant'
+    END,
+    pl.PostId,
+    pl.RelatedPostId,
+    pl.LinkCount
+ORDER BY ua.VoteWeightSum DESC
+LIMIT 50;

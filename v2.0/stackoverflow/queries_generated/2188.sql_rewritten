@@ -1,0 +1,142 @@
+-- {"query": "2188.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1149} 
+with RecursivePosts as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        coalesce(p.Tags, '') as Tags,
+        0 as Depth
+    from Posts p
+    where p.PostTypeId = 1 -- Questions only
+    union all
+    select 
+        c.Id,
+        c.PostTypeId,
+        c.ParentId,
+        c.OwnerUserId,
+        c.Score,
+        c.ViewCount,
+        c.CreationDate,
+        c.Title,
+        coalesce(c.Tags, ''),
+        rp.Depth + 1
+    from Posts c
+    join RecursivePosts rp on c.ParentId = rp.Id
+    where c.PostTypeId = 2 -- Answers and descendants
+),
+UserScores as (
+    select 
+        OwnerUserId as UserId,
+        count(*) filter (where PostTypeId = 1) as QuestionCount,
+        count(*) filter (where PostTypeId = 2) as AnswerCount,
+        sum(Score) as TotalScore,
+        avg(Score) as AverageScore,
+        sum(ViewCount) as TotalViews
+    from RecursivePosts
+    where OwnerUserId is not null
+    group by OwnerUserId
+),
+TopUsers as (
+    select 
+        u.Id,
+        u.DisplayName,
+        us.QuestionCount,
+        us.AnswerCount,
+        us.TotalScore,
+        us.AverageScore,
+        us.TotalViews,
+        row_number() over (order by us.TotalScore desc nulls last) as ScoreRank
+    from Users u
+    left join UserScores us on u.Id = us.UserId
+    where u.Reputation > 1000
+),
+LatestComments perPost as (
+    select
+        c.PostId,
+        c.Text,
+        c.CreationDate,
+        c.UserId,
+        row_number() over (partition by c.PostId order by c.CreationDate desc) as rn
+    from Comments c
+    where c.Text is not null and length(c.Text) > 10
+),
+PostCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReasonName,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    left join CloseReasonTypes crt on try_cast(ph.Comment as int) = crt.Id
+    where ph.PostHistoryTypeId = 10 -- Post Closed
+),
+UserBadges as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserBadgeSummary as (
+    select 
+        UserId,
+        sum(case when Class = 1 then BadgeCount else 0 end) as GoldBadges,
+        sum(case when Class = 2 then BadgeCount else 0 end) as SilverBadges,
+        sum(case when Class = 3 then BadgeCount else 0 end) as BronzeBadges
+    from UserBadges
+    group by UserId
+)
+select 
+    tu.Id as UserId,
+    tu.DisplayName,
+    coalesce(ub.GoldBadges,0) as GoldBadges,
+    coalesce(ub.SilverBadges,0) as SilverBadges,
+    coalesce(ub.BronzeBadges,0) as BronzeBadges,
+    tu.QuestionCount,
+    tu.AnswerCount,
+    tu.TotalScore,
+    tu.AverageScore,
+    tu.TotalViews,
+    ph.PostId,
+    p.Title,
+    p.Tags,
+    ph.CloseReasonName,
+    ph.CloseDate,
+    lc.Text as LatestComment,
+    lc.CreationDate as LatestCommentDate,
+    (select count(*) 
+     from PostLinks pl 
+     where pl.PostId = p.Id and pl.LinkTypeId = 3 /* Duplicate */) as DuplicateCount,
+    (select count(*) 
+     from Votes v 
+     where v.PostId = p.Id and v.VoteTypeId = 2 /* UpMod */) as UpVotes,
+    (select count(*) 
+     from Votes v 
+     where v.PostId = p.Id and v.VoteTypeId = 3 /* DownMod */) as DownVotes,
+    case 
+        when p.CreationDate < cast('2024-10-01 12:34:56' as timestamp) - interval '1 year' then 'Old' 
+        when p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '1 year' and p.CreationDate < cast('2024-10-01 12:34:56' as timestamp) - interval '1 month' then 'Recent' 
+        else 'New' 
+    end as PostAgeCategory,
+    concat(
+        substring(coalesce(p.Title, ''), 1, 30),
+        ' ... [tags: ', 
+        coalesce(string_agg(trim(t.TagName), ', '), 'None'),
+        ']'
+    ) as TitleWithTagsSummary
+from TopUsers tu
+join Posts p on p.OwnerUserId = tu.Id and p.PostTypeId = 1
+left join PostCloseReasons ph on ph.PostId = p.Id
+left join LatestComments lc on lc.PostId = p.Id and lc.rn = 1
+left join UserBadgeSummary ub on ub.UserId = tu.Id
+left join lateral (
+    select unnest(string_to_array(trim(both '<>' from coalesce(p.Tags, '')), '><')) as TagName
+) t on true
+where tu.ScoreRank <= 50
+order by tu.TotalScore desc, p.ViewCount desc
+limit 100;

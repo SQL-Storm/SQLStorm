@@ -1,0 +1,170 @@
+WITH UserPostActivity AS (
+    SELECT
+        p.OwnerUserId,
+        COUNT(p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        COALESCE(SUM(p.FavoriteCount), 0) AS TotalFavorites
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+UserCommentActivity AS (
+    SELECT
+        c.UserId,
+        COUNT(c.Id) AS TotalComments,
+        AVG(c.Score) AS AvgCommentScore,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+    GROUP BY c.UserId
+),
+UserVoteActivity AS (
+    SELECT
+        v.UserId,
+        COUNT(CASE WHEN vt.Name = 'UpMod' THEN v.Id END) AS UpVotesReceived,
+        COUNT(CASE WHEN vt.Name = 'DownMod' THEN v.Id END) AS DownVotesReceived,
+        COUNT(CASE WHEN vt.Name = 'Favorite' THEN v.Id END) AS FavoritesGiven,
+        MAX(v.CreationDate) AS LastVoteDate
+    FROM Votes v
+    JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    WHERE v.UserId IS NOT NULL
+    GROUP BY v.UserId
+),
+UserBadgeSummary AS (
+    SELECT
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Badges b
+    WHERE b.UserId IS NOT NULL
+    GROUP BY b.UserId
+),
+QuestionDetails AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate AS QuestionCreationDate,
+        p.AnswerCount,
+        p.Score AS QuestionScore,
+        p.ViewCount,
+        p.ClosedDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS RowNum
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.OwnerUserId IS NOT NULL
+)
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.Views AS UserViews,
+    u.UpVotes AS UserUpVotes,
+    u.DownVotes AS UserDownVotes,
+    u.CreationDate AS UserCreationDate,
+    COALESCE(upa.TotalPosts, 0) AS TotalPostsByUpa,
+    COALESCE(upa.QuestionCount, 0) AS QuestionCountByUpa,
+    COALESCE(upa.AnswerCount, 0) AS AnswerCountByUpa,
+    upa.AvgPostScore,
+    COALESCE(uca.TotalComments, 0) AS TotalCommentsByUca,
+    uca.AvgCommentScore,
+    COALESCE(uva.UpVotesReceived, 0) AS UpVotesReceivedByUva,
+    COALESCE(uva.DownVotesReceived, 0) AS DownVotesReceivedByUva,
+    COALESCE(ubs.GoldBadges, 0) AS GoldBadgesByUbs,
+    COALESCE(ubs.SilverBadges, 0) AS SilverBadgesByUbs,
+    COALESCE(ubs.BronzeBadges, 0) AS BronzeBadgesByUbs,
+    CASE
+        WHEN u.WebsiteUrl IS NULL OR u.WebsiteUrl = '' THEN 'No Website'
+        WHEN u.WebsiteUrl LIKE '%stackoverflow.com%' THEN 'Stack Overflow Related'
+        ELSE 'External Website'
+    END AS WebsiteCategory,
+    CASE
+        WHEN qd.AnswerCount > 10 AND qd.QuestionScore > 50 THEN 'High Performing Question'
+        WHEN qd.ClosedDate IS NOT NULL THEN 'Closed Question'
+        ELSE 'Standard Question'
+    END AS QuestionStatus,
+    COALESCE(pht.EditCount, 0) AS PostEditCount,
+    COALESCE(pl.DuplicateLinkCount, 0) AS DuplicateLinkCount,
+    UPPER(SUBSTRING(u.DisplayName FROM 1 FOR 3)) AS DisplayNamePrefix,
+    upa.LastPostDate,
+    uca.LastCommentDate,
+    uva.LastVoteDate,
+    ubs.LastBadgeDate,
+    qd.QuestionCreationDate AS MostRecentQuestionDate,
+    qd.ViewCount AS MostRecentQuestionViews,
+    qd.QuestionScore AS MostRecentQuestionScore,
+    qd.Title AS MostRecentQuestionTitle,
+    CASE
+        WHEN u.AccountId IS NULL THEN 'No AccountId'
+        WHEN u.AccountId = -1 THEN 'Community User'
+        ELSE 'Regular User'
+    END AS AccountType,
+    CAST(STRFTIME('%Y', u.CreationDate) AS INTEGER) AS UserCreationYear,
+    CASE
+        WHEN u.LastAccessDate < (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1' YEAR) THEN 'Inactive User'
+        ELSE 'Active User'
+    END AS UserActivityStatus
+FROM Users u
+LEFT JOIN UserPostActivity upa ON u.Id = upa.OwnerUserId
+LEFT JOIN UserCommentActivity uca ON u.Id = uca.UserId
+LEFT JOIN UserVoteActivity uva ON u.Id = uva.UserId
+LEFT JOIN UserBadgeSummary ubs ON u.Id = ubs.UserId
+LEFT JOIN LATERAL (
+    SELECT ph.OwnerUserId, COUNT(*) AS EditCount
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6) AND ph.OwnerUserId = u.Id
+    GROUP BY ph.OwnerUserId
+) pht ON true
+LEFT JOIN LATERAL (
+    SELECT pl_sub.PostId, COUNT(*) AS DuplicateLinkCount
+    FROM PostLinks pl_sub
+    WHERE pl_sub.LinkTypeId = 3 AND pl_sub.PostId = u.Id
+    GROUP BY pl_sub.PostId
+) pl ON true
+LEFT JOIN QuestionDetails qd ON u.Id = qd.OwnerUserId AND qd.RowNum = 1
+GROUP BY
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.CreationDate,
+    upa.TotalPosts,
+    upa.QuestionCount,
+    upa.AnswerCount,
+    upa.AvgPostScore,
+    upa.LastPostDate,
+    uca.UserId,
+    uca.TotalComments,
+    uca.AvgCommentScore,
+    uca.LastCommentDate,
+    uva.UserId,
+    uva.UpVotesReceived,
+    uva.DownVotesReceived,
+    uva.LastVoteDate,
+    ubs.UserId,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    ubs.LastBadgeDate,
+    u.WebsiteUrl,
+    qd.AnswerCount,
+    qd.QuestionScore,
+    qd.ClosedDate,
+    pht.OwnerUserId,
+    pht.EditCount,
+    pl.PostId,
+    pl.DuplicateLinkCount,
+    qd.QuestionCreationDate,
+    qd.ViewCount,
+    qd.QuestionScore,
+    qd.Title,
+    u.AccountId,
+    u.LastAccessDate
+ORDER BY u.Reputation DESC
+LIMIT 100;

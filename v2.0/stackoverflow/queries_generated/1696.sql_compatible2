@@ -1,0 +1,226 @@
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        COALESCE(U.DisplayName, 'Anonymous') AS DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.Views AS UserViews,
+        U.UpVotes AS UserUpVotes,
+        U.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(CASE WHEN P.PostTypeId IN (1, 2) THEN P.Score ELSE 0 END) AS TotalPostScore,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS timestamp) - U.CreationDate)) AS AccountAgeDays,
+        (CAST(U.UpVotes AS NUMERIC) / NULLIF(U.UpVotes + U.DownVotes, 0)) AS UpvoteRatio
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.Views, U.UpVotes, U.DownVotes
+),
+PostDetailsWithHistory AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score,
+        P.ViewCount,
+        P.Body,
+        P.Title,
+        P.Tags,
+        P.AnswerCount,
+        P.CommentCount AS DirectCommentCount,
+        P.FavoriteCount,
+        P.ClosedDate,
+        P.LastActivityDate,
+        P.LastEditDate,
+        AA.Score AS AcceptedAnswerScore,
+        COUNT(DISTINCT C.Id) AS TotalCommentsOnPost,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS PostUpVotes,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS PostDownVotes,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseHistoryCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenHistoryCount,
+        CASE
+            WHEN P.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN P.CommunityOwnedDate IS NOT NULL THEN 'CommunityOwned'
+            ELSE 'Open'
+        END AS PostStatus,
+        LENGTH(COALESCE(P.Body, '')) - LENGTH(REPLACE(COALESCE(P.Body, ''), '<p>', '')) AS ParagraphCount,
+        LENGTH(COALESCE(P.Body, '')) - LENGTH(REPLACE(COALESCE(P.Body, ''), '<a', '')) AS LinkCountInBody,
+        (SELECT string_to_array(substring(P.Tags FROM 2 FOR char_length(P.Tags) - 2), '><')) AS TagsArray,
+        P.CommunityOwnedDate,
+        P.AcceptedAnswerId
+    FROM Posts P
+    LEFT JOIN Posts AA ON P.AcceptedAnswerId = AA.Id
+    LEFT JOIN Comments C ON P.Id = C.PostId
+    LEFT JOIN Votes V ON P.Id = V.PostId AND V.VoteTypeId IN (2,3)
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId AND PH.PostHistoryTypeId IN (4,5,6,10,11)
+    GROUP BY
+        P.Id, P.PostTypeId, P.OwnerUserId, P.CreationDate, P.Score, P.ViewCount, P.Body, P.Title, P.Tags,
+        P.AnswerCount, P.CommentCount, P.FavoriteCount, P.ClosedDate, P.LastActivityDate, P.LastEditDate,
+        AA.Score, P.CommunityOwnedDate, P.AcceptedAnswerId
+),
+QuestionAnalysis AS (
+    SELECT
+        PD.PostId,
+        PD.OwnerUserId,
+        PD.PostCreationDate,
+        PD.Score,
+        PD.ViewCount,
+        PD.Title,
+        PD.TagsArray,
+        PD.AnswerCount,
+        PD.TotalCommentsOnPost,
+        PD.PostUpVotes,
+        PD.PostDownVotes,
+        PD.EditCount,
+        PD.CloseHistoryCount,
+        PD.ReopenHistoryCount,
+        PD.PostStatus,
+        PD.AcceptedAnswerScore,
+        PD.ParagraphCount,
+        PD.LinkCountInBody,
+        EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS timestamp) - PD.LastActivityDate)) AS DaysSinceLastActivity,
+        RANK() OVER (PARTITION BY PD.OwnerUserId ORDER BY PD.Score DESC, PD.PostCreationDate DESC) AS RankByScoreForUser,
+        NTILE(10) OVER (ORDER BY PD.ViewCount DESC, PD.PostId) AS ViewCountDecile,
+        AVG(PD.Score) OVER (PARTITION BY PD.OwnerUserId) AS AvgScoreForUserPosts,
+        LAG(PD.Score, 1, 0) OVER (PARTITION BY PD.OwnerUserId ORDER BY PD.PostCreationDate) AS PrevPostScoreBySameUser,
+        (SELECT COUNT(DISTINCT PH2.UserId)
+         FROM PostHistory PH2
+         WHERE PH2.PostId = PD.PostId
+           AND PH2.PostHistoryTypeId IN (4, 5, 6)
+           AND PH2.UserId IS NOT NULL
+           AND PH2.UserId != PD.OwnerUserId
+        ) AS OtherEditorCount,
+        (SELECT SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END)
+         FROM Badges B
+         WHERE B.UserId = PD.OwnerUserId AND B.TagBased = TRUE
+           AND PD.TagsArray IS NOT NULL
+           AND B.Name = ANY(PD.TagsArray)
+        ) AS GoldTagBadgesRelevantToPost
+    FROM PostDetailsWithHistory PD
+    WHERE PD.PostTypeId = 1
+),
+ClosedQuestionDetails AS (
+    SELECT
+        QA.PostId,
+        QA.PostStatus,
+        CR.Name AS CloseReason,
+        EXTRACT(DAY FROM (PD.ClosedDate - QA.PostCreationDate)) AS DaysToClose,
+        NULL::INTEGER AS DaysSinceLastEditForOpen,
+        NULL::TEXT AS HasAcceptedAnswerForOpen
+    FROM QuestionAnalysis QA
+    JOIN PostDetailsWithHistory PD ON QA.PostId = PD.PostId
+    LEFT JOIN PostHistory PH_Close ON QA.PostId = PH_Close.PostId
+                                  AND PH_Close.PostHistoryTypeId = 10
+                                  AND PH_Close.CreationDate = (SELECT MAX(PH_Inner.CreationDate)
+                                                               FROM PostHistory PH_Inner
+                                                               WHERE PH_Inner.PostId = QA.PostId
+                                                                 AND PH_Inner.PostHistoryTypeId = 10)
+    LEFT JOIN CloseReasonTypes CR ON CAST(PH_Close.Comment AS INTEGER) = CR.Id
+    WHERE QA.PostStatus = 'Closed'
+),
+OpenQuestionDetails AS (
+    SELECT
+        QA.PostId,
+        QA.PostStatus,
+        NULL::TEXT AS CloseReason,
+        NULL::INTEGER AS DaysToClose,
+        EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS timestamp) - PD.LastEditDate)) AS DaysSinceLastEditForOpen,
+        CASE WHEN PD.AcceptedAnswerId IS NOT NULL THEN 'Yes' ELSE 'No' END AS HasAcceptedAnswerForOpen
+    FROM QuestionAnalysis QA
+    JOIN PostDetailsWithHistory PD ON QA.PostId = PD.PostId
+    WHERE QA.PostStatus IN ('Open', 'CommunityOwned')
+),
+CombinedQuestionDetails AS (
+    SELECT PostId, PostStatus, CloseReason, DaysToClose, DaysSinceLastEditForOpen, HasAcceptedAnswerForOpen FROM ClosedQuestionDetails
+    UNION ALL
+    SELECT PostId, PostStatus, CloseReason, DaysToClose, DaysSinceLastEditForOpen, HasAcceptedAnswerForOpen FROM OpenQuestionDetails
+),
+ProblematicPosts AS (
+    SELECT
+        QA.PostId
+    FROM QuestionAnalysis QA
+    WHERE QA.EditCount > 3
+       OR QA.CloseHistoryCount > 0
+       OR QA.ReopenHistoryCount > 0
+       OR QA.TotalCommentsOnPost > 10
+       OR (QA.PostUpVotes + QA.PostDownVotes) > 50
+),
+RecentHighActivityUsers AS (
+    SELECT U.Id AS UserId
+    FROM Users U
+    JOIN Posts P ON U.Id = P.OwnerUserId
+    WHERE P.CreationDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days')
+    GROUP BY U.Id
+    HAVING COUNT(P.Id) > 50
+)
+SELECT
+    UAS.UserId,
+    UAS.DisplayName,
+    UAS.Reputation,
+    UAS.AccountAgeDays,
+    QA.PostId,
+    QA.Title,
+    QA.Score,
+    QA.ViewCount,
+    QA.PostCreationDate,
+    QA.TagsArray,
+    QA.AnswerCount,
+    QA.TotalCommentsOnPost,
+    QA.PostUpVotes,
+    QA.PostDownVotes,
+    QA.EditCount,
+    QA.CloseHistoryCount,
+    QA.ReopenHistoryCount,
+    CQD.PostStatus,
+    COALESCE(CQD.CloseReason, 'N/A') AS CloseReason,
+    COALESCE(CQD.DaysToClose, -1) AS DaysToClose,
+    COALESCE(CQD.DaysSinceLastEditForOpen, -1) AS DaysSinceLastEditForOpen,
+    COALESCE(CQD.HasAcceptedAnswerForOpen, 'N/A') AS HasAcceptedAnswerForOpen,
+    QA.RankByScoreForUser,
+    QA.ViewCountDecile,
+    QA.AvgScoreForUserPosts,
+    QA.PrevPostScoreBySameUser,
+    QA.OtherEditorCount,
+    COALESCE(QA.GoldTagBadgesRelevantToPost, 0) AS GoldTagBadgesRelevantToPostCount,
+    QA.DaysSinceLastActivity,
+    QA.ParagraphCount,
+    QA.LinkCountInBody,
+    UAS.UpvoteRatio,
+    (CAST(QA.Score AS NUMERIC) * QA.ViewCount * (QA.PostUpVotes + 1)) / NULLIF((UAS.TotalQuestions + UAS.TotalAnswers + 1) * (QA.DaysSinceLastActivity + 1), 0) AS EngagementMetric,
+    UPPER(SUBSTR(COALESCE(QA.Title, 'NO TITLE'), 1, 5)) || '...' || LOWER(RIGHT(COALESCE(array_to_string(COALESCE(QA.TagsArray, ARRAY['unknown']), ','), ''), 5)) AS TitleTagSnippet,
+    CASE
+        WHEN QA.Score > 50 AND QA.ViewCount > 10000 THEN 'Highly Viral'
+        WHEN QA.EditCount > 5 AND QA.CloseHistoryCount > 0 THEN 'Contentious & Edited'
+        WHEN CQD.DaysToClose IS NOT NULL AND CQD.DaysToClose < 7 THEN 'Quickly Closed'
+        WHEN QA.AnswerCount = 0 AND QA.DaysSinceLastActivity > 30 THEN 'Unanswered Stale'
+        ELSE 'Regular Activity'
+    END AS PostCategory
+FROM UserActivitySummary UAS
+INNER JOIN QuestionAnalysis QA ON UAS.UserId = QA.OwnerUserId
+INNER JOIN CombinedQuestionDetails CQD ON QA.PostId = CQD.PostId
+WHERE
+    UAS.Reputation > 5000
+    AND UAS.AccountAgeDays > 730
+    AND QA.ViewCount > 500
+    AND QA.Score > 5
+    AND (
+        (CQD.PostStatus = 'Closed' AND CQD.DaysToClose < 30)
+        OR (QA.EditCount > 2 AND QA.ReopenHistoryCount > 0)
+        OR (QA.AnswerCount > 3 AND QA.AcceptedAnswerScore IS NOT NULL AND QA.AcceptedAnswerScore > 0)
+    )
+    AND QA.TagsArray IS NOT NULL AND NOT ('sql' = ANY(QA.TagsArray))
+    AND NOT EXISTS (SELECT 1 FROM ProblematicPosts PP WHERE PP.PostId = QA.PostId)
+    AND EXISTS (SELECT 1 FROM RecentHighActivityUsers RHU WHERE RHU.UserId = UAS.UserId)
+    AND (QA.Title ILIKE 'what %' OR QA.Title ILIKE 'how %' OR QA.Title ILIKE 'why %' OR QA.Title ILIKE 'best %')
+ORDER BY
+    EngagementMetric DESC,
+    UAS.Reputation DESC,
+    QA.PostCreationDate DESC
+LIMIT 500;

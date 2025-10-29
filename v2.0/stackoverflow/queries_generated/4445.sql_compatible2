@@ -1,0 +1,199 @@
+WITH
+  QuestionScores AS (
+    SELECT
+      p.Id AS QuestionId,
+      p.Title AS QuestionTitle,
+      p.OwnerUserId,
+      COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVotes,
+      COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVotes,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE -1 END) AS NetScore,
+      ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserQuestionRank,
+      AVG(p.AnswerCount * 1.0) OVER (PARTITION BY p.OwnerUserId) AS AvgUserAnswers,
+      MAX(p.ViewCount) OVER (PARTITION BY p.OwnerUserId) AS MaxUserViewCount,
+      CASE
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN p.FavoriteCount > 0 THEN 'Favorited'
+        ELSE 'Active'
+      END AS PostStatus
+    FROM Posts p
+    LEFT JOIN Votes v
+      ON p.Id = v.PostId
+    WHERE
+      p.PostTypeId = 1
+      AND p.OwnerUserId IS NOT NULL
+      AND p.OwnerUserId > 0
+    GROUP BY
+      p.Id,
+      p.Title,
+      p.OwnerUserId,
+      p.CreationDate,
+      p.AnswerCount,
+      p.ViewCount,
+      p.ClosedDate,
+      p.FavoriteCount
+  ),
+  UserReputation AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate,
+      u.Views AS TotalViews,
+      u.UpVotes AS TotalUpVotes,
+      u.DownVotes AS TotalDownVotes,
+      LAG(u.Reputation, 1, 0) OVER (ORDER BY u.CreationDate) AS PreviousReputation,
+      DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+    WHERE
+      u.AccountId IS NOT NULL
+  ),
+  AnswerData AS (
+    SELECT
+      a.ParentId AS QuestionId,
+      COUNT(a.Id) AS AnswerCount,
+      SUM(CASE WHEN a.Id = p_q.AcceptedAnswerId THEN 1 ELSE 0 END) AS IsAcceptedAnswerPresent
+    FROM Posts a
+    JOIN Posts p_q
+      ON a.ParentId = p_q.Id
+    WHERE
+      a.PostTypeId = 2
+    GROUP BY
+      a.ParentId
+  ),
+  CommentAggregation AS (
+    SELECT
+      c.PostId,
+      COUNT(c.Id) AS CommentCount,
+      AVG(CAST(c.Score AS DOUBLE)) AS AvgCommentScore,
+      STRING_AGG(c.Text, ' | ' ORDER BY c.CreationDate) AS AllCommentsConcatenated
+    FROM Comments c
+    GROUP BY
+      c.PostId
+  ),
+  AllPostData AS (
+    SELECT
+      qs.QuestionId,
+      qs.QuestionTitle,
+      qs.OwnerUserId,
+      ur.DisplayName AS OwnerDisplayName,
+      ur.Reputation AS OwnerReputation,
+      ur.ReputationRank AS OwnerReputationRank,
+      qs.UpVotes AS QuestionUpVotes,
+      qs.DownVotes AS QuestionDownVotes,
+      qs.NetScore AS QuestionNetScore,
+      qs.UserQuestionRank,
+      qs.AvgUserAnswers,
+      qs.MaxUserViewCount,
+      qs.PostStatus,
+      COALESCE(ad.AnswerCount, 0) AS TotalAnswers,
+      COALESCE(ad.IsAcceptedAnswerPresent, 0) AS AcceptedAnswerProvided,
+      COALESCE(ca.CommentCount, 0) AS TotalCommentsOnQuestion,
+      COALESCE(ca.AvgCommentScore, 0.0) AS AvgQuestionCommentScore,
+      ph.CreationDate AS FirstPostHistoryDate,
+      pht.Name AS FirstPostHistoryType
+    FROM QuestionScores qs
+    LEFT JOIN UserReputation ur
+      ON qs.OwnerUserId = ur.UserId
+    LEFT JOIN AnswerData ad
+      ON qs.QuestionId = ad.QuestionId
+    LEFT JOIN CommentAggregation ca
+      ON qs.QuestionId = ca.PostId
+    LEFT JOIN PostHistory ph
+      ON qs.QuestionId = ph.PostId
+    LEFT JOIN PostHistoryTypes pht
+      ON ph.PostHistoryTypeId = pht.Id
+    WHERE
+      ph.PostHistoryTypeId IN (1, 2, 3)
+  )
+SELECT
+  apd.QuestionId,
+  apd.QuestionTitle,
+  apd.OwnerDisplayName,
+  apd.OwnerReputation,
+  apd.OwnerReputationRank,
+  apd.QuestionUpVotes,
+  apd.QuestionDownVotes,
+  apd.QuestionNetScore,
+  apd.UserQuestionRank,
+  apd.AvgUserAnswers,
+  apd.MaxUserViewCount,
+  apd.PostStatus,
+  apd.TotalAnswers,
+  apd.AcceptedAnswerProvided,
+  apd.TotalCommentsOnQuestion,
+  apd.AvgQuestionCommentScore,
+  apd.FirstPostHistoryDate,
+  apd.FirstPostHistoryType,
+  CASE
+    WHEN LENGTH(TRIM(apd.QuestionTitle)) = 0 THEN 'Empty Title'
+    WHEN LENGTH(TRIM(apd.QuestionTitle)) > 100 THEN 'Very Long Title'
+    WHEN apd.QuestionNetScore < 0 THEN 'Negative Score'
+    ELSE 'Standard'
+  END AS TitleComplexityFlag,
+  CASE
+    WHEN apd.OwnerReputation > 100000 THEN 'High Rep User'
+    WHEN apd.OwnerReputation < 100 THEN 'Low Rep User'
+    ELSE 'Medium Rep User'
+  END AS ReputationCategory,
+  CASE
+    WHEN ad2.Id IS NOT NULL THEN 'HasDuplicateLink'
+    ELSE 'NoDuplicateLink'
+  END AS DuplicateLinkStatus,
+  COALESCE(NULLIF(ur2.DisplayName, ''), 'Unknown Editor') AS LastEditorDisplayName,
+  COALESCE(p2.LastEditDate, p2.CreationDate) AS EffectiveLastUpdateDate
+FROM AllPostData apd
+LEFT JOIN PostLinks pl
+  ON apd.QuestionId = pl.PostId
+  AND pl.LinkTypeId = 3
+LEFT JOIN Posts p2
+  ON apd.QuestionId = p2.Id
+LEFT JOIN Users ur2
+  ON p2.LastEditorUserId = ur2.Id
+LEFT JOIN Posts ad2
+  ON apd.QuestionId = ad2.Id
+  AND EXISTS (
+    SELECT 1
+    FROM PostLinks pl_dup
+    WHERE
+      pl_dup.RelatedPostId = apd.QuestionId
+      AND pl_dup.LinkTypeId = 3
+  )
+WHERE
+  apd.OwnerReputation >= 50
+  AND apd.TotalAnswers > 0
+  AND apd.UserQuestionRank <= 10
+  AND apd.AvgQuestionCommentScore BETWEEN 0 AND 5
+  AND apd.QuestionTitle NOT LIKE '%sql%'
+  AND (
+    apd.OwnerReputation > 1000
+    OR apd.TotalAnswers > 5
+  )
+GROUP BY
+  apd.QuestionId,
+  apd.QuestionTitle,
+  apd.OwnerDisplayName,
+  apd.OwnerReputation,
+  apd.OwnerReputationRank,
+  apd.QuestionUpVotes,
+  apd.QuestionDownVotes,
+  apd.QuestionNetScore,
+  apd.UserQuestionRank,
+  apd.AvgUserAnswers,
+  apd.MaxUserViewCount,
+  apd.PostStatus,
+  apd.TotalAnswers,
+  apd.AcceptedAnswerProvided,
+  apd.TotalCommentsOnQuestion,
+  apd.AvgQuestionCommentScore,
+  apd.FirstPostHistoryDate,
+  apd.FirstPostHistoryType,
+  ad2.Id,
+  ur2.DisplayName,
+  p2.LastEditDate,
+  p2.CreationDate
+HAVING
+  SUM(apd.QuestionNetScore) > 10
+ORDER BY
+  apd.OwnerReputation DESC,
+  apd.QuestionNetScore DESC
+LIMIT 100;

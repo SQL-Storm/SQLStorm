@@ -1,0 +1,295 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COUNT(DISTINCT ph.Id) as HistoryCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        MAX(b.Date) as LastBadgeDate,
+        MAX(ph.CreationDate) as LastHistoryDate,
+        CAST(DATE_PART('day', CAST('2024-10-01 12:34:56' AS timestamp) - u.CreationDate) AS INTEGER) as AccountAgeDays,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Elite'
+            WHEN u.Reputation > 5000 THEN 'Veteran'
+            WHEN u.Reputation > 1000 THEN 'Contributor'
+            ELSE 'Member'
+        END as ReputationTier,
+        CASE 
+            WHEN u.Views > 10000 THEN 'Highly Viewed'
+            WHEN u.Views > 5000 THEN 'Popular'
+            WHEN u.Views > 1000 THEN 'Active'
+            ELSE 'Regular'
+        END as PopularityTier
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate
+),
+PostPerformanceMetrics AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        CAST(DATE_PART('day', CAST('2024-10-01 12:34:56' AS timestamp) - p.CreationDate) AS INTEGER) as AgeDays,
+        CASE 
+            WHEN p.Score >= 100 THEN 'Highly Voted'
+            WHEN p.Score >= 50 THEN 'Well Voted'
+            WHEN p.Score >= 10 THEN 'Moderately Voted'
+            ELSE 'Low Voted'
+        END as VotedTier,
+        CASE 
+            WHEN p.ViewCount >= 10000 THEN 'Viral'
+            WHEN p.ViewCount >= 5000 THEN 'Popular'
+            WHEN p.ViewCount >= 1000 THEN 'Notable'
+            ELSE 'Standard'
+        END as ViewTier,
+        CAST(DATE_PART('day', p.LastActivityDate - p.CreationDate) AS INTEGER) as ActivityLagDays,
+        CASE 
+            WHEN p.AnswerCount >= 10 THEN 'Highly Answered'
+            WHEN p.AnswerCount >= 5 THEN 'Mid Answered'
+            WHEN p.AnswerCount >= 1 THEN 'Partially Answered'
+            ELSE 'Unanswered'
+        END as AnswerTier,
+        CAST(100.0 * p.CommentCount / NULLIF(p.AnswerCount + p.CommentCount, 0) AS DECIMAL(5,2)) as CommentRatio,
+        COALESCE(
+            (SELECT pt.Name 
+             FROM PostTypes pt 
+             WHERE pt.Id = p.PostTypeId
+             LIMIT 1), 
+            'Unknown'
+        ) as PostTypeName
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+CombinedAnalysis AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.PostCount,
+        uas.CommentCount,
+        uas.BadgeCount,
+        uas.HistoryCount,
+        uas.AccountAgeDays,
+        uas.ReputationTier,
+        uas.PopularityTier,
+        ppm.PostId,
+        ppm.Title,
+        ppm.Score,
+        ppm.ViewCount,
+        ppm.AnswerCount,
+        ppm.CommentCount,
+        ppm.FavoriteCount,
+        ppm.AgeDays,
+        ppm.VotedTier,
+        ppm.ViewTier,
+        ppm.ActivityLagDays,
+        ppm.AnswerTier,
+        ppm.CommentRatio,
+        ppm.PostTypeName,
+        ROW_NUMBER() OVER (PARTITION BY uas.UserId ORDER BY ppm.Score DESC) as RankByScore,
+        ROW_NUMBER() OVER (PARTITION BY uas.UserId ORDER BY ppm.ViewCount DESC) as RankByViews,
+        ROW_NUMBER() OVER (PARTITION BY uas.UserId ORDER BY ppm.AgeDays ASC) as RankByAge,
+        RANK() OVER (ORDER BY ppm.Score DESC) as GlobalScoreRank,
+        RANK() OVER (ORDER BY ppm.ViewCount DESC) as GlobalViewRank,
+        DENSE_RANK() OVER (ORDER BY uas.Reputation DESC) as ReputationRank,
+        AVG(ppm.Score) OVER (PARTITION BY uas.UserId) as AvgUserScore,
+        AVG(ppm.ViewCount) OVER (PARTITION BY uas.UserId) as AvgUserViews,
+        PERCENT_RANK() OVER (ORDER BY ppm.Score) as ScorePercentile,
+        PERCENT_RANK() OVER (ORDER BY ppm.ViewCount) as ViewPercentile,
+        CASE 
+            WHEN ppm.Score > (SELECT AVG(p2.Score) FROM Posts p2 WHERE p2.PostTypeId IN (1, 2)) THEN 'Above Avg'
+            WHEN ppm.Score < (SELECT AVG(p2.Score) FROM Posts p2 WHERE p2.PostTypeId IN (1, 2)) THEN 'Below Avg'
+            ELSE 'Avg'
+        END as ScoreComparison
+    FROM UserActivityStats uas
+    INNER JOIN PostPerformanceMetrics ppm ON uas.UserId = (
+        SELECT p.OwnerUserId 
+        FROM Posts p 
+        WHERE p.Id = ppm.PostId
+        LIMIT 1
+    )
+),
+TopPerformers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        ReputationTier,
+        PopularityTier,
+        AccountAgeDays,
+        MAX(PostCount) as MaxPosts,
+        MAX(CommentCount) as MaxComments,
+        MAX(BadgeCount) as MaxBadges,
+        MAX(HistoryCount) as MaxHistory,
+        STRING_AGG(
+            CASE 
+                WHEN RankByScore <= 3 THEN CONCAT('R', RankByScore, ':', Title, '(', Score, ')')
+                ELSE NULL
+            END, 
+            '; '
+            ORDER BY RankByScore
+        ) as Top3ByScore,
+        STRING_AGG(
+            CASE 
+                WHEN RankByViews <= 3 THEN CONCAT('R', RankByViews, ':', Title, '(', ViewCount, ')')
+                ELSE NULL
+            END, 
+            '; '
+            ORDER BY RankByViews
+        ) as Top3ByViews,
+        STRING_AGG(
+            CASE 
+                WHEN RankByAge <= 3 THEN CONCAT('R', RankByAge, ':', Title, '(', AgeDays, 'd)')
+                ELSE NULL
+            END, 
+            '; '
+            ORDER BY RankByAge
+        ) as Top3ByAge,
+        (MAX(PostCount) + MAX(CommentCount) + MAX(BadgeCount) + MAX(HistoryCount)) as EngagementScore,
+        (SELECT COUNT(*) FROM CombinedAnalysis ca WHERE ca.UserId = MIN(CombinedAnalysis.UserId) AND ca.GlobalScoreRank <= 10) as Top10GlobalScoreCount
+    FROM CombinedAnalysis
+    GROUP BY UserId, DisplayName, Reputation, ReputationTier, PopularityTier, AccountAgeDays
+),
+ComplexCalculations AS (
+    SELECT 
+        tp.UserId,
+        tp.DisplayName,
+        tp.Reputation,
+        tp.ReputationTier,
+        tp.PopularityTier,
+        tp.AccountAgeDays,
+        tp.MaxPosts,
+        tp.MaxComments,
+        tp.MaxBadges,
+        tp.MaxHistory,
+        tp.Top3ByScore,
+        tp.Top3ByViews,
+        tp.Top3ByAge,
+        tp.EngagementScore,
+        tp.Top10GlobalScoreCount,
+        CAST(DATE_PART('day', CAST('2024-10-01 12:34:56' AS timestamp) - CAST('2010-01-01' AS date)) AS INTEGER) as DaysSinceLaunch,
+        (tp.ReputationTier = 'Elite') as IsEliteUser,
+        (tp.PopularityTier IN ('Highly Viewed', 'Popular')) as IsPopular,
+        (tp.AccountAgeDays > 365) as IsVeteranAccount,
+        (tp.Top10GlobalScoreCount > 0) as HasTopGlobalPosts,
+        CASE 
+            WHEN tp.Reputation > 10000 AND tp.MaxPosts > 50 AND tp.MaxComments > 100 THEN 'High Achiever'
+            WHEN tp.Reputation > 5000 AND tp.MaxPosts > 25 AND tp.MaxComments > 50 THEN 'Mid Achiever'
+            WHEN tp.Reputation > 1000 AND tp.MaxPosts > 10 AND tp.MaxComments > 25 THEN 'Beginner Achiever'
+            ELSE 'Standard Participant'
+        END as AchievementTier,
+        (tp.Reputation * 0.1 + 
+         tp.MaxPosts * 10 + 
+         tp.MaxComments * 5 + 
+         tp.MaxBadges * 20 + 
+         tp.MaxHistory * 2 + 
+         tp.Top10GlobalScoreCount * 100 + 
+         CASE WHEN (tp.ReputationTier = 'Elite') THEN 500 ELSE 0 END +
+         CASE WHEN (tp.PopularityTier IN ('Highly Viewed', 'Popular')) THEN 300 ELSE 0 END +
+         CASE WHEN (tp.AccountAgeDays > 365) THEN 200 ELSE 0 END +
+         CASE WHEN (tp.Top10GlobalScoreCount > 0) THEN 100 ELSE 0 END) as CalculatedPerformanceScore
+    FROM TopPerformers tp
+)
+
+SELECT 
+    cc.UserId,
+    cc.DisplayName,
+    cc.Reputation,
+    cc.ReputationTier,
+    cc.PopularityTier,
+    cc.AccountAgeDays,
+    cc.MaxPosts,
+    cc.MaxComments,
+    cc.MaxBadges,
+    cc.MaxHistory,
+    cc.Top3ByScore,
+    cc.Top3ByViews,
+    cc.Top3ByAge,
+    cc.EngagementScore,
+    cc.Top10GlobalScoreCount,
+    cc.IsEliteUser,
+    cc.IsPopular,
+    cc.IsVeteranAccount,
+    cc.HasTopGlobalPosts,
+    cc.AchievementTier,
+    cc.CalculatedPerformanceScore,
+    CASE 
+        WHEN cc.CalculatedPerformanceScore > 2000 THEN 'Excellent'
+        WHEN cc.CalculatedPerformanceScore > 1500 THEN 'Good'
+        WHEN cc.CalculatedPerformanceScore > 1000 THEN 'Average'
+        WHEN cc.CalculatedPerformanceScore > 500 THEN 'Below Average'
+        ELSE 'Poor'
+    END as PerformanceRating,
+    (SELECT COUNT(*) FROM (VALUES (cc.MaxPosts), (cc.MaxComments), (cc.MaxBadges)) AS v(value) WHERE value > 0) as NonZeroMetricsCount,
+    CONCAT('User ', cc.DisplayName, ' (', cc.UserId, ') with ', cc.Reputation, ' reputation and ', cc.MaxPosts, ' posts') as UserSummary,
+    ROW_NUMBER() OVER (ORDER BY cc.CalculatedPerformanceScore DESC) as OverallRank,
+    RANK() OVER (PARTITION BY cc.ReputationTier ORDER BY cc.CalculatedPerformanceScore DESC) as TierRank,
+    DENSE_RANK() OVER (ORDER BY cc.CalculatedPerformanceScore DESC) as DenseRank,
+    CASE 
+        WHEN cc.AccountAgeDays = 0 OR cc.Reputation = 0 THEN 'Incomplete Profile'
+        WHEN cc.Top3ByScore IS NULL AND cc.Top3ByViews IS NULL THEN 'Low Engagement'
+        ELSE 'Active Participant'
+    END as UserStatus,
+    COUNT(*) OVER () as TotalUsersAnalyzed,
+    AVG(cc.CalculatedPerformanceScore) OVER () as AveragePerformance,
+    MAX(cc.CalculatedPerformanceScore) OVER () as HighestPerformance,
+    MIN(cc.CalculatedPerformanceScore) OVER () as LowestPerformance,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = cc.UserId AND p.Score > 1000) as HighScorePosts,
+    (SELECT COUNT(*) FROM Votes v JOIN Posts p ON v.PostId = p.Id WHERE p.OwnerUserId = cc.UserId AND v.VoteTypeId = 2) as UpVotesReceived,
+    (cc.MaxPosts * cc.MaxComments * cc.MaxBadges) as EngagementProduct,
+    SQRT(cc.CalculatedPerformanceScore * COALESCE(NULLIF(cc.MaxPosts, 0), 1)) as NormalizedScore,
+    LOG(COALESCE(cc.Reputation, 1)) as ReputationLog,
+    STRING_AGG(
+        CASE 
+            WHEN cc.MaxPosts > 50 THEN CONCAT('High Post Count (', cc.MaxPosts, ')')
+            WHEN cc.MaxComments > 100 THEN CONCAT('High Comment Count (', cc.MaxComments, ')')
+            WHEN cc.MaxBadges > 50 THEN CONCAT('High Badge Count (', cc.MaxBadges, ')')
+            ELSE NULL
+        END, 
+        ', '
+    ) as StrengthIndicators
+FROM ComplexCalculations cc
+WHERE cc.CalculatedPerformanceScore IS NOT NULL
+    AND (cc.MaxPosts > 0 OR cc.MaxComments > 0 OR cc.MaxBadges > 0 OR cc.MaxHistory > 0)
+    AND cc.DisplayName IS NOT NULL
+    AND cc.Reputation > 0
+GROUP BY
+    cc.UserId,
+    cc.DisplayName,
+    cc.Reputation,
+    cc.ReputationTier,
+    cc.PopularityTier,
+    cc.AccountAgeDays,
+    cc.MaxPosts,
+    cc.MaxComments,
+    cc.MaxBadges,
+    cc.MaxHistory,
+    cc.Top3ByScore,
+    cc.Top3ByViews,
+    cc.Top3ByAge,
+    cc.EngagementScore,
+    cc.Top10GlobalScoreCount,
+    cc.IsEliteUser,
+    cc.IsPopular,
+    cc.IsVeteranAccount,
+    cc.HasTopGlobalPosts,
+    cc.AchievementTier,
+    cc.CalculatedPerformanceScore
+ORDER BY cc.CalculatedPerformanceScore DESC
+OFFSET 10 ROWS
+FETCH NEXT 20 ROWS ONLY;

@@ -1,0 +1,165 @@
+WITH recent_user_activity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.AboutMe,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.ProfileImageUrl,
+    u.EmailHash,
+    u.AccountId,
+    COALESCE(b.TotalBadges, 0) AS BadgeCount,
+    COALESCE(p.Questions, 0) AS QuestionCount,
+    COALESCE(a.AnswerCount, 0) AS AnswerCount,
+    COALESCE(v.TotalVotes, 0) AS TotalVotes,
+    COALESCE(cv.ClosedCount, 0) AS ClosedCount
+  FROM Users u
+  LEFT JOIN (
+    SELECT UserId, COUNT(*) AS TotalBadges
+    FROM Badges
+    GROUP BY UserId
+  ) b ON b.UserId = u.Id
+  LEFT JOIN (
+    SELECT OwnerUserId AS UserId, COUNT(*) AS Questions
+    FROM Posts
+    WHERE PostTypeId = 1
+    GROUP BY OwnerUserId
+  ) p ON p.UserId = u.Id
+  LEFT JOIN (
+    SELECT OwnerUserId AS UserId, COUNT(*) AS AnswerCount
+    FROM Posts
+    WHERE PostTypeId = 2
+    GROUP BY OwnerUserId
+  ) a ON a.UserId = u.Id
+  LEFT JOIN (
+    SELECT OwnerUserId AS UserId, SUM(Score) AS TotalVotes
+    FROM Posts
+    WHERE PostTypeId IN (1,2,4)
+    GROUP BY OwnerUserId
+  ) v ON v.UserId = u.Id
+  LEFT JOIN (
+    SELECT OwnerUserId AS UserId, COUNT(*) AS ClosedCount
+    FROM Posts
+    WHERE ClosedDate IS NOT NULL
+    GROUP BY OwnerUserId
+  ) cv ON cv.UserId = u.Id
+),
+recent_post_activity AS (
+  SELECT
+    p.Id AS PostId,
+    p.OwnerUserId,
+    p.Title,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.PostTypeId,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.FavoriteCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.AcceptedAnswerId,
+    p.ParentId,
+    p.ContentLicense,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate DESC, p.CreationDate DESC) AS rn
+  FROM Posts p
+  WHERE p.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '90 days')
+),
+complex_join AS (
+  SELECT
+    u.Id AS user_id,
+    u.DisplayName,
+    u.Reputation,
+    pr.PostId,
+    pr.Title,
+    pr.CreationDate AS post_creation,
+    pr.LastActivityDate AS post_last_activity,
+    pr.PostTypeId,
+    pr.Score,
+    pr.ViewCount,
+    pr.Tags,
+    pr.FavoriteCount,
+    pr.AnswerCount,
+    pr.CommentCount,
+    pr.AcceptedAnswerId,
+    pr.ParentId,
+    pr.ContentLicense,
+    (
+      SELECT COUNT(*) FROM PostLinks pl
+      WHERE pl.PostId = pr.PostId
+    ) AS linked_count,
+    (
+      SELECT tl.Name
+      FROM PostLinks pl2
+      JOIN LinkTypes tl ON tl.Id = pl2.LinkTypeId
+      WHERE pl2.PostId = pr.PostId
+      ORDER BY tl.Name
+      LIMIT 1
+    ) AS primary_link_type
+  FROM recent_user_activity u
+  LEFT JOIN recent_post_activity pr ON pr.OwnerUserId = u.UserId
+  WHERE pr.rn <= 5
+    OR pr.rn IS NOT NULL
+)
+SELECT
+  cu.user_id,
+  cu.DisplayName AS UserDisplayName,
+  cu.Reputation,
+  cu.PostId AS PostId,
+  cu.Title,
+  cu.post_creation,
+  cu.post_last_activity,
+  CASE cu.PostTypeId
+    WHEN 1 THEN 'Question'
+    WHEN 2 THEN 'Answer'
+    WHEN 4 THEN 'TagWikiExcerpt'
+    WHEN 5 THEN 'TagWiki'
+    ELSE 'Other'
+  END AS PostType,
+  cu.Score,
+  cu.ViewCount,
+  cu.Tags,
+  cu.FavoriteCount,
+  cu.AnswerCount,
+  cu.CommentCount,
+  cu.AcceptedAnswerId,
+  cu.ParentId,
+  cu.ContentLicense,
+  cu.linked_count,
+  cu.primary_link_type,
+  CASE
+    WHEN cu.post_last_activity IS NULL THEN 0
+    ELSE EXTRACT(EPOCH FROM (cu.post_last_activity - cu.post_creation))
+  END AS seconds_since_creation_to_last_activity,
+  (
+    SELECT STRING_AGG((b.Name || ' (' || b.Class || ')'), ', ')
+    FROM Badges b
+    WHERE b.UserId = cu.user_id
+  ) AS badge_summary
+FROM complex_join cu
+GROUP BY
+  cu.user_id,
+  cu.DisplayName,
+  cu.Reputation,
+  cu.PostId,
+  cu.Title,
+  cu.post_creation,
+  cu.post_last_activity,
+  cu.PostTypeId,
+  cu.Score,
+  cu.ViewCount,
+  cu.Tags,
+  cu.FavoriteCount,
+  cu.AnswerCount,
+  cu.CommentCount,
+  cu.AcceptedAnswerId,
+  cu.ParentId,
+  cu.ContentLicense,
+  cu.linked_count,
+  cu.primary_link_type
+ORDER BY cu.Reputation DESC, cu.post_last_activity DESC;

@@ -1,0 +1,195 @@
+-- {"query": "1835.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3044} 
+WITH UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.Views AS UserViews,
+        u.UpVotes,
+        COUNT(b.Id) AS TotalBadges,
+        MAX(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS HasGoldBadge,
+        AVG(EXTRACT(EPOCH FROM (u.LastAccessDate - u.CreationDate)) / (3600 * 24 * 365.25)) AS AvgYearsActive,
+        RANK() OVER (ORDER BY u.Reputation DESC, u.UpVotes DESC) AS UserRepRank
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 7500 -- Significant reputation
+      AND u.Views > 2500 -- Many profile views
+      AND u.LastAccessDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '180 days' -- Recently active
+      AND u.DisplayName IS NOT NULL
+      AND u.AboutMe IS NOT NULL AND LENGTH(u.AboutMe) > 100 -- Has a descriptive profile
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes
+),
+PostHistoryEvents AS (
+    SELECT
+        ph.PostId,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS TotalContentEdits, -- Title, Body, Tags edits
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN 1 ELSE 0 END) AS StatusChangeEvents, -- Close, Reopen, Delete, Undelete
+        MAX(ph.CreationDate) AS LatestHistoryEventDate,
+        MIN(ph.CreationDate) AS EarliestHistoryEventDate,
+        STRING_AGG(DISTINCT crt.Name, '; ') FILTER (WHERE ph.PostHistoryTypeId = 10 AND ph.Comment IS NOT NULL AND ph.Comment ~ '^[0-9]+$') AS AllCloseReasons,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 AND ph.Comment ~ '^[0-9]+$' AND ph.Comment::smallint = crt.Id AND crt.Name LIKE '%duplicate%' THEN 1 ELSE 0 END) AS WasClosedAsDuplicateEver,
+        COUNT(DISTINCT ph.UserId) FILTER (WHERE ph.UserId IS NOT NULL) AS UniqueEditors
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON ph.PostHistoryTypeId = 10 AND ph.Comment ~ '^[0-9]+$' AND ph.Comment::smallint = crt.Id
+    GROUP BY ph.PostId
+),
+BaseQuestionStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.OwnerUserId,
+        q.Title,
+        q.Tags,
+        q.Score AS QuestionScore,
+        q.ViewCount AS QuestionViewCount,
+        q.CreationDate AS QuestionCreationDate,
+        q.LastActivityDate AS QuestionLastActivityDate,
+        q.AnswerCount,
+        q.CommentCount AS QuestionCommentCount,
+        q.FavoriteCount,
+        q.ClosedDate,
+        COALESCE(SUM(a.Score), 0) AS TotalAnswerScore,
+        COUNT(a.Id) AS ActualAnswerCount,
+        MAX(a.CreationDate) AS LatestAnswerDate,
+        COALESCE(AVG(LENGTH(a.Body)), 0) AS AvgAnswerBodyLength,
+        COALESCE(AVG(CASE WHEN a.Score > 0 THEN 1.0 ELSE 0.0 END), 0.0) AS PctPositiveAnswers,
+        COUNT(DISTINCT c.UserId) FILTER (WHERE c.UserId IS NOT NULL) AS UniqueCommentersOnQuestion
+    FROM Posts q
+    LEFT JOIN Posts a ON q.Id = a.ParentId AND a.PostTypeId = 2 -- Answers to this question
+    LEFT JOIN Comments c ON q.Id = c.PostId
+    WHERE q.PostTypeId = 1
+      AND q.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '3 years' -- Focus on recent history
+      AND q.ViewCount > 1000 -- Popular questions
+    GROUP BY
+        q.Id, q.OwnerUserId, q.Title, q.Tags, q.Score, q.ViewCount, q.CreationDate,
+        q.LastActivityDate, q.AnswerCount, q.CommentCount, q.FavoriteCount, q.ClosedDate
+)
+SELECT
+    ue.UserId,
+    ue.DisplayName AS UserDisplayName,
+    ue.Reputation,
+    ue.TotalBadges,
+    ue.HasGoldBadge,
+    bqs.QuestionId,
+    bqs.Title AS QuestionTitle,
+    bqs.Tags,
+    bqs.QuestionScore,
+    bqs.QuestionViewCount,
+    bqs.ActualAnswerCount,
+    bqs.QuestionCommentCount,
+    bqs.FavoriteCount,
+    bqs.TotalAnswerScore,
+    phe.TotalContentEdits,
+    phe.StatusChangeEvents,
+    phe.AllCloseReasons,
+    phe.WasClosedAsDuplicateEver,
+    bqs.AvgAnswerBodyLength,
+    bqs.PctPositiveAnswers,
+    bqs.UniqueCommentersOnQuestion,
+    EXTRACT(DAY FROM (bqs.QuestionLastActivityDate - bqs.QuestionCreationDate)) AS DaysActiveSinceCreation,
+    CASE
+        WHEN bqs.FavoriteCount IS NULL OR bqs.FavoriteCount <= 5 THEN 'Low/None'
+        WHEN bqs.FavoriteCount BETWEEN 6 AND 25 THEN 'Moderate'
+        ELSE 'High'
+    END AS FavoriteCategory,
+    TRIM(BOTH '<>' FROM SUBSTRING(bqs.Tags FROM '<([^>]+)>')) AS FirstTag, -- Extract first tag assuming format <tag1><tag2>...
+    -- Correlated subquery: Avg score of user's *other* highly-voted questions
+    (
+        SELECT AVG(p_other.Score)
+        FROM Posts p_other
+        WHERE p_other.OwnerUserId = ue.UserId
+          AND p_other.PostTypeId = 1
+          AND p_other.Id != bqs.QuestionId
+          AND p_other.Score > 20 -- Only consider highly-voted questions
+          AND p_other.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '2 year'
+    ) AS AvgOtherHighScoreQuestionByOwner,
+    -- Window Function 1: Rank questions by engagement index within tag groups
+    RANK() OVER (PARTITION BY TRIM(BOTH '<>' FROM SUBSTRING(bqs.Tags FROM '<([^>]+)>')) ORDER BY bqs.QuestionScore + bqs.FavoriteCount DESC) AS TagEngagementRank,
+    -- Window Function 2: Cumulative sum of question scores for a user
+    SUM(bqs.QuestionScore) OVER (PARTITION BY ue.UserId ORDER BY bqs.QuestionCreationDate) AS UserCumulativeScore,
+    -- Complex predicate with NULL logic:
+    (phe.TotalContentEdits >= 2 AND phe.StatusChangeEvents >= 1 OR bqs.ClosedDate IS NOT NULL AND phe.WasClosedAsDuplicateEver = 1) AS IsControversialOrHeavilyManaged,
+    -- Complex calculation: "Weighted Engagement Score"
+    (bqs.QuestionScore * 0.4 + bqs.TotalAnswerScore * 0.25 + COALESCE(bqs.FavoriteCount, 0) * 0.2 + bqs.QuestionCommentCount * 0.1 + COALESCE(phe.UniqueEditors, 0) * 0.05) AS WeightedEngagementScore,
+    -- String expression: check for specific keywords in title (case-insensitive)
+    (bqs.Title ILIKE '%performance%' OR bqs.Title ILIKE '%optimization%' OR bqs.Title ILIKE '%scaling%') AS IsPerformanceTopic,
+    'HighInteractionQuestion' AS QuerySegment
+FROM UserEngagement ue
+INNER JOIN BaseQuestionStats bqs ON ue.UserId = bqs.OwnerUserId
+LEFT JOIN PostHistoryEvents phe ON bqs.QuestionId = phe.PostId
+WHERE
+    bqs.QuestionScore >= 100
+    AND bqs.ActualAnswerCount >= 3
+    AND bqs.QuestionCommentCount >= 5
+    AND COALESCE(bqs.FavoriteCount, 0) >= 10
+    AND bqs.Tags IS NOT NULL AND bqs.Tags ILIKE '%<sql>%' -- Must be a SQL question
+    AND (LENGTH(bqs.Title) > 30 AND bqs.Title NOT ILIKE '%test%') -- Long and not a test question
+    AND ue.Reputation > 20000 -- Very high reputation users
+    AND COALESCE(phe.UniqueEditors, 0) > 1 -- Multiple editors for the post
+    AND bqs.ClosedDate IS NULL -- Exclude closed for this segment
+UNION ALL
+SELECT
+    ue.UserId,
+    ue.DisplayName AS UserDisplayName,
+    ue.Reputation,
+    ue.TotalBadges,
+    ue.HasGoldBadge,
+    bqs.QuestionId,
+    bqs.Title AS QuestionTitle,
+    bqs.Tags,
+    bqs.QuestionScore,
+    bqs.QuestionViewCount,
+    bqs.ActualAnswerCount,
+    bqs.QuestionCommentCount,
+    bqs.FavoriteCount,
+    bqs.TotalAnswerScore,
+    phe.TotalContentEdits,
+    phe.StatusChangeEvents,
+    phe.AllCloseReasons,
+    phe.WasClosedAsDuplicateEver,
+    bqs.AvgAnswerBodyLength,
+    bqs.PctPositiveAnswers,
+    bqs.UniqueCommentersOnQuestion,
+    EXTRACT(DAY FROM (bqs.QuestionLastActivityDate - bqs.QuestionCreationDate)) AS DaysActiveSinceCreation,
+    CASE
+        WHEN bqs.FavoriteCount IS NULL OR bqs.FavoriteCount <= 2 THEN 'Low/None'
+        WHEN bqs.FavoriteCount BETWEEN 3 AND 15 THEN 'Moderate'
+        ELSE 'High'
+    END AS FavoriteCategory,
+    TRIM(BOTH '<>' FROM SUBSTRING(bqs.Tags FROM '<([^>]+)>')) AS FirstTag,
+    -- Correlated subquery: Avg score of user's *all* questions with any answers
+    (
+        SELECT AVG(p_other.Score)
+        FROM Posts p_other
+        WHERE p_other.OwnerUserId = ue.UserId
+          AND p_other.PostTypeId = 1
+          AND p_other.Id != bqs.QuestionId
+          AND p_other.AnswerCount > 0
+          AND p_other.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '3 year'
+    ) AS AvgAllAnsweredQuestionByOwner,
+    -- Window Function 1: Rank questions by total history events
+    RANK() OVER (PARTITION BY ue.UserId ORDER BY phe.TotalContentEdits DESC, phe.StatusChangeEvents DESC) AS UserHistoryRank,
+    -- Window Function 2: Moving average of view counts over creation date
+    AVG(bqs.QuestionViewCount) OVER (ORDER BY bqs.QuestionCreationDate ROWS BETWEEN 5 PRECEDING AND CURRENT ROW) AS MovingAvgViewCount,
+    -- Complex predicate with NULL logic:
+    (bqs.ClosedDate IS NOT NULL AND phe.WasClosedAsDuplicateEver = 1 AND COALESCE(phe.StatusChangeEvents, 0) > 1) AS WasComplexlyClosedDuplicate,
+    -- Complex calculation: "Historical Activity Score"
+    (bqs.QuestionViewCount * 0.3 + COALESCE(phe.TotalContentEdits, 0) * 0.4 + COALESCE(phe.StatusChangeEvents, 0) * 0.3 + COALESCE(LENGTH(phe.AllCloseReasons), 0) * 0.01) AS HistoricalActivityScore,
+    -- String expression: check for controversial terms
+    (bqs.Title ILIKE '%issue%' OR bqs.Title ILIKE '%problem%' OR bqs.Title ILIKE '%bug%') AS IsControversialTopic,
+    'HighActivityQuestion' AS QuerySegment
+FROM UserEngagement ue
+INNER JOIN BaseQuestionStats bqs ON ue.UserId = bqs.OwnerUserId
+INNER JOIN PostHistoryEvents phe ON bqs.QuestionId = phe.PostId -- INNER JOIN to ensure history exists for this segment
+WHERE
+    bqs.QuestionScore BETWEEN 10 AND 99 -- Moderate score
+    AND bqs.ActualAnswerCount BETWEEN 0 AND 2 -- Few answers
+    AND bqs.QuestionCommentCount >= 1 -- Some comments
+    AND phe.TotalContentEdits >= 3 -- Many edits
+    AND phe.StatusChangeEvents >= 1 -- Some status changes (closed/reopened/deleted/undeleted)
+    AND bqs.Tags IS NOT NULL AND bqs.Tags ILIKE '%<database>%' -- Database related
+    AND ue.Reputation BETWEEN 7500 AND 19999 -- Mid-high reputation users
+    AND bqs.ClosedDate IS NOT NULL -- Must be closed for this segment
+ORDER BY WeightedEngagementScore DESC, HistoricalActivityScore DESC
+LIMIT 2000;

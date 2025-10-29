@@ -1,0 +1,126 @@
+WITH
+RecentActivePosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Body,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.OwnerDisplayName,
+    p.LastEditorUserId,
+    p.LastEditorDisplayName,
+    p.LastEditDate,
+    p.CommentCount,
+    p.AnswerCount
+  FROM Posts p
+  WHERE p.LastActivityDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days')
+),
+UserEngagement AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.ProfileImageUrl,
+    u.EmailHash,
+    u.AccountId,
+    (2.0 * COALESCE(u.Reputation, 0) + 0.5 * COALESCE(u.Views, 0)
+         + 1.0 * (COALESCE(u.UpVotes, 0) - COALESCE(u.DownVotes, 0))) AS BaseEngagement
+  FROM Users u
+),
+TopLinked AS (
+  SELECT
+    pl.PostId,
+    pl.RelatedPostId,
+    pl.LinkTypeId,
+    p.Title AS RelatedTitle,
+    p.CreationDate AS RelatedCreationDate
+  FROM PostLinks pl
+  JOIN Posts p ON p.Id = pl.RelatedPostId
+  WHERE pl.LinkTypeId IN (1, 3)
+  ORDER BY p.CreationDate DESC
+  OFFSET 0 LIMIT 100
+),
+PopularTags AS (
+  SELECT
+    tag AS TagName,
+    COUNT(*) AS TagCount,
+    AVG(p.Score) AS AvgPostScore
+  FROM RecentActivePosts rap
+  CROSS JOIN LATERAL (
+    SELECT regexp_split_to_table(rap.Tags, '><') AS tag
+  ) s
+  LEFT JOIN Posts p ON p.Id = rap.PostId
+  GROUP BY tag
+),
+ClosedReasons AS (
+  SELECT
+    rh.PostId,
+    rh.Comment AS CloseComment,
+    rh.Text AS ExtraInfo,
+    rh.CreationDate
+  FROM PostHistory rh
+  WHERE rh.PostHistoryTypeId = 10
+),
+FinalQuery AS (
+  SELECT
+    rap.PostId,
+    rap.Title,
+    rap.Body,
+    rap.Tags,
+    rap.CreationDate,
+    rap.LastActivityDate,
+    rap.Score,
+    rap.ViewCount,
+    rap.CommentCount,
+    rap.AnswerCount,
+    rap.OwnerUserId,
+    ue.UserId,
+    ue.DisplayName AS OwnerDisplayName,
+    ue.Reputation,
+    ue.BaseEngagement,
+    ui.DisplayName AS LastEditorDisplayName,
+    rap.LastEditDate,
+    bl.RelatedPostId,
+    bl.RelatedTitle,
+    bl.RelatedCreationDate,
+    clr.CloseComment
+  FROM RecentActivePosts rap
+  LEFT JOIN UserEngagement ue ON rap.OwnerUserId = ue.UserId
+  LEFT JOIN Users ui ON rap.LastEditorUserId = ui.Id
+  LEFT JOIN TopLinked bl ON rap.PostId = bl.PostId
+  LEFT JOIN ClosedReasons clr ON rap.PostId = clr.PostId
+  ORDER BY rap.LastActivityDate DESC, rap.Score DESC
+  OFFSET 0 LIMIT 200
+)
+SELECT
+  PostId,
+  Title,
+  CASE WHEN Body IS NOT NULL THEN SUBSTRING(Body FROM 1 FOR 200) || '...' ELSE NULL END AS PreviewBody,
+  Tags,
+  CreationDate,
+  LastActivityDate,
+  Score,
+  ViewCount,
+  CommentCount,
+  AnswerCount,
+  OwnerUserId,
+  OwnerDisplayName,
+  Reputation,
+  BaseEngagement,
+  LastEditorDisplayName,
+  RelatedPostId,
+  RelatedTitle,
+  RelatedCreationDate,
+  CloseComment
+FROM FinalQuery
+WHERE LastActivityDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '14 days')
+ORDER BY LastActivityDate DESC, Score DESC;

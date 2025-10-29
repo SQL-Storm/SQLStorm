@@ -1,0 +1,153 @@
+-- {"query": "3217.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1638} 
+WITH
+/* 1. Basic user activity metrics */
+UserStats AS (
+    SELECT
+        u.Id                                       AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id)                                AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        COALESCE(SUM(p.Score),0)                   AS NetScore,
+        MAX(p.CreationDate)                        AS LastPostDate,
+        -- correlated subquery: most recent edit date per user
+        (SELECT MAX(ph.CreationDate)
+         FROM PostHistory ph
+         JOIN Posts p2 ON ph.PostId = p2.Id
+         WHERE ph.UserId = u.Id)                  AS LastEditDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+/* 2. Badge aggregation – includes tag‑based and class breakdown */
+BadgeAggregates AS (
+    SELECT
+        b.UserId,
+        COUNT(*)                                      AS TotalBadges,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END)       AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END)       AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END)       AS BronzeBadges,
+        STRING_AGG(DISTINCT CASE WHEN b.TagBased = 1 THEN b.Name END, ', ') AS TagBadges,
+        STRING_AGG(DISTINCT CASE WHEN b.TagBased = 0 THEN b.Name END, ', ') AS NamedBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+/* 3. Recent vote snapshot per post – window function to get top 3 vote types */
+PostVoteRanks AS (
+    SELECT
+        v.PostId,
+        vt.Name                                   AS VoteType,
+        v.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY v.PostId ORDER BY v.CreationDate DESC) AS rn
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+),
+
+TopVotesPerPost AS (
+    SELECT
+        pvr.PostId,
+        STRING_AGG(pvr.VoteType, ', ') FILTER (WHERE pvr.rn <= 3) AS TopThreeVoteTypes
+    FROM PostVoteRanks pvr
+    GROUP BY pvr.PostId
+),
+
+/* 4. Tag activity – count of questions per tag with recent activity */
+TagActivity AS (
+    SELECT
+        t.Id                                   AS TagId,
+        t.TagName,
+        COUNT(p.Id)                            AS QuestionCount,
+        MAX(p.LastActivityDate)                AS LastActivity,
+        -- string aggregation of top 5 recent question titles for the tag
+        STRING_AGG(p.Title, ' | ') FILTER (WHERE p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '30 days' ORDER BY p.CreationDate DESC LIMIT 5) AS RecentTitles
+    FROM Tags t
+    JOIN Posts p ON p.Tags ILIKE CONCAT('%<', t.TagName, '>%')
+               AND p.PostTypeId = 1
+    GROUP BY t.Id, t.TagName
+),
+
+/* 5. Complex post hierarchy with outer joins and null handling */
+PostHierarchy AS (
+    SELECT
+        q.Id                                   AS QuestionId,
+        q.Title                                 AS QuestionTitle,
+        q.CreationDate                         AS QuestionDate,
+        COALESCE(a.Id, -1)                      AS TopAnswerId,
+        COALESCE(a.Score, 0)                    AS TopAnswerScore,
+        COALESCE(a.OwnerUserId, 0)              AS TopAnswerOwner,
+        CASE 
+            WHEN q.AcceptedAnswerId IS NOT NULL THEN 1
+            ELSE 0
+        END                                     AS HasAccepted,
+        -- correlated subquery: count of comments on the question
+        (SELECT COUNT(c.Id)
+         FROM Comments c
+         WHERE c.PostId = q.Id)                AS QuestionCommentCount
+    FROM Posts q
+    LEFT JOIN Posts a
+        ON a.ParentId = q.Id
+       AND a.PostTypeId = 2
+       AND a.Score = (
+            SELECT MAX(a2.Score)
+            FROM Posts a2
+            WHERE a2.ParentId = q.Id AND a2.PostTypeId = 2
+       )
+    WHERE q.PostTypeId = 1
+),
+
+/* 6. Union of users meeting either of two complex criteria */
+HighImpactUsers AS (
+    SELECT us.UserId, us.DisplayName, us.Reputation, us.NetScore,
+           ba.GoldBadges, ba.SilverBadges, ba.BronzeBadges,
+           us.LastPostDate, us.LastEditDate
+    FROM UserStats us
+    JOIN BadgeAggregates ba ON ba.UserId = us.UserId
+    WHERE (us.NetScore > 5000 AND ba.GoldBadges >= 5)
+       OR (us.Reputation > 20000 AND us.QuestionCount > 100)
+),
+
+LowActivityOrphanPosts AS (
+    SELECT ph.QuestionId, ph.QuestionTitle, ph.QuestionDate,
+           ph.TopAnswerId, ph.TopAnswerScore, ph.HasAccepted,
+           ph.QuestionCommentCount,
+           COALESCE(tv.TopThreeVoteTypes, 'none') AS RecentVoteTypes
+    FROM PostHierarchy ph
+    LEFT JOIN TopVotesPerPost tv ON tv.PostId = ph.QuestionId
+    WHERE ph.TopAnswerId = -1
+       OR ph.QuestionCommentCount = 0
+       OR ph.TopAnswerScore < 0
+),
+
+/* 7. Final set operator combining user and post perspectives */
+CombinedResults AS (
+    SELECT
+        'User'                              AS RecordType,
+        hiu.UserId::TEXT                    AS PrimaryKey,
+        hiu.DisplayName,
+        hiu.Reputation::TEXT,
+        hiu.NetScore::TEXT                  AS Metric,
+        hiu.GoldBadges::TEXT || '/' || hiu.SilverBadges::TEXT || '/' || hiu.BronzeBadges::TEXT AS BadgeBreakdown,
+        hiu.LastPostDate::DATE::TEXT        AS LastActivity,
+        hiu.LastEditDate::DATE::TEXT        AS LastEdit
+    FROM HighImpactUsers hiu
+
+    UNION ALL
+
+    SELECT
+        'Post'                              AS RecordType,
+        lop.QuestionId::TEXT                AS PrimaryKey,
+        lop.QuestionTitle,
+        NULL::TEXT                          AS Reputation,
+        lop.TopAnswerScore::TEXT            AS Metric,
+        NULL::TEXT                          AS BadgeBreakdown,
+        lop.QuestionDate::DATE::TEXT        AS LastActivity,
+        lop.RecentVoteTypes                 AS LastEdit
+    FROM LowActivityOrphanPosts lop
+)
+
+SELECT *
+FROM CombinedResults
+ORDER BY RecordType, PrimaryKey;

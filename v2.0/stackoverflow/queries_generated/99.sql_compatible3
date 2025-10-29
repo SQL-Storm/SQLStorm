@@ -1,0 +1,339 @@
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        u.location,
+        u.websiteurl,
+        coalesce(nullif(trim(u.location), ''), 'Unknown') as norm_location,
+        date_trunc('month', u.creationdate) as cohort_month,
+        row_number() over (order by u.creationdate desc, u.id) as rn_desc_creation
+    from users u
+    where u.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+),
+user_activity as (
+    select
+        u.user_id,
+        count(distinct p.id) filter (where p.posttypeid in (1,2)) as total_posts,
+        count(*) filter (where c.id is not null) as total_comments,
+        sum(greatest(p.score, 0)) as nonneg_post_score,
+        sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end) as net_votes_cast,
+        max(coalesce(p.lastactivitydate, p.creationdate)) as last_post_activity,
+        max(c.creationdate) as last_comment_activity,
+        count(*) filter (where v.votetypeid in (8,9)) as bounty_events
+    from recent_users u
+    left join posts p on p.owneruserid = u.user_id
+    left join comments c on c.userid = u.user_id
+    left join votes v on v.userid = u.user_id
+    group by u.user_id
+),
+question_metrics as (
+    select
+        q.owneruserid as user_id,
+        count(*) as q_count,
+        sum(coalesce(q.viewcount,0)) as q_views,
+        avg(nullif(q.viewcount,0)) as q_avg_nonzero_views,
+        sum(case when q.acceptedanswerid is not null then 1 else 0 end) as q_accepted,
+        avg(q.score) as q_avg_score,
+        percentile_cont(0.5) within group (order by q.score) as q_median_score
+    from posts q
+    where q.posttypeid = 1
+    group by q.owneruserid
+),
+answer_metrics as (
+    select
+        a.owneruserid as user_id,
+        count(*) as a_count,
+        sum(case when v.votetypeid = 1 then 1 else 0 end) as a_accepted_by_originator,
+        avg(a.score) as a_avg_score,
+        stddev_pop(a.score) as a_score_stddev
+    from posts a
+    left join votes v on v.postid = a.id and v.votetypeid = 1
+    where a.posttypeid = 2
+    group by a.owneruserid
+),
+tag_usage as (
+    select
+        p.owneruserid as user_id,
+        lower(trim(both '<>' from t.tag)) as tag_name,
+        count(*) as tag_use_count
+    from posts p,
+         lateral unnest(string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')) as t(tag)
+    where p.posttypeid = 1 and p.tags is not null and length(p.tags) > 2
+    group by p.owneruserid, lower(trim(both '<>' from t.tag))
+),
+top_tags as (
+    select user_id, tag_name, tag_use_count,
+           row_number() over (partition by user_id order by tag_use_count desc, tag_name) as rn
+    from tag_usage
+),
+user_badges as (
+    select
+        b.userid as user_id,
+        count(*) as badge_count,
+        sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+        sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+        sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+        count(*) filter (where b.tagbased = true) as tag_badges
+    from badges b
+    group by b.userid
+),
+postlink_dupes as (
+    select
+        q.owneruserid as user_id,
+        count(*) filter (where pl.linktypeid = 3) as dup_marks_given,
+        count(distinct pl.relatedpostid) filter (where pl.linktypeid = 3) as distinct_dupe_targets
+    from postlinks pl
+    join posts q on q.id = pl.postid and q.posttypeid = 1
+    group by q.owneruserid
+),
+close_events as (
+    select
+        ph.userid as user_id,
+        count(*) filter (where ph.posthistorytypeid = 10) as close_votes,
+        count(*) filter (where ph.posthistorytypeid = 11) as reopen_votes,
+        sum(
+            case
+                when ph.posthistorytypeid = 10 then
+                    case
+                        when (ph.comment ~ '^[0-9]+$') then 1
+                        else 0
+                    end
+                else 0
+            end
+        ) as close_votes_with_reason_numeric
+    from posthistory ph
+    where ph.posthistorytypeid in (10,11)
+    group by ph.userid
+),
+hotness as (
+    select
+        p.owneruserid as user_id,
+        count(*) filter (where ph.posthistorytypeid = 52) as times_hot,
+        count(*) filter (where ph.posthistorytypeid = 53) as times_unhot,
+        max(ph.creationdate) filter (where ph.posthistorytypeid in (52,53)) as last_hot_event
+    from posts p
+    left join posthistory ph on ph.postid = p.id and ph.posthistorytypeid in (52,53)
+    group by p.owneruserid
+),
+user_null_safety as (
+    select
+        u.user_id,
+        case when u.websiteurl is null or trim(u.websiteurl) = '' then 1 else 0 end as missing_website,
+        case when u.location is null or trim(u.location) = '' then 1 else 0 end as missing_location,
+        case when u.displayname is null or trim(u.displayname) = '' then 1 else 0 end as missing_displayname
+    from recent_users u
+),
+rankings as (
+    select
+        u.user_id,
+        dense_rank() over (order by ua.total_posts desc nulls last, ua.total_comments desc nulls last) as r_activity,
+        dense_rank() over (order by coalesce(qm.q_views,0) desc) as r_views,
+        dense_rank() over (order by coalesce(am.a_count,0) desc) as r_answers,
+        dense_rank() over (order by u.reputation desc, u.creationdate asc) as r_rep
+    from recent_users u
+    left join user_activity ua on ua.user_id = u.user_id
+    left join question_metrics qm on qm.user_id = u.user_id
+    left join answer_metrics am on am.user_id = u.user_id
+    group by u.user_id, ua.total_posts, ua.total_comments, qm.q_views, am.a_count, u.reputation, u.creationdate
+),
+monthly_activity as (
+    select
+        u.user_id,
+        date_trunc('month', p.creationdate) as month,
+        count(*) filter (where p.posttypeid = 1) as q_in_month,
+        count(*) filter (where p.posttypeid = 2) as a_in_month,
+        count(distinct p.id) as posts_in_month
+    from recent_users u
+    left join posts p on p.owneruserid = u.user_id
+    group by u.user_id, date_trunc('month', p.creationdate)
+),
+streaks as (
+    -- Rewritten without CROSS APPLY using lateral derived calculations
+    with months_with_activity as (
+        select user_id, month
+        from monthly_activity
+        where posts_in_month > 0
+    ),
+    flagged as (
+        select
+            ma.user_id,
+            ma.month,
+            case
+                when lag(ma.month) over (partition by ma.user_id order by ma.month) = ma.month - interval '1 month' then 0
+                else 1
+            end as is_break
+        from months_with_activity ma
+    ),
+    grp_calc as (
+        select
+            f.user_id,
+            f.month,
+            sum(is_break) over (partition by f.user_id order by f.month rows between unbounded preceding and current row) as grp
+        from flagged f
+    )
+    select
+        g.user_id as user_id,
+        max(counts.slen) as max_monthly_post_streak
+    from (
+        select
+            g.user_id,
+            g.month,
+            g.grp,
+            count(*) over (partition by g.user_id, g.grp) as slen
+        from grp_calc g
+    ) counts
+    group by g.user_id
+),
+norms as (
+    select
+        u.user_id,
+        log(1 + coalesce(ua.total_posts,0)) as ln_posts,
+        log(1 + coalesce(qm.q_views,0)) as ln_q_views,
+        sqrt(greatest(coalesce(am.a_score_stddev,0), 0)) as sqrt_ans_score_sd,
+        case when coalesce(qm.q_count,0) > 0 then cast(coalesce(qm.q_accepted,0) as numeric) / qm.q_count else null end as accept_rate
+    from recent_users u
+    left join user_activity ua on ua.user_id = u.user_id
+    left join question_metrics qm on qm.user_id = u.user_id
+    left join answer_metrics am on am.user_id = u.user_id
+),
+dupe_resolution as (
+    select
+        a.owneruserid as user_id,
+        count(*) as answers_on_dupes
+    from posts q
+    join postlinks pl on pl.relatedpostid = q.id and pl.linktypeid = 3
+    join posts a on a.parentid = q.id and a.posttypeid = 2
+    group by a.owneruserid
+),
+save_vs_fav as (
+    select
+        p.owneruserid as user_id,
+        count(*) filter (where v.votetypeid = 5 and v.creationdate < '2022-10-01') as old_favorites,
+        count(*) filter (where v.votetypeid = 5 and v.creationdate >= '2022-10-01') as post_oct22_fav_events
+    from posts p
+    left join votes v on v.postid = p.id and v.votetypeid = 5
+    group by p.owneruserid
+),
+user_summary as (
+    select
+        u.user_id,
+        u.displayname,
+        u.norm_location,
+        u.cohort_month,
+        ua.total_posts,
+        ua.total_comments,
+        ua.nonneg_post_score,
+        ua.net_votes_cast,
+        ua.last_post_activity,
+        ua.last_comment_activity,
+        ua.bounty_events,
+        qm.q_count, qm.q_views, qm.q_avg_nonzero_views, qm.q_accepted, qm.q_avg_score, qm.q_median_score,
+        am.a_count, am.a_accepted_by_originator, am.a_avg_score, am.a_score_stddev,
+        tt1.tag_name as top_tag_1,
+        tt2.tag_name as top_tag_2,
+        tt3.tag_name as top_tag_3,
+        ub.badge_count, ub.gold_badges, ub.silver_badges, ub.bronze_badges, ub.tag_badges,
+        pd.dup_marks_given, pd.distinct_dupe_targets,
+        ce.close_votes, ce.reopen_votes, ce.close_votes_with_reason_numeric,
+        h.times_hot, h.times_unhot, h.last_hot_event,
+        uns.missing_website, uns.missing_location, uns.missing_displayname,
+        r.r_activity, r.r_views, r.r_answers, r.r_rep,
+        st.max_monthly_post_streak,
+        n.ln_posts, n.ln_q_views, n.sqrt_ans_score_sd, n.accept_rate,
+        dr.answers_on_dupes,
+        svf.old_favorites, svf.post_oct22_fav_events,
+        case
+            when coalesce(ub.gold_badges,0) > 0 and coalesce(qm.q_accepted,0) > 0 then 'Elite'
+            when coalesce(ub.silver_badges,0) > 3 then 'Veteran'
+            when coalesce(ua.total_posts,0) > 50 then 'Active'
+            else 'Casual'
+        end as user_segment
+    from recent_users u
+    left join user_activity ua on ua.user_id = u.user_id
+    left join question_metrics qm on qm.user_id = u.user_id
+    left join answer_metrics am on am.user_id = u.user_id
+    left join top_tags tt1 on tt1.user_id = u.user_id and tt1.rn = 1
+    left join top_tags tt2 on tt2.user_id = u.user_id and tt2.rn = 2
+    left join top_tags tt3 on tt3.user_id = u.user_id and tt3.rn = 3
+    left join user_badges ub on ub.user_id = u.user_id
+    left join postlink_dupes pd on pd.user_id = u.user_id
+    left join close_events ce on ce.user_id = u.user_id
+    left join hotness h on h.user_id = u.user_id
+    left join user_null_safety uns on uns.user_id = u.user_id
+    left join rankings r on r.user_id = u.user_id
+    left join streaks st on st.user_id = u.user_id
+    left join norms n on n.user_id = u.user_id
+    left join dupe_resolution dr on dr.user_id = u.user_id
+    left join save_vs_fav svf on svf.user_id = u.user_id
+),
+filtered as (
+    select *
+    from user_summary
+    where coalesce(total_posts,0) + coalesce(total_comments,0) > 0
+      and (accept_rate is null or accept_rate between 0 and 1)
+      and (r_rep <= 100 or times_hot > 0 or a_count > 0)
+),
+ranked as (
+    select
+        f.*,
+        row_number() over (
+            partition by user_segment
+            order by coalesce(q_views,0) desc, coalesce(a_count,0) desc, coalesce(nonneg_post_score,0) desc, user_id
+        ) as seg_rank,
+        percent_rank() over (order by coalesce(q_views,0) desc) as pr_q_views,
+        ntile(10) over (order by coalesce(a_count,0) desc, coalesce(q_count,0) desc) as decile_activity
+    from filtered f
+),
+dupe_enrichment as (
+    select
+        r.*,
+        (select count(*) from postlinks pl
+         join posts p on p.id = pl.postid
+         where pl.linktypeid = 3 and p.owneruserid = r.user_id) as dup_links_made,
+        (select count(*) from postlinks pl
+         join posts p on p.id = pl.relatedpostid
+         where pl.linktypeid = 3 and p.owneruserid = r.user_id) as times_marked_duplicate_of_their_posts
+    from ranked r
+)
+select
+    re.user_id,
+    re.displayname,
+    re.user_segment,
+    re.cohort_month,
+    re.norm_location,
+    coalesce(re.top_tag_1, '(none)') as top_tag_1,
+    coalesce(re.top_tag_2, '(none)') as top_tag_2,
+    coalesce(re.top_tag_3, '(none)') as top_tag_3,
+    re.total_posts,
+    re.total_comments,
+    re.q_count, re.a_count,
+    re.q_views, re.q_avg_nonzero_views,
+    re.q_accepted, re.a_accepted_by_originator,
+    re.q_avg_score, re.q_median_score,
+    re.a_avg_score, re.a_score_stddev,
+    re.nonneg_post_score,
+    re.net_votes_cast,
+    re.badge_count, re.gold_badges, re.silver_badges, re.bronze_badges, re.tag_badges,
+    re.dup_marks_given, re.distinct_dupe_targets,
+    re.close_votes, re.reopen_votes, re.close_votes_with_reason_numeric,
+    re.times_hot, re.times_unhot, re.last_hot_event,
+    re.max_monthly_post_streak,
+    re.accept_rate,
+    re.ln_posts, re.ln_q_views, re.sqrt_ans_score_sd,
+    re.answers_on_dupes,
+    re.old_favorites, re.post_oct22_fav_events,
+    re.seg_rank, re.pr_q_views, re.decile_activity,
+    re.dup_links_made, re.times_marked_duplicate_of_their_posts,
+    case when re.missing_website = 1 or re.missing_location = 1 or re.missing_displayname = 1 then 'INCOMPLETE' else 'OK' end as profile_completeness,
+    coalesce(re.last_post_activity, re.last_comment_activity, (select min(creationdate) from posts p2 where p2.owneruserid = re.user_id)) as last_any_activity,
+    case
+        when coalesce(re.q_views,0) > 0 then (cast(re.net_votes_cast as numeric) / nullif(re.q_views,0)) else null end as votes_cast_per_view
+from dupe_enrichment re
+where (
+        (re.user_segment = 'Elite' and re.seg_rank <= 500)
+     or (re.user_segment = 'Veteran' and re.seg_rank <= 500)
+     or (re.user_segment in ('Active','Casual') and re.seg_rank <= 200)
+)
+order by re.user_segment, re.seg_rank, re.user_id;

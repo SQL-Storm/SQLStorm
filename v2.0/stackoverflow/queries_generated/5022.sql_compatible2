@@ -1,0 +1,139 @@
+WITH TopActiveQuestions AS (
+  SELECT
+    p.id AS PostId,
+    p.title,
+    p.tags,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.owneruserid,
+    p.lastactivitydate,
+    p.commentcount,
+    p.answercount,
+    ROW_NUMBER() OVER (PARTITION BY p.owneruserid ORDER BY p.lastactivitydate DESC) AS rn
+  FROM Posts p
+  WHERE p.posttypeid = 1
+),
+RecentTagStats AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS TagQuestionCount,
+    AVG(p.score) AS AvgQuestionScore,
+    SUM(p.viewcount) AS TotalViews
+  FROM Posts p
+  JOIN LATERAL (
+    SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(p.tags FROM 2 FOR LENGTH(p.tags) - 2), '><')) AS TagName
+  ) t ON TRUE
+  WHERE p.posttypeid = 1
+  GROUP BY t.TagName
+),
+PopularWikis AS (
+  SELECT
+    w.id AS WikiPostId,
+    w.title AS WikiTitle,
+    w.owneruserid,
+    w.lasteditdate,
+    w.lastactivitydate,
+    w.contentlicense,
+    COUNT(c.id) AS CommentCountOnWiki
+  FROM Posts w
+  LEFT JOIN Comments c ON c.postid = w.id
+  WHERE w.posttypeid IN (4,5)
+  GROUP BY w.id, w.title, w.owneruserid, w.lasteditdate, w.lastactivitydate, w.contentlicense
+),
+CrossJoinBenchmark AS (
+  SELECT
+    q.PostId,
+    q.title,
+    q.owneruserid,
+    q.lastactivitydate,
+    q.score,
+    q.viewcount,
+    q.commentcount,
+    q.answercount,
+    u.reputation,
+    u.displayname,
+    u.location,
+    vtype.name AS VoteTypeName,
+    t.TagName,
+    q.rn
+  FROM TopActiveQuestions q
+  LEFT JOIN Users u ON u.id = q.owneruserid
+  LEFT JOIN Votes vv ON vv.postid = q.PostId
+  LEFT JOIN VoteTypes vtype ON vtype.id = CASE WHEN vv.votetypeid IS NULL THEN 0 ELSE vv.votetypeid END
+  LEFT JOIN LATERAL (
+    SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(q.tags FROM 2 FOR LENGTH(q.tags) - 2), '><')) AS TagName
+  ) t ON TRUE
+  WHERE q.rn = 1
+),
+CombinedCP AS (
+  SELECT
+    c.PostId,
+    c.title,
+    c.owneruserid,
+    c.lastactivitydate,
+    c.score,
+    c.viewcount,
+    c.commentcount,
+    c.answercount,
+    c.reputation,
+    c.displayname,
+    c.location,
+    c.votetypename,
+    c.tagname
+  FROM CrossJoinBenchmark c
+  UNION ALL
+  SELECT
+    p.id AS PostId,
+    p.title,
+    p.owneruserid,
+    p.lastactivitydate,
+    p.score,
+    p.viewcount,
+    p.commentcount,
+    p.answercount,
+    u.reputation,
+    u.displayname,
+    u.location,
+    NULL AS VoteTypeName,
+    t.TagName
+  FROM TopActiveQuestions p
+  LEFT JOIN Users u ON u.id = p.owneruserid
+  LEFT JOIN LATERAL (
+    SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(p.tags FROM 2 FOR LENGTH(p.tags) - 2), '><')) AS TagName
+  ) t ON TRUE
+  WHERE p.rn = 1
+),
+FinalOutput AS (
+  SELECT
+    PostId,
+    title AS Title,
+    owneruserid AS OwnerUserId,
+    lastactivitydate AS LastActivityDate,
+    score AS Score,
+    viewcount AS ViewCount,
+    commentcount AS CommentCount,
+    answercount AS AnswerCount,
+    reputation AS Reputation,
+    displayname AS DisplayName,
+    location AS Location,
+    COALESCE(votetypename, 'Unknown') AS VoteTypeName,
+    COALESCE(tagname, '') AS TagName
+  FROM CombinedCP
+  ORDER BY lastactivitydate DESC, postid
+  LIMIT 100
+)
+SELECT PostId,
+       Title,
+       OwnerUserId,
+       LastActivityDate,
+       Score,
+       ViewCount,
+       CommentCount,
+       AnswerCount,
+       Reputation,
+       DisplayName,
+       Location,
+       VoteTypeName,
+       TagName
+FROM FinalOutput;

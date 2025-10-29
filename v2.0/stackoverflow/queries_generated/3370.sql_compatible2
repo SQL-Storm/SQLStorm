@@ -1,0 +1,134 @@
+WITH UserStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT b.Id)                                   AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END)            AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END)            AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END)            AS BronzeBadges,
+        MAX(u.LastAccessDate)                                  AS LastSeen,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1)             AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2)             AS AnswerCount
+    FROM Users u
+    LEFT JOIN Badges b   ON b.UserId   = u.Id
+    LEFT JOIN Posts  p   ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopUsers AS (
+    SELECT *
+    FROM UserStats
+    ORDER BY Reputation DESC, BadgeCount DESC
+    FETCH FIRST 100 ROWS ONLY
+),
+UserQuestionScores AS (
+    SELECT
+        p.OwnerUserId                                     AS UserId,
+        AVG(p.Score)                                      AS AvgQuestionScore,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score)
+            OVER (PARTITION BY p.OwnerUserId)             AS MedianQuestionScore,
+        MAX(p.CreationDate)                               AS LatestQuestionDate
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+    GROUP BY p.OwnerUserId
+),
+UserRecentActivity AS (
+    SELECT
+        u.Id,
+        GREATEST(
+            COALESCE((SELECT MAX(CreationDate) FROM Posts    WHERE OwnerUserId = u.Id), TIMESTAMP '1970-01-01 00:00:00'),
+            COALESCE((SELECT MAX(CreationDate) FROM Comments WHERE UserId      = u.Id), TIMESTAMP '1970-01-01 00:00:00'),
+            COALESCE((SELECT MAX(CreationDate) FROM Votes    WHERE UserId      = u.Id), TIMESTAMP '1970-01-01 00:00:00')
+        )                                               AS MostRecentActivity
+    FROM Users u
+),
+TagInfo AS (
+    SELECT
+        t.TagName,
+        t.Count                                          AS TagUseCount,
+        COALESCE(e.Title, '')                            AS ExcerptTitle,
+        COALESCE(w.Title, '')                            AS WikiTitle
+    FROM Tags t
+    LEFT JOIN Posts e ON e.Id = t.ExcerptPostId
+    LEFT JOIN Posts w ON w.Id = t.WikiPostId
+),
+UserTagOverlap AS (
+    SELECT
+        tu.UserId,
+        ARRAY_AGG(DISTINCT t.TagName) FILTER (WHERE t.Count > 1000) AS PopularTags
+    FROM (
+        SELECT
+            p.OwnerUserId                                 AS UserId,
+            regexp_split_to_table(trim(both '<>' FROM p.Tags), '><') AS Tag
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+    ) tu
+    JOIN Tags t ON t.TagName = tu.Tag
+    GROUP BY tu.UserId
+),
+MainRows AS (
+    SELECT
+        tu.Id,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.BadgeCount,
+        tu.GoldBadges,
+        tu.SilverBadges,
+        tu.BronzeBadges,
+        tu.QuestionCount,
+        tu.AnswerCount,
+        COALESCE(uqs.AvgQuestionScore, 0)                     AS AvgQScore,
+        COALESCE(uqs.MedianQuestionScore, 0)                 AS MedianQScore,
+        COALESCE(uqs.LatestQuestionDate, TIMESTAMP '1970-01-01 00:00:00') AS LastQDate,
+        ua.MostRecentActivity,
+        CASE
+            WHEN tu.Reputation > 20000 THEN 'Legend'
+            WHEN tu.Reputation > 10000 THEN 'Expert'
+            WHEN tu.Reputation > 5000  THEN 'Seasoned'
+            ELSE 'Rising'
+        END                                                   AS ReputationTier,
+        uto.PopularTags,
+        STRING_AGG(DISTINCT tg.TagName, ', ') FILTER (WHERE tg.Count BETWEEN 500 AND 1000)
+                                                              AS MediumPopularityTags
+    FROM TopUsers tu
+    LEFT JOIN UserQuestionScores uqs ON uqs.UserId = tu.Id
+    LEFT JOIN UserRecentActivity ua  ON ua.Id    = tu.Id
+    LEFT JOIN UserTagOverlap uto    ON uto.UserId = tu.Id
+    LEFT JOIN LATERAL (
+        SELECT t.TagName, t.Count
+        FROM Tags t
+        WHERE uto.PopularTags IS NOT NULL AND t.TagName = ANY (uto.PopularTags)
+    ) tg ON true
+    GROUP BY
+        tu.Id, tu.DisplayName, tu.Reputation, tu.BadgeCount, tu.GoldBadges,
+        tu.SilverBadges, tu.BronzeBadges, tu.QuestionCount, tu.AnswerCount,
+        uqs.AvgQuestionScore, uqs.MedianQuestionScore, uqs.LatestQuestionDate,
+        ua.MostRecentActivity, uto.PopularTags, ReputationTier
+    HAVING COUNT(*) > 0
+    ORDER BY tu.Reputation DESC, tu.BadgeCount DESC
+)
+SELECT * FROM MainRows
+
+UNION ALL
+
+SELECT
+    NULL                                       AS Id,
+    'TOTAL'                                    AS DisplayName,
+    SUM(tu.Reputation)                         AS Reputation,
+    SUM(tu.BadgeCount)                         AS BadgeCount,
+    SUM(tu.GoldBadges)                         AS GoldBadges,
+    SUM(tu.SilverBadges)                       AS SilverBadges,
+    SUM(tu.BronzeBadges)                       AS BronzeBadges,
+    SUM(tu.QuestionCount)                      AS QuestionCount,
+    SUM(tu.AnswerCount)                        AS AnswerCount,
+    AVG(COALESCE(uqs.AvgQuestionScore,0))      AS AvgQScore,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY COALESCE(uqs.MedianQuestionScore,0))
+                                                AS MedianQScore,
+    MAX(uqs.LatestQuestionDate)                AS LastQDate,
+    MAX(ua.MostRecentActivity)                 AS MostRecentActivity,
+    NULL                                       AS ReputationTier,
+    NULL                                       AS PopularTags,
+    NULL                                       AS MediumPopularityTags
+FROM TopUsers tu
+LEFT JOIN UserQuestionScores uqs ON uqs.UserId = tu.Id
+LEFT JOIN UserRecentActivity ua  ON ua.Id    = tu.Id;

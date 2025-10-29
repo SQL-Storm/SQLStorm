@@ -1,0 +1,183 @@
+-- {"query": "2332.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1704} 
+
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        Id,
+        TagName,
+        Count,
+        ExcerptPostId,
+        WikiPostId,
+        0 AS Level,
+        CAST(TagName AS varchar(1000)) AS Path
+    FROM Tags
+    WHERE IsRequired = 1
+
+    UNION ALL
+
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        r.Level + 1,
+        r.Path || ' > ' || t.TagName
+    FROM Tags t
+    INNER JOIN RecursiveTagHierarchy r ON t.Id > r.Id AND t.IsRequired = 1
+    WHERE r.Level < 3
+), UserPostAgg AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(COALESCE(p.Score,0)) AS TotalPostScore,
+        AVG(COALESCE(p.ViewCount,0)) AS AvgViews,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        SUM(COALESCE(vt.UpVotes,0)) AS TotalUpVotes,
+        SUM(COALESCE(vt.DownVotes,0)) AS TotalDownVotes,
+        MAX(p.LastActivityDate) AS LastActivity
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN (
+        SELECT
+            p.OwnerUserId,
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes v
+        INNER JOIN Posts p ON v.PostId = p.Id
+        WHERE p.OwnerUserId IS NOT NULL
+        GROUP BY p.OwnerUserId
+    ) vt ON vt.OwnerUserId = u.Id
+    WHERE u.Reputation > 1000 AND u.LastAccessDate > now() - interval '1 year'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+), QuestionAnswerStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.OwnerUserId,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        q.AcceptedAnswerId,
+        COUNT(a.Id) AS AnswerCount,
+        AVG(a.Score) FILTER (WHERE a.Score IS NOT NULL) AS AvgAnswerScore,
+        MAX(a.Score) FILTER (WHERE a.Score IS NOT NULL) AS MaxAnswerScore,
+        BOOL_OR(a.OwnerUserId = q.AcceptedAnswerId) AS AcceptedAnswerExists
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.Title, q.CreationDate, q.OwnerUserId, q.Score, q.ViewCount, q.Tags, q.AcceptedAnswerId
+), LatestPostHistories AS (
+    SELECT DISTINCT ON (ph.PostId)
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        ph.UserId,
+        ph.UserDisplayName,
+        ph.Comment,
+        ph.Text
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (10, 11, 12, 13) -- Closed, Reopened, Deleted, Undeleted
+    ORDER BY ph.PostId, ph.CreationDate DESC
+), PostLinkDuplicates AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate
+    FROM PostLinks pl
+    INNER JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    WHERE lt.Name = 'Duplicate'
+), RankedUserPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Title,
+        p.Score,
+        p.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate DESC) AS RankByScore,
+        RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.ViewCount DESC NULLS LAST) AS RankByViews
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+)
+SELECT
+    u.UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.TotalPosts,
+    u.TotalPostScore,
+    u.AvgViews,
+    u.GoldBadges,
+    u.SilverBadges,
+    u.BronzeBadges,
+    u.CommentCount,
+    u.TotalUpVotes,
+    u.TotalDownVotes,
+    u.LastActivity,
+    qas.QuestionId,
+    LEFT(qas.Title, 80) AS QuestionTitleSnippet,
+    qas.AnswerCount,
+    qas.AvgAnswerScore,
+    qas.MaxAnswerScore,
+    qas.ViewCount AS QuestionViewCount,
+    array_to_string(
+        ARRAY(
+            SELECT DISTINCT tag
+            FROM unnest(string_to_array(regexp_replace(qas.Tags, '^<|>$', '', 'g'), '><')) tag
+            WHERE tag ~ '^[a-zA-Z]+$'
+            ORDER BY 1
+            LIMIT 5
+        ),
+        ', '
+    ) AS Tags,
+    lp.PostHistoryTypeId AS LatestPostHistoryType,
+    lp.CreationDate AS LatestPostHistoryDate,
+    lp.UserDisplayName AS LatestPostHistoryUser,
+    dups.RelatedPostId AS DuplicatePostId,
+    dups.CreationDate AS DuplicateLinkDate,
+    rups.RankByScore,
+    rups.RankByViews,
+    CASE 
+        WHEN rups.RankByScore = 1 THEN 'Top Score'
+        WHEN rups.RankByViews <= 3 THEN 'Top Views'
+        ELSE 'Regular'
+    END AS PostTier,
+    CASE 
+        WHEN u.TotalPostScore < 0 THEN 'Negative'
+        WHEN u.TotalPostScore BETWEEN 0 AND 100 THEN 'Low'
+        ELSE 'High'
+    END AS UserScoreCategory,
+    CONCAT_WS(' | ',
+        COALESCE(u.DisplayName, 'Unknown User'),
+        'Rep: ' || u.Reputation,
+        'Posts: ' || u.TotalPosts,
+        'Gold Badges: ' || u.GoldBadges,
+        'Comment Count: ' || u.CommentCount
+    ) AS UserSummary,
+    COALESCE(NULLIF(qas.Title, ''), '(No Title)') ||
+    CASE WHEN qas.ViewCount > 10000 THEN ' 🔥' ELSE '' END ||
+    CASE WHEN qas.AnswerCount = 0 THEN ' (Unanswered)' ELSE '' END AS HighlightedQuestionTitle
+FROM
+    UserPostAgg u
+    LEFT JOIN QuestionAnswerStats qas ON qas.OwnerUserId = u.UserId
+    LEFT JOIN LatestPostHistories lp ON lp.PostId = qas.QuestionId
+    LEFT JOIN PostLinkDuplicates dups ON dups.PostId = qas.QuestionId
+    LEFT JOIN RankedUserPosts rups ON rups.OwnerUserId = u.UserId
+        AND rups.PostId = qas.QuestionId
+WHERE
+    u.TotalPosts > 10
+    AND (qas.AnswerCount IS NULL OR qas.AnswerCount < 5)
+    AND (
+        lp.PostHistoryTypeId IS NULL
+        OR (lp.PostHistoryTypeId IN (10, 12) AND lp.CreationDate < now() - interval '6 months')
+    )
+ORDER BY
+    u.Reputation DESC,
+    qas.ViewCount DESC NULLS LAST
+LIMIT 100;

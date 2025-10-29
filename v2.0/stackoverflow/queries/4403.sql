@@ -1,0 +1,142 @@
+WITH UserReputationChanges AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVotesReceived,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVotesReceived,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) - SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS NetVoteScore,
+        LAG(u.Reputation, 1, u.Reputation) OVER (ORDER BY u.CreationDate) AS PreviousReputation,
+        u.CreationDate
+    FROM Users u
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+PostActivitySummary AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.ViewCount,
+        COALESCE(p.AnswerCount, 0) + COALESCE(p.CommentCount, 0) AS TotalInteractions,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate DESC) AS MostRecentPostRank,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed
+    FROM Posts p
+    LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserPostContribution AS (
+    SELECT
+        pas.OwnerUserId,
+        COUNT(CASE WHEN pas.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+        COUNT(CASE WHEN pas.PostTypeId = 2 THEN 1 END) AS AnswerCount,
+        SUM(pas.Score) AS TotalScoreReceived,
+        AVG(CAST(pas.FavoriteCount AS DECIMAL)) AS AvgFavoriteCount,
+        MAX(pas.PostCreationDate) AS LatestPostDate,
+        MIN(pas.PostCreationDate) AS EarliestPostDate,
+        SUM(pas.IsClosed) AS ClosedPostCount
+    FROM PostActivitySummary pas
+    GROUP BY pas.OwnerUserId
+)
+SELECT
+    COALESCE(urc.DisplayName, 'Deleted User') AS UserDisplayName,
+    urc.Reputation,
+    urc.UpVotesReceived,
+    urc.DownVotesReceived,
+    urc.NetVoteScore,
+    CASE
+        WHEN urc.Reputation >= 100000 THEN 'Legendary'
+        WHEN urc.Reputation >= 50000 THEN 'High Tier'
+        WHEN urc.Reputation >= 10000 THEN 'Mid Tier'
+        WHEN urc.Reputation >= 1000 THEN 'Low Tier'
+        ELSE 'Beginner'
+    END AS ReputationTier,
+    COALESCE(upc.QuestionCount, 0) AS TotalQuestions,
+    COALESCE(upc.AnswerCount, 0) AS TotalAnswers,
+    COALESCE(upc.TotalScoreReceived, 0) AS TotalScoreOnPosts,
+    COALESCE(upc.AvgFavoriteCount, 0.0) AS AverageFavoriteCountOnPosts,
+    COALESCE(upc.ClosedPostCount, 0) AS NumberOfClosedPosts,
+    CASE
+        WHEN upc.QuestionCount > 0 AND upc.AnswerCount > 0 THEN CAST(upc.AnswerCount AS DOUBLE PRECISION) / upc.QuestionCount
+        ELSE 0.0
+    END AS AnswerToQuestionRatio,
+    CASE
+        WHEN upc.LatestPostDate IS NOT NULL AND urc.CreationDate IS NOT NULL THEN
+            EXTRACT(EPOCH FROM (CAST(upc.LatestPostDate AS TIMESTAMP) - CAST(urc.CreationDate AS TIMESTAMP))) / 86400.0
+        ELSE 0.0
+    END AS DaysSinceCreationToLatestPost,
+    CASE
+        WHEN upc.EarliestPostDate IS NOT NULL AND urc.CreationDate IS NOT NULL THEN
+            EXTRACT(EPOCH FROM (CAST(upc.EarliestPostDate AS TIMESTAMP) - CAST(urc.CreationDate AS TIMESTAMP))) / 86400.0
+        ELSE 0.0
+    END AS DaysSinceCreationToEarliestPost,
+    CASE
+        WHEN upc.LatestPostDate IS NOT NULL AND upc.EarliestPostDate IS NOT NULL THEN
+            EXTRACT(EPOCH FROM (CAST(upc.LatestPostDate AS TIMESTAMP) - CAST(upc.EarliestPostDate AS TIMESTAMP))) / 86400.0
+        ELSE 0.0
+    END AS DaysActiveOnPlatform,
+    CASE
+        WHEN urc.PreviousReputation IS NOT NULL AND urc.Reputation IS NOT NULL THEN
+            CAST((urc.Reputation - urc.PreviousReputation) AS DOUBLE PRECISION)
+        ELSE 0.0
+    END AS ReputationChange,
+    pa.PostTypeName,
+    pa.Score AS PostScore,
+    pa.AnswerCount AS PostAnswerCount,
+    pa.CommentCount AS PostCommentCount,
+    pa.FavoriteCount AS PostFavoriteCount,
+    pa.IsClosed AS PostIsClosed,
+    pa.MostRecentPostRank
+FROM UserReputationChanges urc
+FULL OUTER JOIN UserPostContribution upc ON urc.UserId = upc.OwnerUserId
+LEFT JOIN PostActivitySummary pa ON urc.UserId = pa.OwnerUserId AND pa.MostRecentPostRank = 1
+WHERE urc.DisplayName IS NOT NULL
+GROUP BY
+    COALESCE(urc.DisplayName, 'Deleted User'),
+    urc.Reputation,
+    urc.UpVotesReceived,
+    urc.DownVotesReceived,
+    urc.NetVoteScore,
+    ReputationTier,
+    COALESCE(upc.QuestionCount, 0),
+    COALESCE(upc.AnswerCount, 0),
+    COALESCE(upc.TotalScoreReceived, 0),
+    COALESCE(upc.AvgFavoriteCount, 0.0),
+    COALESCE(upc.ClosedPostCount, 0),
+    AnswerToQuestionRatio,
+    DaysSinceCreationToLatestPost,
+    DaysSinceCreationToEarliestPost,
+    DaysActiveOnPlatform,
+    ReputationChange,
+    pa.PostTypeName,
+    pa.Score,
+    pa.AnswerCount,
+    pa.CommentCount,
+    pa.FavoriteCount,
+    pa.IsClosed,
+    pa.MostRecentPostRank,
+    urc.DisplayName,
+    urc.PreviousReputation,
+    urc.CreationDate,
+    upc.QuestionCount,
+    upc.AnswerCount,
+    upc.TotalScoreReceived,
+    upc.AvgFavoriteCount,
+    upc.LatestPostDate,
+    upc.EarliestPostDate,
+    upc.ClosedPostCount,
+    pa.PostId,
+    pa.PostCreationDate,
+    pa.OwnerUserId,
+    pa.PostTypeId
+ORDER BY urc.Reputation DESC, urc.DisplayName
+LIMIT 100;

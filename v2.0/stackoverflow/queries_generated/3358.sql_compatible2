@@ -1,0 +1,140 @@
+WITH
+    UserBadgeStats AS (
+        SELECT
+            u.Id                                   AS UserId,
+            u.DisplayName,
+            u.Reputation,
+            COUNT(b.Id)                            AS TotalBadges,
+            MAX(b.Class)                           AS HighestBadgeClass,
+            STRING_AGG(DISTINCT b.Name, ', ')      AS BadgeNames,
+            MAX(b.Date)                            AS MostRecentBadgeDate,
+            u.Location,
+            u.WebsiteUrl
+        FROM Users u
+        LEFT JOIN Badges b ON b.UserId = u.Id
+        GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location, u.WebsiteUrl
+    ),
+    UserRecentActivity AS (
+        SELECT
+            ua.UserId,
+            GREATEST(
+                COALESCE(p.LastActivityDate, TIMESTAMP '1970-01-01'),
+                COALESCE(c.CreationDate, TIMESTAMP '1970-01-01')
+            )                                      AS LastActivity,
+            ROW_NUMBER() OVER (PARTITION BY ua.UserId ORDER BY 
+                GREATEST(
+                    COALESCE(p.LastActivityDate, TIMESTAMP '1970-01-01'),
+                    COALESCE(c.CreationDate, TIMESTAMP '1970-01-01')
+                ) DESC)                         AS rn
+        FROM (
+            SELECT DISTINCT OwnerUserId AS UserId FROM Posts WHERE OwnerUserId IS NOT NULL
+            UNION
+            SELECT DISTINCT UserId     FROM Comments WHERE UserId IS NOT NULL
+        ) ua
+        LEFT JOIN Posts p ON p.OwnerUserId = ua.UserId
+        LEFT JOIN Comments c ON c.UserId = ua.UserId
+    ),
+    UserAnswerStats AS (
+        SELECT
+            u.Id                                    AS UserId,
+            (SELECT COUNT(*) 
+               FROM Posts p 
+              WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS AnswerCount,
+            (SELECT AVG(CAST(p.Score AS DOUBLE PRECISION))
+               FROM Posts p
+              WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS AvgAnswerScore
+        FROM Users u
+    ),
+    UserTagBadgeStats AS (
+        SELECT
+            b.UserId                                   AS UserId,
+            STRING_AGG(t.TagName, ', ')                AS TopTags,
+            COUNT(*)                                   AS TagBadgeCount
+        FROM Badges b
+        JOIN Tags t ON t.TagName = b.Name
+        WHERE b.TagBased = TRUE
+        GROUP BY b.UserId
+    ),
+    RankedUsers AS (
+        SELECT
+            ubs.UserId,
+            ubs.DisplayName,
+            ubs.Reputation,
+            ubs.TotalBadges,
+            ubs.HighestBadgeClass,
+            ub.BadgeNames,
+            ub.MostRecentBadgeDate,
+            uas.AnswerCount,
+            uas.AvgAnswerScore,
+            COALESCE(ura.LastActivity, TIMESTAMP '1970-01-01') AS LastActivity,
+            CAST(
+              (DATE_PART('day', CAST('2024-10-01 12:34:56' AS TIMESTAMP) - COALESCE(ura.LastActivity, TIMESTAMP '1970-01-01')))
+              AS INTEGER
+            ) AS DaysSinceLastActivity,
+            COALESCE(utbs.TopTags, '')                 AS TopTagBadges,
+            utbs.TagBadgeCount,
+            ROW_NUMBER() OVER (ORDER BY 
+                ubs.Reputation DESC,
+                ubs.TotalBadges DESC,
+                COALESCE(uas.AnswerCount, 0) DESC,
+                COALESCE(ura.LastActivity, TIMESTAMP '1970-01-01') DESC
+            )                                           AS OverallRank,
+            ubs.Location,
+            ubs.WebsiteUrl
+        FROM UserBadgeStats ubs
+        LEFT JOIN UserRecentActivity ura ON ura.UserId = ubs.UserId AND ura.rn = 1
+        LEFT JOIN UserAnswerStats uas   ON uas.UserId = ubs.UserId
+        LEFT JOIN UserTagBadgeStats utbs ON utbs.UserId = ubs.UserId
+        LEFT JOIN (
+            SELECT UserId,
+                   MAX(CASE WHEN Class = 1 THEN Name END) AS GoldBadge,
+                   MAX(CASE WHEN Class = 2 THEN Name END) AS SilverBadge,
+                   MAX(CASE WHEN Class = 3 THEN Name END) AS BronzeBadge
+            FROM Badges
+            GROUP BY UserId
+        ) ub ON ub.UserId = ubs.UserId
+        WHERE
+            (ubs.Reputation > 5000 OR ubs.TotalBadges >= 50)
+            AND (ubs.DisplayName IS NOT NULL OR ub.GoldBadge IS NOT NULL)
+            AND (ubs.Location IS NOT NULL OR ubs.WebsiteUrl LIKE '%stackoverflow%')
+        GROUP BY
+            ubs.UserId,
+            ubs.DisplayName,
+            ubs.Reputation,
+            ubs.TotalBadges,
+            ubs.HighestBadgeClass,
+            ub.BadgeNames,
+            ub.MostRecentBadgeDate,
+            uas.AnswerCount,
+            uas.AvgAnswerScore,
+            ura.LastActivity,
+            COALESCE(utbs.TopTags, ''),
+            utbs.TagBadgeCount,
+            ubs.Location,
+            ubs.WebsiteUrl,
+            ubs.TotalBadges -- included again to satisfy some dialects requiring grouped columns referenced elsewhere
+    )
+SELECT
+    ru.OverallRank,
+    ru.UserId,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.TotalBadges,
+    ru.HighestBadgeClass,
+    ru.BadgeNames,
+    ru.MostRecentBadgeDate,
+    ru.AnswerCount,
+    ROUND(ru.AvgAnswerScore, 2) AS AvgAnswerScore,
+    ru.DaysSinceLastActivity,
+    CASE 
+        WHEN ru.DaysSinceLastActivity < 30 THEN 'Active'
+        WHEN ru.DaysSinceLastActivity < 180 THEN 'Semi-Active'
+        ELSE 'Inactive'
+    END AS ActivityStatus,
+    ru.TopTagBadges,
+    ru.TagBadgeCount,
+    CONCAT('User_', CAST(ru.UserId AS VARCHAR)) AS UserCode,
+    NULLIF(ru.WebsiteUrl, '') AS CleanWebsiteUrl
+FROM RankedUsers ru
+WHERE ru.OverallRank <= 100
+ORDER BY ru.OverallRank;

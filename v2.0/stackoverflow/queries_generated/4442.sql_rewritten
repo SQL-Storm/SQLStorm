@@ -1,0 +1,129 @@
+-- {"query": "4442.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1559} 
+WITH RankedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.CreationDate DESC) AS ScoreRank,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.ViewCount DESC) AS ViewRank,
+        COUNT(c.Id) OVER (PARTITION BY p.Id) AS CommentCountPerPost,
+        LAG(p.Score, 1, 0) OVER (ORDER BY p.CreationDate) AS PreviousScore,
+        LEAD(p.Score, 1, 0) OVER (ORDER BY p.CreationDate) AS NextScore,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL THEN 1
+            ELSE 0
+        END AS IsClosed,
+        p.Title,
+        SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2) AS CleanTags,
+        CASE
+            WHEN p.OwnerUserId IS NULL THEN 'Community'
+            ELSE CAST(p.OwnerUserId AS VARCHAR)
+        END AS OwnerIdentifier,
+        COALESCE(p.OwnerDisplayName, 'Unknown') AS SafeOwnerDisplayName,
+        DENSE_RANK() OVER (ORDER BY p.ViewCount) AS ViewCountDenseRank
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    WHERE p.PostTypeId IN (1, 2) -- Questions and Answers
+),
+TagScores AS (
+    SELECT
+        pt.Id AS PostId,
+        SUM(v.VoteTypeId = 2) AS UpVoteCount, -- Count of UpMods
+        SUM(v.VoteTypeId = 3) AS DownVoteCount, -- Count of DownMods
+        COUNT(DISTINCT v.UserId) AS DistinctVoters
+    FROM Posts pt
+    JOIN Votes v ON pt.Id = v.PostId
+    WHERE v.VoteTypeId IN (2, 3)
+    GROUP BY pt.Id
+),
+UserPostActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        AVG(p.Score) AS AverageScore,
+        MAX(p.CreationDate) AS LastPostCreationDate
+    FROM Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id, u.DisplayName
+)
+SELECT
+    rp.PostId,
+    rp.PostTypeName,
+    rp.OwnerDisplayName,
+    rp.PostCreationDate,
+    rp.Score,
+    rp.ViewCount,
+    rp.AnswerCount AS PostAnswerCount,
+    rp.CommentCount AS PostCommentCount,
+    rp.FavoriteCount,
+    rp.ClosedDate,
+    rp.ScoreRank,
+    rp.ViewRank,
+    rp.CommentCountPerPost,
+    rp.PreviousScore,
+    rp.NextScore,
+    rp.IsClosed,
+    rp.Title,
+    rp.CleanTags,
+    rp.OwnerIdentifier,
+    rp.SafeOwnerDisplayName,
+    rp.ViewCountDenseRank,
+    ts.UpVoteCount,
+    ts.DownVoteCount,
+    ts.DistinctVoters,
+    upa.TotalPosts AS UserTotalPosts,
+    upa.QuestionCount AS UserQuestionCount,
+    upa.AnswerCount AS UserAnswerCount,
+    upa.AverageScore AS UserAverageScore,
+    upa.LastPostCreationDate AS UserLastPostCreationDate,
+    CASE
+        WHEN rp.Score > 0 AND rp.AnswerCount > 0 AND rp.ScoreRank <= 10 THEN 'Top Scorer with Answers'
+        WHEN rp.ViewCount > 10000 AND rp.IsClosed = 0 THEN 'High Traffic Open Post'
+        WHEN rp.CommentCountPerPost > 5 AND rp.Score < 0 THEN 'Contentious Low Score Post'
+        WHEN rp.PostCreationDate < cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year' AND rp.FavoriteCount = 0 THEN 'Old Unpopular Post'
+        WHEN ts.DistinctVoters > 50 AND ts.UpVoteCount > ts.DownVoteCount * 2 THEN 'Highly Voted Popular Post'
+        ELSE 'Standard Post'
+    END AS PostCategory,
+    CASE
+        WHEN LENGTH(rp.Title) > 50 THEN UPPER(SUBSTRING(rp.Title FROM 1 FOR 10)) || '...' || LOWER(SUBSTRING(rp.Title FROM LENGTH(rp.Title) - 10 FOR 10))
+        ELSE rp.Title
+    END AS ProcessedTitle,
+    rp.Score + rp.ViewCount AS CombinedMetric,
+    CASE WHEN rp.OwnerUserId IS NULL THEN 'Community Owned' WHEN u.Reputation > 10000 THEN 'High Rep User' ELSE 'Standard User' END AS OwnerReputationCategory,
+    COALESCE(pht.PostHistoryCount, 0) AS PostHistoryEditCount,
+    COALESCE(pl.DuplicateLinks, 0) AS DuplicateLinkCount,
+    CASE
+        WHEN rp.PostTypeId = 1 AND rp.Score > 100 THEN 'Highly Rated Question'
+        WHEN rp.PostTypeId = 2 AND ts.UpVoteCount > 50 THEN 'Highly Rated Answer'
+        ELSE 'Other Post Type'
+    END AS QualityIndicator
+FROM RankedPosts rp
+LEFT JOIN TagScores ts ON rp.PostId = ts.PostId
+LEFT JOIN UserPostActivity upa ON rp.OwnerUserId = upa.UserId
+LEFT JOIN (
+    SELECT PostId, COUNT(*) AS PostHistoryCount
+    FROM PostHistory
+    WHERE PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+    GROUP BY PostId
+) pht ON rp.PostId = pht.PostId
+LEFT JOIN (
+    SELECT PostId, COUNT(*) AS DuplicateLinks
+    FROM PostLinks
+    WHERE LinkTypeId = 3 -- Duplicate link
+    GROUP BY PostId
+) pl ON rp.PostId = pl.PostId
+WHERE rp.ScoreRank <= 50 OR rp.ViewRank <= 50 OR ts.DistinctVoters > 100;

@@ -1,0 +1,133 @@
+WITH recent_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.AcceptedAnswerId
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days'
+),
+tag_summary AS (
+  SELECT
+    tag_name,
+    COUNT(*) AS questions_in_tag,
+    AVG(r.score) AS avg_score,
+    SUM(r.ViewCount) AS total_views,
+    MAX(r.LastActivityDate) AS last_activity
+  FROM recent_questions r,
+       LATERAL (SELECT unnest(string_to_array(substr(r.tags, 2, length(r.tags) - 2), '><')) AS tag_name) u
+  GROUP BY tag_name
+),
+top_tags AS (
+  SELECT
+    t.tag_name,
+    t.questions_in_tag,
+    t.avg_score,
+    t.total_views,
+    t.last_activity
+  FROM tag_summary t
+  ORDER BY t.questions_in_tag DESC, t.total_views DESC
+  LIMIT 20
+),
+complex_joins AS (
+  SELECT
+    q.PostId,
+    q.Title,
+    q.CreationDate,
+    q.Score AS question_score,
+    a.Id AS AnswerId,
+    a.Score AS answer_score,
+    c.Id AS CommentId,
+    c.Score AS comment_score,
+    v1.Creator AS dummy
+  FROM recent_questions q
+  LEFT JOIN Posts a ON a.ParentId = q.PostId AND a.PostTypeId = 2
+  LEFT JOIN Comments c ON c.PostId = q.PostId
+  LEFT JOIN Votes v1 ON v1.PostId = q.PostId
+  WHERE q.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1)
+  GROUP BY q.PostId, q.Title, q.CreationDate, q.Score, a.Id, a.Score, c.Id, c.Score, v1.Creator
+),
+window_analytic AS (
+  SELECT
+    q.PostId,
+    q.Title,
+    q.CreationDate,
+    q.ViewCount,
+    SUM(q.ViewCount) OVER (ORDER BY q.CreationDate ROWS BETWEEN 29 PRECEDING AND CURRENT ROW) AS rolling_views_30d,
+    AVG(q.Score) OVER (ORDER BY q.CreationDate ROWS BETWEEN 49 PRECEDING AND CURRENT ROW) AS rolling_avg_score
+  FROM recent_questions q
+),
+correlated_subquery AS (
+  SELECT
+    q.PostId,
+    q.Title,
+    (SELECT COUNT(*) FROM Posts p2 WHERE p2.ParentId = q.PostId AND p2.PostTypeId = 2) AS answer_count,
+    (SELECT AVG(Score) FROM Votes v WHERE v.PostId = q.PostId AND v.VoteTypeId = 2) AS avg_upvotes
+  FROM recent_questions q
+  GROUP BY q.PostId, q.Title
+),
+set_ops AS (
+  SELECT PostId, Title
+  FROM recent_questions
+  WHERE Title ILIKE '%performance%'
+  UNION ALL
+  SELECT PostId, Title
+  FROM top_tags
+  WHERE questions_in_tag > 0
+),
+final AS (
+  SELECT
+    r.PostId,
+    r.Title,
+    r.CreationDate,
+    r.ViewCount,
+    r.Score AS question_score,
+    t.tag_name AS top_tag,
+    w.rolling_views_30d,
+    w.rolling_avg_score,
+    c2.answer_count,
+    c2.avg_upvotes,
+    s.PostId AS set_post_id
+  FROM recent_questions r
+  LEFT JOIN window_analytic w ON w.PostId = r.PostId
+  LEFT JOIN correlated_subquery c2 ON c2.PostId = r.PostId
+  LEFT JOIN LATERAL (
+    SELECT unnest(string_to_array(substr(r.Tags, 2, length(r.Tags) - 2), '><')) AS tag_name
+  ) t ON TRUE
+  LEFT JOIN set_ops s ON s.PostId = r.PostId
+  GROUP BY
+    r.PostId,
+    r.Title,
+    r.CreationDate,
+    r.ViewCount,
+    r.Score,
+    t.tag_name,
+    w.rolling_views_30d,
+    w.rolling_avg_score,
+    c2.answer_count,
+    c2.avg_upvotes,
+    s.PostId
+)
+SELECT
+  f.PostId,
+  f.Title,
+  f.CreationDate,
+  f.ViewCount,
+  f.question_score,
+  f.top_tag,
+  f.rolling_views_30d,
+  f.rolling_avg_score,
+  f.answer_count,
+  f.avg_upvotes,
+  f.set_post_id
+FROM final f
+ORDER BY f.CreationDate DESC
+LIMIT 100;

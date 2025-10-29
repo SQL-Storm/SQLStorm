@@ -1,0 +1,147 @@
+WITH PostEngagement AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate AS PostCreationDate,
+        COUNT(c.Id) AS CommentCountForPost,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+        CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN 1 ELSE 0 END AS IsCommunityOwned,
+        DENSE_RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS ScoreRank,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) AS RecentPostOrder
+    FROM
+        Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (2, 3)
+    GROUP BY
+        p.Id, p.OwnerUserId, p.PostTypeId, p.Score, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.CreationDate, p.ClosedDate, p.CommunityOwnedDate
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.Views AS UserViews,
+        u.UpVotes AS UserUpVotes,
+        u.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(b.Date) AS LastBadgeDate,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UserUpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS UserDownVoteCount,
+        COUNT(DISTINCT ph.Id) AS PostHistoryCount,
+        MAX(ph.CreationDate) AS LastPostHistoryDate
+    FROM
+        Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId AND v.VoteTypeId IN (2, 3)
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Views, u.UpVotes, u.DownVotes
+),
+PostAnalysis AS (
+    SELECT
+        pe.PostId,
+        pe.PostTypeId,
+        pt.Name AS PostTypeName,
+        pe.OwnerUserId,
+        ua.DisplayName AS OwnerDisplayName,
+        ua.Reputation AS OwnerReputation,
+        pe.Score,
+        pe.ScoreRank,
+        pe.RecentPostOrder,
+        pe.AnswerCount,
+        pe.CommentCountForPost,
+        pe.UpVoteCount,
+        pe.DownVoteCount,
+        pe.IsClosed,
+        pe.IsCommunityOwned,
+        CASE WHEN pe.Score > 0 THEN 'Positive' WHEN pe.Score < 0 THEN 'Negative' ELSE 'Neutral' END AS ScoreCategory,
+        pe.PostCreationDate,
+        ua.UserCreationDate AS OwnerAccountCreationDate,
+        CAST(EXTRACT(EPOCH FROM (pe.PostCreationDate - ua.UserCreationDate)) / 86400 AS INTEGER) AS DaysSinceOwnerAccountCreation,
+        (ua.DisplayName || ' (' || ua.Reputation || ')') AS OwnerInfo
+    FROM
+        PostEngagement pe
+    JOIN PostTypes pt ON pe.PostTypeId = pt.Id
+    LEFT JOIN UserActivity ua ON pe.OwnerUserId = ua.UserId
+    WHERE
+        pe.PostTypeId IN (1, 2)
+        AND pe.Score >= -5
+        AND pe.PostCreationDate BETWEEN DATE '2023-01-01' AND DATE '2023-12-31'
+)
+SELECT
+    pa.PostId,
+    pa.PostTypeName,
+    pa.OwnerInfo,
+    pa.Score,
+    pa.ScoreCategory,
+    pa.AnswerCount,
+    pa.CommentCountForPost,
+    pa.UpVoteCount,
+    pa.DownVoteCount,
+    pa.IsClosed,
+    pa.IsCommunityOwned,
+    pa.DaysSinceOwnerAccountCreation,
+    ua_last_editor.DisplayName AS LastEditorDisplayName,
+    ua_last_editor.Reputation AS LastEditorReputation,
+    CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - pa.PostCreationDate)) / 86400 AS INTEGER) AS DaysSinceCreation,
+    CASE WHEN pa.ScoreRank <= 10 THEN 'Top 10 in Type' WHEN pa.RecentPostOrder <= 20 THEN 'Recently Posted' ELSE 'Other' END AS PostStatusCategory,
+    CASE WHEN pa.OwnerReputation > 50000 AND pa.Score > 100 THEN 'High Reputation Author, High Score Post' WHEN pa.OwnerReputation < 1000 AND pa.Score < 0 THEN 'Low Reputation Author, Negative Score Post' ELSE 'Standard Post' END AS AuthorScoreProfile,
+    COALESCE(pa.OwnerDisplayName, 'Community') AS FinalOwnerDisplayName,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = pa.PostId AND pl.LinkTypeId = 3) AS DuplicateLinkCount
+FROM
+    PostAnalysis pa
+LEFT JOIN Users u_last_editor ON (
+    SELECT ph.UserId
+    FROM PostHistory ph
+    WHERE ph.PostId = pa.PostId AND ph.PostHistoryTypeId IN (4, 5, 6)
+    ORDER BY ph.CreationDate DESC
+    LIMIT 1
+) = u_last_editor.Id
+LEFT JOIN UserActivity ua_last_editor ON u_last_editor.Id = ua_last_editor.UserId
+WHERE
+    pa.OwnerReputation > 100 OR pa.IsCommunityOwned = 1
+
+UNION ALL
+
+SELECT
+    pa.PostId,
+    pa.PostTypeName,
+    pa.OwnerInfo,
+    pa.Score,
+    pa.ScoreCategory,
+    pa.AnswerCount,
+    pa.CommentCountForPost,
+    pa.UpVoteCount,
+    pa.DownVoteCount,
+    pa.IsClosed,
+    pa.IsCommunityOwned,
+    pa.DaysSinceOwnerAccountCreation,
+    ua_last_editor.DisplayName AS LastEditorDisplayName,
+    ua_last_editor.Reputation AS LastEditorReputation,
+    CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - pa.PostCreationDate)) / 86400 AS INTEGER) AS DaysSinceCreation,
+    CASE WHEN pa.ScoreRank <= 10 THEN 'Top 10 in Type' WHEN pa.RecentPostOrder <= 20 THEN 'Recently Posted' ELSE 'Other' END AS PostStatusCategory,
+    CASE WHEN pa.OwnerReputation > 50000 AND pa.Score > 100 THEN 'High Reputation Author, High Score Post' WHEN pa.OwnerReputation < 1000 AND pa.Score < 0 THEN 'Low Reputation Author, Negative Score Post' ELSE 'Standard Post' END AS AuthorScoreProfile,
+    COALESCE(pa.OwnerDisplayName, 'Community') AS FinalOwnerDisplayName,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = pa.PostId AND pl.LinkTypeId = 3) AS DuplicateLinkCount
+FROM
+    PostAnalysis pa
+LEFT JOIN Users u_last_editor ON (
+    SELECT ph.UserId
+    FROM PostHistory ph
+    WHERE ph.PostId = pa.PostId AND ph.PostHistoryTypeId IN (4, 5, 6)
+    ORDER BY ph.CreationDate DESC
+    LIMIT 1
+) = u_last_editor.Id
+LEFT JOIN UserActivity ua_last_editor ON u_last_editor.Id = ua_last_editor.UserId
+WHERE
+    pa.OwnerReputation <= 100 AND pa.IsCommunityOwned = 0
+ORDER BY
+    Score DESC, PostCreationDate DESC;

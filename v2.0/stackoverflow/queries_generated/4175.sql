@@ -1,0 +1,121 @@
+-- {"query": "4175.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1284} 
+
+WITH RankedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        pt.Name AS PostTypeName,
+        ROW_NUMBER() OVER(PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn_user_post,
+        DENSE_RANK() OVER(ORDER BY p.Score DESC) as dr_overall_score,
+        CASE
+            WHEN p.AnswerCount IS NULL THEN 0
+            ELSE p.AnswerCount
+        END AS CalculatedAnswerCount,
+        LAG(p.Score, 1, 0) OVER (ORDER BY p.CreationDate) as PreviousScore,
+        LEAD(p.Score, 1, 0) OVER (ORDER BY p.CreationDate) as NextScore
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.OwnerUserId IS NOT NULL
+      AND p.CreationDate >= '2023-01-01'
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT rp.PostId) AS TotalPosts,
+        SUM(rp.CalculatedAnswerCount) AS TotalAnswersPublished,
+        AVG(rp.Score) AS AveragePostScore,
+        MAX(rp.PostCreationDate) AS LatestPostDate
+    FROM Users u
+    LEFT JOIN RankedPosts rp ON u.Id = rp.OwnerUserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+RecentQuestions AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title AS QuestionTitle,
+        u.DisplayName AS OwnerDisplayName,
+        p.CreationDate AS QuestionCreationDate,
+        p.Score AS QuestionScore,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id AND c.CreationDate >= DATE_SUB(p.CreationDate, INTERVAL 7 DAY)) AS CommentsLastWeek,
+        CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Accepted' ELSE 'Not Accepted' END AS AcceptanceStatus
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE pt.Name = 'Question'
+      AND p.CreationDate >= DATE_SUB(NOW(), INTERVAL 30 DAY)
+),
+HighReputationUsers AS (
+    SELECT
+        Id,
+        DisplayName,
+        Reputation
+    FROM Users
+    WHERE Reputation > 50000
+),
+PostMetaData AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        u.DisplayName AS OwnerDisplayName,
+        COALESCE(p.OwnerDisplayName, u.DisplayName) AS EffectiveOwnerName,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS PostStatus,
+        SUBSTRING_INDEX(p.Tags, '><', 1) AS FirstTag
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+)
+SELECT
+    pm.PostId,
+    pm.Title AS PostTitle,
+    pm.EffectiveOwnerName,
+    pt.Name AS PostType,
+    pm.PostStatus,
+    pm.Score,
+    pm.ViewCount,
+    pm.CommentCount,
+    pm.FavoriteCount,
+    pm.FirstTag,
+    COALESCE(rq.QuestionScore, 0) AS RecentQuestionScore,
+    COALESCE(rq.AcceptanceStatus, 'N/A') AS RecentQuestionAcceptance,
+    COALESCE(rq.CommentsLastWeek, 0) AS RecentQuestionCommentsLastWeek,
+    hr.DisplayName AS HighRepUserDisplayName,
+    ua.TotalPosts,
+    ua.TotalAnswersPublished,
+    ua.AveragePostScore,
+    ua.LatestPostDate,
+    rp.rn_user_post,
+    rp.dr_overall_score,
+    rp.PreviousScore,
+    rp.NextScore,
+    CASE
+        WHEN pm.Score > 100 AND pm.ViewCount > 1000 THEN 'High Performing'
+        WHEN pm.Score < 0 AND pm.CommentCount > 5 THEN 'Controversial'
+        ELSE 'Standard'
+    END AS PerformanceCategory,
+    CASE
+        WHEN pm.ClosedDate IS NOT NULL AND pm.Score > 10 THEN CONCAT('Closed with Score: ', pm.Score)
+        WHEN pm.ViewCount > 5000 THEN CONCAT('High Views: ', pm.ViewCount)
+        ELSE 'Normal Activity'
+    END AS ActivityDescription
+FROM PostMetaData pm
+LEFT JOIN PostTypes pt ON pm.PostTypeId = pt.Id
+LEFT JOIN RecentQuestions rq ON pm.PostId = rq.QuestionId
+LEFT JOIN PostLinks pl ON pm.PostId = pl.PostId OR pm.PostId = pl.RelatedPostId
+LEFT JOIN HighReputationUsers hr ON pl.PostId = hr.Id OR pl.RelatedPostId = hr.Id
+LEFT JOIN UserActivity ua ON pm.OwnerUserId = ua.UserId
+LEFT JOIN RankedPosts rp ON pm.PostId = rp.PostId
+WHERE pm.Score > 0
+   OR pm.ViewCount > 0
+ORDER BY pm.Score DESC, pm.ViewCount DESC
+LIMIT 100;

@@ -1,0 +1,147 @@
+WITH
+  RankedPostEdits AS (
+    SELECT
+      ph.PostId,
+      ph.UserId,
+      ph.PostHistoryTypeId,
+      ph.CreationDate,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6)
+  ),
+  LatestEdits AS (
+    SELECT
+      rpe.PostId,
+      rpe.UserId AS LastEditorUserId,
+      rpe.CreationDate AS LastEditDate
+    FROM RankedPostEdits rpe
+    WHERE rpe.rn = 1
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      COUNT(DISTINCT p.Id) AS QuestionCount,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount
+    FROM Users u
+    LEFT JOIN Posts p
+      ON u.Id = p.OwnerUserId
+    LEFT JOIN Votes v
+      ON u.Id = v.UserId
+    GROUP BY u.Id
+  ),
+  PostTags AS (
+    SELECT
+      p.Id AS PostId,
+      CASE
+        WHEN CHARINDEX('>', p.Tags, 2) > 0 THEN SUBSTRING(p.Tags, 2, CHARINDEX('>', p.Tags, 2) - 2)
+        ELSE NULL
+      END AS TagName,
+      CASE
+        WHEN CHARINDEX('>', p.Tags, 2) > 0 THEN SUBSTRING(p.Tags, CHARINDEX('>', p.Tags, 2) + 1, LEN(p.Tags))
+        ELSE NULL
+      END AS Remainder,
+      p.Tags AS FullTags
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.Tags IS NOT NULL
+    UNION ALL
+    SELECT
+      pt.PostId,
+      CASE
+        WHEN CHARINDEX('>', pt.Remainder, 1) > 0 AND LEFT(pt.Remainder,1) = '<' THEN SUBSTRING(pt.Remainder, 2, CHARINDEX('>', pt.Remainder, 1) - 2)
+        ELSE NULL
+      END AS TagName,
+      CASE
+        WHEN CHARINDEX('>', pt.Remainder, 1) > 0 THEN SUBSTRING(pt.Remainder, CHARINDEX('>', pt.Remainder, 1) + 1, LEN(pt.Remainder))
+        ELSE NULL
+      END AS Remainder,
+      pt.FullTags
+    FROM PostTags pt
+    WHERE pt.Remainder IS NOT NULL AND pt.Remainder <> '' AND CHARINDEX('<', pt.Remainder) > 0
+  ),
+  TagEngagement AS (
+    SELECT
+      p.Id AS PostId,
+      ptp.Name AS PostTypeName,
+      t.TagName,
+      CASE
+        WHEN ph.PostHistoryTypeId = 6 THEN 'Edited'
+        WHEN ph.PostHistoryTypeId = 3 THEN 'Initial'
+        ELSE 'Other'
+      END AS TagHistoryType,
+      COUNT(ph.Id) AS TagHistoryCount,
+      ROW_NUMBER() OVER (PARTITION BY p.Id, t.TagName ORDER BY ph.CreationDate DESC) AS rn_tag,
+      ph.PostHistoryTypeId,
+      ph.CreationDate
+    FROM Posts p
+    JOIN PostTypes ptp
+      ON p.PostTypeId = ptp.Id
+    LEFT JOIN PostHistory ph
+      ON p.Id = ph.PostId
+      AND ph.PostHistoryTypeId IN (3, 6)
+    JOIN (
+      SELECT DISTINCT PostId, TagName
+      FROM PostTags
+      WHERE TagName IS NOT NULL
+    ) ptags
+      ON p.Id = ptags.PostId
+    JOIN Tags t
+      ON ptags.TagName = t.TagName
+    WHERE p.PostTypeId = 1
+    GROUP BY
+      p.Id,
+      ptp.Name,
+      t.TagName,
+      ph.PostHistoryTypeId,
+      ph.CreationDate
+  )
+SELECT
+  p.Id AS PostId,
+  pt.Name AS PostType,
+  p.Title,
+  p.CreationDate AS PostCreationDate,
+  p.OwnerUserId,
+  u.DisplayName AS OwnerDisplayName,
+  le.LastEditorUserId,
+  le.LastEditDate,
+  ua.QuestionCount,
+  ua.AnswerCount,
+  ua.UpVoteCount,
+  ua.DownVoteCount,
+  (
+    SELECT COUNT(c.Id)
+    FROM Comments c
+    WHERE c.PostId = p.Id
+      AND c.UserId IS NOT NULL
+  ) AS CommenterCount,
+  COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+  p.ClosedDate,
+  CASE WHEN p.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS PostStatus,
+  te.TagName,
+  te.TagHistoryType,
+  te.TagHistoryCount
+FROM Posts p
+JOIN PostTypes pt
+  ON p.PostTypeId = pt.Id
+LEFT JOIN Users u
+  ON p.OwnerUserId = u.Id
+LEFT JOIN LatestEdits le
+  ON p.Id = le.PostId
+LEFT JOIN UserActivity ua
+  ON u.Id = ua.UserId
+LEFT JOIN TagEngagement te
+  ON p.Id = te.PostId
+  AND te.rn_tag = 1
+WHERE
+  p.Id BETWEEN 1 AND 10000
+  AND p.CreationDate >= DATE '2023-01-01'
+  AND (
+    u.DisplayName LIKE '%John%'
+    OR u.Location IS NULL
+  )
+  AND pt.Name IN ('Question', 'Answer')
+ORDER BY
+  p.LastActivityDate DESC
+LIMIT 100;

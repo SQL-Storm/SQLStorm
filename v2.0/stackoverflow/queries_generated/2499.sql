@@ -1,0 +1,155 @@
+-- {"query": "2499.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1603} 
+WITH RecursiveTagHierarchy AS (
+    SELECT t.Id, t.TagName, t.Count, 0 AS Level, ARRAY[t.TagName] AS Path
+    FROM Tags t
+    WHERE NOT EXISTS (
+        SELECT 1 FROM Posts p WHERE p.Id = t.ExcerptPostId AND p.PostTypeId = 1
+    )
+    UNION ALL
+    SELECT t.Id, t.TagName, t.Count, rh.Level + 1,
+           rh.Path || t.TagName
+    FROM Tags t
+    JOIN Posts p ON p.Id = t.ExcerptPostId
+    JOIN RecursiveTagHierarchy rh ON p.Tags LIKE '%' || rh.TagName || '%'
+    WHERE t.TagName <> ALL(rh.Path)
+), UserBadgesSummary AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+        COUNT(b.Id) AS TotalBadges
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+), PostVotesAggregated AS (
+    SELECT 
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        COUNT(v.Id) AS TotalVotes,
+        AVG(CASE WHEN v.VoteTypeId IN (2,3) THEN 1.0 ELSE NULL END) OVER (PARTITION BY p.OwnerUserId) AS AvgVotesPerPostByUser
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    GROUP BY p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score
+), LatestPostHistoryEdits AS (
+    SELECT ph.PostId, ph.UserId, ph.UserDisplayName, ph.CreationDate, ph.PostHistoryTypeId,
+           ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+), UserRecentActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        MAX(p.LastActivityDate) AS LastPostActivity,
+        MAX(c.CreationDate) AS LastCommentActivity,
+        GREATEST(
+            COALESCE(MAX(p.LastActivityDate), '1970-01-01'),
+            COALESCE(MAX(c.CreationDate), '1970-01-01')
+        ) AS RecentActivityDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+), CloseReasonsCountPerUser AS (
+    SELECT 
+        ph.UserId,
+        crt.Name AS CloseReason,
+        COUNT(*) AS CloseVotesCount
+    FROM PostHistory ph
+    JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS SMALLINT)
+    WHERE ph.PostHistoryTypeId = 10 AND ph.UserId IS NOT NULL
+    GROUP BY ph.UserId, crt.Name
+), UserAggregated AS (
+    SELECT
+        uba.UserId,
+        uba.DisplayName,
+        uba.GoldBadges,
+        uba.SilverBadges,
+        uba.BronzeBadges,
+        uba.TotalBadges,
+        COALESCE(pr.ScoreAggregated, 0) AS TotalPostScore,
+        COALESCE(pr.AnswerCount, 0) AS AnswerPosts,
+        COALESCE(pr.QuestionCount, 0) AS QuestionPosts,
+        COALESCE(ur.RecentActivityDate, '1970-01-01') AS LastActivity,
+        COALESCE(crc.CloseVotesCount, 0) AS LatestCloseVotes
+    FROM UserBadgesSummary uba
+    LEFT JOIN (
+        SELECT
+            p.OwnerUserId AS UserId,
+            SUM(p.Score) AS ScoreAggregated,
+            COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE NULL END) AS AnswerCount,
+            COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE NULL END) AS QuestionCount
+        FROM Posts p
+        GROUP BY p.OwnerUserId
+    ) pr ON pr.UserId = uba.UserId
+    LEFT JOIN UserRecentActivity ur ON ur.UserId = uba.UserId
+    LEFT JOIN (
+        SELECT UserId, SUM(CloseVotesCount) AS CloseVotesCount
+        FROM CloseReasonsCountPerUser
+        GROUP BY UserId
+    ) crc ON crc.UserId = uba.UserId
+    WHERE uba.TotalBadges > 0
+)
+SELECT DISTINCT 
+    ua.UserId,
+    ua.DisplayName,
+    ua.GoldBadges,
+    ua.SilverBadges,
+    ua.BronzeBadges,
+    ua.TotalBadges,
+    ua.TotalPostScore,
+    ua.AnswerPosts,
+    ua.QuestionPosts,
+    ua.LastActivity,
+    COALESCE(crct.CloseReason, 'No close reasons') AS PreferredCloseReason,
+    CONCAT(
+        'User ', ua.DisplayName, ' with ', ua.TotalBadges, 
+        ' badges and a total score of ', ua.TotalPostScore, '. Last active: ', TO_CHAR(ua.LastActivity, 'YYYY-MM-DD HH24:MI:SS')
+    ) AS Summary,
+    CASE
+        WHEN ua.TotalBadges >= 10 AND ua.TotalPostScore > 1000 THEN 'Elite User'
+        WHEN ua.TotalBadges BETWEEN 5 AND 9 AND ua.TotalPostScore BETWEEN 500 AND 1000 THEN 'Experienced User'
+        ELSE 'New or Casual User'
+    END AS UserCategory
+FROM UserAggregated ua
+LEFT JOIN LATERAL (
+    SELECT crc.CloseReason
+    FROM CloseReasonTypes crt
+    JOIN CloseReasonsCountPerUser crc ON crc.CloseReason = crt.Name AND crc.UserId = ua.UserId
+    ORDER BY crc.CloseVotesCount DESC
+    LIMIT 1
+) crct ON TRUE
+WHERE ua.AnswerPosts > 0
+AND ua.QuestionPosts > 0
+AND ua.LastActivity > NOW() - INTERVAL '1 year'
+ORDER BY ua.TotalPostScore DESC, ua.TotalBadges DESC
+LIMIT 50
+
+UNION
+
+SELECT 
+    p.Id AS UserId,
+    COALESCE(p.OwnerDisplayName, 'Community') AS DisplayName,
+    0 AS GoldBadges,
+    0 AS SilverBadges,
+    0 AS BronzeBadges,
+    0 AS TotalBadges,
+    p.Score AS TotalPostScore,
+    0 AS AnswerPosts,
+    0 AS QuestionPosts,
+    p.LastActivityDate AS LastActivity,
+    'N/A' AS PreferredCloseReason,
+    CONCAT('Orphan post with score ', p.Score, ' last activity on ', TO_CHAR(p.LastActivityDate, 'YYYY-MM-DD')) AS Summary,
+    'Orphan Post' AS UserCategory
+FROM Posts p
+WHERE p.OwnerUserId IS NULL OR p.OwnerUserId = -1
+AND p.PostTypeId = 1
+AND p.Score > 100
+ORDER BY p.Score DESC
+LIMIT 10;

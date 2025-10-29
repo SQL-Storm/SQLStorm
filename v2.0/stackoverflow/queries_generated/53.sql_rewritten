@@ -1,0 +1,341 @@
+-- {"query": "53.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3370} 
+with
+-- Recent active users with engagement metrics
+recent_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.location,
+    u.upvotes,
+    u.downvotes,
+    coalesce(nullif(trim(split_part(coalesce(u.websiteurl, ''), '/', 3)), ''), 'unknown') as website_domain,
+    row_number() over (order by u.reputation desc, u.id) as rn
+  from users u
+  where u.creationdate >= (select date_trunc('year', max(creationdate)) - interval '3 years' from users)
+),
+-- Posts in the last N years with normalized tag arrays
+recent_posts as (
+  select
+    p.id,
+    p.posttypeid,
+    p.owneruserid,
+    p.score,
+    p.viewcount,
+    p.creationdate,
+    p.lastactivitydate,
+    p.title,
+    p.tags,
+    case
+      when p.tags is null then array[]::varchar[]
+      else string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')
+    end as tag_arr,
+    (p.commentcount + coalesce(p.favoritecount, 0)) as discuss_fav,
+    (p.score * greatest(1, coalesce(p.viewcount, 0))) as score_view_product
+  from posts p
+  where p.creationdate >= (select date_trunc('year', max(creationdate)) - interval '3 years' from posts)
+    and p.posttypeid in (1,2) -- questions and answers
+),
+-- Aggregate votes by type for recent posts
+vote_aggs as (
+  select
+    v.postid,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+    sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_total,
+    count(*) as vote_events
+  from votes v
+  where v.creationdate >= (select date_trunc('year', max(creationdate)) - interval '3 years' from votes)
+  group by v.postid
+),
+-- Link relationships (duplicates and linked)
+link_map as (
+  select
+    pl.postid,
+    pl.relatedpostid,
+    pl.linktypeid,
+    lt.name as link_type_name
+  from postlinks pl
+  join linktypes lt on lt.id = pl.linktypeid
+),
+-- Comment sentiment proxy by simple heuristics
+comment_scores as (
+  select
+    c.postid,
+    count(*) as comment_count,
+    sum(case when c.score > 0 then 1 else 0 end) as pos_comments,
+    sum(case when c.score < 0 then 1 else 0 end) as neg_comments,
+    avg(nullif(c.score,0)) as avg_nonzero_comment_score,
+    count(*) filter (where c.text ilike '%thanks%' or c.text ilike '%great%' or c.text ilike '%helpful%') as gratitude_count,
+    count(*) filter (where c.text ilike '%duplicate%' or c.text ilike '%off-topic%' or c.text ilike '%close%') as moderation_hints
+  from comments c
+  where c.creationdate >= (select date_trunc('year', max(creationdate)) - interval '3 years' from comments)
+  group by c.postid
+),
+-- Badge tallies per user and recency
+badge_rollup as (
+  select
+    b.userid,
+    sum(case when b.class = 1 then 1 else 0 end) as gold_count,
+    sum(case when b.class = 2 then 1 else 0 end) as silver_count,
+    sum(case when b.class = 3 then 1 else 0 end) as bronze_count,
+    max(b.date) as last_badge_date,
+    count(*) filter (where b.tagbased = 1) as tag_badges,
+    count(*) filter (where b.tagbased = 0) as named_badges
+  from badges b
+  group by b.userid
+),
+-- Question-Answer mapping for acceptance and answer counts
+qa_map as (
+  select
+    q.id as question_id,
+    q.owneruserid as asker_id,
+    q.acceptedanswerid,
+    q.score as q_score,
+    q.viewcount as q_views,
+    q.creationdate as q_created,
+    q.tag_arr
+  from recent_posts q
+  where q.posttypeid = 1
+),
+answers as (
+  select
+    a.id as answer_id,
+    a.parentid as question_id,
+    a.owneruserid as answerer_id,
+    a.score as a_score,
+    a.creationdate as a_created
+  from recent_posts a
+  where a.posttypeid = 2
+),
+answer_stats as (
+  select
+    a.question_id,
+    count(*) as answer_count,
+    max(a.a_score) as max_answer_score,
+    avg(a.a_score::numeric) as avg_answer_score,
+    min(a.a_created) as first_answer_time,
+    max(a.a_created) as last_answer_time
+  from answers a
+  group by a.question_id
+),
+-- Post history signals (closes, protects, migrations)
+posthistory_flags as (
+  select
+    ph.postid,
+    sum(case when ph.posthistorytypeid = 10 then 1 else 0 end) as close_votes,
+    sum(case when ph.posthistorytypeid = 11 then 1 else 0 end) as reopen_votes,
+    sum(case when ph.posthistorytypeid = 19 then 1 else 0 end) as protected_events,
+    sum(case when ph.posthistorytypeid = 52 then 1 else 0 end) as became_hot_count,
+    max(ph.creationdate) filter (where ph.posthistorytypeid in (10,11,19,52)) as last_mgmt_event
+  from posthistory ph
+  where ph.creationdate >= (select date_trunc('year', max(creationdate)) - interval '3 years' from posthistory)
+  group by ph.postid
+),
+-- Tag popularity joined for each question via unnested tags
+tag_pop as (
+  select
+    q.question_id,
+    avg(t.count::numeric) as avg_tag_popularity,
+    max(t.count) as max_tag_popularity,
+    count(*) as tag_count
+  from qa_map q
+  left join lateral (
+    select unnest(q.tag_arr) as tagname
+  ) ut on true
+  left join tags t on lower(t.tagname) = lower(ut.tagname)
+  group by q.question_id
+),
+-- Normalize acceptance
+accepted_stats as (
+  select
+    q.question_id,
+    case when q.acceptedanswerid is not null then 1 else 0 end as has_accepted,
+    q.acceptedanswerid
+  from qa_map q
+),
+-- Detect duplicates via PostLinks type 3 and PostHistory type 10 with reason 101 in comment JSON/text
+duplicate_signals as (
+  select
+    q.question_id,
+    max(case when lm.linktypeid = 3 then 1 else 0 end) as link_dup_flag,
+    count(distinct lm.relatedpostid) filter (where lm.linktypeid = 3) as dup_targets
+  from qa_map q
+  left join link_map lm on lm.postid = q.question_id
+  group by q.question_id
+),
+-- Synthesize per-question metrics
+question_metrics as (
+  select
+    q.question_id,
+    q.asker_id,
+    q.q_score,
+    q.q_views,
+    q.q_created,
+    coalesce(ans.answer_count, 0) as answer_count,
+    ans.max_answer_score,
+    ans.avg_answer_score,
+    extract(epoch from (ans.first_answer_time - q.q_created)) as secs_to_first_answer,
+    extract(epoch from (ans.last_answer_time - q.q_created)) as secs_to_last_answer,
+    acc.has_accepted,
+    tp.avg_tag_popularity,
+    tp.max_tag_popularity,
+    tp.tag_count,
+    coalesce(v.upvotes,0) as v_up,
+    coalesce(v.downvotes,0) as v_down,
+    coalesce(v.favorites,0) as v_fav,
+    coalesce(v.bounty_total,0) as bounty_total,
+    coalesce(v.vote_events,0) as vote_events,
+    coalesce(c.comment_count,0) as comment_count,
+    coalesce(c.pos_comments,0) as pos_comments,
+    coalesce(c.neg_comments,0) as neg_comments,
+    coalesce(c.gratitude_count,0) as gratitude_count,
+    coalesce(c.moderation_hints,0) as moderation_hints,
+    coalesce(ph.close_votes,0) as close_votes,
+    coalesce(ph.reopen_votes,0) as reopen_votes,
+    coalesce(ph.protected_events,0) as protected_events,
+    coalesce(ph.became_hot_count,0) as became_hot_count,
+    ph.last_mgmt_event,
+    ds.link_dup_flag,
+    ds.dup_targets
+  from qa_map q
+  left join answer_stats ans on ans.question_id = q.question_id
+  left join accepted_stats acc on acc.question_id = q.question_id
+  left join vote_aggs v on v.postid = q.question_id
+  left join comment_scores c on c.postid = q.question_id
+  left join posthistory_flags ph on ph.postid = q.question_id
+  left join tag_pop tp on tp.question_id = q.question_id
+  left join duplicate_signals ds on ds.question_id = q.question_id
+),
+-- Join question metrics back to askers and their badge/user metrics
+user_enriched as (
+  select
+    qm.*,
+    ru.displayname as asker_name,
+    ru.reputation as asker_rep,
+    ru.location as asker_location,
+    br.gold_count,
+    br.silver_count,
+    br.bronze_count,
+    br.tag_badges,
+    br.named_badges,
+    br.last_badge_date,
+    ru.website_domain
+  from question_metrics qm
+  left join recent_users ru on ru.user_id = qm.asker_id
+  left join badge_rollup br on br.userid = qm.asker_id
+),
+-- Rank questions per user by custom engagement score
+scored as (
+  select
+    ue.*,
+    (
+      (coalesce(ue.q_score,0) * 3)
+      + (coalesce(ue.v_up,0) - coalesce(ue.v_down,0)) * 2
+      + (coalesce(ue.v_fav,0) * 4)
+      + (least(coalesce(ue.answer_count,0), 10) * 1.5)
+      + (case when ue.has_accepted = 1 then 10 else 0 end)
+      + (least(coalesce(ue.q_views,0), 100000) / 500.0)
+      + (least(coalesce(ue.gratitude_count,0), 10) * 0.5)
+      - (coalesce(ue.close_votes,0) * 2)
+      - (coalesce(ue.moderation_hints,0) * 0.5)
+      + (case when ue.became_hot_count > 0 then 15 else 0 end)
+    )::numeric(18,4) as engagement_score
+  from user_enriched ue
+),
+-- Window analytics for distribution
+analytics as (
+  select
+    s.*,
+    ntile(10) over (order by engagement_score desc nulls last) as score_decile,
+    row_number() over (partition by asker_id order by engagement_score desc, question_id) as user_rank,
+    rank() over (order by engagement_score desc, coalesce(q_views,0) desc) as global_rank,
+    avg(engagement_score) over () as global_avg_score,
+    stddev_pop(engagement_score) over () as global_stddev,
+    avg(engagement_score) over (partition by coalesce(website_domain,'unknown')) as domain_avg_score
+  from scored s
+),
+-- Build a small dimension for status labels
+status_labels as (
+  select 1 as code, 'top' as label
+  union all select 2, 'above_avg'
+  union all select 3, 'avg'
+  union all select 4, 'below_avg'
+)
+select
+  a.question_id,
+  coalesce(a.asker_name, '[unknown]') as asker_name,
+  a.asker_id,
+  a.asker_rep,
+  coalesce(a.asker_location, 'n/a') as asker_location,
+  coalesce(a.website_domain, 'unknown') as website_domain,
+  a.q_score,
+  a.q_views,
+  a.answer_count,
+  a.has_accepted,
+  a.v_up,
+  a.v_down,
+  a.v_fav,
+  a.bounty_total,
+  a.comment_count,
+  a.gratitude_count,
+  a.moderation_hints,
+  a.close_votes,
+  a.reopen_votes,
+  a.protected_events,
+  a.became_hot_count,
+  a.link_dup_flag,
+  a.dup_targets,
+  a.avg_tag_popularity,
+  a.max_tag_popularity,
+  a.tag_count,
+  a.engagement_score,
+  a.score_decile,
+  a.user_rank,
+  a.global_rank,
+  round(a.engagement_score - a.global_avg_score, 2) as score_delta_from_mean,
+  case
+    when a.engagement_score >= a.global_avg_score + coalesce(nullif(a.global_stddev,0), 0)::numeric then 'above_stddev'
+    when a.engagement_score <= a.global_avg_score - coalesce(nullif(a.global_stddev,0), 0)::numeric then 'below_stddev'
+    else 'within_stddev'
+  end as stddev_bucket,
+  sl.label as coarse_label,
+  -- String expressions
+  coalesce('Q' || a.question_id::text || ' by ' || coalesce(a.asker_name,'[unknown]') || ' (' || coalesce(a.asker_location,'n/a') || ')', 'Q?') as summary,
+  -- Correlated scalar subquery: time since last activity or last mgmt event
+  extract(epoch from (
+    coalesce(
+      (select p.lastactivitydate from posts p where p.id = a.question_id),
+      a.last_mgmt_event,
+      cast('2024-10-01 12:34:56' as timestamp)
+    ) - a.q_created
+  )) as secs_since_created_to_last_activity
+from analytics a
+left join lateral (
+  select
+    case
+      when a.engagement_score >= a.global_avg_score + greatest(a.global_stddev, 0) then 1
+      when a.engagement_score >= a.global_avg_score then 2
+      when a.engagement_score >= a.global_avg_score - greatest(a.global_stddev, 0) then 3
+      else 4
+    end as status_code
+) st on true
+left join status_labels sl on sl.code = st.status_code
+where
+  -- Complicated predicates: ensure data richness
+  (a.answer_count >= 1 or a.v_fav >= 1 or a.became_hot_count > 0)
+  and (a.q_views is not null and a.q_views > 0)
+  and (a.engagement_score is not null)
+  and (a.asker_rep is null or a.asker_rep >= 1)
+  and (
+    a.stddev_bucket <> 'below_stddev'
+    or (a.close_votes = 0 and coalesce(a.link_dup_flag,0) = 0)
+  )
+order by
+  a.score_decile asc,
+  a.user_rank asc,
+  a.engagement_score desc,
+  a.question_id
+limit 500;

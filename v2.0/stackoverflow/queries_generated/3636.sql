@@ -1,0 +1,124 @@
+-- {"query": "3636.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 3007} 
+
+WITH
+    user_posts AS (
+        SELECT
+            u.Id                                                       AS user_id,
+            u.DisplayName,
+            u.Reputation,
+            COUNT(p.Id)                                                AS total_posts,
+            SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END)   AS q_score_sum,
+            SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END)   AS a_score_sum,
+            MAX(p.CreationDate)                                        AS last_post_date,
+            (SELECT COUNT(*) 
+               FROM Posts p2 
+              WHERE p2.OwnerUserId = u.Id AND p2.Score > 0)           AS positive_post_cnt
+        FROM Users u
+        LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+        GROUP BY u.Id, u.DisplayName, u.Reputation
+    ),
+    user_badges AS (
+        SELECT
+            b.UserId,
+            COUNT(*)                                                       AS badge_cnt,
+            SUM(CASE b.Class WHEN 1 THEN 1000 WHEN 2 THEN 500 ELSE 100 END) AS badge_points
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+    tag_usage AS (
+        SELECT
+            t.TagName,
+            COUNT(*) AS tag_cnt
+        FROM Tags t
+        JOIN LATERAL (
+            SELECT trim(both '<>' FROM unnest(string_to_array(p.Tags, '><'))) AS tag
+            FROM Posts p
+            WHERE p.PostTypeId = 1
+        ) pt ON pt.tag = t.TagName
+        GROUP BY t.TagName
+    ),
+    top_tags AS (
+        SELECT
+            TagName,
+            tag_cnt,
+            ROW_NUMBER() OVER (ORDER BY tag_cnt DESC) AS rn
+        FROM tag_usage
+    ),
+    vote_agg AS (
+        SELECT
+            v.PostId,
+            COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS up_votes,
+            COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS down_votes
+        FROM Votes v
+        GROUP BY v.PostId
+    ),
+    post_votes AS (
+        SELECT
+            p.OwnerUserId,
+            SUM(COALESCE(va.up_votes,0))   AS total_up_votes,
+            SUM(COALESCE(va.down_votes,0)) AS total_down_votes
+        FROM Posts p
+        LEFT JOIN vote_agg va ON va.PostId = p.Id
+        GROUP BY p.OwnerUserId
+    ),
+    combined AS (
+        SELECT
+            up.user_id,
+            up.DisplayName,
+            up.Reputation,
+            up.total_posts,
+            up.q_score_sum,
+            up.a_score_sum,
+            up.last_post_date,
+            up.positive_post_cnt,
+            COALESCE(ub.badge_cnt,0)      AS badge_cnt,
+            COALESCE(ub.badge_points,0)   AS badge_points,
+            COALESCE(pv.total_up_votes,0) AS total_up_votes,
+            COALESCE(pv.total_down_votes,0) AS total_down_votes
+        FROM user_posts up
+        LEFT JOIN user_badges ub ON ub.UserId = up.user_id
+        LEFT JOIN post_votes pv  ON pv.OwnerUserId = up.user_id
+    )
+SELECT
+    c.user_id,
+    c.DisplayName,
+    c.Reputation,
+    c.total_posts,
+    c.q_score_sum,
+    c.a_score_sum,
+    c.positive_post_cnt,
+    c.badge_cnt,
+    c.badge_points,
+    c.total_up_votes,
+    c.total_down_votes,
+    c.last_post_date,
+    tt.TagName,
+    tt.tag_cnt
+FROM combined c
+FULL OUTER JOIN (
+    SELECT TagName, tag_cnt
+    FROM top_tags
+    WHERE rn <= 5
+) tt ON TRUE
+WHERE c.Reputation > 1000
+ORDER BY c.Reputation DESC NULLS LAST, c.total_posts DESC
+
+UNION ALL
+
+SELECT
+    NULL                             AS user_id,
+    'SUMMARY'                        AS DisplayName,
+    SUM(c.Reputation)                AS Reputation,
+    SUM(c.total_posts)               AS total_posts,
+    SUM(c.q_score_sum)               AS q_score_sum,
+    SUM(c.a_score_sum)               AS a_score_sum,
+    SUM(c.positive_post_cnt)         AS positive_post_cnt,
+    SUM(c.badge_cnt)                 AS badge_cnt,
+    SUM(c.badge_points)              AS badge_points,
+    SUM(c.total_up_votes)            AS total_up_votes,
+    SUM(c.total_down_votes)          AS total_down_votes,
+    MAX(c.last_post_date)            AS last_post_date,
+    NULL                             AS TagName,
+    NULL                             AS tag_cnt
+FROM combined c
+WHERE c.Reputation > 1000;

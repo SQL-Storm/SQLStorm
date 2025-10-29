@@ -1,0 +1,332 @@
+with
+recent_users as (
+    select u.id as user_id,
+           u.displayname,
+           u.reputation,
+           cast(u.creationdate as date) as joined_date,
+           coalesce(nullif(trim(u.location), ''), 'Unknown') as location_norm
+    from users u
+    where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+tag_exploded as (
+    select p.id as post_id,
+           lower(t) as tag
+    from posts p
+    cross join lateral unnest(
+        case
+            when p.tags is null then cast(array[] as varchar[])
+            else string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')
+        end
+    ) as t
+    where p.posttypeid = 1
+),
+popular_tags as (
+    select tag, count(*) as q_cnt
+    from tag_exploded
+    group by tag
+    having count(*) > 50
+),
+post_stats as (
+    select p.id as post_id,
+           p.posttypeid,
+           p.owneruserid,
+           p.creationdate,
+           p.score,
+           p.viewcount,
+           p.answercount,
+           (cast(p.score as numeric) / nullif(greatest(1, date_part('day', cast('2024-10-01 12:34:56' as timestamp) - coalesce(p.creationdate, cast('2024-10-01 12:34:56' as timestamp)))), 0)) as score_per_day,
+           case when p.closeddate is null then 0 else 1 end as is_closed
+    from posts p
+    where p.posttypeid in (1,2)
+),
+votes_agg as (
+    select v.postid,
+           sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+           sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+           sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+           count(*) as total_votes,
+           max(v.creationdate) as last_vote_at
+    from votes v
+    group by v.postid
+),
+comments_agg as (
+    select c.postid,
+           count(*) as comment_count,
+           max(c.creationdate) as last_comment_at,
+           sum(case when c.score > 0 then 1 else 0 end) as pos_comments
+    from comments c
+    group by c.postid
+),
+postlinks_agg as (
+    select pl.postid,
+           sum(case when pl.linktypeid = 1 then 1 else 0 end) as linked_cnt,
+           sum(case when pl.linktypeid = 3 then 1 else 0 end) as duplicate_cnt,
+           count(*) as links_total
+    from postlinks pl
+    group by pl.postid
+),
+posthistory_flags as (
+    select ph.postid,
+           sum(case when ph.posthistorytypeid in (10,11,12,13,14,15,19,20,35) then 1 else 0 end) as mod_events,
+           sum(case when ph.posthistorytypeid = 10 then 1 else 0 end) as closes,
+           sum(case when ph.posthistorytypeid = 11 then 1 else 0 end) as reopens,
+           sum(case when ph.posthistorytypeid in (24) then 1 else 0 end) as suggested_edits,
+           max(ph.creationdate) as last_history_at
+    from posthistory ph
+    group by ph.postid
+),
+user_badges as (
+    select b.userid,
+           count(*) filter (where b.class = 1) as gold_badges,
+           count(*) filter (where b.class = 2) as silver_badges,
+           count(*) filter (where b.class = 3) as bronze_badges,
+           count(*) filter (where cast(b.tagbased as integer) = 1) as tag_badges,
+           count(*) as total_badges,
+           max(b.date) as last_badge_date
+    from badges b
+    group by b.userid
+),
+question_answer_pairs as (
+    select q.id as question_id,
+           a.id as answer_id,
+           a.owneruserid as answerer_id,
+           a.score as answer_score,
+           row_number() over (partition by q.id order by a.score desc nulls last, a.creationdate asc) as rn_best_by_score,
+           row_number() over (partition by q.id order by a.creationdate asc) as rn_first_answer
+    from posts q
+    left join posts a
+      on a.parentid = q.id
+     and a.posttypeid = 2
+    where q.posttypeid = 1
+),
+best_answers as (
+    select question_id,
+           answer_id,
+           answerer_id,
+           answer_score,
+           rn_best_by_score,
+           rn_first_answer
+    from question_answer_pairs
+    where rn_best_by_score = 1
+),
+user_engagement as (
+    select u.id as user_id,
+           count(distinct p.id) filter (where p.posttypeid = 1) as questions_asked,
+           count(distinct p.id) filter (where p.posttypeid = 2) as answers_posted,
+           sum(coalesce(v.total_votes,0)) as votes_received,
+           sum(coalesce(ca.comment_count,0)) as comments_received,
+           avg(p.score) filter (where p.posttypeid in (1,2)) as avg_post_score,
+           max(p.creationdate) as last_post_at
+    from users u
+    left join posts p on p.owneruserid = u.id
+    left join votes_agg v on v.postid = p.id
+    left join comments_agg ca on ca.postid = p.id
+    group by u.id
+),
+tag_quality as (
+    select te.tag,
+           count(distinct q.post_id) as q_count,
+           avg(ps.score) as avg_q_score,
+           avg(ps.viewcount) as avg_q_views,
+           avg(coalesce(va.upvotes,0) - coalesce(va.downvotes,0)) as avg_net_votes,
+           sum(case when ph.closes > 0 then 1 else 0 end) as closed_q,
+           count(*) filter (where ba.answer_id is not null) as with_answers
+    from tag_exploded te
+    join post_stats ps on ps.post_id = te.post_id and ps.posttypeid = 1
+    left join votes_agg va on va.postid = te.post_id
+    left join posthistory_flags ph on ph.postid = te.post_id
+    left join best_answers ba on ba.question_id = te.post_id
+    group by te.tag
+),
+ranked_users as (
+    select
+        ru.user_id,
+        ru.displayname,
+        ru.location_norm,
+        ue.questions_asked,
+        ue.answers_posted,
+        ue.votes_received,
+        ue.comments_received,
+        ue.avg_post_score,
+        ub.total_badges,
+        ub.gold_badges,
+        ub.silver_badges,
+        ub.bronze_badges,
+        coalesce(ue.answers_posted,0) + coalesce(ue.questions_asked,0) as total_posts,
+        dense_rank() over (order by coalesce(ue.answers_posted,0) desc, coalesce(ue.avg_post_score,0) desc) as dr_answerers,
+        dense_rank() over (order by coalesce(ue.questions_asked,0) desc, coalesce(ue.avg_post_score,0) desc) as dr_askers
+    from recent_users ru
+    left join user_engagement ue on ue.user_id = ru.user_id
+    left join user_badges ub on ub.userid = ru.user_id
+),
+location_rollup as (
+    select
+        case
+            when position(',' in location_norm) > 0 then split_part(location_norm, ',', 2)
+            when position(' ' in location_norm) > 0 then split_part(location_norm, ' ', array_length(string_to_array(location_norm, ' '),1))
+            else location_norm
+        end as region,
+        count(*) as user_cnt,
+        avg(coalesce(reputation,0)) as avg_rep
+    from users
+    where location is not null
+    group by
+        case
+            when position(',' in location_norm) > 0 then split_part(location_norm, ',', 2)
+            when position(' ' in location_norm) > 0 then split_part(location_norm, ' ', array_length(string_to_array(location_norm, ' '),1))
+            else location_norm
+        end
+),
+user_top_tags as (
+    select p.owneruserid as user_id,
+           te.tag,
+           count(*) as tag_posts,
+           row_number() over (partition by p.owneruserid order by count(*) desc, min(p.creationdate) asc) as rn
+    from posts p
+    join tag_exploded te on te.post_id = p.id
+    where p.owneruserid is not null
+    group by p.owneruserid, te.tag
+),
+user_tag_pref as (
+    select utt.user_id,
+           string_agg(utt.tag, ', ' order by utt.tag_posts desc) filter (where utt.rn <= 3) as top3_tags
+    from user_top_tags utt
+    group by utt.user_id
+),
+question_health as (
+    select
+        q.id as question_id,
+        q.owneruserid as asker_id,
+        q.creationdate,
+        coalesce(va.upvotes,0) as ups,
+        coalesce(va.downvotes,0) as downs,
+        coalesce(va.favorites,0) as favs,
+        coalesce(ca.comment_count,0) as comments,
+        coalesce(pl.duplicate_cnt,0) as dupes,
+        coalesce(ph.closes,0) as closes,
+        case
+            when q.acceptedanswerid is not null then 1
+            when exists (select 1 from posts a where a.parentid = q.id and a.posttypeid = 2 and a.score >= 1) then 1
+            else 0
+        end as has_solution,
+        percentile_disc(0.5) within group (order by coalesce(va.upvotes,0) - coalesce(va.downvotes,0)) over () as global_median_net
+    from posts q
+    left join votes_agg va on va.postid = q.id
+    left join comments_agg ca on ca.postid = q.id
+    left join postlinks_agg pl on pl.postid = q.id
+    left join posthistory_flags ph on ph.postid = q.id
+    where q.posttypeid = 1
+),
+final_scores as (
+    select
+        ru.user_id,
+        ru.displayname,
+        coalesce(ru.location_norm, 'Unknown') as location_norm,
+        coalesce(utp.top3_tags, '(none)') as top3_tags,
+        ru.questions_asked,
+        ru.answers_posted,
+        ru.total_posts,
+        ru.votes_received,
+        ru.comments_received,
+        coalesce(ru.avg_post_score,0) as avg_post_score,
+        ub.total_badges,
+        ub.gold_badges,
+        ub.silver_badges,
+        ub.bronze_badges,
+        lr.region,
+        lr.user_cnt as region_user_cnt,
+        lr.avg_rep as region_avg_rep,
+        (
+            0.35 * coalesce(ru.answers_posted,0) +
+            0.25 * coalesce(ru.questions_asked,0) +
+            0.20 * coalesce(ru.avg_post_score,0) +
+            0.10 * coalesce(ub.total_badges,0) +
+            0.05 * least(coalesce(ru.votes_received,0) - coalesce(ru.comments_received,0), 100) +
+            0.05 * case when coalesce(ru.total_posts,0) = 0 then 0 else
+                coalesce((select avg(has_solution) from question_health qh where qh.asker_id = ru.user_id), 0) * 10 end
+        ) as composite_score,
+        ru.dr_answerers,
+        ru.dr_askers
+    from ranked_users ru
+    left join user_badges ub on ub.userid = ru.user_id
+    left join user_tag_pref utp on utp.user_id = ru.user_id
+    left join lateral (
+        select coalesce(
+            case
+                when position(',' in ru.location_norm) > 0 then split_part(ru.location_norm, ',', 2)
+                when position(' ' in ru.location_norm) > 0 then split_part(ru.location_norm, ' ', array_length(string_to_array(ru.location_norm, ' '),1))
+                else ru.location_norm
+            end, 'Unknown'
+        ) as region
+    ) r on true
+    left join location_rollup lr on lr.region = r.region
+),
+dupe_chains as (
+    select q.id as question_id,
+           count(*) as dupe_chain_len
+    from posts q
+    left join postlinks pl on pl.relatedpostid = q.id and pl.linktypeid = 3
+    left join postlinks pl2 on pl2.relatedpostid = pl.postid and pl2.linktypeid = 3
+    where q.posttypeid = 1
+    group by q.id
+),
+user_activity_recent as (
+    select p.owneruserid as user_id,
+           count(*) filter (where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days') as posts_30d,
+           count(*) filter (where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '7 days') as posts_7d,
+           max(p.creationdate) as last_post_at
+    from posts p
+    where p.owneruserid is not null
+    group by p.owneruserid
+)
+select
+    fs.user_id,
+    fs.displayname,
+    fs.location_norm,
+    fs.top3_tags,
+    fs.questions_asked,
+    fs.answers_posted,
+    fs.total_posts,
+    round(cast(fs.avg_post_score as numeric), 2) as avg_post_score,
+    fs.votes_received,
+    fs.comments_received,
+    fs.total_badges,
+    fs.gold_badges,
+    fs.silver_badges,
+    fs.bronze_badges,
+    fs.region,
+    fs.region_user_cnt,
+    round(cast(fs.region_avg_rep as numeric), 1) as region_avg_rep,
+    ua.posts_30d,
+    ua.posts_7d,
+    to_char(ua.last_post_at, 'YYYY-MM-DD HH24:MI:SS') as last_post_at,
+    coalesce(
+        case when fs.composite_score is null then 0
+             else fs.composite_score end, 0
+    ) as composite_score,
+    rank() over (order by coalesce(fs.composite_score,0) desc, fs.answers_posted desc nulls last) as overall_rank,
+    count(*) filter (where qh.has_solution = 1) over (partition by fs.user_id) as solved_questions_count,
+    sum(qh.dupes) over (partition by fs.user_id) as total_dupes_marked
+from final_scores fs
+left join user_activity_recent ua on ua.user_id = fs.user_id
+left join lateral (
+    select
+        qh.asker_id,
+        qh.has_solution,
+        qh.dupes
+    from (
+        select
+            q.owneruserid as asker_id,
+            case when ph.closes > 0 and pl.duplicate_cnt > 0 then 1 else 0 end as dupes,
+            case when q.acceptedanswerid is not null then 1
+                 when exists (select 1 from posts a where a.parentid = q.id and a.posttypeid = 2 and a.score >= 1) then 1
+                 else 0 end as has_solution
+        from posts q
+        left join posthistory_flags ph on ph.postid = q.id
+        left join postlinks_agg pl on pl.postid = q.id
+        where q.posttypeid = 1 and q.owneruserid = fs.user_id
+    ) qh
+) qh on qh.asker_id = fs.user_id
+where coalesce(fs.total_posts,0) > 0
+order by composite_score desc, fs.answers_posted desc nulls last, fs.questions_asked desc nulls last
+limit 200;

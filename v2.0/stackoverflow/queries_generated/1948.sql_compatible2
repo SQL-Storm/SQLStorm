@@ -1,0 +1,222 @@
+WITH UserAggregatedPosts AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestions,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswers,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS TotalQuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS TotalAnswerScore,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END) AS AvgQuestionScore,
+        MAX(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END) AS MaxQuestionViewCount,
+        MIN(p.CreationDate) AS FirstPostDate,
+        MAX(p.CreationDate) AS LastPostDate,
+        COUNT(DISTINCT CASE WHEN p.AcceptedAnswerId IS NOT NULL AND p.PostTypeId = 1 THEN p.Id END) AS QuestionsWithAcceptedAnswer,
+        COUNT(DISTINCT CASE WHEN p.ParentId IS NOT NULL AND p.Id = q.AcceptedAnswerId THEN p.Id END) AS AnswersAcceptedByOthers,
+        SUM(p.FavoriteCount) AS TotalFavoriteCounts
+    FROM
+        Posts p
+    LEFT JOIN Posts q ON p.ParentId = q.Id AND p.PostTypeId = 2
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY
+        p.OwnerUserId
+),
+UserAggregatedActivity AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesGivenByUser,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesGivenByUser
+    FROM
+        Users u
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    GROUP BY
+        u.Id
+),
+UserReceivedUpvotes AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(v.Id) AS TotalUpvotesReceivedOnUserPosts
+    FROM Votes v
+    JOIN Posts p ON v.PostId = p.Id
+    WHERE v.VoteTypeId = 2 AND p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+UserAggregatedHistory AS (
+    SELECT
+        ph.UserId,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.Id END) AS EditsMadeByUser,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Id END) AS CloseVotesMadeByUser,
+        MAX(ph.CreationDate) AS LatestHistoryEventByUserDate,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (1,2,3) THEN 1 ELSE 0 END) AS InitialPostsHistoryCount
+    FROM
+        PostHistory ph
+    WHERE ph.UserId IS NOT NULL
+    GROUP BY
+        ph.UserId
+),
+UserBadgeSummary AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(b.Date) AS LatestBadgeDate
+    FROM
+        Badges b
+    GROUP BY
+        b.UserId
+),
+PostFirstEditTimes AS (
+    SELECT
+        ph.PostId,
+        p.OwnerUserId AS UserId,
+        MIN(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.CreationDate ELSE NULL END) AS FirstEditDate,
+        MIN(CASE WHEN ph.PostHistoryTypeId IN (1, 2, 3) THEN ph.CreationDate ELSE NULL END) AS InitialCreationDate
+    FROM
+        PostHistory ph
+    JOIN Posts p ON ph.PostId = p.Id
+    WHERE ph.PostHistoryTypeId IN (1,2,3,4,5,6) AND p.OwnerUserId IS NOT NULL
+    GROUP BY
+        ph.PostId, p.OwnerUserId
+),
+UserAvgFirstEditDuration AS (
+    SELECT
+        UserId,
+        AVG(EXTRACT(EPOCH FROM (FirstEditDate - InitialCreationDate)) / 3600.0) AS AvgHoursToFirstEdit
+    FROM PostFirstEditTimes
+    WHERE FirstEditDate IS NOT NULL AND InitialCreationDate IS NOT NULL AND FirstEditDate > InitialCreationDate
+    GROUP BY UserId
+),
+UserTopTags AS (
+    SELECT
+        UserId,
+        TagName,
+        TagCount,
+        RANK() OVER (PARTITION BY UserId ORDER BY TagCount DESC, TagName) as rn
+    FROM (
+        SELECT
+            p.OwnerUserId AS UserId,
+            TRIM(t.tag) AS TagName,
+            COUNT(*) AS TagCount
+        FROM Posts p,
+             LATERAL (SELECT UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><')) AS tag) t
+        WHERE p.PostTypeId = 1 AND p.OwnerUserId IS NOT NULL AND p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2
+        GROUP BY p.OwnerUserId, TRIM(t.tag)
+    ) AS UserTagCounts
+    WHERE TagName IS NOT NULL AND TagName != ''
+),
+CorrelatedPostModerationSummary AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(DISTINCT p.Id) AS PostsClosedAndReopened
+    FROM Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1 AND EXISTS (
+        SELECT 1
+        FROM PostHistory ph_close
+        WHERE ph_close.PostId = p.Id AND ph_close.PostHistoryTypeId = 10
+        AND EXISTS (
+            SELECT 1
+            FROM PostHistory ph_reopen
+            WHERE ph_reopen.PostId = p.Id AND ph_reopen.PostHistoryTypeId = 11
+            AND ph_reopen.CreationDate > ph_close.CreationDate
+        )
+    )
+    GROUP BY u.Id
+)
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    u.LastAccessDate,
+    u.WebsiteUrl,
+    u.Location,
+    COALESCE(uap.TotalQuestions, 0) AS TotalQuestionsPosted,
+    COALESCE(uap.TotalAnswers, 0) AS TotalAnswersPosted,
+    COALESCE(uap.AvgQuestionScore, 0.0) AS AverageQuestionScore,
+    COALESCE(uaa.TotalCommentsMade, 0) AS TotalCommentsMade,
+    COALESCE(uaa.TotalUpVotesGivenByUser, 0) AS TotalUpVotesGiven,
+    COALESCE(uaa.TotalDownVotesGivenByUser, 0) AS TotalDownVotesGiven,
+    COALESCE(uru.TotalUpvotesReceivedOnUserPosts, 0) AS TotalUpvotesReceived,
+    COALESCE(uah.EditsMadeByUser, 0) AS TotalEditsMadeOnOwnPosts,
+    COALESCE(uah.CloseVotesMadeByUser, 0) AS TotalCloseVotesCast,
+    COALESCE(ubs.GoldBadges, 0) AS GoldBadgesCount,
+    COALESCE(ubs.SilverBadges, 0) AS SilverBadgesCount,
+    COALESCE(ubs.BronzeBadges, 0) AS BronzeBadgesCount,
+    (SELECT COUNT(DISTINCT pl.RelatedPostId)
+     FROM Posts p_owned
+     JOIN PostLinks pl ON p_owned.Id = pl.PostId
+     WHERE p_owned.OwnerUserId = u.Id AND pl.LinkTypeId = 1) AS TotalLinkedPostsByOwned,
+    (SELECT AVG(LENGTH(c.Text))
+     FROM Comments c
+     WHERE c.UserId = u.Id
+       AND c.CreationDate BETWEEN CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year' AND CAST('2024-10-01 12:34:56' AS timestamp)
+       AND c.Text IS NOT NULL) AS AvgCommentLengthLastYear,
+    COALESCE(cpm.PostsClosedAndReopened, 0) AS PostsWithClosureAndReopening,
+    COALESCE(uafed.AvgHoursToFirstEdit, 0.0) AS AvgHoursToFirstEditForUserPosts,
+    ut.TagName AS TopQuestionTag,
+    ut.TagCount AS TopQuestionTagCount,
+    NTILE(5) OVER (ORDER BY u.Reputation DESC) AS ReputationQuintile,
+    RANK() OVER (PARTITION BY COALESCE(u.Location, 'Unknown') ORDER BY u.Reputation DESC, u.CreationDate) AS RankInLocation,
+    LAG(u.LastAccessDate, 1, u.CreationDate) OVER (PARTITION BY COALESCE(u.Location, 'Unknown') ORDER BY u.LastAccessDate) AS PrevUserLastAccessInLocation,
+    SUM(COALESCE(uap.TotalQuestions, 0) + COALESCE(uap.TotalAnswers, 0)) OVER (PARTITION BY EXTRACT(YEAR FROM u.CreationDate)) AS TotalPostsByUsersInSameCreationYear,
+    COALESCE(NULLIF(CAST(uap.TotalAnswers AS DECIMAL), 0) / NULLIF(CAST(uap.TotalQuestions AS DECIMAL), 0), 0) AS AnswerQuestionRatio,
+    CASE
+        WHEN u.Reputation >= 20000 AND COALESCE(ubs.GoldBadges, 0) >= 5 THEN 'Power User Elite'
+        WHEN u.Reputation >= 5000 AND COALESCE(ubs.SilverBadges, 0) >= 3 THEN 'Experienced Contributor'
+        WHEN u.Reputation >= 500 THEN 'Active Member'
+        ELSE 'Casual User'
+    END AS UserTier,
+    SUBSTRING(u.DisplayName, 1, 5) AS DisplayName_5CharPrefix,
+    LOWER(u.Location) AS LowercaseLocation,
+    (u.AboutMe IS NOT NULL AND LENGTH(u.AboutMe) > 100) AS HasElaborateAboutMe,
+    (u.WebsiteUrl IS NOT NULL AND u.WebsiteUrl LIKE 'http%://%.%') AS HasValidWebsiteUrl
+FROM
+    Users u
+LEFT JOIN UserAggregatedPosts uap ON u.Id = uap.UserId
+LEFT JOIN UserAggregatedActivity uaa ON u.Id = uaa.UserId
+LEFT JOIN UserReceivedUpvotes uru ON u.Id = uru.UserId
+LEFT JOIN UserAggregatedHistory uah ON u.Id = uah.UserId
+LEFT JOIN UserBadgeSummary ubs ON u.Id = ubs.UserId
+LEFT JOIN UserAvgFirstEditDuration uafed ON u.Id = uafed.UserId
+LEFT JOIN UserTopTags ut ON u.Id = ut.UserId AND ut.rn = 1
+LEFT JOIN CorrelatedPostModerationSummary cpm ON u.Id = cpm.UserId
+WHERE
+    u.Reputation > 100
+    AND u.LastAccessDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+    AND u.Location IS NOT NULL AND LENGTH(TRIM(u.Location)) > 3
+    AND (u.DisplayName IS NOT NULL AND u.DisplayName ~ '[a-zA-Z]')
+    AND COALESCE(uap.TotalQuestions, 0) + COALESCE(uap.TotalAnswers, 0) > 2
+GROUP BY
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.WebsiteUrl,
+    u.Location,
+    uap.TotalQuestions,
+    uap.TotalAnswers,
+    uap.AvgQuestionScore,
+    uap.TotalQuestionScore,
+    uap.TotalAnswerScore,
+    uaa.TotalCommentsMade,
+    uaa.TotalUpVotesGivenByUser,
+    uaa.TotalDownVotesGivenByUser,
+    uru.TotalUpvotesReceivedOnUserPosts,
+    uah.EditsMadeByUser,
+    uah.CloseVotesMadeByUser,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    cpm.PostsClosedAndReopened,
+    uafed.AvgHoursToFirstEdit,
+    ut.TagName,
+    ut.TagCount
+HAVING
+    COALESCE(ubs.GoldBadges, 0) + COALESCE(ubs.SilverBadges, 0) + COALESCE(ubs.BronzeBadges, 0) >= 1
+    OR COALESCE(uap.TotalQuestionScore, 0) + COALESCE(uap.TotalAnswerScore, 0) > 50
+ORDER BY
+    u.Reputation DESC, COALESCE(uap.TotalQuestions, 0) DESC, COALESCE(uru.TotalUpvotesReceivedOnUserPosts, 0) DESC
+LIMIT 500;

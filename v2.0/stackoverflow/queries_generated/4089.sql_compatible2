@@ -1,0 +1,113 @@
+WITH RankedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.AnswerCount,
+        p.CommentCount,
+        pt.Name AS PostTypeName,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.PostTypeId IN (1, 2) AND p.OwnerUserId IS NOT NULL
+),
+UserContributions AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+        COUNT(DISTINCT ph.Id) AS PostHistoryCount,
+        u.CreationDate
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+QuestionStats AS (
+    SELECT
+        rp1.OwnerUserId,
+        COUNT(DISTINCT rp1.PostId) AS TotalQuestions,
+        AVG(rp1.Score) AS AvgQuestionScore,
+        SUM(CASE WHEN rp1.AnswerCount > 0 THEN 1 ELSE 0 END) AS QuestionsWithAnswers,
+        MAX(rp1.CreationDate) AS LastQuestionDate
+    FROM RankedPosts rp1
+    WHERE rp1.PostTypeName = 'Question'
+    GROUP BY rp1.OwnerUserId
+),
+AnswerStats AS (
+    SELECT
+        rp2.OwnerUserId,
+        COUNT(DISTINCT rp2.PostId) AS TotalAnswers,
+        AVG(rp2.Score) AS AvgAnswerScore,
+        SUM(CASE WHEN rp2.Score > 0 THEN 1 ELSE 0 END) AS AnswersWithPositiveScore
+    FROM RankedPosts rp2
+    WHERE rp2.PostTypeName = 'Answer'
+    GROUP BY rp2.OwnerUserId
+),
+PostLinkAnalysis AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name AS LinkType,
+        CASE WHEN EXISTS (SELECT 1 FROM Posts p_related WHERE p_related.Id = pl.RelatedPostId AND p_related.Score < 0) THEN 'HasNegativeScoreRelatedPost' ELSE 'NoNegativeScoreRelatedPost' END AS RelatedPostScoreStatus
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    WHERE lt.Name = 'Duplicate'
+)
+SELECT
+    uc.DisplayName,
+    uc.Reputation,
+    uc.BadgeCount,
+    qs.TotalQuestions,
+    COALESCE(ans.TotalAnswers, 0) AS TotalAnswers,
+    qs.AvgQuestionScore,
+    COALESCE(ans.AvgAnswerScore, 0.0) AS AvgAnswerScore,
+    qs.QuestionsWithAnswers,
+    ans.AnswersWithPositiveScore,
+    uc.PostHistoryCount,
+    rp_latest.Title AS LatestPostTitle,
+    CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - uc.CreationDate)) / 86400 AS INTEGER) AS DaysSinceCreation,
+    CASE
+        WHEN uc.Reputation > 100000 THEN 'HighReputation'
+        WHEN uc.Reputation BETWEEN 1000 AND 100000 THEN 'MediumReputation'
+        ELSE 'LowReputation'
+    END AS ReputationBracket,
+    CASE
+        WHEN COALESCE(qs.TotalQuestions,0) > 0 THEN CAST(qs.QuestionsWithAnswers AS FLOAT) / qs.TotalQuestions
+        ELSE 0.0
+    END AS PercentageQuestionsWithAnswers,
+    CASE
+        WHEN EXISTS (SELECT 1 FROM PostLinkAnalysis pla WHERE pla.PostId = rp_latest.PostId) THEN 'LinkedTo'
+        ELSE 'NotLinkedTo'
+    END AS LatestPostLinkStatus,
+    COALESCE(COUNT(DISTINCT pl.RelatedPostId), 0) AS NumberOfDuplicateLinks,
+    SUM(CASE WHEN pl.RelatedPostId IS NOT NULL AND pl.PostId IS NOT NULL AND EXISTS (SELECT 1 FROM PostLinkAnalysis pla2 WHERE pla2.PostId = pl.PostId AND pla2.RelatedPostId = pl.RelatedPostId AND pla2.RelatedPostScoreStatus = 'HasNegativeScoreRelatedPost') THEN 1 ELSE 0 END) AS DuplicateLinksToNegativeScorePosts,
+    rp_latest.PostTypeName AS LatestPostType
+FROM UserContributions uc
+LEFT JOIN QuestionStats qs ON uc.UserId = qs.OwnerUserId
+LEFT JOIN AnswerStats ans ON uc.UserId = ans.OwnerUserId
+LEFT JOIN RankedPosts rp_latest ON uc.UserId = rp_latest.OwnerUserId AND rp_latest.rn = 1
+LEFT JOIN PostLinkAnalysis pl ON rp_latest.PostId = pl.PostId
+GROUP BY
+    uc.DisplayName,
+    uc.Reputation,
+    uc.BadgeCount,
+    qs.TotalQuestions,
+    ans.TotalAnswers,
+    qs.AvgQuestionScore,
+    ans.AvgAnswerScore,
+    qs.QuestionsWithAnswers,
+    ans.AnswersWithPositiveScore,
+    uc.PostHistoryCount,
+    rp_latest.Title,
+    uc.CreationDate,
+    rp_latest.PostTypeName
+HAVING uc.Reputation > 0 AND COALESCE(qs.TotalQuestions,0) > 5
+ORDER BY uc.Reputation DESC
+LIMIT 100;

@@ -1,0 +1,169 @@
+WITH RECURSIVE RecursiveUserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsAsked,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersGiven,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        SUM(v.BountyAmount) FILTER (WHERE v.VoteTypeId IN (8,9)) AS TotalBountyGranted
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id AND v.VoteTypeId IN (8,9)
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+    UNION ALL
+    SELECT
+        r.UserId,
+        ru.DisplayName,
+        ru.Reputation,
+        ru.CreationDate,
+        ru.LastAccessDate,
+        ru.QuestionsAsked,
+        ru.AnswersGiven,
+        ru.CommentsMade,
+        ru.TotalBountyGranted
+    FROM RecursiveUserActivity r
+    JOIN Users ru ON ru.Id = r.UserId
+    WHERE ru.Reputation > 10000
+    LIMIT 1000
+),
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        JSON_AGG(DISTINCT CASE WHEN b.TagBased = 1 THEN b.Name END) FILTER (WHERE b.TagBased = 1) AS TagBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+RankedPosts AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.Title,
+        p.Score,
+        p.CreationDate,
+        p.ViewCount,
+        p.Body,
+        p.Tags,
+        ROW_NUMBER() OVER (
+            PARTITION BY p.OwnerUserId
+            ORDER BY p.Score DESC, p.CreationDate ASC
+        ) AS PostRank,
+        RANK() OVER (
+            PARTITION BY p.PostTypeId
+            ORDER BY p.Score DESC, p.ViewCount DESC
+        ) AS GlobalPostRank
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+),
+DuplicateLinkCounts AS (
+    SELECT
+        p.Id AS PostId,
+        COUNT(pl.Id) FILTER (WHERE lt.Name = 'Duplicate') AS DuplicateCount
+    FROM Posts p
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+    LEFT JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    GROUP BY p.Id
+),
+TopTags AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        p.Id AS ExcerptPostId,
+        COALESCE(STRING_AGG(DISTINCT p.Title, '; ') FILTER (WHERE p.Title IS NOT NULL), '') AS TagPostTitles
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Id = t.ExcerptPostId
+    WHERE t.Count > 1000 AND (t.IsRequired = 1 OR t.IsModeratorOnly = 1)
+    GROUP BY t.TagName, t.Count, p.Id
+),
+QuestionCloseStats AS (
+    SELECT
+        ph.PostId,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId = 10) AS TimesClosed,
+        MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId = 10) AS LastClosedDate,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId = 11) AS TimesReopened,
+        (
+            SELECT crt.Name
+            FROM CloseReasonTypes crt
+            WHERE crt.Id = CAST(ph.Comment AS INTEGER)
+            LIMIT 1
+        ) AS LastCloseReason
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (10, 11)
+    GROUP BY ph.PostId, ph.Comment
+)
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    ua.QuestionsAsked,
+    ua.AnswersGiven,
+    ua.CommentsMade,
+    ubc.GoldBadges,
+    ubc.SilverBadges,
+    ubc.BronzeBadges,
+    COALESCE(CAST(ubc.TagBadges AS TEXT), '[]') AS TagBadges,
+    rp.Title AS TopScoredPostTitle,
+    rp.Score AS TopPostScore,
+    rp.PostRank AS UserPostRank,
+    rp.GlobalPostRank,
+    dup.DuplicateCount,
+    qcs.TimesClosed,
+    qcs.TimesReopened,
+    qcs.LastCloseReason,
+    TO_CHAR(u.LastAccessDate, 'YYYY-MM-DD') AS LastAccess,
+    CASE 
+        WHEN u.Reputation > 100000 THEN 'Elite'
+        WHEN u.Reputation > 10000 THEN 'Advanced'
+        ELSE 'Novice'
+    END AS ReputationLevel,
+    SUBSTRING(rp.Body FROM 1 FOR 100) AS PostSnippet,
+    LENGTH(COALESCE(rp.Body, '')) AS PostBodyLength,
+    REGEXP_REPLACE(COALESCE(rp.Tags, ''), '[<>]', '{}', 'g') AS ParsedTags,
+    (
+        SELECT ARRAY_AGG(t.TagName ORDER BY t.Count DESC)
+        FROM Tags t
+        WHERE POSITION(t.TagName IN COALESCE(rp.Tags, '')) > 0
+    ) AS TagsInPost,
+    t.TagsInPost AS TagPostTitles
+FROM Users u
+INNER JOIN RecursiveUserActivity ua ON ua.UserId = u.Id
+LEFT JOIN UserBadgeCounts ubc ON ubc.UserId = u.Id
+LEFT JOIN RankedPosts rp ON rp.OwnerUserId = u.Id AND rp.PostRank = 1
+LEFT JOIN DuplicateLinkCounts dup ON dup.PostId = rp.Id
+LEFT JOIN QuestionCloseStats qcs ON qcs.PostId = rp.Id
+LEFT JOIN LATERAL (
+    SELECT STRING_AGG(DISTINCT tt.TagPostTitles, ' | ') AS TagsInPost
+    FROM TopTags tt
+    WHERE POSITION(tt.TagName IN COALESCE(rp.Tags, '')) > 0
+) t ON TRUE
+WHERE u.Reputation > 5000 AND ua.QuestionsAsked > 5 AND rp.Score > 10
+GROUP BY
+    u.Id,
+    u.DisplayName,
+    ua.QuestionsAsked,
+    ua.AnswersGiven,
+    ua.CommentsMade,
+    ubc.GoldBadges,
+    ubc.SilverBadges,
+    ubc.BronzeBadges,
+    ubc.TagBadges,
+    rp.Title,
+    rp.Score,
+    rp.PostRank,
+    rp.GlobalPostRank,
+    dup.DuplicateCount,
+    qcs.TimesClosed,
+    qcs.TimesReopened,
+    qcs.LastCloseReason,
+    u.LastAccessDate,
+    u.Reputation,
+    rp.Body,
+    rp.Tags,
+    t.TagsInPost
+ORDER BY ua.AnswersGiven DESC, rp.Score DESC
+LIMIT 50;

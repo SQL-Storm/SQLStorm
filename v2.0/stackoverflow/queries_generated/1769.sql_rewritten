@@ -1,0 +1,53 @@
+-- {"query": "1769.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 836} 
+WITH UserEngagementMetrics AS (
+    -- Calculate various engagement metrics for each user
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.UpVotes AS TotalUpVotesGiven,
+        u.DownVotes AS TotalDownVotesGiven,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswers,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        SUM(CASE WHEN pv.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesReceivedOnPosts,
+        SUM(CASE WHEN pv.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesReceivedOnPosts
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes pv ON p.Id = pv.PostId AND pv.VoteTypeId IN (2, 3) -- UpMod (2) and DownMod (3) on user's posts
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.UpVotes, u.DownVotes
+),
+PostActivitySummary AS (
+    -- Summarize activity and quality metrics for each post
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS CurrentScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.AcceptedAnswerId,
+        p.LastActivityDate,
+        COALESCE(p.Tags, '') AS TagsString,
+        COUNT(DISTINCT ph_edit.Id) AS NumberOfEdits,
+        COUNT(DISTINCT CASE WHEN ph_close.PostHistoryTypeId = 10 THEN ph_close.Id END) AS NumberOfCloseEvents,
+        COUNT(DISTINCT CASE WHEN ph_reopen.PostHistoryTypeId = 11 THEN ph_reopen.Id END) AS NumberOfReopenEvents,
+        AVG(COALESCE(c.Score, 0)) AS AvgCommentScore,
+        MAX(CASE WHEN p_aa.Id IS NOT NULL THEN 1 ELSE 0 END) AS IsAcceptedAnswerPost, -- Checks if *this* post is an accepted answer to any question
+        COUNT(DISTINCT pl.RelatedPostId) AS TotalRelatedPosts
+    FROM Posts p
+    LEFT JOIN PostHistory ph_edit ON p.Id = ph_edit.PostId AND ph_edit.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Body, Tags
+    LEFT JOIN PostHistory ph_close ON p.Id = ph_close.PostId AND ph_close.PostHistoryTypeId = 10 -- Post Closed
+    LEFT JOIN PostHistory ph_reopen ON p.Id = ph_reopen.PostId AND ph_reopen.PostHistoryTypeId = 11 -- Post Reopened
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Posts p_aa ON p.Id = p_aa.AcceptedAnswerId -- Links a post if it's an accepted answer to some question
+    LEFT JOIN PostLinks pl ON p.Id = pl.Post

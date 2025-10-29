@@ -1,0 +1,179 @@
+-- {"query": "2022.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1581} 
+with RecursiveTagCounts as (
+    select
+        t.Id as TagId,
+        t.TagName,
+        count(p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(p.Id) filter (where p.PostTypeId = 2) as AnswerCount
+    from Tags t
+    left join Posts p
+        on p.PostTypeId = 1 and 
+           (p.Tags like concat('%<', t.TagName, '>%') or p.Tags like concat('%&lt;', t.TagName, '&gt;%'))
+    group by t.Id, t.TagName
+), 
+LatestPostHistory as (
+    select ph.PostId, ph.UserId, ph.PostHistoryTypeId, ph.CreationDate,
+        row_number() over (partition by ph.PostId order by ph.CreationDate desc) as rn
+    from PostHistory ph
+),
+EligiblePostHistories as (
+    select ph.PostId, ph.UserId, ph.PostHistoryTypeId, ph.CreationDate
+    from LatestPostHistory ph
+    where ph.rn = 1
+), 
+UserBadgeCounts as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    where b.Date > now() - interval '365 days'
+    group by b.UserId, b.Class
+),
+UserRecentActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        max(p.CreationDate) filter (where p.PostTypeId in (1,2)) as LastPostDate,
+        max(v.CreationDate) as LastVoteDate,
+        greatest(
+            max(p.CreationDate) filter (where p.PostTypeId in (1,2)),
+            max(v.CreationDate)
+        ) as LastActivity
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+QuestionAnswersWindow as (
+    select
+        p.Id as QuestionId,
+        p.Title,
+        p.CreationDate,
+        a.Id as AnswerId,
+        a.CreationDate as AnswerCreation,
+        a.Score as AnswerScore,
+        sum(v.VoteTypeId = 2::int) over (partition by a.Id) as AnswerUpvotes,
+        sum(v.VoteTypeId = 3::int) over (partition by a.Id) as AnswerDownvotes,
+        row_number() over (partition by p.Id order by a.Score desc, a.CreationDate) as AnswerRank
+    from Posts p
+    left join Posts a on a.ParentId = p.Id and a.PostTypeId = 2
+    left join Votes v on v.PostId = a.Id
+    where p.PostTypeId = 1
+), 
+TopAnswersWithComments as (
+    select
+        qa.QuestionId,
+        qa.AnswerId,
+        qa.AnswerRank,
+        count(c.Id) as CommentCount
+    from QuestionAnswersWindow qa
+    left join Comments c on c.PostId = qa.AnswerId
+    where qa.AnswerRank <= 3
+    group by qa.QuestionId, qa.AnswerId, qa.AnswerRank
+),
+FilteredQuestions as (
+    select 
+        q.Id,
+        q.Title,
+        q.OwnerUserId,
+        q.Score,
+        q.ViewCount,
+        q.Tags,
+        u.DisplayName as OwnerName,
+        ubc.Class as OwnerTopBadgeClass,
+        ubc.BadgeCount as OwnerBadgeCount,
+        rts.Name as LastPostHistoryType,
+        ph.CreationDate as LastEditDate,
+        coalesce(pc.CommentCount,0) as QuestionCommentCount,
+        rtc.QuestionCount,
+        rtc.AnswerCount
+    from Posts q
+    left join Users u on u.Id = q.OwnerUserId
+    left join EligiblePostHistories ph on ph.PostId = q.Id
+    left join PostHistoryTypes rts on rts.Id = ph.PostHistoryTypeId
+    left join (select p.Id, count(c.Id) as CommentCount from Posts p left join Comments c on c.PostId = p.Id group by p.Id) pc on pc.Id = q.Id
+    left join RecursiveTagCounts rtc on rtc.TagName = (substring(q.Tags from '<([^>]+)>'))
+    left join UserBadgeCounts ubc on ubc.UserId = q.OwnerUserId and ubc.Class = 1 -- Gold badges
+    where q.PostTypeId = 1
+      and coalesce(q.Score,0) >= 5
+      and q.ViewCount > 1000
+),
+UnionQuestionsAnswers as (
+    select
+        q.Id as PostId,
+        q.Title,
+        q.OwnerUserId,
+        q.DisplayName as OwnerName,
+        'Question' as PostType,
+        q.Score,
+        q.ViewCount,
+        null::int as ParentId,
+        q.CreationDate,
+        q.Tags,
+        q.AcceptedAnswerId
+    from Posts q
+    join Users u on u.Id = q.OwnerUserId
+    where q.PostTypeId = 1
+
+    union all
+
+    select
+        a.Id,
+        null,
+        a.OwnerUserId,
+        u.DisplayName,
+        'Answer' as PostType,
+        a.Score,
+        null::int,
+        a.ParentId,
+        a.CreationDate,
+        null,
+        null::int
+    from Posts a
+    join Users u on u.Id = a.OwnerUserId
+    where a.PostTypeId = 2
+),
+AnswerAcceptRatio as (
+    select
+        a.OwnerUserId,
+        count(*) as TotalAnswers,
+        sum(case when q.AcceptedAnswerId = a.Id then 1 else 0 end) as AcceptedCount,
+        sum(case when q.AcceptedAnswerId = a.Id then 1 else 0 end)::decimal / nullif(count(*),0) as AcceptRatio
+    from Posts a
+    join Posts q on q.Id = a.ParentId and q.PostTypeId = 1
+    where a.PostTypeId = 2
+    group by a.OwnerUserId
+)
+select distinct
+    fq.Id as QuestionId,
+    fq.Title,
+    fq.OwnerUserId,
+    fq.OwnerName,
+    fq.OwnerTopBadgeClass,
+    fq.OwnerBadgeCount,
+    fq.Score as QuestionScore,
+    fq.ViewCount as QuestionViews,
+    fq.Tags,
+    fq.LastEditDate,
+    fq.LastPostHistoryType,
+    fq.QuestionCommentCount,
+    fq.QuestionCount as TotalQuestionsForTag,
+    fq.AnswerCount as TotalAnswersForTag,
+    ua.AcceptRatio,
+    ta.AnswerId,
+    ta.AnswerRank,
+    ta.CommentCount as AnswerCommentCount,
+    ans.Score as AnswerScore,
+    ans.CreationDate as AnswerCreationDate,
+    ans.OwnerUserId as AnswerOwnerUserId,
+    u2.DisplayName as AnswerOwnerName,
+    row_number() over (partition by fq.Id order by fq.Score desc, fq.ViewCount desc) as QuestionRank
+from FilteredQuestions fq
+left join TopAnswersWithComments ta on ta.QuestionId = fq.Id and ta.AnswerRank = 1
+left join Posts ans on ans.Id = ta.AnswerId
+left join Users u2 on u2.Id = ans.OwnerUserId
+left join AnswerAcceptRatio ua on ua.OwnerUserId = ans.OwnerUserId
+where fq.Tags is not null
+order by QuestionRank, fq.Score desc, ta.AnswerRank
+limit 100;

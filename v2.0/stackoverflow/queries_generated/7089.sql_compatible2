@@ -1,0 +1,304 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        COUNT(DISTINCT c.Id) AS Comments,
+        COUNT(DISTINCT b.Id) AS Badges,
+        MAX(p.CreationDate) AS LastPostDate,
+        (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - u.CreationDate) AS AccountAgeInterval,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - u.CreationDate))/86400 AS AccountAgeDays,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Elite'
+            WHEN u.Reputation > 1000 THEN 'Senior'
+            WHEN u.Reputation > 100 THEN 'Junior'
+            ELSE 'Beginner'
+        END AS RepLevel,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank,
+        AVG(p.Score) AS AvgPostScore,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags)-2)), ', ') AS AllTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        CASE 
+            WHEN p.Score > 100 THEN 'Hot'
+            WHEN p.Score > 10 THEN 'Popular'
+            WHEN p.Score > 0 THEN 'Moderate'
+            ELSE 'Low'
+        END AS Popularity,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - p.CreationDate))/86400 AS AgeDays,
+        COALESCE(p.AnswerCount, 0) + COALESCE(p.CommentCount, 0) AS Engagement,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END AS PostType,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS Upvotes,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS Downvotes,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 5) AS Favorites,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCountDetailed,
+        (SELECT STRING_AGG(c.Text, ' | ') FROM Comments c WHERE c.PostId = p.Id LIMIT 3) AS SampleComments
+    FROM Posts p
+    WHERE p.Id IS NOT NULL
+),
+UserPostActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT pa.PostId) AS ActivePosts,
+        SUM(pa.Score) AS TotalScore,
+        AVG(pa.Score) AS AvgScore,
+        MAX(pa.CreationDate) AS LastActivity,
+        STRING_AGG(DISTINCT pa.PostType, ', ') AS PostTypes,
+        MAX(pa.AgeDays) AS MaxPostAge
+    FROM Users u
+    LEFT JOIN PostAnalysis pa ON u.Id = pa.OwnerUserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            ELSE 'Niche'
+        END AS TagPopularity,
+        (SELECT COUNT(*) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%') AS RelatedPostCount,
+        (SELECT AVG(p.Score) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%') AS AvgRelatedScore,
+        (SELECT STRING_AGG(p.Title, ', ') FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%' LIMIT 5) AS SampleTitles
+    FROM Tags t
+    WHERE t.TagName IS NOT NULL
+),
+ComplexAnalytics AS (
+    SELECT 
+        ua.UserId,
+        ua.DisplayName,
+        ua.ActivePosts,
+        ua.TotalScore,
+        ua.AvgScore,
+        ua.LastActivity,
+        ua.PostTypes,
+        ua.MaxPostAge,
+        uas.RepLevel,
+        uas.RepRank,
+        uas.AccountAgeDays,
+        uas.Questions,
+        uas.Answers,
+        uas.Comments,
+        uas.Badges,
+        ROW_NUMBER() OVER (PARTITION BY uas.RepLevel ORDER BY ua.TotalScore DESC) AS LevelScoreRank,
+        DENSE_RANK() OVER (ORDER BY ua.TotalScore DESC) AS ScoreRank,
+        PERCENT_RANK() OVER (ORDER BY ua.TotalScore) AS ScorePercentile,
+        NTILE(10) OVER (ORDER BY ua.ActivePosts) AS ActivityDecile,
+        CASE 
+            WHEN ua.ActivePosts > 50 AND ua.TotalScore > 1000 THEN 'Highly Active'
+            WHEN ua.ActivePosts > 10 AND ua.TotalScore > 500 THEN 'Moderately Active'
+            WHEN ua.ActivePosts > 0 THEN 'Active'
+            ELSE 'Inactive'
+        END AS ActivityStatus,
+        CONCAT(ua.DisplayName, ' (', uas.RepLevel, ')') AS FullNameWithRank
+    FROM UserPostActivity ua
+    JOIN UserActivityStats uas ON ua.UserId = uas.UserId
+    WHERE ua.UserId IS NOT NULL
+),
+MainSelection AS (
+SELECT 
+    ca.UserId,
+    ca.DisplayName,
+    ca.ActivePosts,
+    ca.TotalScore,
+    ca.AvgScore,
+    ca.LastActivity,
+    ca.PostTypes,
+    ca.MaxPostAge,
+    ca.RepLevel,
+    ca.RepRank,
+    ca.AccountAgeDays,
+    ca.Questions,
+    ca.Answers,
+    ca.Comments,
+    ca.Badges,
+    ca.LevelScoreRank,
+    ca.ScoreRank,
+    ca.ScorePercentile,
+    ca.ActivityDecile,
+    ca.ActivityStatus,
+    ca.FullNameWithRank,
+    (SELECT STRING_AGG(ta.TagName, ', ') FROM Tags ta WHERE ta.TagName IN (
+         SELECT trim(x) FROM regexp_split_to_table(uas.AllTags, ',') AS x WHERE x IS NOT NULL
+     ) LIMIT 5) AS SampleTags,
+    CASE 
+        WHEN ca.RepRank <= 10 THEN 'Top 10'
+        WHEN ca.RepRank <= 100 THEN 'Top 100'
+        WHEN ca.RepRank <= 1000 THEN 'Top 1K'
+        ELSE 'Regular'
+    END AS ReputationTier,
+    CONCAT(
+        'Score: ', ca.TotalScore, 
+        ', Posts: ', ca.ActivePosts, 
+        ', Avg: ', ROUND(ca.AvgScore::numeric, 2),
+        ', RepStatus: ', ca.RepLevel,
+        ', Activity: ', ca.ActivityStatus
+    ) AS UserSummary,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = ca.UserId AND p.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days')) AS RecentPosts30Days,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = ca.UserId AND p.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '7 days')) AS RecentPosts7Days,
+    (SELECT MAX(p.Score) FROM Posts p WHERE p.OwnerUserId = ca.UserId) AS MaxPostScore,
+    (SELECT STRING_AGG(DISTINCT p.PostType, ', ') FROM PostAnalysis p WHERE p.OwnerUserId = ca.UserId) AS PostTypeDistribution,
+    NULL AS NullColumnForTesting,
+    CASE 
+        WHEN ca.TotalScore > (SELECT AVG(TotalScore) FROM ComplexAnalytics) THEN 'Above Average'
+        ELSE 'Below Average'
+    END AS ScoreComparison,
+    (SELECT COUNT(*) FROM Votes v JOIN Posts p ON v.PostId = p.Id WHERE p.OwnerUserId = ca.UserId AND v.VoteTypeId = 2) AS TotalUpvotesReceived,
+    (SELECT COUNT(*) FROM Votes v JOIN Posts p ON v.PostId = p.Id WHERE p.OwnerUserId = ca.UserId AND v.VoteTypeId = 3) AS TotalDownvotesReceived
+FROM ComplexAnalytics ca
+JOIN UserActivityStats uas ON ca.UserId = uas.UserId
+WHERE ca.UserId IS NOT NULL
+GROUP BY
+    ca.UserId,
+    ca.DisplayName,
+    ca.ActivePosts,
+    ca.TotalScore,
+    ca.AvgScore,
+    ca.LastActivity,
+    ca.PostTypes,
+    ca.MaxPostAge,
+    ca.RepLevel,
+    ca.RepRank,
+    ca.AccountAgeDays,
+    ca.Questions,
+    ca.Answers,
+    ca.Comments,
+    ca.Badges,
+    ca.LevelScoreRank,
+    ca.ScoreRank,
+    ca.ScorePercentile,
+    ca.ActivityDecile,
+    ca.ActivityStatus,
+    ca.FullNameWithRank,
+    uas.AllTags,
+    ca.UserId,
+    ca.UserId,
+    uas.AllTags
+HAVING ca.ActivePosts > 0
+ORDER BY ca.TotalScore DESC, ca.RepRank ASC
+LIMIT 1000
+),
+FilteredSelection AS (
+SELECT 
+    ca.UserId,
+    ca.DisplayName,
+    ca.ActivePosts,
+    ca.TotalScore,
+    ca.AvgScore,
+    ca.LastActivity,
+    ca.PostTypes,
+    ca.MaxPostAge,
+    ca.RepLevel,
+    ca.RepRank,
+    ca.AccountAgeDays,
+    ca.Questions,
+    ca.Answers,
+    ca.Comments,
+    ca.Badges,
+    ca.LevelScoreRank,
+    ca.ScoreRank,
+    ca.ScorePercentile,
+    ca.ActivityDecile,
+    ca.ActivityStatus,
+    ca.FullNameWithRank,
+    (SELECT STRING_AGG(ta.TagName, ', ') FROM Tags ta WHERE ta.TagName IN (
+         SELECT trim(x) FROM regexp_split_to_table(uas.AllTags, ',') AS x WHERE x IS NOT NULL
+     ) LIMIT 5) AS SampleTags,
+    CASE 
+        WHEN ca.RepRank <= 10 THEN 'Top 10'
+        WHEN ca.RepRank <= 100 THEN 'Top 100'
+        WHEN ca.RepRank <= 1000 THEN 'Top 1K'
+        ELSE 'Regular'
+    END AS ReputationTier,
+    CONCAT(
+        'Score: ', ca.TotalScore, 
+        ', Posts: ', ca.ActivePosts, 
+        ', Avg: ', ROUND(ca.AvgScore::numeric, 2),
+        ', RepStatus: ', ca.RepLevel,
+        ', Activity: ', ca.ActivityStatus
+    ) AS UserSummary,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = ca.UserId AND p.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days')) AS RecentPosts30Days,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = ca.UserId AND p.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '7 days')) AS RecentPosts7Days,
+    (SELECT MAX(p.Score) FROM Posts p WHERE p.OwnerUserId = ca.UserId) AS MaxPostScore,
+    (SELECT STRING_AGG(DISTINCT p.PostType, ', ') FROM PostAnalysis p WHERE p.OwnerUserId = ca.UserId) AS PostTypeDistribution,
+    NULL AS NullColumnForTesting,
+    CASE 
+        WHEN ca.TotalScore > (SELECT AVG(TotalScore) FROM ComplexAnalytics) THEN 'Above Average'
+        ELSE 'Below Average'
+    END AS ScoreComparison,
+    (SELECT COUNT(*) FROM Votes v JOIN Posts p ON v.PostId = p.Id WHERE p.OwnerUserId = ca.UserId AND v.VoteTypeId = 2) AS TotalUpvotesReceived,
+    (SELECT COUNT(*) FROM Votes v JOIN Posts p ON v.PostId = p.Id WHERE p.OwnerUserId = ca.UserId AND v.VoteTypeId = 3) AS TotalDownvotesReceived
+FROM ComplexAnalytics ca
+JOIN UserActivityStats uas ON ca.UserId = uas.UserId
+WHERE ca.UserId IS NOT NULL
+AND ca.RepLevel IN ('Elite', 'Senior')
+GROUP BY
+    ca.UserId,
+    ca.DisplayName,
+    ca.ActivePosts,
+    ca.TotalScore,
+    ca.AvgScore,
+    ca.LastActivity,
+    ca.PostTypes,
+    ca.MaxPostAge,
+    ca.RepLevel,
+    ca.RepRank,
+    ca.AccountAgeDays,
+    ca.Questions,
+    ca.Answers,
+    ca.Comments,
+    ca.Badges,
+    ca.LevelScoreRank,
+    ca.ScoreRank,
+    ca.ScorePercentile,
+    ca.ActivityDecile,
+    ca.ActivityStatus,
+    ca.FullNameWithRank,
+    uas.AllTags,
+    ca.UserId,
+    ca.UserId,
+    uas.AllTags
+ORDER BY ca.RepRank ASC
+)
+SELECT * FROM MainSelection
+WHERE (UserId, DisplayName, ActivePosts, TotalScore, AvgScore, LastActivity, PostTypes, MaxPostAge, RepLevel, RepRank, AccountAgeDays, Questions, Answers, Comments, Badges, LevelScoreRank, ScoreRank, ScorePercentile, ActivityDecile, ActivityStatus, FullNameWithRank, SampleTags, ReputationTier, UserSummary, RecentPosts30Days, RecentPosts7Days, MaxPostScore, PostTypeDistribution, NullColumnForTesting, ScoreComparison, TotalUpvotesReceived, TotalDownvotesReceived)
+NOT IN (
+    SELECT UserId, DisplayName, ActivePosts, TotalScore, AvgScore, LastActivity, PostTypes, MaxPostAge, RepLevel, RepRank, AccountAgeDays, Questions, Answers, Comments, Badges, LevelScoreRank, ScoreRank, ScorePercentile, ActivityDecile, ActivityStatus, FullNameWithRank, SampleTags, ReputationTier, UserSummary, RecentPosts30Days, RecentPosts7Days, MaxPostScore, PostTypeDistribution, NullColumnForTesting, ScoreComparison, TotalUpvotesReceived, TotalDownvotesReceived
+    FROM FilteredSelection
+)
+ORDER BY TotalScore DESC, RepRank ASC
+LIMIT 1000;

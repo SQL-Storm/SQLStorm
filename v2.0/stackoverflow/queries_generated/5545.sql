@@ -1,0 +1,113 @@
+-- {"query": "5545.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 773} 
+WITH RankedPosts AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.PostTypeId,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.LastActivityDate,
+    p.LastEditDate,
+    p.LastEditorUserId,
+    p.ContentLicense,
+    COALESCE(u.Reputation, 0) AS OwnerReputation,
+    u.DisplayName AS OwnerDisplayName,
+    u.Location AS OwnerLocation,
+    u.UpVotes AS OwnerUpVotes,
+    u.DownVotes AS OwnerDownVotes,
+    COALESCE((
+      SELECT STRING_AGG(CONCAT(b.Name, '#', b.Class), '|')
+      FROM Badges b
+      WHERE b.UserId = p.OwnerUserId
+    ), '') AS OwnerBadges
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.CreationDate >= NOW() - INTERVAL '1 year'
+),
+ExpandedLinks AS (
+  SELECT
+    rp.Id,
+    rp.Title,
+    rp.OwnerUserId,
+    rp.OwnerDisplayName,
+    rp.OwnerReputation,
+    rp.LastActivityDate,
+    rp.Tags,
+    rp.AnswerCount,
+    rp.CommentCount,
+    rp.ViewCount,
+    rp.Score,
+    rp.LastEditDate,
+    rp.ContentLicense,
+    rp.OwnerBadges,
+    lt.Name AS LinkTypeName
+  FROM RankedPosts rp
+  LEFT JOIN PostLinks pl ON pl.PostId = rp.Id
+  LEFT JOIN Posts rp2 ON pl.RelatedPostId = rp2.Id
+  LEFT JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+),
+Aggregated AS (
+  SELECT
+    rp.Id,
+    rp.Title,
+    rp.OwnerUserId,
+    rp.OwnerDisplayName,
+    rp.OwnerReputation,
+    rp.LastActivityDate,
+    rp.Tags,
+    rp.AnswerCount,
+    rp.CommentCount,
+    rp.ViewCount,
+    rp.Score,
+    rp.LastEditDate,
+    rp.ContentLicense,
+    rp.OwnerBadges,
+    COUNT(*) OVER (PARTITION BY rp.OwnerUserId) AS PostsByOwner,
+    MAX(rp.LastActivityDate) OVER () AS LastGlobalActivity
+  FROM RankedPosts rp
+  LEFT JOIN ExpandedLinks el ON el.Id = rp.Id
+),
+WindowStats AS (
+  SELECT
+    a.*,
+    ROW_NUMBER() OVER (PARTITION BY a.OwnerUserId ORDER BY a.LastActivityDate DESC) AS rn_by_owner,
+    PERCENT_RANK() OVER (ORDER BY a.Score) AS perc_score
+  FROM Aggregated a
+)
+SELECT
+  w.Id,
+  w.Title,
+  w.OwnerDisplayName,
+  w.OwnerReputation,
+  w.LastActivityDate,
+  w.Tags,
+  w.AnswerCount,
+  w.CommentCount,
+  w.ViewCount,
+  w.Score,
+  w.LastEditDate,
+  w.ContentLicense,
+  w.OwnerBadges,
+  w.PostsByOwner,
+  w.LastGlobalActivity,
+  w.LinkTypeName,
+  CASE
+    WHEN w.rn_by_owner = 1 THEN 'Top recent by owner'
+    ELSE 'Older'
+  END AS OwnershipRankLabel,
+  CASE
+    WHEN w.perc_score < 0.2 THEN 'Low quality'
+    WHEN w.perc_score < 0.5 THEN 'Medium quality'
+    ELSE 'High quality'
+  END AS QualityBucket
+FROM WindowStats w
+WHERE w.rn_by_owner <= 5
+ORDER BY w.LastActivityDate DESC, w.Score DESC
+OFFSET 0 ROWS
+FETCH FIRST 100 ROWS ONLY;

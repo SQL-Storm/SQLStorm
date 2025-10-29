@@ -1,0 +1,117 @@
+WITH
+  RankedAnswers AS (
+    SELECT
+      p.Id AS AnswerId,
+      p.ParentId AS QuestionId,
+      p.OwnerUserId AS AnswerOwnerUserId,
+      p.Score,
+      p.CreationDate AS AnswerCreationDate,
+      ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+  ),
+  HighScoringQuestions AS (
+    SELECT
+      Id AS QuestionId,
+      Title,
+      OwnerUserId AS QuestionOwnerUserId,
+      Score AS QuestionScore,
+      CreationDate AS QuestionCreationDate,
+      Tags,
+      AnswerCount
+    FROM Posts
+    WHERE PostTypeId = 1
+      AND Score > 100
+      AND AnswerCount > 5
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      COUNT(DISTINCT c.Id) AS CommentCount,
+      COUNT(DISTINCT v.Id) AS VoteCount,
+      SUM(CASE WHEN ph.PostHistoryTypeId IN (2, 5) THEN 1 ELSE 0 END) AS PostEditCount,
+      MAX(u.LastAccessDate) AS LastAccessDate
+    FROM Users u
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+  ),
+  AvgQuestionScore AS (
+    SELECT AVG(Score) AS AvgScore FROM Posts WHERE PostTypeId = 1
+  )
+SELECT
+  hq.QuestionId,
+  hq.Title AS QuestionTitle,
+  hq.QuestionScore,
+  hq.QuestionCreationDate,
+  hq.Tags,
+  hq.AnswerCount AS TotalAnswerCount,
+  ra.AnswerId,
+  ra.Score AS AnswerScore,
+  ra.AnswerCreationDate,
+  ua.DisplayName AS AnswererDisplayName,
+  ua.Reputation AS AnswererReputation,
+  ua.CommentCount AS AnswererCommentCount,
+  ua.VoteCount AS AnswererVoteCount,
+  ua.PostEditCount AS AnswererEditCount,
+  ua.LastAccessDate AS AnswererLastAccessDate,
+  CASE
+    WHEN hq.QuestionOwnerUserId = ra.AnswerOwnerUserId THEN 'Same User'
+    ELSE 'Different Users'
+  END AS OwnerAnswererRelation,
+  UPPER(SUBSTRING(hq.Title FROM 1 FOR 3)) AS TitlePrefix,
+  CAST(EXTRACT(EPOCH FROM (ra.AnswerCreationDate - hq.QuestionCreationDate)) / 86400 AS INTEGER) AS DaysBetweenQuestionAndAnswer,
+  COALESCE(ua.DisplayName, 'Unknown') AS DisplayNameOrUnknown,
+  (
+    SELECT COUNT(*) FROM PostLinks pl
+    WHERE pl.PostId = hq.QuestionId AND pl.LinkTypeId = 3
+  ) AS DuplicateLinkCount
+FROM HighScoringQuestions hq
+LEFT JOIN RankedAnswers ra
+  ON hq.QuestionId = ra.QuestionId AND ra.rn = 1
+LEFT JOIN UserActivity ua
+  ON ra.AnswerOwnerUserId = ua.UserId
+WHERE
+  hq.QuestionScore > (SELECT AvgScore FROM AvgQuestionScore)
+  AND ra.Score >= 0
+
+UNION
+
+SELECT
+  hq.QuestionId,
+  hq.Title AS QuestionTitle,
+  hq.QuestionScore,
+  hq.QuestionCreationDate,
+  hq.Tags,
+  hq.AnswerCount AS TotalAnswerCount,
+  ra.AnswerId,
+  ra.Score AS AnswerScore,
+  ra.AnswerCreationDate,
+  ua.DisplayName AS AnswererDisplayName,
+  ua.Reputation AS AnswererReputation,
+  ua.CommentCount AS AnswererCommentCount,
+  ua.VoteCount AS AnswererVoteCount,
+  ua.PostEditCount AS AnswererEditCount,
+  ua.LastAccessDate AS AnswererLastAccessDate,
+  CASE
+    WHEN hq.QuestionOwnerUserId = ra.AnswerOwnerUserId THEN 'Same User'
+    ELSE 'Different Users'
+  END AS OwnerAnswererRelation,
+  UPPER(SUBSTRING(hq.Title FROM 1 FOR 3)) AS TitlePrefix,
+  CAST(EXTRACT(EPOCH FROM (ra.AnswerCreationDate - hq.QuestionCreationDate)) / 86400 AS INTEGER) AS DaysBetweenQuestionAndAnswer,
+  COALESCE(ua.DisplayName, 'Unknown') AS DisplayNameOrUnknown,
+  (
+    SELECT COUNT(*) FROM PostLinks pl
+    WHERE pl.PostId = hq.QuestionId AND pl.LinkTypeId = 3
+  ) AS DuplicateLinkCount
+FROM HighScoringQuestions hq
+RIGHT JOIN RankedAnswers ra
+  ON hq.QuestionId = ra.QuestionId AND ra.rn = 2
+LEFT JOIN UserActivity ua
+  ON ra.AnswerOwnerUserId = ua.UserId
+WHERE
+  COALESCE(hq.QuestionScore, 0) <= (SELECT AvgScore FROM AvgQuestionScore)
+  AND ra.Score >= 0;

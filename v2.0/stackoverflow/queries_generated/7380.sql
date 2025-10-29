@@ -1,0 +1,206 @@
+-- {"query": "7380.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2211} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT c.Id) as Comments,
+        COUNT(DISTINCT b.Id) as Badges,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) as ReputationRank,
+        DENSE_RANK() OVER (ORDER BY u.Views DESC) as ViewRank,
+        NTILE(100) OVER (ORDER BY u.Reputation) as ReputationPercentile
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.AccountId IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostStats AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.Tags,
+        p.FavoriteCount,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Question with Answer'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            ELSE 'Other'
+        END as PostCategory,
+        COALESCE(p.Tags, '') as CleanTags,
+        LENGTH(COALESCE(p.Tags, '')) as TagsLength,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId IN (2,3)) as VoteCount,
+        (SELECT AVG(v.BountyAmount) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 8) as AvgBounty,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) as CommentCountReal,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = p.Id AND a.Score > 0)
+            ELSE 0
+        END as PositiveAnswers
+    FROM Posts p
+    WHERE p.CreationDate >= '2010-01-01'::timestamp
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            ELSE 'Niche'
+        END as TagPopularity,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as PopularityRank,
+        AVG(t.Count) OVER () as AvgTagCount
+    FROM Tags t
+),
+ComplexUserAnalysis AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.Views,
+        uas.UpVotes,
+        uas.DownVotes,
+        uas.TotalPosts,
+        uas.Questions,
+        uas.Answers,
+        uas.Comments,
+        uas.Badges,
+        uas.ReputationRank,
+        uas.ViewRank,
+        uas.ReputationPercentile,
+        CASE 
+            WHEN uas.Reputation > 10000 AND uas.TotalPosts > 100 THEN 'Elite'
+            WHEN uas.Reputation > 1000 AND uas.TotalPosts > 50 THEN 'Veteran'
+            WHEN uas.Reputation > 100 AND uas.TotalPosts > 10 THEN 'Active'
+            ELSE 'Regular'
+        END as UserLevel,
+        DATEDIFF('DAY', uas.LastPostDate, CURRENT_TIMESTAMP) as DaysSinceLastPost,
+        DATEDIFF('DAY', uas.LastCommentDate, CURRENT_TIMESTAMP) as DaysSinceLastComment,
+        CASE 
+            WHEN uas.Views > 10000 OR uas.UpVotes > 1000 THEN 'HighlyEngaged'
+            WHEN uas.Views > 1000 OR uas.UpVotes > 100 THEN 'Engaged'
+            ELSE 'Regular'
+        END as EngagementLevel
+    FROM UserActivityStats uas
+),
+FilteredPosts AS (
+    SELECT 
+        ps.PostId,
+        ps.Title,
+        ps.Score,
+        ps.ViewCount,
+        ps.CreationDate,
+        ps.OwnerUserId,
+        ps.PostTypeId,
+        ps.AnswerCount,
+        ps.CommentCount,
+        ps.Tags,
+        ps.FavoriteCount,
+        ps.PostCategory,
+        ps.CleanTags,
+        ps.TagsLength,
+        ps.VoteCount,
+        ps.AvgBounty,
+        ps.CommentCountReal,
+        ps.PositiveAnswers,
+        CASE 
+            WHEN ps.Score > 100 AND ps.ViewCount > 1000 THEN 'HighImpact'
+            WHEN ps.Score > 50 AND ps.ViewCount > 500 THEN 'MediumImpact'
+            ELSE 'LowImpact'
+        END as ImpactLevel,
+        (ps.ViewCount * 0.8 + ps.Score * 0.2) as EngagementScore,
+        DATEDIFF('MONTH', ps.CreationDate, CURRENT_TIMESTAMP) as AgeInMonths,
+        COALESCE(ps.Tags, '') as NormalizedTags,
+        POSITION('java' IN LOWER(COALESCE(ps.Tags, ''))) as JavaTagPosition,
+        POSITION('python' IN LOWER(COALESCE(ps.Tags, ''))) as PythonTagPosition
+    FROM PostStats ps
+    WHERE ps.Score IS NOT NULL AND ps.ViewCount IS NOT NULL
+)
+SELECT 
+    'Report Summary' as ReportType,
+    COUNT(*) as TotalRecords,
+    COUNT(DISTINCT fp.PostId) as DistinctPosts,
+    COUNT(DISTINCT fua.UserId) as DistinctUsers,
+    AVG(fp.ViewCount) as AvgViews,
+    AVG(fp.Score) as AvgScore,
+    AVG(fp.VoteCount) as AvgVotes,
+    MAX(fp.CreationDate) as LatestPostDate,
+    MIN(fp.CreationDate) as EarliestPostDate,
+    SUM(CASE WHEN fp.PostCategory = 'Question' THEN 1 ELSE 0 END) as QuestionCount,
+    SUM(CASE WHEN fp.PostCategory = 'Answer' THEN 1 ELSE 0 END) as AnswerCount,
+    SUM(CASE WHEN fp.PostCategory = 'Question with Answer' THEN 1 ELSE 0 END) as QWithAnswerCount,
+    COUNT(DISTINCT CASE WHEN fp.AvgBounty > 0 THEN fp.PostId END) as BountyPosts,
+    AVG(CASE WHEN fp.AvgBounty > 0 THEN fp.AvgBounty END) as AvgBountyAmount,
+    COUNT(DISTINCT CASE WHEN fp.ImpactLevel = 'HighImpact' THEN fp.PostId END) as HighImpactPosts,
+    COUNT(DISTINCT CASE WHEN fp.ImpactLevel = 'MediumImpact' THEN fp.PostId END) as MediumImpactPosts,
+    COUNT(DISTINCT CASE WHEN fp.ImpactLevel = 'LowImpact' THEN fp.PostId END) as LowImpactPosts
+FROM FilteredPosts fp
+FULL OUTER JOIN ComplexUserAnalysis fua ON fp.OwnerUserId = fua.UserId
+WHERE (fp.PostId IS NOT NULL OR fua.UserId IS NOT NULL)
+UNION ALL
+SELECT 
+    'Detailed Analysis' as ReportType,
+    COUNT(*) as TotalRecords,
+    COUNT(DISTINCT fp.PostId) as DistinctPosts,
+    COUNT(DISTINCT fua.UserId) as DistinctUsers,
+    AVG(fp.ViewCount) as AvgViews,
+    AVG(fp.Score) as AvgScore,
+    AVG(fp.VoteCount) as AvgVotes,
+    MAX(fp.CreationDate) as LatestPostDate,
+    MIN(fp.CreationDate) as EarliestPostDate,
+    SUM(CASE WHEN fp.PostCategory = 'Question' THEN 1 ELSE 0 END) as QuestionCount,
+    SUM(CASE WHEN fp.PostCategory = 'Answer' THEN 1 ELSE 0 END) as AnswerCount,
+    SUM(CASE WHEN fp.PostCategory = 'Question with Answer' THEN 1 ELSE 0 END) as QWithAnswerCount,
+    COUNT(DISTINCT CASE WHEN fp.AvgBounty > 0 THEN fp.PostId END) as BountyPosts,
+    AVG(CASE WHEN fp.AvgBounty > 0 THEN fp.AvgBounty END) as AvgBountyAmount,
+    COUNT(DISTINCT CASE WHEN fp.ImpactLevel = 'HighImpact' THEN fp.PostId END) as HighImpactPosts,
+    COUNT(DISTINCT CASE WHEN fp.ImpactLevel = 'MediumImpact' THEN fp.PostId END) as MediumImpactPosts,
+    COUNT(DISTINCT CASE WHEN fp.ImpactLevel = 'LowImpact' THEN fp.PostId END) as LowImpactPosts
+FROM FilteredPosts fp
+LEFT JOIN ComplexUserAnalysis fua ON fp.OwnerUserId = fua.UserId
+WHERE fp.CreationDate >= '2015-01-01'::timestamp
+AND (
+    fp.Score > (SELECT AVG(Score) FROM Posts WHERE Score IS NOT NULL) 
+    OR fp.ViewCount > (SELECT AVG(ViewCount) FROM Posts WHERE ViewCount IS NOT NULL)
+)
+UNION ALL
+SELECT 
+    'Tag Analysis Summary' as ReportType,
+    COUNT(*) as TotalRecords,
+    0 as DistinctPosts,
+    0 as DistinctUsers,
+    0 as AvgViews,
+    0 as AvgScore,
+    0 as AvgVotes,
+    NULL as LatestPostDate,
+    NULL as EarliestPostDate,
+    0 as QuestionCount,
+    0 as AnswerCount,
+    0 as QWithAnswerCount,
+    0 as BountyPosts,
+    0 as AvgBountyAmount,
+    0 as HighImpactPosts,
+    0 as MediumImpactPosts,
+    0 as LowImpactPosts
+FROM TagAnalysis ta
+WHERE ta.Count > (SELECT AVG(Count) FROM Tags WHERE Count IS NOT NULL)
+AND ta.TagName IS NOT NULL
+ORDER BY ReportType DESC;

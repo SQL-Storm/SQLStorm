@@ -1,0 +1,124 @@
+WITH
+    recent_questions AS (
+        SELECT
+            p.Id,
+            p.Title,
+            p.OwnerUserId,
+            p.CreationDate,
+            p.Score,
+            p.ViewCount,
+            p.Tags,
+            p.AnswerCount,
+            p.FavoriteCount,
+            COALESCE(p.Tags, '') AS raw_tags
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+          AND p.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '180 days')
+        ORDER BY p.CreationDate DESC
+        LIMIT 2000
+    ),
+    question_answer_stats AS (
+        SELECT
+            q.Id AS QuestionId,
+            COUNT(a.Id) AS TotalAnswers,
+            AVG(a.Score) FILTER (WHERE a.Score IS NOT NULL) AS AvgAnswerScore,
+            MAX(a.Score) AS MaxAnswerScore
+        FROM recent_questions q
+        LEFT JOIN Posts a
+          ON a.ParentId = q.Id
+         AND a.PostTypeId = 2
+        GROUP BY q.Id
+    ),
+    user_rank AS (
+        SELECT
+            u.Id,
+            u.DisplayName,
+            u.Reputation,
+            RANK() OVER (ORDER BY u.Reputation DESC) AS RepRank,
+            COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+            COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+            COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges
+        FROM Users u
+        LEFT JOIN Badges b ON b.UserId = u.Id
+        GROUP BY u.Id, u.DisplayName, u.Reputation
+    ),
+    tag_expansion AS (
+        SELECT
+            q.Id AS QuestionId,
+            UNNEST(string_to_array(SUBSTRING(q.Tags FROM 2 FOR (LENGTH(q.Tags) - 2)), '><')) AS Tag
+        FROM recent_questions q
+        WHERE q.Tags IS NOT NULL
+    ),
+    tag_stats AS (
+        SELECT
+            t.Tag,
+            COUNT(DISTINCT t.QuestionId) AS QuestionCount,
+            SUM(CASE WHEN q.AnswerCount > 0 THEN 1 ELSE 0 END) AS QuestionsWithAnswers,
+            AVG(q.Score) AS AvgQuestionScore
+        FROM tag_expansion t
+        JOIN recent_questions q ON q.Id = t.QuestionId
+        GROUP BY t.Tag
+    ),
+    top_tags AS (
+        SELECT
+            Tag,
+            QuestionCount,
+            QuestionsWithAnswers,
+            AvgQuestionScore,
+            RANK() OVER (ORDER BY QuestionCount DESC) AS TagRank
+        FROM tag_stats
+    )
+SELECT
+    q.Id                               AS QuestionId,
+    q.Title,
+    u.DisplayName                      AS OwnerName,
+    u.Reputation,
+    ur.RepRank,
+    qq.TotalAnswers,
+    qq.AvgAnswerScore,
+    qq.MaxAnswerScore,
+    COALESCE(q.FavoriteCount, 0)       AS FavoriteCount,
+    COALESCE(q.ViewCount, 0)           AS ViewCount,
+    CASE
+        WHEN q.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN q.CommunityOwnedDate IS NOT NULL THEN 'CommunityOwned'
+        ELSE 'Open'
+    END                                 AS Status,
+    COALESCE(ur.GoldBadges, 0)          AS GoldBadges,
+    COALESCE(ur.SilverBadges, 0)        AS SilverBadges,
+    COALESCE(ur.BronzeBadges, 0)        AS BronzeBadges,
+    STRING_AGG(DISTINCT tt.Tag, ', ') FILTER (WHERE tt.Tag IS NOT NULL) AS TagsList,
+    MAX(tt.TagRank) FILTER (WHERE tt.TagRank <= 10)                 AS TopTagRank
+FROM recent_questions q
+LEFT JOIN question_answer_stats qq ON qq.QuestionId = q.Id
+LEFT JOIN Users u                   ON u.Id = q.OwnerUserId
+LEFT JOIN user_rank ur              ON ur.Id = u.Id
+LEFT JOIN tag_expansion te          ON te.QuestionId = q.Id
+LEFT JOIN top_tags tt               ON tt.Tag = te.Tag
+GROUP BY
+    q.Id, q.Title, u.DisplayName, u.Reputation, ur.RepRank,
+    qq.TotalAnswers, qq.AvgAnswerScore, qq.MaxAnswerScore,
+    q.FavoriteCount, q.ViewCount, q.ClosedDate, q.CommunityOwnedDate,
+    ur.GoldBadges, ur.SilverBadges, ur.BronzeBadges
+HAVING COUNT(*) > 0
+UNION ALL
+SELECT
+    NULL AS QuestionId,
+    NULL AS Title,
+    NULL AS OwnerName,
+    NULL AS Reputation,
+    NULL AS RepRank,
+    NULL AS TotalAnswers,
+    NULL AS AvgAnswerScore,
+    NULL AS MaxAnswerScore,
+    NULL AS FavoriteCount,
+    NULL AS ViewCount,
+    NULL AS Status,
+    NULL AS GoldBadges,
+    NULL AS SilverBadges,
+    NULL AS BronzeBadges,
+    tt.Tag                                 AS TagsList,
+    tt.TagRank                             AS TopTagRank
+FROM top_tags tt
+WHERE tt.TagRank <= 10
+ORDER BY RepRank NULLS LAST, TopTagRank NULLS LAST;

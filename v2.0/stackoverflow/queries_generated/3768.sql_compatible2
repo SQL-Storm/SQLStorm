@@ -1,0 +1,137 @@
+WITH UserStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.UpVotes, 0) - COALESCE(u.DownVotes, 0) AS VoteBalance,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadges,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS QuestionCount,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS AnswerCount,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank
+    FROM Users u
+    WHERE u.Reputation > 1000
+),
+RecentPosts AS (
+    SELECT
+        p.OwnerUserId,
+        MAX(p.CreationDate) AS LastPostDate,
+        SUM(COALESCE(p.Score, 0)) AS TotalScore,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsPosted,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersPosted
+    FROM Posts p
+    WHERE p.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '180 days')
+    GROUP BY p.OwnerUserId
+),
+TagPopularity AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        COALESCE(e.ExcerptLength, 0) AS ExcerptLen,
+        COALESCE(w.WikiLength, 0) AS WikiLen,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank
+    FROM Tags t
+    LEFT JOIN LATERAL (
+        SELECT LENGTH(p.Body) AS ExcerptLength
+        FROM Posts p
+        WHERE p.Id = t.ExcerptPostId
+        LIMIT 1
+    ) e ON TRUE
+    LEFT JOIN LATERAL (
+        SELECT LENGTH(p.Body) AS WikiLength
+        FROM Posts p
+        WHERE p.Id = t.WikiPostId
+        LIMIT 1
+    ) w ON TRUE
+    WHERE t.IsModeratorOnly = 0
+),
+UserTagActivity AS (
+    SELECT
+        us.Id,
+        us.DisplayName,
+        STRING_AGG(DISTINCT tg.TagName, ', ') FILTER (WHERE tg.TagName IS NOT NULL) AS TagsUsed,
+        COUNT(DISTINCT tg.TagName) AS DistinctTagCount
+    FROM UserStats us
+    LEFT JOIN Posts p
+        ON p.OwnerUserId = us.Id AND p.PostTypeId = 1
+    LEFT JOIN LATERAL (
+        SELECT UNNEST(string_to_array(SUBSTR(p.Tags, 2, LENGTH(p.Tags) - 2), '><')) AS TagName
+    ) tg ON TRUE
+    GROUP BY us.Id, us.DisplayName
+),
+Combined AS (
+    SELECT
+        us.Id,
+        us.DisplayName,
+        us.Reputation,
+        us.VoteBalance,
+        us.GoldBadges,
+        us.SilverBadges,
+        us.BronzeBadges,
+        us.QuestionCount,
+        us.AnswerCount,
+        us.RepRank,
+        COALESCE(rp.LastPostDate, CAST('1970-01-01' AS timestamp)) AS LastPostDate,
+        COALESCE(rp.TotalScore, 0) AS RecentScore,
+        COALESCE(rp.QuestionsPosted, 0) AS RecentQuestions,
+        COALESCE(rp.AnswersPosted, 0) AS RecentAnswers,
+        uta.TagsUsed,
+        uta.DistinctTagCount
+    FROM UserStats us
+    LEFT JOIN RecentPosts rp ON rp.OwnerUserId = us.Id
+    LEFT JOIN UserTagActivity uta ON uta.Id = us.Id
+)
+SELECT *
+FROM (
+    SELECT *
+    FROM Combined
+    WHERE (RecentScore > 0 AND DistinctTagCount >= 3)
+       OR (GoldBadges >= 5 AND Reputation > 20000)
+    ORDER BY RepRank
+    LIMIT 100
+
+    UNION ALL
+
+    SELECT
+        CAST(NULL AS BIGINT) AS Id,
+        'Summary' AS DisplayName,
+        CAST(NULL AS BIGINT) AS Reputation,
+        CAST(NULL AS BIGINT) AS VoteBalance,
+        CAST(NULL AS INTEGER) AS GoldBadges,
+        CAST(NULL AS INTEGER) AS SilverBadges,
+        CAST(NULL AS INTEGER) AS BronzeBadges,
+        CAST(NULL AS INTEGER) AS QuestionCount,
+        CAST(NULL AS INTEGER) AS AnswerCount,
+        CAST(NULL AS BIGINT) AS RepRank,
+        MAX(LastPostDate) AS LastPostDate,
+        SUM(RecentScore) AS RecentScore,
+        SUM(RecentQuestions) AS RecentQuestions,
+        SUM(RecentAnswers) AS RecentAnswers,
+        CAST(NULL AS TEXT) AS TagsUsed,
+        CAST(NULL AS INTEGER) AS DistinctTagCount
+    FROM Combined
+    WHERE RepRank IS NOT NULL
+
+    EXCEPT
+
+    SELECT
+        Id,
+        DisplayName,
+        Reputation,
+        VoteBalance,
+        GoldBadges,
+        SilverBadges,
+        BronzeBadges,
+        QuestionCount,
+        AnswerCount,
+        RepRank,
+        LastPostDate,
+        RecentScore,
+        RecentQuestions,
+        RecentAnswers,
+        TagsUsed,
+        DistinctTagCount
+    FROM Combined
+    WHERE RepRank > 2000
+) t;

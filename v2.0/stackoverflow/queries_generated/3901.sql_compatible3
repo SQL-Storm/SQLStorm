@@ -1,0 +1,185 @@
+WITH 
+    UserStats AS (
+        SELECT 
+            u.Id                             AS UserId,
+            u.DisplayName,
+            u.Reputation,
+            u.CreationDate,
+            u.LastAccessDate,
+            COALESCE(p.TotalPosts, 0)        AS TotalPosts,
+            COALESCE(a.Answers, 0)           AS AnswerCount,
+            COALESCE(q.Questions, 0)         AS QuestionCount,
+            COALESCE(b.BadgeCount, 0)        AS BadgeCount,
+            COALESCE(v.UpVotes, 0)           AS UpVoteCount,
+            COALESCE(v.DownVotes, 0)         AS DownVoteCount,
+            COALESCE(v.FavVotes, 0)          AS FavoriteCount
+        FROM Users u
+        LEFT JOIN (
+            SELECT OwnerUserId, COUNT(*) AS TotalPosts
+            FROM Posts
+            GROUP BY OwnerUserId
+        ) p ON p.OwnerUserId = u.Id
+        LEFT JOIN (
+            SELECT OwnerUserId, COUNT(*) AS Answers
+            FROM Posts
+            WHERE PostTypeId = 2
+            GROUP BY OwnerUserId
+        ) a ON a.OwnerUserId = u.Id
+        LEFT JOIN (
+            SELECT OwnerUserId, COUNT(*) AS Questions
+            FROM Posts
+            WHERE PostTypeId = 1
+            GROUP BY OwnerUserId
+        ) q ON q.OwnerUserId = u.Id
+        LEFT JOIN (
+            SELECT UserId, COUNT(*) AS BadgeCount
+            FROM Badges
+            GROUP BY UserId
+        ) b ON b.UserId = u.Id
+        LEFT JOIN (
+            SELECT 
+                UserId,
+                SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+                SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+                SUM(CASE WHEN VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavVotes
+            FROM Votes
+            GROUP BY UserId
+        ) v ON v.UserId = u.Id
+    ),
+
+    TopUsers AS (
+        SELECT 
+            us.UserId,
+            us.DisplayName,
+            us.Reputation,
+            us.CreationDate,
+            us.LastAccessDate,
+            us.TotalPosts,
+            us.AnswerCount,
+            us.QuestionCount,
+            us.BadgeCount,
+            us.UpVoteCount,
+            us.DownVoteCount,
+            us.FavoriteCount,
+            (us.TotalPosts * 0.4
+             + us.AnswerCount * 0.3
+             + us.QuestionCount * 0.2
+             + us.BadgeCount * 0.1)           AS CompositeScore,
+            DENSE_RANK() OVER (ORDER BY 
+                (us.TotalPosts * 0.4
+                 + us.AnswerCount * 0.3
+                 + us.QuestionCount * 0.2
+                 + us.BadgeCount * 0.1) DESC) AS RankPos
+        FROM UserStats us
+        WHERE us.TotalPosts > 0
+    ),
+
+    RecentActivity AS (
+        SELECT 
+            u.Id                                      AS UserId,
+            MAX(p.LastActivityDate)                   AS LastPostActivity,
+            MAX(c.CreationDate)                       AS LastCommentDate,
+            MAX(v.CreationDate)                       AS LastVoteDate
+        FROM Users u
+        LEFT JOIN Posts p    ON p.OwnerUserId = u.Id
+        LEFT JOIN Comments c ON c.UserId      = u.Id
+        LEFT JOIN Votes v    ON v.UserId      = u.Id
+        GROUP BY u.Id
+    ),
+
+    TagCooccurrence AS (
+        -- replace regexp_split_to_table lateral usage with a portable approach assuming Tags column uses <tag1><tag2>... format
+        -- explode tags by splitting; some dialects use different functions, here we attempt ANSI-compatible approach using a recursive split
+        WITH RECURSIVE split_tags(post_id, rest, tag) AS (
+            SELECT p.Id, p.Tags, NULL
+            FROM Posts p
+            UNION ALL
+            SELECT post_id,
+                   CASE
+                     WHEN POSITION('><' IN rest) > 0 THEN SUBSTRING(rest FROM POSITION('><' IN rest)+2)
+                     ELSE ''
+                   END,
+                   CASE
+                     WHEN POSITION('><' IN rest) > 0 THEN SUBSTRING(rest FROM 2 FOR POSITION('><' IN rest)-2)
+                     ELSE CASE WHEN rest <> '' THEN SUBSTRING(rest FROM 2 FOR CHAR_LENGTH(rest)-2) ELSE NULL END
+                   END
+            FROM split_tags
+            WHERE rest IS NOT NULL AND rest <> ''
+        )
+        SELECT 
+            t1.TagName AS TagA,
+            t2.TagName AS TagB,
+            COUNT(*)   AS CooccurCount
+        FROM split_tags st1
+        JOIN Tags t1 ON t1.TagName = st1.tag
+        JOIN split_tags st2 ON st2.post_id = st1.post_id AND st2.tag IS NOT NULL
+        JOIN Tags t2 ON t2.TagName = st2.tag AND t2.TagName > t1.TagName
+        GROUP BY t1.TagName, t2.TagName
+        HAVING COUNT(*) > 100
+    ),
+
+    Combined AS (
+        SELECT 
+            tu.UserId,
+            tu.DisplayName,
+            tu.Reputation,
+            tu.CompositeScore,
+            tu.RankPos,
+            ra.LastPostActivity,
+            CASE 
+                WHEN ra.LastPostActivity IS NULL THEN NULL
+                ELSE EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - ra.LastPostActivity))/86400
+            END                                   AS DaysSinceLastPost,
+            (tu.UpVoteCount - tu.DownVoteCount) AS NetVotes,
+            tu.FavoriteCount,
+            (SELECT STRING_AGG(t.TagName, ', ')
+             FROM Posts p2
+             JOIN (
+                 WITH RECURSIVE split_tags2(post_id, rest, tag) AS (
+                     SELECT p2_inner.Id, p2_inner.Tags, NULL
+                     FROM Posts p2_inner
+                     WHERE p2_inner.OwnerUserId = tu.UserId
+                     UNION ALL
+                     SELECT post_id,
+                            CASE
+                              WHEN POSITION('><' IN rest) > 0 THEN SUBSTRING(rest FROM POSITION('><' IN rest)+2)
+                              ELSE ''
+                            END,
+                            CASE
+                              WHEN POSITION('><' IN rest) > 0 THEN SUBSTRING(rest FROM 2 FOR POSITION('><' IN rest)-2)
+                              ELSE CASE WHEN rest <> '' THEN SUBSTRING(rest FROM 2 FOR CHAR_LENGTH(rest)-2) ELSE NULL END
+                            END
+                     FROM split_tags2
+                     WHERE rest IS NOT NULL AND rest <> ''
+                 )
+                 SELECT tag FROM split_tags2 WHERE tag IS NOT NULL
+             ) st ON st.tag IS NOT NULL
+             JOIN Tags t ON t.TagName = st.tag
+             WHERE p2.OwnerUserId = tu.UserId
+             GROUP BY p2.OwnerUserId
+             ORDER BY COUNT(*) DESC
+             LIMIT 5)                           AS TopTags
+        FROM TopUsers tu
+        LEFT JOIN RecentActivity ra ON ra.UserId = tu.UserId
+    )
+
+SELECT *
+FROM Combined
+WHERE RankPos <= 50
+ORDER BY CompositeScore DESC
+
+UNION ALL
+
+SELECT 
+    CAST(NULL AS bigint) AS UserId,
+    CAST(NULL AS varchar) AS DisplayName,
+    CAST(NULL AS integer) AS Reputation,
+    CAST(NULL AS double precision) AS CompositeScore,
+    CAST(NULL AS integer) AS RankPos,
+    CAST(NULL AS timestamp) AS LastPostActivity,
+    CAST(NULL AS double precision) AS DaysSinceLastPost,
+    CAST(NULL AS integer) AS NetVotes,
+    CAST(NULL AS integer) AS FavoriteCount,
+    CAST(NULL AS varchar) AS TopTags
+FROM (SELECT 1) AS _dummy
+WHERE NOT EXISTS (SELECT 1 FROM Combined WHERE RankPos <= 50);

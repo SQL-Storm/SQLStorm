@@ -1,0 +1,124 @@
+-- {"query": "5254.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 968} 
+WITH per_post AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.OwnerUserId,
+    p.ViewCount,
+    p.Score,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.LastEditDate,
+    p.LastEditorUserId,
+    p.LastEditorDisplayName,
+    p.ContentLicense,
+    -- compute a dynamic difficulty score for benchmarking
+    (CASE WHEN p.Score > 0 THEN 1.0 * p.Score / NULLIF(p.ViewCount,0) ELSE 0 END) AS engagement_ratio,
+    (EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - p.CreationDate)) / 3600.0) AS hours_since_created
+  FROM Posts p
+),
+recent_comments AS (
+  SELECT
+    c.PostId,
+    COUNT(*) AS CommentCountRecent
+  FROM Comments c
+  WHERE c.CreationDate >= CURRENT_DATE - INTERVAL '30 days'
+  GROUP BY c.PostId
+),
+owner_activity AS (
+  SELECT
+    u.Id AS UserId,
+    u.Reputation,
+    u.CreationDate AS UserCreated,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.AccountId,
+    u.Location,
+    u.DisplayName
+  FROM Users u
+),
+tag_info AS (
+  SELECT
+    t.Id AS TagId,
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId,
+    t.IsModeratorOnly,
+    t.IsRequired
+  FROM Tags t
+),
+-- sample correlated subquery to fetch last edit details per post
+last_edit AS (
+  SELECT
+    ph.PostId,
+    ph.RevisionGUID,
+    ph.Id AS HistoryId,
+    ph.CreationDate AS RevisionDate,
+    ph.UserId AS EditorUserId,
+    ph.UserDisplayName,
+    ph.Comment
+  FROM PostHistory ph
+  WHERE ph.PostHistoryTypeId IN (4,5,6,8,9,15,16,19,20)
+    AND ph.PostId = p.PostId
+  ORDER BY ph.CreationDate DESC
+  LIMIT 1
+  )
+SELECT
+  pr.PostId,
+  pr.PostTypeId,
+  pt.Name AS PostTypeName,
+  pr.Title,
+  pr.Tags,
+  pr.CreationDate,
+  pr.LastActivityDate,
+  pr.OwnerUserId,
+  ou.DisplayName AS OwnerDisplayName,
+  ou.Reputation AS OwnerReputation,
+  COALESCE(rc.CommentCountRecent, 0) AS RecentComments,
+  pr.ViewCount,
+  pr.Score,
+  pr.CommentCount,
+  pr.FavoriteCount,
+  pr.AcceptedAnswerId,
+  pr.ParentId,
+  pr.LastEditDate,
+  pr.LastEditorUserId,
+  le.RevisionDate AS LastEditDateBenchmark,
+  le.EditorUserId AS LastEditorBenchmarkUserId,
+  le.Comment AS LastEditComment,
+  (CASE WHEN pr.PostTypeId = 1 THEN pr.AnswerCount ELSE NULL END) AS AnswerCountBenchmark,
+  eng.engagement_ratio,
+  eng.hours_since_created,
+  -- aggregate: join to a couple of related entities to increase complexity
+  bl.Name AS BadgeName,
+  bl.Class AS BadgeClass,
+  ta.TagName AS TagNameBenchmark,
+  vt.Name AS VoteTypeBench
+FROM per_post pr
+LEFT JOIN PostTypes pt ON pr.PostTypeId = pt.Id
+LEFT JOIN recent_comments rc ON rc.PostId = pr.PostId
+LEFT JOIN Users ou ON pr.OwnerUserId = ou.Id
+LEFT JOIN owner_activity oa ON oa.UserId = pr.OwnerUserId
+LEFT JOIN LATERAL (
+  SELECT engagement_ratio, hours_since_created
+  FROM per_post eng
+  WHERE eng.PostId = pr.PostId
+) eng ON TRUE
+LEFT JOIN PostHistory le ON le.PostId = pr.PostId
+LEFT JOIN Badges bl ON bl.UserId = pr.OwnerUserId
+LEFT JOIN Tags ta ON ta.Id = (SELECT Id FROM Tags t2 WHERE t2.TagName = ANY (STRING_TO_ARRAY(REGEXP_REPLACE(pr.Tags, '[<>]', '', 'g'), '><')) LIMIT 1)
+LEFT JOIN Votes vt ON vt.PostId = pr.PostId
+WHERE
+  pr.LastActivityDate >= pr.CreationDate - INTERVAL '1 year'
+  AND (pr.ViewCount > 0 OR pr.Score IS NOT NULL)
+ORDER BY eng.hours_since_created DESC NULLS LAST
+LIMIT 200;

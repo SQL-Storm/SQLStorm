@@ -1,0 +1,325 @@
+with recent_posts as (
+    select
+        p.id,
+        p.posttypeid,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        p.owneruserid as owneruserid,
+        p.title,
+        p.tags,
+        u.displayname as ownername,
+        coalesce(u.location, 'Unknown') as ownerlocation,
+        u.reputation,
+        p.closeddate,
+        p.acceptedanswerid
+    from posts p
+    left join users u on u.id = p.owneruserid
+    where p.creationdate >= (
+        select date_trunc('month', max(creationdate)) - interval '6 months' from posts
+    )
+),
+tag_expanded as (
+    select
+        rp.id as post_id,
+        lower(trim(tg)) as tag
+    from recent_posts rp
+    cross join lateral (
+        select unnest(
+            case
+                when rp.tags is null then array[]::text[]  -- keep as-is when the dialect supports array literal; otherwise this branch yields no rows
+                when length(rp.tags) <= 2 then array[]::text[]
+                else string_to_array(substring(rp.tags from 2 for char_length(rp.tags)-2), '><')
+            end
+        ) as tg
+    ) t
+),
+post_metrics as (
+    select
+        rp.id,
+        rp.posttypeid,
+        rp.creationdate,
+        rp.score,
+        rp.viewcount,
+        rp.owneruserid,
+        rp.title,
+        rp.ownername,
+        rp.ownerlocation,
+        rp.reputation,
+        rp.closeddate,
+        rp.acceptedanswerid,
+        count(distinct c.id) as comment_count,
+        count(distinct case when v.votetypeid = 2 then v.id end) as upvotes,
+        count(distinct case when v.votetypeid = 3 then v.id end) as downvotes,
+        count(distinct case when v.votetypeid = 5 then v.id end) as favorites,
+        count(distinct pl_r.id) filter (where pl_r.linktypeid = 1) as related_links,
+        count(distinct pl_d.id) filter (where pl_d.linktypeid = 3) as duplicate_links
+    from recent_posts rp
+    left join comments c on c.postid = rp.id and c.creationdate >= rp.creationdate and c.creationdate < rp.creationdate + interval '90 days'
+    left join votes v on v.postid = rp.id and v.creationdate >= rp.creationdate and v.creationdate < rp.creationdate + interval '90 days'
+    left join postlinks pl_r on pl_r.postid = rp.id and pl_r.linktypeid = 1
+    left join postlinks pl_d on pl_d.postid = rp.id and pl_d.linktypeid = 3
+    group by
+        rp.id, rp.posttypeid, rp.creationdate, rp.score, rp.viewcount, rp.owneruserid, rp.title, rp.ownername, rp.ownerlocation, rp.reputation, rp.closeddate, rp.acceptedanswerid
+),
+answer_enrichment as (
+    select
+        q.id as question_id,
+        q.acceptedanswerid,
+        a.score as accepted_answer_score,
+        a.owneruserid as accepted_ownerid,
+        au.displayname as accepted_ownername,
+        au.reputation as accepted_owner_rep
+    from post_metrics q
+    left join posts a on a.id = q.acceptedanswerid
+    left join users au on au.id = a.owneruserid
+),
+tag_stats as (
+    select
+        te.tag,
+        count(distinct te.post_id) as tag_post_count,
+        sum(pm.score) as tag_score_sum,
+        avg(nullif(pm.viewcount,0)) as tag_avg_viewcount,
+        count(distinct case when pm.closeddate is not null then pm.id end) as tag_closed_count
+    from tag_expanded te
+    join post_metrics pm on pm.id = te.post_id
+    group by te.tag
+),
+user_activity as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        date_trunc('month', u.creationdate) as cohort_month,
+        count(distinct p.id) as posts_created,
+        sum(p.score) as total_post_score,
+        sum(pm.comment_count) as total_comments_received,
+        sum(pm.upvotes) as total_upvotes_received,
+        sum(pm.downvotes) as total_downvotes_received
+    from users u
+    left join posts p on p.owneruserid = u.id
+    left join post_metrics pm on pm.id = p.id
+    where exists (select 1 from recent_posts rp where rp.owneruserid = u.id)
+    group by u.id, u.displayname, u.reputation, date_trunc('month', u.creationdate)
+),
+ranked_posts as (
+    select
+        pm.*,
+        row_number() over (partition by pm.posttypeid order by pm.score desc NULLS LAST, pm.viewcount desc NULLS LAST, pm.creationdate desc) as rn_score,
+        row_number() over (partition by pm.posttypeid order by pm.viewcount desc NULLS LAST, pm.score desc NULLS LAST, pm.creationdate desc) as rn_views,
+        NULL as median_score_overall,
+        NULL as median_views_overall,
+        sum(pm.upvotes - pm.downvotes) over (order by pm.creationdate rows between unbounded preceding and current row) as running_net_votes
+    from post_metrics pm
+),
+closed_reason_counts as (
+    select
+        ph.postid,
+        count(*) filter (where ph.posthistorytypeid = 10) as close_events,
+        count(*) filter (where ph.posthistorytypeid = 11) as reopen_events,
+        sum(
+            case
+                when ph.posthistorytypeid = 10 then
+                    case
+                        when ph.comment ~ '^[0-9]+$' then 1
+                        else 0
+                    end
+                else 0
+            end
+        ) as close_reason_records
+    from posthistory ph
+    where ph.posthistorytypeid in (10,11)
+    group by ph.postid
+),
+post_tag_concat as (
+    select
+        pm.id,
+        string_agg(distinct te.tag, ',' order by te.tag) as tag_list,
+        count(distinct te.tag) as tag_count
+    from ranked_posts pm
+    left join tag_expanded te on te.post_id = pm.id
+    group by pm.id
+),
+heavy_predicate as (
+    select
+        rp.id
+    from ranked_posts rp
+    left join post_tag_concat ptc on ptc.id = rp.id
+    where
+        coalesce(rp.score, 0) * 2 + coalesce(rp.viewcount, 0) / 100
+        + greatest(coalesce(rp.upvotes,0) - coalesce(rp.downvotes,0), 0)
+        + coalesce(rp.comment_count, 0) / 2
+        - case when rp.closeddate is not null then 5 else 0 end
+        + coalesce(char_length(rp.title), 0) / 50
+        + coalesce(ptc.tag_count, 0)
+        > (
+            select avg(coalesce(score,0) * 2 + coalesce(viewcount,0) / 100)
+            from ranked_posts
+        )
+),
+dupe_graph as (
+    select
+        pm.id as post_id,
+        count(distinct pl.relatedpostid) filter (where pl.linktypeid = 3) as duplicates_of,
+        count(distinct pl.postid) filter (where pl.linktypeid = 3) as has_duplicates
+    from ranked_posts pm
+    left join postlinks pl on pl.postid = pm.id or pl.relatedpostid = pm.id
+    group by pm.id
+),
+final_candidates as (
+    select
+        rp.id,
+        rp.posttypeid,
+        rp.creationdate,
+        rp.score,
+        rp.viewcount,
+        rp.owneruserid,
+        rp.title,
+        rp.ownername,
+        rp.ownerlocation,
+        rp.reputation,
+        rp.closeddate,
+        rp.acceptedanswerid,
+        rp.comment_count,
+        rp.upvotes,
+        rp.downvotes,
+        rp.favorites,
+        rp.related_links,
+        rp.duplicate_links,
+        rp.rn_score,
+        rp.rn_views,
+        (select percentile_cont(0.5) within group (order by pm2.score) from post_metrics pm2) as median_score_overall,
+        (select percentile_cont(0.5) within group (order by pm3.viewcount) from post_metrics pm3) as median_views_overall,
+        rp.running_net_votes,
+        ptc.tag_list,
+        ptc.tag_count,
+        coalesce(crc.close_events,0) as close_events,
+        coalesce(crc.reopen_events,0) as reopen_events,
+        coalesce(crc.close_reason_records,0) as close_reason_records,
+        coalesce(dg.duplicates_of,0) as duplicates_of,
+        coalesce(dg.has_duplicates,0) as has_duplicates
+    from ranked_posts rp
+    left join post_tag_concat ptc on ptc.id = rp.id
+    left join closed_reason_counts crc on crc.postid = rp.id
+    left join dupe_graph dg on dg.post_id = rp.id
+    where rp.rn_score <= 500 or rp.rn_views <= 500
+),
+user_summaries as (
+    select
+        fa.owneruserid as user_id,
+        count(*) as candidate_posts,
+        sum(fa.score) as sum_score,
+        avg(fa.score) as avg_score,
+        max(fa.viewcount) as max_views,
+        min(fa.creationdate) as first_post_date,
+        max(fa.creationdate) as last_post_date,
+        count(*) filter (where fa.closeddate is not null) as closed_candidates
+    from final_candidates fa
+    group by fa.owneruserid
+),
+tag_leaders as (
+    select
+        te.tag,
+        pm.owneruserid as user_id,
+        count(*) as tag_posts,
+        row_number() over (partition by te.tag order by count(*) desc, pm.owneruserid) as tag_rank
+    from tag_expanded te
+    join post_metrics pm on pm.id = te.post_id
+    group by te.tag, pm.owneruserid
+),
+normalized_scores as (
+    select
+        fc.id,
+        fc.owneruserid,
+        case
+            when fc.median_score_overall is null or fc.median_score_overall = 0 then null
+            else (cast(fc.score as numeric) / fc.median_score_overall)
+        end as score_norm,
+        case
+            when fc.median_views_overall is null or fc.median_views_overall = 0 then null
+            else (cast(fc.viewcount as numeric) / fc.median_views_overall)
+        end as views_norm
+    from final_candidates fc
+),
+correlated_checks as (
+    select
+        fc.id,
+        exists (
+            select 1
+            from comments c
+            where c.postid = fc.id
+              and c.score >= all (
+                    select coalesce(score, 0) from comments c2 where c2.postid = fc.id
+              )
+              and length(c.text) > 50
+        ) as has_top_long_comment,
+        (select count(*) from votes v where v.postid = fc.id and v.votetypeid = 2) as upvote_count_check
+    from final_candidates fc
+)
+select
+    fc.id as post_id,
+    fc.posttypeid,
+    fc.title,
+    coalesce(fc.ownername, '[unknown]') as ownername,
+    fc.ownerlocation,
+    fc.reputation as owner_reputation,
+    fc.creationdate,
+    fc.score,
+    fc.viewcount,
+    fc.upvotes,
+    fc.downvotes,
+    fc.favorites,
+    fc.comment_count,
+    fc.tag_list,
+    fc.tag_count,
+    fc.close_events,
+    fc.reopen_events,
+    fc.close_reason_records,
+    fc.duplicates_of,
+    fc.has_duplicates,
+    ae.accepted_answer_score,
+    ae.accepted_ownername,
+    ae.accepted_owner_rep,
+    ua.posts_created as owner_recent_posts_created,
+    ua.total_post_score as owner_recent_total_score,
+    us.candidate_posts as owner_candidate_posts,
+    round(cast(ns.score_norm as numeric), 3) as score_norm_vs_median,
+    round(cast(ns.views_norm as numeric), 3) as views_norm_vs_median,
+    cc.has_top_long_comment,
+    cc.upvote_count_check,
+    case
+        when fc.tag_count is null or fc.tag_count = 0 then 'untagged'
+        when fc.tag_count = 1 then 'single-tag'
+        else 'multi-tag'
+    end as tag_profile,
+    case
+        when fc.score >= coalesce(fc.median_score_overall, 0) and fc.viewcount >= coalesce(fc.median_views_overall, 0) then 'high-performer'
+        when fc.score >= coalesce(fc.median_score_overall, 0) then 'score-strong'
+        when fc.viewcount >= coalesce(fc.median_views_overall, 0) then 'views-strong'
+        else 'under-median'
+    end as performance_bucket
+from final_candidates fc
+left join answer_enrichment ae on ae.question_id = fc.id
+left join user_activity ua on ua.user_id = fc.owneruserid
+left join user_summaries us on us.user_id = fc.owneruserid
+left join normalized_scores ns on ns.id = fc.id
+left join correlated_checks cc on cc.id = fc.id
+where fc.id in (select id from heavy_predicate)
+  and (
+        fc.tag_count is null
+        or fc.tag_count between 1 and 5
+        or exists (
+            select 1 from tag_leaders tl
+            where tl.user_id = fc.owneruserid
+              and tl.tag_rank <= 3
+              and tl.tag in (
+                  select unnest(string_to_array(coalesce(fc.tag_list,''), ','))
+              )
+        )
+      )
+order by
+    coalesce(ns.score_norm, 0) + coalesce(ns.views_norm, 0) desc,
+    fc.score desc,
+    fc.viewcount desc,
+    fc.creationdate desc
+limit 1000;

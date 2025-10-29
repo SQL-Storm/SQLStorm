@@ -1,0 +1,131 @@
+WITH RankedPosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.PostTypeId,
+    ROW_NUMBER() OVER (
+      PARTITION BY p.PostTypeId
+      ORDER BY
+        p.Score DESC,
+        p.ViewCount DESC,
+        p.CreationDate DESC
+    ) AS rn
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId IN (1,2)
+),
+TopQ AS (
+  SELECT *
+  FROM RankedPosts
+  WHERE PostTypeId = 1 AND rn = 1
+),
+TopA AS (
+  SELECT
+    a.PostId AS AnswerId,
+    a.PostId AS PostIdForJoin,
+    a.ParentId,
+    a.Title AS AnswerTitle,
+    a.CreationDate AS AnswerDate,
+    a.Score AS AnswerScore,
+    a.OwnerUserId AS AnswerOwner,
+    a.LastActivityDate AS AnswerLastActivity,
+    u.DisplayName AS OwnerDisplayName
+  FROM RankedPosts a
+  LEFT JOIN Users u ON a.OwnerUserId = u.Id
+  WHERE a.PostTypeId = 2
+    AND a.ParentId IN (SELECT Id FROM Posts WHERE PostTypeId = 1)
+),
+TagPopularity AS (
+  SELECT
+    t.TagName,
+    SUM(t.Count) AS TotalTagCount
+  FROM Tags t
+  GROUP BY t.TagName
+),
+ActivityWindow AS (
+  SELECT
+    p.PostId,
+    p.Title,
+    p.CreationDate,
+    p.ViewCount,
+    p.Score,
+    p.Tags,
+    p.LastActivityDate AS LastActivityNormalized,
+    p.rn
+  FROM RankedPosts p
+  WHERE p.rn = 1
+),
+CrossQuery AS (
+  SELECT
+    w.PostId,
+    w.Title,
+    w.CreationDate,
+    w.ViewCount,
+    w.Score,
+    w.Tags,
+    w.LastActivityNormalized,
+    ta.TotalTagCount,
+    CASE
+      WHEN EXISTS (
+        SELECT 1
+        FROM Votes v
+        WHERE v.PostId = w.PostId
+          AND v.VoteTypeId IN (2,4)
+      ) THEN 1 ELSE 0
+    END AS HasUpOrBadVote
+  FROM ActivityWindow w
+  LEFT JOIN TagPopularity ta ON ta.TagName = (
+    SELECT
+      -- extract first tag from string like '<tag1><tag2>'
+      SUBSTRING(
+        w.Tags FROM 2 FOR (CHAR_LENGTH(w.Tags) - 2)
+      )
+  )
+  WHERE w.Score > 0
+)
+SELECT
+  c.PostId,
+  c.Title,
+  c.CreationDate,
+  c.ViewCount,
+  c.Score,
+  c.LastActivityNormalized,
+  c.TotalTagCount,
+  c.HasUpOrBadVote,
+  u.DisplayName AS OwnerDisplay,
+  a.AnswerId,
+  a.ParentId AS QuestionId,
+  a.AnswerDate,
+  a.AnswerScore,
+  a.OwnerDisplayName
+FROM CrossQuery c
+LEFT JOIN Users u ON c.PostId = u.Id
+LEFT JOIN TopA a ON a.ParentId = c.PostId
+
+UNION ALL
+
+SELECT
+  tq.PostId,
+  tq.Title,
+  tq.CreationDate,
+  tq.ViewCount,
+  tq.Score,
+  tq.LastActivityDate AS LastActivityNormalized,
+  NULL AS TotalTagCount,
+  NULL AS HasUpOrBadVote,
+  uq.DisplayName AS OwnerDisplay,
+  NULL AS AnswerId,
+  NULL AS QuestionId,
+  NULL AS AnswerDate,
+  NULL AS AnswerScore,
+  NULL AS AnswerOwner
+FROM TopQ tq
+LEFT JOIN Users uq ON tq.OwnerUserId = uq.Id
+ORDER BY CreationDate DESC
+LIMIT 100;

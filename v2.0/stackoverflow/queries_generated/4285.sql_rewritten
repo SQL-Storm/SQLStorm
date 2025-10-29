@@ -1,0 +1,157 @@
+-- {"query": "4285.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1665} 
+WITH
+  RankedPostHistory AS (
+    SELECT
+      ph.PostId,
+      ph.PostHistoryTypeId,
+      ph.CreationDate,
+      ph.UserId,
+      ph.Comment,
+      ph.Text AS RevisionText,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory AS ph
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6) -- Edits (Title, Body, Tags)
+  ),
+  LatestPostEdits AS (
+    SELECT
+      rph.PostId,
+      MAX(CASE WHEN rph.PostHistoryTypeId = 4 THEN rph.RevisionText ELSE NULL END) AS LatestTitleEdit,
+      MAX(CASE WHEN rph.PostHistoryTypeId = 5 THEN rph.RevisionText ELSE NULL END) AS LatestBodyEdit,
+      MAX(CASE WHEN rph.PostHistoryTypeId = 6 THEN rph.RevisionText ELSE NULL END) AS LatestTagsEdit,
+      MAX(CASE WHEN rph.PostHistoryTypeId = 4 THEN rph.CreationDate ELSE NULL END) AS LatestTitleEditDate,
+      MAX(CASE WHEN rph.PostHistoryTypeId = 5 THEN rph.CreationDate ELSE NULL END) AS LatestBodyEditDate,
+      MAX(CASE WHEN rph.PostHistoryTypeId = 6 THEN rph.CreationDate ELSE NULL END) AS LatestTagsEditDate,
+      MAX(CASE WHEN rph.PostHistoryTypeId IN (4, 5, 6) THEN rph.CreationDate ELSE NULL END) AS LatestAnyEditDate,
+      STRING_AGG(u.DisplayName, ', ') AS EditorsOfLatestEdit
+    FROM RankedPostHistory AS rph
+    LEFT JOIN Users AS u
+      ON rph.UserId = u.Id
+    WHERE
+      rph.rn = 1
+    GROUP BY
+      rph.PostId
+  ),
+  QuestionDetails AS (
+    SELECT
+      p.Id AS QuestionId,
+      p.Title,
+      p.CreationDate AS QuestionCreationDate,
+      p.OwnerUserId,
+      u.DisplayName AS OwnerDisplayName,
+      p.Score AS QuestionScore,
+      p.AnswerCount,
+      p.FavoriteCount,
+      p.ViewCount AS QuestionViewCount,
+      p.CommunityOwnedDate,
+      lpe.LatestTitleEdit,
+      lpe.LatestBodyEdit,
+      lpe.LatestTagsEdit,
+      lpe.LatestAnyEditDate,
+      lpe.EditorsOfLatestEdit,
+      (
+        SELECT
+          COUNT(c.Id)
+        FROM Comments AS c
+        WHERE
+          c.PostId = p.Id AND c.Score > 0
+      ) AS CommentCountWithPositiveScore,
+      CASE
+        WHEN p.ClosedDate IS NOT NULL THEN 1
+        ELSE 0
+      END AS IsClosed
+    FROM Posts AS p
+    LEFT JOIN Users AS u
+      ON p.OwnerUserId = u.Id
+    LEFT JOIN LatestPostEdits AS lpe
+      ON p.Id = lpe.PostId
+    WHERE
+      p.PostTypeId = 1 -- Questions
+  ),
+  AnswerAggregates AS (
+    SELECT
+      a.ParentId AS QuestionId,
+      COUNT(a.Id) AS TotalAnswers,
+      SUM(a.Score) AS TotalAnswerScore,
+      AVG(a.Score) AS AverageAnswerScore,
+      MAX(a.CreationDate) AS LastAnswerDate,
+      COUNT(CASE WHEN a.Id = p.AcceptedAnswerId THEN 1 ELSE NULL END) AS AcceptedAnswerPresent
+    FROM Posts AS a
+    LEFT JOIN Posts AS p
+      ON a.ParentId = p.Id
+    WHERE
+      a.PostTypeId = 2 -- Answers
+    GROUP BY
+      a.ParentId
+  ),
+  UserActivity AS (
+    SELECT
+      UserId,
+      COUNT(Id) AS TotalPosts,
+      SUM(CASE WHEN PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+      SUM(CASE WHEN PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+      SUM(CASE WHEN PostTypeId = 1 AND Score > 50 THEN 1 ELSE 0 END) AS HighScoreQuestions,
+      SUM(CASE WHEN PostTypeId = 2 AND Score > 20 THEN 1 ELSE 0 END) AS HighScoreAnswers,
+      SUM(CASE WHEN EXISTS (
+        SELECT
+          1
+        FROM Badges AS b
+        WHERE
+          b.UserId = Users.Id AND b.Class = 1
+      ) THEN 1 ELSE 0 END) AS GoldBadgeCount
+    FROM Posts
+    WHERE
+      OwnerUserId IS NOT NULL AND OwnerUserId <> -1
+    GROUP BY
+      UserId
+  )
+SELECT
+  COALESCE(q.Title, 'No Title') AS ProcessedTitle,
+  q.QuestionId,
+  q.OwnerDisplayName,
+  q.QuestionScore,
+  q.AnswerCount AS PostAnswerCount,
+  COALESCE(aa.TotalAnswers, 0) AS TotalAnswersForQuestion,
+  COALESCE(aa.TotalAnswerScore, 0) AS TotalAnswerScoreForQuestion,
+  COALESCE(aa.AverageAnswerScore, 0.0) AS AverageAnswerScoreForQuestion,
+  q.QuestionViewCount,
+  CASE
+    WHEN q.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+    WHEN q.LatestAnyEditDate IS NOT NULL THEN 'Edited ' || STRFTIME('%Y-%m-%d %H:%M:%S', q.LatestAnyEditDate)
+    ELSE 'Original'
+  END AS PostStatus,
+  q.EditorsOfLatestEdit,
+  q.CommentCountWithPositiveScore,
+  q.IsClosed,
+  CASE
+    WHEN q.OwnerDisplayName LIKE '%[^a-zA-Z0-9 ]%' THEN 'Contains Special Chars'
+    WHEN LENGTH(q.OwnerDisplayName) > 20 THEN 'Long Display Name'
+    ELSE 'Standard Display Name'
+  END AS DisplayNameCategory,
+  ua.TotalPosts AS UserTotalPosts,
+  ua.QuestionCount AS UserQuestionCount,
+  ua.AnswerCount AS UserAnswerCount,
+  ua.HighScoreQuestions,
+  ua.HighScoreAnswers,
+  ua.GoldBadgeCount,
+  CASE
+    WHEN ua.GoldBadgeCount > 5 AND ua.TotalPosts > 1000 THEN 'Experienced Expert'
+    WHEN ua.AnswerCount > ua.QuestionCount * 2 AND ua.HighScoreAnswers > 5 THEN 'Answer Focused Expert'
+    ELSE 'General User'
+  END AS UserProfileCategory
+FROM QuestionDetails AS q
+LEFT JOIN AnswerAggregates AS aa
+  ON q.QuestionId = aa.QuestionId
+LEFT JOIN UserActivity AS ua
+  ON q.OwnerUserId = ua.UserId
+WHERE
+  q.QuestionScore > 0
+  AND (q.AnswerCount IS NULL OR q.AnswerCount > 0)
+  AND q.QuestionViewCount > 100
+  AND q.OwnerDisplayName IS NOT NULL
+  AND q.OwnerDisplayName <> 'Community'
+  AND q.LatestAnyEditDate IS NULL OR q.LatestAnyEditDate > q.QuestionCreationDate + INTERVAL '30 days'
+ORDER BY
+  q.QuestionScore DESC,
+  q.QuestionViewCount DESC
+LIMIT 100;

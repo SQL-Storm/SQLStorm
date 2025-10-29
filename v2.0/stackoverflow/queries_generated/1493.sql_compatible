@@ -1,0 +1,181 @@
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        COALESCE(U.DisplayName, 'Anonymous') AS UserDisplayName,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(P.Score) AS TotalPostScore,
+        AVG(P.Score) AS AveragePostScore,
+        SUM(P.ViewCount) AS TotalPostViews,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        MAX(COALESCE(P.LastActivityDate, C.CreationDate, U.LastAccessDate)) AS LatestActivityDate,
+        COUNT(DISTINCT PH.PostId) FILTER (WHERE PH.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20)) AS ModerationHistoryCount,
+        SUM(CASE WHEN P.CommunityOwnedDate IS NOT NULL THEN 1 ELSE 0 END) AS CommunityOwnedPosts,
+        COUNT(DISTINCT B.Id) AS TotalBadges
+    FROM
+        Users U
+    LEFT JOIN
+        Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN
+        Comments C ON U.Id = C.UserId
+    LEFT JOIN
+        PostHistory PH ON U.Id = PH.UserId
+    LEFT JOIN
+        Badges B ON U.Id = B.UserId
+    GROUP BY
+        U.Id, U.Reputation, U.CreationDate, U.LastAccessDate, U.DisplayName
+),
+TagPerformance AS (
+    SELECT
+        TRIM(UNNEST(string_to_array(SUBSTRING(P.Tags FROM 2 FOR (LENGTH(P.Tags) - 2)), '><'))) AS TagName,
+        SUM(P.Score) AS TagTotalScore,
+        AVG(P.Score) AS TagAverageScore,
+        COUNT(DISTINCT P.Id) AS TagPostCount,
+        SUM(P.ViewCount) AS TagTotalViewCount
+    FROM
+        Posts P
+    WHERE
+        P.PostTypeId = 1
+        AND P.Tags IS NOT NULL
+        AND LENGTH(P.Tags) > 2
+    GROUP BY
+        TRIM(UNNEST(string_to_array(SUBSTRING(P.Tags FROM 2 FOR (LENGTH(P.Tags) - 2)), '><')))
+),
+HotTagThreshold AS (
+    SELECT
+        TP.TagName
+    FROM
+        TagPerformance TP
+    WHERE
+        TP.TagPostCount >= 100
+        AND TP.TagAverageScore >= (
+            SELECT AVG(TagAverageScore) * 1.5
+            FROM TagPerformance
+            WHERE TagPostCount >= 100
+        )
+    ORDER BY
+        TP.TagTotalScore DESC
+    LIMIT 10
+),
+UserPostDetails AS (
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId AS UserId,
+        P.PostTypeId,
+        P.Score,
+        P.CreationDate AS PostCreationDate,
+        P.ViewCount,
+        COALESCE(P.Title, SUBSTRING(P.Body FROM 1 FOR 50) || '...') AS PostTitleExcerpt,
+        P.ParentId,
+        P.AcceptedAnswerId,
+        COALESCE(P.Tags, 'No Tags') AS PostTags,
+        LAG(P.LastEditDate, 1, P.CreationDate) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate) AS PreviousEditDate,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate) AS PostSequenceNum,
+        RANK() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.ViewCount DESC) AS RankOverallScoreViews,
+        NTILE(10) OVER (ORDER BY P.CreationDate) AS CreationDateDecile
+    FROM
+        Posts P
+    WHERE
+        P.OwnerUserId IS NOT NULL
+),
+UserCumulativeScores AS (
+    -- compute cumulative score per post per user
+    SELECT
+        UPD.UserId,
+        UPD.PostCreationDate,
+        SUM(UPD.Score) OVER (PARTITION BY UPD.UserId ORDER BY UPD.PostCreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativeUserScore
+    FROM
+        UserPostDetails UPD
+),
+UserAggregatedWindowStats AS (
+    SELECT
+        UPD.UserId,
+        AVG(UPD.Score) AS UserAvgPostScore,
+        MAX(UCS.CumulativeUserScore) AS MaxCumulativeUserScore,
+        COUNT(DISTINCT HT.TagName) AS HotTagContributions
+    FROM
+        UserPostDetails UPD
+    LEFT JOIN
+        UserCumulativeScores UCS
+        ON UPD.UserId = UCS.UserId AND UPD.PostCreationDate = UCS.PostCreationDate
+    LEFT JOIN
+        HotTagThreshold HT
+        ON UPD.PostTags ILIKE '%' || '<' || HT.TagName || '>' || '%'
+    GROUP BY
+        UPD.UserId
+)
+SELECT
+    UE.UserId,
+    UE.UserDisplayName,
+    UE.Reputation,
+    UE.TotalPosts,
+    UE.TotalQuestions,
+    UE.TotalAnswers,
+    UE.TotalComments,
+    UE.LatestActivityDate,
+    UE.ModerationHistoryCount,
+    UE.CommunityOwnedPosts,
+    UE.TotalBadges,
+    (UE.TotalQuestions * 1.0 / NULLIF(UE.TotalPosts, 0)) AS QuestionRatio,
+    (UE.TotalAnswers * 1.0 / NULLIF(UE.TotalPosts, 0)) AS AnswerRatio,
+    EXTRACT(EPOCH FROM (UE.LatestActivityDate - UE.UserCreationDate)) / 86400.0 AS DaysSinceCreationToLastActivity,
+    UAWS.UserAvgPostScore,
+    UAWS.MaxCumulativeUserScore,
+    UAWS.HotTagContributions,
+    (
+        SELECT COUNT(DISTINCT A.Id)
+        FROM Posts Q
+        JOIN Posts A ON Q.AcceptedAnswerId = A.Id
+        LEFT JOIN Comments C_sub ON Q.Id = C_sub.PostId
+        WHERE Q.OwnerUserId = UE.UserId
+          AND A.OwnerUserId = UE.UserId
+          AND Q.AnswerCount > 0
+          AND (Q.Tags ILIKE '%<sql>%' OR Q.Tags ILIKE '%<database>%')
+        GROUP BY Q.Id
+        HAVING COUNT(C_sub.Id) >= 5
+    ) AS AcceptedAnswersWithManyCommentsOnSqlQuestions,
+    COALESCE(UPPER(SUBSTRING(U.Location FROM 1 FOR 1)) || SUBSTRING(U.Location FROM 2), 'Unknown Location') AS FormattedLocation,
+    NULLIF(U.WebsiteUrl, '') AS UserWebsite,
+    (
+        SELECT COUNT(DISTINCT V.PostId)
+        FROM Votes V
+        WHERE V.UserId = UE.UserId AND V.VoteTypeId = 5
+          AND V.CreationDate BETWEEN CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year' AND CAST('2024-10-01 12:34:56' AS TIMESTAMP)
+    ) AS RecentFavoriteCount,
+    CASE
+        WHEN UE.Reputation >= 10000 AND UE.ModerationHistoryCount > 5 THEN 'Power User & Moderator'
+        WHEN UE.Reputation >= 5000 AND UE.TotalQuestions > 100 THEN 'Prolific Questioner'
+        WHEN UE.Reputation >= 2000 AND UE.TotalAnswers > 50 THEN 'Established Answerer'
+        WHEN UE.Reputation < 100 THEN 'New Contributor'
+        ELSE 'Active User'
+    END AS UserCategory,
+    COUNT(DISTINCT PL.RelatedPostId) FILTER (WHERE PL.LinkTypeId = 3 AND PL.CreationDate >= UE.LastAccessDate - INTERVAL '6 months') AS RecentDuplicateLinks
+FROM
+    Users U
+INNER JOIN
+    UserEngagement UE ON U.Id = UE.UserId
+LEFT JOIN
+    UserAggregatedWindowStats UAWS ON UE.UserId = UAWS.UserId
+LEFT JOIN
+    PostLinks PL ON U.Id = (
+        SELECT P2.OwnerUserId FROM Posts P2 WHERE P2.Id = PL.PostId LIMIT 1
+    )
+WHERE
+    UE.TotalPosts > 5
+    AND UE.Reputation > 100
+    AND (UE.LatestActivityDate BETWEEN CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 years' AND CAST('2024-10-01 12:34:56' AS TIMESTAMP) OR UE.TotalQuestions > 10)
+    AND U.AboutMe IS NOT NULL
+    AND U.DisplayName IS NOT NULL
+    AND UAWS.UserAvgPostScore IS NOT NULL
+GROUP BY
+    UE.UserId, UE.UserDisplayName, UE.Reputation, UE.TotalPosts, UE.TotalQuestions, UE.TotalAnswers,
+    UE.TotalComments, UE.LatestActivityDate, UE.ModerationHistoryCount, UE.CommunityOwnedPosts,
+    UE.TotalBadges, UE.UserCreationDate, UAWS.UserAvgPostScore, UAWS.MaxCumulativeUserScore,
+    UAWS.HotTagContributions, U.Location, U.WebsiteUrl
+ORDER BY
+    UE.Reputation DESC, UAWS.HotTagContributions DESC, UE.LatestActivityDate DESC
+LIMIT 500;

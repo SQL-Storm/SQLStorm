@@ -1,0 +1,35 @@
+SELECT
+  u.Id AS UserId,
+  u.DisplayName AS UserName,
+  COUNT(DISTINCT p.Id) AS PostCount,
+  SUM(p.ViewCount) AS TotalViews,
+  AVG(p.Score) AS AvgPostScore,
+  SUM(CASE WHEN v.VoteTypeId IN (2) THEN 1 ELSE 0 END) AS UpVotesReceived,
+  SUM(CASE WHEN v.VoteTypeId IN (3) THEN 1 ELSE 0 END) AS DownVotesReceived,
+  ARRAY_AGG(DISTINCT t.tag) FILTER (WHERE p.PostTypeId = 1) AS QuestionTags,
+  MAX(p.LastActivityDate) AS LastActivityActiveDate,
+  MAX(p.CreationDate) AS FirstPostDate,
+  SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsCreated,
+  SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersGiven
+FROM
+  Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  LEFT JOIN (
+    SELECT
+      p2.Id,
+      UNNEST(string_to_array(REPLACE(TRIM(p2.Tags), '<', ''), '>')) AS tag
+    FROM Posts p2
+    WHERE p2.Tags IS NOT NULL
+  ) t ON t.Id = p.Id
+WHERE
+  u.AccountId IS NOT NULL
+  AND u.Reputation >= 100
+  AND u.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '5 years'
+GROUP BY
+  u.Id, u.DisplayName
+HAVING
+  COUNT(DISTINCT p.Id) > 0
+ORDER BY
+  TotalViews DESC, UserName ASC
+LIMIT 100;

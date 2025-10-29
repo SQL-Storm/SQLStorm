@@ -1,0 +1,103 @@
+-- {"query": "5301.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 795} 
+WITH
+-- 1) Highly active users by reputation, recent activity, and badge diversity
+ActiveUsers AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    COUNT(DISTINCT b.Id) AS BadgeCount,
+    MAX(p.LastActivityDate) AS LastActivity
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Location
+),
+-- 2) Cross-referenced post activity with complex predicates
+PostActivity AS (
+  SELECT
+    p.Id AS PostId,
+    p.OwnerUserId,
+    p.PostTypeId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.CommentCount,
+    p.Title,
+    p.Tags,
+    p.AcceptedAnswerId,
+    p.ParentId,
+    p.OwnerDisplayName,
+    -- window function: rank posts within same day by score
+    ROW_NUMBER() OVER (
+      PARTITION BY CAST(p.CreationDate AS date)
+      ORDER BY p.Score DESC, p.ViewCount DESC
+    ) AS DayRank,
+    -- correlated subquery: count of related posts via PostLinks (duplicates and references)
+    (
+      SELECT COUNT(*) FROM PostLinks pl
+      WHERE pl.PostId = p.Id OR pl.RelatedPostId = p.Id
+    ) AS RelatedCount
+  FROM Posts p
+  WHERE p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '365 days'
+),
+-- 3) Complex correlated computation: average accepted answer score per question with existence checks
+AvgAcceptedPerQuestion AS (
+  SELECT
+    q.Id AS QuestionId,
+    AVG(a.Score) AS AvgAcceptedScore
+  FROM Posts q
+  LEFT JOIN Posts a
+    ON a.ParentId = q.Id
+   AND a.PostTypeId = 2 -- Answer
+  WHERE q.PostTypeId = 1
+  GROUP BY q.Id
+),
+-- 4) Tag-based distribution with NULL handling and string computations
+TagMetrics AS (
+  SELECT
+    t.TagName,
+    COALESCE(t.Count, 0) AS TagCount,
+    COALESCE(t.IsModeratorOnly, 0) AS IsModeratorOnlyFlag,
+    CASE
+      WHEN t.IsRequired = 1 THEN 'Required'
+      ELSE 'Optional'
+    END AS Requirement,
+    CONCAT('[', t.TagName, ']') AS BracketedTag
+  FROM Tags t
+  WHERE t.IsModeratorOnly = 0 OR t.IsModeratorOnly IS NULL
+)
+SELECT
+  -- 5) final rowset with advanced constructs
+  AU.UserId,
+  AU.DisplayName AS UserName,
+  AU.Reputation,
+  AU.LastActivity,
+  AU.BadgeCount,
+  PA.PostId,
+  PA.DayRank,
+  PA.Title,
+  PA.Tags,
+  PA.Score AS PostScore,
+  PA.ViewCount,
+  PA.CommentCount,
+  AA.AvgAcceptedScore,
+  TM.TagName,
+  TM.TagCount,
+  TM.Requirement
+FROM ActiveUsers AU
+LEFT JOIN PostActivity PA
+  ON PA.OwnerUserId = AU.UserId
+LEFT JOIN AvgAcceptedPerQuestion AA
+  ON AA.QuestionId = PA.PostId
+LEFT JOIN TagMetrics TM
+  ON TM.TagName = ANY(string_to_array(REPLACE(REPLACE(PA.Tags, '<', ''), '>', ''), '><'))
+WHERE
+  AU.Reputation > 1000
+  AND PA.DayRank <= 3
+ORDER BY AU.Reputation DESC, AU.LastActivity DESC
+LIMIT 100;

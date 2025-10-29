@@ -1,0 +1,169 @@
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.UpVotes,
+        U.DownVotes,
+        U.Views AS UserProfileViews,
+        COUNT(DISTINCT P.Id) AS TotalPostsCreated,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsAsked,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersGiven,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT PH.Id) AS TotalPostHistoryEvents,
+        SUM(COALESCE(V_bounty.BountyAmount, 0)) AS TotalBountyReceived,
+        MAX(P.LastActivityDate) AS LastPostActivityDate,
+        MAX(C.CreationDate) AS LastCommentActivityDate,
+        (U.UpVotes * 2 + U.DownVotes + COUNT(DISTINCT P.Id) * 5 + COUNT(DISTINCT C.Id) * 3 + COUNT(DISTINCT PH.Id) * 0.5) AS ActivityScore,
+        COALESCE(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - U.CreationDate)) / 86400, 0) AS DaysSinceCreation
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId AND P.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '5 year')
+    LEFT JOIN Comments AS C ON U.Id = C.UserId AND C.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '5 year')
+    LEFT JOIN PostHistory AS PH ON U.Id = PH.UserId AND PH.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '5 year')
+    LEFT JOIN Votes AS V_bounty ON U.Id = V_bounty.UserId AND V_bounty.VoteTypeId IN (8, 9) AND V_bounty.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '5 year')
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.UpVotes, U.DownVotes, U.Views
+),
+PostPerformanceSummary AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.AcceptedAnswerId,
+        P.ClosedDate,
+        P.LastActivityDate,
+        CASE WHEN P.PostTypeId = 1 AND P.AcceptedAnswerId IS NOT NULL THEN TRUE ELSE FALSE END AS HasAcceptedAnswer,
+        CASE
+            WHEN P.Score >= 100 AND P.ViewCount >= 10000 THEN 'Highly Viral'
+            WHEN P.Score >= 50 AND P.ViewCount >= 5000 THEN 'Very Popular'
+            WHEN P.Score >= 10 AND P.ViewCount >= 1000 THEN 'Popular'
+            WHEN P.Score > 0 OR P.ViewCount > 100 THEN 'Modestly Engaged'
+            ELSE 'Niche/New'
+        END AS PostPopularityCategory,
+        CAST(P.Score AS NUMERIC) / NULLIF(P.ViewCount, 0) AS ScorePerView,
+        (SELECT MAX(C_sub.CreationDate) FROM Comments AS C_sub WHERE C_sub.PostId = P.Id AND C_sub.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '5 year')) AS LatestCommentDateForPost
+    FROM Posts AS P
+    WHERE P.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '5 year')
+),
+BadgeMilestoneAnalysis AS (
+    SELECT
+        B.UserId,
+        B.Name AS BadgeName,
+        B.Date AS BadgeDate,
+        B.Class AS BadgeClass,
+        EXTRACT(EPOCH FROM (B.Date - LAG(B.Date) OVER (PARTITION BY B.UserId ORDER BY B.Date))) / 86400 AS DaysSincePreviousBadge,
+        ROW_NUMBER() OVER (PARTITION BY B.UserId, B.Class ORDER BY B.Date) AS BadgeClassRank
+    FROM Badges AS B
+    WHERE B.Class IN (1, 2) AND B.Date >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '5 year')
+),
+QuestionTagUsage AS (
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        TRIM(UNNEST(string_to_array(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags) - 2), '><'))) AS TagName
+    FROM Posts AS P
+    WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2 AND P.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '5 year')
+),
+DuplicateQuestionImpact AS (
+    SELECT
+        PL.RelatedPostId AS OriginalPostId,
+        PL.PostId AS DuplicatePostId,
+        P_orig.CreationDate AS OriginalCreationDate,
+        P_orig.Score AS OriginalScore,
+        P_dup.CreationDate AS DuplicateCreationDate,
+        P_dup.Score AS DuplicateScore,
+        EXTRACT(EPOCH FROM (P_dup.CreationDate - P_orig.CreationDate)) / 86400 AS DaysUntilDuplicated,
+        (COALESCE(P_orig.Score,0) - COALESCE(P_dup.Score,0)) AS DuplicateScore
+    FROM PostLinks AS PL
+    JOIN Posts AS P_orig ON PL.RelatedPostId = P_orig.Id
+    JOIN Posts AS P_dup ON PL.PostId = P_dup.Id
+    WHERE PL.LinkTypeId = 3 AND P_orig.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '5 year')
+),
+UserMonthlyActivity AS (
+    SELECT
+        U.Id AS UserId,
+        TO_CHAR(DATE_TRUNC('month', P.CreationDate), 'YYYY-MM') AS ActivityMonth,
+        COUNT(DISTINCT P.Id) AS MonthlyPosts,
+        COUNT(DISTINCT C.Id) AS MonthlyComments,
+        SUM(P.Score) AS MonthlyPostScore,
+        ROW_NUMBER() OVER (PARTITION BY TO_CHAR(DATE_TRUNC('month', P.CreationDate), 'YYYY-MM') ORDER BY COUNT(DISTINCT P.Id) DESC) AS MonthlyPostRank
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId AND P.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')
+    LEFT JOIN Comments AS C ON U.Id = C.UserId AND C.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')
+    WHERE P.Id IS NOT NULL OR C.Id IS NOT NULL
+    GROUP BY U.Id, TO_CHAR(DATE_TRUNC('month', P.CreationDate), 'YYYY-MM')
+)
+SELECT
+    UE.UserId,
+    UE.DisplayName,
+    UE.Reputation,
+    UE.ActivityScore,
+    UE.DaysSinceCreation,
+    UE.TotalPostsCreated,
+    UE.QuestionsAsked,
+    UE.AnswersGiven,
+    UE.TotalCommentsMade,
+    COALESCE(UE.TotalBountyReceived, 0) AS TotalBountyReceived,
+    AVG(PPS.ScorePerView) OVER (PARTITION BY UE.UserId) AS AvgPostScorePerView,
+    COUNT(PPS.PostId) FILTER (WHERE PPS.HasAcceptedAnswer = TRUE) AS AcceptedAnswerPostsCount,
+    MAX(PPS.PostPopularityCategory) FILTER (WHERE PPS.PostTypeId = 1) AS UsersMostPopularQuestionCategory,
+    (SELECT COUNT(DISTINCT QTA_sub.TagName) FROM QuestionTagUsage AS QTA_sub WHERE QTA_sub.OwnerUserId = UE.UserId) AS DistinctTagsUsedInQuestions,
+    COUNT(DISTINCT BMA.BadgeName) AS TotalUniqueBadges,
+    MAX(BMA.BadgeDate) AS LatestBadgeDate,
+    COALESCE(AVG(BMA.DaysSincePreviousBadge) FILTER (WHERE BMA.BadgeClass = 1), 0) AS AvgDaysBetweenGoldBadges,
+    CONCAT_WS(' | ',
+        'Rep: ' || UE.Reputation,
+        'Posts: ' || UE.TotalPostsCreated,
+        'Comments: ' || UE.TotalCommentsMade,
+        'Activity: ' || CASE
+            WHEN UE.QuestionsAsked > UE.AnswersGiven THEN 'Question-Oriented'
+            WHEN UE.AnswersGiven > UE.QuestionsAsked THEN 'Answer-Oriented'
+            ELSE 'Balanced Contributor'
+        END,
+        'Last Active: ' || TO_CHAR(COALESCE(UE.LastPostActivityDate, UE.LastCommentActivityDate, UE.LastAccessDate), 'YYYY-MM-DD')
+    ) AS UserActivitySummary,
+    BOOL_OR(PPS.PostPopularityCategory = 'Highly Viral' AND PPS.PostTypeId = 1 AND PPS.HasAcceptedAnswer = TRUE) AS HasHighlyViralAcceptedQuestion,
+    COALESCE(SUM(DQI.DuplicateScore) FILTER (WHERE DQI.OriginalPostId = PPS.PostId), 0) AS TotalDuplicateScoreImpact,
+    COUNT(DISTINCT DQI.DuplicatePostId) FILTER (WHERE DQI.OriginalPostId = PPS.PostId) AS CountOriginalsDuplicated,
+    (SELECT MAX(CASE WHEN UMA.MonthlyPostRank <= 10 THEN TRUE ELSE FALSE END) FROM UserMonthlyActivity AS UMA WHERE UMA.UserId = UE.UserId) AS WasTopMonthlyPoster,
+    (UE.Reputation / NULLIF(UE.DaysSinceCreation, 0) * 100) + (UE.UpVotes - UE.DownVotes) * 0.5 + COALESCE(UE.UserProfileViews, 0) / 10 AS LegacyUserPerformanceIndex
+FROM UserEngagement AS UE
+LEFT JOIN PostPerformanceSummary AS PPS ON UE.UserId = PPS.OwnerUserId
+LEFT JOIN BadgeMilestoneAnalysis AS BMA ON UE.UserId = BMA.UserId
+FULL OUTER JOIN DuplicateQuestionImpact AS DQI ON PPS.PostId = DQI.OriginalPostId OR PPS.PostId = DQI.DuplicatePostId
+WHERE
+    UE.Reputation > 5000
+    AND UE.DaysSinceCreation > 730
+    AND (
+        LOWER(COALESCE(UE.DisplayName, '')) LIKE '%developer%'
+        OR LOWER(COALESCE(UE.DisplayName, '')) LIKE '%engineer%'
+        OR UE.TotalPostsCreated > 100
+    )
+    AND NOT EXISTS (
+        SELECT 1
+        FROM Comments AS C_recent
+        WHERE C_recent.UserId = UE.UserId
+        AND C_recent.CreationDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '6 month')
+        GROUP BY C_recent.UserId
+        HAVING COUNT(C_recent.Id) < 5
+    )
+GROUP BY
+    UE.UserId, UE.DisplayName, UE.Reputation, UE.ActivityScore, UE.DaysSinceCreation,
+    UE.TotalPostsCreated, UE.QuestionsAsked, UE.AnswersGiven, UE.TotalCommentsMade,
+    UE.TotalBountyReceived, UE.LastPostActivityDate, UE.LastCommentActivityDate, UE.LastAccessDate,
+    UE.UserProfileViews
+HAVING
+    COUNT(DISTINCT BMA.BadgeName) > 10
+    OR SUM(PPS.Score) FILTER (WHERE PPS.PostTypeId = 1) > 500
+    OR BOOL_OR(PPS.PostPopularityCategory = 'Highly Viral')
+ORDER BY
+    UE.ActivityScore DESC, TotalUniqueBadges DESC, TotalDuplicateScoreImpact DESC
+LIMIT 200;

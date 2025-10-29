@@ -1,0 +1,141 @@
+-- {"query": "3351.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2234} 
+
+/*  Comprehensive performance‑benchmarking query on the StackOverflow schema  */
+WITH
+-- 1️⃣ Aggregate per‑user statistics, mixing joins, aggregates, FILTER, and a correlated subquery
+user_stats AS (
+    SELECT
+        u.id                                            AS user_id,
+        u.displayname                                   AS display_name,
+        u.reputation,
+        COALESCE(u.location, '[unknown]')               AS location,
+        COUNT(DISTINCT b.id) FILTER (WHERE b.class = 1) AS gold_badges,
+        COUNT(DISTINCT b.id) FILTER (WHERE b.class = 2) AS silver_badges,
+        COUNT(DISTINCT b.id) FILTER (WHERE b.class = 3) AS bronze_badges,
+        SUM(CASE WHEN v.votetypeid = 2 THEN 1 ELSE 0 END) AS upvotes_given,
+        SUM(CASE WHEN v.votetypeid = 3 THEN 1 ELSE 0 END) AS downvotes_given,
+        MAX(p.creationdate)                             AS last_post_date,
+        MAX(c.creationdate)                             AS last_comment_date,
+        (SELECT AVG(LENGTH(c2.text))                  -- correlated subquery for avg comment length
+         FROM comments c2
+         WHERE c2.userid = u.id)                      AS avg_comment_length
+    FROM users u
+    LEFT JOIN badges b      ON b.userid = u.id
+    LEFT JOIN votes v       ON v.userid = u.id
+    LEFT JOIN posts p       ON p.owneruserid = u.id
+    LEFT JOIN comments c    ON c.userid = u.id
+    GROUP BY u.id, u.displayname, u.reputation, u.location
+),
+
+-- 2️⃣ Rank the top users (window function) and keep the first 1000 rows only
+top_users AS (
+    SELECT
+        us.*,
+        ROW_NUMBER() OVER (ORDER BY us.reputation DESC,
+                                    us.gold_badges DESC,
+                                    us.silver_badges DESC) AS rn
+    FROM user_stats us
+    WHERE us.reputation > 1000
+),
+
+-- 3️⃣ Tag‑level aggregates, using outer joins, string pattern matching, and a set operator later
+tag_stats AS (
+    SELECT
+        t.tagname,
+        COUNT(p.id)                                              AS question_cnt,
+        AVG(p.score)                                             AS avg_score,
+        SUM(CASE WHEN ph.posthistorytypeid = 10 THEN 1 ELSE 0 END) AS closed_cnt
+    FROM tags t
+    LEFT JOIN posts p
+           ON p.posttypeid = 1                         -- only questions
+          AND p.tags LIKE ('%' || t.tagname || '%')
+    LEFT JOIN posthistory ph
+           ON ph.postid = p.id
+          AND ph.posthistorytypeid = 10                -- closed events
+    GROUP BY t.tagname
+    HAVING COUNT(p.id) > 50
+),
+
+-- 4️⃣ Recent hot questions (window function + complex predicate)
+recent_hot AS (
+    SELECT
+        p.id,
+        p.title,
+        p.score,
+        p.viewcount,
+        p.creationdate,
+        u.displayname               AS owner_name,
+        p.tags,
+        ROW_NUMBER() OVER (PARTITION BY p.tags ORDER BY p.score DESC) AS rn_tag
+    FROM posts p
+    JOIN users u ON u.id = p.owneruserid
+    WHERE p.posttypeid = 1
+      AND p.creationdate > CURRENT_DATE - INTERVAL '30 days'
+      AND p.score > 5
+),
+
+-- 5️⃣ Combine the above CTEs, featuring outer joins, CASE expressions, NULL logic,
+--    and a correlated subquery for the most recent vote on a question
+combined AS (
+    SELECT
+        tu.user_id,
+        tu.display_name,
+        tu.reputation,
+        tu.gold_badges,
+        tu.silver_badges,
+        tu.bronze_badges,
+        ts.tagname,
+        ts.question_cnt,
+        ts.avg_score,
+        rh.title      AS hot_title,
+        rh.score      AS hot_score,
+        rh.viewcount  AS hot_views,
+        CASE
+            WHEN rh.rn_tag = 1 THEN 'TopInTag'
+            ELSE NULL
+        END           AS tag_flag,
+        /* Correlated subquery: most recent up‑vote on any of the user's questions */
+        (SELECT v.creationdate
+         FROM votes v
+         JOIN posts qp ON qp.id = v.postid
+         WHERE v.votetypeid = 2                -- up‑vote
+           AND qp.owneruserid = tu.user_id
+         ORDER BY v.creationdate DESC
+         LIMIT 1) AS most_recent_upvote
+    FROM top_users tu
+    LEFT JOIN tag_stats ts
+           ON ts.tagname ILIKE ANY (string_to_array(tu.display_name, ' '))
+    LEFT JOIN recent_hot rh
+           ON rh.rn_tag = 1
+          AND rh.tags LIKE ('%' || ts.tagname || '%')
+    WHERE tu.rn <= 100
+)
+
+-- 6️⃣ Final result set with UNION ALL (set operator), ordering and NULL handling
+SELECT *
+FROM combined
+WHERE (gold_badges > 5 OR silver_badges > 10)
+  AND (hot_score IS NOT NULL OR question_cnt > 100)
+ORDER BY reputation DESC, gold_badges DESC, hot_score DESC
+
+UNION ALL
+
+SELECT
+    tu.user_id,
+    tu.display_name,
+    tu.reputation,
+    tu.gold_badges,
+    tu.silver_badges,
+    tu.bronze_badges,
+    NULL      AS tagname,
+    NULL      AS question_cnt,
+    NULL      AS avg_score,
+    NULL      AS hot_title,
+    NULL      AS hot_score,
+    NULL      AS hot_views,
+    NULL      AS tag_flag,
+    NULL      AS most_recent_upvote
+FROM top_users tu
+WHERE tu.rn = 1
+  AND NOT EXISTS (SELECT 1 FROM combined c WHERE c.user_id = tu.user_id)
+ORDER BY reputation DESC, gold_badges DESC;

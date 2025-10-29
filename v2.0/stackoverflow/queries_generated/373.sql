@@ -1,0 +1,314 @@
+-- {"query": "373.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2780} 
+with recent_questions as (
+    select
+        q.Id as QuestionId,
+        q.OwnerUserId,
+        q.Title,
+        q.Tags,
+        q.Score,
+        q.ViewCount,
+        q.CreationDate,
+        coalesce(q.AnswerCount, 0) as AnswerCount
+    from Posts q
+    where q.PostTypeId = 1
+      and q.CreationDate >= (select max(CreationDate) - interval '180 days' from Posts)
+),
+answers as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId as AnswerOwnerId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreation
+    from Posts a
+    where a.PostTypeId = 2
+),
+first_answer as (
+    select distinct on (QuestionId)
+        QuestionId,
+        AnswerId,
+        AnswerOwnerId,
+        AnswerScore,
+        AnswerCreation
+    from answers
+    order by QuestionId, AnswerCreation
+),
+user_activity as (
+    select
+        u.Id as UserId,
+        u.Reputation,
+        u.CreationDate as UserCreated,
+        u.LastAccessDate,
+        u.UpVotes,
+        u.DownVotes,
+        u.Views as ProfileViews,
+        count(distinct b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(distinct b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(distinct b.Id) filter (where b.Class = 3) as BronzeBadges
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.Reputation, u.CreationDate, u.LastAccessDate, u.UpVotes, u.DownVotes, u.Views
+),
+q_votes as (
+    select
+        v.PostId,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpCnt,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownCnt,
+        sum(case when v.VoteTypeId = 5 then 1 else 0 end) as FavCnt
+    from Votes v
+    group by v.PostId
+),
+q_comments as (
+    select
+        c.PostId,
+        count(*) as CommentCount,
+        max(c.CreationDate) as LastCommentAt,
+        sum(case when c.Score > 0 then 1 else 0 end) as PosComments
+    from Comments c
+    group by c.PostId
+),
+dup_links as (
+    select
+        pl.PostId,
+        count(*) filter (where pl.LinkTypeId = 3) as DuplicateLinks,
+        count(*) filter (where pl.LinkTypeId = 1) as LinkedLinks
+    from PostLinks pl
+    group by pl.PostId
+),
+closures as (
+    select
+        ph.PostId,
+        min(ph.CreationDate) as FirstClosedAt,
+        max(ph.CreationDate) filter (where ph.PostHistoryTypeId = 11) as LastReopenedAt,
+        count(*) filter (where ph.PostHistoryTypeId = 10) as CloseEvents,
+        count(*) filter (where ph.PostHistoryTypeId = 11) as ReopenEvents,
+        array_agg(distinct cast(nullif(ph.Comment, '') as int)) filter (where ph.PostHistoryTypeId = 10 and ph.Comment ~ '^[0-9]+$') as CloseReasonsRaw
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (10,11)
+    group by ph.PostId
+),
+tag_expanded as (
+    select
+        rq.QuestionId,
+        unnest(string_to_array(substring(coalesce(rq.Tags, ''), 2, greatest(length(coalesce(rq.Tags, '')),2)-2), '><')) as TagName
+    from recent_questions rq
+    where rq.Tags is not null and rq.Tags like '<%>'
+),
+tag_stats as (
+    select
+        te.QuestionId,
+        count(*) as TagCount,
+        string_agg(te.TagName, ',' order by te.TagName) as TagList,
+        sum(case when t.IsModeratorOnly then 1 else 0 end) as ModOnlyCount,
+        sum(case when t.IsRequired then 1 else 0 end) as RequiredCount,
+        sum(coalesce(t.Count,0)) as TagPopularity
+    from tag_expanded te
+    left join Tags t on lower(t.TagName) = lower(te.TagName)
+    group by te.QuestionId
+),
+activity_windows as (
+    select
+        rq.QuestionId,
+        rq.CreationDate,
+        rq.Score,
+        rq.ViewCount,
+        rq.AnswerCount,
+        qv.UpCnt,
+        qv.DownCnt,
+        qv.FavCnt,
+        qc.CommentCount,
+        qc.LastCommentAt,
+        qc.PosComments,
+        dl.DuplicateLinks,
+        dl.LinkedLinks,
+        cl.FirstClosedAt,
+        cl.LastReopenedAt,
+        cl.CloseEvents,
+        cl.ReopenEvents,
+        ts.TagCount,
+        ts.TagList,
+        ts.ModOnlyCount,
+        ts.RequiredCount,
+        ts.TagPopularity,
+        row_number() over (order by rq.ViewCount desc nulls last) as rn_views,
+        row_number() over (order by rq.Score desc nulls last) as rn_score,
+        ntile(10) over (order by coalesce(qv.UpCnt,0) - coalesce(qv.DownCnt,0) desc) as vote_decile,
+        percentile_disc(0.5) within group (order by rq.ViewCount) over () as median_views_overall
+    from recent_questions rq
+    left join q_votes qv on qv.PostId = rq.QuestionId
+    left join q_comments qc on qc.PostId = rq.QuestionId
+    left join dup_links dl on dl.PostId = rq.QuestionId
+    left join closures cl on cl.PostId = rq.QuestionId
+    left join tag_stats ts on ts.QuestionId = rq.QuestionId
+),
+owner_join as (
+    select
+        aw.*,
+        ua.Reputation as OwnerReputation,
+        ua.UpVotes as OwnerUpVotes,
+        ua.DownVotes as OwnerDownVotes,
+        ua.ProfileViews as OwnerProfileViews,
+        ua.GoldBadges,
+        ua.SilverBadges,
+        ua.BronzeBadges
+    from activity_windows aw
+    left join recent_questions rq on rq.QuestionId = aw.QuestionId
+    left join user_activity ua on ua.UserId = rq.OwnerUserId
+),
+answer_enrichment as (
+    select
+        oj.*,
+        fa.AnswerId as FirstAnswerId,
+        fa.AnswerOwnerId,
+        fa.AnswerScore as FirstAnswerScore,
+        fa.AnswerCreation as FirstAnswerAt,
+        case
+            when fa.AnswerId is null then null
+            else extract(epoch from (fa.AnswerCreation - oj.CreationDate))::bigint
+        end as FirstAnswerLagSeconds
+    from owner_join oj
+    left join first_answer fa on fa.QuestionId = oj.QuestionId
+),
+dup_self_ref as (
+    select
+        ae.*,
+        case
+            when ae.DuplicateLinks > 0 then 1
+            when exists (
+                select 1
+                from PostLinks d
+                where d.PostId = ae.QuestionId
+                  and d.LinkTypeId = 3
+            ) then 1
+            else 0
+        end as IsDuplicateFlag
+    from answer_enrichment ae
+),
+quality_score as (
+    select
+        ds.*,
+        (
+            coalesce(Score,0) * 2
+            + coalesce(UpCnt,0) * 1
+            - coalesce(DownCnt,0) * 2
+            + coalesce(FavCnt,0) * 3
+            + least(coalesce(ViewCount,0) / 100, 100)
+            + coalesce(OwnerReputation,0) / 100
+            + coalesce(GoldBadges,0) * 5
+            + coalesce(SilverBadges,0) * 2
+            + coalesce(BronzeBadges,0) * 1
+            + case when IsDuplicateFlag = 1 then -25 else 0 end
+            + case when FirstClosedAt is not null then -15 else 0 end
+            + case when ModOnlyCount > 0 then 3 else 0 end
+            + case when RequiredCount > 0 then 2 else 0 end
+            + least(coalesce(TagPopularity,0) / 1000, 50)
+            - coalesce(ReopenEvents,0) * 2
+            - coalesce(CloseEvents,0) * 2
+        )::numeric(18,2) as QualityScore
+    from dup_self_ref ds
+),
+ranked as (
+    select
+        qs.*,
+        dense_rank() over (order by QualityScore desc nulls last) as dr_quality,
+        rank() over (order by coalesce(ViewCount,0) desc) as r_views,
+        rank() over (order by coalesce(Score,0) desc) as r_score,
+        coalesce(FirstAnswerLagSeconds, 999999999) as FirstAnswerLagForSort
+    from quality_score qs
+),
+filtering as (
+    select
+        r.*,
+        case
+            when TagCount is null or TagCount = 0 then 'untagged'
+            when TagCount = 1 then 'single-tag'
+            when TagCount between 2 and 4 then 'multi-tag'
+            else 'many-tags'
+        end as TagBucket,
+        case
+            when OwnerReputation is null then 'anon-or-deleted'
+            when OwnerReputation < 100 then '<100'
+            when OwnerReputation < 1000 then '100-999'
+            when OwnerReputation < 10000 then '1k-9,999'
+            else '10k+'
+        end as RepBucket
+    from ranked r
+)
+select
+    f.QuestionId,
+    coalesce(p.Title, f.QuestionId::text) as TitleOrId,
+    f.TagList,
+    f.TagBucket,
+    f.RepBucket,
+    f.ViewCount,
+    f.Score,
+    f.UpCnt,
+    f.DownCnt,
+    f.FavCnt,
+    f.CommentCount,
+    f.PosComments,
+    f.DuplicateLinks,
+    f.LinkedLinks,
+    f.IsDuplicateFlag,
+    f.CloseEvents,
+    f.ReopenEvents,
+    date_trunc('day', f.CreationDate) as CreatedDay,
+    f.FirstClosedAt,
+    f.LastReopenedAt,
+    f.FirstAnswerId,
+    f.FirstAnswerScore,
+    f.FirstAnswerLagSeconds,
+    f.OwnerReputation,
+    f.GoldBadges,
+    f.SilverBadges,
+    f.BronzeBadges,
+    f.vrn as rn_deprecated_placeholder, -- intentional null/nullif trick for complexity
+    f.median_views_overall,
+    f.QualityScore,
+    f.dr_quality,
+    f.r_views,
+    f.r_score,
+    f.vote_decile,
+    case
+        when f.QualityScore >= percentile_disc(0.9) within group (order by f.QualityScore) over () then 'top10%'
+        when f.QualityScore >= percentile_disc(0.75) within group (order by f.QualityScore) over () then 'top25%'
+        when f.QualityScore >= percentile_disc(0.5) within group (order by f.QualityScore) over () then 'top50%'
+        else 'bottom50%'
+    end as QualityBucket
+from (
+    select fsub.*, null::int as vrn
+    from filtering fsub
+) f
+left join Posts p on p.Id = f.QuestionId
+where (
+    -- complicated predicate to exercise planner
+    (coalesce(f.UpCnt,0) - coalesce(f.DownCnt,0)) >= 0
+    or (f.Score >= 0 and coalesce(f.FavCnt,0) > 0)
+    or (
+        f.CloseEvents = 0 and (
+            f.TagCount >= 3
+            or (f.TagCount is null and f.ViewCount >= f.median_views_overall)
+        )
+    )
+)
+and (
+    -- NULL logic exercise
+    (f.FirstAnswerLagSeconds is null and f.AnswerCount = 0)
+    or (f.FirstAnswerLagSeconds is not null and f.FirstAnswerLagSeconds < 86400)
+    or (f.FirstClosedAt is null and f.IsDuplicateFlag = 0)
+)
+and (
+    -- string and pattern matching
+    p.Title ilike any (array['%how to%','%best way%','%performance%','%optimiz%'])
+    or exists (
+        select 1
+        from tag_expanded te2
+        where te2.QuestionId = f.QuestionId
+          and lower(te2.TagName) in ('sql','postgresql','performance','tuning')
+    )
+)
+order by
+    f.dr_quality,
+    f.r_views,
+    f.FirstAnswerLagForSort
+limit 500;

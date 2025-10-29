@@ -1,0 +1,306 @@
+-- {"query": "91.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3074} 
+with
+-- 1) Active users with activity bins and NULL-safe location parsing
+active_users as (
+  select
+    u.id,
+    u.displayname,
+    u.reputation,
+    u.creationdate::date as user_since,
+    coalesce(nullif(trim(u.location), ''), 'Unknown') as location_norm,
+    date_trunc('month', u.lastaccessdate) as last_seen_month,
+    width_bucket(u.reputation, 0, 100000, 10) as rep_bucket,
+    sum(u.upvotes - u.downvotes) over (partition by coalesce(nullif(trim(u.location), ''), 'Unknown')) as net_votes_by_location
+  from users u
+  where u.creationdate <= now()
+),
+-- 2) Questions in the last N years with derived tag array and quality metrics
+recent_questions as (
+  select
+    p.id as question_id,
+    p.owneruserid,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.answercount,
+    p.closeddate,
+    p.acceptedanswerid,
+    string_to_array(substring(p.tags, 2, greatest(length(p.tags)-2,0)), '><') as tag_arr
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= now() - interval '5 years'
+),
+-- 3) Answers and answerers to join with questions
+answers as (
+  select
+    a.id as answer_id,
+    a.parentid as question_id,
+    a.owneruserid as answerer_id,
+    a.creationdate as answer_created,
+    a.score as answer_score
+  from posts a
+  where a.posttypeid = 2
+),
+-- 4) Most recent non-trivial edits per question (correlated row_number)
+latest_edit as (
+  select ph.postid as question_id,
+         ph.posthistorytypeid,
+         ph.creationdate as edit_date,
+         row_number() over (partition by ph.postid order by ph.creationdate desc) as rn
+  from posthistory ph
+  where ph.posthistorytypeid in (4,5,6,24) -- title/body/tags edit or suggested edit applied
+),
+-- 5) Close reasons JSON extraction and normalization
+close_events as (
+  select
+    ph.postid as question_id,
+    ph.creationdate as closed_at,
+    ph.comment as close_reason_code_raw,
+    case
+      when ph.comment ~ '^[0-9]+$' then cast(ph.comment as int)
+      else null
+    end as close_reason_code
+  from posthistory ph
+  where ph.posthistorytypeid = 10
+),
+-- 6) Duplicate graph: map a question to its canonical via PostLinks
+dupe_map as (
+  select
+    pl.postid as dup_question_id,
+    pl.relatedpostid as canonical_question_id,
+    pl.creationdate as dup_linked_at
+  from postlinks pl
+  where pl.linktypeid = 3
+),
+-- 7) Vote aggregates with conditional filters and window stats
+vote_aggs as (
+  select
+    v.postid,
+    count(*) filter (where v.votetypeid = 2) as upvotes,
+    count(*) filter (where v.votetypeid = 3) as downvotes,
+    count(*) filter (where v.votetypeid in (8,9)) as bounty_events,
+    sum(coalesce(v.bountyamount,0)) as bounty_total,
+    min(v.creationdate) as first_vote_at,
+    max(v.creationdate) as last_vote_at,
+    avg(extract(epoch from (v.creationdate - min(v.creationdate) over (partition by v.postid)))) over (partition by v.postid) as avg_vote_lag_seconds
+  from votes v
+  group by v.postid
+),
+-- 8) Comment sentiment proxy and density
+comment_insights as (
+  select
+    c.postid,
+    count(*) as comment_count,
+    avg(c.score) as avg_comment_score,
+    sum(case when c.text ilike any (array['%thanks%','%great%','%helpful%','%awesome%']) then 1 else 0 end) as pos_hits,
+    sum(case when c.text ilike any (array['%wrong%','%duplicate%','%off-topic%','%spam%']) then 1 else 0 end) as neg_hits,
+    max(c.creationdate) as last_comment_at
+  from comments c
+  group by c.postid
+),
+-- 9) Tag popularity snapshot for intersection with question tags
+tag_pop as (
+  select
+    t.tagname,
+    t.count as global_tag_count,
+    coalesce(t.ismoderatoronly::int, 0) as is_mod_only,
+    coalesce(t.isrequired::int, 0) as is_required
+  from tags t
+),
+-- 10) Per-question exploded tags and popularity join
+question_tags as (
+  select
+    rq.question_id,
+    lower(trim(tag)) as tagname
+  from recent_questions rq
+  cross join lateral unnest(coalesce(rq.tag_arr, array[]::varchar[])) as tag
+),
+tag_enriched as (
+  select
+    qt.question_id,
+    qt.tagname,
+    tp.global_tag_count,
+    tp.is_mod_only,
+    tp.is_required
+  from question_tags qt
+  left join tag_pop tp
+    on tp.tagname = qt.tagname
+),
+-- 11) Answer latencies and accepted flags
+answer_latency as (
+  select
+    a.question_id,
+    min(a.answer_created) as first_answer_at,
+    avg(extract(epoch from (a.answer_created - rq.creationdate))) as avg_answer_lag_sec,
+    count(*) as answers_total,
+    sum(case when a.answer_id = rq.acceptedanswerid then 1 else 0 end) as accepted_count
+  from answers a
+  join recent_questions rq on rq.question_id = a.question_id
+  group by a.question_id
+),
+-- 12) Per-question rolling rank by a composite score with window functions
+question_metric as (
+  select
+    rq.question_id,
+    rq.owneruserid as asker_id,
+    rq.creationdate,
+    rq.score,
+    rq.viewcount,
+    rq.answercount,
+    rq.closeddate,
+    coalesce(va.upvotes,0) as upvotes,
+    coalesce(va.downvotes,0) as downvotes,
+    coalesce(va.bounty_total,0) as bounty_total,
+    coalesce(ci.comment_count,0) as comment_count,
+    coalesce(ci.avg_comment_score,0) as avg_comment_score,
+    coalesce(ci.pos_hits,0) as pos_hits,
+    coalesce(ci.neg_hits,0) as neg_hits,
+    al.first_answer_at,
+    al.avg_answer_lag_sec,
+    al.answers_total,
+    al.accepted_count,
+    ce.close_reason_code,
+    dm.canonical_question_id,
+    case when rq.closeddate is not null then 1 else 0 end as is_closed,
+    case when dm.canonical_question_id is not null then 1 else 0 end as is_duplicate,
+    case when al.accepted_count > 0 then 1 else 0 end as has_accepted,
+    -- composite popularity/quality metric with NULL safety
+    (
+      coalesce(rq.score,0)*2
+      + coalesce(va.upvotes,0)
+      - coalesce(va.downvotes,0)
+      + least(coalesce(rq.viewcount,0)::numeric/1000, 50)
+      + case when rq.closeddate is null then 5 else -10 end
+      + case when al.accepted_count > 0 then 8 else 0 end
+      + coalesce(va.bounty_total,0)::numeric/100
+      + greatest(0, 3 - coalesce(al.avg_answer_lag_sec, 3.0e7)::numeric/86400)  -- reward quick answers, clamp
+      - coalesce(ci.neg_hits,0)
+      + coalesce(ci.pos_hits,0)*0.5
+    )::numeric as composite_metric,
+    row_number() over (partition by date_trunc('month', rq.creationdate) order by
+      coalesce(rq.score, -9999) desc, coalesce(rq.viewcount, -1) desc, rq.question_id) as month_pop_rank,
+    percent_rank() over (order by
+      coalesce(rq.viewcount,0) desc, coalesce(rq.score,0) desc, coalesce(va.upvotes,0) desc) as global_attention_pr
+  from recent_questions rq
+  left join vote_aggs va on va.postid = rq.question_id
+  left join comment_insights ci on ci.postid = rq.question_id
+  left join answer_latency al on al.question_id = rq.question_id
+  left join close_events ce on ce.question_id = rq.question_id
+  left join dupe_map dm on dm.dup_question_id = rq.question_id
+),
+-- 13) Latest edit per question, outer applied
+latest_edit_pick as (
+  select le.question_id, le.edit_date, le.posthistorytypeid
+  from latest_edit le
+  where le.rn = 1
+),
+-- 14) Enrich with user and location cohorting
+cohorted as (
+  select
+    qm.*,
+    au.displayname as asker_name,
+    au.location_norm as asker_location,
+    au.rep_bucket as asker_rep_bucket,
+    au.net_votes_by_location
+  from question_metric qm
+  left join active_users au on au.id = qm.asker_id
+),
+-- 15) Aggregate tag properties per question
+tag_rollup as (
+  select
+    te.question_id,
+    count(*) as tag_count,
+    sum(coalesce(te.global_tag_count,0)) as tag_pop_sum,
+    max(te.global_tag_count) as tag_pop_max,
+    min(te.global_tag_count) as tag_pop_min,
+    sum(te.is_mod_only) as mod_only_count,
+    sum(te.is_required) as required_count,
+    string_agg(te.tagname, ',' order by coalesce(te.global_tag_count,0) desc nulls last) as tags_sorted
+  from tag_enriched te
+  group by te.question_id
+),
+-- 16) Build a set for top N by composite metric to stress set operations
+top_candidates as (
+  select question_id from cohorted
+  where composite_metric is not null
+  qualify row_number() over (order by composite_metric desc, viewcount desc, score desc) <= 500
+),
+recent_hot as (
+  select question_id from cohorted
+  where month_pop_rank <= 20
+),
+attention_outliers as (
+  select question_id from cohorted
+  where global_attention_pr >= 0.99
+),
+-- 17) Set operators to form union/intersect/except mix
+candidate_pool as (
+  (
+    select question_id from top_candidates
+    union
+    select question_id from recent_hot
+  )
+  intersect
+  select question_id from attention_outliers
+),
+-- 18) Final assembly with complicated predicates and string operations
+final as (
+  select
+    c.question_id,
+    coalesce(c.asker_name, '[anonymous]') as asker_name,
+    coalesce(c.asker_location, 'Unknown') as asker_location,
+    c.asker_rep_bucket,
+    c.creationdate,
+    c.score,
+    c.viewcount,
+    c.answercount,
+    c.upvotes,
+    c.downvotes,
+    c.bounty_total,
+    c.is_closed,
+    c.is_duplicate,
+    c.has_accepted,
+    c.close_reason_code,
+    coalesce(to_char(le.edit_date, 'YYYY-MM-DD"T"HH24:MI:SS'), 'no-edit') as latest_edit_ts,
+    tr.tag_count,
+    tr.mod_only_count,
+    tr.required_count,
+    tr.tag_pop_sum,
+    tr.tag_pop_max,
+    tr.tag_pop_min,
+    left(coalesce(tr.tags_sorted, ''), 200) as tags_top200,
+    round(c.composite_metric, 3) as composite_metric,
+    c.month_pop_rank,
+    round(c.global_attention_pr::numeric, 4) as global_attention_pr,
+    -- complex predicate flags
+    case
+      when c.is_duplicate = 1 and c.is_closed = 1 and coalesce(c.close_reason_code,0) in (101) then 'closed-dup'
+      when c.is_closed = 1 then 'closed-other'
+      when c.has_accepted = 1 then 'accepted-open'
+      else 'open-unaccepted'
+    end as status_bucket,
+    -- string expression involving tags and location
+    trim(both ' ' from regexp_replace(coalesce(c.asker_location,'Unknown') || ' | ' || coalesce(tr.tags_sorted,''), '\s+', ' ', 'g')) as loc_tag_sig
+  from cohorted c
+  left join latest_edit_pick le on le.question_id = c.question_id
+  left join tag_rollup tr on tr.question_id = c.question_id
+  where c.question_id in (select question_id from candidate_pool)
+    and (
+      -- complicated predicate mixing NULL logic and calculations
+      (coalesce(c.viewcount,0) > 1000 and coalesce(c.upvotes,0) >= greatest(5, coalesce(c.downvotes,0)*2))
+      or (c.bounty_total > 0 and c.score >= 0)
+      or (c.has_accepted = 1 and coalesce(c.avg_answer_lag_sec, 1e12) < 86400)
+    )
+    and not (c.is_closed = 1 and c.has_accepted = 0 and coalesce(c.downvotes,0) > coalesce(c.upvotes,0))
+)
+select
+  f.*,
+  -- correlated subqueries for extra stress
+  (select count(*) from answers a where a.question_id = f.question_id and a.answer_score >= 1) as answers_with_upvotes,
+  (select count(*) from comments c2 where c2.postid = f.question_id and c2.score < 0) as negative_comments,
+  -- outer join derived metrics: days since creation/edit
+  extract(day from (now() - f.creationdate))::int as days_since_asked,
+  nullif(extract(epoch from (now() - to_timestamp(nullif(f.latest_edit_ts,'no-edit'), 'YYYY-MM-DD"T"HH24:MI:SS')))/86400, 'NaN')::numeric(12,2) as days_since_last_edit
+from final f
+order by f.composite_metric desc, f.viewcount desc, f.score desc
+limit 200;

@@ -1,0 +1,111 @@
+-- {"query": "4608.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1034} 
+
+WITH
+  RankedPostEdits AS (
+    SELECT
+      ph.PostId,
+      ph.UserId,
+      ph.CreationDate,
+      pht.Name AS HistoryType,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory AS ph
+    JOIN PostHistoryTypes AS pht
+      ON ph.PostHistoryTypeId = pht.Id
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6) /* Edit Title, Edit Body, Edit Tags */
+  ),
+  UserContribution AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      COUNT(DISTINCT p.Id) AS QuestionsAnswered,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersProvided,
+      COUNT(DISTINCT b.Id) AS BadgesEarned,
+      MAX(u.Reputation) AS MaxReputation
+    FROM Users AS u
+    LEFT JOIN Posts AS p
+      ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges AS b
+      ON u.Id = b.UserId
+    WHERE
+      u.CreationDate < DATE('now', '-1 year')
+    GROUP BY
+      u.Id,
+      u.DisplayName
+    HAVING
+      COUNT(DISTINCT p.Id) > 50
+  ),
+  PostEngagement AS (
+    SELECT
+      p.Id AS PostId,
+      p.Title,
+      p.CreationDate,
+      p.OwnerUserId,
+      COALESCE(p.AnswerCount, 0) AS AnswerCount,
+      COALESCE(p.CommentCount, 0) AS CommentCount,
+      COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+      COALESCE(p.ViewCount, 0) AS ViewCount,
+      CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+      (
+        SELECT
+          COUNT(*)
+        FROM Votes AS v
+        WHERE
+          v.PostId = p.Id AND v.VoteTypeId = 2 /* UpMod */
+      ) AS UpVotes,
+      (
+        SELECT
+          COUNT(*)
+        FROM Votes AS v
+        WHERE
+          v.PostId = p.Id AND v.VoteTypeId = 3 /* DownMod */
+      ) AS DownVotes
+    FROM Posts AS p
+    WHERE
+      p.PostTypeId = 1 /* Question */
+  )
+SELECT
+  pe.PostId,
+  pe.Title,
+  uc.DisplayName AS OwnerDisplayName,
+  uc.QuestionsAnswered,
+  uc.AnswersProvided,
+  uc.BadgesEarned,
+  uc.MaxReputation,
+  pe.AnswerCount,
+  pe.CommentCount,
+  pe.FavoriteCount,
+  pe.ViewCount,
+  pe.IsClosed,
+  pe.UpVotes,
+  pe.DownVotes,
+  COALESCE(rpe.HistoryType, 'No Edits') AS LastEditType,
+  DATE('now') - pe.CreationDate AS DaysSinceCreation,
+  CASE
+    WHEN pe.ViewCount > 1000000 THEN 'Very High'
+    WHEN pe.ViewCount > 100000 THEN 'High'
+    WHEN pe.ViewCount > 10000 THEN 'Medium'
+    ELSE 'Low'
+  END AS ViewBucket,
+  CASE
+    WHEN pe.UpVotes - pe.DownVotes > 500 THEN 'Very Popular'
+    WHEN pe.UpVotes - pe.DownVotes > 100 THEN 'Popular'
+    ELSE 'Average'
+  END AS EngagementLevel,
+  CASE
+    WHEN uc.MaxReputation IS NULL THEN 'New User'
+    WHEN uc.MaxReputation < 1000 THEN 'Beginner'
+    WHEN uc.MaxReputation < 10000 THEN 'Intermediate'
+    ELSE 'Expert'
+  END AS UserExperienceLevel
+FROM PostEngagement AS pe
+LEFT JOIN UserContribution AS uc
+  ON pe.OwnerUserId = uc.UserId
+LEFT JOIN RankedPostEdits AS rpe
+  ON pe.PostId = rpe.PostId AND rpe.rn = 1
+WHERE
+  pe.CreationDate BETWEEN DATE('now', '-365 days') AND DATE('now')
+  AND pe.ViewCount > 1000
+ORDER BY
+  pe.ViewCount DESC,
+  pe.UpVotes DESC;

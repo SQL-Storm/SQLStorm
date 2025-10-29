@@ -1,0 +1,129 @@
+WITH ranked_user_activity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.AccountId,
+    COALESCE(p.total_posts, 0) * 2
+      + COALESCE(e.total_edits, 0) * 3
+      + COALESCE(b.total_badges, 0) AS activity_score
+  FROM Users u
+  LEFT JOIN (
+    SELECT OwnerUserId, COUNT(*) AS total_posts
+    FROM Posts
+    GROUP BY OwnerUserId
+  ) p ON p.OwnerUserId = u.Id
+  LEFT JOIN (
+    SELECT UserId, COUNT(*) AS total_edits
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4,5,6,8,9,18,19,24,36,37,38)
+    GROUP BY UserId
+  ) e ON e.UserId = u.Id
+  LEFT JOIN (
+    SELECT UserId, COUNT(*) AS total_badges
+    FROM Badges
+    GROUP BY UserId
+  ) b ON b.UserId = u.Id
+),
+posts_by_tag AS (
+  SELECT
+    p.Id AS PostId,
+    TRIM(tkn) AS tag_token
+  FROM Posts p,
+  LATERAL (
+    SELECT UNNEST(string_to_array(
+      CASE WHEN p.Tags IS NULL THEN '' ELSE SUBSTR(p.Tags, 2, LENGTH(p.Tags)-2) END,
+      '><'
+    )) AS tkn
+  ) AS token
+  WHERE p.PostTypeId = 1
+    AND TRIM(token.tkn) <> ''
+),
+tag_aggregate AS (
+  SELECT
+    pb.tag_token AS Tag,
+    COUNT(*) AS TagPostCount,
+    AVG(p.Score) AS AvgScore
+  FROM posts_by_tag pb
+  JOIN Posts p ON p.Id = pb.PostId
+  GROUP BY pb.tag_token
+),
+recent_questions AS (
+  SELECT
+    q.Id AS QuestionId,
+    q.Title,
+    q.Tags,
+    q.Score,
+    q.CreationDate,
+    q.OwnerUserId
+  FROM Posts q
+  WHERE q.PostTypeId = 1
+    AND q.CreationDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days')
+),
+open_closures AS (
+  SELECT
+    ph.PostId,
+    ph.Text AS CloseComment,
+    ph.CreationDate AS CloseDate,
+    ph.Comment
+  FROM PostHistory ph
+  WHERE ph.PostHistoryTypeId = 10
+)
+SELECT
+  rua.UserId,
+  rua.DisplayName AS UserName,
+  rua.Reputation,
+  rua.CreationDate AS UserCreationDate,
+  rua.LastAccessDate,
+  rua.Location,
+  rua.Views,
+  rua.UpVotes,
+  rua.DownVotes,
+  rua.AccountId,
+  rua.activity_score,
+  COUNT(DISTINCT rqa.QuestionId) AS RecentQuestions,
+  AVG(rqa.Score) AS AvgQuestionScore,
+  COUNT(DISTINCT ta.Tag) AS UniqueTagsUsed,
+  MAX(ta.TagPostCount) AS TagPostCount,
+  MAX(ta.AvgScore) AS AvgScore,
+  rq.Title AS MostRecentQuestionTitle,
+  rq.CreationDate AS MostRecentQuestionDate,
+  oc.CloseComment AS MostRecentCloseReason
+FROM ranked_user_activity rua
+LEFT JOIN recent_questions rqa ON rqa.OwnerUserId = rua.UserId
+LEFT JOIN Posts p ON p.OwnerUserId = rua.UserId AND p.PostTypeId = 1
+LEFT JOIN tag_aggregate ta ON TRUE
+LEFT JOIN (
+  SELECT
+    q.OwnerUserId,
+    q.Id AS QuestionId,
+    q.Title,
+    q.CreationDate
+  FROM Posts q
+  WHERE q.PostTypeId = 1
+) rq ON rq.OwnerUserId = rua.UserId
+LEFT JOIN open_closures oc ON oc.PostId = rq.QuestionId
+GROUP BY
+  rua.UserId,
+  rua.DisplayName,
+  rua.Reputation,
+  rua.CreationDate,
+  rua.LastAccessDate,
+  rua.Location,
+  rua.Views,
+  rua.UpVotes,
+  rua.DownVotes,
+  rua.AccountId,
+  rua.activity_score,
+  rq.Title,
+  rq.CreationDate,
+  oc.CloseComment
+HAVING rua.activity_score > 0
+ORDER BY rua.activity_score DESC, rua.Reputation DESC
+LIMIT 100;

@@ -1,0 +1,40 @@
+SELECT 
+    u.DisplayName,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    SUM(CASE WHEN p.ViewCount > 1000 THEN 1 ELSE 0 END) AS PopularPosts,
+    COUNT(DISTINCT v.PostId) AS TotalVotes,
+    COUNT(DISTINCT CASE WHEN b.TagBased = FALSE OR b.TagBased = 0 THEN b.Id ELSE NULL END) AS NamedBadges,
+    COUNT(DISTINCT CASE WHEN b.TagBased = TRUE OR b.TagBased = 1 THEN b.Id ELSE NULL END) AS TagBadges,
+    AVG(u.Reputation) AS AvgReputation,
+    MAX(u.LastAccessDate) AS LastAccessDate,
+    MIN(p.CreationDate) AS FirstPostDate,
+    MAX(p.LastActivityDate) AS LastActivityDate,
+    STRING_AGG(DISTINCT t.TagName, ', ' ORDER BY t.TagName) AS PopularTags
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    Tags t ON p.Id = t.ExcerptPostId
+WHERE 
+    u.Reputation > 100
+    AND p.PostTypeId IN (1, 2)
+    AND p.ViewCount IS NOT NULL
+    AND p.Score > 0
+    AND p.LastEditDate > p.CreationDate
+GROUP BY 
+    u.DisplayName,
+    u.Reputation,
+    u.LastAccessDate
+HAVING 
+    COUNT(DISTINCT p.Id) > 50
+    AND AVG(p.Score) > 10
+ORDER BY 
+    AvgReputation DESC, 
+    TotalPosts DESC;

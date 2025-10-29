@@ -1,0 +1,359 @@
+with
+params as (
+  select
+    date_trunc('month', cast('2024-10-01 12:34:56' as timestamp)) - interval '12 months' as start_date,
+    cast('2024-10-01 12:34:56' as timestamp) as end_date
+),
+active_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.lastaccessdate,
+    coalesce(nullif(trim(u.location), ''), 'Unknown') as location_norm,
+    coalesce(u.websiteurl, '') as websiteurl,
+    u.upvotes,
+    u.downvotes,
+    u.views,
+    count(distinct p.id) filter (where p.creationdate >= (select start_date from params)) as posts_last_year,
+    count(distinct c.id) filter (where c.creationdate >= (select start_date from params)) as comments_last_year
+  from users u
+  left join posts p on p.owneruserid = u.id
+  left join comments c on c.userid = u.id
+  group by u.id, u.displayname, u.reputation, u.creationdate, u.lastaccessdate, coalesce(nullif(trim(u.location), ''), 'Unknown'), coalesce(u.websiteurl, ''), u.upvotes, u.downvotes, u.views
+),
+qa_agg as (
+  select
+    p.owneruserid as user_id,
+    sum(case when p.posttypeid = 1 then 1 else 0 end) as questions,
+    sum(case when p.posttypeid = 2 then 1 else 0 end) as answers,
+    sum(case when p.posttypeid = 1 and p.acceptedanswerid is not null then 1 else 0 end) as questions_with_accepted,
+    sum(case when p.posttypeid = 2 and exists (
+      select 1 from posts q
+      where q.id = p.parentid and q.acceptedanswerid = p.id
+    ) then 1 else 0 end) as accepted_answers,
+    avg(nullif(p.score,0)) filter (where p.posttypeid in (1,2)) as avg_nonzero_score,
+    sum(p.viewcount) filter (where p.posttypeid = 1) as total_question_views,
+    count(distinct t.tagname) filter (where p.posttypeid = 1 and p.tags is not null) as distinct_tags_used
+  from posts p
+  left join lateral (
+    select unnest(string_to_array(substring(p.tags, 2, char_length(p.tags)-2), '><')) as tagname
+  ) t on p.tags is not null
+  group by p.owneruserid
+),
+vote_agg as (
+  select
+    v.userid as user_id,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes_cast,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes_cast,
+    sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started,
+    sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded,
+    count(*) as total_votes_cast,
+    max(v.creationdate) as last_vote_at,
+    to_timestamp(percentile_cont(0.5) within group (order by extract(epoch from v.creationdate))) as median_vote_time
+  from votes v
+  group by v.userid
+),
+badge_agg as (
+  select
+    b.userid as user_id,
+    sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+    sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+    sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+    count(*) as total_badges,
+    count(*) filter (where b.tagbased = true) as tag_badges,
+    min(b.date) as first_badge_date,
+    max(b.date) as last_badge_date
+  from badges b
+  group by b.userid
+),
+comment_agg as (
+  select
+    c.userid as user_id,
+    count(*) as comments_made,
+    avg(char_length(c.text)) as avg_comment_length,
+    sum(
+      (case when position('thanks' in lower(c.text)) > 0 then 1 else 0 end)
+      + (case when position('great' in lower(c.text)) > 0 then 1 else 0 end)
+      + (case when position('nice' in lower(c.text)) > 0 then 1 else 0 end)
+      - (case when position('bad' in lower(c.text)) > 0 then 1 else 0 end)
+      - (case when position('wrong' in lower(c.text)) > 0 then 1 else 0 end)
+      - (case when position('terrible' in lower(c.text)) > 0 then 1 else 0 end)
+    ) as sentiment_tokens,
+    max(c.creationdate) as last_comment_at
+  from comments c
+  group by c.userid
+),
+closure_agg as (
+  select
+    ph.userid as user_id,
+    count(*) filter (where ph.posthistorytypeid = 10) as closes,
+    count(*) filter (where ph.posthistorytypeid = 11) as reopens,
+    count(*) filter (where ph.posthistorytypeid in (12,13)) as delete_undelete_events,
+    count(*) filter (where ph.posthistorytypeid in (35,36)) as migrations,
+    count(*) filter (where ph.posthistorytypeid in (50,52,53)) as hot_or_bump_events,
+    sum(case when ph.posthistorytypeid = 10 and coalesce(ph.comment, '') ~ '^[0-9]+$' then 1 else 0 end) as closes_with_reason_id_numeric
+  from posthistory ph
+  group by ph.userid
+),
+link_agg as (
+  select
+    u.id as user_id,
+    count(distinct pl.id) filter (where pl.linktypeid = 3 and (p.owneruserid = u.id or rp.owneruserid = u.id)) as duplicate_links_touching_user,
+    count(distinct pl.id) filter (where pl.linktypeid = 1 and (p.owneruserid = u.id or rp.owneruserid = u.id)) as related_links_touching_user
+  from users u
+  left join postlinks pl on true
+  left join posts p on p.id = pl.postid
+  left join posts rp on rp.id = pl.relatedpostid
+  group by u.id
+),
+monthly_posting as (
+  select
+    p.owneruserid as user_id,
+    date_trunc('month', p.creationdate) as month,
+    count(*) filter (where p.posttypeid = 1) as q_count,
+    count(*) filter (where p.posttypeid = 2) as a_count,
+    avg(p.score) as avg_score,
+    sum(p.viewcount) filter (where p.posttypeid = 1) as views_sum
+  from posts p
+  where p.creationdate >= (select start_date from params)
+  group by p.owneruserid, date_trunc('month', p.creationdate)
+),
+monthly_ranks as (
+  select
+    user_id,
+    month,
+    q_count,
+    a_count,
+    avg_score,
+    views_sum,
+    row_number() over (partition by month order by a_count desc, q_count desc, avg_score desc nulls last) as rank_in_month
+  from monthly_posting
+),
+engagement as (
+  select
+    au.user_id,
+    0.30 * coalesce(qa.answers,0) +
+    0.20 * coalesce(qa.questions,0) +
+    0.15 * coalesce(qa.accepted_answers,0) +
+    0.10 * coalesce(qa.questions_with_accepted,0) +
+    0.05 * greatest(0, au.upvotes - au.downvotes) +
+    0.05 * coalesce(va.total_votes_cast,0) +
+    0.10 * coalesce(ba.total_badges,0) +
+    0.05 * coalesce(ca.sentiment_tokens,0) as engagement_score,
+    case when au.posts_last_year > 0 or au.comments_last_year > 0 then 1 else 0 end as active_flag
+  from active_users au
+  left join qa_agg qa on qa.user_id = au.user_id
+  left join vote_agg va on va.user_id = au.user_id
+  left join badge_agg ba on ba.user_id = au.user_id
+  left join comment_agg ca on ca.user_id = au.user_id
+),
+top_tag_per_user as (
+  select
+    p.owneruserid as user_id,
+    (
+      select t2.tagname
+      from (
+        select unnest(string_to_array(substring(p2.tags, 2, char_length(p2.tags)-2), '><')) as tagname
+        from posts p2
+        where p2.owneruserid = p.owneruserid and p2.posttypeid = 1 and p2.tags is not null
+      ) t2
+      group by t2.tagname
+      order by count(*) desc, t2.tagname asc
+      limit 1
+    ) as top_tag
+  from posts p
+  where p.owneruserid is not null
+  group by p.owneruserid
+),
+score_distribution as (
+  select
+    e.user_id,
+    e.engagement_score,
+    ntile(100) over (order by e.engagement_score nulls first) as percentile_bucket
+  from engagement e
+),
+peak_monthly_rank as (
+  select
+    mr.user_id,
+    min(mr.rank_in_month) as best_rank,
+    max(mr.rank_in_month) as worst_rank,
+    count(*) as months_active
+  from monthly_ranks mr
+  group by mr.user_id
+),
+user_domains as (
+  select
+    u.id as user_id,
+    nullif(regexp_replace(coalesce(u.websiteurl,''), '^https?://(www\.)?', '', 'i'), '') as domain_raw,
+    case
+      when coalesce(u.websiteurl,'') = '' then null
+      else split_part(regexp_replace(u.websiteurl, '^https?://(www\.)?', '', 'i'), '/', 1)
+    end as domain_host
+  from users u
+),
+final_users as (
+  select
+    au.user_id,
+    au.displayname,
+    au.reputation,
+    au.creationdate,
+    au.lastaccessdate,
+    au.location_norm,
+    coalesce(qa.questions,0) as questions,
+    coalesce(qa.answers,0) as answers,
+    coalesce(qa.accepted_answers,0) as accepted_answers,
+    coalesce(qa.questions_with_accepted,0) as questions_with_accepted,
+    coalesce(qa.total_question_views,0) as total_question_views,
+    coalesce(qa.avg_nonzero_score, 0.0) as avg_nonzero_score,
+    coalesce(qa.distinct_tags_used,0) as distinct_tags_used,
+    coalesce(va.upvotes_cast,0) as upvotes_cast,
+    coalesce(va.downvotes_cast,0) as downvotes_cast,
+    coalesce(va.bounty_started,0) as bounty_started,
+    coalesce(va.bounty_awarded,0) as bounty_awarded,
+    va.last_vote_at,
+    va.median_vote_time,
+    coalesce(ba.gold_badges,0) as gold_badges,
+    coalesce(ba.silver_badges,0) as silver_badges,
+    coalesce(ba.bronze_badges,0) as bronze_badges,
+    coalesce(ba.total_badges,0) as total_badges,
+    coalesce(ba.tag_badges,0) as tag_badges,
+    ba.first_badge_date,
+    ba.last_badge_date,
+    coalesce(ca.comments_made,0) as comments_made,
+    coalesce(ca.avg_comment_length,0) as avg_comment_length,
+    coalesce(ca.sentiment_tokens,0) as sentiment_tokens,
+    ca.last_comment_at,
+    coalesce(cl.closes,0) as closes,
+    coalesce(cl.reopens,0) as reopens,
+    coalesce(cl.delete_undelete_events,0) as delete_undelete_events,
+    coalesce(cl.migrations,0) as migrations,
+    coalesce(cl.hot_or_bump_events,0) as hot_or_bump_events,
+    coalesce(la.duplicate_links_touching_user,0) as duplicate_links_touching_user,
+    coalesce(la.related_links_touching_user,0) as related_links_touching_user,
+    tt.top_tag,
+    sd.percentile_bucket,
+    pm.best_rank,
+    pm.worst_rank,
+    pm.months_active,
+    ud.domain_host,
+    e.engagement_score,
+    e.active_flag
+  from active_users au
+  left join qa_agg qa on qa.user_id = au.user_id
+  left join vote_agg va on va.user_id = au.user_id
+  left join badge_agg ba on ba.user_id = au.user_id
+  left join comment_agg ca on ca.user_id = au.user_id
+  left join closure_agg cl on cl.user_id = au.user_id
+  left join link_agg la on la.user_id = au.user_id
+  left join top_tag_per_user tt on tt.user_id = au.user_id
+  left join score_distribution sd on sd.user_id = au.user_id
+  left join peak_monthly_rank pm on pm.user_id = au.user_id
+  left join user_domains ud on ud.user_id = au.user_id
+  left join engagement e on e.user_id = au.user_id
+),
+cohort_active as (
+  select user_id from engagement where active_flag = 1
+),
+cohort_highrep as (
+  select user_id from users where reputation >= (select percentile_cont(0.90) within group (order by reputation) from users)
+),
+cohort_badged as (
+  select user_id from badge_agg where total_badges >= 10
+),
+cohort_intersection as (
+  select user_id from cohort_active
+  intersect
+  select user_id from cohort_highrep
+  intersect
+  select user_id from cohort_badged
+),
+cohort_symdiff as (
+  (
+    select user_id, 'active_only' as cohort from cohort_active
+    except
+    select user_id, 'active_only' from cohort_highrep
+  )
+  union all
+  (
+    select user_id, 'highrep_only' from cohort_highrep
+    except
+    select user_id, 'highrep_only' from cohort_badged
+  )
+)
+select
+  fu.user_id,
+  fu.displayname,
+  fu.reputation,
+  fu.location_norm,
+  fu.domain_host,
+  fu.questions,
+  fu.answers,
+  fu.accepted_answers,
+  fu.questions_with_accepted,
+  fu.total_question_views,
+  fu.avg_nonzero_score,
+  fu.distinct_tags_used,
+  fu.upvotes_cast,
+  fu.downvotes_cast,
+  fu.bounty_started,
+  fu.bounty_awarded,
+  fu.total_badges,
+  fu.gold_badges,
+  fu.silver_badges,
+  fu.bronze_badges,
+  fu.comments_made,
+  fu.avg_comment_length,
+  fu.sentiment_tokens,
+  fu.closes,
+  fu.reopens,
+  fu.delete_undelete_events,
+  fu.migrations,
+  fu.hot_or_bump_events,
+  fu.duplicate_links_touching_user,
+  fu.related_links_touching_user,
+  coalesce(fu.top_tag, 'untagged') as top_tag_or_untagged,
+  fu.percentile_bucket,
+  fu.best_rank,
+  fu.worst_rank,
+  fu.months_active,
+  fu.engagement_score,
+  fu.active_flag,
+  case when ci.user_id is not null then 1 else 0 end as in_elite_intersection,
+  string_agg(cs.cohort, ',' order by cs.cohort) as cohort_symdiff_flags
+from final_users fu
+left join cohort_intersection ci on ci.user_id = fu.user_id
+left join cohort_symdiff cs on cs.user_id = fu.user_id
+where
+  (
+    fu.answers > 0
+    or (fu.questions > 0 and (fu.top_tag is not null or fu.distinct_tags_used > 0))
+    or (fu.comments_made > 10 and coalesce(fu.sentiment_tokens,0) >= 0)
+  )
+  and (
+    fu.reputation >= 1
+    and (fu.domain_host is null or lower(fu.domain_host) not similar to '%(spam|malware|phish)%' )
+  )
+  and (
+    (fu.engagement_score > 1.0 or fu.total_badges >= 3)
+    and not (fu.engagement_score is null and fu.total_badges = 0)
+  )
+group by
+  fu.user_id, fu.displayname, fu.reputation, fu.location_norm, fu.domain_host,
+  fu.questions, fu.answers, fu.accepted_answers, fu.questions_with_accepted,
+  fu.total_question_views, fu.avg_nonzero_score, fu.distinct_tags_used,
+  fu.upvotes_cast, fu.downvotes_cast, fu.bounty_started, fu.bounty_awarded,
+  fu.total_badges, fu.gold_badges, fu.silver_badges, fu.bronze_badges,
+  fu.comments_made, fu.avg_comment_length, fu.sentiment_tokens,
+  fu.closes, fu.reopens, fu.delete_undelete_events, fu.migrations, fu.hot_or_bump_events,
+  fu.duplicate_links_touching_user, fu.related_links_touching_user, fu.top_tag,
+  fu.percentile_bucket, fu.best_rank, fu.worst_rank, fu.months_active, fu.engagement_score, fu.active_flag, ci.user_id
+order by
+  in_elite_intersection desc,
+  fu.percentile_bucket desc,
+  fu.engagement_score desc nulls last,
+  fu.total_badges desc,
+  fu.answers desc,
+  fu.questions desc
+limit 500;

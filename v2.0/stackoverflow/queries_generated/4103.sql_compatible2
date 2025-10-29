@@ -1,0 +1,115 @@
+WITH RankedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount AS PostViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        pt.Name AS PostType,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserPostRank,
+        AVG(CAST(p.Score AS DECIMAL(10, 2))) OVER (PARTITION BY p.OwnerUserId) AS AvgUserPostScore,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id) AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id) AS DownVoteCount,
+        COUNT(ph.Id) OVER (PARTITION BY p.Id) AS PostHistoryCount,
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostScore,
+        LEAD(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextPostScore
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    WHERE p.OwnerUserId IS NOT NULL AND p.OwnerUserId > 0
+    GROUP BY
+        p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, pt.Name, p.ClosedDate
+),
+UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate AS UserLastAccessDate,
+        COUNT(DISTINCT rp.PostId) AS TotalPosts,
+        SUM(rp.PostScore) AS TotalScore,
+        AVG(CAST(rp.PostScore AS DECIMAL(10, 2))) AS AverageScore,
+        SUM(rp.UpVoteCount) AS TotalUpVotesReceived,
+        SUM(rp.DownVoteCount) AS TotalDownVotesReceived,
+        MAX(rp.PostCreationDate) AS LastPostDate,
+        COUNT(DISTINCT CASE WHEN rp.IsClosed = 1 THEN rp.PostId END) AS ClosedPostsCount,
+        COUNT(DISTINCT CASE WHEN rp.PostHistoryCount > 5 THEN rp.PostId END) AS HighlyEditedPosts,
+        CAST(AVG(CAST(rp.PostViewCount AS DECIMAL(12, 2))) AS BIGINT) AS AvgPostViews,
+        SUM(rp.PostViewCount) AS TotalPostViews,
+        SUM(CASE WHEN rp.UserPostRank <= 5 THEN 1 ELSE 0 END) AS Top5PostsCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadgeCount,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadgeCount,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadgeCount,
+        COALESCE(SUM(rp.AnswerCount), 0) AS TotalAnswers,
+        COALESCE(SUM(rp.CommentCount), 0) AS TotalComments,
+        COALESCE(SUM(rp.FavoriteCount), 0) AS TotalFavorites,
+        AVG(CASE WHEN rp.AvgUserPostScore IS NOT NULL THEN rp.AvgUserPostScore ELSE 0 END) AS GlobalAvgUserPostScore,
+        MAX(rp.PostCreationDate) - MIN(rp.PostCreationDate) AS UserActivitySpan
+    FROM Users u
+    JOIN RankedPosts rp ON u.Id = rp.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+)
+SELECT
+    ue.UserId,
+    ue.DisplayName,
+    ue.Reputation,
+    ue.UserCreationDate,
+    ue.UserLastAccessDate,
+    ue.TotalPosts,
+    ue.TotalScore,
+    ue.AverageScore,
+    ue.TotalUpVotesReceived,
+    ue.TotalDownVotesReceived,
+    ue.LastPostDate,
+    ue.ClosedPostsCount,
+    ue.HighlyEditedPosts,
+    ue.AvgPostViews,
+    ue.TotalPostViews,
+    ue.Top5PostsCount,
+    ue.BadgeCount,
+    ue.GoldBadgeCount,
+    ue.SilverBadgeCount,
+    ue.BronzeBadgeCount,
+    ue.TotalAnswers,
+    ue.TotalComments,
+    ue.TotalFavorites,
+    ue.GlobalAvgUserPostScore,
+    ue.UserActivitySpan,
+    CASE
+        WHEN ue.TotalPosts = 0 THEN 'No Posts'
+        WHEN ue.AverageScore > 50 THEN 'High Performer'
+        WHEN ue.AverageScore > 10 THEN 'Good Performer'
+        WHEN ue.Reputation > 10000 THEN 'Experienced'
+        WHEN ue.UserActivitySpan > INTERVAL '365 days' AND ue.TotalPosts > 100 THEN 'Veteran'
+        WHEN ue.UserLastAccessDate < (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year') THEN 'Inactive'
+        ELSE 'Standard'
+    END AS UserPerformanceCategory,
+    ROUND(CAST(ue.TotalPostViews AS DECIMAL(15, 2)) / NULLIF(ue.TotalPosts, 0), 2) AS AvgViewsPerPost,
+    (SELECT COUNT(*) FROM Comments WHERE UserId = ue.UserId) AS CommentsMade,
+    (SELECT COUNT(*) FROM Votes WHERE UserId = ue.UserId AND VoteTypeId = 2) AS UpVotesCast,
+    (SELECT COUNT(*) FROM Votes WHERE UserId = ue.UserId AND VoteTypeId = 3) AS DownVotesCast,
+    (SELECT COUNT(*) FROM Badges WHERE UserId = ue.UserId AND Name LIKE '%Master%') AS MasterBadgeCount,
+    (SELECT COUNT(*) FROM Posts p_sub WHERE p_sub.OwnerUserId = ue.UserId AND p_sub.AnswerCount > 0) AS PostsWithAnswers,
+    (SELECT COUNT(*) FROM Posts p_sub WHERE p_sub.OwnerUserId = ue.UserId AND p_sub.ClosedDate IS NOT NULL) AS UserClosedPosts,
+    COALESCE(ue.TotalAnswers, 0) + COALESCE(ue.TotalComments, 0) AS TotalContributions,
+    ue.UserActivitySpan,
+    CASE
+        WHEN ue.UserActivitySpan IS NULL OR ue.UserActivitySpan <= INTERVAL '0 days' THEN 0
+        ELSE ROUND(CAST(ue.TotalPosts AS DECIMAL) / EXTRACT(DAY FROM ue.UserActivitySpan), 3)
+    END AS AvgPostsPerDay,
+    ue.DisplayName || ' (' || ue.Reputation || ')' AS UserDisplayWithRep,
+    CAST(ue.UserCreationDate AS DATE) AS UserStartDate,
+    CASE WHEN ue.AvgPostViews > 10000 THEN 'High Traffic User' WHEN ue.AvgPostViews > 1000 THEN 'Medium Traffic User' ELSE 'Low Traffic User' END AS TrafficCategory
+FROM UserEngagement ue
+WHERE ue.TotalPosts > 0
+ORDER BY ue.Reputation DESC, ue.TotalScore DESC
+LIMIT 100;

@@ -1,0 +1,119 @@
+-- {"query": "3811.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2206} 
+WITH
+    TopUsers AS (
+        SELECT
+            u.Id,
+            u.DisplayName,
+            u.Reputation,
+            COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+            COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+            COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesGiven,
+            SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesGiven,
+            ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank
+        FROM Users u
+        LEFT JOIN Badges b ON b.UserId = u.Id
+        LEFT JOIN Votes v  ON v.UserId = u.Id
+        GROUP BY u.Id, u.DisplayName, u.Reputation
+    ),
+    RecentPosts AS (
+        SELECT
+            p.Id,
+            p.Title,
+            p.CreationDate,
+            p.OwnerUserId,
+            p.Score,
+            p.ViewCount,
+            p.AnswerCount,
+            p.FavoriteCount,
+            p.Tags,
+            p.AcceptedAnswerId,
+            ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+    ),
+    TagStats AS (
+        SELECT
+            t.TagName,
+            t.Count AS TagUseCount,
+            COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+            AVG(p.Score) FILTER (WHERE p.PostTypeId = 1) AS AvgQuestionScore,
+            MAX(p.CreationDate) AS LastQuestionDate
+        FROM Tags t
+        LEFT JOIN Posts p ON p.Tags ILIKE '%' || t.TagName || '%'
+        GROUP BY t.TagName, t.Count
+    ),
+    LatestCloseReason AS (
+        SELECT
+            ph.PostId,
+            ph.Comment AS CloseReason,
+            ph.CreationDate AS ClosedOn,
+            ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+        FROM PostHistory ph
+        WHERE ph.PostHistoryTypeId = 10
+    )
+SELECT
+    tu.RepRank,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.GoldBadges,
+    tu.SilverBadges,
+    tu.BronzeBadges,
+    COALESCE(tu.UpVotesGiven,0) - COALESCE(tu.DownVotesGiven,0) AS VoteBalance,
+    rp.Title,
+    rp.CreationDate,
+    rp.Score,
+    rp.ViewCount,
+    rp.AnswerCount,
+    rp.FavoriteCount,
+    rp.Tags,
+    COALESCE(lcr.CloseReason,'Not Closed') AS CloseReason,
+    ts.TagName,
+    ts.TagUseCount,
+    ts.QuestionCount,
+    ROUND(ts.AvgQuestionScore,2) AS AvgQuestionScore,
+    ts.LastQuestionDate,
+    CASE
+        WHEN rp.AnswerCount = 0 THEN 'Unanswered'
+        WHEN rp.AcceptedAnswerId IS NOT NULL THEN 'Answered & Accepted'
+        ELSE 'Answered'
+    END AS AnswerStatus,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = rp.Id AND c.Score > 0) AS PositiveCommentCount
+FROM TopUsers tu
+LEFT JOIN RecentPosts rp ON rp.OwnerUserId = tu.Id AND rp.rn = 1
+LEFT JOIN LatestCloseReason lcr ON lcr.PostId = rp.Id AND lcr.rn = 1
+LEFT JOIN LATERAL (SELECT UNNEST(string_to_array(rp.Tags, '><')) AS TagName) t ON true
+LEFT JOIN TagStats ts ON ts.TagName = t.TagName
+WHERE tu.RepRank <= 100
+ORDER BY tu.RepRank, rp.CreationDate DESC
+
+UNION ALL
+
+SELECT
+    NULL,
+    u.DisplayName,
+    u.Reputation,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL
+FROM Users u
+WHERE u.Reputation < 100
+ORDER BY 2 DESC
+LIMIT 10;

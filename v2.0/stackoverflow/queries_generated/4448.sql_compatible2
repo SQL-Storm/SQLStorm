@@ -1,0 +1,209 @@
+WITH
+  RelevantPosts AS (
+    SELECT
+      p.Id AS PostId,
+      p.PostTypeId,
+      pt.Name AS PostTypeName,
+      p.OwnerUserId,
+      u.DisplayName AS OwnerDisplayName,
+      p.CreationDate AS PostCreationDate,
+      p.Score,
+      p.ViewCount,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      p.ClosedDate,
+      CASE
+        WHEN p.PostTypeId = 1 THEN SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2)
+        ELSE NULL
+      END AS Tags,
+      ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS PostSequence
+    FROM Posts p
+    JOIN PostTypes pt
+      ON p.PostTypeId = pt.Id
+    LEFT JOIN Users u
+      ON p.OwnerUserId = u.Id
+    WHERE
+      p.PostTypeId IN (1, 2)
+      AND p.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '1 year')
+  ),
+  PostHistorySummary AS (
+    SELECT
+      ph.PostId,
+      COUNT(CASE WHEN ph.PostHistoryTypeId = 5 THEN 1 END) AS BodyEdits,
+      COUNT(CASE WHEN ph.PostHistoryTypeId = 4 THEN 1 END) AS TitleEdits,
+      MAX(CASE WHEN ph.PostHistoryTypeId = 4 THEN ph.CreationDate END) AS LastTitleEditDate
+    FROM PostHistory ph
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5)
+      AND ph.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '1 year')
+    GROUP BY
+      ph.PostId
+  ),
+  UserPostActivity AS (
+    SELECT
+      rp.OwnerUserId,
+      COUNT(DISTINCT rp.PostId) AS TotalPosts,
+      COUNT(CASE WHEN rp.PostTypeId = 1 THEN rp.PostId END) AS QuestionCount,
+      COUNT(CASE WHEN rp.PostTypeId = 2 THEN rp.PostId END) AS AnswerCount,
+      AVG(rp.Score) AS AverageScore,
+      SUM(CASE WHEN rp.ClosedDate IS NOT NULL THEN 1 ELSE 0 END) AS ClosedPosts,
+      MAX(rp.PostCreationDate) AS LatestPostDate
+    FROM RelevantPosts rp
+    GROUP BY
+      rp.OwnerUserId
+  ),
+  AggregatedPostData AS (
+    SELECT
+      rp.PostId,
+      rp.PostTypeName,
+      rp.OwnerUserId,
+      rp.OwnerDisplayName,
+      rp.PostCreationDate,
+      rp.Score,
+      rp.ViewCount,
+      rp.AnswerCount AS DirectAnswerCount,
+      rp.CommentCount,
+      rp.FavoriteCount,
+      rp.ClosedDate,
+      rp.Tags,
+      COALESCE(phs.BodyEdits, 0) AS TotalBodyEdits,
+      COALESCE(phs.TitleEdits, 0) AS TotalTitleEdits,
+      phs.LastTitleEditDate,
+      upa.TotalPosts AS OwnerTotalPosts,
+      upa.QuestionCount AS OwnerQuestionCount,
+      upa.AnswerCount AS OwnerAnswerCount,
+      upa.AverageScore AS OwnerAverageScore,
+      upa.ClosedPosts AS OwnerClosedPosts
+    FROM RelevantPosts rp
+    LEFT JOIN PostHistorySummary phs
+      ON rp.PostId = phs.PostId
+    LEFT JOIN UserPostActivity upa
+      ON rp.OwnerUserId = upa.OwnerUserId
+    WHERE
+      rp.PostSequence <= 10
+  )
+SELECT
+  apd.PostId,
+  apd.PostTypeName,
+  apd.OwnerDisplayName,
+  apd.PostCreationDate,
+  apd.Score,
+  apd.ViewCount,
+  apd.DirectAnswerCount,
+  apd.CommentCount,
+  apd.FavoriteCount,
+  apd.ClosedDate,
+  apd.Tags,
+  apd.TotalBodyEdits,
+  apd.TotalTitleEdits,
+  apd.LastTitleEditDate,
+  apd.OwnerTotalPosts,
+  apd.OwnerQuestionCount,
+  apd.OwnerAnswerCount,
+  apd.OwnerAverageScore,
+  CASE
+    WHEN apd.OwnerAverageScore > 500 THEN 'High Performer'
+    WHEN apd.OwnerAverageScore BETWEEN 100 AND 500 THEN 'Mid Performer'
+    ELSE 'Standard Performer'
+  END AS OwnerPerformanceCategory,
+  (
+    SELECT
+      COUNT(*)
+    FROM Comments c
+    WHERE
+      c.PostId = apd.PostId
+      AND c.CreationDate >= apd.PostCreationDate
+  ) AS CommentCountSinceCreation,
+  (
+    SELECT
+      AVG(v.Score)
+    FROM Votes v
+    WHERE
+      v.PostId = apd.PostId
+      AND v.VoteTypeId = 2
+  ) AS AverageUpvoteScore,
+  CASE
+    WHEN apd.ClosedDate IS NOT NULL AND apd.OwnerClosedPosts > 5 THEN 'Frequent Closer'
+    WHEN apd.ClosedDate IS NOT NULL THEN 'Occasional Closer'
+    ELSE 'Never Closed'
+  END AS OwnerClosingHabit,
+  SUBSTRING(apd.OwnerDisplayName FROM 1 FOR 3) AS OwnerDisplayNameInitials,
+  CHAR_LENGTH(apd.OwnerDisplayName) AS OwnerDisplayNameLength,
+  CASE WHEN apd.OwnerDisplayName IS NULL OR apd.OwnerDisplayName = '' THEN 'Anonymous' ELSE 'Identified' END AS OwnerIdentificationStatus,
+  CASE
+    WHEN apd.Tags LIKE '%sql%' OR apd.Tags LIKE '%database%' THEN 'SQL/DB Related'
+    WHEN apd.Tags LIKE '%python%' OR apd.Tags LIKE '%java%' THEN 'Programming Language Related'
+    ELSE 'Other'
+  END AS TagCategory,
+  LAG(apd.Score, 1, 0) OVER (ORDER BY apd.PostCreationDate, apd.PostId) AS PreviousPostScore,
+  LEAD(apd.Score, 1, 0) OVER (ORDER BY apd.PostCreationDate, apd.PostId) AS NextPostScore,
+  apd.PostCreationDate + INTERVAL '1 day' AS PostCreationDatePlusOneDay,
+  apd.OwnerUserId
+FROM AggregatedPostData apd
+WHERE
+  apd.OwnerUserId IS NOT NULL
+
+UNION
+
+SELECT
+  apd.PostId,
+  apd.PostTypeName,
+  apd.OwnerDisplayName,
+  apd.PostCreationDate,
+  apd.Score,
+  apd.ViewCount,
+  apd.DirectAnswerCount,
+  apd.CommentCount,
+  apd.FavoriteCount,
+  apd.ClosedDate,
+  apd.Tags,
+  apd.TotalBodyEdits,
+  apd.TotalTitleEdits,
+  apd.LastTitleEditDate,
+  apd.OwnerTotalPosts,
+  apd.OwnerQuestionCount,
+  apd.OwnerAnswerCount,
+  apd.OwnerAverageScore,
+  CASE
+    WHEN apd.OwnerAverageScore > 500 THEN 'High Performer'
+    WHEN apd.OwnerAverageScore BETWEEN 100 AND 500 THEN 'Mid Performer'
+    ELSE 'Standard Performer'
+  END AS OwnerPerformanceCategory,
+  (
+    SELECT
+      COUNT(*)
+    FROM Comments c
+    WHERE
+      c.PostId = apd.PostId
+      AND c.CreationDate >= apd.PostCreationDate
+  ) AS CommentCountSinceCreation,
+  (
+    SELECT
+      AVG(v.Score)
+    FROM Votes v
+    WHERE
+      v.PostId = apd.PostId
+      AND v.VoteTypeId = 2
+  ) AS AverageUpvoteScore,
+  CASE
+    WHEN apd.ClosedDate IS NOT NULL AND apd.OwnerClosedPosts > 5 THEN 'Frequent Closer'
+    WHEN apd.ClosedDate IS NOT NULL THEN 'Occasional Closer'
+    ELSE 'Never Closed'
+  END AS OwnerClosingHabit,
+  SUBSTRING(apd.OwnerDisplayName FROM 1 FOR 3) AS OwnerDisplayNameInitials,
+  CHAR_LENGTH(apd.OwnerDisplayName) AS OwnerDisplayNameLength,
+  CASE WHEN apd.OwnerDisplayName IS NULL OR apd.OwnerDisplayName = '' THEN 'Anonymous' ELSE 'Identified' END AS OwnerIdentificationStatus,
+  CASE
+    WHEN apd.Tags LIKE '%sql%' OR apd.Tags LIKE '%database%' THEN 'SQL/DB Related'
+    WHEN apd.Tags LIKE '%python%' OR apd.Tags LIKE '%java%' THEN 'Programming Language Related'
+    ELSE 'Other'
+  END AS TagCategory,
+  LAG(apd.Score, 1, 0) OVER (ORDER BY apd.PostCreationDate, apd.PostId) AS PreviousPostScore,
+  LEAD(apd.Score, 1, 0) OVER (ORDER BY apd.PostCreationDate, apd.PostId) AS NextPostScore,
+  apd.PostCreationDate + INTERVAL '1 day' AS PostCreationDatePlusOneDay,
+  apd.OwnerUserId
+FROM AggregatedPostData apd
+WHERE
+  apd.OwnerUserId IS NULL
+  AND apd.PostTypeName = 'Question';

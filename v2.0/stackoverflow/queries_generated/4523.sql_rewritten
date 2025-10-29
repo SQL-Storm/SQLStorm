@@ -1,0 +1,112 @@
+-- {"query": "4523.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1376} 
+WITH RankedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount AS PostViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        pt.Name AS PostTypeName,
+        ROW_NUMBER() OVER(PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) as rn
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.OwnerUserId IS NOT NULL AND p.PostTypeId IN (1, 2)
+),
+UserPostAggregates AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName AS UserDisplayName,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN p.Id ELSE NULL END) AS QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN p.Id ELSE NULL END) AS AnswerCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.PostScore ELSE 0 END) AS TotalQuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.PostScore ELSE 0 END) AS TotalAnswerScore,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.PostViewCount ELSE NULL END) AS AvgQuestionViews,
+        MAX(CASE WHEN p.PostTypeId = 1 THEN p.PostCreationDate ELSE NULL END) AS LastQuestionDate,
+        COUNT(DISTINCT b.Id) AS BadgeCount
+    FROM Users u
+    LEFT JOIN RankedPosts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000 AND u.DisplayName IS NOT NULL AND u.DisplayName NOT LIKE '%[Bot]%'
+    GROUP BY u.Id, u.DisplayName
+),
+HotQuestions AS (
+    SELECT
+        Id,
+        Title,
+        Tags,
+        Score,
+        ViewCount,
+        AnswerCount,
+        FavoriteCount,
+        CreationDate,
+        ROW_NUMBER() OVER (ORDER BY (Score * 1.0 / NULLIF(DATEDIFF(day, CreationDate, cast('2024-10-01 12:34:56' as timestamp)), 0) * LOG(ViewCount + 1)) DESC) as HotScoreRank
+    FROM Posts
+    WHERE PostTypeId = 1
+      AND CreationDate > DATEADD(day, -7, cast('2024-10-01 12:34:56' as timestamp))
+      AND Score > 5
+      AND AnswerCount > 0
+      AND Tags LIKE '%<sql>%'
+),
+ClosedButNotDeleted AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.ClosedDate,
+        crt.Name AS CloseReason,
+        ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY p.ClosedDate DESC) as rn_closed
+    FROM Posts p
+    JOIN PostHistory ph ON p.Id = ph.PostId
+    JOIN CloseReasonTypes crt ON CAST(ph.Comment AS INT) = crt.Id
+    WHERE p.PostTypeId = 1
+      AND p.ClosedDate IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM PostHistory ph_del WHERE ph_del.PostId = p.Id AND ph_del.PostHistoryTypeId = 13)
+      AND ph.PostHistoryTypeId = 10
+      AND ph.Comment IS NOT NULL
+)
+SELECT
+    upa.UserId,
+    upa.UserDisplayName,
+    upa.QuestionCount,
+    upa.AnswerCount,
+    upa.TotalQuestionScore,
+    upa.TotalAnswerScore,
+    upa.AvgQuestionViews,
+    upa.LastQuestionDate,
+    upa.BadgeCount,
+    hq.Title AS HotQuestionTitle,
+    hq.Tags AS HotQuestionTags,
+    cbd.Title AS RecentlyClosedQuestionTitle,
+    cbd.CloseReason AS LastCloseReason,
+    CASE WHEN upa.TotalQuestionScore > 10000 AND upa.AnswerCount > 50 THEN 'Expert' WHEN upa.TotalQuestionScore > 1000 AND upa.AnswerCount > 10 THEN 'Experienced' ELSE 'Intermediate' END AS UserExperienceLevel,
+    COALESCE(upa.UserDisplayName, 'Anonymous') AS DisplayNameOrAnonymous,
+    DATEDIFF(day, upa.LastQuestionDate, cast('2024-10-01 12:34:56' as timestamp)) AS DaysSinceLastQuestion
+FROM UserPostAggregates upa
+LEFT JOIN HotQuestions hq ON hq.HotScoreRank <= 5
+LEFT JOIN ClosedButNotDeleted cbd ON cbd.rn_closed = 1 AND cbd.PostId IN (SELECT Id FROM RankedPosts WHERE rn <= 10)
+WHERE upa.QuestionCount > 0 OR upa.AnswerCount > 0
+UNION
+SELECT
+    NULL AS UserId,
+    'Summary' AS UserDisplayName,
+    COUNT(CASE WHEN p.PostTypeId = 1 THEN p.Id ELSE NULL END) AS QuestionCount,
+    COUNT(CASE WHEN p.PostTypeId = 2 THEN p.Id ELSE NULL END) AS AnswerCount,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN p.PostScore ELSE 0 END) AS TotalQuestionScore,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN p.PostScore ELSE 0 END) AS TotalAnswerScore,
+    AVG(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE NULL END) AS AvgQuestionViews,
+    MAX(p.CreationDate) AS LastQuestionDate,
+    COUNT(DISTINCT b.Id) AS BadgeCount,
+    NULL AS HotQuestionTitle,
+    NULL AS HotQuestionTags,
+    NULL AS RecentlyClosedQuestionTitle,
+    NULL AS LastCloseReason,
+    NULL AS UserExperienceLevel,
+    'Platform Summary' AS DisplayNameOrAnonymous,
+    NULL AS DaysSinceLastQuestion
+FROM Posts p
+LEFT JOIN Badges b ON p.OwnerUserId = b.UserId
+WHERE p.OwnerUserId IS NOT NULL AND p.PostTypeId IN (1, 2);

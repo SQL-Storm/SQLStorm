@@ -1,0 +1,144 @@
+-- {"query": "4163.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1766} 
+
+WITH UserPostActivity AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount AS PostViewCount,
+        p.CommentCount AS PostCommentCount,
+        p.FavoriteCount AS PostFavoriteCount,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        COALESCE(p.ClosedDate, '1900-01-01') AS ClosedDate,
+        ROW_NUMBER() OVER(PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserPostRank,
+        COUNT(c.Id) OVER(PARTITION BY p.Id) AS CommentCountPerPost,
+        AVG(p.Score) OVER(PARTITION BY p.OwnerUserId) AS AvgUserPostScore,
+        CASE
+            WHEN p.OwnerUserId = -1 THEN 'Community'
+            ELSE u.DisplayName
+        END AS DisplayName,
+        CASE
+            WHEN p.OwnerUserId = -1 THEN u.Reputation
+            ELSE COALESCE(u.Reputation, 0)
+        END AS UserReputation
+    FROM
+        Posts p
+    JOIN
+        PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN
+        Comments c ON p.Id = c.PostId
+    WHERE
+        p.OwnerUserId IS NOT NULL AND p.OwnerUserId <> -2 AND p.PostTypeId IN (1, 2) -- Questions and Answers
+),
+UserEngagementMetrics AS (
+    SELECT
+        upa.OwnerUserId,
+        COUNT(DISTINCT upa.PostId) AS TotalPosts,
+        SUM(CASE WHEN upa.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN upa.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        AVG(upa.PostScore) AS AvgPostScore,
+        SUM(upa.PostViewCount) AS TotalViewCount,
+        SUM(upa.PostCommentCount) AS TotalCommentCount,
+        SUM(upa.PostFavoriteCount) AS TotalFavoriteCount,
+        MAX(upa.UserPostRank) AS MaxUserPostRank,
+        AVG(upa.UserReputation) AS AvgUserReputation,
+        COUNT(DISTINCTCASE WHEN upa.ClosedDate <> '1900-01-01' THEN upa.PostId ELSE NULL END) AS ClosedPostCount,
+        STRING_AGG(DISTINCT upa.PostTypeName, ', ') AS PostTypes
+    FROM
+        UserPostActivity upa
+    WHERE upa.OwnerUserId IS NOT NULL
+    GROUP BY
+        upa.OwnerUserId
+),
+FrequentTags AS (
+    SELECT
+        TagName,
+        COUNT(*) AS TagCount
+    FROM
+        Tags
+    CROSS APPLY string_split(REPLACE(REPLACE(Tags, '<', '>'), '>', '<'), '>') -- Assuming Tags are stored like <tag1><tag2>
+    WHERE
+        LEN(TagName) > 0
+    GROUP BY
+        TagName
+    HAVING
+        COUNT(*) > 1000
+),
+HighScoringQuestions AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.AnswerCount,
+        p.CreationDate,
+        ROW_NUMBER() OVER(ORDER BY p.Score DESC, p.AnswerCount DESC) AS QuestionRank
+    FROM
+        Posts p
+    WHERE
+        p.PostTypeId = 1 AND p.Score > 500 AND p.AnswerCount > 10
+),
+TopUsersWithBadges AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(b.Id) AS BadgeCount,
+        STRING_AGG(b.Name, '; ') AS BadgeNames
+    FROM
+        Users u
+    LEFT JOIN
+        Badges b ON u.Id = b.UserId
+    WHERE
+        u.Reputation > 10000
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation
+    HAVING
+        COUNT(b.Id) > 5
+)
+SELECT
+    uem.OwnerUserId,
+    COALESCE(tuwb.DisplayName, uem.DisplayName) AS FinalDisplayName,
+    uem.TotalPosts,
+    uem.TotalQuestions,
+    uem.TotalAnswers,
+    uem.AvgPostScore,
+    uem.TotalViewCount,
+    uem.TotalCommentCount,
+    uem.TotalFavoriteCount,
+    uem.MaxUserPostRank,
+    uem.ClosedPostCount,
+    uem.PostTypes,
+    tuwb.BadgeCount,
+    tuwb.BadgeNames,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = upa.PostId AND pl.LinkTypeId = 1) AS LinkedPostsCount,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.RelatedPostId = upa.PostId AND pl.LinkTypeId = 3) AS DuplicateLinksCount,
+    (SELECT TOP 1 Name FROM FrequentTags ft JOIN Posts p ON ft.TagName = p.Title WHERE p.OwnerUserId = upa.OwnerUserId ORDER BY ft.TagCount DESC) AS MostFrequentTagForUser,
+    CASE WHEN hsq.QuestionId IS NOT NULL THEN 'Yes' ELSE 'No' END AS HasHighScoringQuestion,
+    CASE WHEN tuwb.UserId IS NOT NULL THEN 'Yes' ELSE 'No' END AS IsTopUserWithBadges,
+    CASE WHEN uem.AvgUserReputation > 50000 THEN 'High' WHEN uem.AvgUserReputation > 10000 THEN 'Medium' ELSE 'Low' END AS ReputationLevel,
+    CONCAT('User ', uem.OwnerUserId, ' has activity on ', uem.TotalPosts, ' posts.') AS UserActivitySummary,
+    CAST(AVG(upa.PostScore) OVER(PARTITION BY upa.OwnerUserId) AS DECIMAL(10, 2)) AS AveragedUserPostScore,
+    ROW_NUMBER() OVER (ORDER BY uem.TotalPosts DESC, uem.AvgPostScore DESC) AS OverallActivityRank,
+    (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = uem.OwnerUserId AND PostTypeId = 1 AND Score > 0) * 1.0 / NULLIF(uem.TotalQuestions, 0) AS QuestionUpvoteRatio,
+    CASE
+        WHEN EXISTS (SELECT 1 FROM Votes v WHERE v.UserId = uem.OwnerUserId AND v.VoteTypeId = 2) THEN 'Has Upvoted'
+        ELSE 'No Upvotes Recorded'
+    END AS VoteStatus
+FROM
+    UserEngagementMetrics uem
+LEFT JOIN
+    TopUsersWithBadges tuwb ON uem.OwnerUserId = tuwb.UserId
+LEFT JOIN
+    UserPostActivity upa ON uem.OwnerUserId = upa.OwnerUserId
+LEFT JOIN
+    HighScoringQuestions hsq ON uem.OwnerUserId = hsq.OwnerUserId
+WHERE
+    uem.TotalPosts > 10 AND uem.AvgPostScore > 5
+GROUP BY
+    uem.OwnerUserId, tuwb.DisplayName, uem.DisplayName, uem.TotalPosts, uem.TotalQuestions, uem.TotalAnswers, uem.AvgPostScore, uem.TotalViewCount, uem.TotalCommentCount, uem.TotalFavoriteCount, uem.MaxUserPostRank, uem.ClosedPostCount, uem.PostTypes, tuwb.BadgeCount, tuwb.BadgeNames, upa.PostId, upa.OwnerUserId;

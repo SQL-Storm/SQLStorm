@@ -1,0 +1,127 @@
+-- {"query": "3369.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2511} 
+
+WITH
+/* ---------- USER‑LEVEL AGGREGATES ---------- */
+user_posts AS (
+    SELECT
+        p.OwnerUserId                                     AS user_id,
+        COUNT(*)            FILTER (WHERE p.PostTypeId = 1) AS question_cnt,
+        COUNT(*)            FILTER (WHERE p.PostTypeId = 2) AS answer_cnt,
+        SUM(p.Score)                                 AS total_post_score,
+        SUM(CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS q_with_accepted
+    FROM Posts p
+    GROUP BY p.OwnerUserId
+),
+user_votes AS (
+    SELECT
+        p.OwnerUserId                                 AS user_id,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS up_votes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS down_votes
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    GROUP BY p.OwnerUserId
+),
+badge_agg AS (
+    SELECT
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS gold_cnt,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS silver_cnt,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS bronze_cnt,
+        MAX(b.Date)                           AS last_badge_date,
+        STRING_AGG(b.Name, ', ') FILTER (WHERE b.Class = 1) AS gold_names
+    FROM Badges b
+    GROUP BY b.UserId
+),
+recent_badge AS (
+    SELECT
+        b1.UserId,
+        b1.Name      AS recent_badge_name,
+        b1.Date      AS recent_badge_date
+    FROM Badges b1
+    WHERE b1.Date = (
+        SELECT MAX(b2.Date)
+        FROM Badges b2
+        WHERE b2.UserId = b1.UserId
+    )
+),
+user_metrics AS (
+    SELECT
+        u.Id,
+        COALESCE(u.DisplayName, 'Anonymous')                     AS display_name,
+        u.Reputation,
+        COALESCE(up.question_cnt, 0)                             AS question_cnt,
+        COALESCE(up.answer_cnt, 0)                               AS answer_cnt,
+        COALESCE(up.total_post_score, 0)
+           + COALESCE(uv.up_votes, 0)
+           - COALESCE(uv.down_votes, 0)                         AS net_score,
+        COALESCE(ba.gold_cnt,0)*100
+           + COALESCE(ba.silver_cnt,0)*10
+           + COALESCE(ba.bronze_cnt,0)                           AS badge_points,
+        COALESCE(rb.recent_badge_name, 'None')                  AS recent_badge,
+        ROW_NUMBER() OVER (
+            ORDER BY (u.Reputation
+                      + COALESCE(up.total_post_score,0)
+                      + COALESCE(ba.gold_cnt,0)*100) DESC)    AS rank_overall
+    FROM Users u
+    LEFT JOIN user_posts   up ON up.user_id   = u.Id
+    LEFT JOIN user_votes   uv ON uv.user_id   = u.Id
+    LEFT JOIN badge_agg    ba ON ba.UserId    = u.Id
+    LEFT JOIN recent_badge rb ON rb.UserId    = u.Id
+    WHERE u.Reputation > 0
+),
+
+top_users AS (
+    SELECT
+        'User'   AS entity_type,
+        Id,
+        display_name AS name,
+        (net_score + badge_points + Reputation) AS composite_score,
+        rank_overall
+    FROM user_metrics
+    WHERE rank_overall <= 20
+),
+
+/* ---------- TAG‑LEVEL AGGREGATES ---------- */
+tag_stats AS (
+    SELECT
+        UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><')) AS tag_name,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 1) AS q_cnt,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 2) AS a_cnt
+    FROM Posts p
+    WHERE p.PostTypeId IN (1,2) AND p.Tags IS NOT NULL
+    GROUP BY tag_name
+),
+tag_info AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count                              AS tag_usage,
+        COALESCE(ts.q_cnt,0)               AS question_cnt,
+        COALESCE(ts.a_cnt,0)               AS answer_cnt,
+        (COALESCE(ts.a_cnt,0)::numeric /
+         NULLIF(COALESCE(ts.q_cnt,0),0))   AS avg_answers_per_q,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS tag_rank
+    FROM Tags t
+    LEFT JOIN tag_stats ts ON ts.tag_name = t.TagName
+    WHERE t.IsModeratorOnly = 0
+),
+
+top_tags AS (
+    SELECT
+        'Tag'      AS entity_type,
+        Id,
+        TagName    AS name,
+        (tag_usage * COALESCE(avg_answers_per_q,0)) AS composite_score,
+        tag_rank
+    FROM tag_info
+    WHERE tag_rank <= 20
+)
+
+/* ---------- FINAL UNION ---------- */
+SELECT *
+FROM top_users
+UNION ALL
+SELECT *
+FROM top_tags
+ORDER BY composite_score DESC
+LIMIT 40;

@@ -1,0 +1,160 @@
+with recursive TagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        1 as Level,
+        array[t.TagName] as Path
+    from Tags t
+    where t.IsModeratorOnly = false
+
+    union all
+
+    select
+        t.Id,
+        t.TagName,
+        th.Level + 1,
+        th.Path || t.TagName
+    from Tags t
+    join TagHierarchy th on array_length(th.Path, 1) < 3 and t.TagName > th.TagName
+    where t.IsModeratorOnly = false
+),
+UserBadgeCounts as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        coalesce(sum(case when b.Class = 1 then 1 else 0 end), 0) as GoldBadges,
+        coalesce(sum(case when b.Class = 2 then 1 else 0 end), 0) as SilverBadges,
+        coalesce(sum(case when b.Class = 3 then 1 else 0 end), 0) as BronzeBadges,
+        count(b.Id) as TotalBadges
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+TopAnswerers as (
+    select
+        p.OwnerUserId,
+        u.DisplayName,
+        count(*) as AnswerCount,
+        avg(p.Score) as AvgAnswerScore,
+        max(p.Score) as MaxAnswerScore,
+        min(p.Score) as MinAnswerScore,
+        row_number() over (order by count(*) desc, avg(p.Score) desc) as Rank
+    from Posts p
+    join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId = 2 and p.OwnerUserId is not null
+    group by p.OwnerUserId, u.DisplayName
+    having count(*) > 10
+),
+RecentQuestionsWithVotes as (
+    select
+        q.Id,
+        q.OwnerUserId,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.Tags,
+        (select count(*) from Votes v where v.PostId = q.Id and v.VoteTypeId = 2) as UpVotes,
+        (select count(*) from Votes v where v.PostId = q.Id and v.VoteTypeId = 3) as DownVotes,
+        (select count(*) from Comments c where c.PostId = q.Id) as CommentCount,
+        case
+            when q.ClosedDate is not null then 'Closed'
+            when q.AcceptedAnswerId is not null then 'Answered'
+            else 'Open'
+        end as Status
+    from Posts q
+    where q.PostTypeId = 1 
+      and q.CreationDate > (timestamp '2024-10-01 12:34:56' - interval '30 days')
+),
+PostLinkPairs as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name as LinkType
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+),
+TopQuestionsWithAnswers as (
+    select
+        q.Id,
+        q.Title,
+        q.Score as QuestionScore,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.OwnerUserId,
+        u.DisplayName as AnswerOwner,
+        row_number() over (partition by q.Id order by a.Score desc) as AnswerRank
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Users u on u.Id = a.OwnerUserId
+    where q.PostTypeId = 1 and q.Score > 10
+),
+FilteredPostHistory as (
+    select
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        pht.Name as HistoryTypeName,
+        ph.CreationDate,
+        ph.UserId,
+        u.DisplayName as EditorName,
+        ph.Comment
+    from PostHistory ph
+    join PostHistoryTypes pht on pht.Id = ph.PostHistoryTypeId
+    left join Users u on u.Id = ph.UserId
+    where ph.PostHistoryTypeId in (4,5,6,10,11)
+),
+QuestionsClosedAndReopened as (
+    select
+        phc.PostId,
+        min(phc.CreationDate) as FirstClosedDate,
+        (select min(phr.CreationDate) from PostHistory phr where phr.PostId = phc.PostId and phr.PostHistoryTypeId = 11 and phr.CreationDate > min(phc.CreationDate)) as FirstReopenedDate
+    from PostHistory phc
+    where phc.PostHistoryTypeId = 10
+    group by phc.PostId
+)
+select
+    u.DisplayName as User,
+    u.Reputation,
+    ubc.GoldBadges,
+    ubc.SilverBadges,
+    ubc.BronzeBadges,
+    ta.AnswerCount,
+    round(ta.AvgAnswerScore,2) as AvgAnswerScore,
+    ta.MaxAnswerScore,
+    ta.MinAnswerScore,
+    q.Id as RecentQuestionId,
+    q.Title as RecentQuestionTitle,
+    q.CreationDate as RecentQuestionDate,
+    q.UpVotes,
+    q.DownVotes,
+    q.CommentCount as QuestionComments,
+    q.Status as QuestionStatus,
+    q.ViewCount,
+    ph.HistoryTypeName,
+    ph.Comment as HistoryComment,
+    ph.EditorName as LastEditor,
+    case when q.Tags is not null then 
+        array_to_string((
+            select array_agg(distinct trim(tag)) 
+            from unnest(string_to_array(replace(replace(q.Tags, '<', ''), '>', ' '), ' ')) tag
+            where tag <> ''
+        ), ', ') 
+    else 'No Tags' end as ParsedTags,
+    coalesce(pl.LinkType, 'No Link') as PostLinkType,
+    coalesce(th.Level, 0) as TagHierLevel,
+    coalesce(th.Path[array_length(th.Path, 1)], 'NoTag') as TagLeaf,
+    qc.FirstClosedDate,
+    qc.FirstReopenedDate
+from Users u
+left join UserBadgeCounts ubc on ubc.UserId = u.Id
+left join TopAnswerers ta on ta.OwnerUserId = u.Id
+left join RecentQuestionsWithVotes q on q.OwnerUserId = u.Id
+left join FilteredPostHistory ph on ph.PostId = q.Id
+left join PostLinkPairs pl on pl.PostId = q.Id and pl.RelatedPostId in (
+    select Id from Posts where OwnerUserId = u.Id
+)
+left join TagHierarchy th on th.TagName = split_part(split_part(coalesce(q.Tags, ''), '><', 2), '>', 1)
+left join QuestionsClosedAndReopened qc on qc.PostId = q.Id
+where u.Reputation > 1000
+order by u.Reputation desc, ta.AnswerCount desc, q.CreationDate desc
+limit 100;

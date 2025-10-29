@@ -1,0 +1,199 @@
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT P.Id) FILTER (WHERE P.PostTypeId = 1) AS TotalQuestions,
+        COUNT(DISTINCT P.Id) FILTER (WHERE P.PostTypeId = 2) AS TotalAnswers,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COALESCE(SUM(P.Score), 0) AS TotalPostScore,
+        MAX(GREATEST(P.LastActivityDate, C.CreationDate)) AS LastUserActivityDate,
+        AVG(CASE WHEN P.PostTypeId = 1 THEN P.ViewCount ELSE NULL END) AS AvgQuestionViewCount,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - U.CreationDate)) / (3600 * 24 * 365.25) AS YearsActive,
+        COALESCE(SUM(P.FavoriteCount), 0) AS TotalFavoritePosts
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate
+),
+PostHistoryMetrics AS (
+    SELECT
+        PH.PostId,
+        COUNT(PH.Id) FILTER (WHERE PH.PostHistoryTypeId IN (4, 5, 6)) AS EditCount,
+        COUNT(DISTINCT PH.UserId) FILTER (WHERE PH.PostHistoryTypeId IN (4, 5, 6)) AS UniqueEditorsCount,
+        MIN(PH.CreationDate) FILTER (WHERE PH.PostHistoryTypeId IN (4, 5, 6)) AS FirstEditDate,
+        MAX(PH.CreationDate) FILTER (WHERE PH.PostHistoryTypeId IN (4, 5, 6)) AS LastEditHistoryDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN 'Closed'
+                 WHEN PH.PostHistoryTypeId = 11 THEN 'Reopened'
+                 WHEN PH.PostHistoryTypeId = 12 THEN 'Deleted'
+                 WHEN PH.PostHistoryTypeId = 13 THEN 'Undeleted'
+                 ELSE NULL END) AS LastSignificantPostStatusEvent,
+        MAX(PH.CreationDate) FILTER (WHERE PH.PostHistoryTypeId IN (10, 11, 12, 13)) AS LastPostStatusChangeDate,
+        STRING_AGG(DISTINCT CR.Name, ', ' ORDER BY CR.Name) FILTER (WHERE PH.PostHistoryTypeId = 10 AND PH.Comment IS NOT NULL AND CR.Id = CAST(PH.Comment AS INTEGER)) AS CloseReasons,
+        SUM(CASE WHEN PH.Text ILIKE '%<a href="/users/%' THEN 1 ELSE 0 END) AS MentionsInHistory,
+        COUNT(PH.Id) FILTER (WHERE PH.PostHistoryTypeId IN (33, 34)) AS PostNoticeEvents
+    FROM PostHistory PH
+    LEFT JOIN CloseReasonTypes CR ON PH.PostHistoryTypeId = 10 AND PH.Comment IS NOT NULL AND CR.Id = CAST(PH.Comment AS INTEGER)
+    GROUP BY PH.PostId
+),
+PostLinkAnalysis AS (
+    SELECT
+        P.Id AS PostId,
+        COUNT(PL.Id) FILTER (WHERE PL.LinkTypeId = 1) AS LinkedPostCount,
+        COUNT(PL.Id) FILTER (WHERE PL.LinkTypeId = 3) AS DuplicatePostCount,
+        ARRAY_AGG(DISTINCT PL.RelatedPostId) FILTER (WHERE PL.LinkTypeId = 3) AS DuplicatedToPosts,
+        ARRAY_AGG(DISTINCT PLA.RelatedPostId) FILTER (WHERE PLA.LinkTypeId = 3) AS DuplicatedFromPosts
+    FROM Posts P
+    LEFT JOIN PostLinks PL ON P.Id = PL.PostId
+    LEFT JOIN PostLinks PLA ON P.Id = PLA.RelatedPostId AND PLA.LinkTypeId = 3
+    GROUP BY P.Id
+),
+UserBadgeStats AS (
+    SELECT
+        B.UserId,
+        COUNT(B.Id) AS TotalBadges,
+        COUNT(B.Id) FILTER (WHERE B.Class = 1) AS GoldBadges,
+        COUNT(B.Id) FILTER (WHERE B.Class = 2) AS SilverBadges,
+        COUNT(B.Id) FILTER (WHERE B.Class = 3) AS BronzeBadges,
+        COUNT(B.Id) FILTER (WHERE B.TagBased IS TRUE) AS TagBadges
+    FROM Badges B
+    GROUP BY B.UserId
+),
+UserTopTags AS (
+    SELECT
+        TSM.OwnerUserId AS UserId,
+        TSM.TagName,
+        SUM(P.Score) AS TagTotalScore,
+        COUNT(DISTINCT TSM.PostId) AS TagPostCount,
+        ROW_NUMBER() OVER (PARTITION BY TSM.OwnerUserId ORDER BY SUM(P.Score) DESC, COUNT(DISTINCT TSM.PostId) DESC) AS TagRankForUser
+    FROM (
+        SELECT
+            P_inner.Id AS PostId,
+            P_inner.OwnerUserId,
+            TRIM(UNNEST(string_to_array(SUBSTRING(P_inner.Tags FROM 2 FOR (LENGTH(P_inner.Tags)-2))), '><'))) AS TagName
+        FROM Posts P_inner
+        WHERE P_inner.PostTypeId = 1 AND P_inner.Tags IS NOT NULL AND P_inner.OwnerUserId IS NOT NULL
+    ) TSM
+    JOIN Posts P ON TSM.PostId = P.Id
+    GROUP BY TSM.OwnerUserId, TSM.TagName
+),
+VoteTypeBreakdown AS (
+    SELECT
+        V.PostId,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesCount,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesCount,
+        SUM(CASE WHEN V.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoriteCount_OldSystem,
+        SUM(CASE WHEN V.VoteTypeId = 8 THEN COALESCE(V.BountyAmount,0) ELSE 0 END) AS TotalBountyGiven,
+        SUM(CASE WHEN V.VoteTypeId = 9 THEN COALESCE(V.BountyAmount,0) ELSE 0 END) AS TotalBountyReceived,
+        COUNT(V.Id) FILTER (WHERE V.VoteTypeId IN (4, 12)) AS OffensiveSpamVotes
+    FROM Votes V
+    GROUP BY V.PostId
+)
+SELECT
+    UAS.UserId,
+    UAS.DisplayName AS UserDisplayName,
+    UAS.Reputation,
+    UAS.TotalQuestions,
+    UAS.TotalAnswers,
+    UAS.TotalComments,
+    UAS.TotalPostScore,
+    UAS.LastUserActivityDate,
+    UAS.YearsActive,
+    UB.GoldBadges,
+    UB.SilverBadges,
+    UB.BronzeBadges,
+    UB.TagBadges,
+    P.Id AS PostId,
+    PT.Name AS PostTypeName,
+    P.Title AS PostTitle,
+    P.CreationDate AS PostCreationDate,
+    P.Score AS PostScore,
+    P.ViewCount AS PostViewCount,
+    P.AnswerCount,
+    P.CommentCount AS PostCommentCount,
+    P.FavoriteCount AS PostFavoriteCount_NewSystem,
+    P.LastActivityDate AS PostLastActivityDate,
+    P.LastEditDate AS PostLastEditDate,
+    P.ClosedDate,
+    P.CommunityOwnedDate,
+    PHM.EditCount AS PostEditCount,
+    PHM.UniqueEditorsCount,
+    PHM.LastSignificantPostStatusEvent,
+    PHM.CloseReasons,
+    PHM.MentionsInHistory,
+    PHM.PostNoticeEvents,
+    PLA.LinkedPostCount,
+    PLA.DuplicatePostCount,
+    COALESCE(CARDINALITY(PLA.DuplicatedToPosts), 0) AS DuplicatedToCount,
+    COALESCE(CARDINALITY(PLA.DuplicatedFromPosts), 0) AS DuplicatedFromCount,
+    UTT.TagName AS UsersTopTag,
+    UTT.TagTotalScore AS UsersTopTagScore,
+    UTT.TagPostCount AS UsersTopTagPosts,
+    VTB.UpVotesCount,
+    VTB.DownVotesCount,
+    VTB.TotalBountyGiven,
+    VTB.TotalBountyReceived,
+    VTB.OffensiveSpamVotes,
+    (
+        SELECT C_inner.Text
+        FROM Comments C_inner
+        WHERE C_inner.PostId = P.Id
+          AND C_inner.UserId IS DISTINCT FROM UAS.UserId
+          AND C_inner.Score >= 3
+        ORDER BY C_inner.CreationDate DESC
+        LIMIT 1
+    ) AS LatestHighlyScoredOtherCommentText,
+    ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.LastActivityDate DESC) AS PostRankByScoreAndActivity,
+    AVG(P.Score) OVER (PARTITION BY UAS.UserId, UTT.TagName) AS AvgPostScoreInUserTopTag,
+    COALESCE(EXTRACT(DAY FROM (PHM.FirstEditDate - P.CreationDate)), -1) AS DaysToFirstEdit,
+    COALESCE(
+        (P.Score * 10.0 + COALESCE(P.ViewCount,0) * 0.5 + COALESCE(P.CommentCount,0) * 2.0 + COALESCE(P.AnswerCount, 0) * 3.0 - COALESCE(VTB.DownVotesCount,0) * 5.0) /
+        NULLIF(COALESCE(PHM.EditCount,0) + ABS(COALESCE(VTB.OffensiveSpamVotes,0) * 2) + 1 + COALESCE(LENGTH(COALESCE(P.Body, '')),0) / 1000.0, 0),
+        0.0
+    ) AS CalculatedPostImpactMetric,
+    CASE
+        WHEN P.Title ILIKE '%help%' OR P.Title ILIKE '%stuck%' OR P.Title ILIKE '%issue%' THEN 'Problematic Title'
+        WHEN P.ClosedDate IS NOT NULL AND PHM.CloseReasons ILIKE '%duplicate%' THEN 'Closed Duplicate'
+        WHEN P.AnswerCount = 0 AND P.PostTypeId = 1 AND P.CreationDate < CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '6 months' THEN 'Old Unanswered Question'
+        WHEN P.Body ILIKE '%I don''t understand%' OR P.Body ILIKE '%newbie%' THEN 'Beginner Content'
+        ELSE 'General Content'
+    END AS PostContentClassification,
+    (
+        (P.Score < 0 AND P.ClosedDate IS NOT NULL AND COALESCE(PHM.EditCount,0) > 3 AND UAS.Reputation < 2000 AND COALESCE(VTB.DownVotesCount,0) > COALESCE(VTB.UpVotesCount,0) * 2)
+        OR
+        (P.PostTypeId = 1 AND COALESCE(P.AnswerCount,0) = 0 AND P.LastActivityDate < CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year' AND PHM.LastSignificantPostStatusEvent IS NULL)
+    ) AS IsHighlyProblematicOrStalePost
+FROM UserActivitySummary UAS
+LEFT JOIN UserBadgeStats UB ON UAS.UserId = UB.UserId
+JOIN Posts P ON UAS.UserId = P.OwnerUserId
+LEFT JOIN PostTypes PT ON P.PostTypeId = PT.Id
+LEFT JOIN PostHistoryMetrics PHM ON P.Id = PHM.PostId
+LEFT JOIN PostLinkAnalysis PLA ON P.Id = PLA.PostId
+LEFT JOIN UserTopTags UTT ON UAS.UserId = UTT.UserId AND UTT.TagRankForUser = 1
+LEFT JOIN VoteTypeBreakdown VTB ON P.Id = VTB.PostId
+WHERE
+    UAS.Reputation > 100
+    AND UAS.TotalQuestions + UAS.TotalAnswers > 0
+    AND P.CreationDate BETWEEN CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '10 years' AND CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 day'
+    AND P.PostTypeId IN (1, 2)
+    AND P.Score >= -10
+    AND (
+        (P.PostTypeId = 1 AND COALESCE(P.ViewCount,0) > 500 AND COALESCE(P.AnswerCount,0) > 0 AND P.AcceptedAnswerId IS NOT NULL)
+        OR
+        (P.PostTypeId = 2 AND P.ParentId IS NOT NULL AND P.Score > 5 AND P.OwnerUserId IS NOT NULL)
+    )
+    AND NOT EXISTS (
+        SELECT 1
+        FROM PostHistory PH_mig
+        WHERE PH_mig.PostId = P.Id
+          AND PH_mig.PostHistoryTypeId = 35
+          AND PH_mig.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '6 months'
+    )
+    AND P.Title IS NOT NULL
+ORDER BY
+    CalculatedPostImpactMetric DESC,
+    UAS.Reputation DESC,
+    PostLastActivityDate DESC,
+    P.Id
+LIMIT 1000;

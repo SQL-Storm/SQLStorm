@@ -1,0 +1,204 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        MAX(b.Date) as LastBadgeDate,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+                (COUNT(DISTINCT c.Id) * 100.0 / NULLIF(COUNT(DISTINCT p.Id), 0))
+            ELSE 0 
+        END as CommentToPostRatio,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Elite'
+            WHEN u.Reputation > 5000 THEN 'Veteran'
+            WHEN u.Reputation > 1000 THEN 'Regular'
+            ELSE 'Newbie'
+        END as UserTier
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes
+),
+QuestionStats AS (
+    SELECT 
+        p.Id as QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        p.ClosedDate,
+        CAST(
+            EXTRACT(EPOCH FROM (COALESCE(p.ClosedDate, TIMESTAMP '2024-10-01 12:34:56') - p.CreationDate))/86400
+            AS INTEGER
+        ) as DaysOpen,
+        CASE 
+            WHEN p.AnswerCount > 0 THEN p.Score / NULLIF(p.AnswerCount, 0)
+            ELSE p.Score 
+        END as AvgScorePerAnswer,
+        LAG(p.Score) OVER (ORDER BY p.CreationDate) as PreviousScore,
+        LAG(p.ViewCount) OVER (ORDER BY p.CreationDate) as PreviousViews,
+        ROW_NUMBER() OVER (ORDER BY p.Score DESC) as RankByScore,
+        NTILE(10) OVER (ORDER BY p.ViewCount DESC) as ViewDecile,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.AnswerCount > 0 THEN 'Answered'
+            ELSE 'Unanswered'
+        END as QuestionStatus
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Highly Popular'
+            WHEN t.Count > 100 THEN 'Popular'
+            WHEN t.Count > 10 THEN 'Moderate'
+            ELSE 'Low'
+        END as PopularityLevel,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as PopularityRank
+    FROM Tags t
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        PostCount,
+        CommentCount,
+        BadgeCount,
+        UserTier,
+        RANK() OVER (ORDER BY Reputation DESC) as ReputationRank,
+        DENSE_RANK() OVER (ORDER BY PostCount DESC) as PostActivityRank
+    FROM UserActivityStats
+    WHERE PostCount > 0
+),
+UserPostEngagement AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) as UserPostCount,
+        SUM(p.Score) as TotalScore,
+        AVG(p.Score) as AvgScore,
+        MIN(p.CreationDate) as FirstPost,
+        MAX(p.CreationDate) as LastPost,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.Score > 0 THEN p.Id END) as PositiveAnswerCount,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+                (COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.Score > 0 THEN p.Id END) * 100.0 / NULLIF(COUNT(DISTINCT p.Id), 0))
+            ELSE 0 
+        END as PositiveAnswerRatio
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id, u.DisplayName
+)
+SELECT 
+    'Performance Benchmark Results' as QueryType,
+    COUNT(*) as TotalRecords,
+    COUNT(DISTINCT u.Id) as DistinctUsers,
+    COUNT(DISTINCT p.Id) as DistinctPosts,
+    COUNT(DISTINCT c.Id) as DistinctComments,
+    COUNT(DISTINCT b.Id) as DistinctBadges,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) as QuestionCount,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) as AnswerCount,
+    AVG(u.Reputation) as AvgReputation,
+    AVG(p.Score) as AvgPostScore,
+    COUNT(DISTINCT CASE WHEN p.ClosedDate IS NOT NULL THEN p.Id END) as ClosedQuestions,
+    COUNT(DISTINCT CASE WHEN p.AnswerCount > 0 THEN p.Id END) as AnsweredQuestions,
+    RANK() OVER (ORDER BY AVG(u.Reputation) DESC) as ReputationRank,
+    DENSE_RANK() OVER (ORDER BY SUM(p.Score) DESC) as ScoreRank,
+    COUNT(DISTINCT t.TagName) as UniqueTags,
+    (
+        SELECT AVG(ua.PostCount) 
+        FROM UserActivityStats ua 
+        WHERE ua.Reputation > (SELECT AVG(Reputation) FROM Users)
+    ) as AvgHighReputationUserPosts,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p2 
+        WHERE p2.OwnerUserId = u.Id 
+        AND p2.Score > (SELECT AVG(Score) FROM Posts WHERE OwnerUserId = u.Id)
+    ) as HighScorePosts,
+    CONCAT(
+        'Top User: ', 
+        COALESCE((SELECT DisplayName FROM TopUsers ORDER BY Reputation DESC LIMIT 1), 'None'),
+        ' | Avg Reputation: ', 
+        ROUND(AVG(u.Reputation), 2),
+        ' | User Tiers: ',
+        STRING_AGG(DISTINCT UserTier, ', ')
+    ) as SummaryString,
+    COALESCE(
+        (SELECT MAX(CreationDate) FROM Posts WHERE OwnerUserId = u.Id), 
+        'No Posts'
+    ) as LastPostByUser,
+    (SELECT COUNT(*) FROM Posts WHERE Score > 1000) - 
+    (SELECT COUNT(*) FROM Posts WHERE Score < -1000) as NetHighScorePosts,
+    CASE 
+        WHEN (
+            COUNT(DISTINCT p.Id) > 100 
+            AND COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) > 50
+            AND u.Reputation > 1000
+        ) THEN 'Active Contributor'
+        WHEN (
+            COUNT(DISTINCT p.Id) > 10 
+            AND u.Reputation > 500
+        ) THEN 'Regular Poster'
+        WHEN u.Reputation > 100 THEN 'Casual User'
+        ELSE 'New User'
+    END as UserCategory,
+    (
+        SELECT t.TagName
+        FROM Tags t
+        INNER JOIN Posts p2 ON p2.Tags LIKE CONCAT('%', t.TagName, '%')
+        WHERE p2.OwnerUserId = u.Id
+        GROUP BY t.TagName
+        ORDER BY COUNT(*) DESC
+        LIMIT 1
+    ) as MostActiveTag,
+    ROW_NUMBER() OVER (
+        PARTITION BY CASE WHEN u.Reputation > 10000 THEN 'Elite' ELSE 'Regular' END 
+        ORDER BY u.Reputation DESC
+    ) as ReputationWithinTier
+FROM Users u
+FULL OUTER JOIN Posts p ON u.Id = p.OwnerUserId
+FULL OUTER JOIN Comments c ON u.Id = c.UserId
+FULL OUTER JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN UserActivityStats ua ON u.Id = ua.UserId
+LEFT JOIN QuestionStats qs ON qs.QuestionId = p.Id
+LEFT JOIN TagAnalysis ta ON ta.TagName = SUBSTR(p.Tags, 2, LENGTH(p.Tags) - 2)
+LEFT JOIN TopUsers tu ON u.Id = tu.UserId
+LEFT JOIN UserPostEngagement upe ON u.Id = upe.UserId
+WHERE 
+    (p.Id IS NOT NULL OR c.Id IS NOT NULL OR b.Id IS NOT NULL)
+    AND (
+        u.Reputation > 100 
+        OR (
+            p.Score > 0 
+            AND p.PostTypeId IN (1, 2)
+        )
+    )
+    AND COALESCE(p.CreationDate, c.CreationDate, b.Date) >= DATE '2020-01-01'
+GROUP BY u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes
+HAVING 
+    COUNT(DISTINCT p.Id) >= 0
+ORDER BY u.Reputation DESC
+LIMIT 50 OFFSET 0;

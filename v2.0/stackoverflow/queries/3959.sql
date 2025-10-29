@@ -1,0 +1,152 @@
+WITH RecentPosts AS (
+    SELECT p.Id,
+           p.OwnerUserId,
+           p.PostTypeId,
+           p.Score,
+           p.CreationDate,
+           CASE 
+               WHEN p.Tags IS NOT NULL 
+               THEN (CHAR_LENGTH(p.Tags) - CHAR_LENGTH(REPLACE(p.Tags, '><', '')))/2 + 1
+               ELSE 0
+           END AS TagCount
+    FROM Posts p
+    WHERE p.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '365' DAY
+),
+UserPostStats AS (
+    SELECT u.Id                               AS UserId,
+           COALESCE(COUNT(rp.Id),0)           AS TotalPosts,
+           COALESCE(SUM(CASE WHEN rp.PostTypeId = 2 THEN 1 ELSE 0 END),0) AS AnswerPosts,
+           COALESCE(SUM(CASE WHEN rp.PostTypeId = 1 THEN 1 ELSE 0 END),0) AS QuestionPosts,
+           COALESCE(AVG(rp.Score),0)          AS AvgPostScore,
+           COALESCE(SUM(rp.TagCount),0)       AS TotalTagAppearances
+    FROM Users u
+    LEFT JOIN RecentPosts rp ON rp.OwnerUserId = u.Id
+    GROUP BY u.Id
+),
+UserBadgeStats AS (
+    SELECT u.Id                                            AS UserId,
+           COUNT(b.Id)                                     AS TotalBadges,
+           SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END)    AS GoldBadges,
+           SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END)    AS SilverBadges,
+           SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END)    AS BronzeBadges,
+           COUNT(DISTINCT CASE WHEN b.TagBased = TRUE THEN b.Name END) AS TagBasedBadgeCount
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id
+),
+UserVoteStats AS (
+    SELECT u.Id                                              AS UserId,
+           COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END),0) AS UpVotes,
+           COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END),0) AS DownVotes,
+           COALESCE(SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END),0) AS Favorites
+    FROM Users u
+    LEFT JOIN Posts p  ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v  ON v.PostId = p.Id
+    GROUP BY u.Id
+),
+CompositeScore AS (
+    SELECT ups.UserId,
+           ups.TotalPosts,
+           ups.AnswerPosts,
+           ups.QuestionPosts,
+           ups.AvgPostScore,
+           bs.TotalBadges,
+           bs.GoldBadges,
+           bs.SilverBadges,
+           bs.BronzeBadges,
+           vs.UpVotes,
+           vs.DownVotes,
+           vs.Favorites,
+           ( ups.TotalPosts   * 0.40
+           + ups.AnswerPosts  * 0.30
+           + bs.GoldBadges    * 5.00
+           + bs.SilverBadges  * 2.00
+           + vs.UpVotes       * 0.01
+           - vs.DownVotes     * 0.02
+           + COALESCE(ups.AvgPostScore,0) * 0.50 ) AS CompositeScore
+    FROM UserPostStats ups
+    JOIN UserBadgeStats bs ON bs.UserId = ups.UserId
+    JOIN UserVoteStats vs ON vs.UserId = ups.UserId
+),
+RankedUsers AS (
+    SELECT cs.UserId,
+           cs.TotalPosts,
+           cs.AnswerPosts,
+           cs.QuestionPosts,
+           cs.AvgPostScore,
+           cs.TotalBadges,
+           cs.GoldBadges,
+           cs.SilverBadges,
+           cs.BronzeBadges,
+           cs.UpVotes,
+           cs.DownVotes,
+           cs.Favorites,
+           cs.CompositeScore,
+           ROW_NUMBER() OVER (ORDER BY cs.CompositeScore DESC) AS Rank,
+           CASE WHEN cs.GoldBadges > 0 THEN 'GoldHolder' ELSE 'NoGold' END AS GoldStatus
+    FROM CompositeScore cs
+)
+SELECT ru.Rank,
+       u.Id,
+       u.DisplayName,
+       ru.CompositeScore,
+       ru.TotalPosts,
+       ru.AnswerPosts,
+       ru.QuestionPosts,
+       ru.AvgPostScore,
+       ru.TotalBadges,
+       ru.GoldBadges,
+       ru.SilverBadges,
+       ru.BronzeBadges,
+       ru.UpVotes,
+       ru.DownVotes,
+       ru.Favorites,
+       ru.GoldStatus,
+       COALESCE(dcnt.DuplicateCloseCount,0) AS DuplicateCloseCount,
+       COALESCE(lcnt.LinkedPostCount,0)      AS LinkedPostCount,
+       u.Reputation
+FROM RankedUsers ru
+JOIN Users u ON u.Id = ru.UserId
+LEFT JOIN (
+    SELECT ph.UserId,
+           COUNT(*) AS DuplicateCloseCount
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10
+      AND ph.Comment LIKE '101%'
+    GROUP BY ph.UserId
+) dcnt ON dcnt.UserId = ru.UserId
+LEFT JOIN (
+    SELECT pl.PostId,
+           COUNT(*) AS LinkedPostCount
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 1
+    GROUP BY pl.PostId
+) lcnt ON lcnt.PostId = u.Id
+WHERE ru.Rank <= 100
+
+UNION ALL
+
+SELECT NULL AS Rank,
+       u.Id,
+       u.DisplayName,
+       NULL AS CompositeScore,
+       NULL AS TotalPosts,
+       NULL AS AnswerPosts,
+       NULL AS QuestionPosts,
+       NULL AS AvgPostScore,
+       NULL AS TotalBadges,
+       NULL AS GoldBadges,
+       NULL AS SilverBadges,
+       NULL AS BronzeBadges,
+       NULL AS UpVotes,
+       NULL AS DownVotes,
+       NULL AS Favorites,
+       'NoGold' AS GoldStatus,
+       NULL AS DuplicateCloseCount,
+       NULL AS LinkedPostCount,
+       u.Reputation
+FROM Users u
+WHERE NOT EXISTS (SELECT 1 FROM RankedUsers ru WHERE ru.UserId = u.Id)
+  AND u.Reputation > 10000
+
+ORDER BY Rank NULLS LAST, Reputation DESC;

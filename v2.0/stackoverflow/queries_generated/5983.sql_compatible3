@@ -1,0 +1,101 @@
+WITH recent_top_users AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.CreationDate ASC) AS rn
+  FROM Users u
+  WHERE u.Reputation > 1000
+),
+tag_popularity AS (
+  SELECT
+    tag.TagName,
+    SUM(p.Score) AS total_post_score,
+    COUNT(p.Id) AS post_count
+  FROM Posts p
+  JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS TagName
+  ) AS tag ON true
+  GROUP BY tag.TagName
+),
+mature_posts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Body,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.OwnerUserId,
+    p.Tags,
+    p.AcceptedAnswerId,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.PostTypeId,
+    LAST_VALUE(v.CreationDate) OVER (PARTITION BY p.Id ORDER BY v.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS LastVoteDate
+  FROM Posts p
+  LEFT JOIN Votes v
+    ON v.PostId = p.Id
+  WHERE p.PostTypeId IN (1,2)
+    AND p.LastActivityDate > (CAST('2024-10-01' AS date) - INTERVAL '180 days')
+    AND (p.Score > 0 OR p.ViewCount > 50)
+),
+complex_analysis AS (
+  SELECT
+    mp.PostId,
+    mp.Title,
+    mp.OwnerUserId,
+    wu.Reputation AS OwnerReputation,
+    CASE
+      WHEN mp.OwnerUserId IS NOT NULL THEN
+        (SELECT AVG(vt.BountyAmount::numeric) FROM Votes vt WHERE vt.PostId = mp.PostId AND vt.VoteTypeId = 8)
+      ELSE NULL
+    END AS AvgOpenBounty,
+    COALESCE(pw.TotalWatches, 0) AS Watchers,
+    mp.LastActivityDate,
+    ROW_NUMBER() OVER (ORDER BY mp.LastActivityDate DESC) AS seq
+  FROM mature_posts mp
+  LEFT JOIN (
+    SELECT UserId, SUM(1) AS TotalWatches, MAX(CreationDate) AS MaxWatchDate
+    FROM Votes
+    WHERE VoteTypeId = 16
+    GROUP BY UserId
+  ) pw
+    ON pw.UserId = mp.OwnerUserId
+  LEFT JOIN Users wu ON wu.Id = mp.OwnerUserId
+)
+SELECT
+  ca.PostId,
+  ca.Title,
+  ca.OwnerUserId,
+  ca.OwnerReputation,
+  ca.AvgOpenBounty,
+  ca.Watchers,
+  ca.seq,
+  (SELECT COUNT(*) FROM Comments c WHERE c.PostId = ca.PostId) AS CommentCount,
+  (
+    SELECT JSON_AGG(JSON_BUILD_OBJECT(
+             'Tag', t.TagName,
+             'Score', p.Score
+           ))
+    FROM Posts p
+    JOIN LATERAL (
+      SELECT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS TagName
+    ) t ON true
+    WHERE p.Id = ca.PostId
+  ) AS TagsJson,
+  (SELECT MAX(v.CreationDate) FROM Votes v WHERE v.PostId = ca.PostId) AS LastVoteDate
+FROM complex_analysis ca
+GROUP BY
+  ca.PostId,
+  ca.Title,
+  ca.OwnerUserId,
+  ca.OwnerReputation,
+  ca.AvgOpenBounty,
+  ca.Watchers,
+  ca.seq
+ORDER BY ca.OwnerReputation DESC NULLS LAST, ca.seq
+LIMIT 200;

@@ -1,0 +1,180 @@
+WITH UserEngagementSummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS QuestionsAsked,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS AnswersGiven,
+        COUNT(DISTINCT C.Id) AS CommentsPosted,
+        COUNT(DISTINCT PH.PostId) FILTER (WHERE PH.PostHistoryTypeId IN (4, 5, 6)) AS PostsEdited,
+        SUM(CASE WHEN PV.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesReceivedOnPosts,
+        SUM(CASE WHEN PV.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesReceivedOnPosts,
+        SUM(CASE WHEN UV.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesGivenByMe,
+        SUM(CASE WHEN UV.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesGivenByMe,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    LEFT JOIN PostHistory AS PH ON U.Id = PH.UserId
+    LEFT JOIN Votes AS PV ON P.Id = PV.PostId AND PV.VoteTypeId IN (2, 3)
+    LEFT JOIN Votes AS UV ON U.Id = UV.UserId AND UV.VoteTypeId IN (2, 3)
+    LEFT JOIN Badges AS B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate
+),
+PostQualityMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.Title,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.CreationDate AS PostCreationDate,
+        P.LastActivityDate,
+        P.LastEditDate,
+        P.AcceptedAnswerId,
+        P.ClosedDate,
+        P.Body,
+        COALESCE(
+            (EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - P.LastEditDate)) / 3600),
+            (EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - P.CreationDate)) / 3600)
+        ) AS LastActivityAgeHours,
+        COALESCE(P.ViewCount, 0) AS ViewCountNonNull,
+        COALESCE(P.FavoriteCount, 0) AS FavoriteCountNonNull,
+        CASE
+            WHEN P.PostTypeId = 1 THEN (
+                SELECT AVG(A.Score)
+                FROM Posts AS A
+                WHERE A.ParentId = P.Id
+                  AND A.PostTypeId = 2
+            )
+            ELSE NULL
+        END AS AvgChildAnswerScore,
+        EXISTS (
+            SELECT 1
+            FROM PostLinks AS PL
+            JOIN Posts AS LinkedP ON PL.RelatedPostId = LinkedP.Id
+            WHERE PL.PostId = P.Id
+              AND PL.LinkTypeId = 1
+              AND LinkedP.Score > 50
+        ) AS HasHighScoreLinkedPost
+    FROM Posts AS P
+),
+TagAnalysis AS (
+    SELECT
+        P.Id AS PostId,
+        TRIM(UNNEST(STRING_TO_ARRAY(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags) - 2), '><'))) AS TagName
+    FROM Posts AS P
+    WHERE P.Tags IS NOT NULL AND LENGTH(TRIM(P.Tags)) > 2
+)
+SELECT
+    UES.UserId,
+    UES.DisplayName,
+    UES.Reputation,
+    UES.UserCreationDate,
+    UES.QuestionsAsked,
+    UES.AnswersGiven,
+    UES.CommentsPosted,
+    UES.PostsEdited,
+    UES.GoldBadges,
+    UES.SilverBadges,
+    UES.BronzeBadges,
+    PQM.PostId,
+    PQM.Title,
+    PQM.PostTypeId,
+    PQM.PostCreationDate,
+    PQM.Score AS PostScore,
+    PQM.ViewCount,
+    PQM.FavoriteCount,
+    PQM.CommentCount,
+    PQM.LastActivityDate,
+    PQM.LastActivityAgeHours,
+    PQM.AvgChildAnswerScore,
+    PQM.HasHighScoreLinkedPost,
+    TA.TagName,
+    T.Count AS TagGlobalCount,
+    CR.Name AS ActualCloseReasonName,
+    COALESCE(CR.Name, 'No Close Reason Specified') AS CoalescedCloseReason,
+    PL.RelatedPostId AS LinkedOrDuplicatePostId,
+    LT.Name AS LinkTypeName,
+    PHT.HistoryDate AS PostLatestEditHistoryDate,
+    PHT.PostHistoryTypeId AS PostLatestEditHistoryType,
+    CAST((PQM.Score * 0.4 + PQM.CommentCount * 0.2 + COALESCE(PQM.AvgChildAnswerScore, 0) * 0.3 + PQM.FavoriteCount * 0.1) AS DECIMAL(10,2)) AS WeightedPostEngagementScore,
+    CASE
+        WHEN PQM.AcceptedAnswerId IS NOT NULL THEN 'Accepted Answered'
+        WHEN PQM.ClosedDate IS NOT NULL THEN 'Closed Question'
+        WHEN PQM.AnswerCount > 0 AND PQM.AcceptedAnswerId IS NULL THEN 'Unaccepted Answered'
+        WHEN PQM.PostTypeId = 1 AND PQM.AnswerCount = 0 THEN 'No Answers Yet'
+        ELSE 'Other Post Type'
+    END AS PostStatusCategory,
+    RANK() OVER (PARTITION BY PQM.PostTypeId ORDER BY PQM.Score DESC, PQM.ViewCount DESC, PQM.PostCreationDate DESC) AS RankOverallScorePerType,
+    AVG(PQM.Score) OVER (PARTITION BY UES.UserId) AS AvgUserPostScore,
+    EXTRACT(EPOCH FROM (PQM.PostCreationDate - LAG(PQM.PostCreationDate, 1, UES.UserCreationDate) OVER (PARTITION BY UES.UserId ORDER BY PQM.PostCreationDate))) / (60*60*24) AS DaysSincePreviousPost,
+    CASE
+        WHEN PQM.Body IS NULL OR LENGTH(PQM.Body) = 0 THEN 'No Body'
+        WHEN LENGTH(PQM.Body) < 250 THEN 'Short Body'
+        WHEN LENGTH(PQM.Body) BETWEEN 250 AND 1500 THEN 'Medium Body'
+        ELSE 'Long Body'
+    END AS BodyLengthCategory
+FROM UserEngagementSummary AS UES
+INNER JOIN PostQualityMetrics AS PQM ON UES.UserId = PQM.OwnerUserId
+LEFT JOIN PostLinks AS PL ON PQM.PostId = PL.PostId
+LEFT JOIN LinkTypes AS LT ON PL.LinkTypeId = LT.Id
+LEFT JOIN TagAnalysis AS TA ON PQM.PostId = TA.PostId
+LEFT JOIN Tags AS T ON TA.TagName = T.TagName
+LEFT JOIN (
+    SELECT
+        PH_Close.PostId,
+        MAX(CASE WHEN PH_Close.PostHistoryTypeId = 10 THEN PH_Close.Comment END) AS LastCloseReasonId_Raw
+    FROM PostHistory AS PH_Close
+    WHERE PH_Close.PostHistoryTypeId = 10
+    GROUP BY PH_Close.PostId
+) AS LastPostCloseHistory ON PQM.PostId = LastPostCloseHistory.PostId
+LEFT JOIN CloseReasonTypes AS CR ON CAST(LastPostCloseHistory.LastCloseReasonId_Raw AS SMALLINT) = CR.Id
+LEFT JOIN (
+    SELECT
+        sub.PostId,
+        sub.CreationDate AS HistoryDate,
+        sub.PostHistoryTypeId
+    FROM (
+        SELECT
+            PH_Edit.PostId,
+            PH_Edit.CreationDate,
+            PH_Edit.PostHistoryTypeId,
+            ROW_NUMBER() OVER (PARTITION BY PH_Edit.PostId ORDER BY PH_Edit.CreationDate DESC, PH_Edit.Id DESC) as rn
+        FROM PostHistory AS PH_Edit
+        WHERE PH_Edit.PostHistoryTypeId IN (4, 5, 6)
+    ) AS sub
+    WHERE sub.rn = 1
+) AS PHT ON PQM.PostId = PHT.PostId
+WHERE UES.Reputation >= 10000
+    AND PQM.PostTypeId = 1
+    AND PQM.Score > 20
+    AND PQM.ViewCount > 500
+    AND PQM.FavoriteCount > 2
+    AND (PQM.ClosedDate IS NULL OR CR.Name IS NULL)
+    AND PQM.LastActivityAgeHours > 24 * 90
+    AND PQM.HasHighScoreLinkedPost IS TRUE
+    AND (TA.TagName LIKE '%sql%' OR TA.TagName LIKE '%database%' OR TA.TagName LIKE '%performance%')
+    AND NOT EXISTS (
+        SELECT 1
+        FROM PostHistory AS PH_EarlyEdit
+        WHERE PH_EarlyEdit.PostId = PQM.PostId
+          AND PH_EarlyEdit.UserId = PQM.OwnerUserId
+          AND PH_EarlyEdit.PostHistoryTypeId IN (4, 5, 6)
+          AND PH_EarlyEdit.CreationDate < PQM.PostCreationDate + INTERVAL '24' HOUR
+    )
+    AND PQM.ViewCount > (
+        SELECT AVG(ViewCount)
+        FROM Posts
+        WHERE PostTypeId = 1
+          AND CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1' YEAR
+    )
+ORDER BY WeightedPostEngagementScore DESC, DaysSincePreviousPost DESC, UES.Reputation DESC
+LIMIT 500;

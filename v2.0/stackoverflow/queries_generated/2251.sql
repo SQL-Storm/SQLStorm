@@ -1,0 +1,172 @@
+-- {"query": "2251.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1552} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 as Level,
+        array[t.TagName] as Path
+    from Tags t
+    where t.IsModeratorOnly = 0
+
+    union all
+
+    select
+        c.Id,
+        c.TagName,
+        c.Count,
+        c.ExcerptPostId,
+        c.WikiPostId,
+        p.Level + 1,
+        p.Path || c.TagName
+    from Tags c
+    join RecursiveTagHierarchy p on c.Id <> p.Id and not c.TagName = any(p.Path)
+    where c.IsModeratorOnly = 0 and c.Count > 50
+), UserPostStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        coalesce(sum(p.Score),0) as TotalScore,
+        avg(p.Score) filter (where p.Score is not null) as AvgPostScore,
+        max(p.CreationDate) as LastPostDate,
+        bool_or(p.ClosedDate is not null) as HasClosedPosts,
+        coalesce(sum(v.VoteCount), 0) as TotalVotesReceived
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join (
+        select PostId, count(*) as VoteCount
+        from Votes
+        group by PostId
+    ) v on v.PostId = p.Id
+    group by u.Id, u.DisplayName
+), HighActivityBadges as (
+    select
+        UserId,
+        count(*) as BadgeCount,
+        max(Class) as HighestBadgeClass,
+        string_agg(distinct Name, ', ') as BadgeNames
+    from Badges
+    group by UserId
+    having count(*) > 10
+), AnswerWithWindow as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId,
+        a.CreationDate,
+        a.Score,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank,
+        count(*) over (partition by a.ParentId) as TotalAnswersForQuestion
+    from Posts a
+    where a.PostTypeId = 2
+), QuestionWithAcceptedAnswer as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score as QuestionScore,
+        q.OwnerUserId,
+        q.AcceptedAnswerId,
+        a.Score as AcceptedAnswerScore,
+        u.DisplayName as QuestionOwnerName
+    from Posts q
+    left join Posts a on a.Id = q.AcceptedAnswerId
+    left join Users u on u.Id = q.OwnerUserId
+    where q.PostTypeId = 1
+), CloseReasonsCount as (
+    select
+        ph.PostId,
+        crt.Name as CloseReasonName,
+        count(*) as CloseEventsCount
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    where ph.PostHistoryTypeId = 10 and ph.Comment is not null and ph.Comment ~ '^\d+$'
+    group by ph.PostId, crt.Name
+), CommentTextPatterns as (
+    select
+        c.PostId,
+        count(*) as TotalComments,
+        count(*) filter (where c.Text ilike '%error%') as CommentsWithError,
+        count(*) filter (where c.Text ilike '%sql%') as CommentsWithSQL,
+        min(c.CreationDate) as FirstCommentDate,
+        max(c.CreationDate) as LastCommentDate
+    from Comments c
+    group by c.PostId
+), UserActivitySummary as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        coalesce(ps.QuestionCount,0) as Questions,
+        coalesce(ps.AnswerCount,0) as Answers,
+        coalesce(hb.BadgeCount,0) as Badges,
+        coalesce(ps.TotalVotesReceived,0) as VotesReceived,
+        case 
+            when u.Location is not null then upper(u.Location)
+            else 'UNKNOWN'
+        end as LocationNormalized,
+        dense_rank() over (order by coalesce(ps.TotalVotesReceived, 0) desc, u.Reputation desc) as RankByVotesAndReputation
+    from Users u
+    left join UserPostStats ps on ps.UserId = u.Id
+    left join HighActivityBadges hb on hb.UserId = u.Id
+), CombinedQuestions as (
+    select
+        q.QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.QuestionScore,
+        q.AcceptedAnswerId,
+        q.AcceptedAnswerScore,
+        q.QuestionOwnerName,
+        coalesce(cr.CloseReasonName, 'Open') as CloseReason,
+        coalesce(cr.CloseEventsCount, 0) as CloseCount,
+        coalesce(ctp.TotalComments, 0) as CommentCount,
+        coalesce(ctp.CommentsWithError, 0) as ErrorComments,
+        coalesce(ctp.CommentsWithSQL, 0) as SqlComments,
+        q.QuestionScore + coalesce(q.AcceptedAnswerScore,0) as TotalQAScore,
+        aw.AnswerRank,
+        aw.TotalAnswersForQuestion
+    from QuestionWithAcceptedAnswer q
+    left join CloseReasonsCount cr on cr.PostId = q.QuestionId
+    left join CommentTextPatterns ctp on ctp.PostId = q.QuestionId
+    left join AnswerWithWindow aw on aw.QuestionId = q.QuestionId and aw.AnswerRank = 1
+)
+select
+    das.RankByVotesAndReputation,
+    das.DisplayName as User,
+    das.LocationNormalized,
+    das.Reputation,
+    das.Questions,
+    das.Answers,
+    das.Badges,
+    das.VotesReceived,
+    cq.QuestionId,
+    cq.Title,
+    substring(cq.Title from '(\w{4,})') as FirstLongWordInTitle,
+    cq.CreationDate as QuestionCreated,
+    cq.CloseReason,
+    case 
+        when cq.CloseCount > 1 then 'Frequently Closed'
+        when cq.CloseCount = 1 then 'Once Closed'
+        else 'Never Closed'
+    end as CloseStatus,
+    cq.CommentCount,
+    cq.ErrorComments,
+    cq.SqlComments,
+    cq.TotalAnswersForQuestion,
+    cq.AnswerRank,
+    cq.TotalQAScore,
+    (case when cq.AcceptedAnswerId is not null then 1 else 0 end) as HasAcceptedAnswer,
+    das.Questions * das.Answers as QuestionAnswerProduct,
+    case when das.VotesReceived > 100 and das.Reputation > 1000 then 'Top Contributor' else 'Regular User' end as UserCategory
+from UserActivitySummary das
+left join CombinedQuestions cq on cq.QuestionOwnerName = das.DisplayName
+where das.RankByVotesAndReputation <= 50 and (cq.CreationDate is null or cq.CreationDate > now() - interval '2 years')
+order by das.RankByVotesAndReputation, cq.QuestionCreated desc
+limit 100;

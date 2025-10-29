@@ -1,0 +1,259 @@
+WITH UserContributionSummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.Views AS UserViews,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(COALESCE(P.Score, 0)) AS TotalPostScore,
+        COALESCE(SUM(C.Score), 0) AS TotalCommentScore,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        (SELECT AVG(LENGTH(T.Text)) FROM Comments AS T WHERE T.UserId = U.Id AND T.Text IS NOT NULL) AS AvgCommentLength,
+        EXTRACT(EPOCH FROM (MAX(P.CreationDate) - MIN(P.CreationDate))) / NULLIF(COUNT(P.Id) - 1, 0) AS AvgTimeBetweenPostsInSeconds,
+        LAG(MIN(P.CreationDate)) OVER (PARTITION BY U.Id ORDER BY MIN(P.CreationDate)) AS PreviousPostDate
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    LEFT JOIN Badges AS B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.Views
+    HAVING COUNT(DISTINCT P.Id) > 5
+),
+PostDetailsBase AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.FavoriteCount,
+        P.OwnerUserId,
+        P.Title,
+        P.Body,
+        P.Tags,
+        P.ParentId,
+        P.AcceptedAnswerId,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (10, 101, 102, 103, 104, 105) THEN 1 ELSE 0 END) AS WasClosed,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS WasReopened,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 35 THEN 1 ELSE 0 END) AS WasMigratedAway,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 36 THEN 1 ELSE 0 END) AS WasMigratedHere,
+        COALESCE(MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.Comment END), 'N/A') AS CloseReasonComment,
+        DENSE_RANK() OVER (PARTITION BY P.OwnerUserId, P.PostTypeId ORDER BY P.Score DESC, P.CreationDate ASC) AS UserPostScoreRank
+    FROM Posts AS P
+    LEFT JOIN PostHistory AS PH ON P.Id = PH.PostId
+    WHERE P.PostTypeId IN (1, 2)
+    GROUP BY P.Id, P.PostTypeId, P.CreationDate, P.Score, P.ViewCount, P.AnswerCount, P.FavoriteCount, P.OwnerUserId, P.Title, P.Body, P.Tags, P.ParentId, P.AcceptedAnswerId
+),
+TagPerformance AS (
+    SELECT
+        T.TagName,
+        SUM(PDB.PostScore) AS TotalTagScore,
+        COUNT(DISTINCT PDB.PostId) AS TotalPostsWithTag,
+        AVG(PDB.ViewCount) AS AvgTagViewCount,
+        RANK() OVER (ORDER BY SUM(PDB.PostScore) DESC) AS TagScoreRank
+    FROM PostDetailsBase AS PDB
+    JOIN (
+        SELECT Id, UNNEST(STRING_TO_ARRAY(SUBSTRING(Tags, 2, LENGTH(Tags) - 2), '><')) AS TagName
+        FROM Posts
+        WHERE Tags IS NOT NULL AND PostTypeId = 1
+    ) AS PT ON PDB.PostId = PT.Id
+    JOIN Tags AS T ON PT.TagName = T.TagName
+    WHERE PDB.PostTypeId = 1
+    GROUP BY T.TagName
+    HAVING COUNT(DISTINCT PDB.PostId) > 10
+),
+PostLinkInfluence AS (
+    SELECT
+        P.Id AS PostId,
+        P.Title,
+        P.PostTypeId,
+        P.CreationDate,
+        P.OwnerUserId,
+        SUM(CASE WHEN PL.LinkTypeId = 1 THEN 1 ELSE 0 END) AS LinkedPostsCount,
+        SUM(CASE WHEN PL.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicatePostsCount,
+        COALESCE(MAX(RelatedP.Score), 0) AS MaxRelatedPostScore,
+        (
+            SELECT SUM(V.BountyAmount)
+            FROM Votes AS V
+            WHERE V.PostId = P.Id AND V.VoteTypeId = 8
+        ) AS TotalBountyAmountOffered,
+        (
+            SELECT AVG(U2.Reputation)
+            FROM Users AS U2
+            JOIN Comments AS C ON U2.Id = C.UserId
+            WHERE C.PostId = P.Id
+        ) AS AvgCommenterReputation,
+        LAG(P.CreationDate) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate) AS PreviousPostCreationDate
+    FROM Posts AS P
+    LEFT JOIN PostLinks AS PL ON P.Id = PL.PostId
+    LEFT JOIN Posts AS RelatedP ON PL.RelatedPostId = RelatedP.Id
+    GROUP BY P.Id, P.Title, P.PostTypeId, P.CreationDate, P.OwnerUserId
+)
+SELECT
+    UCS.UserId,
+    UCS.DisplayName,
+    UCS.Reputation,
+    UCS.TotalPosts,
+    UCS.TotalQuestions,
+    UCS.TotalAnswers,
+    UCS.GoldBadges,
+    PDB.PostId,
+    PDB.Title AS PostTitle,
+    'Question' AS PostType,
+    PDB.PostScore,
+    PDB.ViewCount AS PostViewCount,
+    PDB.AnswerCount AS PostAnswerCount,
+    PDB.FavoriteCount AS PostFavoriteCount,
+    PDB.CloseReasonComment,
+    PDB.WasClosed,
+    PDB.WasMigratedAway,
+    PLA.LinkedPostsCount,
+    PLA.DuplicatePostsCount,
+    PLA.MaxRelatedPostScore,
+    TP.TagName AS MostPopularTagUsed,
+    TP.TotalTagScore,
+    TP.TagScoreRank,
+    COALESCE(PLA.TotalBountyAmountOffered, 0) AS PostBounty,
+    COALESCE(PLA.AvgCommenterReputation, 0.0) AS AvgCommenterReputationOnPost,
+    CASE
+        WHEN PDB.PostScore > 100 AND PDB.AnswerCount > 5 AND PDB.WasClosed = 0 THEN 'Highly Influential Open Question'
+        WHEN PDB.PostScore > 50 AND PDB.WasClosed = 1 THEN 'Popular Closed Question'
+        WHEN PDB.WasMigratedAway = 1 AND PLA.LinkedPostsCount > 0 THEN 'Migrated Question with Links'
+        ELSE 'Other Notable Question'
+    END AS PostInfluenceCategory,
+    EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS timestamp) - PDB.PostCreationDate)) AS DaysSincePostCreation,
+    (
+        SELECT COUNT(DISTINCT C.UserId)
+        FROM Comments AS C
+        WHERE C.PostId = PDB.PostId
+          AND C.CreationDate > PDB.PostCreationDate
+          AND C.UserId IS NOT NULL
+          AND C.UserId != UCS.UserId
+    ) AS UniqueCommentersOnPost,
+    UCS.AvgCommentLength,
+    UCS.AvgTimeBetweenPostsInSeconds,
+    LENGTH(PDB.Body) AS BodyLength,
+    NULLIF(PDB.AnswerCount, 0) * 1.0 / NULLIF(PDB.ViewCount, 0) AS AnswerConversionRate
+FROM UserContributionSummary AS UCS
+INNER JOIN PostDetailsBase AS PDB ON UCS.UserId = PDB.OwnerUserId
+LEFT JOIN PostLinkInfluence AS PLA ON PDB.PostId = PLA.PostId
+LEFT JOIN (
+    SELECT DISTINCT ON (P.Id)
+        P.Id,
+        T.TagName,
+        TP_CTE.TotalTagScore,
+        TP_CTE.TagScoreRank
+    FROM Posts AS P
+    JOIN (
+        SELECT Id, UNNEST(STRING_TO_ARRAY(SUBSTRING(Tags, 2, LENGTH(Tags) - 2), '><')) AS TagName
+        FROM Posts
+        WHERE Tags IS NOT NULL
+    ) AS PT ON P.Id = PT.Id
+    JOIN TagPerformance AS TP_CTE ON PT.TagName = TP_CTE.TagName
+    ORDER BY P.Id, TP_CTE.TotalTagScore DESC, TP_CTE.TagScoreRank ASC
+) AS TP ON PDB.PostId = TP.Id
+WHERE
+    PDB.PostTypeId = 1
+    AND UCS.TotalQuestions > 2 AND UCS.Reputation > 500
+    AND PDB.PostScore > 10
+    AND PDB.UserPostScoreRank <= 5
+    AND PDB.PostCreationDate >= DATE '2022-01-01'
+    AND PDB.PostCreationDate <= DATE '2024-01-01'
+    AND PDB.Title IS NOT NULL
+    AND LOWER(PDB.Title) LIKE '%sql%'
+    AND (PLA.MaxRelatedPostScore > 0 OR PLA.LinkedPostsCount > 0)
+    AND NOT EXISTS (
+        SELECT 1 FROM PostHistory AS PH_INNER
+        WHERE PH_INNER.PostId = PDB.PostId
+          AND PH_INNER.PostHistoryTypeId = 12
+          AND PH_INNER.CreationDate > PDB.PostCreationDate
+    )
+
+UNION ALL
+
+SELECT
+    UCS.UserId,
+    UCS.DisplayName,
+    UCS.Reputation,
+    UCS.TotalPosts,
+    UCS.TotalQuestions,
+    UCS.TotalAnswers,
+    UCS.GoldBadges,
+    PDB.PostId,
+    COALESCE(Q.Title, 'N/A Parent Title') AS PostTitle,
+    'Answer' AS PostType,
+    PDB.PostScore,
+    Q.ViewCount AS PostViewCount,
+    Q.AnswerCount AS PostAnswerCount,
+    PDB.FavoriteCount AS PostFavoriteCount,
+    PDB.CloseReasonComment,
+    Q.WasClosed AS WasClosed,
+    Q.WasMigratedAway AS WasMigratedAway,
+    PLA.LinkedPostsCount,
+    PLA.DuplicatePostsCount,
+    PLA.MaxRelatedPostScore,
+    TP.TagName AS MostPopularTagUsed,
+    TP.TotalTagScore,
+    TP.TagScoreRank,
+    COALESCE(PLA.TotalBountyAmountOffered, 0) AS PostBounty,
+    COALESCE(PLA.AvgCommenterReputation, 0.0) AS AvgCommenterReputationOnPost,
+    CASE
+        WHEN PDB.PostScore > 75 AND PDB.ParentId IS NOT NULL THEN 'Highly Upvoted Answer to a Question'
+        WHEN PDB.PostScore BETWEEN 20 AND 75 AND Q.AcceptedAnswerId = PDB.PostId THEN 'Accepted Moderately Upvoted Answer'
+        ELSE 'Other Notable Answer'
+    END AS PostInfluenceCategory,
+    EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS timestamp) - PDB.PostCreationDate)) AS DaysSincePostCreation,
+    (
+        SELECT COUNT(DISTINCT C.UserId)
+        FROM Comments AS C
+        WHERE C.PostId = PDB.PostId
+          AND C.CreationDate > PDB.PostCreationDate
+          AND C.UserId IS NOT NULL
+          AND C.UserId != UCS.UserId
+    ) AS UniqueCommentersOnPost,
+    UCS.AvgCommentLength,
+    UCS.AvgTimeBetweenPostsInSeconds,
+    LENGTH(PDB.Body) AS BodyLength,
+    NULL AS AnswerConversionRate
+FROM UserContributionSummary AS UCS
+INNER JOIN PostDetailsBase AS PDB ON UCS.UserId = PDB.OwnerUserId
+LEFT JOIN PostLinkInfluence AS PLA ON PDB.PostId = PLA.PostId
+LEFT JOIN PostDetailsBase AS Q ON PDB.ParentId = Q.PostId AND Q.PostTypeId = 1
+LEFT JOIN (
+    SELECT DISTINCT ON (P.Id)
+        P.Id,
+        T.TagName,
+        TP_CTE.TotalTagScore,
+        TP_CTE.TagScoreRank
+    FROM Posts AS P
+    JOIN (
+        SELECT Id, UNNEST(STRING_TO_ARRAY(SUBSTRING(Tags, 2, LENGTH(Tags) - 2), '><')) AS TagName
+        FROM Posts
+        WHERE Tags IS NOT NULL
+    ) AS PT ON P.Id = PT.Id
+    JOIN TagPerformance AS TP_CTE ON PT.TagName = TP_CTE.TagName
+    ORDER BY P.Id, TP_CTE.TotalTagScore DESC, TP_CTE.TagScoreRank ASC
+) AS TP ON Q.PostId = TP.Id
+WHERE
+    PDB.PostTypeId = 2
+    AND UCS.TotalAnswers > 5 AND UCS.Reputation > 750
+    AND PDB.PostScore > 5
+    AND PDB.UserPostScoreRank <= 3
+    AND PDB.PostCreationDate >= DATE '2023-01-01'
+    AND PDB.PostCreationDate <= DATE '2024-01-01'
+    AND PDB.ParentId IS NOT NULL
+    AND Q.PostId IS NOT NULL
+    AND LOWER(Q.Tags) LIKE '%python%'
+    AND NOT EXISTS (
+        SELECT 1 FROM PostHistory AS PH_INNER
+        WHERE PH_INNER.PostId = PDB.PostId
+          AND PH_INNER.PostHistoryTypeId = 12
+          AND PH_INNER.CreationDate > PDB.PostCreationDate
+    )
+ORDER BY Reputation DESC, PostScore DESC, DaysSincePostCreation ASC
+LIMIT 2000;

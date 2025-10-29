@@ -1,0 +1,235 @@
+-- {"query": "356.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2575} 
+with
+-- Select recent active questions with parsed tags
+recent_q as (
+  select
+    p.id as question_id,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.ownerduserid,
+    p.title,
+    p.tags,
+    string_to_array(substring(p.tags, 2, length(p.tags)-2), '><') as tag_list
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= now() - interval '365 days'
+),
+-- Expand tags
+q_tags as (
+  select
+    r.question_id,
+    lower(trim(t)) as tag_name
+  from recent_q r
+  cross join lateral unnest(r.tag_list) as t
+),
+-- Tag popularity and density among recent questions
+tag_stats as (
+  select
+    qt.tag_name,
+    count(*) as tag_q_count,
+    avg(nullif(r.score,0)) filter (where r.score is not null) as avg_q_score_nonzero,
+    avg(coalesce(r.viewcount,0)) as avg_views
+  from q_tags qt
+  join recent_q r on r.question_id = qt.question_id
+  group by qt.tag_name
+),
+-- Users' recent activity and quality signals
+user_activity as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate as user_created,
+    sum(case when p.posttypeid = 1 then 1 else 0 end) filter (where p.creationdate >= now() - interval '365 days') as q_count_yr,
+    sum(case when p.posttypeid = 2 then 1 else 0 end) filter (where p.creationdate >= now() - interval '365 days') as a_count_yr,
+    avg(p.score) filter (where p.creationdate >= now() - interval '365 days') as avg_post_score_yr,
+    sum(coalesce(p.viewcount,0)) filter (where p.posttypeid = 1 and p.creationdate >= now() - interval '365 days') as q_views_yr,
+    count(distinct b.id) filter (where b.class = 1) as gold_badges,
+    count(distinct b.id) filter (where b.class = 2) as silver_badges,
+    count(distinct b.id) filter (where b.class = 3) as bronze_badges
+  from users u
+  left join posts p on p.owneruserid = u.id
+  left join badges b on b.userid = u.id
+  group by u.id, u.displayname, u.reputation, u.creationdate
+),
+-- Compute per-question engagement metrics and rank within tag
+q_engagement as (
+  select
+    r.question_id,
+    r.title,
+    r.creationdate,
+    r.score,
+    r.viewcount,
+    r.ownerduserid,
+    qt.tag_name,
+    ts.tag_q_count,
+    coalesce(ts.avg_q_score_nonzero, 0) as tag_avg_score_nonzero,
+    coalesce(ts.avg_views, 0) as tag_avg_views,
+    -- comments in first 48h
+    (select count(*) from comments c where c.postid = r.question_id and c.creationdate <= r.creationdate + interval '48 hours') as comments_48h,
+    -- answers within 7 days
+    (select count(*) from posts a where a.parentid = r.question_id and a.posttypeid = 2 and a.creationdate <= r.creationdate + interval '7 days') as answers_7d,
+    -- favorites/saves proxy via Votes type 5 (legacy)
+    (select count(*) from votes v where v.postid = r.question_id and v.votetypeid = 5) as favorites_legacy
+  from recent_q r
+  join q_tags qt on qt.question_id = r.question_id
+  left join tag_stats ts on ts.tag_name = qt.tag_name
+),
+-- Windowed ranks and z-scores within tag over the year
+q_window as (
+  select
+    q.*,
+    avg(score) over (partition by tag_name) as tag_score_avg,
+    stddev_pop(score) over (partition by tag_name) as tag_score_std,
+    avg(viewcount) over (partition by tag_name) as tag_view_avg,
+    stddev_pop(viewcount) over (partition by tag_name) as tag_view_std,
+    row_number() over (partition by tag_name order by score desc nulls last, viewcount desc nulls last, question_id) as rank_in_tag_by_score,
+    percent_rank() over (partition by tag_name order by coalesce(viewcount,0)) as view_percent_rank_in_tag
+  from q_engagement q
+),
+-- Synthesize a composite engagement score with NULL-safe logic
+q_scored as (
+  select
+    qw.*,
+    case
+      when coalesce(qw.tag_score_std,0) = 0 then 0
+      else (coalesce(qw.score,0) - coalesce(qw.tag_score_avg,0)) / nullif(qw.tag_score_std,0)
+    end as score_z,
+    case
+      when coalesce(qw.tag_view_std,0) = 0 then 0
+      else (coalesce(qw.viewcount,0) - coalesce(qw.tag_view_avg,0)) / nullif(qw.tag_view_std,0)
+    end as view_z,
+    -- extra boosts for early engagement and legacy favorites
+    (coalesce(qw.comments_48h,0) * 0.1) + (coalesce(qw.answers_7d,0) * 0.7) + (least(coalesce(qw.favorites_legacy,0), 50) * 0.05) as early_engagement_boost
+  from q_window qw
+),
+-- Post closure information and duplicate relationships
+q_status as (
+  select
+    p.id as question_id,
+    min(ph.creationdate) filter (where ph.posthistorytypeid = 10) as first_closed_at,
+    max(ph.creationdate) filter (where ph.posthistorytypeid = 11) as last_reopened_at,
+    bool_or(ph.posthistorytypeid = 10) as was_closed,
+    bool_or(pl.linktypeid = 3) as has_duplicate_link,
+    count(*) filter (where pl.linktypeid = 3) as duplicate_links_count
+  from posts p
+  left join posthistory ph on ph.postid = p.id and ph.posthistorytypeid in (10,11)
+  left join postlinks pl on pl.postid = p.id and pl.linktypeid in (1,3)
+  where p.posttypeid = 1
+    and p.creationdate >= now() - interval '365 days'
+  group by p.id
+),
+-- Compose final per-question metrics with user aggregates
+q_final as (
+  select
+    qs.question_id,
+    qs.title,
+    qs.tag_name,
+    qs.score,
+    qs.viewcount,
+    qs.rank_in_tag_by_score,
+    round(qs.view_percent_rank_in_tag::numeric, 4) as view_percent_rank_in_tag,
+    round((coalesce(qs.score_z,0) * 0.6 + coalesce(qs.view_z,0) * 0.3 + qs.early_engagement_boost), 4) as composite_score,
+    round(coalesce(qs.tag_avg_score_nonzero,0)::numeric, 4) as tag_avg_score_nonzero,
+    round(coalesce(qs.tag_avg_views,0)::numeric, 2) as tag_avg_views,
+    ua.user_id,
+    coalesce(ua.displayname, concat('user_', qs.ownerduserid::text)) as owner_displayname,
+    ua.reputation,
+    ua.gold_badges,
+    ua.silver_badges,
+    ua.bronze_badges,
+    coalesce(us.was_closed, false) as was_closed,
+    us.first_closed_at,
+    us.last_reopened_at,
+    coalesce(us.has_duplicate_link, false) as has_duplicate_link,
+    coalesce(us.duplicate_links_count, 0) as duplicate_links_count
+  from q_scored qs
+  left join user_activity ua on ua.user_id = qs.ownerduserid
+  left join q_status us on us.question_id = qs.question_id
+),
+-- Identify "notable" tags using set operators compared against overall medians
+tag_medians as (
+  select
+    percentile_cont(0.5) within group (order by tag_q_count) as median_tag_q_count,
+    percentile_cont(0.5) within group (order by avg_views) as median_tag_avg_views
+  from tag_stats
+),
+notable_tags as (
+  select tag_name from tag_stats, tag_medians
+  where tag_q_count >= median_tag_q_count
+  intersect
+  select tag_name from tag_stats, tag_medians
+  where avg_views >= median_tag_avg_views
+),
+-- Correlated flag for power users asking questions in notable tags
+power_user_questions as (
+  select
+    qf.question_id,
+    case
+      when qf.reputation >= 25000
+        or (qf.gold_badges >= 5 and qf.reputation >= 10000)
+      then true else false end as is_power_user_q,
+    exists (
+      select 1 from notable_tags nt where nt.tag_name = qf.tag_name
+    ) as in_notable_tag
+  from q_final qf
+)
+select
+  qf.question_id,
+  qf.title,
+  qf.tag_name,
+  qf.score,
+  qf.viewcount,
+  qf.rank_in_tag_by_score,
+  qf.view_percent_rank_in_tag,
+  qf.composite_score,
+  qf.owner_displayname,
+  qf.reputation,
+  qf.gold_badges,
+  qf.silver_badges,
+  qf.bronze_badges,
+  qf.was_closed,
+  qf.first_closed_at,
+  qf.last_reopened_at,
+  qf.has_duplicate_link,
+  qf.duplicate_links_count,
+  pu.is_power_user_q,
+  pu.in_notable_tag,
+  -- String expressions: short, formatted summary
+  concat(
+    '[', upper(qf.tag_name), '] ',
+    coalesce(nullif(regexp_replace(qf.title, '\s+', ' ', 'g'), ''), '(no title)')
+  ) as formatted_title,
+  -- Complicated predicate projection: engagement tier
+  case
+    when qf.composite_score >= 10 and not qf.was_closed then 'S-Tier'
+    when qf.composite_score >= 5 and (not qf.was_closed or qf.last_reopened_at is not null) then 'A-Tier'
+    when qf.composite_score >= 2 then 'B-Tier'
+    when qf.was_closed and qf.has_duplicate_link and qf.duplicate_links_count >= 2 then 'Duplicate-Heavy'
+    when qf.was_closed then 'Closed'
+    else 'C-Tier'
+  end as engagement_tier,
+  -- Null logic and defensive casting
+  coalesce(nullif(qf.tag_avg_views, 0), 1)::numeric as safe_tag_avg_views
+from q_final qf
+left join power_user_questions pu on pu.question_id = qf.question_id
+where
+  -- Complex WHERE using tag-based normalization and NULL-safe logic
+  (
+    qf.composite_score >= 1.0
+    or (qf.viewcount > qf.tag_avg_views * 1.5 and qf.score >= coalesce(qf.tag_avg_score_nonzero, 0))
+    or (qf.was_closed = false and qf.rank_in_tag_by_score <= 5)
+  )
+  and (
+    -- filter out community wiki and wikis by checking owner and title heuristics
+    coalesce(qf.owner_displayname, '') not ilike '%community%' and
+    coalesce(qf.title, '') not ilike '%wiki%'
+  )
+order by
+  pu.is_power_user_q desc nulls last,
+  qf.composite_score desc nulls last,
+  qf.viewcount desc nulls last,
+  qf.score desc nulls last,
+  qf.question_id
+limit 250;

@@ -1,0 +1,123 @@
+WITH
+RecentActivePosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.Title,
+    p.Body,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate DESC) AS rn
+  FROM Posts p
+  WHERE p.LastActivityDate IS NOT NULL
+),
+TopOwners AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.Location,
+    u.WebsiteUrl,
+    u.AboutMe,
+    COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+    COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswerCount
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes, u.Location, u.WebsiteUrl, u.AboutMe
+),
+OwnerBadges AS (
+  SELECT
+    b.UserId,
+    COUNT(*) AS BadgeCount,
+    -- normalize TagBased to integer 1/0 for cross-dialect compatibility
+    STRING_AGG(CASE WHEN COALESCE(CASE WHEN b.TagBased IN (1, TRUE) THEN 1 ELSE 0 END, 0) = 1 THEN b.Name || ' (Tag)' ELSE b.Name END, ', ') AS Badges
+  FROM Badges b
+  GROUP BY b.UserId
+),
+Engagement AS (
+  SELECT
+    w.UserId,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesReceived,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesReceived,
+    SUM(CASE WHEN v.VoteTypeId = 10 THEN 1 ELSE 0 END) AS Deletions,
+    SUM(CASE WHEN v.VoteTypeId = 8 THEN 1 ELSE 0 END) AS BountiesOpened
+  FROM Votes v
+  LEFT JOIN Posts w ON w.Id = v.PostId
+  GROUP BY w.UserId
+),
+ComplexPosts AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.OwnerUserId,
+    -- replace PostgreSQL-specific string_to_array + CARDINALITY with a portable expression counting occurrences of a separator
+    ( (LENGTH(p.Tags) - LENGTH(REPLACE(p.Tags, '<>', '')) ) / LENGTH('<>') + 1 ) AS TagArrayLen
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+FilteredComplex AS (
+  SELECT
+    cp.*,
+    ROW_NUMBER() OVER (ORDER BY cp.Score DESC, cp.ViewCount DESC, cp.LastActivityDate DESC) AS rn
+  FROM ComplexPosts cp
+  WHERE cp.TagArrayLen > 1
+    AND cp.LastActivityDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '180' DAY
+),
+Final AS (
+  SELECT
+    towner.UserId,
+    towner.DisplayName,
+    towner.Reputation,
+    COALESCE(ob.Badges, '') AS BadgesInfo,
+    COALESCE(e.UpvotesReceived, 0) AS UpvotesReceived,
+    COALESCE(e.DownvotesReceived, 0) AS DownvotesReceived,
+    COALESCE(e.BountiesOpened, 0) AS BountiesOpened,
+    COALESCE(er.QuestionCount, 0) AS QuestionCount,
+    COALESCE(er.AnswerCount, 0) AS AnswerCount,
+    ro.PostId AS LinkedPostId,
+    ro.LastActivityDate AS LinkedPostActivity
+  FROM TopOwners towner
+  LEFT JOIN OwnerBadges ob ON ob.UserId = towner.UserId
+  LEFT JOIN Engagement e ON e.UserId = towner.UserId
+  LEFT JOIN (
+    SELECT p.OwnerUserId, COUNT(*) AS QuestionCount, SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount
+    FROM Posts p
+    GROUP BY p.OwnerUserId
+  ) er ON er.OwnerUserId = towner.UserId
+  LEFT JOIN (
+    SELECT p.OwnerUserId, pl.RelatedPostId AS PostId, p.LastActivityDate
+    FROM Posts p
+    JOIN PostLinks pl ON pl.PostId = p.Id
+    WHERE pl.LinkTypeId = 1
+  ) ro ON ro.OwnerUserId = towner.UserId
+  WHERE towner.UserId IS NOT NULL
+)
+SELECT
+  UserId,
+  DisplayName,
+  Reputation,
+  BadgesInfo,
+  UpvotesReceived,
+  DownvotesReceived,
+  BountiesOpened,
+  QuestionCount,
+  AnswerCount,
+  LinkedPostId,
+  LinkedPostActivity
+FROM Final
+ORDER BY Reputation DESC, UpvotesReceived DESC
+LIMIT 100;

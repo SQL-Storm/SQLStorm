@@ -1,0 +1,358 @@
+-- {"query": "7236.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 3225} 
+WITH PostStats AS (
+    SELECT 
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.ParentId,
+        p.AcceptedAnswerId,
+        CASE WHEN p.Score > 0 THEN 'High' WHEN p.Score > -5 THEN 'Medium' ELSE 'Low' END as ScoreCategory,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as UserPostRank,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PrevScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as AvgUserScore,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) as GlobalScoreRank,
+        NTILE(10) OVER (ORDER BY p.Score) as ScoreDecile
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) -- Questions and Answers
+),
+UserActivity AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT ps.PostId) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN ps.PostTypeId = 1 THEN ps.PostId END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN ps.PostTypeId = 2 THEN ps.PostId END) as AnswerCount,
+        SUM(ps.Score) as TotalScore,
+        AVG(ps.Score) as AvgScore,
+        MAX(ps.CreationDate) as LastActivityDate,
+        STRING_AGG(CASE WHEN ps.PostTypeId = 1 THEN ps.Title ELSE NULL END, ' | ') as RecentQuestions,
+        STRING_AGG(CASE WHEN ps.PostTypeId = 2 THEN ps.Title ELSE NULL END, ' | ') as RecentAnswers
+    FROM Users u
+    LEFT JOIN PostStats ps ON u.Id = ps.OwnerUserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE WHEN t.Count > 1000 THEN 'Popular' ELSE 'Moderate' END as TagPopularity,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as PopularityRank
+    FROM Tags t
+    WHERE t.Count > 50
+),
+ComplexFilter AS (
+    SELECT 
+        ps.PostId,
+        ps.OwnerUserId,
+        ps.Score,
+        ps.ViewCount,
+        ps.AnswerCount,
+        ps.CommentCount,
+        ps.FavoriteCount,
+        ps.UserPostRank,
+        ps.PrevScore,
+        ps.AvgUserScore,
+        ps.GlobalScoreRank,
+        ps.ScoreDecile,
+        ps.ScoreCategory,
+        ps.CreationDate,
+        ps.Title,
+        ps.Tags,
+        ps.ParentId,
+        ps.AcceptedAnswerId,
+        CASE 
+            WHEN ps.Score > ps.AvgUserScore AND ps.Score > 10 THEN 'AboveAvgHighScore'
+            WHEN ps.Score > ps.AvgUserScore THEN 'AboveAvg'
+            WHEN ps.Score < ps.AvgUserScore AND ps.Score < -5 THEN 'BelowAvgLowScore'
+            WHEN ps.Score < ps.AvgUserScore THEN 'BelowAvg'
+            ELSE 'Normal'
+        END as ScorePerformance,
+        CASE 
+            WHEN ps.UserPostRank = 1 THEN 'FirstPost'
+            WHEN ps.UserPostRank = 2 THEN 'SecondPost'
+            WHEN ps.Score > 50 AND ps.ViewCount > 1000 THEN 'Viral'
+            WHEN ps.Score > 100 THEN 'HighlyRated'
+            ELSE 'Regular'
+        END as PostClassification
+    FROM PostStats ps
+    WHERE ps.Score IS NOT NULL
+),
+UserComplexCalc AS (
+    SELECT 
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.TotalPosts,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.TotalScore,
+        ua.AvgScore,
+        ua.LastActivityDate,
+        CASE 
+            WHEN ua.Reputation > 10000 THEN 'Elite'
+            WHEN ua.Reputation > 5000 THEN 'Veteran'
+            WHEN ua.Reputation > 1000 THEN 'Active'
+            ELSE 'Newbie'
+        END as UserLevel,
+        CASE 
+            WHEN ua.QuestionCount > 50 AND ua.AnswerCount > 100 THEN 'ProActive'
+            WHEN ua.QuestionCount > 20 THEN 'Questioner'
+            WHEN ua.AnswerCount > 50 THEN 'Helper'
+            ELSE 'Regular'
+        END as ActivityType,
+        ROW_NUMBER() OVER (ORDER BY ua.TotalScore DESC) as TopScoreRank,
+        RANK() OVER (ORDER BY ua.Reputation DESC) as TopReputationRank
+    FROM UserActivity ua
+),
+DetailedAnalysis AS (
+    SELECT 
+        cf.PostId,
+        cf.OwnerUserId,
+        cf.Score,
+        cf.ViewCount,
+        cf.AnswerCount,
+        cf.CommentCount,
+        cf.FavoriteCount,
+        cf.UserPostRank,
+        cf.PrevScore,
+        cf.AvgUserScore,
+        cf.GlobalScoreRank,
+        cf.ScoreDecile,
+        cf.ScoreCategory,
+        cf.CreationDate,
+        cf.Title,
+        cf.Tags,
+        cf.ParentId,
+        cf.AcceptedAnswerId,
+        cf.ScorePerformance,
+        cf.PostClassification,
+        u.UserLevel,
+        u.ActivityType,
+        u.TopScoreRank,
+        u.TopReputationRank,
+        CASE 
+            WHEN cf.Score > 0 AND cf.ViewCount > 100 AND cf.AnswerCount > 0 THEN 'ViralQuestion'
+            WHEN cf.Score > 0 AND cf.ViewCount > 500 THEN 'PopularQuestion'
+            WHEN cf.Score < 0 AND cf.ViewCount > 500 THEN 'ControversialQuestion'
+            WHEN cf.PostTypeId = 2 AND cf.Score > 5 THEN 'HelpfulAnswer'
+            WHEN cf.PostTypeId = 2 AND cf.Score > 0 AND cf.ViewCount > 100 THEN 'UsefulAnswer'
+            ELSE 'Regular'
+        END as ContentCategory,
+        CASE 
+            WHEN cf.Tags IS NOT NULL AND cf.Tags LIKE '%<%' THEN 
+                (SELECT COUNT(*) FROM unnest(string_to_array(substring(cf.Tags, 2, length(cf.Tags)-2), '><')) AS tag)
+            ELSE 0
+        END as TagCount,
+        COALESCE(cf.Score - cf.PrevScore, 0) as ScoreChange,
+        CASE 
+            WHEN cf.PostClassification IN ('Viral', 'HighlyRated') AND cf.ViewCount > 1000 THEN 'Extreme'
+            WHEN cf.PostClassification IN ('Viral', 'HighlyRated') THEN 'High'
+            WHEN cf.PostClassification IN ('AboveAvgHighScore', 'AboveAvg') THEN 'Medium'
+            ELSE 'Low'
+        END as ImpactLevel,
+        CASE 
+            WHEN cf.Score > 5 AND cf.ViewCount > 500 AND cf.AnswerCount > 2 THEN 'WellAnswered'
+            WHEN cf.Score > 3 AND cf.AnswerCount > 0 THEN 'ModeratelyAnswered'
+            WHEN cf.Score > 0 THEN 'Answered'
+            ELSE 'Unanswered'
+        END as AnswerStatus,
+        DENSE_RANK() OVER (PARTITION BY cf.OwnerUserId ORDER BY cf.CreationDate) as PostSequence
+    FROM ComplexFilter cf
+    JOIN UserComplexCalc u ON cf.OwnerUserId = u.UserId
+    WHERE cf.Score IS NOT NULL
+),
+AdvancedMetrics AS (
+    SELECT 
+        da.PostId,
+        da.OwnerUserId,
+        da.Score,
+        da.ViewCount,
+        da.AnswerCount,
+        da.CommentCount,
+        da.FavoriteCount,
+        da.UserPostRank,
+        da.PrevScore,
+        da.AvgUserScore,
+        da.GlobalScoreRank,
+        da.ScoreDecile,
+        da.ScoreCategory,
+        da.CreationDate,
+        da.Title,
+        da.Tags,
+        da.ParentId,
+        da.AcceptedAnswerId,
+        da.ScorePerformance,
+        da.PostClassification,
+        da.UserLevel,
+        da.ActivityType,
+        da.TopScoreRank,
+        da.TopReputationRank,
+        da.ContentCategory,
+        da.TagCount,
+        da.ScoreChange,
+        da.ImpactLevel,
+        da.AnswerStatus,
+        da.PostSequence,
+        CASE 
+            WHEN da.Score > (SELECT AVG(Score) FROM DetailedAnalysis) THEN 1
+            WHEN da.Score < (SELECT AVG(Score) FROM DetailedAnalysis) THEN -1
+            ELSE 0
+        END as ScoreVsAverage,
+        CASE 
+            WHEN da.ViewCount > (SELECT AVG(ViewCount) FROM DetailedAnalysis) THEN 1
+            WHEN da.ViewCount < (SELECT AVG(ViewCount) FROM DetailedAnalysis) THEN -1
+            ELSE 0
+        END as ViewsVsAverage,
+        CASE 
+            WHEN EXISTS (SELECT 1 FROM Posts p WHERE p.ParentId = da.PostId AND p.PostTypeId = 2) THEN 1
+            ELSE 0
+        END as HasAnswers,
+        CASE 
+            WHEN da.Tags IS NOT NULL AND da.Tags != '' THEN 
+                STRING_AGG(DISTINCT TRIM(tag) FROM unnest(string_to_array(substring(da.Tags, 2, length(da.Tags)-2), '><')) AS tag)
+            ELSE NULL
+        END as ExtractedTags,
+        LAG(da.Score, 1) OVER (PARTITION BY da.OwnerUserId ORDER BY da.CreationDate) as PreviousScore,
+        LEAD(da.Score, 1) OVER (PARTITION BY da.OwnerUserId ORDER BY da.CreationDate) as NextScore,
+        ABS(da.Score - LAG(da.Score, 1) OVER (PARTITION BY da.OwnerUserId ORDER BY da.CreationDate)) as ScoreVariation,
+        CASE 
+            WHEN da.ScoreChange > 10 THEN 'HighGrowth'
+            WHEN da.ScoreChange < -10 THEN 'HighDecline'
+            WHEN da.ScoreChange > 0 THEN 'PositiveChange'
+            WHEN da.ScoreChange < 0 THEN 'NegativeChange'
+            ELSE 'Stable'
+        END as TrendAnalysis
+    FROM DetailedAnalysis da
+),
+
+FinalAnalysis AS (
+    SELECT
+        am.*,
+        ta.TagName,
+        ta.Count as TagCount,
+        ta.ExcerptPostId,
+        ta.WikiPostId,
+        ta.TagPopularity,
+        ta.PopularityRank,
+        CASE 
+            WHEN am.Tags IS NOT NULL AND am.Tags != '' THEN 
+                (SELECT COUNT(*) FROM unnest(string_to_array(substring(am.Tags, 2, length(am.Tags)-2), '><')) AS tag)
+            ELSE 0
+        END as TotalTags,
+        CASE 
+            WHEN am.Tags IS NOT NULL AND am.Tags != '' THEN 
+                (SELECT STRING_AGG(tag, ', ') FROM unnest(string_to_array(substring(am.Tags, 2, length(am.Tags)-2), '><')) AS tag LIMIT 5)
+            ELSE NULL
+        END as SampleTags,
+        ROW_NUMBER() OVER (ORDER BY am.Score DESC) as RowNum,
+        COUNT(*) OVER () as TotalRows
+    FROM AdvancedMetrics am
+    LEFT JOIN TagAnalysis ta ON EXISTS (
+        SELECT 1 FROM unnest(string_to_array(substring(am.Tags, 2, length(am.Tags)-2), '><')) AS tag 
+        WHERE tag = ta.TagName
+    )
+)
+
+SELECT 
+    fa.PostId,
+    fa.OwnerUserId,
+    fa.Score,
+    fa.ViewCount,
+    fa.AnswerCount,
+    fa.CommentCount,
+    fa.FavoriteCount,
+    fa.UserPostRank,
+    fa.PrevScore,
+    fa.AvgUserScore,
+    fa.GlobalScoreRank,
+    fa.ScoreDecile,
+    fa.ScoreCategory,
+    fa.CreationDate,
+    fa.Title,
+    fa.Tags,
+    fa.ParentId,
+    fa.AcceptedAnswerId,
+    fa.ScorePerformance,
+    fa.PostClassification,
+    fa.UserLevel,
+    fa.ActivityType,
+    fa.TopScoreRank,
+    fa.TopReputationRank,
+    fa.ContentCategory,
+    fa.TagCount,
+    fa.ScoreChange,
+    fa.ImpactLevel,
+    fa.AnswerStatus,
+    fa.PostSequence,
+    fa.ScoreVsAverage,
+    fa.ViewsVsAverage,
+    fa.HasAnswers,
+    fa.ExtractedTags,
+    fa.PreviousScore,
+    fa.NextScore,
+    fa.ScoreVariation,
+    fa.TrendAnalysis,
+    fa.TagName,
+    fa.TagPopularity,
+    fa.PopularityRank,
+    fa.TotalTags,
+    fa.SampleTags,
+    fa.RowNum,
+    fa.TotalRows,
+    CASE 
+        WHEN fa.Score < 0 THEN 'Poor'
+        WHEN fa.Score BETWEEN 0 AND 5 THEN 'Fair'
+        WHEN fa.Score BETWEEN 6 AND 20 THEN 'Good'
+        WHEN fa.Score BETWEEN 21 AND 100 THEN 'VeryGood'
+        WHEN fa.Score > 100 THEN 'Excellent'
+        ELSE 'Undefined'
+    END as Rating,
+    CASE 
+        WHEN fa.ViewCount > 1000 THEN 'Viral'
+        WHEN fa.ViewCount > 500 THEN 'Popular'
+        WHEN fa.ViewCount > 100 THEN 'Notable'
+        WHEN fa.ViewCount > 0 THEN 'SomeInterest'
+        ELSE 'NoViews'
+    END as Popularity,
+    CAST((fa.Score * 100.0 / NULLIF(fa.GlobalScoreRank, 0)) AS DECIMAL(10,2)) as ScoreToRankRatio,
+    ROUND((100.0 * (fa.Score - (SELECT MIN(Score) FROM FinalAnalysis))) / NULLIF((SELECT MAX(Score) FROM FinalAnalysis) - (SELECT MIN(Score) FROM FinalAnalysis), 0), 2) as ScorePercentile,
+    DATEDIFF('days', fa.CreationDate, NOW()) as AgeInDays,
+    CASE 
+        WHEN fa.Score > 0 AND fa.AnswerCount > 0 THEN ROUND((100.0 * fa.AnswerCount) / (fa.Score + 1), 2)
+        ELSE NULL
+    END as AnswerScoreRatio,
+    CASE 
+        WHEN fa.AnswerCount > 0 THEN (fa.Score / NULLIF(fa.AnswerCount, 0))
+        ELSE NULL
+    END as ScorePerAnswer,
+    CASE 
+        WHEN fa.ViewCount > 0 THEN (fa.Score / NULLIF(fa.ViewCount, 0))
+        ELSE NULL
+    END as ScorePerView
+FROM FinalAnalysis fa
+WHERE 
+    (fa.Score > -50 OR fa.Score IS NULL) AND
+    (fa.ViewCount > 0 OR fa.ViewCount IS NULL) AND
+    (fa.OwnerUserId IS NOT NULL) AND
+    (fa.PostId > 0) AND
+    (fa.Score > (SELECT AVG(Score) FROM FinalAnalysis) OR fa.Score IS NULL)
+ORDER BY 
+    fa.Score DESC NULLS LAST,
+    fa.ViewCount DESC NULLS LAST,
+    fa.CreationDate DESC NULLS LAST
+OFFSET 100 
+LIMIT 5000;

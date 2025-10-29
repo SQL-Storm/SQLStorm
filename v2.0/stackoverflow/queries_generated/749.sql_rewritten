@@ -1,0 +1,302 @@
+-- {"query": "749.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2745} 
+with recent_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.location,
+    u.upvotes,
+    u.downvotes,
+    coalesce(nullif(trim(u.websiteurl), ''), 'unknown') as normalized_website
+  from users u
+  where u.creationdate >= (select date_trunc('month', max(creationdate)) - interval '12 months' from users)
+),
+question_posts as (
+  select
+    p.id as post_id,
+    p.owneruserid as owner_user_id,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.title,
+    p.tags,
+    p.answercount,
+    p.favoritecount,
+    p.closeddate,
+    p.communityowneddate
+  from posts p
+  where p.posttypeid = 1
+),
+answer_posts as (
+  select
+    a.id as answer_id,
+    a.parentid as question_id,
+    a.owneruserid as owner_user_id,
+    a.creationdate,
+    a.score
+  from posts a
+  where a.posttypeid = 2
+),
+user_activity as (
+  select
+    ru.user_id,
+    count(distinct qp.post_id) filter (where qp.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '90 days') as questions_last_90d,
+    count(distinct ap.answer_id) filter (where ap.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '90 days') as answers_last_90d,
+    sum(greatest(qp.score, 0)) as pos_q_score,
+    sum(least(qp.score, 0)) as neg_q_score,
+    sum(greatest(ap.score, 0)) as pos_a_score,
+    sum(least(ap.score, 0)) as neg_a_score,
+    count(distinct case when qp.closeddate is not null then qp.post_id end) as closed_questions,
+    count(distinct case when qp.communityowneddate is not null then qp.post_id end) as community_owned_questions
+  from recent_users ru
+  left join question_posts qp on qp.owner_user_id = ru.user_id
+  left join answer_posts ap on ap.owner_user_id = ru.user_id
+  group by ru.user_id
+),
+votes_agg as (
+  select
+    v.postid,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+    sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount, 0) else 0 end) as bounty_total
+  from votes v
+  where v.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+  group by v.postid
+),
+comments_agg as (
+  select
+    c.postid,
+    count(*) as comments_count,
+    sum(c.score) as comment_score_sum,
+    max(c.creationdate) as last_comment_date
+  from comments c
+  group by c.postid
+),
+links_agg as (
+  select
+    pl.postid,
+    sum(case when pl.linktypeid = 1 then 1 else 0 end) as linked_count,
+    sum(case when pl.linktypeid = 3 then 1 else 0 end) as duplicate_links
+  from postlinks pl
+  group by pl.postid
+),
+post_metrics as (
+  select
+    qp.post_id,
+    qp.owner_user_id,
+    qp.creationdate,
+    qp.score,
+    qp.viewcount,
+    qp.answercount,
+    qp.favoritecount,
+    qp.closeddate,
+    qp.title,
+    qp.tags,
+    va.upvotes,
+    va.downvotes,
+    va.favorites,
+    va.bounty_total,
+    ca.comments_count,
+    ca.comment_score_sum,
+    ca.last_comment_date,
+    la.linked_count,
+    la.duplicate_links,
+    case
+      when qp.viewcount is null or qp.viewcount = 0 then null
+      else cast(qp.score as numeric) / nullif(qp.viewcount, 0)
+    end as score_per_view,
+    case
+      when qp.answercount is null or qp.answercount = 0 then null
+      else cast(coalesce(va.upvotes,0) - coalesce(va.downvotes,0) as numeric) / qp.answercount
+    end as netvotes_per_answer
+  from question_posts qp
+  left join votes_agg va on va.postid = qp.post_id
+  left join comments_agg ca on ca.postid = qp.post_id
+  left join links_agg la on la.postid = qp.post_id
+),
+tag_expanded as (
+  select
+    pm.*,
+    lower(t) as tag
+  from post_metrics pm
+  cross join lateral unnest(string_to_array(substring(coalesce(pm.tags,''), 2, greatest(length(coalesce(pm.tags,'')) - 2, 0)), '><')) as t
+),
+tag_rank as (
+  select
+    tag,
+    count(*) as tag_q_count,
+    sum(score) as tag_score_sum,
+    avg(score) as tag_score_avg,
+    percentile_cont(0.9) within group (order by score) as tag_score_p90
+  from tag_expanded
+  group by tag
+),
+user_badges as (
+  select
+    b.userid,
+    sum(case when b.class = 1 then 1 else 0 end) as gold,
+    sum(case when b.class = 2 then 1 else 0 end) as silver,
+    sum(case when b.class = 3 then 1 else 0 end) as bronze,
+    sum(case when b.tagbased = 1 then 1 else 0 end) as tag_badges
+  from badges b
+  group by b.userid
+),
+posttype_names as (
+  select id, name from posttypes
+),
+close_reasons as (
+  select
+    ph.postid,
+    max(ph.creationdate) as last_close_date,
+    max(crt.name) filter (where ph.posthistorytypeid = 10) as last_close_reason_name
+  from posthistory ph
+  left join closerreasontypes crt on crt.id = nullif(ph.comment, '')::smallint
+  where ph.posthistorytypeid in (10,11)
+  group by ph.postid
+),
+user_post_windows as (
+  select
+    pm.owner_user_id,
+    pm.post_id,
+    pm.creationdate,
+    pm.score,
+    row_number() over (partition by pm.owner_user_id order by pm.creationdate desc) as rn_recent,
+    row_number() over (partition by pm.owner_user_id order by pm.score desc nulls last) as rn_topscore,
+    sum(pm.viewcount) over (partition by pm.owner_user_id rows between unbounded preceding and unbounded following) as total_views_by_user
+  from post_metrics pm
+),
+user_quality as (
+  select
+    ru.user_id,
+    avg(pm.score) as avg_q_score,
+    avg(pm.score_per_view) as avg_score_per_view,
+    stddev_samp(pm.score) as stddev_q_score,
+    sum(case when pm.closeddate is not null then 1 else 0 end) as total_closed,
+    count(*) as total_questions
+  from recent_users ru
+  left join post_metrics pm on pm.owner_user_id = ru.user_id
+  group by ru.user_id
+),
+activity_time_buckets as (
+  select
+    pm.owner_user_id,
+    date_trunc('month', pm.creationdate) as month_bucket,
+    count(*) as q_count,
+    sum(pm.score) as q_score_sum
+  from post_metrics pm
+  group by pm.owner_user_id, date_trunc('month', pm.creationdate)
+),
+activity_time_rollup as (
+  select
+    owner_user_id,
+    month_bucket,
+    q_count,
+    q_score_sum,
+    sum(q_count) over (partition by owner_user_id order by month_bucket rows between 2 preceding and current row) as q_count_3mo,
+    sum(q_score_sum) over (partition by owner_user_id order by month_bucket rows between 5 preceding and current row) as q_score_6mo
+  from activity_time_buckets
+),
+dupe_graph as (
+  select
+    pl.relatedpostid as canonical_id,
+    count(*) as dup_count
+  from postlinks pl
+  where pl.linktypeid = 3
+  group by pl.relatedpostid
+),
+final as (
+  select
+    ru.user_id,
+    ru.displayname,
+    ru.reputation,
+    ru.creationdate as user_created,
+    coalesce(nullif(ru.location,''), 'unknown') as location,
+    ru.normalized_website,
+    uq.avg_q_score,
+    uq.stddev_q_score,
+    uq.avg_score_per_view,
+    uq.total_closed,
+    uq.total_questions,
+    ua.questions_last_90d,
+    ua.answers_last_90d,
+    ua.pos_q_score + ua.pos_a_score as pos_total_score,
+    ua.neg_q_score + ua.neg_a_score as neg_total_score,
+    ub.gold,
+    ub.silver,
+    ub.bronze,
+    ub.tag_badges,
+    atb.q_count_3mo,
+    atb.q_score_6mo,
+    pm.post_id,
+    pm.title,
+    pm.score,
+    pm.viewcount,
+    pm.answercount,
+    pm.favoritecount,
+    pm.upvotes,
+    pm.downvotes,
+    pm.favorites as vote_favorites,
+    pm.bounty_total,
+    pm.comments_count,
+    pm.comment_score_sum,
+    pm.linked_count,
+    pm.duplicate_links,
+    cr.last_close_date,
+    cr.last_close_reason_name,
+    dg.dup_count as canonical_dupe_count,
+    uw.total_views_by_user,
+    tr.tag as primary_tag,
+    rank() over (partition by ru.user_id order by coalesce(pm.score, -2147483648) desc nulls last, pm.viewcount desc nulls last) as rank_by_score,
+    dense_rank() over (order by coalesce(uq.avg_q_score, -1) desc nulls last) as user_avg_score_rank,
+    case
+      when pm.tags ilike '%<sql>%' and coalesce(ub.tag_badges,0) > 5 then 'SQL Power User'
+      when pm.tags ilike '%<python>%' and coalesce(ru.reputation,0) > 50000 then 'Python Star'
+      when pm.closeddate is not null and coalesce(cr.last_close_reason_name,'') <> '' then 'Closed - ' || cr.last_close_reason_name
+      when pm.closeddate is not null then 'Closed'
+      else 'Open'
+    end as status_label
+  from recent_users ru
+  left join user_activity ua on ua.user_id = ru.user_id
+  left join user_badges ub on ub.userid = ru.user_id
+  left join user_quality uq on uq.user_id = ru.user_id
+  left join activity_time_rollup atb on atb.owner_user_id = ru.user_id
+  left join post_metrics pm on pm.owner_user_id = ru.user_id
+  left join close_reasons cr on cr.postid = pm.post_id
+  left join dupe_graph dg on dg.canonical_id = pm.post_id
+  left join user_post_windows uw on uw.post_id = pm.post_id and uw.owner_user_id = ru.user_id
+  left join lateral (
+      select tx.tag
+      from tag_expanded tx
+      where tx.post_id = pm.post_id
+      order by tx.tag asc
+      limit 1
+  ) tr on true
+)
+select *
+from final
+where
+  -- complicated predicate combining numeric, string, null logic, and date math
+  (
+    (coalesce(score, -9999) > avg_q_score and coalesce(viewcount, 0) > 0)
+    or (favoritecount is not null and favoritecount >= 10)
+    or (comments_count is not null and comments_count > 25 and comment_score_sum > 0)
+  )
+  and coalesce(primary_tag, '') <> ''
+  and (
+    normalized_website ~* '(github|gitlab|bitbucket)'
+    or (position('stack' in lower(coalesce(location,''))) > 0)
+    or (reputation > 10000 and coalesce(gold,0) + coalesce(silver,0) + coalesce(bronze,0) >= 10)
+  )
+  and (
+    last_close_date is null
+    or last_close_date >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+  )
+  and (
+    case when q_count_3mo is null then 0 else q_count_3mo end
+    +
+    case when q_score_6mo is null then 0 else q_score_6mo end
+  ) > 0
+order by user_avg_score_rank, rank_by_score, score desc nulls last
+limit 500;

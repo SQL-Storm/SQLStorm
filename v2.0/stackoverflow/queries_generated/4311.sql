@@ -1,0 +1,95 @@
+-- {"query": "4311.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1235} 
+
+WITH QuestionScores AS (
+    SELECT
+        p.Id AS QuestionId,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE NULL END) AS Upvotes,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE NULL END) AS Downvotes,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 WHEN v.VoteTypeId = 3 THEN -1 ELSE 0 END) AS NetScore
+    FROM Posts p
+    JOIN Votes v ON p.Id = v.PostId
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id
+),
+AnswerMetrics AS (
+    SELECT
+        a.ParentId AS QuestionId,
+        COUNT(a.Id) AS AnswerCount,
+        AVG(COALESCE(a.Score, 0)) AS AvgAnswerScore,
+        MAX(a.Score) AS MaxAnswerScore,
+        MIN(a.Score) AS MinAnswerScore,
+        SUM(CASE WHEN a.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END) AS AcceptedAnswerCount
+    FROM Posts a
+    LEFT JOIN Posts q ON a.ParentId = q.Id
+    WHERE a.PostTypeId = 2
+    GROUP BY a.ParentId
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (2, 5) THEN 1 ELSE NULL END) AS Edits,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20) THEN 1 ELSE NULL END) AS ModActions,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20) THEN 1 ELSE 0 END) AS TotalModActions
+    FROM Users u
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    GROUP BY u.Id
+),
+TagPopularity AS (
+    SELECT
+        t.TagName,
+        COUNT(p.Id) AS QuestionCount,
+        SUM(COALESCE(qs.NetScore, 0)) AS TotalTagScore,
+        AVG(COALESCE(qs.NetScore, 0)) AS AvgTagScore
+    FROM Tags t
+    LEFT JOIN Posts p ON ',' + REPLACE(p.Tags, '><', ',') + ',' LIKE '%,' + t.TagName + ',%' AND p.PostTypeId = 1
+    LEFT JOIN QuestionScores qs ON p.Id = qs.QuestionId
+    GROUP BY t.TagName
+)
+SELECT
+    q.Id AS QuestionId,
+    q.Title,
+    q.CreationDate AS QuestionCreationDate,
+    COALESCE(qs.NetScore, 0) AS QuestionNetScore,
+    COALESCE(am.AnswerCount, 0) AS TotalAnswers,
+    COALESCE(am.AcceptedAnswerCount, 0) AS AcceptedAnswers,
+    COALESCE(am.AvgAnswerScore, 0) AS AverageAnswerScore,
+    COALESCE(u.Reputation, 0) AS OwnerReputation,
+    u.DisplayName AS OwnerDisplayName,
+    COALESCE(ua.Edits, 0) AS OwnerEdits,
+    COALESCE(ua.ModActions, 0) AS OwnerModActions,
+    CASE WHEN q.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+    DATEDIFF(day, q.CreationDate, q.ClosedDate) AS DaysToClose,
+    tp.TagName,
+    tp.QuestionCount AS TagQuestionCount,
+    tp.AvgTagScore AS TagAverageScore,
+    CONCAT(
+        SUBSTRING(q.Tags, 2, CHARINDEX('>', q.Tags) - 2),
+        '|',
+        SUBSTRING(q.Tags, CHARINDEX('>', q.Tags) + 1, LEN(q.Tags) - CHARINDEX('>', q.Tags) - 1)
+    ) AS FormattedTags
+FROM Posts q
+LEFT JOIN QuestionScores qs ON q.Id = qs.QuestionId
+LEFT JOIN AnswerMetrics am ON q.Id = am.QuestionId
+LEFT JOIN Users u ON q.OwnerUserId = u.Id
+LEFT JOIN UserActivity ua ON q.OwnerUserId = ua.UserId
+LEFT JOIN (
+    SELECT DISTINCT
+        PostId,
+        TagName
+    FROM Posts p
+    CROSS APPLY (
+        SELECT value AS TagName
+        FROM STRING_SPLIT(REPLACE(REPLACE(p.Tags, '<', ''), '>', ','), ',')
+    ) AS TagsSplit
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+) AS TagExtractor ON q.Id = TagExtractor.PostId
+LEFT JOIN TagPopularity tp ON TagExtractor.TagName = tp.TagName
+WHERE q.PostTypeId = 1
+  AND q.CreationDate >= DATEADD(year, -1, GETDATE())
+  AND COALESCE(q.ViewCount, 0) > 1000
+  AND COALESCE(qs.NetScore, 0) > 50
+  AND COALESCE(am.AnswerCount, 0) BETWEEN 5 AND 50
+ORDER BY
+    q.LastActivityDate DESC,
+    tp.TagAverageScore DESC
+OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY;

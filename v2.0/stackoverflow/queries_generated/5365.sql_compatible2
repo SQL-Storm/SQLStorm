@@ -1,0 +1,118 @@
+WITH RankedPosts AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.ViewCount,
+    p.Score,
+    p.Tags,
+    p.PostTypeId,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.LastActivityDate,
+    p.LastEditDate,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.Body,
+    p.ContentLicense,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation,
+    u.AccountId,
+    ROW_NUMBER() OVER (
+      PARTITION BY p.PostTypeId
+      ORDER BY
+        p.Score DESC,
+        p.ViewCount DESC,
+        p.LastActivityDate DESC
+    ) AS rn
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId IN (1,2) -- Questions and Answers
+    AND p.LastActivityDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '180 days')
+),
+Filtered AS (
+  SELECT *
+  FROM RankedPosts
+  WHERE rn = 1
+),
+Aggs AS (
+  SELECT
+    rp.PostTypeId,
+    COUNT(*) AS TotalPosts,
+    SUM(rp.Score) AS SumScore,
+    SUM(rp.ViewCount) AS SumViews,
+    AVG(rp.Score) AS AvgScore,
+    MAX(rp.LastActivityDate) AS LastActive
+  FROM RankedPosts rp
+  GROUP BY rp.PostTypeId
+),
+LinkStats AS (
+  SELECT
+    p.Id AS PostId,
+    COUNT(pl.Id) AS LinkCount,
+    MIN(pl.CreationDate) AS FirstLinkDate
+  FROM Posts p
+  LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+  GROUP BY p.Id
+),
+TagStats AS (
+  SELECT
+    t.Id AS TagId,
+    t.TagName,
+    t.Count AS TagCount,
+    t.IsModeratorOnly,
+    t.IsRequired
+  FROM Tags t
+  WHERE t.IsModeratorOnly = FALSE
+),
+RecentBadges AS (
+  SELECT
+    b.UserId,
+    b.Name AS BadgeName,
+    b.Date AS EarnedDate,
+    b.Class
+  FROM Badges b
+  WHERE b.Date >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6 months')
+),
+TopCorrelated AS (
+  SELECT
+    rp1.Id AS PostId,
+    rp2.Id AS CorrelatedPostId,
+    COUNT(*) AS CoOccur
+  FROM Posts rp1
+  LEFT JOIN Posts rp2 ON rp1.OwnerUserId = rp2.OwnerUserId
+  WHERE rp1.OwnerUserId IS NOT NULL
+  GROUP BY rp1.Id, rp2.Id
+  HAVING COUNT(*) > 0
+)
+SELECT
+  a.PostTypeId,
+  a.TotalPosts,
+  a.SumScore,
+  a.SumViews,
+  a.AvgScore,
+  a.LastActive,
+  ls.PostId,
+  ls.LinkCount,
+  ls.FirstLinkDate,
+  ts.TagName,
+  rb.BadgeName,
+  rb.EarnedDate,
+  rb.Class,
+  tc.CorrelatedPostId,
+  tc.CoOccur,
+  rp.Id AS PostId,
+  rp.Title,
+  rp.Body,
+  rp.OwnerDisplayName,
+  rp.Reputation,
+  rp.LastActivityDate
+FROM Aggs a
+LEFT JOIN Filtered rp ON rp.PostTypeId = a.PostTypeId
+LEFT JOIN LinkStats ls ON ls.PostId = rp.Id
+LEFT JOIN TagStats ts ON 1=1
+LEFT JOIN RecentBadges rb ON rb.UserId = rp.OwnerUserId
+LEFT JOIN TopCorrelated tc ON tc.PostId = rp.Id
+ORDER BY a.PostTypeId, a.TotalPosts DESC
+OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY;

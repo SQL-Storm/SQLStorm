@@ -1,0 +1,321 @@
+-- {"query": "7387.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2904} 
+WITH PostStats AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Title,
+        p.Tags,
+        p.Body,
+        COALESCE(p.AcceptedAnswerId, 0) AS AcceptedAnswerId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END AS PostType,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as UserPostRank,
+        ROW_NUMBER() OVER (ORDER BY p.Score DESC) as ScoreRank,
+        DENSE_RANK() OVER (ORDER BY p.ViewCount DESC) as ViewRank,
+        CASE 
+            WHEN p.Score >= 100 THEN 'High'
+            WHEN p.Score >= 10 THEN 'Medium'
+            ELSE 'Low'
+        END AS ScoreCategory,
+        CONCAT(
+            UPPER(LEFT(p.Title, 1)),
+            SUBSTRING(p.Title, 2, CHARINDEX(' ', p.Title) - 2),
+            CASE WHEN CHARINDEX(' ', p.Title) > 0 THEN ' ' ELSE '' END,
+            UPPER(LEFT(SUBSTRING(p.Title, CHARINDEX(' ', p.Title)+1, LEN(p.Title)), 1))
+        ) AS TitleAbbr
+    FROM Posts p
+),
+UserActivity AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.AccountId,
+        COUNT(DISTINCT ps.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN ps.PostTypeId = 1 THEN ps.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN ps.PostTypeId = 2 THEN ps.Id END) as Answers,
+        SUM(COALESCE(ps.Score, 0)) as TotalScore,
+        MAX(ps.CreationDate) as LastPostDate,
+        DATEDIFF(DAY, MIN(ps.CreationDate), MAX(ps.CreationDate)) as ActiveDays,
+        AVG(COALESCE(ps.Score, 0)) as AvgScore,
+        STRING_AGG(ps.Tags, ', ') WITHIN GROUP (ORDER BY ps.CreationDate) as TagHistory
+    FROM Users u
+    LEFT JOIN PostStats ps ON u.Id = ps.OwnerUserId
+    WHERE u.AccountId IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.AccountId
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            ELSE 'Niche'
+        END AS PopularityLevel,
+        RANK() OVER (ORDER BY t.Count DESC) as PopularityRank,
+        AVG(t.Count) OVER () as AvgTagCount
+    FROM Tags t
+),
+PostHistoryAnalysis AS (
+    SELECT 
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.UserId,
+        ph.CreationDate,
+        ph.Comment,
+        ph.Text,
+        CASE 
+            WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN 'StatusChange'
+            WHEN ph.PostHistoryTypeId IN (1, 4, 7) THEN 'TitleEdit'
+            WHEN ph.PostHistoryTypeId IN (2, 5, 8) THEN 'BodyEdit'
+            WHEN ph.PostHistoryTypeId IN (3, 6, 9) THEN 'TagEdit'
+            ELSE 'Other'
+        END AS EditCategory,
+        DATEDIFF(HOUR, LAG(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate), ph.CreationDate) as HoursSinceLastEdit,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) as EditSequence
+    FROM PostHistory ph
+),
+AnswerQuality AS (
+    SELECT 
+        p.Id as AnswerId,
+        p.ParentId,
+        p.OwnerUserId,
+        p.Score,
+        p.CreationDate,
+        p.LastActivityDate,
+        CASE 
+            WHEN p.OwnerUserId IS NULL OR p.OwnerUserId = -1 THEN 0
+            ELSE 1 
+        END as IsOriginalUser,
+        ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) as AnswerRank,
+        AVG(p.Score) OVER (PARTITION BY p.ParentId) as AvgScoreForQuestion,
+        CASE 
+            WHEN p.Score >= 10 THEN 'Great'
+            WHEN p.Score >= 5 THEN 'Good'
+            WHEN p.Score >= 1 THEN 'Fair'
+            ELSE 'Poor'
+        END as QualityRating
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+),
+FinalAnalysis AS (
+    SELECT 
+        ps.Id as PostId,
+        ps.PostTypeId,
+        ps.OwnerUserId,
+        ps.Score,
+        ps.ViewCount,
+        ps.AnswerCount,
+        ps.CommentCount,
+        ps.FavoriteCount,
+        ps.CreationDate,
+        ps.LastActivityDate,
+        ps.Title,
+        ps.Tags,
+        ps.PostType,
+        ps.UserPostRank,
+        ps.ScoreRank,
+        ps.ViewRank,
+        ps.ScoreCategory,
+        ps.TitleAbbr,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.Views as UserViews,
+        ua.TotalPosts,
+        ua.Questions,
+        ua.Answers,
+        ua.TotalScore,
+        ua.LastPostDate,
+        ua.ActiveDays,
+        ua.AvgScore,
+        ta.TagName,
+        ta.Count as TagCount,
+        ta.PopularityLevel,
+        ph.EditCategory,
+        ph.HoursSinceLastEdit,
+        ph.EditSequence,
+        aq.AnswerId,
+        aq.IsOriginalUser,
+        aq.AnswerRank,
+        aq.AvgScoreForQuestion,
+        aq.QualityRating,
+        CASE 
+            WHEN ps.Score >= 100 AND ps.AnswerCount >= 5 THEN 'HighValue'
+            WHEN ps.Score >= 50 AND ps.AnswerCount >= 2 THEN 'ModerateValue'
+            ELSE 'LowValue'
+        END as PostValueLevel,
+        CASE 
+            WHEN ps.LastActivityDate > DATEADD(DAY, -30, cast('2024-10-01 12:34:56' as timestamp)) THEN 'RecentlyActive'
+            WHEN ps.LastActivityDate > DATEADD(DAY, -90, cast('2024-10-01 12:34:56' as timestamp)) THEN 'ModeratelyActive'
+            ELSE 'Inactive'
+        END as ActivityStatus,
+        ABS(ps.Score - ua.AvgScore) as ScoreDeviationFromUserAvg,
+        IIF(ps.Tags IS NOT NULL, LEN(ps.Tags) - LEN(REPLACE(ps.Tags, '<', '')), 0) as TagCountInPost,
+        COALESCE(ps.ViewCount, 0) + COALESCE(ps.AnswerCount, 0) + COALESCE(ps.CommentCount, 0) AS EngagementIndex,
+        CONCAT('Post-', ps.Id) as PostIdentifier,
+        COALESCE(ta.PopularityLevel, 'Unknown') as TagPopularity,
+        CASE 
+            WHEN ps.PostTypeId = 1 AND ps.AnswerCount > 0 THEN ps.AnswerCount
+            WHEN ps.PostTypeId = 2 THEN 1
+            ELSE 0
+        END as RelatedContentCount
+    FROM PostStats ps
+    LEFT JOIN UserActivity ua ON ps.OwnerUserId = ua.Id
+    LEFT JOIN PostHistoryAnalysis ph ON ps.Id = ph.PostId AND ph.EditSequence = 1
+    LEFT JOIN AnswerQuality aq ON ps.Id = aq.AnswerId
+    LEFT JOIN TagAnalysis ta ON ps.Tags LIKE '%' + ta.TagName + '%'
+    WHERE ps.PostTypeId IN (1, 2)
+),
+ScoreAggregates AS (
+    SELECT 
+        PostId,
+        SUM(Score) OVER (ORDER BY ScoreRank ROWS UNBOUNDED PRECEDING) as CumulativeScore,
+        AVG(Score) OVER (ORDER BY ScoreRank ROWS BETWEEN 10 PRECEDING AND 10 FOLLOWING) as MovingAverageScore,
+        COUNT(*) OVER () as TotalPosts,
+        MAX(Score) OVER () as MaxScore,
+        MIN(Score) OVER () as MinScore
+    FROM FinalAnalysis
+),
+FilteredResults AS (
+    SELECT 
+        fa.*,
+        sa.CumulativeScore,
+        sa.MovingAverageScore,
+        sa.TotalPosts,
+        sa.MaxScore,
+        sa.MinScore,
+        CASE 
+            WHEN fa.PostValueLevel = 'HighValue' AND fa.ActivityStatus = 'RecentlyActive' THEN 'HotHighValue'
+            WHEN fa.PostValueLevel = 'HighValue' THEN 'HighValue'
+            WHEN fa.PostValueLevel = 'ModerateValue' AND fa.ActivityStatus = 'RecentlyActive' THEN 'HotModerateValue'
+            WHEN fa.ActivityStatus = 'RecentlyActive' THEN 'RecentHot'
+            ELSE 'Other'
+        END as PostClassification,
+        CASE 
+            WHEN fa.ScoreCategory = 'High' AND fa.ViewCount > 100 THEN 'HighScoreHighView'
+            WHEN fa.ViewCount > 500 THEN 'HighView'
+            WHEN fa.CommentCount > 5 THEN 'HighComment'
+            ELSE 'Standard'
+        END as EngagementCategory
+    FROM FinalAnalysis fa
+    JOIN ScoreAggregates sa ON fa.PostId = sa.PostId
+),
+FinalJoin AS (
+    SELECT 
+        fr.PostId,
+        fr.PostTypeId,
+        fr.OwnerUserId,
+        fr.Score,
+        fr.ViewCount,
+        fr.AnswerCount,
+        fr.CommentCount,
+        fr.FavoriteCount,
+        fr.CreationDate,
+        fr.LastActivityDate,
+        fr.Title,
+        fr.Tags,
+        fr.PostType,
+        fr.UserPostRank,
+        fr.ScoreRank,
+        fr.ViewRank,
+        fr.ScoreCategory,
+        fr.PostValueLevel,
+        fr.ActivityStatus,
+        fr.TagPopularity,
+        fr.AnswerId,
+        fr.AnswerRank,
+        fr.IsOriginalUser,
+        fr.QualityRating,
+        fr.ScoreDeviationFromUserAvg,
+        fr.TagCountInPost,
+        fr.EngagementIndex,
+        fr.RelatedContentCount,
+        fr.PostIdentifier,
+        fr.CumulativeScore,
+        fr.MovingAverageScore,
+        fr.TotalPosts,
+        fr.MaxScore,
+        fr.MinScore,
+        fr.PostClassification,
+        fr.EngagementCategory,
+        CASE 
+            WHEN fr.Score > fr.MovingAverageScore * 1.5 THEN 'AboveAverage'
+            WHEN fr.Score > fr.MovingAverageScore THEN 'Average'
+            ELSE 'BelowAverage'
+        END as PerformanceRating,
+        CASE 
+            WHEN fr.AnswerCount IS NOT NULL AND fr.AnswerCount > 0 THEN 
+                CAST(fr.AnswerCount AS FLOAT) / NULLIF(CAST(fr.CommentCount AS FLOAT), 0)
+            ELSE NULL 
+        END as AnswerToCommentRatio
+    FROM FilteredResults fr
+),
+ComplexCalculations AS (
+    SELECT 
+        fj.*,
+        ABS(fj.Score - (
+            SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1 AND Score IS NOT NULL
+        )) as NormalizedScore,
+        DATEDIFF(DAY, fj.CreationDate, cast('2024-10-01 12:34:56' as timestamp)) as DaysSinceCreation,
+        CASE 
+            WHEN fj.ViewCount > 0 THEN 
+                CAST(fj.Score AS FLOAT) / fj.ViewCount
+            ELSE NULL
+        END as ScorePerView,
+        CASE 
+            WHEN fj.AnswerCount > 0 THEN 
+                CAST(fj.CommentCount AS FLOAT) / CAST(fj.AnswerCount AS FLOAT)
+            ELSE NULL
+        END as CommentPerAnswer,
+        IIF(fj.PostType = 'Question' AND fj.AnswerCount > 0, 
+            CAST(fj.AnswerCount AS FLOAT) / NULLIF(CAST(fj.ViewCount AS FLOAT), 0), NULL) as AnswerPerViewRatio,
+        ROW_NUMBER() OVER (ORDER BY fj.Score DESC) as OverallRank,
+        NTILE(10) OVER (ORDER BY fj.Score DESC) as DecileRank,
+        PERCENT_RANK() OVER (ORDER BY fj.Score DESC) as PercentRank
+    FROM FinalJoin fj
+)
+SELECT 
+    cc.*
+FROM ComplexCalculations cc
+WHERE 
+    cc.Score IS NOT NULL 
+    AND cc.ViewCount IS NOT NULL 
+    AND cc.AnswerCount IS NOT NULL
+    AND cc.CommentCount IS NOT NULL
+    AND cc.FavoriteCount IS NOT NULL
+    AND cc.Score > -100
+    AND cc.ViewCount >= 0
+    AND cc.AnswerCount >= 0
+    AND cc.CommentCount >= 0
+    AND cc.FavoriteCount >= 0
+    AND cc.DaysSinceCreation < 3650
+    AND cc.PostType IN ('Question', 'Answer')
+    AND cc.PostClassification IN ('HotHighValue', 'HighValue', 'HotModerateValue', 'RecentHot')
+    AND (
+        cc.Score > (SELECT AVG(Score) * 0.5 FROM Posts WHERE PostTypeId = 1 AND Score IS NOT NULL)
+        OR cc.ViewCount > (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = 1 AND ViewCount IS NOT NULL)
+        OR cc.AnswerCount > (SELECT AVG(AnswerCount) FROM Posts WHERE PostTypeId = 1 AND AnswerCount IS NOT NULL)
+    )
+ORDER BY cc.Score DESC, cc.ViewCount DESC, cc.AnswerCount DESC
+OFFSET 0 ROWS 
+FETCH NEXT 10000 ROWS ONLY;

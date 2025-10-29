@@ -1,0 +1,93 @@
+-- {"query": "3011.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2076} 
+
+WITH UserStats AS (
+    SELECT u.Id,
+           u.DisplayName,
+           u.Reputation,
+           COALESCE(p.PostCnt,0)               AS PostCnt,
+           COALESCE(p.AnsCnt,0)                AS AnswerCnt,
+           COALESCE(p.QuesCnt,0)               AS QuestionCnt,
+           COALESCE(b.GoldCnt,0)               AS GoldBadges,
+           COALESCE(b.SilverCnt,0)             AS SilverBadges,
+           COALESCE(b.BronzeCnt,0)             AS BronzeBadges,
+           COALESCE(v.UpV,0) - COALESCE(v.DownV,0) AS VoteDiff,
+           p.LastActDate
+    FROM Users u
+    LEFT JOIN (
+        SELECT OwnerUserId,
+               COUNT(*)                                   AS PostCnt,
+               SUM(CASE WHEN PostTypeId = 2 THEN 1 ELSE 0 END) AS AnsCnt,
+               SUM(CASE WHEN PostTypeId = 1 THEN 1 ELSE 0 END) AS QuesCnt,
+               MAX(LastActivityDate)                      AS LastActDate
+        FROM Posts
+        WHERE OwnerUserId IS NOT NULL
+        GROUP BY OwnerUserId
+    ) p ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT UserId,
+               SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldCnt,
+               SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverCnt,
+               SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeCnt
+        FROM Badges
+        GROUP BY UserId
+    ) b ON b.UserId = u.Id
+    LEFT JOIN (
+        SELECT UserId,
+               SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpV,
+               SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownV
+        FROM Votes
+        GROUP BY UserId
+    ) v ON v.UserId = u.Id
+),
+TopUserTags AS (
+    SELECT us.Id,
+           STRING_AGG(t.TagName, ', ') WITHIN GROUP (ORDER BY tag_use_cnt DESC) AS TopTags
+    FROM UserStats us
+    JOIN Posts p ON p.OwnerUserId = us.Id AND p.PostTypeId = 1
+    CROSS JOIN LATERAL (
+        SELECT regexp_split_to_table(p.Tags, '[><]') AS Tag
+    ) split_tag
+    JOIN Tags t ON t.TagName = split_tag.Tag
+    GROUP BY us.Id
+),
+RecentClosedQuestions AS (
+    SELECT p.OwnerUserId,
+           COUNT(*) FILTER (WHERE ph.PostHistoryTypeId = 10) AS Closed30d,
+           COUNT(*) FILTER (WHERE ph.PostHistoryTypeId = 11) AS Reopened30d
+    FROM Posts p
+    JOIN PostHistory ph ON ph.PostId = p.Id
+                         AND ph.PostHistoryTypeId IN (10,11)
+    WHERE p.PostTypeId = 1
+      AND ph.CreationDate >= CURRENT_DATE - INTERVAL '30 days'
+    GROUP BY p.OwnerUserId
+)
+SELECT us.Id,
+       us.DisplayName,
+       us.Reputation,
+       us.PostCnt,
+       us.QuestionCnt,
+       us.AnswerCnt,
+       us.GoldBadges,
+       us.SilverBadges,
+       us.BronzeBadges,
+       us.VoteDiff,
+       us.LastActDate,
+       COALESCE(tut.TopTags, '')               AS TopTags,
+       COALESCE(rc.Closed30d,0)                AS ClosedLast30d,
+       COALESCE(rc.Reopened30d,0)              AS ReopenedLast30d,
+       CASE
+           WHEN us.Reputation > 100000 THEN 'Legendary'
+           WHEN us.Reputation > 20000  THEN 'Veteran'
+           WHEN us.Reputation > 5000   THEN 'Experienced'
+           ELSE 'Newbie'
+       END                                     AS ReputationTier,
+       ROW_NUMBER() OVER (ORDER BY us.Reputation DESC) AS RankByRep
+FROM UserStats us
+LEFT JOIN TopUserTags tut ON tut.Id = us.Id
+LEFT JOIN RecentClosedQuestions rc ON rc.OwnerUserId = us.Id
+WHERE (us.PostCnt > 0 OR us.GoldBadges > 0)
+ORDER BY us.Reputation DESC
+LIMIT 100
+UNION ALL
+SELECT NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL
+WHERE FALSE;

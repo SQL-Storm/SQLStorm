@@ -1,0 +1,70 @@
+SELECT 
+    u.Id,
+    u.DisplayName, 
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    MAX(p.Score) AS HighestScoredPost,
+    MIN(p.CreationDate) AS FirstPost,
+    MAX(p.LastActivityDate) AS LastActivity,
+    b.Name AS LatestBadge,
+    ph.Comment AS LastEditComment,
+    v.VoteTypeId AS LastVoteType
+FROM 
+    Users u
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    (
+     SELECT 
+         UserId, 
+         MAX(Date) AS MaxBadgeDate
+     FROM 
+         Badges
+     GROUP BY 
+         UserId
+    ) bb ON u.Id = bb.UserId AND b.Date = bb.MaxBadgeDate
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    (
+     SELECT 
+         PostId, 
+         MAX(CreationDate) AS LastEditDate
+     FROM 
+         PostHistory
+     WHERE 
+         PostHistoryTypeId = 5
+     GROUP BY 
+         PostId
+    ) pe ON p.Id = pe.PostId
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId AND pe.LastEditDate = ph.CreationDate
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId AND v.CreationDate = 
+    (
+     SELECT 
+         MAX(CreationDate) 
+     FROM 
+         Votes v2
+     WHERE 
+         v2.PostId = p.Id
+    )
+WHERE 
+    u.Reputation > 1000
+    AND u.Id NOT IN 
+        (
+         SELECT 
+             UserId 
+         FROM 
+             Comments 
+         WHERE 
+             Text LIKE '%spam%'
+        )
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation, b.Name, ph.Comment, v.VoteTypeId
+HAVING 
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 10
+ORDER BY 
+    u.Reputation DESC;

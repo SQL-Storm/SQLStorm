@@ -1,0 +1,214 @@
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.Views AS UserViews,
+        U.UpVotes AS UserUpVotes,
+        U.DownVotes AS UserDownVotes,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - U.CreationDate)) / 86400 AS AccountAgeDays,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        SUM(LENGTH(C.Text)) * 1.0 / NULLIF(COUNT(DISTINCT C.Id), 0) AS AvgCommentLength,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        SUM(CASE WHEN V.VoteTypeId IN (2, 8) THEN 1 ELSE 0 END) AS TotalUpVotesGiven,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesGiven,
+        SUM(CASE WHEN V.VoteTypeId = 1 THEN 1 ELSE 0 END) AS TotalAcceptedAnswersByOthers
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN Votes V ON U.Id = V.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.Views, U.UpVotes, U.DownVotes, U.CreationDate
+),
+PostEngagementMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.LastActivityDate,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        COALESCE(P.AcceptedAnswerId, -1) AS AcceptedAnswerId,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - P.LastActivityDate)) / 3600 AS HoursSinceLastActivity,
+        LENGTH(P.Body) AS BodyLength,
+        LENGTH(P.Title) AS TitleLength,
+        (SELECT COUNT(DISTINCT Tag) FROM (
+            SELECT TRIM(BOTH '<>' FROM untagged) AS Tag FROM (
+                SELECT UNNEST(string_to_array(COALESCE(P.Tags, '<>'), '><')) AS untagged
+            ) sub1
+        ) sub2) AS TagCount,
+        CASE WHEN P.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS HasAcceptedAnswer,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4,5,6) THEN 1 ELSE 0 END) AS EditCount,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS PostUpVotesReceived,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS PostDownVotesReceived
+    FROM Posts P
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    LEFT JOIN Votes V ON P.Id = V.PostId AND V.VoteTypeId IN (2,3)
+    WHERE P.PostTypeId IN (1, 2)
+    GROUP BY P.Id, P.PostTypeId, P.OwnerUserId, P.CreationDate, P.LastActivityDate, P.Score, P.ViewCount, P.AnswerCount, P.CommentCount, P.FavoriteCount, P.AcceptedAnswerId, P.Body, P.Title, P.Tags
+),
+QuestionClosingTrends AS (
+    SELECT
+        P.Id AS QuestionId,
+        P.OwnerUserId,
+        P.CreationDate AS QuestionCreationDate,
+        MAX(PH_Closed.CreationDate) AS LastClosedDate,
+        MAX(PH_Reopened.CreationDate) AS LastReopenedDate,
+        COUNT(DISTINCT CASE WHEN PH_Closed.PostHistoryTypeId = 10 THEN PH_Closed.Id END) AS CloseEvents,
+        COUNT(DISTINCT CASE WHEN PH_Reopened.PostHistoryTypeId = 11 THEN PH_Reopened.Id END) AS ReopenEvents,
+        MAX(CR.Name) FILTER (WHERE PH_Closed.PostHistoryTypeId = 10 AND PH_Closed.Comment ~ '^[0-9]+$') AS MostRecentCloseReasonName,
+        MAX(PH_Closed.Comment) FILTER (WHERE PH_Closed.PostHistoryTypeId = 10) AS MostRecentCloseReasonIdText
+    FROM Posts P
+    LEFT JOIN PostHistory PH_Closed ON P.Id = PH_Closed.PostId AND PH_Closed.PostHistoryTypeId = 10
+    LEFT JOIN PostHistory PH_Reopened ON P.Id = PH_Reopened.PostId AND PH_Reopened.PostHistoryTypeId = 11
+    LEFT JOIN CloseReasonTypes CR ON (PH_Closed.Comment ~ '^[0-9]+$' AND CAST(PH_Closed.Comment AS INTEGER) = CR.Id)
+    WHERE P.PostTypeId = 1
+    GROUP BY P.Id, P.OwnerUserId, P.CreationDate
+),
+UserPostTagStats AS (
+    SELECT
+        UAS.UserId,
+        UAS.DisplayName,
+        Tag.TagName,
+        COUNT(DISTINCT PEM.PostId) AS UserQuestionsWithTag,
+        AVG(PEM.Score) AS UserAvgScoreForTag,
+        AVG(PEM.ViewCount) AS UserAvgViewCountForTag,
+        SUM(PEM.HasAcceptedAnswer) AS UserQuestionsWithAcceptedAnswerForTag,
+        ROW_NUMBER() OVER (PARTITION BY UAS.UserId ORDER BY COUNT(DISTINCT PEM.PostId) DESC, AVG(PEM.Score) DESC) AS TagRankForUser
+    FROM UserActivitySummary UAS
+    INNER JOIN PostEngagementMetrics PEM ON UAS.UserId = PEM.OwnerUserId
+    INNER JOIN Posts P ON PEM.PostId = P.Id AND P.PostTypeId = 1
+    CROSS JOIN LATERAL (
+        SELECT UNNEST(string_to_array(COALESCE(P.Tags, '<>'), '><')) AS TagName
+    ) AS Tag
+    WHERE P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2
+    GROUP BY UAS.UserId, UAS.DisplayName, Tag.TagName
+),
+MainQueryData AS (
+    SELECT
+        UAS.UserId,
+        UAS.DisplayName,
+        UAS.Reputation,
+        UAS.TotalQuestions,
+        UAS.TotalAnswers,
+        UAS.TotalCommentsMade,
+        COALESCE(UAS.AvgCommentLength, 0.0) AS AverageCommentBodyLength,
+        UAS.GoldBadges,
+        UAS.SilverBadges,
+        UAS.BronzeBadges,
+        UAS.TotalAcceptedAnswersByOthers,
+        SUM(PEM.Score) AS TotalPostScoreOwned,
+        AVG(PEM.Score) AS AvgPostScoreOwned,
+        AVG(PEM.ViewCount) AS AvgPostViewCountOwned,
+        SUM(PEM.AnswerCount) AS TotalAnswersReceivedOnQuestions,
+        SUM(PEM.FavoriteCount) AS TotalFavoritesReceived,
+        SUM(QCT.CloseEvents) AS TotalQuestionCloseEvents,
+        SUM(QCT.ReopenEvents) AS TotalQuestionReopenEvents,
+        CAST(SUM(QCT.CloseEvents) AS DECIMAL) / NULLIF(SUM(UAS.TotalQuestions), 0) AS CloseRatePerQuestion,
+        MAX(CASE WHEN UPTS.TagRankForUser = 1 THEN UPTS.TagName ELSE NULL END) AS TopTagByQuestions,
+        MAX(CASE WHEN UPTS.TagRankForUser = 1 THEN UPTS.UserQuestionsWithTag ELSE NULL END) AS TopTagQuestionCount,
+        (
+            SELECT COUNT(DISTINCT PL_Inner.RelatedPostId)
+            FROM PostLinks PL_Inner
+            WHERE PL_Inner.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = UAS.UserId AND PostTypeId = 1)
+        ) AS UserLinkedQuestionCount,
+        NTILE(10) OVER (ORDER BY UAS.Reputation DESC) AS ReputationDecile,
+        RANK() OVER (ORDER BY SUM(COALESCE(PEM.Score, 0)) DESC, UAS.Reputation DESC) AS OverallScoreRank,
+        (
+            SELECT CR.Name
+            FROM QuestionClosingTrends QCT_corr
+            LEFT JOIN CloseReasonTypes CR ON (QCT_corr.MostRecentCloseReasonIdText ~ '^[0-9]+$' AND CAST(QCT_corr.MostRecentCloseReasonIdText AS INTEGER) = CR.Id)
+            WHERE QCT_corr.OwnerUserId = UAS.UserId
+            AND QCT_corr.QuestionId = (
+                SELECT PostId
+                FROM PostEngagementMetrics
+                WHERE OwnerUserId = UAS.UserId AND PostTypeId = 1
+                ORDER BY Score DESC, ViewCount DESC
+                LIMIT 1
+            )
+            ORDER BY QCT_corr.LastClosedDate DESC
+            LIMIT 1
+        ) AS TopQuestionCloseReason,
+        (UAS.TotalUpVotesGiven * 1.0) / NULLIF(UAS.TotalDownVotesGiven, 0) AS UpToDownVoteRatioGiven,
+        'HighReputationWithQuestionActivity' AS UserSegment
+    FROM UserActivitySummary UAS
+    LEFT JOIN PostEngagementMetrics PEM ON UAS.UserId = PEM.OwnerUserId AND PEM.PostTypeId = 1
+    LEFT JOIN QuestionClosingTrends QCT ON UAS.UserId = QCT.OwnerUserId
+    LEFT JOIN UserPostTagStats UPTS ON UAS.UserId = UPTS.UserId AND UPTS.TagRankForUser = 1
+    WHERE UAS.Reputation > 5000
+      AND UAS.TotalQuestions > 10
+      AND EXISTS (SELECT 1 FROM PostEngagementMetrics sub_pem WHERE sub_pem.OwnerUserId = UAS.UserId AND sub_pem.PostTypeId = 1 AND sub_pem.Score > 0)
+    GROUP BY UAS.UserId, UAS.DisplayName, UAS.Reputation, UAS.TotalQuestions, UAS.TotalAnswers, UAS.TotalCommentsMade, UAS.AvgCommentLength, UAS.GoldBadges, UAS.SilverBadges, UAS.BronzeBadges, UAS.TotalAcceptedAnswersByOthers, UAS.TotalUpVotesGiven, UAS.TotalDownVotesGiven
+    HAVING SUM(COALESCE(QCT.CloseEvents, 0)) > 0 OR SUM(COALESCE(QCT.ReopenEvents, 0)) > 0
+),
+SecondaryUserData AS (
+    SELECT
+        UAS.UserId,
+        UAS.DisplayName,
+        UAS.Reputation,
+        UAS.TotalQuestions,
+        UAS.TotalAnswers,
+        UAS.TotalCommentsMade,
+        COALESCE(UAS.AvgCommentLength, 0.0) AS AverageCommentBodyLength,
+        UAS.GoldBadges,
+        UAS.SilverBadges,
+        UAS.BronzeBadges,
+        UAS.TotalAcceptedAnswersByOthers,
+        SUM(PEM.Score) AS TotalPostScoreOwned,
+        AVG(PEM.Score) AS AvgPostScoreOwned,
+        AVG(PEM.ViewCount) AS AvgPostViewCountOwned,
+        SUM(PEM.AnswerCount) AS TotalAnswersReceivedOnQuestions,
+        SUM(PEM.FavoriteCount) AS TotalFavoritesReceived,
+        SUM(QCT.CloseEvents) AS TotalQuestionCloseEvents,
+        SUM(QCT.ReopenEvents) AS TotalQuestionReopenEvents,
+        CAST(SUM(QCT.CloseEvents) AS DECIMAL) / NULLIF(SUM(UAS.TotalQuestions), 0) AS CloseRatePerQuestion,
+        MAX(CASE WHEN UPTS.TagRankForUser = 1 THEN UPTS.TagName ELSE NULL END) AS TopTagByQuestions,
+        MAX(CASE WHEN UPTS.TagRankForUser = 1 THEN UPTS.UserQuestionsWithTag ELSE NULL END) AS TopTagQuestionCount,
+        (
+            SELECT COUNT(DISTINCT PL_Inner.RelatedPostId)
+            FROM PostLinks PL_Inner
+            WHERE PL_Inner.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = UAS.UserId AND PostTypeId = 1)
+        ) AS UserLinkedQuestionCount,
+        NTILE(10) OVER (ORDER BY UAS.Reputation DESC) AS ReputationDecile,
+        RANK() OVER (ORDER BY SUM(COALESCE(PEM.Score, 0)) DESC, UAS.Reputation DESC) AS OverallScoreRank,
+        (
+            SELECT CR.Name
+            FROM QuestionClosingTrends QCT_corr
+            LEFT JOIN CloseReasonTypes CR ON (QCT_corr.MostRecentCloseReasonIdText ~ '^[0-9]+$' AND CAST(QCT_corr.MostRecentCloseReasonIdText AS INTEGER) = CR.Id)
+            WHERE QCT_corr.OwnerUserId = UAS.UserId
+            AND QCT_corr.QuestionId = (
+                SELECT PostId
+                FROM PostEngagementMetrics
+                WHERE OwnerUserId = UAS.UserId AND PostTypeId = 1
+                ORDER BY Score DESC, ViewCount DESC
+                LIMIT 1
+            )
+            ORDER BY QCT_corr.LastClosedDate DESC
+            LIMIT 1
+        ) AS TopQuestionCloseReason,
+        (UAS.TotalUpVotesGiven * 1.0) / NULLIF(UAS.TotalDownVotesGiven, 0) AS UpToDownVoteRatioGiven,
+        'HighAcceptedAnswersWithPositiveVoting' AS UserSegment
+    FROM UserActivitySummary UAS
+    LEFT JOIN PostEngagementMetrics PEM ON UAS.UserId = PEM.OwnerUserId AND PEM.PostTypeId = 1
+    LEFT JOIN QuestionClosingTrends QCT ON UAS.UserId = QCT.OwnerUserId
+    LEFT JOIN UserPostTagStats UPTS ON UAS.UserId = UPTS.UserId AND UPTS.TagRankForUser = 1
+    WHERE UAS.TotalAnswers > 50
+      AND UAS.TotalAcceptedAnswersByOthers > 5
+      AND (UAS.TotalUpVotesGiven * 1.0) / NULLIF(UAS.TotalDownVotesGiven, 0) > 3.0
+    GROUP BY UAS.UserId, UAS.DisplayName, UAS.Reputation, UAS.TotalQuestions, UAS.TotalAnswers, UAS.TotalCommentsMade, UAS.AvgCommentLength, UAS.GoldBadges, UAS.SilverBadges, UAS.BronzeBadges, UAS.TotalAcceptedAnswersByOthers, UAS.TotalUpVotesGiven, UAS.TotalDownVotesGiven
+)
+SELECT * FROM MainQueryData
+UNION ALL
+SELECT * FROM SecondaryUserData
+ORDER BY UserSegment, OverallScoreRank ASC
+LIMIT 200;

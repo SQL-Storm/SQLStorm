@@ -1,0 +1,153 @@
+-- {"query": "2728.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1344} 
+with RecursiveTagCounts as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        p.Id as PostId,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.CreationDate
+    from Tags t
+    join Posts p on p.PostTypeId = 1 and p.Tags like '%' || t.TagName || '%'
+    where t.Count > 1000
+
+    union all
+
+    select
+        rtc.Id,
+        rtc.TagName,
+        rtc.Count,
+        child.Id,
+        child.Score,
+        child.ViewCount,
+        child.OwnerUserId,
+        child.CreationDate
+    from RecursiveTagCounts rtc
+    join Posts child on child.ParentId = rtc.PostId
+),
+UserBadgeRankings as (
+    select
+        b.UserId,
+        b.Name,
+        b.Class,
+        row_number() over (partition by b.UserId order by b.Class, b.Date desc) as rn
+    from Badges b
+    where b.Class in (1, 2, 3)
+),
+LatestPostComments as (
+    select distinct on (c.PostId)
+        c.PostId,
+        c.Text as LatestCommentText,
+        c.CreationDate as LatestCommentDate
+    from Comments c
+    order by c.PostId, c.CreationDate desc
+),
+UserPostAggregates as (
+    select
+        u.Id as UserId,
+        count(distinct p.Id) as TotalPosts,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionCount,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswerCount,
+        sum(coalesce(p.Score,0)) as TotalPostScore,
+        avg(coalesce(p.ViewCount,0)) as AvgViewCount,
+        max(p.CreationDate) as LastPostDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id
+),
+HighActivityUsers as (
+    select
+        u.Id,
+        u.DisplayName,
+        upa.TotalPosts,
+        upa.QuestionCount,
+        upa.AnswerCount,
+        upa.TotalPostScore,
+        upa.AvgViewCount,
+        upa.LastPostDate,
+        array_agg(distinct ub.Name order by ub.Class, ub.Date desc) filter (where ub.rn = 1) as TopBadges
+    from Users u
+    join UserPostAggregates upa on upa.UserId = u.Id
+    left join UserBadgeRankings ub on ub.UserId = u.Id
+    where upa.TotalPosts > 50 
+      and u.Reputation > (select percentile_cont(0.75) within group (order by Reputation) from Users)
+    group by u.Id, u.DisplayName, upa.TotalPosts, upa.QuestionCount, upa.AnswerCount,
+             upa.TotalPostScore, upa.AvgViewCount, upa.LastPostDate
+),
+PostLinkDetails as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name as LinkTypeName,
+        p1.Title as PostTitle,
+        p2.Title as RelatedPostTitle,
+        p1.Score as PostScore,
+        p2.Score as RelatedPostScore
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    join Posts p1 on p1.Id = pl.PostId
+    join Posts p2 on p2.Id = pl.RelatedPostId
+    where pl.LinkTypeId in (1,3)
+),
+QuestionsWithDuplicateAnswers as (
+    select distinct p.ParentId as QuestionId, count(*) over (partition by p.ParentId) as DuplicateAnswerCount
+    from Posts p
+    join PostLinks pl ON pl.PostId = p.Id and pl.LinkTypeId = 3
+    where p.PostTypeId = 2
+),
+FinalSelection as (
+    select
+        p.Id as QuestionId,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        coalesce(dups.DuplicateAnswerCount, 0) as DuplicateAnswers,
+        lag(p.Score) over (partition by p.OwnerUserId order by p.CreationDate) as PreviousPostScore,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc) as UserTopScoreRank,
+        u.DisplayName as OwnerName,
+        u.Reputation as OwnerReputation,
+        LatestComments.LatestCommentText,
+        LatestComments.LatestCommentDate
+    from Posts p
+    left join QuestionsWithDuplicateAnswers dups on dups.QuestionId = p.Id
+    left join Users u on u.Id = p.OwnerUserId
+    left join LatestPostComments LatestComments on LatestComments.PostId = p.Id
+    where p.PostTypeId = 1
+      and p.Score > 5
+      and p.ViewCount > 1000
+)
+select
+    fs.QuestionId,
+    fs.Title,
+    fs.Tags,
+    fs.Score,
+    fs.ViewCount,
+    extract(epoch from (now() - fs.CreationDate))/86400 as DaysSinceCreation,
+    fs.DuplicateAnswers,
+    fs.PreviousPostScore,
+    fs.UserTopScoreRank,
+    fs.OwnerName,
+    fs.OwnerReputation,
+    fs.LatestCommentText,
+    fs.LatestCommentDate,
+    ht.TopBadges,
+    rtc.TagName,
+    rtc.Count as TagGlobalCount,
+    rtc.Score as PostTagScore,
+    rtc.ViewCount as PostTagViewCount,
+    row_number() over (partition by rtc.TagName order by rtc.Score desc) as TagPostRank,
+    pl.LinkTypeName,
+    pl.RelatedPostTitle,
+    pl.RelatedPostScore
+from FinalSelection fs
+left join HighActivityUsers ht on ht.Id = fs.OwnerName::int -- intentionally numeric conversion will produce nulls to test null logic
+left join RecursiveTagCounts rtc on rtc.PostId = fs.QuestionId
+left join PostLinkDetails pl on pl.PostId = fs.QuestionId
+where (fs.Score > coalesce(pl.RelatedPostScore,0) * 0.7 or pl.RelatedPostScore is null)
+  and (rtc.TagName is not null or pl.LinkTypeName is not null)
+order by fs.Score desc, rtc.Count desc, pl.RelatedPostScore desc
+limit 100;

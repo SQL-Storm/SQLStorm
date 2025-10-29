@@ -1,0 +1,161 @@
+-- {"query": "2160.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1569} 
+with RecursiveTagTree as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        coalesce(t.IsModeratorOnly::int, 0) as IsModeratorOnly,
+        coalesce(t.IsRequired::int, 0) as IsRequired,
+        1 as Depth
+    from Tags t
+    where t.Id in (
+        select distinct unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')::int[])
+        from Posts p where p.PostTypeId = 1 and p.CreationDate >= current_date - interval '1 year'
+    )
+    union all
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        coalesce(t.IsModeratorOnly::int, 0),
+        coalesce(t.IsRequired::int, 0),
+        r.Depth + 1
+    from Tags t
+    join RecursiveTagTree r on t.Id = r.Id + 1 -- artificial recursion to create depth
+    where r.Depth < 3
+),
+UserBadgeStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(distinct b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(distinct b.Id) filter (where b.Class = 3) as BronzeBadges,
+        coalesce(sum(case when b.TagBased = 1 then 1 else 0 end),0) as TagBasedBadges,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.ViewCount,
+        q.Score,
+        q.AnswerCount,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreationDate,
+        a.OwnerUserId as AnswerOwnerUserId,
+        u.DisplayName as AnswerOwnerDisplayName,
+        row_number() over (partition by q.Id order by a.Score desc nulls last, a.CreationDate asc) as AnswerRank
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Users u on u.Id = a.OwnerUserId
+    where q.PostTypeId = 1
+      and q.CreationDate >= current_date - interval '6 months'
+),
+PostCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReason,
+        ph.CreationDate
+    from PostHistory ph
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int) and ph.PostHistoryTypeId = 10
+    where ph.PostHistoryTypeId = 10
+),
+PopularQuestions as (
+    select
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        substring(p.Tags from 2 for char_length(p.Tags) - 2) as RawTags,
+        string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><') as TagArray
+    from Posts p
+    where p.PostTypeId = 1
+      and p.Score > 10
+      and p.ViewCount > 1000
+),
+SelectedComments as (
+    select
+        c.PostId,
+        c.UserId,
+        u.DisplayName,
+        c.Text,
+        c.Score,
+        row_number() over (partition by c.PostId order by c.Score desc nulls last, c.CreationDate asc) as CommentRank
+    from Comments c
+    left join Users u on u.Id = c.UserId
+    where c.CreationDate >= current_date - interval '3 months'
+),
+DuplicatesAndLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name as LinkTypeName,
+        p.Title as RelatedPostTitle,
+        p.PostTypeId as RelatedPostType,
+        p.Score as RelatedPostScore
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    left join Posts p on p.Id = pl.RelatedPostId
+),
+UserReputationRank as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        rank() over (order by u.Reputation desc) as ReputationRank
+    from Users u
+    where u.Reputation is not null
+),
+FilteredVotes as (
+    select
+        v.PostId,
+        count(*) filter (where v.VoteTypeId = 2) as UpVotes,
+        count(*) filter (where v.VoteTypeId = 3) as DownVotes,
+        count(*) filter (where v.VoteTypeId = 8) as BountyStarts,
+        count(distinct v.UserId) as VotingUsers
+    from Votes v
+    group by v.PostId
+)
+select
+    pq.Id as QuestionId,
+    pq.Title,
+    pq.Score,
+    pq.ViewCount,
+    coalesce(pv.UpVotes,0) as UpVotes,
+    coalesce(pv.DownVotes,0) as DownVotes,
+    coalesce(pv.BountyStarts,0) as BountyStarts,
+    pq.AnswerCount,
+    (select count(*) from SelectedComments sc where sc.PostId = pq.Id and sc.CommentRank <= 3) as Top3CommentsCount,
+    array_to_string(pq.TagArray, ',') as Tags,
+    case
+        when pq.AnswerCount > 0 then (select avg(a.AnswerScore) from PostAnswerStats a where a.QuestionId = pq.Id)
+        else null
+    end as AvgAnswerScore,
+    max(ub.LastBadgeDate) filter (where ub.UserId = pq.OwnerUserId) as OwnerLastBadgeDate,
+    ur.ReputationRank as OwnerReputationRank,
+    case
+        when pc.CloseReason is not null then pc.CloseReason
+        else 'Open'
+    end as CurrentCloseStatus,
+    (select count(distinct dl.RelatedPostId) from DuplicatesAndLinks dl where dl.PostId = pq.Id and dl.LinkTypeName = 'Duplicate') as DuplicateCount,
+    sum(case when rb.Depth = 1 then 1 else 0 end) as PrimaryTagCount,
+    sum(rb.IsModeratorOnly) as ModeratorOnlyTagCount,
+    sum(rb.IsRequired) as RequiredTagCount
+from PopularQuestions pq
+left join Users u on u.Id = pq.OwnerUserId
+left join UserBadgeStats ub on ub.UserId = u.Id
+left join UserReputationRank ur on ur.UserId = u.Id
+left join PostCloseReasons pc on pc.PostId = pq.Id
+left join FilteredVotes pv on pv.PostId = pq.Id
+left join RecursiveTagTree rb on rb.TagName = any(pq.TagArray)
+group by pq.Id, pq.Title, pq.Score, pq.ViewCount, pv.UpVotes, pv.DownVotes, pv.BountyStarts, pq.AnswerCount, pq.TagArray, ub.LastBadgeDate, ur.ReputationRank, pc.CloseReason, pq.OwnerUserId
+having count(distinct rb.Id) > 1
+order by pq.Score desc, pq.ViewCount desc, pq.CreationDate desc
+limit 50;

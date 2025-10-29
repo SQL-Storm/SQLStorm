@@ -1,0 +1,171 @@
+-- {"query": "1392.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2453} 
+WITH UserCoreStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.Location,
+        u.WebsiteUrl,
+        u.AboutMe,
+        u.Views AS UserProfileViews,
+        u.UpVotes AS TotalUpVotesGiven,
+        u.DownVotes AS TotalDownVotesGiven,
+        COUNT(DISTINCT b.Id) AS TotalBadgesEarned,
+        MAX(b.Date) AS LastBadgeAwardDate,
+        -- Elaborate calculation for user engagement score
+        (u.Reputation * 0.7 + u.UpVotes * 0.2 - u.DownVotes * 0.1 + COUNT(DISTINCT b.Id) * 10 +
+         COALESCE(EXTRACT(DAY FROM (cast('2024-10-01 12:34:56' as timestamp) - u.LastAccessDate)), 365) * -0.01 +
+         CASE WHEN u.WebsiteUrl IS NOT NULL THEN 50 ELSE 0 END
+        )::numeric AS EngagementScore,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadgeCount
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Location, u.WebsiteUrl, u.AboutMe, u.Views, u.UpVotes, u.DownVotes
+    HAVING u.Reputation > 500
+),
+PostTagParser AS (
+    -- Extract and normalize individual tags from the Posts table
+    SELECT
+        p.Id AS PostId,
+        TRIM(UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><'))) AS TagName
+    FROM Posts p
+    WHERE p.Tags IS NOT NULL AND p.Tags LIKE '<%>%'
+),
+PostDetailsExtended AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.ClosedDate,
+        p.CommunityOwnedDate,
+        LENGTH(p.Body) AS BodyLength,
+        LENGTH(COALESCE(p.Title, '')) AS TitleLength,
+        -- Calculate score per view ratio, handling potential division by zero with NULLIF and COALESCE
+        COALESCE(p.Score::numeric / NULLIF(p.ViewCount, 0), 0) AS ScorePerViewRatio,
+        -- Window function: Rank posts by score within each PostTypeId and quarter
+        RANK() OVER (PARTITION BY p.PostTypeId, EXTRACT(QUARTER FROM p.CreationDate) ORDER BY p.Score DESC, p.ViewCount DESC) AS RankInQuarterByScore,
+        -- Window function: Calculate a rolling average of post scores for each user
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS RollingAvgOwnerPostScore,
+        -- String expressions with ILIKE for keyword identification
+        (p.Body ILIKE '%sql%' OR p.Title ILIKE '%sql%') AS IsSQLRelated,
+        (p.Body ILIKE '%database%' OR p.Title ILIKE '%database%') AS IsDatabaseRelated,
+        -- Calculation for post "age" in days since last activity
+        EXTRACT(DAY FROM (cast('2024-10-01 12:34:56' as timestamp) - p.LastActivityDate)) AS DaysSinceLastActivity,
+        -- NULL logic: check if post is closed AND community owned
+        (p.ClosedDate IS NOT NULL AND p.CommunityOwnedDate IS NOT NULL) AS IsClosedAndCommunityOwned
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL AND p.PostTypeId IN (1, 2, 4) -- Questions, Answers, TagWikiExcerpt
+),
+PostHistoryTimeline AS (
+    SELECT
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate AS HistoryCreationDate,
+        ph.UserId AS HistoryEditorUserId,
+        -- Window function: Calculate time in hours since the previous history event for the same post
+        EXTRACT(EPOCH FROM (ph.CreationDate - LAG(ph.CreationDate, 1, ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate))) / 3600.0 AS HoursSincePreviousEvent,
+        -- Window function: Count total minor edits (title, body, tags) for each post
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) OVER (PARTITION BY ph.PostId) AS TotalMinorEdits,
+        -- Window function: Determine if a post has ever been closed or reopened
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) OVER (PARTITION BY ph.PostId) AS EverClosed,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) OVER (PARTITION BY ph.PostId) AS EverReopened
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15) -- Common edit/status history types
+),
+AggregatedPostHistory AS (
+    SELECT
+        PostId,
+        COUNT(DISTINCT HistoryCreationDate) AS TotalHistoryEvents,
+        AVG(HoursSincePreviousEvent) FILTER (WHERE HoursSincePreviousEvent > 0) AS AvgHoursBetweenEdits, -- Filter out initial 0 from LAG default
+        MAX(HistoryCreationDate) AS LastHistoryEventDate,
+        MIN(HistoryCreationDate) AS FirstHistoryEventDate,
+        MAX(TotalMinorEdits) AS PostTotalMinorEdits,
+        MAX(EverClosed) AS PostEverClosed,
+        MAX(EverReopened) AS PostEverReopened
+    FROM PostHistoryTimeline
+    GROUP BY PostId
+),
+UserQuestionPerformance AS (
+    -- Metrics specific to user's questions
+    SELECT
+        pde.OwnerUserId AS UserId,
+        COUNT(DISTINCT pde.PostId) AS TotalQuestionsAsked,
+        SUM(pde.PostScore) AS TotalQuestionScore,
+        AVG(pde.ScorePerViewRatio) AS AvgQuestionScorePerView,
+        SUM(CASE WHEN pde.IsSQLRelated THEN 1 ELSE 0 END) AS SQLRelatedQuestions,
+        SUM(CASE WHEN pde.IsDatabaseRelated THEN 1 ELSE 0 END) AS DatabaseRelatedQuestions
+    FROM PostDetailsExtended pde
+    WHERE pde.PostTypeId = 1
+    GROUP BY pde.OwnerUserId
+),
+UserAnswerPerformance AS (
+    -- Metrics specific to user's answers
+    SELECT
+        pde.OwnerUserId AS UserId,
+        COUNT(DISTINCT pde.PostId) AS TotalAnswersProvided,
+        SUM(pde.PostScore) AS TotalAnswerScore,
+        AVG(pde.ScorePerViewRatio) AS AvgAnswerScorePerView,
+        SUM(CASE WHEN pde.IsSQLRelated THEN 1 ELSE 0 END) AS SQLRelatedAnswers,
+        SUM(CASE WHEN pde.IsDatabaseRelated THEN 1 ELSE 0 END) AS DatabaseRelatedAnswers,
+        -- Correlated subquery: Check if user has any answers accepted by highly reputable question owners
+        EXISTS (
+            SELECT 1
+            FROM Posts a_inner
+            JOIN Posts q_parent ON a_inner.ParentId = q_parent.Id AND q_parent.AcceptedAnswerId = a_inner.Id
+            JOIN Users u_q_owner ON q_parent.OwnerUserId = u_q_owner.Id
+            WHERE a_inner.OwnerUserId = pde.OwnerUserId
+              AND a_inner.PostTypeId = 2
+              AND u_q_owner.Reputation > 15000
+        ) AS HasHighRepQuestionerAcceptedAnswer
+    FROM PostDetailsExtended pde
+    WHERE pde.PostTypeId = 2
+    GROUP BY pde.OwnerUserId
+),
+UserCommentAndLinkAggregates AS (
+    -- Aggregate comments and post links for all users
+    SELECT
+        u.Id AS UserId,
+        COALESCE(AVG(c_user.Score), 0) AS AvgCommentScoreOnUserPosts,
+        COALESCE(MAX(c_user.Score), 0) AS MaxCommentScoreOnUserPosts,
+        COUNT(DISTINCT c_user.Id) FILTER (WHERE c_user.Score < 0) AS ControversialCommentsCount,
+        -- Nested subquery with aggregation: count links to highly viewed/scored posts by the user
+        (SELECT COUNT(DISTINCT pl_inner.PostId)
+         FROM PostLinks pl_inner
+         JOIN Posts related_p ON pl_inner.RelatedPostId = related_p.Id
+         WHERE pl_inner.PostId IN (SELECT p_own.Id FROM Posts p_own WHERE p_own.OwnerUserId = u.Id)
+           AND pl_inner.LinkTypeId = 1 -- Linked posts
+           AND related_p.ViewCount > 10000
+           AND related_p.Score > 50
+           AND related_p.ClosedDate IS NULL
+        ) AS HighImpactLinkedPostsCount,
+        MAX(c_user.CreationDate) AS LastCommentDate
+    FROM Users u
+    LEFT JOIN Posts p_user ON u.Id = p_user.OwnerUserId
+    LEFT JOIN Comments c_user ON p_user.Id = c_user.PostId
+    GROUP BY u.Id
+)
+SELECT
+    ucs.UserId,
+    ucs.DisplayName,
+    ucs.Reputation,
+    ucs.Location,
+    ucs.EngagementScore,
+    ucs.TotalBadgesEarned,
+    ucs.GoldBadgeCount,
+    -- Combined question and answer performance metrics using FULL OUTER JOIN
+    COALESCE(uq.TotalQuestionsAsked, 0) AS TotalQuestionsAsked,
+    COALESCE(uq.TotalQuestionScore, 0) AS TotalQuestionScore,
+    COALESCE(uq.AvgQuestionScorePerView, 0) AS AvgQuestionScorePerView,
+    COALESCE(ua.TotalAnswersProvided, 0) AS TotalAnswersProvided,
+    COALESCE(ua.TotalAnswerScore, 0) AS TotalAnswerScore,
+    COALESCE(ua.Avg

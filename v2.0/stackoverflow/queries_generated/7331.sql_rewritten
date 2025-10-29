@@ -1,0 +1,271 @@
+-- {"query": "7331.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 3079} 
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        COALESCE(SUM(p.ViewCount), 0) as TotalViews,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(u.CreationDate) as UserCreationDate,
+        DATEDIFF(day, u.CreationDate, cast('2024-10-01 12:34:56' as timestamp)) as AccountAgeDays,
+        CASE 
+            WHEN u.Reputation >= 100000 THEN 'Elite'
+            WHEN u.Reputation >= 10000 THEN 'Expert'
+            WHEN u.Reputation >= 1000 THEN 'Advanced'
+            WHEN u.Reputation >= 100 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as ReputationLevel,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags, 2, LEN(p.Tags) - 2), ', ') WITHIN GROUP (ORDER BY p.Tags) as AllTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+RankingStats AS (
+    SELECT 
+        *,
+        ROW_NUMBER() OVER (ORDER BY TotalScore DESC) as ScoreRank,
+        ROW_NUMBER() OVER (ORDER BY PostCount DESC) as PostRank,
+        ROW_NUMBER() OVER (ORDER BY BadgeCount DESC) as BadgeRank,
+        RANK() OVER (ORDER BY Reputation DESC) as ReputationRank,
+        DENSE_RANK() OVER (ORDER BY AccountAgeDays DESC) as AgeRank,
+        NTILE(10) OVER (ORDER BY TotalScore DESC) as ScorePercentile,
+        PERCENT_RANK() OVER (ORDER BY TotalScore DESC) as ScorePercentileRank,
+        LAG(TotalScore, 1) OVER (ORDER BY TotalScore DESC) as PreviousScore,
+        LEAD(TotalScore, 1) OVER (ORDER BY TotalScore DESC) as NextScore,
+        AVG(TotalScore) OVER (PARTITION BY ReputationLevel) as AvgScoreByLevel,
+        STDDEV(TotalScore) OVER (PARTITION BY ReputationLevel) as StdDevScoreByLevel,
+        CASE 
+            WHEN TotalScore > (SELECT AVG(TotalScore) FROM UserStats WHERE TotalScore IS NOT NULL) * 1.5 THEN 'High'
+            WHEN TotalScore < (SELECT AVG(TotalScore) FROM UserStats WHERE TotalScore IS NOT NULL) * 0.5 THEN 'Low'
+            ELSE 'Average'
+        END as ScoreCategory
+    FROM UserStats
+),
+QuestionAnalysis AS (
+    SELECT 
+        p.OwnerUserId,
+        COUNT(*) as QuestionsPosted,
+        AVG(p.Score) as AvgQuestionScore,
+        MAX(p.Score) as MaxQuestionScore,
+        MIN(p.Score) as MinQuestionScore,
+        COUNT(DISTINCT p.AnswerCount) as UniqueAnswerCounts,
+        STRING_AGG(p.Title, '; ') WITHIN GROUP (ORDER BY p.CreationDate) as QuestionTitles,
+        STRING_AGG(p.Tags, ', ') WITHIN GROUP (ORDER BY p.CreationDate) as QuestionTags,
+        AVG(p.ViewCount) as AvgViewCount,
+        MAX(p.LastActivityDate) as LastQuestionActivity,
+        COUNT(DISTINCT CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 END) as QuestionsWithAcceptedAnswers,
+        COUNT(DISTINCT CASE WHEN p.ViewCount > 1000 THEN 1 END) as HighViewQuestions
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+    GROUP BY p.OwnerUserId
+),
+AnswerAnalysis AS (
+    SELECT 
+        p.OwnerUserId,
+        COUNT(*) as AnswersGiven,
+        AVG(p.Score) as AvgAnswerScore,
+        MAX(p.Score) as MaxAnswerScore,
+        COUNT(DISTINCT p.ParentId) as UniqueQuestionsAnswered,
+        COUNT(DISTINCT CASE WHEN p.Score > 10 THEN 1 END) as HighScoreAnswers,
+        COUNT(DISTINCT CASE WHEN p.CreationDate >= DATEADD(year, -1, cast('2024-10-01 12:34:56' as timestamp)) THEN 1 END) as RecentAnswers,
+        AVG(DATEDIFF(day, p.CreationDate, p.LastActivityDate)) as AvgDaysToLastActivity
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+    GROUP BY p.OwnerUserId
+),
+ComplexUserMetrics AS (
+    SELECT 
+        rs.*,
+        qa.QuestionsPosted,
+        qa.AvgQuestionScore,
+        qa.MaxQuestionScore,
+        qa.MinQuestionScore,
+        qa.UniqueAnswerCounts,
+        qa.QuestionTitles,
+        qa.QuestionTags,
+        qa.AvgViewCount,
+        qa.LastQuestionActivity,
+        qa.QuestionsWithAcceptedAnswers,
+        qa.HighViewQuestions,
+        aa.AnswersGiven,
+        aa.AvgAnswerScore,
+        aa.MaxAnswerScore,
+        aa.UniqueQuestionsAnswered,
+        aa.HighScoreAnswers,
+        aa.RecentAnswers,
+        aa.AvgDaysToLastActivity,
+        CASE 
+            WHEN rs.PostCount > 0 AND rs.QuestionCount > 0 THEN CAST(rs.AnswerCount AS FLOAT) / rs.QuestionCount
+            ELSE NULL 
+        END as AnswersPerQuestion,
+        CASE 
+            WHEN rs.QuestionCount > 0 THEN CAST(rs.QuestionsWithAcceptedAnswers AS FLOAT) / rs.QuestionCount
+            ELSE NULL 
+        END as AcceptanceRate,
+        CASE 
+            WHEN rs.CommentCount > 0 THEN rs.TotalScore / rs.CommentCount
+            ELSE NULL 
+        END as ScorePerComment,
+        CASE 
+            WHEN rs.Reputation > 0 THEN rs.PostCount / rs.Reputation
+            ELSE NULL 
+        END as PostsPerReputation,
+        IIF(rs.Reputation > 10000 AND rs.ScoreCategory = 'High', 1, 0) as EliteHighPerformer,
+        CASE 
+            WHEN rs.ReputationLevel IN ('Elite', 'Expert') AND rs.PostCount > 500 AND rs.BadgeCount > 50 
+            THEN 'Top Performer'
+            WHEN rs.ReputationLevel IN ('Advanced', 'Intermediate') AND rs.PostCount > 200 AND rs.BadgeCount > 20 
+            THEN 'Active Contributor'
+            ELSE 'Regular User'
+        END as UserCategory,
+        DATEDIFF(day, rs.LastPostDate, cast('2024-10-01 12:34:56' as timestamp)) as DaysSinceLastPost,
+        CASE 
+            WHEN DATEDIFF(day, rs.LastQuestionActivity, cast('2024-10-01 12:34:56' as timestamp)) <= 30 THEN 'Active'
+            WHEN DATEDIFF(day, rs.LastQuestionActivity, cast('2024-10-01 12:34:56' as timestamp)) <= 90 THEN 'Inactive'
+            ELSE 'Very Inactive'
+        END as QuestionActivityStatus
+    FROM RankingStats rs
+    LEFT JOIN QuestionAnalysis qa ON rs.UserId = qa.OwnerUserId
+    LEFT JOIN AnswerAnalysis aa ON rs.UserId = aa.OwnerUserId
+),
+FinalAnalysis AS (
+    SELECT 
+        *,
+        CASE 
+            WHEN PostCount > 100 THEN 'Veteran'
+            WHEN PostCount > 50 THEN 'Experienced'
+            WHEN PostCount > 25 THEN 'Active'
+            WHEN PostCount > 10 THEN 'Beginner'
+            ELSE 'Newcomer'
+        END as PostingExperience,
+        CASE 
+            WHEN ReputationLevel = 'Elite' AND ScorePercentile >= 90 THEN 'Super Elite'
+            WHEN ReputationLevel = 'Expert' AND ScorePercentile >= 80 THEN 'High Performer'
+            WHEN ReputationLevel IN ('Advanced', 'Intermediate') AND ScorePercentile >= 70 THEN 'Regular Performer'
+            ELSE 'Standard User'
+        END as PerformanceTier,
+        CASE 
+            WHEN AVG(TotalScore) OVER() > 0 THEN (TotalScore - AVG(TotalScore) OVER()) / STDEV(TotalScore) OVER()
+            ELSE 0 
+        END as ZScore,
+        (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = fa.UserId) AND pl.LinkTypeId = 3) as DuplicateLinkCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.UserId = fa.UserId AND v.VoteTypeId = 2) as UpvoteCounts,
+        (SELECT COUNT(*) FROM Votes v WHERE v.UserId = fa.UserId AND v.VoteTypeId = 3) as DownvoteCounts,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = fa.UserId AND b.Class = 1) as GoldBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = fa.UserId AND b.Class = 2) as SilverBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = fa.UserId AND b.Class = 3) as BronzeBadges,
+        (
+            SELECT COUNT(DISTINCT ph.PostId) 
+            FROM PostHistory ph 
+            WHERE ph.UserId = fa.UserId 
+            AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6) 
+            AND ph.CreationDate >= DATEADD(year, -1, cast('2024-10-01 12:34:56' as timestamp))
+        ) as RecentEdits,
+        (
+            SELECT COUNT(DISTINCT p.Id) 
+            FROM Posts p 
+            JOIN PostHistory ph ON p.Id = ph.PostId 
+            WHERE ph.UserId = fa.UserId 
+            AND ph.PostHistoryTypeId IN (10, 11) 
+            AND ph.CreationDate >= DATEADD(month, -6, cast('2024-10-01 12:34:56' as timestamp))
+        ) as RecentModerationActions,
+        COALESCE(UpVotes, 0) - COALESCE(DownVotes, 0) as NetReputation,
+        CASE 
+            WHEN TotalScore > 0 AND (NetReputation + 1) > 0 THEN LOG10(TotalScore) * LOG10(NetReputation + 1)
+            ELSE 0 
+        END as ScoreReputationProduct,
+        CASE 
+            WHEN LastActivityDate >= DATEADD(day, -30, cast('2024-10-01 12:34:56' as timestamp)) THEN 'Very Recent'
+            WHEN LastActivityDate >= DATEADD(day, -90, cast('2024-10-01 12:34:56' as timestamp)) THEN 'Recently Active'
+            WHEN LastActivityDate >= DATEADD(day, -180, cast('2024-10-01 12:34:56' as timestamp)) THEN 'Moderately Active'
+            ELSE 'Passive'
+        END as ActivityStatus,
+        ABS(DATEDIFF(day, LastPostDate, cast('2024-10-01 12:34:56' as timestamp)) - AVG(DATEDIFF(day, LastPostDate, cast('2024-10-01 12:34:56' as timestamp))) OVER()) AS DaysSinceLastPostVariance,
+        NULLIF(PostCount, 0) / NULLIF(Reputation, 0) as PostReputationRatio
+    FROM ComplexUserMetrics fa
+)
+SELECT TOP 1000
+    UserId,
+    DisplayName,
+    Reputation,
+    ReputationLevel,
+    ScoreRank,
+    PostRank,
+    BadgeRank,
+    ScoreCategory,
+    TotalScore,
+    PostCount,
+    QuestionCount,
+    AnswerCount,
+    BadgeCount,
+    NetReputation,
+    ScoreReputationProduct,
+    ActivityStatus,
+    UserCategory,
+    PerformanceTier,
+    PostingExperience,
+    ZScore,
+    DaysSinceLastPost,
+    AVG(TotalScore) OVER() as OverallAvgScore,
+    MIN(TotalScore) OVER() as OverallMinScore,
+    MAX(TotalScore) OVER() as OverallMaxScore,
+    COUNT(*) OVER() as TotalUserCount,
+    SUM(TotalScore) OVER() as TotalScoreSum,
+    (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = UserId) as UserPostCount,
+    (SELECT COUNT(*) FROM Comments WHERE UserId = UserId) as UserCommentCount,
+    (SELECT COUNT(*) FROM Badges WHERE UserId = UserId) as UserBadgeCount,
+    ((SELECT COUNT(*) FROM Posts WHERE OwnerUserId = UserId AND PostTypeId = 1) * 100.0 / NULLIF((SELECT COUNT(*) FROM Posts WHERE OwnerUserId = UserId), 0)) as QuestionPercentage,
+    ((SELECT COUNT(*) FROM Posts WHERE OwnerUserId = UserId AND PostTypeId = 2) * 100.0 / NULLIF((SELECT COUNT(*) FROM Posts WHERE OwnerUserId = UserId), 0)) as AnswerPercentage,
+    STDEV(TotalScore) OVER() as OverallStdDev,
+    COALESCE(QuestionsPosted, 0) as QuestionsPosted,
+    COALESCE(AnswersGiven, 0) as AnswersGiven,
+    COALESCE(AvgQuestionScore, 0) as AvgQuestionScore,
+    COALESCE(AvgAnswerScore, 0) as AvgAnswerScore,
+    COALESCE(AnswersPerQuestion, 0) as AnswersPerQuestion,
+    COALESCE(AcceptanceRate * 100, 0) as AcceptanceRatePercent,
+    CASE 
+        WHEN GoldBadges > 10 THEN 'Award Winner'
+        WHEN SilverBadges > 20 THEN 'Silver Award'
+        WHEN BronzeBadges > 50 THEN 'Bronze Collector'
+        ELSE 'Standard'
+    END as BadgeStatus,
+    CASE 
+        WHEN RecentEdits >= 50 THEN 'Heavy Editor'
+        WHEN RecentEdits >= 20 THEN 'Moderate Editor'
+        WHEN RecentEdits > 0 THEN 'Light Editor'
+        ELSE 'No Activity'
+    END as EditActivityLevel,
+    CASE 
+        WHEN RecentModerationActions >= 10 THEN 'Active Moderator'
+        WHEN RecentModerationActions >= 5 THEN 'Moderator Interested'
+        WHEN RecentModerationActions > 0 THEN 'Moderation Observer'
+        ELSE 'Regular Member'
+    END as ModerationActivity,
+    ROW_NUMBER() OVER (ORDER BY TotalScore DESC, PostCount DESC) as OverallRanking
+FROM FinalAnalysis
+WHERE TotalScore > 0 OR QuestionCount > 0 OR AnswerCount > 0
+HAVING 
+    COUNT(*) OVER() > 0
+    AND 
+    (
+        (COUNT(*) OVER() > 1000 AND TotalScore > (SELECT AVG(TotalScore) FROM FinalAnalysis WHERE TotalScore IS NOT NULL))
+        OR
+        (COUNT(*) OVER() <= 1000 AND TotalScore > 0)
+    )
+ORDER BY 
+    TotalScore DESC,
+    PostCount DESC,
+    BadgeCount DESC,
+    Reputation DESC;

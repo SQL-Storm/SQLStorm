@@ -1,0 +1,386 @@
+with
+active_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.upvotes,
+    u.downvotes,
+    coalesce(nullif(trim(u.location), ''), 'Unknown') as norm_location,
+    width_bucket(u.reputation, 0, greatest(u.reputation, 1), 10) as rep_bucket,
+    row_number() over (order by u.reputation desc, u.id) as rep_rank_global
+  from users u
+  where u.creationdate >= (select min(creationdate) from users) + interval '365 days'
+),
+post_enriched as (
+  select
+    p.id,
+    p.posttypeid,
+    p.owneruserid,
+    p.score,
+    p.viewcount,
+    p.creationdate,
+    p.lastactivitydate,
+    p.title,
+    p.tags,
+    case
+      when p.tags is null then cast(array[] as varchar[])
+      else string_to_array(substring(p.tags, 2, greatest(length(p.tags)-2,0)), '><')
+    end as tag_arr,
+    coalesce(cardinality(
+      case
+        when p.tags is null then cast(array[] as varchar[])
+        else string_to_array(substring(p.tags, 2, greatest(length(p.tags)-2,0)), '><')
+      end
+    ), 0) as tag_count,
+    au.displayname as owner_name,
+    au.rep_rank_global as owner_rep_rank
+  from posts p
+  left join active_users au on au.user_id = p.owneruserid
+),
+vote_agg as (
+  select
+    v.postid,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.votetypeid = 12 then 1 else 0 end) as spamflags,
+    sum(case when v.votetypeid = 10 then 1 else 0 end) as deletions,
+    sum(case when v.votetypeid = 11 then 1 else 0 end) as undeletions,
+    sum(case when v.votetypeid = 8 then 1 else 0 end) as bounty_starts,
+    sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_total
+  from votes v
+  group by v.postid
+),
+comment_agg as (
+  select
+    c.postid,
+    count(*) as comment_count,
+    max(c.creationdate) as last_comment_at,
+    max(case when c.creationdate = (select max(c2.creationdate) from comments c2 where c2.postid = c.postid) then c.id else null end) as last_comment_id
+  from comments c
+  group by c.postid
+),
+last_comment_detail as (
+  select distinct on (c.postid)
+    c.postid,
+    c.userid as last_comment_user_id,
+    coalesce(c.userdisplayname, u.displayname, 'Anonymous') as last_comment_user_name,
+    c.text as last_comment_text
+  from comments c
+  left join users u on u.id = c.userid
+  order by c.postid, c.creationdate desc, c.id desc
+),
+dup_links as (
+  select
+    pl.postid,
+    pl.relatedpostid
+  from postlinks pl
+  where pl.linktypeid = 3
+),
+duplicate_group as (
+  select
+    p.id as post_id,
+    case
+      when exists (select 1 from dup_links d where d.postid = p.id) then 'duplicate'
+      when exists (select 1 from dup_links d where d.relatedpostid = p.id) then 'original'
+      else 'unique'
+    end as dup_role,
+    coalesce(sum(case when d1.postid = p.id then 1 else 0 end) over (partition by p.id), 0) as dup_out_degree,
+    coalesce(sum(case when d2.relatedpostid = p.id then 1 else 0 end) over (partition by p.id), 0) as dup_in_degree
+  from posts p
+  left join dup_links d1 on d1.postid = p.id
+  left join dup_links d2 on d2.relatedpostid = p.id
+),
+post_close_reason as (
+  select
+    ph.postid,
+    min(case when ph.posthistorytypeid = 10 then ph.creationdate else null end) as first_closed_at,
+    max(case when ph.posthistorytypeid = 11 then ph.creationdate else null end) as last_reopened_at,
+    max(case when ph.posthistorytypeid = 10 then ph.creationdate else null end) as last_closed_at,
+    max(
+      nullif(regexp_replace(ph.comment, '[^0-9]', '', 'g'), '')
+    ) as last_close_reason_str
+  from posthistory ph
+  group by ph.postid
+),
+close_reason_named as (
+  select
+    pcr.postid,
+    pcr.first_closed_at,
+    pcr.last_reopened_at,
+    pcr.last_closed_at,
+    crt.name as last_close_reason_name
+  from post_close_reason pcr
+  left join (select id, name from closereasontypes) crt
+    on crt.id = cast(nullif(pcr.last_close_reason_str, '') as smallint)
+),
+user_post_activity as (
+  select
+    pe.owneruserid as user_id,
+    pe.id as post_id,
+    pe.creationdate,
+    sum(coalesce(va.upvotes,0) - coalesce(va.downvotes,0)) over (
+      partition by pe.owneruserid
+      order by pe.creationdate
+      rows between unbounded preceding and current row
+    ) as cum_net_votes,
+    avg(coalesce(pe.score,0)) over (
+      partition by pe.owneruserid
+      order by pe.creationdate
+      rows between 10 preceding and current row
+    ) as avg_score_last_10
+  from post_enriched pe
+  left join vote_agg va on va.postid = pe.id
+  where pe.owneruserid is not null
+),
+tag_usage as (
+  select
+    t.tagname,
+    t.count as global_tagcount
+  from tags t
+),
+post_tag_expanded as (
+  select
+    pe.id as post_id,
+    lower(trim(tag)) as tagname
+  from post_enriched pe,
+  unnest(pe.tag_arr) as tag
+  where pe.posttypeid = 1 and pe.tag_count > 0
+),
+post_tag_rank as (
+  select
+    pte.post_id,
+    pte.tagname,
+    tu.global_tagcount,
+    dense_rank() over (partition by pte.post_id order by tu.global_tagcount desc nulls last, pte.tagname) as tag_pop_rank
+  from post_tag_expanded pte
+  left join tag_usage tu on tu.tagname = pte.tagname
+),
+tag_stats as (
+  select
+    pte.tagname,
+    percentile_cont(0.5) within group (order by pe.score) as median_score,
+    avg(pe.score) as avg_score
+  from post_tag_expanded pte
+  join post_enriched pe on pe.id = pte.post_id
+  group by pte.tagname
+),
+post_anomaly as (
+  select
+    pe.id as post_id,
+    pe.score,
+    avg(ts.avg_score) as ref_avg_score,
+    avg(ts.median_score) as ref_median_score,
+    case
+      when count(ts.median_score) filter (where ts.median_score is not null) = 0 then null
+      else pe.score - avg(ts.median_score)
+    end as median_delta
+  from post_enriched pe
+  left join post_tag_expanded pte on pte.post_id = pe.id
+  left join tag_stats ts on ts.tagname = pte.tagname
+  group by pe.id, pe.score
+),
+hot_streak_flags as (
+  select
+    upa.user_id,
+    upa.post_id,
+    upa.creationdate,
+    upa.cum_net_votes,
+    lag(upa.cum_net_votes) over (partition by upa.user_id order by upa.creationdate) as prev_cum_net_votes,
+    upa.avg_score_last_10
+  from user_post_activity upa
+),
+hot_streak as (
+  select
+    user_id,
+    sum(case when cum_net_votes > prev_cum_net_votes and prev_cum_net_votes is not null then 1 else 0 end) as streak_increases,
+    max(avg_score_last_10) as peak_avg_score_last_10
+  from hot_streak_flags
+  group by user_id
+),
+badge_summary as (
+  select
+    b.userid as user_id,
+    sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+    sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+    sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+    sum(case when b.tagbased = 1 then 1 else 0 end) as tag_badges
+  from badges b
+  group by b.userid
+),
+qa as (
+  select
+    q.id as question_id,
+    q.owneruserid as asker_id,
+    q.creationdate as question_created,
+    q.acceptedanswerid,
+    a.id as answer_id,
+    a.owneruserid as answerer_id,
+    a.creationdate as answer_created,
+    extract(epoch from (a.creationdate - q.creationdate)) as answer_secs_after_question,
+    case when q.acceptedanswerid = a.id then 1 else 0 end as is_accepted
+  from posts q
+  left join posts a on a.parentid = q.id and a.posttypeid = 2
+  where q.posttypeid = 1
+),
+qa_speed as (
+  select
+    question_id,
+    min(answer_secs_after_question) as fastest_answer_secs,
+    max(case when is_accepted = 1 then answer_secs_after_question else null end) as accepted_answer_secs,
+    bool_or(is_accepted = 1) as had_accepted
+  from qa
+  group by question_id
+),
+post_metrics as (
+  select
+    pe.id as post_id,
+    pe.posttypeid,
+    coalesce(pe.owneruserid, -1) as owner_user_id,
+    pe.title,
+    pe.score,
+    pe.viewcount,
+    pe.tag_count,
+    case
+      when pe.posttypeid = 1 and (pe.tags ilike '%<sql>%' or pe.tags ilike '%<postgresql>%') then 'SQLish'
+      when pe.posttypeid = 2 and pe.score >= 10 then 'Popular Answer'
+      when pe.posttypeid = 1 and pe.viewcount >= 10000 then 'Popular Question'
+      when pe.posttypeid = 1 and pe.score < 0 then 'Controversial Question'
+      else 'Other'
+    end as category_label,
+    va.upvotes,
+    va.downvotes,
+    (coalesce(va.upvotes,0) - coalesce(va.downvotes,0)) as net_votes,
+    va.bounty_total,
+    ca.comment_count,
+    lcd.last_comment_user_name,
+    left(coalesce(lcd.last_comment_text,''), 120) as last_comment_preview,
+    dr.dup_role,
+    coalesce(dr.dup_out_degree,0) as dup_out_degree,
+    coalesce(dr.dup_in_degree,0) as dup_in_degree,
+    crn.last_close_reason_name,
+    case
+      when crn.last_close_reason_name is null and pe.closeddate is not null then 'Closed (unknown reason)'
+      when crn.last_close_reason_name is not null then 'Closed (' || crn.last_close_reason_name || ')'
+      else null
+    end as close_label,
+    pa.median_delta,
+    qas.fastest_answer_secs,
+    qas.accepted_answer_secs,
+    (qas.had_accepted and qas.accepted_answer_secs is not null and qas.fastest_answer_secs is not null and qas.accepted_answer_secs <= qas.fastest_answer_secs) as accepted_was_fastest
+  from post_enriched pe
+  left join vote_agg va on va.postid = pe.id
+  left join comment_agg ca on ca.postid = pe.id
+  left join last_comment_detail lcd on lcd.postid = pe.id
+  left join duplicate_group dr on dr.post_id = pe.id
+  left join close_reason_named crn on crn.postid = pe.id
+  left join post_anomaly pa on pa.post_id = pe.id
+  left join qa_speed qas on qas.question_id = pe.id
+),
+ranked as (
+  select
+    pm.*,
+    cast(
+      (
+        coalesce(pm.net_votes,0) * 2
+        + coalesce(pm.viewcount,0) / 100
+        + coalesce(pm.bounty_total,0) / 50
+        + case when pm.category_label = 'Popular Question' then 50 when pm.category_label = 'Popular Answer' then 30 when pm.category_label = 'SQLish' then 20 else 0 end
+        - coalesce(pm.dup_in_degree,0) * 5
+        - case when pm.close_label is not null then 25 else 0 end
+        + coalesce(pm.median_delta,0)
+      ) as numeric
+    ) as composite_score,
+    row_number() over (
+      partition by pm.posttypeid
+      order by
+        (
+          coalesce(pm.net_votes,0) * 2
+          + coalesce(pm.viewcount,0) / 100
+          + coalesce(pm.bounty_total,0) / 50
+          + case when pm.category_label = 'Popular Question' then 50 when pm.category_label = 'Popular Answer' then 30 when pm.category_label = 'SQLish' then 20 else 0 end
+          - coalesce(pm.dup_in_degree,0) * 5
+          - case when pm.close_label is not null then 25 else 0 end
+          + coalesce(pm.median_delta,0)
+        ) desc,
+        pm.id
+    ) as rank_within_type
+  from post_metrics pm
+),
+user_summary as (
+  select
+    au.user_id,
+    au.displayname,
+    au.reputation,
+    bs.gold_badges,
+    bs.silver_badges,
+    bs.bronze_badges,
+    bs.tag_badges,
+    hs.streak_increases,
+    hs.peak_avg_score_last_10,
+    sum(r.composite_score) as total_composite_score,
+    avg(r.composite_score) as avg_composite_score
+  from active_users au
+  left join badge_summary bs on bs.user_id = au.user_id
+  left join hot_streak hs on hs.user_id = au.user_id
+  left join ranked r on r.owner_user_id = au.user_id
+  group by au.user_id, au.displayname, au.reputation, bs.gold_badges, bs.silver_badges, bs.bronze_badges, bs.tag_badges, hs.streak_increases, hs.peak_avg_score_last_10
+),
+top_posts as (
+  select
+    cast('post' as varchar(10)) as entity_type,
+    cast(r.post_id as bigint) as id,
+    cast(null as int) as user_id,
+    r.composite_score as metric,
+    r.category_label as label,
+    r.rank_within_type as rank_order
+  from ranked r
+  where r.rank_within_type <= 50
+),
+top_users as (
+  select
+    cast('user' as varchar(10)) as entity_type,
+    cast(us.user_id as bigint) as id,
+    us.user_id as user_id,
+    coalesce(us.total_composite_score,0) + coalesce(us.reputation / 10.0, 0) as metric,
+    'UserScore' as label,
+    dense_rank() over (order by coalesce(us.total_composite_score,0) + coalesce(us.reputation / 10.0, 0) desc, us.user_id) as rank_order
+  from user_summary us
+),
+unioned as (
+  select * from top_posts
+  union all
+  select * from top_users
+)
+select
+  u.entity_type,
+  u.id,
+  u.user_id,
+  round(cast(u.metric as numeric), 3) as metric,
+  u.label,
+  u.rank_order,
+  (
+    select count(*) from comments c
+    where u.entity_type = 'post' and c.postid = u.id
+  ) as comment_count_if_post,
+  (
+    select count(*) from posts p
+    where u.entity_type = 'user' and p.owneruserid = u.user_id
+  ) as post_count_if_user,
+  case
+    when u.entity_type = 'post' and exists (
+      select 1 from posts p
+      where p.id = u.id
+        and (p.title ilike any (array['%help%', '%error%', '%exception%'])
+             or coalesce(p.tags,'') ilike '%<performance>%')
+    ) then 'Help/Perf Related Post'
+    when u.entity_type = 'user' and exists (
+      select 1 from users uu
+      where uu.id = u.user_id
+        and (coalesce(nullif(uu.websiteurl,''), nullif(uu.location,'')) is not null)
+    ) then 'User with Web/Location'
+    else 'General'
+  end as classification
+from unioned u
+order by entity_type, rank_order, id;

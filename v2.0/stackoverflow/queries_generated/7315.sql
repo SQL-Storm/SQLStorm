@@ -1,0 +1,205 @@
+-- {"query": "7315.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1890} 
+WITH PostStats AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Title,
+        p.Tags,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 1 
+            ELSE 0 
+        END AS HasAcceptedAnswer,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN 'Question' 
+            WHEN p.PostTypeId = 2 THEN 'Answer' 
+            ELSE 'Other' 
+        END AS PostCategory,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL THEN 1 
+            ELSE 0 
+        END AS IsClosed,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 
+                (SELECT COUNT(*) FROM Posts WHERE ParentId = p.Id AND PostTypeId = 2) 
+            ELSE 0 
+        END AS AnswerCountActual,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) AS ScoreRank,
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.ViewCount DESC) AS ViewRank,
+        ROW_NUMBER() OVER (ORDER BY p.CreationDate ASC) AS ChronologicalOrder
+    FROM Posts p
+),
+UserActivity AS (
+    SELECT 
+        u.Id,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.AccountId,
+        u.CreationDate,
+        LAG(u.CreationDate, 1) OVER (ORDER BY u.CreationDate) AS PrevCreationDate,
+        DATEDIFF('day', LAG(u.CreationDate, 1) OVER (ORDER BY u.CreationDate), u.CreationDate) AS DaysSincePrevAccount,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Elite' 
+            WHEN u.Reputation > 5000 THEN 'Advanced' 
+            WHEN u.Reputation > 1000 THEN 'Intermediate' 
+            ELSE 'Beginner' 
+        END AS ReputationLevel,
+        CASE 
+            WHEN u.AccountId IS NOT NULL THEN 'Linked' 
+            ELSE 'Unlinked' 
+        END AS AccountStatus
+    FROM Users u
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular' 
+            WHEN t.Count > 100 THEN 'Moderate' 
+            ELSE 'Niche' 
+        END AS PopularityTier,
+        COALESCE((SELECT COUNT(*) FROM Posts WHERE Tags LIKE '%' || t.TagName || '%'), 0) AS PostsUsingTag,
+        NULLIF(t.Count, 0) * 100.0 / NULLIF((SELECT SUM(Count) FROM Tags), 0) AS PercentageOfTotal,
+        CONCAT('Tag:', t.TagName, ' - ', t.Count, ' uses') AS TagSummary
+    FROM Tags t
+),
+QuestionComplexity AS (
+    SELECT 
+        ps.Id,
+        ps.Title,
+        ps.Score,
+        ps.AnswerCount,
+        ps.CommentCount,
+        ps.ViewCount,
+        ps.Tags,
+        LENGTH(ps.Tags) - LENGTH(REPLACE(ps.Tags, '>', '')) AS TagCount,
+        CASE 
+            WHEN ps.AnswerCount > 10 THEN 'Highly Active Question' 
+            WHEN ps.AnswerCount > 5 THEN 'Active Question' 
+            WHEN ps.AnswerCount > 0 THEN 'Basic Question' 
+            ELSE 'Unanswered Question' 
+        END AS QuestionActivityLevel,
+        CASE 
+            WHEN ps.CommentCount > 5 THEN 'Highly Discussed' 
+            WHEN ps.CommentCount > 2 THEN 'Discussed' 
+            ELSE 'Low Discussion' 
+        END AS DiscussionLevel,
+        CASE 
+            WHEN ps.Score > 50 THEN 'Highly Voted' 
+            WHEN ps.Score > 10 THEN 'Moderately Voted' 
+            ELSE 'Low Voted' 
+        END AS VotedLevel,
+        ps.Score * 1.0 / NULLIF(ps.AnswerCount + 1, 0) AS ScorePerAnswer,
+        CAST(EXTRACT(YEAR FROM ps.CreationDate) AS VARCHAR) || '-' || 
+        CAST(EXTRACT(MONTH FROM ps.CreationDate) AS VARCHAR) AS YearMonth
+    FROM PostStats ps
+    WHERE ps.PostTypeId = 1
+),
+AnswerQuality AS (
+    SELECT 
+        ps.Id,
+        ps.ParentId,
+        ps.OwnerUserId,
+        ps.Score,
+        ps.CreationDate,
+        ps.LastActivityDate,
+        ps.ViewCount,
+        ps.AnswerCountActual,
+        ps.PostCategory,
+        ps.IsClosed,
+        ROW_NUMBER() OVER (PARTITION BY ps.ParentId ORDER BY ps.Score DESC) AS RankByScore,
+        AVG(ps.Score) OVER (PARTITION BY ps.ParentId) AS AvgScorePerQuestion,
+        (ps.Score - AVG(ps.Score) OVER (PARTITION BY ps.ParentId)) / NULLIF(STDDEV(ps.Score) OVER (PARTITION BY ps.ParentId), 0) AS ZScore,
+        CASE 
+            WHEN ps.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 2 AND ParentId = ps.ParentId) THEN 'Above Average' 
+            ELSE 'Below Average' 
+        END AS ScoreStatus,
+        ps.Score * 1.0 / NULLIF(ps.ViewCount + 1, 0) AS ScorePerView,
+        DATEDIFF('day', ps.CreationDate, ps.LastActivityDate) AS DaysSinceActivity
+    FROM PostStats ps
+    WHERE ps.PostTypeId = 2
+)
+SELECT 
+    qc.Id AS QuestionId,
+    qc.Title,
+    qc.Score,
+    qc.AnswerCountActual,
+    qc.TagCount,
+    qc.QuestionActivityLevel,
+    qc.DiscussionLevel,
+    qc.VotedLevel,
+    qc.ScorePerAnswer,
+    qa.Id AS AnswerId,
+    qa.OwnerUserId AS AnswererId,
+    qa.Score AS AnswerScore,
+    qa.ScorePerView,
+    CASE 
+        WHEN qa.RankByScore = 1 AND qc.AnswerCountActual > 0 THEN 'Best Answer' 
+        WHEN qa.RankByScore <= 3 THEN 'Good Answer' 
+        WHEN qa.Score > 0 THEN 'Positive Answer' 
+        ELSE 'Low Scoring Answer' 
+    END AS AnswerQuality,
+    qa.ScoreStatus,
+    qa.ZScore,
+    COALESCE(u.DisplayName, 'Anonymous') AS AnswererName,
+    u.Reputation AS AnswererReputation,
+    ta.TagSummary,
+    ta.PopularityTier,
+    CASE 
+        WHEN qa.DaysSinceActivity < 1 THEN 'Recently Active' 
+        WHEN qa.DaysSinceActivity < 7 THEN 'Active Recent' 
+        WHEN qa.DaysSinceActivity < 30 THEN 'Active' 
+        ELSE 'Inactive' 
+    END AS AnswerActivityStatus,
+    CASE 
+        WHEN qc.ScorePerAnswer > 10.0 THEN 'Excellent' 
+        WHEN qc.ScorePerAnswer > 5.0 THEN 'Good' 
+        WHEN qc.ScorePerAnswer > 2.0 THEN 'Moderate' 
+        ELSE 'Poor' 
+    END AS QuestionQuality,
+    CONCAT(
+        'Question: ', qc.Title, 
+        ' | Answers: ', qc.AnswerCountActual, 
+        ' | Tags: ', qc.TagCount
+    ) AS QuestionSummary
+FROM QuestionComplexity qc
+LEFT JOIN AnswerQuality qa ON qc.Id = qa.ParentId
+LEFT JOIN Users u ON qa.OwnerUserId = u.Id
+LEFT JOIN (
+    SELECT DISTINCT TagName, TagSummary, PopularityTier 
+    FROM TagAnalysis 
+    WHERE TagName IS NOT NULL
+) ta ON qc.Tags ILIKE '%' || ta.TagName || '%'
+WHERE 
+    qc.AnswerCountActual >= 1 
+    AND (qc.DiscussionLevel IN ('Highly Discussed', 'Discussed') OR qc.VotedLevel IN ('Highly Voted', 'Moderately Voted'))
+    AND (
+        CASE WHEN qa.ScoreStatus = 'Above Average' THEN 1 ELSE 0 END + 
+        CASE WHEN qc.ScorePerAnswer > 10.0 THEN 1 ELSE 0 END + 
+        CASE WHEN ta.PopularityTier = 'Popular' THEN 1 ELSE 0 END
+    ) >= 2
+    AND (
+        qa.Score IS NOT NULL 
+        OR qc.Id IN (
+            SELECT p.Id 
+            FROM Posts p 
+            WHERE p.PostTypeId = 1 
+            AND p.LastActivityDate > CURRENT_TIMESTAMP - INTERVAL '7 days'
+        )
+    )
+ORDER BY qc.Score DESC, qc.AnswerCountActual DESC, qa.Score DESC, ta.PopularityTier DESC
+LIMIT 1000;

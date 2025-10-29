@@ -1,0 +1,253 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.LastActivityDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) as total_posts_by_user,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as avg_score_by_user,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+        CASE 
+            WHEN p.Score > 100 THEN 'High'
+            WHEN p.Score > 50 THEN 'Medium'
+            ELSE 'Low'
+        END as score_category,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags <> '' THEN 
+                CASE 
+                    WHEN LENGTH(p.Tags) - LENGTH(REPLACE(p.Tags, '><', '')) > 0 THEN 
+                        LENGTH(p.Tags) - LENGTH(REPLACE(p.Tags, '><', '')) + 1
+                    ELSE 1
+                END
+            ELSE 0
+        END as tag_count,
+        CASE
+            WHEN p.OwnerUserId IS NOT NULL AND p.OwnerUserId > 0 THEN 
+                (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2)
+            ELSE 0
+        END as upvotes_on_post
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserActivity AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.CreationDate as user_created,
+        u.LastAccessDate,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT r.Id) as post_count,
+        SUM(CASE WHEN r.PostTypeId = 1 THEN 1 ELSE 0 END) as question_count,
+        SUM(CASE WHEN r.PostTypeId = 2 THEN 1 ELSE 0 END) as answer_count,
+        SUM(r.Score) as total_score,
+        AVG(r.Score) as avg_score,
+        MAX(r.CreationDate) as last_post_date,
+        CASE WHEN SUM(r.Score) > 0 AND SUM(r.ViewCount) > 0 THEN CAST(SUM(r.Score) AS DOUBLE PRECISION) / CAST(SUM(r.ViewCount) AS DOUBLE PRECISION) ELSE 0 END as score_to_view_ratio,
+        CASE WHEN MAX(r.CreationDate) > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30 days') OR MAX(r.LastActivityDate) > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30 days') THEN 'Active' ELSE 'Inactive' END as user_status
+    FROM Users u
+    LEFT JOIN RankedPosts r ON u.Id = r.OwnerUserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes
+),
+TagAnalysis AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE WHEN t.Count > 100 THEN 'Popular' WHEN t.Count > 50 THEN 'Moderate' ELSE 'Rare' END as tag_popularity,
+        t.IsRequired,
+        t.IsModeratorOnly,
+        CASE 
+            WHEN (CASE WHEN t.IsRequired IS TRUE THEN 1 ELSE 0 END) = 1 AND (CASE WHEN t.IsModeratorOnly IS TRUE THEN 1 ELSE 0 END) = 1 THEN 'Special'
+            WHEN (CASE WHEN t.IsRequired IS TRUE THEN 1 ELSE 0 END) = 1 THEN 'Required'
+            WHEN (CASE WHEN t.IsModeratorOnly IS TRUE THEN 1 ELSE 0 END) = 1 THEN 'ModeratorOnly'
+            ELSE 'Regular' 
+        END as tag_type
+    FROM Tags t
+),
+PostWithStats AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        r.rn,
+        r.total_posts_by_user,
+        r.avg_score_by_user,
+        CASE 
+            WHEN r.score_category = 'High' THEN 
+                CASE WHEN p.Score > r.avg_score_by_user THEN 'Above Avg' ELSE 'Below Avg' END
+            ELSE 'Normal'
+        END as score_vs_avg,
+        CASE WHEN p.LastActivityDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '7 days') THEN 'Recently Active' ELSE 'Inactive' END as post_status,
+        p.OwnerDisplayName,
+        CASE 
+            WHEN p.OwnerUserId IS NOT NULL THEN 
+                CASE WHEN p.OwnerUserId IN (SELECT Id FROM Users WHERE Reputation > 100000) THEN 'HighRepUser' ELSE 'RegularUser' END
+            ELSE 'DeletedUser'
+        END as user_category,
+        COALESCE(p.Tags, '') as normalized_tags,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AnswerCount = 0 THEN 'No Answers'
+            WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Answered' ELSE 'Unanswered' END
+            ELSE 'Not a Question'
+        END as question_status,
+        CASE WHEN EXISTS (
+            SELECT 1 FROM PostLinks pl 
+            WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3) THEN 'Duplicate' ELSE 'Original' END as duplication_status,
+        p.LastActivityDate as p_last_activity_date,
+        p.OwnerUserId
+    FROM Posts p
+    INNER JOIN RankedPosts r ON p.Id = r.Id
+    WHERE p.PostTypeId IN (1, 2)
+),
+FilteredUserPosts AS (
+    SELECT 
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.user_created,
+        ua.last_post_date,
+        ua.post_count,
+        ua.question_count,
+        ua.answer_count,
+        ua.total_score,
+        ua.avg_score,
+        ua.user_status,
+        CASE WHEN ua.Reputation > 10000 THEN 'Gold' WHEN ua.Reputation > 1000 THEN 'Silver' ELSE 'Bronze' END as reputation_tier,
+        CASE 
+            WHEN ua.post_count > 100 AND ua.avg_score > 50 THEN 'Highly Active'
+            WHEN ua.post_count > 50 AND ua.avg_score > 25 THEN 'Moderately Active'
+            ELSE 'Casual'
+        END as engagement_level
+    FROM UserActivity ua
+    WHERE ua.user_status = 'Active' AND ua.post_count > 10
+),
+FinalAnalysis AS (
+    SELECT 
+        fup.UserId,
+        fup.DisplayName,
+        fup.Reputation,
+        fup.user_created,
+        fup.last_post_date,
+        fup.post_count,
+        fup.question_count,
+        fup.answer_count,
+        fup.total_score,
+        fup.avg_score,
+        fup.user_status,
+        fup.reputation_tier,
+        fup.engagement_level,
+        pws.PostId,
+        pws.Title,
+        pws.Tags,
+        pws.Score,
+        pws.ViewCount,
+        pws.CreationDate,
+        pws.PostTypeId,
+        pws.question_status,
+        pws.duplication_status,
+        pws.score_vs_avg,
+        pws.post_status,
+        pws.user_category,
+        CASE 
+            WHEN pws.normalized_tags <> '' AND POSITION('>' IN pws.normalized_tags) > 0 THEN 
+                SUBSTRING(pws.normalized_tags FROM 2)
+            ELSE pws.normalized_tags 
+        END as clean_tags,
+        CASE WHEN pws.Score > 100 OR pws.ViewCount > 1000 THEN 'Popular Post' ELSE 'Regular Post' END as post_quality,
+        ROW_NUMBER() OVER (PARTITION BY fup.UserId ORDER BY pws.CreationDate DESC) as user_post_rank,
+        CASE WHEN pws.p_last_activity_date > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '14 days') THEN 'Hot' ELSE 'Cold' END as time_sensitivity,
+        COALESCE(pws.Title, 'Untitled Post') as processed_title,
+        pws.p_last_activity_date as LastActivityDate,
+        pws.normalized_tags,
+        pws.OwnerUserId
+    FROM FilteredUserPosts fup
+    INNER JOIN PostWithStats pws ON fup.UserId = pws.OwnerUserId
+    WHERE pws.PostTypeId IN (1, 2)
+)
+SELECT 
+    fa.UserId,
+    fa.DisplayName,
+    fa.Reputation,
+    fa.user_created,
+    fa.last_post_date,
+    fa.post_count,
+    fa.question_count,
+    fa.answer_count,
+    fa.total_score,
+    fa.avg_score,
+    fa.user_status,
+    fa.reputation_tier,
+    fa.engagement_level,
+    fa.PostId,
+    fa.Title,
+    fa.Tags,
+    fa.Score,
+    fa.ViewCount,
+    fa.CreationDate,
+    fa.PostTypeId,
+    fa.question_status,
+    fa.duplication_status,
+    fa.score_vs_avg,
+    fa.post_status,
+    fa.user_category,
+    fa.clean_tags,
+    fa.post_quality,
+    fa.user_post_rank,
+    fa.time_sensitivity,
+    fa.processed_title,
+    CASE 
+        WHEN fa.reputation_tier = 'Gold' AND fa.engagement_level = 'Highly Active' THEN 'Prime Contributor'
+        ELSE CASE WHEN fa.post_count > 100 THEN 'Experienced' WHEN fa.reputation > 1000 THEN 'Competent' ELSE 'Newbie' END
+    END as contributor_type,
+    CASE WHEN fa.total_score > 1000 AND fa.question_count > 50 THEN 'Elite' ELSE 'Standard' END as performance_level,
+    CASE WHEN fa.ViewCount < 100 THEN 'Low Visibility' WHEN fa.ViewCount < 1000 THEN 'Moderate Visibility' ELSE 'High Visibility' END as visibility_level,
+    TO_CHAR(fa.CreationDate, 'YYYY-MM-DD') as formatted_creation_date,
+    CAST(EXTRACT(EPOCH FROM (fa.last_post_date - fa.user_created)) / 86400 AS INTEGER) as days_active,
+    CASE 
+        WHEN fa.user_category = 'HighRepUser' AND fa.post_count > 50 THEN CONCAT('Active ', fa.reputation_tier, ' ', fa.engagement_level, ' Contributor')
+        ELSE CONCAT(fa.user_status, ' ', fa.engagement_level, ' Poster')
+    END as detailed_user_description,
+    CASE WHEN fa.engagement_level IN ('Highly Active', 'Moderately Active') AND (fa.question_status LIKE '%Answered%' OR fa.question_status LIKE '%Unanswered%') THEN 'Engaged Question Poster' ELSE 'Other' END as user_role,
+    COALESCE(fa.processed_title, '') as safe_title,
+    CASE WHEN fa.score_vs_avg = 'Above Avg' AND fa.post_quality = 'Popular Post' THEN 'Top Performer' WHEN fa.score_vs_avg = 'Below Avg' THEN 'Below Average' ELSE 'Standard' END as performance_marker,
+    (SELECT COUNT(*) FROM FinalAnalysis fa2 WHERE fa2.UserId = fa.UserId) as total_user_posts,
+    (SELECT AVG(Score) FROM FinalAnalysis fa3 WHERE fa3.UserId = fa.UserId) as avg_user_post_score,
+    CASE WHEN EXISTS(SELECT 1 FROM Posts p WHERE p.Id = fa.PostId AND p.CommentCount > 10) THEN 'High Comment Engagement' ELSE 'Standard Engagement' END as engagement_indicator,
+    CASE 
+        WHEN fa.reputation_tier = 'Gold' AND fa.engagement_level = 'Highly Active' AND fa.post_count > 100 THEN 'Elite Contributor'
+        WHEN fa.reputation_tier = 'Silver' AND fa.engagement_level = 'Highly Active' THEN 'Senior Contributor'
+        WHEN fa.reputation_tier = 'Bronze' AND fa.engagement_level = 'Moderately Active' THEN 'Intermediate Contributor'
+        ELSE 'Regular Contributor'
+    END as contributor_category
+FROM FinalAnalysis fa
+WHERE fa.engagement_level IN ('Highly Active', 'Moderately Active') 
+  AND fa.post_status = 'Recently Active'
+  AND (fa.question_status IN ('Answered', 'Unanswered') OR fa.question_status = 'No Answers')
+ORDER BY fa.total_score DESC, fa.CreationDate DESC
+OFFSET 1000 ROWS
+FETCH NEXT 500 ROWS ONLY;

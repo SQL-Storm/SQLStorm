@@ -1,0 +1,116 @@
+-- {"query": "5345.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 876} 
+WITH recent_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.AnswerCount
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= NOW() - INTERVAL '30 days'
+),
+tag_popularity AS (
+  SELECT
+    unnest(string_to_array(substr(t.TagName, 2, length(t.TagName)-2), '><')) AS tag,
+    t.Count AS TagCount
+  FROM Tags t
+  WHERE t.IsModeratorOnly = 0
+),
+top_tags AS (
+  SELECT
+    tp.tag,
+    SUM(tp.TagCount) AS total_count
+  FROM tag_popularity tp
+  GROUP BY tp.tag
+  ORDER BY total_count DESC
+  LIMIT 50
+),
+complex_joins AS (
+  SELECT
+    rq.PostId,
+    rq.Title,
+    rq.CreationDate,
+    rq.Views,
+    rq.Score,
+    rq.OwnerUserId,
+    rq.LastActivityDate,
+    rq.CommentCount,
+    rq.FavoriteCount,
+    rq.AnswerCount,
+    lv.DisplayName AS OwnerName,
+    lv.Reputation AS OwnerRep,
+    COALESCE(vt1.Name, 'Unknown') AS LastEditorVoteType,
+    v2.Name AS VoteTypeName,
+    cl.Name AS CloseReason
+  FROM recent_questions rq
+  LEFT JOIN Users lv ON rq.OwnerUserId = lv.Id
+  LEFT JOIN Votes v ON rq.PostId = v.PostId AND v.CreateDate = (
+    SELECT MAX(CreateDate) FROM Votes vv WHERE vv.PostId = rq.PostId
+  )
+  LEFT JOIN VoteTypes v2 ON v.VoteTypeId = v2.Id
+  LEFT JOIN PostHistory ph ON rq.PostId = ph.PostId
+    AND ph.PostHistoryTypeId = 10
+  LEFT JOIN CloseReasonTypes cl ON CAST(JSON_VALUE(ph.Text, '$.CloseReasonId') AS INT) = cl.Id
+  LEFT JOIN PostLinks pl ON rq.PostId = pl.PostId
+  LEFT JOIN Posts linked ON pl.RelatedPostId = linked.Id
+  LEFT JOIN (SELECT Id, Name FROM PostHistoryTypes) AS vt1 ON ph.PostHistoryTypeId = vt1.Id
+  WHERE ph.Id IS NULL OR ph.PostHistoryTypeId <> 10
+),
+windowed AS (
+  SELECT
+    cf.*,
+    ROW_NUMBER() OVER (
+      PARTITION BY cf.OwnerUserId
+      ORDER BY cf.CreationDate DESC
+    ) AS rn_within_owner
+  FROM complex_joins cf
+),
+aggregate AS (
+  SELECT
+    w.PostId,
+    w.Title,
+    w.CreationDate,
+    w.OwnerName,
+    w.OwnerRep,
+    w.LastActivityDate,
+    w.ViewCount,
+    w.Score,
+    w.CommentCount,
+    w.FavoriteCount,
+    w.AnswerCount,
+    w.LastEditorVoteType,
+    w.VoteTypeName,
+    w.CloseReason,
+    (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = w.OwnerUserId AND p2.PostTypeId = 1) AS QuestionsByOwner,
+    (SELECT COUNT(*) FROM PostLinks pl2 WHERE pl2.PostId = w.PostId) AS RelatedLinks
+  FROM windowed w
+  WHERE w.rn_within_owner = 1
+)
+SELECT
+  a.PostId,
+  a.Title,
+  a.CreationDate,
+  a.OwnerName,
+  a.OwnerRep,
+  a.LastActivityDate,
+  a.ViewCount,
+  a.Score,
+  a.CommentCount,
+  a.FavoriteCount,
+  a.AnswerCount,
+  a.LastEditorVoteType,
+  a.VoteTypeName,
+  a.CloseReason,
+  a.QuestionsByOwner,
+  a.RelatedLinks,
+  (SELECT STRING_AGG(t.tag, ',') FROM top_tags t WHERE t.total_count > 0) AS TopTags
+FROM aggregate a
+ORDER BY a.CreationDate DESC
+LIMIT 100;

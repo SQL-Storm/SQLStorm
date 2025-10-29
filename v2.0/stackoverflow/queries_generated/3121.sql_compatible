@@ -1,0 +1,131 @@
+WITH
+    user_stats AS (
+        SELECT
+            u.Id,
+            u.DisplayName,
+            u.Reputation,
+            COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS question_cnt,
+            COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS answer_cnt,
+            COUNT(DISTINCT c.Id) AS comment_cnt,
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvote_cnt,
+            SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvote_cnt
+        FROM Users u
+        LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+        LEFT JOIN Comments c ON c.UserId = u.Id
+        LEFT JOIN Votes v ON v.UserId = u.Id
+        GROUP BY u.Id, u.DisplayName, u.Reputation
+    ),
+    badge_agg AS (
+        SELECT
+            b.UserId,
+            -- use standard SQL list aggregation; fallback to GROUP_CONCAT for MySQL, LISTAGG for Oracle/ANSI
+            -- here we use LISTAGG syntax compatible with many systems; if not supported, replace with engine-specific function
+            LISTAGG(b.Name, ', ') WITHIN GROUP (ORDER BY b.Name) AS badge_list,
+            SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_cnt,
+            SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_cnt,
+            SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_cnt
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+    recent_q AS (
+        SELECT
+            p.OwnerUserId,
+            p.Title,
+            p.CreationDate,
+            ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+    ),
+    popular_tags AS (
+        SELECT
+            t.TagName,
+            COUNT(*) AS tag_use_cnt
+        FROM Posts p
+        CROSS JOIN LATERAL (
+            -- split tags like '<tag1><tag2>' into rows in a more portable way:
+            -- remove angle brackets then split on space; many dialects need a table-valued split function.
+            -- Here we use a generic approach assuming a STRING_SPLIT-like function named UNNEST_STRING_SPLIT(text, separator)
+            -- Replace UNNEST_STRING_SPLIT with the target DB's splitting function.
+            SELECT TRIM(value) AS value
+            FROM UNNEST_STRING_SPLIT(REPLACE(REPLACE(p.Tags, '<', ''), '>', ''), ' ') AS s(value)
+        ) s
+        JOIN Tags t ON t.TagName = s.value
+        GROUP BY t.TagName
+        HAVING COUNT(*) > 1000
+    ),
+    user_tag_activity AS (
+        SELECT
+            u.Id AS user_id,
+            pt.TagName,
+            SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS q_cnt,
+            SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS a_cnt
+        FROM Users u
+        JOIN Posts p ON p.OwnerUserId = u.Id
+        CROSS JOIN LATERAL (
+            SELECT TRIM(value) AS value
+            FROM UNNEST_STRING_SPLIT(REPLACE(REPLACE(p.Tags, '<', ''), '>', ''), ' ') AS s(value)
+        ) s
+        JOIN Tags t ON t.TagName = s.value
+        JOIN popular_tags pt ON pt.TagName = t.TagName
+        GROUP BY u.Id, pt.TagName
+    ),
+    user_top_tag AS (
+        SELECT
+            uta.user_id,
+            uta.TagName,
+            ROW_NUMBER() OVER (PARTITION BY uta.user_id ORDER BY (uta.q_cnt + uta.a_cnt) DESC) AS tag_rank
+        FROM user_tag_activity uta
+    ),
+    scoring AS (
+        SELECT
+            us.Id,
+            us.DisplayName,
+            us.Reputation,
+            us.question_cnt,
+            us.answer_cnt,
+            us.comment_cnt,
+            us.upvote_cnt,
+            us.downvote_cnt,
+            COALESCE(ba.gold_cnt, 0) AS gold_cnt,
+            COALESCE(ba.silver_cnt, 0) AS silver_cnt,
+            COALESCE(ba.bronze_cnt, 0) AS bronze_cnt,
+            COALESCE(ba.badge_list, '') AS badge_list,
+            rq.Title AS recent_question_title,
+            rq.CreationDate AS recent_question_date,
+            (us.Reputation * 0.15
+             + us.answer_cnt * 4
+             + us.question_cnt * 2
+             + COALESCE(ba.gold_cnt, 0) * 12
+             + COALESCE(ba.silver_cnt, 0) * 6
+             + COALESCE(ba.bronze_cnt, 0) * 2) AS composite_score
+        FROM user_stats us
+        LEFT JOIN badge_agg ba ON ba.UserId = us.Id
+        LEFT JOIN recent_q rq ON rq.OwnerUserId = us.Id AND rq.rn = 1
+    )
+
+SELECT
+    s.Id,
+    s.DisplayName,
+    s.Reputation,
+    s.composite_score,
+    s.recent_question_title,
+    s.recent_question_date,
+    s.badge_list,
+    ut.TagName AS top_tag
+FROM scoring s
+LEFT JOIN user_top_tag ut
+    ON ut.user_id = s.Id AND ut.tag_rank = 1
+WHERE s.composite_score > (SELECT AVG(composite_score) FROM scoring)
+
+UNION ALL
+
+SELECT
+    CAST(NULL AS INTEGER) AS Id,
+    'TOTAL_USERS' AS DisplayName,
+    COUNT(*) AS Reputation,
+    CAST(NULL AS NUMERIC) AS composite_score,
+    CAST(NULL AS VARCHAR(4000)) AS recent_question_title,
+    CAST(NULL AS TIMESTAMP) AS recent_question_date,
+    CAST(NULL AS VARCHAR(4000)) AS badge_list,
+    CAST(NULL AS VARCHAR(4000)) AS top_tag
+FROM Users;

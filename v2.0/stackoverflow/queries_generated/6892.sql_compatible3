@@ -1,0 +1,69 @@
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id ELSE NULL END) AS TotalQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id ELSE NULL END) AS TotalAnswers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 3 THEN p.Id ELSE NULL END) AS TotalWikis,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.PostId ELSE NULL END) AS TotalUpVotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.PostId ELSE NULL END) AS TotalDownVotes,
+    MAX(p.Score) AS HighestScoredPost,
+    MIN(p.Score) AS LowestScoredPost,
+    STRING_AGG(DISTINCT t.TagName, ', ') AS MostCommonTags,
+    AVG(p.ViewCount) AS AvgViewCount,
+    SUM(p.AnswerCount) AS TotalAnswersCount,
+    MAX(ph.CreationDate) AS LastPostEdit,
+    COALESCE(SUM(b.Class), 0) AS TotalBadges,
+    AVG(CASE WHEN p.PostTypeId = 1 THEN p.AnswerCount ELSE 0 END) AS AvgAnswersPerQuestion
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN LATERAL (
+    SELECT t2.TagName
+    FROM Tags t2
+    WHERE EXISTS (
+        SELECT 1
+        FROM (
+            -- produce rows of tag ids as integers in a dialect-agnostic way
+            SELECT CAST(trim(element) AS INTEGER) AS tagid
+            FROM (
+                -- handle NULL or empty p.Tags
+                SELECT CASE
+                    WHEN p.Tags IS NULL OR p.Tags = '' THEN NULL
+                    ELSE trim(both '<' FROM p.Tags)
+                END AS trimmed
+            ) x,
+            LATERAL (
+                -- split on '><' producing text elements; adjust for dialects without string_to_array by using regexp_split_to_table where available
+                SELECT element
+                FROM (
+                    SELECT regexp_split_to_table(x.trimmed, '\>\<') AS element
+                    WHERE x.trimmed IS NOT NULL
+                ) y
+            ) z
+        ) taglist
+        WHERE taglist.tagid = t2.Id
+        LIMIT 1
+    )
+) t ON true
+WHERE 
+    u.Reputation > 1000
+    AND p.CreationDate >= (DATE_TRUNC('month', DATE '2024-10-01') - INTERVAL '1 year')
+GROUP BY 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.Location
+HAVING 
+    COUNT(DISTINCT p.Id) > 10
+ORDER BY 
+    u.Reputation DESC
+LIMIT 100;

@@ -1,0 +1,220 @@
+-- {"query": "1570.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3153} 
+
+WITH UserPostCommentCounts AS (
+    -- Calculate aggregated counts for posts and comments per user
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        COALESCE(COUNT(DISTINCT P.Id) FILTER (WHERE P.OwnerUserId IS NOT NULL), 0) AS TotalPosts,
+        COALESCE(SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END), 0) AS TotalQuestions,
+        COALESCE(SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END), 0) AS TotalAnswers,
+        COALESCE(COUNT(DISTINCT C.Id) FILTER (WHERE C.UserId IS NOT NULL), 0) AS TotalCommentsMade
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    GROUP BY U.Id, U.DisplayName
+),
+PostEditActivity AS (
+    -- Aggregate post history data for edits, closes, and reopens
+    SELECT
+        PH.PostId,
+        COUNT(PH.Id) AS TotalRevisions,
+        COUNT(DISTINCT PH.UserId) AS DistinctEditors,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.CreationDate ELSE NULL END) AS LastEditDate_Significant, -- Edit Title, Body, Tags
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (10, 11) THEN PH.CreationDate ELSE NULL END) AS LastCloseReopenDate -- Post Closed, Post Reopened
+    FROM PostHistory AS PH
+    WHERE PH.PostHistoryTypeId IN (4, 5, 6, 10, 11, 12, 13) -- Including deleted/undeleted actions
+    GROUP BY PH.PostId
+),
+QuestionDetailedMetrics AS (
+    -- Detailed metrics for questions, including votes, links, and tag complexity
+    SELECT
+        Q.Id AS PostId,
+        Q.OwnerUserId,
+        Q.Score AS QuestionScore,
+        Q.ViewCount,
+        Q.FavoriteCount,
+        Q.AnswerCount,
+        -- Calculate number of tags from the Tags string
+        COALESCE(LENGTH(Q.Tags) - LENGTH(REPLACE(Q.Tags, '><', '')) + 1, 0) AS TagCount,
+        CASE
+            WHEN Q.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN Q.CommunityOwnedDate IS NOT NULL THEN 'CommunityOwned'
+            ELSE 'Open'
+        END AS Status,
+        SUM(CASE WHEN PL.LinkTypeId = 1 THEN 1 ELSE 0 END) AS LinkedPostsCount,
+        SUM(CASE WHEN PL.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicatePostsCount,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvoteCount,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvoteCount
+    FROM Posts AS Q
+    LEFT JOIN PostLinks AS PL ON Q.Id = PL.PostId
+    LEFT JOIN Votes AS V ON Q.Id = V.PostId AND V.VoteTypeId IN (2, 3) -- Only consider up/down votes
+    WHERE Q.PostTypeId = 1
+    GROUP BY Q.Id, Q.OwnerUserId, Q.Score, Q.ViewCount, Q.FavoriteCount, Q.AnswerCount, Q.Tags, Q.ClosedDate, Q.CommunityOwnedDate
+),
+AnswerDetailedMetrics AS (
+    -- Detailed metrics for answers, linking to parent questions and checking acceptance status
+    SELECT
+        A.Id AS PostId,
+        A.OwnerUserId,
+        A.Score AS AnswerScore,
+        A.ParentId AS QuestionId,
+        CASE WHEN A.Id = Q.AcceptedAnswerId THEN TRUE ELSE FALSE END AS IsAcceptedAnswer,
+        COALESCE(Q.ViewCount, 0) AS ParentQuestionViewCount,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvoteCount,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvoteCount
+    FROM Posts AS A
+    LEFT JOIN Posts AS Q ON A.ParentId = Q.Id -- Join to parent question to check AcceptedAnswerId
+    LEFT JOIN Votes AS V ON A.Id = V.PostId AND V.VoteTypeId IN (2, 3)
+    WHERE A.PostTypeId = 2
+    GROUP BY A.Id, A.OwnerUserId, A.Score, A.ParentId, Q.AcceptedAnswerId, Q.ViewCount
+),
+AllPostAggregatedMetrics AS (
+    -- Combine metrics for questions and answers into a single dataset using UNION ALL
+    SELECT
+        PostId,
+        OwnerUserId,
+        'Question' AS PostType,
+        QuestionScore AS Score,
+        ViewCount,
+        FavoriteCount,
+        AnswerCount AS RelatedPostsCount, -- Number of answers for a question
+        TagCount,
+        Status,
+        LinkedPostsCount,
+        DuplicatePostsCount,
+        UpvoteCount,
+        DownvoteCount,
+        NULL::BOOLEAN AS IsAccepted,
+        NULL::INT AS ParentPostViewCount
+    FROM QuestionDetailedMetrics
+    UNION ALL
+    SELECT
+        PostId,
+        OwnerUserId,
+        'Answer' AS PostType,
+        AnswerScore AS Score,
+        NULL AS ViewCount, -- Answers don't have their own direct ViewCount
+        NULL AS FavoriteCount,
+        NULL AS RelatedPostsCount, -- Not applicable for answers
+        NULL AS TagCount, -- Not applicable for answers
+        NULL AS Status, -- Not applicable for answers
+        NULL AS LinkedPostsCount,
+        NULL AS DuplicatePostsCount,
+        UpvoteCount,
+        DownvoteCount,
+        IsAcceptedAnswer AS IsAccepted,
+        ParentQuestionViewCount AS ParentPostViewCount
+    FROM AnswerDetailedMetrics
+),
+UserOverallPerformance AS (
+    -- Aggregate all post-related metrics per user, apply window functions and complex calculations
+    SELECT
+        UPC.UserId,
+        UPC.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        UPC.TotalPosts,
+        UPC.TotalQuestions,
+        UPC.TotalAnswers,
+        UPC.TotalCommentsMade,
+        COALESCE(SUM(APAM.Score), 0) AS TotalPostScore,
+        COALESCE(SUM(APAM.FavoriteCount), 0) AS TotalFavoriteCount,
+        COALESCE(SUM(APAM.ViewCount), 0) AS TotalQuestionViews,
+        COALESCE(AVG(APAM.Score) FILTER (WHERE APAM.PostType = 'Question'), 0.0) AS AvgQuestionScore,
+        COALESCE(AVG(APAM.Score) FILTER (WHERE APAM.PostType = 'Answer'), 0.0) AS AvgAnswerScore,
+        COALESCE(SUM(APAM.UpvoteCount), 0) AS TotalUpvotesReceived,
+        COALESCE(SUM(APAM.DownvoteCount), 0) AS TotalDownvotesReceived,
+        COALESCE(COUNT(DISTINCT PEA.PostId), 0) AS PostsWithHistory,
+        COALESCE(SUM(PEA.TotalRevisions), 0) AS TotalPostRevisions,
+        COALESCE(SUM(CASE WHEN APAM.PostType = 'Question' AND APAM.Status = 'Closed' THEN 1 ELSE 0 END), 0) AS TotalClosedQuestions,
+        -- Window function: Rank users by overall post score and total posts
+        RANK() OVER (ORDER BY COALESCE(SUM(APAM.Score), 0) DESC, UPC.TotalPosts DESC) AS RankByOverallScore,
+        -- Window function: Divide users into 10 groups based on reputation
+        NTILE(10) OVER (ORDER BY U.Reputation DESC) AS ReputationDecile,
+        -- Complex calculation: Engagement Ratio, handles division by zero using NULLIF
+        CAST(COALESCE(SUM(APAM.UpvoteCount) + SUM(APAM.DownvoteCount) + UPC.TotalCommentsMade * 2 + SUM(APAM.FavoriteCount) * 3, 0) AS DECIMAL) /
+        NULLIF( (COALESCE(UPC.TotalPosts, 0) + COALESCE(UPC.TotalCommentsMade, 0)), 0) AS EngagementRatio,
+        MAX(PEA.LastCloseReopenDate) AS LatestCloseOrReopenActivity
+    FROM UserPostCommentCounts AS UPC
+    INNER JOIN Users AS U ON UPC.UserId = U.Id -- Ensures only valid users are included
+    LEFT JOIN AllPostAggregatedMetrics AS APAM ON UPC.UserId = APAM.OwnerUserId
+    LEFT JOIN PostEditActivity AS PEA ON APAM.PostId = PEA.PostId
+    GROUP BY UPC.UserId, UPC.DisplayName, U.Reputation, U.CreationDate, UPC.TotalPosts, UPC.TotalQuestions, UPC.TotalAnswers, UPC.TotalCommentsMade
+),
+UserBadgeTimeline AS (
+    -- Analyze user badge acquisition timeline using window functions
+    SELECT
+        B.UserId,
+        B.Name AS BadgeName,
+        B.Date AS BadgeDate,
+        ROW_NUMBER() OVER (PARTITION BY B.UserId ORDER BY B.Date ASC) AS Rn, -- Assign a rank to each badge for a user
+        LAG(B.Date, 1, B.Date) OVER (PARTITION BY B.UserId ORDER BY B.Date ASC) AS PreviousBadgeDate, -- Date of the previous badge
+        LEAD(B.Date, 1, B.Date) OVER (PARTITION BY B.UserId ORDER BY B.Date ASC) AS NextBadgeDate -- Date of the next badge
+    FROM Badges AS B
+)
+-- Final selection combining all CTEs with additional user details and correlated subqueries
+SELECT
+    UOP.UserId,
+    UOP.DisplayName,
+    UOP.Reputation,
+    UOP.UserCreationDate,
+    UOP.TotalPosts,
+    UOP.TotalQuestions,
+    UOP.TotalAnswers,
+    UOP.TotalCommentsMade,
+    UOP.TotalPostScore,
+    UOP.AvgQuestionScore,
+    UOP.AvgAnswerScore,
+    UOP.TotalUpvotesReceived,
+    UOP.TotalDownvotesReceived,
+    UOP.PostsWithHistory,
+    UOP.TotalPostRevisions,
+    UOP.TotalClosedQuestions,
+    UOP.RankByOverallScore,
+    UOP.ReputationDecile,
+    UOP.EngagementRatio,
+    UOP.LatestCloseOrReopenActivity,
+    COALESCE(U.WebsiteUrl, 'N/A') AS UserWebsiteUrl, -- NULL logic, string expression
+    COALESCE(U.Location, 'Unknown') AS UserLocation, -- NULL logic, string expression
+    -- Correlated subquery to find the first badge earned by the user
+    (SELECT UBT.BadgeName FROM UserBadgeTimeline AS UBT WHERE UBT.UserId = UOP.UserId AND UBT.Rn = 1) AS FirstBadgeName,
+    (SELECT UBT.BadgeDate FROM UserBadgeTimeline AS UBT WHERE UBT.UserId = UOP.UserId AND UBT.Rn = 1) AS FirstBadgeDate,
+    -- Correlated subquery with string manipulation to find the user's top contributing tag
+    (
+        SELECT
+            T.TagName
+        FROM Posts AS P_tags
+        CROSS JOIN LATERAL UNNEST(string_to_array(substring(P_tags.Tags, 2, length(P_tags.Tags)-2), '><')) AS Tag_name_array -- string_to_array, substring
+        JOIN Tags AS T ON Tag_name_array = T.TagName
+        WHERE P_tags.OwnerUserId = UOP.UserId
+          AND P_tags.PostTypeId = 1 -- Only questions have tags in this context
+          AND P_tags.Tags IS NOT NULL
+        GROUP BY T.TagName
+        ORDER BY COUNT(P_tags.Id) DESC, SUM(P_tags.Score) DESC
+        LIMIT 1
+    ) AS TopContributingTag,
+    -- Correlated subquery to find the title of the user's latest question
+    (
+        SELECT
+            P_recent.Title
+        FROM Posts AS P_recent
+        WHERE P_recent.OwnerUserId = UOP.UserId AND P_recent.PostTypeId = 1
+        ORDER BY P_recent.CreationDate DESC
+        LIMIT 1
+    ) AS LatestQuestionTitle,
+    -- Complicated predicate/expression/calculation (CASE statement) for user categorization
+    CASE
+        WHEN UOP.TotalQuestions > 0 AND UOP.AvgQuestionScore > 10 THEN 'High-Impact Questioner'
+        WHEN UOP.TotalAnswers > 0 AND UOP.AvgAnswerScore > 5 AND UOP.TotalPosts > UOP.TotalQuestions THEN 'Valuable Answerer'
+        WHEN UOP.TotalPosts = 0 AND UOP.TotalCommentsMade > 0 THEN 'Commenter Only'
+        WHEN UOP.TotalPosts > 0 AND UOP.TotalCommentsMade = 0 THEN 'Content Creator (No Comments)'
+        ELSE 'General Contributor'
+    END AS UserCategory,
+    -- Date calculation: years active since creation
+    EXTRACT(EPOCH FROM (NOW() - UOP.UserCreationDate)) / (60 * 60 * 24 * 365.25) AS YearsActive
+FROM UserOverallPerformance AS UOP
+LEFT JOIN Users AS U ON UOP.UserId = U.Id -- Join again to get WebsiteUrl and Location
+WHERE UOP.Reputation > 100 AND UOP.TotalPosts > 0 -- Filter for more active/reputable users
+ORDER BY UOP.Reputation DESC, UOP.EngagementRatio DESC
+LIMIT 1000;

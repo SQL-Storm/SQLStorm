@@ -1,0 +1,216 @@
+WITH UserEngagementSummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate,
+        U.LastAccessDate,
+        COUNT(DISTINCT P.Id) AS TotalPostsCreated,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestionsAsked,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswersGiven,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        SUM(P.Score) AS TotalPostScoreReceived,
+        SUM(COALESCE(P.ViewCount, 0)) AS TotalPostViewsGenerated,
+        COUNT(DISTINCT B.Id) AS TotalBadgesEarned,
+        MAX(P.LastActivityDate) AS LastUserPostActivityDate,
+        AVG(CASE WHEN P.PostTypeId = 1 THEN P.Score ELSE NULL END) AS AvgQuestionScore,
+        AVG(CASE WHEN P.PostTypeId = 2 THEN P.Score ELSE NULL END) AS AvgAnswerScore,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) AND PH.UserId = U.Id THEN PH.Id END) AS PostsEditedByOwnerCount,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesGiven,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesGiven
+    FROM
+        Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    LEFT JOIN Votes V ON U.Id = V.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate
+),
+PostContentMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        P.PostTypeId,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.FavoriteCount,
+        P.CreationDate AS PostCreationDate,
+        P.LastActivityDate AS PostLastActivityDate,
+        P.ClosedDate,
+        (P.Score * 0.75) + (COALESCE(P.ViewCount, 0) * 0.05) + (COALESCE(P.AnswerCount, 0) * 2) + (COALESCE(P.FavoriteCount, 0) * 5) +
+        CASE
+            WHEN P.PostTypeId = 1 AND LENGTH(P.Body) < 200 THEN -10
+            WHEN P.PostTypeId = 1 AND LENGTH(P.Title) < 15 THEN -5
+            ELSE 0
+        END AS ContentQualityScore,
+        CASE
+            WHEN P.Tags IS NULL OR LENGTH(TRIM(P.Tags)) < 3 THEN NULL
+            ELSE string_to_array(substring(P.Tags FROM 2 FOR (char_length(P.Tags) - 2)), '><')
+        END AS TagArray
+    FROM
+        Posts P
+    WHERE
+        P.PostTypeId IN (1, 2)
+),
+TagPerformance AS (
+    SELECT
+        PCM.PostId,
+        PCM.OwnerUserId,
+        T.TagName,
+        PCM.PostTypeId,
+        PCM.ContentQualityScore,
+        PCM.PostScore
+    FROM
+        PostContentMetrics PCM,
+        unnest(PCM.TagArray) AS T(TagName)
+    WHERE
+        PCM.TagArray IS NOT NULL
+),
+UserTagDominance AS (
+    SELECT
+        TP.OwnerUserId AS UserId,
+        TP.TagName,
+        COUNT(TP.PostId) AS PostsInTag,
+        SUM(COALESCE(TP.ContentQualityScore,0)) AS TotalTagQualityContribution,
+        AVG(COALESCE(TP.PostScore,0)) AS AvgScoreInTag,
+        ROW_NUMBER() OVER (PARTITION BY TP.OwnerUserId ORDER BY SUM(COALESCE(TP.ContentQualityScore,0)) DESC, COUNT(TP.PostId) DESC) AS TagRank
+    FROM
+        TagPerformance TP
+    GROUP BY
+        TP.OwnerUserId, TP.TagName
+),
+PostLinkInfluence AS (
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        COUNT(PL.Id) AS TotalLinks,
+        SUM(CASE WHEN PL.LinkTypeId = 1 THEN 1 ELSE 0 END) AS LinkedFromCount,
+        SUM(CASE WHEN PL.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicateOfCount,
+        (SELECT CASE WHEN COUNT(DISTINCT P2.Id) > 0 THEN 1 ELSE 0 END
+         FROM PostLinks PL2
+         JOIN Posts P2 ON PL2.RelatedPostId = P2.Id
+         WHERE PL2.PostId = P.Id
+           AND P2.Score > P.Score * 1.5
+           AND P2.OwnerUserId IS NOT NULL
+           AND P2.OwnerUserId != P.OwnerUserId) AS HasHigherScoringExternalLink
+    FROM
+        Posts P
+    LEFT JOIN PostLinks PL ON P.Id = PL.PostId
+    WHERE P.PostTypeId = 1
+    GROUP BY
+        P.Id, P.OwnerUserId, P.Score
+),
+QuestionClosureMetrics AS (
+    SELECT
+        P.Id AS QuestionId,
+        P.OwnerUserId,
+        P.CreationDate,
+        P.ClosedDate,
+        MAX(PH.CreationDate) AS LastClosureEventDate,
+        MAX(CASE
+            WHEN PH.PostHistoryTypeId = 10 AND PH.Comment IS NOT NULL THEN 'Closed: ' || COALESCE(CR.Name, 'Unknown Reason')
+            WHEN PH.PostHistoryTypeId = 11 THEN 'Reopened'
+            WHEN PH.PostHistoryTypeId = 12 THEN 'Deleted'
+            WHEN PH.PostHistoryTypeId = 13 THEN 'Undeleted'
+            ELSE NULL
+        END) AS LatestClosureAction,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.Id END) AS CloseVoteHistoryCount,
+        (SELECT CASE WHEN COUNT(DISTINCT PL_DUP.RelatedPostId) > 0 THEN 1 ELSE 0 END
+         FROM PostHistory PH_DUP
+         JOIN PostLinks PL_DUP ON P.Id = PL_DUP.PostId
+         JOIN Posts P_DUP ON PL_DUP.RelatedPostId = P_DUP.Id
+         WHERE PH_DUP.PostId = P.Id
+           AND PH_DUP.PostHistoryTypeId = 10
+           AND PH_DUP.Comment = '101'
+           AND PL_DUP.LinkTypeId = 3
+           AND P_DUP.Score > P.Score
+        ) AS ClosedAsDuplicateToBetterQuestion
+    FROM
+        Posts P
+    JOIN PostHistory PH ON P.Id = PH.PostId
+    LEFT JOIN CloseReasonTypes CR ON PH.Comment = CAST(CR.Id AS text) AND PH.PostHistoryTypeId = 10
+    WHERE
+        P.PostTypeId = 1
+        AND PH.PostHistoryTypeId IN (10, 11, 12, 13)
+    GROUP BY
+        P.Id, P.OwnerUserId, P.CreationDate, P.ClosedDate
+)
+SELECT
+    UES.UserId,
+    UES.DisplayName,
+    UES.Reputation,
+    UES.TotalPostsCreated,
+    UES.TotalQuestionsAsked,
+    UES.TotalAnswersGiven,
+    UES.TotalCommentsMade,
+    UES.TotalPostScoreReceived,
+    UES.TotalPostViewsGenerated,
+    UES.TotalBadgesEarned,
+    UES.AvgQuestionScore,
+    UES.AvgAnswerScore,
+    UES.PostsEditedByOwnerCount,
+    CASE
+        WHEN UES.LastAccessDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 month' AND UES.LastUserPostActivityDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 month' THEN 'Highly Active'
+        WHEN UES.LastAccessDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 months' OR UES.LastUserPostActivityDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 months' THEN 'Moderately Active'
+        WHEN UES.LastAccessDate IS NULL AND UES.LastUserPostActivityDate IS NULL THEN 'Inactive (No Known Activity)'
+        ELSE 'Infrequently Active'
+    END AS UserActivityStatus,
+    MAX(CASE WHEN UTD.TagRank = 1 THEN UTD.TagName END) AS TopTag1,
+    MAX(CASE WHEN UTD.TagRank = 1 THEN UTD.TotalTagQualityContribution END) AS TopTag1_QualityScore,
+    MAX(CASE WHEN UTD.TagRank = 2 THEN UTD.TagName END) AS TopTag2,
+    MAX(CASE WHEN UTD.TagRank = 2 THEN UTD.TotalTagQualityContribution END) AS TopTag2_QualityScore,
+    MAX(CASE WHEN UTD.TagRank = 3 THEN UTD.TagName END) AS TopTag3,
+    MAX(CASE WHEN UTD.TagRank = 3 THEN UTD.TotalTagQualityContribution END) AS TopTag3_QualityScore,
+    SUM(COALESCE(PLI.TotalLinks, 0)) AS TotalLinkedPostsByOwner,
+    SUM(COALESCE(PLI.LinkedFromCount, 0)) AS TotalQuestionsLinkedFrom,
+    SUM(COALESCE(PLI.DuplicateOfCount, 0)) AS TotalQuestionsMarkedAsDuplicate,
+    SUM(CASE WHEN PLI.HasHigherScoringExternalLink = 1 THEN 1 ELSE 0 END) AS QuestionsLinkingToBetterContent,
+    SUM(CASE WHEN QCM.ClosedDate IS NOT NULL THEN 1 ELSE 0 END) AS QuestionsActuallyClosedCount,
+    string_agg(DISTINCT QCM.LatestClosureAction, '; ') FILTER (WHERE QCM.LatestClosureAction IS NOT NULL) AS DistinctClosureActionDetails,
+    SUM(CASE WHEN QCM.ClosedAsDuplicateToBetterQuestion = 1 THEN 1 ELSE 0 END) AS QuestionsClosedToBetterDuplicates,
+    DENSE_RANK() OVER (ORDER BY
+        (UES.Reputation * 0.1) +
+        (UES.TotalPostScoreReceived * 0.5) +
+        (UES.TotalPostViewsGenerated * 0.01) +
+        (UES.TotalBadgesEarned * 10) +
+        (COALESCE(SUM(UTD.TotalTagQualityContribution) OVER (PARTITION BY UES.UserId),0) * 0.05) +
+        (COALESCE(SUM(PCM.ContentQualityScore) OVER (PARTITION BY UES.UserId),0) * 0.1)
+        DESC, UES.DisplayName ASC
+    ) AS HolisticEngagementRank,
+    AVG(COALESCE(PCM.ContentQualityScore, 0)) OVER (PARTITION BY (UES.Reputation / 10000)) AS AvgContentQualityInRepTier,
+    COALESCE(
+        'User ' || UES.DisplayName || ' (ID: ' || UES.UserId || ') - ' ||
+        CASE
+            WHEN UES.TotalQuestionsAsked > 0 AND UES.TotalAnswersGiven > 0 AND UES.TotalCommentsMade > 0 THEN 'Multi-faceted Contributor'
+            WHEN UES.TotalQuestionsAsked > 0 THEN 'Primary Questioner'
+            WHEN UES.TotalAnswersGiven > 0 THEN 'Primary Answerer'
+            ELSE 'Passive Member'
+        END ||
+        ' (Rep: ' || UES.Reputation || ', Posts: ' || UES.TotalPostsCreated || ')',
+        'Unknown User Profile'
+    ) AS UserProfileSummary,
+    CASE
+        WHEN UES.TotalAnswersGiven > 10 AND UES.AvgAnswerScore < 0 AND UES.PostsEditedByOwnerCount < UES.TotalAnswersGiven * 0.1 THEN 'LowQualityAnswerer'
+        WHEN UES.TotalQuestionsAsked > 5 AND SUM(CASE WHEN QCM.ClosedAsDuplicateToBetterQuestion = 1 THEN 1 ELSE 0 END) OVER (PARTITION BY UES.UserId) > UES.TotalQuestionsAsked * 0.4 THEN 'FrequentDuplicateQuestioner'
+        WHEN UES.TotalUpvotesGiven = 0 AND UES.TotalDownvotesGiven > 0 AND UES.Reputation < 100 THEN 'NegativeVoterNoContribution'
+        ELSE NULL
+    END AS UserBehaviorFlag
+FROM
+    UserEngagementSummary UES
+LEFT JOIN UserTagDominance UTD ON UES.UserId = UTD.UserId
+LEFT JOIN PostLinkInfluence PLI ON UES.UserId = PLI.OwnerUserId
+LEFT JOIN QuestionClosureMetrics QCM ON UES.UserId = QCM.OwnerUserId
+LEFT JOIN PostContentMetrics PCM ON UES.UserId = PCM.OwnerUserId
+GROUP BY
+    UES.UserId, UES.DisplayName, UES.Reputation, UES.CreationDate, UES.LastAccessDate,
+    UES.TotalPostsCreated, UES.TotalQuestionsAsked, UES.TotalAnswersGiven, UES.TotalCommentsMade,
+    UES.TotalPostScoreReceived, UES.TotalPostViewsGenerated, UES.TotalBadgesEarned,
+    UES.LastUserPostActivityDate, UES.AvgQuestionScore, UES.AvgAnswerScore, UES.PostsEditedByOwnerCount,
+    UES.TotalUpvotesGiven, UES.TotalDownvotesGiven,
+    (UES.Reputation / 10000)
+ORDER BY
+    HolisticEngagementRank ASC, UES.Reputation DESC
+LIMIT 1000;

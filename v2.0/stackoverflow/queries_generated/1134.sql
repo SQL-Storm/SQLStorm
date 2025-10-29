@@ -1,0 +1,237 @@
+-- {"query": "1134.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 4346} 
+
+WITH UserActivitySummary AS (
+    -- Summarize user post and comment activity, score, and last active date
+    SELECT
+        U.Id AS UserId,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        COALESCE(SUM(P.Score), 0) AS TotalPostScore,
+        COALESCE(SUM(P.ViewCount), 0) AS TotalPostViewCount,
+        MAX(P.LastActivityDate) AS LastPostActivity,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COALESCE(SUM(C.Score), 0) AS TotalCommentScore,
+        MAX(C.CreationDate) AS LastCommentActivity
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    GROUP BY U.Id
+),
+PostTagAnalysis AS (
+    -- Analyze tags for questions, count unique tags, and check for specific tags
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId AS PostOwnerId,
+        P.CreationDate AS PostCreationDate,
+        P.Title,
+        P.Tags,
+        COALESCE(ARRAY_LENGTH(string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><'), 1), 0) AS UniqueTagCount,
+        MAX(CASE WHEN P.Tags LIKE '%<sql>%' OR P.Tags LIKE '%<database>%' THEN 1 ELSE 0 END) AS IsSqlOrDbRelated,
+        MAX(CASE WHEN P.Tags LIKE '%<performance>%' OR P.Tags LIKE '%<optimization>%' THEN 1 ELSE 0 END) AS IsPerformanceRelated,
+        STRING_AGG(DISTINCT T.TagName, ';') FILTER (WHERE T.TagName IS NOT NULL) AS AssociatedTagNames
+    FROM Posts AS P
+    LEFT JOIN (
+        -- Inline subquery to unnest tags for joining with Tags table
+        SELECT P2.Id, unnest(string_to_array(SUBSTRING(P2.Tags, 2, LENGTH(P2.Tags) - 2), '><')) AS TagName
+        FROM Posts P2
+        WHERE P2.Tags IS NOT NULL AND P2.PostTypeId = 1
+    ) AS PostTags ON P.Id = PostTags.Id
+    LEFT JOIN Tags AS T ON PostTags.TagName = T.TagName
+    WHERE P.PostTypeId = 1 -- Only questions for tag analysis
+    GROUP BY P.Id, P.OwnerUserId, P.CreationDate, P.Title, P.Tags
+),
+PostHistoryAndStatus AS (
+    -- Analyze post history for edits, closes, and reopens, and calculate time between events
+    SELECT
+        PH.PostId,
+        COUNT(PH.Id) AS HistoryEntryCount,
+        COUNT(DISTINCT PH.UserId) AS DistinctEditors,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditCount, -- Title, Body, Tags edits
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS WasClosed,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS WasReopened,
+        MAX(PH.CreationDate) AS LastHistoryDate,
+        MIN(PH.CreationDate) AS FirstHistoryDate,
+        STRING_AGG(DISTINCT CRT.Name, ', ') FILTER (WHERE CRT.Name IS NOT NULL AND PH.PostHistoryTypeId = 10) AS CloseReasons,
+        -- Calculate time difference to the previous history entry for the same post
+        EXTRACT(EPOCH FROM (PH.CreationDate - LAG(PH.CreationDate, 1, PH.CreationDate) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate))) / 3600.0 AS HoursSincePreviousHistory
+    FROM PostHistory AS PH
+    LEFT JOIN CloseReasonTypes AS CRT ON PH.PostHistoryTypeId = 10 AND PH.Comment = CRT.Id::varchar(50) -- Cast for join
+    GROUP BY PH.PostId, PH.CreationDate -- Grouping by CreationDate for LAG window function to work as intended over partitions
+),
+UserBadgeAchievements AS (
+    -- Summarize user badge achievements and calculate a weighted score
+    SELECT
+        B.UserId,
+        COUNT(B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(B.Date) AS LastBadgeDate,
+        COALESCE(SUM(CASE B.Class WHEN 1 THEN 100 WHEN 2 THEN 20 WHEN 3 THEN 5 ELSE 0 END), 0) AS WeightedBadgeScore
+    FROM Badges AS B
+    GROUP BY B.UserId
+),
+PostLinkRelationships AS (
+    -- Analyze how posts are linked or duplicated
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId AS PostOwnerId,
+        SUM(CASE WHEN PL.LinkTypeId = 1 THEN 1 ELSE 0 END) AS LinkedFromCount,
+        SUM(CASE WHEN PL.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicateOfCount,
+        COUNT(DISTINCT PL.RelatedPostId) AS DistinctRelatedPosts,
+        MAX(PL.CreationDate) AS LastLinkActivity
+    FROM Posts AS P
+    LEFT JOIN PostLinks AS PL ON P.Id = PL.PostId
+    GROUP BY P.Id, P.OwnerUserId
+)
+SELECT
+    U.Id AS UserId,
+    U.DisplayName,
+    U.Reputation,
+    U.CreationDate AS UserCreationDate,
+    U.LastAccessDate,
+    U.Views AS UserProfileViews,
+    U.UpVotes AS UserUpVotes,
+    U.DownVotes AS UserDownVotes,
+    COALESCE(UA.TotalPosts, 0) AS TotalPostsByOwner,
+    COALESCE(UA.QuestionCount, 0) AS QuestionsByOwner,
+    COALESCE(UA.AnswerCount, 0) AS AnswersByOwner,
+    COALESCE(UA.TotalPostScore, 0) AS TotalPostScoreByOwner,
+    COALESCE(UA.TotalPostViewCount, 0) AS TotalPostViewCountByOwner,
+    COALESCE(UA.TotalComments, 0) AS TotalCommentsByOwner,
+    COALESCE(UBA.TotalBadges, 0) AS TotalBadges,
+    UBA.GoldBadges,
+    UBA.SilverBadges,
+    UBA.BronzeBadges,
+    UBA.WeightedBadgeScore,
+    EXTRACT(DAY FROM AGE(U.LastAccessDate, U.CreationDate)) AS DaysSinceCreation,
+    (U.Reputation * 1.0) / (EXTRACT(DAY FROM AGE(U.LastAccessDate, U.CreationDate)) + 1) AS ReputationPerDay,
+    -- Correlated subquery to find average question score for user's posts in a specific period and content
+    (SELECT AVG(P_sub.Score)
+     FROM Posts AS P_sub
+     WHERE P_sub.OwnerUserId = U.Id AND P_sub.PostTypeId = 1
+     AND P_sub.CreationDate BETWEEN U.CreationDate AND U.LastAccessDate
+     AND P_sub.Body ILIKE '%performance%'
+    ) AS AvgPerformanceQuestionScore,
+    RANK() OVER (ORDER BY U.Reputation DESC, COALESCE(UA.TotalPostScore, 0) DESC) AS OverallUserRank,
+    NTILE(5) OVER (ORDER BY UBA.WeightedBadgeScore DESC) AS BadgePerformanceTier,
+    COALESCE(SUM(PTA.IsSqlOrDbRelated) FILTER (WHERE PTA.PostOwnerId = U.Id), 0) AS SqlDbRelatedQuestions,
+    COALESCE(SUM(PTA.IsPerformanceRelated) FILTER (WHERE PTA.PostOwnerId = U.Id), 0) AS PerformanceRelatedQuestions,
+    AVG(PTA.UniqueTagCount) FILTER (WHERE PTA.PostOwnerId = U.Id) AS AvgUniqueTagsPerQuestion,
+    MAX(LENGTH(PTA.Tags)) FILTER (WHERE PTA.PostOwnerId = U.Id) AS MaxTagStringLength,
+    (SUM(PHS.WasClosed)::NUMERIC / NULLIF(COUNT(DISTINCT P.Id), 0)) * 100 AS PercentQuestionsClosed,
+    SUM(PHS.EditCount)::NUMERIC / NULLIF(COALESCE(UA.TotalPosts, 0), 0) AS EditToPostRatio,
+    AVG(PHS.HoursSincePreviousHistory) AS AvgPostHistoryLagHours,
+    COALESCE(SUM(PLR.LinkedFromCount) FILTER (WHERE PLR.PostOwnerId = U.Id), 0) AS TotalLinkedFromPosts,
+    COALESCE(SUM(PLR.DuplicateOfCount) FILTER (WHERE PLR.PostOwnerId = U.Id), 0) AS TotalDuplicateOfPosts,
+    CASE
+        WHEN U.Location ILIKE '%engineer%' OR U.Location ILIKE '%developer%' THEN 'TechProfessional'
+        WHEN U.AboutMe ILIKE '%learning%' OR U.AboutMe ILIKE '%student%' THEN 'Learner'
+        WHEN U.Location IS NULL OR U.Location = '' THEN 'UnknownLocation'
+        ELSE 'Other'
+    END AS UserCategoryByKeywords,
+    MIN(P.CreationDate) OVER (PARTITION BY U.Id) AS FirstPostDate,
+    MAX(P.LastActivityDate) OVER (PARTITION BY U.Id) AS LastPostActivityDate,
+    COALESCE(AVG(PV.VoteCount) FILTER (WHERE P.OwnerUserId = U.Id), 0) AS AvgVotesPerOwnedPost,
+    CASE
+        WHEN U.Reputation > 50000 AND COALESCE(UA.TotalPosts, 0) < 100 AND UBA.GoldBadges > 0 THEN TRUE
+        ELSE FALSE
+    END AS IsSilentExpert,
+    STRING_AGG(DISTINCT PT.Name, ', ') FILTER (WHERE PT.Name IS NOT NULL) AS ContributedPostTypes
+FROM Users AS U
+LEFT JOIN UserActivitySummary AS UA ON U.Id = UA.UserId
+LEFT JOIN UserBadgeAchievements AS UBA ON U.Id = UBA.UserId
+LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId AND P.CreationDate BETWEEN '2019-01-01' AND '2023-12-31'
+LEFT JOIN PostHistoryAndStatus AS PHS ON P.Id = PHS.PostId
+LEFT JOIN PostTagAnalysis AS PTA ON P.Id = PTA.PostId AND P.OwnerUserId = PTA.PostOwnerId
+LEFT JOIN PostLinkRelationships AS PLR ON P.Id = PLR.PostId AND P.OwnerUserId = PLR.PostOwnerId
+LEFT JOIN PostTypes AS PT ON P.PostTypeId = PT.Id
+LEFT JOIN (
+    SELECT PostId, COUNT(Id) AS VoteCount
+    FROM Votes
+    WHERE VoteTypeId IN (2, 3) -- UpMod and DownMod
+    GROUP BY PostId
+) AS PV ON P.Id = PV.PostId
+WHERE U.Reputation > 1000
+AND U.Views > (SELECT AVG(Views) FROM Users WHERE Views IS NOT NULL AND Views > 0)
+AND (U.AboutMe IS NOT NULL AND LENGTH(U.AboutMe) > 50 OR U.Location IS NOT NULL AND LENGTH(U.Location) > 10)
+AND (EXISTS (SELECT 1 FROM Badges B_sub WHERE B_sub.UserId = U.Id AND B_sub.Class = 1) OR COALESCE(UA.TotalPosts, 0) > 10)
+GROUP BY
+    U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Views, U.UpVotes, U.DownVotes,
+    UA.TotalPosts, UA.QuestionCount, UA.AnswerCount, UA.TotalPostScore, UA.TotalPostViewCount, UA.TotalComments,
+    UBA.TotalBadges, UBA.GoldBadges, UBA.SilverBadges, UBA.BronzeBadges, UBA.WeightedBadgeScore,
+    U.AboutMe, U.Location
+HAVING COUNT(DISTINCT P.Id) > 3 OR UBA.TotalBadges > 5
+UNION ALL
+-- A UNION ALL branch to find posts that were closed by duplicate vote, had specific tags, and high view counts
+SELECT
+    U.Id AS UserId,
+    U.DisplayName,
+    U.Reputation,
+    U.CreationDate AS UserCreationDate,
+    U.LastAccessDate,
+    U.Views AS UserProfileViews,
+    U.UpVotes AS UserUpVotes,
+    U.DownVotes AS UserDownVotes,
+    COALESCE(UA.TotalPosts, 0) AS TotalPostsByOwner,
+    COALESCE(UA.QuestionCount, 0) AS QuestionsByOwner,
+    COALESCE(UA.AnswerCount, 0) AS AnswersByOwner,
+    COALESCE(UA.TotalPostScore, 0) AS TotalPostScoreByOwner,
+    COALESCE(UA.TotalPostViewCount, 0) AS TotalPostViewCountByOwner,
+    COALESCE(UA.TotalComments, 0) AS TotalCommentsByOwner,
+    COALESCE(UBA.TotalBadges, 0) AS TotalBadges,
+    UBA.GoldBadges,
+    UBA.SilverBadges,
+    UBA.BronzeBadges,
+    UBA.WeightedBadgeScore,
+    EXTRACT(DAY FROM AGE(U.LastAccessDate, U.CreationDate)) AS DaysSinceCreation,
+    (U.Reputation * 1.0) / (EXTRACT(DAY FROM AGE(U.LastAccessDate, U.CreationDate)) + 1) AS ReputationPerDay,
+    NULL AS AvgPerformanceQuestionScore, -- Not the focus here
+    RANK() OVER (ORDER BY U.Reputation DESC, COALESCE(UA.TotalPostScore, 0) DESC) AS OverallUserRank,
+    NTILE(5) OVER (ORDER BY UBA.WeightedBadgeScore DESC) AS BadgePerformanceTier,
+    COALESCE(SUM(PTA.IsSqlOrDbRelated) FILTER (WHERE PTA.PostOwnerId = U.Id), 0) AS SqlDbRelatedQuestions,
+    COALESCE(SUM(PTA.IsPerformanceRelated) FILTER (WHERE PTA.PostOwnerId = U.Id), 0) AS PerformanceRelatedQuestions,
+    AVG(PTA.UniqueTagCount) FILTER (WHERE PTA.PostOwnerId = U.Id) AS AvgUniqueTagsPerQuestion,
+    MAX(LENGTH(PTA.Tags)) FILTER (WHERE PTA.PostOwnerId = U.Id) AS MaxTagStringLength,
+    (SUM(PHS.WasClosed)::NUMERIC / NULLIF(COUNT(DISTINCT P.Id), 0)) * 100 AS PercentQuestionsClosed,
+    SUM(PHS.EditCount)::NUMERIC / NULLIF(COALESCE(UA.TotalPosts, 0), 0) AS EditToPostRatio,
+    AVG(PHS.HoursSincePreviousHistory) AS AvgPostHistoryLagHours,
+    COALESCE(SUM(PLR.LinkedFromCount) FILTER (WHERE PLR.PostOwnerId = U.Id), 0) AS TotalLinkedFromPosts,
+    COALESCE(SUM(PLR.DuplicateOfCount) FILTER (WHERE PLR.PostOwnerId = U.Id), 0) AS TotalDuplicateOfPosts,
+    CASE
+        WHEN U.Location ILIKE '%engineer%' OR U.Location ILIKE '%developer%' THEN 'TechProfessional'
+        WHEN U.AboutMe ILIKE '%learning%' OR U.AboutMe ILIKE '%student%' THEN 'Learner'
+        WHEN U.Location IS NULL OR U.Location = '' THEN 'UnknownLocation'
+        ELSE 'Other'
+    END AS UserCategoryByKeywords,
+    MIN(P.CreationDate) OVER (PARTITION BY U.Id) AS FirstPostDate,
+    MAX(P.LastActivityDate) OVER (PARTITION BY U.Id) AS LastPostActivityDate,
+    COALESCE(AVG(PV.VoteCount) FILTER (WHERE P.OwnerUserId = U.Id), 0) AS AvgVotesPerOwnedPost,
+    FALSE AS IsSilentExpert,
+    STRING_AGG(DISTINCT PT.Name, ', ') FILTER (WHERE PT.Name IS NOT NULL) AS ContributedPostTypes
+FROM Users AS U
+INNER JOIN Posts AS P ON U.Id = P.OwnerUserId
+INNER JOIN PostHistoryAndStatus AS PHS ON P.Id = PHS.PostId AND PHS.WasClosed = 1 AND PHS.CloseReasons LIKE '%Duplicate%'
+INNER JOIN PostTagAnalysis AS PTA ON P.Id = PTA.PostId AND PTA.IsSqlOrDbRelated = 1
+LEFT JOIN UserActivitySummary AS UA ON U.Id = UA.UserId
+LEFT JOIN UserBadgeAchievements AS UBA ON U.Id = UBA.UserId
+LEFT JOIN PostLinkRelationships AS PLR ON P.Id = PLR.PostId AND P.OwnerUserId = PLR.PostOwnerId
+LEFT JOIN PostTypes AS PT ON P.PostTypeId = PT.Id
+LEFT JOIN (
+    SELECT PostId, COUNT(Id) AS VoteCount
+    FROM Votes
+    WHERE VoteTypeId IN (2, 3)
+    GROUP BY PostId
+) AS PV ON P.Id = PV.PostId
+WHERE P.PostTypeId = 1
+AND P.ViewCount > (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = 1 AND ViewCount IS NOT NULL) * 2 -- Very high view count
+AND P.CreationDate BETWEEN '2018-01-01' AND '2022-12-31'
+GROUP BY
+    U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Views, U.UpVotes, U.DownVotes,
+    UA.TotalPosts, UA.QuestionCount, UA.AnswerCount, UA.TotalPostScore, UA.TotalPostViewCount, UA.TotalComments,
+    UBA.TotalBadges, UBA.GoldBadges, UBA.SilverBadges, UBA.BronzeBadges, UBA.WeightedBadgeScore,
+    U.AboutMe, U.Location
+HAVING COUNT(DISTINCT P.Id) > 1
+ORDER BY Reputation DESC, TotalPostsByOwner DESC
+LIMIT 1000;

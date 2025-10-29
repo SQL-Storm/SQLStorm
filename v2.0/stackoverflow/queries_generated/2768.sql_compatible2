@@ -1,0 +1,133 @@
+with recursive TagHierarchy as (
+    select Id, TagName, WikiPostId, 0 as Level
+    from Tags
+    where IsRequired = true
+    union all
+    select t.Id, t.TagName, t.WikiPostId, th.Level + 1
+    from Tags t
+    join TagHierarchy th on t.Id = th.Id + 1 and t.IsRequired = false
+),
+BadgedUsers as (
+    select u.Id as UserId, u.DisplayName, b.Name as BadgeName, b.Class, row_number() over (partition by u.Id order by b.Date desc) as rn
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    where b.Class in (1, 2)
+),
+PostScoresWithRanks as (
+    select p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate,
+           p.Score,
+           dense_rank() over (partition by p.PostTypeId order by p.Score desc) as ScoreRank,
+           count(*) over (partition by p.PostTypeId) as PostTypeCount,
+           (
+               select count(*)
+               from Votes v
+               where v.PostId = p.Id and v.VoteTypeId = 2
+           ) as UpVotes,
+           (
+               select count(*)
+               from Votes v
+               where v.PostId = p.Id and v.VoteTypeId = 3
+           ) as DownVotes
+    from Posts p
+    where p.PostTypeId in (1, 2) and p.Score is not null
+),
+QuestionAnswerStats as (
+    select q.Id as QuestionId, q.Title, q.Tags,
+           count(a.Id) as AnswerCount,
+           max(a.Score) as MaxAnswerScore,
+           avg(cast(a.Score as numeric)) as AvgAnswerScore,
+           sum(case when a.OwnerUserId is not null then 1 else 0 end) as AnsweredByRegisteredUsers
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.Tags
+),
+RecentActivity as (
+    select p.Id, p.PostTypeId, p.OwnerUserId,
+           max(ph.CreationDate) as LastHistoryDate,
+           max(coalesce(v.CreationDate, cast('1900-01-01' as timestamp))) as LastVoteDate,
+           max(coalesce(c.CreationDate, cast('1900-01-01' as timestamp))) as LastCommentDate,
+           greatest(
+               max(ph.CreationDate),
+               max(coalesce(v.CreationDate, cast('1900-01-01' as timestamp))),
+               max(coalesce(c.CreationDate, cast('1900-01-01' as timestamp)))
+           ) as LastActivity
+    from Posts p
+    left join PostHistory ph on ph.PostId = p.Id
+    left join Votes v on v.PostId = p.Id
+    left join Comments c on c.PostId = p.Id
+    group by p.Id, p.PostTypeId, p.OwnerUserId
+),
+LinkAnalysis as (
+    select pl.PostId, pl.RelatedPostId, lt.Name as LinkTypeName,
+        row_number() over (partition by pl.PostId order by pl.CreationDate desc) as rn
+    from PostLinks pl
+    join LinkTypes lt on pl.LinkTypeId = lt.Id
+    where lt.Name in ('Duplicate', 'Linked')
+),
+ComplexUserStats as (
+    select u.Id, u.DisplayName,
+           coalesce(u.Reputation, 0) as Reputation,
+           coalesce(u.UpVotes, 0) as UpVotes,
+           coalesce(u.DownVotes, 0) as DownVotes,
+           coalesce(bc.BadgeCount, 0) as BadgeCount,
+           (case when u.LastAccessDate > (cast('2024-10-01' as date) - interval '30 days') then 'Active' else 'Inactive' end) as ActiveStatus,
+           length(coalesce(u.AboutMe, '')) as AboutMeLength,
+           (select count(1) from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 1 and p.Score > 5) as HighlyScoredQuestions,
+           (
+               select count(distinct ph.PostId)
+               from PostHistory ph
+               where ph.UserId = u.Id and ph.PostHistoryTypeId in (4,5,6)
+           ) as EditCount
+    from Users u
+    left join (
+        select UserId, count(*) BadgeCount
+        from Badges
+        group by UserId
+    ) bc on u.Id = bc.UserId
+),
+FinalQualifiedPosts as (
+    select ps.Id, ps.PostTypeId, ps.OwnerUserId, ps.Score, ps.ScoreRank, ps.PostTypeCount, ps.UpVotes, ps.DownVotes,
+           qa.Title, qa.Tags, qa.AnswerCount, qa.MaxAnswerScore, qa.AvgAnswerScore, qa.AnsweredByRegisteredUsers,
+           ra.LastActivity,
+           la.LinkTypeName,
+           cu.DisplayName as OwnerName,
+           cu.Reputation as OwnerReputation,
+           cu.ActiveStatus as OwnerActiveStatus,
+           cu.BadgeCount as OwnerBadgeCount
+    from PostScoresWithRanks ps
+    left join QuestionAnswerStats qa on qa.QuestionId = ps.Id
+    left join RecentActivity ra on ra.Id = ps.Id
+    left join LinkAnalysis la on la.PostId = ps.Id and la.rn = 1
+    left join ComplexUserStats cu on cu.Id = ps.OwnerUserId
+    where ps.ScoreRank <= 100 and (ps.UpVotes - ps.DownVotes) > 5
+      and (qa.AnswerCount is null or qa.AnswerCount >= 2)
+)
+select distinct fp.Id,
+       fp.PostTypeId,
+       fp.Title,
+       fp.Tags,
+       (
+            'Score: ' || fp.Score || ', Rank: ' || fp.ScoreRank || '/' || fp.PostTypeCount ||
+            '; Answers: ' || coalesce(cast(fp.AnswerCount as varchar), '0') ||
+            ' (Max: ' || coalesce(cast(fp.MaxAnswerScore as varchar), 'N/A') ||
+            ', Avg: ' || coalesce(case when fp.AvgAnswerScore is not null then trim(to_char(fp.AvgAnswerScore, 'FM999999.00')) else null end, 'N/A') || ')' ||
+            '; Owner: ' || coalesce(fp.OwnerName, 'Anonymous') ||
+            ' (Rep: ' || coalesce(cast(fp.OwnerReputation as varchar), '0') ||
+            ', Badges: ' || coalesce(cast(fp.OwnerBadgeCount as varchar), '0') || 
+            ', Status: ' || coalesce(fp.OwnerActiveStatus, 'Unknown') || ')' ||
+            '; LastActivity: ' || coalesce(to_char(fp.LastActivity, 'YYYY-MM-DD'), '') ||
+            '; LinkType: ' || coalesce(fp.LinkTypeName, 'None')
+       ) as Summary,
+       row_number() over (partition by fp.PostTypeId order by fp.Score desc) as PostRankInType
+from FinalQualifiedPosts fp
+where fp.Tags is not null and fp.Tags like '%<sql>%'
+union
+select p.Id, p.PostTypeId, '[Non-SQL Tag Posts]' as Title, '' as Tags,
+       'No SQL tag found; Post Score: ' || coalesce(cast(p.Score as varchar), '0') || '; Owner: ' || coalesce(u.DisplayName, 'Anonymous') as Summary,
+       0 as PostRankInType
+from Posts p
+left join Users u on p.OwnerUserId = u.Id
+where p.PostTypeId = 1 and (p.Tags is null or p.Tags not like '%<sql>%')
+order by PostTypeId, PostRankInType, Id
+limit 250;

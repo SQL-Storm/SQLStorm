@@ -1,0 +1,234 @@
+-- {"query": "1865.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3688} 
+
+WITH UserEngagementSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.UpVotes AS UserUpVotes,
+        u.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswers,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostScore,
+        AVG(COALESCE(p.Score, 0)) AS AvgPostScore,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        MAX(p.LastActivityDate) AS LastPostActivity,
+        MAX(u.LastAccessDate) AS LastUserAccess,
+        -- Complicated calculation for a 'Participation Score'
+        (u.UpVotes * 0.7 + u.DownVotes * 0.3 + COUNT(DISTINCT p.Id) * 0.5 + COUNT(DISTINCT c.Id) * 0.2) AS ParticipationScore,
+        CASE
+            WHEN u.Reputation >= 10000 THEN 'Legendary'
+            WHEN u.Reputation >= 5000 THEN 'Veteran'
+            WHEN u.Reputation >= 1000 THEN 'Experienced'
+            WHEN u.Reputation >= 200 THEN 'Active'
+            ELSE 'Novice'
+        END AS UserTier
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes
+),
+PostHistorySnapshots AS (
+    SELECT
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate AS HistoryCreationDate,
+        ph.UserId AS HistoryUserId,
+        ph.UserDisplayName AS HistoryUserDisplayName,
+        ph.Text AS HistoryText,
+        -- Window function: Get the latest history entry for a given type per post
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId, ph.PostHistoryTypeId ORDER BY ph.CreationDate DESC) AS rn_latest_per_type,
+        -- Window function: Get the previous history date for temporal analysis
+        LAG(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS PreviousHistoryDate
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (1, 2, 4, 5, 10, 11, 12, 13, 35, 36) -- Various history types including edits, close/reopen, delete/undelete, migration
+),
+PostDetailsWithEngagement AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.CreationDate AS PostCreationDate,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        -- Calculation: Post Age in days
+        EXTRACT(DAY FROM (NOW() - p.CreationDate)) AS PostAgeDays,
+        -- Complex expression: Activity Ratio, using COALESCE for NULL AnswerCount and NULLIF to prevent division by zero
+        CAST(p.CommentCount + COALESCE(p.AnswerCount, 0) AS DECIMAL) / NULLIF(p.ViewCount, 0) AS ActivityRatio,
+        -- Conditional logic using CASE to determine comprehensive Post Status
+        MAX(CASE WHEN ph_closed.PostHistoryTypeId = 10 THEN 'Closed'
+                 WHEN ph_reopened.PostHistoryTypeId = 11 THEN 'Reopened'
+                 WHEN ph_deleted.PostHistoryTypeId = 12 THEN 'Deleted'
+                 WHEN ph_migrated_away.PostHistoryTypeId = 35 THEN 'Migrated Away'
+                 WHEN ph_migrated_here.PostHistoryTypeId = 36 THEN 'Migrated Here'
+                 ELSE 'Open'
+            END) AS PostStatus,
+        -- Correlated Subquery: Count edits for each post
+        (SELECT COUNT(DISTINCT RevisionGUID) FROM PostHistory ph_edits WHERE ph_edits.PostId = p.Id AND ph_edits.PostHistoryTypeId IN (4,5,6)) AS EditCount,
+        -- Correlated Subquery: Get last editor's display name from history
+        (SELECT phs_last_edit.HistoryUserDisplayName FROM PostHistorySnapshots phs_last_edit WHERE phs_last_edit.PostId = p.Id AND phs_last_edit.PostHistoryTypeId IN (4,5,6) AND phs_last_edit.rn_latest_per_type = 1) AS LastEditorFromHistory,
+        -- Correlated Subquery: Calculate average score of answers for a question
+        (SELECT AVG(ans.Score) FROM Posts ans WHERE ans.ParentId = p.Id AND ans.PostTypeId = 2) AS AvgAnswerScore,
+        -- NULL logic: Check if a question has an accepted answer
+        (p.AcceptedAnswerId IS NOT NULL) AS HasAcceptedAnswer
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN PostHistorySnapshots ph_closed ON p.Id = ph_closed.PostId AND ph_closed.PostHistoryTypeId = 10 AND ph_closed.rn_latest_per_type = 1
+    LEFT JOIN PostHistorySnapshots ph_reopened ON p.Id = ph_reopened.PostId AND ph_reopened.PostHistoryTypeId = 11 AND ph_reopened.rn_latest_per_type = 1
+    LEFT JOIN PostHistorySnapshots ph_deleted ON p.Id = ph_deleted.PostId AND ph_deleted.PostHistoryTypeId = 12 AND ph_deleted.rn_latest_per_type = 1
+    LEFT JOIN PostHistorySnapshots ph_migrated_away ON p.Id = ph_migrated_away.PostId AND ph_migrated_away.PostHistoryTypeId = 35 AND ph_migrated_away.rn_latest_per_type = 1
+    LEFT JOIN PostHistorySnapshots ph_migrated_here ON p.Id = ph_migrated_here.PostId AND ph_migrated_here.PostHistoryTypeId = 36 AND ph_migrated_here.rn_latest_per_type = 1
+    WHERE p.PostTypeId IN (1, 2) -- Focus on Questions (1) and Answers (2)
+    GROUP BY p.Id, p.PostTypeId, pt.Name, p.CreationDate, p.LastEditDate, p.LastActivityDate, p.Title, p.Tags, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.OwnerUserId, p.AcceptedAnswerId
+),
+UserTopTags AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        -- String expression: Parse tags into individual rows
+        TRIM(UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><'))) AS TagName,
+        COUNT(p.Id) AS TagUsageCount,
+        -- Window function: Rank tags by usage count for each user
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY COUNT(p.Id) DESC, TRIM(UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><'))) ASC) AS rn
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL AND p.Tags IS NOT NULL AND p.PostTypeId IN (1,2)
+    GROUP BY p.OwnerUserId, TRIM(UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><')))
+),
+GlobalTagStats AS (
+    SELECT
+        t.TagName,
+        t.Id AS TagId,
+        t.Count AS GlobalPostCountForTag,
+        t.WikiPostId,
+        t.ExcerptPostId,
+        AVG(p.Score) AS AvgScoreForTag,
+        SUM(p.ViewCount) AS TotalViewsForTag
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE CONCAT('%<', t.TagName, '>%' ) AND p.PostTypeId IN (1,2)
+    GROUP BY t.TagName, t.Id, t.Count, t.WikiPostId, t.ExcerptPostId
+),
+BaseQuery AS (
+    SELECT
+        ues.DisplayName,
+        ues.Reputation,
+        ues.UserTier,
+        pde.PostId,
+        pde.PostTypeName,
+        pde.Title,
+        pde.PostCreationDate,
+        pde.Score AS PostScore,
+        pde.ViewCount AS PostViewCount,
+        pde.ActivityRatio,
+        pde.PostStatus,
+        pde.EditCount,
+        pde.LastEditorFromHistory,
+        pde.AvgAnswerScore,
+        pde.HasAcceptedAnswer,
+        phs_init_body.HistoryCreationDate AS InitialBodyDate,
+        phs_last_edit_body.HistoryCreationDate AS LastEditBodyDate,
+        phs_last_edit_body.HistoryUserDisplayName AS LastEditorOfBody,
+        phs_last_edit_body.HistoryUserId AS LastEditorUserId, -- Keep for correlated subquery
+        ph_closed_reason.Comment AS CloseReasonComment,
+        utt.TagName AS UserMostFrequentTag,
+        gts.AvgScoreForTag AS UserMostFrequentTagAvgScore,
+        gts.TotalViewsForTag AS UserMostFrequentTagTotalViews,
+        -- Correlated subquery: Get the reputation of the specific user who performed the last body edit
+        (SELECT u_editor.Reputation FROM Users u_editor WHERE u_editor.Id = phs_last_edit_body.HistoryUserId) AS LastEditorReputation,
+        -- Window function: Rank posts by engagement (score * activity ratio) within each user's post type
+        RANK() OVER (PARTITION BY ues.UserId, pde.PostTypeId ORDER BY (pde.Score * COALESCE(pde.ActivityRatio, 0.1)) DESC, pde.PostCreationDate DESC) AS PostEngagementRankByUserType,
+        -- Window function: Calculate the reputation difference from the average of users in the same tier
+        ues.Reputation - AVG(ues.Reputation) OVER (PARTITION BY ues.UserTier) AS ReputationDeltaFromTierAvg,
+        -- String expression: Analyze length of the title
+        LENGTH(pde.Title) AS TitleLength,
+        -- String expression: Extract the first tag from the post's tags, handling NULL tags with COALESCE
+        COALESCE(SUBSTRING(pde.Tags FROM 2 FOR POSITION('>' IN pde.Tags) - 2), 'No Tags') AS FirstTagInPost,
+        pde.PostTypeId -- Keep PostTypeId for filtering in the final UNION ALL
+    FROM UserEngagementSummary ues
+    INNER JOIN PostDetailsWithEngagement pde ON ues.UserId = pde.OwnerUserId
+    LEFT JOIN PostHistorySnapshots phs_init_body ON pde.PostId = phs_init_body.PostId AND phs_init_body.PostHistoryTypeId = 2 AND phs_init_body.rn_latest_per_type = 1
+    LEFT JOIN PostHistorySnapshots phs_last_edit_body ON pde.PostId = phs_last_edit_body.PostId AND phs_last_edit_body.PostHistoryTypeId = 5 AND phs_last_edit_body.rn_latest_per_type = 1
+    LEFT JOIN PostHistory ph_closed_reason ON pde.PostId = ph_closed_reason.PostId AND ph_closed_reason.PostHistoryTypeId = 10 AND ph_closed_reason.Comment IS NOT NULL AND ph_closed_reason.RevisionGUID IS NOT NULL
+    LEFT JOIN UserTopTags utt ON ues.UserId = utt.UserId AND utt.rn = 1
+    LEFT JOIN GlobalTagStats gts ON utt.TagName = gts.TagName
+    WHERE ues.TotalPosts > 20 -- Filter for highly active users
+    AND pde.PostScore > 15
+    AND pde.PostAgeDays BETWEEN 180 AND 2500 -- Posts between 6 months and approx 7 years old
+    AND pde.PostStatus IN ('Open', 'Reopened', 'Migrated Here')
+    -- Complicated string predicate: Case-insensitive search in title or tags
+    AND (pde.Title ILIKE '%performance%' OR pde.Tags ILIKE '%<optimization>%')
+    AND pde.ActivityRatio IS NOT NULL AND pde.ActivityRatio > 0.05 -- Ensure significant activity
+    AND ues.UserTier IN ('Legendary', 'Veteran') -- Focus on top tier users
+    -- NULL logic: AvgAnswerScore must be NULL (for answers) or greater than 5 (for questions with good answers)
+    AND (pde.AvgAnswerScore IS NULL OR pde.AvgAnswerScore > 5)
+)
+-- Set Operator: UNION ALL to combine two distinct result sets
+-- Branch 1: Analyze highly engaged Questions by top tier users
+SELECT
+    'QuestionAnalysis' AS ReportType,
+    bq.DisplayName,
+    bq.Reputation,
+    bq.UserTier,
+    bq.PostId,
+    bq.Title,
+    bq.PostScore,
+    bq.ViewCount,
+    bq.ActivityRatio,
+    bq.PostStatus,
+    bq.EditCount,
+    bq.LastEditorFromHistory,
+    bq.HasAcceptedAnswer,
+    bq.UserMostFrequentTag,
+    bq.UserMostFrequentTagAvgScore,
+    bq.LastEditorReputation,
+    bq.PostEngagementRankByUserType,
+    bq.ReputationDeltaFromTierAvg,
+    bq.TitleLength,
+    bq.FirstTagInPost,
+    bq.PostCreationDate
+FROM BaseQuery bq
+WHERE bq.PostTypeId = 1 -- Only Questions
+AND bq.HasAcceptedAnswer = TRUE -- Focus on resolved questions
+AND bq.PostEngagementRankByUserType <= 10 -- Top 10 engaged questions per user/post type
+ORDER BY bq.Reputation DESC, bq.PostScore DESC, bq.ActivityRatio DESC
+LIMIT 100
+
+UNION ALL
+
+-- Branch 2: Analyze well-received Answers by top tier users
+SELECT
+    'AnswerAnalysis' AS ReportType,
+    bq.DisplayName,
+    bq.Reputation,
+    bq.UserTier,
+    bq.PostId,
+    bq.Title, -- Will be NULL for answers, demonstrating NULL data
+    bq.PostScore,
+    bq.ViewCount,
+    bq.ActivityRatio,
+    bq.PostStatus,
+    bq.EditCount,
+    bq.LastEditorFromHistory,
+    bq.HasAcceptedAnswer, -- Will be FALSE for answers
+    bq.UserMostFrequentTag,
+    bq.UserMostFrequentTagAvgScore,
+    bq.LastEditorReputation,
+    bq.PostEngagementRankByUserType,
+    bq.ReputationDeltaFromTierAvg,
+    bq.TitleLength, -- Will be NULL for answers, demonstrating NULL data
+    bq.FirstTagInPost,
+    bq.PostCreationDate
+FROM BaseQuery bq
+WHERE bq.PostTypeId = 2 -- Only Answers
+AND bq.PostScore >= 50 -- Only highly upvoted answers
+AND bq.PostEngagementRankByUserType <= 5 -- Top 5 engaged answers per user/post type
+ORDER BY bq.Reputation DESC, bq.PostScore DESC, bq.PostCreationDate DESC
+LIMIT 100;

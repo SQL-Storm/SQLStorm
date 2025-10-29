@@ -1,0 +1,182 @@
+WITH ContentActivityUnion AS (
+    SELECT
+        Id AS ActivityId,
+        OwnerUserId AS UserId,
+        CreationDate,
+        'Post' AS ActivityType,
+        Score
+    FROM Posts
+    WHERE OwnerUserId IS NOT NULL AND PostTypeId IN (1, 2)
+    UNION ALL
+    SELECT
+        Id AS ActivityId,
+        UserId,
+        CreationDate,
+        'Comment' AS ActivityType,
+        Score
+    FROM Comments
+    WHERE UserId IS NOT NULL
+),
+UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        COUNT(DISTINCT P.Id) AS TotalPostsCreated,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestionsAsked,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswersPosted,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesGiven,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesGiven,
+        COALESCE(SUM(P.Score), 0) AS TotalPostScoreOwned,
+        COALESCE(AVG(P.Score), 0.0) AS AvgPostScoreOwned,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        COALESCE(SUM(CASE WHEN CA.ActivityType = 'Post' THEN CA.Score ELSE 0 END), 0) AS TotalPostContentScore,
+        COALESCE(SUM(CASE WHEN CA.ActivityType = 'Comment' THEN CA.Score ELSE 0 END), 0) AS TotalCommentContentScore
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Votes V ON U.Id = V.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN ContentActivityUnion CA ON U.Id = CA.UserId
+    GROUP BY U.Id
+),
+PostClosingHistory AS (
+    SELECT
+        PH.PostId,
+        CRT.Name AS CloseReasonName,
+        PH.CreationDate AS CloseDate,
+        ROW_NUMBER() OVER(PARTITION BY PH.PostId ORDER BY PH.CreationDate DESC) AS rn_latest_close
+    FROM PostHistory PH
+    JOIN PostHistoryTypes PHT ON PH.PostHistoryTypeId = PHT.Id
+    LEFT JOIN CloseReasonTypes CRT ON
+        PH.PostHistoryTypeId = 10
+        AND PH.Comment ~ '^[0-9]+$'
+        AND CAST(PH.Comment AS integer) = CRT.Id
+    WHERE PH.PostHistoryTypeId = 10
+),
+PostTagAnalysis AS (
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        P.Score,
+        P.CreationDate,
+        P.LastActivityDate,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        STRING_TO_ARRAY(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><') AS TagArray,
+        ROW_NUMBER() OVER(PARTITION BY P.OwnerUserId ORDER BY P.Score DESC, P.ViewCount DESC, P.CreationDate DESC) AS rn_top_post_by_user
+    FROM Posts P
+    WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2
+),
+ExpandedPostTags AS (
+    SELECT
+        PTA.PostId,
+        PTA.OwnerUserId,
+        UNNEST(PTA.TagArray) AS TagName,
+        PTA.Score
+    FROM PostTagAnalysis PTA
+    WHERE PTA.OwnerUserId IS NOT NULL
+)
+SELECT
+    U.Id AS UserId,
+    U.DisplayName,
+    U.Reputation,
+    U.CreationDate AS UserCreationDate,
+    U.LastAccessDate,
+    U.Location,
+    COALESCE(U.Views, 0) AS ProfileViews,
+    U.UpVotes AS UserUpVotesReceived,
+    U.DownVotes AS UserDownVotesReceived,
+    UAS.TotalPostsCreated,
+    UAS.TotalQuestionsAsked,
+    UAS.TotalAnswersPosted,
+    UAS.TotalCommentsMade,
+    UAS.TotalUpVotesGiven,
+    UAS.TotalDownVotesGiven,
+    UAS.TotalPostScoreOwned,
+    UAS.AvgPostScoreOwned,
+    UAS.TotalBadges,
+    UAS.TotalPostContentScore,
+    UAS.TotalCommentContentScore,
+    (SELECT COUNT(DISTINCT B.Name) FROM Badges B WHERE B.UserId = U.Id AND B.Class = 1) AS GoldBadgesCount,
+    COALESCE(AVG(P_location.Score) OVER (PARTITION BY U.Location), 0.0) AS AvgScoreInLocation,
+    COALESCE(SUM(U.Reputation) OVER (ORDER BY U.CreationDate RANGE BETWEEN INTERVAL '30 day' PRECEDING AND CURRENT ROW), 0) AS Rolling30DayReputationSum,
+    COALESCE(LAG(U.Reputation, 1, 0) OVER (ORDER BY U.CreationDate), 0) AS PrevUserReputation,
+    (
+        SELECT EPT_inner.TagName
+        FROM ExpandedPostTags EPT_inner
+        WHERE EPT_inner.OwnerUserId = U.Id
+        GROUP BY EPT_inner.TagName
+        ORDER BY COUNT(EPT_inner.PostId) DESC, SUM(EPT_inner.Score) DESC
+        LIMIT 1
+    ) AS MostActiveTagName,
+    COALESCE((
+        SELECT SUM(EPT_inner.Score)
+        FROM ExpandedPostTags EPT_inner
+        WHERE EPT_inner.OwnerUserId = U.Id
+          AND EPT_inner.TagName = (
+                SELECT EPT_sub.TagName
+                FROM ExpandedPostTags EPT_sub
+                WHERE EPT_sub.OwnerUserId = U.Id
+                GROUP BY EPT_sub.TagName
+                ORDER BY COUNT(EPT_sub.PostId) DESC, SUM(EPT_sub.Score) DESC
+                LIMIT 1
+              )
+    ), 0) AS ScoreInMostActiveTag,
+    PTA_top.PostId AS TopPostId,
+    P_top.Title AS TopPostTitle,
+    P_top.Score AS TopPostScore,
+    P_top.ViewCount AS TopPostViewCount,
+    P_top.CreationDate AS TopPostCreationDate,
+    P_top.LastActivityDate AS TopPostLastActivityDate,
+    PCH.CloseReasonName AS TopPostCloseReason,
+    PCH.CloseDate AS TopPostCloseDate,
+    (
+        SELECT COUNT(DISTINCT PL.RelatedPostId)
+        FROM PostLinks PL
+        WHERE PL.PostId = PTA_top.PostId AND PL.LinkTypeId = 1
+    ) AS TopPostLinkedCount,
+    (
+        SELECT COUNT(DISTINCT PL.RelatedPostId)
+        FROM PostLinks PL
+        WHERE PL.PostId = PTA_top.PostId AND PL.LinkTypeId = 3
+    ) AS TopPostDuplicateCount,
+    CASE
+        WHEN U.Reputation > 10000 AND UAS.TotalBadges > 50 AND UAS.TotalQuestionsAsked > 100 THEN 'Veteran Power User'
+        WHEN U.Reputation > 5000 AND UAS.TotalBadges > 20 AND UAS.TotalAnswersPosted > 50 THEN 'Experienced Contributor'
+        WHEN U.Reputation > 1000 AND (UAS.TotalPostsCreated > 10 OR UAS.TotalCommentsMade > 50) THEN 'Active Member'
+        ELSE 'Novice'
+    END AS UserTier,
+    COALESCE((SELECT AVG(C_sub.Score) FROM Comments C_sub WHERE C_sub.UserId = U.Id), 0.0) AS AvgCommentScore,
+    (U.AboutMe IS NOT NULL AND TRIM(U.AboutMe) <> '') AS HasAboutMe,
+    COALESCE(LENGTH(U.AboutMe), 0) AS AboutMeLength,
+    (U.WebsiteUrl IS NOT NULL AND TRIM(U.WebsiteUrl) <> '') AS HasWebsiteUrl,
+    ABS(EXTRACT(DAY FROM (U.CreationDate - U.LastAccessDate))) AS DaysSinceLastAccess,
+    COALESCE(P_top.AnswerCount, 0) AS TopPostAnswerCount,
+    COALESCE(P_top.CommentCount, 0) AS TopPostCommentCount,
+    COALESCE(P_top.FavoriteCount, 0) AS TopPostFavoriteCount,
+    COALESCE((SELECT AVG(Q.ViewCount) FROM Posts Q WHERE Q.OwnerUserId = U.Id AND Q.PostTypeId = 1), 0.0) AS AvgQuestionViewsByUser,
+    RANK() OVER (ORDER BY U.Reputation DESC, U.CreationDate ASC) AS UserReputationRank,
+    DENSE_RANK() OVER (ORDER BY UAS.TotalPostsCreated DESC, U.Reputation DESC) AS UserActivityRank
+FROM Users U
+LEFT JOIN UserActivitySummary UAS ON U.Id = UAS.UserId
+LEFT JOIN PostTagAnalysis PTA_top ON U.Id = PTA_top.OwnerUserId AND PTA_top.rn_top_post_by_user = 1
+LEFT JOIN Posts P_top ON PTA_top.PostId = P_top.Id
+LEFT JOIN PostClosingHistory PCH ON P_top.Id = PCH.PostId AND PCH.rn_latest_close = 1
+LEFT JOIN Posts P_location ON U.Id = P_location.OwnerUserId AND P_location.PostTypeId IN (1,2)
+WHERE
+    U.CreationDate >= DATE '2020-01-01'
+    AND U.Reputation > 100
+    AND (U.Location IS NOT NULL AND U.Location <> '' AND LOWER(U.Location) NOT LIKE '%united states%')
+    AND EXISTS (SELECT 1 FROM Badges B_exists WHERE B_exists.UserId = U.Id AND B_exists.Class = 1 AND B_exists.Date >= U.CreationDate + INTERVAL '1 month')
+    AND COALESCE(UAS.TotalPostsCreated, 0) + COALESCE(UAS.TotalCommentsMade, 0) > 5
+GROUP BY
+    U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Location, U.Views, U.UpVotes, U.DownVotes, U.AboutMe, U.WebsiteUrl,
+    UAS.TotalPostsCreated, UAS.TotalQuestionsAsked, UAS.TotalAnswersPosted, UAS.TotalCommentsMade, UAS.TotalUpVotesGiven, UAS.TotalDownVotesGiven,
+    UAS.TotalPostScoreOwned, UAS.AvgPostScoreOwned, UAS.TotalBadges, UAS.TotalPostContentScore, UAS.TotalCommentContentScore,
+    PTA_top.PostId, P_top.Title, P_top.Score, P_top.ViewCount, P_top.CreationDate, P_top.LastActivityDate, P_top.AnswerCount, P_top.CommentCount, P_top.FavoriteCount,
+    PCH.CloseReasonName, PCH.CloseDate, P_location.Score
+ORDER BY
+    UserReputationRank ASC, U.CreationDate DESC
+LIMIT 1000;

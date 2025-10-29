@@ -1,0 +1,316 @@
+with recent_users as (
+    select u.id as user_id,
+           u.displayname,
+           u.reputation,
+           u.creationdate,
+           date_trunc('month', u.creationdate) as cohort_month,
+           coalesce(nullif(trim(split_part(coalesce(u.location, ''), ',', 1)), ''), 'Unknown') as region_guess
+    from users u
+    where u.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+),
+posts_enriched as (
+    select p.id,
+           p.posttypeid,
+           p.creationdate,
+           p.owneruserid,
+           p.parentid,
+           p.score,
+           p.viewcount,
+           p.title,
+           p.tags,
+           case when p.posttypeid = 1 then 1 else 0 end as is_question,
+           case when p.posttypeid = 2 then 1 else 0 end as is_answer,
+           array_length(string_to_array(coalesce(nullif(substring(p.tags, 2, greatest(length(p.tags) - 2, 0)), ''), ''), '><'), 1) as tag_count,
+           coalesce(p.answercount, 0) as answercount,
+           p.acceptedanswerid as accepted_answer_id
+    from posts p
+    where p.creationdate >= (select min(creationdate) from recent_users)
+),
+q_with_answers as (
+    select q.id as question_id,
+           q.owneruserid as asker_id,
+           q.creationdate as question_date,
+           q.score as question_score,
+           q.viewcount as question_views,
+           q.title as question_title,
+           q.tags as question_tags,
+           q.tag_count,
+           q.answercount,
+           q.accepted_answer_id,
+           (select count(*) from comments c where c.postid = q.id) as comment_count,
+           (select min(a.creationdate) from posts a where a.parentid = q.id and a.posttypeid = 2) as first_answer_date,
+           (select count(*) 
+            from posts a
+            where a.parentid = q.id and a.posttypeid = 2 and a.score > 0) as positive_answer_count
+    from posts_enriched q
+    where q.posttypeid = 1
+),
+answers_enriched as (
+    select a.id as answer_id,
+           a.parentid as question_id,
+           a.owneruserid as answerer_id,
+           a.creationdate as answer_date,
+           a.score as answer_score,
+           row_number() over (partition by a.parentid order by a.creationdate) as rn_by_time,
+           row_number() over (partition by a.parentid order by a.score desc, a.creationdate) as rn_by_score,
+           rank() over (partition by a.parentid order by a.creationdate) as rnk_by_time,
+           dense_rank() over (partition by a.parentid order by a.score desc) as dr_by_score
+    from posts_enriched a
+    where a.posttypeid = 2
+),
+user_activity as (
+    select ru.user_id,
+           count(*) filter (where pe.is_question = 1) as questions_count,
+           count(*) filter (where pe.is_answer = 1) as answers_count,
+           sum(coalesce(pe.score, 0)) as post_score_sum,
+           max(pe.creationdate) as last_post_date
+    from recent_users ru
+    left join posts_enriched pe
+      on pe.owneruserid = ru.user_id
+    group by ru.user_id
+),
+vote_agg as (
+    select v.postid,
+           count(*) filter (where v.votetypeid = 2) as upvotes,
+           count(*) filter (where v.votetypeid = 3) as downvotes,
+           sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount, 0) else 0 end) as bounty_total,
+           min(v.creationdate) filter (where v.votetypeid = 2) as first_upvote_date
+    from votes v
+    group by v.postid
+),
+tag_unpacked as (
+    select q.question_id,
+           unnest(string_to_array(coalesce(nullif(substring(q.question_tags, 2, greatest(length(q.question_tags) - 2, 0)), ''), ''), '><')) as tag
+    from q_with_answers q
+),
+tag_stats as (
+    select tu.tag,
+           count(distinct tu.question_id) as questions_with_tag,
+           avg(qwa.question_score) as avg_q_score_for_tag,
+           percentile_disc(0.5) within group (order by qwa.question_views) as median_views_for_tag
+    from tag_unpacked tu
+    join q_with_answers qwa on qwa.question_id = tu.question_id
+    group by tu.tag
+),
+accepted_answer as (
+    select q.question_id,
+           q.accepted_answer_id,
+           ae.answer_id,
+           ae.answerer_id,
+           ae.answer_date,
+           ae.answer_score,
+           ae.rn_by_time,
+           ae.rn_by_score
+    from q_with_answers q
+    left join answers_enriched ae
+      on ae.answer_id = q.accepted_answer_id
+),
+post_history_flags as (
+    select ph.postid,
+           max(case when ph.posthistorytypeid in (10,35) then 1 else 0 end) as was_closed_or_migrated,
+           max(case when ph.posthistorytypeid in (11) then 1 else 0 end) as was_reopened,
+           max(case when ph.posthistorytypeid in (50) then 1 else 0 end) as was_bumped,
+           max(case when ph.posthistorytypeid in (52) then 1 else 0 end) as was_hot
+    from posthistory ph
+    group by ph.postid
+),
+question_quality as (
+    select q.question_id,
+           q.asker_id,
+           q.question_date,
+           q.question_score,
+           q.question_views,
+           q.answercount,
+           qa.upvotes,
+           qa.downvotes,
+           qa.bounty_total,
+           qa.first_upvote_date,
+           ph.was_closed_or_migrated,
+           ph.was_reopened,
+           ph.was_bumped,
+           ph.was_hot,
+           case when (coalesce(qa.upvotes,0) + coalesce(qa.downvotes,0)) = 0 then null
+                else (cast(coalesce(qa.upvotes,0) as double precision) - cast(coalesce(qa.downvotes,0) as double precision)) / nullif((coalesce(qa.upvotes,0) + coalesce(qa.downvotes,0)), 0) end as vote_balance_ratio,
+           extract(epoch from (coalesce(qa.first_upvote_date, q.question_date) - q.question_date)) / 3600.0 as hours_to_first_upvote
+    from q_with_answers q
+    left join vote_agg qa on qa.postid = q.question_id
+    left join post_history_flags ph on ph.postid = q.question_id
+),
+user_labels as (
+    select ru.user_id,
+           case
+             when coalesce(ua.answers_count,0) >= 50 and coalesce(ua.questions_count,0) >= 10 and coalesce(ru.reputation,0) >= 10000 then 'Elite'
+             when coalesce(ua.answers_count,0) >= 20 and coalesce(ru.reputation,0) >= 3000 then 'Pro'
+             when coalesce(ua.answers_count,0) >= 5 or coalesce(ua.questions_count,0) >= 5 then 'Active'
+             when ua.answers_count is null and ua.questions_count is null then 'Dormant'
+             else 'Casual'
+           end as user_tier,
+           ru.region_guess,
+           ru.cohort_month
+    from recent_users ru
+    left join user_activity ua on ua.user_id = ru.user_id
+),
+dup_links as (
+    select pl.postid as duplicate_id,
+           pl.relatedpostid as canonical_id,
+           count(*) as dup_edges
+    from postlinks pl
+    where pl.linktypeid = 3
+    group by pl.postid, pl.relatedpostid
+),
+canonical_map as (
+    select q.question_id,
+           coalesce(dl.canonical_id, q.question_id) as canonical_question_id,
+           dl.dup_edges
+    from q_with_answers q
+    left join dup_links dl on dl.duplicate_id = q.question_id
+),
+cte_union as (
+    select question_id, 'HAS_ACCEPTED' as flag
+    from q_with_answers
+    where accepted_answer_id is not null
+    union all
+    select question_id, 'NO_ACCEPTED' as flag
+    from q_with_answers
+    where accepted_answer_id is null
+),
+answerer_firsts as (
+    select ae.question_id,
+           ae.answerer_id,
+           min(ae.answer_date) as first_answer_date_for_user_on_q
+    from answers_enriched ae
+    group by ae.question_id, ae.answerer_id
+),
+answer_speed as (
+    select ae.question_id,
+           ae.answer_id,
+           ae.answerer_id,
+           ae.answer_date,
+           ae.answer_score,
+           extract(epoch from (ae.answer_date - q.question_date)) / 60.0 as minutes_to_answer,
+           case when ae.rn_by_time = 1 then 1 else 0 end as is_first_answer
+    from answers_enriched ae
+    join q_with_answers q on q.question_id = ae.question_id
+),
+aggregated as (
+    select
+        q.question_id,
+        cm.canonical_question_id,
+        q.asker_id,
+        ul.user_tier as asker_tier,
+        ul.region_guess as asker_region,
+        date_trunc('month', q.question_date) as question_month,
+        qs.vote_balance_ratio,
+        qs.hours_to_first_upvote,
+        q.question_score,
+        q.question_views,
+        q.answercount,
+        coalesce(qs.upvotes, 0) as upvotes,
+        coalesce(qs.downvotes, 0) as downvotes,
+        coalesce(qs.bounty_total, 0) as bounty_total,
+        qs.was_closed_or_migrated,
+        qs.was_reopened,
+        qs.was_bumped,
+        qs.was_hot,
+        aa.answer_id as accepted_answer_id,
+        aa.answer_score as accepted_answer_score,
+        aa.rn_by_time as accepted_rank_by_time,
+        count(distinct se.answer_id) as total_answers,
+        avg(se.minutes_to_answer) as avg_minutes_to_answer,
+        min(se.minutes_to_answer) as min_minutes_to_answer,
+        max(se.minutes_to_answer) as max_minutes_to_answer,
+        sum(case when se.is_first_answer = 1 then 1 else 0 end) as first_answers_count,
+        ts.tag as sample_tag_for_partition
+    from q_with_answers q
+    left join canonical_map cm on cm.question_id = q.question_id
+    left join question_quality qs on qs.question_id = q.question_id
+    left join accepted_answer aa on aa.question_id = q.question_id
+    left join answer_speed se on se.question_id = q.question_id
+    left join user_labels ul on ul.user_id = q.asker_id
+    left join lateral (
+        select tu.tag
+        from tag_unpacked tu
+        where tu.question_id = q.question_id
+        order by random()
+        limit 1
+    ) ts on true
+    group by
+        q.question_id, cm.canonical_question_id, q.asker_id, ul.user_tier, ul.region_guess,
+        date_trunc('month', q.question_date),
+        qs.vote_balance_ratio, qs.hours_to_first_upvote, q.question_score, q.question_views, q.answercount,
+        qs.upvotes, qs.downvotes, qs.bounty_total, qs.was_closed_or_migrated, qs.was_reopened, qs.was_bumped, qs.was_hot,
+        aa.answer_id, aa.answer_score, aa.rn_by_time, ts.tag
+),
+ranked as (
+    select
+        a.*,
+        row_number() over (partition by a.sample_tag_for_partition order by a.question_score desc, a.question_views desc) as rn_score_within_tag,
+        dense_rank() over (order by a.vote_balance_ratio desc) as dr_vote_balance,
+        ntile(10) over (order by coalesce(a.avg_minutes_to_answer, 1e9)) as response_speed_decile
+    from aggregated a
+),
+final_rollup as (
+    select
+        r.sample_tag_for_partition as tag,
+        r.asker_tier,
+        r.asker_region,
+        count(*) as questions,
+        sum(case when r.accepted_answer_id is not null then 1 else 0 end) as with_accepted,
+        avg(r.question_score) as avg_q_score,
+        avg(r.question_views) as avg_q_views,
+        avg(coalesce(r.avg_minutes_to_answer, 0)) as avg_minutes_to_answer,
+        percentile_disc(0.9) within group (order by coalesce(r.avg_minutes_to_answer, 0)) as p90_minutes_to_answer,
+        sum(case when r.was_hot = 1 then 1 else 0 end) as hot_count,
+        sum(case when r.was_closed_or_migrated = 1 then 1 else 0 end) as closed_or_migrated_count,
+        sum(coalesce(r.bounty_total, 0)) as total_bounty,
+        avg(r.vote_balance_ratio) as avg_vote_balance_ratio
+    from ranked r
+    group by r.sample_tag_for_partition, r.asker_tier, r.asker_region
+)
+select
+    r.question_id,
+    r.canonical_question_id,
+    r.asker_tier,
+    r.asker_region,
+    r.question_month,
+    r.sample_tag_for_partition as tag,
+    r.vote_balance_ratio,
+    r.hours_to_first_upvote,
+    r.question_score,
+    r.question_views,
+    r.answercount,
+    r.upvotes,
+    r.downvotes,
+    r.bounty_total,
+    r.was_closed_or_migrated,
+    r.was_reopened,
+    r.was_bumped,
+    r.was_hot,
+    r.accepted_answer_id,
+    r.accepted_answer_score,
+    r.accepted_rank_by_time,
+    r.total_answers,
+    r.avg_minutes_to_answer,
+    r.min_minutes_to_answer,
+    r.max_minutes_to_answer,
+    r.first_answers_count,
+    r.rn_score_within_tag,
+    r.dr_vote_balance,
+    r.response_speed_decile,
+    fr.questions as rollup_questions,
+    fr.with_accepted as rollup_with_accepted,
+    fr.avg_q_score as rollup_avg_q_score,
+    fr.avg_q_views as rollup_avg_q_views,
+    fr.avg_minutes_to_answer as rollup_avg_minutes_to_answer,
+    fr.p90_minutes_to_answer as rollup_p90_minutes_to_answer,
+    fr.hot_count as rollup_hot_count,
+    fr.closed_or_migrated_count as rollup_closed_or_migrated_count,
+    fr.total_bounty as rollup_total_bounty,
+    fr.avg_vote_balance_ratio as rollup_avg_vote_balance_ratio
+from ranked r
+left join final_rollup fr
+  on coalesce(fr.tag, 'NULL') = coalesce(r.sample_tag_for_partition, 'NULL')
+ and coalesce(fr.asker_tier, 'NULL') = coalesce(r.asker_tier, 'NULL')
+ and coalesce(fr.asker_region, 'NULL') = coalesce(r.asker_region, 'NULL')
+where r.rn_score_within_tag <= 50
+order by r.sample_tag_for_partition nulls last, r.rn_score_within_tag, r.question_id;

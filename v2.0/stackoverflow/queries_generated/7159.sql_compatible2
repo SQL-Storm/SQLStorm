@@ -1,0 +1,308 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.CreationDate,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COUNT(DISTINCT v.Id) as VoteCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        MAX(b.Date) as LastBadgeDate,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Elite'
+            WHEN u.Reputation >= 5000 THEN 'Veteran'
+            WHEN u.Reputation >= 1000 THEN 'Experienced'
+            ELSE 'Beginner'
+        END as ReputationLevel,
+        CASE 
+            WHEN EXISTS(SELECT 1 FROM Posts p2 WHERE p2.OwnerUserId = u.Id AND p2.PostTypeId = 1) THEN 'Questioner'
+            WHEN EXISTS(SELECT 1 FROM Posts p3 WHERE p3.OwnerUserId = u.Id AND p3.PostTypeId = 2) THEN 'Answerer'
+            ELSE 'Contributor'
+        END as UserRole,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) as RankByReputation,
+        PERCENT_RANK() OVER (ORDER BY u.Reputation) as ReputationPercentile,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) as QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) as AnswerCount,
+        AVG(p.Score) as AvgPostScore,
+        STRING_AGG(DISTINCT p.Title, '; ') as PostTitles,
+        STRING_AGG(DISTINCT t.TagName, ', ') as FavoriteTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+    LEFT JOIN Tags t ON POSITION('<' || t.TagName || '>' IN p.Tags) > 0
+    WHERE u.AccountId IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate
+),
+TopPosts AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        p.Tags,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as PostType,
+        CASE 
+            WHEN p.Score > 100 THEN 'HighlyVoted'
+            WHEN p.Score > 50 THEN 'WellVoted'
+            WHEN p.Score > 0 THEN 'ModeratelyVoted'
+            ELSE 'LowVoted'
+        END as PopularityLevel,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) as RankByScore,
+        AVG(p.Score) OVER (PARTITION BY p.PostTypeId) as AvgScoreByType,
+        NTH_VALUE(p.Title, 1) OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) as TopScoredTitle,
+        LAG(p.Score) OVER (ORDER BY p.CreationDate) as PreviousScore,
+        LEAD(p.Score) OVER (ORDER BY p.CreationDate) as NextScore
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year')
+),
+UserPostAnalysis AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.UserRole,
+        uas.PostCount,
+        uas.CommentCount,
+        uas.BadgeCount,
+        uas.VoteCount,
+        uas.ReputationLevel,
+        uas.RankByReputation,
+        uas.ReputationPercentile,
+        uas.QuestionCount,
+        uas.AnswerCount,
+        uas.AvgPostScore,
+        uas.PostTitles,
+        uas.FavoriteTags,
+        CASE 
+            WHEN uas.PostCount > 0 AND uas.VoteCount = 0 THEN 'Inactive'
+            WHEN uas.PostCount = 0 AND uas.CommentCount > 0 THEN 'CommenterOnly'
+            WHEN uas.PostCount > 0 AND uas.VoteCount > 0 THEN 'ActiveContributor'
+            ELSE 'Inactive'
+        END as EngagementLevel,
+        (uas.Views - COALESCE(LAG(uas.Views) OVER (ORDER BY uas.Reputation), 0)) as ViewChange,
+        (uas.UpVotes - COALESCE(LAG(uas.UpVotes) OVER (ORDER BY uas.Reputation), 0)) as UpVoteChange,
+        (uas.DownVotes - COALESCE(LAG(uas.DownVotes) OVER (ORDER BY uas.Reputation), 0)) as DownVoteChange
+    FROM UserActivityStats uas
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        tp.PostId,
+        tp.Title,
+        tp.Score,
+        tp.ViewCount,
+        tp.AnswerCount,
+        tp.CommentCount,
+        tp.CreationDate,
+        tp.OwnerUserId,
+        tp.OwnerName,
+        tp.PostType,
+        tp.PopularityLevel,
+        tp.RankByScore,
+        tp.AvgScoreByType,
+        tp.TopScoredTitle,
+        tp.PreviousScore,
+        tp.NextScore,
+        CASE 
+            WHEN tp.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'AboveAverage'
+            WHEN tp.Score < (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'BelowAverage'
+            ELSE 'Average'
+        END as ScoreComparison,
+        COALESCE(
+            (SELECT COUNT(*) FROM Comments c WHERE c.PostId = tp.PostId AND c.CreationDate >= tp.CreationDate), 
+            0
+        ) as CommentCountSincePost,
+        (tp.ViewCount - COALESCE(tp.PreviousScore, 0)) as ViewChange,
+        (tp.Score - COALESCE(tp.PreviousScore, 0)) as ScoreChange,
+        CONCAT(
+            'V', tp.ViewCount, '-S', tp.Score, '-A', tp.AnswerCount, '-C', tp.CommentCount
+        ) as PostMetricsString,
+        STRING_AGG(
+            CASE WHEN t.TagName IS NOT NULL THEN t.TagName ELSE 'NoTag' END, 
+            ', ' 
+        ) as AllTags,
+        COUNT(DISTINCT pl.Id) as LinkCount,
+        MAX(ph.CreationDate) as LastActivityDate,
+        MIN(ph.CreationDate) as FirstActivityDate
+    FROM TopPosts tp
+    LEFT JOIN Tags t ON POSITION('<' || t.TagName || '>' IN tp.Tags) > 0
+    LEFT JOIN PostLinks pl ON tp.PostId = pl.PostId
+    LEFT JOIN PostHistory ph ON tp.PostId = ph.PostId
+    GROUP BY 
+        tp.PostId, tp.Title, tp.Score, tp.ViewCount, tp.AnswerCount, 
+        tp.CommentCount, tp.CreationDate, tp.OwnerUserId, tp.OwnerName, 
+        tp.PostType, tp.PopularityLevel, tp.RankByScore, tp.AvgScoreByType,
+        tp.TopScoredTitle, tp.PreviousScore, tp.NextScore, tp.ViewCount, tp.Score, tp.AnswerCount, tp.CommentCount, tp.Tags
+),
+FinalAggregation AS (
+    SELECT 
+        upa.UserId,
+        upa.DisplayName,
+        upa.Reputation,
+        upa.UserRole,
+        upa.PostCount,
+        upa.CommentCount,
+        upa.BadgeCount,
+        upa.VoteCount,
+        upa.ReputationLevel,
+        upa.RankByReputation,
+        upa.ReputationPercentile,
+        upa.QuestionCount,
+        upa.AnswerCount,
+        upa.AvgPostScore,
+        upa.PostTitles,
+        upa.FavoriteTags,
+        upa.EngagementLevel,
+        upa.ViewChange,
+        upa.UpVoteChange,
+        upa.DownVoteChange,
+        cpa.PostId,
+        cpa.Title,
+        cpa.Score,
+        cpa.ViewCount,
+        cpa.AnswerCount as PostAnswerCount,
+        cpa.CommentCount as PostCommentCount,
+        cpa.CreationDate as PostCreationDate,
+        cpa.OwnerName as PostOwnerName,
+        cpa.PostType,
+        cpa.PopularityLevel as PostPopularity,
+        cpa.RankByScore as PostRank,
+        cpa.AvgScoreByType,
+        cpa.TopScoredTitle,
+        cpa.ScoreComparison,
+        cpa.CommentCountSincePost,
+        cpa.ViewChange as PostViewChange,
+        cpa.ScoreChange,
+        cpa.PostMetricsString,
+        cpa.AllTags,
+        cpa.LinkCount,
+        cpa.LastActivityDate,
+        cpa.FirstActivityDate,
+        (CAST(cpa.CreationDate AS date) - CAST(upa.CreationDate AS date)) as DaysSinceRegistration,
+        CASE 
+            WHEN cpa.Score > 100 THEN 1
+            WHEN cpa.Score > 50 THEN 2
+            WHEN cpa.Score > 0 THEN 3
+            ELSE 4
+        END as ScoreCategory,
+        CASE 
+            WHEN upa.Reputation > 10000 AND cpa.Score > 100 THEN 'EliteHighImpact'
+            WHEN upa.Reputation > 5000 AND cpa.Score > 50 THEN 'VeteranHighImpact'
+            WHEN upa.Reputation > 1000 AND cpa.Score > 0 THEN 'ExperiencedHighImpact'
+            ELSE 'StandardImpact'
+        END as ImpactLevel,
+        ROW_NUMBER() OVER (PARTITION BY cpa.PostType ORDER BY cpa.Score DESC, upa.Reputation DESC) as OverallRank
+    FROM UserPostAnalysis upa
+    INNER JOIN ComplexPostAnalysis cpa ON upa.UserId = cpa.OwnerUserId
+    WHERE upa.PostCount >= 1 
+      AND upa.UserRole IN ('Questioner', 'Answerer')
+      AND cpa.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6 months')
+    GROUP BY
+        upa.UserId, upa.DisplayName, upa.Reputation, upa.UserRole, upa.PostCount, upa.CommentCount, upa.BadgeCount, upa.VoteCount,
+        upa.ReputationLevel, upa.RankByReputation, upa.ReputationPercentile, upa.QuestionCount, upa.AnswerCount, upa.AvgPostScore,
+        upa.PostTitles, upa.FavoriteTags, upa.EngagementLevel, upa.ViewChange, upa.UpVoteChange, upa.DownVoteChange,
+        cpa.PostId, cpa.Title, cpa.Score, cpa.ViewCount, cpa.AnswerCount, cpa.CommentCount, cpa.CreationDate, cpa.OwnerName,
+        cpa.PostType, cpa.PopularityLevel, cpa.RankByScore, cpa.AvgScoreByType, cpa.TopScoredTitle, cpa.ScoreComparison,
+        cpa.CommentCountSincePost, cpa.ViewChange, cpa.ScoreChange, cpa.PostMetricsString, cpa.AllTags, cpa.LinkCount,
+        cpa.LastActivityDate, cpa.FirstActivityDate
+),
+FinalSelect AS (
+    SELECT 
+        fa.UserId,
+        fa.DisplayName,
+        fa.Reputation,
+        fa.UserRole,
+        fa.PostCount,
+        fa.CommentCount,
+        fa.BadgeCount,
+        fa.VoteCount,
+        fa.ReputationLevel,
+        fa.RankByReputation,
+        fa.ReputationPercentile,
+        fa.QuestionCount,
+        fa.AnswerCount,
+        fa.AvgPostScore,
+        fa.PostTitles,
+        fa.FavoriteTags,
+        fa.EngagementLevel,
+        fa.ViewChange,
+        fa.UpVoteChange,
+        fa.DownVoteChange,
+        fa.PostId,
+        fa.Title,
+        fa.Score,
+        fa.ViewCount,
+        fa.PostAnswerCount,
+        fa.PostCommentCount,
+        fa.PostCreationDate,
+        fa.PostOwnerName,
+        fa.PostType,
+        fa.PostPopularity,
+        fa.PostRank,
+        fa.AvgScoreByType,
+        fa.TopScoredTitle,
+        fa.ScoreComparison,
+        fa.CommentCountSincePost,
+        fa.PostViewChange,
+        fa.ScoreChange,
+        fa.PostMetricsString,
+        fa.AllTags,
+        fa.LinkCount,
+        fa.LastActivityDate,
+        fa.FirstActivityDate,
+        fa.DaysSinceRegistration,
+        fa.ScoreCategory,
+        fa.ImpactLevel,
+        fa.OverallRank,
+        CASE 
+            WHEN fa.PostRank <= 10 THEN 'Top10'
+            WHEN fa.PostRank <= 50 THEN 'Top50'
+            WHEN fa.PostRank <= 100 THEN 'Top100'
+            ELSE 'BelowTop100'
+        END as TopRankCategory,
+        CASE 
+            WHEN fa.PostType = 'Question' THEN 
+                (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND OwnerUserId = fa.UserId)
+            WHEN fa.PostType = 'Answer' THEN 
+                (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 2 AND OwnerUserId = fa.UserId)
+            ELSE 0
+        END as TypeSpecificPostCount,
+        COALESCE(
+            (SELECT COUNT(*) FROM Votes v WHERE v.PostId = fa.PostId AND v.VoteTypeId IN (1,2,3)), 
+            0
+        ) as TotalVotesForPost,
+        (fa.PostViewChange + fa.ScoreChange) as ActivityImpactScore,
+        CASE 
+            WHEN fa.PostViewChange > 100 AND fa.ScoreChange > 10 THEN 'HighlyActive'
+            WHEN fa.PostViewChange > 50 AND fa.ScoreChange > 5 THEN 'ModeratelyActive'
+            WHEN fa.PostViewChange > 0 OR fa.ScoreChange > 0 THEN 'SlightlyActive'
+            ELSE 'Inactive'
+        END as ActivityLevel,
+        'UserPostAnalysis' as ReportType
+    FROM FinalAggregation fa
+    WHERE fa.PostCreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 weeks')
+      AND (fa.Score >= 50 OR fa.ViewCount >= 100)
+      AND (fa.CommentCountSincePost >= 3 OR fa.ScoreChange >= 20)
+)
+SELECT *
+FROM FinalSelect
+ORDER BY Score DESC, Reputation DESC, PostViewChange DESC
+LIMIT 1000;

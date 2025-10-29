@@ -1,0 +1,159 @@
+WITH
+  UserEngagement AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      COUNT(DISTINCT p.Id) AS TotalPosts,
+      SUM(CASE WHEN pt.Name = 'Question' THEN 1 ELSE 0 END) AS QuestionCount,
+      SUM(CASE WHEN pt.Name = 'Answer' THEN 1 ELSE 0 END) AS AnswerCount,
+      COUNT(DISTINCT c.Id) AS CommentCount,
+      COUNT(DISTINCT v.Id) AS VoteCount,
+      MAX(p.CreationDate) AS LastPostDate,
+      AVG(p.Score) AS AveragePostScore,
+      SUM(p.FavoriteCount) AS TotalFavorites
+    FROM
+      Users u
+      LEFT JOIN Posts p
+        ON u.Id = p.OwnerUserId
+      LEFT JOIN PostTypes pt
+        ON p.PostTypeId = pt.Id
+      LEFT JOIN Comments c
+        ON u.Id = c.UserId
+      LEFT JOIN Votes v
+        ON u.Id = v.UserId
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation
+  ),
+  PostDetails AS (
+    SELECT
+      p.Id AS PostId,
+      p.Title,
+      p.Score,
+      p.AnswerCount,
+      p.CommentCount,
+      p.CreationDate,
+      p.LastActivityDate,
+      CAST(
+        (EXTRACT(EPOCH FROM (p.LastActivityDate::timestamp - p.CreationDate::timestamp)) / 86400)
+        AS INTEGER
+      ) AS PostLifespanDays,
+      CASE
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        ELSE 'Active'
+      END AS PostStatus,
+      pt.Name AS PostType,
+      u.DisplayName AS OwnerDisplayName,
+      (
+        SELECT
+          COUNT(*)
+        FROM
+          Comments c
+        WHERE
+          c.PostId = p.Id
+      ) AS CommentCountForPost,
+      (
+        SELECT
+          COUNT(*)
+        FROM
+          Votes v
+        WHERE
+          v.PostId = p.Id AND v.VoteTypeId = 2
+      ) AS UpVoteCountForPost,
+      (
+        SELECT
+          COUNT(*)
+        FROM
+          Votes v
+        WHERE
+          v.PostId = p.Id AND v.VoteTypeId = 3
+      ) AS DownVoteCountForPost,
+      LAG(p.Score, 1, 0) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate) AS PreviousScore,
+      p.OwnerUserId
+    FROM
+      Posts p
+      JOIN PostTypes pt
+        ON p.PostTypeId = pt.Id
+      LEFT JOIN Users u
+        ON p.OwnerUserId = u.Id
+    WHERE
+      p.OwnerUserId IS NOT NULL AND p.OwnerUserId <> -1
+  ),
+  TagAnalysis AS (
+    SELECT
+      t.TagName,
+      COUNT(DISTINCT p.Id) AS PostsWithTag,
+      SUM(p.Score) AS TotalScoreForTag,
+      AVG(p.Score) AS AverageScoreForTag,
+      SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCountForTag,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCountForTag,
+      RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS TagPopularityRank
+    FROM
+      Tags t
+      JOIN Posts p
+        ON p.Tags LIKE '%' || t.TagName || '%'
+    WHERE
+      p.PostTypeId = 1 AND p.OwnerUserId IS NOT NULL AND p.OwnerUserId <> -1
+    GROUP BY
+      t.TagName
+  )
+SELECT
+  ue.DisplayName,
+  ue.Reputation,
+  ue.TotalPosts,
+  ue.QuestionCount,
+  ue.AnswerCount,
+  ue.CommentCount,
+  ue.VoteCount,
+  ue.TotalFavorites,
+  pd.Title AS LatestPostTitle,
+  pd.Score AS LatestPostScore,
+  pd.PostStatus,
+  pd.PostType,
+  pd.PostLifespanDays,
+  ta.TagName AS TopTag,
+  ta.PostsWithTag AS TopTagPosts,
+  ta.AverageScoreForTag,
+  CASE
+    WHEN ue.LastPostDate IS NULL THEN 'Never Posted'
+    WHEN ue.LastPostDate < (cast('2024-10-01' as date) - INTERVAL '365' DAY) THEN 'Inactive'
+    ELSE 'Active'
+  END AS UserActivityStatus,
+  ue.AveragePostScore,
+  pd.PreviousScore AS ScoreOfPreviousPost,
+  CASE
+    WHEN pd.Score > pd.PreviousScore THEN 'Improved'
+    WHEN pd.Score < pd.PreviousScore THEN 'Declined'
+    ELSE 'Stable'
+  END AS ScoreTrend,
+  COALESCE(
+    SUBSTRING(pd.Title FROM 1 FOR 10) || '...' || REVERSE(pd.OwnerDisplayName),
+    'N/A'
+  ) AS ProcessedTitle,
+  (
+    pd.Score + pd.CommentCountForPost - pd.UpVoteCountForPost + pd.DownVoteCountForPost
+  ) * COALESCE(ta.TagPopularityRank, 0) AS WeightedPerformanceMetric
+FROM
+  UserEngagement ue
+LEFT JOIN PostDetails pd
+  ON ue.UserId = pd.OwnerUserId
+LEFT JOIN TagAnalysis ta
+  ON ta.TagPopularityRank <= 5 AND ta.TagName IN (
+    SELECT
+      TRIM(tag)
+    FROM
+      (
+        SELECT TRIM(value) AS tag
+        FROM
+          -- build a JSON array from DisplayName tokens in a more portable way
+          (SELECT json_array_elements_text(('["' || REPLACE(REPLACE(ue.DisplayName, '"', ''), ' ', '","') || '"]')::json) AS value)
+      ) AS derived
+  )
+WHERE
+  ue.Reputation > 1000 AND ue.TotalPosts > 10
+ORDER BY
+  ue.Reputation DESC,
+  pd.LastActivityDate DESC;

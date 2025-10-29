@@ -1,0 +1,197 @@
+WITH UserSummaryStats AS (
+    SELECT
+        u.Id AS UserId,
+        COALESCE(u.DisplayName, 'Anonymous User') AS UserDisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.Views AS TotalProfileViews,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesGiven,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesGiven,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadgesCount,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadgesCount,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadgesCount,
+        AVG(p.Score) FILTER (WHERE p.OwnerUserId = u.Id AND p.Score IS NOT NULL) AS AvgOwnedPostScore,
+        CASE
+            WHEN u.Reputation > 10000 AND u.LastAccessDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30' DAY) THEN 'Highly Active & Reputable'
+            WHEN u.Reputation > 1000 AND u.LastAccessDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '90' DAY) THEN 'Active Contributor'
+            WHEN u.LastAccessDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1' YEAR) THEN 'Occasional User'
+            ELSE 'Dormant User'
+        END AS UserActivityLevel,
+        CASE
+            WHEN EXTRACT(YEAR FROM TIMESTAMP '2024-10-01 12:34:56') - EXTRACT(YEAR FROM u.CreationDate) > 0
+            THEN u.Reputation / (EXTRACT(YEAR FROM TIMESTAMP '2024-10-01 12:34:56') - EXTRACT(YEAR FROM u.CreationDate))
+            ELSE u.Reputation
+        END AS AvgAnnualReputationGrowth
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views
+),
+PostAggregatedMetrics AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.OwnerUserId,
+        COALESCE(q.Title, 'No Title Provided') AS QuestionTitle,
+        q.CreationDate AS QuestionCreationDate,
+        q.LastEditDate,
+        q.LastActivityDate,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        q.FavoriteCount,
+        COALESCE(q.ClosedDate, TIMESTAMP '1900-01-01 00:00:00') AS ClosedDate,
+        LENGTH(q.Body) AS BodyLength,
+        TRIM(BOTH '>' FROM TRIM(BOTH '<' FROM q.Tags)) AS RawTagsString,
+        string_to_array(TRIM(BOTH '>' FROM TRIM(BOTH '<' FROM q.Tags)), '><') AS TagArray,
+        COUNT(DISTINCT pha.UserId) AS NumberOfEditors,
+        COUNT(DISTINCT phc.Id) AS TotalHistoryEntries,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN 1 ELSE 0 END) AS EditCount,
+        SUM(CASE WHEN pl.LinkTypeId = 1 THEN 1 ELSE 0 END) AS LinkedPostsCount,
+        SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicateLinksCount,
+        EXISTS (
+            SELECT 1
+            FROM PostHistory ph_reopen
+            WHERE ph_reopen.PostId = q.Id AND ph_reopen.PostHistoryTypeId = 11
+        ) AS WasReopened,
+        ROW_NUMBER() OVER (PARTITION BY q.OwnerUserId ORDER BY q.Score DESC, q.ViewCount DESC) AS RankByUserScore,
+        AVG(q.Score) OVER (ORDER BY q.CreationDate ASC ROWS BETWEEN 5 PRECEDING AND CURRENT ROW) AS MovingAvgScore,
+        EXTRACT(EPOCH FROM (q.LastEditDate - q.CreationDate)) / 3600.0 AS HoursUntilLastEdit,
+        q.AcceptedAnswerId IS NOT NULL AS HasAcceptedAnswer
+    FROM Posts q
+    LEFT JOIN PostHistory pha ON q.Id = pha.PostId AND pha.PostHistoryTypeId IN (4,5,6)
+    LEFT JOIN PostHistory phc ON q.Id = phc.PostId
+    LEFT JOIN PostHistory ph ON q.Id = ph.PostId
+    LEFT JOIN PostLinks pl ON q.Id = pl.PostId
+    WHERE q.PostTypeId = 1
+    GROUP BY
+        q.Id, q.OwnerUserId, q.Title, q.CreationDate, q.LastEditDate, q.LastActivityDate,
+        q.Score, q.ViewCount, q.AnswerCount, q.FavoriteCount, q.ClosedDate, q.Body, q.Tags, q.AcceptedAnswerId
+),
+CommentSentimentAndActivity AS (
+    SELECT
+        c.PostId,
+        COUNT(c.Id) AS TotalComments,
+        AVG(c.Score) AS AvgCommentScore,
+        SUM(CASE WHEN c.Score > 0 THEN 1 ELSE 0 END) AS PositiveComments,
+        SUM(CASE WHEN c.Score < 0 THEN 1 ELSE 0 END) AS NegativeComments,
+        MAX(c.CreationDate) AS LatestCommentDate,
+        ROW_NUMBER() OVER (PARTITION BY c.PostId ORDER BY c.Score DESC, c.CreationDate DESC) AS CommentRankInPost
+    FROM Comments c
+    GROUP BY c.PostId
+),
+SpecialPosts AS (
+    SELECT
+        pam.QuestionId,
+        pam.QuestionTitle,
+        'Highly Engaged & Valued' AS PostCategory,
+        pam.QuestionScore,
+        pam.FavoriteCount,
+        pam.EditCount,
+        pam.AnswerCount
+    FROM PostAggregatedMetrics pam
+    WHERE pam.QuestionScore >= 150
+      AND pam.FavoriteCount >= 30
+      AND pam.EditCount < 7
+      AND pam.AnswerCount >= 3
+    UNION ALL
+    SELECT
+        pam.QuestionId,
+        pam.QuestionTitle,
+        'Problematic/Needs Review' AS PostCategory,
+        pam.QuestionScore,
+        pam.FavoriteCount,
+        pam.EditCount,
+        pam.AnswerCount
+    FROM PostAggregatedMetrics pam
+    LEFT JOIN CommentSentimentAndActivity csa ON pam.QuestionId = csa.PostId
+    WHERE (pam.EditCount >= 10 OR pam.TotalHistoryEntries >= 20 OR pam.ClosedDate > pam.CreationDate)
+      AND pam.QuestionScore < 20
+      AND COALESCE(csa.TotalComments, 0) > 5
+)
+SELECT
+    uss.UserId,
+    uss.UserDisplayName,
+    uss.Reputation,
+    uss.UserActivityLevel,
+    uss.TotalQuestions,
+    uss.AvgOwnedPostScore,
+    uss.AvgAnnualReputationGrowth,
+    pam.QuestionId,
+    pam.QuestionTitle,
+    pam.QuestionScore,
+    pam.ViewCount,
+    pam.AnswerCount,
+    pam.FavoriteCount,
+    pam.BodyLength,
+    pam.EditCount,
+    pam.WasReopened,
+    pam.RankByUserScore,
+    pam.MovingAvgScore,
+    pam.HoursUntilLastEdit,
+    pam.HasAcceptedAnswer,
+    COALESCE(csa.TotalComments, 0) AS QuestionTotalComments,
+    COALESCE(csa.AvgCommentScore, 0.0) AS QuestionAvgCommentScore,
+    COALESCE(csa.PositiveComments, 0) AS QuestionPositiveComments,
+    COALESCE(csa.NegativeComments, 0) AS QuestionNegativeComments,
+    COALESCE(EXTRACT(DAY FROM (TIMESTAMP '2024-10-01 12:34:56' - csa.LatestCommentDate)), 9999) AS DaysSinceLastComment,
+    LOWER(SUBSTRING(pam.QuestionTitle FROM 1 FOR 15)) AS TitlePrefixLower,
+    UPPER(REPLACE(REPLACE(pam.QuestionTitle, ' ', '-'), '.', '')) AS TitleDashCasedUpper,
+    (pam.QuestionScore * 0.7) + (pam.ViewCount * 0.005) + (pam.AnswerCount * 1.5) + (pam.FavoriteCount * 2.5)
+    - (pam.EditCount * 0.5) - (CASE WHEN pam.WasReopened THEN 10 ELSE 0 END) AS QuestionQualityScore,
+    CASE
+        WHEN pam.ClosedDate > pam.QuestionCreationDate AND pam.AcceptedAnswerId IS NULL THEN 'Closed & Unanswered'
+        WHEN pam.HasAcceptedAnswer AND pam.ClosedDate <= pam.QuestionCreationDate THEN 'Answered & Open'
+        WHEN pam.AnswerCount = 0 AND pam.QuestionCreationDate < (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '180' DAY) THEN 'Stale No-Answer'
+        WHEN pam.FavoriteCount >= 50 AND pam.QuestionScore >= 100 AND pam.HasAcceptedAnswer THEN 'Highly Valued & Resolved'
+        ELSE 'Regular/Needs Attention'
+    END AS DetailedQuestionStatus,
+    (
+        SELECT STRING_AGG(t.TagName, ', ')
+        FROM UNNEST(pam.TagArray) AS tt(TagName)
+        LEFT JOIN Tags t ON tt.TagName = t.TagName
+        WHERE tt.TagName IS NOT NULL
+    ) AS QuestionTagsList,
+    (
+        SELECT c_owner.Text
+        FROM Comments c_owner
+        WHERE c_owner.PostId = pam.QuestionId AND c_owner.UserId = pam.OwnerUserId
+        ORDER BY c_owner.CreationDate DESC
+        LIMIT 1
+    ) AS LatestOwnerCommentText,
+    COALESCE(sp.PostCategory, 'Standard') AS SpecialPostCategory,
+    EXISTS (
+        SELECT 1
+        FROM Comments co
+        WHERE co.PostId = pam.QuestionId AND co.UserId = uss.UserId
+    ) AS HasOwnerCommentedOnOwnQuestion
+FROM UserSummaryStats uss
+JOIN PostAggregatedMetrics pam ON uss.UserId = pam.OwnerUserId
+LEFT JOIN CommentSentimentAndActivity csa ON pam.QuestionId = csa.PostId
+LEFT JOIN SpecialPosts sp ON pam.QuestionId = sp.QuestionId
+WHERE
+    uss.Reputation >= 500
+    AND pam.QuestionScore >= 10
+    AND pam.ViewCount > 50
+    AND pam.BodyLength BETWEEN 100 AND 5000
+    AND (
+        pam.WasReopened = TRUE
+        OR pam.EditCount > 3
+        OR (pam.DuplicateLinksCount > 0 AND pam.AnswerCount = 0)
+        OR COALESCE(csa.AvgCommentScore, 0) < 0
+    )
+    AND pam.TagArray IS NOT NULL
+    AND COALESCE(sp.PostCategory, 'Standard') != 'Highly Engaged & Valued'
+ORDER BY
+    QuestionQualityScore DESC,
+    uss.Reputation DESC,
+    pam.ViewCount DESC,
+    QuestionTotalComments DESC,
+    uss.AvgAnnualReputationGrowth DESC
+LIMIT 5000;

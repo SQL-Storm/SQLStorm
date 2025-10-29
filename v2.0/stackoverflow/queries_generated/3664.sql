@@ -1,0 +1,140 @@
+-- {"query": "3664.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1722} 
+
+/*--------------------------------------------------------------
+  Complex benchmarking query on the StackOverflow replica schema
+  --------------------------------------------------------------*/
+WITH
+/*--------------------------------------------------------------
+  1. Aggregate badge counts per user by class (Gold/Silver/Bronze)
+  --------------------------------------------------------------*/
+user_badge_counts AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_cnt,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_cnt,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_cnt
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+/*--------------------------------------------------------------
+  2. Summarise posts per user (questions vs answers) and compute
+     latest activity timestamps, average scores and tag‑list string
+  --------------------------------------------------------------*/
+user_post_stats AS (
+    SELECT
+        p.OwnerUserId                                          AS user_id,
+        COUNT(*) FILTER (WHERE pt.Name = 'Question')           AS question_cnt,
+        COUNT(*) FILTER (WHERE pt.Name = 'Answer')             AS answer_cnt,
+        COALESCE(MAX(p.LastActivityDate), MIN(p.CreationDate)) AS last_activity,
+        AVG(p.Score)                                           AS avg_score,
+        /* build a semi‑unique comma‑separated tag list (questions only) */
+        STRING_AGG(DISTINCT TRIM(BOTH '<>' FROM UNNEST(string_to_array(p.Tags, '><'))), ', ')
+            FILTER (WHERE p.PostTypeId = 1)                    AS tag_list
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    GROUP BY p.OwnerUserId
+),
+
+/*--------------------------------------------------------------
+  3. Compute per‑user vote profile (up‑votes vs down‑votes) and
+     latest vote date, using a window function to rank users.
+  --------------------------------------------------------------*/
+user_vote_profile AS (
+    SELECT
+        v.UserId                                 AS user_id,
+        COUNT(*) FILTER (WHERE vt.Name = 'UpMod')   AS up_votes,
+        COUNT(*) FILTER (WHERE vt.Name = 'DownMod') AS down_votes,
+        MAX(v.CreationDate)                         AS last_vote_date,
+        ROW_NUMBER() OVER (ORDER BY COUNT(*) FILTER (WHERE vt.Name = 'UpMod') DESC) AS vote_rank
+    FROM Votes v
+    JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    GROUP BY v.UserId
+),
+
+/*--------------------------------------------------------------
+  4. Correlated sub‑query: count comments made after the last edit
+     of each post; also showcase NULL handling with COALESCE.
+  --------------------------------------------------------------*/
+post_comment_delta AS (
+    SELECT
+        p.Id                                     AS post_id,
+        p.OwnerUserId                            AS user_id,
+        COALESCE(
+            (SELECT COUNT(*)
+             FROM Comments c
+             WHERE c.PostId = p.Id
+               AND (p.LastEditDate IS NULL OR c.CreationDate > p.LastEditDate)
+            ), 0)                               AS comments_after_last_edit
+    FROM Posts p
+),
+
+/*--------------------------------------------------------------
+  5. Top users by reputation (limit 100) and top users by activity
+     (last_activity within last 30 days). Use UNION ALL to merge
+     the two sets, later intersect to find users excelling in both.
+  --------------------------------------------------------------*/
+top_by_rep AS (
+    SELECT u.Id AS user_id, u.Reputation
+    FROM Users u
+    ORDER BY u.Reputation DESC
+    LIMIT 100
+),
+top_by_activity AS (
+    SELECT ups.user_id, ups.last_activity
+    FROM user_post_stats ups
+    WHERE ups.last_activity >= CURRENT_DATE - INTERVAL '30 days'
+    ORDER BY ups.last_activity DESC
+    LIMIT 100
+),
+
+/*--------------------------------------------------------------
+  6. Intersection of the two top‑lists to obtain elite users.
+  --------------------------------------------------------------*/
+elite_users AS (
+    SELECT t1.user_id
+    FROM top_by_rep t1
+    INTERSECT
+    SELECT t2.user_id
+    FROM top_by_activity t2
+),
+
+/*--------------------------------------------------------------
+  7. Final composition: join all CTEs, demonstrate outer joins,
+     string manipulation, CASE expression, and NULL logic.
+  --------------------------------------------------------------*/
+final_report AS (
+    SELECT
+        u.Id                                    AS user_id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(ubc.gold_cnt,0)                AS gold_badges,
+        COALESCE(ubc.silver_cnt,0)              AS silver_badges,
+        COALESCE(ubc.bronze_cnt,0)              AS bronze_badges,
+        COALESCE ups.question_cnt,0)            AS total_questions,
+        COALESCE ups.answer_cnt,0)              AS total_answers,
+        ROUND(UPS.avg_score::numeric,2)         AS average_post_score,
+        UPS.tag_list,
+        UVP.up_votes,
+        UVP.down_votes,
+        UVP.vote_rank,
+        PCD.comments_after_last_edit,
+        CASE
+            WHEN u.Reputation >= 20000 THEN 'Legendary'
+            WHEN u.Reputation BETWEEN 10000 AND 19999 THEN 'Veteran'
+            WHEN u.Reputation BETWEEN 5000 AND 9999 THEN 'Experienced'
+            ELSE 'Rising'
+        END                                      AS reputation_tier,
+        /* Null‑aware boolean: user is elite only if present in elite_users */
+        CASE WHEN EU.user_id IS NOT NULL THEN TRUE ELSE FALSE END AS is_elite
+    FROM Users u
+    LEFT JOIN user_badge_counts ubc      ON ubc.UserId = u.Id
+    LEFT JOIN user_post_stats ups        ON ups.user_id = u.Id
+    LEFT JOIN user_vote_profile uvp      ON uvp.user_id = u.Id
+    LEFT JOIN post_comment_delta pcd     ON pcd.user_id = u.Id
+    LEFT JOIN elite_users eu             ON eu.user_id = u.Id
+)
+SELECT *
+FROM final_report
+ORDER BY reputation_tier DESC, Reputation DESC
+LIMIT 50;

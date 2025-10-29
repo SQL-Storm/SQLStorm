@@ -1,0 +1,97 @@
+-- {"query": "5443.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 723} 
+WITH RankedPostActivity AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Title,
+    p.Tags,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.OwnerDisplayName,
+    p.CloseReasonTypes = NULL, -- placeholder to ensure proper column resolution in some engines
+    ROW_NUMBER() OVER (
+      PARTITION BY p.PostTypeId
+      ORDER BY
+        GREATEST(COALESCE(p.LastActivityDate, p.CreationDate), COALESCE(p.CreationDate, '1900-01-01')) DESC,
+        p.Score DESC,
+        p.ViewCount DESC,
+        p.Id ASC
+    ) AS rn
+  FROM Posts p
+  LEFT JOIN LATERAL (
+    SELECT 1
+  ) AS l ON TRUE
+  WHERE p.PostTypeId IN (1, 2) -- Questions and Answers
+    AND p.ClosedDate IS NULL
+),
+TopInteractions AS (
+  SELECT
+    rp.PostId,
+    rp.PostTypeId,
+    rp.Title,
+    rp.Tags,
+    rp.OwnerUserId,
+    rp.OwnerDisplayName,
+    rp.CreationDate,
+    rp.LastActivityDate,
+    rp.Score,
+    rp.ViewCount,
+    COALESCE(vt.TotalUp, 0) AS UpVotes,
+    COALESCE(vt.TotalDown, 0) AS DownVotes,
+    COALESCE(vc.TotalComment, 0) AS CommentCount,
+    COALESCE(b.TotalBadges, 0) AS BadgeCount
+  FROM RankedPostActivity rp
+  LEFT JOIN (
+    SELECT PostId,
+           SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUp,
+           SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDown
+    FROM Votes
+    GROUP BY PostId
+  ) vt ON vt.PostId = rp.PostId
+  LEFT JOIN (
+    SELECT PostId,
+           COUNT(*) AS TotalComment
+    FROM Comments
+    GROUP BY PostId
+  ) vc ON vc.PostId = rp.PostId
+  LEFT JOIN (
+    SELECT PostId,
+           COUNT(*) AS TotalBadges
+    FROM Posts p
+    LEFT JOIN Badges b ON b.UserId = p.OwnerUserId AND p.Id = b.Id
+    GROUP BY PostId
+  ) b ON b.PostId = rp.PostId
+  WHERE rp.rn <= 50
+),
+WindowedStats AS (
+  SELECT
+    t.*,
+    AVG(UpVotes) OVER (PARTITION BY PostTypeId) AS AvgUpVotesByType,
+    SUM(DownVotes) OVER (PARTITION BY PostTypeId) AS SumDownVotesByType,
+    ROW_NUMBER() OVER (PARTITION BY PostTypeId ORDER BY UpVotes DESC, DownVotes ASC) AS rank_by_votes
+  FROM TopInteractions t
+)
+SELECT
+  PostId,
+  PostTypeId,
+  Title,
+  Tags,
+  OwnerUserId,
+  OwnerDisplayName,
+  CreationDate,
+  LastActivityDate,
+  Score,
+  ViewCount,
+  UpVotes,
+  DownVotes,
+  CommentCount,
+  BadgeCount,
+  AvgUpVotesByType,
+  SumDownVotesByType,
+  rank_by_votes
+FROM WindowedStats
+ORDER BY PostTypeId, rank_by_votes
+LIMIT 100;

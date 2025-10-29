@@ -1,0 +1,125 @@
+WITH 
+ranked_users AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS rn
+    FROM Users u
+    WHERE u.Reputation > 10000
+),
+user_badges AS (
+    SELECT 
+        b.UserId,
+        COUNT(*)                                     AS total_badges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_badges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_badges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_badges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+latest_questions AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId 
+                           ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate > DATE '2024-10-01' - INTERVAL '30' DAY
+),
+question_tags AS (
+    SELECT 
+        q.Id               AS QuestionId,
+        TRIM(BOTH '><' FROM value) AS Tag
+    FROM latest_questions q,
+    LATERAL (
+      SELECT UNNEST(string_to_array(q.Tags, '><')) AS value
+    ) s
+    WHERE q.rn = 1
+),
+question_close AS (
+    SELECT 
+        ph.PostId,
+        CASE 
+            WHEN ph.PostHistoryTypeId = 10 
+                 AND ph.Comment LIKE '%101%'
+            THEN 'DuplicateClosed'
+            ELSE 'Open'
+        END AS CloseStatus
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10
+),
+answer_stats AS (
+    SELECT 
+        q.Id                                   AS QuestionId,
+        COALESCE( (SELECT COUNT(*) 
+                   FROM Posts a 
+                   WHERE a.PostTypeId = 2 
+                     AND a.ParentId = q.Id
+                     AND a.Score > 0), 0)      AS PositiveAnswers,
+        COALESCE( (SELECT ROUND(AVG(v.Score),2)
+                   FROM Votes v
+                   JOIN Posts a ON a.Id = v.PostId
+                   WHERE a.PostTypeId = 2 
+                     AND a.ParentId = q.Id
+                     AND v.VoteTypeId = 2), 0) AS AvgUpVotesOnAnswers,
+        COALESCE( (SELECT COUNT(*) 
+                   FROM Votes v
+                   WHERE v.PostId = q.AcceptedAnswerId
+                     AND v.VoteTypeId = 1), 0)  AS AcceptedByOriginatorCount
+    FROM latest_questions q
+    WHERE q.rn = 1
+)
+
+SELECT 
+    ru.Id                                   AS UserId,
+    ru.DisplayName,
+    ru.Reputation,
+    ub.total_badges,
+    ub.gold_badges,
+    ub.silver_badges,
+    ub.bronze_badges,
+    lq.Title                               AS LatestQuestionTitle,
+    lq.Score                               AS LatestQuestionScore,
+    lq.ViewCount                           AS LatestQuestionViews,
+    COALESCE(asb.PositiveAnswers,0)        AS PositiveAnswerCount,
+    COALESCE(asb.AvgUpVotesOnAnswers,0)    AS AvgUpVotesOnAnswers,
+    COALESCE(asb.AcceptedByOriginatorCount,0) AS AcceptanceVotes,
+    STRING_AGG(DISTINCT qt.Tag, ', ')      AS RecentTags,
+    qc.CloseStatus,
+    ROW_NUMBER() OVER (PARTITION BY ru.Id ORDER BY lq.CreationDate DESC) AS QuestionRecencyRank,
+    CASE 
+        WHEN lq.Tags IS NULL OR lq.Tags = '' THEN 'NoTags'
+        ELSE 'HasTags'
+    END                                   AS TagPresenceFlag,
+    CASE 
+        WHEN ub.gold_badges > 0 THEN 'GoldMember'
+        WHEN ub.silver_badges > 0 THEN 'SilverMember'
+        ELSE 'Member'
+    END                                   AS BadgeLevel
+FROM ranked_users ru
+LEFT JOIN user_badges ub       ON ub.UserId = ru.Id
+LEFT JOIN latest_questions lq ON lq.OwnerUserId = ru.Id AND lq.rn = 1
+LEFT JOIN question_tags qt    ON qt.QuestionId = lq.Id
+LEFT JOIN question_close qc   ON qc.PostId = lq.Id
+LEFT JOIN answer_stats asb    ON asb.QuestionId = lq.Id
+WHERE ru.rn <= 100
+GROUP BY 
+    ru.Id, ru.DisplayName, ru.Reputation,
+    ub.total_badges, ub.gold_badges, ub.silver_badges, ub.bronze_badges,
+    lq.Title, lq.Score, lq.ViewCount, lq.CreationDate, lq.Id,
+    asb.PositiveAnswers, asb.AvgUpVotesOnAnswers, asb.AcceptedByOriginatorCount,
+    qc.CloseStatus, lq.Tags
+HAVING COUNT(qt.Tag) > 0
+UNION ALL
+SELECT 
+    NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+    NULL, NULL, NULL, NULL, NULL, NULL,
+    NULL, NULL, NULL, NULL
+LIMIT 101;

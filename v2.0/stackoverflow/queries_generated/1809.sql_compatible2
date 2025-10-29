@@ -1,0 +1,238 @@
+WITH UserActivity AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Views AS UserViews,
+        U.UpVotes AS UserUpVotes,
+        U.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT Q.Id) AS TotalQuestions,
+        COUNT(DISTINCT A.Id) AS TotalAnswers,
+        COUNT(DISTINCT P_All.Id) AS TotalPosts,
+        SUM(CASE WHEN P_All.PostTypeId = 1 THEN P_All.Score ELSE 0 END) AS TotalQuestionScore,
+        SUM(CASE WHEN P_All.PostTypeId = 2 THEN P_All.Score ELSE 0 END) AS TotalAnswerScore,
+        SUM(CASE WHEN P_All.PostTypeId = 1 AND P_All.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS QuestionsWithAcceptedAnswer,
+        SUM(CASE WHEN A.AcceptedAnswerId = A.Id THEN 1 ELSE 0 END) AS AcceptedAnswersCount,
+        MAX(P_All.CreationDate) AS LatestPostDate,
+        MIN(P_All.CreationDate) AS EarliestPostDate,
+        (SELECT COUNT(C.Id) FROM Comments C WHERE C.UserId = U.Id) AS TotalCommentsMade,
+        COALESCE(SUM(P_All.FavoriteCount), 0) AS TotalFavoriteCountOnPosts
+    FROM Users U
+    LEFT JOIN Posts P_All ON U.Id = P_All.OwnerUserId
+    LEFT JOIN Posts Q ON U.Id = Q.OwnerUserId AND Q.PostTypeId = 1
+    LEFT JOIN Posts A ON U.Id = A.OwnerUserId AND A.PostTypeId = 2
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Views, U.UpVotes, U.DownVotes
+),
+PostHistoryStats AS (
+    SELECT
+        PH.PostId,
+        PH.UserId AS EditorUserId,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.Id END) AS EditCount,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.CreationDate ELSE NULL END) AS LastEditDate,
+        MIN(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.CreationDate ELSE NULL END) AS FirstEditDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.CreationDate ELSE NULL END) AS ClosedDateHistory,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 12 THEN PH.CreationDate ELSE NULL END) AS DeletedDateHistory
+    FROM PostHistory PH
+    WHERE PH.UserId IS NOT NULL
+    GROUP BY PH.PostId, PH.UserId
+),
+UserBadgeSummary AS (
+    SELECT
+        B.UserId,
+        COUNT(B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(B.Date) AS LatestBadgeDate
+    FROM Badges B
+    GROUP BY B.UserId
+),
+TagPerformance AS (
+    SELECT
+        P.OwnerUserId AS UserId,
+        unnest(string_to_array(substring(P.Tags, 2, length(P.Tags)-2), '><')) AS TagName,
+        SUM(P.ViewCount) AS TagPostsViewCount,
+        SUM(P.Score) AS TagPostsScore,
+        COUNT(P.Id) AS TagPostCount
+    FROM Posts P
+    WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2
+    GROUP BY P.OwnerUserId, unnest(string_to_array(substring(P.Tags, 2, length(P.Tags)-2), '><'))
+),
+UserTagImpact AS (
+    SELECT
+        TP.UserId,
+        COUNT(DISTINCT TP.TagName) AS DistinctTagsContributed,
+        SUM(TP.TagPostsViewCount) AS TotalTagViews,
+        SUM(TP.TagPostsScore) AS TotalTagScore,
+        MAX(TP.TagPostsScore) AS MaxTagPostScore,
+        (SELECT TagName FROM TagPerformance WHERE UserId = TP.UserId ORDER BY TagPostCount DESC, TagPostsViewCount DESC LIMIT 1) AS MostFrequentTag,
+        (SELECT TagName FROM TagPerformance WHERE UserId = TP.UserId ORDER BY TagPostsScore DESC, TagPostsViewCount DESC LIMIT 1) AS HighestScoringTag
+    FROM TagPerformance TP
+    GROUP BY TP.UserId
+),
+PostLinkAnalysis AS (
+    SELECT
+        P.OwnerUserId AS UserId,
+        COUNT(PL.Id) AS LinkedPostsCount,
+        SUM(CASE WHEN PL.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicateLinksCount,
+        MAX(PL.CreationDate) AS LatestLinkDate
+    FROM Posts P
+    JOIN PostLinks PL ON P.Id = PL.PostId OR P.Id = PL.RelatedPostId
+    GROUP BY P.OwnerUserId
+),
+RankedActivity AS (
+    SELECT
+        UA.UserId,
+        UA.DisplayName,
+        UA.Reputation,
+        UA.UserCreationDate,
+        UA.LastAccessDate,
+        UA.TotalQuestions,
+        UA.TotalAnswers,
+        UA.TotalPosts,
+        UA.QuestionsWithAcceptedAnswer,
+        UA.AcceptedAnswersCount,
+        UA.TotalCommentsMade,
+        UA.TotalFavoriteCountOnPosts,
+        UBS.TotalBadges,
+        UBS.GoldBadges,
+        UBS.SilverBadges,
+        UBS.BronzeBadges,
+        UBS.LatestBadgeDate,
+        UTI.DistinctTagsContributed,
+        UTI.TotalTagViews,
+        UTI.TotalTagScore,
+        UTI.MostFrequentTag,
+        UTI.HighestScoringTag,
+        PLA.LinkedPostsCount,
+        PLA.DuplicateLinksCount,
+        PLA.LatestLinkDate,
+        COALESCE(AVG_PHS.TotalEdits, 0) AS UserTotalEdits,
+        COALESCE(AVG_PHS.AvgTimeBetweenEdits, INTERVAL '0 seconds') AS AvgTimeBetweenUserEdits,
+        COALESCE(AVG_PHS.PostsClosedByOthers, 0) AS PostsClosedByOthers,
+        COALESCE(AVG_PHS.PostsDeletedByOthers, 0) AS PostsDeletedByOthers,
+        (
+            SELECT MAX(PH_sig.CreationDate)
+            FROM PostHistory PH_sig
+            WHERE PH_sig.UserId = UA.UserId AND PH_sig.PostHistoryTypeId IN (10, 12, 35, 36)
+        ) AS LatestSignificantHistoryEvent,
+        ROW_NUMBER() OVER (ORDER BY UA.Reputation DESC, UA.LastAccessDate DESC) AS UserReputationRank,
+        RANK() OVER (PARTITION BY EXTRACT(YEAR FROM UA.UserCreationDate) ORDER BY UA.TotalQuestions DESC) AS QuestionsByCreationYearRank
+    FROM UserActivity UA
+    LEFT JOIN UserBadgeSummary UBS ON UA.UserId = UBS.UserId
+    LEFT JOIN UserTagImpact UTI ON UA.UserId = UTI.UserId
+    LEFT JOIN PostLinkAnalysis PLA ON UA.UserId = PLA.UserId
+    LEFT JOIN (
+        SELECT
+            PHS_PerPost.EditorUserId AS UserId,
+            SUM(PHS_PerPost.EditCount) AS TotalEdits,
+            AVG(
+                CASE WHEN PHS_PerPost.FirstEditDate IS NOT NULL AND PHS_PerPost.LastEditDate IS NOT NULL
+                     THEN EXTRACT(EPOCH FROM (PHS_PerPost.LastEditDate - PHS_PerPost.FirstEditDate))
+                     ELSE NULL END
+            ) AS AvgTimeBetweenEditsSeconds,
+            -- multiply seconds average by interval 1 second in a SQL-dialect neutral way:
+            -- convert seconds to interval using MAKE_INTERVAL when available; fallback to CAST of seconds || ' seconds'
+            -- Here we use CAST(AVG_seconds || ' seconds' AS interval) via subquery
+            NULL AS AvgTimeBetweenEdits,
+            SUM(CASE WHEN PHS_PerPost.ClosedDateHistory IS NOT NULL AND P.OwnerUserId != PHS_PerPost.EditorUserId THEN 1 ELSE 0 END) AS PostsClosedByOthers,
+            SUM(CASE WHEN PHS_PerPost.DeletedDateHistory IS NOT NULL AND P.OwnerUserId != PHS_PerPost.EditorUserId THEN 1 ELSE 0 END) AS PostsDeletedByOthers
+        FROM PostHistoryStats PHS_PerPost
+        JOIN Posts P ON PHS_PerPost.PostId = P.Id
+        WHERE P.OwnerUserId IS NOT NULL
+        GROUP BY PHS_PerPost.EditorUserId
+    ) AVG_PHS ON UA.UserId = AVG_PHS.UserId
+    GROUP BY
+        UA.UserId, UA.DisplayName, UA.Reputation, UA.UserCreationDate, UA.LastAccessDate,
+        UA.TotalQuestions, UA.TotalAnswers, UA.TotalPosts, UA.QuestionsWithAcceptedAnswer,
+        UA.AcceptedAnswersCount, UA.TotalCommentsMade, UA.TotalFavoriteCountOnPosts,
+        UBS.TotalBadges, UBS.GoldBadges, UBS.SilverBadges, UBS.BronzeBadges, UBS.LatestBadgeDate,
+        UTI.DistinctTagsContributed, UTI.TotalTagViews, UTI.TotalTagScore, UTI.MostFrequentTag, UTI.HighestScoringTag,
+        PLA.LinkedPostsCount, PLA.DuplicateLinksCount, PLA.LatestLinkDate,
+        AVG_PHS.TotalEdits, AVG_PHS.AvgTimeBetweenEdits, AVG_PHS.PostsClosedByOthers, AVG_PHS.PostsDeletedByOthers
+)
+SELECT
+    RA.UserId,
+    RA.DisplayName,
+    RA.Reputation,
+    RA.UserCreationDate,
+    RA.LastAccessDate,
+    RA.TotalQuestions,
+    RA.TotalAnswers,
+    RA.TotalPosts,
+    RA.QuestionsWithAcceptedAnswer,
+    RA.AcceptedAnswersCount,
+    RA.TotalCommentsMade,
+    RA.TotalFavoriteCountOnPosts,
+    RA.GoldBadges,
+    RA.SilverBadges,
+    RA.BronzeBadges,
+    RA.LatestBadgeDate,
+    RA.DistinctTagsContributed,
+    RA.TotalTagViews,
+    RA.TotalTagScore,
+    RA.MostFrequentTag,
+    RA.HighestScoringTag,
+    RA.LinkedPostsCount,
+    RA.DuplicateLinksCount,
+    RA.LatestLinkDate,
+    RA.UserTotalEdits,
+    RA.AvgTimeBetweenUserEdits,
+    RA.PostsClosedByOthers,
+    RA.PostsDeletedByOthers,
+    RA.LatestSignificantHistoryEvent,
+    (RA.Reputation * 0.5 +
+     RA.TotalAnswers * 0.1 +
+     RA.AcceptedAnswersCount * 0.2 +
+     COALESCE(RA.TotalQuestionScore, 0) * 0.05 +
+     COALESCE(RA.TotalAnswerScore, 0) * 0.05 +
+     COALESCE(RA.GoldBadges, 0) * 10 + COALESCE(RA.SilverBadges, 0) * 5 + COALESCE(RA.BronzeBadges, 0) * 1 +
+     COALESCE(RA.TotalTagScore, 0) * 0.01 +
+     COALESCE(RA.UserTotalEdits, 0) * 0.02 +
+     CASE WHEN RA.LastAccessDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30' DAY) THEN 50 ELSE 0 END -
+     CASE WHEN COALESCE(RA.PostsClosedByOthers, 0) > 0 OR COALESCE(RA.PostsDeletedByOthers, 0) > 0 THEN 20 ELSE 0 END
+    ) AS InfluenceScore,
+    CASE
+        WHEN RA.TotalQuestions = 0 THEN 'No Questions'
+        WHEN RA.QuestionsWithAcceptedAnswer = RA.TotalQuestions THEN 'All Questions Accepted'
+        WHEN RA.AcceptedAnswersCount > RA.TotalQuestions * 0.5 THEN 'High Answerer Rate'
+        ELSE 'Mixed Activity'
+    END AS UserActivityType,
+    (SELECT P.Title FROM Posts P WHERE P.OwnerUserId = RA.UserId AND P.PostTypeId = 1 AND P.AcceptedAnswerId IS NOT NULL ORDER BY P.Score DESC FETCH FIRST 1 ROWS ONLY) AS HighestScoringQuestionWithAcceptedAnswerTitle,
+    (SELECT P.Title FROM Posts P WHERE P.OwnerUserId = RA.UserId AND P.PostTypeId = 1 ORDER BY P.CreationDate ASC FETCH FIRST 1 ROWS ONLY) AS OldestQuestionTitle,
+    (SELECT P.Title FROM Posts P WHERE P.OwnerUserId = RA.UserId AND P.PostTypeId = 2 ORDER BY P.Score DESC FETCH FIRST 1 ROWS ONLY) AS HighestScoringAnswerTitle,
+    COALESCE(U_Details.Location, 'Undisclosed') AS UserLocation,
+    SUBSTRING(U_Details.AboutMe FROM 1 FOR 100) AS AboutMeExcerpt,
+    CASE WHEN U_Details.WebsiteUrl IS NOT NULL AND LENGTH(U_Details.WebsiteUrl) > 0 THEN TRUE ELSE FALSE END AS HasWebsite,
+    COALESCE(RA.UserReputationRank, 999999) AS ReputationRankGlobal,
+    COALESCE(RA.QuestionsByCreationYearRank, 999999) AS QuestionsByCreationYearRank,
+    (SELECT
+        STRING_AGG(UserTopTags.TagName, ', ')
+     FROM (
+        SELECT
+            T.TagName
+        FROM Posts P_tags
+        CROSS JOIN LATERAL UNNEST(string_to_array(substring(P_tags.Tags, 2, length(P_tags.Tags)-2), '><')) AS T(TagName)
+        WHERE P_tags.OwnerUserId = RA.UserId AND P_tags.PostTypeId = 1
+        GROUP BY T.TagName
+        ORDER BY COUNT(T.TagName) DESC, SUM(P_tags.ViewCount) DESC
+        FETCH FIRST 5 ROWS ONLY
+     ) AS UserTopTags
+    ) AS Top5TagsUsedByThisUser
+FROM RankedActivity RA
+JOIN Users U_Details ON RA.UserId = U_Details.Id
+WHERE RA.TotalPosts > 0
+  AND RA.Reputation > 1000
+  AND ((U_Details.Location IS NOT NULL AND U_Details.Location LIKE '%york%') OR U_Details.Location IS NULL)
+  AND (U_Details.AboutMe IS NOT NULL AND LENGTH(U_Details.AboutMe) > 10)
+  AND NOT EXISTS (
+      SELECT 1
+      FROM PostHistory PH_negative
+      WHERE PH_negative.UserId = RA.UserId
+        AND PH_negative.CreationDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1' YEAR)
+        AND PH_negative.PostHistoryTypeId IN (12, 35)
+  )
+ORDER BY InfluenceScore DESC
+LIMIT 100;

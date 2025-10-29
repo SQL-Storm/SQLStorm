@@ -1,0 +1,171 @@
+-- {"query": "4410.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1735} 
+
+WITH
+  QuestionStats AS (
+    SELECT
+      p.Id AS QuestionId,
+      p.OwnerUserId,
+      p.Title,
+      p.CreationDate AS QuestionCreationDate,
+      p.AnswerCount,
+      p.FavoriteCount,
+      p.Score AS QuestionScore,
+      p.ViewCount AS QuestionViewCount,
+      CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+      COUNT(DISTINCT a.Id) AS AnswerCountActual,
+      SUM(CASE WHEN c.UserId IS NOT NULL THEN 1 ELSE 0 END) AS CommentCountOnQuestion,
+      AVG(CASE WHEN ph.PostHistoryTypeId IN (5, 8) THEN 1 ELSE 0 END) AS HasBodyEdits,
+      CASE
+        WHEN EXISTS (
+          SELECT
+            1
+          FROM
+            PostLinks pl
+          WHERE
+            pl.PostId = p.Id AND pl.LinkTypeId = 3
+        )
+        THEN 1
+        ELSE 0
+      END AS IsDuplicateLink
+    FROM
+      Posts p
+      LEFT JOIN Posts a ON p.Id = a.ParentId AND a.PostTypeId = 2
+      LEFT JOIN Comments c ON p.Id = c.PostId
+      LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId IN (5, 8)
+    WHERE
+      p.PostTypeId = 1
+    GROUP BY
+      p.Id,
+      p.OwnerUserId,
+      p.Title,
+      p.CreationDate,
+      p.AnswerCount,
+      p.FavoriteCount,
+      p.Score,
+      p.ViewCount,
+      p.ClosedDate
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate AS UserCreationDate,
+      COUNT(DISTINCT qs.QuestionId) AS QuestionsAsked,
+      SUM(qs.AnswerCountActual) AS AnswersGiven,
+      SUM(qs.FavoriteCount) AS FavoritesOnQuestions,
+      AVG(qs.IsClosed) AS AvgQuestionClosedStatus,
+      MAX(qs.QuestionCreationDate) AS LatestQuestionDate
+    FROM
+      Users u
+      LEFT JOIN QuestionStats qs ON u.Id = qs.OwnerUserId
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate
+  ),
+  TagPerformance AS (
+    SELECT
+      t.TagName,
+      COUNT(DISTINCT qs.QuestionId) AS QuestionsWithTag,
+      SUM(qs.QuestionScore) AS TotalScoreForTag,
+      AVG(qs.QuestionViewCount) AS AvgViewCountForTag,
+      SUM(qs.HasBodyEdits) AS EditsToTagWikiOrExcerpt
+    FROM
+      Tags t
+      LEFT JOIN QuestionStats qs ON qs.Tags LIKE '%' || t.TagName || '%'
+    WHERE
+      t.TagName IS NOT NULL
+    GROUP BY
+      t.TagName
+    HAVING
+      COUNT(DISTINCT qs.QuestionId) > 10
+  ),
+  RankedUserQuestions AS (
+    SELECT
+      qs.OwnerUserId,
+      qs.QuestionId,
+      qs.QuestionScore,
+      qs.QuestionViewCount,
+      ROW_NUMBER() OVER (PARTITION BY qs.OwnerUserId ORDER BY qs.QuestionScore DESC, qs.QuestionViewCount DESC) AS ScoreRank,
+      DENSE_RANK() OVER (PARTITION BY qs.OwnerUserId ORDER BY qs.QuestionCreationDate ASC) AS AgeRank
+    FROM
+      QuestionStats qs
+  )
+SELECT
+  ua.DisplayName AS UserDisplayName,
+  ua.Reputation,
+  ua.UserCreationDate,
+  ua.QuestionsAsked,
+  ua.AnswersGiven,
+  ua.FavoritesOnQuestions,
+  ua.AvgQuestionClosedStatus,
+  ua.LatestQuestionDate,
+  qs.Title AS MostPopularQuestionTitle,
+  qs.QuestionScore AS MostPopularQuestionScore,
+  qs.QuestionViewCount AS MostPopularQuestionViewCount,
+  qs.IsDuplicateLink AS IsQuestionLinkedAsDuplicate,
+  COALESCE(tp.TagName, 'N/A') AS TopPerformingTag,
+  COALESCE(tp.QuestionsWithTag, 0) AS QuestionsInTopTag,
+  COALESCE(tp.TotalScoreForTag, 0) AS ScoreInTopTag,
+  COALESCE(tp.AvgViewCountForTag, 0.0) AS AvgViewsInTopTag,
+  ph.Comment AS LastNotablePostHistoryComment,
+  CASE
+    WHEN u.Location IS NULL THEN 'Unknown'
+    WHEN u.Location LIKE '%USA%' THEN 'USA Based'
+    WHEN u.Location LIKE '%UK%' THEN 'UK Based'
+    WHEN u.Location LIKE '%Canada%' THEN 'Canada Based'
+    ELSE SUBSTRING(u.Location FROM 1 FOR 20)
+  END AS ProcessedLocation,
+  CASE
+    WHEN DATEDIFF(day, ua.LatestQuestionDate, GETDATE()) > 365 THEN 'Inactive User'
+    WHEN ua.QuestionsAsked > 1000 THEN 'Power User'
+    WHEN ua.AnswersGiven > 5000 THEN 'Highly Productive'
+    ELSE 'Standard User'
+  END AS UserTier,
+  UPPER(LEFT(ua.DisplayName, 3)) AS DisplayNamePrefix,
+  COUNT(DISTINCT votes.Id) FILTER (WHERE votes.VoteTypeId = 2) AS UpVotesReceived,
+  COUNT(DISTINCT votes.Id) FILTER (WHERE votes.VoteTypeId = 3) AS DownVotesReceived,
+  MAX(ruq.QuestionScore) FILTER (WHERE ruq.ScoreRank = 1) AS HighestScoreForAnyQuestion,
+  MIN(ruq.AgeRank) FILTER (WHERE ruq.AgeRank = 1) AS OldestQuestionRankForUser
+FROM
+  UserActivity ua
+  LEFT JOIN QuestionStats qs ON ua.UserId = qs.OwnerUserId
+  LEFT JOIN TagPerformance tp ON tp.TagName = ANY(SELECT TagName FROM TagPerformance WHERE QuestionsWithTag > 50 ORDER BY TotalScoreForTag DESC LIMIT 1)
+  LEFT JOIN PostHistory ph ON ua.UserId = ph.UserId AND ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20)
+  LEFT JOIN RankedUserQuestions ruq ON ua.UserId = ruq.OwnerUserId
+  LEFT JOIN Votes votes ON qs.QuestionId = votes.PostId
+  LEFT JOIN Users u ON ua.UserId = u.Id
+WHERE
+  ua.QuestionsAsked > 5
+  AND COALESCE(ua.AnswersGiven, 0) > 0
+  AND qs.QuestionScore > 10
+GROUP BY
+  ua.DisplayName,
+  ua.Reputation,
+  ua.UserCreationDate,
+  ua.QuestionsAsked,
+  ua.AnswersGiven,
+  ua.FavoritesOnQuestions,
+  ua.AvgQuestionClosedStatus,
+  ua.LatestQuestionDate,
+  qs.Title,
+  qs.QuestionScore,
+  qs.QuestionViewCount,
+  qs.IsDuplicateLink,
+  tp.TagName,
+  tp.QuestionsWithTag,
+  tp.TotalScoreForTag,
+  tp.AvgViewCountForTag,
+  ph.Comment,
+  ProcessedLocation,
+  UserTier,
+  DisplayNamePrefix,
+  u.Location
+HAVING
+  SUM(qs.QuestionScore) > 100
+ORDER BY
+  ua.Reputation DESC,
+  ua.QuestionsAsked DESC
+LIMIT 100;

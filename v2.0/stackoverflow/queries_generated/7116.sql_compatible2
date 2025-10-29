@@ -1,0 +1,326 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        COUNT(DISTINCT c.Id) AS Comments,
+        COUNT(DISTINCT b.Id) AS Badges,
+        MAX(p.CreationDate) AS LastPostDate,
+        ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS ActivityRank,
+        AVG(p.Score) AS AvgPostScore,
+        SUM(CASE WHEN p.Score > 0 THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(p.Id), 0) AS PositiveScorePercentage
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= DATE '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+QuestionStats AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        p.AcceptedAnswerId,
+        CAST(COALESCE(p.ClosedDate, p.LastActivityDate) AS DATE) - CAST(p.CreationDate AS DATE) AS AgeInDays,
+        CASE 
+            WHEN p.AnswerCount = 0 THEN 'No Answers'
+            WHEN p.AnswerCount = 1 THEN 'One Answer'
+            WHEN p.AnswerCount > 1 AND p.AnswerCount <= 5 THEN 'Few Answers'
+            ELSE 'Many Answers'
+        END AS AnswerCategory,
+        COALESCE(
+            (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2),
+            0
+        ) AS Upvotes,
+        COALESCE(
+            (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3),
+            0
+        ) AS Downvotes,
+        RANK() OVER (ORDER BY p.Score DESC) AS ScoreRank,
+        PERCENT_RANK() OVER (ORDER BY p.ViewCount) AS ViewPercentile,
+        NTILE(10) OVER (ORDER BY p.ViewCount) AS ViewDecile
+    FROM Posts p
+    WHERE p.PostTypeId = 1 
+      AND p.CreationDate >= DATE '2015-01-01'
+      AND p.CreationDate < DATE '2023-01-01'
+),
+TopAnswerers AS (
+    SELECT 
+        p.OwnerUserId,
+        COUNT(*) AS AnswerCount,
+        AVG(p.Score) AS AvgAnswerScore,
+        SUM(p.Score) AS TotalAnswerScore,
+        RANK() OVER (ORDER BY COUNT(*) DESC) AS AnswerRank
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+      AND p.CreationDate >= DATE '2015-01-01'
+    GROUP BY p.OwnerUserId
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count >= 1000 THEN 'Highly Popular'
+            WHEN t.Count >= 500 THEN 'Popular'
+            WHEN t.Count >= 100 THEN 'Moderately Popular'
+            ELSE 'Less Popular'
+        END AS PopularityLevel,
+        (SELECT COUNT(*) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%') AS PostsWithTag
+    FROM Tags t
+    WHERE t.Count >= 100
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        qs.QuestionId,
+        qs.Title,
+        qs.Score,
+        qs.ViewCount,
+        qs.AnswerCount,
+        qs.CommentCount,
+        qs.OwnerUserId,
+        qs.Tags,
+        qs.AgeInDays,
+        qs.AnswerCategory,
+        qs.Upvotes,
+        qs.Downvotes,
+        qs.ScoreRank,
+        qs.ViewPercentile,
+        qs.ViewDecile,
+        uas.DisplayName AS OwnerName,
+        uas.Reputation AS OwnerReputation,
+        uas.TotalPosts AS OwnerTotalPosts,
+        uas.ActivityRank AS OwnerActivityRank,
+        ta.TagCount,
+        ta.PopularityLevel,
+        CASE WHEN ta.PostsWithTag > 0 THEN 1 ELSE 0 END AS HasPost,
+        CASE 
+            WHEN qs.Score > 10 AND qs.ViewCount > 1000 AND qs.AnswerCount > 2 THEN 'High Impact'
+            WHEN qs.Score > 5 AND qs.ViewCount > 500 THEN 'Medium Impact'
+            WHEN qs.Score > 0 AND qs.ViewCount > 100 THEN 'Low Impact'
+            ELSE 'Very Low Impact'
+        END AS ImpactLevel,
+        (qs.Score * qs.ViewCount) / NULLIF(qs.AnswerCount + 1, 0) AS ScoreViewRatio,
+        (SELECT COUNT(*) FROM Posts p2 WHERE p2.ParentId = qs.QuestionId AND p2.PostTypeId = 2 AND p2.Score > 0) AS PositiveAnswersCount,
+        CAST(
+            (SELECT COUNT(*) FROM Posts p3 WHERE p3.ParentId = qs.QuestionId AND p3.PostTypeId = 2 AND p3.Score > 0) * 100.0 / 
+            NULLIF((SELECT COUNT(*) FROM Posts p4 WHERE p4.ParentId = qs.QuestionId AND p4.PostTypeId = 2), 0)
+        AS DECIMAL(5,2)) AS PositiveAnswerPercentage,
+        ROW_NUMBER() OVER (ORDER BY qs.ViewCount DESC, qs.Score DESC) AS ViewScoreRank,
+        LAG(qs.Score, 1) OVER (ORDER BY qs.CreationDate) AS PreviousScore,
+        LAG(qs.ViewCount, 1) OVER (ORDER BY qs.CreationDate) AS PreviousViewCount,
+        AVG(qs.Score) OVER (ORDER BY qs.CreationDate ROWS BETWEEN 5 PRECEDING AND CURRENT ROW) AS RollingAvgScore,
+        SUM(qs.ViewCount) OVER (ORDER BY qs.CreationDate) AS CumulativeViews,
+        CASE WHEN qs.AgeInDays > 365 THEN 1 ELSE 0 END AS IsOldQuestion
+    FROM QuestionStats qs
+    JOIN UserActivityStats uas ON qs.OwnerUserId = uas.UserId
+    JOIN TagAnalysis ta ON qs.Tags LIKE '%' || ta.TagName || '%'
+    WHERE qs.AgeInDays <= 365
+),
+CombinedResults AS (
+    SELECT 
+        cp.QuestionId,
+        cp.Title,
+        cp.OwnerUserId,
+        cp.OwnerName,
+        cp.OwnerReputation,
+        cp.OwnerTotalPosts,
+        cp.OwnerActivityRank,
+        cp.Score,
+        cp.ViewCount,
+        cp.AnswerCount,
+        cp.CommentCount,
+        cp.Tags,
+        cp.AgeInDays,
+        cp.AnswerCategory,
+        cp.Upvotes,
+        cp.Downvotes,
+        cp.ScoreRank,
+        cp.ViewPercentile,
+        cp.ViewDecile,
+        cp.TagCount,
+        cp.PopularityLevel,
+        cp.ImpactLevel,
+        cp.ScoreViewRatio,
+        cp.PositiveAnswersCount,
+        cp.PositiveAnswerPercentage,
+        cp.ViewScoreRank,
+        cp.PreviousScore,
+        cp.PreviousViewCount,
+        cp.RollingAvgScore,
+        cp.CumulativeViews,
+        cp.IsOldQuestion,
+        CASE 
+            WHEN cp.PositiveAnswerPercentage >= 80 THEN 'Excellent'
+            WHEN cp.PositiveAnswerPercentage >= 60 THEN 'Good'
+            WHEN cp.PositiveAnswerPercentage >= 40 THEN 'Average'
+            ELSE 'Poor'
+        END AS AnswerQuality,
+        CASE 
+            WHEN cp.Score >= 100 THEN 'Viral'
+            WHEN cp.Score >= 50 THEN 'Highly Popular'
+            WHEN cp.Score >= 20 THEN 'Popular'
+            WHEN cp.Score >= 0 THEN 'Moderate'
+            ELSE 'Low'
+        END AS ScoreCategory,
+        CAST(
+            (cp.Upvotes - cp.Downvotes) * 100.0 / NULLIF(cp.Upvotes + cp.Downvotes, 0) 
+            AS DECIMAL(5,2)
+        ) AS UpvoteRatio,
+        CASE 
+            WHEN cp.Score > 0 THEN (cp.ViewCount * 100.0 / NULLIF(cp.Score, 0))
+            ELSE 0 
+        END AS ViewsPerScore,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = cp.QuestionId) AS CommentCountActual,
+        (cp.ViewCount * 100.0 / NULLIF(cp.AnswerCount + 1, 0)) AS ViewsPerAnswer,
+        DENSE_RANK() OVER (PARTITION BY cp.AnswerCategory ORDER BY cp.ViewCount DESC) AS CategoryViewRank
+    FROM ComplexPostAnalysis cp
+    WHERE cp.IsOldQuestion = 0
+      AND cp.OwnerReputation >= 1000
+),
+FinalAnalysis AS (
+    SELECT 
+        cr.QuestionId,
+        cr.Title,
+        cr.OwnerUserId,
+        cr.OwnerName,
+        cr.OwnerReputation,
+        cr.OwnerTotalPosts,
+        cr.OwnerActivityRank,
+        cr.Score,
+        cr.ViewCount,
+        cr.AnswerCount,
+        cr.CommentCount,
+        cr.Tags,
+        cr.AgeInDays,
+        cr.AnswerCategory,
+        cr.Upvotes,
+        cr.Downvotes,
+        cr.ScoreRank,
+        cr.ViewPercentile,
+        cr.ViewDecile,
+        cr.TagCount,
+        cr.PopularityLevel,
+        cr.ImpactLevel,
+        cr.ScoreViewRatio,
+        cr.PositiveAnswersCount,
+        cr.PositiveAnswerPercentage,
+        cr.ViewScoreRank,
+        cr.PreviousScore,
+        cr.PreviousViewCount,
+        cr.RollingAvgScore,
+        cr.CumulativeViews,
+        cr.IsOldQuestion,
+        cr.AnswerQuality,
+        cr.ScoreCategory,
+        cr.UpvoteRatio,
+        cr.ViewsPerScore,
+        cr.CommentCountActual,
+        cr.ViewsPerAnswer,
+        cr.CategoryViewRank,
+        ABS(cr.Score - cr.RollingAvgScore) AS ScoreDeviation,
+        ABS(cr.ViewCount - cr.CumulativeViews) AS ViewDeviation,
+        CASE WHEN cr.Score > cr.RollingAvgScore THEN 1 ELSE 0 END AS ScoreAboveAverage,
+        CASE WHEN cr.ViewCount > cr.CumulativeViews THEN 1 ELSE 0 END AS ViewAboveAverage,
+        ROW_NUMBER() OVER (ORDER BY cr.ViewCount DESC, cr.Score DESC) AS OverallRank,
+        PERCENT_RANK() OVER (ORDER BY cr.ViewCount) AS ViewPercentileRank,
+        NTILE(4) OVER (ORDER BY cr.ViewCount) AS ViewQuartile,
+        NTH_VALUE(cr.ViewCount, 1) OVER (ORDER BY cr.ViewCount DESC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS MaximumViews,
+        NTH_VALUE(cr.Score, 1) OVER (ORDER BY cr.Score DESC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS MaximumScore,
+        (SELECT AVG(ViewCount) FROM CombinedResults) AS AverageViews,
+        (SELECT AVG(Score) FROM CombinedResults) AS AverageScore,
+        'Q' || cr.QuestionId || ' - ' || SUBSTR(cr.Title, 1, 50) || ' (Views: ' || cr.ViewCount || ', Score: ' || cr.Score || ', Tags: ' || SUBSTR(cr.Tags, 1, 30) || ')' AS QuestionSummary,
+        CASE WHEN cr.ViewsPerScore > 10 THEN 'High Engagement' ELSE 'Normal Engagement' END AS EngagementLevel,
+        CASE 
+            WHEN cr.PopularityLevel = 'Highly Popular' AND cr.ViewCount > 1000 THEN 'Trending'
+            WHEN cr.ViewsPerAnswer > 100 AND cr.PositiveAnswerPercentage > 50 THEN 'Active Discussion'
+            WHEN cr.AnswerCount > 0 AND cr.Score > 0 THEN 'Engaged Community'
+            ELSE 'Low Activity'
+        END AS CommunityStatus
+    FROM CombinedResults cr
+)
+SELECT 
+    fa.QuestionId,
+    fa.Title,
+    fa.OwnerUserId,
+    fa.OwnerName,
+    fa.OwnerReputation,
+    fa.OwnerTotalPosts,
+    fa.OwnerActivityRank,
+    fa.Score,
+    fa.ViewCount,
+    fa.AnswerCount,
+    fa.CommentCount,
+    fa.Tags,
+    fa.AgeInDays,
+    fa.AnswerCategory,
+    fa.Upvotes,
+    fa.Downvotes,
+    fa.ScoreRank,
+    fa.ViewPercentile,
+    fa.ViewDecile,
+    fa.TagCount,
+    fa.PopularityLevel,
+    fa.ImpactLevel,
+    fa.ScoreViewRatio,
+    fa.PositiveAnswersCount,
+    fa.PositiveAnswerPercentage,
+    fa.ViewScoreRank,
+    fa.PreviousScore,
+    fa.PreviousViewCount,
+    fa.RollingAvgScore,
+    fa.CumulativeViews,
+    fa.IsOldQuestion,
+    fa.AnswerQuality,
+    fa.ScoreCategory,
+    fa.UpvoteRatio,
+    fa.ViewsPerScore,
+    fa.CommentCountActual,
+    fa.ViewsPerAnswer,
+    fa.CategoryViewRank,
+    fa.ScoreDeviation,
+    fa.ViewDeviation,
+    fa.ScoreAboveAverage,
+    fa.ViewAboveAverage,
+    fa.OverallRank,
+    fa.ViewPercentileRank,
+    fa.ViewQuartile,
+    fa.MaximumViews,
+    fa.MaximumScore,
+    fa.AverageViews,
+    fa.AverageScore,
+    fa.QuestionSummary,
+    fa.EngagementLevel,
+    fa.CommunityStatus,
+    CASE 
+        WHEN fa.ViewScoreRank <= 10 THEN 'Top 10 Views'
+        WHEN fa.ViewScoreRank <= 50 THEN 'Top 50 Views'
+        WHEN fa.ViewScoreRank <= 100 THEN 'Top 100 Views'
+        ELSE 'Below Top 100 Views'
+    END AS ViewRankCategory,
+    CASE 
+        WHEN fa.Score >= fa.MaximumScore * 0.8 THEN 'High Score'
+        WHEN fa.Score >= fa.MaximumScore * 0.6 THEN 'Medium Score'
+        WHEN fa.Score >= fa.MaximumScore * 0.4 THEN 'Low Score'
+        ELSE 'Very Low Score'
+    END AS ScorePerformanceCategory
+FROM FinalAnalysis fa
+WHERE fa.ViewCount >= 50
+  AND fa.Score >= 0
+  AND fa.AnswerCount >= 0
+  AND fa.CommentCount >= 0
+  AND fa.TagCount >= 50
+ORDER BY fa.ViewCount DESC, fa.Score DESC, fa.OverallRank ASC
+LIMIT 1000;

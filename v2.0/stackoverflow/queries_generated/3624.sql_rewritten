@@ -1,0 +1,119 @@
+-- {"query": "3624.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2475} 
+-- Complex benchmark query using CTEs, window functions, outer joins,
+-- correlated subqueries, string handling, NULL logic and set operators
+WITH UserActivity AS (
+    SELECT
+        u.Id                         AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.UpVotes,0) - COALESCE(u.DownVotes,0)          AS NetVoteBalance,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1)            AS QuestionCnt,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2)            AS AnswerCnt,
+        COUNT(c.Id)                                            AS CommentCnt,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END)     AS UpVotesGiven,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END)     AS DownVotesGiven
+    FROM Users u
+    LEFT JOIN Posts    p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId      = u.Id
+    LEFT JOIN Votes    v ON v.UserId      = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes
+),
+TopTags AS (
+    SELECT
+        t.TagName,
+        COUNT(*)                                   AS UsageCnt,
+        ROW_NUMBER() OVER (ORDER BY COUNT(*) DESC) AS TagRank
+    FROM Posts p
+    CROSS JOIN LATERAL (
+        SELECT regexp_split_to_table(trim(both '<>' FROM p.Tags), '><') AS tag
+    ) AS split
+    JOIN Tags t ON t.TagName = split.tag
+    WHERE p.PostTypeId = 1
+    GROUP BY t.TagName
+    HAVING COUNT(*) > 100
+),
+UserBadgeScore AS (
+    SELECT
+        b.UserId,
+        SUM(CASE b.Class WHEN 1 THEN 1000 WHEN 2 THEN 500 ELSE 100 END) AS BadgeScore,
+        STRING_AGG(DISTINCT b.Name, ', ') FILTER (WHERE b.TagBased = 0)   AS BadgeList
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserRecentActivity AS (
+    SELECT
+        ua.UserId,
+        MAX(p.CreationDate)                         AS LastQuestionDate,
+        MAX(c.CreationDate)                         AS LastCommentDate,
+        MAX(v.CreationDate)                         AS LastVoteDate
+    FROM UserActivity ua
+    LEFT JOIN Posts    p ON p.OwnerUserId = ua.UserId AND p.PostTypeId = 1
+    LEFT JOIN Comments c ON c.UserId      = ua.UserId
+    LEFT JOIN Votes    v ON v.UserId      = ua.UserId
+    GROUP BY ua.UserId
+),
+UserScore AS (
+    SELECT
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.NetVoteBalance,
+        ua.QuestionCnt,
+        ua.AnswerCnt,
+        ua.CommentCnt,
+        ub.BadgeScore,
+        (ua.QuestionCnt * 2) + (ua.AnswerCnt * 3) + COALESCE(ub.BadgeScore,0) + ua.NetVoteBalance AS TotalScore,
+        ROW_NUMBER() OVER (ORDER BY
+            (ua.QuestionCnt * 2) + (ua.AnswerCnt * 3) + COALESCE(ub.BadgeScore,0) + ua.NetVoteBalance DESC
+        ) AS RankOverall
+    FROM UserActivity ua
+    LEFT JOIN UserBadgeScore ub ON ub.UserId = ua.UserId
+)
+SELECT
+    us.RankOverall,
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.TotalScore,
+    us.QuestionCnt,
+    us.AnswerCnt,
+    us.CommentCnt,
+    ub.BadgeList,
+    COALESCE(ur.LastQuestionDate, TIMESTAMP '1970-01-01') AS LastQuestionDate,
+    COALESCE(ur.LastCommentDate, TIMESTAMP '1970-01-01') AS LastCommentDate,
+    COALESCE(ur.LastVoteDate,    TIMESTAMP '1970-01-01') AS LastVoteDate
+FROM UserScore us
+LEFT JOIN UserBadgeScore   ub ON ub.UserId = us.UserId
+LEFT JOIN UserRecentActivity ur ON ur.UserId = us.UserId
+WHERE us.TotalScore > (SELECT AVG(TotalScore) FROM UserScore)
+
+UNION ALL
+
+SELECT
+    NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL
+FROM (SELECT 1) AS dummy
+
+EXCEPT
+
+SELECT *
+FROM (
+    SELECT
+        us.RankOverall,
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.TotalScore,
+        us.QuestionCnt,
+        us.AnswerCnt,
+        us.CommentCnt,
+        ub.BadgeList,
+        COALESCE(ur.LastQuestionDate, TIMESTAMP '1970-01-01') AS LastQuestionDate,
+        COALESCE(ur.LastCommentDate, TIMESTAMP '1970-01-01') AS LastCommentDate,
+        COALESCE(ur.LastVoteDate,    TIMESTAMP '1970-01-01') AS LastVoteDate
+    FROM UserScore us
+    LEFT JOIN UserBadgeScore   ub ON ub.UserId = us.UserId
+    LEFT JOIN UserRecentActivity ur ON ur.UserId = us.UserId
+    WHERE us.TotalScore > (SELECT AVG(TotalScore) FROM UserScore)
+) src
+ORDER BY RankOverall
+LIMIT 100;

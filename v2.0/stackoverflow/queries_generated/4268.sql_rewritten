@@ -1,0 +1,137 @@
+-- {"query": "4268.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1430} 
+WITH
+  AnswerDetails AS (
+    SELECT
+      p.Id AS AnswerId,
+      p.ParentId AS QuestionId,
+      p.OwnerUserId,
+      p.Score AS AnswerScore,
+      p.CreationDate AS AnswerCreationDate,
+      ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS RankByScore,
+      LAG(p.Score, 1, 0) OVER (PARTITION BY p.ParentId ORDER BY p.CreationDate ASC) AS PreviousAnswerScore
+    FROM Posts AS p
+    WHERE
+      p.PostTypeId = 2
+  ),
+  QuestionWithBestAnswer AS (
+    SELECT
+      q.Id AS QuestionId,
+      q.OwnerUserId AS QuestionOwnerUserId,
+      q.Title AS QuestionTitle,
+      q.CreationDate AS QuestionCreationDate,
+      q.Score AS QuestionScore,
+      q.ViewCount AS QuestionViewCount,
+      q.AnswerCount,
+      q.FavoriteCount,
+      q.ClosedDate,
+      ad.AnswerId AS BestAnswerId,
+      ad.OwnerUserId AS BestAnswerOwnerUserId,
+      ad.AnswerScore AS BestAnswerScore,
+      ad.AnswerCreationDate AS BestAnswerCreationDate,
+      ad.RankByScore AS BestAnswerRank,
+      ad.PreviousAnswerScore AS PreviousAnswerScoreForBest,
+      CASE
+        WHEN ad.AnswerId IS NULL THEN 'No Answer'
+        WHEN ad.AnswerScore > 0 THEN 'Accepted/Upvoted'
+        WHEN ad.AnswerScore <= 0 THEN 'Zero/Downvoted'
+      END AS AnswerQualityCategory
+    FROM Posts AS q
+    LEFT JOIN AnswerDetails AS ad
+      ON q.Id = ad.QuestionId AND ad.RankByScore = 1
+    WHERE
+      q.PostTypeId = 1
+  )
+SELECT
+  qwba.QuestionId,
+  qwba.QuestionTitle,
+  qwba.QuestionScore,
+  qwba.QuestionViewCount,
+  qwba.AnswerCount,
+  qwba.FavoriteCount,
+  qwba.QuestionCreationDate,
+  qwba.ClosedDate,
+  qwba.BestAnswerId,
+  qwba.BestAnswerScore,
+  qwba.BestAnswerCreationDate,
+  qwba.AnswerQualityCategory,
+  u_q.DisplayName AS QuestionOwnerDisplayName,
+  u_a.DisplayName AS BestAnswerOwnerDisplayName,
+  COALESCE(t.TagName, 'General') AS PrimaryTag,
+  ph.Comment AS LastPostHistoryComment,
+  ph.CreationDate AS LastPostHistoryDate,
+  CASE
+    WHEN q.OwnerUserId = -1 THEN 'Community'
+    ELSE 'User'
+  END AS QuestionOwnershipType,
+  CASE
+    WHEN q.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+    WHEN q.ClosedDate IS NOT NULL THEN 'Closed'
+    WHEN q.AnswerCount > 100 THEN 'High Answer Count'
+    ELSE 'Active'
+  END AS QuestionStatusFlag,
+  LENGTH(qwba.QuestionTitle) AS TitleLength,
+  DATEDIFF(DAY, qwba.QuestionCreationDate, cast('2024-10-01 12:34:56' as timestamp)) AS DaysSinceCreation,
+  AVG(ad.AnswerScore) OVER (PARTITION BY q.Id) AS AvgAnswerScoreForQuestion,
+  SUM(ad.AnswerScore) OVER (PARTITION BY q.Id) AS TotalAnswerScoreForQuestion,
+  COUNT(ad.AnswerId) OVER (PARTITION BY q.Id) AS TotalAnswerCountForQuestion,
+  CASE
+    WHEN UPPER(qwba.QuestionTitle) LIKE '%HOW%' THEN 'How-To Question'
+    WHEN UPPER(qwba.QuestionTitle) LIKE '%WHY%' THEN 'Why Question'
+    ELSE 'Other Query Type'
+  END AS QuestionTypeByKeyword,
+  MAX(c.Score) FILTER (WHERE c.UserId IS NOT NULL) OVER (PARTITION BY q.Id) AS MaxCommentScoreForQuestion,
+  COUNT(DISTINCT c.Id) FILTER (WHERE c.UserId IS NOT NULL) OVER (PARTITION BY q.Id) AS UserCommentCountForQuestion
+FROM Posts AS q
+JOIN QuestionWithBestAnswer AS qwba
+  ON q.Id = qwba.QuestionId
+LEFT JOIN Users AS u_q
+  ON q.OwnerUserId = u_q.Id
+LEFT JOIN Users AS u_a
+  ON qwba.BestAnswerOwnerUserId = u_a.Id
+LEFT JOIN (
+  SELECT
+    p.Id,
+    SUBSTRING(p.Tags, 2, CHARINDEX('>', p.Tags) - 2) AS TagName
+  FROM Posts AS p
+  WHERE
+    p.PostTypeId = 1 AND p.Tags IS NOT NULL
+) AS t
+  ON q.Id = t.Id
+LEFT JOIN PostHistory AS ph
+  ON q.Id = ph.PostId AND ph.PostHistoryTypeId IN (1, 4, 6, 10, 11, 19, 20, 35, 36)
+LEFT JOIN Comments AS c
+  ON q.Id = c.PostId
+LEFT JOIN AnswerDetails AS ad
+  ON q.Id = ad.QuestionId
+WHERE
+  q.PostTypeId = 1 AND qwba.AnswerScore IS NOT NULL AND qwba.QuestionScore > -10
+GROUP BY
+  qwba.QuestionId,
+  qwba.QuestionTitle,
+  qwba.QuestionScore,
+  qwba.QuestionViewCount,
+  qwba.AnswerCount,
+  qwba.FavoriteCount,
+  qwba.QuestionCreationDate,
+  qwba.ClosedDate,
+  qwba.BestAnswerId,
+  qwba.BestAnswerScore,
+  qwba.BestAnswerCreationDate,
+  qwba.AnswerQualityCategory,
+  u_q.DisplayName,
+  u_a.DisplayName,
+  t.TagName,
+  ph.Comment,
+  ph.CreationDate,
+  q.OwnerUserId,
+  q.CommunityOwnedDate,
+  qwba.QuestionTitle,
+  qwba.QuestionCreationDate,
+  c.Score,
+  c.UserId,
+  c.Id,
+  q.Id
+ORDER BY
+  qwba.QuestionScore DESC,
+  qwba.QuestionViewCount DESC
+LIMIT 100;

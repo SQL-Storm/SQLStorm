@@ -1,0 +1,157 @@
+WITH ranked_users AS (
+  SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.AccountId,
+    ROW_NUMBER() OVER (
+      PARTITION BY COALESCE(u.Location, 'Unknown')
+      ORDER BY
+        u.Reputation DESC,
+        u.UpVotes - u.DownVotes DESC,
+        u.CreationDate ASC
+    ) AS rn
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  WHERE u.CreationDate >= TIMESTAMP '2015-01-01 00:00:00'
+),
+recent_activity AS (
+  SELECT
+    p.Id AS PostId,
+    p.OwnerUserId,
+    p.Title,
+    p.PostTypeId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.AcceptedAnswerId,
+    p.ParentId,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.Body,
+    p.LastEditorUserId,
+    p.LastEditDate,
+    p.OwnerDisplayName,
+    p.ContentLicense,
+    ROW_NUMBER() OVER (
+      PARTITION BY p.OwnerUserId
+      ORDER BY p.LastActivityDate DESC, p.Score DESC
+    ) AS rn_owner
+  FROM Posts p
+  LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+  WHERE p.LastActivityDate >= TIMESTAMP '2015-01-01 00:00:00'
+    AND p.PostTypeId IN (1, 2)
+),
+tag_extremes AS (
+  SELECT
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId,
+    t.WikiPostId,
+    (SELECT MAX(Body) FROM Posts WHERE Id = t.ExcerptPostId) AS ExcerptBody,
+    (SELECT MAX(Body) FROM Posts WHERE Id = t.WikiPostId) AS WikiBody
+  FROM Tags t
+  WHERE t.Count > 1000
+),
+complex_expression AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    v.VoteTypeId,
+    v.BountyAmount,
+    CASE
+      WHEN v.VoteTypeId IN (2, 3) THEN v.BountyAmount * 2
+      ELSE COALESCE(v.BountyAmount, 0)
+    END AS WeightedValue,
+    CASE
+      WHEN u.Reputation > 10000 THEN 'High'
+      WHEN u.Reputation > 1000 THEN 'Medium'
+      ELSE 'Low'
+    END AS ReputationTier,
+    DATE_TRUNC('month', u.CreationDate) AS CreationMonth
+  FROM Votes v
+  JOIN Users u ON v.UserId = u.Id
+  WHERE v.CreationDate >= TIMESTAMP '2020-01-01 00:00:00'
+),
+outer_join_demo AS (
+  SELECT
+    a.Id AS IdA,
+    b.Id AS IdB,
+    a.Title AS TitleA,
+    b.Title AS TitleB,
+    a.Score AS ScoreA,
+    b.Score AS ScoreB
+  FROM Posts a
+  FULL OUTER JOIN Posts b
+    ON a.Id = b.ParentId
+  WHERE (a.Score > 5 OR b.Score > 5)
+),
+correlated_subq AS (
+  SELECT
+    p.Id,
+    p.Title,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCountForPost
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+)
+SELECT
+  ru.Id AS UserId,
+  ru.DisplayName AS UserName,
+  ra.PostId,
+  ra.Title,
+  ra.PostTypeId,
+  ra.CreationDate AS PostCreationDate,
+  ra.LastActivityDate,
+  ce.ReputationTier,
+  ce.CreationMonth,
+  te.TagName,
+  te.Count AS TagCount,
+  te.ExcerptBody,
+  te.WikiBody,
+  oe.IdA,
+  oe.IdB,
+  oe.TitleA,
+  oe.TitleB,
+  oe.ScoreA,
+  oe.ScoreB,
+  cs.Id AS CorrelatedPostId,
+  cs.CommentCountForPost
+FROM ranked_users ru
+LEFT JOIN recent_activity ra ON ra.OwnerUserId = ru.Id AND ra.rn_owner = 1
+LEFT JOIN complex_expression ce ON ce.UserId = ru.Id
+LEFT JOIN tag_extremes te ON te.ExcerptPostId = ra.PostId
+LEFT JOIN outer_join_demo oe ON oe.IdA = ra.PostId OR oe.IdB = ra.PostId
+LEFT JOIN correlated_subq cs ON cs.Id = ra.PostId
+GROUP BY
+  ru.Id,
+  ru.DisplayName,
+  ru.Reputation,
+  ra.PostId,
+  ra.Title,
+  ra.PostTypeId,
+  ra.CreationDate,
+  ra.LastActivityDate,
+  ce.ReputationTier,
+  ce.CreationMonth,
+  te.TagName,
+  te.Count,
+  te.ExcerptBody,
+  te.WikiBody,
+  oe.IdA,
+  oe.IdB,
+  oe.TitleA,
+  oe.TitleB,
+  oe.ScoreA,
+  oe.ScoreB,
+  cs.Id,
+  cs.CommentCountForPost
+ORDER BY ru.Reputation DESC, ra.LastActivityDate DESC
+LIMIT 100;

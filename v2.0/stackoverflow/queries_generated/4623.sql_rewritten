@@ -1,0 +1,144 @@
+-- {"query": "4623.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1655} 
+WITH RankedUserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.CreationDate ASC) AS ReputationRank,
+        RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS ActivityRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+UserPostContributions AS (
+    SELECT
+        p.OwnerUserId,
+        COUNT(DISTINCT p.Id) AS TotalContributions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        SUM(p.Score) AS TotalScore,
+        AVG(p.Score) AS AverageScore,
+        MAX(p.CreationDate) AS LatestPostDate
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+HighReputationUsers AS (
+    SELECT UserId
+    FROM RankedUserActivity
+    WHERE ReputationRank <= 100
+),
+RecentActivity AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        p.Title,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Score,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.CommentCount,
+        LAG(p.LastActivityDate, 1, p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate) AS PreviousActivityDate,
+        LEAD(p.LastActivityDate, 1, p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate) AS NextActivityDate,
+        DATEDIFF(second, LAG(p.LastActivityDate, 1, p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate), p.LastActivityDate) AS TimeSincePreviousActivity,
+        DATEDIFF(second, p.LastActivityDate, LEAD(p.LastActivityDate, 1, p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate)) AS TimeToNextActivity
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.CreationDate >= DATEADD(month, -6, cast('2024-10-01 12:34:56' as timestamp))
+),
+CommentAnalysis AS (
+    SELECT
+        c.PostId,
+        COUNT(c.Id) AS CommentCount,
+        SUM(c.Score) AS TotalCommentScore,
+        AVG(c.Score) AS AverageCommentScore,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM Comments c
+    GROUP BY c.PostId
+),
+PostDetailsWithAnalysis AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        p.Title,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Score,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.CommentCount AS PostCommentCount,
+        ca.CommentCount AS TotalComments,
+        ca.TotalCommentScore,
+        ca.AverageCommentScore,
+        COALESCE(p.ViewCount, 0) AS ViewCount,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+        CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN 1 ELSE 0 END AS IsCommunityOwned,
+        IIF(p.OwnerUserId IS NULL OR p.OwnerUserId = -1, 'Community', u.DisplayName) AS EffectiveOwnerDisplayName,
+        DATEDIFF(day, p.CreationDate, p.LastActivityDate) AS DaysActive
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN CommentAnalysis ca ON p.Id = ca.PostId
+    WHERE p.Score > 5 OR p.AnswerCount > 3
+)
+SELECT
+    pa.PostId,
+    pa.PostTypeName,
+    pa.OwnerDisplayName,
+    pa.Title,
+    pa.CreationDate,
+    pa.LastActivityDate,
+    pa.Score,
+    pa.AnswerCount,
+    pa.FavoriteCount,
+    pa.PostCommentCount,
+    pa.TotalComments,
+    pa.TotalCommentScore,
+    pa.AverageCommentScore,
+    pa.ViewCount,
+    pa.IsClosed,
+    pa.IsCommunityOwned,
+    pa.EffectiveOwnerDisplayName,
+    pa.DaysActive,
+    rua.Reputation AS OwnerReputation,
+    rua.UserCreationDate AS OwnerCreationDate,
+    rua.PostCount AS OwnerPostCount,
+    upc.TotalContributions AS OwnerTotalContributions,
+    upc.Questions AS OwnerQuestions,
+    upc.Answers AS OwnerAnswers,
+    upc.TotalScore AS OwnerTotalScore,
+    upc.AverageScore AS OwnerAverageScore,
+    ra.TimeSincePreviousActivity,
+    ra.TimeToNextActivity,
+    CASE
+        WHEN pa.ViewCount > 1000 AND pa.Score > 10 THEN 'Popular & Highly Rated'
+        WHEN pa.AnswerCount > 5 AND pa.FavoriteCount > 2 THEN 'Engaging Question'
+        WHEN pa.TotalComments > 10 AND pa.AverageCommentScore < 0 THEN 'Contentious Discussion'
+        WHEN pa.IsCommunityOwned = 1 AND pa.DaysActive > 365 THEN 'Mature Community Content'
+        ELSE 'Standard Content'
+    END AS ContentCategory,
+    CONCAT(
+        COALESCE(CAST(pa.PostTypeId AS VARCHAR), 'NULL'), '-',
+        COALESCE(pa.OwnerDisplayName, 'Anonymous'), '-',
+        COALESCE(pa.Title, 'No Title')
+    ) AS CompositeKey
+FROM PostDetailsWithAnalysis pa
+LEFT JOIN RankedUserActivity rua ON pa.OwnerUserId = rua.UserId
+LEFT JOIN UserPostContributions upc ON pa.OwnerUserId = upc.OwnerUserId
+LEFT JOIN RecentActivity ra ON pa.PostId = ra.Id AND pa.OwnerUserId = ra.OwnerUserId
+WHERE pa.Score >= (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) * 2
+   OR pa.OwnerUserId IN (SELECT UserId FROM HighReputationUsers)
+ORDER BY pa.LastActivityDate DESC, pa.Score DESC
+LIMIT 5000;

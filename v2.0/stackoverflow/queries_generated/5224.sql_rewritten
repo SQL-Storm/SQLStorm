@@ -1,0 +1,85 @@
+-- {"query": "5224.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 711} 
+WITH TopPosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.PostTypeId,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC, p.CreationDate DESC) AS rn_owner
+  FROM Posts p
+  WHERE p.PostTypeId = 1 -- Questions
+    AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '2 years'
+),
+OwnerStats AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(t.PostId) AS TopQuestionCount,
+    SUM(t.Score) AS TotalScoreFromTopQuestions,
+    SUM(CASE WHEN t.Views IS NOT NULL THEN t.ViewCount ELSE 0 END) AS TotalViewsFromTopQuestions
+  FROM TopPosts t
+  JOIN Users u ON u.Id = t.OwnerUserId
+  WHERE t.rn_owner = 1
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+Agg AS (
+  SELECT
+    o.UserId,
+    o.DisplayName,
+    o.Reputation,
+    o.TopQuestionCount,
+    o.TotalScoreFromTopQuestions,
+    o.TotalViewsFromTopQuestions,
+    -- Correlated subquery: percent of top questions that have at least one tag in Tags (split by ><)
+    (
+      SELECT AVG(CASE WHEN c.tag_present THEN 1.0 ELSE 0.0 END)
+      FROM (
+        SELECT
+          CASE
+            WHEN ARRAY_LENGTH(string_to_array(REPLACE(t.Tags, '<', '' ), '><'), 1) > 0
+                 AND string_to_array(t.Tags, '><') IS NOT NULL
+                 THEN true
+                 ELSE false
+          END AS tag_present
+        FROM TopPosts t
+        WHERE t.OwnerUserId = o.UserId AND t.rn_owner = 1
+      ) c
+    ) AS TopTagsPresenceRatio,
+    -- Window function: rank users by TotalScoreFromTopQuestions within partition of Reputation bucket
+    NTILE(4) OVER (ORDER BY o.TotalScoreFromTopQuestions DESC) AS ScoreQuartile
+  FROM OwnerStats o
+)
+SELECT
+  a.UserId,
+  a.DisplayName,
+  a.Reputation,
+  a.TopQuestionCount,
+  a.TotalScoreFromTopQuestions,
+  a.TotalViewsFromTopQuestions,
+  a.TopTagsPresenceRatio,
+  a.ScoreQuartile,
+  -- Elaborate derived metrics: average age of top questions in days
+  (
+    SELECT AVG(EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - p.CreationDate)) / 86400.0)
+    FROM TopPosts p
+    WHERE p.OwnerUserId = a.UserId
+  ) AS AvgAgeDaysTopQuestions,
+  -- Outer join example: latest comment count on the top questions
+  COALESCE((
+    SELECT SUM(c.COUNT)
+    FROM (
+      SELECT COUNT(*) AS COUNT
+      FROM Comments cm
+      WHERE cm.PostId IN (
+        SELECT PostId FROM TopPosts WHERE OwnerUserId = a.UserId AND rn_owner = 1
+      )
+    ) c
+  ), 0) AS TotalCommentsOnTopQuestion
+FROM Agg a
+ORDER BY a.TotalScoreFromTopQuestions DESC
+LIMIT 100;

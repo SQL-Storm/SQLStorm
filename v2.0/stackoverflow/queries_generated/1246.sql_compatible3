@@ -1,0 +1,188 @@
+WITH UserBaseMetrics AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.CreationDate AS UserCreationDate,
+        u.Reputation,
+        u.Views AS UserViews,
+        u.UpVotes AS UserUpVotesGiven,
+        u.DownVotes AS UserDownVotesGiven,
+        COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsOwned,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersOwned,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        COALESCE(SUM(p.Score), 0) AS TotalOwnedPostScore,
+        COALESCE(AVG(p.Score) FILTER (WHERE p.Id IS NOT NULL), 0) AS AvgOwnedPostScore,
+        COALESCE(SUM(c.Score), 0) AS TotalOwnedCommentScore,
+        SUM(CASE WHEN pv.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceivedOnOwnPosts,
+        SUM(CASE WHEN pv.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceivedOnOwnPosts,
+        SUM(COALESCE(p.FavoriteCount, 0)) AS TotalFavoriteCountOnOwnedPosts
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Votes pv ON p.Id = pv.PostId AND pv.VoteTypeId IN (2, 3)
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    GROUP BY u.Id, u.DisplayName, u.CreationDate, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostDetails AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.Title,
+        p.Body,
+        p.LastActivityDate,
+        COALESCE(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2), '') AS RawTagsString,
+        CASE
+            WHEN p.Tags IS NOT NULL AND CHAR_LENGTH(TRIM(p.Tags)) > 2
+                 THEN SUBSTRING(p.Tags FROM 2 FOR POSITION('>' IN p.Tags) - 2)
+            ELSE 'untagged'
+        END AS PrimaryTag,
+        (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 1) AS LinkedPostsCount,
+        (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3) AS DuplicateSourceCount,
+        (SELECT COUNT(*) FROM Comments pc WHERE pc.PostId = p.Id AND pc.Score > 1) AS PopularCommentCount
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserBadgesSummary AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.TagBased = TRUE THEN 1 ELSE 0 END) AS TagBasedBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+PostHistoryAggregates AS (
+    SELECT
+        ph.PostId,
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) AND ph.UserId = pd.OwnerUserId THEN 1 ELSE 0 END) AS HasSelfEdited,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS WasClosedEver,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS WasReopenedEver,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 12 THEN 1 ELSE 0 END) AS WasDeletedEver,
+        MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId IN (4, 5, 6)) AS LastSelfEditDate,
+        STRING_AGG(DISTINCT crt.Name, '; ') FILTER (WHERE ph.PostHistoryTypeId = 10 AND ph.Comment IS NOT NULL AND crt.Id = CAST(ph.Comment AS SMALLINT)) AS AllCloseReasons,
+        COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6)) AS TotalEditRevisions,
+        COUNT(DISTINCT ph.UserId) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6) AND ph.UserId IS NOT NULL) AS UniqueEditorsCount
+    FROM PostHistory ph
+    JOIN PostDetails pd ON ph.PostId = pd.PostId
+    LEFT JOIN CloseReasonTypes crt ON ph.PostHistoryTypeId = 10 AND ph.Comment IS NOT NULL AND crt.Id = CAST(ph.Comment AS SMALLINT)
+    GROUP BY ph.PostId, pd.OwnerUserId
+),
+RankedPostsPerUser AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.WebsiteUrl,
+        u.Location,
+        u.AboutMe,
+        pd.PostId,
+        pd.PostTypeId,
+        pd.Title,
+        pd.Score AS PostScore,
+        pd.ViewCount AS PostViewCount,
+        pd.AnswerCount,
+        pd.CommentCount AS PostCommentCount,
+        pd.FavoriteCount,
+        pd.PostCreationDate,
+        pd.LastActivityDate,
+        pd.PrimaryTag,
+        pd.RawTagsString,
+        pd.LinkedPostsCount,
+        pd.DuplicateSourceCount,
+        pd.PopularCommentCount,
+        pha.HasSelfEdited,
+        pha.WasClosedEver,
+        pha.WasReopenedEver,
+        pha.WasDeletedEver,
+        pha.LastSelfEditDate,
+        pha.AllCloseReasons,
+        pha.TotalEditRevisions,
+        pha.UniqueEditorsCount,
+        LAG(pd.Score, 1, 0) OVER (PARTITION BY u.Id ORDER BY pd.PostCreationDate) AS PreviousPostScoreByUserId,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY pd.Score DESC, pd.ViewCount DESC, pd.PostCreationDate DESC) AS rn_post_by_score
+    FROM Users u
+    JOIN PostDetails pd ON u.Id = pd.OwnerUserId
+    LEFT JOIN PostHistoryAggregates pha ON pd.PostId = pha.PostId
+    WHERE u.Reputation >= 500
+      AND pd.PostTypeId IN (1, 2)
+      AND pd.Score >= 5
+      AND u.LastAccessDate >= DATE '2024-10-01' - INTERVAL '2 year'
+      AND (pd.FavoriteCount IS NULL OR pd.FavoriteCount > 0)
+)
+SELECT
+    r.UserId,
+    r.DisplayName,
+    r.Reputation,
+    ubm.TotalPostsOwned,
+    ubm.TotalQuestionsOwned,
+    ubm.TotalAnswersOwned,
+    ubm.TotalCommentsMade,
+    ubm.UpVotesReceivedOnOwnPosts,
+    ubm.DownVotesReceivedOnOwnPosts,
+    ubm.AvgOwnedPostScore,
+    ubm.TotalFavoriteCountOnOwnedPosts,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    r.PostId AS TopPostId,
+    r.Title AS TopPostTitle,
+    r.PostScore AS TopPostScore,
+    r.PostViewCount AS TopPostViewCount,
+    r.PostCommentCount AS TopPostCommentCount,
+    r.PrimaryTag AS TopPostPrimaryTag,
+    r.HasSelfEdited AS TopPostHasSelfEdited,
+    r.WasClosedEver AS TopPostWasClosedEver,
+    r.AllCloseReasons AS TopPostCloseReasons,
+    r.TotalEditRevisions AS TopPostTotalEditRevisions,
+    r.UniqueEditorsCount AS TopPostUniqueEditorsCount,
+    RANK() OVER (ORDER BY r.Reputation DESC, ubm.TotalPostsOwned DESC) AS GlobalReputationRank,
+    NTILE(10) OVER (ORDER BY r.Reputation DESC) AS ReputationDecile,
+    r.PreviousPostScoreByUserId,
+    (SELECT AVG(sub_p.Score)
+     FROM Posts sub_p
+     WHERE sub_p.OwnerUserId = r.UserId
+       AND sub_p.PostTypeId = r.PostTypeId
+       AND sub_p.CreationDate BETWEEN r.PostCreationDate - INTERVAL '90 days' AND r.PostCreationDate + INTERVAL '90 days'
+       AND sub_p.Id != r.PostId
+    ) AS AvgScoreOfSimilarPostTypeAroundTopPostDate,
+    CAST(ubm.TotalAnswersOwned AS DECIMAL) / NULLIF(ubm.TotalQuestionsOwned, 0) AS AnswerToQuestionRatio,
+    (ubm.UpVotesReceivedOnOwnPosts - ubm.DownVotesReceivedOnOwnPosts) AS NetPostVotesForUser,
+    COALESCE(r.PostScore * LN(r.PostViewCount + 1) / NULLIF(r.PostCommentCount + COALESCE(r.FavoriteCount, 0) + 1, 0), 0.0) AS PostEngagementMetric,
+    UPPER(SUBSTRING(r.DisplayName FROM 1 FOR 1)) AS FirstLetterOfDisplayName,
+    CHAR_LENGTH(COALESCE(r.AboutMe, '')) AS AboutMeLength,
+    CASE
+        WHEN r.WebsiteUrl LIKE '%stackexchange.com%' THEN 'SE User'
+        WHEN r.WebsiteUrl IS NOT NULL THEN 'External Website'
+        ELSE 'No Website'
+    END AS WebsiteType,
+    COALESCE(r.Location, 'Earth') AS UserLocationDetailed,
+    CASE
+        WHEN r.PostTypeId = 1 AND r.AnswerCount > 0 AND r.PostScore > 10 THEN 'High-Impact Question'
+        WHEN r.PostTypeId = 2 AND r.PostScore > 10 AND r.PostId IS NOT NULL AND EXISTS (SELECT 1 FROM Posts p_parent WHERE p_parent.Id = r.ParentId) THEN 'High-Impact Answer'
+        WHEN r.WasClosedEver = 1 THEN 'Closed Post'
+        ELSE 'Regular Post'
+    END AS TopPostCategory,
+    EXTRACT(DAY FROM AGE(DATE '2024-10-01', r.PostCreationDate)) AS DaysSinceTopPostCreation,
+    COALESCE(EXTRACT(HOUR FROM AGE(r.LastActivityDate, r.LastSelfEditDate)), -1) AS HoursBetweenLastActivityAndSelfEdit
+FROM RankedPostsPerUser r
+LEFT JOIN UserBaseMetrics ubm ON r.UserId = ubm.UserId
+LEFT JOIN UserBadgesSummary ubs ON r.UserId = ubs.UserId
+WHERE r.rn_post_by_score = 1
+  AND r.PostScore > 10
+  AND r.PostViewCount > 100
+  AND (r.HasSelfEdited = 1 OR r.TotalEditRevisions > 1)
+  AND NOT (r.WasClosedEver = 1 AND r.WasReopenedEver = 0 AND r.PostTypeId = 1 AND COALESCE(ubm.TotalQuestionsOwned, 0) < 5)
+ORDER BY GlobalReputationRank ASC, r.PostCreationDate DESC
+LIMIT 5000;

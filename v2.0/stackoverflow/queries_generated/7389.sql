@@ -1,0 +1,245 @@
+-- {"query": "7389.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2156} 
+WITH UserPostStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) as TotalPosts,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) as QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) as AnswerCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) as TotalQuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) as TotalAnswerScore,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) as AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) as AvgAnswerScore,
+        MAX(p.CreationDate) as LatestPostDate,
+        MIN(p.CreationDate) as FirstPostDate,
+        COUNT(DISTINCT p.Tags) as TagCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.CreationDate >= '2010-01-01'::timestamp
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopQuestions AS (
+    SELECT 
+        p.Id as QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        u.DisplayName as OwnerName,
+        p.Tags,
+        string_to_array(trim(trim(p.Tags, '<'), '>'), '><') as TagArray,
+        CASE 
+            WHEN p.Score > 100 THEN 'High'
+            WHEN p.Score > 50 THEN 'Medium'
+            ELSE 'Low'
+        END as ScoreCategory,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) as ScoreRank,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) as TypeScoreRank
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1 
+    AND p.CreationDate >= '2015-01-01'::timestamp
+    AND p.Score > 0
+),
+QuestionTagAnalysis AS (
+    SELECT 
+        tq.QuestionId,
+        tq.Title,
+        tq.Score,
+        tq.ViewCount,
+        tq.AnswerCount,
+        tq.TagArray,
+        unnest(tq.TagArray) as Tag,
+        COUNT(*) OVER (PARTITION BY unnest(tq.TagArray)) as TagFrequency,
+        RANK() OVER (ORDER BY COUNT(*) OVER (PARTITION BY unnest(tq.TagArray)) DESC) as PopularTagRank
+    FROM TopQuestions tq
+),
+UserActivityAnalysis AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        up.TotalPosts,
+        up.QuestionCount,
+        up.AnswerCount,
+        up.TotalQuestionScore,
+        up.TotalAnswerScore,
+        up.AvgQuestionScore,
+        up.AvgAnswerScore,
+        up.LatestPostDate,
+        up.FirstPostDate,
+        up.TagCount,
+        CASE 
+            WHEN up.TotalPosts > 100 THEN 'Active'
+            WHEN up.TotalPosts > 50 THEN 'Moderate'
+            WHEN up.TotalPosts > 10 THEN 'New'
+            ELSE 'Inactive'
+        END as ActivityLevel,
+        DATEDIFF('day', up.FirstPostDate, up.LatestPostDate) as ActiveDays,
+        CASE 
+            WHEN up.TotalPosts > 0 THEN up.TotalPosts / NULLIF(DATEDIFF('day', up.FirstPostDate, CURRENT_TIMESTAMP), 0)
+            ELSE 0 
+        END as PostsPerDay,
+        COALESCE(
+            (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.Score > 0),
+            0
+        ) as PositiveScorePosts,
+        COALESCE(
+            (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id),
+            0
+        ) as CommentCount,
+        COALESCE(
+            (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id),
+            0
+        ) as BadgeCount,
+        CASE 
+            WHEN up.TotalPosts > 0 AND up.QuestionCount > 0 AND up.AnswerCount > 0 THEN 1
+            WHEN up.TotalPosts > 0 AND up.QuestionCount > 0 THEN 2
+            WHEN up.TotalPosts > 0 AND up.AnswerCount > 0 THEN 3
+            ELSE 4
+        END as UserType,
+        (up.QuestionCount * 100.0 / NULLIF(up.TotalPosts, 0)) as QuestionPercentage,
+        (up.AnswerCount * 100.0 / NULLIF(up.TotalPosts, 0)) as AnswerPercentage
+    FROM Users u
+    JOIN UserPostStats up ON u.Id = up.UserId
+    WHERE u.Reputation > 1000
+),
+RecentActivity AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        'Post' as ActivityType,
+        COALESCE(p.Tags, '') as Tags,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as PostType
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.LastActivityDate >= CURRENT_TIMESTAMP - INTERVAL '7 days'
+    
+    UNION ALL
+    
+    SELECT 
+        c.Id as PostId,
+        c.Text as Title,
+        c.Score,
+        c.CreationDate,
+        c.CreationDate as LastActivityDate,
+        c.UserId as OwnerUserId,
+        c.UserDisplayName as OwnerName,
+        'Comment' as ActivityType,
+        '' as Tags,
+        'Comment' as PostType
+    FROM Comments c
+    WHERE c.CreationDate >= CURRENT_TIMESTAMP - INTERVAL '7 days'
+),
+CombinedAnalysis AS (
+    SELECT 
+        uaa.UserId,
+        uaa.DisplayName,
+        uaa.Reputation,
+        uaa.TotalPosts,
+        uaa.QuestionCount,
+        uaa.AnswerCount,
+        uaa.TotalQuestionScore,
+        uaa.TotalAnswerScore,
+        uaa.AvgQuestionScore,
+        uaa.AvgAnswerScore,
+        uaa.ActivityLevel,
+        uaa.ActiveDays,
+        uaa.PostsPerDay,
+        uaa.PositiveScorePosts,
+        uaa.CommentCount,
+        uaa.BadgeCount,
+        uaa.UserType,
+        uaa.QuestionPercentage,
+        uaa.AnswerPercentage,
+        ra.PostId,
+        ra.Title,
+        ra.Score as ActivityScore,
+        ra.CreationDate,
+        ra.LastActivityDate,
+        ra.ActivityType,
+        ra.Tags,
+        ra.PostType,
+        CASE WHEN ra.PostId IS NOT NULL THEN 1 ELSE 0 END as HasRecentActivity,
+        DENSE_RANK() OVER (ORDER BY uaa.Reputation DESC) as ReputationRank,
+        ROW_NUMBER() OVER (ORDER BY uaa.TotalPosts DESC) as PostRank
+    FROM UserActivityAnalysis uaa
+    LEFT JOIN RecentActivity ra ON uaa.UserId = ra.OwnerUserId
+    WHERE uaa.TotalPosts > 0
+)
+SELECT 
+    ca.UserId,
+    ca.DisplayName,
+    ca.Reputation,
+    ca.TotalPosts,
+    ca.QuestionCount,
+    ca.AnswerCount,
+    ca.TotalQuestionScore,
+    ca.TotalAnswerScore,
+    ca.AvgQuestionScore,
+    ca.AvgAnswerScore,
+    ca.ActivityLevel,
+    ca.ActiveDays,
+    ca.PostsPerDay,
+    ca.PositiveScorePosts,
+    ca.CommentCount,
+    ca.BadgeCount,
+    ca.UserType,
+    ca.QuestionPercentage,
+    ca.AnswerPercentage,
+    ca.PostId,
+    ca.Title,
+    ca.ActivityScore,
+    ca.CreationDate,
+    ca.LastActivityDate,
+    ca.ActivityType,
+    ca.Tags,
+    CASE 
+        WHEN ca.HasRecentActivity = 1 AND ca.ActivityType = 'Post' THEN 
+            CASE WHEN ca.PostType = 'Question' THEN 1 ELSE 2 END
+        WHEN ca.HasRecentActivity = 1 AND ca.ActivityType = 'Comment' THEN 3
+        ELSE 4
+    END as EngagementType,
+    CASE 
+        WHEN ca.Reputation > 50000 THEN 'Elite'
+        WHEN ca.Reputation > 25000 THEN 'Veteran'
+        WHEN ca.Reputation > 10000 THEN 'Expert'
+        ELSE 'Regular'
+    END as ReputationTier,
+    ABS(ca.PostsPerDay - (SELECT AVG(PostsPerDay) FROM UserActivityAnalysis)) as DeviationFromAvg,
+    ROUND((ca.BadgeCount * 100.0 / NULLIF(ca.TotalPosts, 0)), 2) as BadgeEfficiency,
+    CASE 
+        WHEN ca.Reputation > 10000 AND ca.CommentCount > 50 THEN 'Engaged'
+        WHEN ca.Reputation > 5000 AND ca.CommentCount > 25 THEN 'Moderate'
+        WHEN ca.Reputation > 1000 AND ca.CommentCount > 10 THEN 'Basic'
+        ELSE 'Minimal'
+    END as EngagementLevel,
+    ca.ReputationRank,
+    ca.PostRank,
+    (SELECT COUNT(*) FROM CombinedAnalysis) as TotalUsers,
+    (SELECT AVG(Reputation) FROM CombinedAnalysis) as AvgReputation,
+    (SELECT MAX(Reputation) FROM CombinedAnalysis) as MaxReputation,
+    'Performance_Benchmark_Pass' as BenchmarkStatus,
+    CURRENT_TIMESTAMP as BenchmarkTimestamp,
+    CASE 
+        WHEN ca.Reputation > (SELECT AVG(Reputation) FROM CombinedAnalysis) * 1.5 THEN 'High'
+        WHEN ca.Reputation > (SELECT AVG(Reputation) FROM CombinedAnalysis) * 0.5 THEN 'Medium'
+        ELSE 'Low'
+    END as BenchmarkScoreLevel
+FROM CombinedAnalysis ca
+WHERE ca.Reputation > 10000
+AND (ca.HasRecentActivity = 1 OR ca.TotalPosts > 10)
+ORDER BY ca.Reputation DESC, ca.TotalPosts DESC
+LIMIT 15000;

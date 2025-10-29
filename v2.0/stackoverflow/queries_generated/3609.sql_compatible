@@ -1,0 +1,139 @@
+WITH UserActivity AS (
+    SELECT 
+        u.Id                         AS UserId,
+        u.DisplayName,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COALESCE(SUM(v.UpVotes),0)   AS TotalUpVotes,
+        MAX(p.CreationDate)          AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT 
+            pv.PostId,
+            COUNT(*) AS UpVotes
+        FROM Votes pv
+        WHERE pv.VoteTypeId = 2
+        GROUP BY pv.PostId
+    ) v ON v.PostId = p.Id
+    GROUP BY u.Id, u.DisplayName
+),
+
+UserTagStats AS (
+    SELECT
+        a.OwnerUserId               AS UserId,
+        UNNEST(STRING_TO_ARRAY(TRIM(BOTH '<>' FROM p.Tags), '><')) AS Tag,
+        COUNT(*)                    AS AnswersOnTag,
+        AVG(p.Score)                AS AvgScore,
+        ROW_NUMBER() OVER (PARTITION BY a.OwnerUserId ORDER BY COUNT(*) DESC) AS TagRank
+    FROM Posts p
+    JOIN Posts a ON a.Id = p.ParentId AND a.PostTypeId = 1
+    WHERE p.PostTypeId = 2 
+      AND p.Tags IS NOT NULL
+    GROUP BY a.OwnerUserId, Tag
+),
+
+TopUserTags AS (
+    SELECT 
+        UserId,
+        Tag,
+        AnswersOnTag,
+        AvgScore
+    FROM UserTagStats
+    WHERE TagRank <= 3
+),
+
+BadgeSummary AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1)                                 AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2)                                 AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3)                                 AS BronzeBadges,
+        STRING_AGG(DISTINCT b.Name, ', ') FILTER (WHERE b.TagBased = 1)    AS TagBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+RecentCloseReasons AS (
+    SELECT 
+        ph.PostId,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Comment END)       AS CloseReasonId,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) AS ClosedOn
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.PostId
+),
+
+UserClosedPosts AS (
+    SELECT 
+        p.OwnerUserId                     AS UserId,
+        COUNT(*)                          AS ClosedPosts,
+        AVG(DATE_PART('day', CAST('2024-10-01 12:34:56' AS timestamp) - rc.ClosedOn)) AS AvgDaysClosed
+    FROM Posts p
+    LEFT JOIN RecentCloseReasons rc ON rc.PostId = p.Id
+    WHERE p.PostTypeId = 1 
+      AND rc.CloseReasonId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+
+MainResults AS (
+    SELECT 
+        ua.UserId,
+        ua.DisplayName,
+        ua.AnswerCount,
+        ua.QuestionCount,
+        ua.TotalUpVotes,
+        COALESCE(bs.GoldBadges,0)   AS GoldBadges,
+        COALESCE(bs.SilverBadges,0) AS SilverBadges,
+        COALESCE(bs.BronzeBadges,0) AS BronzeBadges,
+        bs.TagBadges,
+        uc.ClosedPosts,
+        uc.AvgDaysClosed,
+        STRING_AGG(
+            CONCAT(t.Tag, ':', t.AnswersOnTag, '/', ROUND(t.AvgScore::numeric,2)),
+            '; '
+        )                           AS TopTagsInfo,
+        CASE 
+            WHEN ua.TotalUpVotes > 10000 THEN 'PowerUser'
+            WHEN ua.AnswerCount > 500    THEN 'ProlificAnswerer'
+            ELSE 'Regular'
+        END                         AS UserTier,
+        ua.LastPostDate
+    FROM UserActivity ua
+    LEFT JOIN BadgeSummary bs   ON bs.UserId = ua.UserId
+    LEFT JOIN UserClosedPosts uc ON uc.UserId = ua.UserId
+    LEFT JOIN TopUserTags t     ON t.UserId = ua.UserId
+    GROUP BY 
+        ua.UserId, ua.DisplayName, ua.AnswerCount, ua.QuestionCount,
+        ua.TotalUpVotes, bs.GoldBadges, bs.SilverBadges, bs.BronzeBadges,
+        bs.TagBadges, uc.ClosedPosts, uc.AvgDaysClosed, ua.LastPostDate
+    HAVING COUNT(t.Tag) > 0
+)
+
+SELECT *
+FROM MainResults
+WHERE TotalUpVotes IS NOT NULL
+ORDER BY TotalUpVotes DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT 
+    CAST(NULL AS bigint)               AS UserId,
+    'Aggregated Stats'                 AS DisplayName,
+    SUM(ua.AnswerCount)                AS AnswerCount,
+    SUM(ua.QuestionCount)              AS QuestionCount,
+    SUM(ua.TotalUpVotes)               AS TotalUpVotes,
+    SUM(COALESCE(bs.GoldBadges,0))      AS GoldBadges,
+    SUM(COALESCE(bs.SilverBadges,0))    AS SilverBadges,
+    SUM(COALESCE(bs.BronzeBadges,0))    AS BronzeBadges,
+    CAST(NULL AS text)                 AS TagBadges,
+    SUM(COALESCE(uc.ClosedPosts,0))    AS ClosedPosts,
+    AVG(COALESCE(uc.AvgDaysClosed,0))  AS AvgDaysClosed,
+    CAST(NULL AS text)                 AS TopTagsInfo,
+    CAST(NULL AS text)                 AS UserTier,
+    MAX(ua.LastPostDate)               AS LastPostDate
+FROM UserActivity ua
+LEFT JOIN BadgeSummary bs   ON bs.UserId = ua.UserId
+LEFT JOIN UserClosedPosts uc ON uc.UserId = ua.UserId
+WHERE ua.TotalUpVotes > 0;

@@ -1,0 +1,148 @@
+-- {"query": "3897.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2995} 
+
+WITH
+-- 1. Aggregate badge counts per user, broken by class
+badge_counts AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_cnt,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_cnt,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_cnt,
+        COUNT(*) AS total_badges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+-- 2. Compute post statistics per user
+post_stats AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 1) AS question_cnt,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 2) AS answer_cnt,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId IN (1,2)) AS avg_score,
+        SUM(CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END)::float
+            / NULLIF(COUNT(*) FILTER (WHERE p.PostTypeId = 1),0) AS answered_ratio,
+        MAX(p.CreationDate) AS last_post_date
+    FROM Posts p
+    GROUP BY p.OwnerUserId
+),
+
+-- 3. Latest post (by CreationDate) per user, with title trimmed to 30 chars
+latest_post AS (
+    SELECT DISTINCT ON (p.OwnerUserId)
+        p.OwnerUserId AS UserId,
+        p.Id AS PostId,
+        LEFT(p.Title,30) AS short_title,
+        p.CreationDate,
+        p.Score,
+        CASE WHEN p.Tags IS NOT NULL THEN
+            (SELECT string_agg(t, ',')
+             FROM unnest(string_to_array(trim(both '<>' FROM p.Tags), '><')) AS t
+             ORDER BY t LIMIT 3)
+        END AS top_3_tags
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    ORDER BY p.OwnerUserId, p.CreationDate DESC
+),
+
+-- 4. Top tags per user based on tag usage in questions
+user_tag_usage AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        unnest(string_to_array(trim(both '<>' FROM p.Tags), '><')) AS Tag,
+        COUNT(*) AS tag_used_cnt
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+    GROUP BY p.OwnerUserId, Tag
+),
+
+top_tags AS (
+    SELECT
+        utu.UserId,
+        STRING_AGG(utu.Tag, ', ' ORDER BY utu.tag_used_cnt DESC, utu.Tag) AS top_tags_csv
+    FROM (
+        SELECT
+            utu.*,
+            ROW_NUMBER() OVER (PARTITION BY utu.UserId ORDER BY utu.tag_used_cnt DESC, utu.Tag) AS rn
+        FROM user_tag_usage utu
+    ) utu
+    WHERE utu.rn <= 5
+    GROUP BY utu.UserId
+),
+
+-- 5. Users that satisfy either of two complex conditions (set operator)
+cond_a AS (
+    SELECT u.Id AS UserId
+    FROM Users u
+    JOIN badge_counts bc ON bc.UserId = u.Id
+    WHERE bc.gold_cnt >= 1
+),
+cond_b AS (
+    SELECT u.Id AS UserId
+    FROM Users u
+    LEFT JOIN badge_counts bc ON bc.UserId = u.Id
+    WHERE u.Reputation > 1000 AND COALESCE(bc.total_badges,0) = 0
+),
+qualified_users AS (
+    SELECT UserId FROM cond_a
+    UNION
+    SELECT UserId FROM cond_b
+),
+
+-- 6. Correlated subquery to fetch the most recent vote type for each user’s posts
+recent_vote AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        (SELECT vt.Name
+         FROM Votes v
+         JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+         WHERE v.PostId = p.Id
+         ORDER BY v.CreationDate DESC
+         LIMIT 1) AS last_vote_type
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId, p.Id
+),
+
+-- 7. Final assembly, left joins to keep users with no activity
+final AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(bc.gold_cnt,0) AS gold_badges,
+        COALESCE(bc.silver_cnt,0) AS silver_badges,
+        COALESCE(bc.bronze_cnt,0) AS bronze_badges,
+        COALESCE(ps.question_cnt,0) AS questions,
+        COALESCE(ps.answer_cnt,0) AS answers,
+        ROUND(COALESCE(ps.avg_score,0)::numeric,2) AS avg_post_score,
+        ROUND(COALESCE(ps.answered_ratio,0)::numeric,4) AS answered_ratio,
+        lp.PostId AS latest_post_id,
+        lp.short_title,
+        lp.last_post_date,
+        lp.top_3_tags,
+        tt.top_tags_csv,
+        rv.last_vote_type,
+        CASE
+            WHEN u.CreationDate < '2010-01-01'::date THEN 'veteran'
+            WHEN u.Reputation > 20000 THEN 'power_user'
+            ELSE 'regular'
+        END AS user_category,
+        CASE
+            WHEN COALESCE(bc.total_badges,0) = 0 AND u.Reputation > 5000 THEN 'high_rep_no_badge'
+            WHEN COALESCE(bc.gold_cnt,0) > 0 THEN 'gold_holder'
+            ELSE NULL
+        END AS special_flag
+    FROM Users u
+    LEFT JOIN badge_counts bc ON bc.UserId = u.Id
+    LEFT JOIN post_stats ps ON ps.UserId = u.Id
+    LEFT JOIN latest_post lp ON lp.UserId = u.Id
+    LEFT JOIN top_tags tt ON tt.UserId = u.Id
+    LEFT JOIN recent_vote rv ON rv.UserId = u.Id
+    WHERE u.Id IN (SELECT UserId FROM qualified_users)
+)
+
+SELECT *
+FROM final
+ORDER BY Reputation DESC, gold_badges DESC, answers DESC
+LIMIT 100;

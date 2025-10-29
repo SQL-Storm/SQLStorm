@@ -1,0 +1,127 @@
+WITH RankedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        pt.Name AS PostTypeName,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) AS rn_by_type,
+        AVG(CAST(p.Score AS DOUBLE PRECISION)) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate ROWS BETWEEN 10 PRECEDING AND CURRENT ROW) AS rolling_avg_score,
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate) AS previous_score
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.OwnerUserId IS NOT NULL
+      AND p.CreationDate > (cast('2024-10-01' as date) - INTERVAL '1 year')
+),
+UserPostStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(rp.PostId) AS TotalPosts,
+        SUM(CASE WHEN rp.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        AVG(CAST(rp.Score AS DOUBLE PRECISION)) AS AvgPostScore,
+        MAX(rp.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN RankedPosts rp ON u.Id = rp.OwnerUserId
+    GROUP BY u.Id, u.DisplayName
+),
+MostActiveUsers AS (
+    SELECT
+        UserId,
+        DisplayName,
+        TotalPosts,
+        LastPostDate,
+        ROW_NUMBER() OVER (ORDER BY TotalPosts DESC, LastPostDate DESC) AS UserRank
+    FROM UserPostStats
+    WHERE TotalPosts > 5
+),
+TopQuestions AS (
+    SELECT
+        PostId,
+        PostTypeName,
+        Score,
+        ViewCount,
+        AnswerCount,
+        CommentCount,
+        FavoriteCount,
+        rolling_avg_score,
+        previous_score,
+        CASE
+            WHEN Score > 100 AND ViewCount > 10000 THEN 'High Performance'
+            WHEN Score > 50 AND AnswerCount > 10 THEN 'Popular'
+            WHEN CommentCount > 20 THEN 'Engaged'
+            ELSE 'Standard'
+        END AS PerformanceCategory,
+        -- include OwnerUserId for joins later
+        rp.OwnerUserId
+    FROM RankedPosts rp
+    WHERE PostTypeId = 1 AND rn_by_type <= 100
+),
+UserQuestionActivity AS (
+    SELECT
+        rp.OwnerUserId,
+        COUNT(CASE WHEN rp.PostTypeId = 1 THEN rp.PostId ELSE NULL END) AS QuestionsPosted,
+        COUNT(CASE WHEN rp.PostTypeId = 2 THEN rp.PostId ELSE NULL END) AS AnswersPosted,
+        SUM(CASE WHEN rp.Score > 0 THEN 1 ELSE 0 END) AS PositivelyScoredPosts,
+        SUM(CASE WHEN rp.Score < 0 THEN 1 ELSE 0 END) AS NegativelyScoredPosts,
+        rp.CreationDate,
+        rp.Score,
+        rp.rolling_avg_score,
+        rp.previous_score
+    FROM RankedPosts rp
+    WHERE rp.OwnerUserId IS NOT NULL
+    GROUP BY rp.OwnerUserId, rp.CreationDate, rp.Score, rp.rolling_avg_score, rp.previous_score
+),
+RecentQuestionActivity AS (
+    SELECT
+        QUA.OwnerUserId,
+        QUA.QuestionsPosted,
+        QUA.AnswersPosted,
+        QUA.PositivelyScoredPosts,
+        QUA.NegativelyScoredPosts,
+        QUA.Score,
+        QUA.rolling_avg_score,
+        QUA.previous_score,
+        QUA.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY QUA.OwnerUserId ORDER BY QUA.CreationDate DESC) AS recent_activity_rank
+    FROM UserQuestionActivity QUA
+    WHERE QUA.CreationDate > (cast('2024-10-01' as date) - INTERVAL '30 days')
+)
+SELECT
+    mq.DisplayName AS MostActiveUser,
+    mq.UserRank,
+    tq.PostId,
+    tq.PostTypeName,
+    tq.Score,
+    tq.ViewCount,
+    tq.AnswerCount,
+    tq.CommentCount,
+    tq.FavoriteCount,
+    tq.rolling_avg_score,
+    tq.previous_score,
+    tq.PerformanceCategory,
+    rca.QuestionsPosted AS RecentQuestions,
+    rca.AnswersPosted AS RecentAnswers,
+    rca.PositivelyScoredPosts AS RecentPositiveScores,
+    rca.NegativelyScoredPosts AS RecentNegativeScores,
+    CASE
+        WHEN tq.rolling_avg_score IS NULL THEN 'N/A'
+        WHEN tq.rolling_avg_score > tq.previous_score THEN 'Improving'
+        WHEN tq.rolling_avg_score < tq.previous_score THEN 'Declining'
+        ELSE 'Stable'
+    END AS ScoreTrend,
+    COALESCE(u.Location, 'Unknown') AS UserLocation,
+    CASE WHEN u.WebsiteUrl IS NOT NULL AND LENGTH(u.WebsiteUrl) > 0 THEN 'Has Website' ELSE 'No Website' END AS WebsiteStatus,
+    u.Id AS UserId
+FROM TopQuestions tq
+JOIN MostActiveUsers mq ON mq.UserRank <= 10
+LEFT JOIN Users u ON tq.OwnerUserId = u.Id
+LEFT JOIN RecentQuestionActivity rca ON tq.OwnerUserId = rca.OwnerUserId AND rca.recent_activity_rank = 1
+WHERE (u.Reputation IS NOT NULL AND u.Reputation > 1000) OR tq.Score > 500
+ORDER BY mq.UserRank, tq.Score DESC
+LIMIT 50;

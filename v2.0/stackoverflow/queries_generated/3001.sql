@@ -1,0 +1,120 @@
+-- {"query": "3001.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2202} 
+
+WITH RecentQuestions AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.Title,
+        UNNEST(STRING_TO_ARRAY(TRIM(BOTH '<>' FROM p.Tags), '><')) AS Tag
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= CURRENT_DATE - INTERVAL '30 days'
+),
+TagStats AS (
+    SELECT
+        Tag,
+        COUNT(*)                              AS QuestionCount,
+        AVG(p.Score)                          AS AvgScore,
+        MAX(p.CreationDate)                   AS LatestQuestion
+    FROM RecentQuestions p
+    GROUP BY Tag
+    HAVING COUNT(*) > 10
+),
+UserActivity AS (
+    SELECT
+        u.Id                                              AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 END),0) AS QuestionCount,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 END),0) AS AnswerCount,
+        COALESCE(SUM(p.Score),0)                           AS TotalPostScore,
+        COALESCE(COUNT(b.Id),0)                            AS BadgeCount,
+        MAX(p.CreationDate)                               AS LastPostDate,
+        MAX(v.CreationDate)                               AS LastVoteDate
+    FROM Users u
+    LEFT JOIN Posts   p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges  b ON b.UserId      = u.Id
+    LEFT JOIN Votes   v ON v.UserId      = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+UserRecentVotes AS (
+    SELECT
+        u.Id                                                       AS UserId,
+        COUNT(*) FILTER (WHERE vt.Id = 2)                           AS UpVotesGiven,
+        COUNT(*) FILTER (WHERE vt.Id = 3)                           AS DownVotesGiven,
+        COUNT(*) FILTER (WHERE vt.Id = 5)                           AS FavoritesGiven
+    FROM Users u
+    JOIN Votes v   ON v.UserId = u.Id
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE v.CreationDate >= CURRENT_DATE - INTERVAL '90 days'
+    GROUP BY u.Id
+),
+TopUsers AS (
+    SELECT
+        ua.*,
+        ROW_NUMBER() OVER (ORDER BY ua.Reputation DESC, ua.TotalPostScore DESC) AS ReputationRank,
+        COALESCE(urv.UpVotesGiven,0) - COALESCE(urv.DownVotesGiven,0)           AS NetVotesGiven
+    FROM UserActivity ua
+    LEFT JOIN UserRecentVotes urv ON urv.UserId = ua.UserId
+    WHERE ua.Reputation >= 1000
+)
+SELECT
+    tu.UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.ReputationRank,
+    tu.QuestionCount,
+    tu.AnswerCount,
+    tu.TotalPostScore,
+    tu.BadgeCount,
+    tu.LastPostDate,
+    tu.LastVoteDate,
+    tu.NetVotesGiven,
+    CASE
+        WHEN tu.BadgeCount >= 10          THEN 'PowerUser'
+        WHEN tu.QuestionCount > tu.AnswerCount THEN 'QuestionHeavy'
+        ELSE 'Balanced'
+    END                                          AS UserCategory,
+    COALESCE(ts.AvgScore,0)                      AS RecentTagAvgScore,
+    ts.QuestionCount                            AS RecentTagQuestionCount,
+    STRING_AGG(DISTINCT ts.Tag, ', ')
+        FILTER (WHERE ts.QuestionCount > 20)    AS PopularRecentTags
+FROM TopUsers tu
+LEFT JOIN TagStats ts
+       ON ts.Tag = ANY (
+              SELECT UNNEST(STRING_TO_ARRAY(TRIM(BOTH '<>' FROM p.Tags), '><'))
+              FROM Posts p
+              WHERE p.OwnerUserId = tu.UserId
+                AND p.PostTypeId = 1
+              LIMIT 5
+          )
+GROUP BY
+    tu.UserId, tu.DisplayName, tu.Reputation, tu.ReputationRank,
+    tu.QuestionCount, tu.AnswerCount, tu.TotalPostScore, tu.BadgeCount,
+    tu.LastPostDate, tu.LastVoteDate, tu.NetVotesGiven,
+    ts.AvgScore, ts.QuestionCount
+
+UNION ALL
+
+SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    NULL,
+    0,
+    0,
+    0,
+    COALESCE(COUNT(b.Id),0),
+    NULL,
+    NULL,
+    0,
+    'NoPosts'               AS UserCategory,
+    NULL,
+    NULL,
+    NULL
+FROM Users u
+LEFT JOIN Badges b ON b.UserId = u.Id
+WHERE NOT EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id)
+GROUP BY u.Id, u.DisplayName, u.Reputation;

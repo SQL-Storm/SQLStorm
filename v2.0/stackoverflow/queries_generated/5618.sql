@@ -1,0 +1,124 @@
+-- {"query": "5618.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 896} 
+WITH recent_activity AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.PostTypeId,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.LastActivityDate,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation,
+    u.Location,
+    u.CreationDate AS OwnerCreationDate,
+    b.Class AS BadgeClass,
+    b.Name AS BadgeName,
+    b.Date AS BadgeDate
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  WHERE p.PostTypeId IN (1,2) -- Questions and Answers
+    AND p.LastActivityDate >= NOW() - INTERVAL '30 days'
+),
+tag_expansion AS (
+  SELECT
+    ra.*,
+    ts.TagName AS Tag,
+    ROW_NUMBER() OVER (PARTITION BY ra.PostId ORDER BY ra.CreationDate DESC) AS rn
+  FROM recent_activity ra
+  CROSS APPLY (
+    SELECT unnest(string_to_array(
+      replace(replace(coalesce(ra.Tags, ''), '<', ''), '>', ''), '')
+    , '')) AS TagName
+  ) AS ts -- Note: standard SQL doesn't have CROSS APPLY; adapt per dialect
+  WHERE ts.TagName <> ''
+),
+correlated_metrics AS (
+  SELECT
+    te.PostId,
+    te.Title,
+    te.OwnerUserId,
+    te.OwnerDisplayName,
+    te.Reputation,
+    te.Location,
+    te.CreationDate,
+    te.LastActivityDate,
+    te.ViewCount,
+    te.Score,
+    te.CommentCount,
+    te.AnswerCount,
+    te.FavoriteCount,
+    te.Tag,
+    te.BadgeName,
+    te.BadgeDate,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = te.PostId) AS CommentCountTotal,
+    (SELECT AVG(v.BountyAmount) FROM Votes v WHERE v.PostId = te.PostId) AS AvgBounty,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = te.PostId AND v.VoteTypeId = 2) AS Upvotes,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = te.PostId AND v.VoteTypeId = 3) AS Downvotes
+  FROM tag_expansion te
+  WHERE te.rn = 1
+),
+windowed AS (
+  SELECT
+    cm.*,
+    SUM(cm.Upvotes) OVER (PARTITION BY cm.OwnerUserId ORDER BY cm.LastActivityDate ROWS BETWEEN 29 PRECEDING AND CURRENT ROW) AS RunningUpvotes,
+    SUM(cm.Downvotes) OVER (PARTITION BY cm.OwnerUserId ORDER BY cm.LastActivityDate ROWS BETWEEN 29 PRECEDING AND CURRENT ROW) AS RunningDownvotes
+  FROM correlated_metrics cm
+),
+final_summary AS (
+  SELECT
+    w.PostId,
+    w.Title,
+    w.OwnerUserId,
+    w.OwnerDisplayName,
+    w.Reputation,
+    w.Location,
+    w.CreationDate,
+    w.LastActivityDate,
+    w.ViewCount,
+    w.Score,
+    w.CommentCount,
+    w.AnswerCount,
+    w.FavoriteCount,
+    w.Tag,
+    w.BadgeName,
+    w.BadgeDate,
+    w.CommentCountTotal,
+    w.AvgBounty,
+    w.Upvotes,
+    w.Downvotes,
+    w.RunningUpvotes,
+    w.RunningDownvotes
+  FROM windowed w
+)
+SELECT
+  fs.PostId,
+  fs.Title,
+  fs.OwnerDisplayName,
+  fs.Reputation,
+  fs.Location,
+  fs.CreationDate,
+  fs.LastActivityDate,
+  fs.ViewCount,
+  fs.Score,
+  fs.CommentCount,
+  fs.AnswerCount,
+  fs.FavoriteCount,
+  fs.Tag,
+  fs.BadgeName,
+  fs.BadgeDate,
+  fs.CommentCountTotal,
+  fs.AvgBounty,
+  fs.Upvotes,
+  fs.Downvotes,
+  fs.RunningUpvotes,
+  fs.RunningDownvotes
+FROM final_summary fs
+ORDER BY fs.LastActivityDate DESC
+LIMIT 200;

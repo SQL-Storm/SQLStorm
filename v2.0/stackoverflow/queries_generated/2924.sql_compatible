@@ -1,0 +1,208 @@
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        coalesce(case when t.IsModeratorOnly then 1 else 0 end, 0) as IsModeratorOnly,
+        coalesce(case when t.IsRequired then 1 else 0 end, 0) as IsRequired,
+        1 as Level,
+        cast(t.TagName as varchar(500)) as Path
+    from Tags t
+    where t.IsRequired = 1
+
+    union all
+
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        coalesce(case when t2.IsModeratorOnly then 1 else 0 end, 0),
+        coalesce(case when t2.IsRequired then 1 else 0 end, 0),
+        r.Level + 1,
+        r.Path || ' > ' || t2.TagName
+    from Tags t2
+    inner join RecursiveTagHierarchy r on t2.Id = (
+        select pl.RelatedPostId
+        from PostLinks pl
+        join Posts p on p.Id = pl.PostId
+        where p.PostTypeId = 1
+          and p.Tags like '%' || t2.TagName || '%'
+          and pl.LinkTypeId = 1
+        limit 1
+    )
+    where r.Level < 3
+),
+TopUsers as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        coalesce(u.Location, 'UNKNOWN') as Location,
+        coalesce(u.WebsiteUrl, '') as WebsiteUrl,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        dense_rank() over (order by u.Reputation desc) as RankByReputation
+    from Users u
+    where u.Reputation > 10000
+),
+UserBadgesAgg as (
+    select
+        b.UserId,
+        count(case when b.Class = 1 then 1 end) as GoldBadges,
+        count(case when b.Class = 2 then 1 end) as SilverBadges,
+        count(case when b.Class = 3 then 1 end) as BronzeBadges,
+        count(distinct b.Name) as DistinctBadgeNames
+    from Badges b
+    group by b.UserId
+),
+QuestionStats as (
+    select
+        p.Id,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.Tags,
+        case when p.ClosedDate is not null then 1 else 0 end as IsClosed,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.CreationDate desc) as UserTopQuestionRank
+    from Posts p
+    where p.PostTypeId = 1
+),
+AnswerStats as (
+    select
+        pa.Id,
+        pa.ParentId as QuestionId,
+        pa.OwnerUserId,
+        pa.Score,
+        pa.CreationDate,
+        pa.Body,
+        case when pa.AcceptedAnswerId is not null then 1 else 0 end as IsAccepted,
+        row_number() over (partition by pa.ParentId order by pa.Score desc, pa.CreationDate asc) as AnswerRankWithinQuestion
+    from Posts pa
+    where pa.PostTypeId = 2
+),
+QuestionAnswerCombined as (
+    select
+        q.Id as QuestionId,
+        q.OwnerUserId as QuestionOwnerId,
+        q.Title,
+        q.CreationDate as QuestionCreation,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        q.IsClosed,
+        a.Id as AnswerId,
+        a.OwnerUserId as AnswerOwnerId,
+        a.Score as AnswerScore,
+        a.IsAccepted,
+        a.AnswerRankWithinQuestion
+    from QuestionStats q
+    left join AnswerStats a on a.QuestionId = q.Id
+),
+LatestCloseReasons as (
+    select distinct on (ph.PostId)
+        ph.PostId,
+        crt.Name as CloseReason,
+        ph.CreationDate
+    from PostHistory ph
+    left join CloseReasonTypes crt on cast(ph.Comment as integer) = crt.Id
+    where ph.PostHistoryTypeId = 10
+    order by ph.PostId, ph.CreationDate desc
+),
+UserActivity as (
+    select
+        u.Id,
+        u.DisplayName,
+        count(distinct p.Id) as TotalPosts,
+        count(distinct q.Id) as TotalQuestions,
+        count(distinct a.Id) as TotalAnswers,
+        count(distinct c.Id) as TotalComments,
+        count(distinct v.Id) as TotalVotes,
+        userbadges.GoldBadges,
+        userbadges.SilverBadges,
+        userbadges.BronzeBadges,
+        max(p.CreationDate) as LastPostDate,
+        max(c.CreationDate) as LastCommentDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Posts q on q.OwnerUserId = u.Id and q.PostTypeId = 1
+    left join Posts a on a.OwnerUserId = u.Id and a.PostTypeId = 2
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    left join UserBadgesAgg userbadges on userbadges.UserId = u.Id
+    group by u.Id, u.DisplayName, userbadges.GoldBadges, userbadges.SilverBadges, userbadges.BronzeBadges
+),
+WindowedQuestions as (
+    select
+        q.Id,
+        q.OwnerUserId,
+        q.Title,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.CreationDate,
+        q.IsClosed,
+        latestClose.CloseReason,
+        lead(q.Score) over (order by q.Score desc) as NextHigherScore,
+        lag(q.Score) over (order by q.Score desc) as PrevLowerScore,
+        avg(q.Score) over () as AvgScore,
+        count(*) over () as TotalCount,
+        row_number() over (partition by q.OwnerUserId order by q.Score desc, q.CreationDate desc) as RowNum,
+        q.Tags
+    from QuestionStats q
+    left join LatestCloseReasons latestClose on latestClose.PostId = q.Id
+)
+select 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    ua.TotalPosts,
+    ua.TotalQuestions,
+    ua.TotalAnswers,
+    ua.TotalComments,
+    ua.TotalVotes,
+    ua.GoldBadges,
+    ua.SilverBadges,
+    ua.BronzeBadges,
+    (select count(*) from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 1 and p.Score > ua.AvgScore) as AboveAverageScoreQuestions,
+    q.Id as TopQuestionId,
+    q.Title as TopQuestionTitle,
+    q.Score as TopQuestionScore,
+    q.ViewCount as TopQuestionViewCount,
+    q.AnswerCount as TopQuestionAnswerCount,
+    q.IsClosed as TopQuestionIsClosed,
+    q.CloseReason as TopQuestionCloseReason,
+    q.NextHigherScore,
+    q.PrevLowerScore,
+    rt.Path as TagHierarchyPath,
+    (case 
+        when u.WebsiteUrl is null or u.WebsiteUrl = '' then 'N/A'
+        when position('http' in lower(u.WebsiteUrl)) = 1 then u.WebsiteUrl 
+        else 'http://' || u.WebsiteUrl
+    end) as NormalizedWebsite,
+    coalesce(
+        (select string_agg(distinct b.Name, ', ') 
+         from Badges b 
+         where b.UserId = u.Id and b.Class = 1
+        ),
+        'No Gold Badges') as SampleGoldBadges,
+    ua.LastPostDate,
+    ua.LastCommentDate
+from TopUsers u
+left join UserActivity ua on ua.Id = u.Id
+left join WindowedQuestions q on q.OwnerUserId = u.Id and q.RowNum = 1
+left join RecursiveTagHierarchy rt on rt.TagName = (
+    select unnest(string_to_array(regexp_replace(q.Tags, '[<>]', '', 'g'), ' ')) 
+    limit 1
+)
+where ua.TotalPosts > 50
+order by u.Reputation desc, ua.TotalPosts desc
+limit 50;

@@ -1,0 +1,120 @@
+WITH
+RecentActivePosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.AcceptedAnswerId,
+    COALESCE(p.ParentId, 0) AS ParentId
+  FROM Posts p
+  WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30' DAY
+),
+TagStats AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS TagCount,
+    COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionsWithTag,
+    AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS AvgQuestionScore,
+    MAX(p.ViewCount) AS MaxViews
+  FROM Posts p,
+       UNNEST(string_to_array(TRIM(BOTH '<' FROM TRIM(BOTH '>' FROM p.Tags)), '><')) AS t(TagName)
+  GROUP BY t.TagName
+),
+TopUsers AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.AccountId,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.Views DESC) AS rn
+  FROM Users u
+  WHERE u.AccountId IS NOT NULL
+),
+UserBadgeActivity AS (
+  SELECT
+    b.UserId,
+    COUNT(*) AS BadgesEarned,
+    MAX(b.Date) AS LastBadgeDate,
+    STRING_AGG(b.Name, ',') AS BadgeNames
+  FROM Badges b
+  GROUP BY b.UserId
+),
+PostHistorySummary AS (
+  SELECT
+    ph.PostId,
+    MAX(pht.Name) AS HistoryTypeName,
+    MAX(ph.CreationDate) AS LatestHistoryDate
+  FROM PostHistory ph
+  LEFT JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+  GROUP BY ph.PostId
+),
+CrossLinkMetrics AS (
+  SELECT
+    pl.PostId,
+    COUNT(*) AS LinkCount,
+    SUM(CASE WHEN lt.Name ILIKE 'duplicate%' THEN 1 ELSE 0 END) AS DuplicateLinks
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+  GROUP BY pl.PostId
+)
+SELECT
+  rp.PostId,
+  rp.PostTypeId,
+  rp.OwnerUserId,
+  ru.DisplayName AS OwnerDisplayName,
+  rp.Title,
+  rp.Tags,
+  rp.CreationDate,
+  rp.LastActivityDate,
+  rp.Score,
+  rp.ViewCount,
+  rp.AnswerCount,
+  rp.CommentCount,
+  rp.FavoriteCount,
+  CASE WHEN rp.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS HasAcceptedAnswer,
+  CASE WHEN rp.ParentId <> 0 THEN rp.ParentId ELSE NULL END AS ParentPostId,
+  ht.LatestHistoryDate,
+  ht.HistoryTypeName,
+  ts.MaxViews AS MaxRelatedPostViews,
+  ts.TagName,
+  ts.TagCount,
+  ts.QuestionsWithTag,
+  ts.AvgQuestionScore,
+  bu.BadgesEarned,
+  bu.LastBadgeDate,
+  bu.BadgeNames,
+  upn.rn AS TopUserRank,
+  clm.LinkCount,
+  clm.DuplicateLinks
+FROM RecentActivePosts rp
+LEFT JOIN Users ru ON rp.OwnerUserId = ru.Id
+LEFT JOIN PostHistorySummary ht ON rp.PostId = ht.PostId
+LEFT JOIN TopUsers upn ON rp.OwnerUserId = upn.UserId
+LEFT JOIN UserBadgeActivity bu ON rp.OwnerUserId = bu.UserId
+LEFT JOIN CrossLinkMetrics clm ON rp.PostId = clm.PostId
+LEFT JOIN TagStats ts ON ts.TagName IN (
+    -- extract tag names from rp.Tags to match TagStats.TagName
+    -- produce same splitting logic as used in TagStats
+    -- works in many dialects: generate list by splitting and trimming
+    -- Here we re-create same splitting using regexp_split_to_table if available,
+    -- otherwise the IN will still work for dialects that support the function.
+    SELECT TRIM(BOTH '<' FROM TRIM(BOTH '>' FROM v)) FROM (
+      SELECT UNNEST(string_to_array(rp.Tags, '><')) AS v
+    ) sub
+)
+WHERE rp.ViewCount > 0
+  AND rp.Score >= (SELECT AVG(Score) FROM Posts)
+ORDER BY rp.LastActivityDate DESC
+LIMIT 100;

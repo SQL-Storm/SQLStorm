@@ -1,0 +1,243 @@
+-- {"query": "1823.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 4095} 
+
+WITH UserEngagement AS (
+    -- Summarizes user engagement metrics, including post counts by type, comment counts, badges, and overall owned post score.
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.Views AS UserViews,
+        U.UpVotes AS UserUpVotes,
+        U.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestionsOwned,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswersOwned,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN P.ViewCount ELSE 0 END) AS TotalQuestionViewsOwned,
+        SUM(P.Score) AS TotalPostScoreOwned,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(P.LastActivityDate) AS LastActivityAsOwner
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    LEFT JOIN Badges AS B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.Views, U.UpVotes, U.DownVotes
+),
+PostHistoricalAnalysis AS (
+    -- Analyzes post history for edit counts, closure details, and community ownership events.
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.CreationDate AS PostCreationDate,
+        P.LastEditDate,
+        P.ClosedDate,
+        P.CommunityOwnedDate,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9, 24) THEN PH.Id END) AS EditRevisionCount, -- Counts various edit-related history types
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.CreationDate END) AS FirstCloseDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 11 THEN PH.CreationDate END) AS LastReopenDate,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 16 THEN 1 ELSE 0 END) AS CommunityOwnedEvents,
+        (
+            SELECT MAX(PH2.CreationDate) -- Correlated subquery to find the previous close date if any
+            FROM PostHistory AS PH2
+            WHERE PH2.PostId = P.Id
+              AND PH2.PostHistoryTypeId = 10
+              AND PH2.CreationDate < P.ClosedDate -- Ensure it's a close event before the final closed date
+            ORDER BY PH2.CreationDate DESC
+            LIMIT 1
+        ) AS PriorCloseDate,
+        STRING_AGG(DISTINCT SUBSTRING(COALESCE(PH.Comment, 'N/A'), 1, 50), '; ' ORDER BY PH.CreationDate) FILTER (WHERE PH.PostHistoryTypeId = 10 AND PH.Comment IS NOT NULL) AS CloseReasonsSample -- Aggregates distinct close reasons
+    FROM Posts AS P
+    LEFT JOIN PostHistory AS PH ON P.Id = PH.PostId
+    GROUP BY P.Id, P.PostTypeId, P.CreationDate, P.LastEditDate, P.ClosedDate, P.CommunityOwnedDate
+),
+PostVoteBreakdown AS (
+    -- Detailed vote counts for each post.
+    SELECT
+        P.Id AS PostId,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived,
+        SUM(CASE WHEN V.VoteTypeId = 1 THEN 1 ELSE 0 END) AS AcceptedVotes,
+        SUM(CASE WHEN V.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoriteVotes -- Note: Favorite vote data might be sparse or legacy
+    FROM Posts AS P
+    LEFT JOIN Votes AS V ON P.Id = V.PostId
+    GROUP BY P.Id
+),
+PostTagsExpanded AS (
+    -- Expands the 'Tags' string column into individual rows for each tag, using string functions.
+    SELECT
+        P.Id AS PostId,
+        TRIM(UNNEST(string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><'))) AS TagName
+    FROM Posts AS P
+    WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL AND LENGTH(TRIM(P.Tags)) > 2 -- Ensures only valid tags are processed
+),
+TagPerformanceMetrics AS (
+    -- Calculates average scores and answer counts for tags based on associated questions.
+    SELECT
+        PTE.TagName,
+        COUNT(DISTINCT P.Id) AS TotalTaggedQuestions,
+        AVG(P.Score) AS AvgQuestionScore,
+        SUM(P.AnswerCount) AS TotalAnswersForTagQuestions,
+        AVG(COALESCE((SELECT A.Score FROM Posts AS A WHERE A.Id = P.AcceptedAnswerId), 0)) AS AvgAcceptedAnswerScoreForTag -- Correlated subquery with NULL logic for accepted answer scores
+    FROM PostTagsExpanded AS PTE
+    JOIN Posts AS P ON PTE.PostId = P.Id
+    GROUP BY PTE.TagName
+    HAVING COUNT(DISTINCT P.Id) >= 5 -- Filters for tags with a minimum number of questions
+)
+-- Main Query: Combines all CTEs to provide a comprehensive view of users and their post activity, with complex calculations and filtering.
+SELECT
+    UE.UserId,
+    UE.DisplayName,
+    UE.Reputation,
+    UE.UserViews,
+    UE.TotalQuestionsOwned,
+    UE.TotalAnswersOwned,
+    UE.TotalCommentsMade,
+    UE.GoldBadges,
+    UE.SilverBadges,
+    UE.BronzeBadges,
+    P.Id AS PostId,
+    P.PostTypeId,
+    P.CreationDate AS PostCreationDate,
+    P.LastEditDate,
+    P.ClosedDate,
+    PHA.EditRevisionCount,
+    PVB.UpVotesReceived AS PostUpVotes,
+    PVB.DownVotesReceived AS PostDownVotes,
+    PVB.FavoriteVotes AS PostFavoriteVotes,
+    PTE.TagName AS AssociatedTag, -- Each row now explicitly linked to one tag if the post has multiple
+    TPM.AvgQuestionScore AS TagAvgQuestionScore,
+    TPM.TotalAnswersForTagQuestions,
+    AGE(NOW(), UE.LastActivityAsOwner) AS TimeSinceLastUserActivity, -- Date calculation (difference from current time)
+    (UE.TotalPostScoreOwned * 1.0 / NULLIF(UE.TotalPostsOwned, 0)) AS AvgPostScorePerOwnedPost, -- Calculation with NULL logic
+    (UE.TotalAnswersOwned * 1.0 / NULLIF(UE.TotalQuestionsOwned, 0)) AS AnswerRatio,
+    (
+        SELECT COUNT(P_Inner.Id) -- Correlated subquery for user's question acceptance rate
+        FROM Posts AS P_Inner
+        WHERE P_Inner.OwnerUserId = UE.UserId
+          AND P_Inner.PostTypeId = 1
+          AND P_Inner.AcceptedAnswerId IS NOT NULL
+    ) * 1.0 / NULLIF(UE.TotalQuestionsOwned, 0) AS QuestionAcceptanceRate,
+    CASE
+        WHEN UE.Reputation >= 50000 AND UE.GoldBadges >= 5 AND UE.TotalQuestionsOwned >= 50 THEN 'Legendary Contributor'
+        WHEN UE.Reputation >= 10000 AND UE.SilverBadges >= 10 AND UE.TotalAnswersOwned >= 100 THEN 'Expert Contributor'
+        WHEN UE.Reputation >= 1000 OR UE.TotalQuestionsOwned + UE.TotalAnswersOwned >= 100 THEN 'Active Contributor'
+        ELSE 'Casual User'
+    END AS UserContributionLevel, -- Complex CASE expression for user categorization
+    DENSE_RANK() OVER (ORDER BY UE.Reputation DESC, UE.TotalPostScoreOwned DESC, UE.GoldBadges DESC) AS GlobalReputationRank, -- Window function: global rank
+    RANK() OVER (PARTITION BY UE.UserContributionLevel ORDER BY UE.TotalPostsOwned DESC, UE.TotalCommentsMade DESC) AS PostsWithinLevelRank, -- Window function: rank within a user contribution level
+    LAG(PHA.LastEditDate, 1, PHA.PostCreationDate) OVER (PARTITION BY P.Id ORDER BY PHA.LastEditDate) AS PreviousEditDate, -- Window function: previous edit date for a post
+    (
+        SELECT COUNT(PL.Id) -- Correlated subquery for linked posts count
+        FROM PostLinks AS PL
+        WHERE PL.PostId = P.Id AND PL.LinkTypeId = 1
+    ) AS LinkedPostCount,
+    (
+        SELECT COUNT(PL.Id) -- Correlated subquery for duplicate of posts count
+        FROM PostLinks AS PL
+        WHERE PL.RelatedPostId = P.Id AND PL.LinkTypeId = 3
+    ) AS DuplicateOfCount,
+    COALESCE(PHA.PriorCloseDate, PHA.PostCreationDate) AS EffectiveCloseBaseDate, -- NULL logic: Fallback date
+    PHA.CloseReasonsSample,
+    (PHA.FirstCloseDate IS NOT NULL AND PHA.LastReopenDate IS NOT NULL AND PHA.LastReopenDate > PHA.FirstCloseDate) AS HasBeenClosedAndReopened, -- Boolean logic
+    P.Title AS PostTitle,
+    P.Tags AS OriginalTags,
+    (LENGTH(P.Body) - LENGTH(REPLACE(P.Body, '<pre>', ''))) / NULLIF(LENGTH('<pre>'), 0) AS CodeBlockCount, -- String expression for counting code blocks
+    CASE
+        WHEN P.Body ILIKE '%example%' AND P.Body ILIKE '%code%' THEN 'Contains Example Code'
+        WHEN P.Body ILIKE '%screenshot%' OR P.Body ILIKE '%image%' THEN 'Contains Visuals'
+        WHEN P.Body ILIKE '%bug%' OR P.Body ILIKE '%error%' THEN 'Problem Description'
+        ELSE 'Textual'
+    END AS BodyContentHint, -- More string and CASE expressions
+    NULLIF(P.AnswerCount, 0) IS NULL AS NoAnswersOrZero, -- NULL logic check
+    EXTRACT(YEAR FROM P.CreationDate) AS CreationYear, -- Date function to extract year
+    (P.LastEditDate IS NOT NULL AND P.LastEditDate > P.CreationDate) AS HasBeenEdited
+FROM Users AS U
+JOIN UserEngagement AS UE ON U.Id = UE.UserId
+LEFT JOIN Posts AS P ON UE.UserId = P.OwnerUserId
+LEFT JOIN PostHistoricalAnalysis AS PHA ON P.Id = PHA.PostId
+LEFT JOIN PostVoteBreakdown AS PVB ON P.Id = PVB.PostId
+LEFT JOIN PostTagsExpanded AS PTE ON P.Id = PTE.PostId -- Joins a post to multiple rows if it has multiple tags
+LEFT JOIN TagPerformanceMetrics AS TPM ON PTE.TagName = TPM.TagName
+WHERE
+    (UE.Reputation > 1000 OR UE.TotalQuestionsOwned > 10 OR UE.TotalAnswersOwned > 20) -- Filter for users with significant activity
+    AND (P.CreationDate BETWEEN '2020-01-01' AND '2022-12-31' OR P.CreationDate IS NULL) -- Date range for posts, including NULL creation dates
+    AND (
+        (P.Score >= 10 AND P.ViewCount >= 500 AND P.PostTypeId = 1) OR -- High-score/view questions
+        (P.PostTypeId = 2 AND P.ParentId IS NOT NULL AND (SELECT COUNT(V_Inner.Id) FROM Votes AS V_Inner WHERE V_Inner.PostId = P.ParentId AND V_Inner.VoteTypeId = 8) > 0) OR -- Answer to a bountied question
+        (P.PostTypeId = 1 AND P.FavoriteCount IS NOT NULL AND P.FavoriteCount >= 50) -- Questions with many favorites
+    )
+    AND (UE.DisplayName IS NOT NULL AND LENGTH(TRIM(UE.DisplayName)) > 0 AND UE.DisplayName NOT ILIKE '%deleted user%') -- String functions and NULL logic for display name
+    AND (P.Title ILIKE '%sql%' OR P.Tags ILIKE '%<database>%' OR P.Title IS NULL) -- Case-insensitive string search and NULL logic
+GROUP BY -- Extensive GROUP BY due to non-aggregated columns and the PostTagsExpanded join potentially creating multiple rows per post.
+    UE.UserId, UE.DisplayName, UE.Reputation, UE.UserViews, UE.TotalPostsOwned, UE.TotalQuestionsOwned, UE.TotalAnswersOwned,
+    UE.TotalCommentsMade, UE.TotalPostScoreOwned, UE.GoldBadges, UE.SilverBadges, UE.BronzeBadges, UE.LastActivityAsOwner,
+    P.Id, P.PostTypeId, P.CreationDate, P.LastEditDate, P.ClosedDate, P.CommunityOwnedDate, P.Score, P.ViewCount, P.Body, P.Title, P.Tags, P.ParentId, P.AnswerCount, P.FavoriteCount,
+    PHA.EditRevisionCount, PHA.FirstCloseDate, PHA.LastReopenDate, PHA.PriorCloseDate, PHA.CloseReasonsSample, PHA.CommunityOwnedEvents,
+    PVB.UpVotesReceived, PVB.DownVotesReceived, PVB.AcceptedVotes, PVB.FavoriteVotes,
+    PTE.TagName,
+    TPM.AvgQuestionScore, TPM.TotalAnswersForTagQuestions
+HAVING
+    COUNT(DISTINCT P.Id) >= 1 -- Ensures that at least one post meets the criteria for the user
+    AND (SUM(PVB.UpVotesReceived) - SUM(PVB.DownVotesReceived) > 10 OR SUM(PVB.UpVotesReceived) IS NULL) -- Aggregate with NULL check
+UNION ALL
+-- Secondary branch: identifies highly active users who contribute many comments on highly voted posts, demonstrating a set operator.
+SELECT
+    U.Id AS UserId,
+    U.DisplayName,
+    U.Reputation,
+    U.Views AS UserViews,
+    NULL AS TotalQuestionsOwned, -- NULL for columns not directly available in this branch
+    NULL AS TotalAnswersOwned,
+    COUNT(C.Id) AS TotalCommentsMade,
+    NULL AS GoldBadges,
+    NULL AS SilverBadges,
+    NULL AS BronzeBadges,
+    P.Id AS PostId,
+    P.PostTypeId,
+    P.CreationDate AS PostCreationDate,
+    P.LastEditDate,
+    P.ClosedDate,
+    0 AS EditRevisionCount, -- Placeholder
+    NULL AS PostUpVotes,
+    NULL AS PostDownVotes,
+    NULL AS PostFavoriteVotes,
+    NULL AS AssociatedTag,
+    NULL AS TagAvgQuestionScore,
+    NULL AS TotalAnswersForTagQuestions,
+    AGE(NOW(), U.LastAccessDate) AS TimeSinceLastUserActivity,
+    NULL AS AvgPostScorePerOwnedPost,
+    NULL AS AnswerRatio,
+    NULL AS QuestionAcceptanceRate,
+    'Comment Maestro' AS UserContributionLevel, -- A distinct user contribution level for this branch
+    0 AS GlobalReputationRank, -- Placeholder rank
+    0 AS PostsWithinLevelRank, -- Placeholder rank
+    P.CreationDate AS PreviousEditDate, -- Placeholder
+    (SELECT COUNT(PL_inner.Id) FROM PostLinks AS PL_inner WHERE PL_inner.PostId = P.Id AND PL_inner.LinkTypeId = 1) AS LinkedPostCount,
+    (SELECT COUNT(PL_inner.Id) FROM PostLinks AS PL_inner WHERE PL_inner.RelatedPostId = P.Id AND PL_inner.LinkTypeId = 3) AS DuplicateOfCount,
+    P.CreationDate AS EffectiveCloseBaseDate,
+    NULL AS CloseReasonsSample,
+    FALSE AS HasBeenClosedAndReopened,
+    P.Title AS PostTitle,
+    P.Tags AS OriginalTags,
+    (LENGTH(P.Body) - LENGTH(REPLACE(P.Body, '<code>', ''))) / NULLIF(LENGTH('<code>'), 0) AS CodeBlockCount, -- Different string expression for this branch
+    'Comment Driven' AS BodyContentHint,
+    NULLIF(P.AnswerCount, 0) IS NULL AS NoAnswersOrZero,
+    EXTRACT(YEAR FROM P.CreationDate) AS CreationYear,
+    (P.LastEditDate IS NOT NULL AND P.LastEditDate > P.CreationDate) AS HasBeenEdited
+FROM Users AS U
+JOIN Comments AS C ON U.Id = C.UserId
+JOIN Posts AS P ON C.PostId = P.Id
+WHERE
+    P.Score > 500
+    AND P.ViewCount > 10000
+    AND C.CreationDate BETWEEN '2019-01-01' AND '2023-12-31'
+    AND U.Reputation > 10000
+    AND U.DisplayName IS NOT NULL
+GROUP BY
+    U.Id, U.DisplayName, U.Reputation, U.Views, U.LastAccessDate,
+    P.Id, P.PostTypeId, P.CreationDate, P.LastEditDate, P.ClosedDate, P.Title, P.Tags, P.Body, P.AnswerCount
+HAVING
+    COUNT(C.Id) >= 100 -- Users must have at least 100 comments on such posts
+ORDER BY GlobalReputationRank ASC, UserViews DESC, TotalCommentsMade DESC;

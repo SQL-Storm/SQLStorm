@@ -1,0 +1,250 @@
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Location,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        count(distinct b.Id) as BadgeCount,
+        count(distinct c.Id) as CommentCount,
+        count(distinct v.Id) filter (where v.VoteTypeId = 2) as UpVotesCast,
+        count(distinct v.Id) filter (where v.VoteTypeId = 3) as DownVotesCast
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Location
+
+    union all
+
+    select
+        u2.Id,
+        u2.DisplayName,
+        u2.Reputation,
+        u2.CreationDate,
+        u2.LastAccessDate,
+        u2.Location,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+    from Users u2
+    where u2.Reputation > 10000
+      and not exists (
+          select 1 from Users u1 where u1.Id = u2.Id
+      )
+),
+PostAnswerRanks as (
+    select
+        p.Id as PostId,
+        p.ParentId,
+        p.Score,
+        row_number() over (partition by p.ParentId order by p.Score desc, p.CreationDate asc) as AnswerRank
+    from Posts p
+    where p.PostTypeId = 2
+),
+TopAnswers as (
+    select
+        par.PostId,
+        par.ParentId,
+        par.Score,
+        p.Title as QuestionTitle,
+        p.OwnerUserId as QuestionOwnerId,
+        u.DisplayName as AnswererName,
+        p2.OwnerUserId as QuestionOwnerUserId,
+        p2.Title as QuestionTitle2,
+        u2.DisplayName as QuestionOwnerName
+    from PostAnswerRanks par
+    join Posts p on p.Id = par.PostId
+    join Posts p2 on p2.Id = par.ParentId
+    left join Users u on u.Id = p.OwnerUserId
+    left join Users u2 on u2.Id = p2.OwnerUserId
+    where par.AnswerRank <= 3
+),
+PostCloseReasons as (
+    select
+        ph.PostId,
+        cast(ph.Comment as integer) as CloseReasonId,
+        crt.Name as CloseReasonName,
+        max(ph.CreationDate) as LastCloseDate
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where ph.PostHistoryTypeId = 10
+    group by ph.PostId, cast(ph.Comment as integer), crt.Name
+),
+CloseReasonSummary as (
+    select
+        p.Id as QuestionId,
+        p.Title,
+        coalesce(cr.CommentCount, 0) as CloseVoteCount,
+        coalesce(crs.CloseReasonName, 'N/A') as MostRecentCloseReason,
+        coalesce(crs.LastCloseDate, p.CreationDate) as MostRecentCloseDate
+    from Posts p
+    left join (
+        select PostId, count(*) as CommentCount
+        from PostHistory
+        where PostHistoryTypeId = 10
+        group by PostId
+    ) cr on cr.PostId = p.Id
+    left join PostCloseReasons crs on crs.PostId = p.Id
+    where p.PostTypeId = 1
+),
+UserTagActivity as (
+    -- parse tags without UNNEST/STRING_TO_ARRAY by extracting tag positions using recursive approach
+    -- produce one row per tag per post
+    with recursive tag_positions as (
+        select
+            p.Id as PostId,
+            p.OwnerUserId,
+            p.Tags,
+            1 as pos_start,
+            null::integer as pos_end
+        from Posts p
+        where p.Tags is not null and p.PostTypeId = 1
+
+        union all
+
+        select
+            tp.PostId,
+            tp.OwnerUserId,
+            tp.Tags,
+            tp.pos_end + 1,
+            null::integer
+        from tag_positions tp
+        where tp.pos_end is not null and tp.pos_end + 1 <= length(tp.Tags)
+    ), tag_extracted as (
+        select
+            tp.PostId,
+            tp.OwnerUserId,
+            -- find next '>' after current start (search for '>' from pos_start)
+            case
+                when substr(tp.Tags, tp.pos_start, 1) = '<' then
+                    -- find position of next '>' after pos_start
+                    instr(tp.Tags, '>', tp.pos_start) -- use instr if available; if not, fallback below
+                else
+                    instr(tp.Tags, '>', tp.pos_start)
+            end as found_pos
+        from tag_positions tp
+    ), tags_clean as (
+        select
+            te.PostId,
+            te.OwnerUserId,
+            -- extract tag between '<' and '>'
+            trim(both ' ' from substr(p.Tags, te.pos_start + 1, te.found_pos - te.pos_start - 1)) as Tag,
+            te.found_pos as pos_end,
+            p.CreationDate,
+            p.Score
+        from tag_extracted te
+        join Posts p on p.Id = te.PostId
+        where te.found_pos > 0
+    )
+    select
+        u.Id as UserId,
+        tc.Tag,
+        count(distinct tc.PostId) as PostsCount,
+        sum(tc.Score) as TotalScore,
+        max(tc.CreationDate) as LatestPostDate
+    from Users u
+    join tags_clean tc on tc.OwnerUserId = u.Id
+    group by u.Id, tc.Tag
+),
+UserTopTags as (
+    select
+        uta.UserId,
+        uta.Tag,
+        uta.PostsCount,
+        uta.TotalScore,
+        uta.LatestPostDate
+    from (
+        select
+            uta.*,
+            row_number() over (partition by uta.UserId order by uta.PostsCount desc, uta.TotalScore desc) as rn
+        from UserTagActivity uta
+    ) uta
+    where uta.rn = 1
+),
+FinalAggregation as (
+    select
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.BadgeCount,
+        ua.CommentCount,
+        ua.UpVotesCast,
+        ua.DownVotesCast,
+        utt.Tag as UserTopTag,
+        ts.CloseVoteCount,
+        ts.MostRecentCloseReason,
+        ts.MostRecentCloseDate,
+        concat(
+            'Rep: ', ua.Reputation,
+            ' | Q: ', ua.QuestionCount,
+            ' | A: ', ua.AnswerCount,
+            ' | Badges: ', ua.BadgeCount,
+            ' | Comments: ', ua.CommentCount
+        ) as UserStatsString,
+        row_number() over (partition by ua.Location order by ua.Reputation desc) as LocationRank,
+        ua.Location as Location_for_grouping
+    from RecursiveUserActivity ua
+    left join UserTopTags utt on utt.UserId = ua.UserId
+    left join CloseReasonSummary ts on ts.QuestionId = ua.UserId
+    where ua.Location is not null
+    group by
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.BadgeCount,
+        ua.CommentCount,
+        ua.UpVotesCast,
+        ua.DownVotesCast,
+        utt.Tag,
+        ts.CloseVoteCount,
+        ts.MostRecentCloseReason,
+        ts.MostRecentCloseDate,
+        ua.Location
+)
+select
+    fa.UserId,
+    fa.DisplayName,
+    fa.Location_for_grouping as Location,
+    fa.UserTopTag,
+    fa.UserStatsString,
+    fa.CloseVoteCount,
+    fa.MostRecentCloseReason,
+    fa.MostRecentCloseDate,
+    fa.LocationRank,
+    t.AnswerRank,
+    t.Score as AnswerScore,
+    t.QuestionTitle,
+    t.AnswererName,
+    t.QuestionOwnerName
+from FinalAggregation fa
+left join (
+    select
+        par.PostId,
+        par.ParentId,
+        par.Score,
+        row_number() over (partition by par.ParentId order by par.Score desc) as AnswerRank,
+        p.Title as QuestionTitle,
+        u.DisplayName as AnswererName,
+        u2.DisplayName as QuestionOwnerName,
+        par.ParentId as ParentId_for_join
+    from PostAnswerRanks par
+    join Posts p on p.Id = par.PostId
+    left join Users u on u.Id = p.OwnerUserId
+    left join Posts q on q.Id = par.ParentId
+    left join Users u2 on u2.Id = q.OwnerUserId
+    where par.AnswerRank <= 3
+) t on t.QuestionOwnerName = fa.DisplayName
+where fa.LocationRank <= 5
+order by fa.Location_for_grouping, fa.LocationRank, t.AnswerRank;

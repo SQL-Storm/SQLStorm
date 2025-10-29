@@ -1,0 +1,99 @@
+WITH
+RecentActivePosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.PostTypeId,
+    ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.LastActivityDate DESC) AS rn
+  FROM Posts p
+  WHERE p.LastActivityDate IS NOT NULL
+),
+TagPopularity AS (
+  SELECT
+    t.TagName,
+    t.Count AS TagCount,
+    AVG(p.Score) AS AvgPostScore,
+    MIN(p.CreationDate) AS FirstPostDate
+  FROM Tags t
+  JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+  WHERE t.IsModeratorOnly = FALSE
+  GROUP BY t.TagName, t.Count
+),
+UserImpact AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesGiven,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesGiven,
+    SUM(CASE WHEN v.VoteTypeId = 6 THEN 1 ELSE 0 END) AS CloseVotesCast
+  FROM Users u
+  LEFT JOIN Votes v ON v.UserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+ComplexMetrics AS (
+  SELECT
+    p.PostTypeId,
+    COUNT(*) AS TotalPosts,
+    SUM(CASE WHEN p.Score > 0 THEN 1 ELSE 0 END) AS PositiveScorePosts,
+    SUM(CASE WHEN p.ViewCount > 1000 THEN 1 ELSE 0 END) AS ViralPosts,
+    AVG(p.Score) AS AvgScore,
+    MAX(p.LastActivityDate) AS MostRecentActivity
+  FROM Posts p
+  GROUP BY p.PostTypeId
+),
+CrossJoined AS (
+  SELECT
+    q.Id AS QuestionPostId,
+    q.Title AS QuestionTitle,
+    q.OwnerUserId AS QuestionOwner,
+    a.Id AS AnswerPostId,
+    a.Title AS AnswerTitle,
+    a.OwnerUserId AS AnswerOwner,
+    b.Title AS LinkPostTitle,
+    cl.Name AS CloseReason,
+    lt.Name AS LinkTypeName,
+    ph.Text AS PostHistoryText
+  FROM Posts q
+  LEFT JOIN Posts a ON a.ParentId = q.Id
+  LEFT JOIN PostLinks pl ON pl.PostId = q.Id
+  LEFT JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+  LEFT JOIN Posts b ON b.Id = pl.RelatedPostId
+  LEFT JOIN PostHistory ph ON ph.PostId = q.Id
+  LEFT JOIN PostHistoryTypes pht ON pht.Id = ph.PostHistoryTypeId
+  LEFT JOIN CloseReasonTypes cl ON cl.Id = CAST(JSON_VALUE(ph.Text, '$.CloseReasonId') AS INTEGER)
+  CROSS JOIN (SELECT 1) AS dummy
+  WHERE q.PostTypeId = 1
+  FETCH FIRST 200 ROWS ONLY
+)
+SELECT
+  rp.QuestionPostId,
+  rp.QuestionTitle,
+  rp.QuestionOwner,
+  rp.AnswerPostId,
+  rp.AnswerTitle,
+  rp.AnswerOwner,
+  rp.CloseReason AS CloseReasonName,
+  rp.LinkTypeName AS LinkedOrDuplicate,
+  up.DisplayName AS RespondentName,
+  v.CreationDate AS VoteDate,
+  v.BountyAmount,
+  p.Score AS PostScore,
+  p.ViewCount AS PostViews,
+  t.TagName,
+  tv.AvgPostScore AS TagAvgScore
+FROM CrossJoined rp
+LEFT JOIN Users up ON up.Id = rp.AnswerOwner
+LEFT JOIN Votes v ON v.PostId = rp.AnswerPostId
+LEFT JOIN Posts p ON p.Id = rp.AnswerPostId
+LEFT JOIN Tags t ON p.Tags LIKE '%' || t.TagName || '%'
+LEFT JOIN TagPopularity tv ON tv.TagName = t.TagName
+ORDER BY rp.QuestionPostId, v.CreationDate;

@@ -1,0 +1,316 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COUNT(DISTINCT v.Id) as VoteCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        MAX(b.Date) as LastBadgeDate,
+        MAX(v.CreationDate) as LastVoteDate,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+                CAST(SUM(p.Score) AS DOUBLE PRECISION) / NULLIF(COUNT(DISTINCT p.Id), 0)
+            ELSE 0 
+        END as AvgPostScore,
+        CASE 
+            WHEN COUNT(DISTINCT c.Id) > 0 THEN 
+                CAST(SUM(c.Score) AS DOUBLE PRECISION) / NULLIF(COUNT(DISTINCT c.Id), 0)
+            ELSE 0 
+        END as AvgCommentScore,
+        STRING_AGG(DISTINCT SUBSTRING(p.Title FROM 1 FOR 50), '; ') as SamplePostTitles,
+        STRING_AGG(DISTINCT SUBSTRING(c.Text FROM 1 FOR 50), '; ') as SampleCommentTexts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 3 THEN p.Id END) as WikiCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 4 THEN p.Id END) as TagWikiExcerptCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 5 THEN p.Id END) as TagWikiCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    WHERE u.Id IN (SELECT DISTINCT p2.UserId FROM Posts p2 WHERE p2.UserId IS NOT NULL)
+       OR u.Id IN (SELECT DISTINCT c2.UserId FROM Comments c2 WHERE c2.UserId IS NOT NULL)
+       OR u.Id IN (SELECT DISTINCT b2.UserId FROM Badges b2 WHERE b2.UserId IS NOT NULL)
+       OR u.Id IN (SELECT DISTINCT v2.UserId FROM Votes v2 WHERE v2.UserId IS NOT NULL)
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views
+),
+TopUsers AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.Views,
+        uas.PostCount,
+        uas.CommentCount,
+        uas.BadgeCount,
+        uas.VoteCount,
+        uas.LastPostDate,
+        uas.LastCommentDate,
+        uas.LastBadgeDate,
+        uas.LastVoteDate,
+        uas.AvgPostScore,
+        uas.AvgCommentScore,
+        uas.SamplePostTitles,
+        uas.SampleCommentTexts,
+        uas.QuestionCount,
+        uas.AnswerCount,
+        uas.WikiCount,
+        uas.TagWikiExcerptCount,
+        uas.TagWikiCount,
+        ROW_NUMBER() OVER (ORDER BY uas.Reputation DESC, uas.PostCount DESC) as RankByReputation,
+        ROW_NUMBER() OVER (ORDER BY uas.PostCount DESC, uas.Reputation DESC) as RankByPostCount
+    FROM UserActivityStats uas
+),
+UserPostActivity AS (
+    SELECT DISTINCT
+        u.Id as UserId,
+        u.DisplayName,
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.PostTypeId,
+        p.Tags,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            WHEN p.PostTypeId = 4 THEN 'Tag Wiki Excerpt'
+            WHEN p.PostTypeId = 5 THEN 'Tag Wiki'
+            ELSE 'Other'
+        END as PostType,
+        CASE 
+            WHEN p.Score >= 100 THEN 'Gold'
+            WHEN p.Score >= 50 THEN 'Silver'
+            WHEN p.Score >= 10 THEN 'Bronze'
+            ELSE 'Base'
+        END as ScoreTier,
+        DENSE_RANK() OVER (PARTITION BY u.Id ORDER BY p.CreationDate) as PostOrder,
+        LAG(p.Score) OVER (PARTITION BY u.Id ORDER BY p.CreationDate) as PreviousScore,
+        LAG(p.CreationDate) OVER (PARTITION BY u.Id ORDER BY p.CreationDate) as PreviousPostDate,
+        LEAD(p.Score) OVER (PARTITION BY u.Id ORDER BY p.CreationDate) as NextScore,
+        LAG(p.ViewCount) OVER (PARTITION BY u.Id ORDER BY p.CreationDate) as PreviousViewCount,
+        LAG(p.Tags) OVER (PARTITION BY u.Id ORDER BY p.CreationDate) as PreviousTags
+    FROM Users u
+    INNER JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId IN (1, 2) AND p.Score IS NOT NULL
+),
+UserPostDetails AS (
+    SELECT DISTINCT
+        upa.UserId,
+        upa.DisplayName,
+        upa.PostId,
+        upa.Title,
+        upa.Score,
+        upa.ViewCount,
+        upa.CreationDate,
+        upa.PostTypeId,
+        upa.PostType,
+        upa.ScoreTier,
+        upa.PostOrder,
+        upa.PreviousScore,
+        upa.PreviousPostDate,
+        upa.NextScore,
+        upa.PreviousViewCount,
+        upa.PreviousTags,
+        CAST(EXTRACT(EPOCH FROM (upa.CreationDate - upa.PreviousPostDate)) / 86400 AS INTEGER) as DaysSinceLastPost,
+        CASE 
+            WHEN upa.PreviousViewCount IS NOT NULL AND upa.ViewCount IS NOT NULL THEN
+                CAST((upa.ViewCount - upa.PreviousViewCount) AS DOUBLE PRECISION) / NULLIF(upa.PreviousViewCount, 0)
+            ELSE 0 
+        END as ViewGrowthRate,
+        CASE 
+            WHEN upa.PreviousScore IS NOT NULL AND upa.Score IS NOT NULL THEN
+                CAST((upa.Score - upa.PreviousScore) AS DOUBLE PRECISION) / NULLIF(upa.PreviousScore, 0)
+            ELSE 0 
+        END as ScoreGrowthRate,
+        CASE 
+            WHEN upa.PreviousTags IS NOT NULL AND upa.Tags IS NOT NULL THEN
+                COALESCE(LENGTH(upa.Tags), 0) - COALESCE(LENGTH(upa.PreviousTags), 0)
+            ELSE 0 
+        END as TagChangeCount,
+        CASE 
+            WHEN p.OwnerUserId IS NOT NULL THEN 
+                (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId IN (2, 3))
+            ELSE 0 
+        END as NetVotesOnPost,
+        ABS(COALESCE(upa.Score, 0) - COALESCE(upa.PreviousScore, 0)) as ScoreDelta,
+        p.ParentId,
+        CASE 
+            WHEN p.ParentId IS NOT NULL THEN 
+                (SELECT q.Title FROM Posts q WHERE q.Id = p.ParentId LIMIT 1)
+            ELSE NULL 
+        END as ParentQuestionTitle
+    FROM UserPostActivity upa
+    LEFT JOIN Posts p ON upa.PostId = p.Id
+),
+AggregatedUserMetrics AS (
+    SELECT
+        u.UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.PostCount,
+        u.CommentCount,
+        u.BadgeCount,
+        u.VoteCount,
+        u.AvgPostScore,
+        u.AvgCommentScore,
+        u.QuestionCount,
+        u.AnswerCount,
+        u.WikiCount,
+        u.TagWikiExcerptCount,
+        u.TagWikiCount,
+        u.RankByReputation,
+        u.RankByPostCount,
+        COUNT(ura.PostId) as TotalPosts,
+        SUM(CASE WHEN ura.PostType = 'Question' THEN 1 ELSE 0 END) as TotalQuestions,
+        SUM(CASE WHEN ura.PostType = 'Answer' THEN 1 ELSE 0 END) as TotalAnswers,
+        AVG(ura.Score) as AvgScore,
+        MAX(ura.Score) as MaxScore,
+        MIN(ura.Score) as MinScore,
+        AVG(ura.ViewCount) as AvgViews,
+        MAX(ura.ViewCount) as MaxViews,
+        AVG(ura.DaysSinceLastPost) as AvgDaysBetweenPosts,
+        AVG(ura.ViewGrowthRate) as AvgViewGrowthRate,
+        AVG(ura.ScoreGrowthRate) as AvgScoreGrowthRate,
+        COUNT(DISTINCT CASE WHEN EXISTS(SELECT 1 FROM Posts p2 WHERE p2.ParentId = ura.PostId AND p2.PostTypeId = 2) THEN ura.PostId END) as QuestionsWithAnswers,
+        COUNT(DISTINCT CASE 
+            WHEN EXISTS(SELECT 1 FROM Posts p3 WHERE p3.ParentId = ura.PostId AND p3.PostTypeId = 2) 
+                 AND EXISTS(SELECT 1 FROM Votes v2 WHERE v2.PostId = ura.PostId AND v2.VoteTypeId = 1) 
+            THEN ura.PostId 
+        END) as QuestionsWithAcceptedAnswers,
+        STRING_AGG(DISTINCT SUBSTRING(ura.Title FROM 1 FOR 30), ', ') as AllPostTitles,
+        STRING_AGG(DISTINCT ura.ParentQuestionTitle, ', ') as AllParentQuestionTitles,
+        COUNT(DISTINCT CASE WHEN ura.TagChangeCount > 0 THEN ura.PostId END) as PostsWithTagChanges
+    FROM TopUsers u
+    LEFT JOIN UserPostDetails ura ON u.UserId = ura.UserId
+    WHERE u.UserId > 0
+    GROUP BY u.UserId, u.DisplayName, u.Reputation, u.Views, u.PostCount, u.CommentCount, u.BadgeCount, 
+            u.VoteCount, u.AvgPostScore, u.AvgCommentScore, u.QuestionCount, u.AnswerCount, u.WikiCount,
+            u.TagWikiExcerptCount, u.TagWikiCount, u.RankByReputation, u.RankByPostCount
+)
+SELECT 
+    am.UserId,
+    am.DisplayName,
+    am.Reputation,
+    am.Views,
+    am.PostCount,
+    am.CommentCount,
+    am.BadgeCount,
+    am.VoteCount,
+    am.AvgPostScore,
+    am.AvgCommentScore,
+    am.QuestionCount,
+    am.AnswerCount,
+    am.WikiCount,
+    am.TagWikiExcerptCount,
+    am.TagWikiCount,
+    am.RankByReputation,
+    am.RankByPostCount,
+    am.TotalPosts,
+    am.TotalQuestions,
+    am.TotalAnswers,
+    am.AvgScore,
+    am.MaxScore,
+    am.MinScore,
+    am.AvgViews,
+    am.MaxViews,
+    am.AvgDaysBetweenPosts,
+    am.AvgViewGrowthRate,
+    am.AvgScoreGrowthRate,
+    am.QuestionsWithAnswers,
+    am.QuestionsWithAcceptedAnswers,
+    CASE 
+        WHEN am.AvgScore > 10 AND am.TotalPosts >= 5 THEN 
+            'High Activity'
+        WHEN am.AvgScore > 5 AND am.TotalPosts >= 3 THEN 
+            'Medium Activity'
+        WHEN am.AvgScore > 0 AND am.TotalPosts >= 1 THEN 
+            'Low Activity'
+        ELSE 
+            'No Activity'
+    END as ActivityLevel,
+    CASE 
+        WHEN am.MaxScore >= 100 THEN 
+            'High Performing'
+        WHEN am.MaxScore >= 50 THEN 
+            'Medium Performing'
+        WHEN am.MaxScore >= 10 THEN 
+            'Low Performing'
+        ELSE 
+            'Baseline'
+    END as PerformanceTier,
+    CASE 
+        WHEN am.QuestionsWithAcceptedAnswers > 0 AND am.TotalAnswers > 0 THEN 
+            CAST(am.QuestionsWithAcceptedAnswers AS DOUBLE PRECISION) / NULLIF(am.TotalAnswers, 0)
+        ELSE 0 
+    END as AnswerAcceptanceRate,
+    CASE 
+        WHEN am.TotalAnswers > 0 THEN 
+            CAST(am.QuestionsWithAcceptedAnswers AS DOUBLE PRECISION) / NULLIF(am.TotalAnswers, 0)
+        ELSE NULL 
+    END as ConversionRate,
+    'User Profile Summary' as ReportType,
+    CAST('2024-10-01 12:34:56' AS TIMESTAMP) as QueryTimestamp,
+    ('UserRank_' || am.RankByReputation) as RankCategory,
+    CASE 
+        WHEN am.Reputation >= 10000 THEN 'Elite'
+        WHEN am.Reputation >= 5000 THEN 'Veteran'
+        WHEN am.Reputation >= 1000 THEN 'Regular'
+        WHEN am.Reputation >= 100 THEN 'Newbie'
+        ELSE 'Beginner'
+    END as ReputationCategory,
+    CASE 
+        WHEN am.BadgeCount >= 100 THEN 'Veteran'
+        WHEN am.BadgeCount >= 50 THEN 'Experienced'
+        WHEN am.BadgeCount >= 20 THEN 'Intermediate'
+        WHEN am.BadgeCount >= 5 THEN 'Beginner'
+        ELSE 'Novice'
+    END as BadgeLevel,
+    CASE 
+        WHEN am.PostCount >= 1000 THEN 'Expert'
+        WHEN am.PostCount >= 500 THEN 'Advanced'
+        WHEN am.PostCount >= 100 THEN 'Intermediate'
+        WHEN am.PostCount >= 10 THEN 'Beginner'
+        ELSE 'Novice'
+    END as PostingLevel,
+    CASE 
+        WHEN am.CommentCount >= 500 THEN 'Active Commenter'
+        WHEN am.CommentCount >= 200 THEN 'Regular Commenter'
+        WHEN am.CommentCount >= 50 THEN 'Moderate Commenter'
+        WHEN am.CommentCount >= 10 THEN 'Occasional Commenter'
+        ELSE 'Rare Commenter'
+    END as CommentingLevel,
+    CASE 
+        WHEN am.Views >= 10000 THEN 'High Visibility'
+        WHEN am.Views >= 5000 THEN 'Medium Visibility'
+        WHEN am.Views >= 1000 THEN 'Low Visibility'
+        ELSE 'Minimal Visibility'
+    END as VisibilityLevel,
+    (SELECT COUNT(*) FROM AggregatedUserMetrics) as TotalUserCount,
+    (SELECT COUNT(*) FROM AggregatedUserMetrics WHERE AvgScore >= 10) as HighScoringUsers,
+    (SELECT COUNT(*) FROM AggregatedUserMetrics WHERE Reputation >= 1000) as QualifiedUsers,
+    (SELECT AVG(Reputation) FROM AggregatedUserMetrics) as AverageReputation,
+    (SELECT AVG(AvgScore) FROM AggregatedUserMetrics) as AverageScore,
+    (SELECT MAX(Reputation) FROM AggregatedUserMetrics) as MaxReputation,
+    (SELECT MIN(Reputation) FROM AggregatedUserMetrics) as MinReputation,
+    (SELECT COUNT(*) FROM AggregatedUserMetrics WHERE Views >= 1000) as PopularUsers,
+    (SELECT COUNT(*) FROM AggregatedUserMetrics WHERE VoteCount >= 500) as HighlyVotedUsers,
+    (SELECT COUNT(*) FROM AggregatedUserMetrics WHERE BadgeCount >= 50) as HighlyBadgedUsers,
+    (SELECT COUNT(*) FROM AggregatedUserMetrics WHERE QuestionCount >= 50) as HighQuestionUsers,
+    (SELECT COUNT(*) FROM AggregatedUserMetrics WHERE AnswerCount >= 100) as HighAnswerUsers,
+    (SELECT COUNT(*) FROM AggregatedUserMetrics WHERE AvgDaysBetweenPosts <= 30) as RegularPosters
+FROM AggregatedUserMetrics am
+WHERE am.UserId IS NOT NULL
+  AND EXISTS(SELECT 1 FROM Users u WHERE u.Id = am.UserId)
+  AND (am.Reputation > (SELECT AVG(u2.Reputation) FROM Users u2) OR am.PostCount > 10)
+ORDER BY am.RankByReputation ASC
+OFFSET 0 ROWS FETCH NEXT 500 ROWS ONLY;

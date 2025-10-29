@@ -1,0 +1,349 @@
+with
+params as (
+  select
+    date_trunc('month', coalesce((select max(CreationDate) from Posts), cast('2024-10-01 12:34:56' as timestamp))) - interval '24 months' as start_dt,
+    date_trunc('month', coalesce((select max(CreationDate) from Posts), cast('2024-10-01 12:34:56' as timestamp))) + interval '1 month' as end_dt,
+    cast('{python,java,javascript,c#,c++}' as varchar) as tag_whitelist
+),
+q as (
+  select
+    p.Id as PostId,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.FavoriteCount,
+    p.AnswerCount,
+    p.CreationDate,
+    p.ClosedDate,
+    p.Tags,
+    unnest(string_to_array(nullif(substring(p.Tags, 2, greatest(length(p.Tags)-2,0)), '><'))) as TagItem
+  from Posts p
+  join PostTypes pt on pt.Id = p.PostTypeId and pt.Name = 'Question'
+  join params prm on p.CreationDate >= prm.start_dt and p.CreationDate < prm.end_dt
+),
+q_tags as (
+  select
+    q.PostId,
+    q.OwnerUserId,
+    q.Score,
+    q.ViewCount,
+    q.FavoriteCount,
+    q.AnswerCount,
+    q.CreationDate,
+    q.ClosedDate,
+    q.Tags,
+    q.TagItem,
+    lower(q.TagItem) as tag_lower
+  from q
+  where q.TagItem is not null
+),
+whitelist as (
+  select lower(regexp_replace(t, '^\s*|\s*$', '')) as tag_lower
+  from params, unnest(string_to_array(tag_whitelist, ',')) t
+),
+q_whitelist as (
+  select qt.PostId,
+    qt.OwnerUserId,
+    qt.Score,
+    qt.ViewCount,
+    qt.FavoriteCount,
+    qt.AnswerCount,
+    qt.CreationDate,
+    qt.ClosedDate,
+    qt.Tags,
+    qt.TagItem,
+    qt.tag_lower
+  from q_tags qt
+  join whitelist w on w.tag_lower = qt.tag_lower
+),
+votes_agg as (
+  select
+    v.PostId,
+    count(*) filter (where v.VoteTypeId = 2) as upvotes,
+    count(*) filter (where v.VoteTypeId = 3) as downvotes,
+    count(*) filter (where v.VoteTypeId = 12) as spam_flags,
+    count(*) filter (where v.VoteTypeId = 10) as deletions,
+    max(v.CreationDate) as last_vote_at
+  from Votes v
+  join q on q.PostId = v.PostId
+  group by v.PostId
+),
+comment_agg as (
+  select
+    c.PostId,
+    count(*) as comment_count,
+    coalesce(sum(greatest(c.Score,0)),0) as nonneg_comment_score,
+    max(c.CreationDate) as last_comment_at,
+    (
+      select c2.Text
+      from Comments c2
+      where c2.PostId = c.PostId
+      order by length(c2.Text) desc nulls last, c2.Score desc nulls last, c2.Id
+      limit 1
+    ) as longest_comment_text
+  from Comments c
+  where exists (select 1 from q where q.PostId = c.PostId)
+  group by c.PostId
+),
+answers as (
+  select
+    a.ParentId as QuestionId,
+    count(*) as answer_count_all,
+    max(a.Score) as max_answer_score,
+    count(*) filter (where a.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '90 days') as recent_answers,
+    bool_or(a.Id = q.AcceptedAnswerId) as has_accepted
+  from Posts a
+  join PostTypes pt on pt.Id = a.PostTypeId and pt.Name = 'Answer'
+  join Posts q on q.Id = a.ParentId
+  group by a.ParentId
+),
+history_flags as (
+  select
+    ph.PostId,
+    min(ph.CreationDate) filter (where ph.PostHistoryTypeId in (10,35,36)) as first_mod_action_at,
+    count(*) filter (where ph.PostHistoryTypeId in (10)) as close_votes_events,
+    count(*) filter (where ph.PostHistoryTypeId in (11)) as reopen_events,
+    count(*) filter (where ph.PostHistoryTypeId in (19)) as protected_events,
+    count(*) filter (where ph.PostHistoryTypeId in (24)) as suggested_edits_applied,
+    count(*) filter (where ph.PostHistoryTypeId in (5,8)) as body_edits
+  from PostHistory ph
+  where exists (select 1 from q where q.PostId = ph.PostId)
+  group by ph.PostId
+),
+owner_profile as (
+  select
+    u.Id as UserId,
+    u.Reputation,
+    cast(extract(year from age(cast('2024-10-01 12:34:56' as timestamp), u.CreationDate)) as integer) as account_age_years,
+    coalesce(u.Location, '') as location,
+    greatest(u.UpVotes - coalesce(u.DownVotes,0), 0) as net_votes,
+    sum(case when b.Class = 1 then 1 else 0 end) as gold_badges,
+    sum(case when b.Class = 2 then 1 else 0 end) as silver_badges,
+    sum(case when b.Class = 3 then 1 else 0 end) as bronze_badges
+  from Users u
+  left join Badges b on b.UserId = u.Id
+  group by u.Id, u.Reputation, u.CreationDate, u.Location, u.UpVotes, u.DownVotes
+),
+per_tag_month as (
+  select
+    cast(date_trunc('month', q.CreationDate) as date) as month,
+    q.tag_lower,
+    count(distinct q.PostId) as questions,
+    avg(q.Score) as avg_score,
+    percentile_cont(0.5) within group (order by q.ViewCount) as median_views,
+    sum(coalesce(v.upvotes,0)) as sum_upvotes,
+    sum(coalesce(v.downvotes,0)) as sum_downvotes,
+    sum(coalesce(c.comment_count,0)) as sum_comments
+  from q_whitelist q
+  left join votes_agg v on v.PostId = q.PostId
+  left join comment_agg c on c.PostId = q.PostId
+  group by cast(date_trunc('month', q.CreationDate) as date), q.tag_lower
+),
+tag_month_rank as (
+  select
+    ptm.month,
+    ptm.tag_lower,
+    ptm.questions,
+    ptm.avg_score,
+    ptm.median_views,
+    ptm.sum_upvotes,
+    ptm.sum_downvotes,
+    ptm.sum_comments,
+    row_number() over (partition by ptm.month order by ptm.questions desc, ptm.avg_score desc nulls last, ptm.sum_upvotes desc nulls last) as rnk_by_questions,
+    dense_rank() over (partition by ptm.month order by ptm.sum_upvotes - ptm.sum_downvotes desc nulls last) as rnk_by_net_votes
+  from per_tag_month ptm
+),
+question_signals as (
+  select
+    q.PostId,
+    q.tag_lower,
+    cast(date_trunc('month', q.CreationDate) as date) as month,
+    q.Score,
+    q.ViewCount,
+    q.FavoriteCount,
+    q.AnswerCount,
+    coalesce(v.upvotes,0) - coalesce(v.downvotes,0) as net_votes,
+    coalesce(v.spam_flags,0) as spam_flags,
+    coalesce(c.comment_count,0) as comment_count,
+    coalesce(a.has_accepted, false) as has_accepted,
+    coalesce(a.max_answer_score,0) as max_answer_score,
+    coalesce(h.body_edits,0) as body_edits,
+    case when q.ClosedDate is not null then 1 else 0 end as is_closed
+  from q_whitelist q
+  left join votes_agg v on v.PostId = q.PostId
+  left join comment_agg c on c.PostId = q.PostId
+  left join answers a on a.QuestionId = q.PostId
+  left join history_flags h on h.PostId = q.PostId
+),
+scored as (
+  select
+    qs.PostId,
+    qs.tag_lower,
+    qs.month,
+    qs.Score,
+    qs.ViewCount,
+    qs.FavoriteCount,
+    qs.AnswerCount,
+    qs.net_votes,
+    qs.spam_flags,
+    qs.comment_count,
+    qs.has_accepted,
+    qs.max_answer_score,
+    qs.body_edits,
+    qs.is_closed,
+    (
+      0.40 * coalesce(qs.Score,0) +
+      0.25 * ln(greatest(qs.ViewCount,1)) +
+      0.15 * coalesce(qs.net_votes,0) +
+      0.10 * coalesce(qs.comment_count,0) +
+      0.07 * coalesce(qs.max_answer_score,0) +
+      0.03 * (case when qs.has_accepted then 5 else 0 end) -
+      0.20 * coalesce(qs.spam_flags,0) -
+      0.30 * coalesce(qs.is_closed,0) +
+      0.05 * coalesce(qs.body_edits,0)
+    ) as hotness_score
+  from question_signals qs
+),
+ranked as (
+  select
+    s.PostId,
+    s.tag_lower,
+    s.month,
+    s.Score,
+    s.ViewCount,
+    s.FavoriteCount,
+    s.AnswerCount,
+    s.net_votes,
+    s.spam_flags,
+    s.comment_count,
+    s.has_accepted,
+    s.max_answer_score,
+    s.body_edits,
+    s.is_closed,
+    s.hotness_score,
+    row_number() over (partition by s.tag_lower, s.month order by s.hotness_score desc nulls last, s.PostId) as rn_in_tag_month,
+    ntile(100) over (partition by s.tag_lower, s.month order by s.hotness_score desc nulls last) as percentile_in_tag_month,
+    rank() over (partition by s.month order by s.hotness_score desc nulls last) as month_rank
+  from scored s
+),
+with_owner as (
+  select
+    r.PostId,
+    r.tag_lower,
+    r.month,
+    r.Score,
+    r.ViewCount,
+    r.FavoriteCount,
+    r.AnswerCount,
+    r.net_votes,
+    r.spam_flags,
+    r.comment_count,
+    r.has_accepted,
+    r.max_answer_score,
+    r.body_edits,
+    r.is_closed,
+    r.hotness_score,
+    r.rn_in_tag_month,
+    r.percentile_in_tag_month,
+    r.month_rank,
+    u.UserId,
+    u.Reputation,
+    u.account_age_years,
+    u.net_votes as owner_net_votes,
+    coalesce(u.gold_badges,0) as gold_badges,
+    coalesce(u.silver_badges,0) as silver_badges,
+    coalesce(u.bronze_badges,0) as bronze_badges,
+    case
+      when u.UserId is null then '[deleted]'
+      when coalesce(u.location,'') = '' then coalesce((select DisplayName from Posts p where p.Id = r.PostId and p.OwnerDisplayName is not null limit 1), 'user')
+      else u.location
+    end as owner_label
+  from ranked r
+  left join Posts p on p.Id = r.PostId
+  left join owner_profile u on u.UserId = p.OwnerUserId
+),
+topn as (
+  select * from with_owner where rn_in_tag_month <= 10
+  union all
+  select wo.*
+  from with_owner wo
+  join (
+    select month, tag_lower, min(rnk_by_questions) as best_rnk
+    from tag_month_rank
+    group by month, tag_lower
+    having min(rnk_by_questions) = 1
+  ) leaders on leaders.month = wo.month and leaders.tag_lower = wo.tag_lower
+),
+dedup as (
+  select distinct on (PostId, tag_lower, month)
+    PostId,
+    tag_lower,
+    month,
+    Score,
+    ViewCount,
+    FavoriteCount,
+    AnswerCount,
+    net_votes,
+    spam_flags,
+    comment_count,
+    has_accepted,
+    max_answer_score,
+    body_edits,
+    is_closed,
+    hotness_score,
+    rn_in_tag_month,
+    percentile_in_tag_month,
+    month_rank,
+    UserId,
+    Reputation,
+    account_age_years,
+    owner_net_votes,
+    gold_badges,
+    silver_badges,
+    bronze_badges,
+    owner_label
+  from topn
+  order by PostId, tag_lower, month
+)
+select
+  d.month,
+  d.tag_lower as tag,
+  d.PostId,
+  coalesce(p.Title, concat('[wiki/', d.tag_lower, ']')) as title_or_tag,
+  round(cast(d.hotness_score as numeric), 3) as hotness,
+  d.Score,
+  d.ViewCount,
+  d.FavoriteCount,
+  d.AnswerCount,
+  d.net_votes,
+  d.comment_count,
+  d.max_answer_score,
+  d.has_accepted,
+  (case when d.is_closed = 1 then true else false end) as is_closed_bool,
+  d.percentile_in_tag_month,
+  d.month_rank,
+  d.rn_in_tag_month,
+  d.UserId as owner_id,
+  d.Reputation as owner_rep,
+  d.owner_net_votes,
+  d.gold_badges,
+  d.silver_badges,
+  d.bronze_badges,
+  d.owner_label,
+  regexp_replace(
+    coalesce(p.Tags,''),
+    '(^<|>$)',
+    '',
+    'g'
+  ) as raw_tags,
+  coalesce(c.longest_comment_text, '') as longest_comment_excerpt,
+  greatest(
+    coalesce(cast('2024-10-01 12:34:56' as timestamp) - v.last_vote_at, interval '0'),
+    coalesce(cast('2024-10-01 12:34:56' as timestamp) - c.last_comment_at, interval '0')
+  ) as since_last_engagement
+from dedup d
+left join Posts p on p.Id = d.PostId
+left join votes_agg v on v.PostId = d.PostId
+left join comment_agg c on c.PostId = d.PostId
+order by d.month desc, d.tag_lower asc, d.hotness_score desc, d.PostId
+limit 500;

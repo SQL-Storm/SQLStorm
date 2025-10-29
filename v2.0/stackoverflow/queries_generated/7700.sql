@@ -1,0 +1,260 @@
+-- {"query": "7700.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2237} 
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.ViewCount,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        AVG(p.Score) as AvgPostScore,
+        MAX(p.CreationDate) as LastPostDate,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Elite'
+            WHEN u.Reputation >= 1000 THEN 'Veteran'
+            WHEN u.Reputation >= 100 THEN 'Regular'
+            ELSE 'Newbie'
+        END as ReputationLevel,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), ', ') as AllTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.ViewCount, u.UpVotes, u.DownVotes
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        u.DisplayName as Author,
+        p.OwnerUserId,
+        p.PostTypeId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as PostType,
+        COALESCE(p.Tags, '') as Tags,
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) as ScoreRank,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as UserPostSequence,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PrevScore,
+        LAG(p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PrevPostDate,
+        DATEDIFF('DAY', LAG(p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate), p.CreationDate) as DaysSinceLastPost,
+        CASE 
+            WHEN p.Score > 100 THEN 'Highly Voted'
+            WHEN p.Score > 50 THEN 'Moderately Voted'
+            WHEN p.Score > 0 THEN 'Low Voted'
+            ELSE 'No Votes'
+        END as VoteClassification
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.CreationDate >= '2020-01-01'
+),
+ComplexFilter AS (
+    SELECT 
+        pa.PostId,
+        pa.Title,
+        pa.Score,
+        pa.Author,
+        pa.PostType,
+        pa.Tags,
+        pa.ScoreRank,
+        pa.UserPostSequence,
+        pa.DaysSinceLastPost,
+        pa.VoteClassification,
+        us.ReputationLevel,
+        us.PostCount,
+        us.BadgeCount
+    FROM PostAnalysis pa
+    INNER JOIN UserStats us ON pa.OwnerUserId = us.UserId
+    WHERE 
+        (pa.PostType = 'Question' AND pa.Score > 10)
+        OR (pa.PostType = 'Answer' AND pa.AnswerCount > 10)
+        OR (pa.PostType = 'Question' AND pa.CommentCount > 5)
+        OR (us.PostCount > 100 AND us.BadgeCount > 50)
+        OR us.ReputationLevel = 'Elite'
+),
+RankedResults AS (
+    SELECT 
+        *,
+        DENSE_RANK() OVER (ORDER BY Score DESC, PostCount DESC) as OverallRank,
+        PERCENT_RANK() OVER (ORDER BY Score DESC) as ScorePercentile,
+        NTILE(4) OVER (ORDER BY Score DESC) as Quartile
+    FROM ComplexFilter
+),
+StatisticalAnalysis AS (
+    SELECT 
+        COUNT(*) as TotalPosts,
+        AVG(Score) as AvgScore,
+        STDDEV(Score) as ScoreStdDev,
+        MIN(Score) as MinScore,
+        MAX(Score) as MaxScore,
+        COUNT(DISTINCT Author) as UniqueAuthors,
+        COUNT(DISTINCT OwnerUserId) as UniquePostOwners
+    FROM ComplexFilter
+),
+FinalAggregate AS (
+    SELECT 
+        cr.*,
+        sa.TotalPosts,
+        sa.AvgScore,
+        sa.ScoreStdDev,
+        sa.MinScore,
+        sa.MaxScore,
+        sa.UniqueAuthors,
+        sa.UniquePostOwners,
+        CASE 
+            WHEN cr.Score > (sa.AvgScore + 2 * sa.ScoreStdDev) THEN 'Exceptional'
+            WHEN cr.Score > (sa.AvgScore + sa.ScoreStdDev) THEN 'Above Average'
+            WHEN cr.Score > sa.AvgScore THEN 'Average'
+            WHEN cr.Score > (sa.AvgScore - sa.ScoreStdDev) THEN 'Below Average'
+            ELSE 'Below Average'
+        END as PerformanceCategory,
+        CASE 
+            WHEN cr.ScoreRank <= 10 THEN 'Top 10'
+            WHEN cr.ScoreRank <= 25 THEN 'Top 25'
+            WHEN cr.ScoreRank <= 50 THEN 'Top 50'
+            ELSE 'Below Top 50'
+        END as RankCategory,
+        CASE 
+            WHEN cr.DaysSinceLastPost IS NOT NULL AND cr.DaysSinceLastPost > 30 THEN 'Inactive'
+            WHEN cr.DaysSinceLastPost IS NOT NULL AND cr.DaysSinceLastPost > 7 THEN 'Semi-Active'
+            WHEN cr.DaysSinceLastPost IS NOT NULL AND cr.DaysSinceLastPost > 0 THEN 'Active'
+            ELSE 'New'
+        END as ActivityStatus
+    FROM RankedResults cr
+    CROSS JOIN StatisticalAnalysis sa
+),
+CombinedResults AS (
+    SELECT 
+        fa.PostId,
+        fa.Title,
+        fa.Score,
+        fa.Author,
+        fa.PostType,
+        fa.Tags,
+        fa.ScoreRank,
+        fa.UserPostSequence,
+        fa.DaysSinceLastPost,
+        fa.VoteClassification,
+        fa.ReputationLevel,
+        fa.PostCount,
+        fa.BadgeCount,
+        fa.TotalPosts,
+        fa.AvgScore,
+        fa.ScoreStdDev,
+        fa.MinScore,
+        fa.MaxScore,
+        fa.UniqueAuthors,
+        fa.UniquePostOwners,
+        fa.PerformanceCategory,
+        fa.RankCategory,
+        fa.ActivityStatus,
+        ROW_NUMBER() OVER (ORDER BY fa.Score DESC) as RowNum,
+        CASE 
+            WHEN fa.Score >= 100 THEN 
+                CONCAT('High Value Post: ', fa.Title, ' by ', fa.Author, ' (', fa.Score, ' points)')
+            WHEN fa.Score >= 50 THEN 
+                CONCAT('Medium Value Post: ', fa.Title, ' by ', fa.Author, ' (', fa.Score, ' points)')
+            ELSE 
+                CONCAT('Low Value Post: ', fa.Title, ' by ', fa.Author, ' (', fa.Score, ' points)')
+        END as PostSummary
+    FROM FinalAggregate fa
+    WHERE 
+        fa.PostType IN ('Question', 'Answer')
+        AND fa.ActivityStatus IN ('Active', 'Semi-Active')
+)
+SELECT 
+    cr.PostId,
+    cr.Title,
+    cr.Score,
+    cr.Author,
+    cr.PostType,
+    cr.Tags,
+    cr.ScoreRank,
+    cr.UserPostSequence,
+    cr.DaysSinceLastPost,
+    cr.VoteClassification,
+    cr.ReputationLevel,
+    cr.PostCount,
+    cr.BadgeCount,
+    cr.TotalPosts,
+    cr.AvgScore,
+    cr.ScoreStdDev,
+    cr.MinScore,
+    cr.MaxScore,
+    cr.UniqueAuthors,
+    cr.UniquePostOwners,
+    cr.PerformanceCategory,
+    cr.RankCategory,
+    cr.ActivityStatus,
+    cr.RowNum,
+    cr.PostSummary,
+    CASE 
+        WHEN cr.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1 AND CreationDate >= '2020-01-01') THEN
+            'Above Average Question'
+        WHEN cr.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 2 AND CreationDate >= '2020-01-01') THEN
+            'Above Average Answer'
+        ELSE 
+            'Below Average'
+    END as CategoryPerformance,
+    CASE 
+        WHEN cr.Score > 50 AND cr.PostCount > 50 AND cr.BadgeCount > 20 THEN 
+            'Veteran Contributor'
+        WHEN cr.Score > 25 AND cr.PostCount > 25 AND cr.BadgeCount > 10 THEN 
+            'Regular Contributor'
+        WHEN cr.Score > 10 AND cr.PostCount > 10 THEN
+            'Active Contributor'
+        ELSE 
+            'New Contributor'
+    END as ContributorStatus,
+    CASE 
+        WHEN EXISTS (
+            SELECT 1 FROM Comments c 
+            WHERE c.PostId = cr.PostId 
+            AND c.CreationDate >= cr.CreationDate
+            AND c.Score > 10
+        ) THEN 'Has High Score Comments'
+        ELSE 'No High Score Comments'
+    END as CommentActivity,
+    COALESCE(
+        CASE 
+            WHEN cr.Tags LIKE '%<c++>%' THEN 'C++ Expert'
+            WHEN cr.Tags LIKE '%<java>%' THEN 'Java Expert'
+            WHEN cr.Tags LIKE '%<python>%' THEN 'Python Expert'
+            ELSE 'Multi Language'
+        END,
+        'Unknown Specialization'
+    ) as SpecializationType,
+    CASE 
+        WHEN cr.Score > (cr.AvgScore + cr.ScoreStdDev) 
+        AND cr.ScoreRank <= 25 
+        THEN 'Elite Performance'
+        WHEN cr.Score > (cr.AvgScore + cr.ScoreStdDev) 
+        AND cr.PerformanceCategory IN ('Above Average', 'Exceptional') 
+        THEN 'Strong Performance'
+        ELSE 'Standard Performance'
+    END as PerformanceRating,
+    'Generated at ' || CURRENT_TIMESTAMP as MetadataTimestamp
+FROM CombinedResults cr
+WHERE 
+    cr.PostId IS NOT NULL
+    AND cr.Score > 0
+    AND cr.Author IS NOT NULL
+    AND cr.Title IS NOT NULL
+    AND cr.Tags IS NOT NULL
+    AND cr.PostType IS NOT NULL
+ORDER BY 
+    cr.Score DESC,
+    cr.PostCount DESC,
+    cr.BadgeCount DESC
+LIMIT 10000;

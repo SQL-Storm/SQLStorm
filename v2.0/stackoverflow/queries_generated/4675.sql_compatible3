@@ -1,0 +1,245 @@
+WITH
+  RankedPostHistory AS (
+    SELECT
+      ph.PostId,
+      ph.PostHistoryTypeId,
+      ph.CreationDate,
+      ph.UserId,
+      ph.Comment,
+      ph.Text AS HistoryText,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM
+      PostHistory ph
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6)
+  ),
+  LatestEdits AS (
+    SELECT
+      rph.PostId,
+      rph.PostHistoryTypeId,
+      rph.CreationDate AS LastEditDate,
+      rph.UserId AS LastEditorUserId,
+      rph.Comment AS LastEditComment,
+      rph.HistoryText AS LastEditContent
+    FROM
+      RankedPostHistory rph
+    WHERE
+      rph.rn = 1
+  ),
+  PostTags AS (
+    SELECT
+      p.Id AS PostId,
+      TRIM(
+        -- use standard SQL substring + regexp-like extraction via POSITION and SUBSTR to get the nth comma-separated token
+        CASE
+          WHEN n.n = 1 THEN
+            SUBSTRING(
+              REPLACE(REPLACE(p.Tags, '<', ''), '>', '')
+              FROM 1 FOR CASE
+                WHEN POSITION(',' IN REPLACE(REPLACE(p.Tags, '<', ''), '>', '')) = 0 THEN CHAR_LENGTH(REPLACE(REPLACE(p.Tags, '<', ''), '>', ''))
+                ELSE POSITION(',' IN REPLACE(REPLACE(p.Tags, '<', ''), '>', '')) - 1
+              END
+            )
+          ELSE
+            SUBSTRING(
+              REPLACE(REPLACE(p.Tags, '<', ''), '>', '')
+              FROM
+                ( -- start position: find (n-1)th comma + 2
+                  CASE
+                    WHEN ((n.n - 1) = 0) THEN 1
+                    ELSE
+                      COALESCE(
+                        NULLIF(
+                          (SELECT
+                             MAX(position_info.pos)
+                           FROM (
+                             SELECT
+                               POSITION(',' IN t.rest) + t.accum AS pos,
+                               t.rest,
+                               t.accum
+                             FROM (
+                               SELECT
+                                 REPLACE(REPLACE(p.Tags, '<', ''), '>', '') AS rest,
+                                 0 AS accum
+                               ) init
+                               JOIN LATERAL (
+                                 SELECT
+                                   rest,
+                                   accum
+                               ) t2 ON true
+                             ) t
+                           ), 0), 1
+                      )
+                  END
+                )
+              FOR
+                CASE
+                  WHEN POSITION(',' IN SUBSTRING(REPLACE(REPLACE(p.Tags, '<', ''), '>', '') FROM ( (SELECT 1) ) )) = 0 THEN CHAR_LENGTH(REPLACE(REPLACE(p.Tags, '<', ''), '>', ''))
+                  ELSE CHAR_LENGTH(REPLACE(REPLACE(p.Tags, '<', ''), '>', ''))
+                END
+            )
+        END
+      ) AS Tag
+    FROM
+      Posts p
+      CROSS JOIN (
+        SELECT
+          ROW_NUMBER() OVER () AS n
+        FROM
+          (SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5
+           UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9 UNION ALL SELECT 10
+           UNION ALL SELECT 11 UNION ALL SELECT 12 UNION ALL SELECT 13 UNION ALL SELECT 14 UNION ALL SELECT 15
+           UNION ALL SELECT 16 UNION ALL SELECT 17 UNION ALL SELECT 18 UNION ALL SELECT 19 UNION ALL SELECT 20
+           UNION ALL SELECT 21 UNION ALL SELECT 22 UNION ALL SELECT 23 UNION ALL SELECT 24 UNION ALL SELECT 25
+           UNION ALL SELECT 26 UNION ALL SELECT 27 UNION ALL SELECT 28 UNION ALL SELECT 29 UNION ALL SELECT 30
+           UNION ALL SELECT 31 UNION ALL SELECT 32 UNION ALL SELECT 33 UNION ALL SELECT 34 UNION ALL SELECT 35
+           UNION ALL SELECT 36 UNION ALL SELECT 37 UNION ALL SELECT 38 UNION ALL SELECT 39 UNION ALL SELECT 40
+           UNION ALL SELECT 41 UNION ALL SELECT 42 UNION ALL SELECT 43 UNION ALL SELECT 44 UNION ALL SELECT 45
+           UNION ALL SELECT 46 UNION ALL SELECT 47 UNION ALL SELECT 48 UNION ALL SELECT 49 UNION ALL SELECT 50
+           UNION ALL SELECT 51 UNION ALL SELECT 52 UNION ALL SELECT 53 UNION ALL SELECT 54 UNION ALL SELECT 55
+           UNION ALL SELECT 56 UNION ALL SELECT 57 UNION ALL SELECT 58 UNION ALL SELECT 59 UNION ALL SELECT 60
+           UNION ALL SELECT 61 UNION ALL SELECT 62 UNION ALL SELECT 63 UNION ALL SELECT 64 UNION ALL SELECT 65
+           UNION ALL SELECT 66 UNION ALL SELECT 67 UNION ALL SELECT 68 UNION ALL SELECT 69 UNION ALL SELECT 70
+           UNION ALL SELECT 71 UNION ALL SELECT 72 UNION ALL SELECT 73 UNION ALL SELECT 74 UNION ALL SELECT 75
+           UNION ALL SELECT 76 UNION ALL SELECT 77 UNION ALL SELECT 78 UNION ALL SELECT 79 UNION ALL SELECT 80
+           UNION ALL SELECT 81 UNION ALL SELECT 82 UNION ALL SELECT 83 UNION ALL SELECT 84 UNION ALL SELECT 85
+           UNION ALL SELECT 86 UNION ALL SELECT 87 UNION ALL SELECT 88 UNION ALL SELECT 89 UNION ALL SELECT 90
+           UNION ALL SELECT 91 UNION ALL SELECT 92 UNION ALL SELECT 93 UNION ALL SELECT 94 UNION ALL SELECT 95
+           UNION ALL SELECT 96 UNION ALL SELECT 97 UNION ALL SELECT 98 UNION ALL SELECT 99 UNION ALL SELECT 100
+          ) nums
+      ) n
+    WHERE
+      p.Tags IS NOT NULL
+      AND n.n <= (CHAR_LENGTH(p.Tags) - CHAR_LENGTH(REPLACE(p.Tags, ',', '')) + 1)
+  ),
+  UserPostActivity AS (
+    SELECT
+      p.OwnerUserId,
+      COUNT(DISTINCT p.Id) AS NumberOfPosts,
+      SUM(p.ViewCount) AS TotalViewCount,
+      AVG(p.Score) AS AverageScore,
+      MAX(p.CreationDate) AS LatestPostDate
+    FROM
+      Posts p
+    WHERE
+      p.OwnerUserId IS NOT NULL
+      AND p.OwnerUserId > 0
+    GROUP BY
+      p.OwnerUserId
+  ),
+  UserBadgeCounts AS (
+    SELECT
+      b.UserId,
+      COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+      COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+      COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges
+    FROM
+      Badges b
+    GROUP BY
+      b.UserId
+  ),
+  PostCloseInfo AS (
+    SELECT
+      ph.PostId,
+      MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Comment END) AS CloseReasonId,
+      MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) AS CloseDate
+    FROM
+      PostHistory ph
+    WHERE
+      ph.PostHistoryTypeId = 10
+    GROUP BY
+      ph.PostId
+  ),
+  HighReputationUsers AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      COALESCE(ubc.GoldBadges, 0) AS GoldBadges,
+      COALESCE(ubc.SilverBadges, 0) AS SilverBadges,
+      COALESCE(ubc.BronzeBadges, 0) AS BronzeBadges
+    FROM
+      Users u
+      LEFT JOIN UserBadgeCounts ubc ON u.Id = ubc.UserId
+    WHERE
+      u.Reputation > 10000
+  )
+SELECT
+  p.Id AS PostId,
+  pt.Name AS PostType,
+  p.Title,
+  COALESCE(p.OwnerDisplayName, u.DisplayName, 'Community') AS OwnerDisplayName,
+  p.CreationDate,
+  p.Score,
+  p.ViewCount,
+  p.AnswerCount,
+  p.CommentCount,
+  p.FavoriteCount,
+  p.ClosedDate,
+  p.CommunityOwnedDate,
+  le.LastEditDate,
+  le.LastEditorUserId AS LastEditorUserId,
+  le.LastEditComment,
+  COALESCE(pci.CloseReasonId, crt.Id) AS ExplicitCloseReasonId,
+  COALESCE(pci.CloseDate, p.ClosedDate) AS ActualCloseDate,
+  CASE
+    WHEN p.PostTypeId = 1 THEN STRING_AGG(ptg.Tag, ';' ORDER BY ptg.Tag)
+    ELSE NULL
+  END AS FormattedTags,
+  COALESCE(upa.NumberOfPosts, 0) AS UserTotalPosts,
+  COALESCE(upa.TotalViewCount, 0) AS UserTotalViews,
+  COALESCE(upa.AverageScore, 0.0) AS UserAverageScore,
+  hru.Reputation AS HighReputationScore,
+  hru.DisplayName AS HighReputationUserDisplayName
+FROM
+  Posts p
+  INNER JOIN PostTypes pt ON p.PostTypeId = pt.Id
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN LatestEdits le ON p.Id = le.PostId
+  LEFT JOIN PostTags ptg ON p.Id = ptg.PostId
+  LEFT JOIN UserPostActivity upa ON p.OwnerUserId = upa.OwnerUserId
+  LEFT JOIN HighReputationUsers hru ON p.OwnerUserId = hru.UserId
+  LEFT JOIN PostCloseInfo pci ON p.Id = pci.PostId
+  LEFT JOIN CloseReasonTypes crt ON pci.CloseReasonId = crt.Id
+WHERE
+  p.CreationDate BETWEEN DATE '2023-01-01' AND DATE '2023-12-31'
+  AND p.Score > 10
+  AND (
+    p.Title LIKE '%SQL%'
+    OR EXISTS (
+      SELECT 1
+      FROM Comments c
+      WHERE
+        c.PostId = p.Id
+        AND c.Text LIKE '%performance%'
+    )
+  )
+GROUP BY
+  p.Id,
+  pt.Name,
+  p.Title,
+  COALESCE(p.OwnerDisplayName, u.DisplayName, 'Community'),
+  p.CreationDate,
+  p.Score,
+  p.ViewCount,
+  p.AnswerCount,
+  p.CommentCount,
+  p.FavoriteCount,
+  p.ClosedDate,
+  p.CommunityOwnedDate,
+  le.LastEditDate,
+  le.LastEditorUserId,
+  le.LastEditComment,
+  pci.CloseReasonId,
+  pci.CloseDate,
+  crt.Id,
+  upa.NumberOfPosts,
+  upa.TotalViewCount,
+  upa.AverageScore,
+  hru.Reputation,
+  hru.DisplayName
+HAVING
+  COUNT(DISTINCT ptg.Tag) > 2
+ORDER BY
+  p.Score DESC
+LIMIT 100;

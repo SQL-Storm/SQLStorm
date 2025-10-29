@@ -1,0 +1,394 @@
+-- {"query": "658.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3950} 
+with
+-- parameterizable knobs
+params as (
+  select
+    30::int as recent_days,
+    12::int as months_back,
+    10::int as min_views,
+    50::int as top_n_per_tag
+),
+-- recent question candidates with derived metrics
+recent_q as (
+  select
+    p.Id as QuestionId,
+    p.CreationDate,
+    p.Score,
+    coalesce(p.ViewCount,0) as ViewCount,
+    p.OwnerUserId,
+    p.AcceptedAnswerId,
+    p.Tags,
+    date_trunc('day', p.CreationDate) as q_day
+  from Posts p
+  join PostTypes pt on pt.Id = p.PostTypeId and pt.Name = 'Question'
+  cross join params k
+  where p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - (k.recent_days || ' days')::interval
+    and coalesce(p.ViewCount,0) >= k.min_views
+),
+-- explode tags into rows
+q_tags as (
+  select
+    q.QuestionId,
+    lower(trim(t)) as tag
+  from recent_q q
+  cross join lateral unnest(string_to_array(substring(q.Tags, 2, greatest(length(q.Tags)-2,0)), '><')) as t
+),
+-- compute per-question engagement windows
+q_engagement as (
+  select
+    q.QuestionId,
+    q.Score,
+    q.ViewCount,
+    q.OwnerUserId,
+    q.AcceptedAnswerId,
+    q.CreationDate,
+    count(a.Id) filter (where a.PostTypeId = 2) as AnswerCount,
+    max(a.Score) filter (where a.PostTypeId = 2) as MaxAnswerScore,
+    min(a.CreationDate) filter (where a.PostTypeId = 2) as FirstAnswerAt,
+    max(a.CreationDate) filter (where a.PostTypeId = 2) as LastAnswerAt,
+    sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotesOnQuestion,
+    sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotesOnQuestion,
+    sum(case when v.VoteTypeId = 5 then 1 else 0 end) as FavoritesOnQuestion
+  from recent_q q
+  left join Posts a on a.ParentId = q.QuestionId
+  left join Votes v on v.PostId = q.QuestionId
+  group by q.QuestionId, q.Score, q.ViewCount, q.OwnerUserId, q.AcceptedAnswerId, q.CreationDate
+),
+-- time to first accepted answer and acceptance signals
+accept_metrics as (
+  select
+    qe.QuestionId,
+    case when q.AcceptedAnswerId is not null then 1 else 0 end as HasAccepted,
+    case when q.AcceptedAnswerId is not null then
+      extract(epoch from (aa.CreationDate - q.CreationDate))/60.0
+    else null end as MinutesToAccepted,
+    aa.Score as AcceptedAnswerScore
+  from q_engagement qe
+  join Posts q on q.Id = qe.QuestionId
+  left join Posts aa on aa.Id = q.AcceptedAnswerId
+),
+-- comment and edit intensity
+q_activity as (
+  select
+    q.QuestionId,
+    count(distinct c.Id) as CommentCount,
+    count(*) filter (where ph.PostHistoryTypeId in (4,5,6,7,8,9,24)) as EditEvents,
+    max(c.CreationDate) as LastCommentAt,
+    max(ph.CreationDate) as LastEditAt
+  from recent_q q
+  left join Comments c on c.PostId = q.QuestionId
+  left join PostHistory ph on ph.PostId = q.QuestionId
+  group by q.QuestionId
+),
+-- closure info and reasons extracted from PostHistory.Comment
+q_closure as (
+  select
+    q.QuestionId,
+    min(ph.CreationDate) as ClosedAt,
+    string_agg(distinct crt.Name, ', ' order by crt.Name) as CloseReasons,
+    count(*) as CloseVotesCount
+  from recent_q q
+  join PostHistory ph on ph.PostId = q.QuestionId and ph.PostHistoryTypeId = 10
+  left join CloseReasonTypes crt
+    on crt.Id::varchar = nullif(ph.Comment, '') -- Comment stores CloseReasonId for type 10
+  group by q.QuestionId
+),
+-- duplicate links both directions
+q_dupes as (
+  select
+    q.QuestionId,
+    count(*) filter (where pl.PostId = q.QuestionId and pl.LinkTypeId = 3) as OutboundDupes,
+    count(*) filter (where pl.RelatedPostId = q.QuestionId and pl.LinkTypeId = 3) as InboundDupes
+  from recent_q q
+  left join PostLinks pl on pl.PostId = q.QuestionId or pl.RelatedPostId = q.QuestionId
+  group by q.QuestionId
+),
+-- per-user historical quality over the past N months
+user_hist as (
+  select
+    u.Id as UserId,
+    count(*) filter (where p.PostTypeId = 1) as QuestionsPastN,
+    count(*) filter (where p.PostTypeId = 2) as AnswersPastN,
+    avg(nullif(p.Score,0)) filter (where p.PostTypeId = 1) as AvgQScoreNonZero,
+    avg(nullif(p.Score,0)) filter (where p.PostTypeId = 2) as AvgAScoreNonZero,
+    sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotesGivenToUserPosts,
+    sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotesGivenToUserPosts,
+    max(p.CreationDate) as LastPostAt
+  from Users u
+  left join Posts p on p.OwnerUserId = u.Id
+    and p.CreationDate >= date_trunc('month', cast('2024-10-01 12:34:56' as timestamp)) - ((select months_back from params) || ' months')::interval
+  left join Votes v on v.PostId = p.Id
+  group by u.Id
+),
+-- tag popularity baseline
+tag_baseline as (
+  select
+    lower(t.TagName) as tag,
+    t.Count as TagTotalCount,
+    row_number() over (order by t.Count desc, t.TagName) as TagPopRank
+  from Tags t
+),
+-- windowed rank per tag by engagement
+q_tag_rank as (
+  select
+    qt.tag,
+    qe.QuestionId,
+    qe.Score,
+    qe.ViewCount,
+    qe.AnswerCount,
+    qe.UpVotesOnQuestion,
+    qe.DownVotesOnQuestion,
+    dense_rank() over (partition by qt.tag order by coalesce(qe.Score,0) desc, coalesce(qe.ViewCount,0) desc, qe.QuestionId) as RankInTag
+  from q_tags qt
+  join q_engagement qe on qe.QuestionId = qt.QuestionId
+),
+-- select top N per tag
+q_tag_top as (
+  select *
+  from q_tag_rank r
+  where r.RankInTag <= (select top_n_per_tag from params)
+),
+-- normalize string signals (presence of "how", "why", code blocks, urls)
+q_text_signals as (
+  select
+    q.QuestionId,
+    -- crude heuristic using Body/Title presence in Posts
+    p.Title,
+    p.Body,
+    (position('<code>' in coalesce(p.Body,'')) > 0)::int as HasCode,
+    (position('http' in lower(coalesce(p.Body,''))) > 0)::int as HasLink,
+    (position('how' in lower(coalesce(p.Title,''))) > 0)::int as TitleHasHow,
+    (position('why' in lower(coalesce(p.Title,''))) > 0)::int as TitleHasWhy
+  from recent_q q
+  join Posts p on p.Id = q.QuestionId
+),
+-- compute composite KPI per question
+q_kpi as (
+  select
+    qe.QuestionId,
+    0.4*greatest(qe.Score,0)
+    + 0.2*log(1+greatest(qe.ViewCount,0))
+    + 0.25*coalesce(qe.AnswerCount,0)
+    + 0.1*coalesce(qe.UpVotesOnQuestion,0)
+    - 0.15*coalesce(qe.DownVotesOnQuestion,0)
+    + 0.2*coalesce(case when am.HasAccepted=1 then 5 else 0 end,0)
+    + 0.05*coalesce(case when ts.HasCode=1 then 2 else 0 end,0)
+    + 0.03*coalesce(case when ts.HasLink=1 then 1 else 0 end,0)
+    as KPI
+  from q_engagement qe
+  left join accept_metrics am on am.QuestionId = qe.QuestionId
+  left join q_text_signals ts on ts.QuestionId = qe.QuestionId
+),
+-- rolling daily aggregates to mix time-series windowing
+daily_rollup as (
+  select
+    date_trunc('day', p.CreationDate) as day,
+    count(*) filter (where p.PostTypeId = 1) as Questions,
+    count(*) filter (where p.PostTypeId = 2) as Answers,
+    avg(nullif(p.Score,0)) filter (where p.PostTypeId = 1) as AvgQScoreNonZero,
+    sum(p.ViewCount) filter (where p.PostTypeId = 1) as SumQViews,
+    sum(case when v.VoteTypeId = 2 then 1 else 0 end) as Ups,
+    sum(case when v.VoteTypeId = 3 then 1 else 0 end) as Downs,
+    sum(case when v.VoteTypeId = 5 then 1 else 0 end) as Favorites
+  from Posts p
+  left join Votes v on v.PostId = p.Id
+  where p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - ((select months_back from params) || ' months')::interval
+  group by 1
+),
+-- add moving averages
+daily_with_ma as (
+  select
+    d.*,
+    avg(Questions) over (order by day rows between 6 preceding and current row) as MA7_Questions,
+    avg(Answers) over (order by day rows between 6 preceding and current row) as MA7_Answers,
+    avg(SumQViews) over (order by day rows between 6 preceding and current row) as MA7_SumQViews
+  from daily_rollup d
+),
+-- assemble everything per question
+final_questions as (
+  select
+    q.QuestionId,
+    q.CreationDate,
+    qe.Score,
+    qe.ViewCount,
+    qe.AnswerCount,
+    qe.MaxAnswerScore,
+    am.HasAccepted,
+    am.MinutesToAccepted,
+    qa.CommentCount,
+    qa.EditEvents,
+    qc.ClosedAt,
+    qc.CloseReasons,
+    qd.OutboundDupes,
+    qd.InboundDupes,
+    coalesce(qk.KPI,0) as KPI,
+    ts.Title,
+    ts.HasCode,
+    ts.HasLink
+  from recent_q q
+  left join q_engagement qe on qe.QuestionId = q.QuestionId
+  left join accept_metrics am on am.QuestionId = q.QuestionId
+  left join q_activity qa on qa.QuestionId = q.QuestionId
+  left join q_closure qc on qc.QuestionId = q.QuestionId
+  left join q_dupes qd on qd.QuestionId = q.QuestionId
+  left join q_kpi qk on qk.QuestionId = q.QuestionId
+  left join q_text_signals ts on ts.QuestionId = q.QuestionId
+),
+-- tie in user quality and tag/popularity context
+question_enriched as (
+  select
+    fq.*,
+    u.Id as UserId,
+    u.Reputation,
+    uh.QuestionsPastN,
+    uh.AnswersPastN,
+    uh.AvgQScoreNonZero,
+    uh.AvgAScoreNonZero
+  from final_questions fq
+  left join Posts p on p.Id = fq.QuestionId
+  left join Users u on u.Id = p.OwnerUserId
+  left join user_hist uh on uh.UserId = u.Id
+),
+-- join tags and tag baseline for context
+question_tagged as (
+  select
+    qe.*,
+    qt.tag,
+    tb.TagTotalCount,
+    tb.TagPopRank,
+    qt2.RankInTag
+  from question_enriched qe
+  join q_tags qt on qt.QuestionId = qe.QuestionId
+  left join tag_baseline tb on tb.tag = qt.tag
+  left join q_tag_top qt2 on qt2.QuestionId = qe.QuestionId and qt2.tag = qt.tag
+),
+-- compute percentiles over KPI by tag using window functions
+question_ranked as (
+  select
+    qt.*,
+    percentile_cont(0.5) within group (order by coalesce(qt.KPI,0)) over (partition by qt.tag) as KPI_p50_in_tag,
+    percentile_cont(0.9) within group (order by coalesce(qt.KPI,0)) over (partition by qt.tag) as KPI_p90_in_tag,
+    ntile(10) over (partition by qt.tag order by coalesce(qt.KPI,0) desc) as KPI_decile_in_tag,
+    row_number() over (partition by qt.tag order by coalesce(qt.KPI,0) desc, qt.ViewCount desc, qt.QuestionId) as RowNumInTag
+  from question_tagged qt
+),
+-- pick the best tag row per question (highest KPI_decile and then lowest TagPopRank)
+question_best_tag as (
+  select distinct on (QuestionId)
+    QuestionId,
+    tag as BestTag,
+    TagTotalCount,
+    TagPopRank,
+    KPI_decile_in_tag,
+    RowNumInTag
+  from question_ranked
+  order by QuestionId, KPI_decile_in_tag asc, TagPopRank asc, RowNumInTag asc
+),
+-- optional: questions with suspicious patterns via set operators
+suspicious as (
+  select QuestionId
+  from final_questions
+  where coalesce(OutboundDupes,0) + coalesce(InboundDupes,0) >= 3
+  union
+  select q.QuestionId
+  from final_questions q
+  where q.HasCode=0 and q.AnswerCount=0 and q.Score <= 0
+),
+-- correlated subquery: most-upvoted comment snippet per question
+best_comment as (
+  select
+    c.PostId as QuestionId,
+    substring(c.Text from 1 for 140) as BestCommentSnippet,
+    c.Score as BestCommentScore
+  from Comments c
+  where c.PostId in (select QuestionId from recent_q)
+    and (c.PostId, c.Score, c.Id) in (
+      select c2.PostId, max(c2.Score) as maxs, max(c2.Id) keep (dense_rank last order by c2.Score, c2.Id) -- for compatibility, emulate by (c2.PostId, max score); tiebreak via greater Id
+      from Comments c2
+      where c2.PostId in (select QuestionId from recent_q)
+      group by c2.PostId
+    )
+),
+-- fallback if previous correlated tie-break is not available in dialect: pick via window
+best_comment_win as (
+  select QuestionId, BestCommentSnippet, BestCommentScore
+  from (
+    select
+      c.PostId as QuestionId,
+      substring(c.Text from 1 for 140) as BestCommentSnippet,
+      c.Score as BestCommentScore,
+      row_number() over (partition by c.PostId order by c.Score desc nulls last, c.Id desc) as rn
+    from Comments c
+    where c.PostId in (select QuestionId from recent_q)
+  ) x
+  where rn = 1
+),
+-- unify best_comment using windowed version
+best_comment_final as (
+  select * from best_comment_win
+),
+-- final scoring with null-safe expressions and case analyses
+scored as (
+  select
+    qr.QuestionId,
+    qb.BestTag,
+    qr.tag,
+    coalesce(qr.KPI,0) as KPI,
+    coalesce(qr.KPI_p50_in_tag,0) as KPI_p50_in_tag,
+    coalesce(qr.KPI_p90_in_tag,0) as KPI_p90_in_tag,
+    qr.KPI_decile_in_tag,
+    qr.RowNumInTag,
+    qb.TagPopRank,
+    case
+      when s.QuestionId is not null then 'Suspicious'
+      when qr.ClosedAt is not null then 'Closed'
+      when qr.HasAccepted = 1 then 'Accepted'
+      when qr.AnswerCount >= 1 then 'Answered'
+      else 'Open'
+    end as Status,
+    coalesce(qr.Score,0) as Score,
+    coalesce(qr.ViewCount,0) as Views,
+    coalesce(qr.AnswerCount,0) as Answers,
+    qr.MaxAnswerScore,
+    round(coalesce(qr.MinutesToAccepted, null)) as MinutesToAccepted,
+    qr.CommentCount,
+    qr.EditEvents,
+    qr.CloseReasons,
+    qr.OutboundDupes,
+    qr.InboundDupes,
+    qr.Title,
+    qr.HasCode,
+    qr.HasLink,
+    qe.Reputation,
+    qe.QuestionsPastN,
+    qe.AnswersPastN,
+    qe.AvgQScoreNonZero,
+    qe.AvgAScoreNonZero,
+    bcf.BestCommentSnippet,
+    bcf.BestCommentScore
+  from question_ranked qr
+  left join question_best_tag qb on qb.QuestionId = qr.QuestionId
+  left join suspicious s on s.QuestionId = qr.QuestionId
+  left join question_enriched qe on qe.QuestionId = qr.QuestionId
+  left join best_comment_final bcf on bcf.QuestionId = qr.QuestionId
+)
+-- final result with filters, ordering, and a sample union to vary execution plans
+select *
+from scored
+where
+  -- emphasize higher KPI and non-null best tag
+  KPI >= coalesce(KPI_p50_in_tag, 0)
+  and qb is not null is not null -- intentionally convoluted null logic to exercise optimizer
+union all
+select *
+from scored
+where
+  Status in ('Suspicious','Closed')
+order by
+  Status,
+  TagPopRank nulls last,
+  KPI desc,
+  Views desc,
+  Score desc,
+  QuestionId
+limit 500;

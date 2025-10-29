@@ -1,0 +1,246 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.UpVotes,
+        u.DownVotes,
+        u.Views,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(p.CreationDate) AS LatestPostDate,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags)-2)), ', ') AS AllTags,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Elite'
+            WHEN u.Reputation > 5000 THEN 'Veteran'
+            WHEN u.Reputation > 1000 THEN 'Regular'
+            ELSE 'Newbie'
+        END AS ReputationTier
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes, u.Views
+),
+RankedUsers AS (
+    SELECT rs.*,
+        ROW_NUMBER() OVER (ORDER BY rs.Reputation DESC, rs.PostCount DESC) AS RankByReputation,
+        RANK() OVER (ORDER BY rs.BadgeCount DESC) AS RankByBadges,
+        DENSE_RANK() OVER (ORDER BY rs.CommentCount DESC) AS RankByComments
+    FROM UserStats rs
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END AS PostType,
+        CASE 
+            WHEN p.Score > 100 THEN 'HighlyVoted'
+            WHEN p.Score > 50 THEN 'ModeratelyVoted'
+            WHEN p.Score > 0 THEN 'LowVoted'
+            ELSE 'NoVotes'
+        END AS VoteCategory,
+        CASE 
+            WHEN p.ViewCount > 1000 THEN 'Popular'
+            WHEN p.ViewCount > 100 THEN 'Moderate'
+            WHEN p.ViewCount > 0 THEN 'Low'
+            ELSE 'NoViews'
+        END AS Popularity,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousScore,
+        LEAD(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS AvgScorePerUser,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) AS PostsPerUser,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS PostRank
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.CreationDate >= TIMESTAMP '2020-01-01' AND p.CreationDate < TIMESTAMP '2024-01-01'
+),
+TagStats AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Trending'
+            WHEN t.Count > 100 THEN 'Popular'
+            WHEN t.Count > 10 THEN 'Moderate'
+            ELSE 'Niche'
+        END AS TagPopularity,
+        LAG(t.Count, 1) OVER (ORDER BY t.Count DESC) AS PreviousCount,
+        LAG(t.Count, 2) OVER (ORDER BY t.Count DESC) AS PreviousCount2,
+        (t.Count - LAG(t.Count, 1) OVER (ORDER BY t.Count DESC)) / NULLIF(LAG(t.Count, 1) OVER (ORDER BY t.Count DESC), 0) * 100 AS GrowthRate,
+        RANK() OVER (ORDER BY t.Count DESC) AS RankByCount
+    FROM Tags t
+),
+ComplexVoting AS (
+    SELECT 
+        v.Id AS VoteId,
+        v.PostId,
+        v.VoteTypeId,
+        v.UserId,
+        v.CreationDate,
+        p.Score AS PostScore,
+        p.Title AS PostTitle,
+        u.DisplayName AS VoterName,
+        CASE 
+            WHEN v.VoteTypeId = 2 THEN 'Upvote'
+            WHEN v.VoteTypeId = 3 THEN 'Downvote'
+            ELSE 'Other'
+        END AS VoteType,
+        CASE 
+            WHEN v.VoteTypeId = 2 AND p.Score > 0 THEN 'PositiveEffect'
+            WHEN v.VoteTypeId = 3 AND p.Score < 0 THEN 'NegativeEffect'
+            WHEN v.VoteTypeId = 2 AND p.Score = 0 THEN 'NeutralEffect'
+            ELSE 'MixedEffect'
+        END AS VoteImpact,
+        DENSE_RANK() OVER (PARTITION BY v.PostId ORDER BY v.CreationDate ASC) AS VoteOrder,
+        COUNT(*) OVER (PARTITION BY v.PostId) AS TotalVotes,
+        AVG(EXTRACT(EPOCH FROM v.CreationDate)) OVER (PARTITION BY v.PostId) AS AvgVoteDate,
+        (SELECT COUNT(*) 
+         FROM Votes v2 
+         WHERE v2.PostId = v.PostId AND v2.UserId = v.UserId) AS UserVotesOnPost,
+        ROW_NUMBER() OVER (ORDER BY v.CreationDate DESC) AS RecentVoteId
+    FROM Votes v
+    JOIN Posts p ON v.PostId = p.Id
+    LEFT JOIN Users u ON v.UserId = u.Id
+    WHERE v.CreationDate >= TIMESTAMP '2020-01-01' AND v.CreationDate < TIMESTAMP '2024-01-01'
+)
+
+SELECT 
+    'Performance Benchmarks Report' AS ReportName,
+    COUNT(*) AS TotalRecords,
+    COUNT(DISTINCT ru.UserId) AS DistinctUsers,
+    COUNT(DISTINCT pa.PostId) AS DistinctPosts,
+    COUNT(DISTINCT ts.TagName) AS DistinctTags,
+    COUNT(DISTINCT cv.VoteId) AS TotalVotes,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1) AS QuestionCount,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 2) AS AnswerCount,
+    (SELECT AVG(Reputation) FROM Users) AS AvgUserReputation,
+    (SELECT AVG(Score) FROM Posts) AS AvgPostScore,
+    (SELECT AVG(CASE WHEN VoteTypeId IN (2,3) THEN 1.0*Score ELSE NULL END) FROM Votes) AS AvgVoteScore,
+    (SELECT STRING_AGG(UPPER(TRIM(SUBSTRING(Title FROM 1 FOR 10))), ', ') 
+     FROM Posts 
+     WHERE CreationDate >= TIMESTAMP '2023-01-01' 
+     AND EXISTS (SELECT 1 FROM Users u WHERE u.Id = Posts.OwnerUserId AND u.Reputation > 5000)) AS RecentHighRepPostTitles,
+    (SELECT MIN(CreationDate) || ' to ' || MAX(CreationDate) 
+     FROM Posts 
+     WHERE CreationDate >= TIMESTAMP '2020-01-01' 
+     AND EXISTS (SELECT 1 FROM Users u WHERE u.Id = Posts.OwnerUserId AND u.Reputation > 1000)) AS PostDateRange,
+    (SELECT STRING_AGG(DisplayName || ':' || BadgeCount, '; ') 
+     FROM RankedUsers 
+     WHERE BadgeCount > 100 
+     AND RankByBadges <= 20) AS TopBadgeHolders,
+    (SELECT STRING_AGG(TagName || ':' || Count, ' | ') 
+     FROM TagStats 
+     WHERE TagPopularity IN ('Trending', 'Popular') 
+     AND RankByCount <= 50) AS PopularTags,
+    (SELECT STRING_AGG(VoteType || ':' || cnt, ' | ') 
+     FROM (
+         SELECT VoteType, COUNT(*) AS cnt
+         FROM ComplexVoting
+         WHERE VoteType IN ('Upvote', 'Downvote')
+         GROUP BY VoteType
+     ) t) AS VoteTypeDistribution,
+    (SELECT COUNT(*) 
+     FROM Posts p 
+     JOIN Posts p2 ON p.ParentId = p2.Id 
+     WHERE p.PostTypeId = 2 
+     AND EXISTS (SELECT 1 FROM Users u WHERE u.Id = p.OwnerUserId AND u.Reputation < 1000)) AS LowRepAnswers,
+    (SELECT STRING_AGG('Q' || PostId || ':' || Title, ' | ') 
+     FROM (
+        SELECT p.Id AS PostId, p.Title, p.CreationDate
+        FROM Posts p
+        WHERE PostTypeId = 1
+        AND EXISTS (SELECT 1 FROM Posts p2 WHERE p2.ParentId = p.Id)
+        AND EXISTS (SELECT 1 FROM Posts p3 WHERE p3.ParentId = p.Id AND p3.Score > 0)
+        AND Score < 0
+        ORDER BY p.CreationDate DESC
+        LIMIT 10
+     ) sub) AS LowScoreQuestions,
+    (SELECT COUNT(*) 
+     FROM (
+        SELECT OwnerUserId, COUNT(*) AS PostsCount
+        FROM Posts 
+        WHERE PostTypeId = 1 
+        AND Score > 100
+        GROUP BY OwnerUserId
+        HAVING COUNT(*) > 50
+     ) AS HighlyVotedQuestionAuthors) AS TopQuestionAuthors,
+    (SELECT AVG(ABS(Score)) 
+     FROM Posts 
+     WHERE PostTypeId = 1 
+     AND Score < 0) AS AvgNegativeQuestionScore
+FROM RankedUsers ru
+FULL OUTER JOIN PostAnalysis pa ON ru.UserId = pa.OwnerUserId
+FULL OUTER JOIN TagStats ts ON ts.Count > 100
+FULL OUTER JOIN ComplexVoting cv ON cv.PostId IN (SELECT Id FROM Posts WHERE PostTypeId = 1)
+WHERE (ru.UserId IS NOT NULL OR pa.PostId IS NOT NULL OR ts.TagName IS NOT NULL OR cv.VoteId IS NOT NULL)
+
+UNION ALL
+
+SELECT 
+    'Advanced Metrics Report' AS ReportName,
+    COUNT(*) AS TotalRecords,
+    COUNT(DISTINCT ru.UserId) AS DistinctUsers,
+    COUNT(DISTINCT pa.PostId) AS DistinctPosts,
+    COUNT(DISTINCT ts.TagName) AS DistinctTags,
+    COUNT(DISTINCT cv.VoteId) AS TotalVotes,
+    COUNT(DISTINCT CASE WHEN pa.PostType = 'Question' THEN pa.PostId END) AS QuestionCount,
+    COUNT(DISTINCT CASE WHEN pa.PostType = 'Answer' THEN pa.PostId END) AS AnswerCount,
+    AVG(ru.Reputation) AS AvgUserReputation,
+    AVG(pa.Score) AS AvgPostScore,
+    AVG(cv.PostScore) AS AvgVoteScore,
+    MAX(ru.Views) AS MaxUserViews,
+    SUM(pa.ViewCount) AS TotalPostViews,
+    (SELECT STRING_AGG(pt || ':' || cnt, ' | ')
+     FROM (
+       SELECT pa2.PostType AS pt, COUNT(*) AS cnt
+       FROM RankedUsers rj
+       FULL JOIN PostAnalysis pa2 ON rj.UserId = pa2.OwnerUserId
+       WHERE (rj.UserId IS NOT NULL OR pa2.PostId IS NOT NULL)
+       GROUP BY pa2.PostType
+     ) x) AS PostTypeDistribution,
+    (SELECT COUNT(*) 
+     FROM Posts p 
+     WHERE p.PostTypeId = 1 
+     AND p.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '6 months')) AS RecentQuestions,
+    (SELECT COUNT(DISTINCT OwnerUserId) 
+     FROM Posts 
+     WHERE PostTypeId = 1 
+     AND Score > 50) AS HighScoreQuestions,
+    (SELECT COUNT(DISTINCT VoteTypeId) 
+     FROM Votes 
+     WHERE CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '1 year')) AS VoteTypesUsed,
+    (SELECT AVG(GrowthRate) 
+     FROM TagStats 
+     WHERE GrowthRate IS NOT NULL) AS AvgTagGrowth,
+    COUNT(DISTINCT CASE WHEN pa.VoteCategory = 'HighlyVoted' THEN pa.PostId END) AS HighlyVotedPosts,
+    COUNT(DISTINCT CASE WHEN pa.Popularity = 'Popular' THEN pa.PostId END) AS PopularPosts,
+    COUNT(*) AS TotalRows
+FROM RankedUsers ru
+FULL OUTER JOIN PostAnalysis pa ON ru.UserId = pa.OwnerUserId
+FULL OUTER JOIN TagStats ts ON ts.Count > 100
+FULL OUTER JOIN ComplexVoting cv ON cv.PostId IN (SELECT Id FROM Posts WHERE PostTypeId = 1)
+WHERE ru.UserId IS NOT NULL OR pa.PostId IS NOT NULL OR ts.TagName IS NOT NULL OR cv.VoteId IS NOT NULL
+GROUP BY
+    'Advanced Metrics Report'
+HAVING COUNT(*) > 0
+ORDER BY TotalRecords DESC;

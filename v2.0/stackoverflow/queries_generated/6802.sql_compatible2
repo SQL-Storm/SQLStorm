@@ -1,0 +1,56 @@
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    u.AboutMe,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.PostId END) AS TotalUpVotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.PostId END) AS TotalDownVotes,
+    MAX(u.CreationDate) AS LatestAccountActivity,
+    AVG(p.Score) AS AvgPostScore,
+    MAX(p.LastActivityDate) AS LatestPostActivity,
+    (
+        SELECT STRING_AGG(t.TagName, ', ')
+        FROM Tags t
+        WHERE t.Id IN (
+            SELECT pt.TagId
+            FROM PostTags pt
+            WHERE pt.PostId IN (
+                SELECT p2.Id FROM Posts p2 WHERE p2.OwnerUserId = u.Id
+            )
+        )
+    ) AS PopularTags,
+    COUNT(DISTINCT p.PostTypeId) AS DifferentPostTypes,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) AS LastClosedDate,
+    (
+        SELECT COUNT(*)
+        FROM (
+            SELECT DISTINCT pl.PostId
+            FROM PostLinks pl
+            WHERE pl.LinkTypeId = 1
+        ) linked_posts
+    ) AS TotalLinkedPosts
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+WHERE 
+    u.Reputation > 1000
+    AND u.LastAccessDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30' DAY)
+GROUP BY 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    u.AboutMe
+HAVING 
+    COUNT(DISTINCT p.PostTypeId) > 5
+ORDER BY 
+    TotalPosts DESC, 
+    AvgPostScore DESC;

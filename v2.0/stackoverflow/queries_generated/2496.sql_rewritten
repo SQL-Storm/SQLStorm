@@ -1,0 +1,157 @@
+-- {"query": "2496.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1595} 
+with RecursiveTagHierarchy as (
+    select Id, TagName, Count, WikiPostId, 1 as Level
+    from Tags
+    where Count > 1000
+  union all
+    select t.Id, t.TagName, t.Count, t.WikiPostId, r.Level + 1
+    from Tags t
+    join RecursiveTagHierarchy r on r.Id <> t.Id and t.Count between r.Count / 2 and r.Count
+    where r.Level < 3
+),
+UserBadgeRankings as (
+    select
+        UserId,
+        Class,
+        count(*) as BadgeCount,
+        row_number() over (partition by UserId order by Class asc, count(*) desc) as BadgeRank
+    from Badges
+    where TagBased = 0
+    group by UserId, Class
+),
+TopUsers as (
+    select u.Id, u.DisplayName, u.Reputation, u.CreationDate,
+      coalesce(b.GoldBadges,0) as GoldBadges,
+      coalesce(b.SilverBadges,0) as SilverBadges,
+      coalesce(b.BronzeBadges,0) as BronzeBadges
+    from Users u
+    left join (
+        select UserId,
+          sum(case when Class=1 then BadgeCount else 0 end) as GoldBadges,
+          sum(case when Class=2 then BadgeCount else 0 end) as SilverBadges,
+          sum(case when Class=3 then BadgeCount else 0 end) as BronzeBadges
+        from UserBadgeRankings
+        group by UserId
+    ) b on u.Id = b.UserId
+    where u.Reputation > 10000 and u.CreationDate < cast('2024-10-01' as date) - interval '5 years'
+),
+QuestionWithAnswerStats as (
+    select
+      q.Id as QuestionId,
+      q.Title,
+      q.CreationDate as QuestionCreation,
+      q.Score as QuestionScore,
+      q.ViewCount,
+      q.Tags,
+      q.AnswerCount,
+      a.Id as AcceptedAnswerId,
+      a.Score as AcceptedAnswerScore,
+      a.CreationDate as AcceptedAnswerCreation,
+      (
+        select count(*)
+        from Comments cm
+        where cm.PostId = q.Id and cm.Score > 0 and cm.CreationDate > q.CreationDate
+      ) as PositiveCommentCount,
+      (
+        select avg(vt.Score)
+        from Posts vt
+        where vt.ParentId = q.Id
+      ) as AvgAnswerScore
+    from Posts q
+    left join Posts a on q.AcceptedAnswerId = a.Id
+    where q.PostTypeId = 1
+      and q.AnswerCount > 0
+      and q.ViewCount is not null
+),
+AnswerRankings as (
+    select
+      p.Id,
+      p.ParentId,
+      p.Score,
+      rank() over (partition by p.ParentId order by p.Score desc, p.CreationDate asc) as AnswerRank
+    from Posts p
+    where p.PostTypeId = 2
+),
+TagUsageStats as (
+    select
+      rt.TagName,
+      count(distinct p.Id) as QuestionCount,
+      avg(p.Score) as AvgQuestionScore,
+      sum(p.ViewCount) as TotalViews,
+      max(p.Score) as MaxQuestionScore,
+      min(p.Score) as MinQuestionScore
+    from RecursiveTagHierarchy rt
+    left join Posts p on p.PostTypeId = 1 and p.Tags like concat('%<', rt.TagName, '>%')
+    group by rt.TagName
+),
+ClosedQuestionsWithReasons as (
+    select
+      ph.PostId,
+      cr.Name as CloseReason,
+      min(ph.CreationDate) as ClosedDate
+    from PostHistory ph
+    join CloseReasonTypes cr on cast(ph.Comment as smallint) = cr.Id
+    where ph.PostHistoryTypeId = 10
+    group by ph.PostId, cr.Name
+),
+ComplexUserActivity as (
+    select
+      u.Id,
+      u.DisplayName,
+      count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsPosted,
+      count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersPosted,
+      count(distinct c.Id) as CommentsMade,
+      count(distinct v.Id) filter (where v.VoteTypeId in (2,3)) as VotesCast,
+      max(p.CreationDate) as LastPostDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName
+    having count(distinct p.Id) > 10
+)
+select 
+  qu.QuestionId,
+  qu.Title,
+  qu.ViewCount,
+  coalesce(qu.PositiveCommentCount,0) as PositiveComments,
+  coalesce(qu.AvgAnswerScore,0) as AvgAnswerScore,
+  au.Id as TopAnswerId,
+  au.Score as TopAnswerScore,
+  cu.CloseReason,
+  ts.TagName,
+  ts.QuestionCount,
+  ts.AvgQuestionScore,
+  tu.DisplayName as TopUser,
+  tu.Reputation,
+  tu.GoldBadges,
+  cuq.QuestionsPosted,
+  cuq.AnswersPosted,
+  cuq.CommentsMade,
+  cuq.VotesCast,
+  round(
+    case when qu.AnswerCount > 0 then (qu.Score * 1.0 / nullif(qu.AnswerCount,0)) else 0 end,2
+  ) as ScorePerAnswer,
+  case when qu.ViewCount > 100000 then 'High Traffic' else 'Normal Traffic' end as TrafficCategory,
+  case
+    when coalesce(cu.CloseReason,'') <> '' then 'Closed'
+    else 'Open'
+  end as QuestionStatus,
+  string_agg(distinct concat_ws(':', rt.TagName, rt.Level::text), ',' order by rt.Level desc) as RelatedTagsHierarchy,
+  lag(qu.ViewCount) over (order by qu.CreationDate) as PrevQuestionViewCount,
+  lead(qu.ViewCount) over (order by qu.CreationDate) as NextQuestionViewCount
+from QuestionWithAnswerStats qu
+left join AnswerRankings au on au.ParentId = qu.QuestionId and au.AnswerRank = 1
+left join ClosedQuestionsWithReasons cu on cu.PostId = qu.QuestionId
+left join Tags ts on ts.TagName = (select unnest(string_to_array(substring(qu.Tags from 2 for length(qu.Tags)-2), '><')) limit 1)
+left join TopUsers tu on tu.Id = qu.AcceptedAnswerId or tu.Id = qu.OwnerUserId
+left join ComplexUserActivity cuq on cuq.Id = qu.OwnerUserId
+left join RecursiveTagHierarchy rt on rt.TagName = any(string_to_array(substring(qu.Tags from 2 for length(qu.Tags)-2), '><'))
+where qu.QuestionCreation > cast('2024-10-01' as date) - interval '1 year'
+group by qu.QuestionId, qu.Title, qu.ViewCount, qu.PositiveCommentCount, qu.AvgAnswerScore, au.Id, au.Score, 
+         cu.CloseReason, ts.TagName, ts.QuestionCount, ts.AvgQuestionScore,
+         tu.DisplayName, tu.Reputation, tu.GoldBadges,
+         cuq.QuestionsPosted, cuq.AnswersPosted, cuq.CommentsMade, cuq.VotesCast, qu.ScorePerAnswer, qu.AnswerCount,
+         qu.QuestionCreation, cu.CloseReason
+order by qu.ViewCount desc
+limit 50;

@@ -1,0 +1,225 @@
+-- {"query": "2462.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2068} 
+
+with RecursiveTagHierarchy as (
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 as Level,
+        array[t.TagName] as Ancestors
+    from Tags t
+    where t.IsModeratorOnly = 0
+
+    union all
+
+    select 
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        r.Level + 1,
+        r.Ancestors || t2.TagName
+    from Tags t2
+    join RecursiveTagHierarchy r on array_position(r.Ancestors, t2.TagName) is null
+    where t2.IsModeratorOnly = 0 and r.Level < 3
+),
+PostScoresWithBadges as (
+    select 
+        p.Id as PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        u.Reputation,
+        count(distinct b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(distinct b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(distinct b.Id) filter (where b.Class = 3) as BronzeBadges,
+        coalesce(p.Tags, '') as Tags,
+        -- Complex calculation mixing score, views, badges, and reputation
+        (p.Score * 0.6 + p.ViewCount * 0.03 + coalesce(u.Reputation,0) * 0.001 + 
+         count(distinct b.Id) over (partition by p.OwnerUserId) * 0.5
+        ) as WeightedImpact
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    left join Badges b on u.Id = b.UserId
+    group by p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.OwnerUserId, u.Reputation, p.Tags
+),
+LatestCommentStats as (
+    select 
+        c.PostId,
+        max(c.CreationDate) as LastCommentDate,
+        avg(c.Score) as AvgCommentScore,
+        count(*) as CommentCount
+    from Comments c
+    group by c.PostId
+),
+LinkedPostsCTE as (
+    select 
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.LinkTypeId,
+        lt.Name as LinkTypeName
+    from PostLinks pl
+    left join LinkTypes lt on pl.LinkTypeId = lt.Id
+),
+AnswerStats as (
+    select 
+        a.ParentId as QuestionId,
+        count(distinct a.Id) as AnswerCount,
+        max(a.Score) as MaxAnswerScore,
+        avg(a.Score) as AvgAnswerScore,
+        sum(case when a.Id = q.AcceptedAnswerId then 1 else 0 end) as HasAcceptedAnswer
+    from Posts a
+    join Posts q on a.ParentId = q.Id and q.PostTypeId = 1
+    where a.PostTypeId = 2
+    group by a.ParentId
+),
+UserActivityWindow as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        row_number() over (order by u.Reputation desc, u.CreationDate) as RankByReputation,
+        count(distinct p.Id) filter (where p.CreationDate > (u.CreationDate + interval '1 year')) as PostsAfterFirstYear,
+        count(distinct ph.Id) filter (where ph.PostHistoryTypeId in (10, 11, 19, 20) and ph.CreationDate > (u.CreationDate)) as ModerationActionCount
+    from Users u
+    left join Posts p on u.Id = p.OwnerUserId
+    left join PostHistory ph on u.Id = ph.UserId
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+UserCloseVotes as (
+    select
+        ph.UserId,
+        count(distinct ph.PostId) as CloseVotesCast,
+        count(distinct case when ph.Comment::int in (101,102,103,104,105) then ph.PostId end) as ValidCloseReasons
+    from PostHistory ph
+    where ph.PostHistoryTypeId = 10
+    group by ph.UserId
+),
+ComplexTaggedPosts as (
+    select 
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.Tags,
+        unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><')) as TagName
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+),
+TaggedPostScores as (
+    select 
+        ctp.Id as PostId,
+        ctp.Title,
+        ctp.CreationDate,
+        ctp.Score,
+        ctp.ViewCount,
+        ctp.OwnerUserId,
+        ctp.TagName,
+        t.Count as TagUsageCount,
+        row_number() over (
+            partition by ctp.TagName order by ctp.Score desc, ctp.ViewCount desc
+        ) as RankInTag
+    from ComplexTaggedPosts ctp
+    left join Tags t on ctp.TagName = t.TagName
+),
+QnAAggregated as (
+    select
+        pq.Id as QuestionId,
+        pq.Title,
+        pq.CreationDate,
+        pq.Score as QuestionScore,
+        pq.ViewCount as QuestionViews,
+        pa.AnswerCount,
+        pa.MaxAnswerScore,
+        pa.AvgAnswerScore,
+        pa.HasAcceptedAnswer,
+        pswb.GoldBadges,
+        pswb.SilverBadges,
+        pswb.BronzeBadges,
+        pswb.WeightedImpact,
+        lc.LastCommentDate,
+        lc.AvgCommentScore,
+        lc.CommentCount
+    from Posts pq
+    left join AnswerStats pa on pq.Id = pa.QuestionId
+    left join PostScoresWithBadges pswb on pq.Id = pswb.PostId
+    left join LatestCommentStats lc on pq.Id = lc.PostId
+    where pq.PostTypeId = 1
+),
+FinalSelection as (
+    select 
+        qna.QuestionId,
+        qna.Title,
+        qna.CreationDate,
+        qna.QuestionScore,
+        qna.QuestionViews,
+        qna.AnswerCount,
+        qna.MaxAnswerScore,
+        qna.AvgAnswerScore,
+        qna.HasAcceptedAnswer,
+        qna.GoldBadges,
+        qna.SilverBadges,
+        qna.BronzeBadges,
+        qna.WeightedImpact,
+        qna.LastCommentDate,
+        qna.AvgCommentScore,
+        qna.CommentCount,
+        case when uac.RankByReputation <= 100 then 'Top 100 rep user' else 'Other user' end as OwnerCategory,
+        uac.PostsAfterFirstYear,
+        uac.ModerationActionCount,
+        coalesce(ucv.CloseVotesCast,0) as CloseVotesCast,
+        coalesce(ucv.ValidCloseReasons,0) as ValidCloseReasons,
+        -- String and null logic: build a safe snippet of the title and tags
+        substring(qna.Title from 1 for 50) || coalesce(' [' || substring(qna.Title from 51 for 50) || ']', '') as TitleSnippet,
+        substring(coalesce(pswb.Tags,''),1, 50) as TagsSnippet
+    from QnAAggregated qna
+    left join Users u on qna.OwnerUserId = u.Id
+    left join UserActivityWindow uac on u.Id = uac.UserId
+    left join UserCloseVotes ucv on u.Id = ucv.UserId
+    left join PostScoresWithBadges pswb on qna.QuestionId = pswb.PostId
+    where qna.HasAcceptedAnswer = 1
+      and (qna.AnswerCount > 3 or qna.QuestionViews > 10000)
+      and (qna.WeightedImpact > 10)
+)
+select 
+    fs.QuestionId,
+    fs.TitleSnippet,
+    fs.CreationDate,
+    fs.QuestionScore,
+    fs.QuestionViews,
+    fs.AnswerCount,
+    round(fs.AvgAnswerScore::numeric,2) as AvgAnswerScore,
+    fs.GoldBadges,
+    fs.SilverBadges,
+    fs.BronzeBadges,
+    round(fs.WeightedImpact::numeric,2) as WeightedImpact,
+    fs.LastCommentDate,
+    round(fs.AvgCommentScore::numeric,2) as AvgCommentScore,
+    fs.CommentCount,
+    fs.OwnerCategory,
+    fs.PostsAfterFirstYear,
+    fs.ModerationActionCount,
+    fs.CloseVotesCast,
+    fs.ValidCloseReasons,
+    fs.TagsSnippet,
+    -- Window function to rank questions by weighted impact within owner category
+    rank() over (partition by fs.OwnerCategory order by fs.WeightedImpact desc) as ImpactRankInCategory,
+    -- Correlated subquery example: number of distinct users commenting uniquely on this question
+    (
+        select count(distinct c2.UserId)
+        from Comments c2
+        where c2.PostId = fs.QuestionId
+          and c2.UserId is not null
+          and c2.CreationDate > fs.CreationDate
+    ) as DistinctRecentCommenters,
+    -- EXISTS usage with NULL logic checking if this question has any links marked as duplicate
+    case when exists(
+        select 1 from LinkedPostsCTE lpc 
+        where lpc.PostId = fs.QuestionId and lpc.LinkTypeName = 'Duplicate'
+    ) then 'Yes' else 'No' end as HasDuplicateLink
+from FinalSelection fs
+order by fs.WeightedImpact desc, fs.QuestionViews desc
+limit 50;

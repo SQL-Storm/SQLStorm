@@ -1,0 +1,218 @@
+WITH PostStats AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.ParentId,
+        p.AcceptedAnswerId,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS UserPostSequence,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) AS ScoreRank,
+        LAG(p.Score) OVER (ORDER BY p.CreationDate) AS PrevScore,
+        LEAD(p.Score) OVER (ORDER BY p.CreationDate) AS NextScore,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) AS TotalUserPosts,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS AvgUserScore,
+        CASE 
+            WHEN p.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'AboveAvg'
+            WHEN p.Score < (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'BelowAvg'
+            ELSE 'Avg'
+        END AS ScoreCategory,
+        COALESCE(p.Tags, '') AS CleanTags,
+        REPLACE(REPLACE(REPLACE(REPLACE(p.Title, '<', ''), '>', ''), '&', ''), '"', '') AS CleanTitle,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN (p.AnswerCount * 100.0 / NULLIF(p.ViewCount, 0))
+            ELSE NULL 
+        END AS AnswerViewRatio,
+        CAST((JULIANDAY(COALESCE(p.LastEditDate, p.CreationDate)) - JULIANDAY(p.CreationDate)) AS INTEGER) AS DaysSinceLastEdit,
+        p.LastEditDate
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserMetrics AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.AccountId,
+        COUNT(DISTINCT ps.Id) AS TotalPosts,
+        AVG(ps.Score) AS AvgPostScore,
+        MAX(ps.CreationDate) AS LastPostDate,
+        STRING_AGG(DISTINCT ps.Title, '; ') AS UserPostTitles,
+        STRING_AGG(DISTINCT ps.Tags, '; ') AS UserPostTags,
+        CASE 
+            WHEN COUNT(DISTINCT ps.Id) > 0 AND AVG(ps.Score) > 10 THEN 'HighlyActive'
+            WHEN COUNT(DISTINCT ps.Id) > 0 AND AVG(ps.Score) > 0 THEN 'Active'
+            ELSE 'Inactive'
+        END AS ActivityLevel,
+        COUNT(DISTINCT CASE WHEN ps.PostTypeId = 1 THEN ps.Id END) AS QuestionCount,
+        COUNT(DISTINCT ps.Id) AS TotalPosts_ForGroup
+    FROM Users u
+    LEFT JOIN PostStats ps ON u.Id = ps.OwnerUserId
+    GROUP BY u.Id, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.AccountId
+),
+TopQuestions AS (
+    SELECT 
+        ps.Id,
+        ps.Title,
+        ps.Score,
+        ps.ViewCount,
+        ps.AnswerCount,
+        ps.CommentCount,
+        ps.OwnerUserId,
+        ps.CreationDate,
+        ps.Tags,
+        ps.ScoreRank,
+        ps.ScoreCategory,
+        ps.AnswerViewRatio,
+        ps.DaysSinceLastEdit,
+        ps.UserPostSequence,
+        ps.TotalUserPosts,
+        ps.AvgUserScore,
+        ps.PrevScore,
+        ps.NextScore,
+        ROW_NUMBER() OVER (ORDER BY ps.Score DESC, ps.ViewCount DESC) AS RankByScoreAndViews,
+        RANK() OVER (PARTITION BY ps.OwnerUserId ORDER BY ps.ViewCount DESC) AS UserViewRank,
+        DENSE_RANK() OVER (ORDER BY ps.ViewCount DESC) AS ViewRank,
+        CASE 
+            WHEN ps.AnswerCount = 0 AND ps.Score > 0 THEN 'Unanswered'
+            WHEN ps.AnswerCount > 0 AND ps.AcceptedAnswerId IS NOT NULL THEN 'Answered-Accepted'
+            WHEN ps.AnswerCount > 0 THEN 'Answered-NotAccepted'
+            ELSE 'NoAnswers'
+        END AS AnswerStatus,
+        ps.AcceptedAnswerId,
+        ps.LastEditDate,
+        ps.PostTypeId
+    FROM PostStats ps
+    WHERE ps.PostTypeId = 1 AND ps.Score > 0
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > (SELECT AVG(Count) FROM Tags) THEN 'Popular'
+            WHEN t.Count < (SELECT AVG(Count) FROM Tags) THEN 'LessPopular'
+            ELSE 'Average'
+        END AS PopularityLevel,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank,
+        DENSE_RANK() OVER (ORDER BY t.Count DESC) AS TagDensityRank,
+        NTILE(4) OVER (ORDER BY t.Count DESC) AS TagQuartile
+    FROM Tags t
+),
+AnswerAnalysis AS (
+    SELECT 
+        ps.Id AS AnswerId,
+        ps.ParentId,
+        ps.Score,
+        ps.CreationDate,
+        ps.OwnerUserId,
+        ps.LastEditDate,
+        ps.AnswerCount,
+        ps.CommentCount,
+        ps.FavoriteCount,
+        ps.PrevScore,
+        ps.NextScore,
+        ps.ScoreRank,
+        ps.ScoreCategory,
+        ROW_NUMBER() OVER (PARTITION BY ps.ParentId ORDER BY ps.Score DESC, ps.CreationDate ASC) AS AnswerRank,
+        RANK() OVER (PARTITION BY ps.OwnerUserId ORDER BY ps.Score DESC) AS UserAnswerRank,
+        CASE 
+            WHEN ps.Score = (SELECT MAX(Score) FROM Posts WHERE ParentId = ps.ParentId AND PostTypeId = 2) THEN 1
+            ELSE 0
+        END AS IsBestAnswer
+    FROM PostStats ps 
+    WHERE ps.PostTypeId = 2
+)
+SELECT 
+    'PerformanceBenchmark' AS QueryType,
+    COUNT(*) AS TotalRecords,
+    COUNT(DISTINCT tq.Id) AS UniqueQuestions,
+    COUNT(DISTINCT u.UserId) AS UniqueUsers,
+    COUNT(DISTINCT ta.TagName) AS TotalTags,
+    COUNT(DISTINCT CASE WHEN tq.AnswerStatus = 'Answered-Accepted' THEN tq.Id END) AS AcceptedAnswers,
+    COUNT(DISTINCT CASE WHEN tq.AnswerStatus = 'Unanswered' THEN tq.Id END) AS UnansweredQuestions,
+    AVG(tq.Score) AS AvgQuestionScore,
+    AVG(tq.ViewCount) AS AvgQuestionViews,
+    AVG(CASE WHEN tq.AnswerViewRatio IS NOT NULL THEN tq.AnswerViewRatio END) AS AvgAnswerViewRatio,
+    SUM(tq.AnswerCount) AS TotalAnswers,
+    SUM(tq.CommentCount) AS TotalComments,
+    MAX(tq.CreationDate) AS LatestQuestion,
+    MIN(tq.CreationDate) AS EarliestQuestion,
+    STRING_AGG(DISTINCT CASE WHEN tq.AnswerStatus = 'Answered-NotAccepted' THEN tq.Title END, '; ') AS NonAcceptedAnswers,
+    STRING_AGG(DISTINCT CASE WHEN tq.AnswerStatus = 'Unanswered' THEN tq.Title END, '; ') AS UnansweredQuestionsList,
+    STRING_AGG(DISTINCT u.DisplayName, '; ') AS UserList,
+    STRING_AGG(DISTINCT ta.TagName, '; ') AS PopularTags,
+    STRING_AGG(DISTINCT CASE WHEN tq.ScoreRank <= 10 THEN tq.Title END, '; ') AS Top10ScoreQuestions,
+    COUNT(DISTINCT CASE WHEN tq.ScoreCategory = 'AboveAvg' AND tq.PostTypeId = 1 THEN tq.Id END) AS AboveAvgQuestions,
+    COUNT(DISTINCT CASE WHEN ta.PopularityLevel = 'Popular' THEN ta.TagName END) AS PopularTagsCount,
+    COUNT(DISTINCT CASE WHEN a.IsBestAnswer = 1 THEN a.AnswerId END) AS TopAnswers,
+    COUNT(DISTINCT CASE WHEN u.LastPostDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30' DAY) THEN u.UserId END) AS RecentActiveUsers,
+    AVG(u.Reputation) AS AvgUserReputation,
+    SUM(u.UpVotes) AS TotalUpVotes,
+    SUM(u.DownVotes) AS TotalDownVotes,
+    AVG(CASE WHEN u.QuestionCount > 0 THEN u.QuestionCount END) AS AvgQuestionsPerUser,
+    MIN(tq.ViewRank) AS LowestViewRank,
+    MAX(tq.ScoreRank) AS HighestScoreRank,
+    COUNT(DISTINCT CASE WHEN tq.AnswerCount > 10 THEN tq.Id END) AS HighAnswerCountQuestions,
+    COUNT(DISTINCT CASE WHEN tq.DaysSinceLastEdit > 30 THEN tq.Id END) AS OldQuestions,
+    COUNT(DISTINCT CASE WHEN u.TotalPosts > 100 THEN u.UserId END) AS HighPostUsers,
+    STRING_AGG(DISTINCT CASE WHEN ta.TagQuartile <= 2 THEN ta.TagName END, '; ') AS HighDensityTags,
+    COUNT(DISTINCT CASE WHEN tq.UserPostSequence = 1 THEN tq.Id END) AS FirstPosts,
+    COUNT(DISTINCT CASE WHEN u.ActivityLevel = 'HighlyActive' THEN u.UserId END) AS HighlyActiveUsers,
+    COUNT(DISTINCT CASE WHEN a.AnswerRank = 1 THEN a.AnswerId END) AS FirstRankedAnswers,
+    COUNT(DISTINCT CASE WHEN tq.UserViewRank = 1 THEN tq.Id END) AS TopViewedQuestions,
+    COUNT(DISTINCT CASE WHEN tq.RankByScoreAndViews <= 5 THEN tq.Id END) AS TopScoreAndViewQuestions,
+    AVG(tq.AnswerCount) AS AvgAnswersPerQuestion,
+    MAX(tq.AnswerCount) AS MaxAnswersPerQuestion,
+    MIN(tq.AnswerCount) AS MinAnswersPerQuestion,
+    AVG(tq.CommentCount) AS AvgCommentsPerQuestion,
+    SUM(CASE WHEN tq.AnswerStatus = 'Answered-NotAccepted' THEN 1 ELSE 0 END) AS NonAcceptedAnswersCount,
+    COUNT(DISTINCT CASE WHEN tq.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1' YEAR) THEN tq.Id END) AS RecentQuestions,
+    STRING_AGG(DISTINCT CASE WHEN tq.DaysSinceLastEdit > 90 THEN tq.Title END, '; ') AS VeryOldQuestions,
+    COUNT(DISTINCT CASE WHEN tq.Score > 100 THEN tq.Id END) AS HighlyScoredQuestions,
+    COUNT(DISTINCT CASE WHEN tq.ViewCount > 1000 THEN tq.Id END) AS HighlyViewedQuestions,
+    AVG(CASE WHEN tq.AnswerViewRatio IS NOT NULL THEN tq.AnswerViewRatio END) AS AvgAnswerViewRatioFiltered,
+    COUNT(DISTINCT CASE WHEN a.IsBestAnswer = 1 THEN a.AnswerId END) AS BestAnswerQuestions,
+    SUM(CASE WHEN u.TotalPosts > 0 THEN u.TotalPosts END) AS TotalUserPostsAggregate,
+    COUNT(DISTINCT CASE WHEN u.Views > 1000 THEN u.UserId END) AS HighViewUsers,
+    STRING_AGG(DISTINCT CASE WHEN tq.Score > 50 AND tq.AnswerCount > 0 THEN tq.Title END, '; ') AS HighScoreAnsweredQuestions,
+    COUNT(DISTINCT CASE WHEN tq.Tags IS NOT NULL AND TRIM(tq.Tags) <> '' THEN tq.Id END) AS TaggedQuestions,
+    COUNT(DISTINCT CASE WHEN tq.LastEditDate IS NOT NULL AND tq.LastEditDate > tq.CreationDate THEN tq.Id END) AS EditedQuestions,
+    COUNT(DISTINCT CASE WHEN tq.AcceptedAnswerId IS NOT NULL THEN tq.Id END) AS QuestionsWithAcceptedAnswers,
+    COUNT(DISTINCT CASE WHEN tq.AnswerCount > 0 THEN tq.Id END) AS AnsweredQuestions,
+    COUNT(DISTINCT CASE WHEN tq.AnswerCount > 1 THEN tq.Id END) AS MultipleAnsweredQuestions,
+    COUNT(DISTINCT CASE WHEN u.QuestionCount > 10 THEN u.UserId END) AS MultipleQuestionUsers,
+    AVG(CASE WHEN u.TotalPosts > 0 THEN u.TotalPosts END) AS AvgUserPostCount,
+    COUNT(DISTINCT CASE WHEN tq.Score > 10 AND tq.CommentCount > 5 THEN tq.Id END) AS HighScoreHighCommentQuestions,
+    STRING_AGG(DISTINCT CASE WHEN u.ActivityLevel = 'Active' THEN u.DisplayName END, '; ') AS ActiveUsersList,
+    COUNT(DISTINCT CASE WHEN tq.ScoreRank <= 50 THEN tq.Id END) AS Top50ScoreQuestions,
+    COUNT(DISTINCT CASE WHEN u.Reputation > 10000 THEN u.UserId END) AS HighReputationUsers,
+    COUNT(DISTINCT CASE WHEN ta.TagDensityRank <= 25 THEN ta.TagName END) AS TopTagsDensity,
+    COUNT(DISTINCT CASE WHEN tq.DaysSinceLastEdit < 7 THEN tq.Id END) AS RecentQuestionsByEdit,
+    STRING_AGG(DISTINCT CASE WHEN a.UserAnswerRank = 1 THEN CAST(a.AnswerId AS TEXT) END, '; ') AS UserTopAnswers
+FROM TopQuestions tq
+FULL OUTER JOIN UserMetrics u ON u.UserId = tq.OwnerUserId
+FULL OUTER JOIN TagAnalysis ta ON ta.TagRank <= 100
+LEFT JOIN AnswerAnalysis a ON a.AnswerId = tq.Id
+WHERE 
+    (tq.Id IS NOT NULL OR u.UserId IS NOT NULL OR ta.TagName IS NOT NULL)
+    AND (u.Reputation IS NOT NULL OR u.Views IS NOT NULL OR a.AnswerId IS NOT NULL)
+    AND (ta.Count IS NOT NULL OR tq.PostTypeId = 1 OR a.AnswerRank IS NOT NULL)
+GROUP BY
+    tq.Id, tq.Title, tq.Score, tq.ViewCount, tq.AnswerCount, tq.CommentCount, tq.OwnerUserId, tq.CreationDate, tq.Tags, tq.ScoreRank, tq.ScoreCategory, tq.AnswerViewRatio, tq.DaysSinceLastEdit, tq.UserPostSequence, tq.TotalUserPosts, tq.AvgUserScore, tq.PrevScore, tq.NextScore, tq.RankByScoreAndViews, tq.UserViewRank, tq.ViewRank, tq.AnswerStatus, tq.AcceptedAnswerId, tq.LastEditDate, tq.PostTypeId,
+    u.UserId, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.AccountId, u.TotalPosts, u.AvgPostScore, u.LastPostDate, u.UserPostTitles, u.UserPostTags, u.ActivityLevel, u.QuestionCount, u.TotalPosts_ForGroup, u.DisplayName,
+    ta.TagName, ta.Count, ta.ExcerptPostId, ta.WikiPostId, ta.PopularityLevel, ta.TagRank, ta.TagDensityRank, ta.TagQuartile,
+    a.AnswerId, a.ParentId, a.LastEditDate, a.Score, a.CreationDate, a.OwnerUserId, a.AnswerCount, a.CommentCount, a.FavoriteCount, a.PrevScore, a.NextScore, a.ScoreRank, a.ScoreCategory, a.AnswerRank, a.UserAnswerRank, a.IsBestAnswer
+ORDER BY tq.Score DESC, tq.ViewCount DESC
+LIMIT 100000 OFFSET 0;

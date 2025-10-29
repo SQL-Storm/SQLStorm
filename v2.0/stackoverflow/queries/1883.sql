@@ -1,0 +1,188 @@
+WITH UserActivity AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate,
+        U.LastAccessDate,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS UserUpVotesGiven,
+        U.DownVotes AS UserDownVotesGiven,
+        U.Location,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN P.AnswerCount ELSE 0 END) AS TotalAnswersToQuestionsOwned,
+        COALESCE(SUM(P.Score), 0) AS TotalPostScoreReceived,
+        COALESCE(SUM(P.ViewCount), 0) AS TotalPostViewCount,
+        MAX(P.LastActivityDate) AS LastPostActivity,
+        MAX(P.CreationDate) AS LatestPostCreation,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        MAX(C.CreationDate) AS LatestCommentCreation
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Views, U.UpVotes, U.DownVotes, U.Location
+),
+PostHistoricalMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        P.PostTypeId,
+        P.CreationDate AS PostCreationDate,
+        P.LastEditDate,
+        P.LastActivityDate,
+        P.Title,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.Tags,
+        P.AcceptedAnswerId,
+        COUNT(DISTINCT PH.Id) AS TotalHistoryEntries,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4,5,6) THEN 1 ELSE 0 END) AS MajorEditCount,
+        (EXTRACT(EPOCH FROM MIN(CASE WHEN PH.PostHistoryTypeId = 5 THEN PH.CreationDate END)) - EXTRACT(EPOCH FROM MIN(CASE WHEN PH.PostHistoryTypeId = 2 THEN PH.CreationDate END))) / 3600.0 AS InitialBodyEditDelayHours,
+        COALESCE(MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END), 0) AS IsClosedPostFlag,
+        COALESCE(MAX(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END), 0) AS IsReopenedPostFlag,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 5 THEN PH.Text END) AS LatestBodyEditText
+    FROM Posts P
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    GROUP BY P.Id, P.OwnerUserId, P.PostTypeId, P.CreationDate, P.LastEditDate, P.LastActivityDate, P.Title, P.Score, P.ViewCount, P.Tags, P.AcceptedAnswerId
+),
+UserBadgeSummary AS (
+    SELECT
+        B.UserId,
+        COUNT(B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(B.Date) AS LastBadgeAwardDate,
+        MIN(B.Date) AS FirstBadgeAwardDate,
+        RANK() OVER (ORDER BY SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) DESC, COUNT(B.Id) DESC) AS GoldBadgeRank
+    FROM Badges B
+    GROUP BY B.UserId
+),
+TopQuestionTags AS (
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        UNNEST(STRING_TO_ARRAY(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags) - 2), '><')) AS TagName
+    FROM Posts P
+    WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2
+),
+PopularTagStats AS (
+    SELECT
+        TQT.TagName,
+        COUNT(DISTINCT TQT.PostId) AS QuestionCountWithTag,
+        AVG(P.Score) AS AverageQuestionScoreForTag,
+        SUM(P.ViewCount) AS TotalQuestionViewCountForTag,
+        NTILE(4) OVER (ORDER BY COUNT(DISTINCT TQT.PostId) DESC) AS TagPopularityQuartile
+    FROM TopQuestionTags TQT
+    JOIN Posts P ON TQT.PostId = P.Id
+    GROUP BY TQT.TagName
+)
+SELECT
+    UA.UserId,
+    UA.DisplayName,
+    UA.Reputation,
+    UA.CreationDate,
+    UA.LastAccessDate,
+    UA.UserProfileViews,
+    UA.TotalPostsOwned,
+    UA.TotalQuestions,
+    UA.TotalAnswers,
+    UA.TotalPostScoreReceived,
+    UA.TotalPostViewCount,
+    UA.TotalCommentsMade,
+    UBS.TotalBadges,
+    UBS.GoldBadges,
+    UBS.SilverBadges,
+    UBS.BronzeBadges,
+    UBS.LastBadgeAwardDate,
+    UBS.GoldBadgeRank,
+    (SELECT AVG(PM_Correlated.PostScore)
+     FROM PostHistoricalMetrics PM_Correlated
+     WHERE PM_Correlated.OwnerUserId = UA.UserId
+       AND PM_Correlated.PostTypeId = 1
+       AND PM_Correlated.MajorEditCount > 0
+       AND PM_Correlated.PostCreationDate > (UA.CreationDate + INTERVAL '1 year')
+    ) AS AvgQuestionScoreAfterFirstYearWithEdits,
+    (SELECT PM_Sub.ViewCount
+     FROM PostHistoricalMetrics PM_Sub
+     WHERE PM_Sub.OwnerUserId = UA.UserId
+       AND PM_Sub.PostTypeId = 1
+       AND PM_Sub.MajorEditCount >= 3
+     ORDER BY PM_Sub.PostScore DESC, PM_Sub.ViewCount DESC
+     LIMIT 1
+    ) AS HighestViewedHighEditedQuestionViewCount,
+    CASE
+        WHEN UA.Reputation >= 10000 AND UBS.GoldBadges >= 5 THEN 'Guru Contributor'
+        WHEN UA.Reputation >= 5000 AND UA.TotalPostsOwned >= 100 THEN 'Active Expert'
+        WHEN UA.Reputation >= 1000 THEN 'Engaged User'
+        ELSE 'Casual User'
+    END AS UserCategory,
+    COALESCE(EXTRACT(YEAR FROM AGE(UA.LastAccessDate, UA.CreationDate)), 0) AS YearsActive,
+    SUBSTRING(UA.DisplayName, 1, 1) AS FirstInitial,
+    LOWER(UA.Location) LIKE '%london%' AS IsLondonBased,
+    NULLIF(UA.TotalAnswers, 0) AS AnswersIfAny,
+    COALESCE(UA.LatestPostCreation, UA.LatestCommentCreation, UA.LastAccessDate) AS LastActivityOverall,
+    AVG(CASE WHEN PHM.PostTypeId = 1 THEN PHM.PostScore END) FILTER (WHERE PHM.PostTypeId = 1) AS UserAvgQuestionScore,
+    LAG(UA.LastAccessDate, 1, UA.CreationDate) OVER (ORDER BY UA.LastAccessDate) AS PrevUserLastAccessDate,
+    STRING_AGG(P_TopTag.TagName, ', ') FILTER (WHERE PTS.TagPopularityQuartile <= 2) AS TopAssociatedTags,
+    SUM(CASE WHEN PHM.IsClosedPostFlag = 1 THEN 1 ELSE 0 END) AS TotalClosedPostsOwned,
+    SUM(CASE WHEN PHM.InitialBodyEditDelayHours IS NOT NULL AND PHM.InitialBodyEditDelayHours < 24 THEN 1 ELSE 0 END) AS PostsEditedQuicklyWithin24H,
+    (SELECT COUNT(DISTINCT PM_Link.PostId)
+     FROM PostLinks PM_Link
+     WHERE PM_Link.RelatedPostId IN (SELECT P_Owned.Id FROM Posts P_Owned WHERE P_Owned.OwnerUserId = UA.UserId AND P_Owned.PostTypeId = 1)
+       AND PM_Link.LinkTypeId = 3
+       AND PM_Link.CreationDate >= (UA.CreationDate + INTERVAL '6 months')
+       AND NOT EXISTS (SELECT 1 FROM Posts P_Closed WHERE P_Closed.Id = PM_Link.PostId AND P_Closed.ClosedDate IS NULL)
+    ) AS DuplicateReferencingClosedQuestionsCount
+FROM UserActivity UA
+LEFT JOIN UserBadgeSummary UBS ON UA.UserId = UBS.UserId
+LEFT JOIN PostHistoricalMetrics PHM ON UA.UserId = PHM.OwnerUserId
+LEFT JOIN TopQuestionTags P_TopTag ON PHM.PostId = P_TopTag.PostId AND PHM.PostTypeId = 1
+LEFT JOIN PopularTagStats PTS ON P_TopTag.TagName = PTS.TagName
+WHERE
+    UA.Reputation >= 500
+    AND UA.TotalPostsOwned > 5
+    AND UA.CreationDate >= DATE '2015-01-01'
+    AND UA.LastAccessDate >= DATE '2022-01-01'
+    AND (UA.Location IS NOT NULL AND UA.Location != '')
+    AND NOT EXISTS (
+        SELECT 1 FROM Comments C_Sub
+        WHERE C_Sub.UserId = UA.UserId
+        AND C_Sub.Text LIKE '%spam%'
+        AND C_Sub.CreationDate > (UA.LastAccessDate - INTERVAL '1 year')
+    )
+GROUP BY
+    UA.UserId,
+    UA.DisplayName,
+    UA.Reputation,
+    UA.CreationDate,
+    UA.LastAccessDate,
+    UA.UserProfileViews,
+    UA.TotalPostsOwned,
+    UA.TotalQuestions,
+    UA.TotalAnswers,
+    UA.TotalPostScoreReceived,
+    UA.TotalPostViewCount,
+    UA.TotalCommentsMade,
+    UBS.TotalBadges,
+    UBS.GoldBadges,
+    UBS.SilverBadges,
+    UBS.BronzeBadges,
+    UBS.LastBadgeAwardDate,
+    UBS.GoldBadgeRank,
+    UA.Location,
+    UA.LatestPostCreation,
+    UA.LatestCommentCreation,
+    LOWER(UA.Location),
+    UA.UserId, -- ensure grouped for joins/aggregates referenced
+    PHM.PostTypeId,
+    PHM.PostScore,
+    UA.CreationDate, -- included to ensure deterministic grouping for WINDOW default value
+    UA.LastAccessDate -- included for ORDER BY in LAG window
+HAVING
+    COUNT(DISTINCT CASE WHEN PHM.PostTypeId = 1 THEN PHM.PostId END) > 2
+ORDER BY
+    UA.Reputation DESC, TotalPostScoreReceived DESC
+LIMIT 1000;

@@ -1,0 +1,264 @@
+-- {"query": "7772.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2703} 
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        AVG(p.Score) as AvgPostScore,
+        MAX(p.CreationDate) as LatestPostDate,
+        STRING_AGG(DISTINCT p.PostTypeId::text, ',') as PostTypes,
+        (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = u.Id AND PostTypeId = 1) as QuestionCount,
+        (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = u.Id AND PostTypeId = 2) as AnswerCount,
+        (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = u.Id AND PostTypeId = 3) as WikiCount,
+        (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = u.Id AND PostTypeId = 4) as TagWikiExcerptCount,
+        (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = u.Id AND PostTypeId = 5) as TagWikiCount,
+        (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = u.Id AND PostTypeId = 6) as ModeratorNominationCount,
+        (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = u.Id AND PostTypeId = 7) as WikiPlaceholderCount,
+        (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = u.Id AND PostTypeId = 8) as PrivilegeWikiCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+RankedUsers AS (
+    SELECT 
+        *,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, PostCount DESC) as RankByReputation,
+        RANK() OVER (ORDER BY AVGPostScore DESC) as RankByAvgScore,
+        DENSE_RANK() OVER (ORDER BY BadgeCount DESC) as RankByBadges,
+        NTILE(10) OVER (ORDER BY Views DESC) as DecileByViews,
+        PERCENT_RANK() OVER (ORDER BY UpVotes DESC) as PercentileByUpVotes,
+        LAG(DisplayName) OVER (ORDER BY Reputation DESC) as PreviousReputationUser,
+        LEAD(DisplayName) OVER (ORDER BY Reputation DESC) as NextReputationUser,
+        FIRST_VALUE(DisplayName) OVER (ORDER BY Reputation DESC) as TopReputationUser,
+        LAST_VALUE(DisplayName) OVER (ORDER BY Reputation DESC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) as BottomReputationUser
+    FROM UserStats
+),
+PostMetrics AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.Tags,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            WHEN p.PostTypeId = 4 THEN 'Tag Wiki Excerpt'
+            WHEN p.PostTypeId = 5 THEN 'Tag Wiki'
+            WHEN p.PostTypeId = 6 THEN 'Moderator Nomination'
+            WHEN p.PostTypeId = 7 THEN 'Wiki Placeholder'
+            WHEN p.PostTypeId = 8 THEN 'Privilege Wiki'
+            ELSE 'Unknown'
+        END as PostTypeName,
+        COALESCE(p.Tags, '') as CleanTags,
+        STRING_SPLIT(p.Tags, '>') as TagArray,
+        (SELECT COUNT(*) FROM Comments WHERE PostId = p.Id) as CommentCountActual,
+        (SELECT COUNT(*) FROM Votes WHERE PostId = p.Id AND VoteTypeId = 2) as UpVoteCount,
+        (SELECT COUNT(*) FROM Votes WHERE PostId = p.Id AND VoteTypeId = 3) as DownVoteCount,
+        (SELECT COUNT(*) FROM Votes WHERE PostId = p.Id AND VoteTypeId = 5) as FavoriteCountActual,
+        (SELECT COUNT(*) FROM Votes WHERE PostId = p.Id AND VoteTypeId IN (8, 9)) as BountyCount,
+        (SELECT COUNT(*) FROM PostHistory WHERE PostId = p.Id AND PostHistoryTypeId IN (10, 11, 12, 13)) as ActivityCount,
+        (SELECT COUNT(*) FROM PostHistory WHERE PostId = p.Id AND PostHistoryTypeId = 1) as TitleEditCount,
+        (SELECT COUNT(*) FROM PostHistory WHERE PostId = p.Id AND PostHistoryTypeId = 2) as BodyEditCount,
+        (SELECT COUNT(*) FROM PostHistory WHERE PostId = p.Id AND PostHistoryTypeId = 3) as TagEditCount,
+        (SELECT COUNT(*) FROM PostHistory WHERE PostId = p.Id AND PostHistoryTypeId = 14) as LockCount,
+        (SELECT COUNT(*) FROM PostHistory WHERE PostId = p.Id AND PostHistoryTypeId = 15) as UnlockCount,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) as RankByScoreByType,
+        RANK() OVER (ORDER BY p.ViewCount DESC) as RankByViews,
+        DENSE_RANK() OVER (ORDER BY p.CreationDate DESC) as RankByCreationDate,
+        NTILE(4) OVER (ORDER BY p.Score DESC) as QuartileByScore,
+        PERCENT_RANK() OVER (ORDER BY p.ViewCount DESC) as PercentileByViews,
+        AVG(Score) OVER (PARTITION BY p.PostTypeId) as AvgScoreByType,
+        MAX(CreationDate) OVER (PARTITION BY p.PostTypeId) as LatestByType,
+        LAG(p.Title) OVER (ORDER BY p.CreationDate) as PreviousTitle,
+        LEAD(p.Title) OVER (ORDER BY p.CreationDate) as NextTitle,
+        FIRST_VALUE(p.Title) OVER (ORDER BY p.CreationDate) as OldestTitle,
+        LAST_VALUE(p.Title) OVER (ORDER BY p.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) as NewestTitle
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2, 3, 4, 5)
+),
+ComplexQueryResults AS (
+    SELECT 
+        'User Analysis' as AnalysisType,
+        NULL as PostId,
+        NULL as PostTitle,
+        NULL as Score,
+        NULL as ViewCount,
+        NULL as CreationDate,
+        NULL as OwnerUserId,
+        NULL as PostTypeName,
+        COUNT(*) as RecordCount,
+        STRING_AGG(DisplayName, ', ') as AnalysisSummary,
+        MAX(Reputation) as MaxReputation,
+        MIN(Reputation) as MinReputation,
+        AVG(Reputation) as AvgReputation,
+        COUNT(DISTINCT PostCount) as UniquePosts,
+        SUM(BadgeCount) as TotalBadges,
+        AVG(AvgPostScore) as AvgAvgPostScore,
+        STRING_AGG(CAST(RankByReputation AS VARCHAR), ', ') as ReputationRanks
+    FROM RankedUsers
+    
+    UNION ALL
+    
+    SELECT 
+        'Post Analysis' as AnalysisType,
+        PostId,
+        Title,
+        Score,
+        ViewCount,
+        CreationDate,
+        OwnerUserId,
+        PostTypeName,
+        1 as RecordCount,
+        NULL as AnalysisSummary,
+        NULL as MaxReputation,
+        NULL as MinReputation,
+        NULL as AvgReputation,
+        NULL as UniquePosts,
+        NULL as TotalBadges,
+        NULL as AvgAvgPostScore,
+        NULL as ReputationRanks
+    FROM PostMetrics
+    WHERE PostTypeId IN (1, 2)
+    
+    UNION ALL
+    
+    SELECT 
+        'Tag Analysis' as AnalysisType,
+        NULL as PostId,
+        NULL as PostTitle,
+        NULL as Score,
+        NULL as ViewCount,
+        NULL as CreationDate,
+        NULL as OwnerUserId,
+        NULL as PostTypeName,
+        COUNT(*) as RecordCount,
+        STRING_AGG(CAST(TagName AS VARCHAR), ', ') as AnalysisSummary,
+        NULL as MaxReputation,
+        NULL as MinReputation,
+        NULL as AvgReputation,
+        NULL as UniquePosts,
+        NULL as TotalBadges,
+        NULL as AvgAvgPostScore,
+        NULL as ReputationRanks
+    FROM Tags
+    WHERE Count > 10
+    
+    UNION ALL
+    
+    SELECT 
+        'Activity Analysis' as AnalysisType,
+        NULL as PostId,
+        NULL as PostTitle,
+        NULL as Score,
+        NULL as ViewCount,
+        NULL as CreationDate,
+        NULL as OwnerUserId,
+        NULL as PostTypeName,
+        COUNT(*) as RecordCount,
+        STRING_AGG(CAST(CommentCountActual AS VARCHAR), ', ') as AnalysisSummary,
+        NULL as MaxReputation,
+        NULL as MinReputation,
+        NULL as AvgReputation,
+        NULL as UniquePosts,
+        NULL as TotalBadges,
+        NULL as AvgAvgPostScore,
+        NULL as ReputationRanks
+    FROM PostMetrics
+    WHERE CommentCountActual > 50
+    
+    UNION ALL
+    
+    SELECT 
+        'Moderation Analysis' as AnalysisType,
+        NULL as PostId,
+        NULL as PostTitle,
+        Score,
+        ViewCount,
+        CreationDate,
+        OwnerUserId,
+        PostTypeName,
+        1 as RecordCount,
+        NULL as AnalysisSummary,
+        NULL as MaxReputation,
+        NULL as MinReputation,
+        NULL as AvgReputation,
+        NULL as UniquePosts,
+        NULL as TotalBadges,
+        NULL as AvgAvgPostScore,
+        NULL as ReputationRanks
+    FROM PostMetrics
+    WHERE LockCount > 0 OR UnlockCount > 0
+)
+SELECT 
+    AnalysisType,
+    COUNT(*) as ResultCount,
+    SUM(RecordCount) as TotalRecords,
+    MAX(CAST(MaxReputation AS BIGINT)) as MaxReputation,
+    MIN(CAST(MinReputation AS BIGINT)) as MinReputation,
+    AVG(CAST(AvgReputation AS DECIMAL(10,2))) as AvgReputation,
+    STRING_AGG(DISTINCT CASE WHEN AnalysisSummary IS NOT NULL THEN AnalysisSummary ELSE 'N/A' END, ' | ') as SummaryInfo,
+    STRING_AGG(DISTINCT CAST(PostId AS VARCHAR), ', ') as PostIds,
+    STRING_AGG(DISTINCT CAST(OwnerUserId AS VARCHAR), ', ') as UserIds,
+    STRING_AGG(DISTINCT PostTypeName, ', ') as PostTypes,
+    STRING_AGG(DISTINCT CAST(Score AS VARCHAR), ', ') as Scores,
+    STRING_AGG(DISTINCT CAST(ViewCount AS VARCHAR), ', ') as ViewCounts
+FROM ComplexQueryResults
+WHERE AnalysisType IN ('User Analysis', 'Post Analysis', 'Tag Analysis', 'Activity Analysis', 'Moderation Analysis')
+GROUP BY AnalysisType
+HAVING COUNT(*) > 0
+ORDER BY CASE 
+    WHEN AnalysisType = 'User Analysis' THEN 1
+    WHEN AnalysisType = 'Post Analysis' THEN 2
+    WHEN AnalysisType = 'Tag Analysis' THEN 3
+    WHEN AnalysisType = 'Activity Analysis' THEN 4
+    WHEN AnalysisType = 'Moderation Analysis' THEN 5
+    ELSE 6
+END
+UNION ALL
+SELECT 
+    'Final Analysis' as AnalysisType,
+    COUNT(*) as ResultCount,
+    SUM(RecordCount) as TotalRecords,
+    MAX(CAST(MaxReputation AS BIGINT)) as MaxReputation,
+    MIN(CAST(MinReputation AS BIGINT)) as MinReputation,
+    AVG(CAST(AvgReputation AS DECIMAL(10,2))) as AvgReputation,
+    STRING_AGG(DISTINCT CASE WHEN AnalysisSummary IS NOT NULL THEN AnalysisSummary ELSE 'N/A' END, ' | ') as SummaryInfo,
+    STRING_AGG(DISTINCT CAST(PostId AS VARCHAR), ', ') as PostIds,
+    STRING_AGG(DISTINCT CAST(OwnerUserId AS VARCHAR), ', ') as UserIds,
+    STRING_AGG(DISTINCT PostTypeName, ', ') as PostTypes,
+    STRING_AGG(DISTINCT CAST(Score AS VARCHAR), ', ') as Scores,
+    STRING_AGG(DISTINCT CAST(ViewCount AS VARCHAR), ', ') as ViewCounts
+FROM (
+    SELECT 
+        AnalysisType,
+        RecordCount,
+        MaxReputation,
+        MinReputation,
+        AvgReputation,
+        AnalysisSummary,
+        PostId,
+        OwnerUserId,
+        PostTypeName,
+        Score,
+        ViewCount
+    FROM ComplexQueryResults
+    WHERE AnalysisType IN ('User Analysis', 'Post Analysis', 'Tag Analysis', 'Activity Analysis', 'Moderation Analysis')
+) FinalResult
+ORDER BY ResultCount DESC
+LIMIT 1000;

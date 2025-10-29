@@ -1,0 +1,133 @@
+-- {"query": "3883.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1655} 
+WITH 
+-- 1. Basic post aggregates per user (questions + answers)
+user_posts AS (
+    SELECT 
+        u.Id                                   AS user_id,
+        u.DisplayName                          AS user_name,
+        COALESCE(u.Reputation,0)               AS reputation,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS questions_cnt,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS answers_cnt,
+        SUM(p.Score) FILTER (WHERE p.PostTypeId = 1) AS questions_score_sum,
+        SUM(p.Score) FILTER (WHERE p.PostTypeId = 2) AS answers_score_sum,
+        MAX(p.CreationDate)                   AS last_post_date
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+-- 2. Badge summary per user (gold/silver/bronze with tag‑based flag)
+user_badges AS (
+    SELECT 
+        b.UserId                                   AS user_id,
+        COUNT(*) FILTER (WHERE b.Class = 1)        AS gold_cnt,
+        COUNT(*) FILTER (WHERE b.Class = 2)        AS silver_cnt,
+        COUNT(*) FILTER (WHERE b.Class = 3)        AS bronze_cnt,
+        COUNT(*) FILTER (WHERE b.TagBased = 1)    AS tag_based_cnt,
+        MAX(b.Date)                               AS latest_badge_date
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+-- 3. Recent voting activity (last 30 days) per post with window ranking
+recent_votes AS (
+    SELECT 
+        v.PostId,
+        v.VoteTypeId,
+        v.UserId,
+        v.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY v.PostId ORDER BY v.CreationDate DESC) AS vote_rank
+    FROM Votes v
+    WHERE v.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+),
+
+-- 4. Top voted posts per user (upvotes only) using the windowed recent_votes CTE
+top_voted_posts AS (
+    SELECT 
+        p.OwnerUserId                         AS user_id,
+        p.Id                                   AS post_id,
+        p.Title                                AS post_title,
+        COUNT(rv.Id) FILTER (WHERE rv.VoteTypeId = 2) AS upvote_cnt,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY COUNT(rv.Id) FILTER (WHERE rv.VoteTypeId = 2) DESC) AS rn
+    FROM Posts p
+    LEFT JOIN recent_votes rv ON rv.PostId = p.Id AND rv.VoteTypeId = 2
+    WHERE p.PostTypeId IN (1,2)               -- only questions & answers
+    GROUP BY p.OwnerUserId, p.Id, p.Title
+),
+
+-- 5. Tag popularity derived from Posts.Tags (extract individual tags)
+post_tags AS (
+    SELECT 
+        p.Id                                 AS post_id,
+        UNNEST(STRING_TO_ARRAY(
+            TRIM(BOTH '<>' FROM COALESCE(p.Tags,'')),
+            '><'))::varchar(35)               AS tag_name
+    FROM Posts p
+    WHERE p.PostTypeId = 1                     -- only questions have tags
+),
+
+tag_popularity AS (
+    SELECT 
+        t.tag_name,
+        COUNT(*) AS tag_usage_cnt,
+        SUM(p.Score) AS total_score,
+        MAX(p.CreationDate) AS latest_used
+    FROM post_tags t
+    JOIN Posts p ON p.Id = t.post_id
+    GROUP BY t.tag_name
+),
+
+-- 6. Users with no posts (to test outer join handling)
+users_without_posts AS (
+    SELECT u.Id AS user_id, u.DisplayName AS user_name
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    WHERE p.Id IS NULL
+),
+
+-- 7. Union of active and inactive users for benchmarking set operator performance
+all_users AS (
+    SELECT up.user_id, up.user_name, 'active'   AS status FROM user_posts up
+    UNION ALL
+    SELECT uwp.user_id, uwp.user_name, 'inactive' AS status FROM users_without_posts uwp
+)
+
+SELECT 
+    au.user_id,
+    au.user_name,
+    up.reputation,
+    up.questions_cnt,
+    up.answers_cnt,
+    COALESCE(up.questions_score_sum,0) + COALESCE(up.answers_score_sum,0) AS total_score,
+    ub.gold_cnt,
+    ub.silver_cnt,
+    ub.bronze_cnt,
+    ub.tag_based_cnt,
+    tvp.post_title,
+    tvp.upvote_cnt,
+    tp.tag_name,
+    tp.tag_usage_cnt,
+    tp.total_score AS tag_total_score,
+    CASE 
+        WHEN up.last_post_date IS NULL THEN 'Never posted'
+        WHEN up.last_post_date < cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year' THEN 'Stale'
+        ELSE 'Active'
+    END AS activity_status,
+    au.status
+FROM all_users au
+LEFT JOIN user_posts up      ON up.user_id = au.user_id
+LEFT JOIN user_badges ub     ON ub.user_id = au.user_id
+LEFT JOIN top_voted_posts tvp 
+       ON tvp.user_id = au.user_id AND tvp.rn = 1               -- best post per user
+LEFT JOIN LATERAL (
+    SELECT pt.tag_name
+    FROM post_tags pt
+    JOIN Posts p ON p.Id = pt.post_id
+    WHERE p.OwnerUserId = au.user_id
+    ORDER BY p.Score DESC NULLS LAST
+    LIMIT 1
+) tp ON true
+ORDER BY 
+    COALESCE(up.reputation,0) DESC,
+    up.questions_cnt DESC NULLS LAST,
+    up.answers_cnt DESC NULLS LAST;

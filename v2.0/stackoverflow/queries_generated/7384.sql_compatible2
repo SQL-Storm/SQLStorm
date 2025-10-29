@@ -1,0 +1,365 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.CreationDate,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COUNT(DISTINCT v.Id) as VoteCount,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        MAX(p.CreationDate) as LastPostDate,
+        RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) as PostRank,
+        ROW_NUMBER() OVER (PARTITION BY u.Reputation ORDER BY u.CreationDate) as ReputationRowNum,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) as ReputationRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.CreationDate
+    HAVING COUNT(DISTINCT p.Id) > 0
+),
+TopPosts AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.AcceptedAnswerId,
+        RANK() OVER (ORDER BY p.Score DESC) as ScoreRank,
+        DENSE_RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) as TypeScoreRank,
+        PERCENT_RANK() OVER (ORDER BY p.Score) as ScorePercentile,
+        NTILE(100) OVER (ORDER BY p.Score) as ScoreQuintile,
+        LAG(p.Score, 1) OVER (ORDER BY p.Score DESC) as PrevScore,
+        LEAD(p.Score, 1) OVER (ORDER BY p.Score DESC) as NextScore,
+        AVG(p.Score) OVER (ORDER BY p.CreationDate ROWS BETWEEN 30 PRECEDING AND CURRENT ROW) as MovingAvgScore,
+        STRING_AGG(p.Tags, ' | ') OVER (ORDER BY p.Score DESC ROWS BETWEEN 100 PRECEDING AND CURRENT ROW) as RecentTags,
+        CASE 
+            WHEN p.Score >= 100 THEN 'HighlyVoted'
+            WHEN p.Score >= 50 THEN 'HighVoted'
+            WHEN p.Score >= 10 THEN 'MediumVoted'
+            ELSE 'LowVoted'
+        END as VoteCategory,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 
+                COALESCE(
+                    (SELECT COUNT(*) FROM Posts WHERE ParentId = p.Id), 
+                    0
+                )
+            ELSE 0 
+        END as AnswerCountForQuestion
+    FROM Posts p
+    WHERE p.Score IS NOT NULL AND p.PostTypeId IN (1, 2)
+),
+UserActivity AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        p.OwnerUserId,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 
+                COALESCE(
+                    (SELECT MIN(v.CreationDate) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2),
+                    TIMESTAMP '1900-01-01 00:00:00'
+                )
+            ELSE 
+                COALESCE(p.CreationDate, TIMESTAMP '1900-01-01 00:00:00')
+        END as FirstUpvoteTime,
+        COALESCE(
+            (SELECT MAX(v.CreationDate) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2),
+            TIMESTAMP '1900-01-01 00:00:00'
+        ) as LastUpvoteTime,
+        CAST(EXTRACT(EPOCH FROM (COALESCE(
+            (SELECT MAX(v.CreationDate) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2),
+            p.CreationDate
+        ) - p.CreationDate)) / 86400 AS INTEGER) as DaysToFirstUpvote,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 
+                (SELECT COUNT(DISTINCT v.Id) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) 
+            ELSE 0
+        END as UpvoteCount,
+        CASE 
+            WHEN p.PostTypeId = 2 THEN 
+                (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 6) 
+            ELSE 0
+        END as CloseCount,
+        p.Score > (SELECT AVG(p2.Score) FROM Posts p2 WHERE p2.PostTypeId = 1 AND p2.OwnerUserId = p.OwnerUserId) 
+            AS AboveAvgScore,
+        p.OwnerUserId IN (
+            SELECT Id FROM Users 
+            WHERE Reputation > (SELECT AVG(Reputation) FROM Users) * 2
+        ) AS HighReputationOwner
+    FROM Users u
+    INNER JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE p.Score IS NOT NULL
+),
+CombinedAnalytics AS (
+    SELECT 
+        us.UserId,
+        us.Reputation,
+        us.DisplayName,
+        us.PostCount,
+        us.QuestionCount,
+        us.AnswerCount,
+        us.BadgeCount,
+        us.VoteCount,
+        us.TotalScore,
+        us.LastPostDate,
+        us.PostRank,
+        us.ReputationRowNum,
+        us.ReputationRank,
+        tp.PostId,
+        tp.Title,
+        tp.Score as PostScore,
+        tp.ViewCount,
+        tp.CreationDate as PostCreationDate,
+        tp.PostTypeId,
+        tp.Tags,
+        tp.AnswerCount as PostAnswerCount,
+        tp.CommentCount,
+        tp.FavoriteCount,
+        tp.ScoreRank,
+        tp.TypeScoreRank,
+        tp.ScorePercentile,
+        tp.ScoreQuintile,
+        tp.PrevScore,
+        tp.NextScore,
+        tp.MovingAvgScore,
+        tp.RecentTags,
+        tp.VoteCategory,
+        tp.AnswerCountForQuestion,
+        ua.FirstUpvoteTime,
+        ua.LastUpvoteTime,
+        ua.DaysToFirstUpvote,
+        ua.UpvoteCount,
+        ua.CloseCount,
+        ua.AboveAvgScore,
+        ua.HighReputationOwner,
+        ROW_NUMBER() OVER (PARTITION BY us.UserId ORDER BY tp.Score DESC) as UserPostRank,
+        ROW_NUMBER() OVER (ORDER BY tp.Score DESC) as GlobalPostRank,
+        CASE 
+            WHEN us.PostCount > 100 AND us.QuestionCount > 10 THEN 'ActiveContributor'
+            WHEN us.BadgeCount > 10 THEN 'BadgeMaster'
+            WHEN us.TotalScore > 10000 THEN 'HighScorer'
+            ELSE 'RegularUser'
+        END as UserCategory
+    FROM UserStats us
+    INNER JOIN TopPosts tp ON us.UserId = tp.OwnerUserId OR (tp.OwnerUserId IS NULL AND us.UserId = 1)
+    LEFT JOIN UserActivity ua ON us.UserId = ua.UserId AND tp.PostId = ua.PostId
+),
+QualityScoredPosts AS (
+    SELECT 
+        ap.PostId,
+        ap.Title,
+        ap.PostScore,
+        ap.ViewCount,
+        ap.PostTypeId,
+        ap.Tags,
+        ap.ScoreRank,
+        ap.TypeScoreRank,
+        ap.ScorePercentile,
+        ap.ScoreQuintile,
+        ap.MovingAvgScore,
+        ap.RecentTags,
+        ap.VoteCategory,
+        ap.UserCategory,
+        ap.PostAnswerCount,
+        ap.AnswerCountForQuestion,
+        ap.UpvoteCount,
+        ap.CloseCount,
+        ap.AboveAvgScore,
+        ap.HighReputationOwner,
+        ap.PostCreationDate,
+        CAST(EXTRACT(EPOCH FROM (ap.PostCreationDate - TIMESTAMP '2008-01-01 00:00:00')) / 86400 AS INTEGER) as DaysSinceStart,
+        CASE 
+            WHEN ap.PostScore > 100 AND ap.ViewCount > 1000 THEN 'Popular'
+            WHEN ap.PostScore > 50 AND ap.ViewCount > 500 THEN 'Notable'
+            WHEN ap.PostScore > 10 THEN 'Standard'
+            ELSE 'Basic'
+        END as PostQuality,
+        ROW_NUMBER() OVER (PARTITION BY ap.PostTypeId ORDER BY ap.ScoreRank) as TypeRank,
+        COUNT(*) OVER (PARTITION BY ap.PostTypeId) as TotalPostsOfType,
+        AVG(ap.PostScore) OVER (PARTITION BY ap.PostTypeId) as AvgScoreByType,
+        (SELECT COUNT(*) FROM Posts p2 WHERE p2.PostTypeId = ap.PostTypeId AND p2.CreationDate > ap.PostCreationDate) as PostsAfterThis,
+        (SELECT COUNT(*) FROM Posts p3 WHERE p3.PostTypeId = ap.PostTypeId AND p3.CreationDate < ap.PostCreationDate) as PostsBeforeThis,
+        STRING_AGG(ap.Tags, ', ') WITHIN GROUP (ORDER BY ap.PostScore DESC) OVER (PARTITION BY ap.PostTypeId ORDER BY ap.ScoreRank ROWS BETWEEN 5 PRECEDING AND 5 FOLLOWING) as TagCluster,
+        CASE 
+            WHEN ap.PostScore > (SELECT AVG(PostScore) FROM CombinedAnalytics) THEN 1 
+            ELSE 0 
+        END as AboveGlobalAvg,
+        COALESCE(
+            (SELECT COUNT(*) FROM Comments c WHERE c.PostId = ap.PostId),
+            0
+        ) as CommentCountForPost,
+        CASE 
+            WHEN ap.TagCluster LIKE '%sql%' OR ap.TagCluster LIKE '%database%' THEN 'DatabaseRelated'
+            WHEN ap.TagCluster LIKE '%java%' OR ap.TagCluster LIKE '%spring%' THEN 'JavaRelated'
+            ELSE 'Other'
+        END as TopicCategory
+    FROM CombinedAnalytics ap
+)
+SELECT 
+    qs.PostId,
+    qs.Title,
+    qs.PostScore,
+    qs.ViewCount,
+    qs.PostTypeId,
+    qs.Tags,
+    qs.ScoreRank,
+    qs.TypeScoreRank,
+    qs.ScorePercentile,
+    qs.ScoreQuintile,
+    qs.MovingAvgScore,
+    qs.RecentTags,
+    qs.VoteCategory,
+    qs.PostQuality,
+    qs.TypeRank,
+    qs.TotalPostsOfType,
+    qs.AvgScoreByType,
+    qs.PostAnswerCount,
+    qs.AnswerCountForQuestion,
+    qs.UpvoteCount,
+    qs.CloseCount,
+    qs.AboveAvgScore,
+    qs.HighReputationOwner,
+    qs.PostCreationDate,
+    qs.DaysSinceStart,
+    qs.PostsAfterThis,
+    qs.PostsBeforeThis,
+    qs.TagCluster,
+    qs.AboveGlobalAvg,
+    qs.CommentCountForPost,
+    qs.TopicCategory,
+    CASE 
+        WHEN qs.PostScore > 10000 OR (qs.PostScore > 1000 AND qs.ViewCount > 100000) THEN 'Viral'
+        WHEN qs.PostScore > 500 OR (qs.PostScore > 100 AND qs.ViewCount > 50000) THEN 'Popular'
+        WHEN qs.PostScore > 100 OR (qs.PostScore > 50 AND qs.ViewCount > 10000) THEN 'Notable'
+        ELSE 'Regular'
+    END as ViralScore,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.OwnerUserId = 1 
+        AND p.PostTypeId = qs.PostTypeId
+        AND p.CreationDate >= qs.PostCreationDate
+        AND p.CreationDate <= qs.PostCreationDate + INTERVAL '7 days'
+    ) as WeeklyPostsCount,
+    COALESCE(
+        (SELECT p2.Title 
+         FROM Posts p2 
+         WHERE p2.ParentId = qs.PostId 
+         AND p2.PostTypeId = 2 
+         ORDER BY p2.Score DESC
+         LIMIT 1),
+        'No Answers'
+    ) as TopScoringAnswer,
+    COALESCE(
+        (SELECT COUNT(*) 
+         FROM Posts p3 
+         WHERE p3.ParentId = qs.PostId 
+         AND p3.PostTypeId = 2),
+        0
+    ) as AnswerCountForThisPost,
+    COALESCE(
+        (SELECT AVG(p4.Score) 
+         FROM Posts p4 
+         WHERE p4.ParentId = qs.PostId 
+         AND p4.PostTypeId = 2),
+        0
+    ) as AvgAnswerScore,
+    (qs.TagCluster || ' | ' || qs.TopicCategory || ' | ' || qs.PostQuality) as CombinedTagInfo,
+    CASE 
+        WHEN qs.ScoreRank <= 10 THEN 'Top10'
+        WHEN qs.ScoreRank <= 100 THEN 'Top100'
+        WHEN qs.ScoreRank <= 1000 THEN 'Top1000'
+        ELSE 'Other'
+    END as ScoreTier,
+    qs.PostScore + qs.ViewCount + qs.AnswerCountForQuestion + qs.UpvoteCount as CombinedMetric,
+    CASE
+        WHEN qs.ScorePercentile > 0.95 AND qs.PostScore > 1000 THEN qs.ScorePercentile * 10000
+        ELSE qs.ScorePercentile * 100
+    END as WeightedScore,
+    CASE 
+        WHEN qs.PostScore > (SELECT AVG(PostScore) FROM QualityScoredPosts) 
+        AND qs.ViewCount > (SELECT AVG(ViewCount) FROM QualityScoredPosts)
+        AND qs.AnswerCountForQuestion > 2 
+        THEN 'HighImpact'
+        ELSE 'Standard'
+    END as ImpactLevel,
+    (qs.ScoreRank * qs.ViewCount / (1 + qs.AnswerCountForQuestion)) as EngagementMultiplier,
+    LAG(qs.PostScore, 1, 0) OVER (ORDER BY qs.PostScore DESC) - qs.PostScore as ScoreDiff,
+    COALESCE(
+        (SELECT MIN(p5.Score) 
+         FROM Posts p5 
+         WHERE p5.PostTypeId = qs.PostTypeId
+         AND p5.Score > qs.PostScore),
+        0
+    ) as NextHigherScore,
+    COALESCE(
+        (SELECT MAX(p6.Score) 
+         FROM Posts p6 
+         WHERE p6.PostTypeId = qs.PostTypeId
+         AND p6.Score < qs.PostScore),
+        0
+    ) as NextLowerScore
+FROM QualityScoredPosts qs
+WHERE qs.PostScore > 0
+AND qs.PostAnswerCount >= 0
+AND qs.ViewCount >= 0
+AND qs.PostTypeId IN (1, 2)
+GROUP BY 
+    qs.PostId, 
+    qs.Title, 
+    qs.PostScore, 
+    qs.ViewCount, 
+    qs.PostTypeId, 
+    qs.Tags, 
+    qs.ScoreRank, 
+    qs.TypeScoreRank, 
+    qs.ScorePercentile, 
+    qs.ScoreQuintile, 
+    qs.MovingAvgScore, 
+    qs.RecentTags, 
+    qs.VoteCategory, 
+    qs.PostQuality, 
+    qs.TypeRank, 
+    qs.TotalPostsOfType, 
+    qs.AvgScoreByType, 
+    qs.PostAnswerCount, 
+    qs.AnswerCountForQuestion, 
+    qs.UpvoteCount, 
+    qs.CloseCount, 
+    qs.AboveAvgScore, 
+    qs.HighReputationOwner, 
+    qs.PostCreationDate, 
+    qs.DaysSinceStart, 
+    qs.PostsAfterThis, 
+    qs.PostsBeforeThis, 
+    qs.TagCluster, 
+    qs.AboveGlobalAvg, 
+    qs.CommentCountForPost, 
+    qs.TopicCategory
+HAVING 
+    COUNT(qs.PostId) >= 1
+    AND AVG(qs.PostScore) > 0
+ORDER BY 
+    qs.PostScore DESC,
+    qs.ViewCount DESC
+LIMIT 1000 OFFSET 0;

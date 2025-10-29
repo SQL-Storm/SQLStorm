@@ -1,0 +1,174 @@
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.Views AS UserViews,
+        U.UpVotes AS UserUpVotes,
+        U.DownVotes AS UserDownVotes,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsAsked,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersProvided,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(P.Score) AS TotalPostScore,
+        AVG(P.ViewCount) AS AvgPostViewCount,
+        (U.Reputation * 0.5) + (U.UpVotes * 0.2) - (U.DownVotes * 0.1) + (COUNT(DISTINCT P.Id) * 5) + (COUNT(DISTINCT C.Id) * 1) AS EngagementScore,
+        NTILE(5) OVER (ORDER BY U.Reputation DESC, U.UpVotes DESC) AS ReputationTier,
+        CAST(U.UpVotes AS NUMERIC) / NULLIF((U.UpVotes + U.DownVotes), 0) AS UpvoteRatio
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.Views, U.UpVotes, U.DownVotes,
+        U.CreationDate, U.LastAccessDate
+    HAVING COUNT(DISTINCT P.Id) > 0 OR COUNT(DISTINCT C.Id) > 0
+),
+PostContentAnalysis AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount AS PostViewCount,
+        P.AnswerCount,
+        P.CommentCount AS PostCommentCount,
+        P.FavoriteCount,
+        P.ClosedDate,
+        P.Title,
+        P.Body,
+        P.Tags,
+        LENGTH(P.Body) AS BodyLength,
+        LENGTH(P.Title) AS TitleLength,
+        (COALESCE(P.AnswerCount, 0) * 10) + (P.Score * 5) + (COALESCE(P.FavoriteCount, 0) * 2) + (COALESCE(P.ViewCount, 0) / 100.0) AS PostPopularityScore,
+        NULLIF(SUBSTRING(P.Tags FROM 2 FOR (POSITION('><' IN P.Tags) - 2)), '') AS PrimaryTag,
+        (CASE WHEN LOWER(P.Title) LIKE '%problem%' OR LOWER(P.Title) LIKE '%error%' OR LOWER(P.Title) LIKE '%bug%' OR LOWER(P.Title) LIKE '%help%' THEN TRUE ELSE FALSE END) AS IsProblematicTitle,
+        COUNT(DISTINCT PH.UserId) AS DistinctEditorCount,
+        MAX(PH.CreationDate) AS LastEditHistoryDate
+    FROM Posts P
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId AND PH.PostHistoryTypeId IN (4, 5, 6, 8, 9)
+    WHERE P.PostTypeId IN (1, 2)
+    GROUP BY
+        P.Id, P.PostTypeId, P.OwnerUserId, P.CreationDate, P.Score, P.ViewCount,
+        P.AnswerCount, P.CommentCount, P.FavoriteCount, P.ClosedDate, P.Title, P.Body, P.Tags
+),
+PostActivityTimelines AS (
+    SELECT
+        PH.PostId,
+        MIN(PH.CreationDate) AS FirstHistoryEntry,
+        MAX(PH.CreationDate) AS LastHistoryEntry,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenCount,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.CreationDate ELSE NULL END) AS LastClosedDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 11 THEN PH.CreationDate ELSE NULL END) AS LastReopenedDate,
+        MAX(PH.CreationDate) AS MaxCreationDateForLifespan,
+        MIN(PH.CreationDate) AS MinCreationDateForLifespan
+    FROM PostHistory PH
+    GROUP BY PH.PostId
+),
+QuestionAnswerChains AS (
+    SELECT
+        Q.Id AS QuestionId,
+        Q.Title AS QuestionTitle,
+        Q.OwnerUserId AS QuestionOwnerId,
+        Q.CreationDate AS QuestionCreationDate,
+        Q.Score AS QuestionScore,
+        A.Id AS AnswerId,
+        A.OwnerUserId AS AnswerOwnerId,
+        A.CreationDate AS AnswerCreationDate,
+        A.Score AS AnswerScore,
+        A.AcceptedAnswerId,
+        (SELECT COUNT(DISTINCT B_corr.Id) FROM Badges B_corr WHERE B_corr.UserId = Q.OwnerUserId AND B_corr.Date < Q.CreationDate) AS QuestionOwnerBadgesBeforePost,
+        (SELECT COUNT(DISTINCT B_corr.Id) FROM Badges B_corr WHERE B_corr.UserId = A.OwnerUserId AND B_corr.Date < A.CreationDate) AS AnswerOwnerBadgesBeforePost,
+        ROW_NUMBER() OVER (PARTITION BY Q.Id ORDER BY A.Score DESC, A.CreationDate ASC) AS AnswerRankByScore,
+        AGE(A.CreationDate, Q.CreationDate) AS TimeToAnswer
+    FROM Posts Q
+    INNER JOIN Posts A ON Q.Id = A.ParentId
+    WHERE Q.PostTypeId = 1 AND A.PostTypeId = 2
+),
+DuplicateLinkAnalysis AS (
+    SELECT
+        PL.PostId,
+        COUNT(PL.RelatedPostId) AS DuplicateCount,
+        STRING_AGG(CAST(PL.RelatedPostId AS VARCHAR), ', ' ORDER BY PL.RelatedPostId) AS RelatedDuplicatePostIds,
+        MAX(PL.CreationDate) AS LastDuplicateLinkDate
+    FROM PostLinks PL
+    WHERE PL.LinkTypeId = 3
+    GROUP BY PL.PostId
+)
+SELECT
+    UAS.UserId,
+    UAS.DisplayName,
+    UAS.Reputation,
+    UAS.EngagementScore,
+    UAS.ReputationTier,
+    UAS.UpvoteRatio,
+    PCA.PostId,
+    PCA.PostTypeId,
+    PCA.Title,
+    PCA.PostScore,
+    PCA.PostViewCount,
+    PCA.AnswerCount,
+    PCA.PostCommentCount,
+    PCA.PrimaryTag,
+    PCA.IsProblematicTitle,
+    PCA.BodyLength,
+    PCA.DistinctEditorCount,
+    PT.EditCount AS PostHistoryEditCount,
+    PT.CloseCount,
+    PT.ReopenCount,
+    PT.LastClosedDate,
+    PT.LastReopenedDate,
+    QA.QuestionId,
+    QA.QuestionTitle,
+    QA.AnswerId,
+    QA.AnswerScore,
+    QA.AnswerRankByScore,
+    QA.QuestionOwnerBadgesBeforePost,
+    QA.AnswerOwnerBadgesBeforePost,
+    QA.TimeToAnswer,
+    DLA.DuplicateCount,
+    DLA.RelatedDuplicatePostIds,
+    CASE
+        WHEN COALESCE(PT.CloseCount, 0) > 0 AND COALESCE(PT.ReopenCount, 0) > 0 THEN 'ClosedAndReopened'
+        WHEN COALESCE(PT.CloseCount, 0) > 0 AND COALESCE(PT.ReopenCount, 0) = 0 THEN 'ClosedOnly'
+        WHEN PCA.PostScore < 0 AND PCA.PostViewCount > 5000 THEN 'NegativeScoreHighViews'
+        WHEN PCA.PostPopularityScore > 750 THEN 'HighlyPopular'
+        WHEN PCA.IsProblematicTitle = TRUE AND COALESCE(PT.EditCount, 0) > 3 THEN 'ProblematicAndEdited'
+        WHEN QA.AcceptedAnswerId IS NOT NULL AND QA.TimeToAnswer < INTERVAL '1 hour' THEN 'QuicklyAnsweredAndAccepted'
+        ELSE 'NormalEngagement'
+    END AS PostStatusCategory,
+    AGE(TIMESTAMP '2024-10-01 12:34:56', COALESCE(PT.LastHistoryEntry, PCA.LastEditHistoryDate, PCA.PostCreationDate)) AS TimeSinceLastPostActivity,
+    (SELECT AVG(C_sub.Score) FROM Comments C_sub WHERE C_sub.PostId = PCA.PostId) AS AvgCommentScoreForPost,
+    AVG(UAS.Reputation) OVER (PARTITION BY UAS.ReputationTier ORDER BY UAS.Reputation DESC) AS AvgReputationInTier,
+    RANK() OVER (PARTITION BY PCA.PrimaryTag ORDER BY PCA.PostPopularityScore DESC, PCA.PostCreationDate DESC) AS PostPopularityRankInTag
+FROM UserActivitySummary UAS
+INNER JOIN PostContentAnalysis PCA ON UAS.UserId = PCA.OwnerUserId
+LEFT JOIN PostActivityTimelines PT ON PCA.PostId = PT.PostId
+LEFT JOIN QuestionAnswerChains QA ON PCA.PostId = QA.QuestionId
+LEFT JOIN DuplicateLinkAnalysis DLA ON PCA.PostId = DLA.PostId
+WHERE
+    UAS.ReputationTier <= 3
+    AND PCA.PostPopularityScore >= 150
+    AND PCA.PostTypeId = 1
+    AND (
+        PCA.Tags ILIKE '%<sql>%' OR PCA.Tags ILIKE '%<database>%' OR PCA.Tags ILIKE '%<performance>%'
+        OR PCA.PrimaryTag IN ('python', 'java', 'c#')
+        OR PCA.IsProblematicTitle = TRUE
+    )
+    AND (QA.AnswerRankByScore = 1 OR QA.AnswerRankByScore IS NULL)
+    AND (DLA.DuplicateCount IS NULL OR DLA.DuplicateCount < 3)
+    AND UAS.LastAccessDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year 6 months')
+    AND PCA.PostCreationDate BETWEEN (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6 years') AND (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 years')
+    AND (PT.EditCount IS NULL OR PT.EditCount < 10)
+    AND COALESCE(PCA.BodyLength, 0) > 100
+ORDER BY
+    UAS.EngagementScore DESC,
+    PCA.PostPopularityScore DESC,
+    PCA.PostId
+LIMIT 7500;

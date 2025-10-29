@@ -1,0 +1,219 @@
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COALESCE(SUM(P.Score), 0) AS TotalPostScore,
+        COALESCE(AVG(CASE WHEN P.PostTypeId IN (1,2) THEN P.Score END), 0.0) AS AvgPostScore,
+        U.Views AS UserViews,
+        U.UpVotes AS UserUpVotes,
+        U.DownVotes AS UserDownVotes,
+        COUNT(B.Id) AS TotalBadges,
+        MAX(CASE WHEN B.Class = 1 THEN B.Date END) AS LastGoldBadgeDate
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.Views, U.UpVotes, U.DownVotes
+),
+PostEngagementMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        COALESCE(P.Title, SUBSTRING(P.Body FROM 1 FOR 100)) AS PostTitleExcerpt,
+        P.Tags AS PostTags,
+        COUNT(DISTINCT CASE WHEN V_Up.VoteTypeId = 2 THEN V_Up.Id END) AS UpVoteCount,
+        COUNT(DISTINCT CASE WHEN V_Down.VoteTypeId = 3 THEN V_Down.Id END) AS DownVoteCount,
+        COUNT(DISTINCT PL_Linked.RelatedPostId) AS LinkedPostsCount,
+        COUNT(DISTINCT PL_Duplicate.RelatedPostId) AS DuplicatePostsCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseVoteHistoryCount,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.CreationDate END) AS LastCloseDate,
+        CASE
+            WHEN P.AcceptedAnswerId IS NOT NULL AND P.PostTypeId = 1 THEN TRUE
+            ELSE FALSE
+        END AS HasAcceptedAnswer,
+        SUM(CASE WHEN V_Fav.VoteTypeId = 5 THEN 1 ELSE 0 END) AS LegacyFavoriteCount
+    FROM Posts P
+    LEFT JOIN Votes V_Up ON P.Id = V_Up.PostId AND V_Up.VoteTypeId = 2
+    LEFT JOIN Votes V_Down ON P.Id = V_Down.PostId AND V_Down.VoteTypeId = 3
+    LEFT JOIN Votes V_Fav ON P.Id = V_Fav.PostId AND V_Fav.VoteTypeId = 5
+    LEFT JOIN PostLinks PL_Linked ON P.Id = PL_Linked.PostId AND PL_Linked.LinkTypeId = 1
+    LEFT JOIN PostLinks PL_Duplicate ON P.Id = PL_Duplicate.PostId AND PL_Duplicate.LinkTypeId = 3
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId AND PH.PostHistoryTypeId = 10
+    GROUP BY
+        P.Id, P.PostTypeId, P.OwnerUserId, P.CreationDate, P.Score, P.ViewCount,
+        P.AnswerCount, P.CommentCount, P.FavoriteCount, P.AcceptedAnswerId, P.Title, P.Body, P.Tags
+),
+RecentTrendingTags AS (
+    SELECT
+        TagName,
+        SUM(PEM.UpVoteCount + COALESCE(PEM.LegacyFavoriteCount, 0)) AS TagEngagementScore,
+        COUNT(PEM.PostId) AS TaggedPostCount,
+        DENSE_RANK() OVER (ORDER BY SUM(PEM.UpVoteCount + COALESCE(PEM.LegacyFavoriteCount, 0)) DESC, COUNT(PEM.PostId) DESC) AS TagPopularityRank
+    FROM PostEngagementMetrics PEM
+    JOIN Posts P ON PEM.PostId = P.Id
+    CROSS JOIN LATERAL (
+        SELECT unnest(string_to_array(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags)-2), '><')) AS TagName
+    ) t
+    WHERE P.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '6 months')
+      AND P.Tags IS NOT NULL
+      AND P.Tags != '<>'
+      AND P.PostTypeId IN (1,2)
+    GROUP BY TagName
+    HAVING COUNT(PEM.PostId) > 50
+),
+ModeratorActivity AS (
+    SELECT
+        PH.UserId,
+        COUNT(DISTINCT PH.PostId) AS ModeratedPostsCount,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (10, 14) THEN PH.PostId END) AS ClosureLockCount,
+        MIN(PH.CreationDate) AS FirstModerationAction,
+        MAX(PH.CreationDate) AS LastModerationAction
+    FROM PostHistory PH
+    WHERE PH.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20)
+      AND PH.UserId IS NOT NULL
+    GROUP BY PH.UserId
+),
+TopQuestionPosts AS (
+    SELECT
+        PEM.PostId,
+        PEM.OwnerUserId,
+        PEM.PostTitleExcerpt,
+        PEM.PostScore,
+        PEM.UpVoteCount,
+        PEM.ViewCount,
+        PEM.AnswerCount,
+        PEM.HasAcceptedAnswer,
+        ROW_NUMBER() OVER (PARTITION BY PEM.OwnerUserId ORDER BY PEM.UpVoteCount DESC, PEM.ViewCount DESC) AS Rn
+    FROM PostEngagementMetrics PEM
+    WHERE PEM.PostTypeId = 1
+      AND PEM.PostScore >= 10
+      AND PEM.ViewCount >= 100
+),
+TopAnswerPosts AS (
+    SELECT
+        PEM.PostId,
+        PEM.OwnerUserId,
+        PEM.PostTitleExcerpt,
+        PEM.PostScore,
+        PEM.UpVoteCount,
+        P.ParentId,
+        ROW_NUMBER() OVER (PARTITION BY PEM.OwnerUserId ORDER BY PEM.UpVoteCount DESC, PEM.PostScore DESC) AS Rn
+    FROM PostEngagementMetrics PEM
+    JOIN Posts P ON PEM.PostId = P.Id
+    WHERE PEM.PostTypeId = 2
+      AND PEM.PostScore >= 5
+),
+BaseUserMetrics AS (
+    SELECT
+        UAS.UserId,
+        UAS.DisplayName,
+        UAS.Reputation,
+        UAS.UserCreationDate,
+        UAS.TotalPosts,
+        UAS.TotalQuestions,
+        UAS.TotalAnswers,
+        UAS.TotalBadges,
+        UAS.LastGoldBadgeDate,
+        COALESCE(MA.ModeratedPostsCount, 0) AS ModeratedPostsCount,
+        COALESCE(MA.ClosureLockCount, 0) AS ClosureLockCount,
+        COALESCE(UAS.TotalPostScore, 0) AS TotalUserPostScore,
+        UAS.AvgPostScore,
+        COALESCE(SUM(PEM.UpVoteCount), 0) AS TotalPostsUpVotesReceived,
+        COALESCE(AVG(PEM.UpVoteCount), 0.0) AS AvgPostUpVotesReceived,
+        COUNT(CASE WHEN PEM.HasAcceptedAnswer THEN 1 END) AS QuestionsWithAcceptedAnswers,
+        COUNT(DISTINCT TQT.PostId) AS TopQuestionCount,
+        COUNT(DISTINCT TAP.PostId) AS TopAnswerCount,
+        SUM(CASE WHEN PEM.PostTypeId = 1 AND EXISTS (
+            SELECT 1 FROM RecentTrendingTags TRT_Inner
+            WHERE TRT_Inner.TagPopularityRank <= 10
+              AND PEM.PostTags ILIKE '%' || TRT_Inner.TagName || '%'
+        ) THEN 1 ELSE 0 END) AS RecentTrendingQuestionCount,
+        (UAS.Reputation * 1.0 / NULLIF(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - UAS.UserCreationDate))/ (3600*24), 0)) AS AvgReputationPerDay,
+        CASE WHEN NULLIF(UAS.UserDownVotes, 0) IS NOT NULL THEN (UAS.UserUpVotes * 1.0 / NULLIF(UAS.UserDownVotes, 0)) ELSE NULL END AS UpVoteToDownVoteRatio,
+        COALESCE(
+            (SELECT MAX(V.CreationDate)
+             FROM Votes V
+             WHERE V.UserId = UAS.UserId AND V.VoteTypeId IN (2,3)
+               AND V.CreationDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 months')), NULL) AS LastVoteActivityDate,
+        COALESCE(
+            (SELECT PH_Inner.Comment
+             FROM PostHistory PH_Inner
+             WHERE PH_Inner.UserId = UAS.UserId
+               AND PH_Inner.PostHistoryTypeId = 5
+               AND PH_Inner.PostId = (SELECT MIN(P_Inner.Id) FROM Posts P_Inner WHERE P_Inner.OwnerUserId = UAS.UserId)
+             ORDER BY PH_Inner.CreationDate DESC
+             LIMIT 1), 'N/A: No first post body edit comment found'
+        ) AS CommentOnFirstPostBodyEdit,
+        STRING_AGG(DISTINCT T.TagName, ', ') FILTER (WHERE TRT.TagName IS NOT NULL AND TRT.TagPopularityRank <= 5) AS Top5TrendingTagsByPosts
+    FROM UserActivitySummary UAS
+    LEFT JOIN PostEngagementMetrics PEM ON UAS.UserId = PEM.OwnerUserId
+    LEFT JOIN ModeratorActivity MA ON UAS.UserId = MA.UserId
+    LEFT JOIN TopQuestionPosts TQT ON UAS.UserId = TQT.OwnerUserId AND TQT.Rn = 1
+    LEFT JOIN TopAnswerPosts TAP ON UAS.UserId = TAP.OwnerUserId AND TAP.Rn = 1
+    LEFT JOIN Posts P ON UAS.UserId = P.OwnerUserId
+    LEFT JOIN LATERAL (
+        SELECT unnest(string_to_array(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags)-2), '><')) AS TagName
+    ) T ON P.Tags IS NOT NULL AND P.Tags != '<>'
+    LEFT JOIN RecentTrendingTags TRT ON T.TagName = TRT.TagName
+    WHERE UAS.TotalPosts > 0
+      AND UAS.Reputation > 500
+      AND UAS.DisplayName IS NOT NULL
+    GROUP BY
+        UAS.UserId, UAS.DisplayName, UAS.Reputation, UAS.UserCreationDate, UAS.TotalPosts,
+        UAS.TotalQuestions, UAS.TotalAnswers, UAS.TotalBadges, UAS.LastGoldBadgeDate,
+        MA.ModeratedPostsCount, MA.ClosureLockCount, UAS.TotalPostScore, UAS.AvgPostScore,
+        UAS.UserUpVotes, UAS.UserDownVotes
+    HAVING COUNT(DISTINCT PEM.PostId) > 2
+)
+SELECT
+    BUM.UserId,
+    BUM.DisplayName,
+    BUM.Reputation,
+    BUM.TotalQuestions,
+    BUM.TotalAnswers,
+    BUM.AvgReputationPerDay,
+    BUM.RecentTrendingQuestionCount,
+    BUM.Top5TrendingTagsByPosts,
+    BUM.CommentOnFirstPostBodyEdit,
+    'High_Engagement_Questioner' AS UserCategory
+FROM BaseUserMetrics BUM
+WHERE BUM.TotalQuestions > 10
+  AND BUM.QuestionsWithAcceptedAnswers >= 2
+  AND BUM.RecentTrendingQuestionCount >= 1
+  AND BUM.AvgPostUpVotesReceived > 5
+  AND BUM.TopQuestionCount >= 1
+  AND BUM.LastVoteActivityDate IS NOT NULL
+UNION ALL
+SELECT
+    BUM.UserId,
+    BUM.DisplayName,
+    BUM.Reputation,
+    BUM.TotalQuestions,
+    BUM.TotalAnswers,
+    BUM.AvgReputationPerDay,
+    BUM.RecentTrendingQuestionCount,
+    BUM.Top5TrendingTagsByPosts,
+    BUM.CommentOnFirstPostBodyEdit,
+    'Moderator_Contributor' AS UserCategory
+FROM BaseUserMetrics BUM
+WHERE BUM.ModeratedPostsCount > 0
+  AND BUM.ClosureLockCount > 0
+  AND BUM.TotalAnswers > 5
+  AND BUM.TotalBadges >= 20
+  AND (BUM.UpVoteToDownVoteRatio IS NOT NULL AND BUM.UpVoteToDownVoteRatio > 2.0)
+  AND BUM.CommentOnFirstPostBodyEdit <> 'N/A: No first post body edit comment found'
+ORDER BY Reputation DESC, AvgReputationPerDay DESC
+LIMIT 200;

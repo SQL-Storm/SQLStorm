@@ -1,0 +1,255 @@
+WITH UserCoreMetrics AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views AS UserViews,
+        u.UpVotes AS UserUpVotesGiven,
+        u.DownVotes AS UserDownVotesGiven,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COUNT(p.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS TotalQuestionsOwned,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS TotalAnswersOwned,
+        COUNT(c.Id) AS TotalCommentsMade,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        MAX(b.Date) AS LastBadgeDate,
+        COALESCE(u.Location, 'Unknown') AS UserLocation,
+        CASE
+            WHEN u.Reputation >= 100000 THEN 'Legend'
+            WHEN u.Reputation >= 25000 THEN 'Expert'
+            WHEN u.Reputation >= 5000 THEN 'Pro'
+            WHEN u.Reputation >= 1000 THEN 'Enthusiast'
+            ELSE 'Novice'
+        END AS ReputationTier
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes,
+        u.CreationDate, u.LastAccessDate, u.Location
+),
+PostContentMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.Title,
+        p.Tags,
+        COALESCE(LENGTH(p.Body) - LENGTH(REPLACE(p.Body, ' ', '')), 0) AS BodyWordCount,
+        LENGTH(p.Body) AS BodyCharCount,
+        COUNT(ph.Id) AS TotalRevisions,
+        COUNT(DISTINCT ph.UserId) AS UniqueRevisers,
+        MAX(ph.CreationDate) AS LatestRevisionDate,
+        (p.Score * 0.75 + p.ViewCount * 0.005 + p.CommentCount * 0.2 + COALESCE(p.FavoriteCount, 0) * 1.5 + CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 50 ELSE 0 END) AS EngagementScore,
+        p.ClosedDate,
+        p.CommunityOwnedDate,
+        p.Body
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId IN (1,2,3,4,5,6,7,8,9)
+    GROUP BY
+        p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount,
+        p.AnswerCount, p.CommentCount, p.FavoriteCount, p.AcceptedAnswerId,
+        p.ParentId, p.Title, p.Tags, p.Body, p.ClosedDate, p.CommunityOwnedDate
+),
+QuestionAnswerFlow AS (
+    SELECT
+        q.PostId AS QuestionId,
+        q.OwnerUserId AS QuestionOwnerId,
+        q.CreationDate AS QuestionCreationDate,
+        q.PostScore AS QuestionScore,
+        q.ViewCount AS QuestionViews,
+        q.EngagementScore AS QuestionEngagementScore,
+        ans.PostId AS AnswerId,
+        ans.OwnerUserId AS AnswerOwnerId,
+        ans.CreationDate AS AnswerCreationDate,
+        ans.PostScore AS AnswerScore,
+        ans.BodyWordCount AS AnswerWordCount,
+        ans.EngagementScore AS AnswerEngagementScore,
+        ROW_NUMBER() OVER (PARTITION BY q.PostId ORDER BY ans.PostScore DESC, ans.CreationDate ASC) AS RankByAnswerScore,
+        LAG(ans.CreationDate) OVER (PARTITION BY q.PostId ORDER BY ans.CreationDate) AS PreviousAnswerDate,
+        (ans.CreationDate - q.CreationDate) AS TimeToAnswer,
+        CASE WHEN ans.PostId = q.AcceptedAnswerId THEN 1 ELSE 0 END AS IsAcceptedAnswer
+    FROM PostContentMetrics q
+    JOIN PostContentMetrics ans ON q.PostId = ans.ParentId
+    WHERE q.PostTypeId = 1 AND ans.PostTypeId = 2
+      AND q.EngagementScore > 100
+),
+TagUsageAndPerformance AS (
+    SELECT
+        TRIM(LOWER(tag)) AS TagName,
+        EXTRACT(YEAR FROM p.CreationDate) AS PostYear,
+        COUNT(p.PostId) AS TaggedPostsCount,
+        AVG(p.PostScore) AS AvgTagPostScore,
+        SUM(p.ViewCount) AS TotalTagViews,
+        MAX(p.EngagementScore) AS MaxEngagementInTag
+    FROM (
+        SELECT
+            PostId, PostTypeId, OwnerUserId, CreationDate, PostScore, ViewCount, EngagementScore, Tags,
+            UNNEST(STRING_TO_ARRAY(SUBSTRING(Tags, 2, LENGTH(Tags) - 2), '><')) AS tag
+        FROM PostContentMetrics
+    ) p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2
+    GROUP BY
+        TRIM(LOWER(tag)),
+        EXTRACT(YEAR FROM p.CreationDate)
+    HAVING COUNT(p.PostId) > 5
+),
+PostModerationActions AS (
+    SELECT
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate AS ActionDate,
+        ph.UserId AS ModeratorUserId,
+        pht.Name AS HistoryTypeName,
+        CASE
+            WHEN ph.PostHistoryTypeId IN (10, 101) THEN COALESCE(cr.Name, 'Unknown Close Reason')
+            WHEN ph.PostHistoryTypeId IN (35, 36) THEN SUBSTRING(ph.Text FROM 'to (.+?)/')
+            ELSE 'N/A'
+        END AS ActionDetail,
+        LEAD(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS NextActionDate,
+        ph.Comment
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    LEFT JOIN CloseReasonTypes cr ON ph.PostHistoryTypeId IN (10, 101) AND ph.Comment = CAST(cr.Id AS VARCHAR)
+    WHERE ph.PostHistoryTypeId IN (10, 11, 12, 13, 17, 35, 36, 101, 102, 103, 104, 105)
+),
+UserEngagementSummary AS (
+    SELECT
+        u.UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.ReputationTier,
+        SUM(qaf.AnswerScore) AS TotalAnswerScore,
+        COUNT(DISTINCT qaf.QuestionId) AS QuestionsAnswered,
+        SUM(qaf.IsAcceptedAnswer) AS AcceptedAnswersCount,
+        AVG(qaf.AnswerWordCount) AS AvgAnswerWordCount,
+        AVG(qaf.AnswerEngagementScore) AS AvgAnswerEngagementScore,
+        MIN(qaf.TimeToAnswer) AS FastestTimeToAnswer,
+        NTILE(10) OVER (ORDER BY SUM(qaf.AnswerScore) DESC, SUM(qaf.IsAcceptedAnswer) DESC) AS AnswererPerformanceTier
+    FROM UserCoreMetrics u
+    JOIN QuestionAnswerFlow qaf ON u.UserId = qaf.AnswerOwnerId
+    WHERE qaf.RankByAnswerScore <= 5
+    GROUP BY u.UserId, u.DisplayName, u.Reputation, u.ReputationTier
+),
+PostIssueClassification AS (
+    SELECT
+        pcm.PostId,
+        'Problematic' AS PostCategory,
+        COUNT(pma.PostId) FILTER (WHERE pma.PostHistoryTypeId IN (10, 101)) AS CloseActions,
+        COUNT(pma.PostId) FILTER (WHERE pma.PostHistoryTypeId IN (12)) AS DeleteActions,
+        COUNT(pma.PostId) FILTER (WHERE pma.PostHistoryTypeId IN (35, 36)) AS MigrationActions,
+        STRING_AGG(pma.HistoryTypeName, '; ') FILTER (WHERE pma.PostHistoryTypeId IN (10, 12, 35, 36) ) AS AllProblemActions
+    FROM PostContentMetrics pcm
+    LEFT JOIN PostModerationActions pma ON pcm.PostId = pma.PostId
+    WHERE pcm.ClosedDate IS NOT NULL OR pcm.PostId IN (SELECT DISTINCT PostId FROM PostModerationActions WHERE PostHistoryTypeId IN (12, 17, 35, 36))
+    GROUP BY pcm.PostId
+    HAVING COUNT(pma.PostId) > 0
+    UNION ALL
+    SELECT
+        pcm.PostId,
+        'Successful' AS PostCategory,
+        0 AS CloseActions,
+        0 AS DeleteActions,
+        0 AS MigrationActions,
+        'N/A' AS AllProblemActions
+    FROM PostContentMetrics pcm
+    WHERE pcm.AcceptedAnswerId IS NOT NULL
+      AND pcm.PostScore >= 10
+      AND pcm.ViewCount >= 1000
+      AND pcm.ClosedDate IS NULL
+      AND NOT EXISTS (SELECT 1 FROM PostModerationActions pma WHERE pma.PostId = pcm.PostId AND pma.PostHistoryTypeId IN (10, 12, 17, 35, 36))
+)
+SELECT
+    ucm.UserId,
+    ucm.DisplayName,
+    ucm.Reputation,
+    ucm.ReputationTier,
+    ucm.GoldBadges,
+    ucm.SilverBadges,
+    ucm.BronzeBadges,
+    ues.TotalAnswerScore,
+    ues.AcceptedAnswersCount,
+    ues.AvgAnswerWordCount,
+    ues.FastestTimeToAnswer,
+    ues.AnswererPerformanceTier,
+    pc_q.TotalRevisions AS QuestionRevisions,
+    pc_q.EngagementScore AS QuestionEngagementScore,
+    pc_q.ViewCount AS QuestionViews,
+    pc_q.PostScore AS QuestionScore,
+    tup_agg.TopContributingTag,
+    tup_agg.AvgScoreOfTopTag,
+    tup_agg.QuestionsInTopTag,
+    pic.PostCategory AS TopPostCategory,
+    pic.CloseActions AS TopPostCloseActions,
+    pic.DeleteActions AS TopPostDeleteActions,
+    LAG(ucm.LastAccessDate) OVER (ORDER BY ucm.Reputation DESC) AS PreviousUserAccessDate,
+    RANK() OVER (ORDER BY ucm.Reputation DESC, ucm.GoldBadges DESC, ues.AcceptedAnswersCount DESC) AS GlobalUserRank,
+    COALESCE(
+        (SELECT
+            ph_corr.Comment
+         FROM PostHistory ph_corr
+         WHERE ph_corr.UserId = ucm.UserId
+           AND ph_corr.PostHistoryTypeId IN (10, 101)
+           AND ph_corr.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = ucm.UserId AND PostTypeId = 1 AND ClosedDate IS NOT NULL)
+         ORDER BY ph_corr.CreationDate DESC
+         LIMIT 1),
+        'N/A - No recent closure'
+    ) AS LastQuestionClosureReason,
+    (SELECT AVG(LENGTH(t.TagName)) FROM Tags t WHERE t.TagName LIKE '%' || SUBSTRING(ucm.DisplayName, 1, 3) || '%') AS AvgTagNameLengthMatchingDisplayNamePrefix
+FROM UserCoreMetrics ucm
+LEFT JOIN UserEngagementSummary ues ON ucm.UserId = ues.UserId
+LEFT JOIN PostContentMetrics pc_q ON ucm.UserId = pc_q.OwnerUserId AND pc_q.PostTypeId = 1 AND pc_q.EngagementScore = (SELECT MAX(sq.EngagementScore) FROM PostContentMetrics sq WHERE sq.OwnerUserId = ucm.UserId AND sq.PostTypeId = 1)
+LEFT JOIN (
+    SELECT
+        ranked_tup.PostYear,
+        ranked_tup.TagName AS TopContributingTag,
+        ranked_tup.AvgTagPostScore AS AvgScoreOfTopTag,
+        ranked_tup.TaggedPostsCount AS QuestionsInTopTag,
+        ranked_tup.OwnerUserId AS TagOwnerUserId
+    FROM (
+        SELECT
+            sq_tup.PostYear,
+            sq_tup.TagName,
+            sq_tup.AvgTagPostScore,
+            sq_tup.TaggedPostsCount,
+            sq_p.OwnerUserId,
+            ROW_NUMBER() OVER (PARTITION BY sq_p.OwnerUserId ORDER BY sq_tup.AvgTagPostScore DESC, sq_tup.TotalTagViews DESC) as rn
+        FROM TagUsageAndPerformance sq_tup
+        JOIN Posts sq_p ON sq_p.PostTypeId = 1
+            AND sq_p.OwnerUserId IS NOT NULL
+            AND sq_p.Tags LIKE '%' || sq_tup.TagName || '%'
+            AND EXTRACT(YEAR FROM sq_p.CreationDate) = sq_tup.PostYear
+        WHERE sq_tup.AvgTagPostScore = (
+            SELECT MAX(sq_tup2.AvgTagPostScore)
+            FROM TagUsageAndPerformance sq_tup2
+            WHERE sq_tup2.PostYear = sq_tup.PostYear
+        )
+    ) ranked_tup
+    WHERE ranked_tup.rn = 1
+) tup_agg ON ucm.UserId = tup_agg.TagOwnerUserId AND EXTRACT(YEAR FROM ucm.LastAccessDate) = tup_agg.PostYear
+LEFT JOIN PostIssueClassification pic ON pc_q.PostId = pic.PostId
+WHERE ucm.TotalPostsOwned > 5
+  AND ucm.Reputation >= 100
+  AND (ues.AnswererPerformanceTier IS NULL OR ues.AnswererPerformanceTier <= 5)
+  AND (
+        (pc_q.EngagementScore > 500 AND pc_q.TotalRevisions > 3)
+        OR
+        (ucm.GoldBadges >= 1 AND ucm.ReputationTier = 'Expert')
+      )
+ORDER BY
+    GlobalUserRank ASC,
+    ucm.LastAccessDate DESC,
+    ues.TotalAnswerScore DESC
+LIMIT 200;

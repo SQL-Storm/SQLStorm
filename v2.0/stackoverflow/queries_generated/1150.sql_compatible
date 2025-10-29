@@ -1,0 +1,189 @@
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate,
+        U.UpVotes,
+        U.DownVotes,
+        COUNT(DISTINCT B.Id) FILTER (WHERE B.Class = 1) AS GoldBadges,
+        COUNT(DISTINCT B.Id) FILTER (WHERE B.Class = 2) AS SilverBadges,
+        COUNT(DISTINCT B.Id) FILTER (WHERE B.Class = 3) AS BronzeBadges,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesGiven,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesGiven,
+        SUM(CASE WHEN V.VoteTypeId = 5 THEN 1 ELSE 0 END) AS TotalFavoritesGiven,
+        AVG(NULLIF(P.Score, 0)) AS AvgPostScoreByOwner,
+        DENSE_RANK() OVER (ORDER BY U.Reputation DESC, U.UpVotes DESC, U.CreationDate) AS ReputationRank,
+        NTILE(10) OVER (ORDER BY U.CreationDate ASC) AS CreationDateDecile
+    FROM Users U
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Votes V ON U.Id = V.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.UpVotes, U.DownVotes
+),
+PostDetails AS (
+    SELECT
+        Q.Id AS QuestionId,
+        Q.OwnerUserId,
+        Q.Title,
+        Q.Tags,
+        Q.CreationDate AS QuestionCreationDate,
+        Q.Score AS QuestionScore,
+        Q.ViewCount,
+        Q.AnswerCount,
+        Q.CommentCount,
+        Q.FavoriteCount,
+        Q.ClosedDate,
+        Q.AcceptedAnswerId,
+        COALESCE(LENGTH(Q.Body), 0) AS BodyLength,
+        COUNT(DISTINCT PH.Id) FILTER (WHERE PH.PostHistoryTypeId IN (4, 5, 6)) AS EditCount,
+        (SELECT STRING_AGG(tag, ',') FROM (SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(Q.Tags, 2, LENGTH(Q.Tags)-2), '><')) AS tag) t) AS ParsedTagsList,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.Comment END) AS CloseReason,
+        AVG(C.Score) FILTER (WHERE C.Id IS NOT NULL) AS AvgCommentScore,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS QuestionUpVotesReceived,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS QuestionDownVotesReceived,
+        LAG(Q.Score, 1, 0) OVER (PARTITION BY Q.OwnerUserId ORDER BY Q.CreationDate) AS PreviousQuestionScore,
+        ROW_NUMBER() OVER (PARTITION BY Q.OwnerUserId ORDER BY Q.CreationDate) AS QuestionSequenceByOwner
+    FROM Posts Q
+    LEFT JOIN PostHistory PH ON Q.Id = PH.PostId
+    LEFT JOIN Comments C ON Q.Id = C.PostId
+    LEFT JOIN Votes V ON Q.Id = V.PostId AND V.VoteTypeId IN (2,3)
+    WHERE Q.PostTypeId = 1
+    GROUP BY Q.Id, Q.OwnerUserId, Q.Title, Q.Tags, Q.CreationDate, Q.Score, Q.ViewCount, Q.AnswerCount, Q.CommentCount, Q.FavoriteCount, Q.ClosedDate, Q.AcceptedAnswerId, Q.Body
+),
+RelatedPostStats AS (
+    SELECT
+        PL.PostId,
+        COUNT(DISTINCT PL.RelatedPostId) AS TotalLinkedPosts,
+        COUNT(DISTINCT PL.RelatedPostId) FILTER (WHERE PL.LinkTypeId = 3) AS TotalDuplicatePosts,
+        AVG(RP.Score) AS AvgRelatedPostScore,
+        SUM(CASE WHEN RP.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS RelatedPostsWithAcceptedAnswers
+    FROM PostLinks PL
+    JOIN Posts RP ON PL.RelatedPostId = RP.Id
+    GROUP BY PL.PostId
+)
+SELECT
+    PD.QuestionId,
+    UE.DisplayName AS QuestionOwnerDisplayName,
+    UE.Reputation AS QuestionOwnerReputation,
+    PD.Title,
+    PD.QuestionCreationDate,
+    PD.QuestionScore,
+    PD.ViewCount,
+    PD.AnswerCount,
+    PD.CommentCount,
+    PD.EditCount,
+    PD.AvgCommentScore,
+    PD.CloseReason,
+    PD.ParsedTagsList,
+    RPS.TotalLinkedPosts,
+    RPS.TotalDuplicatePosts,
+    RPS.AvgRelatedPostScore,
+    QAT.AcceptedAnswerOwnerDisplayName,
+    QAT.AcceptedAnswerCreationDate,
+    QAT.AcceptedAnswerScore,
+    QAT.AcceptedAnswerBodyLength,
+    (
+        SELECT COUNT(DISTINCT B.Id)
+        FROM Badges B
+        WHERE B.UserId = PD.OwnerUserId
+          AND B.Class = 1
+          AND B.Date < PD.QuestionCreationDate
+    ) AS GoldBadgesBeforeQuestion,
+    CASE
+        WHEN PD.AcceptedAnswerId IS NOT NULL AND PD.ClosedDate IS NULL THEN 'Active & Answered'
+        WHEN PD.AcceptedAnswerId IS NOT NULL AND PD.ClosedDate IS NOT NULL THEN 'Closed & Answered'
+        WHEN PD.AcceptedAnswerId IS NULL AND PD.ClosedDate IS NOT NULL THEN 'Closed & Unanswered'
+        ELSE 'Active & Unanswered'
+    END AS QuestionStatus,
+    COALESCE(PD.FavoriteCount, 0) + (PD.QuestionScore * 2) + (PD.ViewCount / 100.0) AS EngagementMetric,
+    NULLIF(PD.QuestionUpVotesReceived, 0) / NULLIF(CAST(PD.QuestionDownVotesReceived AS NUMERIC), 0) AS UpDownRatio,
+    UPPER(SUBSTRING(PD.Title, 1, 10)) || '...' || LOWER(SUBSTRING(PD.Title, GREATEST(LENGTH(PD.Title) - 9, 1), 10)) AS TitleSnippet,
+    UE.ReputationRank,
+    UE.CreationDateDecile,
+    (PD.QuestionScore - PD.PreviousQuestionScore) AS ScoreChangeFromPrevious,
+    CASE WHEN PD.BodyLength > 1000 AND PD.QuestionScore > 50 THEN 'High-Effort High-Value'
+         WHEN PD.BodyLength > 500 AND PD.QuestionScore > 10 THEN 'Medium-Effort Medium-Value'
+         ELSE 'Low-Effort'
+    END AS QuestionEffortValueCategory
+FROM PostDetails PD
+LEFT JOIN UserEngagement UE ON PD.OwnerUserId = UE.UserId
+LEFT JOIN RelatedPostStats RPS ON PD.QuestionId = RPS.PostId
+LEFT JOIN LATERAL (
+    SELECT
+        A.Id AS AcceptedAnswerId,
+        A.OwnerUserId AS AcceptedAnswerOwnerUserId,
+        UA.DisplayName AS AcceptedAnswerOwnerDisplayName,
+        A.CreationDate AS AcceptedAnswerCreationDate,
+        A.Score AS AcceptedAnswerScore,
+        LENGTH(A.Body) AS AcceptedAnswerBodyLength
+    FROM Posts A
+    LEFT JOIN Users UA ON A.OwnerUserId = UA.Id
+    WHERE A.Id = PD.AcceptedAnswerId
+) QAT ON TRUE
+WHERE
+    PD.QuestionCreationDate BETWEEN DATE '2022-01-01' AND DATE '2023-12-31'
+    AND PD.QuestionScore > (SELECT AVG(P_inner.Score) FROM Posts P_inner WHERE P_inner.PostTypeId = 1 AND P_inner.CreationDate BETWEEN DATE '2022-01-01' AND DATE '2023-12-31')
+    AND (PD.Tags LIKE '%<sql>%' OR PD.Tags LIKE '%<postgresql>%')
+    AND EXISTS (
+        SELECT 1
+        FROM Comments C_ex
+        WHERE C_ex.PostId = PD.QuestionId
+          AND C_ex.UserId IS NOT NULL
+          AND C_ex.CreationDate > PD.QuestionCreationDate + INTERVAL '1 hour'
+    )
+    AND NOT EXISTS (
+        SELECT 1
+        FROM PostHistory PH_ex
+        WHERE PH_ex.PostId = PD.QuestionId
+          AND PH_ex.PostHistoryTypeId = 12
+    )
+    AND UE.ReputationRank <= 1000
+    AND PD.QuestionSequenceByOwner = 1
+UNION ALL
+SELECT
+    PD.QuestionId,
+    UE.DisplayName AS QuestionOwnerDisplayName,
+    UE.Reputation AS QuestionOwnerReputation,
+    PD.Title,
+    PD.QuestionCreationDate,
+    PD.QuestionScore,
+    PD.ViewCount,
+    PD.AnswerCount,
+    PD.CommentCount,
+    PD.EditCount,
+    PD.AvgCommentScore,
+    PD.CloseReason,
+    PD.ParsedTagsList,
+    RPS.TotalLinkedPosts,
+    RPS.TotalDuplicatePosts,
+    RPS.AvgRelatedPostScore,
+    NULL AS AcceptedAnswerOwnerDisplayName,
+    NULL AS AcceptedAnswerCreationDate,
+    NULL AS AcceptedAnswerScore,
+    NULL AS AcceptedAnswerBodyLength,
+    (
+        SELECT COUNT(DISTINCT B.Id)
+        FROM Badges B
+        WHERE B.UserId = PD.OwnerUserId
+          AND B.Class = 1
+          AND B.Date < PD.QuestionCreationDate
+    ) AS GoldBadgesBeforeQuestion,
+    'Closed & Unanswered (Special)' AS QuestionStatus,
+    COALESCE(PD.FavoriteCount, 0) + (PD.QuestionScore * 1.5) AS EngagementMetric,
+    NULLIF(PD.QuestionUpVotesReceived, 0) / NULLIF(CAST(PD.QuestionDownVotesReceived AS NUMERIC), 0) AS UpDownRatio,
+    UPPER(SUBSTRING(PD.Title, 1, 10)) || '...' || LOWER(SUBSTRING(PD.Title, GREATEST(LENGTH(PD.Title) - 9, 1), 10)) AS TitleSnippet,
+    UE.ReputationRank,
+    UE.CreationDateDecile,
+    (PD.QuestionScore - PD.PreviousQuestionScore) AS ScoreChangeFromPrevious,
+    'Closed-Analysis' AS QuestionEffortValueCategory
+FROM PostDetails PD
+LEFT JOIN UserEngagement UE ON PD.OwnerUserId = UE.UserId
+LEFT JOIN RelatedPostStats RPS ON PD.QuestionId = RPS.PostId
+WHERE
+    PD.ClosedDate IS NOT NULL
+    AND PD.AcceptedAnswerId IS NULL
+    AND PD.QuestionCreationDate BETWEEN DATE '2020-01-01' AND DATE '2021-12-31'
+    AND (UE.GoldBadges > 0 OR UE.SilverBadges > 2)
+    AND PD.ViewCount < (SELECT AVG(P_inner.ViewCount) * 0.5 FROM Posts P_inner WHERE P_inner.PostTypeId = 1 AND P_inner.ClosedDate IS NOT NULL)
+ORDER BY QuestionCreationDate DESC, EngagementMetric DESC;

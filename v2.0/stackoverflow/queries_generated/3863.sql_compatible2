@@ -1,0 +1,137 @@
+WITH 
+user_stats AS (
+    SELECT 
+        u.Id                                   AS user_id,
+        COALESCE(u.DisplayName, 'Anonymous')   AS display_name,
+        u.Reputation,
+        COUNT(p.Id)                            AS total_posts,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS questions,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS answers,
+        SUM(COALESCE(p.Score,0))               AS total_score,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS up_votes_given,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS down_votes_given,
+        MAX(p.CreationDate)                   AS first_post_date,
+        MAX(p.LastActivityDate)                AS last_activity_date,
+        (SELECT COUNT(*) 
+         FROM Posts p2 
+         WHERE p2.OwnerUserId = u.Id AND p2.Score > 0) AS positive_posts
+    FROM Users u
+    LEFT JOIN Posts p   ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v   ON v.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+badge_stats AS (
+    SELECT 
+        b.UserId                                   AS user_id,
+        COUNT(*)                                   AS badge_cnt,
+        SUM(CASE b.Class 
+                WHEN 1 THEN 5
+                WHEN 2 THEN 3
+                ELSE 1
+            END)                                   AS badge_score
+    FROM Badges b
+    GROUP BY b.UserId
+),
+recent_activity AS (
+    SELECT 
+        p.OwnerUserId                               AS user_id,
+        MAX(p.LastActivityDate)                     AS recent_activity
+    FROM Posts p
+    WHERE p.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '30' DAY)
+    GROUP BY p.OwnerUserId
+),
+top_tags AS (
+    SELECT 
+        t.TagName,
+        COUNT(*) AS usage_cnt
+    FROM Tags t
+    JOIN LATERAL (
+        SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags)-2)), '><')) AS tag
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+    ) pt ON pt.tag = t.TagName
+    GROUP BY t.TagName
+    HAVING COUNT(*) > 1000
+    ORDER BY usage_cnt DESC
+    LIMIT 10
+),
+combined AS (
+    SELECT 
+        us.user_id,
+        us.display_name,
+        us.Reputation,
+        us.total_posts,
+        us.questions,
+        us.answers,
+        us.total_score,
+        us.positive_posts,
+        COALESCE(bs.badge_cnt,0)               AS badge_cnt,
+        COALESCE(bs.badge_score,0)             AS badge_score,
+        ra.recent_activity,
+        us.total_score * (1 + COALESCE(bs.badge_score,0)/10.0) 
+            + us.positive_posts * 2            AS weighted_score,
+        CASE 
+            WHEN us.Reputation >= 20000 THEN 'high'
+            WHEN us.Reputation >= 5000  THEN 'mid'
+            ELSE 'low'
+        END                                    AS rep_bucket,
+        ROW_NUMBER() OVER (
+            PARTITION BY 
+                CASE 
+                    WHEN us.Reputation >= 20000 THEN 'high'
+                    WHEN us.Reputation >= 5000  THEN 'mid'
+                    ELSE 'low'
+                END
+            ORDER BY us.total_score DESC
+        )                                      AS rank_in_bucket,
+        CASE 
+            WHEN ra.recent_activity IS NULL THEN 'inactive'
+            ELSE 'active'
+        END                                    AS activity_status
+    FROM user_stats us
+    LEFT JOIN badge_stats bs      ON bs.user_id = us.user_id
+    LEFT JOIN recent_activity ra  ON ra.user_id = us.user_id
+    GROUP BY
+        us.user_id, us.display_name, us.Reputation, us.total_posts, us.questions, us.answers,
+        us.total_score, us.positive_posts, bs.badge_cnt, bs.badge_score, ra.recent_activity,
+        CASE 
+            WHEN us.Reputation >= 20000 THEN 'high'
+            WHEN us.Reputation >= 5000  THEN 'mid'
+            ELSE 'low'
+        END,
+        us.total_score, bs.badge_score, ra.recent_activity
+)
+
+SELECT 
+    c.user_id,
+    c.display_name,
+    c.Reputation,
+    c.total_posts,
+    c.questions,
+    c.answers,
+    c.total_score,
+    c.positive_posts,
+    c.badge_cnt,
+    c.badge_score,
+    c.recent_activity,
+    ROUND(c.weighted_score,2)          AS weighted_score,
+    c.rank_in_bucket,
+    c.activity_status
+FROM combined c
+WHERE c.rank_in_bucket <= 10
+  AND (c.weighted_score > 1000 OR c.badge_cnt >= 5)
+
+UNION ALL
+
+SELECT 
+    NULL::bigint, '---', NULL::integer, NULL::integer, NULL::integer, NULL::integer, NULL::numeric, NULL::integer, NULL::integer, NULL::numeric, NULL::timestamp, NULL::numeric, NULL::integer, NULL::text
+FROM (SELECT 1) s
+
+UNION ALL
+
+SELECT 
+    NULL::bigint,
+    tt.TagName,
+    NULL::integer, NULL::integer, NULL::integer, NULL::integer, NULL::numeric, NULL::integer, NULL::integer, NULL::numeric, NULL::timestamp, NULL::numeric, NULL::integer, NULL::text
+FROM top_tags tt
+ORDER BY 2;

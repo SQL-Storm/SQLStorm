@@ -1,0 +1,307 @@
+with recent_users as (
+  select u.id as user_id,
+         u.displayname,
+         u.reputation,
+         u.creationdate,
+         coalesce(nullif(trim(u.location), ''), 'Unknown') as location_norm,
+         date_trunc('month', u.creationdate) as cohort_month
+  from users u
+  where u.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+),
+user_badge_agg as (
+  select b.userid,
+         count(*) as total_badges,
+         sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+         sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+         sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+         sum(case when b.tagbased = 1 then 1 else 0 end) as tag_badges,
+         min(b.date) as first_badge_date,
+         max(b.date) as last_badge_date
+  from badges b
+  group by b.userid
+),
+question_posts as (
+  select p.id,
+         p.owneruserid as user_id,
+         p.creationdate,
+         p.score,
+         p.viewcount,
+         p.answercount,
+         p.commentcount,
+         p.favoritecount,
+         p.tags,
+         p.title,
+         p.acceptedanswerid,
+         p.closeddate
+  from posts p
+  where p.posttypeid = 1
+),
+answer_posts as (
+  select p.id,
+         p.parentid as question_id,
+         p.owneruserid as user_id,
+         p.creationdate,
+         p.score,
+         p.commentcount
+  from posts p
+  where p.posttypeid = 2
+),
+user_q_stats as (
+  select q.user_id,
+         count(*) as q_count,
+         avg(coalesce(q.score,0)) as q_avg_score,
+         sum(case when q.acceptedanswerid is not null then 1 else 0 end) as q_with_accepted,
+         sum(case when q.closeddate is not null then 1 else 0 end) as q_closed,
+         sum(coalesce(q.viewcount,0)) as q_views,
+         max(q.creationdate) as last_q_date
+  from question_posts q
+  group by q.user_id
+),
+user_a_stats as (
+  select a.user_id,
+         count(*) as a_count,
+         avg(coalesce(a.score,0)) as a_avg_score,
+         sum(case when a.score > 0 then 1 else 0 end) as a_pos_count,
+         max(a.creationdate) as last_a_date
+  from answer_posts a
+  group by a.user_id
+),
+user_comment_stats as (
+  select c.userid as user_id,
+         count(*) as c_count,
+         avg(coalesce(c.score,0)) as c_avg_score,
+         max(c.creationdate) as last_c_date
+  from comments c
+  group by c.userid
+),
+vote_agg as (
+  select v.postid,
+         sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+         sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+         sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites
+  from votes v
+  group by v.postid
+),
+link_dup as (
+  select pl.postid as dup_post_id,
+         sum(case when pl.linktypeid = 3 then 1 else 0 end) as dup_links,
+         sum(case when pl.linktypeid = 1 then 1 else 0 end) as related_links
+  from postlinks pl
+  group by pl.postid
+),
+hot_question_bumps as (
+  select ph.postid,
+         sum(case when ph.posthistorytypeid = 52 then 1 else 0 end) as hot_selected,
+         sum(case when ph.posthistorytypeid = 53 then 1 else 0 end) as hot_removed,
+         sum(case when ph.posthistorytypeid = 50 then 1 else 0 end) as community_bumps
+  from posthistory ph
+  group by ph.postid
+),
+question_enriched as (
+  select q.*,
+         coalesce(va.upvotes,0) as upvotes,
+         coalesce(va.downvotes,0) as downvotes,
+         coalesce(va.favorites,0) as favorites,
+         coalesce(ld.dup_links,0) as dup_links,
+         coalesce(ld.related_links,0) as related_links,
+         coalesce(hq.hot_selected,0) as hot_selected,
+         coalesce(hq.hot_removed,0) as hot_removed,
+         coalesce(hq.community_bumps,0) as community_bumps
+  from question_posts q
+  left join vote_agg va on va.postid = q.id
+  left join link_dup ld on ld.dup_post_id = q.id
+  left join hot_question_bumps hq on hq.postid = q.id
+),
+tag_exploded as (
+  select qe.id as question_id,
+         lower(trim(tg)) as tag
+  from question_enriched qe,
+       lateral (
+         select unnest(string_to_array(coalesce(substring(qe.tags, 2, greatest(length(qe.tags)-2,0)), ''), '><')) as tg
+       ) s
+),
+user_top_tag as (
+  select teq.user_id,
+         te.tag,
+         count(*) as tag_q_count,
+         row_number() over (partition by teq.user_id order by count(*) desc, min(teq.creationdate)) as rn
+  from (
+    select qe.user_id, qe.id, qe.creationdate
+    from question_enriched qe
+  ) teq
+  join tag_exploded te on te.question_id = teq.id
+  group by teq.user_id, te.tag
+),
+user_activity as (
+  select ru.user_id,
+         ru.displayname,
+         ru.reputation,
+         ru.cohort_month,
+         coalesce(ru.location_norm, 'Unknown') as location,
+         coalesce(ub.total_badges,0) as total_badges,
+         coalesce(ub.gold_badges,0) as gold_badges,
+         coalesce(ub.silver_badges,0) as silver_badges,
+         coalesce(ub.bronze_badges,0) as bronze_badges,
+         coalesce(ub.tag_badges,0) as tag_badges,
+         ub.first_badge_date,
+         ub.last_badge_date,
+         coalesce(qs.q_count,0) as q_count,
+         coalesce(qs.q_avg_score,0) as q_avg_score,
+         coalesce(qs.q_with_accepted,0) as q_with_accepted,
+         coalesce(qs.q_closed,0) as q_closed,
+         coalesce(qs.q_views,0) as q_views,
+         qs.last_q_date,
+         coalesce(asx.a_count,0) as a_count,
+         coalesce(asx.a_avg_score,0) as a_avg_score,
+         coalesce(asx.a_pos_count,0) as a_pos_count,
+         asx.last_a_date,
+         coalesce(cs.c_count,0) as c_count,
+         coalesce(cs.c_avg_score,0) as c_avg_score,
+         cs.last_c_date,
+         coalesce(ut.tag, '(none)') as top_tag
+  from recent_users ru
+  left join user_badge_agg ub on ub.userid = ru.user_id
+  left join user_q_stats qs on qs.user_id = ru.user_id
+  left join user_a_stats asx on asx.user_id = ru.user_id
+  left join user_comment_stats cs on cs.user_id = ru.user_id
+  left join (
+    select user_id, tag
+    from user_top_tag
+    where rn = 1
+  ) ut on ut.user_id = ru.user_id
+),
+user_quality_score as (
+  select ua.*,
+         (
+           coalesce(nullif(ua.reputation,0), 1)
+           / greatest(1, extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - ua.cohort_month)) / 86400.0)
+         ) as rep_per_day,
+         (
+           0.4 * coalesce(ua.q_avg_score,0) +
+           0.3 * coalesce(ua.a_avg_score,0) +
+           0.2 * (case when ua.q_count > 0 then cast(ua.q_with_accepted as numeric) / ua.q_count else 0 end) * 10 +
+           0.1 * least(ua.gold_badges * 3 + ua.silver_badges * 2 + ua.bronze_badges, 50)
+         ) as quality_component,
+         (
+           coalesce(ua.q_views,0) / greatest(ua.q_count,1)
+         ) as avg_views_per_q,
+         (
+           coalesce(ua.a_pos_count,0) / greatest(ua.a_count,1)
+         ) as positive_answer_ratio
+  from user_activity ua
+),
+per_user_recent_perf as (
+  select u.id as user_id,
+         avg(case when p.posttypeid = 1 then coalesce(p.score,0) end) filter (where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '180 days') as recent_q_avg_score,
+         avg(case when p.posttypeid = 2 then coalesce(p.score,0) end) filter (where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '180 days') as recent_a_avg_score,
+         sum(case when v.votetypeid = 2 and v.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '90 days' then 1 else 0 end) as recent_upvotes
+  from users u
+  join posts p on p.owneruserid = u.id
+  left join votes v on v.postid = p.id
+  group by u.id
+),
+final_rank as (
+  select uqs.user_id,
+         uqs.displayname,
+         uqs.location,
+         uqs.cohort_month,
+         uqs.reputation,
+         uqs.total_badges,
+         uqs.gold_badges,
+         uqs.silver_badges,
+         uqs.bronze_badges,
+         uqs.q_count,
+         uqs.a_count,
+         uqs.c_count,
+         uqs.top_tag,
+         uqs.rep_per_day,
+         uqs.quality_component,
+         uqs.avg_views_per_q,
+         uqs.positive_answer_ratio,
+         prp.recent_q_avg_score,
+         prp.recent_a_avg_score,
+         prp.recent_upvotes,
+         (
+           0.45 * uqs.quality_component +
+           0.25 * least(uqs.rep_per_day, 50) +
+           0.15 * uqs.positive_answer_ratio * 100 +
+           0.10 * least(uqs.avg_views_per_q / 50.0, 50) +
+           0.05 * coalesce(prp.recent_upvotes,0)
+         ) as perf_score,
+         row_number() over (
+           partition by date_trunc('year', uqs.cohort_month)
+           order by (
+             0.45 * uqs.quality_component +
+             0.25 * least(uqs.rep_per_day, 50) +
+             0.15 * uqs.positive_answer_ratio * 100 +
+             0.10 * least(uqs.avg_views_per_q / 50.0, 50) +
+             0.05 * coalesce(prp.recent_upvotes,0)
+           ) desc, uqs.reputation desc, uqs.total_badges desc
+         ) as cohort_rank
+  from user_quality_score uqs
+  left join per_user_recent_perf prp on prp.user_id = uqs.user_id
+),
+cohort_summary as (
+  select date_trunc('year', cohort_month) as cohort_year,
+         count(*) as members,
+         avg(perf_score) as avg_perf,
+         percentile_cont(0.9) within group (order by perf_score) as p90_perf
+  from final_rank
+  group by date_trunc('year', cohort_month)
+),
+outliers as (
+  select fr.user_id,
+         fr.perf_score,
+         cs.cohort_year,
+         case when fr.perf_score >= cs.p90_perf then 1 else 0 end as is_top10pct
+  from final_rank fr
+  join cohort_summary cs on cs.cohort_year = date_trunc('year', fr.cohort_month)
+)
+select fr.user_id,
+       fr.displayname,
+       fr.location,
+       fr.cohort_month,
+       fr.reputation,
+       fr.total_badges,
+       fr.gold_badges,
+       fr.silver_badges,
+       fr.bronze_badges,
+       fr.q_count,
+       fr.a_count,
+       fr.c_count,
+       fr.top_tag,
+       round(fr.rep_per_day::numeric, 3) as rep_per_day,
+       round(fr.quality_component::numeric, 3) as quality_component,
+       round(fr.avg_views_per_q::numeric, 3) as avg_views_per_q,
+       round(fr.positive_answer_ratio::numeric, 3) as positive_answer_ratio,
+       round(coalesce(fr.recent_q_avg_score,0)::numeric, 3) as recent_q_avg_score,
+       round(coalesce(fr.recent_a_avg_score,0)::numeric, 3) as recent_a_avg_score,
+       coalesce(fr.recent_upvotes,0) as recent_upvotes,
+       round(fr.perf_score::numeric, 3) as perf_score,
+       fr.cohort_rank,
+       case when o.is_top10pct = 1 then 'Top 10% in cohort' else '—' end as cohort_flag
+from final_rank fr
+left join outliers o on o.user_id = fr.user_id
+where (
+        (
+          fr.perf_score > 25
+          and coalesce(fr.recent_upvotes,0) >= 3
+        )
+        or (
+          fr.gold_badges >= 1
+          and fr.quality_component > 10
+          and (fr.q_count + fr.a_count) >= 20
+        )
+        or (
+          fr.reputation >= 10000
+          and coalesce(fr.recent_q_avg_score,0) + coalesce(fr.recent_a_avg_score,0) > 2
+        )
+      )
+  and exists (
+          select 1
+          from posts p2
+          where p2.owneruserid = fr.user_id
+            and p2.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '400 days'
+        )
+order by fr.perf_score desc, fr.reputation desc, fr.total_badges desc
+limit 250;

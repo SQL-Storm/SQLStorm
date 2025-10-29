@@ -1,0 +1,237 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        CASE 
+            WHEN u.Reputation > 100000 THEN 'Elite'
+            WHEN u.Reputation > 10000 THEN 'Veteran'
+            WHEN u.Reputation > 1000 THEN 'Regular'
+            ELSE 'Newbie'
+        END AS RepLevel,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank,
+        PERCENT_RANK() OVER (ORDER BY u.Reputation) AS RepPercentile
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.AccountId IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id,
+        p.OwnerUserId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Tags,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END AS PostType,
+        CASE 
+            WHEN p.Score > 100 THEN 'Hot'
+            WHEN p.Score > 50 THEN 'Popular'
+            WHEN p.Score > 10 THEN 'Moderate'
+            ELSE 'Low'
+        END AS ScoreCategory,
+        -- difference in days between truncated dates; result as integer
+        CAST(EXTRACT(EPOCH FROM (DATE_TRUNC('day', p.LastActivityDate) - DATE_TRUNC('day', p.CreationDate))) / 86400 AS INTEGER) AS DaysActive,
+        COALESCE(p.AnswerCount, 0) AS AnswerCountCorrected,
+        COALESCE(p.Tags, '') AS TagsCleaned,
+        STRING_AGG(TRIM(BOTH '>' FROM TRIM(BOTH '<' FROM tag)), ',') AS TagList
+    FROM Posts p
+    LEFT JOIN LATERAL (
+        SELECT regexp_split_to_table(COALESCE(p.Tags, ''), '><') AS tag
+    ) tag_split ON true
+    WHERE p.PostTypeId IN (1, 2) 
+      AND p.CreationDate >= TIMESTAMP '2020-01-01'
+    GROUP BY p.Id, p.OwnerUserId, p.Title, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.CreationDate, p.LastActivityDate, p.Tags, p.PostTypeId
+),
+TopQuestions AS (
+    SELECT 
+        pa.Id,
+        pa.Title,
+        pa.Score,
+        pa.ViewCount,
+        pa.AnswerCount,
+        pa.OwnerUserId,
+        pa.ScoreCategory,
+        pa.DaysActive,
+        pa.TagList,
+        NTILE(10) OVER (ORDER BY pa.Score DESC) AS ScoreQuintile,
+        ROW_NUMBER() OVER (PARTITION BY pa.OwnerUserId ORDER BY pa.Score DESC) AS UserQuestionRank
+    FROM PostAnalysis pa
+    WHERE pa.Score > 50
+),
+UserPostPerformance AS (
+    SELECT 
+        us.Id AS UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.RepLevel,
+        us.PostCount,
+        us.CommentCount,
+        us.BadgeCount,
+        SUM(pa.Score) AS TotalScore,
+        AVG(pa.Score) AS AvgScore,
+        MAX(pa.Score) AS MaxScore,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY pa.Score) AS MedianScore,
+        COUNT(CASE WHEN pa.Score > 100 THEN 1 END) AS HotPostCount,
+        COUNT(CASE WHEN pa.Score > 50 THEN 1 END) AS PopularPostCount,
+        COUNT(CASE WHEN pa.PostType = 'Question' THEN 1 END) AS QuestionCount,
+        COUNT(CASE WHEN pa.PostType = 'Answer' THEN 1 END) AS AnswerCount
+    FROM UserStats us
+    LEFT JOIN PostAnalysis pa ON us.Id = pa.OwnerUserId
+    GROUP BY us.Id, us.DisplayName, us.Reputation, us.RepLevel, us.PostCount, us.CommentCount, us.BadgeCount
+),
+TagStats AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.IsRequired,
+        t.IsModeratorOnly,
+        DENSE_RANK() OVER (ORDER BY t.Count DESC) AS TagRank,
+        AVG(t.Count) OVER () AS AvgTagCount,
+        CASE 
+            WHEN t.Count > (SELECT AVG(t2.Count) FROM Tags t2) THEN 'Popular'
+            WHEN t.Count > (SELECT AVG(t2.Count)/2 FROM Tags t2) THEN 'Moderate'
+            ELSE 'Rare'
+        END AS PopularityLevel
+    FROM Tags t
+    WHERE t.Count > 100
+),
+PerformanceMetrics AS (
+    SELECT 
+        'Overall' AS MetricType,
+        COUNT(*) AS TotalUsers,
+        AVG(Reputation) AS AvgReputation,
+        MAX(Reputation) AS MaxReputation,
+        (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND CreationDate >= TIMESTAMP '2021-01-01') AS QuestionCount2021,
+        (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 2 AND CreationDate >= TIMESTAMP '2021-01-01') AS AnswerCount2021
+    FROM UserStats
+    UNION ALL
+    SELECT 
+        'Top Users' AS MetricType,
+        COUNT(*) AS TotalUsers,
+        AVG(Reputation) AS AvgReputation,
+        MAX(Reputation) AS MaxReputation,
+        (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND CreationDate >= TIMESTAMP '2021-01-01' AND OwnerUserId IN (SELECT Id FROM UserStats WHERE RepRank <= 100)) AS QuestionCount2021,
+        (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 2 AND CreationDate >= TIMESTAMP '2021-01-01' AND OwnerUserId IN (SELECT Id FROM UserStats WHERE RepRank <= 100)) AS AnswerCount2021
+    FROM UserStats 
+    WHERE RepRank <= 100
+)
+SELECT 
+    upp.UserId,
+    upp.DisplayName,
+    upp.Reputation,
+    upp.RepLevel,
+    upp.PostCount,
+    upp.CommentCount,
+    upp.BadgeCount,
+    upp.TotalScore,
+    upp.AvgScore,
+    upp.MaxScore,
+    upp.HotPostCount,
+    upp.PopularPostCount,
+    upp.QuestionCount,
+    upp.AnswerCount,
+    CASE WHEN upp.MaxScore > 1000 THEN 'Elite Contributor' ELSE 'Regular Contributor' END AS ContributionLevel,
+    CASE WHEN upp.QuestionCount > 0 THEN ('Average Score: ' || CAST(upp.AvgScore AS VARCHAR(50))) ELSE 'No Questions' END AS QuestionAnalysis,
+    COALESCE((
+        SELECT STRING_AGG(t.TagName, ', ') 
+        FROM Tags t 
+        WHERE t.Count IN (
+            SELECT MAX(t2.Count) 
+            FROM Tags t2 
+            WHERE t2.TagName IN (
+                SELECT TRIM(BOTH '<' FROM TRIM(BOTH '>' FROM tag))
+                FROM PostAnalysis pa2, LATERAL regexp_split_to_table(COALESCE(pa2.Tags, ''), '><') AS tag
+                WHERE pa2.OwnerUserId = upp.UserId
+            )
+        )
+    ), 'No Popular Tags') AS TopTags,
+    (SELECT COUNT(*) FROM TopQuestions tq WHERE tq.OwnerUserId = upp.UserId AND tq.ScoreQuintile <= 2) AS HighScoringQuestions,
+    (SELECT AVG(tp.Score) FROM PostAnalysis tp JOIN TopQuestions tq ON tp.Id = tq.Id WHERE tq.OwnerUserId = upp.UserId) AS AvgHighScoredQuestion,
+    (SELECT COUNT(*) FROM Votes v JOIN Posts p ON v.PostId = p.Id WHERE p.OwnerUserId = upp.UserId AND v.VoteTypeId = 2) AS UpVotesReceived,
+    (SELECT COUNT(*) FROM Votes v JOIN Posts p ON v.PostId = p.Id WHERE p.OwnerUserId = upp.UserId AND v.VoteTypeId = 3) AS DownVotesReceived,
+    CASE 
+        WHEN upp.Reputation > 1000 AND upp.PostCount > 50 THEN 'Active'
+        WHEN upp.Reputation > 100 AND upp.PostCount > 10 THEN 'Moderate'
+        ELSE 'New'
+    END AS ActivityLevel,
+    (SELECT STRING_AGG(('Tag:' || ts.TagName || ' (' || ts.Count || ')'), '; ') 
+     FROM Tags ts 
+     WHERE ts.Count > (SELECT AVG(t3.Count) FROM Tags t3) + 200
+       AND ts.TagName IN (
+           SELECT TRIM(BOTH '<' FROM TRIM(BOTH '>' FROM tag))
+           FROM PostAnalysis pa3, LATERAL regexp_split_to_table(COALESCE(pa3.Tags, ''), '><') AS tag
+           WHERE pa3.OwnerUserId = upp.UserId
+       )
+    ) AS PopularTags,
+    CAST(COUNT(*) AS VARCHAR(50)) AS MetricsCount,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.UserId = upp.UserId) AS EditingActivity,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = upp.UserId AND b.Class = 1) AS GoldBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = upp.UserId AND b.Class = 2) AS SilverBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = upp.UserId AND b.Class = 3) AS BronzeBadges,
+    (SELECT AVG(us2.Reputation) FROM UserStats us2) AS AvgReputationTotal,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.UserId = upp.UserId AND ph.PostHistoryTypeId = 2) AS BodyEdits,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.UserId = upp.UserId AND ph.PostHistoryTypeId = 4) AS TitleEdits,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.UserId = upp.UserId AND ph.PostHistoryTypeId = 6) AS TagsEdits,
+    (SELECT MAX(CreationDate) FROM PostHistory ph WHERE ph.UserId = upp.UserId) AS LastEditDate,
+    CASE 
+        WHEN (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = upp.UserId AND Score > 100) > 0 THEN 'High Scoring Contributor'
+        WHEN (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = upp.UserId AND Score > 50) > 0 THEN 'Moderate Scoring Contributor'
+        ELSE 'Low Scoring Contributor'
+    END AS ScoringContribution,
+    (SELECT STRING_AGG(t1.TagName, ', ') FROM Tags t1 
+     WHERE t1.Count = (SELECT MAX(t2.Count) FROM Tags t2) 
+       AND t1.TagName IN (
+           SELECT TRIM(BOTH '<' FROM TRIM(BOTH '>' FROM tag))
+           FROM PostAnalysis pa4, LATERAL regexp_split_to_table(COALESCE(pa4.Tags, ''), '><') AS tag
+           WHERE pa4.OwnerUserId = upp.UserId
+       )
+    ) AS MostPopularTagInUserPosts,
+    (SELECT COUNT(*) FROM Comments c WHERE c.UserId = upp.UserId) AS CommentCountTotal,
+    ROW_NUMBER() OVER (ORDER BY upp.TotalScore DESC) AS RankingByScore,
+    PERCENT_RANK() OVER (ORDER BY upp.TotalScore DESC) AS ScorePercentile,
+    (SELECT AVG(Reputation) FROM UserStats WHERE RepRank <= 10) AS Top10AvgRep,
+    (SELECT MAX(Reputation) FROM UserStats WHERE RepRank <= 10) AS Top10MaxRep
+FROM UserPostPerformance upp
+LEFT JOIN UserStats us ON upp.UserId = us.Id
+LEFT JOIN PostAnalysis pa ON pa.OwnerUserId = upp.UserId
+WHERE upp.PostCount > 0
+GROUP BY 
+    upp.UserId,
+    upp.DisplayName,
+    upp.Reputation,
+    upp.RepLevel,
+    upp.PostCount,
+    upp.CommentCount,
+    upp.BadgeCount,
+    upp.TotalScore,
+    upp.AvgScore,
+    upp.MaxScore,
+    upp.HotPostCount,
+    upp.PopularPostCount,
+    upp.QuestionCount,
+    upp.AnswerCount
+HAVING 
+    upp.PostCount > 10 OR upp.Reputation > 1000
+ORDER BY 
+    upp.TotalScore DESC
+LIMIT 100 OFFSET 0;

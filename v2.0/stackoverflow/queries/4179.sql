@@ -1,0 +1,204 @@
+WITH
+  RankedPostHistory AS (
+    SELECT
+      ph.PostId,
+      ph.UserId,
+      ph.PostHistoryTypeId,
+      ph.CreationDate,
+      ph.Comment,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (1,2,3,4,5,6,7,8,9)
+  ),
+  LatestPostRevisions AS (
+    SELECT
+      rph.PostId,
+      rph.UserId AS EditorUserId,
+      rph.PostHistoryTypeId AS LastEditTypeId,
+      rph.CreationDate AS LastEditDate,
+      rph.Comment AS LastEditComment,
+      CASE
+        WHEN rph.PostHistoryTypeId IN (1,2,3) THEN 'Initial'
+        WHEN rph.PostHistoryTypeId IN (4,5,6) THEN 'Edit'
+        WHEN rph.PostHistoryTypeId IN (7,8,9) THEN 'Rollback'
+        ELSE 'Other'
+      END AS EditTypeCategory,
+      rph.rn
+    FROM RankedPostHistory rph
+    WHERE rph.rn = 1
+  ),
+  UserPostStats AS (
+    SELECT
+      p.OwnerUserId,
+      COUNT(p.Id) AS TotalPostsOwned,
+      SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsOwned,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersOwned,
+      AVG(p.Score) AS AverageScoreOwned,
+      MAX(p.CreationDate) AS LastPostDateOwned
+    FROM Posts p
+    GROUP BY p.OwnerUserId
+  ),
+  UserCommentStats AS (
+    SELECT
+      c.UserId,
+      COUNT(c.Id) AS TotalComments,
+      AVG(c.Score) AS AverageCommentScore,
+      MAX(c.CreationDate) AS LastCommentDate
+    FROM Comments c
+    GROUP BY c.UserId
+  ),
+  UserVoteStats AS (
+    SELECT
+      v.UserId,
+      COUNT(CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS TotalUpVotes,
+      COUNT(CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS TotalDownVotes,
+      COUNT(CASE WHEN v.VoteTypeId = 5 THEN v.Id END) AS TotalFavorites,
+      MAX(v.CreationDate) AS LastVoteDate
+    FROM Votes v
+    GROUP BY v.UserId
+  ),
+  ComplexCalculations AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.Views AS ProfileViews,
+      u.UpVotes AS ProfileUpVotes,
+      u.DownVotes AS ProfileDownVotes,
+      u.CreationDate AS UserCreationDate,
+      CASE
+        WHEN u.WebsiteUrl IS NULL THEN 'No Website'
+        WHEN POSITION('http' IN u.WebsiteUrl) = 0 THEN 'Invalid URL Format'
+        ELSE 'Valid URL'
+      END AS WebsiteUrlStatus,
+      COALESCE(ups.TotalPostsOwned, 0) AS TotalPostsOwned,
+      COALESCE(ups.QuestionsOwned, 0) AS QuestionsOwned,
+      COALESCE(ups.AnswersOwned, 0) AS AnswersOwned,
+      COALESCE(ups.AverageScoreOwned, 0.0) AS AverageScoreOwned,
+      COALESCE(ucs.TotalComments, 0) AS TotalComments,
+      COALESCE(ucs.AverageCommentScore, 0.0) AS AverageCommentScore,
+      COALESCE(uvs.TotalUpVotes, 0) AS TotalUpVotes,
+      COALESCE(uvs.TotalDownVotes, 0) AS TotalDownVotes,
+      COALESCE(uvs.TotalFavorites, 0) AS TotalFavorites,
+      lpr.LastEditDate,
+      lpr.EditTypeCategory,
+      CAST(DATE_PART('day', (TIMESTAMP '2024-10-01 12:34:56') - u.CreationDate) AS INTEGER) AS AccountAgeDays,
+      CASE
+        WHEN u.LastAccessDate < (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6 months') THEN 'Inactive'
+        ELSE 'Active'
+      END AS UserActivityStatus,
+      CASE
+        WHEN COALESCE(ups.LastPostDateOwned, TIMESTAMP '0001-01-01 00:00:00') > COALESCE(ucs.LastCommentDate, TIMESTAMP '0001-01-01 00:00:00')
+         AND COALESCE(ups.LastPostDateOwned, TIMESTAMP '0001-01-01 00:00:00') > COALESCE(uvs.LastVoteDate, TIMESTAMP '0001-01-01 00:00:00') THEN 'Post Dominant'
+        WHEN COALESCE(ucs.LastCommentDate, TIMESTAMP '0001-01-01 00:00:00') > COALESCE(ups.LastPostDateOwned, TIMESTAMP '0001-01-01 00:00:00')
+         AND COALESCE(ucs.LastCommentDate, TIMESTAMP '0001-01-01 00:00:00') > COALESCE(uvs.LastVoteDate, TIMESTAMP '0001-01-01 00:00:00') THEN 'Comment Dominant'
+        WHEN COALESCE(uvs.LastVoteDate, TIMESTAMP '0001-01-01 00:00:00') > COALESCE(ups.LastPostDateOwned, TIMESTAMP '0001-01-01 00:00:00')
+         AND COALESCE(uvs.LastVoteDate, TIMESTAMP '0001-01-01 00:00:00') > COALESCE(ucs.LastCommentDate, TIMESTAMP '0001-01-01 00:00:00') THEN 'Vote Dominant'
+        ELSE 'Mixed Activity'
+      END AS PrimaryActivityType
+    FROM Users u
+    LEFT JOIN UserPostStats ups ON u.Id = ups.OwnerUserId
+    LEFT JOIN UserCommentStats ucs ON u.Id = ucs.UserId
+    LEFT JOIN UserVoteStats uvs ON u.Id = uvs.UserId
+    LEFT JOIN LatestPostRevisions lpr ON u.Id = lpr.EditorUserId
+    GROUP BY
+      u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate, u.WebsiteUrl,
+      ups.TotalPostsOwned, ups.QuestionsOwned, ups.AnswersOwned, ups.AverageScoreOwned, ups.LastPostDateOwned,
+      ucs.TotalComments, ucs.AverageCommentScore, ucs.LastCommentDate,
+      uvs.TotalUpVotes, uvs.TotalDownVotes, uvs.TotalFavorites, uvs.LastVoteDate,
+      lpr.LastEditDate, lpr.EditTypeCategory, u.LastAccessDate
+  )
+SELECT
+  cc.UserId,
+  cc.DisplayName,
+  cc.Reputation,
+  cc.ProfileViews,
+  cc.AccountAgeDays,
+  cc.UserActivityStatus,
+  cc.WebsiteUrlStatus,
+  cc.TotalPostsOwned,
+  cc.QuestionsOwned,
+  cc.AnswersOwned,
+  cc.AverageScoreOwned,
+  cc.TotalComments,
+  cc.AverageCommentScore,
+  cc.TotalUpVotes,
+  cc.TotalDownVotes,
+  cc.TotalFavorites,
+  cc.LastEditDate,
+  cc.EditTypeCategory,
+  cc.PrimaryActivityType,
+  p.Title,
+  pt.Name AS PostTypeName,
+  p.CreationDate AS PostCreationDate,
+  p.Score AS PostScore,
+  p.FavoriteCount AS PostFavoriteCount,
+  p.ViewCount AS PostViewCount,
+  p.CommentCount AS PostCommentCount,
+  p.AnswerCount AS PostAnswerCount,
+  CASE WHEN p.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS PostStatus,
+  CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Wiki' ELSE 'User Owned' END AS PostOwnership,
+  p.ContentLicense,
+  CASE WHEN EXISTS (SELECT 1 FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3) THEN 'Has Duplicate Link' ELSE 'No Duplicate Link' END AS DuplicateLinkStatus,
+  CASE WHEN EXISTS (SELECT 1 FROM PostHistory ph_closed WHERE ph_closed.PostId = p.Id AND ph_closed.PostHistoryTypeId = 10) THEN 'Was Closed' ELSE 'Never Closed' END AS CloseHistoryStatus,
+  (SELECT COUNT(*) FROM Comments c_sub WHERE c_sub.PostId = p.Id) AS CommentCountSubquery,
+  (SELECT MAX(v_sub.CreationDate) FROM Votes v_sub WHERE v_sub.PostId = p.Id AND v_sub.VoteTypeId = 2) AS LastUpVoteDateSubquery,
+  CASE WHEN cc.UserCreationDate < (p.CreationDate - INTERVAL '1 year') THEN 'Older Than 1 Year' ELSE 'Younger Than 1 Year' END AS UserAgeVsPostAge,
+  LENGTH(p.Body) AS PostBodyLength,
+  REPLACE(p.Title, ' ', '_') AS TitleWithUnderscores
+FROM ComplexCalculations cc
+JOIN Posts p ON cc.UserId = p.OwnerUserId
+JOIN PostTypes pt ON p.PostTypeId = pt.Id
+WHERE
+  cc.Reputation > 1000
+  AND p.Score > 5
+  AND cc.TotalPostsOwned BETWEEN 10 AND 1000
+  AND p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '12 months')
+  AND cc.UserActivityStatus = 'Active'
+  AND pt.Name IN ('Question', 'Answer')
+UNION ALL
+SELECT
+  NULL AS UserId,
+  'Community User' AS DisplayName,
+  NULL AS Reputation,
+  NULL AS ProfileViews,
+  NULL AS AccountAgeDays,
+  NULL AS UserActivityStatus,
+  'No Website' AS WebsiteUrlStatus,
+  NULL AS TotalPostsOwned,
+  NULL AS QuestionsOwned,
+  NULL AS AnswersOwned,
+  NULL AS AverageScoreOwned,
+  NULL AS TotalComments,
+  NULL AS AverageCommentScore,
+  NULL AS TotalUpVotes,
+  NULL AS TotalDownVotes,
+  NULL AS TotalFavorites,
+  NULL AS LastEditDate,
+  NULL AS EditTypeCategory,
+  NULL AS PrimaryActivityType,
+  p.Title,
+  pt.Name AS PostTypeName,
+  p.CreationDate AS PostCreationDate,
+  p.Score AS PostScore,
+  p.FavoriteCount AS PostFavoriteCount,
+  p.ViewCount AS PostViewCount,
+  p.CommentCount AS PostCommentCount,
+  p.AnswerCount AS PostAnswerCount,
+  CASE WHEN p.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS PostStatus,
+  CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Wiki' ELSE 'User Owned' END AS PostOwnership,
+  p.ContentLicense,
+  CASE WHEN EXISTS (SELECT 1 FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3) THEN 'Has Duplicate Link' ELSE 'No Duplicate Link' END AS DuplicateLinkStatus,
+  CASE WHEN EXISTS (SELECT 1 FROM PostHistory ph_closed WHERE ph_closed.PostId = p.Id AND ph_closed.PostHistoryTypeId = 10) THEN 'Was Closed' ELSE 'Never Closed' END AS CloseHistoryStatus,
+  (SELECT COUNT(*) FROM Comments c_sub WHERE c_sub.PostId = p.Id) AS CommentCountSubquery,
+  (SELECT MAX(v_sub.CreationDate) FROM Votes v_sub WHERE v_sub.PostId = p.Id AND v_sub.VoteTypeId = 2) AS LastUpVoteDateSubquery,
+  NULL AS UserAgeVsPostAge,
+  LENGTH(p.Body) AS PostBodyLength,
+  REPLACE(p.Title, ' ', '_') AS TitleWithUnderscores
+FROM Posts p
+JOIN PostTypes pt ON p.PostTypeId = pt.Id
+WHERE
+  p.OwnerUserId = -1
+  AND p.Score > 10
+  AND p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '12 months')
+  AND pt.Name = 'Answer';

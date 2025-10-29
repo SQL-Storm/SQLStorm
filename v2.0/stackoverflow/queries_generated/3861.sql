@@ -1,0 +1,112 @@
+-- {"query": "3861.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1918} 
+
+/*  Complex benchmark query using CTEs, window functions, outer joins,
+    correlated sub‑queries, set operators and rich expressions           */
+WITH RECURSIVE
+    /* Latest question per user (row_number = 1) */
+    latest_q AS (
+        SELECT  p.OwnerUserId,
+                p.Title,
+                p.CreationDate,
+                ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId
+                                   ORDER BY p.CreationDate DESC) AS rn
+        FROM    Posts p
+        WHERE   p.PostTypeId = 1                         /* only questions */
+    ),
+
+    /* Most recent badge per user, plus aggregated gold badge list */
+    user_badge AS (
+        SELECT  b.UserId,
+                MAX(b.Date)                                   AS last_badge_dt,
+                STRING_AGG(CASE WHEN b.Class = 1 THEN b.Name END,
+                           ', '
+                          ) FILTER (WHERE b.Class = 1)      AS gold_badges
+        FROM    Badges b
+        GROUP BY b.UserId
+    ),
+
+    /* Tag popularity and length of excerpt (if any) */
+    tag_stats AS (
+        SELECT  t.Id,
+                t.TagName,
+                t.Count,
+                COALESCE(LENGTH(p.Body),0)                      AS excerpt_len
+        FROM    Tags t
+        LEFT JOIN Posts p
+               ON p.Id = t.ExcerptPostId
+    ),
+
+    /* Voting aggregates per user */
+    vote_agg AS (
+        SELECT  p.OwnerUserId,
+                SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS up_votes,
+                SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS down_votes,
+                MAX(v.CreationDate)                               AS last_vote_dt
+        FROM    Posts p
+        JOIN    Votes v ON v.PostId = p.Id
+        WHERE   v.VoteTypeId IN (2,3)            /* up/down votes only */
+        GROUP BY p.OwnerUserId
+    ),
+
+    /* Concatenated list of distinct tags a user has used in questions */
+    user_tags AS (
+        SELECT  p.OwnerUserId,
+                STRING_AGG(DISTINCT t.TagName, ', ') AS tag_list
+        FROM    Posts p
+        CROSS JOIN LATERAL
+                regexp_split_to_table(
+                    COALESCE(p.Tags,'')
+                    , '[><]' ) AS raw_tag
+        LEFT JOIN Tags t ON t.TagName = raw_tag
+        WHERE   p.PostTypeId = 1                /* only questions */
+        GROUP BY p.OwnerUserId
+    )
+
+SELECT
+    u.Id                                    AS user_id,
+    u.DisplayName,
+    u.Reputation,
+    COALESCE(ub.gold_badges,'')             AS gold_badges,
+    ub.last_badge_dt,
+    lq.Title                                AS latest_question_title,
+    lq.CreationDate                         AS latest_question_date,
+    COALESCE(va.up_votes,0) - COALESCE(va.down_votes,0) AS net_vote_score,
+    CASE
+        WHEN u.Location IS NULL THEN 'Unknown'
+        ELSE u.Location
+    END                                     AS location,
+    COALESCE(ut.tag_list,'')                AS top_tags,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS reputation_rank,
+    /* correlated sub‑query: total answers authored */
+    (SELECT COUNT(*)
+       FROM Posts a
+      WHERE a.OwnerUserId = u.Id
+        AND a.PostTypeId = 2)               AS answer_count,
+    /* correlated sub‑query: total comments authored */
+    (SELECT COUNT(*)
+       FROM Comments c
+      WHERE c.UserId = u.Id)                AS comment_count,
+    va.last_vote_dt                         AS last_vote_date,
+    /* derived metric using NULL‑aware logic */
+    COALESCE(u.Views,0) *
+    (1 + (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id)) AS weighted_activity
+FROM
+    Users u
+LEFT JOIN user_badge ub      ON ub.UserId = u.Id
+LEFT JOIN latest_q lq        ON lq.OwnerUserId = u.Id AND lq.rn = 1
+LEFT JOIN vote_agg va       ON va.OwnerUserId = u.Id
+LEFT JOIN user_tags ut      ON ut.OwnerUserId = u.Id
+WHERE
+    u.Reputation > 1000
+    AND (u.CreationDate < CURRENT_TIMESTAMP - INTERVAL '5 years'
+         OR u.EmailHash IS NOT NULL)
+ORDER BY
+    u.Reputation DESC
+LIMIT 100
+
+UNION ALL
+
+/* Dummy row to test set‑operator handling and NULL ordering */
+SELECT
+    NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL
+ORDER BY reputation_rank NULLS LAST;

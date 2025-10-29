@@ -1,0 +1,148 @@
+WITH RankedUserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(p.Id) AS PostCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.CreationDate ASC) AS ReputationRank,
+        RANK() OVER (PARTITION BY EXTRACT(year FROM u.CreationDate) ORDER BY u.Reputation DESC) AS YearlyReputationRank,
+        COALESCE(AVG(p.Score), 0) AS AveragePostScore,
+        MAX(p.LastActivityDate) AS LatestActivityDate,
+        CASE
+            WHEN u.WebsiteUrl IS NULL OR u.WebsiteUrl = '' THEN 'No Website'
+            WHEN u.WebsiteUrl LIKE '%stackoverflow.com%' THEN 'Stack Overflow Related'
+            ELSE 'External Website'
+        END AS WebsiteCategory,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadgeCount,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadgeCount,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadgeCount
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    WHERE
+        u.DisplayName IS NOT NULL AND u.DisplayName != ''
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.WebsiteUrl
+),
+FrequentCloseReasons AS (
+    SELECT
+        ph.Comment AS CloseReason,
+        COUNT(*) AS CloseCount
+    FROM
+        PostHistory ph
+    WHERE
+        ph.PostHistoryTypeId = 10 AND ph.Comment IS NOT NULL AND ph.Comment != ''
+    GROUP BY
+        ph.Comment
+    ORDER BY
+        CloseCount DESC
+    LIMIT 5
+),
+PostEngagement AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.Score,
+        p.ViewCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate AS PostCreationDate,
+        p.LastActivityDate AS PostLastActivityDate,
+        COALESCE(u.DisplayName, p.OwnerDisplayName) AS OwnerDisplayName,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS PostStatus,
+        p.AnswerCount,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS ActualCommentCount,
+        (SELECT SUM(Score) FROM Comments c WHERE c.PostId = p.Id) AS TotalCommentScore,
+        (
+            SELECT COUNT(pl.Id)
+            FROM PostLinks pl
+            WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3
+        ) AS DuplicateLinkCount,
+        (
+            SELECT COUNT(pl.Id)
+            FROM PostLinks pl
+            WHERE pl.PostId = p.Id AND pl.LinkTypeId = 1
+        ) AS LinkedPostCount,
+        CASE
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Answer Accepted'
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NULL THEN 'No Answer Accepted'
+            ELSE NULL
+        END AS AcceptanceStatus,
+        p.OwnerUserId
+    FROM
+        Posts p
+    JOIN
+        PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN
+        Users u ON p.OwnerUserId = u.Id
+    WHERE
+        p.Score > 100 AND p.ViewCount > 10000
+)
+SELECT
+    rua.UserId,
+    rua.DisplayName,
+    rua.Reputation,
+    rua.UserCreationDate,
+    rua.ReputationRank,
+    rua.YearlyReputationRank,
+    rua.PostCount,
+    rua.QuestionCount,
+    rua.AnswerCount,
+    rua.AveragePostScore,
+    rua.LatestActivityDate,
+    rua.WebsiteCategory,
+    rua.GoldBadgeCount,
+    rua.SilverBadgeCount,
+    rua.BronzeBadgeCount,
+    fcr.CloseReason AS MostFrequentCloseReason,
+    fcr.CloseCount AS MostFrequentCloseReasonCount,
+    pe.PostId,
+    pe.Title AS PostTitle,
+    pe.PostTypeName,
+    pe.Score AS PostScore,
+    pe.ViewCount AS PostViewCount,
+    pe.CommentCount AS PostCommentCount,
+    pe.FavoriteCount AS PostFavoriteCount,
+    pe.PostCreationDate,
+    pe.PostLastActivityDate,
+    pe.OwnerDisplayName AS PostOwnerDisplayName,
+    pe.PostStatus,
+    pe.AnswerCount AS PostAnswerCount,
+    pe.ActualCommentCount,
+    pe.TotalCommentScore,
+    pe.DuplicateLinkCount,
+    pe.LinkedPostCount,
+    pe.AcceptanceStatus,
+    (
+        SELECT COUNT(*)
+        FROM Votes v
+        WHERE v.PostId = pe.PostId AND v.VoteTypeId = 2
+    ) AS UpVoteCount,
+    (
+        SELECT COUNT(*)
+        FROM Votes v
+        WHERE v.PostId = pe.PostId AND v.VoteTypeId = 3
+    ) AS DownVoteCount,
+    CASE
+        WHEN rua.Reputation > 100000 THEN 'High Reputation'
+        WHEN rua.Reputation BETWEEN 10000 AND 100000 THEN 'Medium Reputation'
+        ELSE 'Low Reputation'
+    END AS ReputationTier
+FROM
+    RankedUserActivity rua
+LEFT JOIN
+    PostEngagement pe ON rua.UserId = pe.OwnerUserId
+LEFT JOIN
+    FrequentCloseReasons fcr ON 1=1
+WHERE
+    rua.Reputation > 5000
+    AND pe.Score IS NOT NULL
+ORDER BY
+    rua.Reputation DESC, pe.Score DESC
+LIMIT 1000;

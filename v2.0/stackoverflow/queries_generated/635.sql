@@ -1,0 +1,334 @@
+-- {"query": "635.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3060} 
+with recent_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.location,
+    coalesce(nullif(trim(u.websiteurl), ''), 'n/a') as websiteurl_norm,
+    date_trunc('month', u.creationdate) as cohort_month,
+    dense_rank() over (order by date_trunc('month', u.creationdate)) as cohort_rank
+  from users u
+  where u.creationdate >= (select coalesce(max(creationdate), '1900-01-01') from users) - interval '5 years'
+),
+user_badge_agg as (
+  select
+    b.userid,
+    count(*) as badge_count,
+    sum(case when b.class = 1 then 1 else 0 end) as gold_count,
+    sum(case when b.class = 2 then 1 else 0 end) as silver_count,
+    sum(case when b.class = 3 then 1 else 0 end) as bronze_count,
+    min(b.date) as first_badge_at,
+    max(b.date) as last_badge_at
+  from badges b
+  group by b.userid
+),
+question_posts as (
+  select
+    p.id,
+    p.owneruserid,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.answercount,
+    p.title,
+    p.tags,
+    p.closeddate,
+    p.acceptedanswerid
+  from posts p
+  where p.posttypeid = 1
+),
+answer_posts as (
+  select
+    p.id,
+    p.parentid,
+    p.owneruserid,
+    p.creationdate,
+    p.score
+  from posts p
+  where p.posttypeid = 2
+),
+votes_agg as (
+  select
+    v.postid,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+    sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_total
+  from votes v
+  group by v.postid
+),
+comment_agg as (
+  select
+    c.postid,
+    count(*) as comment_count,
+    max(c.creationdate) as last_comment_at
+  from comments c
+  group by c.postid
+),
+dup_links as (
+  select
+    pl.postid,
+    count(*) filter (where pl.linktypeid = 3) as duplicate_of_count,
+    count(*) filter (where pl.linktypeid = 1) as linked_count
+  from postlinks pl
+  group by pl.postid
+),
+close_events as (
+  select
+    ph.postid,
+    min(ph.creationdate) as first_close_at,
+    max(ph.creationdate) as last_close_at,
+    count(*) filter (where ph.posthistorytypeid = 10) as close_votes_events,
+    count(distinct case when ph.posthistorytypeid = 10 then ph.userid end) as distinct_closers,
+    max(case when ph.posthistorytypeid = 10 then nullif(ph.comment, '') end) as last_close_reason_raw
+  from posthistory ph
+  where ph.posthistorytypeid in (10,11,12,13,14,15,35)
+  group by ph.postid
+),
+tag_exploded as (
+  select
+    q.id as question_id,
+    unnest(string_to_array(substring(q.tags, 2, greatest(length(q.tags)-2,0)), '><')) as tag
+  from question_posts q
+  where q.tags is not null and q.tags like '<%>'
+),
+tag_stats as (
+  select
+    t.tag as tagname,
+    count(distinct t.question_id) as tagged_questions,
+    avg(q.score) as avg_q_score,
+    sum(coalesce(va.upvotes,0) - coalesce(va.downvotes,0)) as net_votes_on_q
+  from tag_exploded t
+  join question_posts q on q.id = t.question_id
+  left join votes_agg va on va.postid = q.id
+  group by t.tag
+),
+user_activity as (
+  select
+    ru.user_id,
+    count(distinct q.id) as questions_asked,
+    count(distinct a.id) as answers_given,
+    sum(coalesce(vq.upvotes,0)) + sum(coalesce(va.upvotes,0)) as total_upvotes,
+    sum(coalesce(vq.downvotes,0)) + sum(coalesce(va.downvotes,0)) as total_downvotes,
+    sum(coalesce(vq.favorites,0)) as question_favorites,
+    sum(coalesce(vq.bounty_total,0) + coalesce(va.bounty_total,0)) as total_bounty,
+    max(greatest(coalesce(q.creationdate, '1900-01-01'), coalesce(a.creationdate, '1900-01-01'))) as last_post_at
+  from recent_users ru
+  left join question_posts q on q.owneruserid = ru.user_id
+  left join votes_agg vq on vq.postid = q.id
+  left join answer_posts a on a.owneruserid = ru.user_id
+  left join votes_agg va on va.postid = a.id
+  group by ru.user_id
+),
+accepted_answer_stats as (
+  select
+    q.owneruserid as asker_id,
+    count(*) as questions_with_accepted,
+    sum(case when a.score > 0 then 1 else 0 end) as accepted_with_positive_score
+  from question_posts q
+  join posts a on a.id = q.acceptedanswerid
+  group by q.owneruserid
+),
+ranked_questions as (
+  select
+    q.*,
+    coalesce(va.upvotes,0) as upvotes,
+    coalesce(va.downvotes,0) as downvotes,
+    coalesce(va.favorites,0) as favorites,
+    coalesce(va.bounty_total,0) as bounty_total,
+    coalesce(ca.comment_count,0) as comment_count,
+    coalesce(dl.duplicate_of_count,0) as duplicate_of_count,
+    row_number() over (
+      partition by q.owneruserid
+      order by
+        (coalesce(va.upvotes,0) - coalesce(va.downvotes,0)) desc,
+        coalesce(q.viewcount,0) desc,
+        q.creationdate desc
+    ) as rn_by_owner
+  from question_posts q
+  left join votes_agg va on va.postid = q.id
+  left join comment_agg ca on ca.postid = q.id
+  left join dup_links dl on dl.postid = q.id
+),
+user_quality as (
+  select
+    ru.user_id,
+    percentile_cont(0.5) within group (order by rq.score) as median_q_score,
+    avg(rq.score) filter (where rq.score is not null) as avg_q_score,
+    avg(a.score) filter (where a.score is not null) as avg_a_score,
+    avg((coalesce(rq.upvotes,0) - coalesce(rq.downvotes,0))) as avg_q_net_votes,
+    max(rq.viewcount) as max_q_views
+  from recent_users ru
+  left join ranked_questions rq on rq.owneruserid = ru.user_id
+  left join answer_posts a on a.owneruserid = ru.user_id
+  group by ru.user_id
+),
+user_flags as (
+  select
+    ru.user_id,
+    case when ua.questions_asked = 0 and ua.answers_given = 0 then 1 else 0 end as is_lurker,
+    case when ua.total_downvotes > ua.total_upvotes then 1 else 0 end as net_negative,
+    case when qb.top_dupe_q_count > 0 then 1 else 0 end as has_duplicates_flag,
+    case when ub.badge_count >= 10 then 1 else 0 end as decorated
+  from recent_users ru
+  left join (
+    select owneruserid, sum(case when duplicate_of_count > 0 then 1 else 0 end) as top_dupe_q_count
+    from ranked_questions
+    where rn_by_owner <= 5
+    group by owneruserid
+  ) qb on qb.owneruserid = ru.user_id
+  left join user_badge_agg ub on ub.userid = ru.user_id
+  left join user_activity ua on ua.user_id = ru.user_id
+),
+user_latest_close as (
+  select
+    q.owneruserid as user_id,
+    max(ce.last_close_at) as last_close_any_q
+  from question_posts q
+  join close_events ce on ce.postid = q.id
+  group by q.owneruserid
+),
+cohort_stats as (
+  select
+    ru.cohort_month,
+    count(*) as cohort_users,
+    avg(ua.questions_asked) as avg_q_per_user,
+    avg(ua.answers_given) as avg_a_per_user,
+    sum(ua.total_upvotes) as cohort_upvotes,
+    sum(ua.total_downvotes) as cohort_downvotes
+  from recent_users ru
+  left join user_activity ua on ua.user_id = ru.user_id
+  group by ru.cohort_month
+),
+top_tags_per_user as (
+  select
+    q.owneruserid as user_id,
+    t.tag,
+    count(*) as q_count,
+    row_number() over (partition by q.owneruserid order by count(*) desc, min(q.creationdate)) as rn
+  from question_posts q
+  join tag_exploded t on t.question_id = q.id
+  group by q.owneruserid, t.tag
+),
+stringified as (
+  select
+    ru.user_id,
+    '[' ||
+      string_agg(
+        distinct
+        '"' || replace(tt.tag, '"', '\"') || '"',
+        ','
+        order by tt.rn
+      )
+    || ']' as top_tags_json
+  from recent_users ru
+  left join top_tags_per_user tt on tt.user_id = ru.user_id and tt.rn <= 3
+  group by ru.user_id
+),
+user_summary as (
+  select
+    ru.user_id,
+    ru.displayname,
+    ru.reputation,
+    ru.cohort_month,
+    ru.cohort_rank,
+    ua.questions_asked,
+    ua.answers_given,
+    ua.total_upvotes - ua.total_downvotes as net_votes,
+    ua.question_favorites,
+    ua.total_bounty,
+    uq.median_q_score,
+    uq.avg_q_score,
+    uq.avg_a_score,
+    uq.avg_q_net_votes,
+    uq.max_q_views,
+    coalesce(ub.badge_count,0) as badge_count,
+    coalesce(ub.gold_count,0) as gold_badges,
+    coalesce(ub.silver_count,0) as silver_badges,
+    coalesce(ub.bronze_count,0) as bronze_badges,
+    al.last_close_any_q,
+    sf.is_lurker,
+    sf.net_negative,
+    sf.has_duplicates_flag,
+    sf.decorated,
+    coalesce(s.top_tags_json, '[]') as top_tags_json
+  from recent_users ru
+  left join user_activity ua on ua.user_id = ru.user_id
+  left join user_badge_agg ub on ub.userid = ru.user_id
+  left join user_quality uq on uq.user_id = ru.user_id
+  left join user_latest_close al on al.user_id = ru.user_id
+  left join user_flags sf on sf.user_id = ru.user_id
+  left join stringified s on s.user_id = ru.user_id
+),
+rank_within_cohort as (
+  select
+    us.*,
+    row_number() over (partition by us.cohort_month order by coalesce(us.net_votes,0) desc, coalesce(us.questions_asked,0) desc, us.reputation desc) as rn_cohort,
+    percent_rank() over (partition by us.cohort_month order by coalesce(us.net_votes,0)) as pct_net_votes
+  from user_summary us
+),
+top_question_per_user as (
+  select
+    rq.owneruserid as user_id,
+    rq.id as question_id,
+    rq.title,
+    rq.score,
+    rq.viewcount,
+    rq.upvotes - rq.downvotes as net_votes,
+    rq.favorites,
+    rq.tags,
+    rq.rn_by_owner
+  from ranked_questions rq
+  where rq.rn_by_owner = 1
+),
+final as (
+  select
+    ruc.user_id,
+    ruc.displayname,
+    ruc.reputation,
+    ruc.cohort_month,
+    ruc.rn_cohort,
+    ruc.pct_net_votes,
+    ruc.questions_asked,
+    ruc.answers_given,
+    ruc.net_votes,
+    ruc.question_favorites,
+    ruc.total_bounty,
+    ruc.median_q_score,
+    ruc.avg_q_score,
+    ruc.avg_a_score,
+    ruc.avg_q_net_votes,
+    ruc.max_q_views,
+    ruc.badge_count,
+    ruc.gold_badges,
+    ruc.silver_badges,
+    ruc.bronze_badges,
+    ruc.last_close_any_q,
+    ruc.is_lurker,
+    ruc.net_negative,
+    ruc.has_duplicates_flag,
+    ruc.decorated,
+    ruc.top_tags_json,
+    tq.question_id as top_question_id,
+    coalesce(nullif(trim(tq.title), ''), '[no title]') as top_question_title,
+    tq.score as top_question_score,
+    tq.viewcount as top_question_views,
+    tq.net_votes as top_question_net_votes,
+    coalesce(nullif(tq.tags,''), '<none>') as top_question_tags
+  from rank_within_cohort ruc
+  left join top_question_per_user tq on tq.user_id = ruc.user_id
+)
+select *
+from final
+where
+  (
+    (questions_asked > 0 and avg_q_score is not null)
+    or
+    (answers_given > 0 and avg_a_score is not null)
+  )
+  and (cohort_month >= date_trunc('month', now() - interval '4 years'))
+  and not (is_lurker = 1 and decorated = 0)
+order by cohort_month desc, rn_cohort
+limit 500;

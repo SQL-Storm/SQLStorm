@@ -1,0 +1,254 @@
+-- {"query": "969.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2886} 
+with recent_users as (
+    select u.id as user_id,
+           u.displayname,
+           u.reputation,
+           u.creationdate,
+           coalesce(nullif(trim(u.location), ''), '(unknown)') as location_norm,
+           date_trunc('month', u.creationdate) as cohort_month,
+           row_number() over (order by u.creationdate desc, u.id desc) as rn_global
+    from users u
+    where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+user_activity as (
+    select u.user_id,
+           count(distinct p.id) filter (where p.posttypeid in (1,2)) as total_posts,
+           count(*) filter (where c.id is not null) as total_comments,
+           sum(greatest(p.score,0)) as nonneg_post_score,
+           sum(case when v.votetypeid=2 then 1 when v.votetypeid=3 then -1 else 0 end) as net_votes_cast_on_posts,
+           max(p.lastactivitydate) as last_post_activity,
+           max(c.creationdate) as last_comment_activity
+    from recent_users u
+    left join posts p on p.owneruserid = u.user_id
+    left join comments c on c.userid = u.user_id
+    left join votes v on v.postid = p.id
+    group by u.user_id
+),
+question_stats as (
+    select q.owneruserid as user_id,
+           count(*) as questions,
+           avg(q.viewcount) as avg_views,
+           sum(q.favoritecount) as favs,
+           sum(case when q.acceptedanswerid is not null then 1 else 0 end) as accepted_qs,
+           percentile_cont(0.9) within group (order by coalesce(q.score,0)) as p90_qscore
+    from posts q
+    where q.posttypeid = 1
+    group by q.owneruserid
+),
+answer_stats as (
+    select a.owneruserid as user_id,
+           count(*) as answers,
+           sum(case when a.id = q.acceptedanswerid then 1 else 0 end) as accepted_answers,
+           avg(coalesce(a.score,0)) as avg_ascore,
+           percentile_cont(0.9) within group (order by coalesce(a.score,0)) as p90_ascore
+    from posts a
+    left join posts q on q.id = a.parentid and q.posttypeid = 1
+    where a.posttypeid = 2
+    group by a.owneruserid
+),
+tag_extract as (
+    select q.id as post_id,
+           unnest(string_to_array(substring(q.tags, 2, length(q.tags)-2), '><')) as tag
+    from posts q
+    where q.posttypeid = 1 and q.tags is not null and length(q.tags) > 2
+),
+user_top_tags as (
+    select q.owneruserid as user_id,
+           t.tag,
+           count(*) as uses,
+           row_number() over (partition by q.owneruserid order by count(*) desc, min(q.id)) as rn_tag
+    from posts q
+    join tag_extract t on t.post_id = q.id
+    group by q.owneruserid, t.tag
+),
+badges_by_user as (
+    select b.userid as user_id,
+           sum(case when b.class=1 then 1 else 0 end) as gold,
+           sum(case when b.class=2 then 1 else 0 end) as silver,
+           sum(case when b.class=3 then 1 else 0 end) as bronze,
+           count(*) as total_badges,
+           max(b.date) as last_badge_date
+    from badges b
+    group by b.userid
+),
+hot_bumps as (
+    select ph.postid,
+           min(ph.creationdate) as first_bump
+    from posthistory ph
+    where ph.posthistorytypeid in (50, 52)
+    group by ph.postid
+),
+dupe_links as (
+    select pl.postid, count(*) filter (where pl.linktypeid=3) as dupes
+    from postlinks pl
+    group by pl.postid
+),
+vote_summaries as (
+    select p.owneruserid as user_id,
+           sum(case when v.votetypeid=2 then 1 else 0 end) as upvotes_on_posts,
+           sum(case when v.votetypeid=3 then 1 else 0 end) as downvotes_on_posts,
+           sum(case when v.votetypeid=8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started,
+           sum(case when v.votetypeid=9 then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded
+    from posts p
+    left join votes v on v.postid = p.id
+    group by p.owneruserid
+),
+post_quality as (
+    select p.owneruserid as user_id,
+           count(*) filter (where p.posttypeid in (1,2) and p.score >= 5) as high_score_posts,
+           count(*) filter (where p.posttypeid in (1,2) and p.score < 0) as negative_posts,
+           sum(coalesce(p.viewcount,0)) filter (where p.posttypeid=1) as total_q_views,
+           sum(case when d.dupes > 0 then 1 else 0 end) as duped_posts,
+           count(*) filter (where hb.postid is not null) as hot_or_bumped
+    from posts p
+    left join dupe_links d on d.postid = p.id
+    left join hot_bumps hb on hb.postid = p.id
+    group by p.owneruserid
+),
+cohort_activity as (
+    select r.cohort_month,
+           r.location_norm,
+           count(*) as users_in_cohort,
+           avg(ua.total_posts) as avg_posts_per_user,
+           avg(coalesce(qs.questions,0)) as avg_qs,
+           avg(coalesce(asn.answers,0)) as avg_as,
+           sum(case when ua.total_posts = 0 and ua.total_comments = 0 then 1 else 0 end) as lurkers
+    from recent_users r
+    left join user_activity ua on ua.user_id = r.user_id
+    left join question_stats qs on qs.user_id = r.user_id
+    left join answer_stats asn on asn.user_id = r.user_id
+    group by r.cohort_month, r.location_norm
+),
+ranked_users as (
+    select r.user_id,
+           r.displayname,
+           r.location_norm,
+           r.cohort_month,
+           ua.total_posts,
+           ua.total_comments,
+           coalesce(qs.questions,0) as questions,
+           coalesce(asn.answers,0) as answers,
+           coalesce(qs.accepted_qs,0) as accepted_qs,
+           coalesce(asn.accepted_answers,0) as accepted_answers,
+           coalesce(b.total_badges,0) as total_badges,
+           coalesce(b.gold,0) as gold,
+           coalesce(b.silver,0) as silver,
+           coalesce(b.bronze,0) as bronze,
+           coalesce(vs.upvotes_on_posts,0) as up_on_posts,
+           coalesce(vs.downvotes_on_posts,0) as down_on_posts,
+           coalesce(vs.bounty_started,0) as bounty_started,
+           coalesce(vs.bounty_awarded,0) as bounty_awarded,
+           coalesce(pq.high_score_posts,0) as high_score_posts,
+           coalesce(pq.negative_posts,0) as negative_posts,
+           coalesce(pq.total_q_views,0) as total_q_views,
+           coalesce(pq.duped_posts,0) as duped_posts,
+           coalesce(pq.hot_or_bumped,0) as hot_or_bumped,
+           ua.nonneg_post_score,
+           ua.last_post_activity,
+           ua.last_comment_activity,
+           coalesce(qs.p90_qscore,0) as p90_qscore,
+           coalesce(asn.p90_ascore,0) as p90_ascore,
+           dense_rank() over (order by coalesce(asn.answers,0) desc, coalesce(qs.questions,0) desc, coalesce(b.total_badges,0) desc, ua.total_posts desc, r.user_id) as contrib_rank
+    from recent_users r
+    left join user_activity ua on ua.user_id = r.user_id
+    left join question_stats qs on qs.user_id = r.user_id
+    left join answer_stats asn on asn.user_id = r.user_id
+    left join badges_by_user b on b.user_id = r.user_id
+    left join vote_summaries vs on vs.user_id = r.user_id
+    left join post_quality pq on pq.user_id = r.user_id
+),
+stringy as (
+    select ru.*,
+           upper(coalesce(nullif(ru.location_norm,'(unknown)'), 'N/A')) as location_caps,
+           initcap(coalesce(ru.displayname, 'User ' || ru.user_id::varchar)) as display_pretty,
+           left(coalesce(ru.location_norm,'(unknown)'), 20) || case when length(coalesce(ru.location_norm,'(unknown)')) > 20 then '…' else '' end as location_short,
+           regexp_replace(coalesce(ru.displayname,''), '\s+', ' ', 'g') as display_compact
+    from ranked_users ru
+),
+leaderboard as (
+    select s.*,
+           (coalesce(answers,0)*3 + coalesce(questions,0)*2 + coalesce(high_score_posts,0)*2 + coalesce(total_badges,0) - coalesce(negative_posts,0))::numeric
+             + least(1000, greatest(0, total_q_views/100))::numeric
+             + case when accepted_answers > 0 then log(accepted_answers+1) else 0 end
+             - case when down_on_posts > up_on_posts then (down_on_posts - up_on_posts)::numeric * 0.5 else 0 end
+             + case when bounty_awarded > 0 then least(10, bounty_awarded/50.0) else 0 end
+             as perf_score,
+           row_number() over (partition by date_trunc('quarter', cohort_month) order by coalesce(answers,0)*3 + coalesce(questions,0)*2 + coalesce(total_badges,0) desc, user_id) as rn_quarter
+    from stringy s
+),
+cohort_extremes as (
+    select c.cohort_month,
+           c.location_norm,
+           max(perf_score) as max_perf,
+           min(perf_score) as min_perf,
+           avg(perf_score) as avg_perf
+    from leaderboard c
+    group by c.cohort_month, c.location_norm
+),
+flag_null_logic as (
+    select l.*,
+           case when total_posts is null or total_comments is null then 1 else 0 end as has_null_activity,
+           case when questions is null and answers is null then 1 else 0 end as has_null_qa
+    from leaderboard l
+),
+winners as (
+    select f.*,
+           ce.max_perf,
+           ce.min_perf,
+           ce.avg_perf,
+           case
+             when f.perf_score >= ce.avg_perf then 'above_avg'
+             when f.perf_score < ce.avg_perf then 'below_avg'
+             else 'unknown'
+           end as perf_bucket
+    from flag_null_logic f
+    left join cohort_extremes ce
+      on ce.cohort_month = f.cohort_month and ce.location_norm = f.location_norm
+),
+tie_breaker as (
+    select w.*,
+           row_number() over (
+             partition by w.perf_bucket
+             order by w.perf_score desc, w.contrib_rank asc, w.user_id asc
+           ) as rbucket
+    from winners w
+)
+select
+    tb.user_id,
+    tb.display_pretty as display_name,
+    tb.location_short as location,
+    to_char(tb.cohort_month, 'YYYY-MM') as cohort,
+    tb.total_posts,
+    tb.total_comments,
+    tb.questions,
+    tb.answers,
+    tb.accepted_qs,
+    tb.accepted_answers,
+    tb.total_badges,
+    tb.gold,
+    tb.silver,
+    tb.bronze,
+    tb.up_on_posts,
+    tb.down_on_posts,
+    tb.high_score_posts,
+    tb.negative_posts,
+    tb.duped_posts,
+    tb.hot_or_bumped,
+    tb.p90_qscore,
+    tb.p90_ascore,
+    round(tb.perf_score::numeric, 2) as perf_score,
+    tb.perf_bucket,
+    tb.contrib_rank,
+    tb.rn_quarter,
+    tb.has_null_activity,
+    tb.has_null_qa,
+    (select count(*) from badges b where b.userid = tb.user_id and b.tagbased = 1) as tag_badges,
+    (select array_agg(tag order by uses desc) from user_top_tags utt where utt.user_id = tb.user_id and utt.rn_tag <= 3) as top_tags,
+    case when tb.last_post_activity is null and tb.last_comment_activity is null then 'inactive'
+         when greatest(coalesce(tb.last_post_activity, 'epoch'::timestamp), coalesce(tb.last_comment_activity, 'epoch'::timestamp))
+              < cast('2024-10-01 12:34:56' as timestamp) - interval '90 days' then 'stale'
+         else 'active'
+    end as activity_state
+from tie_breaker tb
+where tb.rbucket <= 100
+order by tb.perf_bucket, tb.perf_score desc, tb.user_id;

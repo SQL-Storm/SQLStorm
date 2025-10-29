@@ -1,0 +1,195 @@
+WITH RECURSIVE RecursiveCTE AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        array_length(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'), 1) AS TagCount,
+        row_number() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS rn,
+        1 AS depth
+    FROM
+        Posts p
+    WHERE
+        p.PostTypeId = 1
+        AND p.Score > 10
+        AND p.Tags IS NOT NULL
+    UNION ALL
+    SELECT
+        c.Id,
+        c.PostTypeId,
+        c.OwnerUserId,
+        c.CreationDate,
+        c.Score,
+        c.ViewCount,
+        c.Title,
+        r.TagCount,
+        r.rn,
+        r.depth + 1
+    FROM
+        Posts c
+        JOIN RecursiveCTE r ON c.ParentId = r.Id
+    WHERE
+        c.PostTypeId = 2
+        AND c.Score > 0
+),
+UserBadgeAgg AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        count(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        count(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        count(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        coalesce(sum(CASE WHEN b.TagBased = 1 THEN 1 ELSE 0 END), 0) AS TagBasedBadges,
+        rank() OVER (ORDER BY count(b.Id) DESC) AS BadgeRank
+    FROM
+        Users u
+        LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY
+        u.Id, u.DisplayName
+),
+PostCommentsAgg AS (
+    SELECT
+        p.Id AS PostId,
+        count(c.Id) AS CommentCount,
+        string_agg(DISTINCT substr(c.Text, 1, 15), ' | ') AS SampleCommentSnippets,
+        max(c.CreationDate) AS LastCommentDate
+    FROM
+        Posts p
+        LEFT JOIN Comments c ON c.PostId = p.Id
+    GROUP BY
+        p.Id
+),
+FilteredPostHistory AS (
+    SELECT
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        ph.UserId,
+        ph.Comment,
+        ph.Text,
+        row_number() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM
+        PostHistory ph
+    WHERE
+        ph.PostHistoryTypeId IN (4,5,6,10,11)
+),
+TopPostHistories AS (
+    SELECT
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        ph.UserId,
+        ph.Comment,
+        ph.Text
+    FROM
+        FilteredPostHistory ph
+    WHERE
+        ph.rn = 1
+),
+FinalSelection AS (
+    SELECT
+        r.PostTypeId,
+        r.Id AS PostId,
+        r.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        r.CreationDate,
+        r.Score,
+        r.ViewCount,
+        r.TagCount,
+        pb.GoldBadges,
+        pb.SilverBadges,
+        pb.BronzeBadges,
+        pb.TagBasedBadges,
+        pc.CommentCount,
+        pc.SampleCommentSnippets,
+        pc.LastCommentDate,
+        tph.PostHistoryTypeId,
+        tph.Comment AS CloseReason,
+        tph.Text AS LastEditTextSample,
+        dense_rank() OVER (PARTITION BY r.PostTypeId ORDER BY r.Score DESC, r.ViewCount DESC) AS RankWithinType,
+        CASE
+            WHEN r.Score > 100 THEN 'High Score'
+            WHEN r.Score BETWEEN 50 AND 100 THEN 'Medium Score'
+            ELSE 'Low Score'
+        END AS ScoreCategory,
+        coalesce(u.Location, 'Unknown') AS UserLocation,
+        CASE WHEN pb.GoldBadges > 0 THEN CAST(1 AS boolean) ELSE CAST(0 AS boolean) END AS HasGoldBadge,
+        substring(r.Title from 1 for 50) || coalesce(' ... [' || CAST(pb.BronzeBadges AS varchar) || ' Bronze Badges]', '') AS ShortTitleWithBadgeInfo
+    FROM
+        RecursiveCTE r
+        LEFT JOIN Users u ON u.Id = r.OwnerUserId
+        LEFT JOIN UserBadgeAgg pb ON pb.UserId = r.OwnerUserId
+        LEFT JOIN PostCommentsAgg pc ON pc.PostId = r.Id
+        LEFT JOIN TopPostHistories tph ON tph.PostId = r.Id
+    WHERE
+        r.depth = 1
+)
+SELECT 
+    fs.PostTypeId,
+    fs.PostId,
+    fs.OwnerUserId,
+    fs.OwnerName,
+    fs.CreationDate,
+    fs.Score,
+    fs.ViewCount,
+    fs.TagCount,
+    fs.GoldBadges,
+    fs.SilverBadges,
+    fs.BronzeBadges,
+    fs.TagBasedBadges,
+    fs.CommentCount,
+    fs.SampleCommentSnippets,
+    fs.LastCommentDate,
+    fs.PostHistoryTypeId,
+    fs.CloseReason,
+    substring(fs.LastEditTextSample from 1 for 100) AS LastEditTextSample,
+    fs.RankWithinType,
+    fs.ScoreCategory,
+    fs.UserLocation,
+    fs.HasGoldBadge,
+    fs.ShortTitleWithBadgeInfo
+FROM
+    FinalSelection fs
+WHERE
+    fs.RankWithinType <= 100
+
+UNION
+
+SELECT
+    pt.Id AS PostTypeId,
+    p.Id AS PostId,
+    p.OwnerUserId,
+    u.DisplayName AS OwnerName,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    0 AS TagCount,
+    0 AS GoldBadges,
+    0 AS SilverBadges,
+    0 AS BronzeBadges,
+    0 AS TagBasedBadges,
+    0 AS CommentCount,
+    NULL AS SampleCommentSnippets,
+    NULL AS LastCommentDate,
+    NULL AS PostHistoryTypeId,
+    NULL AS CloseReason,
+    NULL AS LastEditTextSample,
+    NULL AS RankWithinType,
+    'N/A' AS ScoreCategory,
+    coalesce(u.Location, 'Unknown') AS UserLocation,
+    CAST(0 AS boolean) AS HasGoldBadge,
+    substring(coalesce(p.Title,'[No Title]') from 1 for 50) AS ShortTitleWithBadgeInfo
+FROM
+    Posts p
+    JOIN PostTypes pt ON pt.Id = p.PostTypeId
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+WHERE
+    p.PostTypeId NOT IN (1,2)
+ORDER BY
+    PostTypeId,
+    Score DESC NULLS LAST,
+    ViewCount DESC NULLS LAST,
+    CreationDate DESC;

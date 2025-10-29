@@ -1,0 +1,59 @@
+-- {"query": "6683.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-micro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 545} 
+
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT v.PostId) AS TotalVotes,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id ELSE NULL END) AS TotalQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id ELSE NULL END) AS TotalAnswers,
+    AVG(p.Score) AS AvgScore,
+    MAX(p.LastActivityDate) AS LastActivePost,
+    MAX(CASE WHEN p.PostTypeId = 1 THEN p.AnswerCount ELSE 0 END) AS MaxAnswersPerQuestion,
+    MIN(p.CreationDate) AS EarliestPost,
+    MAX(p.LastEditDate) AS LatestEdit,
+    b.Class,
+    b.TagBased
+FROM 
+    Users u
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    (SELECT 
+         ph.PostId,
+         ph.CreationDate,
+         ph.UserId,
+         ph.PostHistoryTypeId
+     FROM 
+         PostHistory ph
+     WHERE 
+         ph.PostHistoryTypeId IN (1, 2, 5, 10, 11, 12, 13, 14, 15, 19, 20, 35)
+     ) ph ON u.Id = ph.UserId
+LEFT JOIN 
+    (SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.Score,
+        p.CreationDate,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.AnswerCount
+     FROM 
+        Posts p
+     WHERE 
+        p.OwnerUserId IS NOT NULL
+    ) p ON ph.PostId = p.Id
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+WHERE 
+    u.Reputation > 10000
+    AND u.LastAccessDate > (CURRENT_DATE - INTERVAL '30 days')
+GROUP BY 
+    u.Id, b.Id
+HAVING 
+    COUNT(DISTINCT p.Id) > 50
+ORDER BY 
+    TotalVotes DESC, 
+    AvgScore DESC;

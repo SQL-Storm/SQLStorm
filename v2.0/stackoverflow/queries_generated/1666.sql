@@ -1,0 +1,280 @@
+-- {"query": "1666.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3641} 
+
+WITH UserPostSummary AS (
+    -- Summarizes user activity, including post counts, average scores, and badge statistics.
+    -- Incorporates an outer join with Badges to get badge details for all users, even those without badges.
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswers,
+        SUM(CASE WHEN p.PostTypeId IN (1, 2) THEN p.Score ELSE 0 END) AS TotalPostScore,
+        AVG(CASE WHEN p.PostTypeId IN (1, 2) THEN p.Score ELSE 0 END) AS AvgPostScore,
+        MAX(p.LastActivityDate) AS LastPostActivity,
+        COUNT(b.Id) AS TotalBadges,
+        COUNT(CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+        MAX(b.Date) AS LastBadgeAwardDate
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+PostHistoryDetails AS (
+    -- Tracks post history events, particularly focusing on edits and close/reopen actions.
+    -- Uses FIRST_VALUE window function to determine the most recent closing reason.
+    SELECT
+        ph.PostId,
+        MIN(ph.CreationDate) AS FirstHistoryDate,
+        MAX(ph.CreationDate) AS LastHistoryDate,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.Id END) AS EditCount, -- Title, Body, Tags edits
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate ELSE NULL END) AS LastClosedDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.CreationDate ELSE NULL END) AS LastReopenedDate,
+        -- Get the most recent closing reason
+        FIRST_VALUE(crt.Name) OVER (
+            PARTITION BY ph.PostId
+            ORDER BY CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate ELSE '1900-01-01'::timestamp END DESC, ph.Id DESC
+            ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+        ) AS MostRecentCloseReason
+    FROM
+        PostHistory ph
+    LEFT JOIN
+        CloseReasonTypes crt ON ph.PostHistoryTypeId = 10 AND ph.Comment = crt.Id::text -- Join for close reason name
+    GROUP BY
+        ph.PostId
+),
+TagAnalysis AS (
+    -- Parses tags from posts and expands them into individual rows for further analysis.
+    -- Uses string_to_array and UNNEST for tag parsing.
+    SELECT
+        p.Id AS PostId,
+        LOWER(UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><'))) AS TagName,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate
+    FROM
+        Posts p
+    WHERE
+        p.Tags IS NOT NULL AND p.Tags != ''
+),
+TopTags AS (
+    -- Identifies the top N tags based on total score and view count using DENSE_RANK window function.
+    SELECT
+        ta.TagName,
+        SUM(ta.Score) AS TotalTagScore,
+        SUM(ta.ViewCount) AS TotalTagViewCount,
+        COUNT(DISTINCT ta.PostId) AS PostCount,
+        DENSE_RANK() OVER (ORDER BY SUM(ta.Score) DESC, SUM(ta.ViewCount) DESC) AS TagRank
+    FROM
+        TagAnalysis ta
+    GROUP BY
+        ta.TagName
+    HAVING
+        COUNT(DISTINCT ta.PostId) > 50 -- Filter out less active tags
+),
+PostCommentSentiment AS (
+    -- Analyzes comment sentiment for posts, including average score and flagged comments.
+    SELECT
+        c.PostId,
+        COUNT(c.Id) AS TotalComments,
+        AVG(c.Score) AS AvgCommentScore,
+        MAX(CASE WHEN c.Text ILIKE '%thanks%' THEN 1 ELSE 0 END) AS HasThanksComment,
+        SUM(CASE WHEN c.Text ILIKE '%bug%' OR c.Text ILIKE '%error%' THEN 1 ELSE 0 END) AS ProblematicCommentsCount
+    FROM
+        Comments c
+    GROUP BY
+        c.PostId
+)
+-- Main query combining all CTEs and applying complex logic.
+-- This part focuses on highly engaged or recently active posts.
+SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    pt.Name AS PostTypeName,
+    p.CreationDate AS PostCreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Title,
+    p.Tags,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    ups.DisplayName AS OwnerDisplayName,
+    ups.Reputation AS OwnerReputation,
+    COALESCE(ups.GoldBadges, 0) AS OwnerGoldBadges, -- NULL logic with COALESCE
+    phd.EditCount AS PostEditCount,
+    phd.LastClosedDate,
+    phd.MostRecentCloseReason,
+    pcs.TotalComments,
+    pcs.AvgCommentScore,
+    pcs.HasThanksComment,
+    tt.TotalTagScore AS PrimaryTagTotalScore,
+    tt.TagRank AS PrimaryTagOverallRank,
+    COALESCE(p.CommunityOwnedDate, p.ClosedDate, '1900-01-01'::timestamp) AS LastStatusChangeDate, -- Example of NULL handling & COALESCE
+    NULLIF(p.LastEditorDisplayName, '') AS EffectiveLastEditorDisplayName, -- Example of NULLIF
+    -- Complex Calculation: Age of post in days until last activity or creation
+    EXTRACT(DAY FROM (COALESCE(p.LastActivityDate, NOW()) - p.CreationDate)) AS PostAgeInDays,
+    -- String Expression: Length of post body
+    LENGTH(COALESCE(p.Body, '')) AS BodyLength,
+    -- Conditional Expression: Status based on closed date and community ownership
+    CASE
+        WHEN p.ClosedDate IS NOT NULL AND p.CommunityOwnedDate IS NULL THEN 'Closed'
+        WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Answered & Accepted'
+        WHEN p.AnswerCount > 0 THEN 'Answered'
+        ELSE 'Open'
+    END AS PostStatus,
+    -- Window Function: Rank of post score within its owner's posts
+    RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS RankWithinOwnerPosts,
+    -- Window Function: Average score of posts with the same primary tag (using subquery in PARTITION BY)
+    AVG(p.Score) OVER (
+        PARTITION BY (SELECT LOWER(SPLIT_PART(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><', 1)) FROM Posts p_sub WHERE p_sub.Id = p.Id LIMIT 1)
+    ) AS AvgScoreForPrimaryTag,
+    -- Correlated Subquery: Check if owner has a 'Stellar Question' badge awarded within a year of post creation
+    EXISTS (
+        SELECT 1
+        FROM Badges b_sub
+        WHERE b_sub.UserId = p.OwnerUserId
+          AND b_sub.Name = 'Stellar Question'
+          AND b_sub.Date BETWEEN p.CreationDate AND p.CreationDate + INTERVAL '1 year'
+    ) AS HasStellarBadgeEarly,
+    -- Another Correlated Subquery: Retrieve max score of any linked duplicate post
+    (
+        SELECT MAX(dp.Score)
+        FROM PostLinks pl
+        JOIN Posts dp ON pl.RelatedPostId = dp.Id
+        WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3 -- Duplicate link type
+    ) AS MaxDuplicatePostScore,
+    -- Outer Join to get details of the accepted answer, if any
+    ans.Score AS AcceptedAnswerScore,
+    ans_owner.DisplayName AS AcceptedAnswerOwner,
+    -- Complex predicate combining multiple conditions, including `NOT EXISTS`
+    (
+        p.ViewCount > 5000 AND p.FavoriteCount > 50
+        AND (p.Score > 100 OR COALESCE(pcs.ProblematicCommentsCount, 0) > 5)
+        AND p.CreationDate >= '2020-01-01'::timestamp
+        AND p.Title ILIKE '%sql%'
+        AND NOT EXISTS (SELECT 1 FROM PostHistory ph_sub WHERE ph_sub.PostId = p.Id AND ph_sub.PostHistoryTypeId = 12) -- Not deleted
+        AND (phd.LastClosedDate IS NULL OR p.LastActivityDate > phd.LastClosedDate + INTERVAL '30 days') -- Reopened or active after close
+    ) AS IsHighEngagementComplex,
+    -- String expression: Extract first tag, default if no tags
+    COALESCE(
+        LOWER(SPLIT_PART(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><', 1)),
+        'no-tag'
+    ) AS PrimaryTag
+FROM
+    Posts p
+INNER JOIN
+    PostTypes pt ON p.PostTypeId = pt.Id
+LEFT JOIN
+    UserPostSummary ups ON p.OwnerUserId = ups.UserId
+LEFT JOIN
+    PostHistoryDetails phd ON p.Id = phd.PostId
+LEFT JOIN
+    PostCommentSentiment pcs ON p.Id = pcs.PostId
+LEFT JOIN
+    TagAnalysis ta_primary ON p.Id = ta_primary.PostId AND ta_primary.TagName = COALESCE(LOWER(SPLIT_PART(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><', 1)), 'no-tag')
+LEFT JOIN
+    TopTags tt ON ta_primary.TagName = tt.TagName
+LEFT JOIN
+    Posts ans ON p.AcceptedAnswerId = ans.Id -- Outer Join for accepted answer
+LEFT JOIN
+    Users ans_owner ON ans.OwnerUserId = ans_owner.Id -- Get owner of accepted answer
+WHERE
+    p.PostTypeId IN (1, 2) -- Only consider Questions and Answers
+    AND p.CreationDate >= '2018-01-01'::timestamp -- Filter for recent data
+    AND p.Score >= 0 -- Exclude potentially malformed posts with negative scores
+    AND (p.ViewCount IS NULL OR p.ViewCount > 10) -- Ensure some activity
+    AND (
+        p.OwnerUserId IS NOT NULL
+        OR p.OwnerDisplayName IS NOT NULL
+    ) -- Ensure there's an owner identified
+
+UNION ALL
+
+-- Second branch of the UNION: Focus on posts edited by high-reputation users or recently reopened
+SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    pt.Name AS PostTypeName,
+    p.CreationDate AS PostCreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Title,
+    p.Tags,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    u_editor.DisplayName AS OwnerDisplayName, -- In this branch, 'Owner' refers to the last editor
+    u_editor.Reputation AS OwnerReputation,
+    (SELECT COUNT(b.Id) FROM Badges b WHERE b.UserId = u_editor.Id AND b.Class = 1) AS OwnerGoldBadges, -- Subquery for editor's gold badges
+    phd.EditCount AS PostEditCount,
+    phd.LastClosedDate,
+    phd.MostRecentCloseReason,
+    pcs.TotalComments,
+    pcs.AvgCommentScore,
+    pcs.HasThanksComment,
+    tt.TotalTagScore AS PrimaryTagTotalScore,
+    tt.TagRank AS PrimaryTagOverallRank,
+    COALESCE(p.CommunityOwnedDate, p.ClosedDate, '1900-01-01'::timestamp) AS LastStatusChangeDate,
+    NULLIF(p.LastEditorDisplayName, '') AS EffectiveLastEditorDisplayName,
+    EXTRACT(DAY FROM (COALESCE(p.LastEditDate, p.LastActivityDate, NOW()) - p.CreationDate)) AS PostAgeInDays,
+    LENGTH(COALESCE(p.Body, '')) AS BodyLength,
+    CASE
+        WHEN phd.LastReopenedDate IS NOT NULL AND p.LastActivityDate > phd.LastReopenedDate THEN 'Reopened & Active' -- Custom status for this branch
+        WHEN p.LastEditDate IS NOT NULL AND p.LastEditorUserId IS NOT NULL THEN 'Edited by High-Rep User'
+        ELSE 'Other Post Activity'
+    END AS PostStatus,
+    NULL::INT AS RankWithinOwnerPosts, -- Not applicable for this branch's focus
+    NULL::NUMERIC AS AvgScoreForPrimaryTag,
+    FALSE AS HasStellarBadgeEarly, -- Not applicable for this branch's focus
+    (
+        SELECT MAX(dp.Score)
+        FROM PostLinks pl
+        JOIN Posts dp ON pl.RelatedPostId = dp.Id
+        WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3
+    ) AS MaxDuplicatePostScore,
+    NULL::INT AS AcceptedAnswerScore,
+    NULL::VARCHAR(40) AS AcceptedAnswerOwner,
+    TRUE AS IsHighEngagementComplex, -- Simplified for this branch
+    COALESCE(
+        LOWER(SPLIT_PART(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><', 1)),
+        'no-tag'
+    ) AS PrimaryTag
+FROM
+    Posts p
+INNER JOIN
+    PostTypes pt ON p.PostTypeId = pt.Id
+LEFT JOIN
+    Users u_editor ON p.LastEditorUserId = u_editor.Id -- Join for editor details
+LEFT JOIN
+    PostHistoryDetails phd ON p.Id = phd.PostId
+LEFT JOIN
+    PostCommentSentiment pcs ON p.Id = pcs.PostId
+LEFT JOIN
+    TagAnalysis ta_primary ON p.Id = ta_primary.PostId AND ta_primary.TagName = COALESCE(LOWER(SPLIT_PART(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><', 1)), 'no-tag')
+LEFT JOIN
+    TopTags tt ON ta_primary.TagName = tt.TagName
+WHERE
+    p.LastEditorUserId IS NOT NULL
+    AND p.LastEditDate IS NOT NULL
+    AND p.CreationDate >= '2019-01-01'::timestamp -- Slightly different date range
+    AND (
+        (phd.LastReopenedDate IS NOT NULL AND p.LastActivityDate > phd.LastReopenedDate) -- Was reopened
+        OR (
+            u_editor.Reputation > 50000 -- Edited by high-rep user
+            AND p.LastEditDate > p.CreationDate + INTERVAL '90 days' -- Edited significantly later
+        )
+    )
+ORDER BY
+    PostCreationDate DESC, PostId DESC
+LIMIT 1000;

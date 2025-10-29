@@ -1,0 +1,252 @@
+-- {"query": "7871.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 3115} 
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), ', ') AS AllTags,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Elite'
+            WHEN u.Reputation > 5000 THEN 'Veteran'
+            WHEN u.Reputation > 1000 THEN 'Expert'
+            ELSE 'Newbie'
+        END AS ReputationLevel,
+        CASE 
+            WHEN EXISTS (SELECT 1 FROM Posts p2 WHERE p2.OwnerUserId = u.Id AND p2.PostTypeId = 1 AND p2.Score > 100) THEN 'HighValueQuestioner'
+            WHEN EXISTS (SELECT 1 FROM Posts p3 WHERE p3.OwnerUserId = u.Id AND p3.PostTypeId = 2 AND p3.Score > 50) THEN 'HighValueAnswerer'
+            ELSE NULL
+        END AS Specialization
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.ParentId,
+        p.PostTypeId,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        COALESCE(p.AcceptedAnswerId, 0) AS AcceptedAnswerId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN DENSE_RANK() OVER (ORDER BY p.Score DESC)
+            WHEN p.PostTypeId = 2 THEN DENSE_RANK() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC)
+            ELSE NULL
+        END AS RankWithinType,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.Score > 100 THEN 'HighScoreQuestion'
+            WHEN p.PostTypeId = 2 AND p.Score > 50 THEN 'HighScoreAnswer'
+            ELSE NULL
+        END AS QualityIndicator,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS PostsPerUser
+    FROM Posts p
+),
+UserPostPerformance AS (
+    SELECT 
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.PostCount,
+        us.BadgeCount,
+        us.CommentCount,
+        us.VoteCount,
+        us.ReputationLevel,
+        us.Specialization,
+        AVG(pa.Score) AS AvgPostScore,
+        MAX(pa.Score) AS MaxPostScore,
+        STRING_AGG(pa.Title, '; ') AS RecentTitles,
+        COUNT(CASE WHEN pa.QualityIndicator IS NOT NULL THEN 1 END) AS QualityPostsCount,
+        CASE 
+            WHEN AVG(pa.Score) > 10 THEN 'HighlyActive'
+            WHEN AVG(pa.Score) > 5 THEN 'ModeratelyActive'
+            ELSE 'LowActivity'
+        END AS EngagementLevel
+    FROM UserStats us
+    LEFT JOIN PostAnalysis pa ON pa.OwnerUserId = us.UserId
+    GROUP BY us.UserId, us.DisplayName, us.Reputation, us.PostCount, us.BadgeCount, us.CommentCount, us.VoteCount, us.ReputationLevel, us.Specialization
+)
+SELECT 
+    upp.UserId,
+    upp.DisplayName,
+    upp.Reputation,
+    upp.PostCount,
+    upp.BadgeCount,
+    upp.CommentCount,
+    upp.VoteCount,
+    upp.ReputationLevel,
+    upp.Specialization,
+    upp.AvgPostScore,
+    upp.MaxPostScore,
+    upp.RecentTitles,
+    upp.QualityPostsCount,
+    upp.EngagementLevel,
+    CASE 
+        WHEN upp.PostCount > 100 AND upp.BadgeCount > 20 THEN 'VeteranContributor'
+        WHEN upp.PostCount > 50 AND upp.BadgeCount > 10 THEN 'RegularContributor'
+        WHEN upp.PostCount > 10 THEN 'ActiveUser'
+        ELSE 'OccasionalUser'
+    END AS ContributionTier,
+    COALESCE(
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = upp.UserId AND p.CreationDate > '2023-01-01'), 
+        0
+    ) AS RecentPosts2023,
+    STRING_AGG(b.Name, ', ') AS BadgeTypes,
+    COALESCE(
+        (SELECT STRING_AGG(vt.Name, ', ') 
+         FROM Votes v 
+         JOIN VoteTypes vt ON v.VoteTypeId = vt.Id 
+         WHERE v.UserId = upp.UserId 
+         GROUP BY v.UserId), 
+        'NoVotes'
+    ) AS VoteActivity,
+    COALESCE(
+        (SELECT STRING_AGG(DISTINCT SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), ', ') 
+         FROM Posts p 
+         WHERE p.OwnerUserId = upp.UserId AND p.Tags IS NOT NULL), 
+        ''
+    ) AS AllTagCombinations,
+    CASE 
+        WHEN upp.Reputation > 10000 AND upp.BadgeCount > 50 THEN 'ElitePowerUser'
+        WHEN upp.Reputation > 5000 AND upp.PostCount > 50 THEN 'ExpertContributor'
+        WHEN upp.PostCount > 100 THEN 'HighVolumeUser'
+        ELSE 'StandardUser'
+    END AS UserClassification,
+    ROW_NUMBER() OVER (ORDER BY upp.Reputation DESC, upp.PostCount DESC) AS GlobalRank,
+    PERCENT_RANK() OVER (ORDER BY upp.Reputation) * 100 AS ReputationPercentile,
+    (SELECT COUNT(*) FROM Users) AS TotalUsers,
+    (SELECT AVG(Reputation) FROM Users) AS AvgReputation,
+    (SELECT COUNT(DISTINCT PostTypeId) FROM Posts WHERE OwnerUserId = upp.UserId) AS UniquePostTypes,
+    CASE 
+        WHEN upp.PostCount = 0 THEN 'NoPosts'
+        WHEN upp.QualityPostsCount > 0 THEN 'HasQualityContent'
+        ELSE 'HasRegularPosts'
+    END AS ContentQualityStatus,
+    CASE 
+        WHEN upp.Reputation > (SELECT AVG(Reputation) FROM Users) * 1.5 THEN 'AboveAverageReputation'
+        WHEN upp.Reputation < (SELECT AVG(Reputation) FROM Users) * 0.5 THEN 'BelowAverageReputation'
+        ELSE 'AverageReputation'
+    END AS RepComparison,
+    (SELECT COUNT(*) FROM Votes v WHERE v.UserId = upp.UserId AND v.CreationDate > '2023-01-01') AS RecentVotes2023,
+    (SELECT COUNT(DISTINCT p.Id) FROM Posts p JOIN Comments c ON p.Id = c.PostId WHERE p.OwnerUserId = upp.UserId AND c.CreationDate > '2023-01-01') AS RecentActivity2023,
+    UPPER(SUBSTRING(upp.DisplayName, 1, 1)) || LOWER(SUBSTRING(upp.DisplayName, 2)) AS ProperCaseName,
+    CASE 
+        WHEN upp.Reputation > 10000 THEN CONCAT('MVP', '_', upp.UserId)
+        WHEN upp.Reputation > 5000 THEN CONCAT('Expert', '_', upp.UserId)
+        WHEN upp.Reputation > 1000 THEN CONCAT('Contributor', '_', upp.UserId)
+        ELSE CONCAT('Member', '_', upp.UserId)
+    END AS UserIdentifier,
+    'StackOverflow_' || upp.UserId || '_' || upp.Reputation AS CompleteUserIdentifier,
+    COALESCE(
+        (SELECT COUNT(DISTINCT p.Id) FROM Posts p WHERE p.OwnerUserId = upp.UserId AND p.Score > 50 AND p.PostTypeId = 1), 
+        0
+    ) AS HighScoreQuestions,
+    COALESCE(
+        (SELECT COUNT(DISTINCT p.Id) FROM Posts p WHERE p.OwnerUserId = upp.UserId AND p.Score > 25 AND p.PostTypeId = 2), 
+        0
+    ) AS HighScoreAnswers,
+    COALESCE(
+        (SELECT COUNT(DISTINCT p.Id) FROM Posts p WHERE p.OwnerUserId = upp.UserId AND p.PostTypeId = 1 AND p.ViewCount > 1000), 
+        0
+    ) AS PopularQuestions,
+    CASE 
+        WHEN upp.PostCount > 0 THEN ROUND(upp.QualityPostsCount * 100.0 / upp.PostCount, 2)
+        ELSE 0
+    END AS QualityPercentage,
+    CASE 
+        WHEN upp.VoteCount > 0 THEN ROUND(upp.CommentCount * 100.0 / upp.VoteCount, 2)
+        ELSE 0
+    END AS CommentToVoteRatio,
+    CASE 
+        WHEN upp.CommentCount > 0 THEN ROUND(upp.VoteCount * 1.0 / upp.CommentCount, 2)
+        ELSE 0
+    END AS VoteToCommentRatio,
+    CASE 
+        WHEN upp.BadgeCount > 0 THEN ROUND(upp.PostCount * 1.0 / upp.BadgeCount, 2)
+        ELSE 0
+    END AS PostsPerBadge,
+    (
+        CASE WHEN upp.Reputation > 1000 THEN 1 ELSE 0 END +
+        CASE WHEN upp.PostCount > 50 THEN 1 ELSE 0 END +
+        CASE WHEN upp.BadgeCount > 10 THEN 1 ELSE 0 END +
+        CASE WHEN upp.CommentCount > 20 THEN 1 ELSE 0 END +
+        CASE WHEN upp.VoteCount > 100 THEN 1 ELSE 0 END +
+        CASE WHEN upp.QualityPostsCount > 10 THEN 1 ELSE 0 END +
+        CASE WHEN upp.EngagementLevel = 'HighlyActive' THEN 1 ELSE 0 END +
+        CASE WHEN upp.ReputationLevel IN ('Elite', 'Veteran') THEN 1 ELSE 0 END
+    ) AS ActivityScore,
+    CASE 
+        WHEN upp.ReputationLevel = 'Elite' AND upp.ContributionTier = 'VeteranContributor' THEN 'TopPerformer'
+        WHEN upp.ReputationLevel = 'Veteran' AND upp.ContributionTier IN ('RegularContributor', 'VeteranContributor') THEN 'SolidContributor'
+        WHEN upp.ReputationLevel = 'Expert' AND upp.ContributionTier = 'ActiveUser' THEN 'ActiveMember'
+        ELSE 'RegularMember'
+    END AS PerformanceTier,
+    CASE 
+        WHEN upp.Reputation > (SELECT AVG(Reputation) FROM Users) * 2 THEN 'Exceptional'
+        WHEN upp.Reputation > (SELECT AVG(Reputation) FROM Users) * 1.5 THEN 'Great'
+        WHEN upp.Reputation > (SELECT AVG(Reputation) FROM Users) THEN 'Good'
+        WHEN upp.Reputation > (SELECT AVG(Reputation) FROM Users) * 0.5 THEN 'Fair'
+        ELSE 'Poor'
+    END AS ReputationRating,
+    (SELECT COUNT(DISTINCT p.Id) FROM Posts p WHERE p.OwnerUserId = upp.UserId AND p.CreationDate BETWEEN '2022-01-01' AND '2023-12-31') AS Posts2022_2023,
+    (SELECT COUNT(DISTINCT p.Id) FROM Posts p WHERE p.OwnerUserId = upp.UserId AND p.CreationDate BETWEEN '2021-01-01' AND '2021-12-31') AS Posts2021,
+    (SELECT COUNT(DISTINCT p.Id) FROM Posts p WHERE p.OwnerUserId = upp.UserId AND p.CreationDate BETWEEN '2020-01-01' AND '2020-12-31') AS Posts2020,
+    (SELECT COUNT(DISTINCT p.Id) FROM Posts p WHERE p.OwnerUserId = upp.UserId AND p.CreationDate BETWEEN '2019-01-01' AND '2019-12-31') AS Posts2019,
+    ROUND(
+        (SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = upp.UserId), 
+        2
+    ) AS AvgUserScore,
+    CASE 
+        WHEN (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = upp.UserId AND p.PostTypeId = 1) > 0 THEN 'Questioner'
+        WHEN (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = upp.UserId AND p.PostTypeId = 2) > 0 THEN 'Answerer'
+        ELSE 'Neither'
+    END AS ContentProducerType,
+    CASE 
+        WHEN upp.Reputation > (SELECT AVG(Reputation) FROM Users) THEN 'Above'
+        WHEN upp.Reputation < (SELECT AVG(Reputation) FROM Users) THEN 'Below'
+        ELSE 'At'
+    END AS ReputationStatus,
+    COALESCE(
+        (SELECT COUNT(DISTINCT p.Id) FROM Posts p WHERE p.OwnerUserId = upp.UserId AND p.Score > 0), 
+        0
+    ) AS PositiveScorePosts,
+    COALESCE(
+        (SELECT COUNT(DISTINCT p.Id) FROM Posts p WHERE p.OwnerUserId = upp.UserId AND p.Score < 0), 
+        0
+    ) AS NegativeScorePosts,
+    CASE 
+        WHEN upp.BadgeCount = 0 THEN NULL
+        ELSE (
+            SELECT STRING_AGG(CONCAT(b.Class, '_', b.Name), ', ')
+            FROM Badges b 
+            WHERE b.UserId = upp.UserId 
+            GROUP BY b.UserId
+        )
+    END AS BadgeClassifications
+FROM UserPostPerformance upp
+LEFT JOIN Badges b ON b.UserId = upp.UserId
+GROUP BY 
+    upp.UserId, upp.DisplayName, upp.Reputation, upp.PostCount, upp.BadgeCount, 
+    upp.CommentCount, upp.VoteCount, upp.ReputationLevel, upp.Specialization, 
+    upp.AvgPostScore, upp.MaxPostScore, upp.RecentTitles, upp.QualityPostsCount, 
+    upp.EngagementLevel, upp.ContributionTier, upp.ReputationPercentile, 
+    (SELECT COUNT(*) FROM Users), (SELECT AVG(Reputation) FROM Users)
+ORDER BY upp.Reputation DESC, upp.PostCount DESC
+LIMIT 1000;

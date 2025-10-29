@@ -1,0 +1,338 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn,
+        LAG(p.ViewCount) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_viewcount,
+        CASE 
+            WHEN p.Score > 100 THEN 'Highly Voted'
+            WHEN p.Score > 50 THEN 'Moderately Voted'
+            ELSE 'Low Voted'
+        END as vote_category,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags != '' THEN 
+                CARDINALITY(string_to_array(trim(both '<>' FROM p.Tags), '><'))
+            ELSE 0
+        END as tag_count
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+TaggedPosts AS (
+    SELECT 
+        rp.Id,
+        rp.PostTypeId,
+        rp.Score,
+        rp.ViewCount,
+        rp.Title,
+        rp.Tags,
+        rp.OwnerUserId,
+        rp.CreationDate,
+        rp.LastActivityDate,
+        rp.AnswerCount,
+        rp.CommentCount,
+        rp.FavoriteCount,
+        rp.vote_category,
+        rp.tag_count,
+        COALESCE(rp.prev_viewcount, 0) as prev_viewcount,
+        CASE 
+            WHEN rp.ViewCount > COALESCE(rp.prev_viewcount, 0) THEN 'Increased'
+            WHEN rp.ViewCount < COALESCE(rp.prev_viewcount, 0) THEN 'Decreased'
+            ELSE 'No Change'
+        END as view_trend
+    FROM RankedPosts rp
+    WHERE rp.rn <= 5
+),
+UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.AccountId,
+        COUNT(DISTINCT p.Id) as total_posts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as answers,
+        SUM(p.Score) as total_score,
+        AVG(p.Score) as avg_score,
+        MAX(p.CreationDate) as latest_activity,
+        STRING_AGG(DISTINCT p.Tags, '; ') as all_tags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes, u.AccountId
+),
+PostMetrics AS (
+    SELECT 
+        tp.Id,
+        tp.PostTypeId,
+        tp.Score,
+        tp.ViewCount,
+        tp.Title,
+        tp.Tags,
+        tp.OwnerUserId,
+        tp.CreationDate,
+        tp.LastActivityDate,
+        tp.AnswerCount,
+        tp.CommentCount,
+        tp.FavoriteCount,
+        tp.vote_category,
+        tp.tag_count,
+        tp.view_trend,
+        CASE 
+            WHEN tp.tag_count > 3 THEN 'Many Tags'
+            WHEN tp.tag_count > 1 THEN 'Few Tags'
+            ELSE 'No Tags'
+        END as tag_density,
+        CAST(tp.LastActivityDate AS DATE) - CAST(tp.CreationDate AS DATE) as days_since_last_activity,
+        CASE 
+            WHEN CAST(tp.LastActivityDate AS DATE) - CAST(tp.CreationDate AS DATE) > 30 THEN 'Inactive'
+            WHEN CAST(tp.LastActivityDate AS DATE) - CAST(tp.CreationDate AS DATE) > 7 THEN 'Moderately Active'
+            ELSE 'Active'
+        END as activity_level,
+        CASE 
+            WHEN tp.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = tp.PostTypeId) 
+            THEN 'Above Average'
+            ELSE 'Below Average'
+        END as score_performance,
+        COALESCE((tp.Score * 1.0 / NULLIF(tp.ViewCount, 0)), 0) as score_to_view_ratio
+    FROM TaggedPosts tp
+),
+FilteredPosts AS (
+    SELECT 
+        pm.Id,
+        pm.PostTypeId,
+        pm.Score,
+        pm.ViewCount,
+        pm.Title,
+        pm.Tags,
+        pm.OwnerUserId,
+        pm.CreationDate,
+        pm.LastActivityDate,
+        pm.AnswerCount,
+        pm.CommentCount,
+        pm.FavoriteCount,
+        pm.vote_category,
+        pm.tag_count,
+        pm.view_trend,
+        pm.tag_density,
+        pm.days_since_last_activity,
+        pm.activity_level,
+        pm.score_performance,
+        pm.score_to_view_ratio,
+        ROW_NUMBER() OVER (ORDER BY pm.Score DESC) as rank_by_score,
+        PERCENT_RANK() OVER (ORDER BY pm.ViewCount) as view_percentile,
+        NTILE(4) OVER (ORDER BY pm.Score) as score_quartile,
+        FIRST_VALUE(pm.Title) OVER (PARTITION BY pm.OwnerUserId ORDER BY pm.CreationDate) as first_post_title,
+        LAG(pm.Score) OVER (ORDER BY pm.CreationDate) as previous_score,
+        CASE 
+            WHEN pm.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = pm.PostTypeId) 
+            THEN 1 ELSE 0
+        END as is_above_avg
+    FROM PostMetrics pm
+    WHERE pm.Score > 0 AND pm.ViewCount > 0
+),
+AdvancedAnalysis AS (
+    SELECT 
+        fp.Id,
+        fp.PostTypeId,
+        fp.Score,
+        fp.ViewCount,
+        fp.Title,
+        fp.Tags,
+        fp.OwnerUserId,
+        fp.CreationDate,
+        fp.LastActivityDate,
+        fp.AnswerCount,
+        fp.CommentCount,
+        fp.FavoriteCount,
+        fp.vote_category,
+        fp.tag_count,
+        fp.view_trend,
+        fp.tag_density,
+        fp.days_since_last_activity,
+        fp.activity_level,
+        fp.score_performance,
+        fp.score_to_view_ratio,
+        fp.rank_by_score,
+        fp.view_percentile,
+        fp.score_quartile,
+        fp.first_post_title,
+        fp.previous_score,
+        fp.is_above_avg,
+        u.DisplayName as owner_name,
+        us.Reputation as owner_reputation,
+        us.total_posts,
+        us.questions,
+        us.answers,
+        us.total_score,
+        us.avg_score,
+        us.latest_activity,
+        CASE 
+            WHEN fp.Score > 1000 THEN 'Elite'
+            WHEN fp.Score > 500 THEN 'High Achiever'
+            WHEN fp.Score > 100 THEN 'Mid-level Pro'
+            ELSE 'Beginner'
+        END as achievement_level,
+        COALESCE(fp.Score * fp.ViewCount, 0) as score_view_product,
+        CASE 
+            WHEN fp.CommentCount > 5 THEN 'Highly Commented'
+            WHEN fp.CommentCount > 2 THEN 'Moderately Commented'
+            ELSE 'Low Commented'
+        END as comment_level,
+        CASE 
+            WHEN fp.AnswerCount > 5 THEN 'Highly Answered'
+            WHEN fp.AnswerCount > 2 THEN 'Moderately Answered'
+            ELSE 'Low Answered'
+        END as answer_level,
+        COALESCE(
+            CASE 
+                WHEN fp.PostTypeId = 1 AND fp.AnswerCount IS NOT NULL THEN 
+                    ((fp.AnswerCount * 1.0) / NULLIF(fp.ViewCount, 0)) * 100
+                ELSE NULL 
+            END, 0
+        ) as answer_to_view_ratio,
+        EXISTS (
+            SELECT 1 FROM Comments c 
+            WHERE c.PostId = fp.Id AND c.Score > 10
+        ) as has_highly_rated_comments
+    FROM FilteredPosts fp
+    JOIN Users u ON fp.OwnerUserId = u.Id
+    JOIN UserStats us ON fp.OwnerUserId = us.UserId
+    WHERE u.AccountId IS NOT NULL 
+      AND fp.Score > 50
+      AND fp.ViewCount > 10
+),
+FinalAnalysis AS (
+    SELECT 
+        aa.Id,
+        aa.PostTypeId,
+        aa.Score,
+        aa.ViewCount,
+        aa.Title,
+        aa.Tags,
+        aa.OwnerUserId,
+        aa.CreationDate,
+        aa.LastActivityDate,
+        aa.AnswerCount,
+        aa.CommentCount,
+        aa.FavoriteCount,
+        aa.vote_category,
+        aa.tag_count,
+        aa.view_trend,
+        aa.tag_density,
+        aa.days_since_last_activity,
+        aa.activity_level,
+        aa.score_performance,
+        aa.score_to_view_ratio,
+        aa.rank_by_score,
+        aa.view_percentile,
+        aa.score_quartile,
+        aa.first_post_title,
+        aa.previous_score,
+        aa.is_above_avg,
+        aa.owner_name,
+        aa.owner_reputation,
+        aa.total_posts,
+        aa.questions,
+        aa.answers,
+        aa.total_score,
+        aa.avg_score,
+        aa.latest_activity,
+        aa.achievement_level,
+        aa.score_view_product,
+        aa.comment_level,
+        aa.answer_level,
+        aa.answer_to_view_ratio,
+        aa.has_highly_rated_comments,
+        ROW_NUMBER() OVER (ORDER BY aa.total_score DESC) as user_rank_by_total_score,
+        RANK() OVER (PARTITION BY aa.OwnerUserId ORDER BY aa.Score DESC) as post_rank_per_user,
+        DENSE_RANK() OVER (ORDER BY aa.owner_reputation DESC) as reputation_rank,
+        CASE 
+            WHEN aa.score_to_view_ratio > 0.5 THEN 'Highly Engaging'
+            WHEN aa.score_to_view_ratio > 0.1 THEN 'Moderately Engaging'
+            ELSE 'Low Engagement'
+        END as engagement_level
+    FROM AdvancedAnalysis aa
+),
+AggregatedResults AS (
+    SELECT 
+        fa.Id,
+        fa.PostTypeId,
+        fa.Score,
+        fa.ViewCount,
+        fa.Title,
+        fa.Tags,
+        fa.OwnerUserId,
+        fa.CreationDate,
+        fa.LastActivityDate,
+        fa.AnswerCount,
+        fa.CommentCount,
+        fa.FavoriteCount,
+        fa.vote_category,
+        fa.tag_count,
+        fa.view_trend,
+        fa.tag_density,
+        fa.days_since_last_activity,
+        fa.activity_level,
+        fa.score_performance,
+        fa.score_to_view_ratio,
+        fa.rank_by_score,
+        fa.view_percentile,
+        fa.score_quartile,
+        fa.first_post_title,
+        fa.previous_score,
+        fa.is_above_avg,
+        fa.owner_name,
+        fa.owner_reputation,
+        fa.total_posts,
+        fa.questions,
+        fa.answers,
+        fa.total_score,
+        fa.avg_score,
+        fa.latest_activity,
+        fa.achievement_level,
+        fa.score_view_product,
+        fa.comment_level,
+        fa.answer_level,
+        fa.answer_to_view_ratio,
+        fa.has_highly_rated_comments,
+        fa.user_rank_by_total_score,
+        fa.post_rank_per_user,
+        fa.reputation_rank,
+        fa.engagement_level,
+        ROW_NUMBER() OVER (PARTITION BY fa.OwnerUserId ORDER BY fa.rank_by_score) as user_post_trend,
+        LAG(fa.Score) OVER (PARTITION BY fa.OwnerUserId ORDER BY fa.CreationDate) as user_prev_score,
+        CASE 
+            WHEN LAG(fa.Score) OVER (PARTITION BY fa.OwnerUserId ORDER BY fa.CreationDate) IS NULL THEN 0
+            ELSE fa.Score - LAG(fa.Score) OVER (PARTITION BY fa.OwnerUserId ORDER BY fa.CreationDate)
+        END as score_change,
+        CASE 
+            WHEN fa.ViewCount = 0 THEN 0
+            ELSE (fa.Score * 1.0 / fa.ViewCount)
+        END as performance_index,
+        CASE 
+            WHEN fa.tag_count > 0 THEN 
+                STRING_AGG(fa.Tags, '; ') OVER (PARTITION BY fa.OwnerUserId ORDER BY fa.CreationDate ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING)
+            ELSE ''
+        END as recent_tags
+    FROM FinalAnalysis fa
+)
+SELECT * FROM AggregatedResults
+WHERE (score_change > 0 OR has_highly_rated_comments = TRUE)
+  AND engagement_level IN ('Highly Engaging', 'Moderately Engaging')
+  AND achievement_level IN ('Elite', 'High Achiever')
+  AND reputation_rank <= 100
+ORDER BY score_change DESC, total_score DESC
+LIMIT 10000;

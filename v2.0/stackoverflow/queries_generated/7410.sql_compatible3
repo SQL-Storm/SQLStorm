@@ -1,0 +1,264 @@
+WITH UserActivitySummary AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT c.Id) as Comments,
+        COUNT(DISTINCT b.Id) as Badges,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) as ReputationRank,
+        DENSE_RANK() OVER (ORDER BY u.Views DESC) as ViewRank,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        CASE 
+            WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 0 
+            THEN COALESCE(SUM(p.Score), 0) * 1.0 / COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END)
+            ELSE 0 
+        END as AvgQuestionScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostPerformanceMetrics AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        CAST(EXTRACT(EPOCH FROM (COALESCE(p.ClosedDate, TIMESTAMP '2024-10-01 12:34:56') AT TIME ZONE 'UTC' - (p.CreationDate AT TIME ZONE 'UTC'))) / 86400 AS INTEGER) as PostAgeDays,
+        CASE 
+            WHEN p.ViewCount > 0 THEN (p.Score * 1.0 / p.ViewCount) 
+            ELSE 0 
+        END as ScorePerView,
+        CASE 
+            WHEN p.AnswerCount > 0 THEN (p.Score * 1.0 / p.AnswerCount) 
+            ELSE 0 
+        END as ScorePerAnswer,
+        CASE 
+            WHEN p.CommentCount > 0 THEN (p.Score * 1.0 / p.CommentCount) 
+            ELSE 0 
+        END as ScorePerComment
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > (SELECT AVG(t2.Count) FROM Tags t2) THEN 'High Frequency' 
+            ELSE 'Low Frequency' 
+        END as TagFrequencyCategory,
+        COALESCE((SELECT COUNT(*) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%'), 0) as AssociatedPostCount
+    FROM Tags t
+),
+UserPostEngagement AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.Score > 0 THEN p.Id END) as PositiveQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.Score > 0 THEN p.Id END) as PositiveAnswers,
+        AVG(COALESCE(p.Score, 0)) as AvgScore,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(p.LastActivityDate) as LastActivityDate,
+        CAST(EXTRACT(EPOCH FROM (MAX(p.CreationDate) AT TIME ZONE 'UTC' - MIN(p.CreationDate) AT TIME ZONE 'UTC')) / 86400 AS INTEGER) as ActivePeriodDays
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6 months')
+    GROUP BY u.Id, u.DisplayName
+),
+FilteredMain AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.Views,
+        uas.TotalPosts,
+        uas.Questions,
+        uas.Answers,
+        uas.Comments,
+        uas.Badges,
+        uas.LastPostDate,
+        uas.ReputationRank,
+        uas.ViewRank,
+        uas.TotalScore,
+        uas.AvgQuestionScore,
+        ROUND(100.0 * (CASE WHEN uas.Questions > 0 THEN uas.Answers * 1.0 / uas.Questions ELSE 0 END), 2) as AnswerToQuestionRatio,
+        CASE 
+            WHEN uas.Views > 0 THEN ROUND(100.0 * uas.TotalScore / uas.Views, 4)
+            ELSE 0 
+        END as ScorePerViewRate,
+        COALESCE(pa.Title, 'No Recent Posts') as RecentPostTitle,
+        COALESCE(pa.Score, 0) as RecentPostScore,
+        COALESCE(pa.ScorePerView, 0) as RecentPostScorePerView,
+        COALESCE(pa.ViewCount, 0) as RecentPostViews,
+        COALESCE(pa.AnswerCount, 0) as RecentPostAnswers,
+        COALESCE(pa.CommentCount, 0) as RecentPostComments,
+        COALESCE(pa.PostAgeDays, 0) as PostAgeDays,
+        COALESCE(ta.TagName, 'No Tags') as PopularTag,
+        COALESCE(ta.TagCount, 0) as TagCount,
+        CASE 
+            WHEN ta.TagCount > 0 AND ta.AssociatedPostCount > 5 THEN 'Highly Engaged Tag'
+            ELSE 'Regular Tag'
+        END as TagEngagementLevel,
+        CASE 
+            WHEN upe.TotalPosts > 0 AND upe.ActivePeriodDays > 0 THEN ROUND(upe.TotalPosts * 1.0 / upe.ActivePeriodDays, 4)
+            ELSE 0 
+        END as PostsPerDayAvg,
+        CASE 
+            WHEN (CASE WHEN upe.TotalPosts > 0 AND upe.ActivePeriodDays > 0 THEN ROUND(upe.TotalPosts * 1.0 / upe.ActivePeriodDays, 4) ELSE 0 END) > 0.1 THEN 'Highly Active'
+            WHEN (CASE WHEN upe.TotalPosts > 0 AND upe.ActivePeriodDays > 0 THEN ROUND(upe.TotalPosts * 1.0 / upe.ActivePeriodDays, 4) ELSE 0 END) > 0.05 THEN 'Moderately Active'
+            ELSE 'Inactive'
+        END as UserActivityLevel,
+        CASE 
+            WHEN uas.Badges > 0 THEN 
+                (SELECT COUNT(*) FROM Badges b WHERE b.UserId = uas.UserId AND b.Class = 1)
+            ELSE 0 
+        END as GoldBadges,
+        CASE 
+            WHEN uas.Badges > 0 THEN 
+                (SELECT COUNT(*) FROM Badges b WHERE b.UserId = uas.UserId AND b.Class = 2)
+            ELSE 0 
+        END as SilverBadges,
+        CASE 
+            WHEN uas.Badges > 0 THEN 
+                (SELECT COUNT(*) FROM Badges b WHERE b.UserId = uas.UserId AND b.Class = 3)
+            ELSE 0 
+        END as BronzeBadges,
+        CASE 
+            WHEN uas.TotalPosts = 0 THEN 'No Posts'
+            WHEN uas.AvgQuestionScore > 10 THEN 'High Scoring'
+            WHEN uas.AvgQuestionScore > 0 THEN 'Moderate Scoring'
+            ELSE 'Low Scoring'
+        END as QuestionScoringLevel,
+        CASE 
+            WHEN uas.Views > 1000 THEN 'High Visibility'
+            WHEN uas.Views > 100 THEN 'Moderate Visibility'
+            ELSE 'Low Visibility'
+        END as VisibilityLevel,
+        COALESCE(ROUND(100.0 * (uas.UpVotes - uas.DownVotes) / NULLIF(uas.UpVotes + uas.DownVotes, 0), 2), 0) as NetVoteRatio,
+        COALESCE(
+            (SELECT MIN(p.CreationDate) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.PostTypeId = 1),
+            TIMESTAMP '2024-10-01 12:34:56'
+        ) as FirstQuestionDate,
+        COALESCE(
+            (SELECT MAX(p.CreationDate) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.PostTypeId = 1),
+            TIMESTAMP '2024-10-01 12:34:56'
+        ) as LastQuestionDate,
+        CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' AT TIME ZONE 'UTC' - COALESCE((SELECT MIN(p.CreationDate) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.PostTypeId = 1), TIMESTAMP '2024-10-01 12:34:56') AT TIME ZONE 'UTC')) / 86400 AS INTEGER) as DaysSinceFirstQuestion,
+        CASE 
+            WHEN uas.Reputation > 10000 THEN 'Expert Level'
+            WHEN uas.Reputation > 1000 THEN 'Advanced Level'
+            WHEN uas.Reputation > 100 THEN 'Intermediate Level'
+            ELSE 'Beginner Level'
+        END as ReputationTier,
+        CASE 
+            WHEN uas.ReputationRank <= 10 THEN 'Top 10 Reputation'
+            WHEN uas.ReputationRank <= 100 THEN 'Top 100 Reputation'
+            ELSE 'Below Top 100'
+        END as ReputationPosition
+    FROM UserActivitySummary uas
+    LEFT JOIN PostPerformanceMetrics pa ON pa.OwnerUserId = uas.UserId AND pa.CreationDate = (
+        SELECT MAX(p2.CreationDate) FROM Posts p2 WHERE p2.OwnerUserId = uas.UserId AND p2.PostTypeId IN (1, 2)
+    )
+    LEFT JOIN TagAnalysis ta ON ta.TagCount = (
+        SELECT MAX(t2.Count) FROM Tags t2 WHERE t2.TagName IN (
+            SELECT TRIM(value) as tag FROM (
+                SELECT regexp_split_to_table(p.Tags, '>') as value FROM Posts p 
+                WHERE p.OwnerUserId = uas.UserId AND p.Tags IS NOT NULL
+            ) sub
+        )
+    )
+    LEFT JOIN UserPostEngagement upe ON upe.UserId = uas.UserId
+    WHERE uas.Reputation > 50
+      AND EXISTS (
+        SELECT 1 FROM Posts p WHERE p.OwnerUserId = uas.UserId 
+        AND p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '3 months')
+      )
+)
+SELECT *
+FROM (
+    SELECT *
+    FROM FilteredMain
+    ORDER BY Reputation DESC, TotalPosts DESC
+    LIMIT 50000
+) fm
+WHERE (SELECT COUNT(*) FROM FilteredMain) >= 10
+UNION ALL
+SELECT 
+    -1 as UserId,
+    'ANALYTICAL_SUMMARY' as DisplayName,
+    SUM(uas.Reputation) as Reputation,
+    SUM(uas.Views) as Views,
+    SUM(uas.TotalPosts) as TotalPosts,
+    SUM(uas.Questions) as Questions,
+    SUM(uas.Answers) as Answers,
+    SUM(uas.Comments) as Comments,
+    SUM(uas.Badges) as Badges,
+    MAX(uas.LastPostDate) as LastPostDate,
+    COUNT(uas.UserId) as ReputationRank,
+    COUNT(uas.UserId) as ViewRank,
+    SUM(uas.TotalScore) as TotalScore,
+    AVG(uas.AvgQuestionScore) as AvgQuestionScore,
+    ROUND(AVG(100.0 * (CASE WHEN uas.Questions > 0 THEN uas.Answers * 1.0 / uas.Questions ELSE 0 END)), 2) as AnswerToQuestionRatio,
+    ROUND(AVG(CASE WHEN uas.Views > 0 THEN 100.0 * uas.TotalScore / uas.Views ELSE 0 END), 4) as ScorePerViewRate,
+    'SUMMARY' as RecentPostTitle,
+    SUM(COALESCE(pa.Score, 0)) as RecentPostScore,
+    AVG(COALESCE(pa.ScorePerView, 0)) as RecentPostScorePerView,
+    SUM(COALESCE(pa.ViewCount, 0)) as RecentPostViews,
+    SUM(COALESCE(pa.AnswerCount, 0)) as RecentPostAnswers,
+    SUM(COALESCE(pa.CommentCount, 0)) as RecentPostComments,
+    AVG(COALESCE(pa.PostAgeDays, 0)) as PostAgeDays,
+    'OVERALL_ANALYSIS' as PopularTag,
+    SUM(COALESCE(ta.TagCount, 0)) as TagCount,
+    'OVERALL_TAG_ENGAGEMENT' as TagEngagementLevel,
+    AVG(CASE 
+        WHEN upe.TotalPosts > 0 AND upe.ActivePeriodDays > 0 THEN upe.TotalPosts * 1.0 / upe.ActivePeriodDays 
+        ELSE 0 
+    END) as PostsPerDayAvg,
+    'AGGREGATE_LEVEL' as UserActivityLevel,
+    SUM(CASE WHEN uas.Badges > 0 THEN (SELECT COUNT(*) FROM Badges b WHERE b.UserId = uas.UserId AND b.Class = 1) ELSE 0 END) as GoldBadges,
+    SUM(CASE WHEN uas.Badges > 0 THEN (SELECT COUNT(*) FROM Badges b WHERE b.UserId = uas.UserId AND b.Class = 2) ELSE 0 END) as SilverBadges,
+    SUM(CASE WHEN uas.Badges > 0 THEN (SELECT COUNT(*) FROM Badges b WHERE b.UserId = uas.UserId AND b.Class = 3) ELSE 0 END) as BronzeBadges,
+    CASE 
+        WHEN AVG(uas.AvgQuestionScore) > 10 THEN 'HIGH_SCORING_AGGREGATE'
+        WHEN AVG(uas.AvgQuestionScore) > 0 THEN 'MODERATE_SCORING_AGGREGATE'
+        ELSE 'LOW_SCORING_AGGREGATE'
+    END as QuestionScoringLevel,
+    CASE 
+        WHEN AVG(uas.Views) > 1000 THEN 'HIGH_VISIBILITY_AGGREGATE'
+        WHEN AVG(uas.Views) > 100 THEN 'MODERATE_VISIBILITY_AGGREGATE'
+        ELSE 'LOW_VISIBILITY_AGGREGATE'
+    END as VisibilityLevel,
+    ROUND(AVG(COALESCE(100.0 * (uas.UpVotes - uas.DownVotes) / NULLIF(uas.UpVotes + uas.DownVotes, 0), 0)), 2) as NetVoteRatio,
+    MIN(TIMESTAMP '2024-10-01 12:34:56') as FirstQuestionDate,
+    MAX(TIMESTAMP '2024-10-01 12:34:56') as LastQuestionDate,
+    ROUND(AVG(CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' AT TIME ZONE 'UTC' - TIMESTAMP '2024-10-01 12:34:56' AT TIME ZONE 'UTC')) / 86400 AS INTEGER)), 2) as DaysSinceFirstQuestion,
+    'AGGREGATE_REPUTATION_TIER' as ReputationTier,
+    'OVERALL_POSITION' as ReputationPosition
+FROM UserActivitySummary uas
+LEFT JOIN PostPerformanceMetrics pa ON pa.OwnerUserId = uas.UserId
+LEFT JOIN TagAnalysis ta ON ta.TagCount = 0
+LEFT JOIN UserPostEngagement upe ON upe.UserId = uas.UserId
+GROUP BY uas.Id, uas.DisplayName
+ORDER BY Reputation DESC, TotalPosts DESC
+LIMIT 10000;

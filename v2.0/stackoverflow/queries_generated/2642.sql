@@ -1,0 +1,152 @@
+-- {"query": "2642.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1461} 
+with RecursiveTagHierarchy as (
+    select 
+        t.Id
+        , t.TagName
+        , 0 as Level
+        , array[t.TagName] as Path
+    from Tags t
+    where t.IsRequired = 1
+
+    union all
+
+    select
+        t.Id
+        , t.TagName
+        , r.Level + 1
+        , r.Path || t.TagName
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id <> r.Id and not t.TagName = any(r.Path)
+    where t.IsModeratorOnly = 0 and r.Level < 3
+)
+, RecentUserActivity as (
+    select 
+        u.Id as UserId
+        , u.DisplayName
+        , u.Reputation
+        , u.CreationDate
+        , max(p.LastActivityDate) filter (where p.PostTypeId = 1) as LastQuestionActivity
+        , max(p.LastActivityDate) filter (where p.PostTypeId = 2) as LastAnswerActivity
+        , count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount
+        , count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount
+        , sum(case when v.VoteTypeId = 2 then 1 else 0 end) as TotalUpVotes
+        , sum(case when v.VoteTypeId = 3 then 1 else 0 end) as TotalDownVotes
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Votes v on v.PostId = p.Id
+    where u.CreationDate > current_date - interval '2 years'
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate
+)
+, QuestionWithAcceptedAndCloseInfo as (
+    select 
+        q.Id
+        , q.Title
+        , q.Tags
+        , q.OwnerUserId
+        , q.CreationDate
+        , q.Score
+        , q.ViewCount
+        , q.AcceptedAnswerId
+        , ca.Score as AcceptedAnswerScore
+        , crt.Name as CloseReason
+        , ph.ClosedDate
+    from Posts q
+    left join Posts ca on ca.Id = q.AcceptedAnswerId
+    left join PostHistory ph on ph.PostId = q.Id and ph.PostHistoryTypeId = 10 and ph.CreationDate = (
+        select max(ph2.CreationDate) from PostHistory ph2 where ph2.PostId = q.Id and ph2.PostHistoryTypeId = 10
+    )
+    left join CloseReasonTypes crt on crt.Id::int = ph.Comment::int
+    where q.PostTypeId = 1
+)
+, RankingVotesPerPost as (
+    select
+        p.Id as PostId
+        , count(case when v.VoteTypeId = 2 then 1 end) as UpVoteCount
+        , count(case when v.VoteTypeId = 3 then 1 end) as DownVoteCount
+        , count(v.Id) as TotalVotes
+        , round(
+            coalesce(
+                sum(case when v.VoteTypeId = 2 then 1 else 0 end) * 1.0 / nullif(count(v.Id), 0)
+                , 0
+            ), 4
+          ) as UpVoteRatio
+    from Posts p
+    left join Votes v on v.PostId = p.Id
+    group by p.Id
+)
+select
+    q.Id as QuestionId
+    , q.Title
+    , q.Tags
+    , q.Score
+    , q.ViewCount
+    , q.CreationDate::date as QuestionDate
+    , q.CloseReason
+    , q.ClosedDate::date as ClosedDate
+    , q.AcceptedAnswerId
+    , q.AcceptedAnswerScore
+    , r.UserId
+    , r.DisplayName as QuestionOwner
+    , r.Reputation as OwnerReputation
+    , r.QuestionCount
+    , r.AnswerCount
+    , rv.UpVoteCount
+    , rv.DownVoteCount
+    , rv.TotalVotes
+    , rv.UpVoteRatio
+    , row_number() over (partition by r.UserId order by q.Score desc, q.ViewCount desc) as UserQuestionRank
+    , dense_rank() over (order by q.Score desc, q.ViewCount desc) as GlobalQuestionRank
+    , coalesce(phc.Comment, 'No recent close comments') as LatestCloseComment
+    , coalesce((select string_agg(b.Name || ' (class ' || b.Class || ')', ', ' order by b.Date desc)
+                from Badges b 
+                where b.UserId = r.UserId
+                and b.Date > current_date - interval '1 year'), 'No recent badges') as RecentBadges
+from QuestionWithAcceptedAndCloseInfo q
+inner join RecentUserActivity r on r.UserId = q.OwnerUserId
+left join RankingVotesPerPost rv on rv.PostId = q.Id
+left join LATERAL (
+    select ph3.Comment from PostHistory ph3
+    where ph3.PostId = q.Id and ph3.PostHistoryTypeId = 10 and ph3.CreationDate > current_date - interval '1 month'
+    order by ph3.CreationDate desc limit 1
+) phc on true
+where
+    (q.CloseReason is null or q.CloseReason not in ('Duplicate', 'Exact Duplicate'))
+    and (array_length(string_to_array(q.Tags, '><'), 1) between 1 and 5)
+    and r.Reputation > 1000
+    and (q.Score > 5 or q.ViewCount > 1000)
+order by r.UserId
+limit 100
+
+union all
+
+select
+    a.Id as AnswerId
+    , concat('Answer to: ', coalesce(q.Title, '[unknown question]')) as Title
+    , q.Tags
+    , a.Score
+    , null
+    , a.CreationDate::date
+    , null
+    , null
+    , null
+    , null
+    , r.UserId
+    , r.DisplayName as AnswerOwner
+    , r.Reputation
+    , r.QuestionCount
+    , r.AnswerCount
+    , rv.UpVoteCount
+    , rv.DownVoteCount
+    , rv.TotalVotes
+    , rv.UpVoteRatio
+    , null
+    , null
+    , null
+    , null
+from Posts a
+left join Posts q on q.Id = a.ParentId and q.PostTypeId = 1
+inner join RecentUserActivity r on r.UserId = a.OwnerUserId
+left join RankingVotesPerPost rv on rv.PostId = a.Id
+where a.PostTypeId = 2 and a.CreationDate > current_date - interval '6 months' and r.Reputation > 500
+order by a.CreationDate desc
+limit 50;

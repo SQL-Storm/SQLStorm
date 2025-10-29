@@ -1,0 +1,314 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+        LAG(p.ViewCount) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_views,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) as avg_score_3posts,
+        CASE 
+            WHEN p.Score > 100 THEN 'High'
+            WHEN p.Score > 50 THEN 'Medium'
+            ELSE 'Low'
+        END as score_category,
+        COALESCE(
+            NULLIF(SUBSTRING(p.Tags FROM 1 FOR (POSITION('>' IN p.Tags) - 1)), ''),
+            'No Tags'
+        ) as primary_tag,
+        CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate)) / 86400 AS INTEGER) as days_since_creation,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AnswerCount = 0 THEN 'Unanswered Question'
+            WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN 'Answered Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as post_status
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as total_posts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) as question_count,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) as answer_count,
+        AVG(p.Score) as avg_score,
+        MAX(p.CreationDate) as latest_post_date,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Expert'
+            WHEN u.Reputation > 1000 THEN 'Advanced'
+            WHEN u.Reputation > 100 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as user_level
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes
+),
+TagAnalysis AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            ELSE 'Niche'
+        END as tag_popularity,
+        CASE 
+            WHEN t.IsRequired = TRUE THEN 'Required Tag'
+            WHEN t.IsModeratorOnly = TRUE THEN 'Moderator Only'
+            ELSE 'Standard Tag'
+        END as tag_type
+    FROM Tags t
+),
+PostActivity AS (
+    SELECT 
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.UserId,
+        ph.CreationDate,
+        ph.Comment,
+        ph.Text,
+        CASE 
+            WHEN ph.PostHistoryTypeId IN (1, 4, 6) THEN 'Title/Tag Edit'
+            WHEN ph.PostHistoryTypeId IN (2, 5) THEN 'Content Edit'
+            WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN 'Status Change'
+            ELSE 'Other'
+        END as activity_type,
+        CASE 
+            WHEN ph.PostHistoryTypeId = 10 THEN 
+                CASE 
+                    WHEN ph.Comment LIKE '%101%' THEN 'Duplicate Close'
+                    WHEN ph.Comment LIKE '%102%' THEN 'Off-topic Close'
+                    WHEN ph.Comment LIKE '%103%' THEN 'Needs Clarity Close'
+                    ELSE 'Other Close'
+                END
+            ELSE 'Not Close'
+        END as close_reason
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (1, 2, 4, 5, 6, 10, 11, 12, 13)
+),
+UserTagUsage AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) as questions_with_tags,
+        STRING_AGG(DISTINCT COALESCE(t.TagName, 'No Tag'), ', ') as used_tags,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as question_count,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as answer_count,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) as avg_question_score,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) as avg_answer_score
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Tags t ON p.Tags IS NOT NULL AND t.TagName IN (
+        SELECT TRIM(x) FROM (
+            SELECT UNNEST(STRING_TO_ARRAY(
+                CASE 
+                    WHEN p.Tags IS NOT NULL THEN SUBSTRING(p.Tags FROM 2)
+                    ELSE ''
+                END, '<'
+            )) AS x
+        ) sub
+    )
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName
+)
+SELECT 
+    r.Id,
+    r.Title,
+    r.Tags,
+    r.primary_tag,
+    r.post_status,
+    r.Score,
+    r.ViewCount,
+    r.AnswerCount,
+    r.CommentCount,
+    r.FavoriteCount,
+    s.total_posts,
+    s.question_count,
+    s.answer_count,
+    s.avg_score,
+    s.user_level,
+    ta.tag_popularity,
+    ta.tag_type,
+    pa.activity_type,
+    pa.close_reason,
+    utu.used_tags,
+    utu.questions_with_tags,
+    utu.avg_question_score,
+    utu.avg_answer_score,
+    CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - r.CreationDate)) / 86400 AS INTEGER) as age_in_days,
+    CASE 
+        WHEN r.prev_score IS NOT NULL THEN 
+            CASE 
+                WHEN r.Score > r.prev_score THEN 'Improving'
+                WHEN r.Score < r.prev_score THEN 'Declining'
+                ELSE 'Stable'
+            END
+        ELSE 'New'
+    END as trend,
+    CASE 
+        WHEN r.Score >= 100 AND r.ViewCount >= 1000 THEN 'High Impact'
+        WHEN r.Score >= 50 AND r.ViewCount >= 500 THEN 'Medium Impact'
+        ELSE 'Low Impact'
+    END as impact_level,
+    CASE 
+        WHEN r.days_since_creation <= 7 THEN 'Recent'
+        WHEN r.days_since_creation <= 30 THEN 'This Month'
+        WHEN r.days_since_creation <= 90 THEN 'This Quarter'
+        ELSE 'Old'
+    END as time_category,
+    r.avg_score_3posts,
+    CASE 
+        WHEN r.AnswerCount = 0 THEN 'Unanswered'
+        WHEN r.AnswerCount >= 1 THEN 'Answered'
+    END as answered_status,
+    CASE 
+        WHEN RANK() OVER (ORDER BY r.Score DESC) <= 10 THEN 'Top 10 Score'
+        WHEN RANK() OVER (ORDER BY r.Score DESC) <= 50 THEN 'Top 50 Score'
+        ELSE 'Other'
+    END as top_score_rank,
+    NULLIF(r.Title, '') as title_without_nulls,
+    COALESCE(r.Tags, 'No Tags') as tags_or_default,
+    REVERSE(SUBSTRING(r.Title FROM 1 FOR 50)) as title_reverse,
+    CASE 
+        WHEN s.user_level = 'Expert' AND r.Score >= 100 THEN 'Expert High Score'
+        WHEN s.user_level = 'Advanced' AND r.Score >= 50 THEN 'Advanced Moderate Score'
+        WHEN s.user_level = 'Intermediate' AND r.Score >= 10 THEN 'Intermediate Low Score'
+        ELSE 'Other Category'
+    END as user_score_category,
+    CASE 
+        WHEN r.ViewCount > (SELECT AVG(ViewCount) FROM Posts WHERE ViewCount IS NOT NULL) THEN 'Above Average Views'
+        WHEN r.ViewCount < (SELECT AVG(ViewCount) FROM Posts WHERE ViewCount IS NOT NULL) THEN 'Below Average Views'
+        ELSE 'Average Views'
+    END as view_performance,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = r.Id AND v.VoteTypeId = 2) as upvote_count,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = r.Id AND v.VoteTypeId = 3) as downvote_count,
+    CASE 
+        WHEN EXISTS (SELECT 1 FROM PostLinks pl WHERE pl.PostId = r.Id) THEN 'Has Related Posts'
+        ELSE 'No Related Posts'
+    END as related_posts_status,
+    CASE 
+        WHEN EXISTS (SELECT 1 FROM Comments c WHERE c.PostId = r.Id) THEN 'Has Comments'
+        ELSE 'No Comments'
+    END as comment_status,
+    CASE 
+        WHEN EXISTS (SELECT 1 FROM Comments c WHERE c.PostId = r.Id AND c.UserId IS NOT NULL) THEN 'Has User Comments'
+        ELSE 'No User Comments'
+    END as user_comments_status,
+    CASE 
+        WHEN EXISTS (SELECT 1 FROM PostHistory ph WHERE ph.PostId = r.Id AND ph.PostHistoryTypeId IN (10, 11, 12, 13)) THEN 'Has History Events'
+        ELSE 'No History Events'
+    END as history_events_status,
+    CASE 
+        WHEN EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = r.OwnerUserId AND b.Name LIKE '%Favorite%') THEN 'Has Favorite Badges'
+        ELSE 'No Favorite Badges'
+    END as favorite_badges_status,
+    CASE 
+        WHEN s.Reputation >= 10000 THEN 1
+        WHEN s.Reputation >= 1000 THEN 0.5
+        ELSE 0.2
+    END as reputation_multiplier,
+    (r.Score * (CASE WHEN s.Reputation >= 10000 THEN 1.5 WHEN s.Reputation >= 1000 THEN 1.2 ELSE 1.0 END)) as adjusted_score,
+    CASE 
+        WHEN r.Score > 0 THEN 'Positive Score'
+        WHEN r.Score < 0 THEN 'Negative Score'
+        ELSE 'Zero Score'
+    END as score_direction,
+    COALESCE(
+        CASE 
+            WHEN r.FavoriteCount > 50 THEN 'Highly Favorited'
+            WHEN r.FavoriteCount > 10 THEN 'Moderately Favorited'
+            ELSE 'Low Favorited'
+        END, 
+        'Not Favorited'
+    ) as favorited_status,
+    CASE 
+        WHEN r.AnswerCount > r.CommentCount THEN 'More Answers Than Comments'
+        WHEN r.AnswerCount < r.CommentCount THEN 'More Comments Than Answers'
+        ELSE 'Equal Answers and Comments'
+    END as answer_comment_ratio,
+    (SELECT COUNT(DISTINCT VoteTypeId) FROM Votes WHERE PostId = r.Id) as distinct_vote_tyes,
+    CASE 
+        WHEN EXISTS (SELECT 1 FROM Posts p2 WHERE p2.ParentId = r.Id AND p2.PostTypeId = 2) THEN 'Has Answers'
+        ELSE 'No Answers'
+    END as has_answers,
+    COALESCE(utu.question_count, 0) as user_question_count,
+    COALESCE(utu.answer_count, 0) as user_answer_count,
+    r.CreationDate,
+    r.prev_score,
+    r.prev_views,
+    r.OwnerUserId,
+    r.post_status,
+    r.score_category
+FROM RankedPosts r
+LEFT JOIN UserStats s ON r.OwnerUserId = s.UserId
+LEFT JOIN TagAnalysis ta ON ta.TagName = r.primary_tag
+LEFT JOIN PostActivity pa ON pa.PostId = r.Id
+LEFT JOIN UserTagUsage utu ON utu.UserId = r.OwnerUserId
+WHERE 
+    r.rn <= 5 AND
+    s.total_posts > 0 AND
+    s.user_level IN ('Expert', 'Advanced', 'Intermediate') AND
+    r.post_status IN ('Answered Question', 'Unanswered Question', 'Answer') AND
+    (r.Score IS NOT NULL OR r.Score >= -50) AND
+    r.ViewCount IS NOT NULL AND
+    r.AnswerCount IS NOT NULL AND
+    r.CommentCount IS NOT NULL AND
+    r.FavoriteCount IS NOT NULL AND
+    r.days_since_creation >= 0
+GROUP BY
+    r.Id,
+    r.Title,
+    r.Tags,
+    r.primary_tag,
+    r.post_status,
+    r.Score,
+    r.ViewCount,
+    r.AnswerCount,
+    r.CommentCount,
+    r.FavoriteCount,
+    s.total_posts,
+    s.question_count,
+    s.answer_count,
+    s.avg_score,
+    s.user_level,
+    ta.tag_popularity,
+    ta.tag_type,
+    pa.activity_type,
+    pa.close_reason,
+    utu.used_tags,
+    utu.questions_with_tags,
+    utu.avg_question_score,
+    utu.avg_answer_score,
+    r.CreationDate,
+    r.prev_score,
+    r.prev_views,
+    r.days_since_creation,
+    r.avg_score_3posts,
+    s.Reputation,
+    utu.question_count,
+    utu.answer_count,
+    r.OwnerUserId,
+    r.score_category
+ORDER BY 
+    r.Score DESC,
+    r.ViewCount DESC,
+    r.CreationDate DESC
+LIMIT 10000;

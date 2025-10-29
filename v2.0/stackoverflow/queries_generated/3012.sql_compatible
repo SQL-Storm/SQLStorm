@@ -1,0 +1,98 @@
+WITH
+user_stats AS (
+    SELECT
+        u.id,
+        u.displayname,
+        u.reputation,
+        COALESCE(u.location, 'N/A') AS location,
+        (SELECT COUNT(*) FROM badges b WHERE b.userid = u.id AND b.class = 1) AS gold_badges,
+        (SELECT COUNT(*) FROM badges b WHERE b.userid = u.id AND b.class = 2) AS silver_badges,
+        (SELECT COUNT(*) FROM badges b WHERE b.userid = u.id AND b.class = 3) AS bronze_badges,
+        (SELECT COUNT(*) FROM posts p WHERE p.owneruserid = u.id AND p.posttypeid = 1) AS question_cnt,
+        (SELECT COUNT(*) FROM posts p WHERE p.owneruserid = u.id AND p.posttypeid = 2) AS answer_cnt
+    FROM users u
+    WHERE u.reputation > 500
+),
+tag_usage AS (
+    SELECT
+        t.tagname,
+        COUNT(p.id) AS question_uses,
+        STRING_AGG(DISTINCT CAST(p.owneruserid AS VARCHAR), ',') AS distinct_owners
+    FROM tags t
+    JOIN posts p
+        ON p.posttypeid = 1
+       AND p.tags IS NOT NULL
+       AND p.tags LIKE '%' || '<' || t.tagname || '>' || '%'
+    WHERE p.owneruserid IN (SELECT id FROM user_stats)
+    GROUP BY t.tagname
+),
+ranked_posts AS (
+    SELECT
+        p.id,
+        p.title,
+        p.score,
+        p.viewcount,
+        p.creationdate,
+        COALESCE(p.ownerdisplayname, u.displayname) AS owner_name,
+        p.owneruserid,
+        p.posttypeid,
+        ROW_NUMBER() OVER (PARTITION BY p.owneruserid, p.posttypeid ORDER BY p.score DESC, p.viewcount DESC) AS rn
+    FROM posts p
+    LEFT JOIN users u ON p.owneruserid = u.id
+    WHERE p.posttypeid IN (1, 2)
+      AND p.owneruserid IS NOT NULL
+)
+
+SELECT
+    us.id,
+    us.displayname,
+    us.reputation,
+    us.location,
+    us.gold_badges,
+    us.silver_badges,
+    us.bronze_badges,
+    us.question_cnt,
+    us.answer_cnt,
+    qp.title AS top_question_title,
+    qp.score AS top_question_score,
+    qp.viewcount AS top_question_views,
+    qp.creationdate AS top_question_date,
+    ap.title AS top_answer_title,
+    ap.score AS top_answer_score,
+    ap.viewcount AS top_answer_views,
+    tu.tagname,
+    tu.question_uses,
+    tu.distinct_owners
+FROM user_stats us
+LEFT JOIN ranked_posts qp
+       ON qp.owneruserid = us.id
+      AND qp.posttypeid = 1
+      AND qp.rn = 1
+LEFT JOIN ranked_posts ap
+       ON ap.owneruserid = us.id
+      AND ap.posttypeid = 2
+      AND ap.rn = 1
+LEFT JOIN LATERAL (
+    SELECT tu2.*
+    FROM tag_usage tu2
+    WHERE tu2.tagname = ANY (
+        SELECT UNNEST(string_to_array(p.tags, '><'))
+        FROM posts p
+        WHERE p.owneruserid = us.id AND p.posttypeid = 1
+        LIMIT 5
+    )
+    ORDER BY tu2.question_uses DESC
+    LIMIT 3
+) tu ON TRUE
+WHERE (us.gold_badges + us.silver_badges + us.bronze_badges) >= 5
+ORDER BY us.reputation DESC, us.gold_badges DESC
+OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY
+
+UNION ALL
+
+SELECT
+    NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+    NULL, NULL, NULL, NULL, NULL, NULL,
+    NULL, NULL, NULL, NULL, NULL, NULL,
+    NULL, NULL, NULL, NULL, NULL, NULL
+WHERE FALSE;

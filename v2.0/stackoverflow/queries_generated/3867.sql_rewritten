@@ -1,0 +1,83 @@
+-- {"query": "3867.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1758} 
+WITH RecentQuestions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        p.Score,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '180 days'
+),
+DuplicateClosures AS (
+    SELECT
+        ph.PostId,
+        ph.CreationDate      AS CloseDate,
+        CAST(ph.Comment AS int) AS DuplicateOfId
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    WHERE pht.Name = 'Post Closed'
+      AND ph.Comment ~ '^\d+$'                     -- comment holds duplicate target id
+),
+UserBadgeStats AS (
+    SELECT
+        u.Id                                   AS UserId,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        MAX(b.Date)                            AS LastBadgeDate
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id
+),
+TagPopularity AS (
+    SELECT
+        TRIM(t.TagName) AS Tag,
+        t.Count          AS TagCount
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0
+)
+SELECT
+    u.Id                                 AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ub.LastBadgeDate,
+    q.Id                                 AS QuestionId,
+    q.Title,
+    q.Score                              AS QuestionScore,
+    q.CreationDate                       AS QuestionCreated,
+    d.CloseDate,
+    d.DuplicateOfId,
+    COALESCE(tpop.TagCount, 0)           AS PrimaryTagPopularity,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, q.Score DESC) AS RankByRepAndScore,
+    CASE
+        WHEN q.Score IS NULL THEN 0
+        ELSE q.Score * (1.0 + COALESCE(ub.GoldBadges,0) * 0.05)
+    END                                 AS WeightedScore,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = q.Id AND c.Score >= 0) AS PositiveCommentCount,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = q.Id AND v.VoteTypeId = 2) AS UpVoteCount,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = q.Id AND v.VoteTypeId = 3) AS DownVoteCount
+FROM RecentQuestions q
+LEFT JOIN DuplicateClosures d ON d.PostId = q.Id
+JOIN Users u ON u.Id = q.OwnerUserId
+LEFT JOIN UserBadgeStats ub ON ub.UserId = u.Id
+LEFT JOIN LATERAL (
+    SELECT UNNEST(string_to_array(TRIM(BOTH '><' FROM q.Tags), '><')) AS Tag
+) AS taglist ON TRUE
+LEFT JOIN TagPopularity tpop ON tpop.Tag = taglist.Tag
+WHERE q.rn = 1
+  AND (d.DuplicateOfId IS NOT NULL OR q.Score > 5)
+GROUP BY
+    u.Id, u.DisplayName, u.Reputation,
+    ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges, ub.LastBadgeDate,
+    q.Id, q.Title, q.Score, q.CreationDate,
+    d.CloseDate, d.DuplicateOfId,
+    tpop.TagCount
+ORDER BY RankByRepAndScore
+LIMIT 100;

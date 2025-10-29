@@ -1,0 +1,126 @@
+-- {"query": "5925.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 866} 
+WITH warmed AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.Location,
+    u.AboutMe,
+    u.ProfileImageUrl,
+    u.EmailHash,
+    u.AccountId,
+    COALESCE(b.TotalBadges, 0) AS BadgeCount
+  FROM Users u
+  LEFT JOIN (
+    SELECT UserId, COUNT(*) AS TotalBadges
+    FROM Badges
+    GROUP BY UserId
+  ) b ON b.UserId = u.Id
+),
+recent_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.OwnerUserId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.LastActivityDate,
+    p.AnswerCount,
+    p.PostTypeId,
+    p.AcceptedAnswerId,
+    p.ParentId,
+    p.LastEditorUserId,
+    p.LastEditDate,
+    p.ContentLicense
+  FROM Posts p
+  WHERE p.PostTypeId = 1 -- Question
+    AND p.CreationDate >= NOW() - INTERVAL '30 days'
+),
+tag_wiki_activity AS (
+  SELECT
+    t.TagName,
+    t.Count AS TagCount,
+    t.WikiPostId,
+    w.Id AS WikiPostId,
+    w.Title AS WikiTitle,
+    wb.CreationDate AS WikiCreated,
+    pc.PostId,
+    pc.ComputedScore
+  FROM Tags t
+  LEFT JOIN Posts w ON w.Id = t.WikiPostId
+  LEFT JOIN (
+    SELECT
+      p.Id AS PostId,
+      p.Score AS ComputedScore,
+      p.CreationDate AS CreationDate
+    FROM Posts p
+    WHERE p.PostTypeId IN (4,5) -- some tag wiki related entries
+  ) pc ON pc.PostId = t.WikiPostId
+)
+SELECT
+  warmed.UserId,
+  warmed.DisplayName,
+  warmed.Reputation,
+  warmed.UserCreationDate,
+  warmed.LastAccessDate,
+  warmed.Location,
+  warmed.AboutMe,
+  warmed.Views,
+  warmed.UpVotes,
+  warmed.DownVotes,
+  warmed.ProfileImageUrl,
+  warmed.EmailHash,
+  warmed.AccountId,
+  warmed.BadgeCount,
+  recent_questions.PostId AS QuestionId,
+  recent_questions.Title AS QuestionTitle,
+  recent_questions.Tags,
+  recent_questions.CreationDate AS QuestionCreationDate,
+  recent_questions.Score AS QuestionScore,
+  recent_questions.ViewCount AS QuestionViews,
+  recent_questions.CommentCount AS QuestionCommentCount,
+  recent_questions.FavoriteCount AS QuestionFavorites,
+  recent_questions.LastActivityDate AS QuestionLastActivity,
+  recent_questions.AnswerCount,
+  recent_questions.AcceptedAnswerId,
+  recent_questions.ParentId,
+  recent_questions.LastEditorUserId,
+  recent_questions.LastEditDate AS QuestionLastEditDate,
+  recent_questions.ContentLicense,
+  -- window function: rank users by total question score among top 100 users by reputation
+  RANK() OVER (
+    ORDER BY warmed.Reputation DESC, warmed.UserId ASC
+  ) AS UserRankByReputation,
+  -- set operation: cumulative badge/title overlap count with top 5 tag-related wiki posts
+  (
+    SELECT COUNT(*) FROM (
+      SELECT DISTINCT b.Id
+      FROM Badges b
+      JOIN Posts p ON p.Id = b.UserId
+      WHERE b.UserId = warmed.UserId
+    ) AS sub
+  ) AS UserBadgeCount
+FROM warmed
+LEFT JOIN recent_questions
+  ON recent_questions.OwnerUserId = warmed.UserId
+LEFT JOIN (
+  SELECT
+    t.TagName,
+    t.Count,
+    t.WikiPostId,
+    t.ExcerptPostId
+  FROM Tags t
+) AS taginfo ON 1 = 1
+LEFT JOIN tag_wiki_activity twa
+  ON twa.TagName = taginfo.TagName
+ORDER BY UserRankByReputation ASC, warmed.UserId ASC
+LIMIT 100;

@@ -1,0 +1,252 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.LastActivityDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+        LAG(p.ViewCount) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_views,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) as score_rank,
+        NTILE(100) OVER (ORDER BY p.Score) as score_quintile
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.AccountId,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) as TotalQuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) as TotalAnswerScore,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END) as AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE NULL END) as AvgAnswerScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.AccountId
+),
+PostActivity AS (
+    SELECT 
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.UserId,
+        ph.CreationDate,
+        ph.Comment,
+        ph.Text,
+        CASE 
+            WHEN ph.PostHistoryTypeId IN (1, 4, 6) THEN 'Title/Tag Edit'
+            WHEN ph.PostHistoryTypeId IN (2, 5) THEN 'Body Edit'
+            WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN 'State Change'
+            WHEN ph.PostHistoryTypeId = 24 THEN 'Suggested Edit'
+            ELSE 'Other'
+        END as ActivityType,
+        LAG(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) as prev_activity_date,
+        EXTRACT(EPOCH FROM (ph.CreationDate - LAG(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate))) as seconds_since_last_activity
+    FROM PostHistory ph
+    WHERE ph.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year')
+),
+RecentBadges AS (
+    SELECT 
+        b.UserId,
+        b.Name,
+        b.Date,
+        b.Class,
+        b.TagBased,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC) as badge_rank
+    FROM Badges b
+    WHERE b.Date >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6 months')
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 10000 THEN 'Popular'
+            WHEN t.Count > 1000 THEN 'Moderate'
+            WHEN t.Count > 100 THEN 'Niche'
+            ELSE 'Rare'
+        END as TagPopularity
+    FROM Tags t
+    WHERE t.Count > 0
+),
+AnswerQuality AS (
+    SELECT 
+        a.Id,
+        a.PostId,
+        a.OwnerUserId,
+        a.Score,
+        a.CreationDate,
+        a.LastEditDate,
+        p.Title as QuestionTitle,
+        COALESCE(p.Score, 0) as QuestionScore,
+        CASE 
+            WHEN a.Score > 10 THEN 'High Quality'
+            WHEN a.Score > 0 THEN 'Moderate Quality'
+            WHEN a.Score = 0 THEN 'Low Quality'
+            ELSE 'Very Low Quality'
+        END as AnswerQualityLevel,
+        CAST(EXTRACT(DAY FROM (a.LastEditDate - a.CreationDate)) AS INTEGER) as DaysToEdit,
+        CASE 
+            WHEN a.Score > p.Score THEN 'Better than Question'
+            WHEN a.Score = p.Score THEN 'Same as Question'
+            WHEN a.Score < p.Score THEN 'Worse than Question'
+            ELSE 'Unknown'
+        END as RelativeQuality
+    FROM Posts a
+    JOIN Posts p ON a.ParentId = p.Id
+    WHERE a.PostTypeId = 2
+),
+PostPerformance AS (
+    SELECT 
+        r.Id as PostId,
+        r.PostTypeId,
+        r.OwnerUserId,
+        r.Score,
+        r.ViewCount,
+        r.CreationDate,
+        r.Title,
+        r.Tags,
+        r.AnswerCount,
+        r.CommentCount,
+        r.FavoriteCount,
+        r.LastActivityDate,
+        r.prev_score,
+        r.prev_views,
+        r.score_rank,
+        r.score_quintile,
+        CASE 
+            WHEN r.Score > 100 THEN 'High Impact'
+            WHEN r.Score > 50 THEN 'Medium Impact'
+            WHEN r.Score > 10 THEN 'Low Impact'
+            ELSE 'Minimal Impact'
+        END as ImpactCategory,
+        CASE 
+            WHEN r.ViewCount > 10000 THEN 'Viral'
+            WHEN r.ViewCount > 1000 THEN 'Trending'
+            WHEN r.ViewCount > 100 THEN 'Popular'
+            ELSE 'Obscure'
+        END as PopularityCategory,
+        CASE 
+            WHEN r.AnswerCount > 10 THEN 'Highly Engaged'
+            WHEN r.AnswerCount > 5 THEN 'Moderately Engaged'
+            WHEN r.AnswerCount > 0 THEN 'Slightly Engaged'
+            ELSE 'Unengaged'
+        END as EngagementCategory,
+        CASE 
+            WHEN (r.ViewCount * 1.0 / NULLIF(r.Score, 0)) > 100 THEN 'High View-to-Score Ratio'
+            WHEN (r.ViewCount * 1.0 / NULLIF(r.Score, 0)) > 10 THEN 'Medium View-to-Score Ratio'
+            ELSE 'Low View-to-Score Ratio'
+        END as ViewScoreRatioCategory
+    FROM RankedPosts r
+    WHERE r.rn = 1
+)
+SELECT 
+    p.OwnerUserId,
+    u.DisplayName,
+    u.Reputation,
+    u.Views as UserViews,
+    p.PostId,
+    p.Title,
+    p.PostTypeId,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.prev_score,
+    p.prev_views,
+    p.score_rank,
+    p.score_quintile,
+    p.ImpactCategory,
+    p.PopularityCategory,
+    p.EngagementCategory,
+    p.ViewScoreRatioCategory,
+    CASE 
+        WHEN p.Score = 0 THEN 'Zero Score Post'
+        WHEN p.Score < 0 THEN 'Negative Score Post'
+        WHEN p.Score BETWEEN 1 AND 5 THEN 'Low Score Post'
+        WHEN p.Score BETWEEN 6 AND 20 THEN 'Medium Score Post'
+        WHEN p.Score BETWEEN 21 AND 100 THEN 'High Score Post'
+        WHEN p.Score > 100 THEN 'Very High Score Post'
+        ELSE 'Other'
+    END as ScoreCategory,
+    CASE 
+        WHEN p.ViewCount > (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = 1) THEN 'Above Average Views'
+        WHEN p.ViewCount < (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = 1) THEN 'Below Average Views'
+        ELSE 'Average Views'
+    END as ViewCategory,
+    ('User ' || u.Id || ' with reputation ' || u.Reputation || ' created post ' || p.PostId || ' titled "' || COALESCE(p.Title,'') || '" on ' || TO_CHAR(p.CreationDate, 'YYYY-MM-DD') || ' with score ' || COALESCE(p.Score::text, '0') || ' and ' || COALESCE(p.AnswerCount::text, '0') || ' answers') as DetailedPostInfo,
+    COALESCE(
+        (SELECT COUNT(*) 
+         FROM Comments c 
+         WHERE c.PostId = p.PostId 
+         AND c.Score > 1), 
+        0
+    ) as PositiveComments,
+    COALESCE(
+        (SELECT COUNT(DISTINCT ph.UserId) 
+         FROM PostHistory ph 
+         WHERE ph.PostId = p.PostId 
+         AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 24)), 
+        0
+    ) as EditorCount,
+    CASE 
+        WHEN p.ViewCount > 1000 AND p.Score > 50 THEN 'High Performance'
+        WHEN p.ViewCount > 500 AND p.Score > 25 THEN 'Medium Performance'
+        WHEN p.ViewCount > 100 AND p.Score > 10 THEN 'Low Performance'
+        ELSE 'Poor Performance'
+    END as PerformanceLevel,
+    CASE 
+        WHEN p.Tags IS NOT NULL AND CHAR_LENGTH(p.Tags) > 0 THEN 
+            TRIM(BOTH '<>' FROM SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2)) 
+        ELSE 'No Tags'
+    END as CleanedTags,
+    CASE 
+        WHEN EXISTS (SELECT 1 FROM PostHistory ph WHERE ph.PostId = p.PostId AND ph.PostHistoryTypeId = 10) 
+        THEN 'Closed'
+        WHEN EXISTS (SELECT 1 FROM PostHistory ph WHERE ph.PostId = p.PostId AND ph.PostHistoryTypeId = 12) 
+        THEN 'Deleted'
+        ELSE 'Active'
+    END as PostStatus,
+    u.AccountId,
+    CASE 
+        WHEN u.Reputation >= 10000 THEN 'Expert'
+        WHEN u.Reputation >= 1000 THEN 'Advanced'
+        WHEN u.Reputation >= 100 THEN 'Intermediate'
+        ELSE 'Beginner'
+    END as UserExpertise,
+    COALESCE((SELECT AVG(Score) FROM Posts WHERE OwnerUserId = p.OwnerUserId AND PostTypeId = 1), 0) as UserAvgQuestionScore,
+    COALESCE((SELECT AVG(Score) FROM Posts WHERE OwnerUserId = p.OwnerUserId AND PostTypeId = 2), 0) as UserAvgAnswerScore,
+    (SELECT COUNT(*) FROM Badges WHERE UserId = p.OwnerUserId) as TotalBadges,
+    (SELECT COUNT(*) FROM Badges WHERE UserId = p.OwnerUserId AND Class = 1) as GoldBadges,
+    (SELECT COUNT(*) FROM Badges WHERE UserId = p.OwnerUserId AND Class = 2) as SilverBadges,
+    (SELECT COUNT(*) FROM Badges WHERE UserId = p.OwnerUserId AND Class = 3) as BronzeBadges,
+    (SELECT Name FROM RecentBadges rb WHERE rb.UserId = p.OwnerUserId AND rb.badge_rank = 1) as RecentBadge,
+    (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = p.OwnerUserId AND CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 weeks')) as RecentPosts,
+    (SELECT MIN(CreationDate) FROM Posts WHERE OwnerUserId = p.OwnerUserId) as FirstPostDate
+FROM PostPerformance p
+LEFT JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN AnswerQuality a ON p.PostId = a.PostId
+WHERE p.PostTypeId IN (1, 2)
+  AND p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 years')
+  AND (p.Score IS NOT NULL OR p.ViewCount IS NOT NULL OR p.AnswerCount IS NOT NULL)
+ORDER BY p.Score DESC, p.ViewCount DESC, p.CreationDate DESC
+LIMIT 1000;

@@ -1,0 +1,166 @@
+-- {"query": "3669.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1910} 
+
+/*  Benchmark query:  heavy use of CTEs, window functions, outer joins,
+    correlated subqueries, set operators, string manipulation and NULL logic   */
+WITH 
+-- 1. Aggregate basic user activity (posts, score, answer acceptance)
+usr_posts AS (
+    SELECT 
+        u.Id                                          AS user_id,
+        COUNT(p.Id)                                   AS total_posts,
+        SUM(COALESCE(p.Score,0))                      AS total_score,
+        SUM(CASE 
+                WHEN p.PostTypeId = 2                 -- Answer
+                     AND p.Id = q.AcceptedAnswerId 
+                THEN 1 ELSE 0 
+            END)                                      AS accepted_answers,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END)  AS total_answers,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END)  AS total_questions,
+        MAX(p.CreationDate)                           AS latest_post_date
+    FROM Users u
+    LEFT JOIN Posts p                 ON p.OwnerUserId = u.Id
+    LEFT JOIN Posts q                 ON p.PostTypeId = 2 
+                                      AND p.ParentId = q.Id
+    GROUP BY u.Id
+),
+
+-- 2. Count badges per class (Gold=1, Silver=2, Bronze=3)
+usr_badges AS (
+    SELECT 
+        b.UserId                         AS user_id,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS gold_badges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS silver_badges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS bronze_badges,
+        COUNT(*)                         AS total_badges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+-- 3. Sum upvotes received on a user's posts (only up-mod votes)
+usr_upvotes AS (
+    SELECT 
+        p.OwnerUserId                     AS user_id,
+        COUNT(v.Id)                       AS upvote_count
+    FROM Posts p
+    JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId = 2           -- UpMod
+    GROUP BY p.OwnerUserId
+),
+
+-- 4. Gather top three tags (by question count) per user
+usr_top_tags AS (
+    SELECT 
+        up.user_id,
+        STRING_AGG(t.TagName, ', ' ORDER BY tag_q_cnt DESC) AS top_tags
+    FROM (
+        SELECT 
+            p.OwnerUserId AS user_id,
+            UNNEST(string_to_array(TRIM(BOTH '<>' FROM p.Tags), '><')) AS tag
+        FROM Posts p
+        WHERE p.PostTypeId = 1                                     -- questions only
+    ) pt
+    JOIN Tags t ON t.TagName = pt.tag
+    GROUP BY up.user_id
+),
+
+-- 5. Users with badges but no posts (to be UNION‑ED later)
+usr_no_posts AS (
+    SELECT 
+        u.Id                                      AS user_id,
+        u.DisplayName,
+        u.Reputation,
+        NULL::int                                 AS total_posts,
+        NULL::int                                 AS total_score,
+        NULL::int                                 AS accepted_answers,
+        NULL::int                                 AS total_answers,
+        NULL::int                                 AS total_questions,
+        NULL::timestamp                           AS latest_post_date,
+        b.gold_badges,
+        b.silver_badges,
+        b.bronze_badges,
+        b.total_badges,
+        0                                         AS upvote_count,
+        NULL::text                                AS top_tags
+    FROM Users u
+    JOIN usr_badges b ON b.user_id = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    WHERE p.Id IS NULL
+),
+
+-- 6. Final combined user statistics (including users with posts)
+usr_combined AS (
+    SELECT 
+        u.Id                                               AS user_id,
+        COALESCE(u.DisplayName, 'Anonymous')               AS display_name,
+        u.Reputation,
+        COALESCE(up.total_posts,0)                         AS total_posts,
+        COALESCE(up.total_score,0)                         AS total_score,
+        COALESCE(up.accepted_answers,0)                    AS accepted_answers,
+        COALESCE(up.total_answers,0)                       AS total_answers,
+        COALESCE(up.total_questions,0)                     AS total_questions,
+        COALESCE(up.latest_post_date,'1970-01-01')         AS latest_post_date,
+        COALESCE(b.gold_badges,0)                           AS gold_badges,
+        COALESCE(b.silver_badges,0)                         AS silver_badges,
+        COALESCE(b.bronze_badges,0)                         AS bronze_badges,
+        COALESCE(b.total_badges,0)                          AS total_badges,
+        COALESCE(vu.upvote_count,0)                         AS upvote_count,
+        COALESCE(t.tags,'')                                 AS top_tags,
+        /* Weighted composite score for ranking */
+        (u.Reputation * 0.4) +
+        (COALESCE(up.total_score,0) * 0.2) +
+        (COALESCE(vu.upvote_count,0) * 0.15) +
+        (COALESCE(b.gold_badges,0) * 10) +
+        (COALESCE(b.silver_badges,0) * 5) +
+        (COALESCE(b.bronze_badges,0) * 2) AS composite_score
+    FROM Users u
+    LEFT JOIN usr_posts up      ON up.user_id = u.Id
+    LEFT JOIN usr_badges b      ON b.user_id = u.Id
+    LEFT JOIN usr_upvotes vu    ON vu.user_id = u.Id
+    LEFT JOIN (
+        SELECT user_id, top_tags AS tags FROM usr_top_tags
+    ) t ON t.user_id = u.Id
+)
+
+SELECT *
+FROM (
+    SELECT 
+        uc.*,
+        ROW_NUMBER() OVER (ORDER BY uc.composite_score DESC) AS rank,
+        /* Concatenate display name and location handling NULLs */
+        COALESCE(uc.display_name, 'User') || 
+        CASE WHEN u.Location IS NOT NULL THEN ' (' || u.Location || ')' ELSE '' END 
+            AS display_with_location
+    FROM usr_combined uc
+    JOIN Users u ON u.Id = uc.user_id
+    WHERE uc.total_posts > 0                         -- at least one post
+      AND uc.reputation >= 1000                     -- filter for seasoned users
+) ranked_users
+WHERE rank <= 100
+
+UNION ALL
+
+SELECT 
+    unp.user_id,
+    unp.display_name,
+    unp.reputation,
+    unp.total_posts,
+    unp.total_score,
+    unp.accepted_answers,
+    unp.total_answers,
+    unp.total_questions,
+    unp.latest_post_date,
+    unp.gold_badges,
+    unp.silver_badges,
+    unp.bronze_badges,
+    unp.total_badges,
+    unp.upvote_count,
+    unp.top_tags,
+    /* Composite score for badge‑only users (no posts) */
+    (unp.reputation * 0.4) +
+    (unp.gold_badges * 10) +
+    (unp.silver_badges * 5) +
+    (unp.bronze_badges * 2)                           AS composite_score,
+    NULL                                              AS rank,
+    unp.display_name || ' (no posts)'                 AS display_with_location
+FROM usr_no_posts unp
+ORDER BY composite_score DESC
+LIMIT 20;

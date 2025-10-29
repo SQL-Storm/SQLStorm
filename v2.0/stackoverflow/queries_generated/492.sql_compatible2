@@ -1,0 +1,328 @@
+WITH
+q_posts AS (
+    SELECT p.Id AS QuestionId,
+           p.CreationDate AS QuestionCreationDate,
+           p.OwnerUserId AS QuestionOwnerId,
+           p.Score AS QuestionScore,
+           p.ViewCount,
+           p.Title,
+           p.Tags,
+           p.AcceptedAnswerId,
+           COALESCE(p.AnswerCount, 0) AS AnswerCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+a_posts AS (
+    SELECT a.Id AS AnswerId,
+           a.ParentId AS QuestionId,
+           a.OwnerUserId AS AnswerOwnerId,
+           a.Score AS AnswerScore,
+           a.CreationDate AS AnswerCreationDate
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+),
+user_stats AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.UpVotes,
+        u.DownVotes,
+        u.Views AS ProfileViews,
+        COALESCE(NULLIF(TRIM(u.Location), ''), 'Unknown') AS LocationNorm,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.Reputation, u.CreationDate, u.UpVotes, u.DownVotes, u.Views, COALESCE(NULLIF(TRIM(u.Location), ''), 'Unknown')
+),
+question_activity AS (
+    SELECT
+        q.QuestionId,
+        MIN(a.AnswerCreationDate) AS FirstAnswerDate,
+        COUNT(a.AnswerId) AS TotalAnswers,
+        SUM(CASE WHEN a.AnswerId = q.AcceptedAnswerId THEN 1 ELSE 0 END) AS AcceptedAnswerPresent,
+        MAX(a.AnswerScore) AS MaxAnswerScore,
+        AVG(CAST(a.AnswerScore AS DECIMAL)) AS AvgAnswerScore
+    FROM q_posts q
+    LEFT JOIN a_posts a ON a.QuestionId = q.QuestionId
+    GROUP BY q.QuestionId
+),
+first_interaction AS (
+    SELECT
+        q.QuestionId,
+        MIN(c.CreationDate) AS FirstCommentDate,
+        MIN(pl.CreationDate) AS FirstLinkDate
+    FROM q_posts q
+    LEFT JOIN Comments c ON c.PostId = q.QuestionId
+    LEFT JOIN PostLinks pl ON pl.PostId = q.QuestionId
+    GROUP BY q.QuestionId
+),
+question_votes AS (
+    SELECT
+        v.PostId AS QuestionId,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS UpVotes,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS DownVotes,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 5) AS Favorites,
+        COUNT(*) FILTER (WHERE v.VoteTypeId IN (8,9)) AS BountyEvents,
+        SUM(CASE WHEN v.VoteTypeId IN (8,9) THEN COALESCE(v.BountyAmount,0) ELSE 0 END) AS BountyAmountTotal
+    FROM Votes v
+    JOIN q_posts q ON q.QuestionId = v.PostId
+    GROUP BY v.PostId
+),
+close_events AS (
+    SELECT
+        ph.PostId AS QuestionId,
+        MIN(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId = 10) AS FirstClosedDate,
+        MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId = 11) AS LastReopenedDate,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId = 10) AS CloseCount,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId = 11) AS ReopenCount,
+        (
+          SELECT MODE() WITHIN GROUP (ORDER BY CASE WHEN REGEXP_REPLACE(ph2.Comment, '[^0-9]', '', 'g') = '' THEN NULL ELSE CAST(REGEXP_REPLACE(ph2.Comment, '[^0-9]', '', 'g') AS INTEGER) END)
+          FROM PostHistory ph2
+          WHERE ph2.PostId = ph.PostId AND ph2.PostHistoryTypeId IN (10,11)
+        ) AS DominantCloseReasonId
+    FROM PostHistory ph
+    JOIN q_posts q ON q.QuestionId = ph.PostId
+    WHERE ph.PostHistoryTypeId IN (10,11)
+    GROUP BY ph.PostId
+),
+duplicate_links AS (
+    SELECT
+        pl.PostId AS QuestionId,
+        COUNT(*) FILTER (WHERE pl.LinkTypeId = 3) AS DuplicateLinksCount,
+        COUNT(*) FILTER (WHERE pl.LinkTypeId = 1) AS LinkedCount
+    FROM PostLinks pl
+    JOIN q_posts q ON q.QuestionId = pl.PostId
+    GROUP BY pl.PostId
+),
+tag_expansion AS (
+    SELECT
+        q.QuestionId,
+        UNNEST(STRING_TO_ARRAY(SUBSTRING(q.Tags FROM 2 FOR (CHAR_LENGTH(q.Tags)-2)), '><')) AS TagName
+    FROM q_posts q
+    WHERE q.Tags IS NOT NULL AND CHAR_LENGTH(q.Tags) > 2
+),
+tag_metrics AS (
+    SELECT
+        te.QuestionId,
+        COUNT(*) AS TagCount,
+        SUM(t.Count) AS SumTagGlobalUsage,
+        MAX(t.Count) AS MaxTagGlobalUsage,
+        MIN(t.Count) AS MinTagGlobalUsage
+    FROM tag_expansion te
+    LEFT JOIN Tags t ON LOWER(t.TagName) = LOWER(te.TagName)
+    GROUP BY te.QuestionId
+),
+owner_enrichment AS (
+    SELECT
+        q.QuestionId,
+        qu.UserId AS OwnerUserId,
+        qu.Reputation AS OwnerReputation,
+        qu.UpVotes AS OwnerUpVotes,
+        qu.DownVotes AS OwnerDownVotes,
+        qu.ProfileViews AS OwnerProfileViews,
+        qu.LocationNorm AS OwnerLocation,
+        qu.GoldBadges, qu.SilverBadges, qu.BronzeBadges
+    FROM q_posts q
+    LEFT JOIN user_stats qu ON qu.UserId = q.QuestionOwnerId
+),
+answerer_diversity AS (
+    SELECT
+        q.QuestionId,
+        COUNT(DISTINCT a.AnswerOwnerId) AS DistinctAnswerers,
+        AVG(CAST(us.Reputation AS DECIMAL)) AS AvgAnswererReputation,
+        MIN(us.Reputation) AS MinAnswererReputation,
+        MAX(us.Reputation) AS MaxAnswererReputation
+    FROM q_posts q
+    LEFT JOIN a_posts a ON a.QuestionId = q.QuestionId
+    LEFT JOIN user_stats us ON us.UserId = a.AnswerOwnerId
+    GROUP BY q.QuestionId
+),
+time_to_events AS (
+    SELECT
+        q.QuestionId,
+        EXTRACT(EPOCH FROM (qa.FirstAnswerDate - q.QuestionCreationDate)) AS SecToFirstAnswer,
+        EXTRACT(EPOCH FROM (fi.FirstCommentDate - q.QuestionCreationDate)) AS SecToFirstComment,
+        EXTRACT(EPOCH FROM (fi.FirstLinkDate - q.QuestionCreationDate)) AS SecToFirstLink,
+        EXTRACT(EPOCH FROM (ce.FirstClosedDate - q.QuestionCreationDate)) AS SecToFirstClose
+    FROM q_posts q
+    LEFT JOIN question_activity qa ON qa.QuestionId = q.QuestionId
+    LEFT JOIN first_interaction fi ON fi.QuestionId = q.QuestionId
+    LEFT JOIN close_events ce ON ce.QuestionId = q.QuestionId
+),
+rolling_views AS (
+    SELECT
+        q.QuestionId,
+        q.ViewCount,
+        q.QuestionCreationDate,
+        SUM(q.ViewCount) OVER (ORDER BY q.QuestionCreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumViews,
+        AVG(CAST(q.ViewCount AS DECIMAL)) OVER (ORDER BY q.QuestionCreationDate ROWS BETWEEN 99 PRECEDING AND CURRENT ROW) AS MovingAvgViews_100
+    FROM q_posts q
+),
+rankings AS (
+    SELECT
+        q.QuestionId,
+        DENSE_RANK() OVER (ORDER BY q.ViewCount DESC) AS RankByViews,
+        DENSE_RANK() OVER (ORDER BY q.QuestionScore DESC) AS RankByScore,
+        ROW_NUMBER() OVER (ORDER BY COALESCE(q.ViewCount,0) + COALESCE(q.QuestionScore,0) DESC) AS RowNumByEngagement
+    FROM q_posts q
+),
+question_quality AS (
+    SELECT
+        q.QuestionId,
+        q.QuestionScore,
+        q.ViewCount,
+        qa.TotalAnswers,
+        qv.UpVotes,
+        qv.DownVotes,
+        qv.Favorites,
+        qa.AcceptedAnswerPresent,
+        CAST(
+        (COALESCE(q.QuestionScore,0) * 2
+         + COALESCE(qv.UpVotes,0)
+         - COALESCE(qv.DownVotes,0) * 2
+         + COALESCE(qa.TotalAnswers,0)
+         + CASE WHEN qa.AcceptedAnswerPresent > 0 THEN 5 ELSE 0 END
+         + LEAST(COALESCE(q.ViewCount,0) / NULLIF(GREATEST(qa.TotalAnswers,1),0), 100)
+        ) AS DECIMAL) AS QualityScore
+    FROM q_posts q
+    LEFT JOIN question_activity qa ON qa.QuestionId = q.QuestionId
+    LEFT JOIN question_votes qv ON qv.QuestionId = q.QuestionId
+),
+accepted_answer_latency AS (
+    SELECT
+        q.QuestionId,
+        CASE
+            WHEN q.AcceptedAnswerId IS NULL THEN NULL
+            ELSE (
+                SELECT EXTRACT(EPOCH FROM (a.AnswerCreationDate - q.QuestionCreationDate))
+                FROM a_posts a
+                WHERE a.AnswerId = q.AcceptedAnswerId
+            )
+        END AS SecToAcceptedAnswer
+    FROM q_posts q
+),
+dup_closed_overlap AS (
+    SELECT
+        q.QuestionId,
+        COALESCE(dl.DuplicateLinksCount,0) AS DuplicateLinksCount,
+        COALESCE(ce.CloseCount,0) AS CloseCount,
+        CASE WHEN COALESCE(dl.DuplicateLinksCount,0) > 0 AND COALESCE(ce.CloseCount,0) > 0 THEN 1 ELSE 0 END AS DupAndClosed
+    FROM q_posts q
+    LEFT JOIN duplicate_links dl ON dl.QuestionId = q.QuestionId
+    LEFT JOIN close_events ce ON ce.QuestionId = q.QuestionId
+),
+tag_coverage AS (
+    SELECT
+        q.QuestionId,
+        tm.TagCount,
+        COALESCE(tm.SumTagGlobalUsage, 0) AS SumTagGlobalUsage,
+        COALESCE(tm.MaxTagGlobalUsage, 0) AS MaxTagGlobalUsage,
+        COALESCE(tm.MinTagGlobalUsage, 0) AS MinTagGlobalUsage,
+        CASE WHEN tm.TagCount IS NULL OR tm.TagCount = 0 THEN 'untagged'
+             WHEN tm.TagCount = 1 THEN 'mono'
+             WHEN tm.TagCount BETWEEN 2 AND 3 THEN 'narrow'
+             ELSE 'broad' END AS TagBreadth
+    FROM q_posts q
+    LEFT JOIN tag_metrics tm ON tm.QuestionId = q.QuestionId
+),
+final AS (
+    SELECT
+        q.QuestionId,
+        q.Title,
+        COALESCE(q.Tags, '[]') AS TagsRaw,
+        oe.OwnerUserId,
+        oe.OwnerReputation,
+        oe.OwnerLocation,
+        oe.GoldBadges, oe.SilverBadges, oe.BronzeBadges,
+        qa.TotalAnswers,
+        qa.MaxAnswerScore,
+        qa.AvgAnswerScore,
+        qv.UpVotes, qv.DownVotes, qv.Favorites,
+        qv.BountyEvents, qv.BountyAmountTotal,
+        ce.FirstClosedDate, ce.LastReopenedDate, ce.CloseCount, ce.ReopenCount, ce.DominantCloseReasonId,
+        dl.DuplicateLinksCount, dl.LinkedCount,
+        td.TagCount, td.SumTagGlobalUsage, td.MaxTagGlobalUsage, td.MinTagGlobalUsage, td.TagBreadth,
+        ad.DistinctAnswerers, ad.AvgAnswererReputation, ad.MinAnswererReputation, ad.MaxAnswererReputation,
+        tt.SecToFirstAnswer, tt.SecToFirstComment, tt.SecToFirstLink, tt.SecToFirstClose,
+        al.SecToAcceptedAnswer,
+        rv.ViewCount, rv.CumViews, rv.MovingAvgViews_100,
+        r.RankByViews, r.RankByScore, r.RowNumByEngagement,
+        qq.QualityScore,
+        q.QuestionCreationDate
+    FROM q_posts q
+    LEFT JOIN owner_enrichment oe ON oe.QuestionId = q.QuestionId
+    LEFT JOIN question_activity qa ON qa.QuestionId = q.QuestionId
+    LEFT JOIN question_votes qv ON qv.QuestionId = q.QuestionId
+    LEFT JOIN close_events ce ON ce.QuestionId = q.QuestionId
+    LEFT JOIN duplicate_links dl ON dl.QuestionId = q.QuestionId
+    LEFT JOIN tag_coverage td ON td.QuestionId = q.QuestionId
+    LEFT JOIN answerer_diversity ad ON ad.QuestionId = q.QuestionId
+    LEFT JOIN time_to_events tt ON tt.QuestionId = q.QuestionId
+    LEFT JOIN accepted_answer_latency al ON al.QuestionId = q.QuestionId
+    LEFT JOIN rolling_views rv ON rv.QuestionId = q.QuestionId
+    LEFT JOIN rankings r ON r.QuestionId = q.QuestionId
+    LEFT JOIN question_quality qq ON qq.QuestionId = q.QuestionId
+),
+banded AS (
+    SELECT
+        f.*,
+        NTILE(20) OVER (ORDER BY COALESCE(f.QualityScore,0) DESC) AS QualityVentile,
+        CASE
+            WHEN COALESCE(f.SecToFirstAnswer, 1e15) < 3600 THEN 'under_1h'
+            WHEN COALESCE(f.SecToFirstAnswer, 1e15) < 86400 THEN 'under_1d'
+            WHEN COALESCE(f.SecToFirstAnswer, 1e15) < 604800 THEN 'under_1w'
+            ELSE 'slow_or_never'
+        END AS FirstAnswerBucket
+    FROM final f
+),
+peer_baselines AS (
+    SELECT
+        b.OwnerLocation,
+        b.TagBreadth,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY COALESCE(b.QualityScore,0)) AS MedianQualityByPeerGroup,
+        AVG(COALESCE(b.SecToFirstAnswer, 1e6)) AS AvgSecToFirstAnswerByPeerGroup
+    FROM banded b
+    GROUP BY b.OwnerLocation, b.TagBreadth
+)
+SELECT
+    b.QuestionId,
+    b.Title,
+    b.TagsRaw,
+    b.OwnerUserId,
+    b.OwnerReputation,
+    b.OwnerLocation,
+    b.GoldBadges, b.SilverBadges, b.BronzeBadges,
+    b.TotalAnswers,
+    b.MaxAnswerScore,
+    b.AvgAnswerScore,
+    b.UpVotes, b.DownVotes, b.Favorites,
+    b.BountyEvents, b.BountyAmountTotal,
+    b.FirstClosedDate, b.LastReopenedDate, b.CloseCount, b.ReopenCount, b.DominantCloseReasonId,
+    b.DuplicateLinksCount, b.LinkedCount,
+    b.TagCount, b.SumTagGlobalUsage, b.MaxTagGlobalUsage, b.MinTagGlobalUsage, b.TagBreadth,
+    b.DistinctAnswerers, b.AvgAnswererReputation, b.MinAnswererReputation, b.MaxAnswererReputation,
+    b.SecToFirstAnswer, b.SecToFirstComment, b.SecToFirstLink, b.SecToFirstClose,
+    b.SecToAcceptedAnswer,
+    b.ViewCount, b.CumViews, b.MovingAvgViews_100,
+    b.RankByViews, b.RankByScore, b.RowNumByEngagement,
+    b.QualityScore, b.QualityVentile, b.FirstAnswerBucket,
+    pb.MedianQualityByPeerGroup,
+    pb.AvgSecToFirstAnswerByPeerGroup,
+    b.QuestionCreationDate
+FROM banded b
+LEFT JOIN peer_baselines pb
+  ON pb.OwnerLocation = b.OwnerLocation
+ AND pb.TagBreadth = b.TagBreadth
+WHERE
+    COALESCE(b.ViewCount,0) > 0
+    AND (b.CloseCount IS NULL OR b.CloseCount <= 3)
+    AND (b.DominantCloseReasonId IS NULL OR b.DominantCloseReasonId NOT IN (101))
+ORDER BY
+    b.QualityVentile DESC,
+    b.QualityScore DESC,
+    b.ViewCount DESC,
+    b.QuestionCreationDate DESC
+LIMIT 500;

@@ -1,0 +1,154 @@
+with recursive UserBadgeSummary as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        b.Class,
+        count(*) as BadgeCount,
+        row_number() over (partition by u.Id order by b.Class) as BadgeSeq
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    where (b.TagBased = false) or (b.TagBased is null)
+    group by u.Id, u.DisplayName, u.Reputation, b.Class
+),
+TopUsers as (
+    select UserId, DisplayName, Reputation
+    from Users
+    where Reputation >= (
+        select percentile_cont(0.95) within group (order by Reputation) from Users
+    )
+),
+PostStats as (
+    select 
+        p.OwnerUserId,
+        p.PostTypeId,
+        count(*) as PostCount,
+        avg(p.Score) as AvgScore,
+        max(p.ViewCount) as MaxViews,
+        sum(case when p.AcceptedAnswerId is not null then 1 else 0 end) as AcceptedCount,
+        bool_or(p.ClosedDate is not null) as HasClosedPosts
+    from Posts p
+    where p.OwnerUserId is not null and p.OwnerUserId > 0
+    group by p.OwnerUserId, p.PostTypeId
+),
+LatestComments as (
+    select 
+        c.PostId, 
+        c.Text as LatestCommentText,
+        c.CreationDate as LatestCommentDate,
+        c.UserId as CommentUserId
+    from (
+      select *, row_number() over (partition by PostId order by CreationDate desc) as rn
+      from Comments
+    ) c
+    where c.rn = 1
+),
+LinkedDuplicates as (
+    select distinct pl.PostId, pl.RelatedPostId
+    from PostLinks pl
+    where pl.LinkTypeId = 3
+),
+QuestionsWithDuplicates as (
+    select pq.Id as QuestionId, count(distinct ld.RelatedPostId) as DuplicateCount
+    from Posts pq
+    left join LinkedDuplicates ld on ld.PostId = pq.Id
+    where pq.PostTypeId = 1
+    group by pq.Id
+),
+UserComplexInfo as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        coalesce(psq.PostCount, 0) as QuestionCount,
+        coalesce(psa.PostCount, 0) as AnswerCount,
+        coalesce(psq.AvgScore, 0) as AvgQuestionScore,
+        coalesce(psa.AvgScore, 0) as AvgAnswerScore,
+        coalesce(bsd.BadgeCount, 0) as GoldBadges,
+        coalesce(bss.BadgeCount, 0) as SilverBadges,
+        coalesce(bsb.BadgeCount, 0) as BronzeBadges,
+        maxcase.array_agg_ldt.LatestCommentDate,
+        maxcase.array_agg_ldt.LatestCommentText,
+        case 
+            when u.WebsiteUrl is not null and length(u.WebsiteUrl) > 0 then 
+                'Website: ' || u.WebsiteUrl
+            when u.Location is not null and length(u.Location) > 0 then 
+                'Location: ' || u.Location
+            else 
+                coalesce(u.AboutMe, 'No bio available') 
+        end as UserInfoText,
+        case 
+            when psq.HasClosedPosts then 'Has closed questions'
+            else 'No closed questions'
+        end as ClosedStatus
+    from Users u
+    left join PostStats psq on psq.OwnerUserId = u.Id and psq.PostTypeId = 1
+    left join PostStats psa on psa.OwnerUserId = u.Id and psa.PostTypeId = 2
+    left join (
+        select UserId, count(*) as BadgeCount
+        from Badges where Class = 1 and (TagBased = false or TagBased is null)
+        group by UserId
+    ) bsd on bsd.UserId = u.Id
+    left join (
+        select UserId, count(*) as BadgeCount
+        from Badges where Class = 2 and (TagBased = false or TagBased is null)
+        group by UserId
+    ) bss on bss.UserId = u.Id
+    left join (
+        select UserId, count(*) as BadgeCount
+        from Badges where Class = 3 and (TagBased = false or TagBased is null)
+        group by UserId
+    ) bsb on bsb.UserId = u.Id
+    left join lateral (
+        select 
+          (select array_agg(lc.CreationDate order by lc.CreationDate desc) from Comments lc where lc.UserId = u.Id limit 5) as LatestCommentDate,
+          (select array_agg(lc.Text order by lc.CreationDate desc) from Comments lc where lc.UserId = u.Id limit 5) as LatestCommentText
+    ) maxcase(array_agg_ldt) on true
+)
+select 
+    uci.UserId,
+    uci.DisplayName,
+    uci.Reputation,
+    uci.QuestionCount,
+    uci.AnswerCount,
+    round(cast(uci.AvgQuestionScore as numeric), 2) as AvgQuestionScore,
+    round(cast(uci.AvgAnswerScore as numeric), 2) as AvgAnswerScore,
+    uci.GoldBadges,
+    uci.SilverBadges,
+    uci.BronzeBadges,
+    uci.UserInfoText,
+    uci.ClosedStatus,
+    coalesce(qd.DuplicateCount, 0) as TotalDuplicateQuestions,
+    (select count(*) from Posts p2 
+     where p2.OwnerUserId = uci.UserId 
+       and p2.PostTypeId = 1
+       and p2.ClosedDate is not null
+     ) as ClosedQuestionsCount,
+    rank() over (order by uci.Reputation desc) as ReputationRank,
+    dense_rank() over (partition by uci.ClosedStatus order by uci.Reputation desc) as RankWithinClosedStatus,
+    coalesce(
+      array_to_string(
+        (select array_agg(p.Title order by p.Score desc) from Posts p where p.OwnerUserId = uci.UserId and p.PostTypeId = 1 limit 3), 
+         ' | '), 
+      'No top questions') as TopQuestionTitles
+from UserComplexInfo uci
+left join QuestionsWithDuplicates qd on qd.QuestionId in (
+    select p.Id from Posts p where p.OwnerUserId = uci.UserId and p.PostTypeId = 1
+)
+where uci.Reputation >= 1000
+group by
+    uci.UserId,
+    uci.DisplayName,
+    uci.Reputation,
+    uci.QuestionCount,
+    uci.AnswerCount,
+    uci.AvgQuestionScore,
+    uci.AvgAnswerScore,
+    uci.GoldBadges,
+    uci.SilverBadges,
+    uci.BronzeBadges,
+    uci.UserInfoText,
+    uci.ClosedStatus,
+    qd.DuplicateCount
+order by uci.Reputation desc
+limit 100;

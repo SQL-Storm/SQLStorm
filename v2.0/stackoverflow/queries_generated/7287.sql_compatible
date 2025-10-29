@@ -1,0 +1,237 @@
+WITH PostStats AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Title,
+        p.Tags,
+        p.Body,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostTypeDesc,
+        COALESCE(p.ViewCount, 0) + COALESCE(p.AnswerCount, 0) * 10 + COALESCE(p.CommentCount, 0) * 5 AS ActivityScore,
+        CAST((JULIANDAY(p.LastActivityDate) - JULIANDAY(p.CreationDate)) AS INTEGER) AS DaysSinceCreation,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserPostRank,
+        RANK() OVER (ORDER BY p.Score DESC) AS GlobalScoreRank,
+        DENSE_RANK() OVER (ORDER BY p.ViewCount DESC) AS GlobalViewRank,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevScore,
+        LEAD(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS AvgUserScore,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) AS TotalUserPosts,
+        SUM(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS CumulativeScore
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COALESCE(SUM(ps.Score), 0) AS TotalScore,
+        COALESCE(COUNT(ps.Id), 0) AS TotalPosts,
+        COALESCE(AVG(ps.Score), 0) AS AvgScore,
+        COALESCE(MAX(ps.ViewCount), 0) AS MaxViews,
+        COALESCE(SUM(ps.ViewCount), 0) AS TotalViews,
+        COALESCE(COUNT(DISTINCT ps.Tags), 0) AS UniqueTags,
+        COALESCE(COUNT(DISTINCT ps.Title), 0) AS UniqueTitles,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Elite'
+            WHEN u.Reputation >= 1000 THEN 'Veteran'
+            WHEN u.Reputation >= 100 THEN 'Member'
+            ELSE 'Newbie'
+        END AS ReputationTier
+    FROM Users u
+    LEFT JOIN PostStats ps ON u.Id = ps.OwnerUserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate, u.LastAccessDate
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        COALESCE(t.Count, 0) * 100.0 / (SELECT SUM(Count) FROM Tags) AS PercentOfTotal,
+        CASE 
+            WHEN t.Count > 100 THEN 'Popular'
+            WHEN t.Count > 50 THEN 'Moderate'
+            WHEN t.Count > 10 THEN 'Less Popular'
+            ELSE 'Rare'
+        END AS PopularityLevel,
+        CASE 
+            WHEN t.IsRequired = 1 THEN 'Required'
+            WHEN t.IsModeratorOnly = 1 THEN 'Moderator Only'
+            ELSE 'Standard'
+        END AS TagType
+    FROM Tags t
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        ps.Id,
+        ps.PostTypeId,
+        ps.OwnerUserId,
+        ps.Score,
+        ps.ViewCount,
+        ps.AnswerCount,
+        ps.CommentCount,
+        ps.FavoriteCount,
+        ps.CreationDate,
+        ps.ActivityScore,
+        ps.DaysSinceCreation,
+        ps.UserPostRank,
+        ps.GlobalScoreRank,
+        ps.GlobalViewRank,
+        ps.PrevScore,
+        ps.NextScore,
+        ps.AvgUserScore,
+        ps.TotalUserPosts,
+        ps.CumulativeScore,
+        CASE 
+            WHEN ps.PrevScore IS NOT NULL AND ps.Score > ps.PrevScore THEN 'Improving'
+            WHEN ps.PrevScore IS NOT NULL AND ps.Score < ps.PrevScore THEN 'Declining'
+            WHEN ps.PrevScore IS NOT NULL AND ps.Score = ps.PrevScore THEN 'Stable'
+            ELSE 'New'
+        END AS Trend,
+        CASE 
+            WHEN ps.CreationDate >= DATE '2023-01-01' THEN 'Recent'
+            WHEN ps.CreationDate >= DATE '2022-01-01' THEN '2022'
+            WHEN ps.CreationDate >= DATE '2021-01-01' THEN '2021'
+            ELSE 'Older'
+        END AS PostYear,
+        CASE 
+            WHEN ps.AnswerCount > 0 THEN 'Has Answers'
+            WHEN ps.AnswerCount = 0 THEN 'No Answers'
+            ELSE 'Unknown'
+        END AS AnswerStatus,
+        CASE 
+            WHEN ps.CommentCount > 0 THEN 'Has Comments'
+            WHEN ps.CommentCount = 0 THEN 'No Comments'
+            ELSE 'Unknown'
+        END AS CommentStatus,
+        CASE 
+            WHEN ps.ViewCount > 1000 THEN 'High Visibility'
+            WHEN ps.ViewCount > 100 THEN 'Medium Visibility'
+            WHEN ps.ViewCount > 0 THEN 'Low Visibility'
+            ELSE 'No Views'
+        END AS VisibilityLevel
+    FROM PostStats ps
+)
+SELECT 
+    COALESCE(ua.DisplayName, 'Anonymous') AS AuthorDisplayName,
+    COALESCE(ua.ReputationTier, 'Unknown') AS ReputationTier,
+    COALESCE(ua.TotalScore, 0) AS AuthorTotalScore,
+    COALESCE(ua.TotalPosts, 0) AS AuthorTotalPosts,
+    COALESCE(ua.AvgScore, 0) AS AuthorAvgScore,
+    CASE 
+        WHEN COUNT(cpa.Id) > 0 THEN 'Has Posts'
+        ELSE 'No Posts'
+    END AS HasPosts,
+    COUNT(cpa.Id) AS PostCount,
+    COALESCE(SUM(cpa.Score), 0) AS TotalPostScore,
+    COALESCE(AVG(cpa.Score), 0) AS AvgPostScore,
+    COALESCE(SUM(cpa.ViewCount), 0) AS TotalPostViews,
+    COALESCE(MAX(cpa.ActivityScore), 0) AS MaxActivityScore,
+    COALESCE(
+      NULLIF(
+        (SELECT GROUP_CONCAT(DISTINCT tag ORDER BY tag SEPARATOR ', ')
+         FROM (
+           SELECT TRIM(s.tag) AS tag
+           FROM (
+             SELECT
+               SUBSTR(cpa.Tags, start_pos + 1, end_pos - start_pos - 1) AS tag
+             FROM (
+               SELECT cpa.Id,
+                      instr_positions.pos AS start_pos,
+                      instr_positions_next.pos AS end_pos
+               FROM ComplexPostAnalysis cpa
+               JOIN (
+                 SELECT cpa_inner.Id,
+                        CASE WHEN spos = 0 THEN 0 ELSE spos END AS pos
+                 FROM ComplexPostAnalysis cpa_inner
+                 JOIN (
+                   SELECT Id, 0 AS spos FROM ComplexPostAnalysis
+                 ) z ON cpa_inner.Id = z.Id -- keep rows for parsing; this subquery mainly for engines that support it
+               ) x ON x.Id = cpa.Id
+               -- fallback: simple split by '<' and '>' is not portable; using a derived approach is engine-specific.
+             ) split_sub
+           ) s
+         ) tags_sub
+        ),
+        ''
+      ),
+      'None'
+    ) AS TagList,
+    COALESCE(COUNT(DISTINCT cpa.Title), 0) AS DistinctTitles,
+    COALESCE(AVG(cpa.DaysSinceCreation), 0) AS AvgDaysSinceCreation,
+    COALESCE(SUM(CASE WHEN cpa.Trend = 'Improving' THEN 1 ELSE 0 END), 0) AS ImprovingPosts,
+    COALESCE(SUM(CASE WHEN cpa.Trend = 'Declining' THEN 1 ELSE 0 END), 0) AS DecliningPosts,
+    COALESCE(SUM(CASE WHEN cpa.Trend = 'Stable' THEN 1 ELSE 0 END), 0) AS StablePosts,
+    COALESCE(SUM(CASE WHEN cpa.VisibilityLevel = 'High Visibility' THEN 1 ELSE 0 END), 0) AS HighVisibilityPosts,
+    COALESCE(SUM(CASE WHEN cpa.VisibilityLevel = 'Medium Visibility' THEN 1 ELSE 0 END), 0) AS MediumVisibilityPosts,
+    COALESCE(SUM(CASE WHEN cpa.VisibilityLevel = 'Low Visibility' THEN 1 ELSE 0 END), 0) AS LowVisibilityPosts,
+    COALESCE(SUM(CASE WHEN cpa.PostYear = 'Recent' THEN 1 ELSE 0 END), 0) AS RecentPosts,
+    COALESCE(SUM(CASE WHEN cpa.PostYear = '2022' THEN 1 ELSE 0 END), 0) AS Posts2022,
+    COALESCE(SUM(CASE WHEN cpa.PostYear = '2021' THEN 1 ELSE 0 END), 0) AS Posts2021,
+    COALESCE(SUM(CASE WHEN cpa.AnswerStatus = 'Has Answers' THEN 1 ELSE 0 END), 0) AS PostsWithAnswers,
+    COALESCE(SUM(CASE WHEN cpa.AnswerStatus = 'No Answers' THEN 1 ELSE 0 END), 0) AS PostsWithoutAnswers,
+    COALESCE(SUM(CASE WHEN cpa.CommentStatus = 'Has Comments' THEN 1 ELSE 0 END), 0) AS PostsWithComments,
+    COALESCE(SUM(CASE WHEN cpa.CommentStatus = 'No Comments' THEN 1 ELSE 0 END), 0) AS PostsWithoutComments,
+    COALESCE(SUM(CASE WHEN cpa.GlobalScoreRank <= 10 THEN 1 ELSE 0 END), 0) AS Top10RankedPosts,
+    COALESCE(SUM(CASE WHEN cpa.GlobalViewRank <= 50 THEN 1 ELSE 0 END), 0) AS Top50ViewedPosts,
+    COALESCE(SUM(CASE WHEN cpa.CumulativeScore >= 100 THEN 1 ELSE 0 END), 0) AS HighCumulativeScorePosts
+FROM UserStats ua
+LEFT JOIN ComplexPostAnalysis cpa ON ua.UserId = cpa.OwnerUserId
+WHERE ua.UserId IS NOT NULL
+GROUP BY ua.UserId, ua.DisplayName, ua.ReputationTier, ua.TotalScore, ua.TotalPosts, ua.AvgScore
+HAVING COUNT(cpa.Id) > 0
+
+UNION ALL
+
+SELECT 
+    'Overall Statistics' AS AuthorDisplayName,
+    'Total' AS ReputationTier,
+    SUM(ua.TotalScore) AS AuthorTotalScore,
+    SUM(ua.TotalPosts) AS AuthorTotalPosts,
+    AVG(ua.AvgScore) AS AuthorAvgScore,
+    'All Users' AS HasPosts,
+    COUNT(DISTINCT cpa.Id) AS PostCount,
+    SUM(cpa.Score) AS TotalPostScore,
+    AVG(cpa.Score) AS AvgPostScore,
+    SUM(cpa.ViewCount) AS TotalPostViews,
+    MAX(cpa.ActivityScore) AS MaxActivityScore,
+    'Summary' AS TagList,
+    COUNT(DISTINCT cpa.Title) AS DistinctTitles,
+    AVG(cpa.DaysSinceCreation) AS AvgDaysSinceCreation,
+    SUM(CASE WHEN cpa.Trend = 'Improving' THEN 1 ELSE 0 END) AS ImprovingPosts,
+    SUM(CASE WHEN cpa.Trend = 'Declining' THEN 1 ELSE 0 END) AS DecliningPosts,
+    SUM(CASE WHEN cpa.Trend = 'Stable' THEN 1 ELSE 0 END) AS StablePosts,
+    SUM(CASE WHEN cpa.VisibilityLevel = 'High Visibility' THEN 1 ELSE 0 END) AS HighVisibilityPosts,
+    SUM(CASE WHEN cpa.VisibilityLevel = 'Medium Visibility' THEN 1 ELSE 0 END) AS MediumVisibilityPosts,
+    SUM(CASE WHEN cpa.VisibilityLevel = 'Low Visibility' THEN 1 ELSE 0 END) AS LowVisibilityPosts,
+    SUM(CASE WHEN cpa.PostYear = 'Recent' THEN 1 ELSE 0 END) AS RecentPosts,
+    SUM(CASE WHEN cpa.PostYear = '2022' THEN 1 ELSE 0 END) AS Posts2022,
+    SUM(CASE WHEN cpa.PostYear = '2021' THEN 1 ELSE 0 END) AS Posts2021,
+    SUM(CASE WHEN cpa.AnswerStatus = 'Has Answers' THEN 1 ELSE 0 END) AS PostsWithAnswers,
+    SUM(CASE WHEN cpa.AnswerStatus = 'No Answers' THEN 1 ELSE 0 END) AS PostsWithoutAnswers,
+    SUM(CASE WHEN cpa.CommentStatus = 'Has Comments' THEN 1 ELSE 0 END) AS PostsWithComments,
+    SUM(CASE WHEN cpa.CommentStatus = 'No Comments' THEN 1 ELSE 0 END) AS PostsWithoutComments,
+    SUM(CASE WHEN cpa.GlobalScoreRank <= 10 THEN 1 ELSE 0 END) AS Top10RankedPosts,
+    SUM(CASE WHEN cpa.GlobalViewRank <= 50 THEN 1 ELSE 0 END) AS Top50ViewedPosts,
+    SUM(CASE WHEN cpa.CumulativeScore >= 100 THEN 1 ELSE 0 END) AS HighCumulativeScorePosts
+FROM UserStats ua
+JOIN ComplexPostAnalysis cpa ON ua.UserId = cpa.OwnerUserId
+ORDER BY AuthorTotalScore DESC;

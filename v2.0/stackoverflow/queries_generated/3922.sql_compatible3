@@ -1,0 +1,145 @@
+WITH 
+usr_activity AS (
+    SELECT 
+        u.Id                              AS user_id,
+        u.DisplayName                     AS display_name,
+        u.Reputation,
+        u.CreationDate                    AS user_created,
+        COALESCE(u.LastAccessDate, u.CreationDate) AS last_seen,
+        COUNT(p.Id)                       AS total_posts,
+        MAX(p.CreationDate)               AS last_post_date,
+        COUNT(DISTINCT TRIM(BOTH '<>' FROM tag)) 
+                                          FILTER (WHERE p.PostTypeId = 1) AS distinct_tags,
+        CASE WHEN COUNT(p.Id) = 0 THEN NULL 
+             ELSE CAST(AVG(p.Score) AS NUMERIC(10,2)) END AS avg_score,
+        COALESCE(SUM(vote_cnt.cnt),0)      AS total_votes_received
+    FROM Users u
+    LEFT JOIN Posts p
+        ON p.OwnerUserId = u.Id
+    LEFT JOIN LATERAL (
+        SELECT COUNT(*) AS cnt
+        FROM Votes v
+        WHERE v.PostId = p.Id
+    ) vote_cnt ON TRUE
+    LEFT JOIN LATERAL (
+        SELECT UNNEST(string_to_array(p.Tags, '><')) AS tag
+    ) tags ON p.Tags IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+
+usr_badges AS (
+    SELECT 
+        b.UserId                AS user_id,
+        COUNT(*)                AS total_badges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_badges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_badges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_badges,
+        SUM(CASE WHEN b.TagBased = TRUE OR b.TagBased = 1 THEN 1 ELSE 0 END) AS tag_badges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+controversial_posts AS (
+    SELECT 
+        p.OwnerUserId           AS user_id,
+        p.Id                    AS post_id,
+        p.Title,
+        p.Score,
+        up.cnt                  AS up_votes,
+        dn.cnt                  AS down_votes,
+        (up.cnt + dn.cnt)       AS total_votes,
+        NULLIF(up.cnt,0)        AS up_votes_nonzero,
+        NULLIF(dn.cnt,0)        AS down_votes_nonzero
+    FROM Posts p
+    LEFT JOIN LATERAL (
+        SELECT COUNT(*) AS cnt
+        FROM Votes v
+        WHERE v.PostId = p.Id AND v.VoteTypeId = 2
+    ) up ON TRUE
+    LEFT JOIN LATERAL (
+        SELECT COUNT(*) AS cnt
+        FROM Votes v
+        WHERE v.PostId = p.Id AND v.VoteTypeId = 3
+    ) dn ON TRUE
+    WHERE p.PostTypeId IN (1,2)
+      AND up.cnt > 0 AND dn.cnt > 0
+),
+
+top_users_union AS (
+    SELECT 
+        ua.user_id,
+        ua.display_name,
+        ua.reputation,
+        ub.total_badges,
+        1 AS source_rank_type,
+        ROW_NUMBER() OVER (ORDER BY ua.reputation DESC) rn
+    FROM usr_activity ua
+    LEFT JOIN usr_badges ub ON ub.user_id = ua.user_id
+
+    UNION ALL
+
+    SELECT 
+        ua.user_id,
+        ua.display_name,
+        ua.reputation,
+        ub.total_badges,
+        2 AS source_rank_type,
+        ROW_NUMBER() OVER (ORDER BY ub.total_badges DESC NULLS LAST) rn
+    FROM usr_activity ua
+    LEFT JOIN usr_badges ub ON ub.user_id = ua.user_id
+),
+
+ranked_users AS (
+    SELECT 
+        t.user_id,
+        t.display_name,
+        t.reputation,
+        COALESCE(t.total_badges,0)          AS total_badges,
+        ROW_NUMBER() OVER (
+            PARTITION BY t.source_rank_type
+            ORDER BY 
+                CASE t.source_rank_type 
+                    WHEN 1 THEN t.reputation 
+                    WHEN 2 THEN t.total_badges 
+                END DESC,
+                t.user_id
+        )                                   AS rank_in_source,
+        t.source_rank_type
+    FROM top_users_union t
+)
+
+SELECT 
+    ru.rank_in_source,
+    ru.source_rank_type,
+    ru.user_id,
+    ru.display_name,
+    ru.reputation,
+    ru.total_badges,
+    ua.total_posts,
+    ua.avg_score,
+    ua.distinct_tags,
+    ub.gold_badges,
+    ub.silver_badges,
+    ub.bronze_badges,
+    ub.tag_badges,
+    ua.last_post_date,
+    COALESCE(ua.total_posts,0) * 0.4 +
+    COALESCE(ua.avg_score,0)   * 0.3 +
+    COALESCE(ua.distinct_tags,0) * 0.1 +
+    COALESCE(ua.total_votes_received,0) * 0.2 AS activity_score,
+    COALESCE(
+        (SELECT json_agg(json_build_object(
+                    'post_id', cp.post_id,
+                    'title',   cp.title,
+                    'score',   cp.score,
+                    'up',      cp.up_votes,
+                    'down',    cp.down_votes))
+         FROM controversial_posts cp
+         WHERE cp.user_id = ru.user_id
+         ORDER BY cp.total_votes DESC
+         LIMIT 3), CAST('[]' AS json))          AS recent_controversial_posts
+FROM ranked_users ru
+LEFT JOIN usr_activity ua ON ua.user_id = ru.user_id
+LEFT JOIN usr_badges ub   ON ub.user_id = ru.user_id
+WHERE ru.rank_in_source <= 10
+ORDER BY ru.source_rank_type, ru.rank_in_source;

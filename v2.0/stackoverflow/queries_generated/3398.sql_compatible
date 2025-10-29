@@ -1,0 +1,125 @@
+WITH
+    usr_post_stats AS (
+        SELECT
+            u.Id                                    AS user_id,
+            u.DisplayName,
+            COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS q_cnt,
+            COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS a_cnt,
+            SUM(p.Score)                               AS tot_score,
+            SUM(p.ViewCount)                           AS tot_views,
+            MAX(p.CreationDate)                        AS last_post_dt
+        FROM Users u
+        LEFT JOIN Posts p
+               ON p.OwnerUserId = u.Id
+        GROUP BY u.Id, u.DisplayName
+    ),
+
+    tag_contrib AS (
+        SELECT
+            u.Id                                      AS user_id,
+            LOWER(TRIM(t.tag))                        AS tag,
+            COUNT(*)                                  AS tag_post_cnt,
+            SUM(p.Score)                              AS tag_score
+        FROM Users u
+        JOIN Posts p
+          ON p.OwnerUserId = u.Id
+         AND p.PostTypeId = 1
+         AND p.Tags IS NOT NULL
+        CROSS JOIN LATERAL
+            regexp_split_to_table(
+                TRIM(BOTH '<>' FROM p.Tags),
+                '><'
+            ) AS t(tag)
+        GROUP BY u.Id, LOWER(TRIM(t.tag))
+    ),
+
+    badge_metrics AS (
+        SELECT
+            b.UserId                  AS user_id,
+            COUNT(*)                  AS badge_cnt,
+            SUM(CASE b.Class
+                    WHEN 1 THEN 1000
+                    WHEN 2 THEN 500
+                    ELSE 100
+                END)                  AS badge_weight,
+            MAX(b.Date)               AS last_badge_dt
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+
+    top5_tags AS (
+        SELECT
+            tc.user_id,
+            (SELECT ARRAY_AGG(tag ORDER BY tag_score DESC, tag_post_cnt DESC) FROM (
+                SELECT tc.tag, tc.tag_score, tc.tag_post_cnt
+                FROM tag_contrib tc2
+                WHERE tc2.user_id = tc.user_id
+                ORDER BY tc2.tag_score DESC, tc2.tag_post_cnt DESC
+            ) sub)[:5] AS tags_arr
+        FROM tag_contrib tc
+        GROUP BY tc.user_id
+    ),
+
+    recent_posts AS (
+        SELECT
+            p.Id                     AS post_id,
+            p.OwnerUserId            AS user_id,
+            p.CreationDate,
+            p.Score,
+            ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn,
+            LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate)      AS prev_score
+        FROM Posts p
+        WHERE p.OwnerUserId IS NOT NULL
+    ),
+
+    latest_post_per_user AS (
+        SELECT
+            p.OwnerUserId          AS user_id,
+            p.Id                   AS post_id
+        FROM Posts p
+        WHERE p.OwnerUserId IS NOT NULL
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) = 1
+    )
+
+SELECT
+    u.Id                                          AS user_id,
+    u.DisplayName,
+    ups.q_cnt,
+    ups.a_cnt,
+    ups.tot_score,
+    ups.tot_views,
+    COALESCE(bm.badge_cnt,0)                      AS badge_cnt,
+    COALESCE(bm.badge_weight,0)                   AS badge_weight,
+    tt.tags_arr,
+    CASE
+        WHEN rp.rn = 1 THEN rp.Score - COALESCE(rp.prev_score,0)
+        ELSE NULL
+    END                                          AS recent_score_delta,
+    (SELECT COUNT(*) FROM Votes v
+        WHERE v.PostId = lpp.post_id AND v.VoteTypeId = 2) AS up_votes,
+    (SELECT COUNT(*) FROM Votes v
+        WHERE v.PostId = lpp.post_id AND v.VoteTypeId = 3) AS down_votes,
+    EXISTS (SELECT 1 FROM PostLinks pl
+            WHERE pl.PostId = lpp.post_id AND pl.LinkTypeId = 3) AS has_duplicate_link,
+    CASE
+        WHEN u.EmailHash IS NULL THEN 'NO EMAIL'
+        ELSE 'HAS EMAIL'
+    END                                         AS email_status
+FROM Users u
+LEFT JOIN usr_post_stats ups        ON ups.user_id = u.Id
+LEFT JOIN badge_metrics bm         ON bm.user_id = u.Id
+LEFT JOIN top5_tags tt             ON tt.user_id = u.Id
+LEFT JOIN recent_posts rp          ON rp.user_id = u.Id AND rp.rn = 1
+LEFT JOIN latest_post_per_user lpp ON lpp.user_id = u.Id
+WHERE (ups.tot_score IS NOT NULL AND ups.tot_score > 0)
+   OR COALESCE(bm.badge_cnt,0) > 0
+   OR tt.tags_arr IS NOT NULL
+ORDER BY ups.tot_score DESC NULLS LAST
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL
+EXCEPT
+SELECT * FROM (SELECT 1) AS dummy;

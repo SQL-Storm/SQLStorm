@@ -1,0 +1,146 @@
+WITH RecentActivePosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.PostTypeId,
+    p.Tags
+  FROM Posts p
+  WHERE p.PostTypeId IN (1,2)
+),
+EscalatedQueries AS (
+  SELECT
+    r.PostId,
+    r.Title,
+    r.OwnerUserId,
+    r.CreationDate,
+    r.LastActivityDate,
+    r.Score,
+    r.ViewCount,
+    r.Tags,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+    a.DisplayName AS OwnerDisplayName,
+    u.Reputation,
+    ROW_NUMBER() OVER (
+      PARTITION BY r.OwnerUserId
+      ORDER BY r.LastActivityDate DESC, r.Score DESC
+    ) AS rn_owner
+  FROM RecentActivePosts r
+  LEFT JOIN Votes v
+    ON v.PostId = r.PostId
+  LEFT JOIN Users a
+    ON a.Id = r.OwnerUserId
+  LEFT JOIN Users u
+    ON u.Id = r.OwnerUserId
+  WHERE r.LastActivityDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30' DAY
+  GROUP BY
+    r.PostId,
+    r.Title,
+    r.OwnerUserId,
+    r.CreationDate,
+    r.LastActivityDate,
+    r.Score,
+    r.ViewCount,
+    r.Tags,
+    a.DisplayName,
+    u.Reputation
+),
+CrossLinkStats AS (
+  SELECT
+    e.PostId,
+    e.Title,
+    e.OwnerUserId,
+    e.OwnerDisplayName,
+    e.CreationDate,
+    e.LastActivityDate,
+    e.Score,
+    e.ViewCount,
+    e.Tags,
+    e.UpVotes,
+    e.DownVotes,
+    u2.DisplayName AS LastEditorDisplayName,
+    le.LastEditorRole,
+    le.count_comments,
+    le.comment_experience,
+    e.rn_owner
+  FROM EscalatedQueries e
+  LEFT JOIN Posts P
+    ON P.Id = e.PostId
+  LEFT JOIN Users u2
+    ON u2.Id = (SELECT LastEditorUserId FROM Posts WHERE Id = e.PostId)
+  LEFT JOIN (
+    SELECT Id,
+           CASE
+             WHEN OwnerUserId IS NULL THEN 'Community'
+             WHEN OwnerUserId = -1 THEN 'Community'
+             ELSE 'Author'
+           END AS LastEditorRole,
+           (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p_inner.Id) AS count_comments,
+           (SELECT AVG(COALESCE(CommentCount, 0))
+            FROM (SELECT 1 AS CommentCount) t) AS comment_experience
+    FROM Posts p_inner
+  ) AS le
+    ON le.Id = e.PostId
+  GROUP BY
+    e.PostId,
+    e.Title,
+    e.OwnerUserId,
+    e.OwnerDisplayName,
+    e.CreationDate,
+    e.LastActivityDate,
+    e.Score,
+    e.ViewCount,
+    e.Tags,
+    e.UpVotes,
+    e.DownVotes,
+    u2.DisplayName,
+    le.LastEditorRole,
+    le.count_comments,
+    le.comment_experience,
+    e.rn_owner
+),
+FinalOutput AS (
+  SELECT
+    c.PostId,
+    c.Title,
+    c.OwnerUserId,
+    c.OwnerDisplayName,
+    c.CreationDate,
+    c.LastActivityDate,
+    c.Score,
+    c.ViewCount,
+    c.Tags,
+    c.UpVotes,
+    c.DownVotes,
+    c.LastEditorDisplayName,
+    c.LastEditorRole,
+    c.count_comments,
+    c.comment_experience,
+    c.rn_owner
+  FROM CrossLinkStats c
+)
+SELECT
+  fo.PostId,
+  fo.Title,
+  fo.OwnerUserId,
+  fo.OwnerDisplayName,
+  fo.CreationDate,
+  fo.LastActivityDate,
+  fo.Score,
+  fo.ViewCount,
+  fo.Tags,
+  fo.UpVotes,
+  fo.DownVotes,
+  fo.LastEditorDisplayName,
+  fo.LastEditorRole,
+  fo.count_comments,
+  fo.comment_experience
+FROM FinalOutput fo
+WHERE fo.rn_owner = 1
+ORDER BY fo.LastActivityDate DESC, fo.Score DESC
+LIMIT 100;

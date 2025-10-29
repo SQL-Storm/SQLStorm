@@ -1,0 +1,85 @@
+WITH
+RecentHot AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    u.DisplayName AS OwnerName,
+    p.LastActivityDate,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate DESC) AS rn
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId = 1
+    AND p.ClosedDate IS NULL
+),
+TagStats AS (
+  SELECT
+    unnest(string_to_array(substr(p.Tags, 2, length(p.Tags)-2), '><')) AS tag,
+    COUNT(*) AS cnt,
+    AVG(p.Score) AS avg_score
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+  GROUP BY unnest(string_to_array(substr(p.Tags, 2, length(p.Tags)-2), '><'))
+),
+TopTag AS (
+  SELECT tag, cnt, avg_score
+  FROM TagStats
+  ORDER BY cnt DESC, avg_score DESC
+  LIMIT 5
+),
+CommentInfluence AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    (SELECT AVG(c.Score) FROM Comments c WHERE c.PostId = p.Id) AS AvgCommentScore,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCount
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+ComplexQuery AS (
+  SELECT
+    r.PostId,
+    r.Title,
+    r.OwnerName,
+    r.LastActivityDate,
+    t.tag AS MostReferencedTag,
+    c.AvgCommentScore,
+    c.CommentCount,
+    (COALESCE(v.UpVotes,0) - COALESCE(v.DownVotes,0)) AS NetVotes,
+    v.CreationDate AS VoteDate
+  FROM RecentHot r
+  LEFT JOIN TopTag t ON t.tag = ANY(string_to_array(r.Tags, '><'))
+  LEFT JOIN CommentInfluence c ON c.PostId = r.PostId
+  LEFT JOIN Users u ON r.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.PostId = r.PostId
+  WHERE r.rn = 1
+    AND (v.VoteTypeId = 2 OR v.VoteTypeId = 3)
+  GROUP BY
+    r.PostId,
+    r.Title,
+    r.OwnerName,
+    r.LastActivityDate,
+    t.tag,
+    c.AvgCommentScore,
+    c.CommentCount,
+    v.UpVotes,
+    v.DownVotes,
+    v.CreationDate
+)
+SELECT
+  PostId,
+  Title,
+  OwnerName,
+  LastActivityDate,
+  MostReferencedTag,
+  AvgCommentScore,
+  CommentCount,
+  NetVotes,
+  VoteDate
+FROM ComplexQuery
+ORDER BY LastActivityDate DESC, NetVotes DESC
+LIMIT 100;

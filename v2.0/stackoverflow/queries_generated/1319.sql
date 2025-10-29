@@ -1,0 +1,229 @@
+-- {"query": "1319.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3256} 
+
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate,
+        U.Views AS UserViews,
+        U.UpVotes AS UserUpVotes,
+        U.DownVotes AS UserDownVotes,
+        -- Complex aggregation with conditional counts
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestionsAsked,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswersProvided,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        -- Aggregate scores, handling potential NULLs from LEFT JOIN
+        COALESCE(SUM(CASE WHEN P.PostTypeId = 1 THEN P.Score ELSE 0 END), 0) AS TotalQuestionScore,
+        COALESCE(SUM(CASE WHEN P.PostTypeId = 2 THEN P.Score ELSE 0 END), 0) AS TotalAnswerScore,
+        COALESCE(AVG(C.Score), 0.0) AS AvgCommentScore,
+        MAX(C.CreationDate) AS LastCommentDate,
+        MIN(P.CreationDate) AS FirstPostDate,
+        -- String expression and NULL logic: If DisplayName is null, use a default, capitalize first letter if not null
+        COALESCE(UPPER(SUBSTRING(U.DisplayName, 1, 1)) || SUBSTRING(U.DisplayName, 2), 'Anonymous User') AS FormattedDisplayName,
+        -- Complicated calculation: engagement ratio, handling division by zero
+        CAST(U.UpVotes AS NUMERIC) / NULLIF(U.UpVotes + U.DownVotes, 0) AS UpDownVoteRatio
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.Views, U.UpVotes, U.DownVotes
+),
+PostHistoricalMetrics AS (
+    SELECT
+        PH.PostId,
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 END) AS CloseEvents, -- Post Closed
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 END) AS ReopenEvents, -- Post Reopened
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 12 THEN 1 END) AS DeleteEvents, -- Post Deleted
+        MAX(CASE WHEN PH.PostHistoryTypeId = 5 THEN PH.CreationDate END) AS LastBodyEditDate, -- Edit Body
+        -- Correlated Subquery: Find the comment text related to the last 'Post Closed' event for this post
+        (
+            SELECT PH_INNER.Comment
+            FROM PostHistory PH_INNER
+            WHERE PH_INNER.PostId = PH.PostId
+              AND PH_INNER.PostHistoryTypeId = 10 -- Post Closed
+            ORDER BY PH_INNER.CreationDate DESC
+            LIMIT 1
+        ) AS LastCloseReasonComment
+    FROM PostHistory PH
+    WHERE PH.PostHistoryTypeId IN (10, 11, 12, 5)
+    GROUP BY PH.PostId
+),
+DailyTagScores AS (
+    SELECT
+        TRIM(UNNEST(string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags)-2), '><'))) AS TagName,
+        DATE_TRUNC('day', P.CreationDate) AS TagDate,
+        SUM(P.Score) AS DailyTotalScore,
+        COUNT(P.Id) AS DailyPostCount,
+        COUNT(DISTINCT P.OwnerUserId) AS DailyDistinctOwners
+    FROM Posts P
+    WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL AND P.Tags != ''
+    GROUP BY 1, 2
+),
+AggregatedTagPerformance AS (
+    SELECT
+        TagName,
+        TagDate,
+        DailyTotalScore,
+        DailyPostCount,
+        DailyDistinctOwners,
+        -- Window function: Rolling average of daily total score over a 7-day period
+        AVG(DailyTotalScore) OVER (PARTITION BY TagName ORDER BY TagDate ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS RollingAvg7DayScore,
+        -- Window function: Rank tags by daily post count within the same date
+        RANK() OVER (PARTITION BY TagDate ORDER BY DailyPostCount DESC) AS RankByDailyPosts
+    FROM DailyTagScores
+),
+BadgeMilestones AS (
+    SELECT
+        B.UserId,
+        COUNT(CASE WHEN B.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN B.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN B.Class = 3 THEN 1 END) AS BronzeBadges,
+        MAX(B.Date) AS LastBadgeDate,
+        MIN(B.Date) AS FirstBadgeDate,
+        -- NULL logic and date calculation: -1 if no badges
+        COALESCE(EXTRACT(DAY FROM (NOW() - MAX(B.Date))), -1) AS DaysSinceLastBadge,
+        -- Complicated predicate: Categorize users based on badge counts
+        CASE
+            WHEN COUNT(CASE WHEN B.Class = 1 THEN 1 END) > 0 AND COUNT(CASE WHEN B.Class = 2 THEN 1 END) > 5
+            THEN 'Elite Badge Holder'
+            WHEN COUNT(CASE WHEN B.Class = 1 THEN 1 END) > 0 THEN 'Gold Badge Holder'
+            WHEN COUNT(CASE WHEN B.Class = 2 THEN 1 END) > 0 THEN 'Silver Badge Holder'
+            ELSE 'Bronze/No Gold/Silver'
+        END AS BadgeTier
+    FROM Badges B
+    GROUP BY B.UserId
+),
+RelatedPostSummary AS (
+    -- Set operator: UNION ALL to combine different link types and process them
+    SELECT
+        PL.PostId,
+        PL.RelatedPostId,
+        L.Name AS LinkTypeName,
+        P_Link.Score AS LinkedPostScore,
+        P_Related.Score AS RelatedPostScore,
+        P_Related.ViewCount AS RelatedPostViewCount,
+        -- String expression: concat titles, handle NULL
+        COALESCE(P_Link.Title, 'Untitled Post (' || PL.PostId || ')') || ' <-> ' || COALESCE(P_Related.Title, 'Untitled Related Post (' || PL.RelatedPostId || ')') AS LinkDescription
+    FROM PostLinks PL
+    JOIN LinkTypes L ON PL.LinkTypeId = L.Id
+    LEFT JOIN Posts P_Link ON PL.PostId = P_Link.Id
+    LEFT JOIN Posts P_Related ON PL.RelatedPostId = P_Related.Id
+    WHERE L.Id = 1 -- Linked
+    UNION ALL
+    SELECT
+        PL.PostId,
+        PL.RelatedPostId,
+        L.Name AS LinkTypeName,
+        P_Link.Score AS LinkedPostScore,
+        P_Related.Score AS RelatedPostScore,
+        P_Related.ViewCount AS RelatedPostViewCount,
+        COALESCE(P_Link.Title, 'Untitled Post (' || PL.PostId || ')') || ' <-- DUPLICATE OF --> ' || COALESCE(P_Related.Title, 'Untitled Related Post (' || PL.RelatedPostId || ')') AS LinkDescription
+    FROM PostLinks PL
+    JOIN LinkTypes L ON PL.LinkTypeId = L.Id
+    LEFT JOIN Posts P_Link ON PL.PostId = P_Link.Id
+    LEFT JOIN Posts P_Related ON PL.RelatedPostId = P_Related.Id
+    WHERE L.Id = 3 -- Duplicate
+)
+SELECT
+    UE.UserId,
+    UE.FormattedDisplayName,
+    UE.Reputation,
+    UE.TotalQuestionsAsked,
+    UE.TotalAnswersProvided,
+    UE.TotalCommentsMade,
+    UE.AvgCommentScore,
+    COALESCE(UE.UpDownVoteRatio, 0.0) AS UpDownVoteRatio, -- COALESCE for NULLIF outcome
+    BM.GoldBadges,
+    BM.SilverBadges,
+    BM.BronzeBadges,
+    BM.DaysSinceLastBadge,
+    BM.BadgeTier,
+    PHM.CloseEvents,
+    PHM.ReopenEvents,
+    PHM.DeleteEvents,
+    PHM.LastCloseReasonComment,
+    -- Correlated Subquery: Find the text of the highest-scoring comment a user made on a post *not* owned by them
+    (
+        SELECT C_CORR.Text
+        FROM Comments C_CORR
+        JOIN Posts P_CORR ON C_CORR.PostId = P_CORR.Id
+        WHERE C_CORR.UserId = UE.UserId
+          AND P_CORR.OwnerUserId IS NOT NULL -- Ensure the post has an owner
+          AND P_CORR.OwnerUserId <> UE.UserId -- Commented on someone else's post
+        ORDER BY C_CORR.Score DESC, C_CORR.CreationDate DESC
+        LIMIT 1
+    ) AS HighestScoringOtherComment,
+    -- Window function: Rank users by their UpDownVoteRatio among users with similar reputation (NTILE for bins)
+    NTILE(10) OVER (ORDER BY UE.Reputation, UE.UpDownVoteRatio DESC) AS ReputationUpDownVoteBin,
+    -- Window function: Calculate difference in total questions asked from the user with the next lower reputation
+    LAG(UE.TotalQuestionsAsked, 1, 0) OVER (ORDER BY UE.Reputation) - UE.TotalQuestionsAsked AS QuestionDiffFromNextLowerRep,
+    COALESCE(RPS_Agg.TotalLinkedPosts, 0) AS TotalLinkedPosts,
+    COALESCE(RPS_Agg.TotalDuplicatePosts, 0) AS TotalDuplicatePosts,
+    COALESCE(RPS_Agg.AvgRelatedPostScore, 0.0) AS AvgRelatedPostScore,
+    -- Complicated predicate/expression with string functions
+    CASE
+        WHEN UE.TotalQuestionsAsked > 100 AND UE.TotalAnswersProvided > 200 AND UE.Reputation > 5000 AND BM.GoldBadges > 0
+        THEN 'Super Contributor'
+        WHEN UE.TotalQuestionsAsked > 50 AND UE.TotalAnswersProvided > 100 AND UE.Reputation > 1000
+        THEN 'Active Contributor'
+        WHEN UE.TotalCommentsMade > 50 AND UE.AvgCommentScore > 2
+        THEN 'Engaged Commenter'
+        WHEN UE.FormattedDisplayName LIKE 'A%' AND UE.CreationDate > '2020-01-01'
+        THEN 'New A-Starter'
+        ELSE 'Casual User'
+    END AS UserEngagementCategory,
+    -- Aggregate from AggregatedTagPerformance for a specific user's most active tag
+    (
+        SELECT ATP.TagName
+        FROM AggregatedTagPerformance ATP
+        JOIN Posts P_User ON ATP.TagName = TRIM(UNNEST(string_to_array(SUBSTRING(P_User.Tags, 2, LENGTH(P_User.Tags)-2), '><')))
+        WHERE P_User.OwnerUserId = UE.UserId
+          AND P_User.PostTypeId = 1
+        GROUP BY ATP.TagName
+        ORDER BY SUM(ATP.DailyPostCount) DESC, MAX(ATP.RollingAvg7DayScore) DESC -- Order by total posts and rolling score
+        LIMIT 1
+    ) AS MostActiveOwnedTag
+FROM UserEngagement UE
+LEFT JOIN BadgeMilestones BM ON UE.UserId = BM.UserId
+LEFT JOIN (
+    -- Aggregate related post info per user, specifically for posts they own or are related to
+    SELECT
+        P.OwnerUserId AS UserId,
+        COUNT(DISTINCT CASE WHEN RPS.LinkTypeName = 'Linked' THEN RPS.PostId END) AS TotalLinkedPosts,
+        COUNT(DISTINCT CASE WHEN RPS.LinkTypeName = 'Duplicate' THEN RPS.PostId END) AS TotalDuplicatePosts,
+        AVG(RPS.RelatedPostScore) AS AvgRelatedPostScore -- AVG of the score of the related post
+    FROM RelatedPostSummary RPS
+    JOIN Posts P ON RPS.PostId = P.Id
+    WHERE P.OwnerUserId IS NOT NULL
+    GROUP BY P.OwnerUserId
+) RPS_Agg ON UE.UserId = RPS_Agg.UserId
+LEFT JOIN (
+    -- Join to get PostHistoricalMetrics for one of the user's questions, picking the one with most recent activity
+    SELECT
+        P.OwnerUserId AS UserId,
+        PHM.CloseEvents,
+        PHM.ReopenEvents,
+        PHM.DeleteEvents,
+        PHM.LastCloseReasonComment,
+        P.CreationDate, -- to order for row_number
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.LastActivityDate DESC, P.CreationDate DESC) as rn
+    FROM Posts P
+    JOIN PostHistoricalMetrics PHM ON P.Id = PHM.PostId
+    WHERE P.PostTypeId = 1 -- Only consider questions for these metrics
+) PHM ON UE.UserId = PHM.UserId AND PHM.rn = 1 -- Only the most active question's PHM for the user
+WHERE
+    UE.Reputation > 500
+    AND (UE.TotalQuestionsAsked + UE.TotalAnswersProvided > 10 OR UE.TotalCommentsMade > 20)
+    AND (BM.DaysSinceLastBadge IS NULL OR BM.DaysSinceLastBadge > 30 OR BM.DaysSinceLastBadge = -1) -- NULL logic for no badges
+    AND UE.FormattedDisplayName NOT LIKE '%admin%' -- String predicate
+    AND (
+        (PHM.CloseEvents > 0 AND PHM.ReopenEvents = 0 AND PHM.LastCloseReasonComment IS NOT NULL) -- Closed but not reopened, with comment
+        OR
+        (UE.UpDownVoteRatio > 0.7 AND UE.TotalCommentsMade > 10 AND UE.AvgCommentScore > 1)
+        OR
+        (UE.FirstPostDate IS NOT NULL AND UE.FirstPostDate > '2015-01-01' AND UE.Reputation > 2000) -- Relatively new active users
+    )
+ORDER BY
+    UE.Reputation DESC, UE.LastCommentDate DESC
+LIMIT 1000;

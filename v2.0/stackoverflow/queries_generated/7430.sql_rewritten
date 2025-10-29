@@ -1,0 +1,216 @@
+-- {"query": "7430.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2004} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT c.Id) as Comments,
+        COUNT(DISTINCT b.Id) as Badges,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        DATEDIFF('DAY', u.CreationDate, cast('2024-10-01 12:34:56' as timestamp)) as AccountAgeDays
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate
+),
+QuestionStats AS (
+    SELECT 
+        p.Id as QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.LastActivityDate,
+        u.DisplayName as OwnerDisplayName,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+            WHEN p.ParentId IS NOT NULL THEN 'Answer'
+            ELSE 'Question'
+        END as PostStatus,
+        COALESCE(
+            (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2),
+            0
+        ) as Upvotes,
+        COALESCE(
+            (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3),
+            0
+        ) as Downvotes,
+        COALESCE(
+            (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id),
+            0
+        ) as CommentCountActual,
+        CASE 
+            WHEN p.Score > 100 THEN 'Highly Voted'
+            WHEN p.Score > 50 THEN 'Well Voted'
+            WHEN p.Score > 10 THEN 'Moderately Voted'
+            ELSE 'Low Voted'
+        END as VoteCategory
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+),
+AnswerStats AS (
+    SELECT 
+        p.Id as AnswerId,
+        p.ParentId as QuestionId,
+        p.Score,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.LastActivityDate,
+        CASE 
+            WHEN p.ParentId IS NOT NULL AND p.ParentId > 0 THEN 
+                (SELECT Title FROM Posts WHERE Id = p.ParentId)
+            ELSE NULL
+        END as RelatedQuestionTitle,
+        COALESCE((SELECT u.DisplayName FROM Users u WHERE u.Id = p.OwnerUserId), 'Anonymous User') as AnswerOwnerName,
+        CASE 
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Accepted'
+            ELSE 'Not Accepted'
+        END as AcceptanceStatus
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        COALESCE((SELECT COUNT(*) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%'), 0) as PostsUsingTag,
+        COALESCE((SELECT AVG(p.Score) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%'), 0) as AverageScorePerTag,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as TagRank,
+        NTILE(10) OVER (ORDER BY t.Count DESC) as TagDecile
+    FROM Tags t
+),
+BadgeTiers AS (
+    SELECT 
+        b.UserId,
+        b.Name as BadgeName,
+        b.Date as BadgeDate,
+        b.Class,
+        CASE 
+            WHEN b.Class = 1 THEN 'Gold'
+            WHEN b.Class = 2 THEN 'Silver' 
+            ELSE 'Bronze'
+        END as BadgeTier,
+        COUNT(*) OVER (PARTITION BY b.UserId) as TotalBadgesPerUser,
+        DENSE_RANK() OVER (PARTITION BY b.UserId ORDER BY b.Date) as BadgeSequence
+    FROM Badges b
+),
+UserPerformanceMetrics AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.Views,
+        uas.TotalPosts,
+        uas.Questions,
+        uas.Answers,
+        uas.Comments,
+        uas.Badges,
+        uas.AccountAgeDays,
+        CASE 
+            WHEN uas.TotalPosts > 0 THEN 
+                CAST(uas.Answers AS FLOAT) / CAST(uas.TotalPosts AS FLOAT) * 100
+            ELSE 0
+        END as AnswerPercentage,
+        COALESCE(
+            (SELECT AVG(qs.Score) FROM QuestionStats qs WHERE qs.OwnerUserId = uas.UserId),
+            0
+        ) as AverageQuestionScore,
+        COALESCE(
+            (SELECT AVG(asqs.Score) FROM AnswerStats asqs WHERE asqs.OwnerUserId = uas.UserId),
+            0
+        ) as AverageAnswerScore,
+        CASE 
+            WHEN uas.Reputation > 10000 THEN 'Legendary'
+            WHEN uas.Reputation > 1000 THEN 'Expert'
+            WHEN uas.Reputation > 100 THEN 'Regular'
+            ELSE 'Newbie'
+        END as ReputationLevel,
+        CASE 
+            WHEN uas.TotalPosts > 1000 THEN 'Veteran'
+            WHEN uas.TotalPosts > 100 THEN 'Experienced'
+            WHEN uas.TotalPosts > 10 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as PostingExperience
+    FROM UserActivityStats uas
+)
+SELECT 
+    upm.UserId,
+    upm.DisplayName,
+    upm.Reputation,
+    upm.Views,
+    upm.TotalPosts,
+    upm.Questions,
+    upm.Answers,
+    upm.Comments,
+    upm.Badges,
+    upm.AccountAgeDays,
+    upm.AnswerPercentage,
+    upm.AverageQuestionScore,
+    upm.AverageAnswerScore,
+    upm.ReputationLevel,
+    upm.PostingExperience,
+    STRING_AGG(DISTINCT qs.Title, ' | ') OVER (PARTITION BY upm.UserId) as SampleQuestionTitles,
+    STRING_AGG(DISTINCT tas.TagName, ', ') OVER (PARTITION BY upm.UserId) as UserTagsUsed,
+    STRING_AGG(DISTINCT CONCAT(bt.BadgeName, ' (', bt.BadgeTier, ')'), ' | ') OVER (PARTITION BY upm.UserId ORDER BY bt.BadgeDate) as BadgeHistory,
+    MAX(upm.AccountAgeDays) OVER () as MaxAccountAge,
+    MIN(upm.Reputation) OVER () as MinReputation,
+    AVG(upm.Views) OVER () as AvgViews,
+    RANK() OVER (ORDER BY upm.Reputation DESC) as ReputationRank,
+    DENSE_RANK() OVER (ORDER BY upm.TotalPosts DESC) as PostingRank,
+    ROW_NUMBER() OVER (ORDER BY upm.AverageQuestionScore DESC) as QScoreRank,
+    CASE 
+        WHEN upm.Reputation > (SELECT AVG(Reputation) FROM Users) THEN 1
+        ELSE 0
+    END as AboveAvgReputation,
+    CASE 
+        WHEN upm.TotalPosts > (SELECT AVG(TotalPosts) FROM UserActivityStats) THEN 1
+        ELSE 0
+    END as AboveAvgPosts,
+    CASE 
+        WHEN LENGTH(upm.DisplayName) > 10 THEN 'Long Name'
+        WHEN LENGTH(upm.DisplayName) < 5 THEN 'Short Name'
+        ELSE 'Normal Name'
+    END as DisplayNameCategory,
+    COALESCE(
+        (SELECT COUNT(*) FROM PostHistory ph WHERE ph.UserId = upm.UserId AND ph.PostHistoryTypeId IN (1,2,3,4)),
+        0
+    ) as EditActivity,
+    CASE 
+        WHEN upm.TotalPosts > 0 AND upm.Answers > 0 THEN 
+            CAST(upm.Answers AS FLOAT) / CAST(upm.Questions AS FLOAT)
+        ELSE NULL
+    END as AnswerToQuestionRatio,
+    DATE_TRUNC('MONTH', upm.LastPostDate) as LastPostMonth,
+    DATE_TRUNC('MONTH', upm.LastCommentDate) as LastCommentMonth
+FROM UserPerformanceMetrics upm
+LEFT JOIN QuestionStats qs ON upm.UserId = qs.OwnerUserId
+LEFT JOIN (
+    SELECT DISTINCT UserId, TagName FROM Posts p
+    JOIN UNNEST(string_to_array(p.Tags, '>')) AS tag
+    JOIN Tags t ON t.TagName = tag
+) tas ON upm.UserId = tas.UserId
+LEFT JOIN BadgeTiers bt ON upm.UserId = bt.UserId
+WHERE upm.Reputation > 100
+    AND upm.AccountAgeDays > 30
+    AND upm.TotalPosts > 0
+    AND upm.Views > 50
+ORDER BY upm.Reputation DESC, upm.TotalPosts DESC
+LIMIT 500;

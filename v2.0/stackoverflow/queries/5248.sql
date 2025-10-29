@@ -1,0 +1,144 @@
+WITH RecentPosts AS (
+  SELECT
+    p.Id,
+    p.PostTypeId,
+    p.Title,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.ViewCount,
+    p.Score,
+    p.Tags,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.LastEditorUserId,
+    p.LastEditDate,
+    p.ContentLicense,
+    p.OwnerDisplayName -- include OwnerDisplayName from Posts for fallback
+  FROM Posts p
+  WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days'
+),
+TagInfo AS (
+  SELECT
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId,
+    t.WikiPostId
+  FROM Tags t
+),
+UserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.AccountId,
+    u.Location,
+    u.WebsiteUrl,
+    u.AboutMe,
+    u.ProfileImageUrl,
+    ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY u.LastAccessDate DESC) AS rn
+  FROM Users u
+),
+LatestEdits AS (
+  SELECT
+    ph.PostId,
+    ph.UserId,
+    ph.RevisionGUID,
+    ph.CreationDate AS RevisionDate,
+    ph.Text,
+    ph.Comment,
+    ph.PostHistoryTypeId,
+    ph.UserDisplayName
+  FROM PostHistory ph
+  JOIN (
+    SELECT PostId, MAX(CreationDate) AS MaxRev
+    FROM PostHistory
+    GROUP BY PostId
+  ) m ON ph.PostId = m.PostId AND ph.CreationDate = m.MaxRev
+),
+OpenClosed AS (
+  SELECT
+    p.Id AS PostId,
+    CASE WHEN p.ClosedDate IS NULL THEN 'Open' ELSE 'Closed' END AS Status,
+    p.ClosedDate
+  FROM Posts p
+),
+AllVotes AS (
+  SELECT
+    v.PostId,
+    v.VoteTypeId,
+    v.UserId,
+    v.CreationDate,
+    v.BountyAmount,
+    CASE
+      WHEN v.VoteTypeId = 2 THEN 'UpMod'
+      WHEN v.VoteTypeId = 3 THEN 'DownMod'
+      WHEN v.VoteTypeId = 10 THEN 'Deletion'
+      WHEN v.VoteTypeId = 11 THEN 'Undeletion'
+      WHEN v.VoteTypeId = 12 THEN 'Spam'
+      WHEN v.VoteTypeId = 14 THEN 'NominateModerator'
+      WHEN v.VoteTypeId = 15 THEN 'ModeratorReview'
+      WHEN v.VoteTypeId = 16 THEN 'ApproveEditSuggestion'
+      ELSE 'Other'
+    END AS VoteKind
+  FROM Votes v
+),
+ComplexBenchmark AS (
+  SELECT
+    rp.Id AS PostId,
+    rp.Title,
+    rp.CreationDate,
+    rp.LastActivityDate,
+    rp.ViewCount,
+    rp.Score,
+    rp.Tags,
+    COALESCE(ua.DisplayName, rp.OwnerDisplayName) AS OwnerDisplayName,
+    ua.Reputation,
+    ac.Status AS OpenStatus,
+    va.VoteKind,
+    va.CreationDate AS VoteDate,
+    b.Name AS BadgeName,
+    b.Class AS BadgeClass,
+    t.TagName,
+    ti.Count AS TagCount
+  FROM RecentPosts rp
+  LEFT JOIN PostHistory ph ON ph.PostId = rp.Id
+  LEFT JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+  LEFT JOIN UserActivity ua ON ua.UserId = rp.OwnerUserId AND ua.rn = 1
+  LEFT JOIN OpenClosed ac ON ac.PostId = rp.Id
+  LEFT JOIN AllVotes va ON va.PostId = rp.Id
+  LEFT JOIN Badges b ON b.UserId = rp.OwnerUserId
+  LEFT JOIN TagInfo t ON POSITION(t.TagName IN rp.Tags) > 0
+  LEFT JOIN TagInfo ti ON 1=1
+  WHERE
+    rp.PostTypeId = 1
+    AND rp.LastActivityDate > rp.CreationDate - INTERVAL '7 days'
+    AND (rp.ViewCount + COALESCE(rp.Score, 0)) > 100
+)
+SELECT
+  PostId,
+  Title,
+  CreationDate,
+  LastActivityDate,
+  ViewCount,
+  Score,
+  Tags,
+  OwnerDisplayName,
+  Reputation,
+  OpenStatus,
+  VoteDate,
+  BadgeName,
+  BadgeClass,
+  TagName,
+  TagCount
+FROM ComplexBenchmark
+ORDER BY LastActivityDate DESC, ViewCount DESC
+LIMIT 100;

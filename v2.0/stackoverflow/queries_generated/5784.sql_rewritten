@@ -1,0 +1,96 @@
+-- {"query": "5784.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 791} 
+WITH
+RecentActivity AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.Tags,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ContentLicense,
+    u.Reputation,
+    u.DisplayName AS OwnerDisplayName,
+    u.AccountId,
+    ARRAY_AGG(CASE WHEN v.VoteTypeId IN (2,3) THEN v.VoteTypeId END) FILTER (WHERE v.VoteTypeId IS NOT NULL) AS UpDownVotes
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  WHERE p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '365 days'
+  GROUP BY
+    p.Id, p.PostTypeId, p.Title, p.Tags, p.OwnerUserId, p.CreationDate, p.LastActivityDate,
+    p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.ContentLicense,
+    u.Reputation, u.DisplayName, u.AccountId
+),
+TopTags AS (
+  SELECT
+    unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS TagName,
+    p.Id AS PostId,
+    p.Title,
+    p.PostTypeId
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+TagStats AS (
+  SELECT
+    TagName,
+    COUNT(*) AS PostCount,
+    AVG(p.Score) AS AvgScore,
+    SUM(p.ViewCount) AS TotalViews
+  FROM TopTags t
+  JOIN Posts p ON p.Id = t.PostId
+  GROUP BY TagName
+),
+CorrelatedTitles AS (
+  SELECT
+    r.PostId,
+    r.Title AS PostTitle,
+    (SELECT STRING_AGG(t.TagName, ',')
+     FROM TopTags t2
+     WHERE t2.PostId = r.PostId) AS TagsOnPost,
+    r.OwnerUserId,
+    r.Reputation
+  FROM RecentActivity r
+  WHERE r.PostTypeId = 1
+),
+VarianceWindow AS (
+  SELECT
+    PostId,
+    PostTitle,
+    TagsOnPost,
+    OwnerUserId,
+    Reputation,
+    ROW_NUMBER() OVER (PARTITION BY OwnerUserId ORDER BY LastActivityDate DESC) AS rn,
+    AVG(Score) OVER (PARTITION BY OwnerUserId) AS AvgUserScore,
+    STDDEV_SAMP(Score) OVER (PARTITION BY OwnerUserId) AS ScoreStdDev
+  FROM CorrelatedTitles
+)
+SELECT
+  vw.PostId,
+  vw.PostTitle,
+  vw.TagsOnPost,
+  vw.OwnerUserId,
+  vw.Reputation,
+  vw.AvgUserScore,
+  vw.ScoreStdDev,
+  rt.PostCount AS RelatedTagPostCount,
+  wt.AvgScore AS TopTagAvgScore
+FROM VarianceWindow vw
+LEFT JOIN TagStats rt ON vw.TagsOnPost LIKE '%' || rt.TagName || '%'
+LEFT JOIN (
+  SELECT
+    TagName,
+    AVG(p.Score) AS AvgScore
+  FROM TopTags t
+  JOIN Posts p ON p.Id = t.PostId
+  GROUP BY TagName
+) wt ON wt.TagName = (SELECT unnest(string_to_array(substring(vw.TagsOnPost, 2, length(vw.TagsOnPost)-2), ', ')) FROM VarianceWindow WHERE PostId = vw.PostId LIMIT 1)
+WHERE vw.rn = 1
+ORDER BY vw.Reputation DESC, vw.AvgUserScore DESC
+LIMIT 50;

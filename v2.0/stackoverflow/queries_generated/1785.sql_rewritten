@@ -1,0 +1,288 @@
+-- {"query": "1785.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 4155} 
+WITH UserQuestionStats AS (
+    -- Aggregates statistics for questions asked by each user, including favorite counts and closed status.
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        COUNT(DISTINCT Q.Id) AS TotalQuestionsAsked,
+        SUM(Q.Score) AS TotalQuestionScore,
+        AVG(Q.ViewCount) AS AvgQuestionViewCount,
+        MAX(Q.CreationDate) AS LatestQuestionDate,
+        SUM(COALESCE(Q.FavoriteCount, 0)) AS TotalQuestionFavorites,
+        COUNT(CASE WHEN Q.ClosedDate IS NOT NULL THEN 1 END) AS QuestionsClosedCount
+    FROM Users U
+    JOIN Posts Q ON U.Id = Q.OwnerUserId AND Q.PostTypeId = 1 -- PostTypeId = 1 for Questions
+    GROUP BY U.Id, U.DisplayName
+    HAVING COUNT(DISTINCT Q.Id) >= 3 -- Only consider users with at least 3 questions
+),
+UserAnswerStats AS (
+    -- Aggregates statistics for answers provided by each user, including accepted answer counts.
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        COUNT(DISTINCT A.Id) AS TotalAnswersProvided,
+        SUM(A.Score) AS TotalAnswerScore,
+        AVG(A.Score) AS AvgAnswerScore,
+        MAX(A.CreationDate) AS LatestAnswerDate,
+        COUNT(CASE WHEN P.AcceptedAnswerId = A.Id THEN 1 END) AS AcceptedAnswersCount
+    FROM Users U
+    JOIN Posts A ON U.Id = A.OwnerUserId AND A.PostTypeId = 2 -- PostTypeId = 2 for Answers
+    LEFT JOIN Posts P ON A.ParentId = P.Id AND P.PostTypeId = 1 -- Link answers to their parent questions
+    GROUP BY U.Id, U.DisplayName
+    HAVING COUNT(DISTINCT A.Id) >= 5 -- Only consider users with at least 5 answers
+),
+PostEditHistory AS (
+    -- Summarizes significant post history events for questions and answers, including edit counts and close/reopen dates.
+    SELECT
+        PH.PostId,
+        MIN(CASE WHEN PH.PostHistoryTypeId IN (1,2,3) THEN PH.CreationDate END) AS InitialCreationDate,
+        MIN(CASE WHEN PH.PostHistoryTypeId IN (4,5,6) THEN PH.CreationDate END) AS FirstEditDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (4,5,6) THEN PH.CreationDate END) AS LastEditDate,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (4,5,6) THEN PH.Id END) AS TotalEdits,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.CreationDate END) AS LastClosedDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 11 THEN PH.CreationDate END) AS LastReopenedDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.Comment END) AS LastCloseReasonComment,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.Text END) AS LatestCloseVoterJson
+    FROM PostHistory PH
+    WHERE PH.PostHistoryTypeId IN (1,2,3,4,5,6,10,11) -- Initial, Edit, Closed, Reopened events
+    GROUP BY PH.PostId
+),
+UserBadgeSummary AS (
+    -- Counts the number of Gold, Silver, and Bronze badges for each user.
+    SELECT
+        B.UserId,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(B.Id) AS TotalBadges
+    FROM Badges B
+    GROUP BY B.UserId
+),
+TopQuestionTags AS (
+    -- Identifies the top 3 most used tags for questions asked by each user using string manipulation and window functions.
+    SELECT
+        UserId,
+        TagName,
+        TagRank
+    FROM (
+        SELECT
+            Q.OwnerUserId AS UserId,
+            TRIM(UNNEST(STRING_TO_ARRAY(SUBSTRING(Q.Tags, 2, LENGTH(Q.Tags) - 2), '><'))) AS TagName,
+            COUNT(*) AS TagCount,
+            ROW_NUMBER() OVER (PARTITION BY Q.OwnerUserId ORDER BY COUNT(*) DESC, TRIM(UNNEST(STRING_TO_ARRAY(SUBSTRING(Q.Tags, 2, LENGTH(Q.Tags) - 2), '><'))) ASC) AS TagRank
+        FROM Posts Q
+        WHERE Q.PostTypeId = 1 AND Q.Tags IS NOT NULL AND LENGTH(Q.Tags) > 2
+        GROUP BY Q.OwnerUserId, TRIM(UNNEST(STRING_TO_ARRAY(SUBSTRING(Q.Tags, 2, LENGTH(Q.Tags) - 2), '><')))
+    ) AS UserTagCounts
+    WHERE TagRank <= 3
+),
+RecentHighScoreAnswers AS (
+    -- Finds the single most highly-scored answer for each question.
+    SELECT
+        P.ParentId AS QuestionId,
+        P.Id AS AnswerId,
+        P.Score AS AnswerScore,
+        P.OwnerUserId AS AnswerOwnerUserId,
+        P.CreationDate AS AnswerCreationDate,
+        ROW_NUMBER() OVER (PARTITION BY P.ParentId ORDER BY P.Score DESC, P.CreationDate DESC) AS rn
+    FROM Posts P
+    WHERE P.PostTypeId = 2 AND P.Score >= 10
+),
+UserOverallActivity AS (
+    -- Summarizes user comment activity, including total comments, score, and the text of their latest comment.
+    SELECT
+        C.UserId,
+        MAX(C.CreationDate) AS LastCommentDate,
+        COUNT(C.Id) AS TotalComments,
+        SUM(C.Score) AS TotalCommentScore,
+        NULLIF(SUBSTRING(MAX(C.CreationDate || '||' || C.Text) FROM POSITION('||' IN MAX(C.CreationDate || '||' || C.Text)) + 2), '') AS LatestCommentText
+    FROM Comments C
+    WHERE C.UserId IS NOT NULL
+    GROUP BY C.UserId
+),
+UserActiveEditors AS (
+    -- Identifies users who have edited their own posts (questions or answers).
+    SELECT DISTINCT PH.UserId
+    FROM PostHistory PH
+    JOIN Posts P ON PH.PostId = P.Id
+    WHERE PH.UserId IS NOT NULL
+      AND P.OwnerUserId = PH.UserId -- User edited their own post
+      AND PH.PostHistoryTypeId IN (4, 5, 6) -- Edit events
+)
+-- Main query: Combines user and post data from two distinct perspectives (Questioners vs. Answerers)
+-- and applies complex filtering, aggregations, and conditional logic.
+SELECT
+    'Questioner' AS UserRole,
+    U.Id AS UserIdentifier,
+    U.DisplayName,
+    U.Reputation,
+    U.CreationDate AS UserRegistrationDate,
+    U.LastAccessDate,
+    U.Views AS UserProfileViews,
+    U.UpVotes AS UserTotalUpVotes,
+    U.DownVotes AS UserTotalDownVotes,
+    UQS.TotalQuestionsAsked,
+    UQS.TotalQuestionScore,
+    UQS.AvgQuestionViewCount,
+    UQS.LatestQuestionDate,
+    UQS.TotalQuestionFavorites,
+    UQS.QuestionsClosedCount,
+    NULL::INT AS TotalAnswersProvided, -- NULL for questioner-specific fields
+    NULL::INT AS TotalAnswerScore,
+    NULL::NUMERIC AS AvgAnswerScore,
+    NULL::TIMESTAMP AS LatestAnswerDate,
+    NULL::INT AS AcceptedAnswersCount,
+    COALESCE(UBS.GoldBadges, 0) AS GoldBadgesCount,
+    COALESCE(UBS.SilverBadges, 0) AS SilverBadgesCount,
+    COALESCE(UBS.BronzeBadges, 0) AS BronzeBadgesCount,
+    UBS.TotalBadges,
+    (SELECT TT.TagName FROM TopQuestionTags TT WHERE TT.UserId = U.Id AND TT.TagRank = 1) AS TopTag1,
+    (SELECT TT.TagName FROM TopQuestionTags TT WHERE TT.UserId = U.Id AND TT.TagRank = 2) AS TopTag2,
+    (SELECT TT.TagName FROM TopQuestionTags TT WHERE TT.UserId = U.Id AND TT.TagRank = 3) AS TopTag3,
+    UOA.TotalComments,
+    UOA.TotalCommentScore,
+    UOA.LatestCommentText,
+    EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - U.CreationDate))/3600/24 AS UserAgeInDays, -- User's age in days
+    CASE
+        WHEN U.Reputation > 15000 AND UQS.TotalQuestionsAsked > 50 THEN 'Guru Questioner'
+        WHEN U.Reputation > 7500 OR UQS.TotalQuestionScore > 1000 THEN 'Proactive Questioner'
+        ELSE 'Regular Questioner'
+    END AS UserCategory,
+    P.Id AS ExamplePostId,
+    P.Title AS ExamplePostTitle,
+    P.CreationDate AS ExamplePostCreationDate,
+    PEH.TotalEdits AS ExamplePostTotalEdits,
+    PEH.LastEditDate AS ExamplePostLastEditDate,
+    PEH.LastClosedDate AS ExamplePostLastClosedDate,
+    PEH.LastReopenedDate AS ExamplePostLastReopenedDate,
+    PEH.LastCloseReasonComment AS ExamplePostLastCloseReason,
+    PEH.LatestCloseVoterJson AS ExamplePostCloseVoterDetails,
+    COALESCE(P.AcceptedAnswerId, -1) AS AcceptedAnswerIdForPost,
+    AA.Score AS AcceptedAnswerScore,
+    AA.OwnerDisplayName AS AcceptedAnswerOwnerDisplayName,
+    ( -- Correlated subquery: Average score of highly-reputed users' answers to this specific question
+        SELECT AVG(InnerA.Score)
+        FROM Posts InnerA
+        WHERE InnerA.ParentId = P.Id
+          AND InnerA.PostTypeId = 2
+          AND InnerA.CreationDate > P.CreationDate -- Answer must be after the question
+          AND InnerA.OwnerUserId IS NOT NULL
+          AND EXISTS (SELECT 1 FROM Users InnerU WHERE InnerU.Id = InnerA.OwnerUserId AND InnerU.Reputation > 1000)
+    ) AS AvgHighRepAnswerScoreForPost,
+    ( -- Correlated subquery: Count of distinct users who edited this question more than 2 months after its creation
+        SELECT COUNT(DISTINCT PH2.UserId)
+        FROM PostHistory PH2
+        WHERE PH2.PostId = P.Id
+          AND PH2.PostHistoryTypeId IN (4,5,6) -- Edit events
+          AND PH2.CreationDate > P.CreationDate + INTERVAL '2 months'
+    ) AS EditorsAfterTwoMonthsCount,
+    CASE
+        WHEN P.ClosedDate IS NOT NULL AND PEH.LastReopenedDate IS NOT NULL AND PEH.LastReopenedDate > P.ClosedDate THEN 'Reopened_Q'
+        WHEN P.ClosedDate IS NOT NULL THEN 'Closed_Q'
+        ELSE 'Open_Q'
+    END AS PostStatus,
+    RHS.AnswerId AS TopRelatedAnswerId,
+    RHS.AnswerScore AS TopRelatedAnswerScore,
+    RHS.AnswerOwnerUserId AS TopRelatedAnswerOwner
+FROM Users U
+INNER JOIN UserQuestionStats UQS ON U.Id = UQS.UserId -- Ensures user has asked questions
+LEFT JOIN UserBadgeSummary UBS ON U.Id = UBS.UserId
+LEFT JOIN UserOverallActivity UOA ON U.Id = UOA.UserId
+LEFT JOIN Posts P ON U.Id = P.OwnerUserId AND P.PostTypeId = 1 AND P.Score > 50 AND P.ViewCount > 5000 AND P.AnswerCount > 3 -- Example question criteria
+LEFT JOIN PostHistoryEvents PEH ON P.Id = PEH.PostId
+LEFT JOIN Posts AA ON P.AcceptedAnswerId = AA.Id AND AA.PostTypeId = 2 -- Details of the accepted answer
+LEFT JOIN RecentHighScoreAnswers RHS ON P.Id = RHS.QuestionId AND RHS.rn = 1 -- Get the top answer for the example question
+WHERE U.Reputation > 5000
+  AND U.LastAccessDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year' -- Recently active
+  AND (U.Location IS NOT NULL AND U.Location LIKE '%USA%' OR U.WebsiteUrl IS NOT NULL) -- Must have location info or website
+  AND U.Id IN (SELECT UserId FROM UserActiveEditors) -- Must have edited their own posts
+  AND UOA.TotalComments IS DISTINCT FROM 0 -- Not 0 comments, also handles NULL
+  AND UOA.TotalComments > 5
+  AND LENGTH(COALESCE(U.AboutMe, '')) > 100 -- Users with substantial 'AboutMe' descriptions
+UNION ALL
+-- Branch 2: Focus on high-reputation users who provide high-quality answers
+SELECT
+    'Answerer' AS UserRole,
+    U.Id AS UserIdentifier,
+    U.DisplayName,
+    U.Reputation,
+    U.CreationDate AS UserRegistrationDate,
+    U.LastAccessDate,
+    U.Views AS UserProfileViews,
+    U.UpVotes AS UserTotalUpVotes,
+    U.DownVotes AS UserTotalDownVotes,
+    NULL AS TotalQuestionsAsked,
+    NULL AS TotalQuestionScore,
+    NULL AS AvgQuestionViewCount,
+    NULL AS LatestQuestionDate,
+    NULL AS TotalQuestionFavorites,
+    NULL AS QuestionsClosedCount,
+    UAS.TotalAnswersProvided,
+    UAS.TotalAnswerScore,
+    UAS.AvgAnswerScore,
+    UAS.LatestAnswerDate,
+    UAS.AcceptedAnswersCount,
+    COALESCE(UBS.GoldBadges, 0) AS GoldBadgesCount,
+    COALESCE(UBS.SilverBadges, 0) AS SilverBadgesCount,
+    COALESCE(UBS.BronzeBadges, 0) AS BronzeBadgesCount,
+    UBS.TotalBadges,
+    NULL AS TopTag1, -- Not applicable for answerer-focused branch
+    NULL AS TopTag2,
+    NULL AS TopTag3,
+    UOA.TotalComments,
+    UOA.TotalCommentScore,
+    UOA.LatestCommentText,
+    EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - U.CreationDate))/3600/24 AS UserAgeInDays,
+    CASE
+        WHEN U.Reputation > 20000 AND UAS.AcceptedAnswersCount > 20 THEN 'Legendary Answerer'
+        WHEN U.Reputation > 10000 OR UAS.TotalAnswerScore > 2000 THEN 'Expert Answerer'
+        ELSE 'Contributor Answerer'
+    END AS UserCategory,
+    A.Id AS ExamplePostId,
+    A.Body AS ExamplePostTitle, -- Using Body for answers as Title is usually NULL
+    A.CreationDate AS ExamplePostCreationDate,
+    PEH.TotalEdits AS ExamplePostTotalEdits,
+    PEH.LastEditDate AS ExamplePostLastEditDate,
+    NULL AS ExamplePostLastClosedDate,
+    NULL AS ExamplePostLastReopenedDate,
+    NULL AS ExamplePostLastCloseReason,
+    NULL AS ExamplePostCloseVoterDetails,
+    NULL::INT AS AcceptedAnswerIdForPost, -- An answer cannot accept another post
+    A.Score AS AcceptedAnswerScore, -- The score of this example answer
+    U.DisplayName AS AcceptedAnswerOwnerDisplayName, -- The owner of this answer
+    ( -- Correlated subquery: Count of high-score comments on this specific answer
+        SELECT COUNT(DISTINCT C.Id)
+        FROM Comments C
+        WHERE C.PostId = A.Id
+          AND C.CreationDate > A.CreationDate
+          AND C.Score > 0
+    ) AS AvgHighRepAnswerScoreForPost, -- Repurposed for answer comment count
+    ( -- Correlated subquery: Count of distinct users who upvoted this answer one week after its creation
+        SELECT COUNT(DISTINCT V.UserId)
+        FROM Votes V
+        WHERE V.PostId = A.Id
+          AND V.VoteTypeId = 2 -- UpMod (upvote)
+          AND V.CreationDate >= A.CreationDate + INTERVAL '1 week'
+    ) AS EditorsAfterTwoMonthsCount, -- Repurposed for specific vote count
+    CASE
+        WHEN A.ParentId IS NOT NULL AND (SELECT P_q.AcceptedAnswerId FROM Posts P_q WHERE P_q.Id = A.ParentId) = A.Id THEN 'Accepted_A'
+        WHEN A.Score > 50 THEN 'High_Score_A'
+        ELSE 'Regular_A'
+    END AS PostStatus,
+    NULL AS TopRelatedAnswerId,
+    NULL AS TopRelatedAnswerScore,
+    NULL AS TopRelatedAnswerOwner
+FROM Users U
+INNER JOIN UserAnswerStats UAS ON U.Id = UAS.UserId -- Ensures user has provided answers
+LEFT JOIN UserBadgeSummary UBS ON U.Id = UBS.UserId
+LEFT JOIN UserOverallActivity UOA ON U.Id = UOA.UserId
+LEFT JOIN Posts A ON U.Id = A.OwnerUserId AND A.PostTypeId = 2 AND A.Score > 75 AND A.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '3 years' -- Example answer criteria
+LEFT JOIN PostHistoryEvents PEH ON A.Id = PEH.PostId -- Edit history for the example answer
+WHERE U.Reputation > 7500
+  AND U.LastAccessDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '2 years'
+  AND (U.Location IS NOT NULL AND U.Location LIKE '%USA%') -- Specific location filter for answerers
+  AND U.Id IN (SELECT UserId FROM UserActiveEditors) -- Must have edited their own posts
+  AND UOA.TotalComments > 20 -- More than 20 comments
+  AND U.WebsiteUrl IS NOT NULL
+ORDER BY Reputation DESC, UserTotalUpVotes DESC, UserAgeInDays ASC
+LIMIT 2000;

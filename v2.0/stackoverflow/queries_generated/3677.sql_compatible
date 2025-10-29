@@ -1,0 +1,164 @@
+WITH
+/* 1. Users with high reputation and recent activity */
+high_rep_users AS (
+    SELECT
+        u.Id                     AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        COALESCE(u.Location, 'Unknown') AS Location,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank
+    FROM Users u
+    WHERE u.Reputation >= 20000
+      AND u.LastAccessDate >= CAST('2024-10-01' AS DATE) - INTERVAL '30' DAY
+),
+
+/* 2. Recent questions (last 60 days) with computed tag count */
+recent_questions AS (
+    SELECT
+        p.Id                     AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.FavoriteCount,
+        p.Tags,
+        array_length(string_to_array(trim(both '<>' FROM p.Tags), '><'), 1) AS TagCount,
+        p.OwnerUserId,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS QRank
+    FROM Posts p
+    WHERE p.PostTypeId = 1                                          -- Question
+      AND p.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '60' DAY
+),
+
+/* 3. Badge aggregates per user (including NULL handling) */
+user_badge_stats AS (
+    SELECT
+        b.UserId,
+        COUNT(*)                                   AS TotalBadges,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END)    AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END)    AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END)    AS BronzeBadges,
+        COUNT(CASE WHEN b.TagBased = 1 THEN 1 END) AS TagBasedBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+/* 4. Latest vote per post (correlated sub‑query inside a CTE) */
+latest_votes AS (
+    SELECT
+        v.PostId,
+        v.VoteTypeId,
+        v.CreationDate,
+        v.UserId AS VoterUserId,
+        ROW_NUMBER() OVER (PARTITION BY v.PostId ORDER BY v.CreationDate DESC) AS VoteRank
+    FROM Votes v
+    WHERE v.VoteTypeId IN (2,3)                -- UpMod / DownMod
+),
+
+/* 5. Posts that have never been edited (no PostHistory of type 4‑6) */
+never_edited_posts AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score
+    FROM Posts p
+    LEFT JOIN PostHistory ph
+        ON ph.PostId = p.Id
+       AND ph.PostHistoryTypeId IN (4,5,6)      -- Edit Title/Body/Tags
+    WHERE p.PostTypeId = 1                     -- Question
+      AND ph.Id IS NULL
+),
+
+/* 6. Tag popularity (joined to tag wiki excerpt for extra string work) */
+tag_popularity AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        COALESCE(
+            substring(e.Body FROM '<p>(.*?)</p>'),
+            'No excerpt'
+        ) AS ExcerptSnippet,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank
+    FROM Tags t
+    LEFT JOIN Posts e
+        ON e.Id = t.ExcerptPostId
+)
+
+SELECT
+    hr.UserId,
+    hr.DisplayName,
+    hr.Reputation,
+    hr.Location,
+    ub.TotalBadges,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    q.PostId AS QuestionId,
+    q.Title,
+    q.CreationDate AS QuestionDate,
+    q.Score AS QuestionScore,
+    q.ViewCount,
+    q.FavoriteCount,
+    q.TagCount,
+    CASE
+        WHEN lv.VoteTypeId = 2 THEN 'Upvote'
+        WHEN lv.VoteTypeId = 3 THEN 'Downvote'
+        ELSE NULL
+    END AS LatestVoteType,
+    lv.CreationDate AS LatestVoteDate,
+    CASE
+        WHEN q.TagCount > 3 THEN 'Multi‑tagged'
+        WHEN q.TagCount = 1 THEN 'Single‑tagged'
+        ELSE 'No tags'
+    END AS TagComplexity,
+    COALESCE(tp.ExcerptSnippet, 'N/A') AS TagExcerptSnippet,
+    'QuestionView' AS RecordType
+FROM high_rep_users hr
+JOIN recent_questions q
+    ON hr.UserId = q.OwnerUserId
+LEFT JOIN latest_votes lv
+    ON lv.PostId = q.PostId
+   AND lv.VoteRank = 1
+LEFT JOIN user_badge_stats ub
+    ON ub.UserId = hr.UserId
+LEFT JOIN tag_popularity tp
+    ON tp.TagRank = q.TagCount
+WHERE q.QRank <= 5                                 -- top 5 recent questions per user
+  AND q.TagCount IS NOT NULL
+
+UNION ALL
+
+SELECT
+    ne.OwnerUserId            AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COALESCE(u.Location,'Unknown') AS Location,
+    ub.TotalBadges,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ne.PostId                 AS QuestionId,
+    ne.Title,
+    ne.CreationDate           AS QuestionDate,
+    ne.Score                  AS QuestionScore,
+    NULL                      AS ViewCount,
+    NULL                      AS FavoriteCount,
+    NULL                      AS TagCount,
+    NULL                      AS LatestVoteType,
+    NULL                      AS LatestVoteDate,
+    'NeverEdited'             AS TagComplexity,
+    NULL                      AS TagExcerptSnippet,
+    'NeverEdited'             AS RecordType
+FROM never_edited_posts ne
+JOIN Users u
+    ON u.Id = ne.OwnerUserId
+LEFT JOIN user_badge_stats ub
+    ON ub.UserId = u.Id
+WHERE ne.Score <= 0
+  AND ne.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '180' DAY
+ORDER BY RecordType, Reputation DESC, QuestionDate DESC
+LIMIT 200;

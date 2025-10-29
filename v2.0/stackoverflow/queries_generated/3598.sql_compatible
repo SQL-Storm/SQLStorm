@@ -1,0 +1,153 @@
+WITH
+    recent_questions AS (
+        SELECT
+            p.Id                AS QId,
+            p.Title,
+            p.CreationDate,
+            p.Score,
+            p.OwnerUserId,
+            COALESCE(u.Reputation, 0) AS OwnerReputation,
+            p.Tags,
+            p.AnswerCount,
+            p.FavoriteCount,
+            p.ViewCount
+        FROM Posts p
+        LEFT JOIN Users u ON u.Id = p.OwnerUserId
+        WHERE p.PostTypeId = 1
+          AND p.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '30' DAY
+          AND p.Score >= 5
+    ),
+
+    exploded_tags AS (
+        SELECT
+            q.QId,
+            TRIM(BOTH '<>' FROM regexp_split_to_table(q.Tags, '><')) AS Tag,
+            q.Score,
+            q.OwnerReputation,
+            q.CreationDate
+        FROM recent_questions q
+        WHERE q.Tags IS NOT NULL
+    ),
+
+    tag_stats AS (
+        SELECT
+            e.Tag,
+            COUNT(*)                              AS QuestionCount,
+            AVG(e.Score)                          AS AvgScore,
+            MAX(e.OwnerReputation)                AS MaxOwnerRep,
+            SUM(e.Score) OVER (PARTITION BY e.Tag) AS RunningScoreSum
+        FROM exploded_tags e
+        GROUP BY e.Tag
+    ),
+
+    top_tags AS (
+        SELECT *
+        FROM tag_stats
+        ORDER BY QuestionCount DESC, AvgScore DESC
+        LIMIT 10
+    ),
+
+    recent_badges AS (
+        SELECT
+            b.UserId,
+            b.Name            AS BadgeName,
+            b.Class,
+            b.Date            AS BadgeDate,
+            COUNT(*)          OVER (PARTITION BY b.UserId) AS BadgesEarnedByUser
+        FROM Badges b
+        JOIN recent_questions q ON q.OwnerUserId = b.UserId
+        WHERE b.Date >= CAST('2024-10-01' AS DATE) - INTERVAL '60' DAY
+    ),
+
+    latest_vote AS (
+        SELECT
+            v.PostId      AS QId,
+            vt.Name       AS LatestVoteType,
+            v.CreationDate
+        FROM Votes v
+        JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+        WHERE v.CreationDate = (
+              SELECT MAX(v2.CreationDate)
+              FROM Votes v2
+              WHERE v2.PostId = v.PostId
+          )
+    ),
+
+    questions_union AS (
+        SELECT
+            q.QId,
+            q.Title,
+            q.CreationDate,
+            q.Score,
+            q.OwnerUserId,
+            q.AnswerCount,
+            CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS HasAccepted,
+            COALESCE(lv.LatestVoteType, 'None') AS LatestVoteType,
+            q.ViewCount
+        FROM recent_questions q
+        LEFT JOIN Posts p ON p.Id = q.QId
+        LEFT JOIN latest_vote lv ON lv.QId = q.QId
+
+        UNION ALL
+
+        SELECT
+            q.QId,
+            q.Title,
+            q.CreationDate,
+            q.Score,
+            q.OwnerUserId,
+            q.AnswerCount,
+            0 AS HasAccepted,
+            COALESCE(lv.LatestVoteType, 'None') AS LatestVoteType,
+            q.ViewCount
+        FROM recent_questions q
+        LEFT JOIN latest_vote lv ON lv.QId = q.QId
+        WHERE NOT EXISTS (SELECT 1 FROM Posts p WHERE p.Id = q.QId AND p.AcceptedAnswerId IS NOT NULL)
+    )
+
+SELECT
+    qu.QId,
+    qu.Title,
+    qu.CreationDate,
+    qu.Score,
+    qu.OwnerUserId,
+    u.DisplayName                              AS OwnerDisplayName,
+    qu.AnswerCount,
+    qu.HasAccepted,
+    qu.LatestVoteType,
+    tt.Tag,
+    ts.QuestionCount,
+    ts.AvgScore,
+    ts.MaxOwnerRep,
+    rb.BadgeName,
+    rb.Class,
+    rb.BadgeDate,
+    ROW_NUMBER() OVER (PARTITION BY tt.Tag ORDER BY qu.Score DESC) AS RankInTag,
+    COALESCE(NULLIF(qu.Score, 0) / NULLIF(qu.ViewCount, 0), 0) AS ScorePerView
+FROM questions_union qu
+LEFT JOIN Users u ON u.Id = qu.OwnerUserId
+LEFT JOIN exploded_tags et ON et.QId = qu.QId
+LEFT JOIN top_tags tt ON tt.Tag = et.Tag
+LEFT JOIN tag_stats ts ON ts.Tag = tt.Tag
+LEFT JOIN recent_badges rb ON rb.UserId = qu.OwnerUserId
+WHERE tt.Tag IS NOT NULL
+GROUP BY
+    qu.QId,
+    qu.Title,
+    qu.CreationDate,
+    qu.Score,
+    qu.OwnerUserId,
+    u.DisplayName,
+    qu.AnswerCount,
+    qu.HasAccepted,
+    qu.LatestVoteType,
+    tt.Tag,
+    ts.QuestionCount,
+    ts.AvgScore,
+    ts.MaxOwnerRep,
+    rb.BadgeName,
+    rb.Class,
+    rb.BadgeDate,
+    qu.ViewCount
+ORDER BY tt.Tag, RankInTag
+LIMIT 200;

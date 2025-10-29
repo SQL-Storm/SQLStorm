@@ -1,0 +1,139 @@
+with RECURSIVE RecursiveTagHierarchy as (
+    select 
+        t.Id, 
+        t.TagName, 
+        1 as Level,
+        cast(t.TagName as varchar) as FullTagPath
+    from Tags t
+    where t.IsRequired = true
+
+    union all
+
+    select 
+        t.Id, 
+        t.TagName, 
+        r.Level + 1 as Level,
+        r.FullTagPath || ' > ' || t.TagName
+    from Tags t
+    inner join RecursiveTagHierarchy r on t.ExcerptPostId = r.Id
+    where r.Level < 3
+), QuestionAnswers as (
+    select 
+        p.Id as QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate as QuestionCreation,
+        a.Id as AnswerId,
+        a.OwnerUserId as AnswerOwnerUserId,
+        a.CreationDate as AnswerCreation,
+        a.Score as AnswerScore,
+        row_number() over (partition by p.Id order by a.Score desc, a.CreationDate) as AnswerRank
+    from Posts p
+    left join Posts a on a.ParentId = p.Id and a.PostTypeId = 2
+    where p.PostTypeId = 1 and p.CreationDate >= cast('2020-01-01' as date)
+), UserBadgeCount as (
+    select 
+        UserId, 
+        Name,
+        Class,
+        count(*) as BadgeCount
+    from Badges
+    where Date >= cast('2021-01-01' as date)
+    group by UserId, Name, Class
+), UserReputationWindow as (
+    select 
+        Id, 
+        Reputation,
+        DisplayName,
+        CreationDate,
+        lead(Reputation) over (order by Reputation) as NextReputation,
+        lag(Reputation) over (order by Reputation) as PrevReputation
+    from Users
+    where Reputation > 1000
+), FreshComments as (
+    select 
+        c.PostId, 
+        c.UserId, 
+        c.Text,
+        c.CreationDate,
+        length(c.Text) as TextLength,
+        row_number() over (partition by c.PostId order by c.CreationDate desc) as RecentCommentRank
+    from Comments c
+    where c.CreationDate > cast('2024-10-01' as date) - interval '30 days'
+), PostLinkAggregates as (
+    select 
+        pl.PostId,
+        count(distinct case when pl.LinkTypeId = 1 then pl.RelatedPostId end) as LinkedPostsCount,
+        count(distinct case when pl.LinkTypeId = 3 then pl.RelatedPostId end) as DuplicatePostsCount
+    from PostLinks pl
+    group by pl.PostId
+), ComplexPostsInfo as (
+    select 
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        coalesce(pla.LinkedPostsCount,0) as LinkedPostsCount,
+        coalesce(pla.DuplicatePostsCount,0) as DuplicatePostsCount,
+        (select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 2) as Upvotes,
+        (select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 3) as Downvotes,
+        case 
+            when p.ViewCount > 1000 and p.Score > 10 then 'Popular' 
+            when p.ClosedDate is not null then 'Closed' 
+            else 'Regular' 
+        end as PostStatus,
+        length(p.Title) + coalesce(p.ViewCount,0)/100.0 as PopularityIndex,
+        exists (
+            select 1 
+            from Comments c 
+            join UserBadgeCount ubc on ubc.UserId = c.UserId 
+            where c.PostId = p.Id and c.CreationDate > cast('2024-10-01' as date) - interval '7 days' and ubc.Class = 1
+            limit 1
+        ) as HasGoldBadgeRecentComment
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    left join PostLinkAggregates pla on pla.PostId = p.Id
+    where p.PostTypeId = 1
+)
+select 
+    cpi.Id as QuestionId,
+    cpi.Title,
+    cpi.OwnerName,
+    cpi.Score,
+    cpi.ViewCount,
+    cpi.AnswerCount,
+    cpi.FavoriteCount,
+    cpi.PostStatus,
+    cpi.PopularityIndex,
+    cpi.LinkedPostsCount,
+    cpi.DuplicatePostsCount,
+    cpi.Upvotes,
+    cpi.Downvotes,
+    cpi.HasGoldBadgeRecentComment,
+    string_agg(distinct rth.FullTagPath, ' | ') as TagHierarchies,
+    u.Reputation,
+    u.DisplayName as UserReputationNeighbor,
+    fc.Text as RecentCommentText,
+    wa.AnswerId,
+    wa.AnswerScore,
+    wa.AnswerCreation,
+    (select count(*) from Votes v where v.PostId = wa.AnswerId and v.VoteTypeId = 2) as AnswerUpvotes,
+    (select count(*) from Votes v where v.PostId = wa.AnswerId and v.VoteTypeId = 3) as AnswerDownvotes
+from ComplexPostsInfo cpi
+left join RecursiveTagHierarchy rth on position(rth.TagName in cpi.Tags) > 0
+left join UserReputationWindow u on u.Id = cpi.OwnerUserId
+left join FreshComments fc on fc.PostId = cpi.Id and fc.RecentCommentRank = 1
+left join QuestionAnswers wa on wa.QuestionId = cpi.Id and wa.AnswerRank = 1
+where cpi.HasGoldBadgeRecentComment = true or cpi.PostStatus = 'Popular'
+group by 
+    cpi.Id, cpi.Title, cpi.OwnerName, cpi.Score, cpi.ViewCount, cpi.AnswerCount, cpi.FavoriteCount, cpi.PostStatus, cpi.PopularityIndex, 
+    cpi.LinkedPostsCount, cpi.DuplicatePostsCount, cpi.Upvotes, cpi.Downvotes, cpi.HasGoldBadgeRecentComment,
+    u.Reputation, u.DisplayName, fc.Text, wa.AnswerId, wa.AnswerScore, wa.AnswerCreation
+order by cpi.PopularityIndex desc, cpi.ViewCount desc
+limit 50;

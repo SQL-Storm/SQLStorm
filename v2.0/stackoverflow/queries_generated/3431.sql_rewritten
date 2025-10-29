@@ -1,0 +1,113 @@
+-- {"query": "3431.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2308} 
+WITH UserActivity AS (
+    SELECT 
+        u.Id                                 AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1)             AS QuestionCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2)             AS AnswerCount,
+        SUM(COALESCE(p.Score,0)) FILTER (WHERE p.PostTypeId = 1)         AS QuestionScoreSum,
+        SUM(COALESCE(p.Score,0)) FILTER (WHERE p.PostTypeId = 2)         AS AnswerScoreSum,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1)                 AS GoldBadges,
+        COUNT(DISTINCT v.Id) FILTER (WHERE vt.Name = 'UpMod')           AS UpVotesGiven,
+        COUNT(DISTINCT v2.Id) FILTER (WHERE vt2.Name = 'DownMod')       AS DownVotesGiven,
+        MAX(p.CreationDate)                                            AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p      ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b     ON b.UserId = u.Id
+    LEFT JOIN Votes v      ON v.UserId = u.Id
+    LEFT JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    LEFT JOIN Votes v2     ON v2.UserId = u.Id
+    LEFT JOIN VoteTypes vt2 ON vt2.Id = v2.VoteTypeId
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+TagStats AS (
+    SELECT 
+        t.TagName,
+        t.Count                               AS TagUseCount,
+        COALESCE(e.Id,0)                      AS ExcerptPostId,
+        COALESCE(w.Id,0)                      AS WikiPostId,
+        (SELECT COUNT(*) 
+         FROM PostLinks pl 
+         WHERE pl.PostId = e.Id OR pl.RelatedPostId = e.Id) AS ExcerptLinkCount,
+        (SELECT COUNT(*) 
+         FROM PostLinks pl 
+         WHERE pl.PostId = w.Id OR pl.RelatedPostId = w.Id) AS WikiLinkCount
+    FROM Tags t
+    LEFT JOIN Posts e ON e.Id = t.ExcerptPostId
+    LEFT JOIN Posts w ON w.Id = t.WikiPostId
+    WHERE t.IsModeratorOnly = 0
+),
+
+UserRankings AS (
+    SELECT 
+        ua.*,
+        ROW_NUMBER() OVER (
+            ORDER BY (ua.QuestionScoreSum*2 + ua.AnswerScoreSum*3 + ua.GoldBadges*10 + ua.Reputation) DESC
+        )                                   AS RankByContribution,
+        CASE 
+            WHEN ua.LastPostDate IS NULL                     THEN 'Never Posted'
+            WHEN ua.LastPostDate < cast('2024-10-01' as date) - INTERVAL '1 year' THEN 'Stale'
+            ELSE 'Active'
+        END                                 AS ActivityStatus
+    FROM UserActivity ua
+),
+
+TopUsers AS (
+    SELECT 
+        ur.UserId,
+        ur.DisplayName,
+        ur.RankByContribution,
+        ur.ActivityStatus,
+        CONCAT(
+            'Score:',
+            (ur.QuestionScoreSum*2 + ur.AnswerScoreSum*3 + ur.GoldBadges*10 + ur.Reputation)
+        )                                   AS CompositeScore,
+        COALESCE(
+            (SELECT MAX(p.CreationDate) 
+             FROM Posts p 
+             WHERE p.OwnerUserId = ur.UserId AND p.PostTypeId = 2),
+            ur.LastPostDate
+        )                                   AS LastAnswerOrPostDate
+    FROM UserRankings ur
+    WHERE ur.RankByContribution <= 100
+)
+
+SELECT 
+    tu.UserId,
+    tu.DisplayName,
+    tu.RankByContribution,
+    tu.ActivityStatus,
+    tu.CompositeScore,
+    tu.LastAnswerOrPostDate,
+    COALESCE(cm.CommentCount,0)           AS RecentCommentCount,
+    ISNULL(NULLIF(tu.ActivityStatus,'Never Posted'),'N/A') AS NormalizedStatus
+FROM TopUsers tu
+LEFT JOIN LATERAL (
+    SELECT COUNT(*) AS CommentCount
+    FROM Comments c
+    WHERE c.UserId = tu.UserId
+      AND c.CreationDate >= cast('2024-10-01' as date) - INTERVAL '30 days'
+) cm ON true
+
+UNION ALL
+
+SELECT 
+    NULL                                 AS UserId,
+    ts.TagName,
+    NULL                                 AS RankByContribution,
+    CASE 
+        WHEN ts.ExcerptLinkCount + ts.WikiLinkCount > 100 THEN 'Heavy Linked'
+        ELSE 'Lightly Linked'
+    END                                 AS ActivityStatus,
+    CONCAT('TagUse:', ts.TagUseCount)   AS CompositeScore,
+    NULL::timestamp                      AS LastAnswerOrPostDate,
+    ts.ExcerptLinkCount + ts.WikiLinkCount AS RecentCommentCount,
+    NULL                                 AS NormalizedStatus
+FROM TagStats ts
+WHERE ts.TagUseCount > 5000
+
+ORDER BY 
+    RankByContribution ASC NULLS LAST,
+    CompositeScore DESC;

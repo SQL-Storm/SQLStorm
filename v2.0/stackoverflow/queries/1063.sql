@@ -1,0 +1,190 @@
+WITH UserPerformanceSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Views,
+        u.UpVotes AS TotalUpVotesGiven,
+        u.DownVotes AS TotalDownVotesGiven,
+        COUNT(DISTINCT p.Id) AS TotalPostsCreated,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsCreated,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersCreated,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN pv.VoteTypeId = 2 THEN 1 ELSE 0 END) AS PostsUpvotedByUser,
+        SUM(CASE WHEN pv.VoteTypeId = 3 THEN 1 ELSE 0 END) AS PostsDownvotedByUser,
+        AVG(CAST(p.Score AS DECIMAL)) AS AvgPostScoreOwned,
+        CASE
+            WHEN (EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - u.CreationDate)) / (365 * 24 * 3600)) > 0
+            THEN u.Reputation / (EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - u.CreationDate)) / (365 * 24 * 3600))
+            ELSE u.Reputation
+        END AS ReputationPerYear,
+        LENGTH(COALESCE(u.AboutMe, '')) AS AboutMeLength
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes pv ON u.Id = pv.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes, u.AboutMe
+),
+PostEventAnalysis AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.ViewCount,
+        p.Score,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        (SELECT ARRAY_AGG(TRIM(x))
+         FROM (
+             SELECT TRIM(value) AS x
+             FROM (
+                 SELECT UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2), '><')) AS value
+             ) s
+         ) t) AS TagList,
+        COUNT(DISTINCT ph.UserId) FILTER (WHERE ph.PostHistoryTypeId IN (4, 5, 6)) AS NumberOfEditors,
+        MIN(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) AS FirstClosedDate,
+        (
+            SELECT elem_text
+            FROM (
+                SELECT (elem)::text AS elem_text
+                FROM (
+                    SELECT UNNEST(
+                        CASE
+                            WHEN TRIM(ph_dup.Text) LIKE '{%' THEN string_to_array(trim(ph_dup.Text), ',') 
+                            ELSE NULL
+                        END
+                    ) AS elem
+                    FROM PostHistory ph_dup
+                    WHERE ph_dup.PostId = p.Id
+                      AND ph_dup.PostHistoryTypeId = 10
+                      AND ph_dup.Comment = '101'
+                ) sub_elems
+            ) sub
+            WHERE elem_text IS NOT NULL
+            LIMIT 1
+        ) AS DuplicateOriginalQuestionId,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId, p.PostTypeId ORDER BY p.Score DESC, p.CreationDate DESC) AS PostScoreRankByOwnerType,
+        (LEAD(p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) - p.CreationDate) AS TimeToNextPost
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    WHERE p.PostTypeId IN (1, 2)
+    GROUP BY p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.LastEditDate, p.LastActivityDate, p.ViewCount, p.Score,
+             p.AnswerCount, p.CommentCount, p.FavoriteCount, p.ClosedDate, p.Tags
+),
+UserBadgesAndAwards AS (
+    SELECT
+        b.UserId,
+        COUNT(b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(CASE WHEN b.Class = 1 THEN b.Date ELSE NULL END) AS LatestGoldBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+),
+HighlyEngagedPosts AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        p.Id AS PostId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.Score > 50
+      AND p.ViewCount > 10000
+      AND p.CreationDate > CAST('2024-10-01' AS date) - INTERVAL '3 year'
+    UNION ALL
+    SELECT
+        p.OwnerUserId AS UserId,
+        p.Id AS PostId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+      AND p.Score > 20
+      AND p.CreationDate > CAST('2024-10-01' AS date) - INTERVAL '2 year'
+),
+UserInfluenceRankCalc AS (
+    SELECT
+        ups.UserId,
+        RANK() OVER (
+            ORDER BY
+                ups.ReputationPerYear DESC,
+                ups.TotalPostsCreated DESC,
+                COALESCE(uba.GoldBadges, 0) DESC,
+                COALESCE(he_counts.highly_engaged_count, 0) DESC
+        ) AS UserInfluenceRank
+    FROM UserPerformanceSummary ups
+    LEFT JOIN UserBadgesAndAwards uba ON ups.UserId = uba.UserId
+    LEFT JOIN (
+        SELECT UserId, COUNT(DISTINCT PostId) AS highly_engaged_count
+        FROM HighlyEngagedPosts
+        GROUP BY UserId
+    ) he_counts ON ups.UserId = he_counts.UserId
+)
+SELECT
+    ups.UserId,
+    ups.DisplayName,
+    ups.Reputation,
+    ups.ReputationPerYear,
+    ups.TotalPostsCreated,
+    ups.TotalQuestionsCreated,
+    ups.TotalAnswersCreated,
+    ups.TotalCommentsMade,
+    COALESCE(uba.GoldBadges, 0) AS UserGoldBadges,
+    COALESCE(uba.TotalBadges, 0) AS UserTotalBadges,
+    ups.AvgPostScoreOwned,
+    ups.AboutMeLength,
+    COUNT(DISTINCT pa.PostId) FILTER (WHERE pa.NumberOfEditors > 1 AND pa.OwnerUserId IS NOT NULL) AS PostsEditedByOthersCount,
+    AVG(CASE WHEN pa.PostTypeId = 1 THEN pa.Score END) AS AvgQuestionScoreOwned,
+    AVG(CASE WHEN pa.PostTypeId = 2 THEN pa.Score END) AS AvgAnswerScoreOwned,
+    CAST(SUM(CASE WHEN pa.PostTypeId = 1 AND pa.ClosedDate IS NOT NULL THEN 1 ELSE 0 END) AS DECIMAL) * 100.0 / NULLIF(SUM(CASE WHEN pa.PostTypeId = 1 THEN 1 ELSE 0 END), 0) AS PctQuestionsClosed,
+    EXISTS (
+        SELECT 1
+        FROM PostEventAnalysis sub_pa
+        WHERE sub_pa.OwnerUserId = ups.UserId
+          AND sub_pa.PostTypeId = 1
+          AND sub_pa.DuplicateOriginalQuestionId IS NOT NULL
+    ) AS HasDuplicateClosedQuestion,
+    (
+        SELECT STRING_AGG(unnest_tag, ', ')
+        FROM (
+            SELECT unnest(pa_tags.TagList) AS unnest_tag, COUNT(*) as tag_count
+            FROM PostEventAnalysis pa_tags
+            WHERE pa_tags.OwnerUserId = ups.UserId AND pa_tags.PostTypeId = 1
+            GROUP BY unnest_tag
+            ORDER BY tag_count DESC
+            LIMIT 3
+        ) AS top_tags_sub
+    ) AS Top3QuestionTags,
+    uir.UserInfluenceRank,
+    AVG(CASE WHEN pa.PostTypeId = 1 THEN pa.TimeToNextPost END) AS AvgTimeToNextQuestion
+FROM UserPerformanceSummary ups
+LEFT JOIN PostEventAnalysis pa ON ups.UserId = pa.OwnerUserId
+LEFT JOIN UserBadgesAndAwards uba ON ups.UserId = uba.UserId
+LEFT JOIN (SELECT DISTINCT UserId FROM HighlyEngagedPosts) he_users ON ups.UserId = he_users.UserId
+LEFT JOIN UserInfluenceRankCalc uir ON ups.UserId = uir.UserId
+WHERE
+    ups.Reputation > 1000
+    AND ups.TotalPostsCreated >= 5
+    AND ups.LastAccessDate >= CAST('2024-10-01' AS date) - INTERVAL '1 year'
+    AND (
+        (COALESCE(uba.GoldBadges, 0) > 0 AND ups.TotalQuestionsCreated >= 10)
+        OR (ups.Reputation > 5000 AND ups.TotalAnswersCreated >= 20)
+    )
+GROUP BY
+    ups.UserId, ups.DisplayName, ups.Reputation, ups.ReputationPerYear, ups.TotalPostsCreated,
+    ups.TotalQuestionsCreated, ups.TotalAnswersCreated, ups.TotalCommentsMade,
+    COALESCE(uba.GoldBadges, 0), COALESCE(uba.TotalBadges, 0), ups.AvgPostScoreOwned,
+    ups.AboutMeLength, he_users.UserId, ups.LastAccessDate, uir.UserInfluenceRank
+ORDER BY uir.UserInfluenceRank ASC, ups.Reputation DESC, ups.UserId ASC
+LIMIT 1000;

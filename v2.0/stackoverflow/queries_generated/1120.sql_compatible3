@@ -1,0 +1,252 @@
+WITH UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.UpVotes,
+        u.DownVotes,
+        u.Views AS ProfileViews,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+        (CAST(u.Reputation AS numeric) * 0.5 + CAST(u.UpVotes AS numeric) * 0.2 - CAST(u.DownVotes AS numeric) * 0.1 + CAST(u.Views AS numeric) * 0.05) AS InfluenceScore,
+        EXTRACT(EPOCH FROM (u.LastAccessDate - u.CreationDate)) / (60 * 60 * 24 * 365.25) AS YearsActive,
+        COALESCE(u.Location, 'Unknown') AS UserLocation
+    FROM
+        Users AS u
+    LEFT JOIN
+        Badges AS b ON u.Id = b.UserId
+    WHERE
+        u.CreationDate >= DATE '2010-01-01'
+        AND u.Reputation > 500
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes, u.Views, u.CreationDate, u.LastAccessDate, u.Location
+),
+QuestionEngagementMetrics AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.OwnerUserId,
+        p.CreationDate AS QuestionCreationDate,
+        p.Score AS QuestionScore,
+        p.ViewCount AS QuestionViewCount,
+        p.CommentCount AS QuestionCommentCount,
+        p.FavoriteCount AS QuestionFavoriteCount,
+        p.ClosedDate,
+        p.AcceptedAnswerId,
+        STRING_AGG(DISTINCT SUBSTRING(t.TagName FROM 1 FOR 30), ', ') AS QuestionTags,
+        COUNT(DISTINCT a.Id) AS TotalAnswers,
+        COALESCE(AVG(a.Score), 0) AS AvgAnswerScore,
+        COALESCE(MAX(a.Score), 0) AS MaxAnswerScore,
+        COUNT(DISTINCT CASE WHEN a.OwnerUserId IS NOT NULL THEN a.Id END) AS AnswersByRegisteredUsers,
+        SUM(CASE WHEN a.CreationDate < p.CreationDate + INTERVAL '1 day' THEN 1 ELSE 0 END) AS AnswersInFirstDay,
+        (SELECT COUNT(DISTINCT c.Id) FROM Comments AS c WHERE c.PostId = p.Id AND c.CreationDate BETWEEN p.CreationDate AND p.CreationDate + INTERVAL '7 days') AS InitialCommentsCount,
+        (SELECT
+            COUNT(DISTINCT pl.RelatedPostId)
+         FROM
+            PostLinks AS pl
+         WHERE
+            pl.PostId = p.Id AND pl.LinkTypeId = 1
+            AND pl.CreationDate BETWEEN p.CreationDate AND p.CreationDate + INTERVAL '30 days'
+        ) AS LinkedQuestionsCount,
+        p.Tags,
+        p.Body AS QuestionBody
+    FROM
+        Posts AS p
+    LEFT JOIN
+        Posts AS a ON p.Id = a.ParentId AND a.PostTypeId = 2
+    LEFT JOIN
+        LATERAL (
+            SELECT TRIM(BOTH '<>' FROM p.Tags) AS t_raw
+        ) tr ON true
+    LEFT JOIN
+        LATERAL (
+            SELECT regexp_split_to_table(tr.t_raw, '><') AS TagName
+        ) t ON p.Tags IS NOT NULL
+    WHERE
+        p.PostTypeId = 1
+        AND p.CreationDate >= DATE '2015-01-01'
+        AND p.ViewCount > 100
+    GROUP BY
+        p.Id, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.CommentCount, p.FavoriteCount, p.ClosedDate, p.AcceptedAnswerId, p.Tags, p.Body
+),
+PostHistoryInsights AS (
+    SELECT
+        ph.PostId,
+        MAX(ph.CreationDate) AS LastHistoryDate,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.Id END) AS EditCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Id END) AS CloseCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.Id END) AS ReopenCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 12 THEN ph.Id END) AS DeleteCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 16 THEN ph.Id END) AS CommunityOwnedChanges,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 5 THEN ph.CreationDate END) AS LastBodyEditDate,
+        MIN(CASE WHEN ph.PostHistoryTypeId = 5 THEN ph.CreationDate END) AS FirstBodyEditDate
+    FROM
+        PostHistory AS ph
+    WHERE
+        ph.PostHistoryTypeId IN (4, 5, 6, 10, 11, 12, 16)
+        AND ph.CreationDate >= DATE '2015-01-01'
+    GROUP BY
+        ph.PostId
+),
+AnswerQualityMetrics AS (
+    SELECT
+        p.Id AS AnswerId,
+        p.ParentId AS QuestionId,
+        p.Score AS AnswerScore,
+        p.OwnerUserId AS AnswerOwnerId,
+        p.CreationDate AS AnswerCreationDate,
+        COALESCE(SUM(v.BountyAmount), 0) AS TotalBountyReceived,
+        COUNT(DISTINCT CASE WHEN vt.Name = 'AcceptedByOriginator' THEN v.Id END) AS AcceptedVotes,
+        (SELECT
+            COUNT(DISTINCT b.Id)
+         FROM
+            Badges AS b
+         WHERE
+            b.UserId = p.OwnerUserId AND b.Class = 1
+        ) AS AnswerOwnerGoldBadgesCount,
+        ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS RankWithinQuestion
+    FROM
+        Posts AS p
+    LEFT JOIN
+        Votes AS v ON p.Id = v.PostId AND v.VoteTypeId IN (1, 8, 9)
+    LEFT JOIN
+        VoteTypes AS vt ON v.VoteTypeId = vt.Id
+    WHERE
+        p.PostTypeId = 2
+    GROUP BY
+        p.Id, p.ParentId, p.Score, p.OwnerUserId, p.CreationDate
+)
+SELECT
+    UAS.UserId,
+    UAS.DisplayName,
+    UAS.Reputation,
+    UAS.InfluenceScore,
+    UAS.YearsActive,
+    UAS.GoldBadges,
+    UAS.SilverBadges,
+    UAS.BronzeBadges,
+    UAS.UserLocation,
+    QEM.QuestionId,
+    QEM.QuestionCreationDate,
+    QEM.QuestionScore,
+    QEM.QuestionViewCount,
+    QEM.TotalAnswers,
+    QEM.AvgAnswerScore,
+    QEM.MaxAnswerScore,
+    QEM.QuestionTags,
+    PHI.EditCount AS QuestionEditCount,
+    PHI.CloseCount AS QuestionCloseCount,
+    PHI.DeleteCount AS QuestionDeleteCount,
+    AQM.AnswerId AS TopAnswerId,
+    AQM.AnswerScore AS TopAnswerScore,
+    AQM.AnswerOwnerId AS TopAnswerOwnerId,
+    AQM.TotalBountyReceived AS TopAnswerBounty,
+    AQM.AnswerOwnerGoldBadgesCount AS TopAnswerOwnerGoldBadges,
+    CASE
+        WHEN QEM.ClosedDate IS NOT NULL AND PHI.CloseCount > 1 THEN 'Closed_MultipleTimes'
+        WHEN QEM.ClosedDate IS NOT NULL AND QEM.ClosedDate > QEM.QuestionCreationDate + INTERVAL '30 days' THEN 'Closed_Late'
+        WHEN QEM.ClosedDate IS NOT NULL THEN 'Closed_Early'
+        WHEN QEM.AcceptedAnswerId IS NOT NULL AND QEM.AvgAnswerScore > 5 THEN 'Resolved_HighQuality'
+        WHEN QEM.AcceptedAnswerId IS NOT NULL THEN 'Resolved_Accepted'
+        WHEN QEM.TotalAnswers > 0 AND QEM.AvgAnswerScore <= 1 THEN 'Unresolved_LowQualityAnswers'
+        ELSE 'Unresolved_Open'
+    END AS QuestionResolutionStatus,
+    COALESCE(
+        'User ' || UAS.DisplayName || ' (Rep: ' || CAST(UAS.Reputation AS varchar(20)) || ', Loc: ' || UAS.UserLocation || ') posted Q_ID:' || CAST(QEM.QuestionId AS varchar(20)) ||
+        ' on ' || TO_CHAR(CAST(QEM.QuestionCreationDate AS TIMESTAMP), 'YYYY-MM-DD HH24:MI') || '. Views: ' || CAST(QEM.QuestionViewCount AS varchar(20)) ||
+        ', Score: ' || CAST(QEM.QuestionScore AS varchar(20)) || ', Answers: ' || CAST(QEM.TotalAnswers AS varchar(20)) ||
+        ', AvgAnsScore: ' || COALESCE(TO_CHAR(ROUND(CAST(QEM.AvgAnswerScore AS numeric), 2), 'FM999990.00'), TO_CHAR(0, 'FM999990.00')) ||
+        COALESCE(', Edits: ' || CAST(PHI.EditCount AS varchar(20)), '') ||
+        CASE WHEN QEM.InitialCommentsCount > 5 THEN ', Highly_Commented_Initially' ELSE '' END ||
+        CASE WHEN QEM.LinkedQuestionsCount > 0 THEN ', Linked_From_Others (' || CAST(QEM.LinkedQuestionsCount AS varchar(20)) || ')' ELSE '' END ||
+        CASE WHEN QEM.QuestionTags LIKE '%<javascript>%' THEN ', JAVASCRIPT_Related' ELSE '' END,
+        'User ' || UAS.DisplayName || ' (Rep: ' || CAST(UAS.Reputation AS varchar(20)) || ') has no recent engaging questions to display.'
+    ) AS UserQuestionDetailedSummary,
+    (CASE WHEN QEM.AcceptedAnswerId IS NULL THEN TRUE ELSE FALSE END) AS NoAcceptedAnswerYet,
+    (CASE WHEN QEM.ClosedDate IS NOT NULL THEN TRUE ELSE FALSE END) AS WasOfficiallyClosed,
+    (CASE WHEN PHI.DeleteCount > 0 THEN TRUE ELSE FALSE END) AS WasDeletedEventually
+FROM
+    UserActivitySummary AS UAS
+LEFT JOIN
+    QuestionEngagementMetrics AS QEM ON UAS.UserId = QEM.OwnerUserId
+LEFT JOIN
+    PostHistoryInsights AS PHI ON QEM.QuestionId = PHI.PostId
+LEFT JOIN
+    AnswerQualityMetrics AS AQM ON QEM.QuestionId = AQM.QuestionId AND AQM.RankWithinQuestion = 1
+WHERE
+    (UAS.Reputation > 7500 OR UAS.GoldBadges > 0)
+    AND (QEM.QuestionId IS NOT NULL AND QEM.QuestionViewCount > 1000 AND QEM.AvgAnswerScore > 3)
+    AND (QEM.QuestionTags LIKE '%<sql>%' OR QEM.QuestionTags LIKE '%<database>%' OR QEM.QuestionTags LIKE '%<performance>%')
+    AND (NOT EXISTS (
+        SELECT 1
+        FROM PostHistory AS ph_corr
+        WHERE ph_corr.PostId = QEM.QuestionId
+          AND ph_corr.PostHistoryTypeId = 12
+          AND ph_corr.CreationDate > QEM.QuestionCreationDate + INTERVAL '48 hours'
+          AND QEM.TotalAnswers = 0
+    ))
+    AND COALESCE(PHI.CloseCount, 0) <= 2
+    AND (AQM.AnswerId IS NOT NULL OR QEM.AcceptedAnswerId IS NOT NULL)
+    AND (AQM.AnswerOwnerId IS NULL OR (SELECT u2.Reputation FROM Users u2 WHERE u2.Id = AQM.AnswerOwnerId) > 5000)
+
+UNION ALL
+
+SELECT
+    UAS.UserId,
+    UAS.DisplayName,
+    UAS.Reputation,
+    UAS.InfluenceScore,
+    UAS.YearsActive,
+    UAS.GoldBadges,
+    UAS.SilverBadges,
+    UAS.BronzeBadges,
+    UAS.UserLocation,
+    QEM.QuestionId,
+    QEM.QuestionCreationDate,
+    QEM.QuestionScore,
+    QEM.QuestionViewCount,
+    QEM.TotalAnswers,
+    QEM.AvgAnswerScore,
+    QEM.MaxAnswerScore,
+    QEM.QuestionTags,
+    PHI.EditCount AS QuestionEditCount,
+    PHI.CloseCount AS QuestionCloseCount,
+    PHI.DeleteCount AS QuestionDeleteCount,
+    NULL AS TopAnswerId,
+    NULL AS TopAnswerScore,
+    NULL AS TopAnswerOwnerId,
+    NULL AS TopAnswerBounty,
+    NULL AS TopAnswerOwnerGoldBadges,
+    'Problematic_HighViews_LowEngagement' AS QuestionResolutionStatus,
+    'User ' || UAS.DisplayName || ' (Rep: ' || CAST(UAS.Reputation AS varchar(20)) || ', Loc: ' || UAS.UserLocation || ') has a problematic Q_ID:' || CAST(QEM.QuestionId AS varchar(20)) ||
+    ' on ' || TO_CHAR(CAST(QEM.QuestionCreationDate AS TIMESTAMP), 'YYYY-MM-DD') || '. Views: ' || CAST(QEM.QuestionViewCount AS varchar(20)) ||
+    ', Score: ' || CAST(QEM.QuestionScore AS varchar(20)) || ', Closed Cnt: ' || CAST(COALESCE(PHI.CloseCount,0) AS varchar(20)) ||
+    COALESCE(CASE WHEN PHI.DeleteCount > 0 THEN ', Deleted_Eventually' END, '') ||
+    CASE WHEN QEM.QuestionBody LIKE '%urgent%' OR QEM.QuestionBody LIKE '%help me%' THEN ', Contains_Urgent_Phrases' ELSE '' END AS UserQuestionDetailedSummary,
+    (CASE WHEN QEM.AcceptedAnswerId IS NULL THEN TRUE ELSE FALSE END) AS NoAcceptedAnswerYet,
+    (CASE WHEN QEM.ClosedDate IS NOT NULL THEN TRUE ELSE FALSE END) AS WasOfficiallyClosed,
+    (CASE WHEN PHI.DeleteCount > 0 THEN TRUE ELSE FALSE END) AS WasDeletedEventually
+FROM
+    UserActivitySummary AS UAS
+INNER JOIN
+    QuestionEngagementMetrics AS QEM ON UAS.UserId = QEM.OwnerUserId
+INNER JOIN
+    PostHistoryInsights AS PHI ON QEM.QuestionId = PHI.PostId
+WHERE
+    UAS.Reputation BETWEEN 1000 AND 7500
+    AND QEM.QuestionViewCount > 20000
+    AND (PHI.CloseCount >= 1 OR PHI.DeleteCount > 0)
+    AND QEM.AvgAnswerScore < 2
+    AND QEM.QuestionCreationDate BETWEEN DATE '2019-01-01' AND DATE '2022-12-31'
+    AND QEM.QuestionId NOT IN (SELECT QuestionId FROM AnswerQualityMetrics WHERE RankWithinQuestion = 1 AND AnswerScore > 5)
+    AND QEM.QuestionTags LIKE '%<c#>%<asp.net>%'
+    AND (
+        SELECT COUNT(DISTINCT co.Id)
+        FROM Comments AS co
+        WHERE co.PostId = QEM.QuestionId
+          AND co.CreationDate < QEM.QuestionCreationDate + INTERVAL '24 hours'
+          AND co.Text ILIKE '%duplicate%'
+    ) > 0
+ORDER BY
+    Reputation DESC, QuestionViewCount DESC, QuestionCreationDate DESC;

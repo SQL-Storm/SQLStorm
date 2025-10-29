@@ -1,0 +1,51 @@
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    COUNT(DISTINCT v.PostId) AS TotalVotes,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id ELSE NULL END) AS TotalQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id ELSE NULL END) AS TotalAnswers,
+    MAX(p.Score) AS HighestScoredPost,
+    MIN(p.CreationDate) AS FirstPostDate,
+    AVG(p.ViewCount) AS AvgViewCount,
+    MAX(b.Date) AS LastBadgeEarned,
+    STRING_AGG(distinct tag_names.TagName, ', ') AS PopularTags
+FROM 
+    Users u
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Votes v ON u.Id = v.UserId
+LEFT JOIN (
+    SELECT 
+        p.Id AS PostId,
+        -- split tags like '<tag1><tag2>' into rows by removing surrounding < > and splitting on '><'
+        regexp_split_to_table(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><') AS TagName
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE pt.Name = 'Question'
+) qtags ON p.Id = qtags.PostId
+LEFT JOIN (
+    -- distinct tag names per post joined to global Tags table to get canonical tag info if needed
+    SELECT DISTINCT TagName FROM (
+        SELECT regexp_split_to_table(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><') AS TagName
+        FROM Posts p
+        JOIN PostTypes pt ON p.PostTypeId = pt.Id
+        WHERE pt.Name = 'Question'
+    ) s
+) tag_names ON qtags.TagName = tag_names.TagName
+LEFT JOIN Tags tg ON tag_names.TagName = tg.TagName
+WHERE 
+    u.Reputation > 10000
+    AND u.Id NOT IN (SELECT AccountId FROM Users WHERE AccountId IS NOT NULL)
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation, u.Location
+HAVING 
+    COUNT(DISTINCT p.Id) > 50
+ORDER BY 
+    u.Reputation DESC, TotalPosts DESC;

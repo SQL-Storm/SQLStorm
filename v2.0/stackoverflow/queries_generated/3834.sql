@@ -1,0 +1,202 @@
+-- {"query": "3834.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2063} 
+
+/*  Benchmark query: deep analytics across Users, Posts, Badges, Votes, Tags and PostHistory  */
+WITH
+/*--------------------------------------------------------------
+  1. User‑level aggregates: reputation, badge counts, recent activity
+--------------------------------------------------------------*/
+user_agg AS (
+    SELECT
+        u.Id                     AS user_id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END)      AS gold_badge_cnt,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END)      AS silver_badge_cnt,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END)      AS bronze_badge_cnt,
+        MAX(u.LastAccessDate)                                    AS last_access,
+        MAX(p.CreationDate)                                      AS last_post_date,
+        COUNT(p.Id)                                               AS total_posts,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END)             AS question_cnt,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END)             AS answer_cnt
+    FROM Users u
+    LEFT JOIN Badges b          ON b.UserId = u.Id
+    LEFT JOIN Posts  p          ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+/*--------------------------------------------------------------
+  2. Question‑level metrics: score, view, tag list, closure info
+--------------------------------------------------------------*/
+question_metrics AS (
+    SELECT
+        q.Id                                    AS question_id,
+        q.Title,
+        q.Score                                 AS q_score,
+        q.ViewCount,
+        q.CreationDate,
+        q.FavoriteCount,
+        q.ClosedDate,
+        COALESCE(
+            NULLIF(
+                substring(q.Tags, 2, length(q.Tags)-2),
+                ''
+            ),
+            NULL
+        )                                       AS raw_tag_string,
+        /* split tags into an array‑like string for aggregation */
+        STRING_AGG(t.TagName, ',') WITHIN GROUP (ORDER BY t.TagName) AS tag_list,
+        /* count of answers that have a positive score */
+        SUM(CASE WHEN a.Score > 0 THEN 1 ELSE 0 END) AS positive_answer_cnt,
+        /* latest activity (answer or comment) */
+        GREATEST(
+            q.LastActivityDate,
+            COALESCE(
+                (SELECT MAX(c.CreationDate) FROM Comments c WHERE c.PostId = q.Id),
+                q.CreationDate
+            )
+        )                                       AS latest_activity_ts
+    FROM Posts q
+    LEFT JOIN PostLinks pl      ON pl.PostId = q.Id AND pl.LinkTypeId = 3   -- duplicate links
+    LEFT JOIN Posts a           ON a.ParentId = q.Id AND a.PostTypeId = 2
+    LEFT JOIN Tags t            ON t.TagName = ANY (string_to_array(
+                                        substring(q.Tags, 2, length(q.Tags)-2), '><')
+                                    )
+    WHERE q.PostTypeId = 1                                 -- only questions
+      AND q.CreationDate >= DATE '2020-01-01'
+    GROUP BY q.Id, q.Title, q.Score, q.ViewCount, q.CreationDate,
+             q.FavoriteCount, q.ClosedDate, q.LastActivityDate,
+             raw_tag_string
+),
+
+/*--------------------------------------------------------------
+  3. Vote‑level window: rank of each post by up‑votes per day
+--------------------------------------------------------------*/
+post_vote_rank AS (
+    SELECT
+        v.PostId,
+        p.PostTypeId,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 2)           AS upvote_cnt,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 3)           AS downvote_cnt,
+        DATE_TRUNC('day', v.CreationDate)                 AS vote_day,
+        ROW_NUMBER() OVER (
+            PARTITION BY DATE_TRUNC('day', v.CreationDate), p.PostTypeId
+            ORDER BY COUNT(*) FILTER (WHERE v.VoteTypeId = 2) DESC
+        )                                                  AS daily_upvote_rank
+    FROM Votes v
+    JOIN Posts p ON p.Id = v.PostId
+    WHERE v.VoteTypeId IN (2,3)                          -- up & down votes only
+    GROUP BY v.PostId, p.PostTypeId, DATE_TRUNC('day', v.CreationDate)
+),
+
+/*--------------------------------------------------------------
+  4. Correlated subquery helper: latest post history entry per post
+--------------------------------------------------------------*/
+latest_history AS (
+    SELECT
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        ph.Comment
+    FROM PostHistory ph
+    WHERE ph.Id = (
+        SELECT MAX(ph2.Id)
+        FROM PostHistory ph2
+        WHERE ph2.PostId = ph.PostId
+    )
+),
+
+/*--------------------------------------------------------------
+  5. Unioned set: top‑scoring questions vs. most‑viewed tags
+--------------------------------------------------------------*/
+top_questions AS (
+    SELECT
+        qm.question_id,
+        qm.title,
+        qm.q_score,
+        qm.ViewCount,
+        qm.tag_list,
+        'question' AS entity_type,
+        qm.q_score * 1.0 / NULLIF(qm.ViewCount,0) AS score_per_view
+    FROM question_metrics qm
+    WHERE qm.q_score > 10
+    ORDER BY qm.q_score DESC
+    LIMIT 100
+),
+top_tags AS (
+    SELECT
+        t.Id               AS tag_id,
+        t.TagName,
+        t.Count            AS tag_use_cnt,
+        t.IsModeratorOnly,
+        'tag'              AS entity_type,
+        t.Count * 1.0 / NULLIF( (SELECT SUM(Count) FROM Tags),0) AS usage_fraction
+    FROM Tags t
+    WHERE t.Count > 500
+    ORDER BY t.Count DESC
+    LIMIT 100
+),
+
+combined_entities AS (
+    SELECT * FROM top_questions
+    UNION ALL
+    SELECT * FROM top_tags
+)
+
+/*--------------------------------------------------------------
+  Final projection: join everything together and apply complex
+  predicates, string manipulation and NULL logic.
+--------------------------------------------------------------*/
+SELECT
+    ce.entity_type,
+    COALESCE(qa.question_id, te.tag_id)               AS entity_id,
+    COALESCE(qa.title, te.TagName)                    AS name,
+    CASE
+        WHEN ce.entity_type = 'question' THEN
+            CONCAT('Score: ', qa.q_score,
+                   ', Views: ', qa.ViewCount,
+                   ', Tags: [', qa.tag_list, ']')
+        ELSE
+            CONCAT('Uses: ', te.tag_use_cnt,
+                   ', Fraction: ', ROUND(te.usage_fraction,4),
+                   CASE WHEN te.IsModeratorOnly = 1 THEN ', Mod‑Only' ELSE '' END)
+    END                                               AS description,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.gold_badge_cnt,
+    ua.silver_badge_cnt,
+    ua.bronze_badge_cnt,
+    pv.upvote_cnt,
+    pv.downvote_cnt,
+    pv.daily_upvote_rank,
+    lh.PostHistoryTypeId,
+    lh.Comment                                      AS last_hist_comment,
+    CASE
+        WHEN ua.last_access < CURRENT_DATE - INTERVAL '30 days' THEN 'inactive'
+        ELSE 'active'
+    END                                             AS activity_status,
+    ROW_NUMBER() OVER (PARTITION BY ce.entity_type ORDER BY
+        CASE WHEN ce.entity_type = 'question' THEN qa.q_score END DESC,
+        CASE WHEN ce.entity_type = 'tag'      THEN te.tag_use_cnt END DESC
+    )                                               AS rank_within_type
+FROM combined_entities ce
+LEFT JOIN question_metrics qa      ON ce.entity_type = 'question' AND qa.question_id = ce.entity_id
+LEFT JOIN Tags te                  ON ce.entity_type = 'tag'      AND te.Id        = ce.entity_id
+LEFT JOIN user_agg ua
+    ON (CASE WHEN ce.entity_type = 'question' THEN qa.question_id
+              WHEN ce.entity_type = 'tag'      THEN NULL END) IS NOT NULL
+       AND ua.user_id = (
+           SELECT OwnerUserId
+           FROM Posts p
+           WHERE p.Id = qa.question_id
+       )
+LEFT JOIN post_vote_rank pv
+    ON pv.PostId = qa.question_id
+LEFT JOIN latest_history lh
+    ON lh.PostId = qa.question_id
+WHERE
+    /* Complex predicate mixing NULL‑logic, string functions and dates */
+    (ua.Reputation IS NOT NULL AND ua.Reputation > 1000)
+    AND (pv.upvote_cnt IS NULL OR pv.upvote_cnt >= 5)
+    AND (lh.PostHistoryTypeId IS NULL OR lh.PostHistoryTypeId NOT IN (12,13))   -- exclude deleted/undeleted
+ORDER BY ce.entity_type, rank_within_type
+LIMIT 200;

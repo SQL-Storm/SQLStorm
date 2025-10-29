@@ -1,0 +1,145 @@
+WITH recent_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.CommentCount,
+    p.AnswerCount,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND (p.DeletionDate IS NULL OR p.DeletionDate IS DISTINCT FROM TRUE)
+),
+top_contributors AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.ProfileImageUrl,
+    u.EmailHash,
+    u.AccountId,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.CreationDate) AS rn
+  FROM Users u
+  WHERE u.Reputation IS NOT NULL
+),
+tag_stats AS (
+  SELECT
+    t.TagName,
+    t.Count AS TagCount,
+    AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL) AS AvgQuestionScore,
+    AVG(p.ViewCount) AS AvgViewCount
+  FROM Tags t
+  LEFT JOIN Posts p ON p.Id = t.ExcerptPostId
+  WHERE t.IsModeratorOnly = 0 OR t.IsModeratorOnly IS NULL
+  GROUP BY t.TagName, t.Count
+),
+complex_posts AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.CommentCount,
+    p.AnswerCount,
+    p.OwnerUserId,
+    COALESCE(u.DisplayName, p.OwnerDisplayName) AS DisplayName,
+    (COALESCE(p.ViewCount,0) * 0.5 + COALESCE(p.CommentCount,0) * 3 + COALESCE(p.AnswerCount,0) * 5) AS EngagementScore,
+    CASE
+      WHEN p.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '90' DAY) THEN 1
+      WHEN (COALESCE(p.ViewCount,0) > 1000 AND COALESCE(p.Score,0) > 5) THEN 1
+      ELSE 0
+    END AS RecentOrHighEngagement
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId = 1
+    AND p.ClosedDate IS NULL
+    AND p.CommunityOwnedDate IS NULL
+),
+cte_with_window AS (
+  SELECT
+    cp.Id,
+    cp.Title,
+    cp.Tags,
+    cp.CreationDate,
+    cp.LastActivityDate,
+    cp.Score,
+    cp.ViewCount,
+    cp.CommentCount,
+    cp.AnswerCount,
+    cp.OwnerUserId,
+    cp.DisplayName,
+    cp.EngagementScore,
+    cp.RecentOrHighEngagement,
+    SUM(cp.RecentOrHighEngagement) OVER (PARTITION BY cp.OwnerUserId ORDER BY cp.CreationDate ROWS BETWEEN 29 PRECEDING AND CURRENT ROW) AS RollingFlag,
+    AVG(cp.EngagementScore) OVER (PARTITION BY cp.OwnerUserId) AS AvgEngagementByAuthor
+  FROM complex_posts cp
+)
+SELECT
+  rp.PostId,
+  rp.Title,
+  rp.Tags,
+  rp.CreationDate,
+  w.LastActivityDate,
+  w.Score,
+  w.ViewCount,
+  w.CommentCount,
+  w.AnswerCount,
+  w.DisplayName,
+  w.EngagementScore,
+  w.RecentOrHighEngagement,
+  w.RollingFlag,
+  w.AvgEngagementByAuthor,
+  tc.TagName,
+  tc.TagCount,
+  tc.AvgQuestionScore,
+  tc.AvgViewCount,
+  tu.UserId AS TopContributorUserId,
+  tu.DisplayName AS TopContributorDisplayName,
+  tu.Reputation AS TopContributorReputation
+FROM cte_with_window w
+LEFT JOIN recent_questions rp ON rp.PostId = w.Id
+LEFT JOIN top_contributors tu ON tu.UserId = w.OwnerUserId
+LEFT JOIN tag_stats tc ON tc.TagName = ANY(string_to_array(SUBSTR(w.Tags, 2, LENGTH(w.Tags) - 2), '><'))
+WHERE
+  w.RecentOrHighEngagement = 1
+  AND w.RollingFlag > 0
+GROUP BY
+  rp.PostId,
+  rp.Title,
+  rp.Tags,
+  rp.CreationDate,
+  w.LastActivityDate,
+  w.Score,
+  w.ViewCount,
+  w.CommentCount,
+  w.AnswerCount,
+  w.DisplayName,
+  w.EngagementScore,
+  w.RecentOrHighEngagement,
+  w.RollingFlag,
+  w.AvgEngagementByAuthor,
+  tc.TagName,
+  tc.TagCount,
+  tc.AvgQuestionScore,
+  tc.AvgViewCount,
+  tu.UserId,
+  tu.DisplayName,
+  tu.Reputation,
+  w.Id,
+  w.OwnerUserId
+ORDER BY w.AvgEngagementByAuthor DESC, w.EngagementScore DESC
+LIMIT 100;

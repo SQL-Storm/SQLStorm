@@ -1,0 +1,338 @@
+-- {"query": "1029.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 4033} 
+
+WITH UserStats AS (
+    -- Aggregates user-level statistics including post counts, comment counts, badge counts, and reputation metrics.
+    -- Uses COALESCE for AVG(Post.Score) to handle users without posts gracefully.
+    -- Calculates DaysSinceLastAccess using date arithmetic.
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS QuestionsCount,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS AnswersCount,
+        COUNT(DISTINCT C.Id) AS CommentsCount,
+        COUNT(DISTINCT B.Id) AS BadgesCount,
+        AVG(COALESCE(P.Score, 0)) AS AvgPostScore,
+        SUM(COALESCE(P.ViewCount, 0)) AS TotalPostViews,
+        MAX(P.LastActivityDate) AS LastPostActivity,
+        DATE_PART('day', NOW() - U.LastAccessDate) AS DaysSinceLastAccess
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate
+),
+PostDetailedMetrics AS (
+    -- Computes detailed metrics for each post, focusing on Questions (PostTypeId = 1) and Answers (PostTypeId = 2).
+    -- Includes body/title length, tag count, answer/comment counts, and favorite count.
+    -- Uses correlated subqueries to find the last upvote date and total bounty amount for a post.
+    -- Employs CASE WHEN for boolean flags like IsClosed and IsCommunityOwned.
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        COALESCE(P.ViewCount, 0) AS PostViewCount,
+        LENGTH(P.Body) AS BodyLength,
+        LENGTH(P.Title) AS TitleLength,
+        COALESCE(ARRAY_LENGTH(string_to_array(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags) - 2), '><'), 1), 0) AS TagCount,
+        COALESCE(P.AnswerCount, 0) AS AnswerCount,
+        COALESCE(P.CommentCount, 0) AS CommentCount,
+        COALESCE(P.FavoriteCount, 0) AS FavoriteCount,
+        P.AcceptedAnswerId,
+        P.LastEditDate,
+        P.LastActivityDate,
+        (CASE WHEN P.ClosedDate IS NOT NULL THEN TRUE ELSE FALSE END) AS IsClosed,
+        P.ClosedDate,
+        (CASE WHEN P.CommunityOwnedDate IS NOT NULL THEN TRUE ELSE FALSE END) AS IsCommunityOwned,
+        DATE_PART('day', NOW() - P.CreationDate) AS DaysOld,
+        (SELECT MAX(V.CreationDate) FROM Votes V WHERE V.PostId = P.Id AND V.VoteTypeId = 2) AS LastUpvoteDate,
+        (SELECT SUM(V.BountyAmount) FROM Votes V WHERE V.PostId = P.Id AND V.VoteTypeId = 8) AS TotalBountyAmount
+    FROM Posts P
+    WHERE P.PostTypeId IN (1, 2)
+),
+PostHistoryTimeDiffs AS (
+    -- Analyzes post history to calculate the average time between history events and the count of actual edits.
+    -- Uses the LAG window function to compare consecutive history event timestamps for each post.
+    SELECT
+        PostId,
+        AVG(DATE_PART('hour', CurrentHistoryDate - PreviousHistoryDate)) AS AvgHoursBetweenHistoryEvents,
+        SUM(CASE WHEN PostHistoryTypeId IN (4,5,6) AND PreviousHistoryDate IS NOT NULL THEN 1 ELSE 0 END) AS ActualEditCount
+    FROM (
+        SELECT
+            PH.PostId,
+            PH.CreationDate AS CurrentHistoryDate,
+            LAG(PH.CreationDate, 1, PH.CreationDate) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) AS PreviousHistoryDate,
+            PH.PostHistoryTypeId
+        FROM PostHistory PH
+    ) AS LaggedHistory
+    WHERE PreviousHistoryDate != CurrentHistoryDate AND CurrentHistoryDate > PreviousHistoryDate -- Ensure actual time difference
+    GROUP BY PostId
+),
+TagEngagementStats AS (
+    -- Calculates aggregate statistics for tags, such as tagged post count, average score, and average views.
+    -- Utilizes LATERAL UNNEST and string_to_array for robust tag parsing (PostgreSQL specific).
+    SELECT
+        T.TagName,
+        COUNT(DISTINCT P.Id) AS TaggedPostsCount,
+        AVG(COALESCE(P.Score, 0)) AS AvgScoreForTag,
+        AVG(COALESCE(P.ViewCount, 0)) AS AvgViewsForTag,
+        MAX(P.CreationDate) AS LastTagPostCreationDate
+    FROM Posts P
+    JOIN LATERAL UNNEST(string_to_array(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags) - 2), '><')) AS ExtractedTag ON TRUE
+    JOIN Tags T ON ExtractedTag = T.TagName
+    WHERE P.PostTypeId = 1 -- Tags are primarily on questions
+    GROUP BY T.TagName
+),
+CombinedPostUserMetrics AS (
+    -- Joins post-level metrics with user-level statistics.
+    -- Calculates a ratio of answers to comments, handling division by zero with NULLIF.
+    -- Uses another correlated subquery to find the maximum comment score by the post owner within a specific time frame.
+    SELECT
+        PDM.PostId,
+        PDM.PostTypeId,
+        PDM.PostScore,
+        PDM.PostViewCount,
+        PDM.BodyLength,
+        PDM.TitleLength,
+        PDM.TagCount,
+        PDM.AnswerCount,
+        PDM.CommentCount,
+        PDM.FavoriteCount,
+        PDM.AcceptedAnswerId,
+        PDM.DaysOld,
+        PDM.LastEditDate,
+        PDM.LastActivityDate,
+        PDM.IsClosed,
+        PDM.ClosedDate,
+        PDM.IsCommunityOwned,
+        PDM.LastUpvoteDate,
+        PDM.TotalBountyAmount,
+        US.UserId,
+        US.DisplayName AS OwnerDisplayName,
+        US.Reputation AS OwnerReputation,
+        US.QuestionsCount AS OwnerQuestionsCount,
+        US.AnswersCount AS OwnerAnswersCount,
+        US.CommentsCount AS OwnerCommentsCount,
+        US.BadgesCount AS OwnerBadgesCount,
+        US.DaysSinceLastAccess AS OwnerDaysSinceLastAccess,
+        (PDM.AnswerCount * 1.0 / NULLIF(PDM.CommentCount, 0)) AS AnswerCommentRatio,
+        (
+            SELECT MAX(C.Score)
+            FROM Comments C
+            WHERE C.PostId = PDM.PostId
+              AND C.UserId = PDM.OwnerUserId
+              AND C.CreationDate BETWEEN PDM.PostCreationDate AND PDM.LastActivityDate
+        ) AS OwnerMaxCommentScore
+    FROM PostDetailedMetrics PDM
+    LEFT JOIN UserStats US ON PDM.OwnerUserId = US.UserId
+),
+FinalCombinedData AS (
+    -- Further joins the combined post/user data with post history and tag statistics.
+    -- Includes additional correlated subqueries for linked/duplicated posts counts.
+    -- Calculates "EngagementScore" and "OwnerInfluenceScore" as complex weighted sums.
+    -- Extracts the first character of the owner's display name and modifies it with string functions.
+    -- Fetches an initial post body sample using a correlated subquery.
+    SELECT
+        CPM.PostId,
+        CPM.PostTypeId,
+        CPM.PostScore,
+        CPM.PostViewCount,
+        CPM.BodyLength,
+        CPM.TitleLength,
+        CPM.TagCount,
+        CPM.AnswerCount,
+        CPM.CommentCount,
+        CPM.FavoriteCount,
+        CPM.AcceptedAnswerId,
+        CPM.DaysOld,
+        CPM.LastEditDate,
+        CPM.LastActivityDate,
+        CPM.IsClosed,
+        CPM.ClosedDate,
+        CPM.IsCommunityOwned,
+        CPM.LastUpvoteDate,
+        CPM.TotalBountyAmount,
+        CPM.UserId,
+        CPM.OwnerDisplayName,
+        CPM.OwnerReputation,
+        CPM.OwnerQuestionsCount,
+        CPM.OwnerAnswersCount,
+        CPM.OwnerCommentsCount,
+        CPM.OwnerBadgesCount,
+        CPM.OwnerDaysSinceLastAccess,
+        CPM.AnswerCommentRatio,
+        CPM.OwnerMaxCommentScore,
+        PHTD.AvgHoursBetweenHistoryEvents,
+        PHTD.ActualEditCount,
+        T.TagName,
+        TES.AvgScoreForTag,
+        TES.AvgViewsForTag,
+        TES.TaggedPostsCount,
+        (CASE WHEN CPM.LastEditDate IS NOT NULL THEN DATE_PART('day', NOW() - CPM.LastEditDate) ELSE NULL END) AS DaysSinceLastEdit,
+        (
+            SELECT COUNT(PL.Id)
+            FROM PostLinks PL
+            WHERE PL.PostId = CPM.PostId AND PL.LinkTypeId = 1
+        ) AS LinkedPostsCount,
+        (
+            SELECT COUNT(PL.Id)
+            FROM PostLinks PL
+            WHERE PL.RelatedPostId = CPM.PostId AND PL.LinkTypeId = 3
+        ) AS DuplicatedByCount,
+        COALESCE(UPPER(SUBSTRING(CPM.OwnerDisplayName, 1, 1)), 'N/A') AS FirstCharOfOwnerDisplayName,
+        (CPM.PostScore * 0.4 + CPM.FavoriteCount * 0.3 + CPM.AnswerCount * 0.2 + CPM.CommentCount * 0.1) AS EngagementScore,
+        (CPM.OwnerReputation * 0.6 + CPM.OwnerBadgesCount * 0.4) AS OwnerInfluenceScore,
+        (
+            SELECT PH.Text
+            FROM PostHistory PH
+            WHERE PH.PostId = CPM.PostId AND PH.PostHistoryTypeId = 2 -- Initial Body
+            ORDER BY PH.CreationDate ASC
+            LIMIT 1
+        ) AS InitialPostBodySample
+    FROM CombinedPostUserMetrics CPM
+    LEFT JOIN PostHistoryTimeDiffs PHTD ON CPM.PostId = PHTD.PostId
+    LEFT JOIN Posts P_Tags ON CPM.PostId = P_Tags.Id AND P_Tags.PostTypeId = 1 -- Re-join Posts to get Tags field for unnesting
+    LEFT JOIN LATERAL UNNEST(string_to_array(SUBSTRING(P_Tags.Tags FROM 2 FOR LENGTH(P_Tags.Tags) - 2), '><')) AS ExtractedTag ON TRUE
+    LEFT JOIN Tags T ON ExtractedTag = T.TagName
+    LEFT JOIN TagEngagementStats TES ON T.TagName = TES.TagName
+    WHERE CPM.PostTypeId = 1 -- Focus on questions for the final tag-centric analysis
+)
+, RankedPosts AS (
+    -- Applies window functions for ranking posts based on engagement and owner influence.
+    -- RANK() partitions by TagName, while NTILE divides users into quintiles based on influence.
+    -- Includes complex string manipulation on OwnerDisplayName.
+    SELECT
+        FCD.PostId,
+        FCD.OwnerDisplayName,
+        FCD.OwnerReputation,
+        FCD.PostScore,
+        FCD.PostViewCount,
+        FCD.BodyLength,
+        FCD.TitleLength,
+        FCD.TagCount,
+        FCD.AnswerCount,
+        FCD.CommentCount,
+        FCD.FavoriteCount,
+        FCD.DaysOld,
+        FCD.IsClosed,
+        FCD.DaysSinceLastEdit,
+        FCD.ActualEditCount,
+        FCD.AvgHoursBetweenHistoryEvents,
+        FCD.LinkedPostsCount,
+        FCD.DuplicatedByCount,
+        FCD.TagName,
+        FCD.AvgScoreForTag,
+        FCD.EngagementScore,
+        FCD.OwnerInfluenceScore,
+        FCD.InitialPostBodySample,
+        RANK() OVER (PARTITION BY FCD.TagName ORDER BY FCD.EngagementScore DESC, FCD.PostViewCount DESC) AS TagEngagementRank,
+        NTILE(5) OVER (ORDER BY FCD.OwnerInfluenceScore DESC, FCD.DaysSinceLastAccess ASC) AS OwnerInfluenceQuintile,
+        COALESCE(REPLACE(REPLACE(LOWER(TRIM(SUBSTRING(FCD.OwnerDisplayName, 1, 10))), 'a', '@'), 'e', '3'), 'no_name') AS ModifiedOwnerIdString,
+        FCD.ClosedDate
+    FROM FinalCombinedData FCD
+)
+-- UNION ALL operator to combine two distinct sets of highly filtered results.
+-- The first set identifies high-engagement posts by influential users with specific badge criteria.
+SELECT
+    RP.PostId,
+    RP.OwnerDisplayName,
+    RP.OwnerReputation,
+    RP.PostScore,
+    RP.PostViewCount,
+    RP.BodyLength,
+    RP.TitleLength,
+    RP.TagCount,
+    RP.AnswerCount,
+    RP.CommentCount,
+    RP.FavoriteCount,
+    RP.DaysOld,
+    'HighEngagement_HighRepUser' AS Category,
+    RP.DaysSinceLastEdit,
+    RP.ActualEditCount,
+    RP.AvgHoursBetweenHistoryEvents,
+    RP.LinkedPostsCount,
+    RP.DuplicatedByCount,
+    RP.TagName,
+    RP.AvgScoreForTag,
+    RP.EngagementScore,
+    RP.OwnerInfluenceScore,
+    RP.TagEngagementRank,
+    RP.OwnerInfluenceQuintile,
+    RP.ModifiedOwnerIdString,
+    RP.InitialPostBodySample
+FROM RankedPosts RP
+WHERE
+    RP.OwnerReputation >= 5000
+    AND RP.EngagementScore >= 10
+    AND RP.TagEngagementRank <= 100
+    AND RP.OwnerInfluenceQuintile <= 2
+    AND RP.DaysOld < 1000
+    AND RP.IsClosed = FALSE AND RP.ClosedDate IS NULL -- Demonstrates NULL logic combined with boolean
+    AND RP.InitialPostBodySample IS NOT NULL AND LENGTH(RP.InitialPostBodySample) > 200
+    AND EXISTS (
+        SELECT 1
+        FROM Badges B
+        WHERE B.UserId = RP.UserId AND B.Class = 1 -- Gold Badge owners
+        AND B.Date < (NOW() - INTERVAL '1 year') -- Gold badge held for at least a year
+    )
+UNION ALL
+-- The second set identifies posts with complex edit histories, specific tags, and duplicate links, ensuring
+-- they are not part of the first set using a NOT EXISTS anti-join.
+SELECT
+    RP.PostId,
+    RP.OwnerDisplayName,
+    RP.OwnerReputation,
+    RP.PostScore,
+    RP.PostViewCount,
+    RP.BodyLength,
+    RP.TitleLength,
+    RP.TagCount,
+    RP.AnswerCount,
+    RP.CommentCount,
+    RP.FavoriteCount,
+    RP.DaysOld,
+    'ComplexHistory_SpecificTag' AS Category,
+    RP.DaysSinceLastEdit,
+    RP.ActualEditCount,
+    RP.AvgHoursBetweenHistoryEvents,
+    RP.LinkedPostsCount,
+    RP.DuplicatedByCount,
+    RP.TagName,
+    RP.AvgScoreForTag,
+    RP.EngagementScore,
+    RP.OwnerInfluenceScore,
+    RP.TagEngagementRank,
+    RP.OwnerInfluenceQuintile,
+    RP.ModifiedOwnerIdString,
+    RP.InitialPostBodySample
+FROM RankedPosts RP
+WHERE
+    RP.ActualEditCount >= 3
+    AND RP.AvgHoursBetweenHistoryEvents IS NOT NULL AND RP.AvgHoursBetweenHistoryEvents < 168 -- Avg edit time within a week
+    AND RP.DuplicatedByCount >= 1
+    AND (RP.TagName LIKE '%sql%' OR RP.TagName LIKE '%query%' OR RP.TagName LIKE '%database%') -- String pattern matching
+    AND (RP.BodyLength > 500 OR RP.TitleLength > 100)
+    AND RP.PostScore < 10 -- Filters for posts not necessarily highly upvoted
+    AND RP.FavoriteCount < 5 -- Filters for posts not necessarily highly favorited
+    AND NOT EXISTS ( -- Anti-join to ensure results are distinct from the first UNION ALL part
+        SELECT 1
+        FROM RankedPosts RP_A
+        WHERE RP_A.PostId = RP.PostId
+          AND RP_A.OwnerReputation >= 5000
+          AND RP_A.EngagementScore >= 10
+          AND RP_A.TagEngagementRank <= 100
+          AND RP_A.OwnerInfluenceQuintile <= 2
+          AND RP_A.DaysOld < 1000
+          AND RP_A.IsClosed = FALSE AND RP_A.ClosedDate IS NULL
+          AND RP_A.InitialPostBodySample IS NOT NULL AND LENGTH(RP_A.InitialPostBodySample) > 200
+          AND EXISTS (
+              SELECT 1 FROM Badges B WHERE B.UserId = RP_A.UserId AND B.Class = 1 AND B.Date < (NOW() - INTERVAL '1 year')
+          )
+    )
+ORDER BY
+    Category DESC, PostScore DESC, PostId
+LIMIT 10000;

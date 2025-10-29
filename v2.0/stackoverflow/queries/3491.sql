@@ -1,0 +1,122 @@
+WITH user_stats AS (
+    SELECT u.Id                                     AS user_id,
+           u.Reputation,
+           u.CreationDate,
+           u.DisplayName,
+           COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1)               AS question_cnt,
+           COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2)               AS answer_cnt,
+           SUM(p.Score) FILTER (WHERE p.PostTypeId = 1)              AS question_score_sum,
+           SUM(p.Score) FILTER (WHERE p.PostTypeId = 2)              AS answer_score_sum,
+           MAX(p.CreationDate)                                      AS last_post_dt,
+           COALESCE(SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END),0) AS has_accepted_answers
+    FROM   Users u
+    LEFT JOIN Posts p
+           ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.Reputation, u.CreationDate, u.DisplayName
+),
+badge_stats AS (
+    SELECT b.UserId,
+           COUNT(*)                                            AS total_badges,
+           SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END)        AS gold_badges,
+           SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END)        AS silver_badges,
+           SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END)        AS bronze_badges,
+           COUNT(*) FILTER (WHERE b.TagBased = TRUE)           AS tag_based_badges
+    FROM   Badges b
+    GROUP BY b.UserId
+),
+vote_stats AS (
+    SELECT v.PostId,
+           SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END)         AS up_votes,
+           SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END)         AS down_votes,
+           COUNT(*) FILTER (WHERE vt.Id IN (2,3))              AS total_votes
+    FROM   Votes v
+    JOIN   VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY v.PostId
+),
+tag_explode AS (
+    SELECT p.Id                                               AS post_id,
+           UNNEST(string_to_array(SUBSTR(p.Tags,2,CHAR_LENGTH(p.Tags)-2), '><')) AS tag
+    FROM   Posts p
+    WHERE  p.PostTypeId = 1
+      AND  p.Tags IS NOT NULL
+),
+tag_stats AS (
+    SELECT te.tag,
+           COUNT(DISTINCT te.post_id)                         AS num_questions,
+           AVG(COALESCE(p.Score,0))                           AS avg_score
+    FROM   tag_explode te
+    JOIN   Posts p ON p.Id = te.post_id
+    GROUP BY te.tag
+),
+recent_activity AS (
+    SELECT u.Id                                                AS user_id,
+           GREATEST(
+               COALESCE(u.LastAccessDate,      TIMESTAMP '1970-01-01'),
+               COALESCE(MAX(p.LastActivityDate),TIMESTAMP '1970-01-01'),
+               COALESCE(MAX(c.CreationDate),   TIMESTAMP '1970-01-01')
+           )                                                  AS last_activity_dt
+    FROM   Users u
+    LEFT JOIN Posts    p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    GROUP BY u.Id, u.LastAccessDate
+),
+combined AS (
+    SELECT us.user_id,
+           us.DisplayName,
+           us.Reputation,
+           us.question_cnt,
+           us.answer_cnt,
+           us.question_score_sum,
+           us.answer_score_sum,
+           us.last_post_dt,
+           COALESCE(bs.total_badges,0)                         AS total_badges,
+           COALESCE(bs.gold_badges,0)                          AS gold_badges,
+           COALESCE(bs.silver_badges,0)                        AS silver_badges,
+           COALESCE(bs.bronze_badges,0)                        AS bronze_badges,
+           COALESCE(bs.tag_based_badges,0)                     AS tag_based_badges,
+           ra.last_activity_dt,
+           CASE WHEN us.answer_cnt = 0 THEN NULL
+                ELSE ROUND(CAST(us.answer_score_sum AS NUMERIC) / us.answer_cnt,2)
+           END                                                AS avg_answer_score,
+           CASE WHEN us.question_cnt = 0 THEN NULL
+                ELSE ROUND(CAST(us.question_score_sum AS NUMERIC) / us.question_cnt,2)
+           END                                                AS avg_question_score,
+           ROW_NUMBER() OVER (ORDER BY us.Reputation DESC)    AS rep_rank,
+           RANK()       OVER (ORDER BY (us.answer_score_sum + us.question_score_sum) DESC) AS score_rank
+    FROM   user_stats       us
+    LEFT JOIN badge_stats   bs ON bs.UserId = us.user_id
+    LEFT JOIN recent_activity ra ON ra.user_id = us.user_id
+)
+SELECT *
+FROM   combined
+WHERE  (rep_rank <= 1000 OR total_badges >= 10)
+  AND  (avg_answer_score IS NOT NULL AND avg_answer_score > 5)
+  AND  (DisplayName IS NOT NULL AND DisplayName <> '')
+  AND  EXISTS (
+        SELECT 1
+        FROM   Posts p
+        WHERE  p.OwnerUserId = combined.user_id
+          AND  p.CreationDate > (CAST('2024-10-01' AS DATE) - INTERVAL '30' DAY)
+          AND  p.Score > 10
+       )
+UNION ALL
+SELECT CAST(NULL AS INTEGER)            AS user_id,
+       CAST('Summary' AS VARCHAR)        AS DisplayName,
+       CAST(NULL AS INTEGER)            AS Reputation,
+       CAST(NULL AS INTEGER)            AS question_cnt,
+       CAST(NULL AS INTEGER)            AS answer_cnt,
+       CAST(NULL AS INTEGER)            AS question_score_sum,
+       CAST(NULL AS INTEGER)            AS answer_score_sum,
+       CAST(NULL AS TIMESTAMP)          AS last_post_dt,
+       (SELECT COUNT(*) FROM Users)                         AS total_badges,
+       (SELECT COUNT(*) FROM Badges WHERE Class = 1)        AS gold_badges,
+       (SELECT COUNT(*) FROM Badges WHERE Class = 2)        AS silver_badges,
+       (SELECT COUNT(*) FROM Badges WHERE Class = 3)        AS bronze_badges,
+       (SELECT COUNT(*) FROM Badges WHERE TagBased = TRUE)  AS tag_based_badges,
+       CAST(NULL AS TIMESTAMP)          AS last_activity_dt,
+       CAST(NULL AS NUMERIC)            AS avg_answer_score,
+       CAST(NULL AS NUMERIC)            AS avg_question_score,
+       CAST(NULL AS INTEGER)            AS rep_rank,
+       CAST(NULL AS INTEGER)            AS score_rank
+ORDER BY Reputation DESC NULLS LAST
+LIMIT 1010;

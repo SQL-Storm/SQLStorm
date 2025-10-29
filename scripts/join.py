@@ -30,45 +30,101 @@ def extract_ius(expression):
 
 
 def extract_iu(expression):
-    if expression["expression"] == "iuref":
-        return expression["iu"]
-    elif expression["expression"] in ["cast", "lower", "upper"]:
-        return extract_iu(expression["input"])
-    elif expression["expression"] in ["coalesce"]:
-        return extract_iu(expression["values"][0])
-    elif expression["expression"] in ["concat", "stringconcat", "trimboth"]:
-        iu = None
-        for input in expression["input"]:
-            i = extract_iu(input)
-            if i is not None:
-                if iu is not None:
-                    return None
-                iu = i
-        return iu
-    elif expression["expression"] in ["const", "div", "searchedcase", "round2", "add", "sub", "nullif", "arraylength", "simplecase", "charlength", "accesstext"]:
+    CONST = "__CONST__"
+    exp = expression["expression"]
+
+    def extract_const(ius):
+        if all(iu == CONST or iu is None for iu in ius):
+            return CONST
         return None
-    else:
-        log.print("extract_ui: ", expression)
+
+    def extract_computation(ius):
+        if all(iu == CONST for iu in ius):
+            return CONST
+        ius = [iu for iu in ius if iu is not CONST]
+        return ius[0] if len(ius) == 1 else None
+
+    def extract_first(ius):
+        if all(iu == CONST for iu in ius[1:]):
+            return ius[0]
         return None
+
+    try:
+        if exp == "iuref":
+            return expression["iu"]
+
+        elif exp in ["cast", "lower", "upper", "floor", "abs", "extractepoch", "extractyear", "extractmonth", "extractday", "extracthour"]:
+            return extract_iu(expression["input"])
+
+        elif exp in ["coalesce"]:
+            return extract_first([extract_iu(input) for input in expression["values"]])
+
+        elif exp in [
+            "regexp_replace", "replace",
+            "substring", "regexp_substr", "left",
+            "stringToArray", "regexp_split_to_array", "split_part", "arrayslice", "arrayremove", "arrayToString",
+        ]:
+            return extract_first([extract_iu(input) for input in expression["input"]])
+
+        elif exp in ["concat", "concat_ws", "stringconcat", "trimboth", "datetrunc", "datepart", "arrayaccess", "arraybuild", "arrayappend"]:
+            return extract_computation([extract_iu(input) for input in expression["input"]])
+
+        elif exp in ["and", "or"]:
+            return extract_const([extract_iu(input) for input in expression["input"]])
+        elif exp in ["add", "sub", "mul", "age", "div", "rem", "round2", "and", "or", "pow"]:
+            return extract_const([extract_iu(expression["left"]), extract_iu(expression["right"])])
+        elif exp in ["log", "log10", "exp", "sqrt", "not", "neg", "round"]:
+            return extract_const([extract_iu(expression["input"])])
+
+        elif exp in ["const", "arraylength", "charlength", "cardinality", "position"]:
+            return CONST
+
+        elif exp in ["compare", "beetween", "like", "ilike", "contains", "and", "or", "isnotnull", "isnull", "regex", "startswith"]:
+            return CONST
+
+        elif exp in ["reverse", "to_timestamp",
+                     "searchedcase",  "nullif", "simplecase", "accesstext", "between", "greatestleast", "lpad",
+                     "error"
+                     ]:
+            return None
+        else:
+            log.print("extract_ui: ", expression)
+            return None
+    except Exception as e:
+        log.print(expression)
+        raise e
 
 
 def extract_equalities(expression):
     left = []
     right = []
+    exp = expression["expression"]
 
-    if expression["expression"] == "compare" and expression["direction"] in ["=", "is"]:
+    if (exp == "compare" and expression["direction"] in ["=", "is"]) \
+            or exp in ["arrayoverlap"]:
         left.append(extract_iu(expression["left"]))
         right.append(extract_iu(expression["right"]))
-    elif expression["expression"] == "and":
+
+    elif exp in ["and"]:
         for input in expression["input"]:
             left_ius, right_ius = extract_equalities(input)
             left.extend(left_ius)
             right.extend(right_ius)
-    elif expression["expression"] in ["like", "contains", "ilike"]:
+
+    elif exp in ["like", "contains", "ilike", "startswith"]:
         left.append(extract_iu(expression["input"][0]))
         right.append(extract_iu(expression["input"][1]))
-    elif expression["expression"] in ["const", "or", "compare"]:
+
+    elif exp in ["const", "iuref", "or", "compare", "isnotnull", "isnull", "quantified", "in", "regex", "not", "searchedcase"]:
         return [], []
+
+    elif exp in ["between"]:
+        ius = [extract_iu(input) for input in expression["input"]]
+        if ius[1] != ius[2]:
+            return [], []
+        else:
+            return [ius[0]], [ius[1]]
+
     else:
         log.print("extract_equalities: ", expression)
 
@@ -105,9 +161,9 @@ def check_join(schema, left, right, ius_left, ius_right):
                 if fk["column"] == column_right["column"] and fk["foreign table"] == column_left["table"] and fk["foreign column"] == column_left["column"]:
                     return True
 
-    log.print(f"Join {left} {right} not a correct join edge")
-    log.print(f"  Left: {[ius_left.get(l) for l in left]}")
-    log.print(f"  Right: {[ius_right.get(r) for r in right]}")
+    log.print_verbose(f"Join {left} {right} not a correct join edge")
+    log.print_verbose(f"  Left: {[ius_left.get(l) for l in left]}")
+    log.print_verbose(f"  Right: {[ius_right.get(r) for r in right]}")
 
     return False
 
@@ -124,7 +180,7 @@ def check_join_with_arrayunnest(left, right, ius_left, ius_right):
             if column_left == column_right:
                 return True
 
-    log.print(f"ArrayUnnest Join {left} {right} not a correct join edge")
+    log.print_verbose(f"ArrayUnnest Join {left} {right} not a correct join edge")
     return False
 
 
@@ -147,6 +203,7 @@ def map_groupby_aggregates(aggregates, values, ius, child_ius):
 
 def load_system_representation(plan: dict):
     raw = json.loads(plan["_attrs"]["system_representation"])[0]
+
     raw["children"] = []
     for child in plan["_children"]:
         child_raw = load_system_representation(child)
@@ -206,24 +263,17 @@ def analyze_joins(plan: dict, schema: dict, ius: dict, plan_map: dict) -> bool:
 
             case "GroupJoin":
                 assert len(iu_list) == 2
-                correct_join = None
+                assert (len(raw["keyLeft"]) == len(raw["keyRight"]))
 
-                if len(raw["keyLeft"]) == 1:
-                    assert len(raw["keyRight"]) == 1
-
-                    left = extract_keys(raw["keyLeft"], raw["valuesLeft"])
-                    right = extract_keys(raw["keyRight"], raw["valuesRight"])
-                    correct_join = check_join(schema, left, right, iu_list[0], iu_list[1])
+                left = extract_keys(raw["keyLeft"], raw["valuesLeft"])
+                right = extract_keys(raw["keyRight"], raw["valuesRight"])
+                correct_join = check_join(schema, left, right, iu_list[0], iu_list[1])
 
                 map_groupby_keys(raw["keyLeft"], raw["valuesLeft"], ius, iu_list[0])
                 map_groupby_keys(raw["keyRight"], raw["valuesRight"], ius, iu_list[1])
                 map_groupby_aggregates(raw["aggregatesLeft"], raw["valuesLeft"], ius, iu_list[0])
                 map_groupby_aggregates(raw["aggregatesRight"], raw["valuesRight"], ius, iu_list[1])
                 iu_list = []
-
-                if correct_join is None:
-                    correct_join = False
-                    log.print(raw)
 
             case "PipelineBreakerScan":
                 for o in raw["output"]:
@@ -254,17 +304,30 @@ def analyze_joins(plan: dict, schema: dict, ius: dict, plan_map: dict) -> bool:
                         ius[iu2["iu"]] = iu_list[0][iu]
 
             case "ArrayUnnest":
-                exp_ius = extract_ius(raw["array"])
-                if len(exp_ius) == 1:
-                    iu = exp_ius.pop()
-                    if iu in iu_list[0]:
-                        ius[raw["iu"]] = iu_list[0][iu]
+                if "values" in raw:
+                    for v in raw["values"]:
+                        iu = extract_iu(v["exp"])
+                        if iu is not None and iu in iu_list[0]:
+                            ius[v["iu"]] = iu_list[0][iu]
+                else:
+                    exp_ius = extract_ius(raw["array"] if "array" in raw else raw["values"])
+                    if len(exp_ius) == 1:
+                        iu = exp_ius.pop()
+                        if iu in iu_list[0]:
+                            ius[raw["iu"]] = iu_list[0][iu]
 
             case "RegexSplit":
-                log.print(raw)
+                iu = extract_iu(raw["str"])
+                if iu in iu_list[0]:
+                    ius[raw["iu"]] = iu_list[0][iu]
 
             case "Select" | "Sort" | "ArrayUnnest" | "Window" | "Temp" | "SetOperation" | "InlineTable":
                 pass
+
+            case "CustomOperator":
+                if raw["operator"] not in ["generateseries"]:
+                    log.print(label)
+                    log.print(raw)
 
             case _:
                 log.print(label)
@@ -327,7 +390,7 @@ def analyze(csv_path: str, schema: dict):
                     continue
 
                 correct_join = analyze_plan(row["plan"], schema)
-                log.print(f"{num_queries} {query} -> {correct_join}")
+                log.print_verbose(f"{num_queries} {query} -> {correct_join}")
 
                 if correct_join:
                     correct_joins.append(query)
@@ -383,6 +446,11 @@ def main():
                 "foreign table": "users",
                 "foreign column": "displayname"
             })
+            schema["tags"].append({
+                "column": "tagname",
+                "foreign table": "tags",
+                "foreign column": "tagname"
+            })
             schema["posts"].append({
                 "column": "ownerdisplayname",
                 "foreign table": "users",
@@ -411,6 +479,11 @@ def main():
             schema["posthistory"].append({
                 "column": "comment",
                 "foreign table": "closereasontypes",
+                "foreign column": "id"
+            })
+            schema["votes"].append({
+                "column": "postid",
+                "foreign table": "posts",
                 "foreign column": "id"
             })
 

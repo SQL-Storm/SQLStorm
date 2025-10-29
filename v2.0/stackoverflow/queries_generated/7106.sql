@@ -1,0 +1,494 @@
+-- {"query": "7106.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 4562} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT c.Id) as TotalComments,
+        COUNT(DISTINCT b.Id) as TotalBadges,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        COALESCE(SUM(p.ViewCount), 0) as TotalViews,
+        MAX(p.CreationDate) as LastPostDate,
+        DATEDIFF(CURRENT_TIMESTAMP, MAX(p.CreationDate)) as DaysSinceLastPost,
+        AVG(COALESCE(p.Score, 0)) as AvgPostScore,
+        STRING_AGG(DISTINCT p.Title, ', ') as PostTitles,
+        STRING_AGG(DISTINCT CASE WHEN p.Tags IS NOT NULL THEN SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2) END, ', ') as AllTags,
+        ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) as UserRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        TotalPosts,
+        TotalComments,
+        TotalBadges,
+        QuestionCount,
+        AnswerCount,
+        TotalScore,
+        TotalViews,
+        LastPostDate,
+        DaysSinceLastPost,
+        AvgPostScore,
+        PostTitles,
+        AllTags,
+        UserRank,
+        CASE 
+            WHEN TotalPosts > 100 THEN 'Veteran'
+            WHEN TotalPosts > 50 THEN 'Experienced'
+            WHEN TotalPosts > 10 THEN 'Active'
+            ELSE 'New'
+        END as UserCategory,
+        CASE 
+            WHEN AvgPostScore > 5 THEN 'HighlyRated'
+            WHEN AvgPostScore > 0 THEN 'Neutral'
+            ELSE 'LowRated'
+        END as PerformanceCategory
+    FROM UserActivityStats
+    WHERE TotalPosts > 0
+),
+UserPostAnalysis AS (
+    SELECT 
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.TotalPosts,
+        tu.QuestionCount,
+        tu.AnswerCount,
+        tu.TotalScore,
+        tu.TotalViews,
+        tu.UserCategory,
+        tu.PerformanceCategory,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) * 100.0 / NULLIF(tu.TotalPosts, 0), 0) as QPercentage,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) * 100.0 / NULLIF(tu.TotalPosts, 0), 0) as APercentage,
+        COALESCE(AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END), 0) as AvgQuestionScore,
+        COALESCE(AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE NULL END), 0) as AvgAnswerScore,
+        STRING_AGG(DISTINCT p.Title, '; ') as RecentTitles,
+        DENSE_RANK() OVER (ORDER BY tu.TotalScore DESC) as ScoreRank,
+        DENSE_RANK() OVER (ORDER BY tu.TotalViews DESC) as ViewRank,
+        LAG(tu.TotalScore, 1) OVER (ORDER BY tu.TotalScore DESC) as PrevScore,
+        (tu.TotalScore - LAG(tu.TotalScore, 1) OVER (ORDER BY tu.TotalScore DESC)) as ScoreDifference,
+        ROW_NUMBER() OVER (PARTITION BY tu.UserCategory ORDER BY tu.Reputation DESC) as CategoryRank
+    FROM TopUsers tu
+    LEFT JOIN Posts p ON tu.UserId = p.OwnerUserId
+    WHERE p.CreationDate >= DATEADD(YEAR, -2, CURRENT_TIMESTAMP)
+    GROUP BY tu.UserId, tu.DisplayName, tu.Reputation, tu.TotalPosts, tu.QuestionCount, 
+             tu.AnswerCount, tu.TotalScore, tu.TotalViews, tu.UserCategory, tu.PerformanceCategory
+),
+UserWithBadges AS (
+    SELECT 
+        upa.UserId,
+        upa.DisplayName,
+        upa.Reputation,
+        upa.TotalPosts,
+        upa.QuestionCount,
+        upa.AnswerCount,
+        upa.TotalScore,
+        upa.TotalViews,
+        upa.UserCategory,
+        upa.PerformanceCategory,
+        upa.QPercentage,
+        upa.APercentage,
+        upa.AvgQuestionScore,
+        upa.AvgAnswerScore,
+        upa.RecentTitles,
+        upa.ScoreRank,
+        upa.ViewRank,
+        upa.ScoreDifference,
+        upa.CategoryRank,
+        STRING_AGG(DISTINCT b.Name, ', ') as BadgeNames,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(b.Date) as LastBadgeDate,
+        MIN(b.Date) as FirstBadgeDate,
+        MIN(CASE WHEN b.Class = 1 THEN b.Date END) as FirstGoldBadgeDate,
+        MIN(CASE WHEN b.Class = 2 THEN b.Date END) as FirstSilverBadgeDate,
+        MIN(CASE WHEN b.Class = 3 THEN b.Date END) as FirstBronzeBadgeDate
+    FROM UserPostAnalysis upa
+    LEFT JOIN Badges b ON upa.UserId = b.UserId
+    WHERE b.Date >= DATEADD(YEAR, -3, CURRENT_TIMESTAMP)
+    GROUP BY upa.UserId, upa.DisplayName, upa.Reputation, upa.TotalPosts, upa.QuestionCount, 
+             upa.AnswerCount, upa.TotalScore, upa.TotalViews, upa.UserCategory, upa.PerformanceCategory,
+             upa.QPercentage, upa.APercentage, upa.AvgQuestionScore, upa.AvgAnswerScore, upa.RecentTitles,
+             upa.ScoreRank, upa.ViewRank, upa.ScoreDifference, upa.CategoryRank
+),
+PostPerformanceMetrics AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        COALESCE(p.AnswerCount, 0) as AnswerCount,
+        COALESCE(p.CommentCount, 0) as CommentCount,
+        COALESCE(p.FavoriteCount, 0) as FavoriteCount,
+        CASE 
+            WHEN p.Score >= 100 THEN 'HighlyPopular'
+            WHEN p.Score >= 50 THEN 'Popular'
+            WHEN p.Score >= 10 THEN 'Moderate'
+            ELSE 'Low'
+        END as PopularityLevel,
+        CASE 
+            WHEN p.ViewCount >= 1000 THEN 'Viral'
+            WHEN p.ViewCount >= 500 THEN 'HighTraffic'
+            WHEN p.ViewCount >= 100 THEN 'MediumTraffic'
+            ELSE 'LowTraffic'
+        END as TrafficLevel,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) as UserPostRank,
+        RANK() OVER (ORDER BY p.Score DESC) as GlobalRank,
+        DENSE_RANK() OVER (ORDER BY p.ViewCount DESC) as ViewRank,
+        PERCENT_RANK() OVER (ORDER BY p.Score) as ScorePercentile,
+        NTILE(4) OVER (ORDER BY p.ViewCount) as TrafficQuartile,
+        LAG(p.Score, 1) OVER (ORDER BY p.Score DESC) as PreviousScore,
+        p.Score - LAG(p.Score, 1) OVER (ORDER BY p.Score DESC) as ScoreChange,
+        (p.Score * 1.0 / NULLIF(p.ViewCount, 0)) as ScorePerView
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+    AND p.CreationDate >= DATEADD(MONTH, -12, CURRENT_TIMESTAMP)
+),
+UserWithComplexMetrics AS (
+    SELECT 
+        uwb.UserId,
+        uwb.DisplayName,
+        uwb.Reputation,
+        uwb.TotalPosts,
+        uwb.QuestionCount,
+        uwb.AnswerCount,
+        uwb.TotalScore,
+        uwb.TotalViews,
+        uwb.UserCategory,
+        uwb.PerformanceCategory,
+        uwb.QPercentage,
+        uwb.APercentage,
+        uwb.AvgQuestionScore,
+        uwb.AvgAnswerScore,
+        uwb.RecentTitles,
+        uwb.ScoreRank,
+        uwb.ViewRank,
+        uwb.ScoreDifference,
+        uwb.CategoryRank,
+        uwb.BadgeNames,
+        uwb.BadgeCount,
+        uwb.LastBadgeDate,
+        uwb.FirstBadgeDate,
+        uwb.FirstGoldBadgeDate,
+        uwb.FirstSilverBadgeDate,
+        uwb.FirstBronzeBadgeDate,
+        COALESCE(
+            (SELECT COUNT(*) 
+             FROM Posts p 
+             WHERE p.OwnerUserId = uwb.UserId 
+             AND p.PostTypeId = 1 
+             AND p.CreationDate > uwb.FirstBadgeDate
+             AND p.CreationDate <= uwb.LastBadgeDate
+            ), 0) as QuestionsSinceFirstBadge,
+        COALESCE(
+            (SELECT COUNT(*) 
+             FROM Posts p 
+             WHERE p.OwnerUserId = uwb.UserId 
+             AND p.PostTypeId = 2 
+             AND p.CreationDate > uwb.FirstBadgeDate
+             AND p.CreationDate <= uwb.LastBadgeDate
+            ), 0) as AnswersSinceFirstBadge,
+        CASE 
+            WHEN uwb.BadgeCount * 1.0 / NULLIF(uwb.TotalPosts, 0) >= 1.0 THEN 'AwardedAllPosts'
+            WHEN uwb.BadgeCount * 1.0 / NULLIF(uwb.TotalPosts, 0) >= 0.5 THEN 'AwardedHalfPosts'
+            ELSE 'AwardedFewPosts'
+        END as BadgeEfficiency,
+        COALESCE(
+            (SELECT COUNT(*)
+             FROM Votes v 
+             JOIN Posts p ON v.PostId = p.Id 
+             WHERE p.OwnerUserId = uwb.UserId 
+             AND v.VoteTypeId IN (2, 3)
+            ), 0) as TotalVotesReceived,
+        COALESCE(
+            (SELECT AVG(p.Score) 
+             FROM Posts p 
+             WHERE p.OwnerUserId = uwb.UserId
+            ), 0) as AvgUserPostScore,
+        COALESCE(
+            (SELECT AVG(p.ViewCount) 
+             FROM Posts p 
+             WHERE p.OwnerUserId = uwb.UserId
+            ), 0) as AvgUserPostViews,
+        ROW_NUMBER() OVER (ORDER BY uwb.TotalScore DESC, uwb.Reputation DESC) as OverallRank
+    FROM UserWithBadges uwb
+),
+PostAnalysisWithComplexFeatures AS (
+    SELECT 
+        ppm.PostId,
+        ppm.Title,
+        ppm.Score,
+        ppm.ViewCount,
+        ppm.CreationDate,
+        ppm.OwnerUserId,
+        ppm.PostTypeId,
+        ppm.Tags,
+        ppm.AnswerCount,
+        ppm.CommentCount,
+        ppm.FavoriteCount,
+        ppm.PopularityLevel,
+        ppm.TrafficLevel,
+        ppm.UserPostRank,
+        ppm.GlobalRank,
+        ppm.ViewRank,
+        ppm.ScorePercentile,
+        ppm.TrafficQuartile,
+        ppm.PreviousScore,
+        ppm.ScoreChange,
+        ppm.ScorePerView,
+        CASE 
+            WHEN ppm.TrafficLevel = 'Viral' AND ppm.PopularityLevel = 'HighlyPopular' THEN 'Trending'
+            WHEN ppm.TrafficLevel = 'HighTraffic' AND ppm.PopularityLevel IN ('HighlyPopular', 'Popular') THEN 'Hot'
+            ELSE 'Standard'
+        END as TrendStatus,
+        COALESCE(
+            (SELECT COUNT(*) 
+             FROM Comments c 
+             WHERE c.PostId = ppm.PostId
+            ), 0) as CommentCountWithNullCheck,
+        COALESCE(
+            (SELECT COUNT(*) 
+             FROM Votes v 
+             WHERE v.PostId = ppm.PostId 
+             AND v.VoteTypeId = 2
+            ), 0) as Upvotes,
+        COALESCE(
+            (SELECT COUNT(*) 
+             FROM Votes v 
+             WHERE v.PostId = ppm.PostId 
+             AND v.VoteTypeId = 3
+            ), 0) as Downvotes,
+        COALESCE(
+            (SELECT COUNT(*) 
+             FROM Votes v 
+             WHERE v.PostId = ppm.PostId 
+             AND v.VoteTypeId = 5
+            ), 0) as FavoriteCountFromVotes,
+        CASE 
+            WHEN ppm.ScoreChange > 0 THEN 'Increasing'
+            WHEN ppm.ScoreChange < 0 THEN 'Decreasing'
+            ELSE 'Stable'
+        END as TrendDirection,
+        COALESCE(
+            (SELECT COUNT(DISTINCT v.UserId) 
+             FROM Votes v 
+             WHERE v.PostId = ppm.PostId
+            ), 0) as UniqueVoters,
+        ((ppm.Score * 1.0) / NULLIF((ppm.AnswerCount + 1), 0)) as ScorePerAnswer,
+        ((ppm.ViewCount * 1.0) / NULLIF((ppm.CommentCount + 1), 0)) as ViewsPerComment,
+        (ppm.Score - (COALESCE(ppm.CommentCount, 0) * 0.1)) as AdjustedScore,
+        POWER(ppm.ViewCount * 1.0 / NULLIF(ppm.Score, 1), 2) as ViewToScoreRatio,
+        LAG(ppm.ViewCount, 2) OVER (ORDER BY ppm.GlobalRank DESC) as PrevViewCount2,
+        LEAD(ppm.Score, 1) OVER (ORDER BY ppm.GlobalRank) as NextScore,
+        NTILE(5) OVER (ORDER BY ppm.ViewCount) as ViewDecile,
+        CASE 
+            WHEN ppm.Score >= (SELECT AVG(Score) FROM Posts WHERE PostTypeId IN (1, 2)) THEN 'AboveAverage'
+            ELSE 'BelowAverage'
+        END as ScoreLevel,
+        CASE 
+            WHEN ppm.ViewCount >= (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId IN (1, 2)) THEN 'AboveAverageViews'
+            ELSE 'BelowAverageViews'
+        END as ViewLevel
+    FROM PostPerformanceMetrics ppm
+),
+CompositeAnalysis AS (
+    SELECT 
+        uwm.UserId,
+        uwm.DisplayName,
+        uwm.Reputation,
+        uwm.TotalPosts,
+        uwm.QuestionCount,
+        uwm.AnswerCount,
+        uwm.TotalScore,
+        uwm.TotalViews,
+        uwm.UserCategory,
+        uwm.PerformanceCategory,
+        uwm.QPercentage,
+        uwm.APercentage,
+        uwm.AvgQuestionScore,
+        uwm.AvgAnswerScore,
+        uwm.RecentTitles,
+        uwm.ScoreRank,
+        uwm.ViewRank,
+        uwm.ScoreDifference,
+        uwm.CategoryRank,
+        uwm.BadgeNames,
+        uwm.BadgeCount,
+        uwm.LastBadgeDate,
+        uwm.FirstBadgeDate,
+        uwm.FirstGoldBadgeDate,
+        uwm.FirstSilverBadgeDate,
+        uwm.FirstBronzeBadgeDate,
+        uwm.QuestionsSinceFirstBadge,
+        uwm.AnswersSinceFirstBadge,
+        uwm.BadgeEfficiency,
+        uwm.TotalVotesReceived,
+        uwm.AvgUserPostScore,
+        uwm.AvgUserPostViews,
+        uwm.OverallRank,
+        pa.PostId,
+        pa.Title,
+        pa.Score,
+        pa.ViewCount,
+        pa.CreationDate,
+        pa.PostTypeId,
+        pa.Tags,
+        pa.AnswerCount as PostAnswerCount,
+        pa.CommentCount as PostCommentCount,
+        pa.FavoriteCount as PostFavoriteCount,
+        pa.PopularityLevel,
+        pa.TrafficLevel,
+        pa.UserPostRank,
+        pa.GlobalRank as PostGlobalRank,
+        pa.ViewRank as PostViewRank,
+        pa.ScorePercentile,
+        pa.TrafficQuartile,
+        pa.PreviousScore,
+        pa.ScoreChange,
+        pa.ScorePerView,
+        pa.TrendStatus,
+        pa.CommentCountWithNullCheck,
+        pa.Upvotes,
+        pa.Downvotes,
+        pa.FavoriteCountFromVotes,
+        pa.TrendDirection,
+        pa.UniqueVoters,
+        pa.ScorePerAnswer,
+        pa.ViewsPerComment,
+        pa.AdjustedScore,
+        pa.ViewToScoreRatio,
+        pa.PrevViewCount2,
+        pa.NextScore,
+        pa.ViewDecile,
+        pa.ScoreLevel,
+        pa.ViewLevel,
+        ROW_NUMBER() OVER (ORDER BY uwm.Reputation DESC, pa.Score DESC) as CombinedRank,
+        DENSE_RANK() OVER (ORDER BY pa.GlobalRank) as CompositePostRank,
+        RANK() OVER (PARTITION BY uwm.UserId ORDER BY pa.Score DESC) as UserTopPostRank
+    FROM UserWithComplexMetrics uwm
+    LEFT JOIN PostAnalysisWithComplexFeatures pa ON uwm.UserId = pa.OwnerUserId
+    WHERE uwm.OverallRank <= 500 OR pa.PostGlobalRank <= 1000
+)
+SELECT 
+    ca.UserId,
+    ca.DisplayName,
+    ca.Reputation,
+    ca.TotalPosts,
+    ca.QuestionCount,
+    ca.AnswerCount,
+    ca.TotalScore,
+    ca.TotalViews,
+    ca.UserCategory,
+    ca.PerformanceCategory,
+    ca.QPercentage,
+    ca.APercentage,
+    ca.AvgQuestionScore,
+    ca.AvgAnswerScore,
+    ca.RecentTitles,
+    ca.ScoreRank,
+    ca.ViewRank,
+    ca.ScoreDifference,
+    ca.CategoryRank,
+    ca.BadgeNames,
+    ca.BadgeCount,
+    ca.LastBadgeDate,
+    ca.FirstBadgeDate,
+    ca.FirstGoldBadgeDate,
+    ca.FirstSilverBadgeDate,
+    ca.FirstBronzeBadgeDate,
+    ca.QuestionsSinceFirstBadge,
+    ca.AnswersSinceFirstBadge,
+    ca.BadgeEfficiency,
+    ca.TotalVotesReceived,
+    ca.AvgUserPostScore,
+    ca.AvgUserPostViews,
+    ca.OverallRank,
+    ca.PostId,
+    ca.Title,
+    ca.Score,
+    ca.ViewCount,
+    ca.CreationDate,
+    ca.PostTypeId,
+    ca.Tags,
+    ca.PostAnswerCount,
+    ca.PostCommentCount,
+    ca.PostFavoriteCount,
+    ca.PopularityLevel,
+    ca.TrafficLevel,
+    ca.UserPostRank,
+    ca.PostGlobalRank,
+    ca.PostViewRank,
+    ca.ScorePercentile,
+    ca.TrafficQuartile,
+    ca.PreviousScore,
+    ca.ScoreChange,
+    ca.ScorePerView,
+    ca.TrendStatus,
+    ca.CommentCountWithNullCheck,
+    ca.Upvotes,
+    ca.Downvotes,
+    ca.FavoriteCountFromVotes,
+    ca.TrendDirection,
+    ca.UniqueVoters,
+    ca.ScorePerAnswer,
+    ca.ViewsPerComment,
+    ca.AdjustedScore,
+    ca.ViewToScoreRatio,
+    ca.PrevViewCount2,
+    ca.NextScore,
+    ca.ViewDecile,
+    ca.ScoreLevel,
+    ca.ViewLevel,
+    ca.CombinedRank,
+    ca.CompositePostRank,
+    ca.UserTopPostRank,
+    CASE 
+        WHEN ca.PostGlobalRank <= 100 THEN 'Top100Post'
+        WHEN ca.PostGlobalRank <= 500 THEN 'Top500Post'
+        WHEN ca.PostGlobalRank <= 1000 THEN 'Top1000Post'
+        ELSE 'Other'
+    END as PostImportanceLevel,
+    CASE 
+        WHEN ca.UserCategory = 'Veteran' AND ca.PopularityLevel = 'HighlyPopular' THEN 'EliteCreator'
+        WHEN ca.UserCategory = 'Experienced' AND ca.PopularityLevel = 'Popular' THEN 'PopularCreator'
+        WHEN ca.UserCategory = 'Active' AND ca.PopularityLevel = 'Moderate' THEN 'ModerateCreator'
+        ELSE 'StandardCreator'
+    END as CreatorClassification,
+    (ca.Score * ca.ViewCount) as ScoreViewProduct,
+    CASE 
+        WHEN ca.Score > 100 THEN 'HighScore'
+        WHEN ca.Score > 50 THEN 'MediumScore'
+        WHEN ca.Score > 10 THEN 'LowScore'
+        ELSE 'VeryLowScore'
+    END as ScoreClassification,
+    CASE 
+        WHEN ca.ViewCount > 10000 THEN 'VeryHighTraffic'
+        WHEN ca.ViewCount > 5000 THEN 'HighTraffic'
+        WHEN ca.ViewCount > 1000 THEN 'MediumTraffic'
+        ELSE 'LowTraffic'
+    END as TrafficClassification,
+    IIF(ca.BadgeCount > 10, 'MultipleBadges', 'SingleBadge') as BadgeStatus,
+    COALESCE(
+        (SELECT STRING_AGG(SUBSTRING(t.TagName, 1, 15), ', ')
+         FROM STRING_SPLIT(COALESCE(ca.Tags, ''), '>') t
+         WHERE t.value LIKE '%<%') 
+    ,'NoTags') as ExtractedTags,
+    IIF(ca.LastBadgeDate IS NOT NULL, DATEDIFF(DAY, ca.FirstBadgeDate, ca.LastBadgeDate), 0) as BadgeDurationDays
+FROM CompositeAnalysis ca
+WHERE ca.UserId IS NOT NULL 
+    AND (ca.PostId IS NOT NULL OR ca.OverallRank <= 500)
+ORDER BY ca.CombinedRank ASC, ca.PostGlobalRank ASC
+LIMIT 10000;

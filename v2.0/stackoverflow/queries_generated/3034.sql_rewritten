@@ -1,0 +1,147 @@
+-- {"query": "3034.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2619} 
+WITH
+recent_q AS (
+    SELECT p.Id,
+           p.Title,
+           p.CreationDate,
+           p.OwnerUserId,
+           p.Score,
+           p.ViewCount,
+           p.Tags,
+           p.AnswerCount,
+           p.FavoriteCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= (cast('2024-10-01' as date) - INTERVAL '30 days')
+),
+question_tags AS (
+    SELECT q.Id AS QuestionId,
+           UNNEST(string_to_array(trim(both '<>' FROM q.Tags), '><')) AS Tag
+    FROM recent_q q
+),
+tag_popularity AS (
+    SELECT qt.Tag,
+           COUNT(*) AS QuestionsWithTag,
+           AVG(q.Score) AS AvgQuestionScore,
+           PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY q.Score) AS MedianQuestionScore
+    FROM question_tags qt
+    JOIN recent_q q ON q.Id = qt.QuestionId
+    GROUP BY qt.Tag
+),
+question_metrics AS (
+    SELECT q.Id,
+           q.Title,
+           q.OwnerUserId,
+           q.Score,
+           q.ViewCount,
+           q.FavoriteCount,
+           COALESCE(q.AnswerCount,0)                AS AnswerCount,
+           (SELECT COUNT(*) FROM Posts a
+            WHERE a.PostTypeId = 2 AND a.ParentId = q.Id)    AS ActualAnswerCount,
+           (SELECT AVG(a.Score) FROM Posts a
+            WHERE a.PostTypeId = 2 AND a.ParentId = q.Id)   AS AvgAnswerScore,
+           (SELECT MAX(a.Score) FROM Posts a
+            WHERE a.PostTypeId = 2 AND a.ParentId = q.Id)   AS MaxAnswerScore,
+           (SELECT COUNT(*) FROM Votes v
+            WHERE v.PostId = q.Id AND v.VoteTypeId = 2)      AS UpVoteCount,
+           (SELECT COUNT(*) FROM Votes v
+            WHERE v.PostId = q.Id AND v.VoteTypeId = 3)      AS DownVoteCount,
+           (SELECT COUNT(*) FROM Comments c
+            WHERE c.PostId = q.Id)                           AS CommentCount
+    FROM recent_q q
+),
+user_info AS (
+    SELECT u.Id,
+           u.DisplayName,
+           u.Reputation,
+           u.CreationDate,
+           u.LastAccessDate,
+           COALESCE(b.BadgeCount,0)                     AS BadgeCount,
+           ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+    LEFT JOIN (
+        SELECT UserId, COUNT(*) AS BadgeCount
+        FROM Badges
+        GROUP BY UserId
+    ) b ON b.UserId = u.Id
+),
+question_with_user AS (
+    SELECT qm.*,
+           ui.DisplayName,
+           ui.Reputation,
+           ui.BadgeCount,
+           ui.ReputationRank
+    FROM question_metrics qm
+    LEFT JOIN user_info ui ON ui.Id = qm.OwnerUserId
+),
+question_tag_ranking AS (
+    SELECT qwu.*,
+           tp.Tag,
+           RANK() OVER (PARTITION BY tp.Tag ORDER BY qwu.Score DESC) AS TagScoreRank,
+           tp.QuestionsWithTag,
+           tp.AvgQuestionScore,
+           tp.MedianQuestionScore
+    FROM question_with_user qwu
+    JOIN question_tags qt ON qt.QuestionId = qwu.Id
+    JOIN tag_popularity tp ON tp.Tag = qt.Tag
+),
+final_questions AS (
+    SELECT qtr.Id,
+           qtr.Title,
+           qtr.CreationDate,
+           qtr.DisplayName,
+           qtr.Reputation,
+           qtr.BadgeCount,
+           qtr.ReputationRank,
+           qtr.Score,
+           qtr.ViewCount,
+           qtr.FavoriteCount,
+           qtr.AnswerCount,
+           qtr.ActualAnswerCount,
+           qtr.AvgAnswerScore,
+           qtr.MaxAnswerScore,
+           qtr.UpVoteCount,
+           qtr.DownVoteCount,
+           qtr.CommentCount,
+           qtr.Tag,
+           qtr.TagScoreRank,
+           qtr.QuestionsWithTag,
+           qtr.AvgQuestionScore,
+           qtr.MedianQuestionScore
+    FROM question_tag_ranking qtr
+    WHERE qtr.TagScoreRank <= 5
+)
+SELECT *
+FROM final_questions
+WHERE ReputationRank <= 100
+UNION ALL
+SELECT
+    a.Id,
+    a.Title,
+    a.CreationDate,
+    ui.DisplayName,
+    ui.Reputation,
+    ui.BadgeCount,
+    ui.ReputationRank,
+    a.Score,
+    NULL AS ViewCount,
+    NULL AS FavoriteCount,
+    NULL AS AnswerCount,
+    NULL AS ActualAnswerCount,
+    NULL AS AvgAnswerScore,
+    NULL AS MaxAnswerScore,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = a.Id AND v.VoteTypeId = 2) AS UpVoteCount,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = a.Id AND v.VoteTypeId = 3) AS DownVoteCount,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = a.Id)                AS CommentCount,
+    NULL AS Tag,
+    NULL AS TagScoreRank,
+    NULL AS QuestionsWithTag,
+    NULL AS AvgQuestionScore,
+    NULL AS MedianQuestionScore
+FROM Posts a
+JOIN Users ui ON ui.Id = a.OwnerUserId
+WHERE a.PostTypeId = 2
+  AND a.CreationDate >= (cast('2024-10-01' as date) - INTERVAL '30 days')
+  AND a.Score > 0
+ORDER BY ReputationRank, Score DESC
+LIMIT 200;

@@ -1,0 +1,271 @@
+WITH PostStats AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Title,
+        p.Tags,
+        p.Body,
+        COALESCE(p.AcceptedAnswerId, 0) AS AcceptedAnswerId,
+        CASE WHEN p.PostTypeId = 1 THEN 'Question' ELSE 'Answer' END AS PostType,
+        CASE 
+            WHEN p.Score > 100 THEN 'HighlyVoted'
+            WHEN p.Score > 50 THEN 'ModeratelyVoted'
+            WHEN p.Score > 0 THEN 'LowVoted'
+            ELSE 'NoVotes'
+        END AS VoteCategory,
+        COALESCE(p.AnswerCount, 0) + COALESCE(p.CommentCount, 0) AS EngagementMetric,
+        CAST(EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate)) / 86400 AS INTEGER) AS AgeInDays,
+        CASE 
+            WHEN p.ParentId IS NOT NULL THEN (SELECT COUNT(*) FROM Posts WHERE ParentId = p.Id AND PostTypeId = 2)
+            ELSE 0 
+        END AS AnswerCountForQuestion
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.AccountId,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        SUM(COALESCE(p.Score, 0)) AS TotalScore,
+        AVG(COALESCE(p.Score, 0)) AS AverageScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(p.LastActivityDate) AS LastActivityDate,
+        (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 2) AS UpVoteCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 3) AS DownVoteCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes, u.AccountId
+),
+CommunityFeedback AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        COALESCE(p.CommentCount, 0) AS CommentCount,
+        p.OwnerUserId,
+        COALESCE(p.AcceptedAnswerId, 0) AS AcceptedAnswerId,
+        CASE WHEN pv.VoteTypeId IS NOT NULL THEN 'Yes' ELSE 'No' END AS HasVotes,
+        COALESCE(pv.VoteCount, 0) AS VoteCount,
+        COALESCE(pv.AverageVoteScore, 0) AS AvgVoteScore,
+        COALESCE(pv.TotalVoteScore, 0) AS TotalVoteScore,
+        CASE 
+            WHEN p.FavoriteCount > 10 THEN 'HighInterest'
+            WHEN p.FavoriteCount > 5 THEN 'MediumInterest'
+            WHEN p.FavoriteCount > 0 THEN 'LowInterest'
+            ELSE 'NoInterest'
+        END AS InterestLevel
+    FROM Posts p
+    LEFT JOIN (
+        SELECT 
+            PostId,
+            COUNT(*) AS VoteCount,
+            AVG(CAST(Score AS DOUBLE PRECISION)) AS AverageVoteScore,
+            SUM(Score) AS TotalVoteScore
+        FROM Votes 
+        WHERE VoteTypeId IN (2, 3)
+        GROUP BY PostId
+    ) pv ON p.Id = pv.PostId
+    WHERE p.PostTypeId = 1
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.IsRequired,
+        t.IsModeratorOnly,
+        COALESCE(p.Title, 'N/A') AS SampleQuestionTitle,
+        COALESCE(p.Id, 0) AS SampleQuestionId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'PopularTag'
+            WHEN t.Count > 500 THEN 'ModerateTag'
+            WHEN t.Count > 100 THEN 'NicheTag'
+            ELSE 'RareTag'
+        END AS TagPopularity,
+        CASE 
+            WHEN t.IsRequired = 1 THEN 'Mandatory'
+            WHEN t.IsModeratorOnly = 1 THEN 'ModeratorOnly'
+            ELSE 'Community'
+        END AS TagAccess
+    FROM Tags t
+    LEFT JOIN Posts p ON t.ExcerptPostId = p.Id
+    WHERE t.TagName IS NOT NULL
+),
+PostHistoryAggregate AS (
+    SELECT 
+        ph.PostId,
+        MAX(ph.CreationDate) AS LastModificationDate,
+        COUNT(*) AS TotalActions,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN 1 END) AS StatusChangeCount,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (1, 4, 5, 6) THEN 1 END) AS ContentChangeCount,
+        STRING_AGG(ph.Comment, ', ') AS AllComments,
+        STRING_AGG(ph.UserDisplayName, ', ') AS AllEditors
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+)
+SELECT DISTINCT
+    ps.Id AS PostId,
+    ps.PostType,
+    ps.Title,
+    ps.Score,
+    ps.ViewCount,
+    ps.AnswerCountForQuestion,
+    ps.CommentCount,
+    ps.FavoriteCount,
+    ps.AgeInDays,
+    ps.VoteCategory,
+    ps.EngagementMetric,
+    COALESCE(ua.DisplayName, 'Unknown') AS OwnerDisplayName,
+    COALESCE(ua.Reputation, 0) AS OwnerReputation,
+    COALESCE(ua.QuestionCount, 0) AS OwnerQuestions,
+    COALESCE(ua.AnswerCount, 0) AS OwnerAnswers,
+    COALESCE(ua.UpVoteCount, 0) AS OwnerUpVotes,
+    COALESCE(ua.DownVoteCount, 0) AS OwnerDownVotes,
+    COALESCE(cf.HasVotes, 'Unknown') AS HasVotes,
+    cf.VoteCount,
+    cf.AvgVoteScore,
+    cf.TotalVoteScore,
+    cf.InterestLevel,
+    COALESCE(ta.TagName, 'NoTag') AS AssociatedTag,
+    ta.TagPopularity,
+    ta.TagAccess,
+    COALESCE(ph.LastModificationDate, TIMESTAMP '1900-01-01 00:00:00') AS LastModificationDate,
+    ph.TotalActions,
+    ph.ContentChangeCount,
+    ph.StatusChangeCount,
+    CASE 
+        WHEN ps.AnswerCountForQuestion > 0 THEN 
+            (SELECT AVG(AnswerScore) FROM (
+                SELECT p.Score AS AnswerScore FROM Posts p 
+                WHERE p.ParentId = ps.Id AND p.PostTypeId = 2
+            ) AS Answers)
+        ELSE 0 
+    END AS AvgAnswerScore,
+    CASE 
+        WHEN EXISTS (
+            SELECT 1 FROM Comments c 
+            WHERE c.PostId = ps.Id AND 
+            EXISTS (SELECT 1 FROM Votes v WHERE v.PostId = c.Id AND v.VoteTypeId = 2)
+        ) THEN 'HasHighValueComments' 
+        ELSE 'NoHighValueComments' 
+    END AS CommentQuality,
+    CASE 
+        WHEN ps.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'AboveAverageScore'
+        WHEN ps.Score < (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'BelowAverageScore'
+        ELSE 'AverageScore' 
+    END AS ScoreComparison,
+    COALESCE(ps.Tags, 'NoTags') AS Tags,
+    CASE 
+        WHEN ps.Tags IS NOT NULL AND ps.Tags LIKE '%<%' THEN 
+            (SELECT COUNT(*) FROM (
+                SELECT UNNEST(string_to_array(substring(ps.Tags, 2, length(ps.Tags)-2), '><')) AS tag
+            ) AS tags WHERE tag IS NOT NULL AND tag <> '')
+        ELSE 0 
+    END AS TagCount,
+    CASE 
+        WHEN ps.Views > 0 THEN 
+            (ps.Score * ps.ViewCount) / (ps.Views + 1)
+        ELSE 0 
+    END AS ViewScoreEfficiency,
+    CASE 
+        WHEN ps.Title IS NOT NULL THEN 
+            LENGTH(ps.Title)
+        ELSE 0 
+    END AS TitleLength,
+    CASE 
+        WHEN ps.PostTypeId = 1 THEN 
+            (SELECT COUNT(*) FROM Votes v 
+             WHERE v.PostId = ps.Id AND v.VoteTypeId = 1)
+        ELSE 0 
+    END AS AcceptedAnswerCount,
+    CASE 
+        WHEN ps.ParentId IS NOT NULL THEN 
+            (SELECT COUNT(*) FROM Posts p 
+             WHERE p.ParentId = ps.Id)
+        ELSE 0 
+    END AS ChildAnswerCount,
+    COALESCE(ph.AllComments, 'None') AS ModificationComments,
+    COALESCE(ph.AllEditors, 'None') AS EditorsInvolved,
+    CASE 
+        WHEN COALESCE(ua.Reputation, 0) > 10000 THEN 'HighReputation'
+        WHEN COALESCE(ua.Reputation, 0) > 1000 THEN 'MediumReputation'
+        ELSE 'LowReputation' 
+    END AS ReputationLevel,
+    CASE 
+        WHEN ps.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30 DAYS') THEN 'RecentlyActive'
+        WHEN ps.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '90 DAYS') THEN 'ModeratelyActive'
+        ELSE 'Inactive'
+    END AS ActivityStatus,
+    CASE 
+        WHEN ps.Score > 10 AND ps.CommentCount > 5 THEN 'HighEngagement'
+        WHEN ps.Score > 5 AND ps.CommentCount > 2 THEN 'MediumEngagement'
+        ELSE 'LowEngagement'
+    END AS EngagementLevel,
+    (SELECT COUNT(*) FROM Votes v 
+     WHERE v.PostId = ps.Id AND v.VoteTypeId IN (2, 3)) AS TotalVotes,
+    CASE 
+        WHEN ps.Views IS NOT NULL AND ps.Views > 0 THEN 
+            (COALESCE(ps.Score, 0) * 100.0) / ps.Views 
+        ELSE 0 
+    END AS ScorePerView,
+    (SELECT COUNT(*) FROM Comments c 
+     WHERE c.PostId = ps.Id AND c.UserId IS NOT NULL) AS CommentCountWithUser,
+    CASE 
+        WHEN ps.LastActivityDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '7 DAYS') THEN 'ActiveLastWeek'
+        ELSE 'InactiveLastWeek'
+    END AS RecentActivityStatus,
+    COALESCE(ta.SampleQuestionId, 0) AS TagSampleQuestionId,
+    COALESCE(ta.SampleQuestionTitle, 'N/A') AS TagSampleQuestionTitle,
+    CASE 
+        WHEN ps.FavoriteCount > 0 THEN 
+            (SELECT COUNT(*) FROM Votes v 
+             WHERE v.PostId = ps.Id AND v.VoteTypeId = 5)
+        ELSE 0 
+    END AS BookmarkCount,
+    CASE 
+        WHEN ps.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 2) THEN 'AboveAverageAnswerScore'
+        ELSE 'BelowAverageAnswerScore'
+    END AS AnswerScoreComparison
+FROM PostStats ps
+LEFT JOIN UserActivity ua ON ps.OwnerUserId = ua.UserId
+LEFT JOIN CommunityFeedback cf ON ps.Id = cf.PostId
+LEFT JOIN TagAnalysis ta ON ps.Tags IS NOT NULL 
+    AND ta.TagName IN (
+        SELECT tag FROM (
+            SELECT UNNEST(string_to_array(substring(ps.Tags, 2, length(ps.Tags)-2), '><')) AS tag
+        ) AS _tags WHERE tag IS NOT NULL AND tag <> ''
+    )
+LEFT JOIN PostHistoryAggregate ph ON ps.Id = ph.PostId
+WHERE 
+    ps.PostTypeId IN (1, 2)
+    AND ps.Score IS NOT NULL
+    AND ps.Id IS NOT NULL
+    AND ps.OwnerUserId IS NOT NULL
+    AND ps.Title IS NOT NULL
+    AND (ps.Tags IS NULL OR ps.Tags LIKE '%<%')
+    AND EXISTS (
+        SELECT 1 FROM Posts p 
+        WHERE p.Id = ps.Id AND p.PostTypeId IN (1, 2)
+        AND p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '365 DAYS')
+    )
+ORDER BY ps.Score DESC, ps.ViewCount DESC, ps.AgeInDays ASC
+LIMIT 1000;

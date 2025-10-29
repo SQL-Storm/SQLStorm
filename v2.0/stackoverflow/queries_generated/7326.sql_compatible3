@@ -1,0 +1,248 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        MAX(p.Score) AS MaxPostScore,
+        AVG(p.Score) AS AvgPostScore,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2), ', ') AS AllTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.Reputation, u.CreationDate, u.DisplayName
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        Reputation,
+        PostCount,
+        CommentCount,
+        BadgeCount,
+        QuestionCount,
+        AnswerCount,
+        MaxPostScore,
+        AvgPostScore,
+        AllTags,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, PostCount DESC) AS RowNum
+    FROM UserStats
+),
+RecentActivity AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        u.DisplayName AS OwnerName,
+        CASE WHEN u.Id IS NULL THEN 'Deleted User' ELSE u.DisplayName END AS OwnerDisplayName,
+        COALESCE(p.AnswerCount, 0) + COALESCE(p.CommentCount, 0) AS EngagementCount,
+        CAST((EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate) ) / 86400) AS INTEGER) AS DaysOld,
+        CASE 
+            WHEN p.Score > 100 THEN 'Gold'
+            WHEN p.Score > 50 THEN 'Silver'
+            WHEN p.Score > 10 THEN 'Bronze'
+            ELSE 'Common'
+        END AS ScoreTier,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostType,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousScore,
+        ROUND(AVG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ROWS BETWEEN 2 PRECEDING AND CURRENT ROW), 2) AS MovingAvgScore,
+        RANK() OVER (ORDER BY p.Score DESC) AS ScoreRank
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30 days')
+      AND p.PostTypeId IN (1, 2)
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Trending'
+            WHEN t.Count > 500 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            ELSE 'Niche'
+        END AS PopularityLevel,
+        RANK() OVER (ORDER BY t.Count DESC) AS TagRank,
+        DENSE_RANK() OVER (ORDER BY t.Count DESC) AS TagDenseRank
+    FROM Tags t
+    WHERE t.Count > 50
+),
+ComplexVotes AS (
+    SELECT 
+        v.PostId,
+        v.VoteTypeId,
+        v.UserId,
+        v.CreationDate,
+        v.BountyAmount,
+        CASE 
+            WHEN v.VoteTypeId IN (8, 9) AND v.BountyAmount > 100 THEN 'HighBounty'
+            WHEN v.VoteTypeId IN (8, 9) AND v.BountyAmount > 50 THEN 'MidBounty'
+            WHEN v.VoteTypeId IN (8, 9) THEN 'LowBounty'
+            ELSE 'OtherVote'
+        END AS BountyCategory,
+        CAST((EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - v.CreationDate) ) / 86400) AS INTEGER) AS DaysSinceVote,
+        COUNT(*) OVER (PARTITION BY v.PostId) AS VoteCountPerPost
+    FROM Votes v
+    WHERE v.VoteTypeId IN (1, 2, 3, 8, 9)
+        AND v.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '90 days')
+),
+UserEngagement AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(us.PostCount, 0) AS TotalPosts,
+        COALESCE(us.CommentCount, 0) AS TotalComments,
+        COALESCE(us.BadgeCount, 0) AS TotalBadges,
+        CASE 
+            WHEN us.PostCount IS NULL OR us.PostCount = 0 THEN 0
+            ELSE (COALESCE(us.CommentCount, 0) * 100.0 / us.PostCount)
+        END AS CommentToPostRatio,
+        CASE 
+            WHEN us.PostCount IS NULL OR us.PostCount = 0 THEN 0
+            ELSE (COALESCE(us.BadgeCount, 0) * 100.0 / us.PostCount)
+        END AS BadgeToPostRatio,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, us.PostCount DESC) AS EngagementRank
+    FROM Users u
+    LEFT JOIN UserStats us ON u.Id = us.UserId
+    WHERE u.Reputation > 500
+),
+CombinedStats AS (
+    SELECT 
+        ra.PostId,
+        ra.Title,
+        ra.Score,
+        ra.ViewCount,
+        ra.OwnerUserId,
+        ra.OwnerDisplayName,
+        CAST(NULL AS TEXT) AS TagRank,
+        ra.ScoreTier,
+        ra.EngagementCount,
+        ra.DaysOld,
+        ra.PostType,
+        ra.ScoreRank,
+        ta.TagName,
+        ta.PopularityLevel,
+        cv.BountyCategory,
+        cv.VoteCountPerPost,
+        ue.CommentToPostRatio,
+        ue.BadgeToPostRatio,
+        ue.EngagementRank,
+        CASE 
+            WHEN ra.Score > 0 AND ra.ViewCount > 0 THEN 
+                ROUND((ra.Score * 100.0 / ra.ViewCount), 2)
+            ELSE 0
+        END AS QualityScore
+    FROM RecentActivity ra
+    LEFT JOIN TagAnalysis ta ON ta.TagName = ANY (STRING_TO_ARRAY(SUBSTRING(ra.Tags FROM 2 FOR CHAR_LENGTH(ra.Tags)-2), '><'))
+    LEFT JOIN ComplexVotes cv ON ra.PostId = cv.PostId
+    LEFT JOIN UserEngagement ue ON ra.OwnerUserId = ue.UserId
+    WHERE ra.PostId IS NOT NULL
+),
+FinalAggregation AS (
+    SELECT 
+        'Posts Analysis' AS AnalysisType,
+        COUNT(*) AS RecordCount,
+        COUNT(DISTINCT OwnerUserId) AS UniqueUsers,
+        SUM(QualityScore) AS TotalQualityScore,
+        AVG(QualityScore) AS AvgQualityScore,
+        MAX(QualityScore) AS MaxQualityScore,
+        MIN(QualityScore) AS MinQualityScore,
+        STRING_AGG(DISTINCT ScoreTier, ', ') AS ScoreTiers,
+        STRING_AGG(DISTINCT PopularityLevel, ', ') AS PopularityLevels
+    FROM CombinedStats
+    WHERE ScoreTier IS NOT NULL
+    
+    UNION ALL
+    
+    SELECT 
+        'User Engagement Analysis' AS AnalysisType,
+        COUNT(*) AS RecordCount,
+        COUNT(DISTINCT OwnerUserId) AS UniqueUsers,
+        SUM(QualityScore) AS TotalQualityScore,
+        AVG(QualityScore) AS AvgQualityScore,
+        MAX(QualityScore) AS MaxQualityScore,
+        MIN(QualityScore) AS MinQualityScore,
+        STRING_AGG(DISTINCT ScoreTier, ', ') AS ScoreTiers,
+        STRING_AGG(DISTINCT PopularityLevel, ', ') AS PopularityLevels
+    FROM CombinedStats
+    WHERE EngagementRank <= 50
+    
+    UNION ALL
+    
+    SELECT 
+        'Tag Popularity Analysis' AS AnalysisType,
+        COUNT(*) AS RecordCount,
+        COUNT(DISTINCT OwnerUserId) AS UniqueUsers,
+        SUM(QualityScore) AS TotalQualityScore,
+        AVG(QualityScore) AS AvgQualityScore,
+        MAX(QualityScore) AS MaxQualityScore,
+        MIN(QualityScore) AS MinQualityScore,
+        STRING_AGG(DISTINCT ScoreTier, ', ') AS ScoreTiers,
+        STRING_AGG(DISTINCT PopularityLevel, ', ') AS PopularityLevels
+    FROM CombinedStats
+    WHERE TagName IS NOT NULL
+),
+MaxQuality AS (
+    SELECT MAX(QualityScore) AS MaxQualityScore FROM CombinedStats
+),
+TopQualityOwner AS (
+    SELECT OwnerUserId
+    FROM CombinedStats
+    JOIN MaxQuality ON CombinedStats.QualityScore = MaxQuality.MaxQualityScore
+    LIMIT 1
+)
+SELECT 
+    fa.AnalysisType,
+    fa.RecordCount,
+    fa.UniqueUsers,
+    fa.TotalQualityScore,
+    fa.AvgQualityScore,
+    fa.MaxQualityScore,
+    fa.MinQualityScore,
+    fa.ScoreTiers,
+    fa.PopularityLevels,
+    COUNT(*) OVER (ORDER BY fa.AnalysisType) AS SortOrder,
+    CASE WHEN fa.AnalysisType = 'Posts Analysis' THEN
+        STRING_AGG(('Top User: ' || cs.OwnerDisplayName || ' (Score: ' || CAST(cs.Score AS TEXT) || ')'), '; ')
+        ELSE NULL END AS TopUsersByScore,
+    CASE WHEN fa.AnalysisType = 'Tag Popularity Analysis' THEN
+        -- replace nested aggregate COUNT(...) with COUNT(*) FILTER (WHERE cs.TagName IS NOT NULL)
+        STRING_AGG(('Tag: ' || cs.TagName || ' (Count: ' || CAST(COUNT(*) FILTER (WHERE cs.TagName IS NOT NULL) AS TEXT) || ')'), '; ')
+        ELSE NULL END AS PopularTags,
+    CASE WHEN fa.AnalysisType = 'User Engagement Analysis' THEN
+        STRING_AGG(('User: ' || u.DisplayName || ' (Reputation: ' || CAST(u.Reputation AS TEXT) || ')'), '; ')
+        ELSE NULL END AS TopEngagedUsers
+FROM FinalAggregation fa
+JOIN TopQualityOwner tqo ON 1=1
+JOIN Users u ON u.Id = tqo.OwnerUserId
+JOIN CombinedStats cs ON cs.OwnerUserId = u.Id
+GROUP BY 
+    fa.AnalysisType,
+    fa.RecordCount,
+    fa.UniqueUsers,
+    fa.TotalQualityScore,
+    fa.AvgQualityScore,
+    fa.MaxQualityScore,
+    fa.MinQualityScore,
+    fa.ScoreTiers,
+    fa.PopularityLevels
+ORDER BY SortOrder;

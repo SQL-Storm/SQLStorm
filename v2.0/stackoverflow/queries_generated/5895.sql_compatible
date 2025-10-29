@@ -1,0 +1,100 @@
+WITH recent_activity AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.Tags,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.Body,
+    p.ContentLicense,
+    u.Reputation,
+    u.DisplayName AS OwnerDisplayName,
+    u.Location,
+    u.CreationDate AS UserCreationDate,
+    u.LastAccessDate,
+    b.Class AS BadgeClass,
+    b.Name AS BadgeName,
+    b.Date AS BadgeDate
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  WHERE p.LastActivityDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days')
+),
+tag_expansion AS (
+  SELECT
+    ra.*,
+    t.TagName AS PrimaryTag,
+    CASE
+      WHEN POSITION('<' IN ra.Tags) > 0 THEN
+        (SELECT unnest(string_to_array(SUBSTRING(ra.Tags FROM 2 FOR CHAR_LENGTH(ra.Tags)-2), '><')))
+      ELSE NULL
+    END AS ExpandedTag
+  FROM recent_activity ra
+  LEFT JOIN Tags t ON -- derive a PrimaryTag reference; choose first expanded tag if available
+    (
+      CASE
+        WHEN POSITION('<' IN ra.Tags) > 0 THEN
+          (SELECT unnest(string_to_array(SUBSTRING(ra.Tags FROM 2 FOR CHAR_LENGTH(ra.Tags)-2), '><')) LIMIT 1)
+        ELSE NULL
+      END
+    ) = t.TagName
+),
+correlated_tags AS (
+  SELECT
+    te.*,
+    (SELECT COUNT(*) FROM Tags t2 WHERE t2.TagName = te.PrimaryTag) AS TagPopularity
+  FROM tag_expansion te
+),
+complex_derived AS (
+  SELECT
+    ct.*,
+    (ct.Score * 1.0 / NULLIF(ct.ViewCount, 0)) AS ScorePerView,
+    (ct.AnswerCount + CASE WHEN ct.PostTypeId = 1 THEN 1 ELSE 0 END) AS EngagementScore,
+    (CASE WHEN ct.BadgeDate IS NULL THEN 0 ELSE 1 END) AS HasRecentBadge
+  FROM correlated_tags ct
+),
+windowed AS (
+  SELECT
+    ca.*,
+    ROW_NUMBER() OVER (
+      PARTITION BY ca.PrimaryTag
+      ORDER BY ca.LastActivityDate DESC, ca.Score DESC
+    ) AS rn_tag
+  FROM complex_derived ca
+)
+SELECT
+  w.PostId,
+  w.Title,
+  w.PrimaryTag AS TagForQuery,
+  w.ExpandedTag,
+  w.Tags,
+  w.OwnerDisplayName,
+  w.Reputation,
+  w.Location,
+  w.UserCreationDate,
+  w.LastActivityDate,
+  w.Score,
+  w.ViewCount,
+  w.CommentCount,
+  w.AnswerCount,
+  w.FavoriteCount,
+  w.Body,
+  w.ContentLicense,
+  w.ScorePerView,
+  w.EngagementScore,
+  w.HasRecentBadge,
+  w.BadgeName,
+  w.BadgeDate,
+  w.rn_tag
+FROM windowed w
+WHERE w.rn_tag = 1
+  AND w.TagPopularity IS NOT NULL
+ORDER BY w.LastActivityDate DESC, w.Score DESC
+LIMIT 100;

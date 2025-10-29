@@ -1,0 +1,313 @@
+-- {"query": "4153.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2817} 
+WITH
+  PostEngagement AS (
+    SELECT
+      p.Id AS PostId,
+      p.OwnerUserId,
+      p.PostTypeId,
+      p.CreationDate AS PostCreationDate,
+      p.Score AS PostScore,
+      p.ViewCount AS PostViewCount,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      COALESCE(
+        (
+          SELECT
+            COUNT(*)
+          FROM
+            Votes v_fav
+          WHERE
+            v_fav.PostId = p.Id AND v_fav.VoteTypeId = 5
+        ),
+        0
+      ) AS FavoriteVoteCount,
+      COALESCE(
+        (
+          SELECT
+            COUNT(*)
+          FROM
+            Comments c
+          WHERE
+            c.PostId = p.Id
+        ),
+        0
+      ) AS CommentCountSubquery,
+      COALESCE(
+        (
+          SELECT
+            SUM(v_up.VoteTypeId = 2)
+          FROM
+            Votes v_up
+          WHERE
+            v_up.PostId = p.Id
+        ),
+        0
+      ) AS UpVoteCount,
+      COALESCE(
+        (
+          SELECT
+            SUM(v_down.VoteTypeId = 3)
+          FROM
+            Votes v_down
+          WHERE
+            v_down.PostId = p.Id
+        ),
+        0
+      ) AS DownVoteCount,
+      CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+      CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN 1 ELSE 0 END AS IsCommunityOwned,
+      ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS RowNumByUserCreationDesc,
+      ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS RowNumByUserScoreDesc,
+      LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostScoreByUser,
+      LEAD(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextPostScoreByUser
+    FROM
+      Posts p
+    WHERE
+      p.PostTypeId IN (1, 2) -- Questions and Answers
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate AS UserCreationDate,
+      u.Views AS UserViews,
+      u.UpVotes AS UserUpVotes,
+      u.DownVotes AS UserDownVotes,
+      COUNT(pe.PostId) AS TotalPosts,
+      SUM(CASE WHEN pe.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+      SUM(CASE WHEN pe.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+      AVG(pe.PostScore) AS AvgPostScore,
+      MAX(pe.PostScore) AS MaxPostScore,
+      AVG(pe.PostViewCount) AS AvgPostViewCount,
+      SUM(pe.CommentCountSubquery) AS TotalCommentsMade,
+      SUM(pe.FavoriteVoteCount) AS TotalFavoritesReceived,
+      SUM(pe.UpVoteCount) AS TotalUpVotesReceived,
+      SUM(pe.DownVoteCount) AS TotalDownVotesReceived,
+      AVG(pe.PreviousPostScoreByUser) AS AvgPreviousPostScore,
+      AVG(pe.NextPostScoreByUser) AS AvgNextPostScore,
+      STRING_AGG(DISTINCT pt.Name, ', ') AS PostTypes,
+      COUNT(DISTINCT b.Id) AS BadgeCount,
+      MAX(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS HasGoldBadge,
+      MAX(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS HasSilverBadge,
+      MAX(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS HasBronzeBadge,
+      -- Correlated subquery for recent user activity
+      (
+        SELECT
+          COUNT(*)
+        FROM
+          PostHistory ph_recent
+        WHERE
+          ph_recent.UserId = u.Id AND ph_recent.CreationDate > DATE('now', '-30 day')
+      ) AS RecentHistoryEntries
+    FROM
+      Users u
+      LEFT JOIN PostEngagement pe ON u.Id = pe.OwnerUserId
+      LEFT JOIN PostTypes pt ON pe.PostTypeId = pt.Id
+      LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate,
+      u.Views,
+      u.UpVotes,
+      u.DownVotes
+    HAVING
+      COUNT(pe.PostId) > 5 -- Only consider users with more than 5 posts
+  ),
+  QuestionMetrics AS (
+    SELECT
+      pe.PostId,
+      pe.OwnerUserId,
+      pe.PostCreationDate,
+      pe.PostScore,
+      pe.PostViewCount,
+      pe.CommentCount,
+      pe.FavoriteCount,
+      pe.UpVoteCount,
+      pe.DownVoteCount,
+      pe.IsClosed,
+      pe.IsCommunityOwned,
+      COALESCE(
+        (
+          SELECT
+            MAX(v_acc.CreationDate)
+          FROM
+            Votes v_acc
+          WHERE
+            v_acc.PostId = pe.PostId AND v_acc.VoteTypeId = 1
+        ),
+        pe.PostCreationDate -- Default to creation date if no accepted answer vote
+      ) AS AcceptedAnswerDate,
+      -- Correlated subquery for number of edits
+      (
+        SELECT
+          COUNT(*)
+        FROM
+          PostHistory ph_edit
+        WHERE
+          ph_edit.PostId = pe.PostId AND ph_edit.PostHistoryTypeId IN (4, 5, 6)
+      ) AS EditCount,
+      -- Using CTE for ordered PostHistory
+      COALESCE(
+        (
+          SELECT
+            ph_tag.Text
+          FROM
+            PostHistory ph_tag
+          WHERE
+            ph_tag.PostId = pe.PostId
+            AND ph_tag.PostHistoryTypeId IN (3, 6, 9)
+          ORDER BY
+            ph_tag.CreationDate DESC
+          LIMIT 1
+        ),
+        pe.Tags
+      ) AS LatestTags
+    FROM
+      PostEngagement pe
+    WHERE
+      pe.PostTypeId = 1 -- Questions only
+  ),
+  AnswerMetrics AS (
+    SELECT
+      pe.PostId,
+      pe.OwnerUserId,
+      pe.PostCreationDate,
+      pe.PostScore,
+      pe.CommentCount,
+      pe.UpVoteCount,
+      pe.DownVoteCount,
+      pe.IsClosed,
+      pe.IsCommunityOwned,
+      -- Correlated subquery for best answer score
+      COALESCE(
+        (
+          SELECT
+            MAX(ans.Score)
+          FROM
+            Posts ans
+          WHERE
+            ans.ParentId = pe.PostId AND ans.PostTypeId = 2
+        ),
+        0
+      ) AS BestAnswerScore,
+      -- Correlated subquery for number of answers
+      COALESCE(pe.AnswerCount, 0) AS NumberOfAnswers
+    FROM
+      PostEngagement pe
+    WHERE
+      pe.PostTypeId = 2 -- Answers only
+  )
+SELECT
+  ua.DisplayName,
+  ua.Reputation,
+  ua.UserCreationDate,
+  ua.TotalPosts,
+  ua.QuestionCount,
+  ua.AnswerCount,
+  ua.AvgPostScore,
+  ua.AvgPostViewCount,
+  ua.TotalCommentsMade,
+  ua.TotalFavoritesReceived,
+  ua.TotalUpVotesReceived,
+  ua.TotalDownVotesReceived,
+  ua.BadgeCount,
+  ua.HasGoldBadge,
+  ua.HasSilverBadge,
+  ua.HasBronzeBadge,
+  CASE
+    WHEN ua.Reputation BETWEEN 0 AND 100 THEN 'Novice'
+    WHEN ua.Reputation BETWEEN 101 AND 500 THEN 'Beginner'
+    WHEN ua.Reputation BETWEEN 501 AND 2000 THEN 'Intermediate'
+    WHEN ua.Reputation BETWEEN 2001 AND 10000 THEN 'Advanced'
+    ELSE 'Expert'
+  END AS ReputationLevel,
+  qm.PostId AS QuestionId,
+  qm.PostScore AS QuestionScore,
+  qm.PostViewCount AS QuestionViewCount,
+  qm.CommentCount AS QuestionCommentCount,
+  qm.FavoriteCount AS QuestionFavoriteCount,
+  qm.UpVoteCount AS QuestionUpVotes,
+  qm.DownVoteCount AS QuestionDownVotes,
+  qm.IsClosed AS QuestionIsClosed,
+  qm.IsCommunityOwned AS QuestionIsCommunityOwned,
+  qm.EditCount AS QuestionEditCount,
+  qm.LatestTags AS QuestionLatestTags,
+  am.PostId AS AnswerId,
+  am.PostScore AS AnswerScore,
+  am.CommentCount AS AnswerCommentCount,
+  am.UpVoteCount AS AnswerUpVotes,
+  am.DownVoteCount AS AnswerDownVotes,
+  am.IsClosed AS AnswerIsClosed,
+  am.IsCommunityOwned AS AnswerIsCommunityOwned,
+  am.BestAnswerScore AS BestAnswerScoreOnQuestion,
+  am.NumberOfAnswers AS NumberOfAnswersToQuestion,
+  -- Set operator example (UNION ALL)
+  UNION ALL
+  SELECT
+    NULL AS DisplayName,
+    NULL AS Reputation,
+    NULL AS UserCreationDate,
+    NULL AS TotalPosts,
+    NULL AS QuestionCount,
+    NULL AS AnswerCount,
+    NULL AS AvgPostScore,
+    NULL AS AvgPostViewCount,
+    NULL AS TotalCommentsMade,
+    NULL AS TotalFavoritesReceived,
+    NULL AS TotalUpVotesReceived,
+    NULL AS TotalDownVotesReceived,
+    NULL AS BadgeCount,
+    NULL AS HasGoldBadge,
+    NULL AS HasSilverBadge,
+    NULL AS HasBronzeBadge,
+    NULL AS ReputationLevel,
+    NULL AS QuestionId,
+    NULL AS QuestionScore,
+    NULL AS QuestionViewCount,
+    NULL AS QuestionCommentCount,
+    NULL AS QuestionFavoriteCount,
+    NULL AS QuestionUpVotes,
+    NULL AS QuestionDownVotes,
+    NULL AS QuestionIsClosed,
+    NULL AS QuestionIsCommunityOwned,
+    NULL AS QuestionEditCount,
+    NULL AS QuestionLatestTags,
+    pl.PostId AS AnswerId, -- Reuse AnswerId column for PostId in this branch
+    pl.RelatedPostId AS AnswerScore, -- Reuse AnswerScore column for RelatedPostId
+    CASE WHEN lt.Name = 'Linked' THEN 1 ELSE 0 END AS AnswerCommentCount, -- Placeholder for LinkTypeId
+    CASE WHEN lt.Name = 'Duplicate' THEN 1 ELSE 0 END AS AnswerUpVotes, -- Placeholder for LinkTypeId
+    NULL AS AnswerDownVotes,
+    NULL AS AnswerIsClosed,
+    NULL AS AnswerIsCommunityOwned,
+    NULL AS BestAnswerScoreOnQuestion,
+    NULL AS NumberOfAnswersToQuestion
+  FROM
+    PostLinks pl
+    LEFT JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+  WHERE
+    lt.Name IN ('Linked', 'Duplicate') -- Filter for specific link types
+  -- Complicated predicates and expressions
+  HAVING
+    (
+      ua.Reputation > 1000 OR ua.UserViews > 10000
+    )
+    AND ua.DisplayName NOT LIKE '%bot%'
+    AND ua.DisplayName IS NOT NULL
+    AND ua.UserCreationDate < DATE('now', '-1 year')
+    AND ua.TotalPosts > 10
+    AND ua.AnswerCount * 1.0 / ua.QuestionCount > 0.5 -- High answer to question ratio
+    AND ua.AvgPostScore > 10
+    AND (
+      qm.QuestionScore > 50 OR qm.QuestionViewCount > 5000
+    )
+    AND qm.IsClosed = 0
+    AND qm.EditCount < 5
+    AND am.NumberOfAnswers > 10
+    AND am.BestAnswerScore > 20
+  ORDER BY
+    ua.Reputation DESC,
+    ua.UserCreationDate ASC;

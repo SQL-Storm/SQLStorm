@@ -1,0 +1,144 @@
+WITH UserAgg AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        COALESCE(u.Reputation, 0) AS Reputation,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+        SUM(CASE WHEN COALESCE(b.TagBased, FALSE) = TRUE THEN 1 ELSE 0 END) AS TagBasedBadgeCount
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+PostStats AS (
+    SELECT 
+        p.OwnerUserId AS UserId,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswerCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS QuestionScoreSum,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS AnswerScoreSum,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+
+VoteAgg AS (
+    SELECT 
+        v.PostId,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVotes,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVotes,
+        MAX(v.CreationDate) AS LastVoteDate
+    FROM Votes v
+    GROUP BY v.PostId
+),
+
+TopTags AS (
+    SELECT 
+        pt.Id,
+        pt.Tags,
+        regexp_split_to_table(pt.Tags, '[><]+') AS Tag,
+        ROW_NUMBER() OVER (PARTITION BY pt.Id ORDER BY regexp_split_to_table(pt.Tags, '[><]+')) AS TagPos
+    FROM Posts pt
+    WHERE pt.PostTypeId = 1 AND pt.Tags IS NOT NULL
+),
+
+UserTagScore AS (
+    SELECT 
+        u.Id AS UserId,
+        t.Tag,
+        SUM(p.Score) AS TagScore,
+        COUNT(p.Id) AS TaggedPostCount
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id
+    JOIN TopTags t ON t.Id = p.Id
+    GROUP BY u.Id, t.Tag
+),
+
+RankedUsers AS (
+    SELECT 
+        ua.Id,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.GoldBadges,
+        ua.SilverBadges,
+        ua.BronzeBadges,
+        COALESCE(ps.QuestionCount, 0) AS QuestionCount,
+        COALESCE(ps.AnswerCount, 0) AS AnswerCount,
+        COALESCE(ps.QuestionScoreSum, 0) AS QuestionScoreSum,
+        COALESCE(ps.AnswerScoreSum, 0) AS AnswerScoreSum,
+        COALESCE(va.UpVotes, 0) AS TotalUpVotes,
+        COALESCE(va.DownVotes, 0) AS TotalDownVotes,
+        ROW_NUMBER() OVER (ORDER BY ua.Reputation DESC, ua.GoldBadges DESC, ua.SilverBadges DESC) AS ReputationRank
+    FROM UserAgg ua
+    LEFT JOIN PostStats ps ON ps.UserId = ua.Id
+    LEFT JOIN VoteAgg va ON va.PostId = (
+        SELECT p2.Id
+        FROM Posts p2
+        WHERE p2.OwnerUserId = ua.Id
+        ORDER BY p2.CreationDate DESC
+        LIMIT 1
+    )
+)
+
+SELECT 
+    ru.Id,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.ReputationRank,
+    ru.GoldBadges,
+    ru.SilverBadges,
+    ru.BronzeBadges,
+    ru.QuestionCount,
+    ru.AnswerCount,
+    ru.QuestionScoreSum,
+    ru.AnswerScoreSum,
+    ru.TotalUpVotes,
+    ru.TotalDownVotes,
+    COALESCE(ts.Tag, 'N/A') AS TopTag,
+    COALESCE(ts.TagScore, 0) AS TopTagScore,
+    COALESCE(ts.TaggedPostCount, 0) AS TopTagPostCount,
+    CASE WHEN ru.Reputation IS NULL THEN 'No Rep' ELSE 'Has Rep' END AS RepStatus,
+    'User_' || CAST(ru.Id AS VARCHAR) AS UserKey
+FROM RankedUsers ru
+LEFT JOIN LATERAL (
+    SELECT 
+        uts.Tag,
+        uts.TagScore,
+        uts.TaggedPostCount
+    FROM UserTagScore uts
+    WHERE uts.UserId = ru.Id
+    ORDER BY uts.TagScore DESC, uts.TaggedPostCount DESC
+    LIMIT 1
+) ts ON TRUE
+WHERE ru.ReputationRank <= 100
+
+UNION ALL
+
+SELECT 
+    CAST(NULL AS integer) AS Id,
+    'Aggregate' AS DisplayName,
+    SUM(ua.Reputation) AS Reputation,
+    CAST(NULL AS integer) AS ReputationRank,
+    SUM(ua.GoldBadges) AS GoldBadges,
+    SUM(ua.SilverBadges) AS SilverBadges,
+    SUM(ua.BronzeBadges) AS BronzeBadges,
+    SUM(ps.QuestionCount) AS QuestionCount,
+    SUM(ps.AnswerCount) AS AnswerCount,
+    SUM(ps.QuestionScoreSum) AS QuestionScoreSum,
+    SUM(ps.AnswerScoreSum) AS AnswerScoreSum,
+    SUM(ru.TotalUpVotes) AS TotalUpVotes,
+    SUM(ru.TotalDownVotes) AS TotalDownVotes,
+    CAST(NULL AS varchar) AS TopTag,
+    CAST(NULL AS numeric) AS TopTagScore,
+    CAST(NULL AS integer) AS TopTagPostCount,
+    'TOTAL' AS RepStatus,
+    CAST(NULL AS varchar) AS UserKey
+FROM RankedUsers ru
+JOIN UserAgg ua ON ua.Id = ru.Id
+LEFT JOIN PostStats ps ON ps.UserId = ua.Id
+WHERE 1 = 1
+GROUP BY CAST(NULL AS integer), 'Aggregate'
+HAVING COUNT(*) > 0;

@@ -1,0 +1,53 @@
+-- {"query": "6788.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-micro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 499} 
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    MAX(u.CreationDate) AS LatestAccountActivity,
+    MAX(p.LastActivityDate) AS LatestPostActivity,
+    b.Class,
+    b.Name,
+    ph.Comment,
+    ph.RevisionGUID,
+    ph.CreationDate
+FROM 
+    Users u
+LEFT JOIN 
+    (SELECT 
+         ph.PostId,
+         ph.RevisionGUID,
+         ph.CreationDate,
+         ph.Comment,
+         ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+     FROM 
+         PostHistory ph
+     WHERE 
+         ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 13, 14, 15, 19, 20, 33, 34, 35, 36, 50, 52, 53, 66)) 
+     AS ph ON u.Id = ph.UserId AND ph.rn = 1
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    (SELECT 
+         PostId, 
+         COUNT(*) AS CommentCount
+     FROM 
+         Comments
+     GROUP BY 
+         PostId) AS c ON p.Id = c.PostId
+WHERE 
+    u.Reputation > 1000
+    AND p.PostTypeId IN (1, 2)
+    AND (p.LastEditDate > p.CreationDate OR p.LastEditDate IS NULL)
+GROUP BY 
+    u.Id, 
+    b.Id, 
+    ph.PostId
+HAVING 
+    COUNT(p.Id) > 5
+ORDER BY 
+    TotalPosts DESC, 
+    LatestAccountActivity DESC;

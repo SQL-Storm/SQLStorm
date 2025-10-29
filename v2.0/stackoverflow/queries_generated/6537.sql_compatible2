@@ -1,0 +1,50 @@
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    MAX(u.CreationDate) AS LatestAccountActivity,
+    MAX(p.LastActivityDate) AS LatestPostActivity,
+    AVG(p.Score) AS AvgPostScore,
+    MAX(ph_latest.CreationDate) AS LatestPostHistory,
+    (
+        SELECT STRING_AGG(t2.TagName, ', ')
+        FROM Tags t2
+        WHERE t2.Id IN (
+            SELECT DISTINCT t3.Id
+            FROM Posts p2
+            JOIN Tags t3 ON t3.ExcerptPostId = p2.Id
+            WHERE p2.Id = ph_latest.PostId
+        )
+    ) AS MostFrequentTags
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    PostHistory ph_latest ON p.Id = ph_latest.PostId AND ph_latest.PostHistoryTypeId = 10
+LEFT JOIN 
+    (
+        SELECT 
+            ph2.PostId,
+            ph2.CreationDate
+        FROM 
+            PostHistory ph2
+        WHERE 
+            ph2.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20, 35)
+    ) ph ON p.Id = ph.PostId
+WHERE 
+    u.Reputation > 1000
+GROUP BY 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    p.LastActivityDate,
+    ph_latest.CreationDate
+HAVING 
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id ELSE NULL END) > 10
+ORDER BY 
+    u.Reputation DESC, 
+    TotalPosts DESC;

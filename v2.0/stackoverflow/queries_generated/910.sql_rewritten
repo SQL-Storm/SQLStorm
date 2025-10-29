@@ -1,0 +1,387 @@
+-- {"query": "910.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3562} 
+with
+-- 1) recent active users with mixed null/location logic
+recent_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    coalesce(nullif(trim(u.location), ''), 'Unknown') as location_norm,
+    u.reputation,
+    u.creationdate,
+    u.lastaccessdate,
+    u.upvotes,
+    u.downvotes,
+    row_number() over (order by greatest(u.lastaccessdate, u.creationdate) desc, u.reputation desc, u.id) as rn_recent
+  from users u
+  where u.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '10 years'
+),
+-- 2) questions in last N years with parsed tags array and complexity around nulls
+recent_questions as (
+  select
+    p.id as question_id,
+    p.owneruserid,
+    p.creationdate as q_created,
+    p.lastactivitydate as q_lastact,
+    p.score as q_score,
+    p.viewcount,
+    p.answercount,
+    p.favoritecount,
+    p.closeddate,
+    p.acceptedanswerid,
+    p.title,
+    p.tags,
+    case when p.tags is not null and length(p.tags) >= 2 then string_to_array(substring(p.tags, 2, length(p.tags)-2), '><') else array[]::varchar[] end as tag_arr
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '8 years'
+),
+-- 3) answers to the above questions with answerer info
+answers as (
+  select
+    a.id as answer_id,
+    a.parentid as question_id,
+    a.owneruserid as answerer_id,
+    a.score as a_score,
+    a.creationdate as a_created
+  from posts a
+  where a.posttypeid = 2
+),
+-- 4) votes aggregation per post with conditional sums
+vote_agg as (
+  select
+    v.postid,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+    sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started,
+    sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded,
+    min(v.creationdate) as first_vote_at,
+    max(v.creationdate) as last_vote_at,
+    count(*) as total_votes
+  from votes v
+  group by v.postid
+),
+-- 5) post links (duplicates and general links)
+link_agg as (
+  select
+    pl.postid,
+    sum(case when pl.linktypeid = 3 then 1 else 0 end) as dup_links,
+    sum(case when pl.linktypeid = 1 then 1 else 0 end) as ref_links,
+    count(*) as total_links
+  from postlinks pl
+  group by pl.postid
+),
+-- 6) post history signals: closures, migrations, edits
+ph_signals as (
+  select
+    ph.postid,
+    sum(case when ph.posthistorytypeid = 10 then 1 else 0 end) as closed_events,
+    sum(case when ph.posthistorytypeid = 11 then 1 else 0 end) as reopened_events,
+    sum(case when ph.posthistorytypeid in (4,5,6,24) then 1 else 0 end) as edit_events,
+    sum(case when ph.posthistorytypeid in (35,36) then 1 else 0 end) as migration_events,
+    max(ph.creationdate) as last_history_at,
+    count(*) as history_events
+  from posthistory ph
+  group by ph.postid
+),
+-- 7) badges per user and class, with tag-based split
+badge_agg as (
+  select
+    b.userid,
+    sum(case when b.class = 1 then 1 else 0 end) as gold_cnt,
+    sum(case when b.class = 2 then 1 else 0 end) as silver_cnt,
+    sum(case when b.class = 3 then 1 else 0 end) as bronze_cnt,
+    sum(case when b.tagbased = 1 then 1 else 0 end) as tag_badges,
+    count(*) as total_badges,
+    max(b.date) as last_badge_at
+  from badges b
+  group by b.userid
+),
+-- 8) comments summary on questions
+comment_agg as (
+  select
+    c.postid,
+    count(*) as comment_count,
+    sum(greatest(c.score, 0)) as nonneg_comment_score,
+    max(c.creationdate) as last_comment_at
+  from comments c
+  group by c.postid
+),
+-- 9) tag popularity for tags present in recent questions
+tag_pop as (
+  select
+    t.tagname,
+    t.count as total_tag_count,
+    t.ismodertoronly,
+    t.isrequired
+  from tags t
+),
+-- 10) explode question tags
+question_tags as (
+  select
+    q.question_id,
+    lower(trim(tag)) as tag
+  from recent_questions q
+  left join lateral unnest(q.tag_arr) as tag on true
+),
+-- 11) per-question tag stats with window functions
+question_tag_stats as (
+  select
+    qt.question_id,
+    count(*) as tag_cnt,
+    sum(case when tp.total_tag_count > 0 then 1 else 0 end) as known_tag_cnt,
+    max(tp.total_tag_count) as max_tag_popularity,
+    min(tp.total_tag_count) as min_tag_popularity,
+    avg(coalesce(tp.total_tag_count,0))::numeric as avg_tag_popularity
+  from question_tags qt
+  left join tag_pop tp on tp.tagname = qt.tag
+  group by qt.question_id
+),
+-- 12) determine "fastest accepted answer" metrics with correlated subqueries
+accepted_answer_metrics as (
+  select
+    q.question_id,
+    q.acceptedanswerid,
+    (select a.score from posts a where a.id = q.acceptedanswerid) as accepted_answer_score,
+    (select a.owneruserid from posts a where a.id = q.acceptedanswerid) as accepted_answerer_id,
+    (select extract(epoch from (a.creationdate - q.q_created)) from posts a where a.id = q.acceptedanswerid) as seconds_to_accept
+  from recent_questions q
+),
+-- 13) answer competition: first answer and best score windows
+answer_competition as (
+  select
+    a.question_id,
+    min(a.a_created) as first_answer_at,
+    max(a.a_score) as best_answer_score,
+    count(*) as answer_cnt
+  from answers a
+  join recent_questions q on q.question_id = a.question_id
+  group by a.question_id
+),
+-- 14) user engagement score combining badges, votes, and recency
+user_engagement as (
+  select
+    u.user_id,
+    coalesce(b.total_badges,0) as total_badges,
+    coalesce(b.gold_cnt,0) as gold_badges,
+    coalesce(b.silver_cnt,0) as silver_badges,
+    coalesce(b.bronze_cnt,0) as bronze_badges,
+    coalesce(b.tag_badges,0) as tag_badges,
+    u.upvotes,
+    u.downvotes,
+    u.reputation,
+    u.lastaccessdate,
+    -- heuristic engagement score
+    (
+      0.6 * ln(1 + greatest(u.upvotes - u.downvotes, 0)) +
+      0.3 * ln(1 + coalesce(b.total_badges,0)) +
+      0.1 * ln(1 + greatest(u.reputation, 0))
+    )::numeric(18,6) as engagement_score
+  from recent_users u
+  left join badge_agg b on b.userid = u.user_id
+),
+-- 15) rolling activity windows on questions using window functions
+question_activity_windows as (
+  select
+    q.question_id,
+    q.q_created,
+    q.q_lastact,
+    q.q_score,
+    q.viewcount,
+    sum(q.viewcount) over (order by q.q_created rows between unbounded preceding and current row) as cum_views_by_time,
+    avg(q.q_score) over (order by q.q_created rows between 100 preceding and current row) as moving_avg_score_100,
+    rank() over (order by q.viewcount desc, q.q_score desc) as rank_views
+  from recent_questions q
+),
+-- 16) identify potentially duplicate cluster via links and titles (string ops)
+duplicate_candidates as (
+  select
+    q.question_id,
+    la.dup_links,
+    case
+      when q.title is null then 0
+      when position('duplicate' in lower(q.title)) > 0 then 1
+      else 0
+    end as title_mentions_duplicate
+  from recent_questions q
+  left join link_agg la on la.postid = q.question_id
+),
+-- 17) join everything to build a wide row
+wide as (
+  select
+    q.question_id,
+    q.owneruserid as asker_id,
+    ru.displayname as asker_name,
+    ru.location_norm as asker_location,
+    ue.engagement_score as asker_engagement,
+    q.q_created,
+    q.q_lastact,
+    q.q_score,
+    q.viewcount,
+    q.answercount,
+    q.favoritecount,
+    ph.closed_events,
+    ph.reopened_events,
+    ph.edit_events,
+    ph.migration_events,
+    ph.last_history_at,
+    ph.history_events,
+    va.upvotes as q_upvotes,
+    va.downvotes as q_downvotes,
+    va.favorites as q_favorites,
+    va.total_votes as q_total_votes,
+    ca.comment_count,
+    ca.nonneg_comment_score,
+    ca.last_comment_at,
+    qts.tag_cnt,
+    qts.known_tag_cnt,
+    qts.max_tag_popularity,
+    qts.min_tag_popularity,
+    qts.avg_tag_popularity,
+    ac.first_answer_at,
+    ac.best_answer_score,
+    ac.answer_cnt,
+    aam.acceptedanswerid,
+    aam.accepted_answer_score,
+    aam.accepted_answerer_id,
+    aam.seconds_to_accept,
+    dc.dup_links,
+    dc.title_mentions_duplicate,
+    q.tags,
+    qa.cum_views_by_time,
+    qa.moving_avg_score_100,
+    qa.rank_views
+  from recent_questions q
+  left join recent_users ru on ru.user_id = q.owneruserid
+  left join user_engagement ue on ue.user_id = q.owneruserid
+  left join ph_signals ph on ph.postid = q.question_id
+  left join vote_agg va on va.postid = q.question_id
+  left join comment_agg ca on ca.postid = q.question_id
+  left join question_tag_stats qts on qts.question_id = q.question_id
+  left join answer_competition ac on ac.question_id = q.question_id
+  left join accepted_answer_metrics aam on aam.question_id = q.question_id
+  left join duplicate_candidates dc on dc.question_id = q.question_id
+  left join question_activity_windows qa on qa.question_id = q.question_id
+),
+-- 18) compute per-question composite score with NULL handling and complex predicates
+scored as (
+  select
+    w.*,
+    (
+      1.5 * coalesce(w.q_score, 0) +
+      0.8 * ln(1 + coalesce(w.viewcount, 0)) +
+      0.6 * coalesce(w.q_upvotes - w.q_downvotes, 0) +
+      0.5 * coalesce(w.best_answer_score, 0) +
+      1.0 * case when w.acceptedanswerid is not null then 1 else 0 end +
+      0.2 * coalesce(w.comment_count, 0) -
+      1.2 * case when w.closed_events > 0 then 1 else 0 end -
+      0.7 * coalesce(w.dup_links, 0) +
+      0.3 * coalesce(w.asker_engagement, 0)
+    )::numeric(18,6) as composite_score,
+    case
+      when w.closed_events > 0 or w.title_mentions_duplicate = 1 then 'closed_or_dup'
+      when w.answercount = 0 and cast('2024-10-01 12:34:56' as timestamp) - w.q_created > interval '30 days' then 'stale_no_answers'
+      when coalesce(w.viewcount,0) > 10000 and coalesce(w.q_score,0) >= 5 then 'popular'
+      when coalesce(w.viewcount,0) < 100 and coalesce(w.q_score,0) <= 0 then 'low_impact'
+      else 'normal'
+    end as bucket
+  from wide w
+),
+-- 19) percentile ranks via window functions
+ranked as (
+  select
+    s.*,
+    percent_rank() over (order by s.composite_score) as pr_all,
+    cume_dist() over (order by s.composite_score desc) as cd_all,
+    ntile(20) over (order by s.composite_score desc) as ntile20
+  from scored s
+),
+-- 20) build a small reference set via set operators (intersect/except/union) for extra complexity
+high_interest_ids as (
+  (
+    select question_id from ranked where bucket = 'popular'
+  )
+  union
+  (
+    select question_id from ranked where pr_all >= 0.95
+  )
+  except
+  (
+    select question_id from ranked where bucket in ('closed_or_dup','low_impact')
+  )
+),
+-- 21) anti-join for questions without votes but with comments or answers
+edge_cases as (
+  select
+    w.question_id,
+    case when w.q_total_votes is null or w.q_total_votes = 0 then 1 else 0 end as no_votes,
+    case when coalesce(w.comment_count,0) > 0 or coalesce(w.answer_cnt,0) > 0 then 1 else 0 end as has_discussion
+  from wide w
+),
+-- 22) compute time-to-first-activity and time ranges
+time_metrics as (
+  select
+    w.question_id,
+    extract(epoch from (coalesce(w.first_answer_at, w.last_comment_at, w.q_lastact) - w.q_created)) as secs_to_first_activity,
+    extract(epoch from (w.q_lastact - w.q_created)) as secs_age,
+    extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - w.q_created)) as secs_age_now
+  from wide w
+)
+select
+  r.question_id,
+  r.asker_id,
+  r.asker_name,
+  r.asker_location,
+  r.q_created,
+  r.q_lastact,
+  r.q_score,
+  r.viewcount,
+  r.answercount,
+  r.favoritecount,
+  r.q_upvotes,
+  r.q_downvotes,
+  r.q_total_votes,
+  r.comment_count,
+  r.best_answer_score,
+  r.acceptedanswerid,
+  r.accepted_answer_score,
+  r.seconds_to_accept,
+  r.tag_cnt,
+  r.avg_tag_popularity,
+  r.dup_links,
+  r.title_mentions_duplicate,
+  r.bucket,
+  r.composite_score,
+  r.rank_views,
+  r.moving_avg_score_100,
+  tm.secs_to_first_activity,
+  tm.secs_age,
+  tm.secs_age_now,
+  case when hi.question_id is not null then 1 else 0 end as is_high_interest,
+  ec.no_votes,
+  ec.has_discussion
+from ranked r
+left join time_metrics tm on tm.question_id = r.question_id
+left join high_interest_ids hi on hi.question_id = r.question_id
+left join edge_cases ec on ec.question_id = r.question_id
+where
+  -- elaborate predicate combining multiple dimensions
+  (
+    r.bucket in ('popular','normal')
+    and r.composite_score > 0
+    and coalesce(r.q_upvotes,0) >= coalesce(r.q_downvotes,0)
+    and (
+      r.tag_cnt >= 1
+      or (r.comment_count > 0 and r.answercount > 0)
+    )
+  )
+  or (
+    r.bucket = 'stale_no_answers'
+    and r.viewcount between 100 and 10000
+    and (r.moving_avg_score_100 is null or r.moving_avg_score_100 <= 1.5)
+  )
+order by
+  is_high_interest desc,
+  r.composite_score desc,
+  r.q_created desc
+limit 500;

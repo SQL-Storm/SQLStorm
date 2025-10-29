@@ -1,0 +1,381 @@
+with recent_activity as (
+    select
+        p.id as post_id,
+        p.posttypeid,
+        p.owneruserid,
+        p.creationdate,
+        p.lastactivitydate,
+        p.score,
+        p.viewcount,
+        p.title,
+        p.tags,
+        coalesce(nullif(trim(p.ownerdisplayname), ''), u.displayname, '(unknown)') as owner_name,
+        u.reputation,
+        date_trunc('month', coalesce(p.lastactivitydate, p.creationdate)) as activity_month
+    from posts p
+    left join users u on u.id = p.owneruserid
+    where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+),
+agg_votes as (
+    select
+        v.postid,
+        sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+        sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+        sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded,
+        count(*) filter (where v.votetypeid in (2,3)) as total_ud_votes,
+        max(v.creationdate) as last_vote_at
+    from votes v
+    where v.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+    group by v.postid
+),
+tag_expansion as (
+    select
+        p.id as post_id,
+        unnest(string_to_array(substring(p.tags, 2, greatest(length(p.tags)-2,0)), '><')) as tag
+    from posts p
+    where p.posttypeid = 1
+      and p.tags is not null
+),
+tag_stats as (
+    select
+        te.post_id,
+        count(*) as tag_count,
+        string_agg(lower(te.tag), '|' order by lower(te.tag)) as tag_concat,
+        max(case when lower(te.tag) in ('performance','sql','indexing','postgresql','mysql','tuning') then 1 else 0 end) as has_perf_tag
+    from tag_expansion te
+    group by te.post_id
+),
+comment_aggs as (
+    select
+        c.postid,
+        count(*) as comment_count,
+        max(c.creationdate) as last_comment_at,
+        sum(case when c.score > 0 then 1 else 0 end) as pos_comments,
+        sum(case when c.score < 0 then 1 else 0 end) as neg_comments
+    from comments c
+    where c.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+    group by c.postid
+),
+link_dupes as (
+    select
+        pl.postid,
+        sum(case when pl.linktypeid = 3 then 1 else 0 end) as dup_links,
+        sum(case when pl.linktypeid = 1 then 1 else 0 end) as ref_links,
+        count(*) as total_links,
+        max(pl.creationdate) as last_link_at
+    from postlinks pl
+    where pl.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+    group by pl.postid
+),
+close_events as (
+    select
+        ph.postid,
+        min(ph.creationdate) filter (where ph.posthistorytypeid = 10) as first_closed_at,
+        max(ph.creationdate) filter (where ph.posthistorytypeid = 11) as last_reopened_at,
+        count(*) filter (where ph.posthistorytypeid = 10) as close_votes,
+        count(*) filter (where ph.posthistorytypeid = 11) as reopen_votes,
+        max(case when ph.posthistorytypeid = 10 and ph.comment ~ '^[0-9]+' then ph.comment else null end) as last_close_reason_raw
+    from posthistory ph
+    where ph.posthistorytypeid in (10,11)
+      and ph.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+    group by ph.postid
+),
+accepted_answer as (
+    select
+        q.id as question_id,
+        a.id as answer_id,
+        a.owneruserid as answerer_id,
+        a.score as answer_score,
+        a.creationdate as answer_created
+    from posts q
+    join posts a on a.id = q.acceptedanswerid
+    where q.posttypeid = 1
+),
+answer_counts as (
+    select
+        p.parentid as question_id,
+        count(*) as answers_last_3y,
+        avg(p.score) as avg_answer_score,
+        max(p.creationdate) as last_answer_at
+    from posts p
+    where p.posttypeid = 2
+      and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+    group by p.parentid
+),
+user_badge_summary as (
+    select
+        b.userid,
+        sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+        sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+        sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+        count(*) as total_badges,
+        max(b.date) as last_badge_at
+    from badges b
+    where b.date >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+    group by b.userid
+),
+monthly_activity as (
+    select
+        ra.activity_month,
+        ra.posttypeid,
+        count(*) as posts_in_month,
+        avg(ra.score) as avg_score_in_month
+    from recent_activity ra
+    group by ra.activity_month, ra.posttypeid
+),
+ranked_questions as (
+    select
+        ra.post_id,
+        ra.owneruserid,
+        ra.reputation,
+        ra.title,
+        ra.creationdate,
+        ra.score,
+        coalesce(ra.viewcount,0) as viewcount,
+        coalesce(ag.upvotes,0) as upvotes,
+        coalesce(ag.downvotes,0) as downvotes,
+        coalesce(ag.bounty_awarded,0) as bounty_awarded,
+        coalesce(ts.tag_count,0) as tag_count,
+        coalesce(ts.has_perf_tag,0) as has_perf_tag,
+        coalesce(ca.comment_count,0) as comment_count,
+        coalesce(ld.dup_links,0) as dup_links,
+        coalesce(ld.ref_links,0) as ref_links,
+        coalesce(ce.close_votes,0) as close_votes,
+        coalesce(ce.reopen_votes,0) as reopen_votes,
+        coalesce(ac.answers_last_3y,0) as answers_last_3y,
+        ac.avg_answer_score,
+        aa.answer_id as accepted_answer_id,
+        aa.answer_score as accepted_answer_score,
+        row_number() over (partition by date_trunc('month', ra.creationdate) order by ra.score desc NULLS LAST, coalesce(ag.upvotes,0) desc, coalesce(ra.viewcount,0) desc) as month_rank,
+        dense_rank() over (order by coalesce(ra.viewcount,0) desc) as global_view_rank,
+        -- percentiles vary by dialect; compute 90th percentile of viewcount using a windowed approach:
+        max(case when percentile_rank <= 0.9 then pct_value end) over () as p90_views,
+        case
+            when ra.score is null then -1
+            when coalesce(ag.upvotes,0) + coalesce(ag.downvotes,0) = 0 then 0
+            else (coalesce(ag.upvotes,0) - coalesce(ag.downvotes,0)) * 1.0 / greatest(coalesce(ag.upvotes,0) + coalesce(ag.downvotes,0),1)
+        end as vote_balance_ratio,
+        case when ra.posttypeid = 1 then 1 else 0 end as is_question
+    from recent_activity ra
+    left join agg_votes ag on ag.postid = ra.post_id
+    left join tag_stats ts on ts.post_id = ra.post_id
+    left join comment_aggs ca on ca.postid = ra.post_id
+    left join link_dupes ld on ld.postid = ra.post_id
+    left join close_events ce on ce.postid = ra.post_id
+    left join answer_counts ac on ac.question_id = ra.post_id
+    left join accepted_answer aa on aa.question_id = ra.post_id
+    -- compute percentile-related helpers: generate pct_value and percentile_rank per row
+    left join (
+        select
+            post_id as pct_post_id,
+            viewcount as pct_value,
+            ntile(1000) over (order by viewcount) / 1000.0 as percentile_rank
+        from (
+            select distinct post_id, coalesce(viewcount,0) as viewcount
+            from recent_activity
+        ) x
+    ) pct on pct.pct_post_id = ra.post_id
+),
+question_filter as (
+    select
+        rq.post_id,
+        rq.owneruserid,
+        rq.reputation,
+        rq.title,
+        rq.creationdate,
+        rq.score,
+        rq.viewcount,
+        rq.upvotes,
+        rq.downvotes,
+        rq.bounty_awarded,
+        rq.tag_count,
+        rq.has_perf_tag,
+        rq.comment_count,
+        rq.dup_links,
+        rq.ref_links,
+        rq.close_votes,
+        rq.reopen_votes,
+        rq.answers_last_3y,
+        rq.avg_answer_score,
+        rq.accepted_answer_id,
+        rq.accepted_answer_score,
+        rq.month_rank,
+        rq.global_view_rank,
+        rq.p90_views,
+        rq.vote_balance_ratio,
+        rq.is_question,
+        case
+            when rq.has_perf_tag = 1 then 2
+            when rq.close_votes > rq.reopen_votes then -1
+            when rq.dup_links >= 2 then -2
+            else 1
+        end as quality_signal
+    from ranked_questions rq
+    where rq.is_question = 1
+    group by
+        rq.post_id, rq.owneruserid, rq.reputation, rq.title, rq.creationdate, rq.score, rq.viewcount,
+        rq.upvotes, rq.downvotes, rq.bounty_awarded, rq.tag_count, rq.has_perf_tag, rq.comment_count,
+        rq.dup_links, rq.ref_links, rq.close_votes, rq.reopen_votes, rq.answers_last_3y, rq.avg_answer_score,
+        rq.accepted_answer_id, rq.accepted_answer_score, rq.month_rank, rq.global_view_rank, rq.p90_views,
+        rq.vote_balance_ratio, rq.is_question
+),
+user_enrichment as (
+    select
+        qf.post_id,
+        qf.title,
+        qf.creationdate,
+        qf.score,
+        qf.viewcount,
+        qf.upvotes,
+        qf.downvotes,
+        qf.vote_balance_ratio,
+        qf.comment_count,
+        qf.dup_links,
+        qf.ref_links,
+        qf.close_votes,
+        qf.reopen_votes,
+        qf.answers_last_3y,
+        qf.avg_answer_score,
+        qf.accepted_answer_id,
+        qf.accepted_answer_score,
+        qf.month_rank,
+        qf.global_view_rank,
+        qf.p90_views,
+        qf.quality_signal,
+        qf.reputation,
+        ub.total_badges,
+        ub.gold_badges,
+        ub.silver_badges,
+        ub.bronze_badges,
+        ub.last_badge_at,
+        case
+            when qf.reputation is null then 'unknown'
+            when qf.reputation >= 100000 then 'legend'
+            when qf.reputation >= 20000 then 'expert'
+            when qf.reputation >= 5000 then 'advanced'
+            when qf.reputation >= 1000 then 'intermediate'
+            else 'novice'
+        end as rep_bucket,
+        qf.owneruserid
+    from question_filter qf
+    left join user_badge_summary ub on ub.userid = qf.owneruserid
+),
+scored as (
+    select
+        ue.post_id,
+        ue.title,
+        ue.creationdate,
+        ue.score,
+        ue.viewcount,
+        ue.upvotes,
+        ue.downvotes,
+        ue.vote_balance_ratio,
+        ue.comment_count,
+        ue.answers_last_3y,
+        ue.avg_answer_score,
+        ue.accepted_answer_id,
+        ue.accepted_answer_score,
+        ue.month_rank,
+        ue.global_view_rank,
+        ue.p90_views,
+        ue.quality_signal,
+        ue.reputation,
+        ue.total_badges,
+        ue.gold_badges,
+        ue.silver_badges,
+        ue.bronze_badges,
+        ue.last_badge_at,
+        ue.rep_bucket,
+        (
+            coalesce(ue.score,0) * 2
+            + ln(greatest(ue.viewcount,1)) * 1.5
+            + coalesce(ue.upvotes,0) * 0.8
+            - coalesce(ue.downvotes,0) * 0.9
+            + coalesce(ue.comment_count,0) * 0.2
+            + coalesce(ue.answers_last_3y,0) * 0.7
+            + coalesce(ue.accepted_answer_score,0) * 0.5
+            + case when ue.dup_links > 0 then -2 else 0 end
+            + case when ue.close_votes > ue.reopen_votes then -3 else 0 end
+            + case when ue.viewcount >= coalesce(ue.p90_views, 0) then 5 else 0 end
+            + case ue.rep_bucket
+                when 'legend' then 4
+                when 'expert' then 2
+                when 'advanced' then 1
+                else 0
+              end
+            + ue.quality_signal
+        ) as composite_score
+    from user_enrichment ue
+),
+top_per_month as (
+    select *
+    from (
+        select
+            s.*,
+            row_number() over (partition by date_trunc('month', s.creationdate) order by s.composite_score desc, s.viewcount desc, s.score desc) as rn
+        from scored s
+    ) z
+    where z.rn <= 10
+),
+anomalies as (
+    select
+        s.post_id,
+        s.creationdate,
+        s.viewcount,
+        s.score,
+        s.upvotes,
+        s.downvotes,
+        s.vote_balance_ratio,
+        case
+            when s.viewcount > 10000 and s.vote_balance_ratio < 0 then 'high_views_negative_votes'
+            when s.viewcount < 50 and s.score > 10 then 'low_views_high_score'
+            when s.dup_links >= 3 and s.reopen_votes = 0 then 'many_dupe_links_never_reopened'
+            else null
+        end as anomaly_type
+    from scored s
+    where (
+        (s.viewcount > 10000 and s.vote_balance_ratio < 0)
+        or (s.viewcount < 50 and s.score > 10)
+        or (s.dup_links >= 3 and s.reopen_votes = 0)
+    )
+)
+select
+    tpm.post_id,
+    tpm.title,
+    tpm.creationdate,
+    tpm.composite_score,
+    tpm.viewcount,
+    tpm.score,
+    tpm.upvotes,
+    tpm.downvotes,
+    tpm.vote_balance_ratio,
+    tpm.comment_count,
+    tpm.answers_last_3y,
+    tpm.accepted_answer_id,
+    tpm.accepted_answer_score,
+    tpm.rep_bucket,
+    tpm.gold_badges,
+    tpm.silver_badges,
+    tpm.bronze_badges,
+    tpm.dup_links,
+    tpm.close_votes,
+    tpm.reopen_votes,
+    tpm.month_rank,
+    tpm.global_view_rank,
+    tpm.p90_views,
+    coalesce(a.anomaly_type, 'none') as anomaly_type,
+    coalesce((
+        select extract(day from cast('2024-10-01 12:34:56' as timestamp) - ce.first_closed_at)
+        from close_events ce
+        where ce.postid = tpm.post_id
+    ), -1) as days_since_first_close,
+    case when tpm.post_id in (
+        select post_id from ranked_questions rq where coalesce(rq.upvotes,0)+coalesce(rq.downvotes,0) = 0 and coalesce(rq.viewcount,0) > 5000
+        union
+        select post_id from ranked_questions rq where rq.has_perf_tag = 1 and rq.score > 5
+    ) then 1 else 0 end as special_flag
+from top_per_month tpm
+left join anomalies a on a.post_id = tpm.post_id
+where tpm.composite_score = tpm.composite_score
+order by date_trunc('month', tpm.creationdate) desc, tpm.composite_score desc, tpm.viewcount desc
+limit 200;

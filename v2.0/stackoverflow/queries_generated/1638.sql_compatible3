@@ -1,0 +1,221 @@
+WITH UserActivityMetrics AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.Views AS TotalProfileViews,
+        U.UpVotes AS TotalUpVotesGiven,
+        U.DownVotes AS TotalDownVotesGiven,
+        COUNT(DISTINCT P.Id) AS PostsCreated,
+        COUNT(DISTINCT C.Id) AS CommentsMade,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsAsked,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersProvided,
+        MAX(P.CreationDate) AS LatestPostDate,
+        AVG(NULLIF(P.Score, 0)) AS AvgPostScore,
+        COALESCE(SUM(B.Class), 0) AS TotalBadgeClassValue
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    WHERE U.CreationDate >= DATE '2020-01-01'
+      AND U.LastAccessDate < DATE '2023-01-01'
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.Views, U.UpVotes, U.DownVotes, U.CreationDate, U.LastAccessDate
+    HAVING COUNT(DISTINCT P.Id) > 5 AND U.Reputation > 1000
+),
+PostHistoricalInsights AS (
+    SELECT
+        PH.PostId,
+        COUNT(DISTINCT PH.Id) AS TotalHistoryEntries,
+        MAX(PH.CreationDate) AS LastHistoryUpdate,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.Id END) AS EditCount,
+        SUM(CASE
+            WHEN PH.PostHistoryTypeId = 10 AND PH.Comment IS NOT NULL AND CAST(PH.Comment AS INTEGER) IN (101, 102) THEN 1
+            WHEN PH.PostHistoryTypeId = 12 THEN 1
+            ELSE 0
+        END) AS CloseDeleteVotes,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.CreationDate ELSE NULL END) AS LastClosedDate
+    FROM PostHistory PH
+    WHERE PH.CreationDate BETWEEN DATE '2021-01-01' AND DATE '2023-12-31'
+    GROUP BY PH.PostId
+    HAVING COUNT(DISTINCT PH.Id) > 2
+),
+TagPerformance AS (
+    SELECT
+        TagName,
+        SUM(P.Score) AS TotalTagScore,
+        COUNT(P.Id) AS TotalPostsWithTag,
+        AVG(P.ViewCount) AS AvgTagViewCount
+    FROM Posts P,
+         LATERAL (
+            SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(P.Tags FROM 2 FOR (CHAR_LENGTH(P.Tags)-2)), '><')) AS TagName
+         ) t
+    WHERE P.PostTypeId IN (1, 4, 5)
+    GROUP BY TagName
+    HAVING COUNT(P.Id) > 100
+),
+AggregatedPostPerformance AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.AcceptedAnswerId,
+        P.ParentId,
+        P.CreationDate,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.ClosedDate,
+        P.CommunityOwnedDate,
+        P.Title,
+        P.Tags,
+        P.Body,
+        UAM.DisplayName AS OwnerDisplayName,
+        UAM.Reputation AS OwnerReputation,
+        UAM.TotalProfileViews AS OwnerTotalViews,
+        PHI.TotalHistoryEntries,
+        PHI.EditCount,
+        PHI.CloseDeleteVotes,
+        PHI.LastClosedDate,
+        COALESCE(TP.TotalTagScore, 0) AS TotalTagScore,
+        COALESCE(TP.TotalPostsWithTag, 0) AS TotalPostsWithTag,
+        COALESCE(TP.AvgTagViewCount, 0.0) AS AvgTagViewCount,
+        COALESCE(P.Score, 0) * COALESCE(P.ViewCount, 1) AS RawEngagementScore,
+        (SELECT COUNT(DISTINCT V.Id) FROM Votes V WHERE V.PostId = P.Id AND V.VoteTypeId IN (2, 3)) AS TotalUpAndDownVotes,
+        (SELECT MAX(C.CreationDate) FROM Comments C WHERE C.PostId = P.Id AND C.UserId = P.OwnerUserId) AS OwnerLastCommentDate,
+        CASE
+            WHEN P.AcceptedAnswerId IS NOT NULL THEN 'HasAcceptedAnswer'
+            WHEN P.CommunityOwnedDate IS NOT NULL THEN 'CommunityOwned'
+            WHEN P.ClosedDate IS NOT NULL THEN 'Closed'
+            ELSE 'Open'
+        END AS PostStatus
+    FROM Posts P
+    JOIN UserActivityMetrics UAM ON P.OwnerUserId = UAM.UserId
+    LEFT JOIN PostHistoricalInsights PHI ON P.Id = PHI.PostId
+    LEFT JOIN LATERAL (
+        SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(P.Tags FROM 2 FOR (CHAR_LENGTH(P.Tags)-2)), '><')) AS PostTag
+    ) pt ON TRUE
+    LEFT JOIN TagPerformance TP ON pt.PostTag = TP.TagName
+    WHERE P.CreationDate BETWEEN DATE '2021-01-01' AND DATE '2023-06-30'
+      AND P.PostTypeId IN (1, 2)
+      AND P.Score > 0
+    GROUP BY
+        P.Id, P.PostTypeId, P.OwnerUserId, P.AcceptedAnswerId, P.ParentId, P.CreationDate,
+        P.Score, P.ViewCount, P.AnswerCount, P.CommentCount, P.FavoriteCount, P.ClosedDate,
+        P.CommunityOwnedDate, P.Title, P.Tags, P.Body,
+        UAM.DisplayName, UAM.Reputation, UAM.TotalProfileViews,
+        PHI.TotalHistoryEntries, PHI.EditCount, PHI.CloseDeleteVotes, PHI.LastClosedDate,
+        TP.TotalTagScore, TP.TotalPostsWithTag, TP.AvgTagViewCount
+),
+FinalSet AS (
+    SELECT
+        APP.PostId,
+        APP.PostTypeId,
+        APP.Title,
+        APP.OwnerDisplayName,
+        APP.OwnerReputation,
+        APP.Score,
+        APP.ViewCount,
+        APP.AnswerCount,
+        APP.CommentCount,
+        APP.FavoriteCount,
+        APP.TotalUpAndDownVotes,
+        APP.PostStatus,
+        APP.OwnerLastCommentDate,
+        APP.TotalHistoryEntries,
+        APP.EditCount,
+        APP.CloseDeleteVotes,
+        APP.TotalTagScore,
+        APP.AvgTagViewCount,
+        APP.AcceptedAnswerId,
+        APP.TotalPostsWithTag,
+        APP.Tags,
+        APP.Body,
+        APP.RawEngagementScore,
+        APP.OwnerUserId,
+        APP.CreationDate,
+        APP.LastClosedDate,
+        APP.OwnerTotalViews
+    FROM AggregatedPostPerformance APP
+)
+SELECT
+    F.PostId,
+    F.PostTypeId,
+    F.Title,
+    F.OwnerDisplayName,
+    F.OwnerReputation,
+    F.Score,
+    F.ViewCount,
+    F.AnswerCount,
+    F.CommentCount,
+    F.FavoriteCount,
+    F.TotalUpAndDownVotes,
+    F.PostStatus,
+    F.OwnerLastCommentDate,
+    F.TotalHistoryEntries,
+    F.EditCount,
+    F.CloseDeleteVotes,
+    F.TotalTagScore,
+    F.AvgTagViewCount,
+    (
+        CAST(COALESCE(F.Score, 0) AS NUMERIC)
+        + (COALESCE(F.ViewCount, 0) / 100.0)
+        + (COALESCE(F.AnswerCount, 0) * 2.5)
+        + (COALESCE(F.CommentCount, 0) * 0.75)
+        + (COALESCE(F.FavoriteCount, 0) * 5.0)
+        - (COALESCE(F.CloseDeleteVotes, 0) * 10.0)
+        + (CASE WHEN F.AcceptedAnswerId IS NOT NULL THEN 100 ELSE 0 END)
+        + (COALESCE(F.TotalTagScore, 0) / GREATEST(1, COALESCE(F.TotalPostsWithTag, 1)))
+        + (CASE WHEN F.PostTypeId = 1 AND LOWER(F.Tags) LIKE '%<sql>%' THEN 20 ELSE 0 END)
+        + (CASE WHEN F.PostTypeId = 2 AND F.Body LIKE '%<code>%</code>%' THEN 15 ELSE 0 END)
+    ) AS PostImpactScore,
+    RANK() OVER (PARTITION BY F.PostTypeId ORDER BY (
+        CAST(COALESCE(F.Score, 0) AS NUMERIC)
+        + (COALESCE(F.ViewCount, 0) / 100.0)
+        + (COALESCE(F.AnswerCount, 0) * 2.5)
+        + (COALESCE(F.CommentCount, 0) * 0.75)
+        + (COALESCE(F.FavoriteCount, 0) * 5.0)
+        - (COALESCE(F.CloseDeleteVotes, 0) * 10.0)
+        + (CASE WHEN F.AcceptedAnswerId IS NOT NULL THEN 100 ELSE 0 END)
+        + (COALESCE(F.TotalTagScore, 0) / GREATEST(1, COALESCE(F.TotalPostsWithTag, 1)))
+        + (CASE WHEN F.PostTypeId = 1 AND LOWER(F.Tags) LIKE '%<sql>%' THEN 20 ELSE 0 END)
+        + (CASE WHEN F.PostTypeId = 2 AND F.Body LIKE '%<code>%</code>%' THEN 15 ELSE 0 END)
+    ) DESC) AS PostTypeImpactRank,
+    SUM(F.RawEngagementScore) OVER (PARTITION BY F.OwnerUserId ORDER BY F.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS OwnerCumulativeEngagement,
+    COALESCE(SUBSTRING(F.Title FROM 1 FOR 50), 'No Title Provided') AS ShortTitle,
+    NULLIF(CHAR_LENGTH(F.Body), 0) AS BodyLength,
+    (
+        SELECT MAX(B.Date)
+        FROM Badges B
+        WHERE B.UserId = F.OwnerUserId AND B.Class = 1
+        GROUP BY B.UserId
+    ) AS LatestGoldBadgeDate
+FROM FinalSet F
+LEFT JOIN Posts ParentPost ON F.ParentId = ParentPost.Id
+LEFT JOIN Posts AcceptedAnswer ON F.AcceptedAnswerId = AcceptedAnswer.Id
+WHERE F.OwnerReputation > 5000
+  AND (
+        (
+            CAST(COALESCE(F.Score, 0) AS NUMERIC)
+            + (COALESCE(F.ViewCount, 0) / 100.0)
+            + (COALESCE(F.AnswerCount, 0) * 2.5)
+            + (COALESCE(F.CommentCount, 0) * 0.75)
+            + (COALESCE(F.FavoriteCount, 0) * 5.0)
+            - (COALESCE(F.CloseDeleteVotes, 0) * 10.0)
+            + (CASE WHEN F.AcceptedAnswerId IS NOT NULL THEN 100 ELSE 0 END)
+            + (COALESCE(F.TotalTagScore, 0) / GREATEST(1, COALESCE(F.TotalPostsWithTag, 1)))
+            + (CASE WHEN F.PostTypeId = 1 AND LOWER(F.Tags) LIKE '%<sql>%' THEN 20 ELSE 0 END)
+            + (CASE WHEN F.PostTypeId = 2 AND F.Body LIKE '%<code>%</code>%' THEN 15 ELSE 0 END)
+        ) > 100
+        OR F.OwnerTotalViews > 50000
+      )
+  AND (F.LastClosedDate IS NULL OR F.LastClosedDate > DATE '2023-01-01')
+  AND (
+        (F.PostTypeId = 1 AND F.AnswerCount > 2 AND F.FavoriteCount > 5 AND LOWER(F.Tags) LIKE '%<optimization>%')
+        OR
+        (F.PostTypeId = 2 AND F.Score > 10 AND F.ParentId IS NOT NULL AND LOWER(F.Body) LIKE '%database%')
+      )
+  AND F.Title NOT ILIKE '%[duplicate]%'
+ORDER BY PostImpactScore DESC, PostId
+LIMIT 500;

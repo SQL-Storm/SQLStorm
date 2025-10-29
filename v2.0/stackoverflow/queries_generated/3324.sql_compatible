@@ -1,0 +1,125 @@
+WITH
+    UserStats AS (
+        SELECT 
+            u.Id,
+            u.DisplayName,
+            u.Reputation,
+            COALESCE(u.Location, 'Unknown') AS Location,
+            COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+            COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+            SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+            MAX(p.CreationDate) AS LastPostDate
+        FROM Users u
+        LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+        LEFT JOIN Votes v ON v.PostId = p.Id
+        GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location
+    ),
+    BadgeStats AS (
+        SELECT 
+            b.UserId,
+            COUNT(*) AS TotalBadges,
+            COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+            COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+            COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+            STRING_AGG(DISTINCT b.Name, ', ') AS BadgeNames
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+    TagScore AS (
+        SELECT 
+            t.TagName,
+            SUM(CASE WHEN ph.PostHistoryTypeId = 5 THEN 1 ELSE 0 END) AS Edits,
+            COUNT(DISTINCT ph.PostId) AS PostsUsingTag,
+            ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT ph.PostId) DESC) AS TagRank
+        FROM Tags t
+        LEFT JOIN PostHistory ph ON ph.PostId IS NOT NULL -- keep join deterministic; filter below via EXISTS
+        WHERE EXISTS (
+            SELECT 1
+            FROM Posts p
+            WHERE p.Id = ph.PostId
+              AND p.Tags LIKE '%' || t.TagName || '%'
+        )
+        GROUP BY t.TagName
+    ),
+    TopUsers AS (
+        SELECT 
+            us.Id,
+            us.DisplayName,
+            us.Reputation,
+            COALESCE(bs.TotalBadges, 0) AS TotalBadges,
+            us.QuestionCount,
+            us.AnswerCount,
+            (us.UpVoteCount - us.DownVoteCount) AS NetScore,
+            us.LastPostDate,
+            ROW_NUMBER() OVER (ORDER BY us.Reputation DESC, (us.UpVoteCount - us.DownVoteCount) DESC) AS Rank
+        FROM UserStats us
+        LEFT JOIN BadgeStats bs ON bs.UserId = us.Id
+        WHERE us.Reputation > 1000
+    ),
+    HighScoringAnswers AS (
+        SELECT p.OwnerUserId AS UserId, COUNT(*) AS HighScoringAnswerCount
+        FROM Posts p
+        WHERE p.PostTypeId = 2
+          AND p.Score >= 10
+        GROUP BY p.OwnerUserId
+    ),
+    LastFavoriteVotes AS (
+        SELECT v.UserId, MAX(v.CreationDate) AS LastFavoriteDate
+        FROM Votes v
+        WHERE v.VoteTypeId = 5
+        GROUP BY v.UserId
+    ),
+    SampleTags AS (
+        SELECT p.OwnerUserId AS UserId,
+               STRING_AGG(DISTINCT tag.TagName, '; ') AS SampleTags
+        FROM Posts p
+        JOIN (
+            SELECT DISTINCT REPLACE(REPLACE(TRIM(tag), '<', ''), '>', '') AS TagNameClean
+            FROM (
+                SELECT trim(x) AS tag
+                FROM (
+                    SELECT regexp_split_to_table(p2.Tags, '><') AS x, p2.Id
+                    FROM Posts p2
+                ) s
+            ) s2
+        ) derived_tag ON POSITION(derived_tag.TagNameClean IN COALESCE(p.Tags, '')) > 0
+        JOIN Tags tag ON tag.TagName = derived_tag.TagNameClean
+        WHERE p.PostTypeId = 1
+        GROUP BY p.OwnerUserId
+    )
+SELECT 
+    tu.Rank,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.TotalBadges,
+    tu.QuestionCount,
+    tu.AnswerCount,
+    tu.NetScore,
+    COALESCE(tu.LastPostDate, TIMESTAMP '1970-01-01 00:00:00') AS LastPostDate,
+    CASE WHEN tu.Rank <= 10 THEN 'Top 10' ELSE NULL END AS TopTier,
+    COALESCE(hs.HighScoringAnswerCount, 0) AS HighScoringAnswers,
+    lf.LastFavoriteDate,
+    st.SampleTags
+FROM TopUsers tu
+LEFT JOIN HighScoringAnswers hs ON hs.UserId = tu.Id
+LEFT JOIN LastFavoriteVotes lf ON lf.UserId = tu.Id
+LEFT JOIN SampleTags st ON st.UserId = tu.Id
+WHERE tu.Rank <= 100
+
+UNION ALL
+
+SELECT 
+    NULL::INTEGER AS Rank,
+    '---' AS DisplayName,
+    NULL::BIGINT AS Reputation,
+    NULL::INTEGER AS TotalBadges,
+    NULL::INTEGER AS QuestionCount,
+    NULL::INTEGER AS AnswerCount,
+    NULL::INTEGER AS NetScore,
+    NULL::TIMESTAMP AS LastPostDate,
+    NULL::VARCHAR AS TopTier,
+    NULL::INTEGER AS HighScoringAnswers,
+    NULL::TIMESTAMP AS LastFavoriteDate,
+    NULL::VARCHAR AS SampleTags
+LIMIT 101;

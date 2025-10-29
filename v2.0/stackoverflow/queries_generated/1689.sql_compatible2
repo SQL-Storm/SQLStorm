@@ -1,0 +1,257 @@
+WITH UserEngagementSummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsAsked,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersProvided,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        SUM(COALESCE(P.Score, 0)) AS TotalPostScore,
+        SUM(COALESCE(C.Score, 0)) AS TotalCommentScore,
+        SUM(CASE WHEN P.AcceptedAnswerId IS NOT NULL AND P.OwnerUserId = U.Id THEN 1 ELSE 0 END) AS SelfAcceptedAnswers,
+        MAX(COALESCE(P.LastActivityDate, C.CreationDate, U.LastAccessDate)) AS LastKnownActivityDate,
+        COALESCE(
+            CAST(U.UpVotes AS NUMERIC) / NULLIF(EXTRACT(EPOCH FROM (U.LastAccessDate - U.CreationDate)) / (3600 * 24), 0),
+            0
+        ) AS AvgDailyUpvotesGiven
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.UpVotes
+),
+PostHistoricalMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostCurrentScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.Title,
+        P.Tags,
+        P.ClosedDate,
+        COUNT(DISTINCT PH_edit.Id) AS TotalEdits,
+        COUNT(DISTINCT PH_close.Id) AS TotalCloseEvents,
+        (
+            SELECT SUM(
+                CASE WHEN V.VoteTypeId = 2 THEN 1 WHEN V.VoteTypeId = 3 THEN -1 ELSE 0 END
+            )
+            FROM Votes V
+            WHERE V.PostId = P.Id AND V.VoteTypeId IN (2, 3)
+        ) AS NetVoteFromVotesTable,
+        MAX(CASE WHEN PH_dup.PostHistoryTypeId = 10 AND PH_dup.Comment = '101' THEN 1 ELSE 0 END) AS IsClosedAsDuplicate,
+        COALESCE(NULLIF(P.AnswerCount, 0) * 1.0 / NULLIF(P.ViewCount, 0), 0) AS AnswerToViewRatio,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate DESC) AS UserPostSeqDesc
+    FROM Posts P
+    LEFT JOIN PostHistory PH_edit ON P.Id = PH_edit.PostId AND PH_edit.PostHistoryTypeId IN (4, 5, 6)
+    LEFT JOIN PostHistory PH_close ON P.Id = PH_close.PostId AND PH_close.PostHistoryTypeId = 10
+    LEFT JOIN PostHistory PH_dup ON P.Id = PH_dup.PostId AND PH_dup.PostHistoryTypeId = 10 AND PH_dup.Comment = '101'
+    GROUP BY
+        P.Id, P.PostTypeId, P.OwnerUserId, P.CreationDate, P.Score, P.ViewCount, P.AnswerCount,
+        P.CommentCount, P.FavoriteCount, P.Title, P.Tags, P.ClosedDate
+),
+BadgeAndLinkInfo AS (
+    SELECT
+        U.Id AS UserId,
+        COUNT(B.Id) AS TotalBadgesEarned,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(DISTINCT PL_linked.RelatedPostId) FILTER (WHERE PL_linked.LinkTypeId = 1) AS TotalLinkedPostsByRelatedId,
+        COUNT(DISTINCT PL_dup_source.RelatedPostId) FILTER (WHERE PL_dup_source.LinkTypeId = 3) AS TotalPostsAsDuplicateSource,
+        COUNT(DISTINCT PL_dup_target.PostId) FILTER (WHERE PL_dup_target.LinkTypeId = 3) AS TotalPostsAreDuplicateTarget
+    FROM Users U
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN PostLinks PL_linked ON EXISTS (SELECT 1 FROM Posts WHERE Id = PL_linked.PostId AND OwnerUserId = U.Id)
+    LEFT JOIN PostLinks PL_dup_source ON EXISTS (SELECT 1 FROM Posts WHERE Id = PL_dup_source.PostId AND OwnerUserId = U.Id)
+    LEFT JOIN PostLinks PL_dup_target ON EXISTS (SELECT 1 FROM Posts WHERE Id = PL_dup_target.RelatedPostId AND OwnerUserId = U.Id)
+    GROUP BY U.Id
+),
+UserOverallMetrics AS (
+    SELECT
+        UES.UserId,
+        UES.DisplayName,
+        UES.Reputation,
+        UES.UserCreationDate,
+        UES.LastKnownActivityDate,
+        UES.TotalPosts,
+        UES.QuestionsAsked,
+        UES.AnswersProvided,
+        UES.TotalComments,
+        UES.TotalPostScore,
+        UES.TotalCommentScore,
+        UES.SelfAcceptedAnswers,
+        UES.AvgDailyUpvotesGiven,
+        BAI.TotalBadgesEarned,
+        BAI.GoldBadges,
+        BAI.SilverBadges,
+        BAI.BronzeBadges,
+        BAI.TotalLinkedPostsByRelatedId,
+        BAI.TotalPostsAsDuplicateSource,
+        BAI.TotalPostsAreDuplicateTarget,
+        SUM(COALESCE(PHM.TotalEdits, 0)) AS AggregatePostEdits,
+        SUM(COALESCE(PHM.TotalCloseEvents, 0)) AS AggregatePostCloseEvents,
+        SUM(COALESCE(PHM.NetVoteFromVotesTable, 0)) AS AggregateNetVotes,
+        AVG(COALESCE(PHM.AnswerToViewRatio, 0)) AS AvgAnswerToViewRatio,
+        DENSE_RANK() OVER (ORDER BY UES.Reputation DESC, UES.TotalPostScore DESC) AS ReputationRank,
+        NTILE(100) OVER (ORDER BY UES.TotalPosts DESC) AS TopPostersCentile,
+        LAG(UES.LastKnownActivityDate, 1, UES.UserCreationDate) OVER (ORDER BY UES.LastKnownActivityDate) AS PrevUserActivityDate,
+        EXTRACT(EPOCH FROM (UES.LastKnownActivityDate - UES.UserCreationDate)) / (3600.0 * 24 * 365.25) AS YearsActive
+    FROM UserEngagementSummary UES
+    LEFT JOIN PostHistoricalMetrics PHM ON UES.UserId = PHM.OwnerUserId
+    LEFT JOIN BadgeAndLinkInfo BAI ON UES.UserId = BAI.UserId
+    GROUP BY
+        UES.UserId, UES.DisplayName, UES.Reputation, UES.UserCreationDate, UES.LastKnownActivityDate,
+        UES.TotalPosts, UES.QuestionsAsked, UES.AnswersProvided, UES.TotalComments, UES.TotalPostScore,
+        UES.TotalCommentScore, UES.SelfAcceptedAnswers, UES.AvgDailyUpvotesGiven,
+        BAI.TotalBadgesEarned, BAI.GoldBadges, BAI.SilverBadges, BAI.BronzeBadges,
+        BAI.TotalLinkedPostsByRelatedId, BAI.TotalPostsAsDuplicateSource, BAI.TotalPostsAreDuplicateTarget
+),
+GlobalBenchmarks AS (
+    SELECT
+        AVG(Reputation) AS AvgReputation,
+        AVG(TotalPosts) AS AvgTotalPosts,
+        AVG(TotalComments) AS AvgTotalComments,
+        AVG(TotalPostScore) AS AvgTotalPostScore,
+        AVG(AggregateNetVotes) AS AvgAggregateNetVotes,
+        AVG(TotalBadgesEarned) AS AvgTotalBadgesEarned,
+        AVG(YearsActive) AS AvgYearsActive,
+        AVG(AggregatePostEdits) AS AvgAggregatePostEdits
+    FROM UserOverallMetrics
+),
+TopContributors AS (
+    SELECT
+        UOM.UserId,
+        UOM.DisplayName,
+        UOM.Reputation,
+        UOM.LastKnownActivityDate,
+        UOM.TotalPosts,
+        UOM.QuestionsAsked,
+        UOM.AnswersProvided,
+        UOM.TotalPostScore,
+        UOM.AggregateNetVotes,
+        UOM.GoldBadges,
+        UOM.ReputationRank,
+        'Top Contributor' AS Category,
+        (
+          SELECT ARRAY_AGG(DISTINCT TRIM(tag)) FROM (
+            SELECT regexp_split_to_table(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags) - 2), '><') AS tag
+          ) t
+        ) AS CommonTags
+    FROM UserOverallMetrics UOM
+    JOIN Posts P ON UOM.UserId = P.OwnerUserId
+    WHERE UOM.ReputationRank <= 100
+      AND UOM.TotalPosts > 10
+      AND UOM.AnswersProvided > UOM.QuestionsAsked
+      AND UOM.GoldBadges > 0
+    GROUP BY
+        UOM.UserId, UOM.DisplayName, UOM.Reputation, UOM.LastKnownActivityDate, UOM.TotalPosts,
+        UOM.QuestionsAsked, UOM.AnswersProvided, UOM.TotalPostScore, UOM.AggregateNetVotes,
+        UOM.GoldBadges, UOM.ReputationRank
+),
+HighlyEngagedUsers AS (
+    SELECT
+        UOM.UserId,
+        UOM.DisplayName,
+        UOM.Reputation,
+        UOM.LastKnownActivityDate,
+        UOM.TotalPosts,
+        UOM.QuestionsAsked,
+        UOM.AnswersProvided,
+        UOM.TotalPostScore,
+        UOM.AggregateNetVotes,
+        UOM.GoldBadges,
+        UOM.ReputationRank,
+        'Highly Engaged' AS Category,
+        (
+          SELECT ARRAY_AGG(DISTINCT TRIM(tag)) FROM (
+            SELECT regexp_split_to_table(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags) - 2), '><') AS tag
+          ) t
+        ) AS CommonTags
+    FROM UserOverallMetrics UOM
+    CROSS JOIN GlobalBenchmarks GB
+    JOIN Posts P ON UOM.UserId = P.OwnerUserId
+    WHERE UOM.LastKnownActivityDate >= (DATE '2024-10-01' - INTERVAL '6 months')
+      AND UOM.TotalComments > GB.AvgTotalComments * 1.5
+      AND UOM.AggregatePostEdits > GB.AvgAggregatePostEdits * 2
+      AND UOM.ReputationRank <= 500
+    GROUP BY
+        UOM.UserId, UOM.DisplayName, UOM.Reputation, UOM.LastKnownActivityDate, UOM.TotalPosts,
+        UOM.QuestionsAsked, UOM.AnswersProvided, UOM.TotalPostScore, UOM.AggregateNetVotes,
+        UOM.GoldBadges, UOM.ReputationRank, GB.AvgTotalComments, GB.AvgAggregatePostEdits
+),
+CombinedEliteUsers AS (
+    SELECT * FROM TopContributors
+    UNION ALL
+    SELECT * FROM HighlyEngagedUsers
+)
+SELECT
+    CEU.UserId,
+    CEU.DisplayName,
+    CEU.Reputation,
+    CEU.Category,
+    CEU.LastKnownActivityDate,
+    CEU.TotalPosts,
+    CEU.QuestionsAsked,
+    CEU.AnswersProvided,
+    CEU.TotalPostScore,
+    CEU.AggregateNetVotes,
+    CEU.GoldBadges,
+    CEU.ReputationRank,
+    GB.AvgReputation,
+    GB.AvgTotalPosts,
+    GB.AvgTotalComments,
+    GB.AvgTotalPostScore,
+    GB.AvgAggregateNetVotes,
+    GB.AvgTotalBadgesEarned,
+    ROUND(
+        (CEU.TotalPosts * 0.4 + CEU.AggregateNetVotes * 0.3 + CEU.GoldBadges * 10 + CEU.TotalPostScore * 0.2 + CEU.AnswersProvided * 0.5)
+        / NULLIF(UOM.YearsActive, 0.001), 2
+    ) AS EngagementPerYear,
+    CONCAT_WS(' | ',
+        'Q:' || CEU.QuestionsAsked,
+        'A:' || CEU.AnswersProvided,
+        'T:' || CEU.TotalPosts
+    ) AS PostTypeSummary,
+    COALESCE((
+        SELECT C.Text
+        FROM Comments C
+        WHERE C.UserId = CEU.UserId AND C.CreationDate = (SELECT MAX(C2.CreationDate) FROM Comments C2 WHERE C2.UserId = CEU.UserId)
+        LIMIT 1
+    ), 'No recent comments') AS LastCommentText,
+    COALESCE(CAST(CEU.GoldBadges AS VARCHAR), 'No Gold Badges Earned') AS GoldBadgeStatus,
+    EXISTS (
+        SELECT 1
+        FROM PostHistoricalMetrics PHM_inner
+        WHERE PHM_inner.OwnerUserId = CEU.UserId
+          AND PHM_inner.PostTypeId = 1
+          AND PHM_inner.Tags ILIKE '%<sql>%'
+    ) AS HasSQLQuestions,
+    VT.Name AS VoteTypeName,
+    COUNT(V.Id) OVER (PARTITION BY CEU.UserId, VT.Name) AS VotesOfThisTypeByUser,
+    CEU.CommonTags
+FROM CombinedEliteUsers CEU
+CROSS JOIN GlobalBenchmarks GB
+LEFT JOIN UserOverallMetrics UOM ON CEU.UserId = UOM.UserId
+RIGHT JOIN Votes V ON CEU.UserId = V.UserId
+RIGHT JOIN VoteTypes VT ON V.VoteTypeId = VT.Id
+WHERE
+    CEU.Reputation IS NOT NULL
+    AND VT.Name IS NOT NULL
+GROUP BY
+    CEU.UserId, CEU.DisplayName, CEU.Reputation, CEU.Category, CEU.LastKnownActivityDate,
+    CEU.TotalPosts, CEU.QuestionsAsked, CEU.AnswersProvided, CEU.TotalPostScore,
+    CEU.AggregateNetVotes, CEU.GoldBadges, CEU.ReputationRank, GB.AvgReputation,
+    GB.AvgTotalPosts, GB.AvgTotalComments, GB.AvgTotalPostScore, GB.AvgAggregateNetVotes,
+    GB.AvgTotalBadgesEarned, UOM.YearsActive, CEU.CommonTags, VT.Name
+HAVING
+    COUNT(V.Id) OVER (PARTITION BY CEU.UserId, VT.Name) > 1
+ORDER BY
+    CEU.Reputation DESC, EngagementPerYear DESC, CEU.LastKnownActivityDate DESC
+LIMIT 500;

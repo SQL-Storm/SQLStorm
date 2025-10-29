@@ -1,0 +1,90 @@
+-- {"query": "3288.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1720} 
+WITH UserStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        MAX(p.LastActivityDate) AS LastActivity,
+        COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId = 10) AS ClosedCount
+    FROM Users u
+    LEFT JOIN Badges b          ON b.UserId = u.Id
+    LEFT JOIN Posts p          ON p.OwnerUserId = u.Id
+    LEFT JOIN PostHistory ph   ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+TopUsers AS (
+    SELECT
+        *,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, GoldBadges DESC, TotalPostScore DESC) AS RankByReputation
+    FROM UserStats
+    WHERE Reputation > 10000
+),
+
+RecentVotes AS (
+    SELECT
+        v.UserId,
+        COUNT(*) FILTER (WHERE vt.Name = 'UpMod')      AS UpVotesGiven,
+        COUNT(*) FILTER (WHERE vt.Name = 'DownMod')    AS DownVotesGiven,
+        COUNT(*) FILTER (WHERE vt.Name = 'Favorite')   AS FavoritesGiven,
+        MAX(v.CreationDate)                           AS LastVoteDate
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE v.CreationDate >= cast('2024-10-01' as date) - INTERVAL '30 days'
+    GROUP BY v.UserId
+),
+
+UserTagStats AS (
+    SELECT
+        pu.Id               AS UserId,
+        t.TagName,
+        COUNT(*)            AS TagUseCount,
+        ROW_NUMBER() OVER (PARTITION BY pu.Id ORDER BY COUNT(*) DESC) AS TagRank
+    FROM Posts p
+    JOIN Users pu               ON pu.Id = p.OwnerUserId
+    JOIN LATERAL unnest(string_to_array(trim(both '<>' FROM p.Tags), '><')) AS tg(tag) ON true
+    JOIN Tags t                 ON t.TagName = tg.tag
+    WHERE p.PostTypeId = 1
+    GROUP BY pu.Id, t.TagName
+)
+
+SELECT
+    tu.Id,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.GoldBadges,
+    tu.SilverBadges,
+    tu.BronzeBadges,
+    tu.TotalPostScore,
+    tu.QuestionCount,
+    tu.AnswerCount,
+    tu.ClosedCount,
+    tu.LastActivity,
+    rv.UpVotesGiven,
+    rv.DownVotesGiven,
+    rv.FavoritesGiven,
+    rv.LastVoteDate,
+    CASE WHEN ut.TagRank = 1 THEN ut.TagName END          AS TopTag,
+    ut.TagUseCount                                      AS TopTagUseCount,
+    tu.RankByReputation
+FROM TopUsers tu
+LEFT JOIN RecentVotes rv
+       ON rv.UserId = tu.Id
+LEFT JOIN (
+    SELECT UserId, TagName, TagUseCount, TagRank
+    FROM UserTagStats
+    WHERE TagRank = 1
+) ut
+       ON ut.UserId = tu.Id
+WHERE tu.RankByReputation <= 100
+ORDER BY tu.RankByReputation
+UNION ALL
+SELECT
+    NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL
+LIMIT 100;

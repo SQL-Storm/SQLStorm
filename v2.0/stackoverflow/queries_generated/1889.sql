@@ -1,0 +1,235 @@
+-- {"query": "1889.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3257} 
+
+WITH UserEngagement AS (
+    -- CTE 1: Calculate monthly engagement scores for users by aggregating activity from various tables
+    SELECT
+        u.Id AS UserId,
+        -- Normalize all activity dates to the start of the month for monthly grouping
+        DATE_TRUNC('month', COALESCE(p.CreationDate, c.CreationDate, b.Date, v.CreationDate)) AS ActivityMonth,
+        COUNT(DISTINCT p.Id) AS PostsCount,
+        COUNT(DISTINCT c.Id) AS CommentsCount,
+        -- Count upvotes/downvotes given by the user on any post
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesGiven,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesGiven,
+        COUNT(DISTINCT b.Id) AS BadgesEarned,
+        -- Sum of scores for posts owned by the user
+        SUM(COALESCE(p.Score, 0)) AS PostsScoreSum
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    GROUP BY u.Id, DATE_TRUNC('month', COALESCE(p.CreationDate, c.CreationDate, b.Date, v.CreationDate))
+),
+UserMonthlyMetrics AS (
+    -- CTE 2: Calculate a combined monthly engagement score and month-over-month growth
+    SELECT
+        ue.UserId,
+        ue.ActivityMonth,
+        ue.PostsCount,
+        ue.CommentsCount,
+        ue.UpvotesGiven,
+        ue.DownvotesGiven,
+        ue.BadgesEarned,
+        ue.PostsScoreSum,
+        -- Weighted sum for monthly engagement
+        (ue.PostsCount * 0.5 + ue.CommentsCount * 0.3 + ue.UpvotesGiven * 0.2 - ue.DownvotesGiven * 0.1 + ue.BadgesEarned * 1.0 + ue.PostsScoreSum * 0.1) AS MonthlyEngagementScore,
+        -- Window function to get previous month's score for growth calculation
+        LAG((ue.PostsCount * 0.5 + ue.CommentsCount * 0.3 + ue.UpvotesGiven * 0.2 - ue.DownvotesGiven * 0.1 + ue.BadgesEarned * 1.0 + ue.PostsScoreSum * 0.1), 1, 0) OVER (PARTITION BY ue.UserId ORDER BY ue.ActivityMonth) AS PrevMonthEngagementScore
+    FROM UserEngagement ue
+    WHERE ue.ActivityMonth IS NOT NULL -- Exclude records where no activity date could be determined
+),
+UserPeakActivity AS (
+    -- CTE 3: Identify the user's peak month of activity and calculate the engagement growth during that month
+    SELECT
+        umm.UserId,
+        umm.ActivityMonth AS PeakActivityMonth,
+        umm.MonthlyEngagementScore AS PeakMonthlyEngagement,
+        (umm.MonthlyEngagementScore - umm.PrevMonthEngagementScore) AS EngagementGrowth
+    FROM UserMonthlyMetrics umm
+    -- Correlated subquery to find the maximum engagement score for each user
+    WHERE umm.MonthlyEngagementScore = (SELECT MAX(MonthlyEngagementScore) FROM UserMonthlyMetrics WHERE UserId = umm.UserId)
+),
+QuestionContext AS (
+    -- CTE 4: Gather comprehensive context for questions, including answer statistics, closure history, and duplicate links
+    SELECT
+        q.Id AS QuestionId,
+        q.OwnerUserId,
+        q.CreationDate AS QuestionCreationDate,
+        q.LastActivityDate AS QuestionLastActivityDate,
+        q.ViewCount,
+        q.Score AS QuestionScore,
+        q.AnswerCount,
+        q.FavoriteCount,
+        q.Title,
+        q.Tags,
+        -- Correlated subquery for average score of answers to this question
+        (SELECT AVG(a.Score) FROM Posts a WHERE a.ParentId = q.Id AND a.PostTypeId = 2) AS AvgAnswerScore,
+        -- Correlated subquery for the creation date of the first answer
+        (SELECT MIN(a.CreationDate) FROM Posts a WHERE a.ParentId = q.Id AND a.PostTypeId = 2) AS FirstAnswerDate,
+        ph_closed.CreationDate AS ClosedDate,
+        ph_reopened.CreationDate AS ReopenedDate,
+        ph_closed.Comment AS CloseReasonComment,
+        -- Correlated subquery to count posts linked as duplicates AND actually closed as duplicate
+        (
+            SELECT COUNT(DISTINCT pl_dupe.RelatedPostId)
+            FROM PostLinks pl_dupe
+            JOIN PostHistory ph_dupe_check ON pl_dupe.RelatedPostId = ph_dupe_check.PostId
+            WHERE pl_dupe.PostId = q.Id
+              AND pl_dupe.LinkTypeId = 3 -- Duplicate link type
+              AND ph_dupe_check.PostHistoryTypeId = 10 -- Post Closed event
+              AND ph_dupe_check.Comment LIKE '101%' -- Modern "Duplicate" close reason
+        ) AS DuplicateLinkCount
+    FROM Posts q
+    WHERE q.PostTypeId = 1 -- Only questions
+    LEFT JOIN PostHistory ph_closed ON q.Id = ph_closed.PostId AND ph_closed.PostHistoryTypeId = 10 -- Post Closed event
+    LEFT JOIN PostHistory ph_reopened ON q.Id = ph_reopened.PostId AND ph_reopened.PostHistoryTypeId = 11 -- Post Reopened event
+),
+InfluentialUsersWithQuestionMetrics AS (
+    -- CTE 5: Combine user activity metrics with relevant question context for specific topic areas
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.UpVotes,
+        u.DownVotes,
+        upa.PeakActivityMonth,
+        upa.PeakMonthlyEngagement,
+        upa.EngagementGrowth,
+        qc.QuestionId,
+        qc.Title AS QuestionTitle,
+        qc.Tags AS QuestionTags,
+        qc.QuestionScore,
+        qc.ViewCount AS QuestionViewCount,
+        qc.AvgAnswerScore,
+        -- Calculate question's active duration in hours, using `NULL` if dates are missing
+        NULLIF(EXTRACT(EPOCH FROM (qc.QuestionLastActivityDate - qc.QuestionCreationDate)) / 3600, 0) AS QuestionActiveHours,
+        COALESCE(qc.DuplicateLinkCount, 0) AS UserDuplicateLinkCount,
+        -- Correlated subquery to count gold badges earned by the user
+        (SELECT COUNT(DISTINCT b.Id) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadgesCount,
+        -- Correlated subquery to find the last time the user edited tags on their own question
+        (
+            SELECT MAX(ph_tag.CreationDate)
+            FROM PostHistory ph_tag
+            WHERE ph_tag.PostId = qc.QuestionId
+              AND ph_tag.PostHistoryTypeId IN (3, 6) -- Initial Tags or Edit Tags
+              AND ph_tag.UserId = u.Id
+        ) AS LastTagEditDateByOwner
+    FROM Users u
+    JOIN UserPeakActivity upa ON u.Id = upa.UserId
+    LEFT JOIN QuestionContext qc ON u.Id = qc.OwnerUserId
+    WHERE
+        (
+            -- Complex predicate: Filter for questions related to performance, optimization, or specific database tags
+            LOWER(COALESCE(qc.Title, '')) LIKE '%performance%'
+            OR LOWER(COALESCE(qc.Body, '')) LIKE '%optimization%'
+            OR LOWER(COALESCE(qc.Tags, '')) LIKE '%<sql>%'
+            OR LOWER(COALESCE(qc.Tags, '')) LIKE '%<database>%'
+            OR LOWER(COALESCE(qc.Tags, '')) LIKE '%<benchmark>%'
+        )
+        AND u.Reputation > 5000 -- Filter for established users
+        AND upa.EngagementGrowth > 10 -- Only users with significant positive engagement growth
+        AND qc.QuestionScore > 5 -- Filter for somewhat recognized questions
+        AND qc.ViewCount > 1000
+)
+-- Main Query: Combine influential user data, aggregate question metrics, and rank users
+SELECT
+    iu.UserId,
+    iu.DisplayName,
+    iu.Reputation,
+    iu.UpVotes,
+    iu.DownVotes,
+    iu.PeakActivityMonth,
+    iu.PeakMonthlyEngagement,
+    iu.EngagementGrowth,
+    iu.GoldBadgesCount,
+    SUM(iu.QuestionScore) AS TotalQuestionScore,
+    SUM(iu.QuestionViewCount) AS TotalQuestionViews,
+    AVG(iu.AvgAnswerScore) AS AverageQuestionAnswerScore,
+    AVG(iu.QuestionActiveHours) AS AverageQuestionActiveHours,
+    SUM(iu.UserDuplicateLinkCount) AS TotalDuplicateLinksAsOwner,
+    MAX(iu.LastTagEditDateByOwner) AS LastOverallTagEditDate,
+    -- Window function: Rank users by a combination of reputation and engagement
+    RANK() OVER (ORDER BY iu.Reputation DESC, iu.PeakMonthlyEngagement DESC, SUM(iu.QuestionScore) DESC) AS UserRankByInfluence,
+    -- Window function: Divide users into reputation quintiles
+    NTILE(5) OVER (ORDER BY iu.Reputation DESC, iu.PeakMonthlyEngagement DESC) AS ReputationQuintile,
+    -- Complex CASE expression for user categorization
+    CASE
+        WHEN iu.Reputation > 100000 AND iu.GoldBadgesCount >= 5 THEN 'Legend'
+        WHEN iu.Reputation > 50000 AND iu.PeakMonthlyEngagement > 100 THEN 'Veteran Influencer'
+        WHEN iu.EngagementGrowth > 50 THEN 'Rising Star'
+        ELSE 'Active Contributor'
+    END AS UserCategory,
+    -- Complex string manipulation: Aggregate a cleaned list of distinct key tags from their relevant questions
+    STRING_AGG(DISTINCT (
+        SELECT TRIM(SUBSTRING(tag, 2, LENGTH(tag) - 2))
+        FROM UNNEST(STRING_TO_ARRAY(REPLACE(REPLACE(REPLACE(iu.QuestionTags, '>', ''), '<', ','), ',,', ','), ',')) AS tag
+        WHERE tag IS NOT NULL AND LENGTH(tag) > 0 AND LENGTH(tag) < 30 LIMIT 1
+    ), ', ') FILTER (WHERE iu.QuestionTags IS NOT NULL) AS KeyQuestionTagsSummary
+FROM InfluentialUsersWithQuestionMetrics iu
+GROUP BY
+    iu.UserId,
+    iu.DisplayName,
+    iu.Reputation,
+    iu.UpVotes,
+    iu.DownVotes,
+    iu.PeakActivityMonth,
+    iu.PeakMonthlyEngagement,
+    iu.EngagementGrowth,
+    iu.GoldBadgesCount
+HAVING
+    COUNT(DISTINCT iu.QuestionId) >= 2 -- Require at least two relevant questions
+    AND SUM(iu.UserDuplicateLinkCount) < 5 -- Exclude users heavily involved in duplicate questions
+UNION ALL
+-- Set operator: Also include highly upvoted answers from users who are not primarily top question owners but contribute to the same topics
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.UpVotes,
+    u.DownVotes,
+    NULL AS PeakActivityMonth, -- Not applicable for answer specialists
+    NULL AS PeakMonthlyEngagement,
+    NULL AS EngagementGrowth,
+    -- Correlated subquery for Gold Badges count
+    (SELECT COUNT(DISTINCT b.Id) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadgesCount,
+    0 AS TotalQuestionScore, -- Not applicable here
+    0 AS TotalQuestionViews, -- Not applicable here
+    AVG(a.Score) AS AverageAnswerScore,
+    AVG(EXTRACT(EPOCH FROM (a.LastActivityDate - a.CreationDate)) / 3600) AS AverageAnswerActiveHours,
+    0 AS TotalDuplicateLinksAsOwner, -- Not applicable here
+    NULL AS LastOverallTagEditDate, -- Not applicable here
+    RANK() OVER (ORDER BY u.Reputation DESC, SUM(a.Score) DESC) AS UserRankByInfluence,
+    NTILE(5) OVER (ORDER BY u.Reputation DESC, SUM(a.Score) DESC) AS ReputationQuintile,
+    'Answer Specialist' AS UserCategory,
+    -- Complex string manipulation for answer-related tags
+    STRING_AGG(DISTINCT (
+        SELECT TRIM(SUBSTRING(tag, 2, LENGTH(tag) - 2))
+        FROM UNNEST(STRING_TO_ARRAY(REPLACE(REPLACE(REPLACE(q.Tags, '>', ''), '<', ','), ',,', ','), ',')) AS tag
+        WHERE tag IS NOT NULL AND LENGTH(tag) > 0 AND LENGTH(tag) < 30 LIMIT 1
+    ), ', ') FILTER (WHERE q.Tags IS NOT NULL) AS KeyQuestionTagsSummary
+FROM Users u
+JOIN Posts a ON u.Id = a.OwnerUserId
+JOIN Posts q ON a.ParentId = q.Id -- Join answers to their parent questions
+WHERE
+    a.PostTypeId = 2 -- Only answers
+    AND a.Score > 50 -- Filter for highly upvoted answers
+    AND u.Reputation > 2000 -- Filter for established users
+    AND (
+            -- Filter answers to questions related to the same performance/optimization topics
+            LOWER(COALESCE(q.Title, '')) LIKE '%performance%'
+            OR LOWER(COALESCE(q.Body, '')) LIKE '%optimization%'
+            OR LOWER(COALESCE(q.Tags, '')) LIKE '%<sql>%'
+            OR LOWER(COALESCE(q.Tags, '')) LIKE '%<database>%'
+            OR LOWER(COALESCE(q.Tags, '')) LIKE '%<benchmark>%'
+        )
+GROUP BY
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.UpVotes,
+    u.DownVotes
+ORDER BY
+    UserRankByInfluence ASC,
+    Reputation DESC
+LIMIT 50;

@@ -1,0 +1,107 @@
+-- {"query": "4453.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1248} 
+
+WITH RankedUserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(p.Id) AS PostCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        AVG(p.Score) AS AveragePostScore,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.CreationDate ASC) AS ReputationRank,
+        RANK() OVER (ORDER BY COUNT(p.Id) DESC) AS ActivityRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.DisplayName IS NOT NULL AND u.DisplayName NOT LIKE '%[bot]%'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+HighReputationUsers AS (
+    SELECT
+        UserId,
+        DisplayName
+    FROM RankedUserActivity
+    WHERE ReputationRank <= 500
+),
+TopAnsweredQuestions AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title AS QuestionTitle,
+        p.CreationDate AS QuestionCreationDate,
+        p.AnswerCount,
+        ROW_NUMBER() OVER (ORDER BY p.AnswerCount DESC, p.CreationDate ASC) AS QuestionRank
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.AnswerCount > 0 AND p.ClosedDate IS NULL
+),
+FrequentAnswerers AS (
+    SELECT
+        p.OwnerUserId,
+        COUNT(p.Id) AS AnswerCount,
+        RANK() OVER (ORDER BY COUNT(p.Id) DESC) AS AnswererRank
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+    GROUP BY p.OwnerUserId
+),
+UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVoteCount,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVoteCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadgeCount,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadgeCount,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadgeCount
+    FROM Users u
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.DisplayName IS NOT NULL
+    GROUP BY u.Id, u.DisplayName
+)
+SELECT
+    rau.UserId,
+    rau.DisplayName,
+    rau.Reputation,
+    rau.UserCreationDate,
+    rau.PostCount,
+    rau.QuestionCount,
+    rau.AnswerCount,
+    rau.AveragePostScore,
+    rau.ReputationRank,
+    rau.ActivityRank,
+    COALESCE(taq.QuestionTitle, 'N/A') AS MostAnsweredQuestionTitle,
+    COALESCE(fa.AnswerCount, 0) AS TotalAnswers,
+    fa.AnswererRank,
+    ue.CommentCount,
+    ue.UpVoteCount,
+    ue.DownVoteCount,
+    ue.GoldBadgeCount,
+    ue.SilverBadgeCount,
+    ue.BronzeBadgeCount,
+    CASE
+        WHEN rau.Reputation > 10000 THEN 'High Reputation'
+        WHEN rau.Reputation BETWEEN 1000 AND 10000 THEN 'Medium Reputation'
+        ELSE 'Low Reputation'
+    END AS ReputationTier,
+    UPPER(SUBSTRING(rau.DisplayName FROM 1 FOR 3)) AS DisplayNameAbbreviation,
+    CASE
+        WHEN rau.UserCreationDate < DATE('now', '-5 years') THEN 'Veteran'
+        WHEN rau.UserCreationDate < DATE('now', '-1 year') THEN 'Established'
+        ELSE 'Newer'
+    END AS UserTenure,
+    CASE
+        WHEN taq.QuestionRank <= 10 THEN 'Top 10 Answered Question Author'
+        ELSE 'Not Top 10 Answered Question Author'
+    END AS TopQuestionStatus,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 1) AS ExternalLinksToPost,
+    COALESCE(p.Score, 0) + COALESCE(p.AnswerCount, 0) * 5 AS WeightedPostValue,
+    CASE WHEN rau.DisplayName = 'Community' THEN TRUE ELSE FALSE END AS IsCommunityUser
+FROM RankedUserActivity rau
+LEFT JOIN TopAnsweredQuestions taq ON rau.UserId = (SELECT OwnerUserId FROM Posts WHERE Id = taq.QuestionId)
+LEFT JOIN FrequentAnswerers fa ON rau.UserId = fa.OwnerUserId
+LEFT JOIN UserEngagement ue ON rau.UserId = ue.UserId
+LEFT JOIN Posts p ON rau.Id = p.OwnerUserId -- This join is problematic, assuming we want to check something about the user's posts. Replaced with a correlated subquery.
+WHERE rau.PostCount > 10
+ORDER BY rau.ReputationRank;

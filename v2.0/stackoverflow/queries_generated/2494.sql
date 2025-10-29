@@ -1,0 +1,198 @@
+-- {"query": "2494.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1576} 
+with RecursiveTagHierarchy as (
+    select t.Id, t.TagName, 0 as Level, array[t.Id] as Path
+    from Tags t
+    where t.IsRequired = 1
+
+    union all
+
+    select t.Id, t.TagName, r.Level + 1, r.Path || t.Id
+    from Tags t
+    join RecursiveTagHierarchy r on t.WikiPostId = (select p.Id from Posts p where p.Id = t.ExcerptPostId)
+    where not t.Id = any(r.Path)
+    and r.Level < 3
+),
+UserBadges as (
+    select
+        b.UserId,
+        b.Class,
+        b.Name,
+        row_number() over (partition by b.UserId order by b.Date desc) as rn
+    from Badges b
+    where b.TagBased = 0
+),
+TopBadges as (
+    select
+        ub.UserId,
+        string_agg(ub.Name, ', ' order by ub.rn) as RecentBadges
+    from UserBadges ub
+    where ub.rn <= 3
+    group by ub.UserId
+),
+QuestionScores as (
+    select
+        p.Id,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        coalesce(p.AnswerCount, 0) as AnswerCount,
+        case when p.ClosedDate is not null then 1 else 0 end as IsClosed,
+        p.Tags,
+        string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><') as TagArray
+    from Posts p
+    where p.PostTypeId = 1
+),
+AnswerAggregates as (
+    select
+        p.ParentId,
+        count(*) filter (where v.VoteTypeId = 2) as TotalUpVotes,
+        count(*) filter (where v.VoteTypeId = 3) as TotalDownVotes,
+        avg(p.Score) as AvgAnswerScore,
+        max(p.Score) as MaxAnswerScore
+    from Posts p
+    left join Votes v on v.PostId = p.Id and v.VoteTypeId in (2,3)
+    where p.PostTypeId = 2
+    group by p.ParentId
+),
+UserActivity as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct p.Id) as QuestionCount,
+        count(distinct a.Id) as AnswerCount,
+        row_number() over (order by u.Reputation desc) as UserRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 1
+    left join Posts a on a.OwnerUserId = u.Id and a.PostTypeId = 2
+    group by u.Id
+),
+TopQuestionsWithAnswers as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.CreationDate,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        q.IsClosed,
+        a.TotalUpVotes,
+        a.TotalDownVotes,
+        a.AvgAnswerScore,
+        a.MaxAnswerScore,
+        u.DisplayName as OwnerDisplayName,
+        coalesce(tb.RecentBadges,'') as OwnerRecentBadges
+    from QuestionScores q
+    left join AnswerAggregates a on a.ParentId = q.Id
+    left join Users u on u.Id = q.OwnerUserId
+    left join TopBadges tb on tb.UserId = q.OwnerUserId
+    where q.Score > 5 or (a.AvgAnswerScore > 2 and q.ViewCount > 1000)
+),
+RankedUserActivity as (
+    select
+        ua.*,
+        avg(u2.Reputation) over (partition by 1) as AvgReputationAllUsers,
+        max(ua.Reputation) over () as MaxReputationAllUsers,
+        min(ua.Reputation) over () as MinReputationAllUsers
+    from UserActivity ua
+    left join Users u2 on u2.Id = ua.Id
+),
+PostsWithComments as (
+    select
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Title,
+        p.OwnerUserId,
+        count(c.Id) as CommentCount,
+        max(c.CreationDate) as LatestCommentDate,
+        string_agg(distinct c.Text, ' | ' order by c.CreationDate desc) as RecentCommentTexts
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+    group by p.Id, p.PostTypeId, p.Title, p.OwnerUserId
+),
+CombinedSet as (
+    select
+        tq.QuestionId as Id,
+        tq.Title,
+        tq.OwnerUserId,
+        tq.OwnerDisplayName,
+        tq.QuestionScore as Score,
+        tq.ViewCount,
+        tq.AnswerCount,
+        tq.IsClosed,
+        tq.TotalUpVotes,
+        tq.TotalDownVotes,
+        tq.AvgAnswerScore,
+        tq.MaxAnswerScore,
+        tq.OwnerRecentBadges,
+        null::int as CommentCount,
+        null::timestamp as LatestCommentDate,
+        null::text as RecentCommentTexts,
+        'QuestionSummary' as RecordType
+    from TopQuestionsWithAnswers tq
+
+    union all
+
+    select
+        p.PostId as Id,
+        p.Title,
+        p.OwnerUserId,
+        null::int as Score,
+        null::int as ViewCount,
+        null::int as AnswerCount,
+        null::int as IsClosed,
+        null::int as TotalUpVotes,
+        null::int as TotalDownVotes,
+        null::float as AvgAnswerScore,
+        null::int as MaxAnswerScore,
+        null::varchar as OwnerRecentBadges,
+        p.CommentCount,
+        p.LatestCommentDate,
+        p.RecentCommentTexts,
+        'PostWithComments' as RecordType
+    from PostsWithComments p
+),
+FinalRanking as (
+    select
+        c.*,
+        row_number() over (
+            partition by c.RecordType
+            order by 
+                case when c.RecordType = 'QuestionSummary' then coalesce(c.AvgAnswerScore,0) * 0.6 + coalesce(c.Score,0) * 0.4
+                     else c.CommentCount end desc,
+                c.Id
+        ) as RowNum
+    from CombinedSet c
+)
+select
+    fr.Id,
+    fr.Title,
+    coalesce(fr.OwnerDisplayName, 'Anonymous') as Owner,
+    fr.Score,
+    fr.ViewCount,
+    fr.AnswerCount,
+    fr.IsClosed,
+    fr.TotalUpVotes,
+    fr.TotalDownVotes,
+    fr.AvgAnswerScore,
+    fr.MaxAnswerScore,
+    fr.OwnerRecentBadges,
+    fr.CommentCount,
+    fr.LatestCommentDate,
+    substring(fr.RecentCommentTexts from 1 for 100) as SampleRecentComments,
+    fr.RecordType,
+    rh.Level as TagDepth,
+    rh.TagName as RelatedTag
+from FinalRanking fr
+left join RecursiveTagHierarchy rh
+    on rh.TagName = any(
+        case 
+          when fr.RecordType = 'QuestionSummary' then string_to_array(substring((select Tags from Posts where Id=fr.Id) from 2 for char_length((select Tags from Posts where Id=fr.Id)) - 2), '><')
+          else array[]::varchar[]
+        end
+    )
+where fr.RowNum <= 10
+order by fr.RecordType, fr.RowNum, rh.Level desc;

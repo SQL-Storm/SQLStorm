@@ -1,0 +1,357 @@
+-- {"query": "695.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3409} 
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        coalesce(nullif(trim(u.location), ''), 'Unknown') as location_norm,
+        date_trunc('month', u.creationdate) as signup_month,
+        row_number() over (partition by coalesce(nullif(trim(u.location), ''), 'Unknown') order by u.reputation desc, u.id) as rn_loc_rep
+    from users u
+    where u.creationdate >= (select date_trunc('year', max(creationdate)) from users)
+),
+question_posts as (
+    select
+        p.id,
+        p.owneruserid as user_id,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        p.favoritecount,
+        p.answercount,
+        p.title,
+        p.tags,
+        p.acceptedanswerid,
+        coalesce(p.commentcount, 0) as commentcount,
+        date_trunc('month', p.creationdate) as post_month
+    from posts p
+    where p.posttypeid = 1
+),
+answer_posts as (
+    select
+        p.id,
+        p.owneruserid as user_id,
+        p.parentid as question_id,
+        p.creationdate,
+        p.score,
+        date_trunc('month', p.creationdate) as post_month
+    from posts p
+    where p.posttypeid = 2
+),
+tag_extract as (
+    select
+        qp.id as question_id,
+        unnest(string_to_array(substring(qp.tags, 2, greatest(length(qp.tags)-2,0)), '><')) as tagname
+    from question_posts qp
+    where qp.tags is not null
+),
+hot_tags as (
+    select
+        te.tagname,
+        count(*) as q_count
+    from tag_extract te
+    group by te.tagname
+    having count(*) >= (
+        select percentile_disc(0.95) within group (order by cnt) 
+        from (
+            select tagname, count(*) as cnt
+            from tag_extract
+            group by tagname
+        ) s
+    )
+),
+user_votes as (
+    select
+        v.postid,
+        v.userid,
+        sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+        sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+        sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites
+    from votes v
+    where v.userid is not null
+    group by v.postid, v.userid
+),
+post_vote_agg as (
+    select
+        p.id as post_id,
+        sum(case when v.votetypeid = 2 then 1 else 0 end) as total_up,
+        sum(case when v.votetypeid = 3 then 1 else 0 end) as total_down,
+        sum(case when v.votetypeid = 5 then 1 else 0 end) as total_fav,
+        sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_total,
+        count(*) filter (where v.votetypeid in (8,9)) as bounty_events
+    from posts p
+    left join votes v on v.postid = p.id
+    group by p.id
+),
+close_events as (
+    select
+        ph.postid,
+        min(ph.creationdate) as first_close_date,
+        max(ph.creationdate) as last_close_date,
+        count(*) as close_events
+    from posthistory ph
+    where ph.posthistorytypeid in (10)
+    group by ph.postid
+),
+reopen_events as (
+    select
+        ph.postid,
+        count(*) as reopen_events
+    from posthistory ph
+    where ph.posthistorytypeid in (11)
+    group by ph.postid
+),
+dup_links as (
+    select
+        pl.postid as dup_post_id,
+        pl.relatedpostid as canonical_post_id,
+        min(pl.creationdate) as first_dup_link
+    from postlinks pl
+    where pl.linktypeid = 3
+    group by pl.postid, pl.relatedpostid
+),
+question_metrics as (
+    select
+        qp.id as question_id,
+        qp.user_id,
+        qp.creationdate,
+        qp.score,
+        qp.viewcount,
+        qp.favoritecount,
+        coalesce(qp.answercount, 0) as answercount,
+        qp.acceptedanswerid,
+        pv.total_up,
+        pv.total_down,
+        pv.total_fav,
+        pv.bounty_total,
+        pv.bounty_events,
+        ce.first_close_date,
+        ce.last_close_date,
+        coalesce(ce.close_events,0) as close_events,
+        coalesce(re.reopen_events,0) as reopen_events,
+        case when ce.first_close_date is not null then 1 else 0 end as was_closed,
+        case when re.reopen_events > 0 then 1 else 0 end as was_reopened
+    from question_posts qp
+    left join post_vote_agg pv on pv.post_id = qp.id
+    left join close_events ce on ce.postid = qp.id
+    left join reopen_events re on re.postid = qp.id
+),
+answers_to_question as (
+    select
+        ap.question_id,
+        count(*) as answers_total,
+        sum(case when ap.score > 0 then 1 else 0 end) as answers_positive,
+        max(ap.score) as answer_score_max,
+        min(ap.score) as answer_score_min,
+        avg(ap.score::numeric) as answer_score_avg,
+        max(ap.creationdate) as last_answer_date
+    from answer_posts ap
+    group by ap.question_id
+),
+accepted_answer_latency as (
+    select
+        qm.question_id,
+        extract(epoch from (a.creationdate - qm.creationdate))/3600.0 as hours_to_accepted
+    from question_metrics qm
+    join posts a on a.id = qm.acceptedanswerid
+),
+location_activity as (
+    select
+        ru.location_norm,
+        date_trunc('month', qp.creationdate) as month,
+        count(*) as q_count,
+        sum(qp.viewcount) as views_sum,
+        avg(qp.score::numeric) as avg_score
+    from recent_users ru
+    join question_posts qp on qp.user_id = ru.user_id
+    group by ru.location_norm, date_trunc('month', qp.creationdate)
+),
+top_users_per_location as (
+    select
+        ru.location_norm,
+        ru.user_id,
+        ru.displayname,
+        ru.reputation,
+        ru.signup_month,
+        ru.rn_loc_rep
+    from recent_users ru
+    where ru.rn_loc_rep <= 5
+),
+tag_hotness_per_question as (
+    select
+        te.question_id,
+        max(case when ht.tagname is not null then 1 else 0 end) as has_hot_tag,
+        string_agg(te.tagname, ',' order by te.tagname) filter (where ht.tagname is not null) as hot_tag_list
+    from tag_extract te
+    left join hot_tags ht on ht.tagname = te.tagname
+    group by te.question_id
+),
+comment_agg as (
+    select
+        c.postid,
+        count(*) as comment_count,
+        max(c.score) as comment_max_score,
+        sum(case when c.score > 0 then 1 else 0 end) as comment_positive,
+        bool_or(c.text ilike '%thanks%') as has_thanks
+    from comments c
+    group by c.postid
+),
+user_badge_summary as (
+    select
+        b.userid,
+        sum(case when b.class = 1 then 1 else 0 end) as gold,
+        sum(case when b.class = 2 then 1 else 0 end) as silver,
+        sum(case when b.class = 3 then 1 else 0 end) as bronze,
+        sum(case when b.tagbased = 1 then 1 else 0 end) as tag_based
+    from badges b
+    group by b.userid
+),
+question_quality as (
+    select
+        qm.question_id,
+        case
+            when coalesce(qm.total_up,0) - coalesce(qm.total_down,0) >= 10 and coalesce(atq.answers_total,0) >= 2 then 'High'
+            when coalesce(qm.total_up,0) - coalesce(qm.total_down,0) between 3 and 9 then 'Medium'
+            else 'Low'
+        end as quality_bucket
+    from question_metrics qm
+    left join answers_to_question atq on atq.question_id = qm.question_id
+),
+monthly_user_perf as (
+    select
+        ru.user_id,
+        date_trunc('month', qp.creationdate) as month,
+        count(*) filter (where qp.score >= 0) as q_nonneg,
+        sum(qp.viewcount) as views_sum,
+        sum(coalesce(atq.answers_total,0)) as answers_recv,
+        avg(coalesce(aal.hours_to_accepted, 24*30)) as avg_accept_latency_h
+    from recent_users ru
+    join question_posts qp on qp.user_id = ru.user_id
+    left join answers_to_question atq on atq.question_id = qp.id
+    left join accepted_answer_latency aal on aal.question_id = qp.id
+    group by ru.user_id, date_trunc('month', qp.creationdate)
+),
+cross_loc_comp as (
+    select
+        tl.location_norm,
+        tl.user_id,
+        tl.displayname,
+        tl.reputation,
+        ml.month,
+        ml.q_nonneg,
+        ml.views_sum,
+        ml.answers_recv,
+        ml.avg_accept_latency_h,
+        rank() over (partition by tl.location_norm, ml.month order by ml.views_sum desc nulls last, ml.q_nonneg desc, tl.user_id) as r_loc_month
+    from top_users_per_location tl
+    left join monthly_user_perf ml on ml.user_id = tl.user_id
+),
+final_agg as (
+    select
+        qm.question_id,
+        ru.location_norm,
+        tlp.displayname as author_name,
+        u.reputation as author_rep,
+        coalesce(qa.quality_bucket, 'Low') as quality_bucket,
+        coalesce(th.has_hot_tag,0) as has_hot_tag,
+        nullif(th.hot_tag_list, '') as hot_tags,
+        coalesce(ca.comment_count,0) as comment_count,
+        coalesce(ca.comment_max_score,0) as comment_max_score,
+        coalesce(ca.comment_positive,0) as comment_positive,
+        coalesce(ca.has_thanks,false) as has_thanks_comment,
+        coalesce(atq.answers_total,0) as answers_total,
+        coalesce(atq.answers_positive,0) as answers_positive,
+        atq.answer_score_max,
+        atq.answer_score_min,
+        atq.answer_score_avg,
+        aal.hours_to_accepted,
+        qm.score as q_score,
+        qm.viewcount as q_views,
+        qm.favoritecount as q_fav_legacy,
+        coalesce(qm.total_up,0) as votes_up,
+        coalesce(qm.total_down,0) as votes_down,
+        coalesce(qm.total_fav,0) as votes_fav_legacy,
+        coalesce(qm.bounty_total,0) as bounty_total,
+        qm.bounty_events,
+        qm.was_closed,
+        qm.was_reopened,
+        ce2.first_dup_link is not null as marked_duplicate,
+        case when ce2.first_dup_link is not null then 'Duplicate' when qm.was_closed = 1 then 'Closed' else 'Open' end as status_label,
+        row_number() over (partition by ru.location_norm order by coalesce(qm.viewcount,0) desc, qm.score desc, qm.question_id) as rn_loc_views,
+        dense_rank() over (order by coalesce(qm.total_up,0) - coalesce(qm.total_down,0) desc, qm.viewcount desc) as r_global_score,
+        sum(coalesce(qm.viewcount,0)) over (partition by ru.location_norm) as loc_views_total,
+        sum(case when coalesce(th.has_hot_tag,0)=1 then 1 else 0 end) over (order by qm.creationdate rows between unbounded preceding and current row) as running_hot_q_count
+    from question_metrics qm
+    left join recent_users ru on ru.user_id = qm.user_id
+    left join users u on u.id = qm.user_id
+    left join top_users_per_location tlp on tlp.user_id = qm.user_id
+    left join answers_to_question atq on atq.question_id = qm.question_id
+    left join accepted_answer_latency aal on aal.question_id = qm.question_id
+    left join tag_hotness_per_question th on th.question_id = qm.question_id
+    left join comment_agg ca on ca.postid = qm.question_id
+    left join dup_links ce2 on ce2.dup_post_id = qm.question_id
+    left join question_quality qa on qa.question_id = qm.question_id
+)
+select
+    fa.question_id,
+    coalesce(fa.location_norm, 'Unknown') as location,
+    fa.author_name,
+    fa.author_rep,
+    fa.quality_bucket,
+    fa.has_hot_tag,
+    coalesce(fa.hot_tags, '') as hot_tags,
+    fa.comment_count,
+    fa.comment_max_score,
+    fa.comment_positive,
+    fa.has_thanks_comment,
+    fa.answers_total,
+    fa.answers_positive,
+    coalesce(fa.answer_score_max, 0) as answer_score_max,
+    coalesce(fa.answer_score_min, 0) as answer_score_min,
+    round(coalesce(fa.answer_score_avg, 0)::numeric, 2) as answer_score_avg,
+    round(coalesce(fa.hours_to_accepted, -1)::numeric, 2) as hours_to_accepted,
+    fa.q_score,
+    fa.q_views,
+    fa.q_fav_legacy,
+    fa.votes_up,
+    fa.votes_down,
+    fa.votes_fav_legacy,
+    fa.bounty_total,
+    fa.bounty_events,
+    fa.was_closed,
+    fa.was_reopened,
+    fa.marked_duplicate,
+    fa.status_label,
+    fa.rn_loc_views,
+    fa.r_global_score,
+    fa.loc_views_total,
+    coalesce(clc.month::date, null) as perf_month,
+    coalesce(clc.q_nonneg, 0) as loc_user_q_nonneg,
+    coalesce(clc.views_sum, 0) as loc_user_views_sum,
+    coalesce(clc.answers_recv, 0) as loc_user_answers_recv,
+    round(coalesce(clc.avg_accept_latency_h, 0)::numeric, 2) as loc_user_avg_accept_latency_h,
+    clc.r_loc_month,
+    case
+        when fa.has_hot_tag = 1 and fa.q_score >= 5 then 'HOT_HIGH'
+        when fa.was_closed = 1 and fa.was_reopened = 1 then 'CLOSE_REOPEN'
+        when fa.marked_duplicate then 'DUPLICATE'
+        else 'NORMAL'
+    end as perf_flag
+from final_agg fa
+left join cross_loc_comp clc
+  on clc.user_id = (select user_id from recent_users ru2 where ru2.user_id = (select user_id from posts p2 where p2.id = fa.question_id limit 1))
+ and (clc.month = date_trunc('month', (select creationdate from posts p3 where p3.id = fa.question_id)))
+where
+    (fa.q_views is not null or fa.votes_up + fa.votes_down <> 0)
+    and coalesce(fa.location_norm, 'Unknown') not ilike '%test%'
+    and (
+        fa.has_hot_tag = 1
+        or (fa.was_closed = 1 and fa.was_reopened = 0)
+        or (fa.votes_up - fa.votes_down) >= 5
+    )
+order by
+    fa.status_label desc,
+    fa.r_global_score,
+    fa.rn_loc_views
+limit 500;

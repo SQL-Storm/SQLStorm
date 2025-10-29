@@ -1,0 +1,46 @@
+-- {"query": "6857.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-micro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 509} 
+
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    MAX(u.CreationDate) AS LatestAccountActivity,
+    MAX(p.LastActivityDate) AS LatestPostActivity,
+    AVG(p.Score) AS AvgPostScore,
+    AVG(ph.Score) AS AvgCommentScore,
+    COUNT(DISTINCT CASE WHEN b.Id IS NOT NULL THEN b.UserId END) AS TotalBadges,
+    SUM(CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END) AS TotalClosedPosts,
+    SUM(CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN 1 ELSE 0 END) AS TotalCommunityOwnedPosts,
+    STRING_AGG(DISTINCT t.TagName, ', ') AS PopularTags
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    (SELECT 
+        ph.PostId, 
+        ph.Score
+     FROM 
+        PostHistory ph
+     WHERE 
+        ph.PostHistoryTypeId IN (1, 2, 3, 5, 6, 10, 11, 12, 14, 15, 19, 20, 35)
+    ) ph ON p.Id = ph.PostId
+LEFT JOIN 
+    Comments c ON p.Id = c.PostId
+LEFT JOIN 
+    PostLinks pl ON p.Id = pl.PostId
+LEFT JOIN 
+    Tags t ON p.Tags IS NOT NULL AND t.Id = ANY(STRING_TO_ARRAY(p.Tags, '/><')::int[])
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation
+HAVING 
+    u.Reputation > 1000 AND 
+    AVG(p.Score) > 0 AND 
+    COUNT(DISTINCT p.Id) > 10
+ORDER BY 
+    TotalPosts DESC, 
+    AvgPostScore DESC;

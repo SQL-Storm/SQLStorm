@@ -1,0 +1,148 @@
+WITH recent_activity AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.LastEditorUserId,
+    p.AcceptedAnswerId,
+    p.ParentId,
+    p.CommentCount,
+    COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+    (CASE
+      WHEN TRY_CAST(p.Body AS JSON) IS NOT NULL THEN (CAST(p.Body AS JSON) ->> 'length')
+      ELSE NULL
+    END) AS BodyPreview
+  FROM Posts p
+  WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180' DAY
+),
+owner_info AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.AccountId,
+    u.CreationDate AS UserCreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.WebsiteUrl,
+    u.AboutMe,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.ProfileImageUrl,
+    u.EmailHash
+  FROM Users u
+),
+tag_analytics AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS TagQuestionCount,
+    AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS AvgQuestionScore,
+    AVG(p.ViewCount) AS AvgViewCount
+  FROM Tags t
+  LEFT JOIN Posts p
+    ON p.Id = t.WikiPostId
+  GROUP BY t.TagName
+),
+complex_join AS (
+  SELECT
+    ro.PostId,
+    ro.Title,
+    ro.Tags,
+    ro.CreationDate,
+    ro.Score,
+    ro.ViewCount,
+    oi.DisplayName AS OwnerDisplayName,
+    oi.Reputation,
+    oi.Location,
+    (
+      SELECT COUNT(*) FROM Posts a
+      WHERE a.OwnerUserId = ro.OwnerUserId
+        AND a.PostTypeId = 1
+        AND a.CreationDate >= ro.CreationDate - INTERVAL '365' DAY
+    ) AS OwnerQuestionCount,
+    (
+      SELECT COUNT(*) FROM Comments c
+      WHERE c.PostId = ro.PostId
+    ) AS CommentCountForPost,
+    (
+      SELECT ARRAY_AGG(v.VoteTypeId) FROM Votes v
+      WHERE v.PostId = ro.PostId
+        AND v.CreationDate >= ro.CreationDate
+    ) AS VoteTypesOnPost,
+    (
+      SELECT COUNT(*) FROM PostLinks pl
+      WHERE pl.PostId = ro.PostId
+        AND pl.LinkTypeId = 1
+    ) AS LinkedPostCount
+  FROM recent_activity ro
+  LEFT JOIN owner_info oi ON ro.OwnerUserId = oi.UserId
+),
+warning_window AS (
+  SELECT
+    cp.PostId,
+    cp.OwnerDisplayName,
+    cp.OwnerQuestionCount,
+    cp.CommentCountForPost,
+    cp.LinkedPostCount,
+    cp.VoteTypesOnPost,
+    CASE
+      WHEN cp.VoteTypesOnPost IS NULL THEN ROW(0,0)
+      ELSE ROW(
+        SUM(CASE WHEN v.vtp = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY cp.PostId),
+        SUM(CASE WHEN v.vtp = 3 THEN 1 ELSE 0 END) OVER (PARTITION BY cp.PostId)
+      )
+    END AS UpDownBalance
+  FROM complex_join cp
+  LEFT JOIN LATERAL (
+    SELECT unnest(cp.VoteTypesOnPost) AS vtp
+  ) v ON true
+  GROUP BY
+    cp.PostId,
+    cp.OwnerDisplayName,
+    cp.OwnerQuestionCount,
+    cp.CommentCountForPost,
+    cp.LinkedPostCount,
+    cp.VoteTypesOnPost
+)
+SELECT
+  rp.PostId,
+  rp.Title,
+  rp.CreationDate,
+  rp.ViewCount,
+  rp.Score,
+  rp.Tags,
+  wb.OwnerDisplayName,
+  wb.Reputation,
+  wb.Location,
+  wb.CommentCountForPost,
+  rb.TotalUp AS UpVotes,
+  rb.TotalDown AS DownVotes,
+  wb.UpDownBalance,
+  (
+    SELECT STRING_AGG(tt.Name, ',') FROM (
+      SELECT DISTINCT vt.Name
+      FROM Votes v
+      JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+      WHERE v.PostId = rp.PostId
+    ) tt
+  ) AS DistinctVoteTypesOnPost
+FROM warning_window wb
+JOIN Posts rp ON rp.Id = wb.PostId
+LEFT JOIN (
+  SELECT
+    vp.PostId,
+    SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS TotalUp,
+    SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS TotalDown
+  FROM Votes vp
+  JOIN VoteTypes vt ON vt.Id = vp.VoteTypeId
+  GROUP BY vp.PostId
+) rb ON rb.PostId = rp.Id
+ORDER BY rp.CreationDate DESC
+LIMIT 100;

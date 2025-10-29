@@ -1,0 +1,358 @@
+-- {"query": "684.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 4049} 
+with recent_users as (
+    select u.id as user_id,
+           u.displayname,
+           u.reputation,
+           u.creationdate,
+           u.location,
+           coalesce(nullif(trim(u.websiteurl), ''), 'N/A') as websiteurl,
+           row_number() over (order by u.creationdate desc, u.id desc) as rn
+    from users u
+    where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+top_tags as (
+    select t.tagname,
+           t.count,
+           dense_rank() over (order by t.count desc, t.tagname) as dr
+    from tags t
+    where t.count is not null and t.count > 0
+),
+tagged_questions as (
+    select p.id as post_id,
+           p.owneruserid as owner_user_id,
+           p.score,
+           p.viewcount,
+           p.creationdate as post_creation,
+           p.title,
+           unnest(string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')) as tagname
+    from posts p
+    where p.posttypeid = 1
+      and p.tags is not null
+),
+user_question_stats as (
+    select tq.owner_user_id,
+           count(*) filter (where tq.score > 0) as pos_q_count,
+           count(*) filter (where tq.score <= 0 or tq.score is null) as nonpos_q_count,
+           avg(tq.score) as avg_q_score,
+           percentile_cont(0.5) within group (order by tq.viewcount) as med_q_views
+    from tagged_questions tq
+    group by tq.owner_user_id
+),
+user_answer_stats as (
+    select p.owneruserid as owner_user_id,
+           count(*) as answer_count,
+           sum(case when p.score > 0 then 1 else 0 end) as pos_ans_count,
+           avg(p.score) as avg_ans_score
+    from posts p
+    where p.posttypeid = 2
+    group by p.owneruserid
+),
+user_comment_stats as (
+    select c.userid as user_id,
+           count(*) as comment_count,
+           avg(c.score) as avg_comment_score,
+           max(c.creationdate) as last_comment_date
+    from comments c
+    group by c.userid
+),
+favorite_events as (
+    select v.postid,
+           count(*) as fav_count,
+           min(v.creationdate) as first_fav_date,
+           max(v.creationdate) as last_fav_date
+    from votes v
+    where v.votetypeid = 5
+    group by v.postid
+),
+dup_links as (
+    select pl.postid as dupe_id,
+           pl.relatedpostid as canonical_id,
+           count(*) as dup_link_count,
+           min(pl.creationdate) as first_dup_date
+    from postlinks pl
+    where pl.linktypeid = 3
+    group by pl.postid, pl.relatedpostid
+),
+closed_reasons as (
+    select ph.postid,
+           max(ph.creationdate) filter (where ph.posthistorytypeid = 10) as closed_date,
+           max(ph.creationdate) filter (where ph.posthistorytypeid = 11) as reopened_date,
+           max(ph.comment) filter (where ph.posthistorytypeid = 10) as close_reason_raw
+    from posthistory ph
+    where ph.posthistorytypeid in (10,11)
+    group by ph.postid
+),
+user_badge_tally as (
+    select b.userid as user_id,
+           sum(case when b.class = 1 then 1 else 0 end) as golds,
+           sum(case when b.class = 2 then 1 else 0 end) as silvers,
+           sum(case when b.class = 3 then 1 else 0 end) as bronzes,
+           sum(case when b.tagbased = 1 then 1 else 0 end) as tag_badges,
+           count(*) as total_badges,
+           max(b.date) as last_badge_date
+    from badges b
+    group by b.userid
+),
+post_activity as (
+    select p.id as post_id,
+           p.owneruserid as owner_user_id,
+           p.creationdate,
+           p.lastactivitydate,
+           p.lasteditdate,
+           p.viewcount,
+           p.score,
+           coalesce(fe.fav_count, 0) as fav_count,
+           row_number() over (partition by p.owneruserid order by p.lastactivitydate desc nulls last, p.id desc) as rn_recent_activity
+    from posts p
+    left join favorite_events fe on fe.postid = p.id
+),
+canonical_popularity as (
+    select d.canonical_id,
+           count(*) as dup_inbound_count
+    from dup_links d
+    group by d.canonical_id
+),
+user_quality_index as (
+    select u.id as user_id,
+           coalesce(uqs.avg_q_score, 0) as avg_q_score,
+           coalesce(uas.avg_ans_score, 0) as avg_ans_score,
+           coalesce(ucs.avg_comment_score, 0) as avg_comment_score,
+           coalesce(ubt.total_badges, 0) as total_badges,
+           coalesce(ubt.tag_badges, 0) as tag_badges,
+           coalesce(uqs.pos_q_count, 0) + coalesce(uas.pos_ans_count, 0) as total_positive_posts,
+           coalesce(uqs.nonpos_q_count, 0) + (coalesce(uas.answer_count, 0) - coalesce(uas.pos_ans_count, 0)) as total_nonpositive_posts
+    from users u
+    left join user_question_stats uqs on uqs.owner_user_id = u.id
+    left join user_answer_stats uas on uas.owner_user_id = u.id
+    left join user_comment_stats ucs on ucs.user_id = u.id
+    left join user_badge_tally ubt on ubt.user_id = u.id
+),
+normalized_scores as (
+    select uq.user_id,
+           -- normalize via z-score approximation using window aggregates
+           (uq.avg_q_score - avg(uq.avg_q_score) over ()) / nullif(stddev_pop(uq.avg_q_score) over (), 0) as z_q,
+           (uq.avg_ans_score - avg(uq.avg_ans_score) over ()) / nullif(stddev_pop(uq.avg_ans_score) over (), 0) as z_a,
+           (uq.avg_comment_score - avg(uq.avg_comment_score) over ()) / nullif(stddev_pop(uq.avg_comment_score) over (), 0) as z_c,
+           (uq.total_badges - avg(uq.total_badges) over ()) / nullif(stddev_pop(uq.total_badges) over (), 0) as z_b,
+           (uq.tag_badges - avg(uq.tag_badges) over ()) / nullif(stddev_pop(uq.tag_badges) over (), 0) as z_tb,
+           (uq.total_positive_posts - avg(uq.total_positive_posts) over ()) / nullif(stddev_pop(uq.total_positive_posts) over (), 0) as z_pos,
+           (uq.total_nonpositive_posts - avg(uq.total_nonpositive_posts) over ()) / nullif(stddev_pop(uq.total_nonpositive_posts) over (), 0) as z_nonpos
+    from user_quality_index uq
+),
+user_quality_rank as (
+    select ns.user_id,
+           coalesce(ns.z_q, 0)*0.25
+           + coalesce(ns.z_a, 0)*0.30
+           + coalesce(ns.z_c, 0)*0.05
+           + coalesce(ns.z_b, 0)*0.20
+           + coalesce(ns.z_tb, 0)*0.05
+           + coalesce(ns.z_pos, 0)*0.20
+           - greatest(coalesce(ns.z_nonpos, 0), 0)*0.10 as quality_score
+    from normalized_scores ns
+),
+hot_recent_questions as (
+    select tq.post_id,
+           tq.owner_user_id,
+           tq.title,
+           tq.tagname,
+           tq.score,
+           p.viewcount,
+           p.creationdate,
+           p.lastactivitydate,
+           cr.closed_date,
+           cr.reopened_date,
+           case
+             when cr.closed_date is not null and (cr.reopened_date is null or cr.reopened_date < cr.closed_date) then 1
+             else 0
+           end as is_currently_closed,
+           coalesce(cp.dup_inbound_count, 0) as dup_inbound_count,
+           coalesce(fe.fav_count, 0) as fav_count
+    from tagged_questions tq
+    join posts p on p.id = tq.post_id
+    left join closed_reasons cr on cr.postid = tq.post_id
+    left join canonical_popularity cp on cp.canonical_id = tq.post_id
+    left join favorite_events fe on fe.postid = tq.post_id
+    where p.creationdate >= (select max(creationdate) - interval '90 days' from posts)
+),
+ranked_hot as (
+    select hrq.*,
+           row_number() over (partition by hrq.owner_user_id order by (hrq.score*2 + hrq.viewcount/100 + hrq.fav_count*3 + hrq.dup_inbound_count*5) desc, hrq.post_id) as rn_user_hot,
+           dense_rank() over (order by (hrq.score*2 + hrq.viewcount/100 + hrq.fav_count*3 + hrq.dup_inbound_count*5) desc, hrq.post_id) as dr_global_hot
+    from hot_recent_questions hrq
+),
+user_activity_mix as (
+    select u.id as user_id,
+           count(*) filter (where p.posttypeid = 1) as q_count,
+           count(*) filter (where p.posttypeid = 2) as a_count,
+           count(*) filter (where p.posttypeid not in (1,2) or p.posttypeid is null) as other_count
+    from users u
+    left join posts p on p.owneruserid = u.id
+    group by u.id
+),
+user_last_touch as (
+    select pa.owner_user_id as user_id,
+           min(pa.creationdate) as first_post_date,
+           max(pa.lastactivitydate) as last_activity_date,
+           max(pa.lasteditdate) as last_edit_date,
+           max(pa.viewcount) as max_views_on_owned
+    from post_activity pa
+    group by pa.owner_user_id
+),
+bench_candidates as (
+    select ru.user_id,
+           ru.displayname,
+           ru.reputation,
+           ru.creationdate as user_creation,
+           coalesce(uqr.quality_score, 0) as quality_score,
+           uam.q_count,
+           uam.a_count,
+           uam.other_count,
+           ul.first_post_date,
+           ul.last_activity_date,
+           ul.last_edit_date,
+           ul.max_views_on_owned,
+           rha.post_id as top_recent_hot_qid,
+           rha.title as top_recent_hot_title,
+           rha.score as top_recent_hot_score,
+           rha.viewcount as top_recent_hot_views,
+           rha.fav_count as top_recent_hot_favs,
+           rha.is_currently_closed,
+           rha.dup_inbound_count,
+           rb.golds,
+           rb.silvers,
+           rb.bronzes,
+           rb.total_badges,
+           coalesce(ucs.comment_count,0) as comment_count,
+           coalesce(uas.answer_count,0) as answer_count,
+           coalesce(uqs.pos_q_count,0) as pos_qs,
+           coalesce(uqs.nonpos_q_count,0) as nonpos_qs,
+           ru.rn as user_recency_rank
+    from recent_users ru
+    left join user_quality_rank uqr on uqr.user_id = ru.user_id
+    left join user_activity_mix uam on uam.user_id = ru.user_id
+    left join user_last_touch ul on ul.user_id = ru.user_id
+    left join (
+        select rh.owner_user_id, rh.post_id, rh.title, rh.score, rh.viewcount, rh.fav_count, rh.is_currently_closed, rh.dup_inbound_count
+        from ranked_hot rh
+        where rh.rn_user_hot = 1
+    ) rha on rha.owner_user_id = ru.user_id
+    left join user_badge_tally rb on rb.user_id = ru.user_id
+    left join user_comment_stats ucs on ucs.user_id = ru.user_id
+    left join user_answer_stats uas on uas.owner_user_id = ru.user_id
+    left join user_question_stats uqs on uqs.owner_user_id = ru.user_id
+),
+tag_influence as (
+    select tq.owner_user_id as user_id,
+           lower(tq.tagname) as tagname,
+           count(*) as q_count,
+           sum(case when tq.score > 0 then 1 else 0 end) as pos_qs,
+           sum(tq.score) as total_score
+    from tagged_questions tq
+    group by tq.owner_user_id, lower(tq.tagname)
+),
+tag_influence_ranked as (
+    select ti.*,
+           row_number() over (partition by ti.user_id order by (ti.total_score*2 + ti.pos_qs*3 + ti.q_count) desc, ti.tagname) as rn_tag
+    from tag_influence ti
+),
+top_user_tags as (
+    select tir.user_id,
+           string_agg(tir.tagname, ', ' order by tir.rn_tag) as top_tags
+    from tag_influence_ranked tir
+    where tir.rn_tag <= 3
+    group by tir.user_id
+),
+mixed_source as (
+    select bc.*,
+           tut.top_tags,
+           case
+             when bc.quality_score is null then 'missing_quality'
+             when bc.quality_score >= percentile_cont(0.9) within group(order by bc.quality_score) over () then 'top10'
+             when bc.quality_score >= percentile_cont(0.75) within group(order by bc.quality_score) over () then 'top25'
+             when bc.quality_score >= percentile_cont(0.5) within group(order by bc.quality_score) over () then 'top50'
+             else 'bottom50'
+           end as quality_bucket
+    from bench_candidates bc
+    left join top_user_tags tut on tut.user_id = bc.user_id
+),
+-- produce some cross-set comparisons with set operators
+top_quality as (
+    select user_id from mixed_source where quality_bucket in ('top10','top25')
+),
+active_recent as (
+    select user_id from mixed_source where last_activity_date >= now() - interval '30 days'
+),
+high_badged as (
+    select user_id from mixed_source where total_badges >= coalesce((select avg(total_badges) from mixed_source),0)
+),
+segment_union as (
+    select user_id, 'top_quality' as seg from top_quality
+    union
+    select user_id, 'active_recent' from active_recent
+    union
+    select user_id, 'high_badged' from high_badged
+),
+segment_counts as (
+    select user_id,
+           sum(case when seg = 'top_quality' then 1 else 0 end) as is_top_quality,
+           sum(case when seg = 'active_recent' then 1 else 0 end) as is_active_recent,
+           sum(case when seg = 'high_badged' then 1 else 0 end) as is_high_badged
+    from segment_union
+    group by user_id
+)
+select ms.user_id,
+       ms.displayname,
+       ms.reputation,
+       ms.user_creation,
+       ms.user_recency_rank,
+       round(ms.quality_score::numeric, 4) as quality_score,
+       ms.quality_bucket,
+       coalesce(ms.q_count,0) as q_count,
+       coalesce(ms.a_count,0) as a_count,
+       coalesce(ms.other_count,0) as other_count,
+       ms.first_post_date,
+       ms.last_activity_date,
+       ms.last_edit_date,
+       coalesce(ms.max_views_on_owned,0) as max_views_on_owned,
+       ms.top_recent_hot_qid,
+       left(coalesce(ms.top_recent_hot_title,''), 120) as top_recent_hot_title_trunc,
+       ms.top_recent_hot_score,
+       ms.top_recent_hot_views,
+       ms.top_recent_hot_favs,
+       ms.is_currently_closed,
+       ms.dup_inbound_count,
+       coalesce(ms.golds,0) as golds,
+       coalesce(ms.silvers,0) as silvers,
+       coalesce(ms.bronzes,0) as bronzes,
+       coalesce(ms.total_badges,0) as total_badges,
+       ms.comment_count,
+       ms.answer_count,
+       ms.pos_qs,
+       ms.nonpos_qs,
+       coalesce(ms.top_tags, 'n/a') as top_tags,
+       sc.is_top_quality,
+       sc.is_active_recent,
+       sc.is_high_badged,
+       -- composite ranking with complicated expressions and null logic
+       (
+         coalesce(ms.quality_score, 0)*0.5
+         + ln(1 + greatest(coalesce(ms.q_count,0) + coalesce(ms.a_count,0), 0)) * 0.2
+         + ln(1 + greatest(coalesce(ms.top_recent_hot_views,0), 0)) * 0.1
+         + (case when ms.is_currently_closed = 1 then -0.05 else 0 end)
+         + (coalesce(ms.golds,0)*0.05 + coalesce(ms.silvers,0)*0.02 + coalesce(ms.bronzes,0)*0.01)
+         + (coalesce(sc.is_active_recent,0)*0.1 + coalesce(sc.is_high_badged,0)*0.05)
+       ) as composite_rank_score,
+       rank() over (order by
+         coalesce(ms.quality_score, 0)*0.5
+         + ln(1 + greatest(coalesce(ms.q_count,0) + coalesce(ms.a_count,0), 0)) * 0.2
+         + ln(1 + greatest(coalesce(ms.top_recent_hot_views,0), 0)) * 0.1
+         + (case when ms.is_currently_closed = 1 then -0.05 else 0 end)
+         + (coalesce(ms.golds,0)*0.05 + coalesce(ms.silvers,0)*0.02 + coalesce(ms.bronzes,0)*0.01)
+         + (coalesce(sc.is_active_recent,0)*0.1 + coalesce(sc.is_high_badged,0)*0.05)
+       desc, ms.user_id) as composite_rank
+from mixed_source ms
+left join segment_counts sc on sc.user_id = ms.user_id
+where (ms.top_recent_hot_qid is not null or ms.total_badges >= 3 or ms.quality_bucket in ('top10','top25'))
+  and (ms.location is null or position('remote' in lower(ms.location)) > 0 or position('usa' in lower(ms.location)) > 0)
+order by composite_rank_score desc, ms.user_id
+limit 250;

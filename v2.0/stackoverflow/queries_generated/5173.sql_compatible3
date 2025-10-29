@@ -1,0 +1,126 @@
+WITH ranked_users AS (
+  SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.ProfileImageUrl,
+    u.EmailHash,
+    u.AccountId,
+    ROW_NUMBER() OVER (
+      PARTITION BY CASE
+        WHEN u.Location IS NULL THEN 'unknown'
+        ELSE u.Location
+      END
+      ORDER BY u.Reputation DESC, u.LastAccessDate DESC
+    ) AS rn_by_location
+  FROM Users u
+),
+top_locations AS (
+  SELECT
+    location_group,
+    MAX(reputation) AS max_rep,
+    AVG(reputation) AS avg_rep,
+    COUNT(*) AS cnt
+  FROM (
+    SELECT
+      CASE
+        WHEN Location IS NULL THEN 'Unknown'
+        WHEN LENGTH(Location) < 3 THEN 'Short'
+        ELSE Location
+      END AS location_group,
+      Reputation
+    FROM Users
+  ) t
+  GROUP BY location_group
+),
+badge_totals AS (
+  SELECT UserId,
+         SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS gold_count,
+         SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS silver_count,
+         SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS bronze_count
+  FROM Badges
+  GROUP BY UserId
+),
+recent_votes_per_post AS (
+  SELECT PostId, COUNT(*) AS vote_count
+  FROM Votes
+  WHERE CreationDate >= (DATE '2024-10-01' - INTERVAL '30 day')
+  GROUP BY PostId
+),
+latest_post_per_user AS (
+  SELECT p.OwnerUserId AS OwnerUserId, p.Id AS PostId
+  FROM Posts p
+  WHERE p.OwnerUserId IS NOT NULL
+    AND p.Id = (
+      SELECT p2.Id
+      FROM Posts p2
+      WHERE p2.OwnerUserId = p.OwnerUserId
+      ORDER BY p2.CreationDate DESC
+      LIMIT 1
+    )
+  GROUP BY p.OwnerUserId, p.Id
+)
+SELECT
+  ru.Id AS UserId,
+  ru.DisplayName,
+  ru.Reputation,
+  ru.CreationDate,
+  ru.LastAccessDate,
+  ru.Location,
+  ru.Views,
+  ru.UpVotes,
+  ru.DownVotes,
+  ru.ProfileImageUrl,
+  ru.EmailHash,
+  ru.AccountId,
+  COALESCE(bt.gold_count, 0) AS GoldBadges,
+  COALESCE(bt.silver_count, 0) AS SilverBadges,
+  COALESCE(bt.bronze_count, 0) AS BronzeBadges,
+  COALESCE(vt.vote_count, 0) AS VoteCountLast30,
+  CASE
+    WHEN ru.rn_by_location = 1 THEN TRUE
+    ELSE FALSE
+  END AS IsTopInLocation,
+  tl.max_rep AS LocMaxRep,
+  tl.avg_rep AS LocAvgRep,
+  tl.cnt AS LocCount
+FROM ranked_users ru
+LEFT JOIN badge_totals bt ON bt.UserId = ru.Id
+LEFT JOIN latest_post_per_user lpu ON lpu.OwnerUserId = ru.Id
+LEFT JOIN recent_votes_per_post vt ON vt.PostId = lpu.PostId
+LEFT JOIN top_locations tl ON (
+  CASE
+    WHEN ru.Location IS NULL THEN 'Unknown'
+    WHEN LENGTH(ru.Location) < 3 THEN 'Short'
+    ELSE ru.Location
+  END = tl.location_group
+)
+GROUP BY
+  ru.Id,
+  ru.DisplayName,
+  ru.Reputation,
+  ru.CreationDate,
+  ru.LastAccessDate,
+  ru.Location,
+  ru.Views,
+  ru.UpVotes,
+  ru.DownVotes,
+  ru.ProfileImageUrl,
+  ru.EmailHash,
+  ru.AccountId,
+  bt.gold_count,
+  bt.silver_count,
+  bt.bronze_count,
+  vt.vote_count,
+  ru.rn_by_location,
+  tl.max_rep,
+  tl.avg_rep,
+  tl.cnt
+ORDER BY ru.Reputation DESC, ru.LastAccessDate DESC
+LIMIT 100;

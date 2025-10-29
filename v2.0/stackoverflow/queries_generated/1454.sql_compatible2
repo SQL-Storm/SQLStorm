@@ -1,0 +1,197 @@
+WITH UserActivity AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS UserTotalUpVotes,
+        U.DownVotes AS UserTotalDownVotes,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - U.LastAccessDate)) / (60 * 60 * 24) AS DaysSinceLastAccess,
+        (SELECT COUNT(B.Id) FROM Badges B WHERE B.UserId = U.Id AND B.Class = 1) AS GoldBadges,
+        (SELECT COUNT(B.Id) FROM Badges B WHERE B.UserId = U.Id AND B.TagBased = TRUE) AS TagBasedBadges
+    FROM Users U
+    WHERE U.Reputation >= 100
+),
+PostMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.LastEditDate,
+        P.ClosedDate,
+        COALESCE(P.Title, SUBSTRING(P.Body FROM 1 FOR 100)) AS DisplayTitle,
+        P.Tags,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvoteCount,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvoteCount,
+        COUNT(DISTINCT PH.Id) AS HistoryEntryCount,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6, 24) THEN 1 ELSE 0 END) AS HasBeenEdited,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS HasBeenClosed,
+        (SELECT AVG(C.Score) FROM Comments C WHERE C.PostId = P.Id AND C.Score IS NOT NULL) AS AvgCommentScore
+    FROM Posts P
+    LEFT JOIN Votes V ON P.Id = V.PostId
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    WHERE P.PostTypeId IN (1, 2)
+    GROUP BY
+        P.Id, P.PostTypeId, P.OwnerUserId, P.CreationDate, P.Score, P.ViewCount, P.AnswerCount,
+        P.CommentCount, P.FavoriteCount, P.LastEditDate, P.ClosedDate, P.Title, P.Body, P.Tags
+),
+TagUsage AS (
+    SELECT
+        T.TagName,
+        T.Id AS TagId,
+        T.Count AS GlobalTagCount,
+        RANK() OVER (ORDER BY T.Count DESC, T.TagName) AS TagPopularityRank
+    FROM Tags T
+    WHERE T.TagName IS NOT NULL
+),
+LastHistoryPerPost AS (
+    SELECT
+        PostId, HistoryDate, HistoryTypeName, HistoryEditorUserId, Comment, CloseReasonName, HistoryCategory
+    FROM (
+        SELECT
+            PH.PostId,
+            PH.CreationDate AS HistoryDate,
+            PHT.Name AS HistoryTypeName,
+            PH.UserId AS HistoryEditorUserId,
+            PH.Comment,
+            CR.Name AS CloseReasonName,
+            CASE
+                WHEN PH.PostHistoryTypeId IN (1, 2, 3) THEN 'Initial'
+                WHEN PH.PostHistoryTypeId IN (4, 5, 6, 24) THEN 'Edit'
+                WHEN PH.PostHistoryTypeId IN (10, 12, 14, 35) THEN 'Moderation Action'
+                WHEN PH.PostHistoryTypeId IN (11, 13, 15, 36) THEN 'Moderation Reversal'
+                ELSE 'Other'
+            END AS HistoryCategory,
+            ROW_NUMBER() OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate DESC, PH.Id DESC) AS rn
+        FROM PostHistory PH
+        JOIN PostHistoryTypes PHT ON PH.PostHistoryTypeId = PHT.Id
+        LEFT JOIN CloseReasonTypes CR ON PH.Comment IS NOT NULL
+            AND PH.PostHistoryTypeId = 10
+            AND PH.Comment ~ '^[0-9]+$'
+            AND CAST(PH.Comment AS integer) = CR.Id
+        WHERE PH.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 10, 11, 12, 13, 14, 15, 24, 35, 36)
+    ) AS RankedHistory
+    WHERE rn = 1
+),
+UserPostTagBase AS (
+    SELECT
+        UA.UserId,
+        UA.DisplayName,
+        UA.Reputation,
+        UA.GoldBadges,
+        UA.DaysSinceLastAccess,
+        PM.PostId,
+        PM.PostTypeId,
+        PM.CreationDate AS PostCreationDate,
+        PM.Score AS PostScore,
+        PM.ViewCount AS PostViewCount,
+        PM.FavoriteCount,
+        PM.UpvoteCount,
+        PM.DownvoteCount,
+        PM.HistoryEntryCount,
+        PM.HasBeenClosed,
+        PM.AvgCommentScore,
+        COALESCE(TU.TagName, 'No Tag') AS MostPopularTagOnPost,
+        COALESCE(TU.TagPopularityRank, 999999) AS MostPopularTagRank,
+        (PM.Score * 0.5 + COALESCE(PM.ViewCount, 0) * 0.01 + COALESCE(PM.FavoriteCount, 0) * 2
+         + PM.UpvoteCount * 0.7 - PM.DownvoteCount * 1.5
+         + (CASE WHEN PM.PostTypeId = 1 THEN COALESCE(PM.AnswerCount,0) * 0.8 ELSE 0 END) ) AS PostInfluenceScore,
+        (SELECT COUNT(PL.Id) FROM PostLinks PL WHERE PL.PostId = PM.PostId AND PL.LinkTypeId = 1) AS SourceLinkedPostCount,
+        (SELECT COUNT(PL.Id) FROM PostLinks PL WHERE PL.RelatedPostId = PM.PostId AND PL.LinkTypeId = 3) AS DuplicatedByPostCount
+    FROM UserActivity UA
+    INNER JOIN PostMetrics PM ON UA.UserId = PM.OwnerUserId
+    LEFT JOIN (
+        SELECT TU.TagName, TU.TagPopularityRank
+        FROM TagUsage TU
+    ) TU ON PM.Tags LIKE '%' || '<' || TU.TagName || '>' || '%'
+),
+UserOverallStats AS (
+    SELECT
+        UPTB.UserId,
+        UPTB.DisplayName,
+        UPTB.Reputation,
+        UPTB.GoldBadges,
+        UPTB.DaysSinceLastAccess,
+        SUM(UPTB.PostInfluenceScore) AS TotalUserInfluenceScore,
+        COUNT(DISTINCT UPTB.PostId) AS TotalPostsByThisUser,
+        AVG(UPTB.PostScore) AS AvgPostScoreByUser,
+        (SUM(UPTB.PostInfluenceScore) * 0.6 + UPTB.Reputation * 0.1 + UPTB.GoldBadges * 50
+         + (100 - LEAST(UPTB.DaysSinceLastAccess, 100)) * 0.05) AS UserEngagementScore,
+        RANK() OVER (ORDER BY SUM(UPTB.PostInfluenceScore) DESC, UPTB.Reputation DESC, UPTB.DisplayName ASC) AS OverallUserRank
+    FROM UserPostTagBase UPTB
+    GROUP BY
+        UPTB.UserId, UPTB.DisplayName, UPTB.Reputation, UPTB.GoldBadges, UPTB.DaysSinceLastAccess
+)
+SELECT
+    UOS.OverallUserRank,
+    UOS.DisplayName,
+    UOS.Reputation,
+    UOS.GoldBadges,
+    UOS.DaysSinceLastAccess,
+    UOS.TotalUserInfluenceScore,
+    UOS.TotalPostsByThisUser,
+    UOS.AvgPostScoreByUser,
+    UOS.UserEngagementScore,
+    UPTB.PostId,
+    UPTB.PostTypeId,
+    UPTB.PostCreationDate,
+    UPTB.PostScore,
+    UPTB.PostViewCount,
+    UPTB.FavoriteCount,
+    UPTB.UpvoteCount,
+    UPTB.DownvoteCount,
+    UPTB.HistoryEntryCount,
+    UPTB.SourceLinkedPostCount,
+    UPTB.DuplicatedByPostCount,
+    UPTB.HasBeenClosed,
+    UPTB.AvgCommentScore,
+    UPTB.MostPopularTagOnPost,
+    UPTB.MostPopularTagRank,
+    UPTB.PostInfluenceScore,
+    LHPP.HistoryCategory AS LatestPostHistoryCategory,
+    LHPP.HistoryDate AS LatestPostHistoryDate,
+    LHPP.CloseReasonName,
+    CASE
+        WHEN UPTB.PostTypeId = 1 AND UPTB.HasBeenClosed = 1 AND LHPP.CloseReasonName IS NOT NULL
+            THEN 'Closed Question: ' || LHPP.CloseReasonName
+        WHEN UPTB.PostTypeId = 1 AND UPTB.HasBeenClosed = 1
+            THEN 'Closed Question (Reason Unknown)'
+        WHEN UPTB.PostTypeId = 1 AND UPTB.PostScore >= 10 AND UPTB.PostViewCount > 1000
+            THEN 'High-Visibility Question'
+        WHEN UPTB.PostTypeId = 1
+            THEN 'Standard Question'
+        WHEN UPTB.PostTypeId = 2 AND UPTB.PostScore >= 5 AND UPTB.MostPopularTagRank <= 100
+            THEN 'Highly Rated Answer on Popular Tag'
+        WHEN UPTB.PostTypeId = 2 AND UPTB.PostScore >= 5
+            THEN 'Highly Rated Answer'
+        WHEN UPTB.PostTypeId = 2 AND UPTB.PostScore < 0
+            THEN 'Controversial Answer'
+        ELSE 'Other Post Type or Low Impact'
+    END AS PostClassification,
+    SQRT(
+        POWER(UPTB.PostInfluenceScore, 2) +
+        POWER(COALESCE(UPTB.AvgCommentScore, 0.0) * 10, 2) +
+        POWER(UPTB.SourceLinkedPostCount * 5.0, 2) +
+        POWER(UPTB.DuplicatedByPostCount * -3.0, 2)
+    ) AS ComprehensivePostQualityMetric,
+    EXTRACT(YEAR FROM UPTB.PostCreationDate) || '-' || UPPER(SUBSTRING(UOS.DisplayName FROM 1 FOR LEAST(LENGTH(UOS.DisplayName), 5))) AS UserPostIdentifierPrefix,
+    AVG(UPTB.PostScore) OVER (PARTITION BY UPTB.UserId, EXTRACT(YEAR FROM UPTB.PostCreationDate)) AS AvgUserPostScoreInYear,
+    COALESCE(UOS.Reputation - LEAD(UOS.Reputation, 1) OVER (ORDER BY UOS.OverallUserRank), 0) AS RepDiffToNextRank
+FROM UserPostTagBase UPTB
+INNER JOIN UserOverallStats UOS ON UPTB.UserId = UOS.UserId
+LEFT JOIN LastHistoryPerPost LHPP ON UPTB.PostId = LHPP.PostId
+WHERE UOS.TotalUserInfluenceScore > 0
+  AND UPTB.PostCreationDate >= DATE '2020-01-01'
+ORDER BY
+    UOS.OverallUserRank ASC,
+    UPTB.PostInfluenceScore DESC,
+    UPTB.PostCreationDate DESC
+FETCH FIRST 500 ROWS ONLY;

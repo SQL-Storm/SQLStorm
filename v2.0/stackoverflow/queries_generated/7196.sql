@@ -1,0 +1,134 @@
+-- {"query": "7196.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1241} 
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        MAX(b.Date) as LastBadgeDate,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Elite'
+            WHEN u.Reputation > 5000 THEN 'Veteran'
+            WHEN u.Reputation > 1000 THEN 'Seasoned'
+            ELSE 'Newbie'
+        END as ReputationTier
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.AccountId IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopAnswers AS (
+    SELECT 
+        p.Id as AnswerId,
+        p.ParentId,
+        p.OwnerUserId,
+        p.Score,
+        p.CreationDate,
+        p.Body,
+        ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) as rn
+    FROM Posts p
+    WHERE p.PostTypeId = 2 AND p.Score > 10
+),
+QuestionStats AS (
+    SELECT 
+        p.Id as QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community'
+            ELSE 'Open'
+        END as PostStatus,
+        (SELECT COUNT(*) FROM Posts WHERE ParentId = p.Id AND PostTypeId = 2 AND Score > 0) as PositiveAnswerCount,
+        (SELECT AVG(Score) FROM Posts WHERE ParentId = p.Id AND PostTypeId = 2) as AvgAnswerScore
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.ViewCount > 1000
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            ELSE 'Niche'
+        END as TagPopularity,
+        (SELECT COUNT(*) FROM Posts WHERE Tags LIKE '%' || t.TagName || '%') as QuestionCountWithTag,
+        (SELECT AVG(Score) FROM Posts WHERE Tags LIKE '%' || t.TagName || '%') as AvgScoreWithTag
+    FROM Tags t
+    WHERE t.Count > 50
+)
+SELECT 
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.ReputationTier,
+    us.PostCount,
+    us.CommentCount,
+    us.BadgeCount,
+    us.LastPostDate,
+    qs.Title as MostUpvotedQuestion,
+    qs.Score as QuestionScore,
+    qs.ViewCount as QuestionViews,
+    qs.AnswerCount as QuestionAnswers,
+    qs.CommentCount as QuestionComments,
+    qs.Tags as QuestionTags,
+    qs.PostStatus,
+    qs.PositiveAnswerCount,
+    qs.AvgAnswerScore,
+    ta.TagName as PopularTag,
+    ta.TagCount,
+    ta.TagPopularity,
+    ta.QuestionCountWithTag,
+    ta.AvgScoreWithTag,
+    CASE 
+        WHEN us.PostCount > 100 AND us.Reputation > 10000 THEN 'Power User'
+        WHEN us.PostCount > 50 AND us.Reputation > 5000 THEN 'Active User'
+        WHEN us.PostCount > 10 THEN 'Regular User'
+        ELSE 'Occasional User'
+    END as UserCategory,
+    COALESCE(ROUND(100.0 * (us.UpVotes - us.DownVotes) / NULLIF(us.UpVotes + us.DownVotes, 0), 2), 0) as UpvoteRatio,
+    DATEDIFF('day', us.LastPostDate, CURRENT_TIMESTAMP) as DaysSinceLastPost,
+    CASE 
+        WHEN EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = us.UserId AND b.Name = 'Great Answer') THEN 'Has Great Answer'
+        ELSE 'No Great Answer'
+    END as GreatAnswerStatus,
+    (SELECT STRING_AGG(SUBSTRING(p.Body, 1, 100), ' || ') 
+     FROM Posts p 
+     WHERE p.OwnerUserId = us.UserId 
+     AND p.PostTypeId = 1 
+     AND p.Score > 50 
+     LIMIT 3) as SampleHighScorePosts
+FROM UserStats us
+LEFT JOIN QuestionStats qs ON us.UserId = qs.OwnerUserId
+LEFT JOIN TagAnalysis ta ON ta.TagName IN (
+    SELECT TRIM(SUBSTRING(t, 1, POSITION('>' IN t) - 1)) 
+    FROM UNNEST(STRING_TO_ARRAY(qs.Tags, '>')) t 
+    WHERE POSITION('>' IN t) > 0
+) OR ta.TagName IN (
+    SELECT t 
+    FROM UNNEST(STRING_TO_ARRAY(qs.Tags, '>')) t 
+    WHERE LENGTH(t) > 3
+)
+WHERE us.Reputation > 1000
+AND (qs.PostStatus = 'Open' OR qs.PostStatus IS NULL)
+AND (ta.TagName IS NULL OR ta.TagCount > 100)
+ORDER BY us.Reputation DESC, us.PostCount DESC
+LIMIT 500;

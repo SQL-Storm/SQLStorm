@@ -1,0 +1,254 @@
+-- {"query": "1105.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3960} 
+
+WITH UserStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.UpVotes AS UserUpVotes,
+        u.DownVotes AS UserDownVotes,
+        u.Views AS UserProfileViews,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersCount,
+        COUNT(DISTINCT c.Id) AS CommentsCount,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+        SUM(CASE WHEN vt_acc.VoteTypeId = 1 THEN 1 ELSE 0 END) AS AcceptedAnswersGivenCount, -- User accepting an answer
+        SUM(CASE WHEN vt_fav.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoriteVotesGivenCount -- User marking a post as favorite
+    FROM
+        Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v_acc ON u.Id = v_acc.UserId AND v_acc.VoteTypeId = 1
+    LEFT JOIN VoteTypes vt_acc ON v_acc.VoteTypeId = vt_acc.Id
+    LEFT JOIN Votes v_fav ON u.Id = v_fav.UserId AND v_fav.VoteTypeId = 5
+    LEFT JOIN VoteTypes vt_fav ON v_fav.VoteTypeId = vt_fav.Id
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate,
+        u.UpVotes, u.DownVotes, u.Views
+),
+PostMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate AS PostCreationDate,
+        p.LastActivityDate,
+        p.LastEditDate,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.Tags,
+        p.Body,
+        (SELECT COUNT(ph.Id) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4, 5, 6)) AS EditCount,
+        (SELECT COUNT(DISTINCT ph.UserId) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4, 5, 6)) AS UniqueEditorsCount,
+        COALESCE(p.Score, 0) * 0.5 + COALESCE(p.ViewCount, 0) * 0.01 + COALESCE(p.AnswerCount, 0) * 2 + COALESCE(p.CommentCount, 0) * 1 + COALESCE(p.FavoriteCount, 0) * 5 AS EngagementScore,
+        SUBSTRING(p.Tags, 2, POSITION('><' IN p.Tags) - 2) AS PrimaryTag,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'CommunityWiki'
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+            ELSE 'Open'
+        END AS PostStatus
+    FROM
+        Posts p
+    WHERE
+        p.PostTypeId IN (1, 2) -- Only Questions and Answers
+),
+HotTopicTags AS (
+    SELECT
+        UPPER(TRIM(unnest(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><')))) AS TagName,
+        COUNT(p.Id) AS TagPostCount,
+        AVG(p.Score) AS AvgTagScore,
+        MAX(p.LastActivityDate) AS LastTagActivity
+    FROM
+        Posts p
+    WHERE
+        p.PostTypeId = 1 AND p.Tags IS NOT NULL AND p.Tags != ''
+        AND p.CreationDate > NOW() - INTERVAL '1 year'
+    GROUP BY
+        UPPER(TRIM(unnest(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><'))))
+    HAVING
+        COUNT(p.Id) > 10 AND AVG(p.Score) > 2
+)
+SELECT
+    -- User Details
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.UserCreationDate,
+    us.LastAccessDate,
+    us.UserProfileViews,
+    us.QuestionsCount,
+    us.AnswersCount,
+    us.CommentsCount,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    us.AcceptedAnswersGivenCount,
+    us.FavoriteVotesGivenCount,
+    -- Post Details (Question)
+    pm_q.PostId AS QuestionId,
+    pm_q.Title AS QuestionTitle,
+    pm_q.Score AS QuestionScore,
+    pm_q.ViewCount AS QuestionViewCount,
+    pm_q.CommentCount AS QuestionCommentCount,
+    pm_q.FavoriteCount AS QuestionFavoriteCount,
+    pm_q.PostCreationDate AS QuestionCreationDate,
+    pm_q.LastActivityDate AS QuestionLastActivityDate,
+    pm_q.EditCount AS QuestionEditCount,
+    pm_q.UniqueEditorsCount AS QuestionUniqueEditorsCount,
+    pm_q.EngagementScore AS QuestionEngagementScore,
+    pm_q.PrimaryTag AS QuestionPrimaryTag,
+    pm_q.PostStatus AS QuestionStatus,
+    COALESCE(pm_q.AnswerCount, 0) AS ActualAnswerCount,
+    -- Related Accepted Answer Details
+    pm_a.PostId AS AcceptedAnswerId,
+    pm_a.Score AS AcceptedAnswerScore,
+    pm_a.PostCreationDate AS AcceptedAnswerCreationDate,
+    pm_a.LastActivityDate AS AcceptedAnswerLastActivityDate,
+    COALESCE(pm_a.EditCount, 0) AS AcceptedAnswerEditCount,
+    -- Link details for the question
+    pl.RelatedPostId AS LinkedPostId,
+    lt.Name AS LinkTypeName,
+    -- Tag popularity context
+    (CASE WHEN htt.TagName IS NOT NULL THEN TRUE ELSE FALSE END) AS IsInHotTopic,
+    COALESCE(htt.AvgTagScore, 0.0) AS HotTopicAvgTagScore,
+    -- Derived metrics & Window Functions
+    RANK() OVER (PARTITION BY us.DisplayName IS NULL ORDER BY us.Reputation DESC, us.LastAccessDate DESC) AS GlobalUserRank,
+    ROW_NUMBER() OVER (PARTITION BY pm_q.PrimaryTag ORDER BY pm_q.EngagementScore DESC, pm_q.PostCreationDate DESC) AS PostRankWithinTag,
+    NTILE(5) OVER (ORDER BY pm_q.EngagementScore DESC) AS EngagementQuintile,
+    AVG(pm_q.Score) OVER (PARTITION BY pm_q.PrimaryTag) AS AvgScoreForTag,
+    SUM(us.QuestionsCount) OVER (ORDER BY us.LastAccessDate ROWS BETWEEN 30 PRECEDING AND CURRENT ROW) AS Rolling30DayQuestions,
+    LAG(pm_q.CreationDate, 1, '1970-01-01'::timestamp) OVER (PARTITION BY us.UserId ORDER BY pm_q.CreationDate) AS PreviousQuestionDate,
+    -- Complex expressions and NULL logic
+    EXTRACT(EPOCH FROM (NOW() - us.LastAccessDate)) / (60 * 60 * 24) AS DaysSinceLastAccess,
+    NULLIF(us.UserUpVotes, 0) / NULLIF(us.UserDownVotes, 0)::NUMERIC AS UpDownVoteRatio, -- Cast to NUMERIC for float division
+    COALESCE(us.DisplayName, 'Anonymous') AS EffectiveDisplayName,
+    CASE
+        WHEN us.Reputation > 10000 AND us.QuestionsCount > 50 AND us.GoldBadges > 0 THEN 'Veteran_Influencer'
+        WHEN us.Reputation > 5000 AND us.AnswersCount > 100 AND us.AcceptedAnswersGivenCount > 10 THEN 'Expert_Contributor'
+        WHEN us.LastAccessDate > NOW() - INTERVAL '3 months' AND pm_q.EngagementScore > 50 THEN 'Active_Engager'
+        ELSE 'General_User'
+    END AS UserCategory,
+    -- Correlated Subquery in SELECT
+    (SELECT COUNT(DISTINCT co.UserId) FROM Comments co WHERE co.PostId = pm_q.PostId AND co.UserId IS NOT NULL) AS UniqueCommentersOnQuestion,
+    -- String expressions
+    (LOWER(pm_q.Title) LIKE '%sql%' OR LOWER(pm_q.Title) LIKE '%database%') AS IsSqlRelatedQuestion,
+    LENGTH(pm_q.Body) AS QuestionBodyLength
+FROM
+    UserStats us
+INNER JOIN
+    PostMetrics pm_q ON us.UserId = pm_q.OwnerUserId
+LEFT JOIN
+    PostMetrics pm_a ON pm_q.AcceptedAnswerId = pm_a.PostId AND pm_a.PostTypeId = 2
+LEFT JOIN
+    PostLinks pl ON pm_q.PostId = pl.PostId AND pl.LinkTypeId = 1 -- Only 'Linked' posts
+LEFT JOIN
+    LinkTypes lt ON pl.LinkTypeId = lt.Id
+LEFT JOIN
+    HotTopicTags htt ON pm_q.PrimaryTag = htt.TagName
+WHERE
+    pm_q.PostTypeId = 1 -- Ensure we are looking at questions primarily
+    AND us.Reputation > 1000 -- Filter for more established users
+    AND pm_q.ViewCount > 100 -- Filter for questions with some visibility
+    AND pm_q.LastActivityDate > NOW() - INTERVAL '2 years' -- Relatively recent activity
+    AND (pm_q.Tags IS NOT NULL AND pm_q.Tags != '') -- Ensure tags are present for analysis
+    AND pm_q.Title IS NOT NULL AND pm_q.Body IS NOT NULL
+    AND pm_q.OwnerUserId <> -1 -- Exclude community user posts
+
+UNION ALL
+
+SELECT
+    -- User Details
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.UserCreationDate,
+    us.LastAccessDate,
+    us.UserProfileViews,
+    us.QuestionsCount,
+    us.AnswersCount,
+    us.CommentsCount,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    us.AcceptedAnswersGivenCount,
+    us.FavoriteVotesGivenCount,
+    -- Post Details (Answer to a Question)
+    pm_ans.ParentId AS QuestionId, -- Parent question of the answer
+    (SELECT p_parent.Title FROM Posts p_parent WHERE p_parent.Id = pm_ans.ParentId) AS QuestionTitle, -- Correlated subquery for parent title
+    NULL AS QuestionScore, -- Not directly applicable to the answer entry
+    NULL AS QuestionViewCount,
+    NULL AS QuestionCommentCount,
+    NULL AS QuestionFavoriteCount,
+    NULL AS QuestionCreationDate,
+    NULL AS QuestionLastActivityDate,
+    NULL AS QuestionEditCount,
+    NULL AS QuestionUniqueEditorsCount,
+    NULL AS QuestionEngagementScore,
+    (SELECT SUBSTRING(p_parent.Tags, 2, POSITION('><' IN p_parent.Tags) - 2) FROM Posts p_parent WHERE p_parent.Id = pm_ans.ParentId) AS QuestionPrimaryTag, -- Correlated subquery for parent tag
+    NULL AS QuestionStatus,
+    0 AS ActualAnswerCount, -- this will be 0 for answers being analyzed as the primary record
+    -- Answer Details (the actual answer being analyzed)
+    pm_ans.PostId AS AcceptedAnswerId,
+    pm_ans.Score AS AcceptedAnswerScore,
+    pm_ans.PostCreationDate AS AcceptedAnswerCreationDate,
+    pm_ans.LastActivityDate AS AcceptedAnswerLastActivityDate,
+    COALESCE(pm_ans.EditCount, 0) AS AcceptedAnswerEditCount,
+    -- Link details for the answer (if any, though less common for answers)
+    pl.RelatedPostId AS LinkedPostId,
+    lt.Name AS LinkTypeName,
+    -- Tag popularity context from the parent question
+    (CASE WHEN htt.TagName IS NOT NULL THEN TRUE ELSE FALSE END) AS IsInHotTopic,
+    COALESCE(htt.AvgTagScore, 0.0) AS HotTopicAvgTagScore,
+    -- Derived metrics & Window Functions (re-applying similar for consistency)
+    RANK() OVER (PARTITION BY us.DisplayName IS NULL ORDER BY us.Reputation DESC, us.LastAccessDate DESC) AS GlobalUserRank,
+    ROW_NUMBER() OVER (PARTITION BY (SELECT SUBSTRING(p_parent.Tags, 2, POSITION('><' IN p_parent.Tags) - 2) FROM Posts p_parent WHERE p_parent.Id = pm_ans.ParentId) ORDER BY pm_ans.EngagementScore DESC, pm_ans.PostCreationDate DESC) AS PostRankWithinTag,
+    NTILE(5) OVER (ORDER BY pm_ans.EngagementScore DESC) AS EngagementQuintile,
+    AVG(pm_ans.Score) OVER (PARTITION BY (SELECT SUBSTRING(p_parent.Tags, 2, POSITION('><' IN p_parent.Tags) - 2) FROM Posts p_parent WHERE p_parent.Id = pm_ans.ParentId)) AS AvgScoreForTag,
+    SUM(us.AnswersCount) OVER (ORDER BY us.LastAccessDate ROWS BETWEEN 30 PRECEDING AND CURRENT ROW) AS Rolling30DayQuestions, -- now rolling answers
+    LAG(pm_ans.CreationDate, 1, '1970-01-01'::timestamp) OVER (PARTITION BY us.UserId ORDER BY pm_ans.CreationDate) AS PreviousQuestionDate, -- now previous answer date
+    -- Complex expressions and NULL logic
+    EXTRACT(EPOCH FROM (NOW() - us.LastAccessDate)) / (60 * 60 * 24) AS DaysSinceLastAccess,
+    NULLIF(us.UserUpVotes, 0) / NULLIF(us.UserDownVotes, 0)::NUMERIC AS UpDownVoteRatio,
+    COALESCE(us.DisplayName, 'Anonymous') AS EffectiveDisplayName,
+    CASE
+        WHEN us.Reputation > 10000 AND us.AnswersCount > 200 AND us.AcceptedAnswersGivenCount > 50 THEN 'Veteran_Answerer'
+        WHEN us.Reputation > 5000 AND pm_ans.EngagementScore > 100 THEN 'High_Impact_Answerer'
+        WHEN us.LastAccessDate > NOW() - INTERVAL '6 months' AND pm_ans.Score > 20 THEN 'Recent_Valued_Answerer'
+        ELSE 'General_Contributor'
+    END AS UserCategory,
+    -- Correlated Subquery in SELECT
+    (SELECT COUNT(DISTINCT co.UserId) FROM Comments co WHERE co.PostId = pm_ans.PostId AND co.UserId IS NOT NULL) AS UniqueCommentersOnQuestion,
+    -- String expressions
+    (LOWER(pm_ans.Body) LIKE '%solution%' OR LOWER(pm_ans.Body) LIKE '%example%') AS IsSqlRelatedQuestion, -- Changed to reflect answer content
+    LENGTH(pm_ans.Body) AS QuestionBodyLength
+FROM
+    UserStats us
+INNER JOIN
+    PostMetrics pm_ans ON us.UserId = pm_ans.OwnerUserId
+LEFT JOIN
+    PostLinks pl ON pm_ans.PostId = pl.PostId AND pl.LinkTypeId = 1
+LEFT JOIN
+    LinkTypes lt ON pl.LinkTypeId = lt.Id
+LEFT JOIN
+    HotTopicTags htt ON (SELECT UPPER(TRIM(unnest(string_to_array(SUBSTRING(p_parent.Tags, 2, LENGTH(p_parent.Tags) - 2), '><')))) FROM Posts p_parent WHERE p_parent.Id = pm_ans.ParentId) = htt.TagName
+WHERE
+    pm_ans.PostTypeId = 2 -- Focusing on answers here
+    AND us.Reputation > 500 -- Filter for more established answerers
+    AND pm_ans.Score > 5 -- Filter for answers with some upvotes
+    AND pm_ans.LastActivityDate > NOW() - INTERVAL '1.5 years' -- Relatively recent activity
+    AND pm_ans.ParentId IS NOT NULL -- Must be an answer to a question
+    AND pm_ans.Body IS NOT NULL
+    AND pm_ans.OwnerUserId <> -1; -- Exclude community user posts

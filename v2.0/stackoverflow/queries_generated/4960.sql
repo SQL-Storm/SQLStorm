@@ -1,0 +1,154 @@
+-- {"query": "4960.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1380} 
+
+WITH
+  QuestionDetails AS (
+    SELECT
+      p.Id AS QuestionId,
+      p.Title AS QuestionTitle,
+      p.OwnerUserId,
+      p.CreationDate AS QuestionCreationDate,
+      p.Score AS QuestionScore,
+      p.ViewCount AS QuestionViewCount,
+      p.AnswerCount,
+      p.FavoriteCount,
+      pt.Name AS PostTypeName,
+      u.DisplayName AS OwnerDisplayName,
+      (
+        SELECT
+          COUNT(ph.Id)
+        FROM
+          PostHistory AS ph
+        WHERE
+          ph.PostId = p.Id
+          AND ph.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+      ) AS EditCount,
+      CASE
+        WHEN p.ClosedDate IS NOT NULL THEN 1
+        ELSE 0
+      END AS IsClosed,
+      COALESCE(p.CommunityOwnedDate, '1900-01-01') AS CommunityOwnedTimestamp,
+      LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousQuestionScore,
+      ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS QuestionNumberForUser
+    FROM
+      Posts AS p
+      JOIN PostTypes AS pt
+      ON p.PostTypeId = pt.Id
+      LEFT JOIN Users AS u
+      ON p.OwnerUserId = u.Id
+    WHERE
+      p.PostTypeId = 1 -- Questions
+      AND p.OwnerUserId IS NOT NULL
+      AND p.OwnerUserId > 0
+      AND p.CreationDate BETWEEN '2023-01-01' AND '2023-12-31'
+  ),
+  AnswerDetails AS (
+    SELECT
+      p.Id AS AnswerId,
+      p.ParentId AS QuestionId,
+      p.OwnerUserId,
+      p.CreationDate AS AnswerCreationDate,
+      p.Score AS AnswerScore,
+      u.DisplayName AS AnswererDisplayName,
+      ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS AnswerRankForQuestion
+    FROM
+      Posts AS p
+      LEFT JOIN Users AS u
+      ON p.OwnerUserId = u.Id
+    WHERE
+      p.PostTypeId = 2 -- Answers
+      AND p.ParentId IS NOT NULL
+  ),
+  UserBadges AS (
+    SELECT
+      b.UserId,
+      b.Name AS BadgeName,
+      b.Class,
+      ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC) AS LatestBadgeRank
+    FROM
+      Badges AS b
+    WHERE
+      b.Class IN (1, 2) -- Gold and Silver badges
+  )
+SELECT
+  q.QuestionId,
+  q.QuestionTitle,
+  q.OwnerDisplayName AS QuestionOwner,
+  q.QuestionCreationDate,
+  q.QuestionScore,
+  q.QuestionViewCount,
+  q.AnswerCount AS TotalAnswers,
+  q.FavoriteCount,
+  q.EditCount,
+  q.IsClosed,
+  CASE
+    WHEN q.CommunityOwnedTimestamp > '2000-01-01' THEN 'Community Wiki'
+    ELSE 'User Owned'
+  END AS OwnershipType,
+  COALESCE(a.AnswerId, -1) AS BestAnswerId,
+  COALESCE(a.AnswererDisplayName, 'N/A') AS BestAnswerer,
+  COALESCE(a.AnswerScore, 0) AS BestAnswerScore,
+  q.PreviousQuestionScore,
+  q.QuestionNumberForUser,
+  ub.BadgeName AS UserTopBadgeName,
+  ub.Class AS UserTopBadgeClass,
+  -- Complex string manipulation and calculation
+  CONCAT(
+    LEFT(q.QuestionTitle, 10),
+    ' | ',
+    UPPER(SUBSTRING(q.PostTypeName FROM 1 FOR 1)),
+    '-',
+    CAST(q.QuestionScore AS VARCHAR),
+    '-',
+    FORMAT(q.QuestionCreationDate, 'yyyyMMdd')
+  ) AS CompositeQuestionIdentifier,
+  -- NULL logic and conditional aggregation
+  SUM(CASE WHEN a.AnswerScore > 50 THEN 1 ELSE 0 END) AS HighScoringAnswersCount,
+  AVG(a.AnswerScore) AS AverageAnswerScore,
+  (
+    SELECT
+      COUNT(*)
+    FROM
+      Comments AS c
+    WHERE
+      c.PostId = q.QuestionId
+      AND c.CreationDate > q.QuestionCreationDate + INTERVAL '1 day'
+      AND c.UserId <> q.OwnerUserId
+  ) AS CommentsAfterFirstDayFromOtherUsers
+FROM
+  QuestionDetails AS q
+LEFT JOIN
+  AnswerDetails AS a
+  ON q.QuestionId = a.QuestionId
+  AND a.AnswerRankForQuestion = 1 -- Join with the best answer for each question
+LEFT JOIN
+  UserBadges AS ub
+  ON q.OwnerUserId = ub.UserId
+  AND ub.LatestBadgeRank = 1 -- Get the latest badge for the user
+WHERE
+  q.QuestionScore > 0
+  OR q.AnswerCount > 0
+GROUP BY
+  q.QuestionId,
+  q.QuestionTitle,
+  q.OwnerDisplayName,
+  q.QuestionCreationDate,
+  q.QuestionScore,
+  q.QuestionViewCount,
+  q.AnswerCount,
+  q.FavoriteCount,
+  q.EditCount,
+  q.IsClosed,
+  OwnershipType,
+  BestAnswerId,
+  BestAnswerer,
+  BestAnswerScore,
+  q.PreviousQuestionScore,
+  q.QuestionNumberForUser,
+  UserTopBadgeName,
+  UserTopBadgeClass
+HAVING
+  COUNT(q.QuestionId) > 0 -- Ensure we only return rows where there's at least one question detail
+ORDER BY
+  q.QuestionCreationDate DESC,
+  q.QuestionScore DESC
+LIMIT 100;

@@ -1,0 +1,176 @@
+WITH
+  recent_questions AS (
+    SELECT
+      p.Id AS PostId,
+      p.Title,
+      p.Tags,
+      p.CreationDate,
+      p.Score,
+      p.ViewCount,
+      p.OwnerUserId,
+      p.LastActivityDate,
+      p.AcceptedAnswerId,
+      p.ParentId,
+      p.CommentCount,
+      p.FavoriteCount,
+      p.ContentLicense
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days'
+  ),
+  tag_wiki AS (
+    SELECT
+      t.TagName,
+      t.Count AS TagCount,
+      t.WikiPostId,
+      t.IsModeratorOnly,
+      t.IsRequired
+    FROM Tags t
+  ),
+  user_stats AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.AccountId,
+      u.Views,
+      u.UpVotes,
+      u.DownVotes,
+      u.CreationDate,
+      u.LastAccessDate,
+      u.Location,
+      u.WebsiteUrl,
+      u.AboutMe,
+      u.ProfileImageUrl,
+      -- removed EmailHash reference because column does not exist
+      COALESCE(pv.TotalViews, 0) AS TotalPostViews
+    FROM Users u
+    LEFT JOIN (
+      SELECT OwnerUserId, SUM(ViewCount) AS TotalViews
+      FROM Posts
+      GROUP BY OwnerUserId
+    ) pv ON pv.OwnerUserId = u.Id
+  ),
+  activity AS (
+    SELECT
+      rp.PostId,
+      rp.Title,
+      rp.CreationDate,
+      rp.LastActivityDate,
+      rp.Score,
+      rp.ViewCount,
+      rp.OwnerUserId,
+      rp.AcceptedAnswerId,
+      rp.ParentId,
+      rp.CommentCount,
+      rp.FavoriteCount,
+      ROW_NUMBER() OVER (
+        PARTITION BY rp.OwnerUserId
+        ORDER BY rp.LastActivityDate DESC, rp.Score DESC
+      ) AS rn
+    FROM recent_questions rp
+  ),
+  correlated AS (
+    SELECT
+      a.PostId,
+      a.Title,
+      a.LastActivityDate,
+      a.Score,
+      a.ViewCount,
+      a.OwnerUserId,
+      a.AcceptedAnswerId,
+      a.ParentId,
+      a.CommentCount,
+      a.FavoriteCount,
+      u.DisplayName AS OwnerDisplayName,
+      u.Reputation,
+      u.LastAccessDate,
+      COALESCE(pv.TotalViews, 0) AS TotalPostViews,
+      wt.TagName,
+      wt.Count AS TagCount
+    FROM activity a
+    LEFT JOIN Users u ON u.Id = a.OwnerUserId
+    LEFT JOIN (
+      SELECT OwnerUserId, SUM(ViewCount) AS TotalViews
+      FROM Posts
+      GROUP BY OwnerUserId
+    ) pv ON pv.OwnerUserId = a.OwnerUserId
+    LEFT JOIN (
+      SELECT
+        t.TagName,
+        t.Count
+      FROM Tags t
+    ) wt ON 1=1
+  ),
+  window_example AS (
+    SELECT
+      c.PostId,
+      c.Title,
+      c.LastActivityDate,
+      c.Score,
+      c.ViewCount,
+      c.OwnerUserId,
+      c.OwnerDisplayName,
+      c.Reputation,
+      c.LastAccessDate,
+      c.TotalPostViews,
+      c.CommentCount,
+      c.FavoriteCount,
+      c.ParentId,
+      c.AcceptedAnswerId,
+      SUM(c.ViewCount) OVER (PARTITION BY c.OwnerUserId) AS TotalViewsByUser,
+      MAX(c.Score) OVER (PARTITION BY c.OwnerUserId) AS MaxScoreByUser
+    FROM correlated c
+  )
+SELECT
+  we.PostId,
+  we.Title,
+  we.LastActivityDate,
+  we.Score,
+  we.ViewCount,
+  we.OwnerUserId,
+  we.OwnerDisplayName,
+  we.Reputation,
+  we.LastAccessDate,
+  we.TotalPostViews,
+  we.CommentCount,
+  we.FavoriteCount,
+  we.ParentId,
+  we.AcceptedAnswerId,
+  we.TotalViewsByUser,
+  we.MaxScoreByUser,
+  COALESCE(string_agg(DISTINCT wt.TagName, ', '), '') AS RelatedTags,
+  COALESCE(string_agg(DISTINCT CAST(wt.Count AS VARCHAR), ', '), '') AS TagCountsSnapshot
+FROM window_example we
+LEFT JOIN Tags t ON 1=1
+LEFT JOIN (
+  SELECT
+    t.TagName,
+    t.Count
+  FROM Tags t
+  WHERE t.Count > 0
+) wt ON wt.TagName IS NOT NULL
+GROUP BY
+  we.PostId,
+  we.Title,
+  we.LastActivityDate,
+  we.Score,
+  we.ViewCount,
+  we.OwnerUserId,
+  we.OwnerDisplayName,
+  we.Reputation,
+  we.LastAccessDate,
+  we.TotalPostViews,
+  we.CommentCount,
+  we.FavoriteCount,
+  we.ParentId,
+  we.AcceptedAnswerId,
+  we.TotalViewsByUser,
+  we.MaxScoreByUser
+HAVING
+  (we.Score > 0 AND we.ViewCount > 0)
+  OR (we.Reputation >= 1000 AND we.TotalPostViews > 500)
+ORDER BY
+  we.LastActivityDate DESC,
+  we.Score DESC
+LIMIT 100;

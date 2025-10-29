@@ -1,0 +1,41 @@
+SELECT
+  u.Id AS UserId,
+  u.DisplayName AS UserName,
+  COUNT(DISTINCT p.Id) AS TotalPosts,
+  AVG(p.Score) AS AvgScore,
+  SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesReceived,
+  SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesReceived,
+  MAX(p.LastActivityDate) AS MostRecentActivity,
+  STRING_AGG(DISTINCT t.tag, ',') AS PostTypesPresent,
+  MAX(b.Date) AS LastBadgeDate,
+  COUNT(DISTINCT cr.Id) FILTER (WHERE cr.Name IS NOT NULL) AS DistinctCloseReasons
+FROM Users u
+LEFT JOIN Posts p
+  ON p.OwnerUserId = u.Id
+LEFT JOIN Votes v
+  ON v.PostId = p.Id
+LEFT JOIN PostHistory ph
+  ON ph.PostId = p.Id
+LEFT JOIN PostHistoryTypes pht
+  ON ph.PostHistoryTypeId = pht.Id
+LEFT JOIN Badges b
+  ON b.UserId = u.Id
+LEFT JOIN PostTypes pt
+  ON p.PostTypeId = pt.Id
+LEFT JOIN LATERAL (
+  SELECT REGEXP_REPLACE(tag, '^>|>$', '') AS tag
+  FROM UNNEST(string_to_array(COALESCE(p.Tags, ''), '><')) AS t(tag)
+) AS t ON TRUE
+LEFT JOIN CloseReasonTypes cr
+  ON ph.Comment LIKE '%' || cr.Id || '%'
+WHERE
+  u.Id IS NOT NULL
+  AND p.Id IS NOT NULL
+  /* keep all votes relevant to posts: the original condition "v.Id IS NULL OR v.Id IS NOT NULL" is a no-op and has been removed */
+GROUP BY
+  u.Id, u.DisplayName
+HAVING
+  COUNT(DISTINCT p.Id) > 0
+ORDER BY
+  TotalPosts DESC, MostRecentActivity DESC
+LIMIT 100;

@@ -1,0 +1,199 @@
+-- {"query": "1479.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3228} 
+WITH UserBaseMetrics AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate AS UserLastAccessDate,
+        U.UpVotes,
+        U.DownVotes,
+        COALESCE(U.Views, 0) AS UserProfileViews,
+        SUBSTRING(COALESCE(U.Location, 'Unknown'), 1, 50) AS CleanLocation,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsOwnedCount,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersOwnedCount,
+        SUM(CASE WHEN P.PostTypeId IN (1, 2) THEN COALESCE(P.Score, 0) ELSE 0 END) AS TotalPostsOwnedScore,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN COALESCE(P.ViewCount, 0) ELSE 0 END) AS TotalQuestionsOwnedViews,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        SUM(COALESCE(C.Score, 0)) AS TotalCommentsScore,
+        COUNT(DISTINCT B.Id) AS TotalBadgesEarned,
+        MAX(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS HasGoldBadge,
+        -- Correlated Subquery: Check if user has an answer with score >= 100
+        (SELECT MAX(CASE WHEN P_ans.Score >= 100 THEN 1 ELSE 0 END) FROM Posts P_ans WHERE P_ans.OwnerUserId = U.Id AND P_ans.PostTypeId = 2) AS HasHighlyScoredAnswer
+    FROM
+        Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.UpVotes, U.DownVotes, U.Views, U.Location
+),
+PostTagEngagement AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.LastEditDate AS PostLastEditDate,
+        P.Score AS PostScore,
+        COALESCE(P.ViewCount, 0) AS PostViewCount,
+        COALESCE(P.AnswerCount, 0) AS PostAnswerCount,
+        COALESCE(P.CommentCount, 0) AS PostCommentCount,
+        COALESCE(P.FavoriteCount, 0) AS PostFavoriteCount,
+        P.Title,
+        P.Tags,
+        COALESCE(
+            NULLIF(
+                SUBSTRING(P.Tags, POSITION('<' IN P.Tags) + 1, POSITION('>' IN P.Tags) - POSITION('<' IN P.Tags) - 1),
+                ''
+            ),
+            'NoPrimaryTag'
+        ) AS PrimaryTag,
+        CAST(COALESCE(P.AnswerCount, 0) + COALESCE(P.CommentCount, 0) + COALESCE(P.FavoriteCount, 0) AS NUMERIC) / NULLIF(COALESCE(P.ViewCount, 0), 0) AS EngagementRatio,
+        -- Window function: Rank posts by score within their creation year and PostType
+        RANK() OVER (PARTITION BY EXTRACT(YEAR FROM P.CreationDate), P.PostTypeId ORDER BY P.Score DESC, P.CreationDate DESC) AS RankInYearByScore,
+        -- Window function: Calculate the cumulative sum of scores for owner's posts over time
+        SUM(COALESCE(P.Score, 0)) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS OwnerCumulativeScore,
+        -- Window function: Average score of posts by the same owner in the last 60 days
+        AVG(P.Score) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate RANGE BETWEEN INTERVAL '60 days' PRECEDING AND CURRENT ROW) AS AvgOwnerScoreLast60Days,
+        (SELECT COUNT(DISTINCT V.Id) FROM Votes V WHERE V.PostId = P.Id AND V.VoteTypeId = 2) AS UpVoteCount
+    FROM
+        Posts P
+    WHERE
+        P.PostTypeId IN (1, 2) AND P.CreationDate IS NOT NULL AND P.OwnerUserId IS NOT NULL
+        AND P.ViewCount > 0 -- Exclude posts with no views as engagement won't be meaningful
+),
+PostHistoryAndClosureAnalysis AS (
+    WITH ClosedAndReopenedPosts AS (
+        SELECT PostId FROM PostHistory WHERE PostHistoryTypeId = 10 -- Post Closed
+        INTERSECT
+        SELECT PostId FROM PostHistory WHERE PostHistoryTypeId = 11 -- Post Reopened
+    ),
+    ClosedAsDuplicatePosts AS (
+        SELECT PH.PostId FROM PostHistory PH
+        LEFT JOIN CloseReasonTypes CRT ON PH.PostHistoryTypeId = 10 AND PH.Comment = CAST(CRT.Id AS VARCHAR)
+        WHERE PH.PostHistoryTypeId = 10 AND CRT.Name LIKE '%Duplicate%'
+    )
+    SELECT
+        PH.PostId,
+        COUNT(PH.Id) AS TotalHistoryEvents,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditCount, -- Title, Body, Tags edits
+        SUM(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenCount,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 AND CRT.Name LIKE '%Duplicate%' THEN 1 ELSE 0 END) AS ClosedAsDuplicateFlag,
+        -- Correlated Subquery: Get the name of the most recent history type
+        (SELECT PHT_inner.Name FROM PostHistory PH_inner JOIN PostHistoryTypes PHT_inner ON PH_inner.PostHistoryTypeId = PHT_inner.Id WHERE PH_inner.PostId = PH.PostId ORDER BY PH_inner.CreationDate DESC LIMIT 1) AS MostRecentHistoryTypeName,
+        MAX(CASE WHEN CRP.PostId IS NOT NULL THEN 1 ELSE 0 END) AS WasClosedAndReopenedFlag,
+        MAX(CASE WHEN CDUP.PostId IS NOT NULL THEN 1 ELSE 0 END) AS WasClosedAsDuplicate_SetOpFlag,
+        -- Calculate the duration between first and last edit (NULL if no edits)
+        EXTRACT(EPOCH FROM (MAX(CASE WHEN PH.PostHistoryTypeId IN (4,5,6) THEN PH.CreationDate END) - MIN(CASE WHEN PH.PostHistoryTypeId IN (4,5,6) THEN PH.CreationDate END))) / 3600.0 AS EditDurationHours
+    FROM
+        PostHistory PH
+    LEFT JOIN CloseReasonTypes CRT ON PH.PostHistoryTypeId = 10 AND PH.Comment = CAST(CRT.Id AS VARCHAR)
+    LEFT JOIN ClosedAndReopenedPosts CRP ON PH.PostId = CRP.PostId
+    LEFT JOIN ClosedAsDuplicatePosts CDUP ON PH.PostId = CDUP.PostId
+    GROUP BY PH.PostId
+),
+QuestionAnswerLinkSummary AS (
+    SELECT
+        P.Id AS QuestionId,
+        COALESCE(P.AcceptedAnswerId, -1) AS AcceptedAnswerId,
+        COUNT(DISTINCT A.Id) AS ActualAnswerCount,
+        SUM(COALESCE(A.Score, 0)) AS TotalAnswerScore,
+        COUNT(DISTINCT PL.RelatedPostId) AS LinkedPostsCount,
+        SUM(CASE WHEN PL.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicateLinksMadeCount,
+        -- Correlated Subquery: check if this question has an accepted answer that is highly scored (>= 50)
+        (SELECT MAX(CASE WHEN A_acc.Score >= 50 THEN 1 ELSE 0 END) FROM Posts A_acc WHERE A_acc.Id = P.AcceptedAnswerId) AS HasHighScoringAcceptedAnswer
+    FROM
+        Posts P
+    LEFT JOIN Posts A ON P.Id = A.ParentId AND A.PostTypeId = 2
+    LEFT JOIN PostLinks PL ON P.Id = PL.PostId
+    WHERE
+        P.PostTypeId = 1
+    GROUP BY
+        P.Id, P.AcceptedAnswerId
+)
+SELECT
+    UBM.UserId,
+    UBM.DisplayName,
+    UBM.Reputation,
+    UBM.UserCreationDate,
+    UBM.UserLastAccessDate,
+    UBM.TotalPostsOwned,
+    UBM.QuestionsOwnedCount,
+    UBM.AnswersOwnedCount,
+    UBM.TotalPostsOwnedScore,
+    PTE.PostId,
+    PTE.PostTypeId,
+    PTE.Title AS PostTitle,
+    PTE.PrimaryTag,
+    PTE.PostScore,
+    PTE.PostViewCount,
+    PTE.EngagementRatio,
+    PTE.RankInYearByScore,
+    PTE.OwnerCumulativeScore,
+    PTE.AvgOwnerScoreLast60Days,
+    PTE.UpVoteCount,
+    PHA.TotalHistoryEvents,
+    PHA.EditCount AS PostEditCount,
+    PHA.CloseCount AS PostCloseCount,
+    PHA.ReopenCount AS PostReopenCount,
+    PHA.ClosedAsDuplicateFlag,
+    PHA.MostRecentHistoryTypeName,
+    PHA.WasClosedAndReopenedFlag,
+    PHA.WasClosedAsDuplicate_SetOpFlag,
+    PHA.EditDurationHours,
+    QALS.ActualAnswerCount,
+    QALS.TotalAnswerScore,
+    QALS.LinkedPostsCount,
+    QALS.DuplicateLinksMadeCount,
+    QALS.HasHighScoringAcceptedAnswer,
+    -- Complex CASE expression for user categorization
+    CASE
+        WHEN UBM.Reputation >= 10000 AND UBM.QuestionsOwnedCount >= 50 AND UBM.TotalPostsOwnedScore >= 500 AND UBM.HasGoldBadge = 1 THEN 'Guru Contributor'
+        WHEN UBM.Reputation >= 2000 AND UBM.AnswersOwnedCount >= 100 AND UBM.HasHighlyScoredAnswer = 1 THEN 'Expert Answerer'
+        WHEN UBM.TotalCommentsMade >= 500 AND UBM.TotalCommentsScore >= 100 THEN 'Active Commenter'
+        WHEN UBM.UserCreationDate > cast('2024-10-01' as date) - INTERVAL '1 year' AND UBM.TotalPostsOwned > 5 THEN 'New Active User'
+        ELSE 'Casual User'
+    END AS UserCategory,
+    -- Another CASE expression for post status and characteristics
+    CASE
+        WHEN PTE.PostTypeId = 1 AND PHA.CloseCount > 0 AND PHA.ReopenCount = 0 THEN 'Closed Question'
+        WHEN PTE.PostTypeId = 1 AND QALS.ActualAnswerCount = 0 AND PTE.PostCreationDate < cast('2024-10-01' as date) - INTERVAL '1 year' THEN 'Stale Unanswered Question'
+        WHEN PTE.PostTypeId = 2 AND PTE.PostScore >= 50 AND QALS.HasHighScoringAcceptedAnswer = 1 THEN 'Highly Valued Answer to Good Question'
+        WHEN PTE.PostLastEditDate IS NOT NULL AND PTE.PostCreationDate < PTE.PostLastEditDate - INTERVAL '1 month' AND PHA.EditCount > 5 THEN 'Heavily Edited Old Post'
+        ELSE 'Normal Post'
+    END AS PostStatusFlag,
+    -- Correlated Subquery with string aggregation for user's most used tags
+    (
+        SELECT STRING_AGG(TTFU.TagName, ', ' ORDER BY TTFU.TagCount DESC)
+        FROM (
+            SELECT UNNEST_Tags.TagName, COUNT(P_inner.Id) AS TagCount
+            FROM Posts P_inner
+            CROSS JOIN LATERAL UNNEST(STRING_TO_ARRAY(SUBSTRING(P_inner.Tags, 2, LENGTH(P_inner.Tags)-2), '><')) AS UNNEST_Tags(TagName)
+            WHERE P_inner.OwnerUserId = UBM.UserId AND P_inner.Tags IS NOT NULL AND P_inner.Tags != '<>'
+            GROUP BY UNNEST_Tags.TagName
+            ORDER BY TagCount DESC, UNNEST_Tags.TagName
+            LIMIT 3
+        ) AS TTFU
+    ) AS Top3UserTags
+FROM
+    UserBaseMetrics UBM
+LEFT JOIN PostTagEngagement PTE ON UBM.UserId = PTE.OwnerUserId
+LEFT JOIN PostHistoryAndClosureAnalysis PHA ON PTE.PostId = PHA.PostId
+LEFT JOIN QuestionAnswerLinkSummary QALS ON PTE.PostId = QALS.QuestionId AND PTE.PostTypeId = 1
+WHERE
+    UBM.Reputation > 500 -- Focus on users with significant reputation
+    AND PTE.EngagementRatio > 0.005 -- Filter posts by a minimum engagement ratio
+    AND UBM.UserCreationDate >= cast('2024-10-01' as date) - INTERVAL '6 years' -- Filter for more recent users
+    AND (PHA.MostRecentHistoryTypeName IS NULL OR PHA.MostRecentHistoryTypeName NOT LIKE '%Deleted%') -- Exclude deleted posts based on history
+    AND COALESCE(PTE.AvgOwnerScoreLast60Days, 0) > 0 -- Ensure recent positive score activity
+    AND (
+        (PTE.PostTypeId = 1 AND PTE.PostViewCount > 100 AND QALS.ActualAnswerCount >= 1) -- Questions with views and answers
+        OR
+        (PTE.PostTypeId = 2 AND PTE.PostScore >= 10 AND UBM.AnswersOwnedCount >= 5) -- Highly scored answers from active answerers
+    )
+ORDER BY
+    UBM.Reputation DESC, PTE.PostScore DESC, PTE.PostCreationDate DESC
+LIMIT 500;

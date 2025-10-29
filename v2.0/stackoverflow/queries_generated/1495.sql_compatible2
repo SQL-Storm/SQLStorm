@@ -1,0 +1,201 @@
+WITH PostHistorySummary AS (
+    SELECT
+        ph.PostId,
+        COUNT(ph.Id) AS TotalHistoryEvents,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4,5,6,7,8,9) THEN 1 ELSE 0 END) AS TotalEditsAndRollbacks,
+        MAX(ph.CreationDate) AS LastHistoryDate,
+        MAX(CASE
+                WHEN ph.PostHistoryTypeId = 10 AND ph.Comment IS NOT NULL AND ph.Comment ~ '^[0-9]+$' THEN
+                    (SELECT Name FROM CloseReasonTypes WHERE Id = CAST(ph.Comment AS INTEGER))
+                WHEN ph.PostHistoryTypeId = 10 AND ph.Comment LIKE '%off-topic%' THEN 'Off-topic (textual)'
+                ELSE NULL
+            END) AS CloseReasonName,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseEventsCount,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 16 THEN 1 ELSE 0 END) AS IsCommunityOwnedHistoryFlag
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+),
+PostCommentActivity AS (
+    SELECT
+        c.PostId,
+        COUNT(c.Id) AS TotalComments,
+        SUM(c.Score) AS TotalCommentScore,
+        MAX(c.CreationDate) AS LastCommentDate,
+        (SELECT sub_c.UserId
+         FROM Comments sub_c
+         WHERE sub_c.PostId = c.PostId
+         ORDER BY sub_c.Score DESC, sub_c.CreationDate DESC
+         LIMIT 1) AS TopCommenterUserId,
+        AVG(c.Score) AS AvgCommentScore
+    FROM Comments c
+    GROUP BY c.PostId
+),
+PostTagAnalysis AS (
+    SELECT
+        p.Id AS PostId,
+        STRING_AGG(DISTINCT t.TagName, ', ') AS AllTags,
+        COUNT(DISTINCT t.Id) AS NumUniqueTags,
+        MAX(t.Count) AS MaxAssociatedTagUseCount,
+        SUM(CASE WHEN t.IsModeratorOnly THEN 1 ELSE 0 END) AS ModeratorOnlyTagCount,
+        MIN(t.ExcerptPostId) AS ArbitraryTagExcerptPostId
+    FROM Posts p
+    CROSS JOIN LATERAL (
+        SELECT TRIM(x) AS tag_name
+        FROM UNNEST(string_to_array(SUBSTRING(p.Tags, 2, CHAR_LENGTH(p.Tags) - 2), '><')) AS x
+    ) AS tag_unnest
+    JOIN Tags t ON t.TagName = tag_unnest.tag_name
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND CHAR_LENGTH(p.Tags) > 2
+    GROUP BY p.Id
+),
+UserBadgeSummary AS (
+    SELECT
+        b.UserId,
+        COUNT(b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(b.Date) AS LastBadgeAwardDate
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserActivityAndReputation AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.DisplayName AS UserDisplayName,
+        u.Views AS UserProfileViews,
+        u.UpVotes AS UserTotalUpVotes,
+        u.DownVotes AS UserTotalDownVotes,
+        COALESCE(lbs.TotalBadges, 0) AS UserTotalBadges,
+        COALESCE(lbs.GoldBadges, 0) AS UserGoldBadges,
+        COALESCE(lbs.SilverBadges, 0) AS UserSilverBadges,
+        COALESCE(lbs.BronzeBadges, 0) AS UserBronzeBadges,
+        lbs.LastBadgeAwardDate,
+        (CAST(u.UpVotes AS NUMERIC) + 1) / (CAST(u.DownVotes AS NUMERIC) + 1 + CASE WHEN u.UpVotes = 0 AND u.DownVotes = 0 THEN 1 ELSE 0 END) AS UpDownVoteEffectivenessRatio
+    FROM Users u
+    LEFT JOIN UserBadgeSummary lbs ON u.Id = lbs.UserId
+),
+InterestingPostIdentifiers AS (
+    SELECT p.Id AS PostId, p.PostTypeId, 'HighScoreSQLQuestion' AS InterestReason
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.Score >= 100
+      AND p.Tags IS NOT NULL AND (p.Tags LIKE '%<sql>%' OR p.Tags LIKE '%<database>%')
+      AND p.CreationDate BETWEEN DATE '2022-01-01' AND DATE '2023-12-31'
+
+    UNION ALL
+
+    SELECT p.Id AS PostId, p.PostTypeId, 'HighViewAnswerByRepUser' AS InterestReason
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN Posts parent_q ON p.ParentId = parent_q.Id
+    WHERE p.PostTypeId = 2
+      AND parent_q.ViewCount >= 50000
+      AND u.Reputation >= 20000
+      AND p.CreationDate BETWEEN DATE '2022-01-01' AND DATE '2023-12-31'
+
+    UNION ALL
+
+    SELECT p.Id AS PostId, p.PostTypeId, 'HighlyEditedAndCommented' AS InterestReason
+    FROM Posts p
+    JOIN PostHistorySummary phs ON p.Id = phs.PostId
+    JOIN PostCommentActivity pca ON p.Id = pca.PostId
+    WHERE phs.TotalEditsAndRollbacks >= 5
+      AND pca.TotalComments >= 10
+      AND p.CreationDate BETWEEN DATE '2022-01-01' AND DATE '2023-12-31'
+),
+DistinctInterestingPosts AS (
+    SELECT DISTINCT PostId, PostTypeId
+    FROM InterestingPostIdentifiers
+),
+OwnerAggregates AS (
+    SELECT
+        p_main.OwnerUserId,
+        SUM(COALESCE(p_main.FavoriteCount,0)) AS OwnerTotalFavorites,
+        AVG(p_main.Score) AS OwnerAvgScore,
+        AVG(cm.AvgCommentScore) AS OwnerAvgCommentScore
+    FROM DistinctInterestingPosts p
+    JOIN Posts p_main ON p.PostId = p_main.Id
+    LEFT JOIN PostCommentActivity cm ON p.PostId = cm.PostId
+    GROUP BY p_main.OwnerUserId
+)
+SELECT
+    p.PostId,
+    pt.Name AS PostTypeName,
+    SUBSTRING(p_main.Title FROM 1 FOR 100) AS ShortTitle,
+    p_main.CreationDate,
+    p_main.Score,
+    p_main.ViewCount,
+    COALESCE(p_main.AnswerCount, 0) AS AnswerCount,
+    COALESCE(p_main.FavoriteCount, 0) AS FavoriteCount,
+    p_main.OwnerUserId,
+    COALESCE(p_main.OwnerDisplayName, ua.UserDisplayName, 'Deleted User') AS OwnerDisplayComputedName,
+    ua.Reputation AS OwnerReputation,
+    ua.UserCreationDate AS OwnerAccountCreationDate,
+    ua.UserProfileViews AS OwnerProfileViews,
+    ua.UserGoldBadges,
+    ua.UpDownVoteEffectivenessRatio,
+    hs.TotalEditsAndRollbacks,
+    hs.LastHistoryDate,
+    COALESCE(hs.CloseReasonName, 'Not Closed / Open') AS PostCloseReason,
+    p_main.Body AS FullBodyContent,
+    CHAR_LENGTH(p_main.Body) AS BodyLength,
+    pa.AllTags,
+    pa.NumUniqueTags,
+    pa.MaxAssociatedTagUseCount,
+    COALESCE(cm.TotalComments, 0) AS TotalComments,
+    COALESCE(cm.TotalCommentScore, 0) AS TotalCommentScore,
+    cm.LastCommentDate,
+    (SELECT COUNT(Id) FROM PostLinks WHERE PostId = p.PostId AND LinkTypeId = 1) AS TotalLinkedPostsOut,
+    (SELECT COUNT(Id) FROM PostLinks WHERE PostId = p.PostId AND LinkTypeId = 3) AS TotalDuplicateTargets,
+    ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p_main.Score DESC, p_main.CreationDate DESC) AS RankByScoreInType,
+    AVG(p_main.Score) OVER (PARTITION BY p_main.OwnerUserId ORDER BY p_main.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS AvgPrevOwnerPostScore,
+    SUM(p_main.ViewCount) OVER (PARTITION BY pt.Name ORDER BY p_main.CreationDate) AS CumulativeViewCountByType,
+    CASE
+        WHEN p_main.AcceptedAnswerId IS NOT NULL AND COALESCE(p_main.AnswerCount,0) > 0 THEN 'Answered & Accepted'
+        WHEN p_main.AcceptedAnswerId IS NULL AND COALESCE(p_main.AnswerCount,0) > 0 THEN 'Answered (No Accepted)'
+        WHEN COALESCE(p_main.AnswerCount,0) = 0 AND p.PostTypeId = 1 THEN 'No Answers Yet'
+        WHEN p.PostTypeId = 2 THEN 'Is an Answer'
+        ELSE 'N/A for Post Type'
+    END AS AnswerStatusDetail,
+    UPPER(COALESCE(ua.UserDisplayName, 'UNKNOWN USER')) || ' (' || COALESCE(ua.UserDisplayName, 'UNKNOWN') || ')' AS OwnerNameAndAlias,
+    (
+        (p_main.Score * 1.5) + (COALESCE(p_main.ViewCount, 0) * 0.005) + (COALESCE(p_main.AnswerCount, 0) * 8) +
+        (COALESCE(cm.TotalComments, 0) * 3) + (COALESCE(p_main.FavoriteCount, 0) * 5) +
+        (COALESCE(hs.TotalEditsAndRollbacks, 0) * 2)
+    ) / (EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - p_main.CreationDate)) / (3600 * 24) + 1) AS PostEngagementWeightedIndex,
+    (
+        SELECT COUNT(DISTINCT sq_p.Id)
+        FROM Posts sq_p
+        CROSS JOIN LATERAL (
+            SELECT TRIM(x) AS sq_tag_name
+            FROM UNNEST(string_to_array(SUBSTRING(sq_p.Tags, 2, CHAR_LENGTH(sq_p.Tags) - 2), '><')) AS x
+        ) AS sq_tag_unnest
+        WHERE sq_p.OwnerUserId = p_main.OwnerUserId
+          AND sq_p.Id != p.PostId
+          AND (sq_tag_unnest.sq_tag_name LIKE '%tag-wiki%' OR sq_tag_unnest.sq_tag_name LIKE '%privilege%')
+    ) AS OwnerRelatedMetaPostsCount
+FROM DistinctInterestingPosts p
+JOIN Posts p_main ON p.PostId = p_main.Id
+JOIN PostTypes pt ON p.PostTypeId = pt.Id
+LEFT JOIN UserActivityAndReputation ua ON p_main.OwnerUserId = ua.UserId
+LEFT JOIN PostHistorySummary hs ON p.PostId = hs.PostId
+LEFT JOIN PostCommentActivity cm ON p.PostId = cm.PostId
+LEFT JOIN PostTagAnalysis pa ON p.PostId = pa.PostId
+LEFT JOIN OwnerAggregates oa ON p_main.OwnerUserId = oa.OwnerUserId
+WHERE
+    p_main.Score > 50
+    AND p_main.ViewCount > 10000
+    AND p_main.LastActivityDate IS NOT NULL
+    AND p_main.LastActivityDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6' MONTH)
+    AND (ua.Reputation > 10000 OR ua.UserGoldBadges > 1)
+    AND COALESCE(cm.TotalComments, 0) > 5
+    AND (hs.CloseEventsCount = 0 OR hs.CloseReasonName IS NULL)
+    AND p_main.Body LIKE '%code%' AND p_main.Body NOT LIKE '%[duplicate]%'
+    AND (oa.OwnerTotalFavorites > 50 OR oa.OwnerAvgScore > 30)
+    AND oa.OwnerAvgCommentScore > 2
+ORDER BY
+    PostEngagementWeightedIndex DESC,
+    p_main.CreationDate DESC
+LIMIT 200 OFFSET 10;

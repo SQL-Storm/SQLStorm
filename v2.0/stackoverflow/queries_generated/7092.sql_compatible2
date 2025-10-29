@@ -1,0 +1,290 @@
+WITH PostStats AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Title,
+        p.Tags,
+        p.Body,
+        COALESCE(p.AcceptedAnswerId, 0) AS AcceptedAnswerId,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS PostRank,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) AS ScoreRank,
+        NTILE(10) OVER (ORDER BY p.ViewCount DESC) AS ViewQuartile,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AnswerCount = 0 THEN 'No Answers'
+            WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN 'Has Answers'
+            ELSE 'Not Question'
+        END AS AnswerStatus,
+        CASE 
+            WHEN p.Score >= 100 THEN 'Highly Scored'
+            WHEN p.Score >= 50 THEN 'Moderately Scored'
+            WHEN p.Score >= 10 THEN 'Low Scored'
+            ELSE 'Very Low Scored'
+        END AS ScoreCategory,
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevScore,
+        LEAD(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS AvgOwnerScore,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) AS TotalPostsByOwner
+    FROM Posts p
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.LastAccessDate,
+        u.CreationDate,
+        COUNT(DISTINCT ps.Id) AS TotalPosts,
+        COUNT(DISTINCT ps.Id) FILTER (WHERE ps.PostTypeId = 1) AS TotalQuestions,
+        COUNT(DISTINCT ps.Id) FILTER (WHERE ps.PostTypeId = 2) AS TotalAnswers,
+        COALESCE(SUM(ps.Score), 0) AS TotalScore,
+        COALESCE(AVG(ps.Score), 0) AS AvgScore,
+        COALESCE(MAX(ps.Score), 0) AS MaxScore,
+        COALESCE(SUM(ps.ViewCount), 0) AS TotalViews,
+        COALESCE(MAX(ps.ViewCount), 0) AS MaxViews,
+        COALESCE(SUM(ps.CommentCount), 0) AS TotalComments,
+        COALESCE(SUM(ps.FavoriteCount), 0) AS TotalFavorites,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        STRING_AGG(DISTINCT b.Name, ', ') AS BadgesEarned,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Expert'
+            WHEN u.Reputation >= 5000 THEN 'Advanced'
+            WHEN u.Reputation >= 1000 THEN 'Intermediate'
+            WHEN u.Reputation >= 100 THEN 'Beginner'
+            ELSE 'Newbie'
+        END AS ReputationLevel
+    FROM Users u
+    LEFT JOIN Posts ps ON u.Id = ps.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.LastAccessDate, u.CreationDate
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        ps.Id AS PostId,
+        ps.PostTypeId,
+        ps.Title,
+        ps.Tags,
+        ps.CreationDate,
+        ps.Score,
+        ps.ViewCount,
+        ps.AnswerCount,
+        ps.CommentCount,
+        ps.FavoriteCount,
+        ps.OwnerUserId,
+        ps.PostRank,
+        ps.ScoreRank,
+        ps.ViewQuartile,
+        ps.AnswerStatus,
+        ps.ScoreCategory,
+        ps.PrevScore,
+        ps.NextScore,
+        ps.AvgOwnerScore,
+        ps.TotalPostsByOwner,
+        CASE 
+            WHEN ps.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'Above Average'
+            ELSE 'Below Average'
+        END AS ScorePerformance,
+        CASE 
+            WHEN ps.ViewCount > (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = 1) * 2 THEN 'Highly Viewed'
+            WHEN ps.ViewCount > (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = 1) THEN 'Moderately Viewed'
+            WHEN ps.ViewCount > 0 THEN 'Low Viewed'
+            ELSE 'No Views'
+        END AS ViewPerformance,
+        CASE 
+            WHEN ps.AnswerCount > 0 AND ps.AnswerCount < 3 THEN 'Few Answers'
+            WHEN ps.AnswerCount >= 3 AND ps.AnswerCount < 10 THEN 'Moderate Answers'
+            WHEN ps.AnswerCount >= 10 THEN 'Many Answers'
+            ELSE 'No Answers'
+        END AS AnswerPerformance,
+        CASE 
+            WHEN ps.CommentCount > 10 THEN 'Many Comments'
+            WHEN ps.CommentCount > 5 THEN 'Moderate Comments'
+            WHEN ps.CommentCount > 0 THEN 'Few Comments'
+            ELSE 'No Comments'
+        END AS CommentPerformance,
+        CASE 
+            WHEN ps.FavoriteCount > 5 THEN 'Highly Favorited'
+            WHEN ps.FavoriteCount > 2 THEN 'Moderately Favorited'
+            WHEN ps.FavoriteCount > 0 THEN 'Slightly Favorited'
+            ELSE 'Not Favorited'
+        END AS FavoritePerformance,
+        ps.LastActivityDate,
+        ps.Body,
+        CAST(ps.LastActivityDate AS DATE) - CAST(ps.CreationDate AS DATE) AS DaysSinceLastActivity,
+        (ps.Score + ps.ViewCount + ps.AnswerCount + ps.CommentCount + ps.FavoriteCount) AS CompositeScore,
+        ROW_NUMBER() OVER (ORDER BY (ps.Score + ps.ViewCount + ps.AnswerCount + ps.CommentCount + ps.FavoriteCount) DESC) AS CompositeRank,
+        DENSE_RANK() OVER (ORDER BY ps.Score DESC) AS ScoreDensityRank,
+        RANK() OVER (ORDER BY ps.ViewCount DESC) AS ViewRank
+    FROM PostStats ps
+),
+AdvancedJoinAnalysis AS (
+    SELECT 
+        cpa.PostId,
+        cpa.PostTypeId,
+        cpa.Title,
+        cpa.Tags,
+        cpa.CreationDate,
+        cpa.Score,
+        cpa.ViewCount,
+        cpa.AnswerCount,
+        cpa.CommentCount,
+        cpa.FavoriteCount,
+        cpa.OwnerUserId,
+        cpa.ScoreRank,
+        cpa.ViewQuartile,
+        cpa.AnswerStatus,
+        cpa.ScoreCategory,
+        cpa.ScorePerformance,
+        cpa.ViewPerformance,
+        cpa.AnswerPerformance,
+        cpa.CommentPerformance,
+        cpa.FavoritePerformance,
+        cpa.DaysSinceLastActivity,
+        cpa.CompositeScore,
+        cpa.CompositeRank,
+        cpa.ScoreDensityRank,
+        cpa.ViewRank,
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.Views AS UserViews,
+        ua.TotalPosts,
+        ua.TotalQuestions,
+        ua.TotalAnswers,
+        ua.TotalScore,
+        ua.AvgScore,
+        ua.MaxScore,
+        ua.TotalViews,
+        ua.MaxViews,
+        ua.TotalComments,
+        ua.TotalFavorites,
+        ua.BadgeCount,
+        ua.BadgesEarned,
+        ua.ReputationLevel,
+        CASE 
+            WHEN cpa.CompositeScore > (SELECT AVG(CompositeScore) FROM ComplexPostAnalysis) THEN 'Above Composite Average'
+            ELSE 'Below Composite Average'
+        END AS CompositePerformance,
+        CASE 
+            WHEN cpa.Score > (SELECT AVG(Score) FROM Posts) AND cpa.ViewCount > (SELECT AVG(ViewCount) FROM Posts) THEN 'High Impact'
+            ELSE 'Regular Impact'
+        END AS ImpactLevel,
+        COALESCE(cpa.Score - ua.AvgScore, 0) AS ScoreVsAverage,
+        COALESCE(cpa.ViewCount - ua.MaxViews, 0) AS ViewVsMaxView,
+        (cpa.AnswerCount + cpa.CommentCount) / NULLIF(cpa.Score, 0) AS EfficiencyRatio,
+        CASE 
+            WHEN cpa.AnswerStatus = 'Has Answers' AND cpa.Score > 20 THEN 'Engaging High Score'
+            WHEN cpa.AnswerStatus = 'No Answers' AND cpa.Score > 20 THEN 'High Score No Answers'
+            WHEN cpa.AnswerStatus = 'Has Answers' AND cpa.Score <= 20 THEN 'Engaging Low Score'
+            ELSE 'Other'
+        END AS EngagementType
+    FROM ComplexPostAnalysis cpa
+    INNER JOIN UserActivity ua ON cpa.OwnerUserId = ua.UserId
+    WHERE cpa.PostTypeId = 1 
+    AND (cpa.Score > 10 OR cpa.ViewCount > 100)
+    AND cpa.DaysSinceLastActivity <= 30
+)
+SELECT 
+    aja.PostId,
+    aja.Title,
+    aja.Tags,
+    aja.CreationDate,
+    aja.Score,
+    aja.ViewCount,
+    aja.AnswerCount,
+    aja.CommentCount,
+    aja.FavoriteCount,
+    aja.OwnerUserId,
+    aja.DisplayName,
+    aja.Reputation,
+    aja.TotalPosts,
+    aja.TotalQuestions,
+    aja.TotalAnswers,
+    aja.TotalScore,
+    aja.AvgScore,
+    aja.MaxScore,
+    aja.TotalViews,
+    aja.MaxViews,
+    aja.TotalComments,
+    aja.TotalFavorites,
+    aja.BadgeCount,
+    aja.BadgesEarned,
+    aja.ReputationLevel,
+    aja.CompositeScore,
+    aja.CompositeRank,
+    aja.ScoreDensityRank,
+    aja.ViewRank,
+    aja.ScorePerformance,
+    aja.ViewPerformance,
+    aja.AnswerPerformance,
+    aja.CommentPerformance,
+    aja.FavoritePerformance,
+    aja.DaysSinceLastActivity,
+    aja.CompositePerformance,
+    aja.ImpactLevel,
+    aja.ScoreVsAverage,
+    aja.ViewVsMaxView,
+    aja.EfficiencyRatio,
+    aja.EngagementType,
+    LAG(aja.Score, 1) OVER (ORDER BY aja.CompositeRank) AS PrevScoreInRank,
+    LEAD(aja.Score, 1) OVER (ORDER BY aja.CompositeRank) AS NextScoreInRank,
+    AVG(aja.Score) OVER (ROWS BETWEEN 5 PRECEDING AND 5 FOLLOWING) AS MovingAverageScore,
+    PERCENT_RANK() OVER (ORDER BY aja.Score) AS ScorePercentile,
+    RANK() OVER (PARTITION BY aja.ReputationLevel ORDER BY aja.Score DESC) AS ScoreRankWithinLevel,
+    CASE 
+        WHEN aja.Score >= 100 THEN 'Elite'
+        WHEN aja.Score >= 50 THEN 'Good'
+        WHEN aja.Score >= 20 THEN 'Fair'
+        WHEN aja.Score >= 1 THEN 'Low'
+        ELSE 'Very Low'
+    END AS ScoreGrade,
+    CASE 
+        WHEN aja.UserViews >= 1000 THEN 'Viral'
+        WHEN aja.UserViews >= 100 THEN 'Popular'
+        WHEN aja.UserViews >= 10 THEN 'Noticeable'
+        ELSE 'Obscure'
+    END AS PopularityLevel,
+    aja.CompositeScore + aja.TotalFavorites + aja.AnswerCount * 10 + aja.CommentCount * 5 AS WeightedScore,
+    (aja.CompositeScore + aja.TotalFavorites + aja.AnswerCount * 10 + aja.CommentCount * 5) - 
+    (LAG(aja.CompositeScore + aja.TotalFavorites + aja.AnswerCount * 10 + aja.CommentCount * 5, 1) 
+    OVER (ORDER BY aja.CompositeRank)) AS ScoreChange,
+    CASE 
+        WHEN aja.ReputationLevel IN ('Expert', 'Advanced') AND aja.Score > 50 THEN 'Highly Active'
+        WHEN aja.ReputationLevel = 'Intermediate' AND aja.Score > 20 THEN 'Active'
+        WHEN aja.ReputationLevel = 'Beginner' AND aja.Score > 10 THEN 'Developing'
+        ELSE 'Inactive'
+    END AS ActivityStatus,
+    (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = aja.OwnerUserId AND p2.CreationDate > aja.CreationDate) AS PostsAfterThis,
+    (SELECT COUNT(*) FROM Posts p3 WHERE p3.OwnerUserId = aja.OwnerUserId AND p3.CreationDate < aja.CreationDate) AS PostsBeforeThis,
+    ('Rank #' || aja.CompositeRank || ' - ' || aja.Title || ' by ' || aja.DisplayName) AS PostDisplayLabel,
+    CASE 
+        WHEN aja.BadgeCount > 5 AND aja.TotalQuestions > 10 THEN 'Veteran'
+        WHEN aja.BadgeCount > 2 AND aja.TotalQuestions > 5 THEN 'Experienced'
+        WHEN aja.BadgeCount > 0 AND aja.TotalQuestions > 1 THEN 'Beginning'
+        ELSE 'Novice'
+    END AS UserExperienceLevel,
+    ROW_NUMBER() OVER (ORDER BY aja.CompositeScore DESC) AS OverallRank,
+    DENSE_RANK() OVER (ORDER BY aja.Score DESC) AS ScoreDenseRank,
+    -- Median computed via percentile_cont aggregate in a subquery to avoid ordered-set aggregate OVER()
+    (SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY sub.score)
+     FROM (SELECT score FROM AdvancedJoinAnalysis) AS sub
+    ) AS MedianScore,
+    COALESCE(STDDEV(aja.Score) OVER (), 0) AS ScoreStandardDeviation
+FROM AdvancedJoinAnalysis aja
+WHERE aja.CompositeScore > 50 
+AND aja.ReputationLevel NOT IN ('Newbie', 'Beginner')
+AND aja.ImpactLevel = 'High Impact'
+ORDER BY aja.CompositeRank ASC
+LIMIT 1000
+OFFSET 10000;

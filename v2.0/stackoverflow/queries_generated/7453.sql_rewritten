@@ -1,0 +1,207 @@
+-- {"query": "7453.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1992} 
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT c.Id) as Comments,
+        COUNT(DISTINCT b.Id) as Badges,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        COALESCE(MAX(p.CreationDate), u.CreationDate) as LastActivity,
+        ROW_NUMBER() OVER (ORDER BY COALESCE(SUM(p.Score), 0) DESC) as Ranking,
+        CASE WHEN u.Reputation > 10000 THEN 'Gold' 
+             WHEN u.Reputation > 5000 THEN 'Silver' 
+             ELSE 'Bronze' END as RepTier
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        p.PostTypeId,
+        CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END as IsAnswered,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END as IsClosed,
+        CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN 1 ELSE 0 END as IsCommunityOwned,
+        DATEDIFF(day, p.CreationDate, COALESCE(p.ClosedDate, cast('2024-10-01 12:34:56' as timestamp))) as DaysOpen,
+        STRING_AGG(SUBSTRING(p.Tags, 2, LEN(p.Tags) - 2), ', ') WITHIN GROUP (ORDER BY p.Id) as AllTags,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PrevScore,
+        LEAD(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as NextScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING) as MovingAvgScore,
+        CASE 
+            WHEN p.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'AboveAvg'
+            WHEN p.Score < (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'BelowAvg'
+            ELSE 'Avg'
+        END as ScoreCategory
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1, 2)
+),
+RecentActivity AS (
+    SELECT 
+        PostId,
+        COUNT(*) as EditCount,
+        MAX(CreationDate) as LastEdit,
+        STRING_AGG(CONCAT('Edit by ', ISNULL(UserDisplayName, 'Anonymous')), '; ') as Editors
+    FROM PostHistory
+    WHERE PostHistoryTypeId IN (5, 6) 
+    GROUP BY PostId
+),
+TagImpact AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        AVG(p.Score) as AvgScore,
+        MIN(p.Score) as MinScore,
+        MAX(p.Score) as MaxScore,
+        COUNT(DISTINCT p.OwnerUserId) as ActiveUsers,
+        ROW_NUMBER() OVER (ORDER BY AVG(p.Score) DESC) as PopularityRank
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE '%' + t.TagName + '%'
+    WHERE t.TagName IS NOT NULL AND p.PostTypeId = 1
+    GROUP BY t.TagName, t.Count
+),
+ComplexQuery AS (
+    SELECT 
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.RepTier,
+        us.TotalPosts,
+        us.Questions,
+        us.Answers,
+        us.Comments,
+        us.Badges,
+        us.TotalScore,
+        us.Ranking,
+        pa.PostId,
+        pa.Title,
+        pa.Score as PostScore,
+        pa.ViewCount,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.IsAnswered,
+        pa.IsClosed,
+        pa.DaysOpen,
+        pa.AllTags,
+        pa.ScoreCategory,
+        ra.EditCount,
+        ra.LastEdit,
+        ra.Editors,
+        ti.TagName,
+        ti.TagCount,
+        ti.AvgScore as TagAvgScore,
+        ti.PopularityRank,
+        CASE 
+            WHEN us.Reputation > 10000 AND pa.Score > 50 THEN 'EliteHighValue'
+            WHEN us.Reputation > 5000 AND pa.Score > 25 THEN 'VeteranHighValue'
+            WHEN us.Reputation > 1000 AND pa.Score > 10 THEN 'ActiveHighValue'
+            ELSE 'Standard'
+        END as ContributorTier,
+        ROUND(CAST((pa.Score * 100.0) / NULLIF(us.TotalScore, 0) AS FLOAT), 2) as ScoreContributionPct,
+        CASE 
+            WHEN pa.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) 
+            AND pa.ViewCount > (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = 1)
+            THEN 'PopularHighImpact'
+            WHEN pa.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) 
+            OR pa.ViewCount > (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = 1)
+            THEN 'Popular'
+            ELSE 'Normal'
+        END as PostTier,
+        IIF(pa.Score > 100, 'VeteranPost', IIF(pa.Score > 50, 'ExperiencedPost', 'RegularPost')) as ExperienceLevel,
+        DATEDIFF(day, pa.CreationDate, cast('2024-10-01 12:34:56' as timestamp)) as AgeInDays,
+        NULLIF(pa.ViewCount, 0) / NULLIF(pa.Score, 0) as ViewsPerScore,
+        COALESCE(pa.MovingAvgScore, 0) as MovingAverageScore,
+        CASE 
+            WHEN pa.MovingAvgScore > 10 AND pa.Score - pa.PrevScore > 5 THEN 'Increasing'
+            WHEN pa.MovingAvgScore < 5 AND pa.Score - pa.NextScore > 5 THEN 'Decreasing'
+            ELSE 'Stable'
+        END as TrendStatus,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = us.UserId AND b.Class = 1) as GoldBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = us.UserId AND b.Class = 2) as SilverBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = us.UserId AND b.Class = 3) as BronzeBadges,
+        CASE 
+            WHEN pa.Score > 0 AND pa.ViewCount > 0 THEN LOG(pa.ViewCount * pa.Score)
+            ELSE 0 
+        END as ComplexMetric,
+        CONCAT('User ', us.UserId, ': ', us.DisplayName) as UserIdDisplayName,
+        LEFT(us.AboutMe, 100) as ShortBio,
+        IIF(pa.Title LIKE '%[Qq]uestion%' OR pa.Title LIKE '%[Aa]nswer%', 'QuestionAnswer', 'Regular') as ContentCategory
+    FROM UserStats us
+    INNER JOIN PostAnalysis pa ON us.UserId = pa.OwnerUserId
+    LEFT JOIN RecentActivity ra ON pa.PostId = ra.PostId
+    LEFT JOIN TagImpact ti ON ti.TagName IN (
+        SELECT value FROM STRING_SPLIT(pa.AllTags, ',')
+    )
+    WHERE pa.Score > 0 
+    AND (pa.ViewCount > 10 OR us.Reputation > 1000 OR us.TotalScore > 100)
+    AND pa.CreationDate >= DATEADD(year, -1, cast('2024-10-01 12:34:56' as timestamp))
+)
+SELECT 
+    UserId,
+    DisplayName,
+    Reputation,
+    RepTier,
+    TotalPosts,
+    Questions,
+    Answers,
+    Comments,
+    Badges,
+    TotalScore,
+    Ranking,
+    PostId,
+    Title,
+    PostScore,
+    ViewCount,
+    AnswerCount,
+    CommentCount,
+    IsAnswered,
+    IsClosed,
+    DaysOpen,
+    AllTags,
+    ScoreCategory,
+    EditCount,
+    LastEdit,
+    Editors,
+    TagName,
+    TagCount,
+    TagAvgScore,
+    PopularityRank,
+    ContributorTier,
+    ScoreContributionPct,
+    PostTier,
+    ExperienceLevel,
+    AgeInDays,
+    ViewsPerScore,
+    MovingAverageScore,
+    TrendStatus,
+    GoldBadges,
+    SilverBadges,
+    BronzeBadges,
+    ComplexMetric,
+    UserIdDisplayName,
+    ShortBio,
+    ContentCategory
+FROM ComplexQuery
+WHERE PostTier IN ('PopularHighImpact', 'Popular') 
+AND (ScoreContributionPct > 5 OR TagAvgScore > 50)
+AND TotalPosts > 5
+ORDER BY TotalScore DESC, PostScore DESC, ViewsPerScore DESC
+OFFSET 0 ROWS FETCH NEXT 1000 ROWS ONLY;

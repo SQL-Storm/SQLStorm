@@ -1,0 +1,182 @@
+-- {"query": "4847.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1396} 
+
+WITH
+  QuestionMetrics AS (
+    SELECT
+      p.Id AS QuestionId,
+      p.OwnerUserId,
+      p.Title,
+      p.CreationDate AS QuestionCreationDate,
+      p.AnswerCount,
+      p.FavoriteCount,
+      p.ViewCount AS QuestionViewCount,
+      p.Score AS QuestionScore,
+      COALESCE(u.Reputation, 0) AS OwnerReputation,
+      CASE
+        WHEN EXISTS (
+          SELECT
+            1
+          FROM
+            Posts AS a
+          WHERE
+            a.ParentId = p.Id AND a.PostTypeId = 2
+        ) THEN 1
+        ELSE 0
+      END AS HasAnswers,
+      COALESCE(
+        (
+          SELECT
+            COUNT(*)
+          FROM
+            Comments AS c
+          WHERE
+            c.PostId = p.Id
+        ),
+        0
+      ) AS CommentCount,
+      COALESCE(
+        (
+          SELECT
+            COUNT(*)
+          FROM
+            PostLinks AS pl
+          WHERE
+            pl.PostId = p.Id AND pl.LinkTypeId = 3
+        ),
+        0
+      ) AS DuplicateLinks,
+      COALESCE(
+        (
+          SELECT
+            COUNT(*)
+          FROM
+            PostHistory AS ph
+          WHERE
+            ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+        ),
+        0
+      ) AS CloseVotesCount
+    FROM
+      Posts AS p
+    LEFT JOIN
+      Users AS u
+      ON p.OwnerUserId = u.Id
+    WHERE
+      p.PostTypeId = 1 AND p.CommunityOwnedDate IS NULL
+  ),
+  AnswerMetrics AS (
+    SELECT
+      a.ParentId AS QuestionId,
+      COUNT(a.Id) AS AnswerCountDetail,
+      SUM(a.Score) AS TotalAnswerScore,
+      AVG(a.Score) AS AverageAnswerScore,
+      COUNT(CASE WHEN a.Id = p.AcceptedAnswerId THEN 1 ELSE NULL END) AS AcceptedAnswerCount
+    FROM
+      Posts AS a
+    JOIN
+      Posts AS p
+      ON a.ParentId = p.Id
+    WHERE
+      a.PostTypeId = 2 AND p.PostTypeId = 1
+    GROUP BY
+      a.ParentId
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      COUNT(DISTINCT ph.PostId) AS PostsEdited,
+      MAX(ph.CreationDate) AS LastEditDate
+    FROM
+      Users AS u
+    JOIN
+      PostHistory AS ph
+      ON u.Id = ph.UserId
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6)
+    GROUP BY
+      u.Id
+  ),
+  TagPerformance AS (
+    SELECT
+      t.TagName,
+      COALESCE(SUM(p.ViewCount), 0) AS TotalTagViews,
+      COALESCE(SUM(p.AnswerCount), 0) AS TotalTagAnswers,
+      COALESCE(AVG(p.Score), 0) AS AverageQuestionScoreInTag
+    FROM
+      Tags AS t
+    LEFT JOIN
+      Posts AS p
+      ON p.Tags LIKE '%' || t.TagName || '%' AND p.PostTypeId = 1
+    GROUP BY
+      t.TagName
+  ),
+  RankedAnswers AS (
+    SELECT
+      a.ParentId AS QuestionId,
+      a.Id AS AnswerId,
+      a.Score AS AnswerScore,
+      ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS RankByScore,
+      SUM(a.Score) OVER (PARTITION BY a.ParentId) AS TotalScoreForQuestionAnswers
+    FROM
+      Posts AS a
+    WHERE
+      a.PostTypeId = 2
+  )
+SELECT
+  qm.QuestionId,
+  qm.Title,
+  qm.QuestionCreationDate,
+  qm.OwnerUserId,
+  qm.OwnerReputation,
+  qm.AnswerCount AS QuestionAnswerCount,
+  am.AnswerCountDetail,
+  am.TotalAnswerScore,
+  am.AverageAnswerScore,
+  am.AcceptedAnswerCount,
+  qm.FavoriteCount,
+  qm.QuestionViewCount,
+  qm.QuestionScore,
+  qm.CommentCount,
+  qm.HasAnswers,
+  qm.DuplicateLinks,
+  qm.CloseVotesCount,
+  ua.PostsEdited AS UserPostsEdited,
+  ua.LastEditDate AS UserLastEditDate,
+  tp.TagName,
+  tp.TotalTagViews,
+  tp.TotalTagAnswers,
+  tp.AverageQuestionScoreInTag,
+  ra.AnswerId AS TopAnswerId,
+  ra.AnswerScore AS TopAnswerScore,
+  ra.TotalScoreForQuestionAnswers AS SumOfAllAnswerScoresForQuestion
+FROM
+  QuestionMetrics AS qm
+LEFT OUTER JOIN
+  AnswerMetrics AS am
+  ON qm.QuestionId = am.QuestionId
+LEFT OUTER JOIN
+  UserActivity AS ua
+  ON qm.OwnerUserId = ua.UserId
+LEFT OUTER JOIN
+  TagPerformance AS tp
+  ON qm.Title LIKE '%' || tp.TagName || '%' OR qm.Title LIKE tp.TagName || '%' OR qm.Title LIKE '%' || tp.TagName OR EXISTS (
+    SELECT
+      1
+    FROM
+      STRING_SPLIT(qm.Title, '><') AS tags
+    WHERE
+      tags.value = tp.TagName
+  )
+LEFT OUTER JOIN
+  RankedAnswers AS ra
+  ON qm.QuestionId = ra.QuestionId AND ra.RankByScore = 1
+WHERE
+  qm.QuestionScore > 100
+  AND qm.OwnerReputation > 5000
+  AND COALESCE(qm.OwnerReputation, 0) <> am.TotalAnswerScore
+  AND qm.QuestionCreationDate < '2023-01-01'
+  AND tp.TotalTagViews > 100000
+ORDER BY
+  qm.QuestionViewCount DESC,
+  qm.QuestionScore DESC
+LIMIT 100;

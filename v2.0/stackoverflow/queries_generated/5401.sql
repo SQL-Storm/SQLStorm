@@ -1,0 +1,110 @@
+-- {"query": "5401.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 770} 
+WITH RankedUsers AS (
+  SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.ProfileImageUrl,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.Id ASC) AS rn
+  FROM Users u
+),
+TopTags AS (
+  SELECT
+    t.TagName,
+    t.Count,
+    ROW_NUMBER() OVER (ORDER BY t.Count DESC, t.TagName ASC) AS rn
+  FROM Tags t
+  WHERE t.IsModeratorOnly = 0
+),
+PostActivity AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Title,
+    p.Tags,
+    p.Score,
+    p.ViewCount,
+    p.CommentCount,
+    p.AnswerCount,
+    p.LastActivityDate,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.ClosedDate,
+    p.ContentLicense
+  FROM Posts p
+),
+RecentActivity AS (
+  SELECT
+    pa.PostId,
+    pa.PostTypeId,
+    pa.OwnerUserId,
+    pa.Title,
+    pa.Tags,
+    pa.CreationDate,
+    pa.LastActivityDate,
+    pa.Score,
+    pa.ViewCount,
+    pa.CommentCount,
+    pa.AnswerCount,
+    pa.ClosedDate,
+    ROW_NUMBER() OVER (
+      ORDER BY
+        COALESCE(pa.ClosedDate, TIMESTAMP 'epoch') DESC,
+        pa.LastActivityDate DESC,
+        pa.Score DESC
+    ) AS rn
+  FROM PostActivity pa
+  LEFT JOIN Votes v ON v.PostId = pa.PostId AND v.VoteTypeId = 2
+  WHERE pa.CreationDate > (CURRENT_DATE - INTERVAL '180 days')
+),
+TagWorkflow AS (
+  SELECT
+    tt.TagName,
+    COUNT(*) AS Usage
+  FROM Tags tt
+  JOIN Posts p ON p.Tags LIKE '%' || tt.TagName || '%'
+  GROUP BY tt.TagName
+)
+SELECT
+  -- top user profile snapshot
+  ru.Id AS UserId,
+  ru.DisplayName AS UserName,
+  ru.Reputation,
+  ru.CreationDate AS UserCreationDate,
+  ru.LastAccessDate AS UserLastAccess,
+  ru.Location,
+  ru.Views,
+  ru.UpVotes,
+  ru.DownVotes,
+  ru.ProfileImageUrl,
+  -- correlated metrics
+  (SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = ru.Id) AS AvgPostScore,
+  (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = ru.Id AND p.PostTypeId = 1) AS QuestionCount,
+  (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = ru.Id AND p.PostTypeId = 2) AS AnswerCount,
+  -- recent activity row for the user
+  (SELECT MAX(pa.LastActivityDate)
+     FROM PostActivity pa
+     WHERE pa.OwnerUserId = ru.Id) AS LastActivityDateForUser,
+  -- top tags by usage across posts by the user
+  (SELECT STRING_AGG(tt.TagName, ',')
+     FROM (
+       SELECT t.TagName
+       FROM Tags t
+       JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+       WHERE p.OwnerUserId = ru.Id
+       GROUP BY t.TagName
+       ORDER BY COUNT(*) DESC
+       LIMIT 3
+     ) AS tt
+  ) AS Top3TagsUsed
+FROM RankedUsers ru
+WHERE ru.rn <= 100
+ORDER BY ru.Reputation DESC, ru.rn;

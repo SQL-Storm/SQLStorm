@@ -1,0 +1,41 @@
+-- {"query": "6781.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-micro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 498} 
+
+SELECT 
+    u.DisplayName,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 1 THEN p.Id END) AS TotalTitleEdits,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 2 THEN p.Id END) AS TotalBodyEdits,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 10 THEN p.Id END) AS TotalCloseVotes,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 11 THEN p.Id END) AS TotalReopenVotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN p.Id END) AS TotalUpVotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN p.Id END) AS TotalDownVotes,
+    AVG(p.Score) AS AvgScore,
+    SUM(p.ViewCount) AS TotalViewCount,
+    AVG(DATEDIFF(day, p.CreationDate, p.LastActivityDate)) AS AvgDaysToLastActivity,
+    MAX(CASE WHEN p.PostTypeId = 1 THEN p.AnswerCount END) AS MaxAnswersPerQuestion,
+    MIN(CASE WHEN p.PostTypeId = 1 THEN p.AnswerCount END) AS MinAnswersPerQuestion,
+    STRING_AGG(DISTINCT t.TagName, ', ') AS MostCommonTags,
+    b.Class AS BadgeClass
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    Tags t ON p.Id = t.ExcerptPostId
+WHERE 
+    p.PostTypeId IN (1, 2)
+    AND u.Reputation > 100
+    AND p.CreationDate BETWEEN DATEADD(year, -2, CURRENT_TIMESTAMP) AND CURRENT_TIMESTAMP
+GROUP BY 
+    u.Id, b.Class
+HAVING 
+    SUM(p.Score) > 1000
+ORDER BY 
+    AVGDaysToLastActivity DESC, 
+    TotalPosts DESC;

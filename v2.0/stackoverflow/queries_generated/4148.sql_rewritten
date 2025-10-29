@@ -1,0 +1,91 @@
+-- {"query": "4148.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1034} 
+WITH PostDetails AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL THEN DATEDIFF(day, p.ClosedDate, cast('2024-10-01 12:34:56' as timestamp))
+            ELSE NULL
+        END AS DaysSinceClosed,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS rn_by_score,
+        AVG(CAST(p.Score AS FLOAT)) OVER (PARTITION BY p.PostTypeId) AS avg_score_by_type
+    FROM Posts AS p
+    JOIN PostTypes AS pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Users AS u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1, 2) -- Questions and Answers
+),
+CommentMetrics AS (
+    SELECT
+        c.PostId,
+        COUNT(c.Id) AS CommentCount,
+        SUM(c.Score) AS TotalCommentScore,
+        AVG(CAST(c.Score AS FLOAT)) AS AvgCommentScore,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM Comments AS c
+    GROUP BY c.PostId
+),
+VoteDistribution AS (
+    SELECT
+        v.PostId,
+        COUNT(CASE WHEN vt.Name = 'UpMod' THEN 1 END) AS UpVoteCount,
+        COUNT(CASE WHEN vt.Name = 'DownMod' THEN 1 END) AS DownVoteCount,
+        COUNT(CASE WHEN vt.Name = 'Favorite' THEN 1 END) AS FavoriteVoteCount -- Note: Favorite is now Saves, but using the old VoteType name for demonstration
+    FROM Votes AS v
+    JOIN VoteTypes AS vt ON v.VoteTypeId = vt.Id
+    WHERE vt.Name IN ('UpMod', 'DownMod', 'Favorite')
+    GROUP BY v.PostId
+)
+SELECT
+    pd.PostId,
+    pd.PostTypeName,
+    pd.OwnerDisplayName,
+    pd.PostCreationDate,
+    pd.Score,
+    pd.ViewCount,
+    pd.AnswerCount,
+    pd.CommentCount AS PostCommentCount,
+    pd.FavoriteCount AS PostFavoriteCount,
+    cm.CommentCount AS TotalComments,
+    cm.TotalCommentScore AS TotalCommentScore,
+    cm.AvgCommentScore AS AvgCommentScore,
+    vd.UpVoteCount,
+    vd.DownVoteCount,
+    vd.FavoriteVoteCount,
+    pd.DaysSinceClosed,
+    pd.rn_by_score,
+    pd.avg_score_by_type,
+    CASE
+        WHEN pd.Score > pd.avg_score_by_type * 1.5 THEN 'HighScoring'
+        WHEN pd.Score < pd.avg_score_by_type * 0.5 THEN 'LowScoring'
+        ELSE 'AverageScoring'
+    END AS ScoreCategory,
+    LOWER(SUBSTRING(pd.OwnerDisplayName, 1, 3)) AS FirstThreeCharsDisplayName,
+    CASE WHEN pd.ClosedDate IS NULL THEN 'Open' ELSE 'Closed' END AS Status,
+    CASE
+        WHEN pd.OwnerDisplayName IS NULL THEN 'AnonymousOwner'
+        ELSE 'NamedOwner'
+    END AS OwnerType,
+    UPPER(pt.Name) AS POST_TYPE_UPPER,
+    COALESCE(cm.LastCommentDate, pd.PostCreationDate) AS LatestActivityDate,
+    CASE
+        WHEN EXISTS (SELECT 1 FROM PostLinks pl WHERE pl.PostId = pd.PostId AND pl.LinkTypeId = 3) THEN 'HasDuplicateLink'
+        ELSE 'NoDuplicateLink'
+    END AS DuplicateLinkStatus
+FROM PostDetails AS pd
+LEFT JOIN CommentMetrics AS cm ON pd.PostId = cm.PostId
+LEFT JOIN VoteDistribution AS vd ON pd.PostId = vd.PostId
+LEFT JOIN PostTypes AS pt ON pd.PostTypeId = pt.Id
+WHERE pd.rn_by_score <= 100 -- Top 100 posts by score within each type
+AND pd.ViewCount > 1000
+AND (pd.Score > 50 OR pd.AnswerCount > 10)
+ORDER BY pd.PostTypeId, pd.Score DESC;

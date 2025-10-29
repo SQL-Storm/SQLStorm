@@ -1,0 +1,79 @@
+-- {"query": "5867.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 696} 
+WITH
+recent_bets AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName AS UserName,
+    p.Id AS PostId,
+    p.Title AS PostTitle,
+    p.CreationDate AS PostCreated,
+    p.Score AS PostScore,
+    p.ViewCount,
+    ARRAY_AGG(DISTINCT t.Name) AS TagsList,
+    MAX(v.CreationDate) FILTER (WHERE v.VoteTypeId = 2) AS LastUpvoteDate,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvoteCount,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvoteCount
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN PostTags pt ON p.Id = pt.PostId
+  LEFT JOIN Tags t ON pt.TagId = t.Id
+  LEFT JOIN Votes v ON p.Id = v.PostId
+  WHERE p.CreationDate >= date_trunc('month', current_date) - interval '11 months'
+  GROUP BY u.Id, p.Id
+),
+top_tags AS (
+  SELECT
+    t.Name AS TagName,
+    COUNT(*) AS TagPostCount,
+    SUM(CASE WHEN p.Score > 0 THEN 1 ELSE 0 END) AS PositivePosts
+  FROM Posts p
+  JOIN Tags t ON p.Tags LIKE '%' || t.TagName || '%' -- simplistic tag match
+  GROUP BY t.Name
+),
+complex_calc AS (
+  SELECT
+    rb.UserId,
+    rb.UserName,
+    rb.PostId,
+    rb.PostTitle,
+    rb.PostCreated,
+    rb.PostScore,
+    rb.ViewCount,
+    rb.TagsList,
+    rb.LastUpvoteDate,
+    rb.UpvoteCount,
+    rb.DownvoteCount,
+    CASE
+      WHEN rb.ViewCount > 1000 THEN rb.ViewCount * 0.75
+      WHEN rb.ViewCount BETWEEN 500 AND 1000 THEN rb.ViewCount * 0.9
+      ELSE rb.ViewCount
+    END AS AdjustedViews,
+    (rb.UpvoteCount - rb.DownvoteCount) AS NetVotes,
+    (EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - rb.PostCreated)) / 3600) AS HoursSinceCreation
+  FROM recent_bets rb
+)
+SELECT
+  cc.UserName,
+  cc.PostTitle,
+  cc.PostCreated,
+  cc.ViewCount,
+  cc.AdjustedViews,
+  cc.NetVotes,
+  cc.HoursSinceCreation,
+  array_to_string(cc.TagsList, ',') AS Tags,
+  tp.TagPostCount,
+  tp.PositivePosts,
+  CASE
+    WHEN cc.HoursSinceCreation < 24 THEN 'New'
+    WHEN cc.HoursSinceCreation < 168 THEN 'Active'
+    ELSE 'Stale'
+  END AS ActivityBucket
+FROM complex_calc cc
+LEFT JOIN top_tags tp ON true
+LEFT JOIN Posts p ON cc.PostId = p.Id
+LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+LEFT JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+WHERE cc.NetVotes > 0
+  AND cc.AdjustedViews >= 100
+ORDER BY cc.AdjustedViews DESC, cc.NetVotes DESC
+LIMIT 250;

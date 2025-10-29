@@ -1,0 +1,145 @@
+WITH RecursiveTagStats AS (
+    SELECT 
+        t.Id AS TagId,
+        t.TagName,
+        t.Count AS TagUsageCount,
+        p.Id AS QuestionId,
+        p.OwnerUserId,
+        p.Score AS QuestionScore,
+        p.ViewCount,
+        p.CreationDate
+    FROM Tags t
+    JOIN Posts p ON p.PostTypeId = 1 AND POSITION(CONCAT('<', t.TagName, '>') IN COALESCE(p.Tags, '')) > 0
+    WHERE t.Count > 1000
+), UserAnswerStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(pa.Id) AS AnswerCount,
+        AVG(pa.Score) AS AvgAnswerScore,
+        MAX(pa.CreationDate) AS LastAnswerDate
+    FROM Users u
+    LEFT JOIN Posts pa ON pa.PostTypeId = 2 AND pa.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+), QuestionWithAcceptedAnswerInfo AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.CreationDate AS QuestionCreationDate,
+        a.Id AS AcceptedAnswerId,
+        a.OwnerUserId AS AnswerOwnerUserId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerCreationDate
+    FROM Posts q
+    LEFT JOIN Posts a ON a.Id = q.AcceptedAnswerId AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+), RankedQuestions AS (
+    SELECT
+        q.QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.QuestionScore,
+        q.ViewCount,
+        q.QuestionCreationDate,
+        q.AcceptedAnswerId,
+        q.AnswerOwnerUserId,
+        q.AnswerScore,
+        q.AnswerCreationDate,
+        ROW_NUMBER() OVER (PARTITION BY EXTRACT(YEAR FROM q.QuestionCreationDate) ORDER BY q.QuestionScore DESC) AS YearlyRank,
+        RANK() OVER (ORDER BY q.ViewCount DESC) AS ViewRank
+    FROM QuestionWithAcceptedAnswerInfo q
+), CloseReasonsCount AS (
+    SELECT 
+        CAST(ch.ClosedDate AS date) AS CloseDate,
+        crt.Name AS CloseReason,
+        COUNT(*) AS ClosedPostsCount
+    FROM Posts ch
+    JOIN PostHistory ph ON ph.PostId = ch.Id AND ph.PostHistoryTypeId = 10
+    JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS int)
+    WHERE ch.ClosedDate IS NOT NULL
+    GROUP BY CAST(ch.ClosedDate AS date), crt.Name
+), UsersWithGoldBadgesAndHighReputation AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadgeCount,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadgeCount,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadgeCount
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING u.Reputation > 10000 AND SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) > 0
+)
+SELECT DISTINCT
+    rq.QuestionId,
+    rq.Title,
+    rq.QuestionScore,
+    rq.ViewCount,
+    u.DisplayName AS QuestionOwner,
+    uas.AnswerCount,
+    uas.AvgAnswerScore,
+    cr.ClosedPostsCount,
+    cr.CloseReason,
+    uts.TagName,
+    uts.TagUsageCount,
+    ugh.GoldBadgeCount,
+    ugh.SilverBadgeCount,
+    ugh.BronzeBadgeCount,
+    CONCAT(
+        SUBSTRING(rq.Title FROM 1 FOR 30), ' - ',
+        COALESCE(uts.TagName, 'NoTag'), ' - ',
+        CAST(rq.QuestionScore AS VARCHAR), ' - ',
+        CAST(rq.ViewCount AS VARCHAR)
+    ) AS CompositeInfo,
+    CASE 
+        WHEN rq.ViewCount > 100000 THEN 'Hot'
+        WHEN rq.ViewCount BETWEEN 10000 AND 100000 THEN 'Warm'
+        ELSE 'Cold'
+    END AS QuestionPopularityCategory,
+    (SELECT COUNT(*) 
+     FROM Comments c
+     WHERE c.PostId = rq.QuestionId AND c.CreationDate > rq.QuestionCreationDate) AS CommentCountSinceCreation
+FROM RankedQuestions rq
+LEFT JOIN Users u ON u.Id = rq.OwnerUserId
+LEFT JOIN UserAnswerStats uas ON uas.UserId = rq.OwnerUserId
+LEFT JOIN CloseReasonsCount cr ON cr.CloseDate = CAST(rq.QuestionCreationDate AS date)
+LEFT JOIN RecursiveTagStats uts ON uts.QuestionId = rq.QuestionId
+LEFT JOIN UsersWithGoldBadgesAndHighReputation ugh ON ugh.Id = rq.OwnerUserId
+WHERE rq.YearlyRank <= 10
+  AND COALESCE(ugh.GoldBadgeCount,0) >= 1
+  AND (uas.AvgAnswerScore IS NULL OR uas.AvgAnswerScore > 2)
+
+UNION
+
+SELECT 
+    p.Id AS QuestionId,
+    p.Title,
+    p.Score AS QuestionScore,
+    p.ViewCount,
+    u.DisplayName AS QuestionOwner,
+    0 AS AnswerCount,
+    NULL AS AvgAnswerScore,
+    0 AS ClosedPostsCount,
+    NULL AS CloseReason,
+    NULL AS TagName,
+    0 AS TagUsageCount,
+    0 AS GoldBadgeCount,
+    0 AS SilverBadgeCount,
+    0 AS BronzeBadgeCount,
+    SUBSTRING(p.Title FROM 1 FOR 30) AS CompositeInfo,
+    'Cold' AS QuestionPopularityCategory,
+    0 AS CommentCountSinceCreation
+FROM Posts p
+LEFT JOIN Users u ON u.Id = p.OwnerUserId
+WHERE p.PostTypeId = 1
+  AND p.AcceptedAnswerId IS NULL
+  AND p.Score < 0
+  AND NOT EXISTS (
+      SELECT 1 FROM Comments c WHERE c.PostId = p.Id
+  )
+ORDER BY ViewCount DESC, QuestionScore DESC
+FETCH FIRST 100 ROWS ONLY;

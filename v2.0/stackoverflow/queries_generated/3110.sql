@@ -1,0 +1,164 @@
+-- {"query": "3110.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2554} 
+
+/*  Performance‑benchmarking query – uses CTEs, window functions, outer joins,
+    correlated subqueries, set operators, complex expressions and NULL logic   */
+WITH
+    /*--------------------------------------------------------------
+      Aggregate per‑user post statistics (questions, answers, scores)
+    --------------------------------------------------------------*/
+    usr_posts AS (
+        SELECT
+            u.Id                                            AS user_id,
+            u.DisplayName                                   AS display_name,
+            u.Reputation,
+            COUNT(p.Id)                                     AS total_posts,
+            SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS questions,
+            SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS answers,
+            ROUND(AVG(p.Score)::numeric,2)                 AS avg_score,
+            MAX(p.LastActivityDate)                         AS last_activity
+        FROM Users u
+        LEFT JOIN Posts p
+               ON p.OwnerUserId = u.Id
+        GROUP BY u.Id, u.DisplayName, u.Reputation
+    ),
+
+    /*--------------------------------------------------------------
+      Badge counts per user (including a comma‑separated list)
+    --------------------------------------------------------------*/
+    usr_badges AS (
+        SELECT
+            b.UserId                                    AS user_id,
+            COUNT(*)                                    AS total_badges,
+            COUNT(*) FILTER (WHERE b.Class = 1)         AS gold,
+            COUNT(*) FILTER (WHERE b.Class = 2)         AS silver,
+            COUNT(*) FILTER (WHERE b.Class = 3)         AS bronze,
+            STRING_AGG(DISTINCT b.Name, ', ')           AS badge_list
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+
+    /*--------------------------------------------------------------
+      Tag usage – explode Tags column, count per tag per user
+    --------------------------------------------------------------*/
+    tag_usage AS (
+        SELECT
+            p.OwnerUserId                               AS user_id,
+            UNNEST(STRING_TO_ARRAY(TRIM(BOTH '><' FROM p.Tags), '><')) AS tag,
+            COUNT(*)                                    AS tag_cnt
+        FROM Posts p
+        WHERE p.PostTypeId = 1                -- only questions
+          AND p.Tags IS NOT NULL
+        GROUP BY p.OwnerUserId, tag
+    ),
+
+    /*--------------------------------------------------------------
+      Top 5 tags per user (concatenated as tag:cnt)
+    --------------------------------------------------------------*/
+    top_tags AS (
+        SELECT
+            tu.user_id,
+            STRING_AGG(tu.tag || ':' || tu.tag_cnt, ', ' ORDER BY tu.tag_cnt DESC) AS top_5_tags
+        FROM (
+            SELECT
+                tu.*,
+                ROW_NUMBER() OVER (PARTITION BY tu.user_id ORDER BY tu.tag_cnt DESC) AS rn
+            FROM tag_usage tu
+        ) tu
+        WHERE tu.rn <= 5
+        GROUP BY tu.user_id
+    ),
+
+    /*--------------------------------------------------------------
+      Recent voting activity (last 30 days)
+    --------------------------------------------------------------*/
+    recent_votes AS (
+        SELECT
+            v.UserId                                    AS user_id,
+            COUNT(*) FILTER (WHERE vt.Id = 2)           AS up_votes,
+            COUNT(*) FILTER (WHERE vt.Id = 3)           AS down_votes,
+            MAX(v.CreationDate)                         AS last_vote
+        FROM Votes v
+        JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+        WHERE v.CreationDate >= CURRENT_TIMESTAMP - INTERVAL '30 days'
+        GROUP BY v.UserId
+    ),
+
+    /*--------------------------------------------------------------
+      Users that have never posted (to test outer‑join performance)
+    --------------------------------------------------------------*/
+    users_no_posts AS (
+        SELECT
+            u.Id                                        AS user_id,
+            u.DisplayName,
+            u.Reputation
+        FROM Users u
+        WHERE NOT EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id)
+    )
+
+/*======================================================================
+  Main result set – users with posts + aggregated data
+======================================================================*/
+SELECT
+    up.user_id,
+    up.display_name,
+    up.reputation,
+    up.total_posts,
+    up.questions,
+    up.answers,
+    up.avg_score,
+    up.last_activity,
+    COALESCE(ub.total_badges,0)          AS total_badges,
+    COALESCE(ub.gold,0)                  AS gold_badges,
+    COALESCE(ub.silver,0)                AS silver_badges,
+    COALESCE(ub.bronze,0)                AS bronze_badges,
+    COALESCE(ub.badge_list,'')          AS badge_list,
+    COALESCE(tt.top_5_tags,'')          AS top_5_tags,
+    COALESCE(rv.up_votes,0)             AS recent_up_votes,
+    COALESCE(rv.down_votes,0)           AS recent_down_votes,
+    rv.last_vote,
+    CASE
+        WHEN up.reputation > 20000 THEN 'Legendary'
+        WHEN up.reputation > 10000 THEN 'Expert'
+        WHEN up.reputation > 5000  THEN 'Advanced'
+        ELSE 'Novice'
+    END                                 AS reputation_tier,
+    ROW_NUMBER() OVER (ORDER BY up.reputation DESC) AS reputation_rank
+FROM usr_posts up
+LEFT JOIN usr_badges ub   ON ub.user_id   = up.user_id
+LEFT JOIN top_tags tt    ON tt.user_id   = up.user_id
+LEFT JOIN recent_votes rv ON rv.user_id  = up.user_id
+WHERE up.reputation IS NOT NULL
+
+UNION ALL
+
+/*======================================================================
+  Second result set – users that never posted (all post‑related columns NULL)
+======================================================================*/
+SELECT
+    unp.user_id,
+    unp.display_name,
+    unp.reputation,
+    NULL AS total_posts,
+    NULL AS questions,
+    NULL AS answers,
+    NULL AS avg_score,
+    NULL AS last_activity,
+    0    AS total_badges,
+    0    AS gold_badges,
+    0    AS silver_badges,
+    0    AS bronze_badges,
+    ''   AS badge_list,
+    ''   AS top_5_tags,
+    0    AS recent_up_votes,
+    0    AS recent_down_votes,
+    NULL AS last_vote,
+    CASE
+        WHEN unp.reputation > 20000 THEN 'Legendary'
+        WHEN unp.reputation > 10000 THEN 'Expert'
+        WHEN unp.reputation > 5000  THEN 'Advanced'
+        ELSE 'Novice'
+    END AS reputation_tier,
+    ROW_NUMBER() OVER (ORDER BY unp.reputation DESC) AS reputation_rank
+FROM users_no_posts unp
+ORDER BY reputation_rank
+FETCH FIRST 200 ROWS ONLY;

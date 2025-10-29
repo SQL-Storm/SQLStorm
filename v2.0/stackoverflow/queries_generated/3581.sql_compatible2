@@ -1,0 +1,151 @@
+WITH
+recent_activity AS (
+    SELECT
+        p.Id                     AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId            AS OwnerUserId,
+        p.CreationDate           AS PostCreated,
+        COALESCE(v.VoteTypeId, 0) AS VoteTypeId,
+        COALESCE(v.CreationDate, p.CreationDate) AS EventDate,
+        CASE
+            WHEN v.VoteTypeId = 2 THEN 1
+            WHEN v.VoteTypeId = 3 THEN -1
+            ELSE 0
+        END                            AS VoteScoreDelta
+    FROM Posts p
+    LEFT JOIN Votes v
+        ON v.PostId = p.Id
+       AND v.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '90 days'
+    WHERE p.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '90 days'
+),
+post_agg AS (
+    SELECT
+        ra.PostId,
+        ra.PostTypeId,
+        ra.OwnerUserId,
+        MIN(ra.PostCreated)                AS FirstSeen,
+        MAX(ra.EventDate)                  AS LastActivity,
+        SUM(ra.VoteScoreDelta)             AS NetVoteScore,
+        COUNT(*)                           AS ActivityEvents,
+        ROW_NUMBER() OVER (PARTITION BY ra.PostId
+                           ORDER BY ra.EventDate DESC) AS RecencyRank
+    FROM recent_activity ra
+    GROUP BY ra.PostId, ra.PostTypeId, ra.OwnerUserId, ra.EventDate
+),
+user_enriched AS (
+    SELECT
+        u.Id                                    AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        CASE
+            WHEN u.Reputation >= 20000 THEN 'Legendary'
+            WHEN u.Reputation >= 10000 THEN 'Epic'
+            WHEN u.Reputation >= 5000  THEN 'Advanced'
+            WHEN u.Reputation >= 1000  THEN 'Intermediate'
+            ELSE 'Novice'
+        END                                      AS ReputationTier,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+tag_stats AS (
+    SELECT
+        trim(t)                             AS TagName,
+        COUNT(*)                            AS QuestionCount,
+        SUM(p.Score)                        AS TotalScore,
+        AVG(p.ViewCount)                    AS AvgViews,
+        MAX(p.CreationDate)                 AS LatestQuestion
+    FROM Posts p,
+         LATERAL regexp_split_to_table(
+             COALESCE(p.Tags, ''),
+             '[><]'
+         ) AS t
+    WHERE p.PostTypeId = 1
+      AND p.Tags IS NOT NULL
+    GROUP BY trim(t)
+),
+post_close_reason AS (
+    SELECT
+        ph.PostId,
+        CAST(ph.Comment AS integer) AS CloseReasonId,
+        (SELECT crt.Name FROM CloseReasonTypes crt WHERE crt.Id = CAST(ph.Comment AS integer)) AS CloseReasonName,
+        ph.CreationDate AS ClosedOn
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10
+      AND ph.Comment IS NOT NULL
+      AND ph.Comment ~ '^\d+$'
+      AND ph.CreationDate = (
+            SELECT MAX(ph2.CreationDate)
+            FROM PostHistory ph2
+            WHERE ph2.PostId = ph.PostId
+              AND ph2.PostHistoryTypeId = 10
+          )
+),
+post_relations AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name AS LinkType,
+        pl.CreationDate
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    WHERE lt.Name IN ('Linked', 'Duplicate')
+),
+benchmark_view AS (
+    SELECT
+        pa.PostId,
+        pa.PostTypeId,
+        pt.Title,
+        pa.OwnerUserId,
+        ue.DisplayName,
+        ue.ReputationTier,
+        pa.FirstSeen,
+        pa.LastActivity,
+        pa.NetVoteScore,
+        pa.ActivityEvents,
+        COALESCE(pcr.CloseReasonName, 'Open')              AS CurrentStatus,
+        pcr.ClosedOn                                       AS ClosedOn,
+        STRING_AGG(DISTINCT pr.LinkType, ', ' ORDER BY pr.CreationDate DESC) AS LinkTypes,
+        (
+            SELECT STRING_AGG(t.TagName, '; ' ORDER BY NULL) FROM (
+                SELECT ts.TagName,
+                       (ts.QuestionCount * 0.6 + ts.TotalScore * 0.4) AS TagScore
+                FROM tag_stats ts
+                WHERE pt.Tags LIKE '%' || ts.TagName || '%'
+                ORDER BY TagScore DESC
+                LIMIT 3
+            ) t
+        ) AS TopTags
+    FROM post_agg pa
+    LEFT JOIN Posts pt ON pt.Id = pa.PostId
+    LEFT JOIN user_enriched ue ON ue.UserId = pa.OwnerUserId
+    LEFT JOIN post_close_reason pcr ON pcr.PostId = pa.PostId
+    LEFT JOIN post_relations pr ON pr.PostId = pa.PostId OR pr.RelatedPostId = pa.PostId
+    GROUP BY
+        pa.PostId, pa.PostTypeId, pt.Title, pa.OwnerUserId,
+        ue.DisplayName, ue.ReputationTier,
+        pa.FirstSeen, pa.LastActivity, pa.NetVoteScore,
+        pa.ActivityEvents, pcr.CloseReasonName, pcr.ClosedOn
+)
+SELECT
+    bv.PostId,
+    bv.Title,
+    bv.CurrentStatus,
+    bv.ClosedOn,
+    bv.DisplayName,
+    bv.ReputationTier,
+    bv.FirstSeen,
+    bv.LastActivity,
+    bv.NetVoteScore,
+    bv.ActivityEvents,
+    bv.LinkTypes,
+    bv.TopTags,
+    RANK() OVER (ORDER BY bv.NetVoteScore DESC, bv.ActivityEvents DESC) AS ScoreRank,
+    NTILE(10) OVER (ORDER BY bv.NetVoteScore DESC) AS Decile
+FROM benchmark_view bv
+WHERE bv.PostTypeId = 1
+ORDER BY ScoreRank
+LIMIT 200;

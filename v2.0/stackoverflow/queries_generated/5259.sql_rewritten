@@ -1,0 +1,129 @@
+-- {"query": "5259.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1007} 
+WITH
+recent_top_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.OwnerUserId,
+    ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.ViewCount DESC, p.CreationDate DESC) AS rn
+  FROM Posts p
+  WHERE p.PostTypeId = 1 -- Questions
+    AND p.ClosedDate IS NULL
+    AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '90 days'
+),
+tag_stats AS (
+  SELECT
+    (regexp_split_to_array(p.Tags, '''><'''))[i] AS tag,
+    COUNT(*) AS qcount,
+    AVG(p.Score) AS avg_score,
+    SUM(p.ViewCount) AS total_views
+  FROM recent_top_questions r
+  CROSS JOIN LATERAL unnest(string_to_array(substr(r.Tags, 2, length(r.Tags)-2), '><')) WITH ORDINALITY AS t(tag, i)
+  GROUP BY tag
+),
+top_users AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.ProfileImageUrl,
+    u.AccountId,
+    COUNT(*) OVER (PARTITION BY u.Id) AS post_count
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  WHERE u.Reputation > 1000
+),
+complex_post_history AS (
+  SELECT
+    ph.PostId,
+    ph.Id AS HistoryId,
+    ph.PostHistoryTypeId,
+    ph.CreationDate,
+    ph.UserId,
+    ph.Comment,
+    ph.Text,
+    ph.RevisionGUID
+  FROM PostHistory ph
+  WHERE ph.PostHistoryTypeId IN (10, 16, 24, 33, 34, 50) -- notable history events
+),
+linked_posts AS (
+  SELECT
+    pl.PostId,
+    pl.RelatedPostId,
+    pl.LinkTypeId,
+    lt.Name AS LinkTypeName,
+    p1.Title AS PostTitle,
+    p2.Title AS RelatedPostTitle
+  FROM PostLinks pl
+  JOIN Posts p1 ON pl.PostId = p1.Id
+  JOIN Posts p2 ON pl.RelatedPostId = p2.Id
+  JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+  WHERE pl.LinkTypeId IN (1, 3) -- Linked or Duplicate
+),
+recent_votes AS (
+  SELECT
+    v.PostId,
+    v.VoteTypeId,
+    vt.Name AS VoteTypeName,
+    v.UserId,
+    v.CreationDate,
+    v.BountyAmount
+  FROM Votes v
+  JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+  WHERE v.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+)
+SELECT
+  -- Top 5 questions by score with advanced predicates and window function
+  q.PostId,
+  q.Title,
+  q.CreationDate AS QuestionCreation,
+  q.Score,
+  q.ViewCount,
+  q.OwnerUserId,
+  u.DisplayName AS OwnerDisplayName,
+  u.Reputation,
+  u.Location,
+  q.Tags,
+  -- Correlated subquery: check if the owner has any gold badges
+  (SELECT COUNT(*) FROM Badges b WHERE b.UserId = q.OwnerUserId AND b.Class = 1) AS OwnerGoldBadges,
+  -- Windowed rank within recent 90 days
+  ROW_NUMBER() OVER (ORDER BY q.Score DESC, q.ViewCount DESC) AS RankWithinRecent
+FROM
+  recent_top_questions q
+  JOIN Users u ON q.OwnerUserId = u.Id
+WHERE
+  -- Complicated predicate: ensure the question has at least 1 view and not too old
+  q.ViewCount > 0
+  AND q.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '90 days'
+  AND (SELECT COUNT(*) FROM Posts p2 WHERE p2.ParentId = q.PostId AND p2.PostTypeId = 2) > 0
+ORDER BY
+  RankWithinRecent
+LIMIT 5
+UNION ALL
+SELECT
+  -- Tag statistics snapshot for top tag by qcount in last 90 days
+  NULL::int AS PostId,
+  NULL AS Title,
+  NULL AS QuestionCreation,
+  NULL AS Score,
+  NULL AS ViewCount,
+  NULL AS OwnerUserId,
+  NULL AS OwnerDisplayName,
+  NULL AS Reputation,
+  NULL AS Location,
+  t.tag AS Tags,
+  NULL AS OwnerGoldBadges,
+  NULL AS RankWithinRecent
+FROM tag_stats t
+ORDER BY Tags
+LIMIT 5;

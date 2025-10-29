@@ -1,0 +1,114 @@
+WITH RankedPostEdits AS (
+    SELECT
+        ph.PostId,
+        ph.UserId,
+        ph.CreationDate AS EditDate,
+        ph.PostHistoryTypeId,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6)
+),
+UserReputationHistory AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        LAG(u.Reputation, 1, 0) OVER (PARTITION BY u.Id ORDER BY u.CreationDate) AS PreviousReputation
+    FROM Users u
+),
+PostEditImpact AS (
+    SELECT
+        rpe.PostId,
+        rpe.UserId,
+        rpe.EditDate,
+        CASE
+            WHEN rpe.PostHistoryTypeId = 4 THEN 'Title Edited'
+            WHEN rpe.PostHistoryTypeId = 5 THEN 'Body Edited'
+            WHEN rpe.PostHistoryTypeId = 6 THEN 'Tags Edited'
+            ELSE 'Unknown'
+        END AS EditType,
+        p.Score AS PostScore,
+        p.AnswerCount,
+        p.FavoriteCount,
+        urh.Reputation AS EditorReputation,
+        urh.PreviousReputation AS EditorPreviousReputation,
+        (urh.Reputation - urh.PreviousReputation) AS ReputationChange,
+        CAST((julianday(rpe.EditDate) - julianday(urh.UserCreationDate)) AS INTEGER) AS DaysSinceUserCreation,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+        CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN 1 ELSE 0 END AS IsCommunityOwned
+    FROM RankedPostEdits rpe
+    JOIN Posts p ON rpe.PostId = p.Id
+    JOIN UserReputationHistory urh ON rpe.UserId = urh.UserId AND rpe.EditDate >= urh.UserCreationDate
+    WHERE rpe.rn = 1 AND rpe.UserId IS NOT NULL AND urh.LastAccessDate <= rpe.EditDate
+),
+AggregatedPostInteractions AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoriteVoteCount,
+        COUNT(DISTINCT pl.RelatedPostId) FILTER (WHERE pl.LinkTypeId = 3) AS DuplicateLinkCount
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.OwnerUserId, p.CreationDate
+),
+UserPostContribution AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS QuestionCount,
+        SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS AcceptedAnswerCount,
+        COUNT(DISTINCT ph.PostId) FILTER (WHERE ph.PostHistoryTypeId IN (4, 5, 6)) AS EditedPostCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId AND p.Id = ph.PostId
+    WHERE u.Id <> -1
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+)
+SELECT
+    pe.PostId,
+    pe.UserId AS EditorUserId,
+    u.DisplayName AS EditorDisplayName,
+    pe.EditDate,
+    pe.EditType,
+    pe.PostScore,
+    pe.AnswerCount AS PostAnswerCount,
+    pe.FavoriteCount AS PostFavoriteCount,
+    pe.EditorReputation,
+    pe.ReputationChange,
+    pe.DaysSinceUserCreation,
+    pe.IsClosed,
+    pe.IsCommunityOwned,
+    COALESCE(api.CommentCount, 0) AS TotalComments,
+    COALESCE(api.UpVoteCount, 0) AS TotalUpVotes,
+    COALESCE(api.DownVoteCount, 0) AS TotalDownVotes,
+    COALESCE(api.FavoriteVoteCount, 0) AS TotalFavoriteVotes,
+    COALESCE(api.DuplicateLinkCount, 0) AS TotalDuplicateLinks,
+    upc.QuestionCount AS UserTotalQuestions,
+    upc.AcceptedAnswerCount AS UserAcceptedAnswers,
+    upc.EditedPostCount AS UserEditedPosts,
+    CAST(pe.EditorReputation * 1.0 / NULLIF(pe.EditorPreviousReputation, 0) AS DECIMAL(10, 2)) AS ReputationRatio,
+    CASE
+        WHEN pe.EditDate < DATEADD(day, -30, (SELECT MAX(CreationDate) FROM Posts)) THEN 'Older Post'
+        ELSE 'Recent Post'
+    END AS PostAgeCategory,
+    CASE
+        WHEN POSITION('<div>' IN COALESCE(p.Body, '')) > 0 THEN 'Contains Div Tag'
+        ELSE 'No Div Tag'
+    END AS BodyTagPresence
+FROM PostEditImpact pe
+JOIN Users u ON pe.UserId = u.Id
+LEFT JOIN AggregatedPostInteractions api ON pe.PostId = api.PostId
+LEFT JOIN UserPostContribution upc ON pe.UserId = upc.UserId
+LEFT JOIN Posts p ON pe.PostId = p.Id
+WHERE pe.EditorReputation > 1000
+ORDER BY pe.EditDate DESC
+LIMIT 1000;

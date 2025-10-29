@@ -1,0 +1,145 @@
+WITH RecentTopPosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.AcceptedAnswerId,
+    p.LastActivityDate,
+    p.PostTypeId,
+    COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVotes,
+    COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVotes,
+    AVG(NULLIF(v.BountyAmount, 0)) AS AvgBounty
+  FROM Posts p
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30' DAY
+  GROUP BY
+    p.Id,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.AcceptedAnswerId,
+    p.LastActivityDate,
+    p.PostTypeId
+),
+TopInfluentialAuthors AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    SUM(p.UpVotes - p.DownVotes) AS NetScore,
+    SUM(p.ViewCount) AS TotalViews,
+    COUNT(*) AS PostCount
+  FROM RecentTopPosts p
+  JOIN Users u ON u.Id = p.OwnerUserId
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+  HAVING SUM(p.UpVotes - p.DownVotes) > 0
+),
+-- Standard SQL: split tags by '><' by removing leading/trailing <> and using a recursive split
+TagChunks AS (
+  SELECT
+    p.Id AS PostId,
+    TRIM(BOTH '<>' FROM p.Tags) AS CleanTags,
+    p.ViewCount,
+    p.PostTypeId
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+RecursiveSplit AS (
+  SELECT
+    PostId,
+    CASE WHEN CleanTags = '' THEN NULL ELSE
+      CASE
+        WHEN POSITION('><' IN CleanTags) = 0 THEN CleanTags
+        ELSE SUBSTR(CleanTags, 1, POSITION('><' IN CleanTags) - 1)
+      END
+    END AS TagName,
+    CASE
+      WHEN POSITION('><' IN CleanTags) = 0 THEN '' 
+      ELSE SUBSTR(CleanTags, POSITION('><' IN CleanTags) + 2)
+    END AS Remainder,
+    ViewCount,
+    1 AS lvl
+  FROM TagChunks tc
+  UNION ALL
+  SELECT
+    rs.PostId,
+    CASE WHEN rs.Remainder = '' THEN NULL ELSE
+      CASE
+        WHEN POSITION('><' IN rs.Remainder) = 0 THEN rs.Remainder
+        ELSE SUBSTR(rs.Remainder, 1, POSITION('><' IN rs.Remainder) - 1)
+      END
+    END AS TagName,
+    CASE
+      WHEN POSITION('><' IN rs.Remainder) = 0 THEN '' 
+      ELSE SUBSTR(rs.Remainder, POSITION('><' IN rs.Remainder) + 2)
+    END AS Remainder,
+    rs.ViewCount,
+    rs.lvl + 1
+  FROM RecursiveSplit rs
+  WHERE rs.Remainder IS NOT NULL AND rs.Remainder <> ''
+),
+TagUsage AS (
+  SELECT
+    TagName,
+    COUNT(DISTINCT PostId) AS TagPosts
+  FROM RecursiveSplit
+  WHERE TagName IS NOT NULL AND TagName <> ''
+  GROUP BY TagName
+),
+TagViews AS (
+  SELECT
+    TagName,
+    SUM(ViewCount) AS TotalViews
+  FROM RecursiveSplit
+  WHERE TagName IS NOT NULL AND TagName <> ''
+  GROUP BY TagName
+),
+Competition AS (
+  SELECT
+    t.TagName,
+    t.TagPosts AS PostsWithTag,
+    COALESCE(tv.TotalViews, 0) AS UserViews
+  FROM TagUsage t
+  LEFT JOIN TagViews tv ON tv.TagName = t.TagName
+)
+SELECT
+  rp.PostId,
+  rp.Title,
+  rp.Tags,
+  rp.CreationDate,
+  rp.Score,
+  rp.ViewCount,
+  rp.OwnerUserId,
+  ru.DisplayName AS OwnerName,
+  ru.Reputation AS OwnerReputation,
+  rp.LastActivityDate,
+  rp.UpVotes,
+  rp.DownVotes,
+  rp.AvgBounty,
+  tai.UserId AS TopAuthorId,
+  tai.DisplayName AS TopAuthorName,
+  tai.NetScore AS TopAuthorNetScore,
+  tai.TotalViews AS TopAuthorTotalViews,
+  tai.PostCount AS TopAuthorPostCount,
+  comp.TagName,
+  comp.PostsWithTag,
+  comp.UserViews
+FROM RecentTopPosts rp
+LEFT JOIN TopInfluentialAuthors tai ON tai.UserId = rp.OwnerUserId
+LEFT JOIN Users ru ON rp.OwnerUserId = ru.Id
+LEFT JOIN Competition comp ON comp.TagName IN (
+  SELECT TagName FROM RecursiveSplit rs2
+  WHERE rs2.PostId = rp.PostId AND rs2.TagName IS NOT NULL AND rs2.TagName <> ''
+)
+WHERE rp.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1)
+  AND rp.ViewCount >= 100
+ORDER BY rp.LastActivityDate DESC
+LIMIT 100;

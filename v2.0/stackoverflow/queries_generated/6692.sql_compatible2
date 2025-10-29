@@ -1,0 +1,37 @@
+SELECT 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN pt.Name = 'Question' THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN pt.Name = 'Answer' THEN 1 ELSE 0 END) AS TotalAnswers,
+    SUM(CASE WHEN p.Score > 0 THEN 1 ELSE 0 END) AS TotalPositiveScorePosts,
+    MAX(p.LastActivityDate) AS LastActivePost,
+    MAX(CASE WHEN p.ClosedDate IS NOT NULL THEN p.ClosedDate ELSE p.LastActivityDate END) AS LastClosedOrActivePost,
+    COUNT(DISTINCT v.PostId) AS TotalVotes,
+    AVG(p.Score) AS AvgPostScore,
+    STRING_AGG(DISTINCT t.TagName, ', ') AS PopularTags,
+    ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY MAX(p.LastActivityDate) DESC) AS LastActivePostRank
+FROM 
+    Users u
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    PostTypes pt ON p.PostTypeId = pt.Id
+LEFT JOIN 
+    Tags t ON p.Id = t.ExcerptPostId OR p.Id = t.WikiPostId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+WHERE 
+    u.Reputation > 100
+    AND (p.LastActivityDate IS NULL OR p.LastActivityDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '12' MONTH))
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation
+HAVING 
+    COUNT(DISTINCT p.Id) > 10
+ORDER BY 
+    AvgPostScore DESC, 
+    TotalPositiveScorePosts DESC
+LIMIT 100;

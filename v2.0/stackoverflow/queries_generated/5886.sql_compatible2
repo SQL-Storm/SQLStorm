@@ -1,0 +1,147 @@
+WITH
+  recent_users AS (
+    SELECT
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate,
+      u.LastAccessDate
+    FROM Users u
+    WHERE u.Reputation > 1000
+  ),
+  top_posts AS (
+    SELECT
+      p.Id AS PostId,
+      p.Title,
+      p.CreationDate,
+      p.Score,
+      p.ViewCount,
+      p.OwnerUserId,
+      p.Tags,
+      p.PostTypeId,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      p.LastActivityDate
+    FROM Posts p
+    WHERE p.PostTypeId = 1 -- Questions
+      AND p.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '180' DAY)
+      AND p.ViewCount > 0
+  ),
+  last_edits AS (
+    SELECT
+      ph.PostId,
+      ph.Id AS RevisionId,
+      ph.CreationDate AS RevisionDate,
+      ph.PostHistoryTypeId,
+      ph.UserId,
+      ph.UserDisplayName,
+      ph.Comment
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4,5,6,10,16,50) -- some common edit/notice types
+  ),
+  linked_counts AS (
+    SELECT
+      pl.PostId,
+      COUNT(*) AS LinkedCount
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 1 -- Linked
+    GROUP BY pl.PostId
+  ),
+  badge_counts AS (
+    SELECT
+      b.UserId,
+      COUNT(*) AS BadgeCount
+    FROM Badges b
+    WHERE b.Date >= (CAST('2024-10-01' AS DATE) - INTERVAL '365' DAY)
+    GROUP BY b.UserId
+  ),
+  vote_agg AS (
+    SELECT
+      v.PostId,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+      SUM(CASE WHEN v.VoteTypeId = 8 THEN 1 ELSE 0 END) AS BountyStarts,
+      SUM(CASE WHEN v.VoteTypeId = 9 THEN 1 ELSE 0 END) AS BountyCloses
+    FROM Votes v
+    GROUP BY v.PostId
+  )
+SELECT
+  rp.DisplayName AS AskedBy,
+  rp.Reputation AS AskedByRep,
+  rp.LastAccessDate AS AskedByLastAccess,
+  tp.PostId,
+  tp.Title,
+  tp.CreationDate AS QuestionDate,
+  tp.Score,
+  tp.ViewCount,
+  tc.LinkedCount,
+  bc.BadgeCount,
+  va.UpVotes,
+  va.DownVotes,
+  va.BountyStarts,
+  va.BountyCloses,
+  ne.RevisionDate AS LastEditDate,
+  ne.PostHistoryTypeId AS LastEditType,
+  ne.UserDisplayName AS LastEditorName,
+  ne.Comment AS EditComment,
+  CAST(STRFTIME('%Y-%m-%d %H:%M:%S', tp.LastActivityDate) AS TEXT) AS LastActivity,
+  tag_unnest.Tag
+FROM top_posts tp
+LEFT JOIN Users rp ON tp.OwnerUserId = rp.Id
+LEFT JOIN linked_counts tc ON tp.PostId = tc.PostId
+LEFT JOIN badge_counts bc ON rp.Id = bc.UserId
+LEFT JOIN vote_agg va ON tp.PostId = va.PostId
+LEFT JOIN last_edits ne ON tp.PostId = ne.PostId
+CROSS JOIN LATERAL (
+  SELECT value AS Tag
+  FROM (
+    WITH RECURSIVE split(src, rest, value) AS (
+      SELECT tp.Tags AS src,
+             tp.Tags AS rest,
+             CAST(NULL AS VARCHAR) AS value
+      UNION ALL
+      SELECT src,
+             CASE
+               WHEN POSITION('<>' IN rest) > 0 THEN SUBSTRING(rest FROM POSITION('<>' IN rest) + 2)
+               WHEN rest IS NOT NULL THEN ''
+               ELSE ''
+             END,
+             CASE
+               WHEN POSITION('<>' IN rest) > 0 THEN SUBSTRING(rest FROM 1 FOR POSITION('<>' IN rest) - 1)
+               ELSE rest
+             END
+      FROM split
+      WHERE rest IS NOT NULL AND rest <> ''
+    )
+    SELECT value FROM split WHERE value IS NOT NULL
+  )
+) AS tag_unnest
+WHERE
+  (rp.Reputation > 0 OR rp.Id IS NULL)
+  AND tp.Tags IS NOT NULL
+GROUP BY
+  rp.DisplayName,
+  rp.Reputation,
+  rp.LastAccessDate,
+  tp.PostId,
+  tp.Title,
+  tp.CreationDate,
+  tp.Score,
+  tp.ViewCount,
+  tc.LinkedCount,
+  bc.BadgeCount,
+  va.UpVotes,
+  va.DownVotes,
+  va.BountyStarts,
+  va.BountyCloses,
+  ne.RevisionDate,
+  ne.PostHistoryTypeId,
+  ne.UserDisplayName,
+  ne.Comment,
+  tp.LastActivityDate,
+  tag_unnest.Tag
+ORDER BY
+  tp.CreationDate DESC,
+  va.UpVotes DESC
+LIMIT 100;

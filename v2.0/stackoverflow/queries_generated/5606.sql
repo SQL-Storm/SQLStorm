@@ -1,0 +1,81 @@
+-- {"query": "5606.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 670} 
+WITH
+TopContribs AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName AS UserName,
+    u.Reputation,
+    COUNT(*) AS PostCount,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS TotalQuestionScore,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS TotalAnswerScore,
+    MAX(p.CreationDate) AS LastPostDate
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+ActiveUsers AS (
+  SELECT
+    tc.UserId,
+    tc.UserName,
+    tc.Reputation,
+    tc.PostCount,
+    tc.TotalQuestionScore,
+    tc.TotalAnswerScore,
+    tc.LastPostDate,
+    ROW_NUMBER() OVER (ORDER BY tc.Reputation DESC, tc.TotalQuestionScore DESC, tc.LastPostDate DESC) AS rn
+  FROM TopContribs tc
+  WHERE tc.PostCount > 0
+),
+RecentActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName AS UserName,
+    COUNT(p.Id) AS PostTodayCount
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  AND p.CreationDate >= current_date
+  GROUP BY u.Id, u.DisplayName
+),
+BadgeActivity AS (
+  SELECT
+    b.UserId,
+    COUNT(*) AS BadgesEarned
+  FROM Badges b
+  GROUP BY b.UserId
+),
+Voices AS (
+  SELECT
+    v.UserId,
+    COUNT(*) AS VotesCast
+  FROM Votes v
+  GROUP BY v.UserId
+)
+SELECT
+  au.UserName,
+  au.Reputation,
+  au.PostCount,
+  au.TotalQuestionScore,
+  au.TotalAnswerScore,
+  au.LastPostDate,
+  ra.PostTodayCount,
+  ba.BadgesEarned,
+  va.VotesCast,
+  -- multi-join of latest 5 posts by each top user to exercise various constructs
+  (SELECT STRING_AGG(CONCAT('Post ', p.Id, ': ', p.Title), ' | ')
+     FROM Posts p
+     WHERE p.OwnerUserId = au.UserId
+     ORDER BY p.CreationDate DESC
+     LIMIT 5) AS LatestPostsSummary,
+  -- correlate to last 5 post history events for those posts
+  (SELECT STRING_AGG(CONCAT('PH', ph.Id, '(', ph.PostHistoryTypeId, '):', ph.Text), ' | ')
+     FROM PostHistory ph
+     JOIN Posts p ON p.Id = ph.PostId
+     WHERE p.OwnerUserId = au.UserId
+     ORDER BY ph.CreationDate DESC
+     LIMIT 5) AS RecentPostHistory
+FROM ActiveUsers au
+LEFT JOIN RecentActivity ra ON ra.UserId = au.UserId
+LEFT JOIN BadgeActivity ba ON ba.UserId = au.UserId
+LEFT JOIN Voices va ON va.UserId = au.UserId
+WHERE au.rn <= 100
+ORDER BY au.Reputation DESC, au.TotalQuestionScore DESC, au.LastPostDate DESC;

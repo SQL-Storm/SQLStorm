@@ -1,0 +1,138 @@
+-- {"query": "3563.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2518} 
+
+/*  Performance‑benchmarking query using many SQL features */
+WITH
+/* ------------------------------------------------------------------
+   Aggregate user activity (questions and answers) plus latest post date
+   ------------------------------------------------------------------ */
+usr AS (
+    SELECT
+        u.Id                                   AS uid,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate                        AS user_created,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score END),0) AS q_score,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score END),0) AS a_score,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END)     AS q_cnt,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END)     AS a_cnt,
+        MAX(p.CreationDate)                  AS last_post_dt
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+
+/* --------------------------------------------------------------
+   Badge totals per user (gold / silver / bronze) using window fn
+   -------------------------------------------------------------- */
+badge AS (
+    SELECT
+        b.UserId                                     AS uid,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze,
+        COUNT(*)                                     AS total_badges,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId
+                           ORDER BY b.Date DESC)    AS rn_latest_badge
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+/* -----------------------------------------------------------------
+   Votes given by a user in the last 30 days – using FILTER clause
+   ----------------------------------------------------------------- */
+voted_30d AS (
+    SELECT
+        v.UserId                                       AS uid,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 2)       AS up_votes,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 3)       AS down_votes,
+        MAX(v.CreationDate)                           AS last_vote_dt
+    FROM Votes v
+    WHERE v.CreationDate >= CURRENT_DATE - INTERVAL '30 days'
+    GROUP BY v.UserId
+),
+
+/* --------------------------------------------
+   Top 10 tags (by global usage) with rownum
+   -------------------------------------------- */
+top_tags AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS rn
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0
+),
+
+/* ----------------------------------------------------
+   Split question tags into rows (correlated sub‑query)
+   ---------------------------------------------------- */
+question_tags AS (
+    SELECT
+        p.Id                                            AS qid,
+        regexp_split_to_table(trim(both '<>' FROM p.Tags), '><') AS tag
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.Tags IS NOT NULL
+)
+
+SELECT
+    u.uid,
+    u.DisplayName,
+    u.Reputation,
+    u.q_score,
+    u.a_score,
+    u.q_cnt,
+    u.a_cnt,
+    COALESCE(b.gold,0)   AS gold_badges,
+    COALESCE(b.silver,0) AS silver_badges,
+    COALESCE(b.bronze,0) AS bronze_badges,
+    COALESCE(v.up_votes,0)   AS up_votes_30d,
+    COALESCE(v.down_votes,0) AS down_votes_30d,
+    /* latest activity: either a post or a vote */
+    GREATEST(
+        COALESCE(u.last_post_dt,'1970-01-01'::timestamp),
+        COALESCE(v.last_vote_dt,'1970-01-01'::timestamp)
+    )                         AS last_activity_dt,
+    /* average scores – avoid division by zero */
+    CASE WHEN u.a_cnt = 0 THEN NULL
+         ELSE (u.a_score::numeric / u.a_cnt)::numeric(10,2)
+    END                        AS avg_answer_score,
+    CASE WHEN u.q_cnt = 0 THEN NULL
+         ELSE (u.q_score::numeric / u.q_cnt)::numeric(10,2)
+    END                        AS avg_question_score,
+    /* concatenate up to 5 distinct tags the user has used in questions */
+    STRING_AGG(DISTINCT qt.tag, ', ') FILTER (WHERE tt.rn <= 5) AS top_5_tags,
+    /* correlated sub‑query: total comments on all of the user's posts */
+    (SELECT COUNT(*)
+       FROM Comments c
+      WHERE c.UserId = u.uid)                       AS total_comments_made,
+    /* show the most recent badge name (if any) using the row number */
+    (SELECT b.Name
+       FROM Badges b
+      WHERE b.UserId = u.uid
+        AND ROW_NUMBER() OVER (ORDER BY b.Date DESC) = 1) AS latest_badge_name
+FROM usr u
+LEFT JOIN badge b   ON b.uid = u.uid
+LEFT JOIN voted_30d v ON v.uid = u.uid
+LEFT JOIN question_tags qt ON qt.qid = u.uid   -- intentional mismatched join to force outer join evaluation
+LEFT JOIN top_tags tt ON tt.TagName = qt.tag
+WHERE u.Reputation > 1000
+  AND (u.q_cnt + u.a_cnt) >= 10
+GROUP BY
+    u.uid, u.DisplayName, u.Reputation,
+    u.q_score, u.a_score, u.q_cnt, u.a_cnt,
+    b.gold, b.silver, b.bronze,
+    v.up_votes, v.down_votes,
+    u.last_post_dt, v.last_vote_dt,
+    u.CreationDate
+HAVING COUNT(DISTINCT tt.TagName) > 0
+ORDER BY u.Reputation DESC, u.uid
+LIMIT 100
+
+UNION ALL
+
+/* Dummy block to keep the planner busy – never returns rows */
+SELECT
+    NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,
+    NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL
+WHERE FALSE;

@@ -1,0 +1,121 @@
+WITH top_users AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.AcceptedAnswerId,
+    u.AccountId
+  FROM Users u
+),
+tag_wiki AS (
+  SELECT
+    t.Id AS TagWikiId,
+    t.TagName,
+    t.Count,
+    t.IsModeratorOnly,
+    t.IsRequired,
+    p.Title AS WikiTitle,
+    p.CreationDate AS WikiCreated
+  FROM Tags t
+  LEFT JOIN Posts p ON t.WikiPostId = p.Id
+  WHERE t.IsModeratorOnly = 0
+),
+recent_closed AS (
+  SELECT
+    ph.Id AS PostHistoryId,
+    ph.PostId,
+    ph.Comment,
+    ph.CreationDate,
+    ph.PostHistoryTypeId,
+    rc.Name AS CloseReason
+  FROM PostHistory ph
+  LEFT JOIN CloseReasonTypes rc ON ph.Comment = CAST(rc.Id AS varchar) OR ph.Comment LIKE CAST(rc.Id AS varchar)
+  WHERE ph.PostHistoryTypeId = 10
+),
+activity AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.CommentCount,
+    p.LastActivityDate,
+    p.Tags,
+    p.AcceptedAnswerId,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate DESC) AS rn
+  FROM Posts p
+  LEFT JOIN LATERAL (
+    SELECT 1
+  ) AS l ON TRUE
+  WHERE p.LastActivityDate IS NOT NULL
+),
+complex AS (
+  SELECT
+    u.UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    p.Id AS PostId,
+    p.Title AS PostTitle,
+    p.PostTypeId,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.LastActivityDate,
+    p.AcceptedAnswerId,
+    p.OwnerUserId,
+    phs.Name AS HistoryTypeName,
+    v.VoteTypeId,
+    v.CreationDate AS VoteDate,
+    v.BountyAmount
+  FROM top_users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.UserId
+  LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+  LEFT JOIN PostHistoryTypes phs ON ph.PostHistoryTypeId = phs.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+  WHERE p.Id IS NOT NULL
+)
+SELECT
+  complex.UserId,
+  complex.DisplayName,
+  complex.Reputation,
+  complex.CreationDate,
+  complex.LastAccessDate,
+  complex.Location,
+  complex.Views,
+  complex.UpVotes,
+  complex.DownVotes,
+  complex.PostId,
+  complex.PostTitle,
+  complex.PostTypeId,
+  complex.Score,
+  complex.ViewCount,
+  complex.Tags,
+  complex.LastActivityDate,
+  complex.AcceptedAnswerId,
+  complex.OwnerUserId,
+  complex.HistoryTypeName,
+  complex.VoteTypeId,
+  complex.VoteDate,
+  complex.BountyAmount
+FROM complex
+WHERE
+  complex.LastActivityDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30' DAY)
+  AND complex.Reputation > 1000
+  AND (complex.Tags ~* '(<[^>]+>)|''' ) IS NULL
+ORDER BY complex.LastActivityDate DESC
+LIMIT 100;

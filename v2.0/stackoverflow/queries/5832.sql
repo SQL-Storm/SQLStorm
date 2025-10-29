@@ -1,0 +1,118 @@
+WITH ranked_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.ViewCount,
+    p.Score,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.ContentLicense,
+    u.Reputation,
+    u.DisplayName AS OwnerDisplayName,
+    u.Location,
+    u.UpVotes,
+    u.DownVotes,
+    u.AccountId,
+    CASE WHEN EXISTS (SELECT 1 FROM Posts a WHERE a.ParentId = p.Id) THEN TRUE ELSE FALSE END AS HasChildren
+  FROM Posts p
+  JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId = 1 -- Questions
+    AND p.ClosedDate IS NULL
+),
+recent_activity AS (
+  SELECT
+    rp.PostId,
+    rp.OwnerUserId,
+    rp.Title,
+    rp.CreationDate,
+    rp.LastActivityDate,
+    ROW_NUMBER() OVER (
+      PARTITION BY rp.OwnerUserId
+      ORDER BY rp.LastActivityDate DESC
+    ) AS rn_by_owner
+  FROM ranked_questions rp
+),
+tag_stats AS (
+  SELECT
+    t.tagname AS TagName,
+    COUNT(*) AS tag_count,
+    AVG(p.Score) AS avg_score
+  FROM Posts p,
+    UNNEST(string_to_array(substr(p.Tags, 2, length(p.Tags) - 2), '><')) AS t(tagname)
+  WHERE p.PostTypeId = 1
+  GROUP BY t.tagname
+),
+complex_aggregation AS (
+  SELECT
+    rq.PostId,
+    rq.Title,
+    rq.OwnerUserId,
+    rq.Reputation,
+    rq.LastActivityDate,
+    rq.ViewCount,
+    rq.Score,
+    rq.CommentCount,
+    rq.AnswerCount,
+    rq.FavoriteCount,
+    rq.Location,
+    rq.AccountId,
+    rr.rn_by_owner,
+    t.tag_name,
+    ts.tag_count,
+    ts.avg_score,
+    rq.OwnerDisplayName
+  FROM recent_activity rr
+  JOIN ranked_questions rq ON rr.PostId = rq.PostId
+  LEFT JOIN (
+    SELECT
+      Id AS PostId,
+      UNNEST(string_to_array(substr(Tags, 2, length(Tags) - 2), '><')) AS tag_name
+    FROM Posts
+    WHERE PostTypeId = 1
+  ) t ON t.PostId = rq.PostId
+  LEFT JOIN tag_stats ts ON ts.TagName = t.tag_name
+  WHERE rr.rn_by_owner = 1
+    AND rq.ViewCount > 0
+),
+final_output AS (
+  SELECT
+    ca.PostId,
+    ca.Title,
+    ca.OwnerUserId,
+    ca.Reputation,
+    ca.OwnerDisplayName,
+    ca.LastActivityDate,
+    ca.ViewCount,
+    ca.Score,
+    ca.CommentCount,
+    ca.AnswerCount,
+    ca.FavoriteCount,
+    ca.Location,
+    ca.AccountId,
+    ca.rn_by_owner,
+    ca.tag_name,
+    ca.tag_count,
+    ca.avg_score,
+    CASE
+      WHEN ca.Score > 0 AND ca.ViewCount > 100 THEN 'Hot'
+      WHEN ca.Reputation > 10000 THEN 'HighRep'
+      ELSE 'Standard'
+    END AS category,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = ca.PostId AND v.VoteTypeId = 2) AS UpModCount,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = ca.PostId AND v.VoteTypeId = 3) AS DownModCount,
+    (SELECT STRING_AGG(vt.Name || ':' || COALESCE(CAST(v.BountyAmount AS VARCHAR), ''), '|')
+       FROM Votes v
+       JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+       WHERE v.PostId = ca.PostId AND v.VoteTypeId IN (8,9)
+    ) AS BountyHistory
+  FROM complex_aggregation ca
+)
+SELECT *
+FROM final_output
+ORDER BY category, LastActivityDate DESC
+LIMIT 200;

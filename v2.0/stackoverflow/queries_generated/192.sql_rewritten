@@ -1,0 +1,312 @@
+-- {"query": "192.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3109} 
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        u.location,
+        coalesce(nullif(trim(u.websiteurl), ''), 'unknown') as websiteurl,
+        row_number() over (order by u.creationdate desc, u.id desc) as rn
+    from users u
+    where u.creationdate >= (select date_trunc('year', max(creationdate)) - interval '3 years' from users)
+),
+active_questions as (
+    select
+        p.id as question_id,
+        p.owneruserid as owner_id,
+        p.creationdate as q_created,
+        p.score as q_score,
+        p.viewcount,
+        p.title,
+        p.tags,
+        p.acceptedanswerid,
+        p.closeddate,
+        p.commentcount,
+        p.favoritecount,
+        p.lastactivitydate,
+        case when p.closeddate is not null then 1 else 0 end as is_closed
+    from posts p
+    where p.posttypeid = 1
+      and p.creationdate >= (select date_trunc('year', max(creationdate)) - interval '5 years' from posts)
+),
+answers as (
+    select
+        a.id as answer_id,
+        a.parentid as question_id,
+        a.owneruserid as answer_owner_id,
+        a.creationdate as a_created,
+        a.score as a_score,
+        a.commentcount as a_commentcount
+    from posts a
+    where a.posttypeid = 2
+),
+answer_stats as (
+    select
+        q.question_id,
+        count(*) as answer_count,
+        sum(case when a.a_score > 0 then 1 else 0 end) as pos_answers,
+        max(a.a_score) as max_answer_score,
+        min(a.a_score) as min_answer_score,
+        avg(a.a_score) as avg_answer_score,
+        count(distinct a.answer_owner_id) as distinct_answerers,
+        max(a.a_created) as last_answer_time
+    from active_questions q
+    left join answers a on a.question_id = q.question_id
+    group by q.question_id
+),
+question_activity as (
+    select
+        q.question_id,
+        count(c.id) filter (where c.id is not null) as comment_count,
+        sum(coalesce(c.score,0)) as comment_score_sum,
+        count(v.id) filter (where v.votetypeid = 2) as upvotes,
+        count(v.id) filter (where v.votetypeid = 3) as downvotes,
+        count(v.id) filter (where v.votetypeid = 5) as favorites_legacy,
+        count(v.id) as total_votes
+    from active_questions q
+    left join comments c on c.postid = q.question_id
+    left join votes v on v.postid = q.question_id
+    group by q.question_id
+),
+tag_exploded as (
+    select
+        q.question_id,
+        lower(trim(t)) as tag
+    from active_questions q
+    cross join lateral unnest(string_to_array(substring(q.tags, 2, length(q.tags)-2), '><')) as t
+),
+tag_rank as (
+    select
+        te.question_id,
+        te.tag,
+        dense_rank() over (partition by te.question_id order by (select count(*) from tags tg where lower(tg.tagname)=te.tag) desc nulls last, te.tag) as tag_popularity_rank
+    from tag_exploded te
+),
+question_top_tag as (
+    select te.question_id, min(te.tag) filter (where tr.tag_popularity_rank = 1) as top_tag
+    from tag_exploded te
+    join tag_rank tr on tr.question_id = te.question_id and tr.tag = te.tag
+    group by te.question_id
+),
+dupe_links as (
+    select
+        pl.postid as dup_post_id,
+        pl.relatedpostid as original_post_id,
+        pl.creationdate as link_created
+    from postlinks pl
+    where pl.linktypeid = 3
+),
+posthistory_closures as (
+    select
+        ph.postid as question_id,
+        min(ph.creationdate) as first_close_date,
+        max(ph.creationdate) as last_close_date,
+        max(case when ph.posthistorytypeid = 11 then 1 else 0 end) as was_reopened
+    from posthistory ph
+    where ph.posthistorytypeid in (10,11)
+    group by ph.postid
+),
+owner_badges as (
+    select
+        u.id as user_id,
+        count(*) as badge_count,
+        sum(case when b.class = 1 then 1 else 0 end) as gold,
+        sum(case when b.class = 2 then 1 else 0 end) as silver,
+        sum(case when b.class = 3 then 1 else 0 end) as bronze,
+        max(b.date) as last_badge_date
+    from users u
+    left join badges b on b.userid = u.id
+    group by u.id
+),
+question_owner as (
+    select
+        q.question_id,
+        u.id as owner_user_id,
+        u.displayname as owner_name,
+        u.reputation as owner_rep,
+        ob.badge_count,
+        ob.gold, ob.silver, ob.bronze,
+        u.creationdate as owner_created,
+        u.location as owner_location
+    from active_questions q
+    left join users u on u.id = q.owner_id
+    left join owner_badges ob on ob.user_id = u.id
+),
+accepted_vs_top as (
+    select
+        q.question_id,
+        q.acceptedanswerid,
+        max(a.a_score) as top_answer_score,
+        max(a.answer_id) filter (where a.a_score = (select max(a2.a_score) from answers a2 where a2.question_id = q.question_id)) as top_answer_id,
+        case
+            when q.acceptedanswerid is null then null
+            when q.acceptedanswerid = any(array(
+                select a3.answer_id from answers a3 where a3.question_id = q.question_id and a3.a_score = (
+                    select max(a4.a_score) from answers a4 where a4.question_id = q.question_id
+                )
+            )) then 1 else 0
+        end as accepted_is_top
+    from active_questions q
+    left join answers a on a.question_id = q.question_id
+    group by q.question_id, q.acceptedanswerid
+),
+owner_recent_comment as (
+    select distinct on (q.question_id)
+        q.question_id,
+        c.id as comment_id,
+        c.creationdate as comment_date,
+        c.score as comment_score,
+        c.text as comment_text
+    from active_questions q
+    left join comments c
+      on c.postid = q.question_id
+     and c.userid = q.owner_id
+    order by q.question_id, c.creationdate desc nulls last
+),
+question_quality as (
+    select
+        q.question_id,
+        (qa.upvotes - qa.downvotes) as net_votes,
+        greatest(coalesce(asx.answer_count,0),0) as answer_count,
+        case when q.is_closed = 1 then 0
+             when qa.upvotes - qa.downvotes >= 5 and coalesce(asx.answer_count,0) >= 2 then 3
+             when qa.upvotes - qa.downvotes >= 1 and coalesce(asx.answer_count,0) >= 1 then 2
+             when qa.upvotes - qa.downvotes < 0 then -1
+             else 1 end as quality_bucket
+    from active_questions q
+    join question_activity qa on qa.question_id = q.question_id
+    left join answer_stats asx on asx.question_id = q.question_id
+),
+time_bins as (
+    select
+        q.question_id,
+        case
+            when q.q_created >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days' then '30d'
+            when q.q_created >= cast('2024-10-01 12:34:56' as timestamp) - interval '90 days' then '90d'
+            when q.q_created >= cast('2024-10-01 12:34:56' as timestamp) - interval '1 year' then '1y'
+            else 'older'
+        end as age_bin
+    from active_questions q
+),
+user_engagement as (
+    select
+        coalesce(qo.owner_user_id, -1) as user_id,
+        count(*) as questions_asked,
+        sum(qa.upvotes) as upvotes_on_questions,
+        sum(qa.downvotes) as downvotes_on_questions,
+        sum(coalesce(asx.answer_count,0)) as total_answers_received,
+        sum(case when q.is_closed = 1 then 1 else 0 end) as closed_questions,
+        avg(extract(epoch from (q.lastactivitydate - q.q_created)) / 3600.0) as avg_hours_to_last_activity
+    from active_questions q
+    join question_activity qa on qa.question_id = q.question_id
+    left join answer_stats asx on asx.question_id = q.question_id
+    left join question_owner qo on qo.question_id = q.question_id
+    group by coalesce(qo.owner_user_id, -1)
+),
+cross_user_recent as (
+    select
+        ru.user_id,
+        ru.displayname,
+        ue.questions_asked,
+        ue.total_answers_received,
+        row_number() over (order by ue.total_answers_received desc nulls last, ue.questions_asked desc nulls last, ru.user_id) as activity_rank
+    from recent_users ru
+    left join user_engagement ue on ue.user_id = ru.user_id
+),
+top_recent_users as (
+    select * from cross_user_recent where activity_rank <= 100
+),
+final_scores as (
+    select
+        q.question_id,
+        qo.owner_user_id,
+        qa.total_votes,
+        asx.answer_count,
+        coalesce(asx.avg_answer_score,0) as avg_answer_score,
+        coalesce(asx.max_answer_score,0) as max_answer_score,
+        qq.quality_bucket,
+        case when av.accepted_is_top = 1 then 1 else 0 end as accepted_is_top,
+        case when dl.original_post_id is not null then 1 else 0 end as is_marked_duplicate,
+        case when ph.was_reopened = 1 then 1 else 0 end as was_reopened,
+        coalesce(ph.first_close_date, q.closeddate) as first_close_date,
+        qt.top_tag,
+        tb.age_bin,
+        greatest(1, qa.total_votes + coalesce(asx.answer_count,0)) as engagement_denominator,
+        (qa.upvotes - qa.downvotes) + coalesce(asx.pos_answers,0) * 0.5 as raw_signal
+    from active_questions q
+    left join question_activity qa on qa.question_id = q.question_id
+    left join answer_stats asx on asx.question_id = q.question_id
+    left join accepted_vs_top av on av.question_id = q.question_id
+    left join dupe_links dl on dl.dup_post_id = q.question_id
+    left join posthistory_closures ph on ph.question_id = q.question_id
+    left join question_top_tag qt on qt.question_id = q.question_id
+    left join time_bins tb on tb.question_id = q.question_id
+    left join question_owner qo on qo.question_id = q.question_id
+),
+ranked as (
+    select
+        f.*,
+        (f.raw_signal::numeric / f.engagement_denominator) +
+        case when f.accepted_is_top = 1 then 0.75 else 0 end +
+        case when f.is_marked_duplicate = 1 then -1.0 else 0 end +
+        case when f.was_reopened = 1 then 0.25 else 0 end +
+        case when f.age_bin = '30d' then 0.3 when f.age_bin = '90d' then 0.1 else 0 end +
+        case when f.top_tag in ('sql','postgresql','mysql','sqlite') then 0.2 else 0 end as score,
+        row_number() over (
+            partition by coalesce(f.top_tag, 'untagged')
+            order by
+                ((f.raw_signal::numeric / f.engagement_denominator)
+                + case when f.accepted_is_top = 1 then 0.75 else 0 end
+                + case when f.is_marked_duplicate = 1 then -1.0 else 0 end
+                + case when f.was_reopened = 1 then 0.25 else 0 end
+                + case when f.age_bin = '30d' then 0.3 when f.age_bin = '90d' then 0.1 else 0 end
+                + case when f.top_tag in ('sql','postgresql','mysql','sqlite') then 0.2 else 0 end
+            ) desc,
+            q.question_id
+        ) as tag_rank
+    from final_scores f
+    join active_questions q on q.question_id = f.question_id
+),
+tag_leaders as (
+    select
+        r.*
+    from ranked r
+    where r.tag_rank <= 5
+),
+owner_stringified as (
+    select
+        tl.question_id,
+        coalesce(qo.owner_name, '[unknown]') || ' (#' || coalesce(qo.owner_user_id::text,'-') || ')' as owner_label,
+        coalesce(qo.owner_rep,0) as owner_rep
+    from tag_leaders tl
+    left join question_owner qo on qo.question_id = tl.question_id
+)
+select
+    tl.question_id,
+    left(coalesce(aq.title,'[no title]'), 120) as title_snippet,
+    os.owner_label,
+    tl.top_tag,
+    tl.age_bin,
+    tl.answer_count,
+    tl.avg_answer_score,
+    tl.max_answer_score,
+    tl.total_votes,
+    tl.accepted_is_top,
+    tl.is_marked_duplicate,
+    tl.was_reopened,
+    tl.first_close_date,
+    tl.score,
+    row_number() over (order by tl.score desc, tl.total_votes desc, tl.answer_count desc, tl.question_id) as global_rank
+from tag_leaders tl
+join active_questions aq on aq.question_id = tl.question_id
+left join owner_stringified os on os.question_id = tl.question_id
+where
+    (
+        tl.accepted_is_top = 1
+        or (tl.answer_count >= 3 and tl.avg_answer_score >= 1)
+        or (tl.total_votes >= 10 and tl.is_marked_duplicate = 0)
+    )
+  and coalesce(tl.top_tag, '') not ilike any (array['%regex%','%homework%'])
+order by tl.score desc, tl.total_votes desc, tl.answer_count desc, tl.question_id
+limit 500;

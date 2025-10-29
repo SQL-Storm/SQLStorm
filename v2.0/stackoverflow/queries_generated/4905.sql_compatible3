@@ -1,0 +1,132 @@
+WITH RECURSIVE TagHierarchy AS (
+    SELECT
+        t.Id AS TagId,
+        t.TagName,
+        t.Id AS RootTagId,
+        0 AS Level
+    FROM Tags t
+    WHERE t.TagName IN ('sql', 'performance', 'optimization', 'query')
+
+    UNION ALL
+
+    SELECT
+        t.Id AS TagId,
+        t.TagName,
+        th.RootTagId,
+        th.Level + 1
+    FROM Tags t
+    JOIN PostLinks pl ON t.Id = pl.RelatedPostId
+    JOIN TagHierarchy th ON pl.PostId = th.TagId
+    WHERE th.Level < 3
+),
+QuestionDetails AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        u.DisplayName AS OwnerDisplayName,
+        COALESCE(p.OwnerUserId, -1) AS OwnerUserId,
+        COUNT(DISTINCT c.Id) AS CommentCountTotal,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        AVG(p_answers.Score) AS AvgAnswerScore,
+        MAX(p_answers.Score) AS MaxAnswerScore,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 1 THEN 1 ELSE 0 END) AS TitleEdits,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 5 THEN 1 ELSE 0 END) AS BodyEdits
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (2, 3)
+    LEFT JOIN Posts p_answers ON p.Id = p_answers.ParentId
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId IN (1, 5)
+    WHERE p.PostTypeId = 1 AND p.Score > 10 AND p.CreationDate > DATE '2023-01-01'
+    GROUP BY p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, u.DisplayName, p.OwnerUserId
+),
+RankedAnswers AS (
+    SELECT
+        p.Id AS AnswerId,
+        p.ParentId AS QuestionId,
+        p.Score,
+        p.CreationDate,
+        ROW_NUMBER() OVER(PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS RankByScore,
+        RANK() OVER(PARTITION BY p.ParentId ORDER BY p.CreationDate ASC) AS RankByDate
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+),
+FeaturedQuestions AS (
+    SELECT
+        th.RootTagId,
+        qd.PostId,
+        qd.Title,
+        qd.Score,
+        qd.ViewCount,
+        qd.FavoriteCount,
+        qd.OwnerDisplayName,
+        qd.UpVotes,
+        qd.DownVotes,
+        qd.AvgAnswerScore,
+        qd.MaxAnswerScore,
+        qd.TitleEdits,
+        qd.BodyEdits,
+        (qd.Score + qd.ViewCount + qd.FavoriteCount * 10) AS CompositeScore,
+        SUM(ra.Score) AS TotalAnswerScore,
+        MAX(ra.RankByScore) AS MaxAnswerRank,
+        MIN(ra.RankByDate) AS MinAnswerRankDate
+    FROM QuestionDetails qd
+    JOIN PostLinks pl ON qd.PostId = pl.PostId
+    JOIN Tags t ON pl.RelatedPostId = t.Id
+    JOIN TagHierarchy th ON t.Id = th.TagId
+    LEFT JOIN RankedAnswers ra ON qd.PostId = ra.QuestionId
+    GROUP BY th.RootTagId,
+             qd.PostId,
+             qd.Title,
+             qd.Score,
+             qd.ViewCount,
+             qd.FavoriteCount,
+             qd.OwnerDisplayName,
+             qd.UpVotes,
+             qd.DownVotes,
+             qd.AvgAnswerScore,
+             qd.MaxAnswerScore,
+             qd.TitleEdits,
+             qd.BodyEdits
+    HAVING COUNT(DISTINCT t.TagName) >= 2
+)
+SELECT
+    fq.Title AS QuestionTitle,
+    fq.OwnerDisplayName,
+    fq.Score AS QuestionScore,
+    fq.ViewCount AS QuestionViewCount,
+    fq.UpVotes AS QuestionUpVotes,
+    fq.DownVotes AS QuestionDownVotes,
+    fq.CompositeScore,
+    fq.TotalAnswerScore,
+    fq.MaxAnswerRank,
+    fq.MinAnswerRankDate,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = fq.PostId AND c.Score > 5) AS HighScoreComments,
+    CASE
+        WHEN fq.AvgAnswerScore > 15 THEN 'Excellent'
+        WHEN fq.AvgAnswerScore > 5 THEN 'Good'
+        ELSE 'Average'
+    END AS AnswerQuality,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = fq.PostId AND ph.PostHistoryTypeId IN (4, 6)) AS PostEditsCount,
+    CASE
+        WHEN fq.TitleEdits > 0 AND fq.BodyEdits > 0 THEN 'Both Title and Body Edited'
+        WHEN fq.TitleEdits > 0 THEN 'Title Edited'
+        WHEN fq.BodyEdits > 0 THEN 'Body Edited'
+        ELSE 'No Edits Recorded'
+    END AS EditTypeSummary,
+    (SELECT COUNT(DISTINCT v.UserId) FROM Votes v WHERE v.PostId = fq.PostId AND v.VoteTypeId = 16) AS SuggestedEditApprovals,
+    COALESCE(
+      (SELECT MIN(u2.CreationDate) FROM Users u2 JOIN Posts p2 ON u2.Id = p2.OwnerUserId WHERE p2.Id = fq.PostId),
+      fq.CreationDate
+    ) AS FirstInteractionDate
+FROM FeaturedQuestions fq
+WHERE fq.CompositeScore > 1000 AND fq.TotalAnswerScore > 50
+ORDER BY fq.CompositeScore DESC, fq.TotalAnswerScore DESC
+LIMIT 100;

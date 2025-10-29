@@ -1,0 +1,212 @@
+with ranked_posts as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.Title,
+        p.Tags,
+        u.DisplayName as OwnerDisplayName,
+        dense_rank() over (
+            partition by p.PostTypeId
+            order by p.Score desc, p.ViewCount desc, p.CreationDate asc
+        ) as rank_score_view
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId in (1, 2)
+), badge_counts as (
+    select
+        UserId,
+        sum(case when Class = 1 then 1 else 0 end) as gold_badges,
+        sum(case when Class = 2 then 1 else 0 end) as silver_badges,
+        sum(case when Class = 3 then 1 else 0 end) as bronze_badges
+    from Badges
+    group by UserId
+), question_answer_links as (
+    select
+        q.Id as QuestionId,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreationDate,
+        a.OwnerUserId as AnswerOwner,
+        u.DisplayName as AnswerOwnerName
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Users u on a.OwnerUserId = u.Id
+    where q.PostTypeId = 1
+), latest_comments as (
+    select
+        c.PostId,
+        c.Id as CommentId,
+        c.Score as CommentScore,
+        c.CreationDate as CommentCreationDate,
+        coalesce(u.DisplayName, c.UserDisplayName) as CommentUser
+    from (
+        select
+            c.*,
+            row_number() over (partition by c.PostId order by c.CreationDate desc) as rn
+        from Comments c
+    ) c
+    left join Users u on c.UserId = u.Id
+    where c.rn = 1
+), close_reason_counts as (
+    select
+        ph.Comment as CloseReasonId,
+        crt.Name as CloseReasonName,
+        count(*) as CloseCount
+    from PostHistory ph
+    inner join CloseReasonTypes crt on cast(ph.Comment as integer) = crt.Id
+    where ph.PostHistoryTypeId = 10
+    group by ph.Comment, crt.Name
+), question_with_scores as (
+    select
+        rp.Id,
+        rp.PostTypeId,
+        rp.CreationDate,
+        rp.Score,
+        rp.ViewCount,
+        rp.OwnerUserId,
+        rp.AcceptedAnswerId,
+        rp.Title,
+        rp.Tags,
+        rp.OwnerDisplayName,
+        rp.rank_score_view,
+        bc.gold_badges,
+        bc.silver_badges,
+        bc.bronze_badges,
+        (rp.Score * 2 + coalesce(bc.gold_badges, 0) * 10 + coalesce(bc.silver_badges, 0) * 5 + coalesce(bc.bronze_badges, 0)) as composite_score,
+        case
+            when rp.ViewCount > 10000 then 'Very High'
+            when rp.ViewCount between 5000 and 10000 then 'High'
+            when rp.ViewCount between 1000 and 4999 then 'Medium'
+            else 'Low'
+        end as ViewCategory,
+        (select count(*) from Comments c where c.PostId = rp.Id) as CommentCount,
+        (select count(*) from Votes v where v.PostId = rp.Id and v.VoteTypeId = 2) as UpVotes,
+        (select count(*) from Votes v where v.PostId = rp.Id and v.VoteTypeId = 3) as DownVotes
+    from ranked_posts rp
+    left join badge_counts bc on rp.OwnerUserId = bc.UserId
+    where rp.PostTypeId = 1
+), duplicated_questions as (
+    select distinct
+        pl.PostId as DuplicateQuestionId,
+        pl.RelatedPostId as OriginalQuestionId
+    from PostLinks pl
+    where pl.LinkTypeId = 3
+), question_stats as (
+    select
+        qws.Id,
+        qws.Title,
+        qws.OwnerDisplayName,
+        qws.CreationDate,
+        qws.Score,
+        qws.ViewCount,
+        qws.composite_score,
+        qws.ViewCategory,
+        qws.CommentCount,
+        qws.UpVotes,
+        qws.DownVotes,
+        dq.OriginalQuestionId as DuplicateOf,
+        (
+            select listagg(tag, ',') within group (order by tag) from (
+                select distinct trim(e) as tag
+                from (
+                    select regexp_replace(t, '[<>]', '') as t
+                    from (
+                        select regexp_split_to_table(coalesce(qws.Tags, ''), '><') as t
+                    )
+                )
+            )
+        ) as TagList
+    from question_with_scores qws
+    left join duplicated_questions dq on qws.Id = dq.DuplicateQuestionId
+), final_ranking as (
+    select
+        qs.Id,
+        qs.Title,
+        qs.OwnerDisplayName,
+        qs.CreationDate,
+        qs.Score,
+        qs.ViewCount,
+        qs.composite_score,
+        qs.ViewCategory,
+        qs.CommentCount,
+        qs.UpVotes,
+        qs.DownVotes,
+        qs.DuplicateOf,
+        qs.TagList,
+        rank() over (order by qs.composite_score desc, qs.ViewCount desc) as FinalRank
+    from question_stats qs
+), tagged_badged_users as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) as BadgeCount,
+        listagg(distinct t.TagName, ', ') within group (order by t.TagName) as Tags
+    from Users u
+    left join Badges b on b.UserId = u.Id and (b.TagBased = true or b.TagBased = 1)
+    left join Tags t on t.TagName = b.Name
+    group by u.Id, u.DisplayName
+    having count(b.Id) > 0
+)
+select
+    fr.FinalRank,
+    fr.Id as QuestionId,
+    fr.Title,
+    fr.OwnerDisplayName,
+    fr.CreationDate,
+    fr.Score,
+    fr.ViewCount,
+    fr.composite_score,
+    fr.ViewCategory,
+    fr.CommentCount,
+    fr.UpVotes,
+    fr.DownVotes,
+    fr.DuplicateOf,
+    fr.TagList,
+    (select array_to_json(array_agg(json_object))
+     from (
+         select
+             json_object(
+                 'AnswerId' value qa.AnswerId,
+                 'AnswerScore' value qa.AnswerScore,
+                 'AnswerOwner' value qa.AnswerOwnerName,
+                 'AnswerCreationDate' value qa.AnswerCreationDate
+             ) as json_object
+         from question_answer_links qa
+         where qa.QuestionId = fr.Id
+     ) t) as Answers,
+    (select array_to_json(array_agg(json_object))
+     from (
+         select
+             json_object(
+                 'CommentId' value lc.CommentId,
+                 'CommentScore' value lc.CommentScore,
+                 'CommentCreationDate' value lc.CommentCreationDate,
+                 'CommentUser' value lc.CommentUser
+             ) as json_object
+         from latest_comments lc
+         where lc.PostId = fr.Id
+     ) t) as LatestComments,
+    (select json_object(
+         'Gold' value coalesce(bc.gold_badges, 0),
+         'Silver' value coalesce(bc.silver_badges, 0),
+         'Bronze' value coalesce(bc.bronze_badges, 0)
+     )
+     from badge_counts bc where bc.UserId = (select OwnerUserId from Posts p2 where p2.Id = fr.Id)) as OwnerBadgeSummary,
+    (select count(*) from Votes v where v.PostId = fr.Id and v.VoteTypeId = 5) as FavoriteCount,
+    (select sum(case when v.VoteTypeId in (2,5) then 1 when v.VoteTypeId = 3 then -1 else 0 end) from Votes v where v.PostId = fr.Id) as NetVotes,
+    (select count(*) from PostHistory ph where ph.PostId = fr.Id and ph.PostHistoryTypeId in (10, 11)) as CloseReopenEventCount,
+    (select count(distinct u.Id) from Users u
+     where u.Id in (
+            select p.OwnerUserId from Posts p where p.Tags like '%' || split_part(coalesce(fr.TagList, ''), ',', 1) || '%'
+        ) and u.Reputation > 10000) as HighRepUsersWithTag,
+    (select listagg(distinct b.Name, ', ') within group (order by b.Name)
+     from Badges b
+     where b.UserId = fr.Id and b.Class = 1) as GoldBadgesForQuestionOwner
+from final_ranking fr
+order by fr.FinalRank
+fetch first 50 rows only;

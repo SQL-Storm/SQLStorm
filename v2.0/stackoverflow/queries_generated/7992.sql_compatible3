@@ -1,0 +1,155 @@
+SELECT 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) as TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.ViewCount > 1000 THEN p.Id END) as HighViewQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.Score > 10 THEN p.Id END) as HighScoreQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.Score > 5 THEN p.Id END) as HighScoreAnswers,
+    COUNT(DISTINCT b.Id) as Badges,
+    COUNT(DISTINCT c.Id) as Comments,
+    COUNT(DISTINCT ph.Id) as PostHistoryActions,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END), 0) as TotalQuestionViews,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.ViewCount ELSE 0 END), 0) as TotalAnswerViews,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN p.Id END) as QuestionsWithAcceptedAnswers,
+    COALESCE(AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END), 0) as AvgQuestionScore,
+    COALESCE(AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END), 0) as AvgAnswerScore,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.Tags IS NOT NULL AND p.Tags <> '' THEN p.Id END) as TaggedQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL THEN p.Id END) as ClosedQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.CommunityOwnedDate IS NOT NULL THEN p.Id END) as CommunityOwnedQuestions,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.FavoriteCount ELSE 0 END), 0) as TotalFavorites,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.AnswerCount ELSE 0 END), 0) as TotalAnswersCount,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.CommentCount > 0 THEN p.Id END) as QuestionWithComments,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.CommentCount > 0 THEN p.Id END) as AnswerWithComments,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END), 0) as TotalQuestionScore,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END), 0) as TotalAnswerScore,
+    (SELECT COUNT(*) FROM Posts p2 WHERE p2.PostTypeId = 1 AND p2.OwnerUserId = u.Id AND p2.Score > 0) as PositiveScoreQuestions,
+    (SELECT COUNT(*) FROM Posts p3 WHERE p3.PostTypeId = 2 AND p3.OwnerUserId = u.Id AND p3.Score > 0) as PositiveScoreAnswers,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(*) + 1, 0), 0) as QuestionPercentage,
+    COALESCE((
+        SELECT r.asc_rank FROM (
+            SELECT ROW_NUMBER() OVER (ORDER BY u2.Reputation ASC) as asc_rank, u2.Id
+            FROM Users u2
+        ) r WHERE r.Id = u.Id
+    ), 0) as ReputationRankAsc,
+    COALESCE((
+        SELECT r.desc_rank FROM (
+            SELECT ROW_NUMBER() OVER (ORDER BY u2.Reputation DESC) as desc_rank, u2.Id
+            FROM Users u2
+        ) r WHERE r.Id = u.Id
+    ), 0) as ReputationRankDesc,
+    (SELECT COUNT(*) FROM Posts p4 WHERE p4.OwnerUserId = u.Id AND p4.CreationDate > u.CreationDate) as PostsAfterAccountCreation,
+    (SELECT STRING_AGG(DISTINCT t2.TagName, ', ') FROM Posts p5 
+     JOIN Posts p6 ON p5.Id = p6.ParentId 
+     JOIN Tags t2 ON t2.TagName = ANY(string_to_array(REPLACE(p5.Tags, '<', ''), '>')) 
+     WHERE p6.OwnerUserId = u.Id AND p5.PostTypeId = 1) as UserTaggedQuestions,
+    (SELECT COUNT(*) FROM Posts p7 
+     JOIN PostHistory ph2 ON p7.Id = ph2.PostId 
+     WHERE p7.OwnerUserId = u.Id AND ph2.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6) 
+     AND ph2.CreationDate > u.CreationDate) as PostEditsAfterAccountCreation,
+    (SELECT COUNT(*) FROM PostLinks pl2 
+     JOIN Posts p8 ON pl2.PostId = p8.Id 
+     WHERE p8.OwnerUserId = u.Id AND pl2.LinkTypeId = 1) as LinksInUserPosts,
+    (SELECT COUNT(DISTINCT p9.Id) FROM Posts p9 
+     JOIN PostHistory ph3 ON p9.Id = ph3.PostId 
+     WHERE p9.OwnerUserId = u.Id AND (ph3.PostHistoryTypeId IN (10, 11, 12, 13) OR 
+       (ph3.PostHistoryTypeId = 17 AND ph3.Text LIKE '%migration%'))) as PostModerationActions,
+    COALESCE(AVG(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount END), 0) as AvgQuestionViews,
+    COALESCE(AVG(CASE WHEN p.PostTypeId = 2 THEN p.ViewCount END), 0) as AvgAnswerViews,
+    CAST(ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS numeric) * 1.5 + 
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) * 0.8, 0) as PerformanceScore,
+    CASE WHEN u.WebsiteUrl IS NOT NULL AND u.WebsiteUrl <> '' THEN 1 ELSE 0 END as HasWebsite,
+    CASE WHEN u.AboutMe IS NOT NULL AND LENGTH(u.AboutMe) > 100 THEN 1 ELSE 0 END as HasLongBio,
+    CASE WHEN u.Location IS NOT NULL AND u.Location <> '' THEN 1 ELSE 0 END as HasLocation,
+    (SELECT COUNT(*) FROM Badges b2 WHERE b2.UserId = u.Id AND b2.Class = 1) as GoldBadges,
+    (SELECT COUNT(*) FROM Badges b3 WHERE b3.UserId = u.Id AND b3.Class = 2) as SilverBadges,
+    (SELECT COUNT(*) FROM Badges b4 WHERE b4.UserId = u.Id AND b4.Class = 3) as BronzeBadges,
+    CASE WHEN u.AccountId IS NOT NULL THEN 1 ELSE 0 END as HasAccount,
+    (SELECT COUNT(*) FROM PostHistory ph4 
+     JOIN PostHistoryTypes pht2 ON ph4.PostHistoryTypeId = pht2.Id 
+     WHERE ph4.UserId = u.Id AND ph4.CreationDate > u.CreationDate AND 
+     (pht2.Name LIKE '%Edit%' OR pht2.Name LIKE '%Title%' OR pht2.Name LIKE '%Body%')) as EditingActivities,
+    (SELECT COUNT(*) FROM Posts p10 WHERE p10.OwnerUserId = u.Id AND p10.LastActivityDate > u.LastAccessDate) as PostActivityAfterLastAccess,
+    (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 2) as UpvotesGiven,
+    (SELECT COUNT(*) FROM Votes v2 WHERE v2.UserId = u.Id AND v2.VoteTypeId = 3) as DownvotesGiven,
+    (SELECT COUNT(*) FROM Votes v3 WHERE v3.UserId = u.Id AND v3.VoteTypeId = 5) as FavoritesGiven,
+    (SELECT COUNT(DISTINCT ph5.PostId) FROM PostHistory ph5 WHERE ph5.UserId = u.Id) as PostsEdited,
+    (SELECT COUNT(DISTINCT p11.Id) FROM Posts p11 WHERE p11.OwnerUserId = u.Id AND p11.CreationDate BETWEEN u.CreationDate AND u.CreationDate + INTERVAL '1 month') as PostsInFirstMonth,
+    CASE WHEN EXISTS (SELECT 1 FROM Badges b5 WHERE b5.UserId = u.Id AND b5.Name IN ('Yearling', 'Fanatic', 'Necromancer')) THEN 1 ELSE 0 END as HasSpecialBadges,
+    (SELECT STRING_AGG(DISTINCT p12.Tags, ', ') 
+     FROM Posts p12 
+     WHERE p12.OwnerUserId = u.Id AND p12.PostTypeId = 1 AND p12.Tags IS NOT NULL 
+     GROUP BY p12.OwnerUserId 
+     HAVING COUNT(*) > 0) as AllUserTags,
+    COALESCE(SUM(CASE WHEN p.Score >= 0 THEN 1 ELSE 0 END), 0) AS GoodPosts,
+    COALESCE(SUM(CASE WHEN p.Score < 0 THEN 1 ELSE 0 END), 0) AS BadPosts,
+    (SELECT COUNT(DISTINCT c1.Id) FROM Comments c1 
+     JOIN Posts p15 ON c1.PostId = p15.Id 
+     WHERE p15.OwnerUserId = u.Id) AS CommentsInUserPosts,
+    (SELECT COUNT(DISTINCT c2.Id) FROM Comments c2 
+     WHERE c2.UserId = u.Id) AS UserComments,
+    (SELECT COUNT(DISTINCT p16.Id) FROM Posts p16 
+     JOIN PostLinks pl3 ON p16.Id = pl3.PostId 
+     WHERE p16.OwnerUserId = u.Id AND pl3.LinkTypeId = 3) AS DuplicateLinks,
+    (SELECT COUNT(DISTINCT p17.Id) FROM Posts p17 
+     JOIN PostHistory ph6 ON p17.Id = ph6.PostId 
+     WHERE p17.OwnerUserId = u.Id AND ph6.PostHistoryTypeId IN (35, 36)) AS MigrationPosts,
+    (SELECT COUNT(*) FROM Posts p18 
+     WHERE p18.OwnerUserId = u.Id AND p18.PostTypeId = 1 
+     AND p18.CommunityOwnedDate IS NOT NULL AND p18.ClosedDate IS NOT NULL) AS CommunityOwnedClosedQuestions,
+    (SELECT STRING_AGG(p19.Title, ' | ') 
+     FROM (
+       SELECT p19_inner.Title
+       FROM Posts p19_inner
+       WHERE p19_inner.PostTypeId = 1 AND p19_inner.OwnerUserId = u.Id
+       ORDER BY COALESCE(p19_inner.Score, 0) DESC
+       FETCH FIRST 5 ROWS ONLY
+     ) p19) AS TopQuestions,
+    (SELECT STRING_AGG(a.Title, ' | ')
+     FROM (
+       SELECT a_inner.Title
+       FROM Posts a_inner
+       JOIN Posts q_inner ON a_inner.ParentId = q_inner.Id
+       WHERE q_inner.OwnerUserId = u.Id AND a_inner.PostTypeId = 2
+       ORDER BY COALESCE(a_inner.Score, 0) DESC
+       FETCH FIRST 5 ROWS ONLY
+     ) a) AS TopAnswers,
+    COUNT(*) OVER () as TotalUserCount,
+    ((COUNT(DISTINCT p.Id) - MIN(COUNT(DISTINCT p.Id)) OVER ()) / NULLIF(MAX(COUNT(DISTINCT p.Id)) OVER () - MIN(COUNT(DISTINCT p.Id)) OVER (), 0)) as NormalizedPostActivity,
+    COALESCE(COUNT(DISTINCT p.Id) * (SELECT AVG(sub.cnt) FROM (SELECT COUNT(DISTINCT p2.Id) as cnt FROM Users u2 JOIN Posts p2 ON u2.Id = p2.OwnerUserId GROUP BY u2.Id) sub), 1) as PostActivityFactor,
+    NULLIF(COUNT(DISTINCT b.Id), 0) * NULLIF(COUNT(DISTINCT p.Id), 0) as BadgePostRatio,
+    CASE 
+        WHEN COUNT(DISTINCT p.Id) > 100 THEN 'Active'
+        WHEN COUNT(DISTINCT p.Id) > 50 THEN 'Moderate'
+        WHEN COUNT(DISTINCT p.Id) > 0 THEN 'Beginner'
+        ELSE 'Inactive'
+    END as ActivityLevel,
+    (SELECT COUNT(*) FROM Posts p20 
+     WHERE p20.OwnerUserId = u.Id  
+     AND p20.CreationDate BETWEEN u.CreationDate + INTERVAL '3 months' AND u.CreationDate + INTERVAL '6 months') as PostsIn3To6Months,
+    (SELECT COUNT(*) FROM Posts p21 
+     WHERE p21.OwnerUserId = u.Id AND p21.CreationDate > u.CreationDate + INTERVAL '1 year') as PostsAfterOneYear,
+    (SELECT AVG(p22.ViewCount) FROM Posts p22 WHERE p22.OwnerUserId = u.Id AND p22.PostTypeId = 1) as AvgViewCountPerQuestion,
+    (SELECT AVG(p23.ViewCount) FROM Posts p23 WHERE p23.OwnerUserId = u.Id AND p23.PostTypeId = 2) as AvgViewCountPerAnswer,
+    COALESCE(COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) * 100.0 / NULLIF((
+        SELECT COUNT(DISTINCT ph7_inner.PostId) FROM PostHistory ph7_inner JOIN Posts p_inner ON p_inner.Id = ph7_inner.PostId WHERE p_inner.OwnerUserId = u.Id
+    ), 0), 0) as QuestionPostRatio,
+    (SELECT COUNT(DISTINCT p24.Id) 
+     FROM Posts p24 
+     JOIN PostHistory ph8 ON p24.Id = ph8.PostId 
+     WHERE p24.OwnerUserId = u.Id AND ph8.PostHistoryTypeId = 24) as EditsApplied
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN Comments c ON u.Id = c.UserId
+LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+LEFT JOIN PostLinks pl ON u.Id = pl.PostId AND pl.LinkTypeId = 1
+LEFT JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+WHERE u.Id IS NOT NULL
+GROUP BY u.Id, u.DisplayName, u.Reputation, u.WebsiteUrl, u.AboutMe, u.Location, u.AccountId, u.CreationDate, u.LastAccessDate
+HAVING 
+    COUNT(DISTINCT p.Id) > 0
+ORDER BY u.Reputation DESC
+FETCH FIRST 100 ROWS ONLY;

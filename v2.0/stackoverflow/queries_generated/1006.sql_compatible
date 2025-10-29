@@ -1,0 +1,162 @@
+WITH UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostScore,
+        SUM(COALESCE(p.ViewCount, 0)) AS TotalPostViewCount,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT ph.Id) AS TotalHistoryEvents,
+        (u.Reputation * 0.1
+         + SUM(COALESCE(p.Score, 0)) * 0.5
+         + COUNT(DISTINCT c.Id) * 0.2
+         + (EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - u.LastAccessDate)) / 86400 / 365.25) * -0.05
+        ) AS ActivityScoreBase
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+    HAVING COUNT(DISTINCT p.Id) > 5 OR COUNT(DISTINCT c.Id) > 10
+),
+UserBadgesSummary AS (
+    SELECT
+        b.UserId,
+        COUNT(b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        SUM(CASE WHEN b.TagBased = TRUE THEN 1 ELSE 0 END) AS TagBasedBadges,
+        (SUM(CASE WHEN b.Class = 1 THEN 10 ELSE 0 END) + SUM(CASE WHEN b.Class = 2 THEN 5 ELSE 0 END) + SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END)) AS BadgeScore
+    FROM Badges b
+    GROUP BY b.UserId
+),
+QualifiedUsers AS (
+    SELECT ue.UserId FROM UserEngagement ue
+    LEFT JOIN UserBadgesSummary ubs ON ue.UserId = ubs.UserId
+    WHERE (ue.Reputation >= 5000 AND COALESCE(ubs.GoldBadges, 0) > 0)
+    UNION
+    SELECT ue.UserId FROM UserEngagement ue
+    WHERE ue.TotalAnswers >= 50 AND ue.TotalPostScore >= 1000
+    UNION
+    SELECT ue.UserId FROM UserEngagement ue
+    WHERE ue.TotalQuestions >= 20 AND ue.TotalPostViewCount >= 50000 AND ue.ActivityScoreBase >= 500
+),
+PostHistoricalMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        p.LastEditDate,
+        p.ClosedDate,
+        COUNT(ph.Id) AS TotalHistoryEvents,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 END) AS ActualEdits,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN 'Closed' ELSE NULL END) AS IsClosedFlag,
+        COALESCE(MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN cl.Name ELSE NULL END), 'Not Closed') AS LastCloseReason,
+        (EXTRACT(EPOCH FROM (COALESCE(p.LastEditDate, p.CreationDate) - p.CreationDate)) / 3600) AS HoursSinceCreationToLastEdit,
+        (SELECT COALESCE(MAX(c_sub.Score), 0)
+         FROM Comments c_sub
+         WHERE c_sub.PostId = p.Id
+           AND c_sub.UserId IS NOT NULL
+           AND c_sub.UserId <> p.OwnerUserId
+           AND c_sub.Text IS NOT NULL
+           AND LENGTH(c_sub.Text) > 10
+        ) AS MaxCommentScoreByOtherUsers,
+        ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY ph.CreationDate DESC) AS rn_latest_history,
+        EXTRACT(EPOCH FROM (ph.CreationDate - LAG(ph.CreationDate) OVER (PARTITION BY p.Id ORDER BY ph.CreationDate))) / 3600 AS HoursBetweenEdits,
+        ph.CreationDate AS ph_CreationDate -- include ph.CreationDate used in window in group by below
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    LEFT JOIN CloseReasonTypes cl ON (ph.PostHistoryTypeId = 10 AND ph.Comment = CAST(cl.Id AS varchar))
+    GROUP BY p.Id, p.PostTypeId, p.CreationDate, p.LastEditDate, p.ClosedDate, ph.CreationDate
+),
+TagAnalysis AS (
+    SELECT
+        p.Id AS QuestionId,
+        LOWER(unnest(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><'))) AS TagName
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2
+),
+AvgPostScoreByReputationBucket AS (
+    SELECT
+        NTILE(5) OVER (ORDER BY Reputation DESC) AS ReputationBucket,
+        AVG(p.Score) AS AvgScoreInBucket,
+        COUNT(p.Id) AS PostCountInBucket
+    FROM Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId IN (1, 2) AND p.Score IS NOT NULL
+    GROUP BY NTILE(5) OVER (ORDER BY Reputation DESC)
+)
+SELECT
+    ue.UserId,
+    ue.DisplayName,
+    ue.Reputation,
+    ue.UserCreationDate,
+    ue.TotalQuestions,
+    ue.TotalAnswers,
+    ue.TotalPostScore,
+    ue.TotalPostViewCount,
+    COALESCE(ubs.GoldBadges, 0) AS GoldBadges,
+    COALESCE(ubs.SilverBadges, 0) AS SilverBadges,
+    COALESCE(ubs.BronzeBadges, 0) AS BronzeBadges,
+    COALESCE(ubs.TagBasedBadges, 0) AS TagBasedBadges,
+    (ue.ActivityScoreBase + COALESCE(ubs.BadgeScore, 0) * 0.8 + (ue.TotalQuestions * 0.5) + (ue.TotalAnswers * 0.7) - (ue.TotalHistoryEvents * 0.01)) AS UserInfluenceScore,
+    DENSE_RANK() OVER (ORDER BY (ue.ActivityScoreBase + COALESCE(ubs.BadgeScore, 0) * 0.8 + (ue.TotalQuestions * 0.5) + (ue.TotalAnswers * 0.7)) DESC, ue.Reputation DESC, ue.LastAccessDate ASC) AS InfluenceRank,
+    MAX(CASE WHEN q.PostTypeId = 1 AND q.Score = (SELECT MAX(q_sub.Score) FROM Posts q_sub WHERE q_sub.OwnerUserId = ue.UserId AND q_sub.PostTypeId = 1) THEN q.Title END) AS TopQuestionTitle,
+    MAX(CASE WHEN q.PostTypeId = 1 AND q.Score = (SELECT MAX(q_sub.Score) FROM Posts q_sub WHERE q_sub.OwnerUserId = ue.UserId AND q_sub.PostTypeId = 1) THEN q.Score END) AS TopQuestionScore,
+    COALESCE(AVG(c_q.Score) FILTER (WHERE q.Id = c_q.PostId AND q.PostTypeId = 1 AND c_q.Score > 0), 0.0) AS AvgQuestionCommentScore,
+    SUM(CASE WHEN phm_q.IsClosedFlag = 'Closed' AND phm_q.LastCloseReason = 'Duplicate' THEN 1 ELSE 0 END) AS DuplicateClosedQuestions,
+    COUNT(DISTINCT CASE WHEN ta.TagName IN ('sql', 'postgresql') AND q.Id IS NOT NULL THEN q.Id END) AS SqlRelatedQuestions,
+    COUNT(DISTINCT CASE WHEN a.Score > 200 AND a.PostTypeId = 2 THEN a.Id END) AS VeryHighScoreAnswers,
+    AVG(phm_all.HoursSinceCreationToLastEdit) FILTER (WHERE phm_all.HoursSinceCreationToLastEdit IS NOT NULL) AS AvgPostEditLagHours,
+    COALESCE(
+        LOWER(
+            SPLIT_PART(
+                SUBSTRING(u.WebsiteUrl FROM '://([^/]+)'),
+                'www.', 2
+            )
+        ), 'No Website'
+    ) AS WebsiteDomain,
+    COALESCE(
+        (SELECT aps.AvgScoreInBucket FROM AvgPostScoreByReputationBucket aps
+         WHERE aps.ReputationBucket = (SELECT NTILE(5) OVER (ORDER BY u_inner.Reputation DESC) FROM Users u_inner WHERE u_inner.Id = ue.UserId)
+        ), 0.0
+    ) AS AvgScoreInUserReputationBucket,
+    COUNT(DISTINCT CASE
+        WHEN q.PostTypeId = 1 AND EXISTS (
+            SELECT 1
+            FROM PostHistory ph_inner
+            WHERE ph_inner.PostId = q.Id
+              AND ph_inner.UserId = ue.UserId
+              AND ph_inner.PostHistoryTypeId = 5
+              AND ph_inner.CreationDate BETWEEN q.CreationDate AND q.CreationDate + INTERVAL '24 hours'
+        ) THEN q.Id
+        ELSE NULL
+    END) AS QuestionsBodyEditedEarly
+FROM UserEngagement ue
+JOIN QualifiedUsers qu ON ue.UserId = qu.UserId
+LEFT JOIN Users u ON ue.UserId = u.Id
+LEFT JOIN UserBadgesSummary ubs ON ue.UserId = ubs.UserId
+LEFT JOIN Posts q ON ue.UserId = q.OwnerUserId AND q.PostTypeId = 1
+LEFT JOIN Posts a ON ue.UserId = a.OwnerUserId AND a.PostTypeId = 2
+LEFT JOIN PostHistoricalMetrics phm_q ON q.Id = phm_q.PostId
+LEFT JOIN PostHistoricalMetrics phm_a ON a.Id = phm_a.PostId
+LEFT JOIN PostHistoricalMetrics phm_all ON (q.Id = phm_all.PostId OR a.Id = phm_all.PostId)
+LEFT JOIN Comments c_q ON q.Id = c_q.PostId
+LEFT JOIN TagAnalysis ta ON q.Id = ta.QuestionId
+WHERE ue.Reputation >= 500
+  AND (ue.DisplayName IS NOT NULL AND ue.DisplayName <> '')
+  AND NOT (u.AboutMe LIKE '%deleted user%' OR u.WebsiteUrl IS NULL OR u.WebsiteUrl = '')
+GROUP BY ue.UserId, ue.DisplayName, ue.Reputation, ue.UserCreationDate, ue.LastAccessDate, ue.TotalQuestions, ue.TotalAnswers, ue.TotalPostScore, ue.TotalPostViewCount,
+         ubs.GoldBadges, ubs.SilverBadges, ubs.BronzeBadges, ubs.TagBasedBadges, ue.ActivityScoreBase, COALESCE(ubs.BadgeScore, 0), u.WebsiteUrl
+HAVING
+    SUM(CASE WHEN q.Id IS NOT NULL THEN 1 ELSE 0 END) > 0
+    AND (COALESCE(ubs.GoldBadges, 0) + COALESCE(ubs.SilverBadges, 0) + COALESCE(ubs.BronzeBadges, 0)) > 0
+    AND AVG(phm_all.HoursSinceCreationToLastEdit) FILTER (WHERE phm_all.HoursSinceCreationToLastEdit IS NOT NULL) IS NOT NULL
+ORDER BY UserInfluenceScore DESC, ue.Reputation DESC
+LIMIT 100;

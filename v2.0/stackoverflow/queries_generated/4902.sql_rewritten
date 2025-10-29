@@ -1,0 +1,122 @@
+-- {"query": "4902.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 910} 
+WITH
+  HighReputationUsers AS (
+    SELECT
+      Id,
+      DisplayName,
+      Reputation,
+      (
+        SELECT
+          COUNT(*)
+        FROM
+          Posts AS P_Inner
+        WHERE
+          P_Inner.OwnerUserId = U.Id
+          AND P_Inner.PostTypeId = 1 -- Questions
+      ) AS QuestionCount
+    FROM
+      Users AS U
+    WHERE
+      U.Reputation > 10000
+  ),
+  UserActivity AS (
+    SELECT
+      U.Id AS UserId,
+      U.DisplayName,
+      COUNT(C.Id) AS CommentCount,
+      SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount, -- Upvote
+      SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount -- Downvote
+    FROM
+      Users AS U
+    LEFT JOIN
+      Comments AS C
+      ON U.Id = C.UserId
+    LEFT JOIN
+      Votes AS V
+      ON U.Id = V.UserId
+    WHERE
+      U.Id IN (SELECT Id FROM HighReputationUsers)
+    GROUP BY
+      U.Id,
+      U.DisplayName
+  ),
+  PostEngagement AS (
+    SELECT
+      P.Id AS PostId,
+      P.Title,
+      P.OwnerUserId,
+      P.CreationDate,
+      P.Score,
+      P.AnswerCount,
+      P.CommentCount,
+      P.FavoriteCount,
+      CASE
+        WHEN P.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN P.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        ELSE 'Active'
+      END AS PostStatus,
+      ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.LastActivityDate DESC) AS PostRank
+    FROM
+      Posts AS P
+    WHERE
+      P.PostTypeId = 1 -- Questions
+      AND P.OwnerUserId IS NOT NULL
+      AND P.OwnerUserId != -1
+      AND P.CreationDate >= DATE('now', '-1 year')
+  )
+SELECT
+  HRU.DisplayName AS UserName,
+  HRU.Reputation,
+  HRU.QuestionCount,
+  COALESCE(UA.CommentCount, 0) AS TotalComments,
+  UA.UpVoteCount,
+  UA.DownVoteCount,
+  SUM(CASE WHEN PE.PostStatus = 'Closed' THEN 1 ELSE 0 END) AS ClosedQuestions,
+  AVG(PE.Score) AS AverageQuestionScore,
+  MAX(PE.FavoriteCount) AS MaxFavoriteCount,
+  (
+    SELECT
+      Name
+    FROM
+      PostHistoryTypes AS PHT
+    WHERE
+      PHT.Id = (
+        SELECT
+          PostHistoryTypeId
+        FROM
+          PostHistory AS PH_Inner
+        WHERE
+          PH_Inner.PostId = PE.PostId
+          AND PH_Inner.CreationDate = (
+            SELECT
+              MAX(CreationDate)
+            FROM
+              PostHistory AS PH_Max
+            WHERE
+              PH_Max.PostId = PE.PostId
+              AND PH_Max.PostHistoryTypeId IN (4, 6) -- Edit Title, Edit Tags
+          )
+      )
+  ) AS LastEditType
+FROM
+  HighReputationUsers AS HRU
+LEFT OUTER JOIN
+  UserActivity AS UA
+  ON HRU.Id = UA.UserId
+LEFT OUTER JOIN
+  PostEngagement AS PE
+  ON HRU.Id = PE.OwnerUserId
+WHERE
+  PE.PostRank <= 5 -- Consider top 5 questions per user
+GROUP BY
+  HRU.Id,
+  HRU.DisplayName,
+  HRU.Reputation,
+  UA.CommentCount,
+  UA.UpVoteCount,
+  UA.DownVoteCount
+HAVING
+  COUNT(PE.PostId) > 0 OR UA.CommentCount > 0
+ORDER BY
+  HRU.Reputation DESC,
+  TotalComments DESC;

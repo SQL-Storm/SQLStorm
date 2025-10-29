@@ -1,0 +1,112 @@
+-- {"query": "4039.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1231} 
+
+WITH RankedQuestions AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title AS QuestionTitle,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        p.CreationDate AS QuestionCreationDate,
+        p.Score AS QuestionScore,
+        p.AnswerCount,
+        p.ViewCount AS QuestionViewCount,
+        ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.CreationDate ASC) AS RankByScore,
+        ROW_NUMBER() OVER (ORDER BY p.AnswerCount DESC, p.ViewCount ASC) AS RankByAnswersViews
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+      AND p.AcceptedAnswerId IS NOT NULL
+      AND p.Score > 10
+      AND p.AnswerCount BETWEEN 2 AND 50
+),
+AnswerDetails AS (
+    SELECT
+        a.ParentId AS QuestionId,
+        COUNT(a.Id) AS AnswerCountForQuestion,
+        AVG(a.Score) AS AverageAnswerScore,
+        SUM(CASE WHEN a.Id = p.AcceptedAnswerId THEN 1 ELSE 0 END) AS IsAcceptedAnswerCount
+    FROM Posts a
+    JOIN Posts p ON p.Id = a.ParentId -- Ensure we are joining to the correct question for AcceptedAnswerId
+    WHERE a.PostTypeId = 2
+      AND a.Score > 0
+    GROUP BY a.ParentId
+),
+UserActivity AS (
+    SELECT
+        UserId,
+        COUNT(Id) AS PostCount,
+        MAX(CreationDate) AS LastPostDate
+    FROM Posts
+    WHERE OwnerUserId IS NOT NULL
+    GROUP BY UserId
+),
+QuestionWithAnswerStats AS (
+    SELECT
+        rq.QuestionId,
+        rq.QuestionTitle,
+        rq.OwnerUserId,
+        rq.OwnerDisplayName,
+        rq.QuestionCreationDate,
+        rq.QuestionScore,
+        rq.RankByScore,
+        rq.RankByAnswersViews,
+        COALESCE(ad.AnswerCountForQuestion, 0) AS TotalAnswers,
+        COALESCE(ad.AverageAnswerScore, 0) AS AvgAnswerScore,
+        CASE
+            WHEN rq.OwnerUserId IS NOT NULL THEN
+                CASE
+                    WHEN EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = rq.OwnerUserId AND b.Name LIKE '%Expert%') THEN 'Expert'
+                    WHEN EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = rq.OwnerUserId AND b.Name LIKE '%Scholar%') THEN 'Scholar'
+                    ELSE 'Regular'
+                END
+            ELSE 'Anonymous'
+        END AS OwnerBadgeStatus,
+        CASE
+            WHEN u.Reputation > 100000 THEN 'High'
+            WHEN u.Reputation BETWEEN 10000 AND 100000 THEN 'Medium'
+            ELSE 'Low'
+        END AS OwnerReputationLevel,
+        ua.PostCount AS OwnerTotalPosts,
+        DATEDIFF(day, ua.LastPostDate, GETDATE()) AS DaysSinceLastPost
+    FROM RankedQuestions rq
+    LEFT JOIN AnswerDetails ad ON rq.QuestionId = ad.QuestionId
+    LEFT JOIN Users u ON rq.OwnerUserId = u.Id
+    LEFT JOIN UserActivity ua ON rq.OwnerUserId = ua.UserId
+    WHERE rq.QuestionScore > 50
+),
+CommentAnalysis AS (
+    SELECT
+        c.PostId,
+        COUNT(c.Id) AS CommentCount,
+        SUM(CASE WHEN c.UserId IS NULL THEN 1 ELSE 0 END) AS AnonymousCommentCount,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM Comments c
+    WHERE c.PostId IN (SELECT QuestionId FROM QuestionWithAnswerStats)
+    GROUP BY c.PostId
+)
+SELECT
+    qwas.QuestionId,
+    qwas.QuestionTitle,
+    qwas.OwnerDisplayName,
+    qwas.QuestionCreationDate,
+    qwas.QuestionScore,
+    qwas.RankByScore,
+    qwas.TotalAnswers,
+    qwas.AvgAnswerScore,
+    qwas.OwnerBadgeStatus,
+    qwas.OwnerReputationLevel,
+    qwas.OwnerTotalPosts,
+    qwas.DaysSinceLastPost,
+    COALESCE(ca.CommentCount, 0) AS TotalCommentsOnQuestion,
+    CASE
+        WHEN qwas.OwnerReputationLevel = 'High' AND qwas.TotalAnswers > 10 AND qwas.AvgAnswerScore > 5 THEN 'Top Performer'
+        WHEN qwas.OwnerReputationLevel = 'Medium' AND qwas.TotalAnswers BETWEEN 3 AND 10 AND qwas.AvgAnswerScore > 2 THEN 'Good Contributor'
+        ELSE 'Standard'
+    END AS ContributorTier,
+    CAST(qwas.QuestionScore AS VARCHAR(20)) + '-' + LOWER(LEFT(qwas.OwnerDisplayName, 3)) AS ScoreAndDisplayNamePrefix,
+    qwas.QuestionViewCount,
+    CASE WHEN qwas.QuestionCreationDate < DATEADD(year, -5, GETDATE()) THEN 'Old' ELSE 'Recent' END AS AgeCategory
+FROM QuestionWithAnswerStats qwas
+LEFT JOIN CommentAnalysis ca ON qwas.QuestionId = ca.PostId
+WHERE qwas.RankByScore <= 100
+ORDER BY qwas.RankByScore, qwas.QuestionScore DESC;

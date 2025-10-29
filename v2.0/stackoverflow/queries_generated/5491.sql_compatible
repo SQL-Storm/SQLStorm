@@ -1,0 +1,62 @@
+WITH
+ActiveUsers AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(p.Id) AS PostCount
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+UserEngagement AS (
+  SELECT
+    a.UserId,
+    a.DisplayName,
+    a.Reputation,
+    a.PostCount,
+    COALESCE(COUNT(c.Id), 0) AS CommentCount,
+    COALESCE(SUM(v.BountyAmount), 0) AS TotalBountyOnPosts
+  FROM ActiveUsers a
+  LEFT JOIN Posts p ON p.OwnerUserId = a.UserId
+  LEFT JOIN Comments c ON c.PostId = p.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  GROUP BY a.UserId, a.DisplayName, a.Reputation, a.PostCount
+),
+UserBadges AS (
+  SELECT
+    b.UserId,
+    COUNT(DISTINCT b.Name) AS DistinctBadges
+  FROM Badges b
+  GROUP BY b.UserId
+),
+Final AS (
+  SELECT
+    u.UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.PostCount,
+    uc.CommentCount,
+    uc.TotalBountyOnPosts,
+    COALESCE(ub.DistinctBadges, 0) AS DistinctBadges,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.PostCount DESC) AS RankByReputation,
+    SUM(CASE WHEN t.PostTypeId = 1 THEN 1 ELSE 0 END) OVER (PARTITION BY u.UserId) AS QuestionsCreated,
+    SUM(CASE WHEN t.PostTypeId = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY u.UserId) AS AnswersGiven,
+    (SELECT MAX(p2.LastActivityDate) FROM Posts p2 WHERE p2.OwnerUserId = u.UserId) AS LastActive
+  FROM ActiveUsers u
+  LEFT JOIN UserEngagement uc ON uc.UserId = u.UserId
+  LEFT JOIN UserBadges ub ON ub.UserId = u.UserId
+  LEFT JOIN Posts t ON t.OwnerUserId = u.UserId
+  GROUP BY
+    u.UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.PostCount,
+    uc.CommentCount,
+    uc.TotalBountyOnPosts,
+    ub.DistinctBadges
+)
+SELECT *
+FROM Final
+WHERE RankByReputation <= 10
+ORDER BY RankByReputation;

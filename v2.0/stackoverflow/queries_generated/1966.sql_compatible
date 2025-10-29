@@ -1,0 +1,158 @@
+WITH UserEngagementSummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsAsked,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersProvided,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        COALESCE(SUM(P.Score), 0) AS TotalPostScoreReceived,
+        COALESCE(SUM(C.Score), 0) AS TotalCommentScoreReceived,
+        COUNT(DISTINCT PV.Id) AS UpvotesReceivedOnPosts,
+        COUNT(DISTINCT DV.Id) AS DownvotesReceivedOnPosts,
+        COUNT(DISTINCT UV.Id) AS UpvotesGivenBySelf,
+        COUNT(DISTINCT DDV.Id) AS DownvotesGivenBySelf,
+        MAX(P.LastActivityDate) AS LatestPostActivity,
+        MAX(C.CreationDate) AS LatestCommentActivity,
+        AVG(CASE WHEN P.Id IS NOT NULL THEN P.Score ELSE NULL END) AS AvgPostScore,
+        COUNT(DISTINCT TagsArray.Tag) AS UniqueQuestionTagsUsed
+    FROM
+        Users AS U
+    LEFT JOIN
+        Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN
+        Comments AS C ON U.Id = C.UserId
+    LEFT JOIN
+        Votes AS PV ON P.Id = PV.PostId AND PV.VoteTypeId = 2
+    LEFT JOIN
+        Votes AS DV ON P.Id = DV.PostId AND DV.VoteTypeId = 3
+    LEFT JOIN
+        Votes AS UV ON U.Id = UV.UserId AND UV.VoteTypeId = 2
+    LEFT JOIN
+        Votes AS DDV ON U.Id = DDV.UserId AND DDV.VoteTypeId = 3
+    LEFT JOIN LATERAL (
+        SELECT UNNEST(string_to_array(SUBSTRING(P_tags.Tags FROM 2 FOR LENGTH(P_tags.Tags)-2), '><')) AS Tag
+        FROM Posts AS P_tags
+        WHERE P_tags.OwnerUserId = U.Id
+          AND P_tags.PostTypeId = 1
+          AND P_tags.Tags IS NOT NULL
+    ) AS TagsArray ON TRUE
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate
+),
+PostHistoricalMetrics AS (
+    SELECT
+        PH.PostId,
+        P.OwnerUserId,
+        COUNT(DISTINCT PH.Id) AS TotalRevisions,
+        MAX(PH.CreationDate) AS LastEditDate,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS MajorContentEdits,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS TimesClosed,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS TimesReopened,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY COUNT(DISTINCT PH.Id) DESC, MAX(PH.CreationDate) DESC) AS PostRevisionRankByOwner
+    FROM
+        PostHistory AS PH
+    JOIN
+        Posts AS P ON PH.PostId = P.Id
+    GROUP BY
+        PH.PostId, P.OwnerUserId
+),
+BadgeProgression AS (
+    SELECT
+        B.UserId,
+        B.Name AS BadgeName,
+        B.Date AS BadgeDate,
+        B.Class,
+        EXTRACT(EPOCH FROM (B.Date - LAG(B.Date, 1, B.Date) OVER (PARTITION BY B.UserId ORDER BY B.Date))) / 86400.0 AS DaysSinceLastBadge,
+        ROW_NUMBER() OVER (PARTITION BY B.UserId ORDER BY B.Date DESC) AS LatestBadgeRank
+    FROM
+        Badges AS B
+),
+HighEngagementUsers AS (
+    SELECT DISTINCT C.UserId
+    FROM Comments AS C
+    JOIN Posts AS P ON C.PostId = P.Id
+    WHERE P.PostTypeId = 1
+    INTERSECT
+    SELECT DISTINCT V.UserId
+    FROM Votes AS V
+    JOIN Posts AS P2 ON V.PostId = P2.Id
+    WHERE P2.PostTypeId = 1 AND V.VoteTypeId IN (2, 3)
+),
+EliteContributors AS (
+    SELECT DISTINCT UserId FROM Badges WHERE Class = 1
+    INTERSECT
+    SELECT Id FROM Users WHERE Reputation > 7500
+)
+SELECT
+    UES.UserId,
+    UES.DisplayName,
+    UES.Reputation,
+    UES.QuestionsAsked,
+    UES.AnswersProvided,
+    UES.TotalCommentsMade,
+    UES.TotalPostScoreReceived,
+    PHM.TotalRevisions AS MostRevisedPostTotalEdits,
+    PHM.TimesClosed AS MostRevisedPostTimesClosed,
+    BP.BadgeName AS LatestBadgeAcquired,
+    BP.BadgeDate AS LatestBadgeAcquisitionDate,
+    BP.DaysSinceLastBadge,
+    (UES.UpvotesReceivedOnPosts * 2 + UES.UpvotesGivenBySelf * 0.5 - UES.DownvotesReceivedOnPosts * 1.5) AS OverallEngagementScore,
+    COALESCE(U.Location, 'Undisclosed') || ' | ' || COALESCE(U.WebsiteUrl, 'No Website Provided') AS UserLocationAndOnlinePresence,
+    CASE
+        WHEN UES.QuestionsAsked > 0 THEN (CAST(UES.AnswersProvided AS NUMERIC) / UES.QuestionsAsked)
+        ELSE NULL
+    END AS AnswerToQuestionRatio,
+    EXISTS (
+        SELECT 1
+        FROM Posts AS P_ClosedDup
+        WHERE P_ClosedDup.OwnerUserId = UES.UserId
+          AND P_ClosedDup.PostTypeId = 1
+          AND P_ClosedDup.ClosedDate IS NOT NULL
+          AND P_ClosedDup.Id IN (
+                SELECT PL.RelatedPostId
+                FROM PostLinks AS PL
+                WHERE PL.PostId = P_ClosedDup.Id
+                  AND PL.LinkTypeId = 3
+            )
+    ) AS HasDuplicateClosedQuestion,
+    EXISTS (
+        SELECT 1
+        FROM Posts AS P_AcceptedAns
+        WHERE P_AcceptedAns.OwnerUserId = UES.UserId
+          AND P_AcceptedAns.PostTypeId = 2
+          AND P_AcceptedAns.Id = (
+                SELECT Q_Parent.AcceptedAnswerId
+                FROM Posts AS Q_Parent
+                WHERE Q_Parent.Id = P_AcceptedAns.ParentId
+            )
+    ) AS HasAcceptedAnswer
+FROM
+    UserEngagementSummary AS UES
+LEFT JOIN
+    Users AS U ON UES.UserId = U.Id
+LEFT JOIN
+    PostHistoricalMetrics AS PHM ON UES.UserId = PHM.OwnerUserId AND PHM.PostRevisionRankByOwner = 1
+LEFT JOIN
+    BadgeProgression AS BP ON UES.UserId = BP.UserId AND BP.LatestBadgeRank = 1
+WHERE
+    UES.Reputation > 1500
+    AND (UES.QuestionsAsked > 3 OR UES.AnswersProvided > 8)
+    AND UES.TotalCommentsMade > 5
+    AND UES.LatestPostActivity IS NOT NULL
+    AND UES.LatestPostActivity >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '18 months')
+    AND (COALESCE(PHM.MajorContentEdits, 0) < 5 OR PHM.TimesClosed > 1)
+    AND (UES.UserId IN (SELECT UserId FROM HighEngagementUsers)
+         OR UES.UserId IN (SELECT UserId FROM EliteContributors))
+    AND (BP.DaysSinceLastBadge IS NULL OR BP.DaysSinceLastBadge < 730)
+    AND (UES.UpvotesReceivedOnPosts + UES.DownvotesReceivedOnPosts) > 0
+    AND (CAST(UES.DownvotesReceivedOnPosts AS NUMERIC) / (UES.UpvotesReceivedOnPosts + UES.DownvotesReceivedOnPosts)) > 0.15
+    AND UES.UniqueQuestionTagsUsed >= 3
+ORDER BY
+    OverallEngagementScore DESC,
+    UES.Reputation DESC,
+    UES.LastAccessDate DESC
+LIMIT 50;

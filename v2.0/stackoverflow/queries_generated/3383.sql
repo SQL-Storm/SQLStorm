@@ -1,0 +1,124 @@
+-- {"query": "3383.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1966} 
+
+WITH 
+-- Aggregate badge counts per user
+badge_agg AS (
+    SELECT 
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_cnt,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_cnt,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_cnt
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+-- Core user statistics
+user_stats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(ba.gold_cnt,0)   AS gold_badges,
+        COALESCE(ba.silver_cnt,0) AS silver_badges,
+        COALESCE(ba.bronze_cnt,0) AS bronze_badges,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS q_cnt,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS a_cnt,
+        (SELECT MAX(p.CreationDate) FROM Posts p WHERE p.OwnerUserId = u.Id) AS last_post_dt
+    FROM Users u
+    LEFT JOIN badge_agg ba ON ba.UserId = u.Id
+),
+
+-- Votes per post (up‑ and down‑votes)
+post_votes AS (
+    SELECT 
+        v.PostId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS up_votes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS down_votes
+    FROM Votes v
+    GROUP BY v.PostId
+),
+
+-- Question metrics with window function for recent‑question ranking
+question_metrics AS (
+    SELECT 
+        p.Id,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.Tags,
+        COALESCE(pv.up_votes,0) - COALESCE(pv.down_votes,0) AS vote_diff,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    LEFT JOIN post_votes pv ON pv.PostId = p.Id
+    WHERE p.PostTypeId = 1                       -- only questions
+),
+
+-- Keep only the five most recent questions per user
+top_recent_q AS (
+    SELECT *
+    FROM question_metrics
+    WHERE rn <= 5
+),
+
+-- Resolve the latest close reason (if any) for a question
+close_reason AS (
+    SELECT 
+        ph.PostId,
+        CASE 
+            WHEN ph.Comment ~ '^\d+$' THEN ct.Name
+            ELSE NULL
+        END AS reason_name,
+        ph.CreationDate
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes ct ON ct.Id = ph.Comment::int
+    WHERE ph.PostHistoryTypeId = 10               -- Post Closed
+),
+
+latest_close AS (
+    SELECT DISTINCT ON (cr.PostId)
+        cr.PostId,
+        cr.reason_name
+    FROM close_reason cr
+    ORDER BY cr.PostId, cr.CreationDate DESC
+)
+
+SELECT 
+    us.Id,
+    us.DisplayName,
+    us.Reputation,
+    us.gold_badges,
+    us.silver_badges,
+    us.bronze_badges,
+    us.q_cnt,
+    us.a_cnt,
+    us.last_post_dt,
+    tq.Id                     AS recent_q_id,
+    tq.Score                  AS recent_q_score,
+    tq.ViewCount              AS recent_q_views,
+    tq.FavoriteCount          AS recent_q_favs,
+    tq.vote_diff              AS recent_q_vote_diff,
+    CASE 
+        WHEN tq.Tags LIKE '%<sql>%' OR tq.Tags LIKE '%<database>%' THEN 1 
+        ELSE 0 
+    END                       AS has_sql_tag,
+    COALESCE(lc.reason_name,'Open') AS close_status
+FROM user_stats us
+LEFT JOIN top_recent_q tq ON tq.OwnerUserId = us.Id
+LEFT JOIN latest_close lc ON lc.PostId = tq.Id
+WHERE us.Reputation > 5000
+  AND (us.gold_badges + us.silver_badges + us.bronze_badges) >= 10
+  AND (tq.Score IS NULL OR tq.Score > 0)
+ORDER BY 
+    us.Reputation DESC,
+    us.gold_badges DESC,
+    tq.CreationDate DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT 
+    NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,
+    NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL
+WHERE FALSE;

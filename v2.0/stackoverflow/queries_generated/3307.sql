@@ -1,0 +1,133 @@
+-- {"query": "3307.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2591} 
+
+WITH 
+-- Aggregate per user their questions and answers
+user_activity AS (
+    SELECT 
+        u.id                     AS user_id,
+        u.displayname            AS display_name,
+        COUNT(CASE WHEN p.posttypeid = 1 THEN 1 END) AS q_cnt,
+        COUNT(CASE WHEN p.posttypeid = 2 THEN 1 END) AS a_cnt,
+        SUM(CASE WHEN p.posttypeid = 1 THEN p.score ELSE 0 END) AS q_score_sum,
+        SUM(CASE WHEN p.posttypeid = 2 THEN p.score ELSE 0 END) AS a_score_sum,
+        MAX(p.creationdate)      AS last_post_dt
+    FROM users u
+    LEFT JOIN posts p
+        ON p.owneruserid = u.id
+    GROUP BY u.id, u.displayname
+),
+
+-- Most recent badge per user (if any)
+recent_badge AS (
+    SELECT 
+        b.userid,
+        b.name,
+        b.class,
+        b.date,
+        ROW_NUMBER() OVER (PARTITION BY b.userid ORDER BY b.date DESC) AS rn
+    FROM badges b
+),
+
+-- Vote totals per user (only up‑votes)
+user_upvotes AS (
+    SELECT 
+        p.owneruserid                     AS userid,
+        SUM(CASE WHEN v.votetypeid = 2 THEN 1 ELSE 0 END) AS upvote_cnt
+    FROM posts p
+    JOIN votes v ON v.postid = p.id
+    GROUP BY p.owneruserid
+),
+
+-- Extract tags from questions and count usage per user
+user_tags AS (
+    SELECT 
+        p.owneruserid               AS userid,
+        LOWER(TRIM(BOTH '<>' FROM UNNEST(string_to_array(p.tags, '><')))) AS tag,
+        COUNT(*)                    AS tag_cnt
+    FROM posts p
+    WHERE p.posttypeid = 1
+      AND p.tags IS NOT NULL
+    GROUP BY p.owneruserid, tag
+),
+
+-- Top 3 tags per user, ranked by usage
+top_tags AS (
+    SELECT 
+        ut.userid,
+        ut.tag,
+        ut.tag_cnt,
+        ROW_NUMBER() OVER (PARTITION BY ut.userid ORDER BY ut.tag_cnt DESC, ut.tag) AS rn
+    FROM user_tags ut
+)
+
+-- Main result set (users with at least one question AND one answer)
+SELECT
+    ua.user_id,
+    ua.display_name,
+    ua.q_cnt,
+    ua.a_cnt,
+    ua.q_score_sum,
+    ua.a_score_sum,
+    ROUND(
+        CASE 
+            WHEN ua.a_cnt = 0 THEN NULL 
+            ELSE ua.a_score_sum::numeric / ua.a_cnt 
+        END
+    , 2)                                 AS avg_answer_score,
+    COALESCE(rb.name, 'No Badge')        AS recent_badge_name,
+    COALESCE(rb.class, 0)                AS recent_badge_class,
+    COALESCE(uu.upvote_cnt, 0)           AS total_upvotes_received,
+    STRING_AGG(
+        CASE WHEN tt.rn <= 3 THEN tt.tag END,
+        ', '
+    ) FILTER (WHERE tt.rn <= 3)         AS top_3_tags,
+    CASE
+        WHEN ua.q_cnt >= 5 AND ua.a_cnt >= 5 THEN 'Active Q&A'
+        WHEN ua.q_cnt >= 5                     THEN 'Questioner'
+        WHEN ua.a_cnt >= 5                     THEN 'Answerer'
+        ELSE 'Occasional'
+    END                                 AS activity_tier,
+    CASE
+        WHEN ua.q_score_sum IS NULL THEN 'Bronze'
+        WHEN ua.q_score_sum > 1000   THEN 'Gold'
+        WHEN ua.q_score_sum > 500    THEN 'Silver'
+        ELSE 'Bronze'
+    END                                 AS question_score_tier
+FROM user_activity ua
+LEFT JOIN (
+    SELECT userid, name, class, date
+    FROM recent_badge
+    WHERE rn = 1
+) rb ON rb.userid = ua.user_id
+LEFT JOIN user_upvotes uu ON uu.userid = ua.user_id
+LEFT JOIN top_tags tt ON tt.userid = ua.user_id
+WHERE ua.q_cnt > 0
+  AND ua.a_cnt > 0
+GROUP BY 
+    ua.user_id, ua.display_name, ua.q_cnt, ua.a_cnt,
+    ua.q_score_sum, ua.a_score_sum, rb.name, rb.class,
+    uu.upvote_cnt, ua.a_cnt
+HAVING COUNT(*) FILTER (WHERE tt.rn = 1) >= 0
+
+UNION ALL
+
+-- Fallback set: users with no posts and low reputation
+SELECT
+    u.id,
+    u.displayname,
+    0                               AS q_cnt,
+    0                               AS a_cnt,
+    0                               AS q_score_sum,
+    0                               AS a_score_sum,
+    NULL                            AS avg_answer_score,
+    'No Badge'                      AS recent_badge_name,
+    0                               AS recent_badge_class,
+    0                               AS total_upvotes_received,
+    NULL                            AS top_3_tags,
+    'No Activity'                   AS activity_tier,
+    'Bronze'                        AS question_score_tier
+FROM users u
+WHERE NOT EXISTS (SELECT 1 FROM posts p WHERE p.owneruserid = u.id)
+  AND u.reputation < 100
+ORDER BY user_id
+LIMIT 100;

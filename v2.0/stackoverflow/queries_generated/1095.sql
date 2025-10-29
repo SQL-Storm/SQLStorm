@@ -1,0 +1,175 @@
+-- {"query": "1095.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2717} 
+
+WITH UserEngagement AS (
+    -- Calculate various engagement metrics per user
+    SELECT
+        U.Id AS UserId,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.Views AS UserViews,
+        U.UpVotes AS UserUpVotes,
+        U.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COUNT(C.Id) AS TotalComments,
+        COUNT(B.Id) AS TotalBadges,
+        MAX(P.CreationDate) AS LatestPostDate,
+        SUM(P.Score) AS TotalPostScore,
+        AVG(P.Score) FILTER (WHERE P.PostTypeId = 1) AS AvgQuestionScore,
+        AVG(P.Score) FILTER (WHERE P.PostTypeId = 2) AS AvgAnswerScore,
+        (EXTRACT(EPOCH FROM (NOW() - U.CreationDate)) / (3600 * 24))::int AS AccountAgeDays
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    LEFT JOIN Badges AS B ON U.Id = B.UserId
+    GROUP BY U.Id, U.Reputation, U.CreationDate, U.Views, U.UpVotes, U.DownVotes
+),
+PostEditActivity AS (
+    -- Calculate edit counts, unique editors, and parse close/reopen events for each post
+    SELECT
+        PH.PostId,
+        COUNT(PH.Id) AS TotalEdits,
+        COUNT(DISTINCT PH.UserId) AS UniqueEditors,
+        MIN(PH.CreationDate) AS FirstEditDate,
+        MAX(PH.CreationDate) AS LastEditDate,
+        STRING_AGG(DISTINCT
+            CASE
+                WHEN PH.PostHistoryTypeId = 10 AND PH.Comment IS NOT NULL THEN COALESCE(CR_Old.Name, 'Old Reason (ID ' || PH.Comment || ')')
+                WHEN PH.PostHistoryTypeId IN (101, 102, 103, 104, 105) THEN COALESCE(CR_New.Name, 'New Reason (ID ' || PH.PostHistoryTypeId || ')')
+                ELSE NULL
+            END, '; ' ORDER BY PH.CreationDate DESC) FILTER (WHERE PH.PostHistoryTypeId IN (10, 101, 102, 103, 104, 105)) AS AllCloseReasons,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (10, 101, 102, 103, 104, 105) THEN 1 ELSE 0 END) AS CloseCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenCount
+    FROM PostHistory AS PH
+    LEFT JOIN CloseReasonTypes AS CR_Old ON PH.PostHistoryTypeId = 10 AND PH.Comment IS NOT NULL AND CR_Old.Id = CAST(PH.Comment AS smallint)
+    LEFT JOIN CloseReasonTypes AS CR_New ON PH.PostHistoryTypeId IN (101, 102, 103, 104, 105) AND CR_New.Id = PH.PostHistoryTypeId
+    GROUP BY PH.PostId
+),
+PostLinkSummary AS (
+    -- Summarize linked and duplicate posts for each post
+    SELECT
+        PL.PostId,
+        COUNT(CASE WHEN PL.LinkTypeId = 1 THEN PL.RelatedPostId ELSE NULL END) AS LinkedPostsCount,
+        COUNT(CASE WHEN PL.LinkTypeId = 3 THEN PL.RelatedPostId ELSE NULL END) AS DuplicatePostsCount,
+        STRING_AGG(DISTINCT
+            CASE WHEN PL.LinkTypeId = 3 THEN CAST(PL.RelatedPostId AS varchar) ELSE NULL END, ', '
+            ORDER BY PL.RelatedPostId DESC) AS DuplicateOfPostIds
+    FROM PostLinks AS PL
+    GROUP BY PL.PostId
+),
+CommentSentiment AS (
+    -- Identify the most impactful comment per post based on score, then length
+    SELECT
+        C.PostId,
+        C.Id AS CommentId,
+        C.Score AS CommentScore,
+        LENGTH(C.Text) AS CommentLength,
+        C.CreationDate AS CommentCreationDate,
+        U.DisplayName AS CommenterDisplayName,
+        ROW_NUMBER() OVER(PARTITION BY C.PostId ORDER BY C.Score DESC, LENGTH(C.Text) DESC) AS rn_top_comment
+    FROM Comments AS C
+    LEFT JOIN Users AS U ON C.UserId = U.Id
+),
+QuestionAnswerDetails AS (
+    -- Detailed information for questions, including accepted answer details and average answer score
+    SELECT
+        Q.Id AS QuestionId,
+        Q.Title AS QuestionTitle,
+        Q.Score AS QuestionScore,
+        Q.ViewCount AS QuestionViewCount,
+        Q.AnswerCount AS QuestionAnswerCount,
+        Q.CreationDate AS QuestionCreationDate,
+        Q.LastActivityDate AS QuestionLastActivityDate,
+        Q.OwnerUserId AS QuestionOwnerId,
+        Q.ClosedDate AS QuestionClosedDate,
+        Q.CommunityOwnedDate AS QuestionCommunityOwnedDate,
+        A.Id AS AcceptedAnswerId,
+        A.Score AS AcceptedAnswerScore,
+        A.OwnerUserId AS AcceptedAnswerOwnerId,
+        A.CreationDate AS AcceptedAnswerCreationDate,
+        -- Correlated subquery to calculate average score of all answers for a question
+        (SELECT AVG(SubA.Score) FROM Posts AS SubA WHERE SubA.ParentId = Q.Id AND SubA.PostTypeId = 2) AS AvgAnswerScoreForQuestion,
+        -- Split and format tags, limit tag length
+        STRING_AGG(DISTINCT
+            REPLACE(TRIM(SUBSTRING(unnest(string_to_array(SUBSTRING(Q.Tags, 2, LENGTH(Q.Tags) - 2), '><')), 1, 30)), '&amp;', '&'), ', ')
+            FILTER (WHERE Q.Tags IS NOT NULL) AS FormattedTags
+    FROM Posts AS Q
+    LEFT JOIN Posts AS A ON Q.AcceptedAnswerId = A.Id
+    WHERE Q.PostTypeId = 1 -- Only questions
+)
+-- Main query combining all CTEs to generate a comprehensive report on high-impact questions
+SELECT
+    QAD.QuestionId,
+    QAD.QuestionTitle,
+    QAD.QuestionScore,
+    QAD.QuestionViewCount,
+    QAD.QuestionAnswerCount,
+    QAD.QuestionCreationDate,
+    QAD.QuestionLastActivityDate,
+    QAD.QuestionClosedDate,
+    QAD.QuestionCommunityOwnedDate,
+    QAD.FormattedTags,
+    UE_Q.Reputation AS QuestionOwnerReputation,
+    UE_Q.AccountAgeDays AS QuestionOwnerAccountAgeDays,
+    COALESCE(UE_Q.TotalQuestions, 0) AS QuestionOwnerTotalQuestions,
+    COALESCE(UE_Q.TotalAnswers, 0) AS QuestionOwnerTotalAnswers,
+    COALESCE(PEA.TotalEdits, 0) AS TotalPostEdits,
+    COALESCE(PEA.UniqueEditors, 0) AS UniquePostEditors,
+    PEA.AllCloseReasons,
+    COALESCE(PEA.CloseCount, 0) AS PostCloseCount,
+    COALESCE(PEA.ReopenCount, 0) AS PostReopenCount,
+    COALESCE(PLS.LinkedPostsCount, 0) AS RelatedLinksCount,
+    COALESCE(PLS.DuplicatePostsCount, 0) AS DuplicatesCount,
+    PLS.DuplicateOfPostIds,
+    CASE
+        WHEN QAD.AcceptedAnswerId IS NOT NULL THEN 'Has Accepted Answer'
+        WHEN QAD.QuestionAnswerCount > 0 THEN 'Has Answers, No Accepted'
+        ELSE 'No Answers'
+    END AS AnswerStatus,
+    QAD.AcceptedAnswerScore,
+    QAD.AvgAnswerScoreForQuestion,
+    UE_A.Reputation AS AcceptedAnswerOwnerReputation,
+    CS.CommentScore AS TopCommentScore,
+    CS.CommentLength AS TopCommentLength,
+    CS.CommenterDisplayName AS TopCommenter,
+    -- Window function: Rank questions globally by score and view count
+    DENSE_RANK() OVER (ORDER BY QAD.QuestionScore DESC, QAD.QuestionViewCount DESC) AS GlobalScoreRank,
+    -- Window function: Calculate the average view count for questions created in the same month
+    AVG(QAD.QuestionViewCount) OVER (PARTITION BY DATE_TRUNC('month', QAD.QuestionCreationDate)) AS AvgMonthlyQuestionViews,
+    -- Window function: Find the previous question's score by the same owner
+    LAG(QAD.QuestionScore, 1, 0) OVER (PARTITION BY QAD.QuestionOwnerId ORDER BY QAD.QuestionCreationDate) AS PrevQuestionScoreByOwner,
+    -- Complex calculation: Percentage of closed questions for the owner, handling division by zero
+    CAST(COALESCE(PEA.CloseCount, 0) AS NUMERIC) / NULLIF(UE_Q.TotalQuestions, 0) AS OwnerCloseRate,
+    -- Complex predicate: Identify potentially high-impact questions
+    (QAD.QuestionViewCount > 50000 AND QAD.QuestionAnswerCount > 10 AND QAD.QuestionScore > 100) AS IsHighImpactQuestion,
+    -- String manipulation and NULL logic: Process the question title snippet
+    COALESCE(
+        REPLACE(
+            REPLACE(
+                LOWER(SUBSTRING(QAD.QuestionTitle FROM 1 FOR 50)),
+                'sql', 'database'
+            ),
+            'c#', 'dotnet'
+        ),
+        'NO TITLE PROVIDED'
+    ) AS ProcessedTitleSnippet,
+    -- Check for presence of 'gold' badges for the question owner using a subquery
+    (SELECT COUNT(B.Id) FROM Badges AS B WHERE B.UserId = QAD.QuestionOwnerId AND B.Class = 1) > 0 AS HasGoldBadge
+FROM QuestionAnswerDetails AS QAD
+LEFT JOIN UserEngagement AS UE_Q ON QAD.QuestionOwnerId = UE_Q.UserId
+LEFT JOIN UserEngagement AS UE_A ON QAD.AcceptedAnswerOwnerId = UE_A.UserId
+LEFT JOIN PostEditActivity AS PEA ON QAD.QuestionId = PEA.PostId
+LEFT JOIN PostLinkSummary AS PLS ON QAD.QuestionId = PLS.PostId
+LEFT JOIN CommentSentiment AS CS ON QAD.QuestionId = CS.PostId AND CS.rn_top_comment = 1
+WHERE
+    QAD.QuestionCreationDate >= NOW() - INTERVAL '5 year' -- Filter for questions posted in the last 5 years
+    AND QAD.QuestionTitle IS NOT NULL -- Ensure a title exists
+    AND (
+        QAD.QuestionClosedDate IS NULL OR -- Include open questions
+        (COALESCE(PEA.CloseCount, 0) > 0 AND COALESCE(PEA.ReopenCount, 0) > 0) OR -- Or questions that were closed AND reopened
+        (COALESCE(PEA.CloseCount, 0) > 0 AND QAD.QuestionClosedDate IS NOT NULL AND QAD.QuestionClosedDate >= NOW() - INTERVAL '1 year') -- Or recently closed questions
+    )
+    AND EXISTS (SELECT 1 FROM Posts AS Ans WHERE Ans.ParentId = QAD.QuestionId AND Ans.PostTypeId = 2) -- Ensure the question has at least one answer
+ORDER BY GlobalScoreRank ASC, QAD.QuestionCreationDate DESC, QAD.QuestionId ASC
+LIMIT 1000;

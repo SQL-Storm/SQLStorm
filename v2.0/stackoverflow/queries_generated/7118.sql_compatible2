@@ -1,0 +1,217 @@
+WITH 
+  RecentQuestions AS (
+    SELECT 
+      p.Id,
+      p.Title,
+      p.CreationDate,
+      p.Score,
+      p.ViewCount,
+      p.OwnerUserId,
+      p.AnswerCount,
+      p.CommentCount,
+      p.Tags,
+      ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1 
+      AND p.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6 months')
+  ),
+  UserActivity AS (
+    SELECT 
+      u.Id as UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.Views,
+      u.UpVotes,
+      u.DownVotes,
+      COUNT(DISTINCT r.Id) as RecentQuestionsCount,
+      COUNT(DISTINCT c.Id) as CommentCount,
+      COUNT(DISTINCT b.Id) as BadgeCount,
+      SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) as QuestionCount,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) as AnswerCount,
+      MAX(p.Score) as MaxScore,
+      AVG(p.Score) as AvgScore,
+      STRING_AGG(p.Tags, '; ') as AllTags
+    FROM Users u
+    LEFT JOIN RecentQuestions r ON u.Id = r.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year')
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+  ),
+  QualityPosts AS (
+    SELECT 
+      p.Id,
+      p.Title,
+      p.Score,
+      p.ViewCount,
+      p.AnswerCount,
+      p.CommentCount,
+      p.Tags,
+      p.OwnerUserId,
+      p.CreationDate,
+      (p.Score * 1.0 / NULLIF(p.ViewCount, 0)) as ScorePerView,
+      CASE 
+        WHEN p.AnswerCount > 0 AND p.Score > 10 THEN 'HighQuality'
+        WHEN p.AnswerCount = 0 AND p.Score > 5 THEN 'GoodQuality'
+        ELSE 'LowQuality'
+      END as QualityLevel,
+      DENSE_RANK() OVER (ORDER BY p.Score DESC) as ScoreRank
+    FROM Posts p
+    WHERE p.PostTypeId = 1 
+      AND p.Score >= 0
+      AND p.ViewCount IS NOT NULL
+      AND p.ViewCount > 0
+  ),
+  TopUsers AS (
+    SELECT 
+      ua.UserId,
+      ua.DisplayName,
+      ua.Reputation,
+      ua.RecentQuestionsCount,
+      ua.CommentCount,
+      ua.BadgeCount,
+      ua.QuestionCount,
+      ua.AnswerCount,
+      ua.MaxScore,
+      ua.AvgScore,
+      ua.AllTags,
+      ROW_NUMBER() OVER (ORDER BY ua.Reputation DESC, ua.QuestionCount DESC) as RankByReputation,
+      ROW_NUMBER() OVER (ORDER BY ua.QuestionCount DESC, ua.Reputation DESC) as RankByQuestions
+    FROM UserActivity ua
+    WHERE ua.RecentQuestionsCount >= 2
+  ),
+  CommunityInsights AS (
+    SELECT 
+      'Overall' as Category,
+      COUNT(*) as TotalPosts,
+      AVG(Score) as AvgScore,
+      SUM(ViewCount) as TotalViews,
+      COUNT(DISTINCT OwnerUserId) as ActiveUsers,
+      COUNT(DISTINCT Tags) as UniqueTags,
+      MIN(CreationDate) as EarliestPost,
+      MAX(CreationDate) as LatestPost,
+      STRING_AGG(DISTINCT Tags, '; ') as AllTags
+    FROM Posts 
+    WHERE PostTypeId = 1 AND Score >= 0
+    
+    UNION ALL
+    
+    SELECT 
+      'HighScoring' as Category,
+      COUNT(*) as TotalPosts,
+      AVG(Score) as AvgScore,
+      SUM(ViewCount) as TotalViews,
+      COUNT(DISTINCT OwnerUserId) as ActiveUsers,
+      COUNT(DISTINCT Tags) as UniqueTags,
+      MIN(CreationDate) as EarliestPost,
+      MAX(CreationDate) as LatestPost,
+      STRING_AGG(DISTINCT Tags, '; ') as AllTags
+    FROM Posts 
+    WHERE PostTypeId = 1 AND Score > 100
+    
+    UNION ALL
+    
+    SELECT 
+      'Popular' as Category,
+      COUNT(*) as TotalPosts,
+      AVG(Score) as AvgScore,
+      SUM(ViewCount) as TotalViews,
+      COUNT(DISTINCT OwnerUserId) as ActiveUsers,
+      COUNT(DISTINCT Tags) as UniqueTags,
+      MIN(CreationDate) as EarliestPost,
+      MAX(CreationDate) as LatestPost,
+      STRING_AGG(DISTINCT Tags, '; ') as AllTags
+    FROM Posts 
+    WHERE PostTypeId = 1 AND ViewCount > 1000
+  )
+SELECT 
+  tu.UserId,
+  tu.DisplayName,
+  tu.Reputation,
+  tu.RecentQuestionsCount,
+  tu.CommentCount,
+  tu.BadgeCount,
+  tu.QuestionCount,
+  tu.AnswerCount,
+  tu.MaxScore,
+  tu.AvgScore,
+  tu.AllTags,
+  tu.RankByReputation,
+  tu.RankByQuestions,
+  COALESCE(qp.ScorePerView, 0) as ScorePerView,
+  COALESCE(qp.QualityLevel, 'Unknown') as QualityLevel,
+  COALESCE(qp.ScoreRank, 0) as ScoreRank,
+  ci.Category,
+  ci.TotalPosts,
+  ci.AvgScore as CategoryAvgScore,
+  ci.TotalViews,
+  ci.ActiveUsers as CategoryActiveUsers,
+  ci.EarliestPost,
+  ci.LatestPost,
+  CASE 
+    WHEN tu.Reputation > 10000 AND tu.QuestionCount > 50 THEN 'Elite'
+    WHEN tu.Reputation > 5000 AND tu.QuestionCount > 25 THEN 'Veteran'
+    WHEN tu.Reputation > 1000 THEN 'Active'
+    ELSE 'Newbie'
+  END as UserTier,
+  CASE 
+    WHEN tu.RecentQuestionsCount >= 5 AND tu.Reputation > 1000 THEN 1
+    WHEN tu.RecentQuestionsCount >= 2 AND tu.Reputation > 500 THEN 1
+    ELSE 0
+  END as ActiveInLastMonth,
+  CASE 
+    WHEN EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = tu.UserId AND b.Name IN ('Good Question', 'Great Question')) THEN 'Awarded'
+    WHEN EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = tu.UserId AND p.Score > 100 AND p.PostTypeId = 1) THEN 'HighScoring'
+    ELSE 'Regular'
+  END as RecognitionStatus,
+  CAST((tu.Reputation * 1.0 / NULLIF(tu.QuestionCount, 0)) AS DECIMAL(10,2)) as ReputationPerQuestion,
+  CASE 
+    WHEN tu.QuestionCount > 0 THEN (CAST(tu.AnswerCount AS DOUBLE PRECISION) * 100 / NULLIF(tu.QuestionCount, 0))
+    ELSE 0 
+  END as AnswerPercentage,
+  (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = tu.UserId AND p.PostTypeId = 1 AND p.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 weeks')) as QuestionsLast2Weeks,
+  ('https://stackoverflow.com/users/' || tu.UserId || '/' || REPLACE(tu.DisplayName, ' ', '-')) as ProfileUrl
+FROM TopUsers tu
+LEFT JOIN QualityPosts qp ON tu.UserId = qp.OwnerUserId
+LEFT JOIN CommunityInsights ci ON ci.Category = (
+  CASE 
+    WHEN tu.Reputation > 10000 THEN 'HighScoring'
+    WHEN tu.QuestionCount > 50 THEN 'HighScoring'
+    WHEN tu.Reputation > 5000 THEN 'Popular'
+    ELSE 'Overall'
+  END
+)
+WHERE tu.Reputation > 100
+  AND ( (qp.ScoreRank IS NOT NULL AND qp.ScoreRank <= 50) OR ci.Category IN ('HighScoring', 'Popular'))
+GROUP BY
+  tu.UserId,
+  tu.DisplayName,
+  tu.Reputation,
+  tu.RecentQuestionsCount,
+  tu.CommentCount,
+  tu.BadgeCount,
+  tu.QuestionCount,
+  tu.AnswerCount,
+  tu.MaxScore,
+  tu.AvgScore,
+  tu.AllTags,
+  tu.RankByReputation,
+  tu.RankByQuestions,
+  qp.ScorePerView,
+  qp.QualityLevel,
+  qp.ScoreRank,
+  ci.Category,
+  ci.TotalPosts,
+  ci.AvgScore,
+  ci.TotalViews,
+  ci.ActiveUsers,
+  ci.EarliestPost,
+  ci.LatestPost
+ORDER BY 
+  CASE WHEN ci.Category = 'HighScoring' THEN 1 WHEN ci.Category = 'Popular' THEN 2 ELSE 3 END,
+  tu.Reputation DESC,
+  tu.QuestionCount DESC,
+  qp.ScoreRank ASC
+OFFSET 0 ROWS
+FETCH NEXT 1000 ROWS ONLY;

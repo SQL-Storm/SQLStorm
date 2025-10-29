@@ -1,0 +1,72 @@
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id ELSE NULL END) AS TotalQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id ELSE NULL END) AS TotalAnswers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 3 THEN p.Id ELSE NULL END) AS TotalWikis,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.PostId ELSE NULL END) AS TotalUpVotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.PostId ELSE NULL END) AS TotalDownVotes,
+    MAX(p.Score) AS HighestScoredPost,
+    AVG(p.Score) AS AverageScore,
+    MIN(p.LastEditDate) AS FirstEditedPost,
+    MAX(p.LastEditDate) AS MostRecentlyEditedPost,
+    STRING_AGG(DISTINCT t.TagName, ', ') AS MostCommonTags,
+    (
+        SELECT COUNT(*) 
+        FROM Badges b 
+        WHERE b.UserId = u.Id AND b.Class = 1
+    ) AS GoldBadgeCount,
+    (
+        SELECT COUNT(*) 
+        FROM Badges b 
+        WHERE b.UserId = u.Id AND b.Class = 2
+    ) AS SilverBadgeCount,
+    (
+        SELECT COUNT(*) 
+        FROM Badges b 
+        WHERE b.UserId = u.Id AND b.Class = 3
+    ) AS BronzeBadgeCount,
+    (
+        SELECT COUNT(*) 
+        FROM Comments c 
+        WHERE c.UserId = u.Id
+    ) AS CommentCount,
+    (
+        SELECT SUM(p2.Score) 
+        FROM Posts p2 
+        WHERE p2.OwnerUserId = u.Id 
+    ) AS TotalOwnerScore,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p3 
+        WHERE p3.AcceptedAnswerId IS NOT NULL AND p3.OwnerUserId = u.Id
+    ) AS AcceptedAnswerCount
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+LEFT JOIN 
+    Tags t ON t.TagName = TRIM(BOTH '>' FROM TRIM(BOTH '<' FROM t.TagName)) -- no-op placeholder to ensure tag table is available
+    OR EXISTS (
+        SELECT 1
+        FROM (
+            SELECT UNNEST(
+                CASE 
+                    WHEN p.Tags IS NULL THEN ARRAY[]::text[] 
+                    ELSE regexp_split_to_array(p.Tags, '[<>]+')
+                END
+            ) AS tag
+        ) s
+        WHERE s.tag <> '' AND s.tag = t.TagName
+    )
+GROUP BY 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.Location
+ORDER BY 
+    u.Reputation DESC;

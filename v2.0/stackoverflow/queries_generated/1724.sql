@@ -1,0 +1,249 @@
+-- {"query": "1724.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3463} 
+WITH UserEngagement AS (
+    -- Summarize user engagement metrics for older, active users
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesGiven,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesGiven,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        MAX(CASE WHEN B.Class = 1 THEN B.Date ELSE NULL END) AS LatestGoldBadgeDate,
+        AVG(P.Score) AS AvgPostScore,
+        SUM(P.ViewCount) AS TotalPostViews,
+        COALESCE(U.Location, 'Unknown') AS UserLocation,
+        CASE
+            WHEN U.AboutMe IS NOT NULL AND LENGTH(U.AboutMe) > 100 THEN 'Verbose'
+            WHEN U.AboutMe IS NOT NULL AND LENGTH(U.AboutMe) <= 100 THEN 'Concise'
+            ELSE 'NoDescription'
+        END AS AboutMeCategory
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Votes V ON U.Id = V.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    WHERE U.Reputation > 500
+      AND U.LastAccessDate >= '2023-01-01'
+      AND U.CreationDate < '2022-01-01'
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Location, U.AboutMe
+),
+QuestionMetrics AS (
+    -- Detailed metrics for questions, including answers, edit history, and tags
+    SELECT
+        Q.Id AS QuestionId,
+        Q.Title AS QuestionTitle,
+        Q.CreationDate AS QuestionCreationDate,
+        Q.Score AS QuestionScore,
+        Q.ViewCount,
+        Q.OwnerUserId AS QuestionOwnerId,
+        Q.AnswerCount AS DeclaredAnswerCount,
+        Q.LastEditDate AS LatestEditDateForQuestion,
+        COUNT(A.Id) AS ActualAnswerCount,
+        SUM(CASE WHEN A.AcceptedAnswerId = Q.Id THEN 1 ELSE 0 END) AS AcceptedAnswerCount,
+        AVG(A.Score) AS AvgAnswerScore,
+        MAX(A.CreationDate) AS LatestAnswerDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (10, 101) THEN PH.CreationDate ELSE NULL END) AS ClosedDate,
+        MIN(CASE WHEN PH.PostHistoryTypeId = 11 THEN PH.CreationDate ELSE NULL END) AS ReopenedDate,
+        STRING_AGG(DISTINCT T.TagName, ',') FILTER (WHERE T.TagName IS NOT NULL) AS QuestionTagsList,
+        MAX(Q.FavoriteCount) AS QuestionFavoriteCount
+    FROM Posts Q
+    LEFT JOIN Posts A ON Q.Id = A.ParentId AND A.PostTypeId = 2
+    LEFT JOIN PostHistory PH ON Q.Id = PH.PostId AND PH.PostHistoryTypeId IN (10, 11, 101)
+    LEFT JOIN LATERAL (SELECT UNNEST(string_to_array(substring(Q.Tags, 2, length(Q.Tags)-2), '><')) AS TagName) AS TagList ON TRUE
+    LEFT JOIN Tags T ON TagList.TagName = T.TagName
+    WHERE Q.PostTypeId = 1
+      AND Q.ViewCount > 1000
+      AND Q.CreationDate BETWEEN '2020-01-01' AND '2023-12-31'
+    GROUP BY Q.Id, Q.Title, Q.CreationDate, Q.Score, Q.ViewCount, Q.OwnerUserId, Q.AnswerCount, Q.LastEditDate, Q.FavoriteCount
+),
+TopTagsByPostCount AS (
+    -- Identify top tags based on recent post usage
+    SELECT
+        TagName,
+        COUNT(P.Id) AS TagPostCount,
+        ROW_NUMBER() OVER (ORDER BY COUNT(P.Id) DESC, TagName ASC) AS TagRank
+    FROM Posts P
+    JOIN LATERAL (SELECT UNNEST(string_to_array(substring(P.Tags, 2, length(P.Tags)-2), '><')) AS TagName) AS TagList ON TRUE
+    WHERE P.PostTypeId IN (1, 4, 5)
+      AND P.CreationDate >= '2022-01-01'
+    GROUP BY TagName
+    HAVING COUNT(P.Id) > 500
+),
+ModerationActions AS (
+    -- Analyze moderation actions on posts by users, ordered to get the latest
+    SELECT
+        PH.UserId,
+        PH.PostId,
+        PH.PostHistoryTypeId,
+        PH.CreationDate AS ActionDate,
+        PH.Comment,
+        LEAD(PH.PostHistoryTypeId) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) AS NextActionType,
+        LAG(PH.PostHistoryTypeId) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) AS PrevActionType,
+        ROW_NUMBER() OVER (PARTITION BY PH.PostId, PH.UserId ORDER BY PH.CreationDate DESC) AS rn
+    FROM PostHistory PH
+    WHERE PH.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20)
+      AND PH.UserId IS NOT NULL
+      AND PH.CreationDate >= '2023-01-01'
+),
+CombinedPostAndUserScores AS (
+    -- Calculate user and post aggregated scores and user's average badge class
+    SELECT
+        UE.UserId,
+        UE.DisplayName,
+        UE.Reputation,
+        QM.QuestionId,
+        QM.QuestionTitle,
+        QM.QuestionScore,
+        QM.ViewCount,
+        QM.ActualAnswerCount,
+        QM.AvgAnswerScore,
+        (QM.QuestionScore * 0.5 + QM.ViewCount * 0.01 + QM.ActualAnswerCount * 2 + COALESCE(QM.QuestionFavoriteCount, 0) * 3) AS WeightedPostScore,
+        (SELECT AVG(B2.Class) FROM Badges B2 WHERE B2.UserId = UE.UserId) AS AvgBadgeClassForUser
+    FROM UserEngagement UE
+    INNER JOIN QuestionMetrics QM ON UE.UserId = QM.QuestionOwnerId
+    WHERE QM.AvgAnswerScore IS NOT NULL
+      AND UE.TotalPosts > 10
+),
+UserPostRanking AS (
+    -- Rank users based on their weighted post scores and overall reputation
+    SELECT
+        CPS.UserId,
+        CPS.DisplayName,
+        CPS.Reputation,
+        CPS.QuestionId,
+        CPS.QuestionTitle,
+        CPS.WeightedPostScore,
+        CPS.AvgBadgeClassForUser,
+        RANK() OVER (PARTITION BY CPS.UserId ORDER BY CPS.WeightedPostScore DESC, CPS.QuestionTitle ASC) AS PostRankByUser,
+        NTILE(4) OVER (ORDER BY CPS.WeightedPostScore DESC) AS WeightedScoreQuartile,
+        ROW_NUMBER() OVER (ORDER BY CPS.Reputation DESC, CPS.WeightedPostScore DESC) AS GlobalUserPostRank
+    FROM CombinedPostAndUserScores CPS
+),
+HotTopicsBasedOnHistory AS (
+    -- Identify questions with significant recent activity (close/reopen or high upvotes)
+    SELECT
+        P.Id AS PostId,
+        P.Title AS PostTitle,
+        P.PostTypeId,
+        P.CreationDate AS PostCreationDate,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (10, 101) THEN 1 ELSE 0 END) AS CloseCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenCount,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvoteCountRecent,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvoteCountRecent,
+        COUNT(DISTINCT C.Id) AS CommentCountRecent
+    FROM Posts P
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    LEFT JOIN Votes V ON P.Id = V.PostId AND V.CreationDate >= (NOW() - INTERVAL '30 days')
+    LEFT JOIN Comments C ON P.Id = C.PostId AND C.CreationDate >= (NOW() - INTERVAL '30 days')
+    WHERE P.PostTypeId = 1
+      AND P.CreationDate >= (NOW() - INTERVAL '1 year')
+    GROUP BY P.Id, P.Title, P.PostTypeId, P.CreationDate
+    HAVING (SUM(CASE WHEN PH.PostHistoryTypeId IN (10, 101) THEN 1 ELSE 0 END) > 0 AND SUM(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) > 0)
+       OR (SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) > 50 AND SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) = 0)
+),
+LatestCrossReferencedPosts AS (
+    -- Get the latest linked or duplicate post for each PostId
+    SELECT
+        PL.PostId,
+        P.Title AS PostTitle,
+        PL.RelatedPostId,
+        PR.Title AS RelatedPostTitle,
+        LT.Name AS LinkTypeName,
+        PL.CreationDate AS LinkCreationDate,
+        ROW_NUMBER() OVER (PARTITION BY PL.PostId ORDER BY PL.CreationDate DESC) AS rn
+    FROM PostLinks PL
+    JOIN Posts P ON PL.PostId = P.Id
+    JOIN Posts PR ON PL.RelatedPostId = PR.Id
+    JOIN LinkTypes LT ON PL.LinkTypeId = LT.Id
+    WHERE LT.Id IN (1, 3)
+      AND PL.CreationDate >= '2023-01-01'
+)
+-- Main Query: Combine and analyze various aspects of user and post performance
+SELECT
+    UPR.UserId,
+    UPR.DisplayName,
+    UPR.Reputation,
+    UPR.QuestionId,
+    UPR.QuestionTitle,
+    UPR.WeightedPostScore,
+    UPR.PostRankByUser,
+    UPR.WeightedScoreQuartile,
+    UPR.GlobalUserPostRank,
+    UE.TotalPosts,
+    UE.TotalBadges,
+    UE.AvgPostScore,
+    UE.AboutMeCategory,
+    UE.UserLocation,
+    QM.ActualAnswerCount,
+    QM.AvgAnswerScore,
+    QM.ClosedDate,
+    QM.ReopenedDate,
+    COALESCE(QM.QuestionTagsList, 'untagged') AS QuestionTagsList,
+    TT.TagPostCount AS MainTagPostCount,
+    TT.TagRank AS MainTagRank,
+    MA.ActionDate AS LatestModerationActionDate,
+    MA.PostHistoryTypeId AS LatestModerationActionType,
+    MA.PrevActionType AS PrecedingModerationAction,
+    MA.NextActionType AS SubsequentModerationAction,
+    HT.CloseCount AS RecentCloseEvents,
+    HT.ReopenCount AS RecentReopenEvents,
+    HT.UpvoteCountRecent AS RecentUpvotesOnHotTopic,
+    LCRP.LinkTypeName AS LatestLinkType,
+    LCRP.RelatedPostTitle AS LatestRelatedPostTitle,
+    -- Correlated subquery: Count comments made *after* the latest link was created for the current question
+    (
+        SELECT COUNT(C_SQ.Id)
+        FROM Comments C_SQ
+        WHERE C_SQ.PostId = UPR.QuestionId
+          AND C_SQ.CreationDate > COALESCE(LCRP.LinkCreationDate, UPR.QuestionCreationDate)
+    ) AS CommentsAfterLatestLink,
+    -- Correlated subquery: Get the text of the most upvoted comment on the current question
+    (
+        SELECT C_SQ.Text
+        FROM Comments C_SQ
+        WHERE C_SQ.PostId = UPR.QuestionId
+        ORDER BY C_SQ.Score DESC, C_SQ.CreationDate DESC
+        LIMIT 1
+    ) AS TopCommentText,
+    -- Correlated subquery: Check if the user has any gold badges newer than their latest *post edit* on this specific question
+    (
+        SELECT
+            CASE
+                WHEN EXISTS (
+                    SELECT 1
+                    FROM Badges B_SQ
+                    WHERE B_SQ.UserId = UPR.UserId
+                      AND B_SQ.Class = 1
+                      AND B_SQ.Date > QM.LatestEditDateForQuestion
+                ) THEN TRUE
+                ELSE FALSE
+            END
+    ) AS HasNewerGoldBadgeThanLastEdit,
+    NULLIF(LOWER(SUBSTRING(UE.DisplayName, 1, 3)), 'adm') AS DisplayNamePrefixIfNoAdmin
+FROM UserPostRanking UPR
+INNER JOIN UserEngagement UE ON UPR.UserId = UE.UserId
+INNER JOIN QuestionMetrics QM ON UPR.QuestionId = QM.QuestionId
+LEFT JOIN TopTagsByPostCount TT ON QM.QuestionTagsList LIKE '%' || TT.TagName || '%' AND TT.TagRank = 1
+LEFT JOIN ModerationActions MA ON UPR.QuestionId = MA.PostId AND UPR.UserId = MA.UserId AND MA.rn = 1
+LEFT JOIN HotTopicsBasedOnHistory HT ON UPR.QuestionId = HT.PostId
+LEFT JOIN LatestCrossReferencedPosts LCRP ON UPR.QuestionId = LCRP.PostId AND LCRP.rn = 1
+WHERE UPR.WeightedScoreQuartile IN (1, 2)
+  AND UPR.PostRankByUser = 1
+  AND UPR.Reputation > 10000
+  AND (UPR.AvgBadgeClassForUser IS NULL OR UPR.AvgBadgeClassForUser > 2.0)
+  AND EXISTS (
+        -- Subquery in WHERE: Check if the user has at least one post with more than 50 comments created recently
+        SELECT 1
+        FROM Posts P_EXISTS
+        WHERE P_EXISTS.OwnerUserId = UPR.UserId
+          AND P_EXISTS.CommentCount > 50
+          AND P_EXISTS.CreationDate >= '2023-01-01'
+    )
+ORDER BY UPR.GlobalUserPostRank ASC, UPR.Reputation DESC, UPR.WeightedPostScore DESC
+LIMIT 1000;

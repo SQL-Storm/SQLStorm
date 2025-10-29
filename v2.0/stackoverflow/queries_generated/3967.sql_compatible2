@@ -1,0 +1,128 @@
+WITH 
+UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.Location, '[unknown]') AS Location,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COUNT(p.Id) AS TotalPosts,
+        AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL) AS AvgScore,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location
+),
+RecentActivity AS (
+    SELECT 
+        u.Id,
+        MAX(v.CreationDate) AS LastVoteDate,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM Users u
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    GROUP BY u.Id
+),
+TagAggregates AS (
+    SELECT 
+        p.OwnerUserId AS UserId,
+        STRING_AGG(DISTINCT t.TagName, ',') AS TagsUsed
+    FROM Posts p
+    CROSS JOIN LATERAL (
+        -- split tag string like '<tag1><tag2>' into rows using standard SQL functions
+        WITH RECURSIVE parts(pos, rest) AS (
+            SELECT 1, p.Tags
+            UNION ALL
+            SELECT
+                pos + CASE WHEN CHAR_LENGTH(rest) = 0 THEN 0 ELSE (POSITION('><' IN rest) + 2) END,
+                CASE WHEN POSITION('><' IN rest) > 0 THEN SUBSTRING(rest FROM POSITION('><' IN rest) + 2) ELSE '' END
+            FROM parts
+            WHERE rest IS NOT NULL AND rest <> '' AND POSITION('><' IN rest) > 0
+        ), extracted AS (
+            SELECT
+                TRIM(BOTH '<>' FROM
+                    CASE
+                        WHEN POSITION('><' IN rest) > 0 THEN SUBSTRING(rest FROM 1 FOR POSITION('><' IN rest) - 1)
+                        ELSE rest
+                    END
+                ) AS tag
+            FROM parts
+            UNION ALL
+            -- also include the last part when there is no '><' left
+            SELECT
+                TRIM(BOTH '<>' FROM rest) AS tag
+            FROM parts
+            WHERE rest IS NOT NULL AND rest <> '' AND POSITION('><' IN rest) = 0
+        )
+        SELECT tag FROM extracted WHERE tag IS NOT NULL AND tag <> ''
+    ) AS tag_raw
+    JOIN Tags t ON t.TagName = tag_raw.tag
+    WHERE p.PostTypeId = 1
+    GROUP BY p.OwnerUserId
+),
+TopUsers AS (
+    SELECT 
+        us.Id,
+        us.DisplayName,
+        us.Reputation,
+        us.GoldBadges,
+        us.SilverBadges,
+        us.BronzeBadges,
+        us.TotalPosts,
+        us.AvgScore,
+        us.LastPostDate,
+        ra.LastVoteDate,
+        ra.LastCommentDate,
+        COALESCE(ta.TagsUsed, '') AS TagsUsed,
+        ROW_NUMBER() OVER (ORDER BY us.Reputation DESC, us.TotalPosts DESC) AS RankByRep
+    FROM UserStats us
+    LEFT JOIN RecentActivity ra ON ra.Id = us.Id
+    LEFT JOIN TagAggregates ta ON ta.UserId = us.Id
+    WHERE us.Reputation > 1000
+),
+ClosedDuplicatePosts AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        CAST(ph.Comment AS INTEGER) AS CloseReasonId,
+        (CAST(ph.Text AS JSON) ->> 'OriginalQuestionIds') AS DuplicatesJson,
+        pl.RelatedPostId AS DuplicateOf
+    FROM Posts p
+    JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id AND pl.LinkTypeId = 3
+    WHERE p.ClosedDate IS NOT NULL
+),
+Combined AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.RankByRep,
+        u.TagsUsed,
+        CASE WHEN cd.Id IS NOT NULL THEN 'Closed/Duplicate' ELSE 'Active' END AS Status,
+        COALESCE(cd.Title, p.Title) AS RepresentativeTitle,
+        COALESCE(cd.DuplicateOf, p.Id) AS RepresentativePostId,
+        COALESCE(cd.CloseReasonId, 0) AS CloseReason,
+        COALESCE(cd.DuplicatesJson, '[]') AS DuplicateSet
+    FROM TopUsers u
+    LEFT JOIN ClosedDuplicatePosts cd ON cd.Id = (
+        SELECT p2.Id
+        FROM Posts p2
+        WHERE p2.OwnerUserId = u.Id
+        ORDER BY p2.CreationDate DESC
+        LIMIT 1
+    )
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.CreationDate = (
+        SELECT MAX(p3.CreationDate)
+        FROM Posts p3
+        WHERE p3.OwnerUserId = u.Id
+    )
+)
+SELECT *
+FROM Combined
+WHERE RankByRep <= 100
+ORDER BY RankByRep;

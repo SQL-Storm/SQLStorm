@@ -1,0 +1,219 @@
+-- {"query": "1881.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3469} 
+WITH UserEngagement AS (
+    -- Summarizes core user activity: post counts, scores, first/last activity dates, and comment metrics.
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName AS UserName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) AS AvgAnswerScore,
+        MIN(p.CreationDate) AS FirstPostDate,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(p.LastActivityDate) AS LatestActivityDate,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        SUM(COALESCE(c.Score, 0)) AS TotalCommentScore_Dummy -- Assuming 'Score' on comments is meaningful for benchmarking
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+PostEditActivity AS (
+    -- Aggregates post editing and rollback counts for each user.
+    -- Identifies if a post was closed with a reason or migrated away, regardless of who edited.
+    SELECT
+        ph.PostId,
+        ph.UserId AS EditorUserId,
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (5, 8) THEN ph.CreationDate ELSE NULL END) AS LastBodyEditDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (4, 7) THEN ph.CreationDate ELSE NULL END) AS LastTitleEditDate,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.Id END) AS TotalEdits,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (7, 8, 9) THEN ph.Id END) AS TotalRollbacks,
+        BOOL_OR(ph.PostHistoryTypeId = 10 AND ph.Comment IS NOT NULL AND ph.Comment <> '') AS WasClosedWithReason,
+        BOOL_OR(ph.PostHistoryTypeId = 35) AS WasMigratedAway
+    FROM PostHistory ph
+    WHERE ph.UserId IS NOT NULL -- Focus on explicit user edits, not system/community
+    GROUP BY ph.PostId, ph.UserId
+),
+TopTagsPerUser AS (
+    -- Parses tags from questions and answers, counts user-specific tag usage, and ranks them.
+    SELECT
+        u.Id AS UserId,
+        tag_name.tag AS TagName,
+        COUNT(p.Id) AS TaggedPostCount,
+        ROW_NUMBER() OVER(PARTITION BY u.Id ORDER BY COUNT(p.Id) DESC, tag_name.tag ASC) AS rn
+    FROM Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId IN (1, 2) AND p.Tags IS NOT NULL AND p.Tags != ''
+    CROSS JOIN LATERAL UNNEST(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS tag_name(tag)
+    GROUP BY u.Id, tag_name.tag
+),
+LatestBadgeInfo AS (
+    -- Summarizes badge counts by class and records the date of the user's latest badge.
+    SELECT
+        b.UserId,
+        MAX(b.Date) AS LatestBadgeDate,
+        COUNT(CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadgeCount,
+        COUNT(CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadgeCount,
+        COUNT(CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadgeCount
+    FROM Badges b
+    GROUP BY b.UserId
+),
+PostInteractionSummary AS (
+    -- Combines various post history events and comments into a unified interaction stream.
+    SELECT
+        ph.PostId,
+        ph.UserId AS InteractionUserId,
+        ph.CreationDate AS InteractionDate,
+        'History: ' || pht.Name AS InteractionType,
+        COALESCE(ph.Comment, 'No comment detail') AS InteractionDetail
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    WHERE ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 35, 36) -- Closed, Reopened, Deleted, Undeleted, Locked, Unlocked, Migrated
+    UNION ALL
+    SELECT
+        c.PostId,
+        c.UserId AS InteractionUserId,
+        c.CreationDate AS InteractionDate,
+        'Comment' AS InteractionType,
+        LEFT(c.Text, 100) AS InteractionDetail -- Truncate comment text for brevity
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+)
+SELECT
+    ue.UserId,
+    ue.UserName,
+    ue.Reputation,
+    ue.UserCreationDate,
+    ue.TotalPosts,
+    ue.QuestionCount,
+    ue.AnswerCount,
+    ue.TotalPostScore,
+    ue.AvgAnswerScore,
+    ue.FirstPostDate,
+    ue.LastPostDate,
+    ue.LatestActivityDate,
+    COALESCE(ue.TotalComments, 0) AS TotalCommentsMade,
+    COALESCE(ue.TotalCommentScore_Dummy, 0) AS TotalCommentScores,
+    lb.LatestBadgeDate,
+    COALESCE(lb.GoldBadgeCount, 0) AS GoldBadges,
+    COALESCE(lb.SilverBadgeCount, 0) AS SilverBadges,
+    COALESCE(lb.BronzeBadgeCount, 0) AS BronzeBadges,
+    tt.TagName AS MostFrequentTag,
+    tt.TaggedPostCount AS MostFrequentTagPosts,
+    COUNT(DISTINCT pa_user_edits.PostId) AS PostsUserHasEdited,
+    COUNT(DISTINCT pa_user_edits.PostId) FILTER (WHERE pa_user_edits.TotalRollbacks > 0) AS PostsUserHasRolledBack,
+    SUM(CASE WHEN p_q.Id IS NOT NULL AND p_q.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS QuestionsWithAcceptedAnswer,
+    SUM(CASE WHEN p_a.ParentId IS NOT NULL AND p_a.AcceptedAnswerId = p_a.Id THEN 1 ELSE 0 END) AS AcceptedAnswersCount_UserOwned,
+
+    -- Correlated Subquery: Total upvotes received on all posts owned by the user.
+    (SELECT COUNT(v_rec.Id)
+     FROM Votes v_rec
+     JOIN VoteTypes vt_rec ON v_rec.VoteTypeId = vt_rec.Id
+     JOIN Posts p_owned ON v_rec.PostId = p_owned.Id
+     WHERE p_owned.OwnerUserId = ue.UserId
+       AND vt_rec.Name = 'UpMod'
+    ) AS TotalUpvotesReceivedOnPosts,
+
+    -- Correlated Subquery: Total upvotes cast by the user on any post.
+    (SELECT COUNT(v_cast.Id)
+     FROM Votes v_cast
+     JOIN VoteTypes vt_cast ON v_cast.VoteTypeId = vt_cast.Id
+     WHERE v_cast.UserId = ue.UserId
+       AND vt_cast.Name = 'UpMod'
+    ) AS TotalUpvotesCastByThisUser,
+
+    -- Correlated Subquery: Counts gold badges awarded after the user's last significant post history action (edit, close, delete, etc.).
+    (SELECT COUNT(DISTINCT b_corr.Id)
+     FROM Badges b_corr
+     WHERE b_corr.UserId = ue.UserId
+       AND b_corr.Class = 1
+       AND b_corr.Date > COALESCE(
+           (SELECT MAX(ph_corr.CreationDate)
+            FROM PostHistory ph_corr
+            WHERE ph_corr.UserId = ue.UserId AND ph_corr.PostHistoryTypeId IN (4,5,6,7,8,9,10,11,12,13,14,15,19,20)), -- Edits, close/reopen, delete/undelete, lock/unlock, protect/unprotect
+           '1900-01-01'::timestamp
+       )
+    ) AS GoldBadgesAfterLastMajorAction,
+
+    -- Window Function: Ranks users based on a combination of reputation, total post score, gold badge count, and recent activity.
+    RANK() OVER (ORDER BY ue.Reputation DESC, ue.TotalPostScore DESC, COALESCE(lb.GoldBadgeCount, 0) DESC, ue.LatestActivityDate DESC) AS UserOverallRank,
+
+    -- String Expression and NULL Logic: Cleans up user location, provides an excerpt of "AboutMe" in uppercase.
+    COALESCE(u.Location, 'Earth') AS UserLocation_Clean,
+    UPPER(LEFT(COALESCE(u.AboutMe, 'No bio provided'), 50)) AS AboutMeExcerpt_Upper,
+
+    -- Complicated Calculation & NULL Logic: Calculates the number of days from user creation to their first post.
+    COALESCE(EXTRACT(EPOCH FROM (ue.FirstPostDate - ue.UserCreationDate)) / 3600 / 24, 0) AS DaysToFirstPost,
+
+    -- Complicated Calculation & NULL Logic: Average score per view for questions with more than 100 views.
+    COALESCE(AVG(CASE WHEN p_q.ViewCount > 100 THEN p_q.Score::numeric / p_q.ViewCount ELSE 0 END) FILTER (WHERE p_q.ViewCount > 100), 0) AS AvgQuestionScorePerView_HighView,
+
+    -- Correlated Subquery: Title of the highest scoring non-answer post (not tag wiki) by the user.
+    (SELECT p_hs.Title
+     FROM Posts p_hs
+     WHERE p_hs.OwnerUserId = ue.UserId
+       AND p_hs.PostTypeId NOT IN (2, 4, 5) -- Not an answer, tag wiki excerpt, or tag wiki
+       AND p_hs.Score = (SELECT MAX(p_inner.Score) FROM Posts p_inner WHERE p_inner.OwnerUserId = ue.UserId AND p_inner.PostTypeId NOT IN (2, 4, 5))
+     ORDER BY p_hs.CreationDate DESC -- In case of tie, pick latest
+     LIMIT 1
+    ) AS HighestScoringNonAnswerPostTitle,
+
+    -- Correlated Subquery: Determines if the user's last post was a question or an answer related to 'database' or 'sql' tags.
+    (SELECT
+        CASE
+            WHEN p_lp.Id IS NULL THEN 'No Recent Post'
+            WHEN p_lp.PostTypeId = 1 AND (p_lp.Tags ILIKE '%<database>%' OR p_lp.Tags ILIKE '%<sql>%') THEN 'Last Post SQL/DB Question'
+            WHEN p_lp.PostTypeId = 2 AND (pp_lp.Tags ILIKE '%<database>%' OR pp_lp.Tags ILIKE '%<sql>%') THEN 'Last Post Answered SQL/DB Question'
+            ELSE 'Last Post Other'
+        END
+     FROM Posts p_lp
+     LEFT JOIN Posts pp_lp ON p_lp.ParentId = pp_lp.Id
+     WHERE p_lp.OwnerUserId = ue.UserId AND p_lp.CreationDate = ue.LastPostDate
+     LIMIT 1
+    ) AS LastPostTopicCategory,
+
+    -- Correlated Subquery: Counts unique interaction types (from PostInteractionSummary CTE) associated with this user's *own posts*.
+    (SELECT COUNT(DISTINCT pis_corr.InteractionType)
+     FROM PostInteractionSummary pis_corr
+     JOIN Posts p_owned_int ON pis_corr.PostId = p_owned_int.Id
+     WHERE p_owned_int.OwnerUserId = ue.UserId
+       AND pis_corr.InteractionUserId IS NOT NULL -- Exclude system interactions
+    ) AS UniqueInteractionTypesOnUserPosts,
+
+    -- Correlated Subquery with AGGREGATE function: Concatenates titles of up to 3 recent questions by the user that were closed.
+    (SELECT STRING_AGG(p_closed.Title, ' | ')
+     FROM Posts p_closed
+     JOIN PostHistory ph_closed ON p_closed.Id = ph_closed.PostId
+     WHERE p_closed.OwnerUserId = ue.UserId
+       AND p_closed.PostTypeId = 1 -- Only questions
+       AND ph_closed.PostHistoryTypeId = 10 -- Post Closed
+       AND ph_closed.CreationDate > (NOW() - INTERVAL '6 months')
+     ORDER BY ph_closed.CreationDate DESC
+     LIMIT 3
+    ) AS RecentClosedQuestionTitles
+FROM Users u
+JOIN UserEngagement ue ON u.Id = ue.UserId
+LEFT JOIN LatestBadgeInfo lb ON ue.UserId = lb.UserId
+LEFT JOIN TopTagsPerUser tt ON ue.UserId = tt.UserId AND tt.rn = 1 -- Get only the most frequent tag
+LEFT JOIN PostEditActivity pa_user_edits ON ue.UserId = pa_user_edits.EditorUserId -- For user's editing activities
+LEFT JOIN Posts p_q ON u.Id = p_q.OwnerUserId AND p_q.PostTypeId = 1 -- For question-specific aggregates
+LEFT JOIN Posts p_a ON u.Id = p_a.OwnerUserId AND p_a.PostTypeId = 2 -- For answer-specific aggregates
+GROUP BY
+    ue.UserId, ue.UserName, ue.Reputation, ue.UserCreationDate, ue.TotalPosts, ue.QuestionCount, ue.AnswerCount,
+    ue.TotalPostScore, ue.AvgAnswerScore, ue.FirstPostDate, ue.LastPostDate, ue.LatestActivityDate,
+    ue.TotalComments, ue.TotalCommentScore_Dummy, lb.LatestBadgeDate, lb.GoldBadgeCount, lb.SilverBadgeCount,
+    lb.BronzeBadgeCount, tt.TagName, tt.TaggedPostCount, u.Location, u.AboutMe -- All non-aggregated selected columns from `u` and `ue`
+HAVING
+    ue.Reputation > 1500 -- Filter for established users
+    AND ue.TotalPosts >= 10 -- Ensure a reasonable level of participation
+    AND (COALESCE(lb.GoldBadgeCount, 0) + COALESCE(lb.SilverBadgeCount, 0)) >= 1 -- At least one significant badge
+    AND (
+        ue.LatestActivityDate > (NOW() - INTERVAL '9 months') -- User has been active recently
+        OR ue.TotalPostScore > 500 -- Or has historically high-scoring posts
+    )
+ORDER BY
+    UserOverallRank ASC, ue.Reputation DESC
+LIMIT 100;

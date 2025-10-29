@@ -1,0 +1,139 @@
+WITH top_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.OwnerDisplayName,
+    p.LastActivityDate,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.ContentLicense,
+    pt.Name AS PostTypeName
+  FROM Posts p
+  JOIN PostTypes pt ON p.PostTypeId = pt.Id
+  WHERE pt.Id = 1
+),
+tag_exploded AS (
+  SELECT
+    q.PostId AS Id,
+    q.Score,
+    q.ViewCount,
+    q.OwnerDisplayName,
+    q.CreationDate,
+    TRIM(BOTH '><' FROM t.tag) AS TagName
+  FROM top_questions q,
+  LATERAL (
+    SELECT unnest(string_to_array(substring(q.Tags FROM 2 FOR char_length(q.Tags)-2), '><')) AS tag
+  ) t
+),
+tag_aggregate AS (
+  SELECT
+    te.TagName,
+    COUNT(*) AS tag_question_count,
+    AVG(te.Score) AS avg_score,
+    MAX(te.ViewCount) AS max_views,
+    MIN(te.CreationDate) AS first_question,
+    STRING_AGG(te.OwnerDisplayName, ',') AS distinct_owners
+  FROM tag_exploded te
+  JOIN Tags t ON t.TagName = te.TagName
+  GROUP BY te.TagName
+),
+recent_activity AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.OwnerUserId,
+    p.OwnerDisplayName,
+    p.LastActivityDate,
+    p.LastEditDate,
+    p.AnswerCount,
+    p.CommentCount,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate DESC) AS rn_by_user
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+complex_pred AS (
+  SELECT
+    pr.PostId,
+    pr.Title,
+    pr.OwnerUserId,
+    pr.LastActivityDate,
+    pr.Score,
+    pr.ViewCount,
+    CASE
+      WHEN pr.Score >= 100 THEN 'Elite'
+      WHEN pr.Score >= 50 THEN 'Rising'
+      WHEN pr.Score >= 0 THEN 'Popular'
+      ELSE 'New'
+    END AS popularity_band,
+    CASE
+      WHEN pr.ViewCount > 1000 THEN TRUE
+      ELSE FALSE
+    END AS high_visibility
+  FROM top_questions pr
+),
+outer_join_demo AS (
+  SELECT
+    tq.PostId,
+    tq.Title,
+    tq.OwnerUserId,
+    tq.OwnerDisplayName,
+    tq.LastActivityDate,
+    ca.avg_score,
+    ca.max_views,
+    ca.first_question
+  FROM top_questions tq
+  LEFT JOIN tag_aggregate ca ON TRUE
+),
+final AS (
+  SELECT
+    oq.PostId,
+    oq.Title,
+    oq.OwnerUserId,
+    oq.OwnerDisplayName,
+    oq.LastActivityDate,
+    oq.avg_score,
+    oq.max_views,
+    oq.first_question,
+    ca.tag_question_count,
+    ca.distinct_owners,
+    pa.popularity_band,
+    pa.high_visibility,
+    -- Use standardized SQL: convert timestamp to formatted string using CAST/EXTRACT concat for broad compatibility
+    (LPAD(CAST(EXTRACT(YEAR FROM oq.LastActivityDate) AS VARCHAR),4,'0') || '-' ||
+     LPAD(CAST(EXTRACT(MONTH FROM oq.LastActivityDate) AS VARCHAR),2,'0') || '-' ||
+     LPAD(CAST(EXTRACT(DAY FROM oq.LastActivityDate) AS VARCHAR),2,'0') || ' ' ||
+     LPAD(CAST(EXTRACT(HOUR FROM oq.LastActivityDate) AS VARCHAR),2,'0') || ':' ||
+     LPAD(CAST(EXTRACT(MINUTE FROM oq.LastActivityDate) AS VARCHAR),2,'0') || ':' ||
+     LPAD(CAST(EXTRACT(SECOND FROM oq.LastActivityDate) AS INTEGER)::VARCHAR,2,'0')
+    ) AS last_activity_str,
+    CASE
+      WHEN oq.Title IS NOT NULL THEN CHAR_LENGTH(oq.Title)
+      ELSE 0
+    END AS title_length
+  FROM outer_join_demo oq
+  LEFT JOIN tag_aggregate ca ON TRUE
+  LEFT JOIN complex_pred pa ON pa.PostId = oq.PostId
+  GROUP BY
+    oq.PostId,
+    oq.Title,
+    oq.OwnerUserId,
+    oq.OwnerDisplayName,
+    oq.LastActivityDate,
+    oq.avg_score,
+    oq.max_views,
+    oq.first_question,
+    ca.tag_question_count,
+    ca.distinct_owners,
+    pa.popularity_band,
+    pa.high_visibility
+  ORDER BY oq.LastActivityDate DESC, oq.PostId, oq.Title, oq.OwnerUserId
+  LIMIT 100
+)
+SELECT *
+FROM final;

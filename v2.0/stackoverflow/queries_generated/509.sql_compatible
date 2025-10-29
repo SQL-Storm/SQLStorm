@@ -1,0 +1,256 @@
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        u.location,
+        coalesce(nullif(trim(u.websiteurl), ''), 'N/A') as websiteurl,
+        count(*) filter (where b.class = 1) as gold_badges,
+        count(*) filter (where b.class = 2) as silver_badges,
+        count(*) filter (where b.class = 3) as bronze_badges,
+        row_number() over (order by u.reputation desc, u.id) as rn_rep
+    from users u
+    left join badges b
+      on b.userid = u.id
+    where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+    group by u.id, u.displayname, u.reputation, u.creationdate, u.location, u.websiteurl
+),
+q_and_a as (
+    select
+        p_owner.owneruserid as user_id,
+        sum(case when p_owner.posttypeid = 1 then 1 else 0 end) as questions_count,
+        sum(case when p_owner.posttypeid = 2 then 1 else 0 end) as answers_count,
+        sum(p_owner.score) as total_post_score,
+        avg(nullif(p_owner.viewcount,0)) as avg_question_views,
+        count(distinct case when p_owner.posttypeid = 1 and p_owner.acceptedanswerid is not null then p_owner.id end) as accepted_questions,
+        count(distinct case when p_owner.posttypeid = 2 and exists (
+            select 1
+            from posts q
+            where q.id = p_owner.parentid
+              and q.acceptedanswerid = p_owner.id
+        ) then p_owner.id end) as accepted_answers
+    from posts p_owner
+    where p_owner.owneruserid is not null
+    group by p_owner.owneruserid
+),
+vote_stats as (
+    select
+        v.userid as user_id,
+        count(*) filter (where v.votetypeid = 2) as upvotes_cast,
+        count(*) filter (where v.votetypeid = 3) as downvotes_cast,
+        sum(coalesce(v.bountyamount,0)) as bounty_spent,
+        min(v.creationdate) as first_vote_at,
+        max(v.creationdate) as last_vote_at
+    from votes v
+    where v.userid is not null
+    group by v.userid
+),
+comment_stats as (
+    select
+        c.userid as user_id,
+        count(*) as comments_count,
+        avg(c.score) as avg_comment_score,
+        max(length(c.text)) as max_comment_len,
+        sum(case when lower(c.text) like '%thanks%' or lower(c.text) like '%thank you%' then 1 else 0 end) as polite_comments
+    from comments c
+    where c.userid is not null
+    group by c.userid
+),
+tag_extract as (
+    select
+        p.id as post_id,
+        unnest(string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')) as tagname
+    from posts p
+    where p.posttypeid = 1
+      and p.tags is not null
+      and length(p.tags) >= 2
+),
+user_top_tags as (
+    select
+        p.owneruserid as user_id,
+        lower(t.tagname) as tagname,
+        count(*) as tag_uses,
+        row_number() over (partition by p.owneruserid order by count(*) desc, lower(t.tagname)) as rn
+    from posts p
+    join tag_extract t on t.post_id = p.id
+    where p.owneruserid is not null
+    group by p.owneruserid, lower(t.tagname)
+),
+duplicates_closed as (
+    select
+        ph.postid as question_id,
+        min(ph.creationdate) as first_closed_at,
+        max(ph.creationdate) as last_closed_at,
+        count(*) as close_events,
+        count(*) filter (where ph.comment in ('1','101')) as dup_reason_events
+    from posthistory ph
+    where ph.posthistorytypeid in (10,35)
+    group by ph.postid
+),
+link_dupes as (
+    select
+        pl.postid as question_id,
+        count(*) filter (where pl.linktypeid = 3) as duplicate_links,
+        count(*) filter (where pl.linktypeid = 1) as linked_links,
+        min(pl.creationdate) as first_link_at
+    from postlinks pl
+    group by pl.postid
+),
+post_activity as (
+    select
+        p.id as post_id,
+        p.owneruserid as user_id,
+        coalesce(p.lastactivitydate, p.creationdate) as last_act,
+        p.score,
+        p.viewcount,
+        p.posttypeid
+    from posts p
+    where p.owneruserid is not null
+),
+user_recent_activity as (
+    select
+        pa.user_id,
+        count(*) filter (where pa.posttypeid = 1 and pa.last_act >= timestamp '2024-10-01 12:34:56' - interval '90 days') as q_last_90d,
+        count(*) filter (where pa.posttypeid = 2 and pa.last_act >= timestamp '2024-10-01 12:34:56' - interval '90 days') as a_last_90d,
+        sum(pa.score) filter (where pa.last_act >= timestamp '2024-10-01 12:34:56' - interval '90 days') as score_last_90d,
+        max(pa.last_act) as last_seen_post_activity
+    from post_activity pa
+    group by pa.user_id
+),
+score_percentiles as (
+    select
+        p.owneruserid as user_id,
+        percentile_disc(0.5) within group (order by p.score) as median_post_score,
+        percentile_disc(0.9) within group (order by p.score) as p90_post_score
+    from posts p
+    where p.owneruserid is not null
+    group by p.owneruserid
+),
+user_quality as (
+    select
+        qa.user_id,
+        case
+            when qa.answers_count = 0 then null
+            else round(100.0 * qa.accepted_answers / qa.answers_count, 2)
+        end as accept_rate_answers_pct,
+        case
+            when qa.questions_count = 0 then null
+            else round(100.0 * qa.accepted_questions / qa.questions_count, 2)
+        end as accept_rate_questions_pct,
+        qa.total_post_score,
+        qa.avg_question_views
+    from q_and_a qa
+),
+heavy_commenters as (
+    select user_id
+    from comment_stats
+    where comments_count >= (
+        select coalesce(avg(comments_count) + stddev_pop(comments_count), 50) from comment_stats
+    )
+),
+user_rank as (
+    select
+        ru.user_id,
+        dense_rank() over (order by coalesce(uq.total_post_score,0) desc, coalesce(vs.upvotes_cast,0) desc, ru.reputation desc) as perf_rank
+    from recent_users ru
+    left join user_quality uq on uq.user_id = ru.user_id
+    left join vote_stats vs on vs.user_id = ru.user_id
+),
+agg as (
+    select
+        ru.user_id,
+        ru.displayname,
+        ru.reputation,
+        ru.creationdate,
+        ru.location,
+        ru.websiteurl,
+        ru.gold_badges,
+        ru.silver_badges,
+        ru.bronze_badges,
+        uq.accept_rate_answers_pct,
+        uq.accept_rate_questions_pct,
+        uq.total_post_score,
+        uq.avg_question_views,
+        vs.upvotes_cast,
+        vs.downvotes_cast,
+        vs.bounty_spent,
+        vs.first_vote_at,
+        vs.last_vote_at,
+        cs.comments_count,
+        cs.avg_comment_score,
+        cs.max_comment_len,
+        cs.polite_comments,
+        ur.perf_rank,
+        ura.q_last_90d,
+        ura.a_last_90d,
+        ura.score_last_90d,
+        ura.last_seen_post_activity,
+        sp.median_post_score,
+        sp.p90_post_score,
+        lt.duplicate_links,
+        lt.linked_links,
+        dc.first_closed_at,
+        dc.last_closed_at,
+        dc.close_events,
+        dc.dup_reason_events,
+        ut.tagname as top_tag,
+        ut.tag_uses,
+        hc.user_id is not null as is_heavy_commenter
+    from recent_users ru
+    left join user_quality uq on uq.user_id = ru.user_id
+    left join vote_stats vs on vs.user_id = ru.user_id
+    left join comment_stats cs on cs.user_id = ru.user_id
+    left join user_rank ur on ur.user_id = ru.user_id
+    left join user_recent_activity ura on ura.user_id = ru.user_id
+    left join score_percentiles sp on sp.user_id = ru.user_id
+    left join lateral (
+        select
+            sum(lt.duplicate_links) as duplicate_links,
+            sum(lt.linked_links) as linked_links
+        from posts p
+        left join link_dupes lt on lt.question_id = p.id
+        where p.owneruserid = ru.user_id
+    ) lt on true
+    left join lateral (
+        select
+            min(dc.first_closed_at) as first_closed_at,
+            max(dc.last_closed_at) as last_closed_at,
+            sum(dc.close_events) as close_events,
+            sum(dc.dup_reason_events) as dup_reason_events
+        from posts p
+        left join duplicates_closed dc on dc.question_id = p.id
+        where p.owneruserid = ru.user_id
+    ) dc on true
+    left join lateral (
+        select tagname, tag_uses
+        from user_top_tags utt
+        where utt.user_id = ru.user_id and utt.rn = 1
+    ) ut on true
+    left join heavy_commenters hc on hc.user_id = ru.user_id
+)
+select *
+from agg
+where
+    coalesce(total_post_score, 0) + coalesce(upvotes_cast,0) - coalesce(downvotes_cast,0) >= (
+        select avg(coalesce(total_post_score,0) + coalesce(upvotes_cast,0) - coalesce(downvotes_cast,0)) from agg
+    )
+    and (accept_rate_answers_pct is null or accept_rate_answers_pct >= 25 or (bronze_badges + silver_badges + gold_badges) >= 5)
+    and (
+        top_tag is null
+        or (not (lower(top_tag) like any (array['%test%','%debug%'])))
+        or tag_uses >= coalesce((select avg(tag_uses) from user_top_tags), 1)
+    )
+    and (
+        (duplicate_links is not null and duplicate_links >= 0)
+        or (close_events is null and dup_reason_events is null)
+    )
+    and (coalesce(websiteurl,'') = '' or websiteurl like 'http%')
+    and (last_seen_post_activity is null or last_seen_post_activity <= timestamp '2024-10-01 12:34:56')
+    and (first_vote_at is null or first_vote_at <= last_vote_at or last_vote_at is null)
+order by
+    perf_rank nulls last,
+    reputation desc,
+    coalesce(total_post_score,0) desc,
+    user_id
+limit 200;

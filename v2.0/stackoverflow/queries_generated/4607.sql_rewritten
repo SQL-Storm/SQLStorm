@@ -1,0 +1,138 @@
+-- {"query": "4607.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1613} 
+WITH QuestionDetails AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.Score AS QuestionScore,
+        p.ViewCount AS QuestionViews,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.CreationDate AS QuestionCreationDate,
+        u.DisplayName AS OwnerDisplayName,
+        u.Reputation AS OwnerReputation,
+        COALESCE(
+            (
+                SELECT STRING_AGG(t.TagName, ', ')
+                FROM Tags t
+                WHERE t.Id IN (
+                    SELECT value
+                    FROM STRING_SPLIT(SUBSTRING(p.Tags, 2, LEN(p.Tags) - 2), '><')
+                )
+            ),
+            'No Tags'
+        ) AS QuestionTags,
+        (
+            SELECT COUNT(*)
+            FROM Comments c
+            WHERE c.PostId = p.Id
+              AND c.Score > 0
+              AND c.UserId IS NOT NULL
+        ) AS HighScoringCommentsCount,
+        (
+            SELECT COUNT(DISTINCT ph.UserId)
+            FROM PostHistory ph
+            WHERE ph.PostId = p.Id
+              AND ph.PostHistoryTypeId IN (4, 5, 6)
+        ) AS DistinctEditorsCount
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1 -- Questions
+      AND p.Score > 10
+      AND p.AnswerCount > 0
+),
+AnswerMetrics AS (
+    SELECT
+        a.ParentId AS QuestionId,
+        COUNT(a.Id) AS AnswerCount,
+        AVG(a.Score) AS AverageAnswerScore,
+        MAX(a.Score) AS MaxAnswerScore,
+        SUM(CASE WHEN a.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END) AS IsAcceptedAnswerPresent,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN v.UserId ELSE NULL END) AS UpvotesOnAnswers,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN v.UserId ELSE NULL END) AS DownvotesOnAnswers,
+        AVG(DATEDIFF(minute, q.CreationDate, a.CreationDate)) AS AvgMinutesToFirstAnswer,
+        SUM(CASE WHEN a.OwnerUserId IS NOT NULL AND a.OwnerUserId = u.Id THEN 1 ELSE 0 END) AS AnswersByOwnerCount,
+        COUNT(CASE WHEN c.UserId IS NOT NULL THEN c.UserId ELSE NULL END) AS CommentersOnAnswersCount
+    FROM Posts a
+    JOIN Posts q ON a.ParentId = q.Id
+    LEFT JOIN Votes v ON a.Id = v.PostId AND v.VoteTypeId IN (2, 3)
+    LEFT JOIN Comments c ON a.Id = c.PostId
+    LEFT JOIN Users u ON a.OwnerUserId = u.Id
+    WHERE a.PostTypeId = 2 -- Answers
+      AND q.PostTypeId = 1
+    GROUP BY a.ParentId, q.AcceptedAnswerId, q.CreationDate
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS PostsOwned,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        COUNT(DISTINCT b.Id) AS BadgesEarned,
+        MAX(u.LastAccessDate) AS LastActivityDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+LaggedPostScores AS (
+    SELECT
+        Id,
+        PostId,
+        Score,
+        CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY PostId ORDER BY CreationDate DESC) as rn
+    FROM PostHistory
+    WHERE PostHistoryTypeId = 5 -- Edit Body
+),
+RankedAnswers AS (
+    SELECT
+        a.Id,
+        a.ParentId,
+        a.Score,
+        a.OwnerUserId,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) as RankByScore
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+)
+SELECT
+    qd.Title AS QuestionTitle,
+    qd.OwnerDisplayName AS QuestionOwner,
+    qd.OwnerReputation,
+    qd.QuestionScore,
+    qd.QuestionViews,
+    qd.AnswerCount AS TotalAnswers,
+    qd.FavoriteCount,
+    qd.QuestionTags,
+    qd.HighScoringCommentsCount,
+    COALESCE(am.AverageAnswerScore, 0) AS AvgAnswerScore,
+    COALESCE(am.MaxAnswerScore, 0) AS MaxAnswerScore,
+    CASE WHEN am.IsAcceptedAnswerPresent > 0 THEN 'Yes' ELSE 'No' END AS AcceptedAnswer,
+    COALESCE(ua.PostsOwned, 0) AS OwnerPosts,
+    COALESCE(ua.BadgesEarned, 0) AS UserBadges,
+    COALESCE(la.Score, 0) AS LatestPostHistoryScore,
+    ra.Score AS TopAnswerScore,
+    CASE
+        WHEN qd.QuestionCreationDate > DATEADD(year, -1, cast('2024-10-01 12:34:56' as timestamp)) THEN 'Recent'
+        WHEN qd.QuestionCreationDate < DATEADD(year, -5, cast('2024-10-01 12:34:56' as timestamp)) THEN 'Old'
+        ELSE 'Mid-Age'
+    END AS QuestionAgeGroup,
+    FORMAT(DATEDIFF(day, qd.QuestionCreationDate, cast('2024-10-01 12:34:56' as timestamp)), 'N0') + ' days old' AS DaysSinceCreation,
+    CASE
+        WHEN am.AvgMinutesToFirstAnswer IS NULL THEN NULL
+        WHEN am.AvgMinutesToFirstAnswer < 60 THEN 'Fast'
+        WHEN am.AvgMinutesToFirstAnswer > 1440 THEN 'Slow'
+        ELSE 'Moderate'
+    END AS FirstAnswerSpeed,
+    ROW_NUMBER() OVER (ORDER BY qd.QuestionScore DESC, qd.ViewCount DESC) AS QuestionRank
+FROM QuestionDetails qd
+LEFT JOIN AnswerMetrics am ON qd.QuestionId = am.QuestionId
+LEFT JOIN UserActivity ua ON qd.OwnerDisplayName = ua.DisplayName -- Join on DisplayName for potential NULL OwnerUserId in QuestionDetails if user deleted
+LEFT JOIN LaggedPostScores ls ON qd.QuestionId = ls.PostId AND ls.rn = 1
+LEFT JOIN RankedAnswers ra ON qd.QuestionId = ra.ParentId AND ra.RankByScore = 1
+WHERE qd.QuestionTags LIKE '%sql%' -- Example predicate
+  AND COALESCE(am.AverageAnswerScore, -999) > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 2) -- Answers generally better than average
+  AND qd.DistinctEditorsCount > (SELECT AVG(DistinctEditorsCount) FROM QuestionDetails) -- More edits than average
+ORDER BY QuestionRank;

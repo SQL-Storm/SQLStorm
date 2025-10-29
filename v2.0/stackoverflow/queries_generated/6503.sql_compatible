@@ -1,0 +1,55 @@
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id ELSE NULL END) AS TotalQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id ELSE NULL END) AS TotalAnswers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 3 THEN p.Id ELSE NULL END) AS TotalWikis,
+    SUM(p.Score) AS TotalScore,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN p.AnswerCount ELSE 0 END) AS TotalAnswersToQuestions,
+    MAX(u.LastAccessDate) AS LastAccess,
+    MAX(p.LastActivityDate) AS LastPostActivity,
+    b.Class,
+    b.TagBased,
+    ph.RevisionGUID,
+    ph.Comment,
+    ph.CreationDate
+FROM 
+    Users u
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    (SELECT 
+         ph.PostId, 
+         ph.RevisionGUID, 
+         ph.Comment, 
+         ph.CreationDate,
+         ph.UserId
+     FROM 
+         PostHistory ph
+     WHERE 
+         ph.PostHistoryTypeId IN (1, 2, 5, 10, 11)
+     ) ph ON u.Id = ph.UserId
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+WHERE 
+    u.Reputation > 1000
+    AND p.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '1' YEAR)
+GROUP BY 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.LastAccessDate,
+    b.Id,
+    b.Class,
+    b.TagBased,
+    ph.PostId,
+    ph.RevisionGUID,
+    ph.Comment,
+    ph.CreationDate
+HAVING 
+    AVG(p.Score) > 100
+ORDER BY 
+    u.Reputation DESC, 
+    TotalPosts DESC
+LIMIT 100;

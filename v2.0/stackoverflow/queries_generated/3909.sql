@@ -1,0 +1,152 @@
+-- {"query": "3909.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2956} 
+
+/*  Performance‑benchmarking query using many advanced SQL features */
+WITH
+    recent_votes AS (
+        SELECT
+            v.PostId,
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS up_votes,
+            SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS down_votes
+        FROM Votes v
+        WHERE v.CreationDate >= CURRENT_DATE - INTERVAL '90 days'
+        GROUP BY v.PostId
+    ),
+
+    post_scores AS (
+        SELECT
+            p.Id                         AS post_id,
+            p.PostTypeId,
+            p.OwnerUserId,
+            COALESCE(p.Score,0) +
+            COALESCE(rv.up_votes,0) -
+            COALESCE(rv.down_votes,0)   AS net_score,
+            ROW_NUMBER() OVER (
+                PARTITION BY p.OwnerUserId
+                ORDER BY COALESCE(p.Score,0) DESC
+            )                           AS rn
+        FROM Posts p
+        LEFT JOIN recent_votes rv
+               ON rv.PostId = p.Id
+        WHERE p.PostTypeId IN (1,2)          -- questions or answers
+    ),
+
+    user_badge_counts AS (
+        SELECT
+            b.UserId,
+            SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold,
+            SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver,
+            SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze,
+            COUNT(*)                                     AS total_badges
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+
+    tag_usage AS (
+        SELECT
+            p.OwnerUserId,
+            COUNT(DISTINCT UNNEST(string_to_array(trim(both '<>' FROM p.Tags), '><'))) AS distinct_tags_used
+        FROM Posts p
+        WHERE p.Tags IS NOT NULL
+          AND p.PostTypeId = 1               -- only questions have tags
+        GROUP BY p.OwnerUserId
+    ),
+
+    top_activities AS (
+        SELECT
+            u.Id                                   AS user_id,
+            u.DisplayName,
+            u.Reputation,
+            COALESCE(ubc.gold,0)    AS gold_badges,
+            COALESCE(ubc.silver,0)  AS silver_badges,
+            COALESCE(ubc.bronze,0)  AS bronze_badges,
+            COALESCE(tu.distinct_tags_used,0) AS tag_variety,
+            SUM(CASE WHEN ps.PostTypeId = 1 THEN 1 ELSE 0 END) AS questions_posted,
+            SUM(CASE WHEN ps.PostTypeId = 2 THEN 1 ELSE 0 END) AS answers_posted,
+            AVG(ps.net_score) FILTER (WHERE ps.PostTypeId = 1) AS avg_question_score,
+            AVG(ps.net_score) FILTER (WHERE ps.PostTypeId = 2) AS avg_answer_score,
+            MAX(ps.net_score)                                 AS max_net_score,
+            ROW_NUMBER() OVER (ORDER BY u.Reputation DESC,
+                                         gold_badges DESC,
+                                         tag_variety DESC) AS rank_rep
+        FROM Users u
+        LEFT JOIN user_badge_counts ubc ON ubc.UserId = u.Id
+        LEFT JOIN tag_usage tu          ON tu.OwnerUserId = u.Id
+        LEFT JOIN post_scores ps
+               ON ps.OwnerUserId = u.Id AND ps.rn <= 5      -- top‑5 posts per user
+        GROUP BY
+            u.Id, u.DisplayName, u.Reputation,
+            ubc.gold, ubc.silver, ubc.bronze,
+            tu.distinct_tags_used
+    ),
+
+    closed_duplicate_links AS (
+        SELECT
+            pl.PostId,
+            pl.RelatedPostId,
+            lt.Name                                 AS link_type,
+            ph.Comment::int                         AS close_reason_id,
+            cr.Name                                 AS close_reason_name,
+            ph.CreationDate                         AS close_date
+        FROM PostLinks pl
+        JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+        JOIN PostHistory ph
+              ON ph.PostId = pl.PostId
+             AND ph.PostHistoryTypeId = 10           -- Close event
+        LEFT JOIN CloseReasonTypes cr
+               ON cr.Id = ph.Comment::int
+        WHERE lt.Name = 'Duplicate'
+    )
+
+SELECT
+    ta.user_id,
+    ta.DisplayName,
+    ta.Reputation,
+    ta.gold_badges,
+    ta.silver_badges,
+    ta.bronze_badges,
+    ta.tag_variety,
+    ta.questions_posted,
+    ta.answers_posted,
+    ROUND(ta.avg_question_score,2) AS avg_q_score,
+    ROUND(ta.avg_answer_score,2)   AS avg_a_score,
+    ta.max_net_score,
+    ta.rank_rep,
+    COALESCE(cd.link_type, 'None')       AS dup_link_type,
+    COALESCE(cd.close_reason_name, 'Not Closed') AS close_reason,
+    cd.close_date
+FROM top_activities ta
+LEFT JOIN LATERAL (
+    SELECT *
+    FROM closed_duplicate_links cdl
+    WHERE cdl.PostId = (
+        SELECT p.Id
+        FROM Posts p
+        WHERE p.OwnerUserId = ta.user_id
+          AND p.PostTypeId = 1               -- latest question of the user
+        ORDER BY p.CreationDate DESC
+        LIMIT 1
+    )
+    LIMIT 1
+) cd ON TRUE
+WHERE ta.rank_rep <= 100
+
+UNION ALL
+
+SELECT
+    NULL                         AS user_id,
+    'TOTAL'                      AS DisplayName,
+    SUM(Reputation)              AS Reputation,
+    SUM(gold_badges)             AS gold_badges,
+    SUM(silver_badges)           AS silver_badges,
+    SUM(bronze_badges)           AS bronze_badges,
+    NULL                         AS tag_variety,
+    SUM(questions_posted)        AS questions_posted,
+    SUM(answers_posted)          AS answers_posted,
+    NULL                         AS avg_q_score,
+    NULL                         AS avg_a_score,
+    NULL                         AS max_net_score,
+    NULL                         AS rank_rep,
+    NULL                         AS dup_link_type,
+    NULL                         AS close_reason,
+    NULL                         AS close_date
+FROM top_activities;

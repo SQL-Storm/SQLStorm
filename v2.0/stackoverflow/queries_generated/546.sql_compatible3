@@ -1,0 +1,405 @@
+with recent_users as (
+    select u.id as user_id,
+           u.displayname,
+           u.reputation,
+           u.creationdate,
+           u.location,
+           coalesce(nullif(trim(u.websiteurl), ''), 'N/A') as websiteurl,
+           dense_rank() over (order by u.creationdate desc) as recency_rank
+    from users u
+),
+tag_exploded_fixed as (
+    select post_id, owneruserid, tag from (
+      select p.id as post_id,
+             p.owneruserid,
+             lower(t.tag) as tag,
+             1 as ord
+      from posts p
+      cross join lateral (
+        select unnest(string_to_array(substring(p.tags, 2, char_length(p.tags)-2), '><')) as tag
+      ) t
+      where p.posttypeid = 1 and p.tags is not null
+      union all
+      select p.id as post_id,
+             p.owneruserid,
+             null as tag,
+             2 as ord
+      from posts p
+      where p.posttypeid = 1 and p.tags is null
+    ) s
+    where tag is not null
+),
+user_tag_activity as (
+    select te.owneruserid as user_id,
+           te.tag,
+           count(*) filter (where p.score > 0) as pos_qs,
+           count(*) filter (where p.score <= 0 or p.score is null) as nonpos_qs,
+           sum(p.viewcount) as total_views,
+           avg(p.score) as avg_score_q,
+           max(p.creationdate) as last_q_date
+    from tag_exploded_fixed te
+    join posts p on p.id = te.post_id
+    group by te.owneruserid, te.tag
+),
+answers_by_user as (
+    select a.owneruserid as user_id,
+           a.parentid as question_id,
+           count(*) as answers_count,
+           max(a.score) as best_answer_score,
+           sum(a.score) as total_answer_score,
+           max(a.creationdate) as last_answer_date
+    from posts a
+    where a.posttypeid = 2
+    group by a.owneruserid, a.parentid
+),
+question_meta as (
+    select q.id as question_id,
+           q.owneruserid as q_owner_id,
+           q.score as q_score,
+           q.viewcount as q_views,
+           q.acceptedanswerid,
+           q.creationdate as q_date,
+           q.favoritecount,
+           q.answercount
+    from posts q
+    where q.posttypeid = 1
+),
+dup_clusters as (
+    select pl.relatedpostid as canonical_qid,
+           pl.postid as dup_qid,
+           count(*) over (partition by pl.relatedpostid) as cluster_size
+    from postlinks pl
+    where pl.linktypeid = 3
+),
+user_vote_stats as (
+    select v.userid as user_id,
+           count(*) filter (where v.votetypeid = 2) as upvotes_cast,
+           count(*) filter (where v.votetypeid = 3) as downvotes_cast,
+           count(*) filter (where v.votetypeid = 5) as favorites_cast,
+           count(*) filter (where v.votetypeid in (8,9)) as bounties_touch,
+           sum(coalesce(v.bountyamount,0)) as bounty_total
+    from votes v
+    group by v.userid
+),
+badge_pivot as (
+    select b.userid as user_id,
+           count(*) filter (where b.class = 1) as gold_badges,
+           count(*) filter (where b.class = 2) as silver_badges,
+           count(*) filter (where b.class = 3) as bronze_badges,
+           count(*) filter (where b.tagbased = true) as tag_badges,
+           min(b.date) as first_badge_date,
+           max(b.date) as last_badge_date
+    from badges b
+    group by b.userid
+),
+post_edits as (
+    select ph.postid,
+           ph.userid as editor_user_id,
+           count(*) filter (where ph.posthistorytypeid in (4,5,6)) as edits_count,
+           max(ph.creationdate) as last_edit_date,
+           count(*) filter (where ph.posthistorytypeid in (10)) as closes,
+           count(*) filter (where ph.posthistorytypeid in (11)) as reopens
+    from posthistory ph
+    group by ph.postid, ph.userid
+),
+user_activity_agg as (
+    select u.id as user_id,
+           count(*) filter (where p.posttypeid = 1) as q_count,
+           count(*) filter (where p.posttypeid = 2) as a_count,
+           sum(coalesce(p.score,0)) as total_post_score,
+           avg(nullif(p.score,0)) filter (where p.posttypeid = 1) as avg_q_score_nonzero,
+           avg(nullif(p.score,0)) filter (where p.posttypeid = 2) as avg_a_score_nonzero,
+           max(p.lastactivitydate) as last_post_activity,
+           sum(coalesce(p.viewcount,0)) filter (where p.posttypeid = 1) as total_q_views
+    from users u
+    left join posts p on p.owneruserid = u.id
+    group by u.id
+),
+accepted_answerers as (
+    select a.owneruserid as user_id,
+           count(*) as accepted_answers,
+           sum(a.score) as accepted_total_score
+    from posts q
+    join posts a on a.id = q.acceptedanswerid and a.posttypeid = 2
+    group by a.owneruserid
+),
+user_comment_stats as (
+    select c.userid as user_id,
+           count(*) as comments_made,
+           avg(c.score) as avg_comment_score,
+           max(c.creationdate) as last_comment_date,
+           count(*) filter (where position('http' in lower(c.text)) > 0) as comments_with_links
+    from comments c
+    group by c.userid
+),
+user_tag_rank as (
+    select uta.user_id,
+           uta.tag,
+           uta.pos_qs,
+           uta.nonpos_qs,
+           uta.total_views,
+           uta.avg_score_q,
+           row_number() over (partition by uta.user_id order by uta.pos_qs desc, uta.total_views desc, uta.avg_score_q desc, uta.tag asc) as tag_rank
+    from user_tag_activity uta
+),
+top_tag_per_user as (
+    select user_id,
+           tag as top_tag,
+           pos_qs as top_tag_pos_qs,
+           nonpos_qs as top_tag_nonpos_qs,
+           total_views as top_tag_views,
+           avg_score_q as top_tag_avg_q_score
+    from user_tag_rank
+    where tag_rank = 1
+),
+question_quality as (
+    select qm.question_id,
+           qm.q_owner_id,
+           qm.q_score,
+           qm.q_views,
+           qm.answercount,
+           coalesce((select sum(v2.bountyamount) from votes v2 where v2.votetypeid in (8,9) and v2.postid = qm.question_id),0) as bounty_flow,
+           case when dc.cluster_size >= 3 then 'large'
+                when dc.cluster_size = 2 then 'pair'
+                when dc.cluster_size is null then 'none'
+                else 'medium'
+           end as dup_cluster,
+           dc.cluster_size
+    from question_meta qm
+    left join dup_clusters dc on dc.canonical_qid = qm.question_id
+),
+user_question_quality as (
+    select qq.q_owner_id as user_id,
+           count(*) as total_questions,
+           avg(qq.q_score) as avg_q_score,
+           percentile_cont(0.9) within group (order by qq.q_views) as p90_q_views,
+           count(*) filter (where qq.dup_cluster <> 'none') as dup_related_qs,
+           sum(qq.bounty_flow) as total_bounty_flow_on_qs
+    from question_quality qq
+    group by qq.q_owner_id
+),
+activity_window as (
+    select p.owneruserid as user_id,
+           p.id as post_id,
+           p.creationdate,
+           p.score,
+           sum(p.score) over (partition by p.owneruserid order by p.creationdate rows between unbounded preceding and current row) as running_score,
+           count(*) over (partition by p.owneruserid order by p.creationdate rows between unbounded preceding and current row) as running_posts,
+           avg(p.score) over (partition by p.owneruserid order by p.creationdate rows between 10 preceding and current row) as moving_avg_score_11
+    from posts p
+    where p.owneruserid is not null
+),
+recent_activity_flags as (
+    select aw.user_id,
+           max(case when aw.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days' then 1 else 0 end) as posted_last_30d,
+           max(case when aw.score > 10 and aw.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days' then 1 else 0 end) as had_hot_post_last_year
+    from activity_window aw
+    group by aw.user_id
+),
+user_editing_impact as (
+    select coalesce(ph.userid, p.owneruserid) as user_id,
+           count(*) filter (where ph.posthistorytypeid in (4,5,6)) as edits_made,
+           count(distinct ph.postid) as edited_posts_distinct,
+           count(*) filter (where ph.posthistorytypeid = 10) as close_votes_events,
+           count(*) filter (where ph.posthistorytypeid = 11) as reopen_votes_events
+    from posthistory ph
+    left join posts p on p.id = ph.postid
+    group by coalesce(ph.userid, p.owneruserid)
+),
+user_postlink_patterns as (
+    select coalesce(p.owneruserid, a.owneruserid) as user_id,
+           count(*) filter (where pl.linktypeid = 1) as linked_refs,
+           count(*) filter (where pl.linktypeid = 3) as duplicate_links
+    from postlinks pl
+    left join posts p on p.id = pl.postid
+    left join posts a on a.id = pl.relatedpostid
+    group by coalesce(p.owneruserid, a.owneruserid)
+),
+user_nullness as (
+    select u.id as user_id,
+           case when coalesce(u.displayname, '') = '' then 1 else 0 end as is_anon_display,
+           case when u.websiteurl is null or trim(u.websiteurl) = '' then 1 else 0 end as missing_website,
+           case when u.location is null or trim(u.location) = '' then 1 else 0 end as missing_location
+    from users u
+),
+final_scores as (
+    select ru.user_id,
+           ru.displayname,
+           ru.reputation,
+           ru.creationdate,
+           ru.location,
+           ru.websiteurl,
+           ua.q_count,
+           ua.a_count,
+           ua.total_post_score,
+           coalesce(uqq.total_questions,0) as total_questions,
+           coalesce(uqq.avg_q_score,0) as avg_q_score,
+           coalesce(uqq.p90_q_views,0) as p90_q_views,
+           coalesce(uqq.dup_related_qs,0) as dup_related_qs,
+           coalesce(uqq.total_bounty_flow_on_qs,0) as total_bounty_flow_on_qs,
+           coalesce(aw2.posted_last_30d,0) as posted_last_30d,
+           coalesce(aw2.had_hot_post_last_year,0) as had_hot_post_last_year,
+           coalesce(uas.accepted_answers,0) as accepted_answers,
+           coalesce(uas.accepted_total_score,0) as accepted_total_score,
+           coalesce(uvs.upvotes_cast,0) as upvotes_cast,
+           coalesce(uvs.downvotes_cast,0) as downvotes_cast,
+           coalesce(uvs.favorites_cast,0) as favorites_cast,
+           coalesce(uvs.bounties_touch,0) as bounties_touch,
+           coalesce(uvs.bounty_total,0) as bounty_total,
+           coalesce(bp.gold_badges,0) as gold_badges,
+           coalesce(bp.silver_badges,0) as silver_badges,
+           coalesce(bp.bronze_badges,0) as bronze_badges,
+           coalesce(bp.tag_badges,0) as tag_badges,
+           bp.first_badge_date,
+           bp.last_badge_date,
+           coalesce(tt.top_tag,'<none>') as top_tag,
+           coalesce(tt.top_tag_pos_qs,0) as top_tag_pos_qs,
+           coalesce(tt.top_tag_nonpos_qs,0) as top_tag_nonpos_qs,
+           coalesce(tt.top_tag_views,0) as top_tag_views,
+           coalesce(tt.top_tag_avg_q_score,0) as top_tag_avg_q_score,
+           coalesce(uei.edits_made,0) as edits_made,
+           coalesce(uei.edited_posts_distinct,0) as edited_posts_distinct,
+           coalesce(uei.close_votes_events,0) as close_votes_events,
+           coalesce(uei.reopen_votes_events,0) as reopen_votes_events,
+           coalesce(upp.linked_refs,0) as linked_refs,
+           coalesce(upp.duplicate_links,0) as duplicate_links,
+           coalesce(ucs.comments_made,0) as comments_made,
+           coalesce(ucs.avg_comment_score,0) as avg_comment_score,
+           coalesce(ucs.last_comment_date, ru.creationdate) as last_comment_date,
+           ua.last_post_activity,
+           coalesce(un.is_anon_display,0) as is_anon_display,
+           coalesce(un.missing_website,0) as missing_website,
+           coalesce(un.missing_location,0) as missing_location,
+           case
+               when coalesce(uqq.avg_q_score,0) >= 5 and coalesce(uas.accepted_answers,0) >= 10 then 'expert'
+               when coalesce(ua.q_count,0) + coalesce(ua.a_count,0) > 100 and ru.reputation > 10000 then 'veteran'
+               when coalesce(aw2.posted_last_30d,0) = 1 or coalesce(ucs.comments_made,0) > 0 then 'active'
+               else 'casual'
+           end as user_segment,
+           (
+               coalesce(ua.total_post_score,0)
+               + 2 * coalesce(uas.accepted_total_score,0)
+               + coalesce(uqq.total_bounty_flow_on_qs,0)
+               + 5 * coalesce(bp.gold_badges,0)
+               + 3 * coalesce(bp.silver_badges,0)
+               + 1 * coalesce(bp.bronze_badges,0)
+               + case when lower(coalesce(tt.top_tag,'')) like 'sql%' or lower(coalesce(tt.top_tag,'')) like 'postgres%' or lower(coalesce(tt.top_tag,'')) like 'mysql%' then 50 else 0 end
+               - 2 * coalesce(uvs.downvotes_cast,0)
+               - case when coalesce(un.missing_location,0) = 1 and coalesce(un.missing_website,0) = 1 then 10 else 0 end
+           ) as composite_score
+    from recent_users ru
+    left join user_activity_agg ua on ua.user_id = ru.user_id
+    left join user_question_quality uqq on uqq.user_id = ru.user_id
+    left join recent_activity_flags aw2 on aw2.user_id = ru.user_id
+    left join accepted_answerers uas on uas.user_id = ru.user_id
+    left join user_vote_stats uvs on uvs.user_id = ru.user_id
+    left join badge_pivot bp on bp.user_id = ru.user_id
+    left join top_tag_per_user tt on tt.user_id = ru.user_id
+    left join user_editing_impact uei on uei.user_id = ru.user_id
+    left join user_postlink_patterns upp on upp.user_id = ru.user_id
+    left join user_comment_stats ucs on ucs.user_id = ru.user_id
+    left join user_nullness un on un.user_id = ru.user_id
+    where ru.recency_rank <= 5000
+),
+ranked as (
+    select f.user_id,
+           f.displayname,
+           f.reputation,
+           f.creationdate,
+           f.location,
+           f.websiteurl,
+           f.q_count,
+           f.a_count,
+           f.total_post_score,
+           f.total_questions,
+           f.avg_q_score,
+           f.p90_q_views,
+           f.dup_related_qs,
+           f.total_bounty_flow_on_qs,
+           f.posted_last_30d,
+           f.had_hot_post_last_year,
+           f.accepted_answers,
+           f.accepted_total_score,
+           f.upvotes_cast,
+           f.downvotes_cast,
+           f.favorites_cast,
+           f.bounties_touch,
+           f.bounty_total,
+           f.gold_badges,
+           f.silver_badges,
+           f.bronze_badges,
+           f.tag_badges,
+           f.first_badge_date,
+           f.last_badge_date,
+           f.top_tag,
+           f.top_tag_pos_qs,
+           f.top_tag_nonpos_qs,
+           f.top_tag_views,
+           f.top_tag_avg_q_score,
+           f.edits_made,
+           f.edited_posts_distinct,
+           f.close_votes_events,
+           f.reopen_votes_events,
+           f.linked_refs,
+           f.duplicate_links,
+           f.comments_made,
+           f.avg_comment_score,
+           f.last_comment_date,
+           f.last_post_activity,
+           f.is_anon_display,
+           f.missing_website,
+           f.missing_location,
+           f.user_segment,
+           f.composite_score,
+           row_number() over (order by f.composite_score desc, f.reputation desc, f.last_post_activity desc) as rn,
+           rank() over (order by f.composite_score desc) as rnk,
+           dense_rank() over (order by f.user_segment, f.composite_score desc) as segment_dense_rank,
+           ntile(10) over (order by f.composite_score desc) as decile
+    from final_scores f
+)
+select r.user_id,
+       r.displayname,
+       r.reputation,
+       r.user_segment,
+       r.composite_score,
+       r.q_count,
+       r.a_count,
+       r.accepted_answers,
+       r.gold_badges,
+       r.silver_badges,
+       r.bronze_badges,
+       r.top_tag,
+       r.top_tag_pos_qs,
+       r.top_tag_avg_q_score,
+       r.p90_q_views,
+       r.dup_related_qs,
+       r.total_bounty_flow_on_qs,
+       r.upvotes_cast,
+       r.downvotes_cast,
+       r.posted_last_30d,
+       r.had_hot_post_last_year,
+       r.comments_made,
+       r.linked_refs,
+       r.duplicate_links,
+       r.edits_made,
+       r.close_votes_events,
+       r.reopen_votes_events,
+       r.is_anon_display,
+       r.missing_website,
+       r.missing_location,
+       r.creationdate as user_creationdate,
+       r.last_post_activity,
+       r.last_comment_date,
+       r.decile,
+       r.rnk,
+       r.segment_dense_rank
+from ranked r
+where (
+         (r.user_segment = 'expert' and r.decile <= 3)
+      or (r.user_segment = 'veteran' and r.decile <= 5)
+      or (r.user_segment in ('active','casual') and r.decile <= 2)
+      )
+   and (r.missing_location = 0 or r.websiteurl <> 'N/A')
+   and (r.top_tag is null or r.top_tag not like '%regex%')
+order by r.composite_score desc, r.reputation desc, r.user_id asc
+limit 250;

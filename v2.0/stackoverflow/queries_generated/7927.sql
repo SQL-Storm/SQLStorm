@@ -1,0 +1,313 @@
+-- {"query": "7927.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 3667} 
+WITH UserActivity AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        AVG(p.Score) as AvgPostScore,
+        MAX(p.ViewCount) as MaxViewCount,
+        STRING_AGG(DISTINCT p.PostTypeId::text, ',') as PostTypes,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN p.Id END) as QuestionWithAcceptedAnswer,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL THEN p.Id END) as ClosedQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.FavoriteCount > 0 THEN p.Id END) as FavoritedQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.Score > 0 THEN p.Id END) as PositiveAnswerCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.Score < 0 THEN p.Id END) as NegativeAnswerCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopTags AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        STRING_AGG(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END, ',') as RelatedQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) as AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) as AvgAnswerScore,
+        MAX(p.ViewCount) as MaxQuestionViewCount,
+        MIN(p.CreationDate) as FirstQuestionDate,
+        MAX(p.CreationDate) as LastQuestionDate
+    FROM Tags t
+    LEFT JOIN Posts p ON (p.Tags LIKE '%' || t.TagName || '%')
+    WHERE t.Count > 100
+    GROUP BY t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId
+),
+QuestionStats AS (
+    SELECT 
+        p.Id as QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        u.DisplayName as OwnerName,
+        u.Reputation as OwnerReputation,
+        p.Tags,
+        COALESCE(SPLIT_PART(p.Tags, '><', 1), '') as PrimaryTag,
+        CASE 
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Yes' 
+            ELSE 'No' 
+        END as HasAcceptedAnswer,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed' 
+            ELSE 'Open' 
+        END as QuestionStatus,
+        DATEDIFF('day', p.CreationDate, CURRENT_TIMESTAMP) as DaysSinceCreation,
+        CASE 
+            WHEN p.Score > 100 THEN 'Highly Popular' 
+            WHEN p.Score > 50 THEN 'Popular' 
+            WHEN p.Score > 10 THEN 'Moderate' 
+            ELSE 'Low' 
+        END as PopularityLevel,
+        ROW_NUMBER() OVER (ORDER BY p.Score DESC) as ScoreRank,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.ViewCount DESC) as ViewRank,
+        RANK() OVER (ORDER BY p.CreationDate DESC) as NewnessRank,
+        DENSE_RANK() OVER (ORDER BY p.ViewCount DESC) as ViewPopularityRank,
+        NTILE(4) OVER (ORDER BY p.Score DESC) as ScoreQuartile,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as UserAvgScore,
+        LAG(p.Score, 1) OVER (ORDER BY p.CreationDate) as PrevScore,
+        LAG(p.ViewCount, 1) OVER (ORDER BY p.CreationDate) as PrevViews,
+        LEAD(p.Score, 1) OVER (ORDER BY p.CreationDate) as NextScore,
+        LEAD(p.ViewCount, 1) OVER (ORDER BY p.CreationDate) as NextViews,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) as UserTotalPosts,
+        FIRST_VALUE(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ROWS UNBOUNDED PRECEDING) as UserFirstScore,
+        LAST_VALUE(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ROWS UNBOUNDED FOLLOWING) as UserLastScore
+    FROM Posts p
+    INNER JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+),
+RankedUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        Views,
+        UpVotes,
+        DownVotes,
+        PostCount,
+        CommentCount,
+        BadgeCount,
+        LastPostDate,
+        LastCommentDate,
+        AvgPostScore,
+        MaxViewCount,
+        PostTypes,
+        QuestionCount,
+        AnswerCount,
+        QuestionWithAcceptedAnswer,
+        ClosedQuestions,
+        FavoritedQuestions,
+        PositiveAnswerCount,
+        NegativeAnswerCount,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, PostCount DESC) as UserRank,
+        RANK() OVER (ORDER BY Reputation DESC) as ReputationRank,
+        DENSE_RANK() OVER (ORDER BY PostCount DESC) as PostActivityRank,
+        NTILE(5) OVER (ORDER BY Reputation DESC) as ReputationQuintile,
+        PERCENT_RANK() OVER (ORDER BY Reputation) as ReputationPercentile,
+        CUME_DIST() OVER (ORDER BY Reputation) as ReputationCumulativeDistribution,
+        AVG(Reputation) OVER () as OverallAvgReputation,
+        STDDEV(Reputation) OVER () as ReputationStdDev,
+        MAX(Reputation) OVER () as MaxReputation,
+        MIN(Reputation) OVER () as MinReputation,
+        LAG(Reputation, 1) OVER (ORDER BY Reputation DESC) as PrevReputation,
+        LEAD(Reputation, 1) OVER (ORDER BY Reputation DESC) as NextReputation,
+        FIRST_VALUE(Reputation) OVER (ORDER BY Reputation DESC) as TopReputation,
+        LAST_VALUE(Reputation) OVER (ORDER BY Reputation DESC ROWS UNBOUNDED FOLLOWING) as BottomReputation
+    FROM UserActivity
+),
+ComplexAnalysis AS (
+    SELECT 
+        ru.UserId,
+        ru.DisplayName,
+        ru.Reputation,
+        ru.Views,
+        ru.PostCount,
+        ru.QuestionCount,
+        ru.AnswerCount,
+        ru.ReputationRank,
+        ru.UserRank,
+        ru.PostActivityRank,
+        CASE 
+            WHEN ru.Reputation > 10000 THEN 'Elite'
+            WHEN ru.Reputation > 5000 THEN 'Veteran'
+            WHEN ru.Reputation > 1000 THEN 'Active'
+            ELSE 'Newbie'
+        END as UserTier,
+        CASE 
+            WHEN ru.PostCount > 1000 THEN 'Super Poster'
+            WHEN ru.PostCount > 500 THEN 'High Poster'
+            WHEN ru.PostCount > 100 THEN 'Regular Poster'
+            ELSE 'Occasional Poster'
+        END as ActivityLevel,
+        CASE 
+            WHEN ru.QuestionCount > 100 THEN 'Question Master'
+            WHEN ru.QuestionCount > 50 THEN 'Question Creator'
+            WHEN ru.QuestionCount > 10 THEN 'Question Asker'
+            ELSE 'Question Seeker'
+        END as QuestionLevel,
+        CASE 
+            WHEN ru.AnswerCount > 500 THEN 'Answer Giant'
+            WHEN ru.AnswerCount > 200 THEN 'Answerer Extraordinaire'
+            WHEN ru.AnswerCount > 50 THEN 'Answer Contributor'
+            ELSE 'Answer Helper'
+        END as AnswerLevel,
+        (ru.Reputation * 0.3 + ru.PostCount * 0.2 + ru.QuestionCount * 0.25 + ru.AnswerCount * 0.25) as CompositeScore,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = ru.UserId AND p.PostTypeId = 1 AND p.Score > 10) as HighScoringQuestions,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = ru.UserId AND p.PostTypeId = 2 AND p.Score > 10) as HighScoringAnswers,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = ru.UserId AND p.PostTypeId = 1 AND p.ViewCount > 1000) as HighlyViewedQuestions,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = ru.UserId AND p.PostTypeId = 2 AND p.ViewCount > 1000) as HighlyViewedAnswers,
+        (SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = ru.UserId AND p.PostTypeId = 1) as AvgQuestionScore,
+        (SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = ru.UserId AND p.PostTypeId = 2) as AvgAnswerScore,
+        CASE 
+            WHEN (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = ru.UserId AND p.PostTypeId = 1 AND p.Score > 100) > 0 
+            THEN 'Has Legendary Questions' 
+            ELSE 'No Legendary Questions' 
+        END as HasLegendaryQuestions,
+        CASE 
+            WHEN (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = ru.UserId AND p.PostTypeId = 2 AND p.Score > 100) > 0 
+            THEN 'Has Legendary Answers' 
+            ELSE 'No Legendary Answers' 
+        END as HasLegendaryAnswers,
+        -- Correlated subquery for calculating user activity score
+        (SELECT SUM(
+            CASE 
+                WHEN po.PostTypeId = 1 THEN (po.Score * 0.5 + po.ViewCount * 0.001)
+                WHEN po.PostTypeId = 2 THEN (po.Score * 0.3 + po.ViewCount * 0.0005)
+                ELSE 0 
+            END
+        ) FROM Posts po WHERE po.OwnerUserId = ru.UserId) as UserActivityScore,
+        -- Complex calculated fields
+        ROUND((ru.Reputation / NULLIF(ru.Views, 0)), 2) as ReputationPerView,
+        ROUND((ru.PostCount / NULLIF(ru.Reputation, 0)), 4) as PostsPerReputation,
+        ROUND((ru.QuestionCount / NULLIF(ru.AnswerCount, 0)), 2) as QuestionsPerAnswer,
+        CASE 
+            WHEN ru.QuestionCount > 0 THEN ROUND((ru.AnswerCount * 100.0 / ru.QuestionCount), 2)
+            ELSE 0 
+        END as AnswerRate,
+        -- Calculating engagement metrics
+        CASE 
+            WHEN (ru.QuestionCount + ru.AnswerCount) > 0 THEN 
+                ROUND((ru.CommentCount * 100.0 / (ru.QuestionCount + ru.AnswerCount)), 2)
+            ELSE 0 
+        END as CommentToPostRatio,
+        -- Time-based calculations
+        CASE 
+            WHEN ru.LastPostDate IS NOT NULL THEN 
+                DATEDIFF('day', ru.LastPostDate, CURRENT_TIMESTAMP)
+            ELSE NULL 
+        END as DaysSinceLastPost,
+        CASE 
+            WHEN ru.LastCommentDate IS NOT NULL THEN 
+                DATEDIFF('day', ru.LastCommentDate, CURRENT_TIMESTAMP)
+            ELSE NULL 
+        END as DaysSinceLastComment,
+        -- Null-aware calculations
+        NULLIF(ru.Reputation, 0) as NonZeroReputation,
+        NULLIF(ru.Views, 0) as NonZeroViews,
+        NULLIF(ru.UpVotes, 0) as NonZeroUpVotes,
+        NULLIF(ru.DownVotes, 0) as NonZeroDownVotes,
+        -- Set operator example: union of different user groups
+        CASE 
+            WHEN ru.Reputation > (SELECT AVG(Reputation) FROM Users) THEN 'Above Average'
+            ELSE 'Below Average' 
+        END as ReputationStatus,
+        CASE 
+            WHEN ru.PostCount > (SELECT AVG(PostCount) FROM UserActivity) THEN 'Above Post Average'
+            ELSE 'Below Post Average' 
+        END as PostActivityStatus
+    FROM RankedUsers ru
+)
+SELECT 
+    ca.UserId,
+    ca.DisplayName,
+    ca.Reputation,
+    ca.Views,
+    ca.PostCount,
+    ca.QuestionCount,
+    ca.AnswerCount,
+    ca.ReputationRank,
+    ca.UserRank,
+    ca.PostActivityRank,
+    ca.UserTier,
+    ca.ActivityLevel,
+    ca.QuestionLevel,
+    ca.AnswerLevel,
+    ca.CompositeScore,
+    ca.HighScoringQuestions,
+    ca.HighScoringAnswers,
+    ca.HighlyViewedQuestions,
+    ca.HighlyViewedAnswers,
+    ca.AvgQuestionScore,
+    ca.AvgAnswerScore,
+    ca.HasLegendaryQuestions,
+    ca.HasLegendaryAnswers,
+    ca.UserActivityScore,
+    ca.ReputationPerView,
+    ca.PostsPerReputation,
+    ca.QuestionsPerAnswer,
+    ca.AnswerRate,
+    ca.CommentToPostRatio,
+    ca.DaysSinceLastPost,
+    ca.DaysSinceLastComment,
+    ca.NonZeroReputation,
+    ca.NonZeroViews,
+    ca.NonZeroUpVotes,
+    ca.NonZeroDownVotes,
+    ca.ReputationStatus,
+    ca.PostActivityStatus,
+    -- Window function aggregations
+    FIRST_VALUE(ca.DisplayName) OVER (ORDER BY ca.CompositeScore DESC) as TopScoringUser,
+    LAST_VALUE(ca.DisplayName) OVER (ORDER BY ca.CompositeScore DESC ROWS UNBOUNDED FOLLOWING) as BottomScoringUser,
+    AVG(ca.Reputation) OVER (PARTITION BY ca.UserTier) as TierAvgReputation,
+    STDDEV(ca.Reputation) OVER (PARTITION BY ca.UserTier) as TierReputationStdDev,
+    MIN(ca.PostCount) OVER (PARTITION BY ca.UserTier) as TierMinPosts,
+    MAX(ca.PostCount) OVER (PARTITION BY ca.UserTier) as TierMaxPosts,
+    -- Complex string manipulation
+    CONCAT('User ', ca.UserId, ' - ', ca.DisplayName) as UserIdentifier,
+    CONCAT('Tier: ', ca.UserTier, ' | Rank: ', ca.ReputationRank) as StatusSummary,
+    -- NULL handling for edge cases
+    COALESCE(ca.ReputationPerView, 0) as FinalReputationPerView,
+    COALESCE(ca.DaysSinceLastPost, 9999) as DaysSinceLastActivity,
+    -- Conditional filtering and complex boolean expressions
+    CASE 
+        WHEN ca.CompositeScore > 5000 AND ca.QuestionCount > 100 AND ca.AnswerCount > 500 
+        THEN 'Elite Contributor'
+        WHEN ca.CompositeScore > 3000 AND ca.QuestionCount > 50 
+        THEN 'Active Contributor'
+        WHEN ca.CompositeScore > 1000 AND ca.PostCount > 100 
+        THEN 'Regular Contributor'
+        ELSE 'Beginner Contributor' 
+    END as ContributionLevel,
+    -- Set operators and complex joins
+    (SELECT COUNT(*) FROM Badges bg WHERE bg.UserId = ca.UserId AND bg.Class = 1) as GoldBadges,
+    (SELECT COUNT(*) FROM Badges bg WHERE bg.UserId = ca.UserId AND bg.Class = 2) as SilverBadges,
+    (SELECT COUNT(*) FROM Badges bg WHERE bg.UserId = ca.UserId AND bg.Class = 3) as BronzeBadges,
+    -- Multiple subqueries with correlated conditions
+    (SELECT STRING_AGG(b.Name, ', ') FROM Badges b WHERE b.UserId = ca.UserId AND b.Class = 1) as GoldBadgeNames,
+    (SELECT STRING_AGG(b.Name, ', ') FROM Badges b WHERE b.UserId = ca.UserId AND b.Class = 2) as SilverBadgeNames,
+    (SELECT STRING_AGG(b.Name, ', ') FROM Badges b WHERE b.UserId = ca.UserId AND b.Class = 3) as BronzeBadgeNames
+FROM ComplexAnalysis ca
+WHERE ca.Reputation > 1000
+  AND (ca.QuestionCount > 0 OR ca.AnswerCount > 0 OR ca.CommentCount > 0)
+  AND (ca.DaysSinceLastPost IS NULL OR ca.DaysSinceLastPost < 365)
+ORDER BY ca.CompositeScore DESC, ca.Reputation DESC
+LIMIT 100;

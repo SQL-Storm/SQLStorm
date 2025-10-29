@@ -1,0 +1,129 @@
+WITH
+  AnswerStats AS (
+    SELECT
+      p.Id AS PostId,
+      COUNT(c.Id) AS CommentCount,
+      SUM(c.Score) AS TotalCommentScore,
+      AVG(c.Score) AS AvgCommentScore,
+      MAX(c.CreationDate) AS LastCommentDate,
+      ROW_NUMBER() OVER (
+        PARTITION BY p.Id
+        ORDER BY COUNT(c.Id) DESC, SUM(c.Score) DESC
+      ) AS rn
+    FROM Posts p
+    LEFT JOIN Comments c
+      ON p.Id = c.PostId
+    WHERE p.PostTypeId = 2
+    GROUP BY p.Id
+  ),
+  QuestionDetails AS (
+    SELECT
+      q.Id AS QuestionId,
+      q.Title,
+      q.Score AS QuestionScore,
+      q.ViewCount AS QuestionViewCount,
+      q.AnswerCount AS QuestionAnswerCount,
+      q.FavoriteCount AS QuestionFavoriteCount,
+      q.CreationDate AS QuestionCreationDate,
+      u.DisplayName AS OwnerDisplayName,
+      COALESCE(q.OwnerUserId, -1) AS OwnerUserId,
+      CASE
+        WHEN q.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN q.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        ELSE 'Open'
+      END AS QuestionStatus,
+      (
+        SELECT COUNT(*) FROM PostLinks pl
+        WHERE pl.PostId = q.Id AND pl.LinkTypeId = 3
+      ) AS DuplicateLinkCount,
+      (
+        SELECT COUNT(*) FROM PostHistory ph
+        WHERE ph.PostId = q.Id AND ph.PostHistoryTypeId IN (10,11,12,13,14,15,19,20)
+      ) AS ModerationActionCount,
+      (
+        SELECT COUNT(*) FROM Votes v
+        WHERE v.PostId = q.Id AND v.VoteTypeId = 2
+      ) AS UpVoteCount
+    FROM Posts q
+    LEFT JOIN Users u
+      ON q.OwnerUserId = u.Id
+    WHERE q.PostTypeId = 1
+  ),
+  CombinedData AS (
+    SELECT
+      qd.QuestionId,
+      qd.Title,
+      qd.QuestionScore,
+      qd.QuestionViewCount,
+      qd.QuestionAnswerCount,
+      qd.QuestionFavoriteCount,
+      qd.QuestionCreationDate,
+      qd.OwnerDisplayName,
+      qd.OwnerUserId,
+      qd.QuestionStatus,
+      qd.DuplicateLinkCount,
+      qd.ModerationActionCount,
+      qd.UpVoteCount,
+      COALESCE(ans.CommentCount, 0) AS MaxAnswerCommentCount,
+      COALESCE(ans.TotalCommentScore, 0) AS MaxAnswerTotalCommentScore,
+      COALESCE(ans.AvgCommentScore, 0.0) AS MaxAnswerAvgCommentScore,
+      ans.LastCommentDate AS MaxAnswerLastCommentDate,
+      ROW_NUMBER() OVER (
+        ORDER BY qd.QuestionScore DESC, qd.QuestionViewCount DESC
+      ) AS QuestionRank
+    FROM QuestionDetails qd
+    LEFT JOIN AnswerStats ans
+      ON qd.QuestionId = ans.PostId AND ans.rn = 1
+  )
+SELECT
+  cd.QuestionId,
+  cd.Title,
+  cd.QuestionScore,
+  cd.QuestionViewCount,
+  cd.QuestionAnswerCount,
+  cd.QuestionFavoriteCount,
+  cd.QuestionCreationDate,
+  cd.OwnerDisplayName,
+  cd.OwnerUserId,
+  cd.QuestionStatus,
+  cd.DuplicateLinkCount,
+  cd.ModerationActionCount,
+  cd.UpVoteCount,
+  cd.MaxAnswerCommentCount,
+  cd.MaxAnswerTotalCommentScore,
+  cd.MaxAnswerAvgCommentScore,
+  cd.MaxAnswerLastCommentDate,
+  CASE
+    WHEN cd.QuestionStatus = 'Closed' AND cd.MaxAnswerLastCommentDate IS NOT NULL AND cd.QuestionCreationDate IS NOT NULL
+      THEN CAST(
+        DATE_PART('day', CAST(cd.MaxAnswerLastCommentDate AS TIMESTAMP) - CAST(cd.QuestionCreationDate AS TIMESTAMP)
+        ) AS INTEGER)
+    ELSE NULL
+  END AS DaysToFirstAnswerCommentIfClosed,
+  CASE
+    WHEN cd.QuestionFavoriteCount > 100 AND cd.QuestionScore > 500 THEN 'Highly Popular'
+    WHEN cd.QuestionViewCount > 100000 THEN 'Widely Viewed'
+    WHEN cd.DuplicateLinkCount > 0 THEN 'Has Duplicates'
+    ELSE 'Standard'
+  END AS QuestionCategory,
+  'Q-' || CAST(cd.QuestionId AS VARCHAR) AS QuestionIdentifier,
+  LENGTH(cd.Title) AS TitleLength,
+  UPPER(SUBSTR(cd.Title, 1, 1)) || SUBSTR(cd.Title, 2) AS FormattedTitle,
+  CASE
+    WHEN cd.OwnerDisplayName IS NULL THEN 'Anonymous'
+    ELSE cd.OwnerDisplayName
+  END AS DisplayNameOrAnonymous,
+  CASE
+    WHEN cd.MaxAnswerAvgCommentScore BETWEEN 0 AND 2 THEN 'Low Engagement'
+    WHEN cd.MaxAnswerAvgCommentScore > 2 AND cd.MaxAnswerAvgCommentScore <= 5 THEN 'Moderate Engagement'
+    WHEN cd.MaxAnswerAvgCommentScore > 5 THEN 'High Engagement'
+    ELSE 'No Answers or Zero Score'
+  END AS AnswerEngagementLevel,
+  cd.QuestionRank
+FROM CombinedData cd
+WHERE
+  cd.QuestionRank <= 100
+  AND cd.QuestionScore > 0
+  AND cd.QuestionAnswerCount > 0
+  AND cd.MaxAnswerCommentCount > 0
+ORDER BY cd.QuestionRank;

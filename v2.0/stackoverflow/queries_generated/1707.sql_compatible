@@ -1,0 +1,252 @@
+WITH UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.DisplayName,
+        u.Location,
+        u.WebsiteUrl,
+        u.Views AS UserProfileViews,
+        u.UpVotes AS UserUpVotes,
+        u.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        MAX(b.Date) AS LastBadgeDate,
+        AVG(COALESCE(p.Score, 0)) AS AvgPostScore,
+        MAX(p.LastActivityDate) AS LastPostActivityDate,
+        (SELECT COUNT(DISTINCT c.Id) FROM Comments c WHERE c.UserId = u.Id) AS TotalCommentsMade,
+        (SELECT SUM(v.BountyAmount) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 8) AS TotalBountyGiven,
+        (SELECT SUM(v.BountyAmount) FROM Votes v WHERE v.PostId IN (SELECT p_inner.Id FROM Posts p_inner WHERE p_inner.OwnerUserId = u.Id) AND v.VoteTypeId = 9) AS TotalBountyReceived
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.Reputation, u.CreationDate, u.DisplayName, u.Location, u.WebsiteUrl, u.Views, u.UpVotes, u.DownVotes
+),
+PostDetailsExtended AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.Title,
+        p.Tags,
+        p.Body,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.ClosedDate,
+        p.CommunityOwnedDate,
+        COALESCE(p.AcceptedAnswerId, -1) AS ValidAcceptedAnswerId,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - p.CreationDate)) / 86400 AS PostAgeDays,
+        (CASE WHEN p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2
+              THEN regexp_split_to_array(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2), '><')
+              ELSE NULL END) AS TagArray,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Wiki'
+            ELSE 'Open'
+        END AS PostStatus,
+        LENGTH(p.Body) AS BodyLength,
+        (SELECT COUNT(DISTINCT ph.Id) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4,5,6,8,9,24)) AS EditCount,
+        (SELECT MAX(ph.CreationDate) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4,5,6,8,9,24)) AS LastEditHistoryDate
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+),
+PostLinkAnalysis AS (
+    SELECT
+        pl.PostId,
+        STRING_AGG(CASE WHEN pl.LinkTypeId = 1 THEN 'Linked' ELSE 'Duplicate' END || ':' || CAST(pl.RelatedPostId AS VARCHAR), '; ') AS RelatedPostsSummary,
+        COUNT(CASE WHEN pl.LinkTypeId = 1 THEN 1 END) AS LinkedPostCount,
+        COUNT(CASE WHEN pl.LinkTypeId = 3 THEN 1 END) AS DuplicatePostCount,
+        MAX(pl.CreationDate) AS LastLinkDate
+    FROM PostLinks pl
+    GROUP BY pl.PostId
+),
+TopTagsPerPost AS (
+    SELECT
+        pd.PostId,
+        (CASE WHEN pd.TagArray IS NOT NULL AND array_length(pd.TagArray,1) > 0 THEN pd.TagArray[1] ELSE NULL END) AS PrimaryTag
+    FROM PostDetailsExtended pd
+    WHERE pd.PostTypeId = 1 AND pd.TagArray IS NOT NULL AND array_length(pd.TagArray,1) > 0
+),
+ModeratorActionSummary AS (
+    SELECT
+        ph.PostId,
+        STRING_AGG(DISTINCT pht.Name, ', ') AS ModeratorActionTypes,
+        COUNT(DISTINCT ph.Id) AS TotalModeratorActions,
+        MAX(ph.CreationDate) AS LastModeratorActionDate,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE NULL END) AS CloseVotesHistoryCount,
+        STRING_AGG(DISTINCT crt.Name, ';') FILTER (WHERE ph.PostHistoryTypeId = 10 AND ph.Comment IS NOT NULL) AS CloseReasonDetails
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    LEFT JOIN CloseReasonTypes crt ON ph.PostHistoryTypeId = 10 AND ph.Comment = CAST(crt.Id AS VARCHAR)
+    WHERE ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20)
+    GROUP BY ph.PostId
+)
+SELECT
+    ue.UserId,
+    ue.DisplayName AS UserDisplayName,
+    ue.Reputation,
+    ue.UserCreationDate,
+    ue.Location AS UserLocation,
+    COALESCE(ue.WebsiteUrl, 'N/A') AS UserWebsite,
+    ue.UserProfileViews,
+    ue.TotalPosts,
+    ue.TotalQuestions,
+    ue.TotalAnswers,
+    ue.TotalBadges,
+    ue.LastBadgeDate,
+    ue.AvgPostScore,
+    ue.TotalCommentsMade,
+    ue.TotalBountyGiven,
+    ue.TotalBountyReceived,
+    q.PostId AS TopQuestionId,
+    q.Title AS TopQuestionTitle,
+    q.Score AS TopQuestionScore,
+    q.ViewCount AS TopQuestionViewCount,
+    q.AnswerCount AS TopQuestionAnswerCount,
+    q.FavoriteCount AS TopQuestionFavoriteCount,
+    q.PostAgeDays AS TopQuestionAgeDays,
+    q.PostStatus AS TopQuestionStatus,
+    q.EditCount AS TopQuestionEditCount,
+    q.BodyLength AS TopQuestionBodyLength,
+    COALESCE(tpp.PrimaryTag, 'untagged') AS TopQuestionPrimaryTag,
+    pla_q.RelatedPostsSummary AS TopQuestionLinkedInfo,
+    mas_q.ModeratorActionTypes AS TopQuestionModActions,
+    mas_q.CloseReasonDetails AS TopQuestionCloseReasons,
+    a.PostId AS TopAnswerId,
+    a.Title AS TopAnswerQuestionTitle,
+    a.Score AS TopAnswerScore,
+    a.PostAgeDays AS TopAnswerAgeDays,
+    a.PostStatus AS TopAnswerStatus,
+    a.EditCount AS TopAnswerEditCount,
+    (
+        SELECT
+            COUNT(c_inner.Id)
+        FROM Comments c_inner
+        WHERE c_inner.PostId = a.PostId
+          AND c_inner.CreationDate > a.PostCreationDate
+          AND c_inner.Score > 0
+    ) AS TopAnswerPositiveCommentCount,
+    pla_a.RelatedPostsSummary AS TopAnswerLinkedInfo,
+    mas_a.ModeratorActionTypes AS TopAnswerModActions,
+    ROW_NUMBER() OVER (ORDER BY ue.Reputation DESC, ue.TotalQuestions DESC, ue.TotalAnswers DESC) AS GlobalUserRank,
+    AVG(ue.TotalQuestions) OVER (PARTITION BY ue.Location) AS AvgQuestionsInLocation,
+    MAX(ue.LastPostActivityDate) OVER (PARTITION BY DATE_TRUNC('month', ue.UserCreationDate)) AS LastActivityForCreationMonth,
+    ue.UserUpVotes - ue.UserDownVotes AS NetUserVotes,
+    EXTRACT(YEAR FROM CAST('2024-10-01 12:34:56' AS timestamp)) - EXTRACT(YEAR FROM ue.UserCreationDate) AS YearsOnPlatform,
+    (
+        (ue.Reputation * 0.5)
+        + (ue.TotalPosts * 0.1)
+        + (COALESCE(q.Score, 0) * 0.2)
+        + (COALESCE(a.Score, 0) * 0.2)
+        + (COALESCE(q.ViewCount, 0) * 0.005)
+        + (ue.TotalBadges * 10)
+        + (ue.TotalCommentsMade * 0.05)
+        - (ue.UserDownVotes * 0.1)
+    ) AS UserInfluenceScore,
+    UPPER(SUBSTRING(ue.DisplayName FROM 1 FOR 1)) AS FirstLetterOfDisplayName,
+    REPLACE(REPLACE(REPLACE(LOWER(SUBSTRING(COALESCE(q.Body, '' ) FROM 1 FOR 500)), 'sql', '[SQL_TERM]'), 'database', '[DB_TERM]'), 'query', '[QUERY_TERM]') AS SanitizedQuestionBodySnippet,
+    (SELECT COUNT(*) FROM Posts p_inner WHERE p_inner.OwnerUserId = ue.UserId AND p_inner.PostTypeId = 1 AND p_inner.Title ILIKE '%performance%') AS PerformanceQuestionCount,
+    EXTRACT(EPOCH FROM (q.LastEditHistoryDate - q.PostCreationDate)) / 3600 AS HoursSinceFirstEditForTopQuestion,
+    EXTRACT(EPOCH FROM (a.LastEditHistoryDate - a.PostCreationDate)) / 3600 AS HoursSinceFirstEditForTopAnswer
+FROM
+    UserEngagement ue
+LEFT JOIN LATERAL (
+    SELECT
+        pd.PostId,
+        pd.PostTypeId,
+        pd.PostTypeName,
+        pd.OwnerUserId,
+        pd.PostCreationDate,
+        pd.Score,
+        pd.ViewCount,
+        pd.AnswerCount,
+        pd.CommentCount,
+        pd.FavoriteCount,
+        pd.AcceptedAnswerId,
+        pd.ParentId,
+        pd.Title,
+        pd.Tags,
+        pd.Body,
+        pd.LastEditDate,
+        pd.LastActivityDate,
+        pd.ClosedDate,
+        pd.CommunityOwnedDate,
+        pd.ValidAcceptedAnswerId,
+        pd.PostAgeDays,
+        pd.TagArray,
+        pd.PostStatus,
+        pd.BodyLength,
+        pd.EditCount,
+        pd.LastEditHistoryDate
+    FROM PostDetailsExtended pd
+    WHERE pd.OwnerUserId = ue.UserId
+      AND pd.PostTypeId = 1
+    ORDER BY pd.Score DESC, pd.ViewCount DESC, pd.PostCreationDate DESC
+    LIMIT 1
+) q ON TRUE
+LEFT JOIN LATERAL (
+    SELECT
+        pd.PostId,
+        pd.PostTypeId,
+        pd.PostTypeName,
+        pd.OwnerUserId,
+        pd.PostCreationDate,
+        pd.Score,
+        pd.ViewCount,
+        pd.AnswerCount,
+        pd.CommentCount,
+        pd.FavoriteCount,
+        pd.AcceptedAnswerId,
+        pd.ParentId,
+        (SELECT p_q.Title FROM Posts p_q WHERE p_q.Id = pd.ParentId) AS Title,
+        pd.Tags,
+        pd.Body,
+        pd.LastEditDate,
+        pd.LastActivityDate,
+        pd.ClosedDate,
+        pd.CommunityOwnedDate,
+        pd.ValidAcceptedAnswerId,
+        pd.PostAgeDays,
+        pd.TagArray,
+        pd.PostStatus,
+        pd.BodyLength,
+        pd.EditCount,
+        pd.LastEditHistoryDate
+    FROM PostDetailsExtended pd
+    WHERE pd.OwnerUserId = ue.UserId
+      AND pd.PostTypeId = 2
+    ORDER BY pd.Score DESC, pd.PostCreationDate DESC
+    LIMIT 1
+) a ON TRUE
+LEFT JOIN TopTagsPerPost tpp ON q.PostId = tpp.PostId
+LEFT JOIN PostLinkAnalysis pla_q ON q.PostId = pla_q.PostId
+LEFT JOIN PostLinkAnalysis pla_a ON a.PostId = pla_a.PostId
+LEFT JOIN ModeratorActionSummary mas_q ON q.PostId = mas_q.PostId
+LEFT JOIN ModeratorActionSummary mas_a ON a.PostId = mas_a.PostId
+WHERE
+    ue.Reputation > 1000
+    AND ue.TotalPosts > 5
+    AND ue.UserCreationDate < CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+    AND (
+        q.PostId IS NOT NULL
+        OR a.PostId IS NOT NULL
+    )
+    AND (
+        LOWER(ue.Location) LIKE '%london%'
+        OR LOWER(ue.Location) LIKE '%new york%'
+        OR ue.Location IS NULL
+    )
+ORDER BY
+    UserInfluenceScore DESC, GlobalUserRank ASC
+LIMIT 1000;

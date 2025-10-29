@@ -1,0 +1,117 @@
+WITH
+UserStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.UpVotes, 0) - COALESCE(u.DownVotes, 0) AS NetVotes,
+        (SELECT MAX(p.CreationDate) FROM Posts p WHERE p.OwnerUserId = u.Id) AS LastPostDate,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadges
+    FROM Users u
+),
+PostAgg AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS QuestionScoreSum,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS AnswerScoreSum,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswerCount,
+        COUNT(*) FILTER (WHERE p.Tags IS NOT NULL) AS TaggedPostCount,
+        ARRAY_AGG(DISTINCT t) FILTER (WHERE p.Tags IS NOT NULL) AS AllTags
+    FROM Posts p
+    LEFT JOIN LATERAL (
+        SELECT UNNEST(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')) AS t
+    ) tags ON TRUE
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+TagStats AS (
+    SELECT
+        t.TagName,
+        COUNT(p.Id) AS PostsWithTag,
+        SUM(p.Score) AS TotalScore,
+        MAX(p.CreationDate) AS LatestPostDate
+    FROM Tags t
+    JOIN Posts p
+      ON p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+    GROUP BY t.TagName
+),
+UserTagRank AS (
+    SELECT
+        us.Id,
+        us.DisplayName,
+        us.Reputation,
+        us.NetVotes,
+        us.GoldBadges,
+        us.SilverBadges,
+        us.BronzeBadges,
+        pa.QuestionScoreSum,
+        pa.AnswerScoreSum,
+        pa.QuestionCount,
+        pa.AnswerCount,
+        pa.TaggedPostCount,
+        COALESCE(pa.AllTags, ARRAY[]::text[]) AS Tags,
+        ROW_NUMBER() OVER (ORDER BY (us.Reputation + us.NetVotes) DESC) AS RankByRepNet,
+        ROW_NUMBER() OVER (PARTITION BY (us.GoldBadges > 0) ORDER BY us.Reputation DESC) AS RankGoldGroup,
+        us.LastPostDate
+    FROM UserStats us
+    LEFT JOIN PostAgg pa ON pa.UserId = us.Id
+)
+
+SELECT
+    utr.Id,
+    utr.DisplayName,
+    utr.Reputation,
+    utr.NetVotes,
+    utr.GoldBadges,
+    utr.SilverBadges,
+    utr.BronzeBadges,
+    utr.QuestionScoreSum,
+    utr.AnswerScoreSum,
+    utr.QuestionCount,
+    utr.AnswerCount,
+    utr.TaggedPostCount,
+    COALESCE(utr.Tags[1], 'NoTag') AS FirstTag,
+    utr.RankByRepNet,
+    utr.RankGoldGroup,
+    CASE
+        WHEN utr.LastPostDate IS NULL THEN 'Never posted'
+        WHEN utr.LastPostDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days') THEN 'Active'
+        ELSE 'Dormant'
+    END AS ActivityStatus,
+    COALESCE((
+        SELECT string_agg(DISTINCT ts.TagName, ',')
+        FROM   UNNEST(utr.Tags) AS t(tag)
+        JOIN   TagStats ts ON ts.TagName = t.tag
+        WHERE  ts.PostsWithTag > 100
+    ), 'None') AS PopularTagList
+FROM UserTagRank utr
+WHERE utr.RankByRepNet <= 100
+   OR (utr.GoldBadges > 0 AND utr.AnswerCount > 0)
+
+UNION ALL
+
+SELECT
+    NULL                     AS Id,
+    '--- Summary ---'        AS DisplayName,
+    NULL                     AS Reputation,
+    NULL                     AS NetVotes,
+    NULL                     AS GoldBadges,
+    NULL                     AS SilverBadges,
+    NULL                     AS BronzeBadges,
+    SUM(QuestionScoreSum)    AS QuestionScoreSum,
+    SUM(AnswerScoreSum)      AS AnswerScoreSum,
+    SUM(QuestionCount)       AS QuestionCount,
+    SUM(AnswerCount)         AS AnswerCount,
+    SUM(TaggedPostCount)     AS TaggedPostCount,
+    NULL                     AS FirstTag,
+    NULL                     AS RankByRepNet,
+    NULL                     AS RankGoldGroup,
+    NULL                     AS ActivityStatus,
+    NULL                     AS PopularTagList
+FROM UserTagRank
+WHERE RankByRepNet <= 100
+
+ORDER BY RankByRepNet;

@@ -1,0 +1,145 @@
+-- {"query": "2526.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1162} 
+with RecursiveTagCounts as (
+    select
+        t.Id as TagId,
+        t.TagName,
+        coalesce(p.AnswerCount, 0) as AnswerCount,
+        coalesce(p.FavoriteCount, 0) as FavoriteCount,
+        coalesce(u.Reputation, 0) as OwnerReputation,
+        p.Id as PostId,
+        p.Score,
+        p.ViewCount,
+        p.Tags
+    from Tags t
+    left join Posts p on p.PostTypeId = 1 and (p.Tags like concat('%<', t.TagName, '>%') escape '')
+    left join Users u on u.Id = p.OwnerUserId
+    where p.Id is not null
+),
+PostRanks as (
+    select
+        PostId,
+        TagName,
+        Score,
+        ViewCount,
+        FavoriteCount,
+        AnswerCount,
+        OwnerReputation,
+        row_number() over (partition by TagName order by Score desc, ViewCount desc) as rn
+    from RecursiveTagCounts
+),
+TopPosts as (
+    select *
+    from PostRanks
+    where rn <= 5
+),
+UserBadgeCounts as (
+    select 
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges
+    from Badges b
+    group by b.UserId
+),
+HighRepUsers as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        u.CreationDate,
+        u.Location,
+        u.WebsiteUrl
+    from Users u
+    left join UserBadgeCounts ub on ub.UserId = u.Id
+    where u.Reputation > 10000
+),
+PostWithCloseReasons as (
+    select
+        p.Id as PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.OwnerUserId,
+        crt.Name as CloseReason,
+        p.ClosedDate
+    from Posts p
+    left join PostHistory ph on p.Id = ph.PostId and ph.PostHistoryTypeId = 10
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int) -- close reason stored in Comment as int
+    where p.PostTypeId = 1
+),
+CloseReasonStats as (
+    select
+        CloseReason,
+        count(*) as CountClosed,
+        min(ClosedDate) as FirstCloseDate,
+        max(ClosedDate) as LastCloseDate
+    from PostWithCloseReasons
+    where CloseReason is not null
+    group by CloseReason
+),
+AnswerScores as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.Score as AnswerScore,
+        q.Title as QuestionTitle,
+        q.OwnerUserId as QuestionOwner,
+        u.DisplayName as AnswerOwnerDisplayName,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts a
+    join Posts q on q.Id = a.ParentId and q.PostTypeId = 1
+    left join Users u on u.Id = a.OwnerUserId
+    where a.PostTypeId = 2
+)
+select 
+    t.TagName,
+    t.PostId,
+    t.Score,
+    t.ViewCount,
+    t.FavoriteCount,
+    t.AnswerCount,
+    t.OwnerReputation,
+    p.Title as PostTitle,
+    hru.DisplayName as HighRepUserDisplayName,
+    hru.GoldBadges,
+    hru.SilverBadges,
+    hru.BronzeBadges,
+    cr.CloseReason,
+    cr.CountClosed,
+    cr.FirstCloseDate,
+    cr.LastCloseDate,
+    a.AnswerId,
+    a.AnswerScore,
+    a.AnswerRank,
+    a.AnswerOwnerDisplayName,
+    substring(p.Body from 1 for 100) as BodyExcerpt,
+    case when p.ClosedDate is not null then 'Closed' else 'Open' end as PostStatus,
+    coalesce(pl.CountLinked, 0) as LinkCount,
+    case when pl.DuplicateCount > 0 then 1 else 0 end as HasDuplicates
+from TopPosts t
+join Posts p on p.Id = t.PostId
+left join HighRepUsers hru on hru.Id = p.OwnerUserId
+left join CloseReasonStats cr on cr.CloseReason = (
+    select top 1 crt.Name
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    where ph.PostId = p.Id and ph.PostHistoryTypeId = 10
+    order by ph.CreationDate desc
+)
+left join (
+    select
+        pl.PostId,
+        count(*) as CountLinked,
+        sum(case when pl.LinkTypeId = 3 then 1 else 0 end) as DuplicateCount
+    from PostLinks pl
+    group by pl.PostId
+) pl on pl.PostId = p.Id
+left join AnswerScores a on a.QuestionId = p.Id and a.AnswerRank = 1
+where exists (
+    select 1 from HighRepUsers h2 where h2.Id = p.OwnerUserId
+)
+order by t.TagName, t.Score desc, a.AnswerScore desc
+limit 100;

@@ -1,0 +1,282 @@
+-- {"query": "7124.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2556} 
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) as QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) as AnswerCount,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(u.LastAccessDate) as LastAccessDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes
+),
+RankedUsers AS (
+    SELECT 
+        *,
+        ROW_NUMBER() OVER (ORDER BY TotalScore DESC, Reputation DESC) as RankByScore,
+        RANK() OVER (ORDER BY Reputation DESC) as RankByReputation,
+        DENSE_RANK() OVER (ORDER BY PostCount DESC) as RankByPostCount,
+        NTILE(100) OVER (ORDER BY Views DESC) as ViewPercentile,
+        PERCENT_RANK() OVER (ORDER BY TotalScore DESC) as ScorePercentile
+    FROM UserStats
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.Body,
+        p.ParentId,
+        p.AcceptedAnswerId,
+        COALESCE(p.ViewCount, 0) + COALESCE(p.AnswerCount, 0) * 10 + COALESCE(p.CommentCount, 0) * 5 + COALESCE(p.FavoriteCount, 0) * 25 as EngagementScore,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 
+                CASE 
+                    WHEN p.AnswerCount = 0 THEN 'No Answers'
+                    WHEN p.AnswerCount >= 5 THEN 'Many Answers'
+                    ELSE 'Some Answers'
+                END
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as PostCategory,
+        CASE 
+            WHEN p.Score >= 100 THEN 'Highly Voted'
+            WHEN p.Score >= 25 THEN 'Moderately Voted'
+            WHEN p.Score >= 0 THEN 'Neutral'
+            ELSE 'Downvoted'
+        END as ScoreCategory,
+        ABS(COALESCE(p.ViewCount, 0) - COALESCE(LAG(p.ViewCount) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate), 0)) as ViewChange,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) as ScoreRankForUser
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count >= 1000 THEN 'Popular'
+            WHEN t.Count >= 100 THEN 'Moderate'
+            WHEN t.Count >= 10 THEN 'Niche'
+            ELSE 'Rare'
+        END as TagPopularity,
+        LAG(t.Count) OVER (ORDER BY t.Count DESC) - t.Count as PopularityChange,
+        DENSE_RANK() OVER (ORDER BY t.Count DESC) as PopularityRank
+    FROM Tags t
+    WHERE t.Count > 0
+),
+CombinedData AS (
+    SELECT 
+        ru.UserId,
+        ru.DisplayName,
+        ru.Reputation,
+        ru.PostCount,
+        ru.CommentCount,
+        ru.BadgeCount,
+        ru.QuestionCount,
+        ru.AnswerCount,
+        ru.TotalScore,
+        ru.ViewPercentile,
+        ru.ScorePercentile,
+        pa.PostId,
+        pa.PostTypeId,
+        pa.Score as PostScore,
+        pa.ViewCount as PostViewCount,
+        pa.AnswerCount as PostAnswerCount,
+        pa.CommentCount as PostCommentCount,
+        pa.FavoriteCount as PostFavoriteCount,
+        pa.CreationDate as PostCreationDate,
+        pa.Title as PostTitle,
+        pa.Tags as PostTags,
+        pa.EngagementScore,
+        pa.PostCategory,
+        pa.ScoreCategory,
+        ta.TagName,
+        ta.TagCount,
+        ta.TagPopularity
+    FROM RankedUsers ru
+    INNER JOIN PostAnalysis pa ON ru.UserId = pa.OwnerUserId
+    LEFT JOIN TagAnalysis ta ON pa.Tags IS NOT NULL AND ta.TagName = 'c#'
+    WHERE ru.PostCount >= 5
+      AND pa.Score > 0
+      AND (pa.PostTypeId = 1 OR pa.PostTypeId = 2)
+),
+FinalAggregation AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        PostCount,
+        CommentCount,
+        BadgeCount,
+        QuestionCount,
+        AnswerCount,
+        TotalScore,
+        ViewPercentile,
+        ScorePercentile,
+        PostId,
+        PostTypeId,
+        PostScore,
+        PostViewCount,
+        PostAnswerCount,
+        PostCommentCount,
+        PostFavoriteCount,
+        PostCreationDate,
+        PostTitle,
+        PostTags,
+        EngagementScore,
+        PostCategory,
+        ScoreCategory,
+        TagName,
+        TagCount,
+        TagPopularity,
+        CASE 
+            WHEN TotalScore > (SELECT AVG(TotalScore) FROM CombinedData) THEN 'Above Average'
+            WHEN TotalScore < (SELECT AVG(TotalScore) FROM CombinedData) THEN 'Below Average'
+            ELSE 'Average'
+        END as ScoreStatus,
+        CASE 
+            WHEN PostTags LIKE '%c#%' OR PostTags LIKE '%java%' THEN 'Popular Tech'
+            WHEN PostTags LIKE '%python%' OR PostTags LIKE '%javascript%' THEN 'Popular Languages'
+            WHEN PostTags LIKE '%database%' THEN 'Database Related'
+            ELSE 'Other Tags'
+        END as TagFocus,
+        ABS(EngagementScore - (SELECT AVG(EngagementScore) FROM CombinedData)) as EngagementDeviation,
+        CASE 
+            WHEN TagCount >= 1000 THEN 'Tag Heavy'
+            WHEN TagCount >= 100 THEN 'Tag Moderate'
+            ELSE 'Tag Light'
+        END as TagLoad
+    FROM CombinedData
+    WHERE PostTags IS NOT NULL
+),
+PerformanceMetrics AS (
+    SELECT 
+        *,
+        LAG(Reputation) OVER (ORDER BY RankByScore) - Reputation as RepChange,
+        LAG(PostCount) OVER (ORDER BY RankByScore) - PostCount as PostChange,
+        LAG(TotalScore) OVER (ORDER BY RankByScore) - TotalScore as ScoreChange,
+        AVG(Reputation) OVER (ORDER BY RankByScore ROWS BETWEEN 10 PRECEDING AND 10 FOLLOWING) as RepMA,
+        AVG(PostCount) OVER (ORDER BY RankByScore ROWS BETWEEN 10 PRECEDING AND 10 FOLLOWING) as PostMA,
+        AVG(TotalScore) OVER (ORDER BY RankByScore ROWS BETWEEN 10 PRECEDING AND 10 FOLLOWING) as ScoreMA,
+        COUNT(*) OVER () as TotalUsers,
+        ROW_NUMBER() OVER (ORDER BY ScorePercentile DESC) as ReverseScorePercentile,
+        PERCENT_RANK() OVER (ORDER BY ViewPercentile) as ViewScorePercentile,
+        RANK() OVER (ORDER BY EngagementScore DESC) as EngagementRank,
+        DENSE_RANK() OVER (ORDER BY PostCount DESC) as PostRank
+    FROM FinalAggregation
+)
+SELECT 
+    p.UserId,
+    p.DisplayName,
+    p.Reputation,
+    p.PostCount,
+    p.CommentCount,
+    p.BadgeCount,
+    p.QuestionCount,
+    p.AnswerCount,
+    p.TotalScore,
+    p.ViewPercentile,
+    p.ScorePercentile,
+    p.PostId,
+    p.PostTypeId,
+    p.PostScore,
+    p.PostViewCount,
+    p.PostAnswerCount,
+    p.PostCommentCount,
+    p.PostFavoriteCount,
+    p.PostCreationDate,
+    p.PostTitle,
+    p.PostTags,
+    p.EngagementScore,
+    p.PostCategory,
+    p.ScoreCategory,
+    p.TagName,
+    p.TagCount,
+    p.TagPopularity,
+    p.ScoreStatus,
+    p.TagFocus,
+    p.EngagementDeviation,
+    p.TagLoad,
+    p.RepChange,
+    p.PostChange,
+    p.ScoreChange,
+    p.RepMA,
+    p.PostMA,
+    p.ScoreMA,
+    p.TotalUsers,
+    p.ReverseScorePercentile,
+    p.ViewScorePercentile,
+    p.EngagementRank,
+    p.PostRank,
+    CASE 
+        WHEN p.TagFocus = 'Popular Tech' AND p.TagPopularity = 'Popular' THEN 'Tech Power User'
+        WHEN p.TagFocus = 'Popular Languages' AND p.ScorePercentage > 0.8 THEN 'Language Expert'
+        WHEN p.RepMA > 10000 AND p.ScoreMA > 1000 THEN 'Top Performer'
+        WHEN p.TagLoad = 'Tag Heavy' AND p.PostCount > 50 THEN 'Tag Specialist'
+        ELSE 'Regular User'
+    END as UserClassification,
+    CONCAT(
+        'User: ', p.DisplayName, 
+        ' | Reput: ', p.Reputation, 
+        ' | Posts: ', p.PostCount, 
+        ' | Score: ', p.TotalScore,
+        ' | Tags: ', COALESCE(p.TagName, 'None'),
+        ' | Ranking: ', p.ReverseScorePercentile,
+        ' | Engagement: ', p.EngagementRank
+    ) as UserSummary,
+    CASE 
+        WHEN p.PostScore > (SELECT AVG(PostScore) FROM PerformanceMetrics) THEN 1
+        ELSE 0 
+    END as AboveAverageScore,
+    CASE 
+        WHEN p.PostViewCount IS NOT NULL THEN FLOOR((p.PostViewCount / 1000.0) * 100) 
+        ELSE 0 
+    END as ViewFactor,
+    CASE 
+        WHEN p.PostAnswerCount > 0 THEN ROUND((p.AnswerCount * 100.0 / p.PostCount), 2)
+        ELSE 0 
+    END as AnswerPercentage,
+    COALESCE(p.TagCount, 0) + COALESCE(p.QuestionCount, 0) * 100 + COALESCE(p.BadgeCount, 0) * 500 as CompositeMetric,
+    LAG(p.PostId, 1) OVER (ORDER BY p.PostCreationDate) as PreviousPostId,
+    LEAD(p.PostId, 1) OVER (ORDER BY p.PostCreationDate) as NextPostId,
+    CASE 
+        WHEN p.ScoreChange IS NOT NULL AND p.ScoreChange > 0 THEN 'Growth'
+        WHEN p.ScoreChange IS NOT NULL AND p.ScoreChange < 0 THEN 'Decline'
+        ELSE 'Stable'
+    END as ScoreTrend,
+    CASE 
+        WHEN p.ViewFactor > 50 THEN 'High Viewer'
+        WHEN p.ViewFactor > 25 THEN 'Medium Viewer'
+        ELSE 'Low Viewer'
+    END as ViewerLevel
+FROM PerformanceMetrics p
+WHERE p.PostTypeId IN (1, 2)
+  AND p.Reputation >= 5000
+  AND (p.PostCount >= 10 OR p.TagCount >= 50)
+  AND p.PostCategory != 'Other'
+  AND (p.TagFocus = 'Popular Tech' OR p.TagFocus = 'Popular Languages')
+ORDER BY p.Score DESC, p.PostCount DESC, p.Reputation DESC, p.ViewPercentile DESC
+LIMIT 10000;

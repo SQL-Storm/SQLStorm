@@ -1,0 +1,134 @@
+WITH RankedPostEdits AS (
+    SELECT
+        ph.PostId,
+        ph.UserId,
+        ph.CreationDate,
+        pht.Name AS HistoryTypeName,
+        ROW_NUMBER() OVER(PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate DESC) as rn
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9)
+),
+UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        SUM(CASE WHEN c.Id IS NOT NULL THEN 1 ELSE 0 END) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COALESCE(MAX(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END), 0) AS MaxQuestionScore,
+        COALESCE(AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE NULL END), 0) AS AvgAnswerScore,
+        CAST(
+          SUM(
+            CASE
+              WHEN p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL THEN
+                EXTRACT(EPOCH FROM (p.ClosedDate - p.CreationDate)) / 86400.0
+              ELSE 0
+            END
+          ) AS NUMERIC(10,2)
+        ) / NULLIF(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END), 0) AS AvgQuestionCloseDuration
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+PostMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        pt.Name AS PostTypeName,
+        u.DisplayName AS OwnerDisplayName,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+            ELSE 'Active'
+        END AS PostStatus,
+        -- Extract first tag between <> from a string like '<tag1><tag2>'
+        CASE
+          WHEN p.Tags IS NOT NULL AND p.Tags LIKE '<%>' THEN
+            LOWER(SUBSTRING(p.Tags FROM 3 FOR (STRPOS(p.Tags, '>') - 3 + 1)))
+          ELSE NULL
+        END AS PrimaryTag,
+        CASE
+            WHEN p.Score > 1000 THEN 'High Score'
+            WHEN p.ViewCount > 10000 THEN 'High Views'
+            ELSE 'Standard'
+        END AS PerformanceCategory
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1, 2)
+),
+CommentAnalysis AS (
+    SELECT
+        c.PostId,
+        COUNT(c.Id) AS CommentCountForPost,
+        AVG(c.Score) AS AvgCommentScoreForPost,
+        STRING_AGG(SUBSTRING(c.Text FROM 1 FOR 50), ' | ') AS SampleComments
+    FROM Comments c
+    GROUP BY c.PostId
+),
+PostLinkAnalysis AS (
+    SELECT
+        pl.PostId,
+        COUNT(CASE WHEN lt.Name = 'Linked' THEN pl.Id END) AS LinkedCount,
+        COUNT(CASE WHEN lt.Name = 'Duplicate' THEN pl.Id END) AS DuplicateCount
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    GROUP BY pl.PostId
+)
+SELECT
+    pm.PostId,
+    pm.Title,
+    pm.PostTypeName,
+    pm.OwnerDisplayName,
+    pm.Score,
+    pm.ViewCount,
+    pm.AnswerCount,
+    pm.CommentCount,
+    pm.FavoriteCount,
+    pm.CreationDate,
+    pm.LastActivityDate,
+    pm.PostStatus,
+    pm.PrimaryTag,
+    pm.PerformanceCategory,
+    ca.CommentCountForPost,
+    ca.AvgCommentScoreForPost,
+    ca.SampleComments,
+    pla.LinkedCount,
+    pla.DuplicateCount,
+    ue.Reputation AS OwnerReputation,
+    ue.QuestionCount AS OwnerQuestionCount,
+    ue.AnswerCount AS OwnerAnswerCount,
+    ue.CommentCount AS OwnerCommentCount,
+    ue.BadgeCount AS OwnerBadgeCount,
+    ue.MaxQuestionScore AS OwnerMaxQuestionScore,
+    ue.AvgAnswerScore AS OwnerAvgAnswerScore,
+    ue.AvgQuestionCloseDuration AS OwnerAvgQuestionCloseDuration,
+    rpe.CreationDate AS LastEditDate,
+    rpe.HistoryTypeName AS LastEditType
+FROM PostMetrics pm
+LEFT JOIN CommentAnalysis ca ON pm.PostId = ca.PostId
+LEFT JOIN PostLinkAnalysis pla ON pm.PostId = pla.PostId
+LEFT JOIN UserEngagement ue ON pm.OwnerUserId = ue.UserId
+LEFT JOIN RankedPostEdits rpe ON pm.PostId = rpe.PostId AND rpe.rn = 1
+WHERE
+    pm.Score > 0
+    AND pm.ViewCount > 100
+    AND pm.CreationDate >= DATE '2023-01-01'
+    AND (ue.Reputation IS NULL OR ue.Reputation > 1000)
+ORDER BY
+    pm.Score DESC,
+    pm.ViewCount DESC
+LIMIT 1000;

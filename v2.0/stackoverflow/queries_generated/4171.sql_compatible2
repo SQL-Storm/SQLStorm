@@ -1,0 +1,188 @@
+WITH
+  QuestionDetails AS (
+    SELECT
+      p.Id AS QuestionId,
+      p.Title AS QuestionTitle,
+      p.OwnerUserId AS QuestionOwnerUserId,
+      u.DisplayName AS QuestionOwnerDisplayName,
+      p.CreationDate AS QuestionCreationDate,
+      p.Score AS QuestionScore,
+      p.ViewCount AS QuestionViewCount,
+      p.AnswerCount AS QuestionAnswerCount,
+      p.FavoriteCount AS QuestionFavoriteCount,
+      p.Tags AS QuestionTags,
+      pt.Name AS QuestionTypeName,
+      COUNT(c.Id) AS CommentCount,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+      ROW_NUMBER() OVER (ORDER BY p.CreationDate DESC) AS RowNum
+    FROM
+      Posts p
+      JOIN PostTypes pt
+        ON p.PostTypeId = pt.Id
+      LEFT JOIN Users u
+        ON p.OwnerUserId = u.Id
+      LEFT JOIN Comments c
+        ON p.Id = c.PostId
+      LEFT JOIN Votes v
+        ON p.Id = v.PostId
+    WHERE
+      p.PostTypeId = 1
+      AND p.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '1 year')
+      AND p.OwnerUserId IS NOT NULL
+    GROUP BY
+      p.Id,
+      p.Title,
+      p.OwnerUserId,
+      u.DisplayName,
+      p.CreationDate,
+      p.Score,
+      p.ViewCount,
+      p.AnswerCount,
+      p.FavoriteCount,
+      p.Tags,
+      pt.Name
+  ),
+  AnswerDetails AS (
+    SELECT
+      p.Id AS AnswerId,
+      p.ParentId AS QuestionId,
+      p.OwnerUserId AS AnswerOwnerUserId,
+      u.DisplayName AS AnswerOwnerDisplayName,
+      p.CreationDate AS AnswerCreationDate,
+      p.Score AS AnswerScore,
+      ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS AnswerRank
+    FROM
+      Posts p
+      LEFT JOIN Users u
+        ON p.OwnerUserId = u.Id
+    WHERE
+      p.PostTypeId = 2
+      AND p.ParentId IN (
+        SELECT
+          Id
+        FROM
+          Posts
+        WHERE
+          PostTypeId = 1
+          AND CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '1 year')
+      )
+  ),
+  UserEngagement AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsAsked,
+      COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersGiven,
+      COUNT(DISTINCT b.Id) AS BadgesEarned,
+      SUM(CASE WHEN ph.PostHistoryTypeId IN (2, 5) THEN 1 ELSE 0 END) AS EditsMade,
+      MAX(COALESCE(u.Reputation, 0)) AS MaxReputation
+    FROM
+      Users u
+      LEFT JOIN Posts p
+        ON u.Id = p.OwnerUserId
+      LEFT JOIN Badges b
+        ON u.Id = b.UserId
+      LEFT JOIN PostHistory ph
+        ON u.Id = ph.UserId
+    WHERE
+      u.Id IN (
+        SELECT
+          OwnerUserId
+        FROM
+          Posts
+        WHERE
+          PostTypeId IN (1, 2) AND CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '1 year')
+      )
+    GROUP BY
+      u.Id,
+      u.DisplayName
+  ),
+  TagPopularity AS (
+    SELECT
+      t.TagName,
+      COUNT(DISTINCT p.Id) AS TaggedQuestionCount,
+      AVG(COALESCE(p.AnswerCount, 0)) AS AvgAnswersPerQuestion
+    FROM
+      Tags t
+      JOIN Posts p
+        ON p.Tags LIKE '%' || t.TagName || '%'
+    WHERE
+      p.PostTypeId = 1
+      AND p.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '1 year')
+    GROUP BY
+      t.TagName
+    ORDER BY
+      TaggedQuestionCount DESC
+    LIMIT 10
+  )
+SELECT
+  qd.QuestionId,
+  qd.QuestionTitle,
+  qd.QuestionOwnerDisplayName,
+  qd.QuestionCreationDate,
+  qd.QuestionScore,
+  qd.QuestionViewCount,
+  qd.QuestionAnswerCount,
+  qd.QuestionFavoriteCount,
+  qd.QuestionTags,
+  qd.CommentCount,
+  qd.UpVoteCount,
+  qd.DownVoteCount,
+  ad.AnswerId AS BestAnswerId,
+  ad.AnswerOwnerDisplayName AS BestAnswerOwner,
+  ad.AnswerScore AS BestAnswerScore,
+  ad.AnswerRank AS BestAnswerRank,
+  ue.QuestionsAsked AS OwnerQuestionsAsked,
+  ue.AnswersGiven AS OwnerAnswersGiven,
+  ue.BadgesEarned AS OwnerBadgesEarned,
+  ue.EditsMade AS OwnerEditsMade,
+  tp.TagName AS TopTag1,
+  tp.AvgAnswersPerQuestion AS TopTag1AvgAnswers,
+  CASE
+    WHEN qd.QuestionScore > 100 AND qd.QuestionAnswerCount > 10 THEN 'High Impact'
+    WHEN qd.QuestionScore > 50 OR qd.QuestionAnswerCount > 5 THEN 'Medium Impact'
+    ELSE 'Low Impact'
+  END AS ImpactCategory,
+  COALESCE(qd.QuestionOwnerUserId, -1) AS SafeOwnerId,
+  TO_CHAR(CAST(qd.QuestionCreationDate AS TIMESTAMP), 'YYYY-MM') AS QuestionMonth
+FROM
+  QuestionDetails qd
+LEFT JOIN AnswerDetails ad
+  ON qd.QuestionId = ad.QuestionId AND ad.AnswerRank = 1
+LEFT JOIN UserEngagement ue
+  ON qd.QuestionOwnerUserId = ue.UserId
+LEFT JOIN TagPopularity tp
+  ON qd.QuestionTags LIKE '%' || tp.TagName || '%'
+WHERE
+  qd.RowNum BETWEEN 1 AND 100
+  AND qd.QuestionScore IS NOT NULL
+  AND qd.QuestionOwnerUserId <> -1
+  AND qd.QuestionTitle ILIKE '%SQL%'
+GROUP BY
+  qd.QuestionId,
+  qd.QuestionTitle,
+  qd.QuestionOwnerDisplayName,
+  qd.QuestionCreationDate,
+  qd.QuestionScore,
+  qd.QuestionViewCount,
+  qd.QuestionAnswerCount,
+  qd.QuestionFavoriteCount,
+  qd.QuestionTags,
+  qd.CommentCount,
+  qd.UpVoteCount,
+  qd.DownVoteCount,
+  qd.RowNum,
+  ad.AnswerId,
+  ad.AnswerOwnerDisplayName,
+  ad.AnswerScore,
+  ad.AnswerRank,
+  ue.QuestionsAsked,
+  ue.AnswersGiven,
+  ue.BadgesEarned,
+  ue.EditsMade,
+  tp.TagName,
+  tp.AvgAnswersPerQuestion,
+  qd.QuestionOwnerUserId
+ORDER BY
+  qd.QuestionScore DESC;

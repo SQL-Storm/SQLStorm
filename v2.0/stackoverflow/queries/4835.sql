@@ -1,0 +1,149 @@
+WITH
+  RecentQuestions AS (
+    SELECT
+      Id,
+      OwnerUserId,
+      Title,
+      Tags,
+      Score,
+      AnswerCount,
+      ViewCount,
+      FavoriteCount,
+      CreationDate
+    FROM Posts
+    WHERE
+      PostTypeId = 1
+      AND CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '30 days'
+  ),
+  TopUsers AS (
+    SELECT
+      Id,
+      DisplayName,
+      Reputation,
+      UpVotes,
+      DownVotes,
+      Views AS UserViews,
+      (
+        SELECT COUNT(*)
+        FROM Badges
+        WHERE UserId = Users.Id
+          AND Class = 1
+      ) AS GoldBadges,
+      (
+        SELECT COUNT(*)
+        FROM Badges
+        WHERE UserId = Users.Id
+          AND Class = 2
+      ) AS SilverBadges,
+      (
+        SELECT COUNT(*)
+        FROM Badges
+        WHERE UserId = Users.Id
+          AND Class = 3
+      ) AS BronzeBadges,
+      Location
+    FROM Users
+    ORDER BY Reputation DESC
+    LIMIT 100
+  ),
+  QuestionMetrics AS (
+    SELECT
+      rq.Id AS QuestionId,
+      rq.Title,
+      rq.Tags,
+      rq.Score,
+      rq.AnswerCount,
+      rq.ViewCount,
+      rq.FavoriteCount,
+      rq.CreationDate,
+      tu.DisplayName AS OwnerDisplayName,
+      tu.Reputation AS OwnerReputation,
+      tu.GoldBadges,
+      tu.SilverBadges,
+      tu.BronzeBadges,
+      CASE
+        WHEN rq.FavoriteCount > 0 THEN 'High Engagement'
+        WHEN rq.AnswerCount >= 5 THEN 'Active Discussion'
+        WHEN rq.ViewCount > 1000 THEN 'Popular'
+        ELSE 'Standard'
+      END AS EngagementLevel,
+      ROW_NUMBER() OVER (ORDER BY rq.Score DESC, rq.FavoriteCount DESC) AS ScoreRank,
+      AVG(rq.Score) OVER (PARTITION BY tu.Id) AS AvgUserQuestionScore,
+      SUM(rq.ViewCount) OVER (PARTITION BY tu.Id) AS TotalUserViews,
+      CASE
+        WHEN tu.Location IS NOT NULL AND POSITION('london' IN LOWER(tu.Location)) > 0 THEN 'UK Based'
+        WHEN tu.Location IS NOT NULL AND POSITION('new york' IN LOWER(tu.Location)) > 0 THEN 'US Based'
+        ELSE 'Other Location'
+      END AS GeographicIndicator,
+      tu.Id AS OwnerUserId,
+      tu.Location
+    FROM RecentQuestions AS rq
+    INNER JOIN TopUsers AS tu
+      ON rq.OwnerUserId = tu.Id
+  ),
+  QuestionComments AS (
+    SELECT
+      PostId,
+      COUNT(*) AS CommentCount,
+      SUM(CASE WHEN Score > 0 THEN 1 ELSE 0 END) AS PositiveCommentCount,
+      MAX(CreationDate) AS LatestCommentDate
+    FROM Comments
+    WHERE
+      PostId IN (SELECT Id FROM RecentQuestions)
+    GROUP BY
+      PostId
+  )
+SELECT
+  qm.QuestionId,
+  qm.Title,
+  qm.OwnerDisplayName,
+  qm.OwnerReputation,
+  qm.EngagementLevel,
+  qm.ScoreRank,
+  qm.AvgUserQuestionScore,
+  qm.TotalUserViews,
+  qm.GeographicIndicator,
+  COALESCE(qc.CommentCount, 0) AS TotalComments,
+  COALESCE(qc.PositiveCommentCount, 0) AS PositiveComments,
+  CASE
+    WHEN qc.LatestCommentDate IS NULL THEN 'No Comments'
+    WHEN qc.LatestCommentDate < qm.CreationDate + INTERVAL '1 day' THEN 'Immediate Feedback'
+    WHEN qc.LatestCommentDate < qm.CreationDate + INTERVAL '7 days' THEN 'Within a Week'
+    ELSE 'Delayed Feedback'
+  END AS CommentTimeliness,
+  (
+    SELECT COUNT(ph.Id)
+    FROM PostHistory AS ph
+    WHERE ph.PostId = qm.QuestionId
+      AND ph.PostHistoryTypeId IN (4, 5, 6)
+  ) AS EditHistoryCount,
+  COALESCE((
+      SELECT COUNT(*)
+      FROM PostLinks AS pl
+      WHERE pl.PostId = qm.QuestionId
+        AND pl.LinkTypeId = 1
+    ), 0) AS LinkedPosts,
+  COALESCE((
+      SELECT COUNT(*)
+      FROM PostLinks AS pl
+      WHERE pl.PostId = qm.QuestionId
+        AND pl.LinkTypeId = 3
+    ), 0) AS DuplicateLinks,
+  qm.FavoriteCount,
+  qm.CreationDate,
+  qm.Location
+FROM QuestionMetrics AS qm
+LEFT OUTER JOIN QuestionComments AS qc
+  ON qm.QuestionId = qc.PostId
+WHERE
+  qm.Score > 10
+  AND qm.OwnerReputation > 5000
+  AND qm.OwnerUserId NOT IN (
+    SELECT UserId
+    FROM Badges
+    WHERE Name = 'Troll'
+  )
+ORDER BY
+  qm.Score DESC,
+  qm.FavoriteCount DESC
+LIMIT 50;

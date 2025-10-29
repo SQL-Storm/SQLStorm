@@ -1,0 +1,225 @@
+-- {"query": "7412.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2291} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT c.Id) as Comments,
+        COUNT(DISTINCT b.Id) as Badges,
+        MAX(p.CreationDate) as LastPostDate,
+        DATEDIFF(day, u.CreationDate, cast('2024-10-01 12:34:56' as timestamp)) as AccountAgeDays,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+                CAST(SUM(COALESCE(p.Score, 0)) AS FLOAT) / COUNT(DISTINCT p.Id)
+            ELSE 0 
+        END as AvgScorePerPost,
+        (SELECT TOP 1 TagName 
+         FROM Tags t 
+         JOIN Posts p2 ON p2.Tags LIKE '%' + t.TagName + '%' 
+         WHERE p2.OwnerUserId = u.Id 
+         GROUP BY t.TagName 
+         ORDER BY COUNT(*) DESC) as MostActiveTag
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        TotalPosts,
+        Questions,
+        Answers,
+        Comments,
+        Badges,
+        LastPostDate,
+        AccountAgeDays,
+        AvgScorePerPost,
+        MostActiveTag,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, TotalPosts DESC) as RankByReputation
+    FROM UserActivityStats
+),
+UserPostAnalysis AS (
+    SELECT 
+        p.OwnerUserId,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Question with Accepted Answer'
+            WHEN p.PostTypeId = 1 THEN 'Question without Accepted Answer'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as PostTypeDescription,
+        DATEDIFF(day, p.CreationDate, cast('2024-10-01 12:34:56' as timestamp)) as DaysSincePost,
+        CASE 
+            WHEN p.Score > 100 THEN 'Highly Voted'
+            WHEN p.Score > 10 THEN 'Moderately Voted'
+            WHEN p.Score > 0 THEN 'Slightly Voted'
+            ELSE 'No Votes'
+        END as VoteCategory,
+        COALESCE(p.AnswerCount, 0) + COALESCE(p.CommentCount, 0) as EngagementCount,
+        RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) as PostRankWithinUser
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL AND p.OwnerUserId > 0
+),
+QualifiedUsers AS (
+    SELECT 
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.TotalPosts,
+        tu.Questions,
+        tu.Answers,
+        tu.Comments,
+        tu.Badges,
+        tu.LastPostDate,
+        tu.AccountAgeDays,
+        tu.AvgScorePerPost,
+        tu.MostActiveTag,
+        tu.RankByReputation,
+        COUNT(UPA.PostId) as ActivePosts,
+        SUM(CASE WHEN UPA.PostTypeId = 1 THEN 1 ELSE 0 END) as ActiveQuestions,
+        SUM(CASE WHEN UPA.PostTypeId = 2 THEN 1 ELSE 0 END) as ActiveAnswers,
+        SUM(UPA.Score) as TotalScore,
+        AVG(UPA.Score) as AvgScore,
+        MAX(UPA.ViewCount) as MaxViews,
+        MIN(UPA.CreationDate) as FirstPostDate,
+        MAX(UPA.CreationDate) as LastPostDateUser,
+        STRING_AGG(UPA.Title, '; ') as AllPostTitles,
+        STRING_AGG(UPA.Tags, '; ') as AllTagsUsed,
+        CASE 
+            WHEN MAX(UPA.CreationDate) > DATEADD(month, -6, cast('2024-10-01 12:34:56' as timestamp)) THEN 'Active in Last 6 Months'
+            WHEN MAX(UPA.CreationDate) > DATEADD(month, -12, cast('2024-10-01 12:34:56' as timestamp)) THEN 'Active in Last Year'
+            ELSE 'Inactive'
+        END as UserActivityStatus
+    FROM TopUsers tu
+    LEFT JOIN UserPostAnalysis UPA ON tu.UserId = UPA.OwnerUserId
+    WHERE tu.RankByReputation <= 10000
+    GROUP BY tu.UserId, tu.DisplayName, tu.Reputation, tu.TotalPosts, tu.Questions, 
+             tu.Answers, tu.Comments, tu.Badges, tu.LastPostDate, tu.AccountAgeDays, 
+             tu.AvgScorePerPost, tu.MostActiveTag, tu.RankByReputation
+)
+SELECT 
+    QU.UserId,
+    QU.DisplayName,
+    QU.Reputation,
+    QU.TotalPosts,
+    QU.Questions,
+    QU.Answers,
+    QU.Comments,
+    QU.Badges,
+    QU.LastPostDate,
+    QU.AccountAgeDays,
+    QU.AvgScorePerPost,
+    QU.MostActiveTag,
+    QU.RankByReputation,
+    QU.ActivePosts,
+    QU.ActiveQuestions,
+    QU.ActiveAnswers,
+    QU.TotalScore,
+    QU.AvgScore,
+    QU.MaxViews,
+    QU.FirstPostDate,
+    QU.LastPostDateUser,
+    QU.AllPostTitles,
+    QU.AllTagsUsed,
+    QU.UserActivityStatus,
+    CASE 
+        WHEN QU.Reputation > 10000 THEN 'Elite'
+        WHEN QU.Reputation > 5000 THEN 'Advanced'
+        WHEN QU.Reputation > 1000 THEN 'Intermediate'
+        ELSE 'Beginner'
+    END as UserLevel,
+    CASE 
+        WHEN QU.ActivePosts > 100 THEN 'High Engagement'
+        WHEN QU.ActivePosts > 50 THEN 'Medium Engagement'
+        WHEN QU.ActivePosts > 10 THEN 'Low Engagement'
+        ELSE 'Sporadic'
+    END as EngagementLevel,
+    COALESCE(
+        (SELECT SUM(v.BountyAmount) 
+         FROM Votes v 
+         WHERE v.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = QU.UserId) 
+         AND v.VoteTypeId = 8), 
+        0
+    ) as TotalBounties,
+    COUNT(DISTINCT CASE WHEN QU.MostActiveTag IS NOT NULL THEN QU.MostActiveTag END) as UniqueTagsContributed,
+    (SELECT COUNT(*) 
+     FROM Posts p 
+     WHERE p.OwnerUserId = QU.UserId 
+     AND p.PostTypeId = 1 
+     AND p.AcceptedAnswerId IS NOT NULL) as QuestionsWithAcceptedAnswers,
+    100 * CAST(COUNT(DISTINCT CASE WHEN QU.MostActiveTag IS NOT NULL THEN QU.MostActiveTag END) AS FLOAT) / 
+    NULLIF(COUNT(DISTINCT QU.AllTagsUsed), 0) as TagDiversityPercentage,
+    IIF(QU.Reputation > (SELECT AVG(Reputation) FROM Users), 1, 0) as AboveAverageReputation,
+    IIF(QU.TotalPosts > (SELECT AVG(TotalPosts) FROM UserActivityStats), 1, 0) as AboveAveragePostCount,
+    CASE 
+        WHEN QU.AccountAgeDays > 365 AND QU.Reputation > 1000 THEN 
+            CAST(QU.Reputation AS FLOAT) / (QU.AccountAgeDays / 365.25)
+        ELSE 0 
+    END as ReputationPerYear,
+    100.0 * QU.AvgScore / NULLIF(QU.MaxViews, 0) as ScoreToViewsRatio,
+    COALESCE(QU.TotalScore, 0) + COALESCE(QU.Badges, 0) + COALESCE(QU.Answers, 0) as CompositeActivityScore,
+    (SELECT TOP 1 COUNT(*) 
+     FROM Posts p 
+     JOIN Votes v ON p.Id = v.PostId 
+     WHERE p.OwnerUserId = QU.UserId 
+     AND v.VoteTypeId IN (2, 3) 
+     GROUP BY p.Id 
+     ORDER BY COUNT(*) DESC) as MaxVotesOnSinglePost,
+    (SELECT STRING_AGG(CONCAT(p.Title, ' (', p.Score, ')'), '; ') 
+     FROM Posts p 
+     WHERE p.OwnerUserId = QU.UserId 
+     AND p.Score > 50 
+     ORDER BY p.Score DESC 
+     OFFSET 0 ROWS FETCH NEXT 3 ROWS ONLY) as HighScorePosts,
+    (SELECT COUNT(*) 
+     FROM Questions q 
+     JOIN Answers a ON q.Id = a.ParentId 
+     JOIN Posts p ON a.Id = p.Id 
+     WHERE q.OwnerUserId = QU.UserId 
+     AND p.Score > 0 
+     AND p.CreationDate > DATEADD(year, -1, cast('2024-10-01 12:34:56' as timestamp))) as RecentHighValueAnswers,
+    (SELECT IIF(COUNT(*) > 0, 1, 0) 
+     FROM Badges b 
+     WHERE b.UserId = QU.UserId 
+     AND b.Class = 1 
+     AND b.Date > DATEADD(month, -3, cast('2024-10-01 12:34:56' as timestamp))) as RecentGoldBadge,
+    ROW_NUMBER() OVER (ORDER BY QU.Reputation DESC, QU.TotalPosts DESC, QU.Badges DESC) as OverallRank,
+    CASE 
+        WHEN QU.Badges > 0 THEN 
+            CAST(QU.Badges AS FLOAT) * 100.0 / CAST(QU.TotalPosts AS FLOAT)
+        ELSE 0 
+    END as BadgeToPostRatio,
+    QU.UserActivityStatus,
+    'User Analysis Report' as ReportName
+FROM QualifiedUsers QU
+WHERE QU.AccountAgeDays > 0
+GROUP BY 
+    QU.UserId, QU.DisplayName, QU.Reputation, QU.TotalPosts, QU.Questions, 
+    QU.Answers, QU.Comments, QU.Badges, QU.LastPostDate, QU.AccountAgeDays, 
+    QU.AvgScorePerPost, QU.MostActiveTag, QU.RankByReputation, QU.ActivePosts,
+    QU.ActiveQuestions, QU.ActiveAnswers, QU.TotalScore, QU.AvgScore, QU.MaxViews,
+    QU.FirstPostDate, QU.LastPostDateUser, QU.AllPostTitles, QU.AllTagsUsed,
+    QU.UserActivityStatus
+HAVING 
+    QU.AccountAgeDays >= 30 
+    AND QU.TotalPosts >= 5
+ORDER BY 
+    QU.Reputation DESC,
+    QU.TotalPosts DESC,
+    QU.Badges DESC;

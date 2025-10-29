@@ -1,0 +1,292 @@
+-- {"query": "7625.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2657} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        MAX(b.Date) as LastBadgeDate,
+        AVG(p.Score) as AvgPostScore,
+        STRING_AGG(DISTINCT p.Tags, ', ') as AllTags,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+                DATEDIFF(day, MIN(p.CreationDate), MAX(p.CreationDate))
+            ELSE 0 
+        END as ActiveDays,
+        ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) as PostRank,
+        RANK() OVER (ORDER BY u.Reputation DESC) as ReputationRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id IS NOT NULL 
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopPosts AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        p.PostTypeId,
+        p.ParentId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            WHEN p.PostTypeId = 4 THEN 'TagWikiExcerpt'
+            WHEN p.PostTypeId = 5 THEN 'TagWiki'
+            ELSE 'Other'
+        END as PostType,
+        COALESCE(LEN(p.Body) - LEN(REPLACE(p.Body, '<', '')), 0) as HtmlTagCount,
+        COALESCE(LEN(p.Body) - LEN(REPLACE(p.Body, ' ', '')), 0) as WordCount,
+        CASE 
+            WHEN EXISTS (
+                SELECT 1 FROM PostLinks pl 
+                WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3
+            ) THEN 'Duplicate'
+            WHEN EXISTS (
+                SELECT 1 FROM PostHistory ph 
+                WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+            ) THEN 'Closed'
+            ELSE 'Active'
+        END as Status,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) as ScoreRank,
+        DENSE_RANK() OVER (ORDER BY p.ViewCount DESC) as ViewRank
+    FROM Posts p
+    WHERE p.CreationDate >= '2021-01-01' 
+      AND (p.PostTypeId = 1 OR p.PostTypeId = 2)
+),
+UserEngagement AS (
+    SELECT 
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.PostCount,
+        ua.CommentCount,
+        ua.BadgeCount,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.ActiveDays,
+        ua.PostRank,
+        ua.ReputationRank,
+        CASE 
+            WHEN ua.PostCount > 0 THEN 
+                (CAST(ua.CommentCount AS FLOAT) / NULLIF(ua.PostCount, 0)) * 100
+            ELSE 0 
+        END as CommentToPostRatio,
+        CASE 
+            WHEN ua.Reputation > 0 THEN 
+                (CAST(ua.BadgeCount AS FLOAT) / NULLIF(ua.Reputation, 0)) * 1000
+            ELSE 0 
+        END as BadgeToReputationRatio,
+        CASE 
+            WHEN ua.QuestionCount > 0 THEN 
+                (CAST(ua.AnswerCount AS FLOAT) / NULLIF(ua.QuestionCount, 0)) * 100
+            ELSE 0 
+        END as AnswersPerQuestion,
+        ROW_NUMBER() OVER (PARTITION BY CASE WHEN ua.AnswerCount > 0 THEN 1 ELSE 0 END ORDER BY ua.Reputation DESC) as HighAnswerUsers,
+        COUNT(*) OVER () as TotalUsers
+    FROM UserActivityStats ua
+    WHERE ua.Reputation > 100
+),
+CombinedResults AS (
+    SELECT 
+        ue.UserId,
+        ue.DisplayName,
+        ue.Reputation,
+        ue.PostCount,
+        ue.CommentCount,
+        ue.BadgeCount,
+        ue.QuestionCount,
+        ue.AnswerCount,
+        ue.ActiveDays,
+        ue.PostRank,
+        ue.ReputationRank,
+        ue.CommentToPostRatio,
+        ue.BadgeToReputationRatio,
+        ue.AnswersPerQuestion,
+        tp.PostId,
+        tp.Title,
+        tp.Score,
+        tp.ViewCount,
+        tp.AnswerCount as PostAnswerCount,
+        tp.CommentCount as PostCommentCount,
+        tp.CreationDate as PostCreationDate,
+        tp.Tags,
+        tp.PostType,
+        tp.HtmlTagCount,
+        tp.WordCount,
+        tp.Status,
+        tp.ScoreRank,
+        tp.ViewRank,
+        CASE 
+            WHEN ue.AnswersPerQuestion > 1.5 AND ue.PostCount > 10 THEN 'Highly Engaged'
+            WHEN ue.Reputation > 10000 AND ue.BadgeCount > 20 THEN 'Veteran'
+            WHEN ue.Reputation < 100 AND ue.PostCount < 5 THEN 'Newbie'
+            ELSE 'Moderate'
+        END as UserCategory,
+        CASE 
+            WHEN tp.Score > 100 AND tp.ViewCount > 1000 THEN 'Popular'
+            WHEN tp.Score > 50 AND tp.ViewCount > 500 THEN 'Well Viewed'
+            WHEN tp.Score > 10 THEN 'Standard'
+            ELSE 'Low'
+        END as PostPopularity,
+        CASE 
+            WHEN tp.ScoreRank <= 50 AND tp.ViewRank <= 50 THEN 'Top Performing'
+            WHEN tp.ScoreRank <= 100 OR tp.ViewRank <= 100 THEN 'Good'
+            ELSE 'Average'
+        END as PostPerformance,
+        IIF(tp.Tags IS NOT NULL AND tp.Tags != '', 
+            STRING_AGG(SUBSTRING(tp.Tags, 2, LEN(tp.Tags)-2), ' ') WITHIN GROUP (ORDER BY tp.Score DESC), 
+            NULL
+        ) as TagList,
+        CASE 
+            WHEN tp.PostTypeId = 1 AND tp.ParentId IS NULL THEN 'Original Question'
+            WHEN tp.PostTypeId = 1 AND tp.ParentId IS NOT NULL THEN 'Follow-up Question'
+            WHEN tp.PostTypeId = 2 AND EXISTS (
+                SELECT 1 FROM Posts p2 
+                WHERE p2.Id = tp.ParentId AND p2.PostTypeId = 1
+            ) THEN 'Answer to Question'
+            ELSE 'Other'
+        END as PostClassification,
+        DATEDIFF(day, tp.CreationDate, cast('2024-10-01 12:34:56' as timestamp)) as DaysSincePost,
+        IIF(
+            (SELECT COUNT(*) FROM VoteTypes vt WHERE vt.Id IN (2, 3)) > 0,
+            (SELECT COUNT(*) FROM Votes v WHERE v.PostId = tp.PostId AND v.VoteTypeId IN (2, 3)),
+            0
+        ) as VoteCount,
+        COALESCE(
+            (SELECT MAX(v.CreationDate) FROM Votes v WHERE v.PostId = tp.PostId),
+            tp.CreationDate
+        ) as LastVoteDate,
+        CASE 
+            WHEN tp.ViewCount > 500 THEN 'Very High'
+            WHEN tp.ViewCount > 250 THEN 'High'
+            WHEN tp.ViewCount > 100 THEN 'Medium'
+            ELSE 'Low'
+        END as ViewCategory
+    FROM UserEngagement ue
+    INNER JOIN TopPosts tp ON ue.UserId = tp.OwnerUserId
+    WHERE tp.CreationDate >= '2021-01-01' 
+      AND tp.Score IS NOT NULL
+      AND tp.Score >= 0
+    GROUP BY 
+        ue.UserId, ue.DisplayName, ue.Reputation, ue.PostCount, ue.CommentCount, 
+        ue.BadgeCount, ue.QuestionCount, ue.AnswerCount, ue.ActiveDays, ue.PostRank, 
+        ue.ReputationRank, ue.CommentToPostRatio, ue.BadgeToReputationRatio, 
+        ue.AnswersPerQuestion, tp.PostId, tp.Title, tp.Score, tp.ViewCount, 
+        tp.AnswerCount, tp.CommentCount, tp.CreationDate, tp.Tags, tp.PostType, 
+        tp.HtmlTagCount, tp.WordCount, tp.Status, tp.ScoreRank, tp.ViewRank, tp.PostTypeId, tp.ParentId
+)
+SELECT 
+    UserId,
+    DisplayName,
+    Reputation,
+    PostCount,
+    CommentCount,
+    BadgeCount,
+    QuestionCount,
+    AnswerCount,
+    ActiveDays,
+    PostRank,
+    ReputationRank,
+    CommentToPostRatio,
+    BadgeToReputationRatio,
+    AnswersPerQuestion,
+    PostId,
+    Title,
+    Score,
+    ViewCount,
+    PostAnswerCount,
+    PostCommentCount,
+    PostCreationDate,
+    Tags,
+    PostType,
+    HtmlTagCount,
+    WordCount,
+    Status,
+    ScoreRank,
+    ViewRank,
+    UserCategory,
+    PostPopularity,
+    PostPerformance,
+    TagList,
+    PostClassification,
+    DaysSincePost,
+    VoteCount,
+    LastVoteDate,
+    ViewCategory,
+    ROW_NUMBER() OVER (ORDER BY Score DESC, ViewCount DESC) as FinalRank,
+    COUNT(*) OVER () as TotalResults,
+    AVG(Score) OVER (PARTITION BY UserCategory) as AvgScoreByCategory,
+    PERCENT_RANK() OVER (ORDER BY Score DESC) as ScorePercentile,
+    NTILE(4) OVER (ORDER BY Reputation) as ReputationQuartile,
+    CASE 
+        WHEN COUNT(*) OVER (PARTITION BY UserId) > 1 THEN 
+            STRING_AGG(CONCAT(Title, ' (', Score, ')'), '; ') WITHIN GROUP (ORDER BY Score DESC)
+        ELSE NULL
+    END as TopPostsByUser,
+    CASE 
+        WHEN Reputation > 10000 THEN 
+            CONCAT('Expert: ', 
+                IIF(AnswerCount > 10, 'High Answerer', 'Regular'),
+                ', ', 
+                IIF(BadgeCount > 20, 'Veteran', 'Intermediate'),
+                ' User')
+        WHEN Reputation > 1000 THEN 
+            'Good User'
+        WHEN Reputation > 100 THEN 
+            'Average User'
+        ELSE 
+            'Beginner'
+    END as ExpertiseLevel,
+    CASE 
+        WHEN PostPerformance = 'Top Performing' AND Score > 100 THEN 
+            'Top Performer'
+        WHEN PostPerformance = 'Top Performing' OR Score > 50 THEN 
+            'Strong Performer'
+        WHEN PostType = 'Question' AND ViewCount > 200 THEN 
+            'Engagement Focused'
+        WHEN PostType = 'Answer' AND Score > 25 THEN 
+            'Helpful Answerer'
+        ELSE 
+            'Regular Contributor'
+    END as ContributionLevel,
+    CASE 
+        WHEN ViewCategory = 'Very High' AND Score > 50 THEN 
+            'Trending Content'
+        WHEN ViewCategory IN ('High', 'Medium', 'Low') THEN 
+            'Standard Content'
+        ELSE 
+            'Unknown Content'
+    END as ContentClassification,
+    ABS(Score - AVG(Score) OVER()) as ScoreDeviation,
+    IIF(Reputation >= 10000, 'Elite', 'Non-Elite') as EliteStatus,
+    CASE 
+        WHEN PostCount >= 500 AND Reputation >= 50000 THEN 
+            'Community Leader'
+        WHEN PostCount >= 100 AND Reputation >= 10000 THEN 
+            'Knowledge Contributor'
+        WHEN PostCount >= 10 AND Reputation >= 1000 THEN 
+            'Regular Contributor'
+        ELSE 
+            'New Member'
+    END as CommunityRole
+FROM CombinedResults
+ORDER BY Score DESC, ViewCount DESC
+OFFSET 0 ROWS FETCH NEXT 1000 ROWS ONLY;

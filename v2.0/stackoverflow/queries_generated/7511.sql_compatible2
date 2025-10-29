@@ -1,0 +1,341 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+        LAG(p.ViewCount) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_viewcount,
+        CASE 
+            WHEN p.Score > 100 THEN 'Highly_Voted'
+            WHEN p.Score > 50 THEN 'Moderately_Voted'
+            WHEN p.Score > 10 THEN 'Low_Voted'
+            ELSE 'Very_Low_Voted'
+        END as vote_category,
+        CASE 
+            WHEN p.ViewCount > 1000 THEN 'High_View_Count'
+            WHEN p.ViewCount > 500 THEN 'Moderate_View_Count'
+            ELSE 'Low_View_Count'
+        END as view_category,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags != '' THEN 
+                (SELECT COUNT(*) FROM unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) as tag)
+            ELSE 0
+        END as tag_count,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) as score_rank,
+        PERCENT_RANK() OVER (ORDER BY p.Score) as score_percentile,
+        AVG(p.Score) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) as avg_score_4posts,
+        SUM(p.ViewCount) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as cumulative_views,
+        NTILE(4) OVER (ORDER BY p.Score) as score_quartile
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) AND p.CreationDate >= CAST('2020-01-01' AS timestamp)
+),
+UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.CreationDate,
+        COUNT(DISTINCT p.Id) as total_posts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as question_count,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as answer_count,
+        SUM(COALESCE(p.Score, 0)) as total_score,
+        AVG(COALESCE(p.Score, 0)) as avg_score,
+        MAX(COALESCE(p.ViewCount, 0)) as max_views,
+        MIN(COALESCE(p.Score, 0)) as min_score,
+        MAX(COALESCE(p.CreationDate, DATE '1900-01-01')) as latest_activity,
+        STRING_AGG(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Title END, '; ') as question_titles,
+        STRING_AGG(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Body END, ' | ') as answer_bodies
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.CreationDate >= CAST('2020-01-01' AS timestamp)
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate
+),
+PostStats AS (
+    SELECT 
+        p.Id as PostId,
+        p.ParentId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        RANK() OVER (ORDER BY p.ViewCount DESC) as view_rank,
+        RANK() OVER (ORDER BY p.Score DESC) as score_rank,
+        DENSE_RANK() OVER (ORDER BY p.PostTypeId, p.CreationDate DESC) as post_type_rank,
+        PERCENT_RANK() OVER (ORDER BY p.ViewCount) as view_percentile,
+        PERCENT_RANK() OVER (ORDER BY p.Score) as score_percentile,
+        CASE 
+            WHEN p.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 1
+            ELSE 0
+        END as is_above_avg_score,
+        CASE 
+            WHEN p.ViewCount > (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = 1) THEN 1
+            ELSE 0
+        END as is_above_avg_views,
+        CASE 
+            WHEN p.Score = (SELECT MAX(Score) FROM Posts WHERE PostTypeId = 1) THEN 'MAX_SCORE'
+            WHEN p.Score >= (SELECT PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY Score) FROM Posts WHERE PostTypeId = 1) THEN 'HIGH_SCORE'
+            ELSE 'NORMAL_SCORE'
+        END as score_category,
+        CASE 
+            WHEN p.ViewCount = (SELECT MAX(ViewCount) FROM Posts WHERE PostTypeId = 1) THEN 'MAX_VIEWS'
+            WHEN p.ViewCount >= (SELECT PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY ViewCount) FROM Posts WHERE PostTypeId = 1) THEN 'HIGH_VIEWS'
+            ELSE 'NORMAL_VIEWS'
+        END as view_category,
+        COALESCE(
+            (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id AND c.CreationDate >= DATE '2020-01-01'),
+            0
+        ) as comment_count,
+        COALESCE(
+            (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2 AND v.CreationDate >= DATE '2020-01-01'),
+            0
+        ) as upvote_count,
+        COALESCE(
+            (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3 AND v.CreationDate >= DATE '2020-01-01'),
+            0
+        ) as downvote_count,
+        COALESCE(
+            (SELECT COUNT(*) FROM Badges b WHERE b.UserId = p.OwnerUserId AND b.Date >= DATE '2020-01-01'),
+            0
+        ) as badge_count
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) AND p.CreationDate >= CAST('2020-01-01' AS timestamp)
+),
+ComplexAnalytics AS (
+    SELECT 
+        ps.PostId,
+        ps.ParentId,
+        ps.PostTypeId,
+        ps.Score,
+        ps.ViewCount,
+        ps.Title,
+        ps.Tags,
+        ps.AnswerCount,
+        ps.view_rank,
+        ps.score_rank,
+        ps.post_type_rank,
+        ps.view_percentile,
+        ps.score_percentile,
+        ps.is_above_avg_score,
+        ps.is_above_avg_views,
+        ps.score_category,
+        ps.view_category,
+        ps.comment_count,
+        ps.upvote_count,
+        ps.downvote_count,
+        ps.badge_count,
+        rs.rn,
+        rs.prev_score,
+        rs.prev_viewcount,
+        rs.vote_category,
+        rs.view_category as user_view_category,
+        rs.tag_count,
+        rs.score_rank as user_score_rank,
+        rs.score_percentile as user_score_percentile,
+        rs.avg_score_4posts,
+        rs.cumulative_views,
+        rs.score_quartile,
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.Views as user_views,
+        us.UpVotes,
+        us.DownVotes,
+        us.total_posts,
+        us.question_count,
+        us.answer_count,
+        us.total_score,
+        us.avg_score,
+        us.max_views,
+        us.min_score,
+        us.latest_activity,
+        us.question_titles,
+        us.answer_bodies,
+        ps.OwnerUserId
+    FROM PostStats ps
+    LEFT JOIN RankedPosts rs ON ps.PostId = rs.Id
+    LEFT JOIN UserStats us ON ps.OwnerUserId = us.UserId
+    WHERE (ps.is_above_avg_score = 1 OR ps.is_above_avg_views = 1)
+)
+SELECT 
+    ca.PostId,
+    ca.ParentId,
+    ca.PostTypeId,
+    ca.Score,
+    ca.ViewCount,
+    ca.Title,
+    ca.Tags,
+    ca.AnswerCount,
+    ca.view_rank,
+    ca.score_rank,
+    ca.post_type_rank,
+    ca.view_percentile,
+    ca.score_percentile,
+    ca.is_above_avg_score,
+    ca.is_above_avg_views,
+    ca.score_category,
+    ca.view_category,
+    ca.comment_count,
+    ca.upvote_count,
+    ca.downvote_count,
+    ca.badge_count,
+    ca.rn,
+    ca.prev_score,
+    ca.prev_viewcount,
+    ca.vote_category,
+    ca.user_view_category,
+    ca.tag_count,
+    ca.user_score_rank,
+    ca.user_score_percentile,
+    ca.avg_score_4posts,
+    ca.cumulative_views,
+    ca.score_quartile,
+    ca.UserId,
+    ca.DisplayName,
+    ca.Reputation,
+    ca.user_views,
+    ca.UpVotes,
+    ca.DownVotes,
+    ca.total_posts,
+    ca.question_count,
+    ca.answer_count,
+    ca.total_score,
+    ca.avg_score,
+    ca.max_views,
+    ca.min_score,
+    ca.latest_activity,
+    CASE 
+        WHEN ca.question_titles IS NOT NULL AND ca.question_titles != '' 
+        THEN SUBSTRING(ca.question_titles FROM 1 FOR LEAST(50, CHAR_LENGTH(ca.question_titles)))
+        ELSE 'No questions'
+    END as shortened_question_titles,
+    CASE 
+        WHEN ca.answer_bodies IS NOT NULL AND ca.answer_bodies != ''
+        THEN UPPER(SUBSTRING(ca.answer_bodies FROM 1 FOR 30)) || '...'
+        ELSE 'No answers'
+    END as shortened_answer_bodies,
+    (ca.total_posts - ca.question_count) as answer_ratio,
+    ROUND((ca.answer_count * 100.0 / NULLIF(ca.total_posts, 0)), 2) as answer_percentage,
+    CASE 
+        WHEN ca.ViewCount > 0 THEN ROUND((ca.upvote_count * 100.0 / ca.ViewCount), 2)
+        ELSE 0.0
+    END as upvote_to_view_ratio,
+    CASE 
+        WHEN ca.Score > 0 THEN ROUND((ca.comment_count * 100.0 / ca.Score), 2)
+        ELSE 0.0
+    END as comment_to_score_ratio,
+    CASE 
+        WHEN ca.total_posts > 0 THEN 
+            ROUND((ca.total_score * 100.0 / NULLIF(ca.total_posts, 0)), 2)
+        ELSE 0.0
+    END as user_avg_score_per_post,
+    CASE 
+        WHEN ca.user_views > 0 THEN 
+            ROUND((ca.total_score * 100.0 / ca.user_views), 2)
+        ELSE 0.0
+    END as score_to_user_view_ratio,
+    CASE 
+        WHEN ca.answer_count > 0 THEN 
+            ROUND((ca.total_score * 100.0 / ca.answer_count), 2)
+        ELSE 0.0
+    END as score_to_answer_ratio,
+    CASE 
+        WHEN ca.tag_count > 0 THEN 
+            ROUND((ca.total_score * 100.0 / ca.tag_count), 2)
+        ELSE 0.0
+    END as score_to_tag_ratio,
+    CASE 
+        WHEN ca.badge_count > 0 THEN 
+            ca.badge_count
+        ELSE 0
+    END as effective_badge_count,
+    CASE 
+        WHEN ca.score_percentile >= 0.95 THEN 'TOP_5_PERCENTILE'
+        WHEN ca.score_percentile >= 0.80 THEN 'TOP_20_PERCENTILE'
+        WHEN ca.score_percentile >= 0.60 THEN 'TOP_40_PERCENTILE'
+        ELSE 'BELOW_AVERAGE'
+    END as performance_category,
+    CASE 
+        WHEN ca.view_percentile >= 0.95 THEN 'TOP_5_PERCENTILE_VIEWS'
+        WHEN ca.view_percentile >= 0.80 THEN 'TOP_20_PERCENTILE_VIEWS'
+        WHEN ca.view_percentile >= 0.60 THEN 'TOP_40_PERCENTILE_VIEWS'
+        ELSE 'BELOW_AVERAGE_VIEWS'
+    END as popularity_category,
+    ROUND(POWER(COALESCE(ca.Score,0), 2) + POWER(COALESCE(ca.ViewCount,0), 2), 2) as score_view_complexity_index,
+    ROUND(GREATEST(0, ca.Score * 2 - ca.ViewCount), 2) as balance_score,
+    ROUND(CAST((SELECT COUNT(*) FROM Posts WHERE OwnerUserId = ca.UserId AND PostTypeId = 1 AND CreationDate >= DATE '2020-01-01') AS numeric), 2) as user_question_count,
+    ROUND(CAST((SELECT COUNT(*) FROM Posts WHERE OwnerUserId = ca.UserId AND PostTypeId = 2 AND CreationDate >= DATE '2020-01-01') AS numeric), 2) as user_answer_count,
+    CASE 
+        WHEN ca.latest_activity >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '7 days' THEN 'ACTIVE_THIS_WEEK'
+        WHEN ca.latest_activity >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days' THEN 'ACTIVE_THIS_MONTH'
+        ELSE 'INACTIVE'
+    END as user_activity_status,
+    CASE 
+        WHEN ca.total_posts >= 100 THEN 'MASTERY'
+        WHEN ca.total_posts >= 50 THEN 'EXPERT'
+        WHEN ca.total_posts >= 20 THEN 'ADVANCED'
+        WHEN ca.total_posts >= 5 THEN 'INTERMEDIATE'
+        ELSE 'BEGINNER'
+    END as user_experience_level,
+    CASE 
+        WHEN ca.Score >= 1000 THEN 'LEGENDARY'
+        WHEN ca.Score >= 500 THEN 'MASTER'
+        WHEN ca.Score >= 100 THEN 'PRO'
+        WHEN ca.Score >= 50 THEN 'SKILLED'
+        ELSE 'LEARNING'
+    END as post_experience_level,
+    (SELECT MAX(ViewCount) FROM Posts WHERE OwnerUserId = ca.UserId) as user_max_post_views,
+    (SELECT MIN(CreationDate) FROM Posts WHERE OwnerUserId = ca.UserId AND PostTypeId = 1) as first_question_date,
+    (SELECT MAX(CreationDate) FROM Posts WHERE OwnerUserId = ca.UserId AND PostTypeId = 2) as last_answer_date,
+    (SELECT COUNT(*) FROM Comments WHERE UserId = ca.UserId AND CreationDate >= DATE '2020-01-01') as user_comment_count,
+    CASE 
+        WHEN (SELECT COUNT(DISTINCT PostId) FROM Votes WHERE UserId = ca.UserId AND VoteTypeId = 2 AND CreationDate >= DATE '2020-01-01') > 0 THEN 
+            (SELECT COUNT(DISTINCT PostId) FROM Votes WHERE UserId = ca.UserId AND VoteTypeId = 2 AND CreationDate >= DATE '2020-01-01')
+        ELSE 0
+    END as user_upvote_count,
+    CASE 
+        WHEN (SELECT COUNT(DISTINCT PostId) FROM Votes WHERE UserId = ca.UserId AND VoteTypeId = 3 AND CreationDate >= DATE '2020-01-01') > 0 THEN 
+            (SELECT COUNT(DISTINCT PostId) FROM Votes WHERE UserId = ca.UserId AND VoteTypeId = 3 AND CreationDate >= DATE '2020-01-01')
+        ELSE 0
+    END as user_downvote_count,
+    (SELECT COUNT(DISTINCT PostId) FROM Posts WHERE OwnerUserId = ca.UserId) as total_owner_posts,
+    (SELECT COUNT(DISTINCT PostId) FROM Posts WHERE OwnerUserId = ca.UserId AND ParentId IS NOT NULL) as answer_posts,
+    (SELECT COUNT(DISTINCT PostId) FROM Posts WHERE OwnerUserId = ca.UserId AND ParentId IS NULL) as question_posts,
+    CASE 
+        WHEN ca.ViewCount > (SELECT AVG(ViewCount) FROM Posts WHERE OwnerUserId = ca.UserId) THEN 'ABOVE_AVERAGE_VIEWS'
+        ELSE 'BELOW_AVERAGE_VIEWS'
+    END as view_position,
+    CASE 
+        WHEN ca.Score > (SELECT AVG(Score) FROM Posts WHERE OwnerUserId = ca.UserId) THEN 'ABOVE_AVERAGE_SCORE'
+        ELSE 'BELOW_AVERAGE_SCORE'
+    END as score_position,
+    (SELECT COUNT(*) FROM Badges WHERE UserId = ca.UserId) as badge_total_count,
+    CASE 
+        WHEN (SELECT COUNT(*) FROM Badges WHERE UserId = ca.UserId AND Date >= DATE '2020-01-01') >= 10 THEN 'SUPER_USER'
+        WHEN (SELECT COUNT(*) FROM Badges WHERE UserId = ca.UserId AND Date >= DATE '2020-01-01') >= 5 THEN 'CONTRIBUTOR'
+        WHEN (SELECT COUNT(*) FROM Badges WHERE UserId = ca.UserId AND Date >= DATE '2020-01-01') >= 1 THEN 'STANDARD_USER'
+        ELSE 'NO_RECOGNITION'
+    END as recognition_level
+FROM ComplexAnalytics ca
+WHERE ca.Score IS NOT NULL 
+    AND ca.ViewCount IS NOT NULL 
+    AND ca.PostTypeId IS NOT NULL
+    AND ca.OwnerUserId IS NOT NULL
+    AND ca.DisplayName IS NOT NULL
+ORDER BY ca.Score DESC, ca.ViewCount DESC
+LIMIT 5000;

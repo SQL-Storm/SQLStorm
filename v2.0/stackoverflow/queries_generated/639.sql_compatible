@@ -1,0 +1,276 @@
+with
+seed_users as (
+  select u.id as user_id,
+         u.displayname,
+         u.reputation,
+         u.creationdate,
+         u.location,
+         row_number() over (order by u.reputation desc, u.id) as rn
+  from users u
+  where u.reputation > 0
+),
+sample_users as (
+  select *
+  from seed_users
+  where rn <= 500
+),
+user_posts as (
+  select p.id,
+         p.posttypeid,
+         p.owneruserid,
+         p.creationdate,
+         p.score,
+         p.viewcount,
+         p.title,
+         p.tags,
+         p.acceptedanswerid,
+         p.parentid,
+         p.favoritecount,
+         p.commentcount
+  from posts p
+  where p.owneruserid in (select user_id from sample_users)
+),
+question_tags as (
+  select q.id as question_id,
+         unnest(string_to_array(substring(q.tags, 2, greatest(length(q.tags)-2,0)), '><')) as tag
+  from posts q
+  where q.posttypeid = 1
+    and q.tags is not null
+),
+post_engagement as (
+  select p.id,
+         coalesce(sum(case when v.votetypeid = 2 then 1 end),0) as upvotes,
+         coalesce(sum(case when v.votetypeid = 3 then 1 end),0) as downvotes,
+         coalesce(sum(case when v.votetypeid = 5 then 1 end),0) as favorites_legacy,
+         coalesce(sum(case when v.votetypeid in (8,9) then v.bountyamount end),0) as bounty_total,
+         count(*) filter (where v.votetypeid in (2,3,5,8,9)) as vote_events
+  from posts p
+  left join votes v on v.postid = p.id
+  group by p.id
+),
+post_history_summary as (
+  select ph.postid,
+         max(ph.creationdate) as last_event_at,
+         count(*) filter (where ph.posthistorytypeid in (4,5,6,7,8,9,24)) as edit_events,
+         count(*) filter (where ph.posthistorytypeid in (10,11,12,13,14,15,19,20,31,33,34,35,36)) as mod_events,
+         min(ph.creationdate) filter (where ph.posthistorytypeid in (10)) as first_closed_at,
+         max(case when ph.posthistorytypeid = 10 then cast(ph.comment as integer) end) as last_close_reason_id
+  from posthistory ph
+  group by ph.postid
+),
+post_link_metrics as (
+  select p.id,
+         count(*) filter (where pl.linktypeid = 1 and pl.postid = p.id) as links_from,
+         count(*) filter (where pl.linktypeid = 1 and pl.relatedpostid = p.id) as links_to,
+         count(*) filter (where pl.linktypeid = 3 and pl.postid = p.id) as dup_of,
+         count(*) filter (where pl.linktypeid = 3 and pl.relatedpostid = p.id) as dup_targets
+  from posts p
+  left join postlinks pl
+    on pl.postid = p.id
+    or pl.relatedpostid = p.id
+  group by p.id
+),
+comment_stats as (
+  select c.postid,
+         count(*) as comments,
+         sum(c.score) as comment_score,
+         max(c.creationdate) as last_comment_at
+  from comments c
+  group by c.postid
+),
+user_badge_summary as (
+  select b.userid,
+         count(*) as badges_total,
+         count(*) filter (where b.class = 1) as gold,
+         count(*) filter (where b.class = 2) as silver,
+         count(*) filter (where b.class = 3) as bronze,
+         count(*) filter (where b.tagbased = 1) as tag_badges
+  from badges b
+  group by b.userid
+),
+core as (
+  select p.id as post_id,
+         p.posttypeid,
+         p.owneruserid as user_id,
+         p.creationdate as post_created_at,
+         p.score,
+         p.viewcount,
+         p.title,
+         coalesce(p.tags, '') as tags_raw,
+         p.acceptedanswerid,
+         p.parentid,
+         p.favoritecount,
+         p.commentcount,
+         u.displayname,
+         u.reputation,
+         u.creationdate as user_created_at,
+         u.location,
+         coalesce(ubs.badges_total,0) as badges_total,
+         coalesce(ubs.gold,0) as gold_badges,
+         coalesce(ubs.silver,0) as silver_badges,
+         coalesce(ubs.bronze,0) as bronze_badges,
+         coalesce(ubs.tag_badges,0) as tag_badges
+  from user_posts p
+  join users u on u.id = p.owneruserid
+  left join user_badge_summary ubs on ubs.userid = u.id
+),
+qa as (
+  select q.id as question_id,
+         q.owneruserid as asker_id,
+         q.acceptedanswerid,
+         a.id as answer_id,
+         a.owneruserid as answerer_id,
+         a.score as answer_score
+  from posts q
+  left join posts a on a.parentid = q.id and a.posttypeid = 2
+  where q.posttypeid = 1
+),
+qa_agg as (
+  select question_id,
+         max(case when answer_id = acceptedanswerid then 1 else 0 end) as has_accepted,
+         count(answer_id) as answers,
+         max(answer_score) as best_answer_score,
+         sum(case when answer_score >= 0 then 1 else 0 end) as nonneg_answers
+  from qa
+  group by question_id
+),
+ranked as (
+  select c.*,
+         pe.upvotes,
+         pe.downvotes,
+         pe.favorites_legacy,
+         pe.bounty_total,
+         pe.vote_events,
+         ph.last_event_at,
+         ph.edit_events,
+         ph.mod_events,
+         ph.first_closed_at,
+         ph.last_close_reason_id,
+         pl.links_from,
+         pl.links_to,
+         pl.dup_of,
+         pl.dup_targets,
+         cs.comments,
+         cs.comment_score,
+         cs.last_comment_at,
+         qa2.has_accepted,
+         qa2.answers,
+         qa2.best_answer_score,
+         qa2.nonneg_answers,
+         (coalesce(pe.upvotes,0) - coalesce(pe.downvotes,0)) as net_votes,
+         case
+           when c.posttypeid = 1 then coalesce(qa2.answers,0)
+           when c.posttypeid = 2 then 0
+           else null
+         end as answer_count_calc,
+         case when c.tags_raw like '%<sql>%' then 1 else 0 end as has_sql_tag,
+         position(lower('performance') in lower(coalesce(c.title,''))) as perf_term_pos,
+         coalesce(c.viewcount,0) / nullif(extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - c.post_created_at))/86400.0, 0) as views_per_day
+  from core c
+  left join post_engagement pe on pe.id = c.post_id
+  left join post_history_summary ph on ph.postid = c.post_id
+  left join post_link_metrics pl on pl.id = c.post_id
+  left join comment_stats cs on cs.postid = c.post_id
+  left join qa_agg qa2 on qa2.question_id = c.post_id
+),
+windowed as (
+  select r.*,
+         percent_rank() over (order by coalesce(r.viewcount,0)) as pr_views,
+         percent_rank() over (order by coalesce(r.score,0)) as pr_score,
+         percent_rank() over (order by coalesce(r.net_votes,0)) as pr_net_votes,
+         percent_rank() over (order by coalesce(r.bounty_total,0)) as pr_bounty,
+         dense_rank() over (partition by r.user_id order by coalesce(r.score, -999999) desc, r.post_id) as user_score_rank,
+         sum(coalesce(r.viewcount,0)) over (partition by r.user_id) as user_total_views,
+         avg(coalesce(r.score,0)) over (partition by r.user_id) as user_avg_score,
+         count(*) over (partition by r.user_id) as user_post_count
+  from ranked r
+),
+scored as (
+  select w.*,
+         (coalesce(w.pr_views,0) * 0.35
+        + coalesce(w.pr_score,0) * 0.35
+        + coalesce(w.pr_net_votes,0) * 0.2
+        + coalesce(w.pr_bounty,0) * 0.1) as hotness_pct,
+         (case when coalesce(w.edit_events,0) > 5 or coalesce(w.mod_events,0) > 0 then 1 else 0 end) as high_churn,
+         (case when w.first_closed_at is not null then 1 else 0 end) as was_closed,
+         coalesce(w.links_from,0) + coalesce(w.links_to,0) + coalesce(w.dup_of,0) + coalesce(w.dup_targets,0) as link_degree
+  from windowed w
+),
+hot_questions as (
+  select s.post_id
+  from scored s
+  where s.posttypeid = 1
+    and s.hotness_pct >= 0.9
+),
+hot_tags as (
+  select qt.tag, count(*) as freq
+  from question_tags qt
+  join hot_questions hq on hq.post_id = qt.question_id
+  group by qt.tag
+),
+close_reason as (
+  select crt.id, crt.name
+  from closereasontypes crt
+),
+top_hot as (
+  select s.post_id, s.user_id, s.displayname, s.title, s.score, s.viewcount, s.hotness_pct,
+         s.has_sql_tag, s.was_closed, s.last_close_reason_id, s.high_churn, s.link_degree,
+         s.pr_views, s.pr_score, s.user_score_rank, s.user_total_views, s.user_post_count
+  from scored s
+  where s.hotness_pct >= 0.95
+),
+edge_cases as (
+  select s.post_id, s.user_id, s.displayname, s.title, s.score, s.viewcount, s.hotness_pct,
+         s.has_sql_tag, s.was_closed, s.last_close_reason_id, s.high_churn, s.link_degree,
+         s.pr_views, s.pr_score, s.user_score_rank, s.user_total_views, s.user_post_count
+  from scored s
+  where s.posttypeid in (1,2)
+    and (
+      (s.was_closed = 1 and coalesce(s.score,0) >= 10)
+      or (s.high_churn = 1 and s.link_degree >= 5)
+      or (s.has_sql_tag = 1 and s.score >= 5 and s.viewcount >= 1000)
+    )
+    and s.hotness_pct between 0.6 and 0.95
+),
+unioned as (
+  select * from top_hot
+  union all
+  select * from edge_cases
+),
+rank_final as (
+  select u.*,
+         row_number() over (
+           partition by u.post_id
+           order by u.hotness_pct desc, u.score desc, u.viewcount desc
+         ) as rn
+  from unioned u
+)
+select
+  rf.post_id,
+  rf.user_id,
+  rf.displayname,
+  coalesce(nullif(rf.title, ''), concat('[post ', cast(rf.post_id as text), ']')) as title,
+  rf.score,
+  rf.viewcount,
+  round(cast(rf.hotness_pct as numeric), 4) as hotness_pct,
+  case rf.has_sql_tag when 1 then 'sql' else null end as has_sql_tag,
+  rf.was_closed,
+  coalesce(cr.name, concat('ReasonId:', cast(rf.last_close_reason_id as text))) as close_reason,
+  rf.high_churn,
+  rf.link_degree,
+  rf.user_score_rank,
+  rf.user_total_views,
+  rf.user_post_count,
+  trim(both ' ' from coalesce(rf.displayname, 'anonymous')) || ' (#' || cast(rf.user_id as text) || ')' as user_label,
+  case
+    when rf.pr_views >= 0.95 then 'very high views'
+    when rf.pr_views >= 0.75 then 'high views'
+    when rf.pr_views >= 0.50 then 'medium views'
+    else 'low views'
+  end as view_band,
+  cast('2024-10-01 12:34:56' as timestamp) as generated_at
+from rank_final rf
+left join close_reason cr on cr.id = rf.last_close_reason_id
+where rf.rn = 1
+order by hotness_pct desc, score desc, viewcount desc
+limit 200;

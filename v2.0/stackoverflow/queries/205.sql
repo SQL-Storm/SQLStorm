@@ -1,0 +1,336 @@
+with recent_posts as (
+  select
+    p.id,
+    p.posttypeid,
+    p.owneruserid,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.title,
+    p.tags,
+    p.answercount,
+    coalesce(nullif(trim(p.ownerdisplayname), ''), u.displayname, 'anonymous') as effective_displayname,
+    date_trunc('month', p.creationdate) as month_bucket
+  from posts p
+  left join users u on u.id = p.owneruserid
+  where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+),
+user_activity as (
+  select
+    u.id as userid,
+    u.reputation,
+    u.creationdate as user_created,
+    u.location,
+    u.upvotes,
+    u.downvotes,
+    coalesce(u.websiteurl, '') as websiteurl,
+    count(distinct p.id) filter (where p.owneruserid = u.id) as total_authored_posts,
+    count(distinct c.id) as total_comments_made,
+    sum(v.bountyamount) filter (where v.votetypeid in (8,9)) as total_bounty_flow,
+    sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end) as net_votes_cast
+  from users u
+  left join posts p on p.owneruserid = u.id and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+  left join comments c on c.userid = u.id and c.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+  left join votes v on v.userid = u.id and v.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+  group by u.id, u.reputation, u.creationdate, u.location, u.upvotes, u.downvotes, u.websiteurl
+),
+post_interactions as (
+  select
+    p.id as postid,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+    sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_total,
+    count(distinct c.id) as comments_count,
+    max(c.creationdate) as last_comment_date
+  from recent_posts p
+  left join votes v on v.postid = p.id
+  left join comments c on c.postid = p.id
+  group by p.id
+),
+tag_expansion as (
+  select
+    rp.id as postid,
+    lower(trim(tg)) as tagname
+  from recent_posts rp
+  cross join lateral unnest(
+    case
+      when rp.tags is null or rp.tags = '' then array[]::text[]
+      else string_to_array(substring(rp.tags, 2, length(rp.tags)-2), '><')
+    end
+  ) as tg
+),
+tag_stats as (
+  select
+    te.tagname,
+    count(*) as tag_recent_posts,
+    count(*) filter (where rp.posttypeid = 1) as tag_recent_questions,
+    count(*) filter (where rp.posttypeid = 2) as tag_recent_answers,
+    avg(nullif(pi.upvotes - pi.downvotes, 0)) as avg_net_votes_nonzero,
+    max(pi.bounty_total) as max_bounty_in_tag
+  from tag_expansion te
+  join recent_posts rp on rp.id = te.postid
+  join post_interactions pi on pi.postid = rp.id
+  group by te.tagname
+),
+linked_posts as (
+  select
+    p.id as postid,
+    count(*) filter (where pl.linktypeid = 1) as linked_count,
+    count(*) filter (where pl.linktypeid = 3) as duplicate_count,
+    bool_or(pl.linktypeid = 3) as has_duplicate_flag
+  from recent_posts p
+  left join postlinks pl on pl.postid = p.id
+  group by p.id
+),
+closure_events as (
+  select
+    ph.postid,
+    min(ph.creationdate) filter (where ph.posthistorytypeid = 10) as first_closed_at,
+    count(*) filter (where ph.posthistorytypeid = 10) as close_votes_count,
+    count(*) filter (where ph.posthistorytypeid = 11) as reopen_events,
+    cast(max(last_reason) as integer) as last_close_reason_id
+  from (
+    select
+      ph.*,
+      regexp_match_val[1] as last_reason
+    from posthistory ph
+    join recent_posts rp on rp.id = ph.postid
+    left join lateral (
+      select regexp_matches(coalesce(ph.comment,''), '([0-9]{2,3})') as regexp_match_val
+    ) r on true
+  ) ph
+  group by ph.postid
+),
+question_answer_pairs as (
+  select
+    q.id as question_id,
+    q.acceptedanswerid,
+    a.id as answer_id,
+    a.owneruserid as answer_ownerid,
+    a.score as answer_score,
+    a.creationdate as answer_created
+  from posts q
+  left join posts a on a.parentid = q.id and a.posttypeid = 2
+  where q.posttypeid = 1
+    and q.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+),
+answerer_stats as (
+  select
+    qa.question_id,
+    count(*) as answers_count,
+    max(answer_score) as max_answer_score,
+    sum(case when qa.answer_id = qa.acceptedanswerid then 1 else 0 end) as accepted_answers_present,
+    min(qa.answer_created) as first_answer_time
+  from question_answer_pairs qa
+  group by qa.question_id
+),
+ranked_posts as (
+  select
+    rp.id,
+    rp.posttypeid,
+    rp.owneruserid,
+    rp.month_bucket,
+    rp.title,
+    rp.score,
+    rp.viewcount,
+    pi.upvotes,
+    pi.downvotes,
+    pi.favorites,
+    pi.bounty_total,
+    lp.linked_count,
+    lp.duplicate_count,
+    ce.first_closed_at,
+    ce.close_votes_count,
+    ce.reopen_events,
+    coalesce(ce.last_close_reason_id, 0) as last_close_reason_id,
+    row_number() over (partition by rp.posttypeid order by rp.score desc nulls last, rp.viewcount desc nulls last, rp.creationdate desc) as rn_by_type,
+    dense_rank() over (partition by rp.month_bucket order by coalesce(pi.upvotes,0) - coalesce(pi.downvotes,0) desc nulls last) as monthly_netvote_rank,
+    avg(coalesce(pi.upvotes,0) - coalesce(pi.downvotes,0)) over (partition by rp.month_bucket) as monthly_avg_netvote,
+    sum(coalesce(pi.favorites,0)) over (order by rp.creationdate rows between unbounded preceding and current row) as running_favorites,
+    rp.creationdate
+  from recent_posts rp
+  left join post_interactions pi on pi.postid = rp.id
+  left join linked_posts lp on lp.postid = rp.id
+  left join closure_events ce on ce.postid = rp.id
+),
+user_rollup as (
+  select
+    rp.owneruserid as userid,
+    count(*) as recent_posts_count,
+    sum(case when rp.posttypeid = 1 then 1 else 0 end) as recent_questions,
+    sum(case when rp.posttypeid = 2 then 1 else 0 end) as recent_answers,
+    sum(coalesce(pi.upvotes,0) - coalesce(pi.downvotes,0)) as net_votes_received,
+    sum(coalesce(pi.favorites,0)) as favorites_received,
+    max(rp.creationdate) as last_post_date
+  from recent_posts rp
+  left join post_interactions pi on pi.postid = rp.id
+  group by rp.owneruserid
+),
+tag_user_affinity as (
+  select
+    te.tagname,
+    rp.owneruserid as userid,
+    count(*) as posts_in_tag,
+    sum(coalesce(pi.upvotes,0) - coalesce(pi.downvotes,0)) as net_votes_in_tag,
+    rank() over (partition by te.tagname order by count(*) desc, sum(coalesce(pi.upvotes,0) - coalesce(pi.downvotes,0)) desc) as rnk_in_tag
+  from tag_expansion te
+  join recent_posts rp on rp.id = te.postid
+  join post_interactions pi on pi.postid = rp.id
+  where rp.owneruserid is not null
+  group by te.tagname, rp.owneruserid
+),
+power_users as (
+  select
+    ua.userid,
+    ua.reputation,
+    ua.user_created,
+    ua.location,
+    ur.recent_posts_count,
+    ur.net_votes_received,
+    ua.net_votes_cast,
+    coalesce(ur.recent_posts_count,0) + coalesce(ua.net_votes_cast,0) as activity_index,
+    row_number() over (order by (coalesce(ur.recent_posts_count,0) + coalesce(ua.net_votes_cast,0)) desc, ua.reputation desc) as overall_activity_rank
+  from user_activity ua
+  left join user_rollup ur on ur.userid = ua.userid
+),
+null_safety as (
+  select
+    rp.id as postid,
+    case when rp.title is null or trim(rp.title) = '' then '(untitled #'||rp.id||')'
+         else rp.title end as safe_title,
+    case when rp.owneruserid is null then -1 else rp.owneruserid end as safe_owneruserid
+  from recent_posts rp
+),
+final_scores as (
+  select
+    rp.id as postid,
+    ns.safe_title,
+    rp.posttypeid,
+    coalesce(pi.upvotes,0) as upvotes,
+    coalesce(pi.downvotes,0) as downvotes,
+    coalesce(pi.favorites,0) as favorites,
+    coalesce(pi.bounty_total,0) as bounty_total,
+    coalesce(lp.duplicate_count,0) as duplicate_count,
+    case
+      when rp.posttypeid = 1 then coalesce(asx.answers_count,0)
+      else 0
+    end as answers_count,
+    case
+      when ce.first_closed_at is not null then 1 else 0
+    end as is_closed,
+    greatest(
+      0,
+      coalesce(pi.upvotes,0) - coalesce(pi.downvotes,0)
+      + (coalesce(pi.favorites,0) / nullif(ln(rp.viewcount + 10),0))
+      + (case when lp.duplicate_count > 0 then -2 else 0 end)
+      + (case when ce.reopen_events > 0 then 1 else 0 end)
+      + (case when rp.posttypeid = 1 then least(coalesce(asx.answers_count,0), 5) * 0.5 else 0 end)
+      + (case when rp.posttypeid = 2 then (coalesce(pi.upvotes,0) - coalesce(pi.downvotes,0)) * 0.1 else 0 end)
+    ) as interesting_score
+  from ranked_posts rp
+  left join post_interactions pi on pi.postid = rp.id
+  left join linked_posts lp on lp.postid = rp.id
+  left join closure_events ce on ce.postid = rp.id
+  left join answerer_stats asx on asx.question_id = rp.id
+  join null_safety ns on ns.postid = rp.id
+),
+top_tags as (
+  select
+    ts.tagname,
+    ts.tag_recent_posts,
+    ts.avg_net_votes_nonzero,
+    dense_rank() over (order by ts.tag_recent_posts desc, ts.max_bounty_in_tag desc nulls last) as tag_pop_rank
+  from tag_stats ts
+),
+post_tag_summary as (
+  select
+    te.postid,
+    string_agg(te.tagname, ',' order by te.tagname) as tags_csv,
+    max(tt.tag_pop_rank) as worst_tag_rank,
+    min(tt.tag_pop_rank) as best_tag_rank
+  from tag_expansion te
+  left join top_tags tt on tt.tagname = te.tagname
+  group by te.postid
+),
+owner_join as (
+  select
+    fs.postid,
+    fs.safe_title,
+    fs.posttypeid,
+    fs.upvotes,
+    fs.downvotes,
+    fs.favorites,
+    fs.bounty_total,
+    fs.duplicate_count,
+    fs.answers_count,
+    fs.is_closed,
+    fs.interesting_score,
+    u.id as ownerid,
+    u.displayname as owner_displayname,
+    pu.activity_index,
+    pu.overall_activity_rank
+  from final_scores fs
+  left join posts p on p.id = fs.postid
+  left join users u on u.id = p.owneruserid
+  left join power_users pu on pu.userid = u.id
+)
+select
+  oj.postid,
+  oj.safe_title as title,
+  oj.posttypeid,
+  coalesce(oj.owner_displayname, 'unknown') as owner_displayname,
+  coalesce(oj.activity_index, 0) as owner_activity_index,
+  coalesce(oj.overall_activity_rank, 999999) as owner_activity_rank,
+  oj.upvotes,
+  oj.downvotes,
+  oj.favorites,
+  oj.bounty_total,
+  oj.duplicate_count,
+  oj.answers_count,
+  oj.is_closed,
+  oj.interesting_score,
+  pts.tags_csv,
+  pts.best_tag_rank,
+  pts.worst_tag_rank,
+  rp.month_bucket,
+  rp.rn_by_type,
+  rp.monthly_netvote_rank,
+  rp.monthly_avg_netvote,
+  rp.running_favorites,
+  case
+    when oj.is_closed = 1 and rp.monthly_netvote_rank <= 5 then 'controversial'
+    when oj.duplicate_count > 0 then 'duplicate'
+    when oj.interesting_score >= (
+      select percentile_cont(0.9) within group (order by interesting_score)
+      from final_scores
+    ) then 'top10pct'
+    when coalesce(oj.favorites,0) > 10 and coalesce(oj.upvotes,0) > 5 then 'liked'
+    else 'normal'
+  end as flag_category
+from owner_join oj
+join ranked_posts rp on rp.id = oj.postid
+left join post_tag_summary pts on pts.postid = oj.postid
+where
+  (
+    (oj.interesting_score > 1 and rp.monthly_netvote_rank <= 100)
+    or (oj.duplicate_count > 0 and oj.downvotes > oj.upvotes)
+    or (oj.is_closed = 1 and coalesce(oj.favorites,0) >= 1)
+  )
+  and coalesce(pts.best_tag_rank, 999999) <= 250
+  and (
+    exists (
+      select 1
+      from tag_user_affinity tua
+      where tua.userid = oj.ownerid
+        and tua.rnk_in_tag <= 5
+    )
+    or oj.ownerid is null
+  )
+order by
+  flag_category,
+  rp.month_bucket desc,
+  oj.interesting_score desc,
+  oj.upvotes desc,
+  oj.favorites desc
+limit 500;

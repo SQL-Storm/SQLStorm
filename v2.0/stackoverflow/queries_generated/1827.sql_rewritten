@@ -1,0 +1,235 @@
+-- {"query": "1827.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3231} 
+WITH UserEngagement AS (
+    -- Summarize user activity and reputation trends
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.Views AS UserViews,
+        U.UpVotes AS UserTotalUpVotes,
+        U.DownVotes AS UserTotalDownVotes,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(COALESCE(P.Score, 0)) AS TotalPostScore,
+        AVG(COALESCE(P.Score, 0)) AS AvgPostScore,
+        SUM(COALESCE(P.ViewCount, 0)) AS TotalPostViewCount,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        MAX(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS HasGoldBadge,
+        MAX(PH.CreationDate) AS LastActivityDateFromHistory,
+        (
+            SELECT COALESCE(SUM(V.BountyAmount), 0)
+            FROM Votes V
+            WHERE V.UserId = U.Id AND V.VoteTypeId = 8 -- BountyStart
+        ) AS TotalBountyGiven,
+        (
+            SELECT COUNT(PV.Id)
+            FROM Votes PV
+            WHERE PV.PostId IN (SELECT P_inner.Id FROM Posts P_inner WHERE P_inner.OwnerUserId = U.Id) AND PV.VoteTypeId = 1 -- AcceptedByOriginator
+        ) AS AcceptedAnswerVotesReceived
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN PostHistory PH ON U.Id = PH.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.Views, U.UpVotes, U.DownVotes
+),
+PostContentAnalysis AS (
+    -- Analyze post content, tags, and specific closing reasons
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        P.PostTypeId,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.FavoriteCount,
+        P.CreationDate AS PostCreationDate,
+        P.ClosedDate,
+        LOWER(P.Title) AS LowerTitle,
+        LOWER(P.Body) AS LowerBody,
+        P.Tags,
+        COALESCE(P.LastEditDate, P.CreationDate) AS EffectiveLastEditDate,
+        -- Extract the first tag from the Tags string, or NULL if not available
+        NULLIF(SUBSTRING(P.Tags FROM 2 FOR POSITION('>' IN P.Tags) - 2), '') AS FirstTag,
+        COALESCE(CR_Sub.CloseReason, 'Not Closed / Unknown') AS CloseReason,
+        COUNT(DISTINCT CO.Id) AS CommentCountOnPost,
+        SUM(COALESCE(CO.Score, 0)) AS TotalCommentScoreOnPost
+    FROM Posts P
+    LEFT JOIN Comments CO ON P.Id = CO.PostId
+    LEFT JOIN (
+        -- Subquery to get the most recent close reason for each post
+        SELECT
+            PH_Sub.PostId,
+            CR_Sub.Name AS CloseReason,
+            ROW_NUMBER() OVER(PARTITION BY PH_Sub.PostId ORDER BY PH_Sub.CreationDate DESC) AS rn
+        FROM PostHistory PH_Sub
+        INNER JOIN CloseReasonTypes CR_Sub ON CR_Sub.Id = CAST(PH_Sub.Comment AS smallint)
+        WHERE PH_Sub.PostHistoryTypeId = 10 -- Post Closed event
+    ) AS CR_Sub ON P.Id = CR_Sub.PostId AND CR_Sub.rn = 1 -- Get the most recent close reason if multiple
+    WHERE P.PostTypeId IN (1, 2) -- Only Questions and Answers
+    GROUP BY P.Id, P.OwnerUserId, P.PostTypeId, P.Score, P.ViewCount, P.AnswerCount, P.FavoriteCount, P.CreationDate, P.ClosedDate, P.Title, P.Body, P.Tags, P.LastEditDate, CR_Sub.CloseReason
+),
+TagPerformanceMetrics AS (
+    -- Calculate performance metrics per tag, focusing on "performance" related tags
+    SELECT
+        PCA.FirstTag AS TagName,
+        COUNT(DISTINCT PCA.PostId) AS TagPostCount,
+        AVG(PCA.PostScore) AS AvgTagPostScore,
+        SUM(COALESCE(PCA.ViewCount, 0)) AS TotalTagViewCount,
+        COUNT(DISTINCT CASE WHEN PCA.ClosedDate IS NOT NULL THEN PCA.PostId ELSE NULL END) AS ClosedTagPosts,
+        SUM(CASE WHEN PCA.LowerTitle LIKE '%performance%' OR PCA.LowerBody LIKE '%performance%' THEN 1 ELSE 0 END) AS PerformanceKeywordMentions,
+        AVG(EXTRACT(EPOCH FROM (PCA.ClosedDate - PCA.PostCreationDate))) FILTER (WHERE PCA.ClosedDate IS NOT NULL) AS AvgTimeToCloseSeconds
+    FROM PostContentAnalysis PCA
+    WHERE PCA.FirstTag IS NOT NULL AND (PCA.LowerTitle LIKE '%performance%' OR PCA.LowerBody LIKE '%performance%' OR PCA.Tags LIKE '%<performance>%')
+    GROUP BY PCA.FirstTag
+    HAVING COUNT(DISTINCT PCA.PostId) > 10 -- Only consider tags with significant activity
+),
+UserPostImpact AS (
+    -- Combine user engagement with post content analysis to determine impact
+    SELECT
+        UE.UserId,
+        UE.DisplayName,
+        UE.Reputation,
+        UE.TotalPosts,
+        UE.TotalQuestions,
+        UE.TotalAnswers,
+        UE.TotalPostScore,
+        UE.AvgPostScore,
+        UE.TotalPostViewCount,
+        UE.TotalComments,
+        UE.TotalBadges,
+        UE.HasGoldBadge,
+        UE.TotalBountyGiven,
+        UE.AcceptedAnswerVotesReceived,
+        SUM(CASE WHEN PCA.PostTypeId = 1 AND PCA.LowerTitle LIKE '%sql%' THEN 1 ELSE 0 END) AS SqlQuestions,
+        SUM(CASE WHEN PCA.PostTypeId = 2 AND PCA.LowerBody LIKE '%index%' THEN 1 ELSE 0 END) AS IndexRelatedAnswers,
+        AVG(PCA.CommentCountOnPost) AS AvgCommentsPerPost,
+        MAX(PCA.EffectiveLastEditDate) AS MostRecentPostEdit,
+        SUM(CASE WHEN PCA.CloseReason = 'Duplicate' THEN 1 ELSE 0 END) AS DuplicateClosures,
+        -- Correlated subquery: Get the score of the user's highest viewed question
+        (
+            SELECT COALESCE(MAX(P_inner.Score), 0)
+            FROM Posts P_inner
+            WHERE P_inner.OwnerUserId = UE.UserId AND P_inner.PostTypeId = 1
+            ORDER BY P_inner.ViewCount DESC, P_inner.Score DESC
+            LIMIT 1
+        ) AS MaxScoreOnHighestViewedQuestion,
+        -- Calculate time difference between user creation and last post activity
+        EXTRACT(DAY FROM (COALESCE(UE.LastActivityDateFromHistory, UE.UserCreationDate) - UE.UserCreationDate)) AS DaysSinceUserCreationToLastActivity,
+        -- Aggregate specific tag performance for the user's relevant posts
+        AVG(TPM.AvgTagPostScore) FILTER (WHERE TPM.TagName IS NOT NULL) AS UserRelevantTagsAvgScore
+    FROM UserEngagement UE
+    LEFT JOIN PostContentAnalysis PCA ON UE.UserId = PCA.OwnerUserId
+    LEFT JOIN TagPerformanceMetrics TPM ON PCA.FirstTag = TPM.TagName
+    GROUP BY UE.UserId, UE.DisplayName, UE.Reputation, UE.TotalPosts, UE.TotalQuestions, UE.TotalAnswers, UE.TotalPostScore, UE.AvgPostScore, UE.TotalPostViewCount, UE.TotalComments, UE.TotalBadges, UE.HasGoldBadge, UE.TotalBountyGiven, UE.AcceptedAnswerVotesReceived, UE.LastActivityDateFromHistory, UE.UserCreationDate
+),
+FinalUserRanking AS (
+    -- Apply window functions and final calculations for a composite impact score
+    SELECT
+        UPI.UserId,
+        UPI.DisplayName,
+        UPI.Reputation,
+        UPI.TotalPosts,
+        UPI.TotalQuestions,
+        UPI.TotalAnswers,
+        UPI.TotalPostScore,
+        UPI.TotalPostViewCount,
+        UPI.TotalComments,
+        UPI.TotalBadges,
+        UPI.HasGoldBadge,
+        UPI.MaxScoreOnHighestViewedQuestion,
+        UPI.SqlQuestions,
+        UPI.IndexRelatedAnswers,
+        UPI.DuplicateClosures,
+        UPI.DaysSinceUserCreationToLastActivity,
+        COALESCE(UPI.UserRelevantTagsAvgScore, 0) AS UserRelevantTagsAvgScore,
+        -- Composite impact score - normalize to 0-1 range for each component using global max
+        (
+            0.5 * (UPI.Reputation::numeric / NULLIF(MAX(UPI.Reputation) OVER (), 0)) +
+            0.2 * (UPI.TotalPostScore::numeric / NULLIF(MAX(UPI.TotalPostScore) OVER (), 0)) +
+            0.15 * (UPI.TotalPostViewCount::numeric / NULLIF(MAX(UPI.TotalPostViewCount) OVER (), 0)) +
+            0.1 * (UPI.TotalBadges::numeric / NULLIF(MAX(UPI.TotalBadges) OVER (), 0)) +
+            0.05 * (UPI.AcceptedAnswerVotesReceived::numeric / NULLIF(MAX(UPI.AcceptedAnswerVotesReceived) OVER (), 0))
+        ) AS CompositeImpactScore,
+        RANK() OVER (ORDER BY UPI.Reputation DESC, UPI.TotalPostScore DESC, UPI.TotalPostViewCount DESC) AS RankByActivity,
+        NTILE(4) OVER (ORDER BY UPI.Reputation DESC) AS ReputationQuartile,
+        LAG(UPI.Reputation, 1, 0) OVER (ORDER BY UPI.Reputation ASC) AS PreviousReputationInRankOrder,
+        -- Check if user's last post edit was within the last year
+        CASE
+            WHEN UPI.MostRecentPostEdit IS NOT NULL AND UPI.MostRecentPostEdit > (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year') THEN 'Active Recently'
+            ELSE 'Inactive/No Recent Edits'
+        END AS ActivityStatus,
+        UPI.AvgPostScore
+    FROM UserPostImpact UPI
+    WHERE UPI.TotalPosts > 0
+),
+ModeratorReviewCandidates AS (
+    -- Identify potential candidates for moderator review based on specific criteria
+    SELECT
+        FUR.UserId,
+        FUR.DisplayName,
+        'HighDuplicateClosures' AS Reason,
+        FUR.DuplicateClosures::text AS MetricValue -- Cast to text for union compatibility
+    FROM FinalUserRanking FUR
+    WHERE FUR.DuplicateClosures > 5 -- User has had more than 5 of their posts closed as duplicate
+    UNION ALL
+    SELECT
+        FUR.UserId,
+        FUR.DisplayName,
+        'LowAvgPostScoreForActiveUsers' AS Reason,
+        FUR.AvgPostScore::text AS MetricValue
+    FROM FinalUserRanking FUR
+    WHERE FUR.ActivityStatus = 'Active Recently' AND FUR.AvgPostScore < 0
+    AND FUR.TotalPosts > 10 -- Only for users with a reasonable number of posts
+    UNION ALL
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        'HighDownvotesLowReputation' AS Reason,
+        U.DownVotes::text AS MetricValue
+    FROM Users U
+    WHERE U.Reputation < 100 AND U.DownVotes > 50
+    AND NOT EXISTS (SELECT 1 FROM Badges B WHERE B.UserId = U.Id AND B.Class = 1) -- No gold badges
+)
+-- Final SELECT statement combining all insights
+SELECT
+    FUR.UserId,
+    FUR.DisplayName,
+    FUR.Reputation,
+    FUR.TotalPosts,
+    FUR.TotalQuestions,
+    FUR.TotalAnswers,
+    FUR.CompositeImpactScore,
+    FUR.RankByActivity,
+    FUR.ReputationQuartile,
+    FUR.ActivityStatus,
+    TPM_Overall.TagName AS TopPerformanceTag,
+    TPM_Overall.AvgTagPostScore AS TopPerformanceTagAvgScore,
+    TPM_Overall.TagPostCount AS TopPerformanceTagPostCount,
+    -- String expression: Concatenate location and creation year
+    COALESCE(U.Location, 'Unspecified') || ' (' || EXTRACT(YEAR FROM U.CreationDate) || ')' AS UserLocationAndCreationYear,
+    -- Null logic example: check if AboutMe contains a specific keyword, or indicate it's empty
+    CASE
+        WHEN U.AboutMe IS NOT NULL AND LOWER(U.AboutMe) LIKE '%developer%' THEN 'Developer Profile'
+        WHEN U.AboutMe IS NOT NULL THEN 'Has AboutMe'
+        ELSE 'No AboutMe'
+    END AS AboutMeStatus,
+    MRC.Reason AS ModeratorCandidateReason,
+    MRC.MetricValue AS ModeratorCandidateMetric
+FROM FinalUserRanking FUR
+INNER JOIN Users U ON FUR.UserId = U.Id -- Join back to Users for additional user details
+LEFT JOIN (
+    -- Find the highest performing "performance" related tag overall
+    SELECT TagName, AvgTagPostScore, TagPostCount,
+           ROW_NUMBER() OVER (ORDER BY AvgTagPostScore DESC, TagPostCount DESC) as rn
+    FROM TagPerformanceMetrics
+    WHERE PerformanceKeywordMentions > 0
+) TPM_Overall ON TPM_Overall.rn = 1
+LEFT JOIN ModeratorReviewCandidates MRC ON FUR.UserId = MRC.UserId
+WHERE FUR.Reputation > 1000 -- Focus on more established users
+AND FUR.TotalPosts > 5 -- And those with some activity
+ORDER BY FUR.CompositeImpactScore DESC, FUR.Reputation DESC
+LIMIT 100;

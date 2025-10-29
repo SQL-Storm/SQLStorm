@@ -1,0 +1,212 @@
+-- {"query": "7713.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2334} 
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as avg_score,
+        CASE 
+            WHEN p.Score > 100 THEN 'High'
+            WHEN p.Score > 10 THEN 'Medium'
+            WHEN p.Score > 0 THEN 'Low'
+            ELSE 'None'
+        END as score_category,
+        COALESCE(p.Title, 'No Title') as normalized_title,
+        LENGTH(p.Tags) as tag_length,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags <> '' THEN 
+                (SELECT COUNT(*) 
+                 FROM unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) as tag 
+                 WHERE tag <> '') 
+            ELSE 0 
+        END as tag_count,
+        COALESCE(p.AnswerCount, 0) + COALESCE(p.CommentCount, 0) as engagement_count
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) -- Questions and Answers
+),
+UserActivity AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.CreationDate,
+        COUNT(DISTINCT r.Id) as post_count,
+        COUNT(DISTINCT CASE WHEN r.PostTypeId = 1 THEN r.Id END) as question_count,
+        COUNT(DISTINCT CASE WHEN r.PostTypeId = 2 THEN r.Id END) as answer_count,
+        SUM(COALESCE(r.Score, 0)) as total_score,
+        AVG(COALESCE(r.Score, 0)) as avg_score,
+        MAX(r.CreationDate) as last_post_date,
+        MAX(CASE WHEN r.PostTypeId = 1 THEN r.CreationDate END) as last_question_date,
+        MAX(CASE WHEN r.PostTypeId = 2 THEN r.CreationDate END) as last_answer_date,
+        STRING_AGG(DISTINCT r.Tags, '; ') as tag_activity
+    FROM Users u
+    LEFT JOIN RankedPosts r ON u.Id = r.OwnerUserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            WHEN t.Count > 10 THEN 'Niche'
+            ELSE 'Obscure'
+        END as popularity_level,
+        t.IsRequired,
+        t.IsModeratorOnly
+    FROM Tags t
+    WHERE t.Count > 0
+),
+TopUsers AS (
+    SELECT 
+        ua.Id,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.Views,
+        ua.UpVotes,
+        ua.DownVotes,
+        ua.post_count,
+        ua.question_count,
+        ua.answer_count,
+        ua.total_score,
+        ua.avg_score,
+        ua.last_post_date,
+        DATEDIFF('day', ua.CreationDate, CURRENT_TIMESTAMP) as account_age_days,
+        CASE 
+            WHEN ua.Reputation > 100000 THEN 'Expert'
+            WHEN ua.Reputation > 10000 THEN 'Advanced'
+            WHEN ua.Reputation > 1000 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as reputation_level,
+        DENSE_RANK() OVER (ORDER BY ua.total_score DESC) as score_rank,
+        DENSE_RANK() OVER (ORDER BY ua.post_count DESC) as post_rank,
+        ROW_NUMBER() OVER (ORDER BY ua.Reputation DESC) as rep_rank
+    FROM UserActivity ua
+    WHERE ua.Reputation > 100 AND ua.post_count > 0
+),
+ComplexPosts AS (
+    SELECT 
+        rp.Id,
+        rp.Title,
+        rp.OwnerUserId,
+        rp.Score,
+        rp.ViewCount,
+        rp.CreationDate,
+        rp.rn,
+        rp.prev_score,
+        rp.avg_score,
+        rp.score_category,
+        rp.normalized_title,
+        rp.tag_length,
+        rp.tag_count,
+        rp.engagement_count,
+        CASE 
+            WHEN rp.Score > (SELECT AVG(Score) FROM RankedPosts) THEN 'Above Average'
+            WHEN rp.Score < (SELECT AVG(Score) FROM RankedPosts) THEN 'Below Average'
+            ELSE 'Average'
+        END as score_rating,
+        CASE 
+            WHEN rp.AnswerCount > 0 AND rp.Score > 5 THEN 'Active Question'
+            WHEN rp.AnswerCount > 0 AND rp.Score <= 5 THEN 'Inactive Question'
+            WHEN rp.AnswerCount = 0 AND rp.Score > 0 THEN 'Unanswered'
+            ELSE 'No Engagement'
+        END as post_status,
+        DATEDIFF('day', rp.CreationDate, CURRENT_TIMESTAMP) as days_since_creation,
+        (CASE WHEN LENGTH(rp.Title) > 50 THEN 'Long' ELSE 'Short' END) as title_length_category
+    FROM RankedPosts rp
+    WHERE rp.rn <= 10 -- Top 10 posts per user
+)
+SELECT 
+    COUNT(*) as total_results,
+    COUNT(DISTINCT cu.Id) as unique_users,
+    COUNT(DISTINCT CASE WHEN cp.post_status = 'Active Question' THEN cp.Id END) as active_questions,
+    COUNT(DISTINCT CASE WHEN cp.post_status = 'Unanswered' THEN cp.Id END) as unanswered_questions,
+    AVG(cp.Score) as avg_post_score,
+    AVG(cu.avg_score) as avg_user_score,
+    AVG(cu.Reputation) as avg_user_reputation,
+    MAX(cu.Reputation) as max_user_reputation,
+    MIN(cu.Reputation) as min_user_reputation,
+    COUNT(DISTINCT ta.TagName) as total_tags,
+    COUNT(DISTINCT CASE WHEN ta.popularity_level = 'Popular' THEN ta.TagName END) as popular_tags,
+    COUNT(DISTINCT CASE WHEN ta.popularity_level = 'Niche' THEN ta.TagName END) as niche_tags,
+    COUNT(DISTINCT CASE WHEN ta.popularity_level = 'Obscure' THEN ta.TagName END) as obscure_tags,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Score > 100) as high_score_questions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 2 AND Score > 100) as high_score_answers,
+    COUNT(DISTINCT CASE WHEN cu.score_rank <= 10 THEN cu.Id END) as top_10_score_users,
+    COUNT(DISTINCT CASE WHEN cu.post_rank <= 10 THEN cu.Id END) as top_10_post_users,
+    COUNT(DISTINCT CASE WHEN cu.rep_rank <= 10 THEN cu.Id END) as top_10_rep_users,
+    COUNT(DISTINCT CASE WHEN cp.days_since_creation > 365 THEN cp.Id END) as old_posts,
+    COUNT(DISTINCT CASE WHEN cp.days_since_creation <= 365 THEN cp.Id END) as recent_posts,
+    COUNT(DISTINCT CASE WHEN cp.title_length_category = 'Long' THEN cp.Id END) as long_title_posts,
+    COUNT(DISTINCT CASE WHEN cp.title_length_category = 'Short' THEN cp.Id END) as short_title_posts,
+    AVG(cp.engagement_count) as avg_engagement,
+    MIN(cp.engagement_count) as min_engagement,
+    MAX(cp.engagement_count) as max_engagement,
+    COUNT(DISTINCT CASE WHEN cp.avg_score > 50 THEN cp.Id END) as high_avg_score_posts,
+    COUNT(DISTINCT CASE WHEN cp.avg_score <= 50 THEN cp.Id END) as low_avg_score_posts,
+    COUNT(DISTINCT CASE WHEN cp.score_rating = 'Above Average' THEN cp.Id END) as above_avg_posts,
+    COUNT(DISTINCT CASE WHEN cp.score_rating = 'Below Average' THEN cp.Id END) as below_avg_posts,
+    COUNT(DISTINCT CASE WHEN cp.score_rating = 'Average' THEN cp.Id END) as average_posts,
+    COUNT(DISTINCT CASE WHEN cu.reputation_level = 'Expert' THEN cu.Id END) as expert_users,
+    COUNT(DISTINCT CASE WHEN cu.reputation_level = 'Advanced' THEN cu.Id END) as advanced_users,
+    COUNT(DISTINCT CASE WHEN cu.reputation_level = 'Intermediate' THEN cu.Id END) as intermediate_users,
+    COUNT(DISTINCT CASE WHEN cu.reputation_level = 'Beginner' THEN cu.Id END) as beginner_users
+FROM ComplexPosts cp
+INNER JOIN TopUsers cu ON cp.OwnerUserId = cu.Id
+LEFT JOIN TagAnalysis ta ON EXISTS (
+    SELECT 1 
+    FROM unnest(string_to_array(substring(cp.Tags, 2, length(cp.Tags)-2), '><')) as tag 
+    WHERE tag = ta.TagName
+) 
+WHERE cp.CreationDate > '2020-01-01'
+  AND cu.CreationDate > '2019-01-01'
+  AND cp.Score > 0
+  AND (cp.post_status IN ('Active Question', 'Unanswered') OR cp.engagement_count > 5)
+  AND cp.tag_count > 0
+  AND cp.tag_length > 10
+  AND cu.account_age_days > 180
+  AND cu.Reputation >= 1000
+  AND EXISTS (
+    SELECT 1 
+    FROM Votes v 
+    WHERE v.PostId = cp.Id 
+      AND v.VoteTypeId IN (2, 3) -- UpMod or DownMod
+      AND v.CreationDate > '2021-01-01'
+  )
+  AND cp.OwnerUserId IN (
+    SELECT u.Id 
+    FROM Users u 
+    WHERE u.Reputation > 10000 
+      AND u.Views > 1000 
+      AND u.UpVotes > 100 
+      AND u.DownVotes <= 50
+  )
+  AND NOT EXISTS (
+    SELECT 1 
+    FROM Posts p2 
+    WHERE p2.ParentId = cp.Id 
+      AND p2.PostTypeId = 2 
+      AND p2.Score = 0 
+      AND p2.CreationDate > '2022-01-01'
+  )
+  AND cp.prev_score IS NOT NULL
+  AND ABS(cp.Score - cp.prev_score) > 10
+  AND cp.tag_count BETWEEN 1 AND 10
+  AND CASE WHEN cp.tag_length > 50 THEN TRUE ELSE FALSE END;

@@ -1,0 +1,228 @@
+WITH UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT p_ans.Id) FILTER (WHERE p_ans.PostTypeId = 2) AS TotalAnswersGiven,
+        COUNT(DISTINCT q.Id) FILTER (WHERE q.AcceptedAnswerId IN (
+            SELECT pa.Id FROM Posts pa WHERE pa.OwnerUserId = u.Id AND pa.PostTypeId = 2
+        )) AS AcceptedAnswersCount,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(b.Date) AS LastBadgeDate,
+        EXISTS (
+            SELECT 1
+            FROM Posts sq_p_ans
+            WHERE sq_p_ans.OwnerUserId = u.Id
+              AND sq_p_ans.PostTypeId = 2
+              AND sq_p_ans.ParentId IS NOT NULL
+              AND (SELECT sq_q.ViewCount FROM Posts sq_q WHERE sq_q.Id = sq_p_ans.ParentId) >= 100000
+            LIMIT 1
+        ) AS HasAnsweredPopularQuestion,
+        AVG(EXTRACT(EPOCH FROM (u.LastAccessDate - u.CreationDate)) / 86400.0)
+            OVER (PARTITION BY EXTRACT(YEAR FROM u.CreationDate)) AS AvgUserLifetimeDaysInCohort,
+        (
+            SELECT sq_c.Text
+            FROM Comments sq_c
+            WHERE sq_c.UserId = u.Id
+            ORDER BY sq_c.CreationDate DESC
+            LIMIT 1
+        ) AS LatestCommentText
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Posts p_ans ON u.Id = p_ans.OwnerUserId AND p_ans.PostTypeId = 2
+    LEFT JOIN Posts q ON q.PostTypeId = 1
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+PostDetailsExtended AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.OwnerUserId,
+        p.LastEditorUserId,
+        p.CreationDate AS PostCreationDate,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        COALESCE(p.ClosedDate, ph_closed.CreationDate) AS EffectiveClosedDate,
+        COALESCE(
+            TRIM(SUBSTRING(p.Tags FROM 2 FOR POSITION('><' IN p.Tags) - 2)),
+            'Untagged'
+        ) AS FirstTag,
+        (p.Score * 2.0 + p.ViewCount * 0.1 + COALESCE(p.FavoriteCount, 0) * 3 + COALESCE(p.AnswerCount, 0) * 5 + COALESCE(p.CommentCount, 0) * 1)
+        / NULLIF(EXTRACT(EPOCH FROM (COALESCE(p.LastActivityDate, p.CreationDate) - p.CreationDate)) / 3600.0, 0) AS EngagementRatioPerHour,
+        RANK() OVER (PARTITION BY p.PostTypeId, EXTRACT(MONTH FROM p.CreationDate) ORDER BY p.Score DESC, p.ViewCount DESC) AS RankByScoreInMonth,
+        EXISTS (
+            SELECT 1 FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3 LIMIT 1
+        ) AS HasDuplicateLinks,
+        (
+            SELECT ph_type.PostHistoryTypeId
+            FROM PostHistory ph_type
+            WHERE ph_type.PostId = p.Id
+              AND ph_type.PostHistoryTypeId NOT IN (1, 2, 3, 16)
+            GROUP BY ph_type.PostHistoryTypeId
+            ORDER BY COUNT(*) DESC, ph_type.PostHistoryTypeId DESC
+            LIMIT 1
+        ) AS MostCommonHistoryType,
+        CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN TRUE ELSE FALSE END AS IsAcceptedQuestion,
+        COALESCE(REPLACE(REPLACE(p.Title, ' ', '_'), '-', '_'), 'Untitled_Post_' || p.Id) AS CleanedTitle
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN (
+        SELECT ph.PostId, MAX(ph.CreationDate) AS CreationDate
+        FROM PostHistory ph
+        WHERE ph.PostHistoryTypeId = 10
+        GROUP BY ph.PostId
+    ) AS ph_closed ON p.Id = ph_closed.PostId
+    WHERE p.CreationDate >= DATE '2020-01-01' AND p.CreationDate < DATE '2023-01-01'
+),
+PostCommentActivity AS (
+    SELECT
+        pde.PostId,
+        AVG(c.Score) AS AvgCommentScore,
+        MAX(c.CreationDate) AS LastCommentDate,
+        COUNT(DISTINCT c.UserId) AS UniqueCommenters,
+        AVG(AVG(c.Score)) OVER (PARTITION BY pde.OwnerUserId ORDER BY pde.PostCreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativeAvgCommentScoreForOwner
+    FROM PostDetailsExtended pde
+    JOIN Comments c ON pde.PostId = c.PostId
+    GROUP BY pde.PostId, pde.OwnerUserId, pde.PostCreationDate
+),
+TagUsageStats AS (
+    SELECT
+        EXTRACT(YEAR FROM p.CreationDate) AS PostYear,
+        tag_exploded.tag AS TagName,
+        COUNT(DISTINCT p.Id) AS PostsWithTag,
+        SUM(p.Score) AS TotalTagScore,
+        AVG(p.Score) AS AvgTagScore,
+        CASE
+            WHEN COUNT(p.Id) = 0 THEN 0
+            ELSE (COUNT(DISTINCT p.Id) * 100.0) / NULLIF(SUM(COUNT(DISTINCT p.Id)) OVER (PARTITION BY EXTRACT(YEAR FROM p.CreationDate)), 0)
+        END AS TagPostsPercentageInYear,
+        RANK() OVER (PARTITION BY EXTRACT(YEAR FROM p.CreationDate) ORDER BY SUM(p.Score) DESC, COUNT(p.Id) DESC) AS TagRankByScoreInYear
+    FROM Posts p,
+         LATERAL UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><')) AS tag_exploded(tag)
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+    GROUP BY EXTRACT(YEAR FROM p.CreationDate), tag_exploded.tag
+),
+UserTopTag AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        tag_exploded.tag AS TagName,
+        AVG(p.Score) AS AvgTagScore,
+        COUNT(p.Id) AS TaggedPostsCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY AVG(p.Score) DESC, COUNT(p.Id) DESC) AS rn
+    FROM Posts p,
+         LATERAL UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><')) AS tag_exploded(tag)
+    WHERE p.PostTypeId = 1 AND p.OwnerUserId IS NOT NULL AND p.Tags IS NOT NULL
+    GROUP BY p.OwnerUserId, tag_exploded.tag
+)
+SELECT
+    'HighEngagementUser' AS ProfileType,
+    ue.UserId,
+    ue.DisplayName,
+    ue.Reputation,
+    ue.TotalPostsOwned,
+    ue.TotalAnswersGiven,
+    ue.AcceptedAnswersCount,
+    pde.PostId,
+    pde.PostTypeName,
+    pde.PostScore,
+    pde.EngagementRatioPerHour,
+    pde.RankByScoreInMonth,
+    pca.AvgCommentScore,
+    utt.TagName AS TopContributingTag,
+    utt.AvgTagScore AS TopTagAvgScore,
+    ue.GoldBadges,
+    ue.SilverBadges,
+    ue.BronzeBadges,
+    (ue.Reputation * 0.1 + ue.TotalPostsOwned * 5 + ue.AcceptedAnswersCount * 10 + ue.TotalBadges * 2 + COALESCE(pde.EngagementRatioPerHour, 0) * 100 + COALESCE(pca.AvgCommentScore, 0) * 5) AS OverallPerformanceScore,
+    COALESCE(ue.DisplayName, 'Anonymous User #' || ue.UserId) || ' (Posts: ' || ue.TotalPostsOwned || ', Badges: ' || ue.TotalBadges || ')' AS FormattedUserIdentifier,
+    CASE WHEN ue.AcceptedAnswersCount = 0 THEN NULL ELSE ue.AcceptedAnswersCount * 100.0 / NULLIF(ue.TotalAnswersGiven, 0) END AS AnswerAcceptanceRate,
+    EXTRACT(DAY FROM (ue.LastAccessDate - ue.UserCreationDate)) AS DaysActiveSinceCreation,
+    pde.FirstTag,
+    pde.HasDuplicateLinks,
+    pde.IsAcceptedQuestion,
+    pde.CleanedTitle,
+    ue.LatestCommentText
+FROM UserEngagement ue
+JOIN PostDetailsExtended pde ON ue.UserId = pde.OwnerUserId
+LEFT JOIN PostCommentActivity pca ON pde.PostId = pca.PostId
+LEFT JOIN UserTopTag utt ON ue.UserId = utt.UserId AND utt.rn = 1
+WHERE
+    ue.Reputation >= 1000
+    AND ue.TotalPostsOwned >= 5
+    AND pde.EngagementRatioPerHour IS NOT NULL
+    AND pde.PostTypeName = 'Question'
+    AND pde.HasDuplicateLinks = FALSE
+    AND ue.HasAnsweredPopularQuestion = TRUE
+    AND pde.EffectiveClosedDate IS NULL
+    AND ue.AvgUserLifetimeDaysInCohort > 30
+    AND COALESCE(utt.AvgTagScore, 0) >= 10
+    AND pde.CleanedTitle ILIKE '%sql_%query%'
+    AND NOT EXISTS (
+        SELECT 1 FROM Votes v WHERE v.UserId = ue.UserId AND v.VoteTypeId = 4
+    )
+UNION ALL
+SELECT
+    'ActiveEditor' AS ProfileType,
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    NULL AS TotalPostsOwned,
+    NULL AS TotalAnswersGiven,
+    NULL AS AcceptedAnswersCount,
+    ph.PostId,
+    pt.Name AS PostTypeName,
+    p.Score AS PostScore,
+    NULL AS EngagementRatioPerHour,
+    NULL AS RankByScoreInMonth,
+    NULL AS AvgCommentScore,
+    NULL AS TopContributingTag,
+    NULL AS TopTagAvgScore,
+    NULL AS GoldBadges,
+    NULL AS SilverBadges,
+    NULL AS BronzeBadges,
+    (u.Reputation * 0.05 + COUNT(ph.Id) * 1.5 +
+     SUM(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN 1 ELSE 0 END) * 2 +
+     SUM(CASE WHEN ph.PostHistoryTypeId IN (8,9) THEN 1 ELSE 0 END) * 3) AS OverallPerformanceScore,
+    COALESCE(u.DisplayName, 'Anonymous Editor ID:' || u.Id) || ' (Edits: ' || COUNT(ph.Id) || ')' AS FormattedUserIdentifier,
+    NULL AS AnswerAcceptanceRate,
+    EXTRACT(DAY FROM (u.LastAccessDate - u.CreationDate)) AS DaysActiveSinceCreation,
+    NULL AS FirstTag,
+    NULL AS HasDuplicateLinks,
+    NULL AS IsAcceptedQuestion,
+    COALESCE(REPLACE(REPLACE(p.Title, ' ', '_'), '-', '_'), 'Edited_Post_' || p.Id) AS CleanedTitle,
+    NULL AS LatestCommentText
+FROM Users u
+JOIN PostHistory ph ON u.Id = ph.UserId
+JOIN Posts p ON ph.PostId = p.Id
+JOIN PostTypes pt ON p.PostTypeId = pt.Id
+WHERE
+    ph.PostHistoryTypeId IN (4, 5, 6, 8, 9, 10, 11)
+    AND u.Reputation >= 500
+    AND ph.CreationDate >= DATE '2022-01-01'
+    AND NOT EXISTS (
+        SELECT 1 FROM PostHistory sq_ph_q JOIN Posts sq_p_q ON sq_ph_q.PostId = sq_p_q.Id
+        WHERE sq_ph_q.UserId = u.Id AND sq_p_q.PostTypeId = 1 AND sq_ph_q.PostHistoryTypeId IN (4,5,6)
+    )
+GROUP BY
+    u.Id, u.DisplayName, u.Reputation, ph.PostId, pt.Name, p.Score, u.CreationDate, u.LastAccessDate, p.Title
+HAVING
+    COUNT(ph.Id) >= 5
+    AND SUM(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN 1 ELSE 0 END) >= 1
+ORDER BY
+    OverallPerformanceScore DESC, Reputation DESC
+LIMIT 500;

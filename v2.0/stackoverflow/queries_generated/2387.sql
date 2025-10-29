@@ -1,0 +1,119 @@
+-- {"query": "2387.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1267} 
+WITH RecursiveTagHierarchy AS (
+    SELECT t.Id, t.TagName, t.Count, t.WikiPostId, 0 AS Level
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0 AND t.Count > 1000
+
+    UNION ALL
+
+    SELECT ct.Id, ct.TagName, ct.Count, ct.WikiPostId, rh.Level + 1
+    FROM Tags ct
+    JOIN RecursiveTagHierarchy rh ON ct.WikiPostId = rh.Id
+    WHERE ct.IsModeratorOnly = 0 AND ct.Count > 1000
+), UserPostStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COALESCE(SUM(p.Score),0) AS TotalScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        AVG(COALESCE(p.Score,0)) FILTER (WHERE p.PostTypeId IN (1,2)) OVER (PARTITION BY u.Id) AS AvgPostScore
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+), BadgeRanking AS (
+    SELECT
+        b.UserId,
+        b.Class,
+        COUNT(*) AS BadgeCount,
+        RANK() OVER (PARTITION BY b.Class ORDER BY COUNT(*) DESC) AS RankInClass
+    FROM Badges b
+    GROUP BY b.UserId, b.Class
+), PostLinksWithTitles AS (
+    SELECT pl.Id, pl.CreationDate, pl.PostId, pl.RelatedPostId, pl.LinkTypeId,
+           p1.Title AS PostTitle,
+           p2.Title AS RelatedPostTitle
+    FROM PostLinks pl
+    LEFT JOIN Posts p1 ON pl.PostId = p1.Id
+    LEFT JOIN Posts p2 ON pl.RelatedPostId = p2.Id
+), ComplexPosts AS (
+    SELECT
+        p.Id, p.PostTypeId, p.Title, p.Tags, p.Score, p.ViewCount, p.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS RN,
+        STRING_AGG(DISTINCT ph.Comment, ' | ') AS CloseReasons,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL THEN TRUE
+            ELSE FALSE
+        END AS IsClosed,
+        NULLIF(p.Tags, '') IS NOT NULL AND POSITION('<sql>' IN p.Tags) > 0 AS HasSQLTag
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+    GROUP BY p.Id, p.PostTypeId, p.Title, p.Tags, p.Score, p.ViewCount, p.CreationDate, p.ClosedDate
+), HighValueVotes AS (
+    SELECT
+        v.PostId,
+        COUNT(CASE WHEN vt.Name = 'UpMod' THEN 1 END) AS UpVotes,
+        COUNT(CASE WHEN vt.Name = 'DownMod' THEN 1 END) AS DownVotes,
+        SUM(CASE WHEN vt.Name = 'BountyStart' THEN COALESCE(v.BountyAmount,0) ELSE 0 END) AS TotalBounty
+    FROM Votes v
+    JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    GROUP BY v.PostId
+), TagUsageWithQuestions AS (
+    SELECT
+        rh.TagName,
+        rh.Count AS TotalTagCount,
+        COUNT(DISTINCT p.Id) AS QuestionCountWithTag,
+        AVG(p.Score) AS AvgScoreForTagQuestions
+    FROM RecursiveTagHierarchy rh
+    LEFT JOIN Posts p ON p.PostTypeId = 1 AND p.Tags LIKE '%' || CONCAT('<', rh.TagName, '>') || '%'
+    GROUP BY rh.TagName, rh.Count
+), TopActiveUsers AS (
+    SELECT
+        u.Id, u.DisplayName, COUNT(p.Id) AS ActivityCount,
+        ROW_NUMBER() OVER (ORDER BY COUNT(p.Id) DESC) AS ActivityRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.CreationDate >= NOW() - INTERVAL '30 days'
+    GROUP BY u.Id, u.DisplayName
+    HAVING COUNT(p.Id) > 10
+)
+SELECT
+    u.UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.QuestionCount,
+    u.AnswerCount,
+    u.TotalScore,
+    b.Class AS BadgeClass,
+    b.BadgeCount,
+    b.RankInClass,
+    h.UpVotes,
+    h.DownVotes,
+    h.TotalBounty,
+    cp.Title AS TopQuestionTitle,
+    cp.Score AS TopQuestionScore,
+    cp.ViewCount AS TopQuestionViews,
+    tu.TagName AS PopularTag,
+    tu.QuestionCountWithTag,
+    tu.AvgScoreForTagQuestions,
+    ta.ActivityCount AS RecentPostsLast30Days
+FROM UserPostStats u
+LEFT JOIN BadgeRanking b ON b.UserId = u.UserId AND b.RankInClass = 1
+LEFT JOIN HighValueVotes h ON h.PostId = (
+    SELECT p.Id FROM Posts p
+    WHERE p.OwnerUserId = u.UserId AND p.PostTypeId = 1
+    ORDER BY p.Score DESC, p.ViewCount DESC
+    LIMIT 1
+)
+LEFT JOIN ComplexPosts cp ON cp.OwnerUserId = u.UserId AND cp.RN = 1
+LEFT JOIN LATERAL (
+    SELECT TagName, QuestionCountWithTag, AvgScoreForTagQuestions
+    FROM TagUsageWithQuestions
+    ORDER BY QuestionCountWithTag DESC
+    LIMIT 1
+) tu ON TRUE
+LEFT JOIN TopActiveUsers ta ON ta.Id = u.UserId
+WHERE u.Reputation > 1000
+ORDER BY u.TotalScore DESC NULLS LAST
+LIMIT 50;

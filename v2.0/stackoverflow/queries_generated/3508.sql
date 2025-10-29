@@ -1,0 +1,156 @@
+-- {"query": "3508.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2106} 
+
+WITH 
+/* ------------------------------------------------------------------
+   1. Top tags by global usage (excluding moderator‑only tags)
+------------------------------------------------------------------- */
+TopTags AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS rn
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0
+),
+
+/* ------------------------------------------------------------------
+   2. Aggregated user scores (post scores + vote adjustments)
+------------------------------------------------------------------- */
+UserScores AS (
+    SELECT 
+        u.Id                     AS UserId,
+        u.DisplayName,
+        COALESCE(SUM(p.Score),0) +
+        COALESCE(SUM(
+            CASE 
+                WHEN v.VoteTypeId = 2 THEN 1      -- UpMod
+                WHEN v.VoteTypeId = 3 THEN -1     -- DownMod
+                ELSE 0
+            END),0)               AS TotalScore
+    FROM Users u
+    LEFT JOIN Posts p   ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v   ON v.PostId = p.Id
+    GROUP BY u.Id, u.DisplayName
+),
+
+/* ------------------------------------------------------------------
+   3. Question‑level metrics, including answer counts & latest answer
+------------------------------------------------------------------- */
+QuestionMetrics AS (
+    SELECT 
+        q.Id                                   AS QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score                                 AS QScore,
+        q.ViewCount,
+        q.FavoriteCount,
+        q.Tags,
+        q.OwnerUserId,
+        /* answer count for the question */
+        (SELECT COUNT(*) 
+         FROM Posts a 
+         WHERE a.ParentId = q.Id AND a.PostTypeId = 2) AS AnswerCount,
+        /* newest answer date (may be NULL) */
+        (SELECT MAX(a.CreationDate) 
+         FROM Posts a 
+         WHERE a.ParentId = q.Id AND a.PostTypeId = 2) AS LastAnswerDate,
+        ROW_NUMBER() OVER (PARTITION BY q.OwnerUserId 
+                           ORDER BY q.Score DESC, q.CreationDate DESC) AS RankByOwner
+    FROM Posts q
+    WHERE q.PostTypeId = 1                         -- only questions
+),
+
+/* ------------------------------------------------------------------
+   4. Most recent close‑reason per post (if any)
+------------------------------------------------------------------- */
+RecentCloseReasons AS (
+    SELECT 
+        ph.PostId,
+        TRY_CAST(ph.Comment AS SMALLINT)        AS CloseReasonId,
+        ph.CreationDate                         AS CloseDate,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId 
+                           ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10               -- Post Closed
+),
+
+/* ------------------------------------------------------------------
+   5. Explode the tag list of each question (Post.Tags is “<tag1><tag2>…”) 
+------------------------------------------------------------------- */
+ExplodedTags AS (
+    SELECT 
+        qm.QuestionId,
+        TRIM(BOTH '<>' FROM 
+            SPLIT_PART(qm.Tags, '><', gs.n))    AS TagName
+    FROM QuestionMetrics qm
+    CROSS JOIN LATERAL GENERATE_SERIES(1, 
+        COALESCE(NULLIF(REGEXP_COUNT(qm.Tags, '><'),0),1)+1) AS gs(n)
+    WHERE qm.Tags IS NOT NULL
+),
+
+/* ------------------------------------------------------------------
+   6. Combine everything into one wide fact set
+------------------------------------------------------------------- */
+Aggregated AS (
+    SELECT 
+        qm.QuestionId,
+        qm.Title,
+        qm.CreationDate,
+        qm.QScore,
+        qm.ViewCount,
+        qm.FavoriteCount,
+        qm.Tags,
+        qm.AnswerCount,
+        qm.LastAnswerDate,
+        qm.RankByOwner,
+        us.TotalScore,
+        us.DisplayName,
+        rcr.CloseReasonId,
+        rcr.CloseDate,
+        et.TagName,
+        tt.Count                              AS TagGlobalCount,
+        ROW_NUMBER() OVER (ORDER BY qm.QScore DESC, qm.ViewCount DESC) AS OverallRank
+    FROM QuestionMetrics qm
+    LEFT JOIN UserScores us
+           ON us.UserId = qm.OwnerUserId
+    LEFT JOIN RecentCloseReasons rcr
+           ON rcr.PostId = qm.QuestionId AND rcr.rn = 1
+    LEFT JOIN ExplodedTags et
+           ON et.QuestionId = qm.QuestionId
+    LEFT JOIN TopTags tt
+           ON tt.TagName = et.TagName
+)
+
+/* ------------------------------------------------------------------
+   Final result set: top‑100 ranked questions with rich filters,
+   plus a dummy row when the set is empty (tests UNION ALL cost)
+------------------------------------------------------------------- */
+SELECT 
+    a.QuestionId,
+    a.Title,
+    a.CreationDate,
+    a.QScore,
+    a.ViewCount,
+    a.FavoriteCount,
+    a.Tags,
+    a.AnswerCount,
+    a.LastAnswerDate,
+    a.TotalScore,
+    a.DisplayName,
+    a.CloseReasonId,
+    a.CloseDate,
+    a.TagName,
+    a.TagGlobalCount,
+    a.OverallRank
+FROM Aggregated a
+WHERE a.OverallRank <= 100
+  AND (a.TagGlobalCount IS NULL OR a.TagGlobalCount > 20)
+  AND (a.CloseReasonId IS NULL OR a.CloseReasonId NOT IN (1,2,3,101,102))
+ORDER BY a.OverallRank, a.TagGlobalCount DESC
+
+UNION ALL
+
+SELECT 
+    NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,
+    NULL,NULL,NULL,NULL,NULL,NULL
+WHERE NOT EXISTS (SELECT 1 FROM Aggregated);

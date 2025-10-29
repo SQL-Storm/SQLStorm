@@ -1,0 +1,198 @@
+-- {"query": "3282.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1930} 
+
+/*  Performance‑benchmarking query mixing CTEs, window functions, outer joins,
+    correlated subqueries, set operators, string handling and NULL logic */
+WITH
+/* 1️⃣  Users with high reputation and their badge summary */
+TopUsers AS (
+    SELECT 
+        u.Id                               AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(b.Id)                        AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(u.CreationDate)               AS FirstSeen
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Reputation > 20000
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(b.Id) >= 10
+),
+
+/* 2️⃣  Recent questions (last 30 days) exploded into individual tags */
+ExplodedTags AS (
+    SELECT
+        p.Id                                   AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS TagName
+    FROM Posts p
+    WHERE p.PostTypeId = 1               -- only questions
+      AND p.CreationDate >= now() - interval '30 days'
+),
+
+/* 3️⃣  Tag‑level statistics for the past month */
+TagPostStats AS (
+    SELECT
+        et.TagName,
+        COUNT(*)                                      AS QuestionCount,
+        AVG(et.Score)                                 AS AvgScore,
+        MAX(et.Score)                                 AS MaxScore,
+        MIN(et.CreationDate)                          AS FirstQuestionDate,
+        MAX(et.CreationDate)                          AS LastQuestionDate,
+        ROW_NUMBER() OVER (PARTITION BY et.TagName ORDER BY AVG(et.Score) DESC) AS RankByAvgScore
+    FROM ExplodedTags et
+    GROUP BY et.TagName
+),
+
+/* 4️⃣  Per‑user post aggregation with a correlated subquery for comment count */
+UserPostAgg AS (
+    SELECT
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.BadgeCount,
+        tu.GoldBadges,
+        tu.SilverBadges,
+        tu.BronzeBadges,
+        COUNT(p.Id)                                    AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsAsked,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersGiven,
+        COALESCE(SUM(p.Score),0)                       AS NetScore,
+        AVG(p.ViewCount)                               AS AvgViews,
+        MAX(p.CreationDate)                            AS LastActivity,
+        /* correlated subquery: total comments on all posts of the user */
+        (SELECT COUNT(*) 
+         FROM Comments c 
+         WHERE c.UserId = tu.UserId)                  AS TotalCommentsMade,
+        /* correlated subquery: average answer score for answers authored */
+        (SELECT AVG(a.Score) 
+         FROM Posts a 
+         WHERE a.OwnerUserId = tu.UserId 
+           AND a.PostTypeId = 2)                      AS AvgAnswerScore
+    FROM TopUsers tu
+    LEFT JOIN Posts p ON p.OwnerUserId = tu.UserId
+    GROUP BY
+        tu.UserId, tu.DisplayName, tu.Reputation,
+        tu.BadgeCount, tu.GoldBadges, tu.SilverBadges, tu.BronzeBadges
+),
+
+/* 5️⃣  Recent votes per post, separating up‑votes and down‑votes */
+PostVoteSummary AS (
+    SELECT
+        v.PostId,
+        SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END)    AS UpVotes,
+        SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END)    AS DownVotes,
+        COUNT(*)                                      AS TotalVotes
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE v.CreationDate >= now() - interval '30 days'
+      AND vt.Id IN (2,3)          -- only UpMod and DownMod
+    GROUP BY v.PostId
+)
+
+/* ──────────────────────────────────────────────────────────────────────── */
+/* Final result set combines user aggregates, tag stats and post‑vote info   */
+/* using UNION ALL to stress set operators and outer joins.                */
+SELECT
+    upa.UserId,
+    upa.DisplayName,
+    upa.Reputation,
+    upa.BadgeCount,
+    upa.GoldBadges,
+    upa.SilverBadges,
+    upa.BronzeBadges,
+    upa.TotalPosts,
+    upa.QuestionsAsked,
+    upa.AnswersGiven,
+    upa.NetScore,
+    upa.AvgViews,
+    upa.LastActivity,
+    upa.TotalCommentsMade,
+    upa.AvgAnswerScore,
+    NULL::varchar(35)                               AS TagName,
+    NULL::int                                      AS QuestionCount,
+    NULL::numeric                                  AS AvgScore,
+    NULL::int                                      AS MaxScore,
+    NULL::timestamp                                AS TagFirstSeen,
+    NULL::timestamp                                AS TagLastSeen,
+    NULL::int                                      AS TagRankByAvgScore,
+    NULL::int                                      AS PostId,
+    NULL::int                                      AS UpVotes,
+    NULL::int                                      AS DownVotes,
+    NULL::int                                      AS TotalVotes
+FROM UserPostAgg upa
+
+UNION ALL
+
+SELECT
+    NULL::int,
+    NULL::varchar(40),
+    NULL::int,
+    NULL::int,
+    NULL::int,
+    NULL::int,
+    NULL::int,
+    NULL::int,
+    NULL::int,
+    NULL::int,
+    NULL::int,
+    NULL::numeric,
+    NULL::timestamp,
+    NULL::int,
+    NULL::numeric,
+    tps.TagName,
+    tps.QuestionCount,
+    tps.AvgScore,
+    tps.MaxScore,
+    tps.FirstQuestionDate,
+    tps.LastQuestionDate,
+    tps.RankByAvgScore,
+    NULL::int,
+    NULL::int,
+    NULL::int,
+    NULL::int
+FROM TagPostStats tps
+WHERE tps.RankByAvgScore <= 10          -- top‑10 tags by avg score
+
+UNION ALL
+
+SELECT
+    NULL::int,
+    NULL::varchar(40),
+    NULL::int,
+    NULL::int,
+    NULL::int,
+    NULL::int,
+    NULL::int,
+    NULL::int,
+    NULL::int,
+    NULL::int,
+    NULL::int,
+    NULL::numeric,
+    NULL::timestamp,
+    NULL::int,
+    NULL::numeric,
+    NULL::varchar(35),
+    NULL::int,
+    NULL::numeric,
+    NULL::int,
+    NULL::timestamp,
+    NULL::timestamp,
+    NULL::int,
+    pvs.PostId,
+    pvs.UpVotes,
+    pvs.DownVotes,
+    pvs.TotalVotes
+FROM PostVoteSummary pvs
+WHERE pvs.TotalVotes > 100
+ORDER BY
+    /* keep ordering deterministic across the UNION ALL */
+    COALESCE(UserId, 0) DESC,
+    COALESCE(TagName, '') ASC,
+    COALESCE(PostId, 0) DESC;

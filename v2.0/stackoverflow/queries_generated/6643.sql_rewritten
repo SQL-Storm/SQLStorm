@@ -1,0 +1,34 @@
+-- {"query": "6643.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-micro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 355} 
+SELECT 
+    u.DisplayName, 
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE NULL END) AS TotalQuestions,
+    COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE NULL END) AS TotalAnswers,
+    COUNT(DISTINCT b.Id) AS TotalBadges,
+    SUM(CASE WHEN p.Score > 0 THEN 1 ELSE 0 END) AS PositiveScorePosts,
+    MAX(p.Score) AS HighestScore,
+    MIN(p.Score) AS LowestScore,
+    STRING_AGG(DISTINCT p.Tags, ',') AS TagList,
+    MAX(p.LastActivityDate) AS LastActivityDate,
+    AVG(p.ViewCount) AS AvgViewCount
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    (SELECT ph.PostId, ph.RevisionGUID, ph.CreationDate 
+     FROM PostHistory ph 
+     WHERE ph.PostHistoryTypeId IN (1, 2, 5, 6)) AS ph ON p.Id = ph.PostId
+WHERE 
+    u.Reputation > 100 
+    AND p.CreationDate >= DATEADD(year, -1, cast('2024-10-01 12:34:56' as timestamp))
+GROUP BY 
+    u.DisplayName, u.Reputation
+HAVING 
+    AVG(p.Score) > 0 
+ORDER BY 
+    TotalPosts DESC, 
+    HighestScore DESC;

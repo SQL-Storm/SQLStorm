@@ -1,0 +1,208 @@
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        array[t.TagName] as TagPath,
+        t.Count,
+        1 as Level
+    from Tags t
+    where t.IsModeratorOnly = false
+
+    union all
+
+    select
+        t2.Id,
+        t2.TagName,
+        r.TagPath || t2.TagName,
+        t2.Count,
+        r.Level + 1
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.ExcerptPostId = r.Id
+    where r.Level < 3
+),
+RecentUserActivity as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as RecentQuestions,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as RecentAnswers,
+        coalesce(sum(vb.UpVotes),0) as RecentUpVotes,
+        coalesce(sum(vd.DownVotes),0) as RecentDownVotes,
+        rank() over (order by u.Reputation desc nulls last) as ReputationRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.CreationDate > cast('2024-10-01' as date) - interval '180 days'
+    left join lateral (
+        select count(*) as UpVotes 
+        from Votes v 
+        where v.PostId in (select Id from Posts where OwnerUserId = u.Id) and v.VoteTypeId = 2 and v.CreationDate > cast('2024-10-01' as date) - interval '180 days'
+    ) vb on true
+    left join lateral (
+        select count(*) as DownVotes 
+        from Votes v 
+        where v.PostId in (select Id from Posts where OwnerUserId = u.Id) and v.VoteTypeId = 3 and v.CreationDate > cast('2024-10-01' as date) - interval '180 days'
+    ) vd on true
+    group by u.Id, u.DisplayName, u.Reputation
+),
+TopQuestionsWithTags as (
+    select 
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        array_agg(distinct substring(t.TagName from 1 for 20)) as TagsTop20,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc) as rn
+    from Posts p
+    left join lateral (
+        select unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) as TagName
+    ) t on true
+    where p.PostTypeId = 1
+    group by p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.OwnerUserId
+),
+FilteredQuestions as (
+    select * from TopQuestionsWithTags where rn <= 3
+),
+AnswerComplexity as (
+    select 
+        a.Id,
+        a.ParentId as QuestionId,
+        a.Score,
+        length(a.Body) as BodyLength,
+        (select count(*) from Comments c where c.PostId = a.Id) as CommentsCount,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts a
+    where a.PostTypeId = 2 
+),
+AnswersWithUser as (
+    select 
+        ac.*,
+        u.DisplayName as AnswerUserName,
+        u.Reputation as AnswerUserRep
+    from AnswerComplexity ac
+    left join Users u on u.Id = ac.Id
+),
+QuestionAnswerSummary as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.CreationDate as QuestionDate,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        coalesce(count(a.Id),0) as AnswerCount,
+        coalesce(max(a.Score),0) as MaxAnswerScore,
+        coalesce(avg(a.BodyLength),0) as AvgAnswerLength,
+        coalesce(sum(a.CommentsCount),0) as TotalAnswerComments
+    from FilteredQuestions q
+    left join AnswerComplexity a on a.QuestionId = q.Id
+    group by q.Id, q.Title, q.OwnerUserId, q.CreationDate, q.Score, q.ViewCount
+),
+UserBadgeStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        count(b.Id) as TotalBadges,
+        bool_or(b.TagBased) as HasTagBasedBadge
+    from Users u 
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+CloseReasonTop as (
+    select
+        cht.Id,
+        cht.Name
+    from CloseReasonTypes cht
+    where cht.Id in (
+        select distinct cast(ph.Comment as int) 
+        from PostHistory ph 
+        where ph.PostHistoryTypeId = 10 and ph.Comment ~ '^\d+$'
+    )
+),
+ClosedQuestionsWithReason as (
+    select
+        p.Id,
+        p.Title,
+        ph.Comment as CloseReasonId,
+        crt.Name as CloseReasonName,
+        p.ClosedDate
+    from Posts p
+    join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 10
+    left join CloseReasonTop crt on cast(crt.Id as text) = ph.Comment
+    where p.ClosedDate is not null and p.PostTypeId = 1
+),
+CombinedQuestionInfo as (
+    select 
+        qas.QuestionId,
+        qas.Title,
+        u.DisplayName as QuestionOwner,
+        u.Reputation as OwnerReputation,
+        qas.QuestionDate,
+        qas.QuestionScore,
+        qas.ViewCount,
+        qas.AnswerCount,
+        qas.MaxAnswerScore,
+        qas.AvgAnswerLength,
+        qas.TotalAnswerComments,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        cr.CloseReasonName
+    from QuestionAnswerSummary qas
+    join Users u on u.Id = qas.OwnerUserId
+    left join UserBadgeStats ub on ub.UserId = qas.OwnerUserId
+    left join ClosedQuestionsWithReason cr on cr.Id = qas.QuestionId
+)
+select 
+    cqi.QuestionId,
+    cqi.Title,
+    cqi.QuestionOwner,
+    cqi.OwnerReputation,
+    cqi.QuestionDate,
+    cqi.QuestionScore,
+    cqi.ViewCount,
+    cqi.AnswerCount,
+    cqi.MaxAnswerScore,
+    cqi.AvgAnswerLength,
+    cqi.TotalAnswerComments,
+    cqi.GoldBadges,
+    cqi.SilverBadges,
+    cqi.BronzeBadges,
+    cqi.CloseReasonName,
+    array_to_string(rt.TagPath, ' > ') as SampleTagHierarchyPath,
+    case when cqi.CloseReasonName is null then 'Open' else 'Closed' end as QuestionStatus,
+    dense_rank() over (partition by case when cqi.CloseReasonName is null then 'Open' else 'Closed' end order by cqi.ViewCount desc) as ViewRankWithinStatus,
+    first_value(RecentUserActivity.DisplayName) over (partition by (cqi.OwnerReputation > 5000) order by cqi.QuestionScore desc) as TopContributorInRepGroup
+from CombinedQuestionInfo cqi
+left join RecursiveTagHierarchy rt on rt.Id = (
+    select ExcerptPostId from Tags 
+    where TagName = (
+        select unnest(string_to_array(substring(cqi.Title, 1, 50), ' ')) limit 1
+    )
+    limit 1
+)
+left join RecentUserActivity on RecentUserActivity.UserId = cqi.QuestionOwner
+where cqi.QuestionDate > cast('2024-10-01' as date) - interval '1 year' and (cqi.AnswerCount > 0 or cqi.CloseReasonName is not null)
+group by
+    cqi.QuestionId,
+    cqi.Title,
+    cqi.QuestionOwner,
+    cqi.OwnerReputation,
+    cqi.QuestionDate,
+    cqi.QuestionScore,
+    cqi.ViewCount,
+    cqi.AnswerCount,
+    cqi.MaxAnswerScore,
+    cqi.AvgAnswerLength,
+    cqi.TotalAnswerComments,
+    cqi.GoldBadges,
+    cqi.SilverBadges,
+    cqi.BronzeBadges,
+    cqi.CloseReasonName,
+    array_to_string(rt.TagPath, ' > ')
+order by cqi.QuestionScore desc nulls last, cqi.ViewCount desc
+limit 100;

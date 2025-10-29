@@ -1,0 +1,92 @@
+-- {"query": "4424.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 750} 
+WITH
+  RankedPostHistory AS (
+    SELECT
+      PostId,
+      PostHistoryTypeId,
+      UserId,
+      CreationDate,
+      ROW_NUMBER() OVER (PARTITION BY PostId, PostHistoryTypeId ORDER BY CreationDate DESC) as rn
+    FROM PostHistory
+    WHERE
+      PostHistoryTypeId IN (4, 5) AND UserId IS NOT NULL
+  ),
+  LatestEdits AS (
+    SELECT
+      rph.PostId,
+      u.DisplayName AS LastEditorDisplayName,
+      rph.CreationDate AS LastEditDate,
+      p.Title AS OriginalTitle,
+      p.Tags AS OriginalTags,
+      CASE WHEN p.PostTypeId = 1 THEN COALESCE(p.AnswerCount, 0) ELSE 0 END AS AnswerCount
+    FROM RankedPostHistory AS rph
+    JOIN Users AS u
+      ON rph.UserId = u.Id
+    JOIN Posts AS p
+      ON rph.PostId = p.Id
+    WHERE
+      rph.rn = 1
+  ),
+  UserPostStats AS (
+    SELECT
+      p.OwnerUserId,
+      COUNT(p.Id) AS TotalPosts,
+      SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+      AVG(p.Score) AS AvgScore
+    FROM Posts AS p
+    WHERE
+      p.OwnerUserId IS NOT NULL
+    GROUP BY
+      p.OwnerUserId
+  )
+SELECT
+  COALESCE(le.LastEditorDisplayName, 'Community') AS EditorName,
+  le.LastEditDate,
+  le.OriginalTitle,
+  SUBSTRING(le.OriginalTags FROM 2 FOR LENGTH(le.OriginalTags) - 2) AS CleanTags,
+  le.AnswerCount,
+  CASE
+    WHEN ups.TotalPosts IS NULL THEN 0
+    ELSE ups.TotalPosts
+  END AS EditorTotalPosts,
+  CASE
+    WHEN ups.QuestionCount IS NULL THEN 0
+    ELSE ups.QuestionCount
+  END AS EditorQuestionCount,
+  CASE
+    WHEN ups.AvgScore IS NULL THEN 0.0
+    ELSE ROUND(ups.AvgScore, 2)
+  END AS EditorAvgScore,
+  COUNT(c.Id) AS CommentCountOnEditedPost
+FROM LatestEdits AS le
+LEFT JOIN UserPostStats AS ups
+  ON le.LastEditorDisplayName = (
+    SELECT
+      DisplayName
+    FROM Users
+    WHERE
+      Id = (
+        SELECT
+          UserId
+        FROM PostHistory
+        WHERE
+          PostId = le.PostId AND PostHistoryTypeId = (SELECT Id FROM PostHistoryTypes WHERE Name = 'Edit Body') AND CreationDate = le.LastEditDate
+      )
+  )
+LEFT JOIN Comments AS c
+  ON le.PostId = c.PostId
+GROUP BY
+  le.LastEditorDisplayName,
+  le.LastEditDate,
+  le.OriginalTitle,
+  CleanTags,
+  le.AnswerCount,
+  ups.TotalPosts,
+  ups.QuestionCount,
+  ups.AvgScore
+HAVING
+  COUNT(c.Id) > 5
+ORDER BY
+  le.LastEditDate DESC
+LIMIT 100;

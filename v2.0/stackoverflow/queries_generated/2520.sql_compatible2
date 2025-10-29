@@ -1,0 +1,153 @@
+with RecursiveTagCounts as (
+    select
+        t.Id,
+        t.TagName,
+        coalesce(t.Count,0) as TagCount,
+        p.Id as QuestionId,
+        row_number() over (partition by t.Id order by p.Score desc nulls last, p.ViewCount desc nulls last) as rn
+    from Tags t
+    join Posts p on p.PostTypeId = 1 and p.Tags like concat('%<', t.TagName, '>%')
+    where t.IsModeratorOnly = false
+), TopTagQuestions as (
+    select
+        rtc.Id as TagId,
+        rtc.TagName,
+        rtc.QuestionId
+    from RecursiveTagCounts rtc
+    where rtc.rn <= 5
+), UserBadgesCount as (
+    select
+        b.UserId,
+        count(*) as BadgeCountGold,
+        sum(case when b.Class = 1 then 1 else 0 end) as Gold,
+        sum(case when b.Class = 2 then 1 else 0 end) as Silver,
+        sum(case when b.Class = 3 then 1 else 0 end) as Bronze
+    from Badges b
+    group by b.UserId
+), PostOwnerStats as (
+    select
+        p.Id as PostId,
+        p.OwnerUserId,
+        u.Reputation,
+        u.DisplayName,
+        ub.BadgeCountGold,
+        p.Score,
+        p.ViewCount,
+        case when p.ClosedDate is not null then 1 else 0 end as IsClosed,
+        p.CreationDate,
+        p.Tags,
+        p.PostTypeId
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    left join UserBadgesCount ub on ub.UserId = p.OwnerUserId
+    where p.PostTypeId in (1,2)
+), LatestCommentHolders as (
+    select
+        c.PostId,
+        c.Id as CommentId,
+        c.UserId as CommentUserId,
+        c.UserDisplayName,
+        c.CreationDate,
+        row_number() over (partition by c.PostId order by c.CreationDate desc nulls last) as rn
+    from Comments c
+), PostScoresAndVotes as (
+    select
+        p.Id as PostId,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+        sum(case when v.VoteTypeId = 1 then 1 else 0 end) as AcceptedByOriginatorVotes
+    from Posts p
+    left join Votes v on v.PostId = p.Id
+    group by p.Id
+), DuplicateLinkCounts as (
+    select
+        pl.PostId,
+        count(case when pl.LinkTypeId = 3 then 1 end) as DuplicateCount
+    from PostLinks pl
+    group by pl.PostId
+), PostHistoryCloseReasons as (
+    select
+        ph.PostId,
+        max(case when ph.PostHistoryTypeId = 10 then cast(ph.Comment as integer) else null end) as CloseReasonId
+    from PostHistory ph
+    group by ph.PostId
+)
+select distinct 
+    pos.PostId,
+    pos.OwnerUserId,
+    pos.DisplayName as OwnerDisplayName,
+    pos.Reputation,
+    pos.BadgeCountGold,
+    pos.Score,
+    pos.ViewCount,
+    pos.IsClosed,
+    pos.CreationDate,
+    pos.PostTypeId,
+    pos.Tags,
+    dlc.DuplicateCount,
+    phcr.CloseReasonId,
+    psa.UpVotes,
+    psa.DownVotes,
+    psa.AcceptedByOriginatorVotes,
+    latestc.CommentId as LastCommentId,
+    latestc.UserDisplayName as LastCommentUser,
+    latestc.CreationDate as LastCommentDate,
+    array_agg(distinct ttq.TagName) filter (where ttq.TagName is not null) as TopTagsLinked,
+    row_number() over (
+        partition by pos.PostTypeId 
+        order by pos.Score desc nulls last, pos.ViewCount desc nulls last
+    ) as RankWithinPostType
+from PostOwnerStats pos
+left join DuplicateLinkCounts dlc on dlc.PostId = pos.PostId
+left join PostHistoryCloseReasons phcr on phcr.PostId = pos.PostId
+left join PostScoresAndVotes psa on psa.PostId = pos.PostId
+left join LatestCommentHolders latestc on latestc.PostId = pos.PostId and latestc.rn = 1
+left join TopTagQuestions ttq on ttq.QuestionId = pos.PostId
+where 
+    (
+        (pos.Tags is not null and lower(pos.Tags) like '%<sql>%') 
+        or (pos.Tags is not null and lower(pos.Tags) like '%<performance>%')
+        or (pos.Tags is null and pos.PostTypeId = 2)
+    )
+    and (
+        pos.Reputation > (select avg(Reputation) from Users) * 0.75 
+        or (pos.BadgeCountGold is not null and pos.BadgeCountGold > 2)
+        or pos.IsClosed = 0
+    )
+    and pos.Score > -5
+group by 
+    pos.PostId, pos.OwnerUserId, pos.DisplayName, pos.Reputation, pos.BadgeCountGold, pos.Score, pos.ViewCount, pos.IsClosed, pos.CreationDate, pos.PostTypeId, pos.Tags, dlc.DuplicateCount,
+    phcr.CloseReasonId,
+    psa.UpVotes, psa.DownVotes, psa.AcceptedByOriginatorVotes,
+    latestc.CommentId, latestc.UserDisplayName, latestc.CreationDate
+union
+select
+    p.Id as PostId,
+    u.Id as OwnerUserId,
+    u.DisplayName,
+    u.Reputation,
+    0 as BadgeCountGold,
+    p.Score,
+    p.ViewCount,
+    0 as IsClosed,
+    p.CreationDate,
+    p.PostTypeId,
+    p.Tags,
+    0 as DuplicateCount,
+    null as CloseReasonId,
+    0 as UpVotes,
+    0 as DownVotes,
+    0 as AcceptedByOriginatorVotes,
+    null as LastCommentId,
+    null as LastCommentUser,
+    null as LastCommentDate,
+    cast(array[] as varchar[]) as TopTagsLinked,
+    row_number() over (partition by p.PostTypeId order by p.Score desc nulls last, p.ViewCount desc nulls last) as RankWithinPostType
+from Posts p
+join Users u on u.Id = p.OwnerUserId
+where p.PostTypeId = 1 
+  and not exists (
+    select 1 from Comments c where c.PostId = p.Id
+) 
+order by RankWithinPostType, PostId
+limit 100;

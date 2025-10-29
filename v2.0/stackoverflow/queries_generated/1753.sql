@@ -1,0 +1,213 @@
+-- {"query": "1753.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3283} 
+
+WITH UsersWithSelfEdits AS (
+    SELECT DISTINCT UserId
+    FROM PostHistory
+    WHERE PostHistoryTypeId IN (4, 5, 6) AND UserId IS NOT NULL
+),
+UsersWithOtherComments AS (
+    SELECT DISTINCT C.UserId
+    FROM Comments C
+    JOIN Posts P ON C.PostId = P.Id
+    WHERE C.UserId IS NOT NULL AND C.UserId <> P.OwnerUserId -- Commented on others' posts
+),
+UsersWhoEditButDontCommentOtherPosts AS (
+    SELECT UserId FROM UsersWithSelfEdits
+    EXCEPT
+    SELECT UserId FROM UsersWithOtherComments
+),
+UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS AnswerCount,
+        SUM(P.Score) AS TotalPostScore,
+        SUM(P.ViewCount) AS TotalPostViewCount,
+        COUNT(DISTINCT C.Id) AS TotalCommentCount,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesGiven,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesGiven,
+        SUM(CASE WHEN V.VoteTypeId = 1 THEN 1 ELSE 0 END) AS TotalAcceptedAnswersGiven,
+        MAX(P.LastActivityDate) AS LastPostActivityDate,
+        MIN(P.CreationDate) AS FirstPostDate
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Votes V ON U.Id = V.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate
+),
+PostHistoryEngagement AS (
+    SELECT
+        PH.PostId,
+        COUNT(PH.Id) AS TotalHistoryEvents,
+        COUNT(DISTINCT PH.UserId) AS UniqueEditors,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.CreationDate END) AS LastEditDate,
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 END) AS CloseEventsLegacy,
+        COUNT(CASE WHEN PH.PostHistoryTypeId IN (101, 102, 103, 104, 105) THEN 1 END) AS CloseEventsModern,
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 END) AS ReopenEvents,
+        STRING_AGG(DISTINCT CRT.Name, '; ') FILTER (WHERE PH.PostHistoryTypeId = 10 AND PH.Comment IS NOT NULL AND CRT.Id IS NOT NULL) AS CloseReasonsLegacy
+    FROM PostHistory PH
+    LEFT JOIN CloseReasonTypes CRT ON PH.PostHistoryTypeId = 10 AND CRT.Id = CAST(PH.Comment AS smallint)
+    GROUP BY PH.PostId
+),
+TagUsageMetrics AS (
+    SELECT
+        TRIM(UNNEST(string_to_array(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags) - 2), '><'))) AS TagName,
+        P.Id AS PostId,
+        P.Score AS PostScore,
+        P.ViewCount AS PostViewCount,
+        P.CreationDate AS PostCreationDate,
+        P.OwnerUserId
+    FROM Posts P
+    WHERE P.Tags IS NOT NULL AND P.Tags != '' AND P.PostTypeId = 1 AND P.OwnerUserId IS NOT NULL
+),
+OverallTagPerformance AS (
+    SELECT
+        TagName,
+        COUNT(DISTINCT PostId) AS TaggedQuestionCount,
+        SUM(PostScore) AS TotalTagScore,
+        AVG(PostScore) AS AvgTagScore,
+        COUNT(DISTINCT OwnerUserId) AS UniqueQuestionOwnersForTag
+    FROM TagUsageMetrics
+    GROUP BY TagName
+),
+UserBadgeSummary AS (
+    SELECT
+        B.UserId,
+        COUNT(B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(B.Date) AS LastBadgeDate
+    FROM Badges B
+    GROUP BY B.UserId
+),
+TopQuestionPosts AS (
+    SELECT
+        P.Id AS PostId,
+        P.Title,
+        P.OwnerUserId,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CreationDate,
+        P.LastActivityDate,
+        P.ClosedDate,
+        P.AcceptedAnswerId,
+        ROW_NUMBER() OVER(PARTITION BY P.OwnerUserId ORDER BY P.Score DESC, P.ViewCount DESC, P.CreationDate DESC) as rn_user_top_post
+    FROM Posts P
+    WHERE P.PostTypeId = 1 AND P.OwnerUserId IS NOT NULL
+),
+UserLatestEditInfo AS (
+    SELECT
+        PH.UserId,
+        PH.CreationDate AS LastEditDate,
+        PH.Comment AS LastEditComment,
+        ROW_NUMBER() OVER(PARTITION BY PH.UserId ORDER BY PH.CreationDate DESC, PH.Id DESC) AS rn
+    FROM PostHistory PH
+    WHERE PH.PostHistoryTypeId IN (4, 5, 6) AND PH.UserId IS NOT NULL
+),
+UserTagScoreRank AS (
+    SELECT
+        TUM.OwnerUserId AS UserId,
+        TUM.TagName,
+        OTP.AvgTagScore,
+        RANK() OVER (PARTITION BY TUM.OwnerUserId ORDER BY OTP.AvgTagScore DESC, COUNT(TUM.PostId) DESC) AS TagRank
+    FROM TagUsageMetrics TUM
+    JOIN OverallTagPerformance OTP ON TUM.TagName = OTP.TagName
+    WHERE OTP.TaggedQuestionCount > 50
+    GROUP BY TUM.OwnerUserId, TUM.TagName, OTP.AvgTagScore
+)
+SELECT
+    UAS.UserId,
+    UAS.DisplayName,
+    UAS.Reputation,
+    UAS.UserCreationDate,
+    UAS.TotalPosts,
+    UAS.QuestionCount,
+    UAS.AnswerCount,
+    UAS.TotalPostScore,
+    UAS.TotalPostViewCount,
+    UAS.TotalCommentCount,
+    UAS.TotalUpVotesGiven,
+    UAS.TotalDownVotesGiven,
+    UAS.TotalAcceptedAnswersGiven,
+    UAS.LastPostActivityDate,
+    COALESCE(UBS.TotalBadges, 0) AS TotalBadges,
+    COALESCE(UBS.GoldBadges, 0) AS GoldBadges,
+    COALESCE(UBS.SilverBadges, 0) AS SilverBadges,
+    COALESCE(UBS.BronzeBadges, 0) AS BronzeBadges,
+    UBS.LastBadgeDate,
+    TQP.Title AS TopQuestionTitle,
+    TQP.Score AS TopQuestionScore,
+    TQP.ViewCount AS TopQuestionViewCount,
+    TQP.AnswerCount AS TopQuestionAnswerCount,
+    EXTRACT(DAY FROM (NOW() - TQP.CreationDate)) AS DaysSinceTopQuestionCreated,
+    COALESCE(PHE.TotalHistoryEvents, 0) AS TopQuestionHistoryEvents,
+    COALESCE(PHE.UniqueEditors, 0) AS TopQuestionUniqueEditors,
+    (COALESCE(PHE.CloseEventsLegacy, 0) + COALESCE(PHE.CloseEventsModern, 0)) AS TopQuestionTotalCloseEvents,
+    COALESCE(PHE.ReopenEvents, 0) AS TopQuestionReopenEvents,
+    PHE.CloseReasonsLegacy AS TopQuestionCloseReasons,
+    AA.Score AS AcceptedAnswerScore,
+    AA_Owner.DisplayName AS AcceptedAnswerOwnerDisplayName,
+    (
+        SELECT COUNT(PL.Id)
+        FROM PostLinks PL
+        WHERE PL.PostId = TQP.PostId AND PL.LinkTypeId = 1
+    ) AS LinkedPostsCount,
+    (
+        SELECT COUNT(PL.Id)
+        FROM PostLinks PL
+        WHERE PL.PostId = TQP.PostId AND PL.LinkTypeId = 3
+    ) AS DuplicatePostsCount,
+    AVG(OTP_Avg.AvgTagScore) OVER (PARTITION BY UAS.UserId) AS UserAveragePostTagScore,
+    MAX(OTP_Max.AvgTagScore) OVER (PARTITION BY UAS.UserId) AS UserMaxPostTagScore,
+    RANK() OVER (ORDER BY UAS.Reputation DESC, COALESCE(UAS.LastPostActivityDate, UAS.UserCreationDate) DESC) AS UserOverallReputationRank,
+    STRING_AGG(DISTINCT UTS.TagName, ', ' ORDER BY UTS.TagRank) FILTER (WHERE UTS.TagRank <= 3) AS Top3UsedTagsByScore,
+    (COALESCE(UAS.TotalPostScore, 0) * 1.2) + (COALESCE(UAS.TotalCommentCount, 0) * 0.75) + (COALESCE(UAS.TotalUpVotesGiven, 0) * 0.5) - (COALESCE(UAS.TotalDownVotesGiven, 0) * 1.5) + (COALESCE(UBS.GoldBadges, 0) * 100) AS CustomEngagementIndex,
+    COALESCE(NULLIF(TRIM(UAS.DisplayName), ''), 'Anonymous') AS ActualDisplayNameOrAnonymous,
+    UPPER(LEFT(UAS.DisplayName, 2)) || SUBSTRING(UAS.DisplayName, 3, LENGTH(UAS.DisplayName) - 4) || LOWER(RIGHT(UAS.DisplayName, 2)) AS DisplayNameMixedCase,
+    CASE
+        WHEN UAS.Reputation > 50000 AND COALESCE(UBS.GoldBadges, 0) > 5 AND UAS.QuestionCount > 100 THEN 'Legendary Grandmaster'
+        WHEN UAS.Reputation > 10000 AND COALESCE(UBS.SilverBadges, 0) > 10 AND UAS.AnswerCount > 200 THEN 'Distinguished Expert'
+        WHEN UAS.Reputation > 2500 AND COALESCE(UBS.BronzeBadges, 0) > 20 THEN 'Seasoned Contributor'
+        WHEN UAS.Reputation > 500 AND (UAS.QuestionCount > 5 OR UAS.AnswerCount > 10) THEN 'Emerging Participant'
+        ELSE 'Casual User'
+    END AS UserTier,
+    ULEI.LastEditDate AS UsersLastEditDate,
+    COALESCE(ULEI.LastEditComment, 'No specific comment for last edit available.') AS UsersLastEditComment,
+    (CASE WHEN UWES.UserId IS NOT NULL THEN TRUE ELSE FALSE END) AS EditsOwnPostsButNoOtherComments,
+    DATE_TRUNC('month', UAS.UserCreationDate) AS UserCreationMonth,
+    LAG(UAS.Reputation, 1, 0) OVER (ORDER BY UAS.Reputation DESC) AS PrevUserReputation,
+    LEAD(UAS.Reputation, 1, 0) OVER (ORDER BY UAS.Reputation DESC) AS NextUserReputation
+FROM UserActivitySummary UAS
+LEFT JOIN UserBadgeSummary UBS ON UAS.UserId = UBS.UserId
+LEFT JOIN TopQuestionPosts TQP ON UAS.UserId = TQP.OwnerUserId AND TQP.rn_user_top_post = 1
+LEFT JOIN Posts AA ON TQP.AcceptedAnswerId = AA.Id
+LEFT JOIN Users AA_Owner ON AA.OwnerUserId = AA_Owner.Id
+LEFT JOIN PostHistoryEngagement PHE ON TQP.PostId = PHE.PostId
+LEFT JOIN UserLatestEditInfo ULEI ON UAS.UserId = ULEI.UserId AND ULEI.rn = 1
+LEFT JOIN TagUsageMetrics TUM_for_avg ON UAS.UserId = TUM_for_avg.OwnerUserId
+LEFT JOIN OverallTagPerformance OTP_Avg ON TUM_for_avg.TagName = OTP_Avg.TagName
+LEFT JOIN OverallTagPerformance OTP_Max ON TUM_for_avg.TagName = OTP_Max.TagName
+LEFT JOIN UserTagScoreRank UTS ON UAS.UserId = UTS.UserId
+LEFT JOIN UsersWhoEditButDontCommentOtherPosts UWES ON UAS.UserId = UWES.UserId
+WHERE UAS.Reputation > 500
+  AND UAS.TotalPosts > 2
+  AND UAS.CreationDate < (NOW() - INTERVAL '1 year')
+  AND (TQP.PostId IS NOT NULL OR UAS.AnswerCount > 0)
+  AND (UAS.DisplayName NOT ILIKE '%test%' AND UAS.DisplayName IS NOT NULL AND LENGTH(UAS.DisplayName) > 2)
+  AND (UAS.AboutMe IS NOT NULL OR UAS.Location IS NOT NULL)
+GROUP BY
+    UAS.UserId, UAS.DisplayName, UAS.Reputation, UAS.UserCreationDate, UAS.TotalPosts, UAS.QuestionCount, UAS.AnswerCount, UAS.TotalPostScore,
+    UAS.TotalPostViewCount, UAS.TotalCommentCount, UAS.TotalUpVotesGiven, UAS.TotalDownVotesGiven, UAS.TotalAcceptedAnswersGiven,
+    UAS.LastPostActivityDate, UBS.TotalBadges, UBS.GoldBadges, UBS.SilverBadges, UBS.BronzeBadges, UBS.LastBadgeDate,
+    TQP.Title, TQP.Score, TQP.ViewCount, TQP.AnswerCount, TQP.CreationDate, TQP.PostId, TQP.AcceptedAnswerId,
+    PHE.TotalHistoryEvents, PHE.UniqueEditors, PHE.CloseEventsLegacy, PHE.CloseEventsModern, PHE.ReopenEvents, PHE.CloseReasonsLegacy,
+    AA.Score, AA_Owner.DisplayName, ULEI.LastEditDate, ULEI.LastEditComment, UWES.UserId
+HAVING COUNT(DISTINCT UTS.TagName) > 0
+ORDER BY UserOverallReputationRank ASC, CustomEngagementIndex DESC
+LIMIT 1000;

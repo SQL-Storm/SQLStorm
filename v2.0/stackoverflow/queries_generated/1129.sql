@@ -1,0 +1,231 @@
+-- {"query": "1129.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3646} 
+
+WITH UserEngagement AS (
+    -- Calculate aggregated user statistics, including post counts, scores, and activity metrics.
+    -- Features: SUM, COUNT, COALESCE, EXTRACT, NULLIF, CASE expressions.
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views AS UserViews,
+        u.UpVotes AS UserUpVotes,
+        u.DownVotes AS UserDownVotes,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate AS UserLastAccessDate,
+        COALESCE(u.Location, 'Unknown Location') AS UserLocation,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(c.Id) AS TotalComments,
+        COUNT(b.Id) AS TotalBadges,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostScore,
+        SUM(COALESCE(p.ViewCount, 0)) AS TotalPostViews,
+        COUNT(DISTINCT ph.UserId) AS UniqueEditorsOnPosts,
+        NULLIF(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END), 0) AS QuestionCountDivisor,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.AnswerCount ELSE NULL END) AS AvgAnswersPerQuestion,
+        EXTRACT(EPOCH FROM (u.LastAccessDate - u.CreationDate)) / (3600 * 24) AS DaysSinceCreation,
+        NULLIF(u.Reputation, 0) AS ReputationDivisor -- Used for potential division later to avoid errors
+    FROM
+        Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Body, Tags
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes,
+        u.CreationDate, u.LastAccessDate, u.Location
+),
+PostQualityMetrics AS (
+    -- Analyze individual post quality, engagement, and historical events.
+    -- Features: LEFT JOIN, correlated subquery, window functions (RANK, LAG, AVG OVER), CASE expressions, date arithmetic.
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.FavoriteCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.LastEditDate,
+        COALESCE(p.Title, SUBSTRING(p.Body, 1, 50) || '...') AS PostTitleSnippet, -- String expression
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        CAST(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS DECIMAL) AS UpVoteCount,
+        CAST(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DECIMAL) AS DownVoteCount,
+        COUNT(DISTINCT ph.UserId) AS DistinctEditors,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS WasClosed, -- Post closed event
+        MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS WasReopened, -- Post reopened event
+        LAG(ph.CreationDate, 1, p.CreationDate) OVER (PARTITION BY p.Id ORDER BY ph.CreationDate) AS PrevEditDate, -- Window function
+        RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS RankByScoreAndViews, -- Window function
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId, p.PostTypeId ORDER BY p.CreationDate DESC) AS RowNumByPostTypeDate, -- Window function
+        COUNT(DISTINCT pl_linked.RelatedPostId) AS LinkedPostCount,
+        COUNT(DISTINCT pl_duplicate.RelatedPostId) AS DuplicatePostCount,
+        COALESCE(EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate)) / (3600 * 24 * 7), 0) AS WeeksActive,
+        AVG(c.Score) OVER (PARTITION BY p.Id) AS AverageCommentScore, -- Window function
+        -- Correlated subquery: checks if the post owner has another post with a significantly higher view count
+        (SELECT EXISTS (
+            SELECT 1 FROM Posts p2
+            WHERE p2.OwnerUserId = p.OwnerUserId
+            AND p2.Id != p.Id
+            AND p2.ViewCount > p.ViewCount * 2 AND p2.ViewCount > 5000 -- Threshold for 'significantly higher'
+            LIMIT 1
+        )) AS HasMuchHigherViewCountSiblingPost
+    FROM
+        Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId IN (4, 5, 6, 10, 11)
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN PostLinks pl_linked ON p.Id = pl_linked.PostId AND pl_linked.LinkTypeId = 1
+    LEFT JOIN PostLinks pl_duplicate ON p.Id = pl_duplicate.PostId AND pl_duplicate.LinkTypeId = 3
+    GROUP BY -- Grouping for accurate vote counts before window functions, ensuring distinct PostId context.
+        p.Id, p.OwnerUserId, p.PostTypeId, p.Score, p.ViewCount, p.FavoriteCount,
+        p.CommentCount, p.CreationDate, p.LastEditDate, p.Title, p.Body, p.Tags,
+        p.AcceptedAnswerId, p.ParentId, p.LastActivityDate
+),
+TopQuestionTags AS (
+    -- Identify prominent tags from top-ranked questions.
+    -- Features: CROSS JOIN UNNEST, string_to_array, substring, STRING_AGG, HAVING.
+    SELECT
+        t.TagName,
+        AVG(pqm.Score) AS AvgScoreForTag,
+        COUNT(pqm.PostId) AS TotalPostsWithTag,
+        STRING_AGG(DISTINCT ue.DisplayName, ', ' ORDER BY ue.DisplayName) AS TopContributorsToTagList
+    FROM
+        PostQualityMetrics pqm
+    JOIN UserEngagement ue ON pqm.OwnerUserId = ue.UserId
+    CROSS JOIN UNNEST(string_to_array(SUBSTRING(pqm.Tags, 2, LENGTH(pqm.Tags)-2), '><')) AS t(TagName) -- String manipulation to extract tags
+    WHERE pqm.PostTypeId = 1 AND pqm.RankByScoreAndViews <= 5 -- Consider top 5 questions per user
+    GROUP BY
+        t.TagName
+    HAVING COUNT(pqm.PostId) > 10 AND AVG(pqm.Score) > 50
+),
+ModeratorActivity AS (
+    -- Summarize closing/reopening activity for users.
+    SELECT
+        ph.UserId,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.PostId END) AS PostsClosedByModerator,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.PostId END) AS PostsReopenedByModerator
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (10, 11) AND ph.UserId IS NOT NULL
+    GROUP BY ph.UserId
+),
+HighImpactUsers AS (
+    -- Main CTE combining user engagement with post quality and tag data.
+    -- Features: Complex CASE logic, string expressions, NULL handling, correlated subquery.
+    SELECT
+        ue.UserId,
+        ue.DisplayName,
+        ue.Reputation,
+        ue.TotalQuestions,
+        ue.TotalAnswers,
+        ue.TotalPostScore,
+        ue.TotalPostViews,
+        pqm.PostId AS TopPostId,
+        pqm.PostTitleSnippet AS TopPostTitle,
+        pqm.Score AS TopPostScore,
+        pqm.ViewCount AS TopPostViews,
+        pqm.AverageCommentScore,
+        pqm.DistinctEditors AS TopPostDistinctEditors,
+        pqm.WeeksActive AS TopPostWeeksActive,
+        pqm.HasMuchHigherViewCountSiblingPost,
+        tqt.TagName AS ProminentTagAssociated,
+        tqt.AvgScoreForTag,
+        COALESCE(ma.PostsClosedByModerator, 0) AS UserPostsClosedCount,
+        COALESCE(ma.PostsReopenedByModerator, 0) AS UserPostsReopenedCount,
+        -- Complex categorical assignment based on multiple metrics
+        CASE
+            WHEN ue.Reputation >= 20000 AND ue.TotalQuestions > 100 AND ue.AvgAnswersPerQuestion >= 2.5 THEN 'Elite_Veteran_Expert'
+            WHEN ue.Reputation >= 10000 AND ue.TotalPosts > 200 AND ue.TotalComments > 300 THEN 'Highly_Engaged_Contributor'
+            WHEN ue.Reputation >= 5000 AND ue.TotalPosts > 50 AND ue.TotalPostScore > 1000 THEN 'Seasoned_Participant'
+            WHEN ue.Reputation < 5000 AND ue.TotalPosts > 15 AND ue.TotalPostScore > 300 AND ue.TotalBadges > 5 THEN 'Emerging_Talent_With_Badges'
+            ELSE 'General_Active_User'
+        END AS UserContributionCategory,
+        UPPER(SUBSTRING(COALESCE(ue.DisplayName, 'ANONYMOUS_USER'), 1, 1)) AS FirstLetterOfDisplayName, -- String expression
+        NULLIF(ue.UserUpVotes, 0) AS UserUpVotesNullIfZero,
+        -- Correlated subquery: checks if a user has a specific type of badge
+        (SELECT EXISTS (SELECT 1 FROM Badges b_sub WHERE b_sub.UserId = ue.UserId AND b_sub.Class = 1 AND b_sub.TagBased = FALSE)) AS HasNonTagBasedGoldBadge
+    FROM
+        UserEngagement ue
+    LEFT JOIN PostQualityMetrics pqm ON ue.UserId = pqm.OwnerUserId AND pqm.RankByScoreAndViews = 1 -- Get the top-ranked post
+    LEFT JOIN TopQuestionTags tqt ON pqm.Tags LIKE '%' || tqt.TagName || '%' -- Join to find associated prominent tags
+    LEFT JOIN ModeratorActivity ma ON ue.UserId = ma.UserId
+    WHERE
+        ue.Reputation > 750 -- Minimum reputation for consideration
+        AND ue.TotalPosts > 5 -- Minimum number of posts
+        AND pqm.PostId IS NOT NULL -- Must have at least one top post identified
+        AND (ue.AvgAnswersPerQuestion IS NULL OR ue.AvgAnswersPerQuestion >= 0.2) -- Accommodate users without questions or with few answers
+),
+DiverseActivityProfiles AS (
+    -- Identify users who have both high-quality questions and high-scoring answers.
+    -- Features: UNION ALL for set operation, combining different aspects of user activity.
+    SELECT
+        hiu.UserId,
+        hiu.DisplayName,
+        'HighQualityQuestioner' AS ActivityType,
+        hiu.TopPostScore AS ActivityScore,
+        hiu.TotalQuestions AS ActivityCount,
+        hiu.ProminentTagAssociated AS PrimaryFocus
+    FROM HighImpactUsers hiu
+    WHERE hiu.TotalQuestions > 10 AND hiu.TopPostScore > 50
+
+    UNION ALL
+
+    SELECT
+        p.OwnerUserId AS UserId,
+        u.DisplayName,
+        'HighScoreAnswerer' AS ActivityType,
+        SUM(p.Score) AS ActivityScore,
+        COUNT(p.Id) AS ActivityCount,
+        'Answers' AS PrimaryFocus
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 2 AND p.Score > 25 AND p.CreationDate > (NOW() - INTERVAL '1 year')
+    GROUP BY p.OwnerUserId, u.DisplayName
+    HAVING COUNT(p.Id) >= 5
+)
+-- Final selection combining various insights.
+-- Features: LEFT JOIN, NTILE window function, complex WHERE predicates, ORDER BY.
+SELECT
+    hiu.UserId,
+    hiu.DisplayName,
+    hiu.Reputation,
+    hiu.UserContributionCategory,
+    hiu.TotalQuestions,
+    hiu.TotalAnswers,
+    hiu.TotalPostScore,
+    hiu.TopPostTitle,
+    hiu.TopPostScore,
+    hiu.TopPostViews,
+    hiu.AverageCommentScore,
+    hiu.TopPostDistinctEditors,
+    hiu.HasMuchHigherViewCountSiblingPost,
+    hiu.ProminentTagAssociated,
+    hiu.AvgScoreForTag,
+    hiu.UserPostsClosedCount,
+    hiu.UserPostsReopenedCount,
+    hiu.FirstLetterOfDisplayName,
+    hiu.HasNonTagBasedGoldBadge,
+    COALESCE(SUM(CASE WHEN dap.ActivityType = 'HighScoreAnswerer' THEN dap.ActivityCount ELSE 0 END), 0) AS TotalHighQualityAnswers,
+    COALESCE(SUM(CASE WHEN dap.ActivityType = 'HighScoreAnswerer' THEN dap.ActivityScore ELSE 0 END), 0) AS TotalHighScoreAnswerScore,
+    NTILE(10) OVER (ORDER BY hiu.Reputation DESC, hiu.TotalPostScore DESC, COALESCE(SUM(CASE WHEN dap.ActivityType = 'HighScoreAnswerer' THEN dap.ActivityScore ELSE 0 END), 0) DESC) AS OverallInfluenceDecile
+FROM
+    HighImpactUsers hiu
+LEFT JOIN DiverseActivityProfiles dap ON hiu.UserId = dap.UserId
+WHERE
+    (hiu.Reputation / COALESCE(hiu.ReputationDivisor, 1)) > 0.005 -- Example of robust division
+    AND (hiu.ProminentTagAssociated IS NOT NULL OR hiu.TotalQuestions > 15) -- Must contribute to prominent tags or have many questions
+    AND hiu.HasNonTagBasedGoldBadge = TRUE -- Only users with a non-tag-based gold badge
+    AND (hiu.UserPostsClosedCount > 0 OR hiu.UserPostsReopenedCount > 0 OR hiu.UserViews > 50000) -- Demonstrate some moderation activity or high visibility
+    AND hiu.DaysSinceCreation >= 365 -- Active for at least a year
+GROUP BY
+    hiu.UserId, hiu.DisplayName, hiu.Reputation, hiu.UserContributionCategory, hiu.TotalQuestions,
+    hiu.TotalAnswers, hiu.TotalPostScore, hiu.TotalPostViews, hiu.TopPostId, hiu.TopPostTitle,
+    hiu.TopPostScore, hiu.TopPostViews, hiu.AverageCommentScore, hiu.TopPostDistinctEditors,
+    hiu.HasMuchHigherViewCountSiblingPost, hiu.ProminentTagAssociated, hiu.AvgScoreForTag,
+    hiu.UserPostsClosedCount, hiu.UserPostsReopenedCount, hiu.FirstLetterOfDisplayName,
+    hiu.HasNonTagBasedGoldBadge, hiu.ReputationDivisor, hiu.DaysSinceCreation
+ORDER BY
+    OverallInfluenceDecile ASC, hiu.Reputation DESC, hiu.TotalPostScore DESC
+LIMIT 200;

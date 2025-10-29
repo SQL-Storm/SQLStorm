@@ -1,0 +1,106 @@
+WITH
+RecentTopQ AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.Tags,
+    ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.ViewCount DESC, p.CreationDate DESC) AS rn
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '180' DAY
+),
+TopQuestionAuthors AS (
+  SELECT
+    rt.PostId,
+    rt.Title,
+    rt.CreationDate,
+    rt.Score,
+    rt.ViewCount,
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.AccountId,
+    rt.Tags,
+    rt.rn
+  FROM RecentTopQ rt
+  LEFT JOIN Users u ON u.Id = rt.OwnerUserId
+  WHERE rt.rn <= 50
+),
+TaggedActivity AS (
+  SELECT
+    tag.TagName,
+    p.Id AS PostId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation
+  FROM TopQuestionAuthors qa
+  JOIN Posts p ON p.Id = qa.PostId
+  CROSS JOIN LATERAL (
+    SELECT unnest(string_to_array(SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags)-2)), '><')) AS TagName
+  ) tag
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  LEFT JOIN Users u ON u.Id = p.OwnerUserId
+  WHERE tag.TagName IS NOT NULL
+),
+CorrelatedCommentActivity AS (
+  SELECT
+    c.PostId,
+    c.Id AS CommentId,
+    c.CreationDate AS CommentDate,
+    c.Score AS CommentScore,
+    c.Text AS CommentText,
+    c.UserId AS CommentUserId,
+    du.DisplayName AS CommentUserName
+  FROM Comments c
+  LEFT JOIN Users du ON du.Id = c.UserId
+  WHERE c.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '60' DAY
+),
+WindowedPostStats AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.Tags,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate DESC) AS owner_seq
+  FROM Posts p
+  WHERE p.PostTypeId IN (1,2)
+),
+Result AS (
+  SELECT
+    t.TagName,
+    t.PostId,
+    t.Title,
+    t.CreationDate,
+    t.Score,
+    t.ViewCount,
+    u.Id AS UserId,
+    u.DisplayName AS UserName,
+    u.Reputation,
+    ca.CommentDate AS LastCommentDate,
+    ca.CommentText AS LastCommentSnippet,
+    ws.owner_seq
+  FROM TaggedActivity t
+  JOIN WindowedPostStats ws ON ws.PostId = t.PostId
+  LEFT JOIN CorrelatedCommentActivity ca ON ca.PostId = t.PostId
+  LEFT JOIN Users u ON u.Id = t.UserId
+  WHERE ws.owner_seq = 1
+  GROUP BY
+    t.TagName, t.PostId, t.Title, t.CreationDate, t.Score, t.ViewCount,
+    u.Id, u.DisplayName, u.Reputation, ca.CommentDate, ca.CommentText, ws.owner_seq
+)
+SELECT
+  *
+FROM Result
+ORDER BY Reputation DESC, LastCommentDate DESC
+LIMIT 100;

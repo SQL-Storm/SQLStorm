@@ -1,0 +1,90 @@
+WITH q_stats AS (
+    SELECT 
+        p.OwnerUserId AS UserId,
+        COUNT(*)                                   AS QuestionCount,
+        AVG(p.Score)                               AS AvgQuestionScore
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+    GROUP BY p.OwnerUserId
+),
+a_stats AS (
+    SELECT 
+        p.OwnerUserId AS UserId,
+        COUNT(*)                                   AS AnswerCount,
+        AVG(p.Score)                               AS AvgAnswerScore,
+        SUM(CASE WHEN p.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END) AS AcceptedAnswers
+    FROM Posts p
+    LEFT JOIN Posts q 
+           ON q.Id = p.ParentId 
+          AND q.PostTypeId = 1
+    WHERE p.PostTypeId = 2
+    GROUP BY p.OwnerUserId
+),
+badge_counts AS (
+    SELECT 
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+recent_votes AS (
+    SELECT 
+        v.UserId,
+        MAX(v.CreationDate) AS LastVoteDate
+    FROM Votes v
+    WHERE v.UserId IS NOT NULL
+    GROUP BY v.UserId
+),
+top_tags AS (
+    SELECT 
+        t.TagName,
+        t.Count
+    FROM Tags t
+    ORDER BY t.Count DESC
+    LIMIT 10
+)
+SELECT 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    COALESCE(q.QuestionCount, 0)               AS QuestionsPosted,
+    COALESCE(a.AnswerCount, 0)                 AS AnswersPosted,
+    ROUND(COALESCE(q.AvgQuestionScore, 0), 2) AS AvgQScore,
+    ROUND(COALESCE(a.AvgAnswerScore, 0), 2)   AS AvgAScore,
+    CASE 
+        WHEN COALESCE(a.AnswerCount, 0) = 0 THEN NULL 
+        ELSE ROUND((CAST(COALESCE(a.AcceptedAnswers, 0) AS DECIMAL) / a.AnswerCount) * 100, 2) 
+    END                                         AS AcceptanceRatePct,
+    COALESCE(bc.GoldBadges, 0)                  AS GoldBadges,
+    COALESCE(bc.SilverBadges, 0)                AS SilverBadges,
+    COALESCE(bc.BronzeBadges, 0)                AS BronzeBadges,
+    rv.LastVoteDate,
+    STRING_AGG(DISTINCT utag.TagName, ', ') 
+        OVER (PARTITION BY u.Id)               AS PopularTags,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+    EXISTS (
+        SELECT 1 
+        FROM Posts p2 
+        WHERE p2.OwnerUserId = u.Id 
+          AND p2.PostTypeId = 1 
+          AND p2.CreationDate > (CAST('2024-10-01' AS DATE) - INTERVAL '30' DAY)
+    )                                          AS HasRecentQuestion,
+    (SELECT COUNT(*) 
+     FROM Comments c 
+     WHERE c.UserId = u.Id 
+       AND c.CreationDate > (CAST('2024-10-01' AS DATE) - INTERVAL '90' DAY)
+    )                                          AS RecentCommentCount
+FROM Users u
+LEFT JOIN q_stats q      ON q.UserId = u.Id
+LEFT JOIN a_stats a      ON a.UserId = u.Id
+LEFT JOIN badge_counts bc ON bc.UserId = u.Id
+LEFT JOIN recent_votes rv ON rv.UserId = u.Id
+LEFT JOIN LATERAL (
+    SELECT TRIM(BOTH '>' FROM TRIM(BOTH '<' FROM UNNEST(STRING_TO_ARRAY(u.Tags, '><')))) AS TagName
+) utag ON TRUE
+LEFT JOIN top_tags t ON t.TagName = utag.TagName
+WHERE u.Reputation >= 1000
+ORDER BY u.Reputation DESC
+LIMIT 100;

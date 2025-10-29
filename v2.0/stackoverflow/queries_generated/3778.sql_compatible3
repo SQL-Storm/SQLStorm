@@ -1,0 +1,135 @@
+WITH
+usr_stats AS (
+    SELECT
+        u.Id                              AS user_id,
+        u.DisplayName                     AS display_name,
+        u.Reputation,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1)               AS q_cnt,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2)               AS a_cnt,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END),0) AS up_votes,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END),0) AS down_votes,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1)                  AS gold_badge,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2)                  AS silver_badge,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3)                  AS bronze_badge,
+        COUNT(DISTINCT t.TagName)                               AS distinct_tags
+    FROM Users u
+    LEFT JOIN Posts  p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes  v ON v.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN LATERAL (
+        SELECT t.TagName
+        FROM regexp_split_to_table(p.Tags, '[><]+') AS split(tag)
+        JOIN Tags t ON t.TagName = split.tag
+    ) t ON TRUE
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+last_activity AS (
+    SELECT
+        u.Id                                            AS user_id,
+        GREATEST(
+            COALESCE(MAX(p.CreationDate),    TIMESTAMP '1970-01-01'),
+            COALESCE(MAX(v.CreationDate),    TIMESTAMP '1970-01-01')
+        )                                              AS last_ts
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    GROUP BY u.Id
+),
+popular_tags AS (
+    SELECT
+        t.TagName,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS q_uses,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS a_uses,
+        COUNT(*)                                           AS total_posts
+    FROM Tags t
+    JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    GROUP BY t.TagName
+    HAVING COUNT(*) >= 100
+),
+main AS (
+SELECT
+    us.user_id,
+    us.display_name,
+    us.Reputation,
+    us.q_cnt,
+    us.a_cnt,
+    us.up_votes,
+    us.down_votes,
+    us.gold_badge,
+    us.silver_badge,
+    us.bronze_badge,
+    us.distinct_tags,
+    COALESCE(la.last_ts, u.CreationDate)                AS last_active,
+    RANK() OVER (ORDER BY us.Reputation DESC,
+                        us.q_cnt DESC)                AS reputation_rank,
+    CASE
+        WHEN us.Reputation > 20000                 THEN 'Elite'
+        WHEN us.Reputation BETWEEN 10000 AND 19999  THEN 'Pro'
+        WHEN us.Reputation BETWEEN 5000  AND 9999  THEN 'Experienced'
+        ELSE 'Novice'
+    END                                              AS reputation_tier,
+    (SELECT STRING_AGG(pt.TagName, ', ' ORDER BY pt.total_posts DESC)
+     FROM (
+            SELECT unnest(regexp_split_to_array(p2.Tags, '[><]+')) AS tag, p2.OwnerUserId
+            FROM Posts p2
+            WHERE p2.OwnerUserId = us.user_id
+          ) AS t2
+     JOIN popular_tags pt ON pt.TagName = t2.tag
+     WHERE t2.OwnerUserId = us.user_id
+     GROUP BY t2.OwnerUserId
+     LIMIT 3)                                       AS top_tags
+FROM usr_stats us
+LEFT JOIN last_activity la   ON la.user_id = us.user_id
+LEFT JOIN Users u           ON u.Id = us.user_id
+WHERE (us.q_cnt + us.a_cnt) > 10
+  AND NOT EXISTS (
+        SELECT 1
+        FROM Badges b
+        WHERE b.UserId = us.user_id
+          AND b.Name = 'User is Suspended'
+      )
+)
+
+SELECT
+    user_id,
+    display_name,
+    Reputation,
+    q_cnt,
+    a_cnt,
+    up_votes,
+    down_votes,
+    gold_badge,
+    silver_badge,
+    bronze_badge,
+    distinct_tags,
+    last_active,
+    reputation_rank,
+    reputation_tier,
+    top_tags
+FROM main
+GROUP BY
+    user_id, display_name, Reputation, q_cnt, a_cnt,
+    up_votes, down_votes, gold_badge, silver_badge,
+    bronze_badge, distinct_tags, last_active, reputation_rank, reputation_tier, top_tags
+
+UNION ALL
+
+SELECT
+    NULL                         AS user_id,
+    'ALL USERS'                  AS display_name,
+    SUM(us.Reputation)           AS Reputation,
+    SUM(us.q_cnt)                AS q_cnt,
+    SUM(us.a_cnt)                AS a_cnt,
+    SUM(us.up_votes)             AS up_votes,
+    SUM(us.down_votes)           AS down_votes,
+    SUM(us.gold_badge)           AS gold_badge,
+    SUM(us.silver_badge)         AS silver_badge,
+    SUM(us.bronze_badge)         AS bronze_badge,
+    SUM(us.distinct_tags)        AS distinct_tags,
+    NULL                         AS last_active,
+    NULL                         AS reputation_rank,
+    NULL                         AS reputation_tier,
+    NULL                         AS top_tags
+FROM usr_stats us
+WHERE us.Reputation > 1000
+GROUP BY NULL;

@@ -1,0 +1,111 @@
+WITH RECURSIVE
+    latest_q AS (
+        SELECT  p.OwnerUserId,
+                p.Title,
+                p.CreationDate,
+                ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId
+                                   ORDER BY p.CreationDate DESC) AS rn
+        FROM    Posts p
+        WHERE   p.PostTypeId = 1
+    ),
+
+    user_badge AS (
+        SELECT  b.UserId,
+                MAX(b.Date)                                   AS last_badge_dt,
+                STRING_AGG(CASE WHEN b.Class = 1 THEN b.Name END, ', ') FILTER (WHERE b.Class = 1) AS gold_badges
+        FROM    Badges b
+        GROUP BY b.UserId
+    ),
+
+    tag_stats AS (
+        SELECT  t.Id,
+                t.TagName,
+                t.Count,
+                COALESCE(LENGTH(p.Body),0)                      AS excerpt_len
+        FROM    Tags t
+        LEFT JOIN Posts p
+               ON p.Id = t.ExcerptPostId
+    ),
+
+    vote_agg AS (
+        SELECT  p.OwnerUserId,
+                SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS up_votes,
+                SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS down_votes,
+                MAX(v.CreationDate)                               AS last_vote_dt
+        FROM    Posts p
+        JOIN    Votes v ON v.PostId = p.Id
+        WHERE   v.VoteTypeId IN (2,3)
+        GROUP BY p.OwnerUserId
+    ),
+
+    user_tags AS (
+        SELECT  p.OwnerUserId,
+                STRING_AGG(DISTINCT t.TagName, ', ') AS tag_list
+        FROM    Posts p
+        CROSS JOIN LATERAL
+                regexp_split_to_table(
+                    COALESCE(p.Tags,''),
+                    '[><]') AS raw_tag
+        LEFT JOIN Tags t ON t.TagName = raw_tag
+        WHERE   p.PostTypeId = 1
+        GROUP BY p.OwnerUserId
+    )
+
+SELECT
+    u.Id                                    AS user_id,
+    u.DisplayName,
+    u.Reputation,
+    COALESCE(ub.gold_badges,'')             AS gold_badges,
+    ub.last_badge_dt,
+    lq.Title                                AS latest_question_title,
+    lq.CreationDate                         AS latest_question_date,
+    COALESCE(va.up_votes,0) - COALESCE(va.down_votes,0) AS net_vote_score,
+    CASE
+        WHEN u.Location IS NULL THEN 'Unknown'
+        ELSE u.Location
+    END                                     AS location,
+    COALESCE(ut.tag_list,'')                AS top_tags,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS reputation_rank,
+    (SELECT COUNT(*)
+       FROM Posts a
+      WHERE a.OwnerUserId = u.Id
+        AND a.PostTypeId = 2)               AS answer_count,
+    (SELECT COUNT(*)
+       FROM Comments c
+      WHERE c.UserId = u.Id)                AS comment_count,
+    va.last_vote_dt                         AS last_vote_date,
+    COALESCE(u.Views,0) *
+    (1 + (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id)) AS weighted_activity
+FROM
+    Users u
+LEFT JOIN user_badge ub      ON ub.UserId = u.Id
+LEFT JOIN latest_q lq        ON lq.OwnerUserId = u.Id AND lq.rn = 1
+LEFT JOIN vote_agg va       ON va.OwnerUserId = u.Id
+LEFT JOIN user_tags ut      ON ut.OwnerUserId = u.Id
+WHERE
+    u.Reputation > 1000
+    AND (u.CreationDate < CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '5 years'
+         OR u.EmailHash IS NOT NULL)
+ORDER BY
+    u.Reputation DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    NULL AS user_id,
+    NULL AS DisplayName,
+    NULL AS Reputation,
+    NULL AS gold_badges,
+    NULL AS last_badge_dt,
+    NULL AS latest_question_title,
+    NULL AS latest_question_date,
+    NULL AS net_vote_score,
+    NULL AS location,
+    NULL AS top_tags,
+    NULL AS reputation_rank,
+    NULL AS answer_count,
+    NULL AS comment_count,
+    NULL AS last_vote_date,
+    NULL AS weighted_activity
+ORDER BY reputation_rank NULLS LAST;

@@ -1,0 +1,135 @@
+-- {"query": "3469.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2279} 
+
+-- CTE: aggregate user stats
+WITH UserStats AS (
+    SELECT u.Id,
+           u.DisplayName,
+           u.Reputation,
+           COALESCE(u.UpVotes,0) - COALESCE(u.DownVotes,0)          AS NetVotes,
+           COUNT(b.Id) FILTER (WHERE b.Class = 1)                 AS GoldBadges,
+           COUNT(b.Id) FILTER (WHERE b.Class = 2)                 AS SilverBadges,
+           COUNT(b.Id) FILTER (WHERE b.Class = 3)                 AS BronzeBadges,
+           MAX(p.CreationDate)                                   AS LastPostDate
+    FROM Users u
+    LEFT JOIN Badges b      ON b.UserId = u.Id
+    LEFT JOIN Posts p       ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes
+),
+
+-- CTE: tag usage derived from questions
+TagUsage AS (
+    SELECT t.TagName,
+           COUNT(*)                                              AS QuestionCount,
+           AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL)      AS AvgScore,
+           STRING_AGG(DISTINCT u.DisplayName, ', ') 
+                FILTER (WHERE u.Id IS NOT NULL)                 AS TopContributors
+    FROM Posts p
+    JOIN LATERAL regexp_split_to_table(p.Tags, '><') AS lt(tag) ON true
+    JOIN Tags t ON t.TagName = lt.tag
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1            -- only questions
+    GROUP BY t.TagName
+),
+
+-- CTE: recent vote aggregation per post
+RecentVotes AS (
+    SELECT v.PostId,
+           SUM(CASE WHEN vt.Id = 2 THEN 1               -- UpMod
+                    WHEN vt.Id = 3 THEN -1              -- DownMod
+                    ELSE 0 END)                        AS VoteScore,
+           MAX(v.CreationDate)                           AS LastVoteDate
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE vt.Id IN (2,3)                               -- up/down votes only
+    GROUP BY v.PostId
+)
+
+-- Main query: blend user, post, tag, and vote data
+SELECT us.Id                              AS UserId,
+       us.DisplayName,
+       us.Reputation,
+       us.NetVotes,
+       us.GoldBadges,
+       us.SilverBadges,
+       us.BronzeBadges,
+       us.LastPostDate,
+       q.TotalQuestions,
+       q.AvgQuestionScore,
+       a.TotalAnswers,
+       a.AvgAnswerScore,
+       CASE 
+           WHEN us.Reputation > 20000 THEN 'Legendary'
+           WHEN us.Reputation > 10000 THEN 'Expert'
+           WHEN us.Reputation > 5000  THEN 'Experienced'
+           ELSE 'Novice'
+       END                                 AS ReputationBand,
+       STRING_AGG(DISTINCT tu.TagName, ', ') 
+            FILTER (WHERE tu.TagName IS NOT NULL) AS ActiveTags,
+       COALESCE(rv.VoteScore,0)           AS RecentVoteScore,
+       rv.LastVoteDate
+FROM UserStats us
+
+LEFT JOIN (
+    SELECT OwnerUserId,
+           COUNT(*)                        AS TotalQuestions,
+           AVG(Score)                      AS AvgQuestionScore
+    FROM Posts
+    WHERE PostTypeId = 1
+    GROUP BY OwnerUserId
+) q ON q.OwnerUserId = us.Id
+
+LEFT JOIN (
+    SELECT OwnerUserId,
+           COUNT(*)                        AS TotalAnswers,
+           AVG(Score)                      AS AvgAnswerScore
+    FROM Posts
+    WHERE PostTypeId = 2
+    GROUP BY OwnerUserId
+) a ON a.OwnerUserId = us.Id
+
+-- pull up to 5 distinct tags the user has used on questions
+LEFT JOIN LATERAL (
+    SELECT t.TagName
+    FROM Posts p
+    JOIN LATERAL regexp_split_to_table(p.Tags, '><') AS tag ON true
+    JOIN Tags t ON t.TagName = tag
+    WHERE p.OwnerUserId = us.Id
+      AND p.PostTypeId = 1
+    LIMIT 5
+) tu ON true
+
+-- recent vote info for the user's latest post
+LEFT JOIN RecentVotes rv ON rv.PostId = (
+    SELECT p2.Id
+    FROM Posts p2
+    WHERE p2.OwnerUserId = us.Id
+    ORDER BY p2.CreationDate DESC
+    LIMIT 1
+)
+
+WHERE us.Reputation IS NOT NULL
+GROUP BY us.Id, us.DisplayName, us.Reputation, us.NetVotes,
+         us.GoldBadges, us.SilverBadges, us.BronzeBadges,
+         us.LastPostDate,
+         q.TotalQuestions, q.AvgQuestionScore,
+         a.TotalAnswers, a.AvgAnswerScore,
+         rv.VoteScore, rv.LastVoteDate
+ORDER BY us.Reputation DESC
+OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY
+
+UNION ALL
+
+-- supplemental result set: high‑scoring tags
+SELECT NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+       t.QuestionCount,
+       NULL,
+       NULL,
+       NULL,
+       NULL,
+       t.TagName,
+       NULL,
+       NULL,
+       NULL
+FROM TagUsage t
+WHERE t.AvgScore > 5
+ORDER BY Reputation DESC NULLS LAST;

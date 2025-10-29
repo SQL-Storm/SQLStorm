@@ -1,0 +1,124 @@
+-- {"query": "3653.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2596} 
+WITH UserStats AS (
+    SELECT u.Id,
+           u.DisplayName,
+           u.Reputation,
+           COALESCE(pcnt.PostCount,0)              AS PostCount,
+           COALESCE(anscnt.AnswerCount,0)          AS AnswerCount,
+           COALESCE(anscnt.QuestionCount,0)        AS QuestionCount,
+           COALESCE(bc.GoldBadgeCount,0)           AS GoldBadgeCount,
+           COALESCE(bc.SilverBadgeCount,0)         AS SilverBadgeCount,
+           COALESCE(bc.BronzeBadgeCount,0)         AS BronzeBadgeCount,
+           (SELECT MAX(CreationDate)
+              FROM Posts p
+             WHERE p.OwnerUserId = u.Id)            AS LastPostDate,
+           (SELECT MAX(CreationDate)
+              FROM Comments c
+             WHERE c.UserId = u.Id)                AS LastCommentDate
+      FROM Users u
+ LEFT JOIN (
+            SELECT OwnerUserId,
+                   COUNT(*) AS PostCount
+              FROM Posts
+             WHERE OwnerUserId IS NOT NULL
+          GROUP BY OwnerUserId
+          ) pcnt ON pcnt.OwnerUserId = u.Id
+ LEFT JOIN (
+            SELECT OwnerUserId,
+                   SUM(CASE WHEN PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+                   SUM(CASE WHEN PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount
+              FROM Posts
+             WHERE OwnerUserId IS NOT NULL
+          GROUP BY OwnerUserId
+          ) anscnt ON anscnt.OwnerUserId = u.Id
+ LEFT JOIN (
+            SELECT UserId,
+                   SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadgeCount,
+                   SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadgeCount,
+                   SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadgeCount
+              FROM Badges
+          GROUP BY UserId
+          ) bc ON bc.UserId = u.Id
+),
+TagAffinity AS (
+    SELECT u.Id                             AS UserId,
+           t.TagName,
+           COUNT(*)                         AS TagUseCount,
+           ROW_NUMBER() OVER (PARTITION BY u.Id
+                              ORDER BY COUNT(*) DESC) AS TagRank
+      FROM Users u
+      JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+      CROSS JOIN LATERAL regexp_split_to_table(p.Tags, '[><]') AS split(tag_raw)
+      JOIN Tags t ON t.TagName = split.tag_raw
+     WHERE p.Tags IS NOT NULL
+  GROUP BY u.Id, t.TagName
+),
+TopTagPerUser AS (
+    SELECT UserId,
+           TagName,
+           TagUseCount
+      FROM TagAffinity
+     WHERE TagRank = 1
+),
+RecentVotes AS (
+    SELECT v.UserId,
+           SUM(CASE WHEN vt.Name = 'UpMod'      THEN 1 ELSE 0 END) AS UpVotes,
+           SUM(CASE WHEN vt.Name = 'DownMod'    THEN 1 ELSE 0 END) AS DownVotes,
+           MAX(v.CreationDate)                                 AS LastVoteDate
+      FROM Votes v
+      JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+     WHERE v.CreationDate >= cast('2024-10-01' as date) - INTERVAL '30 days'
+  GROUP BY v.UserId
+)
+SELECT us.Id,
+       us.DisplayName,
+       us.Reputation,
+       us.PostCount,
+       us.AnswerCount,
+       us.QuestionCount,
+       us.GoldBadgeCount,
+       us.SilverBadgeCount,
+       us.BronzeBadgeCount,
+       COALESCE(tp.TagName, '(none)')           AS TopTag,
+       COALESCE(tp.TagUseCount,0)               AS TopTagUseCount,
+       rv.UpVotes,
+       rv.DownVotes,
+       GREATEST(
+           COALESCE(us.LastPostDate,    TIMESTAMP '1970-01-01 00:00:00'),
+           COALESCE(us.LastCommentDate,TIMESTAMP '1970-01-01 00:00:00'),
+           COALESCE(rv.LastVoteDate,   TIMESTAMP '1970-01-01 00:00:00')
+       )                                        AS MostRecentActivity
+  FROM UserStats us
+  LEFT JOIN TopTagPerUser tp ON tp.UserId = us.Id
+  LEFT JOIN RecentVotes rv   ON rv.UserId = us.Id
+ WHERE us.Reputation > 10000
+    OR us.PostCount > 500
+
+UNION ALL
+
+SELECT NULL                                     AS Id,
+       '--- Summary ---'                        AS DisplayName,
+       NULL                                     AS Reputation,
+       SUM(us.PostCount)                        AS PostCount,
+       SUM(us.AnswerCount)                      AS AnswerCount,
+       SUM(us.QuestionCount)                    AS QuestionCount,
+       SUM(us.GoldBadgeCount)                   AS GoldBadgeCount,
+       SUM(us.SilverBadgeCount)                 AS SilverBadgeCount,
+       SUM(us.BronzeBadgeCount)                 AS BronzeBadgeCount,
+       NULL                                     AS TopTag,
+       NULL                                     AS TopTagUseCount,
+       SUM(rv.UpVotes)                          AS UpVotes,
+       SUM(rv.DownVotes)                        AS DownVotes,
+       MAX(
+           GREATEST(
+               COALESCE(us.LastPostDate,    TIMESTAMP '1970-01-01 00:00:00'),
+               COALESCE(us.LastCommentDate,TIMESTAMP '1970-01-01 00:00:00'),
+               COALESCE(rv.LastVoteDate,   TIMESTAMP '1970-01-01 00:00:00')
+           )
+       )                                        AS MostRecentActivity
+  FROM UserStats us
+  LEFT JOIN RecentVotes rv ON rv.UserId = us.Id
+ WHERE us.Reputation > 10000
+    OR us.PostCount > 500
+
+ORDER BY Reputation DESC NULLS LAST, PostCount DESC;

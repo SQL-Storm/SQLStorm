@@ -1,0 +1,162 @@
+-- {"query": "2546.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1513} 
+
+WITH RecursiveTagHierarchy AS (
+    SELECT Id, TagName, WikiPostId, 1 AS Level
+    FROM Tags
+    WHERE IsModeratorOnly = 0
+  UNION ALL
+    SELECT t.Id, t.TagName, t.WikiPostId, r.Level + 1
+    FROM Tags t
+    JOIN RecursiveTagHierarchy r ON t.Id = r.WikiPostId
+    WHERE r.Level < 3
+),
+UserBadgeAggr AS (
+    SELECT 
+        UserId,
+        COUNT(*) FILTER (WHERE Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE Class = 3) AS BronzeBadges,
+        MAX(Date) AS LastBadgeDate
+    FROM Badges
+    GROUP BY UserId
+),
+PostScores AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        COALESCE(vote_counts.UpVotes, 0) AS UpVotes,
+        COALESCE(vote_counts.DownVotes, 0) AS DownVotes,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS PostRecencyRank,
+        CASE 
+            WHEN p.Score >= 100 THEN 'HighScore'
+            WHEN p.Score BETWEEN 50 AND 99 THEN 'MediumScore'
+            WHEN p.Score < 50 THEN 'LowScore'
+            ELSE 'Unscored'
+        END AS ScoreCategory
+    FROM Posts p
+    LEFT JOIN (
+        SELECT
+          PostId,
+          SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+          SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes
+        GROUP BY PostId
+    ) vote_counts ON p.Id = vote_counts.PostId
+),
+FilteredQuestions AS (
+    SELECT 
+        ps.*,
+        u.DisplayName,
+        u.Reputation,
+        uba.GoldBadges,
+        uba.SilverBadges,
+        uba.BronzeBadges,
+        uba.LastBadgeDate
+    FROM PostScores ps
+    LEFT JOIN Users u ON ps.OwnerUserId = u.Id
+    LEFT JOIN UserBadgeAggr uba ON uba.UserId = u.Id
+    WHERE ps.PostTypeId = 1
+      AND (ps.Tags IS NOT NULL AND ps.Tags LIKE '%<sql>%')
+      AND u.Reputation > 1000
+),
+QuestionAnswerStats AS (
+    SELECT
+        fq.Id AS QuestionId,
+        fq.Title,
+        fq.CreationDate AS QuestionCreated,
+        fq.DisplayName,
+        fq.Reputation,
+        fq.GoldBadges,
+        fq.SilverBadges,
+        fq.BronzeBadges,
+        COUNT(a.Id) FILTER (WHERE a.Score > 0) AS PositiveAnswersCount,
+        COUNT(a.Id) FILTER (WHERE a.Score <= 0 OR a.Score IS NULL) AS NonPositiveAnswersCount,
+        AVG(a.Score) FILTER (WHERE a.Score IS NOT NULL) AS AvgAnswerScore,
+        MAX(a.CreationDate) FILTER (WHERE a.CreationDate IS NOT NULL) AS LastAnswerDate,
+        COALESCE(plink.DuplicateCount, 0) AS DuplicateCount,
+        CASE 
+          WHEN fq.ClosedDate IS NOT NULL THEN 'Closed'
+          ELSE 'Open'
+        END AS QuestionStatus
+    FROM FilteredQuestions fq
+    LEFT JOIN Posts a ON a.ParentId = fq.Id AND a.PostTypeId = 2
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS DuplicateCount
+        FROM PostLinks
+        WHERE LinkTypeId = 3
+        GROUP BY PostId
+    ) plink ON plink.PostId = fq.Id
+    GROUP BY fq.Id, fq.Title, fq.CreationDate, fq.DisplayName, fq.Reputation, fq.GoldBadges, fq.SilverBadges, fq.BronzeBadges, fq.ClosedDate, plink.DuplicateCount
+),
+AnsweredUsers AS (
+    SELECT 
+        DISTINCT a.OwnerUserId AS UserId
+    FROM Posts a
+    WHERE a.PostTypeId = 2 AND a.OwnerUserId IS NOT NULL
+),
+UserEngagement AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (10, 11)) AS CloseReopenEvents,
+        COUNT(DISTINCT c.Id) AS CommentsCount,
+        COUNT(DISTINCT v.Id) AS VotesCast,
+        EXISTS (
+            SELECT 1 FROM AnsweredUsers au WHERE au.UserId = u.Id
+        ) AS HasAnsweredPosts
+    FROM Users u
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    WHERE u.Reputation > 500
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+)
+SELECT
+    qas.QuestionId,
+    qas.Title,
+    qas.DisplayName AS QuestionOwner,
+    qas.Reputation AS OwnerReputation,
+    qas.GoldBadges,
+    qas.SilverBadges,
+    qas.BronzeBadges,
+    qas.PositiveAnswersCount,
+    qas.NonPositiveAnswersCount,
+    ROUND(qas.AvgAnswerScore::numeric, 2) AS AvgAnswerScore,
+    qas.LastAnswerDate,
+    qas.DuplicateCount,
+    qas.QuestionStatus,
+    ue.DisplayName AS TopEngagedUser,
+    ue.Reputation AS TopUserReputation,
+    ue.CloseReopenEvents,
+    ue.CommentsCount,
+    ue.VotesCast,
+    ue.HasAnsweredPosts,
+    RTRIM(LTRIM(REGEXP_REPLACE(fq.Tags, '[<>]', ' ', 'g'))) AS CleanTags,
+    COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId = 50) AS CommunityBumps
+FROM QuestionAnswerStats qas
+JOIN FilteredQuestions fq ON fq.Id = qas.QuestionId
+LEFT JOIN UserEngagement ue ON ue.Id = (
+    SELECT u.Id
+    FROM Users u
+    WHERE u.Reputation = (
+        SELECT MAX(u2.Reputation) 
+        FROM Users u2 
+        WHERE u2.Reputation > 0
+    )
+    LIMIT 1
+)
+LEFT JOIN PostHistory ph ON ph.PostId = qas.QuestionId
+GROUP BY 
+    qas.QuestionId, qas.Title, qas.DisplayName, qas.Reputation, qas.GoldBadges, qas.SilverBadges, qas.BronzeBadges,
+    qas.PositiveAnswersCount, qas.NonPositiveAnswersCount, qas.AvgAnswerScore, qas.LastAnswerDate, qas.DuplicateCount,
+    qas.QuestionStatus, ue.DisplayName, ue.Reputation, ue.CloseReopenEvents, ue.CommentsCount, ue.VotesCast, ue.HasAnsweredPosts,
+    CleanTags
+ORDER BY AvgAnswerScore DESC
+LIMIT 20
+;

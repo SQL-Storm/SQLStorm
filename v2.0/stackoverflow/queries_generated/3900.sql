@@ -1,0 +1,117 @@
+-- {"query": "3900.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2107} 
+
+/*  Benchmark query – mixture of CTEs, window functions, outer joins, lateral, set operators,
+    string handling, NULL logic, and correlated sub‑queries                                            */
+WITH
+/*-------------------------------------------------------
+   Gather per‑user aggregates (questions, answers, badges)
+ -------------------------------------------------------*/
+UserStats AS (
+    SELECT u.Id,
+           u.DisplayName,
+           u.Reputation,
+           COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1)               AS GoldBadgeCnt,
+           COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1)          AS QCnt,
+           COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2)          AS ACnt,
+           COALESCE(AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END),0) AS AvgQScore,
+           COALESCE(AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END),0) AS AvgAScore,
+           MAX(p.CreationDate)                                          AS LastPostDt
+    FROM   Users   u
+    LEFT   JOIN Badges    b ON b.UserId = u.Id
+    LEFT   JOIN Posts     p ON p.OwnerUserId = u.Id
+    GROUP  BY u.Id, u.DisplayName, u.Reputation
+),
+
+/*-------------------------------------------------------
+   Tag‑level statistics – used later to locate a tag a user
+   has contributed to the most
+ -------------------------------------------------------*/
+TagStats AS (
+    SELECT t.TagName,
+           COUNT(p.Id)                                   AS TagQCnt,
+           SUM(p.Score)                                  AS TagTotScore,
+           AVG(p.Score)                                  AS TagAvgScore,
+           STRING_AGG(DISTINCT u.Id::TEXT, ',' ORDER BY u.Reputation DESC) AS UserIdList
+    FROM   Tags   t
+    JOIN   Posts  p ON p.Tags LIKE '%<'||t.TagName||'>%' AND p.PostTypeId = 1
+    JOIN   Users  u ON u.Id = p.OwnerUserId
+    GROUP  BY t.TagName
+),
+
+/*-------------------------------------------------------
+   Recent voting activity (last 30 days) per post
+ -------------------------------------------------------*/
+RecentVotes AS (
+    SELECT v.PostId,
+           SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS UpV,
+           SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS DownV,
+           MAX(v.CreationDate)                         AS LastVoteDt
+    FROM   Votes     v
+    JOIN   VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE  v.CreationDate >= CURRENT_DATE - INTERVAL '30 days'
+    GROUP  BY v.PostId
+),
+
+/*-------------------------------------------------------
+   Rank users having at least one gold badge
+ -------------------------------------------------------*/
+RankedUsers AS (
+    SELECT us.*,
+           ROW_NUMBER() OVER (ORDER BY us.Reputation DESC, us.GoldBadgeCnt DESC)        AS RepRank,
+           PERCENT_RANK() OVER (ORDER BY us.AvgAScore DESC)                               AS AnswerScorePct
+    FROM   UserStats us
+    WHERE  us.GoldBadgeCnt > 0
+)
+
+SELECT
+    ru.Id,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.GoldBadgeCnt,
+    ru.QCnt,
+    ru.ACnt,
+    ru.AvgQScore,
+    ru.AvgAScore,
+    ru.LastPostDt,
+    ru.RepRank,
+    ru.AnswerScorePct,
+    COALESCE(t.TagName, 'NULL')                     AS SampleTag,
+    COALESCE(t.TagQCnt,0)                           AS TagQCnt,
+    COALESCE(t.TagAvgScore,0)                       AS TagAvgScore,
+    COALESCE(rv.UpV,0)                              AS RecentUpVotes,
+    COALESCE(rv.DownV,0)                            AS RecentDownVotes,
+    CASE
+        WHEN ru.LastPostDt IS NULL                     THEN 'NeverPosted'
+        WHEN ru.LastPostDt < CURRENT_DATE - INTERVAL '2 years' THEN 'Dormant'
+        ELSE 'Active'
+    END                                            AS ActivityStatus
+FROM   RankedUsers ru
+/*--- pick the tag where the user appears in the top‑user list -------------------*/
+LEFT   JOIN LATERAL (
+        SELECT ts.*
+        FROM   TagStats ts
+        WHERE  ts.UserIdList LIKE '%'||ru.Id::TEXT||'%'
+        ORDER  BY ts.TagQCnt DESC
+        LIMIT  1
+) t ON TRUE
+/*--- recent votes on the user’s latest answer ----------------------------------*/
+LEFT   JOIN RecentVotes rv
+       ON rv.PostId = (
+           SELECT p.Id
+           FROM   Posts p
+           WHERE  p.OwnerUserId = ru.Id
+                  AND p.PostTypeId = 2
+           ORDER  BY p.CreationDate DESC
+           LIMIT  1
+       )
+WHERE  ru.RepRank <= 100
+ORDER  BY ru.RepRank
+LIMIT  100
+
+UNION ALL
+
+/*--- a dummy row to force the planner to consider a UNION ALL path -------------*/
+SELECT
+    NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,
+    NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL
+LIMIT 1;

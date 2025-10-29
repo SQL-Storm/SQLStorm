@@ -1,0 +1,149 @@
+-- {"query": "2005.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1359} 
+
+WITH RecursiveUserPosts AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Score,
+        p.CreationDate,
+        p.Tags,
+        p.ParentId,
+        p.AcceptedAnswerId,
+        1 AS Depth
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Reputation > 1000 AND p.CreationDate > CURRENT_DATE - INTERVAL '365 days'
+
+    UNION ALL
+
+    SELECT 
+        rup.UserId,
+        rup.DisplayName,
+        c.PostId,
+        p.PostTypeId,
+        p.Score,
+        p.CreationDate,
+        p.Tags,
+        p.ParentId,
+        p.AcceptedAnswerId,
+        Depth + 1
+    FROM RecursiveUserPosts rup
+    JOIN Comments c ON c.UserId = rup.UserId AND c.PostId <> rup.PostId
+    JOIN Posts p ON c.PostId = p.Id
+    WHERE rup.Depth < 3
+),
+LatestPostHistory AS (
+    SELECT 
+        ph.PostId, 
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        ph.UserId,
+        ph.Comment,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4,5,6)
+),
+TopBadges AS (
+    SELECT 
+        b.UserId,
+        b.Name,
+        b.Class,
+        COUNT(*) OVER (PARTITION BY b.UserId, b.Class) AS BadgeCount,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY COUNT(*) OVER (PARTITION BY b.UserId, b.Class) DESC, b.Name) AS rn
+    FROM Badges b
+    WHERE b.Date > CURRENT_DATE - INTERVAL '1 year'
+),
+PostLinkAggregates AS (
+    SELECT 
+        pl.PostId,
+        COUNT(DISTINCT CASE WHEN lt.Name = 'Linked' THEN pl.RelatedPostId END) AS LinkedCount,
+        COUNT(DISTINCT CASE WHEN lt.Name = 'Duplicate' THEN pl.RelatedPostId END) AS DuplicateCount
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    GROUP BY pl.PostId
+),
+UserScoreRankings AS (
+    SELECT 
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Id AS PostId,
+        p.Score,
+        p.ViewCount,
+        RANK() OVER (PARTITION BY p.OwnerUserId, p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS ScoreRank
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+),
+AggregatedVotes AS (
+    SELECT 
+        p.Id AS PostId,
+        SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes,
+        SUM(CASE WHEN vt.Name = 'Favorite' THEN 1 ELSE 0 END) AS FavoriteVotes
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    GROUP BY p.Id
+),
+FilteredQuestions AS (
+    SELECT 
+        p.*,
+        agv.UpVotes,
+        agv.DownVotes,
+        agv.FavoriteVotes,
+        pla.LinkedCount,
+        pla.DuplicateCount,
+        ph.Comment AS CloseReason
+    FROM Posts p
+    LEFT JOIN AggregatedVotes agv ON p.Id = agv.PostId
+    LEFT JOIN PostLinkAggregates pla ON p.Id = pla.PostId
+    LEFT JOIN LatestPostHistory ph ON p.Id = ph.PostId AND ph.rn = 1 AND ph.PostHistoryTypeId = 10 -- Post Closed
+    WHERE p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL
+      AND (agv.UpVotes - agv.DownVotes) > 5
+),
+ComplexFilteredUsers AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        COUNT(DISTINCT b.Id) AS BadgesLastYear,
+        COALESCE(SUM(p.Score),0) AS TotalPostScore,
+        AVG(COALESCE(p.ViewCount,0)) AS AvgPostViews,
+        MAX(p.CreationDate) AS LastPostDate,
+        COUNT(DISTINCT CASE WHEN bp.PostId IS NOT NULL THEN 1 END) AS QuestionsWithDuplicates,
+        STRING_AGG(DISTINCT t.TagName, ',' ORDER BY t.TagName) AS ExpertiseTags
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId AND b.Date > CURRENT_DATE - INTERVAL '1 year'
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId IN (1,2)
+    LEFT JOIN PostLinks bp ON p.Id = bp.PostId AND bp.LinkTypeId = (SELECT Id FROM LinkTypes WHERE Name = 'Duplicate' LIMIT 1)
+    LEFT JOIN Tags t ON EXISTS (
+        SELECT 1 FROM Posts pt WHERE pt.Id = t.ExcerptPostId AND pt.OwnerUserId = u.Id
+    )
+    WHERE u.Reputation > 5000 AND u.CreationDate < CURRENT_DATE - INTERVAL '2 years'
+    GROUP BY u.Id, u.DisplayName
+)
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    u.BadgesLastYear,
+    u.TotalPostScore,
+    ROUND(u.AvgPostViews) AS AvgPostViews,
+    u.LastPostDate,
+    u.QuestionsWithDuplicates,
+    u.ExpertiseTags,
+    fq.Id AS ClosedQuestionId,
+    fq.Title AS ClosedQuestionTitle,
+    fq.Score AS ClosedQuestionScore,
+    fq.UpVotes AS ClosedQuestionUpVotes,
+    fq.DownVotes AS ClosedQuestionDownVotes,
+    fq.LinkedCount,
+    fq.DuplicateCount,
+    fq.CloseReason,
+    usr.ScoreRank,
+    usr.PostTypeId AS RankPostTypeId
+FROM ComplexFilteredUsers u
+JOIN FilteredQuestions fq ON fq.OwnerUserId = u.Id
+LEFT JOIN UserScoreRankings usr ON usr.OwnerUserId = u.Id AND usr.PostId = fq.Id
+WHERE COALESCE(fq.DuplicateCount,0) > 0
+ORDER BY u.TotalPostScore DESC, fq.Score DESC
+LIMIT 50;

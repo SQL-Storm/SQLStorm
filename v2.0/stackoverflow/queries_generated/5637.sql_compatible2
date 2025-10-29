@@ -1,0 +1,41 @@
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS PostCount,
+    AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END) AS AvgQuestionScore,
+    AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE NULL END) AS AvgAnswerScore,
+    MAX(p.LastActivityDate) AS LastActive,
+    COUNT(DISTINCT bh.Id) FILTER (WHERE p.PostTypeId = 1) AS TitleEditCount,
+    STRING_AGG(DISTINCT CAST(v.VoteTypeId AS text) || '', ',') AS DistinctVoteTypes,
+    MAX(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS HasGoldBadges,
+    SUM(CASE WHEN b.TagBased = 1 THEN 1 ELSE 0 END) AS TagBasedBadges
+FROM
+    Users u
+LEFT JOIN
+    Posts p ON p.OwnerUserId = u.Id
+LEFT JOIN
+    PostHistory bh ON bh.PostId = p.Id
+LEFT JOIN
+    Votes v ON v.PostId = p.Id
+LEFT JOIN
+    Badges b ON b.UserId = u.Id
+LEFT JOIN
+    (SELECT Id, UserId, Class FROM Badges WHERE Class = 1) AS gold ON gold.UserId = u.Id
+WHERE
+    u.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '5 years')
+    AND (u.LastAccessDate IS NOT NULL)
+    AND (p.CreationDate IS NULL OR p.CreationDate <= u.LastAccessDate)
+GROUP BY
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    MAX(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END),
+    MAX(p.LastActivityDate)
+HAVING
+    COUNT(DISTINCT p.Id) > 10
+ORDER BY
+    MAX(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) DESC,
+    PostCount DESC,
+    MAX(p.LastActivityDate) DESC
+LIMIT 100;

@@ -1,0 +1,188 @@
+WITH UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.Views AS UserProfileViews,
+        u.UpVotes AS UserTotalUpVotes,
+        u.DownVotes AS UserTotalDownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesGiven,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesGiven,
+        SUM(CASE WHEN v.VoteTypeId = 1 THEN 1 ELSE 0 END) AS AcceptedVotesGiven
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes
+),
+PostEngagementMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        COUNT(DISTINCT ph.UserId) AS DistinctEditors,
+        MAX(ph.CreationDate) AS LatestEditDate,
+        COUNT(ph.Id) AS TotalHistoryEntries,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (10, 101, 102, 103, 104, 105) THEN 1 ELSE 0 END) AS CloseVoteHistoryCount,
+        SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL AND p.PostTypeId = 1 THEN 1 ELSE 0 END) AS HasAcceptedAnswer,
+        SUM(CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END) AS IsClosed
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    GROUP BY p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.AcceptedAnswerId, p.ClosedDate
+),
+PostCloseHistory AS (
+    SELECT
+        ph.PostId,
+        ph.CreationDate AS CloseHistoryDate,
+        ph.Comment AS CloseReasonId_str,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (10, 101, 102, 103, 104, 105)
+),
+AggregatedTagStats AS (
+    SELECT
+        t.TagName,
+        COUNT(DISTINCT p_tag_link.Id) AS TotalQuestionsWithTag,
+        AVG(p_tag_link.Score) AS AverageScoreForTag,
+        SUM(p_tag_link.ViewCount) AS TotalViewsForTag
+    FROM Tags t
+    JOIN Posts p_tag_link ON p_tag_link.PostTypeId = 1
+    CROSS JOIN LATERAL string_to_array(SUBSTRING(p_tag_link.Tags, 2, LENGTH(p_tag_link.Tags) - 2), '><') AS tag_array_inner(TagName_Inner)
+    WHERE tag_array_inner.TagName_Inner = t.TagName
+    GROUP BY t.TagName
+    HAVING COUNT(DISTINCT p_tag_link.Id) > 50
+),
+RankedPosts AS (
+    SELECT
+        pem.PostId,
+        pem.PostTypeId,
+        pem.OwnerUserId,
+        pem.PostCreationDate,
+        pem.Score,
+        pem.ViewCount,
+        pem.AnswerCount,
+        pem.CommentCount,
+        pem.FavoriteCount,
+        pem.DistinctEditors,
+        pem.LatestEditDate,
+        pem.TotalHistoryEntries,
+        pem.HasAcceptedAnswer,
+        pem.IsClosed,
+        RANK() OVER (PARTITION BY pem.PostTypeId ORDER BY pem.Score DESC, pem.ViewCount DESC) AS ScoreRank,
+        ROW_NUMBER() OVER (PARTITION BY pem.PostTypeId ORDER BY pem.LatestEditDate DESC, pem.Score DESC) AS LatestActivityRank,
+        LAG(pem.Score, 1, 0) OVER (PARTITION BY pem.OwnerUserId ORDER BY pem.PostCreationDate) AS PrevPostScoreByOwner,
+        LEAD(pem.Score, 1, 0) OVER (PARTITION BY pem.OwnerUserId ORDER BY pem.PostCreationDate) AS NextPostScoreByOwner,
+        AVG(pem.Score) OVER (PARTITION BY pem.OwnerUserId) AS OwnerAvgPostScore,
+        COUNT(pem.PostId) OVER (PARTITION BY pem.OwnerUserId) AS OwnerTotalPosts
+    FROM PostEngagementMetrics pem
+    WHERE pem.PostCreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 year'
+    AND pem.Score > 0
+),
+UserCommentPreference AS (
+    SELECT UserId FROM Comments
+    GROUP BY UserId
+    HAVING COUNT(Id) > 5 AND COUNT(DISTINCT PostId) > 2
+    EXCEPT
+    SELECT OwnerUserId FROM Posts WHERE PostTypeId = 1
+    GROUP BY OwnerUserId
+    HAVING COUNT(Id) > 0
+)
+SELECT
+    uas.UserId,
+    COALESCE(uas.DisplayName, 'Deleted User') AS UserDisplayName,
+    uas.Reputation,
+    uas.UserCreationDate,
+    uas.TotalPosts,
+    uas.TotalQuestions,
+    uas.TotalAnswers,
+    uas.TotalCommentsMade,
+    uas.TotalBadges,
+    uas.UserTotalUpVotes,
+    uas.UserTotalDownVotes,
+    uas.AcceptedVotesGiven,
+    uas.UserProfileViews,
+    rp.PostId,
+    pt.Name AS PostTypeName,
+    p.Title,
+    p.Tags,
+    rp.PostCreationDate,
+    rp.Score AS PostScore,
+    rp.ViewCount AS PostViewCount,
+    rp.AnswerCount AS PostAnswerCount,
+    rp.CommentCount AS PostCommentCount,
+    rp.FavoriteCount AS PostFavoriteCount,
+    rp.DistinctEditors,
+    rp.LatestEditDate,
+    rp.TotalHistoryEntries,
+    rp.HasAcceptedAnswer,
+    rp.IsClosed,
+    (CAST(rp.Score AS NUMERIC) / NULLIF(rp.ViewCount, 0)) AS ScorePerViewRatio,
+    (CAST(rp.Score AS NUMERIC) / NULLIF(rp.OwnerAvgPostScore, 0)) AS ScoreRatioToOwnerAverage,
+    rp.ScoreRank,
+    rp.LatestActivityRank,
+    rp.PrevPostScoreByOwner,
+    rp.NextPostScoreByOwner,
+    (SELECT AVG(p2.Score)
+     FROM Posts p2
+     WHERE p2.OwnerUserId = uas.UserId
+       AND p2.Id <> rp.PostId
+       AND p2.CreationDate BETWEEN rp.PostCreationDate - INTERVAL '6 month' AND rp.PostCreationDate + INTERVAL '6 month'
+       AND p2.PostTypeId = rp.PostTypeId
+    ) AS AvgOtherRecentPostScoreByOwner,
+    ptags.TagName AS AssociatedTagName,
+    COALESCE(ats.AverageScoreForTag, 0) AS AverageTagScore,
+    COALESCE(ats.TotalQuestionsWithTag, 0) AS QuestionsInTag,
+    CASE
+        WHEN uas.Reputation > 5000 AND rp.Score > 50 AND rp.DistinctEditors > 1 AND rp.PostTypeId = 1 THEN 'Highly Influential Question'
+        WHEN uas.Reputation > 2000 AND rp.HasAcceptedAnswer = 1 AND rp.PostTypeId = 2 AND rp.PostScore > rp.PrevPostScoreByOwner THEN 'Valuable Answerer (Improving Trend)'
+        WHEN rp.LatestEditDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 month' AND rp.Score > 10 AND CHAR_LENGTH(COALESCE(p.Body, '')) > 500 THEN 'Recently Active & Elaborate Post'
+        WHEN uas.UserId IN (SELECT UserId FROM UserCommentPreference) THEN 'Active Commenter, Not Primary Questioner'
+        WHEN p.ClosedDate IS NOT NULL AND crt.Name IS NOT NULL AND LOWER(crt.Name) LIKE '%duplicate%' THEN 'Closed Post (Duplicate)'
+        ELSE 'General Contributor'
+    END AS UserPostImpactCategory,
+    LENGTH(COALESCE(p.Body, '')) AS PostBodyLength,
+    LENGTH(COALESCE(p.Title, '')) AS PostTitleLength,
+    phc.CloseHistoryDate,
+    crt.Name AS CloseReason
+FROM UserActivitySummary uas
+INNER JOIN RankedPosts rp ON uas.UserId = rp.OwnerUserId
+INNER JOIN Posts p ON rp.PostId = p.Id
+INNER JOIN PostTypes pt ON rp.PostTypeId = pt.Id
+LEFT JOIN LATERAL (
+    SELECT TRIM(tag_name) AS TagName
+    FROM string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><') AS tag_array(tag_name)
+    WHERE p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2
+) AS ptags ON TRUE
+LEFT JOIN AggregatedTagStats ats ON ptags.TagName = ats.TagName
+LEFT JOIN PostCloseHistory phc ON p.Id = phc.PostId AND phc.rn = 1
+LEFT JOIN CloseReasonTypes crt ON crt.Id = CASE
+    WHEN phc.CloseReasonId_str ~ '^\d+$' THEN CAST(phc.CloseReasonId_str AS SMALLINT)
+    ELSE NULL
+END
+WHERE
+    uas.Reputation > 750
+    AND rp.PostTypeId IN (1, 2)
+    AND p.Title IS NOT NULL AND p.Body IS NOT NULL
+    AND rp.Score >= 5
+    AND rp.LatestActivityRank <= 250
+    AND (ptags.TagName IS NULL OR ptags.TagName LIKE '%sql%' OR ptags.TagName LIKE '%python%')
+ORDER BY
+    uas.Reputation DESC,
+    rp.PostScore DESC,
+    rp.LatestEditDate DESC,
+    p.Title
+LIMIT 500;

@@ -1,0 +1,128 @@
+WITH
+AllHighPerformers AS (
+    SELECT u.Id
+    FROM   Users u
+    WHERE  u.Reputation > 20000
+
+    UNION
+
+    SELECT b.UserId
+    FROM   Badges b
+    WHERE  b.Class = 1
+    GROUP  BY b.UserId
+    HAVING COUNT(*) >= 3
+),
+
+UserStats AS (
+    SELECT
+        u.Id                                     AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.UpVotes,0) - COALESCE(u.DownVotes,0) AS NetVotes,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END)   AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END)   AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END)   AS BronzeBadges,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        MAX(p.CreationDate)   AS LastPostDate
+    FROM   Users u
+    LEFT   JOIN Badges b   ON b.UserId = u.Id
+    LEFT   JOIN Posts  p   ON p.OwnerUserId = u.Id
+    GROUP  BY u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes
+),
+
+RankedUsers AS (
+    SELECT
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.NetVotes,
+        us.GoldBadges,
+        us.SilverBadges,
+        us.BronzeBadges,
+        us.QuestionCount,
+        us.AnswerCount,
+        us.LastPostDate,
+        ROW_NUMBER() OVER (ORDER BY us.Reputation DESC, us.NetVotes DESC) AS RepRank
+    FROM   UserStats us
+    WHERE  us.UserId IN (SELECT Id FROM AllHighPerformers)
+),
+
+LatestClosedQuestions AS (
+    SELECT
+        p.OwnerUserId                AS UserId,
+        p.Id,
+        p.Title,
+        ph.Comment                   AS CloseReason,
+        p.ClosedDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId
+                           ORDER BY p.ClosedDate DESC) AS rn
+    FROM   Posts p
+    JOIN   PostHistory ph ON ph.PostId = p.Id
+    WHERE  p.PostTypeId = 1
+      AND  p.ClosedDate IS NOT NULL
+      AND  ph.PostHistoryTypeId = 10
+),
+
+UserTagUsage AS (
+    SELECT
+        u.Id                         AS UserId,
+        UNNEST(string_to_array(TRIM(BOTH '<>' FROM p.Tags), '><')) AS Tag,
+        COUNT(*)                     AS TagUseCount
+    FROM   Users u
+    JOIN   Posts p ON p.OwnerUserId = u.Id
+    WHERE  p.PostTypeId = 1
+      AND  p.Tags IS NOT NULL
+    GROUP  BY u.Id, Tag
+),
+
+TopTags AS (
+    SELECT
+        Tag,
+        SUM(TagUseCount) AS TotalUses,
+        ROW_NUMBER() OVER (ORDER BY SUM(TagUseCount) DESC) AS TagRank
+    FROM   UserTagUsage
+    GROUP  BY Tag
+    -- keep only top 5
+    QUALIFY ROW_NUMBER() OVER (ORDER BY SUM(TagUseCount) DESC) <= 5
+),
+
+UserLatestAnswerScore AS (
+    SELECT
+        u.Id                               AS UserId,
+        (SELECT COALESCE(a.Score,0)
+         FROM   Posts a
+         WHERE  a.OwnerUserId = u.Id
+           AND  a.PostTypeId = 2
+         ORDER  BY a.CreationDate DESC
+         LIMIT  1)                           AS LatestAnswerScore
+    FROM   Users u
+)
+
+SELECT
+    ru.RepRank,
+    ru.UserId,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.NetVotes,
+    ru.GoldBadges,
+    ru.SilverBadges,
+    ru.BronzeBadges,
+    ru.QuestionCount,
+    ru.AnswerCount,
+    lcq.Title                         AS LatestClosedQuestionTitle,
+    COALESCE(lcq.CloseReason,'Unknown') AS NormalizedCloseReason,
+    ula.LatestAnswerScore,
+    tt.Tag,
+    tt.TotalUses,
+    tt.TagRank
+FROM   RankedUsers ru
+LEFT   JOIN LatestClosedQuestions lcq
+       ON lcq.UserId = ru.UserId
+      AND lcq.rn = 1
+LEFT   JOIN UserLatestAnswerScore ula
+       ON ula.UserId = ru.UserId
+LEFT   JOIN TopTags tt
+       ON TRUE
+WHERE  ru.RepRank <= 10
+ORDER  BY ru.RepRank, tt.TagRank;

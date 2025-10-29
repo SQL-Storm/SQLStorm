@@ -1,0 +1,304 @@
+-- {"query": "947.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2980} 
+with recent_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.location,
+    u.creationdate,
+    u.upvotes,
+    u.downvotes,
+    coalesce(nullif(trim(u.websiteurl), ''), 'n/a') as websiteurl_clean
+  from users u
+  where u.creationdate >= (select max(creationdate) - interval '2 years' from users)
+),
+user_activity as (
+  select
+    u.user_id,
+    count(distinct p.id) filter (where p.posttypeid in (1,2)) as total_posts,
+    count(*) filter (where c.id is not null) as total_comments,
+    sum(greatest(p.score,0)) as nonneg_post_score,
+    sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end) as net_votes_cast,
+    max(greatest(p.lastactivitydate, p.creationdate)) as last_post_activity
+  from recent_users u
+  left join posts p on p.owneruserid = u.user_id
+  left join comments c on c.userid = u.user_id
+  left join votes v on v.userid = u.user_id
+  group by u.user_id
+),
+question_stats as (
+  select
+    p.owneruserid as user_id,
+    count(*) as questions,
+    avg(nullif(p.viewcount,0)) as avg_views,
+    sum(case when p.acceptedanswerid is not null then 1 else 0 end) as accepted_qs,
+    sum(case when p.closeddate is not null then 1 else 0 end) as closed_qs
+  from posts p
+  where p.posttypeid = 1
+  group by p.owneruserid
+),
+answer_stats as (
+  select
+    p.owneruserid as user_id,
+    count(*) as answers,
+    avg(p.score) as avg_answer_score,
+    sum(case when p.score >= 1 then 1 else 0 end) as positive_answers
+  from posts p
+  where p.posttypeid = 2
+  group by p.owneruserid
+),
+tag_exposure as (
+  select
+    p.owneruserid as user_id,
+    t.tagname,
+    count(*) as tag_posts
+  from posts p
+  join lateral unnest(string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')) as tn(tagname) on p.posttypeid = 1 and p.tags is not null
+  join tags t on t.tagname = tn.tagname
+  group by p.owneruserid, t.tagname
+),
+top_tag as (
+  select distinct on (te.user_id)
+    te.user_id,
+    te.tagname as top_tag,
+    te.tag_posts
+  from tag_exposure te
+  order by te.user_id, te.tag_posts desc, te.tagname
+),
+badge_rollup as (
+  select
+    b.userid as user_id,
+    sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+    sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+    sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+    count(*) as total_badges,
+    max(b.date) as last_badge_date
+  from badges b
+  group by b.userid
+),
+hot_question_bumps as (
+  select
+    ph.postid,
+    count(*) filter (where ph.posthistorytypeid = 52) as times_hot,
+    count(*) filter (where ph.posthistorytypeid = 53) as times_unhot,
+    count(*) filter (where ph.posthistorytypeid = 50) as community_bumps
+  from posthistory ph
+  group by ph.postid
+),
+dup_graph as (
+  select
+    pl.postid as dup_post_id,
+    pl.relatedpostid as target_post_id,
+    pl.creationdate,
+    pl.linktypeid
+  from postlinks pl
+  where pl.linktypeid = 3
+),
+question_quality as (
+  select
+    q.id as question_id,
+    q.owneruserid as user_id,
+    q.score,
+    q.viewcount,
+    q.favoritecount,
+    q.answercount,
+    hq.times_hot,
+    hq.community_bumps,
+    coalesce(json_extract_path_text(ph.text::json, 'OriginalQuestionIds'), '[]') as dup_json,
+    (case when q.closeddate is not null then 1 else 0 end) as is_closed
+  from posts q
+  left join hot_question_bumps hq on hq.postid = q.id
+  left join posthistory ph on ph.postid = q.id and ph.posthistorytypeid in (10,35)
+  where q.posttypeid = 1
+),
+user_quality_rollup as (
+  select
+    qq.user_id,
+    count(*) as q_count,
+    avg(qq.score) as q_avg_score,
+    percentile_cont(0.9) within group (order by qq.viewcount) as q_p90_views,
+    sum(case when qq.is_closed = 1 then 1 else 0 end) as q_closed_count,
+    sum(coalesce(qq.times_hot,0)) as q_hot_hits,
+    sum(coalesce(qq.community_bumps,0)) as q_bumps,
+    sum(coalesce(qq.favoritecount,0)) as q_favs
+  from question_quality qq
+  group by qq.user_id
+),
+recent_activity_window as (
+  select
+    p.owneruserid as user_id,
+    p.id as post_id,
+    p.posttypeid,
+    p.creationdate,
+    p.score,
+    row_number() over (partition by p.owneruserid order by p.creationdate desc) as rn_recent,
+    sum(p.score) over (partition by p.owneruserid order by p.creationdate rows between unbounded preceding and current row) as running_score
+  from posts p
+  where p.owneruserid is not null
+),
+comment_sentiment as (
+  select
+    c.userid as user_id,
+    avg(length(c.text) - length(replace(lower(c.text), 'thank', ''))) as avg_thank_signal,
+    avg(length(c.text) - length(replace(lower(c.text), 'sorry', ''))) as avg_sorry_signal,
+    avg(c.score) as avg_comment_score
+  from comments c
+  group by c.userid
+),
+sitewide_baselines as (
+  select
+    (select avg(score) from posts where posttypeid = 1) as site_avg_q_score,
+    (select avg(score) from posts where posttypeid = 2) as site_avg_a_score,
+    (select avg(viewcount) from posts where posttypeid = 1 and viewcount is not null) as site_avg_q_views,
+    (select avg(upvotes - downvotes) from users) as site_avg_net_votes
+),
+user_scored as (
+  select
+    ru.user_id,
+    ru.displayname,
+    ru.reputation,
+    ru.location,
+    ru.creationdate,
+    ua.total_posts,
+    ua.total_comments,
+    ua.nonneg_post_score,
+    ua.net_votes_cast,
+    ua.last_post_activity,
+    qs.questions,
+    qs.avg_views,
+    qs.accepted_qs,
+    qs.closed_qs,
+    coalesce(as2.answers, 0) as answers,
+    as2.avg_answer_score,
+    as2.positive_answers,
+    coalesce(qqr.q_count,0) as q_count,
+    qqr.q_avg_score,
+    qqr.q_p90_views,
+    qqr.q_closed_count,
+    qqr.q_hot_hits,
+    qqr.q_bumps,
+    qqr.q_favs,
+    tt.top_tag,
+    br.gold_badges,
+    br.silver_badges,
+    br.bronze_badges,
+    br.total_badges,
+    br.last_badge_date,
+    cs.avg_thank_signal,
+    cs.avg_sorry_signal,
+    cs.avg_comment_score,
+    saw.site_avg_q_score,
+    saw.site_avg_a_score,
+    saw.site_avg_q_views,
+    saw.site_avg_net_votes,
+    -- composite engagement score with null-safety and caps
+    least(1.0,
+      greatest(0.0,
+        (coalesce(ua.total_posts,0) / nullif((coalesce(extract(epoch from now()) - extract(epoch from ru.creationdate), 1) / 86400.0),0)) * 0.2
+        + (coalesce(as2.answers,0) / nullif(coalesce(qs.questions,0) + coalesce(as2.answers,0), 1)) * 0.1
+        + (coalesce(qqr.q_hot_hits,0) / nullif(coalesce(qqr.q_count,0), 1)) * 0.2
+        + (coalesce(qqr.q_avg_score,0) / nullif(saw.site_avg_q_score,1)) * 0.1
+        + (coalesce(as2.avg_answer_score,0) / nullif(saw.site_avg_a_score,1)) * 0.1
+        + (coalesce(qs.avg_views,0) / nullif(saw.site_avg_q_views,1)) * 0.1
+        + (coalesce(ua.nonneg_post_score,0) / nullif(coalesce(ua.total_posts,0),1)) * 0.1
+        + (coalesce(br.total_badges,0) / 50.0) * 0.1
+      )
+    ) as engagement_score
+  from recent_users ru
+  left join user_activity ua on ua.user_id = ru.user_id
+  left join question_stats qs on qs.user_id = ru.user_id
+  left join answer_stats as2 on as2.user_id = ru.user_id
+  left join user_quality_rollup qqr on qqr.user_id = ru.user_id
+  left join top_tag tt on tt.user_id = ru.user_id
+  left join badge_rollup br on br.user_id = ru.user_id
+  left join comment_sentiment cs on cs.user_id = ru.user_id
+  cross join sitewide_baselines saw
+),
+activity_ranked as (
+  select
+    us.*,
+    row_number() over (order by us.engagement_score desc, us.reputation desc) as overall_rank,
+    dense_rank() over (partition by coalesce(us.top_tag,'<none>') order by us.engagement_score desc) as tag_rank,
+    percent_rank() over (order by coalesce(us.q_avg_score,0) desc) as q_score_percentile,
+    ntile(10) over (order by coalesce(us.avg_comment_score,0) desc) as comment_decile
+  from user_scored us
+),
+recent_accepted_answers as (
+  select
+    p.owneruserid as user_id,
+    count(*) filter (
+      where exists (
+        select 1
+        from posts q
+        where q.id = p.parentid
+          and q.acceptedanswerid = p.id
+      )
+      and p.creationdate >= now() - interval '180 days'
+    ) as accepted_last_180
+  from posts p
+  where p.posttypeid = 2
+  group by p.owneruserid
+),
+post_mix as (
+  select
+    u.user_id,
+    sum(case when p.posttypeid = 1 then 1 else 0 end) as q_cnt,
+    sum(case when p.posttypeid = 2 then 1 else 0 end) as a_cnt,
+    sum(case when p.posttypeid not in (1,2) or p.posttypeid is null then 1 else 0 end) as other_cnt
+  from activity_ranked u
+  left join posts p on p.owneruserid = u.user_id
+  group by u.user_id
+),
+anomalies as (
+  select
+    ar.user_id,
+    case
+      when coalesce(ar.q_closed_count,0) > coalesce(ar.q_count,0) * 0.5 then 'high_close_rate'
+      when coalesce(ar.net_votes_cast,0) < -100 then 'toxic_voter'
+      when coalesce(ar.q_hot_hits,0) >= 5 then 'serial_hot_maker'
+      else null
+    end as anomaly_flag
+  from activity_ranked ar
+)
+select
+  ar.user_id,
+  ar.displayname,
+  ar.location,
+  ar.reputation,
+  ar.top_tag,
+  ar.overall_rank,
+  ar.tag_rank,
+  round(ar.engagement_score::numeric, 4) as engagement_score,
+  coalesce(racc.accepted_last_180,0) as accepted_last_180,
+  pm.q_cnt,
+  pm.a_cnt,
+  pm.other_cnt,
+  coalesce(a.anomaly_flag, 'normal') as anomaly_flag,
+  ar.q_score_percentile,
+  ar.comment_decile,
+  ar.last_post_activity,
+  ar.total_posts,
+  ar.total_comments,
+  ar.gold_badges,
+  ar.silver_badges,
+  ar.bronze_badges,
+  ar.total_badges,
+  ar.q_avg_score,
+  ar.avg_answer_score,
+  ar.q_p90_views
+from activity_ranked ar
+left join recent_accepted_answers racc on racc.user_id = ar.user_id
+left join post_mix pm on pm.user_id = ar.user_id
+left join anomalies a on a.user_id = ar.user_id
+where
+  -- complicated predicate mixing string, null, and numeric logic
+  coalesce(nullif(trim(ar.location), ''), 'unknown') not ilike any (array['%test%','%bot%'])
+  and (ar.total_posts is null or ar.total_posts >= 1)
+  and (
+    ar.engagement_score > 0.2
+    or (coalesce(ar.q_hot_hits,0) + coalesce(ar.bronze_badges,0)) >= 3
+    or (ar.q_avg_score > ar.site_avg_q_score and ar.avg_answer_score > ar.site_avg_a_score)
+  )
+order by
+  ar.overall_rank
+limit 250;

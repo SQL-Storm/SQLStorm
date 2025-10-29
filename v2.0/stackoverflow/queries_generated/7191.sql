@@ -1,0 +1,286 @@
+-- {"query": "7191.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2531} 
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        AVG(p.Score) as AvgPostScore,
+        MAX(p.CreationDate) as LastPostDate,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+                DATEDIFF(CURRENT_TIMESTAMP, MAX(p.CreationDate)) 
+            ELSE 0 
+        END as DaysSinceLastPost,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) as ReputationRank,
+        RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) as PostRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.ParentId,
+        p.PostTypeId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.Tags,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question' 
+            WHEN p.PostTypeId = 2 THEN 'Answer' 
+            ELSE 'Other' 
+        END as PostType,
+        CASE 
+            WHEN p.Score > 100 THEN 'Highly Voted'
+            WHEN p.Score > 50 THEN 'Moderately Voted'
+            WHEN p.Score > 0 THEN 'Low Voted'
+            ELSE 'No Votes'
+        END as VoteCategory,
+        DATEDIFF(CURRENT_TIMESTAMP, p.CreationDate) as AgeInDays,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as UserPostSequence,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PrevScore,
+        (p.Score - COALESCE(LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate), 0)) as ScoreChange,
+        LEAD(p.Score, 1) OVER (ORDER BY p.CreationDate) as NextScore,
+        NTILE(10) OVER (ORDER BY p.Score) as ScoreDecile,
+        DENSE_RANK() OVER (ORDER BY p.ViewCount DESC) as ViewRank,
+        PERCENT_RANK() OVER (ORDER BY p.Score) as ScorePercentile
+    FROM Posts p
+    WHERE p.Score IS NOT NULL 
+    AND p.CreationDate >= '2020-01-01'
+),
+CombinedData AS (
+    SELECT 
+        us.Id as UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.PostCount,
+        us.CommentCount,
+        us.BadgeCount,
+        us.AvgPostScore,
+        us.LastPostDate,
+        us.DaysSinceLastPost,
+        us.ReputationRank,
+        us.PostRank,
+        pa.Id as PostId,
+        pa.Title,
+        pa.Score,
+        pa.ViewCount,
+        pa.CreationDate as PostCreationDate,
+        pa.PostType,
+        pa.VoteCategory,
+        pa.AgeInDays,
+        pa.ScoreChange,
+        pa.ScoreDecile,
+        pa.ViewRank,
+        pa.ScorePercentile,
+        CASE 
+            WHEN pa.ScoreChange > 10 THEN 'Significant Increase'
+            WHEN pa.ScoreChange < -5 THEN 'Significant Decrease'
+            WHEN pa.ScoreChange = 0 THEN 'No Change'
+            ELSE 'Minor Change'
+        END as ScoreTrend,
+        COALESCE(pa.Tags, '') as Tags,
+        CASE 
+            WHEN pa.Tags LIKE '%<javascript>%' THEN 1
+            WHEN pa.Tags LIKE '%<python>%' THEN 1
+            WHEN pa.Tags LIKE '%<c++>%' THEN 1
+            ELSE 0
+        END as LanguageTagged,
+        COALESCE(
+            (SELECT TOP 1 p2.Title 
+             FROM PostLinks pl
+             JOIN Posts p2 ON pl.RelatedPostId = p2.Id 
+             WHERE pl.PostId = pa.Id 
+             AND pl.LinkTypeId = 3), 
+            'No Duplicate Found'
+        ) as DuplicateReference,
+        CASE 
+            WHEN pa.ParentId IS NOT NULL AND pa.PostTypeId = 2 THEN 
+                (SELECT Title FROM Posts WHERE Id = pa.ParentId)
+            ELSE NULL 
+        END as QuestionTitle
+    FROM UserStats us
+    INNER JOIN PostAnalysis pa ON us.Id = pa.OwnerUserId
+    WHERE us.PostCount > 0
+),
+FinalAnalysis AS (
+    SELECT 
+        cd.UserId,
+        cd.DisplayName,
+        cd.Reputation,
+        cd.PostCount,
+        cd.CommentCount,
+        cd.BadgeCount,
+        cd.AvgPostScore,
+        cd.LastPostDate,
+        cd.DaysSinceLastPost,
+        cd.ReputationRank,
+        cd.PostRank,
+        cd.PostId,
+        cd.Title,
+        cd.Score,
+        cd.ViewCount,
+        cd.PostCreationDate,
+        cd.PostType,
+        cd.VoteCategory,
+        cd.AgeInDays,
+        cd.ScoreChange,
+        cd.ScoreDecile,
+        cd.ViewRank,
+        cd.ScorePercentile,
+        cd.ScoreTrend,
+        cd.Tags,
+        cd.LanguageTagged,
+        cd.DuplicateReference,
+        cd.QuestionTitle,
+        CASE 
+            WHEN cd.Score >= 100 AND cd.ViewCount >= 1000 THEN 'Popular Post'
+            WHEN cd.Score >= 50 AND cd.ViewCount >= 500 THEN 'Moderate Post'
+            WHEN cd.Score >= 10 AND cd.ViewCount >= 100 THEN 'Low Post'
+            ELSE 'Very Low Post'
+        END as PopularityCategory,
+        DATEDIFF(CURRENT_TIMESTAMP, cd.LastPostDate) as DaysSinceLastActivity,
+        CASE 
+            WHEN cd.Reputation >= 100000 THEN 'Elite User'
+            WHEN cd.Reputation >= 10000 THEN 'Expert User'
+            WHEN cd.Reputation >= 1000 THEN 'Intermediate User'
+            ELSE 'Beginner User'
+        END as UserTier,
+        RANK() OVER (ORDER BY cd.Score DESC) as PostRanking,
+        DENSE_RANK() OVER (ORDER BY cd.ViewCount DESC) as ViewRanking,
+        ROW_NUMBER() OVER (ORDER BY cd.Reputation DESC, cd.Score DESC) as CombinedRanking
+    FROM CombinedData cd
+    WHERE cd.Score > 0 
+    AND cd.PostType IN ('Question', 'Answer')
+)
+SELECT 
+    fa.UserId,
+    fa.DisplayName,
+    fa.Reputation,
+    fa.PostCount,
+    fa.CommentCount,
+    fa.BadgeCount,
+    fa.AvgPostScore,
+    fa.LastPostDate,
+    fa.DaysSinceLastPost,
+    fa.PostRanking,
+    fa.PostId,
+    fa.Title,
+    fa.Score,
+    fa.ViewCount,
+    fa.PostCreationDate,
+    fa.PostType,
+    fa.VoteCategory,
+    fa.AgeInDays,
+    fa.ScoreChange,
+    fa.ScoreDecile,
+    fa.ViewRank,
+    fa.ScorePercentile,
+    fa.ScoreTrend,
+    fa.Tags,
+    fa.LanguageTagged,
+    fa.DuplicateReference,
+    fa.QuestionTitle,
+    fa.PopularityCategory,
+    fa.DaysSinceLastActivity,
+    fa.UserTier,
+    fa.CombinedRanking,
+    CASE 
+        WHEN fa.Score > (SELECT AVG(Score) FROM Posts) THEN 'Above Average'
+        ELSE 'Below Average'
+    END as ScoreVsAverage,
+    CASE 
+        WHEN fa.ViewCount > (SELECT AVG(ViewCount) FROM Posts) THEN 'Above Average Views'
+        ELSE 'Below Average Views'
+    END as ViewsVsAverage,
+    ROW_NUMBER() OVER (PARTITION BY fa.UserTier ORDER BY fa.Score DESC) as TierRank,
+    COALESCE(SUM(fa.Score) OVER (PARTITION BY fa.UserId), 0) as UserTotalScore,
+    AVG(fa.Score) OVER (PARTITION BY fa.UserId) as UserAvgScore,
+    FIRST_VALUE(fa.Title) OVER (PARTITION BY fa.UserId ORDER BY fa.Score DESC) as TopScoredPost,
+    NTH_VALUE(fa.Title, 3) OVER (PARTITION BY fa.UserId ORDER BY fa.Score DESC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) as ThirdBestPost,
+    RANK() OVER (ORDER BY (fa.Score * fa.ViewCount) DESC) as EngagementRank,
+    COUNT(*) OVER (PARTITION BY fa.UserId) as UserPostCount,
+    CASE 
+        WHEN fa.Score = (SELECT MAX(Score) FROM Posts) THEN 1
+        ELSE 0
+    END as IsHighestScoringPost
+FROM FinalAnalysis fa
+WHERE fa.Reputation > 5000
+AND fa.ViewCount IS NOT NULL
+AND (fa.PostType = 'Question' OR fa.PostType = 'Answer')
+AND fa.DaysSinceLastPost <= 365
+UNION ALL
+SELECT 
+    fa.UserId,
+    fa.DisplayName,
+    fa.Reputation,
+    fa.PostCount,
+    fa.CommentCount,
+    fa.BadgeCount,
+    fa.AvgPostScore,
+    fa.LastPostDate,
+    fa.DaysSinceLastPost,
+    fa.PostRanking,
+    fa.PostId,
+    fa.Title,
+    fa.Score,
+    fa.ViewCount,
+    fa.PostCreationDate,
+    fa.PostType,
+    fa.VoteCategory,
+    fa.AgeInDays,
+    fa.ScoreChange,
+    fa.ScoreDecile,
+    fa.ViewRank,
+    fa.ScorePercentile,
+    fa.ScoreTrend,
+    fa.Tags,
+    fa.LanguageTagged,
+    fa.DuplicateReference,
+    fa.QuestionTitle,
+    fa.PopularityCategory,
+    fa.DaysSinceLastActivity,
+    fa.UserTier,
+    fa.CombinedRanking,
+    CASE 
+        WHEN fa.Score > (SELECT AVG(Score) FROM Posts) THEN 'Above Average'
+        ELSE 'Below Average'
+    END as ScoreVsAverage,
+    CASE 
+        WHEN fa.ViewCount > (SELECT AVG(ViewCount) FROM Posts) THEN 'Above Average Views'
+        ELSE 'Below Average Views'
+    END as ViewsVsAverage,
+    ROW_NUMBER() OVER (PARTITION BY fa.UserTier ORDER BY fa.Score DESC) as TierRank,
+    COALESCE(SUM(fa.Score) OVER (PARTITION BY fa.UserId), 0) as UserTotalScore,
+    AVG(fa.Score) OVER (PARTITION BY fa.UserId) as UserAvgScore,
+    FIRST_VALUE(fa.Title) OVER (PARTITION BY fa.UserId ORDER BY fa.Score DESC) as TopScoredPost,
+    NTH_VALUE(fa.Title, 3) OVER (PARTITION BY fa.UserId ORDER BY fa.Score DESC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) as ThirdBestPost,
+    RANK() OVER (ORDER BY (fa.Score * fa.ViewCount) DESC) as EngagementRank,
+    COUNT(*) OVER (PARTITION BY fa.UserId) as UserPostCount,
+    CASE 
+        WHEN fa.Score = (SELECT MAX(Score) FROM Posts) THEN 1
+        ELSE 0
+    END as IsHighestScoringPost
+FROM FinalAnalysis fa
+WHERE fa.Reputation BETWEEN 1000 AND 5000
+AND fa.ViewCount IS NOT NULL
+AND (fa.PostType = 'Question' OR fa.PostType = 'Answer')
+AND fa.DaysSinceLastPost <= 180
+ORDER BY fa.Reputation DESC, fa.Score DESC
+OFFSET 100 ROWS
+FETCH NEXT 100 ROWS ONLY;

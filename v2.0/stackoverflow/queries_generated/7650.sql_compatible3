@@ -1,0 +1,254 @@
+WITH PostStats AS (
+    SELECT 
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.ParentId,
+        p.AcceptedAnswerId,
+        CASE WHEN p.Score > 0 THEN 1 ELSE 0 END AS IsPositiveScore,
+        CASE WHEN p.ViewCount > 1000 THEN 1 ELSE 0 END AS IsPopular,
+        COALESCE(p.AnswerCount, 0) AS ActualAnswerCount,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Question with Accepted Answer'
+            WHEN p.PostTypeId = 1 THEN 'Question without Accepted Answer'
+            WHEN p.PostTypeId = 2 AND p.ParentId IS NOT NULL THEN 'Answer'
+            ELSE 'Other'
+        END AS PostCategory,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevScore,
+        LEAD(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextScore,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PostRank,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) AS TotalPostsByUser,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS AvgScoreByUser,
+        SUM(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativeScore,
+        NTILE(4) OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score) AS ScoreQuartile
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+      AND p.CreationDate >= DATE '2020-01-01'
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.LastAccessDate,
+        u.CreationDate,
+        COUNT(DISTINCT ps.PostId) AS PostCount,
+        SUM(ps.Score) AS TotalScore,
+        AVG(ps.Score) AS AvgPostScore,
+        MAX(ps.CreationDate) AS LastPostDate,
+        MIN(ps.CreationDate) AS FirstPostDate,
+        COUNT(CASE WHEN ps.IsPopular = 1 THEN 1 END) AS PopularPostCount,
+        COUNT(CASE WHEN ps.IsPositiveScore = 1 THEN 1 END) AS PositiveScoreCount,
+        STDDEV(CAST(ps.Score AS numeric)) AS ScoreStdDev,
+        EXTRACT(epoch FROM (COALESCE(MAX(ps.CreationDate), MIN(ps.CreationDate)) - COALESCE(MIN(ps.CreationDate), MAX(ps.CreationDate))))/86400 AS DaysActive
+    FROM Users u
+    LEFT JOIN PostStats ps ON u.Id = ps.OwnerUserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.LastAccessDate, u.CreationDate
+),
+TagAnalysis AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count AS TagCountRaw,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        COALESCE(t.Count, 0) AS TagCount,
+        CASE WHEN COALESCE(t.Count, 0) > 1000 THEN 'Highly Popular' ELSE 'Moderate' END AS PopularityLevel,
+        DENSE_RANK() OVER (ORDER BY COALESCE(t.Count, 0) DESC) AS PopularityRank
+    FROM Tags t
+    WHERE COALESCE(t.Count, 0) > 0
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        ps.PostId,
+        ps.PostTypeId,
+        ps.Score,
+        ps.ViewCount,
+        ps.CommentCount,
+        ps.FavoriteCount,
+        ps.Title,
+        ps.Tags,
+        ps.OwnerUserId,
+        ps.PostCategory,
+        ps.AnswerCount,
+        ps.ParentId,
+        ps.AcceptedAnswerId,
+        ps.IsPositiveScore,
+        ps.IsPopular,
+        ps.ActualAnswerCount,
+        ps.PrevScore,
+        ps.NextScore,
+        ps.PostRank,
+        ps.TotalPostsByUser,
+        ps.AvgScoreByUser,
+        ps.CumulativeScore,
+        ps.ScoreQuartile,
+        CASE 
+            WHEN ps.Score > ps.AvgScoreByUser THEN 'Above Average'
+            WHEN ps.Score < ps.AvgScoreByUser THEN 'Below Average'
+            ELSE 'Average'
+        END AS ScoreCategory,
+        CASE 
+            WHEN ps.Score > ps.PrevScore AND ps.Score > ps.NextScore THEN 'Peak Score'
+            WHEN ps.Score < ps.PrevScore AND ps.Score < ps.NextScore THEN 'Low Score'
+            ELSE 'Normal Score'
+        END AS ScoreTrend,
+        ps.CreationDate,
+        (ps.CreationDate BETWEEN DATE '2020-01-01' AND DATE '2020-12-31') AS Is2020Post,
+        (ps.CreationDate BETWEEN DATE '2021-01-01' AND DATE '2021-12-31') AS Is2021Post,
+        (ps.CreationDate BETWEEN DATE '2022-01-01' AND DATE '2022-12-31') AS Is2022Post,
+        (ps.CreationDate BETWEEN DATE '2023-01-01' AND DATE '2023-12-31') AS Is2023Post
+    FROM PostStats ps
+),
+FinalAnalysis AS (
+    SELECT 
+        ca.PostId,
+        ca.PostTypeId,
+        ca.Score,
+        ca.ViewCount,
+        ca.CommentCount,
+        ca.FavoriteCount,
+        ca.Title,
+        ca.Tags,
+        ca.OwnerUserId,
+        ca.PostCategory,
+        ca.AnswerCount,
+        ca.ParentId,
+        ca.AcceptedAnswerId,
+        ca.IsPositiveScore,
+        ca.IsPopular,
+        ca.ActualAnswerCount,
+        ca.PrevScore,
+        ca.NextScore,
+        ca.PostRank,
+        ca.TotalPostsByUser,
+        ca.AvgScoreByUser,
+        ca.CumulativeScore,
+        ca.ScoreQuartile,
+        ca.ScoreCategory,
+        ca.ScoreTrend,
+        ca.CreationDate,
+        ca.Is2020Post,
+        ca.Is2021Post,
+        ca.Is2022Post,
+        ca.Is2023Post,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.Views AS UserViews,
+        ua.UpVotes,
+        ua.DownVotes,
+        ua.LastAccessDate,
+        ua.CreationDate AS UserCreationDate,
+        ua.PostCount,
+        ua.TotalScore AS UserTotalScore,
+        ua.AvgPostScore,
+        ua.LastPostDate,
+        ua.FirstPostDate,
+        ua.PopularPostCount,
+        ua.PositiveScoreCount,
+        ua.ScoreStdDev,
+        ua.DaysActive,
+        ta.TagName,
+        ta.TagCount AS TagCount,
+        ta.PopularityLevel,
+        ta.PopularityRank,
+        CASE 
+            WHEN ta.TagName LIKE '%python%' THEN 'Python Related'
+            WHEN ta.TagName LIKE '%javascript%' THEN 'JavaScript Related'
+            WHEN ta.TagName LIKE '%c++%' THEN 'C++ Related'
+            WHEN ta.TagName LIKE '%java%' THEN 'Java Related'
+            ELSE 'Other'
+        END AS TagCategory,
+        ROW_NUMBER() OVER (ORDER BY ca.Score DESC) AS GlobalRank,
+        RANK() OVER (PARTITION BY ca.PostTypeId ORDER BY ca.Score DESC) AS TypeRank,
+        DENSE_RANK() OVER (ORDER BY ca.Score DESC) AS DenseGlobalRank,
+        PERCENT_RANK() OVER (ORDER BY ca.Score DESC) AS ScorePercentile,
+        NTILE(100) OVER (ORDER BY ca.Score DESC) AS ScoreDecile
+    FROM ComplexPostAnalysis ca
+    LEFT JOIN UserActivity ua ON ca.OwnerUserId = ua.UserId
+    LEFT JOIN (
+        SELECT 
+            p.Id AS PostId,
+            t.TagName,
+            COALESCE(t.Count, 0) AS Count,
+            CASE WHEN COALESCE(t.Count,0) > 1000 THEN 'Highly Popular' ELSE 'Moderate' END AS PopularityLevel,
+            DENSE_RANK() OVER (ORDER BY COALESCE(t.Count,0) DESC) AS PopularityRank
+        FROM Posts p
+        JOIN Tags t ON p.Tags LIKE '%' || t.TagName || '%'
+        WHERE p.PostTypeId = 1
+    ) ta ON ca.PostId = ta.PostId
+    WHERE ca.IsPopular = 1
+       OR ca.IsPositiveScore = 1
+       OR ca.Score > 100
+       OR (ua.PostCount > 50 AND ua.AvgPostScore > 5)
+)
+SELECT 
+    COUNT(*) AS TotalRows,
+    COUNT(DISTINCT PostId) AS UniquePosts,
+    COUNT(DISTINCT OwnerUserId) AS UniqueUsers,
+    COUNT(DISTINCT TagName) AS UniqueTags,
+    AVG(Score) AS AvgScore,
+    MAX(Score) AS MaxScore,
+    MIN(Score) AS MinScore,
+    AVG(ViewCount) AS AvgViews,
+    AVG(CommentCount) AS AvgComments,
+    AVG(FavoriteCount) AS AvgFavorites,
+    AVG(Reputation) AS AvgUserReputation,
+    SUM(Score) AS TotalScore,
+    MAX(GlobalRank) AS MaxGlobalRank,
+    MIN(GlobalRank) AS MinGlobalRank,
+    AVG(AvgScoreByUser) AS AvgUserAvgScore,
+    COUNT(CASE WHEN ScoreCategory = 'Above Average' THEN 1 END) AS AboveAvgCount,
+    COUNT(CASE WHEN ScoreCategory = 'Below Average' THEN 1 END) AS BelowAvgCount,
+    COUNT(CASE WHEN ScoreCategory = 'Average' THEN 1 END) AS AvgCount,
+    COUNT(CASE WHEN ScoreTrend = 'Peak Score' THEN 1 END) AS PeakScoreCount,
+    COUNT(CASE WHEN ScoreTrend = 'Low Score' THEN 1 END) AS LowScoreCount,
+    COUNT(CASE WHEN ScoreTrend = 'Normal Score' THEN 1 END) AS NormalScoreCount,
+    COUNT(CASE WHEN Is2020Post = TRUE THEN 1 END) AS Posts2020,
+    COUNT(CASE WHEN Is2021Post = TRUE THEN 1 END) AS Posts2021,
+    COUNT(CASE WHEN Is2022Post = TRUE THEN 1 END) AS Posts2022,
+    COUNT(CASE WHEN Is2023Post = TRUE THEN 1 END) AS Posts2023,
+    COUNT(CASE WHEN TagCategory = 'Python Related' THEN 1 END) AS PythonPosts,
+    COUNT(CASE WHEN TagCategory = 'JavaScript Related' THEN 1 END) AS JavaScriptPosts,
+    COUNT(CASE WHEN TagCategory = 'C++ Related' THEN 1 END) AS CppPosts,
+    COUNT(CASE WHEN TagCategory = 'Java Related' THEN 1 END) AS JavaPosts,
+    COUNT(CASE WHEN TagCategory = 'Other' THEN 1 END) AS OtherPosts,
+    STRING_AGG( ('Post-' || CAST(PostId AS varchar) || ':' || CAST(Score AS varchar) || ':' || COALESCE(TagName,'')), '; ') AS SamplePostDetails,
+    FIRST_VALUE(PostId) OVER (ORDER BY Score DESC) AS HighestScorePostId,
+    FIRST_VALUE(OwnerUserId) OVER (ORDER BY Score DESC) AS HighestScoreUserId,
+    FIRST_VALUE(DisplayName) OVER (ORDER BY Score DESC) AS HighestScoreUserName,
+    FIRST_VALUE(AvgScoreByUser) OVER (ORDER BY Score DESC) AS HighestScoreUserAvg,
+    LAST_VALUE(PostId) OVER (ORDER BY Score DESC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS LowestScorePostId,
+    LAST_VALUE(OwnerUserId) OVER (ORDER BY Score DESC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS LowestScoreUserId,
+    LAST_VALUE(DisplayName) OVER (ORDER BY Score DESC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS LowestScoreUserName
+FROM FinalAnalysis
+WHERE PostId IS NOT NULL
+  AND OwnerUserId IS NOT NULL
+  AND Reputation > 0
+GROUP BY 
+    PostCategory,
+    ScoreCategory,
+    ScoreTrend,
+    TagCategory,
+    Score,
+    PostId,
+    OwnerUserId,
+    TagName,
+    DisplayName,
+    AvgScoreByUser,
+    GlobalRank,
+    Reputation
+HAVING COUNT(*) > 0
+ORDER BY Score DESC
+LIMIT 1000 OFFSET 0;

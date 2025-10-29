@@ -1,0 +1,172 @@
+-- {"query": "1506.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2636} 
+
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate AS UserLastAccessDate,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        MAX(B.Date) AS LastBadgeDate,
+        MIN(B.Date) AS FirstBadgeDate,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        SUM(COALESCE(C.Score, 0)) AS TotalCommentScore,
+        AVG(EXTRACT(EPOCH FROM (U.LastAccessDate - U.CreationDate)) / 86400.0) OVER (PARTITION BY EXTRACT(YEAR FROM U.CreationDate)) AS AvgDaysActiveForCreationYear,
+        DENSE_RANK() OVER (ORDER BY U.Reputation DESC, U.UpVotes DESC, COUNT(DISTINCT B.Id) DESC) AS UserOverallRank
+    FROM Users U
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.UpVotes
+),
+PostStatsAndHistory AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount AS PostDirectCommentCount,
+        P.AcceptedAnswerId,
+        P.ParentId,
+        P.ClosedDate,
+        P.LastEditDate,
+        P.LastActivityDate,
+        P.Title,
+        P.Tags,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotes,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotes,
+        SUM(CASE WHEN V.VoteTypeId = 5 THEN 1 ELSE 0 END) AS TotalFavorites,
+        SUM(CASE WHEN V.VoteTypeId = 1 THEN 1 ELSE 0 END) AS AcceptedAnswerVotes,
+        COUNT(PH.Id) FILTER (WHERE PH.PostHistoryTypeId IN (4, 5, 6)) AS EditHistoryCount,
+        COUNT(PH.Id) FILTER (WHERE PH.PostHistoryTypeId = 10) AS CloseHistoryCount,
+        COUNT(PH.Id) FILTER (WHERE PH.PostHistoryTypeId = 11) AS ReopenHistoryCount,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.CreationDate ELSE NULL END) AS LastEditHistoryDate,
+        AVG(P.Score) OVER (PARTITION BY P.PostTypeId) AS AvgScoreForPostType,
+        STRING_AGG(DISTINCT SUBSTRING(TRIM(T.TagName), 1, 10), ', ') FILTER (WHERE T.TagName IS NOT NULL) AS AssociatedTagSample,
+        (SELECT COUNT(DISTINCT C.UserId)
+         FROM Comments C
+         WHERE C.PostId = P.Id
+           AND C.CreationDate BETWEEN P.CreationDate AND P.CreationDate + INTERVAL '7 days'
+           AND C.UserId IS NOT NULL) AS CommentersInFirstWeek,
+        (SELECT MAX(PL.CreationDate)
+         FROM PostLinks PL
+         WHERE PL.PostId = P.Id AND PL.LinkTypeId = 3) AS LastDuplicateLinkDate
+    FROM Posts P
+    LEFT JOIN Votes V ON P.Id = V.PostId
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    LEFT JOIN (SELECT Id, TagName FROM Tags) T ON P.Tags LIKE '%<' || T.TagName || '>%'
+    GROUP BY
+        P.Id, P.PostTypeId, P.OwnerUserId, P.CreationDate, P.Score, P.ViewCount,
+        P.AnswerCount, P.CommentCount, P.AcceptedAnswerId, P.ParentId, P.ClosedDate,
+        P.LastEditDate, P.LastActivityDate, P.Title, P.Tags
+),
+QuestionAnswerAnalysis AS (
+    SELECT
+        Q.PostId AS QuestionId,
+        Q.Title AS QuestionTitle,
+        Q.OwnerUserId AS QuestionOwnerId,
+        Q.PostScore AS QuestionScore,
+        A.PostId AS AnswerId,
+        A.OwnerUserId AS AnswerOwnerId,
+        A.PostScore AS AnswerScore,
+        A.PostCreationDate AS AnswerCreationDate,
+        Q.PostCreationDate AS QuestionCreationDate,
+        (CAST(COALESCE(A.PostScore, 0) AS NUMERIC) / NULLIF(Q.PostScore, 0)) AS AnswerScoreRatioToQuestion,
+        CASE
+            WHEN Q.ClosedDate IS NOT NULL AND A.AcceptedAnswerId = Q.PostId THEN 'ClosedWithAcceptedAnswer'
+            WHEN Q.ClosedDate IS NOT NULL AND A.AcceptedAnswerId IS NULL THEN 'ClosedWithoutAcceptedAnswer'
+            WHEN Q.ClosedDate IS NULL AND A.AcceptedAnswerId = Q.PostId THEN 'OpenWithAcceptedAnswer'
+            ELSE 'OpenWithoutAcceptedAnswer'
+        END AS QuestionStatusCategory,
+        LAG(A.PostScore, 1, 0) OVER (PARTITION BY Q.PostId ORDER BY A.PostCreationDate) AS PreviousAnswerScore,
+        EXTRACT(EPOCH FROM (A.PostCreationDate - Q.PostCreationDate)) / 3600 AS HoursToAnswer
+    FROM PostStatsAndHistory Q
+    LEFT JOIN PostStatsAndHistory A ON Q.PostId = A.ParentId AND A.PostTypeId = 2
+    WHERE Q.PostTypeId = 1
+),
+TopPostsByImpact AS (
+    SELECT
+        P.PostId,
+        P.OwnerUserId,
+        P.PostCreationDate,
+        P.PostScore,
+        P.Title,
+        'HighViewQuestion' AS ImpactType
+    FROM PostStatsAndHistory P
+    WHERE P.PostTypeId = 1 AND P.ViewCount > 50000 AND P.AnswerCount > 5
+    UNION ALL
+    SELECT
+        P.PostId,
+        P.OwnerUserId,
+        P.PostCreationDate,
+        P.PostScore,
+        P.Title,
+        'HighScoreAnswer' AS ImpactType
+    FROM PostStatsAndHistory P
+    WHERE P.PostTypeId = 2 AND P.PostScore > 100 AND P.ParentId IS NOT NULL
+)
+SELECT
+    UE.UserId,
+    UE.DisplayName,
+    UE.Reputation,
+    UE.TotalBadges,
+    UE.GoldBadges,
+    UE.TotalCommentsMade,
+    UE.TotalCommentScore,
+    UE.AvgDaysActiveForCreationYear,
+    UE.UserOverallRank,
+    ROUND(CAST(UE.Reputation AS NUMERIC) / NULLIF(EXTRACT(DAY FROM (UE.UserLastAccessDate - UE.UserCreationDate)), 0), 2) AS ReputationPerDayActive,
+    TP.PostId AS TopImpactPostId,
+    TP.ImpactType AS TopImpactPostType,
+    TP.PostScore AS TopImpactPostScore,
+    TP.Title AS TopImpactPostTitle,
+    SUM(PSH.TotalUpVotes) AS UserTotalUpVotesOnOwnedPosts,
+    SUM(PSH.TotalDownVotes) AS UserTotalDownVotesOnOwnedPosts,
+    COUNT(DISTINCT PSH.PostId) AS UserTotalPostsOwned,
+    AVG(PSH.PostScore) AS UserAvgPostScore,
+    MAX(PSH.LastEditHistoryDate) AS UserLastPostEditDate,
+    COUNT(DISTINCT CASE WHEN PSH.PostTypeId = 1 THEN PSH.PostId END) AS UserQuestionsCount,
+    COUNT(DISTINCT CASE WHEN PSH.PostTypeId = 2 THEN PSH.PostId END) AS UserAnswersCount,
+    ARRAY_AGG(DISTINCT PSH.AssociatedTagSample) FILTER (WHERE PSH.AssociatedTagSample IS NOT NULL) AS UserTopTagsFromPosts,
+    STRING_AGG(DISTINCT QAA.QuestionStatusCategory, '; ') FILTER (WHERE QAA.QuestionStatusCategory IS NOT NULL) AS QuestionStatusCategories,
+    MAX(QAA.AnswerScoreRatioToQuestion) AS MaxAnswerScoreRatio,
+    MIN(QAA.HoursToAnswer) AS MinHoursToAnswer,
+    SUM(CASE WHEN PSH.CommentersInFirstWeek > 0 THEN 1 ELSE 0 END) AS PostsWithEarlyCommenters,
+    SUM(CASE WHEN PSH.LastDuplicateLinkDate IS NOT NULL THEN 1 ELSE 0 END) AS PostsMarkedAsDuplicateCount,
+    SUM(CASE WHEN PSH.PostScore > PSH.AvgScoreForPostType THEN 1 ELSE 0 END) AS PostsAboveAvgScoreOfType,
+    COALESCE(NULLIF(REPLACE(REPLACE(REPLACE(U.Location, 'United States', 'USA'), 'England', 'UK'), 'Germany', 'DE'), ''), 'Undisclosed') AS CleanedLocation,
+    UPPER(SUBSTRING(COALESCE(U.DisplayName, 'ANON'), 1, 1)) AS DisplayNameInitial,
+    CASE
+        WHEN UE.Reputation > 10000 AND UE.GoldBadges > 0 THEN 'Elite Contributor'
+        WHEN UE.Reputation > 5000 AND UE.TotalBadges > 10 THEN 'Experienced Member'
+        WHEN UE.TotalCommentsMade > 50 AND UE.TotalBadges > 0 THEN 'Active Commenter'
+        ELSE 'Casual User'
+    END AS UserTier
+FROM UserEngagement UE
+LEFT JOIN Users U ON UE.UserId = U.Id
+LEFT JOIN PostStatsAndHistory PSH ON UE.UserId = PSH.OwnerUserId
+LEFT JOIN QuestionAnswerAnalysis QAA ON UE.UserId = QAA.QuestionOwnerId OR UE.UserId = QAA.AnswerOwnerId
+LEFT JOIN TopPostsByImpact TP ON UE.UserId = TP.OwnerUserId AND TP.PostCreationDate = (
+    SELECT MAX(TP2.PostCreationDate) FROM TopPostsByImpact TP2 WHERE TP2.OwnerUserId = UE.UserId
+)
+WHERE
+    UE.Reputation > 1000
+    AND UE.UserOverallRank <= 1000
+    AND (PSH.PostId IS NOT NULL OR UE.TotalBadges > 5)
+    AND (U.WebsiteUrl IS NOT NULL OR U.AboutMe IS NOT NULL OR UE.TotalCommentsMade > 10)
+    AND PSH.PostCreationDate > UE.UserCreationDate + INTERVAL '30 days'
+GROUP BY
+    UE.UserId, UE.DisplayName, UE.Reputation, UE.TotalBadges, UE.GoldBadges, UE.TotalCommentsMade,
+    UE.TotalCommentScore, UE.AvgDaysActiveForCreationYear, UE.UserOverallRank,
+    U.LastAccessDate, U.CreationDate, U.Location, U.DisplayName, U.WebsiteUrl, U.AboutMe,
+    TP.PostId, TP.ImpactType, TP.PostScore, TP.Title
+HAVING
+    COUNT(DISTINCT PSH.PostId) > 0 OR UE.TotalBadges > 0
+ORDER BY
+    UE.Reputation DESC, UserTotalUpVotesOnOwnedPosts DESC
+LIMIT 1000;

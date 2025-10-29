@@ -1,0 +1,121 @@
+-- {"query": "4502.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1058} 
+
+WITH
+  RankedPostEdits AS (
+    SELECT
+      ph.PostId,
+      ph.UserId,
+      ph.CreationDate AS EditDate,
+      ph.Comment AS EditComment,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate DESC) as rn
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+  ),
+  UserEditSummary AS (
+    SELECT
+      rpe.UserId,
+      COUNT(rpe.PostId) AS TotalEdits,
+      MAX(rpe.EditDate) AS LastEditDate,
+      STRING_AGG(DISTINCT SUBSTRING(p.Title, 1, 50), ', ') AS SampleTitlesEdited
+    FROM RankedPostEdits rpe
+    JOIN Posts p
+      ON rpe.PostId = p.Id
+    WHERE rpe.rn = 1
+    GROUP BY
+      rpe.UserId
+    HAVING
+      COUNT(rpe.PostId) > 5
+  ),
+  TopUsers AS (
+    SELECT
+      ues.UserId,
+      u.DisplayName,
+      ues.TotalEdits,
+      ues.LastEditDate,
+      ues.SampleTitlesEdited,
+      RANK() OVER (ORDER BY ues.TotalEdits DESC) AS UserRank
+    FROM UserEditSummary ues
+    JOIN Users u
+      ON ues.UserId = u.Id
+  ),
+  PostCommentCount AS (
+    SELECT
+      p.Id AS PostId,
+      COUNT(c.Id) AS CommentCount,
+      SUM(c.Score) AS TotalCommentScore,
+      AVG(c.Score) AS AvgCommentScore,
+      MAX(c.CreationDate) AS LastCommentDate
+    FROM Posts p
+    LEFT JOIN Comments c
+      ON p.Id = c.PostId
+    GROUP BY
+      p.Id
+  )
+SELECT
+  t.UserRank,
+  t.DisplayName,
+  t.TotalEdits,
+  t.LastEditDate,
+  t.SampleTitlesEdited,
+  pcc.PostId,
+  pcc.CommentCount,
+  pcc.TotalCommentScore,
+  pcc.AvgCommentScore,
+  pcc.LastCommentDate,
+  CASE
+    WHEN pcc.CommentCount > 100 THEN 'High'
+    WHEN pcc.CommentCount BETWEEN 50 AND 100 THEN 'Medium'
+    ELSE 'Low'
+  END AS CommentVolumeCategory,
+  CASE
+    WHEN pcc.AvgCommentScore > 5 THEN 'Positive'
+    WHEN pcc.AvgCommentScore < 0 THEN 'Negative'
+    ELSE 'Neutral'
+  END AS SentimentCategory,
+  (
+    SELECT
+      COUNT(*)
+    FROM PostLinks pl
+    WHERE
+      pl.PostId = pcc.PostId AND pl.LinkTypeId = 1
+  ) AS LinkedPostsCount,
+  (
+    SELECT
+      COUNT(*)
+    FROM PostLinks pl
+    WHERE
+      pl.RelatedPostId = pcc.PostId AND pl.LinkTypeId = 3
+  ) AS DuplicateLinksCount,
+  COALESCE(p.AnswerCount, 0) AS AnswerCount,
+  p.ViewCount,
+  p.Score AS PostScore,
+  CASE
+    WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+    ELSE 'Open'
+  END AS PostStatus,
+  UPPER(pt.Name) AS PostType,
+  CASE
+    WHEN p.OwnerUserId = -1 THEN 'Community'
+    ELSE COALESCE(u.DisplayName, 'Unknown')
+  END AS OwnerDisplayName,
+  p.Title,
+  LENGTH(p.Body) AS BodyLength,
+  SUBSTRING(p.Tags, 2, CHARINDEX('>', p.Tags, 1) - 2) AS FirstTag,
+  CASE
+    WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Yes'
+    ELSE 'No'
+  END AS IsCommunityOwned
+FROM TopUsers t
+LEFT JOIN Posts p
+  ON t.UserId = p.OwnerUserId
+LEFT JOIN PostCommentCount pcc
+  ON p.Id = pcc.PostId
+LEFT JOIN PostTypes pt
+  ON p.PostTypeId = pt.Id
+LEFT JOIN Users u
+  ON p.OwnerUserId = u.Id
+WHERE
+  p.CreationDate >= '2023-01-01' AND p.PostTypeId = 1 -- Questions created in 2023
+ORDER BY
+  t.UserRank,
+  pcc.TotalCommentScore DESC;

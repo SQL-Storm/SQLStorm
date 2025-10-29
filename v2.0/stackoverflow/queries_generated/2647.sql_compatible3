@@ -1,0 +1,163 @@
+with recursive RecursiveUserHierarchy(Id, DisplayName, Reputation, Level, Path) as (
+    select
+        Id,
+        DisplayName,
+        Reputation,
+        0 as Level,
+        cast(DisplayName as varchar(1000)) as Path
+    from Users
+    where Id in (
+        select OwnerUserId
+        from Posts
+        where PostTypeId = 1 and OwnerUserId is not null
+    )
+    union all
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        ruh.Level + 1,
+        cast(ruh.Path || ' > ' || u.DisplayName as varchar(1000)) as Path
+    from Users u
+    join RecursiveUserHierarchy ruh on u.Id = (
+        select p.OwnerUserId
+        from Posts p
+        where p.PostTypeId = 1 and p.OwnerUserId = u.Id and p.AcceptedAnswerId is not null
+        limit 1
+    )
+    where ruh.Level < 3
+),
+TopPosts as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        row_number() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as rn
+    from Posts p
+    where p.PostTypeId in (1, 2)
+),
+AnswersWithComments as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.Score as AnswerScore,
+        count(c.Id) as CommentCount,
+        coalesce(sum(case when v.VoteTypeId = 2 then 1 else 0 end), 0) as UpVotes,
+        coalesce(sum(case when v.VoteTypeId = 3 then 1 else 0 end), 0) as DownVotes
+    from Posts a
+    left join Comments c on c.PostId = a.Id
+    left join Votes v on v.PostId = a.Id
+    where a.PostTypeId = 2
+    group by a.Id, a.ParentId, a.Score
+),
+DuplicateLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name as LinkTypeName
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    where pl.LinkTypeId = 3
+),
+BadgeSummary as (
+    select 
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        count(*) as TotalBadges,
+        max(b.Date) as LastBadgeDate
+    from Badges b
+    group by b.UserId
+),
+UserActivityWindow as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        row_number() over (partition by u.Id order by p.CreationDate desc) as RecentPostRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+),
+TopQuestionsWithAnswers as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.Tags,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.OwnerUserId as QuestionOwnerId,
+        au.AnswerId,
+        au.AnswerScore,
+        au.CommentCount,
+        au.UpVotes,
+        au.DownVotes,
+        u.DisplayName as QuestionOwnerName,
+        b.GoldBadges,
+        b.SilverBadges,
+        b.BronzeBadges,
+        b.TotalBadges,
+        b.LastBadgeDate,
+        q.rn
+    from TopPosts q
+    left join AnswersWithComments au on au.QuestionId = q.Id
+    left join Users u on u.Id = q.OwnerUserId
+    left join BadgeSummary b on b.UserId = q.OwnerUserId
+    where q.PostTypeId = 1 and q.rn <= 100
+)
+select
+    tq.QuestionId,
+    case when char_length(tq.Title) > 50 then substring(tq.Title from 1 for 50) || '...' else substring(tq.Title from 1 for 50) end as ShortTitle,
+    coalesce(tq.Tags, '<no tags>') as Tags,
+    tq.QuestionScore,
+    tq.ViewCount,
+    coalesce(tq.GoldBadges,0) as GoldBadges,
+    coalesce(tq.SilverBadges,0) as SilverBadges,
+    coalesce(tq.BronzeBadges,0) as BronzeBadges,
+    coalesce(tq.TotalBadges,0) as TotalBadges,
+    to_char(tq.LastBadgeDate, 'YYYY-MM-DD') as LastBadgeDate,
+    au.AnswerId,
+    au.AnswerScore,
+    au.CommentCount,
+    au.UpVotes,
+    au.DownVotes,
+    case
+        when au.AnswerScore > tq.QuestionScore then 'AnswerScoreHigher'
+        when au.AnswerScore = tq.QuestionScore then 'AnswerScoreEqual'
+        else 'AnswerScoreLower'
+    end as AnswerScoreComparison,
+    case when dq.PostId is not null then 'Duplicate' else 'Original' end as DuplicateStatus,
+    ruh.Level as UserRecursionLevel,
+    ruh.Path as UserHierarchyPath
+from TopQuestionsWithAnswers tq
+left join AnswersWithComments au on au.AnswerId = tq.AnswerId
+left join DuplicateLinks dq on dq.PostId = tq.QuestionId
+left join RecursiveUserHierarchy ruh on ruh.Id = tq.QuestionOwnerId
+where (au.UpVotes - au.DownVotes) > 2 or au.CommentCount > 1
+group by
+    tq.QuestionId,
+    tq.Title,
+    tq.Tags,
+    tq.QuestionScore,
+    tq.ViewCount,
+    tq.GoldBadges,
+    tq.SilverBadges,
+    tq.BronzeBadges,
+    tq.TotalBadges,
+    tq.LastBadgeDate,
+    au.AnswerId,
+    au.AnswerScore,
+    au.CommentCount,
+    au.UpVotes,
+    au.DownVotes,
+    dq.PostId,
+    ruh.Level,
+    ruh.Path
+order by tq.QuestionScore desc, au.AnswerScore desc, tq.TotalBadges desc
+limit 100;

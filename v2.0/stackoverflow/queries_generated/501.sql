@@ -1,0 +1,264 @@
+-- {"query": "501.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2834} 
+with top_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        u.location,
+        coalesce(nullif(trim(u.websiteurl), ''), 'N/A') as websiteurl,
+        sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+        sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+        sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+        count(b.id) as total_badges,
+        row_number() over (order by u.reputation desc, u.id) as rn
+    from users u
+    left join badges b
+        on b.userid = u.id
+    group by u.id, u.displayname, u.reputation, u.creationdate, u.location, u.websiteurl
+),
+question_activity as (
+    select
+        p.owneruserid as user_id,
+        count(*) filter (where p.posttypeid = 1) as questions,
+        count(*) filter (where p.posttypeid = 2) as answers,
+        sum(coalesce(p.viewcount, 0)) filter (where p.posttypeid = 1) as total_views_questions,
+        avg(nullif(p.score, 0)) filter (where p.posttypeid = 2) as avg_answer_score_nonzero,
+        max(p.score) as max_post_score,
+        min(p.score) as min_post_score,
+        sum(case when p.closeddate is not null then 1 else 0 end) as closed_posts
+    from posts p
+    where p.owneruserid is not null
+    group by p.owneruserid
+),
+vote_agg as (
+    select
+        p.owneruserid as user_id,
+        sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes_received,
+        sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes_received,
+        sum(case when v.votetypeid = 1 then 1 else 0 end) as accepts_received,
+        sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites_received
+    from posts p
+    left join votes v
+        on v.postid = p.id
+    where p.owneruserid is not null
+    group by p.owneruserid
+),
+latest_edits as (
+    select
+        ph.postid,
+        ph.userid,
+        ph.posthistorytypeid,
+        ph.creationdate,
+        row_number() over (partition by ph.postid order by ph.creationdate desc, ph.id desc) as rn
+    from posthistory ph
+    where ph.posthistorytypeid in (4,5,6,11,13,24) -- edit title/body/tags/reopen/undelete/suggested edit
+),
+tag_extraction as (
+    select
+        p.id as post_id,
+        p.owneruserid as user_id,
+        unnest(string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')) as tagname
+    from posts p
+    where p.posttypeid = 1
+      and p.tags is not null
+      and length(p.tags) > 2
+),
+top_tags as (
+    select
+        te.user_id,
+        lower(te.tagname) as tagname,
+        count(*) as tag_q_count,
+        row_number() over (partition by te.user_id order by count(*) desc, lower(te.tagname)) as tag_rn
+    from tag_extraction te
+    group by te.user_id, lower(te.tagname)
+),
+user_dup_links as (
+    select
+        p.owneruserid as user_id,
+        count(*) filter (where pl.linktypeid = 3) as duplicates_marked,
+        count(*) filter (where pl.linktypeid = 1) as links_marked
+    from posts p
+    left join postlinks pl
+        on pl.postid = p.id
+    where p.owneruserid is not null
+    group by p.owneruserid
+),
+comment_stats as (
+    select
+        p.owneruserid as user_id,
+        count(c.id) as comments_on_posts,
+        avg(c.score) as avg_comment_score,
+        max(c.score) as max_comment_score
+    from posts p
+    left join comments c on c.postid = p.id
+    where p.owneruserid is not null
+    group by p.owneruserid
+),
+accepted_answer_latency as (
+    select
+        q.owneruserid as user_id,
+        avg(extract(epoch from (a.creationdate - q.creationdate)) / 3600.0) as avg_hours_to_first_answer,
+        avg(extract(epoch from (acc.creationdate - q.creationdate)) / 3600.0) as avg_hours_to_accepted_answer
+    from posts q
+    left join posts a
+        on a.parentid = q.id and a.posttypeid = 2
+        and a.creationdate = (
+            select min(a2.creationdate) from posts a2 where a2.parentid = q.id and a2.posttypeid = 2
+        )
+    left join posts acc
+        on acc.id = q.acceptedanswerid
+    where q.posttypeid = 1
+      and q.owneruserid is not null
+    group by q.owneruserid
+),
+post_editors as (
+    select
+        p.owneruserid as user_id,
+        count(distinct case when le.rn = 1 then le.userid end) as distinct_latest_editors,
+        sum(case when le.rn = 1 and le.userid is null then 1 else 0 end) as latest_edit_by_unknown
+    from posts p
+    left join latest_edits le
+        on le.postid = p.id
+    where p.owneruserid is not null
+    group by p.owneruserid
+),
+user_activity_window as (
+    select
+        p.owneruserid as user_id,
+        count(*) filter (where p.creationdate >= now() - interval '30 days') as posts_30d,
+        count(*) filter (where p.creationdate >= now() - interval '365 days') as posts_365d,
+        sum(p.score) filter (where p.creationdate >= now() - interval '365 days') as score_365d,
+        percentile_cont(0.5) within group (order by p.score) as median_post_score_alltime
+    from posts p
+    where p.owneruserid is not null
+    group by p.owneruserid
+),
+user_rank as (
+    select
+        u.user_id,
+        u.displayname,
+        u.reputation,
+        u.total_badges,
+        qa.questions,
+        qa.answers,
+        va.upvotes_received,
+        va.downvotes_received,
+        coalesce(qa.answers,0) + coalesce(qa.questions,0) as total_posts,
+        row_number() over (
+            order by
+                u.reputation desc,
+                coalesce(va.upvotes_received,0) - coalesce(va.downvotes_received,0) desc,
+                coalesce(qa.answers,0) desc,
+                u.total_badges desc,
+                u.user_id
+        ) as rank_overall
+    from top_users u
+    left join question_activity qa on qa.user_id = u.user_id
+    left join vote_agg va on va.user_id = u.user_id
+),
+thresholds as (
+    select
+        percentile_cont(0.9) within group (order by reputation) as p90_reputation,
+        percentile_cont(0.9) within group (order by coalesce(upvotes_received,0) - coalesce(downvotes_received,0)) as p90_net_votes
+    from user_rank
+),
+qualified_users as (
+    select
+        ur.*
+    from user_rank ur
+    cross join thresholds t
+    where ur.reputation >= t.p90_reputation
+       or (coalesce(ur.upvotes_received,0) - coalesce(ur.downvotes_received,0)) >= t.p90_net_votes
+),
+normalized as (
+    select
+        qu.user_id,
+        qu.displayname,
+        qu.rank_overall,
+        qu.reputation,
+        qu.total_badges,
+        qu.questions,
+        qu.answers,
+        qu.upvotes_received,
+        qu.downvotes_received,
+        case when coalesce(qu.total_posts,0) = 0 then null else round(qu.upvotes_received::numeric / nullif(qu.total_posts,0), 3) end as upvotes_per_post,
+        case when coalesce(qu.total_posts,0) = 0 then null else round(qu.downvotes_received::numeric / nullif(qu.total_posts,0), 3) end as downvotes_per_post
+    from qualified_users qu
+),
+final as (
+    select
+        n.user_id,
+        n.displayname,
+        n.rank_overall,
+        n.reputation,
+        n.total_badges,
+        n.questions,
+        n.answers,
+        n.upvotes_received,
+        n.downvotes_received,
+        n.upvotes_per_post,
+        n.downvotes_per_post,
+        coalesce(qa.total_views_questions, 0) as total_views_questions,
+        coalesce(qa.avg_answer_score_nonzero, 0) as avg_answer_score_nonzero,
+        qa.max_post_score,
+        qa.min_post_score,
+        coalesce(va.accepts_received, 0) as accepts_received,
+        coalesce(va.favorites_received, 0) as favorites_received,
+        coalesce(udl.duplicates_marked, 0) as duplicates_marked,
+        coalesce(udl.links_marked, 0) as links_marked,
+        coalesce(cs.comments_on_posts, 0) as comments_on_posts,
+        cs.avg_comment_score,
+        cs.max_comment_score,
+        ael.avg_hours_to_first_answer,
+        ael.avg_hours_to_accepted_answer,
+        pe.distinct_latest_editors,
+        pe.latest_edit_by_unknown,
+        uaw.posts_30d,
+        uaw.posts_365d,
+        uaw.score_365d,
+        uaw.median_post_score_alltime,
+        string_agg(case when tt.tag_rn <= 3 then tt.tagname else null end, ', ' order by tt.tag_rn) as top_3_tags,
+        max(case when tt.tag_rn = 1 then tt.tag_q_count end) as top_tag_q_count,
+        -- derive a qualitative label using complex predicate and null logic
+        case
+            when n.reputation >= 100000 and coalesce(va.accepts_received,0) > 1000 then 'legend'
+            when n.reputation >= 50000 and coalesce(qa.answers,0) > 5000 then 'veteran'
+            when n.reputation >= 10000 and coalesce(qa.questions,0) > 1000 then 'inquisitive'
+            when coalesce(uaw.posts_30d,0) > 50 then 'active-recent'
+            when coalesce(udl.duplicates_marked,0) > 100 then 'dupe-hunter'
+            else coalesce(nullif(trim(split_part(coalesce(u.location, 'unknown'), ',', 1)), ''), 'unknown')
+        end as profile_label
+    from normalized n
+    left join question_activity qa on qa.user_id = n.user_id
+    left join vote_agg va on va.user_id = n.user_id
+    left join user_dup_links udl on udl.user_id = n.user_id
+    left join comment_stats cs on cs.user_id = n.user_id
+    left join accepted_answer_latency ael on ael.user_id = n.user_id
+    left join post_editors pe on pe.user_id = n.user_id
+    left join user_activity_window uaw on uaw.user_id = n.user_id
+    left join top_users u on u.user_id = n.user_id
+    left join top_tags tt on tt.user_id = n.user_id
+    group by
+        n.user_id, n.displayname, n.rank_overall, n.reputation, n.total_badges, n.questions, n.answers,
+        n.upvotes_received, n.downvotes_received, n.upvotes_per_post, n.downvotes_per_post,
+        qa.total_views_questions, qa.avg_answer_score_nonzero, qa.max_post_score, qa.min_post_score,
+        va.accepts_received, va.favorites_received,
+        udl.duplicates_marked, udl.links_marked,
+        cs.comments_on_posts, cs.avg_comment_score, cs.max_comment_score,
+        ael.avg_hours_to_first_answer, ael.avg_hours_to_accepted_answer,
+        pe.distinct_latest_editors, pe.latest_edit_by_unknown,
+        uaw.posts_30d, uaw.posts_365d, uaw.score_365d, uaw.median_post_score_alltime,
+        u.location
+)
+select
+    f.*,
+    -- additional windowed ranks for benchmarking
+    rank() over (order by f.reputation desc) as r_by_reputation,
+    dense_rank() over (order by f.upvotes_received - f.downvotes_received desc) as r_by_net_votes,
+    ntile(10) over (order by coalesce(f.avg_hours_to_accepted_answer, 1e9)) as decile_time_to_accept
+from final f
+where (f.answers + f.questions) > 0
+  and (f.upvotes_received is not null or f.downvotes_received is not null)
+order by f.rank_overall
+limit 200;

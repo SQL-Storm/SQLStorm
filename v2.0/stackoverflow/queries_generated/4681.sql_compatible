@@ -1,0 +1,188 @@
+WITH
+  RankedPostEdits AS (
+    SELECT
+      ph.PostId,
+      ph.UserId,
+      ph.CreationDate,
+      pht.Name AS HistoryAction,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht
+      ON ph.PostHistoryTypeId = pht.Id
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6)
+  ),
+  UserPostEngagement AS (
+    SELECT
+      p.OwnerUserId,
+      COUNT(DISTINCT p.Id) AS QuestionCount,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+      SUM(CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS AcceptedAnswerCount,
+      AVG(p.Score) AS AverageScore
+    FROM Posts p
+    WHERE
+      p.OwnerUserId IS NOT NULL
+    GROUP BY
+      p.OwnerUserId
+  ),
+  TagSpecificUserActivity AS (
+    -- Standard SQL: parse tags by removing angle brackets and splitting on '><'
+    -- Use a recursive CTE to split tag strings into rows (portable approach)
+    TagStrings AS (
+      SELECT
+        p.OwnerUserId,
+        TRIM(BOTH '<' FROM TRIM(BOTH '>' FROM p.Tags)) AS tags_clean
+      FROM Posts p
+      WHERE p.OwnerUserId IS NOT NULL
+    ),
+    SplitTags AS (
+      SELECT
+        OwnerUserId,
+        CASE WHEN tags_clean = '' THEN NULL ELSE tags_clean END AS rest,
+        NULL::text AS tag,
+        1 AS lvl
+      FROM TagStrings
+      UNION ALL
+      SELECT
+        OwnerUserId,
+        CASE
+          WHEN POSITION('><' IN rest) > 0 THEN SUBSTRING(rest FROM POSITION('><' IN rest) + 2)
+          ELSE NULL
+        END AS rest,
+        CASE
+          WHEN POSITION('><' IN rest) > 0 THEN SUBSTRING(rest FROM 1 FOR POSITION('><' IN rest) - 1)
+          ELSE rest
+        END AS tag,
+        lvl + 1
+      FROM SplitTags
+      WHERE rest IS NOT NULL AND rest <> ''
+    ),
+    DistinctTags AS (
+      SELECT DISTINCT OwnerUserId, tag AS TagName
+      FROM SplitTags
+      WHERE tag IS NOT NULL AND tag <> ''
+    )
+    SELECT
+      dt.OwnerUserId,
+      t.TagName,
+      COUNT(DISTINCT p.Id) AS TagPostCount,
+      SUM(p.Score) AS TagScoreSum,
+      CASE
+        WHEN t.IsModeratorOnly = 1 THEN 'ModeratorOnly'
+        WHEN t.IsRequired = 1 THEN 'Required'
+        ELSE 'Standard'
+      END AS TagType
+    FROM DistinctTags dt
+    JOIN Tags t
+      ON dt.TagName = t.TagName
+    JOIN Posts p
+      ON p.OwnerUserId = dt.OwnerUserId
+      AND p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    GROUP BY
+      dt.OwnerUserId,
+      t.TagName,
+      t.IsModeratorOnly,
+      t.IsRequired
+  ),
+  UserVoteSummary AS (
+    SELECT
+      v.UserId,
+      vt.Name AS VoteType,
+      COUNT(v.Id) AS VoteCount,
+      SUM(v.BountyAmount) AS TotalBountyAmount
+    FROM Votes v
+    JOIN VoteTypes vt
+      ON v.VoteTypeId = vt.Id
+    WHERE
+      v.UserId IS NOT NULL
+      AND vt.Id IN (2, 3, 8)
+    GROUP BY
+      v.UserId,
+      vt.Name
+  )
+SELECT
+  u.Id AS UserId,
+  u.DisplayName,
+  u.Reputation,
+  COALESCE(t.QuestionCount, 0) AS TotalQuestionsPosted,
+  COALESCE(t.AnswerCount, 0) AS TotalAnswersPosted,
+  COALESCE(t.AcceptedAnswerCount, 0) AS AcceptedAnswers,
+  COALESCE(t.AverageScore, 0.0) AS AvgPostScore,
+  COALESCE(rpe.CreationDate, TIMESTAMP '1900-01-01 00:00:00') AS LastEditDateForPost,
+  COALESCE(rpe.HistoryAction, 'NoEdits') AS LastEditAction,
+  tsu.TagName,
+  COALESCE(tsu.TagPostCount, 0) AS TagSpecificPosts,
+  COALESCE(tsu.TagScoreSum, 0) AS TagSpecificScore,
+  tsu.TagType,
+  COALESCE(uvs_up.VoteCount, 0) AS TotalUpVotesReceived,
+  COALESCE(uvs_down.VoteCount, 0) AS TotalDownVotesReceived,
+  COALESCE(uvs_bounty.TotalBountyAmount, 0) AS TotalBountyGiven,
+  CASE
+    WHEN u.WebsiteUrl IS NOT NULL AND u.WebsiteUrl LIKE '%stackoverflow.com%' THEN 'StackOverflow User'
+    WHEN u.Location IS NOT NULL AND u.Location LIKE '%United States%' THEN 'US Based'
+    ELSE 'Other'
+  END AS UserClassification,
+  CASE
+    WHEN u.AboutMe IS NULL OR u.AboutMe = '' THEN 'No Bio'
+    WHEN CHAR_LENGTH(u.AboutMe) < 50 THEN 'Short Bio'
+    ELSE 'Detailed Bio'
+  END AS BioLengthCategory,
+  COUNT(DISTINCT c.Id) AS CommentCountOnUserPosts,
+  CASE
+    WHEN u.CreationDate BETWEEN (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1' YEAR) AND TIMESTAMP '2024-10-01 12:34:56' THEN 'Recent'
+    ELSE 'Established'
+  END AS UserAccountAge
+FROM Users u
+LEFT JOIN UserPostEngagement t
+  ON u.Id = t.OwnerUserId
+LEFT JOIN RankedPostEdits rpe
+  ON u.Id = rpe.UserId AND rpe.rn = 1
+LEFT JOIN TagSpecificUserActivity tsu
+  ON u.Id = tsu.OwnerUserId
+LEFT JOIN UserVoteSummary uvs_up
+  ON u.Id = uvs_up.UserId AND uvs_up.VoteType = 'UpMod'
+LEFT JOIN UserVoteSummary uvs_down
+  ON u.Id = uvs_down.UserId AND uvs_down.VoteType = 'DownMod'
+LEFT JOIN UserVoteSummary uvs_bounty
+  ON u.Id = uvs_bounty.UserId AND uvs_bounty.VoteType = 'BountyStart'
+LEFT JOIN Posts p_for_comments
+  ON u.Id = p_for_comments.OwnerUserId
+LEFT JOIN Comments c
+  ON p_for_comments.Id = c.PostId
+WHERE
+  u.Reputation > 100
+GROUP BY
+  u.Id,
+  u.DisplayName,
+  u.Reputation,
+  t.QuestionCount,
+  t.AnswerCount,
+  t.AcceptedAnswerCount,
+  t.AverageScore,
+  rpe.CreationDate,
+  rpe.HistoryAction,
+  tsu.TagName,
+  tsu.TagPostCount,
+  tsu.TagScoreSum,
+  tsu.TagType,
+  uvs_up.VoteCount,
+  uvs_down.VoteCount,
+  uvs_bounty.TotalBountyAmount,
+  CASE
+    WHEN u.WebsiteUrl IS NOT NULL AND u.WebsiteUrl LIKE '%stackoverflow.com%' THEN 'StackOverflow User'
+    WHEN u.Location IS NOT NULL AND u.Location LIKE '%United States%' THEN 'US Based'
+    ELSE 'Other'
+  END,
+  CASE
+    WHEN u.AboutMe IS NULL OR u.AboutMe = '' THEN 'No Bio'
+    WHEN CHAR_LENGTH(u.AboutMe) < 50 THEN 'Short Bio'
+    ELSE 'Detailed Bio'
+  END,
+  CASE
+    WHEN u.CreationDate BETWEEN (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1' YEAR) AND TIMESTAMP '2024-10-01 12:34:56' THEN 'Recent'
+    ELSE 'Established'
+  END,
+  u.CreationDate
+ORDER BY
+  u.Reputation DESC,
+  u.CreationDate ASC;

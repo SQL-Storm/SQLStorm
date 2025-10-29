@@ -1,0 +1,123 @@
+WITH
+  RankedUserVotes AS (
+    SELECT
+      v.UserId,
+      v.PostId,
+      v.VoteTypeId,
+      v.CreationDate,
+      ROW_NUMBER() OVER (PARTITION BY v.UserId ORDER BY v.CreationDate DESC) AS VoteRank
+    FROM Votes v
+    WHERE v.VoteTypeId IN (2, 3)
+  ),
+  UserVoteSummary AS (
+    SELECT
+      UserId,
+      COUNT(CASE WHEN VoteTypeId = 2 THEN 1 END) AS UpVoteCount,
+      COUNT(CASE WHEN VoteTypeId = 3 THEN 1 END) AS DownVoteCount,
+      SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) - SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS NetVoteScore
+    FROM RankedUserVotes
+    WHERE VoteRank <= 100
+    GROUP BY UserId
+  ),
+  PostHistoryAndScores AS (
+    SELECT
+      ph.PostId,
+      COUNT(CASE WHEN ph.PostHistoryTypeId = 5 THEN 1 END) AS BodyEdits,
+      COUNT(CASE WHEN ph.PostHistoryTypeId = 4 THEN 1 END) AS TitleEdits,
+      MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) AS LastClosedDate,
+      MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.CreationDate END) AS LastReopenedDate,
+      p.OwnerUserId,
+      p.Score AS PostScore,
+      p.ViewCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      p.CreationDate AS PostCreationDate,
+      p.LastActivityDate,
+      pt.Name AS PostTypeName,
+      COALESCE(p.AnswerCount, 0) AS AnswerCount
+    FROM PostHistory ph
+    JOIN Posts p ON ph.PostId = p.Id
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.PostTypeId IN (1, 2)
+      AND p.CreationDate >= TIMESTAMP '2023-01-01'
+    GROUP BY
+      ph.PostId,
+      p.OwnerUserId,
+      p.Score,
+      p.ViewCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      p.CreationDate,
+      p.LastActivityDate,
+      pt.Name,
+      p.AnswerCount
+  )
+SELECT
+  'User Analysis' AS AnalysisType,
+  u.Id AS UserId,
+  u.DisplayName,
+  u.Reputation,
+  u.CreationDate AS UserCreationDate,
+  u.LastAccessDate,
+  COALESCE(uvs.UpVoteCount, 0) AS TotalUpVotesGiven,
+  COALESCE(uvs.DownVoteCount, 0) AS TotalDownVotesGiven,
+  COALESCE(uvs.NetVoteScore, 0) AS NetVoteScoreGiven,
+  COUNT(DISTINCT phs.PostId) AS PostsEditedByThisUser,
+  SUM(phs.BodyEdits) AS TotalBodyEdits,
+  SUM(phs.TitleEdits) AS TotalTitleEdits,
+  AVG(CASE WHEN phs.PostTypeName = 'Question' THEN phs.PostScore END) AS AvgQuestionScore,
+  AVG(CASE WHEN phs.PostTypeName = 'Answer' THEN phs.PostScore END) AS AvgAnswerScore,
+  AVG(phs.ViewCount) AS AvgPostViewCount,
+  AVG(phs.CommentCount) AS AvgPostCommentCount,
+  AVG(phs.FavoriteCount) AS AvgPostFavoriteCount,
+  COUNT(DISTINCT CASE WHEN phs.PostTypeName = 'Question' THEN phs.PostId END) AS QuestionsPosted,
+  COUNT(DISTINCT CASE WHEN phs.PostTypeName = 'Answer' THEN phs.PostId END) AS AnswersPosted,
+  AVG(
+    CASE
+      WHEN phs.PostTypeName = 'Question' THEN
+        EXTRACT(EPOCH FROM (phs.LastActivityDate - phs.PostCreationDate)) / 86400
+    END
+  ) AS AvgDaysActiveForQuestions,
+  MAX(u.Views) AS UserViews,
+  COUNT(b.Id) AS TotalBadgesEarned,
+  MAX(CASE WHEN b.Class = 1 THEN b.Date END) AS LastGoldBadgeDate,
+  MAX(CASE WHEN b.Class = 2 THEN b.Date END) AS LastSilverBadgeDate,
+  MAX(CASE WHEN b.Class = 3 THEN b.Date END) AS LastBronzeBadgeDate,
+  COUNT(DISTINCT CASE WHEN phs.LastClosedDate IS NOT NULL THEN phs.PostId END) AS PostsClosed,
+  COUNT(DISTINCT CASE WHEN phs.LastReopenedDate IS NOT NULL THEN phs.PostId END) AS PostsReopened,
+  SUM(phs.AnswerCount) AS TotalAnswersOnUserPosts,
+  LOG(ABS(u.Reputation) + 1) AS LogReputation,
+  CASE WHEN u.EmailHash IS NOT NULL THEN 'Has Email Hash' ELSE 'No Email Hash' END AS EmailStatus,
+  CASE WHEN u.WebsiteUrl LIKE '%stackoverflow.com%' THEN 'Stack Overflow Profile' ELSE 'Other/No Website' END AS WebsiteCategory,
+  CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - u.CreationDate)) / 86400 AS INTEGER) AS UserAgeInDays,
+  CASE
+    WHEN u.Location IS NULL OR u.Location = '' THEN 'Unknown'
+    WHEN POSITION(',' IN u.Location) > 0 THEN SUBSTRING(u.Location FROM 1 FOR POSITION(',' IN u.Location) - 1)
+    ELSE u.Location
+  END AS PrimaryLocation,
+  CASE WHEN u.AboutMe LIKE '%[data-type="mention"]%' THEN 'Contains Mentions' ELSE 'No Mentions' END AS AboutMeContent
+FROM Users u
+LEFT JOIN UserVoteSummary uvs ON u.Id = uvs.UserId
+LEFT JOIN PostHistoryAndScores phs ON u.Id = phs.OwnerUserId
+LEFT JOIN Badges b ON u.Id = b.UserId
+WHERE MOD(u.Id, 10) = 0
+GROUP BY
+  u.Id,
+  u.DisplayName,
+  u.Reputation,
+  u.CreationDate,
+  u.LastAccessDate,
+  uvs.UpVoteCount,
+  uvs.DownVoteCount,
+  uvs.NetVoteScore,
+  u.Views,
+  u.EmailHash,
+  u.WebsiteUrl,
+  u.Location,
+  u.AboutMe
+HAVING
+  COUNT(DISTINCT phs.PostId) > 5 OR COALESCE(uvs.NetVoteScore, 0) > 100
+ORDER BY
+  u.Reputation DESC,
+  UserAgeInDays DESC
+FETCH FIRST 1000 ROWS ONLY;

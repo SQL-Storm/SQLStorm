@@ -1,0 +1,98 @@
+-- {"query": "4308.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1206} 
+WITH UserPostInteractions AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        pt.Name AS PostType,
+        COALESCE(c.CommentCount, 0) AS CommentCount,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+        u.Reputation AS OwnerReputation,
+        COUNT(DISTINCT v.Id) AS TotalVotes,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        MAX(ph.CreationDate) AS LastEditDate,
+        DATEDIFF(DAY, p.CreationDate, p.LastActivityDate) AS DaysSinceLastActivity,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL THEN 1
+            ELSE 0
+        END AS IsClosed,
+        CASE
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 1
+            ELSE 0
+        END AS IsCommunityOwned
+    FROM Posts AS p
+    JOIN PostTypes AS pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Comments AS c ON p.Id = c.PostId
+    LEFT JOIN Votes AS v ON p.Id = v.PostId
+    LEFT JOIN PostHistory AS ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId IN (4, 5, 6) -- Edits
+    LEFT JOIN Users AS u ON p.OwnerUserId = u.Id
+    WHERE p.OwnerUserId IS NOT NULL AND p.OwnerUserId <> -1 AND p.PostTypeId IN (1, 2) -- Questions and Answers
+    GROUP BY
+        p.Id,
+        p.OwnerUserId,
+        p.CreationDate,
+        pt.Name,
+        c.CommentCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        u.Reputation,
+        p.ClosedDate,
+        p.CommunityOwnedDate,
+        p.LastActivityDate
+),
+RankedUserInteractions AS (
+    SELECT
+        upi.*,
+        ROW_NUMBER() OVER (PARTITION BY upi.OwnerUserId ORDER BY upi.PostCreationDate DESC) AS PostRank,
+        AVG(upi.TotalVotes) OVER (PARTITION BY upi.OwnerUserId) AS AvgUserVotes,
+        SUM(upi.TotalVotes) OVER (PARTITION BY upi.OwnerUserId) AS TotalUserVotes,
+        RANK() OVER (ORDER BY upi.OwnerReputation DESC, upi.TotalUserVotes DESC) AS UserReputationRank
+    FROM UserPostInteractions AS upi
+),
+UserAnswersWithBadges AS (
+    SELECT
+        r.OwnerUserId,
+        COUNT(DISTINCT CASE WHEN r.PostType = 'Answer' THEN r.PostId ELSE NULL END) AS AnswerCountWithRanks,
+        COUNT(DISTINCT b.Id) AS BadgeCount
+    FROM RankedUserInteractions AS r
+    LEFT JOIN Badges AS b ON r.OwnerUserId = b.UserId
+    WHERE r.PostRank <= 10 -- Consider top 10 posts per user
+    GROUP BY r.OwnerUserId
+)
+SELECT
+    r.OwnerUserId,
+    u.DisplayName AS OwnerDisplayName,
+    r.OwnerReputation,
+    r.UserReputationRank,
+    COUNT(DISTINCT r.PostId) AS TotalPostsConsidered,
+    SUM(r.CommentCount) AS TotalComments,
+    SUM(r.AnswerCount) AS TotalAnswers,
+    SUM(r.FavoriteCount) AS TotalFavorites,
+    SUM(r.TotalVotes) AS TotalVotesOnPosts,
+    AVG(r.DaysSinceLastActivity) AS AvgDaysSinceLastActivity,
+    SUM(r.IsClosed) AS TotalClosedPosts,
+    SUM(r.IsCommunityOwned) AS TotalCommunityOwnedPosts,
+    COALESCE(uab.AnswerCountWithRanks, 0) AS AnswersWithRank,
+    COALESCE(uab.BadgeCount, 0) AS TotalBadges,
+    CASE
+        WHEN u.CreationDate < DATEADD(year, -5, cast('2024-10-01 12:34:56' as timestamp)) THEN 'Veteran'
+        WHEN u.CreationDate < DATEADD(year, -1, cast('2024-10-01 12:34:56' as timestamp)) THEN 'Experienced'
+        ELSE 'New'
+    END AS UserTenure,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = r.PostId AND pl.LinkTypeId = 3) AS DuplicateLinks
+FROM RankedUserInteractions AS r
+JOIN Users AS u ON r.OwnerUserId = u.Id
+LEFT JOIN UserAnswersWithBadges AS uab ON r.OwnerUserId = uab.OwnerUserId
+WHERE r.PostRank <= 20 -- Consider top 20 posts per user
+GROUP BY
+    r.OwnerUserId,
+    u.DisplayName,
+    r.OwnerReputation,
+    r.UserReputationRank,
+    uab.AnswerCountWithRanks,
+    uab.BadgeCount,
+    u.CreationDate
+HAVING SUM(r.TotalVotes) > 10 -- Filter for users with at least 10 total votes on their posts
+ORDER BY r.UserReputationRank;

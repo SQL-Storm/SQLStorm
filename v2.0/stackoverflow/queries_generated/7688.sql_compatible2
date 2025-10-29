@@ -1,0 +1,254 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 3 THEN p.Id END) as Wikis,
+        COUNT(DISTINCT c.Id) as Comments,
+        COUNT(DISTINCT b.Id) as Badges,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        CAST(ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS FLOAT) / COUNT(*) OVER() as ReputationPercentile,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 100 THEN 'High'
+            WHEN COUNT(DISTINCT p.Id) > 50 THEN 'Medium'
+            ELSE 'Low'
+        END as ActivityLevel
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostMetrics AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END as PostTypeDescription,
+        COALESCE(p.AnswerCount, 0) + COALESCE(p.CommentCount, 0) as EngagementCount,
+        CASE 
+            WHEN p.Score > 100 THEN 'High'
+            WHEN p.Score > 50 THEN 'Medium'
+            ELSE 'Low'
+        END as ScoreLevel,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as UserPostRank,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PreviousScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as AvgUserScore
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+EngagementAnalysis AS (
+    SELECT 
+        pm.PostId,
+        pm.Title,
+        pm.Score,
+        pm.ViewCount,
+        pm.AnswerCount,
+        pm.CommentCount,
+        pm.FavoriteCount,
+        pm.CreationDate,
+        pm.OwnerUserId,
+        pm.PostTypeId,
+        pm.Tags,
+        pm.PostTypeDescription,
+        pm.EngagementCount,
+        pm.ScoreLevel,
+        pm.UserPostRank,
+        pm.PreviousScore,
+        pm.AvgUserScore,
+        CASE 
+            WHEN pm.Score > pm.AvgUserScore THEN 1
+            ELSE 0
+        END as AboveAverageScore,
+        CASE 
+            WHEN pm.EngagementCount > (SELECT AVG(EngagementCount) FROM PostMetrics) THEN 1
+            ELSE 0
+        END as AboveAverageEngagement,
+        CAST(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - pm.CreationDate)) / 86400 AS INTEGER) as DaysSincePost,
+        CASE 
+            WHEN pm.Tags IS NOT NULL AND pm.Tags != '' THEN 
+                CONCAT('Tagged: ', SUBSTRING(pm.Tags FROM 2 FOR CHAR_LENGTH(pm.Tags) - 2))
+            ELSE 'No Tags'
+        END as TagSummary
+    FROM PostMetrics pm
+),
+UserPerformance AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.Views,
+        uas.UpVotes,
+        uas.DownVotes,
+        uas.TotalPosts,
+        uas.Questions,
+        uas.Answers,
+        uas.Wikis,
+        uas.Comments,
+        uas.Badges,
+        uas.LastPostDate,
+        uas.LastCommentDate,
+        uas.ReputationPercentile,
+        uas.ActivityLevel,
+        CASE WHEN uas.TotalPosts > 0 THEN CAST(100.0 * uas.Answers / uas.TotalPosts AS NUMERIC(5,2)) ELSE 0 END as AnswerPercentage,
+        CASE WHEN uas.TotalPosts > 0 THEN CAST(100.0 * uas.Questions / uas.TotalPosts AS NUMERIC(5,2)) ELSE 0 END as QuestionPercentage
+    FROM UserActivityStats uas
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        ea.PostId,
+        ea.Title,
+        ea.Score,
+        ea.ViewCount,
+        ea.AnswerCount,
+        ea.CommentCount,
+        ea.FavoriteCount,
+        ea.CreationDate,
+        ea.OwnerUserId,
+        ea.PostTypeId,
+        ea.Tags,
+        ea.PostTypeDescription,
+        ea.EngagementCount,
+        ea.ScoreLevel,
+        ea.UserPostRank,
+        ea.PreviousScore,
+        ea.AvgUserScore,
+        ea.AboveAverageScore,
+        ea.AboveAverageEngagement,
+        ea.DaysSincePost,
+        ea.TagSummary,
+        CASE WHEN ea.PreviousScore IS NOT NULL THEN (ea.Score - ea.PreviousScore) ELSE 0 END as ScoreChange,
+        CASE WHEN ea.AvgUserScore > 0 THEN CAST(100.0 * (ea.Score - ea.AvgUserScore) / ea.AvgUserScore AS NUMERIC(5,2)) ELSE 0 END as RelativeScoreChange,
+        CASE 
+            WHEN ea.DaysSincePost < 30 THEN 'New'
+            WHEN ea.DaysSincePost < 180 THEN 'Recent'
+            WHEN ea.DaysSincePost < 365 THEN 'Old'
+            ELSE 'Very Old'
+        END as PostAgeGroup,
+        ROW_NUMBER() OVER (PARTITION BY ea.OwnerUserId ORDER BY ea.Score DESC) as TopScoreRank,
+        RANK() OVER (ORDER BY ea.Score DESC) as GlobalScoreRank,
+        NTH_VALUE(ea.Score, 1) OVER (ORDER BY ea.Score DESC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) as MaxScore,
+        NTH_VALUE(ea.Score, 2) OVER (ORDER BY ea.Score DESC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) as SecondHighestScore
+    FROM EngagementAnalysis ea
+)
+SELECT 
+    up.UserId,
+    up.DisplayName,
+    up.Reputation,
+    up.Views,
+    up.UpVotes,
+    up.DownVotes,
+    up.TotalPosts,
+    up.Questions,
+    up.Answers,
+    up.Wikis,
+    up.Comments,
+    up.Badges,
+    up.LastPostDate,
+    up.LastCommentDate,
+    up.ReputationPercentile,
+    up.ActivityLevel,
+    up.AnswerPercentage,
+    up.QuestionPercentage,
+    CASE 
+        WHEN COUNT(cpa.PostId) > 0 THEN 
+            ROUND(AVG(cpa.Score::numeric), 2)
+        ELSE 0 
+    END as AverageScoreOfUserPosts,
+    CASE 
+        WHEN COUNT(cpa.PostId) > 0 THEN 
+            MAX(cpa.Score)
+        ELSE 0 
+    END as HighestScoreOfUserPosts,
+    CASE 
+        WHEN COUNT(cpa.PostId) > 0 THEN 
+            MIN(cpa.Score)
+        ELSE 0 
+    END as LowestScoreOfUserPosts,
+    COUNT(CASE WHEN cpa.AboveAverageScore = 1 THEN 1 END) as PostsAboveAverageScore,
+    COUNT(CASE WHEN cpa.AboveAverageEngagement = 1 THEN 1 END) as PostsAboveAverageEngagement,
+    COUNT(CASE WHEN cpa.PostAgeGroup = 'New' THEN 1 END) as NewPosts,
+    COUNT(CASE WHEN cpa.PostAgeGroup = 'Recent' THEN 1 END) as RecentPosts,
+    COUNT(CASE WHEN cpa.DaysSincePost > 365 THEN 1 END) as OldPosts,
+    MAX(cpa.GlobalScoreRank) as MaxGlobalScoreRank,
+    AVG(cpa.RelativeScoreChange) as AvgRelativeScoreChange,
+    STRING_AGG(
+        CASE 
+            WHEN cpa.PostTypeDescription = 'Question' AND cpa.AnswerCount > 0 THEN 
+                CONCAT(cpa.Title, ' (', cpa.AnswerCount, ' answers)')
+            WHEN cpa.PostTypeDescription = 'Answer' THEN 
+                CONCAT('Answer to: ', 
+                    COALESCE(
+                        (SELECT p.Title FROM Posts p WHERE p.Id = cpa.PostId AND p.PostTypeId = 1), 
+                        'Unknown Question'
+                    )
+                )
+            ELSE cpa.Title
+        END, 
+        '; '
+    ) as RecentPostsSummary,
+    COUNT(cpa.PostId) as TotalUserPostsCount
+FROM UserPerformance up
+LEFT JOIN ComplexPostAnalysis cpa ON up.UserId = cpa.OwnerUserId
+WHERE (
+    up.TotalPosts > 0 OR 
+    up.Answers > 0 OR 
+    up.Questions > 0 OR 
+    up.Comments > 0 OR 
+    up.Badges > 0
+)
+AND (
+    up.Reputation > 1000 OR 
+    up.Views > 1000 OR
+    up.LastPostDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days') OR
+    up.LastCommentDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days')
+)
+GROUP BY 
+    up.UserId,
+    up.DisplayName,
+    up.Reputation,
+    up.Views,
+    up.UpVotes,
+    up.DownVotes,
+    up.TotalPosts,
+    up.Questions,
+    up.Answers,
+    up.Wikis,
+    up.Comments,
+    up.Badges,
+    up.LastPostDate,
+    up.LastCommentDate,
+    up.ReputationPercentile,
+    up.ActivityLevel,
+    up.AnswerPercentage,
+    up.QuestionPercentage
+HAVING 
+    COUNT(cpa.PostId) > 0 OR 
+    up.Reputation > 500 OR 
+    up.Views > 500 OR
+    up.TotalPosts >= 5
+ORDER BY 
+    up.Reputation DESC,
+    AverageScoreOfUserPosts DESC,
+    COUNT(cpa.PostId) DESC
+LIMIT 1000;

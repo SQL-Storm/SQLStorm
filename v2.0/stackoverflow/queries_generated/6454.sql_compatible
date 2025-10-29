@@ -1,0 +1,32 @@
+SELECT 
+    u.DisplayName, 
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    MAX(u.Reputation) AS MaxReputation,
+    MIN(u.CreationDate) AS EarliestJoined,
+    STRING_AGG(b.Name, ', ' ORDER BY b.Date) AS BadgesEarned,
+    MAX(ph.RevisionGUID) AS LastRevisionGUID,
+    AVG(p.Score) AS AvgScore,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) AS MedianScore
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId = 10
+WHERE 
+    p.PostTypeId IN (1, 2) AND 
+    u.Reputation > 100 AND 
+    u.Id NOT IN (SELECT DISTINCT OwnerUserId FROM Posts WHERE PostTypeId = 1 AND ClosedDate IS NOT NULL)
+GROUP BY 
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate
+HAVING 
+    COUNT(DISTINCT p.Id) > 50
+ORDER BY 
+    TotalPosts DESC, 
+    AvgScore DESC;

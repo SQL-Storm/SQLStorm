@@ -1,0 +1,171 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+                CAST(MAX(p.CreationDate) AS DATE) - CAST(MIN(p.CreationDate) AS DATE)
+            ELSE 0 
+        END AS ActiveDays,
+        SUM(COALESCE(p.Score, 0)) AS TotalScore,
+        AVG(COALESCE(p.Score, 0)) AS AvgScore,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags)-2)), ', ') AS AllTags,
+        STRING_AGG(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Title END, ' | ') AS QuestionTitles,
+        STRING_AGG(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Body END, ' | ') AS AnswerBodies
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= TIMESTAMP '2010-01-01 00:00:00'
+    GROUP BY u.Id, u.Reputation, u.DisplayName
+),
+RankedUsers AS (
+    SELECT 
+        UserId,
+        Reputation,
+        DisplayName,
+        PostCount,
+        CommentCount,
+        BadgeCount,
+        LastPostDate,
+        ActiveDays,
+        TotalScore,
+        AvgScore,
+        AllTags,
+        QuestionTitles,
+        AnswerBodies,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, PostCount DESC) AS RankByReputation,
+        RANK() OVER (ORDER BY TotalScore DESC) AS RankByScore,
+        DENSE_RANK() OVER (ORDER BY BadgeCount DESC) AS RankByBadges,
+        NTILE(10) OVER (ORDER BY Reputation) AS Quintile
+    FROM UserStats
+),
+UsersWithPosts AS (
+    SELECT 
+        ru.*,
+        (SELECT COUNT(*) 
+         FROM Posts p 
+         WHERE p.OwnerUserId = ru.UserId 
+           AND p.PostTypeId = 1 
+           AND p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year')) AS RecentQuestions,
+        (SELECT COUNT(*) 
+         FROM Posts p 
+         WHERE p.OwnerUserId = ru.UserId 
+           AND p.PostTypeId = 2 
+           AND p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year')) AS RecentAnswers
+    FROM RankedUsers ru
+    WHERE ru.PostCount > 0
+),
+TagSummary AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) AS AvgAnswerScore,
+        COUNT(DISTINCT p.OwnerUserId) AS UniquePosterCount,
+        STRING_AGG(DISTINCT p.OwnerDisplayName, ', ') AS Posters
+    FROM Tags t
+    LEFT JOIN Posts p ON t.TagName = SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags)-2))
+    WHERE t.Count > 100
+    GROUP BY t.TagName, t.Count
+),
+ComplexUserAnalysis AS (
+    SELECT 
+        up.UserId,
+        up.Reputation,
+        up.DisplayName,
+        up.PostCount,
+        up.CommentCount,
+        up.BadgeCount,
+        up.LastPostDate,
+        up.ActiveDays,
+        up.TotalScore,
+        up.AvgScore,
+        up.AllTags,
+        up.QuestionTitles,
+        up.AnswerBodies,
+        up.RankByReputation,
+        up.RankByScore,
+        up.RankByBadges,
+        up.Quintile,
+        up.RecentQuestions,
+        up.RecentAnswers,
+        ts.AvgQuestionScore,
+        ts.AvgAnswerScore,
+        ts.UniquePosterCount,
+        CASE 
+            WHEN up.PostCount > 1000 THEN 'Elite'
+            WHEN up.PostCount > 500 THEN 'Veteran'
+            WHEN up.PostCount > 100 THEN 'Active'
+            ELSE 'Regular'
+        END AS PostingTier,
+        CASE 
+            WHEN up.Reputation > 100000 THEN 'Legendary'
+            WHEN up.Reputation > 50000 THEN 'Master'
+            WHEN up.Reputation > 10000 THEN 'Expert'
+            ELSE 'Member'
+        END AS ReputationTier,
+        CASE 
+            WHEN up.RecentQuestions > 50 OR up.RecentAnswers > 50 THEN 'HighlyActive'
+            WHEN up.RecentQuestions > 10 OR up.RecentAnswers > 10 THEN 'Active'
+            ELSE 'Moderate'
+        END AS ActivityLevel,
+        COALESCE(up.TotalScore, 0) * COALESCE(up.Reputation, 1) AS PerformanceIndex,
+        NULLIF(CAST((TIMESTAMP '2024-10-01 12:34:56') AS DATE) - CAST(up.LastPostDate AS DATE), 0) AS DaysSinceLastPost,
+        CASE 
+            WHEN (CAST((TIMESTAMP '2024-10-01 12:34:56') AS DATE) - CAST(up.LastPostDate AS DATE)) > 1000 THEN 'Inactive'
+            WHEN (CAST((TIMESTAMP '2024-10-01 12:34:56') AS DATE) - CAST(up.LastPostDate AS DATE)) > 300 THEN 'LowActivity'
+            ELSE 'Active'
+        END AS ActivityStatus
+    FROM UsersWithPosts up
+    LEFT JOIN TagSummary ts ON EXISTS (
+        SELECT 1 FROM regexp_split_to_table(up.AllTags, ',\\s*') AS s(value)
+        WHERE s.value = ts.TagName
+    )
+)
+SELECT 
+    'User Analysis Report' AS ReportType,
+    COUNT(*) AS TotalUsers,
+    AVG(Reputation) AS AvgReputation,
+    AVG(PostCount) AS AvgPosts,
+    AVG(BadgeCount) AS AvgBadges,
+    MAX(RankByReputation) AS MaxRank,
+    MIN(RankByReputation) AS MinRank,
+    STRING_AGG(DisplayName, ', ') AS AllUserNames,
+    STRING_AGG(DisplayName || ' (' || Reputation || ')', ', ') AS RankedUsers
+FROM ComplexUserAnalysis
+WHERE ReputationTier IN ('Master', 'Expert', 'Legendary')
+UNION ALL
+SELECT 
+    'Tag Analysis Report' AS ReportType,
+    COUNT(*) AS TotalUsers,
+    AVG(Reputation) AS AvgReputation,
+    AVG(PostCount) AS AvgPosts,
+    AVG(BadgeCount) AS AvgBadges,
+    MAX(RankByReputation) AS MaxRank,
+    MIN(RankByReputation) AS MinRank,
+    STRING_AGG(DisplayName, ', ') AS AllUserNames,
+    STRING_AGG(DisplayName || ' (' || Reputation || ')', ', ') AS RankedUsers
+FROM ComplexUserAnalysis
+WHERE ActivityLevel IN ('HighlyActive', 'Active')
+  AND Reputation > 10000
+UNION ALL
+SELECT 
+    'Performance Analysis Report' AS ReportType,
+    COUNT(*) AS TotalUsers,
+    AVG(Reputation) AS AvgReputation,
+    AVG(PostCount) AS AvgPosts,
+    AVG(BadgeCount) AS AvgBadges,
+    MAX(RankByReputation) AS MaxRank,
+    MIN(RankByReputation) AS MinRank,
+    STRING_AGG(DisplayName, ', ') AS AllUserNames,
+    STRING_AGG(DisplayName || ' (' || Reputation || ')', ', ') AS RankedUsers
+FROM ComplexUserAnalysis
+WHERE PerformanceIndex > 1000000
+  AND ActivityStatus = 'Active'
+ORDER BY ReportType;

@@ -1,0 +1,203 @@
+-- {"query": "1427.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2905} 
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT Q.Id) FILTER (WHERE Q.PostTypeId = 1) AS TotalQuestions,
+        COUNT(DISTINCT A.Id) FILTER (WHERE A.PostTypeId = 2) AS TotalAnswers,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        SUM(P.Score) AS TotalPostScore,
+        SUM(C.Score) AS TotalCommentScore,
+        MAX(P.LastActivityDate) AS LastPostActivity,
+        MAX(C.CreationDate) AS LastCommentActivity,
+        -- Calculate average daily reputation gain for active period, handling division by zero
+        COALESCE(
+            CAST(U.Reputation AS numeric) / NULLIF(EXTRACT(EPOCH FROM (U.LastAccessDate - U.CreationDate)) / (24 * 3600), 0),
+            0.0
+        ) AS AvgDailyReputationGain,
+        -- Window function: rank users by their total post score within their account creation year
+        RANK() OVER (PARTITION BY EXTRACT(YEAR FROM U.CreationDate) ORDER BY SUM(P.Score) DESC) AS RankByScoreInCreationYear
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Posts AS Q ON U.Id = Q.OwnerUserId AND Q.PostTypeId = 1 -- Questions
+    LEFT JOIN Posts AS A ON U.Id = A.OwnerUserId AND A.PostTypeId = 2 -- Answers
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate
+),
+PostHistoricalEdits AS (
+    SELECT
+        PostId,
+        COUNT(DISTINCT Id) FILTER (WHERE PostHistoryTypeId IN (4, 5, 6)) AS NumberOfMinorEdits, -- Title, Body, Tags edits
+        COUNT(DISTINCT RevisionGUID) FILTER (WHERE PostHistoryTypeId IN (4, 5, 6, 7, 8, 9)) AS NumberOfUniqueRevisions,
+        MAX(CreationDate) AS LastEditHistoryDate
+    FROM PostHistory
+    GROUP BY PostId
+),
+QuestionAnswerDetails AS (
+    SELECT
+        Q.Id AS QuestionId,
+        Q.OwnerUserId AS QuestionOwnerId,
+        Q.CreationDate AS QuestionCreationDate,
+        Q.Score AS QuestionScore,
+        Q.ViewCount,
+        Q.AnswerCount,
+        Q.FavoriteCount,
+        Q.ClosedDate,
+        PHE.NumberOfUniqueRevisions AS QuestionRevisions,
+        A.Id AS AnswerId,
+        A.Score AS AnswerScore,
+        Q.AcceptedAnswerId,
+        -- Window function: Average score of all answers for this specific question
+        AVG(A.Score) OVER (PARTITION BY Q.Id) AS QuestionAvgAnswerScore_WF,
+        -- Window function: Rank of question by score for a given user
+        ROW_NUMBER() OVER (PARTITION BY Q.OwnerUserId ORDER BY Q.Score DESC, Q.CreationDate DESC) AS UserQuestionRank
+    FROM Posts AS Q
+    LEFT JOIN Posts AS A ON Q.Id = A.ParentId AND A.PostTypeId = 2
+    LEFT JOIN PostHistoricalEdits AS PHE ON Q.Id = PHE.PostId
+    WHERE Q.PostTypeId = 1
+),
+QuestionAnswerPerformance AS (
+    SELECT
+        QuestionId,
+        QuestionOwnerId,
+        QuestionCreationDate,
+        QuestionScore,
+        ViewCount,
+        AnswerCount,
+        FavoriteCount,
+        ClosedDate,
+        QuestionRevisions,
+        COALESCE(SUM(AnswerScore) FILTER (WHERE AnswerId = AcceptedAnswerId), 0) AS AcceptedAnswerScore,
+        COALESCE(MAX(QuestionAvgAnswerScore_WF), 0.0) AS AvgAnswerScore, -- Use the pre-calculated window function result
+        -- Correlated subquery: count of upvotes for the question
+        (SELECT COUNT(V.Id) FROM Votes AS V WHERE V.PostId = QuestionId AND V.VoteTypeId = 2) AS UpVoteCount,
+        -- Correlated subquery: count of downvotes for the question
+        (SELECT COUNT(V.Id) FROM Votes AS V WHERE V.PostId = QuestionId AND V.VoteTypeId = 3) AS DownVoteCount,
+        -- Correlated subquery: count of posts linked as duplicates for this question
+        (SELECT COUNT(PL.RelatedPostId) FROM PostLinks AS PL WHERE PL.PostId = QuestionId AND PL.LinkTypeId = 3) AS DuplicateLinkCount,
+        MAX(UserQuestionRank) FILTER (WHERE UserQuestionRank <= 5) IS NOT NULL AS IsTop5UserQuestion
+    FROM QuestionAnswerDetails
+    GROUP BY
+        QuestionId, QuestionOwnerId, QuestionCreationDate, QuestionScore, ViewCount, AnswerCount, FavoriteCount, ClosedDate, QuestionRevisions
+),
+UserTagEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        T.TagName,
+        COUNT(DISTINCT P.Id) AS PostsWithTag,
+        SUM(P.Score) AS TaggedPostScore,
+        AVG(P.Score) AS AvgTaggedPostScore,
+        -- Correlated subquery: count of unique users who also posted on this tag and have higher reputation
+        (
+            SELECT COUNT(DISTINCT U2.Id)
+            FROM Users AS U2
+            JOIN Posts AS P2 ON U2.Id = P2.OwnerUserId
+            WHERE P2.Tags LIKE '%' || T.TagName || '%'
+              AND U2.Reputation > U.Reputation
+              AND U2.Id <> U.Id
+        ) AS HigherReputationContributorsToTag
+    FROM Users AS U
+    JOIN Posts AS P ON U.Id = P.OwnerUserId AND P.PostTypeId = 1 AND P.Tags IS NOT NULL
+    -- String expression: parse tags from string using `string_to_array` and `substring`
+    CROSS JOIN LATERAL (
+        SELECT TRIM(UNNEST(string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><'))) AS TagName
+    ) AS TagList
+    JOIN Tags AS T ON TagList.TagName = T.TagName
+    GROUP BY U.Id, U.DisplayName, U.Reputation, T.TagName
+),
+UserBadgeStats AS (
+    SELECT
+        UserId,
+        COUNT(Id) AS TotalBadges,
+        COUNT(Id) FILTER (WHERE Class = 1) AS GoldBadges,
+        COUNT(Id) FILTER (WHERE Class = 2) AS SilverBadges,
+        COUNT(Id) FILTER (WHERE Class = 3) AS BronzeBadges,
+        MAX(Date) AS LatestBadgeDate
+    FROM Badges
+    GROUP BY UserId
+),
+HighImpactUsersCandidate AS (
+    -- Set operator: Combine users with high reputation/posts, or good answers, or gold badges
+    SELECT UserId FROM UserActivitySummary WHERE Reputation > 5000 AND TotalPosts > 100
+    UNION ALL
+    SELECT QuestionOwnerId AS UserId FROM QuestionAnswerPerformance WHERE AvgAnswerScore > 5 AND AcceptedAnswerScore > 0
+    UNION ALL
+    SELECT UserId FROM UserBadgeStats WHERE GoldBadges > 0
+)
+SELECT
+    UAS.UserId,
+    UAS.DisplayName,
+    UAS.Reputation,
+    UAS.TotalPosts,
+    UAS.TotalQuestions,
+    UAS.TotalAnswers,
+    UAS.TotalComments,
+    UAS.TotalPostScore,
+    UAS.TotalCommentScore,
+    UBS.TotalBadges,
+    UBS.GoldBadges,
+    UBS.SilverBadges,
+    UBS.BronzeBadges,
+    UBS.LatestBadgeDate,
+    AVG(QAP.QuestionScore) AS AvgQuestionScore,
+    AVG(QAP.AvgAnswerScore) AS AvgQuestionAvgAnswerScore,
+    SUM(QAP.UpVoteCount) AS TotalQuestionUpVotes,
+    SUM(QAP.DownVoteCount) AS TotalQuestionDownVotes,
+    SUM(QAP.DuplicateLinkCount) AS TotalDuplicateQuestionsLinked,
+    MAX(QAP.QuestionRevisions) AS MaxQuestionRevisions,
+    MIN(QAP.QuestionRevisions) AS MinQuestionRevisions,
+    -- Window function: NTILE for reputation deciles
+    NTILE(10) OVER (ORDER BY UAS.Reputation DESC) AS ReputationDecile,
+    -- Conditional expression and NULL logic
+    CASE
+        WHEN UAS.Reputation > 10000 AND UAS.TotalPosts > 500 AND UAS.AvgDailyReputationGain > 10 THEN 'Elite Contributor'
+        WHEN UAS.Reputation > 1000 AND UAS.TotalPosts > 100 THEN 'Active Contributor'
+        WHEN UAS.Reputation IS NULL OR UAS.Reputation = 0 THEN 'New/Inactive'
+        ELSE 'Regular User'
+    END AS UserCategory,
+    COALESCE(UAS.DisplayName, 'Anonymous User') AS EffectiveDisplayName, -- NULL logic: provide default display name
+    -- Complicated calculation using date functions
+    CAST(EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - UAS.CreationDate)) / (365.25 * 24 * 3600) AS numeric(10, 2)) AS AccountAgeYears,
+    AVG(CASE WHEN QAP.ClosedDate IS NOT NULL THEN 1.0 ELSE 0.0 END) AS PctQuestionsClosed,
+    -- Correlated subquery in SELECT clause: sum of all bounty activity for the user
+    (
+        SELECT COALESCE(SUM(V.BountyAmount), 0)
+        FROM Votes AS V
+        WHERE V.UserId = UAS.UserId AND V.VoteTypeId IN (8, 9) -- BountyStart, BountyClose
+    ) AS TotalBountyActivity,
+    -- String aggregation of top active tags
+    STRING_AGG(DISTINCT UTE.TagName, '; ' ORDER BY UTE.TaggedPostScore DESC) FILTER (WHERE UTE.PostsWithTag > 10 AND UTE.AvgTaggedPostScore > 2) AS TopActiveTags,
+    COALESCE(SUM(UTE.HigherReputationContributorsToTag), 0) AS TotalHigherRepContributorsAcrossTags,
+    -- Complex join condition: count of accepted answers that the user provided to their own questions
+    COUNT(DISTINCT SELF_ANS.Id) FILTER (WHERE SELF_ANS.AcceptedAnswerId IS NOT NULL) AS SelfAcceptedAnswersCount
+FROM UserActivitySummary AS UAS
+LEFT JOIN UserBadgeStats AS UBS ON UAS.UserId = UBS.UserId
+LEFT JOIN QuestionAnswerPerformance AS QAP ON UAS.UserId = QAP.QuestionOwnerId
+LEFT JOIN UserTagEngagement AS UTE ON UAS.UserId = UTE.UserId
+-- Join to identify self-accepted answers
+LEFT JOIN Posts AS SELF_ANS ON UAS.UserId = SELF_ANS.OwnerUserId AND SELF_ANS.PostTypeId = 2 AND SELF_ANS.ParentId = QAP.QuestionId AND SELF_ANS.Id = QAP.AcceptedAnswerId
+-- Filter by high impact candidates (derived from UNION ALL CTE)
+JOIN (SELECT DISTINCT UserId FROM HighImpactUsersCandidate) AS HIC ON UAS.UserId = HIC.UserId
+WHERE
+    UAS.Reputation > 100 -- Focus on non-trivial users
+    AND UAS.LastAccessDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year' -- Recently active
+    AND (QAP.QuestionScore > 5 OR QAP.AvgAnswerScore > 3.0 OR QAP.QuestionId IS NULL) -- Filter for quality posts or users without questions
+    -- Complex predicate with string matching and NULL logic
+    AND (
+        LOWER(UAS.DisplayName) LIKE '%dev%' OR LOWER(UAS.DisplayName) LIKE '%sql%'
+        OR LOWER(UAS.AboutMe) LIKE '%developer%' OR LOWER(UAS.AboutMe) LIKE '%database%'
+        OR UAS.Location IS NULL -- Example of NULL logic in WHERE clause
+    )
+GROUP BY
+    UAS.UserId, UAS.DisplayName, UAS.Reputation, UAS.TotalPosts, UAS.TotalQuestions, UAS.TotalAnswers,
+    UAS.TotalComments, UAS.TotalPostScore, UAS.TotalCommentScore, UBS.TotalBadges, UBS.GoldBadges,
+    UBS.SilverBadges, UBS.BronzeBadges, UBS.LatestBadgeDate, UAS.CreationDate, UAS.LastAccessDate
+ORDER BY
+    ReputationDecile,
+    UAS.Reputation DESC,
+    UAS.LastAccessDate DESC
+LIMIT 1000;

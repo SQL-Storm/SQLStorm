@@ -1,0 +1,115 @@
+WITH recent_posts AS (
+    SELECT p.id,
+           p.owneruserid,
+           p.posttypeid,
+           p.creationdate,
+           p.score,
+           p.viewcount,
+           ROW_NUMBER() OVER (PARTITION BY p.owneruserid ORDER BY p.creationdate DESC) AS rn
+    FROM   posts p
+    WHERE  p.creationdate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days')
+),
+top_user_posts AS (
+    SELECT rp.owneruserid,
+           COUNT(*)                                   AS postcnt_lastyr,
+           SUM(CASE WHEN rp.score > 0 THEN rp.score ELSE 0 END) AS pos_score_sum,
+           MAX(rp.viewcount)                         AS max_views
+    FROM   recent_posts rp
+    WHERE  rp.rn <= 10
+    GROUP  BY rp.owneruserid
+),
+badge_stats AS (
+    SELECT b.userid,
+           COUNT(*)                                   AS total_badges,
+           SUM(CASE WHEN b.class = 1 THEN 1 ELSE 0 END) AS gold_badges,
+           STRING_AGG(DISTINCT b.name, ',')           AS badge_names
+    FROM   badges b
+    GROUP  BY b.userid
+),
+tag_activity AS (
+    SELECT t.tagname,
+           COUNT(p.id)                                 AS q_cnt,
+           SUM(p.score)                                AS total_score,
+           COALESCE(SUM(CASE WHEN v.votetypeid = 2 THEN 1 ELSE 0 END),0) AS up_votes
+    FROM   tags t
+    JOIN   posts p
+           ON p.tags LIKE '%' || t.tagname || '%'
+          AND p.posttypeid = 1
+    LEFT JOIN votes v
+           ON v.postid = p.id
+          AND v.votetypeid = 2
+    GROUP  BY t.tagname
+),
+user_scores AS (
+    SELECT u.id,
+           u.displayname,
+           COALESCE(bs.total_badges,0)                 AS badges_earned,
+           COALESCE(tup.postcnt_lastyr,0)              AS recent_post_cnt,
+           COALESCE(tup.pos_score_sum,0)               AS recent_pos_score,
+           CASE
+               WHEN u.reputation > 20000 THEN 'Elite'
+               WHEN u.reputation > 5000  THEN 'PowerUser'
+               ELSE 'Regular'
+           END                                         AS rep_tier,
+           CASE
+               WHEN EXISTS (SELECT 1
+                            FROM   posts p
+                            WHERE  p.owneruserid = u.id
+                                   AND p.acceptedanswerid IS NOT NULL) THEN 1
+               ELSE 0
+           END                                         AS has_accepted_ans,
+           COALESCE(bn.badge_names,'')                 AS badge_list
+    FROM   users u
+    LEFT JOIN top_user_posts tup
+           ON tup.owneruserid = u.id
+    LEFT JOIN badge_stats bs
+           ON bs.userid = u.id
+    LEFT JOIN ( SELECT userid,
+                       STRING_AGG(name, ',') AS badge_names
+                FROM   badges
+                GROUP  BY userid ) bn
+           ON bn.userid = u.id
+)
+SELECT us.id,
+       us.displayname,
+       us.rep_tier,
+       us.badges_earned,
+       us.recent_post_cnt,
+       us.recent_pos_score,
+       us.has_accepted_ans,
+       us.badge_list,
+       COALESCE(t.tagname,'<no-tag>')                 AS sample_tag,
+       COALESCE(t.q_cnt,0)                            AS tag_q_cnt,
+       COALESCE(t.total_score,0)                      AS tag_total_score,
+       COALESCE(t.up_votes,0)                         AS tag_up_votes
+FROM   user_scores us
+LEFT JOIN LATERAL (
+          SELECT ta.tagname,
+                 ta.q_cnt,
+                 ta.total_score,
+                 ta.up_votes
+          FROM   tag_activity ta
+          ORDER  BY ta.q_cnt DESC
+          LIMIT  1
+      ) t ON TRUE
+WHERE  us.rep_tier <> 'Regular'
+ORDER  BY us.recent_pos_score DESC,
+          us.badges_earned DESC
+OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY
+
+UNION ALL
+
+SELECT NULL                     AS id,
+       'TOTAL'                  AS displayname,
+       NULL                     AS rep_tier,
+       SUM(us.badges_earned)    AS badges_earned,
+       SUM(us.recent_post_cnt)  AS recent_post_cnt,
+       SUM(us.recent_pos_score) AS recent_pos_score,
+       NULL                     AS has_accepted_ans,
+       NULL                     AS badge_list,
+       NULL                     AS sample_tag,
+       NULL                     AS tag_q_cnt,
+       NULL                     AS tag_total_score,
+       NULL                     AS tag_up_votes
+FROM   user_scores us
+WHERE  us.rep_tier <> 'Regular';

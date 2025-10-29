@@ -1,0 +1,214 @@
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.Views AS UserViews,
+        U.UpVotes,
+        U.DownVotes,
+        U.Location,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        MAX(B.Class) AS HighestBadgeClass,
+        MAX(U.LastAccessDate) AS LastUserActivity,
+        CAST(U.UpVotes AS NUMERIC) / NULLIF(U.DownVotes, 0) AS UpDownVoteRatio,
+        MAX(CASE WHEN (B.Name ILIKE '%sql%' OR B.Name ILIKE '%database%') AND B.TagBased = TRUE THEN 1 ELSE 0 END) AS HasSqlOrDbTagBadge
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    LEFT JOIN Badges AS B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.Views, U.UpVotes, U.DownVotes, U.Location, U.LastAccessDate
+    HAVING COUNT(DISTINCT P.Id) > 5
+),
+PostHistoricalContext AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.LastEditDate,
+        P.ClosedDate,
+        P.CommunityOwnedDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount AS PostCommentCount,
+        P.Tags,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS WasClosed,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS WasReopened,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 12 THEN 1 ELSE 0 END) AS WasDeleted,
+        COUNT(DISTINCT PH.UserId) FILTER (WHERE PH.UserId IS NOT NULL AND PH.UserId <> P.OwnerUserId AND PH.PostHistoryTypeId IN (4, 5, 6)) AS OtherEditorsCount,
+        MAX(CASE WHEN PH.CreationDate = P.LastEditDate THEN PH.UserId ELSE NULL END) AS LastEditorId,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN COALESCE(PH.Comment, 'Unknown Reason') ELSE NULL END) AS CloseReason,
+        MAX(CASE WHEN PL.LinkTypeId = 3 THEN PL.RelatedPostId ELSE NULL END) AS DuplicateOfPostId
+    FROM Posts AS P
+    LEFT JOIN PostHistory AS PH ON P.Id = PH.PostId
+    LEFT JOIN PostLinks AS PL ON P.Id = PL.PostId
+    GROUP BY P.Id, P.PostTypeId, P.OwnerUserId, P.CreationDate, P.LastEditDate, P.ClosedDate, P.CommunityOwnedDate, P.Score, P.ViewCount, P.AnswerCount, P.CommentCount, P.Tags
+),
+CommentActivity AS (
+    SELECT
+        PostId,
+        SUM(Score) AS TotalCommentScore,
+        COUNT(DISTINCT UserId) AS UniqueCommenters,
+        AVG(LENGTH(Text)) AS AvgCommentLength,
+        MAX(CreationDate) AS LastCommentDate,
+        COUNT(*) AS CommentCountDetailed
+    FROM Comments
+    GROUP BY PostId
+),
+TagAnalysis AS (
+    SELECT
+        P.Id AS PostId,
+        STRING_AGG(T.TagName, ', ') AS AllMatchedTags,
+        MAX(CASE WHEN T.TagName = 'sql' THEN 1 ELSE 0 END) AS HasSQLTag,
+        MAX(CASE WHEN T.TagName = 'performance' THEN 1 ELSE 0 END) AS HasPerformanceTag,
+        MAX(CASE WHEN T.TagName = 'optimization' THEN 1 ELSE 0 END) AS HasOptimizationTag
+    FROM Posts AS P
+    LEFT JOIN LATERAL (
+        SELECT tag
+        FROM UNNEST(string_to_array(substring(P.Tags, 2, length(P.Tags) - 2), '><')) AS tag
+    ) AS UnnestedTags (TagName) ON TRUE
+    LEFT JOIN Tags AS T ON UnnestedTags.TagName = T.TagName
+    WHERE P.Tags IS NOT NULL AND P.Tags <> ''
+    GROUP BY P.Id
+),
+PostScoresWithAvg AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.CreationDate,
+        P.Score,
+        CAST(NULL AS NUMERIC) AS AvgScoreSamePostTypeLastYear
+    FROM Posts AS P
+),
+PostScoreAverages AS (
+    SELECT
+        p1.Id AS PostId,
+        p1.PostTypeId,
+        p1.CreationDate,
+        AVG(p2.Score) AS AvgScoreSamePostTypeLastYear
+    FROM Posts p1
+    LEFT JOIN Posts p2
+      ON p1.PostTypeId = p2.PostTypeId
+     AND p2.CreationDate BETWEEN p1.CreationDate - INTERVAL '365 days' AND p1.CreationDate
+    GROUP BY p1.Id, p1.PostTypeId, p1.CreationDate
+)
+SELECT
+    'HighReputation_ClosedQuestions_TechFocused' AS AnalysisCategory,
+    UE.DisplayName AS UserDisplayName,
+    UE.Reputation AS UserReputation,
+    UE.Location AS UserLocation,
+    PHC.PostId,
+    P.Title AS PostTitle,
+    PHC.PostCreationDate,
+    PHC.PostScore,
+    PHC.ViewCount AS PostViewCount,
+    PHC.AnswerCount,
+    P.FavoriteCount,
+    PHC.WasClosed,
+    PHC.CloseReason,
+    PHC.DuplicateOfPostId,
+    CA.TotalCommentScore,
+    CA.UniqueCommenters,
+    CA.AvgCommentLength,
+    TA.HasSQLTag,
+    TA.HasPerformanceTag,
+    TA.HasOptimizationTag,
+    (
+        SELECT COUNT(P2.Id)
+        FROM Posts AS P2
+        WHERE P2.OwnerUserId = UE.UserId
+          AND P2.CreationDate BETWEEN PHC.PostCreationDate - INTERVAL '7 days' AND PHC.PostCreationDate + INTERVAL '7 days'
+          AND P2.Id <> PHC.PostId
+    ) AS PeerPostsIn7Days,
+    RANK() OVER (PARTITION BY UE.Location ORDER BY UE.Reputation DESC, UE.UpDownVoteRatio DESC) AS RankInLocationByReputation,
+    PSA.AvgScoreSamePostTypeLastYear,
+    (PHC.PostScore * 1.5 + PHC.ViewCount * 0.01 + COALESCE(PHC.AnswerCount, 0) * 5 + COALESCE(CA.TotalCommentScore, 0) * 0.5)
+      / NULLIF(DATE_PART('day', CAST('2024-10-01 12:34:56' AS timestamp) - PHC.PostCreationDate), 0) AS EngagementFactorPerDay,
+    CASE
+        WHEN PHC.WasClosed = 1 AND PHC.CloseReason LIKE '%Duplicate%' THEN 'Closed_Duplicate'
+        WHEN PHC.WasClosed = 1 AND PHC.CloseReason IS NOT NULL THEN 'Closed_Other'
+        WHEN P.AcceptedAnswerId IS NOT NULL AND PHC.AnswerCount > 0 THEN 'Answered_Accepted'
+        WHEN PHC.AnswerCount > 0 AND PHC.PostScore > 50 THEN 'Answered_Popular'
+        ELSE 'Open_Active'
+    END AS PostStatusCategory,
+    COALESCE(SUBSTRING(P.Body FROM 1 FOR 100), 'No Body Content') AS BodySnippet,
+    (P.AcceptedAnswerId IS NOT NULL AND CA.CommentCountDetailed IS NOT NULL) AS HasAcceptedAnswerAndComments
+FROM UserEngagement AS UE
+INNER JOIN PostHistoricalContext AS PHC ON UE.UserId = PHC.OwnerUserId
+INNER JOIN Posts AS P ON PHC.PostId = P.Id
+LEFT JOIN CommentActivity AS CA ON PHC.PostId = CA.PostId
+LEFT JOIN TagAnalysis AS TA ON PHC.PostId = TA.PostId
+LEFT JOIN PostScoreAverages AS PSA ON P.Id = PSA.PostId
+WHERE
+    UE.Reputation > 10000
+    AND UE.LastUserActivity > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '6 months'
+    AND PHC.PostTypeId = 1
+    AND PHC.PostCreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+    AND PHC.WasClosed = 1
+    AND (TA.HasSQLTag = 1 OR TA.HasPerformanceTag = 1)
+    AND UE.TotalQuestions > 10
+    AND (LOWER(UE.Location) LIKE '%europe%' OR LOWER(UE.Location) IS NULL)
+UNION ALL
+SELECT
+    'ModerateReputation_PopularOpenQuestions_Optimized' AS AnalysisCategory,
+    UE.DisplayName AS UserDisplayName,
+    UE.Reputation AS UserReputation,
+    UE.Location AS UserLocation,
+    PHC.PostId,
+    P.Title AS PostTitle,
+    PHC.PostCreationDate,
+    PHC.PostScore,
+    PHC.ViewCount AS PostViewCount,
+    PHC.AnswerCount,
+    P.FavoriteCount,
+    PHC.WasClosed,
+    PHC.CloseReason,
+    PHC.DuplicateOfPostId,
+    CA.TotalCommentScore,
+    CA.UniqueCommenters,
+    CA.AvgCommentLength,
+    TA.HasSQLTag,
+    TA.HasPerformanceTag,
+    TA.HasOptimizationTag,
+    (
+        SELECT COUNT(P2.Id)
+        FROM Posts AS P2
+        WHERE P2.OwnerUserId = UE.UserId
+          AND P2.CreationDate BETWEEN PHC.PostCreationDate - INTERVAL '7 days' AND PHC.PostCreationDate + INTERVAL '7 days'
+          AND P2.Id <> PHC.PostId
+    ) AS PeerPostsIn7Days,
+    RANK() OVER (PARTITION BY UE.Location ORDER BY UE.Reputation DESC, UE.UpDownVoteRatio DESC) AS RankInLocationByReputation,
+    PSA.AvgScoreSamePostTypeLastYear,
+    (PHC.PostScore * 1.5 + PHC.ViewCount * 0.01 + COALESCE(PHC.AnswerCount, 0) * 5 + COALESCE(CA.TotalCommentScore, 0) * 0.5)
+      / NULLIF(DATE_PART('day', CAST('2024-10-01 12:34:56' AS timestamp) - PHC.PostCreationDate), 0) AS EngagementFactorPerDay,
+    CASE
+        WHEN PHC.WasClosed = 1 AND PHC.CloseReason LIKE '%Duplicate%' THEN 'Closed_Duplicate'
+        WHEN PHC.WasClosed = 1 AND PHC.CloseReason IS NOT NULL THEN 'Closed_Other'
+        WHEN P.AcceptedAnswerId IS NOT NULL AND PHC.AnswerCount > 0 THEN 'Answered_Accepted'
+        WHEN PHC.AnswerCount > 0 AND PHC.PostScore > 50 THEN 'Answered_Popular'
+        ELSE 'Open_Active'
+    END AS PostStatusCategory,
+    COALESCE(SUBSTRING(P.Body FROM 1 FOR 100), 'No Body Content') AS BodySnippet,
+    (P.AcceptedAnswerId IS NOT NULL AND CA.CommentCountDetailed IS NOT NULL) AS HasAcceptedAnswerAndComments
+FROM UserEngagement AS UE
+INNER JOIN PostHistoricalContext AS PHC ON UE.UserId = PHC.OwnerUserId
+INNER JOIN Posts AS P ON PHC.PostId = P.Id
+LEFT JOIN CommentActivity AS CA ON PHC.PostId = CA.PostId
+LEFT JOIN TagAnalysis AS TA ON PHC.PostId = TA.PostId
+LEFT JOIN PostScoreAverages AS PSA ON P.Id = PSA.PostId
+WHERE
+    UE.Reputation BETWEEN 1000 AND 10000
+    AND UE.LastUserActivity > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+    AND PHC.PostTypeId = 1
+    AND PHC.PostCreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 years'
+    AND PHC.WasClosed = 0
+    AND PHC.ViewCount > 5000
+    AND PHC.AnswerCount > 5
+    AND (TA.HasOptimizationTag = 1 OR TA.HasPerformanceTag = 1)
+    AND (LOWER(UE.Location) LIKE '%asia%' OR LOWER(UE.Location) IS NULL)
+ORDER BY UserReputation DESC, EngagementFactorPerDay DESC
+LIMIT 2000;

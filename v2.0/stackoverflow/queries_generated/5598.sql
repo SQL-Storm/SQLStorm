@@ -1,0 +1,44 @@
+-- {"query": "5598.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 485} 
+SELECT
+  u.Id AS UserId,
+  u.DisplayName,
+  COUNT(DISTINCT p.Id) AS PostsCreated,
+  SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS Questions,
+  SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS Answers,
+  MAX(p.CreationDate) AS LastActivity,
+  AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL) AS AvgScorePerPost,
+  COUNT(DISTINCT v.Id) AS VotesCast,
+  SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesCast,
+  SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesCast,
+  COUNT(DISTINCT b.Id) AS BadgesEarned,
+  MAX(b.Date) AS LastBadgeDate,
+  STRING_AGG(DISTINCT t.Name, ',') AS TopTags,
+  COUNT(DISTINCT cl.RelatedPostId) AS LinkedToOthers,
+  SUM(CASE WHEN cl.LinkTypeId = 1 THEN 1 ELSE 0 END) AS ExternalLinksFromPosts,
+  MAX(p.LastActivityDate) AS LastPostActivity
+FROM
+  Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id AND v.UserId = u.Id
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  LEFT JOIN (
+    SELECT
+      pt.Id AS PostId,
+      wt.Name
+    FROM Posts pt
+      CROSS APPLY (SELECT wt.Name) w
+  ) bogus ON bogus.PostId = p.Id -- placeholder to demonstrate complex join surface
+  LEFT JOIN (
+    SELECT
+      t.TagName AS Name
+    FROM Tags t
+  ) t ON 1=1
+  LEFT JOIN PostLinks cl ON cl.PostId = p.Id
+  LEFT JOIN (SELECT Id, PostId FROM Badges) b2 ON b2.PostId = p.Id
+WHERE
+  u.AccountId IS NOT NULL
+GROUP BY
+  u.Id, u.DisplayName
+ORDER BY
+  COALESCE(MAX(p.LastActivityDate), u.CreationDate) DESC
+LIMIT 100;

@@ -1,0 +1,393 @@
+-- {"query": "7450.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 4120} 
+WITH PostStats AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Title,
+        p.Tags,
+        COALESCE(p.Body, '') AS Body,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            WHEN p.PostTypeId = 4 THEN 'TagWikiExcerpt'
+            WHEN p.PostTypeId = 5 THEN 'TagWiki'
+            ELSE 'Other'
+        END AS PostTypeDesc,
+        DATEDIFF('day', p.CreationDate, p.LastActivityDate) AS DaysActive,
+        CASE 
+            WHEN p.Score > 100 THEN 'Highly_Voted'
+            WHEN p.Score > 50 THEN 'Moderately_Voted'
+            WHEN p.Score > 10 THEN 'Low_Voted'
+            ELSE 'Very_Low_Voted'
+        END AS VoteCategory,
+        CASE 
+            WHEN p.AnswerCount > 10 THEN 'Many_Answers'
+            WHEN p.AnswerCount > 5 THEN 'Some_Answers'
+            WHEN p.AnswerCount > 0 THEN 'Few_Answers'
+            ELSE 'No_Answers'
+        END AS AnswerCategory,
+        CASE 
+            WHEN p.CommentCount > 50 THEN 'High_Comments'
+            WHEN p.CommentCount > 20 THEN 'Moderate_Comments'
+            WHEN p.CommentCount > 5 THEN 'Low_Comments'
+            ELSE 'Minimal_Comments'
+        END AS CommentCategory,
+        CASE 
+            WHEN p.ViewCount > 10000 THEN 'Viral'
+            WHEN p.ViewCount > 5000 THEN 'Popular'
+            WHEN p.ViewCount > 1000 THEN 'Moderate_Popularity'
+            ELSE 'Low_Popularity'
+        END AS PopularityLevel,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserPostRank,
+        RANK() OVER (ORDER BY p.Score DESC) AS ScoreRank,
+        DENSE_RANK() OVER (ORDER BY p.ViewCount DESC) AS ViewRank,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousScore,
+        LEAD(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS AvgScorePerUser,
+        SUM(p.Score) OVER (PARTITION BY p.OwnerUserId) AS TotalScorePerUser,
+        NTILE(4) OVER (ORDER BY p.Score) AS ScoreQuartile,
+        PERCENT_RANK() OVER (ORDER BY p.ViewCount) AS ViewPercentile,
+        CUME_DIST() OVER (ORDER BY p.Score) AS ScoreCumulativeDistribution,
+        COALESCE(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '') AS CleanedTags
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.AccountId,
+        COUNT(DISTINCT ps.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN ps.PostTypeId = 1 THEN ps.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN ps.PostTypeId = 2 THEN ps.Id END) AS AnswerCount,
+        AVG(ps.Score) AS AvgScore,
+        MAX(ps.Score) AS MaxScore,
+        MIN(ps.Score) AS MinScore,
+        SUM(ps.Score) AS TotalScore,
+        SUM(ps.ViewCount) AS TotalViews,
+        STDEV(ps.Score) AS ScoreStdDev,
+        AVG(ps.DaysActive) AS AvgDaysActive,
+        MAX(ps.LastActivityDate) AS LastActivity,
+        COUNT(DISTINCT CASE WHEN ps.CreationDate::date = CURRENT_DATE THEN ps.Id END) AS PostsToday,
+        COUNT(DISTINCT CASE WHEN ps.CreationDate::date = CURRENT_DATE - INTERVAL '1 day' THEN ps.Id END) AS PostsYesterday,
+        LAG(COUNT(DISTINCT ps.Id), 1) OVER (ORDER BY u.CreationDate) AS PreviousDayPosts,
+        LEAD(COUNT(DISTINCT ps.Id), 1) OVER (ORDER BY u.CreationDate) AS NextDayPosts
+    FROM Users u
+    LEFT JOIN PostStats ps ON u.Id = ps.OwnerUserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.AccountId
+),
+TopUsers AS (
+    SELECT 
+        Id,
+        DisplayName,
+        Reputation,
+        Views,
+        UpVotes,
+        DownVotes,
+        AccountId,
+        TotalPosts,
+        QuestionCount,
+        AnswerCount,
+        AvgScore,
+        MaxScore,
+        MinScore,
+        TotalScore,
+        TotalViews,
+        ScoreStdDev,
+        AvgDaysActive,
+        LastActivity,
+        PostsToday,
+        PostsYesterday,
+        PreviousDayPosts,
+        NextDayPosts,
+        ROW_NUMBER() OVER (ORDER BY TotalScore DESC, Reputation DESC) AS UserRank
+    FROM UserActivityStats
+),
+AnswerQuality AS (
+    SELECT 
+        ps.Id AS AnswerId,
+        ps.OwnerUserId,
+        ps.Score AS AnswerScore,
+        ps.CreationDate AS AnswerDate,
+        ps.LastActivityDate AS AnswerLastActivity,
+        ps.PostTypeId,
+        ps.AnswerCount,
+        ps.CommentCount,
+        ps.ViewCount,
+        ps.Tags,
+        ps.Title,
+        ps.Body,
+        ps.DaysActive,
+        ps.VoteCategory,
+        ps.AnswerCategory,
+        ps.CommentCategory,
+        ps.PopularityLevel,
+        ps.UserPostRank,
+        ps.ScoreRank,
+        ps.ViewRank,
+        ps.PreviousScore,
+        ps.NextScore,
+        ps.AvgScorePerUser,
+        ps.TotalScorePerUser,
+        ps.ScoreQuartile,
+        ps.ViewPercentile,
+        ps.ScoreCumulativeDistribution,
+        ps.CleanedTags,
+        ps.PostTypeDesc,
+        CASE 
+            WHEN ps.Score > (SELECT AVG(Score) FROM PostStats WHERE PostTypeId = 2) THEN 'Above_Avg_Score'
+            ELSE 'Below_Avg_Score'
+        END AS ScoreStatus,
+        CASE 
+            WHEN ps.DaysActive > 30 AND ps.ViewCount > 100 THEN 'Engaged'
+            ELSE 'Inactive'
+        END AS EngagementStatus,
+        CASE 
+            WHEN ps.Score > 20 AND ps.CommentCount > 10 THEN 'Highly_Rated_With_Comments'
+            WHEN ps.Score > 20 THEN 'Highly_Rated'
+            WHEN ps.CommentCount > 10 THEN 'Highly_Commented'
+            ELSE 'Normal'
+        END AS QualityIndicator,
+        CASE 
+            WHEN (ps.Score - ps.PreviousScore) > 10 THEN 'Significant_Improvement'
+            WHEN (ps.Score - ps.PreviousScore) < -10 THEN 'Significant_Degradation'
+            ELSE 'Stable'
+        END AS PerformanceChange,
+        DATEDIFF('day', ps.CreationDate, ps.LastActivityDate) AS DaysActive,
+        DATEDIFF('day', ps.CreationDate, CURRENT_DATE) AS DaysSinceCreation,
+        COALESCE(DATE_TRUNC('month', ps.CreationDate), '') AS CreationMonth,
+        COALESCE(DATE_TRUNC('year', ps.CreationDate), '') AS CreationYear,
+        CONCAT('Score: ', ps.Score, ', Views: ', ps.ViewCount, ', Comments: ', ps.CommentCount, ', Answers: ', ps.AnswerCount) AS SummaryString
+    FROM PostStats ps
+    WHERE ps.PostTypeId = 2
+    AND ps.OwnerUserId IS NOT NULL
+),
+ComplexFilter AS (
+    SELECT 
+        *,
+        CASE 
+            WHEN UserRank <= 100 THEN 'Top100_Users'
+            WHEN UserRank <= 1000 THEN 'Top1000_Users'
+            WHEN UserRank <= 10000 THEN 'Top10000_Users'
+            ELSE 'Other_Users'
+        END AS UserTier,
+        CASE 
+            WHEN Score > 100 AND ViewCount > 500 THEN 'Elite_Post'
+            WHEN Score > 50 AND ViewCount > 250 THEN 'High_Performance_Post'
+            WHEN Score > 25 AND ViewCount > 100 THEN 'Moderate_Performance_Post'
+            ELSE 'Standard_Post'
+        END AS PerformanceTier,
+        CASE 
+            WHEN AVG(Score) OVER (PARTITION BY OwnerUserId) > 50 THEN 'High_Performing_User'
+            WHEN AVG(Score) OVER (PARTITION BY OwnerUserId) > 25 THEN 'Medium_Performing_User'
+            ELSE 'Low_Performing_User'
+        END AS UserPerformanceCategory
+    FROM TopUsers tu
+    JOIN AnswerQuality aq ON tu.Id = aq.OwnerUserId
+)
+SELECT 
+    cf.Id AS UserId,
+    cf.DisplayName,
+    cf.Reputation,
+    cf.Views,
+    cf.TotalPosts,
+    cf.QuestionCount,
+    cf.AnswerCount,
+    cf.AvgScore,
+    cf.MaxScore,
+    cf.MinScore,
+    cf.TotalScore,
+    cf.TotalViews,
+    cf.ScoreStdDev,
+    cf.AvgDaysActive,
+    cf.LastActivity,
+    cf.PostsToday,
+    cf.PostsYesterday,
+    cf.UserTier,
+    cf.UserPerformanceCategory,
+    aq.AnswerId,
+    aq.AnswerScore,
+    aq.AnswerDate,
+    aq.AnswerLastActivity,
+    aq.AnswerCategory,
+    aq.CommentCategory,
+    aq.PopularityLevel,
+    aq.PerformanceChange,
+    aq.ScoreStatus,
+    aq.EngagementStatus,
+    aq.QualityIndicator,
+    aq.CreationMonth,
+    aq.CreationYear,
+    aq.SummaryString,
+    aq.DaysSinceCreation,
+    aq.DaysActive,
+    aq.UserPostRank,
+    aq.ScoreRank,
+    aq.ViewRank,
+    aq.ScoreQuartile,
+    aq.ViewPercentile,
+    aq.ScoreCumulativeDistribution,
+    aq.CleanedTags,
+    aq.PostTypeDesc,
+    cf.PerformanceTier,
+    CASE 
+        WHEN cf.TotalScore > (SELECT AVG(TotalScore) FROM ComplexFilter) THEN 'Above_Avg_Score'
+        ELSE 'Below_Avg_Score'
+    END AS OverallScoreStatus,
+    COALESCE(COUNT(DISTINCT CASE WHEN cf.AnswerCount > 0 THEN aq.AnswerId END), 0) AS AnsweredQuestions,
+    COALESCE(COUNT(DISTINCT CASE WHEN cf.QuestionCount > 0 THEN cf.Id END), 0) AS QuestionedPosts,
+    CASE 
+        WHEN cf.Views > 10000 THEN 'High_View_User'
+        WHEN cf.Views > 5000 THEN 'Moderate_View_User'
+        WHEN cf.Views > 1000 THEN 'Low_View_User'
+        ELSE 'Very_Low_View_User'
+    END AS ViewCategory,
+    CASE 
+        WHEN cf.AvgScore > 50 THEN 'High_Score_User'
+        WHEN cf.AvgScore > 25 THEN 'Moderate_Score_User'
+        WHEN cf.AvgScore > 10 THEN 'Low_Score_User'
+        ELSE 'Very_Low_Score_User'
+    END AS ScoreCategory,
+    CASE 
+        WHEN cf.MaxScore > 100 THEN 'Extremely_High_Score_User'
+        WHEN cf.MaxScore > 50 THEN 'High_Score_User'
+        WHEN cf.MaxScore > 25 THEN 'Moderate_Score_User'
+        ELSE 'Low_Score_User'
+    END AS MaxScoreCategory,
+    CASE 
+        WHEN cf.Reputation > 100000 THEN 'Legendary_Rep_User'
+        WHEN cf.Reputation > 25000 THEN 'Elite_Rep_User'
+        WHEN cf.Reputation > 5000 THEN 'High_Rep_User'
+        WHEN cf.Reputation > 1000 THEN 'Moderate_Rep_User'
+        ELSE 'Low_Rep_User'
+    END AS RepCategory,
+    CASE 
+        WHEN cf.Reputation > 10000 AND cf.TotalScore > 1000 THEN 'Elite_Contributor'
+        WHEN cf.Reputation > 5000 AND cf.TotalScore > 500 THEN 'High_Contributor'
+        WHEN cf.Reputation > 1000 AND cf.TotalScore > 100 THEN 'Moderate_Contributor'
+        ELSE 'Standard_Contributor'
+    END AS ContributionLevel,
+    COALESCE(
+        (SELECT COUNT(*) FROM Votes v WHERE v.UserId = cf.Id AND v.VoteTypeId = 2) / 
+        NULLIF((SELECT COUNT(*) FROM Votes v WHERE v.UserId = cf.Id), 0),
+        0
+    ) AS UpvoteRatio,
+    COALESCE(
+        (SELECT COUNT(*) FROM Votes v WHERE v.UserId = cf.Id AND v.VoteTypeId = 3) / 
+        NULLIF((SELECT COUNT(*) FROM Votes v WHERE v.UserId = cf.Id), 0),
+        0
+    ) AS DownvoteRatio,
+    CASE 
+        WHEN cf.ViewRank <= 500 THEN 'Top_Viewed_User'
+        WHEN cf.ViewRank <= 5000 THEN 'High_Viewed_User'
+        WHEN cf.ViewRank <= 50000 THEN 'Moderate_Viewed_User'
+        ELSE 'Low_Viewed_User'
+    END AS ViewRankCategory,
+    CASE 
+        WHEN cf.ScoreRank <= 100 THEN 'Top_Scored_User'
+        WHEN cf.ScoreRank <= 1000 THEN 'High_Scored_User'
+        WHEN cf.ScoreRank <= 10000 THEN 'Moderate_Scored_User'
+        ELSE 'Low_Scored_User'
+    END AS ScoreRankCategory,
+    CASE 
+        WHEN cf.UserRank <= 10 THEN 'Elite_Ranked_User'
+        WHEN cf.UserRank <= 100 THEN 'High_Ranked_User'
+        WHEN cf.UserRank <= 1000 THEN 'Moderate_Ranked_User'
+        ELSE 'Standard_Ranked_User'
+    END AS RankCategory,
+    COALESCE(
+        (SELECT COUNT(DISTINCT PostId) FROM Comments c WHERE c.UserId = cf.Id),
+        0
+    ) AS CommentsMade,
+    COALESCE(
+        (SELECT COUNT(DISTINCT Id) FROM Posts p WHERE p.OwnerUserId = cf.Id AND p.PostTypeId = 1),
+        0
+    ) AS QuestionsAsked,
+    COALESCE(
+        (SELECT COUNT(DISTINCT Id) FROM Posts p WHERE p.OwnerUserId = cf.Id AND p.PostTypeId = 2),
+        0
+    ) AS AnswersProvided,
+    CASE 
+        WHEN cf.AnswerCount > 0 THEN cf.AnswerCount * 100.0 / NULLIF(cf.QuestionCount, 0)
+        ELSE 0
+    END AS AnswerToQuestionRatio,
+    (cf.QuestionCount * 1.0 / NULLIF(cf.AnswerCount + cf.QuestionCount, 0)) * 100 AS QuestionPercentage,
+    (cf.AnswerCount * 1.0 / NULLIF(cf.AnswerCount + cf.QuestionCount, 0)) * 100 AS AnswerPercentage,
+    COALESCE(SUBSTRING(cf.Id::TEXT, 1, 3), '000') AS UserPrefix,
+    COALESCE(SUBSTRING(cf.Id::TEXT, -3), '000') AS UserSuffix,
+    COALESCE(SUBSTRING(cf.DisplayName, 1, 10), 'Unknown') AS DisplayNamePrefix,
+    CASE 
+        WHEN cf.DisplayName IS NULL OR cf.DisplayName = '' THEN 'No_Display_Name'
+        ELSE 'Has_Display_Name'
+    END AS DisplayNamePresent,
+    CASE 
+        WHEN cf.Views IS NULL OR cf.Views = 0 THEN 'No_Views'
+        ELSE 'Has_Views'
+    END AS ViewStatus,
+    CASE 
+        WHEN cf.Reputation < 100 THEN 'Novice'
+        WHEN cf.Reputation < 1000 THEN 'Experienced'
+        WHEN cf.Reputation < 10000 THEN 'Expert'
+        WHEN cf.Reputation < 100000 THEN 'Master'
+        ELSE 'Grandmaster'
+    END AS UserLevel,
+    CASE 
+        WHEN cf.LastActivity > CURRENT_DATE - INTERVAL '7 days' THEN 'Active_Last_Week'
+        WHEN cf.LastActivity > CURRENT_DATE - INTERVAL '30 days' THEN 'Active_Last_Month'
+        WHEN cf.LastActivity > CURRENT_DATE - INTERVAL '90 days' THEN 'Active_Last_Quarter'
+        ELSE 'Inactive'
+    END AS ActivityStatus,
+    CASE 
+        WHEN cf.PostsToday > 0 THEN 'Daily_Active'
+        ELSE 'Daily_Inactive'
+    END AS DailyActivity,
+    CASE 
+        WHEN cf.PostsYesterday > 0 THEN 'Yesterday_Active'
+        ELSE 'Yesterday_Inactive'
+    END AS YesterdayActivity,
+    CASE 
+        WHEN cf.TotalScore > 1000 AND cf.Reputation > 5000 AND cf.ViewCount > 500 THEN 'Elite_Contributor'
+        WHEN cf.TotalScore > 500 AND cf.Reputation > 2500 AND cf.ViewCount > 250 THEN 'High_Contributor'
+        WHEN cf.TotalScore > 100 AND cf.Reputation > 1000 AND cf.ViewCount > 100 THEN 'Moderate_Contributor'
+        ELSE 'Standard_Contributor'
+    END AS OverallContributorStatus,
+    CASE 
+        WHEN COALESCE(cf.Reputation, 0) = 0 THEN 'Zero_Reputation'
+        ELSE 'Non_Zero_Reputation'
+    END AS ReputationStatus,
+    CASE 
+        WHEN cf.TotalViews > 100000 THEN 'Viral_Exporter'
+        WHEN cf.TotalViews > 50000 THEN 'High_Exporter'
+        WHEN cf.TotalViews > 10000 THEN 'Moderate_Exporter'
+        WHEN cf.TotalViews > 1000 THEN 'Low_Exporter'
+        ELSE 'Minimal_Exporter'
+    END AS ExporterStatus
+FROM ComplexFilter cf
+JOIN AnswerQuality aq ON cf.Id = aq.OwnerUserId
+WHERE cf.UserRank <= 500
+AND (cf.Reputation > 100 OR cf.TotalScore > 100)
+AND aq.AnswerScore > 0
+AND (
+    (cf.PostsToday > 0 AND cf.PostsYesterday > 0) 
+    OR 
+    (cf.AnswerCount > 0 AND cf.QuestionCount > 0)
+    OR 
+    (cf.TotalScore > (SELECT AVG(TotalScore) FROM ComplexFilter WHERE TotalScore > 0) AND 
+     cf.TotalViews > (SELECT AVG(TotalViews) FROM ComplexFilter WHERE TotalViews > 0))
+)
+ORDER BY cf.TotalScore DESC, cf.Reputation DESC, cf.UserRank ASC
+LIMIT 100;

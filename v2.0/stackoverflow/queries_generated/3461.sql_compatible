@@ -1,0 +1,132 @@
+WITH
+    /* Rank each question by score per owner */
+    ranked_questions AS (
+        SELECT
+            p.Id,
+            p.OwnerUserId,
+            p.Score,
+            p.CreationDate,
+            ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS rn,
+            COUNT(*)    OVER (PARTITION BY p.OwnerUserId)                         AS q_cnt
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+          AND p.CreationDate >= TIMESTAMP '2020-01-01'
+    ),
+
+    /* Aggregate badge counts per user */
+    badge_summary AS (
+        SELECT
+            b.UserId,
+            SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_cnt,
+            SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_cnt,
+            SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_cnt,
+            COUNT(*)                                      AS total_badges
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+
+    /* Vote stats per post (up- and down-votes) */
+    post_votes AS (
+        SELECT
+            v.PostId,
+            SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END)   AS up_cnt,
+            SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END)   AS down_cnt,
+            MAX(v.CreationDate)                          AS last_vote_dt
+        FROM Votes v
+        JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+        WHERE vt.Id IN (2, 3)
+        GROUP BY v.PostId
+    ),
+
+    /* Explode tags of each post */
+    post_tags AS (
+        SELECT
+            p.Id               AS PostId,
+            UNNEST(string_to_array(TRIM(BOTH '<>' FROM p.Tags), '><')) AS tag
+        FROM Posts p
+        WHERE p.Tags IS NOT NULL
+    ),
+
+    /* Highly used tags */
+    popular_tags AS (
+        SELECT TagName
+        FROM Tags
+        WHERE Count > 1000
+    ),
+
+    /* Comment activity per user */
+    user_comments AS (
+        SELECT
+            c.UserId,
+            COUNT(*)                            AS comment_cnt,
+            MAX(c.CreationDate)                 AS last_comment_dt
+        FROM Comments c
+        GROUP BY c.UserId
+    )
+
+SELECT
+    u.Id                                   AS user_id,
+    COALESCE(u.DisplayName, 'Anonymous')   AS display_name,
+    u.Reputation,
+    bs.gold_cnt,
+    bs.silver_cnt,
+    bs.bronze_cnt,
+    bs.total_badges,
+    COALESCE(rq.q_cnt, 0)                  AS total_questions,
+    COALESCE(rq.Score, 0)                  AS top_question_score,
+    COALESCE(pv.up_cnt, 0) - COALESCE(pv.down_cnt, 0) AS net_votes,
+    COALESCE(uc.comment_cnt, 0)            AS comment_count,
+    STRING_AGG(DISTINCT pt.tag, ', ') FILTER (WHERE pt.tag IS NOT NULL) AS recent_popular_tags,
+    CASE
+        WHEN u.LastAccessDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30' DAY) THEN 'Active'
+        WHEN u.LastAccessDate IS NULL                      THEN 'NeverLogged'
+        ELSE 'Inactive'
+    END                                    AS activity_status
+FROM Users u
+LEFT JOIN badge_summary bs          ON bs.UserId = u.Id
+LEFT JOIN (
+        SELECT
+            OwnerUserId,
+            MAX(Score) AS Score,
+            MAX(q_cnt) AS q_cnt
+        FROM ranked_questions
+        WHERE rn = 1
+        GROUP BY OwnerUserId
+    ) rq ON rq.OwnerUserId = u.Id
+LEFT JOIN (
+        SELECT
+            p.OwnerUserId,
+            SUM(pv.up_cnt)   AS up_cnt,
+            SUM(pv.down_cnt) AS down_cnt,
+            MAX(pv.last_vote_dt) AS last_vote_dt
+        FROM Posts p
+        LEFT JOIN post_votes pv ON pv.PostId = p.Id
+        GROUP BY p.OwnerUserId
+    ) pv ON pv.OwnerUserId = u.Id
+LEFT JOIN user_comments uc        ON uc.UserId = u.Id
+LEFT JOIN (
+        SELECT
+            pt.PostId,
+            pt.tag
+        FROM post_tags pt
+        JOIN popular_tags ptg ON ptg.TagName = pt.tag
+    ) pt ON pt.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = u.Id)
+GROUP BY
+    u.Id, u.DisplayName, u.Reputation,
+    bs.gold_cnt, bs.silver_cnt, bs.bronze_cnt, bs.total_badges,
+    rq.q_cnt, rq.Score,
+    pv.up_cnt, pv.down_cnt,
+    uc.comment_cnt,
+    u.LastAccessDate
+HAVING COUNT(*) > 0
+ORDER BY u.Reputation DESC NULLS LAST
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    NULL, '---', NULL, NULL, NULL, NULL, NULL,
+    NULL, NULL, NULL, NULL, NULL, NULL, NULL
+FROM (SELECT 1) AS dummy
+ORDER BY 3 DESC NULLS LAST
+OFFSET 0;

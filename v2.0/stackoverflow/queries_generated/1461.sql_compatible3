@@ -1,0 +1,234 @@
+WITH UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName AS UserDisplayName,
+        u.Reputation,
+        u.Views AS UserViews,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswers,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScoreReceived,
+        COALESCE(SUM(p.ViewCount), 0) AS TotalPostViewsReceived,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(p.LastActivityDate) AS LastPostActivity,
+        MIN(p.CreationDate) AS FirstPostDate,
+        u.CreationDate AS UserCreationDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.CreationDate
+    HAVING COUNT(DISTINCT p.Id) >= 5
+),
+PostHistoricalMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        COUNT(ph.Id) AS TotalHistoryEntries,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseEventCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenEventCount,
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.CreationDate ELSE NULL END) AS LastEditHistoryDate,
+        (SELECT MIN(pa.CreationDate) FROM Posts pa WHERE pa.Id = p.AcceptedAnswerId) AS AcceptedAnswerCreationDate,
+        (SELECT MIN(v.CreationDate) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS FirstUpvoteDate
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    GROUP BY p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.LastEditDate, p.LastActivityDate, p.Score, p.ViewCount, p.Title, p.Tags, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.AcceptedAnswerId
+),
+TagAnalysisExpanded AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        TRIM(t.value) AS TagName
+    FROM Posts p,
+    LATERAL (
+      SELECT UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags) - 2)), '><')) AS value
+    ) t
+    WHERE p.Tags IS NOT NULL AND CHAR_LENGTH(p.Tags) > 2
+),
+PopularTagStats AS (
+    SELECT
+        ta.TagName,
+        COUNT(ta.PostId) AS TotalPostsWithTag,
+        AVG(phm.Score) AS AvgScoreForTag,
+        AVG(phm.ViewCount) AS AvgViewCountForTag
+    FROM TagAnalysisExpanded ta
+    JOIN PostHistoricalMetrics phm ON ta.PostId = phm.PostId
+    GROUP BY ta.TagName
+    HAVING COUNT(ta.PostId) >= 100
+),
+RankedUserPostPerformance AS (
+    SELECT
+        ue.UserId,
+        ue.UserDisplayName,
+        ue.Reputation,
+        phm.PostId,
+        phm.PostTypeId,
+        phm.PostCreationDate,
+        phm.Score AS PostScore,
+        phm.ViewCount AS PostViewCount,
+        phm.Title,
+        phm.Tags,
+        phm.EditCount,
+        phm.CloseEventCount,
+        phm.ReopenEventCount,
+        phm.LastEditHistoryDate,
+        phm.FirstUpvoteDate,
+        phm.AcceptedAnswerCreationDate,
+        COALESCE(phm.LastEditHistoryDate, phm.PostCreationDate) AS EffectiveLastActivityDate,
+        EXTRACT(EPOCH FROM (phm.FirstUpvoteDate - phm.PostCreationDate)) / 3600.0 AS TimeToFirstUpvoteHours,
+        EXTRACT(EPOCH FROM (phm.AcceptedAnswerCreationDate - phm.PostCreationDate)) / 3600.0 AS TimeToAcceptedAnswerHours,
+        ROW_NUMBER() OVER (PARTITION BY ue.UserId, phm.PostTypeId ORDER BY phm.Score DESC, phm.PostCreationDate DESC) AS PostScoreRankByUserType,
+        AVG(phm.Score) OVER (PARTITION BY ue.UserId ORDER BY phm.PostCreationDate ROWS BETWEEN 90 PRECEDING AND CURRENT ROW) AS AvgRollingUserPostScore,
+        phm.Score - LAG(phm.Score, 1, 0) OVER (PARTITION BY ue.UserId ORDER BY phm.PostCreationDate) AS ScoreDeltaFromPreviousPost,
+        SUM(phm.ViewCount) OVER (PARTITION BY ue.UserId ORDER BY phm.PostCreationDate) AS CumulativeUserViews
+    FROM UserEngagement ue
+    INNER JOIN PostHistoricalMetrics phm ON ue.UserId = phm.OwnerUserId
+    WHERE phm.PostTypeId IN (1, 2)
+)
+SELECT
+    rupp.UserId,
+    rupp.UserDisplayName,
+    rupp.Reputation,
+    rupp.PostId,
+    pt.Name AS PostTypeName,
+    rupp.PostCreationDate,
+    rupp.PostScore,
+    rupp.PostViewCount,
+    rupp.Title,
+    rupp.Tags,
+    rupp.EditCount,
+    rupp.CloseEventCount,
+    rupp.ReopenEventCount,
+    rupp.TimeToFirstUpvoteHours,
+    rupp.TimeToAcceptedAnswerHours,
+    rupp.PostScoreRankByUserType,
+    rupp.AvgRollingUserPostScore,
+    rupp.ScoreDeltaFromPreviousPost,
+    pts.TagName,
+    pts.TotalPostsWithTag,
+    pts.AvgScoreForTag,
+    CASE
+        WHEN rupp.PostTypeId = 1 AND rupp.TimeToAcceptedAnswerHours IS NOT NULL AND rupp.TimeToAcceptedAnswerHours < 12.0 THEN 'QuicklyAcceptedQuestion'
+        WHEN rupp.PostTypeId = 1 AND rupp.CloseEventCount > 0 AND rupp.ReopenEventCount > 0 THEN 'ClosedThenReopenedQuestion'
+        WHEN rupp.EditCount > 3 AND rupp.PostScore <= 0 THEN 'HeavilyEditedPoorlyReceived'
+        WHEN rupp.Tags LIKE '%<sql>%' AND rupp.PostScore > 15 THEN 'HighScoreSQLPost'
+        WHEN rupp.Tags LIKE '%<python>%' AND rupp.PostScore > 15 THEN 'HighScorePythonPost'
+        WHEN rupp.Tags LIKE '%<javascript>%' AND rupp.PostScore > 15 THEN 'HighScoreJavaScriptPost'
+        WHEN rupp.Title IS NULL OR CHAR_LENGTH(TRIM(rupp.Title)) < 5 THEN 'MalformedTitlePost'
+        ELSE 'OtherPostCategory'
+    END AS PostCategory,
+    ROUND(CAST(rupp.EditCount AS NUMERIC) / NULLIF(EXTRACT(EPOCH FROM (rupp.EffectiveLastActivityDate - rupp.PostCreationDate)) / (24*3600.0), 0), 2) AS EditsPerDaySinceCreation,
+    COALESCE(pts.TotalPostsWithTag, 0) AS TagPopularityScore,
+    rupp.CumulativeUserViews,
+    (
+        SELECT AVG(p_other.ViewCount)
+        FROM Posts p_other
+        WHERE p_other.OwnerUserId = rupp.UserId
+          AND p_other.PostTypeId = rupp.PostTypeId
+          AND p_other.Id <> rupp.PostId
+          AND CAST(p_other.CreationDate AS DATE) = CAST(rupp.PostCreationDate AS DATE)
+    ) AS AvgSameDayPostViewsByUser
+FROM RankedUserPostPerformance rupp
+LEFT JOIN PostTypes pt ON rupp.PostTypeId = pt.Id
+LEFT JOIN TagAnalysisExpanded tae ON rupp.PostId = tae.PostId
+LEFT JOIN PopularTagStats pts ON tae.TagName = pts.TagName
+WHERE
+    rupp.Reputation > 10000
+    AND rupp.PostScoreRankByUserType <= 10
+    AND (
+        rupp.PostScore > 10
+        OR rupp.PostViewCount > 5000
+        OR rupp.EditCount > 5
+    )
+    AND rupp.PostCreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2' YEAR)
+    AND (
+        rupp.Title IS NOT NULL
+        AND CHAR_LENGTH(rupp.Title) > 15
+        AND rupp.Title ~ '[A-Za-z0-9]'
+    )
+    AND EXISTS (
+        SELECT 1
+        FROM Badges b_corr
+        WHERE b_corr.UserId = rupp.UserId
+          AND LOWER(b_corr.Name) LIKE '%answer%'
+          AND b_corr.Date >= (rupp.PostCreationDate - INTERVAL '1' YEAR)
+          AND b_corr.TagBased IS NOT NULL
+    )
+    AND (rupp.TimeToFirstUpvoteHours IS NULL OR rupp.TimeToFirstUpvoteHours < 72.0)
+
+UNION ALL
+
+SELECT
+    u_alt.Id AS UserId,
+    u_alt.DisplayName AS UserDisplayName,
+    u_alt.Reputation,
+    p_alt.Id AS PostId,
+    pt_alt.Name AS PostTypeName,
+    p_alt.CreationDate AS PostCreationDate,
+    p_alt.Score AS PostScore,
+    p_alt.ViewCount AS PostViewCount,
+    p_alt.Title,
+    p_alt.Tags,
+    COUNT(ph_alt.Id) AS EditCount,
+    SUM(CASE WHEN ph_alt.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseEventCount,
+    SUM(CASE WHEN ph_alt.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenEventCount,
+    NULL AS TimeToFirstUpvoteHours,
+    NULL AS TimeToAcceptedAnswerHours,
+    NULL::BIGINT AS PostScoreRankByUserType,
+    NULL::NUMERIC AS AvgRollingUserPostScore,
+    NULL::INT AS ScoreDeltaFromPreviousPost,
+    TRIM(t_alt.value) AS TagName,
+    pts_alt.TotalPostsWithTag,
+    pts_alt.AvgScoreForTag,
+    'HighlyLinkedPostByEmergingUser' AS PostCategory,
+    NULL AS EditsPerDaySinceCreation,
+    COALESCE(pts_alt.TotalPostsWithTag, 0) AS TagPopularityScore,
+    SUM(p_alt.ViewCount) OVER (PARTITION BY u_alt.Id ORDER BY p_alt.CreationDate) AS CumulativeUserViews,
+    NULL AS AvgSameDayPostViewsByUser
+FROM Posts p_alt
+INNER JOIN PostTypes pt_alt ON p_alt.PostTypeId = pt_alt.Id
+INNER JOIN Users u_alt ON p_alt.OwnerUserId = u_alt.Id
+LEFT JOIN PostHistory ph_alt ON p_alt.Id = ph_alt.PostId
+INNER JOIN PostLinks pl_alt ON (p_alt.Id = pl_alt.PostId OR p_alt.Id = pl_alt.RelatedPostId)
+LEFT JOIN TagAnalysisExpanded tae_alt ON p_alt.Id = tae_alt.PostId
+LEFT JOIN PopularTagStats pts_alt ON tae_alt.TagName = pts_alt.TagName,
+LATERAL (
+  SELECT UNNEST(string_to_array(SUBSTRING(p_alt.Tags FROM 2 FOR (CHAR_LENGTH(p_alt.Tags) - 2)), '><')) AS value
+) t_alt
+WHERE
+    u_alt.Reputation BETWEEN 1000 AND 5000
+    AND p_alt.PostTypeId IN (1, 2)
+    AND p_alt.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '3' YEAR)
+    AND p_alt.FavoriteCount > 5
+    AND pl_alt.LinkTypeId = 1
+    AND NOT EXISTS (
+        SELECT 1
+        FROM PostHistory ph_old_close
+        WHERE ph_old_close.PostId = p_alt.Id
+          AND ph_old_close.PostHistoryTypeId = 10
+          AND ph_old_close.Comment IN ('1', '2', '3', '4', '7')
+    )
+GROUP BY
+    u_alt.Id, u_alt.DisplayName, u_alt.Reputation, p_alt.Id, pt_alt.Name, p_alt.CreationDate, p_alt.Score, p_alt.ViewCount, p_alt.Title, p_alt.Tags,
+    TRIM(t_alt.value), pts_alt.TotalPostsWithTag, pts_alt.AvgScoreForTag
+HAVING
+    COUNT(pl_alt.Id) >= 2
+    AND COALESCE(SUM(ph_alt.PostHistoryTypeId), 0) > 0
+ORDER BY
+    Reputation DESC, PostScore DESC, PostCreationDate DESC;

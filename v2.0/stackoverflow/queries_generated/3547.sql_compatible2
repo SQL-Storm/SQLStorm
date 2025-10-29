@@ -1,0 +1,133 @@
+WITH
+user_stats AS (
+    SELECT
+        u.Id                               AS user_id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(pq.Id)                        AS question_cnt,
+        COUNT(pa.Id)                        AS answer_cnt,
+        COALESCE(SUM(pq.Score),0)           AS question_score_sum,
+        COALESCE(SUM(pa.Score),0)           AS answer_score_sum,
+        MAX(pq.LastActivityDate)            AS last_question_activity,
+        MAX(pa.LastActivityDate)            AS last_answer_activity
+    FROM Users u
+    LEFT JOIN Posts pq
+           ON pq.OwnerUserId = u.Id AND pq.PostTypeId = 1
+    LEFT JOIN Posts pa
+           ON pa.OwnerUserId = u.Id AND pa.PostTypeId = 2
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+badge_counts AS (
+    SELECT
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS gold_badges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS silver_badges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS bronze_badges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+top_tag_per_user AS (
+    SELECT
+        uq.OwnerUserId                AS user_id,
+        t.TagName,
+        t.Count                       AS tag_use_count,
+        ROW_NUMBER() OVER (PARTITION BY uq.OwnerUserId
+                           ORDER BY t.Count DESC) AS rn
+    FROM (
+        SELECT
+            p.OwnerUserId,
+            UNNEST(STRING_TO_ARRAY(TRIM(BOTH '<' FROM TRIM(BOTH '>' FROM p.Tags)), '><')) AS tag
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+          AND p.Tags IS NOT NULL
+    ) uq
+    JOIN Tags t
+      ON t.TagName = uq.tag
+),
+latest_votes AS (
+    SELECT
+        v.PostId,
+        v.VoteTypeId,
+        v.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY v.PostId
+                           ORDER BY v.CreationDate DESC) AS rn
+    FROM Votes v
+    WHERE v.VoteTypeId IN (2,3)
+),
+post_vote_agg AS (
+    SELECT
+        v.PostId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS up_votes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS down_votes
+    FROM Votes v
+    WHERE v.VoteTypeId IN (2,3)
+    GROUP BY v.PostId
+),
+merged AS (
+    SELECT
+        us.user_id,
+        us.DisplayName,
+        us.Reputation,
+        us.question_cnt,
+        us.answer_cnt,
+        us.question_score_sum,
+        us.answer_score_sum,
+        GREATEST(us.last_question_activity, us.last_answer_activity) AS latest_activity,
+        COALESCE(bc.gold_badges,0)   AS gold_badges,
+        COALESCE(bc.silver_badges,0) AS silver_badges,
+        COALESCE(bc.bronze_badges,0) AS bronze_badges,
+        tt.TagName                   AS top_tag,
+        tt.tag_use_count             AS top_tag_use_count,
+        AVG(COALESCE(pva.up_votes - pva.down_votes,0))
+            OVER (PARTITION BY us.user_id)               AS avg_vote_delta
+    FROM user_stats us
+    LEFT JOIN badge_counts bc
+           ON bc.UserId = us.user_id
+    LEFT JOIN (
+        SELECT user_id, TagName, tag_use_count
+        FROM top_tag_per_user
+        WHERE rn = 1
+    ) tt
+           ON tt.user_id = us.user_id
+    LEFT JOIN LATERAL (
+        SELECT pva.up_votes, pva.down_votes
+        FROM post_vote_agg pva
+        WHERE pva.PostId = (
+            SELECT Id
+            FROM Posts p2
+            WHERE p2.OwnerUserId = us.user_id
+            ORDER BY p2.CreationDate DESC
+            FETCH FIRST 1 ROW ONLY
+        )
+        FETCH FIRST 1 ROW ONLY
+    ) pva ON TRUE
+)
+SELECT *
+FROM merged
+WHERE Reputation > 1000
+  AND (question_cnt + answer_cnt) > 10
+  AND (gold_badges + silver_badges + bronze_badges) > 0
+  AND top_tag IS NOT NULL
+ORDER BY avg_vote_delta DESC NULLS LAST
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    CAST(NULL AS INTEGER)                AS user_id,
+    'TOTAL'                              AS DisplayName,
+    SUM(Reputation)                      AS Reputation,
+    SUM(question_cnt)                    AS question_cnt,
+    SUM(answer_cnt)                      AS answer_cnt,
+    SUM(question_score_sum)              AS question_score_sum,
+    SUM(answer_score_sum)                AS answer_score_sum,
+    MAX(latest_activity)                 AS latest_activity,
+    SUM(gold_badges)                     AS gold_badges,
+    SUM(silver_badges)                   AS silver_badges,
+    SUM(bronze_badges)                   AS bronze_badges,
+    CAST(NULL AS VARCHAR(255))           AS top_tag,
+    CAST(NULL AS INTEGER)                AS top_tag_use_count,
+    AVG(avg_vote_delta)                  AS avg_vote_delta
+FROM merged
+-- group by all non-aggregated select expressions:
+GROUP BY CAST(NULL AS INTEGER), 'TOTAL';

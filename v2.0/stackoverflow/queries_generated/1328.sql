@@ -1,0 +1,196 @@
+-- {"query": "1328.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2825} 
+
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.UpVotes AS UserUpVotesGiven,
+        U.DownVotes AS UserDownVotesGiven,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsOwned,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersOwned,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN P.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS QuestionsWithAcceptedAnswer,
+        SUM(P.Score) AS TotalPostScoreContributed,
+        SUM(C.Score) AS TotalCommentScoreContributed,
+        COUNT(DISTINCT PH.PostId) AS TotalPostsEdited,
+        COUNT(DISTINCT B.Id) AS TotalBadgesReceived,
+        MAX(P.LastActivityDate) AS LatestActivityDate,
+        MIN(P.CreationDate) AS EarliestPostDate,
+        -- Calculate the average time between user's consecutive posts (simplified)
+        AVG(EXTRACT(EPOCH FROM (P.CreationDate - LAG(P.CreationDate, 1) OVER (PARTITION BY U.Id ORDER BY P.CreationDate)))) AS AvgTimeBetweenPostsInSeconds
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN PostHistory PH ON U.Id = PH.UserId AND PH.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9) -- Edit Title, Body, Tags, Rollbacks
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.UpVotes, U.DownVotes
+),
+PostContentAnalysis AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.Title,
+        P.Tags,
+        P.LastActivityDate,
+        P.ClosedDate,
+        LENGTH(P.Body) AS BodyCharCount,
+        COALESCE(ARRAY_LENGTH(STRING_TO_ARRAY(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><'), 1), 0) AS TagCount,
+        -- Correlated Subquery: Count total distinct editors for this post (excluding the owner)
+        (SELECT COUNT(DISTINCT PH_Sub.UserId)
+         FROM PostHistory PH_Sub
+         WHERE PH_Sub.PostId = P.Id
+           AND PH_Sub.UserId IS NOT NULL
+           AND PH_Sub.PostHistoryTypeId IN (4,5,6) -- Edit Title, Body, Tags
+           AND PH_Sub.UserId != P.OwnerUserId) AS DistinctExternalEditorCount,
+        -- Window function: Calculate running sum of scores for posts by the same owner, ordered by creation date
+        SUM(P.Score) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate) AS RunningUserPostScore,
+        -- Complicated Predicate/Expression: Classify post popularity
+        CASE
+            WHEN P.FavoriteCount >= 100 OR P.ViewCount >= 50000 THEN 'Very Popular'
+            WHEN P.FavoriteCount >= 20 OR P.ViewCount >= 10000 THEN 'Popular'
+            WHEN P.Score > 50 THEN 'Highly Rated'
+            WHEN P.Score > 0 THEN 'Positively Rated'
+            ELSE 'Neutral/Negative'
+        END AS PostPopularityClass,
+        -- Correlated Subquery: Calculate average comment score for the post, handling NULL for no comments
+        (SELECT AVG(C_Sub.Score) FROM Comments C_Sub WHERE C_Sub.PostId = P.Id) AS AvgCommentScore,
+        -- String expression and NULL logic: Check for presence of common negative terms in body
+        COALESCE(
+            CASE
+                WHEN P.Body ILIKE '%problem%' OR P.Body ILIKE '%issue%' OR P.Body ILIKE '%error%' OR P.Body ILIKE '%bug%' THEN TRUE
+                ELSE FALSE
+            END, FALSE
+        ) AS HasProblemKeywords,
+        -- Correlated Subquery: Get the most recent comment text, or NULL if none
+        (SELECT C_Last.Text FROM Comments C_Last WHERE C_Last.PostId = P.Id ORDER BY C_Last.CreationDate DESC LIMIT 1) AS LatestCommentText
+    FROM Posts P
+    WHERE P.PostTypeId IN (1, 2) -- Focus on Questions and Answers
+),
+HistoricalPostSummary AS (
+    SELECT
+        PH.PostId,
+        COUNT(PH.Id) AS TotalHistoryEntries,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS TotalEditCount,
+        MAX(PH.CreationDate) AS LastHistoryDate,
+        MIN(PH.CreationDate) AS FirstHistoryDate,
+        -- Calculate time difference between first post creation and first actual content edit for this post
+        EXTRACT(EPOCH FROM (
+            MIN(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.CreationDate ELSE NULL END) -
+            MIN(CASE WHEN PH.PostHistoryTypeId IN (1, 2, 3) THEN PH.CreationDate ELSE NULL END)
+        )) AS TimeToFirstEditInSeconds
+    FROM PostHistory PH
+    GROUP BY PH.PostId
+),
+TagPerformance AS (
+    SELECT
+        T.TagName,
+        T.Count AS TagUseCount,
+        SUM(P.Score) AS TotalScorePerTag,
+        AVG(P.ViewCount) AS AvgViewCountPerTag,
+        COUNT(DISTINCT P.OwnerUserId) AS UniqueAuthorsPerTag,
+        RANK() OVER (ORDER BY SUM(P.Score) DESC, T.TagName ASC) AS TagScoreRank
+    FROM Tags T
+    JOIN Posts P ON P.Tags LIKE '%' || T.TagName || '%' AND P.PostTypeId = 1 -- Only questions are directly tagged
+    GROUP BY T.TagName, T.Count
+),
+-- Set operator example: combine highly upvoted posts with posts that have many answers
+HighImpactPosts AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        'High Score' AS ImpactType,
+        P.Score
+    FROM Posts P
+    WHERE P.Score >= 50 AND P.PostTypeId IN (1, 2)
+    UNION ALL
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        'Many Answers' AS ImpactType,
+        P.Score
+    FROM Posts P
+    WHERE P.AnswerCount >= 10 AND P.PostTypeId = 1
+)
+SELECT
+    UE.UserId,
+    UE.DisplayName,
+    UE.Reputation,
+    UE.TotalPostsOwned,
+    UE.TotalQuestionsOwned,
+    UE.TotalAnswersOwned,
+    UE.TotalCommentsMade,
+    UE.TotalBadgesReceived,
+    UE.AvgTimeBetweenPostsInSeconds,
+    PCA.PostId,
+    PCA.PostTypeId,
+    PCA.PostCreationDate,
+    PCA.PostScore,
+    PCA.ViewCount,
+    PCA.AnswerCount,
+    PCA.FavoriteCount,
+    PCA.Title,
+    PCA.TagCount,
+    PCA.PostPopularityClass,
+    PCA.AvgCommentScore,
+    PCA.HasProblemKeywords,
+    COALESCE(HPS.TotalEditCount, 0) AS PostEditCount,
+    COALESCE(HPS.TimeToFirstEditInSeconds, 0) AS PostTimeToFirstEdit,
+    PCA.DistinctExternalEditorCount AS PostExternalEditorCount,
+    TP.TagName AS TopContributingTag,
+    TP.TagScoreRank AS TopContributingTagRank,
+    SUM(CASE WHEN HVC.ImpactType = 'High Score' THEN 1 ELSE 0 END) AS IsHighScorePost,
+    SUM(CASE WHEN HVC.ImpactType = 'Many Answers' THEN 1 ELSE 0 END) AS IsManyAnswersPost,
+    -- Complicated calculation: User's reputation per activity item, adjusted by post count
+    CAST(UE.Reputation AS DECIMAL) / NULLIF(UE.TotalPostsOwned + UE.TotalCommentsMade, 0) AS RepPerActivityItem,
+    EXTRACT(DAY FROM (NOW() - UE.UserCreationDate)) AS UserAgeInDays,
+    -- Window function: NTILE for user reputation tiers
+    NTILE(10) OVER (ORDER BY UE.Reputation DESC) AS ReputationTier,
+    -- Outer join with PostLinks to find posts that are linked TO this post (LinkType = 1)
+    COALESCE(COUNT(DISTINCT PL_To.PostId), 0) AS LinkedFromOtherPostsCount,
+    -- Count of upvotes and downvotes received on THIS particular post
+    SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesReceivedOnPost,
+    SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesReceivedOnPost,
+    -- Complicated NULL logic: If a post is closed, calculate days since closure, else NULL
+    CASE WHEN PCA.ClosedDate IS NOT NULL THEN EXTRACT(DAY FROM (NOW() - PCA.ClosedDate)) ELSE NULL END AS DaysSinceClosed,
+    -- Correlated subquery to check if any linked posts are duplicates
+    (SELECT COUNT(1) FROM PostLinks PL_Dup WHERE PL_Dup.PostId = PCA.PostId AND PL_Dup.LinkTypeId = 3) AS DuplicateLinksFromThisPost
+FROM UserEngagement UE
+JOIN PostContentAnalysis PCA ON UE.UserId = PCA.OwnerUserId
+LEFT JOIN HistoricalPostSummary HPS ON PCA.PostId = HPS.PostId
+LEFT JOIN (
+    -- Subquery to get the top performing tag for each user based on post score
+    SELECT
+        P.OwnerUserId AS UserId,
+        T.TagName,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY SUM(P.Score) DESC, T.TagName ASC) AS rn
+    FROM Posts P
+    JOIN Tags T ON P.Tags LIKE '%' || T.TagName || '%'
+    WHERE P.PostTypeId = 1 AND P.OwnerUserId IS NOT NULL
+    GROUP BY P.OwnerUserId, T.TagName
+) AS UserTopTag ON UE.UserId = UserTopTag.UserId AND UserTopTag.rn = 1
+LEFT JOIN TagPerformance TP ON UserTopTag.TagName = TP.TagName
+LEFT JOIN HighImpactPosts HVC ON PCA.PostId = HVC.PostId
+LEFT JOIN PostLinks PL_To ON PCA.PostId = PL_To.RelatedPostId AND PL_To.LinkTypeId = 1 -- Posts linking TO this post
+LEFT JOIN Votes V ON PCA.PostId = V.PostId AND V.VoteTypeId IN (2,3) -- Up/Down votes on this post
+GROUP BY
+    UE.UserId, UE.DisplayName, UE.Reputation, UE.TotalPostsOwned, UE.TotalQuestionsOwned, UE.TotalAnswersOwned,
+    UE.TotalCommentsMade, UE.TotalBadgesReceived, UE.AvgTimeBetweenPostsInSeconds,
+    PCA.PostId, PCA.PostTypeId, PCA.PostCreationDate, PCA.PostScore, PCA.ViewCount, PCA.AnswerCount,
+    PCA.FavoriteCount, PCA.Title, PCA.TagCount, PCA.PostPopularityClass, PCA.AvgCommentScore,
+    PCA.HasProblemKeywords, COALESCE(HPS.TotalEditCount, 0), COALESCE(HPS.TimeToFirstEditInSeconds, 0),
+    PCA.DistinctExternalEditorCount, TP.TagName, TP.TagScoreRank, UE.UserCreationDate, PCA.ClosedDate
+HAVING
+    UE.TotalPostsOwned > 0
+ORDER BY
+    UE.Reputation DESC, PCA.PostCreationDate DESC, PCA.PostScore DESC
+LIMIT 1000;

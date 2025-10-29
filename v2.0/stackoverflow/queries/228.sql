@@ -1,0 +1,335 @@
+with
+q_posts as (
+  select p.Id as QuestionId,
+         p.CreationDate as QuestionCreated,
+         p.Score as QuestionScore,
+         p.ViewCount,
+         p.OwnerUserId as QOwnerId,
+         p.Tags,
+         p.AcceptedAnswerId
+  from Posts p
+  where p.PostTypeId = 1
+),
+a_posts as (
+  select a.Id as AnswerId,
+         a.ParentId as QuestionId,
+         a.OwnerUserId as AOwnerId,
+         a.Score as AnswerScore,
+         a.CreationDate as AnswerCreated
+  from Posts a
+  where a.PostTypeId = 2
+),
+q_activity as (
+  select ph.PostId as QuestionId,
+         min(case when ph.PostHistoryTypeId in (10,35) then ph.CreationDate end) as FirstClosedAt,
+         max(case when ph.PostHistoryTypeId = 11 then ph.CreationDate end) as LastReopenedAt,
+         sum(case when ph.PostHistoryTypeId = 24 then 1 else 0 end) as SuggestedEditsApplied,
+         sum(case when ph.PostHistoryTypeId = 50 then 1 else 0 end) as CommunityBumps
+  from PostHistory ph
+  group by ph.PostId
+),
+accepted_answers as (
+  select q.QuestionId,
+         q.AcceptedAnswerId,
+         aa.AnswerScore as AcceptedAnswerScore,
+         aa.AOwnerId as AcceptedOwnerId
+  from q_posts q
+  left join a_posts aa on aa.AnswerId = q.AcceptedAnswerId
+),
+answers_ranked as (
+  select
+    a.QuestionId,
+    a.AnswerId,
+    a.AOwnerId,
+    a.AnswerScore,
+    a.AnswerCreated,
+    row_number() over (partition by a.QuestionId order by a.AnswerScore desc, a.AnswerId) as rn_by_score,
+    dense_rank() over (partition by a.QuestionId order by a.AnswerScore desc) as dr_by_score,
+    row_number() over (partition by a.QuestionId order by a.AnswerCreated asc, a.AnswerId) as rn_by_earliest
+  from a_posts a
+),
+top_answers as (
+  select *
+  from answers_ranked
+  where rn_by_score = 1
+),
+first_answers as (
+  select *
+  from answers_ranked
+  where rn_by_earliest = 1
+),
+user_stats as (
+  select
+    u.Id as UserId,
+    u.Reputation,
+    u.UpVotes,
+    u.DownVotes,
+    u.Views as ProfileViews,
+    coalesce(nullif(trim(both from regexp_replace(coalesce(u.Location, ''), '\s+', ' ', 'g')), ''), 'Unknown') as LocationNorm,
+    count(b.Id) as TotalBadges,
+    sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+    sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+    sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+    max(b.Date) as LastBadgeAt
+  from Users u
+  left join Badges b on b.UserId = u.Id
+  group by u.Id, u.Reputation, u.UpVotes, u.DownVotes, u.Views, LocationNorm
+),
+vote_agg as (
+  select
+    v.PostId,
+    sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+    sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+    sum(case when v.VoteTypeId = 5 then 1 else 0 end) as Favorites,
+    sum(case when v.VoteTypeId in (8,9) then 1 else 0 end) as BountyEvents,
+    sum(coalesce(v.BountyAmount,0)) as BountyAmountTotal,
+    min(v.CreationDate) as FirstVoteAt,
+    max(v.CreationDate) as LastVoteAt
+  from Votes v
+  group by v.PostId
+),
+link_agg as (
+  select
+    pl.RelatedPostId as QuestionId,
+    sum(case when pl.LinkTypeId = 1 then 1 else 0 end) as InboundLinked,
+    sum(case when pl.LinkTypeId = 3 then 1 else 0 end) as InboundDuplicates
+  from PostLinks pl
+  group by pl.RelatedPostId
+),
+tag_explode as (
+  select
+    q.QuestionId,
+    unnest(string_to_array(substring(coalesce(q.Tags,'<>'), 2, greatest(length(coalesce(q.Tags,'<>'))-2,0)), '><')) as tag
+  from q_posts q
+),
+tag_global_freq as (
+  select tag, count(*) as TagGlobalFreq
+  from tag_explode
+  group by tag
+),
+tag_rank as (
+  select
+    te.QuestionId,
+    te.tag,
+    tgf.TagGlobalFreq,
+    row_number() over (
+      partition by te.QuestionId
+      order by tgf.TagGlobalFreq desc, te.tag
+    ) as tag_rank_in_q
+  from tag_explode te
+  join tag_global_freq tgf on tgf.tag = te.tag
+),
+question_enriched as (
+  select
+    q.QuestionId,
+    q.QuestionCreated,
+    q.QuestionScore,
+    q.ViewCount,
+    q.QOwnerId,
+    coalesce(q.Tags, '') as Tags,
+    qa.FirstClosedAt,
+    qa.LastReopenedAt,
+    qa.SuggestedEditsApplied,
+    qa.CommunityBumps,
+    la.InboundLinked,
+    la.InboundDuplicates,
+    va.UpVotes as QUpVotes,
+    va.DownVotes as QDownVotes,
+    va.Favorites as QFavorites,
+    va.BountyEvents as QBountyEvents,
+    va.BountyAmountTotal as QBountyTotal,
+    va.FirstVoteAt as QFirstVoteAt,
+    va.LastVoteAt as QLastVoteAt,
+    coalesce(ar.AcceptedAnswerScore, -2147483648) as AcceptedAnswerScore,
+    ar.AcceptedAnswerId,
+    ar.AcceptedOwnerId,
+    tr.tag as DominantTag,
+    tr.TagGlobalFreq as DominantTagGlobalFreq
+  from q_posts q
+  left join q_activity qa on qa.QuestionId = q.QuestionId
+  left join link_agg la on la.QuestionId = q.QuestionId
+  left join vote_agg va on va.PostId = q.QuestionId
+  left join accepted_answers ar on ar.QuestionId = q.QuestionId
+  left join lateral (
+    select tag, TagGlobalFreq
+    from tag_rank tr1
+    where tr1.QuestionId = q.QuestionId and tr1.tag_rank_in_q = 1
+    limit 1
+  ) tr on true
+),
+answer_enriched as (
+  select
+    a.AnswerId,
+    a.QuestionId,
+    a.AOwnerId,
+    a.AnswerScore,
+    a.AnswerCreated,
+    va.UpVotes as AUpVotes,
+    va.DownVotes as ADownVotes,
+    va.Favorites as AFavorites,
+    va.BountyEvents as ABountyEvents,
+    va.BountyAmountTotal as ABountyTotal,
+    va.FirstVoteAt as AFirstVoteAt,
+    va.LastVoteAt as ALastVoteAt
+  from a_posts a
+  left join vote_agg va on va.PostId = a.AnswerId
+),
+paired_answers as (
+  select
+    qe.QuestionId,
+    qe.DominantTag,
+    qe.DominantTagGlobalFreq,
+    qe.QuestionScore,
+    qe.ViewCount,
+    qe.QUpVotes,
+    qe.QDownVotes,
+    qe.QFavorites,
+    qe.QBountyEvents,
+    qe.QBountyTotal,
+    qe.FirstClosedAt,
+    qe.LastReopenedAt,
+    qe.SuggestedEditsApplied,
+    qe.CommunityBumps,
+    qe.AcceptedAnswerId,
+    qe.AcceptedAnswerScore,
+    ta.AnswerId as TopAnswerId,
+    ta.AnswerScore as TopAnswerScore,
+    fa.AnswerId as FirstAnswerId,
+    fa.AnswerScore as FirstAnswerScore
+  from question_enriched qe
+  left join top_answers ta on ta.QuestionId = qe.QuestionId
+  left join first_answers fa on fa.QuestionId = qe.QuestionId
+),
+owner_join as (
+  select
+    pa.*,
+    qus.Reputation as QOwnerRep,
+    qus.UpVotes as QOwnerUp,
+    qus.DownVotes as QOwnerDown,
+    qus.TotalBadges as QOwnerBadges,
+    aus_top.Reputation as TopOwnerRep,
+    aus_first.Reputation as FirstOwnerRep
+  from paired_answers pa
+  left join q_posts qp on qp.QuestionId = pa.QuestionId
+  left join user_stats qus on qus.UserId = qp.QOwnerId
+  left join answers_ranked ta on ta.AnswerId = pa.TopAnswerId
+  left join answers_ranked fa on fa.AnswerId = pa.FirstAnswerId
+  left join user_stats aus_top on aus_top.UserId = ta.AOwnerId
+  left join user_stats aus_first on aus_first.UserId = fa.AOwnerId
+),
+scored as (
+  select
+    oj.*,
+    case
+      when coalesce(oj.QUpVotes,0) + coalesce(oj.QDownVotes,0) = 0 then null
+      else round(100.0 * coalesce(oj.QUpVotes,0) / nullif(coalesce(oj.QUpVotes,0) + coalesce(oj.QDownVotes,0),0), 2)
+    end as QUpvoteRatioPct,
+    case
+      when coalesce(oj.TopAnswerScore, -2147483648) = coalesce(oj.AcceptedAnswerScore, -2147483648) then 'accepted_is_top'
+      when oj.AcceptedAnswerId is null then 'no_accepted'
+      when oj.TopAnswerId is null then 'no_answers'
+      else 'accepted_not_top'
+    end as AcceptedVsTopCategory,
+    greatest(coalesce(oj.TopOwnerRep,0), coalesce(oj.FirstOwnerRep,0), coalesce(oj.QOwnerRep,0)) as MaxActorRep,
+    coalesce(oj.QBountyTotal,0) + coalesce(oj.QFavorites,0) * 50 as EngagementScore,
+    case
+      when oj.DominantTag is null then 'untagged'
+      when oj.DominantTagGlobalFreq >= 10000 then 'very_common'
+      when oj.DominantTagGlobalFreq >= 1000 then 'common'
+      when oj.DominantTagGlobalFreq >= 100 then 'uncommon'
+      else 'rare'
+    end as TagRarityBucket
+  from owner_join oj
+),
+median_helper as (
+  select QuestionId, QuestionScore
+  from scored
+),
+ranked as (
+  select
+    s.*,
+    ntile(10) over (order by coalesce(s.ViewCount,0) desc) as ViewCountDecile,
+    -- compute global median of QuestionScore in a dialect-neutral way
+    (select avg(qs.QuestionScore) from (
+        select QuestionScore
+        from median_helper mh
+        order by coalesce(mh.QuestionScore,0)
+        limit 2 offset (select floor((count(*) - 1) / 2.0) from median_helper)
+    ) qs) as GlobalMedianQScore,
+    row_number() over (order by coalesce(s.EngagementScore,0) desc, coalesce(s.ViewCount,0) desc, s.QuestionId) as GlobalRowNum
+  from scored s
+),
+final_union as (
+  select
+    'high_engagement' as cohort,
+    r.*
+  from ranked r
+  where coalesce(r.EngagementScore,0) > 0
+  union all
+  select
+    'closed_no_reopen' as cohort,
+    r.*
+  from ranked r
+  where r.FirstClosedAt is not null and r.LastReopenedAt is null
+  union all
+  select
+    'no_answers' as cohort,
+    r.*
+  from ranked r
+  where r.TopAnswerId is null
+)
+select
+  f.cohort,
+  f.QuestionId,
+  f.DominantTag,
+  f.TagRarityBucket,
+  f.ViewCount,
+  f.QuestionScore,
+  f.QUpVotes,
+  f.QDownVotes,
+  f.QUpvoteRatioPct,
+  f.QFavorites,
+  f.QBountyEvents,
+  f.QBountyTotal,
+  f.EngagementScore,
+  f.SuggestedEditsApplied,
+  f.CommunityBumps,
+  f.AcceptedAnswerId,
+  f.AcceptedAnswerScore,
+  f.TopAnswerId,
+  f.TopAnswerScore,
+  f.FirstAnswerId,
+  f.FirstAnswerScore,
+  f.AcceptedVsTopCategory,
+  f.QOwnerRep,
+  f.MaxActorRep,
+  f.DominantTagGlobalFreq,
+  f.TagRarityBucket,
+  f.ViewCountDecile,
+  f.GlobalMedianQScore,
+  f.GlobalRowNum,
+  case
+    when f.FirstClosedAt is null then 'open'
+    when f.LastReopenedAt is not null and f.LastReopenedAt > f.FirstClosedAt then 'reopened'
+    else 'closed'
+  end as CloseState,
+  concat_ws(
+    ' | ',
+    'Q#' || cast(f.QuestionId as varchar),
+    coalesce('tag=' || f.DominantTag, 'tag=none'),
+    'score=' || coalesce(cast(f.QuestionScore as varchar), 'null'),
+    'views=' || coalesce(cast(f.ViewCount as varchar), 'null'),
+    'accepted=' || coalesce(cast(f.AcceptedAnswerId as varchar), 'none')
+  ) as SummaryLine
+from final_union f
+where (
+    coalesce(f.ViewCount, 0) > 0
+    and (
+      (f.cohort = 'high_engagement' and coalesce(f.EngagementScore,0) >= 100)
+      or (f.cohort = 'closed_no_reopen' and coalesce(f.QDownVotes,0) >= 1)
+      or (f.cohort = 'no_answers' and (f.DominantTag is null or f.TagRarityBucket in ('rare','uncommon')))
+    )
+    and (f.AcceptedVsTopCategory <> 'no_answers' or f.QFavorites is not null)
+  )
+order by f.cohort, f.ViewCountDecile desc, f.EngagementScore desc, f.QuestionId
+limit 500;

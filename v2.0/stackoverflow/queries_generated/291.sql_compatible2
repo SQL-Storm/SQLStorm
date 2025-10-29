@@ -1,0 +1,324 @@
+with
+-- isolate last 3 years of activity
+recent_posts as (
+  select p.*
+  from Posts p
+  where p.CreationDate >= (select max(CreationDate) - interval '3 years' from Posts)
+),
+-- explode tags into rows
+tag_expanded as (
+  select
+    p.Id as PostId,
+    lower(trim(tg)) as tag
+  from recent_posts p
+  cross join lateral unnest(
+    case
+      when p.Tags is not null and length(p.Tags) >= 2
+        then string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')
+      else array[]::text[]
+    end
+  ) as tg
+  where p.PostTypeId = 1
+),
+-- compute user activity aggregates
+user_agg as (
+  select
+    u.Id as UserId,
+    u.Reputation,
+    coalesce(u.Location, 'unknown') as Location,
+    date_trunc('month', u.CreationDate) as CohortMonth,
+    count(distinct p.Id) filter (where p.PostTypeId = 1) as Questions,
+    count(distinct p.Id) filter (where p.PostTypeId = 2) as Answers,
+    sum(p.Score) as TotalPostScore,
+    sum(cast(p.ViewCount as bigint)) filter (where p.PostTypeId = 1) as QuestionViews,
+    sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+    sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+    sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges
+  from Users u
+  left join recent_posts p on p.OwnerUserId = u.Id
+  left join Badges b on b.UserId = u.Id
+  group by u.Id, u.Reputation, u.Location, date_trunc('month', u.CreationDate)
+),
+-- rank a user's posts by score and recency
+post_rank as (
+  select
+    p.Id,
+    p.OwnerUserId,
+    p.PostTypeId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Title,
+    row_number() over (partition by p.OwnerUserId, p.PostTypeId order by p.Score desc nulls last, p.CreationDate desc) as rn_best,
+    row_number() over (partition by p.OwnerUserId, p.PostTypeId order by p.CreationDate desc, p.Id desc) as rn_latest
+  from recent_posts p
+  where p.OwnerUserId is not null
+),
+-- detect duplicates and link influence
+dup_graph as (
+  select
+    pl.PostId,
+    pl.RelatedPostId,
+    pl.LinkTypeId,
+    case when pl.LinkTypeId = 3 then 1 else 0 end as IsDuplicate
+  from PostLinks pl
+  where pl.CreationDate >= (select max(CreationDate) - interval '3 years' from PostLinks)
+),
+-- votes summary by post and type
+vote_agg as (
+  select
+    v.PostId,
+    sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+    sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+    sum(case when v.VoteTypeId = 5 then 1 else 0 end) as Favorites,
+    sum(case when v.VoteTypeId in (8,9) then coalesce(v.BountyAmount,0) else 0 end) as BountyTotal,
+    min(v.CreationDate) as FirstVoteAt,
+    max(v.CreationDate) as LastVoteAt
+  from Votes v
+  join recent_posts p on p.Id = v.PostId
+  group by v.PostId
+),
+-- comments sentiment proxy (very rough: upvote-weighted length)
+comment_agg as (
+  select
+    c.PostId,
+    count(*) as Comments,
+    sum(coalesce(c.Score,0)) as CommentScore,
+    avg(nullif(length(c.Text),0)) as AvgCommentLen,
+    sum(coalesce(c.Score,0) * greatest(1, length(c.Text))) as WeightedLen
+  from Comments c
+  join recent_posts p on p.Id = c.PostId
+  group by c.PostId
+),
+-- closure and reopen events from PostHistory
+closure as (
+  select
+    ph.PostId,
+    min(ph.CreationDate) filter (where ph.PostHistoryTypeId = 10) as FirstClosedAt,
+    max(ph.CreationDate) filter (where ph.PostHistoryTypeId = 11) as LastReopenedAt,
+    count(*) filter (where ph.PostHistoryTypeId = 10) as CloseVotes,
+    max(
+      case
+        when ph.PostHistoryTypeId = 10 and ph.Comment ~ '^[0-9]+' then ph.Comment
+        else null
+      end
+    ) as LastCloseReasonId
+  from PostHistory ph
+  join recent_posts p on p.Id = ph.PostId
+  group by ph.PostId
+),
+-- compute rolling activity windows per user
+user_time_series as (
+  select
+    p.OwnerUserId as UserId,
+    date_trunc('month', p.CreationDate) as ym,
+    count(*) filter (where p.PostTypeId = 1) as q_count,
+    count(*) filter (where p.PostTypeId = 2) as a_count
+  from recent_posts p
+  where p.OwnerUserId is not null
+  group by p.OwnerUserId, date_trunc('month', p.CreationDate)
+),
+user_roll as (
+  select
+    UserId,
+    ym,
+    sum(q_count) over (partition by UserId order by ym rows between 5 preceding and current row) as q_6mo,
+    sum(a_count) over (partition by UserId order by ym rows between 5 preceding and current row) as a_6mo
+  from user_time_series
+),
+-- heavyweight per-tag metrics
+tag_metrics as (
+  select
+    te.tag,
+    count(distinct te.PostId) as TagQuestions,
+    avg(p.Score) as AvgScore,
+    percentile_disc(0.5) within group (order by p.Score) as MedScore,
+    sum(coalesce(va.UpVotes,0)) as UpSum,
+    sum(coalesce(va.DownVotes,0)) as DownSum,
+    count(*) filter (where cl.FirstClosedAt is not null) as ClosedQs,
+    sum(case when dp.IsDuplicate = 1 then 1 else 0 end) as DuplicatesLinked,
+    count(distinct p.OwnerUserId) as DistinctAskers
+  from tag_expanded te
+  join recent_posts p on p.Id = te.PostId
+  left join vote_agg va on va.PostId = p.Id
+  left join closure cl on cl.PostId = p.Id
+  left join dup_graph dp on dp.PostId = p.Id and dp.LinkTypeId in (1,3)
+  group by te.tag
+),
+-- compute a composite "quality" score per post
+post_quality as (
+  select
+    p.Id,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    coalesce(va.UpVotes,0) as UpVotes,
+    coalesce(va.DownVotes,0) as DownVotes,
+    coalesce(va.Favorites,0) as Favorites,
+    coalesce(va.BountyTotal,0) as BountyTotal,
+    coalesce(ca.CommentScore,0) as CommentScore,
+    cast(coalesce(ca.WeightedLen,0) as numeric) as WeightedLen,
+    case when cl.FirstClosedAt is not null then 1 else 0 end as IsClosed,
+    case when exists (select 1 from dup_graph d where d.PostId = p.Id and d.LinkTypeId = 3) then 1 else 0 end as IsMarkedDuplicate,
+    greatest(0, p.Score) * 1.0
+      + coalesce(va.UpVotes,0) * 0.7
+      - coalesce(va.DownVotes,0) * 0.9
+      + coalesce(va.Favorites,0) * 0.5
+      + least(10000, coalesce(p.ViewCount,0)) * 0.001
+      + coalesce(va.BountyTotal,0) * 0.2
+      + least(5000, coalesce(ca.WeightedLen,0)) * 0.0002
+      - case when cl.FirstClosedAt is not null then 2 else 0 end
+      - case when p.PostTypeId = 1 and p.AcceptedAnswerId is null then 0.5 else 0 end
+      + case when p.PostTypeId = 2 and exists (select 1 from Posts q where q.Id = p.ParentId and q.AcceptedAnswerId = p.Id) then 1.5 else 0 end
+    as QualityScore
+  from recent_posts p
+  left join vote_agg va on va.PostId = p.Id
+  left join comment_agg ca on ca.PostId = p.Id
+  left join closure cl on cl.PostId = p.Id
+),
+-- find each user's best question and answer
+best_posts as (
+  select
+    pr.OwnerUserId,
+    max(pr.Id) filter (where pr.PostTypeId = 1 and pr.rn_best = 1) as BestQuestionId,
+    max(pr.Id) filter (where pr.PostTypeId = 2 and pr.rn_best = 1) as BestAnswerId
+  from post_rank pr
+  group by pr.OwnerUserId
+),
+-- correlate users to their tag footprints via their questions
+user_tag_footprint as (
+  select
+    p.OwnerUserId as UserId,
+    te.tag,
+    count(*) as QsInTag,
+    avg(pq.QualityScore) as AvgQualityInTag
+  from recent_posts p
+  join tag_expanded te on te.PostId = p.Id
+  join post_quality pq on pq.Id = p.Id
+  where p.PostTypeId = 1
+  group by p.OwnerUserId, te.tag
+),
+-- choose the dominant tag per user by quality-adjusted volume
+user_dominant_tag as (
+  select distinct on (utf.UserId)
+    utf.UserId,
+    utf.tag as DominantTag,
+    utf.QsInTag,
+    utf.AvgQualityInTag
+  from user_tag_footprint utf
+  order by utf.UserId, (utf.QsInTag * (1 + coalesce(utf.AvgQualityInTag,0))) desc, utf.tag
+),
+-- produce a dense ranking of posts by quality per tag
+tag_quality_rank as (
+  select
+    te.tag,
+    pq.Id as PostId,
+    pq.QualityScore,
+    dense_rank() over (partition by te.tag order by pq.QualityScore desc nulls last, pq.Id) as dr
+  from tag_expanded te
+  join post_quality pq on pq.Id = te.PostId
+  where pq.PostTypeId = 1
+),
+-- build a wide per-user record
+user_wide as (
+  select
+    ua.UserId,
+    ua.Reputation,
+    ua.Location,
+    ua.CohortMonth,
+    ua.Questions,
+    ua.Answers,
+    ua.TotalPostScore,
+    ua.QuestionViews,
+    ua.GoldBadges,
+    ua.SilverBadges,
+    ua.BronzeBadges,
+    coalesce(ur.q_6mo, 0) as Q6mo,
+    coalesce(ur.a_6mo, 0) as A6mo,
+    dp.DominantTag,
+    dp.QsInTag as DominantTagQs,
+    dp.AvgQualityInTag as DominantTagAvgQ,
+    bp.BestQuestionId,
+    bp.BestAnswerId
+  from user_agg ua
+  left join (
+    select distinct on (UserId) UserId, q_6mo, a_6mo
+    from user_roll
+    order by UserId, ym desc
+  ) ur on ur.UserId = ua.UserId
+  left join user_dominant_tag dp on dp.UserId = ua.UserId
+  left join best_posts bp on bp.OwnerUserId = ua.UserId
+),
+-- tie-breaker text processing: normalize display names
+normalized_users as (
+  select
+    u.Id as UserId,
+    regexp_replace(lower(coalesce(u.DisplayName,'')), '\s+', ' ', 'g') as norm_name
+  from Users u
+),
+-- final assembly per user + per dominant tag metrics + top posts' tag ranks
+final as (
+  select
+    uw.*,
+    nu.norm_name,
+    tm.TagQuestions as DomTagQuestionsTotal,
+    tm.AvgScore as DomTagAvgScore,
+    tm.MedScore as DomTagMedScore,
+    tm.UpSum as DomTagUpvotes,
+    tm.DownSum as DomTagDownvotes,
+    tm.ClosedQs as DomTagClosedQs,
+    tm.DuplicatesLinked as DomTagDuplicates,
+    tm.DistinctAskers as DomTagAskers,
+    pq_q.QualityScore as BestQuestionQuality,
+    pq_a.QualityScore as BestAnswerQuality,
+    tqr_q.dr as BestQuestionTagRank
+  from user_wide uw
+  left join normalized_users nu on nu.UserId = uw.UserId
+  left join tag_metrics tm on tm.tag = uw.DominantTag
+  left join post_quality pq_q on pq_q.Id = uw.BestQuestionId
+  left join post_quality pq_a on pq_a.Id = uw.BestAnswerId
+  left join tag_expanded te_q on te_q.PostId = uw.BestQuestionId and te_q.tag = uw.DominantTag
+  left join tag_quality_rank tqr_q on tqr_q.PostId = uw.BestQuestionId and tqr_q.tag = uw.DominantTag
+)
+select
+  f.UserId,
+  f.norm_name as NormalizedDisplayName,
+  f.Reputation,
+  f.Location,
+  to_char(f.CohortMonth::timestamp, 'YYYY-MM') as CohortMonth,
+  f.Questions, f.Answers,
+  f.TotalPostScore, f.QuestionViews,
+  f.GoldBadges, f.SilverBadges, f.BronzeBadges,
+  f.Q6mo, f.A6mo,
+  coalesce(f.DominantTag, 'untagged') as DominantTag,
+  f.DominantTagQs,
+  round(cast(coalesce(f.DominantTagAvgQ,0) as numeric), 3) as DominantTagAvgQuality,
+  coalesce(f.DomTagQuestionsTotal,0) as DomTagQuestionsTotal,
+  round(cast(coalesce(f.DomTagAvgScore,0) as numeric), 3) as DomTagAvgScore,
+  coalesce(f.DomTagMedScore,0) as DomTagMedScore,
+  coalesce(f.DomTagUpvotes,0) as DomTagUpvotes,
+  coalesce(f.DomTagDownvotes,0) as DomTagDownvotes,
+  coalesce(f.DomTagClosedQs,0) as DomTagClosedQs,
+  coalesce(f.DomTagDuplicates,0) as DomTagDuplicates,
+  coalesce(f.DomTagAskers,0) as DomTagDistinctAskers,
+  coalesce(f.BestQuestionId, -1) as BestQuestionId,
+  round(cast(coalesce(f.BestQuestionQuality,0) as numeric), 3) as BestQuestionQuality,
+  coalesce(f.BestQuestionTagRank, null) as BestQuestionTagRankInDominantTag,
+  coalesce(f.BestAnswerId, -1) as BestAnswerId,
+  round(cast(coalesce(f.BestAnswerQuality,0) as numeric), 3) as BestAnswerQuality
+from final f
+where
+  -- exclude obviously inactive or spammy-looking users using a compound predicate
+  (f.Questions + f.Answers) >= 3
+  and (f.GoldBadges + f.SilverBadges + f.BronzeBadges) >= 1
+  and not (f.Reputation < 50 and f.Q6mo = 0 and f.A6mo = 0)
+  and (
+    f.DominantTag is not null
+    or (f.Questions >= 5 and f.QuestionViews >= 1000)
+  )
+order by
+  (f.DominantTagAvgQ * ln(2 + f.Questions + f.Answers)) desc nulls last,
+  f.Reputation desc,
+  f.UserId
+limit 200;

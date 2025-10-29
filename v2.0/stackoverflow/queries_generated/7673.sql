@@ -1,0 +1,129 @@
+-- {"query": "7673.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1416} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+                (COUNT(DISTINCT p.Id) * 100.0 / NULLIF((SELECT COUNT(*) FROM Posts WHERE OwnerUserId = u.Id), 0))
+            ELSE 0 
+        END as PostContributionPct,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Elite'
+            WHEN u.Reputation > 5000 THEN 'Advanced'
+            WHEN u.Reputation > 1000 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as ReputationTier,
+        STRING_AGG(DISTINCT p.PostTypeId::text || ':' || p.Score::text, ';') as PostTypeScores
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopTaggedPosts AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.OwnerUserId,
+        p.CreationDate,
+        (p.Score * 100.0 / NULLIF((SELECT MAX(Score) FROM Posts WHERE PostTypeId = 1), 0)) as ScorePercentile,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) as ScoreRank,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags != '' THEN
+                (SELECT COUNT(*) FROM unnest(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><')) AS tag)
+            ELSE 0 
+        END as TagCount,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags != '' THEN
+                (SELECT COUNT(*) FROM unnest(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><')) AS tag 
+                 WHERE tag ILIKE '%sql%' OR tag ILIKE '%database%' OR tag ILIKE '%query%')
+            ELSE 0 
+        END as TechnicalTagCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Score > 0 AND p.ViewCount > 0
+),
+UserTagAnalysis AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.PostCount,
+        uas.CommentCount,
+        uas.BadgeCount,
+        uas.ReputationTier,
+        COALESCE(STRING_AGG(ttp.Tags, ', '), 'No Tags') as UserTags,
+        AVG(ttp.Score) as AvgScore,
+        SUM(ttp.ViewCount) as TotalViews,
+        MAX(ttp.Score) as MaxScore,
+        COUNT(*) as TotalQuestions,
+        COUNT(CASE WHEN ttp.TechnicalTagCount > 0 THEN 1 END) as TechnicalQuestions
+    FROM UserActivityStats uas
+    LEFT JOIN TopTaggedPosts ttp ON uas.UserId = ttp.OwnerUserId
+    GROUP BY uas.UserId, uas.DisplayName, uas.Reputation, uas.PostCount, uas.CommentCount, uas.BadgeCount, uas.ReputationTier
+)
+SELECT 
+    uta.UserId,
+    uta.DisplayName,
+    uta.Reputation,
+    uta.PostCount,
+    uta.CommentCount,
+    uta.BadgeCount,
+    uta.ReputationTier,
+    uta.UserTags,
+    uta.AvgScore,
+    uta.TotalViews,
+    uta.MaxScore,
+    uta.TotalQuestions,
+    uta.TechnicalQuestions,
+    CASE 
+        WHEN uta.TotalQuestions > 0 THEN 
+            ROUND((uta.TechnicalQuestions * 100.0 / uta.TotalQuestions), 2)
+        ELSE 0 
+    END as TechnicalQuestionPct,
+    COALESCE(
+        (SELECT COUNT(*) 
+         FROM Votes v 
+         INNER JOIN Posts p ON v.PostId = p.Id 
+         WHERE p.OwnerUserId = uta.UserId AND v.VoteTypeId IN (2,3)
+        ), 
+        0
+    ) as TotalVotes,
+    (SELECT COUNT(*) 
+     FROM PostHistory ph 
+     WHERE ph.UserId = uta.UserId AND ph.PostHistoryTypeId IN (2,5,6)) as EditCount,
+    CASE 
+        WHEN uta.Reputation > 10000 AND uta.TechnicalQuestions >= 3 THEN 'Expert'
+        WHEN uta.Reputation > 5000 AND uta.TechnicalQuestions >= 2 THEN 'Advanced'
+        WHEN uta.Reputation > 1000 THEN 'Competent'
+        ELSE 'Novice'
+    END as UserLevel,
+    'ProfileScore: ' || 
+    ROUND((uta.AvgScore * uta.TotalViews * uta.TechnicalQuestionPct / 100.0), 2) || 
+    ' | Relevance: ' || 
+    ROUND((uta.TechnicalQuestions * 100.0 / NULLIF(uta.PostCount, 0)), 2) || 
+    ' | Activity: ' || 
+    ROUND((uta.CommentCount * 10.0 + uta.BadgeCount * 5.0 + uta.PostCount * 2.0), 2) as ProfileSignal,
+    CASE 
+        WHEN uta.ReputationTier = 'Elite' AND uta.PostCount > 100 AND uta.TechnicalQuestions > 5 THEN 'Highly Active Elite'
+        WHEN uta.PostCount >= 50 AND uta.TechnicalQuestions >= 2 THEN 'Active Contributor'
+        WHEN uta.PostCount >= 20 AND uta.TechnicalQuestions >= 1 THEN 'Contributor'
+        ELSE 'Regular User'
+    END as UserStatus
+FROM UserTagAnalysis uta
+WHERE uta.PostCount > 0 
+  AND (uta.TechnicalQuestionPct > 20 OR uta.Reputation > 5000)
+ORDER BY uta.AvgScore DESC, uta.TotalViews DESC, uta.TechnicalQuestions DESC
+LIMIT 100000;

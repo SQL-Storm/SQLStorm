@@ -1,0 +1,111 @@
+-- {"query": "5586.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 752} 
+WITH
+RecentActivePosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount
+    FROM Posts p
+    WHERE p.LastActivityDate > CURRENT_DATE - INTERVAL '180 days'
+),
+TopUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.AccountId,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.UpVotes DESC, u.LastAccessDate DESC) AS rn
+    FROM Users u
+),
+BadgeAgg AS (
+    SELECT
+        b.UserId,
+        COUNT(*) AS GoldCount
+    FROM Badges b
+    WHERE b.Class = 1
+    GROUP BY b.UserId
+),
+HotTagScores AS (
+    SELECT
+        t.TagName,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS Downvotes,
+        AVG(p.Score) AS AvgPostScore
+    FROM (
+        SELECT
+            unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '<>')) AS TagName,
+            p.Id AS PostId,
+            p.Score
+        FROM Posts p
+        WHERE p.Tags IS NOT NULL
+          AND p.PostTypeId = 1
+    ) t
+    LEFT JOIN Votes v ON v.PostId = t.PostId
+    GROUP BY t.TagName
+),
+Combined AS (
+    SELECT
+        rap.PostId,
+        rap.PostTypeId,
+        rap.Title,
+        rap.OwnerUserId,
+        rap.CreationDate,
+        rap.LastActivityDate,
+        rap.Tags,
+        rap.Score,
+        rap.ViewCount,
+        rap.AnswerCount,
+        rap.CommentCount,
+        rap.FavoriteCount,
+        hu.UserId AS AuthorId,
+        hu.DisplayName AS AuthorName,
+        ba.GoldCount,
+        hts.TagName,
+        hts.Upvotes AS TagUpvotes,
+        hts.Downvotes AS TagDownvotes,
+        hts.AvgPostScore
+    FROM RecentActivePosts rap
+    LEFT JOIN TopUsers hu ON rap.OwnerUserId = hu.UserId
+    LEFT JOIN BadgeAgg ba ON hu.UserId = ba.UserId
+    LEFT JOIN HotTagScores hts ON true
+        -- correlated pseudo-link: pick most relevant tag for the post if available
+        AND position(tsort := lower(gt(rap.Tags, hts.TagName)), '' ')''') > 0
+    WHERE rap.PostTypeId IN (1,2)
+)
+SELECT
+    c.PostId,
+    c.Title,
+    c.AuthorId,
+    c.AuthorName,
+    c.CreationDate,
+    c.LastActivityDate,
+    c.Score,
+    c.ViewCount,
+    c.AnswerCount,
+    c.CommentCount,
+    c.FavoriteCount,
+    c.GoldCount,
+    c.TagName,
+    c.TagUpvotes,
+    c.TagDownvotes,
+    c.AvgPostScore
+FROM Combined c
+ORDER BY
+    c.LastActivityDate DESC,
+    c.Score DESC,
+    c.GoldCount DESC NULLS LAST
+LIMIT 100;

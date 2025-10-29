@@ -1,0 +1,219 @@
+with recursive RecursiveTagParents as (
+    select
+        t.Id,
+        t.TagName,
+        array[t.Id] as Ancestors
+    from Tags t
+    where not t.IsModeratorOnly = true
+  union all
+    select
+        t.Id,
+        t.TagName,
+        r.Ancestors || t.Id
+    from Tags t
+    join RecursiveTagParents r on t.WikiPostId = r.Id
+    where not t.Id = any(r.Ancestors)
+),
+UserBadgeRanks as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+TopUsers as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        coalesce(ur.UpVotes,0) as UpVotes,
+        coalesce(ur.DownVotes,0) as DownVotes,
+        coalesce(ubGold.BadgeCount,0) as GoldBadges,
+        coalesce(ubSilver.BadgeCount,0) as SilverBadges,
+        coalesce(ubBronze.BadgeCount,0) as BronzeBadges,
+        row_number() over (order by u.Reputation desc, u.CreationDate asc) as Rnk
+    from Users u
+    left join (
+        select
+            Id as UserId,
+            sum(UpVotes) as UpVotes,
+            sum(DownVotes) as DownVotes
+        from Users
+        group by Id
+    ) ur on ur.UserId = u.Id
+    left join UserBadgeRanks ubGold on ubGold.UserId = u.Id and ubGold.Class = 1
+    left join UserBadgeRanks ubSilver on ubSilver.UserId = u.Id and ubSilver.Class = 2
+    left join UserBadgeRanks ubBronze on ubBronze.UserId = u.Id and ubBronze.Class = 3
+    where u.DisplayName is not null
+),
+QuestionStats as (
+    select
+        p.Id as QuestionId,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.ClosedDate,
+        count(distinct c.Id) as CommentCount,
+        count(distinct v.Id) filter (where vt.Name in ('UpMod', 'DownMod')) as VoteCount,
+        avg(case when vt.Name = 'UpMod' then 1 when vt.Name = 'DownMod' then -1 else 0 end) as AvgVoteScore,
+        max(ph.CreationDate) as LastEditDate,
+        string_agg(distinct pht.Name, ',' order by pht.Name) as HistoryTypes
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+    left join Votes v on v.PostId = p.Id
+    left join VoteTypes vt on vt.Id = v.VoteTypeId
+    left join PostHistory ph on ph.PostId = p.Id
+    left join PostHistoryTypes pht on pht.Id = ph.PostHistoryTypeId
+    where p.PostTypeId = 1
+    group by p.Id, p.Title, p.Tags, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.ClosedDate
+),
+AnswerStats as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId,
+        a.CreationDate,
+        a.Score,
+        a.CommentCount,
+        a.LastActivityDate,
+        a.Body,
+        count(distinct c.Id) as AnswerCommentCount,
+        count(distinct v.Id) filter (where vt.Name in ('UpMod', 'DownMod')) as VoteCount,
+        sum(case when vt.Name = 'UpMod' then 1 when vt.Name = 'DownMod' then -1 else 0 end) as VoteScore
+    from Posts a
+    left join Comments c on c.PostId = a.Id
+    left join Votes v on v.PostId = a.Id
+    left join VoteTypes vt on vt.Id = v.VoteTypeId
+    where a.PostTypeId = 2
+    group by a.Id, a.ParentId, a.OwnerUserId, a.CreationDate, a.Score, a.CommentCount, a.LastActivityDate, a.Body
+),
+QuestionAnswerSummary as (
+    select
+        qs.QuestionId,
+        qs.Title,
+        qs.Tags,
+        qs.OwnerUserId as QuestionOwnerId,
+        qs.CreationDate as QuestionCreation,
+        qs.Score as QuestionScore,
+        qs.ViewCount,
+        qs.AnswerCount,
+        qs.CommentCount as QuestionCommentCount,
+        qs.VoteCount as QuestionVoteCount,
+        qs.AvgVoteScore,
+        qs.LastEditDate as QuestionLastEdit,
+        qs.ClosedDate as QuestionClosed,
+        qs.HistoryTypes,
+        count(1) as TotalAnswers,
+        sum(coalesce(a.Score,0)) as TotalAnswerScore,
+        avg(coalesce(a.Score,0)) as AvgAnswerScore,
+        max(coalesce(a.Score,0)) as MaxAnswerScore,
+        sum(coalesce(a.VoteCount,0)) as TotalAnswerVotes,
+        sum(coalesce(a.AnswerCommentCount,0)) as TotalAnswerComments,
+        bool_or(a.Score > qs.Score) as AnyAnswerBetterScore,
+        bool_or(a.OwnerUserId = qs.OwnerUserId) as AnsweredByOwner
+    from QuestionStats qs
+    left join AnswerStats a on a.QuestionId = qs.QuestionId
+    group by 
+        qs.QuestionId, qs.Title, qs.Tags, qs.OwnerUserId, qs.CreationDate, qs.Score, qs.ViewCount,
+        qs.AnswerCount, qs.CommentCount, qs.VoteCount, qs.AvgVoteScore, qs.LastEditDate, qs.ClosedDate, qs.HistoryTypes
+),
+FilteredQuestions as (
+    select
+        qas.*,
+        u.DisplayName as QuestionOwner,
+        case
+            when qas.ClosedDate is not null then 'Closed'
+            else 'Open'
+        end as StatusLabel
+    from QuestionAnswerSummary qas
+    left join Users u on u.Id = qas.QuestionOwnerId
+    where qas.AnswerCount > 0
+      and qas.QuestionScore >= 0
+      and qas.TotalAnswers >= 2
+),
+DuplicateLinkedQuestions as (
+    select
+        pl.PostId as QuestionId,
+        pl.RelatedPostId as LinkedDuplicateId,
+        pl.CreationDate as LinkCreation,
+        lt.Name as LinkTypeName
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    where lt.Name = 'Duplicate'
+),
+FinalOutput as (
+    select
+        fq.QuestionId,
+        fq.Title,
+        fq.QuestionOwner,
+        fq.QuestionCreation,
+        fq.StatusLabel,
+        fq.AnswerCount,
+        fq.TotalAnswers,
+        fq.QuestionScore,
+        fq.TotalAnswerScore,
+        fq.MaxAnswerScore,
+        fq.AvgAnswerScore,
+        fq.QuestionLastEdit,
+        fq.ViewCount,
+        fq.QuestionCommentCount,
+        fq.TotalAnswerComments,
+        fq.AnyAnswerBetterScore,
+        fq.AnsweredByOwner,
+        string_agg(distinct cast(dt.LinkedDuplicateId as text), ',' order by dt.LinkCreation) as DuplicateLinks,
+        dense_rank() over (partition by fq.StatusLabel order by fq.QuestionScore desc) as ScoreRankWithinStatus,
+        (coalesce(fq.ViewCount,0) / nullif(greatest(fq.AnswerCount,1),0)) * 
+        (coalesce(fq.TotalAnswerScore,0) + 1) * 
+        (coalesce(uGold.BadgeCount,0)*3 + coalesce(uSilver.BadgeCount,0)*2 + coalesce(uBronze.BadgeCount,0)) as PopularityScore
+    from FilteredQuestions fq
+    left join DuplicateLinkedQuestions dt on dt.QuestionId = fq.QuestionId
+    left join UserBadgeRanks uGold on uGold.UserId = fq.QuestionOwnerId and uGold.Class = 1
+    left join UserBadgeRanks uSilver on uSilver.UserId = fq.QuestionOwnerId and uSilver.Class = 2
+    left join UserBadgeRanks uBronze on uBronze.UserId = fq.QuestionOwnerId and uBronze.Class = 3
+    group by
+        fq.QuestionId, fq.Title, fq.QuestionOwner, fq.QuestionCreation, fq.StatusLabel, fq.AnswerCount,
+        fq.TotalAnswers, fq.QuestionScore, fq.TotalAnswerScore, fq.MaxAnswerScore, fq.AvgAnswerScore,
+        fq.QuestionLastEdit, fq.ViewCount, fq.QuestionCommentCount, fq.TotalAnswerComments,
+        fq.AnyAnswerBetterScore, fq.AnsweredByOwner, fq.QuestionOwnerId, uGold.BadgeCount, uSilver.BadgeCount, uBronze.BadgeCount
+    having count(distinct dt.LinkedDuplicateId) < 5 or count(distinct dt.LinkedDuplicateId) is null
+)
+select
+    fo.QuestionId,
+    substring(fo.Title from 1 for 100) as ShortTitle,
+    fo.QuestionOwner,
+    fo.QuestionCreation,
+    fo.StatusLabel,
+    fo.AnswerCount,
+    fo.TotalAnswers,
+    fo.QuestionScore,
+    fo.TotalAnswerScore,
+    fo.MaxAnswerScore,
+    round(fo.AvgAnswerScore,2) as AvgAnswerScore,
+    fo.QuestionLastEdit,
+    fo.ViewCount,
+    fo.QuestionCommentCount,
+    fo.TotalAnswerComments,
+    fo.AnyAnswerBetterScore,
+    fo.AnsweredByOwner,
+    coalesce(fo.DuplicateLinks, 'None') as DuplicateLinkedQuestionIds,
+    fo.ScoreRankWithinStatus,
+    round(fo.PopularityScore,4) as PopularityScore,
+    row_number() over (partition by fo.StatusLabel order by fo.PopularityScore desc) as PopRankWithinStatus,
+    case 
+        when fo.AnsweredByOwner then 'Self-Answered' 
+        else 'Community-Answered' 
+    end as AnsweredBy,
+    (select count(*) from RecursiveTagParents rtp
+     where rtp.TagName = any(string_to_array(replace(replace(fq.Tags,'<',''),'>',''),' '))
+       and array_length(rtp.Ancestors, 1) > 1) as TagHierarchyDepth
+from FinalOutput fo
+join FilteredQuestions fq on fq.QuestionId = fo.QuestionId
+where fo.PopularityScore > 10
+order by fo.StatusLabel, fo.PopularityScore desc, fo.QuestionCreation desc
+limit 100;

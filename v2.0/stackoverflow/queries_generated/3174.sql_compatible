@@ -1,0 +1,167 @@
+WITH
+question_metrics AS (
+    SELECT
+        p.Id                                      AS QuestionId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        COALESCE(p.AnswerCount, 0)                 AS AnswerCount,
+        (SELECT COUNT(*) FROM Votes v
+             WHERE v.PostId = p.Id AND v.VoteTypeId = 2)  AS UpVotes,
+        (SELECT COUNT(*) FROM Votes v
+             WHERE v.PostId = p.Id AND v.VoteTypeId = 3)  AS DownVotes,
+        (SELECT MAX(ph.CreationDate) FROM PostHistory ph
+             WHERE ph.PostId = p.Id)                      AS LastEditDate
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+
+tag_explode AS (
+    SELECT
+        qm.QuestionId,
+        TRIM(BOTH '><' FROM REGEXP_SPLIT_TO_TABLE(
+                SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags) - 2)), '><')) AS Tag
+    FROM question_metrics qm
+    JOIN Posts p ON p.Id = qm.QuestionId
+),
+
+user_top_tag AS (
+    SELECT
+        OwnerUserId,
+        Tag,
+        ROW_NUMBER() OVER (PARTITION BY OwnerUserId ORDER BY cnt DESC) AS rn
+    FROM (
+        SELECT
+            OwnerUserId,
+            Tag,
+            COUNT(*) AS cnt
+        FROM tag_explode
+        GROUP BY OwnerUserId, Tag
+    ) t
+),
+
+badge_agg AS (
+    SELECT
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        COUNT(*)                             AS TotalBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+comment_agg AS (
+    SELECT
+        UserId,
+        COUNT(*) AS CommentCount
+    FROM Comments
+    GROUP BY UserId
+),
+
+user_activity AS (
+    SELECT
+        u.Id                                    AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(qs.TotalScore, 0)               AS TotalQuestionScore,
+        COALESCE(qs.TotalQuestions, 0)           AS TotalQuestions,
+        COALESCE(qs.LastActivity, TIMESTAMP '1970-01-01') AS LastActivity,
+        COALESCE(b.GoldBadges, 0)                AS GoldBadges,
+        COALESCE(b.SilverBadges, 0)              AS SilverBadges,
+        COALESCE(b.BronzeBadges, 0)              AS BronzeBadges,
+        COALESCE(b.TotalBadges, 0)               AS TotalBadges,
+        COALESCE(c.CommentCount, 0)              AS TotalComments,
+        ut.Tag                                   AS TopTag
+    FROM Users u
+    LEFT JOIN (
+        SELECT
+            OwnerUserId,
+            SUM(Score)                         AS TotalScore,
+            COUNT(*)                           AS TotalQuestions,
+            MAX(LastEditDate)                  AS LastActivity
+        FROM question_metrics
+        GROUP BY OwnerUserId
+    ) qs ON qs.OwnerUserId = u.Id
+    LEFT JOIN badge_agg b    ON b.UserId = u.Id
+    LEFT JOIN comment_agg c  ON c.UserId = u.Id
+    LEFT JOIN user_top_tag ut ON ut.OwnerUserId = u.Id AND ut.rn = 1
+),
+
+ranked_users AS (
+    SELECT
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.TotalQuestionScore,
+        ua.TotalQuestions,
+        ua.LastActivity,
+        ua.GoldBadges,
+        ua.SilverBadges,
+        ua.BronzeBadges,
+        ua.TotalBadges,
+        ua.TotalComments,
+        ua.TopTag,
+        (ua.TotalQuestionScore * 1.5 + ua.Reputation) AS CompositeScore,
+        ROW_NUMBER() OVER (ORDER BY (ua.TotalQuestionScore * 1.5 + ua.Reputation) DESC) AS ScoreRank,
+        DENSE_RANK() OVER (ORDER BY ua.TotalQuestions DESC)                                AS QuestionCountRank,
+        CASE
+            WHEN ua.Reputation >= 20000 THEN 'Legendary'
+            WHEN ua.Reputation >= 10000 THEN 'Guru'
+            WHEN ua.Reputation >= 5000  THEN 'Expert'
+            ELSE 'Contributor'
+        END AS ReputationTier,
+        COALESCE(ua.TopTag, 'NoTag') AS PrimaryTag
+    FROM user_activity ua
+),
+
+top_users AS (
+    SELECT *
+    FROM ranked_users
+    WHERE ScoreRank <= 100
+),
+low_tier_users AS (
+    SELECT *
+    FROM ranked_users
+    WHERE ReputationTier = 'Contributor' AND TotalQuestions < 5
+)
+
+SELECT
+    UserId,
+    DisplayName,
+    Reputation,
+    TotalQuestionScore,
+    TotalQuestions,
+    GoldBadges,
+    SilverBadges,
+    BronzeBadges,
+    TotalBadges,
+    TotalComments,
+    PrimaryTag,
+    CompositeScore,
+    ScoreRank,
+    QuestionCountRank,
+    ReputationTier
+FROM top_users
+
+UNION ALL
+
+SELECT
+    UserId,
+    DisplayName,
+    Reputation,
+    TotalQuestionScore,
+    TotalQuestions,
+    GoldBadges,
+    SilverBadges,
+    BronzeBadges,
+    TotalBadges,
+    TotalComments,
+    PrimaryTag,
+    CompositeScore,
+    ScoreRank,
+    QuestionCountRank,
+    ReputationTier
+FROM low_tier_users
+ORDER BY ScoreRank ASC, Reputation DESC
+OFFSET 0 ROWS FETCH NEXT 150 ROWS ONLY;

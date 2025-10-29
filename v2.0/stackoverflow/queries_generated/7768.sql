@@ -1,0 +1,314 @@
+-- {"query": "7768.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2667} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        COUNT(DISTINCT b.Id) AS Badges,
+        COUNT(DISTINCT c.Id) AS Comments,
+        COUNT(DISTINCT v.Id) AS Votes,
+        MAX(p.CreationDate) AS LastPostDate,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.CreationDate DESC) AS PostRank,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        PERCENT_RANK() OVER (ORDER BY u.Reputation) AS ReputationPercentile,
+        LAG(u.Reputation, 1) OVER (ORDER BY u.Reputation DESC) - u.Reputation AS ReputationDifference,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Veteran'
+            WHEN u.Reputation >= 1000 THEN 'Experienced'
+            WHEN u.Reputation >= 100 THEN 'Beginner'
+            ELSE 'Newbie'
+        END AS ReputationLevel,
+        COALESCE(SUM(p.Score), 0) AS TotalScore,
+        COALESCE(AVG(p.Score), 0) AS AverageScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.Tags,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Question with Accepted Answer'
+            WHEN p.PostTypeId = 1 THEN 'Question without Accepted Answer'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostTypeCategory,
+        CASE 
+            WHEN LENGTH(p.Tags) > 0 THEN SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2)
+            ELSE ''
+        END AS RawTags,
+        STRING_TO_ARRAY(
+            CASE 
+                WHEN LENGTH(p.Tags) > 0 THEN SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2)
+                ELSE ''
+            END, 
+            '><'
+        ) AS TagArray,
+        COALESCE(
+            (SELECT COUNT(*) 
+             FROM Posts p2 
+             WHERE p2.ParentId = p.Id 
+             AND p2.PostTypeId = 2 
+             AND p2.Score > 0
+            ), 0
+        ) AS PositiveAnswerCount,
+        COALESCE(
+            (SELECT COUNT(*) 
+             FROM PostLinks pl 
+             WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3
+            ), 0
+        ) AS DuplicateLinksCount,
+        COALESCE(
+            (SELECT COUNT(*) 
+             FROM PostHistory ph 
+             WHERE ph.PostId = p.Id 
+             AND ph.PostHistoryTypeId IN (1, 4, 5, 6)
+            ), 0
+        ) AS EditCount,
+        CASE 
+            WHEN p.Score >= 100 THEN 'Popular'
+            WHEN p.Score >= 20 THEN 'Moderate'
+            WHEN p.Score >= 0 THEN 'Low'
+            ELSE 'Negative'
+        END AS PopularityLevel
+    FROM Posts p
+    WHERE p.Id IS NOT NULL
+),
+UserTagAnalysis AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT t.Id) AS TagsFollowing,
+        STRING_AGG(
+            CASE 
+                WHEN t.TagName IS NOT NULL THEN CONCAT(t.TagName, ' (', t.Count, ')')
+                ELSE ''
+            END, 
+            ', '
+        ) AS TagSummary,
+        COALESCE(
+            (SELECT COUNT(*) 
+             FROM Posts p3 
+             WHERE p3.OwnerUserId = u.Id 
+             AND p3.PostTypeId = 1
+             AND p3.Tags IS NOT NULL
+            ), 0
+        ) AS QuestionsWithTags
+    FROM Users u
+    LEFT JOIN Tags t ON u.Id IN (
+        SELECT DISTINCT UserId 
+        FROM Badges b2 
+        WHERE b2.TagBased = 1 
+        AND b2.Name = t.TagName
+    )
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.DisplayName
+),
+ComplexQuery AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.TotalPosts,
+        uas.Questions,
+        uas.Answers,
+        uas.Badges,
+        uas.Comments,
+        uas.Votes,
+        uas.LastPostDate,
+        uas.ReputationRank,
+        uas.ReputationPercentile,
+        uas.ReputationDifference,
+        uas.ReputationLevel,
+        uas.TotalScore,
+        uas.AverageScore,
+        pa.PostId,
+        pa.Title,
+        pa.Body,
+        pa.Score,
+        pa.ViewCount,
+        pa.CreationDate,
+        pa.PostTypeId,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.FavoriteCount,
+        pa.PostTypeCategory,
+        pa.RawTags,
+        pa.TagArray,
+        pa.PositiveAnswerCount,
+        pa.DuplicateLinksCount,
+        pa.EditCount,
+        pa.PopularityLevel,
+        uta.TagsFollowing,
+        uta.TagSummary,
+        uta.QuestionsWithTags,
+        CASE 
+            WHEN uas.Reputation > 10000 AND pa.PostTypeId = 1 THEN 'Elite Question Author'
+            WHEN uas.Reputation > 1000 AND pa.PostTypeId = 2 THEN 'Moderate Answerer'
+            WHEN uas.Reputation > 100 AND pa.PostTypeId = 1 THEN 'Beginner Question Author'
+            ELSE 'Regular Contributor'
+        END AS ContributionRole,
+        CASE 
+            WHEN pa.Score > uas.AverageScore THEN 'Above Average Score'
+            WHEN pa.Score < uas.AverageScore THEN 'Below Average Score'
+            ELSE 'Average Score'
+        END AS ScoreComparison,
+        ABS(CAST(DATEDIFF('DAY', pa.CreationDate, NOW()) AS FLOAT) - 30) AS DaysFromAverage,
+        CASE 
+            WHEN LENGTH(pa.Tags) > 0 AND pa.Tags LIKE '%<%' THEN 'Has Tags'
+            ELSE 'No Tags'
+        END AS TagStatus,
+        LAG(pa.Score, 1) OVER (PARTITION BY uas.UserId ORDER BY pa.CreationDate DESC) AS PreviousScore,
+        LEAD(pa.Score, 1) OVER (PARTITION BY uas.UserId ORDER BY pa.CreationDate DESC) AS NextScore,
+        PERCENT_RANK() OVER (ORDER BY pa.Score) AS ScorePercentile,
+        CASE 
+            WHEN pa.Score = (SELECT MAX(Score) FROM Posts) THEN 1
+            WHEN pa.Score = (SELECT MIN(Score) FROM Posts) THEN 0
+            ELSE NULL
+        END AS ExtremeScoreFlag
+    FROM UserActivityStats uas
+    INNER JOIN PostAnalysis pa ON uas.UserId = pa.OwnerUserId
+    LEFT JOIN UserTagAnalysis uta ON uas.UserId = uta.UserId
+    WHERE uas.UserId IN (
+        SELECT DISTINCT OwnerUserId 
+        FROM Posts 
+        WHERE CreationDate >= DATEADD('YEAR', -1, NOW())
+    )
+    AND uas.UserId > 0
+    AND pa.Score IS NOT NULL
+)
+SELECT 
+    UserId,
+    DisplayName,
+    Reputation,
+    TotalPosts,
+    Questions,
+    Answers,
+    Badges,
+    Comments,
+    Votes,
+    CAST(LastPostDate AS DATE) AS LastPostDate,
+    ReputationRank,
+    ROUND(ReputationPercentile * 100, 2) AS ReputationPercentile,
+    ReputationDifference,
+    ReputationLevel,
+    TotalScore,
+    ROUND(AverageScore, 2) AS AverageScore,
+    PostId,
+    Title,
+    CASE 
+        WHEN LENGTH(Body) > 200 THEN SUBSTRING(Body, 1, 200) || '...'
+        ELSE Body
+    END AS BodySummary,
+    Score,
+    ViewCount,
+    CAST(CreationDate AS DATE) AS CreationDate,
+    PostTypeId,
+    AnswerCount,
+    CommentCount,
+    FavoriteCount,
+    PostTypeCategory,
+    RawTags,
+    CASE 
+        WHEN ARRAY_LENGTH(TagArray, 1) > 0 THEN 
+            (SELECT STRING_AGG(tag, ', ') 
+             FROM UNNEST(TagArray) AS tag 
+             WHERE tag IS NOT NULL AND LENGTH(tag) > 0)
+        ELSE ''
+    END AS CleanTags,
+    PositiveAnswerCount,
+    DuplicateLinksCount,
+    EditCount,
+    PopularityLevel,
+    TagsFollowing,
+    TagSummary,
+    QuestionsWithTags,
+    ContributionRole,
+    ScoreComparison,
+    DaysFromAverage,
+    TagStatus,
+    PreviousScore,
+    NextScore,
+    ROUND(ScorePercentile * 100, 2) AS ScorePercentile,
+    ExtremeScoreFlag,
+    DENSE_RANK() OVER (ORDER BY Reputation DESC, TotalScore DESC) AS OverallRank,
+    SUM(Score) OVER (PARTITION BY UserId ORDER BY CreationDate) AS RunningScoreSum,
+    COUNT(*) OVER (PARTITION BY UserId) AS UserPostCount,
+    ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY Score DESC) AS RankByScore,
+    CASE 
+        WHEN MAX(CreationDate) OVER (PARTITION BY UserId) >= DATEADD('MONTH', -6, NOW()) THEN 'Active Contributor'
+        ELSE 'Inactive Contributor'
+    END AS ContributionStatus,
+    CASE 
+        WHEN TotalPosts > 0 AND TotalPosts = Questions THEN 'Pure Question Author'
+        WHEN TotalPosts > 0 AND TotalPosts = Answers THEN 'Pure Answerer'
+        WHEN Questions > 0 AND Answers > 0 THEN 'Hybrid Contributor'
+        ELSE 'Other'
+    END AS ContributionStyle,
+    CASE 
+        WHEN AVG(Score) OVER (PARTITION BY UserId) > 10 THEN 'High Performer'
+        WHEN AVG(Score) OVER (PARTITION BY UserId) > 0 THEN 'Moderate Performer'
+        ELSE 'Low Performer'
+    END AS PerformanceLevel,
+    CASE 
+        WHEN TagsFollowing > 10 THEN 'Active Tag Follower'
+        WHEN TagsFollowing > 0 THEN 'Occasional Tag Follower'
+        ELSE 'No Tag Following'
+    END AS TagFollowingStatus,
+    CASE 
+        WHEN AverageScore > 10 AND TotalPosts > 5 THEN 'Consistent Poster'
+        WHEN AverageScore > 10 AND TotalPosts <= 5 THEN 'High Value Poster'
+        ELSE 'Regular Poster'
+    END AS PostingStyle,
+    COALESCE(
+        DATEDIFF('DAY', LastPostDate, NOW()), 
+        0
+    ) AS DaysSinceLastPost,
+    CASE 
+        WHEN Reputation > 50000 THEN 'Elite User'
+        WHEN Reputation > 10000 THEN 'Senior User'
+        WHEN Reputation > 1000 THEN 'Experienced User'
+        ELSE 'Beginner User'
+    END AS UserTier,
+    ABS(TotalScore) AS AbsoluteScore,
+    CASE 
+        WHEN TotalScore > 1000 THEN 'High Scorer'
+        WHEN TotalScore > 100 THEN 'Moderate Scorer'
+        WHEN TotalScore > 0 THEN 'Low Scorer'
+        ELSE 'Non-Scorer'
+    END AS ScoringCategory,
+    CASE 
+        WHEN Reputation > 0 AND ViewCount > 0 THEN CAST(Reputation AS FLOAT) / CAST(ViewCount AS FLOAT)
+        ELSE 0
+    END AS ReputationPerView,
+    CASE 
+        WHEN Questions > 0 THEN CAST(Answers AS FLOAT) / CAST(Questions AS FLOAT)
+        ELSE 0
+    END AS AnswerToQuestionRatio
+FROM ComplexQuery
+WHERE UserId IS NOT NULL
+  AND TotalScore IS NOT NULL
+  AND Score IS NOT NULL
+  AND Reputation > 0
+  AND PostId IS NOT NULL
+  AND Length(DisplayName) > 0
+ORDER BY UserId, Score DESC;

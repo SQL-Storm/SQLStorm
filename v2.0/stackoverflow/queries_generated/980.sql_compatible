@@ -1,0 +1,330 @@
+with
+recent_q as (
+  select
+    p.Id as QuestionId,
+    p.CreationDate as QCreation,
+    p.Score as QScore,
+    p.ViewCount as QViews,
+    p.OwnerUserId as QOwnerId,
+    p.AcceptedAnswerId,
+    p.AnswerCount,
+    p.Title,
+    p.Tags,
+    string_to_array(substring(p.Tags, 2, greatest(length(p.Tags)-2,0)), '><') as tag_arr,
+    coalesce(p.CommentCount, 0) as QCommentCount
+  from Posts p
+  where p.PostTypeId = 1
+    and p.CreationDate >= (select date_trunc('month', max(CreationDate)) - interval '6 months' from Posts where PostTypeId = 1)
+),
+q_tags as (
+  select
+    r.QuestionId,
+    lower(trim(t)) as tag
+  from recent_q r
+  cross join lateral unnest(r.tag_arr) as t
+),
+tag_stats as (
+  select
+    qt.tag,
+    count(distinct qt.QuestionId) as questions_with_tag
+  from q_tags qt
+  group by qt.tag
+),
+answers as (
+  select
+    a.Id as AnswerId,
+    a.ParentId as QuestionId,
+    a.OwnerUserId as AOwnerId,
+    a.Score as AScore,
+    a.CreationDate as ACreation
+  from Posts a
+  where a.PostTypeId = 2
+    and exists (select 1 from recent_q r where r.QuestionId = a.ParentId)
+),
+answer_votes as (
+  select
+    v.PostId as AnswerId,
+    sum(case when v.VoteTypeId = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.VoteTypeId = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.VoteTypeId = 2 and v.CreationDate <= (select min(a2.ACreation) + interval '1 day' from answers a2 where a2.AnswerId = v.PostId) then 1 else 0 end) as early_upvotes,
+    sum(case when v.VoteTypeId = 3 and v.CreationDate <= (select min(a2.ACreation) + interval '1 day' from answers a2 where a2.AnswerId = v.PostId) then 1 else 0 end) as early_downvotes
+  from Votes v
+  where v.VoteTypeId in (2,3)
+    and exists (select 1 from answers a where a.AnswerId = v.PostId)
+  group by v.PostId
+),
+q_comments as (
+  select
+    c.PostId as QuestionId,
+    count(*) filter (where c.CreationDate <= r.QCreation + interval '48 hours') as comments_48h,
+    count(*) as total_comments
+  from Comments c
+  join recent_q r on r.QuestionId = c.PostId
+  group by c.PostId
+),
+q_links as (
+  select
+    pl.PostId as QuestionId,
+    sum(case when pl.LinkTypeId = 3 then 1 else 0 end) as dup_links_out,
+    sum(case when pl.LinkTypeId = 1 then 1 else 0 end) as rel_links_out
+  from PostLinks pl
+  where exists (select 1 from recent_q r where r.QuestionId = pl.PostId)
+  group by pl.PostId
+),
+q_links_in as (
+  select
+    pl.RelatedPostId as QuestionId,
+    sum(case when pl.LinkTypeId = 3 then 1 else 0 end) as dup_links_in,
+    sum(case when pl.LinkTypeId = 1 then 1 else 0 end) as rel_links_in
+  from PostLinks pl
+  where exists (select 1 from recent_q r where r.QuestionId = pl.RelatedPostId)
+  group by pl.RelatedPostId
+),
+q_history as (
+  select
+    ph.PostId as QuestionId,
+    min(ph.CreationDate) filter (where ph.PostHistoryTypeId in (10)) as first_closed_at,
+    min(ph.CreationDate) filter (where ph.PostHistoryTypeId in (11)) as first_reopened_at,
+    count(*) filter (where ph.PostHistoryTypeId in (4,5,6)) as edit_events,
+    count(*) filter (where ph.PostHistoryTypeId in (24)) as suggested_edits_applied
+  from PostHistory ph
+  where exists (select 1 from recent_q r where r.QuestionId = ph.PostId)
+  group by ph.PostId
+),
+user_dims as (
+  select
+    u.Id as UserId,
+    u.Reputation,
+    u.UpVotes,
+    u.DownVotes,
+    u.Views as ProfileViews,
+    date_part('year', age(cast('2024-10-01 12:34:56' as timestamp), u.CreationDate)) as AccountAgeYears,
+    (coalesce(u.UpVotes,0) - coalesce(u.DownVotes,0)) as NetVotes,
+    case when position('@' in coalesce(u.WebsiteUrl,'')) > 0 then 1 else 0 end as SuspiciousWebsiteFlag
+  from Users u
+),
+user_badges as (
+  select
+    b.UserId,
+    count(*) filter (where b.Class = 1) as gold_badges,
+    count(*) filter (where b.Class = 2) as silver_badges,
+    count(*) filter (where b.Class = 3) as bronze_badges,
+    count(*) filter (where b.TagBased = 1) as tag_badges
+  from Badges b
+  group by b.UserId
+),
+answer_agg as (
+  select
+    a.QuestionId,
+    count(*) as answers_total,
+    max(a.AScore) as max_answer_score,
+    avg(a.AScore) as avg_answer_score,
+    min(a.ACreation) as first_answer_at,
+    max(a.ACreation) as last_answer_at,
+    max(case when rn_by_score = 1 then a.AnswerId end) as top_answer_id,
+    max(case when rn_by_early = 1 then a.AnswerId end) as first_answer_id
+  from (
+    select
+      a.*,
+      row_number() over (partition by a.QuestionId order by a.AScore desc nulls last, a.ACreation asc) as rn_by_score,
+      row_number() over (partition by a.QuestionId order by a.ACreation asc) as rn_by_early
+    from answers a
+  ) a
+  group by a.QuestionId
+),
+answer_agg_votes as (
+  select
+    aa.QuestionId,
+    coalesce(v_top.upvotes,0) as top_ans_up,
+    coalesce(v_top.downvotes,0) as top_ans_down,
+    coalesce(v_top.early_upvotes,0) as top_ans_early_up,
+    coalesce(v_top.early_downvotes,0) as top_ans_early_down,
+    coalesce(v_first.upvotes,0) as first_ans_up,
+    coalesce(v_first.downvotes,0) as first_ans_down
+  from answer_agg aa
+  left join answers a_top on a_top.AnswerId = aa.top_answer_id
+  left join answers a_first on a_first.AnswerId = aa.first_answer_id
+  left join answer_votes v_top on v_top.AnswerId = aa.top_answer_id
+  left join answer_votes v_first on v_first.AnswerId = aa.first_answer_id
+),
+q_votes as (
+  select
+    v.PostId as QuestionId,
+    sum(case when v.VoteTypeId = 2 then 1 else 0 end) as q_upvotes,
+    sum(case when v.VoteTypeId = 3 then 1 else 0 end) as q_downvotes,
+    sum(case when v.VoteTypeId = 5 then 1 else 0 end) as q_favorites
+  from Votes v
+  where exists (select 1 from recent_q r where r.QuestionId = v.PostId)
+  group by v.PostId
+),
+ranked as (
+  select
+    r.QuestionId,
+    r.Title,
+    r.QCreation,
+    r.QScore,
+    r.QViews,
+    r.AnswerCount,
+    r.AcceptedAnswerId,
+    ts.tag,
+    ts.questions_with_tag,
+    qa.answers_total,
+    qa.avg_answer_score,
+    qa.max_answer_score,
+    qa.first_answer_at,
+    aav.top_ans_up,
+    aav.top_ans_down,
+    aav.top_ans_early_up,
+    aav.top_ans_early_down,
+    aav.first_ans_up,
+    aav.first_ans_down,
+    qc.comments_48h,
+    qc.total_comments,
+    coalesce(ql.dup_links_out,0) as dup_links_out,
+    coalesce(ql.rel_links_out,0) as rel_links_out,
+    coalesce(qli.dup_links_in,0) as dup_links_in,
+    coalesce(qli.rel_links_in,0) as rel_links_in,
+    qh.first_closed_at,
+    qh.first_reopened_at,
+    qh.edit_events,
+    qh.suggested_edits_applied,
+    qv.q_upvotes,
+    qv.q_downvotes,
+    qv.q_favorites,
+    ud.Reputation,
+    ud.NetVotes,
+    ud.AccountAgeYears,
+    coalesce(ub.gold_badges,0) as gold_badges,
+    coalesce(ub.silver_badges,0) as silver_badges,
+    coalesce(ub.bronze_badges,0) as bronze_badges,
+    coalesce(ub.tag_badges,0) as tag_badges,
+    (
+      coalesce(r.QScore,0) * 1.0
+      + coalesce(qa.avg_answer_score,0) * 0.7
+      + coalesce(aav.top_ans_up,0) * 0.2
+      - coalesce(aav.top_ans_down,0) * 0.3
+      + least(coalesce(r.QViews,0) / 100.0, 50.0)
+      + case when r.AcceptedAnswerId is not null then 5 else 0 end
+      + case when qh.first_closed_at is not null then -10 else 0 end
+      + case when qh.first_reopened_at is not null then 4 else 0 end
+      + cast(ln(1 + coalesce(qc.comments_48h,0)) as double precision)
+      + cast(ln(1 + coalesce(qv.q_favorites,0)) as double precision)
+      + cast(ln(1 + greatest(coalesce(ud.Reputation,0),1)) as double precision) * 0.5
+    ) as quality_score,
+    dense_rank() over (
+      partition by ts.tag
+      order by
+        (
+          coalesce(r.QScore,0) * 1.0
+          + coalesce(qa.avg_answer_score,0) * 0.7
+          + coalesce(aav.top_ans_up,0) * 0.2
+          - coalesce(aav.top_ans_down,0) * 0.3
+          + least(coalesce(r.QViews,0) / 100.0, 50.0)
+          + case when r.AcceptedAnswerId is not null then 5 else 0 end
+          + case when qh.first_closed_at is not null then -10 else 0 end
+          + case when qh.first_reopened_at is not null then 4 else 0 end
+          + cast(ln(1 + coalesce(qc.comments_48h,0)) as double precision)
+          + cast(ln(1 + coalesce(qv.q_favorites,0)) as double precision)
+          + cast(ln(1 + greatest(coalesce(ud.Reputation,0),1)) as double precision) * 0.5
+        ) desc,
+        r.QCreation desc
+    ) as rank_in_tag
+  from recent_q r
+  left join q_tags qt on qt.QuestionId = r.QuestionId
+  left join tag_stats ts on ts.tag = qt.tag
+  left join answer_agg qa on qa.QuestionId = r.QuestionId
+  left join answer_agg_votes aav on aav.QuestionId = r.QuestionId
+  left join q_comments qc on qc.QuestionId = r.QuestionId
+  left join q_links ql on ql.QuestionId = r.QuestionId
+  left join q_links_in qli on qli.QuestionId = r.QuestionId
+  left join q_history qh on qh.QuestionId = r.QuestionId
+  left join q_votes qv on qv.QuestionId = r.QuestionId
+  left join Users u on u.Id = r.QOwnerId
+  left join user_dims ud on ud.UserId = u.Id
+  left join user_badges ub on ub.UserId = u.Id
+),
+top_per_tag as (
+  select *
+  from ranked
+  where rank_in_tag <= 5
+),
+top_global as (
+  select *
+ from (
+    select ranked.*,
+      row_number() over (order by quality_score desc nulls last, QCreation desc) as rn_global
+    from ranked
+  ) t
+  where rn_global <= 200
+),
+combined as (
+  select * from top_per_tag
+  union all
+  select * from top_global
+),
+final_rank as (
+  select
+    c.*,
+    row_number() over (
+      partition by c.QuestionId
+      order by c.quality_score desc nulls last, c.QCreation desc
+    ) as rn_keep,
+    rank() over (order by c.quality_score desc nulls last, c.QViews desc, c.QCreation desc) as overall_rank
+  from combined c
+)
+select
+  fr.overall_rank,
+  fr.QuestionId,
+  coalesce(fr.Title, '(no title)') as Title,
+  fr.tag as RepresentativeTag,
+  fr.questions_with_tag,
+  fr.QCreation,
+  fr.QScore,
+  fr.QViews,
+  fr.AnswerCount,
+  fr.AcceptedAnswerId,
+  fr.answers_total,
+  fr.avg_answer_score,
+  fr.max_answer_score,
+  fr.first_answer_at,
+  fr.top_ans_up,
+  fr.top_ans_down,
+  fr.top_ans_early_up,
+  fr.top_ans_early_down,
+  fr.first_ans_up,
+  fr.first_ans_down,
+  fr.comments_48h,
+  fr.total_comments,
+  fr.dup_links_out,
+  fr.rel_links_out,
+  fr.dup_links_in,
+  fr.rel_links_in,
+  fr.first_closed_at,
+  fr.first_reopened_at,
+  fr.edit_events,
+  fr.suggested_edits_applied,
+  fr.q_upvotes,
+  fr.q_downvotes,
+  fr.q_favorites,
+  fr.Reputation as OwnerReputation,
+  fr.NetVotes as OwnerNetVotes,
+  fr.AccountAgeYears as OwnerAccountAgeYears,
+  fr.gold_badges,
+  fr.silver_badges,
+  fr.bronze_badges,
+  fr.tag_badges,
+  fr.quality_score,
+  case
+    when fr.AcceptedAnswerId is not null then 'Accepted'
+    when fr.answers_total is null or fr.answers_total = 0 then 'Unanswered'
+    else 'Answered'
+  end as AnswerStatus,
+  case
+    when fr.first_closed_at is not null and fr.first_reopened_at is null then 'Closed'
+    when fr.first_closed_at is not null and fr.first_reopened_at is not null then 'Reopened'
+    else 'Open'
+  end as CloseState,
+  left(coalesce(fr.Title,''), 80) || case when length(coalesce(fr.Title,'')) > 80 then '...' else '' end as TitlePreview
+from final_rank fr
+where fr.rn_keep = 1
+order by fr.overall_rank, fr.QuestionId;

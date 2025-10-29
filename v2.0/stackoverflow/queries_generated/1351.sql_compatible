@@ -1,0 +1,204 @@
+WITH UserStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.UpVotes AS TotalUpVotesGiven,
+        u.DownVotes AS TotalDownVotesGiven,
+        u.Views AS ProfileViews,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswers,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        SUM(p.Score) AS TotalPostScoreReceived,
+        SUM(c.Score) AS TotalCommentScoreReceived,
+        MAX(p.LastActivityDate) AS LastPostActivityDate,
+        AVG(NULLIF(p.ViewCount, 0)) AS AvgPostViewCount,
+        DATE_PART('day', CAST('2024-10-01 12:34:56' AS timestamp) - u.CreationDate) AS DaysSinceCreation
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.UpVotes, u.DownVotes, u.Views
+    HAVING COUNT(DISTINCT p.Id) > 50
+),
+PostEngagementAndHistory AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.Title,
+        p.Tags,
+        p.ClosedDate,
+        p.LastEditDate,
+        p.LastActivityDate,
+        COUNT(ph.Id) AS EditHistoryCount,
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.CreationDate END) AS LastBodyOrTagEditDate,
+        SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVoteCountReceived,
+        SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVoteCountReceived,
+        (SELECT AVG(ans.Score)
+         FROM Posts ans
+         WHERE ans.ParentId = p.Id AND ans.PostTypeId = 2) AS AverageAnswerScoreForQuestion,
+        ARRAY_LENGTH(STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><'), 1) AS TagCount,
+        CASE
+            WHEN p.Title IS NULL THEN 'No Title'
+            WHEN LENGTH(p.Title) < 25 THEN 'Short Title'
+            WHEN LENGTH(p.Title) > 120 THEN 'Verbose Title'
+            ELSE 'Normal Title'
+        END AS TitleLengthCategory,
+        CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN TRUE ELSE FALSE END AS HasAcceptedAnswer
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9, 24)
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id AND vt.Name IN ('UpMod', 'DownMod')
+    WHERE p.PostTypeId IN (1, 2)
+    GROUP BY p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.CommentCount, p.FavoriteCount, p.Title, p.Tags, p.ClosedDate, p.LastEditDate, p.LastActivityDate, p.AcceptedAnswerId
+),
+BadgeRankings AS (
+    SELECT
+        b.UserId,
+        b.Name AS BadgeName,
+        b.Class AS BadgeClass,
+        b.Date AS BadgeAwardDate,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC) AS rn,
+        COUNT(b.Id) OVER (PARTITION BY b.UserId) AS UserTotalBadges,
+        COUNT(CASE WHEN b.Class = 1 THEN b.Id END) OVER (PARTITION BY b.UserId) AS GoldBadgeCount,
+        MAX(CASE WHEN b.Name LIKE '%Editor%' OR b.Name LIKE '%Reviewer%' THEN 1 ELSE 0 END) OVER (PARTITION BY b.UserId) AS HasSpecialistBadge,
+        DENSE_RANK() OVER (ORDER BY COUNT(b.Id) DESC, MAX(b.Date) DESC) AS RankByTotalBadges
+    FROM Badges b
+    WHERE b.Class IN (1, 2)
+),
+PostLinkAnalysis AS (
+    SELECT
+        pl.PostId,
+        COUNT(pl.RelatedPostId) AS TotalRelatedPosts,
+        COUNT(CASE WHEN lt.Name = 'Linked' THEN pl.RelatedPostId END) AS LinkedPostsCount,
+        COUNT(CASE WHEN lt.Name = 'Duplicate' THEN pl.RelatedPostId END) AS DuplicatePostsCount,
+        MAX(CASE WHEN lt.Name = 'Duplicate' THEN 1 ELSE 0 END) AS IsSourceOfDuplicate,
+        MAX(pl.CreationDate) AS LastLinkActivityDate
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    GROUP BY pl.PostId
+),
+ClosedQuestionDetails AS (
+    SELECT
+        ph.PostId,
+        ph.CreationDate AS ClosedDate_History,
+        CAST(ph.Comment AS smallint) AS CloseReasonTypeId,
+        crt.Name AS CloseReasonName,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn_close
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    LEFT JOIN CloseReasonTypes crt ON CAST(ph.Comment AS smallint) = crt.Id
+    WHERE pht.Name = 'Post Closed'
+)
+SELECT
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.TotalPosts,
+    us.TotalQuestions,
+    us.TotalAnswers,
+    peh.PostId,
+    peh.PostTypeId,
+    peh.Title,
+    peh.PostScore,
+    peh.ViewCount,
+    peh.EditHistoryCount,
+    peh.UpVoteCountReceived,
+    peh.DownVoteCountReceived,
+    peh.AverageAnswerScoreForQuestion,
+    peh.TagCount,
+    peh.TitleLengthCategory,
+    peh.HasAcceptedAnswer,
+    br.UserTotalBadges,
+    br.GoldBadgeCount,
+    br.HasSpecialistBadge,
+    pla.TotalRelatedPosts,
+    pla.DuplicatePostsCount,
+    cqd.CloseReasonName,
+    DATE_TRUNC('month', peh.PostCreationDate) AS PostCreationMonth,
+    LAG(peh.PostScore, 1, 0) OVER (PARTITION BY us.UserId ORDER BY peh.PostCreationDate) AS PreviousPostScore,
+    peh.PostScore - LAG(peh.PostScore, 1, 0) OVER (PARTITION BY us.UserId ORDER BY peh.PostCreationDate) AS ScoreDeltaFromPreviousPost,
+    CASE
+        WHEN peh.PostTypeId = 1 AND peh.ClosedDate IS NOT NULL THEN 'Closed Question'
+        WHEN peh.PostTypeId = 1 AND peh.HasAcceptedAnswer THEN 'Question with Accepted Answer'
+        WHEN peh.PostTypeId = 2 AND peh.PostScore > 10 THEN 'High Scoring Answer'
+        WHEN peh.PostTypeId = 1 AND peh.PostScore <= 0 AND peh.CommentCount = 0 THEN 'Unengaged Question'
+        ELSE 'Other Engaged Post'
+    END AS PostEngagementStatusCategory,
+    COALESCE(u.Location, 'Unknown Location') AS UserLocation,
+    NULLIF(REGEXP_REPLACE(u.AboutMe, '<[^>]+>', '', 'g'), '') AS AboutMeStripped,
+    CASE
+        WHEN us.DaysSinceCreation < 365 THEN 'New User (<1 Year)'
+        WHEN us.DaysSinceCreation BETWEEN 365 AND 1825 THEN 'Mid-Term User (1-5 Years)'
+        ELSE 'Veteran User (>5 Years)'
+    END AS UserAgeCategory,
+    AVG(peh.PostScore) OVER (PARTITION BY peh.PostTypeId, DATE_TRUNC('year', peh.PostCreationDate)) AS AvgScorePerTypePerYear,
+    RANK() OVER (PARTITION BY us.UserId ORDER BY peh.PostScore DESC, peh.ViewCount DESC) AS RankOfPostByScoreAndViewsForUser,
+    COUNT(DISTINCT peh.OwnerUserId) OVER (PARTITION BY cqd.CloseReasonName) AS UsersAffectedByCloseReason,
+    ABS(peh.UpVoteCountReceived - peh.DownVoteCountReceived) AS NetVoteMagnitude
+FROM UserStats us
+INNER JOIN PostEngagementAndHistory peh ON us.UserId = peh.OwnerUserId
+LEFT JOIN BadgeRankings br ON us.UserId = br.UserId AND br.rn = 1
+LEFT JOIN PostLinkAnalysis pla ON peh.PostId = pla.PostId
+LEFT JOIN ClosedQuestionDetails cqd ON peh.PostId = cqd.PostId AND cqd.rn_close = 1
+LEFT JOIN Users u ON us.UserId = u.Id
+WHERE
+    us.Reputation > 5000
+    AND us.TotalPosts > 100
+    AND peh.EditHistoryCount > 2
+    AND peh.PostScore > 20
+    AND peh.ViewCount > 500
+    AND (peh.Tags ILIKE '%<sql>%' OR peh.Tags ILIKE '%<postgresql>%' OR peh.Tags ILIKE '%<database>%')
+    AND (peh.ClosedDate IS NULL OR cqd.CloseReasonName NOT ILIKE '%duplicate%')
+    AND us.DaysSinceCreation > 730
+    AND COALESCE(pla.DuplicatePostsCount, 0) < 3
+    AND peh.LastEditDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')
+GROUP BY
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.TotalPosts,
+    us.TotalQuestions,
+    us.TotalAnswers,
+    peh.PostId,
+    peh.PostTypeId,
+    peh.Title,
+    peh.PostScore,
+    peh.ViewCount,
+    peh.EditHistoryCount,
+    peh.UpVoteCountReceived,
+    peh.DownVoteCountReceived,
+    peh.AverageAnswerScoreForQuestion,
+    peh.TagCount,
+    peh.TitleLengthCategory,
+    peh.HasAcceptedAnswer,
+    br.UserTotalBadges,
+    br.GoldBadgeCount,
+    br.HasSpecialistBadge,
+    pla.TotalRelatedPosts,
+    pla.DuplicatePostsCount,
+    cqd.CloseReasonName,
+    DATE_TRUNC('month', peh.PostCreationDate),
+    peh.PostCreationDate,
+    peh.CommentCount,
+    u.Location,
+    u.AboutMe,
+    us.DaysSinceCreation,
+    peh.LastEditDate,
+    peh.ViewCount,
+    peh.OwnerUserId,
+    peh.UpVoteCountReceived,
+    peh.DownVoteCountReceived
+ORDER BY
+    us.Reputation DESC,
+    peh.PostCreationDate DESC,
+    peh.PostScore DESC,
+    NetVoteMagnitude DESC
+LIMIT 1000;

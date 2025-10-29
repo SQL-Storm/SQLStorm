@@ -1,0 +1,187 @@
+-- {"query": "2452.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1622} 
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        count(distinct c.Id) as CommentCount,
+        count(distinct b.Id) as BadgeCount,
+        coalesce(sum(v.VoteTypeId = 2::int)::int,0) as UpVotesOnPosts,
+        coalesce(sum(v.VoteTypeId = 3::int)::int,0) as DownVotesOnPosts
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+UserRankings as (
+    select
+        UserId,
+        DisplayName,
+        Reputation,
+        CreationDate,
+        LastAccessDate,
+        QuestionCount,
+        AnswerCount,
+        CommentCount,
+        BadgeCount,
+        UpVotesOnPosts,
+        DownVotesOnPosts,
+        row_number() over (order by Reputation desc, AnswerCount desc, QuestionCount desc) as GlobalRank,
+        rank() over (partition by date_part('year', CreationDate) order by Reputation desc) as YearlyReputationRank
+    from RecursiveUserActivity
+),
+PostWithDetails as (
+    select
+        p.Id,
+        p.PostTypeId,
+        pt.Name as PostTypeName,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        u.DisplayName as OwnerDisplayName,
+        p.AcceptedAnswerId,
+        pa.Score as AcceptedAnswerScore,
+        p.ParentId,
+        p.Tags,
+        p.Title,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        case when p.ClosedDate is not null then 1 else 0 end as IsClosed,
+        coalesce(plDupe.DuplicateOfId, null) as DuplicateOfId
+    from Posts p
+    left join PostTypes pt on p.PostTypeId = pt.Id
+    left join Users u on u.Id = p.OwnerUserId
+    left join Posts pa on pa.Id = p.AcceptedAnswerId
+    left join (
+        select PostId, RelatedPostId as DuplicateOfId
+        from PostLinks pl
+        join LinkTypes lt on pl.LinkTypeId = lt.Id
+        where lt.Name = 'Duplicate'
+    ) plDupe on plDupe.PostId = p.Id
+),
+TopPostsWithUserRank as (
+    select
+        p.Id as PostId,
+        p.PostTypeId,
+        p.PostTypeName,
+        p.Title,
+        p.OwnerUserId,
+        p.OwnerDisplayName,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AcceptedAnswerId,
+        p.AcceptedAnswerScore,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.IsClosed,
+        p.DuplicateOfId,
+        ur.GlobalRank as OwnerGlobalRank,
+        ur.YearlyReputationRank as OwnerYearlyRank,
+        ur.BadgeCount as OwnerBadgeCount,
+        ur.UpVotesOnPosts,
+        ur.DownVotesOnPosts,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc) as PostRankPerUser,
+        dense_rank() over (order by p.Score desc nulls last) as ScoreRankOverall
+    from PostWithDetails p
+    left join UserRankings ur on ur.UserId = p.OwnerUserId
+    where p.PostTypeId in (1,2) and p.Score is not null
+),
+QuestionAnswerCombined as (
+    select
+        q.PostId as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionDate,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViews,
+        q.OwnerUserId as QuestionOwner,
+        q.OwnerDisplayName as QuestionOwnerName,
+        q.OwnerGlobalRank as QuestionOwnerGlobalRank,
+        q.DuplicateOfId as QuestionDuplicateOfId,
+        a.PostId as AnswerId,
+        a.CreationDate as AnswerDate,
+        a.Score as AnswerScore,
+        a.OwnerUserId as AnswerOwner,
+        a.OwnerDisplayName as AnswerOwnerName,
+        a.OwnerGlobalRank as AnswerOwnerGlobalRank,
+        a.PostRankPerUser as AnswerRankForUser,
+        a.FavoriteCount as AnswerFavoriteCount,
+        a.CommentCount as AnswerCommentCount
+    from TopPostsWithUserRank q
+    left join TopPostsWithUserRank a on a.ParentId = q.PostId and a.PostTypeId = 2
+    where q.PostTypeId = 1
+)
+select distinct
+    qac.QuestionId,
+    qac.Title,
+    qac.CreationDate as QuestionCreationDate,
+    qac.QuestionScore,
+    qac.QuestionViews,
+    qac.QuestionOwner,
+    qac.QuestionOwnerName,
+    qac.QuestionOwnerGlobalRank,
+    coalesce(qac.QuestionDuplicateOfId, 0) as QuestionDuplicateOfId,
+    qac.AnswerId,
+    qac.AnswerDate,
+    qac.AnswerScore,
+    qac.AnswerOwner,
+    qac.AnswerOwnerName,
+    qac.AnswerOwnerGlobalRank,
+    qac.AnswerRankForUser,
+    qac.AnswerFavoriteCount,
+    qac.AnswerCommentCount,
+    case
+        when qac.AnswerScore > qac.QuestionScore then 'ANSWER-BETTER'
+        when qac.AnswerScore = qac.QuestionScore then 'EQUAL-SCORE'
+        else 'QUESTION-BETTER'
+    end as AnswerVsQuestionScoreFlag,
+    coalesce(
+        (select count(1)
+         from Comments c
+         where c.PostId = coalesce(qac.AnswerId, qac.QuestionId)
+           and (char_length(c.Text) - char_length(replace(c.Text, 'sql', ''))) / 3 > 0
+        ), 0
+    ) as CommentsMentioningSQL,
+    bq.Name as TopQuestionBadge,
+    ba.Name as TopAnswerBadge,
+    case
+        when qac.QuestionViews > 10000 then 'HOT-QUESTION'
+        when qac.QuestionViews between 1000 and 9999 then 'WARM-QUESTION'
+        else 'COOL-QUESTION'
+    end as PopularityCategory
+from QuestionAnswerCombined qac
+left join lateral (
+    select b.Name
+    from Badges b
+    where b.UserId = qac.QuestionOwner
+    order by b.Class asc, b.Date desc
+    limit 1
+) bq on true
+left join lateral (
+    select b.Name
+    from Badges b
+    where b.UserId = qac.AnswerOwner
+    order by b.Class asc, b.Date desc
+    limit 1
+) ba on true
+where exists (
+    select 1 from Votes v
+    where v.PostId = qac.QuestionId
+      and v.VoteTypeId = 2
+      and v.CreationDate > qac.CreationDate
+)
+and (
+    qac.AnswerId is null or qac.AnswerScore is not null
+)
+order by qac.QuestionScore desc nulls last, qac.AnswerScore desc nulls last
+limit 100;

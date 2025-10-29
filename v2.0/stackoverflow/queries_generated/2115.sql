@@ -1,0 +1,187 @@
+-- {"query": "2115.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1894} 
+with RecursiveUserActivity as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        coalesce(u.AboutMe,'') as AboutMe,
+        coalesce(u.WebsiteUrl,'') as WebsiteUrl,
+        u.UpVotes,
+        u.DownVotes,
+        row_number() over (partition by u.Id order by u.LastAccessDate desc) as rn
+    from Users u
+    where u.Reputation > 1000
+),
+PostScoresPerUser as (
+    select 
+        p.OwnerUserId as UserId,
+        p.PostTypeId,
+        count(*) as PostCount,
+        sum(coalesce(p.Score,0)) as TotalScore,
+        avg(coalesce(p.Score,0)) as AverageScore,
+        sum(case when p.PostTypeId = 1 then 1 else 0 end) as QuestionCount,
+        sum(case when p.PostTypeId = 2 then 1 else 0 end) as AnswerCount,
+        max(p.ViewCount) as MaxViewCount,
+        sum(coalesce(p.FavoriteCount,0)) as TotalFavoriteCount,
+        max(p.LastActivityDate) as LastActivity
+    from Posts p
+    where p.OwnerUserId is not null and p.OwnerUserId > 0
+    group by p.OwnerUserId, p.PostTypeId
+),
+UserBadgeStats as (
+    select 
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        count(*) as TotalBadges,
+        max(b.Date) as LatestBadgeDate
+    from Badges b
+    group by b.UserId
+),
+QuestionClosureStats as (
+    select 
+        p.OwnerUserId as UserId,
+        count(*) filter (where ph.PostHistoryTypeId = 10) as ClosedQuestionsCount,
+        count(*) filter (where ph.PostHistoryTypeId = 11) as ReopenedQuestionsCount,
+        bool_or(ph.PostHistoryTypeId = 10) as HasClosedQuestions
+    from Posts p
+    left join PostHistory ph on ph.PostId = p.Id
+    where p.PostTypeId = 1 and p.OwnerUserId is not null and p.OwnerUserId > 0
+    group by p.OwnerUserId
+),
+UserCommentsWindow as (
+    select 
+        c.UserId,
+        c.PostId,
+        c.CreationDate,
+        c.Score,
+        count(*) over (partition by c.UserId order by c.CreationDate) as CommentSequence,
+        max(c.Score) over (partition by c.UserId) as MaxCommentScore,
+        min(c.Score) over (partition by c.UserId) as MinCommentScore,
+        avg(c.Score) over (partition by c.UserId) as AvgCommentScore
+    from Comments c
+    where c.UserId is not null
+),
+TopPostsTags as (
+    select 
+        p.Id as PostId,
+        unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags) - 2), '><')) as Tag,
+        p.Score,
+        p.ViewCount
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+),
+TagAggregateStats as (
+    select 
+        t.Tag,
+        count(*) as QuestionCount,
+        avg(Score) as AvgScore,
+        avg(ViewCount) as AvgViewCount,
+        max(Score) as MaxScore,
+        min(Score) as MinScore
+    from TopPostsTags t
+    group by t.Tag
+),
+UserTagPreference as (
+    select 
+        ua.UserId,
+        tt.Tag,
+        count(*) as TagUsageCount
+    from Posts p
+    join unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags) - 2), '><')) tt(Tag) on true
+    join RecursiveUserActivity ua on p.OwnerUserId = ua.UserId
+    where p.PostTypeId = 1 and ua.rn = 1
+    group by ua.UserId, tt.Tag
+),
+UserTopTags as (
+    select distinct on (utp.UserId)
+        utp.UserId,
+        utp.Tag,
+        utp.TagUsageCount,
+        rank() over (partition by utp.UserId order by utp.TagUsageCount desc) as TagRank
+    from UserTagPreference utp
+    order by utp.UserId, TagUsageCount desc
+),
+LatestEditsPerPost as (
+    select distinct on (ph.PostId)
+        ph.PostId,
+        ph.CreationDate as LastEditDate,
+        ph.UserId as EditorUserId,
+        ph.UserDisplayName as EditorName
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (4,5,6)
+    order by ph.PostId, ph.CreationDate desc
+),
+DuplicatePostLinks as (
+    select pl.PostId, pl.RelatedPostId
+    from PostLinks pl
+    where pl.LinkTypeId = 3
+),
+MergedQuestions as (
+    select p.Id as QuestionId, p.Title, p.CreationDate, p.AcceptedAnswerId,
+        p.Score,
+        p.ViewCount,
+        dq.RelatedPostId as DuplicateOfId
+    from Posts p
+    left join DuplicatePostLinks dq on p.Id = dq.PostId
+    where p.PostTypeId = 1
+)
+select
+    rua.UserId,
+    rua.DisplayName,
+    rua.Reputation,
+    rua.Location,
+    rua.WebsiteUrl,
+    psp.PostCount,
+    psp.QuestionCount,
+    psp.AnswerCount,
+    coalesce(ubs.GoldBadges,0) as GoldBadges,
+    coalesce(ubs.SilverBadges,0) as SilverBadges,
+    coalesce(ubs.BronzeBadges,0) as BronzeBadges,
+    coalesce(qcs.ClosedQuestionsCount,0) as ClosedQuestions,
+    coalesce(qcs.ReopenedQuestionsCount,0) as ReopenedQuestions,
+    uts.Tag as TopTag,
+    tgs.AvgScore as AvgScoreInTopTag,
+    tgs.QuestionCount as TagQuestionVolume,
+    max(cw.CommentSequence) as TotalComments,
+    round(avg(cw.Score),2) as AvgCommentScore,
+    round(max(p.Score),2) as MaxPostScore,
+    string_agg(distinct coalesce(pt.Name,'Unknown'), ',') as PostTypesCovered,
+    case when qcs.HasClosedQuestions then 'Yes' else 'No' end as HasClosedQuestions,
+    case when psp.AverageScore >= 5 then 'High scoring user'
+        when psp.AverageScore between 1 and 5 then 'Moderate scoring user'
+        else 'Low scoring user' end as ScoringCategory,
+    rg.Rank as UserRankByReputation,
+    rg.cbo as CountByOrder,
+    -- complex string expression and null logic:
+    concat_ws(' | ',
+        substring(rua.DisplayName from 1 for 10),
+        coalesce(rua.Location, 'Unknown Location'),
+        case when ubs.TotalBadges > 10 then 'Badge Collector' else 'Badge Starter' end,
+        case when psp.ViewCount > 100000 then 'Popular Posts' else 'Niche Contributor' end
+    ) as UserSummary
+from RecursiveUserActivity rua
+join PostScoresPerUser psp on psp.UserId = rua.UserId
+left join UserBadgeStats ubs on ubs.UserId = rua.UserId
+left join QuestionClosureStats qcs on qcs.UserId = rua.UserId
+left join UserTopTags uts on uts.UserId = rua.UserId and uts.TagRank=1
+left join TagAggregateStats tgs on tgs.Tag = uts.Tag
+left join UserCommentsWindow cw on cw.UserId = rua.UserId
+left join Posts p on p.OwnerUserId = rua.UserId
+left join PostTypes pt on pt.Id = p.PostTypeId
+left join (
+    select UserId, dense_rank() over (order by Reputation desc) as Rank, count(*) over () as cbo 
+    from RecursiveUserActivity
+) rg on rg.UserId = rua.UserId
+where rua.rn = 1
+group by
+    rua.UserId, rua.DisplayName, rua.Reputation, rua.Location, rua.WebsiteUrl,
+    psp.PostCount, psp.QuestionCount, psp.AnswerCount,
+    ubs.GoldBadges, ubs.SilverBadges, ubs.BronzeBadges, ubs.TotalBadges,
+    qcs.ClosedQuestionsCount, qcs.ReopenedQuestionsCount, qcs.HasClosedQuestions,
+    uts.Tag, tgs.AvgScore, tgs.QuestionCount,
+    rg.Rank, rg.cbo,
+    psp.AverageScore, psp.ViewCount;

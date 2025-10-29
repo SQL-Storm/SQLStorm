@@ -1,0 +1,248 @@
+-- {"query": "7892.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2265} 
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(v.CreationDate) AS LastVoteDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), ', ') AS AllTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    WHERE u.Id > 0 AND u.Reputation > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS ScoreRank,
+        RANK() OVER (ORDER BY p.ViewCount DESC) AS ViewRank,
+        DENSE_RANK() OVER (ORDER BY p.CreationDate DESC) AS RecentRank
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) AND p.Score > 0
+),
+PostHistoryAnalysis AS (
+    SELECT 
+        ph.PostId,
+        COUNT(*) AS HistoryCount,
+        COUNT(DISTINCT ph.PostHistoryTypeId) AS UniqueHistoryTypes,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS IsClosed,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS IsReopened,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 12 THEN 1 ELSE 0 END) AS IsDeleted,
+        STRING_AGG(DISTINCT ph.Comment, '; ') AS HistoryComments
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+),
+UserActivitySummary AS (
+    SELECT 
+        u.Id AS UserId,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsAsked,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersProvided,
+        COUNT(DISTINCT v.Id) AS VotesGiven,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        COUNT(DISTINCT ph.Id) AS HistoryEvents,
+        AVG(p.Score) AS AvgPostScore,
+        AVG(p.ViewCount) AS AvgViewCount,
+        MAX(p.CreationDate) AS LastActivity
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    WHERE u.Id > 0
+    GROUP BY u.Id
+),
+ComplexAnalysis AS (
+    SELECT 
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.Views,
+        us.UpVotes,
+        us.DownVotes,
+        us.PostCount,
+        us.QuestionCount,
+        us.AnswerCount,
+        us.BadgeCount,
+        us.VoteCount,
+        us.CommentCount,
+        us.LastPostDate,
+        us.LastVoteDate,
+        us.LastCommentDate,
+        us.AllTags,
+        CASE 
+            WHEN us.QuestionCount > 0 THEN (us.AnswerCount * 1.0 / us.QuestionCount)
+            ELSE 0 
+        END AS AnswerToQuestionRatio,
+        CASE 
+            WHEN us.Reputation > 0 THEN (us.BadgeCount * 1.0 / us.Reputation)
+            ELSE 0 
+        END AS BadgePerReputation,
+        LAG(us.Reputation) OVER (ORDER BY us.Reputation DESC) AS PrevReputation,
+        CASE 
+            WHEN LAG(us.Reputation) OVER (ORDER BY us.Reputation DESC) IS NOT NULL 
+            THEN (us.Reputation - LAG(us.Reputation) OVER (ORDER BY us.Reputation DESC)) 
+            ELSE 0 
+        END AS ReputationChange,
+        ROW_NUMBER() OVER (ORDER BY us.Reputation DESC, us.PostCount DESC) AS UserRank,
+        NTILE(4) OVER (ORDER BY us.Reputation DESC) AS ReputationQuartile,
+        CASE 
+            WHEN us.PostCount > 100 THEN 'High'
+            WHEN us.PostCount > 50 THEN 'Medium'
+            WHEN us.PostCount > 10 THEN 'Low'
+            ELSE 'Very Low' 
+        END AS ActivityLevel
+    FROM UserStats us
+),
+FinalResult AS (
+    SELECT 
+        ca.UserId,
+        ca.DisplayName,
+        ca.Reputation,
+        ca.Views,
+        ca.UpVotes,
+        ca.DownVotes,
+        ca.PostCount,
+        ca.QuestionCount,
+        ca.AnswerCount,
+        ca.BadgeCount,
+        ca.VoteCount,
+        ca.CommentCount,
+        ca.LastPostDate,
+        ca.LastVoteDate,
+        ca.LastCommentDate,
+        ca.AllTags,
+        ca.AnswerToQuestionRatio,
+        ca.BadgePerReputation,
+        ca.ReputationChange,
+        ca.UserRank,
+        ca.ReputationQuartile,
+        ca.ActivityLevel,
+        CASE 
+            WHEN tp.PostId IS NOT NULL THEN 'Has Top Posts'
+            ELSE 'No Top Posts' 
+        END AS HasTopPosts,
+        COALESCE(pah.HistoryCount, 0) AS PostHistoryCount,
+        COALESCE(pah.UniqueHistoryTypes, 0) AS UniqueHistoryTypes,
+        pah.IsClosed,
+        pah.IsReopened,
+        pah.IsDeleted,
+        COALESCE(uas.QuestionsAsked, 0) AS QuestionsAsked,
+        COALESCE(uas.AnswersProvided, 0) AS AnswersProvided,
+        COALESCE(uas.VotesGiven, 0) AS VotesGiven,
+        COALESCE(uas.CommentsMade, 0) AS CommentsMade,
+        COALESCE(uas.HistoryEvents, 0) AS HistoryEvents,
+        COALESCE(uas.AvgPostScore, 0) AS AvgPostScore,
+        COALESCE(uas.AvgViewCount, 0) AS AvgViewCount,
+        CASE 
+            WHEN ca.Reputation > 10000 THEN 'Master'
+            WHEN ca.Reputation > 5000 THEN 'Expert'
+            WHEN ca.Reputation > 1000 THEN 'Regular'
+            WHEN ca.Reputation > 100 THEN 'Newbie'
+            ELSE 'Beginner' 
+        END AS UserTier,
+        CASE 
+            WHEN uas.LastActivity IS NOT NULL THEN DATEDIFF(cast('2024-10-01' as date), uas.LastActivity)
+            ELSE NULL 
+        END AS DaysSinceLastActivity,
+        CONCAT('User Rank: ', ca.UserRank, '; Reputation Quartile: ', ca.ReputationQuartile, '; Activity Level: ', ca.ActivityLevel) AS UserSummary
+    FROM ComplexAnalysis ca
+    LEFT JOIN TopPosts tp ON ca.UserId IN (
+        SELECT ph.UserId FROM PostHistory ph WHERE ph.PostId = tp.PostId AND ph.PostHistoryTypeId = 24
+    )
+    LEFT JOIN PostHistoryAnalysis pah ON ca.UserId IN (
+        SELECT ph.UserId FROM PostHistory ph WHERE ph.PostId = pah.PostId
+    )
+    LEFT JOIN UserActivitySummary uas ON ca.UserId = uas.UserId
+    WHERE ca.Reputation > 100 AND ca.PostCount > 0
+)
+SELECT 
+    UserId,
+    DisplayName,
+    Reputation,
+    Views,
+    UpVotes + DownVotes AS TotalVotes,
+    PostCount,
+    QuestionCount,
+    AnswerCount,
+    BadgeCount,
+    VoteCount,
+    CommentCount,
+    LastPostDate,
+    LastVoteDate,
+    LastCommentDate,
+    AllTags,
+    (AnswerToQuestionRatio * 100) AS AnswerToQuestionPercentage,
+    ROUND(BadgePerReputation, 4) AS BadgePerReputationRatio,
+    ReputationChange,
+    UserRank,
+    ReputationQuartile,
+    ActivityLevel,
+    HasTopPosts,
+    PostHistoryCount,
+    UniqueHistoryTypes,
+    IsClosed,
+    IsReopened,
+    IsDeleted,
+    QuestionsAsked,
+    AnswersProvided,
+    VotesGiven,
+    CommentsMade,
+    HistoryEvents,
+    AvgPostScore,
+    AvgViewCount,
+    UserTier,
+    DaysSinceLastActivity,
+    UserSummary,
+    CASE 
+        WHEN (Reputation > 5000 OR PostCount > 50) AND 
+             (AnswerCount > QuestionCount OR BadgeCount > 10) THEN 'High Performer'
+        WHEN (Reputation > 1000 OR PostCount > 20) AND 
+             (AnswerCount >= QuestionCount OR BadgeCount >= 5) THEN 'Active Contributor'
+        ELSE 'Regular Participant' 
+    END AS EngagementLevel,
+    (CASE WHEN AllTags LIKE '%sql%' THEN 1 ELSE 0 END) +
+    (CASE WHEN AllTags LIKE '%python%' THEN 1 ELSE 0 END) +
+    (CASE WHEN AllTags LIKE '%javascript%' THEN 1 ELSE 0 END) +
+    (CASE WHEN AllTags LIKE '%java%' THEN 1 ELSE 0 END) +
+    (CASE WHEN AllTags LIKE '%c#' THEN 1 ELSE 0 END) AS TechInterestScore,
+    CONCAT(
+        'Reputation Rank: ', UserRank, 
+        '; Tier: ', UserTier, 
+        '; Activity: ', ActivityLevel,
+        '; HasTopPosts: ', HasTopPosts
+    ) AS ComprehensiveProfile
+FROM FinalResult
+WHERE 
+    (UserTier IN ('Master', 'Expert') OR 
+     (Reputation > 5000 AND PostCount > 20) OR 
+     (AnswerToQuestionRatio > 0.3 AND BadgeCount > 10))
+ORDER BY 
+    Reputation DESC, 
+    PostCount DESC, 
+    UserRank ASC,
+    DaysSinceLastActivity ASC
+LIMIT 1000;

@@ -1,0 +1,116 @@
+WITH
+RecentActivity AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.ViewCount,
+    p.Score,
+    p.CommentCount,
+    p.OwnerUserId,
+    COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+    ROW_NUMBER() OVER (
+      PARTITION BY p.PostTypeId
+      ORDER BY
+        (p.ViewCount * 0.6) +
+        (p.Score * 1.5) +
+        (p.CommentCount * 0.4) +
+        (EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - p.CreationDate)) * -0.0001) DESC
+    ) AS rn_type
+  FROM Posts p
+  WHERE p.ClosedDate IS NULL
+),
+RelatedActive AS (
+  SELECT
+    rl.PostId,
+    rl.RelatedPostId,
+    rp.Title AS RelatedTitle,
+    rp.ViewCount AS RelatedViews,
+    rp.Score AS RelatedScore
+  FROM PostLinks rl
+  JOIN Posts rp ON rp.Id = rl.RelatedPostId
+  WHERE rl.LinkTypeId = 1
+    AND rp.LastActivityDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days'
+),
+BadgeInfluence AS (
+  SELECT
+    b.UserId,
+    SUM(CASE WHEN b.Class = 1 THEN 3 WHEN b.Class = 2 THEN 2 ELSE 1 END) AS BadgeWeight
+  FROM Badges b
+  GROUP BY b.UserId
+),
+UserRanks AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.AccountId,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC NULLS LAST) AS RepRank
+  FROM Users u
+  WHERE u.Reputation IS NOT NULL
+)
+
+SELECT
+  p.Id AS PostId,
+  t.Name AS PostType,
+  p.Title,
+  p.Tags,
+  p.CreationDate,
+  p.LastActivityDate,
+  p.ViewCount,
+  p.Score,
+  p.CommentCount,
+  COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+  u.DisplayName AS OwnerDisplayName,
+  u.Reputation AS OwnerReputation,
+  br.BadgeWeight AS OwnerBadgeWeight,
+  ai.RelatedPostId,
+  ai.RelatedTitle,
+  ai.RelatedViews,
+  ai.RelatedScore,
+  ru.RepRank AS OwnerReputationRank,
+  CASE
+    WHEN p.LastEditorUserId IS NULL THEN NULL
+    ELSE lu.DisplayName
+  END AS LastEditorDisplayName,
+  CASE
+    WHEN p.LastEditDate IS NULL THEN NULL
+    ELSE p.LastEditDate
+  END AS LastEditDate,
+  CASE
+    WHEN p.ViewCount > 1000 AND p.Score > 10 THEN 'High engagement'
+    WHEN p.ViewCount BETWEEN 100 AND 1000 AND p.Score > 0 THEN 'Moderate engagement'
+    ELSE 'Low engagement'
+  END AS EngagementTier,
+  -- convert tags string like "<tag1><tag2>" into a JSON array of tags
+  CONCAT('[', COALESCE(
+    NULLIF(
+      -- transform angle-bracket tag list into comma-separated quoted values
+      TRIM(BOTH ',' FROM
+        REPLACE(
+          REPLACE(
+            REGEXP_REPLACE(p.Tags, '<([^>]+)>', '"\1",', 'g'),
+          '",,', '",'),
+        '",', '",')
+      ),
+    ''), '{}'
+  ), ']') AS TagsJsonArray,
+  (p.ViewCount + p.CommentCount * 2) AS ActivityScore
+FROM Posts p
+JOIN PostTypes t ON t.Id = p.PostTypeId
+LEFT JOIN Users u ON u.Id = p.OwnerUserId
+LEFT JOIN BadgeInfluence br ON br.UserId = u.Id
+LEFT JOIN RelatedActive ai ON ai.PostId = p.Id
+LEFT JOIN Users lu ON lu.Id = p.LastEditorUserId
+LEFT JOIN UserRanks ru ON ru.UserId = u.Id
+WHERE
+  p.LastActivityDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '90 days'
+  AND (p.PostTypeId = 1 OR p.PostTypeId = 2)
+  AND (p.Body IS NOT NULL OR p.Title IS NOT NULL)
+ORDER BY
+  p.LastActivityDate DESC,
+  p.Id
+LIMIT 100;

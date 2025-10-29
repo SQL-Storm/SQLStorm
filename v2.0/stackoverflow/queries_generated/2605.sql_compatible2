@@ -1,0 +1,218 @@
+with RecursiveUserBadges as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class,
+        b.Date,
+        row_number() over (partition by u.Id order by b.Date desc) as rn
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    where (b.TagBased = false) or (b.TagBased is null)
+),
+UserBadgeCounts as (
+    select
+        UserId,
+        count(case when Class = 1 then 1 end) as GoldBadges,
+        count(case when Class = 2 then 1 end) as SilverBadges,
+        count(case when Class = 3 then 1 end) as BronzeBadges,
+        max(Date) as LastBadgeDate
+    from RecursiveUserBadges
+    group by UserId
+),
+TopTags as (
+    select
+        t.Id as TagId,
+        t.TagName,
+        t.Count,
+        t.IsModeratorOnly,
+        t.IsRequired
+    from Tags t
+    where t.Count > 1000 and t.IsModeratorOnly = false
+),
+UserTopTagPosts as (
+    select
+        p.OwnerUserId,
+        unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><')) as Tag,
+        count(*) as PostsWithTag
+    from Posts p
+    where p.PostTypeId in (1, 2) and p.OwnerUserId is not null
+    group by p.OwnerUserId, Tag
+),
+UserTagScores as (
+    select
+        utp.OwnerUserId as UserId,
+        utp.Tag,
+        sum(p.Score) as TotalScore,
+        count(distinct p.Id) as PostCount
+    from UserTopTagPosts utp
+    join Tags t on t.TagName = utp.Tag
+    join Posts p on p.OwnerUserId = utp.OwnerUserId and p.PostTypeId in (1, 2)
+        and p.Tags like '%' || '<' || utp.Tag || '>' || '%'
+    group by utp.OwnerUserId, utp.Tag
+),
+PostWithAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.CreationDate,
+        coalesce(a.AnswerCount, 0) as AnswerCount,
+        coalesce(a.MaxScore, 0) as MaxAnswerScore,
+        coalesce(a.AvgScore, 0) as AvgAnswerScore,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.Tags
+    from Posts q
+    left join (
+        select
+            ParentId,
+            count(*) as AnswerCount,
+            max(Score) as MaxScore,
+            avg(Score) as AvgScore
+        from Posts
+        where PostTypeId = 2
+        group by ParentId
+    ) a on q.Id = a.ParentId
+    where q.PostTypeId = 1
+),
+QuestionCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReasonName,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where ph.PostHistoryTypeId = 10 and ph.Comment is not null
+),
+UserReputationWindow as (
+    select
+        u.Id as UserId,
+        u.Reputation,
+        avg(u.Reputation) over (order by u.Reputation rows between 4 preceding and current row) as AvgReputation5,
+        dense_rank() over (order by u.Reputation desc) as ReputationRank
+    from Users u
+),
+RecentActivity as (
+    select
+        p.Id as PostId,
+        p.OwnerUserId,
+        p.LastActivityDate,
+        c.Id as CommentId,
+        c.CreationDate as CommentDate,
+        c.UserId as CommentUserId,
+        row_number() over (partition by p.Id order by c.CreationDate desc) as CommentRank
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+),
+RecentSignificantComments as (
+    select
+        ra.PostId,
+        ra.OwnerUserId,
+        ra.CommentId,
+        ra.CommentUserId,
+        ra.CommentDate
+    from RecentActivity ra
+    where ra.CommentRank <= 3
+),
+DuplicateQuestions as (
+    select distinct pl.PostId as DuplicateQuestionId, pl.RelatedPostId as OriginalQuestionId
+    from PostLinks pl
+    join Posts p1 on p1.Id = pl.PostId and p1.PostTypeId = 1
+    join Posts p2 on p2.Id = pl.RelatedPostId and p2.PostTypeId = 1
+    where pl.LinkTypeId = 3
+),
+UserAnswerStats as (
+    select
+        a.OwnerUserId as UserId,
+        count(a.Id) as AnswerCount,
+        avg(a.Score) as AvgAnswerScore,
+        max(a.Score) as MaxAnswerScore
+    from Posts a
+    where a.PostTypeId = 2
+    group by a.OwnerUserId
+),
+UsersWithTopAnswers as (
+    select
+        ua.UserId,
+        ua.AnswerCount,
+        ua.AvgAnswerScore,
+        ua.MaxAnswerScore,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ur.ReputationRank
+    from UserAnswerStats ua
+    left join UserBadgeCounts ub on ub.UserId = ua.UserId
+    left join UserReputationWindow ur on ur.UserId = ua.UserId
+    where ua.AnswerCount > 100 and ur.ReputationRank <= 1000
+)
+select distinct
+    p.Id as PostId,
+    p.Title,
+    p.CreationDate,
+    p.OwnerUserId,
+    u.DisplayName as OwnerDisplayName,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    pq.AnswerCount,
+    pq.MaxAnswerScore,
+    pq.AvgAnswerScore,
+    cr.CloseReasonName,
+    d.OriginalQuestionId,
+    rs.CommentId as RecentCommentId,
+    rs.CommentUserId as RecentCommentUserId,
+    rs.CommentDate as RecentCommentDate,
+    uwb.GoldBadges,
+    uwb.SilverBadges,
+    uwb.BronzeBadges,
+    urep.ReputationRank,
+    ut.Tag as TopUserTag,
+    uts.TotalScore as UserTagTotalScore,
+    uts.PostCount as UserTagPostCount,
+    coalesce(CAST(p.Score AS double precision) / nullif(p.ViewCount,0), 0) as ScoreToViewRatio,
+    case when p.ClosedDate is not null then 'Closed' else 'Open' end as PostStatus,
+    case when u.Views > 10000 then 'High View User' else 'Regular User' end as UserPopularityCategory
+from Posts p
+join PostWithAnswerStats pq on pq.QuestionId = p.Id
+left join QuestionCloseReasons cr on cr.PostId = p.Id
+left join DuplicateQuestions d on d.DuplicateQuestionId = p.Id
+left join RecentSignificantComments rs on rs.PostId = p.Id
+left join Users u on u.Id = p.OwnerUserId
+left join UsersWithTopAnswers uwb on uwb.UserId = p.OwnerUserId
+left join UserReputationWindow urep on urep.UserId = p.OwnerUserId
+left join UserTagScores uts on uts.UserId = p.OwnerUserId
+left join UserTopTagPosts ut on ut.OwnerUserId = p.OwnerUserId and ut.Tag = uts.Tag
+where p.PostTypeId = 1
+  and (p.Score > 10 or pq.MaxAnswerScore > 20)
+  and (cr.CloseReasonName is null or cr.CloseDate > timestamp '2024-10-01 12:34:56' - interval '1 year')
+group by
+    p.Id,
+    p.Title,
+    p.CreationDate,
+    p.OwnerUserId,
+    u.DisplayName,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    pq.AnswerCount,
+    pq.MaxAnswerScore,
+    pq.AvgAnswerScore,
+    cr.CloseReasonName,
+    cr.CloseDate,
+    d.OriginalQuestionId,
+    rs.CommentId,
+    rs.CommentUserId,
+    rs.CommentDate,
+    uwb.GoldBadges,
+    uwb.SilverBadges,
+    uwb.BronzeBadges,
+    urep.ReputationRank,
+    ut.Tag,
+    uts.TotalScore,
+    uts.PostCount,
+    p.ClosedDate,
+    u.Views
+order by pq.MaxAnswerScore desc, p.Score desc, urep.ReputationRank
+limit 100;

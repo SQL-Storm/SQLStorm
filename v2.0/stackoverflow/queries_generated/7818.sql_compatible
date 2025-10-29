@@ -1,0 +1,376 @@
+WITH UserActivityMetrics AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        COALESCE(SUM(p.ViewCount), 0) as TotalViews,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(u.LastAccessDate) as LastAccessDate,
+        DATE_PART('day', AGE(TIMESTAMP '2024-10-01 12:34:56', u.CreationDate)) as AccountAgeDays,
+        DATE_PART('day', AGE(MAX(p.CreationDate), u.CreationDate)) as ActiveDays,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+                SUM(p.Score)::double precision / NULLIF(COUNT(DISTINCT p.Id), 0)
+            ELSE 0 
+        END as AvgScorePerPost,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+                SUM(p.ViewCount)::double precision / NULLIF(COUNT(DISTINCT p.Id), 0)
+            ELSE 0 
+        END as AvgViewsPerPost,
+        ROW_NUMBER() OVER (ORDER BY SUM(p.Score) DESC) as RankByScore,
+        ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) as RankByPostCount,
+        NTILE(10) OVER (ORDER BY u.Reputation DESC) as ReputationDecile,
+        CASE 
+            WHEN EXISTS (SELECT 1 FROM Badges b2 WHERE b2.UserId = u.Id AND b2.Class = 1) THEN 'Gold'
+            WHEN EXISTS (SELECT 1 FROM Badges b2 WHERE b2.UserId = u.Id AND b2.Class = 2) THEN 'Silver'
+            WHEN EXISTS (SELECT 1 FROM Badges b2 WHERE b2.UserId = u.Id AND b2.Class = 3) THEN 'Bronze'
+            ELSE 'None'
+        END as BadgeTier
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate, u.LastAccessDate
+),
+TopPosts AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.Tags,
+        p.ParentId,
+        COALESCE(p.AcceptedAnswerId, 0) as AcceptedAnswerId,
+        DATE_PART('day', AGE(TIMESTAMP '2024-10-01 12:34:56', p.CreationDate)) as AgeInDays,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END as PostTypeDescription,
+        ROW_NUMBER() OVER (ORDER BY p.Score DESC) as RankByScore,
+        NTILE(4) OVER (ORDER BY p.Score DESC) as ScoreQuartile,
+        CASE 
+            WHEN p.Score >= 1000 THEN 'Elite'
+            WHEN p.Score >= 500 THEN 'High'
+            WHEN p.Score >= 100 THEN 'Medium'
+            ELSE 'Low'
+        END as ScoreCategory,
+        COALESCE(SUBSTRING(p.Tags FROM 1 FOR 50), '') as TagPreview
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) 
+    AND p.Score >= 0
+),
+UserPostAnalysis AS (
+    SELECT 
+        uam.UserId,
+        uam.DisplayName,
+        uam.Reputation,
+        uam.PostCount,
+        uam.QuestionCount,
+        uam.AnswerCount,
+        uam.TotalScore,
+        uam.AvgScorePerPost,
+        uam.BadgeCount,
+        uam.RankByScore,
+        uam.ReputationDecile,
+        uam.BadgeTier,
+        uam.AccountAgeDays,
+        CASE 
+            WHEN uam.PostCount > 0 AND uam.AccountAgeDays > 0 THEN 
+                (uam.PostCount::double precision / NULLIF(uam.AccountAgeDays, 0)) * 30
+            ELSE 0 
+        END as PostsPerMonth,
+        CASE 
+            WHEN uam.QuestionCount > 0 THEN 
+                uam.AnswerCount::double precision / NULLIF(uam.QuestionCount, 0)
+            ELSE 0 
+        END as AnswerToQuestionRatio,
+        CASE 
+            WHEN uam.AnswerCount > 0 THEN 
+                uam.TotalScore::double precision / NULLIF(uam.AnswerCount, 0)
+            ELSE 0 
+        END as AvgScorePerAnswer,
+        CASE 
+            WHEN uam.QuestionCount > 0 THEN 'Questioner'
+            WHEN uam.AnswerCount > 0 THEN 'Answerer'
+            WHEN uam.PostCount > 0 THEN 'Contributor'
+            ELSE 'Inactive'
+        END as UserRole
+    FROM UserActivityMetrics uam
+    WHERE uam.PostCount > 0
+),
+PostTagAnalysis AS (
+    SELECT 
+        tp.PostId,
+        tp.Title,
+        tp.Score,
+        tp.ViewCount,
+        tp.CreationDate,
+        tp.OwnerUserId,
+        tp.PostTypeId,
+        tp.AnswerCount,
+        tp.CommentCount,
+        tp.Tags,
+        tp.ScoreCategory,
+        tp.TagPreview,
+        CASE 
+            WHEN tp.Tags IS NOT NULL AND tp.Tags <> '' THEN
+                regexp_split_to_array(substring(tp.Tags FROM 2 FOR char_length(tp.Tags)-2), '><')
+            ELSE NULL 
+        END as TagArray,
+        COALESCE(
+            (SELECT COUNT(*) FROM Posts p2 
+             WHERE p2.ParentId = tp.PostId AND p2.PostTypeId = 2), 
+            0
+        ) as ChildAnswersCount,
+        COALESCE(
+            (SELECT COUNT(*) FROM Comments c2 
+             WHERE c2.PostId = tp.PostId), 
+            0
+        ) as CommentCountActual,
+        CASE 
+            WHEN tp.Score >= 10 THEN 'Popular'
+            WHEN tp.Score >= 5 THEN 'Notable'
+            WHEN tp.Score >= 1 THEN 'Marginal'
+            ELSE 'Unpopular'
+        END as PopularityLevel,
+        DATE_PART('day', AGE(TIMESTAMP '2024-10-01 12:34:56', tp.CreationDate)) as DaysSinceCreation
+    FROM TopPosts tp
+    WHERE tp.Score >= 1
+),
+AggregateStats AS (
+    SELECT 
+        'Overall' as Category,
+        COUNT(*) as TotalRecords,
+        COUNT(DISTINCT OwnerUserId) as DistinctUsers,
+        SUM(CAST(Score AS BIGINT)) as TotalScore,
+        AVG(CAST(Score AS double precision)) as AvgScore,
+        MAX(CAST(Score AS BIGINT)) as MaxScore,
+        MIN(CAST(Score AS BIGINT)) as MinScore,
+        SUM(CAST(ViewCount AS BIGINT)) as TotalViews,
+        AVG(CAST(ViewCount AS double precision)) as AvgViews,
+        SUM(CASE WHEN Score >= 1000 THEN 1 ELSE 0 END) as ElitePosts,
+        SUM(CASE WHEN Score >= 500 THEN 1 ELSE 0 END) as HighScorePosts,
+        SUM(CASE WHEN CommentCount > 0 THEN 1 ELSE 0 END) as CommentedPosts,
+        SUM(CASE WHEN AnswerCount > 0 THEN 1 ELSE 0 END) as AnsweredPosts
+    FROM PostTagAnalysis
+),
+TopUsersByScore AS (
+    SELECT 
+        upa.UserId,
+        upa.DisplayName,
+        upa.Reputation,
+        upa.TotalScore,
+        upa.PostCount,
+        upa.AvgScorePerPost,
+        upa.BadgeCount,
+        upa.RankByScore,
+        upa.UserRole,
+        upa.ReputationDecile,
+        upa.BadgeTier
+    FROM UserPostAnalysis upa
+    WHERE upa.RankByScore <= 100
+),
+PostWithMetadata AS (
+    SELECT 
+        pta.PostId,
+        pta.Title,
+        pta.Score,
+        pta.ViewCount,
+        pta.CreationDate,
+        pta.OwnerUserId,
+        pta.PostTypeId,
+        pta.AnswerCount,
+        pta.CommentCount,
+        pta.Tags,
+        pta.ScoreCategory,
+        pta.TagPreview,
+        pta.ChildAnswersCount,
+        pta.CommentCountActual,
+        pta.PopularityLevel,
+        pta.DaysSinceCreation,
+        u.DisplayName as OwnerDisplayName,
+        u.Reputation as OwnerReputation,
+        CASE 
+            WHEN u.Id IS NOT NULL THEN 
+                'User_' || u.Id::text
+            ELSE 
+                'Deleted_User_' || pta.OwnerUserId::text
+        END as UserIdentifier,
+        CASE 
+            WHEN pta.ChildAnswersCount > 0 THEN 
+                (SELECT p2.Title FROM Posts p2 WHERE p2.Id = (SELECT p3.Id FROM Posts p3 WHERE p3.ParentId = pta.PostId AND p3.PostTypeId = 2 ORDER BY p3.Score DESC LIMIT 1) LIMIT 1)
+            ELSE 
+                NULL
+        END as SampleAnswerTitle,
+        CASE 
+            WHEN pta.PostTypeId = 1 THEN 
+                (SELECT u2.DisplayName FROM Users u2 WHERE u2.Id = pta.OwnerUserId LIMIT 1)
+            ELSE 
+                NULL
+        END as QuestionOwnerName,
+        COALESCE(pta.TagArray, ARRAY[]::text[]) as TagsArray,
+        COALESCE(array_length(pta.TagArray, 1), 0) as NumberOfTags,
+        CASE 
+            WHEN pta.Tags IS NOT NULL AND pta.Tags <> '' THEN 
+                substring(pta.Tags FROM 2 FOR char_length(pta.Tags)-2)
+            ELSE 
+                ''
+        END as RawTagsString
+    FROM PostTagAnalysis pta
+    LEFT JOIN Users u ON pta.OwnerUserId = u.Id
+),
+ComplexJoinedResult AS (
+    SELECT 
+        pu.UserId,
+        pu.DisplayName,
+        pu.Reputation,
+        pu.TotalScore,
+        pu.PostCount,
+        pu.AvgScorePerPost,
+        pu.BadgeCount,
+        pu.RankByScore,
+        pu.UserRole,
+        pu.ReputationDecile,
+        pu.BadgeTier,
+        p.PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.PostTypeId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.Tags,
+        p.ScoreCategory,
+        p.TagPreview,
+        p.ChildAnswersCount,
+        p.CommentCountActual,
+        p.PopularityLevel,
+        p.DaysSinceCreation,
+        p.OwnerDisplayName,
+        p.OwnerReputation,
+        p.UserIdentifier,
+        p.SampleAnswerTitle,
+        p.QuestionOwnerName,
+        p.TagsArray,
+        p.NumberOfTags,
+        p.RawTagsString,
+        CASE 
+            WHEN (p.Score + p.ViewCount) > 1000 THEN 
+                'High Impact Post'
+            WHEN (p.Score + p.ViewCount) > 500 THEN 
+                'Medium Impact Post'
+            ELSE 
+                'Low Impact Post'
+        END as ImpactTier,
+        CASE 
+            WHEN p.DaysSinceCreation <= 30 THEN 'New'
+            WHEN p.DaysSinceCreation <= 90 THEN 'Recent'
+            WHEN p.DaysSinceCreation <= 365 THEN 'Established'
+            ELSE 'Legacy'
+        END as PostAgeCategory,
+        COALESCE(
+            (SELECT AVG(p2.Score::double precision) FROM Posts p2 
+             WHERE p2.OwnerUserId = pu.UserId 
+             AND p2.PostTypeId = 1), 
+            0
+        ) as AvgQuestionScore,
+        COALESCE(
+            (SELECT AVG(p2.Score::double precision) FROM Posts p2 
+             WHERE p2.OwnerUserId = pu.UserId 
+             AND p2.PostTypeId = 2), 
+            0
+        ) as AvgAnswerScore,
+        CASE 
+            WHEN EXISTS (
+                SELECT 1 FROM Posts p3 
+                WHERE p3.OwnerUserId = pu.UserId 
+                AND p3.PostTypeId = 2 
+                AND p3.Score >= 10
+            ) THEN 'HasHighValueAnswers'
+            ELSE 'NoHighValueAnswers'
+        END as AnswerQualityIndicator,
+        COALESCE(
+            (SELECT COUNT(*) FROM Posts p4 
+             WHERE p4.OwnerUserId = pu.UserId 
+             AND p4.Score >= 1000), 
+            0
+        ) as ElitePostCount
+    FROM TopUsersByScore pu
+    INNER JOIN PostWithMetadata p ON pu.UserId = p.OwnerUserId
+    WHERE p.Score >= 50
+    AND p.ViewCount >= 100
+    AND (
+        NOT EXISTS (
+            SELECT 1 FROM Posts p5 
+            WHERE p5.ParentId = p.PostId 
+            AND p5.Score <= -10
+        )
+        OR EXISTS (
+            SELECT 1 FROM Votes v 
+            WHERE v.PostId = p.PostId 
+            AND v.VoteTypeId IN (2,3)
+        )
+    )
+)
+SELECT 
+    'Performance Benchmark Query' as QueryName,
+    COUNT(*) as TotalRecords,
+    COUNT(DISTINCT UserId) as DistinctUsers,
+    COUNT(DISTINCT PostId) as DistinctPosts,
+    AVG(TotalScore) as AvgUserScore,
+    MAX(AvgScorePerPost) as MaxAvgScorePerPost,
+    AVG(ElitePostCount) as AvgElitePostsPerUser,
+    MAX(DaysSinceCreation) as MaxDaysSinceCreation,
+    SUM(CASE WHEN PopularityLevel = 'Popular' THEN 1 ELSE 0 END) as PopularPosts,
+    SUM(CASE WHEN ImpactTier = 'High Impact Post' THEN 1 ELSE 0 END) as HighImpactPosts,
+    SUM(CASE WHEN PostAgeCategory = 'New' THEN 1 ELSE 0 END) as NewPosts,
+    STRING_AGG(DISTINCT UserRole || ':' || cnt::text, ', ') as UserRoleDistribution,
+    STRING_AGG(DISTINCT BadgeTier, ', ') as BadgeTiers,
+    STRING_AGG(DISTINCT ScoreCategory, ', ') as ScoreCategories,
+    STRING_AGG(DISTINCT PostAgeCategory, ', ') as PostAgeCategories
+FROM (
+    SELECT cjr.*, COUNT(*) OVER (PARTITION BY UserRole) as cnt
+    FROM ComplexJoinedResult cjr
+) sub
+GROUP BY 
+    (EXISTS (
+        SELECT 1 FROM (
+            SELECT COUNT(*) as cnt2 FROM ComplexJoinedResult 
+            GROUP BY UserId
+            HAVING COUNT(PostId) > 100
+        ) c
+    )),
+    (EXISTS (
+        SELECT 1 FROM (
+            SELECT COUNT(*) as cnt3 FROM ComplexJoinedResult
+            GROUP BY PostId
+            HAVING COUNT(UserId) > 100
+        ) d
+    ))
+HAVING 
+    COUNT(*) > 0 
+    OR (COUNT(*) = 0 AND COUNT(DISTINCT UserId) > 0)
+ORDER BY 
+    TotalRecords DESC,
+    COUNT(DISTINCT PostId) DESC,
+    AVG(TotalScore) DESC
+LIMIT 1000;

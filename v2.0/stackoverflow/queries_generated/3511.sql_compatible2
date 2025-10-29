@@ -1,0 +1,96 @@
+WITH UserPostAgg AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COALESCE(SUM(p.Score), 0) AS TotalScore,
+        AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL) AS AvgScore,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+), BadgeCounts AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        SUM(CASE WHEN b.TagBased = TRUE OR b.TagBased = 1 THEN 1 ELSE 0 END) AS TagBasedBadges
+    FROM Badges b
+    GROUP BY b.UserId
+), RecentVotes AS (
+    SELECT 
+        v.PostId,
+        v.VoteTypeId,
+        v.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY v.PostId ORDER BY v.CreationDate DESC) AS rn
+    FROM Votes v
+    WHERE v.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '30 days')
+), TopPosts AS (
+    SELECT 
+        p.OwnerUserId,
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS RankScore,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.ViewCount DESC) AS RankViews
+    FROM Posts p
+    WHERE p.PostTypeId IN (1,2) AND p.OwnerUserId IS NOT NULL
+), TagUsage AS (
+    SELECT 
+        p.OwnerUserId,
+        tag AS Tag,
+        COUNT(*) AS TagCount
+    FROM Posts p,
+    LATERAL (
+      SELECT UNNEST(string_to_array(TRIM(BOTH '<>' FROM p.Tags), '><')) AS tag
+    ) t
+    WHERE p.Tags IS NOT NULL
+    GROUP BY p.OwnerUserId, tag
+), UserTopTag AS (
+    SELECT 
+        tu.OwnerUserId,
+        tu.Tag,
+        tu.TagCount,
+        ROW_NUMBER() OVER (PARTITION BY tu.OwnerUserId ORDER BY tu.TagCount DESC) AS rn
+    FROM TagUsage tu
+)
+SELECT 
+    upa.UserId,
+    upa.DisplayName,
+    upa.QuestionCount,
+    upa.AnswerCount,
+    upa.TotalScore,
+    ROUND(upa.AvgScore::numeric, 2) AS AvgScore,
+    COALESCE(bc.GoldBadges, 0)    AS GoldBadges,
+    COALESCE(bc.SilverBadges, 0)  AS SilverBadges,
+    COALESCE(bc.BronzeBadges, 0)  AS BronzeBadges,
+    COALESCE(bc.TagBasedBadges, 0) AS TagBasedBadges,
+    tp.Score       AS TopScoredPostScore,
+    tp.Title       AS TopScoredPostTitle,
+    tp.PostId      AS TopScoredPostId,
+    tp2.ViewCount  AS TopViewedPostViews,
+    tp2.Title      AS TopViewedPostTitle,
+    tp2.PostId     AS TopViewedPostId,
+    utt.Tag        AS DominantTag,
+    utt.TagCount   AS DominantTagCount,
+    CASE WHEN upa.LastPostDate >= (CAST('2024-10-01' AS date) - INTERVAL '7 days') THEN 1 ELSE 0 END AS ActiveLastWeek,
+    rv.VoteTypeId  AS RecentVoteType,
+    rv.CreationDate AS RecentVoteDate
+FROM UserPostAgg upa
+LEFT JOIN BadgeCounts bc      ON bc.UserId = upa.UserId
+LEFT JOIN TopPosts tp         ON tp.OwnerUserId = upa.UserId AND tp.RankScore = 1
+LEFT JOIN TopPosts tp2        ON tp2.OwnerUserId = upa.UserId AND tp2.RankViews = 1
+LEFT JOIN UserTopTag utt      ON utt.OwnerUserId = upa.UserId AND utt.rn = 1
+LEFT JOIN LATERAL (
+    SELECT rv.VoteTypeId, rv.CreationDate
+    FROM RecentVotes rv
+    WHERE rv.PostId = tp.PostId
+    ORDER BY rv.rn
+    LIMIT 1
+) rv ON TRUE
+WHERE upa.UserId IS NOT NULL
+ORDER BY upa.TotalScore DESC
+LIMIT 100;

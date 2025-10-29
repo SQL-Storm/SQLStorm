@@ -1,0 +1,177 @@
+-- {"query": "4109.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1497} 
+WITH
+  RankedPostEdits AS (
+    SELECT
+      ph.PostId,
+      ph.UserId,
+      ph.CreationDate,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn,
+      p.Title,
+      p.Tags,
+      p.PostTypeId,
+      p.OwnerUserId,
+      p.CommunityOwnedDate,
+      CASE WHEN ph.PostHistoryTypeId = 4 THEN 'Title Edit' WHEN ph.PostHistoryTypeId = 5 THEN 'Body Edit' WHEN ph.PostHistoryTypeId = 6 THEN 'Tags Edit' ELSE 'Other' END AS EditType
+    FROM
+      PostHistory AS ph
+      JOIN Posts AS p
+      ON ph.PostId = p.Id
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6) -- Edits only
+  ),
+  PostEditStats AS (
+    SELECT
+      re.PostId,
+      re.Title,
+      re.Tags,
+      re.PostTypeId,
+      re.OwnerUserId,
+      re.CommunityOwnedDate,
+      COUNT(re.UserId) AS NumberOfEdits,
+      MAX(re.CreationDate) AS LastEditDate,
+      AVG(
+        EXTRACT(
+          EPOCH
+          FROM
+            (
+              re.CreationDate - LAG(re.CreationDate, 1, re.CreationDate) OVER (PARTITION BY re.PostId ORDER BY re.CreationDate)
+            )
+        )
+      ) AS AvgTimeBetweenEditsSeconds
+    FROM
+      RankedPostEdits AS re
+    GROUP BY
+      re.PostId,
+      re.Title,
+      re.Tags,
+      re.PostTypeId,
+      re.OwnerUserId,
+      re.CommunityOwnedDate
+  ),
+  UserPostActivity AS (
+    SELECT
+      p.OwnerUserId,
+      COUNT(p.Id) AS TotalPostsOwned,
+      SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount
+    FROM
+      Posts AS p
+    WHERE
+      p.OwnerUserId IS NOT NULL
+      AND p.OwnerUserId > 0
+    GROUP BY
+      p.OwnerUserId
+  ),
+  QuestionVoteCounts AS (
+    SELECT
+      p.Id AS QuestionId,
+      COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVotes,
+      COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVotes
+    FROM
+      Posts AS p
+      JOIN Votes AS v
+      ON p.Id = v.PostId
+    WHERE
+      p.PostTypeId = 1 -- Questions only
+    GROUP BY
+      p.Id
+  ),
+  MostActiveUsers AS (
+    SELECT
+      UserId,
+      COUNT(*) AS VoteCount,
+      ROW_NUMBER() OVER (ORDER BY COUNT(*) DESC) AS UserRank
+    FROM
+      Votes
+    WHERE
+      VoteTypeId IN (2, 3) -- Upvotes and Downvotes
+    GROUP BY
+      UserId
+    HAVING
+      COUNT(*) > 50
+  )
+SELECT
+  pes.PostId,
+  pes.Title,
+  pes.Tags,
+  pes.PostTypeId,
+  pes.OwnerUserId,
+  u.DisplayName AS OwnerDisplayName,
+  pes.CommunityOwnedDate,
+  pes.NumberOfEdits,
+  pes.LastEditDate,
+  pes.AvgTimeBetweenEditsSeconds,
+  upa.TotalPostsOwned,
+  upa.QuestionCount,
+  upa.AnswerCount,
+  qvc.UpVotes AS QuestionUpVotes,
+  qvc.DownVotes AS QuestionDownVotes,
+  COALESCE(u.Reputation, 0) AS UserReputation,
+  CASE WHEN u.CreationDate < '2010-01-01' THEN 'OldAccount' ELSE 'NewAccount' END AS AccountAgeCategory,
+  CASE WHEN pes.Title IS NULL THEN 'NoTitle' ELSE SUBSTRING(pes.Title FROM 1 FOR 30) END AS TruncatedTitle,
+  CASE WHEN pes.Tags LIKE '%<sql>%' THEN 'HasSQLTag' ELSE 'NoSQLTag' END AS SQLTagPresence,
+  CASE WHEN pes.CommunityOwnedDate IS NOT NULL THEN 'CommunityOwned' ELSE 'UserOwned' END AS OwnershipType,
+  mau.UserRank AS MostActiveUserRank
+FROM
+  PostEditStats AS pes
+LEFT OUTER JOIN
+  Users AS u
+  ON pes.OwnerUserId = u.Id
+LEFT OUTER JOIN
+  UserPostActivity AS upa
+  ON pes.OwnerUserId = upa.OwnerUserId
+LEFT OUTER JOIN
+  QuestionVoteCounts AS qvc
+  ON pes.PostId = qvc.QuestionId
+LEFT OUTER JOIN
+  MostActiveUsers AS mau
+  ON pes.OwnerUserId = mau.UserId
+WHERE
+  pes.NumberOfEdits > 2
+  AND (
+    pes.AvgTimeBetweenEditsSeconds IS NULL
+    OR pes.AvgTimeBetweenEditsSeconds < 86400
+  ) -- Less than a day between edits on average
+  AND COALESCE(u.Location, 'Unknown') <> 'Unknown'
+  AND pes.PostTypeId IN (1, 2) -- Questions or Answers
+UNION
+SELECT
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  COUNT(ph.Id),
+  MAX(ph.CreationDate),
+  AVG(
+    EXTRACT(
+      EPOCH
+      FROM
+        (
+          ph.CreationDate - LAG(ph.CreationDate, 1, ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate)
+        )
+    )
+  ),
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL
+FROM
+  PostHistory AS ph
+WHERE
+  ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20, 35, 36) -- Moderation actions
+GROUP BY
+  ph.PostId
+HAVING
+  COUNT(ph.Id) > 10 -- More than 10 moderation actions on a single post
+ORDER BY
+  COALESCE(pes.LastEditDate, ph.CreationDate) DESC;

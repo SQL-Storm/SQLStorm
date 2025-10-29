@@ -1,0 +1,290 @@
+-- {"query": "1557.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3914} 
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.UpVotes AS TotalUpVotesGiven,
+        U.DownVotes AS TotalDownVotesGiven,
+        U.CreationDate AS UserCreationDate,
+        U.Views AS ProfileViews,
+        U.Location,
+        COUNT(DISTINCT P_Owned.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT CASE WHEN P_Owned.PostTypeId = 1 THEN P_Owned.Id END) AS TotalQuestionsOwned,
+        COUNT(DISTINCT CASE WHEN P_Owned.PostTypeId = 2 THEN P_Owned.Id END) AS TotalAnswersOwned,
+        SUM(COALESCE(P_Owned.Score, 0)) AS TotalPostScoreReceived,
+        SUM(COALESCE(P_Owned.ViewCount, 0)) AS TotalPostViewsReceived,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN V_Accepted.VoteTypeId = 1 THEN 1 ELSE 0 END) AS AcceptedAnswersCount,
+        MAX(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS HasGoldBadge,
+        COUNT(B.Id) AS TotalBadges,
+        MAX(U.LastAccessDate) AS UserLastAccessDate
+    FROM
+        Users AS U
+    LEFT JOIN
+        Posts AS P_Owned ON U.Id = P_Owned.OwnerUserId
+    LEFT JOIN
+        Comments AS C ON U.Id = C.UserId
+    LEFT JOIN
+        Votes AS V_Accepted ON P_Owned.AcceptedAnswerId = V_Accepted.PostId AND V_Accepted.VoteTypeId = 1 AND V_Accepted.UserId = U.Id -- Accepted answer *given* by this user for their own post
+    LEFT JOIN
+        Badges AS B ON U.Id = B.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.UpVotes, U.DownVotes, U.CreationDate, U.Views, U.Location
+),
+PostQualityMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.ClosedDate,
+        P.LastEditDate,
+        P.CommunityOwnedDate,
+        LENGTH(P.Body) AS BodyLength,
+        LENGTH(P.Title) AS TitleLength,
+        UPPER(SUBSTRING(COALESCE(P.Title, P.Body), 1, 1)) AS FirstCharOfTitleOrBody,
+        TRIM(BOTH '<>' FROM P.Tags) AS TagsString,
+        COALESCE(P.AcceptedAnswerId, -1) AS AcceptedAnswerId_Coalesced,
+        -- Correlated subquery to check for specific history types for this post
+        (SELECT COUNT(PH.Id) FROM PostHistory AS PH WHERE PH.PostId = P.Id AND PH.PostHistoryTypeId IN (4,5,6)) AS EditCount, -- Title, Body, Tags Edits
+        (SELECT COUNT(PH.Id) FROM PostHistory AS PH WHERE PH.PostId = P.Id AND PH.PostHistoryTypeId = 10) AS CloseVoteCount, -- Post Closed
+        (SELECT COUNT(PH.Id) FROM PostHistory AS PH WHERE PH.PostId = P.Id AND PH.PostHistoryTypeId = 11) AS ReopenVoteCount, -- Post Reopened
+        P.ParentId,
+        CASE
+            WHEN P.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN P.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+            WHEN P.AnswerCount = 0 AND P.PostTypeId = 1 THEN 'Unanswered'
+            WHEN P.CommunityOwnedDate IS NOT NULL THEN 'CommunityWiki'
+            ELSE 'Open'
+        END AS PostStatus
+    FROM
+        Posts AS P
+    WHERE
+        P.PostTypeId IN (1, 2) -- Only Questions and Answers
+),
+TagPerformanceStats AS (
+    SELECT
+        Tag.TagName,
+        Tag.Id AS TagId,
+        COUNT(P.PostId) AS TotalPostsWithTag,
+        AVG(P.Score) AS AvgPostScoreWithTag,
+        AVG(P.AnswerCount) AS AvgAnswerCountWithTag,
+        SUM(CASE WHEN P.AcceptedAnswerId_Coalesced != -1 THEN 1 ELSE 0 END) AS PostsWithAcceptedAnswerCount,
+        MAX(Tag.Count) AS GlobalTagCount,
+        SUM(CASE WHEN P.PostStatus = 'Closed' THEN 1 ELSE 0 END) AS ClosedPostsWithTagCount
+    FROM
+        Tags AS Tag
+    INNER JOIN
+        PostQualityMetrics AS P ON P.TagsString LIKE CONCAT('%<', Tag.TagName, '>%', '')
+    GROUP BY
+        Tag.TagName, Tag.Id
+),
+CombinedPostDetails AS (
+    SELECT
+        PQ.PostId,
+        PQ.PostTypeId,
+        PQ.OwnerUserId,
+        PQ.PostCreationDate,
+        PQ.Score,
+        PQ.ViewCount,
+        PQ.AnswerCount,
+        PQ.CommentCount,
+        PQ.FavoriteCount,
+        PQ.ClosedDate,
+        PQ.LastEditDate,
+        PQ.BodyLength,
+        PQ.TitleLength,
+        PQ.FirstCharOfTitleOrBody,
+        PQ.TagsString,
+        PQ.EditCount,
+        PQ.CloseVoteCount,
+        PQ.ReopenVoteCount,
+        PQ.AcceptedAnswerId_Coalesced AS AcceptedAnswerId,
+        PQ.PostStatus,
+        PQ.ParentId,
+        SUM(CASE WHEN PL.LinkTypeId = 1 THEN 1 ELSE 0 END) AS LinkedPostCount,
+        SUM(CASE WHEN PL.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicatePostCount,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesOnPost,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesOnPost,
+        SUM(CASE WHEN V.VoteTypeId = 5 THEN 1 ELSE 0 END) AS TotalFavoriteVotesOnPost -- Although deprecated, still useful for historical data
+    FROM
+        PostQualityMetrics AS PQ
+    LEFT JOIN
+        PostLinks AS PL ON PQ.PostId = PL.PostId
+    LEFT JOIN
+        Votes AS V ON PQ.PostId = V.PostId
+    GROUP BY
+        PQ.PostId, PQ.PostTypeId, PQ.OwnerUserId, PQ.PostCreationDate, PQ.Score, PQ.ViewCount,
+        PQ.AnswerCount, PQ.CommentCount, PQ.FavoriteCount, PQ.ClosedDate, PQ.LastEditDate,
+        PQ.BodyLength, PQ.TitleLength, PQ.FirstCharOfTitleOrBody, PQ.TagsString, PQ.EditCount,
+        PQ.CloseVoteCount, PQ.ReopenVoteCount, PQ.AcceptedAnswerId_Coalesced, PQ.PostStatus, PQ.ParentId
+),
+UserPostTagAggregates AS (
+    SELECT
+        UE.UserId,
+        UE.DisplayName,
+        UE.Reputation,
+        UE.TotalPostsOwned,
+        UE.TotalQuestionsOwned,
+        UE.TotalAnswersOwned,
+        UE.TotalPostScoreReceived,
+        UE.TotalPostViewsReceived,
+        UE.TotalCommentsMade,
+        UE.AcceptedAnswersCount,
+        UE.HasGoldBadge,
+        UE.TotalBadges,
+        UE.ProfileViews,
+        UE.Location,
+        UE.UserCreationDate,
+        UE.UserLastAccessDate,
+        CPD.PostId,
+        CPD.PostTypeId,
+        CPD.Score AS PostScore,
+        CPD.ViewCount AS PostViewCount,
+        CPD.AnswerCount AS PostAnswerCount,
+        CPD.CommentCount AS PostCommentCount,
+        CPD.FavoriteCount AS PostFavoriteCount,
+        CPD.BodyLength,
+        CPD.TitleLength,
+        CPD.EditCount,
+        CPD.CloseVoteCount,
+        CPD.ReopenVoteCount,
+        CPD.PostStatus,
+        CPD.TotalUpVotesOnPost,
+        CPD.TotalDownVotesOnPost,
+        CPD.LinkedPostCount,
+        CPD.DuplicatePostCount,
+        CPD.AcceptedAnswerId,
+        CPD.ParentId,
+        STRING_TO_ARRAY(SUBSTRING(CPD.TagsString, 2, LENGTH(CPD.TagsString) - 2), '><') AS PostTagsArray,
+        ROW_NUMBER() OVER (PARTITION BY UE.UserId, CPD.PostTypeId ORDER BY CPD.PostScore DESC, CPD.ViewCount DESC) AS Rn_UserPostScoreViewType,
+        NTILE(5) OVER (ORDER BY UE.Reputation DESC, UE.TotalPostScoreReceived DESC) AS UserReputationQuintile,
+        AVG(CPD.Score) OVER (PARTITION BY UE.UserId) AS AvgPostScorePerUser,
+        COUNT(CASE WHEN CPD.PostStatus = 'Closed' THEN 1 ELSE NULL END) OVER (PARTITION BY UE.UserId) AS ClosedPostsByUserCount,
+        DATE_PART('day', cast('2024-10-01 12:34:56' as timestamp) - UE.UserLastAccessDate) AS DaysSinceLastAccess,
+        -- Ratio of accepted answers for users who also own the parent question
+        CAST(SUM(CASE WHEN CPD.AcceptedAnswerId = CPD.PostId AND CPD.PostTypeId = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY UE.UserId) AS NUMERIC) /
+        NULLIF(SUM(CASE WHEN CPD.PostTypeId = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY UE.UserId), 0) AS UserAnswerAcceptanceRate
+    FROM
+        UserEngagement AS UE
+    INNER JOIN
+        CombinedPostDetails AS CPD ON UE.UserId = CPD.OwnerUserId
+    WHERE
+        UE.UserCreationDate >= '2020-01-01' -- Filter for more recent users to limit data
+),
+FinalRankedPosts AS (
+    SELECT
+        UPTA.*,
+        TS.TagName AS CurrentTag,
+        TS.TotalPostsWithTag,
+        TS.AvgPostScoreWithTag,
+        TS.PostsWithAcceptedAnswerCount,
+        TS.ClosedPostsWithTagCount,
+        RANK() OVER (PARTITION BY CurrentTag ORDER BY UPTA.PostScore DESC, UPTA.PostViewCount DESC) AS RankInTag,
+        LAG(UPTA.PostScore, 1, 0) OVER (PARTITION BY UPTA.UserId ORDER BY UPTA.PostCreationDate) AS PreviousPostScore,
+        -- Calculate a composite score for posts (more complex weighting)
+        (
+            (UPTA.PostScore * 0.75) +
+            (UPTA.PostViewCount * 0.005) +
+            (UPTA.PostAnswerCount * 1.5) +
+            (UPTA.PostFavoriteCount * 2) -
+            (UPTA.TotalDownVotesOnPost * 1.2) -
+            (UPTA.EditCount * 0.3) -
+            (UPTA.CloseVoteCount * 4) +
+            (CASE WHEN UPTA.PostStatus = 'Answered' AND UPTA.PostTypeId = 1 THEN 5 ELSE 0 END) +
+            (CASE WHEN UPTA.PostStatus = 'CommunityWiki' THEN -2 ELSE 0 END) +
+            (CASE WHEN UPTA.BodyLength < 100 OR UPTA.TitleLength < 15 THEN -1 ELSE 0 END)
+        ) AS PostCompositeScore
+    FROM
+        UserPostTagAggregates AS UPTA
+    LEFT JOIN LATERAL UNNEST(UPTA.PostTagsArray) AS UnnestedTag (TagName) ON TRUE
+    LEFT JOIN
+        TagPerformanceStats AS TS ON UnnestedTag.TagName = TS.TagName
+    WHERE
+        UPTA.Rn_UserPostScoreViewType <= 3 -- Top 3 posts per user per post type
+        AND UPTA.PostStatus NOT IN ('Deleted') -- Exclude deleted posts
+),
+ModeratorDecisionDetails AS (
+    SELECT
+        PH.PostId,
+        PH.CreationDate AS HistoryDate,
+        PH.PostHistoryTypeId,
+        COALESCE(U.DisplayName, PH.UserDisplayName, 'Community') AS ModifierDisplayName,
+        COALESCE(CR.Name, PH.Comment, 'N/A') AS ActionDetail,
+        ROW_NUMBER() OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate DESC) AS rn_latest_action
+    FROM
+        PostHistory AS PH
+    LEFT JOIN
+        Users AS U ON PH.UserId = U.Id
+    LEFT JOIN
+        CloseReasonTypes AS CR ON PH.PostHistoryTypeId = 10 AND PH.Comment = CAST(CR.Id AS VARCHAR)
+    WHERE
+        PH.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15) -- Close, Reopen, Delete, Undelete, Lock, Unlock
+)
+-- Main Query: Combine and filter for a final analytical result
+SELECT
+    FR.UserId,
+    FR.DisplayName,
+    FR.Reputation,
+    FR.UserReputationQuintile,
+    FR.HasGoldBadge,
+    FR.PostId,
+    FR.PostTypeId,
+    FR.PostScore,
+    FR.PostViewCount,
+    FR.PostAnswerCount,
+    FR.PostStatus,
+    FR.PostCompositeScore,
+    FR.CurrentTag,
+    FR.TotalPostsWithTag,
+    FR.AvgPostScoreWithTag,
+    FR.RankInTag,
+    FR.BodyLength,
+    FR.TitleLength,
+    FR.EditCount,
+    FR.CloseVoteCount,
+    FR.DaysSinceLastAccess,
+    FR.UserAnswerAcceptanceRate,
+    MD.ModifierDisplayName AS LastModeratorActionBy,
+    MD.ActionDetail AS LastModeratorActionReason,
+    -- Complicated calculation: Ratio of score to adjusted body length
+    ROUND(CAST(FR.PostScore AS NUMERIC) / NULLIF((FR.BodyLength + FR.TitleLength), 0), 4) AS ScorePerContentLength,
+    -- String expression: Concatenate User DisplayName and a truncated Location
+    COALESCE(FR.DisplayName, 'Unknown User') ||
+    (CASE WHEN FR.Location IS NOT NULL AND LENGTH(FR.Location) > 0 THEN ' from ' || LEFT(FR.Location, 20) || (CASE WHEN LENGTH(FR.Location) > 20 THEN '...' ELSE '' END) ELSE '' END) AS UserLocationSummary,
+    -- NULL logic: Display 'N/A' if ClosedDate is NULL, else format date
+    COALESCE(TO_CHAR(FR.ClosedDate, 'YYYY-MM-DD HH24:MI:SS'), 'Not Closed') AS PostClosedDateTime,
+    (FR.TotalUpVotesOnPost - FR.TotalDownVotesOnPost) AS NetVotesOnPost,
+    (SELECT COUNT(DISTINCT C.Id) FROM Comments AS C WHERE C.PostId = FR.PostId AND C.CreationDate > FR.LastEditDate) AS NewCommentsAfterLastEdit,
+    FR.PreviousPostScore,
+    -- Set operator example (conceptual, as it would usually be a separate query/result, but for complexity can be embedded)
+    (
+        SELECT 'User has high reputation AND recent activity'
+        WHERE FR.Reputation > 50000 AND FR.DaysSinceLastAccess < 30
+        UNION ALL
+        SELECT 'User has many badges OR high post composite score'
+        WHERE FR.TotalBadges > 100 OR FR.PostCompositeScore > 250
+        LIMIT 1 -- Ensures only one string is returned if multiple conditions meet
+    ) AS UserCategorization
+FROM
+    FinalRankedPosts AS FR
+LEFT JOIN
+    ModeratorDecisionDetails AS MD ON FR.PostId = MD.PostId AND MD.rn_latest_action = 1
+WHERE
+    FR.PostCompositeScore > 50 -- Focus on posts above a certain quality threshold
+    AND FR.RankInTag <= 2 -- Top 2 posts for a specific tag for better relevance
+    AND (FR.HasGoldBadge = 1 OR FR.Reputation > 100000) -- Influential users or high reputation
+    AND FR.EditCount < 10 -- Not excessively edited (indicates stability)
+    AND FR.PostTypeId = 1 -- Only questions for this final analysis
+    AND FR.PostCreationDate > (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '2 year') -- Relatively recent posts
+    AND FR.BodyLength BETWEEN 100 AND 5000 -- Reasonable length questions
+    AND FR.ScorePerContentLength > 0.05 -- Good score density
+ORDER BY
+    FR.UserReputationQuintile ASC, FR.Reputation DESC, FR.PostCompositeScore DESC, FR.PostId ASC
+LIMIT 1000;

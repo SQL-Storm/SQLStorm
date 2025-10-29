@@ -1,0 +1,147 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Elite'
+            WHEN u.Reputation >= 5000 THEN 'Veteran'
+            WHEN u.Reputation >= 1000 THEN 'Regular'
+            ELSE 'Newbie'
+        END AS UserTier
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= TIMESTAMP '2010-01-01'
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        CAST((CAST('2024-10-01 12:34:56' AS TIMESTAMP) - p.CreationDate) AS INTERVAL) AS AgeInterval,
+        EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - p.CreationDate)) + 
+            (EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - p.CreationDate))/86400 - FLOOR(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - p.CreationDate))/86400)) AS AgeInDays,
+        CASE 
+            WHEN p.Score > 100 THEN 'HighlyVoted'
+            WHEN p.Score > 50 THEN 'WellVoted'
+            WHEN p.Score > 10 THEN 'ModeratelyVoted'
+            ELSE 'LowVoted'
+        END AS VoteCategory,
+        CASE 
+            WHEN p.AnswerCount > 10 THEN 'MultipleAnswers'
+            WHEN p.AnswerCount > 0 THEN 'HasAnswers'
+            ELSE 'NoAnswers'
+        END AS AnswerStatus
+    FROM Posts p
+    WHERE p.CreationDate >= TIMESTAMP '2015-01-01'
+      AND p.PostTypeId IN (1, 2)
+),
+TopPosts AS (
+    SELECT 
+        pa.PostId,
+        pa.Title,
+        pa.Score,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.OwnerUserId,
+        pa.VoteCategory,
+        pa.AnswerStatus,
+        ROW_NUMBER() OVER (PARTITION BY pa.VoteCategory ORDER BY pa.Score DESC) AS CategoryRank,
+        AVG(pa.Score) OVER (PARTITION BY pa.VoteCategory) AS AvgScoreByCategory
+    FROM PostAnalysis pa
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            ELSE 'Niche'
+        END AS PopularityLevel,
+        STRING_AGG(DISTINCT p.Title, ', ') AS SampleQuestions
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    WHERE t.TagName IS NOT NULL
+    GROUP BY t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId
+)
+SELECT 
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.UserTier,
+    us.PostCount,
+    us.CommentCount,
+    us.BadgeCount,
+    us.AvgPostScore,
+    us.LastPostDate,
+    us.ReputationRank,
+    CASE WHEN tp.PostId IS NOT NULL THEN 'TopPostHolder' ELSE 'Regular' END AS PostStatus,
+    COALESCE(tp.Title, 'No Top Post') AS TopPostTitle,
+    COALESCE(tp.Score, 0) AS TopPostScore,
+    CASE WHEN ta.TagName IS NOT NULL THEN 'TagExpert' ELSE 'RegularUser' END AS TagExpertise,
+    COALESCE(ta.TagName, 'No Tags') AS FavoriteTag,
+    COALESCE(ta.TagCount, 0) AS TagFrequency,
+    CASE 
+        WHEN (us.PostCount * 2) > us.CommentCount THEN 'MorePosts'
+        WHEN (us.CommentCount * 2) > us.PostCount THEN 'MoreComments'
+        ELSE 'Balanced'
+    END AS ContributionStyle,
+    (SELECT COUNT(*) FROM Votes v WHERE v.UserId = us.UserId AND v.VoteTypeId IN (2, 3)) AS VoteActivity,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = us.UserId AND p.PostTypeId = 1) AS QuestionCount,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = us.UserId AND p.PostTypeId = 2) AS AnswerCount,
+    CASE 
+        WHEN us.Views > 1000 THEN 'HighVisibility'
+        WHEN us.Views > 500 THEN 'MediumVisibility'
+        ELSE 'LowVisibility'
+    END AS VisibilityLevel,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = us.UserId) AS TotalBadges,
+    (SELECT STRING_AGG(b.Name, ', ') FROM Badges b WHERE b.UserId = us.UserId) AS BadgeList,
+    (SELECT COUNT(DISTINCT ph.PostId) FROM PostHistory ph WHERE ph.UserId = us.UserId AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5)) AS EditActivity,
+    (SELECT STRING_AGG(ph.Text, ' | ') FROM PostHistory ph WHERE ph.UserId = us.UserId AND ph.PostHistoryTypeId = 2) AS RecentEdits,
+    CASE 
+        WHEN us.Reputation > 10000 AND us.PostCount > 100 THEN 'VeteranUser'
+        WHEN us.Reputation > 5000 AND us.PostCount > 50 THEN 'ExperiencedUser'
+        WHEN us.Reputation > 1000 AND us.PostCount > 10 THEN 'ActiveUser'
+        ELSE 'Beginner'
+    END AS UserLevel,
+    (SELECT AVG(pcount) FROM (SELECT COUNT(p2.Id) AS pcount, p2.OwnerUserId FROM Posts p2 GROUP BY p2.OwnerUserId) sub) AS RollingAvgPostsPerUser,
+    COALESCE(ta.SampleQuestions, 'No Sample Questions') AS SampleQuestionsFromTag,
+    (CASE WHEN tp.PostId IS NOT NULL THEN 1 ELSE 0 END) * 
+    (CASE WHEN ta.TagName IS NOT NULL THEN 1 ELSE 0 END) * 
+    (CASE WHEN us.PostCount > 0 THEN 1 ELSE 0 END) AS UserEngagementScore
+FROM UserStats us
+LEFT JOIN TopPosts tp ON us.UserId = tp.OwnerUserId AND tp.CategoryRank <= 5
+LEFT JOIN TagAnalysis ta ON EXISTS (
+    SELECT 1
+    FROM Posts p
+    WHERE p.OwnerUserId = us.UserId
+      AND ta.TagName IS NOT NULL
+      AND p.Tags LIKE '%' || ta.TagName || '%'
+    LIMIT 1
+)
+WHERE (us.PostCount > 0 OR us.CommentCount > 0 OR us.BadgeCount > 0)
+  AND us.Reputation >= 100
+ORDER BY us.Reputation DESC, us.PostCount DESC
+LIMIT 1000;

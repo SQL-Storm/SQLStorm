@@ -1,0 +1,194 @@
+-- {"query": "2577.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2055} 
+with RecursiveTagPaths as (
+    select
+        t.Id,
+        t.TagName,
+        1 as Level,
+        ARRAY[t.TagName] as Path
+    from Tags t
+    where t.IsRequired = 1
+
+    union all
+
+    select
+        t.Id,
+        t.TagName,
+        r.Level + 1,
+        r.Path || t.TagName
+    from Tags t
+    join RecursiveTagPaths r on substring(t.TagName from 1 for length(r.TagName)) = r.TagName
+    where t.Id <> r.Id and array_position(r.Path, t.TagName) is null and r.Level < 3
+),
+UserReputationWindows as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        count(b.Id) filter (where b.Class = 1) over (partition by u.Id order by b.Date rows between unbounded preceding and current row) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) over (partition by u.Id order by b.Date rows between unbounded preceding and current row) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) over (partition by u.Id order by b.Date rows between unbounded preceding and current row) as BronzeBadges,
+        row_number() over (partition by u.Id order by b.Date desc) as LatestBadgeRank
+    from Users u
+    left join Badges b on u.Id = b.UserId
+),
+TopQuestionsWithAnswers as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionCreation,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        coalesce(ans.AnswersCount,0) as AnswersCount,
+        coalesce(acc.AncScore,0) as AcceptedAnswerScore,
+        acc.AnswerId as AcceptedAnswerId,
+        acc.OwnerUserId as AcceptedAnswerOwner,
+        u.DisplayName as QuestionOwner,
+        u.Reputation as QuestionOwnerRep,
+        row_number() over (order by q.Score desc, q.ViewCount desc) as RankByScoreView
+    from Posts q
+    left join (
+        select ParentId, count(*) as AnswersCount
+        from Posts
+        where PostTypeId = 2
+        group by ParentId
+    ) ans on q.Id = ans.ParentId
+    left join (
+        select
+            a.Id as AnswerId,
+            a.Score as AncScore,
+            a.OwnerUserId,
+            p.Id as QuestionId
+        from Posts a
+        join Posts p on a.Id = p.AcceptedAnswerId
+        where a.PostTypeId = 2
+    ) acc on q.Id = acc.QuestionId
+    left join Users u on q.OwnerUserId = u.Id
+    where q.PostTypeId = 1
+),
+PostsWithCloseReasons as (
+    select
+        p.Id,
+        p.Title,
+        p.ClosedDate,
+        crt.Name as CloseReason,
+        ph.Comment as CloseReasonIdJson
+    from Posts p
+    left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 10
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    where p.PostTypeId = 1 and p.ClosedDate is not null
+),
+UserActivitySummary as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersCount,
+        count(distinct c.Id) as CommentsCount,
+        count(distinct v.Id) filter (where v.VoteTypeId = 2) as UpvotesGiven,
+        count(distinct v.Id) filter (where v.VoteTypeId = 3) as DownvotesGiven,
+        coalesce(sum(case when v.VoteTypeId = 8 then v.BountyAmount else 0 end),0) as TotalBountyGiven
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostMetrics as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        length(p.Body) as BodyLength,
+        (length(coalesce(p.Tags, '')) - length(replace(coalesce(p.Tags, ''), '<', ''))) as TagCount,
+        case when p.AcceptedAnswerId is not null then 1 else 0 end as HasAcceptedAnswer,
+        case when p.ClosedDate is not null then 1 else 0 end as IsClosed,
+        row_number() over (partition by p.PostTypeId order by p.Score desc) as RankWithinType
+    from Posts p
+),
+ComplexPostLinkDetails as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name as LinkTypeName,
+        pl.CreationDate as LinkCreation,
+        p1.PostTypeId as PostType,
+        p2.PostTypeId as RelatedPostType,
+        case when p1.ClosedDate is null then 'Open' else 'Closed' end as PostStatus,
+        case when p2.ClosedDate is null then 'Open' else 'Closed' end as RelatedPostStatus
+    from PostLinks pl
+    join LinkTypes lt on pl.LinkTypeId = lt.Id
+    join Posts p1 on pl.PostId = p1.Id
+    join Posts p2 on pl.RelatedPostId = p2.Id
+),
+FinalAggregated AS (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        ua.QuestionsCount,
+        ua.AnswersCount,
+        ua.CommentsCount,
+        ua.UpvotesGiven,
+        ua.DownvotesGiven,
+        ua.TotalBountyGiven,
+        max(pm.BodyLength) filter (where pm.PostTypeId = 1) as MaxQuestionBodyLength,
+        max(pm.BodyLength) filter (where pm.PostTypeId = 2) as MaxAnswerBodyLength,
+        avg(pm.Score) filter (where pm.PostTypeId = 1) as AvgQuestionScore,
+        avg(pm.Score) filter (where pm.PostTypeId = 2) as AvgAnswerScore,
+        count(distinct pt.Id) filter (where pt.PostTypeId = 1 and pt.IsClosed = 1) as ClosedQuestions,
+        count(distinct pt.Id) filter (where pt.PostTypeId = 1 and pt.HasAcceptedAnswer = 1) as QuestionsWithAcceptedAnswer,
+        case when ua.QuestionsCount = 0 then null else
+            count(distinct pt.Id) filter (where pt.PostTypeId = 1 and pt.HasAcceptedAnswer = 1)::float / ua.QuestionsCount end as AcceptanceRatio,
+        string_agg(distinct rt.TagName, ', ') filter (where rt.Level = 1) as RequiredTopLevelTags
+    from Users u
+    left join UserActivitySummary ua on ua.UserId = u.Id
+    left join PostMetrics pm on pm.PostTypeId in (1,2) and pm.Id in (select Id from Posts where OwnerUserId = u.Id)
+    left join RecursiveTagPaths rt on rt.Level = 1
+    left join Posts pt on pt.OwnerUserId = u.Id and pt.PostTypeId = 1
+    group by u.Id, u.DisplayName, ua.QuestionsCount, ua.AnswersCount, ua.CommentsCount, ua.UpvotesGiven, ua.DownvotesGiven, ua.TotalBountyGiven
+)
+select
+    f.UserId,
+    f.DisplayName,
+    f.QuestionsCount,
+    f.AnswersCount,
+    f.CommentsCount,
+    f.UpvotesGiven,
+    f.DownvotesGiven,
+    f.TotalBountyGiven,
+    f.MaxQuestionBodyLength,
+    f.MaxAnswerBodyLength,
+    round(f.AvgQuestionScore::numeric,2) as AvgQuestionScore,
+    round(f.AvgAnswerScore::numeric,2) as AvgAnswerScore,
+    f.ClosedQuestions,
+    f.QuestionsWithAcceptedAnswer,
+    round(f.AcceptanceRatio::numeric,4) as AcceptanceRatio,
+    coalesce(f.RequiredTopLevelTags, 'N/A') as RequiredTopLevelTags,
+    (
+        select count(distinct pl.PostId)
+        from PostLinks pl
+        join Posts p on pl.PostId = p.Id
+        where p.OwnerUserId = f.UserId and pl.LinkTypeId = 3
+    ) as UserDuplicatesCount,
+    (
+        select avg(p.Score)
+        from Posts p
+        where p.OwnerUserId = f.UserId and p.PostTypeId = 2 and p.AcceptedAnswerId is not null
+    ) as AvgScoreOnAcceptedAnswers,
+    (
+        select Count(*)>0
+        from Badges b
+        where b.UserId = f.UserId and b.Class = 1 and b.Name ilike '%legend%'
+    ) as HasLegendaryGoldBadge,
+    (
+        select json_agg(json_build_object('QuestionId', pq.QuestionId, 'Title', pq.Title, 'Score', pq.QuestionScore, 'AnswersCount', pq.AnswersCount, 'AcceptedAnswerScore', pq.AcceptedAnswerScore))
+        from TopQuestionsWithAnswers pq
+        where pq.QuestionOwner = f.DisplayName and pq.RankByScoreView <= 3
+    ) as TopQuestionsSample
+from FinalAggregated f
+where f.QuestionsCount > 20
+order by f.QuestionsCount desc, f.AnswersCount desc
+limit 25;

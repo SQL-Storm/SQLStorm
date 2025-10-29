@@ -1,0 +1,193 @@
+-- {"query": "4894.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1411} 
+
+WITH
+  HighReputationUsers AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      ROW_NUMBER() OVER (
+        ORDER BY
+          u.Reputation DESC,
+          u.CreationDate ASC
+      ) AS Rank
+    FROM
+      Users AS u
+    WHERE
+      u.Reputation > 50000
+  ),
+  RecentQuestions AS (
+    SELECT
+      p.Id AS QuestionId,
+      p.Title,
+      p.OwnerUserId,
+      p.CreationDate AS QuestionCreationDate,
+      p.AnswerCount,
+      p.Score AS QuestionScore,
+      p.FavoriteCount,
+      CASE
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        ELSE 'Open'
+      END AS QuestionStatus
+    FROM
+      Posts AS p
+    WHERE
+      p.PostTypeId = 1
+      AND p.CreationDate >= DATE('now', '-90 day')
+  ),
+  AnswersPerQuestion AS (
+    SELECT
+      pr.Id AS AnswerId,
+      pr.ParentId AS QuestionId,
+      pr.OwnerUserId AS AnswererUserId,
+      pr.CreationDate AS AnswerCreationDate,
+      pr.Score AS AnswerScore,
+      ROW_NUMBER() OVER (
+        PARTITION BY
+          pr.ParentId
+        ORDER BY
+          pr.Score DESC,
+          pr.CreationDate ASC
+      ) AS AnswerRank
+    FROM
+      Posts AS pr
+    WHERE
+      pr.PostTypeId = 2
+  ),
+  QuestionAnswerStats AS (
+    SELECT
+      rq.QuestionId,
+      rq.Title,
+      u.DisplayName AS OwnerDisplayName,
+      rq.QuestionCreationDate,
+      rq.AnswerCount,
+      rq.QuestionScore,
+      rq.FavoriteCount,
+      rq.QuestionStatus,
+      COALESCE(MAX(apq.AnswerScore), 0) AS MaxAnswerScore,
+      COUNT(apq.AnswerId) AS TotalAnswers,
+      AVG(apq.AnswerScore) AS AvgAnswerScore,
+      SUM(CASE WHEN apq.AnswerRank = 1 THEN 1 ELSE 0 END) AS HasAcceptedAnswer
+    FROM
+      RecentQuestions AS rq
+      LEFT JOIN Users AS u
+        ON rq.OwnerUserId = u.Id
+      LEFT JOIN AnswersPerQuestion AS apq
+        ON rq.QuestionId = apq.QuestionId
+    GROUP BY
+      rq.QuestionId,
+      rq.Title,
+      u.DisplayName,
+      rq.QuestionCreationDate,
+      rq.AnswerCount,
+      rq.QuestionScore,
+      rq.FavoriteCount,
+      rq.QuestionStatus
+  )
+SELECT
+  qas.QuestionId,
+  qas.Title,
+  qas.OwnerDisplayName,
+  qas.QuestionCreationDate,
+  qas.QuestionStatus,
+  qas.QuestionScore,
+  qas.FavoriteCount,
+  qas.TotalAnswers,
+  qas.AvgAnswerScore,
+  qas.MaxAnswerScore,
+  CASE
+    WHEN qas.QuestionScore > 0
+    AND qas.AvgAnswerScore > 0 THEN CAST(
+      (
+        qas.QuestionScore + qas.AvgAnswerScore
+      ) AS REAL
+    ) / qas.TotalAnswers
+    WHEN qas.QuestionScore > 0 THEN CAST(
+      qas.QuestionScore AS REAL
+    ) / qas.TotalAnswers
+    WHEN qas.AvgAnswerScore > 0 THEN CAST(
+      qas.AvgAnswerScore AS REAL
+    ) / qas.TotalAnswers
+    ELSE 0
+  END AS ScoreRatio,
+  CASE
+    WHEN hru.UserId IS NOT NULL THEN 'High Rep User'
+    ELSE 'Regular User'
+  END AS OwnerReputationCategory,
+  CONCAT(
+    SUBSTRING(qas.Title, 1, 50),
+    CASE
+      WHEN LENGTH(qas.Title) > 50 THEN '...'
+      ELSE ''
+    END
+  ) AS ShortTitle,
+  CASE
+    WHEN EXISTS (
+      SELECT
+        1
+      FROM
+        PostLinks AS pl
+      WHERE
+        pl.PostId = qas.QuestionId
+        AND pl.LinkTypeId = 3
+    ) THEN 'Is Duplicate'
+    ELSE 'Not Explicitly Duplicate'
+  END AS LinkStatus
+FROM
+  QuestionAnswerStats AS qas
+LEFT JOIN HighReputationUsers AS hru
+  ON qas.OwnerUserId = hru.UserId
+WHERE
+  qas.TotalAnswers > 0
+  AND qas.QuestionScore > (
+    SELECT
+      AVG(p.Score)
+    FROM
+      Posts AS p
+    WHERE
+      p.PostTypeId = 1
+      AND p.CreationDate >= DATE('now', '-90 day')
+  )
+UNION
+SELECT
+  rq.QuestionId,
+  rq.Title,
+  u.DisplayName AS OwnerDisplayName,
+  rq.QuestionCreationDate,
+  rq.QuestionStatus,
+  rq.QuestionScore,
+  rq.FavoriteCount,
+  0 AS TotalAnswers,
+  0.0 AS AvgAnswerScore,
+  0 AS MaxAnswerScore,
+  CAST(rq.QuestionScore AS REAL) AS ScoreRatio,
+  CASE
+    WHEN hru.UserId IS NOT NULL THEN 'High Rep User'
+    ELSE 'Regular User'
+  END AS OwnerReputationCategory,
+  CONCAT(
+    SUBSTRING(rq.Title, 1, 50),
+    CASE
+      WHEN LENGTH(rq.Title) > 50 THEN '...'
+      ELSE ''
+    END
+  ) AS ShortTitle,
+  'No Answers' AS LinkStatus
+FROM
+  RecentQuestions AS rq
+LEFT JOIN Users AS u
+  ON rq.OwnerUserId = u.Id
+LEFT JOIN HighReputationUsers AS hru
+  ON rq.OwnerUserId = hru.UserId
+WHERE
+  rq.QuestionId NOT IN (
+    SELECT
+      QuestionId
+    FROM
+      QuestionAnswerStats
+  )
+ORDER BY
+  QuestionCreationDate DESC,
+  QuestionScore DESC
+LIMIT 1000;

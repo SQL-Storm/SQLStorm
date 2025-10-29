@@ -1,0 +1,296 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COUNT(DISTINCT v.Id) as VoteCount,
+        COALESCE(SUM(p.Score), 0) as TotalPostScore,
+        COALESCE(SUM(p.ViewCount), 0) as TotalViewCount,
+        MAX(p.CreationDate) as LatestPostDate,
+        MAX(c.CreationDate) as LatestCommentDate,
+        MAX(u.CreationDate) as UserCreationDate,
+        CAST('2024-10-01 12:34:56' AS date) - CAST(u.CreationDate AS date) as AccountAgeDays,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Elite'
+            WHEN u.Reputation >= 1000 THEN 'Advanced'
+            WHEN u.Reputation >= 100 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as ReputationTier,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) as ReputationRank,
+        ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) as PostActivityRank,
+        PERCENT_RANK() OVER (ORDER BY u.Reputation) as ReputationPercentile,
+        AVG(p.Score) OVER (PARTITION BY u.Id) as AvgPostScore,
+        NTILE(4) OVER (ORDER BY u.Reputation) as ReputationQuartile
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate
+),
+TopPosts AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ParentId,
+        p.AcceptedAnswerId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END as PostType,
+        COALESCE(p.Tags, '') as CleanTags,
+        CASE 
+            WHEN p.Tags IS NULL OR p.Tags = '' THEN NULL
+            WHEN POSITION('<' IN p.Tags) = 0 THEN NULL
+            ELSE
+                SUBSTRING(p.Tags FROM POSITION('<' IN p.Tags)+1 FOR POSITION('>' IN p.Tags) - POSITION('<' IN p.Tags) - 1)
+        END AS FirstTag,
+        (LENGTH(COALESCE(p.Tags, '')) - LENGTH(REPLACE(COALESCE(p.Tags, ''), '<', ''))) as TagCount,
+        CASE 
+            WHEN p.Score >= 100 THEN 'Hot'
+            WHEN p.Score >= 50 THEN 'Popular'
+            WHEN p.Score >= 10 THEN 'Moderate'
+            ELSE 'Low'
+        END as PopularityLevel,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) as PostRankPerUser,
+        COUNT(*) OVER () as TotalPosts,
+        AVG(p.Score) OVER () as AverageScore
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserPostAnalysis AS (
+    SELECT 
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.PostCount,
+        ua.CommentCount,
+        ua.BadgeCount,
+        ua.VoteCount,
+        ua.TotalPostScore,
+        ua.TotalViewCount,
+        ua.ReputationTier,
+        ua.ReputationRank,
+        T1.PostId as TopPostId,
+        T1.Title as TopPostTitle,
+        T1.Score as TopPostScore,
+        T1.ViewCount as TopPostViewCount,
+        T1.CreationDate as TopPostCreationDate,
+        T1.PostType,
+        T1.FirstTag,
+        T1.TagCount,
+        CASE 
+            WHEN T1.PostType = 'Question' AND T1.AnswerCount = 0 THEN 'Unanswered'
+            WHEN T1.PostType = 'Question' AND T1.AnswerCount > 0 THEN 'Answered'
+            WHEN T1.PostType = 'Answer' AND T1.Score > 0 THEN 'Helpful'
+            ELSE 'Neutral'
+        END as PostCategory,
+        COALESCE(T1.PopularityLevel, 'Unknown') as PopularityLevel,
+        ROUND((CAST(T1.Score AS DOUBLE PRECISION) / NULLIF(ua.TotalPostScore, 0)) * 100, 2) as ScorePercentage,
+        ROUND((CAST(T1.ViewCount AS DOUBLE PRECISION) / NULLIF(ua.TotalViewCount, 0)) * 100, 2) as ViewPercentage,
+        ROW_NUMBER() OVER (PARTITION BY ua.UserId ORDER BY T1.Score DESC) as UserTopPostRank
+    FROM UserActivityStats ua
+    LEFT JOIN TopPosts T1 ON ua.UserId = T1.OwnerUserId
+    WHERE T1.PostRankPerUser = 1 OR T1.PostRankPerUser IS NULL
+),
+QuestionAnalytics AS (
+    SELECT 
+        qa.PostId,
+        qa.Title,
+        qa.Score,
+        qa.ViewCount,
+        qa.CreationDate,
+        qa.OwnerUserId,
+        qa.Tags,
+        qa.AnswerCount,
+        qa.CommentCount,
+        qa.FavoriteCount,
+        qa.PostType,
+        qa.FirstTag,
+        qa.TagCount,
+        qa.PopularityLevel,
+        qa.ScorePercentage,
+        qa.ViewPercentage,
+        CASE 
+            WHEN qa.AnswerCount = 0 THEN 'No Answers'
+            WHEN qa.AnswerCount BETWEEN 1 AND 3 THEN 'Few Answers'
+            WHEN qa.AnswerCount BETWEEN 4 AND 10 THEN 'Moderate Answers'
+            WHEN qa.AnswerCount > 10 THEN 'Many Answers'
+            ELSE 'Unknown'
+        END as AnswerLevelCategory,
+        CASE 
+            WHEN qa.Score > 50 AND qa.ViewCount > 1000 THEN 'High Impact'
+            WHEN qa.Score > 20 OR qa.ViewCount > 500 THEN 'Medium Impact'
+            ELSE 'Low Impact'
+        END as ImpactCategory,
+        CAST('2024-10-01 12:34:56' AS date) - CAST(qa.CreationDate AS date) as DaysSinceCreation,
+        CASE 
+            WHEN (CAST('2024-10-01 12:34:56' AS date) - CAST(qa.CreationDate AS date)) <= 7 THEN 'New'
+            WHEN (CAST('2024-10-01 12:34:56' AS date) - CAST(qa.CreationDate AS date)) BETWEEN 8 AND 30 THEN 'Recent'
+            WHEN (CAST('2024-10-01 12:34:56' AS date) - CAST(qa.CreationDate AS date)) BETWEEN 31 AND 90 THEN 'Old'
+            ELSE 'Very Old'
+        END as AgeCategory,
+        LAG(qa.Score, 1) OVER (ORDER BY qa.CreationDate) as PreviousScore,
+        LEAD(qa.Score, 1) OVER (ORDER BY qa.CreationDate) as NextScore,
+        AVG(qa.Score) OVER (ORDER BY qa.CreationDate ROWS BETWEEN 3 PRECEDING AND 3 FOLLOWING) as MovingAverageScore,
+        NTILE(5) OVER (ORDER BY qa.Score) as ScoreQuintile,
+        PERCENT_RANK() OVER (ORDER BY qa.ViewCount) as ViewPercentile,
+        PERCENT_RANK() OVER (ORDER BY qa.Score) as ScorePercentile,
+        SUBSTRING(qa.Tags FROM 2 FOR (LENGTH(qa.Tags) - 2)) as RawTags,
+        REPLACE(qa.Tags, '<', ',') as CommaSeparatedTags,
+        CASE 
+            WHEN qa.Tags IS NULL THEN NULL
+            ELSE
+                SUBSTRING(REPLACE(qa.Tags, '<', '' ) FROM 1 FOR GREATEST(LENGTH(REPLACE(qa.Tags, '<', '')) - 1,0))
+        END as CleanTagList,
+        CASE WHEN qa.Tags LIKE '%<sql>%' THEN 1 ELSE 0 END as HasSqlTag,
+        CASE WHEN qa.Tags LIKE '%<python>%' THEN 1 ELSE 0 END as HasPythonTag,
+        CASE WHEN qa.Tags LIKE '%<javascript>%' THEN 1 ELSE 0 END as HasJavaScriptTag,
+        qa.PostTypeId
+    FROM TopPosts qa
+    WHERE qa.PostTypeId = 1
+),
+FinalAnalysis AS (
+    SELECT 
+        upa.UserId,
+        upa.DisplayName,
+        upa.Reputation,
+        upa.PostCount,
+        upa.CommentCount,
+        upa.BadgeCount,
+        upa.VoteCount,
+        upa.TotalPostScore,
+        upa.TotalViewCount,
+        upa.ReputationTier,
+        upa.ReputationRank,
+        upa.TopPostId,
+        upa.TopPostTitle,
+        upa.TopPostScore,
+        upa.TopPostViewCount,
+        upa.TopPostCreationDate,
+        upa.PostType,
+        upa.FirstTag,
+        upa.TagCount,
+        upa.PostCategory,
+        upa.PopularityLevel,
+        upa.ScorePercentage,
+        upa.ViewPercentage,
+        upa.UserTopPostRank,
+        qa.Score as QuestionScore,
+        qa.ViewCount as QuestionViewCount,
+        qa.CreationDate as QuestionCreationDate,
+        qa.Tags as QuestionTags,
+        qa.AnswerCount as QuestionAnswerCount,
+        qa.CommentCount as QuestionCommentCount,
+        qa.FavoriteCount as QuestionFavoriteCount,
+        qa.AnswerLevelCategory,
+        qa.ImpactCategory,
+        qa.DaysSinceCreation,
+        qa.AgeCategory,
+        qa.PreviousScore,
+        qa.NextScore,
+        qa.MovingAverageScore,
+        qa.ScoreQuintile,
+        qa.ViewPercentile,
+        qa.ScorePercentile,
+        qa.HasSqlTag,
+        qa.HasPythonTag,
+        qa.HasJavaScriptTag,
+        CASE 
+            WHEN upa.TotalPostScore > 0 THEN ROUND((upa.TotalPostScore * 1.0 / (upa.TotalViewCount + 1)), 2)
+            ELSE 0 
+        END AS ScorePerView,
+        CASE 
+            WHEN upa.Reputation > 0 AND upa.PostCount > 0 THEN ROUND((upa.TotalPostScore * 1.0 / (upa.Reputation * upa.PostCount)), 2)
+            ELSE 0 
+        END AS EfficiencyRatio,
+        COUNT(*) OVER () AS TotalActiveUsers,
+        SUM(CASE WHEN qa.HasSqlTag = 1 THEN 1 ELSE 0 END) OVER () AS TotalSqlQuestions,
+        SUM(CASE WHEN qa.HasPythonTag = 1 THEN 1 ELSE 0 END) OVER () AS TotalPythonQuestions,
+        SUM(CASE WHEN qa.HasJavaScriptTag = 1 THEN 1 ELSE 0 END) OVER () AS TotalJavaScriptQuestions
+    FROM UserPostAnalysis upa
+    LEFT JOIN QuestionAnalytics qa ON upa.TopPostId = qa.PostId
+    WHERE upa.TopPostId IS NOT NULL
+)
+SELECT 
+    UserId,
+    DisplayName,
+    Reputation,
+    PostCount,
+    CommentCount,
+    BadgeCount,
+    VoteCount,
+    TotalPostScore,
+    TotalViewCount,
+    ReputationTier,
+    ReputationRank,
+    TopPostId,
+    TopPostTitle,
+    TopPostScore,
+    TopPostViewCount,
+    TopPostCreationDate,
+    PostType,
+    FirstTag,
+    TagCount,
+    PostCategory,
+    PopularityLevel,
+    ScorePercentage,
+    ViewPercentage,
+    UserTopPostRank,
+    QuestionScore,
+    QuestionViewCount,
+    QuestionCreationDate,
+    QuestionTags,
+    QuestionAnswerCount,
+    QuestionCommentCount,
+    QuestionFavoriteCount,
+    AnswerLevelCategory,
+    ImpactCategory,
+    DaysSinceCreation,
+    AgeCategory,
+    PreviousScore,
+    NextScore,
+    MovingAverageScore,
+    ScoreQuintile,
+    ViewPercentile,
+    ScorePercentile,
+    HasSqlTag,
+    HasPythonTag,
+    HasJavaScriptTag,
+    ScorePerView,
+    EfficiencyRatio,
+    TotalActiveUsers,
+    TotalSqlQuestions,
+    TotalPythonQuestions,
+    TotalJavaScriptQuestions
+FROM FinalAnalysis
+WHERE 
+    Reputation > 1000 
+    AND PostCount > 0 
+    AND (ScorePerView > 0 OR EfficiencyRatio > 0)
+    AND (TotalSqlQuestions > 0 OR TotalPythonQuestions > 0 OR TotalJavaScriptQuestions > 0)
+ORDER BY 
+    Reputation DESC,
+    TotalPostScore DESC,
+    EfficiencyRatio DESC,
+    ScorePerView DESC
+OFFSET 100 ROWS 
+FETCH NEXT 1000 ROWS ONLY;

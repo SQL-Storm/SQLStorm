@@ -1,0 +1,225 @@
+-- {"query": "7681.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2134} 
+WITH QuestionStats AS (
+    SELECT 
+        p.Id as QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        u.Reputation as OwnerReputation,
+        p.Tags,
+        STRING_AGG(CAST(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END AS VARCHAR), ',') AS UpvoteFlags,
+        COUNT(DISTINCT c.Id) as CommentCountActual,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) as DownvoteCount,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 1 THEN v.Id END) as AcceptanceCount,
+        MAX(p.LastActivityDate) as LastActivity,
+        (SELECT COUNT(*) FROM Posts WHERE ParentId = p.Id AND PostTypeId = 2 AND Score > 0) as HighScoreAnswers
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.CreationDate, p.OwnerUserId, u.DisplayName, u.Reputation, p.Tags, p.LastActivityDate
+),
+TopTags AS (
+    SELECT 
+        T.TagName,
+        T.Count as TagCount,
+        RANK() OVER (ORDER BY T.Count DESC) as TagRank,
+        ROW_NUMBER() OVER (PARTITION BY T.IsRequired ORDER BY T.Count DESC) as RequiredTagRank
+    FROM Tags T
+    WHERE T.Count > 1000
+),
+UserActivity AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        NTILE(10) OVER (ORDER BY COALESCE(SUM(p.Score), 0)) as ScoreDecile,
+        AVG(CAST(p.Score AS FLOAT)) as AvgScore,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        STRING_AGG(DISTINCT b.Name, ', ') as BadgesEarned
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(p.Id) > 0
+),
+ComplexAnalysis AS (
+    SELECT 
+        qs.QuestionId,
+        qs.Title,
+        qs.Score,
+        qs.ViewCount,
+        qs.AnswerCount,
+        qs.CommentCountActual,
+        qs.OwnerName,
+        qs.OwnerReputation,
+        qs.Tags,
+        qs.LastActivity,
+        qs.HighScoreAnswers,
+        CASE 
+            WHEN qs.AnswerCount = 0 THEN 'No Answers'
+            WHEN qs.AnswerCount = 1 THEN 'Single Answer'
+            WHEN qs.AnswerCount > 1 AND qs.Score <= 5 THEN 'Multiple Low Score'
+            ELSE 'Multiple High Score'
+        END AS AnswerQuality,
+        CASE 
+            WHEN qs.ViewCount > 1000 THEN 'High View'
+            WHEN qs.ViewCount > 100 THEN 'Medium View'
+            ELSE 'Low View'
+        END AS ViewCategory,
+        COALESCE(NULLIF(qs.CommentCountActual, 0), 1) / NULLIF(qs.AnswerCount + 1, 0) AS CommentToAnswerRatio,
+        DATEDIFF(DAY, qs.CreationDate, CURRENT_TIMESTAMP) AS DaysOld,
+        CASE 
+            WHEN DATEDIFF(DAY, qs.CreationDate, CURRENT_TIMESTAMP) < 30 THEN 'Recent'
+            WHEN DATEDIFF(DAY, qs.CreationDate, CURRENT_TIMESTAMP) > 365 THEN 'Legacy'
+            ELSE 'Stale'
+        END AS QuestionAge,
+        CASE 
+            WHEN qs.Score > 0 THEN 'Positive'
+            WHEN qs.Score = 0 THEN 'Neutral'
+            ELSE 'Negative'
+        END AS ScoreCategory,
+        (SELECT STRING_AGG(
+            CASE 
+                WHEN LENGTH(t) > 0 THEN 
+                    TRIM(UPPER(SUBSTRING(t, 2, LENGTH(t) - 2)))
+                ELSE NULL 
+            END, ' '
+        ) FROM UNNEST(SPLIT(qs.Tags, '><')) AS t) AS CleanedTags
+    FROM QuestionStats qs
+    WHERE qs.CommentCountActual > 0
+),
+CombinedData AS (
+    SELECT 
+        ca.QuestionId,
+        ca.Title,
+        ca.Score,
+        ca.ViewCount,
+        ca.AnswerCount,
+        ca.CommentCountActual,
+        ca.OwnerName,
+        ca.OwnerReputation,
+        ca.Tags,
+        ca.LastActivity,
+        ca.HighScoreAnswers,
+        ca.AnswerQuality,
+        ca.ViewCategory,
+        ca.CommentToAnswerRatio,
+        ca.DaysOld,
+        ca.QuestionAge,
+        ca.ScoreCategory,
+        ca.CleanedTags,
+        ta.TagRank,
+        ta.RequiredTagRank,
+        ua.PostCount,
+        ua.QuestionCount,
+        ua.AnswerCount as UserAnswerCount,
+        ua.TotalScore,
+        ua.ScoreDecile,
+        ua.BadgeCount,
+        CASE 
+            WHEN ua.ScoreDecile <= 2 THEN 'Top Tier'
+            WHEN ua.ScoreDecile <= 5 THEN 'Mid Tier'
+            ELSE 'Lower Tier'
+        END AS UserTier,
+        COALESCE(ua.BadgesEarned, '') as UserBadges,
+        CASE 
+            WHEN LENGTH(ca.CleanedTags) > 0 AND POSITION('SQL' IN ca.CleanedTags) > 0 THEN 1
+            WHEN LENGTH(ca.CleanedTags) > 0 AND POSITION('DATABASE' IN ca.CleanedTags) > 0 THEN 1
+            ELSE 0
+        END AS HasDatabaseKeywords,
+        ROW_NUMBER() OVER (ORDER BY ca.ViewCount DESC) as ViewRanking,
+        RANK() OVER (ORDER BY ca.Score DESC) as ScoreRanking,
+        DENSE_RANK() OVER (ORDER BY ca.LastActivity DESC) as RecentActivityRank,
+        PERCENT_RANK() OVER (ORDER BY ca.ViewCount) as ViewPercentile,
+        PERCENT_RANK() OVER (ORDER BY ca.Score) as ScorePercentile,
+        AVG(ca.Score) OVER() as AvgScoreAcrossQuestions,
+        STDDEV(ca.Score) OVER() as StdDevScoreAcrossQuestions
+    FROM ComplexAnalysis ca
+    LEFT JOIN TopTags ta ON ta.TagName IN (
+        SELECT TRIM(UPPER(SUBSTRING(t, 2, LENGTH(t) - 2))) 
+        FROM UNNEST(SPLIT(ca.Tags, '><')) AS t
+    )
+    LEFT JOIN UserActivity ua ON ua.UserId = ca.OwnerName
+)
+SELECT 
+    cd.QuestionId,
+    cd.Title,
+    cd.Score,
+    cd.ViewCount,
+    cd.AnswerCount,
+    cd.CommentCountActual,
+    cd.OwnerName,
+    cd.OwnerReputation,
+    cd.Tags,
+    cd.LastActivity,
+    cd.HighScoreAnswers,
+    cd.AnswerQuality,
+    cd.ViewCategory,
+    cd.CommentToAnswerRatio,
+    cd.DaysOld,
+    cd.QuestionAge,
+    cd.ScoreCategory,
+    cd.CleanedTags,
+    cd.TagRank,
+    cd.RequiredTagRank,
+    cd.PostCount,
+    cd.QuestionCount,
+    cd.UserAnswerCount,
+    cd.TotalScore,
+    cd.ScoreDecile,
+    cd.BadgeCount,
+    cd.UserTier,
+    cd.UserBadges,
+    cd.HasDatabaseKeywords,
+    cd.ViewRanking,
+    cd.ScoreRanking,
+    cd.RecentActivityRank,
+    cd.ViewPercentile,
+    cd.ScorePercentile,
+    cd.AvgScoreAcrossQuestions,
+    cd.StdDevScoreAcrossQuestions,
+    CASE 
+        WHEN cd.ViewCount > cd.AvgScoreAcrossQuestions AND cd.Score < 0 THEN 'Underperforming'
+        WHEN cd.ViewCount > cd.AvgScoreAcrossQuestions AND cd.Score > cd.AvgScoreAcrossQuestions THEN 'Outperforming'
+        ELSE 'Standard'
+    END AS PerformanceCategory,
+    CASE 
+        WHEN cd.ScorePercentile > 0.8 THEN 'High Score Percentile'
+        WHEN cd.ScorePercentile > 0.6 THEN 'Mid Score Percentile'
+        ELSE 'Low Score Percentile'
+    END AS ScorePerformance,
+    CASE 
+        WHEN cd.ViewPercentile > 0.8 THEN 'High View Percentile'
+        WHEN cd.ViewPercentile > 0.6 THEN 'Mid View Percentile'
+        ELSE 'Low View Percentile'
+    END AS ViewPerformance,
+    CASE 
+        WHEN cd.Score > 0 AND cd.ViewCount > 0 AND cd.Score > cd.ViewCount THEN 'Valuable'
+        WHEN cd.Score <= 0 AND cd.ViewCount > 0 THEN 'Ineffective'
+        ELSE 'Neutral'
+    END AS QuestionValue,
+    CASE 
+        WHEN cd.UserTier = 'Top Tier' AND cd.AnswerQuality = 'Multiple High Score' THEN 'Excellent'
+        WHEN cd.UserTier = 'Mid Tier' AND cd.Score > 10 THEN 'Good'
+        WHEN cd.UserTier = 'Lower Tier' AND cd.Score > 5 THEN 'Decent'
+        ELSE 'Average'
+    END AS QualityAssessment
+FROM CombinedData cd
+WHERE cd.HasDatabaseKeywords = 1
+    AND cd.Score BETWEEN -10 AND 1000
+    AND cd.ViewCount BETWEEN 0 AND 20000
+    AND (cd.TagRank IS NOT NULL OR cd.RequiredTagRank IS NOT NULL)
+    AND (cd.UserBadges IS NOT NULL AND LENGTH(cd.UserBadges) > 0)
+ORDER BY cd.ViewCount DESC, cd.Score DESC, cd.DaysOld ASC
+LIMIT 1000;

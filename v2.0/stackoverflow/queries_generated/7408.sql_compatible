@@ -1,0 +1,246 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT c.Id) as Comments,
+        COUNT(DISTINCT b.Id) as Badges,
+        MAX(p.CreationDate) as LatestPostDate,
+        RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) as PostRank,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) as RepRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= TIMESTAMP '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopTags AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 500 THEN 'Moderate'
+            WHEN t.Count > 100 THEN 'Growing'
+            ELSE 'Niche'
+        END as TagCategory,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as TagRank
+    FROM Tags t
+    WHERE t.Count > 50
+),
+PostComplexity AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.CommentCount,
+        p.AnswerCount,
+        p.CreationDate,
+        p.ParentId,
+        p.OwnerUserId,
+        CASE 
+            WHEN p.ParentId IS NOT NULL THEN 'Answer'
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as PostType,
+        LENGTH(p.Body) as BodyLength,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId IN (2,3)) as VoteCount,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) as CommentCountSub,
+        CASE 
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 1
+            ELSE 0
+        END as HasAcceptedAnswer,
+        CAST(EXTRACT(EPOCH FROM (COALESCE(p.LastActivityDate, p.CreationDate) - p.CreationDate)) / 86400 AS INTEGER) as DaysSinceCreation,
+        NTILE(4) OVER (ORDER BY p.Score DESC) as ScoreQuartile,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags != '' THEN 
+                (SELECT COUNT(*) FROM unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS tag)
+            ELSE 0
+        END as TagCount
+    FROM Posts p
+    WHERE p.CreationDate >= TIMESTAMP '2019-01-01'
+),
+UserPostMetrics AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) as TotalQuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) as TotalAnswerScore,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END) as AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE NULL END) as AvgAnswerScore,
+        MAX(p.Score) as MaxScore,
+        MIN(p.Score) as MinScore,
+        SUM(p.ViewCount) as TotalViews,
+        COUNT(DISTINCT p.ParentId) as AnsweredQuestions,
+        (SELECT COUNT(*) FROM Posts p2 WHERE p2.ParentId = p.Id) as DirectAnswers,
+        (SELECT COUNT(*) FROM Posts p3 WHERE p3.OwnerUserId = u.Id AND p3.PostTypeId = 1 AND p3.Score > 100) as HighScoreQuestions
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id, u.DisplayName
+)
+SELECT 
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.TotalPosts,
+    uas.Questions,
+    uas.Answers,
+    uas.Comments,
+    uas.Badges,
+    uas.LatestPostDate,
+    uas.PostRank,
+    uas.RepRank,
+    CASE 
+        WHEN uas.TotalPosts > 100 THEN 'Veteran'
+        WHEN uas.TotalPosts > 50 THEN 'Experienced'
+        WHEN uas.TotalPosts > 10 THEN 'Active'
+        ELSE 'Beginner'
+    END as UserStatus,
+    tps.TagName,
+    tps.Count as TagCount,
+    tps.TagCategory,
+    tps.TagRank,
+    pcm.PostId,
+    pcm.Title,
+    pcm.BodyLength,
+    pcm.Score,
+    pcm.ViewCount,
+    pcm.AnswerCount,
+    pcm.CommentCount,
+    pcm.HasAcceptedAnswer,
+    pcm.DaysSinceCreation,
+    pcm.ScoreQuartile,
+    pcm.TagCount as PostTagCount,
+    upm.QuestionCount,
+    upm.AnswerCount,
+    upm.TotalQuestionScore,
+    upm.TotalAnswerScore,
+    upm.AvgQuestionScore,
+    upm.AvgAnswerScore,
+    upm.MaxScore,
+    upm.MinScore,
+    upm.TotalViews,
+    upm.AnsweredQuestions,
+    upm.DirectAnswers,
+    upm.HighScoreQuestions,
+    CASE 
+        WHEN upm.TotalAnswerScore > 1000 THEN 'Answerer'
+        WHEN upm.TotalQuestionScore > 1000 THEN 'Questioner'
+        ELSE 'Mixed'
+    END as ContributionType,
+    ROW_NUMBER() OVER (PARTITION BY uas.UserId ORDER BY pcm.Score DESC) as PostRankPerUser,
+    DENSE_RANK() OVER (ORDER BY uas.Reputation DESC, uas.TotalPosts DESC) as OverallRank,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.CreationDate >= TIMESTAMP '2020-01-01') as Posts2020,
+    CASE 
+        WHEN uas.Badges > 0 THEN 'BadgeHolder'
+        ELSE 'NoBadge'
+    END as BadgeStatus,
+    CASE 
+        WHEN uas.Questions > 0 AND uas.Answers > 0 THEN 'Both'
+        WHEN uas.Questions > 0 THEN 'Questioner'
+        WHEN uas.Answers > 0 THEN 'Answerer'
+        ELSE 'Neither'
+    END as ContributionFocus,
+    (SELECT MIN(p1.Score) FROM Posts p1 WHERE p1.OwnerUserId = uas.UserId) as LowestScore,
+    (SELECT MAX(p2.Score) FROM Posts p2 WHERE p2.OwnerUserId = uas.UserId) as HighestScore,
+    (SELECT AVG(p3.Score) FROM Posts p3 WHERE p3.OwnerUserId = uas.UserId) as AvgScore,
+    COALESCE(SUM(p4.Score) OVER (PARTITION BY uas.UserId), 0) as RunningTotalScore,
+    FIRST_VALUE(uas.Reputation) OVER (ORDER BY uas.Reputation DESC ROWS UNBOUNDED PRECEDING) as MaxReputation,
+    CASE 
+        WHEN uas.TotalPosts > (SELECT AVG(TotalPosts) FROM UserActivityStats) THEN 'AboveAverage'
+        ELSE 'BelowAverage'
+    END as PostPerformance,
+    CASE 
+        WHEN uas.Questions > 50 THEN 'HighQuestioner'
+        WHEN uas.Answers > 100 THEN 'HighAnswerer'
+        ELSE 'Normal'
+    END as ActivityLevel,
+    COALESCE((uas.Answers * 100.0 / NULLIF(uas.Questions, 0)), 0) as AnswerToQuestionRatio,
+    CASE 
+        WHEN uas.Reputation > 10000 AND uas.Badges > 10 THEN 'Elite'
+        WHEN uas.Reputation > 5000 AND uas.Badges > 5 THEN 'Senior'
+        WHEN uas.Reputation > 1000 THEN 'Junior'
+        ELSE 'Newbie'
+    END as UserTier,
+    CASE 
+        WHEN uas.TotalPosts > 50 AND uas.Reputation > 1000 AND uas.Badges > 5 THEN 'ActiveContributor'
+        ELSE 'Regular'
+    END as UserClassification,
+    (SELECT COUNT(*) FROM Votes v WHERE v.UserId = uas.UserId AND v.VoteTypeId = 2) as UpvotesReceived,
+    (SELECT COUNT(*) FROM Votes v WHERE v.UserId = uas.UserId AND v.VoteTypeId = 3) as DownvotesReceived,
+    (SELECT COUNT(CASE WHEN vh.PostHistoryTypeId = 10 THEN 1 END) FROM PostHistory vh WHERE vh.UserId = uas.UserId) as CloseVotes,
+    (SELECT COUNT(CASE WHEN vh.PostHistoryTypeId = 12 THEN 1 END) FROM PostHistory vh WHERE vh.UserId = uas.UserId) as DeleteVotes,
+    (SELECT COUNT(DISTINCT vh.PostId) FROM PostHistory vh WHERE vh.UserId = uas.UserId) as TotalActions,
+    (SELECT MAX(vv.CreationDate) FROM Votes vv WHERE vv.UserId = uas.UserId) as LatestVoteDate,
+    (SELECT MIN(vv.CreationDate) FROM Votes vv WHERE vv.UserId = uas.UserId) as FirstVoteDate,
+    CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - uas.LatestPostDate)) / 86400 AS INTEGER) as DaysSinceLastPost,
+    CASE 
+        WHEN uas.RepRank <= 10 THEN 'Top10'
+        WHEN uas.RepRank <= 100 THEN 'Top100'
+        ELSE 'BelowTop100'
+    END as RepCategory,
+    CONCAT(
+        'User_', uas.UserId, 
+        '_', uas.DisplayName,
+        '_', uas.RepRank
+    ) as UserIdentifier
+FROM UserActivityStats uas
+LEFT JOIN TopTags tps ON uas.UserId = uas.UserId 
+LEFT JOIN PostComplexity pcm ON uas.UserId = pcm.OwnerUserId 
+LEFT JOIN UserPostMetrics upm ON uas.UserId = upm.UserId
+WHERE uas.TotalPosts > 5
+  AND uas.Reputation > 100
+  AND uas.LatestPostDate >= TIMESTAMP '2020-01-01'
+  AND (tps.Count IS NOT NULL OR pcm.PostId IS NOT NULL OR upm.UserId IS NOT NULL)
+GROUP BY
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.TotalPosts,
+    uas.Questions,
+    uas.Answers,
+    uas.Comments,
+    uas.Badges,
+    uas.LatestPostDate,
+    uas.PostRank,
+    uas.RepRank,
+    tps.TagName,
+    tps.Count,
+    tps.TagCategory,
+    tps.TagRank,
+    pcm.PostId,
+    pcm.Title,
+    pcm.BodyLength,
+    pcm.Score,
+    pcm.ViewCount,
+    pcm.AnswerCount,
+    pcm.CommentCount,
+    pcm.HasAcceptedAnswer,
+    pcm.DaysSinceCreation,
+    pcm.ScoreQuartile,
+    pcm.TagCount,
+    upm.QuestionCount,
+    upm.AnswerCount,
+    upm.TotalQuestionScore,
+    upm.TotalAnswerScore,
+    upm.AvgQuestionScore,
+    upm.AvgAnswerScore,
+    upm.MaxScore,
+    upm.MinScore,
+    upm.TotalViews,
+    upm.AnsweredQuestions,
+    upm.DirectAnswers,
+    upm.HighScoreQuestions
+ORDER BY uas.Reputation DESC, uas.TotalPosts DESC, uas.LatestPostDate DESC
+LIMIT 1000;

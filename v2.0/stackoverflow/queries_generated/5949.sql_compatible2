@@ -1,0 +1,137 @@
+WITH
+RecentHot AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    ROW_NUMBER() OVER (ORDER BY p.ViewCount DESC, p.Score DESC, p.CreationDate DESC) AS rn
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.ClosedDate IS NULL
+),
+TagStats AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS QuestionCount,
+    AVG(p.Score) AS AvgScore,
+    SUM(p.ViewCount) AS TotalViews
+  FROM Tags t
+  JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+  WHERE p.PostTypeId = 1
+  GROUP BY t.TagName
+),
+UserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS PostCount,
+    SUM(p.ViewCount) AS Views
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+ComplexQuery AS (
+  SELECT
+    rh.PostId,
+    rh.Title,
+    rh.CreationDate,
+    rh.Score,
+    rh.ViewCount,
+    rh.Tags,
+    rh.OwnerUserId,
+    rh.LastActivityDate,
+    COALESCE(vt1.CountLikes, 0) AS UpVotes,
+    COALESCE(vt2.CountDowns, 0) AS DownVotes,
+    CASE
+      WHEN ot.IsModeratorOnly = 1 THEN 'ModOnly'
+      ELSE 'Public'
+    END AS Visibility,
+    CASE
+      WHEN EXISTS (
+        SELECT 1
+        FROM Votes v
+        WHERE v.PostId = rh.PostId
+          AND v.VoteTypeId = 2
+      ) THEN TRUE
+      ELSE FALSE
+    END AS HasUpvoteIndicator,
+    ARRAY_AGG(DISTINCT c.UserDisplayName) FILTER (WHERE c.UserDisplayName IS NOT NULL) AS CommentAuthors
+  FROM RecentHot rh
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS CountLikes
+    FROM Votes
+    WHERE VoteTypeId = 2
+    GROUP BY PostId
+  ) vt1 ON vt1.PostId = rh.PostId
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS CountDowns
+    FROM Votes
+    WHERE VoteTypeId = 3
+    GROUP BY PostId
+  ) vt2 ON vt2.PostId = rh.PostId
+  LEFT JOIN Posts p ON p.Id = rh.PostId
+  LEFT JOIN PostHistory ph ON ph.PostId = rh.PostId AND ph.PostHistoryTypeId = 10
+  LEFT JOIN (
+    SELECT Id, Name, MAX(CASE WHEN IsModeratorOnly = 1 THEN 1 ELSE 0 END) AS IsModeratorOnly
+    FROM Badges
+    GROUP BY Id, Name
+  ) ot ON ot.Id = rh.PostId
+  LEFT JOIN Comments c ON c.PostId = rh.PostId
+  GROUP BY
+    rh.PostId, rh.Title, rh.CreationDate, rh.Score, rh.ViewCount, rh.Tags,
+    rh.OwnerUserId, rh.LastActivityDate, vt1.CountLikes, vt2.CountDowns, ot.IsModeratorOnly
+),
+FinalOutput AS (
+  SELECT
+    cq.PostId,
+    cq.Title,
+    cq.CreationDate,
+    cq.Score,
+    cq.ViewCount,
+    cq.Tags,
+    cq.OwnerUserId,
+    cq.LastActivityDate,
+    cq.UpVotes,
+    cq.DownVotes,
+    cq.Visibility,
+    cq.HasUpvoteIndicator,
+    cq.CommentAuthors,
+    ua.DisplayName AS OwnerDisplayName,
+    ua.Reputation,
+    ua.PostCount AS OwnerPostCount,
+    ua.Views AS OwnerViews,
+    ts.TagName,
+    ts.QuestionCount,
+    ts.AvgScore,
+    ts.TotalViews
+  FROM ComplexQuery cq
+  LEFT JOIN Users ua ON ua.Id = cq.OwnerUserId
+  LEFT JOIN TagStats ts ON POSITION('[' || ts.TagName || ']' IN cq.Tags) > 0
+  LEFT JOIN UserActivity ua2 ON ua2.UserId = cq.OwnerUserId
+)
+SELECT
+  PostId,
+  Title,
+  CreationDate,
+  Score,
+  ViewCount,
+  OwnerDisplayName,
+  Reputation,
+  CommentAuthors,
+  ARRAY_AGG(DISTINCT TagName) AS TopTags,
+  QuestionCount,
+  AvgScore AS AveragePostScore,
+  TotalViews AS TagTotalViews
+FROM FinalOutput
+GROUP BY
+  PostId, Title, CreationDate, Score, ViewCount, OwnerDisplayName, Reputation, CommentAuthors,
+  LastActivityDate, UpVotes, DownVotes, Visibility, HasUpvoteIndicator, OwnerUserId,
+  OwnerPostCount, OwnerViews, AvgScore, TotalViews, QuestionCount
+ORDER BY CreationDate DESC
+LIMIT 100;

@@ -1,0 +1,196 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END), 0) as QuestionCount,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END), 0) as AnswerCount,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END), 0) as TotalQuestionScore,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END), 0) as TotalAnswerScore,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        AVG(CAST(p.Score AS DOUBLE PRECISION)) as AvgPostScore,
+        MAX(p.CreationDate) as LatestPostDate,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY MAX(p.CreationDate) DESC) as PostRank,
+        STRING_AGG(DISTINCT p.Tags, ', ') as AllTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id > 0 
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views
+),
+RankedUsers AS (
+    SELECT 
+        uas.*,
+        RANK() OVER (ORDER BY uas.TotalQuestionScore DESC, uas.TotalAnswerScore DESC) as ScoreRank,
+        DENSE_RANK() OVER (ORDER BY uas.Reputation DESC) as RepRank,
+        NTILE(10) OVER (ORDER BY uas.Views DESC) as ViewQuartile
+    FROM UserActivityStats uas
+),
+TagStats AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            WHEN t.Count > 10 THEN 'Niche'
+            ELSE 'Rare'
+        END as TagCategory,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as PopularityRank
+    FROM Tags t
+),
+PostAnalytics AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        COALESCE(p.AnswerCount, 0) * 100.0 / NULLIF(p.ViewCount, 0) as AnswerViewRatio,
+        CASE 
+            WHEN p.Score > 10 THEN 'High'
+            WHEN p.Score > 5 THEN 'Medium'
+            WHEN p.Score > 0 THEN 'Low'
+            ELSE 'Negative'
+        END as ScoreCategory,
+        EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - p.CreationDate)) as DaysSinceCreation,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PrevPostScore,
+        LEAD(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as NextPostScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as AvgUserScore,
+        COALESCE(p.ViewCount, 0) - COALESCE(LAG(p.ViewCount, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate), 0) as ViewChange
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+FilteredPosts AS (
+    SELECT 
+        pa.*,
+        CASE 
+            WHEN pa.DaysSinceCreation < 30 THEN 'New'
+            WHEN pa.DaysSinceCreation BETWEEN 30 AND 365 THEN 'Established'
+            ELSE 'Legacy'
+        END as PostAgeCategory
+    FROM PostAnalytics pa
+    WHERE pa.Score IS NOT NULL OR pa.ViewCount IS NOT NULL
+),
+CrossUserPostAnalysis AS (
+    SELECT 
+        ru.UserId,
+        ru.DisplayName,
+        ru.QuestionCount,
+        ru.AnswerCount,
+        ru.TotalQuestionScore,
+        ru.TotalAnswerScore,
+        ru.Reputation,
+        ru.Views,
+        ru.ScoreRank,
+        ru.RepRank,
+        ru.ViewQuartile,
+        (SELECT ARRAY_AGG(pa.Id ORDER BY pa.CreationDate DESC) FROM FilteredPosts pa WHERE pa.OwnerUserId = ru.UserId AND pa.PostTypeId = 1 LIMIT 5) as RecentQuestions,
+        (SELECT ARRAY_AGG(pa.Id ORDER BY pa.CreationDate DESC) FROM FilteredPosts pa WHERE pa.OwnerUserId = ru.UserId AND pa.PostTypeId = 2 LIMIT 5) as RecentAnswers,
+        STRING_AGG(CASE WHEN pa.PostTypeId = 1 THEN pa.Title ELSE NULL END, ' | ') as QuestionTitles,
+        STRING_AGG(CASE WHEN pa.PostTypeId = 2 THEN SUBSTRING(pa.Title, 1, 50) ELSE NULL END, ' | ') as AnswerTitles
+    FROM RankedUsers ru
+    LEFT JOIN FilteredPosts pa ON ru.UserId = pa.OwnerUserId
+    WHERE ru.ScoreRank <= 100
+    GROUP BY ru.UserId, ru.DisplayName, ru.QuestionCount, ru.AnswerCount, 
+             ru.TotalQuestionScore, ru.TotalAnswerScore, ru.Reputation, 
+             ru.Views, ru.ScoreRank, ru.RepRank, ru.ViewQuartile
+)
+SELECT 
+    cu.UserId,
+    cu.DisplayName,
+    cu.QuestionCount,
+    cu.AnswerCount,
+    cu.TotalQuestionScore,
+    cu.TotalAnswerScore,
+    cu.Reputation,
+    cu.Views,
+    cu.ScoreRank,
+    cu.RepRank,
+    cu.ViewQuartile,
+    cu.QuestionTitles,
+    cu.AnswerTitles,
+    CASE 
+        WHEN cu.QuestionCount > 0 THEN cu.TotalQuestionScore / cu.QuestionCount
+        ELSE 0
+    END as AvgQuestionScore,
+    CASE 
+        WHEN cu.AnswerCount > 0 THEN cu.TotalAnswerScore / cu.AnswerCount
+        ELSE 0
+    END as AvgAnswerScore,
+    COALESCE((
+        SELECT COUNT(DISTINCT p2.Id) 
+        FROM Posts p2 
+        WHERE p2.OwnerUserId = cu.UserId 
+        AND p2.PostTypeId = 2 
+        AND p2.Score > (
+            SELECT AVG(p3.Score) 
+            FROM Posts p3 
+            WHERE p3.OwnerUserId = cu.UserId 
+            AND p3.PostTypeId = 2
+        )
+        AND p2.CreationDate > (
+            SELECT MAX(ph.CreationDate) 
+            FROM PostHistory ph 
+            WHERE ph.PostId = p2.Id 
+            AND ph.PostHistoryTypeId IN (2, 5)
+        )
+    ), 0) as HighScoringAnswers,
+    COALESCE((
+        SELECT COUNT(DISTINCT p4.Id) 
+        FROM Posts p4 
+        WHERE p4.OwnerUserId = cu.UserId 
+        AND p4.PostTypeId = 1 
+        AND p4.CommentCount > 5
+    ), 0) as HighlyCommentedQuestions,
+    (SELECT COUNT(DISTINCT p5.Id) 
+     FROM Posts p5 
+     WHERE p5.OwnerUserId = cu.UserId 
+     AND p5.PostTypeId = 1 
+     AND p5.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6 months')
+    ) as RecentQuestionsInLast6Months,
+    (SELECT COUNT(DISTINCT p6.Id) 
+     FROM Posts p6 
+     WHERE p6.OwnerUserId = cu.UserId 
+     AND p6.PostTypeId = 2 
+     AND p6.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6 months')
+    ) as RecentAnswersInLast6Months,
+    STRING_AGG(DISTINCT t.TagName, ', ') as AllTagsUserWorksWith,
+    CASE 
+        WHEN cu.QuestionCount > 0 AND cu.AnswerCount > 0 THEN 
+            CAST(cu.QuestionCount AS DOUBLE PRECISION) / NULLIF(cu.AnswerCount, 0)
+        ELSE NULL 
+    END as QuestionAnswerRatio,
+    CASE 
+        WHEN cu.Views > 0 THEN 
+            CAST(cu.TotalQuestionScore + cu.TotalAnswerScore AS DOUBLE PRECISION) / NULLIF(cu.Views, 0)
+        ELSE 0 
+    END as EngagementRate
+FROM CrossUserPostAnalysis cu
+LEFT JOIN Posts pa ON pa.OwnerUserId = cu.UserId
+LEFT JOIN LATERAL (
+    SELECT DISTINCT t.TagName
+    FROM Tags t
+    JOIN LATERAL (
+        SELECT UNNEST(STRING_TO_ARRAY(pa.Tags, '>')) as tag_elem
+    ) te ON TRIM(te.tag_elem) = t.TagName
+    WHERE pa.OwnerUserId = cu.UserId
+) t ON true
+WHERE cu.QuestionCount >= 5 OR cu.AnswerCount >= 10
+GROUP BY cu.UserId, cu.DisplayName, cu.QuestionCount, cu.AnswerCount, 
+         cu.TotalQuestionScore, cu.TotalAnswerScore, cu.Reputation, 
+         cu.Views, cu.ScoreRank, cu.RepRank, cu.ViewQuartile,
+         cu.QuestionTitles, cu.AnswerTitles
+HAVING COALESCE(cu.QuestionCount, 0) + COALESCE(cu.AnswerCount, 0) > 0
+ORDER BY cu.ScoreRank, cu.RepRank, cu.Views DESC
+LIMIT 200;

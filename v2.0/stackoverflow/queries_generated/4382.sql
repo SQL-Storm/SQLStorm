@@ -1,0 +1,209 @@
+-- {"query": "4382.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1905} 
+
+WITH RelevantPosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.AcceptedAnswerId,
+    p.ParentId,
+    p.CreationDate AS PostCreationDate,
+    p.Score AS PostScore,
+    p.ViewCount AS PostViewCount,
+    p.AnswerCount AS PostAnswerCount,
+    p.FavoriteCount AS PostFavoriteCount,
+    p.ClosedDate,
+    pt.Name AS PostTypeName,
+    CASE
+      WHEN p.PostTypeId = 1 THEN 'Q'
+      WHEN p.PostTypeId = 2 THEN 'A'
+      ELSE 'O'
+    END AS PostTypeAbbreviation,
+    LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostScore,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserPostRank
+  FROM Posts AS p
+  JOIN PostTypes AS pt
+    ON p.PostTypeId = pt.Id
+  WHERE
+    p.CreationDate >= '2023-01-01' AND p.OwnerUserId IS NOT NULL
+), UserEngagement AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    u.Views AS UserViews,
+    u.UpVotes AS UserUpVotes,
+    u.DownVotes AS UserDownVotes,
+    COUNT(DISTINCT c.Id) AS CommentCount,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotes,
+    MAX(b.Date) AS LastBadgeDate,
+    COUNT(DISTINCT b.Id) AS BadgeCount
+  FROM Users AS u
+  LEFT JOIN Comments AS c
+    ON u.Id = c.UserId
+  LEFT JOIN Votes AS v
+    ON u.Id = v.UserId
+  LEFT JOIN Badges AS b
+    ON u.Id = b.UserId
+  WHERE
+    u.Id IN (SELECT DISTINCT
+        OwnerUserId
+      FROM Posts
+      WHERE
+        CreationDate >= '2023-01-01')
+  GROUP BY
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes
+), PostPerformance AS (
+  SELECT
+    rp.PostId,
+    rp.PostTypeName,
+    rp.PostTypeAbbreviation,
+    rp.PostCreationDate,
+    rp.PostScore,
+    rp.PostViewCount,
+    rp.PostAnswerCount,
+    rp.PostFavoriteCount,
+    rp.ClosedDate,
+    rp.PreviousPostScore,
+    rp.UserPostRank,
+    ue.UserId,
+    ue.DisplayName AS UserDisplayName,
+    ue.Reputation AS UserReputation,
+    ue.UserCreationDate,
+    ue.UserViews,
+    ue.UserUpVotes,
+    ue.UserDownVotes,
+    ue.CommentCount,
+    ue.TotalUpVotes,
+    ue.TotalDownVotes,
+    ue.LastBadgeDate,
+    ue.BadgeCount,
+    rp.PostScore - rp.PreviousPostScore AS ScoreDelta,
+    CASE
+      WHEN rp.ClosedDate IS NOT NULL THEN 1
+      ELSE 0
+    END AS IsClosed,
+    CASE
+      WHEN rp.PostAnswerCount > 5 THEN 'High'
+      WHEN rp.PostAnswerCount > 2 THEN 'Medium'
+      ELSE 'Low'
+    END AS AnswerBand,
+    COALESCE(rp.PostFavoriteCount, 0) * 1000 AS FavoriteScore,
+    (rp.PostViewCount * 1.0 / NULLIF(rp.PostAnswerCount, 0)) AS ViewToAnswerRatio,
+    UPPER(SUBSTRING(ue.DisplayName, 1, 3)) AS UserInitialPrefix
+  FROM RelevantPosts AS rp
+  JOIN UserEngagement AS ue
+    ON rp.OwnerUserId = ue.UserId
+), LatestEdits AS (
+  SELECT
+    ph.PostId,
+    MAX(ph.CreationDate) AS LatestEditDate
+  FROM PostHistory AS ph
+  WHERE
+    ph.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+  GROUP BY
+    ph.PostId
+)
+SELECT
+  pp.PostId,
+  pp.PostTypeName,
+  pp.PostTypeAbbreviation,
+  pp.PostCreationDate,
+  pp.PostScore,
+  pp.PostViewCount,
+  pp.PostAnswerCount,
+  pp.PostFavoriteCount,
+  pp.ClosedDate,
+  pp.IsClosed,
+  pp.AnswerBand,
+  pp.ScoreDelta,
+  pp.FavoriteScore,
+  pp.ViewToAnswerRatio,
+  pp.UserPostRank,
+  pp.UserId,
+  pp.UserDisplayName,
+  pp.UserReputation,
+  pp.UserCreationDate,
+  pp.UserViews,
+  pp.UserUpVotes,
+  pp.UserDownVotes,
+  pp.CommentCount,
+  pp.TotalUpVotes,
+  pp.TotalDownVotes,
+  pp.LastBadgeDate,
+  pp.BadgeCount,
+  pp.UserInitialPrefix,
+  le.LatestEditDate,
+  DATEDIFF(day, pp.PostCreationDate, le.LatestEditDate) AS DaysSinceLastEdit,
+  CASE
+    WHEN pp.UserReputation > 100000 THEN 'Expert'
+    WHEN pp.UserReputation > 10000 THEN 'Advanced'
+    WHEN pp.UserReputation > 1000 THEN 'Intermediate'
+    ELSE 'Novice'
+  END AS ReputationLevel
+FROM PostPerformance AS pp
+LEFT JOIN LatestEdits AS le
+  ON pp.PostId = le.PostId
+WHERE
+  pp.PostScore > 0
+  AND pp.PostViewCount > 100
+  AND pp.UserReputation >= 500
+  AND pp.UserPostRank <= 5
+UNION
+SELECT
+  pp.PostId,
+  pp.PostTypeName,
+  pp.PostTypeAbbreviation,
+  pp.PostCreationDate,
+  pp.PostScore,
+  pp.PostViewCount,
+  pp.PostAnswerCount,
+  pp.PostFavoriteCount,
+  pp.ClosedDate,
+  pp.IsClosed,
+  pp.AnswerBand,
+  pp.ScoreDelta,
+  pp.FavoriteScore,
+  pp.ViewToAnswerRatio,
+  pp.UserPostRank,
+  pp.UserId,
+  pp.UserDisplayName,
+  pp.UserReputation,
+  pp.UserCreationDate,
+  pp.UserViews,
+  pp.UserUpVotes,
+  pp.UserDownVotes,
+  pp.CommentCount,
+  pp.TotalUpVotes,
+  pp.TotalDownVotes,
+  pp.LastBadgeDate,
+  pp.BadgeCount,
+  pp.UserInitialPrefix,
+  le.LatestEditDate,
+  DATEDIFF(day, pp.PostCreationDate, le.LatestEditDate) AS DaysSinceLastEdit,
+  CASE
+    WHEN pp.UserReputation > 100000 THEN 'Expert'
+    WHEN pp.UserReputation > 10000 THEN 'Advanced'
+    WHEN pp.UserReputation > 1000 THEN 'Intermediate'
+    ELSE 'Novice'
+  END AS ReputationLevel
+FROM PostPerformance AS pp
+JOIN Posts AS pa -- Joining to get accepted answer details for questions
+  ON pp.PostId = pa.ParentId AND pp.PostTypeId = 1
+LEFT JOIN LatestEdits AS le
+  ON pp.PostId = le.PostId
+WHERE
+  pp.PostScore > 0
+  AND pp.PostViewCount > 100
+  AND pp.UserReputation >= 500
+  AND pp.UserPostRank <= 5
+  AND pp.PostTypeAbbreviation = 'Q'
+  AND pa.AcceptedAnswerId IS NOT NULL;

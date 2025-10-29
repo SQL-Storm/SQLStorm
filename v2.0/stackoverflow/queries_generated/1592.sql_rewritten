@@ -1,0 +1,175 @@
+-- {"query": "1592.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2755} 
+WITH UserPostActivity AS (
+    -- CTE 1: Aggregates user activity, including post counts, score sums, and comment counts.
+    -- Uses COALESCE for display names and string functions for AboutMe.
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        COALESCE(U.AboutMe, '') AS AboutMeContent,
+        U.Reputation,
+        U.Views AS UserProfileViews,
+        U.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsAsked,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersGiven,
+        SUM(COALESCE(P.Score, 0)) AS TotalPostScore,
+        SUM(COALESCE(P.ViewCount, 0)) AS TotalPostViewCount,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        MAX(P.LastActivityDate) AS LastPostActivityDate,
+        LENGTH(COALESCE(U.AboutMe, '')) AS AboutMeLength
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    GROUP BY U.Id, U.DisplayName, U.AboutMe, U.Reputation, U.Views, U.CreationDate
+    HAVING COUNT(DISTINCT P.Id) > 0 -- Only users with at least one post
+),
+QuestionTagAnalysis AS (
+    -- CTE 2: Analyzes questions, their tags, acceptance status, and related links.
+    -- Demonstrates string_to_array, UNNEST (implicitly if supported, otherwise LIKE), and conditional logic.
+    SELECT
+        Q.Id AS QuestionId,
+        Q.OwnerUserId,
+        Q.CreationDate AS QuestionCreationDate,
+        Q.Score AS QuestionScore,
+        Q.ViewCount AS QuestionViewCount,
+        Q.AnswerCount,
+        Q.AcceptedAnswerId,
+        Q.Title AS QuestionTitle,
+        Q.Tags AS QuestionTagsRaw,
+        (SELECT COUNT(DISTINCT V.UserId) FROM Votes V WHERE V.PostId = Q.Id AND V.VoteTypeId = 5) AS FavoriteCountActual, -- Correlated subquery for actual favorites
+        CASE
+            WHEN Q.AcceptedAnswerId IS NOT NULL THEN 'Accepted'
+            WHEN Q.ClosedDate IS NOT NULL THEN 'Closed'
+            ELSE 'Open'
+        END AS QuestionStatus,
+        SUM(CASE WHEN LT.Name = 'Linked' THEN 1 ELSE 0 END) AS LinkedPostsCount,
+        SUM(CASE WHEN LT.Name = 'Duplicate' THEN 1 ELSE 0 END) AS DuplicateLinksCount,
+        COALESCE(Q.ClosedDate, '9999-12-31'::timestamp) AS ClosedDateCoalesced
+    FROM Posts Q
+    LEFT JOIN PostLinks PL ON Q.Id = PL.PostId
+    LEFT JOIN LinkTypes LT ON PL.LinkTypeId = LT.Id
+    WHERE Q.PostTypeId = 1 -- Only questions
+    GROUP BY Q.Id, Q.OwnerUserId, Q.CreationDate, Q.Score, Q.ViewCount, Q.AnswerCount, Q.AcceptedAnswerId, Q.Title, Q.Tags, Q.ClosedDate
+),
+ModerationEventLog AS (
+    -- CTE 3: Tracks specific moderation events for posts.
+    -- Uses specific PostHistoryTypeIds and CASE statements.
+    SELECT
+        PH.PostId,
+        PH.CreationDate AS EventDate,
+        PHT.Name AS EventTypeName,
+        PH.UserId AS ModeratorUserId,
+        COALESCE(CR.Name, PH.Comment) AS CloseReasonOrComment,
+        ROW_NUMBER() OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate DESC) AS rn_latest_event,
+        LAG(PH.CreationDate, 1) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) AS PreviousEventDate
+    FROM PostHistory PH
+    JOIN PostHistoryTypes PHT ON PH.PostHistoryTypeId = PHT.Id
+    LEFT JOIN CloseReasonTypes CR ON PH.PostHistoryTypeId = 10 AND PH.Comment IS NOT NULL AND PH.Comment ~ '^[0-9]+$' AND CR.Id = PH.Comment::smallint
+    WHERE PH.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20) -- Closed, Reopened, Deleted, Undeleted, Locked, Unlocked, Protected, Unprotected
+)
+-- Main Query: Combines all CTEs, applies window functions, complex predicates, and set operators.
+SELECT
+    UPA.UserId,
+    UPA.DisplayName,
+    UPA.Reputation,
+    UPA.TotalQuestionsAsked,
+    UPA.TotalAnswersGiven,
+    UPA.TotalPostScore,
+    UPA.TotalCommentsMade,
+    QTA.QuestionId,
+    QTA.QuestionTitle,
+    QTA.QuestionScore,
+    QTA.QuestionViewCount,
+    QTA.FavoriteCountActual,
+    QTA.QuestionStatus,
+    QTA.LinkedPostsCount,
+    QTA.DuplicateLinksCount,
+    MEL.EventDate AS LastModerationEventDate,
+    MEL.EventTypeName AS LastModerationEventType,
+    COALESCE(U_Mod.DisplayName, MEL.ModeratorUserId::varchar) AS ModeratorDisplayName,
+    SUBSTRING(UPA.AboutMeContent, 1, 100) AS AboutMeExcerpt,
+    -- Window functions
+    RANK() OVER (PARTITION BY EXTRACT(YEAR FROM UPA.UserCreationDate) ORDER BY UPA.Reputation DESC, UPA.TotalPostScore DESC) AS RankByReputationInYear,
+    AVG(QTA.QuestionScore) OVER (PARTITION BY UPA.UserId) AS AvgQuestionScoreByUser,
+    NTH_VALUE(QTA.QuestionTitle, 1) OVER (PARTITION BY UPA.UserId ORDER BY QTA.QuestionViewCount DESC NULLS LAST) AS MostViewedQuestionByOwner,
+    -- Complex calculation and predicates
+    (UPA.TotalAnswersGiven * 100.0 / NULLIF(UPA.TotalPosts, 0)) AS AnswerPostRatio,
+    CASE
+        WHEN UPA.Reputation >= 10000 AND UPA.TotalQuestionsAsked >= 50 THEN 'High Impact User'
+        WHEN UPA.Reputation >= 5000 AND UPA.TotalAnswersGiven >= 100 THEN 'Prodigious Answerer'
+        WHEN UPA.UserProfileViews > 5000 AND UPA.AboutMeLength > 100 THEN 'Engaged Personality'
+        ELSE 'Regular Contributor'
+    END AS UserCategory,
+    -- String array and filtering with ILIKE
+    EXISTS (SELECT 1 FROM UNNEST(string_to_array(SUBSTRING(QTA.QuestionTagsRaw, 2, LENGTH(QTA.QuestionTagsRaw) - 2), '><')) AS tag WHERE tag ILIKE '%sql%' OR tag ILIKE '%database%') AS HasDatabaseTags,
+    -- NULL logic (COALESCE already used, also IS NULL/NOT NULL)
+    (QTA.AcceptedAnswerId IS NOT NULL AND QTA.QuestionCreationDate < QTA.ClosedDateCoalesced) AS AcceptedBeforeClosed,
+    B.Name AS BadgeName,
+    B.Class AS BadgeClass,
+    LAG(B.Date, 1) OVER (PARTITION BY UPA.UserId ORDER BY B.Date) AS PreviousBadgeDate
+FROM UserPostActivity UPA
+LEFT JOIN QuestionTagAnalysis QTA ON UPA.UserId = QTA.OwnerUserId
+LEFT JOIN (SELECT PostId, EventDate, EventTypeName, ModeratorUserId, CloseReasonOrComment FROM ModerationEventLog WHERE rn_latest_event = 1) MEL
+    ON QTA.QuestionId = MEL.PostId
+LEFT JOIN Users U_Mod ON MEL.ModeratorUserId = U_Mod.Id -- Moderator's display name
+LEFT JOIN Badges B ON UPA.UserId = B.UserId
+WHERE UPA.UserCreationDate >= '2010-01-01'::timestamp
+  AND UPA.TotalPostScore > 10
+  AND (QTA.QuestionViewCount > 1000 OR QTA.FavoriteCountActual > 10 OR UPA.UserProfileViews > 500)
+  AND (UPA.DisplayName IS NOT NULL AND UPA.DisplayName <> '')
+  AND (UPA.AboutMeContent LIKE '%Stack%' OR QTA.QuestionTagsRaw ILIKE '%<sql>%' OR QTA.QuestionTagsRaw ILIKE '%<database>%')
+  AND (MEL.EventDate IS NOT NULL OR B.Class IN (1,2)) -- At least one of moderation or badge present
+  AND UPA.TotalAnswersGiven > 0
+
+UNION ALL
+
+-- Second part of the UNION ALL: Users with high reputation, many answers, but few questions,
+-- and who have edited their posts frequently. This section focuses more on answerers with editing history.
+SELECT
+    U.Id AS UserId,
+    U.DisplayName,
+    U.Reputation,
+    SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsAsked,
+    SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersGiven,
+    SUM(COALESCE(P.Score, 0)) AS TotalPostScore,
+    COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+    NULL AS QuestionId, -- No specific question focus for this part
+    NULL AS QuestionTitle,
+    NULL AS QuestionScore,
+    NULL AS QuestionViewCount,
+    NULL AS FavoriteCountActual,
+    NULL AS QuestionStatus,
+    NULL AS LinkedPostsCount,
+    NULL AS DuplicateLinksCount,
+    NULL AS LastModerationEventDate,
+    NULL AS LastModerationEventType,
+    NULL AS ModeratorDisplayName,
+    SUBSTRING(COALESCE(U.AboutMe, ''), 1, 100) AS AboutMeExcerpt,
+    NULL AS RankByReputationInYear, -- Window functions not directly comparable across UNION ALL without re-partitioning
+    NULL AS AvgQuestionScoreByUser,
+    NULL AS MostViewedQuestionByOwner,
+    (SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(DISTINCT P.Id), 0)) AS AnswerPostRatio,
+    'Dedicated Answerer & Editor' AS UserCategory,
+    FALSE AS HasDatabaseTags, -- No question context to infer tags
+    NULL AS AcceptedBeforeClosed,
+    B.Name AS BadgeName,
+    B.Class AS BadgeClass,
+    LAG(B.Date, 1) OVER (PARTITION BY U.Id ORDER BY B.Date) AS PreviousBadgeDate
+FROM Users U
+JOIN Posts P ON U.Id = P.OwnerUserId
+LEFT JOIN Comments C ON U.Id = C.UserId
+LEFT JOIN Badges B ON U.Id = B.UserId
+WHERE U.Reputation >= 50000
+  AND P.PostTypeId = 2 -- Only consider answers for this part
+  AND EXISTS (
+      SELECT 1
+      FROM PostHistory PH
+      WHERE PH.PostId = P.Id
+        AND PH.PostHistoryTypeId IN (5, 6) -- Edited body or tags
+        AND PH.UserId = U.Id
+        AND PH.CreationDate > P.CreationDate + INTERVAL '1 hour' -- Edited at least an hour after creation
+  )
+GROUP BY U.Id, U.DisplayName, U.Reputation, U.AboutMe, B.Name, B.Class, B.Date
+HAVING SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) >= 100 -- At least 100 answers
+  AND SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) <= 5 -- Few questions
+ORDER BY Reputation DESC, TotalPostScore DESC;

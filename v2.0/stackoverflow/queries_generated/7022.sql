@@ -1,0 +1,303 @@
+-- {"query": "7022.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2857} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT v.Id) as VoteCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.Views DESC) as RankByReputation,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) as RepRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopUsers AS (
+    SELECT 
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.Views,
+        us.UpVotes,
+        us.DownVotes,
+        us.TotalPosts,
+        us.QuestionCount,
+        us.AnswerCount,
+        us.BadgeCount,
+        us.CommentCount,
+        us.VoteCount,
+        us.LastPostDate,
+        us.LastCommentDate,
+        us.RankByReputation,
+        us.RepRank,
+        CASE 
+            WHEN us.Reputation >= 100000 THEN 'Elite'
+            WHEN us.Reputation >= 10000 THEN 'Veteran'
+            WHEN us.Reputation >= 1000 THEN 'Contributor'
+            ELSE 'Member'
+        END as UserLevel,
+        CASE 
+            WHEN us.QuestionCount > 0 AND (us.AnswerCount * 1.0 / us.QuestionCount) > 2 THEN 'HighRatio'
+            WHEN us.QuestionCount > 0 AND (us.AnswerCount * 1.0 / us.QuestionCount) > 1 THEN 'ModerateRatio'
+            ELSE 'LowRatio'
+        END as AnswerQuestionRatio,
+        DATEDIFF(CURRENT_TIMESTAMP, us.LastPostDate) as DaysSinceLastPost,
+        DATEDIFF(CURRENT_TIMESTAMP, us.LastCommentDate) as DaysSinceLastComment
+    FROM UserActivityStats us
+    WHERE us.RankByReputation <= 1000
+),
+UserStatsWithRankings AS (
+    SELECT 
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.Views,
+        tu.UpVotes,
+        tu.DownVotes,
+        tu.TotalPosts,
+        tu.QuestionCount,
+        tu.AnswerCount,
+        tu.BadgeCount,
+        tu.CommentCount,
+        tu.VoteCount,
+        tu.LastPostDate,
+        tu.LastCommentDate,
+        tu.RankByReputation,
+        tu.RepRank,
+        tu.UserLevel,
+        tu.AnswerQuestionRatio,
+        tu.DaysSinceLastPost,
+        tu.DaysSinceLastComment,
+        NTILE(10) OVER (ORDER BY tu.Reputation DESC) as ReputationDecile,
+        PERCENT_RANK() OVER (ORDER BY tu.Reputation) as ReputationPercentile,
+        -- Complex calculation for engagement score
+        CAST(
+            (tu.Reputation * 0.1) + 
+            (tu.Views * 0.001) + 
+            (tu.UpVotes * 0.5) + 
+            (tu.DownVotes * -0.1) + 
+            (tu.TotalPosts * 1.5) + 
+            (tu.QuestionCount * 2.0) + 
+            (tu.AnswerCount * 0.8) + 
+            (tu.BadgeCount * 10.0) + 
+            (tu.CommentCount * 2.0) + 
+            (tu.VoteCount * 0.3) - 
+            (tu.DaysSinceLastPost * 0.01) - 
+            (tu.DaysSinceLastComment * 0.02)
+        AS DECIMAL(10,2)) as EngagementScore,
+        -- Calculated fields with string manipulation
+        CONCAT(
+            'U', 
+            LPAD(CAST(tu.UserId AS CHAR), 6, '0'), 
+            '_R', 
+            LPAD(CAST(tu.RepRank AS CHAR), 3, '0')
+        ) as UserIdentifier,
+        -- Post analysis
+        CASE 
+            WHEN tu.QuestionCount > 0 THEN 
+                ROUND(tu.AnswerCount * 100.0 / tu.QuestionCount, 2)
+            ELSE 0 
+        END as AnswerPerQuestionRatio
+    FROM TopUsers tu
+),
+EngagementAnalysis AS (
+    SELECT 
+        uswr.UserId,
+        uswr.DisplayName,
+        uswr.Reputation,
+        uswr.Views,
+        uswr.UpVotes,
+        uswr.DownVotes,
+        uswr.TotalPosts,
+        uswr.QuestionCount,
+        uswr.AnswerCount,
+        uswr.BadgeCount,
+        uswr.CommentCount,
+        uswr.VoteCount,
+        uswr.LastPostDate,
+        uswr.LastCommentDate,
+        uswr.RankByReputation,
+        uswr.RepRank,
+        uswr.UserLevel,
+        uswr.AnswerQuestionRatio,
+        uswr.DaysSinceLastPost,
+        uswr.DaysSinceLastComment,
+        uswr.ReputationDecile,
+        uswr.ReputationPercentile,
+        uswr.EngagementScore,
+        uswr.UserIdentifier,
+        uswr.AnswerPerQuestionRatio,
+        -- Advanced calculations with NULL handling
+        COALESCE(uswr.QuestionCount, 0) + COALESCE(uswr.AnswerCount, 0) + 
+        COALESCE(uswr.CommentCount, 0) + COALESCE(uswr.BadgeCount, 0) + 
+        COALESCE(uswr.VoteCount, 0) as TotalEngagementActivities,
+        -- Window functions for comparisons
+        AVG(uswr.Reputation) OVER (PARTITION BY uswr.UserLevel) as AvgReputationByLevel,
+        AVG(uswr.EngagementScore) OVER (PARTITION BY uswr.RepRank) as AvgEngagementByRank,
+        MAX(uswr.Reputation) OVER () as MaxReputation,
+        MIN(uswr.Reputation) OVER () as MinReputation,
+        ROW_NUMBER() OVER (ORDER BY uswr.EngagementScore DESC) as EngagementRankWithinLevel,
+        -- Complex conditional logic
+        CASE 
+            WHEN uswr.Reputation > (SELECT AVG(Reputation) FROM Users WHERE Reputation > 1000) 
+            AND uswr.EngagementScore > 100 THEN 'HighlyEngaged'
+            WHEN uswr.Reputation BETWEEN (SELECT AVG(Reputation) FROM Users WHERE Reputation > 1000) / 2 
+            AND (SELECT AVG(Reputation) FROM Users WHERE Reputation > 1000) 
+            AND uswr.EngagementScore > 50 THEN 'ModeratelyEngaged'
+            ELSE 'LessEngaged'
+        END as EngagementStatus,
+        -- String manipulation and pattern matching
+        CASE 
+            WHEN LENGTH(uswr.DisplayName) > 15 THEN 
+                CONCAT(LEFT(uswr.DisplayName, 10), '...')
+            ELSE uswr.DisplayName 
+        END as ShortDisplayName,
+        -- Calculated time-based metrics
+        DATEDIFF(CURRENT_TIMESTAMP, uswr.LastPostDate) as DaysSinceLastPost,
+        DATEDIFF(CURRENT_TIMESTAMP, uswr.LastCommentDate) as DaysSinceLastComment,
+        CASE 
+            WHEN DATEDIFF(CURRENT_TIMESTAMP, uswr.LastPostDate) > 30 
+            THEN 'Inactive'
+            WHEN DATEDIFF(CURRENT_TIMESTAMP, uswr.LastPostDate) > 7 
+            THEN 'SemiActive'
+            ELSE 'Active'
+        END as PostingActivityLevel
+    FROM UserStatsWithRankings uswr
+),
+FinalAnalysis AS (
+    SELECT 
+        ea.UserId,
+        ea.DisplayName,
+        ea.Reputation,
+        ea.Views,
+        ea.UpVotes,
+        ea.DownVotes,
+        ea.TotalPosts,
+        ea.QuestionCount,
+        ea.AnswerCount,
+        ea.BadgeCount,
+        ea.CommentCount,
+        ea.VoteCount,
+        ea.LastPostDate,
+        ea.LastCommentDate,
+        ea.RankByReputation,
+        ea.RepRank,
+        ea.UserLevel,
+        ea.AnswerQuestionRatio,
+        ea.DaysSinceLastPost,
+        ea.DaysSinceLastComment,
+        ea.ReputationDecile,
+        ea.ReputationPercentile,
+        ea.EngagementScore,
+        ea.UserIdentifier,
+        ea.AnswerPerQuestionRatio,
+        ea.TotalEngagementActivities,
+        ea.AvgReputationByLevel,
+        ea.AvgEngagementByRank,
+        ea.MaxReputation,
+        ea.MinReputation,
+        ea.EngagementRankWithinLevel,
+        ea.EngagementStatus,
+        ea.ShortDisplayName,
+        ea.PostingActivityLevel,
+        -- Advanced ranking logic
+        DENSE_RANK() OVER (ORDER BY ea.EngagementScore DESC, ea.Reputation DESC) as OverallRank,
+        -- Cross-reference with question tags and posts
+        (SELECT COUNT(*) 
+         FROM Posts p 
+         JOIN PostHistory ph ON p.Id = ph.PostId 
+         WHERE p.OwnerUserId = ea.UserId 
+         AND ph.PostHistoryTypeId IN (1, 4, 6) 
+         AND ph.CreationDate > DATE_SUB(CURRENT_TIMESTAMP, INTERVAL 1 YEAR)
+        ) as RecentEditsCount,
+        -- Correlated subqueries
+        (SELECT COUNT(DISTINCT ph.PostId) 
+         FROM PostHistory ph 
+         WHERE ph.UserId = ea.UserId 
+         AND ph.PostHistoryTypeId = 24 
+         AND ph.CreationDate > DATE_SUB(CURRENT_TIMESTAMP, INTERVAL 6 MONTH)
+        ) as SuggestedEditsInLast6Months
+    FROM EngagementAnalysis ea
+    WHERE ea.Reputation > 5000
+      AND ea.TotalEngagementActivities > 10
+      AND ea.EngagementScore > 0
+      AND (ea.DaysSinceLastPost IS NULL OR ea.DaysSinceLastPost <= 180)
+)
+
+SELECT 
+    fa.UserId,
+    fa.DisplayName,
+    fa.Reputation,
+    fa.Views,
+    fa.UpVotes,
+    fa.DownVotes,
+    fa.TotalPosts,
+    fa.QuestionCount,
+    fa.AnswerCount,
+    fa.BadgeCount,
+    fa.CommentCount,
+    fa.VoteCount,
+    fa.LastPostDate,
+    fa.LastCommentDate,
+    fa.RankByReputation,
+    fa.RepRank,
+    fa.UserLevel,
+    fa.AnswerQuestionRatio,
+    fa.DaysSinceLastPost,
+    fa.DaysSinceLastComment,
+    fa.ReputationDecile,
+    fa.ReputationPercentile,
+    fa.EngagementScore,
+    fa.UserIdentifier,
+    fa.AnswerPerQuestionRatio,
+    fa.TotalEngagementActivities,
+    fa.AvgReputationByLevel,
+    fa.AvgEngagementByRank,
+    fa.MaxReputation,
+    fa.MinReputation,
+    fa.EngagementRankWithinLevel,
+    fa.EngagementStatus,
+    fa.ShortDisplayName,
+    fa.PostingActivityLevel,
+    fa.OverallRank,
+    fa.RecentEditsCount,
+    fa.SuggestedEditsInLast6Months,
+    -- Complex predicates
+    CASE 
+        WHEN (fa.QuestionCount > 100 AND fa.AnswerCount > 1000) THEN 'Expert'
+        WHEN (fa.QuestionCount > 50 AND fa.AnswerCount > 500) THEN 'Advanced'
+        WHEN (fa.QuestionCount > 10 AND fa.AnswerCount > 100) THEN 'Intermediate'
+        ELSE 'Beginner'
+    END as SkillLevel,
+    -- Combined conditional expressions
+    CONCAT(
+        CASE WHEN fa.QuestionCount > 10 THEN 'Q' ELSE '' END,
+        CASE WHEN fa.AnswerCount > 100 THEN 'A' ELSE '' END,
+        CASE WHEN fa.BadgeCount > 50 THEN 'B' ELSE '' END,
+        CASE WHEN fa.CommentCount > 1000 THEN 'C' ELSE '' END
+    ) as ActivityIndicators,
+    -- String expressions with NULL handling
+    COALESCE(NULLIF(fa.ShortDisplayName, ''), 'Anonymous') as EffectiveDisplayName,
+    -- Set operators (this is a complex aggregation)
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = fa.UserId AND b.Class = 1) as GoldBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = fa.UserId AND b.Class = 2) as SilverBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = fa.UserId AND b.Class = 3) as BronzeBadges
+FROM FinalAnalysis fa
+WHERE (fa.EngagementScore > 100 OR fa.Reputation > 10000)
+  AND fa.PostingActivityLevel IN ('Active', 'SemiActive')
+  AND fa.AnswerPerQuestionRatio > 0
+ORDER BY fa.OverallRank, fa.EngagementScore DESC, fa.Reputation DESC
+LIMIT 100;

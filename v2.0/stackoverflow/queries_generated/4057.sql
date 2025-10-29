@@ -1,0 +1,178 @@
+-- {"query": "4057.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1398} 
+
+WITH
+  -- Common Table Expression to analyze the most recent edit activity for each post
+  LatestPostEdit AS (
+    SELECT
+      ph.PostId,
+      ph.UserId AS LastEditorUserId,
+      u.DisplayName AS LastEditorDisplayName,
+      ph.CreationDate AS LastEditDate,
+      ROW_NUMBER() OVER (
+        PARTITION BY
+          ph.PostId
+        ORDER BY
+          ph.CreationDate DESC
+      ) as rn
+    FROM
+      PostHistory AS ph
+      JOIN Users AS u ON ph.UserId = u.Id
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 7, 8) -- Edit Title, Edit Body, Rollback Title, Rollback Body
+  ),
+  -- CTE to get the top 3 most voted answers for each question
+  TopAnswers AS (
+    SELECT
+      p.Id AS QuestionId,
+      p.AcceptedAnswerId,
+      p.ParentId,
+      p.Id AS AnswerId,
+      p.OwnerUserId,
+      p.Score AS AnswerScore,
+      ROW_NUMBER() OVER (
+        PARTITION BY
+          p.ParentId
+        ORDER BY
+          p.Score DESC
+      ) AS rn
+    FROM
+      Posts AS p
+    WHERE
+      p.PostTypeId = 2 -- Answers
+  ),
+  -- CTE to calculate the average score of comments for each post
+  AvgCommentScore AS (
+    SELECT
+      c.PostId,
+      AVG(c.Score) AS AvgScore
+    FROM
+      Comments AS c
+    GROUP BY
+      c.PostId
+  ),
+  -- CTE to identify users who have received at least one gold badge and have asked more than 10 questions
+  ExperiencedQuestioners AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+      COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionCount
+    FROM
+      Users AS u
+      LEFT JOIN Badges AS b ON u.Id = b.UserId
+      LEFT JOIN Posts AS p ON u.Id = p.OwnerUserId
+    GROUP BY
+      u.Id,
+      u.DisplayName
+    HAVING
+      COUNT(CASE WHEN b.Class = 1 THEN 1 END) >= 1
+      AND COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) > 10
+  )
+  -- Final query combining information from multiple CTEs and tables
+  SELECT
+    p.Id AS PostId,
+    pt.Name AS PostType,
+    p.Title,
+    u.DisplayName AS OwnerDisplayName,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    CASE
+      WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+      WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+      ELSE 'Active'
+    END AS PostStatus,
+    CONCAT(
+      COALESCE(p.AnswerCount, 0),
+      ' answers'
+    ) AS AnswerCountStr,
+    acs.AvgScore AS AverageCommentScore,
+    lpe.LastEditDate,
+    lpe.LastEditorDisplayName,
+    CASE
+      WHEN EXISTS (
+        SELECT
+          1
+        FROM
+          PostLinks AS pl
+        WHERE
+          pl.PostId = p.Id
+          AND pl.LinkTypeId = 3 -- Duplicate Link Type
+      ) THEN 'Has Duplicate Link'
+      ELSE 'No Duplicate Link'
+    END AS DuplicateLinkStatus,
+    CONCAT(
+      'Tags: ',
+      p.Tags
+    ) AS FormattedTags,
+    COALESCE(eq.DisplayName, 'N/A') AS ExperiencedQuestioner,
+    CASE
+      WHEN p.OwnerUserId IS NOT NULL AND p.OwnerUserId IN (
+        SELECT
+          UserId
+        FROM
+          Badges
+        WHERE
+          Class = 1
+      ) THEN 'Has Gold Badge'
+      ELSE 'No Gold Badge'
+    END AS OwnerBadgeStatus,
+    -- Calculate a "Engagement Score" using a combination of factors
+    (
+      p.Score * 5
+      + COALESCE(p.ViewCount, 0) * 0.5
+      + COALESCE(p.AnswerCount, 0) * 2
+      + COALESCE(p.CommentCount, 0) * 1
+      + COALESCE(acs.AvgScore, 0) * 3
+      + CASE
+        WHEN lpe.LastEditDate IS NOT NULL THEN 1
+        ELSE 0
+      END * 10
+    ) AS EngagementScore
+  FROM
+    Posts AS p
+    JOIN PostTypes AS pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Users AS u ON p.OwnerUserId = u.Id
+    LEFT JOIN AvgCommentScore AS acs ON p.Id = acs.PostId
+    LEFT JOIN LatestPostEdit AS lpe ON p.Id = lpe.PostId
+    AND lpe.rn = 1
+    LEFT JOIN ExperiencedQuestioners AS eq ON p.OwnerUserId = eq.UserId
+  WHERE
+    p.PostTypeId IN (1, 2) -- Questions and Answers
+    AND p.CreationDate >= '2023-01-01'
+    AND (
+      p.Score > 10
+      OR p.ViewCount > 1000
+      OR p.CommentCount > 5
+    )
+  UNION ALL
+  -- Selecting users who have never earned a badge as a contrast
+  SELECT
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    'No Badge Users',
+    NULL,
+    -1.0 AS EngagementScore -- Assign a very low score for contrast
+  FROM
+    Users AS u
+  WHERE
+    NOT EXISTS (
+      SELECT
+        1
+      FROM
+        Badges AS b
+      WHERE
+        b.UserId = u.Id
+    )
+  LIMIT 5;

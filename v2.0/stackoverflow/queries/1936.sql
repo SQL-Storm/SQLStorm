@@ -1,0 +1,276 @@
+WITH UserBaseStats AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        COALESCE(U.Location, 'Unknown') AS UserLocation,
+        U.Views AS UserProfileViews,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        SUM(COALESCE(P.Score, 0)) AS TotalPostScore,
+        SUM(COALESCE(C.Score, 0)) AS TotalCommentScore,
+        MAX(COALESCE(P.LastActivityDate, C.CreationDate, U.CreationDate)) AS LastUserActivity
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Location, U.Views
+),
+PostTagDetails AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.FavoriteCount,
+        P.ClosedDate,
+        P.AcceptedAnswerId,
+        P.ParentId,
+        CASE
+            WHEN P.PostTypeId = 2 AND Q.AcceptedAnswerId = P.Id THEN 1
+            ELSE 0
+        END AS IsAcceptedAnswer,
+        UpVote.VoteCount AS UpVoteCount,
+        DownVote.VoteCount AS DownVoteCount,
+        TagArray.tags_array AS ParsedTags,
+        CASE WHEN LOWER(P.Body) LIKE '%performance%' OR LOWER(P.Body) LIKE '%optimization%' THEN 1 ELSE 0 END AS HasPerformanceKeyword,
+        CASE WHEN LOWER(P.Body) LIKE '%benchmark%' OR LOWER(P.Body) LIKE '%scaling%' THEN 1 ELSE 0 END AS HasBenchmarkScalingKeyword
+    FROM Posts P
+    LEFT JOIN Posts Q ON P.ParentId = Q.Id AND Q.PostTypeId = 1
+    LEFT JOIN (
+        SELECT V.PostId, COUNT(V.Id) AS VoteCount
+        FROM Votes V
+        WHERE V.VoteTypeId = 2
+        GROUP BY V.PostId
+    ) UpVote ON UpVote.PostId = P.Id
+    LEFT JOIN (
+        SELECT V.PostId, COUNT(V.Id) AS VoteCount
+        FROM Votes V
+        WHERE V.VoteTypeId = 3
+        GROUP BY V.PostId
+    ) DownVote ON DownVote.PostId = P.Id
+    LEFT JOIN (
+        SELECT P_inner.Id AS pid,
+            CASE
+                WHEN P_inner.Tags IS NOT NULL AND LENGTH(P_inner.Tags) > 2
+                THEN (SELECT ARRAY_AGG(tag) FROM (
+                        SELECT TRIM(tag) AS tag
+                        FROM (
+                            SELECT regexp_split_to_table(SUBSTRING(P_inner.Tags FROM 2 FOR (LENGTH(P_inner.Tags) - 2)), '><') AS tag
+                        ) s
+                    ) t
+                )
+                ELSE NULL
+            END AS tags_array
+        FROM Posts P_inner
+    ) TagArray ON TagArray.pid = P.Id
+    WHERE P.OwnerUserId IS NOT NULL AND P.PostTypeId IN (1, 2)
+),
+PostTagExploded AS (
+    SELECT
+        PTD.PostId,
+        PTD.PostTypeId,
+        PTD.OwnerUserId,
+        PTD.PostCreationDate,
+        PTD.PostScore,
+        PTD.ViewCount,
+        PTD.AnswerCount,
+        PTD.FavoriteCount,
+        PTD.ClosedDate,
+        PTD.AcceptedAnswerId,
+        PTD.ParentId,
+        PTD.IsAcceptedAnswer,
+        PTD.UpVoteCount,
+        PTD.DownVoteCount,
+        t.tag AS ParsedTag,
+        PTD.HasPerformanceKeyword,
+        PTD.HasBenchmarkScalingKeyword,
+        PTD.ParsedTags
+    FROM PostTagDetails PTD
+    LEFT JOIN LATERAL (
+        SELECT tag
+        FROM (
+            SELECT UNNEST(PTD.ParsedTags) AS tag
+        ) u
+    ) t ON TRUE
+),
+UserPostAggregates AS (
+    SELECT
+        PTD.OwnerUserId AS UserId,
+        COUNT(DISTINCT PTD.PostId) AS UserTotalPosts,
+        SUM(PTD.PostScore) AS UserTotalPostScore,
+        SUM(COALESCE(PTD.ViewCount, 0)) AS UserTotalPostViews,
+        SUM(CASE WHEN PTD.PostTypeId = 1 THEN 1 ELSE 0 END) AS UserQuestionCount,
+        SUM(CASE WHEN PTD.PostTypeId = 2 THEN 1 ELSE 0 END) AS UserAnswerCount,
+        SUM(CASE WHEN PTD.PostTypeId = 1 AND PTD.ClosedDate IS NOT NULL THEN 1 ELSE 0 END) AS UserClosedQuestionCount,
+        SUM(CASE WHEN PTD.IsAcceptedAnswer = 1 THEN 1 ELSE 0 END) AS UserAcceptedAnswerCount,
+        SUM(COALESCE(PTD.UpVoteCount,0)) AS UserTotalPostUpVotes,
+        SUM(COALESCE(PTD.DownVoteCount,0)) AS UserTotalPostDownVotes,
+        AVG(PTD.PostScore) AS AvgPostScore,
+        MAX(PTD.PostScore) AS MaxPostScore,
+        MAX(PTD.ViewCount) AS MaxPostViewCount,
+        AVG(CASE WHEN PTD.PostTypeId = 1 THEN COALESCE(PTD.AnswerCount, 0) ELSE NULL END) AS AvgAnswersPerQuestion,
+        COUNT(DISTINCT PTE.ParsedTag) AS UniqueTagsPosted,
+        SUM(COALESCE(PTD.HasPerformanceKeyword,0)) AS PerformanceKeywordPosts,
+        SUM(COALESCE(PTD.HasBenchmarkScalingKeyword,0)) AS BenchmarkScalingKeywordPosts,
+        EXTRACT(DAY FROM (MAX(PTD.PostCreationDate) - MIN(PTD.PostCreationDate))) AS DaysActivePosting
+    FROM PostTagDetails PTD
+    LEFT JOIN PostTagExploded PTE ON PTD.PostId = PTE.PostId
+    GROUP BY PTD.OwnerUserId
+),
+UserBadgeSummary AS (
+    SELECT
+        B.UserId,
+        COUNT(CASE WHEN B.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN B.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN B.Class = 3 THEN 1 END) AS BronzeBadges,
+        MAX(B.Date) AS LastBadgeAwardDate
+    FROM Badges B
+    GROUP BY B.UserId
+),
+UserEditHistory AS (
+    SELECT
+        PH.UserId,
+        COUNT(PH.Id) AS TotalPostHistoryEntries,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditCount,
+        SUM(CASE WHEN PH.UserId = P.OwnerUserId AND PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS SelfEditCount,
+        MAX(PH.CreationDate) AS LastEditDate,
+        COUNT(DISTINCT PH.PostId) AS UniquePostsEdited,
+        SUM(CASE
+                WHEN PH.PostHistoryTypeId = 5 AND P.Body IS NOT NULL AND PH.Text IS NOT NULL
+                AND ABS((LENGTH(P.Body) - LENGTH(REPLACE(P.Body, ' ', ''))) - (LENGTH(PH.Text) - LENGTH(REPLACE(PH.Text, ' ', '')))) > 10
+                THEN 1
+                ELSE 0
+            END) AS SignificantBodyEdits
+    FROM PostHistory PH
+    JOIN Posts P ON PH.PostId = P.Id
+    WHERE PH.UserId IS NOT NULL
+    GROUP BY PH.UserId
+),
+UserOverallMetrics AS (
+    SELECT
+        UBS.UserId,
+        UBS.DisplayName,
+        UBS.Reputation,
+        UBS.UserCreationDate,
+        UBS.LastAccessDate,
+        UAS.UserTotalPosts,
+        UAS.UserQuestionCount,
+        UAS.UserAnswerCount,
+        UAS.UserAcceptedAnswerCount,
+        UAS.UserTotalPostScore AS TotalPostScore,
+        UHS.EditCount,
+        UHS.SelfEditCount,
+        UBS.TotalComments,
+        UBS.TotalCommentScore,
+        UBS.UserProfileViews,
+        COALESCE(UBG.GoldBadges, 0) AS GoldBadges,
+        COALESCE(UBG.SilverBadges, 0) AS SilverBadges,
+        COALESCE(UBG.BronzeBadges, 0) AS BronzeBadges,
+        COALESCE(UAS.PerformanceKeywordPosts, 0) AS PerformanceKeywordPosts,
+        COALESCE(UAS.BenchmarkScalingKeywordPosts, 0) AS BenchmarkScalingKeywordPosts,
+        (UBS.Reputation * 0.1) +
+        (COALESCE(UAS.UserAcceptedAnswerCount,0) * 5) +
+        (COALESCE(UAS.UserTotalPostScore,0) * 0.5) +
+        (COALESCE(UBG.GoldBadges, 0) * 10) +
+        (COALESCE(UBG.SilverBadges, 0) * 5) +
+        (COALESCE(UHS.EditCount, 0) * 0.2) AS RawInfluenceScore,
+        RANK() OVER (ORDER BY UBS.Reputation DESC) AS ReputationRank,
+        NTILE(4) OVER (ORDER BY COALESCE(UAS.UserTotalPostScore,0) DESC) AS PostScoreQuartile,
+        AVG(COALESCE(UAS.UserAcceptedAnswerCount,0)) OVER (PARTITION BY (FLOOR(UBS.Reputation / 1000) * 1000)) AS AvgAcceptedAnswersInRepGroup,
+        CASE WHEN EXISTS (
+            SELECT 1
+            FROM PostLinks PL
+            JOIN Posts P_link ON PL.PostId = P_link.Id
+            WHERE P_link.OwnerUserId = UBS.UserId
+            AND PL.LinkTypeId = 3
+        ) THEN 1 ELSE 0 END AS HasSourceDuplicatePosts,
+        (
+            SELECT C.Text
+            FROM Comments C
+            JOIN Posts P_comment ON C.PostId = P_comment.Id
+            WHERE P_comment.OwnerUserId = UBS.UserId
+            AND P_comment.PostTypeId = 1 AND C.Score > 100
+            ORDER BY C.CreationDate DESC
+            FETCH FIRST 1 ROW ONLY
+        ) AS MostRecentCommentOnHighScoreQuestion,
+        COALESCE(UBS.DisplayName, 'N/A') || ' (' || COALESCE(UBS.UserLocation, 'Unknown') || ')' AS UserDisplayInfo,
+        CASE
+            WHEN UBS.LastUserActivity IS NOT NULL AND UBG.LastBadgeAwardDate IS NOT NULL
+            THEN EXTRACT(DAY FROM (UBS.LastUserActivity - UBG.LastBadgeAwardDate))
+            ELSE NULL
+        END AS DaysSinceLastBadgeAward
+    FROM UserBaseStats UBS
+    LEFT JOIN UserPostAggregates UAS ON UBS.UserId = UAS.UserId
+    LEFT JOIN UserBadgeSummary UBG ON UBS.UserId = UBG.UserId
+    LEFT JOIN UserEditHistory UHS ON UBS.UserId = UHS.UserId
+    WHERE
+        UBS.Reputation >= 1000
+        AND COALESCE(UAS.UserTotalPosts, 0) > 10
+        AND (COALESCE(UAS.UserAcceptedAnswerCount, 0) > 0 OR COALESCE(UAS.UserQuestionCount, 0) > 0)
+)
+SELECT
+    UM.UserId,
+    UM.DisplayName,
+    UM.Reputation,
+    UM.UserDisplayInfo,
+    UM.UserTotalPosts,
+    UM.UserQuestionCount,
+    UM.UserAnswerCount,
+    UM.UserAcceptedAnswerCount,
+    UM.TotalPostScore,
+    UM.EditCount,
+    UM.GoldBadges,
+    UM.SilverBadges,
+    UM.RawInfluenceScore,
+    UM.ReputationRank,
+    UM.PostScoreQuartile,
+    UM.AvgAcceptedAnswersInRepGroup,
+    UM.HasSourceDuplicatePosts,
+    UM.MostRecentCommentOnHighScoreQuestion,
+    UM.DaysSinceLastBadgeAward,
+    'HighReputationContributor' AS ImpactCategory
+FROM UserOverallMetrics UM
+WHERE
+    UM.Reputation >= 5000
+    AND COALESCE(UM.UserAcceptedAnswerCount,0) >= 5
+    AND COALESCE(UM.EditCount, 0) >= 10
+    AND COALESCE(UM.PerformanceKeywordPosts, 0) >= 1
+
+UNION ALL
+
+SELECT
+    UM.UserId,
+    UM.DisplayName,
+    UM.Reputation,
+    UM.UserDisplayInfo,
+    UM.UserTotalPosts,
+    UM.UserQuestionCount,
+    UM.UserAnswerCount,
+    UM.UserAcceptedAnswerCount,
+    UM.TotalPostScore,
+    UM.EditCount,
+    UM.GoldBadges,
+    UM.SilverBadges,
+    UM.RawInfluenceScore,
+    UM.ReputationRank,
+    UM.PostScoreQuartile,
+    UM.AvgAcceptedAnswersInRepGroup,
+    UM.HasSourceDuplicatePosts,
+    UM.MostRecentCommentOnHighScoreQuestion,
+    UM.DaysSinceLastBadgeAward,
+    'TopQuestionerAnswerer' AS ImpactCategory
+FROM UserOverallMetrics UM
+WHERE
+    UM.PostScoreQuartile = 1
+    AND COALESCE(UM.UserQuestionCount,0) >= 5
+    AND COALESCE(UM.UserAnswerCount,0) >= 5
+    AND COALESCE(UM.HasSourceDuplicatePosts,0) = 0
+    AND UM.MostRecentCommentOnHighScoreQuestion IS NOT NULL
+
+ORDER BY RawInfluenceScore DESC, Reputation DESC
+FETCH FIRST 1000 ROWS ONLY;

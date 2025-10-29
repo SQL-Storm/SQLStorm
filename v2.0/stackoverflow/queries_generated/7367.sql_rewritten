@@ -1,0 +1,309 @@
+-- {"query": "7367.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2926} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 3 THEN p.Id END) as WikiPosts,
+        COUNT(DISTINCT c.Id) as Comments,
+        COUNT(DISTINCT b.Id) as Badges,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        COALESCE(SUM(p.ViewCount), 0) as TotalViews,
+        AVG(p.Score) as AvgPostScore,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.AnswerCount ELSE 0 END), 0) as TotalAnswers,
+        STRING_AGG(DISTINCT p.Tags, ', ') as AllTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopPerformers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        TotalPosts,
+        Questions,
+        Answers,
+        WikiPosts,
+        Comments,
+        Badges,
+        LastPostDate,
+        LastCommentDate,
+        TotalScore,
+        TotalViews,
+        AvgPostScore,
+        TotalAnswers,
+        AllTags,
+        RANK() OVER (ORDER BY TotalScore DESC) as ScoreRank,
+        RANK() OVER (ORDER BY TotalViews DESC) as ViewRank,
+        RANK() OVER (ORDER BY Reputation DESC) as RepRank,
+        NTILE(4) OVER (ORDER BY TotalScore DESC) as ScoreQuartile
+    FROM UserActivityStats
+),
+UserPostHistory AS (
+    SELECT 
+        ph.UserId,
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        p.Title,
+        p.Body,
+        ph.CreationDate,
+        ph.Comment,
+        ROW_NUMBER() OVER (PARTITION BY ph.UserId, ph.PostId ORDER BY ph.CreationDate) as EditSequence,
+        LAG(ph.CreationDate) OVER (PARTITION BY ph.UserId, ph.PostId ORDER BY ph.CreationDate) as PreviousEditDate,
+        DATEDIFF('MINUTE', LAG(ph.CreationDate) OVER (PARTITION BY ph.UserId, ph.PostId ORDER BY ph.CreationDate), ph.CreationDate) as MinutesBetweenEdits,
+        CASE 
+            WHEN ph.PostHistoryTypeId IN (1, 4, 6) THEN 'Title/Tag Edit'
+            WHEN ph.PostHistoryTypeId IN (2, 5) THEN 'Body Edit'
+            WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20) THEN 'Status Change'
+            ELSE 'Other'
+        END as EditCategory
+    FROM PostHistory ph
+    JOIN Posts p ON ph.PostId = p.Id
+    WHERE ph.UserId IS NOT NULL
+),
+UserEditAnalysis AS (
+    SELECT 
+        UserId,
+        PostId,
+        COUNT(*) as TotalEdits,
+        COUNT(CASE WHEN EditCategory = 'Title/Tag Edit' THEN 1 END) as TitleTagEdits,
+        COUNT(CASE WHEN EditCategory = 'Body Edit' THEN 1 END) as BodyEdits,
+        COUNT(CASE WHEN EditCategory = 'Status Change' THEN 1 END) as StatusChanges,
+        AVG(MinutesBetweenEdits) as AvgMinutesBetweenEdits,
+        MAX(CASE WHEN EditSequence = 1 THEN CreationDate END) as FirstEdit,
+        MAX(CASE WHEN EditSequence = 1 THEN EditCategory END) as FirstEditType,
+        COUNT(DISTINCT EditCategory) as UniqueEditTypes
+    FROM UserPostHistory
+    GROUP BY UserId, PostId
+),
+TagStatistics AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        CASE 
+            WHEN t.Count > 100 THEN 'Popular'
+            WHEN t.Count > 10 THEN 'Moderate'
+            WHEN t.Count > 0 THEN 'Rare'
+            ELSE 'Uncommon'
+        END as PopularityLevel,
+        COALESCE(
+            (SELECT COUNT(*) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%'),
+            0
+        ) as PostsUsingTag
+    FROM Tags t
+),
+TagAnalytics AS (
+    SELECT 
+        *,
+        RANK() OVER (ORDER BY Count DESC) as TagRank,
+        DENSE_RANK() OVER (ORDER BY PopularityLevel, Count DESC) as PopularityRank,
+        PERCENT_RANK() OVER (ORDER BY Count DESC) as Percentile
+    FROM TagStatistics
+),
+ComplexUserAnalysis AS (
+    SELECT 
+        tp.UserId,
+        tp.DisplayName,
+        tp.Reputation,
+        tp.TotalPosts,
+        tp.Questions,
+        tp.Answers,
+        tp.WikiPosts,
+        tp.Comments,
+        tp.Badges,
+        tp.LastPostDate,
+        tp.LastCommentDate,
+        tp.TotalScore,
+        tp.TotalViews,
+        tp.AvgPostScore,
+        tp.TotalAnswers,
+        tp.AllTags,
+        tp.ScoreRank,
+        tp.ViewRank,
+        tp.RepRank,
+        tp.ScoreQuartile,
+        COALESCE(uea.TotalEdits, 0) as TotalEdits,
+        COALESCE(uea.TitleTagEdits, 0) as TitleTagEdits,
+        COALESCE(uea.BodyEdits, 0) as BodyEdits,
+        COALESCE(uea.StatusChanges, 0) as StatusChanges,
+        COALESCE(uea.AvgMinutesBetweenEdits, 0) as AvgMinutesBetweenEdits,
+        CASE 
+            WHEN tp.TotalPosts = 0 THEN 0
+            ELSE CAST(tp.TotalEdits AS FLOAT) / CAST(tp.TotalPosts AS FLOAT)
+        END as EditsPerPost,
+        CASE 
+            WHEN tp.LastPostDate IS NOT NULL THEN DATEDIFF('DAY', tp.LastPostDate, cast('2024-10-01 12:34:56' as timestamp))
+            ELSE 0
+        END as DaysSinceLastPost,
+        CASE 
+            WHEN tp.LastCommentDate IS NOT NULL THEN DATEDIFF('DAY', tp.LastCommentDate, cast('2024-10-01 12:34:56' as timestamp))
+            ELSE 0
+        END as DaysSinceLastComment,
+        CASE 
+            WHEN tp.TotalViews = 0 OR tp.TotalScore = 0 THEN 0
+            ELSE CAST(tp.TotalScore AS FLOAT) / CAST(tp.TotalViews AS FLOAT)
+        END as ScoreToViewsRatio,
+        CASE 
+            WHEN tp.Reputation > 10000 THEN 'Expert'
+            WHEN tp.Reputation > 5000 THEN 'Advanced'
+            WHEN tp.Reputation > 1000 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as UserLevel,
+        CASE 
+            WHEN tp.Comments > 100 THEN 'Active Commenter'
+            WHEN tp.Comments > 10 THEN 'Moderate Commenter'
+            WHEN tp.Comments > 0 THEN 'Light Commenter'
+            ELSE 'No Comments'
+        END as CommentActivity,
+        CASE 
+            WHEN tp.Badges > 50 THEN 'Badge Collector'
+            WHEN tp.Badges > 10 THEN 'Regular Achiever'
+            WHEN tp.Badges > 0 THEN 'New Achiever'
+            ELSE 'No Badges'
+        END as AchievementLevel,
+        CASE 
+            WHEN tp.Questions > 100 THEN 'High Questioner'
+            WHEN tp.Questions > 20 THEN 'Questioner'
+            WHEN tp.Questions > 0 THEN 'Beginner Questioner'
+            ELSE 'No Questions'
+        END as QuestionLevel,
+        CASE 
+            WHEN tp.Answers > 1000 THEN 'High Answerer'
+            WHEN tp.Answers > 100 THEN 'Answerer'
+            WHEN tp.Answers > 0 THEN 'Beginner Answerer'
+            ELSE 'No Answers'
+        END as AnswerLevel
+    FROM TopPerformers tp
+    LEFT JOIN UserEditAnalysis uea ON tp.UserId = uea.UserId
+),
+FinalAnalysis AS (
+    SELECT 
+        *,
+        DENSE_RANK() OVER (ORDER BY ScoreRank, ViewRank) as CombinedRank,
+        ROW_NUMBER() OVER (ORDER BY TotalScore DESC) as ScoreRankRowNumber,
+        RANK() OVER (ORDER BY TotalViews DESC) as ViewRankRowNumber,
+        NTILE(10) OVER (ORDER BY CombinedRank) as PerformanceTier,
+        AVG(TotalScore) OVER () as OverallAvgScore,
+        AVG(TotalViews) OVER () as OverallAvgViews,
+        (TotalScore - AVG(TotalScore) OVER ()) / NULLIF(STDDEV(TotalScore) OVER (), 0) as ScoreZScore,
+        (TotalViews - AVG(TotalViews) OVER ()) / NULLIF(STDDEV(TotalViews) OVER (), 0) as ViewsZScore,
+        CASE 
+            WHEN TotalPosts > 10 AND TotalScore > 500 THEN 'Highly Active'
+            WHEN TotalPosts > 5 AND TotalScore > 100 THEN 'Moderately Active'
+            WHEN TotalPosts > 0 THEN 'Beginner Active'
+            ELSE 'Inactive'
+        END as ActivityLevel
+    FROM ComplexUserAnalysis
+)
+SELECT 
+    fa.UserId,
+    fa.DisplayName,
+    fa.Reputation,
+    fa.TotalPosts,
+    fa.Questions,
+    fa.Answers,
+    fa.WikiPosts,
+    fa.Comments,
+    fa.Badges,
+    fa.LastPostDate,
+    fa.LastCommentDate,
+    fa.TotalScore,
+    fa.TotalViews,
+    fa.AvgPostScore,
+    fa.TotalAnswers,
+    fa.AllTags,
+    fa.ScoreRank,
+    fa.ViewRank,
+    fa.RepRank,
+    fa.ScoreQuartile,
+    fa.TotalEdits,
+    fa.TitleTagEdits,
+    fa.BodyEdits,
+    fa.StatusChanges,
+    fa.AvgMinutesBetweenEdits,
+    fa.EditsPerPost,
+    fa.DaysSinceLastPost,
+    fa.DaysSinceLastComment,
+    fa.ScoreToViewsRatio,
+    fa.UserLevel,
+    fa.CommentActivity,
+    fa.AchievementLevel,
+    fa.QuestionLevel,
+    fa.AnswerLevel,
+    fa.CombinedRank,
+    fa.ScoreRankRowNumber,
+    fa.ViewRankRowNumber,
+    fa.PerformanceTier,
+    fa.OverallAvgScore,
+    fa.OverallAvgViews,
+    fa.ScoreZScore,
+    fa.ViewsZScore,
+    fa.ActivityLevel,
+    CASE 
+        WHEN fa.ViewRank <= 20 THEN 'Top 20 Viewers'
+        WHEN fa.ViewRank <= 50 THEN 'Top 50 Viewers'
+        WHEN fa.ViewRank <= 100 THEN 'Top 100 Viewers'
+        ELSE 'Regular Viewers'
+    END as ViewTier,
+    CASE 
+        WHEN fa.ScoreRank <= 10 THEN 'Top 10 Scorers'
+        WHEN fa.ScoreRank <= 50 THEN 'Top 50 Scorers'
+        WHEN fa.ScoreRank <= 100 THEN 'Top 100 Scorers'
+        ELSE 'Regular Scorers'
+    END as ScoreTier,
+    CASE 
+        WHEN fa.RepRank <= 5 THEN 'Top 5 Reputation'
+        WHEN fa.RepRank <= 20 THEN 'Top 20 Reputation'
+        WHEN fa.RepRank <= 50 THEN 'Top 50 Reputation'
+        ELSE 'Regular Reputation'
+    END as RepTier,
+    CASE 
+        WHEN fa.ScoreZScore > 2 THEN 'Exceptional Score'
+        WHEN fa.ScoreZScore > 1 THEN 'Above Average Score'
+        WHEN fa.ScoreZScore > -1 THEN 'Average Score'
+        WHEN fa.ScoreZScore > -2 THEN 'Below Average Score'
+        ELSE 'Poor Score'
+    END as ScorePerformance,
+    CASE 
+        WHEN fa.ViewsZScore > 2 THEN 'Exceptional View Count'
+        WHEN fa.ViewsZScore > 1 THEN 'Above Average View Count'
+        WHEN fa.ViewsZScore > -1 THEN 'Average View Count'
+        WHEN fa.ViewsZScore > -2 THEN 'Below Average View Count'
+        ELSE 'Poor View Count'
+    END as ViewPerformance,
+    CASE 
+        WHEN fa.EditsPerPost > 3 THEN 'High Editor'
+        WHEN fa.EditsPerPost > 1 THEN 'Moderate Editor'
+        WHEN fa.EditsPerPost > 0 THEN 'Light Editor'
+        ELSE 'No Editor'
+    END as EditingIntensity,
+    CASE 
+        WHEN fa.ScoreToViewsRatio > 0.01 THEN 'High Engagement'
+        WHEN fa.ScoreToViewsRatio > 0.005 THEN 'Moderate Engagement'
+        WHEN fa.ScoreToViewsRatio > 0.001 THEN 'Low Engagement'
+        ELSE 'Minimal Engagement'
+    END as EngagementLevel
+FROM FinalAnalysis fa
+WHERE 
+    fa.Reputation > 500 
+    AND fa.TotalPosts >= 2
+    AND (fa.LastPostDate >= '2020-01-01' OR fa.LastCommentDate >= '2020-01-01')
+    AND fa.UserLevel IN ('Expert', 'Advanced', 'Intermediate')
+ORDER BY fa.TotalScore DESC
+LIMIT 1000;

@@ -1,0 +1,168 @@
+WITH
+  RankedQuestions AS (
+    SELECT
+      Id,
+      OwnerUserId,
+      Title,
+      Tags,
+      AcceptedAnswerId,
+      AnswerCount,
+      FavoriteCount,
+      ViewCount,
+      Score,
+      DENSE_RANK() OVER (ORDER BY ViewCount DESC) AS ViewRank,
+      ROW_NUMBER() OVER (PARTITION BY OwnerUserId ORDER BY CreationDate DESC) AS UserQuestionNum,
+      CreationDate
+    FROM Posts
+    WHERE
+      PostTypeId = 1 AND Title IS NOT NULL AND Tags IS NOT NULL
+  ),
+  UserEngagement AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      COUNT(DISTINCT c.Id) AS CommentCount,
+      COUNT(DISTINCT p.Id) AS PostCount,
+      MAX(p.CreationDate) AS LastPostDate,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvoteCount,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvoteCount,
+      COUNT(DISTINCT b.Id) AS BadgeCount
+    FROM Users AS u
+    LEFT JOIN Posts AS p
+      ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments AS c
+      ON u.Id = c.UserId
+    LEFT JOIN Votes AS v
+      ON u.Id = v.UserId
+    LEFT JOIN Badges AS b
+      ON u.Id = b.UserId
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation
+  ),
+  PopularTags AS (
+    SELECT
+      TagName,
+      Count,
+      ROW_NUMBER() OVER (ORDER BY Count DESC) AS TagRank
+    FROM Tags
+    WHERE
+      TagName IS NOT NULL
+  ),
+  RecentActivity AS (
+    SELECT
+      PostId,
+      PostHistoryTypeId,
+      CreationDate,
+      UserId,
+      ROW_NUMBER() OVER (PARTITION BY PostId ORDER BY CreationDate DESC) AS ActivityRank
+    FROM PostHistory
+    WHERE
+      PostHistoryTypeId IN (2, 4, 5, 6, 8, 9)
+  ),
+  HighScorePosts AS (
+    SELECT
+      p.Id,
+      p.PostTypeId,
+      p.OwnerUserId,
+      p.Title,
+      p.Score,
+      pt.Name AS PostTypeName,
+      CASE WHEN p.OwnerUserId IS NOT NULL THEN u.DisplayName ELSE p.OwnerDisplayName END AS AuthorDisplayName
+    FROM Posts AS p
+    INNER JOIN PostTypes AS pt
+      ON p.PostTypeId = pt.Id
+    LEFT JOIN Users AS u
+      ON p.OwnerUserId = u.Id
+    WHERE
+      p.Score > 1000
+  )
+SELECT
+  rq.Id AS QuestionId,
+  rq.Title AS QuestionTitle,
+  rq.Tags,
+  rq.ViewRank,
+  rq.UserQuestionNum,
+  ue.DisplayName AS UserDisplayName,
+  ue.Reputation AS UserReputation,
+  ue.CommentCount AS UserCommentCount,
+  ue.UpvoteCount AS UserUpvoteCount,
+  ue.DownvoteCount AS UserDownvoteCount,
+  ue.BadgeCount AS UserBadgeCount,
+  COALESCE(
+    (
+      SELECT
+        COUNT(*)
+      FROM PostLinks AS pl
+      WHERE
+        pl.PostId = rq.Id AND pl.LinkTypeId = 3
+    ),
+    0
+  ) AS DuplicateLinkCount,
+  pt.TagName AS MostFrequentTag,
+  COALESCE(hsp.AuthorDisplayName, 'Community') AS HighScoreAuthor,
+  hsp.PostTypeName AS HighScorePostType,
+  hsp.Score AS HighScore,
+  CAST(
+    (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - rq.CreationDate) AS INTERVAL
+  ) AS TimeSinceCreation,
+  /* If a numeric day difference is required, use database-specific functions.
+     Below is a common SQL expression to convert interval to days where supported. */
+  EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - rq.CreationDate)) AS DaysSinceCreation,
+  REPLACE(
+    REPLACE(
+      rq.Title,
+      '?',
+      '!'
+    ),
+    ' ',
+    '_'
+  ) AS ModifiedTitle,
+  CASE
+    WHEN rq.AcceptedAnswerId IS NOT NULL THEN 'Accepted'
+    ELSE 'Not Accepted'
+  END AS AcceptanceStatus,
+  ra.CreationDate AS LastEditDate,
+  ra.UserId AS LastEditorId
+FROM RankedQuestions AS rq
+LEFT JOIN UserEngagement AS ue
+  ON rq.OwnerUserId = ue.UserId
+LEFT JOIN PopularTags AS pt
+  ON pt.TagRank = 1
+LEFT JOIN RecentActivity AS ra
+  ON rq.Id = ra.PostId AND ra.ActivityRank = 1
+LEFT JOIN HighScorePosts AS hsp
+  ON rq.Id = hsp.Id AND hsp.PostTypeId = 1
+WHERE
+  rq.ViewCount > (
+    SELECT
+      AVG(ViewCount)
+    FROM Posts
+    WHERE
+      PostTypeId = 1
+  ) AND ue.Reputation > 5000
+GROUP BY
+  rq.Id,
+  rq.Title,
+  rq.Tags,
+  rq.ViewRank,
+  rq.UserQuestionNum,
+  ue.DisplayName,
+  ue.Reputation,
+  ue.CommentCount,
+  ue.UpvoteCount,
+  ue.DownvoteCount,
+  ue.BadgeCount,
+  pt.TagName,
+  hsp.AuthorDisplayName,
+  hsp.PostTypeName,
+  hsp.Score,
+  rq.CreationDate,
+  ra.CreationDate,
+  ra.UserId,
+  rq.AcceptedAnswerId
+ORDER BY
+  rq.ViewRank,
+  ue.Reputation DESC;

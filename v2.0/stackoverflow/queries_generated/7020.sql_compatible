@@ -1,0 +1,209 @@
+WITH UserPostStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) as TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) as QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) as AnswerCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) as TotalQuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) as TotalAnswerScore,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) as AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) as AvgAnswerScore,
+        MAX(p.CreationDate) as LastPostDate,
+        COUNT(DISTINCT c.Id) as TotalComments,
+        COUNT(DISTINCT b.Id) as TotalBadges,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags) - 2)), '; ') as AllTags,
+        u.CreationDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= TIMESTAMP '2010-01-01 00:00:00'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+RankedUsers AS (
+    SELECT 
+        ups.*,
+        ROW_NUMBER() OVER (ORDER BY TotalQuestionScore DESC, TotalAnswerScore DESC) as RankByScore,
+        RANK() OVER (ORDER BY TotalPosts DESC) as RankByPostCount,
+        DENSE_RANK() OVER (ORDER BY Reputation DESC) as RankByReputation
+    FROM UserPostStats ups
+),
+UserActivity AS (
+    SELECT 
+        r.UserId,
+        r.DisplayName,
+        r.Reputation,
+        r.TotalPosts,
+        r.QuestionCount,
+        r.AnswerCount,
+        r.TotalQuestionScore,
+        r.TotalAnswerScore,
+        r.AvgQuestionScore,
+        r.AvgAnswerScore,
+        r.LastPostDate,
+        r.TotalComments,
+        r.TotalBadges,
+        r.AllTags,
+        r.CreationDate,
+        CASE 
+            WHEN r.TotalPosts > 100 THEN 'High Activity'
+            WHEN r.TotalPosts > 50 THEN 'Medium Activity'
+            ELSE 'Low Activity'
+        END as ActivityLevel,
+        CASE 
+            WHEN r.TotalQuestionScore > 10000 THEN 'Expert Level'
+            WHEN r.TotalQuestionScore > 5000 THEN 'Advanced Level'
+            WHEN r.TotalQuestionScore > 1000 THEN 'Intermediate Level'
+            ELSE 'Beginner Level'
+        END as QuestionSkillLevel,
+        CASE 
+            WHEN r.TotalAnswerScore > 5000 THEN 'Helpful Contributor'
+            WHEN r.TotalAnswerScore > 1000 THEN 'Regular Contributor'
+            ELSE 'New Contributor'
+        END as AnswerContributionLevel,
+        COALESCE(
+            (SELECT p.Title 
+             FROM Posts p 
+             WHERE p.OwnerUserId = r.UserId AND p.PostTypeId = 1 
+             ORDER BY p.CreationDate DESC
+             LIMIT 1), 
+            'No Questions'
+        ) as LatestQuestion,
+        COALESCE(
+            (SELECT p.Title 
+             FROM Posts p 
+             WHERE p.OwnerUserId = r.UserId AND p.PostTypeId = 2 
+             ORDER BY p.CreationDate DESC
+             LIMIT 1), 
+            'No Answers'
+        ) as LatestAnswer,
+        CASE 
+            WHEN EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - r.LastPostDate)) / 86400 <= 30 THEN 'Active'
+            ELSE 'Inactive'
+        END as CurrentActivityStatus,
+        CASE 
+            WHEN r.AllTags IS NOT NULL AND CHAR_LENGTH(r.AllTags) > 0 THEN 
+                SUBSTRING(r.AllTags FROM 1 FOR (POSITION('; ' IN r.AllTags || '; ') - 1))
+            ELSE NULL 
+        END as PrimaryTag,
+        CASE 
+            WHEN r.QuestionCount > 0 THEN (r.AnswerCount::numeric / r.QuestionCount::numeric)
+            ELSE 0 
+        END as AnswerToQuestionRatio,
+        (r.TotalPosts * 0.3 + r.TotalQuestionScore * 0.2 + r.TotalAnswerScore * 0.2 + 
+         r.TotalComments * 0.1 + r.TotalBadges * 0.2) as EngagementScore
+    FROM RankedUsers r
+),
+FinalAnalysis AS (
+    SELECT 
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.TotalPosts,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.TotalQuestionScore,
+        ua.TotalAnswerScore,
+        ua.AvgQuestionScore,
+        ua.AvgAnswerScore,
+        ua.LastPostDate,
+        ua.TotalComments,
+        ua.TotalBadges,
+        ua.AllTags,
+        ua.ActivityLevel,
+        ua.QuestionSkillLevel,
+        ua.AnswerContributionLevel,
+        ua.LatestQuestion,
+        ua.LatestAnswer,
+        ua.CurrentActivityStatus,
+        ua.PrimaryTag,
+        ua.AnswerToQuestionRatio,
+        ua.EngagementScore,
+        ua.CreationDate,
+        CASE 
+            WHEN ua.EngagementScore > 1000 THEN 'Elite Contributor'
+            WHEN ua.EngagementScore > 500 THEN 'Active Contributor'
+            WHEN ua.EngagementScore > 100 THEN 'Regular Contributor'
+            ELSE 'Casual Contributor'
+        END as ContributorTier,
+        CASE 
+            WHEN ua.Reputation > 100000 THEN 'Extreme'
+            WHEN ua.Reputation > 10000 THEN 'High'
+            WHEN ua.Reputation > 1000 THEN 'Moderate'
+            ELSE 'Low'
+        END as ReputationLevel,
+        FLOOR(EXTRACT(DAY FROM AGE(TIMESTAMP '2024-10-01 12:34:56', ua.CreationDate)) / 365) as AccountAgeYears,
+        CASE 
+            WHEN EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - ua.LastPostDate)) / 86400 > 365 THEN 'Very Inactive'
+            WHEN EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - ua.LastPostDate)) / 86400 > 180 THEN 'Inactive'
+            WHEN EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - ua.LastPostDate)) / 86400 > 90 THEN 'Semi-Active'
+            ELSE 'Active'
+        END as ActivityStatus,
+        CASE WHEN total_q_sum.sum_q IS NULL OR total_a_sum.sum_a IS NULL THEN 0
+             ELSE (CAST(ua.QuestionCount AS numeric) / NULLIF(total_q_sum.sum_q,0)) * 100
+        END as QuestionContributionPercentage,
+        CASE WHEN total_q_sum.sum_q IS NULL OR total_a_sum.sum_a IS NULL THEN 0
+             ELSE (CAST(ua.AnswerCount AS numeric) / NULLIF(total_a_sum.sum_a,0)) * 100
+        END as AnswerContributionPercentage
+    FROM UserActivity ua
+    CROSS JOIN (SELECT SUM(QuestionCount) AS sum_q FROM UserActivity) total_q_sum
+    CROSS JOIN (SELECT SUM(AnswerCount) AS sum_a FROM UserActivity) total_a_sum
+)
+SELECT 
+    fa.UserId,
+    fa.DisplayName,
+    fa.Reputation,
+    fa.TotalPosts,
+    fa.QuestionCount,
+    fa.AnswerCount,
+    fa.TotalQuestionScore,
+    fa.TotalAnswerScore,
+    fa.AvgQuestionScore,
+    fa.AvgAnswerScore,
+    fa.LastPostDate,
+    fa.TotalComments,
+    fa.TotalBadges,
+    fa.AllTags,
+    fa.ActivityLevel,
+    fa.QuestionSkillLevel,
+    fa.AnswerContributionLevel,
+    fa.LatestQuestion,
+    fa.LatestAnswer,
+    fa.CurrentActivityStatus,
+    fa.PrimaryTag,
+    fa.AnswerToQuestionRatio,
+    fa.EngagementScore,
+    fa.ContributorTier,
+    fa.ReputationLevel,
+    fa.AccountAgeYears,
+    fa.ActivityStatus,
+    fa.QuestionContributionPercentage,
+    fa.AnswerContributionPercentage,
+    CASE 
+        WHEN fa.AnswerToQuestionRatio >= 1.5 THEN 'High Answerer'
+        WHEN fa.AnswerToQuestionRatio >= 1.0 THEN 'Equal Ratio'
+        WHEN fa.AnswerToQuestionRatio >= 0.5 THEN 'Moderate Answerer'
+        ELSE 'Question Focused'
+    END as PostingStyle,
+    CASE 
+        WHEN fa.LastPostDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '7 day') THEN 'Weekly Peak'
+        WHEN fa.LastPostDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30 day') THEN 'Monthly Peak'
+        WHEN fa.LastPostDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '90 day') THEN 'Quarterly Peak'
+        ELSE 'Seasonal'
+    END as PeakActivityPeriod,
+    CASE 
+        WHEN fa.EngagementScore > 2000 OR fa.Reputation > 50000 THEN 'High Impact'
+        WHEN fa.EngagementScore > 1000 OR fa.Reputation > 20000 THEN 'Medium Impact'
+        WHEN fa.EngagementScore > 500 OR fa.Reputation > 10000 THEN 'Low Impact'
+        ELSE 'Minimal Impact'
+    END as UserImpact
+FROM FinalAnalysis fa
+WHERE fa.Reputation > 100 
+    AND (fa.QuestionCount > 0 OR fa.AnswerCount > 0)
+    AND fa.ActivityStatus NOT IN ('Very Inactive', 'Inactive')
+    AND fa.ContributorTier IN ('Elite Contributor', 'Active Contributor')
+ORDER BY fa.EngagementScore DESC, fa.Reputation DESC
+OFFSET 10 ROWS 
+FETCH NEXT 20 ROWS ONLY;

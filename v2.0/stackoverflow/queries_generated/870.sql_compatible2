@@ -1,0 +1,311 @@
+with recent_users as (
+  select u.id as user_id,
+         u.displayname,
+         u.reputation,
+         u.location,
+         u.creationdate,
+         u.upvotes,
+         u.downvotes,
+         coalesce(nullif(trim(u.websiteurl), ''), 'n/a') as websiteurl,
+         row_number() over (order by u.creationdate desc, u.id) as rn
+  from users u
+  where u.creationdate >= (select date_trunc('year', max(p.creationdate)) from posts p)
+),
+user_activity as (
+  select u.user_id,
+         count(distinct p.id) filter (where p.posttypeid in (1,2)) as total_posts,
+         count(*) filter (where c.id is not null) as total_comments,
+         sum(greatest(p.score,0)) as nonneg_post_score,
+         sum(case when v.votetypeid=2 then 1 when v.votetypeid=3 then -1 else 0 end) as net_votes_cast,
+         max(p.lastactivitydate) as last_post_activity
+  from recent_users u
+  left join posts p on p.owneruserid = u.user_id
+  left join comments c on c.userid = u.user_id
+  left join votes v on v.userid = u.user_id
+  group by u.user_id
+),
+user_badge_rollup as (
+  select b.userid as user_id,
+         sum(case when b.class=1 then 1 else 0 end) as gold_badges,
+         sum(case when b.class=2 then 1 else 0 end) as silver_badges,
+         sum(case when b.class=3 then 1 else 0 end) as bronze_badges,
+         count(*) as total_badges,
+         min(b.date) as first_badge_date,
+         max(b.date) as last_badge_date
+  from badges b
+  group by b.userid
+),
+question_answer_stats as (
+  select q.owneruserid as user_id,
+         count(*) filter (where q.posttypeid=1) as questions_posted,
+         sum(q.viewcount) filter (where q.posttypeid=1) as question_views,
+         avg(nullif(q.answercount,0)) filter (where q.posttypeid=1) as avg_answers_per_question,
+         count(*) filter (where a.id is not null and a.score > 0) as pos_scored_answers_received,
+         count(*) filter (where q.acceptedanswerid is not null) as accepted_questions
+  from posts q
+  left join posts a on a.parentid = q.id and a.posttypeid = 2
+  where q.posttypeid = 1
+  group by q.owneruserid
+),
+dup_close_events as (
+  select ph.postid,
+         count(*) filter (where ph.posthistorytypeid = 10 and ph.comment = '101') as duplicate_votes,
+         count(*) filter (where ph.posthistorytypeid = 10) as total_close_votes,
+         min(ph.creationdate) filter (where ph.posthistorytypeid = 10) as first_close_event
+  from posthistory ph
+  group by ph.postid
+),
+postlink_dupes as (
+  select pl.postid,
+         count(*) filter (where pl.linktypeid = 3) as declared_duplicate_links,
+         count(*) filter (where pl.linktypeid = 1) as declared_linked
+  from postlinks pl
+  group by pl.postid
+),
+tag_activity as (
+  select p.owneruserid as user_id,
+         t.tagname,
+         count(*) as posts_with_tag,
+         sum(p.score) as tag_score_sum,
+         avg(p.score) as tag_score_avg,
+         row_number() over (partition by p.owneruserid order by count(*) desc, avg(p.score) desc, t.tagname) as tag_rank
+  from posts p
+  join lateral (
+      select unnest(string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')) as tagname
+  ) x on p.posttypeid = 1 and p.tags is not null and p.tags like '<%>'
+  left join tags t on lower(t.tagname) = lower(x.tagname)
+  group by p.owneruserid, t.tagname
+),
+top_tags as (
+  select user_id,
+         string_agg(tagname, ', ' order by tag_rank) as top3_tags
+  from tag_activity
+  where tag_rank <= 3
+  group by user_id
+),
+answer_efficiency as (
+  select a.owneruserid as user_id,
+         count(*) as answers_posted,
+         sum(case when a.id = q.acceptedanswerid then 1 else 0 end) as accepted_answers,
+         avg(a.score) as avg_answer_score,
+         percentile_cont(0.5) within group (order by a.score) as median_answer_score
+  from posts a
+  left join posts q on q.id = a.parentid and a.posttypeid = 2 and q.posttypeid = 1
+  where a.posttypeid = 2
+  group by a.owneruserid
+),
+engagement_windows as (
+  select p.owneruserid as user_id,
+         count(*) filter (where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days') as posts_30d,
+         count(*) filter (where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '7 days') as posts_7d,
+         count(*) filter (where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '1 day') as posts_1d,
+         sum(p.commentcount) filter (where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days') as comments_on_posts_30d
+  from posts p
+  group by p.owneruserid
+),
+comment_sentiment as (
+  select c.userid as user_id,
+         sum(case when c.score >= 0 then 1 else 0 end) as nonneg_comments,
+         sum(case when c.score < 0 then 1 else 0 end) as neg_comments,
+         avg(c.score) as avg_comment_score,
+         max(c.creationdate) as last_comment_date
+  from comments c
+  group by c.userid
+),
+user_levels as (
+  select u.user_id,
+         case
+           when u.reputation >= 100000 then 'Legend'
+           when u.reputation >= 20000 then 'Expert'
+           when u.reputation >= 5000 then 'Advanced'
+           when u.reputation >= 1000 then 'Intermediate'
+           when u.reputation is null then 'Unknown'
+           else 'Beginner'
+         end as level
+  from recent_users u
+),
+activity_rank as (
+  select u.user_id,
+         dense_rank() over (
+           order by coalesce(ua.total_posts,0) desc,
+                    coalesce(qa.questions_posted,0) desc,
+                    coalesce(ae.answers_posted,0) desc,
+                    coalesce(ua.nonneg_post_score,0) desc,
+                    coalesce(ub.total_badges,0) desc
+         ) as activity_dense_rank,
+         row_number() over (
+           order by coalesce(ua.total_posts,0) desc,
+                    coalesce(ua.nonneg_post_score,0) desc,
+                    coalesce(ub.total_badges,0) desc,
+                    u.user_id
+         ) as activity_rownum
+  from recent_users u
+  left join user_activity ua on ua.user_id = u.user_id
+  left join user_badge_rollup ub on ub.user_id = u.user_id
+  left join question_answer_stats qa on qa.user_id = u.user_id
+  left join answer_efficiency ae on ae.user_id = u.user_id
+),
+normalized as (
+  select u.user_id,
+         cast(coalesce(ua.total_posts,0) as numeric) as n_posts,
+         cast(coalesce(ua.nonneg_post_score,0) as numeric) as n_post_score,
+         cast(coalesce(ub.total_badges,0) as numeric) as n_badges,
+         cast(coalesce(qa.questions_posted,0) as numeric) as n_questions,
+         cast(coalesce(ae.answers_posted,0) as numeric) as n_answers,
+         cast(coalesce(ae.accepted_answers,0) as numeric) as n_acc_answers,
+         cast(coalesce(qa.question_views,0) as numeric) as n_q_views
+  from recent_users u
+  left join user_activity ua on ua.user_id = u.user_id
+  left join user_badge_rollup ub on ub.user_id = u.user_id
+  left join question_answer_stats qa on qa.user_id = u.user_id
+  left join answer_efficiency ae on ae.user_id = u.user_id
+),
+z_scored as (
+  select n.user_id, n.n_posts, n.n_post_score, n.n_badges, n.n_questions, n.n_answers, n.n_acc_answers, n.n_q_views,
+         case when stddev_pop(n_posts) over() > 0 then (n_posts - avg(n_posts) over())/nullif(stddev_pop(n_posts) over(),0) else 0 end as z_posts,
+         case when stddev_pop(n_post_score) over() > 0 then (n_post_score - avg(n_post_score) over())/nullif(stddev_pop(n_post_score) over(),0) else 0 end as z_post_score,
+         case when stddev_pop(n_badges) over() > 0 then (n_badges - avg(n_badges) over())/nullif(stddev_pop(n_badges) over(),0) else 0 end as z_badges,
+         case when stddev_pop(n_questions) over() > 0 then (n_questions - avg(n_questions) over())/nullif(stddev_pop(n_questions) over(),0) else 0 end as z_questions,
+         case when stddev_pop(n_answers) over() > 0 then (n_answers - avg(n_answers) over())/nullif(stddev_pop(n_answers) over(),0) else 0 end as z_answers,
+         case when stddev_pop(n_acc_answers) over() > 0 then (n_acc_answers - avg(n_acc_answers) over())/nullif(stddev_pop(n_acc_answers) over(),0) else 0 end as z_acc_answers,
+         case when stddev_pop(n_q_views) over() > 0 then (n_q_views - avg(n_q_views) over())/nullif(stddev_pop(n_q_views) over(),0) else 0 end as z_q_views
+  from normalized n
+),
+final_scores as (
+  select z.user_id,
+         0.25*z.z_posts +
+         0.20*z.z_post_score +
+         0.15*z.z_badges +
+         0.10*z.z_questions +
+         0.20*z.z_answers +
+         0.07*z.z_acc_answers +
+         0.03*z.z_q_views as composite_score
+  from z_scored z
+),
+user_strings as (
+  select u.user_id,
+         upper(substring(coalesce(u.displayname,'anon') from 1 for 1)) || lower(substring(coalesce(u.displayname,'anon') from 2)) as nice_name,
+         case when u.location ilike '%remote%' or u.location ilike '%internet%' then 'Remote'
+              when u.location is null or trim(u.location) = '' then 'Unknown'
+              else regexp_replace(u.location, '\s+', ' ', 'g')
+         end as norm_location
+  from recent_users u
+),
+closed_or_duplicate as (
+  select q.owneruserid as user_id,
+         sum(case when dce.total_close_votes > 0 then 1 else 0 end) as questions_with_close_votes,
+         sum(coalesce(dce.duplicate_votes,0)) as duplicate_close_votes,
+         sum(coalesce(pld.declared_duplicate_links,0)) as duplicate_links
+  from posts q
+  left join dup_close_events dce on dce.postid = q.id
+  left join postlink_dupes pld on pld.postid = q.id
+  where q.posttypeid = 1
+  group by q.owneruserid
+),
+activity_summary as (
+  select u.user_id,
+         us.nice_name,
+         us.norm_location,
+         u.reputation,
+         u.creationdate,
+         u.upvotes - u.downvotes as net_received_votes,
+         ua.total_posts,
+         ua.total_comments,
+         ua.nonneg_post_score,
+         ua.net_votes_cast,
+         ua.last_post_activity,
+         ub.gold_badges, ub.silver_badges, ub.bronze_badges, ub.total_badges,
+         ub.first_badge_date, ub.last_badge_date,
+         qa.questions_posted, qa.question_views, qa.avg_answers_per_question, qa.pos_scored_answers_received, qa.accepted_questions,
+         ae.answers_posted, ae.accepted_answers, ae.avg_answer_score, ae.median_answer_score,
+         ew.posts_30d, ew.posts_7d, ew.posts_1d, ew.comments_on_posts_30d,
+         cs.nonneg_comments, cs.neg_comments, cs.avg_comment_score, cs.last_comment_date,
+         tl.top3_tags,
+         coalesce(cod.questions_with_close_votes,0) as questions_with_close_votes,
+         coalesce(cod.duplicate_close_votes,0) as duplicate_close_votes,
+         coalesce(cod.duplicate_links,0) as duplicate_links
+  from recent_users u
+  left join user_strings us on us.user_id = u.user_id
+  left join user_activity ua on ua.user_id = u.user_id
+  left join user_badge_rollup ub on ub.user_id = u.user_id
+  left join question_answer_stats qa on qa.user_id = u.user_id
+  left join answer_efficiency ae on ae.user_id = u.user_id
+  left join engagement_windows ew on ew.user_id = u.user_id
+  left join comment_sentiment cs on cs.user_id = u.user_id
+  left join top_tags tl on tl.user_id = u.user_id
+  left join closed_or_duplicate cod on cod.user_id = u.user_id
+),
+baselines as (
+  select 'global' as scope,
+         avg(coalesce(total_posts,0)) as avg_posts,
+         avg(coalesce(nonneg_post_score,0)) as avg_post_score,
+         avg(coalesce(total_badges,0)) as avg_badges
+  from activity_summary
+  union all
+  select 'experts',
+         avg(coalesce(total_posts,0)),
+         avg(coalesce(nonneg_post_score,0)),
+         avg(coalesce(total_badges,0))
+  from activity_summary s
+  where s.reputation >= 20000
+),
+filtered as (
+  select s.*,
+         fl.composite_score,
+         ul.level,
+         ar.activity_dense_rank,
+         ar.activity_rownum,
+         case when s.total_posts is null then 1 else 0 end as is_inactive
+  from activity_summary s
+  left join final_scores fl on fl.user_id = s.user_id
+  left join user_levels ul on ul.user_id = s.user_id
+  left join activity_rank ar on ar.user_id = s.user_id
+  where coalesce(s.total_posts,0) + coalesce(s.total_comments,0) + coalesce(s.total_badges,0) > 0
+),
+ranked as (
+  select f.*,
+         rank() over (order by f.composite_score desc nulls last, f.total_posts desc nulls last, f.user_id) as global_rank,
+         percent_rank() over (order by f.composite_score desc nulls last) as pct_rank
+  from filtered f
+)
+select
+  r.user_id,
+  r.nice_name as display_name,
+  r.norm_location as location,
+  r.level as user_level,
+  r.reputation,
+  r.net_received_votes,
+  r.total_posts,
+  r.total_comments,
+  r.nonneg_post_score as post_score_sum,
+  r.total_badges,
+  r.gold_badges,
+  r.silver_badges,
+  r.bronze_badges,
+  r.questions_posted,
+  r.answers_posted,
+  r.accepted_answers,
+  r.avg_answer_score,
+  r.median_answer_score,
+  r.questions_with_close_votes,
+  r.duplicate_close_votes,
+  r.duplicate_links,
+  coalesce(r.top3_tags, '(none)') as top_tags,
+  r.posts_30d,
+  r.posts_7d,
+  r.posts_1d,
+  r.avg_comment_score,
+  r.last_post_activity,
+  r.composite_score,
+  r.global_rank,
+  lpad(cast(cast(round((r.pct_rank * 100.0)::double precision, 2) as numeric) as text), 0, '') || '%' as percentile
+from ranked r
+where (
+    r.level in ('Expert','Legend')
+    or r.composite_score >= (
+      select avg_post_score from baselines where scope='global'
+    )
+)
+and coalesce(r.top3_tags,'') not ilike '%meta%'
+order by r.composite_score desc nulls last, r.total_posts desc nulls last, r.user_id
+limit 250;

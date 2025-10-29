@@ -1,0 +1,84 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.Title,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.LastActivityDate,
+        U.DisplayName AS OwnerDisplayName,
+        U.Reputation,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.ViewCount DESC) AS Rank
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId = 1 AND P.Score > 0 AND P.ViewCount > 100
+),
+BadgeCounts AS (
+    SELECT 
+        U.Id AS UserId,
+        U.DisplayName AS UserName,
+        COUNT(B.Id) AS BadgeCount
+    FROM 
+        Users U
+    LEFT JOIN 
+        Badges B ON U.Id = B.UserId
+    GROUP BY 
+        U.Id, U.DisplayName
+),
+CommentStats AS (
+    SELECT 
+        P.Id AS PostId,
+        COUNT(C.Id) AS CommentCount,
+        MAX(C.Score) AS MaxCommentScore
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Comments C ON P.Id = C.PostId
+    GROUP BY 
+        P.Id
+),
+PostTags AS (
+    SELECT
+        P.Id AS PostId,
+        TRIM(BOTH '<' FROM UNNEST(STRING_TO_ARRAY(P.Tags, '><'))) AS TagName
+    FROM
+        Posts P
+    WHERE P.Tags IS NOT NULL
+)
+SELECT 
+    RP.Id AS PostId,
+    RP.Title AS PostTitle,
+    RP.Score AS PostScore,
+    RP.ViewCount AS PostViewCount,
+    RP.CreationDate AS PostCreationDate,
+    RP.LastActivityDate AS PostLastActivityDate,
+    RP.Rank AS PostRank,
+    BC.UserName,
+    BC.BadgeCount,
+    CS.CommentCount,
+    CS.MaxCommentScore,
+    CASE
+        WHEN RP.Score > 100 THEN 'High'
+        WHEN RP.Score BETWEEN 50 AND 100 THEN 'Medium'
+        ELSE 'Low'
+    END AS ScoreTier,
+    STRING_AGG(Tg.TagName, ', ' ORDER BY COUNT(*) DESC) AS TopTags
+FROM 
+    RankedPosts RP
+LEFT JOIN 
+    BadgeCounts BC ON RP.OwnerDisplayName = BC.UserName
+LEFT JOIN 
+    CommentStats CS ON RP.Id = CS.PostId
+LEFT JOIN 
+    Posts P ON RP.Id = P.Id
+LEFT JOIN 
+    PostTags Tg ON P.Id = Tg.PostId
+LEFT JOIN 
+    Tags T ON Tg.TagName = T.TagName
+GROUP BY 
+    RP.Id, RP.Title, RP.Score, RP.ViewCount, RP.CreationDate, RP.LastActivityDate, RP.Rank, BC.UserName, BC.BadgeCount, CS.CommentCount, CS.MaxCommentScore
+ORDER BY 
+    RP.Rank, RP.Score DESC;

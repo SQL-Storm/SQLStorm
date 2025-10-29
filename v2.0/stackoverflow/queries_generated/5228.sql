@@ -1,0 +1,126 @@
+-- {"query": "5228.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 906} 
+WITH RankedPosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.PostTypeId,
+    p.AcceptedAnswerId,
+    p.ParentId,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ContentLicense,
+    ROW_NUMBER() OVER (
+      PARTITION BY p.OwnerUserId
+      ORDER BY
+        p.Score DESC,
+        p.ViewCount DESC,
+        p.LastActivityDate DESC
+    ) AS rn_by_owner
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId = 1 -- Questions
+    AND p.CreationDate >= DATEADD(year, -1, GETDATE())
+),
+TagsExpanded AS (
+  SELECT
+    rp.PostId,
+    rp.Title,
+    rp.CreationDate,
+    rp.Score,
+    rp.ViewCount,
+    rp.Tags,
+    rp.OwnerUserId,
+    rp.LastActivityDate,
+    rp.PostTypeId,
+    rp.AcceptedAnswerId,
+    rp.ParentId,
+    rp.CommentCount,
+    rp.FavoriteCount,
+    rp.ContentLicense,
+    t.TagName,
+    ROW_NUMBER() OVER (
+      PARTITION BY rp.PostId
+      ORDER BY t.TagName
+    ) AS rn_tag
+  FROM RankedPosts rp
+  CROSS APPLY (
+    SELECT
+      TRIM(value) AS TagName
+    FROM STRING_SPLIT(rp.Tags, '><')
+  ) AS t
+  WHERE rp.Tags IS NOT NULL
+),
+ActivityWindow AS (
+  SELECT
+    te.PostId,
+    te.Title,
+    te.CreationDate,
+    te.Score,
+    te.ViewCount,
+    te.OwnerUserId,
+    te.LastActivityDate,
+    te.TagName,
+    te.ContentLicense,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesInWindow,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesInWindow,
+    COUNT(DISTINCT c.Id) AS CommentCountInWindow
+  FROM TagsExpanded te
+  LEFT JOIN Votes v ON v.PostId = te.PostId
+  LEFT JOIN Comments c ON c.PostId = te.PostId
+  WHERE te.rn_tag = 1
+    AND te.LastActivityDate >= DATEADD(day, -30, GETDATE())
+  GROUP BY
+    te.PostId, te.Title, te.CreationDate, te.Score, te.ViewCount,
+    te.OwnerUserId, te.LastActivityDate, te.TagName, te.ContentLicense
+),
+CrossJoined AS (
+  SELECT
+    aw.PostId,
+    aw.Title,
+    aw.CreationDate,
+    aw.Score,
+    aw.ViewCount,
+    aw.OwnerUserId,
+    aw.LastActivityDate,
+    aw.TagName,
+    aw.ContentLicense,
+    aw.UpVotesInWindow,
+    aw.DownVotesInWindow,
+    aw.CommentCountInWindow,
+    u.Reputation,
+    u.DisplayName,
+    u.AccountId,
+    u.Location,
+    EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = aw.OwnerUserId AND b.Class = 1) AS HasGoldBadge,
+    EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = aw.OwnerUserId AND b.Class = 2) AS HasSilverBadge
+  FROM ActivityWindow aw
+  LEFT JOIN Users u ON aw.OwnerUserId = u.Id
+)
+SELECT
+  PostId,
+  Title,
+  CreationDate,
+  ViewCount,
+  Score,
+  LastActivityDate,
+  TagName,
+  ContentLicense,
+  UpVotesInWindow,
+  DownVotesInWindow,
+  CommentCountInWindow,
+  Reputation,
+  DisplayName,
+  Location,
+  HasGoldBadge,
+  HasSilverBadge,
+  100.0 * (UpVotesInWindow - DownVotesInWindow) / NULLIF(NULLIF(UpVotesInWindow + DownVotesInWindow, 0), 0) AS NetVoteRatio,
+  (SELECT AVG(reputation) FROM Users) AS GlobalAverageUserReputation
+FROM CrossJoined
+ORDER BY LastActivityDate DESC, Score DESC, ViewCount DESC
+LIMIT 100;

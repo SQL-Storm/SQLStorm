@@ -1,0 +1,254 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        STRING_AGG(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags)-2), ', ' ORDER BY p.CreationDate) AS TagHistory
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000 AND u.Views > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.Body,
+        COALESCE(p.AcceptedAnswerId, 0) AS AcceptanceFlag,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN 'Question with Answers'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostCategory,
+        CASE 
+            WHEN p.Score > 10 THEN 'Highly Upvoted'
+            WHEN p.Score > 0 THEN 'Upvoted'
+            WHEN p.Score < 0 THEN 'Downvoted'
+            ELSE 'Neutral'
+        END AS ScoreCategory,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserPostRank,
+        RANK() OVER (ORDER BY p.Score DESC) AS GlobalScoreRank,
+        DENSE_RANK() OVER (ORDER BY p.ViewCount DESC) AS ViewRank,
+        PERCENT_RANK() OVER (ORDER BY p.Score) AS ScorePercentile,
+        LAG(p.Score, 1) OVER (ORDER BY p.CreationDate) AS PrevScore,
+        LEAD(p.Score, 1) OVER (ORDER BY p.CreationDate) AS NextScore,
+        MAX(p.Score) OVER (PARTITION BY p.OwnerUserId) AS MaxScorePerUser,
+        MIN(p.Score) OVER (PARTITION BY p.OwnerUserId) AS MinScorePerUser,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS AvgScorePerUser
+    FROM Posts p
+    WHERE p.CreationDate >= TIMESTAMP '2020-01-01 00:00:00' AND p.CreationDate < TIMESTAMP '2023-01-01 00:00:00'
+),
+TopUsers AS (
+    SELECT 
+        Id,
+        DisplayName,
+        Reputation,
+        Views,
+        UpVotes,
+        DownVotes,
+        PostCount,
+        CommentCount,
+        BadgeCount,
+        AvgPostScore,
+        LastPostDate,
+        LastCommentDate,
+        TagHistory,
+        CASE 
+            WHEN PostCount > 100 THEN 'Elite Poster'
+            WHEN PostCount > 50 THEN 'Active Poster'
+            WHEN PostCount > 10 THEN 'Regular Poster'
+            ELSE 'Occasional Poster'
+        END AS PosterStatus,
+        CASE 
+            WHEN Reputation > 100000 THEN 'Legend'
+            WHEN Reputation > 50000 THEN 'Master'
+            WHEN Reputation > 10000 THEN 'Expert'
+            ELSE 'Regular'
+        END AS ReputationLevel,
+        DENSE_RANK() OVER (ORDER BY Reputation DESC) AS ReputationRank,
+        DENSE_RANK() OVER (ORDER BY PostCount DESC) AS ActivityRank
+    FROM UserStats
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS Posts,
+        COUNT(DISTINCT c.Id) AS Comments,
+        COUNT(DISTINCT b.Id) AS Badges,
+        COALESCE(MAX(p.CreationDate), MAX(c.CreationDate), MAX(b.Date)) AS LastActivity,
+        COUNT(DISTINCT p.Id) - COALESCE(SUM(CASE WHEN p.Score < 0 THEN 1 ELSE 0 END), 0) AS NetPosts,
+        AVG(p.Score) AS AvgScore,
+        STRING_AGG(p.Tags, ' ' ORDER BY p.Id) AS AllTags,
+        STRING_AGG(p.Title, ' ' ORDER BY p.Id) AS Titles,
+        NULLIF(SUM(p.Score), 0) AS TotalScore,
+        ABS(SUM(p.Score) - AVG(p.Score)) AS ScoreVariation,
+        COUNT(CASE WHEN p.Score > 0 THEN 1 END) AS Upvotes,
+        COUNT(CASE WHEN p.Score < 0 THEN 1 END) AS Downvotes,
+        SUM(CASE WHEN p.Score = 0 THEN 1 ELSE 0 END) AS NeutralPosts,
+        (COUNT(DISTINCT p.Id) * 100.0 / (SELECT COUNT(*) FROM Posts)) AS PostPercentage,
+        (COUNT(DISTINCT c.Id) * 100.0 / (SELECT COUNT(*) FROM Comments)) AS CommentPercentage
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate < TIMESTAMP '2022-01-01 00:00:00' AND u.AccountId IS NOT NULL
+    GROUP BY u.Id, u.DisplayName
+),
+CrossPostAnalysis AS (
+    SELECT 
+        p1.Id AS SourcePostId,
+        p2.Id AS TargetPostId,
+        p1.Id AS PostId,
+        CASE 
+            WHEN p1.Tags LIKE '%' || p2.Tags || '%' THEN 'Tag Overlap'
+            WHEN LOWER(p1.Title) LIKE '%' || LOWER(p2.Title) || '%' THEN 'Title Similarity'
+            ELSE 'No Match'
+        END AS MatchType,
+        CASE 
+            WHEN p1.Score > p2.Score THEN 'Higher Scoring'
+            WHEN p1.Score < p2.Score THEN 'Lower Scoring'
+            ELSE 'Equal Scoring'
+        END AS ScoreComparison,
+        ABS(p1.Score - p2.Score) AS ScoreDifference,
+        ABS(DATEDIFF('day', p1.CreationDate, p2.CreationDate)) AS TimeDifference,
+        (p1.Score * 2 + p2.Score) AS WeightedScore,
+        ((p1.Score + p2.Score) / 2) AS AvgScore,
+        ROW_NUMBER() OVER (PARTITION BY p1.Id ORDER BY ABS(p1.Score - p2.Score)) AS MatchRank
+    FROM Posts p1
+    JOIN Posts p2 ON p1.Id <> p2.Id AND p1.Score >= 0 AND p2.Score >= 0
+    WHERE p1.CreationDate <= p2.CreationDate
+      AND p1.Tags IS NOT NULL AND p2.Tags IS NOT NULL
+      AND p1.Title IS NOT NULL AND p2.Title IS NOT NULL
+),
+FinalAggregation AS (
+    SELECT 
+        'CrossAnalysis' AS AnalysisType,
+        COUNT(*) AS RecordCount,
+        COUNT(DISTINCT CASE WHEN MatchType = 'Tag Overlap' THEN SourcePostId END) AS TagOverlapCount,
+        COUNT(DISTINCT CASE WHEN MatchType = 'Title Similarity' THEN SourcePostId END) AS TitleSimilarityCount,
+        AVG(ScoreDifference) AS AvgScoreDifference,
+        MIN(ScoreDifference) AS MinScoreDifference,
+        MAX(ScoreDifference) AS MaxScoreDifference,
+        NULL AS AvgScoreComparison,
+        (SELECT COUNT(*) FROM UserActivity WHERE Posts > 50) AS ActiveUsers,
+        (SELECT COUNT(*) FROM UserActivity WHERE Comments > 100) AS CommentActiveUsers,
+        NULL AS DummyColumn1,
+        NULL AS DummyColumn2
+    FROM CrossPostAnalysis
+    HAVING COUNT(*) > 0
+    
+    UNION ALL
+    
+    SELECT 
+        'UserActivityAnalysis' AS AnalysisType,
+        COUNT(*) AS RecordCount,
+        NULL AS TagOverlapCount,
+        NULL AS TitleSimilarityCount,
+        AVG(AvgScore) AS AvgScoreDifference,
+        MIN(TotalScore) AS MinScoreDifference,
+        MAX(TotalScore) AS MaxScoreDifference,
+        NULL AS AvgScoreComparison,
+        AVG(Posts) AS ActiveUsers,
+        AVG(Comments) AS CommentActiveUsers,
+        NULL AS DummyColumn1,
+        NULL AS DummyColumn2
+    FROM UserActivity
+    HAVING COUNT(*) > 0
+    
+    UNION ALL
+    
+    SELECT 
+        'PostAnalysis' AS AnalysisType,
+        COUNT(*) AS RecordCount,
+        NULL AS TagOverlapCount,
+        NULL AS TitleSimilarityCount,
+        AVG(Score) AS AvgScoreDifference,
+        MIN(Score) AS MinScoreDifference,
+        MAX(Score) AS MaxScoreDifference,
+        NULL AS AvgScoreComparison,
+        AVG(AnswerCount) AS ActiveUsers,
+        AVG(ViewCount) AS CommentActiveUsers,
+        NULL AS DummyColumn1,
+        NULL AS DummyColumn2
+    FROM Posts p
+    WHERE p.CreationDate >= TIMESTAMP '2020-01-01 00:00:00'
+    HAVING COUNT(*) > 0
+)
+SELECT 
+    AnalysisType,
+    RecordCount,
+    TagOverlapCount,
+    TitleSimilarityCount,
+    AvgScoreDifference,
+    MinScoreDifference,
+    MaxScoreDifference,
+    AvgScoreComparison,
+    ActiveUsers,
+    CommentActiveUsers,
+    DummyColumn1,
+    DummyColumn2,
+    CASE 
+        WHEN RecordCount > 1000 THEN 'Large'
+        WHEN RecordCount > 100 THEN 'Medium'
+        WHEN RecordCount > 10 THEN 'Small'
+        ELSE 'Tiny'
+    END AS DatasetSize,
+    CASE 
+        WHEN ActiveUsers > 100 THEN 'Highly Active'
+        WHEN ActiveUsers > 50 THEN 'Moderately Active'
+        ELSE 'Low Activity'
+    END AS ActivityLevel,
+    'Performance Benchmark Query' AS QueryIdentifier,
+    CAST('2024-10-01 12:34:56' AS TIMESTAMP) AS ExecutionTime,
+    ROW_NUMBER() OVER (ORDER BY RecordCount DESC) AS ExecutionOrder,
+    MOD(RecordCount, 1000) AS ModuloValue,
+    POWER(RecordCount, 2) AS SquareValue,
+    SQRT(RecordCount) AS SquareRootValue,
+    LOG(RecordCount + 1) AS LogValue,
+    CASE 
+        WHEN RecordCount > 0 THEN 100 * COUNT(*) / (SELECT COUNT(*) FROM Posts)
+        ELSE 0 
+    END AS PercentageOfPosts
+FROM FinalAggregation
+WHERE AnalysisType IS NOT NULL
+  AND RecordCount >= 0
+  AND CASE 
+        WHEN AnalysisType = 'CrossAnalysis' THEN 'Cross-Analysis Available'
+        WHEN AnalysisType = 'UserActivityAnalysis' THEN 'User Activity Available'
+        WHEN AnalysisType = 'PostAnalysis' THEN 'Post Analysis Available'
+        ELSE 'Data Quality Check'
+      END IS NOT NULL
+  AND CASE 
+        WHEN AnalysisType = 'CrossAnalysis' THEN COUNT(*) > 0
+        WHEN AnalysisType = 'UserActivityAnalysis' THEN COUNT(*) > 0
+        WHEN AnalysisType = 'PostAnalysis' THEN COUNT(*) > 0
+        ELSE TRUE
+      END
+  AND (CASE WHEN AnalysisType IN ('CrossAnalysis', 'UserActivityAnalysis', 'PostAnalysis') THEN AnalysisType ELSE 'All' END) LIKE '%'
+  AND (CASE WHEN AnalysisType = 'CrossAnalysis' THEN RecordCount * 1000000 ELSE 0 END) >= 0
+  AND (CASE WHEN AnalysisType = 'UserActivityAnalysis' THEN ActiveUsers * 1000 ELSE 0 END) >= 0
+  AND (CASE WHEN AnalysisType = 'PostAnalysis' THEN AvgScoreDifference * 1.5 ELSE 0 END) >= 0
+ORDER BY ExecutionOrder, AnalysisType DESC
+OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY
+LIMIT 1000;

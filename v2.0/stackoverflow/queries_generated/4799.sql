@@ -1,0 +1,135 @@
+-- {"query": "4799.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1399} 
+
+WITH RankedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        pt.Name AS PostTypeName,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS rn,
+        CASE
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 5 THEN 'Tag Wiki'
+            ELSE 'Other'
+        END AS PostCategory,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            ELSE 'Open'
+        END AS PostStatus
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.OwnerUserId IS NOT NULL
+),
+UserPostSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        AVG(p.Score) AS AverageScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        CASE
+            WHEN u.Reputation > 100000 THEN 'High Rep'
+            WHEN u.Reputation BETWEEN 50000 AND 100000 THEN 'Medium Rep'
+            ELSE 'Low Rep'
+        END AS ReputationLevel
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+HighEngagementUsers AS (
+    SELECT
+        ups.UserId,
+        ups.DisplayName,
+        ups.TotalPosts,
+        ups.QuestionCount,
+        ups.AnswerCount,
+        ups.AverageScore,
+        ups.LastPostDate,
+        ups.ReputationLevel
+    FROM UserPostSummary ups
+    WHERE ups.TotalPosts > 500 AND ups.AverageScore > 5 AND ups.AnswerCount > 100
+),
+PostLinkAnalysis AS (
+    SELECT
+        pl.PostId,
+        COUNT(DISTINCT pl.RelatedPostId) AS NumberOfRelatedPosts,
+        SUM(CASE WHEN lt.Name = 'Duplicate' THEN 1 ELSE 0 END) AS DuplicateLinks
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    GROUP BY pl.PostId
+),
+CommentSentiment AS (
+    SELECT
+        c.PostId,
+        CASE
+            WHEN LOWER(c.Text) LIKE '%great%' OR LOWER(c.Text) LIKE '%excellent%' THEN 'Positive'
+            WHEN LOWER(c.Text) LIKE '%bad%' OR LOWER(c.Text) LIKE '%terrible%' THEN 'Negative'
+            ELSE 'Neutral'
+        END AS Sentiment
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+),
+PostCommentAggregates AS (
+    SELECT
+        c.PostId,
+        COUNT(CASE WHEN cs.Sentiment = 'Positive' THEN 1 END) AS PositiveCommentCount,
+        COUNT(CASE WHEN cs.Sentiment = 'Negative' THEN 1 END) AS NegativeCommentCount,
+        COUNT(CASE WHEN cs.Sentiment = 'Neutral' THEN 1 END) AS NeutralCommentCount,
+        SUM(c.Score) AS TotalCommentScore
+    FROM Comments c
+    LEFT JOIN CommentSentiment cs ON c.Id = cs.PostId
+    GROUP BY c.PostId
+)
+SELECT
+    rp.PostId,
+    rp.PostTypeName,
+    rp.PostCategory,
+    rp.PostStatus,
+    rp.Title,
+    rp.CreationDate,
+    rp.Score,
+    rp.ViewCount,
+    rp.AnswerCount,
+    rp.CommentCount,
+    rp.FavoriteCount,
+    COALESCE(heu.DisplayName, 'N/A') AS OwnerDisplayName,
+    COALESCE(heu.ReputationLevel, 'Unknown') AS OwnerReputationLevel,
+    COALESCE(pla.NumberOfRelatedPosts, 0) AS NumberOfRelatedPosts,
+    COALESCE(pla.DuplicateLinks, 0) AS DuplicateLinks,
+    pca.PositiveCommentCount,
+    pca.NegativeCommentCount,
+    pca.NeutralCommentCount,
+    pca.TotalCommentScore,
+    CASE
+        WHEN rp.Score > 100 AND rp.AnswerCount > 10 AND rp.CommentCount > 5 THEN 'Highly Engaged'
+        WHEN rp.Score > 50 AND rp.ViewCount > 1000 THEN 'Popular'
+        ELSE 'Standard'
+    END AS EngagementLevel,
+    CASE
+        WHEN rp.ClosedDate IS NOT NULL AND JULIANDAY(rp.ClosedDate) - JULIANDAY(rp.CreationDate) < 30 THEN 'Quickly Closed'
+        WHEN rp.ClosedDate IS NOT NULL THEN 'Delayed Close'
+        WHEN rp.ViewCount > 50000 THEN 'High Traffic'
+        ELSE 'Regular'
+    END AS PostTrafficType
+FROM RankedPosts rp
+LEFT JOIN HighEngagementUsers heu ON rp.OwnerUserId = heu.UserId
+LEFT JOIN PostLinkAnalysis pla ON rp.PostId = pla.PostId
+LEFT JOIN PostCommentAggregates pca ON rp.PostId = pca.PostId
+WHERE rp.rn <= 100
+  AND (rp.Score > 0 OR rp.ViewCount > 0)
+  AND (rp.Title IS NOT NULL OR rp.PostTypeId <> 1)
+  AND rp.PostCategory IN ('Question', 'Answer')
+  AND rp.OwnerUserId NOT IN (SELECT UserId FROM HighEngagementUsers)
+ORDER BY rp.Score DESC, rp.ViewCount DESC
+LIMIT 500;

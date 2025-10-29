@@ -1,0 +1,144 @@
+WITH
+user_activity AS (
+    SELECT
+        u.id                                           AS user_id,
+        u.displayname                                  AS display_name,
+        u.reputation,
+        COUNT(p.id) FILTER (WHERE p.posttypeid = 1)    AS question_cnt,
+        COUNT(p.id) FILTER (WHERE p.posttypeid = 2)    AS answer_cnt,
+        SUM(p.score)                                   AS total_score,
+        MAX(p.creationdate)                            AS last_post_dt
+    FROM users u
+    LEFT JOIN posts p
+           ON p.owneruserid = u.id
+    GROUP BY u.id, u.displayname, u.reputation
+),
+
+user_badges AS (
+    SELECT
+        b.userid,
+        COUNT(*)                                         AS badge_total,
+        SUM(CASE WHEN b.class = 1 THEN 1 ELSE 0 END)     AS gold_cnt,
+        SUM(CASE WHEN b.class = 2 THEN 1 ELSE 0 END)     AS silver_cnt,
+        SUM(CASE WHEN b.class = 3 THEN 1 ELSE 0 END)     AS bronze_cnt
+    FROM badges b
+    GROUP BY b.userid
+),
+
+post_votes AS (
+    SELECT
+        v.postid,
+        SUM(CASE WHEN v.votetypeid = 2 THEN 1 ELSE 0 END) AS up_votes,
+        SUM(CASE WHEN v.votetypeid = 3 THEN 1 ELSE 0 END) AS down_votes,
+        MAX(v.creationdate)                               AS last_vote_dt
+    FROM votes v
+    GROUP BY v.postid
+),
+
+top_question_per_user AS (
+    SELECT
+        p.id                     AS post_id,
+        p.owneruserid            AS owner_user_id,
+        p.title,
+        p.score,
+        ROW_NUMBER() OVER (
+            PARTITION BY p.owneruserid
+            ORDER BY p.score DESC NULLS LAST,
+                     p.creationdate DESC
+        ) AS rn,
+        COALESCE(
+            NULLIF(
+                regexp_replace(
+                    trim(both '<>' FROM p.tags),
+                    '><',
+                    ',',
+                    'g'
+                ),
+                ''
+            ),
+            NULL
+        ) AS tag_list
+    FROM posts p
+    WHERE p.posttypeid = 1
+),
+
+recent_closed AS (
+    SELECT
+        ph.postid,
+        ph.creationdate AS closed_dt,
+        CAST(ph.comment AS INTEGER) AS close_reason_id
+    FROM posthistory ph
+    WHERE ph.posthistorytypeid = 10
+      AND ph.creationdate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '60 days'
+)
+
+SELECT
+    ua.user_id,
+    ua.display_name,
+    ua.reputation,
+    ua.question_cnt,
+    ua.answer_cnt,
+    ua.total_score,
+    COALESCE(ub.badge_total, 0)      AS total_badges,
+    COALESCE(ub.gold_cnt,   0)       AS gold_badges,
+    COALESCE(ub.silver_cnt, 0)       AS silver_badges,
+    COALESCE(ub.bronze_cnt, 0)       AS bronze_badges,
+    tq.title                         AS top_question_title,
+    tq.score                         AS top_question_score,
+    pv.up_votes,
+    pv.down_votes,
+    (COALESCE(pv.up_votes,0) - COALESCE(pv.down_votes,0)) AS net_votes,
+    CASE
+        WHEN ua.reputation >= 20000 THEN 'Legendary'
+        WHEN ua.reputation >= 10000 THEN 'Expert'
+        WHEN ua.reputation >= 5000  THEN 'Experienced'
+        ELSE 'Novice'
+    END AS reputation_tier,
+    CASE
+        WHEN ua.last_post_dt IS NULL THEN 'NeverPosted'
+        WHEN ua.last_post_dt < CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year' THEN 'Inactive'
+        ELSE 'Active'
+    END AS activity_status,
+    rc.close_reason_id,
+    rc.closed_dt
+FROM user_activity ua
+LEFT JOIN user_badges ub
+       ON ub.userid = ua.user_id
+LEFT JOIN top_question_per_user tq
+       ON tq.owner_user_id = ua.user_id
+      AND tq.rn = 1
+LEFT JOIN post_votes pv
+       ON pv.postid = tq.post_id
+LEFT JOIN LATERAL (
+    SELECT ph.close_reason_id, ph.closed_dt
+    FROM recent_closed ph
+    WHERE ph.postid = tq.post_id
+    ORDER BY ph.closed_dt DESC
+    LIMIT 1
+) rc ON TRUE
+WHERE ua.reputation IS NOT NULL
+ORDER BY ua.reputation DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    CAST(NULL AS BIGINT)        AS user_id,
+    CAST(NULL AS VARCHAR)       AS display_name,
+    CAST(NULL AS INTEGER)       AS reputation,
+    CAST(NULL AS BIGINT)        AS question_cnt,
+    CAST(NULL AS BIGINT)        AS answer_cnt,
+    CAST(NULL AS BIGINT)        AS total_score,
+    CAST(NULL AS BIGINT)        AS total_badges,
+    CAST(NULL AS BIGINT)        AS gold_badges,
+    CAST(NULL AS BIGINT)        AS silver_badges,
+    CAST(NULL AS VARCHAR)       AS top_question_title,
+    CAST(NULL AS INTEGER)       AS top_question_score,
+    CAST(NULL AS INTEGER)       AS up_votes,
+    CAST(NULL AS INTEGER)       AS down_votes,
+    CAST(NULL AS VARCHAR)       AS reputation_tier,
+    CAST(NULL AS VARCHAR)       AS activity_status,
+    CAST(NULL AS INTEGER)       AS close_reason_id,
+    CAST(NULL AS TIMESTAMP)     AS closed_dt,
+    CAST(NULL AS TIMESTAMP)     AS last_post_dt
+FROM (VALUES (1),(2),(3),(4),(5)) AS gs(i);

@@ -1,0 +1,359 @@
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        u.location,
+        coalesce(nullif(trim(u.websiteurl), ''), 'n/a') as websiteurl,
+        dense_rank() over (order by u.creationdate desc) as recency_rnk
+    from users u
+),
+active_users as (
+    select ru.*
+    from recent_users ru
+    where ru.recency_rnk <= 1000
+),
+questions as (
+    select
+        p.id as question_id,
+        p.owneruserid as asker_id,
+        p.creationdate as question_date,
+        p.score as question_score,
+        p.viewcount,
+        p.title,
+        p.tags,
+        p.acceptedanswerid
+    from posts p
+    where p.posttypeid = 1
+),
+answers as (
+    select
+        a.id as answer_id,
+        a.parentid as question_id,
+        a.owneruserid as answerer_id,
+        a.creationdate as answer_date,
+        a.score as answer_score
+    from posts a
+    where a.posttypeid = 2
+),
+qa as (
+    select
+        q.question_id,
+        q.asker_id,
+        q.question_date,
+        q.question_score,
+        q.viewcount,
+        q.title,
+        q.tags,
+        q.acceptedanswerid,
+        a.answer_id,
+        a.answerer_id,
+        a.answer_date,
+        a.answer_score
+    from questions q
+    left join answers a
+      on a.question_id = q.question_id
+),
+user_activity as (
+    select
+        au.user_id,
+        count(distinct case when p.posttypeid = 1 then p.id end) as q_cnt,
+        count(distinct case when p.posttypeid = 2 then p.id end) as a_cnt,
+        count(distinct c.id) as c_cnt,
+        coalesce(sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end), 0) as net_votes_cast
+    from active_users au
+    left join posts p on p.owneruserid = au.user_id
+    left join comments c on c.userid = au.user_id
+    left join votes v on v.userid = au.user_id
+    group by au.user_id
+),
+tag_unpivot as (
+    select
+        qa.*,
+        lower(trim(both ' ' from t.tag)) as tag
+    from qa
+    cross join lateral (
+        select unnest(string_to_array(substring(coalesce(qa.tags, ''), 2, greatest(length(coalesce(qa.tags, '')),2)-2), '><')) as tag
+    ) t
+),
+tagged as (
+    select
+        tu.*,
+        tg.count as global_tag_count,
+        tg.ismoderatoronly,
+        tg.isrequired
+    from tag_unpivot tu
+    left join tags tg
+      on tg.tagname = tu.tag
+),
+votes_agg as (
+    select
+        p.id as post_id,
+        sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end) as vote_score,
+        sum(case when v.votetypeid = 5 then 1 else 0 end) as favorite_cnt,
+        sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_total
+    from posts p
+    left join votes v on v.postid = p.id
+    group by p.id
+),
+edits as (
+    select
+        ph.postid,
+        count(*) filter (where ph.posthistorytypeid in (4,5,6)) as edit_cnt,
+        max(ph.creationdate) as last_edit_date,
+        bool_or(ph.posthistorytypeid = 24) as has_suggested_edits
+    from posthistory ph
+    group by ph.postid
+),
+closures as (
+    select
+        ph.postid,
+        min(ph.creationdate) filter (where ph.posthistorytypeid = 10) as first_closed_date,
+        max(ph.creationdate) filter (where ph.posthistorytypeid = 11) as last_reopen_date,
+        count(*) filter (where ph.posthistorytypeid = 10) as close_events,
+        count(*) filter (where ph.posthistorytypeid = 11) as reopen_events,
+        string_agg(distinct
+            case
+                when ph.posthistorytypeid = 10
+                then coalesce(nullif(trim(ph.comment), ''), 'unknown')
+                else null
+            end, ','
+        ) as close_reasons_raw
+    from posthistory ph
+    where ph.posthistorytypeid in (10,11)
+    group by ph.postid
+),
+links as (
+    select
+        pl.postid,
+        count(*) filter (where pl.linktypeid = 1) as linked_cnt,
+        count(*) filter (where pl.linktypeid = 3) as duplicate_cnt
+    from postlinks pl
+    group by pl.postid
+),
+answers_stats as (
+    select
+        qa.question_id,
+        count(distinct qa.answer_id) as answers_cnt,
+        max(qa.answer_score) as max_answer_score,
+        min(qa.answer_date) as first_answer_date,
+        max(qa.answer_date) as last_answer_date,
+        count(*) filter (where qa.answer_id = qa.acceptedanswerid) as accepted_answer_present,
+        percentile_disc(0.5) within group (order by qa.answer_score) as median_answer_score
+    from qa
+    group by qa.question_id
+),
+user_badges as (
+    select
+        u.id as user_id,
+        count(*) filter (where b.class = 1) as gold_badges,
+        count(*) filter (where b.class = 2) as silver_badges,
+        count(*) filter (where b.class = 3) as bronze_badges,
+        count(*) filter (where coalesce(b.tagbased, false) = true) as tag_badges
+    from users u
+    left join badges b on b.userid = u.id
+    group by u.id
+),
+question_quality as (
+    select
+        q.question_id,
+        q.asker_id,
+        q.question_date,
+        q.question_score,
+        q.viewcount,
+        q.title,
+        coalesce(v.vote_score, 0) as vote_score,
+        coalesce(v.favorite_cnt, 0) as favorite_cnt,
+        coalesce(v.bounty_total, 0) as bounty_total,
+        coalesce(e.edit_cnt, 0) as edit_cnt,
+        e.last_edit_date,
+        e.has_suggested_edits,
+        coalesce(l.linked_cnt, 0) as linked_cnt,
+        coalesce(l.duplicate_cnt, 0) as duplicate_cnt,
+        coalesce(a.answers_cnt, 0) as answers_cnt,
+        a.max_answer_score,
+        a.first_answer_date,
+        a.last_answer_date,
+        coalesce(a.accepted_answer_present, 0) as has_accepted_answer,
+        a.median_answer_score,
+        c.first_closed_date,
+        c.last_reopen_date,
+        c.close_events,
+        c.reopen_events,
+        c.close_reasons_raw,
+        (
+        case
+            when q.question_score is null then 0
+            else q.question_score
+        end
+        + coalesce(v.vote_score, 0)
+        + greatest(0, least(10, coalesce(a.answers_cnt, 0)))
+        + case when coalesce(a.accepted_answer_present, 0) > 0 then 5 else 0 end
+        + least(20, coalesce(v.favorite_cnt, 0))
+        - 3 * coalesce(l.duplicate_cnt, 0)
+        - 2 * case when c.first_closed_date is not null and c.last_reopen_date is null then 1 else 0 end
+        ) as quality_score
+    from questions q
+    left join votes_agg v on v.post_id = q.question_id
+    left join edits e on e.postid = q.question_id
+    left join links l on l.postid = q.question_id
+    left join answers_stats a on a.question_id = q.question_id
+    left join closures c on c.postid = q.question_id
+),
+user_rollup as (
+    select
+        au.user_id,
+        au.displayname,
+        au.reputation,
+        au.creationdate,
+        au.location,
+        au.websiteurl,
+        ua.q_cnt,
+        ua.a_cnt,
+        ua.c_cnt,
+        ua.net_votes_cast,
+        ub.gold_badges,
+        ub.silver_badges,
+        ub.bronze_badges,
+        ub.tag_badges,
+        count(distinct qq.question_id) as authored_questions,
+        count(distinct case when qq.quality_score >= 20 then qq.question_id end) as high_quality_questions,
+        avg(qq.quality_score) as avg_quality_score,
+        stddev_pop(qq.quality_score) as stddev_quality_score,
+        min(qq.question_date) as first_question_date,
+        max(qq.question_date) as last_question_date
+    from active_users au
+    left join user_activity ua on ua.user_id = au.user_id
+    left join user_badges ub on ub.user_id = au.user_id
+    left join question_quality qq on qq.asker_id = au.user_id
+    group by
+        au.user_id, au.displayname, au.reputation, au.creationdate, au.location, au.websiteurl,
+        ua.q_cnt, ua.a_cnt, ua.c_cnt, ua.net_votes_cast,
+        ub.gold_badges, ub.silver_badges, ub.bronze_badges, ub.tag_badges
+),
+tag_rollup as (
+    select
+        t.tag,
+        count(distinct t.question_id) as q_with_tag,
+        avg(t.question_score) as avg_q_score_for_tag,
+        avg(t.answer_score) as avg_ans_score_for_tag,
+        count(distinct case when t.answer_id is not null then t.question_id end) as q_with_answers,
+        count(distinct case when t.acceptedanswerid is not null then t.question_id end) as q_with_accept,
+        max(t.global_tag_count) as global_tag_count,
+        bool_or(coalesce(t.isrequired, false) = true) as any_required,
+        bool_or(coalesce(t.ismoderatoronly, false) = true) as any_mod_only
+    from tagged t
+    group by t.tag
+),
+ranked_questions as (
+    select
+        qq.*,
+        row_number() over (order by qq.quality_score desc, coalesce(qq.viewcount, 0) desc, qq.question_date desc) as global_rank,
+        row_number() over (partition by date_trunc('month', qq.question_date) order by qq.quality_score desc, qq.viewcount desc) as monthly_rank
+    from question_quality qq
+),
+dup_candidates as (
+    select
+        q1.question_id as qid1,
+        q2.question_id as qid2,
+        q1.title as title1,
+        q2.title as title2,
+        q1.quality_score as qs1,
+        q2.quality_score as qs2,
+        similarity(regexp_replace(lower(coalesce(q1.title,'')), '[^a-z0-9 ]', '', 'g'),
+                   regexp_replace(lower(coalesce(q2.title,'')), '[^a-z0-9 ]', '', 'g')) as title_sim
+    from question_quality q1
+    join question_quality q2
+      on q1.question_id < q2.question_id
+     and abs(extract(epoch from (q1.question_date - q2.question_date))) < 60*60*24*180
+     and (coalesce(q1.viewcount,0) >= 10 or coalesce(q2.viewcount,0) >= 10)
+),
+dup_top as (
+    select *
+    from dup_candidates
+    where title_sim > 0.6
+),
+final_union as (
+    select
+        'USER_ROLLUP' as section,
+        cast(null as integer) as id1,
+        cast(null as integer) as id2,
+        ur.user_id as entity_id,
+        ur.displayname as label,
+        json_build_object(
+            'reputation', ur.reputation,
+            'q_cnt', ur.q_cnt,
+            'a_cnt', ur.a_cnt,
+            'c_cnt', ur.c_cnt,
+            'net_votes_cast', ur.net_votes_cast,
+            'gold_badges', ur.gold_badges,
+            'silver_badges', ur.silver_badges,
+            'bronze_badges', ur.bronze_badges,
+            'tag_badges', ur.tag_badges,
+            'authored_questions', ur.authored_questions,
+            'high_quality_questions', ur.high_quality_questions,
+            'avg_quality_score', ur.avg_quality_score,
+            'stddev_quality_score', ur.stddev_quality_score,
+            'first_question_date', ur.first_question_date,
+            'last_question_date', ur.last_question_date
+        ) as payload
+    from user_rollup ur
+    union all
+    select
+        'TAG_ROLLUP' as section,
+        cast(null as integer), cast(null as integer),
+        cast(null as integer),
+        tr.tag as label,
+        json_build_object(
+            'q_with_tag', tr.q_with_tag,
+            'avg_q_score_for_tag', tr.avg_q_score_for_tag,
+            'avg_ans_score_for_tag', tr.avg_ans_score_for_tag,
+            'q_with_answers', tr.q_with_answers,
+            'q_with_accept', tr.q_with_accept,
+            'global_tag_count', tr.global_tag_count,
+            'any_required', tr.any_required,
+            'any_mod_only', tr.any_mod_only
+        ) as payload
+    from tag_rollup tr
+    union all
+    select
+        'RANKED_QUESTIONS' as section,
+        rq.global_rank as id1,
+        rq.monthly_rank as id2,
+        rq.question_id as entity_id,
+        rq.title as label,
+        json_build_object(
+            'quality_score', rq.quality_score,
+            'viewcount', rq.viewcount,
+            'vote_score', rq.vote_score,
+            'favorite_cnt', rq.favorite_cnt,
+            'answers_cnt', rq.answers_cnt,
+            'has_accepted_answer', rq.has_accepted_answer,
+            'first_answer_date', rq.first_answer_date,
+            'last_answer_date', rq.last_answer_date,
+            'closed', (rq.first_closed_date is not null),
+            'duplicate_cnt', rq.duplicate_cnt
+        ) as payload
+    from ranked_questions rq
+    where rq.global_rank <= 500
+    union all
+    select
+        'DUPLICATE_TITLE_CANDIDATES' as section,
+        cast(null as integer), cast(null as integer), cast(null as integer),
+        ('Q' || dt.qid1 || ' ~ Q' || dt.qid2) as label,
+        json_build_object(
+            'qid1', dt.qid1,
+            'qid2', dt.qid2,
+            'title1', dt.title1,
+            'title2', dt.title2,
+            'qs1', dt.qs1,
+            'qs2', dt.qs2,
+            'title_similarity', dt.title_sim
+        ) as payload
+    from dup_top dt
+)
+select *
+from final_union
+order by section, coalesce(id1, 0), coalesce(id2, 0), label
+limit 1000;

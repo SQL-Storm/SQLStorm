@@ -1,0 +1,287 @@
+-- {"query": "1010.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3808} 
+WITH UserEngagement AS (
+    -- Summarize user activity: post counts, comment counts, badge distribution
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS AnswerCount,
+        SUM(P.Score) AS TotalPostScore,
+        AVG(P.Score) AS AveragePostScore,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        MAX(P.LastActivityDate) AS LatestPostActivityDate,
+        MAX(U.LastAccessDate) AS UserLastAccessDate
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate
+    HAVING COUNT(DISTINCT P.Id) > 5 -- Only consider users with a reasonable number of posts
+       AND SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) >= 1 -- At least one gold badge
+),
+PostHistoricalMetrics AS (
+    -- Analyze post history for edits, closes, and other events
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS CurrentScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.FavoriteCount,
+        COUNT(PH.Id) AS TotalHistoryEvents,
+        COUNT(CASE WHEN PH.PostHistoryTypeId IN (4,5,6) THEN PH.Id END) AS EditCount, -- Title, Body, Tags edits
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.CreationDate END) AS ClosedDateHistory, -- Check if closed
+        MAX(CASE WHEN PH.PostHistoryTypeId = 11 THEN PH.CreationDate END) AS ReopenedDate, -- Check if reopened
+        SUM(CASE WHEN V.VoteTypeId IN (2, 8) THEN 1 ELSE 0 END) AS UpvoteBountyVotes, -- UpMod or BountyStart
+        SUM(CASE WHEN V.VoteTypeId IN (3, 10, 12) THEN 1 ELSE 0 END) AS DownvoteDeletionSpamVotes, -- DownMod, Deletion, Spam
+        MAX(PH.CreationDate) AS LatestHistoryEventDate,
+        ROW_NUMBER() OVER(PARTITION BY P.OwnerUserId ORDER BY P.Score DESC, P.ViewCount DESC, P.LastActivityDate DESC) AS RankByUserBestPost
+    FROM Posts P
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    LEFT JOIN Votes V ON P.Id = V.PostId
+    GROUP BY P.Id, P.PostTypeId, P.OwnerUserId, P.CreationDate, P.Score, P.ViewCount, P.AnswerCount, P.FavoriteCount
+    HAVING COUNT(PH.Id) > 2 -- Posts with some history
+),
+IndividualPostTags AS (
+    -- Extracts individual tags from the 'Tags' string for each post
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        LOWER(TRIM(UNNEST(STRING_TO_ARRAY(SUBSTRING(P.Tags, 2, LENGTH(P.Tags)-2), '><')))) AS TagName
+    FROM Posts P
+    WHERE P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2
+),
+TagPerformanceByUserAndTag AS (
+    -- Aggregates performance metrics for each tag per user
+    SELECT
+        IPT.OwnerUserId AS UserId,
+        IPT.TagName,
+        SUM(P.Score) AS TagScoreSum,
+        COUNT(DISTINCT IPT.PostId) AS PostsWithTagCount
+    FROM IndividualPostTags IPT
+    JOIN Posts P ON IPT.PostId = P.Id
+    GROUP BY IPT.OwnerUserId, IPT.TagName
+    HAVING COUNT(DISTINCT IPT.PostId) > 1
+),
+UserTopTag AS (
+    -- Identifies the single top-performing tag for each user based on TagScoreSum
+    SELECT
+        UserId,
+        TagName AS TopTagName,
+        TagScoreSum AS TopTagScoreSum,
+        PostsWithTagCount AS TopTagPostsCount,
+        ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY TagScoreSum DESC, PostsWithTagCount DESC) AS rn
+    FROM TagPerformanceByUserAndTag
+),
+UserPostDetails AS (
+    -- Combines user engagement with historical post metrics and user's top tag
+    SELECT
+        UE.UserId,
+        UE.DisplayName,
+        UE.Reputation,
+        UE.TotalPosts,
+        UE.GoldBadges,
+        UE.SilverBadges,
+        UE.BronzeBadges,
+        UE.LatestPostActivityDate,
+        UE.UserLastAccessDate,
+        PHM.PostId,
+        PHM.PostTypeId,
+        PHM.CurrentScore AS PostScore,
+        PHM.ViewCount AS PostViewCount,
+        PHM.EditCount,
+        PHM.UpvoteBountyVotes,
+        PHM.DownvoteDeletionSpamVotes,
+        PHM.ClosedDateHistory,
+        PHM.ReopenedDate,
+        PHM.LatestHistoryEventDate,
+        PHM.RankByUserBestPost,
+        P.Title,
+        P.Tags,
+        P.Body,
+        P.ParentId,
+        P.AcceptedAnswerId,
+        P.FavoriteCount,
+        P.LastEditDate,
+        COALESCE(P.CommunityOwnedDate, '9999-12-31'::timestamp) AS CommunityOwnedDateOrDefault,
+        UTT.TopTagName,
+        UTT.TopTagScoreSum,
+        UTT.TopTagPostsCount
+    FROM UserEngagement UE
+    JOIN PostHistoricalMetrics PHM ON UE.UserId = PHM.OwnerUserId
+    JOIN Posts P ON PHM.PostId = P.Id
+    LEFT JOIN UserTopTag UTT ON UE.UserId = UTT.UserId AND UTT.rn = 1
+    WHERE PHM.RankByUserBestPost <= 3 -- Consider up to top 3 posts per user by score/views
+      AND (P.PostTypeId = 1 OR (P.PostTypeId = 2 AND P.ParentId IS NOT NULL)) -- Ensure valid questions or answers
+      AND P.Score >= 10 -- Minimum score
+      AND P.CreationDate BETWEEN cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '3 years' AND cast('2024-10-01 12:34:56' as timestamp) -- Posts within the last 3 years
+),
+CorrelatedSubqueryCheck AS (
+    -- Performs correlated subqueries to check for specific user/post interactions
+    SELECT
+        UPD.UserId,
+        UPD.PostId,
+        UPD.PostTypeId,
+        EXISTS (
+            SELECT 1
+            FROM Posts AS InnerP
+            WHERE InnerP.OwnerUserId = UPD.UserId
+              AND InnerP.PostTypeId = 2 -- Is an answer
+              AND InnerP.ParentId IN (
+                  SELECT InnerQ.Id
+                  FROM Posts AS InnerQ
+                  WHERE InnerQ.OwnerUserId = UPD.UserId
+                    AND InnerQ.PostTypeId = 1 -- Is a question by the same user
+              )
+              AND InnerP.Id != UPD.PostId -- Exclude the current post if it's an answer itself
+        ) AS HasSelfAnsweredOwnQuestion,
+        (SELECT COUNT(DISTINCT C.UserId) FROM Comments C WHERE C.PostId = UPD.PostId AND C.UserId IS NOT NULL) AS UniqueCommentersCount,
+        (SELECT MIN(PH_Closed.CreationDate) FROM PostHistory AS PH_Closed WHERE PH_Closed.PostId = UPD.PostId AND PH_Closed.PostHistoryTypeId = 10 AND PH_Closed.CreationDate > UPD.PostCreationDate) AS FirstCloseDateAfterCreation,
+        (SELECT COUNT(DISTINCT V.UserId) FROM Votes V WHERE V.PostId = UPD.PostId AND V.VoteTypeId = 5) AS FavoriteCountFromVotes
+    FROM UserPostDetails UPD
+),
+WindowFunctionAnalysis AS (
+    -- Applies various window functions for ranking, lead/lag, and quartile analysis
+    SELECT
+        UPD.UserId,
+        UPD.DisplayName,
+        UPD.PostId,
+        UPD.PostTypeId,
+        UPD.Title,
+        UPD.PostScore,
+        UPD.PostViewCount,
+        UPD.EditCount,
+        UPD.GoldBadges,
+        UPD.SilverBadges,
+        UPD.BronzeBadges,
+        UPD.TopTagName,
+        UPD.TopTagScoreSum,
+        UPD.TopTagPostsCount,
+        CSQC.HasSelfAnsweredOwnQuestion,
+        CSQC.UniqueCommentersCount,
+        CSQC.FirstCloseDateAfterCreation,
+        CSQC.FavoriteCountFromVotes,
+        LAG(UPD.PostScore, 1, 0) OVER (PARTITION BY UPD.UserId ORDER BY UPD.PostCreationDate) AS PreviousPostScore,
+        ROW_NUMBER() OVER (PARTITION BY UPD.UserId, UPD.PostTypeId ORDER BY UPD.PostScore DESC, UPD.PostViewCount DESC) AS RankWithinTypeByUser,
+        NTILE(4) OVER (ORDER BY UPD.Reputation DESC, UPD.LatestPostActivityDate DESC) AS UserEngagementQuartile,
+        DENSE_RANK() OVER (PARTITION BY UPD.TopTagName ORDER BY UPD.PostScore DESC) AS RankInTopTagByScore,
+        CASE
+            WHEN UPD.ClosedDateHistory IS NOT NULL THEN 'Closed'
+            WHEN UPD.ReopenedDate IS NOT NULL AND UPD.ReopenedDate > UPD.ClosedDateHistory THEN 'Reopened'
+            ELSE 'Open'
+        END AS PostStatus,
+        EXTRACT(EPOCH FROM (UPD.LatestHistoryEventDate - UPD.PostCreationDate)) / 3600 AS HoursSinceCreationToLastHistory,
+        CASE
+            WHEN UPD.LastEditDate IS NOT NULL AND UPD.LastEditDate > UPD.PostCreationDate THEN EXTRACT(DAY FROM (UPD.LastEditDate - UPD.PostCreationDate))
+            ELSE NULL
+        END AS DaysToFirstEdit
+    FROM UserPostDetails UPD
+    JOIN CorrelatedSubqueryCheck CSQC ON UPD.UserId = CSQC.UserId AND UPD.PostId = CSQC.PostId
+    WHERE (UPD.Reputation > 5000 AND UPD.GoldBadges > 1) OR (UPD.SilverBadges > 5)
+      AND UPD.UserLastAccessDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '6 months'
+      AND CSQC.UniqueCommentersCount > 0
+),
+CombinedUserStats AS (
+    -- Aggregates statistics for each user from the detailed post analysis
+    SELECT
+        WFA.UserId,
+        WFA.DisplayName,
+        WFA.UserEngagementQuartile,
+        SUM(WFA.PostScore) AS AggregateUserPostScore,
+        SUM(WFA.PostViewCount) AS AggregateUserPostViews,
+        SUM(WFA.EditCount) AS AggregateUserEditCount,
+        SUM(WFA.UpvoteBountyVotes) AS TotalUpvotesBounties,
+        SUM(WFA.DownvoteDeletionSpamVotes) AS TotalDownvotesDeletionSpam,
+        MAX(WFA.GoldBadges) AS MaxGoldBadges,
+        MAX(WFA.SilverBadges) AS MaxSilverBadges,
+        MAX(WFA.BronzeBadges) AS MaxBronzeBadges,
+        COUNT(DISTINCT WFA.PostId) AS ProcessedPostsCount,
+        STRING_AGG(DISTINCT WFA.TopTagName, ', ') FILTER (WHERE WFA.TopTagName IS NOT NULL) AS TopTagsContributed,
+        AVG(CASE WHEN WFA.PostTypeId = 1 THEN WFA.PostScore ELSE NULL END) AS AvgQuestionScore,
+        AVG(CASE WHEN WFA.PostTypeId = 2 THEN WFA.PostScore ELSE NULL END) AS AvgAnswerScore,
+        COUNT(DISTINCT CASE WHEN WFA.HasSelfAnsweredOwnQuestion THEN WFA.PostId ELSE NULL END) AS SelfAnsweredPostsCount,
+        MAX(WFA.DaysToFirstEdit) AS MaxDaysToFirstEdit,
+        MAX(WFA.HoursSinceCreationToLastHistory) AS MaxHoursSinceCreationToLastHistory,
+        SUM(CASE WHEN WFA.PostStatus = 'Closed' THEN 1 ELSE 0 END) AS ClosedPostsCount,
+        SUM(CASE WHEN WFA.PostStatus = 'Reopened' THEN 1 ELSE 0 END) AS ReopenedPostsCount,
+        SUM(WFA.FavoriteCountFromVotes) AS TotalFavoriteCount
+    FROM WindowFunctionAnalysis WFA
+    GROUP BY WFA.UserId, WFA.DisplayName, WFA.UserEngagementQuartile
+    HAVING SUM(WFA.PostScore) > 100 AND COUNT(DISTINCT WFA.PostId) > 1
+)
+-- Final selection combining various metrics and performing a set operation (UNION ALL)
+SELECT
+    CUS.UserId,
+    CUS.DisplayName,
+    CUS.UserEngagementQuartile,
+    CUS.AggregateUserPostScore,
+    CUS.AggregateUserPostViews,
+    CUS.ProcessedPostsCount,
+    CUS.TopTagsContributed,
+    CUS.SelfAnsweredPostsCount,
+    CUS.MaxDaysToFirstEdit,
+    CUS.ClosedPostsCount,
+    CUS.TotalFavoriteCount,
+    'HighEngagementUser' AS UserCategory,
+    'Primary Query Path' AS SourceQuery,
+    NULL AS PotentialReasonForLowerEngagement
+FROM CombinedUserStats CUS
+WHERE CUS.UserEngagementQuartile IN (1, 2)
+  AND CUS.SelfAnsweredPostsCount > 0
+  AND CUS.ClosedPostsCount = 0
+  AND CUS.MaxGoldBadges >= 2
+  AND CUS.TotalFavoriteCount >= 5
+  AND EXISTS (
+      SELECT 1 FROM Posts P
+      WHERE P.OwnerUserId = CUS.UserId
+        AND P.Title ILIKE '%(api|rest|graphql)%' -- Complex string pattern matching
+        AND LENGTH(P.Body) > 500
+        AND P.LastEditDate > P.CreationDate + INTERVAL '1 hour'
+  )
+
+UNION ALL
+
+SELECT
+    CUS.UserId,
+    CUS.DisplayName,
+    CUS.UserEngagementQuartile,
+    CUS.AggregateUserPostScore,
+    CUS.AggregateUserPostViews,
+    CUS.ProcessedPostsCount,
+    CUS.TopTagsContributed,
+    CUS.SelfAnsweredPostsCount,
+    CUS.MaxDaysToFirstEdit,
+    CUS.ClosedPostsCount,
+    CUS.TotalFavoriteCount,
+    'ModerateEngagementUser' AS UserCategory,
+    'Secondary Query Path' AS SourceQuery,
+    CASE
+        WHEN CUS.ClosedPostsCount > 0 THEN 'HasClosedPosts'
+        WHEN CUS.MaxGoldBadges = 0 THEN 'NoGoldBadges'
+        WHEN CUS.TotalFavoriteCount < 5 THEN 'LowFavorites'
+        ELSE 'OtherFactors'
+    END AS PotentialReasonForLowerEngagement
+FROM CombinedUserStats CUS
+WHERE CUS.UserEngagementQuartile IN (3, 4)
+  AND CUS.ClosedPostsCount > 0
+  AND CUS.MaxGoldBadges < 2
+  AND CUS.MaxHoursSinceCreationToLastHistory IS NOT NULL
+  AND NOT EXISTS ( -- Correlated NOT EXISTS: users who have *not* had any of their answers accepted
+      SELECT 1
+      FROM Posts AcceptedAnswers
+      INNER JOIN Posts Questions ON Questions.AcceptedAnswerId = AcceptedAnswers.Id
+      WHERE AcceptedAnswers.OwnerUserId = CUS.UserId
+  )
+  -- Complex NULL logic: only include if AvgAnswerScore is not NULL AND it's less than AvgQuestionScore OR if AvgAnswerScore IS NULL
+  AND (CUS.AvgAnswerScore IS NULL OR CUS.AvgAnswerScore < CUS.AvgQuestionScore)
+  AND CUS.DisplayName IS NOT NULL AND TRIM(CUS.DisplayName) != ''
+
+ORDER BY AggregateUserPostScore DESC, ProcessedPostsCount DESC, DisplayName NULLS LAST;

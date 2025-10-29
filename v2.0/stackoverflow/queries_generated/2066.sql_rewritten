@@ -1,0 +1,160 @@
+-- {"query": "2066.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1339} 
+WITH RecursiveTagCTE AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        p.Id AS ExcerptPostId,
+        p.Title AS ExcerptTitle,
+        p.Score AS ExcerptScore,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Id = t.ExcerptPostId
+    WHERE t.Count > 100
+    UNION ALL
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        p2.Id,
+        p2.Title,
+        p2.Score,
+        rt.TagRank + 1
+    FROM Tags t2
+    JOIN RecursiveTagCTE rt ON t2.Id = rt.Id + 1
+    LEFT JOIN Posts p2 ON p2.Id = t2.ExcerptPostId
+    WHERE t2.Count > 100 AND rt.TagRank < 10
+),
+PostStats AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(badge_counts.GoldBadges, 0) AS GoldBadges,
+        COALESCE(badge_counts.SilverBadges, 0) AS SilverBadges,
+        COALESCE(badge_counts.BronzeBadges, 0) AS BronzeBadges,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC NULLS LAST) AS PostRank,
+        COUNT(c.Id) OVER (PARTITION BY p.Id) AS CommentCount
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    LEFT JOIN (
+        SELECT
+            UserId,
+            SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+            SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+            SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+        FROM Badges
+        GROUP BY UserId
+    ) AS badge_counts ON badge_counts.UserId = p.OwnerUserId
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    WHERE p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year'
+),
+CorrelatedVotes AS (
+    SELECT
+        p.Id,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpVotesCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS DownVotesCount,
+        COALESCE((SELECT SUM(BountyAmount) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId IN (8,9)),0) AS TotalBounty
+    FROM Posts p
+    WHERE p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year'
+),
+PostLinksInfo AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name AS LinkTypeName,
+        ROW_NUMBER() OVER (PARTITION BY pl.PostId ORDER BY pl.CreationDate DESC) AS LinkRank
+    FROM PostLinks pl
+    INNER JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+),
+FinalPosts AS (
+    SELECT
+        ps.Id,
+        ps.PostTypeId,
+        ps.CreationDate,
+        ps.Score,
+        ps.ViewCount,
+        ps.DisplayName,
+        ps.Reputation,
+        ps.GoldBadges,
+        ps.SilverBadges,
+        ps.BronzeBadges,
+        ps.PostRank,
+        ps.CommentCount,
+        cv.UpVotesCount,
+        cv.DownVotesCount,
+        cv.TotalBounty,
+        pl.LinkTypeName,
+        pl.RelatedPostId
+    FROM PostStats ps
+    LEFT JOIN CorrelatedVotes cv ON cv.Id = ps.Id
+    LEFT JOIN (
+        SELECT PostId, RelatedPostId, LinkTypeName
+        FROM PostLinksInfo
+        WHERE LinkRank = 1
+    ) pl ON pl.PostId = ps.Id
+)
+SELECT
+    fp.Id,
+    CASE
+        WHEN fp.PostTypeId = 1 THEN 'Question'
+        WHEN fp.PostTypeId = 2 THEN 'Answer'
+        WHEN fp.PostTypeId = 3 THEN 'Wiki'
+        ELSE 'Other'
+    END AS PostType,
+    fp.CreationDate,
+    fp.Score,
+    fp.ViewCount,
+    fp.DisplayName AS OwnerName,
+    fp.Reputation AS OwnerReputation,
+    CONCAT(
+        'G:', fp.GoldBadges, ', ',
+        'S:', fp.SilverBadges, ', ',
+        'B:', fp.BronzeBadges
+    ) AS BadgeSummary,
+    fp.PostRank,
+    fp.CommentCount,
+    fp.UpVotesCount,
+    fp.DownVotesCount,
+    fp.TotalBounty,
+    COALESCE(fp.LinkTypeName, 'None') AS TopLinkType,
+    COALESCE(fp.RelatedPostId, -1) AS TopRelatedPostId,
+    CASE 
+        WHEN fp.ViewCount > 10000 THEN 'High Traffic'
+        WHEN fp.ViewCount BETWEEN 1000 AND 10000 THEN 'Medium Traffic'
+        ELSE 'Low Traffic'
+    END AS TrafficCategory,
+    CASE
+        WHEN fp.Score < 0 THEN 'Negative Score'
+        WHEN fp.Score BETWEEN 0 AND 5 THEN 'Low Score'
+        WHEN fp.Score > 5 THEN 'High Score'
+        ELSE 'Unknown Score'
+    END AS ScoreCategory
+FROM FinalPosts fp
+WHERE fp.PostRank <= 50
+UNION
+SELECT
+    rt.Id,
+    'Tag' AS PostType,
+    NULL AS CreationDate,
+    rt.Count AS Score,
+    NULL AS ViewCount,
+    NULL AS OwnerName,
+    NULL AS OwnerReputation,
+    NULL AS BadgeSummary,
+    rt.TagRank AS PostRank,
+    NULL AS CommentCount,
+    NULL AS UpVotesCount,
+    NULL AS DownVotesCount,
+    NULL AS TotalBounty,
+    NULL AS TopLinkType,
+    NULL AS TopRelatedPostId,
+    NULL AS TrafficCategory,
+    NULL AS ScoreCategory
+FROM RecursiveTagCTE rt
+ORDER BY PostType, PostRank, Score DESC NULLS LAST;

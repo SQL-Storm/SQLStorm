@@ -1,0 +1,331 @@
+with recent_questions as (
+    select
+        p.Id as QuestionId,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        coalesce(p.AnswerCount, 0) as AnswerCount,
+        case when p.ClosedDate is null then 0 else 1 end as IsClosed
+    from Posts p
+    where p.PostTypeId = 1
+      and p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+),
+answers as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId,
+        a.Score,
+        a.CreationDate,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc, a.Id asc) as rn_best_by_score,
+        row_number() over (partition by a.ParentId order by a.CreationDate asc, a.Id asc) as rn_fastest
+    from Posts a
+    where a.PostTypeId = 2
+),
+question_stats as (
+    select
+        q.QuestionId,
+        q.CreationDate,
+        q.OwnerUserId,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.Title,
+        q.Tags,
+        q.AnswerCount,
+        q.IsClosed,
+        max(case when ph.PostHistoryTypeId in (10,35) then 1 else 0 end) as HadCloseOrMigrateEvent,
+        min(case when a.AnswerId is not null then a.CreationDate end) as FirstAnswerDate,
+        count(a.AnswerId) as ActualAnswerRows,
+        sum(case when a.rn_best_by_score = 1 then 1 else 0 end) as HasTopScoredAnswer,
+        sum(case when a.rn_fastest = 1 then 1 else 0 end) as HasFastestAnswer
+    from recent_questions q
+    left join answers a on a.QuestionId = q.QuestionId
+    left join PostHistory ph
+      on ph.PostId = q.QuestionId
+     and ph.PostHistoryTypeId in (10,11,12,13,14,15,35,36,50,52,53)
+    group by q.QuestionId, q.CreationDate, q.OwnerUserId, q.Score, q.ViewCount, q.Title, q.Tags, q.AnswerCount, q.IsClosed
+),
+user_dims as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate as UserCreationDate,
+        coalesce(nullif(trim(u.Location), ''), 'Unknown') as NormalizedLocation,
+        coalesce(u.UpVotes,0) as UpVotes,
+        coalesce(u.DownVotes,0) as DownVotes,
+        coalesce(u.Views,0) as ProfileViews,
+        case
+            when lower(coalesce(u.WebsiteUrl,'')) like '%github.com%' then 1
+            when lower(coalesce(u.WebsiteUrl,'')) like '%gitlab.com%' then 1
+            when lower(coalesce(u.WebsiteUrl,'')) like '%bitbucket.org%' then 1
+            else 0
+        end as HasDevWebsite
+    from Users u
+),
+badge_rollup as (
+    select
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        sum(case when b.TagBased = 1 then 1 else 0 end) as TagBadges,
+        count(*) as TotalBadges,
+        max(b.Date) as LastBadgeDate
+    from Badges b
+    group by b.UserId
+),
+question_owner as (
+    select
+        qs.*,
+        ud.DisplayName as OwnerName,
+        ud.Reputation as OwnerReputation,
+        ud.NormalizedLocation,
+        coalesce(br.TotalBadges, 0) as OwnerTotalBadges,
+        coalesce(br.GoldBadges, 0) as OwnerGoldBadges,
+        coalesce(br.SilverBadges, 0) as OwnerSilverBadges,
+        coalesce(br.BronzeBadges, 0) as OwnerBronzeBadges,
+        ud.UpVotes as OwnerUpVotes,
+        ud.DownVotes as OwnerDownVotes,
+        ud.ProfileViews as OwnerProfileViews,
+        ud.HasDevWebsite as OwnerHasDevWebsite
+    from question_stats qs
+    left join user_dims ud on ud.UserId = qs.OwnerUserId
+    left join badge_rollup br on br.UserId = qs.OwnerUserId
+),
+votes_agg as (
+    select
+        v.PostId,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+        sum(case when v.VoteTypeId = 5 then 1 else 0 end) as Favorites,
+        sum(case when v.VoteTypeId in (8,9) then coalesce(v.BountyAmount,0) else 0 end) as BountyTotal,
+        min(case when v.VoteTypeId in (8,9) then v.CreationDate end) as FirstBountyDate
+    from Votes v
+    group by v.PostId
+),
+comments_agg as (
+    select
+        c.PostId,
+        count(*) as CommentCount,
+        max(c.Score) as MaxCommentScore,
+        avg(c.Score) as AvgCommentScore,
+        max(c.CreationDate) as LastCommentDate
+    from Comments c
+    group by c.PostId
+),
+duplicate_links as (
+    select
+        pl.PostId,
+        count(*) filter (where pl.LinkTypeId = 3) as DuplicateCount,
+        count(*) filter (where pl.LinkTypeId = 1) as LinkedCount,
+        max(case when pl.LinkTypeId = 3 then pl.CreationDate end) as LastDuplicateLink
+    from PostLinks pl
+    group by pl.PostId
+),
+tag_expansion as (
+    select
+        q.QuestionId,
+        unnest(string_to_array(substring(coalesce(q.Tags,'<>'), 2, greatest(length(coalesce(q.Tags,'<>'))-2,0)), '><')) as TagName
+    from question_owner q
+),
+tag_stats as (
+    select
+        te.QuestionId,
+        count(*) as TagCount,
+        string_agg(te.TagName, ',' order by te.TagName) as TagList,
+        max(t.Count) as MaxTagGlobalCount,
+        sum(case when t.IsModeratorOnly = 1 then 1 else 0 end) as ModOnlyTagCount,
+        sum(case when t.IsRequired = 1 then 1 else 0 end) as RequiredTagCount
+    from tag_expansion te
+    left join Tags t on lower(t.TagName) = lower(te.TagName)
+    group by te.QuestionId
+),
+accepted_answer as (
+    select
+        q.QuestionId,
+        pa.Id as AcceptedAnswerId,
+        pa.Score as AcceptedScore,
+        pa.OwnerUserId as AcceptedOwnerUserId,
+        pa.CreationDate as AcceptedCreationDate
+    from question_owner q
+    left join Posts pq on pq.Id = q.QuestionId
+    left join Posts pa on pa.Id = pq.AcceptedAnswerId
+),
+best_scored_answer as (
+    select
+        a.QuestionId,
+        a.AnswerId as BestAnswerId,
+        a.OwnerUserId as BestOwnerUserId,
+        a.Score as BestAnswerScore,
+        a.CreationDate as BestAnswerCreation
+    from answers a
+    where a.rn_best_by_score = 1
+),
+fastest_answer as (
+    select
+        a.QuestionId,
+        a.AnswerId as FastestAnswerId,
+        a.OwnerUserId as FastestOwnerUserId,
+        a.CreationDate as FastestAnswerCreation
+    from answers a
+    where a.rn_fastest = 1
+),
+answerer_dims as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        coalesce(br.TotalBadges,0) as TotalBadges,
+        coalesce(br.GoldBadges,0) as GoldBadges,
+        coalesce(br.SilverBadges,0) as SilverBadges,
+        coalesce(br.BronzeBadges,0) as BronzeBadges
+    from Users u
+    left join badge_rollup br on br.UserId = u.Id
+),
+question_quality as (
+    select
+        q.QuestionId,
+        case
+            when q.AnswerCount = 0 and q.ViewCount >= 1000 then 'UNANSWERED_HIGH_VIEW'
+            when q.AnswerCount >= 5 and q.ViewCount < 500 then 'MANY_ANSWERS_LOW_VIEW'
+            when q.QuestionScore >= 5 and coalesce(va.UpVotes,0) >= 10 then 'POPULAR'
+            when q.IsClosed = 1 and coalesce(dl.DuplicateCount,0) >= 1 then 'CLOSED_DUPLICATE'
+            else 'NORMAL'
+        end as QualityBucket
+    from question_owner q
+    left join votes_agg va on va.PostId = q.QuestionId
+    left join duplicate_links dl on dl.PostId = q.QuestionId
+),
+time_to_firsts as (
+    select
+        q.QuestionId,
+        extract(epoch from (fa.FastestAnswerCreation - q.CreationDate)) / 60.0 as MinutesToFirstAnswer,
+        extract(epoch from (aa.AcceptedCreationDate - q.CreationDate)) / 60.0 as MinutesToAcceptedAnswer
+    from question_owner q
+    left join fastest_answer fa on fa.QuestionId = q.QuestionId
+    left join accepted_answer aa on aa.QuestionId = q.QuestionId
+),
+ranked_questions as (
+    select
+        q.QuestionId,
+        q.Title,
+        q.OwnerName,
+        q.OwnerReputation,
+        q.OwnerTotalBadges,
+        q.QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        coalesce(va.UpVotes,0) as UpVotes,
+        coalesce(va.DownVotes,0) as DownVotes,
+        coalesce(va.Favorites,0) as Favorites,
+        coalesce(va.BountyTotal,0) as BountyTotal,
+        coalesce(ca.CommentCount,0) as CommentCount,
+        coalesce(ts.TagCount,0) as TagCount,
+        ts.TagList,
+        qq.QualityBucket,
+        coalesce(ttf.MinutesToFirstAnswer, null) as MinutesToFirstAnswer,
+        coalesce(ttf.MinutesToAcceptedAnswer, null) as MinutesToAcceptedAnswer,
+        aa.AcceptedAnswerId,
+        bsa.BestAnswerId,
+        fa.FastestAnswerId,
+        rank() over (
+            order by
+                case qq.QualityBucket when 'POPULAR' then 1 when 'NORMAL' then 2 when 'UNANSWERED_HIGH_VIEW' then 3 when 'MANY_ANSWERS_LOW_VIEW' then 4 when 'CLOSED_DUPLICATE' then 5 else 6 end,
+                greatest(q.QuestionScore, coalesce(va.UpVotes,0) - coalesce(va.DownVotes,0)) desc,
+                q.ViewCount desc,
+                q.AnswerCount desc
+        ) as RankOverall
+    from question_owner q
+    left join votes_agg va on va.PostId = q.QuestionId
+    left join comments_agg ca on ca.PostId = q.QuestionId
+    left join tag_stats ts on ts.QuestionId = q.QuestionId
+    left join question_quality qq on qq.QuestionId = q.QuestionId
+    left join time_to_firsts ttf on ttf.QuestionId = q.QuestionId
+    left join accepted_answer aa on aa.QuestionId = q.QuestionId
+    left join best_scored_answer bsa on bsa.QuestionId = q.QuestionId
+    left join fastest_answer fa on fa.QuestionId = q.QuestionId
+    group by q.QuestionId, q.Title, q.OwnerName, q.OwnerReputation, q.OwnerTotalBadges, q.QuestionScore, q.ViewCount, q.AnswerCount, va.UpVotes, va.DownVotes, va.Favorites, va.BountyTotal, ca.CommentCount, ts.TagCount, ts.TagList, qq.QualityBucket, ttf.MinutesToFirstAnswer, ttf.MinutesToAcceptedAnswer, aa.AcceptedAnswerId, bsa.BestAnswerId, fa.FastestAnswerId, q.QuestionId, q.Title, q.OwnerName, q.OwnerReputation, q.OwnerTotalBadges, q.QuestionScore, q.ViewCount, q.AnswerCount
+),
+answer_join as (
+    select
+        rq.*,
+        aa_dim.DisplayName as AcceptedAnswerer,
+        aa_dim.Reputation as AcceptedAnswererRep,
+        bsa_dim.DisplayName as BestAnswerer,
+        bsa_dim.Reputation as BestAnswererRep,
+        fa_dim.DisplayName as FastestAnswerer,
+        fa_dim.Reputation as FastestAnswererRep
+    from ranked_questions rq
+    left join accepted_answer aa on aa.QuestionId = rq.QuestionId
+    left join answerer_dims aa_dim on aa_dim.UserId = aa.AcceptedOwnerUserId
+    left join best_scored_answer bsa on bsa.QuestionId = rq.QuestionId
+    left join answerer_dims bsa_dim on bsa_dim.UserId = bsa.BestOwnerUserId
+    left join fastest_answer fa on fa.QuestionId = rq.QuestionId
+    left join answerer_dims fa_dim on fa_dim.UserId = fa.FastestOwnerUserId
+),
+finalized as (
+    select
+        aj.*,
+        case when aj.AcceptedAnswerId is not null then 1 else 0 end as HasAccepted,
+        case when aj.BestAnswerId is not null then 1 else 0 end as HasBestByScore,
+        case when aj.FastestAnswerId is not null then 1 else 0 end as HasFastest
+    from answer_join aj
+),
+top_n as (
+    select *
+    from finalized
+    where
+        (
+            (OwnerReputation >= 1000 and Favorites >= 10)
+            or (OwnerTotalBadges >= 10 and TagCount >= 3)
+            or (QualityBucket in ('POPULAR','UNANSWERED_HIGH_VIEW'))
+        )
+        and coalesce(DownVotes,0) <= coalesce(UpVotes,0)
+        and (MinutesToAcceptedAnswer is null or MinutesToAcceptedAnswer <= 7*24*60)
+),
+top_n_ranked as (
+    select
+        t.*,
+        row_number() over (order by t.RankOverall, t.ViewCount desc, t.Favorites desc, t.QuestionId desc) as rn
+    from top_n t
+)
+select
+    f.QuestionId,
+    f.RankOverall,
+    f.Title,
+    f.OwnerName,
+    f.OwnerReputation,
+    f.OwnerTotalBadges,
+    f.QuestionScore,
+    f.UpVotes,
+    f.DownVotes,
+    f.Favorites,
+    f.ViewCount,
+    f.AnswerCount,
+    f.TagCount,
+    coalesce(f.TagList, '') as TagList,
+    f.QualityBucket,
+    round(coalesce(f.MinutesToFirstAnswer, -1), 2) as MinutesToFirstAnswer,
+    round(coalesce(f.MinutesToAcceptedAnswer, -1), 2) as MinutesToAcceptedAnswer,
+    f.AcceptedAnswerId,
+    f.AcceptedAnswerer,
+    f.AcceptedAnswererRep,
+    f.BestAnswerId,
+    f.BestAnswerer,
+    f.BestAnswererRep,
+    f.FastestAnswerId,
+    f.FastestAnswerer,
+    f.FastestAnswererRep,
+    case
+        when f.HasAccepted = 1 and f.HasBestByScore = 1 and f.AcceptedAnswerId = f.BestAnswerId then 'ACCEPTED_IS_BEST'
+        when f.HasAccepted = 1 and (f.BestAnswerId is null or f.AcceptedAnswerId <> f.BestAnswerId) then 'ACCEPTED_NOT_BEST'
+        when f.HasAccepted = 0 and f.HasBestByScore = 1 then 'NO_ACCEPTED_HAS_BEST'
+        else 'NO_ACCEPTED_NO_BEST'
+    end as AcceptanceVsBest,
+    case when f.HasFastest = 1 then 'HAS_FASTEST' else 'NO_FASTEST' end as HasFastestFlag
+from top_n_ranked f
+where f.rn <= 200;

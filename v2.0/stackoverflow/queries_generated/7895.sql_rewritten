@@ -1,0 +1,189 @@
+-- {"query": "7895.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2046} 
+WITH UserPostStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS TotalQuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS TotalAnswerScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) AS AvgAnswerScore,
+        COUNT(DISTINCT p.Tags) AS UniqueTagCount,
+        STRING_AGG(DISTINCT p.Tags, ', ') AS AllTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+RankedUsers AS (
+    SELECT 
+        *,
+        RANK() OVER (ORDER BY TotalQuestionScore DESC) AS ScoreRank,
+        DENSE_RANK() OVER (ORDER BY QuestionCount DESC) AS QuestionsRank
+    FROM UserPostStats
+),
+TopQuestionPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        p.Tags,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.LastActivityDate,
+        DATEDIFF(DAY, p.CreationDate, p.LastActivityDate) AS DaysActive,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS TopPostRank,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) AS TotalPostsByUser
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1 
+    AND p.CreationDate >= DATEADD(YEAR, -2, cast('2024-10-01 12:34:56' as timestamp))
+),
+PostHistoryAnalysis AS (
+    SELECT 
+        ph.PostId,
+        COUNT(*) AS HistoryCount,
+        MAX(ph.CreationDate) AS LastHistoryDate,
+        STRING_AGG(ph.Comment, ', ') AS AllComments,
+        COUNT(DISTINCT ph.PostHistoryTypeId) AS UniqueActionTypes,
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN 1 ELSE 0 END) AS HasCloseOrDeleteActions
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        NULLIF(LEN(t.TagName) - LEN(REPLACE(t.TagName, '(', '')), 0) AS OpenParenCount,
+        REVERSE(SUBSTRING(REVERSE(t.TagName), 1, CHARINDEX('(', REVERSE(t.TagName)) - 1)) AS CleanedTagName,
+        CASE 
+            WHEN t.IsRequired = 1 THEN 'Required'
+            WHEN t.IsModeratorOnly = 1 THEN 'Moderator Only'
+            ELSE 'Standard'
+        END AS TagType
+    FROM Tags t
+),
+ComplexUserQuery AS (
+    SELECT 
+        ru.UserId,
+        ru.DisplayName,
+        ru.Reputation,
+        ru.TotalPosts,
+        ru.QuestionCount,
+        ru.AnswerCount,
+        COALESCE(ru.TotalQuestionScore, 0) AS TotalQuestionScore,
+        COALESCE(ru.TotalAnswerScore, 0) AS TotalAnswerScore,
+        ru.ScoreRank,
+        ru.QuestionsRank,
+        CASE 
+            WHEN ru.TotalPosts >= 100 AND ru.Reputation >= 10000 THEN 'Elite'
+            WHEN ru.TotalPosts >= 50 AND ru.Reputation >= 5000 THEN 'Veteran'
+            WHEN ru.TotalPosts >= 10 THEN 'Regular'
+            ELSE 'Newbie'
+        END AS UserTier,
+        CASE 
+            WHEN ru.TotalAnswerScore > ru.TotalQuestionScore * 2 THEN 'Answer Focus'
+            WHEN ru.TotalQuestionScore > ru.TotalAnswerScore * 2 THEN 'Question Focus'
+            ELSE 'Balanced'
+        END AS ActivityFocus,
+        IIF(ru.LastPostDate >= DATEADD(DAY, -30, cast('2024-10-01 12:34:56' as timestamp)), 'Active', 'Inactive') AS PostActivityStatus,
+        COALESCE((SELECT TOP 1 p.Title 
+                  FROM Posts p 
+                  INNER JOIN Votes v ON p.Id = v.PostId 
+                  WHERE p.OwnerUserId = ru.UserId 
+                  AND v.VoteTypeId = 2 
+                  ORDER BY v.CreationDate DESC), 'No Upvotes') AS RecentUpvotedPost,
+        NULLIF(CASE 
+                 WHEN ru.QuestionCount > 0 THEN CAST(ru.TotalAnswerScore AS FLOAT) / CAST(ru.QuestionCount AS FLOAT)
+                 ELSE 0 
+               END, 0) AS AvgAnswersPerQuestion
+    FROM RankedUsers ru
+    WHERE ru.ScoreRank <= 100 
+    AND ru.Reputation > 1
+),
+FinalQuery AS (
+    SELECT 
+        cq.UserId,
+        cq.DisplayName,
+        cq.Reputation,
+        cq.TotalPosts,
+        cq.QuestionCount,
+        cq.AnswerCount,
+        cq.TotalQuestionScore,
+        cq.TotalAnswerScore,
+        cq.ScoreRank,
+        cq.QuestionsRank,
+        cq.UserTier,
+        cq.ActivityFocus,
+        cq.PostActivityStatus,
+        cq.RecentUpvotedPost,
+        cq.AvgAnswersPerQuestion,
+        COALESCE(pqa.HistoryCount, 0) AS PostHistoryCount,
+        pqa.LastHistoryDate,
+        COALESCE(pqa.UniqueActionTypes, 0) AS UniqueActionTypes,
+        CASE WHEN pqa.HasCloseOrDeleteActions = 1 THEN 'Has Close/Deletion History' ELSE 'No Close/Deletion History' END AS HistoryStatus,
+        COALESCE(ta.TagName, 'No Tags') AS PopularTag,
+        ta.TagCount,
+        ta.TagType,
+        CASE 
+            WHEN ta.TagName IS NOT NULL THEN ta.TagName 
+            ELSE LEFT(ru.AllTags, 100)
+        END AS TagInformation,
+        (SELECT COUNT(*) 
+         FROM Posts p 
+         WHERE p.OwnerUserId = cq.UserId 
+         AND p.CreationDate >= DATEADD(MONTH, -6, cast('2024-10-01 12:34:56' as timestamp))) AS RecentPostsInLast6Months,
+        COALESCE((SELECT TOP 1 COUNT(*) 
+                  FROM Comments c 
+                  WHERE c.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = cq.UserId AND PostTypeId = 1)
+                  GROUP BY c.PostId 
+                  ORDER BY COUNT(*) DESC), 0) AS MaxCommentsOnQuestion,
+        CASE 
+            WHEN cq.QuestionCount > 0 AND cq.AnswerCount > 0 THEN 
+                CAST((CAST(cq.AnswerCount AS FLOAT) / CAST(cq.QuestionCount AS FLOAT)) * 100 AS INT)
+            ELSE 0 
+        END AS AnswerToQuestionRatioPercent,
+        CASE 
+            WHEN cq.TotalQuestionScore > 0 THEN (cq.TotalAnswerScore * 100.0) / cq.TotalQuestionScore
+            ELSE 0 
+        END AS AnswerScorePercentage,
+        CASE 
+            WHEN EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = cq.UserId AND b.Name IN ('Popular Question', 'Notable Question')) 
+            THEN 'Has Notable Questions'
+            ELSE 'No Notable Questions'
+        END AS QuestionNotabilityStatus
+    FROM ComplexUserQuery cq
+    LEFT JOIN PostHistoryAnalysis pqa ON cq.UserId IN (
+        SELECT DISTINCT p.OwnerUserId 
+        FROM Posts p 
+        WHERE p.Id IN (SELECT PostId FROM PostHistory ph WHERE ph.UserId = cq.UserId)
+    )
+    LEFT JOIN TagAnalysis ta ON ta.TagName IN (
+        SELECT DISTINCT TRIM(value) 
+        FROM STRING_SPLIT(
+            COALESCE(NULLIF(cq.AllTags, ''), 'No Tags'), 
+            '<'
+        ) WHERE value LIKE '%>'
+    )
+    LEFT JOIN RankedUsers ru ON cq.UserId = ru.UserId
+    WHERE cq.TotalPosts >= 1
+)
+SELECT 
+    *
+FROM FinalQuery
+WHERE ScoreRank IS NOT NULL
+ORDER BY ScoreRank, TotalQuestionScore DESC
+OFFSET 0 ROWS
+FETCH NEXT 5000 ROWS ONLY;

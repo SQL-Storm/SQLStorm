@@ -1,0 +1,172 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CAST(t.TagName AS VARCHAR(1400)) AS FullPath,
+        1 AS Depth
+    FROM Tags t
+    WHERE t.IsModeratorOnly = false AND t.IsRequired = false
+
+  UNION ALL
+
+    SELECT
+        c.Id,
+        c.TagName,
+        c.Count,
+        c.ExcerptPostId,
+        c.WikiPostId,
+        r.FullPath || ' > ' || c.TagName AS FullPath,
+        r.Depth + 1
+    FROM Tags c
+    INNER JOIN RecursiveTagHierarchy r ON c.ExcerptPostId = r.WikiPostId AND c.Id <> r.Id
+),
+UserBadgeCounts AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName
+),
+PostAnswerStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title AS QuestionTitle,
+        q.Tags AS QuestionTags,
+        q.OwnerUserId,
+        q.Score AS QuestionScore,
+        COUNT(a.Id) FILTER (WHERE a.Id IS NOT NULL) AS AnswerCount,
+        COALESCE(AVG(a.Score), 0) AS AvgAnswerScore,
+        MAX(a.CreationDate) AS LastAnswerDate,
+        SUM(CASE 
+            WHEN a.OwnerUserId IS NOT NULL AND a.OwnerUserId <> q.OwnerUserId THEN 1 ELSE 0 END) AS AnswersByOthersCount
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.Title, q.Tags, q.OwnerUserId, q.Score
+),
+UserActivityWindow AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsPosted,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersPosted,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY MAX(p.LastActivityDate) DESC) AS ActivityRank,
+        MAX(p.LastActivityDate) AS MostRecentActivity,
+        MIN(p.CreationDate) AS FirstPostDate,
+        CAST(FLOOR(EXTRACT(EPOCH FROM (MAX(p.LastActivityDate) - MIN(p.CreationDate)))/86400) AS INTEGER) AS ActiveDaysSpan
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+ClosedQuestionReasons AS (
+    SELECT
+        ph.PostId,
+        crt.Name AS CloseReason,
+        MIN(ph.CreationDate) AS ClosedAt
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = CASE
+        WHEN ph.Comment ~ '^[0-9]+$' THEN CAST(ph.Comment AS INTEGER)
+        ELSE NULL
+    END
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.PostId, crt.Name
+),
+HighlyVotedAnswers AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.Score,
+        a.CreationDate,
+        u.DisplayName AS AnswerOwner,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS ScoreRank,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = a.Id AND v.VoteTypeId = 2) AS UpVotes,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = a.Id AND v.VoteTypeId = 3) AS DownVotes
+    FROM Posts a
+    LEFT JOIN Users u ON a.OwnerUserId = u.Id
+    WHERE a.PostTypeId = 2
+      AND a.Score > 10
+),
+QuestionsWithPreferredAnswerStats AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.AcceptedAnswerId,
+        a.Score AS AcceptedAnswerScore,
+        a.CreationDate AS AcceptedAnswerDate,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = q.Id AND v.VoteTypeId = 5) AS FavoriteCount,
+        q.ViewCount,
+        q.CreationDate,
+        CASE WHEN q.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+        q.Tags AS QuestionTags
+    FROM Posts q
+    LEFT JOIN Posts a ON q.AcceptedAnswerId = a.Id
+    WHERE q.PostTypeId = 1
+),
+UserReputationWeightedAvgScore AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COALESCE(AVG(p.Score * NULLIF(u.Reputation,0)),0) AS ReputationWeightedAvgScore
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 2
+    GROUP BY u.Id, u.DisplayName
+)
+
+SELECT
+    q.QuestionId,
+    q.Title AS QuestionTitle,
+    q.FavoriteCount,
+    q.ViewCount,
+    q.IsClosed,
+    COALESCE(cq.CloseReason, 'N/A') AS CloseReason,
+    uas.AnswerCount,
+    uas.AvgAnswerScore,
+    uas.AnswersByOthersCount,
+    ha.AnswerOwner AS TopAnswerOwner,
+    ha.Score AS TopAnswerScore,
+    ha.UpVotes AS TopAnswerUpVotes,
+    ha.DownVotes AS TopAnswerDownVotes,
+    r.Id AS QuestionOwnerId,
+    r.DisplayName AS QuestionOwner,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ur.ReputationWeightedAvgScore,
+    ua.TotalPosts,
+    ua.QuestionsPosted,
+    ua.AnswersPosted,
+    ua.ActiveDaysSpan,
+    r.Reputation,
+    (
+      SELECT STRING_AGG(SUBSTRING(tag FROM 2 FOR CHAR_LENGTH(tag)-2), ', ')
+      FROM (
+        SELECT tag
+        FROM UNNEST(STRING_TO_ARRAY(q.QuestionTags, '><')) AS tag
+        ORDER BY CHAR_LENGTH(tag) DESC
+        LIMIT 3
+      ) t
+    ) AS TopThreeTags,
+    SUBSTRING(p.Body FROM 1 FOR 100) || COALESCE(' ... [' || CAST(CHAR_LENGTH(p.Body) AS VARCHAR) || ' chars]', '') AS QuestionBodySnippet
+FROM QuestionsWithPreferredAnswerStats q
+LEFT JOIN ClosedQuestionReasons cq ON q.QuestionId = cq.PostId
+LEFT JOIN PostAnswerStats uas ON uas.QuestionId = q.QuestionId
+LEFT JOIN HighlyVotedAnswers ha ON ha.QuestionId = q.QuestionId AND ha.ScoreRank = 1
+LEFT JOIN Users r ON r.Id = q.OwnerUserId
+LEFT JOIN UserBadgeCounts ub ON ub.UserId = q.OwnerUserId
+LEFT JOIN UserActivityWindow ua ON ua.UserId = q.OwnerUserId
+LEFT JOIN UserReputationWeightedAvgScore ur ON ur.UserId = q.OwnerUserId
+LEFT JOIN Posts p ON p.Id = q.QuestionId
+WHERE q.ViewCount > 5000
+  AND (q.IsClosed = 0 OR q.IsClosed IS NULL)
+  AND (COALESCE(ub.GoldBadges,0) + COALESCE(ub.SilverBadges,0) + COALESCE(ub.BronzeBadges,0)) >= 5
+ORDER BY q.ViewCount DESC, ur.ReputationWeightedAvgScore DESC
+LIMIT 100;

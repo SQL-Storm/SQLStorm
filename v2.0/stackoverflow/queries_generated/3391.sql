@@ -1,0 +1,108 @@
+-- {"query": "3391.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2009} 
+
+WITH RecentQuestions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= CURRENT_DATE - INTERVAL '180 days'
+),
+UserBadgeAgg AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        SUM(CASE WHEN b.TagBased = 1 THEN 1 ELSE 0 END) AS TagBasedBadgeCount
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id
+),
+UserVoteStats AS (
+    SELECT
+        v.PostId,
+        COUNT(*) FILTER (WHERE vt.Id = 2) AS UpVotes,
+        COUNT(*) FILTER (WHERE vt.Id = 3) AS DownVotes,
+        COUNT(*) FILTER (WHERE vt.Id = 5) AS Favorites
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY v.PostId
+),
+TopAnswerScores AS (
+    SELECT
+        p.ParentId AS QuestionId,
+        MAX(p.Score) AS TopAnswerScore,
+        AVG(p.Score) AS AvgAnswerScore,
+        COUNT(*) AS AnswerCount
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+    GROUP BY p.ParentId
+),
+TagPopularity AS (
+    SELECT
+        t.TagName,
+        t.Count AS TagUseCount,
+        COALESCE(e.FavoriteCount,0) AS ExcerptFavorites
+    FROM Tags t
+    LEFT JOIN Posts e ON e.Id = t.ExcerptPostId
+)
+
+SELECT
+    u.Id                               AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COALESCE(ub.GoldBadges,0)          AS GoldBadges,
+    COALESCE(ub.SilverBadges,0)        AS SilverBadges,
+    COALESCE(ub.BronzeBadges,0)        AS BronzeBadges,
+    COALESCE(ub.TagBasedBadgeCount,0) AS TagBasedBadgeCount,
+    rq.Id                              AS RecentQuestionId,
+    rq.Title                           AS RecentQuestionTitle,
+    rq.CreationDate                    AS QuestionCreated,
+    CASE WHEN rq.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS HasAcceptedAnswer,
+    tvs.UpVotes                        AS QuestionUpVotes,
+    tvs.DownVotes                      AS QuestionDownVotes,
+    tas.TopAnswerScore,
+    tas.AvgAnswerScore,
+    tas.AnswerCount,
+    tp.TagName,
+    tp.TagUseCount,
+    tp.ExcerptFavorites,
+    ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY rq.CreationDate DESC) AS QuestionRankPerUser
+FROM Users u
+LEFT JOIN UserBadgeAgg ub      ON ub.UserId = u.Id
+LEFT JOIN RecentQuestions rq  ON rq.OwnerUserId = u.Id AND rq.rn = 1
+LEFT JOIN Posts q              ON q.Id = rq.Id
+LEFT JOIN UserVoteStats tvs    ON tvs.PostId = q.Id
+LEFT JOIN TopAnswerScores tas ON tas.QuestionId = q.Id
+LEFT JOIN LATERAL (
+        SELECT unnest(string_to_array(substring(q.Tags,2,length(q.Tags)-2), '><')) AS TagName
+) AS tagnames ON true
+LEFT JOIN TagPopularity tp    ON tp.TagName = tagnames.TagName
+WHERE u.Reputation > 10000
+  AND (rq.CreationDate IS NOT NULL OR ub.GoldBadges > 0)
+
+UNION ALL
+
+SELECT
+    u2.Id,
+    u2.DisplayName,
+    u2.Reputation,
+    0,0,0,0,
+    NULL,NULL,NULL,
+    0,0,0,
+    NULL,NULL,NULL,
+    NULL
+FROM Users u2
+WHERE NOT EXISTS (
+        SELECT 1 FROM Posts p
+        WHERE p.OwnerUserId = u2.Id AND p.PostTypeId = 1
+      )
+  AND u2.Reputation >= 5000
+
+ORDER BY Reputation DESC, QuestionRankPerUser
+LIMIT 100;

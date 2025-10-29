@@ -1,0 +1,195 @@
+WITH UserContributionSummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COALESCE(SUM(P.Score), 0) AS TotalPostScore,
+        COALESCE(SUM(P.ViewCount), 0) AS TotalPostViews,
+        COALESCE(SUM(P.FavoriteCount), 0) AS TotalFavorites,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COALESCE(SUM(C.Score), 0) AS TotalCommentScore
+    FROM
+        Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate
+),
+PostEditMetrics AS (
+    SELECT
+        PH.PostId,
+        COUNT(PH.Id) AS TotalEdits,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS MajorEdits,
+        MIN(PH.CreationDate) AS FirstEditDate,
+        MAX(PH.CreationDate) AS LastEditDate
+    FROM
+        PostHistory PH
+    WHERE
+        PH.PostHistoryTypeId BETWEEN 1 AND 25
+        AND PH.UserId IS NOT NULL
+    GROUP BY
+        PH.PostId
+),
+UserPostEditAggregates AS (
+    SELECT
+        P.OwnerUserId AS UserId,
+        COUNT(DISTINCT P.Id) AS UserQuestionsWithEdits,
+        AVG(EXTRACT(EPOCH FROM (PEM.LastEditDate - PEM.FirstEditDate)) / (86400.0 * NULLIF(PEM.TotalEdits - 1, 0))) FILTER (WHERE PEM.TotalEdits > 1) AS AvgEditIntervalDaysPerUser,
+        COALESCE(SUM(PEM.MajorEdits), 0) AS TotalMajorEditsOnUserQuestions,
+        COALESCE(SUM(CASE WHEN PH_REOPEN.PostHistoryTypeId = (SELECT Id FROM PostHistoryTypes WHERE Name = 'Post Reopened') THEN 1 ELSE 0 END), 0) AS TotalReopensForUserQuestions
+    FROM
+        Posts P
+    JOIN PostEditMetrics PEM ON P.Id = PEM.PostId
+    LEFT JOIN PostHistory PH_REOPEN ON P.Id = PH_REOPEN.PostId AND PH_REOPEN.PostHistoryTypeId = (SELECT Id FROM PostHistoryTypes WHERE Name = 'Post Reopened')
+    WHERE
+        P.PostTypeId = 1
+        AND P.OwnerUserId IS NOT NULL
+    GROUP BY
+        P.OwnerUserId
+),
+UserBadgeAwards AS (
+    SELECT
+        B.UserId,
+        COUNT(B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        ARRAY_AGG(DISTINCT B.Name ORDER BY B.Name) AS AllBadgeNames
+    FROM
+        Badges B
+    GROUP BY
+        B.UserId
+),
+AnswerQualityMetrics AS (
+    SELECT
+        P_A.Id AS AnswerId,
+        P_A.ParentId AS QuestionId,
+        P_A.OwnerUserId AS AnswerOwnerUserId,
+        P_A.Score AS AnswerScore,
+        ROW_NUMBER() OVER (PARTITION BY P_A.ParentId ORDER BY P_A.Score DESC, P_A.CreationDate ASC) AS Rnk_AnswerScore
+    FROM
+        Posts P_A
+    WHERE
+        P_A.PostTypeId = 2
+),
+DuplicatePostInfo AS (
+    SELECT
+        PL.PostId AS SourcePostId,
+        PL.RelatedPostId AS DuplicateOfPostId
+    FROM
+        PostLinks PL
+    WHERE
+        PL.LinkTypeId = (SELECT Id FROM LinkTypes WHERE Name = 'Duplicate')
+),
+UserTagContributions AS (
+    SELECT
+        P.OwnerUserId AS UserId,
+        t.tag AS TagName,
+        SUM(P.Score) AS TagScoreSum
+    FROM
+        Posts P,
+        LATERAL (
+            SELECT UNNEST(string_to_array(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags) - 2), '><')) AS tag
+        ) t
+    WHERE
+        P.PostTypeId = 1 AND P.Tags IS NOT NULL AND P.Tags != ''
+    GROUP BY
+        P.OwnerUserId, t.tag
+)
+SELECT
+    UCS.UserId,
+    UCS.DisplayName,
+    UCS.Reputation,
+    UCS.TotalQuestions,
+    UCS.TotalAnswers,
+    UCS.TotalPostScore,
+    UCS.TotalPostViews,
+    UBA.TotalBadges,
+    UBA.GoldBadges,
+    (
+        UCS.Reputation * 0.5
+        + UCS.TotalPostScore * 0.1
+        + (UCS.TotalPostViews / 100.0) * 0.005
+        + UCS.TotalFavorites * 0.2
+        + (UBA.GoldBadges * 100.0)
+        + COALESCE((SELECT SUM(AQM.AnswerScore) FROM AnswerQualityMetrics AQM WHERE AQM.AnswerOwnerUserId = UCS.UserId AND AQM.Rnk_AnswerScore = 1 AND AQM.AnswerScore > 0), 0.0) * 0.3
+        + COALESCE((SELECT SUM(t2.TagScoreSum) FROM (SELECT TagScoreSum FROM UserTagContributions t2 WHERE t2.UserId = UCS.UserId ORDER BY t2.TagScoreSum DESC LIMIT 3) s), 0.0) * 0.05
+        + COALESCE((SELECT COUNT(DISTINCT DP.SourcePostId) FROM DuplicatePostInfo DP WHERE DP.SourcePostId IN (SELECT P_Q_INNER.Id FROM Posts P_Q_INNER WHERE P_Q_INNER.OwnerUserId = UCS.UserId AND P_Q_INNER.PostTypeId = 1)), 0.0) * -50.0
+        + COALESCE(UPEA.TotalMajorEditsOnUserQuestions, 0.0) * 0.1
+    ) AS UserInfluenceScore,
+    DENSE_RANK() OVER (ORDER BY (
+        UCS.Reputation * 0.5
+        + UCS.TotalPostScore * 0.1
+        + (UCS.TotalPostViews / 100.0) * 0.005
+        + UCS.TotalFavorites * 0.2
+        + (UBA.GoldBadges * 100.0)
+        + COALESCE((SELECT SUM(AQM.AnswerScore) FROM AnswerQualityMetrics AQM WHERE AQM.AnswerOwnerUserId = UCS.UserId AND AQM.Rnk_AnswerScore = 1 AND AQM.AnswerScore > 0), 0.0) * 0.3
+        + COALESCE((SELECT SUM(t2.TagScoreSum) FROM (SELECT TagScoreSum FROM UserTagContributions t2 WHERE t2.UserId = UCS.UserId ORDER BY t2.TagScoreSum DESC LIMIT 3) s), 0.0) * 0.05
+        + COALESCE((SELECT COUNT(DISTINCT DP.SourcePostId) FROM DuplicatePostInfo DP WHERE DP.SourcePostId IN (SELECT P_Q_INNER.Id FROM Posts P_Q_INNER WHERE P_Q_INNER.OwnerUserId = UCS.UserId AND P_Q_INNER.PostTypeId = 1)), 0.0) * -50.0
+        + COALESCE(UPEA.TotalMajorEditsOnUserQuestions, 0.0) * 0.1
+    ) DESC) AS UserInfluenceRank,
+    COALESCE(UPEA.AvgEditIntervalDaysPerUser, 0.0) AS AvgEditIntervalDaysForQuestions,
+    COALESCE(UPEA.TotalReopensForUserQuestions, 0) AS ReopenCountForQuestions,
+    (
+        SELECT U_EDITOR.DisplayName
+        FROM Posts P_Q_INNER
+        JOIN PostHistory PH_INNER ON P_Q_INNER.Id = PH_INNER.PostId
+        JOIN Users U_EDITOR ON PH_INNER.UserId = U_EDITOR.Id
+        WHERE P_Q_INNER.OwnerUserId = UCS.UserId
+          AND P_Q_INNER.PostTypeId = 1
+          AND PH_INNER.PostHistoryTypeId IN (4, 5, 6)
+        GROUP BY U_EDITOR.DisplayName, U_EDITOR.Reputation
+        ORDER BY COUNT(PH_INNER.Id) DESC, MAX(U_EDITOR.Reputation) DESC
+        LIMIT 1
+    ) AS MostFrequentQuestionEditorAcrossUserPosts,
+    CASE
+        WHEN EXISTS (
+            SELECT 1
+            FROM Posts P_Q_HIGH
+            WHERE P_Q_HIGH.OwnerUserId = UCS.UserId
+              AND P_Q_HIGH.PostTypeId = 1
+              AND P_Q_HIGH.ViewCount >= 1000
+              AND P_Q_HIGH.AcceptedAnswerId IS NOT NULL
+        ) THEN 'HighImpactQuestioner'
+        ELSE 'NormalQuestioner'
+    END AS QuestionerImpactStatus,
+    UPPER(SUBSTRING(COALESCE(U.Location, 'Unknown Region') FROM 1 FOR 15)) AS UserLocationRegion,
+    (
+        SELECT COALESCE(AVG(P_OPT.Score), 0)
+        FROM Posts P_OPT
+        WHERE P_OPT.PostTypeId IN (1, 2)
+          AND (LOWER(P_OPT.Body) LIKE '%optimization%' OR LOWER(P_OPT.Tags) LIKE '%<performance>%')
+          AND P_OPT.Score > 0
+          AND P_OPT.CreationDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')
+    ) AS AvgOptimizationRelatedPostScoreLastYear,
+    AGE(CAST('2024-10-01 12:34:56' AS timestamp), U.LastAccessDate) AS TimeSinceLastAccess,
+    ARRAY_TO_STRING(UBA.AllBadgeNames, ', ') AS UserBadgeList
+FROM
+    Users U
+LEFT JOIN UserContributionSummary UCS ON U.Id = UCS.UserId
+LEFT JOIN UserBadgeAwards UBA ON U.Id = UBA.UserId
+LEFT JOIN UserPostEditAggregates UPEA ON U.Id = UPEA.UserId
+WHERE
+    UCS.Reputation >= 500
+    AND UCS.TotalPosts > 0
+    AND U.LastAccessDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 months')
+    AND (
+        U.WebsiteUrl IS NOT NULL
+        OR LOWER(U.Location) LIKE '%united states%'
+        OR COALESCE(UBA.GoldBadges, 0) > 0
+    )
+    AND UCS.DisplayName IS NOT NULL AND UCS.DisplayName != ''
+GROUP BY
+    UCS.UserId, UCS.DisplayName, UCS.Reputation, UCS.TotalQuestions, UCS.TotalAnswers,
+    UCS.TotalPostScore, UCS.TotalPostViews, UCS.TotalFavorites, UBA.TotalBadges, UBA.GoldBadges,
+    U.Location, U.LastAccessDate, UPEA.AvgEditIntervalDaysPerUser, UPEA.TotalMajorEditsOnUserQuestions,
+    UPEA.TotalReopensForUserQuestions, UBA.AllBadgeNames, UCS.UserCreationDate, U.Id, UBA.UserId, UPEA.UserId
+HAVING
+    UCS.TotalQuestions > 0 OR UCS.TotalAnswers > 0
+ORDER BY
+    UserInfluenceScore DESC, U.Reputation DESC, AGE(CAST('2024-10-01 12:34:56' AS timestamp), UCS.UserCreationDate) ASC
+LIMIT 1000;

@@ -1,0 +1,180 @@
+WITH UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.Views AS UserViews,
+        u.UpVotes AS UserUpVotes,
+        u.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        NTILE(100) OVER (ORDER BY u.Reputation DESC) AS ReputationPercentile,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS AvgQuestionScore,
+        COUNT(ph.Id) AS TotalPostHistoryEntries
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    GROUP BY u.Id, u.Reputation, u.CreationDate, u.Views, u.UpVotes, u.DownVotes
+),
+PostHistoricalAnalysis AS (
+    SELECT
+        ph.PostId,
+        COUNT(ph.Id) AS EditCount,
+        MAX(ph.CreationDate) AS LastEditDate,
+        MIN(ph.CreationDate) AS InitialCreationDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (10, 11) THEN 1 ELSE 0 END) AS HasClosureOrReopenEvent,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN crt.Name ELSE NULL END) AS LastCloseReasonName,
+        COUNT(DISTINCT ph.UserId) AS UniqueEditors,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 5 THEN 1 ELSE 0 END) AS BodyEditCount
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON ph.PostHistoryTypeId = 10 AND ph.Comment = CAST(crt.Id AS VARCHAR(50))
+    WHERE ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 10, 11, 12, 13, 14, 15, 16, 17, 33, 34, 35, 36)
+    GROUP BY ph.PostId
+),
+PostCommentAndVoteMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        SUM(CASE WHEN c.Score IS NOT NULL THEN c.Score ELSE 0 END) AS TotalCommentScore,
+        COUNT(DISTINCT c.UserId) AS UniqueCommenters,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoriteCountAggregated,
+        COUNT(DISTINCT v.UserId) AS UniqueVoters,
+        SUM(CASE WHEN v.VoteTypeId = 8 THEN v.BountyAmount ELSE 0 END) AS TotalBountyOffered
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    GROUP BY p.Id
+),
+QuestionTagAnalysis AS (
+    SELECT
+        p.Id AS PostId,
+        (SELECT COUNT(DISTINCT t.Id) FROM Tags t WHERE p.Tags LIKE '%' || t.TagName || '%' AND p.Tags IS NOT NULL) AS MatchedTagsCount,
+        LOWER(SUBSTRING(p.Tags FROM POSITION('<' IN p.Tags) + 1 FOR POSITION('>' IN p.Tags) - POSITION('<' IN p.Tags) - 1)) AS FirstTag,
+        COUNT(DISTINCT pl.RelatedPostId) FILTER (WHERE pl.LinkTypeId = 1) AS LinkedPostsCount,
+        COUNT(DISTINCT pl.RelatedPostId) FILTER (WHERE pl.LinkTypeId = 3) AS DuplicatePostsCount
+    FROM Posts p
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+    GROUP BY p.Id, p.Tags
+)
+SELECT
+    q.Id AS QuestionId,
+    q.Title,
+    q.CreationDate AS QuestionCreationDate,
+    q.Score AS QuestionScore,
+    q.ViewCount,
+    q.AnswerCount,
+    q.CommentCount,
+    q.FavoriteCount,
+    u.DisplayName AS OwnerDisplayName,
+    ue.Reputation AS OwnerReputation,
+    ue.TotalPosts AS OwnerTotalPosts,
+    ue.GoldBadges AS OwnerGoldBadges,
+    ph.EditCount,
+    ph.LastEditDate,
+    pca.TotalCommentScore,
+    pca.UpVoteCount,
+    pca.DownVoteCount,
+    qta.MatchedTagsCount,
+    qta.FirstTag,
+    qta.LinkedPostsCount,
+    qta.DuplicatePostsCount,
+    (ue.Reputation * 1.0 / NULLIF(ue.TotalPosts, 0)) AS RepPerPostRatio,
+    (pca.UpVoteCount * 1.0 / NULLIF(q.ViewCount, 0)) AS UpvoteToViewRatio,
+    (pca.DownVoteCount * 1.0 / NULLIF(q.ViewCount, 0)) AS DownvoteToViewRatio,
+    (q.AnswerCount * 1.0 / NULLIF(q.ViewCount, 0)) AS AnswerToViewRatio,
+    CASE
+        WHEN q.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN ph.HasClosureOrReopenEvent = 1 AND q.ClosedDate IS NULL THEN 'Reopened'
+        WHEN q.AcceptedAnswerId IS NOT NULL THEN 'AnsweredAccepted'
+        ELSE 'Open'
+    END AS QuestionStatus,
+    COALESCE(ph.LastCloseReasonName, 'N/A') AS LastCloseReason,
+    ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY q.Score DESC, q.CreationDate DESC) AS OwnerQuestionScoreRank,
+    AVG(q.ViewCount) OVER (PARTITION BY EXTRACT(YEAR FROM q.CreationDate), EXTRACT(MONTH FROM q.CreationDate)) AS MonthlyAvgViewCount,
+    (SELECT AVG(ap.Score) FROM Posts ap WHERE ap.OwnerUserId = u.Id AND ap.PostTypeId = 2) AS OwnerAvgAnswerScore,
+    q.CreationDate - u.CreationDate AS TimeSinceOwnerJoined,
+    ABS(q.Score - (SELECT AVG(p2.Score) FROM Posts p2 WHERE p2.PostTypeId = 1)) AS ScoreDifferenceFromOverallAvg,
+    LOWER(SUBSTRING(q.Body FROM 1 FOR 50)) AS BodySnippetLower,
+    REPLACE(q.Title, 'SQL', 'Database') AS TransformedTitle,
+    NULLIF(q.CommentCount, 0) AS NonZeroCommentCount,
+    (q.Score * 0.5 + pca.UpVoteCount * 0.3 + q.AnswerCount * 0.15 + COALESCE(q.FavoriteCount, 0) * 0.05) AS WeightedEngagementScore
+FROM Posts q
+INNER JOIN Users u ON q.OwnerUserId = u.Id
+INNER JOIN UserEngagement ue ON u.Id = ue.UserId
+LEFT JOIN PostHistoricalAnalysis ph ON q.Id = ph.PostId
+LEFT JOIN PostCommentAndVoteMetrics pca ON q.Id = pca.PostId
+LEFT JOIN QuestionTagAnalysis qta ON q.Id = qta.PostId
+WHERE q.PostTypeId = 1
+  AND u.Reputation > 1000
+  AND q.CreationDate >= TIMESTAMP '2020-01-01'
+  AND (q.ViewCount > 500 OR q.AnswerCount > 5)
+  AND (q.Body LIKE '%SQL%' OR q.Body LIKE '%database%' OR q.Body LIKE '%performance%')
+  AND (q.FavoriteCount IS NULL OR q.FavoriteCount > 0)
+  AND ue.ReputationPercentile <= 20
+  AND q.Score > (SELECT COALESCE(AVG(p_corr.Score), 0) FROM Posts p_corr WHERE p_corr.OwnerUserId = u.Id AND p_corr.PostTypeId = 1 AND p_corr.Id != q.Id)
+  AND ((ph.LastEditDate IS NOT NULL AND ph.LastEditDate > q.CreationDate + INTERVAL '1 day' AND ph.EditCount > 1) OR q.CommunityOwnedDate IS NOT NULL)
+
+UNION ALL
+
+SELECT
+    q.Id AS QuestionId,
+    q.Title,
+    q.CreationDate AS QuestionCreationDate,
+    q.Score AS QuestionScore,
+    q.ViewCount,
+    q.AnswerCount,
+    q.CommentCount,
+    q.FavoriteCount,
+    u.DisplayName AS OwnerDisplayName,
+    ue.Reputation AS OwnerReputation,
+    ue.TotalPosts AS OwnerTotalPosts,
+    ue.GoldBadges AS OwnerGoldBadges,
+    ph.EditCount,
+    ph.LastEditDate,
+    pca.TotalCommentScore,
+    pca.UpVoteCount,
+    pca.DownVoteCount,
+    qta.MatchedTagsCount,
+    qta.FirstTag,
+    qta.LinkedPostsCount,
+    qta.DuplicatePostsCount,
+    (ue.Reputation * 1.0 / NULLIF(ue.TotalPosts, 0)) AS RepPerPostRatio,
+    (pca.UpVoteCount * 1.0 / NULLIF(q.ViewCount, 0)) AS UpvoteToViewRatio,
+    (pca.DownVoteCount * 1.0 / NULLIF(q.ViewCount, 0)) AS DownvoteToViewRatio,
+    (q.AnswerCount * 1.0 / NULLIF(q.ViewCount, 0)) AS AnswerToViewRatio,
+    'ReopenedOrClosedControversy' AS QuestionStatus,
+    COALESCE(ph.LastCloseReasonName, 'N/A') AS LastCloseReason,
+    ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY q.LastActivityDate DESC) AS OwnerQuestionScoreRank,
+    AVG(q.Score) OVER (
+        ORDER BY EXTRACT(EPOCH FROM q.CreationDate)
+        RANGE BETWEEN 30 * 24 * 60 * 60 PRECEDING AND CURRENT ROW
+    ) AS Rolling30DayAvgScore,
+    (SELECT COALESCE(AVG(ap.Score), 0) FROM Posts ap WHERE ap.OwnerUserId = u.Id AND ap.PostTypeId = 2 AND ap.CreationDate < q.CreationDate) AS OwnerAvgAnswerScoreBeforeQuestion,
+    q.LastActivityDate - u.CreationDate AS TimeSinceOwnerJoined,
+    ABS(q.Score - (SELECT COALESCE(AVG(p2.Score), 0) FROM Posts p2 WHERE p2.PostTypeId = 1 AND p2.CreationDate > q.CreationDate - INTERVAL '1 year')) AS ScoreDifferenceFromYearlyAvg,
+    LOWER(SUBSTRING(q.Body FROM 1 FOR 50)) AS BodySnippetLower,
+    REPLACE(q.Title, 'Database', 'Data') AS TransformedTitle,
+    NULLIF(q.FavoriteCount, 0) AS NonZeroFavoriteCount,
+    (q.Score * 0.6 + pca.UpVoteCount * 0.25 + q.CommentCount * 0.15) AS WeightedEngagementScore
+FROM Posts q
+INNER JOIN Users u ON q.OwnerUserId = u.Id
+INNER JOIN UserEngagement ue ON u.Id = ue.UserId
+INNER JOIN PostHistoricalAnalysis ph ON q.Id = ph.PostId
+INNER JOIN PostCommentAndVoteMetrics pca ON q.Id = pca.PostId
+LEFT JOIN QuestionTagAnalysis qta ON q.Id = qta.PostId
+WHERE q.PostTypeId = 1
+  AND ph.HasClosureOrReopenEvent = 1
+  AND q.ClosedDate IS NOT NULL
+  AND q.CreationDate >= TIMESTAMP '2021-01-01'
+  AND (ph.EditCount > 3 OR q.CommentCount > 10)
+  AND q.LastActivityDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6 months')
+  AND ue.TotalBadges >= 5
+  AND EXISTS (SELECT 1 FROM Badges b_corr WHERE b_corr.UserId = u.Id AND b_corr.Name LIKE '%Scholar%')
+ORDER BY WeightedEngagementScore DESC, QuestionCreationDate DESC
+LIMIT 1000;

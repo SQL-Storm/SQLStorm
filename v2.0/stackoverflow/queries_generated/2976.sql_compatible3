@@ -1,0 +1,162 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT t.Id, t.TagName, t.Count, CAST(ARRAY[t.TagName] AS varchar[]) AS AncestorTags
+    FROM Tags t
+    WHERE t.IsRequired = true
+    UNION ALL
+    SELECT child.Id, child.TagName, child.Count, parent.AncestorTags || child.TagName
+    FROM Tags child
+    JOIN RecursiveTagHierarchy parent
+        ON child.Id <> parent.Id
+       AND child.Count < parent.Count
+       AND NOT child.TagName = ANY(parent.AncestorTags)
+    WHERE child.IsRequired = false
+),
+UserBadgeCounts AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(b.Id) FILTER(WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER(WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER(WHERE b.Class = 3) AS BronzeBadges,
+        RANK() OVER (ORDER BY COUNT(b.Id) DESC) AS BadgeRank
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+TopAnsweredQuestions AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.OwnerUserId,
+        a.Id AS AnswerId,
+        a.Score AS AnswerScore,
+        a.OwnerUserId AS AnswerOwnerUserId,
+        ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY a.Score DESC, a.CreationDate) AS AnswerRank
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+      AND q.Score >= 10
+      AND a.Score IS NOT NULL
+),
+QuestionCloseInfo AS (
+    SELECT
+        ph.PostId,
+        MIN(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate ELSE NULL END) AS FirstCloseDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.CreationDate ELSE NULL END) AS LastReopenDate,
+        STRING_AGG(DISTINCT crt.Name, ', ' ORDER BY crt.Name) AS CloseReasons
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = ph.Comment
+    WHERE ph.PostHistoryTypeId IN (10,11)
+    GROUP BY ph.PostId
+),
+AnswerVotesSummary AS (
+    SELECT
+        a.Id AS AnswerId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        COUNT(v.Id) AS TotalVotes,
+        AVG(CASE WHEN v.VoteTypeId IN (2,3) THEN 1.0 ELSE NULL END) AS VoteRatio
+    FROM Posts a
+    LEFT JOIN Votes v ON v.PostId = a.Id
+    WHERE a.PostTypeId = 2
+    GROUP BY a.Id
+),
+ComplexPostsAnalysis AS (
+    SELECT
+        q.QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.QuestionScore,
+        q.ViewCount,
+        q.OwnerUserId,
+        u.DisplayName AS QuestionOwner,
+        ab.AnswerId,
+        ab.AnswerScore,
+        au.DisplayName AS AnswerOwner,
+        avs.UpVotes,
+        avs.DownVotes,
+        avs.TotalVotes,
+        avs.VoteRatio,
+        q.AnswerRank,
+        q.QuestionScore * COALESCE(avs.VoteRatio,0) AS CompositeScore,
+        close.FirstCloseDate,
+        close.LastReopenDate,
+        close.CloseReasons,
+        array_to_string(
+            array(
+                SELECT DISTINCT unnest(string_to_array(COALESCE(p.Tags,''), '><'))
+            ), ', '
+        ) AS TagsExtracted,
+        phc.RevisionCount,
+        phc.LastEditDate,
+        pb.GoldBadges,
+        pb.SilverBadges,
+        pb.BronzeBadges,
+        pb.BadgeRank
+    FROM TopAnsweredQuestions q
+    LEFT JOIN Users u ON u.Id = q.OwnerUserId
+    LEFT JOIN Posts ab ON ab.Id = q.AnswerId
+    LEFT JOIN Users au ON au.Id = ab.OwnerUserId
+    LEFT JOIN AnswerVotesSummary avs ON avs.AnswerId = ab.Id
+    LEFT JOIN QuestionCloseInfo close ON close.PostId = q.QuestionId
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS RevisionCount, MAX(CreationDate) AS LastEditDate
+        FROM PostHistory
+        GROUP BY PostId
+    ) phc ON phc.PostId = q.QuestionId
+    LEFT JOIN UserBadgeCounts pb ON pb.UserId = q.OwnerUserId
+    LEFT JOIN Posts p ON p.Id = q.QuestionId
+    WHERE q.AnswerRank = 1
+),
+OwnersWithUpdates AS (
+    SELECT DISTINCT ph.UserId
+    FROM PostHistory ph
+    WHERE ph.UserId IS NOT NULL
+),
+CombinedUserSet AS (
+    SELECT DISTINCT u.Id FROM Users u
+    UNION
+    SELECT UserId FROM OwnersWithUpdates
+)
+SELECT 
+    cpa.QuestionId,
+    cpa.Title,
+    cpa.CreationDate,
+    cpa.ViewCount,
+    cpa.QuestionScore,
+    COALESCE(cpa.TagsExtracted, 'No Tags') AS TagsList,
+    cpa.AnswerId,
+    cpa.AnswerScore,
+    cpa.UpVotes,
+    cpa.DownVotes,
+    cpa.TotalVotes,
+    ROUND(cpa.CompositeScore,2) AS CompositeScore,
+    cpa.FirstCloseDate,
+    cpa.LastReopenDate,
+    COALESCE(cpa.CloseReasons, 'None') AS CloseReasons,
+    cpa.RevisionCount,
+    cpa.LastEditDate,
+    cpa.GoldBadges,
+    cpa.SilverBadges,
+    cpa.BronzeBadges,
+    cpa.BadgeRank,
+    cpa.QuestionOwner,
+    cpa.AnswerOwner,
+    ('User ' || cpa.QuestionOwner ||
+        ' has ' || COALESCE(cpa.GoldBadges,0) || ' gold, ' ||
+        COALESCE(cpa.SilverBadges,0) || ' silver and ' ||
+        COALESCE(cpa.BronzeBadges,0) || ' bronze badges.'
+    ) AS OwnerBadgeSummary,
+    CASE 
+        WHEN cpa.FirstCloseDate IS NOT NULL 
+        THEN 'Closed on ' || TO_CHAR(cpa.FirstCloseDate, 'YYYY-MM-DD') || '; Reasons: ' || COALESCE(cpa.CloseReasons, 'N/A')
+        ELSE 'Never closed'
+    END AS CloseStatus,
+    ROW_NUMBER() OVER (PARTITION BY cpa.QuestionOwner ORDER BY cpa.CompositeScore DESC) AS OwnerTopPostRank
+FROM ComplexPostsAnalysis cpa
+WHERE cpa.ViewCount > 5000
+ORDER BY cpa.CompositeScore DESC
+LIMIT 100;

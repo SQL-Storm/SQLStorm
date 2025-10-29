@@ -1,0 +1,175 @@
+-- {"query": "4615.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1576} 
+
+WITH
+  RankedQuestions AS (
+    SELECT
+      p.Id AS PostId,
+      p.OwnerUserId,
+      p.Title,
+      p.CreationDate,
+      p.Score,
+      p.AnswerCount,
+      p.ViewCount,
+      u.DisplayName AS OwnerDisplayName,
+      ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate DESC) AS rn
+    FROM Posts AS p
+    JOIN Users AS u
+      ON p.OwnerUserId = u.Id
+    WHERE
+      p.PostTypeId = 1 AND p.OwnerUserId IS NOT NULL
+  ),
+  UserEngagement AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate AS UserCreationDate,
+      COUNT(DISTINCT c.Id) AS CommentCount,
+      SUM(CASE WHEN v.VoteTypeId IN (2, 16) THEN 1 ELSE 0 END) AS UpvoteCount,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvoteCount,
+      COUNT(DISTINCT b.Id) AS BadgeCount,
+      COALESCE(MAX(p.LastActivityDate), u.LastAccessDate) AS LastActivity
+    FROM Users AS u
+    LEFT JOIN Comments AS c
+      ON u.Id = c.UserId
+    LEFT JOIN Votes AS v
+      ON u.Id = v.UserId
+    LEFT JOIN Badges AS b
+      ON u.Id = b.UserId
+    LEFT JOIN Posts AS p
+      ON u.Id = p.OwnerUserId
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate,
+      u.LastAccessDate
+  ),
+  HighScoringAnswers AS (
+    SELECT
+      prt.PostId,
+      prt.OwnerUserId,
+      prt.Score,
+      ROW_NUMBER() OVER (ORDER BY prt.Score DESC) AS rn
+    FROM Posts AS prt
+    WHERE
+      prt.PostTypeId = 2 AND prt.Score > 100
+  ),
+  PostRevisionActivity AS (
+    SELECT
+      ph.PostId,
+      ph.UserId AS EditorUserId,
+      ph.PostHistoryTypeId,
+      ph.CreationDate AS RevisionDate,
+      CASE
+        WHEN ph.PostHistoryTypeId = 5 THEN 'Body Edit'
+        WHEN ph.PostHistoryTypeId = 4 THEN 'Title Edit'
+        WHEN ph.PostHistoryTypeId = 6 THEN 'Tags Edit'
+        WHEN ph.PostHistoryTypeId IN (10, 11) THEN 'Close/Reopen Vote'
+        WHEN ph.PostHistoryTypeId IN (12, 13) THEN 'Delete/Undelete'
+        ELSE 'Other'
+      END AS RevisionType
+    FROM PostHistory AS ph
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6, 10, 11, 12, 13)
+  )
+SELECT
+  rq.PostId,
+  rq.Title AS QuestionTitle,
+  rq.OwnerUserId,
+  ue.DisplayName AS OwnerDisplayName,
+  ue.Reputation,
+  rq.Score AS QuestionScore,
+  rq.AnswerCount AS QuestionAnswerCount,
+  rq.ViewCount AS QuestionViewCount,
+  CASE
+    WHEN rq.rn <= 5 THEN 'Top Contributor'
+    WHEN rq.rn <= 20 THEN 'Frequent Contributor'
+    ELSE 'Occasional Contributor'
+  END AS ContributionTier,
+  COALESCE(hsa.Score, 0) AS HighestAnswerScore,
+  CASE
+    WHEN hsa.rn <= 3 AND hsa.Score > 50 THEN 'Received Top Answers'
+    ELSE 'Did Not Receive Top Answers'
+  END AS AnswerQualityFlag,
+  (
+    SELECT
+      COUNT(*)
+    FROM PostLinks AS pl
+    WHERE
+      pl.PostId = rq.PostId AND pl.LinkTypeId = 3
+  ) AS DuplicateLinkCount,
+  (
+    SELECT
+      STRING_AGG(pr.RevisionType, ', ')
+    FROM PostRevisionActivity AS pr
+    WHERE
+      pr.PostId = rq.PostId AND pr.EditorUserId IS NOT NULL
+  ) AS RecentRevisionTypes,
+  CASE
+    WHEN EXISTS (
+      SELECT
+        1
+      FROM Badges AS b
+      WHERE
+        b.UserId = rq.OwnerUserId AND b.Name LIKE '%Expert%'
+    ) THEN 'Has Expert Badge'
+    ELSE 'No Expert Badge'
+  END AS ExpertBadgeStatus,
+  ue.CommentCount,
+  ue.UpvoteCount,
+  ue.DownvoteCount,
+  ue.BadgeCount,
+  ue.UserCreationDate,
+  ue.LastActivity
+FROM RankedQuestions AS rq
+LEFT JOIN UserEngagement AS ue
+  ON rq.OwnerUserId = ue.UserId
+LEFT JOIN HighScoringAnswers AS hsa
+  ON rq.PostId = hsa.PostId
+WHERE
+  rq.CreationDate BETWEEN '2020-01-01' AND '2023-12-31'
+  AND rq.Score > 0
+  AND rq.ViewCount > 1000
+  AND ue.Reputation > 5000
+UNION ALL
+SELECT
+  NULL AS PostId,
+  NULL AS QuestionTitle,
+  NULL AS OwnerUserId,
+  NULL AS OwnerDisplayName,
+  NULL AS Reputation,
+  NULL AS QuestionScore,
+  NULL AS QuestionAnswerCount,
+  NULL AS QuestionViewCount,
+  NULL AS ContributionTier,
+  NULL AS HighestAnswerScore,
+  NULL AS AnswerQualityFlag,
+  NULL AS DuplicateLinkCount,
+  NULL AS RecentRevisionTypes,
+  NULL AS ExpertBadgeStatus,
+  COUNT(DISTINCT c.Id) AS CommentCount,
+  SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvoteCount,
+  SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvoteCount,
+  COUNT(DISTINCT b.Id) AS BadgeCount,
+  MIN(u.CreationDate) AS UserCreationDate,
+  MAX(u.LastAccessDate) AS LastActivity
+FROM Users AS u
+LEFT JOIN Comments AS c
+  ON u.Id = c.UserId
+LEFT JOIN Votes AS v
+  ON u.Id = v.UserId
+LEFT JOIN Badges AS b
+  ON u.Id = b.UserId
+WHERE
+  u.Id NOT IN (
+    SELECT
+      OwnerUserId
+    FROM Posts
+    WHERE
+      PostTypeId = 1
+  )
+GROUP BY
+  u.Id
+HAVING
+  COUNT(DISTINCT c.Id) > 50 OR SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) > 100;

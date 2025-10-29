@@ -1,0 +1,132 @@
+WITH RECURSIVE PostHierarchy AS (
+    -- Base case: Select top-level questions (PostTypeId = 1)
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.AnswerCount,
+        0 AS Level,
+        CAST(p.Id AS VARCHAR(255)) AS Path
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL
+
+    UNION ALL
+
+    -- Recursive step: Select answers associated with the questions from the previous level
+    SELECT
+        a.Id AS PostId,
+        a.Title,
+        a.OwnerUserId,
+        a.CreationDate,
+        a.Score,
+        0 AS AnswerCount,
+        ph.Level + 1 AS Level,
+        CAST(ph.Path || '->' || CAST(a.Id AS VARCHAR(255)) AS VARCHAR(255)) AS Path
+    FROM Posts a
+    JOIN PostHierarchy ph ON a.ParentId = ph.PostId
+    WHERE a.PostTypeId = 2
+),
+UserPostInteraction AS (
+    SELECT
+        p.Id AS PostId,
+        u.DisplayName AS OwnerDisplayName,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY COUNT(DISTINCT c.Id) DESC, SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) DESC) AS rn
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    GROUP BY p.Id, u.DisplayName
+),
+AggregatedPostData AS (
+    SELECT
+        ph.PostId,
+        ph.Title,
+        ph.OwnerUserId,
+        ph.CreationDate,
+        ph.Score,
+        ph.AnswerCount,
+        ph.Level,
+        ph.Path,
+        COALESCE(upi.CommentCount, 0) AS TotalComments,
+        COALESCE(upi.UpVoteCount, 0) AS TotalUpVotes,
+        COALESCE(upi.DownVoteCount, 0) AS TotalDownVotes,
+        CASE
+            WHEN ph.Score > 100 AND ph.AnswerCount > 10 THEN 'Highly Engaged'
+            WHEN ph.Score > 50 AND ph.AnswerCount > 5 THEN 'Moderately Engaged'
+            ELSE 'Standard Engagement'
+        END AS EngagementCategory,
+        CASE
+            WHEN EXISTS (SELECT 1 FROM PostLinks pl WHERE pl.PostId = ph.PostId AND pl.LinkTypeId = 3) THEN 'IsDuplicate'
+            WHEN EXISTS (SELECT 1 FROM PostLinks pl WHERE pl.RelatedPostId = ph.PostId AND pl.LinkTypeId = 3) THEN 'IsDuplicateOf'
+            ELSE 'NotLinkedAsDuplicate'
+        END AS DuplicateStatus,
+        UPPER(SUBSTRING(ph.Title FROM 1 FOR 3)) AS TitlePrefix,
+        CASE
+            WHEN ph.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN ph.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+            ELSE 'Open'
+        END AS PostStatus,
+        COUNT(DISTINCT ph.PostId) OVER (PARTITION BY ph.OwnerUserId) AS UserTotalPosts,
+        AVG(CAST(ph.Score AS DECIMAL(10,2))) OVER (PARTITION BY ph.OwnerUserId) AS UserAverageScore
+    FROM PostHierarchy ph
+    JOIN UserPostInteraction upi ON ph.PostId = upi.PostId AND upi.rn = 1
+    WHERE ph.Level < 5
+)
+SELECT
+    apd.PostId,
+    apd.Title,
+    apd.OwnerUserId,
+    u.DisplayName AS OwnerDisplayName,
+    apd.CreationDate,
+    apd.Score,
+    apd.AnswerCount,
+    apd.Level,
+    apd.Path,
+    apd.TotalComments,
+    apd.TotalUpVotes,
+    apd.TotalDownVotes,
+    apd.EngagementCategory,
+    apd.DuplicateStatus,
+    apd.TitlePrefix,
+    apd.PostStatus,
+    apd.UserTotalPosts,
+    apd.UserAverageScore,
+    (
+        (apd.TotalUpVotes * 1.2) - (apd.TotalDownVotes * 0.8) + (apd.TotalComments * 0.5)
+    ) * (
+        CASE WHEN apd.DuplicateStatus = 'IsDuplicate' THEN 0.7 WHEN apd.DuplicateStatus = 'IsDuplicateOf' THEN 0.7 ELSE 1.0 END
+    ) * (
+        CASE WHEN apd.PostStatus = 'Closed' THEN 0.6 WHEN apd.PostStatus = 'Community Owned' THEN 0.9 ELSE 1.0 END
+    ) AS CalculatedQualityScore,
+    pht.Name AS LastPostHistoryType,
+    (
+        SELECT Name
+        FROM PostHistoryTypes pht_inner
+        WHERE pht_inner.Id = (
+            SELECT ph_inner.PostHistoryTypeId
+            FROM PostHistory ph_inner
+            WHERE ph_inner.PostId = apd.PostId
+            ORDER BY ph_inner.CreationDate DESC
+            LIMIT 1
+        )
+    ) AS MostRecentHistoryAction,
+    TRIM(BOTH ' ' FROM COALESCE(u.Location, '') || '; ' || COALESCE(u.WebsiteUrl, '')) AS UserContactInfo,
+    CASE
+        WHEN u.Views IS NULL OR u.Views < 1000 THEN 'Low Views'
+        WHEN u.Views BETWEEN 1000 AND 10000 THEN 'Medium Views'
+        ELSE 'High Views'
+    END AS UserViewSegment
+FROM AggregatedPostData apd
+LEFT JOIN Users u ON apd.OwnerUserId = u.Id
+LEFT JOIN PostHistoryTypes pht ON TRUE
+WHERE apd.Score IS NOT NULL
+  AND apd.OwnerUserId IS NOT NULL
+  AND u.DisplayName IS NOT NULL
+  AND apd.CreationDate > '2020-01-01'
+ORDER BY apd.Score DESC, apd.CreationDate DESC
+LIMIT 1000;

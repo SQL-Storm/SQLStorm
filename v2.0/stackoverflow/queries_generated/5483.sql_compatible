@@ -1,0 +1,72 @@
+WITH TopQuestions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.ViewCount,
+    p.Score,
+    p.Tags,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ContentLicense,
+    u.DisplayName AS OwnerName,
+    u.Reputation,
+    ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.ViewCount DESC, p.CreationDate DESC) AS rn
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId = 1
+    AND p.ClosedDate IS NULL
+),
+RecentActivity AS (
+  SELECT
+    t.PostId,
+    t.LastActivityDate,
+    t.Tags,
+    t.OwnerName,
+    t.Reputation,
+    t.rn,
+    LAG(t.LastActivityDate) OVER (PARTITION BY t.OwnerName ORDER BY t.LastActivityDate) AS PrevActivity
+  FROM TopQuestions t
+),
+TagStats AS (
+  SELECT
+    tag,
+    COUNT(*) AS PostCount,
+    AVG(p.Score) AS AvgScore,
+    MAX(p.ViewCount) AS MaxViews
+  FROM RecentActivity ra
+  JOIN Posts p ON p.Id = ra.PostId
+  CROSS JOIN LATERAL (
+    SELECT regexp_split_to_table(substr(ra.Tags, 2, length(ra.Tags)-2), '\>\s*\<') AS tag
+  ) AS split_tags
+  GROUP BY tag
+)
+SELECT
+  q.PostId,
+  q.Title,
+  q.CreationDate,
+  q.ViewCount,
+  q.Score,
+  q.Tags,
+  q.OwnerName,
+  q.Reputation,
+  q.LastActivityDate,
+  q.AnswerCount,
+  q.CommentCount,
+  q.FavoriteCount,
+  q.ContentLicense,
+  ROW_NUMBER() OVER (PARTITION BY qa.Tag ORDER BY q.Score DESC, q.ViewCount DESC, q.CreationDate DESC) AS TagRank
+FROM RecentActivity ra
+JOIN TopQuestions q ON ra.PostId = q.PostId
+CROSS JOIN LATERAL (
+  SELECT regexp_split_to_table(substr(q.Tags, 2, length(q.Tags)-2), '\>\s*\<') AS Tag
+) AS qa
+LEFT JOIN Badges b ON b.UserId = q.OwnerUserId
+LEFT JOIN PostLinks pl ON pl.PostId = q.PostId
+LEFT JOIN Votes v ON v.PostId = q.PostId
+WHERE qa.Tag IS NOT NULL
+ORDER BY q.LastActivityDate DESC
+LIMIT 200;

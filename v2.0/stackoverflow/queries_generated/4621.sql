@@ -1,0 +1,108 @@
+-- {"query": "4621.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1041} 
+
+WITH RankedPostEdits AS (
+    SELECT
+        ph.PostId,
+        ph.UserId,
+        ph.CreationDate,
+        ph.PostHistoryTypeId,
+        ph.Comment,
+        ROW_NUMBER() OVER(PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate DESC) as rn
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+),
+UserPostActivity AS (
+    SELECT
+        p.OwnerUserId,
+        COUNT(DISTINCT p.Id) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        MAX(p.CreationDate) AS LatestPostDate,
+        AVG(p.Score) AS AvgPostScore
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL AND p.OwnerUserId > 0
+    GROUP BY p.OwnerUserId
+),
+TopEditors AS (
+    SELECT
+        rpe.UserId,
+        COUNT(DISTINCT rpe.PostId) AS EditedPostCount,
+        MAX(rpe.CreationDate) AS LatestEditDate
+    FROM RankedPostEdits rpe
+    GROUP BY rpe.UserId
+    HAVING COUNT(DISTINCT rpe.PostId) > 10
+),
+UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COALESCE(upa.QuestionCount, 0) AS TotalQuestions,
+        COALESCE(upa.AnswerCount, 0) AS TotalAnswers,
+        COALESCE(te.EditedPostCount, 0) AS DistinctEditedPosts,
+        CASE
+            WHEN EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = u.Id AND b.Name = 'Famous Question') THEN 1
+            ELSE 0
+        END AS HasFamousQuestionBadge,
+        CASE
+            WHEN u.WebsiteUrl IS NOT NULL AND u.WebsiteUrl != '' THEN 1
+            ELSE 0
+        END AS HasWebsite,
+        COALESCE(upa.AvgPostScore, 0) AS AverageScoreOfUserPosts,
+        DATEDIFF(day, u.CreationDate, GETDATE()) AS AccountAgeDays
+    FROM Users u
+    LEFT JOIN UserPostActivity upa ON u.Id = upa.OwnerUserId
+    LEFT JOIN TopEditors te ON u.Id = te.UserId
+    WHERE u.Id <= 100000 -- Limit to a subset for performance
+)
+SELECT
+    ue.UserId,
+    ue.DisplayName,
+    ue.Reputation,
+    ue.UserCreationDate,
+    ue.TotalQuestions,
+    ue.TotalAnswers,
+    ue.DistinctEditedPosts,
+    ue.HasFamousQuestionBadge,
+    ue.HasWebsite,
+    ue.AverageScoreOfUserPosts,
+    ue.AccountAgeDays,
+    SUM(CASE WHEN c.Score > 5 THEN 1 ELSE 0 END) AS HighScoreComments,
+    COUNT(DISTINCT c.Id) AS TotalComments,
+    (SELECT COUNT(DISTINCT ph.PostId) FROM PostHistory ph WHERE ph.UserId = ue.UserId AND ph.PostHistoryTypeId IN (10, 11, 12, 13)) AS PostModVoteCount
+FROM UserEngagement ue
+LEFT JOIN Comments c ON ue.UserId = c.UserId
+GROUP BY
+    ue.UserId,
+    ue.DisplayName,
+    ue.Reputation,
+    ue.UserCreationDate,
+    ue.TotalQuestions,
+    ue.TotalAnswers,
+    ue.DistinctEditedPosts,
+    ue.HasFamousQuestionBadge,
+    ue.HasWebsite,
+    ue.AverageScoreOfUserPosts,
+    ue.AccountAgeDays
+HAVING COUNT(DISTINCT c.Id) > 5
+UNION ALL
+SELECT
+    p.OwnerUserId,
+    p.OwnerDisplayName,
+    u.Reputation,
+    p.CreationDate,
+    0,
+    0,
+    0,
+    0,
+    CASE WHEN p.OwnerUserId IS NULL THEN 0 ELSE 1 END,
+    0,
+    p.Score,
+    DATEDIFF(day, p.CreationDate, GETDATE())
+FROM Posts p
+LEFT JOIN Users u ON p.OwnerUserId = u.Id
+WHERE p.PostTypeId = 1 -- Questions
+AND p.Score > 50
+AND p.AnswerCount > 10
+ORDER BY Reputation DESC
+LIMIT 100;

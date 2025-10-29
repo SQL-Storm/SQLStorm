@@ -1,0 +1,121 @@
+-- {"query": "7642.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1425} 
+SELECT 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) as TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN p.Id END) as QuestionsWithAcceptedAnswer,
+    COUNT(DISTINCT b.Id) as BadgesReceived,
+    COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) as GoldBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) as SilverBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) as BronzeBadges,
+    COALESCE(SUM(p.Score), 0) as TotalScore,
+    COALESCE(AVG(p.Score), 0) as AverageScore,
+    MAX(p.CreationDate) as LastPostDate,
+    MIN(p.CreationDate) as FirstPostDate,
+    DATEDIFF(DAY, MIN(p.CreationDate), MAX(p.CreationDate)) as DaysActive,
+    
+    -- Window function to rank users by reputation within their registration year
+    ROW_NUMBER() OVER (PARTITION BY YEAR(u.CreationDate) ORDER BY u.Reputation DESC) as RepRankInYear,
+    
+    -- Correlated subquery to get user's most active tag
+    (SELECT TOP 1 t.TagName
+     FROM Tags t
+     INNER JOIN Posts p2 ON p2.Tags LIKE '%' + t.TagName + '%'
+     WHERE p2.OwnerUserId = u.Id
+     GROUP BY t.TagName
+     ORDER BY COUNT(*) DESC) as MostActiveTag,
+    
+    -- Complex expression with multiple conditions
+    CASE 
+        WHEN u.Reputation >= 100000 THEN 'Elite'
+        WHEN u.Reputation >= 10000 THEN 'Master'
+        WHEN u.Reputation >= 1000 THEN 'Expert'
+        WHEN u.Reputation >= 100 THEN 'Novice'
+        ELSE 'Beginner'
+    END as UserTier,
+    
+    -- Set operator to find users with high reputation but no posts
+    (SELECT COUNT(*) FROM Users u2 
+     WHERE u2.Reputation > 10000 
+     AND NOT EXISTS (SELECT 1 FROM Posts p3 WHERE p3.OwnerUserId = u2.Id)
+    ) as HighRepNoPosts,
+    
+    -- String manipulation and NULL handling
+    ISNULL(LEFT(u.WebsiteUrl, 20), 'No Website') as WebsiteShort,
+    ISNULL(u.Location, 'Unknown Location') as LocationNormalized,
+    
+    -- CTE to calculate post statistics per month for the last year
+    (WITH MonthlyStats AS (
+        SELECT 
+            YEAR(p.CreationDate) as Year,
+            MONTH(p.CreationDate) as Month,
+            COUNT(*) as PostsCount,
+            SUM(p.Score) as TotalScorePerMonth
+        FROM Posts p
+        WHERE p.OwnerUserId = u.Id 
+        AND p.CreationDate >= DATEADD(YEAR, -1, GETDATE())
+        GROUP BY YEAR(p.CreationDate), MONTH(p.CreationDate)
+    )
+    SELECT STRING_AGG(CAST(PostsCount as VARCHAR(10)), ', ') 
+           FROM MonthlyStats) as MonthlyPostCounts,
+    
+    -- Complex join conditions with multiple outer joins
+    COALESCE((SELECT COUNT(*) FROM Posts p4 
+              INNER JOIN PostHistory ph ON p4.Id = ph.PostId
+              WHERE p4.OwnerUserId = u.Id 
+              AND ph.PostHistoryTypeId IN (1, 2, 3)), 0) as EditCount,
+    
+    -- NULL-safe calculations
+    CASE WHEN u.Views IS NOT NULL THEN (u.Views - COALESCE(u.UpVotes, 0) - COALESCE(u.DownVotes, 0)) ELSE 0 END as NetViews,
+    
+    -- Advanced predicate logic to identify users with specific voting patterns
+    CASE WHEN COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) > 0 
+         AND COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) = 0 
+         AND COUNT(DISTINCT CASE WHEN v.VoteTypeId = 5 THEN v.Id END) > 50 
+         THEN 'Active Supporter'
+         WHEN COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) = 0 
+         AND COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) > 50 
+         AND COUNT(DISTINCT CASE WHEN v.VoteTypeId = 5 THEN v.Id END) > 0 
+         THEN 'Critically Engaged'
+         ELSE 'Regular User'
+    END as UserEngagementType,
+    
+    -- Nested correlated subqueries for post tagging analysis
+    (SELECT COUNT(DISTINCT SUBSTRING(t.TagName, 1, CHARINDEX(' ', t.TagName + ' ') - 1))
+     FROM Tags t
+     INNER JOIN Posts p5 ON p5.Tags LIKE '%' + t.TagName + '%'
+     WHERE p5.OwnerUserId = u.Id
+     AND t.TagName LIKE '%-%' -- Filter for hyphenated tags
+    ) as HyphenatedTagCount
+    
+FROM Users u
+LEFT OUTER JOIN Posts p ON p.OwnerUserId = u.Id
+LEFT OUTER JOIN Badges b ON b.UserId = u.Id
+LEFT OUTER JOIN Votes v ON v.UserId = u.Id
+LEFT OUTER JOIN PostHistory ph ON ph.UserId = u.Id
+
+WHERE u.Reputation >= 100 
+AND u.CreationDate >= DATEADD(YEAR, -5, GETDATE())
+AND (p.PostTypeId = 1 OR p.PostTypeId = 2 OR p.PostTypeId IS NULL)
+
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation, u.WebsiteUrl, u.Location, u.Views, u.UpVotes, u.DownVotes, u.CreationDate
+
+HAVING 
+    COUNT(DISTINCT p.Id) >= 1
+    AND COUNT(DISTINCT b.Id) >= 0
+    AND (
+        MAX(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) > 10
+        OR MAX(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) > 5
+        OR COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 5
+    )
+
+ORDER BY 
+    u.Reputation DESC,
+    COUNT(DISTINCT p.Id) DESC,
+    COALESCE(SUM(p.Score), 0) DESC
+
+OPTION (RECOMPILE)

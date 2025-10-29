@@ -1,0 +1,403 @@
+WITH recent_posts AS (
+    SELECT
+        p.id,
+        p.posttypeid,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        p.owneruserid,
+        p.title,
+        p.tags,
+        COALESCE(NULLIF(TRIM(p.ownerdisplayname), ''), u.displayname, '[unknown]') AS owner_name,
+        CAST(DATE_TRUNC('month', p.creationdate) AS timestamp) AS month_bucket
+    FROM posts p
+    LEFT JOIN users u ON u.id = p.owneruserid
+    WHERE p.creationdate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 years'
+),
+tag_expanded AS (
+    SELECT
+        rp.id AS post_id,
+        rp.posttypeid,
+        rp.creationdate,
+        rp.score,
+        rp.viewcount,
+        rp.owner_name,
+        rp.month_bucket,
+        LOWER(TRIM(t)) AS tag
+    FROM recent_posts rp
+    LEFT JOIN LATERAL (
+        SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(rp.tags FROM 2 FOR GREATEST(LENGTH(rp.tags) - 2, 0)), '><')) AS t
+    ) s ON TRUE
+),
+user_activity AS (
+    SELECT
+        u.id AS user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        u.location,
+        CAST(DATE_TRUNC('month', u.creationdate) AS timestamp) AS user_cohort,
+        COUNT(DISTINCT p.id) FILTER (WHERE p.owneruserid = u.id) AS total_authored_posts,
+        SUM(CASE WHEN p.posttypeid = 1 THEN 1 ELSE 0 END) AS questions_authored,
+        SUM(CASE WHEN p.posttypeid = 2 THEN 1 ELSE 0 END) AS answers_authored,
+        COALESCE(SUM(v.vote_type_up), 0) AS upvotes_given,
+        COALESCE(SUM(v.vote_type_down), 0) AS downvotes_given
+    FROM users u
+    LEFT JOIN posts p ON p.owneruserid = u.id
+    LEFT JOIN LATERAL (
+        SELECT
+            v2.userid,
+            CASE WHEN v2.votetypeid = 2 THEN 1 ELSE 0 END AS vote_type_up,
+            CASE WHEN v2.votetypeid = 3 THEN 1 ELSE 0 END AS vote_type_down
+        FROM votes v2
+        WHERE v2.userid = u.id
+    ) v ON TRUE
+    GROUP BY u.id, u.displayname, u.reputation, u.creationdate, u.location
+),
+post_interactions AS (
+    SELECT
+        p.id AS post_id,
+        COUNT(*) FILTER (WHERE vt.votetypeid = 2) AS upvotes,
+        COUNT(*) FILTER (WHERE vt.votetypeid = 3) AS downvotes,
+        COUNT(*) FILTER (WHERE vt.votetypeid = 5) AS favorites,
+        SUM(vt.bountyamount) FILTER (WHERE vt.votetypeid IN (8,9)) AS bounty_total,
+        COUNT(DISTINCT c.id) AS comments_count
+    FROM posts p
+    LEFT JOIN votes vt ON vt.postid = p.id
+    LEFT JOIN comments c ON c.postid = p.id
+    GROUP BY p.id
+),
+duplicates AS (
+    SELECT
+        pl.postid AS dup_post_id,
+        pl.relatedpostid AS original_post_id,
+        MIN(pl.creationdate) AS first_link_date
+    FROM postlinks pl
+    WHERE pl.linktypeid = 3
+    GROUP BY pl.postid, pl.relatedpostid
+),
+edits_cte AS (
+    SELECT
+        ph.postid,
+        COUNT(*) FILTER (WHERE ph.posthistorytypeid IN (4,5,6)) AS edit_count,
+        MAX(ph.creationdate) FILTER (WHERE ph.posthistorytypeid IN (4,5,6)) AS last_edit_date,
+        COUNT(*) FILTER (WHERE ph.posthistorytypeid = 24) AS suggested_edits_applied,
+        COUNT(*) FILTER (WHERE ph.posthistorytypeid IN (10,11)) AS open_close_flaps
+    FROM posthistory ph
+    GROUP BY ph.postid
+),
+tag_stats AS (
+    SELECT
+        te.tag,
+        te.month_bucket,
+        COUNT(DISTINCT te.post_id) AS posts_with_tag,
+        SUM(pi.upvotes - pi.downvotes) AS net_votes_with_tag,
+        AVG(NULLIF(pi.upvotes + pi.downvotes, 0)) AS avg_votes_activity,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY pi.upvotes - pi.downvotes) AS median_net_votes
+    FROM tag_expanded te
+    LEFT JOIN post_interactions pi ON pi.post_id = te.post_id
+    GROUP BY te.tag, te.month_bucket
+),
+question_answer_pairs AS (
+    SELECT
+        q.id AS question_id,
+        q.title AS question_title,
+        q.owneruserid AS question_owner_id,
+        q.creationdate AS question_date,
+        q.score AS question_score,
+        q.viewcount AS question_views,
+        q.acceptedanswerid,
+        COUNT(a.id) AS answers_count,
+        SUM(a.score) AS answers_score_sum,
+        MAX(a.score) AS max_answer_score,
+        AVG(a.score) AS avg_answer_score
+    FROM posts q
+    LEFT JOIN posts a ON a.parentid = q.id AND a.posttypeid = 2
+    WHERE q.posttypeid = 1
+    GROUP BY q.id, q.title, q.owneruserid, q.creationdate, q.score, q.viewcount, q.acceptedanswerid
+),
+answerer_quality AS (
+    SELECT
+        a.owneruserid AS user_id,
+        COUNT(*) AS answers_posted,
+        SUM(CASE WHEN q.acceptedanswerid = a.id THEN 1 ELSE 0 END) AS answers_accepted,
+        AVG(a.score) AS avg_answer_score,
+        PERCENTILE_DISC(0.9) WITHIN GROUP (ORDER BY a.score) AS p90_answer_score
+    FROM posts a
+    JOIN posts q ON q.id = a.parentid AND q.posttypeid = 1
+    WHERE a.posttypeid = 2
+    GROUP BY a.owneruserid
+),
+hot_questions AS (
+    SELECT
+        qap.question_id,
+        qap.question_title,
+        qap.question_owner_id,
+        qap.question_date,
+        qap.question_score,
+        qap.question_views,
+        CASE WHEN qap.answers_count > 0 THEN 1 ELSE 0 END AS has_answers,
+        CASE
+            WHEN qap.question_views >= 10000 THEN 'very_hot'
+            WHEN qap.question_views >= 2000 THEN 'hot'
+            WHEN qap.question_views >= 500 THEN 'warm'
+            ELSE 'cold'
+        END AS heat_bucket
+    FROM question_answer_pairs qap
+    WHERE COALESCE(qap.question_views, 0) >= 0
+),
+user_rollup AS (
+    SELECT
+        ua.user_id,
+        COALESCE(ua.displayname, '[anonymous]') AS displayname,
+        ua.reputation,
+        ua.location,
+        ua.user_cohort,
+        ua.total_authored_posts,
+        ua.questions_authored,
+        ua.answers_authored,
+        ua.upvotes_given,
+        ua.downvotes_given,
+        COALESCE(aq.answers_posted, 0) AS answers_posted,
+        COALESCE(aq.answers_accepted, 0) AS answers_accepted,
+        COALESCE(aq.avg_answer_score, 0) AS avg_answer_score,
+        COALESCE(aq.p90_answer_score, 0) AS p90_answer_score
+    FROM user_activity ua
+    LEFT JOIN answerer_quality aq ON aq.user_id = ua.user_id
+),
+post_features AS (
+    SELECT
+        rp.id AS post_id,
+        rp.posttypeid,
+        rp.creationdate,
+        rp.score,
+        rp.viewcount,
+        rp.owner_name,
+        rp.month_bucket,
+        pi.upvotes,
+        pi.downvotes,
+        pi.favorites,
+        pi.bounty_total,
+        pi.comments_count,
+        ed.edit_count,
+        ed.last_edit_date,
+        ed.suggested_edits_applied,
+        ed.open_close_flaps,
+        d.original_post_id,
+        CASE WHEN d.original_post_id IS NOT NULL THEN 1 ELSE 0 END AS is_duplicate
+    FROM recent_posts rp
+    LEFT JOIN post_interactions pi ON pi.post_id = rp.id
+    LEFT JOIN edits_cte ed ON ed.postid = rp.id
+    LEFT JOIN duplicates d ON d.dup_post_id = rp.id
+),
+ranked_posts AS (
+    SELECT
+        pf.post_id,
+        pf.posttypeid,
+        pf.creationdate,
+        pf.score,
+        pf.viewcount,
+        pf.owner_name,
+        pf.month_bucket,
+        pf.upvotes,
+        pf.downvotes,
+        pf.favorites,
+        pf.bounty_total,
+        pf.comments_count,
+        pf.edit_count,
+        pf.last_edit_date,
+        pf.suggested_edits_applied,
+        pf.open_close_flaps,
+        pf.original_post_id,
+        pf.is_duplicate,
+        ROW_NUMBER() OVER (PARTITION BY pf.posttypeid ORDER BY COALESCE(pf.viewcount, 0) DESC, COALESCE(pf.score, 0) DESC) AS rn_views,
+        DENSE_RANK() OVER (ORDER BY COALESCE(pf.upvotes, 0) - COALESCE(pf.downvotes, 0) DESC) AS dr_netvotes,
+        SUM(COALESCE(pf.viewcount, 0)) OVER (PARTITION BY pf.owner_name ORDER BY pf.creationdate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS owner_cum_views
+    FROM post_features pf
+),
+flagged_titles AS (
+    SELECT
+        p.id AS post_id,
+        CASE
+            WHEN p.title IS NULL THEN 1
+            WHEN LENGTH(TRIM(p.title)) = 0 THEN 1
+            WHEN p.title ~* '(?<!\w)(help|urgent|asap|problem)(?!\w)' THEN 1
+            ELSE 0
+        END AS bad_title_flag
+    FROM posts p
+    WHERE p.posttypeid = 1
+),
+post_quality_scoring AS (
+    SELECT
+        rp.post_id,
+        rp.posttypeid,
+        rp.owner_name,
+        rp.creationdate,
+        rp.month_bucket,
+        COALESCE(rp.score, 0) AS raw_score,
+        COALESCE(rp.viewcount, 0) AS raw_views,
+        COALESCE(rp.upvotes, 0) - COALESCE(rp.downvotes, 0) AS net_votes,
+        COALESCE(rp.favorites, 0) AS favorites,
+        COALESCE(rp.bounty_total, 0) AS bounty,
+        COALESCE(rp.comments_count, 0) AS comments,
+        COALESCE(rp.edit_count, 0) AS edits,
+        rp.is_duplicate,
+        CASE WHEN ft.bad_title_flag = 1 THEN -5 ELSE 0 END AS title_penalty,
+        CASE WHEN rp.is_duplicate = 1 THEN -10 ELSE 0 END AS duplicate_penalty,
+        (
+            0.40 * LN(1 + GREATEST(COALESCE(rp.viewcount, 0), 0)) +
+            0.30 * (COALESCE(rp.upvotes, 0) - COALESCE(rp.downvotes, 0)) +
+            0.10 * COALESCE(rp.favorites, 0) +
+            0.05 * LN(1 + GREATEST(COALESCE(rp.comments_count, 0), 0)) +
+            0.10 * LEAST(COALESCE(rp.bounty_total, 0), 500) / 50.0 +
+            0.05 * LEAST(5, GREATEST(0, 5 - COALESCE(rp.edit_count, 0))) +
+            CASE WHEN rp.posttypeid = 2 THEN 0.15 ELSE 0 END +
+            CASE WHEN rp.posttypeid = 1 THEN 0.05 ELSE 0 END
+        ) +
+        (CASE WHEN ft.bad_title_flag = 1 THEN -5 ELSE 0 END) +
+        (CASE WHEN rp.is_duplicate = 1 THEN -10 ELSE 0 END) AS quality_score
+    FROM ranked_posts rp
+    LEFT JOIN flagged_titles ft ON ft.post_id = rp.post_id
+),
+monthly_aggregation AS (
+    SELECT
+        pq.month_bucket,
+        pq.posttypeid,
+        COUNT(*) AS posts_count,
+        AVG(pq.quality_score) AS avg_quality_score,
+        SUM(CASE WHEN pq.quality_score >= 10 THEN 1 ELSE 0 END) AS high_quality_posts,
+        SUM(CASE WHEN pq.is_duplicate = 1 THEN 1 ELSE 0 END) AS duplicate_posts,
+        SUM(CASE WHEN pq.quality_score < 0 THEN 1 ELSE 0 END) AS low_quality_posts
+    FROM post_quality_scoring pq
+    GROUP BY pq.month_bucket, pq.posttypeid
+),
+leaderboard AS (
+    SELECT
+        pr.owner_name,
+        COUNT(*) AS posts_count,
+        AVG(COALESCE(pr.score, 0)) AS avg_score,
+        SUM(COALESCE(pr.viewcount, 0)) AS total_views,
+        AVG(COALESCE(pr.upvotes, 0) - COALESCE(pr.downvotes, 0)) AS avg_net_votes,
+        MAX(pr.owner_cum_views) AS cum_views_last_post,
+        MIN(pr.creationdate) AS first_post_date,
+        MAX(pr.creationdate) AS last_post_date,
+        RANK() OVER (ORDER BY SUM(COALESCE(pr.viewcount, 0)) DESC) AS r_views
+    FROM ranked_posts pr
+    GROUP BY pr.owner_name
+),
+final_set AS (
+    SELECT
+        'posts' AS entity,
+        CAST(pq.post_id AS text) AS id,
+        pq.owner_name,
+        CAST(pq.creationdate AT TIME ZONE 'UTC' AS varchar) AS created_at,
+        CAST(pq.posttypeid AS text) AS subtype,
+        CAST(ROUND(CAST(pq.quality_score AS numeric), 2) AS text) AS metric,
+        CASE WHEN pq.quality_score >= 10 THEN 'high'
+             WHEN pq.quality_score >= 3 THEN 'medium'
+             WHEN pq.quality_score >= 0 THEN 'low'
+             ELSE 'bad' END AS category
+    FROM post_quality_scoring pq
+    WHERE pq.creationdate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+
+    UNION ALL
+
+    SELECT
+        'months' AS entity,
+        TO_CHAR(ma.month_bucket, 'YYYY-MM') AS id,
+        'ALL' AS owner_name,
+        SUBSTRING(CAST(ma.month_bucket AS date)::text FROM 1 FOR 10) AS created_at,
+        CAST(ma.posttypeid AS text) AS subtype,
+        CAST(ROUND(CAST(ma.avg_quality_score AS numeric), 3) AS text) AS metric,
+        CASE
+            WHEN ma.avg_quality_score >= 8 THEN 'excellent'
+            WHEN ma.avg_quality_score >= 4 THEN 'good'
+            WHEN ma.avg_quality_score >= 1 THEN 'ok'
+            ELSE 'poor'
+        END AS category
+    FROM monthly_aggregation ma
+
+    UNION ALL
+
+    SELECT
+        'leaders' AS entity,
+        l.owner_name AS id,
+        l.owner_name,
+        CAST(l.last_post_date AS date)::text AS created_at,
+        'all' AS subtype,
+        CAST(l.total_views AS text) AS metric,
+        CASE WHEN l.r_views <= 10 THEN 'top10'
+             WHEN l.r_views <= 100 THEN 'top100'
+             ELSE 'other' END AS category
+    FROM leaderboard l
+),
+tag_trends AS (
+    SELECT
+        ts.tag,
+        ts.month_bucket,
+        ts.posts_with_tag,
+        ts.net_votes_with_tag,
+        ts.avg_votes_activity,
+        ts.median_net_votes,
+        LAG(ts.posts_with_tag) OVER (PARTITION BY ts.tag ORDER BY ts.month_bucket) AS prev_posts_with_tag,
+        LAG(ts.net_votes_with_tag) OVER (PARTITION BY ts.tag ORDER BY ts.month_bucket) AS prev_net_votes_with_tag
+    FROM tag_stats ts
+),
+tag_trend_flags AS (
+    SELECT
+        tt.tag,
+        tt.month_bucket,
+        tt.posts_with_tag,
+        tt.net_votes_with_tag,
+        CASE
+            WHEN tt.prev_posts_with_tag IS NULL THEN 'new'
+            WHEN tt.posts_with_tag >= tt.prev_posts_with_tag * 1.5 AND tt.posts_with_tag >= 10 THEN 'surging'
+            WHEN tt.posts_with_tag <= tt.prev_posts_with_tag * 0.67 AND tt.prev_posts_with_tag >= 10 THEN 'cooling'
+            ELSE 'steady'
+        END AS volume_trend,
+        CASE
+            WHEN tt.prev_net_votes_with_tag IS NULL THEN 'unknown'
+            WHEN tt.net_votes_with_tag > tt.prev_net_votes_with_tag THEN 'improving'
+            WHEN tt.net_votes_with_tag < tt.prev_net_votes_with_tag THEN 'worsening'
+            ELSE 'flat'
+        END AS sentiment_trend
+    FROM tag_trends tt
+),
+top_tags AS (
+    SELECT
+        tag,
+        SUM(posts_with_tag) AS posts_last_2y
+    FROM tag_stats
+    WHERE month_bucket >= DATE_TRUNC('month', CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years')
+    GROUP BY tag
+    HAVING SUM(posts_with_tag) >= 50
+),
+final_output AS (
+    SELECT
+        fs.entity,
+        fs.id,
+        fs.owner_name,
+        fs.created_at,
+        fs.subtype,
+        fs.metric,
+        fs.category
+    FROM final_set fs
+    WHERE fs.entity <> 'leaders' OR fs.category IN ('top10','top100')
+
+    UNION ALL
+
+    SELECT
+        'tag_trend' AS entity,
+        (ttf.tag || ':' || TO_CHAR(ttf.month_bucket, 'YYYY-MM')) AS id,
+        ttf.tag AS owner_name,
+        SUBSTRING(CAST(ttf.month_bucket AS date)::text FROM 1 FOR 10) AS created_at,
+        ttf.volume_trend AS subtype,
+        CAST(COALESCE(ttf.net_votes_with_tag, 0) AS text) AS metric,
+        ttf.sentiment_trend AS category
+    FROM tag_trend_flags ttf
+    JOIN top_tags tt ON tt.tag = ttf.tag
+)
+SELECT *
+FROM final_output
+ORDER BY entity, created_at, id
+LIMIT 2000;

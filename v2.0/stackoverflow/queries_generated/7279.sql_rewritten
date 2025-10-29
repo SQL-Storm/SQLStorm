@@ -1,0 +1,348 @@
+-- {"query": "7279.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 3403} 
+WITH PostStats AS (
+    SELECT 
+        p.Id as PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Title,
+        p.Tags,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END as PostTypeDescription,
+        CASE 
+            WHEN p.Score > 100 THEN 'High'
+            WHEN p.Score > 50 THEN 'Medium'
+            WHEN p.Score > 0 THEN 'Low'
+            ELSE 'None'
+        END as ScoreCategory,
+        DATEDIFF(day, p.CreationDate, p.LastActivityDate) as DaysSinceCreation,
+        COALESCE(p.AnswerCount, 0) + COALESCE(p.CommentCount, 0) as EngagementCount,
+        SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2) as CleanTags
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserActivity AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.AccountId,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        AVG(p.Score) as AvgPostScore,
+        MAX(p.CreationDate) as LastPostDate,
+        ROW_NUMBER() OVER (PARTITION BY u.AccountId ORDER BY u.Reputation DESC) as UserRankInAccount,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) as GlobalReputationRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.AccountId
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.IsRequired = 1 THEN 'Required'
+            WHEN t.IsModeratorOnly = 1 THEN 'Moderator Only'
+            ELSE 'Standard'
+        END as TagType,
+        LAG(t.Count, 1) OVER (ORDER BY t.Count DESC) - t.Count as CountDifferenceFromPrevious,
+        PERCENT_RANK() OVER (ORDER BY t.Count) as PercentileRank
+    FROM Tags t
+    WHERE t.TagName IS NOT NULL
+),
+ComplexPostData AS (
+    SELECT 
+        ps.PostId,
+        ps.PostTypeId,
+        ps.OwnerUserId,
+        ps.Score,
+        ps.ViewCount,
+        ps.AnswerCount,
+        ps.CommentCount,
+        ps.FavoriteCount,
+        ps.CreationDate,
+        ps.LastActivityDate,
+        ps.Title,
+        ps.Tags,
+        ps.PostTypeDescription,
+        ps.ScoreCategory,
+        ps.DaysSinceCreation,
+        ps.EngagementCount,
+        ps.CleanTags,
+        STRING_TO_ARRAY(ps.CleanTags, '><') as TagArray,
+        CASE 
+            WHEN ps.PostTypeId = 1 AND ps.AnswerCount > 0 THEN 
+                (SELECT COUNT(*) FROM Posts WHERE ParentId = ps.PostId AND PostTypeId = 2)
+            ELSE 0 
+        END as AnswerCountIfQuestion,
+        COALESCE(
+            (SELECT COUNT(*) FROM Votes v WHERE v.PostId = ps.PostId AND v.VoteTypeId = 2),
+            0
+        ) as UpVoteCount,
+        COALESCE(
+            (SELECT COUNT(*) FROM Votes v WHERE v.PostId = ps.PostId AND v.VoteTypeId = 3),
+            0
+        ) as DownVoteCount,
+        COALESCE(
+            (SELECT MIN(v.CreationDate) FROM Votes v WHERE v.PostId = ps.PostId AND v.VoteTypeId = 5),
+            ps.CreationDate
+        ) as FirstFavoriteDate,
+        COALESCE(
+            (SELECT MAX(ph.CreationDate) FROM PostHistory ph WHERE ph.PostId = ps.PostId AND ph.PostHistoryTypeId IN (10, 11)),
+            ps.CreationDate
+        ) as LastCloseReopenDate,
+        CASE 
+            WHEN ps.Score > (
+                SELECT AVG(ps2.Score) * 1.5 
+                FROM Posts ps2 
+                WHERE ps2.PostTypeId = ps.PostTypeId 
+                AND ps2.OwnerUserId = ps.OwnerUserId
+            ) THEN 'AboveAvg'
+            ELSE 'BelowAvg'
+        END as ScoreRelative,
+        (
+            SELECT COUNT(*) 
+            FROM Comments c 
+            WHERE c.PostId = ps.PostId 
+            AND c.CreationDate > ps.CreationDate
+        ) as CommentCountAfterCreation
+    FROM PostStats ps
+    WHERE ps.DaysSinceCreation > 30
+),
+CombinedAnalysis AS (
+    SELECT 
+        cpd.PostId,
+        cpd.PostTypeId,
+        cpd.OwnerUserId,
+        cpd.Score,
+        cpd.ViewCount,
+        cpd.AnswerCount,
+        cpd.CommentCount,
+        cpd.FavoriteCount,
+        cpd.CreationDate,
+        cpd.LastActivityDate,
+        cpd.Title,
+        cpd.Tags,
+        cpd.PostTypeDescription,
+        cpd.ScoreCategory,
+        cpd.DaysSinceCreation,
+        cpd.EngagementCount,
+        cpd.AnswerCountIfQuestion,
+        cpd.UpVoteCount,
+        cpd.DownVoteCount,
+        cpd.FirstFavoriteDate,
+        cpd.LastCloseReopenDate,
+        cpd.ScoreRelative,
+        cpd.CommentCountAfterCreation,
+        ua.DisplayName as OwnerDisplayName,
+        ua.Reputation as OwnerReputation,
+        ua.PostCount as OwnerPostCount,
+        ua.CommentCount as OwnerCommentCount,
+        ua.BadgeCount as OwnerBadgeCount,
+        ua.AvgPostScore as OwnerAvgPostScore,
+        ta.TagName,
+        ta.TagCount,
+        ta.TagType,
+        CASE 
+            WHEN LENGTH(cpd.Title) > 100 THEN 'Long Title'
+            WHEN LENGTH(cpd.Title) > 50 THEN 'Medium Title'
+            ELSE 'Short Title'
+        END as TitleLengthCategory,
+        CASE 
+            WHEN cpd.ViewCount > 1000 THEN 'Popular'
+            WHEN cpd.ViewCount > 500 THEN 'Moderate'
+            WHEN cpd.ViewCount > 100 THEN 'Low'
+            ELSE 'Very Low'
+        END as PopularityLevel,
+        CASE 
+            WHEN cpd.EngagementCount > (
+                SELECT AVG(EngagementCount) FROM ComplexPostData
+            ) THEN 'AboveEngagement'
+            ELSE 'BelowEngagement'
+        END as EngagementLevel,
+        DENSE_RANK() OVER (ORDER BY cpd.Score DESC) as ScoreRank,
+        ROW_NUMBER() OVER (ORDER BY cpd.ViewCount DESC) as ViewRank,
+        RANK() OVER (PARTITION BY cpd.PostTypeId ORDER BY cpd.Score DESC) as PostTypeScoreRank
+    FROM ComplexPostData cpd
+    LEFT JOIN UserActivity ua ON cpd.OwnerUserId = ua.UserId
+    LEFT JOIN TagAnalysis ta ON EXISTS (
+        SELECT 1 FROM UNNEST(cpd.TagArray) AS tag 
+        WHERE tag LIKE '%' || ta.TagName || '%'
+        AND ta.TagName IS NOT NULL
+    )
+    WHERE cpd.OwnerUserId IS NOT NULL
+)
+SELECT 
+    ca.PostId,
+    ca.PostTypeId,
+    ca.OwnerUserId,
+    ca.Score,
+    ca.ViewCount,
+    ca.AnswerCount,
+    ca.CommentCount,
+    ca.FavoriteCount,
+    ca.CreationDate,
+    ca.LastActivityDate,
+    ca.Title,
+    ca.Tags,
+    ca.PostTypeDescription,
+    ca.ScoreCategory,
+    ca.DaysSinceCreation,
+    ca.EngagementCount,
+    ca.AnswerCountIfQuestion,
+    ca.UpVoteCount,
+    ca.DownVoteCount,
+    ca.FirstFavoriteDate,
+    ca.LastCloseReopenDate,
+    ca.ScoreRelative,
+    ca.CommentCountAfterCreation,
+    ca.OwnerDisplayName,
+    ca.OwnerReputation,
+    ca.OwnerPostCount,
+    ca.OwnerCommentCount,
+    ca.OwnerBadgeCount,
+    ca.OwnerAvgPostScore,
+    ca.TagName,
+    ca.TagCount,
+    ca.TagType,
+    ca.TitleLengthCategory,
+    ca.PopularityLevel,
+    ca.EngagementLevel,
+    ca.ScoreRank,
+    ca.ViewRank,
+    ca.PostTypeScoreRank,
+    CASE 
+        WHEN ca.PostTypeId = 1 THEN 
+            CASE 
+                WHEN ca.AnswerCount > 0 AND ca.Score > 20 THEN 1
+                WHEN ca.AnswerCount > 0 AND ca.Score <= 20 THEN 2
+                WHEN ca.AnswerCount = 0 THEN 3
+            END
+        WHEN ca.PostTypeId = 2 THEN 
+            CASE 
+                WHEN ca.Score > 10 THEN 4
+                WHEN ca.Score = 0 THEN 5
+                ELSE 6
+            END
+        ELSE 7
+    END as PostClassification,
+    COALESCE(
+        (SELECT COUNT(*) FROM Posts p2 WHERE p2.ParentId = ca.PostId AND p2.PostTypeId = 2),
+        0
+    ) as ChildAnswerCount,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = ca.PostId AND v.VoteTypeId IN (8, 9)) as BountyCount,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = ca.PostId AND c.UserId IS NOT NULL) as AuthoredCommentCount,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = ca.PostId OR pl.RelatedPostId = ca.PostId) as LinkCount,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = ca.PostId AND ph.PostHistoryTypeId = 10) as CloseCount,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = ca.PostId AND ph.PostHistoryTypeId = 11) as ReopenCount,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = ca.PostId AND ph.PostHistoryTypeId = 12) as DeleteCount,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = ca.PostId AND ph.PostHistoryTypeId = 13) as UndeleteCount,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = ca.OwnerUserId AND b.Date > ca.CreationDate) as PostOwnerBadgeCount,
+    (SELECT STRING_AGG(b.Name, ', ') 
+     FROM Badges b 
+     WHERE b.UserId = ca.OwnerUserId 
+     AND b.Class = 1) as GoldBadges,
+    (SELECT STRING_AGG(b.Name, ', ') 
+     FROM Badges b 
+     WHERE b.UserId = ca.OwnerUserId 
+     AND b.Class = 2) as SilverBadges,
+    (SELECT STRING_AGG(b.Name, ', ') 
+     FROM Badges b 
+     WHERE b.UserId = ca.OwnerUserId 
+     AND b.Class = 3) as BronzeBadges,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = ca.PostId AND v.UserId IS NOT NULL) as VotedUsersCount,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = ca.PostId) as TotalCommentsCount,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = ca.OwnerUserId AND p.PostTypeId = 1) as UserQuestionCount,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = ca.OwnerUserId AND p.PostTypeId = 2) as UserAnswerCount,
+    CASE 
+        WHEN ca.OwnerReputation >= 100000 THEN 'Elite'
+        WHEN ca.OwnerReputation >= 50000 THEN 'Advanced'
+        WHEN ca.OwnerReputation >= 10000 THEN 'Intermediate'
+        WHEN ca.OwnerReputation >= 1000 THEN 'Beginner'
+        ELSE 'Newbie'
+    END as UserReputationLevel,
+    CASE 
+        WHEN ca.OwnerBadgeCount > 50 THEN 'Badge Enthusiast'
+        WHEN ca.OwnerBadgeCount > 25 THEN 'Badge Collector'
+        WHEN ca.OwnerBadgeCount > 10 THEN 'Badge Seeker'
+        ELSE 'Badge Novice'
+    END as BadgeAchievementLevel,
+    COALESCE(
+        (SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = ca.OwnerUserId),
+        0
+    ) as UserAverageScore,
+    COALESCE(
+        (SELECT MAX(p.ViewCount) FROM Posts p WHERE p.OwnerUserId = ca.OwnerUserId),
+        0
+    ) as UserMaxViews,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = ca.OwnerUserId) as TotalUserPosts,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = ca.OwnerUserId AND p.Score > 100) as HighScoringUserPosts,
+    (
+        SELECT COUNT(*) FROM Posts p 
+        WHERE p.OwnerUserId = ca.OwnerUserId 
+        AND p.CreationDate BETWEEN DATEADD(month, -6, cast('2024-10-01' as date)()) AND cast('2024-10-01' as date)()
+    ) as RecentUserPosts,
+    (SELECT MAX(b.Date) FROM Badges b WHERE b.UserId = ca.OwnerUserId) as LastBadgeAwardDate,
+    (SELECT COUNT(*) FROM Comments c WHERE c.UserId = ca.OwnerUserId) as TotalUserComments,
+    (SELECT STRING_AGG(SUBSTRING(c.Text, 1, 50), ' | ') 
+     FROM Comments c 
+     WHERE c.UserId = ca.OwnerUserId 
+     LIMIT 5) as SampleUserComments,
+    ((ca.UpVoteCount + CASE WHEN ca.AnswerCountIfQuestion > 0 THEN 1 ELSE 0 END) * 100.0 / NULLIF((ca.UpVoteCount + ca.DownVoteCount + 1), 0)) as NetScorePercentage,
+    CASE 
+        WHEN ca.TagCount >= 1000 THEN 'Trending'
+        WHEN ca.TagCount >= 500 THEN 'Popular'
+        WHEN ca.TagCount >= 100 THEN 'Moderate'
+        ELSE 'Niche'
+    END as TagPopularityLevel,
+    CASE 
+        WHEN ca.OwnerPostCount >= 1000 THEN 'Veteran'
+        WHEN ca.OwnerPostCount >= 500 THEN 'Experienced'
+        WHEN ca.OwnerPostCount >= 100 THEN 'Regular'
+        WHEN ca.OwnerPostCount >= 10 THEN 'Active'
+        ELSE 'New'
+    END as UserPostExperience,
+    CASE 
+        WHEN ca.OwnerCommentCount >= 500 THEN 'Commentator'
+        WHEN ca.OwnerCommentCount >= 100 THEN 'Frequent Commenter'
+        WHEN ca.OwnerCommentCount >= 10 THEN 'Occasional Commenter'
+        ELSE 'Rare Commenter'
+    END as CommentActivityLevel,
+    (ca.ViewCount + ca.AnswerCount * 50 + ca.CommentCount * 10 + ca.FavoriteCount * 20) as CompositeEngagementScore,
+    (SELECT COUNT(*) FROM Posts p 
+     WHERE p.OwnerUserId = ca.OwnerUserId 
+     AND p.ParentId IS NOT NULL 
+     AND p.PostTypeId = 2 
+     AND p.Score > 5) as HighScoringAnswers
+FROM CombinedAnalysis ca
+WHERE ca.OwnerReputation > 100
+  AND ca.TagCount > 10
+  AND ca.Score > 0
+  AND ca.CommentCountAfterCreation > 0
+  AND ca.DaysSinceCreation > 30
+  AND (ca.PostTypeId = 1 OR ca.PostTypeId = 2)
+  AND ca.OwnerDisplayName IS NOT NULL
+  AND ca.Title IS NOT NULL
+  AND LENGTH(ca.Title) > 10
+ORDER BY ca.Score DESC, ca.ViewCount DESC
+LIMIT 1000;

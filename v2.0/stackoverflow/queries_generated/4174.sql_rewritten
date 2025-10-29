@@ -1,0 +1,103 @@
+-- {"query": "4174.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1321} 
+WITH UserPostActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount AS PostViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.CreationDate DESC) as rn
+    FROM Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId IN (1, 2) -- Questions and Answers
+),
+UserEngagement AS (
+    SELECT
+        upa.UserId,
+        upa.DisplayName,
+        COUNT(CASE WHEN upa.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+        COUNT(CASE WHEN upa.PostTypeId = 2 THEN 1 END) AS AnswerCount,
+        SUM(CASE WHEN upa.PostTypeId = 1 THEN upa.PostScore ELSE 0 END) AS TotalQuestionScore,
+        SUM(CASE WHEN upa.PostTypeId = 2 THEN upa.PostScore ELSE 0 END) AS TotalAnswerScore,
+        AVG(CASE WHEN upa.PostTypeId = 1 THEN upa.PostViewCount ELSE NULL END) AS AvgQuestionViews,
+        AVG(CASE WHEN upa.PostTypeId = 2 THEN upa.PostScore ELSE NULL END) AS AvgAnswerScore,
+        SUM(upa.AnswerCount) AS TotalAnswersGivenToOwnQuestions,
+        SUM(upa.CommentCount) AS TotalCommentsMade,
+        SUM(upa.FavoriteCount) AS TotalFavoritesReceived
+    FROM UserPostActivity upa
+    GROUP BY upa.UserId, upa.DisplayName
+),
+LatestUserActivity AS (
+    SELECT
+        upa.UserId,
+        upa.DisplayName,
+        upa.PostId,
+        upa.PostCreationDate,
+        upa.PostScore,
+        upa.PostViewCount,
+        upa.rn
+    FROM UserPostActivity upa
+    WHERE upa.rn <= 5
+),
+UserBadgeStats AS (
+    SELECT
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+),
+PostLinkMetrics AS (
+    SELECT
+        pl.PostId,
+        COUNT(CASE WHEN pl.LinkTypeId = 1 THEN 1 END) AS LinkedCount,
+        COUNT(CASE WHEN pl.LinkTypeId = 3 THEN 1 END) AS DuplicateCount
+    FROM PostLinks pl
+    GROUP BY pl.PostId
+)
+SELECT
+    ue.DisplayName,
+    ue.QuestionCount,
+    ue.AnswerCount,
+    ue.TotalQuestionScore,
+    ue.TotalAnswerScore,
+    ue.AvgQuestionViews,
+    ue.AvgAnswerScore,
+    ue.TotalAnswersGivenToOwnQuestions,
+    ue.TotalCommentsMade,
+    ue.TotalFavoritesReceived,
+    COALESCE(ubs.GoldBadges, 0) AS GoldBadges,
+    COALESCE(ubs.SilverBadges, 0) AS SilverBadges,
+    COALESCE(ubs.BronzeBadges, 0) AS BronzeBadges,
+    COALESCE(ubs.LastBadgeDate, '1970-01-01') AS LastBadgeDate,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.UserId = ue.UserId AND ph.PostHistoryTypeId IN (4, 5, 6)) AS EditsMade,
+    (
+        SELECT SUM(CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN 1 ELSE 0 END)
+        FROM PostHistory ph
+        WHERE ph.UserId = ue.UserId
+    ) AS ModerationActions,
+    CASE
+        WHEN ue.TotalAnswerScore > 1000 AND ue.AnswerCount > 10 THEN 'High Performer'
+        WHEN ue.TotalQuestionScore < -100 AND ue.QuestionCount > 5 THEN 'Needs Improvement'
+        ELSE 'Standard User'
+    END AS PerformanceCategory,
+    plm.LinkedCount,
+    plm.DuplicateCount,
+    (SELECT COUNT(DISTINCT ph.PostId) FROM PostHistory ph WHERE ph.UserId = ue.UserId AND ph.PostHistoryTypeId = 2) AS BodyEditsCount,
+    (SELECT COUNT(DISTINCT ph.PostId) FROM PostHistory ph WHERE ph.UserId = ue.UserId AND ph.PostHistoryTypeId IN (3, 6, 9)) AS TagEditsCount,
+    (SELECT SUM(pl.Id) FROM PostLinks pl WHERE pl.PostId = (SELECT MIN(PostId) FROM UserPostActivity WHERE UserId = ue.UserId AND PostTypeId = 1)) AS SumOfPostLinkIdsForFirstQuestion,
+    CASE WHEN ue.DisplayName LIKE '%Admin%' THEN 'Administrator' ELSE 'Regular' END AS DisplayNameCategory,
+    CAST(STRFTIME('%Y', ue.DisplayName) AS INTEGER) AS DummyYearFromDisplayName -- Example of a nonsensical but complex calculation
+FROM UserEngagement ue
+LEFT JOIN UserBadgeStats ubs ON ue.UserId = ubs.UserId
+LEFT JOIN PostLinkMetrics plm ON ue.UserId = plm.PostId -- Linking PostId to UserId for demonstration, likely incorrect in a real scenario
+WHERE ue.QuestionCount + ue.AnswerCount > 0
+ORDER BY ue.TotalAnswerScore DESC, ue.TotalQuestionScore DESC
+LIMIT 100;

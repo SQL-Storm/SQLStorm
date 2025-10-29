@@ -1,0 +1,170 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        ARRAY[t.Id] AS Path
+    FROM Tags t
+    WHERE t.IsRequired = true
+
+    UNION ALL
+
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        r.Path || t2.Id
+    FROM Tags t2
+    JOIN PostLinks pl ON pl.PostId = t2.ExcerptPostId
+    JOIN RecursiveTagHierarchy r ON pl.RelatedPostId = r.Id
+    WHERE NOT t2.Id = ANY(r.Path)
+),
+UserActivityStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        count(distinct p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        count(distinct b.Id) AS BadgeCount,
+        coalesce(sum(case when v.VoteTypeId = 2 then 1 else 0 end),0) AS TotalUpVotes,
+        coalesce(sum(case when v.VoteTypeId = 3 then 1 else 0 end),0) AS TotalDownVotes
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+RankedPosts AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        row_number() OVER (
+            PARTITION BY p.OwnerUserId, p.PostTypeId
+            ORDER BY p.Score DESC NULLS LAST, p.ViewCount DESC NULLS LAST
+        ) AS PostRank
+    FROM Posts p
+    WHERE p.PostTypeId IN (1,2)
+),
+AcceptedAnswersWithLag AS (
+    SELECT
+        p.Id AS question_id,
+        p.Title AS question_title,
+        a.Id AS answer_id,
+        a.OwnerUserId AS answer_owner,
+        a.CreationDate AS answer_date,
+        a.Score AS answer_score,
+        lag(a.CreationDate) OVER (PARTITION BY p.Id ORDER BY a.CreationDate) AS PrevAnswerDate,
+        coalesce(extract(epoch FROM (a.CreationDate - lag(a.CreationDate) OVER (PARTITION BY p.Id ORDER BY a.CreationDate))), 0) AS SecondsSincePrevAnswer
+    FROM Posts p
+    JOIN Posts a ON a.ParentId = p.Id
+    WHERE p.PostTypeId = 1
+),
+PopularTags AS (
+    SELECT
+        trim(both '<>' FROM unnest(string_to_array(replace(replace(substring(p.Tags FROM 2 FOR char_length(p.Tags)-2), '><', ','), '&lt;', '<'), ','))) AS TagName,
+        count(*) AS UsageCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+    GROUP BY TagName
+    HAVING count(*) > 100
+),
+HighImpactComments AS (
+    SELECT
+        c.Id,
+        c.PostId,
+        c.UserId,
+        c.Score,
+        c.Text,
+        p.Score AS PostScore,
+        rank() OVER (PARTITION BY c.PostId ORDER BY c.Score DESC NULLS LAST) AS CommentRankPerPost,
+        length(c.Text) AS CommentLength
+    FROM Comments c
+    JOIN Posts p ON p.Id = c.PostId
+    WHERE c.Score IS NOT NULL AND c.Score > 5
+),
+FilteredUsersWithBadges AS (
+    SELECT
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.QuestionCount,
+        uas.AnswerCount,
+        uas.BadgeCount,
+        uas.TotalUpVotes,
+        uas.TotalDownVotes,
+        array_agg(b.Name ORDER BY b.Date DESC) FILTER (WHERE b.Name IS NOT NULL) AS RecentBadges
+    FROM UserActivityStats uas
+    LEFT JOIN Badges b ON b.UserId = uas.UserId
+    WHERE uas.BadgeCount > 10 AND uas.Reputation > 1000
+    GROUP BY uas.UserId, uas.DisplayName, uas.Reputation, uas.QuestionCount, uas.AnswerCount, uas.BadgeCount, uas.TotalUpVotes, uas.TotalDownVotes
+)
+
+SELECT DISTINCT
+    fuwb.UserId,
+    fuwb.DisplayName,
+    fuwb.Reputation,
+    fuwb.QuestionCount,
+    fuwb.AnswerCount,
+    fuwb.BadgeCount,
+    fuwb.TotalUpVotes,
+    fuwb.TotalDownVotes,
+    CASE WHEN fuwb.TotalDownVotes = 0 THEN NULL ELSE round((CAST(fuwb.TotalUpVotes AS numeric))/fuwb.TotalDownVotes,2) END AS UpDownVoteRatio,
+    p.Title AS TopQuestionTitle,
+    p.Score AS TopQuestionScore,
+    p.ViewCount AS TopQuestionViews,
+    a.answer_id,
+    a.answer_score,
+    a.answer_date,
+    a.SecondsSincePrevAnswer,
+    hc.Text AS TopCommentText,
+    hc.Score AS TopCommentScore,
+    string_agg(distinct pt.TagName, ',') AS CommonPopularTags,
+    string_agg(distinct rt.TagName, ',') AS RecursiveRequiredTags
+FROM FilteredUsersWithBadges fuwb
+LEFT JOIN RankedPosts p ON p.OwnerUserId = fuwb.UserId AND p.PostRank = 1 AND p.PostTypeId = 1
+LEFT JOIN AcceptedAnswersWithLag a ON a.answer_owner = fuwb.UserId
+LEFT JOIN HighImpactComments hc ON hc.UserId = fuwb.UserId AND hc.CommentRankPerPost = 1
+LEFT JOIN PopularTags pt ON pt.TagName = ANY (
+    -- split tags like '<tag1><tag2>' into array ['tag1','tag2'] using standard SQL approach
+    regexp_split_to_array(
+        replace(replace(substring(coalesce(p.Tags,'' ) FROM 2 FOR char_length(coalesce(p.Tags,''))-2), '><', ','),
+        '&lt;', '<'),
+        ','
+    )
+)
+LEFT JOIN RecursiveTagHierarchy rt ON rt.TagName = ANY (
+    regexp_split_to_array(
+        replace(replace(substring(coalesce(p.Tags,'' ) FROM 2 FOR char_length(coalesce(p.Tags,''))-2), '><', ','),
+        '&lt;', '<'),
+        ','
+    )
+)
+WHERE fuwb.Reputation > 5000
+GROUP BY
+    fuwb.UserId,
+    fuwb.DisplayName,
+    fuwb.Reputation,
+    fuwb.QuestionCount,
+    fuwb.AnswerCount,
+    fuwb.BadgeCount,
+    fuwb.TotalUpVotes,
+    fuwb.TotalDownVotes,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    a.answer_id,
+    a.answer_score,
+    a.answer_date,
+    a.SecondsSincePrevAnswer,
+    hc.Text,
+    hc.Score
+HAVING count(distinct hc.Id) > 0
+ORDER BY fuwb.Reputation DESC, fuwb.BadgeCount DESC, p.Score DESC
+LIMIT 100;

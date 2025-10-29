@@ -1,0 +1,110 @@
+-- {"query": "5535.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 827} 
+WITH RankedPosts AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.CreationDate,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.LastActivityDate,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.LastEditorUserId,
+    p.LastEditDate,
+    p.ContentLicense,
+    u.Reputation,
+    u.DisplayName,
+    u.Location,
+    u.AccountId,
+    -- window: time since creation, and moving average of score over last 7 posts per day
+    CAST(EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - p.CreationDate)) / 3600.0 AS DECIMAL(10,2)) AS hours_since_creation,
+    AVG(p.Score) OVER (PARTITION BY DATE(p.CreationDate) ORDER BY p.CreationDate ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS rolling_score_7d
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.LastActivityDate IS NOT NULL
+),
+TagInsights AS (
+  SELECT
+    rp.Id,
+    rp.Title,
+    rp.Tags,
+    CASE
+      WHEN rp.Tags LIKE ''%<java>%''
+        OR rp.Title ILIKE '%java%'
+      THEN 'Java-related'
+      WHEN rp.Tags LIKE ''%<sql>%''
+        OR rp.Title ILIKE '%sql%'
+      THEN 'SQL-related'
+      ELSE 'Other'
+    END AS topic_category,
+    ROW_NUMBER() OVER (PARTITION BY CASE
+      WHEN rp.Tags LIKE ''%<java>%''
+        OR rp.Title ILIKE '%java%'
+      THEN 'Java-related'
+      WHEN rp.Tags LIKE ''%<sql>%''
+        OR rp.Title ILIKE '%sql%'
+      THEN 'SQL-related'
+      ELSE 'Other'
+    END ORDER BY rp.LastActivityDate DESC) AS rn_by_topic
+  FROM RankedPosts rp
+),
+Filtered AS (
+  SELECT
+    ti.Id,
+    ti.Title,
+    ti.Topic_Category,
+    ti.Tags,
+    ti.hours_since_creation,
+    ti.rolling_score_7d,
+    ti.LastActivityDate
+  FROM TagInsights ti
+  CROSS JOIN LATERAL (
+    SELECT CASE
+      WHEN ti.topic_category = 'Java-related' THEN 1
+      WHEN ti.topic_category = 'SQL-related' THEN 2
+      ELSE 3
+    END AS priority
+  ) as d
+  WHERE ti.rolling_score_7d > 0
+),
+Aggregates AS (
+  SELECT
+    f.Id,
+    f.Title,
+    f.Topic_Category,
+    f.Tags,
+    f.hours_since_creation,
+    f.rolling_score_7d,
+    f.LastActivityDate,
+    -- compute a complex scalar: combined metric with NULL-safe logic and string expressions
+    COALESCE(
+      NULLIF(REGEXP_REPLACE(f.Title, '^(\\s+)|(\\s+)$',''), ''), 'Untitled'
+    ) AS safe_title,
+    CASE
+      WHEN f.hours_since_creation < 24 THEN 'Fresh'
+      WHEN f.hours_since_creation < 168 THEN 'Active'
+      ELSE 'Stale'
+    END AS freshness_bucket,
+    (f.rolling_score_7d * 1.0) + (CASE WHEN f.Tags ~ '\\b(SQL|sql)\\b' THEN 5 ELSE 0 END) AS composite_score
+  FROM Filtered f
+)
+SELECT
+  a.Id,
+  a.Title,
+  a.Topic_Category,
+  a.Tags,
+  a.hours_since_creation,
+  a.rolling_score_7d,
+  a.LastActivityDate,
+  a.safe_title,
+  a.freshness_bucket,
+  a.composite_score
+FROM Aggregates a
+ORDER BY a.composite_score DESC, a.LastActivityDate DESC
+LIMIT 100;

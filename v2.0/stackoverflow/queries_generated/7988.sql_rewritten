@@ -1,0 +1,243 @@
+-- {"query": "7988.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2270} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT c.Id) as Comments,
+        COUNT(DISTINCT b.Id) as Badges,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        DATEDIFF(day, u.CreationDate, cast('2024-10-01 12:34:56' as timestamp)) as AccountAgeDays,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'High'
+            WHEN u.Reputation > 1000 THEN 'Medium'
+            ELSE 'Low'
+        END as ReputationLevel,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END), 0) as TotalQuestionScore,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END), 0) as TotalAnswerScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate
+),
+TopTags AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as TagRank,
+        AVG(t.Count) OVER () as AvgTagCount
+    FROM Tags t
+    WHERE t.Count > 1000
+),
+QuestionStats AS (
+    SELECT 
+        p.Id as QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        u.DisplayName as OwnerName,
+        COALESCE(p.AcceptedAnswerId, 0) as HasAcceptedAnswer,
+        DATEDIFF(day, p.CreationDate, cast('2024-10-01 12:34:56' as timestamp)) as DaysSinceCreation,
+        CASE 
+            WHEN p.AnswerCount = 0 THEN 'No Answers'
+            WHEN p.AnswerCount = 1 THEN 'One Answer'
+            WHEN p.AnswerCount > 1 THEN 'Multiple Answers'
+        END as AnswerStatus,
+        CASE 
+            WHEN p.Score > 10 THEN 'Highly Voted'
+            WHEN p.Score > 5 THEN 'Moderately Voted'
+            ELSE 'Low Voted'
+        END as VoteStatus
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1 
+    AND p.CreationDate >= DATEADD(year, -1, cast('2024-10-01 12:34:56' as timestamp))
+),
+PostAnalysis AS (
+    SELECT 
+        qs.QuestionId,
+        qs.Title,
+        qs.Score,
+        qs.ViewCount,
+        qs.AnswerCount,
+        qs.CommentCount,
+        qs.OwnerUserId,
+        qs.OwnerName,
+        qs.HasAcceptedAnswer,
+        qs.DaysSinceCreation,
+        qs.AnswerStatus,
+        qs.VoteStatus,
+        STRING_AGG(
+            CASE WHEN qs.Tags IS NOT NULL THEN 
+                SUBSTRING(qs.Tags, 2, LEN(qs.Tags) - 2) 
+            ELSE NULL END, 
+            ', '
+        ) WITHIN GROUP (ORDER BY qs.QuestionId) as AllTags,
+        ROW_NUMBER() OVER (PARTITION BY qs.OwnerUserId ORDER BY qs.Score DESC) as UserQuestionRank,
+        PERCENT_RANK() OVER (ORDER BY qs.Score) as ScorePercentile,
+        NTILE(10) OVER (ORDER BY qs.Score) as ScoreDecile,
+        AVG(qs.Score) OVER (PARTITION BY qs.OwnerUserId) as AvgScorePerUser,
+        LAG(qs.Score, 1) OVER (ORDER BY qs.CreationDate) as PrevScore,
+        LEAD(qs.Score, 1) OVER (ORDER BY qs.CreationDate) as NextScore
+    FROM QuestionStats qs
+),
+UserQuestionMetrics AS (
+    SELECT 
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.TotalPosts,
+        ua.Questions,
+        ua.Answers,
+        ua.Comments,
+        ua.Badges,
+        ua.LastPostDate,
+        ua.AccountAgeDays,
+        ua.ReputationLevel,
+        ua.TotalQuestionScore,
+        ua.TotalAnswerScore,
+        (ua.TotalQuestionScore + ua.TotalAnswerScore) as TotalScore,
+        CASE 
+            WHEN ua.TotalAnswerScore > 0 THEN 
+                CAST(ua.TotalQuestionScore AS FLOAT) / CAST(ua.TotalAnswerScore AS FLOAT)
+            ELSE NULL 
+        END as QuestionToAnswerRatio,
+        COALESCE(ROUND(AVG(pa.Score) OVER (PARTITION BY ua.UserId), 2), 0) as AvgQuestionScore,
+        COUNT(pa.QuestionId) OVER (PARTITION BY ua.UserId) as UserTotalQuestions,
+        COALESCE(ROUND(STDDEV(pa.Score) OVER (PARTITION BY ua.UserId), 2), 0) as ScoreStdDev,
+        RANK() OVER (ORDER BY (ua.TotalQuestionScore + ua.TotalAnswerScore) DESC) as OverallRank,
+        DENSE_RANK() OVER (ORDER BY (ua.TotalQuestionScore + ua.TotalAnswerScore) DESC) as DenseRank
+    FROM UserActivityStats ua
+    LEFT JOIN PostAnalysis pa ON ua.UserId = pa.OwnerUserId
+)
+SELECT 
+    uqm.UserId,
+    uqm.DisplayName,
+    uqm.Reputation,
+    uqm.TotalPosts,
+    uqm.Questions,
+    uqm.Answers,
+    uqm.Comments,
+    uqm.Badges,
+    uqm.LastPostDate,
+    uqm.AccountAgeDays,
+    uqm.ReputationLevel,
+    uqm.TotalQuestionScore,
+    uqm.TotalAnswerScore,
+    uqm.TotalScore,
+    uqm.QuestionToAnswerRatio,
+    uqm.AvgQuestionScore,
+    uqm.UserTotalQuestions,
+    uqm.ScoreStdDev,
+    uqm.OverallRank,
+    uqm.DenseRank,
+    CASE 
+        WHEN uqm.ReputationLevel = 'High' AND uqm.TotalScore > 500 THEN 'Elite Contributor'
+        WHEN uqm.ReputationLevel = 'Medium' AND uqm.TotalScore > 200 THEN 'Active Contributor'
+        WHEN uqm.ReputationLevel = 'Low' AND uqm.TotalScore > 50 THEN 'New Contributor'
+        ELSE 'Regular Member'
+    END as ContributionLevel,
+    STUFF((
+        SELECT ', ' + t.TagName
+        FROM Tags t
+        WHERE t.Id IN (
+            SELECT CAST(value AS INT) 
+            FROM STRING_SPLIT(
+                (SELECT TOP 1 qs.Tags 
+                 FROM Posts qs 
+                 WHERE qs.OwnerUserId = uqm.UserId 
+                 AND qs.PostTypeId = 1 
+                 AND qs.Tags IS NOT NULL 
+                 ORDER BY qs.CreationDate DESC), 
+                '><'
+            )
+            WHERE value IS NOT NULL AND LEN(value) > 0 AND value NOT LIKE '%<%'
+        )
+        FOR XML PATH('')
+    ), 1, 2, '') as CommonTags,
+    EXISTS (
+        SELECT 1 
+        FROM PostHistory ph 
+        WHERE ph.UserId = uqm.UserId 
+        AND ph.PostHistoryTypeId = 12
+        AND ph.CreationDate >= DATEADD(month, -6, cast('2024-10-01 12:34:56' as timestamp))
+    ) as RecentlyDeletedPosts,
+    COALESCE((
+        SELECT TOP 1 ph.Text
+        FROM PostHistory ph
+        WHERE ph.UserId = uqm.UserId
+        AND ph.PostHistoryTypeId IN (10, 11, 12, 13)
+        AND ph.CreationDate >= DATEADD(year, -1, cast('2024-10-01 12:34:56' as timestamp))
+        ORDER BY ph.CreationDate DESC
+    ), 'No recent activity') as RecentPostActivity,
+    CASE 
+        WHEN (SELECT COUNT(*) FROM Votes v WHERE v.UserId = uqm.UserId AND v.VoteTypeId = 2) > 100 THEN 'Frequent Upvoter'
+        WHEN (SELECT COUNT(*) FROM Votes v WHERE v.UserId = uqm.UserId AND v.VoteTypeId = 3) > 50 THEN 'Frequent Downvoter'
+        ELSE 'Regular Voter'
+    END as VotingPattern,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.OwnerUserId = uqm.UserId 
+        AND p.PostTypeId = 1 
+        AND p.Score > 10
+    ) as HighScoreQuestions,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.OwnerUserId = uqm.UserId 
+        AND p.PostTypeId = 2 
+        AND p.Score > 5
+    ) as HighScoreAnswers,
+    COALESCE((
+        SELECT AVG(v.BountyAmount)
+        FROM Votes v
+        WHERE v.UserId = uqm.UserId
+        AND v.VoteTypeId = 8
+        AND v.BountyAmount IS NOT NULL
+    ), 0) as AvgBountyAwarded,
+    (
+        SELECT COUNT(*) 
+        FROM Comments c 
+        WHERE c.UserId = uqm.UserId 
+        AND c.CreationDate >= DATEADD(month, -3, cast('2024-10-01 12:34:56' as timestamp))
+    ) as RecentComments,
+    COALESCE((
+        SELECT COUNT(*) 
+        FROM Badges b 
+        WHERE b.UserId = uqm.UserId 
+        AND b.Date >= DATEADD(month, -6, cast('2024-10-01 12:34:56' as timestamp))
+    ), 0) as RecentBadges,
+    CASE 
+        WHEN uqm.Questions > 10 AND uqm.Answers > 20 THEN 'Veteran'
+        WHEN uqm.Questions > 5 AND uqm.Answers > 10 THEN 'Experienced'
+        WHEN uqm.Questions > 1 OR uqm.Answers > 1 THEN 'Beginner'
+        ELSE 'Inactive'
+    END as ActivityLevel,
+    uqm.TotalScore / NULLIF(uqm.AccountAgeDays, 0) as ScorePerDay,
+    NULLIF(
+        (uqm.TotalQuestionScore + uqm.TotalAnswerScore) / 
+        NULLIF(uqm.Questions + uqm.Answers, 0), 0
+    ) as AverageScorePerPost
+FROM UserQuestionMetrics uqm
+WHERE uqm.TotalPosts > 0
+AND uqm.AccountAgeDays > 30
+ORDER BY uqm.TotalScore DESC, uqm.Reputation DESC
+OFFSET 100 ROWS
+FETCH NEXT 50 ROWS ONLY;

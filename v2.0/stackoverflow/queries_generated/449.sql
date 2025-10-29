@@ -1,0 +1,338 @@
+-- {"query": "449.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3045} 
+with
+recent_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.location,
+    coalesce(nullif(trim(u.websiteurl), ''), 'n/a') as websiteurl_norm
+  from users u
+  where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+tagged_questions as (
+  select
+    p.id as question_id,
+    p.creationdate as q_created,
+    p.owneruserid as asker_id,
+    p.score as q_score,
+    p.viewcount,
+    p.answercount,
+    p.title,
+    p.tags,
+    string_to_array(substring(p.tags, 2, length(p.tags)-2), '><') as tag_list
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= (select max(creationdate) - interval '365 days' from posts where posttypeid = 1)
+),
+answers as (
+  select
+    a.id as answer_id,
+    a.parentid as question_id,
+    a.owneruserid as answerer_id,
+    a.score as a_score,
+    a.creationdate as a_created
+  from posts a
+  where a.posttypeid = 2
+),
+answerer_activity as (
+  select
+    an.answerer_id,
+    count(*) filter (where an.a_score > 0) as pos_answers,
+    count(*) filter (where an.a_score <= 0 or an.a_score is null) as nonpos_answers,
+    min(an.a_created) as first_answer_at,
+    max(an.a_created) as last_answer_at
+  from answers an
+  group by an.answerer_id
+),
+votes_agg as (
+  select
+    v.postid,
+    count(*) filter (where v.votetypeid = 2) as upvotes,
+    count(*) filter (where v.votetypeid = 3) as downvotes,
+    count(*) filter (where v.votetypeid = 5) as favorites,
+    count(*) filter (where v.votetypeid = 8) as bounties_started,
+    sum(coalesce(v.bountyamount,0)) filter (where v.votetypeid in (8,9)) as bounty_amount_total,
+    min(v.creationdate) as first_vote_at,
+    max(v.creationdate) as last_vote_at
+  from votes v
+  group by v.postid
+),
+commenter_stats as (
+  select
+    c.postid,
+    count(*) as total_comments,
+    avg(coalesce(c.score,0)) as avg_comment_score,
+    max(c.creationdate) as last_comment_at
+  from comments c
+  group by c.postid
+),
+dup_links as (
+  select
+    pl.postid as dup_postid,
+    pl.relatedpostid as canonical_postid,
+    min(pl.creationdate) as first_dup_link_at
+  from postlinks pl
+  where pl.linktypeid = 3
+  group by pl.postid, pl.relatedpostid
+),
+history_flags as (
+  select
+    ph.postid,
+    max(ph.creationdate) filter (where ph.posthistorytypeid in (10,35)) as last_close_or_migrate,
+    max(ph.creationdate) filter (where ph.posthistorytypeid in (11)) as last_reopen,
+    count(*) filter (where ph.posthistorytypeid in (10)) as close_count,
+    count(*) filter (where ph.posthistorytypeid in (11)) as reopen_count,
+    count(*) filter (where ph.posthistorytypeid in (50)) as community_bumps
+  from posthistory ph
+  group by ph.postid
+),
+badges_by_user as (
+  select
+    b.userid,
+    count(*) as total_badges,
+    count(*) filter (where b.class = 1) as gold_count,
+    count(*) filter (where b.class = 2) as silver_count,
+    count(*) filter (where b.class = 3) as bronze_count,
+    count(*) filter (where b.tagbased = 1) as tag_badges,
+    min(b.date) as first_badge_at,
+    max(b.date) as last_badge_at
+  from badges b
+  group by b.userid
+),
+tag_popularity as (
+  select
+    t.tagname,
+    t.count as global_tag_count,
+    t.ismoderaTORonly::int as is_mod_only_int,
+    t.isrequired::int as is_required_int
+  from tags t
+),
+expanded_tags as (
+  select
+    tq.question_id,
+    lower(trim(t)) as tag
+  from tagged_questions tq
+  cross join lateral unnest(tq.tag_list) as t
+),
+tag_enriched as (
+  select
+    et.question_id,
+    et.tag,
+    coalesce(tp.global_tag_count, 0) as global_tag_count,
+    coalesce(tp.is_mod_only_int, 0) as is_mod_only,
+    coalesce(tp.is_required_int, 0) as is_required
+  from expanded_tags et
+  left join tag_popularity tp
+    on tp.tagname = et.tag
+),
+question_metrics as (
+  select
+    tq.question_id,
+    tq.q_created,
+    tq.asker_id,
+    tq.q_score,
+    tq.viewcount,
+    tq.answercount,
+    tq.title,
+    tq.tags,
+    count(*) as tag_count,
+    sum(case when te.is_mod_only = 1 then 1 else 0 end) as mod_only_tag_count,
+    sum(case when te.is_required = 1 then 1 else 0 end) as required_tag_count,
+    avg(nullif(te.global_tag_count,0)) as avg_global_tag_popularity,
+    max(te.global_tag_count) as max_global_tag_popularity
+  from tagged_questions tq
+  left join tag_enriched te on te.question_id = tq.question_id
+  group by tq.question_id, tq.q_created, tq.asker_id, tq.q_score, tq.viewcount, tq.answercount, tq.title, tq.tags
+),
+question_with_answers as (
+  select
+    qm.*,
+    count(distinct a.answer_id) as answers_total,
+    count(distinct a.answer_id) filter (where a.a_score > 0) as answers_positive,
+    min(a.a_created) as first_answer_at,
+    max(a.a_created) as last_answer_at
+  from question_metrics qm
+  left join answers a on a.question_id = qm.question_id
+  group by qm.question_id, qm.q_created, qm.asker_id, qm.q_score, qm.viewcount, qm.answercount, qm.title, qm.tags, qm.tag_count, qm.mod_only_tag_count, qm.required_tag_count, qm.avg_global_tag_popularity, qm.max_global_tag_popularity
+),
+question_vote_comment as (
+  select
+    qwa.*,
+    va.upvotes,
+    va.downvotes,
+    va.favorites,
+    va.bounties_started,
+    va.bounty_amount_total,
+    va.first_vote_at,
+    va.last_vote_at,
+    cs.total_comments,
+    cs.avg_comment_score,
+    cs.last_comment_at
+  from question_with_answers qwa
+  left join votes_agg va on va.postid = qwa.question_id
+  left join commenter_stats cs on cs.postid = qwa.question_id
+),
+asker_profile as (
+  select
+    ru.user_id as asker_id,
+    ru.displayname as asker_name,
+    ru.reputation as asker_rep,
+    ru.creationdate as asker_created,
+    coalesce(ru.location, 'unknown') as asker_location,
+    ru.websiteurl_norm,
+    bu.total_badges,
+    bu.gold_count,
+    bu.silver_count,
+    bu.bronze_count,
+    bu.tag_badges,
+    bu.last_badge_at
+  from recent_users ru
+  left join badges_by_user bu on bu.userid = ru.user_id
+),
+dup_summary as (
+  select
+    d.dup_postid as question_id,
+    count(*) as dup_targets,
+    min(d.first_dup_link_at) as first_dup_link_at,
+    max(d.first_dup_link_at) as last_dup_link_at
+  from dup_links d
+  group by d.dup_postid
+),
+norms as (
+  select
+    avg(coalesce(qvc.q_score,0)) as avg_q_score,
+    stddev_pop(coalesce(qvc.q_score,0)) as std_q_score,
+    avg(coalesce(qvc.viewcount,0)) as avg_views,
+    stddev_pop(coalesce(qvc.viewcount,0)) as std_views,
+    avg(coalesce(qvc.answers_total,0)) as avg_answers,
+    stddev_pop(coalesce(qvc.answers_total,0)) as std_answers
+  from question_vote_comment qvc
+),
+scored as (
+  select
+    qvc.question_id,
+    qvc.q_created,
+    qvc.asker_id,
+    qvc.q_score,
+    qvc.viewcount,
+    qvc.answercount,
+    qvc.title,
+    qvc.tags,
+    qvc.tag_count,
+    qvc.mod_only_tag_count,
+    qvc.required_tag_count,
+    qvc.avg_global_tag_popularity,
+    qvc.max_global_tag_popularity,
+    qvc.answers_total,
+    qvc.answers_positive,
+    qvc.first_answer_at,
+    qvc.last_answer_at,
+    qvc.upvotes,
+    qvc.downvotes,
+    qvc.favorites,
+    qvc.bounties_started,
+    qvc.bounty_amount_total,
+    qvc.first_vote_at,
+    qvc.last_vote_at,
+    qvc.total_comments,
+    qvc.avg_comment_score,
+    qvc.last_comment_at,
+    hs.last_close_or_migrate,
+    hs.last_reopen,
+    hs.close_count,
+    hs.reopen_count,
+    hs.community_bumps,
+    ds.dup_targets,
+    ds.first_dup_link_at,
+    ds.last_dup_link_at,
+    ap.asker_name,
+    ap.asker_rep,
+    ap.asker_created,
+    ap.asker_location,
+    ap.websiteurl_norm,
+    ap.total_badges,
+    ap.gold_count,
+    ap.silver_count,
+    ap.bronze_count,
+    ap.tag_badges,
+    ap.last_badge_at,
+    -- z-score like normalization with NULL handling
+    case when n.std_q_score is null or n.std_q_score = 0 then null else (qvc.q_score - n.avg_q_score) / nullif(n.std_q_score,0) end as z_q_score,
+    case when n.std_views is null or n.std_views = 0 then null else (qvc.viewcount - n.avg_views) / nullif(n.std_views,0) end as z_views,
+    case when n.std_answers is null or n.std_answers = 0 then null else (qvc.answers_total - n.avg_answers) / nullif(n.std_answers,0) end as z_answers,
+    -- composite difficulty/engagement score
+    (
+      coalesce((qvc.upvotes - coalesce(qvc.downvotes,0))::numeric,0) * 0.4
+      + coalesce(qvc.favorites,0) * 0.3
+      + coalesce(qvc.viewcount,0) * 0.0005
+      + coalesce(qvc.answers_positive,0) * 0.2
+      - coalesce(qvc.dup_targets,0) * 0.5
+      + coalesce(hs.community_bumps,0) * 0.1
+    ) as engagement_score
+  from question_vote_comment qvc
+  left join history_flags hs on hs.postid = qvc.question_id
+  left join dup_summary ds on ds.question_id = qvc.question_id
+  left join asker_profile ap on ap.asker_id = qvc.asker_id
+  cross join norms n
+),
+ranked as (
+  select
+    s.*,
+    row_number() over (order by engagement_score desc nulls last, z_views desc nulls last, q_created desc) as rn_overall,
+    rank() over (partition by coalesce(ap.asker_location,'unknown') order by coalesce(engagement_score, -1e9) desc) as rnk_by_location,
+    dense_rank() over (partition by case when s.tag_count >= 5 then 'many' when s.tag_count >= 3 then 'medium' else 'few' end order by coalesce(z_q_score, -1e9) desc) as d_rnk_by_tagload,
+    percentile_disc(0.9) within group (order by coalesce(engagement_score, -1e9)) over () as p90_engagement_global
+  from scored s
+  left join asker_profile ap on ap.asker_id = s.asker_id
+),
+filtered as (
+  select *
+  from ranked
+  where coalesce(downvotes,0) <= coalesce(upvotes,0)
+    and coalesce(answers_total,0) >= 1
+    and (last_close_or_migrate is null or (last_reopen is not null and last_reopen >= last_close_or_migrate))
+    and (dup_targets is null or dup_targets < 3)
+)
+select
+  f.question_id,
+  f.q_created,
+  coalesce(f.title, '[no title]') as title,
+  f.tags,
+  f.asker_id,
+  coalesce(f.asker_name, 'Anonymous') as asker_name,
+  f.asker_rep,
+  f.asker_location,
+  f.q_score,
+  f.viewcount,
+  f.answers_total,
+  f.upvotes,
+  f.downvotes,
+  f.favorites,
+  f.engagement_score,
+  f.z_q_score,
+  f.z_views,
+  f.z_answers,
+  f.tag_count,
+  f.mod_only_tag_count,
+  f.required_tag_count,
+  f.avg_global_tag_popularity,
+  f.max_global_tag_popularity,
+  f.total_comments,
+  f.avg_comment_score,
+  f.community_bumps,
+  f.dup_targets,
+  f.rn_overall,
+  f.rnk_by_location,
+  f.d_rnk_by_tagload,
+  f.p90_engagement_global,
+  case
+    when f.engagement_score >= f.p90_engagement_global then 'top10%'
+    when f.engagement_score is null then 'unknown'
+    when f.engagement_score >= 0 then 'positive'
+    else 'negative'
+  end as engagement_bucket
+from filtered f
+order by f.rn_overall
+limit 200;

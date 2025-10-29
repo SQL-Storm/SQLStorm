@@ -1,0 +1,92 @@
+WITH RankedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        p.CreationDate,
+        ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.ViewCount DESC) AS ScoreRank,
+        ROW_NUMBER() OVER (ORDER BY p.FavoriteCount DESC) AS FavoriteRank,
+        SUM(p.ViewCount) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS RunningViewCount,
+        AVG(CAST(p.Score AS NUMERIC)) OVER (PARTITION BY p.PostTypeId) AS AvgScoreForPostType
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.CreationDate >= (cast('2024-10-01' as date) - INTERVAL '1 year')
+),
+AnswerStats AS (
+    SELECT
+        ParentId,
+        COUNT(Id) AS AnswerCount,
+        AVG(CAST(Score AS NUMERIC)) AS AvgAnswerScore,
+        MAX(CreationDate) AS LatestAnswerDate
+    FROM Posts
+    WHERE PostTypeId = 2
+    GROUP BY ParentId
+),
+CommentAggregates AS (
+    SELECT
+        PostId,
+        COUNT(Id) AS TotalComments,
+        SUM(CASE WHEN UserId IS NULL THEN 1 ELSE 0 END) AS AnonymousComments,
+        MAX(CreationDate) AS LatestCommentDate
+    FROM Comments
+    GROUP BY PostId
+),
+HighReputationUsers AS (
+    SELECT Id, DisplayName, Reputation
+    FROM Users
+    WHERE Reputation > 10000
+)
+SELECT
+    rp.PostId,
+    rp.Title,
+    rp.PostTypeName,
+    rp.OwnerDisplayName,
+    rp.Score,
+    rp.ViewCount,
+    rp.FavoriteCount,
+    CASE
+        WHEN rp.FavoriteRank <= 10 THEN 'Top 10 Favorite'
+        WHEN rp.ScoreRank <= 50 THEN 'Top 50 Scored'
+        ELSE 'Other'
+    END AS PostCategory,
+    COALESCE(asl.AnswerCount, 0) AS ActualAnswerCount,
+    COALESCE(asl.AvgAnswerScore, 0.0) AS AvgAnswerScore,
+    COALESCE(asl.LatestAnswerDate, rp.CreationDate) AS LastActivityOnAnswer,
+    COALESCE(ca.TotalComments, 0) AS TotalComments,
+    COALESCE(ca.AnonymousComments, 0) AS AnonymousComments,
+    CASE
+        WHEN rp.RunningViewCount > 1000000 THEN 'High Traffic Post Type'
+        ELSE 'Standard Traffic Post Type'
+    END AS TrafficBand,
+    CASE
+        WHEN rp.Score > rp.AvgScoreForPostType * 2 THEN 'Above Average Score'
+        WHEN rp.Score < rp.AvgScoreForPostType / 2 THEN 'Below Average Score'
+        ELSE 'Average Score'
+    END AS ScoreComparison,
+    CASE
+        WHEN hr.Id IS NOT NULL THEN 'High Rep User'
+        ELSE 'Standard Rep User'
+    END AS OwnerReputationStatus,
+    CASE
+        WHEN rp.Title LIKE '%?%' THEN 'Likely Question'
+        ELSE 'Not Clearly Question'
+    END AS TitleQuestionIndicator,
+    rp.CreationDate AS PostCreationDate,
+    asl.LatestAnswerDate AS LatestAnswerTimestamp
+FROM RankedPosts rp
+LEFT JOIN AnswerStats asl ON rp.PostId = asl.ParentId
+LEFT JOIN CommentAggregates ca ON rp.PostId = ca.PostId
+LEFT JOIN HighReputationUsers hr ON rp.OwnerUserId = hr.Id
+WHERE rp.PostTypeName IN ('Question', 'Answer')
+  AND COALESCE(rp.OwnerDisplayName, 'Anonymous') NOT LIKE '%Community%'
+ORDER BY rp.Score DESC, rp.ViewCount DESC
+FETCH FIRST 100 ROWS ONLY;

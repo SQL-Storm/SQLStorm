@@ -1,0 +1,31 @@
+select base_avg_q_views from baselines) * 2
+           and coalesce(du.avg_q_score,0) >= (select base_avg_q_score from baselines)
+           and coalesce(du.dup_marked_count,0) = 0
+        then 1 else 0 end as breakout_question_author,
+    upper(coalesce(split_part(du.location_norm, ',', 1), 'UNKNOWN')) as region_hint,
+    (nullif(trim(coalesce(du.displayname,'')), '') is null) as is_anon_name
+  from dense_user du
+  left join dup_and_tag_context dt on dt.user_id = du.user_id
+)
+select *
+from final f
+where
+  (
+    f.suppress_user = 0
+    or (f.global_ventile <= 5 and (f.email_mentions_in_about + f.url_mentions_in_about) <= 5)
+  )
+  and (
+    f.q_count + f.a_count >= 1
+    or (f.badge_count >= 3 and f.total_post_score is not null)
+  )
+  and (
+    f.avg_tag_popularity_decile is null
+    or f.avg_tag_popularity_decile between 3 and 9
+  )
+  and (
+    f.canonical_links_touched > 0
+    or coalesce(f.external_edits,0) >= coalesce(f.self_edits,0)
+    or f.breakout_question_author = 1
+  )
+order by f.global_rank_desc asc, f.composite_score desc, f.user_id
+limit 500;

@@ -1,0 +1,141 @@
+WITH
+UserStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        COALESCE(u.Location, 'Unknown')        AS Location,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        SUM(p.ViewCount) FILTER (WHERE p.PostTypeId = 1) AS TotalQuestionViews,
+        MAX(p.CreationDate)                    AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate,
+             u.LastAccessDate, u.Location
+),
+
+BadgeAgg AS (
+    SELECT
+        b.UserId,
+        COUNT(*)                                    AS BadgeTotal,
+        COUNT(*) FILTER (WHERE b.Class = 1)        AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2)        AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3)        AS BronzeBadges,
+        STRING_AGG(DISTINCT b.Name, ', ')          AS BadgeList
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+PostScoreAgg AS (
+    SELECT
+        p.OwnerUserId,
+        SUM(p.Score)                               AS NetScore,
+        AVG(p.Score)                               AS AvgScore,
+        MAX(p.Score)                               AS MaxScore,
+        MIN(p.Score)                               AS MinScore,
+        COUNT(*) FILTER (
+            WHERE p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL
+        )                                          AS QuestionsWithAccepted
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+
+VoteStats AS (
+    SELECT
+        v.PostId,
+        SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        SUM(CASE WHEN vt.Id = 5 THEN 1 ELSE 0 END) AS Favorites
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY v.PostId
+),
+
+TopTags AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS rn
+    FROM Tags t
+    WHERE t.IsModeratorOnly = FALSE
+),
+
+RecentClosedQuestions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        ph.CreationDate                           AS ClosedDate,
+        COALESCE(NULLIF(ph.Comment, ''), 'No reason') AS CloseReason,
+        ROW_NUMBER() OVER (
+            PARTITION BY p.OwnerUserId
+            ORDER BY ph.CreationDate DESC
+        )                                          AS rn_user
+    FROM Posts p
+    JOIN PostHistory ph ON ph.PostId = p.Id
+    WHERE p.PostTypeId = 1
+      AND ph.PostHistoryTypeId = 10   -- Post Closed
+),
+
+Combined AS (
+    SELECT
+        us.Id                                      AS UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.QuestionCount,
+        us.AnswerCount,
+        us.TotalQuestionViews,
+        COALESCE(b.BadgeTotal, 0)                  AS BadgeTotal,
+        COALESCE(b.GoldBadges, 0)                  AS GoldBadges,
+        COALESCE(ps.NetScore, 0)                  AS NetScore,
+        COALESCE(vs.UpVotes, 0)                   AS TotalUpVotes,
+        COALESCE(vs.DownVotes, 0)                 AS TotalDownVotes,
+        CASE
+            WHEN us.Reputation > 20000 THEN 'Legendary'
+            WHEN us.Reputation > 10000 THEN 'Expert'
+            WHEN us.Reputation > 1000  THEN 'Intermediate'
+            ELSE 'Novice'
+        END                                        AS ReputationLevel,
+        ROW_NUMBER() OVER (ORDER BY us.Reputation DESC) AS RankByReputation
+    FROM UserStats us
+    LEFT JOIN BadgeAgg b   ON b.UserId = us.Id
+    LEFT JOIN PostScoreAgg ps ON ps.OwnerUserId = us.Id
+    LEFT JOIN (
+        SELECT
+            p.OwnerUserId,
+            SUM(v.UpVotes)   AS UpVotes,
+            SUM(v.DownVotes) AS DownVotes
+        FROM Posts p
+        LEFT JOIN VoteStats v ON v.PostId = p.Id
+        WHERE p.PostTypeId = 2
+        GROUP BY p.OwnerUserId
+    ) vs ON vs.OwnerUserId = us.Id
+)
+
+SELECT *
+FROM Combined
+WHERE RankByReputation <= 100
+
+UNION ALL
+
+SELECT
+    -1                                      AS UserId,
+    'Summary'                               AS DisplayName,
+    NULL                                    AS Reputation,
+    NULL                                    AS QuestionCount,
+    NULL                                    AS AnswerCount,
+    SUM(c.TotalQuestionViews)        AS TotalViewsAllTop100,
+    SUM(c.BadgeTotal)                AS TotalBadgesAllTop100,
+    NULL                                    AS GoldBadges,
+    SUM(c.NetScore)                 AS TotalNetScore,
+    SUM(c.TotalUpVotes)             AS TotalUpVotes,
+    SUM(c.TotalDownVotes)           AS TotalDownVotes,
+    NULL                                    AS ReputationLevel,
+    NULL                                    AS RankByReputation
+FROM Combined c
+WHERE c.RankByReputation <= 100
+
+ORDER BY Reputation DESC NULLS LAST, UserId;

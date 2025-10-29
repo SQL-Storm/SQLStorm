@@ -1,0 +1,261 @@
+WITH UserStats AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate AS UserLastAccessDate,
+        U.Views AS UserViews,
+        U.UpVotes AS UserTotalUpVotesCast,
+        U.DownVotes AS UserTotalDownVotesCast,
+        COUNT(DISTINCT P.Id) AS TotalPostsCreated,
+        COUNT(CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestions,
+        COUNT(CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswers,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COALESCE(SUM(P.Score), 0) AS TotalPostScoreReceived,
+        COUNT(DISTINCT PH_Close.PostId) AS TotalPostsClosedAsOwner
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN PostHistory PH_Close ON U.Id = PH_Close.UserId AND PH_Close.PostHistoryTypeId = 10
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Views, U.UpVotes, U.DownVotes
+),
+PostDetailedMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.ParentId,
+        P.AcceptedAnswerId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.LastActivityDate,
+        P.Score AS InitialScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount AS InitialCommentCount,
+        P.FavoriteCount,
+        P.ClosedDate,
+        P.Title,
+        P.Body,
+        P.Tags,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived,
+        SUM(CASE WHEN V.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoritesReceived,
+        COALESCE(SUM(C.Score), 0) AS TotalCommentScore,
+        COUNT(DISTINCT C.Id) AS ActualCommentCount,
+        MIN(CASE WHEN PH.PostHistoryTypeId IN (4,5,6) THEN PH.CreationDate END) AS FirstEditDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (4,5,6) THEN PH.CreationDate END) AS LastEditDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.CreationDate END) AS ActualClosedDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 11 THEN PH.CreationDate END) AS ActualReopenedDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 AND PH.Comment ~ '^[0-9]+$' THEN CAST(PH.Comment AS SMALLINT) END) AS LastCloseReasonTypeId
+    FROM Posts P
+    LEFT JOIN Votes V ON P.Id = V.PostId
+    LEFT JOIN Comments C ON P.Id = C.PostId
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    GROUP BY P.Id, P.PostTypeId, P.ParentId, P.AcceptedAnswerId, P.OwnerUserId, P.CreationDate, P.LastActivityDate, P.Score, P.ViewCount, P.AnswerCount, P.CommentCount, P.FavoriteCount, P.ClosedDate, P.Title, P.Body, P.Tags
+),
+PostLinkMetrics AS (
+    SELECT
+        PL.PostId,
+        COUNT(CASE WHEN PL.LinkTypeId = 1 THEN PL.RelatedPostId END) AS LinkedPostsCount,
+        COUNT(CASE WHEN PL.LinkTypeId = 3 THEN PL.RelatedPostId END) AS DuplicateOfCount
+    FROM PostLinks PL
+    GROUP BY PL.PostId
+),
+TagGlobalPopularity AS (
+    SELECT
+        TRIM(tag) AS TagName,
+        COUNT(*) AS GlobalTagUsageCount
+    FROM (
+        SELECT P.Id,
+               UNNEST(string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags)-2), '><')) AS tag
+        FROM Posts P
+        WHERE P.Tags IS NOT NULL AND P.Tags <> '' AND P.PostTypeId = 1
+    ) t
+    GROUP BY TRIM(tag)
+),
+PostTopTag AS (
+    SELECT
+        PostId,
+        TagName AS MostPopularTagNameOnPost,
+        GlobalTagUsageCount AS MostPopularTagGlobalUsage
+    FROM (
+        SELECT
+            P.Id AS PostId,
+            TRIM(tag) AS TagName,
+            TGP.GlobalTagUsageCount,
+            ROW_NUMBER() OVER (PARTITION BY P.Id ORDER BY TGP.GlobalTagUsageCount DESC, TRIM(tag) ASC) AS rn
+        FROM Posts P
+        CROSS JOIN LATERAL (
+            SELECT UNNEST(string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags)-2), '><')) AS tag
+        ) tags
+        LEFT JOIN TagGlobalPopularity TGP ON TRIM(tags.tag) = TGP.TagName
+        WHERE P.Tags IS NOT NULL AND P.Tags <> '' AND P.PostTypeId = 1
+    ) RankedPostTags
+    WHERE rn = 1
+)
+SELECT
+    US.UserId,
+    US.DisplayName,
+    US.Reputation,
+    US.TotalPostsCreated,
+    US.TotalQuestions,
+    US.TotalAnswers,
+    US.TotalCommentsMade,
+    PDM.PostId,
+    PT.Name AS PostTypeName,
+    PDM.Title,
+    PDM.PostCreationDate,
+    PDM.LastActivityDate,
+    PDM.InitialScore AS PostInitialScore,
+    PDM.UpVotesReceived,
+    PDM.DownVotesReceived,
+    PDM.FavoritesReceived,
+    PDM.TotalCommentScore,
+    PDM.ActualCommentCount,
+    PDM.ViewCount,
+    PDM.AnswerCount,
+    PDM.ClosedDate AS PostClosedDateFromPostsTable,
+    PDM.ActualClosedDate AS PostClosedDateFromHistory,
+    CRT.Name AS LastCloseReason,
+    PDM.FirstEditDate,
+    PDM.LastEditDate,
+    PDM.ActualReopenedDate,
+    PLM.LinkedPostsCount,
+    PLM.DuplicateOfCount,
+    PTT.MostPopularTagNameOnPost,
+    PTT.MostPopularTagGlobalUsage,
+    ROW_NUMBER() OVER (PARTITION BY US.UserId ORDER BY PDM.PostCreationDate DESC) AS UserPostSeqNum,
+    LAG(PDM.PostCreationDate, 1, US.UserCreationDate) OVER (PARTITION BY US.UserId ORDER BY PDM.PostCreationDate) AS PrevPostCreationDate,
+    SUM(PDM.UpVotesReceived) OVER (PARTITION BY US.UserId ORDER BY PDM.PostCreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS RunningTotalUpVotesForUser,
+    AVG(PDM.ViewCount) OVER (PARTITION BY US.UserId) AS AvgViewCountForUserPosts,
+    EXISTS (
+        SELECT 1
+        FROM PostHistory PH_Corr
+        WHERE PH_Corr.UserId = US.UserId
+          AND PH_Corr.PostHistoryTypeId IN (4,5,6)
+          AND PH_Corr.PostId <> PDM.PostId
+          AND PH_Corr.CreationDate BETWEEN PDM.PostCreationDate - INTERVAL '7 days' AND PDM.PostCreationDate + INTERVAL '7 days'
+    ) AS OwnerEditedAnotherPostAroundThisPostCreation,
+    CAST((PDM.UpVotesReceived - PDM.DownVotesReceived) * (1.0 + PDM.ActualCommentCount * 0.1) * (1.0 + COALESCE(PDM.FavoritesReceived, 0) * 0.5) AS NUMERIC(10,2)) AS EngagementScore,
+    COALESCE(SUBSTRING(PDM.Title FROM 1 FOR (POSITION(' ' IN PDM.Title) - 1)), PDM.Title) AS FirstWordInTitle,
+    NULLIF(LOWER(TRIM(REPLACE(REPLACE(PDM.Title, '?', ''), '.', ''))), '') AS CleanedTitleForSearch,
+    CASE
+        WHEN PDM.ClosedDate IS NOT NULL AND PDM.ActualClosedDate IS NOT NULL THEN 'Closed_Confirmed'
+        WHEN PDM.ClosedDate IS NOT NULL THEN 'Closed_ByPostsTableOnly'
+        WHEN PDM.ActualClosedDate IS NOT NULL THEN 'Closed_ByHistoryOnly'
+        WHEN PDM.ActualReopenedDate IS NOT NULL THEN 'Reopened'
+        ELSE 'Active'
+    END AS PostStatusCategory,
+    A.Body AS AcceptedAnswerBody,
+    A.CreationDate AS AcceptedAnswerCreationDate,
+    AnsOwner.DisplayName AS AcceptedAnswerOwnerDisplayName
+FROM UserStats US
+INNER JOIN PostDetailedMetrics PDM ON US.UserId = PDM.OwnerUserId
+INNER JOIN PostTypes PT ON PDM.PostTypeId = PT.Id
+LEFT JOIN PostLinkMetrics PLM ON PDM.PostId = PLM.PostId
+LEFT JOIN PostTopTag PTT ON PDM.PostId = PTT.PostId
+LEFT JOIN CloseReasonTypes CRT ON PDM.LastCloseReasonTypeId = CRT.Id
+LEFT JOIN Posts A ON PDM.AcceptedAnswerId = A.Id
+LEFT JOIN Users AnsOwner ON A.OwnerUserId = AnsOwner.Id
+WHERE
+    US.Reputation >= 5000
+    AND PDM.PostTypeId IN (1, 2)
+    AND PDM.PostCreationDate >= DATE '2020-01-01'
+    AND PDM.ViewCount > 1000
+    AND (PDM.Tags LIKE '%<sql>%' OR PDM.Tags LIKE '%<database>%')
+    AND (PDM.ClosedDate IS NULL OR PDM.ActualReopenedDate IS NOT NULL)
+    AND NOT EXISTS (
+        SELECT 1
+        FROM Comments C_Corr
+        WHERE C_Corr.PostId = PDM.PostId
+          AND LOWER(C_Corr.Text) LIKE '%spam%'
+    )
+
+UNION ALL
+
+SELECT
+    US.UserId,
+    US.DisplayName,
+    US.Reputation,
+    US.TotalPostsCreated,
+    US.TotalQuestions,
+    US.TotalAnswers,
+    US.TotalCommentsMade,
+    PDM.PostId,
+    PT.Name AS PostTypeName,
+    PDM.Title,
+    PDM.PostCreationDate,
+    PDM.LastActivityDate,
+    PDM.InitialScore AS PostInitialScore,
+    PDM.UpVotesReceived,
+    PDM.DownVotesReceived,
+    PDM.FavoritesReceived,
+    PDM.TotalCommentScore,
+    PDM.ActualCommentCount,
+    PDM.ViewCount,
+    PDM.AnswerCount,
+    PDM.ClosedDate AS PostClosedDateFromPostsTable,
+    PDM.ActualClosedDate AS PostClosedDateFromHistory,
+    CRT.Name AS LastCloseReason,
+    PDM.FirstEditDate,
+    PDM.LastEditDate,
+    PDM.ActualReopenedDate,
+    PLM.LinkedPostsCount,
+    PLM.DuplicateOfCount,
+    PTT.MostPopularTagNameOnPost,
+    PTT.MostPopularTagGlobalUsage,
+    ROW_NUMBER() OVER (PARTITION BY US.UserId ORDER BY PDM.PostCreationDate DESC) AS UserPostSeqNum,
+    LAG(PDM.PostCreationDate, 1, US.UserCreationDate) OVER (PARTITION BY US.UserId ORDER BY PDM.PostCreationDate) AS PrevPostCreationDate,
+    SUM(PDM.UpVotesReceived) OVER (PARTITION BY US.UserId ORDER BY PDM.PostCreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS RunningTotalUpVotesForUser,
+    AVG(PDM.ViewCount) OVER (PARTITION BY US.UserId) AS AvgViewCountForUserPosts,
+    EXISTS (
+        SELECT 1
+        FROM PostHistory PH_Corr
+        WHERE PH_Corr.UserId = US.UserId
+          AND PH_Corr.PostHistoryTypeId IN (4,5,6)
+          AND PH_Corr.PostId <> PDM.PostId
+          AND PH_Corr.CreationDate BETWEEN PDM.PostCreationDate - INTERVAL '7 days' AND PDM.PostCreationDate + INTERVAL '7 days'
+    ) AS OwnerEditedAnotherPostAroundThisPostCreation,
+    CAST((PDM.UpVotesReceived - PDM.DownVotesReceived) * (1.0 + PDM.ActualCommentCount * 0.1) * (1.0 + COALESCE(PDM.FavoritesReceived, 0) * 0.5) AS NUMERIC(10,2)) AS EngagementScore,
+    COALESCE(SUBSTRING(PDM.Title FROM 1 FOR (POSITION(' ' IN PDM.Title) - 1)), PDM.Title) AS FirstWordInTitle,
+    NULLIF(LOWER(TRIM(REPLACE(REPLACE(PDM.Title, '?', ''), '.', ''))), '') AS CleanedTitleForSearch,
+    CASE
+        WHEN PDM.ClosedDate IS NOT NULL AND PDM.ActualClosedDate IS NOT NULL THEN 'Closed_Confirmed'
+        WHEN PDM.ClosedDate IS NOT NULL THEN 'Closed_ByPostsTableOnly'
+        WHEN PDM.ActualClosedDate IS NOT NULL THEN 'Closed_ByHistoryOnly'
+        WHEN PDM.ActualReopenedDate IS NOT NULL THEN 'Reopened'
+        ELSE 'Active'
+    END AS PostStatusCategory,
+    A.Body AS AcceptedAnswerBody,
+    A.CreationDate AS AcceptedAnswerCreationDate,
+    AnsOwner.DisplayName AS AcceptedAnswerOwnerDisplayName
+FROM UserStats US
+INNER JOIN PostDetailedMetrics PDM ON US.UserId = PDM.OwnerUserId
+INNER JOIN PostTypes PT ON PDM.PostTypeId = PT.Id
+LEFT JOIN PostLinkMetrics PLM ON PDM.PostId = PLM.PostId
+LEFT JOIN PostTopTag PTT ON PDM.PostId = PTT.PostId
+LEFT JOIN CloseReasonTypes CRT ON PDM.LastCloseReasonTypeId = CRT.Id
+LEFT JOIN Posts A ON PDM.AcceptedAnswerId = A.Id
+LEFT JOIN Users AnsOwner ON A.OwnerUserId = AnsOwner.Id
+WHERE
+    US.GoldBadges > 0
+    AND PDM.PostTypeId = 1
+    AND PDM.ViewCount > 5000
+    AND PDM.AnswerCount >= 5
+    AND PDM.ClosedDate IS NULL AND PDM.ActualClosedDate IS NULL
+    AND NOT EXISTS (
+        SELECT 1
+        FROM Posts Ans_Corr
+        WHERE Ans_Corr.ParentId = PDM.PostId
+          AND Ans_Corr.PostTypeId = 2
+          AND Ans_Corr.Score < -2
+    )
+ORDER BY
+    Reputation DESC, EngagementScore DESC
+LIMIT 1000;

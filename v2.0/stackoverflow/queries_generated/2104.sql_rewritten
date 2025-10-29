@@ -1,0 +1,177 @@
+-- {"query": "2104.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1918} 
+with RecursiveTagHierarchy as (
+    select t.Id, t.TagName, t.Count, 1 as Level, cast(t.TagName as varchar(1000)) as Path
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+    union all
+    select t2.Id, t2.TagName, t2.Count, r.Level + 1, r.Path || ' > ' || t2.TagName
+    from Tags t2
+    inner join RecursiveTagHierarchy r on t2.Id <> r.Id and t2.Count <= r.Count and r.Level < 3
+    where t2.IsModeratorOnly = 0 and t2.IsRequired = 0
+),
+RankedPosts as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        coalesce(p.Title, '') as Title,
+        coalesce(p.Tags, '') as Tags,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc nulls last) as UserPostRank,
+        dense_rank() over (order by p.CreationDate) as PostCreationRank,
+        count(*) over (partition by p.PostTypeId) as PostTypeCount
+    from Posts p
+    where p.PostTypeId in (1,2) and p.CreationDate > '2012-01-01'
+),
+UserBadgeAgg as (
+    select 
+        b.UserId,
+        count(*) as TotalBadges,
+        count(case when b.Class = 1 then 1 end) as GoldBadges,
+        count(case when b.Class = 2 then 1 end) as SilverBadges,
+        count(case when b.Class = 3 then 1 end) as BronzeBadges,
+        max(b.Date) as LastBadgeDate
+    from Badges b
+    group by b.UserId
+),
+UserReputationWindow as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        sum(u.Reputation) over (order by u.Reputation desc ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) as RunningReputationSum,
+        avg(u.Reputation) over () as AvgReputation,
+        max(u.Reputation) over () as MaxReputation,
+        min(u.Reputation) over () as MinReputation
+    from Users u
+),
+RecentPostActivity as (
+    select 
+        ph.PostId,
+        max(ph.CreationDate) as LastEditDate,
+        count(*) as EditCount,
+        sum(case when ph.PostHistoryTypeId = 10 then 1 else 0 end) as CloseVotes,
+        sum(case when ph.PostHistoryTypeId = 11 then 1 else 0 end) as ReopenVotes
+    from PostHistory ph
+    where ph.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '180 days'
+    group by ph.PostId
+),
+UserCommentSummary as (
+    select 
+        c.UserId,
+        count(distinct c.PostId) as DistinctPostsCommented,
+        count(*) as TotalComments,
+        max(c.CreationDate) as LastCommentDate,
+        avg(length(c.Text)) as AvgCommentLength
+    from Comments c
+    where c.UserId is not null
+    group by c.UserId
+),
+PostsWithLinks as (
+    select 
+        p.Id,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.CreationDate,
+        count(distinct pl.RelatedPostId) filter (where lt.Name = 'Linked') as LinkedCount,
+        count(distinct pl.RelatedPostId) filter (where lt.Name = 'Duplicate') as DuplicateCount
+    from Posts p
+    left join PostLinks pl on pl.PostId = p.Id
+    left join LinkTypes lt on lt.Id = pl.LinkTypeId
+    group by p.Id, p.OwnerUserId, p.PostTypeId, p.Score, p.CreationDate
+)
+select 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    uba.TotalBadges,
+    uba.GoldBadges,
+    uba.SilverBadges,
+    uba.BronzeBadges,
+    coalesce(ucs.DistinctPostsCommented, 0) as DistinctPostsCommented,
+    coalesce(ucs.TotalComments, 0) as TotalComments,
+    coalesce(ucs.AvgCommentLength, 0) as AvgCommentLength,
+    p.Id as TopPostId,
+    p.Title as TopPostTitle,
+    p.Score as TopPostScore,
+    p.ViewCount as TopPostViewCount,
+    p.PostTypeId as TopPostType,
+    pr.LastEditDate,
+    pr.EditCount,
+    pr.CloseVotes,
+    pr.ReopenVotes,
+    rth.Path as SampleTagPath,
+    case 
+        when u.Reputation >= uru.AvgReputation then 'Above Average' 
+        else 'Below Average' 
+    end as ReputationCategory,
+    case 
+        when p.Score > 10 and p.ViewCount > 1000 then 'High Impact' 
+        when p.Score between 5 and 10 then 'Medium Impact' 
+        else 'Low Impact' 
+    end as PostImpactCategory,
+    concat_ws(' - ', substring(p.Title from 1 for 20), substring(coalesce(p.Tags, '') from 1 for 20)) as ShortTitleWithTags
+from Users u
+inner join RankedPosts p on p.OwnerUserId = u.Id and p.UserPostRank = 1
+left join UserBadgeAgg uba on uba.UserId = u.Id
+left join UserCommentSummary ucs on ucs.UserId = u.Id
+left join RecentPostActivity pr on pr.PostId = p.Id
+left join RecursiveTagHierarchy rth on position(rth.TagName in coalesce(p.Tags, '')) > 0 and rth.Level = 1
+cross join (
+    select * from UserReputationWindow uru order by Reputation desc limit 1
+) uru
+where u.Reputation > (select percentile_cont(0.75) within group (order by Reputation) from Users)
+and exists (
+    select 1 from Posts p2 where p2.OwnerUserId = u.Id and p2.PostTypeId = 1 and p2.AcceptedAnswerId is not null
+)
+union
+select 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    0 as TotalBadges,
+    0 as GoldBadges,
+    0 as SilverBadges,
+    0 as BronzeBadges,
+    0 as DistinctPostsCommented,
+    0 as TotalComments,
+    0 as AvgCommentLength,
+    null as TopPostId,
+    null as TopPostTitle,
+    null as TopPostScore,
+    null as TopPostViewCount,
+    null as TopPostType,
+    null as LastEditDate,
+    null as EditCount,
+    null as CloseVotes,
+    null as ReopenVotes,
+    null as SampleTagPath,
+    'Below Average' as ReputationCategory,
+    'Low Impact' as PostImpactCategory,
+    null as ShortTitleWithTags
+from Users u
+where u.Reputation <= (select percentile_cont(0.75) within group (order by Reputation) from Users)
+except
+select u.Id, u.DisplayName, u.Reputation, uba.TotalBadges, uba.GoldBadges, uba.SilverBadges, uba.BronzeBadges,
+       coalesce(ucs.DistinctPostsCommented, 0), coalesce(ucs.TotalComments, 0), coalesce(ucs.AvgCommentLength, 0),
+       p.Id, p.Title, p.Score, p.ViewCount, p.PostTypeId,
+       pr.LastEditDate, pr.EditCount, pr.CloseVotes, pr.ReopenVotes,
+       rth.Path,
+       case when u.Reputation >= uru.AvgReputation then 'Above Average' else 'Below Average' end,
+       case when p.Score > 10 and p.ViewCount > 1000 then 'High Impact' when p.Score between 5 and 10 then 'Medium Impact' else 'Low Impact' end,
+       concat_ws(' - ', substring(p.Title from 1 for 20), substring(coalesce(p.Tags, '') from 1 for 20))
+from Users u
+inner join RankedPosts p on p.OwnerUserId = u.Id and p.UserPostRank = 1
+left join UserBadgeAgg uba on uba.UserId = u.Id
+left join UserCommentSummary ucs on ucs.UserId = u.Id
+left join RecentPostActivity pr on pr.PostId = p.Id
+left join RecursiveTagHierarchy rth on position(rth.TagName in coalesce(p.Tags, '')) > 0 and rth.Level = 1
+cross join (
+    select * from UserReputationWindow uru order by Reputation desc limit 1
+) uru
+where u.Reputation <= (select percentile_cont(0.75) within group (order by Reputation) from Users)
+order by Reputation desc nulls last, UserId asc
+limit 100;

@@ -1,0 +1,160 @@
+-- {"query": "3943.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2364} 
+
+/*  Elaborate benchmark query using CTEs, window functions, outer joins,
+    correlated subqueries, set operators, string ops and NULL logic  */
+WITH 
+/*--------------------------------------------------------------
+  1. Aggregate per‑user statistics (badges, posts, scores)
+--------------------------------------------------------------*/
+UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(b.Id)                                   AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END)  AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END)  AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END)  AS BronzeBadges,
+        COALESCE(SUM(p.Score),0)                      AS TotalPostScore,
+        COALESCE(AVG(p.Score),0)                      AS AvgPostScore,
+        MAX(p.CreationDate)                           AS LastPostDate
+    FROM Users u
+    LEFT JOIN Badges b   ON b.UserId = u.Id
+    LEFT JOIN Posts  p   ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+/*--------------------------------------------------------------
+  2. Tag‑level activity (questions, votes, averages)
+--------------------------------------------------------------*/
+TagActivity AS (
+    SELECT 
+        t.TagName,
+        COUNT(p.Id)                                          AS QuestionCount,
+        AVG(p.Score)                                         AS AvgScore,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END)    AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END)    AS DownVotes
+    FROM Tags t
+    JOIN Posts p ON p.PostTypeId = 1
+                 AND p.Tags LIKE '%<'||t.TagName||'>%'
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    GROUP BY t.TagName
+),
+
+/*--------------------------------------------------------------
+  3. Most recent closed questions (using ROW_NUMBER)
+--------------------------------------------------------------*/
+RecentClosedQuestions AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        ph.CreationDate      AS ClosedDate,
+        ph.Comment           AS CloseReason,
+        ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY ph.CreationDate DESC) AS rn
+    FROM Posts p
+    JOIN PostHistory ph 
+         ON ph.PostId = p.Id 
+        AND ph.PostHistoryTypeId = 10          -- Close event
+    WHERE p.PostTypeId = 1
+),
+
+/*--------------------------------------------------------------
+  4. Rank users by reputation
+--------------------------------------------------------------*/
+TopUsers AS (
+    SELECT 
+        us.*,
+        ROW_NUMBER() OVER (ORDER BY us.Reputation DESC) AS Rank
+    FROM UserStats us
+    WHERE us.Reputation IS NOT NULL
+),
+
+/*--------------------------------------------------------------
+  5. How many times each user has asked a question containing
+     a particular tag (correlated sub‑query via CROSS JOIN)
+--------------------------------------------------------------*/
+UserTagOverlap AS (
+    SELECT 
+        us.Id          AS UserId,
+        ta.TagName,
+        COUNT(p.Id)    AS OverlapCount
+    FROM UserStats us
+    CROSS JOIN TagActivity ta
+    LEFT JOIN Posts p 
+           ON p.OwnerUserId = us.Id
+          AND p.PostTypeId = 1
+          AND p.Tags LIKE '%<'||ta.TagName||'>%'
+    GROUP BY us.Id, ta.TagName
+    HAVING COUNT(p.Id) > 0
+),
+
+/*--------------------------------------------------------------
+  6. Pick the top tag per user (LATERAL sub‑query later)
+--------------------------------------------------------------*/
+UserTopTag AS (
+    SELECT 
+        u.Id,
+        t.TagName,
+        t.OverlapCount,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY t.OverlapCount DESC) AS rn
+    FROM (
+        SELECT us.Id FROM TopUsers us WHERE us.Rank <= 100
+    ) u
+    JOIN UserTagOverlap t ON t.UserId = u.Id
+)
+
+/*==============================================================
+  Final result sets – UNION of “User” rows and “Tag” summary rows
+==============================================================*/
+SELECT 
+    'User'                     AS RecordType,
+    tu.Rank,
+    tu.Id,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.BadgeCount,
+    tu.GoldBadges,
+    tu.SilverBadges,
+    tu.BronzeBadges,
+    tu.TotalPostScore,
+    tu.AvgPostScore,
+    tu.LastPostDate,
+    COALESCE(utt.TagName, 'N/A')           AS TopTag,
+    COALESCE(utt.OverlapCount,0)           AS TopTagOverlap,
+    rcq.Title                              AS RecentClosedTitle,
+    rcq.ClosedDate,
+    rcq.CloseReason
+FROM TopUsers tu
+LEFT JOIN UserTopTag utt 
+       ON utt.Id = tu.Id AND utt.rn = 1
+LEFT JOIN (
+    SELECT Id, Title, ClosedDate, CloseReason
+    FROM RecentClosedQuestions
+    WHERE rn = 1
+) rcq ON TRUE
+WHERE tu.Rank <= 100
+
+UNION ALL
+
+SELECT 
+    'Tag'                      AS RecordType,
+    NULL                       AS Rank,
+    NULL                       AS Id,
+    ta.TagName                 AS DisplayName,
+    NULL                       AS Reputation,
+    NULL                       AS BadgeCount,
+    NULL                       AS GoldBadges,
+    NULL                       AS SilverBadges,
+    NULL                       AS BronzeBadges,
+    NULL                       AS TotalPostScore,
+    ta.AvgScore                AS AvgPostScore,
+    NULL                       AS LastPostDate,
+    NULL                       AS TopTag,
+    ta.QuestionCount           AS TopTagOverlap,
+    NULL                       AS RecentClosedTitle,
+    NULL                       AS ClosedDate,
+    NULL                       AS CloseReason
+FROM TagActivity ta
+WHERE ta.QuestionCount > 1000
+ORDER BY RecordType, Rank NULLS LAST, DisplayName;

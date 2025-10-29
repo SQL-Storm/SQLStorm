@@ -1,0 +1,209 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) = 0 THEN 'Inactive'
+            WHEN COUNT(DISTINCT p.Id) > 100 THEN 'Highly Active'
+            WHEN COUNT(DISTINCT p.Id) > 50 THEN 'Active'
+            ELSE 'Regular'
+        END as ActivityLevel,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        AVG(p.Score) as AvgPostScore,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= DATE '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 500 THEN 'Moderate'
+            WHEN t.Count > 100 THEN 'Minor'
+            ELSE 'Rare'
+        END as PopularityLevel,
+        (SELECT COUNT(*) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%') as PostsWithTag,
+        (SELECT AVG(p.Score) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%') as AvgScoreForTag
+    FROM Tags t
+    WHERE t.Count > 10
+),
+PostWithComplexHistory AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.ParentId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.LastActivityDate,
+        p.LastEditDate,
+        p.LastEditorUserId,
+        p.LastEditorDisplayName,
+        p.OwnerDisplayName,
+        (SELECT MAX(ph.CreationDate) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (10, 11, 12, 13)) as LastModerationActionDate,
+        (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)) as EditCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId IN (2, 3)) as VoteCount,
+        (SELECT AVG(v.BountyAmount) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 8) as AvgBounty,
+        (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = p.Id) as LinkCount,
+        (SELECT COUNT(*) FROM PostLinks pl WHERE pl.RelatedPostId = p.Id) as IncomingLinkCount,
+        CASE 
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.PostTypeId = 2 AND p.ParentId IS NOT NULL THEN 'Answer'
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            ELSE 'Other'
+        END as PostCategory,
+        (SELECT COUNT(DISTINCT c.UserId) FROM Comments c WHERE c.PostId = p.Id AND c.UserId IS NOT NULL) as CommenterCount
+    FROM Posts p
+    WHERE p.CreationDate >= DATE '2015-01-01'
+    AND (p.PostTypeId IN (1, 2) OR p.PostTypeId IS NULL)
+),
+AdvancedUserAnalytics AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.PostCount,
+        uas.CommentCount,
+        uas.BadgeCount,
+        uas.LastPostDate,
+        uas.ActivityLevel,
+        uas.TotalScore,
+        uas.AvgPostScore,
+        uas.QuestionCount,
+        uas.AnswerCount,
+        CASE 
+            WHEN uas.AnswerCount > 0 AND uas.QuestionCount > 0 THEN CAST(uas.AnswerCount AS DECIMAL) / NULLIF(uas.QuestionCount,0)
+            ELSE 0.0
+        END as AnswerToQuestionRatio,
+        CASE 
+            WHEN uas.PostCount > 0 THEN CAST(uas.BadgeCount AS DECIMAL) / NULLIF(uas.PostCount,0)
+            ELSE 0.0
+        END as BadgePerPostRatio,
+        DENSE_RANK() OVER (ORDER BY uas.TotalScore DESC) as ScoreRank,
+        PERCENT_RANK() OVER (ORDER BY uas.Reputation DESC) as ReputationPercentile,
+        NTILE(4) OVER (ORDER BY uas.PostCount DESC) as PostCountQuartile
+    FROM UserActivityStats uas
+),
+FilteredPosts AS (
+    SELECT 
+        pwh.PostId,
+        pwh.Title,
+        pwh.Body,
+        pwh.Score,
+        pwh.ViewCount,
+        pwh.CreationDate,
+        pwh.PostTypeId,
+        pwh.OwnerUserId,
+        pwh.ParentId,
+        pwh.AnswerCount,
+        pwh.CommentCount,
+        pwh.Tags,
+        pwh.AcceptedAnswerId,
+        pwh.LastActivityDate,
+        pwh.EditCount,
+        pwh.VoteCount,
+        pwh.AvgBounty,
+        pwh.LinkCount,
+        pwh.IncomingLinkCount,
+        pwh.PostCategory,
+        pwh.CommenterCount,
+        CASE 
+            WHEN pwh.Score > 100 THEN 'High Impact'
+            WHEN pwh.Score > 50 THEN 'Medium Impact'
+            WHEN pwh.Score > 10 THEN 'Low Impact'
+            ELSE 'Minimal Impact'
+        END as ImpactLevel,
+        ROW_NUMBER() OVER (PARTITION BY pwh.OwnerUserId ORDER BY pwh.Score DESC) as UserPostRank,
+        RANK() OVER (ORDER BY pwh.Score DESC) as GlobalScoreRank,
+        DENSE_RANK() OVER (ORDER BY pwh.CreationDate DESC) as RecentRank,
+        LAG(pwh.Score, 1) OVER (ORDER BY pwh.CreationDate) as PreviousScore,
+        CASE 
+            WHEN pwh.Score > LAG(pwh.Score, 1) OVER (ORDER BY pwh.CreationDate) THEN 'Increased'
+            WHEN pwh.Score < LAG(pwh.Score, 1) OVER (ORDER BY pwh.CreationDate) THEN 'Decreased'
+            ELSE 'Stable'
+        END as ScoreTrend,
+        ABS(pwh.Score - LAG(pwh.Score, 1) OVER (ORDER BY pwh.CreationDate)) as ScoreChange,
+        AVG(pwh.Score) OVER (PARTITION BY pwh.OwnerUserId ORDER BY pwh.CreationDate ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) as MovingAvgScore,
+        (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = pwh.OwnerUserId AND p2.CreationDate BETWEEN pwh.CreationDate - INTERVAL '7' DAY AND pwh.CreationDate) as RecentPostsCount
+    FROM PostWithComplexHistory pwh
+    WHERE pwh.PostTypeId IN (1, 2) AND pwh.Score >= 0
+)
+SELECT 
+    'Overall Statistics' as ReportSection,
+    COUNT(*) as TotalPosts,
+    COUNT(DISTINCT fp.OwnerUserId) as UniqueAuthors,
+    AVG(fp.Score) as AvgScore,
+    AVG(fp.ViewCount) as AvgViews,
+    AVG(fp.EditCount) as AvgEdits,
+    AVG(fp.VoteCount) as AvgVotes,
+    MIN(fp.CreationDate) as EarliestPost,
+    MAX(fp.CreationDate) as LatestPost,
+    COUNT(DISTINCT CASE WHEN fp.PostCategory = 'Question' THEN fp.PostId END) as QuestionCount,
+    COUNT(DISTINCT CASE WHEN fp.PostCategory = 'Answer' THEN fp.PostId END) as AnswerCount,
+    COUNT(DISTINCT CASE WHEN fp.ImpactLevel = 'High Impact' THEN fp.PostId END) as HighImpactPosts,
+    COUNT(DISTINCT CASE WHEN fp.ScoreTrend = 'Increased' THEN fp.PostId END) as IncreasingTrendCount,
+    (SELECT COUNT(*) FROM Users WHERE CreationDate >= DATE '2010-01-01') as ActiveUsers,
+    0 as DummyValue
+FROM FilteredPosts fp
+UNION ALL
+SELECT 
+    'Top Users by Score' as ReportSection,
+    NULL::bigint as TotalPosts,
+    NULL::bigint as UniqueAuthors,
+    NULL::numeric as AvgScore,
+    NULL::numeric as AvgViews,
+    NULL::numeric as AvgEdits,
+    NULL::numeric as AvgVotes,
+    NULL::timestamp as EarliestPost,
+    NULL::timestamp as LatestPost,
+    NULL::bigint as QuestionCount,
+    NULL::bigint as AnswerCount,
+    NULL::bigint as HighImpactPosts,
+    NULL::bigint as IncreasingTrendCount,
+    NULL::bigint as ActiveUsers,
+    aa.UserId::bigint as DummyValue
+FROM AdvancedUserAnalytics aa
+WHERE aa.ScoreRank <= 10
+UNION ALL
+SELECT 
+    'Top Tag Analysis' as ReportSection,
+    NULL::bigint as TotalPosts,
+    NULL::bigint as UniqueAuthors,
+    NULL::numeric as AvgScore,
+    NULL::numeric as AvgViews,
+    NULL::numeric as AvgEdits,
+    NULL::numeric as AvgVotes,
+    NULL::timestamp as EarliestPost,
+    NULL::timestamp as LatestPost,
+    NULL::bigint as QuestionCount,
+    NULL::bigint as AnswerCount,
+    NULL::bigint as HighImpactPosts,
+    NULL::bigint as IncreasingTrendCount,
+    NULL::bigint as ActiveUsers,
+    ta.TagName as DummyValue
+FROM TagAnalysis ta
+WHERE ta.PopularityLevel = 'Popular'
+ORDER BY ReportSection, DummyValue;

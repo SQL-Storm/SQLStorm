@@ -1,0 +1,133 @@
+WITH RankedPosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate AS PostCreationDate,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.Score,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation AS OwnerReputation,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn,
+    LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostScore,
+    LEAD(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextPostScore,
+    SUM(c.Score) OVER (PARTITION BY p.OwnerUserId) AS TotalCommentScoreForUser
+  FROM Posts p
+  JOIN Users u
+    ON p.OwnerUserId = u.Id
+  LEFT JOIN Comments c
+    ON p.Id = c.PostId
+  WHERE
+    p.PostTypeId = 1 AND p.OwnerUserId IS NOT NULL AND p.OwnerUserId <> -1
+),
+UserPostStats AS (
+  SELECT
+    OwnerUserId,
+    COUNT(Id) AS TotalPosts,
+    AVG(Score) AS AverageScore,
+    SUM(CASE WHEN PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+    SUM(CASE WHEN PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+    SUM(CASE WHEN Score > 0 THEN 1 ELSE 0 END) AS PositiveScorePosts,
+    SUM(CASE WHEN Score < 0 THEN 1 ELSE 0 END) AS NegativeScorePosts,
+    MAX(CreationDate) AS LastPostDate,
+    MIN(CreationDate) AS FirstPostDate
+  FROM Posts
+  WHERE
+    OwnerUserId IS NOT NULL AND OwnerUserId <> -1
+  GROUP BY
+    OwnerUserId
+)
+SELECT
+  rp.PostId,
+  rp.Title,
+  rp.OwnerUserId,
+  rp.OwnerDisplayName,
+  rp.OwnerReputation,
+  rp.PostCreationDate,
+  rp.AnswerCount,
+  rp.FavoriteCount,
+  COALESCE(rp.TotalCommentScoreForUser, 0) AS TotalCommentScoreForUser,
+  rp.PreviousPostScore,
+  rp.NextPostScore,
+  (rp.NextPostScore - rp.PreviousPostScore) AS ScoreDifference,
+  CASE
+    WHEN rp.Score > 0 AND rp.NextPostScore > rp.PreviousPostScore THEN 'Gaining Momentum'
+    WHEN rp.Score < 0 AND rp.NextPostScore < rp.PreviousPostScore THEN 'Losing Traction'
+    WHEN rp.Score = 0 THEN 'Neutral'
+    ELSE 'Stable'
+  END AS PostTrend,
+  COALESCE(ups.TotalPosts, 0) AS UserTotalPosts,
+  COALESCE(ups.AverageScore, 0.0) AS UserAverageScore,
+  COALESCE(ups.QuestionCount, 0) AS UserQuestionCount,
+  COALESCE(ups.AnswerCount, 0) AS UserAnswerCount,
+  COALESCE(ups.PositiveScorePosts, 0) AS UserPositiveScorePosts,
+  COALESCE(ups.NegativeScorePosts, 0) AS UserNegativeScorePosts,
+  ups.LastPostDate,
+  ups.FirstPostDate,
+  -- portable datediff: use simple subtraction for days if supported, otherwise DB-specific function required
+  CAST(julianday(ups.LastPostDate) - julianday(ups.FirstPostDate) AS INTEGER) AS UserPostActiveDays,
+  CASE
+    WHEN rp.rn <= 5 THEN 'Top 5 Recent'
+    WHEN rp.rn > 5 AND rp.rn <= 20 THEN 'Next 15 Recent'
+    ELSE 'Older Posts'
+  END AS RecencyRank,
+  CASE
+    WHEN rp.FavoriteCount > 100 AND rp.Score > 50 THEN 'Highly Favorited & Scored'
+    WHEN rp.AnswerCount > 10 THEN 'High Answer Volume'
+    ELSE 'Standard'
+  END AS PostPopularity,
+  CASE
+    WHEN rp.OwnerReputation > 100000 AND rp.PostCreationDate < DATE('2015-01-01') THEN 'Established Expert Old Post'
+    WHEN rp.OwnerReputation < 5000 THEN 'Newer User Post'
+    ELSE 'Mid-Tier User Post'
+  END AS UserExperienceTier,
+  (rp.NextPostScore + rp.PreviousPostScore) AS SymmetricScoreInfluence,
+  (rp.OwnerDisplayName || ' (' || rp.OwnerReputation || ')') AS OwnerInfo,
+  CASE WHEN rp.Title LIKE '%[jQuery]%' THEN 'jQuery Related' ELSE 'Other' END AS TitleTagIndicator,
+  CASE
+    WHEN rp.PostCreationDate >= DATE('now', '-7 day') THEN 'This Week'
+    WHEN rp.PostCreationDate >= DATE('now', '-30 day') THEN 'This Month'
+    ELSE 'Older Than Month'
+  END AS PostAgeGroup
+FROM RankedPosts rp
+LEFT JOIN UserPostStats ups
+  ON rp.OwnerUserId = ups.OwnerUserId
+WHERE
+  rp.rn <= 10
+
+UNION ALL
+
+SELECT
+  NULL::BIGINT AS PostId,
+  '--- Total Stats ---' AS Title,
+  NULL::BIGINT AS OwnerUserId,
+  NULL::TEXT AS OwnerDisplayName,
+  NULL::BIGINT AS OwnerReputation,
+  NULL::TIMESTAMP AS PostCreationDate,
+  COUNT(p.Id) AS AnswerCount,
+  NULL::INT AS FavoriteCount,
+  NULL::INT AS TotalCommentScoreForUser,
+  NULL::INT AS PreviousPostScore,
+  NULL::INT AS NextPostScore,
+  NULL::INT AS ScoreDifference,
+  NULL::TEXT AS PostTrend,
+  NULL::INT AS UserTotalPosts,
+  NULL::REAL AS UserAverageScore,
+  NULL::INT AS UserQuestionCount,
+  NULL::INT AS UserAnswerCount,
+  NULL::INT AS UserPositiveScorePosts,
+  NULL::INT AS UserNegativeScorePosts,
+  NULL::TIMESTAMP AS LastPostDate,
+  NULL::TIMESTAMP AS FirstPostDate,
+  NULL::INT AS UserPostActiveDays,
+  NULL::TEXT AS RecencyRank,
+  NULL::TEXT AS PostPopularity,
+  NULL::TEXT AS UserExperienceTier,
+  NULL::INT AS SymmetricScoreInfluence,
+  NULL::TEXT AS OwnerInfo,
+  NULL::TEXT AS TitleTagIndicator,
+  NULL::TEXT AS PostAgeGroup
+FROM Posts p
+WHERE
+  p.PostTypeId = 1 AND p.OwnerUserId IS NOT NULL AND p.OwnerUserId <> -1;

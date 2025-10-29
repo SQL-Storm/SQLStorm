@@ -1,0 +1,284 @@
+with recent_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    date_trunc('month', u.creationdate) as cohort_month,
+    coalesce(nullif(trim(split_part(coalesce(u.location, ''), ',', 1)), ''), 'Unknown') as region_hint,
+    row_number() over (order by u.creationdate desc, u.id desc) as rn_desc
+  from users u
+  where u.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+),
+activity as (
+  select
+    p.owneruserid as user_id,
+    count(*) filter (where p.posttypeid = 1) as q_count,
+    count(*) filter (where p.posttypeid = 2) as a_count,
+    sum(p.score) as total_post_score,
+    avg(nullif(p.viewcount, 0)) as avg_q_views_nonzero,
+    max(p.lastactivitydate) as last_activity
+  from posts p
+  where p.owneruserid is not null
+  group by p.owneruserid
+),
+badge_rollup as (
+  select
+    b.userid as user_id,
+    count(*) as badge_count,
+    count(*) filter (where b.class = 1) as gold_count,
+    count(*) filter (where b.class = 2) as silver_count,
+    count(*) filter (where b.class = 3) as bronze_count,
+    max(b.date) as last_badge_date
+  from badges b
+  group by b.userid
+),
+vote_agg as (
+  select
+    v.userid as user_id,
+    count(*) filter (where v.votetypeid = 2) as upvotes_cast,
+    count(*) filter (where v.votetypeid = 3) as downvotes_cast,
+    sum(coalesce(v.bountyamount, 0)) as bounty_spent
+  from votes v
+  group by v.userid
+),
+post_interactions as (
+  select
+    u.id as user_id,
+    count(distinct c.id) as comments_made,
+    count(distinct pl.id) as links_made,
+    count(distinct case when pl.linktypeid = 3 then pl.id end) as dup_links_made
+  from users u
+  left join comments c on c.userid = u.id
+  left join posts p on p.owneruserid = u.id
+  left join postlinks pl on pl.postid = p.id
+  group by u.id
+),
+tag_footprint as (
+  select
+    p.owneruserid as user_id,
+    count(*) as tagged_questions,
+    count(distinct t.tag) as distinct_tags_used,
+    max(t.tag_count) as max_tags_on_q
+  from posts p
+  cross join lateral (
+    select tag, 1 as tag_count
+    from unnest(string_to_array(substring(p.tags from 2 for greatest(char_length(p.tags) - 2, 0)), '><')) as tag
+  ) t
+  where p.posttypeid = 1 and p.owneruserid is not null and p.tags is not null
+  group by p.owneruserid
+),
+edits_cte as (
+  select
+    ph.userid as user_id,
+    count(*) filter (where ph.posthistorytypeid in (4,5,6,7,8,9,24)) as edits_made,
+    count(*) filter (where ph.posthistorytypeid in (10,11,12,13,14,15,19,20,35)) as mod_state_changes,
+    count(*) filter (where ph.posthistorytypeid = 10 and cast(ph.comment as integer) in (101,102,103,104,105)) as closes_cast_with_reason,
+    max(ph.creationdate) as last_edit_date
+  from posthistory ph
+  where ph.userid is not null
+  group by ph.userid
+),
+question_quality as (
+  select
+    q.owneruserid as user_id,
+    count(*) as questions,
+    avg(q.score) as avg_q_score,
+    percentile_cont(0.5) within group (order by q.score) as med_q_score,
+    avg(nullif(q.answercount,0)) as avg_answers_when_any,
+    sum(case when q.acceptedanswerid is not null then 1 else 0 end) as accepted_qs,
+    sum(case when q.closeddate is not null then 1 else 0 end) as closed_qs
+  from posts q
+  where q.posttypeid = 1 and q.owneruserid is not null
+  group by q.owneruserid
+),
+answer_quality as (
+  select
+    a.owneruserid as user_id,
+    count(*) as answers,
+    avg(a.score) as avg_a_score,
+    percentile_cont(0.9) within group (order by a.score) as p90_a_score,
+    sum(case when a.id = q.acceptedanswerid then 1 else 0 end) as accepted_answers
+  from posts a
+  join posts q on q.id = a.parentid and q.posttypeid = 1
+  where a.posttypeid = 2 and a.owneruserid is not null
+  group by a.owneruserid
+),
+hot_streaks as (
+  select
+    d.owneruserid as user_id,
+    max(run_len) as max_consecutive_days
+  from (
+    select
+      owneruserid,
+      pdate,
+      count(*) over (partition by owneruserid, grp) as run_len
+    from (
+      select
+        p.owneruserid,
+        date_trunc('day', p.creationdate) as pdate,
+        date_trunc('day', p.creationdate) - (row_number() over (partition by p.owneruserid order by date_trunc('day', p.creationdate))) * interval '1 day' as grp
+      from posts p
+      where p.owneruserid is not null
+      group by p.owneruserid, date_trunc('day', p.creationdate)
+    ) s
+  ) d
+  group by d.owneruserid
+),
+normalize as (
+  select
+    ru.user_id,
+    ru.displayname,
+    ru.reputation,
+    ru.cohort_month,
+    ru.region_hint,
+    ru.rn_desc,
+    coalesce(a.q_count,0) as q_count,
+    coalesce(a.a_count,0) as a_count,
+    coalesce(a.total_post_score,0) as total_post_score,
+    a.avg_q_views_nonzero,
+    a.last_activity,
+    coalesce(b.badge_count,0) as badge_count,
+    coalesce(b.gold_count,0) as gold_count,
+    coalesce(b.silver_count,0) as silver_count,
+    coalesce(b.bronze_count,0) as bronze_count,
+    b.last_badge_date,
+    coalesce(v.upvotes_cast,0) as upvotes_cast,
+    coalesce(v.downvotes_cast,0) as downvotes_cast,
+    coalesce(v.bounty_spent,0) as bounty_spent,
+    coalesce(pi.comments_made,0) as comments_made,
+    coalesce(pi.links_made,0) as links_made,
+    coalesce(pi.dup_links_made,0) as dup_links_made,
+    coalesce(tf.tagged_questions,0) as tagged_questions,
+    coalesce(tf.distinct_tags_used,0) as distinct_tags_used,
+    coalesce(tf.max_tags_on_q,0) as max_tags_on_q,
+    coalesce(e.edits_made,0) as edits_made,
+    coalesce(e.mod_state_changes,0) as mod_state_changes,
+    coalesce(e.closes_cast_with_reason,0) as closes_cast_with_reason,
+    e.last_edit_date,
+    coalesce(qq.questions,0) as questions,
+    qq.avg_q_score,
+    qq.med_q_score,
+    qq.avg_answers_when_any,
+    coalesce(qq.accepted_qs,0) as accepted_qs,
+    coalesce(qq.closed_qs,0) as closed_qs,
+    coalesce(aq.answers,0) as answers,
+    aq.avg_a_score,
+    aq.p90_a_score,
+    coalesce(aq.accepted_answers,0) as accepted_answers,
+    coalesce(hs.max_consecutive_days,0) as max_consecutive_days
+  from recent_users ru
+  left join activity a on a.user_id = ru.user_id
+  left join badge_rollup b on b.user_id = ru.user_id
+  left join vote_agg v on v.user_id = ru.user_id
+  left join post_interactions pi on pi.user_id = ru.user_id
+  left join tag_footprint tf on tf.user_id = ru.user_id
+  left join edits_cte e on e.user_id = ru.user_id
+  left join question_quality qq on qq.user_id = ru.user_id
+  left join answer_quality aq on aq.user_id = ru.user_id
+  left join hot_streaks hs on hs.user_id = ru.user_id
+),
+rankings as (
+  select
+    n.*,
+    dense_rank() over (order by n.reputation desc, n.total_post_score desc, n.badge_count desc) as rep_rank,
+    dense_rank() over (order by coalesce(n.avg_a_score, -1) desc) as a_quality_rank,
+    dense_rank() over (order by coalesce(n.avg_q_score, -1) desc) as q_quality_rank,
+    row_number() over (order by (coalesce(n.upvotes_cast,0) - coalesce(n.downvotes_cast,0)) desc, n.edits_made desc) as civics_rank,
+    (select percentile_disc(0.5) within group (order by rr.answers) from (select answers from normalize) rr) as global_median_answers
+  from normalize n
+),
+flagged_anomalies as (
+  select
+    r.*,
+    case
+      when r.a_count > 0 and coalesce(r.avg_a_score,0) < -2 then 'LOW_ANS_SCORE'
+      when r.q_count > 0 and coalesce(r.avg_q_score,0) < -2 then 'LOW_QUE_SCORE'
+      when r.badge_count = 0 and r.reputation > 10000 then 'HIGH_REP_NO_BADGES'
+      when r.closed_qs > r.questions/2 and r.questions > 5 then 'MANY_CLOSED'
+      when r.max_consecutive_days >= 30 then 'STREAKER'
+      else null
+    end as anomaly_flag
+  from rankings r
+),
+region_stats as (
+  select
+    region_hint,
+    count(*) as users_in_region,
+    avg(reputation) as avg_rep_region,
+    percentile_cont(0.75) within group (order by coalesce(total_post_score,0)) as p75_score_region
+  from normalize
+  group by region_hint
+),
+cohort_stats as (
+  select
+    cohort_month,
+    count(*) as users_in_cohort,
+    avg(answers) as avg_answers_cohort,
+    avg(questions) as avg_questions_cohort
+  from normalize
+  group by cohort_month
+),
+final_set as (
+  select
+    f.user_id,
+    f.displayname,
+    f.reputation,
+    f.cohort_month,
+    f.region_hint,
+    f.q_count,
+    f.a_count,
+    f.total_post_score,
+    f.badge_count,
+    f.gold_count,
+    f.silver_count,
+    f.bronze_count,
+    f.upvotes_cast,
+    f.downvotes_cast,
+    f.bounty_spent,
+    f.comments_made,
+    f.links_made,
+    f.dup_links_made,
+    f.tagged_questions,
+    f.distinct_tags_used,
+    f.max_tags_on_q,
+    f.edits_made,
+    f.mod_state_changes,
+    f.closes_cast_with_reason,
+    f.questions,
+    f.answers,
+    f.avg_q_score,
+    f.med_q_score,
+    f.avg_answers_when_any,
+    f.accepted_qs,
+    f.closed_qs,
+    f.avg_a_score,
+    f.p90_a_score,
+    f.accepted_answers,
+    f.max_consecutive_days,
+    f.rep_rank,
+    f.a_quality_rank,
+    f.q_quality_rank,
+    f.civics_rank,
+    f.global_median_answers,
+    f.anomaly_flag,
+    rs.users_in_region,
+    rs.avg_rep_region,
+    rs.p75_score_region,
+    cs.users_in_cohort,
+    cs.avg_answers_cohort,
+    cs.avg_questions_cohort
+  from flagged_anomalies f
+  left join region_stats rs on rs.region_hint = f.region_hint
+  left join cohort_stats cs on cs.cohort_month = f.cohort_month
+)
+select *
+from final_set
+where
+  (coalesce(answers,0) + coalesce(questions,0)) > 0
+  and (
+    anomaly_flag is not null
+    or rep_rank <= 100
+    or (avg_a_score is not null and avg_a_score >= (select avg(avg_a_score) from rankings where avg_a_score is not null))
+  )
+order by rep_rank, civics_rank, a_quality_rank
+limit 500;

@@ -1,0 +1,350 @@
+-- {"query": "436.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3361} 
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        date_trunc('month', u.creationdate) as cohort_month,
+        u.location,
+        u.websiteurl,
+        u.views,
+        u.upvotes,
+        u.downvotes,
+        row_number() over (partition by date_trunc('month', u.creationdate) order by u.reputation desc, u.id) as rep_rank_in_cohort
+    from users u
+    where u.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+),
+user_activity as (
+    select
+        p.owneruserid as user_id,
+        count(*) filter (where p.posttypeid = 1) as q_count,
+        count(*) filter (where p.posttypeid = 2) as a_count,
+        coalesce(sum(nullif(p.viewcount, 0)), 0) as post_views,
+        coalesce(sum(p.score), 0) as post_score,
+        coalesce(sum(p.answercount), 0) as answers_on_questions,
+        max(p.lastactivitydate) as last_post_activity,
+        avg(nullif(p.commentcount, 0)) as avg_comment_count_nonzero
+    from posts p
+    where p.owneruserid is not null
+      and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+    group by p.owneruserid
+),
+user_badges as (
+    select
+        b.userid as user_id,
+        count(*) as total_badges,
+        count(*) filter (where b.class = 1) as gold_badges,
+        count(*) filter (where b.class = 2) as silver_badges,
+        count(*) filter (where b.class = 3) as bronze_badges,
+        count(*) filter (where b.tagbased = 1) as tag_badges,
+        min(b.date) as first_badge_date,
+        max(b.date) as last_badge_date
+    from badges b
+    where b.date >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+    group by b.userid
+),
+user_votes as (
+    select
+        v.userid as user_id,
+        count(*) filter (where v.votetypeid = 2) as upvotes_cast,
+        count(*) filter (where v.votetypeid = 3) as downvotes_cast,
+        count(*) filter (where v.votetypeid = 5) as favorites_cast,
+        count(*) filter (where v.votetypeid in (8,9)) as bounties_touched,
+        coalesce(sum(case when v.votetypeid in (8,9) then v.bountyamount end), 0) as total_bounty_amount,
+        min(v.creationdate) as first_vote_date,
+        max(v.creationdate) as last_vote_date
+    from votes v
+    where v.userid is not null
+      and v.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+    group by v.userid
+),
+user_comments as (
+    select
+        c.userid as user_id,
+        count(*) as comment_count,
+        coalesce(sum(c.score), 0) as comment_score_sum,
+        avg(c.score) as avg_comment_score,
+        max(c.creationdate) as last_comment_date
+    from comments c
+    where c.userid is not null
+      and c.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+    group by c.userid
+),
+question_tag_expansion as (
+    select
+        p.id as post_id,
+        p.owneruserid as user_id,
+        unnest(string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')) as tagname
+    from posts p
+    where p.posttypeid = 1
+      and p.tags is not null
+      and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+),
+user_top_tags as (
+    select
+        qte.user_id,
+        t.tagname,
+        count(*) as tag_uses,
+        row_number() over (partition by qte.user_id order by count(*) desc, t.tagname) as tag_rank
+    from question_tag_expansion qte
+    join tags t on lower(t.tagname) = lower(qte.tagname)
+    group by qte.user_id, t.tagname
+),
+dupe_network as (
+    select
+        pl.postid,
+        pl.relatedpostid,
+        pl.creationdate,
+        pl.linktypeid
+    from postlinks pl
+    where pl.linktypeid in (1,3)
+      and pl.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+),
+question_closures as (
+    select
+        ph.postid,
+        ph.creationdate as close_date,
+        ph.comment as close_reason_id_raw,
+        try_cast(nullif(ph.comment, '') as int) as close_reason_id,
+        crt.name as close_reason_name
+    from posthistory ph
+    left join closereasontypes crt
+      on try_cast(nullif(ph.comment, '') as int) = crt.id
+    where ph.posthistorytypeid = 10
+      and ph.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+),
+post_quality as (
+    select
+        p.id as post_id,
+        p.owneruserid as user_id,
+        p.posttypeid,
+        p.score,
+        p.viewcount,
+        p.favoritecount,
+        p.commentcount,
+        p.creationdate,
+        p.lastactivitydate,
+        case
+            when p.posttypeid = 1 then greatest(coalesce(p.score,0)*3 + coalesce(p.viewcount,0)/50 + coalesce(p.favoritecount,0)*5, 0)
+            when p.posttypeid = 2 then greatest(coalesce(p.score,0)*4 + coalesce(p.commentcount,0), 0)
+            else coalesce(p.score,0)
+        end as quality_points
+    from posts p
+    where p.owneruserid is not null
+      and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+),
+user_post_windows as (
+    select
+        pq.user_id,
+        pq.post_id,
+        pq.posttypeid,
+        pq.quality_points,
+        pq.creationdate,
+        sum(pq.quality_points) over (partition by pq.user_id order by pq.creationdate rows between unbounded preceding and current row) as cumulative_quality,
+        avg(pq.quality_points) over (partition by pq.user_id rows between unbounded preceding and unbounded following) as avg_quality_all_time,
+        rank() over (partition by pq.user_id order by pq.quality_points desc, pq.post_id) as quality_rank
+    from post_quality pq
+),
+accepted_answer_ratio as (
+    select
+        a.owneruserid as user_id,
+        count(*) filter (where q.acceptedanswerid = a.id) as accepted_answers,
+        count(*) as total_answers,
+        coalesce(count(*) filter (where q.acceptedanswerid = a.id)::decimal / nullif(count(*),0), 0) as accept_rate
+    from posts a
+    join posts q on q.id = a.parentid and q.posttypeid = 1
+    where a.posttypeid = 2
+      and a.owneruserid is not null
+      and a.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+    group by a.owneruserid
+),
+user_joined_activity as (
+    select
+        ru.user_id,
+        ru.displayname,
+        ru.reputation,
+        ru.cohort_month,
+        ru.location,
+        ru.websiteurl,
+        ru.views,
+        ua.q_count,
+        ua.a_count,
+        ua.post_views,
+        ua.post_score,
+        ua.answers_on_questions,
+        uv.upvotes_cast,
+        uv.downvotes_cast,
+        uv.favorites_cast,
+        uv.bounties_touched,
+        uv.total_bounty_amount,
+        ub.total_badges,
+        ub.gold_badges,
+        ub.silver_badges,
+        ub.bronze_badges,
+        ub.tag_badges,
+        uc.comment_count,
+        uc.comment_score_sum,
+        aar.accept_rate,
+        greatest(coalesce(ua.post_score,0)*2 + coalesce(uv.upvotes_cast,0) - coalesce(uv.downvotes_cast,0) + coalesce(ub.total_badges,0)*3 + coalesce(uc.comment_score_sum,0), 0) as engagement_score
+    from recent_users ru
+    left join user_activity ua on ua.user_id = ru.user_id
+    left join user_votes uv on uv.user_id = ru.user_id
+    left join user_badges ub on ub.user_id = ru.user_id
+    left join user_comments uc on uc.user_id = ru.user_id
+    left join accepted_answer_ratio aar on aar.user_id = ru.user_id
+),
+user_best_tag as (
+    select
+        utt.user_id,
+        utt.tagname as best_tag,
+        utt.tag_uses
+    from user_top_tags utt
+    where utt.tag_rank = 1
+),
+anomalous_users as (
+    select
+        uja.user_id,
+        uja.displayname,
+        uja.reputation,
+        uja.cohort_month,
+        uja.location,
+        uja.engagement_score,
+        uja.accept_rate,
+        ubt.best_tag,
+        ubt.tag_uses,
+        case
+            when uja.reputation < 50 and coalesce(uja.engagement_score,0) > 500 then 'low-rep high-engagement'
+            when uja.reputation > 10000 and coalesce(uja.engagement_score,0) < 50 then 'high-rep low-engagement'
+            else 'normal'
+        end as anomaly_bucket
+    from user_joined_activity uja
+    left join user_best_tag ubt on ubt.user_id = uja.user_id
+),
+dupe_impact as (
+    select
+        p.owneruserid as user_id,
+        count(*) filter (where pl.linktypeid = 3) as dupe_links,
+        count(*) filter (where pl.linktypeid = 1) as related_links,
+        count(distinct case when pl.linktypeid = 3 then pl.relatedpostid end) as distinct_dupe_targets,
+        count(distinct case when pl.linktypeid = 1 then pl.relatedpostid end) as distinct_related_targets
+    from posts p
+    left join dupe_network pl on pl.postid = p.id
+    where p.owneruserid is not null
+      and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+    group by p.owneruserid
+),
+close_impact as (
+    select
+        p.owneruserid as user_id,
+        count(*) as closes,
+        count(*) filter (where qc.close_reason_name ilike '%duplicate%') as closes_duplicate,
+        min(qc.close_date) as first_close_date,
+        max(qc.close_date) as last_close_date
+    from posts p
+    join question_closures qc on qc.postid = p.id
+    where p.posttypeid = 1
+      and p.owneruserid is not null
+    group by p.owneruserid
+),
+final_user_metrics as (
+    select
+        a.user_id,
+        a.displayname,
+        a.reputation,
+        a.cohort_month,
+        a.location,
+        a.engagement_score,
+        a.accept_rate,
+        coalesce(di.dupe_links,0) as dupe_links,
+        coalesce(di.related_links,0) as related_links,
+        coalesce(ci.closes,0) as closes,
+        coalesce(ci.closes_duplicate,0) as closes_duplicate,
+        coalesce(ubt.best_tag, '(none)') as best_tag,
+        coalesce(ubt.tag_uses,0) as best_tag_uses,
+        a.anomaly_bucket,
+        percentile_disc(0.9) within group (order by coalesce(di.dupe_links,0)) over () as dupe_p90,
+        percentile_disc(0.9) within group (order by coalesce(ci.closes,0)) over () as close_p90
+    from anomalous_users a
+    left join dupe_impact di on di.user_id = a.user_id
+    left join close_impact ci on ci.user_id = a.user_id
+    left join user_best_tag ubt on ubt.user_id = a.user_id
+),
+outlier_flags as (
+    select
+        fum.*,
+        case when fum.dupe_links >= fum.dupe_p90 then 1 else 0 end as is_dupe_outlier,
+        case when fum.closes >= fum.close_p90 then 1 else 0 end as is_close_outlier
+    from final_user_metrics fum
+),
+top_quality_posts as (
+    select
+        upw.user_id,
+        upw.post_id,
+        upw.posttypeid,
+        upw.quality_points,
+        upw.quality_rank,
+        upw.creationdate
+    from user_post_windows upw
+    where upw.quality_rank <= 3
+),
+stringified_summary as (
+    select
+        ofl.user_id,
+        ('User ' || coalesce(nullif(trim(ofl.displayname), ''), '('||ofl.user_id::text||')') ||
+         ' from ' || coalesce(nullif(trim(ofl.location), ''), 'Unknown') ||
+         ' | best tag: ' || coalesce(nullif(trim(ofl.best_tag), ''), '(none)') ||
+         ' | engagement: ' || coalesce(ofl.engagement_score::text, '0') ||
+         ' | accept_rate: ' || to_char(coalesce(ofl.accept_rate,0), 'FM0.00%') ||
+         ' | anomalies: ' || ofl.anomaly_bucket ||
+         ' | dupe_outlier=' || ofl.is_dupe_outlier::text ||
+         ' | close_outlier=' || ofl.is_close_outlier::text
+        ) as summary
+    from outlier_flags ofl
+)
+select
+    ofl.user_id,
+    u.displayname,
+    u.reputation,
+    ofl.cohort_month,
+    ofl.location,
+    ofl.engagement_score,
+    ofl.accept_rate,
+    ofl.best_tag,
+    ofl.best_tag_uses,
+    ofl.dupe_links,
+    ofl.related_links,
+    ofl.closes,
+    ofl.closes_duplicate,
+    ofl.anomaly_bucket,
+    ofl.is_dupe_outlier,
+    ofl.is_close_outlier,
+    ss.summary,
+    coalesce(json_agg(json_build_object(
+        'post_id', tqp.post_id,
+        'posttypeid', tqp.posttypeid,
+        'quality_points', tqp.quality_points,
+        'rank', tqp.quality_rank,
+        'created', tqp.creationdate
+    ) order by tqp.quality_rank) filter (where tqp.post_id is not null), '[]'::json) as top_posts
+from outlier_flags ofl
+join users u on u.id = ofl.user_id
+left join top_quality_posts tqp on tqp.user_id = ofl.user_id
+left join stringified_summary ss on ss.user_id = ofl.user_id
+where coalesce(ofl.engagement_score,0) > 0
+  and (
+      ofl.anomaly_bucket <> 'normal'
+      or ofl.is_dupe_outlier = 1
+      or ofl.is_close_outlier = 1
+  )
+group by
+    ofl.user_id, u.displayname, u.reputation, ofl.cohort_month, ofl.location,
+    ofl.engagement_score, ofl.accept_rate, ofl.best_tag, ofl.best_tag_uses,
+    ofl.dupe_links, ofl.related_links, ofl.closes, ofl.closes_duplicate,
+    ofl.anomaly_bucket, ofl.is_dupe_outlier, ofl.is_close_outlier, ss.summary
+order by
+    ofl.is_dupe_outlier desc,
+    ofl.is_close_outlier desc,
+    ofl.engagement_score desc,
+    ofl.reputation desc,
+    ofl.user_id asc
+limit 200;

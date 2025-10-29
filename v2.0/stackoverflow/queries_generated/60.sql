@@ -1,0 +1,338 @@
+-- {"query": "60.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3244} 
+with
+recent_posts as (
+  select
+    p.Id,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.CreationDate,
+    p.LastActivityDate,
+    coalesce(nullif(trim(p.Title), ''), '(no title)') as Title,
+    coalesce(p.Tags, '') as Tags,
+    case when p.ClosedDate is null then 0 else 1 end as IsClosed
+  from Posts p
+  where p.CreationDate >= (select max(CreationDate) - interval '365 days' from Posts)
+),
+user_activity as (
+  select
+    u.Id as UserId,
+    u.Reputation,
+    u.UpVotes,
+    u.DownVotes,
+    u.Views as ProfileViews,
+    u.CreationDate as UserCreated,
+    u.LastAccessDate as UserLastAccess,
+    coalesce(nullif(u.Location, ''), 'Unknown') as Location,
+    coalesce(nullif(u.DisplayName, ''), '[deleted]') as DisplayName
+  from Users u
+),
+comments_agg as (
+  select
+    c.PostId,
+    count(*) as CommentCnt,
+    sum(coalesce(c.Score, 0)) as CommentScoreSum,
+    max(c.CreationDate) as LastCommentAt
+  from Comments c
+  group by c.PostId
+),
+votes_agg as (
+  select
+    v.PostId,
+    count(*) filter (where v.VoteTypeId = 2) as Upvotes,
+    count(*) filter (where v.VoteTypeId = 3) as Downvotes,
+    count(*) filter (where v.VoteTypeId = 5) as Favorites,
+    count(*) filter (where v.VoteTypeId = 8) as BountyStarts,
+    count(*) filter (where v.VoteTypeId = 9) as BountyCloses,
+    sum(coalesce(v.BountyAmount,0)) filter (where v.VoteTypeId in (8,9)) as BountyAmountTotal,
+    min(v.CreationDate) as FirstVoteAt,
+    max(v.CreationDate) as LastVoteAt
+  from Votes v
+  group by v.PostId
+),
+post_link_dupes as (
+  select
+    pl.PostId,
+    count(*) filter (where pl.LinkTypeId = 3) as DuplicateLinks,
+    count(*) filter (where pl.LinkTypeId = 1) as LinkedLinks
+  from PostLinks pl
+  group by pl.PostId
+),
+post_edits as (
+  select
+    ph.PostId,
+    count(*) filter (where ph.PostHistoryTypeId in (4,5,6,7,8,9,24)) as EditEvents,
+    count(*) filter (where ph.PostHistoryTypeId in (10)) as CloseVotes,
+    count(*) filter (where ph.PostHistoryTypeId in (11)) as ReopenVotes,
+    count(*) filter (where ph.PostHistoryTypeId in (12)) as DeleteVotes,
+    count(*) filter (where ph.PostHistoryTypeId in (13)) as UndeleteVotes,
+    max(ph.CreationDate) as LastEditAt,
+    min(ph.CreationDate) as FirstEditAt
+  from PostHistory ph
+  group by ph.PostId
+),
+tag_expansion as (
+  select
+    rp.Id as PostId,
+    unnest(
+      case
+        when rp.Tags is null or rp.Tags = '' then array[]::varchar[]
+        else string_to_array(substring(rp.Tags, 2, length(rp.Tags)-2), '><')
+      end
+    ) as TagName
+  from recent_posts rp
+  where rp.PostTypeId = 1
+),
+tag_stats as (
+  select
+    te.PostId,
+    count(*) as TagCount,
+    array_agg(te.TagName order by te.TagName) as TagArray,
+    string_agg(te.TagName, ',' order by te.TagName) as TagList,
+    sum(t.Count) as TagGlobalUsage,
+    count(*) filter (where coalesce(t.IsModeratorOnly, 0) = 1) as ModOnlyTags,
+    count(*) filter (where coalesce(t.IsRequired, 0) = 1) as RequiredTags
+  from tag_expansion te
+  left join Tags t on lower(t.TagName) = lower(te.TagName)
+  group by te.PostId
+),
+answer_latency as (
+  select
+    q.Id as QuestionId,
+    min(a.CreationDate) - q.CreationDate as TimeToFirstAnswer,
+    count(a.Id) as TotalAnswers,
+    count(a.Id) filter (where a.Score > 0) as PositiveAnswers
+  from Posts q
+  left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+  where q.PostTypeId = 1
+  group by q.Id, q.CreationDate
+),
+accepted_answer_stats as (
+  select
+    q.Id as QuestionId,
+    a.Id as AcceptedId,
+    a.Score as AcceptedScore,
+    a.CreationDate as AcceptedAt,
+    (a.CreationDate - q.CreationDate) as TimeToAccept
+  from Posts q
+  join Posts a on a.Id = q.AcceptedAnswerId
+  where q.PostTypeId = 1
+),
+user_badges as (
+  select
+    b.UserId,
+    count(*) as BadgeCount,
+    count(*) filter (where b.Class = 1) as Gold,
+    count(*) filter (where b.Class = 2) as Silver,
+    count(*) filter (where b.Class = 3) as Bronze,
+    max(b.Date) as LastBadgeAt
+  from Badges b
+  group by b.UserId
+),
+post_owner_rollup as (
+  select
+    rp.Id as PostId,
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.UpVotes,
+    ua.DownVotes,
+    ua.ProfileViews,
+    ua.Location,
+    coalesce(ub.BadgeCount, 0) as BadgeCount,
+    coalesce(ub.Gold, 0) as Gold,
+    coalesce(ub.Silver, 0) as Silver,
+    coalesce(ub.Bronze, 0) as Bronze,
+    ub.LastBadgeAt
+  from recent_posts rp
+  left join user_activity ua on ua.UserId = rp.OwnerUserId
+  left join user_badges ub on ub.UserId = rp.OwnerUserId
+),
+post_quality as (
+  select
+    rp.Id as PostId,
+    rp.PostTypeId,
+    rp.Score,
+    coalesce(va.Upvotes,0) as Upvotes,
+    coalesce(va.Downvotes,0) as Downvotes,
+    coalesce(ca.CommentCnt,0) as CommentCnt,
+    coalesce(pa.EditEvents,0) as Edits,
+    coalesce(va.Favorites,0) as Favorites,
+    coalesce(va.BountyAmountTotal,0) as BountyTotal,
+    coalesce(pl.DuplicateLinks,0) as DuplicateLinks,
+    coalesce(pl.LinkedLinks,0) as LinkedLinks,
+    case
+      when rp.ViewCount is null or rp.ViewCount = 0 then null
+      else round((rp.Score::numeric + coalesce(va.Upvotes,0) - coalesce(va.Downvotes,0) + coalesce(va.Favorites,0)*0.5 + coalesce(ca.CommentScoreSum,0)*0.2 + coalesce(va.BountyAmountTotal,0)/100.0) / greatest(rp.ViewCount, 1), 6)
+    end as EngagementScore
+  from recent_posts rp
+  left join votes_agg va on va.PostId = rp.Id
+  left join comments_agg ca on ca.PostId = rp.Id
+  left join post_edits pa on pa.PostId = rp.Id
+  left join post_link_dupes pl on pl.PostId = rp.Id
+),
+ranked_posts as (
+  select
+    rp.Id,
+    rp.PostTypeId,
+    rp.Title,
+    rp.Tags,
+    rp.OwnerUserId,
+    rp.CreationDate,
+    rp.LastActivityDate,
+    rp.Score,
+    rp.ViewCount,
+    rp.AnswerCount,
+    rp.CommentCount,
+    rp.FavoriteCount,
+    rp.IsClosed,
+    pq.Upvotes,
+    pq.Downvotes,
+    pq.Favorites,
+    pq.BountyTotal,
+    pq.DuplicateLinks,
+    pq.LinkedLinks,
+    pq.EngagementScore,
+    ts.TagCount,
+    ts.TagArray,
+    ts.TagList,
+    ts.TagGlobalUsage,
+    ts.ModOnlyTags,
+    ts.RequiredTags,
+    al.TimeToFirstAnswer,
+    al.TotalAnswers,
+    al.PositiveAnswers,
+    aas.AcceptedId,
+    aas.AcceptedScore,
+    aas.TimeToAccept,
+    por.DisplayName,
+    por.Reputation,
+    por.UpVotes as OwnerUpVotes,
+    por.DownVotes as OwnerDownVotes,
+    por.ProfileViews as OwnerProfileViews,
+    por.Location as OwnerLocation,
+    por.BadgeCount,
+    por.Gold,
+    por.Silver,
+    por.Bronze,
+    row_number() over (partition by rp.PostTypeId order by coalesce(pq.EngagementScore, -1) desc nulls last, rp.Score desc, rp.ViewCount desc, rp.CreationDate desc) as RankInType
+  from recent_posts rp
+  left join post_quality pq on pq.PostId = rp.Id
+  left join tag_stats ts on ts.PostId = rp.Id
+  left join answer_latency al on al.QuestionId = rp.Id
+  left join accepted_answer_stats aas on aas.QuestionId = rp.Id
+  left join post_owner_rollup por on por.PostId = rp.Id
+),
+anomalies as (
+  select
+    rp.Id as PostId,
+    case
+      when rp.PostTypeId = 1 and rp.AnswerCount > 0 and rp.AcceptedId is null then 'HasAnswersNoAccepted'
+      when rp.PostTypeId = 1 and rp.AnswerCount = 0 and rp.Score > 10 then 'HighScoreNoAnswers'
+      when coalesce(pq.EngagementScore, 0) < 0 and rp.ViewCount > 0 then 'NegativeEngagement'
+      when rp.IsClosed = 1 and coalesce(va.ReopenVotes,0) > coalesce(va.CloseVotes,0) then 'ClosedButMoreReopenVotes'
+      else null
+    end as Anomaly
+  from ranked_posts rp
+  left join post_edits va on va.PostId = rp.Id
+  left join post_quality pq on pq.PostId = rp.Id
+),
+dense_badge_rank as (
+  select
+    rp.Id as PostId,
+    dense_rank() over (order by coalesce(rp.BadgeCount,0) desc, coalesce(rp.Gold,0) desc, coalesce(rp.Silver,0) desc, coalesce(rp.Bronze,0) desc) as BadgeRank
+  from ranked_posts rp
+),
+summary as (
+  select
+    rp.*,
+    db.BadgeRank,
+    count(a.Anomaly) filter (where a.Anomaly is not null) as AnomalyCount,
+    string_agg(a.Anomaly, ',' order by a.Anomaly) as Anomalies
+  from ranked_posts rp
+  left join anomalies a on a.PostId = rp.Id
+  left join dense_badge_rank db on db.PostId = rp.Id
+  group by
+    rp.Id, rp.PostTypeId, rp.Title, rp.Tags, rp.OwnerUserId, rp.CreationDate, rp.LastActivityDate, rp.Score, rp.ViewCount, rp.AnswerCount, rp.CommentCount, rp.FavoriteCount, rp.IsClosed,
+    rp.Upvotes, rp.Downvotes, rp.Favorites, rp.BountyTotal, rp.DuplicateLinks, rp.LinkedLinks, rp.EngagementScore, rp.TagCount, rp.TagArray, rp.TagList, rp.TagGlobalUsage, rp.ModOnlyTags, rp.RequiredTags,
+    rp.TimeToFirstAnswer, rp.TotalAnswers, rp.PositiveAnswers, rp.AcceptedId, rp.AcceptedScore, rp.TimeToAccept, rp.DisplayName, rp.Reputation, rp.OwnerUpVotes, rp.OwnerDownVotes, rp.OwnerProfileViews, rp.OwnerLocation, rp.BadgeCount, rp.Gold, rp.Silver, rp.Bronze, rp.RankInType,
+    db.BadgeRank
+),
+percentiles as (
+  select
+    s.Id,
+    s.PostTypeId,
+    s.Score,
+    s.ViewCount,
+    s.EngagementScore,
+    percentile_disc(0.5) within group (order by s.EngagementScore) over (partition by s.PostTypeId) as EngagementMedian,
+    percentile_disc(0.9) within group (order by s.EngagementScore) over (partition by s.PostTypeId) as EngagementP90,
+    percentile_disc(0.99) within group (order by s.EngagementScore) over (partition by s.PostTypeId) as EngagementP99
+  from summary s
+)
+select
+  s.Id,
+  s.PostTypeId,
+  s.Title,
+  s.TagList,
+  s.OwnerUserId,
+  s.DisplayName,
+  s.Location as OwnerLocation,
+  s.Reputation,
+  s.Gold || '/' || s.Silver || '/' || s.Bronze as BadgeBreakdown,
+  s.Score,
+  s.ViewCount,
+  s.Upvotes,
+  s.Downvotes,
+  s.Favorites,
+  s.BountyTotal,
+  s.AnswerCount,
+  s.TotalAnswers,
+  s.PositiveAnswers,
+  s.AcceptedId,
+  s.AcceptedScore,
+  s.IsClosed,
+  s.DuplicateLinks,
+  s.LinkedLinks,
+  s.EngagementScore,
+  s.RankInType,
+  s.BadgeRank,
+  coalesce(s.Anomalies, '') as Anomalies,
+  case
+    when p.EngagementScore is null then 'unknown'
+    when p.EngagementScore >= p.EngagementP99 then 'p99+'
+    when p.EngagementScore >= p.EngagementP90 then 'p90-99'
+    when p.EngagementScore >= p.EngagementMedian then 'p50-90'
+    else 'p0-50'
+  end as EngagementBucket,
+  s.CreationDate,
+  s.LastActivityDate
+from summary s
+join percentiles p on p.Id = s.Id
+where
+  (
+    s.PostTypeId in (1,2)
+    and (
+      s.Score >= 5
+      or coalesce(s.EngagementScore, -1) > 0.001
+      or s.BountyTotal > 0
+      or s.AnomalyCount > 0
+    )
+  )
+  or (
+    s.PostTypeId not in (1,2)
+    and s.RankInType <= 50
+  )
+order by
+  s.PostTypeId,
+  s.RankInType,
+  s.EngagementScore desc nulls last,
+  s.Score desc,
+  s.ViewCount desc
+limit 500;

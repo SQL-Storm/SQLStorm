@@ -1,0 +1,148 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.WikiPostId,
+        p.OwnerUserId,
+        p.CreationDate,
+        1 AS Depth
+    FROM Tags t
+    LEFT JOIN Posts p ON t.WikiPostId = p.Id
+    WHERE t.Count > 1000
+
+    UNION ALL
+
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.WikiPostId,
+        p.OwnerUserId,
+        p.CreationDate,
+        r.Depth + 1
+    FROM Tags t
+    INNER JOIN Posts p ON t.WikiPostId = p.Id
+    INNER JOIN RecursiveTagHierarchy r ON p.OwnerUserId = r.OwnerUserId
+    WHERE r.Depth < 3
+), UserBadgeCTE AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        count(distinct b.Id) OVER (PARTITION BY u.Id) AS TotalBadges,
+        count(distinct CASE WHEN b.Class = 1 THEN b.Id END) OVER (PARTITION BY u.Id) AS GoldBadges,
+        count(distinct CASE WHEN b.Class = 2 THEN b.Id END) OVER (PARTITION BY u.Id) AS SilverBadges,
+        count(distinct CASE WHEN b.Class = 3 THEN b.Id END) OVER (PARTITION BY u.Id) AS BronzeBadges,
+        max(b.Date) OVER (PARTITION BY u.Id) AS LatestBadgeDate
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 500 AND u.Location IS NOT NULL
+), TopActivePosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        COALESCE(p.Tags, '') AS Tags,
+        row_number() OVER (
+            PARTITION BY p.PostTypeId 
+            ORDER BY p.Score DESC, p.ViewCount DESC, p.CreationDate ASC
+        ) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) AND p.Score IS NOT NULL
+), PostCommentsAgg AS (
+    SELECT
+        c.PostId,
+        count(*) AS CommentCountTotal,
+        avg(c.Score) AS AvgCommentScore,
+        bool_or(c.UserId IS NULL) AS HasAnonymousComments,
+        string_agg(DISTINCT c.UserDisplayName, ', ' ORDER BY c.UserDisplayName) AS Commenters
+    FROM Comments c
+    WHERE c.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+    GROUP BY c.PostId
+), PostVotesSummary AS (
+    SELECT
+        v.PostId,
+        sum(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
+        sum(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes,
+        sum(CASE WHEN vt.Name = 'Favorite' THEN 1 ELSE 0 END) AS Favorites,
+        count(*) AS TotalVotes
+    FROM Votes v
+    INNER JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    GROUP BY v.PostId
+), UserActivityWindow AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        count(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        count(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        count(ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (10,11)) AS CloseReopenVotes,
+        dense_rank() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        lag(u.Reputation) OVER (ORDER BY u.Reputation DESC) AS PreviousReputation,
+        lead(u.Reputation) OVER (ORDER BY u.Reputation DESC) AS NextReputation
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+)
+SELECT DISTINCT
+    p.Id AS PostId,
+    p.Title,
+    p.PostTypeId,
+    p.OwnerUserId,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation AS OwnerReputation,
+    pb.TotalBadges,
+    pb.GoldBadges,
+    pb.SilverBadges,
+    pb.BronzeBadges,
+    pb.LatestBadgeDate,
+    c.CommentCountTotal,
+    c.AvgCommentScore,
+    c.HasAnonymousComments,
+    c.Commenters,
+    v.UpVotes,
+    v.DownVotes,
+    v.Favorites,
+    v.TotalVotes,
+    RTH.TagName,
+    RTH.Depth AS TagHierarchyDepth,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.CloseReopenVotes,
+    ua.ReputationRank,
+    ua.PreviousReputation,
+    ua.NextReputation,
+    CASE 
+        WHEN p.Score > 100 THEN 'HighScore'
+        WHEN p.Score BETWEEN 50 AND 100 THEN 'ModerateScore'
+        ELSE 'LowScore'
+    END AS ScoreCategory,
+    CASE 
+        WHEN p.ViewCount > 10000 THEN concat('Popular: ', p.ViewCount)
+        ELSE concat('Views: ', p.ViewCount)
+    END AS ViewInfo,
+    COALESCE(NULLIF(p.Tags, ''), '<none>') AS CleanTags,
+    left(p.Body, 100) AS Snippet,
+    (SELECT count(*) FROM PostLinks pl WHERE pl.PostId = p.Id AND EXISTS (
+        SELECT 1 FROM Posts p2 WHERE p2.Id = pl.RelatedPostId AND p2.PostTypeId = 1
+    )) AS LinkedQuestionCount,
+    EXISTS (
+        SELECT 1 FROM PostHistory ph2 
+        WHERE ph2.PostId = p.Id AND ph2.PostHistoryTypeId = 10 AND ph2.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days')
+    ) AS RecentlyClosed,
+    (SELECT sum(v2.BountyAmount) FROM Votes v2 WHERE v2.PostId = p.Id AND v2.BountyAmount IS NOT NULL) AS TotalBounty
+FROM TopActivePosts p
+LEFT JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN UserBadgeCTE pb ON u.Id = pb.UserId
+LEFT JOIN PostCommentsAgg c ON c.PostId = p.Id
+LEFT JOIN PostVotesSummary v ON v.PostId = p.Id
+LEFT JOIN RecursiveTagHierarchy RTH ON position(substring(COALESCE(p.Tags, ''), 2, 50) IN RTH.TagName) > 0 AND RTH.Depth = 1
+LEFT JOIN UserActivityWindow ua ON ua.Id = u.Id
+WHERE p.rn <= 5
+  AND (pb.TotalBadges IS NULL OR pb.TotalBadges > 3 OR u.Reputation > 1000)
+ORDER BY p.PostTypeId, p.Score DESC, p.ViewCount DESC;

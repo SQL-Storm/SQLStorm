@@ -1,0 +1,138 @@
+WITH Agg AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.Body,
+    p.ContentLicense,
+    COALESCE(v1.CntUp, 0) AS UpVotes,
+    COALESCE(v2.CntDown, 0) AS DownVotes,
+    COALESCE(bg.BronzeCnt, 0) AS BronzeBadges,
+    COALESCE(gs.SilverCnt, 0) AS SilverBadges,
+    COALESCE(gd.GoldCnt, 0) AS GoldBadges,
+    ROW_NUMBER() OVER (
+      PARTITION BY CAST(p.CreationDate AS DATE)
+      ORDER BY p.Score DESC, p.ViewCount DESC
+    ) AS DayRank
+  FROM Posts p
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS CntUp
+    FROM Votes
+    WHERE VoteTypeId = 2
+    GROUP BY PostId
+  ) v1 ON v1.PostId = p.Id
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS CntDown
+    FROM Votes
+    WHERE VoteTypeId = 3
+    GROUP BY PostId
+  ) v2 ON v2.PostId = p.Id
+  LEFT JOIN (
+    SELECT OwnerUserId,
+           SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeCnt,
+           SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverCnt,
+           SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldCnt
+    FROM Badges
+    GROUP BY OwnerUserId
+  ) bg ON bg.OwnerUserId = p.OwnerUserId
+  LEFT JOIN (
+    SELECT UserId, COUNT(*) AS SilverCnt
+    FROM Badges
+    WHERE Class = 2
+    GROUP BY UserId
+  ) gs ON gs.UserId = p.OwnerUserId
+  LEFT JOIN (
+    SELECT UserId, COUNT(*) AS GoldCnt
+    FROM Badges
+    WHERE Class = 1
+    GROUP BY UserId
+  ) gd ON gd.UserId = p.OwnerUserId
+  WHERE
+    p.PostTypeId IN (1, 2)
+    AND p.CreationDate >= TIMESTAMP '2020-01-01'
+),
+Filtered AS (
+  SELECT
+    a.PostId,
+    a.PostTypeId,
+    a.OwnerUserId,
+    a.Title,
+    a.Tags,
+    a.CreationDate,
+    a.LastActivityDate,
+    a.Score,
+    a.ViewCount,
+    a.CommentCount,
+    a.FavoriteCount,
+    a.ParentId,
+    a.AcceptedAnswerId,
+    a.Body,
+    a.ContentLicense,
+    a.UpVotes,
+    a.DownVotes,
+    a.BronzeBadges,
+    a.SilverBadges,
+    a.GoldBadges,
+    a.DayRank,
+    CASE WHEN a.PostTypeId = 1 THEN 'Question' ELSE 'Answer' END AS Kind,
+    parent.Title AS ParentTitle
+  FROM Agg a
+  LEFT JOIN Posts parent ON parent.Id = a.ParentId
+),
+Computed AS (
+  SELECT
+    f.PostId,
+    f.Kind,
+    f.OwnerUserId,
+    f.Title,
+    f.Tags,
+    f.CreationDate,
+    f.LastActivityDate,
+    f.Score,
+    f.ViewCount,
+    f.CommentCount,
+    f.FavoriteCount,
+    f.DayRank,
+    COALESCE(f.BronzeBadges, 0) AS BronzeCnt,
+    COALESCE(f.SilverBadges, 0) AS SilverCnt,
+    COALESCE(f.GoldBadges, 0) AS GoldCnt,
+    f.ParentTitle,
+    f.Body,
+    f.ContentLicense
+  FROM Filtered f
+)
+SELECT
+  PostId,
+  Kind,
+  OwnerUserId,
+  Title,
+  Tags,
+  CreationDate,
+  LastActivityDate,
+  Score,
+  ViewCount,
+  CommentCount,
+  FavoriteCount,
+  DayRank,
+  BronzeCnt,
+  SilverCnt,
+  GoldCnt,
+  ParentTitle,
+  SUBSTRING(Body FROM 1 FOR 200) AS Snippet,
+  ContentLicense
+FROM Computed
+WHERE
+  DayRank <= 50
+  AND (Score > 0 OR ViewCount > 100)
+  AND (COALESCE(BronzeCnt,0) + COALESCE(SilverCnt,0) + COALESCE(GoldCnt,0)) >= 1
+ORDER BY DayRank, PostId;

@@ -1,0 +1,374 @@
+with recent_users as (
+    select u.id as user_id,
+           u.displayname,
+           u.reputation,
+           u.creationdate,
+           coalesce(nullif(trim(split_part(coalesce(u.location,''), ',', 1)),''), 'Unknown') as region_hint,
+           date_trunc('month', u.creationdate) as cohort_month
+    from users u
+    where u.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+),
+user_activity as (
+    select p.owneruserid as user_id,
+           count(*) filter (where p.posttypeid = 1) as q_count,
+           count(*) filter (where p.posttypeid = 2) as a_count,
+           sum(coalesce(p.score,0)) as total_post_score,
+           sum(coalesce(p.viewcount,0)) filter (where p.posttypeid = 1) as total_question_views,
+           max(p.lastactivitydate) as last_post_activity
+    from posts p
+    where p.owneruserid is not null
+      and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+    group by p.owneruserid
+),
+user_votes as (
+    select v.userid as user_id,
+           count(*) filter (where v.votetypeid = 2) as upvotes_cast,
+           count(*) filter (where v.votetypeid = 3) as downvotes_cast,
+           count(*) filter (where v.votetypeid = 5) as favorites_cast,
+           count(*) filter (where v.votetypeid in (8,9)) as bounties_touched,
+           sum(coalesce(v.bountyamount,0)) filter (where v.votetypeid in (8,9)) as bounty_amount_sum,
+           min(v.creationdate) as first_vote_at,
+           max(v.creationdate) as last_vote_at
+    from votes v
+    where v.userid is not null
+      and v.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+    group by v.userid
+),
+user_badges as (
+    select b.userid as user_id,
+           count(*) as badge_count,
+           count(*) filter (where b.class = 1) as gold_count,
+           count(*) filter (where b.class = 2) as silver_count,
+           count(*) filter (where b.class = 3) as bronze_count,
+           count(*) filter (where b.tagbased = true) as tag_badges,
+           min(b.date) as first_badge_at,
+           max(b.date) as last_badge_at
+    from badges b
+    where b.date >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+    group by b.userid
+),
+accepted_answers as (
+    select a.owneruserid as user_id,
+           count(*) as accepted_count,
+           avg(cast(a.score as numeric)) as avg_score_on_accepted
+    from posts q
+    join posts a on a.id = q.acceptedanswerid
+    where q.posttypeid = 1
+      and a.posttypeid = 2
+      and a.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+    group by a.owneruserid
+),
+comment_stats as (
+    select c.userid as user_id,
+           count(*) as comment_count,
+           avg(coalesce(c.score,0))::numeric * 1 as avg_comment_score, -- ensure numeric
+           avg(coalesce(c.score,0)) as avg_comment_score_raw,
+           max(case when lower(c.text) similar to '%(thanks|thank you|great|awesome)%' then 1 else 0 end) as has_gratitude_comment,
+           max(c.creationdate) as last_comment_at
+    from comments c
+    where c.userid is not null
+      and c.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+    group by c.userid
+),
+question_tag_exploded as (
+    select p.id as post_id,
+           p.owneruserid as user_id,
+           unnest(string_to_array(substring(coalesce(p.tags,''), 2, greatest(length(coalesce(p.tags,''))-2,0)), '><')) as tag
+    from posts p
+    where p.posttypeid = 1
+      and p.owneruserid is not null
+      and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+),
+top_user_tags as (
+    select user_id,
+           tag,
+           count(*) as tag_uses,
+           row_number() over (partition by user_id order by count(*) desc, tag) as rn
+    from question_tag_exploded
+    group by user_id, tag
+),
+user_top3_tags as (
+    select t.user_id,
+           string_agg(tag || ':' || cast(tag_uses as text), ', ' order by rn) as top3_tags
+    from top_user_tags t
+    where t.rn <= 3
+    group by t.user_id
+),
+postlink_dupes as (
+    select pl.postid as dup_post_id,
+           pl.relatedpostid as canonical_post_id
+    from postlinks pl
+    where pl.linktypeid = 3
+      and pl.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+),
+dupe_involvement as (
+    select p.owneruserid as user_id,
+           count(distinct p.id) filter (where d.dup_post_id is not null) as dup_questions_authored,
+           count(distinct p.id) filter (where d.canonical_post_id is not null and p.posttypeid = 1) as canonical_target_questions
+    from posts p
+    left join postlink_dupes d
+      on d.dup_post_id = p.id or d.canonical_post_id = p.id
+    where p.owneruserid is not null
+      and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+    group by p.owneruserid
+),
+edits_and_closures as (
+    select ph.postid,
+           ph.userid as actor_user_id,
+           sum(case when ph.posthistorytypeid in (4,5,6,7,8,9,24) then 1 else 0 end) as edit_events,
+           sum(case when ph.posthistorytypeid in (10) then 1 else 0 end) as close_events,
+           max(ph.creationdate) as last_history_at,
+           max(case when ph.posthistorytypeid = 10 and (ph.comment ~ '^[0-9]+$') then cast(ph.comment as integer) end) as last_close_reason_id
+    from posthistory ph
+    where ph.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+    group by ph.postid, ph.userid
+),
+user_editing as (
+    select e.actor_user_id as user_id,
+           sum(e.edit_events) as total_edit_events,
+           sum(e.close_events) as total_close_events,
+           max(e.last_history_at) as last_edit_or_close
+    from edits_and_closures e
+    where e.actor_user_id is not null
+    group by e.actor_user_id
+),
+close_reason_names as (
+    select crt.id, crt.name from closereasontypes crt
+),
+recent_closes as (
+    select e.actor_user_id as user_id,
+           crn.name as last_close_reason_name,
+           row_number() over (partition by e.actor_user_id order by e.last_history_at desc) as rn
+    from edits_and_closures e
+    left join close_reason_names crn on crn.id = e.last_close_reason_id
+    where e.actor_user_id is not null
+      and e.close_events > 0
+),
+user_quality_score as (
+    select ru.user_id,
+           (
+             coalesce(ua.total_post_score,0)
+             + coalesce(aa.accepted_count,0) * 10
+             + coalesce(uv.upvotes_cast,0) * 0.5
+             - coalesce(uv.downvotes_cast,0) * 0.25
+             + coalesce(ub.gold_count,0) * 30
+             + coalesce(ub.silver_count,0) * 10
+             + coalesce(ub.bronze_count,0) * 3
+             + least(coalesce(ua.total_question_views,0) / nullif(greatest(coalesce(ua.q_count,0),1),0), 500)
+             + case when coalesce(ci.has_gratitude_comment,0) = 1 then 2 else 0 end
+             - coalesce(di.dup_questions_authored,0) * 5
+           ) as raw_quality_score
+    from recent_users ru
+    left join user_activity ua on ua.user_id = ru.user_id
+    left join accepted_answers aa on aa.user_id = ru.user_id
+    left join user_votes uv on uv.user_id = ru.user_id
+    left join user_badges ub on ub.user_id = ru.user_id
+    left join comment_stats ci on ci.user_id = ru.user_id
+    left join dupe_involvement di on di.user_id = ru.user_id
+),
+ranked_users as (
+    select ru.user_id,
+           ru.displayname,
+           ru.reputation,
+           ru.cohort_month,
+           ru.region_hint,
+           ua.q_count, ua.a_count, ua.total_post_score, ua.total_question_views, ua.last_post_activity,
+           uv.upvotes_cast, uv.downvotes_cast, uv.favorites_cast, uv.bounties_touched, uv.bounty_amount_sum, uv.first_vote_at, uv.last_vote_at,
+           ub.badge_count, ub.gold_count, ub.silver_count, ub.bronze_count, ub.tag_badges, ub.first_badge_at, ub.last_badge_at,
+           aa.accepted_count, aa.avg_score_on_accepted,
+           ci.comment_count, ci.avg_comment_score_raw as avg_comment_score, ci.has_gratitude_comment, ci.last_comment_at,
+           ut3.top3_tags,
+           di.dup_questions_authored, di.canonical_target_questions,
+           ue.total_edit_events, ue.total_close_events, ue.last_edit_or_close,
+           coalesce(rc.last_close_reason_name, 'N/A') as last_close_reason_name,
+           uq.raw_quality_score,
+           rank() over (order by uq.raw_quality_score desc nulls last, ru.reputation desc, ru.user_id) as quality_rank,
+           dense_rank() over (partition by date_trunc('year', ru.creationdate) order by uq.raw_quality_score desc nulls last) as cohort_quality_rank,
+           percentile_cont(0.5) within group (order by uq.raw_quality_score) over () as global_quality_median,
+           ru.creationdate
+    from recent_users ru
+    left join user_activity ua on ua.user_id = ru.user_id
+    left join user_votes uv on uv.user_id = ru.user_id
+    left join user_badges ub on ub.user_id = ru.user_id
+    left join accepted_answers aa on aa.user_id = ru.user_id
+    left join comment_stats ci on ci.user_id = ru.user_id
+    left join user_top3_tags ut3 on ut3.user_id = ru.user_id
+    left join dupe_involvement di on di.user_id = ru.user_id
+    left join user_editing ue on ue.user_id = ru.user_id
+    left join (select user_id, last_close_reason_name from recent_closes where rn = 1) rc on rc.user_id = ru.user_id
+    left join user_quality_score uq on uq.user_id = ru.user_id
+),
+anomalies as (
+    select r.user_id,
+           case
+             when coalesce(r.q_count,0) = 0 and coalesce(r.a_count,0) = 0 and coalesce(r.comment_count,0) > 100 then 'High commenter, zero posts'
+             when coalesce(r.a_count,0) > 0 and coalesce(r.accepted_count,0) = 0 and coalesce(r.total_post_score,0) <= 0 then 'Answers with no accepts and low score'
+             when coalesce(r.dup_questions_authored,0) >= 5 then 'Many duplicates authored'
+             when r.reputation > 10000 and coalesce(r.badge_count,0) = 0 then 'High rep, no badges?'
+             else null
+           end as anomaly_reason
+    from ranked_users r
+    group by r.user_id, r.q_count, r.a_count, r.comment_count, r.accepted_count, r.total_post_score, r.dup_questions_authored, r.reputation, r.badge_count
+),
+finalize as (
+    select r.user_id,
+           r.displayname,
+           r.reputation,
+           r.region_hint,
+           r.cohort_month,
+           r.q_count,
+           r.a_count,
+           r.accepted_count,
+           r.total_post_score,
+           r.total_question_views,
+           r.upvotes_cast,
+           r.downvotes_cast,
+           r.favorites_cast,
+           r.bounties_touched,
+           r.bounty_amount_sum,
+           r.badge_count,
+           r.gold_count,
+           r.silver_count,
+           r.bronze_count,
+           r.tag_badges,
+           r.first_badge_at,
+           r.last_badge_at,
+           r.avg_score_on_accepted,
+           r.comment_count,
+           r.avg_comment_score,
+           r.has_gratitude_comment,
+           r.last_comment_at,
+           r.top3_tags,
+           r.dup_questions_authored,
+           r.canonical_target_questions,
+           r.total_edit_events,
+           r.total_close_events,
+           r.last_edit_or_close,
+           r.last_close_reason_name,
+           r.raw_quality_score,
+           r.quality_rank,
+           r.cohort_quality_rank,
+           r.global_quality_median,
+           r.creationdate,
+           a.anomaly_reason,
+           case when r.raw_quality_score >= r.global_quality_median then 'AboveMedian' else 'BelowMedian' end as quality_band
+    from ranked_users r
+    left join anomalies a on a.user_id = r.user_id
+),
+cohort_stats as (
+    select cohort_month,
+           count(*) as users_in_cohort,
+           avg(coalesce(raw_quality_score,0)) as avg_quality,
+           percentile_cont(0.9) within group (order by raw_quality_score) as p90_quality
+    from finalize
+    group by cohort_month
+),
+with_flags as (
+    select f.user_id,
+           f.displayname,
+           f.reputation,
+           f.region_hint,
+           f.cohort_month,
+           f.q_count,
+           f.a_count,
+           f.accepted_count,
+           f.total_post_score,
+           f.total_question_views,
+           f.upvotes_cast,
+           f.downvotes_cast,
+           f.favorites_cast,
+           f.bounties_touched,
+           f.bounty_amount_sum,
+           f.badge_count,
+           f.gold_count,
+           f.silver_count,
+           f.bronze_count,
+           f.tag_badges,
+           f.first_badge_at,
+           f.last_badge_at,
+           f.avg_score_on_accepted,
+           f.comment_count,
+           f.avg_comment_score,
+           f.has_gratitude_comment,
+           f.last_comment_at,
+           f.top3_tags,
+           f.dup_questions_authored,
+           f.canonical_target_questions,
+           f.total_edit_events,
+           f.total_close_events,
+           f.last_edit_or_close,
+           f.last_close_reason_name,
+           f.raw_quality_score,
+           f.quality_rank,
+           f.cohort_quality_rank,
+           f.global_quality_median,
+           f.creationdate,
+           f.anomaly_reason,
+           f.quality_band,
+           cs.users_in_cohort,
+           cs.avg_quality,
+           cs.p90_quality,
+           case
+             when f.raw_quality_score is null then 'NoActivity'
+             when f.raw_quality_score >= cs.p90_quality then 'Top10Percent'
+             when f.quality_rank <= 100 then 'GlobalTop100'
+             else 'Normal'
+           end as performance_flag
+    from finalize f
+    left join cohort_stats cs on cs.cohort_month = f.cohort_month
+)
+select
+    wf.user_id,
+    wf.displayname,
+    wf.reputation,
+    wf.region_hint,
+    wf.cohort_month,
+    wf.q_count,
+    wf.a_count,
+    wf.accepted_count,
+    wf.total_post_score,
+    wf.total_question_views,
+    wf.upvotes_cast,
+    wf.downvotes_cast,
+    wf.badge_count,
+    wf.gold_count,
+    wf.silver_count,
+    wf.bronze_count,
+    wf.comment_count,
+    wf.avg_comment_score,
+    wf.top3_tags,
+    wf.dup_questions_authored,
+    wf.canonical_target_questions,
+    wf.total_edit_events,
+    wf.total_close_events,
+    wf.last_close_reason_name,
+    round(cast(wf.raw_quality_score as numeric), 2) as raw_quality_score,
+    wf.quality_rank,
+    wf.cohort_quality_rank,
+    wf.global_quality_median,
+    coalesce(wf.anomaly_reason, 'None') as anomaly_reason,
+    wf.quality_band,
+    wf.performance_flag,
+    (
+      select max(ts) from (
+        select max(p.lastactivitydate) as ts from posts p where p.owneruserid = wf.user_id
+        union all
+        select max(c.creationdate) as ts from comments c where c.userid = wf.user_id
+        union all
+        select max(v.creationdate) as ts from votes v where v.userid = wf.user_id
+      ) s
+    ) as last_any_activity_at
+from with_flags wf
+where
+    (
+      coalesce(wf.a_count,0) + coalesce(wf.q_count,0) + coalesce(wf.comment_count,0) >= 10
+      or (wf.raw_quality_score is not null and wf.raw_quality_score > wf.global_quality_median)
+      or (wf.performance_flag in ('Top10Percent','GlobalTop100'))
+    )
+  and not (
+      wf.anomaly_reason is not null
+      and wf.anomaly_reason = 'High commenter, zero posts'
+      and coalesce(wf.comment_count,0) > 500
+  )
+order by wf.quality_rank nulls last, wf.user_id
+limit 250;

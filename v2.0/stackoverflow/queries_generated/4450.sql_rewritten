@@ -1,0 +1,150 @@
+-- {"query": "4450.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1310} 
+WITH
+  RankedAnswers AS (
+    SELECT
+      p.Id AS PostId,
+      p.ParentId AS QuestionId,
+      p.OwnerUserId,
+      p.CreationDate AS AnswerDate,
+      ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS AnswerRank
+    FROM Posts AS p
+    WHERE
+      p.PostTypeId = 2 AND p.ParentId IS NOT NULL
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate AS UserCreationDate,
+      COUNT(DISTINCT p.Id) AS QuestionCount,
+      COUNT(DISTINCT a.PostId) AS AnswerCount,
+      SUM(CASE WHEN p.Score > 0 THEN 1 ELSE 0 END) AS PositiveScoreQuestions,
+      SUM(CASE WHEN a.Score > 0 THEN 1 ELSE 0 END) AS PositiveScoreAnswers,
+      COUNT(DISTINCT b.Id) AS BadgeCount,
+      MAX(p.CreationDate) AS LastQuestionDate,
+      MAX(a.AnswerDate) AS LastAnswerDate,
+      AVG(a.AnswerRank) AS AvgAnswerRankForUser
+    FROM Users AS u
+    LEFT JOIN Posts AS p
+      ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+    LEFT JOIN Posts AS a
+      ON u.Id = a.OwnerUserId AND a.PostTypeId = 2
+    LEFT JOIN Badges AS b
+      ON u.Id = b.UserId
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate
+  ),
+  HotQuestions AS (
+    SELECT
+      p.Id AS QuestionId,
+      p.Title,
+      p.Score,
+      p.AnswerCount,
+      p.ViewCount,
+      p.CreationDate AS QuestionDate,
+      p.OwnerUserId,
+      RANK() OVER (ORDER BY p.FavoriteCount DESC, p.ViewCount DESC) AS HotRank
+    FROM Posts AS p
+    WHERE
+      p.PostTypeId = 1 AND p.ClosedDate IS NULL AND p.CommunityOwnedDate IS NULL
+  ),
+  UserPerformance AS (
+    SELECT
+      ua.UserId,
+      ua.DisplayName,
+      ua.Reputation,
+      ua.UserCreationDate,
+      ua.QuestionCount,
+      ua.AnswerCount,
+      ua.PositiveScoreQuestions,
+      ua.PositiveScoreAnswers,
+      ua.BadgeCount,
+      ua.LastQuestionDate,
+      ua.LastAnswerDate,
+      ua.AvgAnswerRankForUser,
+      hq.HotRank AS UserHotQuestionRank,
+      CASE
+        WHEN ua.AnswerCount > 0 THEN CAST(ua.PositiveScoreAnswers AS REAL) / ua.AnswerCount
+        ELSE 0
+      END AS AnswerAcceptanceRate,
+      CASE
+        WHEN ua.Reputation < 1000 THEN 'Novice'
+        WHEN ua.Reputation BETWEEN 1000 AND 10000 THEN 'Intermediate'
+        ELSE 'Expert'
+      END AS ReputationLevel,
+      -- Simulate a complex calculation involving NULLs and string manipulation
+      COALESCE(ua.DisplayName, 'Anonymous') || ' (' || ua.UserId || ')' AS DisplayIdentifier,
+      DATE_PART('year', cast('2024-10-01 12:34:56' as timestamp)) - DATE_PART('year', ua.UserCreationDate) AS YearsSinceCreation
+    FROM UserActivity AS ua
+    LEFT JOIN HotQuestions AS hq
+      ON ua.UserId = hq.OwnerUserId
+  )
+SELECT
+  up.UserId,
+  up.DisplayName,
+  up.Reputation,
+  up.UserCreationDate,
+  up.QuestionCount,
+  up.AnswerCount,
+  up.PositiveScoreQuestions,
+  up.PositiveScoreAnswers,
+  up.BadgeCount,
+  up.LastQuestionDate,
+  up.LastAnswerDate,
+  up.AvgAnswerRankForUser,
+  up.UserHotQuestionRank,
+  up.AnswerAcceptanceRate,
+  up.ReputationLevel,
+  up.DisplayIdentifier,
+  up.YearsSinceCreation,
+  -- Combine with information about the user's most popular question
+  hq_top.Title AS TopQuestionTitle,
+  hq_top.Score AS TopQuestionScore,
+  hq_top.ViewCount AS TopQuestionViews,
+  hq_top.QuestionDate AS TopQuestionDate,
+  -- Use a set operator for demonstration
+  (
+    SELECT
+      COUNT(*)
+    FROM Comments AS c
+    WHERE
+      c.UserId = up.UserId AND c.CreationDate > (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days')
+  )
+  UNION ALL
+  (
+    SELECT
+      NULL,
+      NULL,
+      NULL,
+      NULL,
+      NULL,
+      NULL,
+      NULL,
+      NULL,
+      NULL,
+      NULL,
+      NULL,
+      NULL,
+      NULL,
+      NULL,
+      NULL,
+      NULL,
+      NULL,
+      COUNT(*)
+    FROM Votes AS v
+    WHERE
+      v.UserId = up.UserId AND v.VoteTypeId IN (2, 3) AND v.CreationDate > (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days')
+  ) AS RecentActivitySummary
+FROM UserPerformance AS up
+LEFT JOIN HotQuestions AS hq_top
+  ON up.UserId = hq_top.OwnerUserId AND hq_top.HotRank = 1
+WHERE
+  up.Reputation > 100 AND up.AnswerCount > 5
+ORDER BY
+  up.Reputation DESC,
+  up.AnswerAcceptanceRate DESC,
+  up.BadgeCount DESC;

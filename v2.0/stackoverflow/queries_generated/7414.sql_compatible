@@ -1,0 +1,193 @@
+WITH UserPerformanceStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.ViewCount,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        AVG(p.Score) as AvgPostScore,
+        MAX(p.CreationDate) as LastPostDate,
+        RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) as PostRank,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) as RepRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.ViewCount, u.UpVotes, u.DownVotes
+),
+TopTags AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as TagRank,
+        NTILE(10) OVER (ORDER BY t.Count DESC) as TagQuartile
+    FROM Tags t
+    WHERE t.Count > 100
+),
+RecentActivity AS (
+    SELECT 
+        ph.PostId,
+        ph.UserId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        ph.Comment,
+        ph.Text,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) as ActivityRank,
+        LAG(ph.PostHistoryTypeId) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) as PrevActivityType
+    FROM PostHistory ph
+    WHERE ph.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days')
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as PostType,
+        CASE 
+            WHEN p.Score > 100 THEN 'HighlyRated'
+            WHEN p.Score > 50 THEN 'ModeratelyRated'
+            WHEN p.Score > 0 THEN 'LowRated'
+            ELSE 'NoScore'
+        END as RatingCategory,
+        LENGTH(p.Body) as BodyLength,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND LENGTH(TRIM(p.Tags)) > 0 THEN array_length(string_to_array(SUBSTRING(p.Tags FROM 2 FOR (LENGTH(p.Tags)-2)), '><'), 1)
+            ELSE 0
+        END as TagCount,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'CommunityOwned'
+            WHEN p.PostTypeId = 2 AND p.ParentId IS NOT NULL THEN 'Answer'
+            ELSE 'Open'
+        END as StatusCategory,
+        (CAST('2024-10-01 12:34:56' AS timestamp) - p.CreationDate) / INTERVAL '1 day' AS AgeInDays,
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) as ScoreRankWithinType,
+        PERCENT_RANK() OVER (ORDER BY p.Score) as ScorePercentile
+    FROM Posts p
+    WHERE p.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years')
+),
+UserActivitySummary AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT v.Id) as VoteCount,
+        COUNT(DISTINCT ph.Id) as PostHistoryCount,
+        SUM(CASE WHEN v.VoteTypeId IN (2, 3) THEN 1 ELSE 0 END) as VoteActivity,
+        AVG(CASE WHEN c.Text IS NOT NULL THEN LENGTH(c.Text) ELSE 0 END) as AvgCommentLength
+    FROM Users u
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    WHERE u.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 years')
+    GROUP BY u.Id, u.DisplayName
+)
+SELECT
+    ups.UserId,
+    ups.DisplayName,
+    ups.Reputation,
+    ups.TotalPosts,
+    ups.QuestionCount,
+    ups.AnswerCount,
+    ups.BadgeCount,
+    ups.AvgPostScore,
+    ups.PostRank,
+    ups.RepRank,
+    COALESCE(ta.TagName, 'No Tags') as PrimaryTag,
+    ta.Count as TagCount,
+    ta.TagRank,
+    CASE 
+        WHEN ta.TagQuartile = 1 THEN 'Top Quartile'
+        WHEN ta.TagQuartile = 2 THEN 'Second Quartile'
+        WHEN ta.TagQuartile = 3 THEN 'Third Quartile'
+        ELSE 'Fourth Quartile'
+    END as TagPerformance,
+    pa.PostId,
+    pa.Title,
+    pa.Score,
+    pa.ViewCount,
+    pa.AnswerCount,
+    pa.CommentCount,
+    pa.PostType,
+    pa.RatingCategory,
+    pa.BodyLength,
+    pa.TagCount as PostTagCount,
+    pa.StatusCategory,
+    CAST(pa.AgeInDays AS INTEGER) as AgeInDays,
+    pa.ScoreRankWithinType,
+    pa.ScorePercentile,
+    COALESCE(uas.CommentCount, 0) as UserComments,
+    COALESCE(uas.VoteCount, 0) as UserVotes,
+    COALESCE(uas.PostHistoryCount, 0) as UserHistory,
+    CASE 
+        WHEN ups.TotalPosts > 50 AND ups.Reputation > 5000 THEN 'High Impact'
+        WHEN ups.TotalPosts > 20 AND ups.Reputation > 2000 THEN 'Medium Impact'
+        WHEN ups.TotalPosts > 5 AND ups.Reputation > 1000 THEN 'Low Impact'
+        ELSE 'Emerging'
+    END as UserImpactLevel,
+    CASE 
+        WHEN CAST(pa.AgeInDays AS INTEGER) <= 30 THEN 'New'
+        WHEN CAST(pa.AgeInDays AS INTEGER) <= 90 THEN 'Recent'
+        WHEN CAST(pa.AgeInDays AS INTEGER) <= 365 THEN 'Established'
+        ELSE 'Legacy'
+    END as PostAgeCategory,
+    CASE 
+        WHEN pa.Score >= 100 THEN 'Viral'
+        WHEN pa.Score >= 50 THEN 'Popular'
+        WHEN pa.Score >= 10 THEN 'Notable'
+        ELSE 'Minor'
+    END as PopularityLevel,
+    CONCAT(
+        'User ', ups.UserId::text, ' (', ups.DisplayName, ') - ', 
+        'Post ', pa.PostId::text, ': ', SUBSTRING(pa.Title FROM 1 FOR 50), '...'
+    ) as UserPostSummary,
+    CASE 
+        WHEN pa.PostType = 'Question' AND pa.AnswerCount > 0 THEN 'Answered'
+        WHEN pa.PostType = 'Question' AND pa.AnswerCount = 0 THEN 'Unanswered'
+        ELSE 'NotQuestion'
+    END as QuestionStatus,
+    COALESCE(pa.BodyLength, 0) + COALESCE(pa.TagCount, 0) + COALESCE(pa.Score, 0) as CompositeMetric,
+    CASE 
+        WHEN EXISTS (
+            SELECT 1 FROM RecentActivity ra 
+            WHERE ra.PostId = pa.PostId 
+            AND ra.ActivityRank = 1 
+            AND ra.PostHistoryTypeId = 10
+        ) THEN 'Recently Closed'
+        WHEN EXISTS (
+            SELECT 1 FROM RecentActivity ra 
+            WHERE ra.PostId = pa.PostId 
+            AND ra.ActivityRank = 1 
+            AND ra.PostHistoryTypeId = 12
+        ) THEN 'Recently Deleted'
+        ELSE 'Active'
+    END as RecentActivityStatus
+FROM UserPerformanceStats ups
+INNER JOIN PostAnalysis pa ON ups.UserId = pa.OwnerUserId
+LEFT JOIN TopTags ta ON ta.TagRank = 1
+LEFT JOIN UserActivitySummary uas ON ups.UserId = uas.UserId
+WHERE ups.TotalPosts >= 5
+    AND pa.PostType IN ('Question', 'Answer')
+    AND CAST(pa.AgeInDays AS INTEGER) <= 730
+    AND ups.RepRank <= 1000
+    AND pa.ScorePercentile > 0.05
+ORDER BY ups.TotalPosts DESC, pa.Score DESC, ups.Reputation DESC, pa.CreationDate DESC
+LIMIT 1000;

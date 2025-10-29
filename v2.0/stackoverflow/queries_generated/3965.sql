@@ -1,0 +1,181 @@
+-- {"query": "3965.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1709} 
+
+/*  Benchmark Query – massive mix of CTEs, window functions, outer joins, correlated subqueries,
+    set operators, string manipulation, and NULL handling                                            */
+WITH 
+-- 1️⃣  Users enriched with badge aggregates
+user_badge_stats AS (
+    SELECT 
+        u.Id               AS user_id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(b.Id)        AS total_badges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_badges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_badges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_badges,
+        COUNT(CASE WHEN b.TagBased = 1 THEN 1 END)   AS tag_based_badges
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+-- 2️⃣  Users enriched with vote aggregates (excluding vote types that are no longer stored)
+user_vote_stats AS (
+    SELECT 
+        v.UserId                AS user_id,
+        COUNT(*)                AS total_votes_cast,
+        SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS upvotes_cast,
+        SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS downvotes_cast,
+        SUM(CASE WHEN vt.Id = 8 THEN v.BountyAmount ELSE 0 END) AS bounty_started
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE v.UserId IS NOT NULL
+    GROUP BY v.UserId
+),
+
+-- 3️⃣  Latest activity per user (post edits, comments, votes) – using window function
+user_latest_activity AS (
+    SELECT 
+        ua.user_id,
+        MAX(ua.activity_ts) AS last_activity_ts
+    FROM (
+        SELECT 
+            OwnerUserId               AS user_id,
+            GREATEST(COALESCE(CreationDate, '1970-01-01'), 
+                     COALESCE(LastEditDate, '1970-01-01')) AS activity_ts
+        FROM Posts
+        WHERE OwnerUserId IS NOT NULL
+
+        UNION ALL
+
+        SELECT 
+            UserId                    AS user_id,
+            CreationDate               AS activity_ts
+        FROM Comments
+        WHERE UserId IS NOT NULL
+
+        UNION ALL
+
+        SELECT 
+            UserId                    AS user_id,
+            CreationDate               AS activity_ts
+        FROM Votes
+        WHERE UserId IS NOT NULL
+    ) ua
+    GROUP BY ua.user_id
+),
+
+-- 4️⃣  Question‑level metrics: answer score stats, duplicate counts, tag list handling
+question_metrics AS (
+    SELECT 
+        q.Id                                    AS question_id,
+        q.Title,
+        q.CreationDate,
+        q.Score                                 AS question_score,
+        q.ViewCount,
+        q.FavoriteCount,
+        q.AnswerCount,
+        COALESCE(q.Tags, '')                    AS raw_tags,
+        /* extract individual tags and count them via a lateral join */
+        (SELECT COUNT(*) 
+         FROM regexp_split_to_table(q.Tags, '[><]') AS t(tag)
+         WHERE t.tag <> '' )                    AS tag_count,
+        /* average answer score using a correlated sub‑query */
+        (SELECT AVG(a.Score)::numeric(10,2)
+         FROM Posts a
+         WHERE a.ParentId = q.Id AND a.PostTypeId = 2) AS avg_answer_score,
+        /* count how many times this question appears as a duplicate target */
+        (SELECT COUNT(*) 
+         FROM PostLinks pl
+         WHERE pl.RelatedPostId = q.Id AND pl.LinkTypeId = 3) AS duplicate_target_cnt,
+        /* recent close reason if the question is closed */
+        (SELECT CAST(ph.Comment AS int) 
+         FROM PostHistory ph
+         WHERE ph.PostId = q.Id 
+           AND ph.PostHistoryTypeId = 10   -- Post Closed
+         ORDER BY ph.CreationDate DESC
+         LIMIT 1)                               AS close_reason_id
+    FROM Posts q
+    WHERE q.PostTypeId = 1                     -- only questions
+),
+
+-- 5️⃣  Tag popularity with CTE for quick lookup
+popular_tags AS (
+    SELECT TagName, Count
+    FROM Tags
+    WHERE Count > 5000
+),
+
+-- 6️⃣  Combine question metrics with tag popularity (outer join) and compute a ranking score
+question_rankings AS (
+    SELECT 
+        qm.question_id,
+        qm.Title,
+        qm.question_score,
+        qm.ViewCount,
+        qm.FavoriteCount,
+        qm.AnswerCount,
+        qm.tag_count,
+        qm.avg_answer_score,
+        qm.duplicate_target_cnt,
+        COALESCE(cr.Name, 'None')               AS close_reason,
+        /* ranking formula mixing several dimensions */
+        (qm.question_score * 1.5
+         + LOG(1 + qm.ViewCount) * 2
+         + COALESCE(qm.FavoriteCount,0) * 3
+         + COALESCE(qm.AnswerCount,0) * 1.2
+         + COALESCE(qm.avg_answer_score,0) * 2
+         - COALESCE(qm.duplicate_target_cnt,0) * 5
+         - CASE WHEN qm.close_reason_id IS NOT NULL THEN 10 ELSE 0 END) 
+         AS ranking_score
+    FROM question_metrics qm
+    LEFT JOIN CloseReasonTypes cr ON cr.Id = qm.close_reason_id
+)
+
+SELECT 
+    ubs.user_id,
+    ubs.DisplayName,
+    ubs.Reputation,
+    ubs.total_badges,
+    ubs.gold_badges,
+    ubs.silver_badges,
+    ubs.bronze_badges,
+    uvs.total_votes_cast,
+    uvs.upvotes_cast,
+    uvs.downvotes_cast,
+    uvs.bounty_started,
+    ula.last_activity_ts,
+    qr.question_id,
+    qr.Title,
+    qr.ranking_score,
+    CASE 
+        WHEN qr.ranking_score > 1000 THEN 'Hot'
+        WHEN qr.ranking_score > 500  THEN 'Warm'
+        ELSE 'Cold'
+    END AS popularity_bucket,
+    /* string aggregation of top 3 tags per question */
+    (SELECT STRING_AGG(t.TagName, ', ') 
+     FROM regexp_split_to_table(qr.Title, '[><]') AS split(tag)
+     JOIN Tags t ON t.TagName = split.tag
+     WHERE t.Count > 1000
+     ORDER BY t.Count DESC
+     LIMIT 3) AS top_tags
+FROM user_badge_stats ubs
+LEFT JOIN user_vote_stats uvs   ON uvs.user_id = ubs.user_id
+LEFT JOIN user_latest_activity ula ON ula.user_id = ubs.user_id
+LEFT JOIN LATERAL (
+    SELECT *
+    FROM question_rankings qr
+    WHERE qr.question_id IN (
+        SELECT p.Id
+        FROM Posts p
+        WHERE p.OwnerUserId = ubs.user_id
+          AND p.PostTypeId IN (1,2)   -- questions & answers
+        ORDER BY p.CreationDate DESC
+        LIMIT 5
+    )
+    ORDER BY qr.ranking_score DESC
+    LIMIT 1
+) qr ON TRUE
+ORDER BY ubs.Reputation DESC, qr.ranking_score DESC NULLS LAST
+LIMIT 100;

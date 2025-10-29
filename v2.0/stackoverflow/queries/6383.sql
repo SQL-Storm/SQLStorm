@@ -1,0 +1,69 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.Title,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        U.DisplayName,
+        U.Reputation,
+        P.LastActivityDate,
+        P.OwnerUserId,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.ViewCount DESC) AS rnk
+    FROM 
+        Posts P
+    JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId IN (1, 2) AND P.Score > 0
+),
+BadgeCounts AS (
+    SELECT 
+        U.Id,
+        COUNT(B.Id) AS BadgeCount
+    FROM 
+        Users U
+    JOIN 
+        Badges B ON U.Id = B.UserId
+    GROUP BY 
+        U.Id
+),
+RecentVotes AS (
+    SELECT 
+        V.PostId,
+        V.UserId,
+        V.CreationDate,
+        V.VoteTypeId,
+        U.DisplayName AS VoterName
+    FROM 
+        Votes V
+    JOIN 
+        Users U ON V.UserId = U.Id
+    WHERE 
+        V.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 month'
+)
+SELECT 
+    RP.Id,
+    RP.Title,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.DisplayName,
+    RP.Reputation,
+    RP.LastActivityDate,
+    BC.BadgeCount,
+    COUNT(DISTINCT RV.UserId) AS RecentVoters,
+    MAX(CASE WHEN RV.VoteTypeId = 2 THEN RV.CreationDate END) AS LastUpVote,
+    MIN(CASE WHEN RV.VoteTypeId = 3 THEN RV.CreationDate END) AS LastDownVote
+FROM 
+    RankedPosts RP
+LEFT JOIN 
+    BadgeCounts BC ON RP.OwnerUserId = BC.Id
+LEFT JOIN 
+    RecentVotes RV ON RP.Id = RV.PostId
+WHERE 
+    RP.rnk <= 10
+GROUP BY 
+    RP.Id, RP.Title, RP.Score, RP.ViewCount, RP.CreationDate, RP.DisplayName, RP.Reputation, RP.LastActivityDate, RP.OwnerUserId, BC.BadgeCount, RP.rnk
+ORDER BY 
+    RP.Score DESC, RP.ViewCount DESC;

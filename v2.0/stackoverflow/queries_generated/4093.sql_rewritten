@@ -1,0 +1,188 @@
+-- {"query": "4093.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1749} 
+WITH
+  RecentQuestions AS (
+    SELECT
+      p.Id AS QuestionId,
+      p.Title,
+      p.OwnerUserId,
+      p.CreationDate AS QuestionCreationDate,
+      p.AnswerCount,
+      p.Score AS QuestionScore,
+      ROW_NUMBER() OVER (
+        ORDER BY
+          p.CreationDate DESC
+      ) AS rn
+    FROM Posts AS p
+    WHERE
+      p.PostTypeId = 1
+      AND p.CreationDate >= DATE('now', '-30 day')
+  ),
+  TopAnswers AS (
+    SELECT
+      p.Id AS AnswerId,
+      p.ParentId AS QuestionId,
+      p.OwnerUserId,
+      p.CreationDate AS AnswerCreationDate,
+      p.Score AS AnswerScore,
+      RANK() OVER (
+        PARTITION BY
+          p.ParentId
+        ORDER BY
+          p.Score DESC,
+          p.CreationDate ASC
+      ) AS rank_num
+    FROM Posts AS p
+    WHERE
+      p.PostTypeId = 2
+  ),
+  QuestionAnswerStats AS (
+    SELECT
+      rq.QuestionId,
+      rq.Title,
+      rq.OwnerUserId AS QuestionOwnerUserId,
+      rq.QuestionCreationDate,
+      rq.AnswerCount,
+      rq.QuestionScore,
+      MAX(ta.AnswerScore) AS MaxAnswerScore,
+      AVG(ta.AnswerScore) AS AvgAnswerScore,
+      SUM(CASE WHEN ta.AnswerScore > 0 THEN 1 ELSE 0 END) AS PositiveAnswerCount,
+      COUNT(ta.AnswerId) AS TotalAnswerCount
+    FROM RecentQuestions AS rq
+    LEFT JOIN TopAnswers AS ta
+      ON rq.QuestionId = ta.QuestionId
+    WHERE
+      rq.rn <= 100
+    GROUP BY
+      rq.QuestionId,
+      rq.Title,
+      rq.OwnerUserId,
+      rq.QuestionCreationDate,
+      rq.AnswerCount,
+      rq.QuestionScore
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      COUNT(DISTINCT c.Id) AS CommentCount,
+      COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS UpVoteCount,
+      COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS DownVoteCount,
+      (
+        SELECT
+          COUNT(*)
+        FROM Badges AS b
+        WHERE
+          b.UserId = u.Id
+          AND b.Class = 1 /* Gold Badge */
+      ) AS GoldBadgeCount,
+      (
+        SELECT
+          COUNT(*)
+        FROM Badges AS b
+        WHERE
+          b.UserId = u.Id
+          AND b.Class = 2 /* Silver Badge */
+      ) AS SilverBadgeCount,
+      (
+        SELECT
+          COUNT(*)
+        FROM Badges AS b
+        WHERE
+          b.UserId = u.Id
+          AND b.Class = 3 /* Bronze Badge */
+      ) AS BronzeBadgeCount
+    FROM Users AS u
+    LEFT JOIN Comments AS c
+      ON u.Id = c.UserId
+    LEFT JOIN Votes AS v
+      ON u.Id = v.UserId
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation
+  ),
+  PostVoteSummary AS (
+    SELECT
+      p.Id AS PostId,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotes,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotes,
+      COUNT(DISTINCT CASE WHEN v.VoteTypeId = 5 THEN v.Id END) AS FavoriteCount
+    FROM Posts AS p
+    JOIN Votes AS v
+      ON p.Id = v.PostId
+    GROUP BY
+      p.Id
+  )
+SELECT
+  qas.QuestionId,
+  qas.Title AS QuestionTitle,
+  ua_q.DisplayName AS QuestionOwnerDisplayName,
+  ua_q.Reputation AS QuestionOwnerReputation,
+  ua_q.GoldBadgeCount AS QuestionOwnerGoldBadges,
+  qas.QuestionCreationDate,
+  qas.QuestionScore,
+  qas.AnswerCount,
+  qas.MaxAnswerScore,
+  qas.AvgAnswerScore,
+  qas.PositiveAnswerCount,
+  pvs.TotalUpVotes AS QuestionTotalUpVotes,
+  pvs.TotalDownVotes AS QuestionTotalDownVotes,
+  pvs.FavoriteCount AS QuestionFavoriteCount,
+  COUNT(DISTINCT ph.Id) AS PostHistoryEntryCount,
+  COALESCE(MAX(CASE WHEN ph.PostHistoryTypeId IN (4, 5) THEN ph.Comment ELSE NULL END), 'No Edit Comment') AS LatestEditComment,
+  SUM(CASE WHEN ph.PostHistoryTypeId IN (10, 11) THEN 1 ELSE 0 END) AS CloseReopenEvents,
+  AVG(
+    CASE
+      WHEN ua_a.UserId IS NOT NULL THEN ua_a.Reputation
+      ELSE 0
+    END
+  ) AS AvgAnswererReputation,
+  STRING_AGG(DISTINCT tag.TagName, ', ') AS Tags,
+  (
+    SELECT
+      COUNT(*)
+    FROM PostLinks AS pl
+    WHERE
+      pl.PostId = qas.QuestionId
+      AND pl.LinkTypeId = 3 /* Duplicate Link Type */
+  ) AS DuplicateLinkCount
+FROM QuestionAnswerStats AS qas
+JOIN UserActivity AS ua_q
+  ON qas.QuestionOwnerUserId = ua_q.UserId
+LEFT JOIN PostVoteSummary AS pvs
+  ON qas.QuestionId = pvs.PostId
+LEFT JOIN PostHistory AS ph
+  ON qas.QuestionId = ph.PostId
+  AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 24, 35, 36, 50, 52, 53, 66)
+LEFT JOIN Posts AS p_tags
+  ON qas.QuestionId = p_tags.Id
+LEFT JOIN UNNEST(STRING_TO_ARRAY(REPLACE(REPLACE(p_tags.Tags, '<', ''), '>', ''), '')) AS tag_name(TagName)
+LEFT JOIN Tags AS tag
+  ON tag.TagName = tag_name.TagName
+LEFT JOIN TopAnswers AS ta_for_avg_user
+  ON qas.QuestionId = ta_for_avg_user.QuestionId
+LEFT JOIN UserActivity AS ua_a
+  ON ta_for_avg_user.OwnerUserId = ua_a.UserId
+GROUP BY
+  qas.QuestionId,
+  qas.Title,
+  ua_q.DisplayName,
+  ua_q.Reputation,
+  ua_q.GoldBadgeCount,
+  qas.QuestionCreationDate,
+  qas.QuestionScore,
+  qas.AnswerCount,
+  qas.MaxAnswerScore,
+  qas.AvgAnswerScore,
+  qas.PositiveAnswerCount,
+  pvs.TotalUpVotes,
+  pvs.TotalDownVotes,
+  pvs.FavoriteCount
+HAVING
+  qas.QuestionScore > 10
+  AND qas.AvgAnswerScore IS NOT NULL
+ORDER BY
+  qas.QuestionScore DESC,
+  qas.QuestionCreationDate DESC
+LIMIT 50;

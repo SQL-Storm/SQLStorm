@@ -1,0 +1,159 @@
+with recursive RecursiveTagHierarchy as (
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        array[t.TagName] as TagPath
+    from Tags t
+    where not t.IsModeratorOnly = true
+
+    union all
+
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.TagPath || t.TagName
+    from Tags t
+    join RecursiveTagHierarchy r on t.Count < r.Count and t.Id <> r.Id
+    where not t.IsModeratorOnly = true and array_length(r.TagPath,1) < 3
+),
+UserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        count(p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        sum(p.Score) filter (where p.PostTypeId in (1,2)) as TotalPostScore,
+        coalesce(sum(v.UpVotes),0) as TotalUpVotes,
+        coalesce(sum(v.DownVotes),0) as TotalDownVotes,
+        coalesce(max(b.Date), timestamp '1970-01-01') as LastBadgeDate,
+        count(distinct b.Id) as BadgeCount
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join (
+        select 
+            UserId, 
+            sum(case when VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+            sum(case when VoteTypeId = 3 then 1 else 0 end) as DownVotes
+        from Votes
+        group by UserId
+    ) v on v.UserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, v.UpVotes, v.DownVotes
+),
+RankedPosts as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        row_number() over(partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc) as RankByScore,
+        dense_rank() over(order by p.Score desc, p.ViewCount desc) as GlobalRank
+    from Posts p
+    where p.PostTypeId in (1,2)
+),
+TopRankedPosts as (
+    select * 
+    from RankedPosts
+    where RankByScore <= 3
+),
+QuestionsWithAcceptedAnswerInfo as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViews,
+        a.Id as AcceptedAnswerId,
+        a.OwnerUserId as AcceptedAnswerUserId,
+        a.Score as AcceptedAnswerScore,
+        (select count(*) from Comments c where c.PostId = q.Id and c.CreationDate > q.CreationDate) as CommentCountAfterQuestion,
+        case when a.CreationDate is not null then extract(epoch from (a.CreationDate - q.CreationDate))/60 else null end as MinutesToAccept
+    from Posts q
+    left join Posts a on a.Id = q.AcceptedAnswerId
+    where q.PostTypeId = 1
+),
+ComplexLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.LinkTypeId,
+        lt.Name as LinkTypeName,
+        p1.Title as PostTitle,
+        p2.Title as RelatedPostTitle,
+        case 
+            when pl.LinkTypeId = 3 then 'Duplicate' 
+            when pl.LinkTypeId = 1 then 'Linked' 
+            else 'Other' 
+        end as LinkCategory,
+        row_number() over(partition by pl.PostId order by pl.CreationDate desc) as LinkRank
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    join Posts p1 on p1.Id = pl.PostId
+    join Posts p2 on p2.Id = pl.RelatedPostId
+),
+FinalAggregation as (
+    select
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.TotalPostScore,
+        ua.TotalUpVotes,
+        ua.TotalDownVotes,
+        ua.BadgeCount,
+        ua.LastBadgeDate,
+        coalesce(max(tq.QuestionScore), 0) as MaxQuestionScore,
+        coalesce(avg(tq.MinutesToAccept), 0) as AvgMinutesToAcceptAnswer,
+        count(distinct fp.Id) as TopPostsCount,
+        count(distinct cl.RelatedPostId) filter (where cl.LinkCategory = 'Duplicate') as DuplicateLinksCount,
+        count(distinct cl.RelatedPostId) filter (where cl.LinkCategory = 'Linked') as LinkedPostsCount
+    from UserActivity ua
+    left join QuestionsWithAcceptedAnswerInfo tq on tq.AcceptedAnswerUserId = ua.UserId
+    left join TopRankedPosts fp on fp.OwnerUserId = ua.UserId
+    left join ComplexLinks cl on cl.PostId = fp.Id
+    group by ua.UserId, ua.DisplayName, ua.Reputation, ua.QuestionCount, ua.AnswerCount, ua.TotalPostScore, ua.TotalUpVotes, ua.TotalDownVotes, ua.BadgeCount, ua.LastBadgeDate
+)
+select
+    fa.UserId,
+    fa.DisplayName,
+    fa.Reputation,
+    fa.QuestionCount,
+    fa.AnswerCount,
+    fa.TotalPostScore,
+    fa.TotalUpVotes,
+    fa.TotalDownVotes,
+    fa.BadgeCount,
+    fa.LastBadgeDate,
+    fa.MaxQuestionScore,
+    fa.AvgMinutesToAcceptAnswer,
+    fa.TopPostsCount,
+    fa.DuplicateLinksCount,
+    fa.LinkedPostsCount,
+    string_agg(distinct rh.TagName, ', ' order by rh.Count desc) as PopularTagsPath,
+    case 
+        when fa.Reputation >= 20000 then 'Legend'
+        when fa.Reputation >= 10000 then 'Expert'
+        when fa.Reputation >= 5000 then 'Contributor'
+        else 'Newbie'
+    end as UserClassification
+from FinalAggregation fa
+left join RecursiveTagHierarchy rh on rh.TagName = any(
+    string_to_array(
+        coalesce(
+            (select p.Tags from Posts p where p.OwnerUserId = fa.UserId and p.PostTypeId = 1 limit 1),
+            ''
+        ),
+        '><'
+    )
+)
+group by fa.UserId, fa.DisplayName, fa.Reputation, fa.QuestionCount, fa.AnswerCount, fa.TotalPostScore, fa.TotalUpVotes, fa.TotalDownVotes, fa.BadgeCount, fa.LastBadgeDate, fa.MaxQuestionScore, fa.AvgMinutesToAcceptAnswer, fa.TopPostsCount, fa.DuplicateLinksCount, fa.LinkedPostsCount
+order by fa.Reputation desc, fa.TotalPostScore desc
+limit 50;

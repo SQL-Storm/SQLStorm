@@ -1,0 +1,154 @@
+WITH RECURSIVE
+post_latest AS (
+    SELECT p.Id                              AS PostId,
+           COALESCE(MAX(ph.CreationDate), p.CreationDate) AS LastChangeDate,
+           p.PostTypeId,
+           p.OwnerUserId,
+           p.Title,
+           p.Tags,
+           p.Score,
+           p.ViewCount,
+           p.FavoriteCount,
+           p.AcceptedAnswerId,
+           p.ParentId,
+           p.CreationDate
+    FROM   Posts p
+    LEFT JOIN PostHistory ph
+           ON ph.PostId = p.Id
+          AND ph.PostHistoryTypeId IN (4,5,6)
+    GROUP BY p.Id, p.PostTypeId, p.OwnerUserId, p.Title,
+             p.Tags, p.Score, p.ViewCount,
+             p.FavoriteCount, p.AcceptedAnswerId, p.ParentId,
+             p.CreationDate
+),
+
+post_votes AS (
+    SELECT v.PostId,
+           SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+           SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+           SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS Favorites,
+           COUNT(*)                                            AS TotalVotes
+    FROM   Votes v
+    GROUP BY v.PostId
+),
+
+post_tags AS (
+    SELECT pl.PostId,
+           TRIM(t)                AS Tag,
+           ROW_NUMBER() OVER (PARTITION BY pl.PostId ORDER BY t) AS TagSeq
+    FROM   post_latest pl,
+           LATERAL regexp_split_to_table(
+               NULLIF(pl.Tags, ''),
+               '<[^>]+>'
+           ) AS t
+),
+
+user_badges AS (
+    SELECT u.Id                     AS UserId,
+           COUNT(b.Id)              AS BadgeCount,
+           SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+           SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+           SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+           STRING_AGG(DISTINCT b.Name, ', ')           AS BadgeNames
+    FROM   Users u
+    LEFT   JOIN Badges b ON b.UserId = u.Id
+    GROUP  BY u.Id
+),
+
+user_recent_activity AS (
+    SELECT pl.OwnerUserId                               AS UserId,
+           COUNT(*)                                     AS RecentPosts,
+           COUNT(CASE WHEN pl.PostTypeId = 1 THEN 1 END) AS RecentQuestions,
+           COUNT(CASE WHEN pl.PostTypeId = 2 THEN 1 END) AS RecentAnswers,
+           MAX(pl.LastChangeDate)                       AS LastActivityDate
+    FROM   post_latest pl
+    WHERE  pl.LastChangeDate >= (CAST('2024-10-01' AS date) - INTERVAL '30 days')
+    GROUP  BY pl.OwnerUserId
+),
+
+user_activity AS (
+    SELECT u.Id                                   AS UserId,
+           u.DisplayName,
+           COALESCE(ub.BadgeCount,0)              AS TotalBadges,
+           COALESCE(ub.GoldBadges,0)              AS GoldBadges,
+           COALESCE(ub.SilverBadges,0)            AS SilverBadges,
+           COALESCE(ub.BronzeBadges,0)            AS BronzeBadges,
+           ub.BadgeNames,
+           COALESCE(ura.RecentPosts,0)            AS PostsLast30d,
+           COALESCE(ura.RecentQuestions,0)        AS QuestionsLast30d,
+           COALESCE(ura.RecentAnswers,0)          AS AnswersLast30d,
+           ura.LastActivityDate,
+           (SELECT COUNT(*)
+            FROM   Votes v
+            WHERE  v.UserId = u.Id
+            AND    v.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '30 days')
+            AND    v.VoteTypeId = 2)              AS UpVotesLast30d,
+           (SELECT COUNT(*)
+            FROM   Votes v
+            WHERE  v.UserId = u.Id
+            AND    v.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '30 days')
+            AND    v.VoteTypeId = 3)              AS DownVotesLast30d,
+           u.Reputation
+    FROM   Users u
+    LEFT   JOIN user_badges ub   ON ub.UserId = u.Id
+    LEFT   JOIN user_recent_activity ura ON ura.UserId = u.Id
+)
+
+SELECT UserId,
+       DisplayName,
+       TotalBadges,
+       GoldBadges,
+       SilverBadges,
+       BronzeBadges,
+       BadgeNames,
+       PostsLast30d,
+       QuestionsLast30d,
+       AnswersLast30d,
+       LastActivityDate,
+       UpVotesLast30d,
+       DownVotesLast30d,
+       Reputation
+FROM   user_activity
+WHERE  TotalBadges > 0
+   OR  PostsLast30d > 5
+   OR  Reputation > 1000
+ORDER BY GoldBadges DESC, SilverBadges DESC, BronzeBadges DESC,
+         PostsLast30d DESC
+LIMIT  100
+
+UNION ALL
+
+SELECT
+       CAST(NULL AS INTEGER)            AS UserId,
+       CAST(NULL AS VARCHAR(40))        AS DisplayName,
+       0                                AS TotalBadges,
+       0                                AS GoldBadges,
+       0                                AS SilverBadges,
+       0                                AS BronzeBadges,
+       CAST(NULL AS TEXT)               AS BadgeNames,
+       0                                AS PostsLast30d,
+       0                                AS QuestionsLast30d,
+       0                                AS AnswersLast30d,
+       CAST(NULL AS TIMESTAMP)          AS LastActivityDate,
+       0                                AS UpVotesLast30d,
+       0                                AS DownVotesLast30d,
+       pt.Tag                           AS BadgeNames_Tag,
+       pl.Title,
+       pl.Score,
+       pl.ViewCount,
+       pl.FavoriteCount,
+       rn.RankInTag
+FROM   post_latest pl
+JOIN   post_tags pt ON pt.PostId = pl.PostId
+JOIN (
+    SELECT pt_inner.PostId, pt_inner.Tag,
+           ROW_NUMBER() OVER (PARTITION BY pt_inner.Tag ORDER BY pl_inner.Score DESC) AS RankInTag
+    FROM post_tags pt_inner
+    JOIN post_latest pl_inner ON pl_inner.PostId = pt_inner.PostId
+    WHERE pl_inner.PostTypeId = 1
+      AND pl_inner.Score IS NOT NULL
+) rn ON rn.PostId = pl.PostId AND rn.Tag = pt.Tag
+WHERE  pl.PostTypeId = 1
+  AND  pl.Score IS NOT NULL
+  AND  rn.RankInTag <= 3
+ORDER BY pt.Tag, rn.RankInTag;

@@ -1,0 +1,234 @@
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        COALESCE(U.DisplayName, 'Anonymous User') AS UserDisplayName,
+        U.Reputation,
+        U.UpVotes AS TotalUpVotesGiven,
+        U.DownVotes AS TotalDownVotesGiven,
+        U.Views AS UserProfileViews,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - U.CreationDate)) / (60 * 60 * 24) AS AccountAgeDays,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsOwned,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersOwned,
+        COALESCE(SUM(P.Score), 0) AS TotalPostsScore,
+        COALESCE(AVG(P.Score) FILTER (WHERE P.Score IS NOT NULL), 0.0) AS AvgPostScoreOwned,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT B.Id) AS TotalBadgesEarned,
+        ROW_NUMBER() OVER (ORDER BY U.Reputation DESC, U.CreationDate ASC) AS GlobalReputationRank
+    FROM
+        Users U
+    LEFT JOIN
+        Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN
+        Comments C ON U.Id = C.UserId
+    LEFT JOIN
+        Badges B ON U.Id = B.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.UpVotes, U.DownVotes, U.Views, U.CreationDate
+),
+PostContentMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        COALESCE(P.Title, '[Untitled Post]') AS PostTitle,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.CreationDate AS PostCreationDate,
+        P.LastActivityDate AS PostLastActivityDate,
+        LENGTH(P.Body) AS BodyLength,
+        LENGTH(P.Title) AS TitleLength,
+        CASE
+            WHEN P.Tags IS NOT NULL AND LENGTH(TRIM(P.Tags)) > 2 THEN
+                ARRAY_LENGTH(STRING_TO_ARRAY(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><'), 1)
+            ELSE 0
+        END AS TagCount,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - P.LastEditDate)) / (60 * 60 * 24) AS DaysSinceLastEdit,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - P.CreationDate)) / (60 * 60 * 24) AS PostAgeDays,
+        COALESCE(P.AnswerCount, 0) AS DeclaredAnswerCount,
+        COALESCE(P.CommentCount, 0) AS DeclaredCommentCount,
+        COALESCE(P.FavoriteCount, 0) AS DeclaredFavoriteCount,
+        (SELECT COUNT(DISTINCT PH.Id) FROM PostHistory PH WHERE PH.PostId = P.Id AND PH.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9)) AS TotalEditHistoryEntries,
+        (CASE WHEN P.Body ILIKE '%performance%' OR P.Body ILIKE '%optimization%' THEN 1 ELSE 0 END) AS HasPerformanceKeywords,
+        (CASE WHEN P.Body ILIKE '%bug%' OR P.Body ILIKE '%error%' OR P.Body ILIKE '%issue%' THEN 1 ELSE 0 END) AS HasProblemKeywords,
+        (CASE WHEN P.Body LIKE '%<code>%' AND P.Body LIKE '%</code>%' THEN 1 ELSE 0 END) AS HasCodeBlock
+    FROM
+        Posts P
+    WHERE
+        P.PostTypeId IN (1, 2)
+),
+PostEngagementAndModeration AS (
+    SELECT
+        P.Id AS PostId,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteTotal,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteTotal,
+        SUM(CASE WHEN V.VoteTypeId = 1 THEN 1 ELSE 0 END) AS AcceptedAnswerMarkCount,
+        SUM(CASE WHEN V.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoriteVoteTotal,
+        SUM(CASE WHEN V.VoteTypeId = 6 THEN 1 ELSE 0 END) AS CloseVoteTotal,
+        SUM(CASE WHEN V.VoteTypeId = 7 THEN 1 ELSE 0 END) AS ReopenVoteTotal,
+        SUM(CASE WHEN V.VoteTypeId = 12 THEN 1 ELSE 0 END) AS SpamVoteTotal,
+        (SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) - SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END)) AS NetVotes,
+        MAX(CASE WHEN EXISTS (SELECT 1 FROM PostHistory PH WHERE PH.PostId = P.Id AND PH.PostHistoryTypeId = 10) THEN 1 ELSE 0 END) AS WasEverClosed,
+        MAX(CASE WHEN EXISTS (
+            SELECT 1 FROM PostHistory PHC JOIN CloseReasonTypes CRT ON CAST(PHC.Comment AS SMALLINT) = CRT.Id
+            WHERE PHC.PostId = P.Id AND PHC.PostHistoryTypeId = 10 AND CRT.Name IN ('Duplicate', 'Off-topic', 'Needs details or clarity')
+        ) THEN 1 ELSE 0 END) AS ClosedForSpecificReason
+    FROM
+        Posts P
+    LEFT JOIN
+        Votes V ON P.Id = V.PostId
+    WHERE P.PostTypeId IN (1, 2)
+    GROUP BY
+        P.Id
+),
+PostLinkSummary AS (
+    SELECT
+        P.Id AS PostId,
+        COUNT(DISTINCT PL_Out.RelatedPostId) FILTER (WHERE PL_Out.LinkTypeId = 1) AS OutgoingLinksCount,
+        COUNT(DISTINCT PL_In.PostId) FILTER (WHERE PL_In.LinkTypeId = 1) AS IncomingLinksCount,
+        COUNT(DISTINCT PL_Out.RelatedPostId) FILTER (WHERE PL_Out.LinkTypeId = 3) AS DuplicateLinksCount,
+        COUNT(DISTINCT PL_In.PostId) FILTER (WHERE PL_In.LinkTypeId = 3) AS DuplicatedByCount
+    FROM
+        Posts P
+    LEFT JOIN
+        PostLinks PL_Out ON P.Id = PL_Out.PostId
+    LEFT JOIN
+        PostLinks PL_In ON P.Id = PL_In.RelatedPostId
+    WHERE P.PostTypeId IN (1, 2)
+    GROUP BY
+        P.Id
+),
+PostCommentActivity AS (
+    SELECT
+        P.Id AS PostId,
+        COUNT(C.Id) AS TotalCommentsActual,
+        COALESCE(AVG(C.Score), 0.0) AS AvgCommentScore,
+        SUM(CASE WHEN C.Text ILIKE '%thank%' OR C.Text ILIKE '%appreciate%' OR C.Text ILIKE '%useful%' THEN 1 ELSE 0 END) AS PositiveCommentCount,
+        SUM(CASE WHEN C.Text ILIKE '%confusing%' OR C.Text ILIKE '%incorrect%' OR C.Text ILIKE '%clarify%' THEN 1 ELSE 0 END) AS NegativeCommentCount,
+        MAX(C.CreationDate) AS LastCommentDate
+    FROM
+        Posts P
+    LEFT JOIN
+        Comments C ON P.Id = C.PostId
+    WHERE P.PostTypeId IN (1, 2)
+    GROUP BY
+        P.Id
+),
+PostTypeRankings AS (
+    SELECT
+        PCM.PostId,
+        PCM.PostTypeId,
+        PCM.PostScore,
+        PCM.ViewCount,
+        PCM.PostCreationDate,
+        PCM.PostLastActivityDate,
+        PCM.DeclaredAnswerCount,
+        PCM.DeclaredCommentCount,
+        PCM.BodyLength,
+        RANK() OVER (PARTITION BY PCM.PostTypeId ORDER BY PCM.PostScore DESC, PCM.ViewCount DESC, PCM.PostCreationDate DESC) AS RankByScoreAndViews,
+        NTILE(10) OVER (PARTITION BY PCM.PostTypeId ORDER BY PCM.PostLastActivityDate DESC, PCM.PostScore DESC) AS ActivityDecile,
+        AVG(PCM.DeclaredAnswerCount) OVER (PARTITION BY PCM.PostTypeId) AS AvgAnswerCountForType,
+        CUME_DIST() OVER (PARTITION BY PCM.PostTypeId ORDER BY PCM.BodyLength DESC) AS BodyLengthCumeDist
+    FROM
+        PostContentMetrics PCM
+),
+HighEngagementPosts AS (
+    SELECT
+        PTR.PostId,
+        PTR.PostTypeId,
+        'High Score & Answer Count' AS EngagementType
+    FROM
+        PostTypeRankings PTR
+    WHERE
+        PTR.PostTypeId = 1
+        AND PTR.PostScore >= (SELECT AVG(PostScore) * 2 FROM PostContentMetrics WHERE PostTypeId = 1)
+        AND PTR.DeclaredAnswerCount >= (SELECT AVG(DeclaredAnswerCount) * 1.5 FROM PostContentMetrics WHERE PostTypeId = 1)
+    UNION ALL
+    SELECT
+        PTR.PostId,
+        PTR.PostTypeId,
+        'High Score & Comment Count' AS EngagementType
+    FROM
+        PostTypeRankings PTR
+    WHERE
+        PTR.PostTypeId = 1
+        AND PTR.PostScore >= (SELECT AVG(PostScore) * 2 FROM PostContentMetrics WHERE PostTypeId = 1)
+        AND PTR.DeclaredCommentCount >= (SELECT AVG(DeclaredCommentCount) * 1.5 FROM PostContentMetrics WHERE PostTypeId = 1)
+)
+SELECT
+    UAS.UserId,
+    UAS.UserDisplayName,
+    UAS.Reputation,
+    PCM.PostId,
+    PCM.PostTitle,
+    PT.Name AS PostTypeName,
+    PCM.PostScore,
+    PCM.ViewCount,
+    PCE.UpVoteTotal,
+    PCE.DownVoteTotal,
+    PCE.NetVotes,
+    PCE.WasEverClosed,
+    PCE.ClosedForSpecificReason,
+    PLS.OutgoingLinksCount,
+    PLS.IncomingLinksCount,
+    PLS.DuplicateLinksCount,
+    PCA.TotalCommentsActual,
+    PCA.AvgCommentScore,
+    PCA.PositiveCommentCount,
+    PCA.NegativeCommentCount,
+    PTR.RankByScoreAndViews,
+    PTR.ActivityDecile,
+    PCM.HasPerformanceKeywords,
+    PCM.HasProblemKeywords,
+    PCM.HasCodeBlock,
+    HE.EngagementType,
+    (CAST(PCM.PostScore AS NUMERIC) * (PCE.NetVotes + 1) + (PCA.TotalCommentsActual * PCA.AvgCommentScore * 1.5) + (PLS.IncomingLinksCount * 5) + (PCM.DeclaredFavoriteCount * 2) + (PCM.TotalEditHistoryEntries * 0.5)) /
+    NULLIF(POWER(PCM.PostAgeDays + 1, 0.75) * POWER(NULLIF(PCM.BodyLength, 0), 0.3) * POWER(NULLIF(PCM.TagCount, 0), 0.1), 0) AS WeightedEngagementScore,
+    COALESCE(
+        SUBSTRING(PCM.PostTitle, 1, GREATEST(15, LEAST(LENGTH(PCM.PostTitle), 50))) || CASE WHEN LENGTH(PCM.PostTitle) > 50 THEN '...' ELSE '' END,
+        'Title Unavailable'
+    ) AS TitleSnippet,
+    CASE
+        WHEN PCE.NetVotes > 50 AND PCE.WasEverClosed = 0 AND PCM.PostAgeDays < 365 AND PCM.HasCodeBlock = 1 AND PCM.PostTypeId = 1 THEN 'Popular & Clean Code Question'
+        WHEN PCE.NetVotes <= 0 AND PCE.WasEverClosed = 1 AND PCM.PostTypeId = 1 AND PCE.ClosedForSpecificReason = 1 THEN 'Controversial/Problematic Question (Closed)'
+        WHEN UAS.TotalQuestionsOwned > 100 AND UAS.AvgPostScoreOwned > 10 AND UAS.GlobalReputationRank <= 1000 THEN 'Top Contributor''s Valued Post'
+        WHEN PCM.PostTypeId = 2 AND PCE.AcceptedAnswerMarkCount > 0 AND PCM.PostScore > 5 THEN 'Highly Accepted Answer'
+        ELSE 'General Engaged Post'
+    END AS PostCategorization
+FROM
+    PostContentMetrics PCM
+INNER JOIN
+    UserActivitySummary UAS ON PCM.OwnerUserId = UAS.UserId
+INNER JOIN
+    PostEngagementAndModeration PCE ON PCM.PostId = PCE.PostId
+INNER JOIN
+    PostLinkSummary PLS ON PCM.PostId = PLS.PostId
+INNER JOIN
+    PostCommentActivity PCA ON PCM.PostId = PCA.PostId
+INNER JOIN
+    PostTypeRankings PTR ON PCM.PostId = PTR.PostId
+INNER JOIN
+    PostTypes PT ON PCM.PostTypeId = PT.Id
+LEFT JOIN
+    HighEngagementPosts HE ON PCM.PostId = HE.PostId AND PCM.PostTypeId = HE.PostTypeId
+WHERE
+    UAS.Reputation > 1500
+    AND PCM.ViewCount > 1000
+    AND PCM.PostAgeDays BETWEEN 60 AND 1095
+    AND (
+        (PCM.PostTypeId = 1 AND PTR.RankByScoreAndViews <= 50 AND PCM.HasProblemKeywords = 0)
+        OR
+        (PCM.PostTypeId = 2 AND PTR.ActivityDecile <= 2 AND PCA.AvgCommentScore > 0.5)
+    )
+    AND NOT EXISTS (
+        SELECT 1
+        FROM PostHistory PH_Del
+        WHERE PH_Del.PostId = PCM.PostId AND PH_Del.PostHistoryTypeId = 12
+        AND PH_Del.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days'
+    )
+    AND PCM.PostTitle IS NOT NULL AND LENGTH(TRIM(PCM.PostTitle)) > 10
+ORDER BY
+    WeightedEngagementScore DESC,
+    UAS.Reputation DESC,
+    PCM.PostLastActivityDate DESC
+LIMIT 750;

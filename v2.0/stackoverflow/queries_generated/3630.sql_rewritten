@@ -1,0 +1,110 @@
+-- {"query": "3630.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2406} 
+WITH BadgeCounts AS (
+    SELECT
+        UserId,
+        SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END)        AS GoldBadges,
+        SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END)        AS SilverBadges,
+        SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END)        AS BronzeBadges,
+        COUNT(*)                                          AS TotalBadges
+    FROM Badges
+    GROUP BY UserId
+),
+PostMetrics AS (
+    SELECT
+        OwnerUserId                                      AS UserId,
+        COUNT(*) FILTER (WHERE PostTypeId = 1)           AS Questions,
+        COUNT(*) FILTER (WHERE PostTypeId = 2)           AS Answers,
+        SUM(Score) FILTER (WHERE PostTypeId = 1)         AS QuestionScoreSum,
+        SUM(Score) FILTER (WHERE PostTypeId = 2)         AS AnswerScoreSum,
+        MAX(CreationDate)                               AS LastPostDate
+    FROM Posts
+    GROUP BY OwnerUserId
+),
+VoteMetrics AS (
+    SELECT
+        p.OwnerUserId                                    AS UserId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived,
+        MAX(v.CreationDate)                               AS LastVoteDate
+    FROM Votes v
+    JOIN Posts p ON v.PostId = p.Id
+    GROUP BY p.OwnerUserId
+),
+RecentCommentActivity AS (
+    SELECT
+        u.Id                                            AS UserId,
+        MAX(c.CreationDate)                             AS LastCommentDate,
+        STRING_AGG(DISTINCT LEFT(c.Text, 30), '; ')     AS RecentCommentSnippets
+    FROM Users u
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    GROUP BY u.Id
+),
+UserScore AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        /* composite scoring formula */
+        COALESCE(bc.GoldBadges,0)   * 100 +
+        COALESCE(bc.SilverBadges,0) * 50  +
+        COALESCE(bc.BronzeBadges,0) * 20  +
+        COALESCE(pm.Questions,0)    * 5   +
+        COALESCE(pm.Answers,0)      * 10  +
+        COALESCE(pm.QuestionScoreSum,0) * 2 +
+        COALESCE(pm.AnswerScoreSum,0)   * 3 +
+        COALESCE(vm.UpVotesReceived,0)  * 1 -
+        COALESCE(vm.DownVotesReceived,0)* 1        AS CompositeScore,
+        GREATEST(
+            COALESCE(pm.LastPostDate, TIMESTAMP '1970-01-01'),
+            COALESCE(vm.LastVoteDate, TIMESTAMP '1970-01-01'),
+            COALESCE(rca.LastCommentDate, TIMESTAMP '1970-01-01')
+        )                                            AS LastActivity,
+        rca.RecentCommentSnippets
+    FROM Users u
+    LEFT JOIN BadgeCounts   bc  ON u.Id = bc.UserId
+    LEFT JOIN PostMetrics   pm  ON u.Id = pm.UserId
+    LEFT JOIN VoteMetrics   vm  ON u.Id = vm.UserId
+    LEFT JOIN RecentCommentActivity rca ON u.Id = rca.UserId
+    WHERE u.Reputation > 1000
+),
+RankedUsers AS (
+    SELECT
+        *,
+        ROW_NUMBER() OVER (ORDER BY CompositeScore DESC, LastActivity DESC) AS Rank
+    FROM UserScore
+)
+/* first result set – top users */
+SELECT
+    Rank,
+    Id,
+    DisplayName,
+    Reputation,
+    CompositeScore,
+    LastActivity,
+    COALESCE(RecentCommentSnippets, 'No recent comments') AS CommentsSnapshot
+FROM RankedUsers
+WHERE Rank <= 20
+UNION ALL
+/* second result set – tag popularity with sample titles (set operator) */
+SELECT
+    NULL AS Rank,
+    t.Id,
+    t.TagName,
+    NULL AS Reputation,
+    t.Count * 10            AS CompositeScore,
+    NULL AS LastActivity,
+    STRING_AGG(p.Title, '; ') FILTER (WHERE p.Title IS NOT NULL) AS SampleTitles
+FROM Tags t
+LEFT JOIN Posts p
+      ON p.Id = t.ExcerptPostId OR p.Id = t.WikiPostId
+/* correlated subquery counting linked posts for each tag's wiki/excerpt */
+CROSS JOIN LATERAL (
+    SELECT COUNT(*) AS cnt
+    FROM PostLinks pl
+    WHERE (pl.PostId = t.ExcerptPostId OR pl.PostId = t.WikiPostId)
+      AND pl.LinkTypeId = 1
+) lc
+WHERE t.Count > 5000
+GROUP BY t.Id, t.TagName, t.Count
+ORDER BY CompositeScore DESC
+LIMIT 30;

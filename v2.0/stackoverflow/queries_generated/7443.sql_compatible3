@@ -1,0 +1,323 @@
+WITH PostStats AS (
+    SELECT 
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.ParentId,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PrevScore,
+        LAG(p.ViewCount) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PrevViewCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PostRank,
+        CASE 
+            WHEN p.Score > 100 THEN 'High'
+            WHEN p.Score > 50 THEN 'Medium'
+            ELSE 'Low'
+        END as ScoreCategory,
+        COALESCE(p.Tags, '') as CleanTags
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserActivity AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT ps.PostId) as TotalPosts,
+        SUM(CASE WHEN ps.PostTypeId = 1 THEN 1 ELSE 0 END) as QuestionCount,
+        SUM(CASE WHEN ps.PostTypeId = 2 THEN 1 ELSE 0 END) as AnswerCount,
+        SUM(ps.Score) as TotalScore,
+        AVG(ps.Score) as AvgScore,
+        MAX(ps.CreationDate) as LastPostDate,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        STRING_AGG(DISTINCT b.Name, ', ') as BadgesEarned
+    FROM Users u
+    LEFT JOIN PostStats ps ON ps.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Reputation > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            ELSE 'Niche'
+        END as TagPopularity,
+        COALESCE((SELECT COUNT(*) FROM Posts p WHERE POSITION('<' || t.TagName || '>' IN COALESCE(p.Tags, '')) > 0), 0) as PostsWithTag
+    FROM Tags t
+    WHERE t.Count > 0
+),
+PostTrends AS (
+    SELECT 
+        ps.PostId,
+        ps.OwnerUserId,
+        ps.Score,
+        ps.ViewCount,
+        ps.AnswerCount,
+        ps.CommentCount,
+        ps.FavoriteCount,
+        ps.ScoreCategory,
+        ps.PostRank,
+        ps.CreationDate,
+        CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - ps.CreationDate)) / 86400 AS INTEGER) as DaysSinceCreation,
+        CASE 
+            WHEN ps.PostRank > 1 THEN (ps.Score - ps.PrevScore) / NULLIF(ps.PrevScore, 0) * 100
+            ELSE 0
+        END as ScoreGrowthPercent,
+        CASE 
+            WHEN ps.PostRank > 1 THEN (ps.ViewCount - ps.PrevViewCount) / NULLIF(ps.PrevViewCount, 0) * 100
+            ELSE 0
+        END as ViewGrowthPercent,
+        CASE 
+            WHEN ps.AnswerCount > 0 THEN ps.Score / NULLIF(ps.AnswerCount, 0)
+            ELSE 0
+        END as ScorePerAnswer,
+        CASE 
+            WHEN ps.CommentCount > 0 THEN ps.Score / NULLIF(ps.CommentCount, 0)
+            ELSE 0
+        END as ScorePerComment,
+        CASE 
+            WHEN ps.ViewCount > 0 THEN ps.Score / NULLIF(ps.ViewCount, 0) * 1000
+            ELSE 0
+        END as ScorePerThousandViews
+    FROM PostStats ps
+),
+QualifiedPosts AS (
+    SELECT 
+        pt.PostId,
+        pt.OwnerUserId,
+        pt.Score,
+        pt.ViewCount,
+        pt.AnswerCount,
+        pt.CommentCount,
+        pt.FavoriteCount,
+        pt.ScoreCategory,
+        pt.ScoreGrowthPercent,
+        pt.ViewGrowthPercent,
+        pt.ScorePerAnswer,
+        pt.ScorePerComment,
+        pt.ScorePerThousandViews,
+        pt.DaysSinceCreation,
+        CASE 
+            WHEN pt.Score > 50 AND pt.AnswerCount > 0 THEN 'HighQuality'
+            WHEN pt.Score > 25 AND pt.ViewCount > 100 THEN 'ModerateQuality'
+            ELSE 'LowQuality'
+        END as QualityLevel,
+        RANK() OVER (ORDER BY pt.Score DESC) as ScoreRank,
+        RANK() OVER (ORDER BY pt.ViewCount DESC) as ViewRank
+    FROM PostTrends pt
+    WHERE pt.Score > 0
+),
+DetailedScores AS (
+    SELECT 
+        qp.PostId,
+        qp.OwnerUserId,
+        qp.Score,
+        qp.ViewCount,
+        qp.AnswerCount,
+        qp.CommentCount,
+        qp.FavoriteCount,
+        qp.ScoreCategory,
+        qp.ScoreGrowthPercent,
+        qp.ViewGrowthPercent,
+        qp.ScorePerAnswer,
+        qp.ScorePerComment,
+        qp.ScorePerThousandViews,
+        qp.DaysSinceCreation,
+        qp.QualityLevel,
+        qp.ScoreRank,
+        qp.ViewRank,
+        CASE 
+            WHEN qp.ScoreRank <= 100 THEN 'Top100'
+            WHEN qp.ScoreRank <= 1000 THEN 'Top1000'
+            ELSE 'Other'
+        END as ScoreTier,
+        COALESCE((SELECT COUNT(*) FROM Votes v WHERE v.PostId = qp.PostId AND v.VoteTypeId = 2), 0) as Upvotes,
+        COALESCE((SELECT COUNT(*) FROM Votes v WHERE v.PostId = qp.PostId AND v.VoteTypeId = 3), 0) as Downvotes,
+        COALESCE((SELECT COUNT(*) FROM Comments c WHERE c.PostId = qp.PostId), 0) as CommentCount,
+        CASE 
+            WHEN qp.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'AboveAve'
+            ELSE 'BelowAve'
+        END as ScoreComparison
+    FROM QualifiedPosts qp
+),
+FinalAnalysis AS (
+    SELECT 
+        ds.PostId,
+        ds.OwnerUserId,
+        ds.Score,
+        ds.ViewCount,
+        ds.AnswerCount,
+        ds.CommentCount,
+        ds.FavoriteCount,
+        ds.ScoreCategory,
+        ds.ScoreGrowthPercent,
+        ds.ViewGrowthPercent,
+        ds.ScorePerAnswer,
+        ds.ScorePerComment,
+        ds.ScorePerThousandViews,
+        ds.DaysSinceCreation,
+        ds.QualityLevel,
+        ds.ScoreRank,
+        ds.ViewRank,
+        ds.ScoreTier,
+        ds.Upvotes,
+        ds.Downvotes,
+        ds.CommentCount as CommentCountFinal,
+        ds.ScoreComparison,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.TotalPosts,
+        ua.QuestionCount,
+        ua.AnswerCount as UserAnswerCount,
+        ua.TotalScore,
+        ua.AvgScore,
+        ta.TagName,
+        ta.TagCount,
+        ta.TagPopularity,
+        CASE 
+            WHEN ds.OwnerUserId IS NOT NULL THEN 
+                (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = ds.OwnerUserId AND p.CreationDate >= DATE '2020-01-01')
+            ELSE 0 
+        END as RecentPostsIn2020,
+        CASE 
+            WHEN ds.OwnerUserId IS NOT NULL THEN 
+                (SELECT COUNT(*) FROM Votes v WHERE v.UserId = ds.OwnerUserId AND v.CreationDate >= DATE '2020-01-01')
+            ELSE 0 
+        END as RecentVotesIn2020,
+        CASE 
+            WHEN ds.OwnerUserId IS NOT NULL THEN 
+                (SELECT COUNT(DISTINCT p.Id) FROM Posts p INNER JOIN Votes v ON v.PostId = p.Id WHERE p.OwnerUserId = ds.OwnerUserId AND v.UserId = ds.OwnerUserId)
+            ELSE 0 
+        END as SelfVotes,
+        CASE 
+            WHEN ds.Score > 0 THEN 
+                (SELECT COALESCE(SUM(v.BountyAmount), 0) FROM Votes v WHERE v.PostId = ds.PostId AND v.VoteTypeId = 8)
+            ELSE 0 
+        END as TotalBountyAmount,
+        COALESCE(ds.CleanTags, '') as CleanTags
+    FROM DetailedScores ds
+    LEFT JOIN UserActivity ua ON ua.UserId = ds.OwnerUserId
+    LEFT JOIN TagAnalysis ta ON POSITION('<' || ta.TagName || '>' IN COALESCE(ds.CleanTags, '')) > 0
+    WHERE ds.Score > 0 AND ds.ViewCount > 0
+)
+SELECT 
+    fa.PostId,
+    fa.OwnerUserId,
+    fa.Score,
+    fa.ViewCount,
+    fa.AnswerCount,
+    fa.CommentCountFinal,
+    fa.FavoriteCount,
+    fa.ScoreCategory,
+    fa.ScoreGrowthPercent,
+    fa.ViewGrowthPercent,
+    fa.ScorePerAnswer,
+    fa.ScorePerComment,
+    fa.ScorePerThousandViews,
+    fa.DaysSinceCreation,
+    fa.QualityLevel,
+    fa.ScoreRank,
+    fa.ViewRank,
+    fa.ScoreTier,
+    fa.Upvotes,
+    fa.Downvotes,
+    fa.ScoreComparison,
+    fa.DisplayName,
+    fa.Reputation,
+    fa.TotalPosts,
+    fa.QuestionCount,
+    fa.UserAnswerCount,
+    fa.TotalScore,
+    fa.AvgScore,
+    fa.TagName,
+    fa.TagCount,
+    fa.TagPopularity,
+    fa.RecentPostsIn2020,
+    fa.RecentVotesIn2020,
+    fa.SelfVotes,
+    fa.TotalBountyAmount,
+    CASE 
+        WHEN fa.Reputation > 10000 THEN 'Expert'
+        WHEN fa.Reputation > 1000 THEN 'Advanced'
+        WHEN fa.Reputation > 100 THEN 'Intermediate'
+        ELSE 'Beginner'
+    END as UserLevel,
+    CASE 
+        WHEN fa.ScorePerThousandViews > 0.5 THEN 'HighEngagement'
+        WHEN fa.ScorePerThousandViews > 0.1 THEN 'MediumEngagement'
+        ELSE 'LowEngagement'
+    END as EngagementLevel,
+    CASE 
+        WHEN fa.Score > fa.AvgScore * 1.5 THEN 'AboveAvgScore'
+        WHEN fa.Score < fa.AvgScore * 0.5 THEN 'BelowAvgScore'
+        ELSE 'AvgScore'
+    END as PerformanceLevel,
+    NULLIF(fa.ScoreGrowthPercent, 0) as NullSafeGrowthPercent,
+    NULLIF(fa.ViewGrowthPercent, 0) as NullSafeViewGrowthPercent,
+    CASE WHEN fa.TagName IS NOT NULL THEN 1 ELSE 0 END as HasTag,
+    CASE WHEN fa.DisplayName IS NOT NULL THEN 1 ELSE 0 END as HasDisplayName,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = fa.OwnerUserId) as UserPostCount,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = fa.OwnerUserId) as UserBadgeCount,
+    (SELECT STRING_AGG(b.Name, ', ') FROM Badges b WHERE b.UserId = fa.OwnerUserId) as UserBadges,
+    TIMESTAMP '2024-10-01 12:34:56' as AnalysisTimestamp,
+    ROUND((fa.Reputation * 1.0 / NULLIF(fa.TotalPosts, 0)), 2) as ReputationPerPost,
+    ROUND((fa.TotalScore * 1.0 / NULLIF(fa.TotalPosts, 0)), 2) as ScorePerPost,
+    ROUND(GREATEST(CAST(fa.Score AS DOUBLE PRECISION) - (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1), 0), 2) as ScoreAboveAverage,
+    ROUND(LEAST(CAST(fa.Score AS DOUBLE PRECISION) - (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1), 0), 2) as ScoreBelowAverage,
+    CASE 
+        WHEN fa.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) * 2 THEN 
+            (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) * 2)
+        ELSE 0
+    END as TopPostCount,
+    CASE 
+        WHEN fa.Score > 0 AND fa.AnswerCount > 0 THEN fa.Score * fa.AnswerCount 
+        ELSE 0 
+    END as ScoreAnswerProduct,
+    CASE 
+        WHEN fa.QuestionCount > 0 THEN CAST(fa.AnswerCount AS DOUBLE PRECISION) / NULLIF(fa.QuestionCount, 0)
+        ELSE 0 
+    END as AnswerRatio,
+    CASE 
+        WHEN fa.Reputation > 0 THEN CAST(fa.UserAnswerCount AS DOUBLE PRECISION) / NULLIF(fa.Reputation, 0) * 1000
+        ELSE 0 
+    END as AnswersPerThousandRep,
+    STRING_AGG(fa.TagName, '; ') as AllTags,
+    ROW_NUMBER() OVER (ORDER BY fa.Score DESC) as OverallRank,
+    RANK() OVER (ORDER BY fa.ViewCount DESC) as ViewRankOverall,
+    DENSE_RANK() OVER (ORDER BY fa.Reputation DESC) as ReputationRank,
+    NTILE(4) OVER (ORDER BY fa.Score DESC) as ScoreQuartile
+FROM FinalAnalysis fa
+GROUP BY 
+    fa.PostId, fa.OwnerUserId, fa.Score, fa.ViewCount, fa.AnswerCount, fa.CommentCountFinal, fa.FavoriteCount,
+    fa.ScoreCategory, fa.ScoreGrowthPercent, fa.ViewGrowthPercent, fa.ScorePerAnswer, fa.ScorePerComment,
+    fa.ScorePerThousandViews, fa.DaysSinceCreation, fa.QualityLevel, fa.ScoreRank, fa.ViewRank, fa.ScoreTier,
+    fa.Upvotes, fa.Downvotes, fa.ScoreComparison, fa.DisplayName, fa.Reputation, fa.TotalPosts, fa.QuestionCount,
+    fa.UserAnswerCount, fa.TotalScore, fa.AvgScore, fa.TagName, fa.TagCount, fa.TagPopularity,
+    fa.RecentPostsIn2020, fa.RecentVotesIn2020, fa.SelfVotes, fa.TotalBountyAmount
+HAVING 
+    fa.Score > 0 
+    AND (fa.ViewCount > 10 OR fa.AnswerCount > 0)
+    AND fa.DisplayName IS NOT NULL
+    AND fa.Reputation > 50
+    AND fa.ScorePerThousandViews > 0.01
+ORDER BY 
+    fa.Score DESC,
+    fa.ViewCount DESC,
+    fa.AnswerCount DESC,
+    fa.CommentCountFinal DESC
+FETCH FIRST 1000 ROWS ONLY;

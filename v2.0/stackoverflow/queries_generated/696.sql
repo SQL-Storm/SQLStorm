@@ -1,0 +1,374 @@
+-- {"query": "696.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3269} 
+with
+q as (
+  select
+    p.Id as QuestionId,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate as QuestionCreation,
+    p.Score as QuestionScore,
+    p.ViewCount,
+    p.Tags,
+    p.AcceptedAnswerId,
+    coalesce(p.AnswerCount, 0) as AnswerCount
+  from Posts p
+  where p.PostTypeId = 1
+),
+a as (
+  select
+    a.ParentId as QuestionId,
+    a.Id as AnswerId,
+    a.OwnerUserId as AnswerOwnerId,
+    a.CreationDate as AnswerCreation,
+    a.Score as AnswerScore
+  from Posts a
+  where a.PostTypeId = 2
+),
+first_answer as (
+  select
+    a.QuestionId,
+    a.AnswerId,
+    a.AnswerOwnerId,
+    a.AnswerCreation,
+    a.AnswerScore,
+    row_number() over (partition by a.QuestionId order by a.AnswerCreation asc, a.AnswerId asc) as rn
+  from a
+),
+agg_answers as (
+  select
+    a.QuestionId,
+    count(*) as total_answers,
+    sum(case when a.AnswerScore > 0 then 1 else 0 end) as pos_answers,
+    avg(a.AnswerScore::numeric) as avg_answer_score,
+    max(a.AnswerScore) as max_answer_score,
+    min(a.AnswerScore) as min_answer_score
+  from a
+  group by a.QuestionId
+),
+recent_comments as (
+  select
+    c.PostId,
+    count(*) filter (where c.Score > 0) as positive_comments,
+    max(c.CreationDate) as last_comment_at
+  from Comments c
+  where c.CreationDate >= now() - interval '365 days'
+  group by c.PostId
+),
+vote_summaries as (
+  select
+    v.PostId,
+    sum(case when v.VoteTypeId = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.VoteTypeId = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.VoteTypeId = 5 then 1 else 0 end) as favorites,
+    sum(case when v.VoteTypeId in (8,9) then coalesce(v.BountyAmount,0) else 0 end) as bounty_total
+  from Votes v
+  where v.CreationDate >= now() - interval '3 years'
+  group by v.PostId
+),
+user_stats as (
+  select
+    u.Id as UserId,
+    u.Reputation,
+    u.UpVotes,
+    u.DownVotes,
+    u.Views,
+    u.CreationDate as UserCreated,
+    coalesce(nullif(trim(u.Location), ''), 'Unknown') as LocationNorm,
+    case when u.WebsiteUrl ilike '%github%' then 1 else 0 end as HasGithub
+  from Users u
+),
+close_events as (
+  select
+    ph.PostId,
+    min(ph.CreationDate) as first_closed_at,
+    count(*) as close_events
+  from PostHistory ph
+  where ph.PostHistoryTypeId in (10,35) -- closed or migrated away
+  group by ph.PostId
+),
+duplicate_links as (
+  select
+    pl.PostId as DuplicateOfId,
+    count(*) as duplicate_count
+  from PostLinks pl
+  where pl.LinkTypeId = 3
+  group by pl.PostId
+),
+tag_explode as (
+  select
+    q.QuestionId,
+    unnest(string_to_array(substring(q.Tags, 2, length(q.Tags)-2), '><')) as tag
+  from q
+  where q.Tags is not null
+),
+tag_density as (
+  select
+    QuestionId,
+    count(*) as tag_count,
+    string_agg(tag, ',' order by tag) as tags_csv,
+    max(case when tag ilike '%sql%' then 1 else 0 end) as has_sql_tag
+  from tag_explode
+  group by QuestionId
+),
+accepted_answer_lag as (
+  select
+    q.QuestionId,
+    q.AcceptedAnswerId,
+    qa.CreationDate as AcceptedCreation,
+    extract(epoch from (qa.CreationDate - q.CreationDate))/3600.0 as hours_to_accept
+  from q
+  join Posts qa on qa.Id = q.AcceptedAnswerId
+),
+hot_bump as (
+  select
+    ph.PostId,
+    max(ph.CreationDate) as last_bump
+  from PostHistory ph
+  where ph.PostHistoryTypeId in (50,52)
+  group by ph.PostId
+),
+ranked_questions as (
+  select
+    q.QuestionId,
+    q.Title,
+    q.OwnerUserId,
+    q.QuestionCreation,
+    q.QuestionScore,
+    q.ViewCount,
+    q.AnswerCount,
+    td.tag_count,
+    td.tags_csv,
+    td.has_sql_tag,
+    vs.upvotes,
+    vs.downvotes,
+    vs.favorites,
+    vs.bounty_total,
+    rc.positive_comments,
+    rc.last_comment_at,
+    ce.first_closed_at,
+    ce.close_events,
+    dl.duplicate_count,
+    aa.hours_to_accept,
+    hb.last_bump,
+    -- composite interest score using a blend of signals, guarding NULLs
+    (
+      coalesce(q.QuestionScore,0)*2
+      + coalesce(vs.upvotes,0)*1.5
+      - coalesce(vs.downvotes,0)*1.0
+      + least(coalesce(q.ViewCount,0)/100.0, 50)
+      + coalesce(vs.favorites,0)*2.0
+      + coalesce(td.tag_count,0)*0.5
+      + case when coalesce(td.has_sql_tag,0)=1 then 5 else 0 end
+      + case when ce.first_closed_at is null then 3 else -5 end
+      + case when hb.last_bump is not null then 2 else 0 end
+      - coalesce(dl.duplicate_count,0)*3
+      + coalesce(rc.positive_comments,0)*0.75
+      + coalesce(vs.bounty_total,0)/100.0
+      + case
+          when aa.hours_to_accept is null then 0
+          when aa.hours_to_accept <= 1 then 5
+          when aa.hours_to_accept <= 24 then 3
+          when aa.hours_to_accept <= 72 then 1
+          else 0
+        end
+    ) as interest_score
+  from q
+  left join tag_density td on td.QuestionId = q.QuestionId
+  left join vote_summaries vs on vs.PostId = q.QuestionId
+  left join recent_comments rc on rc.PostId = q.QuestionId
+  left join close_events ce on ce.PostId = q.QuestionId
+  left join duplicate_links dl on dl.DuplicateOfId = q.QuestionId
+  left join accepted_answer_lag aa on aa.QuestionId = q.QuestionId
+  left join hot_bump hb on hb.PostId = q.QuestionId
+),
+owner_enriched as (
+  select
+    rq.*,
+    us.Reputation as OwnerRep,
+    us.UpVotes as OwnerUpVotes,
+    us.DownVotes as OwnerDownVotes,
+    us.Views as OwnerProfileViews,
+    us.UserCreated as OwnerCreated,
+    us.LocationNorm as OwnerLocation,
+    us.HasGithub as OwnerHasGithub
+  from ranked_questions rq
+  left join user_stats us on us.UserId = rq.OwnerUserId
+),
+first_answer_join as (
+  select
+    fa.QuestionId,
+    fa.AnswerId as FirstAnswerId,
+    fa.AnswerOwnerId as FirstAnswerOwnerId,
+    fa.AnswerCreation as FirstAnswerCreation,
+    fa.AnswerScore as FirstAnswerScore
+  from first_answer fa
+  where fa.rn = 1
+),
+answerer_enriched as (
+  select
+    o.*,
+    faj.FirstAnswerId,
+    faj.FirstAnswerOwnerId,
+    faj.FirstAnswerCreation,
+    faj.FirstAnswerScore,
+    u2.Reputation as FirstAnswererRep,
+    u2.UpVotes as FirstAnswererUpVotes,
+    u2.DownVotes as FirstAnswererDownVotes,
+    u2.LocationNorm as FirstAnswererLocation
+  from owner_enriched o
+  left join first_answer_join faj on faj.QuestionId = o.QuestionId
+  left join user_stats u2 on u2.UserId = faj.FirstAnswerOwnerId
+),
+outlier_flags as (
+  select
+    ae.*,
+    case when ae.ViewCount > percentile_disc(0.99) within group (order by ae.ViewCount) over () then 1 else 0 end as is_view_outlier,
+    case when ae.QuestionScore < percentile_disc(0.01) within group (order by ae.QuestionScore) over () then 1 else 0 end as is_bad_score_outlier
+  from answerer_enriched ae
+),
+ranked as (
+  select
+    ofl.*,
+    dense_rank() over (order by ofl.interest_score desc nulls last, ofl.ViewCount desc nulls last) as interest_rank,
+    row_number() over (order by coalesce(ofl.hours_to_accept, 1e9) asc) as fastest_accept_rank,
+    ntile(10) over (order by ofl.ViewCount desc nulls last) as view_ntile
+  from outlier_flags ofl
+),
+recent_vs_old as (
+  select
+    r.*,
+    case when r.QuestionCreation >= now() - interval '30 days' then 'recent'
+         when r.QuestionCreation >= now() - interval '365 days' then 'mid'
+         else 'old'
+    end as recency_bucket
+  from ranked r
+),
+badge_counts as (
+  select
+    b.UserId,
+    sum(case when b.Class = 1 then 1 else 0 end) as gold_badges,
+    sum(case when b.Class = 2 then 1 else 0 end) as silver_badges,
+    sum(case when b.Class = 3 then 1 else 0 end) as bronze_badges,
+    sum(case when b.TagBased = 1 then 1 else 0 end) as tag_badges
+  from Badges b
+  group by b.UserId
+),
+final_enriched as (
+  select
+    ro.*,
+    coalesce(bc_owner.gold_badges,0) as owner_gold_badges,
+    coalesce(bc_owner.silver_badges,0) as owner_silver_badges,
+    coalesce(bc_owner.bronze_badges,0) as owner_bronze_badges,
+    coalesce(bc_owner.tag_badges,0) as owner_tag_badges,
+    coalesce(bc_ans.gold_badges,0) as first_answerer_gold_badges,
+    coalesce(bc_ans.silver_badges,0) as first_answerer_silver_badges,
+    coalesce(bc_ans.bronze_badges,0) as first_answerer_bronze_badges
+  from recent_vs_old ro
+  left join badge_counts bc_owner on bc_owner.UserId = ro.OwnerUserId
+  left join badge_counts bc_ans on bc_ans.UserId = ro.FirstAnswerOwnerId
+),
+question_similarity as (
+  select
+    fe1.QuestionId as q1,
+    fe2.QuestionId as q2,
+    -- simplistic similarity: overlap in tags and close creation time
+    (
+      case when fe1.tags_csv is not null and fe2.tags_csv is not null
+           then cardinality(
+                array(
+                  select unnest(string_to_array(fe1.tags_csv, ','))
+                  intersect
+                  select unnest(string_to_array(fe2.tags_csv, ','))
+                )
+           )
+           else 0 end
+    ) as tag_overlap,
+    abs(extract(epoch from (fe1.QuestionCreation - fe2.QuestionCreation))) as creation_secs_diff
+  from final_enriched fe1
+  join final_enriched fe2
+    on fe1.QuestionId < fe2.QuestionId
+),
+similar_pairs as (
+  select
+    q1, q2,
+    tag_overlap,
+    creation_secs_diff,
+    row_number() over (partition by q1 order by tag_overlap desc, creation_secs_diff asc) as rn
+  from question_similarity
+  where tag_overlap >= 2
+    and creation_secs_diff <= 60*60*24*30
+),
+top_similar as (
+  select sp.q1 as QuestionId, sp.q2 as SimilarQuestionId, sp.tag_overlap, sp.creation_secs_diff
+  from similar_pairs sp
+  where sp.rn <= 3
+),
+-- heavy predicate with null logic and string ops
+filtered as (
+  select
+    fe.*,
+    ts.SimilarQuestionId,
+    ts.tag_overlap as similar_tag_overlap
+  from final_enriched fe
+  left join top_similar ts on ts.QuestionId = fe.QuestionId
+  where
+    (
+      fe.has_sql_tag = 1
+      or (fe.tags_csv ilike any (array['%performance%','%postgres%','%mysql%','%sql-server%']))
+    )
+    and coalesce(fe.OwnerLocation, 'Unknown') not ilike '%test%'
+    and (fe.FirstAnswerId is null or fe.FirstAnswerScore <= fe.max_answer_score + 0) is not distinct from true
+    and (
+      fe.interest_score > 10
+      or (fe.ViewCount > 1000 and fe.AnswerCount >= 1)
+      or (fe.hours_to_accept is not null and fe.hours_to_accept <= 24)
+    )
+)
+select
+  f.QuestionId,
+  f.Title,
+  f.OwnerUserId,
+  f.OwnerRep,
+  f.OwnerLocation,
+  f.owner_gold_badges || '/' || f.owner_silver_badges || '/' || f.owner_bronze_badges as owner_badges_gsb,
+  f.FirstAnswerId,
+  f.FirstAnswerOwnerId,
+  f.FirstAnswererRep,
+  f.first_answerer_gold_badges || '/' || f.first_answerer_silver_badges || '/' || f.first_answerer_bronze_badges as answerer_badges_gsb,
+  f.QuestionCreation,
+  f.ViewCount,
+  f.QuestionScore,
+  f.AnswerCount,
+  f.tags_csv,
+  f.has_sql_tag,
+  f.interest_score,
+  f.interest_rank,
+  f.fastest_accept_rank,
+  f.view_ntile,
+  f.recency_bucket,
+  f.positive_comments,
+  f.last_comment_at,
+  f.upvotes,
+  f.downvotes,
+  f.favorites,
+  f.bounty_total,
+  f.first_closed_at,
+  f.close_events,
+  f.duplicate_count,
+  f.hours_to_accept,
+  f.is_view_outlier,
+  f.is_bad_score_outlier,
+  coalesce(f.SimilarQuestionId, -1) as SimilarQuestionId,
+  coalesce(f.similar_tag_overlap, 0) as similar_tag_overlap,
+  case
+    when f.first_closed_at is not null then 'closed'
+    when f.duplicate_count > 0 then 'duplicate'
+    else 'open'
+  end as status_label
+from filtered f
+qualify row_number() over (
+  partition by f.OwnerUserId
+  order by f.interest_score desc nulls last, f.ViewCount desc nulls last, f.QuestionId desc
+) <= 5
+order by f.interest_rank asc, f.QuestionId desc
+limit 500;

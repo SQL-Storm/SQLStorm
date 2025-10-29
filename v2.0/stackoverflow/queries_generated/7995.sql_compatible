@@ -1,0 +1,161 @@
+WITH PostStats AS (
+    SELECT 
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Title,
+        p.Tags,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END AS PostTypeDesc,
+        COALESCE(p.ViewCount, 0) + COALESCE(p.AnswerCount, 0) + COALESCE(p.CommentCount, 0) AS EngagementMetric,
+        CAST((EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate)) / 86400) AS INTEGER) AS AgeInDays
+    FROM Posts p
+    WHERE p.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years')
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.UpVotes,
+        u.DownVotes,
+        u.Views,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Elite'
+            WHEN u.Reputation > 1000 THEN 'Expert'
+            WHEN u.Reputation > 100 THEN 'Regular'
+            ELSE 'Newbie'
+        END AS ReputationTier
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes, u.Views
+    HAVING COUNT(DISTINCT p.Id) > 0
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            ELSE 'Niche'
+        END AS PopularityLevel,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank,
+        AVG(COALESCE(p.Score, 0)) AS AvgQuestionScore
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    WHERE p.PostTypeId = 1
+    GROUP BY t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId
+),
+TopPosts AS (
+    SELECT 
+        ps.PostId,
+        ps.Title,
+        ps.PostTypeDesc,
+        ps.OwnerUserId,
+        ps.Score,
+        ps.ViewCount,
+        ps.AnswerCount,
+        ps.CommentCount,
+        ps.FavoriteCount,
+        ps.AgeInDays,
+        ps.EngagementMetric,
+        RANK() OVER (ORDER BY ps.Score DESC, ps.ViewCount DESC) AS ScoreRank,
+        DENSE_RANK() OVER (ORDER BY ps.AgeInDays ASC) AS RecencyRank
+    FROM PostStats ps
+    WHERE ps.PostTypeDesc IN ('Question', 'Answer')
+),
+PostHistorySummary AS (
+    SELECT 
+        ph.PostId,
+        COUNT(*) AS EditCount,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (1, 2, 3) THEN 1 END) AS InitialEdits,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 END) AS EditType456,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN 1 END) AS StatusChanges,
+        STRING_AGG(ph.Comment, ', ') AS AllComments,
+        MAX(ph.CreationDate) AS LastEditDate
+    FROM PostHistory ph
+    WHERE ph.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '6 months')
+    GROUP BY ph.PostId
+)
+SELECT 
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.ReputationTier,
+    ua.PostCount,
+    ua.CommentCount,
+    ua.BadgeCount,
+    ua.AvgPostScore,
+    tp.Title AS TopPostTitle,
+    tp.Score AS TopPostScore,
+    tp.AnswerCount AS TopPostAnswers,
+    tp.CommentCount AS TopPostComments,
+    ta.TagName,
+    ta.TagCount,
+    ta.PopularityLevel,
+    ps.EditCount,
+    ps.InitialEdits,
+    CASE 
+        WHEN tp.ScoreRank <= 10 AND ta.TagCount > 500 THEN 'High Impact Author'
+        WHEN tp.ScoreRank <= 20 THEN 'Regular Contributor'
+        WHEN ua.PostCount >= 100 THEN 'Established User'
+        ELSE 'Active Participant'
+    END AS UserRole,
+    (CASE 
+        WHEN ua.Reputation > 5000 THEN 'Senior'
+        WHEN ua.Reputation > 1000 THEN 'Intermediate'
+        ELSE 'Junior'
+    END) || ' ' || (CASE 
+        WHEN tp.ScoreRank <= 10 THEN 'Top Scorer'
+        WHEN tp.ScoreRank <= 20 THEN 'Consistent Contributor'
+        ELSE 'Casual Poster'
+    END) AS UserClassification,
+    CASE 
+        WHEN ua.PostCount > 50 AND ua.Reputation > 1000 
+        AND tp.ScoreRank <= 10 THEN 'Elite Contributor'
+        WHEN ua.BadgeCount > 15 AND ua.Reputation > 2000 
+        AND ta.PopularityLevel = 'Popular' THEN 'Recognized Expert'
+        ELSE 'Standard Member'
+    END AS CommunityStatus,
+    COALESCE(tp.AgeInDays, 0) AS TopPostAgeDays,
+    COALESCE(ta.AvgQuestionScore, 0) AS AvgTagQuestionScore,
+    COALESCE(ua.Views, 0) + COALESCE(ua.UpVotes, 0) - COALESCE(ua.DownVotes, 0) AS NetActivityScore,
+    CONCAT('User ', ua.UserId, ' - ', ua.DisplayName, ' - ', ua.ReputationTier) AS UserIdentifier,
+    NULL AS NullCheckColumn,
+    (COALESCE(tp.Score, 0) * 0.3 + COALESCE(tp.ViewCount, 0) * 0.2 + COALESCE(tp.AnswerCount, 0) * 0.2 + COALESCE(tp.CommentCount, 0) * 0.1 + COALESCE(ta.TagCount, 0) * 0.2) AS CompositeScore
+FROM UserActivity ua
+LEFT OUTER JOIN TopPosts tp ON ua.UserId = tp.OwnerUserId
+LEFT JOIN TagAnalysis ta ON ta.TagRank = 1
+LEFT JOIN PostHistorySummary ps ON tp.PostId = ps.PostId
+WHERE ua.Reputation >= 100
+  AND ua.PostCount >= 5
+  AND ua.LastPostDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '12 months')
+  AND (
+    tp.ScoreRank <= 5 
+    OR ua.BadgeCount >= 10 
+    OR ta.TagCount > 250
+  )
+  AND NOT (COALESCE(tp.Score, 0) = 0 AND tp.AnswerCount = 0 AND tp.CommentCount = 0)
+ORDER BY ua.Reputation DESC, ua.PostCount DESC, tp.Score DESC
+LIMIT 50;

@@ -1,0 +1,145 @@
+WITH RecursiveUserBadges AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        b.Name AS BadgeName,
+        b.Class,
+        ROW_NUMBER() OVER(PARTITION BY u.Id ORDER BY b.Date DESC) AS BadgeRank,
+        COUNT(*) OVER(PARTITION BY u.Id) AS TotalBadges
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Reputation > 1000
+),
+FilteredPosts AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.AcceptedAnswerId,
+        COALESCE(p.Title, '[no title]') AS Title,
+        u.DisplayName AS OwnerName,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS PostRank
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId IN (1, 2) AND p.Score >= 0
+      AND p.CreationDate BETWEEN '2020-01-01' AND '2023-01-01'
+      AND (p.Tags LIKE '%<sql>%' OR p.Tags LIKE '%<performance>%')
+),
+AnswerCounts AS (
+    SELECT ParentId, COUNT(*) AS AnswerCount
+    FROM Posts
+    WHERE PostTypeId = 2
+    GROUP BY ParentId
+),
+UserActivityWindows AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        DATE_PART('year', AGE(u.LastAccessDate, u.CreationDate)) AS ActiveYears,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersCount,
+        SUM(p.Score) FILTER (WHERE p.PostTypeId IN (1,2)) AS TotalPostScore,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        NTILE(10) OVER (ORDER BY u.Reputation DESC) AS ReputationDecile
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+DuplicateLinks AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        COUNT(*) OVER (PARTITION BY pl.RelatedPostId) AS DuplicationCount,
+        ROW_NUMBER() OVER (PARTITION BY pl.PostId ORDER BY pl.CreationDate DESC) AS LinkRank
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 3
+),
+ComplexUserStats AS (
+    SELECT
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.ActiveYears,
+        ua.QuestionsCount,
+        ua.AnswersCount,
+        ua.TotalPostScore,
+        COALESCE(SUM(CASE WHEN vb.Class = 1 THEN 1 ELSE 0 END), 0) AS GoldBadges,
+        COALESCE(SUM(CASE WHEN vb.Class = 2 THEN 1 ELSE 0 END), 0) AS SilverBadges,
+        COALESCE(SUM(CASE WHEN vb.Class = 3 THEN 1 ELSE 0 END), 0) AS BronzeBadges,
+        MAX(ph.CreationDate) AS LastPostHistoryUpdate,
+        COUNT(DISTINCT ph.PostId) FILTER (WHERE ph.PostHistoryTypeId IN (10, 11)) AS CloseReopenCount
+    FROM UserActivityWindows ua
+    LEFT JOIN Badges vb ON vb.UserId = ua.UserId
+    LEFT JOIN PostHistory ph ON ph.UserId = ua.UserId
+    GROUP BY ua.UserId, ua.DisplayName, ua.Reputation, ua.ActiveYears, ua.QuestionsCount, ua.AnswersCount, ua.TotalPostScore
+),
+PostCorrelatedStats AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        ac.AnswerCount,
+        (
+            SELECT AVG(v.Score)
+            FROM Posts v
+            WHERE v.OwnerUserId = p.OwnerUserId
+              AND v.PostTypeId = 2
+              AND v.Score IS NOT NULL
+        ) AS AvgAnswerScore,
+        CASE
+            WHEN p.Tags IS NULL THEN 'NoTags'
+            ELSE (
+                SELECT STRING_AGG(DISTINCT LOWER(TRIM(tag)), ',')
+                FROM unnest(string_to_array(SUBSTRING(p.Tags FROM 2 FOR (LENGTH(p.Tags) - 2)), '><')) AS tag
+                WHERE tag <> ''
+            )
+        END AS NormalizedTags,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS OwnerPostRank,
+        p.AcceptedAnswerId
+    FROM Posts p
+    LEFT JOIN AnswerCounts ac ON ac.ParentId = p.Id
+    WHERE p.PostTypeId = 1
+)
+SELECT DISTINCT
+    pus.UserId,
+    pus.DisplayName,
+    pus.Reputation,
+    pus.ActiveYears,
+    pus.QuestionsCount,
+    pus.AnswersCount,
+    pus.GoldBadges,
+    pus.SilverBadges,
+    pus.BronzeBadges,
+    pus.LastPostHistoryUpdate,
+    pus.CloseReopenCount,
+    p.Id AS PostId,
+    p.Title AS PostTitle,
+    p.Score AS PostScore,
+    p.ViewCount AS PostViews,
+    p.AnswerCount,
+    p.AvgAnswerScore,
+    p.NormalizedTags,
+    CASE
+        WHEN p.AcceptedAnswerId IS NOT NULL THEN 'AcceptedAnswerExists'
+        ELSE 'NoAcceptedAnswer'
+    END AS AcceptanceStatus,
+    dl.DuplicationCount,
+    dl.LinkRank
+FROM ComplexUserStats pus
+JOIN PostCorrelatedStats p ON p.OwnerUserId = pus.UserId
+LEFT JOIN DuplicateLinks dl ON dl.PostId = p.Id
+WHERE pus.Reputation > 1500
+  AND (pus.GoldBadges + pus.SilverBadges + pus.BronzeBadges) > 5
+  AND (p.Score > 5 OR p.ViewCount > 1000)
+ORDER BY pus.Reputation DESC, p.Score DESC, p.ViewCount DESC
+LIMIT 100;

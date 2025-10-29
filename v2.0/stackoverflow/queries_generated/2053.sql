@@ -1,0 +1,189 @@
+-- {"query": "2053.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1541} 
+with RecursivePostHierarchy as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.Title,
+        1 as Level,
+        array[p.Id] as Path
+    from Posts p
+    where p.ParentId is null
+
+    union all
+
+    select
+        c.Id,
+        c.PostTypeId,
+        c.ParentId,
+        c.OwnerUserId,
+        c.CreationDate,
+        c.Score,
+        c.Title,
+        r.Level + 1,
+        r.Path || c.Id
+    from Posts c
+    inner join RecursivePostHierarchy r on c.ParentId = r.Id
+    where c.Id <> all(r.Path)
+),
+
+RecentUserBadges AS (
+    select 
+        b.UserId, 
+        b.Name as BadgeName,
+        b.Class,
+        b.Date,
+        row_number() over (partition by b.UserId order by b.Date desc) as rn
+    from Badges b 
+    where b.Date > now() - interval '1 year'
+),
+
+TopQuestions AS (
+    select
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CreationDate,
+        coalesce(p.Tags, '') as Tags
+    from Posts p
+    where p.PostTypeId = 1 and p.Score > 10 and p.ViewCount > 1000
+),
+
+LinkedDuplicates as (
+    select 
+        pl.PostId as DuplicateQuestionId,
+        pl.RelatedPostId as OriginalQuestionId,
+        p1.Title as DuplicateTitle,
+        p2.Title as OriginalTitle,
+        pl.CreationDate as LinkCreationDate
+    from PostLinks pl
+    inner join Posts p1 on pl.PostId = p1.Id and p1.PostTypeId = 1
+    inner join Posts p2 on pl.RelatedPostId = p2.Id and p2.PostTypeId = 1
+    where pl.LinkTypeId = 3 -- Duplicate
+),
+
+QuestionAnswers AS (
+    select 
+        a.Id,
+        a.ParentId as QuestionId,
+        a.Score,
+        a.CreationDate,
+        a.OwnerUserId,
+        u.Reputation as OwnerReputation,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts a 
+    left join Users u on a.OwnerUserId = u.Id
+    where a.PostTypeId = 2
+),
+
+QuestionsWithAnswerRanks AS (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        qa.Id as AnswerId,
+        qa.Score as AnswerScore,
+        qa.OwnerUserId as AnswerOwnerUserId,
+        qa.OwnerReputation,
+        qa.AnswerRank
+    from TopQuestions q
+    left join QuestionAnswers qa on q.Id = qa.QuestionId
+),
+
+UserActivity AS (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        count(distinct ph.PostId) filter (where ph.PostHistoryTypeId in (4,5,6)) as EditsMade,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsAsked,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersProvided,
+        coalesce(sum(v.VoteTypeId = 2::int),0) as UpVotesGiven,
+        coalesce(sum(v.VoteTypeId = 3::int),0) as DownVotesGiven
+    from Users u
+    left join PostHistory ph on ph.UserId = u.Id
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+
+TopAnswerersCTE AS (
+    select 
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        count(qa.Id) filter (where qa.AnswerRank = 1) as TopRankedAnswersCount,
+        avg(qa.AnswerScore) filter (where qa.AnswerRank = 1) as AvgTopAnswerScore
+    from UserActivity ua
+    left join QuestionsWithAnswerRanks qa on ua.UserId = qa.AnswerOwnerUserId and qa.AnswerRank = 1
+    group by ua.UserId, ua.DisplayName, ua.Reputation
+),
+
+CombinedResult AS (
+    select 
+        qwr.QuestionId,
+        qwr.Title as QuestionTitle,
+        qwr.CreationDate as QuestionCreated,
+        qwr.QuestionScore,
+        qwr.ViewCount,
+        qwr.Tags,
+        qwr.AnswerId,
+        qwr.AnswerScore,
+        u.DisplayName as AnswerOwnerName,
+        u.Reputation as AnswerOwnerReputation,
+        rab.TopRankedAnswersCount,
+        rab.AvgTopAnswerScore,
+        ld.OriginalQuestionId,
+        ld.OriginalTitle as OriginalQuestionTitle,
+        ld.LinkCreationDate as DuplicateSince,
+        ua.EditsMade,
+        ua.QuestionsAsked,
+        ua.AnswersProvided,
+        coalesce(rub.BadgeName, 'No Recent Badge') as RecentBadge
+    from QuestionsWithAnswerRanks qwr
+    left join Users u on qwr.AnswerOwnerUserId = u.Id
+    left join TopAnswerersCTE rab on rab.UserId = qwr.AnswerOwnerUserId
+    left join LinkedDuplicates ld on ld.DuplicateQuestionId = qwr.QuestionId
+    left join UserActivity ua on ua.UserId = qwr.AnswerOwnerUserId
+    left join RecentUserBadges rub on rub.UserId = qwr.AnswerOwnerUserId and rub.rn=1
+    where qwr.AnswerRank <= 3 or qwr.AnswerRank is null
+)
+
+select 
+    cr.QuestionId,
+    cr.QuestionTitle,
+    cr.QuestionCreated,
+    cr.QuestionScore,
+    cr.ViewCount,
+    cr.Tags,
+    cr.AnswerId,
+    cr.AnswerScore,
+    cr.AnswerOwnerName,
+    cr.AnswerOwnerReputation,
+    cr.TopRankedAnswersCount,
+    cr.AvgTopAnswerScore,
+    cr.OriginalQuestionId,
+    cr.OriginalQuestionTitle,
+    cr.DuplicateSince,
+    cr.EditsMade,
+    cr.QuestionsAsked,
+    cr.AnswersProvided,
+    cr.RecentBadge,
+    length(cr.Tags) as TagStringLength,
+    (cr.AnswerScore * 1.0 / nullif(cr.QuestionScore,0)) as AnswerToQuestionScoreRatio,
+    case when cr.DuplicateSince is null then 'No' else 'Yes' end as IsDuplicate,
+    dense_rank() over (partition by cr.QuestionId order by cr.AnswerScore desc nulls last) as AnswerScoreRankWithinQuestion
+from CombinedResult cr
+where (cr.AnswerScore is not null and cr.AnswerScore > 5) or cr.AnswerId is null
+order by cr.QuestionScore desc nulls last, cr.AnswerScore desc nulls last, cr.AnswerOwnerReputation desc nulls last
+limit 100;

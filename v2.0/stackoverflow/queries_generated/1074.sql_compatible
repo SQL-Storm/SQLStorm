@@ -1,0 +1,222 @@
+WITH UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName AS UserDisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.Views AS UserProfileViews,
+        COUNT(DISTINCT q.Id) AS QuestionsPosted,
+        COUNT(DISTINCT a.Id) AS AnswersPosted,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        SUM(COALESCE(q.Score, 0)) AS TotalQuestionScore,
+        SUM(COALESCE(a.Score, 0)) AS TotalAnswerScore,
+        COUNT(c.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT vp.PostId) AS VotedPostsCount,
+        -- aggregate votes given by user (approximate via Votes table)
+        SUM(CASE WHEN vp.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesGiven,
+        SUM(CASE WHEN vp.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesGiven
+    FROM
+        Users u
+    LEFT JOIN
+        Posts q ON u.Id = q.OwnerUserId AND q.PostTypeId = 1
+    LEFT JOIN
+        Posts a ON u.Id = a.OwnerUserId AND a.PostTypeId = 2
+    LEFT JOIN
+        Badges b ON u.Id = b.UserId
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        Votes vp ON u.Id = vp.UserId AND vp.VoteTypeId IN (2, 3)
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views
+),
+PostHistoricalMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.LastActivityDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.Title,
+        p.Tags,
+        COUNT(ph.Id) AS TotalHistoryEvents,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenCount,
+        MAX(ph.CreationDate) AS LastHistoryEventDate,
+        COALESCE(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - p.LastActivityDate)) / (60 * 60 * 24), 0) AS DaysSinceLastActivity,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 AND ph.Comment IN ('2', '102', '103') THEN 1 ELSE 0 END) AS HasProblematicCloseReason,
+        EXTRACT(EPOCH FROM (MAX(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN ph.CreationDate ELSE NULL END) - MIN(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN ph.CreationDate ELSE NULL END))) / (60 * 60) AS HoursBetweenFirstAndLastEdit
+    FROM
+        Posts p
+    LEFT JOIN
+        PostHistory ph ON p.Id = ph.PostId
+    GROUP BY
+        p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.LastActivityDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.ClosedDate, p.AcceptedAnswerId, p.ParentId, p.Title, p.Tags
+),
+QuestionAnswerPerformance AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.OwnerUserId AS QuestionOwnerUserId,
+        q.CreationDate AS QuestionCreationDate,
+        q.ClosedDate AS QuestionClosedDate,
+        q.Score AS QuestionScore,
+        q.ViewCount AS QuestionViewCount,
+        q.Tags AS QuestionTags,
+        a.Id AS AnswerId,
+        a.OwnerUserId AS AnswerOwnerUserId,
+        a.CreationDate AS AnswerCreationDate,
+        a.Score AS AnswerScore,
+        a.FavoriteCount AS AnswerFavoriteCount,
+        EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate)) / 60 AS TimeToAnswer_Minutes,
+        CASE WHEN q.AcceptedAnswerId = a.Id THEN EXTRACT(EPOCH FROM (q.LastActivityDate - a.CreationDate)) / 60 ELSE NULL END AS TimeToAcceptance_Minutes,
+        ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerScoreRank,
+        (q.OwnerUserId = a.OwnerUserId) AS IsSelfAnswer,
+        EXISTS (
+            SELECT 1
+            FROM Badges b_inner
+            WHERE b_inner.UserId = a.OwnerUserId
+              AND b_inner.Class = 1
+              AND b_inner.TagBased = TRUE
+              AND q.Tags IS NOT NULL
+              AND EXISTS (
+                  SELECT 1
+                  FROM (SELECT UNNEST(string_to_array(SUBSTRING(q.Tags FROM 2 FOR GREATEST(LENGTH(q.Tags)-2,0)), '><')) AS q_tag) AS tag_vals
+                  WHERE LOWER(b_inner.Name) = LOWER(tag_vals.q_tag)
+              )
+        ) AS AnswererHasRelatedGoldBadge,
+        (SELECT u_inner.Reputation FROM Users u_inner WHERE u_inner.Id = a.OwnerUserId) AS AnswererReputation
+    FROM
+        Posts q
+    INNER JOIN
+        Posts a ON q.Id = a.ParentId AND a.PostTypeId = 2
+    WHERE
+        q.PostTypeId = 1
+        AND q.AcceptedAnswerId IS NOT NULL
+        AND q.ClosedDate IS NULL
+),
+AggregatedTagMetrics AS (
+    SELECT
+        tag_name,
+        COUNT(DISTINCT PostId) AS TaggedPostsCount,
+        AVG(Score) AS AvgTagScore,
+        AVG(ViewCount) AS AvgTagViewCount,
+        MAX(PostCreationDate) AS LastTaggedPostDate
+    FROM (
+        SELECT
+            p.Id AS PostId,
+            p.Score,
+            p.ViewCount,
+            p.CreationDate AS PostCreationDate,
+            UNNEST(string_to_array(TRIM(SUBSTRING(p.Tags FROM 2 FOR GREATEST(LENGTH(p.Tags)-2,0))), '><')) AS tag_name
+        FROM Posts p
+        WHERE p.Tags IS NOT NULL AND p.PostTypeId = 1
+    ) AS TaggedPosts
+    WHERE tag_name IS NOT NULL AND tag_name <> ''
+    GROUP BY tag_name
+    HAVING COUNT(DISTINCT PostId) > 500
+)
+SELECT
+    ue.UserId,
+    ue.UserDisplayName,
+    ue.Reputation,
+    ue.GoldBadges,
+    ue.SilverBadges,
+    ue.BronzeBadges,
+    ue.QuestionsPosted,
+    ue.AnswersPosted,
+    ue.TotalAnswerScore,
+    ue.TotalCommentsMade,
+    ue.UserProfileViews,
+    COALESCE(ue.TotalAnswerScore * 1.0 / NULLIF(ue.AnswersPosted, 0), 0) AS AvgAnswerScorePerUser,
+    COALESCE(ue.TotalQuestionScore * 1.0 / NULLIF(ue.QuestionsPosted, 0), 0) AS AvgQuestionScorePerUser,
+    RANK() OVER (ORDER BY COALESCE(ue.TotalAnswerScore * 1.0 / NULLIF(ue.AnswersPosted, 0), 0) DESC, ue.Reputation DESC) AS UserAnswerQualityRank,
+    NTILE(5) OVER (ORDER BY (ue.GoldBadges * 100 + ue.SilverBadges * 10 + ue.BronzeBadges) DESC) AS BadgeTier,
+    SUM(qap.TimeToAnswer_Minutes) FILTER (WHERE qap.TimeToAnswer_Minutes IS NOT NULL) AS TotalTimeToAnswer,
+    AVG(qap.TimeToAnswer_Minutes) FILTER (WHERE qap.TimeToAnswer_Minutes IS NOT NULL) AS AvgTimeToAnswer,
+    SUM(qap.TimeToAcceptance_Minutes) FILTER (WHERE qap.TimeToAcceptance_Minutes IS NOT NULL) AS TotalTimeToAcceptance,
+    AVG(qap.TimeToAcceptance_Minutes) FILTER (WHERE qap.TimeToAcceptance_Minutes IS NOT NULL) AS AvgTimeToAcceptance,
+    SUM(CASE WHEN qap.AnswerScoreRank = 1 THEN 1 ELSE 0 END) AS TopRankedAnswersCount,
+    SUM(CASE WHEN qap.IsSelfAnswer THEN 1 ELSE 0 END) AS SelfAnsweredQuestionsCount,
+    SUM(CASE WHEN qap.AnswererHasRelatedGoldBadge THEN 1 ELSE 0 END) AS AnswersWithRelatedGoldBadgeCount,
+    (
+        SELECT STRING_AGG(DISTINCT atm.tag_name, ', ' ORDER BY atm.tag_name)
+        FROM QuestionAnswerPerformance qap_inner
+        JOIN (
+            SELECT
+                q_tags.Id,
+                UNNEST(string_to_array(TRIM(SUBSTRING(q_tags.Tags FROM 2 FOR GREATEST(LENGTH(q_tags.Tags)-2,0))), '><')) AS tag_name
+            FROM Posts q_tags
+            WHERE q_tags.Tags IS NOT NULL
+        ) AS atm ON qap_inner.QuestionId = atm.Id
+        WHERE qap_inner.AnswerOwnerUserId = ue.UserId
+          AND atm.tag_name IS NOT NULL AND atm.tag_name <> ''
+          AND atm.tag_name IN (SELECT tag_name FROM AggregatedTagMetrics WHERE TaggedPostsCount > 1000 AND AvgTagScore > 15)
+    ) AS TopAnsweredTags,
+    (
+        ue.Reputation * 0.05
+        + COALESCE(ue.TotalAnswerScore * 1.0 / NULLIF(ue.AnswersPosted, 0), 0) * 0.4
+        + (ue.GoldBadges * 50 + ue.SilverBadges * 10 + ue.BronzeBadges * 1) * 0.2
+        + (1000.0 / (NULLIF(AVG(qap.TimeToAnswer_Minutes) FILTER (WHERE qap.TimeToAnswer_Minutes IS NOT NULL), 0) + 1)) * 0.1
+        + (SUM(CASE WHEN qap.AnswerScoreRank = 1 THEN 1 ELSE 0 END) * 50) * 0.15
+        + (ue.UserProfileViews * 0.01) * 0.05
+        + (SUM(CASE WHEN qap.AnswererHasRelatedGoldBadge THEN 1 ELSE 0 END) * 10) * 0.05
+    ) AS InfluenceScore,
+    (ue.TotalUpVotesGiven - ue.TotalDownVotesGiven) AS NetVotesGiven,
+    SUM(phm.EditCount) AS TotalOwnedPostEditCount,
+    MAX(phm.HoursBetweenFirstAndLastEdit) AS MaxHoursBetweenOwnedPostEdits,
+    SUM(phm.HasProblematicCloseReason) AS UserOwnedProblematicPostsCount,
+    EXISTS (
+        SELECT 1
+        FROM PostLinks pl
+        JOIN PostHistoricalMetrics phm_link ON pl.RelatedPostId = phm_link.PostId
+        WHERE pl.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = ue.UserId AND PostTypeId = 1)
+          AND pl.LinkTypeId = 1
+          AND phm_link.PostTypeId = 1
+          AND phm_link.ViewCount > 50000 AND phm_link.Score > 50
+    ) AS LinksToPopularQuestions
+FROM
+    UserEngagement ue
+LEFT JOIN
+    QuestionAnswerPerformance qap ON ue.UserId = qap.AnswerOwnerUserId
+LEFT JOIN
+    PostHistoricalMetrics phm ON ue.UserId = phm.OwnerUserId
+WHERE
+    ue.Reputation > 10000
+    AND ue.AnswersPosted > 20
+    AND ue.LastAccessDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '3 months'
+    AND ue.GoldBadges >= 1
+GROUP BY
+    ue.UserId,
+    ue.UserDisplayName,
+    ue.Reputation,
+    ue.GoldBadges,
+    ue.SilverBadges,
+    ue.BronzeBadges,
+    ue.QuestionsPosted,
+    ue.AnswersPosted,
+    ue.TotalAnswerScore,
+    ue.TotalCommentsMade,
+    ue.UserProfileViews,
+    ue.TotalQuestionScore,
+    ue.LastAccessDate,
+    ue.TotalUpVotesGiven,
+    ue.TotalDownVotesGiven,
+    ue.UserProfileViews -- repeated is harmless but ensures window references are grouped
+HAVING
+    COUNT(qap.AnswerId) > 10
+    AND AVG(qap.TimeToAnswer_Minutes) FILTER (WHERE qap.TimeToAnswer_Minutes IS NOT NULL) < 1440
+ORDER BY
+    InfluenceScore DESC, AvgAnswerScorePerUser DESC, ue.Reputation DESC
+LIMIT 50;

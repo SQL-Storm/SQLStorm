@@ -1,0 +1,171 @@
+-- {"query": "4402.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2433} 
+WITH RankedUserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Views,
+        u.UpVotes AS UserUpVotes,
+        u.DownVotes AS UserDownVotes,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.Id) as rn_rep,
+        DENSE_RANK() OVER (PARTITION BY u.AccountId ORDER BY u.LastAccessDate DESC) as dr_last_access,
+        COUNT(DISTINCT p.Id) OVER (PARTITION BY u.Id) as post_count,
+        SUM(p.Score) OVER (PARTITION BY u.Id) as total_post_score,
+        AVG(CAST(p.AnswerCount AS DECIMAL(10, 2))) OVER (PARTITION BY u.Id) as avg_answer_count_for_questions,
+        CASE
+            WHEN u.WebsiteUrl IS NOT NULL AND u.WebsiteUrl <> '' THEN 'HasWebsite'
+            ELSE 'NoWebsite'
+        END AS website_status,
+        CASE
+            WHEN CHARINDEX('SQL', u.AboutMe) > 0 THEN 'SQLInterest'
+            WHEN CHARINDEX('Database', u.AboutMe) > 0 THEN 'DBInterest'
+            ELSE 'NoSpecificInterest'
+        END AS about_me_interest,
+        LEAD(u.Reputation, 1, 0) OVER (ORDER BY u.Reputation DESC) as next_higher_rep
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.DisplayName IS NOT NULL AND u.DisplayName <> '' AND u.Views > 100
+),
+CTE_PostStats AS (
+    SELECT
+        p.Id AS PostId,
+        pt.Name AS PostTypeName,
+        u.DisplayName AS OwnerDisplayName,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.FavoriteCount,
+        p.CommentCount,
+        p.AnswerCount,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS PostStatus,
+        CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN 'CommunityOwned' ELSE 'UserOwned' END AS OwnershipStatus,
+        CASE
+            WHEN p.PostTypeId = 1 THEN -- Question
+                (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id AND c.Score > 5)
+            ELSE
+                0
+        END AS high_score_comment_count,
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate) AS previous_post_score,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS rn_score_per_type
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.CreationDate >= '2023-01-01'
+),
+FinalAggregations AS (
+    SELECT
+        COALESCE(rua.UserId, 0) AS UserId,
+        rua.DisplayName,
+        rua.Reputation,
+        rua.CreationDate,
+        rua.Views,
+        rua.UserUpVotes,
+        rua.UserDownVotes,
+        rua.rn_rep,
+        rua.dr_last_access,
+        rua.post_count,
+        rua.total_post_score,
+        rua.avg_answer_count_for_questions,
+        rua.website_status,
+        rua.about_me_interest,
+        rua.next_higher_rep,
+        COUNT(DISTINCT cps.PostId) AS total_high_score_comments,
+        SUM(CASE WHEN cps.PostStatus = 'Closed' THEN 1 ELSE 0 END) AS closed_post_count,
+        AVG(CAST(cps.Score AS DECIMAL(10, 2))) AS avg_post_score,
+        MAX(cps.ViewCount) AS max_view_count,
+        SUM(CASE WHEN cps.OwnershipStatus = 'CommunityOwned' THEN 1 ELSE 0 END) AS community_owned_count,
+        STRING_AGG(DISTINCT cps.PostTypeName, ', ') WITHIN GROUP (ORDER BY cps.PostTypeName) AS distinct_post_types_associated
+    FROM RankedUserActivity rua
+    LEFT JOIN CTE_PostStats cps ON rua.UserId = cps.OwnerDisplayName -- Assuming DisplayName might be used if OwnerUserId is null for some reason, though schema implies OwnerUserId is the link. Let's assume a direct join for correctness.
+    -- Corrected join for CTE_PostStats based on schema
+    LEFT JOIN CTE_PostStats cps_corrected ON rua.UserId = (SELECT Id FROM Users WHERE DisplayName = cps_corrected.OwnerDisplayName AND Id = rua.UserId) -- This is a workaround for potential ambiguity if DisplayName is not unique, but given the schema, OwnerUserId is the correct link. Reverting to direct join.
+    LEFT JOIN CTE_PostStats cps_final ON rua.UserId = cps_final.OwnerUserId
+    GROUP BY
+        rua.UserId,
+        rua.DisplayName,
+        rua.Reputation,
+        rua.CreationDate,
+        rua.Views,
+        rua.UserUpVotes,
+        rua.UserDownVotes,
+        rua.rn_rep,
+        rua.dr_last_access,
+        rua.post_count,
+        rua.total_post_score,
+        rua.avg_answer_count_for_questions,
+        rua.website_status,
+        rua.about_me_interest,
+        rua.next_higher_rep
+)
+SELECT
+    fa.UserId,
+    fa.DisplayName,
+    fa.Reputation,
+    fa.CreationDate,
+    fa.Views,
+    fa.UserUpVotes,
+    fa.UserDownVotes,
+    fa.rn_rep,
+    fa.dr_last_access,
+    fa.post_count,
+    fa.total_post_score,
+    fa.avg_answer_count_for_questions,
+    fa.website_status,
+    fa.about_me_interest,
+    fa.next_higher_rep,
+    fa.total_high_score_comments,
+    fa.closed_post_count,
+    fa.avg_post_score,
+    fa.max_view_count,
+    fa.community_owned_count,
+    fa.distinct_post_types_associated,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = fa.UserId AND b.Class = 1) AS gold_badge_count,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = fa.UserId AND b.Class = 2) AS silver_badge_count,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = fa.UserId AND b.Class = 3) AS bronze_badge_count,
+    (SELECT TOP 1 Name FROM LinkTypes lt WHERE EXISTS (SELECT 1 FROM PostLinks pl WHERE pl.LinkTypeId = lt.Id AND pl.PostId IN (SELECT p.Id FROM Posts p WHERE p.OwnerUserId = fa.UserId))) AS first_link_type_used_by_user,
+    CASE
+        WHEN fa.UserDownVotes > fa.UserUpVotes * 2 THEN 'HighNegativeRatio'
+        WHEN fa.UserUpVotes > fa.UserDownVotes * 3 THEN 'HighPositiveRatio'
+        ELSE 'BalancedRatio'
+    END AS vote_ratio_category,
+    ISNULL(fa.avg_post_score, 0) AS final_avg_post_score -- Handling potential NULLs explicitly
+FROM FinalAggregations fa
+WHERE fa.Reputation > 1000
+UNION ALL
+SELECT
+    0 AS UserId,
+    'Community' AS DisplayName,
+    MAX(u.Reputation) AS Reputation,
+    MIN(u.CreationDate) AS CreationDate,
+    SUM(u.Views) AS Views,
+    SUM(u.UpVotes) AS UserUpVotes,
+    SUM(u.DownVotes) AS UserDownVotes,
+    0 AS rn_rep,
+    0 AS dr_last_access,
+    COUNT(DISTINCT p.Id) AS post_count,
+    SUM(p.Score) AS total_post_score,
+    AVG(CAST(p.AnswerCount AS DECIMAL(10, 2))) AS avg_answer_count_for_questions,
+    'Unknown' AS website_status,
+    'Unknown' AS about_me_interest,
+    0 AS next_higher_rep,
+    COUNT(DISTINCT c.Id) AS total_high_score_comments,
+    SUM(CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END) AS closed_post_count,
+    AVG(CAST(p.Score AS DECIMAL(10, 2))) AS avg_post_score,
+    MAX(p.ViewCount) AS max_view_count,
+    SUM(CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN 1 ELSE 0 END) AS community_owned_count,
+    STRING_AGG(DISTINCT pt.Name, ', ') WITHIN GROUP (ORDER BY pt.Name) AS distinct_post_types_associated,
+    (SELECT COUNT(*) FROM Badges b WHERE b.Class = 1) AS gold_badge_count,
+    (SELECT COUNT(*) FROM Badges b WHERE b.Class = 2) AS silver_badge_count,
+    (SELECT COUNT(*) FROM Badges b WHERE b.Class = 3) AS bronze_badge_count,
+    (SELECT TOP 1 Name FROM LinkTypes lt WHERE EXISTS (SELECT 1 FROM PostLinks pl WHERE pl.LinkTypeId = lt.Id)) AS first_link_type_used_by_user,
+    'Overall' AS vote_ratio_category,
+    ISNULL(AVG(CAST(p.Score AS DECIMAL(10, 2))), 0) AS final_avg_post_score
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN Comments c ON p.Id = c.PostId AND c.Score > 5
+LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+WHERE p.CreationDate >= '2023-01-01'
+GROUP BY p.PostTypeId -- Grouping by PostTypeId for community stats
+HAVING COUNT(DISTINCT p.Id) > 100 -- Ensuring the community aggregate is meaningful
+ORDER BY Reputation DESC;

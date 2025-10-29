@@ -1,0 +1,64 @@
+SELECT 
+    u.DisplayName, 
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    MAX(p.Score) AS HighestScoredPost,
+    MIN(p.CreationDate) AS FirstPostDate,
+    MAX(p.LastActivityDate) AS LastActivityDate,
+    b.Name AS LatestBadge,
+    v2.VoteTypeId AS MostRecentVote,
+    AVG(p.ViewCount) AS AvgViewsPerPost,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) AS LastClosedDate,
+    STRING_AGG(t.TagName, ', ') AS MostCommonTags
+FROM 
+    Users u
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    (SELECT 
+         UserId, 
+         MAX(CreationDate) AS LastVoteDate
+     FROM 
+         Votes 
+     GROUP BY 
+         UserId) v ON u.Id = v.UserId
+LEFT JOIN LATERAL
+    (SELECT 
+         UserId, 
+         PostId, 
+         VoteTypeId,
+         CreationDate
+     FROM 
+         Votes v_inner
+     WHERE 
+         v_inner.UserId = u.Id
+     ORDER BY 
+         v_inner.CreationDate DESC
+     LIMIT 1) v2 ON true
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId = 10
+LEFT JOIN 
+    (SELECT 
+         Id, 
+         STRING_AGG(TagName, ', ') AS TagName 
+     FROM 
+         Tags 
+     GROUP BY 
+         Id) t ON p.Id = t.Id
+WHERE 
+    u.Reputation > 1000
+    AND (p.CreationDate IS NULL OR p.CreationDate >= (cast('2024-10-01' as date) + INTERVAL '-5 years') + (CAST('2024-10-01 12:34:56' AS timestamp) - DATE_TRUNC('day', CAST('2024-10-01 12:34:56' AS timestamp))))
+GROUP BY 
+    u.DisplayName, 
+    u.Reputation, 
+    b.Name, 
+    v2.VoteTypeId
+HAVING 
+    COUNT(DISTINCT p.Id) > 50
+ORDER BY 
+    AVG(p.ViewCount) DESC, 
+    u.Reputation DESC;

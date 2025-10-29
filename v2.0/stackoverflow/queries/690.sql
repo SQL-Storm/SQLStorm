@@ -1,0 +1,459 @@
+with recent_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.location,
+    coalesce(nullif(trim(u.websiteurl), ''), 'n/a') as website_norm
+  from users u
+  where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+tag_posts as (
+  select
+    p.id as post_id,
+    p.title,
+    p.tags,
+    p.owneruserid,
+    p.creationdate,
+    p.posttypeid,
+    string_to_array(substring(p.tags, 2, greatest(length(p.tags)-2,0)), '><') as tag_arr
+  from posts p
+  where p.posttypeid in (1,2)
+),
+question_core as (
+  select
+    tp.post_id,
+    tp.title,
+    tp.tags,
+    tp.tag_arr,
+    tp.owneruserid,
+    tp.creationdate as q_creation,
+    p.viewcount,
+    p.score as q_score,
+    p.answercount,
+    p.acceptedanswerid
+  from tag_posts tp
+  join posts p on p.id = tp.post_id and p.posttypeid = 1
+),
+answers_agg as (
+  select
+    a.parentid as question_id,
+    count(case when a.score > 0 then 1 end) as pos_answers,
+    count(case when a.score <= 0 or a.score is null then 1 end) as nonpos_answers,
+    avg(cast(a.score as numeric)) as avg_answer_score,
+    max(a.score) as max_answer_score,
+    min(a.score) as min_answer_score
+  from posts a
+  where a.posttypeid = 2
+  group by a.parentid
+),
+votes_agg as (
+  select
+    v.postid,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+    sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started,
+    sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded,
+    count(*) as total_votes,
+    count(distinct v.userid) as distinct_voters
+  from votes v
+  group by v.postid
+),
+comments_agg as (
+  select
+    c.postid,
+    count(*) as comment_count,
+    avg(nullif(c.score,0)) as avg_nonzero_comment_score,
+    max(c.score) as max_comment_score,
+    min(c.score) as min_comment_score,
+    sum(length(c.text)) as total_comment_text_len,
+    max(c.creationdate) as last_comment_at
+  from comments c
+  group by c.postid
+),
+post_history_flags as (
+  select
+    ph.postid,
+    max(case when ph.posthistorytypeid = 10 then 1 else 0 end) as was_closed,
+    max(case when ph.posthistorytypeid = 11 then 1 else 0 end) as was_reopened,
+    max(case when ph.posthistorytypeid = 12 then 1 else 0 end) as was_deleted,
+    max(case when ph.posthistorytypeid = 13 then 1 else 0 end) as was_undeleted,
+    max(case when ph.posthistorytypeid in (24) then 1 else 0 end) as had_suggested_edits,
+    max(case when ph.posthistorytypeid in (50) then 1 else 0 end) as had_community_bump,
+    min(ph.creationdate) filter (where ph.posthistorytypeid in (4,5,6)) as first_edit_at,
+    count(*) filter (where ph.posthistorytypeid in (4,5,6)) as edit_count
+  from posthistory ph
+  group by ph.postid
+),
+duplicates as (
+  select
+    pl.postid as dup_post_id,
+    pl.relatedpostid as orig_post_id,
+    min(pl.creationdate) as first_dup_link_at
+  from postlinks pl
+  where pl.linktypeid = 3
+  group by pl.postid, pl.relatedpostid
+),
+dup_ranked as (
+  select
+    d.*,
+    row_number() over (partition by d.dup_post_id order by d.first_dup_link_at) as rn
+  from duplicates d
+),
+question_activity as (
+  select
+    qc.post_id,
+    qc.title,
+    qc.tags,
+    qc.tag_arr,
+    qc.owneruserid,
+    qc.q_creation,
+    qc.viewcount,
+    qc.q_score,
+    qc.answercount,
+    qc.acceptedanswerid,
+    coalesce(va.upvotes,0) as upvotes,
+    coalesce(va.downvotes,0) as downvotes,
+    coalesce(va.favorites,0) as favorites,
+    coalesce(va.bounty_started,0) as bounty_started,
+    coalesce(va.bounty_awarded,0) as bounty_awarded,
+    coalesce(va.total_votes,0) as total_votes,
+    coalesce(va.distinct_voters,0) as distinct_voters,
+    coalesce(ca.comment_count,0) as comment_count,
+    ca.avg_nonzero_comment_score,
+    ca.max_comment_score,
+    ca.min_comment_score,
+    ca.total_comment_text_len,
+    ca.last_comment_at,
+    ph.was_closed,
+    ph.was_reopened,
+    ph.was_deleted,
+    ph.was_undeleted,
+    ph.had_suggested_edits,
+    ph.had_community_bump,
+    ph.first_edit_at,
+    ph.edit_count,
+    dr.orig_post_id as first_marked_duplicate_of
+  from question_core qc
+  left join votes_agg va on va.postid = qc.post_id
+  left join comments_agg ca on ca.postid = qc.post_id
+  left join post_history_flags ph on ph.postid = qc.post_id
+  left join dup_ranked dr on dr.dup_post_id = qc.post_id and dr.rn = 1
+),
+user_enriched as (
+  select
+    ru.user_id,
+    ru.displayname,
+    ru.reputation,
+    ru.creationdate,
+    ru.location,
+    ru.website_norm,
+    coalesce(bc.badge_count,0) as badge_count,
+    coalesce(bc.gold,0) as gold_badges,
+    coalesce(bc.silver,0) as silver_badges,
+    coalesce(bc.bronze,0) as bronze_badges,
+    coalesce(ua.up_given,0) as upvotes_given,
+    coalesce(ua.down_given,0) as downvotes_given
+  from recent_users ru
+  left join (
+    select
+      b.userid,
+      count(*) as badge_count,
+      count(case when b.class = 1 then 1 end) as gold,
+      count(case when b.class = 2 then 1 end) as silver,
+      count(case when b.class = 3 then 1 end) as bronze
+    from badges b
+    group by b.userid
+  ) bc on bc.userid = ru.user_id
+  left join (
+    select
+      v.userid,
+      sum(case when v.votetypeid = 2 then 1 else 0 end) as up_given,
+      sum(case when v.votetypeid = 3 then 1 else 0 end) as down_given
+    from votes v
+    where v.userid is not null
+    group by v.userid
+  ) ua on ua.userid = ru.user_id
+),
+question_scoring as (
+  select
+    qa.post_id,
+    qa.title,
+    qa.tags,
+    qa.tag_arr,
+    qa.owneruserid,
+    qa.q_creation,
+    qa.viewcount,
+    qa.q_score,
+    qa.answercount,
+    qa.acceptedanswerid,
+    qa.upvotes,
+    qa.downvotes,
+    qa.favorites,
+    qa.bounty_started,
+    qa.bounty_awarded,
+    qa.total_votes,
+    qa.distinct_voters,
+    qa.comment_count,
+    qa.avg_nonzero_comment_score,
+    qa.max_comment_score,
+    qa.min_comment_score,
+    qa.total_comment_text_len,
+    qa.last_comment_at,
+    qa.was_closed,
+    qa.was_reopened,
+    qa.was_deleted,
+    qa.was_undeleted,
+    qa.had_suggested_edits,
+    qa.had_community_bump,
+    qa.first_edit_at,
+    qa.edit_count,
+    qa.first_marked_duplicate_of,
+    ue.displayname as owner_name,
+    ue.reputation as owner_rep,
+    ue.badge_count,
+    ue.gold_badges,
+    ue.silver_badges,
+    ue.bronze_badges,
+    case
+      when qa.acceptedanswerid is not null then 1
+      else 0
+    end as has_accepted_answer,
+    array_length(qa.tag_arr, 1) as tag_count,
+    cast(
+    (
+      coalesce(qa.upvotes,0) * 3
+      - coalesce(qa.downvotes,0) * 2
+      + coalesce(qa.favorites,0) * 4
+      + coalesce(qa.comment_count,0)
+      + coalesce(qa.viewcount,0) / 100
+      + case when qa.had_community_bump = 1 then 25 else 0 end
+      + case when qa.was_closed = 1 then -50 else 0 end
+      + case when qa.was_deleted = 1 then -100 else 0 end
+      + case when qa.edit_count is not null then least(qa.edit_count, 20) * 2 else 0 end
+      + case when qa.acceptedanswerid is not null then 30 else 0 end
+      + coalesce(qa.bounty_started,0) / 50
+      + coalesce(qa.bounty_awarded,0) / 25
+    ) as numeric) as engagement_score_raw
+  from question_activity qa
+  left join user_enriched ue on ue.user_id = qa.owneruserid
+),
+global_stats as (
+  select
+    percentile_cont(0.5) within group (order by engagement_score_raw) as p50_score,
+    avg(engagement_score_raw) as avg_score_all
+  from question_scoring
+),
+score_ranked as (
+  select
+    qs.post_id,
+    qs.title,
+    qs.tags,
+    qs.tag_arr,
+    qs.owneruserid,
+    qs.q_creation,
+    qs.viewcount,
+    qs.q_score,
+    qs.answercount,
+    qs.acceptedanswerid,
+    qs.upvotes,
+    qs.downvotes,
+    qs.favorites,
+    qs.bounty_started,
+    qs.bounty_awarded,
+    qs.total_votes,
+    qs.distinct_voters,
+    qs.comment_count,
+    qs.avg_nonzero_comment_score,
+    qs.max_comment_score,
+    qs.min_comment_score,
+    qs.total_comment_text_len,
+    qs.last_comment_at,
+    qs.was_closed,
+    qs.was_reopened,
+    qs.was_deleted,
+    qs.was_undeleted,
+    qs.had_suggested_edits,
+    qs.had_community_bump,
+    qs.first_edit_at,
+    qs.edit_count,
+    qs.first_marked_duplicate_of,
+    qs.owner_name,
+    qs.owner_rep,
+    qs.badge_count,
+    qs.gold_badges,
+    qs.silver_badges,
+    qs.bronze_badges,
+    qs.has_accepted_answer,
+    qs.tag_count,
+    qs.engagement_score_raw,
+    date_trunc('month', qs.q_creation) as month_bucket,
+    row_number() over (partition by date_trunc('month', qs.q_creation)
+                       order by qs.engagement_score_raw desc nulls last, qs.q_score desc, qs.viewcount desc) as rn_month,
+    rank() over (order by qs.engagement_score_raw desc nulls last) as global_rank,
+    gs.p50_score,
+    gs.avg_score_all
+  from question_scoring qs
+  cross join global_stats gs
+),
+finalized as (
+  select
+    sr.post_id,
+    sr.title,
+    sr.tags,
+    sr.tag_arr,
+    sr.owneruserid,
+    sr.q_creation,
+    sr.viewcount,
+    sr.q_score,
+    sr.answercount,
+    sr.acceptedanswerid,
+    sr.upvotes,
+    sr.downvotes,
+    sr.favorites,
+    sr.bounty_started,
+    sr.bounty_awarded,
+    sr.total_votes,
+    sr.distinct_voters,
+    sr.comment_count,
+    sr.avg_nonzero_comment_score,
+    sr.max_comment_score,
+    sr.min_comment_score,
+    sr.total_comment_text_len,
+    sr.last_comment_at,
+    sr.was_closed,
+    sr.was_reopened,
+    sr.was_deleted,
+    sr.was_undeleted,
+    sr.had_suggested_edits,
+    sr.had_community_bump,
+    sr.first_edit_at,
+    sr.edit_count,
+    sr.first_marked_duplicate_of,
+    sr.owner_name,
+    sr.owner_rep,
+    sr.badge_count,
+    sr.gold_badges,
+    sr.silver_badges,
+    sr.bronze_badges,
+    sr.has_accepted_answer,
+    sr.tag_count,
+    sr.engagement_score_raw,
+    sr.month_bucket,
+    sr.rn_month,
+    sr.global_rank,
+    sr.p50_score,
+    sr.avg_score_all,
+    (sr.engagement_score_raw - avg(sr.engagement_score_raw) over (partition by sr.month_bucket))
+      / nullif(stddev_pop(sr.engagement_score_raw) over (partition by sr.month_bucket), 0) as month_z,
+    coalesce(
+      (select string_agg(lower(trim(t)), '|')
+       from unnest(sr.tag_arr) as t),
+      ''
+    ) as tag_sig,
+    md5(coalesce(sr.title, '')) as title_hash
+  from score_ranked sr
+),
+tag_peers as (
+  select
+    f1.post_id,
+    count(*) as peers_same_tag_sig_last_year,
+    avg(f2.engagement_score_raw) as avg_peer_score,
+    max(f2.engagement_score_raw) as max_peer_score
+  from finalized f1
+  left join finalized f2
+    on f2.tag_sig = f1.tag_sig
+    and f2.q_creation >= f1.q_creation - interval '365 days'
+    and f2.q_creation <= f1.q_creation
+    and f2.post_id <> f1.post_id
+  group by f1.post_id
+),
+accepted_answer_latency as (
+  select
+    q.id as question_id,
+    a.id as accepted_answer_id,
+    a.creationdate - q.creationdate as latency
+  from posts q
+  join posts a on a.id = q.acceptedanswerid
+  where q.posttypeid = 1
+)
+select
+  f.post_id,
+  coalesce(f.title, '[no title]') as title,
+  f.q_creation,
+  f.viewcount,
+  f.q_score,
+  f.answercount,
+  f.has_accepted_answer,
+  aal.latency as accepted_latency,
+  f.upvotes,
+  f.downvotes,
+  f.favorites,
+  f.total_votes,
+  f.distinct_voters,
+  f.comment_count,
+  f.edit_count,
+  f.was_closed,
+  f.was_reopened,
+  f.was_deleted,
+  f.was_undeleted,
+  f.had_suggested_edits,
+  f.had_community_bump,
+  f.owner_name,
+  f.owner_rep,
+  f.gold_badges,
+  f.silver_badges,
+  f.bronze_badges,
+  f.tag_count,
+  f.month_bucket,
+  f.rn_month,
+  f.global_rank,
+  round(f.engagement_score_raw, 2) as engagement_score,
+  round(f.month_z, 3) as engagement_month_z,
+  tp.peers_same_tag_sig_last_year,
+  round(tp.avg_peer_score, 2) as avg_peer_score,
+  round(tp.max_peer_score, 2) as max_peer_score,
+  f.first_marked_duplicate_of,
+  case
+    when f.viewcount is null then 'unknown'
+    when f.viewcount = 0 then 'none'
+    when f.viewcount < 100 then 'low'
+    when f.viewcount < 1000 then 'medium'
+    when f.viewcount < 10000 then 'high'
+    else 'viral'
+  end as view_band,
+  case
+    when f.owner_rep is null then 'anon'
+    when f.owner_rep < 1000 then 'new'
+    when f.owner_rep < 10000 then 'regular'
+    else 'veteran'
+  end as author_band
+from finalized f
+left join tag_peers tp on tp.post_id = f.post_id
+left join accepted_answer_latency aal on aal.question_id = f.post_id
+where
+  (
+    f.tag_arr is not null
+    and array_length(f.tag_arr, 1) between 1 and 5
+    and exists (
+      select 1
+      from unnest(f.tag_arr) as t(x)
+      where lower(x) similar to '(sql|postgres%|performance|tuning|index%)'
+    )
+  )
+  and coalesce(f.was_deleted, 0) = 0
+  and (f.engagement_score_raw is not null and f.engagement_score_raw > coalesce(f.p50_score, 0))
+  and (
+    f.first_edit_at is null
+    or f.first_edit_at <= f.q_creation + interval '30 days'
+  )
+  and (
+    f.acceptedanswerid is null
+    or coalesce(aal.latency, interval '0') <= interval '14 days'
+  )
+order by
+  f.month_bucket desc,
+  f.rn_month
+limit 250;

@@ -1,0 +1,40 @@
+SELECT
+  u.Id AS UserId,
+  u.DisplayName AS UserName,
+  u.Reputation,
+  COUNT(DISTINCT p.Id) AS PostsCount,
+  SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsCount,
+  SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersCount,
+  COALESCE(SUM(v.BountyAmount), 0) AS TotalBounty,
+  MAX(p.CreationDate) AS LastActivePostDate,
+  STRING_AGG(DISTINCT tt.Name, ',') FILTER (WHERE t.TagBased = 0) AS BadgesNotTagBased,
+  COUNT(DISTINCT bl.BadgeId) AS BadgesEarned
+FROM
+  Users u
+LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+LEFT JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId = 2
+LEFT JOIN (
+  SELECT b.UserId, b.Id AS BadgeId
+  FROM Badges b
+  WHERE b.Class IN (1,2,3)
+) bl ON bl.UserId = u.Id
+LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+LEFT JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+LEFT JOIN (
+  SELECT pl_inner.Id, pl_inner.PostId, pl_inner.Name, 0 AS TagBased
+  FROM PostLinks pl_inner
+) pl ON pl.PostId = p.Id
+LEFT JOIN (
+  SELECT tb_inner.Id, tb_inner.Name, tb_inner.TagBased
+  FROM Badges tb_inner
+) tb ON tb.Id = bl.BadgeId
+LEFT JOIN Tags t ON t.WikiPostId = p.Id OR t.ExcerptPostId = p.Id
+LEFT JOIN (
+  SELECT pr_inner.Id, pr_inner.PostId, pr_inner.Name, 0 AS TagBased
+  FROM PostLinks pr_inner
+) pr ON pr.PostId = p.Id
+GROUP BY
+  u.Id, u.DisplayName, u.Reputation
+ORDER BY
+  u.Reputation DESC, PostsCount DESC
+LIMIT 100;

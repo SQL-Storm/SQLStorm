@@ -1,0 +1,318 @@
+with recent_users as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Location,
+        u.CreationDate,
+        u.UpVotes,
+        u.DownVotes,
+        u.Views,
+        coalesce(nullif(trim(u.WebsiteUrl), ''), '(none)') as WebsiteUrlNorm
+    from Users u
+    where u.CreationDate >= (select date_trunc('year', max(CreationDate)) - interval '2 years' from Users)
+),
+user_activity as (
+    select
+        p.OwnerUserId as UserId,
+        count(*) filter (where p.PostTypeId = 1) as Questions,
+        count(*) filter (where p.PostTypeId = 2) as Answers,
+        sum(p.Score) as TotalPostScore,
+        avg(nullif(p.Score, 0)) as AvgNonZeroScore,
+        sum(coalesce(p.ViewCount, 0)) as TotalViews,
+        max(p.LastActivityDate) as LastActivityDate,
+        count(*) filter (where p.CommunityOwnedDate is not null) as CommunityOwnedPosts,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as DistinctQuestions
+    from Posts p
+    where p.OwnerUserId is not null
+    group by p.OwnerUserId
+),
+answer_accepts as (
+    select
+        a.OwnerUserId as UserId,
+        count(*) filter (where q.AcceptedAnswerId = a.Id) as AcceptedAnswers,
+        count(*) as TotalAnswers
+    from Posts a
+    join Posts q on q.Id = a.ParentId and a.PostTypeId = 2 and q.PostTypeId = 1
+    group by a.OwnerUserId
+),
+comment_stats as (
+    select
+        c.UserId as UserId,
+        count(*) as CommentCount,
+        coalesce(avg(nullif(c.Score, 0)), 0) as AvgNonZeroCommentScore,
+        max(c.CreationDate) as LastCommentDate,
+        sum(case when lower(c.Text) like '%thanks%' then 1 else 0 end) as ThanksComments,
+        sum(case when c.Text ~* '\\y(pls|please)\\y' then 1 else 0 end) as PleaseComments
+    from Comments c
+    where c.UserId is not null
+    group by c.UserId
+),
+vote_breakdown as (
+    select
+        v.UserId as UserId,
+        count(*) filter (where v.VoteTypeId = 2) as UpVotesGiven,
+        count(*) filter (where v.VoteTypeId = 3) as DownVotesGiven,
+        count(*) filter (where v.VoteTypeId = 5) as FavoritesGiven,
+        count(*) filter (where v.VoteTypeId in (8,9)) as BountyEvents,
+        sum(coalesce(v.BountyAmount,0) * case when v.VoteTypeId = 8 then 1 when v.VoteTypeId = 9 then -1 else 0 end) as NetBounty
+    from Votes v
+    where v.UserId is not null
+    group by v.UserId
+),
+badge_tally as (
+    select
+        b.UserId,
+        count(*) as TotalBadges,
+        count(*) filter (where b.Class = 1) as GoldBadges,
+        count(*) filter (where b.Class = 2) as SilverBadges,
+        count(*) filter (where b.Class = 3) as BronzeBadges,
+        count(*) filter (where b.TagBased = true) as TagBadges,
+        min(b.Date) as FirstBadgeDate,
+        max(b.Date) as LastBadgeDate
+    from Badges b
+    group by b.UserId
+),
+question_tag_stats as (
+    select
+        p.OwnerUserId as UserId,
+        count(*) as TaggedQuestions,
+        count(*) filter (where p.Tags is null) as UntaggedQuestions,
+        sum(array_length(string_to_array(substring(p.Tags, 2, greatest(length(p.Tags)-2,0)), '><'), 1)) as TotalTagUsages,
+        max(p.CreationDate) as LastQuestionDate
+    from Posts p
+    where p.PostTypeId = 1 and p.OwnerUserId is not null
+    group by p.OwnerUserId
+),
+edit_events as (
+    select
+        ph.UserId as UserId,
+        count(*) filter (where ph.PostHistoryTypeId in (4,5,6)) as EditsMade,
+        count(*) filter (where ph.PostHistoryTypeId in (10)) as CloseVotes,
+        count(*) filter (where ph.PostHistoryTypeId in (11)) as ReopenVotes,
+        count(*) filter (where ph.PostHistoryTypeId in (12)) as DeleteVotes,
+        count(*) filter (where ph.PostHistoryTypeId in (13)) as UndeleteVotes,
+        count(*) filter (where ph.PostHistoryTypeId in (50)) as CommunityBumps,
+        max(ph.CreationDate) as LastEditEvent
+    from PostHistory ph
+    where ph.UserId is not null
+    group by ph.UserId
+),
+dupe_links as (
+    select
+        pl.PostId,
+        count(*) filter (where pl.LinkTypeId = 3) as DuplicateLinks
+    from PostLinks pl
+    group by pl.PostId
+),
+question_quality as (
+    select
+        q.OwnerUserId as UserId,
+        count(*) filter (where q.Score >= 5) as GoodQuestions,
+        count(*) filter (where q.Score <= 0) as LowScoreQuestions,
+        count(*) filter (where q.ClosedDate is not null) as ClosedQuestions,
+        count(*) filter (where coalesce(dl.DuplicateLinks,0) > 0) as MarkedDuplicate,
+        avg(nullif(q.ViewCount,0)) as AvgNonZeroViews
+    from Posts q
+    left join dupe_links dl on dl.PostId = q.Id
+    where q.PostTypeId = 1 and q.OwnerUserId is not null
+    group by q.OwnerUserId
+),
+answer_quality as (
+    select
+        a.OwnerUserId as UserId,
+        count(*) filter (where a.Score >= 5) as GoodAnswers,
+        count(*) filter (where a.Score <= 0) as LowScoreAnswers,
+        count(*) filter (where a.CreationDate >= (timestamp '2024-10-01 12:34:56' - interval '180 days')) as RecentAnswers
+    from Posts a
+    where a.PostTypeId = 2 and a.OwnerUserId is not null
+    group by a.OwnerUserId
+),
+engagement as (
+    select
+        ru.UserId,
+        ru.DisplayName,
+        ru.Reputation,
+        ru.Location,
+        ru.CreationDate,
+        ru.WebsiteUrlNorm,
+        ua.Questions,
+        ua.Answers,
+        ua.TotalPostScore,
+        ua.AvgNonZeroScore,
+        ua.TotalViews,
+        ua.LastActivityDate,
+        ua.CommunityOwnedPosts,
+        ac.AcceptedAnswers,
+        ac.TotalAnswers,
+        cs.CommentCount,
+        cs.AvgNonZeroCommentScore,
+        cs.LastCommentDate,
+        cs.ThanksComments,
+        cs.PleaseComments,
+        vb.UpVotesGiven,
+        vb.DownVotesGiven,
+        vb.FavoritesGiven,
+        vb.BountyEvents,
+        vb.NetBounty,
+        bt.TotalBadges,
+        bt.GoldBadges,
+        bt.SilverBadges,
+        bt.BronzeBadges,
+        bt.TagBadges,
+        bt.FirstBadgeDate,
+        bt.LastBadgeDate,
+        qts.TaggedQuestions,
+        qts.UntaggedQuestions,
+        qts.TotalTagUsages,
+        qts.LastQuestionDate,
+        qe.GoodQuestions,
+        qe.LowScoreQuestions,
+        qe.ClosedQuestions,
+        qe.MarkedDuplicate,
+        qe.AvgNonZeroViews as AvgQViewsNonZero,
+        ae.GoodAnswers,
+        ae.LowScoreAnswers,
+        ae.RecentAnswers,
+        ee.EditsMade,
+        ee.CloseVotes,
+        ee.ReopenVotes,
+        ee.DeleteVotes,
+        ee.UndeleteVotes,
+        ee.CommunityBumps,
+        ee.LastEditEvent
+    from recent_users ru
+    left join user_activity ua on ua.UserId = ru.UserId
+    left join answer_accepts ac on ac.UserId = ru.UserId
+    left join comment_stats cs on cs.UserId = ru.UserId
+    left join vote_breakdown vb on vb.UserId = ru.UserId
+    left join badge_tally bt on bt.UserId = ru.UserId
+    left join question_tag_stats qts on qts.UserId = ru.UserId
+    left join question_quality qe on qe.UserId = ru.UserId
+    left join answer_quality ae on ae.UserId = ru.UserId
+    left join edit_events ee on ee.UserId = ru.UserId
+),
+scored as (
+    select
+        e.*,
+        coalesce(cast(acceptedanswers as numeric) / nullif(totalanswers,0), 0) as AcceptRate,
+        coalesce(cast(answers as numeric) / nullif(greatest(extract(day from (timestamp '2024-10-01 12:34:56' - e.CreationDate)),1),0), 1) as AnswersPerDaySinceJoin,
+        coalesce(cast(questions as numeric) / nullif(greatest(extract(day from (timestamp '2024-10-01 12:34:56' - e.CreationDate)),1),0), 1) as QuestionsPerDaySinceJoin,
+        case
+            when e.Reputation >= 20000 then 'legend'
+            when e.Reputation >= 10000 then 'expert'
+            when e.Reputation >= 3000 then 'advanced'
+            when e.Reputation >= 1000 then 'intermediate'
+            else 'novice'
+        end as RepTier,
+        (cast(coalesce(GoodAnswers,0) * 2 + coalesce(GoodQuestions,0) - coalesce(LowScoreAnswers,0) - coalesce(LowScoreQuestions,0) as int)) as QualityDelta,
+        (coalesce(UpVotesGiven,0) - coalesce(DownVotesGiven,0)) as NetVotesGiven,
+        coalesce(TotalPostScore,0) + coalesce(bt.GoldBadges,0)*50 + coalesce(bt.SilverBadges,0)*10 + coalesce(bt.BronzeBadges,0)*2 as WeightedScore
+    from engagement e
+    left join badge_tally bt on bt.UserId = e.UserId
+),
+ranked as (
+    select
+        s.*,
+        row_number() over (order by s.WeightedScore desc, s.QualityDelta desc, s.Reputation desc) as GlobalRowNum,
+        dense_rank() over (order by s.RepTier desc, s.WeightedScore desc) as TierRank,
+        percent_rank() over (order by s.WeightedScore desc) as WeightedPct,
+        ntile(10) over (order by s.WeightedScore desc) as WeightedDecile,
+        sum(coalesce(s.TotalViews,0)) over () as SumAllViews,
+        avg(coalesce(s.AvgNonZeroScore,0)) over () as GlobalAvgNonZeroPostScore
+    from scored s
+),
+peer_context as (
+    select
+        r.*,
+        avg(WeightedScore) over (partition by RepTier) as AvgTierWeightedScore,
+        avg(QualityDelta) over (partition by RepTier) as AvgTierQualityDelta,
+        count(*) over (partition by RepTier) as TierPopulation
+    from ranked r
+),
+stringified as (
+    select
+        p.*,
+        trim(both ' ' from coalesce(p.DisplayName, 'user-' || cast(p.UserId as varchar))) as SafeName,
+        coalesce(nullif(p.Location, ''), 'Unknown') as LocationNorm,
+        case when p.WebsiteUrlNorm ~* '^(https?://|www\\.)' then p.WebsiteUrlNorm else '(none)' end as WebsiteNorm2,
+        coalesce(to_char(p.LastActivityDate, 'YYYY-MM-DD'), 'N/A') as LastActStr,
+        coalesce(to_char(p.LastQuestionDate, 'YYYY-MM-DD'), 'N/A') as LastQStr,
+        coalesce(to_char(p.LastCommentDate, 'YYYY-MM-DD'), 'N/A') as LastCStr,
+        coalesce(to_char(p.LastEditEvent, 'YYYY-MM-DD'), 'N/A') as LastEditStr
+    from peer_context p
+),
+null_safety as (
+    select
+        s.*,
+        coalesce(Questions,0) as Questions0,
+        coalesce(Answers,0) as Answers0,
+        coalesce(CommentCount,0) as CommentCount0,
+        coalesce(TotalBadges,0) as TotalBadges0,
+        coalesce(UpVotesGiven,0) as UpVotesGiven0,
+        coalesce(DownVotesGiven,0) as DownVotesGiven0
+    from stringified s
+),
+outliers as (
+    select
+        n.UserId,
+        case when n.WeightedScore > (AvgTierWeightedScore + 2 * nullif(stddev_pop(WeightedScore) over (partition by RepTier),0)) then 1 else 0 end as IsHighOutlier,
+        case when n.WeightedScore < (AvgTierWeightedScore - 2 * nullif(stddev_pop(WeightedScore) over (partition by RepTier),0)) then 1 else 0 end as IsLowOutlier
+    from null_safety n
+)
+select
+    n.UserId,
+    n.SafeName as DisplayName,
+    n.RepTier,
+    n.Reputation,
+    n.Questions0 as Questions,
+    n.Answers0 as Answers,
+    n.AcceptRate,
+    round(cast(n.AnswersPerDaySinceJoin as numeric), 3) as AnswersPerDay,
+    round(cast(n.QuestionsPerDaySinceJoin as numeric), 3) as QuestionsPerDay,
+    n.QualityDelta,
+    n.WeightedScore,
+    n.TierRank,
+    n.WeightedDecile,
+    round(cast(n.WeightedPct as numeric), 4) as WeightedPct,
+    n.TotalBadges0 as TotalBadges,
+    n.GoldBadges,
+    n.SilverBadges,
+    n.BronzeBadges,
+    n.UpVotesGiven0 as UpVotesGiven,
+    n.DownVotesGiven0 as DownVotesGiven,
+    n.NetVotesGiven,
+    n.NetBounty,
+    n.TaggedQuestions,
+    n.UntaggedQuestions,
+    n.TotalTagUsages,
+    n.GoodQuestions,
+    n.LowScoreQuestions,
+    n.ClosedQuestions,
+    n.MarkedDuplicate,
+    n.GoodAnswers,
+    n.LowScoreAnswers,
+    n.RecentAnswers,
+    n.CommentCount0 as CommentCount,
+    n.AvgNonZeroCommentScore,
+    n.CommunityOwnedPosts,
+    n.AvgQViewsNonZero,
+    n.SumAllViews,
+    n.GlobalAvgNonZeroPostScore,
+    n.LocationNorm as Location,
+    n.WebsiteNorm2 as Website,
+    n.LastActStr as LastActivityDate,
+    n.LastQStr as LastQuestionDate,
+    n.LastCStr as LastCommentDate,
+    n.LastEditStr as LastEditEvent,
+    case when o.IsHighOutlier = 1 then 'high' when o.IsLowOutlier = 1 then 'low' else 'normal' end as TierOutlierClass
+from null_safety n
+left join outliers o on o.UserId = n.UserId
+where coalesce(n.Answers0,0) + coalesce(n.Questions0,0) > 0
+  and (
+      n.WeightedDecile <= 2
+      or (n.AcceptRate >= 0.5 and n.GoodAnswers >= 5)
+      or (n.GoodQuestions >= 3 and n.ClosedQuestions = 0)
+  )
+order by n.WeightedScore desc, n.QualityDelta desc, n.Reputation desc
+fetch first 250 rows only;

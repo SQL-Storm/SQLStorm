@@ -1,0 +1,228 @@
+-- {"query": "1109.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3226} 
+WITH UserOverallStats AS (
+    -- Aggregates user-specific statistics including total posts, comments, badges, and reputation tiers.
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswers,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(COALESCE(P.Score, 0)) AS TotalPostScore,
+        SUM(COALESCE(C.Score, 0)) AS TotalCommentScore,
+        U.LastAccessDate,
+        -- Complex CASE expression for reputation tier based on a log-like scale.
+        CASE
+            WHEN U.Reputation >= 100000 THEN 'Legendary'
+            WHEN U.Reputation >= 25000 THEN 'Epic'
+            WHEN U.Reputation >= 5000 THEN 'Veteran'
+            WHEN U.Reputation >= 1000 THEN 'Experienced'
+            WHEN U.Reputation >= 100 THEN 'Active'
+            ELSE 'Novice'
+        END AS ReputationTier,
+        -- Date difference calculation for user activity duration.
+        EXTRACT(DAY FROM (U.LastAccessDate - U.CreationDate)) AS DaysActive
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    LEFT JOIN Badges AS B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate
+),
+PostPerformanceMetrics AS (
+    -- Calculates various performance metrics for posts, including vote counts, closure status, and uses window functions.
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.AcceptedAnswerId,
+        P.CreationDate AS PostCreationDate,
+        P.ViewCount,
+        P.AnswerCount,
+        P.Score AS PostScore,
+        P.FavoriteCount,
+        P.ClosedDate,
+        P.LastActivityDate,
+        -- String expression with NULL handling for post title snippet.
+        COALESCE(P.Title, SUBSTRING(P.Body, 1, 100)) AS PostTitleSnippet,
+        -- String expression to count tags for a post, handles potential NULL Tags.
+        COALESCE(ARRAY_LENGTH(string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><'), 1), 0) AS NumberOfTags,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived,
+        SUM(CASE WHEN V.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoritesCounted, -- Note: VoteType 5 historically existed but replaced by 'Saves'
+        -- Conditional aggregation to check if a post was closed.
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (10, 101, 102, 103, 104, 105) THEN 1 ELSE 0 END) AS WasClosed,
+        -- Window function: Ranks posts by score within each PostType.
+        ROW_NUMBER() OVER(PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.CreationDate ASC) AS RankInPostTypeByScore,
+        -- Window function: Calculates a running average of a user's post scores over time.
+        AVG(P.Score) OVER(PARTITION BY P.OwnerUserId ORDER BY P.CreationDate) AS RunningAvgUserPostScore,
+        -- Window function: Gets the creation date of the previous post by the same user.
+        LAG(P.CreationDate, 1) OVER(PARTITION BY P.OwnerUserId ORDER BY P.CreationDate) AS PrevPostCreationDate
+    FROM Posts AS P
+    LEFT JOIN Votes AS V ON P.Id = V.PostId
+    LEFT JOIN PostHistory AS PH ON P.Id = PH.PostId
+    WHERE P.PostTypeId IN (1, 2) -- Focus on Questions and Answers
+    GROUP BY P.Id, P.PostTypeId, P.OwnerUserId, P.AcceptedAnswerId, P.CreationDate, P.ViewCount, P.AnswerCount, P.Score, P.FavoriteCount, P.ClosedDate, P.LastActivityDate, P.Title, P.Body, P.Tags
+),
+TagPerformance AS (
+    -- Analyzes global tag performance, including average post score and accepted answer ratio for questions using specific tags.
+    SELECT
+        T.TagName,
+        T.Count AS TagUseCount,
+        COUNT(DISTINCT P.Id) AS PostsWithTag,
+        AVG(P.Score) AS AvgPostScoreForTag,
+        MAX(P.ViewCount) AS MaxViewCountForTag,
+        -- Complex calculation: Ratio of questions with accepted answers for a given tag, with NULL handling.
+        CAST(COUNT(DISTINCT CASE WHEN P.AcceptedAnswerId IS NOT NULL THEN P.Id END) AS NUMERIC) /
+        NULLIF(COUNT(DISTINCT P.Id), 0) AS AcceptedAnswerRatio
+    FROM Tags AS T
+    JOIN Posts AS P ON P.Tags LIKE '%' || T.TagName || '%' AND P.PostTypeId = 1 -- Only questions for tag analysis
+    GROUP BY T.Id, T.TagName, T.Count
+    HAVING COUNT(DISTINCT P.Id) > 10 -- Filters for tags with significant usage
+),
+CommentEngagement AS (
+    -- Aggregates comment statistics per post and uses a correlated subquery for specific comment analysis.
+    SELECT
+        C.PostId,
+        COUNT(C.Id) AS TotalCommentsOnPost,
+        SUM(C.Score) AS TotalCommentScoreOnPost,
+        MAX(C.CreationDate) AS LastCommentDate,
+        -- Correlated subquery: Finds the maximum length of a comment made by a non-owner on the post.
+        (SELECT MAX(LENGTH(C2.Text))
+         FROM Comments AS C2
+         WHERE C2.PostId = C.PostId
+           AND C2.UserId IS NOT NULL
+           AND C2.UserId <> P.OwnerUserId
+        ) AS MaxNonOwnerCommentLength,
+        -- Conditional aggregation with NULL handling for average positive comment length.
+        COALESCE(AVG(CASE WHEN C.Score > 0 THEN LENGTH(C.Text) END), 0) AS AvgPositiveCommentLength
+    FROM Comments AS C
+    JOIN Posts AS P ON C.PostId = P.Id -- Join to get P.OwnerUserId for the correlated subquery
+    GROUP BY C.PostId, P.OwnerUserId
+),
+ImpactfulContributions AS (
+    -- Uses a SET OPERATOR (UNION ALL) to combine high-score posts and high-score comments into a single dataset.
+    -- This identifies significant individual contributions from users.
+    -- High score posts
+    SELECT
+        P.OwnerUserId AS ContributorId,
+        P.Id AS ContributionId,
+        'Post' AS ContributionType,
+        P.Score AS ContributionScore,
+        P.CreationDate AS ContributionDate,
+        P.Title AS ContributionText,
+        NULL::INT AS ParentContributionId -- Explicit type cast for NULL
+    FROM Posts AS P
+    WHERE P.Score > 50 AND P.OwnerUserId IS NOT NULL
+      AND P.PostTypeId IN (1, 2)
+
+    UNION ALL
+
+    -- High score comments
+    SELECT
+        C.UserId AS ContributorId,
+        C.Id AS ContributionId,
+        'Comment' AS ContributionType,
+        C.Score AS ContributionScore,
+        C.CreationDate AS ContributionDate,
+        C.Text AS ContributionText,
+        C.PostId AS ParentContributionId
+    FROM Comments AS C
+    WHERE C.Score > 10 AND C.UserId IS NOT NULL
+)
+-- Main query: Combines all CTEs, applies complex filters, and derives final analytical metrics.
+SELECT
+    UOS.UserId,
+    UOS.DisplayName,
+    UOS.Reputation,
+    UOS.ReputationTier,
+    UOS.TotalPosts,
+    UOS.TotalQuestions,
+    UOS.TotalAnswers,
+    UOS.TotalComments,
+    UOS.TotalBadges,
+    (UOS.TotalPostScore + UOS.TotalCommentScore) AS CombinedContentScore, -- Elaborate calculation combining scores
+    UOS.DaysActive,
+    -- Ratio calculation with NULL handling using NULLIF.
+    CAST(UOS.TotalAnswers AS NUMERIC) / NULLIF(UOS.TotalQuestions, 0) AS AnswerQuestionRatio,
+
+    PPM.PostId,
+    PPM.PostTypeId,
+    PPM.PostTitleSnippet,
+    PPM.PostScore,
+    PPM.ViewCount,
+    PPM.AnswerCount,
+    PPM.NumberOfTags,
+    PPM.WasClosed,
+    (PPM.UpVotesReceived - PPM.DownVotesReceived) AS NetVotes,
+    (CAST(PPM.UpVotesReceived AS NUMERIC) / NULLIF(PPM.UpVotesReceived + PPM.DownVotesReceived, 0)) AS UpvoteRatio, -- More calculation with NULL handling
+    PPM.RankInPostTypeByScore,
+    PPM.RunningAvgUserPostScore,
+    -- Date difference calculation based on window function results.
+    EXTRACT(HOUR FROM (PPM.PostCreationDate - PPM.PrevPostCreationDate)) AS HoursSincePrevPost,
+
+    TP_Lat.TagName AS MostPopularTagWrittenAbout, -- From LATERAL JOIN
+    TP_Lat.AvgPostScoreForTag AS MostPopularTagAvgPostScore,
+    TP_Lat.AcceptedAnswerRatio AS MostPopularTagAcceptedAnswerRatio,
+
+    CE.TotalCommentsOnPost,
+    CE.TotalCommentScoreOnPost,
+    CE.MaxNonOwnerCommentLength,
+    CE.AvgPositiveCommentLength,
+
+    -- Subquery: Retrieves the name of the most frequent badge earned by the user.
+    (SELECT B.Name
+     FROM Badges AS B
+     WHERE B.UserId = UOS.UserId
+     GROUP BY B.Name
+     ORDER BY COUNT(B.Id) DESC, B.Name ASC
+     LIMIT 1
+    ) AS MostFrequentBadgeName,
+
+    -- Subquery: Retrieves the latest impactful contribution by the user, formatted as a string.
+    (SELECT IC.ContributionType || ' - ' || SUBSTRING(IC.ContributionText, 1, 50) || COALESCE(' (Score: ' || IC.ContributionScore || ')', '')
+     FROM ImpactfulContributions AS IC
+     WHERE IC.ContributorId = UOS.UserId
+     ORDER BY IC.ContributionDate DESC
+     LIMIT 1) AS LatestImpactfulContributionSummary,
+
+    CR.Name AS CloseReasonTypeName, -- From outer join to CloseReasonTypes
+
+    -- Conditional expression using EXISTS subquery to identify "high impact" posts based on score or comment count.
+    CASE WHEN EXISTS (
+        SELECT 1
+        FROM Posts AS HighImpactP
+        WHERE HighImpactP.Id = PPM.PostId
+          AND (HighImpactP.Score > 50 OR HighImpactP.CommentCount > 10)
+          AND HighImpactP.OwnerUserId = UOS.UserId -- Correlate to current user
+    ) THEN TRUE ELSE FALSE END AS IsHighImpactUserPost,
+
+    -- Complex expression: A custom "contributor activity score" combining various user metrics.
+    (UOS.Reputation * 0.1 + UOS.TotalBadges * 5 + UOS.TotalQuestions * 2 + UOS.TotalAnswers * 3 + UOS.TotalComments * 1.5 + COALESCE(PPM.NetVotes, 0) * 0.5) AS ContributorActivityScore
+FROM UserOverallStats AS UOS
+LEFT JOIN PostPerformanceMetrics AS PPM ON UOS.UserId = PPM.OwnerUserId
+LEFT JOIN LATERAL ( -- LATERAL JOIN: Dynamically finds the most popular tag associated with posts by the current user.
+    SELECT T.TagName, TP.AvgPostScoreForTag, TP.AcceptedAnswerRatio
+    FROM Posts AS P_tag
+    JOIN Tags AS T ON P_tag.Tags LIKE '%' || T.TagName || '%' -- Matching tags in string format
+    JOIN TagPerformance AS TP ON T.TagName = TP.TagName
+    WHERE P_tag.OwnerUserId = UOS.UserId
+    GROUP BY T.TagName, TP.AvgPostScoreForTag, TP.AcceptedAnswerRatio
+    ORDER BY SUM(P_tag.Score) DESC, TP.TagUseCount DESC
+    LIMIT 1
+) AS TP_Lat ON TRUE
+LEFT JOIN CommentEngagement AS CE ON PPM.PostId = CE.PostId
+LEFT JOIN PostHistory AS PH_closure ON PPM.PostId = PH_closure.PostId AND PH_closure.PostHistoryTypeId = 10 -- Join for closure history
+LEFT JOIN CloseReasonTypes AS CR ON PH_closure.Comment = CR.Id::text -- Joins closure reason type (string-to-int conversion)
+WHERE UOS.Reputation >= 1000 -- Filter for established users
+  AND PPM.PostTypeId = 1 -- Focus primarily on questions
+  AND PPM.PostScore > 5 -- Filter for higher-scored posts
+  AND PPM.ViewCount > 100 -- Filter for posts with significant views
+  AND PPM.RankInPostTypeByScore <= 100 -- Restrict to top 100 posts by score per type
+  AND PPM.ClosedDate IS NULL -- Only open questions
+  AND UOS.DisplayName IS NOT NULL AND UOS.DisplayName <> '' -- String predicate and NULL logic
+  AND PPM.PostTitleSnippet IS NOT NULL
+ORDER BY UOS.Reputation DESC, CombinedContentScore DESC, PPM.PostScore DESC
+LIMIT 5000;

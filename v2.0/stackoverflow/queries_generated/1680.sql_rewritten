@@ -1,0 +1,271 @@
+-- {"query": "1680.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3703} 
+WITH UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.CreationDate AS UserCreationDate,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL AND p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsWithAcceptedAnswer,
+        SUM(p.Score) AS TotalPostScore,
+        MAX(p.LastActivityDate) AS LastPostActivityDate,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.CreationDate, u.Reputation
+),
+PostQualityMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount AS DirectCommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        LENGTH(p.Body) AS BodyLength,
+        COUNT(DISTINCT ph.Id) AS TotalHistoryEntries,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditCount, -- Title, Body, Tags edits
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseHistoryCount,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate ELSE NULL END) AS LastCloseDate,
+        (SELECT COUNT(DISTINCT co.Id) FROM Comments co WHERE co.PostId = p.Id AND co.UserId IS NOT NULL) AS UserCommenters,
+        (SELECT SUM(co.Score) FROM Comments co WHERE co.PostId = p.Id) AS TotalCommentScore,
+        (SELECT COUNT(DISTINCT v.Id) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 5) AS FavoriteVoteCount -- Old favorite votes
+    FROM
+        Posts p
+    LEFT JOIN
+        PostHistory ph ON p.Id = ph.PostId
+    GROUP BY
+        p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.ClosedDate, p.Body
+),
+UserPostPerformance AS (
+    SELECT
+        ue.UserId,
+        ue.DisplayName,
+        ue.Reputation,
+        ue.TotalPosts,
+        ue.TotalQuestions,
+        ue.TotalAnswers,
+        ue.QuestionsWithAcceptedAnswer,
+        ue.TotalPostScore,
+        ue.GoldBadges,
+        ue.SilverBadges,
+        ue.BronzeBadges,
+        ue.LastPostActivityDate,
+        ue.TotalCommentsMade,
+        AVG(pq.PostScore) AS AvgPostScore,
+        AVG(pq.ViewCount) AS AvgPostViewCount,
+        SUM(CASE WHEN pq.PostTypeId = 1 THEN pq.EditCount ELSE 0 END) AS QuestionEditCount,
+        SUM(CASE WHEN pq.PostTypeId = 2 THEN pq.EditCount ELSE 0 END) AS AnswerEditCount,
+        SUM(CASE WHEN pq.ClosedDate IS NOT NULL THEN 1 ELSE 0 END) AS ClosedPostsCount,
+        MAX(pq.LastCloseDate) AS MostRecentPostCloseDate,
+        COUNT(DISTINCT pl.RelatedPostId) AS TotalLinkedPosts,
+        COUNT(DISTINCT pl_dup.RelatedPostId) AS TotalDuplicateSources,
+        SUM(CASE WHEN pq.PostTypeId = 1 THEN pq.FavoriteVoteCount ELSE 0 END) AS TotalQuestionFavoritesReceived
+    FROM
+        UserEngagement ue
+    LEFT JOIN
+        PostQualityMetrics pq ON ue.UserId = pq.OwnerUserId
+    LEFT JOIN
+        PostLinks pl ON pq.PostId = pl.PostId AND pl.LinkTypeId = 1 -- Linked posts
+    LEFT JOIN
+        PostLinks pl_dup ON pq.PostId = pl_dup.RelatedPostId AND pl_dup.LinkTypeId = 3 -- Posts that are duplicates OF this post
+    GROUP BY
+        ue.UserId, ue.DisplayName, ue.Reputation, ue.TotalPosts, ue.TotalQuestions, ue.TotalAnswers, ue.QuestionsWithAcceptedAnswer,
+        ue.TotalPostScore, ue.GoldBadges, ue.SilverBadges, ue.BronzeBadges, ue.LastPostActivityDate, ue.TotalCommentsMade
+),
+RecentUserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) AS RecentPosts,
+        COUNT(DISTINCT c.Id) AS RecentComments,
+        SUM(v.BountyAmount) AS TotalBountySpent,
+        (SELECT COUNT(DISTINCT ph.PostId) FROM PostHistory ph WHERE ph.UserId = u.Id AND ph.CreationDate > (u.LastAccessDate - INTERVAL '30 days')) AS RecentHistoryEdits,
+        RANK() OVER (ORDER BY u.LastAccessDate DESC, u.Reputation DESC) AS LastAccessRank
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId AND p.CreationDate > (u.LastAccessDate - INTERVAL '90 days')
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId AND c.CreationDate > (u.LastAccessDate - INTERVAL '60 days')
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId AND v.VoteTypeId = 8 -- BountyStart
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.LastAccessDate
+),
+TagPerformance AS (
+    SELECT
+        t.TagName,
+        t.Count AS TotalTagUses,
+        SUM(p.Score) AS TotalTagScore,
+        COUNT(DISTINCT p.Id) AS PostsWithTag,
+        AVG(p.ViewCount) AS AvgTagPostViewCount,
+        RANK() OVER (ORDER BY SUM(p.Score) DESC, COUNT(DISTINCT p.Id) DESC) AS TagRank
+    FROM
+        Tags t
+    JOIN
+        Posts p ON p.Tags LIKE '%<' || t.TagName || '>%' AND p.PostTypeId = 1 -- Only questions use tags, correct tag matching
+    GROUP BY
+        t.TagName, t.Count
+),
+CombinedUserInsights AS (
+    SELECT
+        COALESCE(upp.UserId, rua.UserId) AS UserId,
+        COALESCE(upp.DisplayName, rua.DisplayName) AS DisplayName,
+        COALESCE(upp.Reputation, rua.Reputation) AS Reputation,
+        COALESCE(upp.TotalPosts, 0) AS TotalPosts,
+        COALESCE(upp.TotalQuestions, 0) AS TotalQuestions,
+        COALESCE(upp.TotalAnswers, 0) AS TotalAnswers,
+        COALESCE(upp.QuestionsWithAcceptedAnswer, 0) AS QuestionsWithAcceptedAnswer,
+        COALESCE(upp.TotalPostScore, 0) AS TotalPostScore,
+        COALESCE(upp.GoldBadges, 0) AS GoldBadges,
+        COALESCE(upp.SilverBadges, 0) AS SilverBadges,
+        COALESCE(upp.BronzeBadges, 0) AS BronzeBadges,
+        COALESCE(upp.AvgPostScore, 0.0) AS AvgPostScore,
+        COALESCE(upp.AvgPostViewCount, 0.0) AS AvgPostViewCount,
+        COALESCE(upp.ClosedPostsCount, 0) AS ClosedPostsCount,
+        upp.MostRecentPostCloseDate, -- Can be NULL
+        COALESCE(upp.TotalLinkedPosts, 0) AS TotalLinkedPosts,
+        COALESCE(upp.TotalDuplicateSources, 0) AS TotalDuplicateSources,
+        rua.LastAccessDate,
+        COALESCE(rua.RecentPosts, 0) AS RecentPosts,
+        COALESCE(rua.RecentComments, 0) AS RecentComments,
+        COALESCE(rua.TotalBountySpent, 0) AS TotalBountySpent,
+        COALESCE(rua.RecentHistoryEdits, 0) AS RecentHistoryEdits,
+        rua.LastAccessRank, -- Can be NULL if no recent activity
+        (SELECT COUNT(DISTINCT v_acc.Id) FROM Votes v_acc JOIN Posts p_acc ON v_acc.PostId = p_acc.Id WHERE p_acc.OwnerUserId = COALESCE(upp.UserId, rua.UserId) AND v_acc.VoteTypeId = 1) AS AcceptedAnswerVotesGiven,
+        (SELECT COUNT(DISTINCT p_closed.Id) FROM Posts p_closed WHERE p_closed.OwnerUserId = COALESCE(upp.UserId, rua.UserId) AND p_closed.ClosedDate IS NOT NULL AND p_closed.ClosedDate > (COALESCE(upp.LastPostActivityDate, rua.LastAccessDate) - INTERVAL '1 year')) AS RecentlyClosedOwnedPosts,
+        COALESCE(rua.RecentPosts, 0) + COALESCE(rua.RecentComments, 0) AS EngagementScore,
+        CASE
+            WHEN COALESCE(upp.TotalQuestions, 0) > 0 THEN CAST(COALESCE(upp.QuestionsWithAcceptedAnswer, 0) AS DECIMAL) / COALESCE(upp.TotalQuestions, 1)
+            ELSE 0.0
+        END AS AcceptanceRateForQuestions,
+        LAG(COALESCE(upp.Reputation, rua.Reputation), 1, 0) OVER (ORDER BY COALESCE(upp.Reputation, rua.Reputation) DESC) AS PrevHigherReputation,
+        LEAD(COALESCE(upp.Reputation, rua.Reputation), 1, 0) OVER (ORDER BY COALESCE(upp.Reputation, rua.Reputation) DESC) AS NextLowerReputation,
+        REPLACE(REPLACE(u.AboutMe, '<p>', ''), '</p>', '') AS CleanAboutMeSnippet,
+        CASE
+            WHEN u.Location LIKE '%USA%' OR u.Location LIKE '%United States%' THEN 'USA'
+            WHEN u.Location LIKE '%UK%' OR u.Location LIKE '%United Kingdom%' THEN 'UK'
+            WHEN u.Location IS NULL OR u.Location = '' THEN 'Unknown'
+            ELSE 'Other'
+        END AS DerivedRegion
+    FROM
+        UserPostPerformance upp
+    FULL OUTER JOIN
+        RecentUserActivity rua ON upp.UserId = rua.UserId
+    LEFT JOIN
+        Users u ON COALESCE(upp.UserId, rua.UserId) = u.Id
+),
+ProblematicPostUserAnalysis AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(DISTINCT p.Id) AS TotalProblematicPosts,
+        SUM(CASE WHEN p.Score < 0 THEN 1 ELSE 0 END) AS NegativeScorePosts,
+        SUM(CASE WHEN p.ClosedDate IS NOT NULL AND p.ViewCount < 100 THEN 1 ELSE 0 END) AS LowViewClosedPosts,
+        SUM(pq.EditCount) AS EditsOnProblematicPosts,
+        AVG(EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate))) AS AvgTimeUntilLastActivity
+    FROM
+        Posts p
+    JOIN
+        PostQualityMetrics pq ON p.Id = pq.PostId
+    WHERE
+        p.Score < 0
+        OR p.ClosedDate IS NOT NULL
+        OR pq.EditCount > 5
+    GROUP BY
+        p.OwnerUserId
+)
+SELECT
+    cui.UserId,
+    cui.DisplayName,
+    cui.Reputation,
+    cui.TotalPosts,
+    cui.TotalQuestions,
+    cui.TotalAnswers,
+    cui.TotalPostScore,
+    cui.GoldBadges,
+    cui.SilverBadges,
+    cui.BronzeBadges,
+    cui.AvgPostScore,
+    cui.AvgPostViewCount,
+    cui.ClosedPostsCount,
+    cui.MostRecentPostCloseDate,
+    cui.TotalLinkedPosts,
+    cui.TotalDuplicateSources,
+    cui.LastAccessDate,
+    cui.RecentPosts,
+    cui.RecentComments,
+    cui.TotalBountySpent,
+    cui.RecentHistoryEdits,
+    cui.LastAccessRank,
+    cui.AcceptedAnswerVotesGiven,
+    cui.RecentlyClosedOwnedPosts,
+    cui.EngagementScore,
+    cui.AcceptanceRateForQuestions,
+    cui.PrevHigherReputation,
+    cui.NextLowerReputation,
+    cui.CleanAboutMeSnippet,
+    cui.DerivedRegion,
+    ppa.TotalProblematicPosts,
+    ppa.NegativeScorePosts,
+    ppa.LowViewClosedPosts,
+    ppa.EditsOnProblematicPosts,
+    ppa.AvgTimeUntilLastActivity,
+    tp.TagName AS TopTagByScore,
+    tp.TagRank AS TopTagRank,
+    (SELECT MAX(ph2.CreationDate) FROM PostHistory ph2 WHERE ph2.UserId = cui.UserId AND ph2.PostHistoryTypeId = 50) AS LastCommunityBump,
+    CASE
+        WHEN cui.Reputation >= 10000 AND cui.GoldBadges >= 5 AND cui.AcceptanceRateForQuestions > 0.5 THEN 'Highly Influential'
+        WHEN cui.Reputation >= 5000 AND cui.SilverBadges >= 10 AND cui.EngagementScore >= 10 THEN 'Engaged Contributor'
+        WHEN cui.ClosedPostsCount > 0 OR ppa.TotalProblematicPosts > 0 THEN 'Potential Problematic User'
+        ELSE 'Regular Contributor'
+    END AS UserPersona
+FROM
+    CombinedUserInsights cui
+LEFT JOIN
+    ProblematicPostUserAnalysis ppa ON cui.UserId = ppa.UserId
+LEFT JOIN LATERAL ( -- Lateral join to get the top tag by score for each user
+    SELECT
+        t2.TagName,
+        tp2.TagRank
+    FROM
+        Posts p_tag
+    JOIN
+        Tags t2 ON p_tag.Tags LIKE '%<' || t2.TagName || '>%'
+    JOIN
+        TagPerformance tp2 ON t2.TagName = tp2.TagName
+    WHERE
+        p_tag.OwnerUserId = cui.UserId
+        AND p_tag.PostTypeId = 1 -- only questions have tags
+    GROUP BY
+        t2.TagName, tp2.TagRank
+    ORDER BY
+        SUM(p_tag.Score) DESC, COUNT(p_tag.Id) DESC
+    LIMIT 1
+) tp ON TRUE
+WHERE
+    cui.Reputation > 500
+    AND (cui.LastAccessDate IS NULL OR cui.LastAccessDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '6 months') -- Active or potential old user
+    AND (cui.TotalPosts > 10 OR cui.TotalCommentsMade > 20)
+    AND (cui.CleanAboutMeSnippet LIKE '%SQL%' OR cui.CleanAboutMeSnippet LIKE '%data%' OR cui.DerivedRegion = 'USA')
+ORDER BY
+    cui.Reputation DESC, EngagementScore DESC
+LIMIT 10000;

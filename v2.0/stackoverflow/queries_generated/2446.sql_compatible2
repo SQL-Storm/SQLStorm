@@ -1,0 +1,255 @@
+WITH RECURSIVE RecursiveCTE AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        tags_array.tag,
+        row_number() OVER (PARTITION BY p.Id ORDER BY p.CreationDate) AS tag_seq,
+        1 AS level
+    FROM Posts p
+    CROSS JOIN LATERAL (
+        SELECT unnest(string_to_array(substring(coalesce(p.Tags, ''), 2, length(coalesce(p.Tags, '')) - 2), '><')) AS tag
+    ) tags_array
+
+    UNION ALL
+
+    SELECT
+        r.Id,
+        r.PostTypeId,
+        r.OwnerUserId,
+        r.Score,
+        r.ViewCount,
+        r.CreationDate,
+        r.tag,
+        r.tag_seq,
+        r.level + 1
+    FROM RecursiveCTE r
+    WHERE r.level < 1
+),
+UserBadgeCount AS (
+    SELECT
+        b.UserId,
+        count(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        count(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        count(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+PostCommentsAgg AS (
+    SELECT
+        c.PostId,
+        count(*) AS CommentCount,
+        sum(c.Score) AS TotalCommentScore,
+        max(c.CreationDate) AS LastCommentDate,
+        -- ORDER BY expression must appear in argument list when using DISTINCT in Postgres.
+        -- Use array_agg of (CreationDate, UserDisplayName) and then extract distinct names ordered by CreationDate.
+        (
+          SELECT string_agg(distinct_name, ', ')
+          FROM (
+            SELECT DISTINCT ON (ci.UserDisplayName) ci.UserDisplayName AS distinct_name, ci.CreationDate
+            FROM Comments ci
+            WHERE ci.PostId = c.PostId
+            ORDER BY ci.UserDisplayName, ci.CreationDate DESC
+          ) s
+          ORDER BY s.CreationDate DESC
+        ) AS RecentCommenters
+    FROM Comments c
+    GROUP BY c.PostId
+),
+PostAcceptedAnswerDetails AS (
+    SELECT
+        q.Id AS QuestionId,
+        a.Id AS AcceptedAnswerId,
+        a.Score AS AnswerScore,
+        a.ViewCount AS AnswerViewCount,
+        a.OwnerUserId AS AnswerOwnerUserId,
+        u.DisplayName AS AnswerOwnerDisplayName,
+        row_number() OVER (PARTITION BY q.Id ORDER BY a.Score DESC) rn
+    FROM Posts q
+    LEFT JOIN Posts a ON a.Id = q.AcceptedAnswerId AND a.PostTypeId = 2
+    LEFT JOIN Users u ON u.Id = a.OwnerUserId
+    WHERE q.PostTypeId = 1
+),
+DuplicateLinksCount AS (
+    SELECT
+        pl.PostId,
+        count(CASE WHEN pl.LinkTypeId = 3 THEN 1 END) AS DuplicateCount,
+        bool_or(pl.CreationDate > (CAST('2024-10-01' AS date) - INTERVAL '30 days')) AS HasRecentDuplicateLink
+    FROM PostLinks pl
+    GROUP BY pl.PostId
+),
+PostHistoryCloseInfo AS (
+    SELECT
+        ph.PostId,
+        max(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) AS LastCloseDate,
+        max(CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.CreationDate END) AS LastReopenDate,
+        count(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 END) AS CloseCount,
+        count(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 END) AS ReopenCount,
+        max(c.CloseReasonTypes_Name) AS CloseReasonName
+    FROM PostHistory ph
+    LEFT JOIN (
+        SELECT crt.Id, crt.Name AS CloseReasonTypes_Name FROM CloseReasonTypes crt
+    ) c ON c.Id = CASE WHEN ph.PostHistoryTypeId = 10 THEN CAST(ph.Comment AS integer) ELSE NULL END
+    GROUP BY ph.PostId
+),
+UserActivityRank AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        count(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+        count(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswerCount,
+        rank() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+TopTagsByCount AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        p.Id AS ExcerptPostId,
+        -- For portability, build ordered distinct list via subquery
+        (
+          SELECT string_agg(displayname, ', ')
+          FROM (
+            SELECT DISTINCT u.DisplayName AS displayname, u.Reputation
+            FROM Users u
+            JOIN Posts p2 ON p2.OwnerUserId = u.Id
+            WHERE p2.Id = t.ExcerptPostId
+            ORDER BY u.Reputation DESC
+          ) s
+        ) AS TopTagOwners
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Id = t.ExcerptPostId
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    GROUP BY t.TagName, t.Count, p.Id
+),
+CombinedQuestions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName,
+        array_agg(DISTINCT r.tag) FILTER (WHERE r.tag IS NOT NULL) AS Tags,
+        coalesce(dc.DuplicateCount, 0) AS DuplicateCount,
+        coalesce(dc.HasRecentDuplicateLink, false) AS HasRecentDuplicateLink,
+        coalesce(pc.CommentCount, 0) AS CommentCount,
+        coalesce(pc.TotalCommentScore, 0) AS TotalCommentScore,
+        aca.AcceptedAnswerId,
+        aca.AnswerScore,
+        aca.AnswerViewCount,
+        aca.AnswerOwnerUserId,
+        aca.AnswerOwnerDisplayName,
+        phci.LastCloseDate,
+        phci.LastReopenDate,
+        phci.CloseCount,
+        phci.ReopenCount,
+        phci.CloseReasonName,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    LEFT JOIN RecursiveCTE r ON r.Id = p.Id
+    LEFT JOIN DuplicateLinksCount dc ON dc.PostId = p.Id
+    LEFT JOIN PostCommentsAgg pc ON pc.PostId = p.Id
+    LEFT JOIN PostAcceptedAnswerDetails aca ON aca.QuestionId = p.Id
+    LEFT JOIN PostHistoryCloseInfo phci ON phci.PostId = p.Id
+    LEFT JOIN UserBadgeCount ub ON ub.UserId = p.OwnerUserId
+    WHERE p.PostTypeId = 1
+    GROUP BY
+        p.Id, p.Title, p.Score, p.ViewCount, p.CreationDate,
+        p.OwnerUserId, u.DisplayName, dc.DuplicateCount, dc.HasRecentDuplicateLink,
+        pc.CommentCount, pc.TotalCommentScore, aca.AcceptedAnswerId, aca.AnswerScore, aca.AnswerViewCount,
+        aca.AnswerOwnerUserId, aca.AnswerOwnerDisplayName, phci.LastCloseDate, phci.LastReopenDate,
+        phci.CloseCount, phci.ReopenCount, phci.CloseReasonName, ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges
+),
+QuestionRanks AS (
+    SELECT
+        cq.*,
+        dense_rank() OVER (ORDER BY cq.Score DESC, cq.ViewCount DESC, cardinality(cq.Tags) DESC) AS PopularityRank,
+        ntile(4) OVER (ORDER BY cq.CreationDate) AS CreationQuartile
+    FROM CombinedQuestions cq
+),
+FinalSelection AS (
+    SELECT
+        qr.Id AS QuestionId,
+        qr.Title AS QuestionTitle,
+        qr.Score AS QuestionScore,
+        qr.ViewCount AS QuestionViews,
+        qr.CreationDate AS AskedOn,
+        qr.DisplayName AS AskedBy,
+        qr.GoldBadges, qr.SilverBadges, qr.BronzeBadges,
+        qr.Tags,
+        qr.DuplicateCount,
+        qr.HasRecentDuplicateLink,
+        qr.CommentCount,
+        qr.TotalCommentScore,
+        qr.AcceptedAnswerId,
+        qr.AnswerScore,
+        qr.AnswerViewCount,
+        qr.AnswerOwnerUserId,
+        qr.AnswerOwnerDisplayName,
+        qr.LastCloseDate,
+        qr.LastReopenDate,
+        qr.CloseCount,
+        qr.ReopenCount,
+        qr.CloseReasonName,
+        qr.PopularityRank,
+        qr.CreationQuartile,
+        (
+         SELECT string_agg(vt.Name, ', ')
+         FROM Votes v
+         JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+         WHERE v.PostId = qr.Id AND v.CreationDate > (CAST('2024-10-01' AS date) - INTERVAL '90 days')
+        ) AS RecentVoteTypes,
+        CASE 
+            WHEN qr.Score > 100 THEN 'Hot Question'
+            WHEN qr.DuplicateCount > 3 THEN 'Likely Duplicate'
+            WHEN qr.CloseCount > qr.ReopenCount THEN 'Closed'
+            WHEN coalesce(qr.HasRecentDuplicateLink, false) = true THEN 'Duplicate Recently Linked'
+            ELSE 'Normal'
+        END AS StatusLabel
+    FROM QuestionRanks qr
+    WHERE qr.PopularityRank <= 100
+)
+SELECT 
+    fs.QuestionId,
+    fs.QuestionTitle,
+    fs.AskedBy,
+    fs.AskedOn,
+    fs.QuestionScore,
+    fs.QuestionViews,
+    fs.GoldBadges,
+    fs.SilverBadges,
+    fs.BronzeBadges,
+    coalesce(array_to_string(fs.Tags, ', '), 'No Tags') AS TagList,
+    fs.DuplicateCount,
+    fs.HasRecentDuplicateLink,
+    fs.CommentCount,
+    fs.TotalCommentScore,
+    fs.AcceptedAnswerId,
+    fs.AnswerScore,
+    fs.AnswerViewCount,
+    fs.AnswerOwnerUserId,
+    fs.AnswerOwnerDisplayName,
+    fs.LastCloseDate,
+    fs.LastReopenDate,
+    fs.CloseCount,
+    fs.ReopenCount,
+    fs.CloseReasonName,
+    fs.RecentVoteTypes,
+    fs.StatusLabel,
+    fs.PopularityRank,
+    fs.CreationQuartile
+FROM FinalSelection fs
+ORDER BY fs.PopularityRank, fs.QuestionScore DESC, fs.QuestionViews DESC
+LIMIT 50;

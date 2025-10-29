@@ -1,0 +1,179 @@
+-- {"query": "3950.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2582} 
+WITH TopTags AS (
+    SELECT 
+        TagName,
+        Count,
+        ROW_NUMBER() OVER (ORDER BY Count DESC) AS rn
+    FROM Tags
+    WHERE IsModeratorOnly = 0 
+      AND IsRequired = 0
+),
+QuestionStats AS (
+    SELECT 
+        p.Id                         AS QuestionId,
+        p.Title,
+        p.CreationDate,
+        p.Score                      AS QuestionScore,
+        p.ViewCount,
+        p.FavoriteCount,
+        p.Tags,
+        p.ClosedDate,
+        u.Id                         AS OwnerUserId,
+        COALESCE(u.Reputation,0)     AS OwnerReputation,
+        (SELECT COUNT(*) 
+         FROM Posts a 
+         WHERE a.ParentId = p.Id 
+           AND a.PostTypeId = 2)    AS AnswerCount,
+        (SELECT AVG(a.Score) 
+         FROM Posts a 
+         WHERE a.ParentId = p.Id 
+           AND a.PostTypeId = 2)    AS AvgAnswerScore,
+        (SELECT MAX(v.CreationDate) 
+         FROM Votes v 
+         WHERE v.PostId = p.Id 
+           AND v.VoteTypeId = 2)    AS LastUpvoteDate
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1                                   -- only questions
+      AND p.CreationDate >= DATE '2020-01-01'
+),
+TagExplode AS (
+    SELECT 
+        q.QuestionId,
+        TRIM(BOTH '><' FROM UNNEST(STRING_TO_ARRAY(SUBSTRING(q.Tags,2,LENGTH(q.Tags)-2), '><')) ) AS Tag
+    FROM QuestionStats q
+),
+TagMetrics AS (
+    SELECT 
+        te.QuestionId,
+        te.Tag,
+        t.Count                         AS TagGlobalCount,
+        ROW_NUMBER() OVER (PARTITION BY te.QuestionId ORDER BY t.Count DESC) AS TagRank
+    FROM TagExplode te
+    LEFT JOIN Tags t ON t.TagName = te.Tag
+),
+UserBadgeCounts AS (
+    SELECT 
+        UserId,
+        COUNT(*) AS BadgeCount
+    FROM Badges
+    WHERE Class = 2                                          -- silver badges only
+    GROUP BY UserId
+),
+RankedQuestions AS (
+    SELECT 
+        qs.*,
+        ROW_NUMBER() OVER (PARTITION BY qs.OwnerUserId ORDER BY qs.QuestionScore DESC, qs.CreationDate) AS UserQuestionRank,
+        COALESCE(ubc.BadgeCount,0)       AS OwnerBadgeCount,
+        CASE WHEN qs.ClosedDate IS NOT NULL THEN 1 ELSE 0 END                  AS IsClosed,
+        (SELECT STRING_AGG(DISTINCT CAST(v.VoteTypeId AS VARCHAR), ',')
+         FROM Votes v
+         WHERE v.PostId = qs.QuestionId) AS VoteTypesSeen
+    FROM QuestionStats qs
+    LEFT JOIN UserBadgeCounts ubc ON ubc.UserId = qs.OwnerUserId
+),
+FinalQuestions AS (
+    SELECT 
+        rq.QuestionId,
+        rq.Title,
+        rq.OwnerUserId,
+        rq.OwnerReputation,
+        rq.QuestionScore,
+        rq.ViewCount,
+        rq.FavoriteCount,
+        rq.AnswerCount,
+        ROUND(rq.AvgAnswerScore,2)      AS AvgAnswerScore,
+        rq.LastUpvoteDate,
+        rq.UserQuestionRank,
+        rq.OwnerBadgeCount,
+        rq.IsClosed,
+        rq.VoteTypesSeen,
+        tm.Tag,
+        tm.TagGlobalCount,
+        tm.TagRank
+    FROM RankedQuestions rq
+    LEFT JOIN TagMetrics tm 
+        ON tm.QuestionId = rq.QuestionId 
+       AND tm.TagRank <= 3                                 -- top‑3 tags per question
+    WHERE rq.UserQuestionRank <= 5                        -- top‑5 questions per user
+),
+TopAnswers AS (
+    SELECT 
+        a.Id                               AS AnswerId,
+        a.ParentId                         AS QuestionId,
+        a.Score                            AS AnswerScore,
+        a.CreationDate,
+        a.OwnerUserId,
+        u.Reputation                       AS OwnerReputation,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate) AS AnswerRank
+    FROM Posts a
+    JOIN Users u ON a.OwnerUserId = u.Id
+    WHERE a.PostTypeId = 2                                   -- answers only
+      AND a.CreationDate >= DATE '2020-01-01'
+),
+TopAnswersFiltered AS (
+    SELECT *
+    FROM TopAnswers
+    WHERE AnswerRank <= 3                                   -- top‑3 answers per question
+)
+SELECT 
+    fq.QuestionId,
+    fq.Title,
+    fq.OwnerUserId,
+    fq.OwnerReputation,
+    fq.QuestionScore,
+    fq.ViewCount,
+    fq.FavoriteCount,
+    fq.AnswerCount,
+    fq.AvgAnswerScore,
+    fq.LastUpvoteDate,
+    fq.UserQuestionRank,
+    fq.OwnerBadgeCount,
+    fq.IsClosed,
+    fq.VoteTypesSeen,
+    fq.Tag,
+    fq.TagGlobalCount,
+    fq.TagRank,
+    NULL::INT        AS AnswerId,
+    NULL::INT        AS AnswerScore,
+    NULL::TIMESTAMP  AS AnswerCreationDate,
+    NULL::INT        AS AnswerOwnerUserId,
+    NULL::INT        AS AnswerOwnerReputation,
+    NULL::INT        AS AnswerRank
+FROM FinalQuestions fq
+WHERE (fq.OwnerReputation > 1000 OR fq.OwnerBadgeCount >= 5)
+  AND (fq.QuestionScore + COALESCE(fq.AvgAnswerScore,0) * 2) > 50
+  AND (fq.TagGlobalCount IS NULL OR fq.TagGlobalCount > 5000)
+
+UNION ALL
+
+SELECT 
+    NULL::INT        AS QuestionId,
+    NULL::VARCHAR    AS Title,
+    NULL::INT        AS OwnerUserId,
+    NULL::INT        AS OwnerReputation,
+    NULL::INT        AS QuestionScore,
+    NULL::INT        AS ViewCount,
+    NULL::INT        AS FavoriteCount,
+    NULL::INT        AS AnswerCount,
+    NULL::NUMERIC    AS AvgAnswerScore,
+    NULL::TIMESTAMP  AS LastUpvoteDate,
+    NULL::INT        AS UserQuestionRank,
+    NULL::INT        AS OwnerBadgeCount,
+    NULL::INT        AS IsClosed,
+    NULL::VARCHAR    AS VoteTypesSeen,
+    NULL::VARCHAR    AS Tag,
+    NULL::INT        AS TagGlobalCount,
+    NULL::INT        AS TagRank,
+    ta.AnswerId,
+    ta.AnswerScore,
+    ta.CreationDate   AS AnswerCreationDate,
+    ta.OwnerUserId    AS AnswerOwnerUserId,
+    ta.OwnerReputation AS AnswerOwnerReputation,
+    ta.AnswerRank
+FROM TopAnswersFiltered ta
+ORDER BY 
+    COALESCE(OwnerReputation,0) DESC,
+    COALESCE(QuestionScore,0) DESC,
+    COALESCE(AnswerScore,0) DESC
+LIMIT 200;

@@ -1,0 +1,626 @@
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END), 0) AS QuestionCount,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END), 0) AS AnswerCount,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END), 0) AS TotalQuestionScore,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END), 0) AS TotalAnswerScore,
+    COUNT(DISTINCT b.Id) AS BadgeCount,
+    COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+    COALESCE(AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END), 0) AS AvgQuestionScore,
+    COALESCE(AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END), 0) AS AvgAnswerScore,
+    COUNT(DISTINCT c.Id) AS CommentCount,
+    COUNT(DISTINCT ph.Id) AS PostHistoryCount,
+    COUNT(DISTINCT pl.Id) AS PostLinkCount,
+    COUNT(DISTINCT v.Id) AS VoteCount,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS Upvotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS Downvotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 5 THEN v.Id END) AS FavoriteCount,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCountWithAnswers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.ParentId IS NOT NULL THEN p.Id END) AS AnswerCountWithParent,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN p.Id END) AS QuestionWithAnswers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL THEN p.Id END) AS ClosedQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.CommunityOwnedDate IS NOT NULL THEN p.Id END) AS CommunityOwnedQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.ViewCount > 1000 THEN p.Id END) AS HighViewQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.ViewCount > 1000 THEN p.Id END) AS HighViewAnswers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AnswerCount > 10 THEN p.Id END) AS HighlyAnsweredQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.Score < 0 THEN p.Id END) AS NegativeScoreQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.Score < 0 THEN p.Id END) AS NegativeScoreAnswers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND (p.Tags IS NOT NULL AND p.Tags <> '') THEN p.Id END) AS TaggedQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND (p.Tags IS NULL OR p.Tags = '') THEN p.Id END) AS UntaggedQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.LastActivityDate >= DATE '2020-01-01' THEN p.Id END) AS ActiveQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.LastActivityDate >= DATE '2020-01-01' THEN p.Id END) AS ActiveAnswers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.CreationDate >= DATE '2020-01-01' THEN p.Id END) AS NewQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.CreationDate >= DATE '2020-01-01' THEN p.Id END) AS NewAnswers,
+    COALESCE(MAX(p.CreationDate), DATE '1900-01-01') AS LatestPostDate,
+    COALESCE(MIN(p.CreationDate), DATE '9999-12-31') AS EarliestPostDate,
+    COALESCE(MAX(CASE WHEN p.PostTypeId = 1 THEN p.CreationDate END), DATE '1900-01-01') AS LatestQuestionDate,
+    COALESCE(MIN(CASE WHEN p.PostTypeId = 1 THEN p.CreationDate END), DATE '9999-12-31') AS EarliestQuestionDate,
+    COALESCE(MAX(CASE WHEN p.PostTypeId = 2 THEN p.CreationDate END), DATE '1900-01-01') AS LatestAnswerDate,
+    COALESCE(MIN(CASE WHEN p.PostTypeId = 2 THEN p.CreationDate END), DATE '9999-12-31') AS EarliestAnswerDate,
+    CAST(EXTRACT(EPOCH FROM (COALESCE(MAX(p.CreationDate), DATE '1900-01-01') - COALESCE(MIN(p.CreationDate), DATE '1900-01-01'))) / 86400 AS INTEGER) AS ActiveDays,
+    CASE 
+        WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+            ROUND(CAST(COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS NUMERIC) / NULLIF(COUNT(DISTINCT p.Id),0) * 100, 2) 
+        ELSE 0 
+    END AS QuestionPercentage,
+    CASE 
+        WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+            ROUND(CAST(COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS NUMERIC) / NULLIF(COUNT(DISTINCT p.Id),0) * 100, 2) 
+        ELSE 0 
+    END AS AnswerPercentage,
+    CASE 
+        WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+            ROUND(CAST(COUNT(DISTINCT b.Id) AS NUMERIC) / NULLIF(COUNT(DISTINCT p.Id),0) * 100, 2) 
+        ELSE 0 
+    END AS BadgePerPostPercentage,
+    CASE 
+        WHEN AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) > 0 THEN 
+            ROUND(CAST(AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS NUMERIC), 2) 
+        ELSE 0 
+    END AS AvgQuestionScoreRounded,
+    CASE 
+        WHEN AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) > 0 THEN 
+            ROUND(CAST(AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) AS NUMERIC), 2) 
+        ELSE 0 
+    END AS AvgAnswerScoreRounded,
+    CASE 
+        WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 0 THEN 
+            ROUND(CAST(COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.Score > 0 THEN p.Id END) AS NUMERIC) / NULLIF(COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END),0) * 100, 2) 
+        ELSE 0 
+    END AS PositiveQuestionPercentage,
+    CASE 
+        WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) > 0 THEN 
+            ROUND(CAST(COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.Score > 0 THEN p.Id END) AS NUMERIC) / NULLIF(COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END),0) * 100, 2) 
+        ELSE 0 
+    END AS PositiveAnswerPercentage,
+    COALESCE(ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC), 0) AS RankByPostCount,
+    COALESCE(RANK() OVER (ORDER BY SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) DESC), 0) AS RankByTotalQuestionScore,
+    COALESCE(DENSE_RANK() OVER (ORDER BY SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) DESC), 0) AS RankByTotalAnswerScore,
+    COALESCE(FIRST_VALUE(u.Reputation) OVER (ORDER BY u.Reputation DESC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING), 0) AS TopReputation,
+    COALESCE(LAST_VALUE(u.Reputation) OVER (ORDER BY u.Reputation ASC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING), 0) AS BottomReputation,
+    COALESCE(NTH_VALUE(u.Reputation, 500) OVER (ORDER BY u.Reputation ASC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING), 0) AS FiftiethPercentileReputation,
+    COALESCE(COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) * 3 + 
+             COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) * 2 + 
+             COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) * 1, 
+             0) AS BadgePoints,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) + 
+             SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) + 
+             COUNT(DISTINCT b.Id) + 
+             COUNT(DISTINCT c.Id) + 
+             COUNT(DISTINCT ph.Id), 
+             0) AS TotalActivity,
+    COALESCE(ROW_NUMBER() OVER (ORDER BY 
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) + 
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) + 
+        COUNT(DISTINCT b.Id) + 
+        COUNT(DISTINCT c.Id) + 
+        COUNT(DISTINCT ph.Id) DESC), 
+        0) AS ActivityRank,
+    CASE 
+        WHEN EXISTS(SELECT 1 FROM Posts p2 WHERE p2.OwnerUserId = u.Id AND p2.PostTypeId = 2 AND p2.Score >= 100) THEN 'Expert' 
+        WHEN EXISTS(SELECT 1 FROM Posts p3 WHERE p3.OwnerUserId = u.Id AND p3.PostTypeId = 2 AND p3.Score >= 50) THEN 'Skilled' 
+        WHEN EXISTS(SELECT 1 FROM Posts p4 WHERE p4.OwnerUserId = u.Id AND p4.PostTypeId = 2 AND p4.Score >= 10) THEN 'Intermediate' 
+        WHEN EXISTS(SELECT 1 FROM Posts p5 WHERE p5.OwnerUserId = u.Id AND p5.PostTypeId = 2) THEN 'Beginner' 
+        ELSE 'Newcomer' 
+    END AS AnswerSkillLevel,
+    CASE 
+        WHEN EXISTS(SELECT 1 FROM Posts p6 WHERE p6.OwnerUserId = u.Id AND p6.PostTypeId = 1 AND p6.Score >= 100) THEN 'Expert' 
+        WHEN EXISTS(SELECT 1 FROM Posts p7 WHERE p7.OwnerUserId = u.Id AND p7.PostTypeId = 1 AND p7.Score >= 50) THEN 'Skilled' 
+        WHEN EXISTS(SELECT 1 FROM Posts p8 WHERE p8.OwnerUserId = u.Id AND p8.PostTypeId = 1 AND p8.Score >= 10) THEN 'Intermediate' 
+        WHEN EXISTS(SELECT 1 FROM Posts p9 WHERE p9.OwnerUserId = u.Id AND p9.PostTypeId = 1) THEN 'Beginner' 
+        ELSE 'Newcomer' 
+    END AS QuestionSkillLevel,
+    CASE 
+        WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 
+             COALESCE((SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND OwnerUserId = u.Id) * 0.9, 0) THEN 'Consistent' 
+        WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 
+             COALESCE((SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND OwnerUserId = u.Id) * 0.5, 0) THEN 'Regular' 
+        ELSE 'Occasional' 
+    END AS QuestionFrequency,
+    CASE 
+        WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) > 
+             COALESCE((SELECT COUNT(*) FROM Posts WHERE PostTypeId = 2 AND OwnerUserId = u.Id) * 0.9, 0) THEN 'Consistent' 
+        WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) > 
+             COALESCE((SELECT COUNT(*) FROM Posts WHERE PostTypeId = 2 AND OwnerUserId = u.Id) * 0.5, 0) THEN 'Regular' 
+        ELSE 'Occasional' 
+    END AS AnswerFrequency,
+    CASE 
+        WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) = 0 AND 
+             COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) = 0 THEN 'Inactive' 
+        WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 100 OR 
+             COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) > 100 THEN 'Active' 
+        WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 10 OR 
+             COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) > 10 THEN 'Moderate' 
+        ELSE 'Low' 
+    END AS ActivityLevel,
+    COALESCE(
+        (SELECT STRING_AGG(Name, ', ' ORDER BY Date DESC) 
+         FROM Badges b2 
+         WHERE b2.UserId = u.Id 
+           AND b2.Class = 1 
+         LIMIT 5), 
+        'No Gold Badges') AS RecentGoldBadges,
+    COALESCE(
+        (SELECT STRING_AGG(Name, ', ' ORDER BY Date DESC) 
+         FROM Badges b3 
+         WHERE b3.UserId = u.Id 
+           AND b3.Class = 2 
+         LIMIT 5), 
+        'No Silver Badges') AS RecentSilverBadges,
+    COALESCE(
+        (SELECT STRING_AGG(Name, ', ' ORDER BY Date DESC) 
+         FROM Badges b4 
+         WHERE b4.UserId = u.Id 
+           AND b4.Class = 3 
+         LIMIT 5), 
+        'No Bronze Badges') AS RecentBronzeBadges,
+    COALESCE(
+        (SELECT STRING_AGG(CAST(EXTRACT(EPOCH FROM (p1.LastActivityDate - p1.CreationDate)) / 86400 AS INTEGER)::TEXT, ', ' ORDER BY p1.CreationDate) 
+         FROM Posts p1 
+         WHERE p1.OwnerUserId = u.Id 
+           AND p1.PostTypeId = 1 
+           AND p1.CreationDate >= DATE '2020-01-01' 
+         LIMIT 10), 
+        'No Data') AS QuestionDaysActive,
+    COALESCE(
+        (SELECT STRING_AGG(CAST(EXTRACT(EPOCH FROM (p2.LastActivityDate - p2.CreationDate)) / 86400 AS INTEGER)::TEXT, ', ' ORDER BY p2.CreationDate) 
+         FROM Posts p2 
+         WHERE p2.OwnerUserId = u.Id 
+           AND p2.PostTypeId = 2 
+           AND p2.CreationDate >= DATE '2020-01-01' 
+         LIMIT 10), 
+        'No Data') AS AnswerDaysActive,
+    COALESCE(
+        (SELECT COUNT(*) 
+         FROM Posts p3 
+         WHERE p3.OwnerUserId = u.Id 
+           AND p3.PostTypeId = 1 
+           AND p3.CreationDate >= DATE '2020-01-01'
+           AND p3.Score > 20), 
+        0) AS HighScoreQuestions,
+    COALESCE(
+        (SELECT COUNT(*) 
+         FROM Posts p4 
+         WHERE p4.OwnerUserId = u.Id 
+           AND p4.PostTypeId = 2 
+           AND p4.CreationDate >= DATE '2020-01-01'
+           AND p4.Score > 20), 
+        0) AS HighScoreAnswers,
+    COALESCE(
+        (SELECT COUNT(*) 
+         FROM Posts p5 
+         WHERE p5.OwnerUserId = u.Id 
+           AND p5.PostTypeId = 1 
+           AND p5.CreationDate >= DATE '2020-01-01'
+           AND p5.ViewCount > 100), 
+        0) AS HighViewQuestionCount,
+    COALESCE(
+        (SELECT COUNT(*) 
+         FROM Posts p6 
+         WHERE p6.OwnerUserId = u.Id 
+           AND p6.PostTypeId = 2 
+           AND p6.CreationDate >= DATE '2020-01-01'
+           AND p6.ViewCount > 100), 
+        0) AS HighViewAnswerCount,
+    CASE 
+        WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 0 THEN 
+            ROUND(CAST(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS NUMERIC) / NULLIF(COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END),0), 2) 
+        ELSE 0 
+    END AS AvgQuestionScorePerPost,
+    CASE 
+        WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) > 0 THEN 
+            ROUND(CAST(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS NUMERIC) / NULLIF(COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END),0), 2) 
+        ELSE 0 
+    END AS AvgAnswerScorePerPost,
+    COALESCE(
+        (SELECT COUNT(DISTINCT r1.Id) 
+         FROM Posts p7 
+         JOIN PostLinks r1 ON r1.PostId = p7.Id 
+         WHERE p7.OwnerUserId = u.Id 
+           AND r1.LinkTypeId = 1), 
+        0) AS LinkedQuestionsCount,
+    COALESCE(
+        (SELECT COUNT(DISTINCT r2.Id) 
+         FROM Posts p8 
+         JOIN PostLinks r2 ON r2.RelatedPostId = p8.Id 
+         WHERE p8.OwnerUserId = u.Id 
+           AND r2.LinkTypeId = 1), 
+        0) AS LinkedAnswersCount,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AnswerCount >= 1 THEN p.Id END) AS QuestionsWithAnswers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AnswerCount >= 5 THEN p.Id END) AS HighlyAnsweredQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.Score > 0 THEN p.Id END) AS PositiveScoringQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.Score > 0 THEN p.Id END) AS PositiveScoringAnswers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.ViewCount > 0 THEN p.Id END) AS ViewedQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.ViewCount > 0 THEN p.Id END) AS ViewedAnswers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.CommentCount > 0 THEN p.Id END) AS CommentedQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.CommentCount > 0 THEN p.Id END) AS CommentedAnswers,
+    COALESCE(
+        (SELECT AVG(p9.Score) 
+         FROM Posts p9 
+         WHERE p9.OwnerUserId = u.Id 
+           AND p9.PostTypeId = 1), 
+        0) AS AvgOwnQuestionScore,
+    COALESCE(
+        (SELECT AVG(p10.Score) 
+         FROM Posts p10 
+         WHERE p10.OwnerUserId = u.Id 
+           AND p10.PostTypeId = 2), 
+        0) AS AvgOwnAnswerScore,
+    COALESCE(
+        (SELECT AVG(p11.Score) 
+         FROM Posts p11 
+         WHERE p11.OwnerUserId = u.Id 
+           AND p11.PostTypeId = 1 
+           AND p11.CreationDate >= DATE '2020-01-01'), 
+        0) AS AvgRecentQuestionScore,
+    COALESCE(
+        (SELECT AVG(p12.Score) 
+         FROM Posts p12 
+         WHERE p12.OwnerUserId = u.Id 
+           AND p12.PostTypeId = 2 
+           AND p12.CreationDate >= DATE '2020-01-01'), 
+        0) AS AvgRecentAnswerScore,
+    COALESCE(
+        (SELECT AVG(p13.Score) 
+         FROM Posts p13 
+         WHERE p13.OwnerUserId = u.Id 
+           AND p13.PostTypeId = 1 
+           AND p13.LastActivityDate >= DATE '2020-01-01'), 
+        0) AS AvgActiveQuestionScore,
+    COALESCE(
+        (SELECT AVG(p14.Score) 
+         FROM Posts p14 
+         WHERE p14.OwnerUserId = u.Id 
+           AND p14.PostTypeId = 2 
+           AND p14.LastActivityDate >= DATE '2020-01-01'), 
+        0) AS AvgActiveAnswerScore,
+    COALESCE(
+        (SELECT COUNT(DISTINCT v1.Id) 
+         FROM Votes v1 
+         WHERE v1.UserId = u.Id 
+           AND v1.VoteTypeId = 2), 
+        0) AS TotalUpvotes,
+    COALESCE(
+        (SELECT COUNT(DISTINCT v2.Id) 
+         FROM Votes v2 
+         WHERE v2.UserId = u.Id 
+           AND v2.VoteTypeId = 3), 
+        0) AS TotalDownvotes,
+    COALESCE(
+        (SELECT COUNT(DISTINCT p15.Id) 
+         FROM Posts p15 
+         JOIN Votes v3 ON v3.PostId = p15.Id 
+         WHERE v3.UserId = u.Id 
+           AND v3.VoteTypeId = 2 
+           AND p15.OwnerUserId = u.Id), 
+        0) AS UpvotedOwnPosts,
+    COALESCE(
+        (SELECT COUNT(DISTINCT p16.Id) 
+         FROM Posts p16 
+         JOIN Votes v4 ON v4.PostId = p16.Id 
+         WHERE v4.UserId = u.Id 
+           AND v4.VoteTypeId = 3 
+           AND p16.OwnerUserId = u.Id), 
+        0) AS DownvotedOwnPosts,
+    COALESCE(
+        (SELECT STRING_AGG(p17.Title, ' | ' ORDER BY p17.CreationDate DESC) 
+         FROM Posts p17 
+         WHERE p17.OwnerUserId = u.Id 
+           AND p17.PostTypeId = 1 
+           AND p17.CreationDate >= DATE '2020-01-01' 
+         LIMIT 10), 
+        'No Recent Questions') AS RecentQuestionTitles,
+    COALESCE(
+        (SELECT STRING_AGG(p18.Body, ' | ' ORDER BY p18.CreationDate DESC) 
+         FROM Posts p18 
+         WHERE p18.OwnerUserId = u.Id 
+           AND p18.PostTypeId = 2 
+           AND p18.CreationDate >= DATE '2020-01-01' 
+         LIMIT 10), 
+        'No Recent Answers') AS RecentAnswerBodies,
+    COALESCE(
+        (SELECT COUNT(*) 
+         FROM Posts p19 
+         WHERE p19.OwnerUserId = u.Id 
+           AND p19.PostTypeId = 1 
+           AND p19.CreationDate >= DATE '2020-01-01' 
+           AND p19.Score > (SELECT AVG(p20.Score) FROM Posts p20 WHERE p20.PostTypeId = 1)), 
+        0) AS AboveAvgScoreQuestions,
+    COALESCE(
+        (SELECT COUNT(*) 
+         FROM Posts p21 
+         WHERE p21.OwnerUserId = u.Id 
+           AND p21.PostTypeId = 2 
+           AND p21.CreationDate >= DATE '2020-01-01' 
+           AND p21.Score > (SELECT AVG(p22.Score) FROM Posts p22 WHERE p22.PostTypeId = 2)), 
+        0) AS AboveAvgScoreAnswers,
+    COALESCE(
+        (SELECT COUNT(*) 
+         FROM Posts p23 
+         WHERE p23.OwnerUserId = u.Id 
+           AND p23.PostTypeId = 1 
+           AND p23.ViewCount > (SELECT AVG(p24.ViewCount) FROM Posts p24 WHERE p24.PostTypeId = 1)), 
+        0) AS AboveAvgViewedQuestions,
+    COALESCE(
+        (SELECT COUNT(*) 
+         FROM Posts p25 
+         WHERE p25.OwnerUserId = u.Id 
+           AND p25.PostTypeId = 2 
+           AND p25.ViewCount > (SELECT AVG(p26.ViewCount) FROM Posts p26 WHERE p26.PostTypeId = 2)), 
+        0) AS AboveAvgViewedAnswers,
+    COALESCE(
+        (SELECT COUNT(*) 
+         FROM Badges b5 
+         WHERE b5.UserId = u.Id 
+           AND b5.Date >= DATE '2020-01-01'), 
+        0) AS RecentBadgesCount,
+    COALESCE(
+        (SELECT COUNT(*) 
+         FROM Comments c1 
+         WHERE c1.UserId = u.Id 
+           AND c1.CreationDate >= DATE '2020-01-01'), 
+        0) AS RecentCommentsCount,
+    COALESCE(
+        (SELECT COUNT(*) 
+         FROM PostHistory ph1 
+         WHERE ph1.UserId = u.Id 
+           AND ph1.CreationDate >= DATE '2020-01-01'), 
+        0) AS RecentPostHistoryCount,
+    COALESCE(
+        (SELECT COUNT(*) 
+         FROM PostLinks pl1 
+         WHERE pl1.Id IN (SELECT Id FROM Posts WHERE OwnerUserId = u.Id) 
+           AND pl1.CreationDate >= DATE '2020-01-01'), 
+        0) AS RecentPostLinksCount,
+    COALESCE(
+        (SELECT COUNT(*) 
+         FROM Votes v5 
+         WHERE v5.UserId = u.Id 
+           AND v5.CreationDate >= DATE '2020-01-01'), 
+        0) AS RecentVotesCount,
+    COALESCE(
+        (SELECT STRING_AGG('Q:' || p27.Id || ':' || p27.Score || ':' || p27.ViewCount || ':' || p27.AnswerCount, '|' ORDER BY p27.CreationDate DESC) 
+         FROM Posts p27 
+         WHERE p27.OwnerUserId = u.Id 
+           AND p27.PostTypeId = 1 
+           AND p27.CreationDate >= DATE '2020-01-01' 
+           AND (p27.Score > 0 OR p27.ViewCount > 50 OR p27.AnswerCount > 0) 
+         LIMIT 5), 
+        'No Significant Questions') AS SignificantQuestions,
+    COALESCE(
+        (SELECT STRING_AGG('A:' || p28.Id || ':' || p28.Score || ':' || p28.ViewCount, '|' ORDER BY p28.CreationDate DESC) 
+         FROM Posts p28 
+         WHERE p28.OwnerUserId = u.Id 
+           AND p28.PostTypeId = 2 
+           AND p28.CreationDate >= DATE '2020-01-01' 
+           AND (p28.Score > 0 OR p28.ViewCount > 50) 
+         LIMIT 5), 
+        'No Significant Answers') AS SignificantAnswers,
+    COALESCE(
+        (SELECT STRING_AGG(b6.Name || ':' || b6.Date || ':' || b6.Class, '|' ORDER BY b6.Date DESC) 
+         FROM Badges b6 
+         WHERE b6.UserId = u.Id 
+           AND b6.Date >= DATE '2020-01-01' 
+         LIMIT 10), 
+        'No Recent Badges') AS RecentBadges,
+    COALESCE(
+        (SELECT STRING_AGG(c2.Text || ' (' || c2.CreationDate || ')', ' || ' ORDER BY c2.CreationDate DESC) 
+         FROM Comments c2 
+         WHERE c2.UserId = u.Id 
+           AND c2.CreationDate >= DATE '2020-01-01' 
+         LIMIT 10), 
+        'No Recent Comments') AS RecentComments,
+    COALESCE(
+        (SELECT STRING_AGG(ph2.PostHistoryTypeId || ':' || ph2.CreationDate || ':' || ph2.Comment, '|' ORDER BY ph2.CreationDate DESC) 
+         FROM PostHistory ph2 
+         WHERE ph2.UserId = u.Id 
+           AND ph2.CreationDate >= DATE '2020-01-01' 
+         LIMIT 10), 
+        'No Recent History') AS RecentHistory,
+    COALESCE(
+        (SELECT STRING_AGG(pl2.LinkTypeId || ':' || pl2.CreationDate, '|' ORDER BY pl2.CreationDate DESC) 
+         FROM PostLinks pl2 
+         WHERE pl2.Id IN (SELECT Id FROM Posts WHERE OwnerUserId = u.Id) 
+           AND pl2.CreationDate >= DATE '2020-01-01' 
+         LIMIT 10), 
+        'No Recent Links') AS RecentLinks,
+    COALESCE(
+        (SELECT STRING_AGG(v6.VoteTypeId || ':' || v6.CreationDate || ':' || v6.PostId, '|' ORDER BY v6.CreationDate DESC) 
+         FROM Votes v6 
+         WHERE v6.UserId = u.Id 
+           AND v6.CreationDate >= DATE '2020-01-01' 
+         LIMIT 10), 
+        'No Recent Votes') AS RecentVotes,
+    COALESCE(
+        (SELECT COUNT(DISTINCT p29.Id) 
+         FROM Posts p29 
+         JOIN Votes v7 ON v7.PostId = p29.Id 
+         WHERE p29.OwnerUserId = u.Id 
+           AND v7.UserId = u.Id 
+           AND v7.VoteTypeId IN (2,3) 
+           AND p29.CreationDate >= DATE '2020-01-01'), 
+        0) AS RecentVotedPosts,
+    COALESCE(
+        (SELECT COUNT(DISTINCT p30.Id) 
+         FROM Posts p30 
+         JOIN Votes v8 ON v8.PostId = p30.Id 
+         WHERE p30.OwnerUserId = u.Id 
+           AND v8.UserId = u.Id 
+           AND v8.VoteTypeId IN (2,3) 
+           AND p30.CreationDate >= DATE '2020-01-01' 
+           AND p30.Score > 0), 
+        0) AS RecentPositiveVotedPosts,
+    COALESCE(
+        (SELECT COUNT(DISTINCT p31.Id) 
+         FROM Posts p31 
+         JOIN Votes v9 ON v9.PostId = p31.Id 
+         WHERE p31.OwnerUserId = u.Id 
+           AND v9.UserId = u.Id 
+           AND v9.VoteTypeId IN (2,3) 
+           AND p31.CreationDate >= DATE '2020-01-01' 
+           AND p31.Score < 0), 
+        0) AS RecentNegativeVotedPosts,
+    COALESCE(
+        (SELECT COUNT(DISTINCT p32.Id) 
+         FROM Posts p32 
+         JOIN Votes v10 ON v10.PostId = p32.Id 
+         WHERE p32.OwnerUserId = u.Id 
+           AND v10.UserId = u.Id 
+           AND v10.VoteTypeId IN (2,3) 
+           AND p32.CreationDate >= DATE '2020-01-01' 
+           AND p32.AnswerCount > 0), 
+        0) AS RecentAnsweredVotedPosts,
+    COALESCE(
+        (SELECT COUNT(DISTINCT p33.Id) 
+         FROM Posts p33 
+         JOIN Votes v11 ON v11.PostId = p33.Id 
+         WHERE p33.OwnerUserId = u.Id 
+           AND v11.UserId = u.Id 
+           AND v11.VoteTypeId IN (2,3) 
+           AND p33.CreationDate >= DATE '2020-01-01' 
+           AND p33.ViewCount > 100), 
+        0) AS RecentHighViewedVotedPosts,
+    COALESCE(
+        (SELECT COUNT(DISTINCT p34.Id) 
+         FROM Posts p34 
+         JOIN Votes v12 ON v12.PostId = p34.Id 
+         WHERE p34.OwnerUserId = u.Id 
+           AND v12.UserId = u.Id 
+           AND v12.VoteTypeId IN (2,3) 
+           AND p34.CreationDate >= DATE '2020-01-01' 
+           AND p34.Score BETWEEN 1 AND 10), 
+        0) AS RecentMediumScoreVotedPosts,
+    COALESCE(
+        (SELECT COUNT(DISTINCT p35.Id) 
+         FROM Posts p35 
+         JOIN Votes v13 ON v13.PostId = p35.Id 
+         WHERE p35.OwnerUserId = u.Id 
+           AND v13.UserId = u.Id 
+           AND v13.VoteTypeId IN (2,3) 
+           AND p35.CreationDate >= DATE '2020-01-01' 
+           AND p35.Score BETWEEN 11 AND 100), 
+        0) AS RecentHighScoreVotedPosts,
+    COALESCE(
+        (SELECT COUNT(DISTINCT p36.Id) 
+         FROM Posts p36 
+         WHERE p36.OwnerUserId = u.Id 
+           AND p36.PostTypeId = 1 
+           AND p36.CreationDate BETWEEN DATE '2020-01-01' AND DATE '2020-12-31' 
+           AND p36.Score > 0), 
+        0) AS Year2020PositiveQuestions,
+    COALESCE(
+        (SELECT COUNT(DISTINCT p37.Id) 
+         FROM Posts p37 
+         WHERE p37.OwnerUserId = u.Id 
+           AND p37.PostTypeId = 2 
+           AND p37.CreationDate BETWEEN DATE '2020-01-01' AND DATE '2020-12-31' 
+           AND p37.Score > 0), 
+        0) AS Year2020PositiveAnswers,
+    COALESCE(
+        (SELECT COUNT(DISTINCT p38.Id) 
+         FROM Posts p38 
+         JOIN Votes v14 ON v14.PostId = p38.Id 
+         WHERE p38.OwnerUserId = u.Id 
+           AND v14.UserId = u.Id 
+           AND v14.VoteTypeId IN (2,3) 
+           AND p38.CreationDate BETWEEN DATE '2020-01-01' AND DATE '2020-12-31' 
+           AND p38.Score > 0), 
+        0) AS Year2020PositiveVotedPosts,
+    COALESCE(
+        (SELECT COUNT(DISTINCT p39.Id) 
+         FROM Posts p39 
+         WHERE p39.OwnerUserId = u.Id 
+           AND p39.PostTypeId = 1 
+           AND p39.CreationDate BETWEEN DATE '2020-01-01' AND DATE '2020-12-31' 
+           AND p39.ViewCount > 100), 
+        0) AS Year2020HighViewQuestions,
+    COALESCE(
+        (SELECT COUNT(DISTINCT p40.Id) 
+         FROM Posts p40 
+         WHERE p40.OwnerUserId = u.Id 
+           AND p40.PostTypeId = 2 
+           AND p40.CreationDate BETWEEN DATE '2020-01-01' AND DATE '2020-12-31' 
+           AND p40.ViewCount > 100), 
+        0) AS Year2020HighViewAnswers,
+    COALESCE(
+        (SELECT COUNT(DISTINCT p41.Id) 
+         FROM Posts p41 
+         JOIN Badges b7 ON b7.UserId = u.Id 
+         WHERE p41.OwnerUserId = u.Id 
+           AND p41.PostTypeId = 1 
+           AND b7.Date BETWEEN DATE '2020-01-01' AND DATE '2020-12-31' 
+           AND b7.Class = 1), 
+        0) AS Year2020GoldBadgedQuestions,
+    COALESCE(
+        (SELECT COUNT(DISTINCT p42.Id) 
+         FROM Posts p42 
+         JOIN Badges b8 ON b8.UserId = u.Id 
+         WHERE p42.OwnerUserId = u.Id 
+           AND p42.PostTypeId = 2 
+           AND b8.Date BETWEEN DATE '2020-01-01' AND DATE '2020-12-31' 
+           AND b8.Class = 1), 
+        0) AS Year2020GoldBadgedAnswers,
+    CASE 
+        WHEN COUNT(DISTINCT p.Id) = 0 THEN 'New User' 
+        WHEN COUNT(DISTINCT p.Id) < 10 THEN 'Occasional User' 
+        WHEN COUNT(DISTINCT p.Id) < 50 THEN 'Regular User' 
+        WHEN COUNT(DISTINCT p.Id) < 200 THEN 'Active User' 
+        WHEN COUNT(DISTINCT p.Id) < 500 THEN 'Highly Active User' 
+        ELSE 'Veteran User' 
+    END AS UserStatus,
+    COALESCE(
+        (SELECT COUNT(DISTINCT p43.Id) 
+         FROM Posts p43 
+         WHERE p43.OwnerUserId = u.Id 
+           AND p43.PostTypeId = 1 
+           AND p43.CreationDate >= DATE '2020-01-01' 
+           AND p43.AnswerCount > 0), 
+        0) AS QuestionWithAnswers2020,
+    COALESCE(
+        (SELECT COUNT(DISTINCT p44.Id) 
+         FROM Posts p44 
+         WHERE p44.OwnerUserId = u.Id 
+           AND p44.PostTypeId = 2 
+           AND p44.CreationDate >= DATE '2020-01-01' 
+           AND p44.ViewCount > 1000), 
+        0) AS HighViewAnswer2020,
+    COALESCE(
+        (SELECT COUNT(DISTINCT p45.Id) 
+         FROM Posts p45 
+         WHERE p45.OwnerUserId = u.Id 
+           AND p45.PostTypeId = 1 
+           AND p45.CreationDate >= DATE '2020-01-01' 
+           AND p45.ViewCount > 1000), 
+        0) AS HighViewQuestion2020,
+    COALESCE(
+        (SELECT COUNT(DISTINCT p46.Id) 
+         FROM Posts p46 
+         JOIN Votes v15 ON v15.PostId = p46.Id 
+         WHERE p46.OwnerUserId = u.Id 
+           AND v15.UserId = u.Id 
+           AND v15.VoteTypeId IN (2,3) 
+           AND p46.CreationDate >= DATE '2020-01-01' 
+           AND p46.Score BETWEEN 0 AND 5), 
+        0) AS RecentLowScoreVotedPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) + 
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) + 
+    COUNT(DISTINCT b.Id) + 
+    COUNT(DISTINCT c.Id) + 
+    COUNT(DISTINCT ph.Id) + 
+    COUNT(DISTINCT pl.Id) + 
+    COUNT(DISTINCT v.Id) AS TotalContributions
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN Comments c ON u.Id = c.UserId
+LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+LEFT JOIN PostLinks pl ON pl.Id IN (SELECT Id FROM Posts WHERE OwnerUserId = u.Id)
+LEFT JOIN Votes v ON u.Id = v.UserId
+WHERE u.Id = 12345
+GROUP BY u.Id, u.DisplayName, u.Reputation
+ORDER BY TotalContributions DESC
+LIMIT 100;

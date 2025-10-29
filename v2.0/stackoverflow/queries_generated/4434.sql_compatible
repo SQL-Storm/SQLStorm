@@ -1,0 +1,187 @@
+WITH
+  QuestionStats AS (
+    SELECT
+      p.Id AS QuestionId,
+      p.Title,
+      p.OwnerUserId,
+      p.CreationDate AS QuestionCreationDate,
+      COUNT(a.Id) AS AnswerCount,
+      SUM(a.Score) AS TotalAnswerScore,
+      MAX(a.Score) AS MaxAnswerScore,
+      AVG(a.Score) AS AvgAnswerScore,
+      MAX(a.CreationDate) AS LastAnswerDate,
+      COUNT(CASE WHEN a.Id = p.AcceptedAnswerId THEN 1 ELSE NULL END) AS IsAcceptedAnswerPresent,
+      SUM(CASE WHEN a.Id = p.AcceptedAnswerId THEN a.Score ELSE 0 END) AS AcceptedAnswerScore,
+      CASE
+        WHEN p.ClosedDate IS NOT NULL THEN 1
+        ELSE 0
+      END AS IsClosed,
+      COALESCE(pt.Name, 'Unknown') AS PostTypeName,
+      DENSE_RANK() OVER (
+        ORDER BY
+          p.Score DESC
+      ) AS RankByScore,
+      ROW_NUMBER() OVER (
+        PARTITION BY
+          p.OwnerUserId
+        ORDER BY
+          p.CreationDate
+      ) AS QuestionNumberForOwner,
+      p.AcceptedAnswerId
+    FROM
+      Posts p
+    LEFT JOIN
+      Posts a
+      ON p.Id = a.ParentId
+    JOIN
+      PostTypes pt
+      ON p.PostTypeId = pt.Id
+    WHERE
+      p.PostTypeId = 1
+    GROUP BY
+      p.Id,
+      p.Title,
+      p.OwnerUserId,
+      p.CreationDate,
+      p.AcceptedAnswerId,
+      p.ClosedDate,
+      pt.Name,
+      p.Score
+  ),
+  UserContributions AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      COUNT(DISTINCT b.Id) AS BadgeCount,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+      COUNT(DISTINCT c.Id) AS CommentCount,
+      AVG((EXTRACT(year FROM AGE(u.CreationDate)) * 12) + EXTRACT(month FROM AGE(u.CreationDate))) AS AvgAccountAgeInMonths,
+      COUNT(CASE WHEN ph.PostHistoryTypeId IN (5, 8) THEN 1 ELSE NULL END) AS BodyEditCount
+    FROM
+      Users u
+    LEFT JOIN
+      Badges b
+      ON u.Id = b.UserId
+    LEFT JOIN
+      Votes v
+      ON u.Id = v.UserId
+    LEFT JOIN
+      Comments c
+      ON u.Id = c.UserId
+    LEFT JOIN
+      PostHistory ph
+      ON u.Id = ph.UserId
+    GROUP BY
+      u.Id,
+      u.DisplayName
+  ),
+  HighReputationUsers AS (
+    SELECT
+      UserId
+    FROM
+      UserContributions
+    WHERE
+      UpVoteCount > 10000 AND CommentCount > 5000
+  )
+SELECT
+  qs.QuestionId,
+  qs.Title,
+  qs.QuestionCreationDate,
+  qs.AnswerCount,
+  qs.TotalAnswerScore,
+  qs.AvgAnswerScore,
+  qs.IsClosed,
+  qs.PostTypeName,
+  qs.RankByScore,
+  qs.QuestionNumberForOwner,
+  uc.DisplayName AS OwnerDisplayName,
+  uc.BadgeCount,
+  uc.UpVoteCount AS OwnerUpVotes,
+  uc.DownVoteCount AS OwnerDownVotes,
+  uc.CommentCount AS OwnerCommentCount,
+  uc.BodyEditCount AS OwnerBodyEditCount,
+  (qs.TotalAnswerScore * uc.UpVoteCount) AS WeightedScore,
+  COALESCE(qs.MaxAnswerScore, 0) AS MaxAnswerScore,
+  CASE
+    WHEN uc.UserId IS NULL THEN 'Guest'
+    WHEN uc.UserId IN (
+      SELECT
+        UserId
+      FROM
+        HighReputationUsers
+    ) THEN 'HighReputation'
+    ELSE 'Standard'
+  END AS UserStatus,
+  LENGTH(qs.Title) AS TitleLength,
+  SUBSTRING(qs.Title FROM 1 FOR 5) AS TitlePrefix,
+  CASE
+    WHEN qs.AcceptedAnswerId IS NULL
+      AND qs.AnswerCount > 0 THEN 'NoAcceptedAnswer'
+    WHEN qs.AcceptedAnswerId IS NOT NULL
+      AND qs.AnswerCount = 0 THEN 'AnsweredButNoAccepted'
+    WHEN qs.AcceptedAnswerId IS NOT NULL
+      AND qs.AnswerCount > 0 THEN 'AcceptedAnswerExists'
+    ELSE 'NoAnswers'
+  END AS AcceptanceStatus
+FROM
+  QuestionStats qs
+LEFT OUTER JOIN
+  UserContributions uc
+  ON qs.OwnerUserId = uc.UserId
+WHERE
+  qs.QuestionCreationDate > DATE '2023-01-01'
+  AND qs.AnswerCount > 0
+  AND qs.AvgAnswerScore > 10
+  AND uc.UpVoteCount > 50
+UNION ALL
+SELECT
+  qs.QuestionId,
+  qs.Title,
+  qs.QuestionCreationDate,
+  qs.AnswerCount,
+  qs.TotalAnswerScore,
+  qs.AvgAnswerScore,
+  qs.IsClosed,
+  qs.PostTypeName,
+  qs.RankByScore,
+  qs.QuestionNumberForOwner,
+  uc.DisplayName AS OwnerDisplayName,
+  uc.BadgeCount,
+  uc.UpVoteCount AS OwnerUpVotes,
+  uc.DownVoteCount AS OwnerDownVotes,
+  uc.CommentCount AS OwnerCommentCount,
+  uc.BodyEditCount AS OwnerBodyEditCount,
+  (qs.TotalAnswerScore * uc.UpVoteCount) AS WeightedScore,
+  COALESCE(qs.MaxAnswerScore, 0) AS MaxAnswerScore,
+  CASE
+    WHEN uc.UserId IS NULL THEN 'Guest'
+    WHEN uc.UserId IN (
+      SELECT
+        UserId
+      FROM
+        HighReputationUsers
+    ) THEN 'HighReputation'
+    ELSE 'Standard'
+  END AS UserStatus,
+  LENGTH(qs.Title) AS TitleLength,
+  SUBSTRING(qs.Title FROM 1 FOR 5) AS TitlePrefix,
+  CASE
+    WHEN qs.AcceptedAnswerId IS NULL
+      AND qs.AnswerCount > 0 THEN 'NoAcceptedAnswer'
+    WHEN qs.AcceptedAnswerId IS NOT NULL
+      AND qs.AnswerCount = 0 THEN 'AnsweredButNoAccepted'
+    WHEN qs.AcceptedAnswerId IS NOT NULL
+      AND qs.AnswerCount > 0 THEN 'AcceptedAnswerExists'
+    ELSE 'NoAnswers'
+  END AS AcceptanceStatus
+FROM
+  QuestionStats qs
+RIGHT JOIN
+  UserContributions uc
+  ON qs.OwnerUserId = uc.UserId
+WHERE
+  qs.QuestionCreationDate < DATE '2020-01-01'
+  AND qs.AnswerCount BETWEEN 1 AND 5
+  AND qs.IsClosed = 1
+  AND uc.DownVoteCount > 100;

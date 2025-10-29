@@ -1,0 +1,148 @@
+WITH
+RecentActiveUsers AS (
+  SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.ProfileImageUrl
+  FROM Users u
+  WHERE u.LastAccessDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30' DAY
+),
+TopTags AS (
+  SELECT
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId,
+    t.WikiPostId
+  FROM Tags t
+  WHERE t.IsModeratorOnly = FALSE
+),
+PostWithOwner AS (
+  SELECT
+    p.Id,
+    p.PostTypeId,
+    p.Title,
+    p.Tags,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.OwnerUserId,
+    p.AcceptedAnswerId,
+    p.ParentId,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ContentLicense,
+    u.DisplayName AS OwnerDisplayName
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180' DAY
+),
+LinkGraph AS (
+  SELECT
+    pl.PostId,
+    pl.RelatedPostId,
+    pls.Name AS LinkTypeName
+  FROM PostLinks pl
+  LEFT JOIN LinkTypes l ON pl.LinkTypeId = l.Id
+  LEFT JOIN LinkTypes pls ON l.Id = pls.Id
+),
+ScoreTier AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.Score,
+    CASE
+      WHEN p.Score >= 100 THEN 'A+'
+      WHEN p.Score >= 50 THEN 'A'
+      WHEN p.Score >= 20 THEN 'B'
+      WHEN p.Score >= 0 THEN 'C'
+      ELSE 'D'
+    END AS ScoreBand
+  FROM PostWithOwner p
+),
+WindowedActivity AS (
+  SELECT
+    p.Id,
+    p.OwnerUserId,
+    p.Title,
+    p.LastActivityDate,
+    ROW_NUMBER() OVER (
+      PARTITION BY p.OwnerUserId
+      ORDER BY p.LastActivityDate DESC
+    ) AS rn
+  FROM Posts p
+  WHERE p.LastActivityDate IS NOT NULL
+),
+CorrelatedStats AS (
+  SELECT
+    w.Id,
+    w.Title,
+    w.LastActivityDate,
+    w.OwnerUserId,
+    w.rn,
+    RANK() OVER (PARTITION BY w.OwnerUserId ORDER BY w.LastActivityDate DESC) AS activity_rank
+  FROM WindowedActivity w
+)
+SELECT
+  ru.Id AS UserId,
+  ru.DisplayName AS UserDisplayName,
+  ru.Reputation,
+  ru.LastAccessDate,
+  ra.Title AS RecentPostTitle,
+  ra.LastActivityDate AS PostLastActivity,
+  ra.Score AS PostScore,
+  tt.TagName AS Tag,
+  tt.Count AS TagCount,
+  CASE
+    WHEN ra.Score IS NULL THEN NULL
+    ELSE (
+      SELECT STRING_AGG(vt.Name, ',')
+      FROM Votes v
+      JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+      WHERE v.PostId = ra.Id
+        AND vt.Id IN (2, 3)
+    )
+  END AS UpDownSummary,
+  CASE
+    WHEN ra.OwnerUserId IS NOT NULL THEN ra.OwnerUserId
+    ELSE NULL
+  END AS PostOwnerId,
+  cl.Name AS ClosedReason
+FROM
+  RecentActiveUsers ru
+  LEFT JOIN Posts ra ON ra.OwnerUserId = ru.Id
+  LEFT JOIN PostHistory ph ON ph.PostId = ra.Id
+  LEFT JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+  LEFT JOIN TopTags tt ON ra.Tags LIKE '%' || tt.TagName || '%'
+  LEFT JOIN CloseReasonTypes cl ON CAST(ph.Comment AS varchar) LIKE '%' || CAST(cl.Id AS varchar) || '%'
+WHERE
+  ra.Id IS NOT NULL
+  AND ra.FavoriteCount > 0
+  AND ra.CommentCount >= 5
+  AND ra.Title IS NOT NULL
+GROUP BY
+  ru.Id,
+  ru.DisplayName,
+  ru.Reputation,
+  ru.LastAccessDate,
+  ra.Id,
+  ra.Title,
+  ra.LastActivityDate,
+  ra.Score,
+  ra.OwnerUserId,
+  tt.TagName,
+  tt.Count,
+  cl.Name,
+  ra.FavoriteCount,
+  ra.CommentCount
+ORDER BY
+  ru.Reputation DESC,
+  ra.LastActivityDate DESC
+LIMIT 200;

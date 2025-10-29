@@ -1,0 +1,142 @@
+-- {"query": "7523.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1664} 
+SELECT 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) as TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN p.Id END) as QuestionsWithAcceptedAnswers,
+    COUNT(DISTINCT b.Id) as BadgesCount,
+    COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) as GoldBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) as SilverBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) as BronzeBadges,
+    COALESCE(SUM(p.Score), 0) as TotalScore,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END), 0) as QuestionScore,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END), 0) as AnswerScore,
+    COALESCE(AVG(p.Score), 0) as AverageScore,
+    MAX(p.CreationDate) as LatestPostDate,
+    MIN(p.CreationDate) as FirstPostDate,
+    DATEDIFF(DAY, MIN(p.CreationDate), MAX(p.CreationDate)) as DaysActive,
+    RANK() OVER (ORDER BY COALESCE(SUM(p.Score), 0) DESC) as ScoreRank,
+    DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) as PostCountRank,
+    PERCENT_RANK() OVER (ORDER BY COUNT(DISTINCT p.Id)) as PostCountPercentile,
+    CASE 
+        WHEN COUNT(DISTINCT p.Id) > 1000 THEN 'Elite'
+        WHEN COUNT(DISTINCT p.Id) > 500 THEN 'Veteran'
+        WHEN COUNT(DISTINCT p.Id) > 100 THEN 'Active'
+        WHEN COUNT(DISTINCT p.Id) > 0 THEN 'Newbie'
+        ELSE 'Inactive'
+    END as UserCategory,
+    STUFF((
+        SELECT ', ' + t.TagName
+        FROM Posts p2
+        JOIN (
+            SELECT Id, LTRIM(RTRIM(value)) as TagName
+            FROM Posts
+            CROSS APPLY STRING_SPLIT(Tags, '<')
+            WHERE Tags IS NOT NULL AND Tags != ''
+        ) t ON t.Id = p2.Id
+        WHERE p2.OwnerUserId = u.Id
+        GROUP BY t.TagName
+        ORDER BY COUNT(*) DESC
+        FOR XML PATH('')
+    ), 1, 2, '') as TopTags,
+    (SELECT COUNT(*) 
+     FROM Posts p3 
+     WHERE p3.OwnerUserId = u.Id 
+       AND p3.CreationDate >= DATEADD(MONTH, -6, cast('2024-10-01 12:34:56' as timestamp))) as RecentPostsCount,
+    CASE 
+        WHEN EXISTS (SELECT 1 FROM Posts p4 WHERE p4.OwnerUserId = u.Id AND p4.Score > 1000) THEN 'HighlyVoted'
+        WHEN EXISTS (SELECT 1 FROM Posts p5 WHERE p5.OwnerUserId = u.Id AND p5.Score > 100) THEN 'ModeratelyVoted'
+        WHEN EXISTS (SELECT 1 FROM Posts p6 WHERE p6.OwnerUserId = u.Id AND p6.Score > 0) THEN 'LowVoted'
+        ELSE 'NoUpvotes'
+    END as VotingCategory,
+    ROW_NUMBER() OVER (PARTITION BY u.Reputation ORDER BY u.Id) as ReputationRank,
+    CASE 
+        WHEN u.Reputation >= 1000000 THEN 'Godlike'
+        WHEN u.Reputation >= 100000 THEN 'Legendary'
+        WHEN u.Reputation >= 10000 THEN 'Master'
+        WHEN u.Reputation >= 1000 THEN 'Expert'
+        WHEN u.Reputation >= 100 THEN 'Novice'
+        ELSE 'Beginner'
+    END as ReputationTier,
+    (SELECT TOP 1 p7.Title 
+     FROM Posts p7 
+     WHERE p7.OwnerUserId = u.Id 
+     ORDER BY p7.Score DESC) as HighestScoredPost,
+    (SELECT TOP 1 p8.CreationDate 
+     FROM Posts p8 
+     WHERE p8.OwnerUserId = u.Id 
+     ORDER BY p8.Score DESC) as HighestScoredPostDate,
+    (SELECT COUNT(*) 
+     FROM Badges b2 
+     WHERE b2.UserId = u.Id 
+       AND b2.Date >= DATEADD(YEAR, -1, cast('2024-10-01 12:34:56' as timestamp))) as RecentBadgesCount,
+    (SELECT AVG(c.Score) 
+     FROM Comments c 
+     WHERE c.UserId = u.Id) as AverageCommentScore,
+    CASE 
+        WHEN (SELECT COUNT(DISTINCT p9.Id) 
+              FROM Posts p9 
+              WHERE p9.OwnerUserId = u.Id 
+                AND p9.Score > 0) = 0 THEN 'NoUpvotedContent'
+        WHEN (SELECT COUNT(DISTINCT p10.Id) 
+              FROM Posts p10 
+              WHERE p10.OwnerUserId = u.Id 
+                AND p10.Score > 1000) > 0 THEN 'HighlyUpvoted'
+        ELSE 'RegularContent'
+    END as ContentQuality,
+    (SELECT COUNT(DISTINCT c2.Id)
+     FROM Comments c2
+     WHERE c2.UserId = u.Id
+       AND c2.CreationDate >= DATEADD(MONTH, -12, cast('2024-10-01 12:34:56' as timestamp))) as MonthlyCommentsCount,
+    (SELECT COUNT(DISTINCT p11.Id)
+     FROM Posts p11
+     WHERE p11.OwnerUserId = u.Id
+       AND p11.PostTypeId = 1
+       AND EXISTS (
+           SELECT 1 
+           FROM PostHistory ph 
+           WHERE ph.PostId = p11.Id 
+             AND ph.PostHistoryTypeId IN (1, 4)
+             AND ph.UserId = u.Id
+       )) as EditedQuestionsCount,
+    (SELECT COUNT(DISTINCT p12.Id)
+     FROM Posts p12
+     WHERE p12.OwnerUserId = u.Id
+       AND p12.PostTypeId = 2
+       AND p12.Score > 0
+       AND p12.ParentId IS NOT NULL
+       AND EXISTS (
+           SELECT 1
+           FROM Posts p13
+           WHERE p13.Id = p12.ParentId
+             AND p13.AcceptedAnswerId = p12.Id
+       )) as AcceptedAnswersCount
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN Badges b ON u.Id = b.UserId
+WHERE u.Id IN (
+    SELECT UserId
+    FROM (
+        SELECT UserId, COUNT(*) as ScoreCount
+        FROM Posts
+        WHERE Score > 0
+        GROUP BY UserId
+        HAVING COUNT(*) > 100
+        UNION
+        SELECT UserId, COUNT(*) as ScoreCount
+        FROM Posts
+        WHERE Score > 100
+        GROUP BY UserId
+        HAVING COUNT(*) > 50
+    ) combined_users
+)
+GROUP BY u.Id, u.DisplayName, u.Reputation
+HAVING COUNT(DISTINCT p.Id) > 0
+   AND COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 1
+   AND COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) > 1
+   AND (COALESCE(SUM(p.Score), 0) > 500 OR COUNT(DISTINCT b.Id) > 5)
+ORDER BY TotalScore DESC, BadgesCount DESC, Questions DESC
+OPTION (MAXDOP 8)

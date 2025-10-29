@@ -1,0 +1,174 @@
+WITH UserEngagementSummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName AS UserName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Location,
+        U.Views AS UserViews,
+        U.UpVotes AS UserUpVotes,
+        U.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COUNT(DISTINCT CASE WHEN B.Class = 1 THEN B.Id END) AS GoldBadgeCount,
+        COUNT(DISTINCT CASE WHEN B.Class = 2 THEN B.Id END) AS SilverBadgeCount,
+        SUM(P.Score) AS SumPostScore,
+        COALESCE(AVG(CASE WHEN P.PostTypeId = 1 THEN P.Score END), 0) AS AvgQuestionScore,
+        COALESCE(AVG(CASE WHEN P.PostTypeId = 2 THEN P.Score END), 0) AS AvgAnswerScore,
+        CASE
+            WHEN U.Reputation >= 100000 THEN 'Legendary'
+            WHEN U.Reputation >= 25000 THEN 'Expert'
+            WHEN U.Reputation >= 5000 THEN 'Seasoned'
+            WHEN U.Reputation >= 1000 THEN 'Contributor'
+            ELSE 'Apprentice'
+        END AS ReputationTier,
+        (SELECT COUNT(*) FROM Badges SB WHERE SB.UserId = U.Id AND SB.Name IN ('Mortarboard', 'Epic', 'Legendary', 'Guru')) > 0 AS HasHighAchievementBadges
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    WHERE U.Reputation > 100
+      AND U.LastAccessDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 year'
+      AND U.Location IS NOT NULL
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Location, U.Views, U.UpVotes, U.DownVotes
+),
+DetailedPostAnalysis AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.Title,
+        P.Body,
+        P.Tags,
+        P.AcceptedAnswerId,
+        P.ParentId,
+        P.LastEditDate,
+        P.LastActivityDate,
+        P.ClosedDate,
+        P.CommentCount AS PostCommentCount,
+        P.FavoriteCount AS PostFavoriteCount,
+        LENGTH(P.Body) AS BodyLength,
+        (
+            SELECT array_agg(TRIM(t_val))
+            FROM (
+                SELECT unnest(string_to_array(SUBSTRING(P.Tags FROM 2 FOR (LENGTH(P.Tags) - 2)), '><')) AS t_val
+            ) AS sub
+            WHERE LENGTH(TRIM(t_val)) > 0
+        ) AS ParsedTags,
+        (P.Tags LIKE '%<performance>%' OR P.Tags LIKE '%<optimization>%' OR P.Tags LIKE '%<scalability>%') AS IsPerformanceRelated,
+        (SELECT COUNT(DISTINCT V.UserId) FROM Votes V WHERE V.PostId = P.Id AND V.VoteTypeId = 5) AS UniqueFavoriters,
+        EXISTS (
+            SELECT 1 FROM Comments SC WHERE SC.PostId = P.Id AND SC.Score > 5
+        ) AS HasHighScoredComment
+    FROM Posts P
+    JOIN PostTypes PT ON P.PostTypeId = PT.Id
+    WHERE P.OwnerUserId IS NOT NULL
+      AND P.CreationDate BETWEEN CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 year' AND CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 month'
+      AND P.Score > 2
+),
+PostVersionHistory AS (
+    SELECT
+        PH.PostId,
+        COUNT(PH.Id) AS TotalRevisions,
+        COUNT(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.Id END) AS EditCount,
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.Id END) AS CloseEventCount,
+        MAX(PH.CreationDate) AS LastRevisionDate,
+        MIN(PH.CreationDate) AS FirstRevisionDate,
+        COALESCE(MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN CRT.Name END), 'N/A') AS MostRecentCloseReason,
+        (MAX(CASE WHEN LOWER(PH.Comment) LIKE '%duplicate%' THEN 1 ELSE 0 END) = 1) AS HasDuplicateCommentInHistory
+    FROM PostHistory PH
+    LEFT JOIN CloseReasonTypes CRT
+      ON PH.PostHistoryTypeId = 10
+         AND PH.Comment IS NOT NULL
+         AND PH.Comment ~ '^[0-9]+$'
+         AND CAST(PH.Comment AS integer) = CRT.Id
+    GROUP BY PH.PostId
+),
+VoteActivity AS (
+    SELECT
+        V.PostId,
+        COUNT(V.Id) AS TotalVotes,
+        COUNT(CASE WHEN V.VoteTypeId = 2 THEN V.Id END) AS UpVoteCount,
+        COUNT(CASE WHEN V.VoteTypeId = 3 THEN V.Id END) AS DownVoteCount,
+        COUNT(CASE WHEN V.VoteTypeId = 8 THEN V.Id END) AS BountyStartCount,
+        SUM(V.BountyAmount) AS TotalBountyAmount
+    FROM Votes V
+    WHERE V.VoteTypeId IN (2, 3, 5, 8, 9, 10, 11, 12)
+    GROUP BY V.PostId
+)
+SELECT
+    UES.UserId,
+    UES.UserName,
+    UES.Reputation,
+    UES.ReputationTier,
+    UES.TotalPosts,
+    DPA.PostId,
+    DPA.PostTypeName,
+    DPA.Title,
+    DPA.PostScore,
+    DPA.ViewCount,
+    DPA.BodyLength,
+    DPA.ParsedTags,
+    DPA.IsPerformanceRelated,
+    DPA.UniqueFavoriters,
+    DPA.HasHighScoredComment,
+    PVH.TotalRevisions,
+    PVH.EditCount,
+    PVH.CloseEventCount,
+    PVH.MostRecentCloseReason,
+    PVH.HasDuplicateCommentInHistory,
+    VA.TotalVotes,
+    VA.UpVoteCount,
+    VA.DownVoteCount,
+    VA.TotalBountyAmount,
+    RANK() OVER (
+        PARTITION BY DPA.PostTypeId, UES.ReputationTier
+        ORDER BY DPA.PostScore DESC, DPA.PostId ASC
+    ) AS PostRankInTypeAndTier,
+    AVG(DPA.PostScore) OVER (
+        PARTITION BY UES.UserId
+        ORDER BY DPA.PostCreationDate ASC
+        ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+    ) AS UserRollingAvgPostScore,
+    LAG(DPA.PostCreationDate, 1, CAST('1970-01-01 00:00:00' AS timestamp)) OVER (
+        PARTITION BY UES.UserId
+        ORDER BY DPA.PostCreationDate ASC
+    ) AS PreviousPostCreationDate,
+    NTILE(5) OVER (ORDER BY UES.TotalPosts DESC) AS UserPostCountQuintile,
+    CASE
+        WHEN VA.DownVoteCount > 0 THEN ROUND(CAST(VA.UpVoteCount AS numeric) / CAST(VA.DownVoteCount AS numeric), 2)
+        WHEN VA.UpVoteCount > 0 THEN 999.99
+        ELSE 0
+    END AS UpToDownVoteRatio,
+    CASE
+        WHEN DPA.ClosedDate IS NOT NULL AND DPA.LastActivityDate < CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year' THEN 'StaleClosed'
+        WHEN DPA.ClosedDate IS NULL AND DPA.LastActivityDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 month' AND DPA.PostScore > 100 THEN 'ActiveHighScoreOpen'
+        WHEN DPA.AcceptedAnswerId IS NOT NULL AND DPA.ParentId IS NOT NULL THEN 'AcceptedAnswer'
+        WHEN DPA.AcceptedAnswerId IS NOT NULL AND DPA.PostTypeId = 1 THEN 'QuestionWithAcceptedAnswer'
+        ELSE 'Other'
+    END AS PostStatusCategory,
+    (LOWER(DPA.Body) LIKE '%bug%' OR LOWER(DPA.Body) LIKE '%error%') AS MentionsBugOrError,
+    COALESCE(UES.UserName, 'Community User ' || CAST(DPA.OwnerUserId AS text)) AS EffectivePostOwnerDisplayName
+FROM UserEngagementSummary UES
+INNER JOIN DetailedPostAnalysis DPA ON UES.UserId = DPA.OwnerUserId
+LEFT JOIN PostVersionHistory PVH ON DPA.PostId = PVH.PostId
+LEFT JOIN VoteActivity VA ON DPA.PostId = VA.PostId
+FULL OUTER JOIN Posts OrphanPosts ON DPA.PostId IS NULL AND OrphanPosts.Id = PVH.PostId AND OrphanPosts.OwnerUserId = UES.UserId
+WHERE
+    UES.TotalPosts >= 5
+    AND DPA.BodyLength > 100
+    AND (
+        DPA.IsPerformanceRelated = TRUE
+        OR DPA.UniqueFavoriters > 2
+        OR (UES.HasHighAchievementBadges = TRUE AND DPA.PostScore > 50)
+    )
+ORDER BY
+    UES.ReputationTier DESC,
+    UES.SumPostScore DESC,
+    DPA.PostCreationDate DESC
+LIMIT 5000;

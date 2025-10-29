@@ -1,0 +1,91 @@
+WITH
+RecentPostActivity AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.OwnerUserId,
+    p.ViewCount,
+    p.Score,
+    p.CommentCount,
+    p.AnswerCount,
+    MAX(CASE WHEN ph.PostHistoryTypeId IN (4,5,6,8,9,10,11,14,15,16) THEN ph.CreationDate END) OVER (PARTITION BY p.Id) AS LastEditDate,
+    MAX(CASE WHEN ph.PostHistoryTypeId IN (4,5,6,8,9,10,11,14,15,16) THEN ph.Id END) OVER (PARTITION BY p.Id) AS LastEditHistoryId
+  FROM Posts p
+  LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+),
+ClosedReasons AS (
+  SELECT
+    p.Id AS PostId,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Comment END) AS CloseReasonJson
+  FROM Posts p
+  LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+  GROUP BY p.Id
+),
+TagInfo AS (
+  SELECT
+    t.Id AS TagId,
+    t.TagName,
+    t.Count,
+    t.IsModeratorOnly
+  FROM Tags t
+),
+BenchmarkMetrics AS (
+  SELECT
+    ra.PostId,
+    ra.PostTypeId,
+    ra.Score,
+    ra.ViewCount,
+    ra.CommentCount,
+    ra.AnswerCount,
+    CASE WHEN ra.ViewCount > 1000 THEN 1 ELSE 0 END AS HighView,
+    CASE WHEN ra.Score > 10 THEN 'hot' WHEN ra.Score < -5 THEN 'cold' ELSE 'normal' END AS Status
+  FROM RecentPostActivity ra
+)
+SELECT
+  bp.PostId,
+  bp.Title,
+  pt.Name AS PostType,
+  COALESCE(u.DisplayName, bp.OwnerDisplayName) AS Owner,
+  bp.CreationDate,
+  bp.LastActivityDate,
+  bp.ViewCount,
+  bp.Score,
+  bp.CommentCount,
+  bp.AnswerCount,
+  br.CloseReasonJson,
+  ti.TagName,
+  bm.HighView,
+  bm.Status,
+  RANK() OVER (PARTITION BY CAST(bp.CreationDate AS date)
+               ORDER BY bp.Score DESC) AS DailyScoreRank,
+  (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = bp.OwnerUserId) AS PostsByOwner,
+  (SELECT AVG(p2.ViewCount) FROM Posts p2 WHERE p2.PostTypeId = bp.PostTypeId) AS AvgViewsByType
+FROM BenchmarkMetrics bm
+JOIN Posts bp ON bp.Id = bm.PostId
+LEFT JOIN PostTypes pt ON bp.PostTypeId = pt.Id
+LEFT JOIN Users u ON bp.OwnerUserId = u.Id
+LEFT JOIN ClosedReasons br ON br.PostId = bp.Id
+LEFT JOIN TagInfo ti ON 1 = 1
+GROUP BY
+  bp.PostId,
+  bp.Title,
+  pt.Name,
+  u.DisplayName,
+  bp.OwnerDisplayName,
+  bp.CreationDate,
+  bp.LastActivityDate,
+  bp.ViewCount,
+  bp.Score,
+  bp.CommentCount,
+  bp.AnswerCount,
+  br.CloseReasonJson,
+  ti.TagName,
+  bm.HighView,
+  bm.Status,
+  bp.OwnerUserId,
+  bp.PostTypeId
+ORDER BY bp.LastActivityDate DESC
+LIMIT 200;

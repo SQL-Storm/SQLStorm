@@ -1,0 +1,173 @@
+-- {"query": "4582.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1653} 
+WITH
+  RankedPosts AS (
+    SELECT
+      p.Id AS PostId,
+      p.Title,
+      p.OwnerUserId,
+      p.CreationDate AS PostCreationDate,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      p.Score AS PostScore,
+      pt.Name AS PostTypeName,
+      ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) AS rn,
+      CASE
+        WHEN p.ClosedDate IS NOT NULL THEN 1
+        ELSE 0
+      END AS IsClosed,
+      COALESCE(p.ViewCount, 0) AS Views,
+      COALESCE(p.FavoriteCount, 0) AS Favorites,
+      CASE
+        WHEN p.OwnerUserId IS NULL THEN -1
+        ELSE p.OwnerUserId
+      END AS SafeOwnerUserId,
+      DENSE_RANK() OVER (ORDER BY p.Score DESC) AS ScoreRank
+    FROM Posts AS p
+    JOIN PostTypes AS pt
+      ON p.PostTypeId = pt.Id
+    WHERE
+      p.PostTypeId IN (1, 2) -- Questions and Answers
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate AS UserCreationDate,
+      COUNT(DISTINCT ph.PostId) AS PostHistoryCount,
+      SUM(CASE WHEN ph.PostHistoryTypeId IN (2, 5) THEN 1 ELSE 0 END) AS BodyEdits,
+      SUM(CASE WHEN ph.PostHistoryTypeId IN (1, 4) THEN 1 ELSE 0 END) AS TitleEdits,
+      SUM(CASE WHEN ph.PostHistoryTypeId IN (3, 6) THEN 1 ELSE 0 END) AS TagEdits,
+      COUNT(DISTINCT c.Id) AS CommentCount,
+      COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotes,
+      COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVotes
+    FROM Users AS u
+    LEFT JOIN PostHistory AS ph
+      ON u.Id = ph.UserId
+    LEFT JOIN Comments AS c
+      ON u.Id = c.UserId
+    LEFT JOIN Votes AS v
+      ON u.Id = v.UserId
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate
+  ),
+  TopQuestions AS (
+    SELECT
+      rp.PostId,
+      rp.Title,
+      rp.PostTypeName,
+      rp.PostScore,
+      rp.ScoreRank,
+      ua.DisplayName AS OwnerDisplayName,
+      ua.Reputation AS OwnerReputation,
+      rp.PostCreationDate,
+      rp.AnswerCount,
+      rp.CommentCount,
+      rp.Favorites,
+      rp.Views,
+      rp.IsClosed,
+      rp.rn AS RankWithinType
+    FROM RankedPosts AS rp
+    LEFT JOIN UserActivity AS ua
+      ON rp.SafeOwnerUserId = ua.UserId
+    WHERE
+      rp.rn <= 100 AND rp.PostTypeId = 1 -- Top 100 Questions
+  ),
+  MostCommentedAnswers AS (
+    SELECT
+      rp.PostId,
+      rp.Title AS QuestionTitle,
+      rp.PostTypeName,
+      rp.PostScore,
+      ua.DisplayName AS OwnerDisplayName,
+      ua.Reputation AS OwnerReputation,
+      rp.PostCreationDate,
+      rp.CommentCount,
+      rp.AnswerCount,
+      rp.Favorites,
+      rp.Views,
+      rp.IsClosed,
+      ROW_NUMBER() OVER (ORDER BY rp.CommentCount DESC) AS CommentRank
+    FROM RankedPosts AS rp
+    JOIN Posts AS p_parent
+      ON rp.Id = p_parent.ParentId -- Join to get question title for answers
+    JOIN RankedPosts AS rp_question
+      ON p_parent.ParentId = rp_question.PostId
+    LEFT JOIN UserActivity AS ua
+      ON rp.SafeOwnerUserId = ua.UserId
+    WHERE
+      rp.PostTypeId = 2 -- Answers
+      AND rp.CommentCount > 0
+  )
+SELECT
+  tq.PostId,
+  tq.Title,
+  tq.PostTypeName,
+  tq.PostScore,
+  tq.ScoreRank,
+  tq.OwnerDisplayName,
+  tq.OwnerReputation,
+  tq.PostCreationDate,
+  tq.AnswerCount,
+  tq.CommentCount,
+  tq.Favorites,
+  tq.Views,
+  tq.IsClosed,
+  tq.RankWithinType,
+  mca.CommentRank,
+  ua_owner.PostHistoryCount AS OwnerPostHistoryCount,
+  ua_owner.BodyEdits AS OwnerBodyEdits,
+  ua_owner.TitleEdits AS OwnerTitleEdits,
+  ua_owner.TagEdits AS OwnerTagEdits,
+  ua_owner.UpVotes AS OwnerUpVotes,
+  ua_owner.DownVotes AS OwnerDownVotes,
+  COALESCE(tq.PostScore + tq.Favorites * 5 - tq.Views / 10, 0) AS EngagementScore,
+  CASE
+    WHEN tq.OwnerReputation >= 100000 THEN 'High Reputation'
+    WHEN tq.OwnerReputation >= 10000 THEN 'Medium Reputation'
+    ELSE 'Low Reputation'
+  END AS ReputationTier,
+  UPPER(SUBSTRING(tq.Title FROM 1 FOR 1)) || LOWER(SUBSTRING(tq.Title FROM 2)) AS FormattedTitle -- Capitalize first letter
+FROM TopQuestions AS tq
+LEFT JOIN MostCommentedAnswers AS mca
+  ON tq.PostId = mca.PostId -- This join might not be meaningful if mca only has answers
+LEFT JOIN UserActivity AS ua_owner
+  ON tq.OwnerUserId = ua_owner.UserId
+WHERE
+  tq.PostScore > 50 -- Filter for highly scored questions
+UNION ALL
+SELECT
+  NULL AS PostId,
+  '--- Top 10 Most Commented Answers ---' AS Title,
+  mca.PostTypeName,
+  mca.PostScore,
+  NULL AS ScoreRank,
+  mca.OwnerDisplayName,
+  mca.OwnerReputation,
+  mca.PostCreationDate,
+  mca.AnswerCount,
+  mca.CommentCount,
+  mca.Favorites,
+  mca.Views,
+  mca.IsClosed,
+  NULL AS RankWithinType,
+  mca.CommentRank,
+  NULL AS OwnerPostHistoryCount,
+  NULL AS OwnerBodyEdits,
+  NULL AS OwnerTitleEdits,
+  NULL AS OwnerTagEdits,
+  NULL AS OwnerUpVotes,
+  NULL AS OwnerDownVotes,
+  NULL AS EngagementScore,
+  NULL AS ReputationTier,
+  NULL AS FormattedTitle
+FROM MostCommentedAnswers AS mca
+WHERE
+  mca.CommentRank <= 10
+ORDER BY
+  ScoreRank NULLS LAST,
+  CommentRank NULLS LAST;

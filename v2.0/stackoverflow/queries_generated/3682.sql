@@ -1,0 +1,153 @@
+-- {"query": "3682.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2683} 
+
+WITH
+    q_posts AS (
+        SELECT
+            p.Id,
+            p.Title,
+            p.OwnerUserId,
+            p.CreationDate,
+            p.Score,
+            p.ViewCount,
+            p.Tags,
+            COALESCE(p.FavoriteCount,0) AS FavCnt,
+            CASE
+                WHEN p.Tags IS NOT NULL THEN split_part(trim(both '><' FROM p.Tags), '><', 1)
+                ELSE NULL
+            END AS FirstTag
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+          AND p.CreationDate >= current_date - interval '1 year'
+    ),
+    tag_stats AS (
+        SELECT
+            t.TagName,
+            COUNT(*) FILTER (WHERE qp.Id IS NOT NULL) AS QuestionCount,
+            AVG(qp.Score) FILTER (WHERE qp.Id IS NOT NULL) AS AvgScore,
+            SUM(qp.ViewCount) FILTER (WHERE qp.Id IS NOT NULL) AS TotalViews
+        FROM Tags t
+        LEFT JOIN q_posts qp
+          ON qp.Tags LIKE concat('%<', t.TagName, '>%')
+        GROUP BY t.TagName
+    ),
+    user_activity AS (
+        SELECT
+            u.Id AS UserId,
+            u.DisplayName,
+            u.Reputation,
+            COUNT(DISTINCT qp.Id) AS QuestionsAsked,
+            COUNT(DISTINCT a.Id) FILTER (WHERE a.OwnerUserId = u.Id) AS AnswersGiven,
+            COALESCE(SUM(CASE WHEN vt.Id = 2 THEN 1 END),0) -
+            COALESCE(SUM(CASE WHEN vt.Id = 3 THEN 1 END),0) AS VoteBalance,
+            MAX(p.LastActivityDate) AS LastActive,
+            ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank,
+            RANK() OVER (ORDER BY COUNT(DISTINCT qp.Id) DESC) AS QuestionRank
+        FROM Users u
+        LEFT JOIN Posts qp
+          ON qp.OwnerUserId = u.Id AND qp.PostTypeId = 1
+        LEFT JOIN Posts a
+          ON a.OwnerUserId = u.Id AND a.PostTypeId = 2
+        LEFT JOIN Votes v
+          ON v.UserId = u.Id
+        LEFT JOIN VoteTypes vt
+          ON vt.Id = v.VoteTypeId
+        GROUP BY u.Id, u.DisplayName, u.Reputation
+    ),
+    recent_badges AS (
+        SELECT
+            b.UserId,
+            STRING_AGG(b.Name, ', ') AS BadgesEarned,
+            MAX(b.Date) AS LastBadgeDate
+        FROM Badges b
+        WHERE b.Date >= current_date - interval '180 days'
+        GROUP BY b.UserId
+    ),
+    question_answers AS (
+        SELECT
+            q.Id AS QuestionId,
+            q.Title,
+            q.Score AS QuestionScore,
+            q.ViewCount,
+            q.CreationDate,
+            q.FirstTag,
+            COALESCE(a.AnsCount,0) AS AnswerCount,
+            COALESCE(a.AcceptedAnswerId, NULL) AS AcceptedAnsId,
+            CASE WHEN a.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS HasAcceptedAnswer,
+            (SELECT MIN(p2.CreationDate)
+             FROM Posts p2
+             WHERE p2.ParentId = q.Id AND p2.PostTypeId = 2) AS FirstAnswerDate,
+            RANK() OVER (PARTITION BY q.FirstTag ORDER BY q.Score DESC) AS TagScoreRank
+        FROM q_posts q
+        LEFT JOIN LATERAL (
+            SELECT
+                COUNT(*) AS AnsCount,
+                MAX(CASE WHEN p.Id = q.AcceptedAnswerId THEN p.Id END) AS AcceptedAnswerId
+            FROM Posts p
+            WHERE p.ParentId = q.Id AND p.PostTypeId = 2
+        ) a ON true
+    )
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.QuestionsAsked,
+    ua.AnswersGiven,
+    ua.VoteBalance,
+    ua.LastActive,
+    ua.RepRank,
+    ua.QuestionRank,
+    COALESCE(rb.BadgesEarned, 'None') AS RecentBadges,
+    COALESCE(rb.LastBadgeDate::date, NULL) AS LastBadgeDate,
+    qa.QuestionId,
+    qa.Title,
+    qa.QuestionScore,
+    qa.ViewCount,
+    qa.CreationDate,
+    qa.FirstTag,
+    qa.AnswerCount,
+    qa.HasAcceptedAnswer,
+    qa.FirstAnswerDate,
+    qa.TagScoreRank,
+    ts.AvgScore AS TagAvgScore,
+    ts.TotalViews AS TagTotalViews
+FROM user_activity ua
+LEFT JOIN recent_badges rb
+  ON rb.UserId = ua.UserId
+LEFT JOIN question_answers qa
+  ON qa.FirstTag IS NOT NULL
+LEFT JOIN tag_stats ts
+  ON ts.TagName = qa.FirstTag
+WHERE ua.RepRank <= 100
+  AND (ua.LastActive >= current_date - interval '30 days' OR ua.LastActive IS NULL)
+ORDER BY ua.RepRank ASC, qa.TagScoreRank ASC
+LIMIT 200
+UNION ALL
+SELECT
+    NULL AS UserId,
+    NULL AS DisplayName,
+    NULL AS Reputation,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    b.UserId,
+    b.Name,
+    b.Date,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL
+FROM Badges b
+WHERE b.Date >= current_date - interval '30 days'
+  AND b.Class = 1
+ORDER BY 12 DESC
+LIMIT 50;

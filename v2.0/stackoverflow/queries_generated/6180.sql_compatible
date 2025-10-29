@@ -1,0 +1,76 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.Title,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.OwnerUserId,
+        U.DisplayName,
+        U.Reputation,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.ViewCount DESC) AS rank
+    FROM 
+        Posts P
+    JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId IN (1, 2) AND P.Score > 0
+),
+BadgeCounts AS (
+    SELECT 
+        U.Id AS UserId,
+        COUNT(DISTINCT B.Id) AS BadgeCount
+    FROM 
+        Users U
+    JOIN 
+        Badges B ON U.Id = B.UserId
+    GROUP BY 
+        U.Id
+)
+SELECT 
+    R.Id,
+    R.Title,
+    R.Score,
+    R.ViewCount,
+    R.CreationDate,
+    R.DisplayName,
+    R.Reputation,
+    R.rank,
+    COALESCE(B.BadgeCount, 0) AS BadgeCount,
+    CASE 
+        WHEN R.rank <= 10 THEN 'Top'
+        WHEN R.rank <= 100 THEN 'High'
+        ELSE 'Low'
+    END AS RankTier,
+    (
+        SELECT 
+            STRING_AGG(DISTINCT T.TagName, ', ')
+        FROM 
+            UNNEST(STRING_TO_ARRAY(P.Tags, '><')) AS tag_text(tag)
+        JOIN 
+            Tags T ON CAST(tag_text.tag AS INTEGER) = T.Id
+        WHERE 
+            P.Id = R.Id
+    ) AS Tags
+FROM 
+    RankedPosts R
+LEFT JOIN 
+    BadgeCounts B ON R.OwnerUserId = B.UserId
+WHERE 
+    EXISTS (
+        SELECT 
+            1
+        FROM 
+            Votes V
+        WHERE 
+            V.PostId = R.Id AND V.VoteTypeId = 1 AND V.UserId NOT IN (
+                SELECT 
+                    Id
+                FROM 
+                    Users
+                WHERE 
+                    EmailHash IS NULL
+            )
+    )
+ORDER BY 
+    R.rank;

@@ -1,0 +1,389 @@
+-- {"query": "790.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3458} 
+with recent_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.location,
+    coalesce(nullif(trim(u.websiteurl), ''), 'N/A') as websiteurl_norm,
+    count(*) filter (where b.class = 1) as gold_badges,
+    count(*) filter (where b.class = 2) as silver_badges,
+    count(*) filter (where b.class = 3) as bronze_badges,
+    count(b.id) as total_badges
+  from users u
+  left join badges b
+    on b.userid = u.id
+    and b.date >= u.creationdate
+  where u.creationdate >= (select date_trunc('month', max(p.creationdate)) - interval '12 months' from posts p)
+  group by u.id, u.displayname, u.reputation, u.creationdate, u.location, u.websiteurl
+),
+user_posts as (
+  select
+    p.owneruserid as user_id,
+    p.posttypeid,
+    p.id as post_id,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.favoritecount,
+    p.commentcount,
+    p.title,
+    p.tags,
+    p.answercount,
+    p.closeddate,
+    p.acceptedanswerid
+  from posts p
+  where p.owneruserid is not null
+),
+q_with_tag as (
+  select
+    up.user_id,
+    up.post_id,
+    up.creationdate,
+    up.score,
+    up.viewcount,
+    up.favoritecount,
+    up.commentcount,
+    up.title,
+    up.tags,
+    up.answercount,
+    case when up.closeddate is not null then 1 else 0 end as is_closed,
+    exists (
+      select 1
+      from lateral unnest(string_to_array(substring(up.tags, 2, length(up.tags)-2), '><')) t(tag)
+      where lower(t.tag) in ('sql','postgresql','sql-server','mysql')
+    ) as has_sql_tag
+  from user_posts up
+  where up.posttypeid = 1
+),
+a_with_parent as (
+  select
+    up.user_id,
+    up.post_id,
+    up.creationdate,
+    up.score,
+    up.commentcount,
+    up.acceptedanswerid is not null and up.acceptedanswerid = up.post_id as is_accepted, -- will be false for answers; placeholder
+    p2.id as parent_qid,
+    p2.score as parent_qscore,
+    p2.viewcount as parent_qviews,
+    p2.tags as parent_qtags
+  from user_posts up
+  join posts p2 on p2.id = up.parentid
+  where up.posttypeid = 2
+),
+votes_agg as (
+  select
+    v.postid,
+    count(*) filter (where v.votetypeid = 2) as upvotes,
+    count(*) filter (where v.votetypeid = 3) as downvotes,
+    count(*) filter (where v.votetypeid = 8) as bounties_started,
+    sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_amount_total
+  from votes v
+  group by v.postid
+),
+links_agg as (
+  select
+    pl.postid,
+    count(*) filter (where pl.linktypeid = 1) as linked_count,
+    count(*) filter (where pl.linktypeid = 3) as duplicate_of_count,
+    count(distinct pl.relatedpostid) as distinct_related
+  from postlinks pl
+  group by pl.postid
+),
+posthistory_close as (
+  select
+    ph.postid,
+    max(ph.creationdate) filter (where ph.posthistorytypeid = 10) as last_closed_at,
+    max(ph.creationdate) filter (where ph.posthistorytypeid = 11) as last_reopened_at,
+    count(*) filter (where ph.posthistorytypeid = 10) as close_events,
+    count(*) filter (where ph.posthistorytypeid = 11) as reopen_events,
+    count(*) filter (where ph.posthistorytypeid in (35,36)) as migrations
+  from posthistory ph
+  group by ph.postid
+),
+tag_counts as (
+  select
+    lower(t.tagname) as tagname,
+    sum(t.count) as total_posts,
+    count(*) as tag_rows
+  from tags t
+  group by lower(t.tagname)
+),
+tag_expanded_questions as (
+  select
+    q.user_id,
+    q.post_id,
+    lower(t.tag) as tagname
+  from q_with_tag q
+  cross join lateral unnest(string_to_array(substring(q.tags, 2, length(q.tags)-2), '><')) as t(tag)
+),
+user_tag_stats as (
+  select
+    teq.user_id,
+    teq.tagname,
+    count(*) as tag_q_count,
+    avg(nullif(q.score,0)) as avg_q_score_nonzero,
+    sum(q.viewcount) as total_views
+  from tag_expanded_questions teq
+  join q_with_tag q on q.post_id = teq.post_id
+  group by teq.user_id, teq.tagname
+),
+answers_enriched as (
+  select
+    a.user_id,
+    a.post_id,
+    a.creationdate,
+    a.score,
+    a.commentcount,
+    a.parent_qid,
+    a.parent_qscore,
+    a.parent_qviews,
+    a.parent_qtags,
+    coalesce(v.upvotes,0) as upvotes,
+    coalesce(v.downvotes,0) as downvotes,
+    coalesce(v.bounties_started,0) as bounties_started,
+    coalesce(v.bounty_amount_total,0) as bounty_amount_total,
+    coalesce(l.linked_count,0) as linked_count,
+    coalesce(l.duplicate_of_count,0) as duplicate_of_count,
+    coalesce(l.distinct_related,0) as distinct_related
+  from a_with_parent a
+  left join votes_agg v on v.postid = a.post_id
+  left join links_agg l on l.postid = a.post_id
+),
+question_enriched as (
+  select
+    q.user_id,
+    q.post_id,
+    q.creationdate,
+    q.score,
+    q.viewcount,
+    q.favoritecount,
+    q.commentcount,
+    q.title,
+    q.tags,
+    q.answercount,
+    q.is_closed,
+    q.has_sql_tag,
+    coalesce(v.upvotes,0) as upvotes,
+    coalesce(v.downvotes,0) as downvotes,
+    coalesce(v.bounties_started,0) as bounties_started,
+    coalesce(v.bounty_amount_total,0) as bounty_amount_total,
+    coalesce(l.linked_count,0) as linked_count,
+    coalesce(l.duplicate_of_count,0) as duplicate_of_count,
+    coalesce(l.distinct_related,0) as distinct_related,
+    ph.last_closed_at,
+    ph.last_reopened_at,
+    ph.close_events,
+    ph.reopen_events,
+    ph.migrations
+  from q_with_tag q
+  left join votes_agg v on v.postid = q.post_id
+  left join links_agg l on l.postid = q.post_id
+  left join posthistory_close ph on ph.postid = q.post_id
+),
+user_activity as (
+  select
+    ru.user_id,
+    count(*) filter (where qe.post_id is not null) as q_count,
+    count(*) filter (where ae.post_id is not null) as a_count,
+    sum(qe.viewcount) as total_q_views,
+    sum(qe.favoritecount) as total_q_favs,
+    sum(qe.linked_count) as total_q_linked_refs,
+    sum(ae.upvotes) + sum(qe.upvotes) as total_upvotes,
+    sum(ae.downvotes) + sum(qe.downvotes) as total_downvotes,
+    avg(qe.score) as avg_q_score,
+    avg(ae.score) as avg_a_score,
+    max(greatest(coalesce(qe.last_closed_at, timestamp 'epoch'), coalesce(qe.last_reopened_at, timestamp 'epoch'))) as last_close_or_reopen
+  from recent_users ru
+  left join question_enriched qe on qe.user_id = ru.user_id
+  left join answers_enriched ae on ae.user_id = ru.user_id
+  group by ru.user_id
+),
+answer_accepts as (
+  select
+    a.user_id,
+    count(*) filter (where p.parentid is not null and p.id = q.acceptedanswerid) as accepted_answers
+  from posts p
+  join posts q on q.id = p.parentid and q.posttypeid = 1
+  join user_posts a on a.post_id = p.id and a.posttypeid = 2
+  group by a.user_id
+),
+user_ranked as (
+  select
+    ru.user_id,
+    ru.displayname,
+    ru.reputation,
+    ru.creationdate,
+    ru.location,
+    ru.websiteurl_norm,
+    ru.gold_badges,
+    ru.silver_badges,
+    ru.bronze_badges,
+    ru.total_badges,
+    ua.q_count,
+    ua.a_count,
+    ua.total_q_views,
+    ua.total_q_favs,
+    ua.total_q_linked_refs,
+    ua.total_upvotes,
+    ua.total_downvotes,
+    ua.avg_q_score,
+    ua.avg_a_score,
+    coalesce(aa.accepted_answers,0) as accepted_answers,
+    coalesce(ua.last_close_or_reopen, ru.creationdate) as last_moderation_touch,
+    case
+      when ru.reputation >= 20000 then 'Legend'
+      when ru.reputation >= 10000 then 'Elite'
+      when ru.reputation >= 5000 then 'Pro'
+      when ru.reputation >= 1000 then 'Rising'
+      else 'Newbie'
+    end as tier,
+    row_number() over (order by coalesce(ua.total_upvotes,0) - coalesce(ua.total_downvotes,0) desc, ru.reputation desc, ru.user_id) as rownum_points,
+    dense_rank() over (order by coalesce(ua.total_q_views,0) desc) as dense_view_rank,
+    percentile_cont(0.5) within group (order by coalesce(ua.avg_a_score,0)) over () as median_avg_a_score_global
+  from recent_users ru
+  left join user_activity ua on ua.user_id = ru.user_id
+  left join answer_accepts aa on aa.user_id = ru.user_id
+),
+tag_focus as (
+  select
+    uts.user_id,
+    string_agg(uts.tagname || ':' || uts.tag_q_count::text, ', ' order by uts.tag_q_count desc, uts.tagname) as top_tags_summary,
+    max(uts.tag_q_count) as max_tag_qs,
+    count(*) as distinct_tags,
+    sum(uts.total_views) as tag_total_views
+  from user_tag_stats uts
+  group by uts.user_id
+),
+final_users as (
+  select
+    ur.*,
+    tf.top_tags_summary,
+    tf.max_tag_qs,
+    tf.distinct_tags,
+    tf.tag_total_views
+  from user_ranked ur
+  left join tag_focus tf on tf.user_id = ur.user_id
+),
+moderation_flags as (
+  select
+    q.user_id,
+    count(*) filter (where q.is_closed = 1) as closed_qs,
+    count(*) filter (where q.migrations > 0) as migrated_qs,
+    count(*) filter (where q.duplicate_of_count > 0) as dup_marked_qs
+  from question_enriched q
+  group by q.user_id
+),
+heavy_commenters as (
+  select
+    u.id as user_id,
+    sum(c.score) as comment_score_sum,
+    count(*) as comment_count,
+    avg(c.score) as avg_comment_score,
+    min(c.creationdate) as first_comment_at,
+    max(c.creationdate) as last_comment_at
+  from users u
+  left join comments c on c.userid = u.id
+  group by u.id
+),
+scored as (
+  select
+    fu.user_id,
+    fu.displayname,
+    fu.reputation,
+    fu.creationdate,
+    fu.location,
+    coalesce(fu.websiteurl_norm, 'N/A') as websiteurl_norm,
+    fu.gold_badges,
+    fu.silver_badges,
+    fu.bronze_badges,
+    fu.total_badges,
+    fu.q_count,
+    fu.a_count,
+    fu.total_q_views,
+    fu.total_q_favs,
+    fu.total_q_linked_refs,
+    fu.total_upvotes,
+    fu.total_downvotes,
+    fu.avg_q_score,
+    fu.avg_a_score,
+    fu.accepted_answers,
+    fu.last_moderation_touch,
+    fu.tier,
+    fu.rownum_points,
+    fu.dense_view_rank,
+    fu.median_avg_a_score_global,
+    fu.top_tags_summary,
+    fu.max_tag_qs,
+    fu.distinct_tags,
+    fu.tag_total_views,
+    coalesce(mf.closed_qs,0) as closed_qs,
+    coalesce(mf.migrated_qs,0) as migrated_qs,
+    coalesce(mf.dup_marked_qs,0) as dup_marked_qs,
+    coalesce(hc.comment_score_sum,0) as comment_score_sum,
+    coalesce(hc.comment_count,0) as comment_count,
+    coalesce(hc.avg_comment_score,0) as avg_comment_score,
+    hc.first_comment_at,
+    hc.last_comment_at,
+    (
+      coalesce(fu.total_upvotes,0) * 2
+      - coalesce(fu.total_downvotes,0) * 3
+      + coalesce(fu.accepted_answers,0) * 15
+      + coalesce(fu.total_q_views,0) / 100
+      + coalesce(fu.total_q_favs,0) * 5
+      + coalesce(fu.gold_badges,0) * 50
+      + coalesce(fu.silver_badges,0) * 20
+      + coalesce(fu.bronze_badges,0) * 5
+      + coalesce(fu.max_tag_qs,0) * 2
+      + coalesce(hc.comment_score_sum,0)
+      - coalesce(mf.closed_qs,0) * 10
+      - coalesce(mf.dup_marked_qs,0) * 5
+    ) as composite_score
+  from final_users fu
+  left join moderation_flags mf on mf.user_id = fu.user_id
+  left join heavy_commenters hc on hc.user_id = fu.user_id
+),
+topn as (
+  select
+    s.*,
+    ntile(10) over (order by s.composite_score desc nulls last) as decile,
+    rank() over (order by s.composite_score desc nulls last, s.reputation desc) as rnk
+  from scored s
+)
+select
+  t.user_id,
+  t.displayname,
+  t.reputation,
+  t.tier,
+  t.decile,
+  t.rnk,
+  t.composite_score,
+  t.total_upvotes,
+  t.total_downvotes,
+  t.accepted_answers,
+  t.q_count,
+  t.a_count,
+  t.avg_q_score,
+  t.avg_a_score,
+  t.total_q_views,
+  t.total_q_favs,
+  t.closed_qs,
+  t.dup_marked_qs,
+  t.migrated_qs,
+  t.top_tags_summary,
+  t.distinct_tags,
+  t.tag_total_views,
+  t.comment_count,
+  t.avg_comment_score,
+  t.last_moderation_touch,
+  t.websiteurl_norm,
+  coalesce(nullif(trim(t.location), ''), 'Unknown') as location_norm
+from topn t
+where
+  (t.decile <= 3 or t.reputation >= 10000)
+  and (t.total_q_views > 0 or t.a_count > 0)
+  and (t.top_tags_summary is not null or t.comment_count > 10)
+order by t.decile, t.composite_score desc, t.rnk
+limit 200;

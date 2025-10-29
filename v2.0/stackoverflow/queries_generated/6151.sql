@@ -1,0 +1,54 @@
+-- {"query": "6151.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-micro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 610} 
+
+SELECT 
+    u.DisplayName,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 1 THEN p.Id ELSE NULL END) AS InitialTitles,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 2 THEN p.Id ELSE NULL END) AS InitialBodies,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 10 THEN p.Id ELSE NULL END) AS ClosedPosts,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 11 THEN p.Id ELSE NULL END) AS ReopenedPosts,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 1 THEN p.Id ELSE NULL END) AS AcceptedAnswers,
+    AVG(p.Score) AS AvgScore,
+    SUM(p.ViewCount) AS TotalViews,
+    MAX(u.Reputation) AS MaxReputation,
+    MIN(u.Reputation) AS MinReputation,
+    AVG(u.Reputation) AS AvgReputation,
+    SUM(b.Class = 1) AS GoldBadges,
+    SUM(b.Class = 2) AS SilverBadges,
+    SUM(b.Class = 3) AS BronzeBadges,
+    STRING_AGG(DISTINCT CASE WHEN t.TagName IS NOT NULL THEN t.TagName ELSE NULL END, ', ') AS PopularTags
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    PostLinks pl ON p.Id = pl.PostId
+LEFT JOIN 
+    LinkTypes lt ON pl.LinkTypeId = lt.Id
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+LEFT JOIN 
+    PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+LEFT JOIN 
+    Tags t ON p.Id = t.ExcerptPostId
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+WHERE 
+    p.PostTypeId = 1 AND 
+    p.ClosedDate IS NULL AND 
+    p.LastActivityDate > (CURRENT_TIMESTAMP - INTERVAL '1 year') AND 
+    ph.CreationDate IS NOT NULL AND 
+    ph.PostHistoryTypeId IN (1, 2, 10, 11) AND 
+    v.VoteTypeId = 1 AND 
+    b.Class IS NOT NULL
+GROUP BY 
+    u.Id, u.DisplayName
+HAVING 
+    COUNT(DISTINCT p.Id) > 10 AND 
+    AVG(p.Score) > 10
+ORDER BY 
+    TotalViews DESC, 
+    AvgScore DESC
+LIMIT 100;

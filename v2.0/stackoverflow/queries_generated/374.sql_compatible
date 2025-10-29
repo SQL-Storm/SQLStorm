@@ -1,0 +1,343 @@
+with recent_active_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.location,
+        u.creationdate,
+        u.lastaccessdate,
+        coalesce(nullif(trim(u.websiteurl), ''), '(none)') as websiteurl,
+        count(*) filter (where p.posttypeid in (1,2)) as total_posts,
+        max(p.lastactivitydate) as last_post_activity,
+        sum(p.score) filter (where p.posttypeid in (1,2)) as total_post_score,
+        count(distinct p.id) filter (where p.posttypeid = 1 and p.acceptedanswerid is not null) as questions_with_accepted
+    from users u
+    left join posts p
+      on p.owneruserid = u.id
+     and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+    where u.lastaccessdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '180 days'
+    group by u.id, u.displayname, u.reputation, u.location, u.creationdate, u.lastaccessdate, u.websiteurl
+),
+badge_stats as (
+    select
+        b.userid,
+        count(*) as badge_count,
+        count(*) filter (where b.class = 1) as gold_count,
+        count(*) filter (where b.class = 2) as silver_count,
+        count(*) filter (where b.class = 3) as bronze_count,
+        count(*) filter (where b.tagbased = true) as tag_badge_count,
+        min(b.date) as first_badge_date,
+        max(b.date) as last_badge_date
+    from badges b
+    where b.date >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+    group by b.userid
+),
+question_metrics as (
+    select
+        p.owneruserid as user_id,
+        count(*) as q_count,
+        sum(p.viewcount) as q_views,
+        avg(nullif(p.viewcount,0)) as avg_q_views_nonzero,
+        sum(p.favoritecount) as q_favs,
+        sum(case when p.acceptedanswerid is not null then 1 else 0 end) as q_with_accept,
+        sum(case when p.closuredate is not null or p.closeddate is not null then 1 else 0 end) as q_closed,
+        count(distinct pl.relatedpostid) filter (where pl.linktypeid = 3) as q_marked_duplicate_of
+    from posts p
+    left join postlinks pl
+      on pl.postid = p.id
+     and pl.linktypeid in (1,3)
+    where p.posttypeid = 1
+      and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '730 days'
+    group by p.owneruserid
+),
+answer_metrics as (
+    select
+        p.owneruserid as user_id,
+        count(*) as a_count,
+        sum(p.score) as a_score,
+        avg(p.score) as avg_a_score,
+        count(*) filter (where v.votetypeid = 1) as a_accepted_count
+    from posts p
+    left join votes v
+      on v.postid = p.id
+     and v.votetypeid = 1
+    where p.posttypeid = 2
+      and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '730 days'
+    group by p.owneruserid
+),
+comment_activity as (
+    select
+        c.userid as user_id,
+        count(*) as c_count,
+        sum(c.score) as c_score,
+        max(c.creationdate) as last_comment_date,
+        count(*) filter (
+            where position(lower('thank') in lower(coalesce(c.text,''))) > 0
+               or position(lower('helpful') in lower(coalesce(c.text,''))) > 0
+        ) as c_gratitude_like
+    from comments c
+    where c.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+    group by c.userid
+),
+hotness_candidates as (
+    select
+        p.id as post_id,
+        p.owneruserid as user_id,
+        p.posttypeid,
+        p.score,
+        coalesce(p.viewcount,0) as viewcount,
+        coalesce(p.favoritecount,0) as favs,
+        p.creationdate,
+        p.lastactivitydate,
+        dense_rank() over (partition by p.posttypeid order by (coalesce(p.viewcount,0) + 5 * coalesce(p.favoritecount,0) + 10 * greatest(p.score,0)) desc, p.creationdate desc) as popularity_rank
+    from posts p
+    where p.posttypeid in (1,2)
+      and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '180 days'
+),
+edits_cte as (
+    select
+        ph.postid,
+        count(*) filter (where ph.posthistorytypeid in (4,5,6)) as edit_count,
+        min(ph.creationdate) filter (where ph.posthistorytypeid in (4,5,6)) as first_edit,
+        max(ph.creationdate) filter (where ph.posthistorytypeid in (4,5,6)) as last_edit,
+        count(*) filter (where ph.posthistorytypeid in (10,11,12,13,14,15,19,20,35)) as mod_events
+    from posthistory ph
+    where ph.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '730 days'
+    group by ph.postid
+),
+dup_network as (
+    select
+        pl.relatedpostid as canonical_id,
+        count(distinct pl.postid) as dup_inbound_count,
+        count(distinct case when p.owneruserid is not null then p.owneruserid end) as distinct_dup_askers
+    from postlinks pl
+    join posts p on p.id = pl.postid
+    where pl.linktypeid = 3
+      and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '730 days'
+    group by pl.relatedpostid
+),
+user_tag_affinity as (
+    select
+        p.owneruserid as user_id,
+        lower(unnest(string_to_array(substring(p.tags, 2, length(p.tags)-2), '><'))) as tagname,
+        count(*) as tag_posts,
+        sum(p.score) as tag_score,
+        avg(p.score) as avg_tag_score
+    from posts p
+    where p.posttypeid = 1
+      and p.tags is not null
+      and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '730 days'
+    group by p.owneruserid, lower(unnest(string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')))
+),
+top_user_tags as (
+    select distinct on (uta.user_id)
+        uta.user_id,
+        uta.tagname,
+        uta.tag_posts,
+        uta.tag_score,
+        uta.avg_tag_score
+    from user_tag_affinity uta
+    order by uta.user_id, uta.tag_posts desc, uta.tag_score desc, uta.tagname
+),
+user_vote_profile as (
+    select
+        v.userid as user_id,
+        count(*) filter (where v.votetypeid = 2) as upvotes_cast,
+        count(*) filter (where v.votetypeid = 3) as downvotes_cast,
+        count(*) filter (where v.votetypeid = 8) as bounties_started,
+        sum(v.bountyamount) filter (where v.votetypeid in (8,9)) as bounty_total,
+        max(v.creationdate) as last_vote_date
+    from votes v
+    where v.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '730 days'
+    group by v.userid
+),
+engagement_score as (
+    select
+        rau.user_id,
+        0.30 * coalesce(am.a_count,0)
+      + 0.20 * coalesce(qm.q_count,0)
+      + 0.15 * coalesce(cm.c_count,0)
+      + 0.10 * coalesce(b.badge_count,0)
+      + 0.10 * coalesce(am.a_accepted_count,0)
+      + 0.05 * coalesce(qm.q_with_accept,0)
+      + 0.10 * least(coalesce(rau.total_post_score,0), 1000) / 1000.0
+      - 0.05 * coalesce(qm.q_closed,0) as score_raw
+    from recent_active_users rau
+    left join question_metrics qm on qm.user_id = rau.user_id
+    left join answer_metrics am on am.user_id = rau.user_id
+    left join comment_activity cm on cm.user_id = rau.user_id
+    left join badge_stats b on b.userid = rau.user_id
+),
+normalized_engagement as (
+    select
+        e.user_id,
+        e.score_raw,
+        (e.score_raw - min(e.score_raw) over ()) /
+        nullif(max(e.score_raw) over () - min(e.score_raw) over (), 0) as score_norm
+    from engagement_score e
+),
+user_summary as (
+    select
+        rau.user_id,
+        rau.displayname,
+        rau.reputation,
+        coalesce(nullif(rau.location,''), '(unknown)') as location,
+        rau.websiteurl,
+        rau.creationdate,
+        rau.lastaccessdate,
+        rau.total_posts,
+        rau.total_post_score,
+        rau.last_post_activity,
+        coalesce(b.badge_count,0) as badges,
+        coalesce(b.gold_count,0) as gold_badges,
+        coalesce(b.silver_count,0) as silver_badges,
+        coalesce(b.bronze_count,0) as bronze_badges,
+        coalesce(qm.q_count,0) as questions_2y,
+        coalesce(qm.q_views,0) as question_views_2y,
+        coalesce(qm.q_with_accept,0) as questions_with_accepted_2y,
+        coalesce(qm.q_marked_duplicate_of,0) as questions_marked_duplicate_of_2y,
+        coalesce(am.a_count,0) as answers_2y,
+        coalesce(am.a_score,0) as answer_score_2y,
+        coalesce(am.a_accepted_count,0) as answers_accepted_2y,
+        coalesce(cm.c_count,0) as comments_1y,
+        coalesce(cm.c_score,0) as comment_score_1y,
+        cm.last_comment_date,
+        coalesce(uvp.upvotes_cast,0) as upvotes_cast_2y,
+        coalesce(uvp.downvotes_cast,0) as downvotes_cast_2y,
+        coalesce(uvp.bounties_started,0) as bounties_started_2y,
+        coalesce(uvp.bounty_total,0) as bounty_total_2y,
+        uvp.last_vote_date,
+        nt.score_norm as engagement_norm,
+        tut.tagname as top_tag,
+        tut.tag_posts as top_tag_posts,
+        tut.tag_score as top_tag_score,
+        tut.avg_tag_score as top_tag_avg_score
+    from recent_active_users rau
+    left join badge_stats b on b.userid = rau.user_id
+    left join question_metrics qm on qm.user_id = rau.user_id
+    left join answer_metrics am on am.user_id = rau.user_id
+    left join comment_activity cm on cm.user_id = rau.user_id
+    left join user_vote_profile uvp on uvp.user_id = rau.user_id
+    left join normalized_engagement nt on nt.user_id = rau.user_id
+    left join top_user_tags tut on tut.user_id = rau.user_id
+),
+post_rollup as (
+    select
+        p.owneruserid as user_id,
+        count(*) filter (where p.posttypeid = 1) as q_total,
+        count(*) filter (where p.posttypeid = 2) as a_total,
+        avg(p.score) filter (where p.posttypeid = 1) as avg_q_score,
+        avg(p.score) filter (where p.posttypeid = 2) as avg_a_score,
+        max(p.creationdate) as newest_post_date,
+        min(p.creationdate) as oldest_post_date
+    from posts p
+    where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+    group by p.owneruserid
+),
+ranked_users as (
+    select
+        us.*,
+        pr.q_total,
+        pr.a_total,
+        pr.avg_q_score,
+        pr.avg_a_score,
+        pr.newest_post_date,
+        pr.oldest_post_date,
+        row_number() over (order by coalesce(engagement_norm, 0) desc, coalesce(answer_score_2y,0) desc, coalesce(question_views_2y,0) desc) as overall_rank
+    from user_summary us
+    left join post_rollup pr on pr.user_id = us.user_id
+),
+user_hot_posts as (
+    select
+        p.owneruserid as user_id,
+        count(*) filter (where hc.popularity_rank <= 50) as top50_recent_posts,
+        max(hc.popularity_rank) filter (where hc.popularity_rank <= 50) as worst_top50_rank,
+        min(hc.popularity_rank) filter (where hc.popularity_rank <= 50) as best_top50_rank,
+        sum(case when hc.popularity_rank <= 50 then p.score else 0 end) as top50_score_sum
+    from hotness_candidates hc
+    join posts p on p.id = hc.post_id
+    group by p.owneruserid
+),
+closed_reason_breakdown as (
+    select
+        p.owneruserid as user_id,
+        count(*) filter (where ph.posthistorytypeid = 10 and cast(ph.comment as integer) = 101) as closed_dup,
+        count(*) filter (where ph.posthistorytypeid = 10 and cast(ph.comment as integer) = 102) as closed_offtopic,
+        count(*) filter (where ph.posthistorytypeid = 10 and cast(ph.comment as integer) = 103) as closed_needs_details,
+        count(*) filter (where ph.posthistorytypeid = 10 and cast(ph.comment as integer) = 104) as closed_needs_focus,
+        count(*) filter (where ph.posthistorytypeid = 10 and cast(ph.comment as integer) = 105) as closed_opinion
+    from posts p
+    join posthistory ph on ph.postid = p.id
+    where p.posttypeid = 1
+      and ph.posthistorytypeid = 10
+      and ph.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '730 days'
+    group by p.owneruserid
+)
+select
+    ru.overall_rank,
+    ru.user_id,
+    ru.displayname,
+    ru.reputation,
+    ru.location,
+    ru.websiteurl,
+    ru.creationdate,
+    ru.lastaccessdate,
+    coalesce(ru.engagement_norm, 0) as engagement_norm,
+    ru.badges,
+    ru.gold_badges,
+    ru.silver_badges,
+    ru.bronze_badges,
+    ru.questions_2y,
+    ru.answers_2y,
+    ru.answers_accepted_2y,
+    ru.answer_score_2y,
+    ru.question_views_2y,
+    ru.questions_with_accepted_2y,
+    ru.questions_marked_duplicate_of_2y,
+    ru.upvotes_cast_2y,
+    ru.downvotes_cast_2y,
+    ru.bounties_started_2y,
+    ru.bounty_total_2y,
+    ru.top_tag,
+    ru.top_tag_posts,
+    ru.top_tag_score,
+    ru.top_tag_avg_score,
+    pr.q_total,
+    pr.a_total,
+    pr.avg_q_score,
+    pr.avg_a_score,
+    pr.newest_post_date,
+    pr.oldest_post_date,
+    coalesce(uhp.top50_recent_posts,0) as top50_recent_posts,
+    uhp.best_top50_rank,
+    uhp.worst_top50_rank,
+    uhp.top50_score_sum,
+    crb.closed_dup,
+    crb.closed_offtopic,
+    crb.closed_needs_details,
+    crb.closed_needs_focus,
+    crb.closed_opinion,
+    dn.dup_inbound_count,
+    dn.distinct_dup_askers,
+    case
+        when coalesce(pr.a_total,0) + coalesce(pr.q_total,0) = 0 then null
+        else round(100.0 * coalesce(pr.a_total,0) / nullif(coalesce(pr.a_total,0) + coalesce(pr.q_total,0),0), 2)
+    end as pct_answers_of_posts,
+    case
+        when ru.top_tag is null then '(none)'
+        else ru.top_tag || ' (' || coalesce(cast(ru.top_tag_posts as text),'0') || ' posts)'
+    end as top_tag_label
+from ranked_users ru
+left join post_rollup pr on pr.user_id = ru.user_id
+left join user_hot_posts uhp on uhp.user_id = ru.user_id
+left join closed_reason_breakdown crb on crb.user_id = ru.user_id
+left join lateral (
+    select sum(dn.dup_inbound_count) as dup_inbound_count,
+           sum(dn.distinct_dup_askers) as distinct_dup_askers
+    from dup_network dn
+    join posts p on p.id = dn.canonical_id
+    where p.owneruserid = ru.user_id
+) dn on true
+where coalesce(ru.answers_2y,0) + coalesce(ru.questions_2y,0) + coalesce(ru.comments_1y,0) > 0
+order by ru.overall_rank
+limit 200;

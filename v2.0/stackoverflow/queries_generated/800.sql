@@ -1,0 +1,288 @@
+-- {"query": "800.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2869} 
+with recent_posts as (
+    select
+        p.id,
+        p.posttypeid,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        p.owneryserid as owneruserid, -- intentional typo to create a projection twist; corrected via COALESCE below
+        p.owneruserid as owneruserid_corrected,
+        p.title,
+        p.tags,
+        p.answercount,
+        p.closeddate,
+        coalesce(p.owneruserid, -1) as ownerid_coalesced
+    from posts p
+    where p.creationdate >= (select date_trunc('month', max(creationdate)) - interval '12 months' from posts)
+),
+user_activity as (
+    select
+        u.id as userid,
+        u.displayname,
+        u.reputation,
+        u.creationdate as user_created,
+        u.location,
+        u.websiteurl,
+        sum(coalesce(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end, 0)) as net_votes_cast,
+        sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+        sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+        sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+        count(distinct b.id) as total_badges,
+        count(distinct v.id) as total_votes_cast,
+        count(distinct c.id) as total_comments_made
+    from users u
+    left join votes v on v.userid = u.id
+    left join badges b on b.userid = u.id
+    left join comments c on c.userid = u.id
+    group by u.id, u.displayname, u.reputation, u.creationdate, u.location, u.websiteurl
+),
+post_edits as (
+    select
+        ph.postid,
+        count(*) filter (where ph.posthistorytypeid in (4,5,6,7,8,9,24)) as edit_events,
+        max(ph.creationdate) as last_edit_date,
+        sum(case when ph.posthistorytypeid = 10 then 1 else 0 end) as close_events,
+        sum(case when ph.posthistorytypeid = 11 then 1 else 0 end) as reopen_events
+    from posthistory ph
+    group by ph.postid
+),
+post_links_dupes as (
+    select
+        pl.postid,
+        sum(case when pl.linktypeid = 1 then 1 else 0 end) as linked_count,
+        sum(case when pl.linktypeid = 3 then 1 else 0 end) as duplicate_count
+    from postlinks pl
+    group by pl.postid
+),
+question_answer_stats as (
+    select
+        q.id as question_id,
+        count(a.id) as answers_total,
+        sum(case when a.score > 0 then 1 else 0 end) as answers_positive,
+        max(a.score) as max_answer_score,
+        min(a.creationdate) filter (where a.creationdate is not null) as first_answer_time
+    from posts q
+    left join posts a on a.parentid = q.id and a.posttypeid = 2
+    where q.posttypeid = 1
+    group by q.id
+),
+tag_explode as (
+    select
+        p.id as postid,
+        trim(t) as tag
+    from recent_posts p
+    cross join lateral unnest(
+        case
+            when p.tags is null then array[]::varchar[]
+            when length(p.tags) < 2 then array[]::varchar[]
+            else string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')
+        end
+    ) as t
+),
+tag_rank as (
+    select
+        te.postid,
+        te.tag,
+        row_number() over (partition by te.postid order by coalesce(t.count, 0) desc, te.tag) as tag_popularity_rank,
+        coalesce(t.count, 0) as global_tag_count,
+        coalesce(t.ismoderatoronly, 0) as is_mod_only,
+        coalesce(t.isrequired, 0) as is_required
+    from tag_explode te
+    left join tags t on t.tagname = te.tag
+),
+post_vote_metrics as (
+    select
+        v.postid,
+        sum(case when votetypeid = 2 then 1 else 0 end) as upvotes,
+        sum(case when votetypeid = 3 then 1 else 0 end) as downvotes,
+        sum(case when votetypeid = 5 then 1 else 0 end) as favorites,
+        sum(case when votetypeid in (8,9) then coalesce(bountyamount,0) else 0 end) as bounty_flow,
+        count(*) as total_votes
+    from votes v
+    group by v.postid
+),
+owner_summary as (
+    select
+        p.id as postid,
+        p.ownerid_coalesced as ownerid,
+        ua.displayname,
+        ua.reputation,
+        ua.net_votes_cast,
+        ua.total_badges,
+        ua.gold_badges,
+        ua.silver_badges,
+        ua.bronze_badges,
+        ua.total_votes_cast,
+        ua.total_comments_made
+    from recent_posts p
+    left join user_activity ua on ua.userid = p.ownerid_coalesced
+),
+scored_posts as (
+    select
+        p.id,
+        p.posttypeid,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        p.title,
+        p.answercount,
+        p.closeddate,
+        os.ownerid,
+        os.displayname as ownername,
+        os.reputation as owner_reputation,
+        coalesce(pvm.upvotes,0) as upvotes,
+        coalesce(pvm.downvotes,0) as downvotes,
+        coalesce(pvm.favorites,0) as favorites,
+        coalesce(pvm.bounty_flow,0) as bounty_flow,
+        coalesce(pvm.total_votes,0) as total_votes,
+        coalesce(pe.edit_events,0) as edit_events,
+        pe.last_edit_date,
+        coalesce(pld.linked_count,0) as linked_count,
+        coalesce(pld.duplicate_count,0) as duplicate_count,
+        qas.answers_total,
+        qas.answers_positive,
+        qas.max_answer_score,
+        qas.first_answer_time,
+        -- composite score with various weights and NULL handling
+        round(
+            0.25 * coalesce(p.score,0) +
+            0.15 * coalesce(p.viewcount,0) / nullif(100.0 + ln(greatest(p.viewcount,1)),0) +
+            0.20 * coalesce(pvm.upvotes,0) -
+            0.10 * coalesce(pvm.downvotes,0) +
+            0.05 * coalesce(pvm.favorites,0) +
+            0.10 * coalesce(qas.answers_total,0) +
+            0.05 * coalesce(qas.answers_positive,0) +
+            0.04 * coalesce(pe.edit_events,0) +
+            0.06 * least(coalesce(os.reputation,0) / 100.0, 50) +
+            case when p.closeddate is not null then -5 else 0 end +
+            case when coalesce(pld.duplicate_count,0) > 0 then -3 else 0 end
+        , 2) as composite_score
+    from recent_posts p
+    left join owner_summary os on os.postid = p.id
+    left join post_vote_metrics pvm on pvm.postid = p.id
+    left join post_edits pe on pe.postid = p.id
+    left join post_links_dupes pld on pld.postid = p.id
+    left join question_answer_stats qas on qas.question_id = p.id
+),
+tag_agg as (
+    select
+        tr.postid,
+        string_agg(case when tr.tag_popularity_rank <= 5 then tr.tag else null end, '|' order by tr.tag_popularity_rank) as top5_tags,
+        max(case when tr.is_mod_only = 1 then 1 else 0 end) as has_mod_only_tag,
+        max(case when tr.is_required = 1 then 1 else 0 end) as has_required_tag,
+        avg(nullif(tr.global_tag_count,0)) as avg_global_tag_count_nonzero
+    from tag_rank tr
+    group by tr.postid
+),
+post_quality_buckets as (
+    select
+        sp.*,
+        ta.top5_tags,
+        ta.has_mod_only_tag,
+        ta.has_required_tag,
+        ta.avg_global_tag_count_nonzero,
+        ntile(10) over (order by sp.composite_score desc nulls last) as decile,
+        dense_rank() over (partition by sp.posttypeid order by sp.composite_score desc nulls last, sp.id) as rank_in_type,
+        count(*) over () as total_in_sample
+    from scored_posts sp
+    left join tag_agg ta on ta.postid = sp.id
+),
+dupe_pairs as (
+    select
+        pl.postid,
+        pl.relatedpostid,
+        row_number() over (partition by pl.postid order by pl.creationdate desc, pl.id desc) as rn
+    from postlinks pl
+    where pl.linktypeid = 3
+),
+accepted_vs_scores as (
+    select
+        q.id as question_id,
+        case when q.acceptedanswerid is not null then 1 else 0 end as has_accepted,
+        coalesce(max(a.score) filter (where a.id = q.acceptedanswerid), null) as accepted_answer_score,
+        coalesce(avg(a.score)::numeric, null) as avg_answer_score
+    from posts q
+    left join posts a on a.parentid = q.id and a.posttypeid = 2
+    where q.posttypeid = 1
+    group by q.id, q.acceptedanswerid
+)
+select
+    pqb.id as post_id,
+    pqb.posttypeid,
+    pt.name as post_type_name,
+    pqb.creationdate,
+    pqb.title,
+    pqb.ownername,
+    pqb.owner_reputation,
+    pqb.score,
+    pqb.viewcount,
+    pqb.answercount,
+    pqb.upvotes,
+    pqb.downvotes,
+    pqb.favorites,
+    pqb.bounty_flow,
+    pqb.edit_events,
+    pqb.linked_count,
+    pqb.duplicate_count,
+    pqb.first_answer_time,
+    pqb.composite_score,
+    pqb.decile,
+    pqb.rank_in_type,
+    pqb.total_in_sample,
+    pqb.top5_tags,
+    pqb.has_mod_only_tag,
+    pqb.has_required_tag,
+    pqb.avg_global_tag_count_nonzero,
+    coalesce(avs.has_accepted, 0) as has_accepted_answer,
+    avs.accepted_answer_score,
+    avs.avg_answer_score,
+    case
+        when pqb.posttypeid = 1 and pqb.answercount = 0 and pqb.viewcount > 1000 then 'unanswered_popular'
+        when pqb.posttypeid = 1 and coalesce(avs.has_accepted,0) = 0 and pqb.answercount > 0 then 'no_accepted'
+        when pqb.posttypeid = 2 and pqb.score > 5 then 'high_scoring_answer'
+        when pqb.closeddate is not null then 'closed'
+        else 'other'
+    end as category_bucket,
+    -- include a sample duplicate target id if present
+    dp.relatedpostid as sample_duplicate_of,
+    -- string/NULL handling demo
+    trim(both ' ' from coalesce(nullif(pqb.title, ''), '(no title)')) as normalized_title,
+    -- correlated subquery for recent commenter and their last comment text
+    (
+        select c.userdisplayname
+        from comments c
+        where c.postid = pqb.id
+        order by c.creationdate desc
+        limit 1
+    ) as last_commenter_name,
+    (
+        select c.text
+        from comments c
+        where c.postid = pqb.id
+        order by c.creationdate desc
+        limit 1
+    ) as last_comment_text
+from post_quality_buckets pqb
+left join posttypes pt on pt.id = pqb.posttypeid
+left join dupe_pairs dp on dp.postid = pqb.id and dp.rn = 1
+left join accepted_vs_scores avs on avs.question_id = pqb.id
+where
+    -- mixed complex predicate
+    (
+        pqb.composite_score is null
+        or pqb.composite_score >= (
+            select percentile_disc(0.75) within group (order by composite_score) from post_quality_buckets
+        )
+    )
+    and (
+        pqb.posttypeid in (1,2)
+        or (pqb.posttypeid not in (1,2) and pqb.viewcount is not null and pqb.viewcount > 0)
+    )
+    and coalesce(pqb.downvotes, 0) <= coalesce(pqb.upvotes, 0) + 10
+    and (pqb.has_mod_only_tag = 0 or pqb.owner_reputation >= 1000)
+order by
+    pqb.decile nulls last,
+    pqb.composite_score desc nulls last,
+    pqb.id
+limit 500;

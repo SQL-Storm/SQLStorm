@@ -1,0 +1,343 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.CreationDate,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        AVG(p.Score) as AvgPostScore,
+        MAX(p.CreationDate) as LastPostDate,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags)-2)), ', ') as AllTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.CreationDate, u.Views, u.UpVotes, u.DownVotes
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.LastEditDate,
+        p.LastActivityDate,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as PostType,
+        COALESCE(p.AnswerCount, 0) + COALESCE(p.CommentCount, 0) as EngagementCount,
+        CASE 
+            WHEN p.Score > 100 THEN 'Highly_Voted'
+            WHEN p.Score > 50 THEN 'Moderately_Voted'
+            WHEN p.Score > 0 THEN 'Slightly_Voted'
+            ELSE 'No_Votes'
+        END as VoteCategory,
+        DENSE_RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) as ScoreRank,
+        ROW_NUMBER() OVER (ORDER BY p.CreationDate DESC) as ChronologicalOrder
+    FROM Posts p
+    WHERE p.CreationDate >= TIMESTAMP '2022-01-01 00:00:00'
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 500 THEN 'Moderate'
+            WHEN t.Count > 100 THEN 'Niche'
+            ELSE 'Rare'
+        END as PopularityLevel,
+        RANK() OVER (ORDER BY t.Count DESC) as PopularityRank,
+        LAG(t.Count) OVER (ORDER BY t.Count DESC) as PreviousCount,
+        LAG(t.TagName) OVER (ORDER BY t.Count DESC) as PreviousTagName
+    FROM Tags t
+    WHERE t.Count > 10
+),
+UserPostComparison AS (
+    SELECT 
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.PostCount,
+        us.CommentCount,
+        us.BadgeCount,
+        us.AvgPostScore,
+        us.LastPostDate,
+        pa.PostId,
+        pa.Title,
+        pa.Score,
+        pa.ViewCount,
+        pa.CreationDate,
+        pa.PostType,
+        pa.VoteCategory,
+        pa.ScoreRank,
+        CASE 
+            WHEN us.PostCount > 10 THEN 'Active'
+            WHEN us.PostCount > 5 THEN 'Moderate'
+            WHEN us.PostCount > 0 THEN 'Beginner'
+            ELSE 'Inactive'
+        END as UserActivityLevel,
+        CASE 
+            WHEN pa.Score > us.AvgPostScore THEN 'Above_Avg'
+            WHEN pa.Score > (us.AvgPostScore / 2) THEN 'Below_Avg'
+            ELSE 'Poor'
+        END as PostPerformance,
+        EXTRACT(EPOCH FROM (COALESCE(pa.LastEditDate, pa.CreationDate) - pa.CreationDate)) * 1 AS EditDurationSeconds,
+        CASE 
+            WHEN pa.Tags IS NOT NULL THEN 
+                CASE 
+                    WHEN pa.Tags LIKE '%<c>%<%' OR pa.Tags LIKE '%<java>%<%' OR pa.Tags LIKE '%<python>%<%' THEN 'Tech'
+                    WHEN pa.Tags LIKE '%<health>%<%' OR pa.Tags LIKE '%<medical>%<%' THEN 'Health'
+                    WHEN pa.Tags LIKE '%<finance>%<%' OR pa.Tags LIKE '%<economics>%<%' THEN 'Finance'
+                    ELSE 'Other'
+                END
+            ELSE 'Unknown'
+        END as TopicCategory,
+        pa.PostTypeId
+    FROM UserStats us
+    INNER JOIN PostAnalysis pa ON us.UserId = pa.OwnerUserId
+    WHERE pa.PostTypeId IN (1, 2)
+),
+ComplexCalculations AS (
+    SELECT 
+        upc.UserId,
+        upc.DisplayName,
+        upc.Reputation,
+        upc.PostCount,
+        upc.CommentCount,
+        upc.BadgeCount,
+        upc.AvgPostScore,
+        upc.LastPostDate,
+        upc.PostId,
+        upc.Title,
+        upc.Score,
+        upc.ViewCount,
+        upc.CreationDate,
+        upc.PostType,
+        upc.VoteCategory,
+        upc.ScoreRank,
+        upc.UserActivityLevel,
+        upc.PostPerformance,
+        upc.EditDurationSeconds,
+        upc.TopicCategory,
+        CAST(upc.Reputation AS DOUBLE PRECISION) / (upc.PostCount + 1) as RepPerPost,
+        CAST(upc.CommentCount AS DOUBLE PRECISION) / NULLIF(upc.PostCount, 0) as CommentsPerPost,
+        CAST(upc.BadgeCount AS DOUBLE PRECISION) / NULLIF(upc.Reputation, 0) as BadgesPerRep,
+        upc.Score / NULLIF(upc.ViewCount, 0) as ScorePerView,
+        CASE 
+            WHEN upc.Score > 0 THEN 
+                (upc.Score - upc.AvgPostScore) / NULLIF(upc.AvgPostScore, 0)
+            ELSE 0
+        END as RelativeScore,
+        NTILE(4) OVER (ORDER BY upc.Score) as ScoreQuartile,
+        ROW_NUMBER() OVER (PARTITION BY upc.TopicCategory ORDER BY upc.Score DESC) as CategoryRank,
+        LAG(upc.Score) OVER (PARTITION BY upc.TopicCategory ORDER BY upc.Score DESC) as PreviousScoreInCategory,
+        LAG(upc.DisplayName) OVER (PARTITION BY upc.TopicCategory ORDER BY upc.Score DESC) as PreviousUserInCategory,
+        RANK() OVER (ORDER BY upc.Score DESC, upc.ViewCount DESC) as CombinedRank
+    FROM UserPostComparison upc
+),
+FinalAnalysis AS (
+    SELECT 
+        cc.UserId,
+        cc.DisplayName,
+        cc.Reputation,
+        cc.PostCount,
+        cc.CommentCount,
+        cc.BadgeCount,
+        cc.AvgPostScore,
+        cc.LastPostDate,
+        cc.PostId,
+        cc.Title,
+        cc.Score,
+        cc.ViewCount,
+        cc.CreationDate,
+        cc.PostType,
+        cc.VoteCategory,
+        cc.ScoreRank,
+        cc.UserActivityLevel,
+        cc.PostPerformance,
+        cc.EditDurationSeconds,
+        cc.TopicCategory,
+        cc.RepPerPost,
+        cc.CommentsPerPost,
+        cc.BadgesPerRep,
+        cc.ScorePerView,
+        cc.RelativeScore,
+        cc.ScoreQuartile,
+        cc.CategoryRank,
+        cc.PreviousScoreInCategory,
+        cc.PreviousUserInCategory,
+        cc.CombinedRank,
+        CASE 
+            WHEN cc.ScoreQuartile = 4 AND cc.Score > 100 THEN 'Top_Performer'
+            WHEN cc.ScoreQuartile = 3 AND cc.Score > 50 THEN 'High_Performer'
+            WHEN cc.ScoreQuartile = 2 AND cc.Score > 25 THEN 'Medium_Performer'
+            WHEN cc.ScoreQuartile = 1 AND cc.Score > 10 THEN 'Low_Performer'
+            ELSE 'Performance_Threshold'
+        END as PerformanceTier,
+        CASE 
+            WHEN cc.EditDurationSeconds > 3600 THEN 'Extended_Editing'
+            WHEN cc.EditDurationSeconds > 1800 THEN 'Moderate_Editing'
+            WHEN cc.EditDurationSeconds > 600 THEN 'Brief_Editing'
+            ELSE 'Quick_Editing'
+        END as EditingDuration,
+        CASE 
+            WHEN cc.PostCount > 0 AND cc.BadgeCount > 0 AND cc.CommentCount > 0 THEN 'Active_Participant'
+            WHEN cc.PostCount > 0 OR cc.BadgeCount > 0 OR cc.CommentCount > 0 THEN 'Partial_Participant'
+            ELSE 'Inactive_Participant'
+        END as ParticipationLevel,
+        CASE 
+            WHEN cc.TopicCategory = 'Tech' THEN 
+                COALESCE(cc.RelativeScore, 0) + 
+                (COALESCE(cc.ScorePerView, 0) * 100) + 
+                (COALESCE(cc.RepPerPost, 0) * 0.01)
+            ELSE 
+                COALESCE(cc.RelativeScore, 0) + 
+                (COALESCE(cc.ScorePerView, 0) * 50) + 
+                (COALESCE(cc.RepPerPost, 0) * 0.005)
+        END as WeightedScore,
+        ('Post_' || CAST(cc.PostId AS VARCHAR) || '_by_' || cc.DisplayName) as PostIdentifier
+    FROM ComplexCalculations cc
+    WHERE cc.Score > 10
+)
+
+SELECT 
+    fa.UserId,
+    fa.DisplayName,
+    fa.Reputation,
+    fa.PostCount,
+    fa.CommentCount,
+    fa.BadgeCount,
+    fa.AvgPostScore,
+    fa.LastPostDate,
+    fa.PostId,
+    fa.Title,
+    fa.Score,
+    fa.ViewCount,
+    fa.CreationDate,
+    fa.PostType,
+    fa.VoteCategory,
+    fa.ScoreRank,
+    fa.UserActivityLevel,
+    fa.PostPerformance,
+    fa.EditDurationSeconds,
+    fa.TopicCategory,
+    fa.RepPerPost,
+    fa.CommentsPerPost,
+    fa.BadgesPerRep,
+    fa.ScorePerView,
+    fa.RelativeScore,
+    fa.ScoreQuartile,
+    fa.CategoryRank,
+    fa.PreviousScoreInCategory,
+    fa.PreviousUserInCategory,
+    fa.CombinedRank,
+    fa.PerformanceTier,
+    fa.EditingDuration,
+    fa.ParticipationLevel,
+    fa.WeightedScore,
+    fa.PostIdentifier,
+    CASE 
+        WHEN fa.WeightedScore > (SELECT AVG(WeightedScore) FROM FinalAnalysis) THEN 'Above_Average'
+        WHEN fa.WeightedScore > (SELECT AVG(WeightedScore) * 0.8 FROM FinalAnalysis) THEN 'Near_Average'
+        ELSE 'Below_Average'
+    END as QualityLevel,
+    DENSE_RANK() OVER (ORDER BY fa.WeightedScore DESC) as QualityRank,
+    LAG(fa.WeightedScore) OVER (ORDER BY fa.WeightedScore DESC) as NextHighestScore,
+    COALESCE(
+        (SELECT fa2.DisplayName 
+         FROM FinalAnalysis fa2 
+         WHERE fa2.WeightedScore > fa.WeightedScore 
+         ORDER BY fa2.WeightedScore ASC
+         LIMIT 1), 
+        'Nobody_Higher'
+    ) as NextBetterUser,
+    STRING_AGG(CASE WHEN fa.TopicCategory = 'Tech' THEN fa.Title END, ' | ') as TechPostTitles,
+    COUNT(*) OVER (PARTITION BY fa.TopicCategory) as CategoryCount,
+    RANK() OVER (ORDER BY COUNT(*) OVER (PARTITION BY fa.TopicCategory) DESC) as CategoryPopularityRank,
+    AVG(fa.Score) OVER (PARTITION BY fa.TopicCategory) as CategoryAvgScore,
+    MAX(fa.EditDurationSeconds) OVER (PARTITION BY fa.UserActivityLevel) as ActivityLevelMaxEditTime,
+    MIN(fa.ViewCount) OVER (PARTITION BY fa.PerformanceTier) as PerformanceTierMinViews,
+    STDDEV(fa.Reputation) OVER (ORDER BY fa.CreationDate ROWS BETWEEN 30 PRECEDING AND CURRENT ROW) as ReputationVolatility,
+    SUM(fa.Score) OVER (ORDER BY fa.CreationDate) as CumulativeScore,
+    COUNT(fa.PostId) OVER (ORDER BY fa.CreationDate ROWS BETWEEN 10 PRECEDING AND CURRENT ROW) as RecentPostCount,
+    CASE 
+        WHEN EXISTS (
+            SELECT 1 FROM Posts p2 
+            WHERE p2.OwnerUserId = fa.UserId 
+            AND p2.CreationDate > fa.CreationDate 
+            AND p2.Score > fa.Score
+        ) THEN 'Has_Better_Posts'
+        ELSE 'No_Better_PostS'
+    END as UserComparison,
+    CASE 
+        WHEN fa.Score > 100 AND fa.ViewCount > 1000 THEN 'Viral_Potential'
+        WHEN fa.Score > 50 AND fa.ViewCount > 500 THEN 'Notable_Potential'
+        WHEN fa.Score > 25 THEN 'Promising_Potential'
+        ELSE 'Standard_Potential'
+    END as PotentialCategory,
+    STRING_AGG(fa.PerformanceTier, ', ') OVER (ORDER BY fa.Score DESC ROWS BETWEEN 10 PRECEDING AND CURRENT ROW) as RecentPerformanceTiers,
+    CAST(100 * (1.0 * ROW_NUMBER() OVER (ORDER BY fa.WeightedScore DESC)) / NULLIF(COUNT(*) OVER(),0) AS INTEGER) as PercentileRank
+FROM FinalAnalysis fa
+WHERE fa.PostId IS NOT NULL
+  AND fa.Score > 10
+  AND fa.Score < 1000
+  AND fa.ViewCount > 0
+GROUP BY
+    fa.UserId,
+    fa.DisplayName,
+    fa.Reputation,
+    fa.PostCount,
+    fa.CommentCount,
+    fa.BadgeCount,
+    fa.AvgPostScore,
+    fa.LastPostDate,
+    fa.PostId,
+    fa.Title,
+    fa.Score,
+    fa.ViewCount,
+    fa.CreationDate,
+    fa.PostType,
+    fa.VoteCategory,
+    fa.ScoreRank,
+    fa.UserActivityLevel,
+    fa.PostPerformance,
+    fa.EditDurationSeconds,
+    fa.TopicCategory,
+    fa.RepPerPost,
+    fa.CommentsPerPost,
+    fa.BadgesPerRep,
+    fa.ScorePerView,
+    fa.RelativeScore,
+    fa.ScoreQuartile,
+    fa.CategoryRank,
+    fa.PreviousScoreInCategory,
+    fa.PreviousUserInCategory,
+    fa.CombinedRank,
+    fa.PerformanceTier,
+    fa.EditingDuration,
+    fa.ParticipationLevel,
+    fa.WeightedScore,
+    fa.PostIdentifier
+ORDER BY fa.WeightedScore DESC, fa.CreationDate DESC
+LIMIT 1000;

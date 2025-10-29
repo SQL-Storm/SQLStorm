@@ -1,0 +1,131 @@
+WITH RECURSIVE RecursivePosts AS (
+  SELECT p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.Title, p.OwnerUserId, 0 AS Level
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+  UNION ALL
+  SELECT a.Id, a.PostTypeId, a.CreationDate, a.Score, a.ViewCount, a.Title, a.OwnerUserId, rp.Level + 1
+  FROM Posts a
+  JOIN RecursivePosts rp ON a.ParentId = rp.Id
+  WHERE a.PostTypeId = 2
+),
+PostScoreWindow AS (
+  SELECT
+    rp.Id AS PostId,
+    rp.Title,
+    rp.CreationDate,
+    rp.Level,
+    rp.Score,
+    rp.ViewCount,
+    u.DisplayName AS OwnerName,
+    COALESCE(badge_counts.GoldBadges, 0) AS GoldBadges,
+    COALESCE(badge_counts.SilverBadges, 0) AS SilverBadges,
+    COALESCE(badge_counts.BronzeBadges, 0) AS BronzeBadges,
+    row_number() OVER (PARTITION BY rp.Level ORDER BY rp.Score DESC, rp.ViewCount DESC) AS RankByScore,
+    avg(rp.Score) OVER (PARTITION BY rp.Level) AS AvgScorePerLevel,
+    count(*) OVER (PARTITION BY rp.Level) AS PostsPerLevel
+  FROM RecursivePosts rp
+  LEFT JOIN Users u ON u.Id = rp.OwnerUserId
+  LEFT JOIN (
+    SELECT UserId,
+      sum(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+      sum(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+      sum(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges
+    GROUP BY UserId
+  ) badge_counts ON badge_counts.UserId = rp.OwnerUserId
+),
+TopScoringPosts AS (
+  SELECT PostId, Title, Level, Score, ViewCount, OwnerName, GoldBadges, SilverBadges, BronzeBadges,
+         RankByScore, AvgScorePerLevel, PostsPerLevel
+  FROM PostScoreWindow
+  WHERE RankByScore <= 10
+),
+PostsWithCloseReasons AS (
+  SELECT ph.PostId,
+    string_agg(distinct crt.Name, ', ') AS CloseReasons
+  FROM PostHistory ph
+  JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS integer)
+  WHERE ph.PostHistoryTypeId = 10
+  GROUP BY ph.PostId
+),
+QuestionTagAnalysis AS (
+  SELECT
+    p.Id AS QuestionId,
+    p.Tags,
+    -- convert >< delimited tags like <tag1><tag2> into array of tags; remove empty strings
+    regexp_split_to_array(substring(p.Tags FROM 2 FOR length(p.Tags) - 2), '><') AS TagArray
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+TagUserActivity AS (
+  SELECT
+    nta.QuestionId,
+    tag AS Tag,
+    count(DISTINCT u.Id) AS UniqueAnswerers,
+    COALESCE(sum(a.Score), 0) AS TotalAnswerScore
+  FROM QuestionTagAnalysis nta
+  CROSS JOIN unnest(nta.TagArray) AS t(tag)
+  JOIN Posts a ON a.ParentId = nta.QuestionId AND a.PostTypeId = 2
+  JOIN Users u ON u.Id = a.OwnerUserId
+  GROUP BY nta.QuestionId, tag
+),
+HighImpactTags AS (
+  SELECT Tag, sum(TotalAnswerScore) AS TagScoreSum, avg(UniqueAnswerers) AS AvgAnswerers
+  FROM TagUserActivity
+  GROUP BY Tag
+  HAVING sum(TotalAnswerScore) > 1000 AND avg(UniqueAnswerers) > 2
+),
+ClosedTopPostsWithTags AS (
+  SELECT tsp.PostId, tsp.Title, tsp.Level, tsp.Score, tsp.ViewCount, tsp.OwnerName, tsp.GoldBadges,
+         tsp.SilverBadges, tsp.BronzeBadges, pcrt.CloseReasons,
+         (SELECT count(*) FROM Comments c WHERE c.PostId = tsp.PostId) AS CommentCount,
+         (SELECT count(*) FROM Votes v WHERE v.PostId = tsp.PostId AND v.VoteTypeId = 2) AS UpVotes,
+         (SELECT count(*) FROM Votes v WHERE v.PostId = tsp.PostId AND v.VoteTypeId = 3) AS DownVotes,
+         regexp_replace(t.Tags, '[<>]', ' ', 'g') AS TagStrings
+  FROM TopScoringPosts tsp
+  LEFT JOIN PostsWithCloseReasons pcrt ON pcrt.PostId = tsp.PostId
+  LEFT JOIN Posts t ON t.Id = tsp.PostId
+  WHERE tsp.Level = 0
+),
+FinalResult AS (
+  SELECT
+    ctp.PostId,
+    ctp.Title,
+    ctp.Score,
+    ctp.ViewCount,
+    ctp.CommentCount,
+    ctp.CloseReasons,
+    ctp.TagStrings,
+    ctp.OwnerName,
+    ctp.GoldBadges, ctp.SilverBadges, ctp.BronzeBadges,
+    ctp.UpVotes,
+    ctp.DownVotes,
+    CASE 
+      WHEN ctp.ViewCount > 0 THEN round(CAST(ctp.Score AS numeric) / ctp.ViewCount, 4)
+      ELSE NULL
+    END AS ScorePerView,
+    rank() OVER (ORDER BY ctp.Score DESC, ctp.ViewCount DESC) AS OverallRank
+  FROM ClosedTopPostsWithTags ctp
+  WHERE (ctp.CloseReasons IS NULL OR char_length(ctp.CloseReasons) = 0)
+  UNION
+  SELECT
+    0 AS PostId,
+    'Summary for High Impact Tags' AS Title,
+    NULL AS Score,
+    NULL AS ViewCount,
+    NULL AS CommentCount,
+    NULL AS CloseReasons,
+    string_agg(distinct Hit.Tag, ', ') AS TagStrings,
+    NULL AS OwnerName,
+    NULL AS GoldBadges,
+    NULL AS SilverBadges,
+    NULL AS BronzeBadges,
+    NULL AS UpVotes,
+    NULL AS DownVotes,
+    NULL AS ScorePerView,
+    NULL AS OverallRank
+  FROM HighImpactTags Hit
+)
+SELECT * FROM FinalResult
+ORDER BY OverallRank NULLS LAST, PostId;

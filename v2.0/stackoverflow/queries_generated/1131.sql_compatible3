@@ -1,0 +1,197 @@
+WITH UserEngagementSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        COALESCE(u.Location, 'Earth') AS UserLocation,
+        u.Views AS UserProfileViews,
+        u.UpVotes AS UserReceivedUpVotes,
+        u.DownVotes AS UserReceivedDownVotes,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - u.CreationDate)) / (60 * 60 * 24 * 365.25) AS YearsOnPlatform,
+        COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersCount,
+        COUNT(DISTINCT CASE WHEN p.AcceptedAnswerId IS NOT NULL AND p.PostTypeId = 1 THEN p.AcceptedAnswerId END) AS AcceptedAnswersCountForOwnQuestions,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostScore,
+        SUM(COALESCE(p.ViewCount, 0)) AS TotalPostViews,
+        SUM(COALESCE(p.CommentCount, 0)) AS TotalCommentsOnOwnPosts,
+        SUM(COALESCE(p.FavoriteCount, 0)) AS TotalFavoritesOnOwnPosts,
+        MAX(p.LastActivityDate) AS LastPostActivityDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Reputation > 500
+      AND u.LastAccessDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')
+      AND u.AboutMe IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Location, u.Views, u.UpVotes, u.DownVotes
+),
+UserPostHistoryMetrics AS (
+    SELECT
+        ph.UserId,
+        COUNT(ph.Id) AS TotalHistoryEvents,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.Id END) AS PostEditCount,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (7, 8, 9) THEN ph.Id END) AS PostRollbackCount,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Id END) AS PostClosedEvents,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.Id END) AS PostReopenedEvents,
+        MAX(ph.CreationDate) AS LatestHistoryEventDate
+    FROM PostHistory ph
+    WHERE ph.UserId IS NOT NULL
+      AND ph.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years')
+    GROUP BY ph.UserId
+),
+UserTagInterest AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(DISTINCT tag_list.tag_name) AS UniqueTagsContributed,
+        SUM(CASE WHEN LOWER(tag_list.tag_name) LIKE '%database%' THEN 1 ELSE 0 END) AS DatabaseTagPosts,
+        SUM(CASE WHEN LOWER(tag_list.tag_name) LIKE '%cloud%' THEN 1 ELSE 0 END) AS CloudTagPosts,
+        SUM(CASE WHEN LOWER(tag_list.tag_name) LIKE '%api%' THEN 1 ELSE 0 END) AS ApiTagPosts,
+        (
+         SELECT STRING_AGG(t.tag_name, ', ')
+         FROM (
+             SELECT DISTINCT tag_list_inner.tag_name
+             FROM Posts p_inner,
+             LATERAL (
+                 SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(p_inner.Tags FROM 2 FOR (LENGTH(p_inner.Tags) - 2)), '><')) AS tag_name
+             ) tag_list_inner
+             WHERE p_inner.OwnerUserId = u.Id
+               AND p_inner.PostTypeId = 1
+               AND p_inner.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 years')
+             ORDER BY tag_list_inner.tag_name
+             LIMIT 5
+         ) t
+        ) AS Top5TagsString
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN LATERAL (
+        SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR (LENGTH(p.Tags) - 2)), '><')) AS tag_name
+        WHERE p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2
+        UNION ALL
+        SELECT NULL::text WHERE NOT (p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2)
+    ) AS tag_list(tag_name) ON p.Id IS NOT NULL
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+      AND p.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 years')
+    GROUP BY u.Id
+),
+UserVotingActivity AS (
+    SELECT
+        v.UserId,
+        COUNT(v.Id) AS TotalVotesCast,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS UpVotesCast,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS DownVotesCast,
+        SUM(CASE WHEN v.VoteTypeId = 8 THEN COALESCE(v.BountyAmount,0) ELSE 0 END) AS TotalBountyOffered
+    FROM Votes v
+    WHERE v.UserId IS NOT NULL
+      AND v.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')
+    GROUP BY v.UserId
+),
+UserBadgeAchievements AS (
+    SELECT
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadgesCount,
+        COUNT(CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadgesCount,
+        COUNT(CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadgesCount,
+        MAX(b.Date) AS LatestBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+),
+FinalUserRanking AS (
+    SELECT
+        ues.UserId,
+        ues.DisplayName,
+        ues.Reputation,
+        ues.YearsOnPlatform,
+        ues.UserProfileViews,
+        ues.UserLocation,
+        ues.QuestionsCount,
+        ues.AnswersCount,
+        COALESCE(ues.TotalPostsOwned, 0) AS TotalPostsOwned,
+        COALESCE(ues.TotalPostScore, 0) AS TotalPostScore,
+        ROUND(COALESCE(CAST(ues.TotalPostScore AS numeric) / NULLIF(ues.TotalPostsOwned, 0), 0), 2) AS AvgScorePerPost,
+        ROUND(COALESCE(CAST(ues.AcceptedAnswersCountForOwnQuestions AS numeric) / NULLIF(ues.QuestionsCount, 0), 0), 2) AS AcceptanceRate,
+        COALESCE(uphm.PostEditCount, 0) AS EditActions,
+        COALESCE(uphm.PostRollbackCount, 0) AS RollbackActions,
+        COALESCE(uti.UniqueTagsContributed, 0) AS UniqueTags,
+        COALESCE(uva.UpVotesCast, 0) AS VotesGivenUp,
+        COALESCE(uva.DownVotesCast, 0) AS VotesGivenDown,
+        COALESCE(uba.GoldBadgesCount, 0) AS GoldBadges,
+        COALESCE(uba.SilverBadgesCount, 0) AS SilverBadges,
+        COALESCE(uba.BronzeBadgesCount, 0) AS BronzeBadges,
+        COALESCE(uti.Top5TagsString, 'No Specific Tags') AS PrimaryTags,
+        (ues.Reputation * 0.4 + ues.TotalPostScore * 0.3 + ues.UserProfileViews * 0.1 + COALESCE(uba.GoldBadgesCount, 0) * 100 + COALESCE(uba.SilverBadgesCount, 0) * 20 + COALESCE(uba.BronzeBadgesCount, 0) * 5) AS DerivedUserInfluenceScore,
+        RANK() OVER (ORDER BY ues.Reputation DESC, ues.LastPostActivityDate DESC) AS GlobalReputationRank,
+        DENSE_RANK() OVER (PARTITION BY ues.UserLocation ORDER BY ues.TotalPostScore DESC) AS LocationPostScoreRank,
+        NTILE(5) OVER (ORDER BY ues.YearsOnPlatform DESC, (ues.QuestionsCount + ues.AnswersCount) DESC) AS UserEngagementQuintile,
+        AVG(ues.TotalPostScore) OVER (PARTITION BY ues.UserLocation) AS AvgScoreInLocation,
+        EXISTS (
+            SELECT 1
+            FROM Posts p_sub
+            WHERE p_sub.OwnerUserId = ues.UserId
+              AND p_sub.Score > 100
+              AND p_sub.CommentCount > 5
+              AND p_sub.ClosedDate IS NULL
+        ) AS HasHighImpactPost,
+        ues.LastPostActivityDate
+    FROM UserEngagementSummary ues
+    LEFT JOIN UserPostHistoryMetrics uphm ON ues.UserId = uphm.UserId
+    LEFT JOIN UserTagInterest uti ON ues.UserId = uti.UserId
+    LEFT JOIN UserVotingActivity uva ON ues.UserId = uva.UserId
+    LEFT JOIN UserBadgeAchievements uba ON ues.UserId = uba.UserId
+    WHERE COALESCE(ues.TotalPostsOwned, 0) > 5
+)
+SELECT
+    fur.UserId,
+    fur.DisplayName,
+    fur.Reputation,
+    fur.YearsOnPlatform,
+    fur.QuestionsCount,
+    fur.AnswersCount,
+    fur.TotalPostsOwned,
+    fur.TotalPostScore,
+    fur.AvgScorePerPost,
+    fur.AcceptanceRate,
+    fur.EditActions,
+    fur.RollbackActions,
+    fur.GoldBadges,
+    fur.SilverBadges,
+    fur.BronzeBadges,
+    fur.PrimaryTags,
+    fur.DerivedUserInfluenceScore,
+    fur.GlobalReputationRank,
+    fur.LocationPostScoreRank,
+    fur.UserEngagementQuintile,
+    fur.HasHighImpactPost,
+    CASE
+        WHEN fur.Reputation > 75000 AND fur.GoldBadges >= 3 AND fur.YearsOnPlatform >= 5 THEN 'Distinguished Veteran'
+        WHEN fur.Reputation > 25000 AND fur.SilverBadges >= 5 AND fur.YearsOnPlatform >= 3 THEN 'Seasoned Expert'
+        WHEN fur.Reputation > 10000 AND (fur.QuestionsCount + fur.AnswersCount) > 100 THEN 'Prolific Contributor'
+        ELSE 'Engaged Participant'
+    END AS UserTier,
+    REPLACE(LOWER(TRIM(fur.DisplayName)), ' ', '-') || '-' || CAST(fur.UserId AS text) AS URLSlug,
+    COALESCE(fur.AcceptanceRate, 0) >= 0.75 AS IsHighAcceptanceRate,
+    NOT EXISTS (
+        SELECT 1
+        FROM Posts p_closed
+        INNER JOIN PostHistory ph_closed ON p_closed.Id = ph_closed.PostId
+        WHERE p_closed.OwnerUserId = fur.UserId
+          AND ph_closed.PostHistoryTypeId = 10
+          AND NOT EXISTS (
+              SELECT 1 FROM PostHistory ph_reopened
+              WHERE ph_reopened.PostId = p_closed.Id
+                AND ph_reopened.PostHistoryTypeId = 11
+                AND ph_reopened.CreationDate > ph_closed.CreationDate
+          )
+    ) AS NeverHadIrreversiblyClosedPost,
+    fur.LastPostActivityDate
+FROM FinalUserRanking fur
+WHERE fur.Reputation > 5000
+  AND fur.TotalPostsOwned > 20
+  AND fur.YearsOnPlatform >= 1.5
+  AND (fur.GoldBadges > 0 OR fur.SilverBadges > 2 OR fur.UniqueTags > 10)
+  AND fur.AvgScorePerPost > 2
+  AND fur.DisplayName IS NOT NULL AND LENGTH(fur.DisplayName) > 3
+  AND fur.UserEngagementQuintile <= 3
+  AND fur.NeverHadIrreversiblyClosedPost = TRUE
+ORDER BY fur.DerivedUserInfluenceScore DESC, fur.GlobalReputationRank ASC
+FETCH FIRST 50 ROWS ONLY;

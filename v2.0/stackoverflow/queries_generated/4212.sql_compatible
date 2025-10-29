@@ -1,0 +1,160 @@
+WITH RECURSIVE PostHierarchy AS (
+    SELECT
+        p.Id AS PostId,
+        p.ParentId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.AnswerCount,
+        CAST(p.Title AS VARCHAR(300)) AS Title,
+        p.Tags,
+        0 AS Level
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+
+    UNION ALL
+
+    SELECT
+        p.Id,
+        p.ParentId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        NULL, -- AnswerCount
+        CAST(NULL AS VARCHAR(300)), -- Title
+        NULL, -- Tags
+        ph.Level + 1
+    FROM Posts p
+    JOIN PostHierarchy ph ON p.ParentId = ph.PostId
+    WHERE p.PostTypeId = 2
+),
+UserPostStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswerCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS QuestionScoreSum,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS AnswerScoreSum,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.AnswerCount ELSE NULL END) AS AvgAnswersPerQuestion,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id, u.DisplayName
+),
+ComplexPostAnalysis AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.Title,
+        p.Tags,
+        pt.Name AS PostTypeName,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS PostSequence,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+            WHEN p.Score > 1000 THEN 'High Score'
+            ELSE 'Standard'
+        END AS PostStatusCategory,
+        CONCAT(COALESCE(u.DisplayName, 'Unknown User'), ' (', COALESCE(CAST(u.Reputation AS VARCHAR), 'N/A'), ')') AS OwnerInfo,
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostScore,
+        LEAD(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextPostScore,
+        p.AnswerCount,
+        p.CommentCount,
+        LENGTH(p.Body) AS BodyLength,
+        CASE
+            WHEN p.Tags LIKE '%<sql>%' THEN 1
+            ELSE 0
+        END AS HasSqlTag,
+        CASE
+            WHEN EXISTS (SELECT 1 FROM Comments c WHERE c.PostId = p.Id AND c.Score < 0) THEN 'Has Negative Comments'
+            ELSE 'No Negative Comments'
+        END AS CommentSentiment,
+        CASE WHEN (p.Id % 2) = 0 THEN 'Even ID' ELSE 'Odd ID' END AS IdParity
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1, 2)
+),
+TagPerformance AS (
+    SELECT
+        t.TagName,
+        COUNT(p.Id) AS TotalPosts,
+        AVG(p.Score) AS AvgScore,
+        SUM(p.ViewCount) AS TotalViews,
+        COUNT(DISTINCT p.OwnerUserId) AS DistinctOwners
+    FROM Tags t
+    JOIN Posts p ON t.TagName = ANY(string_to_array(REPLACE(REPLACE(p.Tags, '<', ''), '>', ''), ' '))
+    WHERE p.PostTypeId = 1
+    GROUP BY t.TagName
+    HAVING COUNT(p.Id) > 100
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPostsCreated,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT b.Id) AS TotalBadgesEarned,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesGiven,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesGiven
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId AND v.VoteTypeId IN (2, 3)
+    GROUP BY u.Id, u.DisplayName
+    HAVING COUNT(DISTINCT p.Id) > 50 OR COUNT(DISTINCT c.Id) > 100
+)
+SELECT
+    cpa.Id,
+    cpa.PostTypeName,
+    cpa.Title,
+    cpa.OwnerInfo,
+    cpa.PostStatusCategory,
+    cpa.PostSequence,
+    cpa.PreviousPostScore,
+    cpa.NextPostScore,
+    cpa.AnswerCount,
+    cpa.CommentCount,
+    cpa.BodyLength,
+    cpa.HasSqlTag,
+    cpa.CommentSentiment,
+    cpa.IdParity,
+    ups.QuestionCount,
+    ups.AnswerCount AS UserAnswerCount,
+    ups.QuestionScoreSum,
+    ups.AnswerScoreSum,
+    ups.AvgAnswersPerQuestion,
+    ups.LastPostDate,
+    tp.TagName,
+    tp.TotalPosts AS TagTotalPosts,
+    tp.AvgScore AS TagAvgScore,
+    tp.TotalViews AS TagTotalViews,
+    tp.DistinctOwners AS TagDistinctOwners,
+    ua.TotalPostsCreated AS UserTotalPostsCreated,
+    ua.TotalCommentsMade AS UserTotalCommentsMade,
+    ua.TotalBadgesEarned AS UserTotalBadgesEarned,
+    ua.TotalUpvotesGiven AS UserTotalUpvotesGiven,
+    ua.TotalDownvotesGiven AS UserTotalDownvotesGiven,
+    COALESCE(cpa.Score, 0) AS FinalScore,
+    CASE WHEN cpa.Tags IS NULL THEN 'No Tags' ELSE 'Has Tags' END AS TagPresence,
+    CASE
+        WHEN cpa.Title IS NULL OR TRIM(cpa.Title) = '' THEN 'Missing Title'
+        WHEN LENGTH(cpa.Title) < 10 THEN 'Short Title'
+        ELSE 'Standard Title'
+    END AS TitleQuality,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = cpa.Id AND pl.LinkTypeId = 1) AS LinkedPostsCount,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.RelatedPostId = cpa.Id AND pl.LinkTypeId = 3) AS DuplicateToCount
+FROM ComplexPostAnalysis cpa
+LEFT JOIN UserPostStats ups ON cpa.OwnerUserId = ups.UserId
+LEFT JOIN TagPerformance tp ON cpa.HasSqlTag = 1 AND tp.TagName = 'sql'
+LEFT JOIN UserActivity ua ON cpa.OwnerUserId = ua.UserId
+WHERE cpa.Score > 0
+   OR (cpa.Score IS NULL AND cpa.AnswerCount IS NOT NULL)
+ORDER BY cpa.CreationDate DESC, cpa.Id
+LIMIT 1000;

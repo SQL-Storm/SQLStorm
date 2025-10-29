@@ -1,0 +1,70 @@
+-- {"query": "6258.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-micro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 445} 
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    MAX(u.CreationDate) AS LatestAccountActivity,
+    MAX(p.LastActivityDate) AS LatestPostActivity,
+    AVG(p.Score) AS AvgPostScore,
+    MAX(ph.CreationDate) AS LatestPostHistory,
+    (
+        SELECT 
+            STRING_AGG(t.TagName, ', ')
+        FROM 
+            Tags t
+        WHERE 
+            t.Id IN (
+                SELECT 
+                    Id
+                FROM 
+                    Posts
+                WHERE 
+                    PostTypeId = 1
+                    AND OwnerUserId = u.Id
+                    AND CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year'
+            )
+    ) AS MostActiveTags,
+    (
+        SELECT 
+            COUNT(*)
+        FROM 
+            Votes v
+        WHERE 
+            v.PostId = p.Id
+            AND v.VoteTypeId = 1
+    ) AS AcceptedAnswerCount,
+    (
+        SELECT 
+            COUNT(*)
+        FROM 
+            Badges b
+        WHERE 
+            b.UserId = u.Id
+            AND b.Class = 1
+    ) AS GoldBadgeCount
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+WHERE 
+    u.Reputation > 100
+    AND u.Id NOT IN (
+        SELECT 
+            DISTINCT UserId
+        FROM 
+            Comments
+        WHERE 
+            Text LIKE '%spam%'
+    )
+GROUP BY 
+    u.Id
+HAVING 
+    AVG(p.Score) > 10
+ORDER BY 
+    u.Reputation DESC, 
+    TotalPosts DESC
+LIMIT 100;

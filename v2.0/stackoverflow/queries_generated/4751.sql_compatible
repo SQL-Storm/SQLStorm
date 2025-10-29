@@ -1,0 +1,176 @@
+WITH
+  RankedAnswers AS (
+    SELECT
+      p.Id AS PostId,
+      p.ParentId AS QuestionId,
+      p.OwnerUserId,
+      p.Score,
+      ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS rn
+    FROM Posts AS p
+    WHERE
+      p.PostTypeId = 2 AND p.ParentId IS NOT NULL
+  ),
+  QuestionDetails AS (
+    SELECT
+      q.Id AS QuestionId,
+      q.Title AS QuestionTitle,
+      q.OwnerUserId AS QuestionOwnerUserId,
+      q.CreationDate AS QuestionCreationDate,
+      q.ViewCount AS QuestionViewCount,
+      q.AnswerCount AS QuestionAnswerCount,
+      q.FavoriteCount AS QuestionFavoriteCount,
+      q.ClosedDate AS QuestionClosedDate,
+      COALESCE(q.AcceptedAnswerId, ra_accepted.PostId) AS EffectiveAcceptedAnswerId,
+      (
+        SELECT
+          COUNT(*)
+        FROM Votes AS v_close
+        WHERE
+          v_close.PostId = q.Id AND v_close.VoteTypeId = 6
+      ) AS CloseVoteCount,
+      (
+        SELECT
+          COUNT(*)
+        FROM Votes AS v_reopen
+        WHERE
+          v_reopen.PostId = q.Id AND v_reopen.VoteTypeId = 7
+      ) AS ReopenVoteCount,
+      q.Tags,
+      q.OwnerUserId
+    FROM Posts AS q
+    LEFT JOIN RankedAnswers AS ra_accepted
+      ON q.Id = ra_accepted.QuestionId AND ra_accepted.rn = 1
+    WHERE
+      q.PostTypeId = 1
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate,
+      u.Views,
+      u.UpVotes,
+      u.DownVotes,
+      (
+        SELECT
+          COUNT(*)
+        FROM Posts AS p_user_posts
+        WHERE
+          p_user_posts.OwnerUserId = u.Id
+      ) AS TotalPostsOwned,
+      (
+        SELECT
+          COUNT(DISTINCT ph.PostId)
+        FROM PostHistory AS ph
+        WHERE
+          ph.UserId = u.Id AND ph.PostHistoryTypeId IN (2, 5, 8)
+      ) AS TotalBodyEdits,
+      CASE WHEN u.WebsiteUrl IS NULL OR u.WebsiteUrl = '' THEN 0 ELSE 1 END AS HasWebsite
+    FROM Users AS u
+  ),
+  AggregatedPostInfo AS (
+    SELECT
+      p.Id AS PostId,
+      p.ParentId AS QuestionId,
+      p.PostTypeId,
+      p.OwnerUserId,
+      p.CreationDate,
+      p.Score,
+      p.CommentCount,
+      p.ContentLicense,
+      CASE
+        WHEN p.PostTypeId = 1 THEN UPPER(SUBSTRING(p.Title, 1, 3)) || LOWER(SUBSTRING(p.Title, 4))
+        WHEN p.PostTypeId = 2 THEN 'Answer to: ' || SUBSTRING(q.Title, 1, 50)
+        ELSE 'Other Post Type'
+      END AS FormattedTitle,
+      CASE
+        WHEN p.PostTypeId = 2 AND p.OwnerUserId = q.OwnerUserId THEN 1
+        ELSE 0
+      END AS IsAnswerByQuestionOwner,
+      p.FavoriteCount,
+      (
+        SELECT
+          COUNT(*)
+        FROM Comments AS c
+        WHERE
+          c.PostId = p.Id AND c.Score < 0
+      ) AS NegativeScoreComments
+    FROM Posts AS p
+    LEFT JOIN Posts AS q
+      ON p.ParentId = q.Id AND q.PostTypeId = 1
+    WHERE
+      p.PostTypeId IN (1, 2)
+  )
+SELECT
+  qd.QuestionId,
+  qd.QuestionTitle,
+  qd.QuestionCreationDate,
+  qd.QuestionViewCount,
+  qd.QuestionAnswerCount,
+  qd.QuestionFavoriteCount,
+  qd.QuestionClosedDate,
+  qd.EffectiveAcceptedAnswerId,
+  qd.CloseVoteCount,
+  qd.ReopenVoteCount,
+  ua_question.DisplayName AS QuestionOwnerDisplayName,
+  ua_question.Reputation AS QuestionOwnerReputation,
+  ua_question.TotalPostsOwned AS QuestionOwnerTotalPosts,
+  COUNT(DISTINCT api_answer.PostId) AS NumberOfAnswers,
+  SUM(COALESCE(api_answer.Score, 0)) AS TotalAnswerScore,
+  AVG(COALESCE(api_answer.CommentCount, 0)) AS AverageAnswerCommentCount,
+  MAX(api_answer.FavoriteCount) AS MaxAnswerFavoriteCount,
+  SUM(api_answer.NegativeScoreComments) AS TotalNegativeScoreAnswerComments,
+  SUM(api_answer.IsAnswerByQuestionOwner) AS AnswersByOwnerCount,
+  (
+    SELECT
+      COUNT(*)
+    FROM PostLinks AS pl
+    WHERE
+      pl.PostId = qd.QuestionId AND pl.LinkTypeId = 3
+  ) AS DuplicateLinkCount,
+  (
+    SELECT
+      COUNT(*)
+    FROM PostLinks AS pl
+    WHERE
+      pl.PostId = qd.QuestionId AND pl.LinkTypeId = 1
+  ) AS LinkedPostCount,
+  STRING_AGG(DISTINCT api_answer.FormattedTitle, ' | ') AS AggregatedAnswerTitles,
+  SUM(CASE WHEN api_answer.ContentLicense = 'CC BY-SA 3.0' THEN 1 ELSE 0 END) AS CCBYSA3AnswerCount,
+  qd.Tags,
+  ua_question.HasWebsite AS QuestionOwnerHasWebsite,
+  CASE
+    WHEN qd.QuestionOwnerUserId IS NOT NULL AND qd.QuestionOwnerUserId = qd.EffectiveAcceptedAnswerId THEN 1
+    WHEN qd.QuestionOwnerUserId IS NOT NULL AND qd.EffectiveAcceptedAnswerId IS NULL THEN 0
+    ELSE NULL
+  END AS IsAnswerAcceptedByOwner,
+  SUM(CASE WHEN api_answer.OwnerUserId = qd.OwnerUserId THEN 1 ELSE 0 END) AS AnswersFromSameOwnerAsQuestion
+FROM QuestionDetails AS qd
+LEFT JOIN AggregatedPostInfo AS api_answer
+  ON qd.QuestionId = api_answer.QuestionId
+LEFT JOIN UserActivity AS ua_question
+  ON qd.QuestionOwnerUserId = ua_question.UserId
+GROUP BY
+  qd.QuestionId,
+  qd.QuestionTitle,
+  qd.QuestionCreationDate,
+  qd.QuestionViewCount,
+  qd.QuestionAnswerCount,
+  qd.QuestionFavoriteCount,
+  qd.QuestionClosedDate,
+  qd.EffectiveAcceptedAnswerId,
+  qd.CloseVoteCount,
+  qd.ReopenVoteCount,
+  ua_question.DisplayName,
+  ua_question.Reputation,
+  ua_question.TotalPostsOwned,
+  ua_question.HasWebsite,
+  qd.Tags,
+  qd.OwnerUserId,
+  qd.QuestionOwnerUserId
+HAVING
+  SUM(COALESCE(api_answer.Score, 0)) > 1000 OR qd.QuestionViewCount > 10000
+ORDER BY
+  qd.QuestionCreationDate DESC
+LIMIT 100;

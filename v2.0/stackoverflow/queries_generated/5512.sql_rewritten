@@ -1,0 +1,108 @@
+-- {"query": "5512.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 923} 
+WITH recent_activity AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.ContentLicense,
+    u.Reputation,
+    u.DisplayName AS OwnerDisplayName,
+    u.Location,
+    u.AboutMe,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.AccountId,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate DESC) AS rn
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId = 1 -- Questions
+    AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year'
+),
+tag_metrics AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS TagQuestionCount,
+    SUM(p.Score) AS TagTotalScore,
+    AVG(p.Score) AS TagAvgScore,
+    SUM(p.ViewCount) AS TagTotalViews
+  FROM Posts p
+  CROSS APPLY string_split_tags(p.Tags) AS t  -- hypothetical splitter function; adjust to your RDBMS if needed
+  INNER JOIN Tags tg ON tg.WikiPostId = p.Id OR tg.ExcerptPostId = p.Id
+  WHERE p.PostTypeId = 1
+  GROUP BY t.TagName
+),
+correlated_history AS (
+  SELECT
+    ph.PostId,
+    ph.PostHistoryTypeId,
+    ph.UserId,
+    ph.CreationDate,
+    ph.Comment,
+    ph.Text
+  FROM PostHistory ph
+  WHERE ph.PostHistoryTypeId IN (10,11,12,16,52,53) -- close/lock/transfer-ish events and hot/network flags
+),
+complex_post_expressions AS (
+  SELECT
+    rp.PostId,
+    rp.RelatedPostId,
+    l.Name AS LinkTypeName,
+    lc.Name AS CloseReasonName,
+    v1.VoteTypeName AS UpOrDownVoteName,
+    CASE
+      WHEN p.CreationDate < cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '2 years' THEN TRUE
+      ELSE FALSE
+    END AS IsOldPost,
+    p.Title || ' [' || COALESCE(p.Tags, '') || ']' AS TitleWithTags,
+    LENGTH(p.Body) AS BodyLength
+  FROM PostLinks rp
+  INNER JOIN Posts p ON rp.PostId = p.Id
+  LEFT JOIN LinkTypes l ON rp.LinkTypeId = l.Id
+  LEFT JOIN CloseReasonTypes lc ON EXISTS (
+      SELECT 1 FROM PostHistory ph
+      WHERE ph.PostId = rp.PostId AND ph.PostHistoryTypeId = 10
+  ) AND ph.Comment LIKE CAST(lc.Id AS varchar)
+  LEFT JOIN Votes v ON v.PostId = rp.RelatedPostId AND v.VoteTypeId = 2
+  LEFT JOIN VoteTypes v1 ON v.VoteTypeId = v1.Id
+  WHERE p.PostTypeId = 1
+),
+cte_with_window AS (
+  SELECT
+    r.*,
+    ROW_NUMBER() OVER (PARTITION BY r.OwnerUserId ORDER BY r.LastActivityDate DESC) AS rn
+  FROM recent_activity r
+  WHERE r.rn = 1
+)
+SELECT
+  cte.OwnerDisplayName,
+  cte.Reputation,
+  cte.TitleWithTags,
+  cte.TagName,
+  cte.TagQuestionCount,
+  cte.TagTotalScore,
+  cte.TagAvgScore,
+  cte.TagTotalViews,
+  cte.IsOldPost,
+  cte.BodyLength,
+  ch.PostHistoryTypeId,
+  ch.UserId AS HistoryUserId,
+  ch.CreationDate AS HistoryDate,
+  ch.Comment AS HistoryComment,
+  cu.DisplayName AS HistoryUserDisplayName
+FROM cte_with_window cte
+LEFT JOIN correlated_history ch ON ch.PostId = cte.PostId
+LEFT JOIN Users cu ON cu.Id = ch.UserId
+LEFT JOIN tag_metrics tm ON tm.TagName = ANY(string_to_array(REPLACE(REPLACE(cte.Tags, '<', ''), '>', ''), ',')) -- approximate tag extraction
+LEFT JOIN Posts p ON p.Id = cte.PostId
+ORDER BY cte.LastActivityDate DESC
+LIMIT 100;

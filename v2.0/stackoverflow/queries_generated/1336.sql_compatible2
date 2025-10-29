@@ -1,0 +1,216 @@
+WITH UserQuestionDetails AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.OwnerUserId,
+        p.CreationDate AS QuestionCreationDate,
+        p.AcceptedAnswerId,
+        p.Score AS QuestionScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.Tags,
+        p.LastEditDate,
+        p.LastActivityDate,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9) THEN ph.Id END) AS EditCount,
+        MAX(CASE WHEN ph_close.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS WasClosed
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    LEFT JOIN PostHistory ph_close ON p.Id = ph_close.PostId AND ph_close.PostHistoryTypeId = 10
+    WHERE
+        p.PostTypeId = 1
+        AND p.CreationDate >= DATE '2022-01-01'
+        AND p.OwnerUserId IS NOT NULL
+        AND p.Tags IS NOT NULL
+    GROUP BY
+        p.Id, p.OwnerUserId, p.CreationDate, p.AcceptedAnswerId, p.Score, p.ViewCount, p.AnswerCount, p.Tags, p.LastEditDate, p.LastActivityDate
+),
+FilteredQuestions AS (
+    SELECT
+        q.QuestionId,
+        q.OwnerUserId,
+        q.QuestionCreationDate,
+        q.AcceptedAnswerId,
+        q.QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        q.Tags,
+        q.LastEditDate,
+        q.LastActivityDate,
+        q.EditCount,
+        q.WasClosed
+    FROM UserQuestionDetails q
+    WHERE
+        q.EditCount >= 2
+        AND q.AnswerCount >= 1
+        AND q.ViewCount > 150
+        AND q.WasClosed = 0
+        AND (q.Tags LIKE '%<sql>%' OR q.Tags LIKE '%<database>%' OR q.Tags LIKE '%<performance>%')
+),
+UserQuestionAggregates AS (
+    SELECT
+        fq.OwnerUserId,
+        COUNT(fq.QuestionId) AS TotalQuestionsConsidered,
+        SUM(fq.QuestionScore) AS TotalQuestionScore,
+        AVG(fq.QuestionScore * 1.0) AS AvgQuestionScore,
+        (
+            SELECT MAX(sq.QuestionScore)
+            FROM UserQuestionDetails sq
+            WHERE
+                sq.OwnerUserId = fq.OwnerUserId
+                AND sq.QuestionCreationDate >= fq.QuestionCreationDate - INTERVAL '6 months'
+                AND sq.QuestionScore > 50
+        ) AS MaxRecentHighScoreQuestion,
+        MAX(CASE WHEN fq.Tags LIKE '%<sql>%' THEN 'SQL_TAG_USED' ELSE NULL END) AS SqlTagPresenceIndicator
+    FROM FilteredQuestions fq
+    GROUP BY fq.OwnerUserId, fq.QuestionCreationDate
+    HAVING COUNT(fq.QuestionId) > 3
+),
+UserAnswerPerformance AS (
+    SELECT
+        p.OwnerUserId,
+        AVG(p.Score * 1.0) AS AvgAnswerScore,
+        COUNT(p.Id) AS TotalAnswers,
+        RANK() OVER (ORDER BY AVG(p.Score * 1.0) DESC) AS AnswerScoreRank
+    FROM Posts p
+    WHERE
+        p.PostTypeId = 2
+        AND p.OwnerUserId IS NOT NULL
+        AND p.CreationDate >= DATE '2022-01-01'
+    GROUP BY p.OwnerUserId
+    HAVING COUNT(p.Id) > 5
+),
+UserBadgeSummary AS (
+    SELECT
+        b.UserId,
+        COUNT(b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.TagBased = TRUE THEN 1 ELSE 0 END) AS TagBasedBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserTagUsage AS (
+    SELECT
+        u.Id AS UserId,
+        tag_exploded.tag_name,
+        COUNT(*) AS tag_count
+    FROM Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+    JOIN LATERAL UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><')) AS tag_exploded(tag_name) ON TRUE
+    WHERE
+        p.PostTypeId = 1
+        AND p.Tags IS NOT NULL
+        AND u.Id IS NOT NULL
+    GROUP BY u.Id, tag_exploded.tag_name
+),
+MostFrequentUserTag AS (
+    SELECT
+        UserId,
+        tag_name AS MostFrequentQuestionTag
+    FROM (
+        SELECT
+            UserId,
+            tag_name,
+            tag_count,
+            ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY tag_count DESC, tag_name ASC) AS rn
+        FROM UserTagUsage
+    ) AS sub
+    WHERE rn = 1
+),
+AcceptedAnswerLatency AS (
+    SELECT
+        q.OwnerUserId AS UserId,
+        AVG(EXTRACT(EPOCH FROM (a.CreationDate - q.QuestionCreationDate)) / 3600.0) AS AvgAcceptLatencyHours,
+        COUNT(q.AcceptedAnswerId) AS AcceptedAnswerCount
+    FROM UserQuestionDetails q
+    JOIN Posts a ON q.AcceptedAnswerId = a.Id
+    WHERE
+        q.AcceptedAnswerId IS NOT NULL
+        AND q.OwnerUserId IS NOT NULL
+        AND q.QuestionCreationDate IS NOT NULL AND a.CreationDate IS NOT NULL
+    GROUP BY q.OwnerUserId
+),
+ProblematicUsers AS (
+    SELECT
+        p.OwnerUserId AS UserId
+    FROM Posts p
+    JOIN PostLinks pl ON p.Id = pl.PostId
+    WHERE
+        pl.LinkTypeId = 3
+        AND p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+    HAVING COUNT(DISTINCT pl.RelatedPostId) >= 3
+),
+FinalUserRanking AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.Views AS UserViews,
+        u.UpVotes AS UserUpVotes,
+        COALESCE(uqa.TotalQuestionsConsidered, 0) AS TotalRelevantQuestions,
+        COALESCE(uqa.AvgQuestionScore, 0.0) AS AvgRelevantQuestionScore,
+        COALESCE(uap.AvgAnswerScore, 0.0) AS AvgUserAnswerScore,
+        COALESCE(ubs.TotalBadges, 0) AS TotalBadges,
+        COALESCE(ubs.GoldBadges, 0) AS GoldBadges,
+        mft.MostFrequentQuestionTag,
+        COALESCE(aal.AvgAcceptLatencyHours, 0.0) AS AvgQuestionAcceptLatencyHours,
+        (
+            (u.Reputation * 0.05)
+            + (COALESCE(uqa.AvgQuestionScore, 0) * 0.8)
+            + (COALESCE(uap.AvgAnswerScore, 0) * 0.4)
+            + (COALESCE(ubs.GoldBadges, 0) * 15)
+            + (COALESCE(uqa.MaxRecentHighScoreQuestion, 0) * 0.1)
+            - (CASE WHEN uqa.SqlTagPresenceIndicator IS NULL THEN 10 ELSE 0 END)
+            - (CASE WHEN uap.TotalAnswers IS NULL OR uap.TotalAnswers < 10 THEN (10 - COALESCE(uap.TotalAnswers, 0)) * 2 ELSE 0 END)
+            + (CASE WHEN u.AboutMe IS NOT NULL AND LENGTH(u.AboutMe) > 100 THEN 5 ELSE 0 END)
+        ) AS UserEngagementScore,
+        CASE
+            WHEN u.Location IS NULL OR TRIM(u.Location) = '' THEN 'Unspecified'
+            WHEN LENGTH(u.Location) > 40 THEN SUBSTRING(u.Location FROM 1 FOR 37) || '...'
+            ELSE u.Location
+        END AS FormattedLocation,
+        (u.LastAccessDate - u.CreationDate) AS UserAccountAgeInterval,
+        (SELECT COUNT(DISTINCT c.PostId) FROM Comments c WHERE c.UserId = u.Id AND c.CreationDate >= (u.LastAccessDate - INTERVAL '1 year')) AS RecentCommentedPostsCount
+    FROM Users u
+    LEFT JOIN UserQuestionAggregates uqa ON u.Id = uqa.OwnerUserId
+    LEFT JOIN UserAnswerPerformance uap ON u.Id = uap.OwnerUserId
+    LEFT JOIN UserBadgeSummary ubs ON u.Id = ubs.UserId
+    LEFT JOIN MostFrequentUserTag mft ON u.Id = mft.UserId
+    LEFT JOIN AcceptedAnswerLatency aal ON u.Id = aal.UserId
+    WHERE
+        u.Reputation > 2500
+        AND u.Views > 200
+        AND u.DisplayName IS NOT NULL
+        AND u.Id NOT IN (SELECT UserId FROM ProblematicUsers)
+        AND EXISTS (
+            SELECT 1
+            FROM Posts p_check
+            WHERE p_check.OwnerUserId = u.Id
+              AND p_check.PostTypeId = 1
+              AND p_check.CreationDate >= DATE '2021-10-01'
+            LIMIT 1
+        )
+)
+SELECT
+    UserId,
+    DisplayName,
+    FormattedLocation,
+    Reputation,
+    TotalRelevantQuestions,
+    AvgRelevantQuestionScore,
+    AvgUserAnswerScore,
+    TotalBadges,
+    GoldBadges,
+    MostFrequentQuestionTag,
+    AvgQuestionAcceptLatencyHours,
+    UserEngagementScore,
+    UserAccountAgeInterval,
+    RecentCommentedPostsCount,
+    DENSE_RANK() OVER (ORDER BY UserEngagementScore DESC, Reputation DESC, TotalRelevantQuestions DESC) AS OverallEngagementRank
+FROM FinalUserRanking
+WHERE
+    AvgRelevantQuestionScore > 0
+    AND TotalRelevantQuestions > 0
+ORDER BY OverallEngagementRank ASC, UserId ASC
+LIMIT 50;

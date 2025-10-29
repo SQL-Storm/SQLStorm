@@ -1,0 +1,202 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.LastActivityDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+        LAG(p.ViewCount) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_views,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as avg_score,
+        NTILE(4) OVER (ORDER BY p.Score) as score_quartile,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags <> '' THEN 
+                CARDINALITY(STRING_TO_ARRAY(TRIM(BOTH '<>' FROM p.Tags), '><'))
+            ELSE 0 
+        END as tag_count
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) 
+      AND p.CreationDate >= DATE '2020-01-01'
+),
+UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.AccountId,
+        COUNT(DISTINCT p.Id) as total_posts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as answers,
+        COALESCE(SUM(p.Score), 0) as total_score,
+        AVG(p.Score) as avg_score,
+        MAX(p.CreationDate) as latest_activity,
+        STRING_AGG(DISTINCT p.Tags, '; ') as all_tags_used
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.CreationDate >= DATE '2015-01-01'
+    GROUP BY u.Id, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.AccountId
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE WHEN t.IsRequired = TRUE OR t.IsRequired = 1 THEN 'Required' ELSE 'Optional' END as tag_type,
+        DENSE_RANK() OVER (ORDER BY t.Count DESC) as popularity_rank,
+        PERCENT_RANK() OVER (ORDER BY t.Count) as popularity_percentile
+    FROM Tags t
+    WHERE t.Count > 100
+),
+PostsWithHistory AS (
+    SELECT 
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        ph.UserId,
+        ph.Comment,
+        ph.Text,
+        ph.RevisionGUID,
+        COALESCE(ph.Text, '') as history_text,
+        COALESCE(ph.Comment, '') as history_comment,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId, ph.PostHistoryTypeId ORDER BY ph.CreationDate DESC) as recent_history
+    FROM PostHistory ph
+    WHERE ph.CreationDate >= DATE '2021-01-01'
+      AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)
+),
+AnswerStats AS (
+    SELECT 
+        p.ParentId as QuestionId,
+        COUNT(*) as answer_count,
+        SUM(p.Score) as total_answer_score,
+        AVG(p.Score) as avg_answer_score,
+        MAX(p.Score) as max_answer_score,
+        MIN(p.Score) as min_answer_score,
+        COUNT(CASE WHEN p.Score > 0 THEN 1 END) as positive_answers,
+        COUNT(CASE WHEN p.Score < 0 THEN 1 END) as negative_answers,
+        COUNT(CASE WHEN p.Score = 0 THEN 1 END) as zero_score_answers,
+        STRING_AGG(p.Title, '; ') as answer_titles,
+        STRING_AGG(CAST(p.Score AS VARCHAR), ', ') as score_list
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+      AND p.ParentId IS NOT NULL
+    GROUP BY p.ParentId
+)
+SELECT 
+    'Performance Benchmarked Query Results' as report_title,
+    COUNT(*) as total_records,
+    COUNT(DISTINCT r.Id) as distinct_posts,
+    COUNT(DISTINCT u.Id) as distinct_users,
+    COUNT(DISTINCT t.TagName) as distinct_tags,
+    COUNT(DISTINCT CASE WHEN r.PostTypeId = 1 THEN r.Id END) as question_count,
+    COUNT(DISTINCT CASE WHEN r.PostTypeId = 2 THEN r.Id END) as answer_count,
+    ROUND(AVG(r.Score)::numeric, 2) as overall_avg_score,
+    ROUND(AVG(u.Reputation)::numeric, 0) as avg_user_reputation,
+    MAX(r.CreationDate) as latest_post_date,
+    MIN(r.CreationDate) as earliest_post_date,
+    
+    ROUND(
+        AVG(
+            CASE 
+                WHEN r.prev_score IS NOT NULL THEN 
+                    (r.Score - COALESCE(r.prev_score, 0)) * 
+                    GREATEST(1, (r.prev_views / NULLIF(r.ViewCount, 0)))
+                ELSE 0 
+            END
+        ), 2
+    ) as avg_score_change_factor,
+    
+    STRING_AGG(
+        CASE 
+            WHEN r.Title IS NOT NULL AND r.Tags IS NOT NULL THEN 
+                SUBSTRING(r.Title FROM 1 FOR 30) || ' (' || 
+                COALESCE(SUBSTRING(r.Tags FROM 2 FOR CHAR_LENGTH(r.Tags)-2), '') || ')'
+            ELSE 'No Title'
+        END, 
+        ' | '
+    ) as formatted_titles,
+    
+    (
+        SELECT COUNT(*) FROM (
+            SELECT DISTINCT u2.Id FROM Users u2
+            INNER JOIN Posts p2 ON u2.Id = p2.OwnerUserId
+            INNER JOIN PostHistory ph2 ON p2.Id = ph2.PostId
+            WHERE u2.Reputation > 10000
+              AND ph2.PostHistoryTypeId IN (1, 2, 3)
+              AND ph2.CreationDate BETWEEN DATE '2020-01-01' AND DATE '2022-12-31'
+            EXCEPT
+            SELECT u3.Id FROM Users u3
+            WHERE u3.Views > 50000
+        ) t2
+    ) as complex_set_op_result,
+    
+    (SELECT MAX(score_quartile) FROM RankedPosts) as max_quartile,
+    (SELECT MIN(r2.Score) FROM RankedPosts r2 WHERE r2.score_quartile = 1) as min_low_quartile_score,
+    
+    COALESCE(
+        (SELECT SUM(p2.Score) 
+         FROM Posts p2 
+         WHERE p2.OwnerUserId = u.Id 
+           AND p2.CreationDate > DATE '2021-01-01'), 
+        0
+    ) as recent_user_score,
+    
+    CONCAT(
+        'Users with ', 
+        COUNT(DISTINCT CASE WHEN u.Reputation > 10000 THEN u.Id END),
+        ' expert users, ',
+        COUNT(DISTINCT CASE WHEN u.Views > 50000 THEN u.Id END),
+        ' highly viewed users'
+    ) as user_summary,
+    
+    ROUND(
+        AVG(CASE 
+            WHEN r.tag_count > 3 THEN r.Score 
+            ELSE NULL 
+        END), 2
+    ) as avg_score_high_tag,
+    
+    (SELECT COUNT(*) 
+     FROM Posts p1 
+     LEFT JOIN AnswerStats ans ON p1.Id = ans.QuestionId
+     WHERE p1.PostTypeId = 1
+       AND ans.answer_count > 10
+       AND p1.Score > 50
+       AND (p1.Title IS NOT NULL OR p1.Body IS NOT NULL)
+    ) as complex_joined_count,
+    
+    ROUND(
+        COALESCE(
+            AVG(r.Score) / NULLIF(AVG(r.ViewCount), 0), 
+            0
+        ), 4
+    ) as score_to_view_ratio
+    
+FROM RankedPosts r
+FULL OUTER JOIN Users u ON r.OwnerUserId = u.Id
+LEFT JOIN TagAnalysis t ON u.AccountId IS NOT NULL
+LEFT JOIN PostsWithHistory ph ON r.Id = ph.PostId
+LEFT JOIN AnswerStats ans ON r.Id = ans.QuestionId
+WHERE (r.Score > 5 OR r.ViewCount > 1000 OR u.Reputation > 1000)
+  AND (r.CreationDate BETWEEN DATE '2019-01-01' AND DATE '2023-12-31' OR u.CreationDate BETWEEN DATE '2015-01-01' AND DATE '2023-12-31')
+  AND (r.Title IS NOT NULL OR r.Body IS NOT NULL OR ph.PostId IS NOT NULL)
+GROUP BY
+    u.Id, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.AccountId,
+    r.Id, r.PostTypeId, r.OwnerUserId, r.Score, r.ViewCount, r.CreationDate, r.Title, r.Tags, r.AnswerCount, r.CommentCount, r.FavoriteCount, r.LastActivityDate,
+    r.rn, r.prev_score, r.prev_views, r.avg_score, r.score_quartile, r.tag_count,
+    t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId,
+    ph.PostId, ph.PostHistoryTypeId, ph.CreationDate, ph.UserId, ph.Comment, ph.Text, ph.RevisionGUID,
+    ans.QuestionId, ans.answer_count, ans.total_answer_score, ans.avg_answer_score, ans.max_answer_score, ans.min_answer_score, ans.positive_answers, ans.negative_answers, ans.zero_score_answers, ans.answer_titles, ans.score_list
+HAVING COUNT(*) > 0
+ORDER BY MAX(r.CreationDate) DESC, MAX(u.Reputation) DESC
+LIMIT 1000;

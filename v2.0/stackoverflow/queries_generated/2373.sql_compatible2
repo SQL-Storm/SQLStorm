@@ -1,0 +1,154 @@
+WITH RecursiveUserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p2.PostTypeId = 2 THEN p2.Id END) AS AnswerCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COALESCE(SUM(vtUp.CountVotes), 0) AS TotalUpVotes,
+        COALESCE(SUM(vtDown.CountVotes), 0) AS TotalDownVotes,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.LastAccessDate DESC) AS UserRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Posts p2 ON p2.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS CountVotes
+        FROM Votes
+        WHERE VoteTypeId = 2
+        GROUP BY PostId
+    ) vtUp ON vtUp.PostId = p.Id
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS CountVotes
+        FROM Votes
+        WHERE VoteTypeId = 3
+        GROUP BY PostId
+    ) vtDown ON vtDown.PostId = p.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+TopTags AS (
+    SELECT
+        tag.TagName,
+        tag.Count,
+        tag.ExcerptPostId,
+        ROW_NUMBER() OVER (ORDER BY tag.Count DESC, tag.TagName) AS TagRank
+    FROM Tags tag
+    WHERE tag.Count > 1000
+),
+HighScorePosts AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.PostTypeId,
+        CASE WHEN p.PostTypeId = 1 THEN 'Question'
+             WHEN p.PostTypeId = 2 THEN 'Answer'
+             ELSE 'Other' END AS PostTypeName
+    FROM Posts p
+    WHERE p.Score > 20
+),
+PostLinkDuplicates AS (
+    SELECT pl.PostId, pl.RelatedPostId, u.DisplayName AS OwnerName, lt.Name AS LinkTypeName
+    FROM PostLinks pl
+    LEFT JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    LEFT JOIN Posts p ON p.Id = pl.PostId
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE pl.LinkTypeId = 3
+),
+ClosedQuestionsWithReason AS (
+    SELECT
+        ph.PostId,
+        ph.Comment AS CloseReasonId,
+        crt.Name AS CloseReasonName,
+        ph.CreationDate AS CloseDate
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS INTEGER)
+    WHERE ph.PostHistoryTypeId = 10
+),
+UserReputationsChanges AS (
+    SELECT
+        ph.UserId,
+        ph.PostId,
+        ph.CreationDate,
+        LAG(ph.CreationDate) OVER (PARTITION BY ph.UserId ORDER BY ph.CreationDate) AS PrevChangeDate,
+        EXTRACT(EPOCH FROM (ph.CreationDate - COALESCE(LAG(ph.CreationDate) OVER (PARTITION BY ph.UserId ORDER BY ph.CreationDate), ph.CreationDate))) AS SecondsSinceLastChange
+    FROM PostHistory ph
+    WHERE ph.UserId IS NOT NULL
+    ORDER BY ph.UserId, ph.CreationDate
+)
+SELECT 
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.BadgeCount,
+    ua.TotalUpVotes,
+    ua.TotalDownVotes,
+    ua.UserRank,
+    tg.TagName AS TopTag,
+    hsp.Id AS HighScorePostId,
+    hsp.Title AS HighScorePostTitle,
+    hsp.Score AS HighScorePostScore,
+    pl.LinkTypeName AS DuplicateLinkType,
+    pl.RelatedPostId AS DuplicateOfPostId,
+    pl.OwnerName AS DuplicatePostOwner,
+    cq.PostId AS ClosedQuestionId,
+    cq.CloseReasonName,
+    cq.CloseDate,
+    urc.SecondsSinceLastChange,
+    (CASE
+        WHEN ua.Reputation > 10000 THEN 'High Rep, '
+        WHEN ua.Reputation > 1000 THEN 'Mid Rep, '
+        ELSE 'Low Rep, '
+     END
+     || 'Questions: ' || COALESCE(CAST(ua.QuestionCount AS VARCHAR), '0')
+     || ', Answers: ' || COALESCE(CAST(ua.AnswerCount AS VARCHAR), '0')
+     || ', Badges: ' || COALESCE(CAST(ua.BadgeCount AS VARCHAR), '0')
+    ) AS Summary,
+    CASE 
+        WHEN ua.QuestionCount = 0 THEN 'New User'
+        WHEN ua.AnswerCount / NULLIF(ua.QuestionCount, 0) > 2 THEN 'Answer Specialist'
+        WHEN ua.QuestionCount / NULLIF(ua.AnswerCount, 0) > 2 THEN 'Question Specialist'
+        ELSE 'Balanced User' 
+    END AS UserFocus
+FROM RecursiveUserActivity ua
+LEFT JOIN TopTags tg ON tg.TagRank = (ua.UserRank % 10) + 1
+LEFT JOIN (
+    SELECT hsp1.*
+    FROM HighScorePosts hsp1
+) hsp ON hsp.OwnerUserId = ua.UserId
+    AND hsp.Id = (
+        SELECT hspm.Id
+        FROM HighScorePosts hspm
+        WHERE hspm.OwnerUserId = ua.UserId
+        ORDER BY hspm.Score DESC
+        LIMIT 1
+    )
+LEFT JOIN PostLinkDuplicates pl ON pl.PostId = hsp.Id
+LEFT JOIN (
+    SELECT cq1.*
+    FROM ClosedQuestionsWithReason cq1
+) cq ON cq.PostId = (
+        SELECT cqm.PostId
+        FROM ClosedQuestionsWithReason cqm
+        JOIN Posts p2 ON p2.Id = cqm.PostId
+        WHERE p2.OwnerUserId = ua.UserId
+          AND p2.PostTypeId = 1
+        ORDER BY cqm.CloseDate DESC
+        LIMIT 1
+    )
+LEFT JOIN (
+    SELECT UserId, AVG(SecondsSinceLastChange) AS SecondsSinceLastChange
+    FROM UserReputationsChanges
+    GROUP BY UserId
+) urc ON urc.UserId = ua.UserId
+WHERE ua.Reputation > 500
+ORDER BY ua.Reputation DESC, ua.UserRank
+LIMIT 100;

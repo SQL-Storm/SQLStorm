@@ -1,0 +1,190 @@
+WITH
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      COUNT(p.Id) AS PostCount,
+      SUM(p.Score) AS TotalScore,
+      AVG(p.ViewCount) AS AvgViewCount,
+      MAX(p.CreationDate) AS LastPostDate
+    FROM
+      Users u
+      JOIN Posts p
+        ON u.Id = p.OwnerUserId
+    WHERE
+      p.PostTypeId IN (1, 2)
+    GROUP BY
+      u.Id,
+      u.DisplayName
+  ),
+  HighReputationUsers AS (
+    SELECT
+      Id
+    FROM
+      Users
+    WHERE
+      Reputation > 10000
+  ),
+  RecentQuestions AS (
+    SELECT
+      Id,
+      OwnerUserId,
+      Title,
+      Tags,
+      CreationDate,
+      AnswerCount,
+      FavoriteCount
+    FROM
+      Posts
+    WHERE
+      PostTypeId = 1
+      AND CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '30 days')
+  ),
+  QuestionMetrics AS (
+    SELECT
+      rq.Id AS QuestionId,
+      rq.Title,
+      rq.Tags,
+      rq.CreationDate,
+      ua.DisplayName AS OwnerDisplayName,
+      ua.TotalScore AS OwnerTotalScore,
+      rq.AnswerCount,
+      rq.FavoriteCount,
+      ROW_NUMBER() OVER (ORDER BY rq.CreationDate DESC) AS RowNum
+    FROM
+      RecentQuestions rq
+      JOIN UserActivity ua
+        ON rq.OwnerUserId = ua.UserId
+    WHERE
+      ua.UserId IN (SELECT Id FROM HighReputationUsers)
+  ),
+  AnswerDetails AS (
+    SELECT
+      p.ParentId AS QuestionId,
+      COUNT(p.Id) AS AnswerCountForQuestion,
+      SUM(p.Score) AS TotalAnswerScore,
+      AVG(p.Score) AS AvgAnswerScore,
+      MAX(p.CreationDate) AS LastAnswerDate
+    FROM
+      Posts p
+    WHERE
+      p.PostTypeId = 2
+    GROUP BY
+      p.ParentId
+  ),
+  QuestionWithAnswers AS (
+    SELECT
+      qm.QuestionId,
+      qm.Title,
+      qm.Tags,
+      qm.CreationDate,
+      qm.OwnerDisplayName,
+      qm.OwnerTotalScore,
+      qm.AnswerCount,
+      qm.FavoriteCount,
+      qm.RowNum,
+      ad.AnswerCountForQuestion,
+      ad.TotalAnswerScore,
+      ad.AvgAnswerScore,
+      ad.LastAnswerDate
+    FROM
+      QuestionMetrics qm
+      LEFT JOIN AnswerDetails ad
+        ON qm.QuestionId = ad.QuestionId
+  ),
+  TopAnswers AS (
+    SELECT
+      p.ParentId AS QuestionId,
+      p.Id AS AnswerId,
+      p.OwnerUserId,
+      u.DisplayName AS AnswerOwnerDisplayName,
+      p.Score AS AnswerScore,
+      ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS Rank
+    FROM
+      Posts p
+      JOIN Users u
+        ON p.OwnerUserId = u.Id
+    WHERE
+      p.PostTypeId = 2
+      AND p.ParentId IN (SELECT QuestionId FROM QuestionMetrics)
+  ),
+  AggregatedData AS (
+    SELECT
+      qwa.QuestionId,
+      qwa.Title,
+      qwa.Tags,
+      qwa.CreationDate,
+      qwa.OwnerDisplayName,
+      qwa.OwnerTotalScore,
+      qwa.AnswerCount,
+      qwa.FavoriteCount,
+      qwa.RowNum,
+      qwa.AnswerCountForQuestion,
+      qwa.TotalAnswerScore,
+      qwa.AvgAnswerScore,
+      qwa.LastAnswerDate,
+      ta.AnswerId AS TopAnswerId,
+      ta.AnswerOwnerDisplayName AS TopAnswerOwner,
+      ta.AnswerScore AS TopAnswerScore
+    FROM
+      QuestionWithAnswers qwa
+      LEFT JOIN TopAnswers ta
+        ON qwa.QuestionId = ta.QuestionId AND ta.Rank = 1
+  )
+SELECT
+  ad.QuestionId,
+  ad.Title,
+  ad.OwnerDisplayName,
+  ad.OwnerTotalScore,
+  ad.CreationDate AS QuestionCreationDate,
+  ad.AnswerCount,
+  ad.FavoriteCount,
+  ad.AnswerCountForQuestion,
+  COALESCE(ad.TotalAnswerScore, 0) AS TotalAnswerScore,
+  COALESCE(ad.AvgAnswerScore, 0) AS AvgAnswerScore,
+  ad.LastAnswerDate,
+  ad.TopAnswerId,
+  ad.TopAnswerOwner,
+  ad.TopAnswerScore,
+  CASE
+    WHEN ad.CreationDate < (CAST('2024-10-01' AS date) - INTERVAL '1 year') THEN 'Old'
+    WHEN ad.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '1 year') THEN 'Recent'
+    ELSE 'Unknown'
+  END AS QuestionAgeCategory,
+  SUBSTRING(
+    ad.Tags
+    FROM (POSITION('>' IN ad.Tags) + 1)
+    FOR (POSITION('>' IN SUBSTRING(ad.Tags FROM POSITION('>' IN ad.Tags) + 1)) - 1)
+  ) AS SecondTag
+FROM
+  AggregatedData ad
+WHERE
+  ad.RowNum <= 100
+  AND ad.AnswerCountForQuestion IS NOT NULL
+  AND ad.OwnerTotalScore > 5000
+
+UNION ALL
+
+SELECT
+  CAST(NULL AS bigint) AS QuestionId,
+  CAST(NULL AS text) AS Title,
+  CAST(NULL AS text) AS OwnerDisplayName,
+  CAST(NULL AS bigint) AS OwnerTotalScore,
+  CAST(NULL AS timestamp) AS QuestionCreationDate,
+  CAST(NULL AS integer) AS AnswerCount,
+  CAST(NULL AS integer) AS FavoriteCount,
+  CAST(NULL AS integer) AS AnswerCountForQuestion,
+  CAST(NULL AS bigint) AS TotalAnswerScore,
+  CAST(NULL AS double precision) AS AvgAnswerScore,
+  CAST(NULL AS timestamp) AS LastAnswerDate,
+  CAST(NULL AS bigint) AS TopAnswerId,
+  CAST(NULL AS text) AS TopAnswerOwner,
+  CAST(NULL AS integer) AS TopAnswerScore,
+  CAST(NULL AS text) AS QuestionAgeCategory,
+  CAST(NULL AS text) AS SecondTag
+FROM
+  Users u
+WHERE
+  u.Id NOT IN (SELECT Id FROM HighReputationUsers)
+ORDER BY
+  QuestionId;

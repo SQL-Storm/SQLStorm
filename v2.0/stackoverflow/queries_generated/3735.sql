@@ -1,0 +1,175 @@
+-- {"query": "3735.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1813} 
+
+/*  Complex benchmark query over the StackOverflow schema  */
+WITH
+-- 1️⃣ User activity summary (reputation, badge counts, vote totals)
+user_summary AS (
+    SELECT
+        u.Id                                   AS user_id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.Views,0)                    AS total_views,
+        COUNT(b.Id)                            AS total_badges,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS gold_badges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS silver_badges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS bronze_badges,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END)   AS up_votes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END)   AS down_votes,
+        SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END)   AS favorites
+    FROM Users u
+    LEFT JOIN Badges b        ON b.UserId = u.Id
+    LEFT JOIN Posts p         ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v         ON v.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views
+),
+
+-- 2️⃣ Tag popularity (derived from Posts.Tags via string functions)
+tag_popularity AS (
+    SELECT
+        TRIM(LEADING '<' FROM TRIM(TRAILING '>' FROM UNNEST(string_to_array(p.Tags, '><')))) AS tag,
+        COUNT(*)                                            AS tag_uses,
+        AVG(p.Score)                                        AS avg_score,
+        SUM(p.ViewCount)                                    AS total_views
+    FROM Posts p
+    WHERE p.PostTypeId = 1               -- only questions
+      AND p.Tags IS NOT NULL
+    GROUP BY tag
+),
+
+-- 3️⃣ Recent high‑scoring answers per user (window function + correlated sub‑query)
+user_top_answers AS (
+    SELECT
+        a.OwnerUserId                           AS user_id,
+        a.Id                                    AS answer_id,
+        a.ParentId                              AS question_id,
+        a.Score                                 AS answer_score,
+        a.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY a.OwnerUserId ORDER BY a.Score DESC, a.CreationDate DESC) AS rn
+    FROM Posts a
+    WHERE a.PostTypeId = 2                      -- answers
+      AND a.Score > 0
+),
+
+-- 4️⃣ Questions with the most comments (outer join + CASE/NULL handling)
+question_comment_stats AS (
+    SELECT
+        q.Id                                 AS question_id,
+        q.Title,
+        q.Score                              AS question_score,
+        COALESCE(c.comment_cnt,0)             AS comment_count,
+        CASE
+            WHEN COALESCE(c.comment_cnt,0) = 0 THEN 'No comments'
+            WHEN COALESCE(c.comment_cnt,0) <= 3 THEN 'Low activity'
+            ELSE 'High activity'
+        END                                 AS activity_level
+    FROM Posts q
+    LEFT JOIN (
+        SELECT
+            p.Id                                   AS post_id,
+            COUNT(cm.Id)                           AS comment_cnt
+        FROM Posts p
+        LEFT JOIN Comments cm ON cm.PostId = p.Id
+        WHERE p.PostTypeId = 1                     -- questions only
+        GROUP BY p.Id
+    ) c ON c.post_id = q.Id
+    WHERE q.PostTypeId = 1                         -- questions
+),
+
+-- 5️⃣ Combine user summary with their top answer and recent activity (set operator)
+combined_user_data AS (
+    SELECT
+        us.user_id,
+        us.DisplayName,
+        us.Reputation,
+        us.total_views,
+        us.total_badges,
+        us.gold_badges,
+        us.silver_badges,
+        us.bronze_badges,
+        us.up_votes,
+        us.down_votes,
+        us.favorites,
+        ua.answer_id,
+        ua.question_id,
+        ua.answer_score,
+        ua.CreationDate          AS answer_date,
+        NULL::int                AS question_id_alt,
+        NULL::text               AS question_title_alt,
+        NULL::int                AS comment_cnt_alt,
+        NULL::text               AS activity_level_alt
+    FROM user_summary us
+    LEFT JOIN user_top_answers ua
+          ON ua.user_id = us.user_id AND ua.rn = 1
+
+    UNION ALL
+
+    SELECT
+        qs.question_id            AS user_id,      -- place‑holder to match column list
+        NULL::varchar(40)         AS DisplayName,
+        NULL::int                 AS Reputation,
+        NULL::int                 AS total_views,
+        NULL::int                 AS total_badges,
+        NULL::int                 AS gold_badges,
+        NULL::int                 AS silver_badges,
+        NULL::int                 AS bronze_badges,
+        NULL::int                 AS up_votes,
+        NULL::int                 AS down_votes,
+        NULL::int                 AS favorites,
+        NULL::int                 AS answer_id,
+        NULL::int                 AS question_id,
+        NULL::int                 AS answer_score,
+        NULL::timestamp           AS answer_date,
+        qs.question_id            AS question_id_alt,
+        qs.Title                  AS question_title_alt,
+        qs.comment_count          AS comment_cnt_alt,
+        qs.activity_level         AS activity_level_alt
+    FROM question_comment_stats qs
+)
+
+SELECT
+    cu.user_id,
+    cu.DisplayName,
+    cu.Reputation,
+    cu.total_views,
+    cu.total_badges,
+    cu.gold_badges,
+    cu.silver_badges,
+    cu.bronze_badges,
+    cu.up_votes,
+    cu.down_votes,
+    cu.favorites,
+    cu.answer_id,
+    cu.question_id,
+    cu.answer_score,
+    cu.answer_date,
+    cu.question_id_alt,
+    cu.question_title_alt,
+    cu.comment_cnt_alt,
+    cu.activity_level_alt,
+    -- tag‑related columns pulled via a lateral join (string concat & NULL logic)
+    COALESCE(t.tag, 'NoTag')                          AS top_tag,
+    COALESCE(t.tag_uses,0)                            AS top_tag_uses,
+    COALESCE(t.avg_score,0)::numeric(10,2)           AS top_tag_avg_score,
+    COALESCE(t.total_views,0)                         AS top_tag_total_views,
+    -- derived metric: weighted reputation score
+    (COALESCE(cu.Reputation,0) * 0.6
+     + COALESCE(cu.gold_badges,0) * 100
+     + COALESCE(cu.silver_badges,0) * 50
+     + COALESCE(cu.bronze_badges,0) * 20
+     + COALESCE(cu.up_votes,0) * 1
+     - COALESCE(cu.down_votes,0) * 2)                AS weighted_score
+FROM combined_user_data cu
+LEFT JOIN LATERAL (
+    SELECT
+        tp.tag,
+        tp.tag_uses,
+        tp.avg_score,
+        tp.total_views
+    FROM tag_popularity tp
+    ORDER BY tp.tag_uses DESC, tp.avg_score DESC
+    LIMIT 1
+) t ON TRUE
+WHERE (cu.user_id IS NOT NULL AND cu.DisplayName IS NOT NULL)      -- filter real users
+   OR (cu.question_id_alt IS NOT NULL AND cu.activity_level_alt = 'High activity')
+ORDER BY weighted_score DESC
+LIMIT 500;

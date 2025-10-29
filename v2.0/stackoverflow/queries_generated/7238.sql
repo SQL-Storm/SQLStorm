@@ -1,0 +1,416 @@
+-- {"query": "7238.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 3340} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COUNT(DISTINCT v.Id) as VoteCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        MAX(b.Date) as LastBadgeDate,
+        MAX(v.CreationDate) as LastVoteDate,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+                CAST(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS FLOAT) * 100 / COUNT(DISTINCT p.Id)
+            ELSE 0 
+        END as QuestionPercentage,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+                CAST(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS FLOAT) * 100 / COUNT(DISTINCT p.Id)
+            ELSE 0 
+        END as AnswerPercentage,
+        AVG(p.Score) as AvgPostScore,
+        SUM(p.ViewCount) as TotalViews,
+        STRING_AGG(
+            CASE 
+                WHEN p.PostTypeId = 1 THEN 'Q' 
+                WHEN p.PostTypeId = 2 THEN 'A' 
+                ELSE 'Other' 
+            END, 
+            ', '
+        ) as PostTypeSummary,
+        DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) as PostRank,
+        RANK() OVER (ORDER BY u.Reputation DESC) as ReputationRank,
+        ROW_NUMBER() OVER (ORDER BY u.Views DESC, u.Reputation DESC) as OverallRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    WHERE u.AccountId IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+RankedActivity AS (
+    SELECT 
+        *,
+        CASE 
+            WHEN PostCount > 100 THEN 'Elite'
+            WHEN PostCount > 50 THEN 'Active'
+            WHEN PostCount > 10 THEN 'Regular'
+            ELSE 'Newbie'
+        END as ActivityLevel,
+        CASE 
+            WHEN LastPostDate > '2023-01-01' THEN 'Recent'
+            WHEN LastPostDate > '2022-01-01' THEN 'Current'
+            WHEN LastPostDate > '2021-01-01' THEN 'Active'
+            ELSE 'Inactive'
+        END as PostingStatus,
+        CASE 
+            WHEN Reputation > 100000 THEN 'Master'
+            WHEN Reputation > 10000 THEN 'Expert'
+            WHEN Reputation > 1000 THEN 'Veteran'
+            ELSE 'Beginner'
+        END as ReputationLevel,
+        CAST(
+            (
+                (PostCount * 0.3) +
+                (CommentCount * 0.2) +
+                (BadgeCount * 0.25) +
+                (VoteCount * 0.15) +
+                (Views * 0.1)
+            ) AS INT
+        ) as ActivityScore
+    FROM UserActivityStats
+),
+PostDetailWithAnalytics AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.OwnerDisplayName,
+        p.AnswerCount,
+        p.CommentCount,
+        p.Tags,
+        p.FavoriteCount,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 
+                COALESCE(
+                    (
+                        SELECT COUNT(*) 
+                        FROM Posts ap 
+                        WHERE ap.ParentId = p.Id 
+                        AND ap.PostTypeId = 2 
+                        AND ap.DeletedDate IS NULL
+                    ), 0
+                )
+            ELSE NULL 
+        END as ActualAnswerCount,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 
+                (
+                    SELECT STRING_AGG(
+                        CASE 
+                            WHEN v.VoteTypeId = 2 THEN '+1'
+                            WHEN v.VoteTypeId = 3 THEN '-1'
+                            WHEN v.VoteTypeId = 5 THEN 'Fav'
+                            ELSE 'Other'
+                        END, 
+                        ', '
+                    )
+                    FROM Votes v 
+                    WHERE v.PostId = p.Id
+                    AND v.UserId IS NOT NULL
+                )
+            ELSE NULL 
+        END as VoteSummary,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 
+                (
+                    SELECT COUNT(*) 
+                    FROM PostHistory ph 
+                    WHERE ph.PostId = p.Id 
+                    AND ph.PostHistoryTypeId IN (1, 4, 5, 6)
+                )
+            ELSE 0 
+        END as EditCount,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 
+                (
+                    SELECT COUNT(*) 
+                    FROM Posts 
+                    WHERE ParentId = p.Id 
+                    AND PostTypeId = 2 
+                    AND Score > 0
+                )
+            ELSE 0 
+        END as PositiveAnswers,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 
+                (
+                    SELECT COUNT(*) 
+                    FROM Posts 
+                    WHERE ParentId = p.Id 
+                    AND PostTypeId = 2 
+                    AND Score <= 0
+                )
+            ELSE 0 
+        END as NegativeAnswers,
+        STRING_TO_ARRAY(
+            CASE 
+                WHEN p.Tags IS NOT NULL THEN 
+                    SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2)
+                ELSE ''
+            END, 
+            '><'
+        ) as TagArray,
+        DATEDIFF('day', p.CreationDate, p.LastActivityDate) as DaysActive,
+        CASE 
+            WHEN p.FavoriteCount > 50 THEN 'Popular'
+            WHEN p.FavoriteCount > 20 THEN 'Notable'
+            WHEN p.FavoriteCount > 5 THEN 'Noticeable'
+            ELSE 'Ordinary'
+        END as PopularityLevel
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) 
+    AND p.DeletedDate IS NULL
+    AND (p.OwnerUserId IS NOT NULL OR p.OwnerDisplayName IS NOT NULL)
+),
+CombinedAnalysis AS (
+    SELECT 
+        ra.UserId,
+        ra.DisplayName,
+        ra.Reputation,
+        ra.PostCount,
+        ra.CommentCount,
+        ra.BadgeCount,
+        ra.VoteCount,
+        ra.QuestionPercentage,
+        ra.AnswerPercentage,
+        ra.AvgPostScore,
+        ra.TotalViews,
+        ra.PostTypeSummary,
+        ra.ActivityLevel,
+        ra.PostingStatus,
+        ra.ReputationLevel,
+        ra.ActivityScore,
+        ra.PostRank,
+        ra.ReputationRank,
+        ra.OverallRank,
+        pd.PostId,
+        pd.Title,
+        pd.Body,
+        pd.Score,
+        pd.ViewCount,
+        pd.CreationDate,
+        pd.LastActivityDate,
+        pd.PostTypeId,
+        pd.OwnerUserId,
+        pd.OwnerDisplayName,
+        pd.AnswerCount,
+        pd.CommentCount,
+        pd.Tags,
+        pd.FavoriteCount,
+        pd.AcceptedAnswerId,
+        pd.ParentId,
+        pd.ActualAnswerCount,
+        pd.VoteSummary,
+        pd.EditCount,
+        pd.PositiveAnswers,
+        pd.NegativeAnswers,
+        pd.TagArray,
+        pd.DaysActive,
+        pd.PopularityLevel,
+        CASE 
+            WHEN pd.PostTypeId = 1 THEN 
+                COALESCE(NULLIF(pd.AnswerCount, 0), pd.ActualAnswerCount)
+            ELSE NULL 
+        END as EffectiveAnswerCount,
+        CASE 
+            WHEN pd.Score >= 10 THEN 'High'
+            WHEN pd.Score >= 5 THEN 'Moderate'
+            WHEN pd.Score >= 1 THEN 'Low'
+            ELSE 'Very Low'
+        END as ScoreTier,
+        CASE 
+            WHEN pd.ViewCount >= 1000 THEN 'Viral'
+            WHEN pd.ViewCount >= 500 THEN 'Trending'
+            WHEN pd.ViewCount >= 100 THEN 'Popular'
+            WHEN pd.ViewCount >= 50 THEN 'Notable'
+            ELSE 'Obscure'
+        END as ViewStatus,
+        -- Complex expression to calculate engagement ratio
+        ROUND(
+            CAST(
+                (
+                    CAST(pd.CommentCount AS FLOAT) + 
+                    CAST(pd.Score AS FLOAT) + 
+                    CAST(pd.FavoriteCount AS FLOAT) + 
+                    (CASE WHEN pd.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) * 10
+                ) / NULLIF(pd.ViewCount, 0) * 100
+            ) AS DECIMAL(10,2)
+        ) as EngagementRatio,
+        -- Complex string expression for tagging analysis
+        STRING_AGG(
+            CASE 
+                WHEN pd.TagArray IS NOT NULL AND ARRAY_LENGTH(pd.TagArray, 1) > 0 THEN 
+                    CONCAT(
+                        'Tag:', 
+                        TRIM(LEADING '<' FROM TRIM(TRAILING '>' FROM pd.TagArray[1])),
+                        '|Count:', 
+                        CASE 
+                            WHEN pd.TagArray[1] LIKE '%tag%' THEN 'Special'
+                            WHEN pd.TagArray[1] LIKE '%sql%' THEN 'Technical'
+                            WHEN pd.TagArray[1] LIKE '%python%' THEN 'Programming'
+                            WHEN pd.TagArray[1] LIKE '%javascript%' THEN 'Programming'
+                            ELSE 'General'
+                        END
+                    )
+                ELSE 'No Tags'
+            END,
+            '|'
+        ) as PrimaryTagAnalysis
+    FROM RankedActivity ra
+    LEFT JOIN PostDetailWithAnalytics pd ON ra.UserId = pd.OwnerUserId
+    WHERE pd.PostId IS NOT NULL
+    GROUP BY 
+        ra.UserId, ra.DisplayName, ra.Reputation, ra.PostCount, ra.CommentCount, 
+        ra.BadgeCount, ra.VoteCount, ra.QuestionPercentage, ra.AnswerPercentage, 
+        ra.AvgPostScore, ra.TotalViews, ra.PostTypeSummary, ra.ActivityLevel, 
+        ra.PostingStatus, ra.ReputationLevel, ra.ActivityScore, ra.PostRank, 
+        ra.ReputationRank, ra.OverallRank, pd.PostId, pd.Title, pd.Body, pd.Score, 
+        pd.ViewCount, pd.CreationDate, pd.LastActivityDate, pd.PostTypeId, 
+        pd.OwnerUserId, pd.OwnerDisplayName, pd.AnswerCount, pd.CommentCount, 
+        pd.Tags, pd.FavoriteCount, pd.AcceptedAnswerId, pd.ParentId, 
+        pd.ActualAnswerCount, pd.VoteSummary, pd.EditCount, pd.PositiveAnswers, 
+        pd.NegativeAnswers, pd.TagArray, pd.DaysActive, pd.PopularityLevel
+)
+SELECT 
+    -- Main result set with all computed metrics
+    ca.UserId,
+    ca.DisplayName,
+    ca.Reputation,
+    ca.PostCount,
+    ca.CommentCount,
+    ca.BadgeCount,
+    ca.VoteCount,
+    ca.QuestionPercentage,
+    ca.AnswerPercentage,
+    ca.AvgPostScore,
+    ca.TotalViews,
+    ca.PostTypeSummary,
+    ca.ActivityLevel,
+    ca.PostingStatus,
+    ca.ReputationLevel,
+    ca.ActivityScore,
+    ca.PostRank,
+    ca.ReputationRank,
+    ca.OverallRank,
+    ca.PostId,
+    ca.Title,
+    ca.Body,
+    ca.Score,
+    ca.ViewCount,
+    ca.CreationDate,
+    ca.LastActivityDate,
+    ca.PostTypeId,
+    ca.OwnerUserId,
+    ca.OwnerDisplayName,
+    ca.AnswerCount,
+    ca.CommentCount,
+    ca.Tags,
+    ca.FavoriteCount,
+    ca.AcceptedAnswerId,
+    ca.ParentId,
+    ca.ActualAnswerCount,
+    ca.VoteSummary,
+    ca.EditCount,
+    ca.PositiveAnswers,
+    ca.NegativeAnswers,
+    ca.TagArray,
+    ca.DaysActive,
+    ca.PopularityLevel,
+    ca.EffectiveAnswerCount,
+    ca.ScoreTier,
+    ca.ViewStatus,
+    ca.EngagementRatio,
+    ca.PrimaryTagAnalysis,
+    -- Complex calculated fields using window functions and set operators
+    LAG(ca.Score, 1) OVER (PARTITION BY ca.UserId ORDER BY ca.CreateDate) as PreviousScore,
+    LEAD(ca.ViewCount, 1) OVER (PARTITION BY ca.UserId ORDER BY ca.CreateDate) as NextViewCount,
+    -- Using set operators for performance analysis
+    CASE 
+        WHEN (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = ca.UserId AND p2.PostTypeId = 1) > 0 
+        THEN 'Has Questions' 
+        ELSE 'No Questions' 
+    END as QuestionStatus,
+    CASE 
+        WHEN EXISTS (
+            SELECT 1 FROM Votes v 
+            WHERE v.UserId = ca.UserId 
+            AND v.VoteTypeId = 2 
+            AND v.CreationDate > '2023-01-01'
+        ) THEN 'Active Voter' 
+        ELSE 'Inactive Voter' 
+    END as VotingStatus,
+    -- Advanced NULL handling and filtering for performance testing
+    COALESCE(
+        CASE 
+            WHEN ca.ViewCount IS NULL THEN 0 
+            ELSE ca.ViewCount 
+        END,
+        0
+    ) as SafeViewCount,
+    COALESCE(
+        CASE 
+            WHEN ca.Score IS NULL THEN 0 
+            ELSE ca.Score 
+        END,
+        0
+    ) as SafeScore,
+    -- Statistical calculations using complex window functions
+    AVG(ca.Score) OVER (PARTITION BY ca.UserId ORDER BY ca.CreateDate ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) as MovingAvgScore,
+    STDDEV(ca.Score) OVER (PARTITION BY ca.UserId ORDER BY ca.CreateDate ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) as ScoreStdDev,
+    -- Correlated subqueries with complex conditions
+    (
+        SELECT COUNT(*) 
+        FROM Comments c 
+        WHERE c.PostId = ca.PostId 
+        AND c.CreationDate > ca.LastActivityDate
+    ) as RecentComments,
+    -- Final complex filtering
+    CASE 
+        WHEN ca.Reputation > 5000 AND ca.PostCount > 20 AND ca.ActivityScore > 1000 THEN 'High Performer'
+        WHEN ca.Reputation > 1000 AND ca.PostCount > 5 AND ca.ActivityScore > 500 THEN 'Mid Performer'
+        ELSE 'Regular Contributor'
+    END as ContributorTier
+FROM CombinedAnalysis ca
+WHERE ca.Score IS NOT NULL 
+AND ca.ViewCount IS NOT NULL 
+AND ca.PostTypeId IS NOT NULL
+-- Additional filter to ensure meaningful data for performance benchmarking
+AND (
+    ca.Reputation > 0 
+    OR ca.PostCount > 0 
+    OR ca.ViewCount > 0 
+    OR ca.Score > -100
+)
+ORDER BY ca.ActivityScore DESC, ca.Reputation DESC, ca.PostCount DESC
+LIMIT 1000
+/* This query represents a complex performance benchmark with:
+- Multiple CTEs with nested complex logic
+- Outer joins with various references
+- Correlated subqueries for detailed analytics
+- Window functions with multiple partitions and aggregation modes
+- Complicated CASE expressions with multiple conditions
+- String manipulation functions and array operations
+- NULL handling with COALESCE and ISNULL patterns
+- Set operators (EXISTS, COUNT) for data validation
+- Complex mathematical calculations and statistical measures
+- Mixed data types and cross-referencing between tables
+- Advanced filtering and sorting scenarios
+- Performance-intensive patterns for benchmarking testing
+*/

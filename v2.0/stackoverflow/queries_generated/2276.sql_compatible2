@@ -1,0 +1,149 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 AS Level,
+        ARRAY[t.Id] AS Path
+    FROM Tags t
+    WHERE t.IsModeratorOnly = false AND t.IsRequired = false
+
+    UNION ALL
+
+    SELECT
+        t.Id,
+        t.TagName,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        r.Level + 1,
+        r.Path || t.Id
+    FROM Tags t
+    JOIN RecursiveTagHierarchy r ON array_position(r.Path, t.Id) IS NULL AND t.Id > r.Id
+    WHERE t.IsModeratorOnly = false AND t.IsRequired = false AND r.Level < 3
+),
+UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COALESCE(SUM(vb.VoteCount),0) AS TotalVotesReceived,
+        COALESCE(SUM(v.TotalVotesGiven),0) AS TotalVotesGiven
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.CreationDate > (date_trunc('year', CAST('2024-10-01 12:34:56' AS timestamp)) - interval '3 years')
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN (
+        SELECT
+            p.OwnerUserId,
+            COUNT(*) AS VoteCount
+        FROM Votes v
+        JOIN Posts p ON v.PostId = p.Id
+        GROUP BY p.OwnerUserId
+    ) vb ON vb.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT UserId, COUNT(*) AS TotalVotesGiven
+        FROM Votes 
+        WHERE UserId IS NOT NULL
+        GROUP BY UserId
+    ) v ON v.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+TopPostsAndComments AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.Body,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        p.AcceptedAnswerId,
+        p.Tags,
+        string_agg(c.Text, ' | ' ORDER BY c.CreationDate) AS CommentTexts,
+        COUNT(c.Id) AS CommentCount,
+        first_value(v.VoteTypeId) OVER (PARTITION BY p.Id ORDER BY v.CreationDate DESC NULLS LAST) AS LastVoteTypeId
+    FROM Posts p
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId IN (1,2)
+    GROUP BY p.Id, p.PostTypeId, p.Title, p.Body, p.CreationDate, p.Score, p.ViewCount, p.OwnerUserId, u.DisplayName, p.AcceptedAnswerId, p.Tags
+),
+PostLinkDuplicates AS (
+    SELECT 
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.LinkTypeId,
+        p1.Score AS PostScore,
+        p2.Score AS RelatedPostScore
+    FROM PostLinks pl
+    JOIN Posts p1 ON p1.Id = pl.PostId
+    JOIN Posts p2 ON p2.Id = pl.RelatedPostId
+    WHERE pl.LinkTypeId = 3
+),
+CloseReasonCounts AS (
+    SELECT
+        p.Id AS PostId,
+        crt.Name AS CloseReason,
+        COUNT(ph.Id) AS CloseVotesCount
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS integer)
+    GROUP BY p.Id, crt.Name
+),
+UserReputationCase AS (
+    SELECT 
+        Id,
+        DisplayName,
+        Reputation,
+        CASE 
+            WHEN Reputation >= 100000 THEN 'Legendary'
+            WHEN Reputation >= 25000 THEN 'Expert'
+            WHEN Reputation >= 5000 THEN 'Proficient'
+            WHEN Reputation >= 1000 THEN 'Intermediate'
+            ELSE 'Newbie'
+        END AS ReputationLevel
+    FROM Users
+)
+SELECT DISTINCT
+    u.DisplayName,
+    u.ReputationLevel,
+    u.Reputation,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.CommentCount,
+    ua.BadgeCount,
+    ua.TotalVotesReceived,
+    ua.TotalVotesGiven,
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CommentCount,
+    p.CommentTexts,
+    p.LastVoteTypeId,
+    cr.CloseReason,
+    cr.CloseVotesCount,
+    pl.RelatedPostId AS DuplicateOfPostId,
+    pl.RelatedPostScore,
+    th.Level AS TagDepth,
+    th.TagName AS RelatedTag
+FROM UserReputationCase u
+JOIN UserActivitySummary ua ON ua.UserId = u.Id
+LEFT JOIN TopPostsAndComments p ON p.OwnerUserId = u.Id
+LEFT JOIN CloseReasonCounts cr ON cr.PostId = p.Id
+LEFT JOIN PostLinkDuplicates pl ON pl.PostId = p.Id
+LEFT JOIN RecursiveTagHierarchy th ON th.TagName = ANY(string_to_array(COALESCE(p.Tags,''), '><'))
+WHERE
+    (ua.QuestionCount > 10 OR ua.AnswerCount > 20)
+    AND (p.Score > 50 OR p.ViewCount > 1000 OR COALESCE(cr.CloseVotesCount,0) > 2)
+    AND (u.ReputationLevel IN ('Legendary','Expert','Proficient'))
+ORDER BY u.Reputation DESC, p.Score DESC, p.ViewCount DESC
+LIMIT 100;

@@ -1,0 +1,109 @@
+WITH RecentActivity AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.OwnerUserId,
+    p.Tags,
+    p.ViewCount AS p_ViewCount,
+    p.Score AS p_Score,
+    COUNT(v.Id) FILTER (WHERE v.VoteTypeId IN (2,3)) OVER (PARTITION BY p.Id) AS NetVotes,
+    MAX(CASE WHEN v.VoteTypeId = 2 THEN v.CreationDate END) OVER (PARTITION BY p.Id) AS LastUpvoteDate,
+    MAX(CASE WHEN v.VoteTypeId = 3 THEN v.CreationDate END) OVER (PARTITION BY p.Id) AS LastDownvoteDate
+  FROM Posts p
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  WHERE p.PostTypeId IN (1,2)
+),
+TaggedDerived AS (
+  SELECT
+    ra.*,
+    t.TagName,
+    ROW_NUMBER() OVER (PARTITION BY ra.PostId ORDER BY ra.CreationDate DESC) AS rn
+  FROM RecentActivity ra
+  LEFT JOIN (
+    SELECT
+      unnested.value AS TagName,
+      unnested.ord AS ord,
+      source_postid
+    FROM (
+      SELECT
+        ja.value::text AS value,
+        gs AS ord,
+        r.PostId AS source_postid
+      FROM RecentActivity r
+      CROSS JOIN LATERAL (
+        -- build a JSON array string from tags like "<tag1><tag2>" to '["tag1","tag2"]'
+        SELECT ('[' || replace(substring(r.Tags, 2, char_length(r.Tags)-2), '><', '","') || ']') AS json_text
+      ) jt
+      CROSS JOIN LATERAL (
+        -- parse the JSON text into elements and enumerates them
+        SELECT ROW_NUMBER() OVER () AS gs, elem
+        FROM (
+          SELECT json_extract.element AS elem
+          FROM (
+            SELECT
+              -- try JSON parsing using JSON functions available across dialects:
+              -- For Postgres, use json_array_elements_text; for others, transform to table via JSON table equivalent.
+              -- Use json_array_elements_text by casting to jsonb if necessary
+              json_array_elements_text(jt.json_text::json) AS element
+          ) AS json_extract
+        ) AS parsed
+      ) parsed2(ja, gs)
+      -- The above CROSS JOIN LATERAL arrangement may not be supported in all dialects.
+      -- To keep compatibility, fallback: split the string by '","' delimiter.
+    ) AS unnested(value, ord, source_postid)
+  ) t ON t.source_postid = ra.PostId
+  WHERE ra.PostTypeId = 1
+),
+CorrelatedPerf AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.LastActivityDate,
+    u.Id AS OwnerUserId,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    COALESCE(vt.Name, 'Unknown') AS VoteTypeName,
+    v.BountyAmount,
+    CASE
+      WHEN p.OwnerUserId IS NOT NULL THEN
+        (SELECT AVG(char_length(Body)) FROM Posts WHERE Id = p.Id)
+      ELSE NULL
+    END AS ApproxBodyLength
+  FROM Posts p
+  LEFT JOIN Users u ON u.Id = p.OwnerUserId
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  LEFT JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+  WHERE p.Id IN (SELECT PostId FROM RecentActivity)
+)
+SELECT
+  cp.PostId,
+  cp.Title,
+  cp.CreationDate,
+  cp.LastActivityDate,
+  cp.OwnerUserId,
+  cp.OwnerDisplayName,
+  cp.Reputation,
+  cp.Score,
+  cp.ViewCount,
+  cp.Tags,
+  string_agg(DISTINCT td.TagName, ',') AS TagList,
+  MAX(cp.ApproxBodyLength) OVER () AS GlobalAvgBodyLength,
+  SUM(CASE WHEN cp.Score > 0 THEN 1 ELSE 0 END) OVER () AS PositiveScorePosts,
+  SUM(CASE WHEN cp.Score < 0 THEN 1 ELSE 0 END) OVER () AS NegativeScorePosts,
+  COUNT(cp.PostId) OVER () AS TotalPostsConsidered,
+  MIN(cp.CreationDate) OVER () AS EarliestPostDate,
+  MAX(cp.LastActivityDate) OVER () AS LatestActivityDate,
+  (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = cp.OwnerUserId) AS PostsByOwner
+FROM CorrelatedPerf cp
+LEFT JOIN TaggedDerived td ON td.PostId = cp.PostId
+GROUP BY
+  cp.PostId, cp.Title, cp.CreationDate, cp.LastActivityDate,
+  cp.OwnerUserId, cp.OwnerDisplayName, cp.Reputation,
+  cp.Score, cp.ViewCount, cp.Tags, cp.ApproxBodyLength;

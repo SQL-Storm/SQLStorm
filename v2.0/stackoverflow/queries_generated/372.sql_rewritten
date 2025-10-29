@@ -1,0 +1,385 @@
+-- {"query": "372.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3772} 
+with
+-- Active users with recent activity and basic stats
+active_users as (
+  select
+    u.id as user_id,
+    coalesce(nullif(trim(u.DisplayName), ''), '(anonymous)') as display_name,
+    u.reputation,
+    u.creationdate,
+    u.lastaccessdate,
+    u.upvotes,
+    u.downvotes,
+    u.views,
+    count(b.id) filter (where b.class = 1) as gold_count,
+    count(b.id) filter (where b.class = 2) as silver_count,
+    count(b.id) filter (where b.class = 3) as bronze_count,
+    max(b.date) as last_badge_date
+  from users u
+  left join badges b on b.userid = u.id
+  where u.reputation > 0
+  group by u.id, u.displayname, u.reputation, u.creationdate, u.lastaccessdate, u.upvotes, u.downvotes, u.views
+),
+-- Questions and answers mapped with owners and key metrics
+qa as (
+  select
+    p.id,
+    p.posttypeid,
+    p.owneruserid as user_id,
+    p.score,
+    p.viewcount,
+    p.creationdate,
+    p.lastactivitydate,
+    p.title,
+    p.tags,
+    p.answercount,
+    p.parentid,
+    p.acceptedanswerid
+  from posts p
+  where p.posttypeid in (1,2)
+),
+-- Votes per post with breakdowns
+vote_agg as (
+  select
+    v.postid,
+    count(*) filter (where v.votetypeid = 2) as up_count,
+    count(*) filter (where v.votetypeid = 3) as down_count,
+    count(*) filter (where v.votetypeid = 5) as fav_count,
+    count(*) filter (where v.votetypeid in (8,9)) as bounty_events,
+    sum(coalesce(v.bountyamount,0)) as bounty_amount_total,
+    max(v.creationdate) as last_vote_at
+  from votes v
+  group by v.postid
+),
+-- Comments per post with latest comment timestamp
+comment_agg as (
+  select
+    c.postid,
+    count(*) as comment_count,
+    max(c.creationdate) as last_comment_at,
+    max(c.score) as max_comment_score
+  from comments c
+  group by c.postid
+),
+-- Close/duplicate info from PostHistory and PostLinks
+closure as (
+  select
+    ph.postid,
+    min(ph.creationdate) filter (where ph.posthistorytypeid = 10) as first_closed_at,
+    max(ph.creationdate) filter (where ph.posthistorytypeid = 11) as last_reopened_at,
+    count(*) filter (where ph.posthistorytypeid = 10) as close_events,
+    count(*) filter (where ph.posthistorytypeid = 11) as reopen_events,
+    -- parse close reason id if stored in Comment column as integer-like
+    max(
+      case
+        when ph.posthistorytypeid = 10 and ph.comment ~ '^[0-9]+$' then cast(ph.comment as int)
+        else null
+      end
+    ) as last_close_reason_id
+  from posthistory ph
+  where ph.posthistorytypeid in (10,11)
+  group by ph.postid
+),
+duplicates as (
+  -- LinkTypeId = 3 => PostId is duplicate of RelatedPostId
+  select
+    pl.postid as dup_id,
+    pl.relatedpostid as canonical_id,
+    min(pl.creationdate) as first_dup_link_at,
+    count(*) as dup_link_count
+  from postlinks pl
+  where pl.linktypeid = 3
+  group by pl.postid, pl.relatedpostid
+),
+-- Tag extraction from Posts.Tags like '<tag1><tag2>'
+question_tags as (
+  select
+    q.id as post_id,
+    unnest(string_to_array(substring(q.tags, 2, length(q.tags)-2), '><')) as tagname
+  from qa q
+  where q.posttypeid = 1 and q.tags is not null and q.tags like '<%>'
+),
+-- Rank questions by multiple windows
+question_metrics as (
+  select
+    q.id as question_id,
+    q.user_id,
+    q.score,
+    q.viewcount,
+    q.answercount,
+    q.creationdate,
+    q.lastactivitydate,
+    v.up_count,
+    v.down_count,
+    v.fav_count,
+    v.bounty_events,
+    v.bounty_amount_total,
+    coalesce(c.comment_count,0) as comment_count,
+    c.last_comment_at,
+    cl.first_closed_at,
+    cl.last_reopened_at,
+    cl.close_events,
+    cl.reopen_events,
+    cl.last_close_reason_id,
+    d.canonical_id as duplicate_of_id,
+    d.first_dup_link_at,
+    row_number() over (order by q.score desc nulls last, q.viewcount desc nulls last, q.creationdate desc) as rn_score,
+    row_number() over (order by q.viewcount desc nulls last) as rn_views,
+    row_number() over (order by coalesce(v.fav_count,0) desc, q.creationdate desc) as rn_favs,
+    dense_rank() over (order by coalesce(v.up_count,0) - coalesce(v.down_count,0) desc) as dr_net_votes,
+    ntile(10) over (order by q.viewcount desc nulls last) as view_ntile,
+    percentile_cont(0.9) within group (order by q.viewcount) over () as p90_views
+  from qa q
+  left join vote_agg v on v.postid = q.id
+  left join comment_agg c on c.postid = q.id
+  left join closure cl on cl.postid = q.id
+  left join duplicates d on d.dup_id = q.id
+  where q.posttypeid = 1
+),
+-- Identify "engaging" questions by mixed signals
+engaging_questions as (
+  select
+    qm.*,
+    case
+      when qm.viewcount >= qm.p90_views then 1
+      when qm.rn_views <= 100 then 1
+      when coalesce(qm.fav_count,0) >= 25 then 1
+      when coalesce(qm.comment_count,0) >= 20 then 1
+      else 0
+    end as is_high_engagement
+  from question_metrics qm
+),
+-- Answers quality metrics, correlate to parent question
+answer_metrics as (
+  select
+    a.id as answer_id,
+    a.parentid as question_id,
+    a.user_id,
+    a.score,
+    a.creationdate,
+    a.lastactivitydate,
+    v.up_count,
+    v.down_count,
+    v.fav_count,
+    c.comment_count,
+    row_number() over (partition by a.parentid order by a.score desc nulls last, a.creationdate asc) as rn_in_question,
+    rank() over (order by a.score desc nulls last) as rank_global_score,
+    sum(case when a.score > 0 then 1 else 0 end) over (partition by a.user_id) as pos_answers_by_user
+  from qa a
+  left join vote_agg v on v.postid = a.id
+  left join comment_agg c on c.postid = a.id
+  where a.posttypeid = 2
+),
+-- Per-user aggregates with activity windows and NULL edge cases
+user_activity as (
+  select
+    au.user_id,
+    au.display_name,
+    au.reputation,
+    au.creationdate,
+    au.lastaccessdate,
+    au.gold_count,
+    au.silver_count,
+    au.bronze_count,
+    au.last_badge_date,
+    coalesce(sum(case when qm.is_high_engagement = 1 then 1 else 0 end),0) as high_eng_q_count,
+    coalesce(count(distinct qm.question_id),0) as questions_count,
+    coalesce(count(distinct am.answer_id),0) as answers_count,
+    coalesce(sum(case when am.rn_in_question = 1 then 1 else 0 end),0) as top_answers_count,
+    coalesce(sum(am.score),0) as total_answer_score,
+    coalesce(sum(qm.score),0) as total_question_score,
+    coalesce(sum(qm.viewcount),0) as total_question_views,
+    max(greatest(qm.lastactivitydate, am.lastactivitydate)) as last_post_activity
+  from active_users au
+  left join engaging_questions qm on qm.user_id = au.user_id
+  left join answer_metrics am on am.user_id = au.user_id
+  group by au.user_id, au.display_name, au.reputation, au.creationdate, au.lastaccessdate, au.gold_count, au.silver_count, au.bronze_count, au.last_badge_date
+),
+-- Compute rolling activity per user by month
+user_monthly as (
+  select
+    p.owneruserid as user_id,
+    date_trunc('month', p.creationdate) as month,
+    count(*) filter (where p.posttypeid = 1) as q_count,
+    count(*) filter (where p.posttypeid = 2) as a_count,
+    sum(p.score) as sum_score
+  from posts p
+  where p.owneruserid is not null
+  group by p.owneruserid, date_trunc('month', p.creationdate)
+),
+user_monthly_window as (
+  select
+    um.user_id,
+    um.month,
+    um.q_count,
+    um.a_count,
+    um.sum_score,
+    sum(um.q_count + um.a_count) over (partition by um.user_id order by um.month rows between 2 preceding and current row) as posts_last_3m,
+    avg(um.sum_score) over (partition by um.user_id order by um.month rows between 11 preceding and current row) as avg_score_last_12m
+  from user_monthly um
+),
+-- Rank tags by user performance and popularity
+user_tag_perf as (
+  select
+    q.user_id,
+    qt.tagname,
+    count(*) as q_in_tag,
+    sum(q.score) as q_score_in_tag,
+    sum(coalesce(va.up_count,0) - coalesce(va.down_count,0)) as net_votes_in_tag,
+    rank() over (partition by q.user_id order by count(*) desc, sum(q.score) desc) as r_tag
+  from qa q
+  join question_tags qt on qt.post_id = q.id
+  left join vote_agg va on va.postid = q.id
+  where q.posttypeid = 1
+  group by q.user_id, qt.tagname
+),
+-- Determine each user's top tag and a diversity measure
+user_top_tag as (
+  select
+    utp.user_id,
+    utp.tagname as top_tag,
+    utp.q_in_tag,
+    utp.q_score_in_tag,
+    utp.net_votes_in_tag,
+    count(*) over (partition by utp.user_id) as tag_diversity
+  from user_tag_perf utp
+  where utp.r_tag = 1
+),
+-- Heavier join combining per-post and per-user views with set operators to stress planner
+post_union as (
+  select
+    qm.question_id as post_id,
+    qm.user_id,
+    'Q' as kind,
+    qm.score,
+    qm.viewcount,
+    qm.comment_count,
+    qm.first_closed_at is not null as is_closed,
+    qm.duplicate_of_id is not null as is_duplicate,
+    qm.creationdate,
+    qm.lastactivitydate
+  from engaging_questions qm
+  union all
+  select
+    am.answer_id as post_id,
+    am.user_id,
+    'A' as kind,
+    am.score,
+    null::int as viewcount,
+    coalesce(am.comment_count,0) as comment_count,
+    false as is_closed,
+    false as is_duplicate,
+    am.creationdate,
+    am.lastactivitydate
+  from answer_metrics am
+),
+-- Correlate each post with the owner's rolling monthly activity at the time of posting
+post_with_user_window as (
+  select
+    pu.post_id,
+    pu.user_id,
+    pu.kind,
+    pu.score,
+    pu.viewcount,
+    pu.comment_count,
+    pu.is_closed,
+    pu.is_duplicate,
+    pu.creationdate,
+    pu.lastactivitydate,
+    umw.posts_last_3m,
+    umw.avg_score_last_12m
+  from post_union pu
+  left join user_monthly_window umw
+    on umw.user_id = pu.user_id
+   and umw.month = date_trunc('month', pu.creationdate)
+),
+-- Identify questions whose accepted answer is not the top-scored answer
+misaligned_accepts as (
+  select
+    q.id as question_id,
+    q.acceptedanswerid,
+    min(a.id) filter (where am.rn_in_question = 1) as top_answer_id,
+    bool_or(am.rn_in_question = 1 and a.id = q.acceptedanswerid) as accepted_is_top,
+    count(*) as answer_count
+  from posts q
+  join posts a on a.parentid = q.id and a.posttypeid = 2
+  left join answer_metrics am on am.answer_id = a.id
+  where q.posttypeid = 1 and q.acceptedanswerid is not null
+  group by q.id, q.acceptedanswerid
+),
+-- Final scoring combining many signals with NULL handling
+user_score as (
+  select
+    ua.user_id,
+    ua.display_name,
+    ua.reputation,
+    ua.gold_count, ua.silver_count, ua.bronze_count,
+    ua.questions_count, ua.answers_count,
+    ua.high_eng_q_count,
+    ua.top_answers_count,
+    ua.total_answer_score + ua.total_question_score as total_post_score,
+    coalesce(ut.top_tag, '(none)') as top_tag,
+    ut.tag_diversity,
+    percentile_disc(0.5) within group (order by coalesce(puw.posts_last_3m,0)) as p50_posts_last_3m,
+    avg(coalesce(puw.avg_score_last_12m,0)) as avg_score_last_12m_mean,
+    max(puw.creationdate) as last_post_at,
+    sum(case when puw.is_closed then 1 else 0 end) as closed_posts,
+    sum(case when puw.is_duplicate then 1 else 0 end) as duplicate_posts
+  from user_activity ua
+  left join user_top_tag ut on ut.user_id = ua.user_id
+  left join post_with_user_window puw on puw.user_id = ua.user_id
+  group by ua.user_id, ua.display_name, ua.reputation, ua.gold_count, ua.silver_count, ua.bronze_count, ua.questions_count, ua.answers_count, ua.high_eng_q_count, ua.top_answers_count, ua.total_answer_score, ua.total_question_score, ut.top_tag, ut.tag_diversity
+)
+select
+  us.user_id,
+  us.display_name,
+  us.reputation,
+  us.gold_count, us.silver_count, us.bronze_count,
+  us.questions_count, us.answers_count,
+  us.high_eng_q_count,
+  us.top_answers_count,
+  us.total_post_score,
+  us.top_tag,
+  us.tag_diversity,
+  us.p50_posts_last_3m,
+  round(us.avg_score_last_12m_mean::numeric, 2) as avg_score_last_12m_mean,
+  us.last_post_at,
+  us.closed_posts,
+  us.duplicate_posts,
+  -- Derived composite score with mixed numeric/boolean/string logic
+  (
+    greatest(1, log(10, us.reputation + 10))
+    + coalesce(us.gold_count,0) * 5
+    + coalesce(us.silver_count,0) * 2
+    + coalesce(us.bronze_count,0) * 1
+    + coalesce(us.total_post_score,0) * 0.3
+    + coalesce(us.high_eng_q_count,0) * 2
+    + coalesce(us.top_answers_count,0) * 1.5
+    + case when lower(us.top_tag) like '%sql%' then 3 else 0 end
+    - coalesce(us.duplicate_posts,0) * 0.5
+    - coalesce(us.closed_posts,0) * 0.25
+  ) as performance_score,
+  -- Include whether user has misaligned accepted answers among their questions
+  exists (
+    select 1
+    from posts q
+    join misaligned_accepts ma on ma.question_id = q.id
+    where q.owneruserid = us.user_id and q.posttypeid = 1 and coalesce(ma.accepted_is_top,false) = false
+  ) as has_misaligned_accepts,
+  -- Decorative string expression
+  concat_ws(
+    ' | ',
+    'User #' || us.user_id,
+    coalesce(nullif(us.display_name, ''), '(anonymous)'),
+    'Top tag: ' || coalesce(us.top_tag, '(none)'),
+    'Q/A: ' || coalesce(us.questions_count,0) || '/' || coalesce(us.answers_count,0),
+    'Score: ' || coalesce(us.total_post_score,0)
+  ) as summary
+from user_score us
+where
+  -- filter to active contributors with some activity but stress NULL logic
+  coalesce(us.questions_count,0) + coalesce(us.answers_count,0) >= 5
+  and (us.last_post_at is null or us.last_post_at >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years')
+  and (us.tag_diversity is null or us.tag_diversity >= 1)
+order by performance_score desc, us.reputation desc, us.total_post_score desc
+limit 200;

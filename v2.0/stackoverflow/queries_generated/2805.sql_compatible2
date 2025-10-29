@@ -1,0 +1,143 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        COALESCE(t.Count, 0) AS TagCount,
+        1 AS Level,
+        CAST(t.TagName AS VARCHAR(1000)) AS TagPath
+    FROM Tags t
+    WHERE t.IsModeratorOnly = FALSE AND t.IsRequired = FALSE
+    UNION ALL
+    SELECT 
+        t2.Id,
+        t2.TagName,
+        COALESCE(t2.Count, 0),
+        r.Level + 1,
+        CAST(r.TagPath || ' > ' || t2.TagName AS VARCHAR(1000))
+    FROM Tags t2
+    INNER JOIN RecursiveTagHierarchy r 
+        ON LENGTH(t2.TagName) > LENGTH(r.TagName) 
+        AND SUBSTR(t2.TagName,1,LENGTH(r.TagName)) = r.TagName
+    WHERE r.Level < 3
+),
+PostStats AS (
+    SELECT 
+       p.Id AS PostId,
+       p.PostTypeId,
+       p.CreationDate,
+       p.Score,
+       p.ViewCount,
+       p.OwnerUserId,
+       p.AcceptedAnswerId,
+       p.Title,
+       p.Tags,
+       array_length(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><'),1) AS TagCount,
+       row_number() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserPostRank
+    FROM Posts p
+    WHERE p.PostTypeId IN (1,2)
+),
+UserBadgesAgg AS (
+    SELECT
+       b.UserId,
+       COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+       COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+       COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+       COUNT(DISTINCT b.Name) AS DistinctBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserActivityWindow AS (
+    SELECT
+       u.Id AS UserId,
+       COUNT(DISTINCT p.Id) AS TotalPosts,
+       COUNT(DISTINCT c.Id) AS TotalComments,
+       SUM(vtUp.VoteCount) AS TotalUpVotes,
+       SUM(vtDown.VoteCount) AS TotalDownVotes,
+       MAX(p.CreationDate) OVER (PARTITION BY u.Id) AS LastPostDate,
+       MIN(p.CreationDate) OVER (PARTITION BY u.Id) AS FirstPostDate,
+       array_agg(DISTINCT t.TagName) FILTER (WHERE t.TagName IS NOT NULL) AS UserTags
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes vtUp ON vtUp.PostId = p.Id AND vtUp.VoteTypeId = 2
+    LEFT JOIN Votes vtDown ON vtDown.PostId = p.Id AND vtDown.VoteTypeId = 3
+    LEFT JOIN (
+       SELECT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')) AS TagName, p.Id AS PostId
+       FROM Posts p WHERE p.PostTypeId = 1
+    ) t ON t.PostId = p.Id
+    GROUP BY u.Id
+),
+UserReputationChanges AS (
+    SELECT
+        u.Id AS UserId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 10 ELSE 0 END) - SUM(CASE WHEN v.VoteTypeId = 3 THEN 2 ELSE 0 END) AS ReputationScoreDelta,
+        COUNT(DISTINCT v.Id) AS TotalVotesCast,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 5 THEN v.Id END) AS FavoriteVotes
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id AND v.UserId = u.Id
+    GROUP BY u.Id
+),
+ClosedQuestionsWithReasons AS (
+    SELECT DISTINCT 
+        ph.PostId,
+        ph.Comment AS CloseReasonCode,
+        crt.Name AS CloseReasonName,
+        ph.CreationDate AS CloseDate
+    FROM PostHistory ph
+    JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS INTEGER)
+    WHERE ph.PostHistoryTypeId = 10
+),
+AnswersWithLinkDuplicates AS (
+    SELECT DISTINCT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        pl.LinkTypeId,
+        lt.Name AS LinkTypeName,
+        pl.RelatedPostId,
+        p.Title AS RelatedPostTitle
+    FROM Posts a
+    LEFT JOIN PostLinks pl ON pl.PostId = a.Id AND pl.LinkTypeId IN (1,3)
+    LEFT JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    LEFT JOIN Posts p ON p.Id = pl.RelatedPostId
+    WHERE a.PostTypeId = 2
+)
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    ua.TotalPosts,
+    ua.TotalComments,
+    COALESCE(ub.GoldBadges,0) AS GoldBadges,
+    COALESCE(ub.SilverBadges,0) AS SilverBadges,
+    COALESCE(ub.BronzeBadges,0) AS BronzeBadges,
+    ua.LastPostDate,
+    ua.FirstPostDate,
+    ua.TotalUpVotes,
+    ua.TotalDownVotes,
+    ur.ReputationScoreDelta,
+    ur.TotalVotesCast,
+    ur.FavoriteVotes,
+    array_to_string(ua.UserTags, ', ') AS UserTags,
+    COALESCE(ps.TagCount,0) AS LatestPostTagCount,
+    ps.Title AS LatestPostTitle,
+    cq.CloseReasonName,
+    cq.CloseDate,
+    array_agg(DISTINCT (adh.LinkTypeName || ': ' || COALESCE(adh.RelatedPostTitle, 'N/A'))) FILTER (WHERE adh.QuestionId IS NOT NULL) AS AnswerLinkDetails,
+    row_number() OVER (ORDER BY u.Reputation DESC, ua.TotalPosts DESC) AS UserRank
+FROM Users u
+LEFT JOIN UserActivityWindow ua ON ua.UserId = u.Id
+LEFT JOIN UserBadgesAgg ub ON ub.UserId = u.Id
+LEFT JOIN UserReputationChanges ur ON ur.UserId = u.Id
+LEFT JOIN PostStats ps ON ps.OwnerUserId = u.Id AND ps.UserPostRank = 1
+LEFT JOIN ClosedQuestionsWithReasons cq ON cq.PostId = ps.PostId AND ps.PostTypeId = 1
+LEFT JOIN AnswersWithLinkDuplicates adh ON adh.QuestionId = ps.PostId AND ps.PostTypeId = 1
+WHERE u.Reputation > 1000 AND COALESCE(ua.TotalPosts,0) > 20
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation, ua.TotalPosts, ua.TotalComments, 
+    ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges, ua.LastPostDate, ua.FirstPostDate, 
+    ua.TotalUpVotes, ua.TotalDownVotes, ur.ReputationScoreDelta, ur.TotalVotesCast, ur.FavoriteVotes, 
+    ua.UserTags, ps.TagCount, ps.Title, ps.PostId, ps.PostTypeId, cq.CloseReasonName, cq.CloseDate, u.Id, u.DisplayName, u.Reputation
+HAVING SUM(CASE WHEN (COALESCE(ub.GoldBadges,0) + COALESCE(ub.SilverBadges,0) + COALESCE(ub.BronzeBadges,0)) > 0 THEN 1 ELSE 0 END) >= 1
+ORDER BY UserRank
+LIMIT 50;

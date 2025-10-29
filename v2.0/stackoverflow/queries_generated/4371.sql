@@ -1,0 +1,146 @@
+-- {"query": "4371.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1484} 
+
+WITH
+  RankedPostEdits AS (
+    SELECT
+      ph.PostId,
+      ph.UserId,
+      ph.UserDisplayName,
+      ph.CreationDate AS EditDate,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory AS ph
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+  ),
+  UserEngagement AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+      SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+      COUNT(DISTINCT c.Id) AS CommentCount,
+      COUNT(DISTINCT b.Id) AS BadgeCount,
+      SUM(CASE WHEN v.VoteTypeId IN (2, 3) THEN 1 ELSE 0 END) AS VoteCount
+    FROM Users AS u
+    LEFT JOIN Posts AS p
+      ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments AS c
+      ON u.Id = c.UserId
+    LEFT JOIN Badges AS b
+      ON u.Id = b.UserId
+    LEFT JOIN Votes AS v
+      ON u.Id = v.UserId
+    GROUP BY
+      u.Id,
+      u.DisplayName
+  ),
+  PostContentSummary AS (
+    SELECT
+      p.Id AS PostId,
+      pt.Name AS PostTypeName,
+      p.Title,
+      p.Tags,
+      p.Score,
+      p.CommentCount,
+      p.FavoriteCount,
+      p.AnswerCount,
+      CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+      CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN 1 ELSE 0 END AS IsCommunityOwned,
+      LENGTH(p.Body) AS BodyLength,
+      CASE
+        WHEN p.OwnerUserId IS NULL
+        THEN 'Deleted User'
+        ELSE COALESCE(u.DisplayName, CAST(p.OwnerUserId AS VARCHAR))
+      END AS OwnerDisplayNameOrId,
+      p.CreationDate,
+      p.LastActivityDate
+    FROM Posts AS p
+    JOIN PostTypes AS pt
+      ON p.PostTypeId = pt.Id
+    LEFT JOIN Users AS u
+      ON p.OwnerUserId = u.Id
+    WHERE
+      p.PostTypeId IN (1, 2) -- Questions and Answers
+  )
+SELECT
+  pcs.PostId,
+  pcs.PostTypeName,
+  pcs.Title,
+  pcs.Tags,
+  pcs.Score,
+  pcs.CommentCount,
+  pcs.FavoriteCount,
+  pcs.AnswerCount,
+  pcs.IsClosed,
+  pcs.IsCommunityOwned,
+  pcs.BodyLength,
+  pcs.OwnerDisplayNameOrId,
+  pcs.CreationDate,
+  pcs.LastActivityDate,
+  ue.DisplayName AS UserDisplayName,
+  ue.TotalPostsOwned,
+  ue.QuestionCount,
+  ue.AnswerCount AS UserAnswerCount,
+  ue.CommentCount AS UserCommentCount,
+  ue.BadgeCount,
+  ue.VoteCount,
+  rpe.EditDate AS LastEditDateForUser,
+  COALESCE(CAST(pcs.Score AS DECIMAL) / NULLIF(pcs.CommentCount + pcs.FavoriteCount + pcs.AnswerCount, 0), 0) AS EngagementRatio,
+  CASE
+    WHEN pcs.Title LIKE '%?%' AND pcs.Score < 10
+    THEN 'Potentially Poorly Formulated Question'
+    WHEN pcs.AnswerCount = 0 AND pcs.IsClosed = 0 AND pcs.CreationDate < CURRENT_TIMESTAMP - INTERVAL '30 days'
+    THEN 'Unanswered Old Question'
+    ELSE 'Standard Post'
+  END AS PostStatusCategory
+FROM PostContentSummary AS pcs
+JOIN UserEngagement AS ue
+  ON pcs.OwnerDisplayNameOrId = ue.DisplayName -- Assuming DisplayName is unique and matches OwnerDisplayNameOrId when not null
+LEFT JOIN RankedPostEdits AS rpe
+  ON pcs.PostId = rpe.PostId AND pcs.OwnerDisplayNameOrId = rpe.UserDisplayName AND rpe.rn = 1
+WHERE
+  pcs.CreationDate BETWEEN '2023-01-01' AND '2023-12-31'
+  AND pcs.Score > -5
+UNION
+SELECT
+  pcs.PostId,
+  pcs.PostTypeName,
+  pcs.Title,
+  pcs.Tags,
+  pcs.Score,
+  pcs.CommentCount,
+  pcs.FavoriteCount,
+  pcs.AnswerCount,
+  pcs.IsClosed,
+  pcs.IsCommunityOwned,
+  pcs.BodyLength,
+  pcs.OwnerDisplayNameOrId,
+  pcs.CreationDate,
+  pcs.LastActivityDate,
+  ue.DisplayName AS UserDisplayName,
+  ue.TotalPostsOwned,
+  ue.QuestionCount,
+  ue.AnswerCount AS UserAnswerCount,
+  ue.CommentCount AS UserCommentCount,
+  ue.BadgeCount,
+  ue.VoteCount,
+  rpe.EditDate AS LastEditDateForUser,
+  COALESCE(CAST(pcs.Score AS DECIMAL) / NULLIF(pcs.CommentCount + pcs.FavoriteCount + pcs.AnswerCount, 0), 0) AS EngagementRatio,
+  CASE
+    WHEN pcs.Title LIKE '%?%' AND pcs.Score < 10
+    THEN 'Potentially Poorly Formulated Question'
+    WHEN pcs.AnswerCount = 0 AND pcs.IsClosed = 0 AND pcs.CreationDate < CURRENT_TIMESTAMP - INTERVAL '30 days'
+    THEN 'Unanswered Old Question'
+    ELSE 'Standard Post'
+  END AS PostStatusCategory
+FROM PostContentSummary AS pcs
+JOIN UserEngagement AS ue
+  ON pcs.OwnerDisplayNameOrId = ue.DisplayName -- Assuming DisplayName is unique and matches OwnerDisplayNameOrId when not null
+LEFT JOIN RankedPostEdits AS rpe
+  ON pcs.PostId = rpe.PostId AND pcs.OwnerDisplayNameOrId = rpe.UserDisplayName AND rpe.rn = 1
+WHERE
+  pcs.CreationDate < '2023-01-01'
+  AND pcs.Score > 50
+ORDER BY
+  pcs.CreationDate DESC;

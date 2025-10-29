@@ -1,0 +1,112 @@
+WITH
+user_stats AS (
+    SELECT
+        u.id                                      AS user_id,
+        u.displayname                             AS display_name,
+        u.reputation,
+        COALESCE(u.views,0)                       AS total_views,
+        (SELECT COUNT(*) FROM posts p
+         WHERE p.owneruserid = u.id AND p.posttypeid = 1) AS ques_cnt,
+        (SELECT COUNT(*) FROM posts p
+         WHERE p.owneruserid = u.id AND p.posttypeid = 2) AS ans_cnt,
+        (SELECT COUNT(*) FROM badges b
+         WHERE b.userid = u.id)                  AS badge_cnt,
+        (SELECT COALESCE(SUM(v.vote_type_id),0)
+         FROM votes v
+         JOIN posts p ON p.id = v.postid
+         WHERE p.owneruserid = u.id)             AS vote_score,
+        ROW_NUMBER() OVER (ORDER BY u.reputation DESC) AS rn_rep
+    FROM users u
+),
+top_users AS (
+    SELECT *
+    FROM user_stats
+    WHERE rn_rep = 1 AND reputation > 10000
+),
+recent_closed AS (
+    SELECT
+        p.id                                   AS post_id,
+        p.title,
+        ph.creationdate                        AS closed_date,
+        CAST(ph.comment AS INTEGER)            AS close_reason_id,
+        ROW_NUMBER() OVER (PARTITION BY p.id
+                           ORDER BY ph.creationdate DESC) AS rn
+    FROM posts p
+    JOIN posthistory ph
+      ON ph.postid = p.id
+     AND ph.posthistorytypeid = 10
+    WHERE p.posttypeid = 1
+),
+user_tags AS (
+    SELECT
+        pu.owneruserid                         AS user_id,
+        TRIM(BOTH '<>' FROM UNNEST(string_to_array(pu.tags,'><')) ) AS tag,
+        COUNT(*)                               AS tag_use_cnt,
+        ROW_NUMBER() OVER (PARTITION BY pu.owneruserid
+                           ORDER BY COUNT(*) DESC) AS rn_tag
+    FROM posts pu
+    WHERE pu.posttypeid = 1
+      AND pu.owneruserid IS NOT NULL
+      AND pu.tags IS NOT NULL
+    GROUP BY pu.owneruserid, tag
+),
+aggregated AS (
+    SELECT
+        tu.user_id,
+        tu.display_name,
+        tu.reputation,
+        tu.total_views,
+        tu.ques_cnt,
+        tu.ans_cnt,
+        tu.badge_cnt,
+        tu.vote_score,
+        rc.title                                 AS last_closed_q_title,
+        rc.closed_date                           AS last_closed_q_date,
+        COALESCE(crt.name,'<unknown>')           AS close_reason_name,
+        ut.tag                                   AS top_tag,
+        ut.tag_use_cnt                           AS top_tag_use_cnt
+    FROM top_users tu
+    LEFT JOIN LATERAL (
+        SELECT rc2.title, rc2.closed_date, rc2.close_reason_id
+        FROM recent_closed rc2
+        WHERE rc2.rn = 1
+          AND EXISTS (SELECT 1 FROM posts p
+                      WHERE p.id = rc2.post_id
+                        AND p.owneruserid = tu.user_id)
+        ORDER BY rc2.closed_date DESC
+        LIMIT 1
+    ) rc ON TRUE
+    LEFT JOIN closereasontypes crt
+      ON rc.close_reason_id = crt.id
+    LEFT JOIN LATERAL (
+        SELECT tag, tag_use_cnt
+        FROM user_tags ut2
+        WHERE ut2.user_id = tu.user_id
+          AND ut2.rn_tag = 1
+    ) ut ON TRUE
+)
+SELECT
+    user_id,
+    display_name,
+    reputation,
+    total_views,
+    ques_cnt,
+    ans_cnt,
+    badge_cnt,
+    vote_score,
+    COALESCE(last_closed_q_title,'<none>')   AS last_closed_question,
+    COALESCE(last_closed_q_date, DATE '1970-01-01') AS last_closed_date,
+    close_reason_name,
+    COALESCE(top_tag,'<none>')               AS most_used_tag,
+    COALESCE(top_tag_use_cnt,0)              AS most_used_tag_count
+FROM aggregated
+WHERE vote_score IS NOT NULL
+ORDER BY reputation DESC, vote_score DESC
+OFFSET 0 FETCH FIRST 50 ROWS ONLY
+
+UNION ALL
+
+SELECT
+    NULL::INTEGER,NULL::TEXT,NULL::INTEGER,NULL::BIGINT,NULL::INTEGER,NULL::INTEGER,NULL::INTEGER,NULL::INTEGER,
+    NULL::TEXT,NULL::DATE,NULL::TEXT,NULL::TEXT,NULL::INTEGER
+;

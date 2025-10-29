@@ -1,0 +1,260 @@
+-- {"query": "7808.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2621} 
+WITH UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.CreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        COALESCE(SUM(p.Score), 0) AS TotalScore,
+        COALESCE(SUM(p.ViewCount), 0) AS TotalViews,
+        MAX(p.CreationDate) AS LastPostDate,
+        DATEDIFF(DAY, u.CreationDate, u.LastAccessDate) AS DaysSinceRegistration,
+        NTILE(10) OVER (ORDER BY u.Reputation DESC) AS ReputationDecile,
+        ROW_NUMBER() OVER (PARTITION BY u.AccountId ORDER BY u.CreationDate) AS AccountMemberNumber,
+        LAG(u.Reputation, 1) OVER (ORDER BY u.Reputation DESC) - u.Reputation AS ReputationDifferenceFromNext,
+        CASE 
+            WHEN u.Reputation >= 1000000 THEN 'Godlike'
+            WHEN u.Reputation >= 100000 THEN 'Legendary'
+            WHEN u.Reputation >= 10000 THEN 'Epic'
+            WHEN u.Reputation >= 1000 THEN 'Master'
+            WHEN u.Reputation >= 100 THEN 'Expert'
+            WHEN u.Reputation >= 10 THEN 'Novice'
+            ELSE 'Newbie'
+        END AS ReputationTier
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.AccountId IS NOT NULL 
+      AND u.Reputation > 0
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.CreationDate, u.LastAccessDate, u.AccountId
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        Reputation,
+        DisplayName,
+        TotalPosts,
+        TotalComments,
+        TotalBadges,
+        QuestionCount,
+        AnswerCount,
+        TotalScore,
+        TotalViews,
+        ReputationTier,
+        ReputationDecile,
+        DaysSinceRegistration,
+        CASE 
+            WHEN (AnswerCount * 1.0 / NULLIF(QuestionCount, 0)) > 2 THEN 'High Answer Ratio'
+            WHEN (AnswerCount * 1.0 / NULLIF(QuestionCount, 0)) > 1 THEN 'Moderate Answer Ratio'
+            WHEN (AnswerCount * 1.0 / NULLIF(QuestionCount, 0)) > 0.5 THEN 'Low Answer Ratio'
+            ELSE 'Very Low Answer Ratio'
+        END AS AnswerRatioCategory,
+        CASE 
+            WHEN TotalScore > 100000 THEN 'High Scorer'
+            WHEN TotalScore > 10000 THEN 'Medium Scorer'
+            WHEN TotalScore > 1000 THEN 'Low Scorer'
+            ELSE 'Minimal Scorer'
+        END AS ScoringCategory,
+        ROW_NUMBER() OVER (ORDER BY TotalScore DESC, TotalPosts DESC) AS ScoreRank,
+        RANK() OVER (ORDER BY Reputation DESC) AS ReputationRank
+    FROM UserActivity
+    WHERE TotalPosts > 0 
+      AND TotalComments >= 0
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.IsRequired,
+        t.IsModeratorOnly,
+        p.PostTypeId,
+        COUNT(*) AS TagUsageCount,
+        AVG(p.ViewCount) AS AvgViewsPerTagUsage,
+        AVG(p.Score) AS AvgScorePerTagUsage,
+        SUM(p.Score) AS TotalScorePerTag,
+        STRING_AGG(p.Title, '; ') WITHIN GROUP (ORDER BY p.CreationDate DESC) AS RecentTitles
+    FROM Tags t
+    INNER JOIN PostLinks pl ON t.Id = pl.LinkTypeId
+    INNER JOIN Posts p ON pl.PostId = p.Id
+    WHERE p.PostTypeId IN (1, 2)
+    GROUP BY t.TagName, t.Count, t.IsRequired, t.IsModeratorOnly, p.PostTypeId
+),
+RecentQuestions AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.Title,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.ViewCount,
+        p.Score,
+        p.AnswerCount,
+        p.CommentCount,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS QuestionRank,
+        DENSE_RANK() OVER (ORDER BY p.CreationDate DESC) AS DailyRank,
+        LAG(p.Score, 1) OVER (ORDER BY p.CreationDate DESC) AS PrevScore,
+        LAG(p.ViewCount, 1) OVER (ORDER BY p.CreationDate DESC) AS PrevViews,
+        CASE WHEN p.Score > COALESCE(LAG(p.Score, 1) OVER (ORDER BY p.CreationDate DESC), 0) THEN 1 ELSE 0 END AS ScoreIncreased,
+        CASE 
+            WHEN p.Score > 1000 THEN 'Popular'
+            WHEN p.Score > 100 THEN 'Moderately Popular'
+            WHEN p.Score > 10 THEN 'Slightly Popular'
+            ELSE 'General'
+        END AS PopularityLevel,
+        PARSENAME(REPLACE(p.Tags, '<', '.'), 1) AS PrimaryTag
+    FROM Posts p
+    WHERE p.PostTypeId = 1 
+      AND p.CreationDate >= DATEADD(DAY, -30, cast('2024-10-01 12:34:56' as timestamp))
+      AND p.Score IS NOT NULL
+),
+MergedBadges AS (
+    SELECT 
+        b.UserId,
+        b.Name AS BadgeName,
+        b.Date,
+        b.Class,
+        b.TagBased,
+        COUNT(*) OVER (PARTITION BY b.UserId, b.Class) AS CountPerClass,
+        LEAD(b.Date, 1) OVER (PARTITION BY b.UserId ORDER BY b.Date) AS NextBadgeDate,
+        DATEDIFF(DAY, b.Date, LEAD(b.Date, 1) OVER (PARTITION BY b.UserId ORDER BY b.Date)) AS DaysToNextBadge,
+        CASE 
+            WHEN b.Class = 1 THEN 'Gold'
+            WHEN b.Class = 2 THEN 'Silver'
+            ELSE 'Bronze'
+        END AS BadgeTier,
+        CASE 
+            WHEN COUNT(*) OVER (PARTITION BY b.UserId, b.Class) >= 5 THEN 'Master'
+            WHEN COUNT(*) OVER (PARTITION BY b.UserId, b.Class) >= 3 THEN 'Expert'
+            ELSE 'Novice'
+        END AS MasteryLevel
+    FROM Badges b
+    WHERE b.Class IN (1, 2, 3)
+),
+FinalAnalysis AS (
+    SELECT 
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.TotalPosts,
+        tu.QuestionCount,
+        tu.AnswerCount,
+        tu.TotalScore,
+        tu.TotalViews,
+        tu.ReputationTier,
+        tu.ReputationDecile,
+        tu.DaysSinceRegistration,
+        REPLICATE('★', tu.ReputationDecile) AS ReputationStars,
+        COALESCE(STRING_AGG(DISTINCT rb.BadgeName, ', '), 'No Badges') AS BadgeList,
+        MAX(ra.Count) AS MaxTagCount,
+        MAX(rq.Score) AS MaxRecentScore,
+        MIN(rq.CreationDate) AS FirstRecentQuestion,
+        STRING_AGG(DISTINCT rq.PrimaryTag, ', ') AS UsedTags,
+        COALESCE(COUNT(DISTINCT CASE WHEN rq.Score > 100 THEN rq.QuestionId END), 0) AS HighScoreQuestions,
+        COALESCE(COUNT(DISTINCT CASE WHEN rq.AnswerCount > 0 THEN rq.QuestionId END), 0) AS QuestionsWithAnswers,
+        STRING_AGG(DISTINCT ta.TagName, '; ') WITHIN GROUP (ORDER BY ta.Count DESC) AS TopTags,
+        AVG(ta.AvgScorePerTagUsage) AS AvgTagScore,
+        CASE 
+            WHEN tu.QuestionCount > 50 AND tu.AnswerCount > 100 THEN 'High Productivity'
+            WHEN tu.QuestionCount > 10 AND tu.AnswerCount > 50 THEN 'Moderate Productivity'
+            WHEN tu.QuestionCount > 0 AND tu.AnswerCount > 10 THEN 'Low Productivity'
+            ELSE 'Minimal Activity'
+        END AS ProductivityCategory
+    FROM TopUsers tu
+    LEFT JOIN MergedBadges rb ON tu.UserId = rb.UserId
+    LEFT JOIN RecentQuestions rq ON tu.UserId = rq.OwnerUserId
+    LEFT JOIN TagAnalysis ta ON STRING_TO_ARRAY(ta.TagName, ', ') && STRING_TO_ARRAY(rq.Tags, '<>')
+    GROUP BY 
+        tu.UserId, 
+        tu.DisplayName, 
+        tu.Reputation, 
+        tu.TotalPosts, 
+        tu.QuestionCount, 
+        tu.AnswerCount, 
+        tu.TotalScore, 
+        tu.TotalViews, 
+        tu.ReputationTier, 
+        tu.ReputationDecile, 
+        tu.DaysSinceRegistration
+    HAVING 
+        COUNT(*) > 0 
+        AND tu.TotalScore IS NOT NULL
+)
+SELECT 
+    fa.UserId,
+    fa.DisplayName,
+    fa.Reputation,
+    fa.TotalPosts,
+    fa.QuestionCount,
+    fa.AnswerCount,
+    fa.TotalScore,
+    fa.TotalViews,
+    fa.ReputationTier,
+    fa.ReputationStars,
+    fa.BadgeList,
+    fa.MaxTagCount,
+    fa.MaxRecentScore,
+    fa.FirstRecentQuestion,
+    fa.UsedTags,
+    fa.HighScoreQuestions,
+    fa.QuestionsWithAnswers,
+    fa.TopTags,
+    fa.AvgTagScore,
+    fa.ProductivityCategory,
+    CASE 
+        WHEN fa.Reputation > 10000 AND fa.AnswerCount > 1000 THEN 'Veteran'
+        WHEN fa.Reputation > 1000 AND fa.AnswerCount > 100 THEN 'Experienced'
+        WHEN fa.Reputation > 100 AND fa.AnswerCount > 10 THEN 'Intermediate'
+        WHEN fa.Reputation > 10 THEN 'Beginner'
+        ELSE 'New'
+    END AS ActivityLevel,
+    IIF(fa.ReputationDecile >= 8, 'Top Performer', 'Regular User') AS PerformanceStatus,
+    CASE 
+        WHEN fa.ReputationRank <= 100 THEN 'Leaderboard Top 100'
+        WHEN fa.ReputationRank <= 1000 THEN 'Leaderboard Top 1000'
+        ELSE 'Regular Contributor'
+    END AS RankingPosition,
+    COALESCE(DATEDIFF(DAY, fa.FirstRecentQuestion, cast('2024-10-01 12:34:56' as timestamp)), 0) AS DaysSinceLastActivity,
+    NULLIF(fa.TotalViews, 0) / NULLIF(fa.TotalPosts, 0) AS AvgViewsPerPost,
+    NULLIF(fa.TotalScore, 0) / NULLIF(fa.TotalPosts, 0) AS AvgScorePerPost
+FROM FinalAnalysis fa
+WHERE fa.TotalPosts >= 1
+GROUP BY 
+    fa.UserId,
+    fa.DisplayName,
+    fa.Reputation,
+    fa.TotalPosts,
+    fa.QuestionCount,
+    fa.AnswerCount,
+    fa.TotalScore,
+    fa.TotalViews,
+    fa.ReputationTier,
+    fa.ReputationStars,
+    fa.BadgeList,
+    fa.MaxTagCount,
+    fa.MaxRecentScore,
+    fa.FirstRecentQuestion,
+    fa.UsedTags,
+    fa.HighScoreQuestions,
+    fa.QuestionsWithAnswers,
+    fa.TopTags,
+    fa.AvgTagScore,
+    fa.ProductivityCategory,
+    fa.ReputationRank
+HAVING 
+    (
+        (COUNT(DISTINCT CASE WHEN fa.ReputationTier = 'Godlike' THEN fa.UserId END) > 0)
+        OR (COUNT(DISTINCT CASE WHEN fa.ReputationTier IN ('Legendary', 'Epic') THEN fa.UserId END) > 0) 
+        OR (COUNT(DISTINCT CASE WHEN fa.ReputationTier IN ('Master', 'Expert') THEN fa.UserId END) > 0)
+        OR COUNT(DISTINCT fa.UserId) >= 10
+    )
+ORDER BY 
+    fa.Reputation DESC,
+    fa.TotalScore DESC,
+    fa.TotalPosts DESC;

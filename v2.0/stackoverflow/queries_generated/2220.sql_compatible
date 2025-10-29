@@ -1,0 +1,170 @@
+with RecursiveUserBadgeStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(distinct b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(distinct b.Id) filter (where b.Class = 3) as BronzeBadges,
+        row_number() over (order by u.Reputation desc, u.Id) as UserRank,
+        min(b.Date) filter (where b.Class = 1) as FirstGoldBadgeDate
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    group by u.Id, u.DisplayName, u.Reputation
+), PostsWithAnswerStats as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AcceptedAnswerId,
+        p.Title,
+        p.Tags,
+        (select count(*) from Posts ans where ans.ParentId = p.Id and ans.CreationDate <= p.CreationDate) as AnswersCountSoFar,
+        case 
+            when p.PostTypeId = 1 then coalesce(p.AcceptedAnswerId, -1)
+            else -1
+        end as LinkToAcceptedAnswer
+    from Posts p
+    where p.PostTypeId = 1
+), PostAnswersWithVotes as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId,
+        a.CreationDate,
+        a.Score as AnswerScore,
+        count(v.Id) filter (where v.VoteTypeId = 2) as UpVotes,
+        count(v.Id) filter (where v.VoteTypeId = 3) as DownVotes,
+        sum(v.BountyAmount) as TotalBounty
+    from Posts a
+    left join Votes v on a.Id = v.PostId
+    where a.PostTypeId = 2
+    group by a.Id, a.ParentId, a.OwnerUserId, a.CreationDate, a.Score
+), QuestionAnswerVotesRanked as (
+    select
+        aav.*,
+        row_number() over (partition by aav.QuestionId order by aav.AnswerScore desc, aav.UpVotes desc, aav.CreationDate) as AnswerRank
+    from PostAnswersWithVotes aav
+), ActiveUserQuestions as (
+    select
+        p.OwnerUserId,
+        count(distinct p.Id) as QuestionCount,
+        avg(p.Score) filter (where p.Score is not null) as AvgQuestionScore,
+        max(p.ViewCount) as MaxViews,
+        sum(case when p.AcceptedAnswerId is not null then 1 else 0 end) as AcceptRate
+    from Posts p
+    where p.PostTypeId = 1
+      and p.OwnerUserId is not null
+    group by p.OwnerUserId
+), RecursiveActivities as (
+    select 
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        ph.UserId,
+        ph.Comment
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (10,11,19,20)
+), QuestionsWithLinks as (
+    select
+        p.Id,
+        p.Title,
+        p.Tags,
+        pl.LinkTypeId,
+        pl.RelatedPostId,
+        lt.Name as LinkTypeName
+    from Posts p
+    left join PostLinks pl on p.Id = pl.PostId
+    left join LinkTypes lt on pl.LinkTypeId = lt.Id
+    where p.PostTypeId = 1
+), ComplexTagExtraction as (
+    select
+        p.Id,
+        unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags) - 2), '><')) as Tag
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+)
+select
+    ru.UserId,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.GoldBadges,
+    ru.SilverBadges,
+    ru.BronzeBadges,
+    ru.UserRank,
+    ru.FirstGoldBadgeDate,
+    a.QuestionCount,
+    a.AvgQuestionScore,
+    a.MaxViews,
+    a.AcceptRate,
+    q.Id as QuestionId,
+    q.Title,
+    q.Tags,
+    ql.LinkTypeName,
+    ql.RelatedPostId,
+    qa.AnswerId,
+    qa.AnswerScore,
+    qa.UpVotes,
+    qa.DownVotes,
+    qa.TotalBounty,
+    qa.AnswerRank,
+    cte.Tag,
+    ph.PostHistoryTypeId,
+    ph.Comment as CloseReasonOrOther,
+    ph.CreationDate as ActionDate,
+    case 
+      when qa.AnswerScore is null then 'No Answers'
+      when qa.AnswerRank = 1 then 'Top Ranked Answer'
+      else 'Other Answer'
+    end as AnswerCategory,
+    case
+      when ru.GoldBadges > 0 then 'Distinguished'
+      when ru.Reputation > 10000 then 'Expert'
+      else 'Novice'
+    end as UserCategory,
+    case 
+      when CAST(a.AcceptRate AS numeric) / nullif(CAST(a.QuestionCount AS numeric), 0) > 0.75 then 'High Acceptance'
+      else 'Low Acceptance'
+    end as AcceptanceQuality
+from RecursiveUserBadgeStats ru
+left join ActiveUserQuestions a on ru.UserId = a.OwnerUserId
+left join PostsWithAnswerStats q on q.OwnerUserId = ru.UserId and q.PostTypeId = 1
+left join QuestionAnswerVotesRanked qa on qa.QuestionId = q.Id and qa.AnswerRank <= 3
+left join QuestionsWithLinks ql on ql.Id = q.Id
+left join ComplexTagExtraction cte on cte.Id = q.Id
+left join PostHistory ph on ph.PostId = q.Id and ph.PostHistoryTypeId = 10
+where ru.UserRank <= 50
+  and (qa.AnswerScore > 5 or qa.AnswerScore is null)
+group by
+    ru.UserId,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.GoldBadges,
+    ru.SilverBadges,
+    ru.BronzeBadges,
+    ru.UserRank,
+    ru.FirstGoldBadgeDate,
+    a.QuestionCount,
+    a.AvgQuestionScore,
+    a.MaxViews,
+    a.AcceptRate,
+    q.Id,
+    q.Title,
+    q.Tags,
+    ql.LinkTypeName,
+    ql.RelatedPostId,
+    qa.AnswerId,
+    qa.AnswerScore,
+    qa.UpVotes,
+    qa.DownVotes,
+    qa.TotalBounty,
+    qa.AnswerRank,
+    cte.Tag,
+    ph.PostHistoryTypeId,
+    ph.Comment,
+    ph.CreationDate
+order by ru.UserRank, q.CreationDate desc, qa.AnswerScore desc nulls last
+limit 150;

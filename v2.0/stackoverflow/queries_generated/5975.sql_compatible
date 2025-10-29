@@ -1,0 +1,148 @@
+WITH
+FilteredPosts AS (
+  SELECT
+    p.Id,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ContentLicense,
+    p.Body,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.LastEditorUserId,
+    p.LastEditDate,
+    p.OwnerDisplayName,
+    p.LastEditorDisplayName
+  FROM Posts p
+  WHERE p.PostTypeId IN (1,2)
+),
+LastActivityPerPost AS (
+  SELECT
+    fp.Id,
+    fp.Title,
+    fp.OwnerUserId,
+    fp.PostTypeId,
+    fp.CreationDate,
+    fp.LastActivityDate,
+    fp.LastEditorDisplayName,
+    fp.Score,
+    fp.ViewCount,
+    fp.Tags,
+    fp.Body,
+    fp.ContentLicense,
+    ROW_NUMBER() OVER (PARTITION BY fp.OwnerUserId ORDER BY fp.LastActivityDate DESC) AS rn
+  FROM FilteredPosts fp
+),
+UserStats AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.ProfileImageUrl,
+    u.Location,
+    COALESCE(bg.GoldBadges, 0) AS GoldBadges,
+    COALESCE(bs.SilverBadges, 0) AS SilverBadges,
+    COALESCE(bb.BronzeBadges, 0) AS BronzeBadges,
+    COALESCE(wv.TotalViews, 0) AS TotalPostViews
+  FROM Users u
+  LEFT JOIN (
+    SELECT UserId, COUNT(*) AS GoldBadges
+    FROM Badges
+    WHERE Class = 1
+    GROUP BY UserId
+  ) bg ON bg.UserId = u.Id
+  LEFT JOIN (
+    SELECT UserId, COUNT(*) AS SilverBadges
+    FROM Badges
+    WHERE Class = 2
+    GROUP BY UserId
+  ) bs ON bs.UserId = u.Id
+  LEFT JOIN (
+    SELECT UserId, COUNT(*) AS BronzeBadges
+    FROM Badges
+    WHERE Class = 3
+    GROUP BY UserId
+  ) bb ON bb.UserId = u.Id
+  LEFT JOIN (
+    SELECT OwnerUserId, SUM(ViewCount) AS TotalViews
+    FROM Posts
+    GROUP BY OwnerUserId
+  ) wv ON wv.OwnerUserId = u.Id
+  WHERE u.Id IN (SELECT DISTINCT OwnerUserId FROM FilteredPosts WHERE OwnerUserId IS NOT NULL)
+),
+ComplexQuery AS (
+  SELECT
+    u.UserId,
+    u.DisplayName AS UserDisplayName,
+    u.Reputation,
+    lap.Title AS UserPostTitle,
+    lap.LastActivityDate,
+    lap.LastEditorDisplayName,
+    lap.Score,
+    lap.ViewCount,
+    lap.Tags,
+    lap.Body,
+    lap.ContentLicense,
+    EXISTS (
+      SELECT 1
+      FROM Votes v
+      WHERE v.UserId = u.UserId
+        AND v.PostId = lap.Id
+        AND v.VoteTypeId = 2
+        AND v.CreationDate >= lap.CreationDate
+    ) AS HasUpvotedAfterCreation,
+    CASE
+      WHEN lap.PostTypeId = 1 THEN 'Question'
+      WHEN lap.PostTypeId = 2 THEN 'Answer'
+      ELSE 'Other'
+    END AS PostKind
+  FROM UserStats u
+  JOIN LastActivityPerPost lap
+    ON lap.OwnerUserId = u.UserId
+  WHERE lap.rn = 1
+    AND lap.LastActivityDate IS NOT NULL
+),
+TemporalCTE AS (
+  SELECT
+    u.Id AS UserId,
+    COUNT(p2.Id) AS PostCountByUser,
+    MAX(p3.CreationDate) AS LastPostDate
+  FROM Users u
+  JOIN LastActivityPerPost l ON l.OwnerUserId = u.Id
+  LEFT JOIN Posts p2 ON p2.OwnerUserId = u.Id
+  LEFT JOIN Posts p3 ON p3.OwnerUserId = u.Id
+  GROUP BY u.Id
+)
+SELECT
+  cq.UserId,
+  cq.UserDisplayName,
+  cq.Reputation,
+  cq.UserPostTitle,
+  cq.LastActivityDate,
+  cq.LastEditorDisplayName,
+  cq.Score,
+  cq.ViewCount,
+  cq.Tags,
+  cq.Body,
+  cq.ContentLicense,
+  cq.HasUpvotedAfterCreation,
+  cq.PostKind,
+  t.PostCountByUser,
+  t.LastPostDate
+FROM ComplexQuery cq
+JOIN TemporalCTE t ON t.UserId = cq.UserId
+ORDER BY cq.LastActivityDate DESC
+LIMIT 100;

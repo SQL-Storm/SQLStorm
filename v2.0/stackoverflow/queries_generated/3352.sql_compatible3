@@ -1,0 +1,125 @@
+WITH q_posts AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.CreationDate,
+        p.OwnerUserId,
+        COALESCE(p.FavoriteCount, 0) AS FavCnt,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS OwnerScoreRank
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+tag_rows AS (
+    SELECT
+        qp.Id        AS PostId,
+        qp.Title,
+        qp.Score,
+        qp.CreationDate,
+        qp.OwnerUserId,
+        qp.FavCnt,
+        qp.OwnerScoreRank,
+        TRIM(BOTH '<>' FROM tag) AS Tag
+    FROM q_posts qp,
+         UNNEST(string_to_array(TRIM(BOTH '<>' FROM qp.Tags), '><')) AS tag
+),
+tag_agg AS (
+    SELECT
+        tr.Tag,
+        COUNT(*)                                   AS PostsPerTag,
+        AVG(tr.Score)                              AS AvgScore,
+        SUM(tr.FavCnt)                             AS TotalFavorites,
+        MAX(CASE WHEN tr.OwnerScoreRank = 1 THEN tr.Score ELSE NULL END) AS TopOwnerScore
+    FROM tag_rows tr
+    GROUP BY tr.Tag
+),
+user_badges AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+latest_close AS (
+    SELECT ph.PostId,
+           ph.Comment      AS CloseReason,
+           ph.CreationDate AS ClosedOn
+    FROM (
+      SELECT ph.*,
+             ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+      FROM PostHistory ph
+      WHERE ph.PostHistoryTypeId = 10
+        AND ph.Comment IS NOT NULL
+    ) ph
+    WHERE ph.rn = 1
+),
+final_set AS (
+    SELECT
+        ta.Tag,
+        ta.PostsPerTag,
+        ta.AvgScore,
+        ta.TotalFavorites,
+        ta.TopOwnerScore,
+        COALESCE(ub.GoldBadges, 0)   AS GoldBadges,
+        COALESCE(ub.SilverBadges, 0) AS SilverBadges,
+        COALESCE(ub.BronzeBadges, 0) AS BronzeBadges,
+        lc.CloseReason,
+        lc.ClosedOn
+    FROM tag_agg ta
+    LEFT JOIN LATERAL (
+        SELECT ub.*
+        FROM user_badges ub
+        WHERE ub.UserId = (
+            SELECT tr.OwnerUserId
+            FROM tag_rows tr
+            WHERE tr.Tag = ta.Tag
+            ORDER BY tr.Score DESC, tr.PostId
+            LIMIT 1
+        )
+    ) ub ON TRUE
+    LEFT JOIN latest_close lc
+        ON lc.PostId = (
+            SELECT tr.PostId
+            FROM tag_rows tr
+            WHERE tr.Tag = ta.Tag
+            ORDER BY tr.Score DESC, tr.PostId
+            LIMIT 1
+        )
+)
+
+SELECT
+    Tag,
+    PostsPerTag,
+    ROUND(AvgScore::numeric, 2)               AS AvgScore,
+    TotalFavorites,
+    TopOwnerScore,
+    GoldBadges,
+    SilverBadges,
+    BronzeBadges,
+    CASE
+        WHEN CloseReason IS NULL THEN 'Never closed'
+        ELSE CloseReason
+    END                              AS CloseReason,
+    ClosedOn
+FROM final_set
+WHERE PostsPerTag > 10
+  AND (GoldBadges IS NULL OR GoldBadges = 0)
+  AND COALESCE(CloseReason, '') <> ''
+ORDER BY AvgScore DESC
+LIMIT 100
+UNION ALL
+SELECT
+    CAST(NULL AS text) AS Tag,
+    CAST(NULL AS bigint) AS PostsPerTag,
+    CAST(NULL AS numeric) AS AvgScore,
+    CAST(NULL AS bigint) AS TotalFavorites,
+    CAST(NULL AS numeric) AS TopOwnerScore,
+    CAST(NULL AS integer) AS GoldBadges,
+    CAST(NULL AS integer) AS SilverBadges,
+    CAST(NULL AS integer) AS BronzeBadges,
+    CAST(NULL AS text) AS CloseReason,
+    CAST(NULL AS timestamp) AS ClosedOn
+WHERE FALSE;

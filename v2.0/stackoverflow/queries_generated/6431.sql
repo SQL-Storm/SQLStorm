@@ -1,0 +1,64 @@
+-- {"query": "6431.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-micro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 599} 
+
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    u.EmailHash,
+    COUNT(DISTINCT v.PostId) AS TotalVotes,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id ELSE NULL END) AS TotalQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id ELSE NULL END) AS TotalAnswers,
+    MAX(p.Score) AS HighestScoredPost,
+    MIN(p.CreationDate) AS FirstPostDate,
+    MAX(p.LastActivityDate) AS LastActiveDate,
+    MAX(CASE WHEN p.PostTypeId = 1 THEN p.AnswerCount ELSE 0 END) AS MaxAnswersPerQuestion,
+    AVG(p.ViewCount) AS AvgViewsPerPost,
+    AVG(ph.Score) AS AvgCommentScore,
+    (
+        SELECT STRING_AGG(tg.TagName, ', ')
+        FROM Tags tg
+        WHERE tg.Id = ANY (
+            SELECT Tags::TEXT::VARIANT[]
+            FROM Posts p
+            WHERE p.Tags IS NOT NULL
+            AND p.Id = ANY (
+                SELECT pl.RelatedPostId
+                FROM PostLinks pl
+                WHERE pl.PostId = p.Id
+                AND pl.LinkTypeId = 3
+            )
+        )
+    ) AS MostCommonDuplicateTags,
+    b.Name AS MostEarnedBadge,
+    b.Class AS BadgeClass,
+    b.Date AS BadgeEarnedDate
+FROM 
+    Users u
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    (
+        SELECT ph.UserId, ph.Score
+        FROM PostHistory ph
+        WHERE ph.PostHistoryTypeId = 10
+    ) ph ON u.Id = ph.UserId
+LEFT JOIN 
+    (
+        SELECT p.OwnerUserId, COUNT(v.PostId) AS VoteCount
+        FROM Posts p
+        LEFT JOIN Votes v ON p.Id = v.PostId
+        WHERE v.VoteTypeId IN (2, 3)
+        GROUP BY p.OwnerUserId
+    ) v ON u.Id = v.OwnerUserId
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+GROUP BY 
+    u.Id
+HAVING 
+    COUNT(DISTINCT v.PostId) > 100
+ORDER BY 
+    TotalPosts DESC, 
+    TotalVotes DESC;

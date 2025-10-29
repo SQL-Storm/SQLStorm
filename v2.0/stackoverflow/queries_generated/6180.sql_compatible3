@@ -1,0 +1,89 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.Title,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.OwnerUserId,
+        U.DisplayName,
+        U.Reputation,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.ViewCount DESC) AS rank,
+        P.Tags
+    FROM 
+        Posts P
+    JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId IN (1, 2) AND P.Score > 0
+),
+BadgeCounts AS (
+    SELECT 
+        U.Id AS UserId,
+        COUNT(DISTINCT B.Id) AS BadgeCount
+    FROM 
+        Users U
+    JOIN 
+        Badges B ON U.Id = B.UserId
+    GROUP BY 
+        U.Id
+)
+SELECT 
+    R.Id,
+    R.Title,
+    R.Score,
+    R.ViewCount,
+    R.CreationDate,
+    R.DisplayName,
+    R.Reputation,
+    R.rank,
+    COALESCE(B.BadgeCount, 0) AS BadgeCount,
+    CASE 
+        WHEN R.rank <= 10 THEN 'Top'
+        WHEN R.rank <= 100 THEN 'High'
+        ELSE 'Low'
+    END AS RankTier,
+    (
+        SELECT 
+            STRING_AGG(DISTINCT T.TagName, ', ')
+        FROM 
+            (
+                -- split tags like "<1><2><3>" into rows in a dialect-neutral way
+                SELECT CAST(trim(BOTH '<>' FROM parts) AS VARCHAR) AS tag
+                FROM (
+                    SELECT
+                        SUBSTRING(value FROM 1 FOR CHAR_LENGTH(value)) AS parts,
+                        ROW_NUMBER() OVER () rn
+                    FROM (
+                        -- replace >< with a delimiter and then split by that delimiter using simple JSON array trick if available,
+                        -- fallback to basic parsing using recursive CTE
+                        SELECT R.Tags AS value
+                    ) init
+                ) derived
+            ) tag_text
+        JOIN 
+            Tags T ON tag_text.tag ~ '^[0-9]+$' AND CAST(tag_text.tag AS INTEGER) = T.Id
+    ) AS Tags
+FROM 
+    RankedPosts R
+LEFT JOIN 
+    BadgeCounts B ON R.OwnerUserId = B.UserId
+WHERE 
+    EXISTS (
+        SELECT 
+            1
+        FROM 
+            Votes V
+        WHERE 
+            V.PostId = R.Id AND V.VoteTypeId = 1 AND V.UserId NOT IN (
+                SELECT 
+                    Id
+                FROM 
+                    Users
+                WHERE 
+                    EmailHash IS NULL
+                GROUP BY Id
+            )
+    )
+ORDER BY 
+    R.rank;

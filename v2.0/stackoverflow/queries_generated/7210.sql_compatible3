@@ -1,0 +1,406 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS prev_score,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS avg_score_3day,
+        NTILE(4) OVER (ORDER BY p.Score DESC) AS quartile,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags <> '' THEN 
+                (SELECT COUNT(*) FROM unnest(string_to_array(trim(both '<>' FROM p.Tags), '><')) AS tag)
+            ELSE 0 
+        END AS tag_count
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COALESCE(SUM(p.Score), 0) AS total_score,
+        COALESCE(COUNT(DISTINCT p.Id), 0) AS post_count,
+        COALESCE(COUNT(DISTINCT c.Id), 0) AS comment_count,
+        MAX(p.CreationDate) AS latest_post_date,
+        STRING_AGG(t.title_ordered, ', ') AS recent_titles,
+        COUNT(DISTINCT b.Id) AS badge_count,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Elite'
+            WHEN u.Reputation > 5000 THEN 'Veteran'
+            WHEN u.Reputation > 1000 THEN 'Regular'
+            ELSE 'Newbie'
+        END AS reputation_level
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN (
+        SELECT OwnerUserId, string_agg(Title, '|~|' ORDER BY title_ord) AS title_ordered
+        FROM (
+            SELECT OwnerUserId, Title, CreationDate,
+                   ROW_NUMBER() OVER (PARTITION BY OwnerUserId ORDER BY CreationDate DESC) AS title_ord
+            FROM Posts
+            WHERE Title IS NOT NULL
+        ) s
+        GROUP BY OwnerUserId
+    ) t ON t.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, t.title_ordered
+),
+TopQuestions AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        u.DisplayName AS owner_name,
+        p.Tags,
+        COALESCE(c.comments_ordered, '') AS comments,
+        COALESCE(SUM(v.BountyAmount), 0) AS total_bounty,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+            ELSE 'Open'
+        END AS status,
+        (CAST(COALESCE(p.ClosedDate, TIMESTAMP '2024-10-01 12:34:56') AS timestamp) - CAST(p.CreationDate AS timestamp)) AS days_open_interval,
+        ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.ViewCount DESC) AS popularity_rank
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT PostId, string_agg(Text, ' | ' ORDER BY CreationDate) AS comments_ordered
+        FROM Comments
+        GROUP BY PostId
+    ) c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId = 8
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.CreationDate, u.DisplayName, p.Tags, p.ClosedDate, p.CommunityOwnedDate, p.AcceptedAnswerId, c.comments_ordered
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        COALESCE(p.Title, 'No Title') AS excerpt_title,
+        COALESCE(p.Body, 'No Body') AS excerpt_body,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 500 THEN 'Moderately Popular'
+            WHEN t.Count > 100 THEN 'Common'
+            ELSE 'Rare'
+        END AS tag_category
+    FROM Tags t
+    LEFT JOIN Posts p ON t.ExcerptPostId = p.Id
+),
+PostActivity AS (
+    SELECT 
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.UserId,
+        ph.CreationDate,
+        ph.Comment,
+        ph.Text,
+        u.DisplayName AS editor_name,
+        CASE 
+            WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN 'Status Change'
+            WHEN ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6) THEN 'Content Edit'
+            WHEN ph.PostHistoryTypeId IN (14, 15, 19, 20) THEN 'Moderation Action'
+            ELSE 'Other'
+        END AS activity_type,
+        DENSE_RANK() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS activity_sequence
+    FROM PostHistory ph
+    LEFT JOIN Users u ON ph.UserId = u.Id
+    WHERE ph.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6' MONTH)
+)
+SELECT 
+    '=== BENCHMARK REPORT ===' AS report_title,
+    COUNT(*) AS total_posts,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1) AS question_count,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 2) AS answer_count,
+    (SELECT COUNT(*) FROM Users) AS user_count,
+    (SELECT COUNT(*) FROM Badges) AS badge_count,
+    (SELECT COUNT(*) FROM Comments) AS comment_count,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        JOIN (
+            SELECT OwnerUserId, COUNT(*) AS post_count 
+            FROM Posts 
+            WHERE PostTypeId = 1 
+            GROUP BY OwnerUserId 
+            HAVING COUNT(*) > 50
+        ) high_posters ON p.OwnerUserId = high_posters.OwnerUserId
+    ) AS high_volume_users,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.Score > 1000 
+        AND p.PostTypeId = 1
+    ) AS highly_voted_questions,
+    (
+        SELECT AVG(ViewCount) 
+        FROM Posts 
+        WHERE PostTypeId = 1
+    ) AS avg_question_views,
+    (
+        SELECT AVG(Score) 
+        FROM Posts 
+        WHERE PostTypeId = 2
+    ) AS avg_answer_score,
+    (
+        SELECT COUNT(*) 
+        FROM (
+            SELECT PostId 
+            FROM Comments 
+            GROUP BY PostId 
+            HAVING COUNT(*) > 10
+        ) prolific_comments
+    ) AS highly_commented_posts,
+    (
+        SELECT COUNT(DISTINCT ParentId) 
+        FROM Posts 
+        WHERE PostTypeId = 2 
+        AND ParentId IS NOT NULL
+    ) AS unique_answered_questions,
+    (
+        SELECT COUNT(DISTINCT p.Id) 
+        FROM Posts p 
+        JOIN Posts parent ON p.ParentId = parent.Id 
+        JOIN Users u ON parent.OwnerUserId = u.Id 
+        WHERE p.PostTypeId = 2 
+        AND u.Reputation > 1000
+    ) AS high_reputation_answers,
+    (
+        SELECT COUNT(*) 
+        FROM (
+            SELECT p.Id, COUNT(*) AS comment_count
+            FROM Posts p
+            JOIN Comments c ON p.Id = c.PostId
+            WHERE p.PostTypeId = 1
+            GROUP BY p.Id
+            HAVING COUNT(*) BETWEEN 5 AND 20
+        ) medium_commented
+    ) AS medium_commented_questions,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.Tags IS NOT NULL 
+        AND p.Tags <> ''
+        AND p.PostTypeId = 1
+    ) AS tagged_questions,
+    (
+        SELECT AVG(tag_count) 
+        FROM RankedPosts 
+        WHERE PostTypeId = 1
+    ) AS avg_tags_per_question,
+    (
+        SELECT COUNT(*) 
+        FROM (
+            SELECT OwnerUserId, AVG(Score) AS avg_score
+            FROM Posts 
+            WHERE PostTypeId = 1 
+            GROUP BY OwnerUserId
+            HAVING AVG(Score) > 50
+        ) high_scorers
+    ) AS high_scoring_question_authors,
+    (
+        SELECT COUNT(*) 
+        FROM (
+            SELECT p.Id, SUM(v.BountyAmount) AS total_score
+            FROM Posts p
+            JOIN Votes v ON p.Id = v.PostId
+            WHERE v.VoteTypeId IN (2, 3)
+            GROUP BY p.Id
+            HAVING SUM(v.BountyAmount) > 100
+        ) high_scored_posts
+    ) AS high_scoring_posts,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30' DAY)
+        AND p.PostTypeId = 1
+    ) AS recent_questions,
+    (
+        SELECT COUNT(*) 
+        FROM (
+            SELECT PostId, COUNT(*) AS edit_count
+            FROM PostHistory 
+            WHERE PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)
+            GROUP BY PostId
+            HAVING COUNT(*) > 10
+        ) heavily_edited
+    ) AS heavily_edited_posts,
+    (
+        SELECT AVG(CommentCount) 
+        FROM TopQuestions
+    ) AS avg_comments_per_question,
+    (
+        SELECT COUNT(*) 
+        FROM PostLinks 
+        WHERE LinkTypeId = 3
+    ) AS duplicate_links,
+    (
+        SELECT COUNT(*) 
+        FROM (
+            SELECT ph.PostId, COUNT(*) AS activity_count
+            FROM PostActivity ph
+            WHERE ph.activity_sequence <= 3
+            GROUP BY ph.PostId
+            HAVING COUNT(*) >= 2
+        ) active_posts
+    ) AS rapidly_active_posts,
+    (
+        SELECT COUNT(*) 
+        FROM (
+            SELECT TagName
+            FROM Tags
+            WHERE Count > 100
+            GROUP BY TagName
+            HAVING COUNT(*) > 1
+        ) popular_tags
+    ) AS multi_use_popular_tags,
+    (
+        SELECT SUM(total_score) 
+        FROM UserStats
+    ) AS total_user_score,
+    (
+        SELECT AVG(post_count) 
+        FROM UserStats
+    ) AS average_posts_per_user,
+    (
+        SELECT MAX(total_score) 
+        FROM UserStats
+    ) AS max_user_score,
+    (
+        SELECT COUNT(*) 
+        FROM (
+            SELECT UserId, COUNT(*) AS badge_count
+            FROM Badges
+            GROUP BY UserId
+            HAVING COUNT(*) > 50
+        ) badge_hoarders
+    ) AS badge_hoarders,
+    (
+        SELECT COUNT(*) 
+        FROM (
+            SELECT PostId
+            FROM PostHistory
+            WHERE PostHistoryTypeId = 10
+            GROUP BY PostId
+            HAVING COUNT(*) >= 1
+        ) closed_posts
+    ) AS closed_posts_count,
+    (
+        SELECT COUNT(*) 
+        FROM (
+            SELECT PostId, COUNT(DISTINCT Comment) AS close_reason_count
+            FROM PostHistory
+            WHERE PostHistoryTypeId = 10
+            GROUP BY PostId
+            HAVING COUNT(DISTINCT Comment) >= 2
+        ) disputed_closures
+    ) AS disputed_closures_count,
+    (
+        SELECT COUNT(*) 
+        FROM (
+            SELECT PostId, COUNT(DISTINCT Text) AS edit_count
+            FROM PostHistory
+            WHERE PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)
+            GROUP BY PostId
+            HAVING COUNT(DISTINCT Text) > 5
+        ) multiple_edits
+    ) AS multiple_edits_count,
+    (
+        SELECT COUNT(*) 
+        FROM (
+            SELECT u.Id
+            FROM Users u
+            JOIN Posts p ON u.Id = p.OwnerUserId
+            WHERE p.PostTypeId = 1
+            GROUP BY u.Id
+            HAVING COUNT(p.Id) >= 100
+        ) prolific_questioners
+    ) AS prolific_questioners_count,
+    (
+        SELECT COUNT(*) 
+        FROM (
+            SELECT u.Id
+            FROM Users u
+            JOIN Posts p ON u.Id = p.OwnerUserId
+            WHERE p.PostTypeId = 2
+            GROUP BY u.Id
+            HAVING COUNT(p.Id) >= 1000
+        ) prolific_answerers
+    ) AS prolific_answerers_count,
+    (
+        SELECT MIN(reputation) 
+        FROM UserStats
+    ) AS min_reputation,
+    (
+        SELECT MAX(reputation) 
+        FROM UserStats
+    ) AS max_reputation,
+    (
+        SELECT AVG(Reputation) 
+        FROM Users
+    ) AS avg_reputation,
+    (
+        SELECT COUNT(*) 
+        FROM (
+            SELECT p.Id, COUNT(c.Id) AS comment_count
+            FROM Posts p
+            JOIN Comments c ON p.Id = c.PostId
+            WHERE p.PostTypeId = 1
+            GROUP BY p.Id
+            HAVING COUNT(c.Id) BETWEEN 0 AND 2
+        ) sparsely_commented
+    ) AS sparsely_commented_questions,
+    (
+        SELECT COUNT(*) 
+        FROM (
+            SELECT u.Id
+            FROM Users u
+            WHERE u.Reputation BETWEEN 100 AND 999
+        ) regular_users
+    ) AS regular_users_count,
+    (
+        SELECT COUNT(*) 
+        FROM (
+            SELECT u.Id
+            FROM Users u
+            WHERE u.Reputation BETWEEN 1000 AND 9999
+        ) veteran_users
+    ) AS veteran_users_count,
+    (
+        SELECT COUNT(*) 
+        FROM (
+            SELECT u.Id
+            FROM Users u
+            WHERE u.Reputation >= 10000
+        ) elite_users
+    ) AS elite_users_count,
+    (
+        SELECT COUNT(*) 
+        FROM (
+            SELECT p.Id
+            FROM Posts p
+            WHERE p.Tags IS NULL OR p.Tags = ''
+        ) untagged_questions
+    ) AS untagged_questions_count
+FROM Posts;

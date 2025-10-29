@@ -1,0 +1,148 @@
+WITH 
+UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.UpVotes,0) - COALESCE(u.DownVotes,0) AS NetVotes,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadges
+    FROM Users u
+),
+TopPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.FavoriteCount,
+        p.OwnerUserId,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS RankInType
+    FROM Posts p
+    WHERE p.PostTypeId IN (1,2)
+),
+PostVotesAgg AS (
+    SELECT 
+        p.Id,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    GROUP BY p.Id
+),
+TagMetrics AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagUseCount,
+        COALESCE(LENGTH(e.Body),0) AS ExcerptLength,
+        COALESCE(LENGTH(w.Body),0) AS WikiLength
+    FROM Tags t
+    LEFT JOIN Posts e ON e.Id = t.ExcerptPostId
+    LEFT JOIN Posts w ON w.Id = t.WikiPostId
+),
+Combined AS (
+    SELECT
+        us.Id                       AS UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.NetVotes,
+        us.RepRank,
+        us.GoldBadges,
+        us.SilverBadges,
+        us.BronzeBadges,
+        tp.Id                       AS PostId,
+        tp.Title,
+        tp.PostTypeId,
+        tp.Score,
+        tp.ViewCount,
+        COALESCE(tp.FavoriteCount,0) AS Favorites,
+        tp.RankInType,
+        COALESCE(pv.UpVotes,0)      AS PostUpVotes,
+        COALESCE(pv.DownVotes,0)    AS PostDownVotes,
+        CASE 
+            WHEN tp.PostTypeId = 1 THEN 
+                (
+                 SELECT STRING_AGG(tg.tag, ',' ORDER BY tg.tag) FROM (
+                   SELECT TRIM(tag) AS tag
+                   FROM (
+                     -- split tags like "<tag1><tag2>" into rows
+                     SELECT SUBSTRING(tagstr FROM s.pos FOR COALESCE(NULLIF(s.next_pos,0)-s.pos, LENGTH(tagstr)-s.pos+1)) AS tag
+                     FROM (
+                       SELECT tp.Tags AS tagstr FROM Posts tp2 WHERE tp2.Id = tp.Id
+                     ) t0,
+                     LATERAL (
+                       SELECT pos, 
+                              (SELECT MIN(pos2) FROM (
+                                 SELECT (POSITION('><' IN SUBSTRING(t0.tagstr FROM pos+1)) + pos) AS pos2
+                                 FROM (VALUES(1)) v
+                               ) x WHERE pos2 > pos) AS next_pos
+                       FROM (
+                         SELECT 2 AS pos UNION ALL
+                         SELECT 2 + ( (n-1) * 1000 ) FROM (VALUES(1),(2),(3),(4),(5),(6),(7),(8),(9),(10)) nums(n)
+                       ) s
+                       WHERE pos <= LENGTH(t0.tagstr)
+                     ) s
+                   ) split_tags
+                   WHERE tag <> ''
+                 ) tg
+                )
+            ELSE NULL
+        END                        AS TagList,
+        COALESCE(tm.TagUseCount,0)  AS TagUseCount
+    FROM UserStats us
+    LEFT JOIN TopPosts tp       ON tp.OwnerUserId = us.Id AND tp.RankInType = 1
+    LEFT JOIN PostVotesAgg pv   ON pv.Id = tp.Id
+    LEFT JOIN TagMetrics tm     ON tp.Tags IS NOT NULL AND tm.TagName IN (
+        -- simple portable split to check presence; handles tags like "<tag1><tag2>"
+        SELECT TRIM(tag) FROM (
+          SELECT SUBSTRING(tagstr FROM s.pos FOR COALESCE(NULLIF(s.next_pos,0)-s.pos, LENGTH(tagstr)-s.pos+1)) AS tag
+          FROM (
+            SELECT tp.Tags AS tagstr
+          ) t0,
+          LATERAL (
+            SELECT pos, 
+                   (SELECT MIN(pos2) FROM (
+                      SELECT (POSITION('><' IN SUBSTRING(t0.tagstr FROM pos+1)) + pos) AS pos2
+                      FROM (VALUES(1)) v
+                    ) x WHERE pos2 > pos) AS next_pos
+            FROM (
+              SELECT 2 AS pos UNION ALL
+              SELECT 2 + ( (n-1) * 1000 ) FROM (VALUES(1),(2),(3),(4),(5),(6),(7),(8),(9),(10)) nums(n)
+            ) s
+            WHERE pos <= LENGTH(t0.tagstr)
+          ) s
+        ) split_tags
+        WHERE tag <> ''
+    )
+)
+SELECT
+    UserId,
+    DisplayName,
+    Reputation,
+    NetVotes,
+    RepRank,
+    GoldBadges,
+    SilverBadges,
+    BronzeBadges,
+    PostId,
+    Title,
+    PostTypeId,
+    Score,
+    ViewCount,
+    Favorites,
+    RankInType,
+    PostUpVotes,
+    PostDownVotes,
+    TagList,
+    TagUseCount
+FROM Combined
+WHERE (Reputation > 10000 OR GoldBadges > 0)
+  AND Score IS NOT NULL AND Score > 0
+  AND (TagUseCount > 0 OR TagList IS NOT NULL)
+ORDER BY RepRank ASC, Score DESC
+FETCH FIRST 100 ROWS ONLY;

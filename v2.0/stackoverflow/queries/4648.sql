@@ -1,0 +1,191 @@
+WITH
+  RankedPostEdits AS (
+    SELECT
+      ph.PostId,
+      ph.UserId,
+      ph.CreationDate,
+      ph.PostHistoryTypeId,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate) AS rn_user_post,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS rn_post_total,
+      LAG(ph.CreationDate, 1, ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS prev_edit_date,
+      LEAD(ph.CreationDate, 1, ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS next_edit_date
+    FROM
+      PostHistory ph
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9)
+  ),
+  PostEditIntervals AS (
+    SELECT
+      PostId,
+      UserId,
+      CreationDate,
+      PostHistoryTypeId,
+      rn_user_post,
+      rn_post_total,
+      (EXTRACT(EPOCH FROM (CreationDate - prev_edit_date)) / 60.0) AS minutes_since_prev_edit,
+      (EXTRACT(EPOCH FROM (next_edit_date - CreationDate)) / 60.0) AS minutes_until_next_edit,
+      CASE
+        WHEN rn_user_post = 1 THEN 'First Edit by User'
+        WHEN rn_user_post > 1 AND MOD(rn_user_post, 2) = 0 THEN 'Second Edit by User'
+        WHEN rn_user_post > 1 AND MOD(rn_user_post, 2) = 1 THEN 'Odd Edit by User'
+        ELSE 'Other Edit by User'
+      END AS edit_sequence_type
+    FROM
+      RankedPostEdits
+  ),
+  UserPostInteraction AS (
+    SELECT
+      p.Id AS PostId,
+      p.OwnerUserId,
+      p.CreationDate AS PostCreationDate,
+      COUNT(DISTINCT c.Id) AS CommentCountOnPost,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+      SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoriteCount
+    FROM
+      Posts p
+      LEFT JOIN Comments c ON p.Id = c.PostId
+      LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE
+      p.PostTypeId = 1
+    GROUP BY
+      p.Id,
+      p.OwnerUserId,
+      p.CreationDate
+  ),
+  UserEditsAggregated AS (
+    /* Aggregate edits per post and user without correlating to outer query */
+    SELECT
+      pe.PostId,
+      pe.UserId,
+      COUNT(pe.PostHistoryTypeId) AS TotalEdits,
+      AVG(pe.minutes_since_prev_edit) AS AvgMinutesBetweenEdits,
+      MAX(CASE WHEN pe.edit_sequence_type = 'First Edit by User' THEN 'Yes' ELSE 'No' END) AS FirstEditBySequence,
+      MAX(CASE WHEN pe.edit_sequence_type = 'Second Edit by User' THEN 'Yes' ELSE 'No' END) AS SecondEditBySequence
+    FROM
+      PostEditIntervals pe
+    GROUP BY
+      pe.PostId,
+      pe.UserId
+  )
+SELECT
+  p.Id AS QuestionId,
+  u.DisplayName AS OwnerDisplayName,
+  p.Title AS QuestionTitle,
+  p.Score AS QuestionScore,
+  p.ViewCount AS QuestionViewCount,
+  p.AnswerCount AS QuestionAnswerCount,
+  p.CommentCount AS QuestionCommentCount,
+  p.FavoriteCount AS QuestionFavoriteCount,
+  p.CommunityOwnedDate,
+  u.Reputation AS OwnerReputation,
+  COALESCE(u.Views, 0) AS OwnerViews,
+  COALESCE(u.UpVotes, 0) AS OwnerUpVotes,
+  COALESCE(u.DownVotes, 0) AS OwnerDownVotes,
+  ue.TotalEdits AS UserTotalEditsOnQuestion,
+  ue.AvgMinutesBetweenEdits AS UserAvgMinutesBetweenEdits,
+  ue.FirstEditBySequence AS UserFirstEditSequence,
+  ue.SecondEditBySequence AS UserSecondEditBySequence,
+  upi.CommentCountOnPost,
+  upi.UpVoteCount AS PostUpVotes,
+  upi.DownVoteCount AS PostDownVotes,
+  upi.FavoriteCount AS PostFavorites,
+  CASE
+    WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+    WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+    WHEN p.LastActivityDate > p.CreationDate + INTERVAL '30 days' THEN 'Active Long Term'
+    ELSE 'Recently Active'
+  END AS PostStatusCategory,
+  CASE
+    WHEN EXISTS (
+      SELECT 1
+      FROM PostLinks pl
+      WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3
+    ) THEN 'Has Duplicate Link'
+    ELSE 'No Duplicate Link'
+  END AS DuplicateLinkStatus,
+  p.CreationDate AS QuestionCreationDate,
+  p.LastActivityDate AS QuestionLastActivityDate,
+  COALESCE(p.ClosedDate, TIMESTAMP '1900-01-01') AS EffectiveClosedDate
+FROM
+  Posts p
+JOIN
+  Users u ON p.OwnerUserId = u.Id
+LEFT JOIN
+  UserEditsAggregated ue ON p.Id = ue.PostId AND p.OwnerUserId = ue.UserId
+LEFT JOIN
+  UserPostInteraction upi ON p.Id = upi.PostId
+WHERE
+  p.PostTypeId = 1
+  AND p.Score > 50
+  AND u.Reputation > 10000
+  AND p.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '365 days')
+UNION
+SELECT
+  p.Id AS QuestionId,
+  u.DisplayName AS OwnerDisplayName,
+  p.Title AS QuestionTitle,
+  p.Score AS QuestionScore,
+  p.ViewCount AS QuestionViewCount,
+  p.AnswerCount AS QuestionAnswerCount,
+  p.CommentCount AS QuestionCommentCount,
+  p.FavoriteCount AS QuestionFavoriteCount,
+  p.CommunityOwnedDate,
+  u.Reputation AS OwnerReputation,
+  COALESCE(u.Views, 0) AS OwnerViews,
+  COALESCE(u.UpVotes, 0) AS OwnerUpVotes,
+  COALESCE(u.DownVotes, 0) AS OwnerDownVotes,
+  NULL AS UserTotalEditsOnQuestion,
+  NULL AS UserAvgMinutesBetweenEdits,
+  NULL AS UserFirstEditBySequence,
+  NULL AS UserSecondEditBySequence,
+  (
+    SELECT COUNT(*)
+    FROM Comments c_ans
+    WHERE c_ans.PostId = p.Id
+  ) AS CommentCountOnPost,
+  (
+    SELECT SUM(CASE WHEN v_ans.VoteTypeId = 2 THEN 1 ELSE 0 END)
+    FROM Votes v_ans
+    WHERE v_ans.PostId = p.Id
+  ) AS PostUpVotes,
+  (
+    SELECT SUM(CASE WHEN v_ans.VoteTypeId = 3 THEN 1 ELSE 0 END)
+    FROM Votes v_ans
+    WHERE v_ans.PostId = p.Id
+  ) AS PostDownVotes,
+  (
+    SELECT SUM(CASE WHEN v_ans.VoteTypeId = 5 THEN 1 ELSE 0 END)
+    FROM Votes v_ans
+    WHERE v_ans.PostId = p.Id
+  ) AS PostFavorites,
+  CASE
+    WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+    WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+    WHEN p.LastActivityDate > p.CreationDate + INTERVAL '30 days' THEN 'Active Long Term'
+    ELSE 'Recently Active'
+  END AS PostStatusCategory,
+  CASE
+    WHEN EXISTS (
+      SELECT 1
+      FROM PostLinks pl_ans
+      WHERE pl_ans.PostId = p.Id AND pl_ans.LinkTypeId = 3
+    ) THEN 'Has Duplicate Link'
+    ELSE 'No Duplicate Link'
+  END AS DuplicateLinkStatus,
+  p.CreationDate AS QuestionCreationDate,
+  p.LastActivityDate AS QuestionLastActivityDate,
+  COALESCE(p.ClosedDate, TIMESTAMP '1900-01-01') AS EffectiveClosedDate
+FROM
+  Posts p
+JOIN
+  Users u ON p.OwnerUserId = u.Id
+WHERE
+  p.PostTypeId = 2
+  AND p.Score > 10
+  AND p.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '365 days')
+ORDER BY
+  EffectiveClosedDate,
+  QuestionScore DESC,
+  QuestionViewCount DESC
+LIMIT 100;

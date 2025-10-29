@@ -1,0 +1,164 @@
+with RecursiveTagHierarchy as (
+    select t.Id, t.TagName, t.ExcerptPostId, t.WikiPostId, 0 as Level
+    from Tags t
+    where (t.IsModeratorOnly = false OR t.IsModeratorOnly = 0::boolean) is not distinct from true OR (t.IsModeratorOnly = false)
+      and (t.IsRequired = false OR t.IsRequired = 0::boolean) is not distinct from true OR (t.IsRequired = false)
+),
+QuestionStats as (
+    select 
+        p.Id as QuestionId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.Tags,
+        u.DisplayName as OwnerName,
+        u.Reputation as OwnerReputation,
+        (select count(*) from Comments c where c.PostId = p.Id and (c.UserId is null or c.UserId <> p.OwnerUserId)) as ExternalCommentCount,
+        (select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 2) as UpVotes,
+        (select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 3) as DownVotes,
+        case 
+            when p.ClosedDate is not null then 1 
+            else 0 
+        end as IsClosed,
+        (select string_agg(distinct coalesce(u2.DisplayName, ph.UserDisplayName), ', ' order by coalesce(u2.DisplayName, ph.UserDisplayName))
+         from PostHistory ph
+         left join Users u2 on ph.UserId = u2.Id
+         where ph.PostId = p.Id and ph.PostHistoryTypeId in (4,5,6) and ph.UserId is not null and ph.UserId <> p.OwnerUserId
+         limit 5) as RecentEditors
+    from Posts p
+    join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId = 1
+),
+AnswerDetails as (
+    select 
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreationDate,
+        a.OwnerUserId as AnswerOwnerId,
+        u.DisplayName as AnswerOwnerName,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts a
+    left join Users u on u.Id = a.OwnerUserId
+    where a.PostTypeId = 2
+),
+TopAnswers as (
+    select * from AnswerDetails where AnswerRank <= 3
+),
+SelectedQuestionTags as (
+    select qt.QuestionId, string_to_array(substring(qs.Tags, 2, length(qs.Tags) - 2), '><') as TagsArray
+    from QuestionStats qs
+    join (select distinct ParentId as QuestionId from Posts where PostTypeId = 2) qt on qt.QuestionId = qs.QuestionId
+),
+ComplexVoteStats as (
+    select
+        q.Id as QuestionId,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as TotalUpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as TotalDownVotes,
+        sum(case when v.VoteTypeId = 8 then coalesce(v.BountyAmount,0) else 0 end) as TotalBountyStarted,
+        sum(case when v.VoteTypeId = 9 then coalesce(v.BountyAmount,0) else 0 end) as TotalBountyClosed,
+        count(distinct v.UserId) filter (where v.UserId is not null) as DistinctVoters,
+        count(*) as TotalVotes
+    from Posts q
+    left join Votes v on q.Id = v.PostId
+    where q.PostTypeId = 1
+    group by q.Id
+),
+UserBadgeAggregates as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        bool_or(coalesce(b.TagBased, false)) as HasTagBasedBadge
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    group by u.Id, u.DisplayName
+),
+ClosedReasonStats as (
+    select
+        pht.PostId,
+        crt.Name as CloseReasonName,
+        count(*) as CloseCount
+    from PostHistory pht
+    join CloseReasonTypes crt on crt.Id = cast(pht.Comment as smallint)
+    where pht.PostHistoryTypeId = 10
+    group by pht.PostId, crt.Name
+),
+QuestionWithCloseReason as (
+    select 
+        qs.QuestionId,
+        qs.Title,
+        qs.CreationDate,
+        qs.Score,
+        qs.ViewCount,
+        qs.AnswerCount,
+        qs.Tags,
+        qs.OwnerName,
+        qs.OwnerReputation,
+        qs.ExternalCommentCount,
+        qs.UpVotes,
+        qs.DownVotes,
+        qs.IsClosed,
+        qs.RecentEditors,
+        crs.CloseReasonName, crs.CloseCount
+    from QuestionStats qs
+    left join ClosedReasonStats crs on qs.QuestionId = crs.PostId
+),
+FinalResults as (
+    select 
+        q.QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.OwnerName,
+        q.OwnerReputation,
+        q.ExternalCommentCount,
+        q.UpVotes,
+        q.DownVotes,
+        q.IsClosed,
+        coalesce(q.RecentEditors, 'None') as RecentEditors,
+        av.AnswerId,
+        av.AnswerOwnerName,
+        av.AnswerScore,
+        av.AnswerRank,
+        uv.GoldBadges,
+        uv.SilverBadges,
+        uv.BronzeBadges,
+        uv.HasTagBasedBadge,
+        cv.TotalUpVotes,
+        cv.TotalDownVotes,
+        cv.TotalBountyStarted,
+        cv.TotalBountyClosed,
+        cv.DistinctVoters,
+        cv.TotalVotes,
+        cr.CloseReasonName,
+        cr.CloseCount,
+        qt.TagsArray,
+        (select string_agg(distinct coalesce(a2.AnswerOwnerName,'<deleted>') || ' (' || a2.AnswerScore || ')', ', ' order by a2.AnswerScore desc)
+         from AnswerDetails a2 where a2.QuestionId = q.QuestionId and a2.AnswerRank <= 3) as TopAnswerers,
+        q.Tags as OriginalTags,
+        q.OwnerName as OwnerDisplayName,
+        q.OwnerReputation as OwnerRep
+    from QuestionWithCloseReason q
+    left join TopAnswers av on q.QuestionId = av.QuestionId
+    left join UserBadgeAggregates uv on uv.UserId = (select OwnerUserId from Posts p where p.Id = q.QuestionId)
+    left join ComplexVoteStats cv on cv.QuestionId = q.QuestionId
+    left join ClosedReasonStats cr on cr.PostId = q.QuestionId
+    left join SelectedQuestionTags qt on qt.QuestionId = q.QuestionId
+)
+select *
+from FinalResults
+where Score > 5
+  and (
+        (IsClosed = 0 OR IsClosed = false)
+        OR ((IsClosed = 1 OR IsClosed = true) AND (CloseCount > 2))
+      )
+  and OwnerReputation > 1000
+order by Score desc, ViewCount desc
+limit 100;

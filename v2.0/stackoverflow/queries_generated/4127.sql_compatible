@@ -1,0 +1,150 @@
+WITH
+  RankedPostEdits AS (
+    SELECT
+      ph.PostId,
+      ph.UserId,
+      ph.CreationDate,
+      ph.PostHistoryTypeId,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6)
+  ),
+  PostEditCounts AS (
+    SELECT
+      ph.UserId,
+      COUNT(DISTINCT ph.PostId) AS TotalEdits,
+      SUM(CASE WHEN ph.PostHistoryTypeId = 4 THEN 1 ELSE 0 END) AS TitleEdits,
+      SUM(CASE WHEN ph.PostHistoryTypeId = 5 THEN 1 ELSE 0 END) AS BodyEdits,
+      SUM(CASE WHEN ph.PostHistoryTypeId = 6 THEN 1 ELSE 0 END) AS TagEdits,
+      MAX(ph.CreationDate) AS LatestEditDate
+    FROM PostHistory ph
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6)
+    GROUP BY
+      ph.UserId
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate AS UserCreationDate,
+      COUNT(DISTINCT p.Id) AS TotalPosts,
+      SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+      COUNT(DISTINCT b.Id) AS BadgeCount,
+      MAX(u.LastAccessDate) AS LastAccessDate
+    FROM Users u
+    LEFT JOIN Posts p
+      ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b
+      ON u.Id = b.UserId
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate,
+      u.LastAccessDate
+  ),
+  RecentQuestions AS (
+    SELECT
+      p.Id AS PostId,
+      p.OwnerUserId,
+      p.Title,
+      p.CreationDate,
+      p.Score,
+      p.AnswerCount,
+      p.Tags,
+      ROW_NUMBER() OVER (ORDER BY p.CreationDate DESC) AS QuestionRank
+    FROM Posts p
+    WHERE
+      p.PostTypeId = 1
+      AND p.CreationDate > (cast('2024-10-01' as date) - INTERVAL '30 day')
+  ),
+  HighRatedAnswers AS (
+    SELECT
+      p.Id AS AnswerId,
+      p.ParentId AS QuestionId,
+      p.OwnerUserId,
+      p.Score,
+      p.CreationDate,
+      ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS AnswerRank
+    FROM Posts p
+    WHERE
+      p.PostTypeId = 2 AND p.Score > 5
+  )
+SELECT
+  ua.UserId,
+  ua.DisplayName,
+  ua.Reputation,
+  ua.UserCreationDate,
+  ua.TotalPosts,
+  ua.QuestionCount,
+  ua.AnswerCount,
+  ua.BadgeCount,
+  ua.LastAccessDate,
+  COALESCE(pec.TotalEdits, 0) AS TotalEdits,
+  COALESCE(pec.TitleEdits, 0) AS TotalTitleEdits,
+  COALESCE(pec.BodyEdits, 0) AS TotalBodyEdits,
+  COALESCE(pec.TagEdits, 0) AS TotalTagEdits,
+  pec.LatestEditDate,
+  rq.Title AS LatestQuestionTitle,
+  rq.Score AS LatestQuestionScore,
+  rq.AnswerCount AS LatestQuestionAnswerCount,
+  rq.Tags AS LatestQuestionTags,
+  rq.QuestionRank,
+  ha.AnswerId AS TopAnswerForLatestQuestion,
+  ha.Score AS TopAnswerScore,
+  ha.AnswerRank
+FROM UserActivity ua
+LEFT JOIN PostEditCounts pec
+  ON ua.UserId = pec.UserId
+LEFT JOIN (
+  SELECT
+    *
+  FROM RankedPostEdits
+  WHERE
+    rn = 1
+) latest_edit
+  ON ua.UserId = latest_edit.UserId
+LEFT JOIN RecentQuestions rq
+  ON ua.UserId = rq.OwnerUserId AND rq.QuestionRank <= 5
+LEFT JOIN HighRatedAnswers ha
+  ON rq.PostId = ha.QuestionId AND ha.AnswerRank = 1
+WHERE
+  ua.Reputation > 1000
+  AND ua.TotalPosts > 10
+  AND (
+    COALESCE(pec.TotalEdits, 0) > 0 OR rq.PostId IS NOT NULL
+  )
+  AND ua.DisplayName NOT LIKE '%[^a-zA-Z0-9 ]%'
+  AND LENGTH(ua.DisplayName) > 3
+  AND ua.LastAccessDate > (cast('2024-10-01' as date) - INTERVAL '1 year')
+GROUP BY
+  ua.UserId,
+  ua.DisplayName,
+  ua.Reputation,
+  ua.UserCreationDate,
+  ua.TotalPosts,
+  ua.QuestionCount,
+  ua.AnswerCount,
+  ua.BadgeCount,
+  ua.LastAccessDate,
+  pec.TotalEdits,
+  pec.TitleEdits,
+  pec.BodyEdits,
+  pec.TagEdits,
+  pec.LatestEditDate,
+  rq.Title,
+  rq.Score,
+  rq.AnswerCount,
+  rq.Tags,
+  rq.QuestionRank,
+  ha.AnswerId,
+  ha.Score,
+  ha.AnswerRank
+ORDER BY
+  ua.Reputation DESC,
+  ua.LastAccessDate DESC
+LIMIT 100;

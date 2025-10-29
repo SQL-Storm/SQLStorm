@@ -1,0 +1,89 @@
+WITH UserStats AS (
+    SELECT
+        u.Id                                   AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVotesReceived,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownVotesReceived,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1)           AS QuestionCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2)           AS AnswerCount,
+        MAX(p.CreationDate) FILTER (WHERE p.PostTypeId = 1)           AS RecentQuestionDate,
+        MAX(
+            CASE 
+                WHEN p.PostTypeId = 1 AND p.CreationDate = (
+                    SELECT MAX(p2.CreationDate)
+                    FROM Posts p2
+                    WHERE p2.OwnerUserId = u.Id AND p2.PostTypeId = 1
+                ) THEN p.Title
+                ELSE NULL
+            END
+        )                                                               AS RecentQuestionTitle,
+        COALESCE(t.DistinctTagCount, 0)                                   AS DistinctTagCount
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN (
+        SELECT
+            psub.OwnerUserId,
+            COUNT(DISTINCT tag) AS DistinctTagCount
+        FROM Posts psub,
+        LATERAL (
+            SELECT unnest(regexp_split_to_array(COALESCE(psub.Tags, ''), '><')) AS tag
+        ) s
+        WHERE psub.PostTypeId = 1
+        GROUP BY psub.OwnerUserId
+    ) t ON t.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, t.DistinctTagCount
+),
+GoldBadgeUsers AS (
+    SELECT DISTINCT b.UserId
+    FROM Badges b
+    WHERE b.Class = 1
+),
+UserActivity AS (
+    SELECT
+        us.*,
+        (us.UpVotesReceived - us.DownVotesReceived) * 0.6
+        + us.QuestionCount * 0.3
+        + us.AnswerCount * 0.1
+        + us.DistinctTagCount * 0.05                         AS ActivityScore
+    FROM UserStats us
+    WHERE us.UserId IN (SELECT UserId FROM GoldBadgeUsers)
+)
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.UpVotesReceived,
+    ua.DownVotesReceived,
+    ua.DistinctTagCount,
+    ua.RecentQuestionTitle,
+    ROUND(ua.ActivityScore, 2)                               AS ActivityScore,
+    CASE
+        WHEN ua.RecentQuestionDate IS NULL                 THEN 'No questions'
+        WHEN ua.RecentQuestionDate >= (CAST('2024-10-01' AS date) - INTERVAL '30 days') THEN 'Active recently'
+        ELSE 'Inactive'
+    END                                                      AS RecentActivityFlag
+FROM UserActivity ua
+WHERE ua.ActivityScore > (
+    SELECT PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY ActivityScore)
+    FROM UserActivity
+)
+UNION ALL
+SELECT
+    NULL      AS UserId,
+    '---'     AS DisplayName,
+    NULL      AS Reputation,
+    NULL      AS QuestionCount,
+    NULL      AS AnswerCount,
+    NULL      AS UpVotesReceived,
+    NULL      AS DownVotesReceived,
+    NULL      AS DistinctTagCount,
+    NULL      AS RecentQuestionTitle,
+    NULL      AS ActivityScore,
+    '---'     AS RecentActivityFlag
+WHERE FALSE
+ORDER BY ActivityScore DESC
+LIMIT 50;

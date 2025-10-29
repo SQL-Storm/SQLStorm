@@ -1,0 +1,157 @@
+-- {"query": "2822.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1367} 
+WITH RankedBadges AS (
+    SELECT
+        b.UserId,
+        b.Name AS BadgeName,
+        b.Class,
+        b.Date,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC, b.Class) AS Rnk
+    FROM Badges b
+    WHERE b.TagBased = 0
+),
+UserPostStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId IN (1,2) AND p.Score IS NOT NULL) AS AvgPostScore,
+        MAX(p.ViewCount) FILTER (WHERE p.PostTypeId = 1) AS MaxQuestionViewCount,
+        COUNT(DISTINCT c.Id) AS CommentCount
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId IN (1, 2)
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+CTE_QuestionsWithDupes AS (
+    SELECT
+        q.Id,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.Tags,
+        q.OwnerUserId,
+        q.AcceptedAnswerId,
+        dup.RelatedPostId AS DuplicateOfQuestionId
+    FROM Posts q
+    LEFT JOIN PostLinks dup ON dup.PostId = q.Id AND dup.LinkTypeId = 3
+    WHERE q.PostTypeId = 1
+),
+CTE_DuplicationCounts AS (
+    SELECT
+        RelatedPostId AS OriginalQuestionId,
+        COUNT(1) AS NumberOfDuplicates
+    FROM PostLinks
+    WHERE LinkTypeId = 3
+    GROUP BY RelatedPostId
+),
+LatestPostHistoryClose AS (
+    SELECT ph.PostId, ph.Comment, ph.CreationDate,
+           ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10 -- Post Closed
+),
+UserActivityWindow AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        COUNT(*) OVER (PARTITION BY u.Id ORDER BY p.CreationDate ROWS BETWEEN 30 PRECEDING AND CURRENT ROW) AS PostsLast30Days,
+        AVG(p.Score) OVER (PARTITION BY u.Id ORDER BY p.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS RunningAvgScore
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+),
+TopUsersWithBadges AS (
+    SELECT
+        ups.UserId,
+        ups.DisplayName,
+        ups.QuestionCount,
+        ups.AnswerCount,
+        ups.TotalPostScore,
+        ups.AvgPostScore,
+        ups.MaxQuestionViewCount,
+        ups.CommentCount,
+        rb.BadgeName AS LatestBadge,
+        rb.Class AS LatestBadgeClass,
+        COALESCE(dq.NumberOfDuplicates, 0) AS NumberOfDuplicates
+    FROM UserPostStats ups
+    LEFT JOIN RankedBadges rb ON rb.UserId = ups.UserId AND rb.Rnk = 1
+    LEFT JOIN CTE_DuplicationCounts dq ON dq.OriginalQuestionId = (
+        SELECT p.Id FROM Posts p
+        WHERE p.OwnerUserId = ups.UserId AND p.PostTypeId = 1
+        ORDER BY p.ViewCount DESC NULLS LAST LIMIT 1
+    )
+    WHERE ups.TotalPostScore > 1000
+)
+SELECT
+    u.DisplayName,
+    u.QuestionCount,
+    u.AnswerCount,
+    u.TotalPostScore,
+    u.AvgPostScore,
+    u.MaxQuestionViewCount,
+    u.CommentCount,
+    u.LatestBadge,
+    CASE u.LatestBadgeClass
+        WHEN 1 THEN 'Gold'
+        WHEN 2 THEN 'Silver'
+        WHEN 3 THEN 'Bronze'
+        ELSE 'Unknown'
+    END AS LatestBadgeClassName,
+    u.NumberOfDuplicates,
+    q.Title AS MostViewedQuestionTitle,
+    q.Score AS MostViewedQuestionScore,
+    q.ViewCount AS MostViewedQuestionViewCount,
+    COALESCE(ph.CloseReasonName, 'Not Closed') AS LastCloseReason,
+    CASE 
+        WHEN LENGTH(COALESCE(q.Tags, '')) > 0 THEN array_to_string(ARRAY(
+            SELECT DISTINCT UNNEST(string_to_array(
+                regexp_replace(q.Tags, '[<>]', '', 'g'), ' ')
+            ) ORDER BY 1
+        ), ', ')
+        ELSE 'No Tags'
+    END AS ParsedTags,
+    CASE 
+        WHEN u.AvgPostScore IS NULL THEN 'No score data'
+        ELSE
+            CASE 
+                WHEN u.AvgPostScore >= 10 THEN 'Excellent'
+                WHEN u.AvgPostScore >= 5 THEN 'Good'
+                ELSE 'Moderate'
+            END
+    END AS PerformanceCategory,
+    CONCAT(
+        LEFT(u.DisplayName, 3),
+        '-',
+        COALESCE(u.NumberOfDuplicates, 0)::text,
+        '-',
+        COALESCE(u.QuestionCount, 0)::text,
+        '-',
+        COALESCE(u.AnswerCount, 0)::text
+    ) AS UserCode
+FROM TopUsersWithBadges u
+LEFT JOIN (
+    SELECT q.Id, q.Title, q.Score, q.ViewCount, q.Tags
+    FROM Posts q
+    WHERE q.PostTypeId = 1
+) q ON q.Id = (
+    SELECT p.Id FROM Posts p
+    WHERE p.OwnerUserId = (
+        SELECT Id FROM Users WHERE DisplayName = u.DisplayName LIMIT 1
+    )
+      AND p.PostTypeId = 1
+    ORDER BY p.ViewCount DESC NULLS LAST
+    LIMIT 1
+)
+LEFT JOIN (
+    SELECT lpc.PostId, crt.Name AS CloseReasonName
+    FROM LatestPostHistoryClose lpc
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(lpc.Comment AS int)
+    WHERE lpc.rn = 1
+) ph ON ph.PostId = q.Id
+ORDER BY u.TotalPostScore DESC NULLS LAST
+LIMIT 25;

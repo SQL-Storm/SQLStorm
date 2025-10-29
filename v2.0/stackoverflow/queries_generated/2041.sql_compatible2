@@ -1,0 +1,169 @@
+with RecursiveTagCounts as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        coalesce(p.AnswerCount, 0) as TotalAnswers,
+        coalesce(p.ViewCount, 0) as QuestionViews,
+        1 as Level
+    from Tags t
+    left join Posts p on p.Id = t.ExcerptPostId and p.PostTypeId = 1
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+
+    union all
+
+    select
+        rt.Id,
+        rt.TagName,
+        rt.Count,
+        rt.TotalAnswers + coalesce(p.AnswerCount, 0) as TotalAnswers,
+        rt.QuestionViews + coalesce(p.ViewCount, 0) as QuestionViews,
+        rt.Level + 1 as Level
+    from RecursiveTagCounts rt
+    join Posts p on p.Tags like '%' || '<' || rt.TagName || '>' || '%'
+    where rt.Level < 2
+),
+UserActivityRank as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct ph.Id) as EditCount,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotesReceived,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotesReceived,
+        max(b.Date) as LastBadgeDate,
+        row_number() over (order by u.Reputation desc, count(distinct ph.Id) desc) as Rank
+    from Users u
+    left join PostHistory ph on ph.UserId = u.Id and ph.PostHistoryTypeId in (4,5,6)
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Votes v on v.PostId = p.Id and v.VoteTypeId in (2,3)
+    left join Badges b on b.UserId = u.Id and b.Class = 1
+    group by u.Id, u.DisplayName, u.Reputation
+),
+QualifiedPosts as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.AcceptedAnswerId,
+        u.DisplayName as OwnerDisplayName,
+        p.Title,
+        p.ClosedDate
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId in (1,2) and p.Score > 0 and p.ViewCount > 100
+),
+AnswerRanks as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId,
+        a.Score,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts a
+    where a.PostTypeId = 2
+),
+BestAnswers as (
+    select
+        ar.AnswerId,
+        ar.QuestionId,
+        ar.OwnerUserId,
+        ar.Score,
+        ar.AnswerRank
+    from AnswerRanks ar
+    where ar.AnswerRank = 1
+),
+PostCommentsSummary as (
+    select
+        c.PostId,
+        count(*) as CommentCount,
+        max(case when c.UserId is null then 1 else 0 end) as HasAnonymousComment,
+        string_agg(distinct coalesce(c.UserDisplayName, 'Anonymous'), ', ' order by coalesce(c.UserDisplayName, 'Anonymous')) as Commenters
+    from Comments c
+    group by c.PostId
+),
+MainSelect as (
+    select
+        q.Id as QuestionId,
+        q.Title as QuestionTitle,
+        q.CreationDate as QuestionDate,
+        coalesce(u.DisplayName, 'Unknown') as QuestionOwner,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViews,
+        b.AnswerId as BestAnswerId,
+        ba.DisplayName as BestAnswerOwner,
+        ba.Score as BestAnswerScore,
+        pas.CommentCount,
+        pas.HasAnonymousComment,
+        pas.Commenters,
+        uar.EditCount as UserEdits,
+        uar.UpVotesReceived,
+        uar.DownVotesReceived,
+        uar.LastBadgeDate,
+        rtc.Level as TagRecursionLevel,
+        rtc.TagName,
+        rtc.Count as TagUsageCount,
+        rtc.TotalAnswers as TagAnswerSum,
+        rtc.QuestionViews as TagViewSum,
+        case
+            when q.ClosedDate is not null then 'Closed'
+            when q.AcceptedAnswerId is not null then 'Answered'
+            else 'Open'
+        end as QuestionStatus,
+        case
+            when length(coalesce(q.Tags, '')) > 0 then
+                substring(q.Tags from 2 for length(q.Tags) - 2)
+            else 'No Tags'
+        end as CleanTags,
+        uar.Rank as UserRank
+    from QualifiedPosts q
+    left join BestAnswers b on b.QuestionId = q.Id
+    left join Users ba on ba.Id = b.OwnerUserId
+    left join PostCommentsSummary pas on pas.PostId = q.Id
+    left join UserActivityRank uar on uar.UserId = q.OwnerUserId
+    left join Users u on u.Id = q.OwnerUserId
+    left join RecursiveTagCounts rtc on rtc.TagName = (
+        select split_part(sub_tags, '><', 1) from (
+            select substring(q.Tags from 2 for length(q.Tags) - 2) as sub_tags
+        ) s
+    )
+    where uar.Rank <= 100
+)
+select *
+from MainSelect
+order by UserRank, QuestionScore desc
+
+union all
+
+select
+    p.Id as QuestionId,
+    coalesce(p.Title, '') || ' / ' || coalesce(pt.Name,'') as QuestionTitle,
+    p.CreationDate,
+    coalesce(u.DisplayName,'Unknown') as QuestionOwner,
+    p.Score,
+    p.ViewCount,
+    null::bigint as BestAnswerId,
+    null as BestAnswerOwner,
+    null::integer as BestAnswerScore,
+    0 as CommentCount,
+    0 as HasAnonymousComment,
+    ''::text as Commenters,
+    0 as UserEdits,
+    0 as UpVotesReceived,
+    null::timestamp as LastBadgeDate,
+    0 as TagRecursionLevel,
+    ''::text as TagName,
+    NULL::integer as TagUsageCount,
+    'Historic' as QuestionStatus,
+    ''::text as CleanTags,
+    NULL::integer as UserRank
+from Posts p
+left join PostTypes pt on pt.Id = p.PostTypeId
+left join Users u on u.Id = p.OwnerUserId
+where p.CreationDate < (cast('2024-10-01' as date) - interval '10 years')
+order by QuestionId desc
+limit 50;

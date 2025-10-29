@@ -1,0 +1,332 @@
+with recent_users as (
+  select u.id as user_id,
+         u.displayname,
+         u.reputation,
+         u.creationdate,
+         u.location,
+         coalesce(nullif(trim(u.websiteurl), ''), 'unknown') as websiteurl_norm,
+         date_trunc('month', u.creationdate) as signup_month,
+         row_number() over (order by u.reputation desc, u.id) as rn_global
+  from users u
+  where u.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+),
+user_activity as (
+  select
+    p.owneruserid as user_id,
+    count(*) filter (where p.posttypeid = 1) as q_count,
+    count(*) filter (where p.posttypeid = 2) as a_count,
+    count(distinct date_trunc('month', p.creationdate)) as active_months,
+    sum(coalesce(p.score, 0)) as total_score,
+    sum(coalesce(p.viewcount, 0)) as total_views,
+    avg(nullif(p.commentcount, 0)) as avg_comments_nonzero,
+    max(p.creationdate) as last_post_date,
+    count(*) filter (where p.closeddate is not null) as closed_posts
+  from posts p
+  where p.owneruserid is not null
+    and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+  group by p.owneruserid
+),
+user_votes as (
+  select
+    v.userid as user_id,
+    count(*) filter (where v.votetypeid = 2) as upvotes_cast,
+    count(*) filter (where v.votetypeid = 3) as downvotes_cast,
+    count(*) filter (where v.votetypeid = 8) as bounties_started,
+    sum(coalesce(v.bountyamount,0)) filter (where v.votetypeid in (8,9)) as bounty_total
+  from votes v
+  where v.userid is not null
+    and v.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+  group by v.userid
+),
+user_badges as (
+  select
+    b.userid as user_id,
+    count(*) as badge_count,
+    count(*) filter (where b.class = 1) as gold_badges,
+    count(*) filter (where b.class = 2) as silver_badges,
+    count(*) filter (where b.class = 3) as bronze_badges,
+    count(*) filter (where b.tagbased = true) as tag_badges
+  from badges b
+  where b.date >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+  group by b.userid
+),
+question_metrics as (
+  select
+    p.owneruserid as user_id,
+    count(*) as questions_total,
+    count(*) filter (where p.acceptedanswerid is not null) as questions_accepted,
+    percentile_cont(0.5) within group (order by coalesce(p.viewcount,0)) as q_views_p50,
+    percentile_cont(0.9) within group (order by coalesce(p.viewcount,0)) as q_views_p90
+  from posts p
+  where p.posttypeid = 1
+    and p.owneruserid is not null
+    and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+  group by p.owneruserid
+),
+answer_metrics as (
+  select
+    p.owneruserid as user_id,
+    count(*) as answers_total,
+    sum(case when exists (
+      select 1
+      from posts q
+      where q.id = p.parentid
+        and q.acceptedanswerid = p.id
+    ) then 1 else 0 end) as answers_accepted,
+    avg(coalesce(p.score,0)) as avg_answer_score
+  from posts p
+  where p.posttypeid = 2
+    and p.owneruserid is not null
+    and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+  group by p.owneruserid
+),
+edits_and_closures as (
+  select
+    ph.userid as user_id,
+    count(*) filter (where ph.posthistorytypeid in (4,5,6,7,8,9,24)) as edits_made,
+    count(*) filter (where ph.posthistorytypeid in (10,35)) as closes_or_migrate,
+    count(*) filter (where ph.posthistorytypeid in (11)) as reopens
+  from posthistory ph
+  where ph.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+    and ph.userid is not null
+  group by ph.userid
+),
+tag_expertise as (
+  select
+    p.owneruserid as user_id,
+    lower(regexp_replace(t.tag, '[^a-z0-9#+\-\.]', '', 'g')) as tag_norm,
+    count(*) as posts_in_tag
+  from posts p
+  cross join lateral (
+    select unnest(string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')) as tag
+  ) t
+  where p.posttypeid = 1
+    and p.tags is not null
+    and p.owneruserid is not null
+    and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+  group by p.owneruserid, lower(regexp_replace(t.tag, '[^a-z0-9#+\-\.]', '', 'g'))
+),
+top_tag_per_user as (
+  select user_id, tag_norm, posts_in_tag,
+         row_number() over (partition by user_id order by posts_in_tag desc, tag_norm) as rn
+  from tag_expertise
+),
+dupe_network as (
+  select
+    pl.postid,
+    pl.relatedpostid,
+    pl.linktypeid,
+    case when pl.linktypeid = 3 then 1 else 0 end as is_duplicate
+  from postlinks pl
+  where pl.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+),
+user_dupe_stats as (
+  select
+    p.owneruserid as user_id,
+    count(distinct pl.postid) filter (where pl.is_duplicate = 1) as dupes_flagged_on_questions,
+    count(distinct pl.relatedpostid) filter (where pl.is_duplicate = 1) as dupes_as_targets
+  from posts p
+  left join dupe_network pl
+    on (p.id = pl.postid or p.id = pl.relatedpostid)
+  where p.owneruserid is not null
+    and p.posttypeid = 1
+  group by p.owneruserid
+),
+recent_commenters as (
+  select c.userid as user_id,
+         count(*) as comments_made,
+         max(c.creationdate) as last_comment_date
+  from comments c
+  where c.userid is not null
+    and c.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+  group by c.userid
+),
+user_rankings as (
+  select
+    ru.user_id,
+    ru.displayname,
+    ru.reputation,
+    ru.signup_month,
+    ua.q_count,
+    ua.a_count,
+    coalesce(ua.total_score,0) + 0.1 * coalesce(ua.total_views,0) as activity_power,
+    dense_rank() over (order by coalesce(ua.total_score,0) + 0.1 * coalesce(ua.total_views,0) desc) as rank_activity_power,
+    dense_rank() over (order by ru.reputation desc) as rank_reputation
+  from recent_users ru
+  left join user_activity ua on ua.user_id = ru.user_id
+),
+baseline as (
+  select
+    ur.user_id,
+    ur.displayname,
+    ur.reputation,
+    ur.rank_reputation,
+    ur.rank_activity_power,
+    coalesce(ua.active_months,0) as active_months,
+    coalesce(ua.total_views,0) as total_views,
+    coalesce(ua.total_score,0) as total_score,
+    coalesce(ua.closed_posts,0) as closed_posts,
+    coalesce(uv.upvotes_cast,0) as upvotes_cast,
+    coalesce(uv.downvotes_cast,0) as downvotes_cast,
+    coalesce(uv.bounties_started,0) as bounties_started,
+    coalesce(uv.bounty_total,0) as bounty_total,
+    coalesce(ub.badge_count,0) as badge_count,
+    coalesce(ub.gold_badges,0) as gold_badges,
+    coalesce(ub.silver_badges,0) as silver_badges,
+    coalesce(ub.bronze_badges,0) as bronze_badges,
+    coalesce(ub.tag_badges,0) as tag_badges,
+    coalesce(qm.questions_total,0) as questions_total,
+    coalesce(qm.questions_accepted,0) as questions_accepted,
+    coalesce(qm.q_views_p50,0) as q_views_p50,
+    coalesce(qm.q_views_p90,0) as q_views_p90,
+    coalesce(am.answers_total,0) as answers_total,
+    coalesce(am.answers_accepted,0) as answers_accepted,
+    coalesce(am.avg_answer_score,0) as avg_answer_score,
+    coalesce(ea.edits_made,0) as edits_made,
+    coalesce(ea.closes_or_migrate,0) as closes_or_migrate,
+    coalesce(ea.reopens,0) as reopens,
+    coalesce(ud.dupes_flagged_on_questions,0) as dupes_flagged_on_questions,
+    coalesce(ud.dupes_as_targets,0) as dupes_as_targets,
+    coalesce(rc.comments_made,0) as comments_made
+  from user_rankings ur
+  left join user_activity ua on ua.user_id = ur.user_id
+  left join user_votes uv on uv.user_id = ur.user_id
+  left join user_badges ub on ub.user_id = ur.user_id
+  left join question_metrics qm on qm.user_id = ur.user_id
+  left join answer_metrics am on am.user_id = ur.user_id
+  left join edits_and_closures ea on ea.user_id = ur.user_id
+  left join user_dupe_stats ud on ud.user_id = ur.user_id
+  left join recent_commenters rc on rc.user_id = ur.user_id
+),
+derived as (
+  select
+    b.*,
+    case
+      when (b.questions_total + b.answers_total) = 0 then null
+      else round(100.0 * b.answers_accepted / nullif(b.answers_total,0), 2)
+    end as answer_accept_rate_pct,
+    case
+      when b.questions_total = 0 then null
+      else round(100.0 * b.questions_accepted / nullif(b.questions_total,0), 2)
+    end as question_accept_rate_pct,
+    case
+      when b.badge_count = 0 then 0
+      when b.gold_badges >= 1 then 3
+      when b.silver_badges >= 2 then 2
+      else 1
+    end as badge_tier,
+    greatest(1, coalesce(b.active_months,1)) as active_months_gte1,
+    coalesce(b.total_score,0) - coalesce(b.downvotes_cast,0) as net_score_minus_downvotes,
+    coalesce(b.total_views,0) / greatest(1, coalesce(b.questions_total,1)) as avg_views_per_question,
+    case when b.comments_made > 0 and b.edits_made > 0 then 1 else 0 end as is_engaged_commenter_editor
+  from baseline b
+),
+scoreboard as (
+  select
+    d.user_id,
+    d.displayname,
+    d.reputation,
+    d.rank_reputation,
+    d.rank_activity_power,
+    d.questions_total,
+    d.answers_total,
+    d.answers_accepted,
+    d.answer_accept_rate_pct,
+    d.question_accept_rate_pct,
+    d.badge_tier,
+    d.avg_views_per_question,
+    d.net_score_minus_downvotes,
+    d.comments_made,
+    d.edits_made,
+    coalesce(tt.tag_norm, '(no tag)') as top_tag,
+    coalesce(tt.posts_in_tag, 0) as top_tag_posts,
+    row_number() over (
+      order by
+        coalesce(d.net_score_minus_downvotes,0) desc,
+        d.reputation desc,
+        d.answers_total desc,
+        d.questions_total desc
+    ) as rn_perf
+  from derived d
+  left join top_tag_per_user tt
+    on tt.user_id = d.user_id and tt.rn = 1
+),
+site_medians as (
+  select
+    -1 as user_id,
+    '<<MEDIANS>>' as displayname,
+    percentile_disc(0.5) within group (order by reputation) as reputation,
+    cast(null as bigint) as rank_reputation,
+    cast(null as bigint) as rank_activity_power,
+    percentile_disc(0.5) within group (order by questions_total) as questions_total,
+    percentile_disc(0.5) within group (order by answers_total) as answers_total,
+    percentile_disc(0.5) within group (order by answers_accepted) as answers_accepted,
+    percentile_disc(0.5) within group (order by coalesce(answer_accept_rate_pct,0)) as answer_accept_rate_pct,
+    percentile_disc(0.5) within group (order by coalesce(question_accept_rate_pct,0)) as question_accept_rate_pct,
+    percentile_disc(0.5) within group (order by badge_tier) as badge_tier,
+    percentile_disc(0.5) within group (order by avg_views_per_question) as avg_views_per_question,
+    percentile_disc(0.5) within group (order by net_score_minus_downvotes) as net_score_minus_downvotes,
+    percentile_disc(0.5) within group (order by comments_made) as comments_made,
+    percentile_disc(0.5) within group (order by edits_made) as edits_made,
+    '(median)' as top_tag,
+    0 as top_tag_posts,
+    0 as rn_perf
+  from scoreboard
+),
+final as (
+  select * from scoreboard
+  union all
+  select * from site_medians
+)
+select
+  f.user_id,
+  f.displayname,
+  f.reputation,
+  f.rank_reputation,
+  f.rank_activity_power,
+  f.questions_total,
+  f.answers_total,
+  f.answers_accepted,
+  f.answer_accept_rate_pct,
+  f.question_accept_rate_pct,
+  f.badge_tier,
+  f.avg_views_per_question,
+  f.net_score_minus_downvotes,
+  f.comments_made,
+  f.edits_made,
+  f.top_tag,
+  f.top_tag_posts,
+  f.rn_perf,
+  (
+    select p.title
+    from posts p
+    where p.owneruserid = f.user_id
+      and p.posttypeid = 1
+    order by p.creationdate desc, p.id desc
+    limit 1
+  ) as latest_question_title,
+  case
+    when f.user_id = -1 then 'site medians'
+    else trim(coalesce(f.displayname, 'user-' || cast(f.user_id as text))) ||
+         ' | top tag: ' || coalesce(f.top_tag, '(none)') ||
+         ' (' || coalesce(cast(f.top_tag_posts as text), '0') || ')'
+  end as summary
+from final f
+where
+  (
+    f.user_id = -1
+    or (
+      coalesce(f.answers_total,0) + coalesce(f.questions_total,0) >= 5
+      and (
+        coalesce(f.answer_accept_rate_pct, 0) >= 25
+        or (coalesce(f.badge_tier,0) >= 2 and coalesce(f.net_score_minus_downvotes,0) > 0)
+      )
+      and not (f.top_tag ilike '%regex%' and coalesce(f.avg_views_per_question,0) < 10)
+    )
+  )
+order by
+  case when f.user_id = -1 then 1 else 0 end,
+  f.rn_perf nulls last,
+  f.reputation desc,
+  f.user_id
+limit 200;

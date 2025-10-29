@@ -1,0 +1,233 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.LastActivityDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) as score_rank,
+        NTILE(100) OVER (ORDER BY p.Score) as score_quartile
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) 
+      AND p.CreationDate >= DATE '2010-01-01'
+),
+UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        AVG(p.Score) as AvgScore,
+        MAX(p.CreationDate) as LastPostDate,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Elite'
+            WHEN u.Reputation > 1000 THEN 'Veteran' 
+            WHEN u.Reputation > 100 THEN 'Regular'
+            ELSE 'Newbie'
+        END as RepLevel,
+        (
+          SELECT STRING_AGG(tag, ', ') FROM (
+            SELECT DISTINCT TRIM(tag) as tag
+            FROM (
+              SELECT UNNEST(
+                CASE 
+                  WHEN us_posts.Tags IS NOT NULL AND us_posts.Tags LIKE '<%>' THEN
+                    SUBSTRING(us_posts.Tags FROM 2 FOR CHAR_LENGTH(us_posts.Tags) - 2)
+                  WHEN us_posts.Tags IS NOT NULL THEN us_posts.Tags
+                  ELSE NULL
+                END
+              ) -- produce array-like value for UNNEST; assumes source is array/text that UNNEST accepts
+            ) s(tag)
+            WHERE tag IS NOT NULL AND us_posts.OwnerUserId = u.Id
+          ) distinct_tags
+        ) as TagFocus
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Posts us_posts ON us_posts.OwnerUserId = u.Id
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes
+),
+PostAnalysis AS (
+    SELECT 
+        rp.Id as PostId,
+        rp.Title,
+        rp.Score,
+        rp.ViewCount,
+        rp.AnswerCount,
+        rp.CommentCount,
+        rp.FavoriteCount,
+        rp.OwnerUserId,
+        rp.rn,
+        rp.prev_score,
+        rp.score_rank,
+        rp.score_quartile,
+        CASE 
+            WHEN rp.Score > 100 THEN 'High Impact'
+            WHEN rp.Score > 50 THEN 'Medium Impact'
+            WHEN rp.Score > 10 THEN 'Low Impact'
+            ELSE 'Minimal Impact'
+        END as ImpactLevel,
+        CAST(rp.LastActivityDate AS DATE) - CAST(rp.CreationDate AS DATE) as DaysActive,
+        CASE 
+            WHEN rp.AcceptedAnswerId IS NOT NULL THEN 'Answered' 
+            ELSE 'Unanswered'
+        END as Status,
+        COALESCE(rp.Tags, '') as Tags,
+        CASE 
+            WHEN rp.Tags IS NOT NULL AND rp.Tags LIKE '%<%' THEN 
+                (
+                  SELECT COUNT(*) FROM (
+                    SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(rp.Tags FROM 2 FOR CHAR_LENGTH(rp.Tags) - 2), '><')) as tag
+                  ) t
+                )
+            ELSE 0 
+        END as TagCount
+    FROM RankedPosts rp
+),
+TopPosts AS (
+    SELECT 
+        pa.PostId,
+        pa.Title,
+        pa.Score,
+        pa.ViewCount,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.FavoriteCount,
+        pa.OwnerUserId,
+        pa.ImpactLevel,
+        pa.DaysActive,
+        pa.Status,
+        pa.Tags,
+        pa.TagCount,
+        ROW_NUMBER() OVER (PARTITION BY pa.OwnerUserId ORDER BY pa.Score DESC) as user_rank
+    FROM PostAnalysis pa
+    WHERE pa.Score > 0
+),
+FilteredPosts AS (
+    SELECT t1.*, 
+           t2.RepLevel,
+           t2.PostCount,
+           t2.AvgScore,
+           t2.LastPostDate
+    FROM TopPosts t1
+    INNER JOIN UserStats t2 ON t1.OwnerUserId = t2.UserId
+    WHERE t2.RepLevel IN ('Elite', 'Veteran') 
+      AND t1.DaysActive > 30
+      AND t1.TagCount > 1
+),
+FinalAnalysis AS (
+    SELECT 
+        fp.PostId,
+        fp.Title,
+        fp.Score,
+        fp.ViewCount,
+        fp.AnswerCount,
+        fp.CommentCount,
+        fp.FavoriteCount,
+        fp.OwnerUserId,
+        fp.ImpactLevel,
+        fp.DaysActive,
+        fp.Status,
+        fp.Tags,
+        fp.TagCount,
+        fp.RepLevel,
+        fp.PostCount,
+        fp.AvgScore,
+        fp.LastPostDate,
+        CASE 
+            WHEN fp.RepLevel = 'Elite' AND fp.Score > 500 THEN 'Top Performer'
+            WHEN fp.RepLevel = 'Veteran' AND fp.Score > 200 THEN 'High Performer'
+            WHEN fp.Score > 100 THEN 'Moderate Performer'
+            ELSE 'Standard Performer'
+        END as PerformanceCategory,
+        LAG(fp.Score, 1) OVER (ORDER BY fp.Score DESC) - fp.Score as ScoreDifference,
+        ROW_NUMBER() OVER (ORDER BY fp.Score DESC) as overall_rank
+    FROM FilteredPosts fp
+)
+SELECT 
+    fa.PostId,
+    fa.Title,
+    fa.Score,
+    fa.ViewCount,
+    fa.AnswerCount,
+    fa.CommentCount,
+    fa.FavoriteCount,
+    fa.OwnerUserId,
+    fa.ImpactLevel,
+    fa.DaysActive,
+    fa.Status,
+    fa.Tags,
+    fa.TagCount,
+    fa.RepLevel,
+    fa.PostCount,
+    fa.AvgScore,
+    fa.LastPostDate,
+    fa.PerformanceCategory,
+    fa.ScoreDifference,
+    fa.overall_rank,
+    CASE 
+        WHEN fa.ScoreDifference < 0 THEN 'Decreased'
+        WHEN fa.ScoreDifference > 0 THEN 'Increased'
+        ELSE 'Stable'
+    END as Trend,
+    COALESCE(fa.Title, 'No Title') as SafeTitle,
+    CASE 
+        WHEN fa.Score < 0 THEN 'Negative Score'
+        WHEN fa.Score BETWEEN 0 AND 10 THEN 'Low Score'
+        WHEN fa.Score BETWEEN 11 AND 100 THEN 'Medium Score'
+        WHEN fa.Score BETWEEN 101 AND 1000 THEN 'High Score'
+        ELSE 'Very High Score'
+    END as ScoreCategory,
+    CONCAT('User: ', fa.OwnerUserId, ' - Title: ', SUBSTRING(fa.Title FROM 1 FOR 50), '...') as Summary,
+    CASE 
+        WHEN fa.Status = 'Answered' AND fa.AnswerCount > 0 THEN 'Has Answers'
+        WHEN fa.Status = 'Unanswered' THEN 'No Answers'
+        ELSE 'Other Status'
+    END as AnswerStatus,
+    CASE 
+        WHEN fa.TagCount = 0 THEN 'No Tags'
+        WHEN fa.TagCount BETWEEN 1 AND 2 THEN 'Few Tags'
+        WHEN fa.TagCount BETWEEN 3 AND 5 THEN 'Medium Tags'
+        ELSE 'Many Tags'
+    END as TagDensity,
+    CASE 
+        WHEN fa.DaysActive > 365 THEN 'Long Active'
+        WHEN fa.DaysActive BETWEEN 180 AND 365 THEN 'Medium Active'
+        WHEN fa.DaysActive BETWEEN 30 AND 180 THEN 'Short Active'
+        ELSE 'Recently Active'
+    END as ActivityLevel,
+    ROUND(CAST(fa.AvgScore AS numeric), 2) as RoundedAvgScore,
+    ABS(fa.Score) as AbsoluteScore,
+    CASE 
+        WHEN fa.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'Above Average'
+        WHEN fa.Score < (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'Below Average'
+        ELSE 'Average'
+    END as AvgComparison,
+    (SELECT COUNT(*) 
+     FROM Posts p2 
+     WHERE p2.OwnerUserId = fa.OwnerUserId 
+       AND p2.CreationDate >= (fa.LastPostDate - INTERVAL '1 year')) as PostsYearToDate
+FROM FinalAnalysis fa
+WHERE fa.Score IS NOT NULL
+  AND fa.Title IS NOT NULL
+  AND fa.OwnerUserId IS NOT NULL
+  AND fa.TagCount IS NOT NULL
+  AND (fa.PostCount > 0 OR fa.TagCount > 0)
+ORDER BY fa.Score DESC, fa.overall_rank ASC
+LIMIT 1500;

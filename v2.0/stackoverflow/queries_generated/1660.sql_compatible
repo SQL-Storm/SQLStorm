@@ -1,0 +1,229 @@
+WITH UserEngagementSummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Location,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS UserUpvotesGiven,
+        U.DownVotes AS UserDownvotesGiven,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestionsOwned,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswersOwned,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT B.Id) AS TotalBadgesEarned,
+        SUM(P.Score) AS TotalPostScoreOwned,
+        MAX(P.CreationDate) AS LastPostCreationDate,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesReceivedOnPosts,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesReceivedOnPosts
+    FROM
+        Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    LEFT JOIN Badges AS B ON U.Id = B.UserId
+    LEFT JOIN Votes AS V ON P.Id = V.PostId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Location,
+        U.Views, U.UpVotes, U.DownVotes
+),
+PostContentMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        P.PostTypeId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.FavoriteCount,
+        P.ClosedDate,
+        P.CommunityOwnedDate,
+        COALESCE(P.Title, '') AS PostTitle,
+        COALESCE(P.Tags, '') AS RawTags,
+        LENGTH(P.Body) AS BodyCharCount,
+        (LENGTH(P.Body) - LENGTH(REPLACE(P.Body, '<code>', ''))) / 6 AS EstimatedCodeBlocks,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS PostUpvotes,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS PostDownvotes,
+        MAX(CASE WHEN V.VoteTypeId = 1 THEN 1 ELSE 0 END) AS HasAcceptedAnswer,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS MajorEditCount,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.CreationDate ELSE NULL END) AS ClosedTimestamp,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 11 THEN PH.CreationDate ELSE NULL END) AS ReopenedTimestamp,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 12 THEN PH.CreationDate ELSE NULL END) AS DeletedTimestamp,
+        MIN(CASE WHEN PH.PostHistoryTypeId = 2 THEN PH.CreationDate ELSE NULL END) AS InitialBodyDate
+    FROM
+        Posts AS P
+    LEFT JOIN Votes AS V ON P.Id = V.PostId
+    LEFT JOIN PostHistory AS PH ON P.Id = PH.PostId
+    WHERE
+        P.PostTypeId IN (1, 2)
+        AND P.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 year')
+    GROUP BY
+        P.Id, P.OwnerUserId, P.PostTypeId, P.CreationDate, P.Score, P.ViewCount, P.AnswerCount, P.FavoriteCount,
+        P.ClosedDate, P.CommunityOwnedDate, P.Title, P.Tags, P.Body
+),
+TagPerformanceSummary AS (
+    SELECT
+        PCM.OwnerUserId AS UserId,
+        TRIM(tag) AS TagName,
+        COUNT(DISTINCT PCM.PostId) AS PostsInTag,
+        SUM(PCM.PostScore) AS TotalScoreInTag,
+        SUM(PCM.ViewCount) AS TotalViewsInTag,
+        AVG(PCM.PostScore) AS AvgScoreInTag
+    FROM
+        PostContentMetrics AS PCM,
+        LATERAL (
+            SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(PCM.RawTags, 2, LENGTH(PCM.RawTags) - 2), '><')) AS tag
+        ) AS tags
+    WHERE
+        PCM.RawTags IS NOT NULL AND LENGTH(TRIM(PCM.RawTags)) > 2
+    GROUP BY
+        PCM.OwnerUserId, TRIM(tag)
+    HAVING
+        COUNT(DISTINCT PCM.PostId) > 2
+),
+UserPostPerformanceRank AS (
+    SELECT
+        PCM.OwnerUserId AS UserId,
+        PCM.PostId,
+        PCM.PostScore,
+        PCM.PostCreationDate,
+        ROW_NUMBER() OVER (PARTITION BY PCM.OwnerUserId ORDER BY PCM.PostScore DESC, PCM.PostCreationDate DESC) AS rn_post_by_score,
+        NTILE(10) OVER (PARTITION BY PCM.PostTypeId ORDER BY PCM.PostScore DESC) AS PostScoreDecileByPostType,
+        AVG(PCM.PostScore) OVER (PARTITION BY PCM.OwnerUserId ORDER BY PCM.PostCreationDate ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS MovingAvgScoreLast3Posts,
+        LAG(PCM.PostScore, 1, 0) OVER (PARTITION BY PCM.OwnerUserId ORDER BY PCM.PostCreationDate) AS PreviousPostScore
+    FROM
+        PostContentMetrics AS PCM
+    WHERE
+        PCM.OwnerUserId IS NOT NULL
+),
+ComplexHistoryPosts AS (
+    SELECT DISTINCT
+        PH_Close.PostId
+    FROM
+        PostHistory AS PH_Close
+    INNER JOIN
+        PostHistory AS PH_Reopen ON PH_Close.PostId = PH_Reopen.PostId
+                                  AND PH_Reopen.PostHistoryTypeId = 11
+                                  AND PH_Reopen.CreationDate > PH_Close.CreationDate
+    WHERE
+        PH_Close.PostHistoryTypeId = 10
+),
+AggregatedUserPostMetrics AS (
+    SELECT
+        PCM.OwnerUserId AS UserId,
+        MAX(PCM.HasAcceptedAnswer) AS HasQuestionWithAcceptedAnswer,
+        SUM(CASE WHEN PCM.BodyCharCount > 1000 AND PCM.EstimatedCodeBlocks > 2 THEN 1 ELSE 0 END) AS PostsWithLongBodyAndCode,
+        AVG(UPPR.MovingAvgScoreLast3Posts) AS AvgMovingScoreRecentPosts,
+        MAX(CASE WHEN UPPR.rn_post_by_score = 1 THEN UPPR.PostScore ELSE NULL END) AS BestPostScore,
+        MIN(UPPR.PreviousPostScore) AS LowestPreviousPostScore
+    FROM
+        PostContentMetrics AS PCM
+    INNER JOIN
+        UserPostPerformanceRank AS UPPR ON PCM.PostId = UPPR.PostId AND PCM.OwnerUserId = UPPR.UserId
+    GROUP BY PCM.OwnerUserId
+)
+SELECT
+    UES.UserId,
+    UES.DisplayName,
+    UES.Reputation,
+    UES.Location,
+    UES.TotalPostsOwned,
+    UES.TotalQuestionsOwned,
+    UES.TotalAnswersOwned,
+    UES.TotalBadgesEarned,
+    UES.UpvotesReceivedOnPosts,
+    UES.DownvotesReceivedOnPosts,
+    UES.UserProfileViews,
+    UES.UserUpvotesGiven,
+    UES.UserDownvotesGiven,
+    UES.LastAccessDate,
+    AGE(CAST('2024-10-01 12:34:56' AS timestamp), UES.UserCreationDate) AS UserAccountAge,
+    EXTRACT(MONTH FROM UES.LastAccessDate) AS LastAccessMonth,
+    SUM(TPP.TotalScoreInTag) AS TotalScoreInFavTags,
+    COUNT(DISTINCT TPP.TagName) FILTER (WHERE TPP.AvgScoreInTag > 100) AS HighPerformingTagsCount,
+    AUPM.AvgMovingScoreRecentPosts,
+    AUPM.BestPostScore,
+    AUPM.LowestPreviousPostScore,
+    CASE
+        WHEN UES.TotalPostsOwned = 0 THEN 0.0
+        ELSE CAST(UES.UpvotesReceivedOnPosts AS NUMERIC) / UES.TotalPostsOwned
+    END AS AvgUpvotesPerPost,
+    (
+        SELECT COUNT(DISTINCT PCM_Sub.PostId)
+        FROM PostContentMetrics AS PCM_Sub
+        WHERE PCM_Sub.OwnerUserId = UES.UserId
+          AND PCM_Sub.HasAcceptedAnswer = 1
+          AND PCM_Sub.PostTypeId = 2
+    ) AS AcceptedAnswersByThisUser,
+    (
+        SELECT COUNT(DISTINCT CH.PostId)
+        FROM ComplexHistoryPosts AS CH
+        INNER JOIN PostContentMetrics AS PCM_CH ON CH.PostId = PCM_CH.PostId
+        WHERE PCM_CH.OwnerUserId = UES.UserId
+    ) AS PostsWithCloseAndReopenHistory,
+    NTILE(5) OVER (ORDER BY UES.Reputation DESC) AS OverallReputationQuintile,
+    RANK() OVER (PARTITION BY COALESCE(UES.Location, 'Unknown') ORDER BY UES.Reputation DESC) AS RankInLocationByReputation,
+    AUPM.HasQuestionWithAcceptedAnswer,
+    AUPM.PostsWithLongBodyAndCode,
+    COALESCE(STRING_AGG(DISTINCT TPP.TagName, ', ') FILTER (WHERE TPP.AvgScoreInTag > 100), 'No Specific Tags') AS TopEngagedTags,
+    (
+        SELECT CRT.Name
+        FROM PostHistory AS PH
+        INNER JOIN CloseReasonTypes AS CRT ON CAST(PH.Comment AS SMALLINT) = CRT.Id
+        WHERE PH.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = UES.UserId)
+          AND PH.PostHistoryTypeId = 10
+        ORDER BY PH.CreationDate DESC
+        LIMIT 1
+    ) AS LastPostCloseReason,
+    (
+        SELECT COUNT(DISTINCT PL.RelatedPostId)
+        FROM PostLinks AS PL
+        WHERE PL.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = UES.UserId)
+          AND PL.LinkTypeId = 3
+    ) AS DuplicatePostsLinkedByThisUser,
+    (
+        SELECT COALESCE(SUM(CASE WHEN V.VoteTypeId = 8 THEN V.BountyAmount ELSE 0 END), 0)
+        FROM Votes AS V
+        WHERE V.UserId = UES.UserId AND V.BountyAmount IS NOT NULL
+    ) AS TotalBountyGivenByThisUser,
+    UES.Reputation * (1.0 + COALESCE(UES.TotalBadgesEarned, 0) / 100.0) * (1.0 + COALESCE(UES.TotalPostsOwned, 0) / 500.0) AS WeightedActivityScore
+FROM
+    UserEngagementSummary AS UES
+LEFT JOIN
+    TagPerformanceSummary AS TPP ON UES.UserId = TPP.UserId
+LEFT JOIN
+    AggregatedUserPostMetrics AS AUPM ON UES.UserId = AUPM.UserId
+WHERE
+    UES.Reputation > 5000
+    AND UES.TotalPostsOwned > 20
+    AND UES.TotalBadgesEarned > 5
+    AND UES.UserUpvotesGiven > UES.UserDownvotesGiven * 2
+    AND UES.LastAccessDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')
+    AND UES.Location IS NOT NULL AND UES.Location <> ''
+    AND (
+        (UES.TotalQuestionsOwned > 5 AND UES.TotalAnswersOwned > 10)
+        OR
+        (UES.TotalPostScoreOwned > 1000 AND UES.UserProfileViews > 500)
+    )
+    AND EXISTS (
+        SELECT 1
+        FROM PostContentMetrics AS PCM_Q
+        WHERE PCM_Q.OwnerUserId = UES.UserId
+          AND PCM_Q.PostTypeId = 1
+          AND PCM_Q.PostScore > 50
+          -- PCM_Q.AcceptedAnswerId did not exist in PostContentMetrics; infer accepted answer presence via HasAcceptedAnswer or join to Posts
+          AND PCM_Q.HasAcceptedAnswer = 1
+    )
+GROUP BY
+    UES.UserId, UES.DisplayName, UES.Reputation, UES.Location, UES.TotalPostsOwned,
+    UES.TotalQuestionsOwned, UES.TotalAnswersOwned, UES.TotalBadgesEarned,
+    UES.UpvotesReceivedOnPosts, UES.DownvotesReceivedOnPosts, UES.UserProfileViews,
+    UES.UserUpvotesGiven, UES.UserDownvotesGiven, UES.LastAccessDate, UES.UserCreationDate,
+    AUPM.AvgMovingScoreRecentPosts, AUPM.BestPostScore, AUPM.LowestPreviousPostScore,
+    AUPM.HasQuestionWithAcceptedAnswer, AUPM.PostsWithLongBodyAndCode,
+    UES.Reputation, AUPM.AvgMovingScoreRecentPosts, AUPM.BestPostScore, AUPM.LowestPreviousPostScore
+ORDER BY
+    WeightedActivityScore DESC, UES.Reputation DESC
+LIMIT 500;

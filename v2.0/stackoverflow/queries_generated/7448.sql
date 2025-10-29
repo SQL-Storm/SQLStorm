@@ -1,0 +1,473 @@
+-- {"query": "7448.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 3992} 
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COUNT(DISTINCT v.Id) as VoteCount,
+        MAX(p.CreationDate) as LastPostDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, COUNT(DISTINCT p.Id) DESC) as ReputationRank,
+        AVG(p.Score) as AvgPostScore,
+        COUNT(DISTINCT CASE WHEN p.Score > 0 THEN p.Id END) as PositiveScorePosts,
+        COUNT(DISTINCT CASE WHEN p.Score < 0 THEN p.Id END) as NegativeScorePosts,
+        COUNT(DISTINCT CASE WHEN p.Score = 0 THEN p.Id END) as ZeroScorePosts,
+        STRING_AGG(DISTINCT COALESCE(p.Tags, ''), ', ') as AllTags,
+        MAX(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount END) as MaxQuestionViews,
+        COUNT(DISTINCT CASE WHEN p.ViewCount > 1000 THEN p.Id END) as HighViewQuestions,
+        COUNT(DISTINCT CASE WHEN p.ViewCount > 5000 THEN p.Id END) as VeryHighViewQuestions
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        PostCount,
+        QuestionCount,
+        AnswerCount,
+        BadgeCount,
+        VoteCount,
+        LastPostDate,
+        ReputationRank,
+        AvgPostScore,
+        PositiveScorePosts,
+        NegativeScorePosts,
+        ZeroScorePosts,
+        AllTags,
+        MaxQuestionViews,
+        HighViewQuestions,
+        VeryHighViewQuestions
+    FROM UserStats
+    WHERE ReputationRank <= 500
+),
+UserActivity AS (
+    SELECT 
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.PostCount,
+        tu.QuestionCount,
+        tu.AnswerCount,
+        tu.BadgeCount,
+        tu.VoteCount,
+        tu.LastPostDate,
+        tu.ReputationRank,
+        tu.AvgPostScore,
+        tu.PositiveScorePosts,
+        tu.NegativeScorePosts,
+        tu.ZeroScorePosts,
+        tu.AllTags,
+        tu.MaxQuestionViews,
+        tu.HighViewQuestions,
+        tu.VeryHighViewQuestions,
+        CASE 
+            WHEN tu.PostCount > 0 THEN (tu.QuestionCount * 100.0 / tu.PostCount)
+            ELSE 0 
+        END as QuestionRatio,
+        CASE 
+            WHEN tu.VoteCount > 0 THEN (tu.PositiveScorePosts * 100.0 / tu.VoteCount)
+            ELSE 0 
+        END as PositiveVoteRatio,
+        CASE 
+            WHEN tu.Reputation <= 100 THEN 'Newbie'
+            WHEN tu.Reputation <= 1000 THEN 'Novice'
+            WHEN tu.Reputation <= 10000 THEN 'Experienced'
+            WHEN tu.Reputation <= 100000 THEN 'Expert'
+            ELSE 'Master'
+        END as ReputationLevel,
+        DATEDIFF(CURRENT_TIMESTAMP, tu.LastPostDate) as DaysSinceLastPost,
+        CASE 
+            WHEN DATEDIFF(CURRENT_TIMESTAMP, tu.LastPostDate) > 30 THEN 'Inactive'
+            WHEN DATEDIFF(CURRENT_TIMESTAMP, tu.LastPostDate) > 7 THEN 'LowActivity'
+            ELSE 'Active'
+        END as ActivityStatus
+    FROM TopUsers tu
+),
+BadgeSummary AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) as TotalBadges,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) as GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) as SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) as BronzeBadges,
+        STRING_AGG(CASE WHEN b.Class = 1 THEN b.Name END, ', ') as GoldBadgeNames,
+        STRING_AGG(CASE WHEN b.Class = 2 THEN b.Name END, ', ') as SilverBadgeNames,
+        STRING_AGG(CASE WHEN b.Class = 3 THEN b.Name END, ', ') as BronzeBadgeNames,
+        MAX(b.Date) as LastBadgeDate,
+        MIN(b.Date) as FirstBadgeDate,
+        DATEDIFF(MAX(b.Date), MIN(b.Date)) as BadgeStreakDays
+    FROM Badges b
+    GROUP BY b.UserId
+),
+PostPerformance AS (
+    SELECT 
+        p.OwnerUserId,
+        COUNT(p.Id) as TotalPosts,
+        AVG(p.Score) as AvgScore,
+        MAX(p.Score) as MaxScore,
+        MIN(p.Score) as MinScore,
+        SUM(p.ViewCount) as TotalViews,
+        AVG(p.ViewCount) as AvgViews,
+        MAX(p.ViewCount) as MaxViews,
+        STRING_AGG(p.Title, ' | ') as AllTitles,
+        STRING_AGG(SUBSTRING(p.Body, 1, 100), ' | ') as BodySnippets,
+        STRING_AGG(p.Tags, ' | ') as AllTags,
+        COUNT(CASE WHEN p.CommentCount > 0 THEN 1 END) as PostsWithComments,
+        COUNT(CASE WHEN p.FavoriteCount > 0 THEN 1 END) as PostsWithFavorites
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+CombinedUserAnalysis AS (
+    SELECT 
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.PostCount,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.BadgeCount,
+        ua.VoteCount,
+        ua.LastPostDate,
+        ua.ReputationRank,
+        ua.AvgPostScore,
+        ua.PositiveScorePosts,
+        ua.NegativeScorePosts,
+        ua.ZeroScorePosts,
+        ua.AllTags,
+        ua.MaxQuestionViews,
+        ua.HighViewQuestions,
+        ua.VeryHighViewQuestions,
+        ua.QuestionRatio,
+        ua.PositiveVoteRatio,
+        ua.ReputationLevel,
+        ua.DaysSinceLastPost,
+        ua.ActivityStatus,
+        bs.TotalBadges,
+        bs.GoldBadges,
+        bs.SilverBadges,
+        bs.BronzeBadges,
+        bs.GoldBadgeNames,
+        bs.SilverBadgeNames,
+        bs.BronzeBadgeNames,
+        bs.LastBadgeDate,
+        bs.FirstBadgeDate,
+        bs.BadgeStreakDays,
+        pp.TotalPosts,
+        pp.AvgScore,
+        pp.MaxScore,
+        pp.MinScore,
+        pp.TotalViews,
+        pp.AvgViews,
+        pp.MaxViews,
+        pp.AllTitles,
+        pp.BodySnippets,
+        pp.AllTags as PostTags,
+        pp.PostsWithComments,
+        pp.PostsWithFavorites,
+        CASE 
+            WHEN ua.ReputationRank <= 100 THEN 'Top100'
+            WHEN ua.ReputationRank <= 250 THEN 'Top250'
+            WHEN ua.ReputationRank <= 500 THEN 'Top500'
+            ELSE 'BelowTop500'
+        END as RankingCategory,
+        CASE 
+            WHEN ua.Reputation >= 10000 AND bs.TotalBadges >= 50 THEN 'EliteUser'
+            WHEN ua.Reputation >= 5000 AND bs.TotalBadges >= 25 THEN 'VeteranUser'
+            WHEN ua.Reputation >= 1000 AND bs.TotalBadges >= 10 THEN 'ExperiencedUser'
+            ELSE 'RegularUser'
+        END as UserCategory,
+        CASE 
+            WHEN bs.TotalBadges > 0 AND ua.PostCount > 0 THEN bs.TotalBadges / ua.PostCount
+            ELSE 0
+        END as BadgesPerPost,
+        CASE 
+            WHEN ua.VoteCount > 0 THEN cast(ua.PositiveScorePosts as float) / cast(ua.VoteCount as float)
+            ELSE 0
+        END as PositiveVoteEfficiency,
+        CASE 
+            WHEN ua.Reputation > 0 THEN CAST(ua.PostCount AS FLOAT) / CAST(ua.Reputation AS FLOAT) * 1000
+            ELSE 0
+        END as PostReputationRatio,
+        CASE 
+            WHEN ua.PostCount > 0 THEN (ua.QuestionCount * 100.0) / ua.PostCount
+            ELSE 0
+        END as QuestionContributionPercentage,
+        CASE 
+            WHEN ua.AnswerCount > 0 THEN (ua.AnswerCount * 100.0) / ua.PostCount
+            ELSE 0
+        END as AnswerContributionPercentage,
+        DATEDIFF(CURRENT_TIMESTAMP, bs.FirstBadgeDate) as DaysSinceFirstBadge,
+        CASE 
+            WHEN bs.BadgeStreakDays > 30 AND bs.BadgeStreakDays <= 90 THEN 'MonthlyStreak'
+            WHEN bs.BadgeStreakDays > 90 AND bs.BadgeStreakDays <= 365 THEN 'QuarterlyStreak'
+            WHEN bs.BadgeStreakDays > 365 THEN 'AnnualStreak'
+            ELSE 'ShortStreak'
+        END as StreakLevel,
+        CASE 
+            WHEN ua.ActivityStatus = 'Active' AND ua.Reputation >= 1000 THEN 'HighValueActive'
+            WHEN ua.ActivityStatus = 'Active' AND ua.Reputation < 1000 THEN 'LowValueActive'
+            WHEN ua.ActivityStatus = 'Inactive' AND ua.Reputation >= 1000 THEN 'HighValueInactive'
+            WHEN ua.ActivityStatus = 'Inactive' AND ua.Reputation < 1000 THEN 'LowValueInactive'
+            ELSE 'Undefined'
+        END as UserQualityCategory,
+        IIF(ua.PostCount > 0 AND ua.Reputation > 0, ua.Reputation / ua.PostCount, 0) as ReputationPerPost,
+        IIF(ua.AnswerCount > 0 AND ua.QuestionCount > 0, CAST(ua.AnswerCount AS FLOAT) / CAST(ua.QuestionCount AS FLOAT), 0) as AnswerToQuestionRatio
+    FROM UserActivity ua
+    LEFT JOIN BadgeSummary bs ON ua.UserId = bs.UserId
+    LEFT JOIN PostPerformance pp ON ua.UserId = pp.OwnerUserId
+),
+RankedUsers AS (
+    SELECT 
+        *,
+        ROW_NUMBER() OVER (ORDER BY 
+            Reputation DESC, 
+            TotalBadges DESC, 
+            PostCount DESC, 
+            AvgPostScore DESC
+        ) as TotalRank,
+        RANK() OVER (ORDER BY 
+            Reputation DESC, 
+            TotalBadges DESC, 
+            PostCount DESC, 
+            AvgPostScore DESC
+        ) as TotalRankUnique,
+        DENSE_RANK() OVER (ORDER BY 
+            Reputation DESC, 
+            TotalBadges DESC, 
+            PostCount DESC, 
+            AvgPostScore DESC
+        ) as TotalRankDense
+    FROM CombinedUserAnalysis
+),
+FinalReport AS (
+    SELECT 
+        'ReportGeneratedAt_' || CURRENT_TIMESTAMP as ReportIdentifier,
+        ru.UserId,
+        ru.DisplayName,
+        ru.Reputation,
+        ru.PostCount,
+        ru.QuestionCount,
+        ru.AnswerCount,
+        ru.BadgeCount,
+        ru.VoteCount,
+        ru.LastPostDate,
+        ru.ReputationRank,
+        ru.AvgPostScore,
+        ru.PositiveScorePosts,
+        ru.NegativeScorePosts,
+        ru.ZeroScorePosts,
+        ru.AllTags,
+        ru.MaxQuestionViews,
+        ru.HighViewQuestions,
+        ru.VeryHighViewQuestions,
+        ru.QuestionRatio,
+        ru.PositiveVoteRatio,
+        ru.ReputationLevel,
+        ru.DaysSinceLastPost,
+        ru.ActivityStatus,
+        ru.TotalBadges,
+        ru.GoldBadges,
+        ru.SilverBadges,
+        ru.BronzeBadges,
+        ru.GoldBadgeNames,
+        ru.SilverBadgeNames,
+        ru.BronzeBadgeNames,
+        ru.LastBadgeDate,
+        ru.FirstBadgeDate,
+        ru.BadgeStreakDays,
+        ru.TotalPosts,
+        ru.AvgScore,
+        ru.MaxScore,
+        ru.MinScore,
+        ru.TotalViews,
+        ru.AvgViews,
+        ru.MaxViews,
+        ru.AllTitles,
+        ru.BodySnippets,
+        ru.PostTags,
+        ru.PostsWithComments,
+        ru.PostsWithFavorites,
+        ru.RankingCategory,
+        ru.UserCategory,
+        ru.BadgesPerPost,
+        ru.PositiveVoteEfficiency,
+        ru.PostReputationRatio,
+        ru.QuestionContributionPercentage,
+        ru.AnswerContributionPercentage,
+        ru.DaysSinceFirstBadge,
+        ru.StreakLevel,
+        ru.UserQualityCategory,
+        ru.ReputationPerPost,
+        ru.AnswerToQuestionRatio,
+        ru.TotalRank,
+        ru.TotalRankUnique,
+        ru.TotalRankDense,
+        CASE 
+            WHEN ru.Reputation > 10000 AND ru.TotalBadges >= 20 AND ru.PostCount >= 100 THEN 'Legend'
+            WHEN ru.Reputation > 5000 AND ru.TotalBadges >= 10 AND ru.PostCount >= 50 THEN 'Veteran'
+            WHEN ru.Reputation > 1000 AND ru.TotalBadges >= 5 AND ru.PostCount >= 10 THEN 'Experienced'
+            WHEN ru.Reputation > 500 AND ru.PostCount >= 5 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as UserTier,
+        CASE 
+            WHEN ru.Reputation >= 10000 THEN 'TopContributor'
+            WHEN ru.Reputation >= 5000 THEN 'SignificantContributor'
+            WHEN ru.Reputation >= 1000 THEN 'RegularContributor'
+            ELSE 'OccasionalContributor'
+        END as ContributorLevel,
+        IIF(ru.PostCount >= 100, 'HighProductivity', 
+            IIF(ru.PostCount >= 50, 'MediumProductivity', 
+                IIF(ru.PostCount >= 10, 'LowProductivity', 'MinimalActivity')
+            )
+        ) as ProductivityLevel,
+        IIF(ru.BadgeStreakDays >= 365, 'YearlyStreak', 
+            IIF(ru.BadgeStreakDays >= 90, 'QuarterlyStreak', 
+                IIF(ru.BadgeStreakDays >= 30, 'MonthlyStreak', 'ShortStreak')
+            )
+        ) as EngagementLevel,
+        CONCAT(
+            'User_', 
+            ru.UserId, 
+            '_Tier_', 
+            CASE 
+                WHEN ru.Reputation > 10000 THEN 'Legendary'
+                WHEN ru.Reputation > 5000 THEN 'Veteran'
+                WHEN ru.Reputation > 1000 THEN 'Experienced'
+                ELSE 'New'
+            END
+        ) as UserIdentifier,
+        1 as ReportType,
+        CURRENT_TIMESTAMP as GeneratedDate,
+        CURRENT_TIMESTAMP as LastUpdated,
+        'StackOverflowPerformanceReport' as ReportName,
+        CONCAT(
+            'Rank_', 
+            ru.ReputationRank, 
+            '_Badges_', 
+            ru.TotalBadges, 
+            '_Posts_', 
+            ru.PostCount
+        ) as RankingKey,
+        IIF(
+            ru.Reputation > 0 AND ru.BadgeStreakDays > 0, 
+            CAST(ru.TotalBadges AS FLOAT) / CAST(ru.BadgeStreakDays AS FLOAT), 
+            0
+        ) as AverageBadgesPerDay,
+        IIF(
+            ru.TotalViews > 0 AND ru.TotalPosts > 0, 
+            CAST(ru.TotalViews AS FLOAT) / CAST(ru.TotalPosts AS FLOAT), 
+            0
+        ) as AverageViewsPerPost,
+        IIF(
+            ru.PositiveScorePosts > 0 AND ru.NegativeScorePosts > 0,
+            CAST(ru.PositiveScorePosts AS FLOAT) / CAST(ru.NegativeScorePosts AS FLOAT),
+            IIF(ru.PositiveScorePosts > 0, 100.0, 
+                IIF(ru.NegativeScorePosts > 0, -100.0, 0.0)
+            )
+        ) as PosNegRatio
+    FROM RankedUsers ru
+)
+SELECT 
+    ReportIdentifier,
+    UserId,
+    DisplayName,
+    Reputation,
+    PostCount,
+    QuestionCount,
+    AnswerCount,
+    BadgeCount,
+    VoteCount,
+    LastPostDate,
+    ReputationRank,
+    AvgPostScore,
+    PositiveScorePosts,
+    NegativeScorePosts,
+    ZeroScorePosts,
+    AllTags,
+    MaxQuestionViews,
+    HighViewQuestions,
+    VeryHighViewQuestions,
+    QuestionRatio,
+    PositiveVoteRatio,
+    ReputationLevel,
+    DaysSinceLastPost,
+    ActivityStatus,
+    TotalBadges,
+    GoldBadges,
+    SilverBadges,
+    BronzeBadges,
+    GoldBadgeNames,
+    SilverBadgeNames,
+    BronzeBadgeNames,
+    LastBadgeDate,
+    FirstBadgeDate,
+    BadgeStreakDays,
+    TotalPosts,
+    AvgScore,
+    MaxScore,
+    MinScore,
+    TotalViews,
+    AvgViews,
+    MaxViews,
+    AllTitles,
+    BodySnippets,
+    PostTags,
+    PostsWithComments,
+    PostsWithFavorites,
+    RankingCategory,
+    UserCategory,
+    BadgesPerPost,
+    PositiveVoteEfficiency,
+    PostReputationRatio,
+    QuestionContributionPercentage,
+    AnswerContributionPercentage,
+    DaysSinceFirstBadge,
+    StreakLevel,
+    UserQualityCategory,
+    ReputationPerPost,
+    AnswerToQuestionRatio,
+    TotalRank,
+    TotalRankUnique,
+    TotalRankDense,
+    UserTier,
+    ContributorLevel,
+    ProductivityLevel,
+    EngagementLevel,
+    UserIdentifier,
+    ReportType,
+    GeneratedDate,
+    LastUpdated,
+    ReportName,
+    RankingKey,
+    AverageBadgesPerDay,
+    AverageViewsPerPost,
+    PosNegRatio
+FROM FinalReport
+WHERE ReputationRank <= 500
+  AND (BadgeStreakDays >= 30 OR TotalBadges >= 10 OR PostCount >= 5)
+  AND (
+    Reputation > 1000 OR 
+    TotalBadges > 5 OR 
+    QuestionCount > 10 OR 
+    AnswerCount > 20 OR 
+    PositiveScorePosts > 100
+  )
+ORDER BY 
+    Reputation DESC, 
+    TotalBadges DESC, 
+    PostCount DESC, 
+    TotalRank ASC
+LIMIT 1000;

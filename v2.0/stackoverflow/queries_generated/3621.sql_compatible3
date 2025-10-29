@@ -1,0 +1,118 @@
+WITH recent_posts AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        COALESCE(p.Title, '') AS Title,
+        ROW_NUMBER() OVER (
+            PARTITION BY p.OwnerUserId
+            ORDER BY p.CreationDate DESC
+        ) AS rn_user_recent
+    FROM Posts p
+    WHERE p.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '30 days'
+),
+user_badge_stats AS (
+    SELECT
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS gold_badges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS silver_badges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS bronze_badges,
+        COUNT(*) AS total_badges,
+        STRING_AGG(DISTINCT b.Name, ', ') AS badge_list
+    FROM Badges b
+    GROUP BY b.UserId
+),
+user_vote_stats AS (
+    SELECT
+        v.UserId,
+        SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS up_votes,
+        SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS down_votes,
+        COUNT(*) AS total_votes
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY v.UserId
+),
+top_questions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        REPLACE(TRIM(BOTH '<>' FROM p.Tags), '><', ', ') AS tag_list,
+        ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.ViewCount DESC) AS rank_q
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+main_rows AS (
+    SELECT
+        u.Id AS user_id,
+        COALESCE(u.DisplayName, 'Anonymous') AS display_name,
+        u.Reputation,
+        ub.gold_badges,
+        ub.silver_badges,
+        ub.bronze_badges,
+        ub.total_badges,
+        ub.badge_list,
+        uv.up_votes,
+        uv.down_votes,
+        uv.total_votes,
+        rp.Title AS latest_post_title,
+        rp.Score AS latest_post_score,
+        rp.ViewCount AS latest_post_views,
+        (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id) AS comment_count,
+        CASE
+            WHEN COALESCE(ub.total_badges,0) > 10 THEN 'Power User'
+            WHEN COALESCE(uv.up_votes,0) > COALESCE(uv.down_votes,0) THEN 'Positive Voter'
+            ELSE 'Participant'
+        END AS user_category,
+        tq.Title AS top_question_title,
+        tq.Score AS top_question_score,
+        tq.tag_list AS top_question_tags
+    FROM Users u
+    LEFT JOIN user_badge_stats ub ON ub.UserId = u.Id
+    LEFT JOIN user_vote_stats uv ON uv.UserId = u.Id
+    LEFT JOIN recent_posts rp ON rp.OwnerUserId = u.Id AND rp.rn_user_recent = 1
+    LEFT JOIN (
+        SELECT Id, Title, Score, ViewCount, tag_list, rank_q
+        FROM top_questions
+        WHERE rank_q <= 5
+    ) tq ON TRUE
+    WHERE u.Reputation > 1000
+      AND (u.emailhash IS NOT NULL OR u.AccountId IS NOT NULL)
+),
+summary_row AS (
+    SELECT
+        CAST(NULL AS bigint) AS user_id,
+        '--- Summary ---' AS display_name,
+        CAST(NULL AS integer) AS Reputation,
+        SUM(COALESCE(ub.gold_badges,0)) AS gold_badges,
+        SUM(COALESCE(ub.silver_badges,0)) AS silver_badges,
+        SUM(COALESCE(ub.bronze_badges,0)) AS bronze_badges,
+        SUM(COALESCE(ub.total_badges,0)) AS total_badges,
+        CAST(NULL AS text) AS badge_list,
+        SUM(COALESCE(uv.up_votes,0)) AS up_votes,
+        SUM(COALESCE(uv.down_votes,0)) AS down_votes,
+        SUM(COALESCE(uv.total_votes,0)) AS total_votes,
+        CAST(NULL AS text) AS latest_post_title,
+        CAST(NULL AS integer) AS latest_post_score,
+        CAST(NULL AS integer) AS latest_post_views,
+        CAST(NULL AS bigint) AS comment_count,
+        CAST(NULL AS text) AS user_category,
+        CAST(NULL AS text) AS top_question_title,
+        CAST(NULL AS integer) AS top_question_score,
+        CAST(NULL AS text) AS top_question_tags
+    FROM Users u
+    LEFT JOIN user_badge_stats ub ON ub.UserId = u.Id
+    LEFT JOIN user_vote_stats uv ON uv.UserId = u.Id
+    WHERE u.Reputation > 1000
+      AND (u.emailhash IS NOT NULL OR u.AccountId IS NOT NULL)
+)
+SELECT *
+FROM main_rows
+UNION ALL
+SELECT *
+FROM summary_row
+ORDER BY Reputation DESC;

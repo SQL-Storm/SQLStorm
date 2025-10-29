@@ -1,0 +1,101 @@
+WITH
+DailyTagActivity AS (
+  SELECT
+    to_char(p.CreationDate, 'YYYY-MM-DD') AS Day,
+    t.TagName,
+    COUNT(*) AS PostCount,
+    SUM(p.Score) AS ScoreSum
+  FROM Posts p
+  JOIN LATERAL (
+    SELECT unnest(string_to_array(p.Tags, '<>')) AS tagname
+  ) tag ON TRUE
+  JOIN Tags t ON t.TagName = tag.tagname
+  WHERE p.PostTypeId = 1
+  GROUP BY to_char(p.CreationDate, 'YYYY-MM-DD'), t.TagName
+),
+RecentCommunity AS (
+  SELECT
+    pl.Id AS PostLinkId,
+    pl.PostId,
+    pl.RelatedPostId,
+    pl.LinkTypeId,
+    p.Id AS Pid,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.OwnerUserId,
+    u.DisplayName AS OwnerName,
+    p.LastActivityDate,
+    p.Tags
+  FROM PostLinks pl
+  JOIN Posts p ON pl.PostId = p.Id
+  JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE pl.LinkTypeId IN (1,3)
+    AND p.CommunityOwnedDate IS NOT NULL
+),
+RankedPosts AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.PostTypeId,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    ROW_NUMBER() OVER (
+      PARTITION BY CAST(p.CreationDate AS DATE)
+      ORDER BY p.Score DESC NULLS LAST, p.ViewCount DESC NULLS LAST, p.Id
+    ) AS rn
+  FROM Posts p
+  WHERE p.PostTypeId IN (1,2)
+    AND p.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days')
+),
+LatestEdit AS (
+  SELECT
+    p.Id AS PostId,
+    (SELECT MAX(pp.LastEditDate) FROM Posts pp WHERE pp.Id = p.Id) AS LastEdit
+  FROM Posts p
+),
+UserBadges AS (
+  SELECT
+    b.UserId,
+    COUNT(*) AS BadgeCount,
+    SUM(CASE WHEN b.TagBased = TRUE OR b.TagBased = 1 THEN 1 ELSE 0 END) AS TagBadges
+  FROM Badges b
+  GROUP BY b.UserId
+)
+SELECT
+  rp.Id AS PostId,
+  rp.Title,
+  rp.PostTypeId,
+  rp.CreationDate,
+  rp.Score,
+  rp.ViewCount,
+  rp.Tags,
+  rp.rn,
+  le.LastEdit,
+  lu.Reputation,
+  ub.BadgeCount,
+  ub.TagBadges,
+  rca.Day AS PeakDay,
+  'Benchmark' AS BenchmarkTag
+FROM RankedPosts rp
+LEFT JOIN LatestEdit le ON le.PostId = rp.Id
+LEFT JOIN Users lu ON rp.OwnerUserId = lu.Id
+LEFT JOIN UserBadges ub ON ub.UserId = rp.OwnerUserId
+LEFT JOIN (
+  SELECT CAST(p.CreationDate AS DATE) AS Day, MAX(p.Score) AS PeakScore
+  FROM Posts p
+  GROUP BY CAST(p.CreationDate AS DATE)
+) rca ON rca.Day = CAST(rp.CreationDate AS DATE)
+LEFT JOIN (
+  SELECT Day, TagName
+  FROM DailyTagActivity
+  WHERE PostCount > 0
+) dta ON dta.Day = CAST(rp.CreationDate AS DATE)
+WHERE rp.rn <= 50
+  AND (le.LastEdit IS NULL OR le.LastEdit >= rp.CreationDate - INTERVAL '60 days')
+ORDER BY rp.rn, rp.Id
+LIMIT 100;

@@ -1,0 +1,101 @@
+WITH UserStats AS (
+    SELECT u.Id,
+           u.DisplayName,
+           u.Reputation,
+           COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1)               AS QuestionCount,
+           COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2)               AS AnswerCount,
+           COALESCE(SUM(p.Score),0)                                          AS TotalPostScore,
+           SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END)                  AS UpVoteGiven,
+           SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END)                  AS DownVoteGiven,
+           ROW_NUMBER() OVER (ORDER BY COALESCE(SUM(p.Score),0) DESC)         AS RankByScore
+    FROM Users u
+    LEFT JOIN Posts p  ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v  ON v.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+TopTags AS (
+    SELECT t.TagName,
+           t.Count,
+           ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank
+    FROM Tags t
+    WHERE t.IsModeratorOnly = FALSE
+),
+
+RecentBadges AS (
+    SELECT b.UserId,
+           STRING_AGG(b.Name, ', ') FILTER (WHERE b.Class = 1) AS GoldBadges,
+           STRING_AGG(b.Name, ', ') FILTER (WHERE b.Class = 2) AS SilverBadges,
+           STRING_AGG(b.Name, ', ') FILTER (WHERE b.Class = 3) AS BronzeBadges
+    FROM Badges b
+    WHERE b.Date >= DATE_TRUNC('year', CAST('2024-10-01' AS date)) - INTERVAL '1 year'
+    GROUP BY b.UserId
+),
+
+ClosedDuplicateQuestions AS (
+    SELECT ph.PostId,
+           ph.CreationDate,
+           CAST(ph.Comment AS integer)                                 AS CloseReasonId,
+           json_array_elements_text(ph.Text)                            AS OriginalDuplicateId
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10                      -- Post Closed
+      AND ph.Comment ~ '^\d+$'                           -- CloseReasonId stored as integer string
+),
+
+UserQuestionStats AS (
+    SELECT p.OwnerUserId                                          AS UserId,
+           COUNT(*)                                               AS TotalQuestions,
+           AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL)       AS AvgScore,
+           MAX(p.ViewCount)                                      AS MaxViews,
+           SUM(CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END) AS ClosedCount,
+           COUNT(DISTINCT pl.RelatedPostId) FILTER (WHERE pl.LinkTypeId = 3) AS DuplicateCount
+    FROM Posts p
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id AND pl.LinkTypeId = 3
+    WHERE p.PostTypeId = 1                                      -- questions
+    GROUP BY p.OwnerUserId
+),
+
+UserTagAggregation AS (
+    SELECT pt.OwnerUserId,
+           t.TagName,
+           ROW_NUMBER() OVER (PARTITION BY pt.OwnerUserId ORDER BY t.Count DESC) AS TagRankPerUser
+    FROM Posts pt
+    JOIN LATERAL regexp_split_to_table(pt.Tags, '[><]') AS tag(token) ON true
+    JOIN Tags t ON t.TagName = tag.token
+    WHERE pt.PostTypeId = 1
+)
+
+SELECT us.Id,
+       us.DisplayName,
+       us.Reputation,
+       us.QuestionCount,
+       us.AnswerCount,
+       us.TotalPostScore,
+       us.UpVoteGiven,
+       us.DownVoteGiven,
+       us.RankByScore,
+       COALESCE(rb.GoldBadges,   '') AS GoldBadges,
+       COALESCE(rb.SilverBadges, '') AS SilverBadges,
+       COALESCE(rb.BronzeBadges, '') AS BronzeBadges,
+       uq.TotalQuestions,
+       uq.AvgScore,
+       uq.MaxViews,
+       uq.ClosedCount,
+       uq.DuplicateCount,
+       CASE
+           WHEN uq.TotalQuestions = 0 OR uq.TotalQuestions IS NULL THEN NULL
+           ELSE (CAST(uq.ClosedCount AS decimal) / uq.TotalQuestions) * 100
+       END AS PercentClosed,
+       STRING_AGG(DISTINCT uta.TagName, '; ') FILTER (WHERE uta.TagRankPerUser <= 3) AS Top3TagsPerUser
+FROM UserStats us
+LEFT JOIN RecentBadges rb           ON rb.UserId = us.Id
+LEFT JOIN UserQuestionStats uq      ON uq.UserId = us.Id
+LEFT JOIN UserTagAggregation uta   ON uta.OwnerUserId = us.Id
+WHERE us.RankByScore <= 100
+GROUP BY us.Id, us.DisplayName, us.Reputation,
+         us.QuestionCount, us.AnswerCount, us.TotalPostScore,
+         us.UpVoteGiven, us.DownVoteGiven, us.RankByScore,
+         rb.GoldBadges, rb.SilverBadges, rb.BronzeBadges,
+         uq.TotalQuestions, uq.AvgScore, uq.MaxViews,
+         uq.ClosedCount, uq.DuplicateCount
+ORDER BY us.RankByScore;

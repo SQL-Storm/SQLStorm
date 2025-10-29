@@ -1,0 +1,224 @@
+-- {"query": "1022.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3164} 
+WITH UserPostMetrics AS (
+    SELECT
+        P.OwnerUserId AS UserId,
+        COUNT(P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COALESCE(SUM(P.Score), 0) AS TotalPostScore,
+        COALESCE(SUM(P.ViewCount), 0) AS TotalPostViews,
+        COALESCE(AVG(P.Score) FILTER (WHERE P.PostTypeId = 1), 0.0) AS AvgQuestionScore,
+        COALESCE(AVG(P.Score) FILTER (WHERE P.PostTypeId = 2), 0.0) AS AvgAnswerScore,
+        MAX(P.LastActivityDate) AS LastPostActivityDate,
+        MAX(P.CreationDate) AS LatestPostDate
+    FROM Posts P
+    WHERE P.OwnerUserId IS NOT NULL
+    GROUP BY P.OwnerUserId
+),
+UserCommentMetrics AS (
+    SELECT
+        C.UserId,
+        COUNT(C.Id) AS TotalComments,
+        COALESCE(SUM(C.Score), 0) AS TotalCommentScore,
+        COUNT(C.Id) FILTER (WHERE C.CreationDate >= NOW() - INTERVAL '1 year') AS RecentCommentsCount -- Dynamic date filtering
+    FROM Comments C
+    WHERE C.UserId IS NOT NULL
+    GROUP BY C.UserId
+),
+UserBadgeMetrics AS (
+    SELECT
+        B.UserId,
+        COUNT(B.Id) FILTER (WHERE B.Class = 1) AS GoldBadges,
+        COUNT(B.Id) FILTER (WHERE B.Class = 2) AS SilverBadges,
+        COUNT(B.Id) FILTER (WHERE B.Class = 3) AS BronzeBadges
+    FROM Badges B
+    GROUP BY B.UserId
+),
+UserAggregatedStats AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.UpVotes AS UserGivenUpVotes,
+        U.DownVotes AS UserGivenDownVotes,
+        COALESCE(UPM.TotalPosts, 0) AS TotalPosts,
+        COALESCE(UPM.TotalQuestions, 0) AS TotalQuestions,
+        COALESCE(UPM.TotalAnswers, 0) AS TotalAnswers,
+        COALESCE(UPM.TotalPostScore, 0) AS TotalPostScore,
+        COALESCE(UPM.TotalPostViews, 0) AS TotalPostViews,
+        COALESCE(UPM.AvgQuestionScore, 0.0) AS AvgQuestionScore,
+        COALESCE(UPM.AvgAnswerScore, 0.0) AS AvgAnswerScore,
+        UPM.LastPostActivityDate,
+        UPM.LatestPostDate,
+        COALESCE(UCM.RecentCommentsCount, 0) AS RecentCommentsCount,
+        COALESCE(UCM.TotalCommentScore, 0) AS TotalCommentScore,
+        COALESCE(UBM.GoldBadges, 0) AS GoldBadges,
+        COALESCE(UBM.SilverBadges, 0) AS SilverBadges,
+        COALESCE(UBM.BronzeBadges, 0) AS BronzeBadges
+    FROM Users U
+    LEFT JOIN UserPostMetrics UPM ON U.Id = UPM.UserId
+    LEFT JOIN UserCommentMetrics UCM ON U.Id = UCM.UserId
+    LEFT JOIN UserBadgeMetrics UBM ON U.Id = UBM.UserId
+),
+PostHistoricalAnalysis AS (
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Title,
+        P.Tags,
+        P.Score,
+        P.ViewCount,
+        P.AcceptedAnswerId,
+        COALESCE(P.AnswerCount, 0) AS CurrentAnswerCount,
+        COALESCE(P.CommentCount, 0) AS CurrentCommentCount,
+        COALESCE(P.FavoriteCount, 0) AS CurrentFavoriteCount,
+        CASE
+            WHEN P.ClosedDate IS NOT NULL THEN TRUE
+            WHEN EXISTS (SELECT 1 FROM PostHistory PH_Closed WHERE PH_Closed.PostId = P.Id AND PH_Closed.PostHistoryTypeId = 10) THEN TRUE
+            ELSE FALSE
+        END AS IsPostClosed,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.Comment ELSE NULL END) AS CloseReasonComment,
+        COUNT(DISTINCT PH.Id) AS TotalHistoryEvents,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6, 8, 9) THEN PH.UserId ELSE NULL END) AS DistinctEditors,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.CreationDate ELSE NULL END) AS LastEditDateByHistory,
+        COALESCE(COUNT(DISTINCT PL_Linked.Id), 0) AS LinkedPostsCount,
+        COALESCE(COUNT(DISTINCT PL_Duplicate.Id), 0) AS DuplicatePostsCount,
+        LOWER(SPLIT_PART(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags)-2), '><', 1)) AS FirstTagRaw, -- String manipulation
+        SUBSTRING(COALESCE(P.Title, 'No Title Provided'), 1, 50) AS TitleExcerpt
+    FROM Posts P
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    LEFT JOIN PostLinks PL_Linked ON P.Id = PL_Linked.PostId AND PL_Linked.LinkTypeId = 1 -- Outer Join
+    LEFT JOIN PostLinks PL_Duplicate ON P.Id = PL_Duplicate.PostId AND PL_Duplicate.LinkTypeId = 3 -- Outer Join
+    GROUP BY
+        P.Id, P.OwnerUserId, P.CreationDate, P.Title, P.Tags, P.Score, P.ViewCount,
+        P.AcceptedAnswerId, P.AnswerCount, P.CommentCount, P.FavoriteCount, P.ClosedDate
+),
+TagPerformanceMetrics AS (
+    SELECT
+        PHA.PostId,
+        unnest(string_to_array(SUBSTRING(PHA.Tags FROM 2 FOR LENGTH(PHA.Tags)-2), '><')) AS TagName, -- Set operator style unnest
+        PHA.Score AS PostScore,
+        PHA.ViewCount AS PostViewCount
+    FROM PostHistoricalAnalysis PHA
+    WHERE PHA.Tags IS NOT NULL AND LENGTH(PHA.Tags) > 2
+),
+AggregatedTagScores AS (
+    SELECT
+        TPM.TagName,
+        COUNT(TPM.PostId) AS TagPostCount,
+        SUM(TPM.PostScore) AS TagTotalScore,
+        AVG(TPM.PostScore) AS TagAvgScore,
+        SUM(TPM.PostViewCount) AS TagTotalViewCount,
+        NTILE(10) OVER (ORDER BY SUM(TPM.PostScore) DESC) AS TagScoreDecile -- Window function (NTILE)
+    FROM TagPerformanceMetrics TPM
+    GROUP BY TPM.TagName
+    HAVING COUNT(TPM.PostId) > 10 -- Group filter
+),
+UserOverallRank AS (
+    SELECT
+        UAS.UserId,
+        UAS.DisplayName,
+        UAS.Reputation,
+        UAS.TotalPosts,
+        UAS.TotalQuestions,
+        UAS.TotalAnswers,
+        UAS.TotalPostScore,
+        UAS.GoldBadges,
+        UAS.SilverBadges,
+        UAS.BronzeBadges,
+        (UAS.Reputation * 0.5 + UAS.TotalPostScore * 0.3 + UAS.TotalQuestions * 0.1 + UAS.GoldBadges * 0.1 * 100) AS CompositeInfluenceScore,
+        RANK() OVER (ORDER BY (UAS.Reputation * 0.5 + UAS.TotalPostScore * 0.3 + UAS.TotalQuestions * 0.1 + UAS.GoldBadges * 0.1 * 100) DESC) AS OverallRank, -- Window function (RANK)
+        NTILE(5) OVER (ORDER BY (UAS.Reputation * 0.5 + UAS.TotalPostScore * 0.3 + UAS.TotalQuestions * 0.1 + UAS.GoldBadges * 0.1 * 100) DESC) AS InfluenceQuintile -- Window function (NTILE)
+    FROM UserAggregatedStats UAS
+    WHERE UAS.Reputation > 100 -- Predicate filtering
+),
+EditorsNoOwnPostsFlag AS (
+    SELECT
+        U.Id AS UserId,
+        CASE
+            WHEN U.Id IN (SELECT DISTINCT PH.UserId FROM PostHistory PH WHERE PH.UserId IS NOT NULL)
+                 AND U.Id NOT IN (SELECT DISTINCT P.OwnerUserId FROM Posts P WHERE P.OwnerUserId IS NOT NULL AND P.PostTypeId IN (1,2))
+            THEN TRUE
+            ELSE FALSE
+        END AS IsEditorNoOwnPosts
+    FROM Users U
+)
+SELECT
+    UOR.UserId,
+    UOR.DisplayName,
+    UOR.Reputation,
+    UOR.TotalPosts,
+    UOR.TotalQuestions,
+    UOR.TotalAnswers,
+    UOR.TotalPostScore,
+    UOR.GoldBadges,
+    UOR.SilverBadges,
+    UOR.BronzeBadges,
+    UOR.OverallRank,
+    UOR.InfluenceQuintile,
+    PHA.PostId,
+    PHA.Title,
+    PHA.Score AS PostScore,
+    PHA.ViewCount AS PostViewCount,
+    PHA.IsPostClosed,
+    COALESCE(PHA.CloseReasonComment, 'N/A') AS PostClosureReason, -- NULL logic (COALESCE)
+    PHA.TotalHistoryEvents,
+    PHA.DistinctEditors,
+    PHA.LinkedPostsCount,
+    PHA.DuplicatePostsCount,
+    COALESCE(ATS.TagName, 'Unknown Tag') AS MostImpactfulTag,
+    COALESCE(ATS.TagPostCount, 0) AS TagPostCount,
+    COALESCE(ATS.TagTotalScore, 0) AS TagTotalScore,
+    COALESCE(ATS.TagScoreDecile, 0) AS TagScoreDecile,
+    ENOP.IsEditorNoOwnPosts,
+    -- Correlated Subquery: Get the CreationDate of the latest accepted answer for any of the user's questions
+    (
+        SELECT MAX(P_AA.CreationDate)
+        FROM Posts P_Q
+        JOIN Posts P_AA ON P_Q.AcceptedAnswerId = P_AA.Id
+        WHERE P_Q.OwnerUserId = UOR.UserId
+          AND P_Q.PostTypeId = 1
+    ) AS LatestAcceptedAnswerDate,
+    -- Complex CASE expression with multiple conditions
+    CASE
+        WHEN UOR.GoldBadges > 0 AND UOR.TotalQuestions > 50 THEN 'Guru Contributor'
+        WHEN UOR.InfluenceQuintile = 1 AND UOR.Reputation > 10000 THEN 'Elite Influencer'
+        WHEN UOR.Reputation > 5000 AND UOR.TotalAnswers > 100 THEN 'Prolific Answerer'
+        WHEN UOR.TotalPosts < 10 AND UOR.Reputation < 500 THEN 'Novice'
+        ELSE 'Active Member'
+    END AS UserCategory,
+    -- Correlated Subquery with String Aggregation and date arithmetic
+    (
+        SELECT STRING_AGG(
+            CASE
+                WHEN PH.PostHistoryTypeId = 1 THEN 'Q-Init: ' || SUBSTRING(PH.Text FROM 1 FOR 30)
+                WHEN PH.PostHistoryTypeId = 2 THEN 'B-Init: ' || SUBSTRING(PH.Text FROM 1 FOR 30)
+                WHEN PH.PostHistoryTypeId = 10 THEN 'Closed: ' || COALESCE(PH.Comment, 'Reason Unknown')
+                WHEN PH.PostHistoryTypeId = 4 THEN 'Title-Edit: ' || SUBSTRING(PH.Text FROM 1 FOR 30)
+                ELSE 'Misc Event (' || PH.PostHistoryTypeId || ')'
+            END, '; ' ORDER BY PH.CreationDate DESC)
+        FROM PostHistory PH
+        WHERE PH.PostId = PHA.PostId
+          AND PH.CreationDate >= NOW() - INTERVAL '30 days' -- Date comparison
+        LIMIT 3 -- Limit the number of aggregated strings
+    ) AS RecentPostHistorySummary
+FROM UserOverallRank UOR
+INNER JOIN PostHistoricalAnalysis PHA ON UOR.UserId = PHA.OwnerUserId
+LEFT JOIN AggregatedTagScores ATS ON PHA.FirstTagRaw = ATS.TagName
+LEFT JOIN EditorsNoOwnPostsFlag ENOP ON UOR.UserId = ENOP.UserId
+WHERE
+    UOR.InfluenceQuintile <= 3 -- Filter for top 60% by influence
+    AND PHA.PostCreationDate BETWEEN '2022-01-01' AND '2023-01-01' -- Specific time window for post analysis
+    AND PHA.Score >= 5
+    AND PHA.ViewCount >= 100
+    AND (PHA.IsPostClosed = FALSE OR PHA.CloseReasonComment IS NOT NULL) -- NULL logic in WHERE
+    AND (PHA.Title LIKE '%SQL%' OR PHA.Title ILIKE '%performance%' OR PHA.Tags LIKE '%<database>%' OR PHA.Tags LIKE '%<optimization>%') -- Complex predicates with string patterns
+ORDER BY
+    UOR.OverallRank ASC,
+    PHA.PostScore DESC,
+    PHA.PostCreationDate DESC,
+    PHA.PostId ASC -- Added to make ORDER BY deterministic
+LIMIT 100;

@@ -1,0 +1,204 @@
+WITH UserPostStats AS (
+    SELECT 
+        p.OwnerUserId AS UserId,
+        COUNT(p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        AVG(p.Score) AS AvgScore,
+        MAX(p.ViewCount) AS MaxViews,
+        STRING_AGG(
+            CASE 
+                WHEN p.PostTypeId = 1 THEN p.Title 
+                ELSE 'Answer to: ' || (SELECT Title FROM Posts WHERE Id = p.ParentId)
+            END, 
+            ' | '
+        ) AS PostTitles,
+        COUNT(DISTINCT p.Tags) AS UniqueTagCount
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate,
+        u.DisplayName,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId IN (2, 3) THEN 1 ELSE 0 END), 0) AS NetVotes,
+        EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - u.LastAccessDate)) / 86400.0 AS DaysSinceLastAccess
+    FROM Users u
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    GROUP BY u.Id, u.Reputation, u.CreationDate, u.DisplayName, u.LastAccessDate
+),
+PostTagAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostType,
+        (SELECT COUNT(*) FROM Posts WHERE ParentId = p.Id AND PostTypeId = 2) AS AnswerCount,
+        CASE 
+            WHEN p.Tags LIKE '%<%' THEN 
+                (SELECT COUNT(*) FROM (
+                    SELECT DISTINCT TRIM(BOTH '<>' FROM TRIM(tag)) AS Tag
+                    FROM (
+                        SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, CHAR_LENGTH(p.Tags) - 2), '><')) AS tag
+                    ) AS t
+                    WHERE TRIM(BOTH '<>' FROM TRIM(tag)) != ''
+                ) AS tags)
+            ELSE 0
+        END AS TagCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS RankByScore
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+ComplexUserAnalysis AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.CommentCount,
+        uas.BadgeCount,
+        uas.VoteCount,
+        uas.NetVotes,
+        uas.DaysSinceLastAccess,
+        ups.TotalPosts,
+        ups.QuestionCount,
+        ups.AnswerCount,
+        ups.AvgScore,
+        ups.MaxViews,
+        ups.PostTitles,
+        ups.UniqueTagCount,
+        CASE 
+            WHEN uas.Reputation > 10000 THEN 'Elite'
+            WHEN uas.Reputation > 1000 THEN 'Advanced'
+            WHEN uas.Reputation > 100 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END AS UserLevel,
+        CASE 
+            WHEN uas.DaysSinceLastAccess > 30 THEN 'Inactive'
+            WHEN uas.DaysSinceLastAccess > 7 THEN 'SemiActive'
+            ELSE 'Active'
+        END AS ActivityLevel
+    FROM UserActivityStats uas
+    JOIN UserPostStats ups ON uas.UserId = ups.UserId
+    WHERE uas.Reputation > 0
+),
+TopPerformingPosts AS (
+    SELECT 
+        pta.PostId,
+        pta.Title,
+        pta.Tags,
+        pta.Score,
+        pta.ViewCount,
+        pta.OwnerUserId,
+        pta.PostType,
+        pta.AnswerCount,
+        pta.TagCount,
+        pta.RankByScore,
+        ROW_NUMBER() OVER (ORDER BY pta.Score DESC, pta.ViewCount DESC) AS GlobalRank,
+        AVG(pta.Score) OVER (PARTITION BY pta.OwnerUserId) AS AvgUserScore,
+        RANK() OVER (ORDER BY pta.Score DESC) AS ScoreRank,
+        DENSE_RANK() OVER (ORDER BY pta.ViewCount DESC) AS ViewRank,
+        NTILE(5) OVER (ORDER BY pta.Score DESC) AS ScoreQuintile,
+        LAG(pta.Score) OVER (ORDER BY pta.Score DESC) - pta.Score AS ScoreDiffFromNext,
+        LEAD(pta.Score) OVER (ORDER BY pta.Score DESC) - pta.Score AS ScoreDiffFromPrev,
+        pta.OwnerUserId AS OwnerUserId_for_join,
+        pta.Title AS PostTitles -- include PostTitles placeholder for later COALESCE if available
+    FROM PostTagAnalysis pta
+    WHERE pta.Score > 0
+)
+SELECT 
+    cua.UserId,
+    cua.DisplayName,
+    cua.Reputation,
+    cua.CommentCount,
+    cua.BadgeCount,
+    cua.VoteCount,
+    cua.NetVotes,
+    cua.DaysSinceLastAccess,
+    cua.TotalPosts,
+    cua.QuestionCount,
+    cua.AnswerCount,
+    cua.AvgScore,
+    cua.MaxViews,
+    cua.UniqueTagCount,
+    cua.UserLevel,
+    cua.ActivityLevel,
+    tpp.PostId,
+    tpp.Title,
+    tpp.Tags,
+    tpp.Score,
+    tpp.ViewCount,
+    tpp.PostType,
+    tpp.AnswerCount AS PostAnswerCount,
+    tpp.TagCount,
+    tpp.GlobalRank,
+    tpp.AvgUserScore,
+    tpp.ScoreRank,
+    tpp.ViewRank,
+    tpp.ScoreQuintile,
+    CASE 
+        WHEN tpp.ScoreDiffFromNext IS NOT NULL THEN 
+            'Score diff from next: ' || tpp.ScoreDiffFromNext
+        ELSE 'Top performer'
+    END AS ScoreTrend,
+    CASE 
+        WHEN tpp.ScoreDiffFromPrev IS NOT NULL THEN 
+            'Score diff from previous: ' || tpp.ScoreDiffFromPrev
+        ELSE 'Bottom performer'
+    END AS PrevScoreTrend,
+    CASE 
+        WHEN tpp.Score > 500 THEN 'High Engagement'
+        WHEN tpp.Score > 100 THEN 'Medium Engagement'
+        WHEN tpp.Score > 0 THEN 'Low Engagement'
+        ELSE 'No Activity'
+    END AS EngagementLevel,
+    CASE 
+        WHEN tpp.ViewRank <= 10 THEN 'High View Rank'
+        WHEN tpp.ViewRank <= 100 THEN 'Medium View Rank'
+        ELSE 'Low View Rank'
+    END AS PopularityLevel,
+    ROUND(
+        (cua.NetVotes + cua.CommentCount + cua.BadgeCount) * 
+        (cua.Reputation / 1000.0) * 
+        (cua.TotalPosts + 1.0) / 
+        (COALESCE(NULLIF(cua.DaysSinceLastAccess, 0), 1) + 1.0),
+        2
+    ) AS UserPerformanceScore,
+    CASE 
+        WHEN cua.Reputation > 5000 AND cua.TotalPosts > 50 THEN 'Veteran Contributor'
+        WHEN cua.Reputation > 1000 AND cua.TotalPosts > 20 THEN 'Mid-level Contributor'
+        WHEN cua.Reputation > 200 AND cua.TotalPosts > 5 THEN 'Emerging Contributor'
+        ELSE 'New Contributor'
+    END AS ContributionTier,
+    COALESCE(tpp.PostTitles, cua.PostTitles, 'No Titles Available') AS AssociatedPostTitles,
+    CASE 
+        WHEN tpp.TagCount > 5 THEN 'Tag Rich'
+        WHEN tpp.TagCount > 2 THEN 'Moderate Tagging'
+        ELSE 'Minimal Tagging'
+    END AS TaggingProfile
+FROM ComplexUserAnalysis cua
+LEFT JOIN TopPerformingPosts tpp ON cua.UserId = tpp.OwnerUserId_for_join
+WHERE cua.Reputation > 500
+  AND (cua.TotalPosts > 10 OR cua.VoteCount > 50)
+  AND cua.DaysSinceLastAccess < 365
+  AND (
+    tpp.GlobalRank <= 20 OR
+    (tpp.Score > 50 AND tpp.ViewCount > 100) OR
+    tpp.TagCount > 3
+  )
+ORDER BY cua.Reputation DESC, tpp.GlobalRank ASC
+LIMIT 50;

@@ -1,0 +1,115 @@
+WITH
+    top_users AS (
+        SELECT
+            u.id AS user_id,
+            u.displayname AS display_name,
+            u.reputation,
+            COUNT(b.id) FILTER (WHERE b.class = 1) AS gold_badges,
+            COUNT(b.id) FILTER (WHERE b.tagbased = 1) AS tag_badges,
+            COALESCE(SUM(p.score), 0) AS total_score,
+            MAX(p.creationdate) AS last_post_date
+        FROM users u
+        LEFT JOIN badges b ON b.userid = u.id
+        LEFT JOIN posts p ON p.owneruserid = u.id
+        WHERE u.reputation >= 5000
+        GROUP BY u.id, u.displayname, u.reputation
+    ),
+    recent_activity AS (
+        SELECT
+            p.id AS post_id,
+            p.posttypeid,
+            p.title,
+            p.creationdate,
+            u.id AS owner_id,
+            COALESCE(p.score, 0) AS post_score,
+            ROW_NUMBER() OVER (PARTITION BY u.id ORDER BY p.creationdate DESC) AS rn
+        FROM posts p
+        JOIN users u ON u.id = p.owneruserid
+        WHERE p.creationdate >= CAST('2024-10-01' AS date) - INTERVAL '30 days'
+    ),
+    top_activity AS (
+        SELECT
+            ra.post_id,
+            ra.posttypeid,
+            ra.title,
+            ra.creationdate,
+            ra.owner_id,
+            ra.post_score,
+            ra.rn,
+            tu.reputation,
+            tu.gold_badges,
+            tu.tag_badges,
+            CASE
+                WHEN ra.post_score > 10 THEN 'Hot'
+                WHEN ra.post_score BETWEEN 1 AND 10 THEN 'Warm'
+                ELSE 'Cold'
+            END AS heat_level,
+            (SELECT COUNT(*) FROM votes v WHERE v.postid = ra.post_id AND v.votetypeid = 2) AS upvote_count
+        FROM recent_activity ra
+        JOIN top_users tu ON tu.user_id = ra.owner_id
+        WHERE ra.rn <= 5
+    ),
+    duplicate_links AS (
+        SELECT
+            pl.postid,
+            pl.relatedpostid,
+            lt.name AS link_type,
+            CASE WHEN lt.id = 3 THEN 'Duplicate' ELSE lt.name END AS link_desc
+        FROM postlinks pl
+        JOIN linktypes lt ON lt.id = pl.linktypeid
+        WHERE lt.id = 3
+    ),
+    tag_summary AS (
+        SELECT
+            t.tagname,
+            COUNT(p.id) FILTER (WHERE p.posttypeid = 1) AS question_cnt,
+            COUNT(p.id) FILTER (WHERE p.posttypeid = 2) AS answer_cnt,
+            MAX(p.score) AS max_score,
+            STRING_AGG(DISTINCT u.displayname, ', ') FILTER (WHERE u.id IS NOT NULL) AS active_users
+        FROM tags t
+        LEFT JOIN posts p
+            ON p.tags IS NOT NULL
+               AND p.tags LIKE '%' || '<' || t.tagname || '>' || '%'
+        LEFT JOIN users u ON u.id = p.owneruserid
+        GROUP BY t.tagname
+        HAVING COUNT(p.id) > 100
+    )
+
+SELECT
+    tu.user_id,
+    tu.display_name,
+    tu.reputation,
+    tu.gold_badges,
+    tu.tag_badges,
+    ta.post_id,
+    ta.title,
+    ta.heat_level,
+    ta.upvote_count,
+    dl.relatedpostid,
+    dl.link_desc,
+    ts.tagname,
+    ts.question_cnt,
+    ts.answer_cnt,
+    ts.max_score,
+    ts.active_users
+FROM top_users tu
+LEFT JOIN top_activity ta ON ta.owner_id = tu.user_id
+LEFT JOIN duplicate_links dl ON dl.postid = ta.post_id
+LEFT JOIN tag_summary ts
+       ON ts.tagname = ANY (
+              regexp_split_to_array(
+                  replace(replace(ta.title, '<', ''), '>', ''), '\s+'
+              )
+          )
+WHERE (tu.gold_badges > 0 OR ta.heat_level = 'Hot')
+ORDER BY tu.reputation DESC, ta.post_score DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    NULL,NULL,NULL,NULL,NULL,
+    NULL,NULL,NULL,NULL,
+    NULL,NULL,
+    NULL,NULL,NULL,NULL
+WHERE FALSE;

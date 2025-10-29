@@ -1,0 +1,266 @@
+with
+-- recent active users with mixed null handling and derived fields
+recent_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    coalesce(nullif(trim(u.location), ''), 'Unknown') as location_norm,
+    u.reputation,
+    u.creationdate,
+    u.lastaccessdate,
+    extract(epoch from (u.lastaccessdate - u.creationdate)) / 86400.0 as lifetime_days,
+    row_number() over (order by u.reputation desc, u.id) as rn_rep
+  from users u
+  where u.creationdate >= (select min(p.creationdate) from posts p where p.creationdate is not null)
+    and (u.upvotes - coalesce(u.downvotes, 0)) >= 0
+),
+-- aggregate badges with window functions
+badge_stats as (
+  select
+    b.userid,
+    count(*) as badge_count,
+    sum(case when b.class = 1 then 1 else 0 end) as gold_count,
+    sum(case when b.class = 2 then 1 else 0 end) as silver_count,
+    sum(case when b.class = 3 then 1 else 0 end) as bronze_count,
+    max(b.date) as last_badge_date,
+    sum(case when b.tagbased = true then 1 else 0 end) as tag_badges,
+    sum(case when b.tagbased = false then 1 else 0 end) as named_badges,
+    dense_rank() over (partition by b.userid order by max(b.date) desc) as dr_last
+  from badges b
+  group by b.userid
+),
+-- questions with engagement metrics
+question_engagement as (
+  select
+    q.id as question_id,
+    q.owneruserid as asker_id,
+    q.creationdate as q_created,
+    q.score as q_score,
+    q.viewcount,
+    q.answercount,
+    q.favoritecount,
+    q.closeddate,
+    q.title,
+    q.tags,
+    coalesce(q.commentcount, 0) as q_commentcount,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites_votes,
+    max(case when v.votetypeid in (8,9) then v.bountyamount else null end) as bounty_max,
+    min(a.creationdate) as first_answer_date,
+    sum(case when a.score > 0 then 1 else 0 end) as pos_answer_count,
+    sum(case when a.score <= 0 then 1 else 0 end) as nonpos_answer_count
+  from posts q
+  left join votes v on v.postid = q.id
+  left join posts a on a.parentid = q.id and a.posttypeid = 2
+  where q.posttypeid = 1
+  group by q.id, q.owneruserid, q.creationdate, q.score, q.viewcount, q.answercount, q.favoritecount, q.closeddate, q.title, q.tags, q.commentcount
+),
+-- extract tag array and normalized tag name for grouping
+question_tags as (
+  select
+    qe.question_id,
+    unnest(string_to_array(substring(qe.tags, 2, length(qe.tags)-2), '><')) as tag
+  from question_engagement qe
+  where qe.tags is not null and length(qe.tags) > 2
+),
+-- recent link/duplicate relationships
+link_profile as (
+  select
+    pl.postid,
+    count(*) filter (where pl.linktypeid = 1) as linked_count,
+    count(*) filter (where pl.linktypeid = 3) as duplicate_count,
+    max(pl.creationdate) as last_link_date
+  from postlinks pl
+  group by pl.postid
+),
+-- close reasons joined via posthistory JSON/comment overload, and mapping to readable reason
+close_reasons as (
+  select
+    ph.postid,
+    max(ph.creationdate) as last_close_date,
+    max(crt.name) filter (where crt.id::text = nullif(trim(ph.comment), '')) as reason_name_exact,
+    max(crt.name) as any_reason_name
+  from posthistory ph
+  left join closeresontypes crt on ph.posthistorytypeid = 10 and crt.id::text = nullif(trim(ph.comment), '')
+  where ph.posthistorytypeid = 10
+  group by ph.postid
+),
+-- compute rolling windows of answer speeds per asker
+answer_speed as (
+  select
+    qe.question_id,
+    qe.asker_id,
+    extract(epoch from (qe.first_answer_date - qe.q_created)) / 3600.0 as hours_to_first_answer,
+    avg(extract(epoch from (qe.first_answer_date - qe.q_created)) / 3600.0) over (
+      partition by qe.asker_id
+      order by qe.q_created
+      rows between 10 preceding and current row
+    ) as avg_hours_to_first_answer_rolling
+  from question_engagement qe
+  where qe.first_answer_date is not null
+),
+-- pick top questions per tag by composite engagement score
+tag_leaders as (
+  select
+    qt.tag,
+    qe.question_id,
+    qe.title,
+    qe.asker_id,
+    qe.q_created,
+    ((coalesce(qe.upvotes,0) - coalesce(qe.downvotes,0)) * 2
+      + coalesce(qe.viewcount,0) * 0.001
+      + coalesce(qe.favoritecount,0) * 1.5
+      + coalesce(qe.answercount,0) * 0.75
+      - case when qe.closeddate is not null then 5 else 0 end
+      + case when coalesce(lp.duplicate_count,0) > 0 then -3 else 0 end
+      + case when coalesce(lp.linked_count,0) > 0 then 1 else 0 end
+      + coalesce(qe.bounty_max,0) * 0.01) as engagement_score
+  from question_tags qt
+  join question_engagement qe on qe.question_id = qt.question_id
+  left join link_profile lp on lp.postid = qe.question_id
+),
+top_tag_ranked as (
+  select
+    tl.tag,
+    tl.question_id,
+    tl.title,
+    tl.asker_id,
+    tl.q_created,
+    tl.engagement_score,
+    row_number() over (partition by tl.tag order by tl.engagement_score desc, tl.q_created desc, tl.question_id) as rn_tag
+  from tag_leaders tl
+),
+-- correlated subquery for recent commenter diversity
+comment_diversity as (
+  select
+    p.id as post_id,
+    (
+      select count(distinct c.userid)
+      from comments c
+      where c.postid = p.id
+        and c.creationdate >= p.creationdate
+        and c.creationdate < p.creationdate + interval '30 day'
+    ) as distinct_commenters_30d,
+    (
+      select max(c.score) from comments c where c.postid = p.id
+    ) as max_comment_score
+  from posts p
+  where p.posttypeid = 1
+),
+-- bring everything together with outer joins and null-aware predicates
+final as (
+  select
+    ttr.tag,
+    ttr.question_id,
+    ttr.title,
+    u.displayname as asker,
+    ru.location_norm,
+    qe.q_created,
+    qe.viewcount,
+    coalesce(qe.upvotes,0) as upvotes,
+    coalesce(qe.downvotes,0) as downvotes,
+    qe.answercount,
+    qe.favoritecount,
+    round(cast(ttr.engagement_score as numeric), 3) as engagement_score,
+    cs.hours_to_first_answer,
+    cs.avg_hours_to_first_answer_rolling,
+    cd.distinct_commenters_30d,
+    cd.max_comment_score,
+    coalesce(cr.reason_name_exact, cr.any_reason_name, 'Open') as close_reason,
+    coalesce(lp.linked_count,0) as linked_count,
+    coalesce(lp.duplicate_count,0) as duplicate_count,
+    bs.badge_count,
+    bs.gold_count,
+    bs.silver_count,
+    bs.bronze_count,
+    bs.last_badge_date,
+    case
+      when qe.tags is null then 'untagged'
+      when position('java' in lower(qe.tags)) > 0 then 'java-ish'
+      when position('python' in lower(qe.tags)) > 0 then 'python-ish'
+      else 'other'
+    end as lang_hint,
+    -- complex predicate projection
+    case
+      when qe.closeddate is not null and coalesce(lp.duplicate_count,0) > 0 then 'closed-dup'
+      when qe.closeddate is not null then 'closed-other'
+      when coalesce(qe.upvotes,0) - coalesce(qe.downvotes,0) >= 10 then 'hot'
+      when coalesce(qe.viewcount,0) >= 10000 then 'popular'
+      else 'normal'
+    end as status_bucket
+  from top_tag_ranked ttr
+  join question_engagement qe on qe.question_id = ttr.question_id
+  left join link_profile lp on lp.postid = ttr.question_id
+  left join close_reasons cr on cr.postid = ttr.question_id
+  left join answer_speed cs on cs.question_id = ttr.question_id
+  left join comment_diversity cd on cd.post_id = ttr.question_id
+  left join users u on u.id = qe.asker_id
+  left join recent_users ru on ru.user_id = qe.asker_id
+  left join badge_stats bs on bs.userid = qe.asker_id
+  where ttr.rn_tag <= 5
+    and (
+      qe.closeddate is null
+      or (cr.any_reason_name is null or lower(cr.any_reason_name) not like '%off%')
+    )
+    and (
+      (coalesce(qe.upvotes,0) - coalesce(qe.downvotes,0)) >= 0
+      or (coalesce(lp.duplicate_count,0) = 0)
+    )
+),
+-- build a comparator set with set operators for union/intersect/except demo
+popular_open as (
+  select question_id from final where status_bucket in ('hot','popular') and close_reason = 'Open'
+),
+closed_dup as (
+  select question_id from final where status_bucket = 'closed-dup'
+),
+compare as (
+  select
+    'popular_not_dup' as bucket, question_id
+  from popular_open
+  except
+  select
+    'popular_not_dup' as bucket, question_id
+  from closed_dup
+  union all
+  select
+    'both_popular_and_closed_dup' as bucket, question_id
+  from (
+    select question_id from popular_open
+    intersect
+    select question_id from closed_dup
+  ) i
+)
+select
+  f.tag,
+  f.question_id,
+  f.title,
+  f.asker,
+  f.location_norm,
+  f.q_created,
+  f.viewcount,
+  f.upvotes,
+  f.downvotes,
+  f.answercount,
+  f.favoritecount,
+  f.engagement_score,
+  f.hours_to_first_answer,
+  f.avg_hours_to_first_answer_rolling,
+  f.distinct_commenters_30d,
+  f.max_comment_score,
+  f.close_reason,
+  f.linked_count,
+  f.duplicate_count,
+  f.badge_count,
+  f.gold_count,
+  f.silver_count,
+  f.bronze_count,
+  f.last_badge_date,
+  f.lang_hint,
+  f.status_bucket,
+  c.bucket as compare_bucket
+from final f
+left join compare c on c.question_id = f.question_id
+order by f.tag, f.engagement_score desc, f.q_created desc, f.question_id
+limit 500;

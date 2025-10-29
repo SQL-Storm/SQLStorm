@@ -1,0 +1,125 @@
+WITH
+RecentActivity AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Title,
+    p.Tags,
+    p.OwnerUserId,
+    p.ViewCount,
+    p.Score,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.ContentLicense,
+    ROW_NUMBER() OVER (
+      PARTITION BY p.PostTypeId
+      ORDER BY
+        (p.ViewCount * 0.25 + p.Score * 2 + p.AnswerCount * 3 + p.CommentCount) DESC,
+        p.LastActivityDate DESC
+    ) AS rn
+  FROM Posts p
+  LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  WHERE p.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '180 days'
+    AND p.PostTypeId IN (1, 2)
+),
+Editors AS (
+  SELECT
+    p.Id AS PostId,
+    MAX(p.LastEditDate) AS LastEditDate,
+    MAX(p.LastEditorUserId) AS LastEditorUserId,
+    MAX(p.LastEditorDisplayName) AS LastEditorDisplayName,
+    MAX(p.LastActivityDate) AS LastActivityDate
+  FROM Posts p
+  GROUP BY p.Id
+),
+OwnerBadges AS (
+  SELECT
+    u.Id AS UserId,
+    COALESCE(SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END), 0) AS GoldBadges,
+    COALESCE(SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END), 0) AS SilverBadges,
+    COALESCE(SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END), 0) AS BronzeBadges
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  GROUP BY u.Id
+),
+LinkedOrDuplicate AS (
+  SELECT
+    pl.PostId,
+    pl.RelatedPostId,
+    lt.Name AS LinkTypeName
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+  WHERE pl.LinkTypeId IN (1, 3)
+),
+UserStats AS (
+  SELECT
+    u.Id AS UserId,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.DisplayName,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.AccountId,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.Views DESC) AS UserRank
+  FROM Users u
+),
+Final AS (
+  SELECT
+    ra.PostId,
+    ra.PostTypeId,
+    ra.CreationDate AS PostCreationDate,
+    ra.LastActivityDate,
+    ra.Title,
+    ra.Tags,
+    ra.OwnerUserId,
+    ra.ViewCount,
+    ra.Score,
+    ra.CommentCount,
+    ra.AnswerCount,
+    ra.FavoriteCount,
+    ra.ContentLicense,
+    e.LastEditDate,
+    e.LastEditorUserId,
+    e.LastEditorDisplayName,
+    (COALESCE(ob.GoldBadges,0) + COALESCE(ob.SilverBadges,0) + COALESCE(ob.BronzeBadges,0)) AS TotalBadges,
+    ob.GoldBadges,
+    ob.SilverBadges,
+    ob.BronzeBadges,
+    u.UserRank,
+    CASE
+      WHEN u.Reputation IS NULL THEN 0
+      ELSE u.Reputation
+    END AS ReputationScore,
+    CASE
+      WHEN ra.PostTypeId = 1 THEN 'Question'
+      WHEN ra.PostTypeId = 2 THEN 'Answer'
+      ELSE 'Other'
+    END AS PostKind,
+    CASE
+      WHEN ra.ViewCount > 1000 THEN 'Popular'
+      WHEN ra.ViewCount > 100 THEN 'Trending'
+      ELSE 'Low'
+    END AS EngagementBand,
+    ARRAY_AGG(DISTINCT l.LinkTypeName) FILTER (WHERE l.PostId = ra.PostId) AS LinkTypes
+  FROM RecentActivity ra
+  LEFT JOIN Editors e ON e.PostId = ra.PostId
+  LEFT JOIN UserStats u ON u.UserId = ra.OwnerUserId
+  LEFT JOIN OwnerBadges ob ON ob.UserId = ra.OwnerUserId
+  LEFT JOIN LinkedOrDuplicate l ON l.PostId = ra.PostId
+  GROUP BY
+    ra.PostId, ra.PostTypeId, ra.CreationDate, ra.LastActivityDate, ra.Title, ra.Tags,
+    ra.OwnerUserId, ra.ViewCount, ra.Score, ra.CommentCount, ra.AnswerCount, ra.FavoriteCount,
+    ra.ContentLicense, e.LastEditDate, e.LastEditorUserId, e.LastEditorDisplayName,
+    ob.GoldBadges, ob.SilverBadges, ob.BronzeBadges, u.UserRank, u.Reputation
+)
+SELECT *
+FROM Final
+WHERE UserRank <= 500
+ORDER BY ReputationScore DESC NULLS LAST, PostCreationDate DESC, PostId
+LIMIT 200;

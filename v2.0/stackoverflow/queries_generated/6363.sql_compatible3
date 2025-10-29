@@ -1,0 +1,90 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.Title,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        U.DisplayName,
+        U.Reputation,
+        P.OwnerUserId AS OwnerUserId,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.ViewCount DESC) AS rank,
+        P.Tags
+    FROM 
+        Posts P
+    JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId IN (1, 2) AND P.Score > 0
+),
+BadgeCounts AS (
+    SELECT 
+        U.Id AS UserId,
+        COUNT(DISTINCT B.Id) AS BadgeCount
+    FROM 
+        Users U
+    JOIN 
+        Badges B ON U.Id = B.UserId
+    GROUP BY 
+        U.Id
+)
+SELECT 
+    RP.Id,
+    RP.Title,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.DisplayName,
+    RP.Reputation,
+    COALESCE(BC.BadgeCount, 0) AS BadgeCount,
+    CASE
+        WHEN RP.rank <= 3 THEN 'Top'
+        WHEN RP.rank <= 10 THEN 'Top 10'
+        ELSE 'Other'
+    END AS RankCategory,
+    (
+        SELECT 
+            STRING_AGG(T.TagName, ', ')
+        FROM 
+            (
+                SELECT TRIM(BOTH '<>' FROM tag) AS tag
+                FROM (
+                    -- split tags like "<tag1><tag2>" into rows using regexp_extract / substring-based approach
+                    SELECT
+                        regexp_extract(RP.Tags, '<([^>]+)>', seq) AS tag
+                    FROM (
+                        -- generate a sequence of numbers up to a reasonable limit (e.g., 50)
+                        SELECT 1 AS seq UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5
+                        UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9 UNION ALL SELECT 10
+                        UNION ALL SELECT 11 UNION ALL SELECT 12 UNION ALL SELECT 13 UNION ALL SELECT 14 UNION ALL SELECT 15
+                        UNION ALL SELECT 16 UNION ALL SELECT 17 UNION ALL SELECT 18 UNION ALL SELECT 19 UNION ALL SELECT 20
+                        UNION ALL SELECT 21 UNION ALL SELECT 22 UNION ALL SELECT 23 UNION ALL SELECT 24 UNION ALL SELECT 25
+                        UNION ALL SELECT 26 UNION ALL SELECT 27 UNION ALL SELECT 28 UNION ALL SELECT 29 UNION ALL SELECT 30
+                        UNION ALL SELECT 31 UNION ALL SELECT 32 UNION ALL SELECT 33 UNION ALL SELECT 34 UNION ALL SELECT 35
+                        UNION ALL SELECT 36 UNION ALL SELECT 37 UNION ALL SELECT 38 UNION ALL SELECT 39 UNION ALL SELECT 40
+                        UNION ALL SELECT 41 UNION ALL SELECT 42 UNION ALL SELECT 43 UNION ALL SELECT 44 UNION ALL SELECT 45
+                        UNION ALL SELECT 46 UNION ALL SELECT 47 UNION ALL SELECT 48 UNION ALL SELECT 49 UNION ALL SELECT 50
+                    ) seqs
+                    WHERE regexp_extract(RP.Tags, '<([^>]+)>', seq) IS NOT NULL
+                ) sub
+            ) s
+        LEFT JOIN 
+            Tags T ON CASE WHEN s.tag ~ '^[0-9]+$' THEN CAST(s.tag AS INTEGER) ELSE NULL END = T.Id
+    ) AS Tags
+FROM 
+    RankedPosts RP
+LEFT JOIN 
+    BadgeCounts BC ON RP.OwnerUserId = BC.UserId
+GROUP BY
+    RP.Id,
+    RP.Title,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.DisplayName,
+    RP.Reputation,
+    BC.BadgeCount,
+    RP.rank,
+    RP.Tags
+ORDER BY 
+    RP.Score DESC, RP.ViewCount DESC;

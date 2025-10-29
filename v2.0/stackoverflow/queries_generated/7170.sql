@@ -1,0 +1,232 @@
+-- {"query": "7170.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1938} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        COUNT(DISTINCT c.Id) AS Comments,
+        COUNT(DISTINCT b.Id) AS Badges,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        MAX(b.Date) AS LastBadgeDate,
+        DATEDIFF(CURRENT_TIMESTAMP, u.CreationDate) AS AccountAgeDays,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Diamond'
+            WHEN u.Reputation >= 1000 THEN 'Platinum'
+            WHEN u.Reputation >= 500 THEN 'Gold'
+            WHEN u.Reputation >= 100 THEN 'Silver'
+            ELSE 'Bronze'
+        END AS ReputationTier,
+        COALESCE(
+            (SELECT COUNT(*) 
+             FROM Posts p2 
+             WHERE p2.OwnerUserId = u.Id 
+               AND p2.PostTypeId = 1 
+               AND p2.Score >= 100), 0) AS HighScoreQuestions,
+        COALESCE(
+            (SELECT COUNT(*) 
+             FROM Posts p3 
+             WHERE p3.OwnerUserId = u.Id 
+               AND p3.PostTypeId = 2 
+               AND p3.Score >= 50), 0) AS HighScoreAnswers
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate
+),
+TopTags AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank,
+        AVG(CASE WHEN p.Score > 0 THEN p.Score END) AS AvgScore,
+        COUNT(DISTINCT p.OwnerUserId) AS UserCount
+    FROM Tags t
+    INNER JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    WHERE p.PostTypeId = 1
+    GROUP BY t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId
+),
+ActivityTimeline AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        p.CreationDate,
+        p.Score,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END AS PostType,
+        p.Title,
+        p.ViewCount,
+        LEAD(p.CreationDate, 1) OVER (
+            PARTITION BY u.Id 
+            ORDER BY p.CreationDate
+        ) AS NextPostDate,
+        DATEDIFF(
+            LEAD(p.CreationDate, 1) OVER (
+                PARTITION BY u.Id 
+                ORDER BY p.CreationDate
+            ), 
+            p.CreationDate
+        ) AS DaysBetweenPosts,
+        ROW_NUMBER() OVER (
+            PARTITION BY u.Id 
+            ORDER BY p.CreationDate
+        ) AS PostSequence,
+        AVG(p.Score) OVER (
+            PARTITION BY u.Id 
+            ORDER BY p.CreationDate 
+            ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+        ) AS MovingAvgScore
+    FROM Users u
+    INNER JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE p.CreationDate >= DATEADD('YEAR', -2, CURRENT_TIMESTAMP)
+),
+UserPerformance AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.TotalPosts,
+        uas.Questions,
+        uas.Answers,
+        uas.Comments,
+        uas.Badges,
+        uas.LastPostDate,
+        uas.AccountAgeDays,
+        uas.ReputationTier,
+        uas.HighScoreQuestions,
+        uas.HighScoreAnswers,
+        CASE 
+            WHEN uas.TotalPosts > 0 THEN 
+                CAST(uas.HighScoreQuestions AS FLOAT) / uas.TotalPosts * 100
+            ELSE 0 
+        END AS HighScoreQuestionPercentage,
+        CASE 
+            WHEN uas.Answers > 0 THEN 
+                CAST(uas.HighScoreAnswers AS FLOAT) / uas.Answers * 100
+            ELSE 0 
+        END AS HighScoreAnswerPercentage,
+        DENSE_RANK() OVER (ORDER BY uas.Reputation DESC) AS RepRank,
+        DENSE_RANK() OVER (ORDER BY uas.TotalPosts DESC) AS PostRank,
+        DENSE_RANK() OVER (ORDER BY uas.Badges DESC) AS BadgeRank
+    FROM UserActivityStats uas
+),
+RankedUsers AS (
+    SELECT 
+        *,
+        CASE 
+            WHEN RepRank <= 10 AND PostRank <= 10 THEN 'Top Performer'
+            WHEN RepRank <= 50 AND PostRank <= 50 THEN 'High Performer'
+            WHEN RepRank <= 100 AND PostRank <= 100 THEN 'Regular Performer'
+            ELSE 'Standard User'
+        END AS UserPerformanceCategory
+    FROM UserPerformance
+)
+SELECT 
+    ru.UserId,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.TotalPosts,
+    ru.Questions,
+    ru.Answers,
+    ru.Comments,
+    ru.Badges,
+    ru.LastPostDate,
+    ru.AccountAgeDays,
+    ru.ReputationTier,
+    ru.HighScoreQuestions,
+    ru.HighScoreAnswers,
+    ru.HighScoreQuestionPercentage,
+    ru.HighScoreAnswerPercentage,
+    ru.RepRank,
+    ru.PostRank,
+    ru.BadgeRank,
+    ru.UserPerformanceCategory,
+    tt.TagName,
+    tt.Count AS TagCount,
+    tt.AvgScore AS AvgQuestionScore,
+    tt.UserCount,
+    tt.TagRank,
+    at.PostType,
+    at.Title,
+    at.Score,
+    at.ViewCount,
+    at.DaysBetweenPosts,
+    at.PostSequence,
+    at.MovingAvgScore,
+    COALESCE(
+        (SELECT COUNT(DISTINCT ph.Id) 
+         FROM PostHistory ph 
+         WHERE ph.UserId = ru.UserId 
+           AND ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15)
+           AND ph.CreationDate >= DATEADD('MONTH', -6, CURRENT_TIMESTAMP)
+        ), 0) AS RecentModerationActions,
+    CASE 
+        WHEN ru.Reputation >= 10000 THEN '🏆'
+        WHEN ru.Reputation >= 1000 THEN '⭐'
+        WHEN ru.Reputation >= 500 THEN '🥇'
+        WHEN ru.Reputation >= 100 THEN '🥈'
+        ELSE '🥉'
+    END AS ReputationEmoji,
+    ROW_NUMBER() OVER (
+        ORDER BY 
+            ru.Reputation DESC,
+            ru.TotalPosts DESC,
+            ru.Badges DESC
+    ) AS OverallRanking,
+    LAG(ru.Reputation, 1) OVER (
+        ORDER BY ru.Reputation DESC
+    ) - ru.Reputation AS RepDifferenceFromNext,
+    CASE 
+        WHEN ru.AccountAgeDays > 365 THEN 
+            CAST(ru.TotalPosts AS FLOAT) / (ru.AccountAgeDays / 30.0)
+        ELSE NULL
+    END AS MonthlyActivityRate,
+    COALESCE(
+        (SELECT STRING_AGG(
+            DISTINCT t.TagName, 
+            ', ' 
+            ORDER BY t.TagName
+        )
+         FROM Posts p 
+         INNER JOIN Tags t ON p.Tags LIKE '%' || t.TagName || '%'
+         WHERE p.OwnerUserId = ru.UserId 
+           AND p.PostTypeId = 1
+         GROUP BY p.OwnerUserId
+        ), 'No Tags') AS UserTopTags,
+    (SELECT COUNT(*) 
+     FROM Posts p 
+     WHERE p.OwnerUserId = ru.UserId 
+       AND p.PostTypeId = 1 
+       AND p.Score > 0) AS PositiveQuestionCount,
+    (SELECT COUNT(*) 
+     FROM Posts p 
+     WHERE p.OwnerUserId = ru.UserId 
+       AND p.PostTypeId = 2 
+       AND p.Score > 0) AS PositiveAnswerCount
+FROM RankedUsers ru
+LEFT JOIN TopTags tt ON tt.TagRank <= 5
+LEFT JOIN ActivityTimeline at ON at.UserId = ru.UserId
+WHERE ru.Reputation > 100
+  AND (ru.Reputation > 1000 OR ru.TotalPosts > 5)
+  AND (tt.TagName IS NOT NULL OR at.UserId IS NOT NULL)
+ORDER BY 
+    ru.Reputation DESC,
+    ru.TotalPosts DESC,
+    ru.Badges DESC,
+    tt.TagRank ASC,
+    at.CreationDate DESC
+LIMIT 1000;

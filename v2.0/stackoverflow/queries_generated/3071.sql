@@ -1,0 +1,89 @@
+-- {"query": "3071.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1769} 
+
+WITH user_stats AS (
+    SELECT
+        u.Id                                 AS user_id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.UpVotes,0) - COALESCE(u.DownVotes,0)          AS net_votes,
+        COUNT(DISTINCT b.Id)                                   AS badge_count,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1)    AS question_count,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2)    AS answer_count,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 1)           AS avg_question_score,
+        MAX(p.CreationDate)                                   AS last_post_date,
+        STRING_AGG(DISTINCT t.TagName, ',') 
+            FILTER (WHERE p.PostTypeId = 1)                    AS top_question_tags
+    FROM Users u
+    LEFT JOIN Badges b   ON b.UserId = u.Id
+    LEFT JOIN Posts p    ON p.OwnerUserId = u.Id
+    LEFT JOIN LATERAL (
+        SELECT unnest(string_to_array(trim(both '<>' FROM p.Tags), '><')) AS tag
+    ) AS taglist ON true
+    LEFT JOIN Tags t     ON t.TagName = taglist.tag
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes
+),
+
+recent_history AS (
+    SELECT
+        ph.UserId,
+        MAX(ph.CreationDate) AS last_history_date
+    FROM PostHistory ph
+    GROUP BY ph.UserId
+),
+
+ranked_users AS (
+    SELECT
+        us.*,
+        ROW_NUMBER() OVER (
+            ORDER BY (us.Reputation * 0.6 + us.BadgeCount * 10 + us.NetVotes * 0.3) DESC
+        ) AS rn
+    FROM user_stats us
+    WHERE us.QuestionCount > 0 OR us.AnswerCount > 0
+)
+
+SELECT
+    ru.user_id,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.badge_count,
+    ru.question_count,
+    ru.answer_count,
+    ru.avg_question_score,
+    ru.net_votes,
+    COALESCE(rh.last_history_date, TIMESTAMP '1970-01-01') AS last_history_date,
+    CASE
+        WHEN ru.top_question_tags IS NULL THEN 'NoTags'
+        ELSE ru.top_question_tags
+    END AS top_tags,
+    CASE
+        WHEN EXISTS (
+            SELECT 1
+            FROM Posts p
+            WHERE p.OwnerUserId = ru.user_id AND p.Score < 0
+        ) THEN 'HasNegScorePosts'
+        ELSE 'AllPositiveOrZero'
+    END AS neg_score_flag
+FROM ranked_users ru
+LEFT JOIN recent_history rh ON rh.UserId = ru.user_id
+WHERE ru.rn <= 10
+
+UNION ALL
+
+SELECT
+    u.Id                               AS user_id,
+    u.DisplayName,
+    u.Reputation,
+    0                                   AS badge_count,
+    0                                   AS question_count,
+    0                                   AS answer_count,
+    NULL                                AS avg_question_score,
+    0                                   AS net_votes,
+    NULL                                AS last_history_date,
+    'NoTags'                            AS top_tags,
+    'NoPosts'                           AS neg_score_flag
+FROM Users u
+WHERE NOT EXISTS (SELECT 1 FROM Posts p   WHERE p.OwnerUserId = u.Id)
+  AND NOT EXISTS (SELECT 1 FROM Badges b  WHERE b.UserId     = u.Id)
+
+ORDER BY Reputation DESC, user_id
+LIMIT 20;

@@ -1,0 +1,91 @@
+-- {"query": "5675.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 758} 
+WITH
+RecentActive AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.Body,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    u.Reputation AS OwnerReputation,
+    u.DisplayName AS OwnerDisplayName,
+    COALESCE(v.TotalUpVotes, 0) AS UpVotesFromVotes,
+    COALESCE(v.TotalDownVotes, 0) AS DownVotesFromVotes,
+    pc.ClosedDate,
+    ch.Name AS CloseReasonName
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN (
+    SELECT
+      PostId,
+      SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotes,
+      SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotes
+    FROM Votes
+    GROUP BY PostId
+  ) v ON p.Id = v.PostId
+  LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+  LEFT JOIN CloseReasonTypes ch ON CAST(ph.Comment AS VARCHAR(100)) LIKE '%' || ch.Id || '%'
+  LEFT JOIN (
+    SELECT Id, PostId, MAX(ClosedDate) AS ClosedDate
+    FROM Posts
+    WHERE ClosedDate IS NOT NULL
+    GROUP BY Id, PostId
+  ) pc ON pc.PostId = p.Id
+  WHERE p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+),
+TagPopularity AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS TagCount,
+    AVG(p.Score) AS AvgPostScore
+  FROM Tags t
+  JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+  WHERE p.PostTypeId = 1
+  GROUP BY t.TagName
+),
+CorrelatedStats AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.Score,
+    p.ViewCount,
+    u.Reputation AS UserReputation,
+    w.Name AS WikiTagName,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate DESC) AS rn
+  FROM Posts p
+  JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Tags w ON w.TagName = (SELECT unnest(string_to_array(substr(p.Tags, 2, length(p.Tags)-2), '><')) LIMIT 1)
+  WHERE p.LastActivityDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '7 days'
+)
+SELECT
+  ra.PostId,
+  ra.Title,
+  ra.Tags,
+  ra.Score,
+  ra.ViewCount,
+  ra.OwnerDisplayName,
+  ra.OwnerReputation,
+  ra.ClosedDate,
+  ra.CloseReasonName,
+  tp.TagCount,
+  tp.AvgPostScore,
+  cs.UserReputation AS CorrelatedUserReputation,
+  cs.rn
+FROM RecentActive ra
+LEFT JOIN TagPopularity tp ON ra.Tags LIKE '%' || tp.TagName || '%'
+LEFT JOIN CorrelatedStats cs ON ra.PostId = cs.PostId
+WHERE
+  ra.ViewCount > 100
+  AND ra.Score BETWEEN -5 AND 100
+  AND (ra.CloseReasonName IS NULL OR ra.CloseReasonName NOT IN ('Too localized', 'Not a real question'))
+ORDER BY ra.LastActivityDate DESC, ra.Score DESC
+LIMIT 200;

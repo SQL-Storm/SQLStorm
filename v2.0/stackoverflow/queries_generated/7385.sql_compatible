@@ -1,0 +1,294 @@
+WITH PostStats AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Title,
+        p.Tags,
+        p.Body,
+        COALESCE(p.AcceptedAnswerId, 0) AS AcceptedAnswerId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END AS PostTypeDescription,
+        CASE 
+            WHEN p.Score > 100 THEN 'HighlyVoted'
+            WHEN p.Score > 50 THEN 'ModeratelyVoted'
+            WHEN p.Score > 0 THEN 'LowVoted'
+            ELSE 'Unvoted'
+        END AS VoteCategory,
+        CAST(julianday(COALESCE(p.LastActivityDate, p.CreationDate)) - julianday(p.CreationDate) AS INTEGER) AS DaysSinceCreation,
+        CASE 
+            WHEN p.ParentId IS NOT NULL AND p.PostTypeId = 2 THEN (SELECT COUNT(*) FROM Posts WHERE ParentId = p.ParentId AND PostTypeId = 2)
+            ELSE 0
+        END AS AnswerCountForQuestion
+    FROM Posts p
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.CreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        AVG(p.Score) AS AveragePostScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        STRING_AGG(DISTINCT p.Title, ', ') AS PostTitles
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate, u.LastAccessDate
+),
+DetailedVotes AS (
+    SELECT 
+        v.PostId,
+        v.VoteTypeId,
+        v.UserId,
+        v.CreationDate,
+        vt.Name AS VoteTypeName,
+        CASE 
+            WHEN v.VoteTypeId IN (1, 2, 3) THEN 'PostVote'
+            WHEN v.VoteTypeId IN (5, 8, 9) THEN 'BountyVote'
+            ELSE 'OtherVote'
+        END AS VoteCategory,
+        ROW_NUMBER() OVER (PARTITION BY v.PostId, v.UserId ORDER BY v.CreationDate) AS VoteSequence,
+        LAG(v.CreationDate, 1) OVER (PARTITION BY v.PostId ORDER BY v.CreationDate) AS PreviousVoteDate,
+        CAST((strftime('%s', v.CreationDate) - strftime('%s', LAG(v.CreationDate, 1) OVER (PARTITION BY v.PostId ORDER BY v.CreationDate))) / 60.0 AS INTEGER) AS MinutesBetweenVotes
+    FROM Votes v
+    INNER JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+),
+PostWithHistory AS (
+    SELECT 
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.UserId,
+        ph.CreationDate,
+        pht.Name AS HistoryTypeName,
+        ph.Comment,
+        ph.Text,
+        ph.RevisionGUID,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId, ph.PostHistoryTypeId ORDER BY ph.CreationDate DESC) AS RecentHistoryOrder,
+        CASE 
+            WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20) THEN 'PostStateChange'
+            WHEN ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 7, 8, 9) THEN 'PostEdit'
+            ELSE 'OtherHistory'
+        END AS HistoryTypeCategory
+    FROM PostHistory ph
+    INNER JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'PopularTag'
+            WHEN t.Count > 100 THEN 'ModerateTag'
+            WHEN t.Count > 10 THEN 'NicheTag'
+            ELSE 'RareTag'
+        END AS TagCategory,
+        COALESCE((SELECT COUNT(*) FROM Posts WHERE Tags LIKE '%' || t.TagName || '%'), 0) AS QuestionsUsingThisTag
+    FROM Tags t
+),
+CombinedAnalysis AS (
+    SELECT 
+        ps.Id AS PostId,
+        ps.PostTypeId,
+        ps.OwnerUserId,
+        ps.Score,
+        ps.ViewCount,
+        ps.AnswerCount,
+        ps.CommentCount,
+        ps.FavoriteCount,
+        ps.CreationDate,
+        ps.LastActivityDate,
+        ps.Title,
+        ps.Tags,
+        ps.PostTypeDescription,
+        ps.VoteCategory,
+        ps.DaysSinceCreation,
+        ps.AnswerCountForQuestion,
+        ua.DisplayName AS OwnerDisplayName,
+        ua.Reputation AS OwnerReputation,
+        ua.PostCount AS OwnerPostCount,
+        ua.QuestionCount AS OwnerQuestionCount,
+        ua.AnswerCount AS OwnerAnswerCount,
+        COALESCE(ua.PostTitles, '') AS OwnerPostTitles,
+        dv.VoteCategory AS VoteCategoryForPost,
+        dv.VoteTypeName AS LastVoteTypeName,
+        dv.VoteSequence AS VoteSequenceInPost,
+        dv.MinutesBetweenVotes AS MinutesBetweenLastVotes,
+        ph.HistoryTypeName AS RecentHistoryTypeName,
+        ph.HistoryTypeCategory AS RecentHistoryTypeCategory,
+        ta.TagCategory AS MostUsedTagCategory,
+        ta.QuestionsUsingThisTag AS TagUsageCount,
+        ROW_NUMBER() OVER (PARTITION BY ps.OwnerUserId ORDER BY ps.Score DESC) AS UserPostRank,
+        RANK() OVER (ORDER BY ps.Score DESC) AS GlobalPostRank,
+        DENSE_RANK() OVER (ORDER BY ps.Score DESC) AS ScoreRank
+    FROM PostStats ps
+    LEFT JOIN UserActivity ua ON ps.OwnerUserId = ua.UserId
+    LEFT JOIN DetailedVotes dv ON ps.Id = dv.PostId AND dv.VoteSequence = 1
+    LEFT JOIN PostWithHistory ph ON ps.Id = ph.PostId AND ph.RecentHistoryOrder = 1
+    LEFT JOIN TagAnalysis ta ON ps.Tags LIKE '%' || ta.TagName || '%'
+    WHERE ps.CreationDate >= '2020-01-01'
+),
+FinalAggregation AS (
+    SELECT 
+        ca.PostId,
+        ca.OwnerUserId,
+        ca.Score,
+        ca.ViewCount,
+        ca.AnswerCount,
+        ca.CommentCount,
+        ca.FavoriteCount,
+        ca.CreationDate,
+        ca.LastActivityDate,
+        ca.Title,
+        ca.Tags,
+        ca.PostTypeDescription,
+        ca.VoteCategory,
+        ca.DaysSinceCreation,
+        ca.OwnerDisplayName,
+        ca.OwnerReputation,
+        ca.OwnerPostCount,
+        ca.OwnerQuestionCount,
+        ca.OwnerAnswerCount,
+        ca.OwnerPostTitles,
+        ca.VoteCategoryForPost,
+        ca.LastVoteTypeName,
+        ca.VoteSequenceInPost,
+        ca.MinutesBetweenLastVotes,
+        ca.RecentHistoryTypeName,
+        ca.RecentHistoryTypeCategory,
+        ca.MostUsedTagCategory AS TagCategory,
+        ca.TagUsageCount,
+        ca.UserPostRank,
+        ca.GlobalPostRank,
+        ca.ScoreRank,
+        CASE 
+            WHEN ca.OwnerReputation > 10000 AND ca.OwnerPostCount > 500 THEN 'EliteUser'
+            WHEN ca.OwnerReputation > 5000 AND ca.OwnerPostCount > 100 THEN 'ExperiencedUser'
+            WHEN ca.OwnerReputation > 1000 THEN 'RegularUser'
+            ELSE 'NewbieUser'
+        END AS UserClassification,
+        CASE 
+            WHEN ca.Score >= 1000 THEN 'ViralPost'
+            WHEN ca.Score >= 500 THEN 'PopularPost'
+            WHEN ca.Score >= 100 THEN 'ModeratePost'
+            WHEN ca.Score > 0 THEN 'LowPost'
+            ELSE 'NonVotedPost'
+        END AS PostRating,
+        CASE 
+            WHEN ca.LastActivityDate >= '2023-01-01' THEN 'Active'
+            WHEN ca.LastActivityDate >= '2022-01-01' THEN 'ModeratelyActive'
+            WHEN ca.LastActivityDate >= '2021-01-01' THEN 'Inactive'
+            ELSE 'VeryInactive'
+        END AS ActivityStatus,
+        (REPLACE(COALESCE(ca.Title, ''), ' ', '_') || '_' || CAST(ca.PostId AS TEXT)) AS CleanTitlePostId,
+        UPPER(SUBSTR(ca.Tags, 1, 10)) AS TagPrefix,
+        CAST(julianday('2024-10-01 12:34:56') - julianday(ca.CreationDate) AS INTEGER) AS DaysSincePostCreation,
+        CASE 
+            WHEN ca.AnswerCount > 0 THEN (CAST(ca.Score AS REAL) / CAST(ca.AnswerCount AS REAL))
+            ELSE NULL
+        END AS ScorePerAnswer,
+        CASE 
+            WHEN ca.ViewCount > 0 THEN (CAST(ca.Score AS REAL) / CAST(ca.ViewCount AS REAL))
+            ELSE NULL
+        END AS ScorePerView,
+        CASE 
+            WHEN ca.CommentCount > 0 THEN (CAST(ca.Score AS REAL) / CAST(ca.CommentCount AS REAL))
+            ELSE NULL
+        END AS ScorePerComment,
+        CASE 
+            WHEN ca.FavoriteCount > 0 THEN (CAST(ca.Score AS REAL) / CAST(ca.FavoriteCount AS REAL))
+            ELSE NULL
+        END AS ScorePerFavorite,
+        (NULLIF(ca.Score, 0) IS NOT NULL) AS HasScoreValue,
+        COALESCE(ca.OwnerDisplayName, 'Anonymous') AS UserIdentifier,
+        ABS(ca.Score - (SELECT AVG(Score) FROM Posts)) AS ScoreDeviationFromAverage,
+        NTILE(100) OVER (ORDER BY ca.Score DESC) AS ScorePercentile
+    FROM CombinedAnalysis ca
+)
+SELECT 
+    fa.PostId,
+    fa.OwnerUserId,
+    fa.Score,
+    fa.ViewCount,
+    fa.AnswerCount,
+    fa.CommentCount,
+    fa.FavoriteCount,
+    fa.CreationDate,
+    fa.LastActivityDate,
+    fa.Title,
+    fa.Tags,
+    fa.PostTypeDescription,
+    fa.VoteCategory,
+    fa.DaysSinceCreation,
+    fa.OwnerDisplayName,
+    fa.OwnerReputation,
+    fa.OwnerPostCount,
+    fa.OwnerQuestionCount,
+    fa.OwnerAnswerCount,
+    fa.OwnerPostTitles,
+    fa.VoteCategoryForPost,
+    fa.LastVoteTypeName,
+    fa.VoteSequenceInPost,
+    fa.MinutesBetweenLastVotes,
+    fa.RecentHistoryTypeName,
+    fa.RecentHistoryTypeCategory,
+    fa.TagCategory,
+    fa.TagUsageCount,
+    fa.UserPostRank,
+    fa.GlobalPostRank,
+    fa.ScoreRank,
+    fa.UserClassification,
+    fa.PostRating,
+    fa.ActivityStatus,
+    fa.CleanTitlePostId,
+    fa.TagPrefix,
+    fa.DaysSincePostCreation,
+    fa.ScorePerAnswer,
+    fa.ScorePerView,
+    fa.ScorePerComment,
+    fa.ScorePerFavorite,
+    fa.HasScoreValue,
+    fa.UserIdentifier,
+    fa.ScoreDeviationFromAverage,
+    fa.ScorePercentile,
+    CASE 
+        WHEN fa.Score > 1000 AND fa.ViewCount > 5000 THEN 'HighTrafficViral'
+        WHEN fa.Score > 500 THEN 'HighTrafficModerate'
+        WHEN fa.ViewCount > 1000 THEN 'ModerateTraffic'
+        ELSE 'LowTraffic'
+    END AS TrafficClassification
+FROM FinalAggregation fa
+WHERE fa.Score IS NOT NULL
+  AND (fa.PostRating IN ('ViralPost', 'PopularPost') OR fa.PostTypeDescription = 'Question') 
+  AND fa.OwnerReputation > 100
+  AND fa.DaysSincePostCreation < 365
+  AND fa.UserClassification IN ('EliteUser', 'ExperiencedUser')
+  AND fa.ActivityStatus IN ('Active', 'ModeratelyActive')
+  AND fa.TagCategory IN ('PopularTag', 'ModerateTag')
+  AND fa.TagUsageCount > 10
+  AND fa.ScoreDeviationFromAverage > 50
+ORDER BY fa.Score DESC, fa.ViewCount DESC
+LIMIT 1000;

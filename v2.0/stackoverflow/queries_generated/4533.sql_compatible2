@@ -1,0 +1,168 @@
+WITH
+  QuestionDetails AS (
+    SELECT
+      p.Id AS QuestionId,
+      p.Title AS QuestionTitle,
+      p.OwnerUserId AS QuestionOwnerUserId,
+      u.DisplayName AS QuestionOwnerDisplayName,
+      p.CreationDate AS QuestionCreationDate,
+      p.Score AS QuestionScore,
+      p.ViewCount AS QuestionViewCount,
+      p.AnswerCount AS QuestionAnswerCount,
+      p.FavoriteCount AS QuestionFavoriteCount,
+      p.ClosedDate AS QuestionClosedDate,
+      CASE
+        WHEN p.ClosedDate IS NOT NULL THEN EXTRACT(EPOCH FROM (p.ClosedDate - p.CreationDate)) / 60
+        ELSE NULL
+      END AS TimeToCloseMinutes,
+      pt.Name AS PostTypeName,
+      (
+        SELECT
+          COUNT(ph.Id)
+        FROM
+          PostHistory ph
+        WHERE
+          ph.PostId = p.Id
+          AND ph.PostHistoryTypeId IN (4, 5, 6)
+      ) AS EditCount
+    FROM
+      Posts p
+      JOIN PostTypes pt
+        ON p.PostTypeId = pt.Id
+      LEFT JOIN Users u
+        ON p.OwnerUserId = u.Id
+    WHERE
+      p.PostTypeId = 1
+  ),
+  AnswerDetails AS (
+    SELECT
+      p.Id AS AnswerId,
+      p.ParentId AS QuestionId,
+      p.OwnerUserId AS AnswerOwnerUserId,
+      u.DisplayName AS AnswerOwnerDisplayName,
+      p.CreationDate AS AnswerCreationDate,
+      p.Score AS AnswerScore,
+      CASE
+        WHEN p.Id = qd.QuestionId AND qd.QuestionId IS NOT NULL AND qd.QuestionId = qd.QuestionId THEN
+          CASE WHEN p.Id = (SELECT q2.AcceptedAnswerId FROM Posts q2 WHERE q2.Id = p.ParentId) THEN 1 ELSE 0 END
+        WHEN p.Id = qd.AcceptedAnswerId THEN 1
+        ELSE 0
+      END AS IsAcceptedAnswer
+    FROM
+      Posts p
+      LEFT JOIN Users u
+        ON p.OwnerUserId = u.Id
+      LEFT JOIN QuestionDetails qd
+        ON p.ParentId = qd.QuestionId
+    WHERE
+      p.PostTypeId = 2
+  ),
+  CommentDetails AS (
+    SELECT
+      c.PostId AS TargetPostId,
+      COUNT(c.Id) AS CommentCount,
+      SUM(c.Score) AS TotalCommentScore,
+      AVG(CAST(c.Score AS DECIMAL(10, 2))) AS AverageCommentScore,
+      MAX(c.CreationDate) AS LastCommentDate
+    FROM
+      Comments c
+    GROUP BY
+      c.PostId
+  ),
+  UserActivity AS (
+    SELECT
+      UserId,
+      COUNT(Id) AS VoteCount,
+      SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+      SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+      SUM(CASE WHEN VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoriteCount,
+      MAX(CreationDate) AS LastVoteDate
+    FROM
+      Votes
+    WHERE
+      UserId IS NOT NULL
+    GROUP BY
+      UserId
+  ),
+  RankedAnswers AS (
+    SELECT
+      ad.QuestionId,
+      ad.AnswerId,
+      ad.AnswerScore,
+      ad.IsAcceptedAnswer,
+      ad.AnswerCreationDate,
+      ROW_NUMBER() OVER (PARTITION BY ad.QuestionId ORDER BY ad.AnswerScore DESC, ad.AnswerCreationDate ASC) AS RankByScore,
+      RANK() OVER (PARTITION BY ad.QuestionId ORDER BY ad.AnswerScore DESC) AS DenseRankByScore
+    FROM
+      AnswerDetails ad
+  )
+SELECT
+  qd.QuestionId,
+  qd.QuestionTitle,
+  qd.QuestionOwnerDisplayName,
+  qd.QuestionCreationDate,
+  qd.QuestionScore,
+  qd.QuestionViewCount,
+  qd.QuestionAnswerCount,
+  qd.QuestionFavoriteCount,
+  qd.QuestionClosedDate,
+  qd.TimeToCloseMinutes,
+  qd.EditCount,
+  cd.CommentCount AS TotalCommentsOnQuestion,
+  cd.TotalCommentScore AS TotalScoreOfCommentsOnQuestion,
+  cd.AverageCommentScore AS AverageScoreOfCommentsOnQuestion,
+  ua.VoteCount AS OwnerTotalVotes,
+  ua.UpVoteCount AS OwnerUpVotes,
+  ua.DownVoteCount AS OwnerDownVotes,
+  ra.AnswerId AS TopAnswerId,
+  ra.AnswerScore AS TopAnswerScore,
+  ra.IsAcceptedAnswer AS IsTopAnswerAccepted,
+  CASE
+    WHEN ra.RankByScore = 1 THEN 'Best'
+    WHEN ra.RankByScore BETWEEN 2 AND 5 THEN 'Good'
+    ELSE 'Other'
+  END AS AnswerQualityRank,
+  COALESCE(qd.QuestionScore, 0) + COALESCE(qd.QuestionViewCount, 0) AS CompositeScore,
+  CASE
+    WHEN qd.QuestionOwnerUserId = -1 THEN 'Community User'
+    WHEN qd.QuestionOwnerDisplayName IS NULL THEN 'Anonymous'
+    ELSE qd.QuestionOwnerDisplayName
+  END AS EffectiveOwnerName,
+  CASE
+    WHEN EXISTS (
+      SELECT
+        1
+      FROM
+        PostLinks pl
+      WHERE
+        pl.PostId = qd.QuestionId
+        AND pl.LinkTypeId = 3
+    ) THEN 'IsDuplicate'
+    ELSE 'NotDuplicate'
+  END AS DuplicateStatus,
+  LOWER(SUBSTRING(qd.QuestionTitle FROM 1 FOR 3)) AS TitleFirstThreeChars,
+  REPLACE(qd.QuestionTitle, ' ', '_') AS QuestionTitleWithUnderscores,
+  CASE
+    WHEN qd.QuestionClosedDate IS NOT NULL AND qd.QuestionScore < 0 THEN 'Closed_LowScore'
+    WHEN qd.QuestionClosedDate IS NOT NULL AND qd.QuestionScore >= 0 THEN 'Closed_NonNegativeScore'
+    WHEN qd.QuestionClosedDate IS NULL AND qd.QuestionScore < 0 THEN 'Open_LowScore'
+    ELSE 'Open_NonNegativeScore'
+  END AS QuestionState
+FROM
+  QuestionDetails qd
+  LEFT JOIN CommentDetails cd
+    ON qd.QuestionId = cd.TargetPostId
+  LEFT JOIN Users u_owner
+    ON qd.QuestionOwnerUserId = u_owner.Id
+  LEFT JOIN UserActivity ua
+    ON qd.QuestionOwnerUserId = ua.UserId
+  LEFT JOIN RankedAnswers ra
+    ON qd.QuestionId = ra.QuestionId
+WHERE
+  ra.RankByScore = 1
+  AND qd.QuestionCreationDate >= TIMESTAMP '2023-01-01'
+  AND qd.QuestionScore > -10
+ORDER BY
+  qd.QuestionScore DESC,
+  qd.QuestionViewCount DESC
+LIMIT 1000;

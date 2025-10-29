@@ -1,0 +1,221 @@
+-- {"query": "1621.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3430} 
+
+WITH PostHistoricalMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.LastActivityDate,
+        P.ClosedDate,
+        P.PostTypeId,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.FavoriteCount,
+        LENGTH(P.Body) AS BodyLength,
+        LENGTH(P.Title) AS TitleLength,
+        COALESCE(P.Tags, '') AS Tags,
+        (SELECT COUNT(PH.Id) FROM PostHistory PH WHERE PH.PostId = P.Id AND PH.PostHistoryTypeId IN (4, 5, 6)) AS TotalEditCount,
+        (SELECT MIN(PH.CreationDate) FROM PostHistory PH WHERE PH.PostId = P.Id AND PH.PostHistoryTypeId IN (4, 5, 6)) AS FirstEditDate,
+        (SELECT MAX(PH.CreationDate) FROM PostHistory PH WHERE PH.PostId = P.Id AND PH.PostHistoryTypeId IN (4, 5, 6)) AS LastEditDate,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseVoteCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenVoteCount,
+        EXTRACT(EPOCH FROM (P.LastActivityDate - P.CreationDate)) / 86400.0 AS DaysActiveUntilLastActivity,
+        (
+            SELECT
+                MAX(CASE WHEN ph_inner.PostHistoryTypeId = 10 THEN 'Closed'
+                         WHEN ph_inner.PostHistoryTypeId = 11 THEN 'Reopened'
+                         ELSE NULL END)
+            FROM PostHistory ph_inner
+            WHERE ph_inner.PostId = P.Id AND ph_inner.CreationDate = (
+                SELECT MAX(ph_max.CreationDate)
+                FROM PostHistory ph_max
+                WHERE ph_max.PostId = P.Id AND ph_max.PostHistoryTypeId IN (10, 11)
+            )
+        ) AS LastModStatus,
+        (
+            SELECT AVG(EXTRACT(EPOCH FROM (next_edit.CreationDate - current_edit.CreationDate)) / 3600.0)
+            FROM (
+                SELECT
+                    PH_lag.CreationDate,
+                    LAG(PH_lag.CreationDate, 1, PH_lag.CreationDate) OVER (ORDER BY PH_lag.CreationDate) AS PrevEditDate
+                FROM PostHistory PH_lag
+                WHERE PH_lag.PostId = P.Id AND PH_lag.PostHistoryTypeId IN (4, 5, 6)
+            ) AS current_edit(CreationDate, PrevEditDate)
+            WHERE current_edit.CreationDate != current_edit.PrevEditDate
+        ) AS AvgEditIntervalHours
+    FROM Posts P
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId AND PH.PostHistoryTypeId IN (10, 11)
+    WHERE P.PostTypeId IN (1, 2)
+    AND P.CreationDate >= '2020-01-01'
+    GROUP BY P.Id, P.OwnerUserId, P.CreationDate, P.LastActivityDate, P.ClosedDate, P.PostTypeId, P.Score, P.ViewCount, P.AnswerCount, P.FavoriteCount, P.Body, P.Title, P.Tags
+),
+PostEngagementMetrics AS (
+    SELECT
+        PHM.PostId,
+        PHM.OwnerUserId,
+        PHM.PostTypeId,
+        PHM.PostCreationDate,
+        PHM.Score,
+        PHM.ViewCount,
+        PHM.AnswerCount,
+        PHM.FavoriteCount,
+        PHM.BodyLength,
+        PHM.TitleLength,
+        PHM.TotalEditCount,
+        PHM.CloseVoteCount,
+        PHM.ReopenVoteCount,
+        PHM.LastModStatus,
+        PHM.AvgEditIntervalHours,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotes,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotes,
+        SUM(CASE WHEN V.VoteTypeId = 5 THEN 1 ELSE 0 END) AS TotalFavoritesFromVotes,
+        COALESCE(PHM.FavoriteCount, 0) AS CurrentFavoriteCount,
+        COALESCE(SUM(C.Score), 0) AS TotalCommentScore,
+        (PHM.Score + COALESCE(PHM.FavoriteCount, 0) + COALESCE(PHM.AnswerCount, 0) + COALESCE(PHM.TotalEditCount, 0)) AS CombinedActivityScore,
+        (PHM.ViewCount * 1.0 / (COALESCE(PHM.AnswerCount, 0) + 1)) AS ViewAnswerRatio,
+        CASE
+            WHEN PHM.Score >= 100 AND PHM.ViewCount >= 10000 THEN 'Highly Popular'
+            WHEN PHM.Score >= 50 OR PHM.ViewCount >= 5000 THEN 'Popular'
+            WHEN PHM.ClosedDate IS NOT NULL AND PHM.CloseVoteCount > PHM.ReopenVoteCount THEN 'Controversial/Closed'
+            ELSE 'Standard'
+        END AS PostCategory,
+        NTILE(4) OVER (ORDER BY PHM.Score DESC) AS ScoreQuartile
+    FROM PostHistoricalMetrics PHM
+    LEFT JOIN Votes V ON PHM.PostId = V.PostId
+    LEFT JOIN Comments C ON PHM.PostId = C.PostId
+    GROUP BY PHM.PostId, PHM.OwnerUserId, PHM.PostTypeId, PHM.PostCreationDate, PHM.Score, PHM.ViewCount, PHM.AnswerCount, PHM.FavoriteCount, PHM.BodyLength, PHM.TitleLength, PHM.TotalEditCount, PHM.ClosedDate, PHM.CloseVoteCount, PHM.ReopenVoteCount, PHM.LastModStatus, PHM.AvgEditIntervalHours
+),
+UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        COALESCE(U.DisplayName, 'Anon User') AS DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.UpVotes AS UserUpVotesGiven,
+        U.DownVotes AS UserDownVotesGiven,
+        U.Views AS UserProfileViews,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsOwned,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersOwned,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT B.Id) AS TotalBadgesEarned,
+        SUM(P.Score) AS TotalPostScoreOwned,
+        SUM(COALESCE(P.ViewCount, 0)) AS TotalPostViewsOwned,
+        SUM(CASE WHEN P.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS AcceptedAnswersCount,
+        (SELECT COUNT(P_corr.Id) FROM Posts P_corr WHERE P_corr.OwnerUserId = U.Id AND P_corr.CreationDate BETWEEN U.CreationDate AND U.CreationDate + INTERVAL '1 month') AS PostsInFirstMonth,
+        (SELECT AVG(LENGTH(C_corr.Text)) FROM Comments C_corr WHERE C_corr.UserId = U.Id) AS AvgCommentLength,
+        EXTRACT(YEAR FROM AGE(U.LastAccessDate, U.CreationDate)) AS YearsActive
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    WHERE U.Reputation >= 500
+    AND U.LastAccessDate >= '2022-01-01'
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.UpVotes, U.DownVotes, U.Views
+),
+ParsedPostTags AS (
+    SELECT
+        PEM.PostId,
+        PEM.OwnerUserId,
+        PEM.PostCreationDate,
+        PEM.Score,
+        TRIM(UNNEST(string_to_array(SUBSTRING(PEM.Tags, 2, LENGTH(PEM.Tags) - 2), '><'))) AS TagName
+    FROM PostEngagementMetrics PEM
+    WHERE PEM.Tags IS NOT NULL AND LENGTH(PEM.Tags) > 2
+),
+MonthlyTagPerformance AS (
+    SELECT
+        DATE_TRUNC('month', PPT.PostCreationDate) AS ActivityMonth,
+        PPT.TagName,
+        COUNT(DISTINCT PPT.PostId) AS MonthlyPostsWithTag,
+        SUM(PPT.Score) AS MonthlyTagScore,
+        AVG(PPT.Score) AS AvgMonthlyTagScore,
+        RANK() OVER (PARTITION BY DATE_TRUNC('month', PPT.PostCreationDate) ORDER BY SUM(PPT.Score) DESC) AS TagScoreRankInMonth
+    FROM ParsedPostTags PPT
+    GROUP BY DATE_TRUNC('month', PPT.PostCreationDate), PPT.TagName
+),
+ControversialPostCandidates AS (
+    SELECT
+        PEM.PostId,
+        PEM.OwnerUserId,
+        PEM.PostCreationDate,
+        PEM.TitleLength,
+        PEM.BodyLength,
+        PEM.PostCategory,
+        PEM.Score,
+        PEM.ViewCount,
+        PEM.TotalUpVotes,
+        PEM.TotalDownVotes,
+        (PEM.TotalDownVotes * 1.0 / (PEM.TotalUpVotes + PEM.TotalDownVotes + 1)) AS DownVoteRatio,
+        PH.CreationDate AS HistoryDate,
+        PH.PostHistoryTypeId,
+        PH.Comment AS HistoryComment,
+        LEAD(PH.CreationDate, 1) OVER (PARTITION BY PEM.PostId ORDER BY PH.CreationDate) AS NextHistoryEventDate
+    FROM PostEngagementMetrics PEM
+    JOIN PostHistory PH ON PEM.PostId = PH.PostId
+    WHERE (PEM.TotalDownVotes * 1.0 / (PEM.TotalUpVotes + PEM.TotalDownVotes + 1)) > 0.3
+    OR PH.PostHistoryTypeId IN (10, 11)
+)
+SELECT
+    UAS.UserId,
+    UAS.DisplayName,
+    UAS.Reputation,
+    UAS.UserCreationDate,
+    UAS.TotalPostsOwned,
+    UAS.TotalQuestionsOwned,
+    UAS.TotalAnswersOwned,
+    UAS.TotalBadgesEarned,
+    UAS.PostsInFirstMonth,
+    UAS.AvgCommentLength,
+    UAS.YearsActive,
+    PEM.PostId,
+    PEM.PostCreationDate,
+    PEM.PostTypeId,
+    PEM.Score,
+    PEM.ViewCount,
+    PEM.AnswerCount,
+    PEM.CurrentFavoriteCount,
+    PEM.BodyLength,
+    PEM.TitleLength,
+    PEM.TotalEditCount,
+    PEM.AvgEditIntervalHours,
+    PEM.TotalUpVotes,
+    PEM.TotalDownVotes,
+    PEM.TotalCommentScore,
+    PEM.CombinedActivityScore,
+    PEM.ViewAnswerRatio,
+    PEM.PostCategory,
+    PEM.ScoreQuartile,
+    LAST_VALUE(MTPS.TagName) OVER (PARTITION BY UAS.UserId ORDER BY MTPS.MonthlyTagScore DESC, MTPS.MonthlyPostsWithTag DESC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS UsersTopTagEver,
+    FIRST_VALUE(MTPS.TagName) OVER (PARTITION BY PEM.PostId ORDER BY MTPS.MonthlyTagScore DESC) AS PostsPrimaryTag,
+    MTPS.ActivityMonth AS PostTagActivityMonth,
+    MTPS.MonthlyPostsWithTag,
+    MTPS.MonthlyTagScore,
+    MTPS.AvgMonthlyTagScore,
+    MTPS.TagScoreRankInMonth,
+    CPC.DownVoteRatio AS PostControversyRatio,
+    (SELECT COUNT(DISTINCT PL.RelatedPostId) FROM PostLinks PL WHERE PL.PostId = PEM.PostId AND PL.LinkTypeId = 3) AS DuplicateLinksCount,
+    SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+    SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+    ROW_NUMBER() OVER (PARTITION BY UAS.UserId ORDER BY PEM.CombinedActivityScore DESC, PEM.ViewCount DESC) AS UserPostRank,
+    RANK() OVER (ORDER BY PEM.CombinedActivityScore DESC, UAS.Reputation DESC, UAS.TotalPostsOwned DESC) AS GlobalContentContributorRank,
+    DENSE_RANK() OVER (PARTITION BY PEM.PostTypeId ORDER BY PEM.Score DESC) AS PostTypeScoreRank
+FROM UserActivitySummary UAS
+INNER JOIN PostEngagementMetrics PEM ON UAS.UserId = PEM.OwnerUserId
+LEFT JOIN ControversialPostCandidates CPC ON PEM.PostId = CPC.PostId AND CPC.PostHistoryTypeId = 10
+LEFT JOIN ParsedPostTags PPT ON PEM.PostId = PPT.PostId
+LEFT JOIN MonthlyTagPerformance MTPS ON PPT.TagName = MTPS.TagName AND DATE_TRUNC('month', PEM.PostCreationDate) = MTPS.ActivityMonth
+LEFT JOIN Badges B ON UAS.UserId = B.UserId
+WHERE PEM.PostCategory != 'Standard'
+AND UAS.TotalPostsOwned > 5
+AND PEM.BodyLength > 100
+AND PEM.PostCreationDate > UAS.UserCreationDate + INTERVAL '1 month'
+GROUP BY
+    UAS.UserId, UAS.DisplayName, UAS.Reputation, UAS.UserCreationDate, UAS.TotalPostsOwned, UAS.TotalQuestionsOwned, UAS.TotalAnswersOwned, UAS.TotalBadgesEarned, UAS.PostsInFirstMonth, UAS.AvgCommentLength, UAS.YearsActive,
+    PEM.PostId, PEM.PostCreationDate, PEM.PostTypeId, PEM.Score, PEM.ViewCount, PEM.AnswerCount, PEM.CurrentFavoriteCount, PEM.BodyLength, PEM.TitleLength, PEM.TotalEditCount, PEM.AvgEditIntervalHours, PEM.TotalUpVotes, PEM.TotalDownVotes, PEM.TotalCommentScore, PEM.CombinedActivityScore, PEM.ViewAnswerRatio, PEM.PostCategory, PEM.ScoreQuartile,
+    MTPS.ActivityMonth, MTPS.MonthlyPostsWithTag, MTPS.MonthlyTagScore, MTPS.AvgMonthlyTagScore, MTPS.TagScoreRankInMonth,
+    CPC.DownVoteRatio
+ORDER BY GlobalContentContributorRank ASC, UserPostRank ASC, PEM.PostCreationDate DESC
+LIMIT 1000;

@@ -1,0 +1,213 @@
+WITH UserEngagementSummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.UpVotes AS TotalUpVotesGiven,
+        U.DownVotes AS TotalDownVotesGiven,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        SUM(P.Score) AS TotalPostScore,
+        SUM(P.ViewCount) AS TotalPostViews,
+        MAX(P.LastActivityDate) AS LastPostActivity,
+        AVG(NULLIF(P.AnswerCount, 0)) AS AvgAnswersPerQuestion,
+        -- use standard SQL aggregate for tags: collect distinct trimmed tag names up to 25 chars
+        STRING_AGG(DISTINCT LEFT(t.TagName, 25), ',') AS TopTags
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    LEFT JOIN (
+        SELECT DISTINCT Id AS PostId, Tags
+        FROM Posts
+        WHERE PostTypeId = 1 AND Tags IS NOT NULL
+    ) AS QTags ON P.Id = QTags.PostId
+    LEFT JOIN Tags AS t ON EXISTS (
+        SELECT 1
+        FROM (
+            SELECT TRIM(tag_elem) AS tag_elem
+            FROM UNNEST(string_to_array(SUBSTRING(QTags.Tags FROM 2 FOR CHAR_LENGTH(QTags.Tags)-2), '><')) AS tag_elem
+        ) AS tag_list
+        WHERE tag_list.tag_elem = t.TagName
+    )
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.UpVotes, U.DownVotes
+    HAVING COUNT(DISTINCT P.Id) > 5 AND U.Reputation > 100
+),
+PostDetailMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        P.PostTypeId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount AS PostViewCount,
+        P.AnswerCount,
+        P.FavoriteCount,
+        P.ClosedDate,
+        PH.CreationDate AS HistoryDate,
+        PH.PostHistoryTypeId,
+        PH.UserId AS HistoryUserId,
+        CL.Name AS CloseReason,
+        CASE WHEN P.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS HasAcceptedAnswer,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) OVER (PARTITION BY P.Id) AS CloseEventsPerPost,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) OVER (PARTITION BY P.Id) AS EditEventsPerPost,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId, P.PostTypeId ORDER BY P.CreationDate DESC) AS PostRankByUserType,
+        AVG(P.Score) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate ROWS BETWEEN 5 PRECEDING AND CURRENT ROW) AS RollingAvgScore
+    FROM Posts AS P
+    LEFT JOIN PostHistory AS PH ON P.Id = PH.PostId
+    LEFT JOIN CloseReasonTypes AS CL ON PH.PostHistoryTypeId = 10
+        AND PH.Comment ~ '^[0-9]+$'
+        AND CAST(PH.Comment AS SMALLINT) = CL.Id
+    WHERE P.PostTypeId IN (1, 2)
+),
+UserBadgePerformance AS (
+    SELECT
+        B.UserId,
+        COUNT(B.Id) AS NumBadges,
+        MAX(B.Date) AS LastBadgeDate,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(CASE WHEN B.TagBased = TRUE THEN B.Class ELSE NULL END) AS HighestTagBadgeClass,
+        RANK() OVER (PARTITION BY B.Class ORDER BY COUNT(B.Id) DESC) AS RankInBadgeClass
+    FROM Badges AS B
+    GROUP BY B.UserId
+),
+SpecialUserGroups AS (
+    SELECT
+        UES.UserId,
+        'Gold Badge Power User' AS GroupType,
+        UES.Reputation AS GroupScore
+    FROM UserEngagementSummary AS UES
+    JOIN UserBadgePerformance AS UBP ON UES.UserId = UBP.UserId
+    WHERE UBP.GoldBadges >= 1 AND UES.Reputation > 50000
+    UNION ALL
+    SELECT
+        UES.UserId,
+        'Active Editor with Closures' AS GroupType,
+        (SELECT COUNT(DISTINCT PH.PostId)
+         FROM PostHistory PH
+         WHERE PH.UserId = UES.UserId
+           AND PH.PostHistoryTypeId IN (4,5,6)
+           AND PH.CreationDate > (CAST('2024-10-01' AS DATE) - INTERVAL '1 year')
+        ) AS GroupScore
+    FROM UserEngagementSummary AS UES
+    WHERE EXISTS (
+        SELECT 1
+        FROM PostDetailMetrics PDM_INNER
+        WHERE PDM_INNER.OwnerUserId = UES.UserId
+          AND PDM_INNER.CloseEventsPerPost > 0
+          AND PDM_INNER.PostCreationDate > (CAST('2024-10-01' AS DATE) - INTERVAL '2 year')
+    )
+    AND (SELECT COUNT(DISTINCT PH.PostId)
+         FROM PostHistory PH
+         WHERE PH.UserId = UES.UserId
+           AND PH.PostHistoryTypeId IN (4,5,6)
+           AND PH.CreationDate > (CAST('2024-10-01' AS DATE) - INTERVAL '1 year')
+        ) >= 5
+)
+SELECT
+    UES.UserId,
+    UES.DisplayName,
+    UES.Reputation,
+    UES.TotalQuestions,
+    UES.TotalAnswers,
+    UES.TotalComments,
+    COALESCE(UES.TotalPostScore, 0) AS TotalPostScore,
+    COALESCE(UES.TotalPostViews, 0) AS TotalPostViews,
+    UES.LastPostActivity,
+    UES.AvgAnswersPerQuestion,
+    -- convert TopTags string back to array of distinct tags if needed; keep as string if dialect lacks array
+    COALESCE(UES.TopTags, '') AS UserPrimaryTags,
+    COALESCE(UBP.GoldBadges, 0) AS GoldBadges,
+    COALESCE(UBP.SilverBadges, 0) AS SilverBadges,
+    COALESCE(UBP.BronzeBadges, 0) AS BronzeBadges,
+    MAX(PDM.RollingAvgScore) FILTER (WHERE PDM.PostTypeId = 1 AND PDM.PostRankByUserType <= 5) AS RecentQuestionRollingAvgScore,
+    MAX(PDM.EditEventsPerPost) AS MaxEditEventsOnAnyPost,
+    MAX(PDM.CloseEventsPerPost) AS MaxCloseEventsOnAnyPost,
+    SUM(CASE WHEN PDM.HasAcceptedAnswer = 1 THEN 1 ELSE 0 END) AS TotalAcceptedAnswersContributed,
+    COUNT(DISTINCT PL_LINKED.PostId) FILTER (WHERE PL_LINKED.LinkTypeId = 1) AS CountPostsLinkingToUsersQuestions,
+    COUNT(DISTINCT PL_DUPLICATE.RelatedPostId) FILTER (WHERE PL_DUPLICATE.LinkTypeId = 3) AS CountQuestionsMarkedDuplicateOfUsers,
+    (UES.Reputation * 0.4 + COALESCE(UES.TotalUpVotesGiven,0) * 0.1 + COALESCE(UES.TotalPostScore,0) * 0.2 + COALESCE(UBP.GoldBadges,0) * 100) AS UserInfluenceScore,
+    CASE
+        WHEN UES.Reputation > 50000 AND COALESCE(UBP.GoldBadges, 0) > 2 THEN 'Elite Contributor'
+        WHEN UES.Reputation > 10000 AND COALESCE(UBP.SilverBadges, 0) > 5 THEN 'Key Member'
+        WHEN UES.TotalQuestions > 50 AND COALESCE(UES.AvgAnswersPerQuestion, 0) > 2 THEN 'Prolific Questioner'
+        ELSE 'Active User'
+    END AS UserSegment,
+    (SELECT COUNT(DISTINCT V.PostId)
+     FROM Votes AS V
+     WHERE V.UserId = UES.UserId
+       AND V.VoteTypeId = 5
+       AND V.CreationDate > (CAST('2024-10-01' AS DATE) - INTERVAL '1 year')
+    ) AS RecentFavoritesGiven,
+    (SELECT MAX(Q_ACC.Score)
+     FROM Posts AS Q_ACC
+     WHERE Q_ACC.Id = (
+         SELECT P_ANS.AcceptedAnswerId
+         FROM Posts AS P_ANS
+         WHERE P_ANS.OwnerUserId = UES.UserId
+           AND P_ANS.PostTypeId = 1
+           AND P_ANS.AcceptedAnswerId IS NOT NULL
+           AND P_ANS.CreationDate > (CAST('2024-10-01' AS DATE) - INTERVAL '2 year')
+         ORDER BY P_ANS.CreationDate DESC
+         LIMIT 1
+     )
+    ) AS ScoreOfMostRecentAcceptedAnswerForTheirQuestion,
+    EXISTS (
+        SELECT 1
+        FROM PostHistory AS PH_CLOSE
+        WHERE PH_CLOSE.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = UES.UserId AND PostTypeId = 1)
+          AND PH_CLOSE.PostHistoryTypeId = 10
+          AND PH_CLOSE.CreationDate > (CAST('2024-10-01' AS DATE) - INTERVAL '3 year')
+          AND PH_CLOSE.Comment IN ('101', '102')
+    ) AS HasRecentProblematicClosures,
+    (SELECT AVG(LENGTH(COALESCE(C_ANALYZE.Text, '')))
+     FROM Comments AS C_ANALYZE
+     WHERE C_ANALYZE.UserId = UES.UserId
+       AND C_ANALYZE.CreationDate BETWEEN (CAST('2024-10-01' AS DATE) - INTERVAL '6 month') AND CAST('2024-10-01' AS DATE)
+       AND C_ANALYZE.Score > 0
+    ) AS AvgRecentPositiveCommentLength,
+    COALESCE(UM.Location, 'Unspecified Location') AS UserLocation,
+    UM.LastAccessDate,
+    -- AccountAge computed in a dialect-neutral way using AGE may not exist; use timestampdiff style where available.
+    -- Keep AGE for systems that support it; else this may need adjustment per dialect
+    AGE(CAST('2024-10-01' AS DATE), UM.CreationDate) AS AccountAge,
+    SUG.GroupType AS SpecialUserGroupAffiliation
+FROM UserEngagementSummary AS UES
+LEFT JOIN UserBadgePerformance AS UBP ON UES.UserId = UBP.UserId
+LEFT JOIN PostDetailMetrics AS PDM ON UES.UserId = PDM.OwnerUserId
+LEFT JOIN Posts AS P_Q_LINK_TARGET ON UES.UserId = P_Q_LINK_TARGET.OwnerUserId AND P_Q_LINK_TARGET.PostTypeId = 1
+LEFT JOIN PostLinks AS PL_LINKED ON P_Q_LINK_TARGET.Id = PL_LINKED.RelatedPostId AND PL_LINKED.LinkTypeId = 1
+LEFT JOIN PostLinks AS PL_DUPLICATE ON P_Q_LINK_TARGET.Id = PL_DUPLICATE.PostId AND PL_DUPLICATE.LinkTypeId = 3
+LEFT JOIN Users AS UM ON UES.UserId = UM.Id
+INNER JOIN SpecialUserGroups AS SUG ON UES.UserId = SUG.UserId
+WHERE
+    (
+        (UES.TotalQuestions > 0 AND UES.TotalAnswers > 0 AND COALESCE(UES.TotalPostScore, 0) > 100)
+        OR
+        (COALESCE(UES.TotalPostScore, 0) > 200 AND COALESCE(UES.TotalPostViews, 0) > 5000)
+    )
+    AND (
+        (UM.AboutMe IS NOT NULL AND CHAR_LENGTH(UM.AboutMe) > 30 AND UM.AboutMe ILIKE '%sql%')
+        OR UM.WebsiteUrl IS NOT NULL
+    )
+    AND (
+        NOT EXISTS (
+            SELECT 1
+            FROM Badges AS B_NEG
+            WHERE B_NEG.UserId = UES.UserId
+              AND B_NEG.Class = 1
+              AND B_NEG.Name ILIKE '%disruptor%'
+        )
+        OR COALESCE(UBP.GoldBadges, 0) > 5
+    )
+GROUP BY
+    UES.UserId, UES.DisplayName, UES.Reputation, UES.TotalQuestions, UES.TotalAnswers,
+    UES.TotalComments, UES.TotalPostScore, UES.TotalPostViews, UES.LastPostActivity,
+    UES.AvgAnswersPerQuestion, UES.TopTags, UBP.GoldBadges, UBP.SilverBadges, UBP.BronzeBadges,
+    UM.Location, UM.LastAccessDate, UM.CreationDate, SUG.GroupType
+ORDER BY UserInfluenceScore DESC, UES.Reputation DESC
+LIMIT 150;

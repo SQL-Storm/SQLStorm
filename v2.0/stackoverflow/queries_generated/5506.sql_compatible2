@@ -1,0 +1,114 @@
+WITH
+UserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.AccountId,
+    (COALESCE(u.UpVotes,0) - COALESCE(u.DownVotes,0)) * 2
+      + COALESCE(vt2.TotalVotes,0)
+      + COALESCE(b.TotalBadges,0) AS ActivityScore
+  FROM Users u
+  LEFT JOIN (
+    SELECT Votes.UserId, SUM(CASE WHEN vt.Id IN (2,14) THEN 1 ELSE 0 END) AS TotalVotes
+    FROM Votes
+    JOIN VoteTypes vt ON vt.Id = Votes.VoteTypeId
+    GROUP BY Votes.UserId
+  ) vt2 ON vt2.UserId = u.Id
+  LEFT JOIN (
+    SELECT UserId, COUNT(*) AS TotalBadges
+    FROM Badges
+    GROUP BY UserId
+  ) b ON b.UserId = u.Id
+),
+TopQuestions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.OwnerUserId,
+    ROW_NUMBER() OVER (
+      PARTITION BY p.OwnerUserId
+      ORDER BY p.Score DESC, p.ViewCount DESC, p.CreationDate ASC
+    ) AS rn_by_owner
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.ClosedDate IS NULL
+    AND p.LastActivityDate > (CAST('2024-10-01' AS date) - INTERVAL '180 days')
+),
+LinkedPosts AS (
+  SELECT
+    tl.PostId,
+    tl.RelatedPostId,
+    pl.LinkTypeId,
+    pl.CreationDate AS LinkCreationDate
+  FROM PostLinks tl
+  JOIN Posts pl ON pl.Id = tl.RelatedPostId
+  WHERE tl.LinkTypeId IN (1,3)
+),
+TagPopularity AS (
+  SELECT
+    t.TagName,
+    t.Count AS TagUsage,
+    AVG(p.Score) AS AvgPostScore,
+    MAX(p.ViewCount) AS MaxViews,
+    COUNT(DISTINCT p.Id) AS PostsWithTag
+  FROM Tags t
+  JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+  WHERE t.TagName IS NOT NULL
+  GROUP BY t.TagName, t.Count
+),
+UserPostSummary AS (
+  SELECT
+    p.OwnerUserId,
+    COUNT(*) AS QuestionsCount,
+    SUM(p.Score) AS TotalScore,
+    AVG(p.ViewCount) AS AvgViews,
+    FIRST_VALUE(p.Title) OVER (
+      PARTITION BY p.OwnerUserId
+      ORDER BY p.LastActivityDate DESC
+    ) AS MostRecentQuestionTitle,
+    MAX(COALESCE(p.LastActivityDate, p.CreationDate)) AS LastActive
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+  GROUP BY p.OwnerUserId
+)
+SELECT
+  ua.UserId,
+  ua.DisplayName,
+  ua.Reputation,
+  ua.ActivityScore,
+  tq.PostId AS TopQuestionId,
+  tq.Title AS TopQuestionTitle,
+  tq.Score AS TopQuestionScore,
+  tq.ViewCount AS TopQuestionViews,
+  tq.CreationDate AS TopQuestionCreated,
+  tq.LastActivityDate AS TopQuestionLastActive,
+  upm.QuestionsCount,
+  upm.TotalScore AS UserTotalScore,
+  upm.AvgViews AS UserAvgViews,
+  upm.MostRecentQuestionTitle,
+  upm.LastActive,
+  lp.RelatedPostId AS LinkedPostId,
+  lp.LinkTypeId,
+  tp.TagName
+FROM UserActivity ua
+LEFT JOIN TopQuestions tq
+  ON tq.OwnerUserId = ua.UserId
+LEFT JOIN UserPostSummary upm
+  ON upm.OwnerUserId = ua.UserId
+LEFT JOIN LinkedPosts lp
+  ON lp.PostId = tq.PostId
+LEFT JOIN TagPopularity tp
+  ON tp.TagName LIKE '%' || regexp_replace(COALESCE(tq.Title,''), '[^a-zA-Z0-9]', '', 'g') || '%'
+WHERE
+  ua.ActivityScore > 0
+  OR (tq.PostId IS NOT NULL)
+ORDER BY ua.ActivityScore DESC
+LIMIT 100;

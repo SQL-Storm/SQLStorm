@@ -1,0 +1,78 @@
+-- {"query": "4087.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1004} 
+
+WITH RankedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.CommunityOwnedDate,
+        ROW_NUMBER() OVER(PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS rn_score_view,
+        AVG(CAST(p.Score AS FLOAT)) OVER(PARTITION BY p.PostTypeId) AS avg_score_by_type,
+        LAG(p.CreationDate, 1, p.CreationDate) OVER(PARTITION BY p.PostTypeId ORDER BY p.CreationDate) AS previous_post_creation_date
+    FROM Posts AS p
+    JOIN PostTypes AS pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Users AS u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1, 2) -- Focus on Questions and Answers
+),
+PostEngagement AS (
+    SELECT
+        p.PostId,
+        COUNT(c.Id) AS CommentCountPerPost,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount
+    FROM Posts AS p
+    LEFT JOIN Comments AS c ON p.Id = c.PostId
+    LEFT JOIN Votes AS v ON p.Id = v.PostId AND v.VoteTypeId IN (2, 3)
+    GROUP BY p.PostId
+)
+SELECT
+    rp.PostId,
+    rp.PostTypeName,
+    rp.OwnerDisplayName,
+    rp.PostCreationDate,
+    rp.Score,
+    rp.ViewCount,
+    rp.AnswerCount,
+    rp.CommentCount AS PostCommentCount,
+    rp.FavoriteCount,
+    pe.CommentCountPerPost,
+    pe.UpVoteCount,
+    pe.DownVoteCount,
+    (rp.Score - rp.avg_score_by_type) AS score_deviation_from_type_avg,
+    CASE
+        WHEN rp.ClosedDate IS NOT NULL AND rp.ClosedDate > DATE('now', '-30 day') THEN 'Recently Closed'
+        WHEN rp.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        WHEN rp.rn_score_view <= 10 THEN 'Top 10 by Score/Views'
+        ELSE 'Regular'
+    END AS post_status_category,
+    IIF(rp.PostCreationDate < DATE('now', '-1 year'), 'Old', 'New') AS age_category,
+    rp.rn_score_view,
+    CASE
+        WHEN rp.previous_post_creation_date IS NOT NULL AND rp.PostCreationDate > rp.previous_post_creation_date THEN
+            strftime('%s', rp.PostCreationDate) - strftime('%s', rp.previous_post_creation_date)
+        ELSE 0
+    END AS time_since_previous_post_of_same_type,
+    CASE
+        WHEN INSTR(rp.OwnerDisplayName, ' ') > 0 THEN SUBSTR(rp.OwnerDisplayName, 1, INSTR(rp.OwnerDisplayName, ' ') - 1)
+        WHEN rp.OwnerDisplayName IS NULL THEN 'Unknown'
+        ELSE rp.OwnerDisplayName
+    END AS owner_first_name_or_placeholder,
+    COALESCE(rp.FavoriteCount, 0) + COALESCE(rp.AnswerCount, 0) AS engagement_metric,
+    (rp.ViewCount * 1.0 / NULLIF(rp.Score, 0)) AS view_score_ratio -- Potential division by zero
+FROM RankedPosts AS rp
+JOIN PostEngagement AS pe ON rp.PostId = pe.PostId
+WHERE rp.Score > 0
+  AND rp.ViewCount > 100
+  AND rp.PostTypeName = 'Question' -- Further filter for questions
+  OR (rp.PostTypeName = 'Answer' AND rp.Score > 5) -- Include answers with at least some score
+ORDER BY rp.PostCreationDate DESC
+LIMIT 100;

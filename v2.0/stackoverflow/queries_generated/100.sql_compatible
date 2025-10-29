@@ -1,0 +1,333 @@
+with recent_questions as (
+    select
+        q.Id as QuestionId,
+        q.CreationDate,
+        q.OwnerUserId,
+        q.Score,
+        q.ViewCount,
+        q.Title,
+        q.Tags,
+        coalesce(q.AnswerCount, 0) as AnswerCount
+    from Posts q
+    where q.PostTypeId = 1
+      and q.CreationDate >= (select max(CreationDate) - interval '365 days' from Posts where PostTypeId = 1)
+),
+user_activity as (
+    select
+        u.Id as UserId,
+        u.Reputation,
+        u.CreationDate as UserCreated,
+        u.LastAccessDate,
+        coalesce(u.Location, '') as Location,
+        coalesce(u.DisplayName, '(unknown)') as DisplayName,
+        u.UpVotes,
+        u.DownVotes,
+        u.Views as ProfileViews
+    from Users u
+),
+question_votes as (
+    select
+        v.PostId,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as Upvotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as Downvotes,
+        sum(case when v.VoteTypeId = 5 then 1 else 0 end) as Favorites,
+        sum(case when v.VoteTypeId in (8,9) then coalesce(v.BountyAmount,0) else 0 end) as BountyTotal,
+        max(case when v.VoteTypeId in (8,9) then v.CreationDate end) as LastBountyDate
+    from Votes v
+    group by v.PostId
+),
+answers as (
+    select
+        a.ParentId as QuestionId,
+        a.Id as AnswerId,
+        a.OwnerUserId as AnswerUserId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreated
+    from Posts a
+    where a.PostTypeId = 2
+),
+accepted as (
+    select
+        q.Id as QuestionId,
+        q.AcceptedAnswerId
+    from Posts q
+    where q.PostTypeId = 1
+      and q.AcceptedAnswerId is not null
+),
+answerers as (
+    select
+        an.QuestionId,
+        count(*) as AnswerCount,
+        count(distinct an.AnswerUserId) as DistinctAnswerers,
+        max(an.AnswerScore) as MaxAnswerScore,
+        min(an.AnswerCreated) as FirstAnswerAt,
+        max(an.AnswerCreated) as LastAnswerAt
+    from answers an
+    group by an.QuestionId
+),
+edits as (
+    select
+        ph.PostId,
+        count(*) filter (where ph.PostHistoryTypeId in (4,5,6,7,8,9,24)) as EditCount,
+        max(ph.CreationDate) filter (where ph.PostHistoryTypeId in (4,5,6,7,8,9,24)) as LastEditAt,
+        count(*) filter (where ph.PostHistoryTypeId in (10,11,12,13,14,15,19,20,35,36)) as ModerationEvents
+    from PostHistory ph
+    group by ph.PostId
+),
+closures as (
+    select
+        ph.PostId,
+        min(ph.CreationDate) filter (where ph.PostHistoryTypeId = 10) as ClosedAt,
+        cast(
+          max(
+            case
+              when ph.PostHistoryTypeId = 10 then
+                nullif(trim(regexp_replace(coalesce(ph.Comment,''), '[^0-9]', '', 'g')), '')
+            end
+          ) as integer
+        ) as CloseReasonId
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (10,11)
+    group by ph.PostId
+),
+duplicates as (
+    select
+        pl.PostId as DuplicateId,
+        pl.RelatedPostId as OriginalId,
+        min(pl.CreationDate) as FirstDupLinkAt
+    from PostLinks pl
+    where pl.LinkTypeId = 3
+    group by pl.PostId, pl.RelatedPostId
+),
+tag_expansion as (
+    select
+        rq.QuestionId,
+        unnest(string_to_array(substring(rq.Tags, 2, greatest(length(rq.Tags)-2,0)), '><')) as TagName
+    from recent_questions rq
+    where rq.Tags is not null and rq.Tags like '<%>'
+),
+tag_stats as (
+    select
+        te.QuestionId,
+        count(*) as TagCount,
+        string_agg(te.TagName, ',' order by te.TagName) as TagList,
+        bool_or(t.IsModeratorOnly) as HasModOnly,
+        bool_or(t.IsRequired) as HasRequired
+    from tag_expansion te
+    left join Tags t on lower(t.TagName) = lower(te.TagName)
+    group by te.QuestionId
+),
+comment_stats as (
+    select
+        c.PostId,
+        count(*) as CommentCount,
+        max(c.Score) as MaxCommentScore,
+        avg(c.Score) filter (where c.Score is not null) as AvgCommentScore,
+        min(c.CreationDate) as FirstCommentAt,
+        max(c.CreationDate) as LastCommentAt
+    from Comments c
+    group by c.PostId
+),
+owner_badges as (
+    select
+        b.UserId,
+        count(*) as BadgeCount,
+        count(*) filter (where b.Class = 1) as GoldCount,
+        count(*) filter (where b.Class = 2) as SilverCount,
+        count(*) filter (where b.Class = 3) as BronzeCount,
+        count(*) filter (where b.TagBased = 1) as TagBadges
+    from Badges b
+    group by b.UserId
+),
+owner_question_density as (
+    select
+        u.Id as UserId,
+        count(*) filter (where p.PostTypeId = 1) as QuestionsAuthored,
+        count(*) filter (where p.PostTypeId = 2) as AnswersAuthored,
+        count(*) as TotalPosts,
+        avg(extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - coalesce(p.LastActivityDate, p.CreationDate)))) as AvgPostAgeSeconds
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id
+),
+q_join as (
+    select
+        rq.QuestionId,
+        rq.CreationDate,
+        rq.OwnerUserId,
+        rq.Score,
+        rq.ViewCount,
+        rq.Title,
+        rq.Tags,
+        rq.AnswerCount as DeclaredAnswerCount,
+        coalesce(qv.Upvotes,0) as Upvotes,
+        coalesce(qv.Downvotes,0) as Downvotes,
+        coalesce(qv.Favorites,0) as Favorites,
+        coalesce(qv.BountyTotal,0) as BountyTotal,
+        qv.LastBountyDate,
+        coalesce(ans.AnswerCount,0) as ActualAnswerCount,
+        coalesce(ans.DistinctAnswerers,0) as DistinctAnswerers,
+        ans.MaxAnswerScore,
+        ans.FirstAnswerAt,
+        ans.LastAnswerAt,
+        ed.EditCount,
+        ed.LastEditAt,
+        ed.ModerationEvents,
+        cls.ClosedAt,
+        cls.CloseReasonId,
+        dup.OriginalId as DuplicateOf,
+        dup.FirstDupLinkAt,
+        ts.TagCount,
+        ts.TagList,
+        ts.HasModOnly,
+        ts.HasRequired,
+        cs.CommentCount,
+        cs.MaxCommentScore,
+        cs.AvgCommentScore,
+        cs.FirstCommentAt,
+        cs.LastCommentAt
+    from recent_questions rq
+    left join question_votes qv on qv.PostId = rq.QuestionId
+    left join answerers ans on ans.QuestionId = rq.QuestionId
+    left join edits ed on ed.PostId = rq.QuestionId
+    left join closures cls on cls.PostId = rq.QuestionId
+    left join duplicates dup on dup.DuplicateId = rq.QuestionId
+    left join tag_stats ts on ts.QuestionId = rq.QuestionId
+    left join comment_stats cs on cs.PostId = rq.QuestionId
+),
+ranked as (
+    select
+        qj.*,
+        row_number() over (order by coalesce(qj.Score,0) desc, coalesce(qj.ViewCount,0) desc) as rn_score,
+        row_number() over (order by coalesce(qj.ViewCount,0) desc, coalesce(qj.Score,0) desc) as rn_views,
+        dense_rank() over (order by coalesce(qj.BountyTotal,0) desc) as dr_bounty,
+        ntile(10) over (order by coalesce(qj.Upvotes - qj.Downvotes,0) desc) as decile_net_votes,
+        sum(coalesce(qj.Upvotes,0)) over () as total_upvotes_window,
+        sum(coalesce(qj.Downvotes,0)) over () as total_downvotes_window,
+        avg(coalesce(qj.Score,0)) over () as avg_score_window
+    from q_join qj
+),
+owner_enriched as (
+    select
+        ua.UserId,
+        ua.Reputation,
+        ua.UserCreated,
+        ua.LastAccessDate,
+        ua.Location,
+        ua.DisplayName,
+        ua.UpVotes,
+        ua.DownVotes,
+        ua.ProfileViews,
+        ob.BadgeCount,
+        ob.GoldCount,
+        ob.SilverCount,
+        ob.BronzeCount,
+        ob.TagBadges,
+        oqd.QuestionsAuthored,
+        oqd.AnswersAuthored,
+        oqd.TotalPosts,
+        oqd.AvgPostAgeSeconds
+    from user_activity ua
+    left join owner_badges ob on ob.UserId = ua.UserId
+    left join owner_question_density oqd on oqd.UserId = ua.UserId
+),
+final_scored as (
+    select
+        r.*,
+        oe.DisplayName as OwnerDisplayName,
+        oe.Reputation as OwnerReputation,
+        oe.Location as OwnerLocation,
+        oe.BadgeCount,
+        oe.GoldCount,
+        oe.SilverCount,
+        oe.BronzeCount,
+        oe.TagBadges,
+        oe.QuestionsAuthored,
+        oe.AnswersAuthored,
+        oe.TotalPosts,
+        case
+            when r.TagCount is null or r.TagCount = 0 then 'untagged'
+            when r.TagCount = 1 then 'single-tag'
+            when r.TagCount between 2 and 3 then 'multi-tag'
+            else 'many-tags'
+        end as TagBucket,
+        case when r.ClosedAt is not null then 1 else 0 end as IsClosed,
+        case when r.DuplicateOf is not null then 1 else 0 end as IsDuplicate,
+        round(
+            coalesce(r.Score,0)*1.0
+            + coalesce(r.Upvotes,0)*0.75
+            - coalesce(r.Downvotes,0)*0.9
+            + coalesce(r.ViewCount,0)*0.001
+            + coalesce(r.Favorites,0)*0.5
+            + coalesce(r.BountyTotal,0)*0.1
+            + coalesce(r.ActualAnswerCount,0)*0.6
+            + coalesce(r.DistinctAnswerers,0)*0.4
+            + coalesce(r.EditCount,0)*0.2
+            + coalesce(r.CommentCount,0)*0.1
+            - case when (case when r.DuplicateOf is not null then 1 else 0 end) = 1 then 3 else 0 end
+            - case when (case when r.ClosedAt is not null then 1 else 0 end) = 1 then 2 else 0 end
+        , 3) as CompositeScore
+    from ranked r
+    left join owner_enriched oe on oe.UserId = r.OwnerUserId
+),
+topn as (
+    select
+        fs.*,
+        row_number() over (order by fs.CompositeScore desc, fs.rn_score asc) as rn
+    from final_scored fs
+)
+select
+    t.QuestionId,
+    t.Title,
+    t.Tags,
+    t.TagList,
+    t.TagBucket,
+    t.Score,
+    t.Upvotes,
+    t.Downvotes,
+    t.ViewCount,
+    t.Favorites,
+    t.BountyTotal,
+    t.LastBountyDate,
+    t.DeclaredAnswerCount,
+    t.ActualAnswerCount,
+    t.DistinctAnswerers,
+    t.MaxAnswerScore,
+    t.FirstAnswerAt,
+    t.LastAnswerAt,
+    t.EditCount,
+    t.LastEditAt,
+    t.ModerationEvents,
+    t.ClosedAt,
+    t.CloseReasonId,
+    t.DuplicateOf,
+    t.FirstDupLinkAt,
+    t.CommentCount,
+    t.MaxCommentScore,
+    round(cast(t.AvgCommentScore as numeric), 3) as AvgCommentScore,
+    t.OwnerUserId,
+    t.OwnerDisplayName,
+    t.OwnerReputation,
+    t.OwnerLocation,
+    t.BadgeCount,
+    t.GoldCount,
+    t.SilverCount,
+    t.BronzeCount,
+    t.TagBadges,
+    t.QuestionsAuthored,
+    t.AnswersAuthored,
+    t.TotalPosts,
+    t.rn_score,
+    t.rn_views,
+    t.dr_bounty,
+    t.decile_net_votes,
+    t.total_upvotes_window,
+    t.total_downvotes_window,
+    round(cast(t.avg_score_window as numeric), 3) as avg_score_window,
+    t.CompositeScore
+from (
+    select *
+    from topn
+    where rn <= 100
+) t
+order by t.CompositeScore desc, t.rn_score asc, t.QuestionId asc;

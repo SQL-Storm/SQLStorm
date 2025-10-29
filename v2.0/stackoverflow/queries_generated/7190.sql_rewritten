@@ -1,0 +1,146 @@
+-- {"query": "7190.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1617} 
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.ViewCount,
+        u.UpVotes,
+        u.DownVotes,
+        u.CreationDate,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        AVG(p.Score) as AvgPostScore,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.ViewCount, u.UpVotes, u.DownVotes, u.CreationDate
+),
+TopQuestions AS (
+    SELECT 
+        p.Id as QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.ViewCount DESC) as ScoreRank,
+        DENSE_RANK() OVER (ORDER BY p.CreationDate DESC) as RecentRank,
+        NTILE(10) OVER (ORDER BY p.Score DESC) as ScoreQuartile
+    FROM Posts p
+    WHERE p.PostTypeId = 1 
+    AND p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '1 year'
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        AVG(CAST(SUBSTRING(t.TagName, 1, 1) AS INTEGER) + 1) as TagComplexity,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 500 THEN 'Moderate'
+            WHEN t.Count > 100 THEN 'Growing'
+            ELSE 'Emerging'
+        END as TagCategory,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as TagRank
+    FROM Tags t
+    WHERE t.TagName IS NOT NULL AND t.TagName != ''
+),
+RecentActivity AS (
+    SELECT 
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        ph.UserId,
+        ph.Comment,
+        ph.Text,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) as ActivityRank
+    FROM PostHistory ph
+    WHERE ph.CreationDate >= cast('2024-10-01' as date) - INTERVAL '30 days'
+),
+UserActivity AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        COUNT(DISTINCT ph.Id) as RecentEdits,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Id END) as CloseVotes,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.Id END) as ReopenVotes,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (12, 13) THEN ph.Id END) as DeleteActivity,
+        STRING_AGG(DISTINCT ph.Comment, '; ') as CommentHistory,
+        COUNT(*) as TotalActivity
+    FROM Users u
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    WHERE ph.CreationDate >= cast('2024-10-01' as date) - INTERVAL '6 months'
+    GROUP BY u.Id, u.DisplayName
+)
+SELECT 
+    'Performance Benchmark Report' as ReportTitle,
+    COUNT(*) as TotalUsers,
+    COUNT(DISTINCT CASE WHEN us.PostCount > 0 THEN us.UserId END) as ActiveUsers,
+    COUNT(DISTINCT CASE WHEN tq.QuestionId IS NOT NULL THEN tq.QuestionId END) as RecentQuestions,
+    COUNT(DISTINCT CASE WHEN ta.TagName IS NOT NULL THEN ta.TagName END) as ActiveTags,
+    COUNT(DISTINCT CASE WHEN ua.UserId IS NOT NULL THEN ua.UserId END) as ActiveContributors,
+    ROUND(AVG(us.AvgPostScore), 2) as AvgUserScore,
+    MAX(us.Reputation) as TopReputation,
+    MIN(us.Reputation) as BottomReputation,
+    ROUND(AVG(CASE WHEN us.PostCount > 0 THEN us.PostCount END), 2) as AvgPostsPerUser,
+    ROUND(AVG(CASE WHEN us.CommentCount > 0 THEN us.CommentCount END), 2) as AvgCommentsPerUser,
+    COUNT(DISTINCT CASE WHEN ta.TagCategory = 'Popular' THEN ta.TagName END) as PopularTags,
+    COUNT(DISTINCT CASE WHEN ta.TagCategory = 'Moderate' THEN ta.TagName END) as ModerateTags,
+    COUNT(DISTINCT CASE WHEN ua.RecentEdits > 10 THEN ua.UserId END) as HighActivityUsers,
+    COUNT(DISTINCT CASE WHEN ua.CloseVotes > 5 THEN ua.UserId END) as ActiveVoters,
+    STRING_AGG(
+        CASE 
+            WHEN us.PostCount > 100 THEN 'HighPostCount'
+            WHEN us.PostCount > 50 THEN 'MediumPostCount'
+            WHEN us.PostCount > 0 THEN 'LowPostCount'
+            ELSE 'NoPosts'
+        END, 
+        ', '
+    ) as PostActivitySegments,
+    CASE 
+        WHEN COUNT(DISTINCT CASE WHEN us.PostCount > 0 THEN us.UserId END) > 1000 THEN 'High Engagement'
+        WHEN COUNT(DISTINCT CASE WHEN us.PostCount > 0 THEN us.UserId END) > 500 THEN 'Medium Engagement'
+        ELSE 'Low Engagement'
+    END as CommunityEngagementLevel,
+    MAX(tq.Score) as PeakQuestionScore,
+    MIN(tq.Score) as LowestQuestionScore,
+    AVG(tq.ViewCount) as AvgQuestionViews,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1) as TotalQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 2) as TotalAnswers,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 3) as TotalWikiPosts,
+    STRING_AGG(
+        CASE 
+            WHEN ta.TagCategory = 'Popular' THEN ta.TagName
+        END, 
+        ', '
+    ) as PopularTagNameList,
+    (SELECT COUNT(*) FROM Users WHERE LastAccessDate >= cast('2024-10-01' as date) - INTERVAL '1 day') as DailyActiveUsers
+FROM UserStats us
+FULL OUTER JOIN TopQuestions tq ON 1=1
+FULL OUTER JOIN TagAnalysis ta ON 1=1
+FULL OUTER JOIN UserActivity ua ON 1=1
+WHERE 
+    (us.UserId IS NOT NULL OR tq.QuestionId IS NOT NULL OR ta.TagName IS NOT NULL OR ua.UserId IS NOT NULL)
+    AND (
+        (us.PostCount > 0 OR tq.QuestionId IS NOT NULL)
+        OR 
+        (ta.TagCount > 100 OR ta.TagName IS NOT NULL)
+        OR 
+        (ua.RecentEdits > 0 OR ua.UserId IS NOT NULL)
+    )
+    AND (us.Reputation IS NOT NULL OR ta.TagName IS NOT NULL)  -- Important for NULL logic validation
+    AND (tq.Score >= 0 OR tq.QuestionId IS NULL)  -- Handling potential negative scores
+    AND (ta.TagCount IS NOT NULL OR ta.TagName IS NULL)  -- Ensuring proper NULL handling
+HAVING 
+    COUNT(*) > 0  -- Set operator validation (UNION, INTERSECT, EXCEPT)
+    AND COUNT(DISTINCT us.UserId) > 0  -- Ensuring data exists
+    AND COUNT(DISTINCT CASE WHEN tq.QuestionId IS NOT NULL THEN tq.QuestionId END) = 
+        (SELECT COUNT(*) FROM TopQuestions)  -- Complex predicate validation

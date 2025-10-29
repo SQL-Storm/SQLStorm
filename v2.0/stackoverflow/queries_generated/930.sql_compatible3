@@ -1,0 +1,299 @@
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        u.location,
+        coalesce(nullif(trim(split_part(coalesce(u.websiteurl, ''), '/', 3)), ''), 'unknown') as domain,
+        date_trunc('month', u.creationdate) as signup_month,
+        row_number() over (partition by coalesce(nullif(trim(split_part(coalesce(u.websiteurl, ''), '/', 3)), ''), 'unknown') order by u.reputation desc, u.id) as rn_in_domain
+    from users u
+    where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+qualified_users as (
+    select *
+    from recent_users
+    where rn_in_domain <= 50
+),
+questions as (
+    select p.*
+    from posts p
+    where p.posttypeid = 1
+),
+answers as (
+    select p.*
+    from posts p
+    where p.posttypeid = 2
+),
+user_activity as (
+    select
+        qu.user_id,
+        count(distinct q.id) filter (where q.id is not null) as questions_count,
+        sum(q.viewcount) filter (where q.id is not null) as questions_views,
+        sum(q.score) filter (where q.id is not null) as questions_score,
+        count(a.id) filter (where a.id is not null) as answers_count,
+        sum(a.score) filter (where a.id is not null) as answers_score,
+        count(c.id) as comments_count,
+        count(distinct case when v.votetypeid = 2 then v.id end) as upvotes_cast,
+        count(distinct case when v.votetypeid = 3 then v.id end) as downvotes_cast
+    from qualified_users qu
+    left join questions q on q.owneruserid = qu.user_id
+    left join answers a on a.owneruserid = qu.user_id
+    left join comments c on c.userid = qu.user_id
+    left join votes v on v.userid = qu.user_id
+    group by qu.user_id
+),
+tag_explode as (
+    select
+        q.id as question_id,
+        lower(tag) as tag
+    from questions q,
+    lateral (
+      select unnest(string_to_array(substring(q.tags, 2, greatest(length(q.tags)-2,0)), '><')) as tag
+    ) t
+),
+user_top_tag as (
+    select
+        qu.user_id,
+        tx.tag,
+        count(*) as tag_uses,
+        row_number() over (partition by qu.user_id order by count(*) desc, tx.tag) as tag_rank
+    from qualified_users qu
+    join questions q on q.owneruserid = qu.user_id
+    join tag_explode tx on tx.question_id = q.id
+    group by qu.user_id, tx.tag
+),
+accepted_answer_stats as (
+    select
+        qu.user_id,
+        count(distinct q.id) as questions_with_accepted,
+        count(distinct a.id) as answers_marked_accepted
+    from qualified_users qu
+    left join questions q on q.owneruserid = qu.user_id and q.acceptedanswerid is not null
+    left join answers a on a.owneruserid = qu.user_id
+                         and exists (
+                            select 1
+                            from posts qa
+                            where qa.posttypeid = 1
+                              and qa.acceptedanswerid = a.id
+                         )
+    group by qu.user_id
+),
+dup_link_stats as (
+    select
+        qu.user_id,
+        count(distinct pl.id) filter (where pl.linktypeid = 3 and p.owneruserid = qu.user_id) as dup_marked_on_their_questions,
+        count(distinct pl.id) filter (where pl.linktypeid = 3 and rp.owneruserid = qu.user_id) as their_posts_marked_as_target
+    from qualified_users qu
+    left join postlinks pl on pl.linktypeid in (1,3)
+    left join posts p on p.id = pl.postid
+    left join posts rp on rp.id = pl.relatedpostid
+    group by qu.user_id
+),
+close_events as (
+    select
+        ph.postid,
+        min(ph.creationdate) filter (where ph.posthistorytypeid = 10) as first_close_date,
+        max(ph.creationdate) filter (where ph.posthistorytypeid = 11) as last_reopen_date,
+        max(case when ph.posthistorytypeid = 10 then (case when ph.comment ~ '^\d+$' then cast(ph.comment as integer) else null end) end) as last_close_reason_id
+    from posthistory ph
+    where ph.posthistorytypeid in (10,11)
+    group by ph.postid
+),
+question_close_summary as (
+    select
+        qu.user_id,
+        count(*) filter (where ce.first_close_date is not null) as closed_questions,
+        count(*) filter (where ce.first_close_date is not null and ce.last_reopen_date is not null and ce.last_reopen_date > ce.first_close_date) as reopened_questions,
+        count(*) filter (where ce.last_close_reason_id = 101) as duplicate_closes
+    from qualified_users qu
+    left join questions q on q.owneruserid = qu.user_id
+    left join close_events ce on ce.postid = q.id
+    group by qu.user_id
+),
+voting_impact as (
+    select
+        qu.user_id,
+        coalesce(sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end),0) as net_votes_cast,
+        coalesce(sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end),0) as total_bounty_amount
+    from qualified_users qu
+    left join votes v on v.userid = qu.user_id
+    group by qu.user_id
+),
+post_engagement as (
+    select
+        qu.user_id,
+        percentile_cont(0.5) within group (order by coalesce(p.viewcount,0)) as median_views_per_post,
+        avg(coalesce(p.commentcount,0)) as avg_comments_per_post,
+        max(coalesce(p.favoritecount,0)) as max_favorites_on_post
+    from qualified_users qu
+    left join posts p on p.owneruserid = qu.user_id
+    group by qu.user_id
+),
+comment_sentiment as (
+    select
+        qu.user_id,
+        avg(length(c.text)) as avg_comment_len,
+        sum(case when position('thanks' in lower(c.text)) > 0 then 1 else 0 end) as thanks_count,
+        sum(case when position('help' in lower(c.text)) > 0 then 1 else 0 end) as help_count
+    from qualified_users qu
+    left join comments c on c.userid = qu.user_id
+    group by qu.user_id
+),
+badge_mix as (
+    select
+        qu.user_id,
+        count(*) filter (where b.class = 1) as gold_badges,
+        count(*) filter (where b.class = 2) as silver_badges,
+        count(*) filter (where b.class = 3) as bronze_badges,
+        count(*) filter (where b.tagbased = true) as tag_badges
+    from qualified_users qu
+    left join badges b on b.userid = qu.user_id
+    group by qu.user_id
+),
+ranked_users as (
+    select
+        qu.*,
+        ua.questions_count,
+        ua.questions_views,
+        ua.questions_score,
+        ua.answers_count,
+        ua.answers_score,
+        ua.comments_count,
+        ua.upvotes_cast,
+        ua.downvotes_cast,
+        coalesce(aa.questions_with_accepted,0) as questions_with_accepted,
+        coalesce(aa.answers_marked_accepted,0) as answers_marked_accepted,
+        coalesce(dls.dup_marked_on_their_questions,0) as dup_marked_on_their_questions,
+        coalesce(dls.their_posts_marked_as_target,0) as their_posts_marked_as_target,
+        coalesce(qcs.closed_questions,0) as closed_questions,
+        coalesce(qcs.reopened_questions,0) as reopened_questions,
+        coalesce(qcs.duplicate_closes,0) as duplicate_closes,
+        vi.net_votes_cast,
+        vi.total_bounty_amount,
+        pe.median_views_per_post,
+        pe.avg_comments_per_post,
+        pe.max_favorites_on_post,
+        cs.avg_comment_len,
+        cs.thanks_count,
+        cs.help_count,
+        bm.gold_badges,
+        bm.silver_badges,
+        bm.bronze_badges,
+        bm.tag_badges,
+        case
+            when coalesce(ua.answers_count,0) + coalesce(ua.questions_count,0) = 0 then null
+            else cast(coalesce(ua.answers_score,0) + coalesce(ua.questions_score,0) as numeric)
+                 / nullif(coalesce(ua.answers_count,0) + coalesce(ua.questions_count,0),0)
+        end as avg_score_per_post,
+        case
+            when coalesce(ua.questions_count,0) = 0 then null
+            else cast(coalesce(aa.questions_with_accepted,0) as numeric) / nullif(ua.questions_count,0)
+        end as acceptance_rate_on_questions,
+        case
+            when coalesce(ua.answers_count,0) = 0 then null
+            else cast(coalesce(aa.answers_marked_accepted,0) as numeric) / nullif(ua.answers_count,0)
+        end as acceptance_rate_on_answers
+    from qualified_users qu
+    left join user_activity ua on ua.user_id = qu.user_id
+    left join accepted_answer_stats aa on aa.user_id = qu.user_id
+    left join dup_link_stats dls on dls.user_id = qu.user_id
+    left join question_close_summary qcs on qcs.user_id = qu.user_id
+    left join voting_impact vi on vi.user_id = qu.user_id
+    left join post_engagement pe on pe.user_id = qu.user_id
+    left join comment_sentiment cs on cs.user_id = qu.user_id
+    left join badge_mix bm on bm.user_id = qu.user_id
+),
+domain_rollup as (
+    select
+        domain,
+        count(*) as users_in_domain,
+        avg(reputation) as avg_rep_domain,
+        percentile_cont(0.9) within group (order by reputation) as p90_rep_domain,
+        sum(answers_count) as answers_domain,
+        sum(questions_count) as questions_domain,
+        sum(net_votes_cast) as net_votes_domain
+    from ranked_users
+    group by domain
+),
+final_rank as (
+    select
+        ru.*,
+        dr.users_in_domain,
+        dr.avg_rep_domain,
+        dr.p90_rep_domain,
+        row_number() over (
+            partition by ru.domain
+            order by
+                coalesce(ru.answers_score,0) * 2
+              + coalesce(ru.questions_score,0)
+              + coalesce(ru.gold_badges,0) * 50
+              + coalesce(ru.silver_badges,0) * 10
+              + coalesce(ru.bronze_badges,0) * 2
+              + coalesce(ru.total_bounty_amount,0) / 10
+              + coalesce(ru.net_votes_cast,0)
+              - coalesce(ru.duplicate_closes,0) * 5
+              - coalesce(ru.downvotes_cast,0) desc,
+                ru.user_id
+        ) as rank_in_domain
+    from ranked_users ru
+    join domain_rollup dr on dr.domain = ru.domain
+)
+select
+    fr.user_id,
+    fr.displayname,
+    fr.reputation,
+    fr.domain,
+    fr.signup_month,
+    fr.rank_in_domain,
+    fr.users_in_domain,
+    fr.avg_rep_domain,
+    fr.p90_rep_domain,
+    coalesce(utt.tag, 'none') as top_tag,
+    coalesce(utt.tag_uses, 0) as top_tag_uses,
+    fr.questions_count,
+    fr.answers_count,
+    fr.avg_score_per_post,
+    fr.acceptance_rate_on_questions,
+    fr.acceptance_rate_on_answers,
+    fr.closed_questions,
+    fr.reopened_questions,
+    fr.dup_marked_on_their_questions,
+    fr.their_posts_marked_as_target,
+    fr.median_views_per_post,
+    fr.avg_comments_per_post,
+    fr.max_favorites_on_post,
+    fr.gold_badges,
+    fr.silver_badges,
+    fr.bronze_badges,
+    fr.tag_badges,
+    fr.upvotes_cast,
+    fr.downvotes_cast,
+    fr.net_votes_cast,
+    fr.total_bounty_amount,
+    fr.avg_comment_len,
+    fr.thanks_count,
+    fr.help_count
+from final_rank fr
+left join lateral (
+    select tag, tag_uses
+    from user_top_tag utt
+    where utt.user_id = fr.user_id and utt.tag_rank = 1
+) utt on true
+where
+    (
+        fr.answers_count > 0
+        or fr.questions_count > 0
+        or coalesce(fr.gold_badges,0) + coalesce(fr.silver_badges,0) + coalesce(fr.bronze_badges,0) > 0
+    )
+  and (
+        fr.reputation > fr.avg_rep_domain
+        or fr.rank_in_domain <= 10
+        or fr.net_votes_cast >= 0
+    )
+order by
+    fr.domain,
+    fr.rank_in_domain,
+    fr.user_id
+limit 500;

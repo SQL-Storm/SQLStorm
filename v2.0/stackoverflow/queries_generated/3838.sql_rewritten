@@ -1,0 +1,147 @@
+-- {"query": "3838.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1978} 
+WITH
+    -- Aggregate basic user statistics
+    user_stats AS (
+        SELECT
+            u.id,
+            u.displayname,
+            u.reputation,
+            COALESCE(u.upvotes, 0) - COALESCE(u.downvotes, 0)        AS net_votes,
+            (SELECT COUNT(*) FROM badges b WHERE b.userid = u.id AND b.class = 1) AS gold_badges,
+            (SELECT COUNT(*) FROM badges b WHERE b.userid = u.id AND b.class = 2) AS silver_badges,
+            (SELECT COUNT(*) FROM badges b WHERE b.userid = u.id AND b.class = 3) AS bronze_badges
+        FROM users u
+    ),
+
+    -- Latest question per user (if any)
+    latest_question AS (
+        SELECT
+            p.id,
+            p.owneruserid,
+            p.title,
+            p.score,
+            p.creationdate,
+            p.tags,
+            ROW_NUMBER() OVER (PARTITION BY p.owneruserid ORDER BY p.creationdate DESC) AS rn
+        FROM posts p
+        WHERE p.posttypeid = 1                              -- only questions
+    ),
+
+    -- Vote aggregates per post
+    post_votes AS (
+        SELECT
+            v.postid,
+            SUM(CASE WHEN vt.id = 2 THEN 1      -- UpMod
+                     WHEN vt.id = 3 THEN -1     -- DownMod
+                     ELSE 0 END)               AS vote_score
+        FROM votes v
+        JOIN votetypes vt ON vt.id = v.votetypeid
+        GROUP BY v.postid
+    ),
+
+    -- Combine user stats with their latest question and vote info
+    user_activity AS (
+        SELECT
+            us.id,
+            us.displayname,
+            us.reputation,
+            us.net_votes,
+            us.gold_badges,
+            us.silver_badges,
+            us.bronze_badges,
+            lq.title,
+            lq.score                                            AS question_score,
+            lq.creationdate,
+            COALESCE(pv.vote_score, 0)                          AS question_vote_score,
+            /* Convert the tag string like "<tag1><tag2>" to "tag1, tag2" */
+            CASE
+                WHEN lq.tags IS NULL THEN ''
+                ELSE REPLACE(SUBSTRING(lq.tags FROM 2 FOR CHAR_LENGTH(lq.tags)-2), '><', ', ')
+            END                                                AS tag_list
+        FROM user_stats us
+        LEFT JOIN latest_question lq
+               ON lq.owneruserid = us.id AND lq.rn = 1
+        LEFT JOIN post_votes pv
+               ON pv.postid = lq.id
+    ),
+
+    -- Rank users by a composite score
+    ranked_users AS (
+        SELECT
+            ua.*,
+            ROW_NUMBER() OVER (ORDER BY ua.reputation DESC,
+                                         ua.net_votes DESC,
+                                         ua.question_vote_score DESC) AS rank
+        FROM user_activity ua
+        WHERE ua.reputation > 1000                     -- filter for active/high‑rep users
+    ),
+
+    -- Top 5 tags by usage (excluding moderator‑only tags)
+    top_tags AS (
+        SELECT
+            t.tagname,
+            t.count,
+            ROW_NUMBER() OVER (ORDER BY t.count DESC) AS rn
+        FROM tags t
+        WHERE t.ismoderatoronly = 0
+    ),
+
+    -- Tags that have never been used in any question (demonstrates outer join + null logic)
+    unused_tags AS (
+        SELECT
+            t.tagname,
+            t.count
+        FROM tags t
+        LEFT JOIN posts p
+               ON p.tags LIKE CONCAT('%', t.tagname, '%')
+               AND p.posttypeid = 1
+        WHERE p.id IS NULL
+    )
+
+-- Final result set combines ranked users with top tags and unused tags via UNION ALL
+SELECT
+    ru.id,
+    ru.displayname,
+    ru.reputation,
+    ru.net_votes,
+    ru.gold_badges,
+    ru.silver_badges,
+    ru.bronze_badges,
+    ru.title,
+    ru.question_score,
+    ru.question_vote_score,
+    ru.creationdate,
+    ru.tag_list,
+    tt.tagname            AS related_tag,
+    tt.count              AS related_tag_usage,
+    NULL                  AS unused_tag_name,
+    NULL                  AS unused_tag_count,
+    ru.rank
+FROM ranked_users ru
+LEFT JOIN top_tags tt
+       ON tt.rn = 1
+WHERE ru.rank <= 100
+
+UNION ALL
+
+SELECT
+    NULL                  AS id,
+    NULL                  AS displayname,
+    NULL                  AS reputation,
+    NULL                  AS net_votes,
+    NULL                  AS gold_badges,
+    NULL                  AS silver_badges,
+    NULL                  AS bronze_badges,
+    NULL                  AS title,
+    NULL                  AS question_score,
+    NULL                  AS question_vote_score,
+    NULL                  AS creationdate,
+    NULL                  AS tag_list,
+    NULL                  AS related_tag,
+    NULL                  AS related_tag_usage,
+    ut.tagname            AS unused_tag_name,
+    ut.count              AS unused_tag_count,
+    NULL                  AS rank
+FROM unused_tags ut
+ORDER BY rank NULLS LAST, unused_tag_count DESC
+FETCH FIRST 100 ROWS ONLY;

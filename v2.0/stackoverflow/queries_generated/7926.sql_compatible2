@@ -1,0 +1,309 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT c.Id) as TotalComments,
+        COUNT(DISTINCT b.Id) as TotalBadges,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+                SUM(COALESCE(p.Score, 0))::double precision / COUNT(DISTINCT p.Id)
+            ELSE 0.0
+        END as AvgPostScore,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) as PostRank,
+        DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT b.Id) DESC) as BadgeRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        TotalPosts,
+        TotalComments,
+        TotalBadges,
+        AvgPostScore,
+        LastPostDate,
+        LastCommentDate,
+        QuestionCount,
+        AnswerCount,
+        PostRank,
+        BadgeRank,
+        RANK() OVER (ORDER BY Reputation DESC) as ReputationRank
+    FROM UserActivityStats
+    WHERE TotalPosts > 0 OR TotalComments > 0 OR TotalBadges > 0
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.Tags,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END as PostType,
+        CASE WHEN p.AcceptedAnswerId IS NULL THEN 0 ELSE 1 END as HasAcceptedAnswer,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'CommunityOwned'
+            ELSE 'Open'
+        END as PostStatus,
+        STRING_AGG(
+            CASE 
+                WHEN v.VoteTypeId = 2 THEN 'Upvote'
+                WHEN v.VoteTypeId = 3 THEN 'Downvote'
+                WHEN v.VoteTypeId = 8 THEN 'BountyStart'
+                WHEN v.VoteTypeId = 9 THEN 'BountyClose'
+                ELSE 'Other'
+            END, 
+            ', '
+        ) as VoteTypes,
+        COUNT(DISTINCT v.Id) as VoteCount,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) as Upvotes,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) as Downvotes,
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) as ScoreRank,
+        ROW_NUMBER() OVER (ORDER BY p.CreationDate DESC) as ChronologicalOrder,
+        LAG(p.CreationDate, 1) OVER (ORDER BY p.CreationDate) as PreviousPostDate,
+        LEAD(p.CreationDate, 1) OVER (ORDER BY p.CreationDate) as NextPostDate,
+        AVG(p.Score) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate ROWS BETWEEN 10 PRECEDING AND CURRENT ROW) as MovingAverageScore
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (2, 3, 8, 9)
+    WHERE p.Id IS NOT NULL
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.CreationDate, 
+             p.OwnerUserId, p.PostTypeId, p.AnswerCount, p.CommentCount,
+             p.FavoriteCount, p.Tags, p.AcceptedAnswerId, p.ClosedDate, p.CommunityOwnedDate
+),
+TagAnalysis AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        CASE 
+            WHEN COALESCE(CASE WHEN t.IsRequired IS TRUE THEN 1 WHEN t.IsRequired IS FALSE THEN 0 ELSE NULL END, 0) = 1 THEN 'Required'
+            WHEN COALESCE(CASE WHEN t.IsModeratorOnly IS TRUE THEN 1 WHEN t.IsModeratorOnly IS FALSE THEN 0 ELSE NULL END, 0) = 1 THEN 'ModeratorOnly'
+            ELSE 'Regular'
+        END as TagType,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as PopularityRank,
+        LAG(t.Count, 1) OVER (ORDER BY t.Count DESC) as PreviousTagCount,
+        LAG(t.TagName, 1) OVER (ORDER BY t.Count DESC) as PreviousTagName,
+        NTILE(10) OVER (ORDER BY t.Count DESC) as Quantile,
+        CASE 
+            WHEN t.Count > (SELECT AVG("Count") FROM Tags) THEN 'AboveAverage'
+            WHEN t.Count < (SELECT AVG("Count") FROM Tags) THEN 'BelowAverage'
+            ELSE 'Average'
+        END as FrequencyCategory
+    FROM Tags t
+    WHERE t.Id IS NOT NULL
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        pa.PostId,
+        pa.Title,
+        pa.Score,
+        pa.ViewCount,
+        pa.CreationDate,
+        pa.OwnerUserId,
+        pa.PostType,
+        pa.PostStatus,
+        pa.VoteTypes,
+        pa.VoteCount,
+        pa.Upvotes,
+        pa.Downvotes,
+        pa.ScoreRank,
+        pa.ChronologicalOrder,
+        pa.MovingAverageScore,
+        CASE 
+            WHEN pa.Score > 100 THEN 'Popular'
+            WHEN pa.Score > 10 THEN 'Moderate'
+            WHEN pa.Score > 0 THEN 'Low'
+            ELSE 'Negative'
+        END as ScoreCategory,
+        CASE 
+            WHEN pa.ViewCount > 10000 THEN 'Viral'
+            WHEN pa.ViewCount > 1000 THEN 'Trending'
+            WHEN pa.ViewCount > 100 THEN 'Interesting'
+            ELSE 'Ordinary'
+        END as ViewCategory,
+        CASE 
+            WHEN pa.VoteCount > 50 THEN 'HighlyVoted'
+            WHEN pa.VoteCount > 10 THEN 'ModeratelyVoted'
+            WHEN pa.VoteCount > 0 THEN 'LowVoted'
+            ELSE 'NoVotes'
+        END as VoteCategory,
+        pa.Tags,
+        CASE 
+            WHEN pa.Tags IS NOT NULL AND LENGTH(pa.Tags) > 0 THEN 
+                (LENGTH(TRIM(BOTH '<>' FROM pa.Tags)) - LENGTH(REPLACE(TRIM(BOTH '<>' FROM pa.Tags), '><', '')) ) / NULLIF(LENGTH('><'),0) + 1
+            ELSE 0 
+        END as TagCount,
+        CASE 
+            WHEN pa.Tags IS NOT NULL AND LENGTH(pa.Tags) > 0 THEN 
+                TRIM(BOTH '<>' FROM pa.Tags)
+            ELSE '' 
+        END as CleanTags,
+        CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - pa.CreationDate)) / 86400.0 AS double precision) as DaysSinceCreation,
+        CASE 
+            WHEN pa.Score > 0 AND pa.ViewCount > 0 THEN 
+                CAST(pa.Score AS double precision) / CAST(pa.ViewCount AS double precision) * 100
+            ELSE 0.0
+        END as ScoreToViewsRatio,
+        CASE 
+            WHEN pa.AnswerCount IS NOT NULL THEN 
+                CASE 
+                    WHEN pa.QuestionCount > 0 THEN 
+                        ROUND(CAST(pa.AnswerCount AS double precision) / CAST(pa.QuestionCount AS double precision) * 100, 2)
+                    ELSE 0.0
+                END
+            ELSE 0.0
+        END as AnswerPercentage
+    FROM PostAnalysis pa
+    WHERE pa.PostId IS NOT NULL
+),
+UserPostSummary AS (
+    SELECT 
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.TotalPosts,
+        tu.TotalComments,
+        tu.TotalBadges,
+        tu.AvgPostScore,
+        tu.LastPostDate,
+        tu.LastCommentDate,
+        tu.QuestionCount,
+        tu.AnswerCount,
+        tu.PostRank,
+        tu.BadgeRank,
+        tu.ReputationRank,
+        CASE 
+            WHEN tu.TotalPosts > 0 THEN 
+                CAST(tu.QuestionCount AS double precision) / CAST(tu.TotalPosts AS double precision) * 100
+            ELSE 0.0
+        END as QuestionPercentage,
+        CASE 
+            WHEN tu.TotalBadges > 0 THEN 
+                CAST(tu.BadgeRank AS double precision) / CAST(tu.TotalBadges AS double precision)
+            ELSE 0.0
+        END as BadgeEfficiency,
+        DENSE_RANK() OVER (ORDER BY (tu.QuestionCount + tu.AnswerCount) DESC) as ActivityRank
+    FROM TopUsers tu
+    WHERE tu.UserId IS NOT NULL
+),
+FinalJoin AS (
+    SELECT 
+        ups.UserId,
+        ups.DisplayName,
+        ups.Reputation,
+        ups.TotalPosts,
+        ups.TotalComments,
+        ups.TotalBadges,
+        ups.AvgPostScore,
+        ups.LastPostDate,
+        ups.LastCommentDate,
+        ups.QuestionCount,
+        ups.AnswerCount,
+        ups.PostRank,
+        ups.BadgeRank,
+        ups.ReputationRank,
+        ups.QuestionPercentage,
+        ups.BadgeEfficiency,
+        ups.ActivityRank,
+        cpa.PostId,
+        cpa.Title,
+        cpa.Score,
+        cpa.ViewCount,
+        cpa.CreationDate,
+        cpa.PostType,
+        cpa.PostStatus,
+        cpa.VoteTypes,
+        cpa.VoteCount,
+        cpa.Upvotes,
+        cpa.Downvotes,
+        cpa.ScoreRank,
+        cpa.ChronologicalOrder,
+        cpa.MovingAverageScore,
+        cpa.ScoreCategory,
+        cpa.ViewCategory,
+        cpa.VoteCategory,
+        cpa.Tags,
+        cpa.TagCount,
+        cpa.ScoreToViewsRatio,
+        cpa.AnswerPercentage,
+        ta.Id as TagId,
+        ta.TagName,
+        ta.Count as TagCountDetailed,
+        ta.TagType,
+        ta.PopularityRank,
+        ta.FrequencyCategory,
+        CASE 
+            WHEN cpa.AnswerPercentage > 50 THEN 'HighAnswerRatio'
+            WHEN cpa.AnswerPercentage > 25 THEN 'ModerateAnswerRatio'
+            ELSE 'LowAnswerRatio'
+        END as AnswerRatioCategory,
+        ROW_NUMBER() OVER (PARTITION BY ups.UserId ORDER BY cpa.CreationDate DESC) as UserPostSeq
+    FROM UserPostSummary ups
+    INNER JOIN ComplexPostAnalysis cpa ON ups.UserId = cpa.OwnerUserId
+    LEFT JOIN TagAnalysis ta ON cpa.Tags LIKE '%' || ta.TagName || '%'
+    WHERE ups.UserId IS NOT NULL 
+      AND cpa.PostId IS NOT NULL
+)
+SELECT 
+    COUNT(*) as TotalRecords,
+    COUNT(DISTINCT UserId) as DistinctUsers,
+    COUNT(DISTINCT PostId) as DistinctPosts,
+    AVG(Reputation) as AvgReputation,
+    MAX(TotalPosts) as MaxPostsPerUser,
+    MIN(AvgPostScore) as MinAvgScore,
+    MAX(TotalPosts) as OverallMaxPosts,
+    STRING_AGG(DISTINCT ScoreCategory, ', ') as ScoreCategories,
+    STRING_AGG(DISTINCT CASE WHEN PostStatus = 'Open' THEN 'Open' ELSE 'ClosedOrCommunity' END, ', ') as PostStatuses,
+    COUNT(DISTINCT CASE WHEN TagCount > 0 THEN TagId END) as TaggedPosts,
+    COUNT(DISTINCT CASE WHEN AnswerCount > 0 THEN PostId END) as AnsweredQuestions,
+    COUNT(DISTINCT CASE WHEN VoteCount > 10 THEN PostId END) as HighlyVotedPosts,
+    COUNT(DISTINCT CASE WHEN ViewCount > 1000 THEN PostId END) as HighViewCountPosts,
+    COUNT(DISTINCT CASE WHEN Score > 100 THEN PostId END) as PopularPosts,
+    COUNT(DISTINCT CASE WHEN Score < 0 THEN PostId END) as NegativeScorePosts,
+    SUM(AvgPostScore) as TotalScore,
+    AVG(DaysSinceCreation) as AvgDaysSinceCreation,
+    AVG(ScoreToViewsRatio) as AvgScoreToViewsRatio
+FROM FinalJoin
+WHERE UserId IS NOT NULL 
+  AND PostId IS NOT NULL
+  AND DisplayName IS NOT NULL
+  AND Score IS NOT NULL
+  AND ViewCount IS NOT NULL
+  AND Reputation > 0
+  AND CreationDate <= TIMESTAMP '2024-10-01 12:34:56'
+  AND (AnswerCount IS NULL OR AnswerCount >= 0)
+  AND (VoteCount IS NULL OR VoteCount >= 0)
+  AND (TagCount IS NULL OR TagCount >= 0)
+GROUP BY 1=1
+HAVING COUNT(*) > 0
+   AND COUNT(DISTINCT UserId) > 1000
+   AND COUNT(DISTINCT PostId) > 5000
+ORDER BY TotalRecords DESC
+LIMIT 1000;

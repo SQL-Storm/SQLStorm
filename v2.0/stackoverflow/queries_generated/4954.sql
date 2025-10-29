@@ -1,0 +1,119 @@
+-- {"query": "4954.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1132} 
+
+WITH RankedUserBadges AS (
+    SELECT
+        b.UserId,
+        b.Name AS BadgeName,
+        b.Date AS BadgeDate,
+        ROW_NUMBER() OVER(PARTITION BY b.UserId ORDER BY b.Date DESC) as rn
+    FROM Badges b
+),
+HighReputationUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        nub.BadgeName AS LatestBadgeName,
+        nub.BadgeDate AS LatestBadgeDate
+    FROM Users u
+    LEFT JOIN RankedUserBadges nub ON u.Id = nub.UserId AND nub.rn = 1
+    WHERE u.Reputation > 10000
+),
+RecentQuestions AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title AS QuestionTitle,
+        p.OwnerUserId,
+        p.CreationDate AS QuestionCreationDate,
+        p.Score AS QuestionScore,
+        p.ViewCount AS QuestionViewCount,
+        p.AnswerCount,
+        p.FavoriteCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.CreationDate >= DATE('now', '-30 days')
+),
+QuestionStats AS (
+    SELECT
+        rq.QuestionId,
+        rq.QuestionTitle,
+        rq.OwnerUserId,
+        rq.QuestionCreationDate,
+        rq.QuestionScore,
+        rq.QuestionViewCount,
+        rq.AnswerCount,
+        rq.FavoriteCount,
+        COUNT(c.Id) AS CommentCount,
+        SUM(CASE WHEN c.Score > 0 THEN 1 ELSE 0 END) AS PositiveCommentCount,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM RecentQuestions rq
+    LEFT JOIN Comments c ON rq.QuestionId = c.PostId
+    GROUP BY rq.QuestionId, rq.QuestionTitle, rq.OwnerUserId, rq.QuestionCreationDate, rq.QuestionScore, rq.QuestionViewCount, rq.AnswerCount, rq.FavoriteCount
+),
+UserQuestionPerformance AS (
+    SELECT
+        qs.QuestionId,
+        qs.QuestionTitle,
+        qs.OwnerUserId,
+        qs.QuestionCreationDate,
+        qs.QuestionScore,
+        qs.QuestionViewCount,
+        qs.AnswerCount,
+        qs.FavoriteCount,
+        qs.CommentCount,
+        qs.PositiveCommentCount,
+        qs.LastCommentDate,
+        COALESCE(hru.DisplayName, 'Anonymous') AS OwnerDisplayName,
+        COALESCE(hru.Reputation, 0) AS OwnerReputation,
+        hru.LatestBadgeName,
+        hru.LatestBadgeDate,
+        CASE
+            WHEN qs.AnswerCount > 0 THEN CAST(qs.QuestionScore AS REAL) / qs.AnswerCount
+            ELSE qs.QuestionScore
+        END AS ScorePerAnswer,
+        CASE
+            WHEN qs.QuestionViewCount > 0 THEN CAST(qs.FavoriteCount AS REAL) / qs.QuestionViewCount * 100
+            ELSE 0
+        END AS FavoritePercentage
+    FROM QuestionStats qs
+    LEFT JOIN HighReputationUsers hru ON qs.OwnerUserId = hru.UserId
+),
+DuplicateLinks AS (
+    SELECT
+        pl.PostId AS QuestionId,
+        pl.RelatedPostId AS DuplicateQuestionId
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 3
+)
+SELECT
+    uqp.QuestionTitle,
+    uqp.QuestionCreationDate,
+    uqp.QuestionScore,
+    uqp.QuestionViewCount,
+    uqp.AnswerCount,
+    uqp.FavoriteCount,
+    uqp.CommentCount,
+    uqp.PositiveCommentCount,
+    uqp.LastCommentDate,
+    uqp.OwnerDisplayName,
+    uqp.OwnerReputation,
+    uqp.LatestBadgeName,
+    uqp.LatestBadgeDate,
+    uqp.ScorePerAnswer,
+    uqp.FavoritePercentage,
+    CASE
+        WHEN dl.DuplicateQuestionId IS NOT NULL THEN 'Yes'
+        ELSE 'No'
+    END AS IsDuplicate,
+    CASE
+        WHEN uqp.OwnerReputation >= 10000 AND uqp.QuestionScore > 100 THEN 'High-Value Question by High-Rep User'
+        WHEN uqp.OwnerReputation < 1000 AND uqp.QuestionScore < 0 THEN 'Low-Value Question by Low-Rep User'
+        WHEN uqp.FavoritePercentage > 5 THEN 'Highly Favorited Question'
+        WHEN uqp.ScorePerAnswer < 0 THEN 'Negative Score Per Answer'
+        ELSE 'Standard Question'
+    END AS PerformanceCategory
+FROM UserQuestionPerformance uqp
+LEFT JOIN DuplicateLinks dl ON uqp.QuestionId = dl.QuestionId
+WHERE uqp.QuestionScore IS NOT NULL AND uqp.OwnerUserId IS NOT NULL
+ORDER BY uqp.QuestionCreationDate DESC
+LIMIT 1000;

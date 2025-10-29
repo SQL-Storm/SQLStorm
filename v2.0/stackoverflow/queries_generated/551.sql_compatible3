@@ -1,0 +1,304 @@
+with recent_users as (
+  select u.id as user_id,
+         u.displayname,
+         u.reputation,
+         u.creationdate,
+         coalesce(nullif(trim(u.location), ''), 'Unknown') as location_norm,
+         coalesce(u.websiteurl, '') as websiteurl,
+         row_number() over (order by u.creationdate desc, u.id) as rn
+  from users u
+  where u.creationdate >= (select date_trunc('year', max(creationdate)) - interval '3 years' from users)
+),
+top_tags as (
+  select t.tagname,
+         t.count,
+         t.ismoderatoronly,
+         t.isrequired,
+         row_number() over (order by t.count desc, t.tagname) as tag_rn
+  from tags t
+  where t.count > 0
+),
+questions as (
+  select p.id as qid,
+         p.owneruserid as asker_id,
+         p.creationdate as q_created,
+         p.score as q_score,
+         p.viewcount as q_views,
+         p.title,
+         p.tags,
+         p.acceptedanswerid,
+         (select count(*) from posts a where a.parentid = p.id and a.posttypeid = 2) as answer_count
+  from posts p
+  where p.posttypeid = 1
+),
+answers as (
+  select a.id as aid,
+         a.parentid as qid,
+         a.owneruserid as answerer_id,
+         a.creationdate as a_created,
+         a.score as a_score
+  from posts a
+  where a.posttypeid = 2
+),
+engagement as (
+  select q.qid,
+         count(distinct c.id) as comment_events,
+         sum(greatest(c.score, 0)) as nonneg_comment_score,
+         count(distinct case when v.votetypeid = 2 then v.userid end) as distinct_upvoters,
+         sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end) as vote_delta,
+         sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites
+  from questions q
+  left join comments c on c.postid = q.qid
+  left join votes v on v.postid = q.qid
+  group by q.qid
+),
+dup_map as (
+  select pl.postid as dup_qid,
+         pl.relatedpostid as master_qid,
+         pl.creationdate as dup_marked_at
+  from postlinks pl
+  where pl.linktypeid = 3
+),
+close_events as (
+  select ph.postid as qid,
+         min(case when ph.posthistorytypeid = 10 then ph.creationdate end) as first_closed_at,
+         max(case when ph.posthistorytypeid = 11 then ph.creationdate end) as last_reopened_at,
+         count(case when ph.posthistorytypeid = 10 then 1 end) as close_votes_events,
+         count(case when ph.posthistorytypeid = 11 then 1 end) as reopen_events,
+         max(case when ph.posthistorytypeid = 10 then nullif(ph.comment, '') end) as last_close_reason_id_text
+  from posthistory ph
+  where ph.posthistorytypeid in (10,11)
+  group by ph.postid
+),
+user_rep_movements as (
+  select u.id as user_id,
+         sum(case when v.votetypeid = 2 then 10 when v.votetypeid = 3 then -2 else 0 end) as rep_delta_from_votes,
+         count(case when v.votetypeid = 8 then 1 end) as bounties_started,
+         sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_amount_started,
+         count(case when v.votetypeid = 9 then 1 end) as bounties_awarded,
+         sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_amount_awarded
+  from users u
+  left join posts p on p.owneruserid = u.id
+  left join votes v on v.postid = p.id
+  group by u.id
+),
+post_edit_density as (
+  select ph.postid as pid,
+         count(case when ph.posthistorytypeid in (4,5,6) then 1 end) as edits,
+         count(case when ph.posthistorytypeid in (7,8,9) then 1 end) as rollbacks,
+         min(ph.creationdate) as first_hist_at,
+         max(ph.creationdate) as last_hist_at
+  from posthistory ph
+  group by ph.postid
+),
+accepted_answer_latency as (
+  select q.qid,
+         extract(epoch from (a.a_created - q.q_created)) / 3600.0 as hours_to_first_answer,
+         extract(epoch from (acc.creationdate - q.q_created)) / 3600.0 as hours_to_accept
+  from questions q
+  left join answers a
+    on a.qid = q.qid
+   and a.a_created = (select min(a2.a_created) from answers a2 where a2.qid = q.qid)
+  left join posts acc on acc.id = q.acceptedanswerid
+),
+user_badge_mix as (
+  select b.userid,
+         sum(case when b.class = 1 then 1 else 0 end) as golds,
+         sum(case when b.class = 2 then 1 else 0 end) as silvers,
+         sum(case when b.class = 3 then 1 else 0 end) as bronzes,
+         count(case when b.tagbased = true then 1 end) as tag_badges,
+         count(case when b.tagbased = false then 1 end) as named_badges,
+         count(*) as total_badges,
+         string_agg(distinct left(b.name, 1), '' order by left(b.name,1)) as badge_initials_sig
+  from badges b
+  group by b.userid
+),
+tag_exploded as (
+  select q.qid,
+         unnest(string_to_array(substring(q.tags, 2, char_length(q.tags)-2), '><')) as tagname
+  from questions q
+  where q.tags is not null and q.tags like '<%>'
+),
+question_tag_rank as (
+  select te.qid,
+         te.tagname,
+         tt.tag_rn,
+         tt.count as tag_global_count
+  from tag_exploded te
+  left join top_tags tt on tt.tagname = te.tagname
+),
+question_quality as (
+  select q.qid,
+         q.q_score,
+         q.q_views,
+         e.vote_delta,
+         e.favorites,
+         e.comment_events,
+         coalesce(aal.hours_to_first_answer, 99999) as hours_to_first_answer,
+         coalesce(aal.hours_to_accept, 99999) as hours_to_accept,
+         coalesce(pd.edits, 0) as edits,
+         coalesce(pd.rollbacks, 0) as rollbacks,
+         coalesce(extract(epoch from (pd.last_hist_at - pd.first_hist_at)) / nullif(greatest(coalesce(pd.edits,0),1),0), 0) as avg_secs_between_edits,
+         case when ce.first_closed_at is not null then 1 else 0 end as was_closed,
+         case when dm.master_qid is not null then 1 else 0 end as was_marked_duplicate,
+         rank() over (order by q.q_score desc, e.vote_delta desc, e.favorites desc) as rank_by_score,
+         dense_rank() over (order by q.q_views desc) as rank_by_views
+  from questions q
+  left join engagement e on e.qid = q.qid
+  left join accepted_answer_latency aal on aal.qid = q.qid
+  left join post_edit_density pd on pd.pid = q.qid
+  left join close_events ce on ce.qid = q.qid
+  left join dup_map dm on dm.dup_qid = q.qid
+),
+question_user as (
+  select q.qid,
+         u.id as user_id,
+         coalesce(u.displayname, q.title) as user_key_for_fun,
+         u.reputation,
+         u.creationdate as user_created_at,
+         ub.total_badges,
+         ub.golds,
+         ub.silvers,
+         ub.bronzes,
+         ub.tag_badges,
+         ub.named_badges,
+         urm.rep_delta_from_votes,
+         urm.bounties_started,
+         urm.bounty_amount_started,
+         urm.bounties_awarded,
+         urm.bounty_amount_awarded
+  from questions q
+  left join users u on u.id = q.asker_id
+  left join user_badge_mix ub on ub.userid = u.id
+  left join user_rep_movements urm on urm.user_id = u.id
+),
+question_tag_agg as (
+  select qtr.qid,
+         count(*) as tag_count,
+         min(qtr.tag_rn) as best_tag_rank,
+         max(qtr.tag_global_count) as max_tag_popularity,
+         string_agg(qtr.tagname, ',' order by qtr.tag_rn nulls last) as tags_csv
+  from question_tag_rank qtr
+  group by qtr.qid
+),
+topk_users as (
+  select ru.user_id
+  from recent_users ru
+  where ru.rn <= 1000
+),
+candidate_questions as (
+  select q.qid
+  from question_user qu
+  left join topk_users tk on tk.user_id = qu.user_id
+  where (qu.reputation >= 1000 or tk.user_id is not null)
+),
+final_scored as (
+  select qq.qid,
+         qu.user_id,
+         qu.reputation,
+         coalesce(qu.total_badges,0) as total_badges,
+         qq.q_score,
+         qq.q_views,
+         qq.vote_delta,
+         qq.favorites,
+         qq.comment_events,
+         qq.edits,
+         qq.rollbacks,
+         qq.was_closed,
+         qq.was_marked_duplicate,
+         coalesce(qt.tag_count,0) as tag_count,
+         coalesce(qt.best_tag_rank, 1000000) as best_tag_rank,
+         coalesce(qt.max_tag_popularity, 0) as max_tag_popularity,
+         0.50*coalesce(qq.q_score,0)
+         + 0.20*coalesce(qq.vote_delta,0)
+         + 0.10*least(coalesce(qq.favorites,0), 50)
+         + 0.05*ln(1+greatest(coalesce(qq.q_views,0),0))
+         + 0.05*least(coalesce(qu.total_badges,0), 50)
+         - 0.05*least(coalesce(qq.comment_events,0), 100)
+         - 0.05*least(coalesce(qq.edits,0), 50)
+         - 0.10*(case when qq.was_closed = 1 then 1 else 0 end)
+         - 0.10*(case when qq.was_marked_duplicate = 1 then 1 else 0 end)
+         + 0.02*(case when coalesce(qt.tag_count,0) between 1 and 5 then 5 - abs(coalesce(qt.tag_count,0) - 3) else -2 end)
+         - 0.01*least(coalesce(qq.hours_to_first_answer,0)/24.0, 30)
+         - 0.01*least(coalesce(qq.hours_to_accept,0)/24.0, 30)
+         + 0.03*(case when coalesce(qt.best_tag_rank, 1000000) <= 500 then 1 else 0 end)
+         as perf_score,
+         qq.hours_to_first_answer,
+         qq.hours_to_accept,
+         qq.q_created
+  from question_quality qq
+  join question_user qu on qu.qid = qq.qid
+  left join question_tag_agg qt on qt.qid = qq.qid
+  where qq.q_created >= (select date_trunc('year', max(creationdate)) - interval '2 years' from posts where posttypeid = 1)
+)
+select *
+from (
+  select fs.qid,
+         fs.user_id,
+         fs.reputation,
+         fs.total_badges,
+         fs.q_score,
+         fs.q_views,
+         fs.vote_delta,
+         fs.favorites,
+         fs.comment_events,
+         fs.edits,
+         fs.rollbacks,
+         fs.was_closed,
+         fs.was_marked_duplicate,
+         fs.tag_count,
+         fs.best_tag_rank,
+         fs.max_tag_popularity,
+         round(cast(fs.perf_score as numeric), 3) as perf_score,
+         coalesce(qt.tags_csv, '') as tags_csv,
+         coalesce(ph.last_close_reason_id_text, '') as last_close_reason_id_text,
+         coalesce(dm.master_qid, 0) as duplicate_of_qid,
+         (select count(*) from answers a where a.qid = fs.qid and a.a_score > 0) as positive_answers,
+         (select count(distinct v.userid) from votes v where v.postid = fs.qid and v.votetypeid in (2,3)) as voters_count,
+         (select string_agg(distinct left(coalesce(u.displayname,''),1), '' order by left(coalesce(u.displayname,''),1))
+            from comments c left join users u on u.id = c.userid
+           where c.postid = fs.qid) as commenter_initials_sig,
+         row_number() over (
+           partition by case when fs.was_marked_duplicate = 1 then 1 else 0 end,
+                        case when fs.was_closed = 1 then 1 else 0 end
+           order by fs.perf_score desc, fs.q_views desc, fs.q_score desc, fs.qid
+         ) as rn
+  from final_scored fs
+  left join question_tag_agg qt on qt.qid = fs.qid
+  left join dup_map dm on dm.dup_qid = fs.qid
+  left join close_events ph on ph.qid = fs.qid
+  where fs.qid in (select qid from candidate_questions)
+) t
+where t.rn <= 200
+union all
+select q.id as qid,
+       q.owneruserid as user_id,
+       u.reputation,
+       coalesce(ub.total_badges,0) as total_badges,
+       q.score as q_score,
+       q.viewcount as q_views,
+       0 as vote_delta,
+       0 as favorites,
+       0 as comment_events,
+       0 as edits,
+       0 as rollbacks,
+       0 as was_closed,
+       0 as was_marked_duplicate,
+       0 as tag_count,
+       1000000 as best_tag_rank,
+       0 as max_tag_popularity,
+       -1000.0 as perf_score,
+       '' as tags_csv,
+       '' as last_close_reason_id_text,
+       0 as duplicate_of_qid,
+       0 as positive_answers,
+       0 as voters_count,
+       '' as commenter_initials_sig,
+       1 as rn_for_union -- added to allow ordering in outer query
+from posts q
+left join users u on u.id = q.owneruserid
+left join user_badge_mix ub on ub.userid = u.id
+where q.posttypeid = 1
+  and q.creationdate is null
+order by perf_score desc, q_views desc, q_score desc, qid
+limit 500;

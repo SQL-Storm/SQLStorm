@@ -1,0 +1,156 @@
+WITH
+recent_posts AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        COALESCE(p.Tags, '') AS tags_raw,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE p.CreationDate >= CAST(CAST('2024-10-01' AS date) - INTERVAL '180 days' AS date)
+),
+
+user_badge_summary AS (
+    SELECT
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS gold_cnt,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS silver_cnt,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS bronze_cnt,
+        COUNT(*) AS total_cnt,
+        STRING_AGG(DISTINCT b.Name, ', ') AS badge_list
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+post_vote_totals AS (
+    SELECT
+        v.PostId,
+        SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS up_votes,
+        SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS down_votes
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY v.PostId
+),
+
+tag_stats AS (
+    SELECT
+        tag,
+        COUNT(DISTINCT p.Id) AS q_cnt,
+        AVG(p.Score) AS avg_score,
+        SUM(p.ViewCount) AS sum_views
+    FROM (
+        SELECT
+            p.Id,
+            p.Score,
+            p.ViewCount,
+            UNNEST(string_to_array(TRIM(BOTH '<>' FROM p.Tags), '><')) AS tag
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+    ) sub
+    GROUP BY tag
+),
+
+user_recent_q_cnt AS (
+    SELECT
+        rp.OwnerUserId,
+        COUNT(*) AS recent_q_cnt
+    FROM recent_posts rp
+    WHERE rp.PostTypeId = 1
+    GROUP BY rp.OwnerUserId
+),
+
+ranked_users AS (
+    SELECT
+        u.Id AS user_id,
+        u.DisplayName,
+        COALESCE(u.Reputation, 0) AS reputation,
+        COALESCE(ubs.gold_cnt, 0) AS gold_cnt,
+        COALESCE(ubs.silver_cnt, 0) AS silver_cnt,
+        COALESCE(ubs.bronze_cnt, 0) AS bronze_cnt,
+        COALESCE(urqc.recent_q_cnt, 0) AS recent_q_cnt,
+        ROW_NUMBER() OVER (ORDER BY COALESCE(u.Reputation, 0) DESC, COALESCE(ubs.gold_cnt, 0) DESC, COALESCE(urqc.recent_q_cnt, 0) DESC) AS rnk
+    FROM Users u
+    LEFT JOIN user_badge_summary ubs ON ubs.UserId = u.Id
+    LEFT JOIN user_recent_q_cnt urqc ON urqc.OwnerUserId = u.Id
+)
+
+SELECT
+    ru.rnk,
+    ru.user_id,
+    ru.DisplayName,
+    ru.reputation,
+    ru.gold_cnt,
+    ru.silver_cnt,
+    ru.bronze_cnt,
+    ru.recent_q_cnt,
+    COALESCE(rp_stats.avg_score, 0) AS recent_q_avg_score,
+    COALESCE(rp_stats.sum_views, 0) AS recent_q_sum_views,
+    ub.badge_list,
+    CASE
+        WHEN EXISTS (
+            SELECT 1
+            FROM Posts p
+            WHERE p.OwnerUserId = ru.user_id
+              AND p.PostTypeId = 1
+              AND p.CreationDate >= CAST(CAST('2024-10-01' AS date) - INTERVAL '30 days' AS date)
+              AND p.Score < 0
+        ) THEN 'NEGATIVE_RECENT'
+        ELSE 'OK'
+    END AS quality_flag,
+    STRING_AGG(DISTINCT ts.tag, ', ') FILTER (WHERE ts.q_cnt > 100) AS popular_tags
+FROM ranked_users ru
+LEFT JOIN (
+    SELECT
+        rp.OwnerUserId,
+        AVG(rp.Score) AS avg_score,
+        SUM(rp.ViewCount) AS sum_views
+    FROM recent_posts rp
+    WHERE rp.PostTypeId = 1
+    GROUP BY rp.OwnerUserId
+) rp_stats ON rp_stats.OwnerUserId = ru.user_id
+LEFT JOIN user_badge_summary ub ON ub.UserId = ru.user_id
+LEFT JOIN LATERAL (
+    SELECT UNNEST(string_to_array(TRIM(BOTH '<>' FROM rp.tags_raw), '><')) AS tag
+    FROM recent_posts rp
+    WHERE rp.OwnerUserId = ru.user_id
+      AND rp.rn = 1
+      AND rp.PostTypeId = 1
+) user_tags(tag) ON TRUE
+LEFT JOIN tag_stats ts ON ts.tag = user_tags.tag
+WHERE ru.rnk <= 50
+GROUP BY
+    ru.rnk,
+    ru.user_id,
+    ru.DisplayName,
+    ru.reputation,
+    ru.gold_cnt,
+    ru.silver_cnt,
+    ru.bronze_cnt,
+    ru.recent_q_cnt,
+    rp_stats.avg_score,
+    rp_stats.sum_views,
+    ub.badge_list,
+    quality_flag
+ORDER BY ru.rnk
+
+UNION ALL
+
+SELECT
+    CAST(NULL AS integer) AS rnk,
+    CAST(NULL AS integer) AS user_id,
+    'No more rows' AS DisplayName,
+    CAST(NULL AS integer) AS reputation,
+    CAST(NULL AS integer) AS gold_cnt,
+    CAST(NULL AS integer) AS silver_cnt,
+    CAST(NULL AS integer) AS bronze_cnt,
+    CAST(NULL AS integer) AS recent_q_cnt,
+    CAST(NULL AS numeric) AS recent_q_avg_score,
+    CAST(NULL AS bigint) AS recent_q_sum_views,
+    CAST(NULL AS text) AS badge_list,
+    CAST(NULL AS text) AS quality_flag,
+    CAST(NULL AS text) AS popular_tags
+WHERE NOT EXISTS (SELECT 1 FROM ranked_users WHERE rnk <= 50);

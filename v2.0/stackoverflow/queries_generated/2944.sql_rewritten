@@ -1,0 +1,161 @@
+-- {"query": "2944.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1794} 
+with RecursiveTagHierarchy as (
+    select t.Id, t.TagName, t.ExcerptPostId, t.WikiPostId, 0 as Level
+    from Tags t
+    where t.IsModeratorOnly = 0
+  union all
+    select t.Id, t.TagName, t.ExcerptPostId, t.WikiPostId, r.Level + 1
+    from Tags t
+    join RecursiveTagHierarchy r on t.WikiPostId = r.ExcerptPostId
+    where r.Level < 3
+),
+UserBadges as (
+    select 
+      u.Id as UserId,
+      u.DisplayName,
+      count(case when b.Class = 1 then 1 end) as GoldBadges,
+      count(case when b.Class = 2 then 1 end) as SilverBadges,
+      count(case when b.Class = 3 then 1 end) as BronzeBadges
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+RecentActivePosts as (
+    select p.Id, p.Title, p.PostTypeId, p.OwnerUserId, p.Score, p.ViewCount,
+      coalesce(p.AnswerCount, 0) as AnswerCount,
+      p.CreationDate,
+      p.Tags,
+      row_number() over(partition by p.OwnerUserId order by p.CreationDate desc) as rn
+    from Posts p
+    where p.PostTypeId in (1, 2) -- Questions and Answers
+      and p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '180 days'
+),
+PostWithLinks as (
+    select p.Id as PostId, p.Title, p.Score, p.ViewCount, p.OwnerUserId,
+      pl.RelatedPostId, lt.Name as LinkTypeName
+    from Posts p
+    left join PostLinks pl on pl.PostId = p.Id
+    left join LinkTypes lt on lt.Id = pl.LinkTypeId
+),
+QuestionStats as (
+    select p.Id as QuestionId, p.Title,
+      count(distinct a.Id) as TotalAnswers,
+      coalesce(max(a.Score), 0) as MaxAnswerScore,
+      count(distinct v.Id) filter (where v.VoteTypeId = 2) as UpVotesCount,
+      count(distinct v.Id) filter (where v.VoteTypeId = 3) as DownVotesCount,
+      (select count(*) from Comments c where c.PostId = p.Id and c.CreationDate > p.CreationDate) as CommentCountAfterCreation
+    from Posts p
+    left join Posts a on a.ParentId = p.Id and a.PostTypeId = 2
+    left join Votes v on v.PostId = p.Id
+    where p.PostTypeId = 1
+    group by p.Id, p.Title
+),
+FilteredClosedQuestions as (
+    select ph.PostId, ph.Comment as CloseReasonJson, crt.Name as CloseReasonName,
+      row_number() over(partition by ph.PostId order by ph.CreationDate desc) as CloseEventRank
+    from PostHistory ph
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where ph.PostHistoryTypeId = 10 -- Post Closed
+),
+QuestionCloseSummary as (
+    select fcq.PostId, fcq.CloseReasonName,
+      (select count(*) from PostHistory ph2 where ph2.PostId = fcq.PostId and ph2.PostHistoryTypeId = 11) as ReopenCount,
+      fcq.CloseEventRank
+    from FilteredClosedQuestions fcq
+    where fcq.CloseEventRank = 1
+),
+UserRecentActivity as (
+    select u.Id as UserId, u.DisplayName, max(p.CreationDate) as LastPostDate,
+      max(ph.CreationDate) as LastEditDate,
+      count(distinct p.Id) as PostsCount,
+      count(distinct ph.Id) as EditsCount
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join PostHistory ph on ph.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+QuestionAnswerSummary as (
+    select q.Id as QuestionId, q.Title as QuestionTitle,
+      a.Id as AnswerId, a.Score as AnswerScore,
+      u.DisplayName as Answerer,
+      row_number() over(partition by q.Id order by a.Score desc, a.CreationDate asc) as AnswerRank,
+      (select count(*) from Comments c where c.PostId = a.Id) as AnswerCommentCount,
+      case when a.Id = q.AcceptedAnswerId then 1 else 0 end as IsAccepted
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Users u on u.Id = a.OwnerUserId
+    where q.PostTypeId = 1
+),
+TopAnswers as (
+    select *
+    from QuestionAnswerSummary
+    where AnswerRank <= 3
+),
+BadgeStringBuild as (
+    select UserId, 
+      string_agg(distinct concat(Name, '(', Class, ')'), ', ') as BadgeSummary
+    from Badges
+    group by UserId
+),
+UserReputationRankings as (
+    select Id, DisplayName, Reputation,
+      rank() over(order by Reputation desc) as ReputationRank
+    from Users
+),
+QuestionFullDetails as (
+    select q.Id as QuestionId, q.Title, q.Tags, q.Score, q.ViewCount, q.CreationDate,
+      u.DisplayName as Asker, u.Reputation as AskerReputation,
+      qas.TotalAnswers,
+      qas.MaxAnswerScore,
+      qas.UpVotesCount,
+      qas.DownVotesCount,
+      qas.CommentCountAfterCreation,
+      qcs.CloseReasonName,
+      qcs.ReopenCount,
+      br.BadgeSummary,
+      ur.ReputationRank
+    from Posts q
+    left join Users u on u.Id = q.OwnerUserId
+    left join QuestionStats qas on qas.QuestionId = q.Id
+    left join QuestionCloseSummary qcs on qcs.PostId = q.Id
+    left join BadgeStringBuild br on br.UserId = q.OwnerUserId
+    left join UserReputationRankings ur on ur.Id = q.OwnerUserId
+    where q.PostTypeId = 1
+),
+FinalResult AS (
+    select qfd.QuestionId, qfd.Title, qfd.Tags, qfd.Score, qfd.ViewCount, qfd.CreationDate,
+      qfd.Asker, qfd.AskerReputation, qfd.ReputationRank, qfd.BadgeSummary,
+      qfd.TotalAnswers, qfd.MaxAnswerScore, qfd.UpVotesCount, qfd.DownVotesCount,
+      qfd.CommentCountAfterCreation, qfd.CloseReasonName, qfd.ReopenCount,
+      string_agg(distinct ta.Answerer || ' (Score: ' || ta.AnswerScore || ', Comments: ' || ta.AnswerCommentCount || ')' , ' | ') as TopAnswers
+    from QuestionFullDetails qfd
+    left join TopAnswers ta on ta.QuestionId = qfd.QuestionId
+    group by qfd.QuestionId, qfd.Title, qfd.Tags, qfd.Score, qfd.ViewCount, qfd.CreationDate,
+      qfd.Asker, qfd.AskerReputation, qfd.ReputationRank, qfd.BadgeSummary,
+      qfd.TotalAnswers, qfd.MaxAnswerScore, qfd.UpVotesCount, qfd.DownVotesCount,
+      qfd.CommentCountAfterCreation, qfd.CloseReasonName, qfd.ReopenCount
+    having qfd.ViewCount > 1000
+      and (qfd.CloseReasonName is null or qfd.ReopenCount > 0)
+    order by qfd.ViewCount desc, qfd.Score desc
+    limit 25
+)
+select 
+  fr.QuestionId,
+  fr.Title,
+  fr.Tags,
+  fr.Score,
+  fr.ViewCount,
+  fr.CreationDate,
+  fr.Asker,
+  fr.AskerReputation,
+  fr.ReputationRank,
+  coalesce(fr.BadgeSummary, 'No Badges') as BadgeSummary,
+  fr.TotalAnswers,
+  fr.MaxAnswerScore,
+  fr.UpVotesCount,
+  fr.DownVotesCount,
+  fr.CommentCountAfterCreation,
+  coalesce(fr.CloseReasonName, 'Open') as CloseReason,
+  fr.ReopenCount,
+  fr.TopAnswers
+from FinalResult fr;

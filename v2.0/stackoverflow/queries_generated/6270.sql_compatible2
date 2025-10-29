@@ -1,0 +1,60 @@
+SELECT 
+    u.DisplayName, 
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    MAX(p.Score) AS HighestScoredPost,
+    MIN(p.CreationDate) AS FirstPostDate,
+    MAX(p.LastActivityDate) AS LastActivityDate,
+    b.Name AS LatestBadge,
+    v.Name AS MostRecentVote,
+    t.TagName AS MostFrequentTag
+FROM 
+    Users u
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    (
+      SELECT 
+        UserId, 
+        MAX(Date) AS MaxDate
+      FROM 
+        Badges
+      GROUP BY 
+        UserId
+    ) b2 ON u.Id = b2.UserId AND b.Date = b2.MaxDate
+LEFT JOIN 
+    (
+      SELECT 
+        UserId, 
+        MAX(CreationDate) AS MaxVoteDate
+      FROM 
+        Votes
+      GROUP BY 
+        UserId
+    ) v1 ON u.Id = v1.UserId
+LEFT JOIN 
+    Votes v ON u.Id = v.UserId AND v.CreationDate = v1.MaxVoteDate
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    (
+      SELECT 
+        TagName, 
+        COUNT(*) AS TagCount
+      FROM 
+        Tags
+      GROUP BY 
+        TagName
+    ) t ON t.TagName IS NOT NULL
+WHERE 
+    u.Reputation > 10000
+    AND p.LastActivityDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '12 months')
+GROUP BY 
+    u.DisplayName, u.Reputation, b.Name, v.Name, t.TagName
+HAVING 
+    COUNT(DISTINCT p.Id) > 50
+ORDER BY 
+    HighestScoredPost DESC, 
+    TotalPosts DESC;

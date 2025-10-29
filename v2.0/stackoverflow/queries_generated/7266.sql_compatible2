@@ -1,0 +1,286 @@
+WITH UserPostStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        SUM(COALESCE(p.Score, 0)) as TotalScore,
+        AVG(COALESCE(p.Score, 0)) as AvgScore,
+        MAX(p.CreationDate) as LastPostDate,
+        STRING_AGG(DISTINCT p.Title, ' || ') as AllTitles,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 100 THEN 'High Engager'
+            WHEN COUNT(DISTINCT p.Id) > 50 THEN 'Medium Engager'
+            WHEN COUNT(DISTINCT p.Id) > 10 THEN 'Low Engager'
+            ELSE 'New User'
+        END as EngagementLevel,
+        CASE 
+            WHEN MAX(p.CreationDate) > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year') THEN 'Active'
+            WHEN MAX(p.CreationDate) > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 years') THEN 'Moderately Active'
+            ELSE 'Inactive'
+        END as ActivityStatus
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.AccountId IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopPosts AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as PostType,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) as RankByScore,
+        RANK() OVER (ORDER BY p.Score DESC) as GlobalRank,
+        DENSE_RANK() OVER (ORDER BY p.OwnerUserId, p.Score DESC) as UserRank,
+        AVG(p.Score) OVER (PARTITION BY p.PostTypeId) as AvgScoreByType,
+        p.Score - AVG(p.Score) OVER (PARTITION BY p.PostTypeId) as ScoreDeviation,
+        CASE 
+            WHEN p.Score > 100 THEN 'Highly Rated'
+            WHEN p.Score > 50 THEN 'Moderately Rated'
+            WHEN p.Score > 10 THEN 'Low Rated'
+            ELSE 'Very Low Rated'
+        END as RatingLevel
+    FROM Posts p
+    WHERE p.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6 months')
+),
+UserActivity AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT v.Id) as VoteCount,
+        COUNT(DISTINCT ph.Id) as HistoryCount,
+        COUNT(DISTINCT pl.Id) as LinkCount,
+        STRING_AGG(CAST(c.Id AS VARCHAR), ',') as CommentIds,
+        STRING_AGG(CAST(v.Id AS VARCHAR), ',') as VoteIds
+    FROM Users u
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    LEFT JOIN PostLinks pl ON u.Id = pl.Id
+    WHERE u.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year')
+    GROUP BY u.Id, u.DisplayName
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Very Popular'
+            WHEN t.Count > 500 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderately Popular'
+            ELSE 'Less Popular'
+        END as PopularityLevel,
+        AVG(COALESCE(p.Score, 0)) as AvgScoreForTag,
+        COUNT(DISTINCT p.Id) as PostsWithTag
+    FROM Tags t
+    LEFT JOIN Posts p ON POSITION(t.TagName IN COALESCE(p.Tags, '')) > 0
+    WHERE t.TagName IS NOT NULL
+    GROUP BY t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId
+),
+ComplexCalculation AS (
+    SELECT 
+        ups.UserId,
+        ups.DisplayName,
+        ups.Reputation,
+        ups.TotalPosts,
+        ups.QuestionCount,
+        ups.AnswerCount,
+        ups.TotalScore,
+        ups.AvgScore,
+        ups.LastPostDate,
+        ups.AllTitles,
+        ups.BadgeCount,
+        ups.EngagementLevel,
+        ups.ActivityStatus,
+        CASE 
+            WHEN ups.TotalPosts > 0 AND ups.AvgScore > 0 THEN 
+                (ups.AvgScore * ups.TotalPosts) / NULLIF(ups.Reputation,0)
+            ELSE 0.0
+        END as ActivityEfficiencyRatio,
+        CASE 
+            WHEN ups.TotalPosts > 0 THEN 
+                ups.BadgeCount * 1.0 / NULLIF(ups.TotalPosts,0)
+            ELSE 0.0
+        END as BadgePerPostRatio,
+        STRING_AGG(CAST(ups.BadgeCount AS VARCHAR), ' | ') as AllBadgesString,
+        COUNT(*) OVER () as TotalUsers,
+        DENSE_RANK() OVER (ORDER BY ups.TotalScore DESC) as ScoreRank,
+        PERCENT_RANK() OVER (ORDER BY ups.TotalScore) as ScorePercentile,
+        NTILE(4) OVER (ORDER BY ups.TotalScore) as ScoreQuartile
+    FROM UserPostStats ups
+    WHERE ups.TotalPosts > 0
+)
+SELECT 
+    cc.UserId,
+    cc.DisplayName,
+    cc.Reputation,
+    cc.TotalPosts,
+    cc.QuestionCount,
+    cc.AnswerCount,
+    cc.TotalScore,
+    cc.AvgScore,
+    cc.LastPostDate,
+    cc.AllTitles,
+    cc.BadgeCount,
+    cc.EngagementLevel,
+    cc.ActivityStatus,
+    cc.ActivityEfficiencyRatio,
+    cc.BadgePerPostRatio,
+    cc.AllBadgesString,
+    cc.TotalUsers,
+    cc.ScoreRank,
+    cc.ScorePercentile,
+    cc.ScoreQuartile,
+    CASE 
+        WHEN cc.ScorePercentile > 0.9 THEN 'Top Tier'
+        WHEN cc.ScorePercentile > 0.75 THEN 'High Tier'
+        WHEN cc.ScorePercentile > 0.5 THEN 'Medium Tier'
+        WHEN cc.ScorePercentile > 0.25 THEN 'Low Tier'
+        ELSE 'Bottom Tier'
+    END as PerformanceTier,
+    CASE 
+        WHEN cc.ActivityStatus = 'Active' AND cc.EngagementLevel IN ('High Engager', 'Medium Engager') THEN 'Engaged Active'
+        WHEN cc.ActivityStatus = 'Active' AND cc.EngagementLevel IN ('Low Engager', 'New User') THEN 'Passive Active'
+        WHEN cc.ActivityStatus = 'Inactive' AND cc.EngagementLevel IN ('High Engager', 'Medium Engager') THEN 'Disengaged Active'
+        WHEN cc.ActivityStatus = 'Inactive' AND cc.EngagementLevel IN ('Low Engager', 'New User') THEN 'Inactive'
+        ELSE 'Unknown'
+    END as UserCategory,
+    COALESCE(ta.TagName, 'No Tags') as PrimaryTag,
+    COALESCE(ta.TagCount, 0) as PrimaryTagCount,
+    CASE WHEN COALESCE(ta.TagCount, 0) > 500 THEN TRUE ELSE FALSE END AS IsPopularTag,
+    STRING_AGG(DISTINCT CASE WHEN tp.RankByScore <= 3 THEN tp.Title END, ' > ') OVER (PARTITION BY cc.UserId ORDER BY tp.RankByScore) as TopThreeTitles,
+    COUNT(*) OVER (PARTITION BY cc.UserId) as UserPostCount,
+    RANK() OVER (ORDER BY cc.TotalScore DESC, cc.Reputation DESC) as CombinedRank,
+    DENSE_RANK() OVER (ORDER BY cc.Reputation DESC, cc.TotalScore DESC) as ReputationRank,
+    LAG(cc.TotalScore, 1, 0) OVER (ORDER BY cc.TotalScore DESC) as PrevScore,
+    LEAD(cc.TotalScore, 1, 0) OVER (ORDER BY cc.TotalScore DESC) as NextScore,
+    ABS(cc.TotalScore - LAG(cc.TotalScore, 1, 0) OVER (ORDER BY cc.TotalScore DESC)) as ScoreDiffFromPrev,
+    CASE 
+        WHEN cc.TotalScore > (SELECT AVG(TotalScore) FROM ComplexCalculation) THEN 'Above Average'
+        WHEN cc.TotalScore < (SELECT AVG(TotalScore) FROM ComplexCalculation) THEN 'Below Average'
+        ELSE 'Average'
+    END as ScoreComparison,
+    CAST(((cc.TotalScore * 1.0) / NULLIF((SELECT MAX(TotalScore) FROM ComplexCalculation),0)) * 100 AS DECIMAL(5,2)) as ScorePercentage,
+    COALESCE(ua.CommentCount, 0) + COALESCE(ua.VoteCount, 0) + COALESCE(ua.HistoryCount, 0) as TotalActivityCount,
+    CASE 
+        WHEN COALESCE(ua.CommentCount, 0) >= 100 AND COALESCE(ua.VoteCount, 0) >= 100 THEN 'Very Active'
+        WHEN COALESCE(ua.CommentCount, 0) >= 50 AND COALESCE(ua.VoteCount, 0) >= 50 THEN 'Moderately Active'
+        ELSE 'Less Active'
+    END as ActivityLevel,
+    CASE 
+        WHEN cc.Reputation > 10000 THEN 'Expert'
+        WHEN cc.Reputation > 5000 THEN 'Advanced'
+        WHEN cc.Reputation > 1000 THEN 'Intermediate'
+        ELSE 'Beginner'
+    END as RepLevel,
+    CASE 
+        WHEN cc.BadgeCount > 20 THEN 'Badge Collector'
+        WHEN cc.BadgeCount > 10 THEN 'Regular Badger'
+        WHEN cc.BadgeCount > 5 THEN 'New Badger'
+        ELSE 'No Badge'
+    END as BadgeLevel,
+    CASE 
+        WHEN cc.TotalPosts >= 500 AND cc.QuestionCount >= 100 THEN 'Question Master'
+        WHEN cc.TotalPosts >= 200 AND cc.AnswerCount >= 100 THEN 'Answer Master'
+        WHEN cc.TotalPosts >= 100 THEN 'Activity Master'
+        ELSE 'Regular User'
+    END as MasteryLevel,
+    (cc.LastPostDate + INTERVAL '1 month') as NextMonthPostDate,
+    COALESCE(STRING_AGG(tp.Title, ', '), 'No Posts') as UserPostTitles,
+    STRING_AGG(CAST(tp.Score AS VARCHAR), ', ') as UserPostScores,
+    COUNT(DISTINCT tp.PostId) as DistinctPosts,
+    STRING_AGG(DISTINCT tp.PostType, ', ') as PostTypes,
+    STRING_AGG(CAST(cc.ActivityEfficiencyRatio AS VARCHAR), ', ') as EfficiencyRatios,
+    CASE 
+        WHEN EXISTS (SELECT 1 FROM TopPosts tp WHERE tp.OwnerUserId = cc.UserId AND tp.RankByScore <= 3) THEN 'Has Top Posts'
+        ELSE 'No Top Posts'
+    END as HasTopPosts,
+    CASE 
+        WHEN (SELECT COUNT(*) FROM Users u WHERE u.Reputation > cc.Reputation) > 0 THEN 
+            CAST((SELECT COUNT(*) FROM Users u WHERE u.Reputation > cc.Reputation) AS VARCHAR) || ' Users Above This User'
+        ELSE 'No Users Above This User'
+    END as ReputationComparison,
+    CASE 
+        WHEN LENGTH(cc.AllTitles) > 2000 THEN SUBSTRING(cc.AllTitles FROM 1 FOR 2000) || '...'
+        ELSE cc.AllTitles
+    END as TruncatedTitles,
+    CASE 
+        WHEN cc.AvgScore > 10 THEN 
+            (SELECT tp2.Title FROM TopPosts tp2 WHERE tp2.OwnerUserId = cc.UserId ORDER BY tp2.Score DESC LIMIT 1)
+        ELSE NULL
+    END as BestPostTitle,
+    COALESCE((SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = cc.UserId AND p.PostTypeId = 1), 0) as QuestionPosts,
+    COALESCE((SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = cc.UserId AND p.PostTypeId = 2), 0) as AnswerPosts,
+    COALESCE((SELECT COUNT(*) FROM Comments c WHERE c.UserId = cc.UserId), 0) as CommentCount,
+    COALESCE((SELECT COUNT(*) FROM Votes v WHERE v.UserId = cc.UserId), 0) as VoteCount,
+    CASE 
+        WHEN cc.Reputation > (SELECT AVG(Reputation) FROM Users) THEN 'Above Avg Rep'
+        WHEN cc.Reputation < (SELECT AVG(Reputation) FROM Users) THEN 'Below Avg Rep'
+        ELSE 'Avg Rep'
+    END as RepVsAvg
+FROM ComplexCalculation cc
+LEFT JOIN UserActivity ua ON cc.UserId = ua.UserId
+LEFT JOIN TagAnalysis ta ON ta.TagName IN (
+    SELECT TRIM(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2)) 
+    FROM Posts p 
+    WHERE p.OwnerUserId = cc.UserId 
+    AND p.Tags IS NOT NULL
+)
+LEFT JOIN TopPosts tp ON tp.OwnerUserId = cc.UserId
+WHERE cc.TotalPosts >= 1
+GROUP BY 
+    cc.UserId,
+    cc.DisplayName,
+    cc.Reputation,
+    cc.TotalPosts,
+    cc.QuestionCount,
+    cc.AnswerCount,
+    cc.TotalScore,
+    cc.AvgScore,
+    cc.LastPostDate,
+    cc.AllTitles,
+    cc.BadgeCount,
+    cc.EngagementLevel,
+    cc.ActivityStatus,
+    cc.ActivityEfficiencyRatio,
+    cc.BadgePerPostRatio,
+    cc.AllBadgesString,
+    cc.TotalUsers,
+    cc.ScoreRank,
+    cc.ScorePercentile,
+    cc.ScoreQuartile,
+    ua.CommentCount,
+    ua.VoteCount,
+    ua.HistoryCount,
+    ta.TagName,
+    ta.TagCount,
+    tp.Title,
+    tp.Score,
+    tp.PostId,
+    tp.PostType,
+    cc.Reputation,
+    cc.BadgeCount,
+    cc.AvgScore,
+    cc.QuestionCount,
+    cc.AnswerCount,
+    cc.AllTitles,
+    cc.LastPostDate
+ORDER BY cc.TotalScore DESC, cc.Reputation DESC
+LIMIT 1000;

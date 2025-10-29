@@ -1,0 +1,180 @@
+WITH RECURSIVE RecursiveTagCounts AS (
+    SELECT
+        t.Id AS TagId,
+        t.TagName,
+        p.Id AS PostId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate
+    FROM Tags t
+    JOIN Posts p ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    WHERE p.PostTypeId = 1
+    UNION ALL
+    SELECT
+        rtc.TagId,
+        rtc.TagName,
+        p.Id,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate
+    FROM RecursiveTagCounts rtc
+    JOIN Posts p ON p.ParentId = rtc.PostId AND p.PostTypeId = 2
+),
+TopUsersBadgeCounts AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COALESCE(SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END), 0) AS GoldBadges,
+        COALESCE(SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END), 0) AS SilverBadges,
+        COALESCE(SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END), 0) AS BronzeBadges,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.CreationDate ASC) AS UserRank
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+    HAVING COUNT(b.Id) > 0
+),
+PostScoreStats AS (
+    SELECT
+        Id AS PostId,
+        Score,
+        ViewCount,
+        OwnerUserId,
+        Title,
+        Tags,
+        CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY OwnerUserId ORDER BY Score DESC NULLS LAST, ViewCount DESC NULLS LAST) AS UserPostRank,
+        COUNT(*) OVER (PARTITION BY OwnerUserId) AS TotalPosts
+    FROM Posts
+    WHERE PostTypeId = 1
+),
+PostClosedCounts AS (
+    SELECT
+        ph.PostId,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE NULL END) AS ClosedTimes,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate ELSE NULL END) AS LastClosedDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.CreationDate ELSE NULL END) AS LastReopenDate
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+),
+UserPostSummary AS (
+    SELECT
+        ps.OwnerUserId,
+        COUNT(DISTINCT ps.PostId) AS QuestionCount,
+        SUM(COALESCE(ps.Score, 0)) AS TotalScore,
+        AVG(COALESCE(ps.Score, 0)) AS AvgScore,
+        SUM(COALESCE(ps.ViewCount, 0)) AS TotalViews,
+        SUM(CASE WHEN COALESCE(pcc.ClosedTimes, 0) > 0 THEN 1 ELSE 0 END) AS ClosedQuestionsCount
+    FROM PostScoreStats ps
+    LEFT JOIN PostClosedCounts pcc ON pcc.PostId = ps.PostId
+    GROUP BY ps.OwnerUserId
+),
+UsersWithBadgesAndPosts AS (
+    SELECT
+        t.UserId,
+        t.DisplayName,
+        t.GoldBadges,
+        t.SilverBadges,
+        t.BronzeBadges,
+        up.QuestionCount,
+        up.TotalScore,
+        up.AvgScore,
+        up.TotalViews,
+        up.ClosedQuestionsCount,
+        (t.GoldBadges * 3 + t.SilverBadges * 2 + t.BronzeBadges) AS BadgeScore,
+        (up.TotalScore * 0.5 + up.TotalViews * 0.02) AS PostImpactScore
+    FROM TopUsersBadgeCounts t
+    LEFT JOIN UserPostSummary up ON up.OwnerUserId = t.UserId
+    WHERE up.QuestionCount > 0
+),
+RecentCommentsWindowed AS (
+    SELECT
+        c.PostId,
+        c.UserId,
+        u.DisplayName,
+        c.CreationDate,
+        c.Text,
+        RANK() OVER (PARTITION BY c.PostId ORDER BY c.CreationDate DESC) AS CommentRank
+    FROM Comments c
+    LEFT JOIN Users u ON u.Id = c.UserId
+    WHERE c.CreationDate > (CAST('2024-10-01' AS DATE) - INTERVAL '30' DAY)
+),
+PostLinksSummary AS (
+    SELECT
+        pl.PostId,
+        SUM(CASE WHEN lt.Name = 'Duplicate' THEN 1 ELSE 0 END) AS DuplicateLinks,
+        SUM(CASE WHEN lt.Name = 'Linked' THEN 1 ELSE 0 END) AS LinkedPosts
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    GROUP BY pl.PostId
+)
+SELECT DISTINCT
+    u.DisplayName AS User,
+    u.GoldBadges,
+    u.SilverBadges,
+    u.BronzeBadges,
+    u.BadgeScore,
+    u.QuestionCount,
+    u.TotalScore,
+    u.AvgScore,
+    u.TotalViews,
+    u.ClosedQuestionsCount,
+    u.PostImpactScore,
+    p.Id AS PostId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.CreationDate AS PostCreationDate,
+    pcc.ClosedTimes,
+    pcc.LastClosedDate,
+    pcc.LastReopenDate,
+    pls.DuplicateLinks,
+    pls.LinkedPosts,
+    STRING_AGG(DISTINCT rtc.TagName, ', ') FILTER (WHERE rtc.TagName IS NOT NULL) AS RelatedTags,
+    rc.CommentCountLast30Days,
+    rc.LastCommentText
+FROM UsersWithBadgesAndPosts u
+JOIN Posts p ON p.OwnerUserId = u.UserId AND p.PostTypeId = 1
+LEFT JOIN PostClosedCounts pcc ON pcc.PostId = p.Id
+LEFT JOIN PostLinksSummary pls ON pls.PostId = p.Id
+LEFT JOIN RecursiveTagCounts rtc ON rtc.PostId = p.Id
+LEFT JOIN (
+    SELECT
+        rc.PostId,
+        COUNT(*) AS CommentCountLast30Days,
+        MAX(rc.CreationDate) AS LastCommentDate,
+        MAX(rc.Text) AS LastCommentText
+    FROM RecentCommentsWindowed rc
+    WHERE rc.CommentRank = 1
+    GROUP BY rc.PostId
+) rc ON rc.PostId = p.Id
+WHERE u.BadgeScore > 5
+  AND (p.Score > 5 OR p.ViewCount > 1000)
+  AND (pcc.ClosedTimes IS NULL OR pcc.ClosedTimes = 0)
+GROUP BY
+    u.DisplayName,
+    u.GoldBadges,
+    u.SilverBadges,
+    u.BronzeBadges,
+    u.BadgeScore,
+    u.QuestionCount,
+    u.TotalScore,
+    u.AvgScore,
+    u.TotalViews,
+    u.ClosedQuestionsCount,
+    u.PostImpactScore,
+    p.Id,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.CreationDate,
+    pcc.ClosedTimes,
+    pcc.LastClosedDate,
+    pcc.LastReopenDate,
+    pls.DuplicateLinks,
+    pls.LinkedPosts,
+    rc.CommentCountLast30Days,
+    rc.LastCommentText
+ORDER BY u.BadgeScore DESC, u.PostImpactScore DESC, p.Score DESC
+LIMIT 100;

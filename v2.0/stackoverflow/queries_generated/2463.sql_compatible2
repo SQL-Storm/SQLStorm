@@ -1,0 +1,244 @@
+with recursive RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        0 as Level,
+        t.Count,
+        u.DisplayName as ExcerptAuthor,
+        coalesce(p.Score, 0) as ExcerptScore
+    from Tags t
+    left join Posts p on p.Id = t.ExcerptPostId
+    left join Users u on u.Id = p.OwnerUserId
+    where coalesce(t.IsModeratorOnly, false) = false and coalesce(t.IsRequired, false) = false
+
+    union all
+
+    select
+        t.Id,
+        t.TagName,
+        r.Level + 1 as Level,
+        t.Count,
+        u.DisplayName,
+        coalesce(p.Score, 0) as ExcerptScore
+    from Tags t
+    join RecursiveTagHierarchy r on t.Count < r.Count
+    left join Posts p on p.Id = t.ExcerptPostId
+    left join Users u on u.Id = p.OwnerUserId
+    where r.Level < 1
+),
+TopUsersByBadge as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        b.Class,
+        count(*) as BadgeCount,
+        row_number() over (partition by b.Class order by count(*) desc) as rn
+    from Users u
+    join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, b.Class
+    having count(*) > 5
+),
+QuestionsWithMeta as (
+    select 
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.Tags,
+        u.DisplayName as OwnerName,
+        coalesce(a.AnswerCount, 0) as AnswerCount,
+        coalesce(a.MaxAnswerScore, -9999) as MaxAnswerScore,
+        coalesce(accu.DisplayName, 'N/A') as AcceptedAnswerUser,
+        q.FavoriteCount,
+        count(distinct ph.Id) filter (where ph.PostHistoryTypeId = 10) as CloseVotes,
+        max(ph.CreationDate) filter (where ph.PostHistoryTypeId = 10) as LastCloseVoteDate
+    from Posts q
+    left join Users u on u.Id = q.OwnerUserId
+    left join (
+        select 
+            p.ParentId,
+            count(*) as AnswerCount,
+            max(p.Score) as MaxAnswerScore
+        from Posts p
+        where p.PostTypeId = 2
+        group by p.ParentId
+    ) a on a.ParentId = q.Id
+    left join Posts acc on acc.Id = q.AcceptedAnswerId
+    left join Users accu on accu.Id = acc.OwnerUserId
+    left join PostHistory ph on ph.PostId = q.Id
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount, q.Tags, u.DisplayName, a.AnswerCount, a.MaxAnswerScore, accu.DisplayName, q.FavoriteCount
+),
+ComplexUserStats as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        count(distinct p.Id) as TotalPosts,
+        sum(case when p.PostTypeId = 1 then 1 else 0 end) as QuestionsCount,
+        sum(case when p.PostTypeId = 2 then 1 else 0 end) as AnswersCount,
+        coalesce(sum(vu.UpVotes), 0) as TotalUpVotes,
+        coalesce(sum(vd.DownVotes), 0) as TotalDownVotes,
+        coalesce(avg(coalesce(p.Score,0)),0) as AvgPostScore,
+        max(p.LastActivityDate) as LastActivity,
+        rank() over (order by u.Reputation desc) as ReputationRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join (
+        select PostId, count(*) as UpVotes
+        from Votes
+        where VoteTypeId = 2
+        group by PostId
+    ) vu on vu.PostId = p.Id
+    left join (
+        select PostId, count(*) as DownVotes
+        from Votes
+        where VoteTypeId = 3
+        group by PostId
+    ) vd on vd.PostId = p.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+FilteredComments as (
+    select 
+        c.Id,
+        c.PostId,
+        c.CreationDate,
+        c.UserId,
+        u.DisplayName,
+        c.Score,
+        length(c.Text) as CommentLength,
+        case when c.Text like '%urgent%' then 1 else 0 end as IsUrgent,
+        c.ContentLicense
+    from Comments c
+    left join Users u on u.Id = c.UserId
+    where c.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '1 year'
+),
+QuestionAnswerComparison as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.Score as QuestionScore,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        coalesce(a.OwnerUserId, -1) as AnswerOwnerId,
+        coalesce(u.DisplayName, 'Anonymous') as AnswerOwner
+    from Posts q
+    join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Users u on u.Id = a.OwnerUserId
+    where q.PostTypeId = 1 and q.Score > 5 and a.Score > 10
+),
+Set1 as (
+    select Id, DisplayName from Users where Reputation > 10000
+),
+Set2 as (
+    select UserId as Id, Name as DisplayName from Badges where Class = 1
+)
+select
+    qwm.QuestionId,
+    qwm.Title,
+    qwm.CreationDate,
+    qwm.Score,
+    qwm.ViewCount,
+    qwm.Tags,
+    qwm.OwnerName,
+    qwm.AnswerCount,
+    qwm.MaxAnswerScore,
+    qwm.AcceptedAnswerUser,
+    qwm.FavoriteCount,
+    qwm.CloseVotes,
+    to_char(qwm.LastCloseVoteDate, 'YYYY-MM-DD') as LastCloseVoteDate,
+    cus.ReputationRank,
+    cus.TotalPosts,
+    cus.QuestionsCount,
+    cus.AnswersCount,
+    cus.TotalUpVotes,
+    cus.TotalDownVotes,
+    cus.AvgPostScore,
+    cus.LastActivity,
+    ft.CommentLength,
+    ft.IsUrgent,
+    rth.Level as TagLevel,
+    rth.TagName as RelatedTag,
+    rth.Count as TagUsageCount,
+    rth.ExcerptAuthor,
+    rth.ExcerptScore,
+    tu.DisplayName as BadgeGoldUser
+from QuestionsWithMeta qwm
+left join ComplexUserStats cus on cus.Id = (
+    select p.OwnerUserId from Posts p where p.Id = qwm.QuestionId limit 1
+)
+left join FilteredComments ft on ft.PostId = qwm.QuestionId
+left join RecursiveTagHierarchy rth on position(concat('<', rth.TagName, '>') in qwm.Tags) > 0
+left join TopUsersByBadge tu on tu.Class = 1 and tu.rn = 1
+where qwm.Score > 10 and qwm.AnswerCount > 0
+
+union
+
+select
+    qac.QuestionId,
+    qac.Title,
+    null as CreationDate,
+    qac.QuestionScore,
+    null as ViewCount,
+    null as Tags,
+    null as OwnerName,
+    null as AnswerCount,
+    null as MaxAnswerScore,
+    null as AcceptedAnswerUser,
+    null as FavoriteCount,
+    null as CloseVotes,
+    null as LastCloseVoteDate,
+    null as ReputationRank,
+    null as TotalPosts,
+    null as QuestionsCount,
+    null as AnswersCount,
+    null as TotalUpVotes,
+    null as TotalDownVotes,
+    null as AvgPostScore,
+    null as LastActivity,
+    null as CommentLength,
+    null as IsUrgent,
+    null as TagLevel,
+    null as RelatedTag,
+    null as TagUsageCount,
+    null as ExcerptAuthor,
+    null as ExcerptScore,
+    null as BadgeGoldUser
+from QuestionAnswerComparison qac
+
+except
+
+select
+    qwm.QuestionId,
+    qwm.Title,
+    null as CreationDate,
+    qwm.Score,
+    null as ViewCount,
+    null as Tags,
+    null as OwnerName,
+    null as AnswerCount,
+    null as MaxAnswerScore,
+    null as AcceptedAnswerUser,
+    null as FavoriteCount,
+    null as CloseVotes,
+    null as LastCloseVoteDate,
+    null as ReputationRank,
+    null as TotalPosts,
+    null as QuestionsCount,
+    null as AnswersCount,
+    null as TotalUpVotes,
+    null as TotalDownVotes,
+    null as AvgPostScore,
+    null as LastActivity,
+    null as CommentLength,
+    null as IsUrgent,
+    null as TagLevel,
+    null as RelatedTag,
+    null as TagUsageCount,
+    null as ExcerptAuthor,
+    null as ExcerptScore,
+    null as BadgeGoldUser
+from QuestionsWithMeta qwm
+order by Score desc nulls last, ReputationRank, TagLevel;

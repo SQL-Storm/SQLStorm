@@ -1,0 +1,226 @@
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.WikiPostId,
+        1 as Level,
+        array[t.Id] as Path
+    from Tags t
+    where t.IsModeratorOnly = false
+
+    union all
+
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.WikiPostId,
+        r.Level + 1,
+        r.Path || t.Id
+    from Tags t
+    join RecursiveTagHierarchy r on t.WikiPostId = r.WikiPostId and not t.Id = any(r.Path)
+    where r.Level < 3
+),
+UserActivityStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        count(distinct c.Id) as CommentCount,
+        coalesce(sum(vup.Votes),0) as UpVotesCount,
+        coalesce(sum(vdown.Votes),0) as DownVotesCount,
+        avg(coalesce(p.Score,0)) as AvgPostScore,
+        max(p.CreationDate) as LastPostAt,
+        avg(u.Reputation) over () as AvgUserReputation
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join (
+        select PostId, count(*) as Votes
+        from Votes v
+        where v.VoteTypeId = 2
+        group by PostId
+    ) vup on vup.PostId = ANY(array(
+        select Id from Posts where OwnerUserId = u.Id
+    ))
+    left join (
+        select PostId, count(*) as Votes
+        from Votes v
+        where v.VoteTypeId = 3
+        group by PostId
+    ) vdown on vdown.PostId = ANY(array(
+        select Id from Posts where OwnerUserId = u.Id
+    ))
+    group by u.Id, u.DisplayName
+),
+LatestHotQuestions as (
+    select 
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        dense_rank() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc nulls last) as PopularRank
+    from Posts p
+    where p.PostTypeId = 1 and p.ClosedDate is null
+),
+FilteredPostsWithBadges as (
+    select 
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        u.DisplayName as OwnerName,
+        ba.BadgeCount,
+        ba.GoldBadges,
+        ba.SilverBadges,
+        ba.BronzeBadges,
+        p.FavoriteCount,
+        p.AnswerCount
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    left join (
+        select 
+            b.UserId,
+            count(*) as BadgeCount,
+            count(*) filter (where b.Class = 1) as GoldBadges,
+            count(*) filter (where b.Class = 2) as SilverBadges,
+            count(*) filter (where b.Class = 3) as BronzeBadges
+        from Badges b
+        group by b.UserId
+    ) ba on ba.UserId = p.OwnerUserId
+    where p.PostTypeId = 1 and p.Score > (
+        select avg(p2.Score) from Posts p2 where p2.PostTypeId = 1 and p2.CreationDate >= cast('2024-10-01' as date) - interval '180 days'
+    )
+),
+ComplexPostScoring as (
+    select 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        count(distinct pl.RelatedPostId) filter (where lt.Name = 'Duplicate') as DuplicateLinks,
+        count(distinct pl.RelatedPostId) filter (where lt.Name = 'Linked') as LinkedPosts,
+        coalesce(sum(vb.BountyAmount),0) as BountyTotal,
+        count(distinct c.Id) as CommentsCount,
+        row_number() over (order by p.Score desc nulls last, p.ViewCount desc nulls last) as RowNum
+    from Posts p
+    left join PostLinks pl on pl.PostId = p.Id
+    left join LinkTypes lt on lt.Id = pl.LinkTypeId
+    left join Votes vb on vb.PostId = p.Id and vb.VoteTypeId in (8,9)
+    left join Comments c on c.PostId = p.Id
+    where p.PostTypeId in (1, 2)
+    group by p.Id, p.Title, p.Score, p.ViewCount
+),
+CorrelatedCloseReasonCounts as (
+    select
+        p.Id as PostId,
+        p.Title,
+        coalesce((
+            select count(*) from PostHistory ph
+            where ph.PostId = p.Id and ph.PostHistoryTypeId = 10 and ph.Comment is not null
+        ), 0) as CloseVotesCount,
+        coalesce((
+            select string_agg(distinct crt.Name, ', ') 
+            from PostHistory ph
+            join CloseReasonTypes crt on cast(crt.Id as varchar) = ph.Comment
+            where ph.PostId = p.Id and ph.PostHistoryTypeId = 10 and ph.Comment is not null
+        ), 'None') as CloseReasons
+    from Posts p
+    where p.PostTypeId = 1
+),
+FinalUserRankings as (
+    select
+        uas.UserId,
+        uas.DisplayName,
+        uas.QuestionCount,
+        uas.AnswerCount,
+        uas.CommentCount,
+        uas.UpVotesCount,
+        uas.DownVotesCount,
+        uas.AvgPostScore,
+        uas.LastPostAt,
+        dense_rank() over (order by uas.UpVotesCount desc nulls last, uas.QuestionCount desc nulls last) as UserRank,
+        case 
+            when uas.Reputation > uas.AvgUserReputation then 'Above Avg Reputation'
+            when uas.Reputation = uas.AvgUserReputation then 'Avg Reputation'
+            else 'Below Avg Reputation'
+        end as ReputationComparison
+    from 
+        (select 
+            u.Id as UserId,
+            u.DisplayName,
+            count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+            count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+            count(distinct c.Id) as CommentCount,
+            coalesce(sum(vup.Votes),0) as UpVotesCount,
+            coalesce(sum(vdown.Votes),0) as DownVotesCount,
+            avg(coalesce(p.Score,0)) as AvgPostScore,
+            max(p.CreationDate) as LastPostAt,
+            u.Reputation,
+            avg(u.Reputation) over () as AvgUserReputation
+         from Users u
+         left join Posts p on p.OwnerUserId = u.Id
+         left join Comments c on c.UserId = u.Id
+         left join (
+             select PostId, count(*) as Votes
+             from Votes v
+             where v.VoteTypeId = 2
+             group by PostId
+         ) vup on vup.PostId = ANY(array(
+             select Id from Posts where OwnerUserId = u.Id
+         ))
+         left join (
+             select PostId, count(*) as Votes
+             from Votes v
+             where v.VoteTypeId = 3
+             group by PostId
+         ) vdown on vdown.PostId = ANY(array(
+             select Id from Posts where OwnerUserId = u.Id
+         ))
+         group by u.Id, u.DisplayName, u.Reputation
+        ) uas
+),
+DistinctTagCounts as (
+    select
+        unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><')) as TagName,
+        count(*) as PostsWithTag
+    from Posts p
+    where p.PostTypeId = 1
+    group by 1
+)
+select
+    p.Id as PostId,
+    p.Title as PostTitle,
+    p.Score,
+    p.ViewCount,
+    p.OwnerName,
+    fpb.GoldBadges,
+    fpb.SilverBadges,
+    fpb.BronzeBadges,
+    cps.DuplicateLinks,
+    cps.LinkedPosts,
+    cps.BountyTotal,
+    cps.CommentsCount,
+    crc.CloseVotesCount,
+    crc.CloseReasons,
+    dtag.PostsWithTag,
+    fu.UserRank as RankRank,
+    fu.ReputationComparison,
+    fu.AvgPostScore as UserAvgPostScore,
+    fu.QuestionCount as UserQuestionCount,
+    fu.AnswerCount as UserAnswerCount,
+    fu.CommentCount as UserCommentCount
+from FilteredPostsWithBadges p
+join ComplexPostScoring cps on cps.Id = p.Id
+left join CorrelatedCloseReasonCounts crc on crc.PostId = p.Id
+left join DistinctTagCounts dtag on dtag.TagName = any(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><'))
+left join FinalUserRankings fu on fu.UserId = (
+    select OwnerUserId from Posts where Id = p.Id
+)
+left join FilteredPostsWithBadges fpb on fpb.Id = p.Id
+where p.ViewCount is not null and p.Score > 0 and (p.FavoriteCount > 0 or p.AnswerCount > 1)
+order by cps.BountyTotal desc nulls last, p.Score desc nulls last, cps.DuplicateLinks asc
+limit 50;

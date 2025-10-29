@@ -1,0 +1,169 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT 
+        T1.Id,
+        T1.TagName,
+        T1.Count,
+        COALESCE(T2.TagName, '') AS ParentTagName,
+        1 AS Level
+    FROM Tags T1
+    LEFT JOIN PostLinks PL ON PL.PostId = T1.ExcerptPostId AND PL.LinkTypeId = 1
+    LEFT JOIN Posts P2 ON PL.RelatedPostId = P2.Id AND P2.PostTypeId = 1
+    LEFT JOIN Tags T2 ON T2.ExcerptPostId = P2.Id
+    WHERE T1.IsModeratorOnly = FALSE AND T1.IsRequired = FALSE
+
+    UNION ALL
+
+    SELECT 
+        T.Id,
+        T.TagName,
+        T.Count,
+        R.TagName AS ParentTagName,
+        R.Level + 1
+    FROM Tags T
+    INNER JOIN RecursiveTagHierarchy R ON T.ExcerptPostId = (
+        SELECT PL2.RelatedPostId
+        FROM PostLinks PL2 
+        WHERE PL2.PostId = (SELECT ExcerptPostId FROM Tags WHERE Id = R.Id) AND PL2.LinkTypeId = 1
+        LIMIT 1
+    )
+    WHERE R.Level < 3
+),
+UserBadgeStats AS (
+    SELECT 
+        U.Id AS UserId,
+        U.DisplayName,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        AVG((EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - B.Date)))/86400) AS AvgDaysSinceBadge,
+        MAX(B.Date) AS LastBadgeDate
+    FROM Users U
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName
+),
+PostActivityWindow AS (
+    SELECT
+        P.Id,
+        P.PostTypeId,
+        P.CreationDate,
+        P.Score,
+        P.ViewCount,
+        P.Tags,
+        P.OwnerUserId,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate DESC) AS RecentPostRank,
+        COUNT(*) OVER (PARTITION BY P.OwnerUserId) AS TotalPosts,
+        AVG(P.Score) OVER (PARTITION BY P.OwnerUserId) AS AvgScore,
+        MAX(P.ViewCount) OVER (PARTITION BY P.OwnerUserId) AS MaxViewCount,
+        (
+            SELECT STRING_AGG(DISTINCT COALESCE(NULLIF(TRIM(tag), ''), 'unknown'), ',')
+            FROM (
+                SELECT regexp_split_to_table(TRIM(BOTH '<>' FROM COALESCE(P2.Tags, '')), '[><]') AS tag
+            ) t
+        ) OVER () AS UserTagsAggregated
+    FROM Posts P
+    LEFT JOIN Posts P2 ON P2.Id = P.Id  -- used for lateral-like split above; kept to reference P2.Tags
+    WHERE P.PostTypeId IN (1,2)
+),
+TopPosts AS (
+    SELECT DISTINCT 
+        P.Id,
+        P.Title,
+        P.OwnerUserId,
+        U.DisplayName,
+        P.Score,
+        P.ViewCount,
+        P.Tags,
+        Ph.PostHistoryTypeId,
+        Ph.CreationDate AS HistoryDate,
+        Ph.Comment AS HistoryComment,
+        CRT.Name AS CloseReasonName,
+        VT.Name AS VoteTypeName,
+        EXISTS (
+            SELECT 1 
+            FROM Votes V 
+            WHERE V.PostId = P.Id AND V.VoteTypeId = 2 AND V.UserId = P.OwnerUserId
+        ) AS OwnerUpvoted
+    FROM Posts P
+    LEFT JOIN PostHistory Ph ON P.Id = Ph.PostId AND Ph.PostHistoryTypeId IN (10,11)
+    LEFT JOIN CloseReasonTypes CRT ON CAST(Ph.Comment AS integer) = CRT.Id
+    LEFT JOIN Votes Vt ON Vt.PostId = P.Id
+    LEFT JOIN VoteTypes VT ON Vt.VoteTypeId = VT.Id
+    LEFT JOIN Users U ON P.OwnerUserId = U.Id
+    WHERE P.Score > (
+        SELECT AVG(Score) FROM Posts WHERE OwnerUserId = P.OwnerUserId
+    )
+),
+AnswerCountPerQuestion AS (
+    SELECT 
+        P1.Id AS QuestionId,
+        P1.Title,
+        COUNT(P2.Id) AS AnswerCount,
+        SUM(COALESCE(P2.Score, 0)) AS TotalAnswerScore,
+        MAX(COALESCE(P2.Score, 0)) AS MaxAnswerScore,
+        AVG(COALESCE(P2.Score, 0)) AS AvgAnswerScore
+    FROM Posts P1
+    LEFT JOIN Posts P2 ON P2.ParentId = P1.Id AND P2.PostTypeId = 2
+    WHERE P1.PostTypeId = 1
+    GROUP BY P1.Id, P1.Title
+),
+UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        COUNT(DISTINCT P.Id) AS PostsCount,
+        COUNT(DISTINCT C.Id) AS CommentsCount,
+        COUNT(DISTINCT BH.Id) FILTER (WHERE BH.PostHistoryTypeId = 10) AS CloseVotesCast,
+        COUNT(DISTINCT V.Id) FILTER (WHERE V.VoteTypeId = 2) AS UpVotesCast,
+        COUNT(DISTINCT V.Id) FILTER (WHERE V.VoteTypeId = 3) AS DownVotesCast,
+        MAX(P.CreationDate) AS LastPostDate,
+        MIN(P.CreationDate) AS FirstPostDate,
+        (EXTRACT(EPOCH FROM (MAX(P.CreationDate) - MIN(P.CreationDate))) / 86400) AS ActiveDaysSpan
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON C.UserId = U.Id
+    LEFT JOIN PostHistory BH ON BH.UserId = U.Id
+    LEFT JOIN Votes V ON V.UserId = U.Id
+    GROUP BY U.Id
+)
+SELECT
+    U.DisplayName,
+    UA.PostsCount,
+    UA.CommentsCount,
+    UA.CloseVotesCast,
+    UA.UpVotesCast,
+    UA.DownVotesCast,
+    UA.ActiveDaysSpan,
+    PostStats.AnswerCount,
+    PostStats.TotalAnswerScore,
+    PostStats.MaxAnswerScore,
+    PostStats.AvgAnswerScore,
+    COALESCE(UBS.TotalBadges,0) AS TotalBadges,
+    UBS.GoldBadges,
+    UBS.SilverBadges,
+    UBS.BronzeBadges,
+    TRH.Level AS TagHierarchyLevel,
+    TRH.TagName,
+    TRH.ParentTagName,
+    PAW.UserTagsAggregated,
+    CASE
+        WHEN UA.PostsCount = 0 THEN 'No Posts'
+        WHEN (CAST(UA.UpVotesCast AS numeric)) / NULLIF(UA.DownVotesCast,0) > 2 THEN 'Highly Positive'
+        WHEN (CAST(UA.DownVotesCast AS numeric)) / NULLIF(UA.UpVotesCast,0) > 1.5 THEN 'Negative Contributor'
+        ELSE 'Neutral'
+    END AS ContributorSentiment,
+    CONCAT(LEFT(COALESCE(U.WebsiteUrl, ''), 20), '...', RIGHT(COALESCE(U.WebsiteUrl, ''), 20)) AS UrlSnippet,
+    COALESCE(U.Location, 'Unknown') AS Location,
+    LEFT(COALESCE(U.AboutMe, ''), 100) AS AboutSnippet
+FROM Users U
+LEFT JOIN UserActivitySummary UA ON UA.UserId = U.Id
+LEFT JOIN AnswerCountPerQuestion PostStats ON PostStats.QuestionId = (
+    SELECT P.Id FROM Posts P WHERE P.OwnerUserId = U.Id AND P.PostTypeId = 1 LIMIT 1
+)
+LEFT JOIN UserBadgeStats UBS ON UBS.UserId = U.Id
+LEFT JOIN RecursiveTagHierarchy TRH ON TRH.TagName = ANY (
+    SELECT unnest(string_to_array(COALESCE(PAW.UserTagsAggregated, ''), ','))
+)
+LEFT JOIN PostActivityWindow PAW ON PAW.OwnerUserId = U.Id AND PAW.RecentPostRank = 1
+WHERE COALESCE(UA.PostsCount, 0) > 0
+ORDER BY UBS.GoldBadges DESC, UBS.SilverBadges DESC, UA.PostsCount DESC
+LIMIT 100;

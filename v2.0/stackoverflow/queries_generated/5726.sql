@@ -1,0 +1,114 @@
+-- {"query": "5726.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 911} 
+WITH recent_high_activity AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        STRING_AGG(t.Name, ',') AS TagsList
+    FROM Posts p
+    LEFT JOIN LATERAL (
+        SELECT unnest(string_to_array(substr(p.Tags, 2, length(p.Tags)-2), '><')) AS Name
+    ) t ON true
+    LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate > now() - interval '180 days'
+    GROUP BY p.Id, p.Title, p.CreationDate, p.LastActivityDate, p.Score, p.ViewCount, p.OwnerUserId
+),
+enhanced AS (
+    SELECT
+        r.PostId,
+        r.Title,
+        r.CreationDate,
+        r.LastActivityDate,
+        r.Score,
+        r.ViewCount,
+        r.OwnerUserId,
+        r.TagsList,
+        COALESCE(v1.UpCount, 0) AS UpVotes,
+        COALESCE(v2.DownCount, 0) AS DownVotes,
+        COALESCE(bd.CountBadges, 0) AS BadgeCount,
+        u.DisplayName AS OwnerDisplayName,
+        u.Reputation
+    FROM recent_high_activity r
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS UpCount
+        FROM Votes
+        WHERE VoteTypeId = 2
+        GROUP BY PostId
+    ) v1 ON v1.PostId = r.PostId
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS DownCount
+        FROM Votes
+        WHERE VoteTypeId = 3
+        GROUP BY PostId
+    ) v2 ON v2.PostId = r.PostId
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS CountBadges
+        FROM Posts p
+        JOIN Badges b ON b.UserId = p.OwnerUserId
+        WHERE b.Id IS NOT NULL
+        GROUP BY PostId
+    ) bd ON bd.PostId = r.PostId
+    LEFT JOIN Users u ON r.OwnerUserId = u.Id
+),
+final AS (
+    SELECT
+        e.PostId,
+        e.Title,
+        e.CreationDate,
+        e.LastActivityDate,
+        e.Score,
+        e.ViewCount,
+        e.OwnerUserId,
+        e.OwnerDisplayName,
+        e.Reputation,
+        e.TagsList,
+        e.UpVotes,
+        e.DownVotes,
+        e.BadgeCount,
+        CASE
+            WHEN e.Reputation > 10000 THEN 'vip'
+            WHEN e.Reputation BETWEEN 1000 AND 10000 THEN 'trusted'
+            ELSE 'newbie'
+        END AS OwnerTier,
+        -- window function: running total of UpVotes over time per owner
+        SUM(e.UpVotes) OVER (PARTITION BY e.OwnerUserId ORDER BY e.CreationDate
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS RunningUpVotes
+    FROM enhanced e
+)
+SELECT
+    f.PostId,
+    f.Title,
+    f.CreationDate,
+    f.LastActivityDate,
+    f.Score,
+    f.ViewCount,
+    f.OwnerUserId,
+    f.OwnerDisplayName,
+    f.Reputation,
+    f.TagsList,
+    f.UpVotes,
+    f.DownVotes,
+    f.BadgeCount,
+    f.OwnerTier,
+    f.RunningUpVotes,
+    -- embedded correlated subquery: top 3 related posts by same tag(s)
+    (SELECT STRING_AGG(pp.Title, '|')
+     FROM Posts pp
+     WHERE pp.Id <> f.PostId
+       AND pp.PostTypeId = 1
+       AND pp.OwnerUserId = f.OwnerUserId
+       AND pp.LastActivityDate > now() - interval '90 days'
+     ORDER BY pp.LastActivityDate DESC
+     LIMIT 3) AS RecentOwnerPosts
+FROM final f
+WHERE f.RunningUpVotes > 0
+  AND f.ViewCount > 0
+  AND (f.TagsList IS NULL OR f.TagsList <> '')
+ORDER BY f.RunningUpVotes DESC, f.ViewCount DESC
+LIMIT 100;

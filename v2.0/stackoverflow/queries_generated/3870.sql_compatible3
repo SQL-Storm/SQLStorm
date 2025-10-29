@@ -1,0 +1,188 @@
+WITH 
+    user_post_stats AS (
+        SELECT 
+            p.OwnerUserId AS UserId,
+            COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+            COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswerCount,
+            SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS QuestionScoreSum,
+            SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS AnswerScoreSum,
+            SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END) AS QuestionViewSum,
+            COUNT(CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 1 END) AS AcceptedAnswers,
+            COALESCE(SUM(p.FavoriteCount),0) AS FavoriteSum
+        FROM Posts p
+        WHERE p.OwnerUserId IS NOT NULL
+        GROUP BY p.OwnerUserId
+    ),
+    
+    user_badge_stats AS (
+        SELECT 
+            b.UserId,
+            COUNT(*) AS TotalBadges,
+            COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+            COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+            COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+            COUNT(CASE WHEN b.TagBased = 1 THEN 1 END) AS TagBasedBadges
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+    
+    user_vote_points AS (
+        SELECT 
+            v.UserId,
+            SUM(CASE WHEN vt.Id = 2 THEN 10
+                     WHEN vt.Id = 3 THEN -2
+                     ELSE 0 END) AS VotePoints
+        FROM Votes v
+        JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+        WHERE v.UserId IS NOT NULL
+        GROUP BY v.UserId
+    ),
+    
+    user_top_tags AS (
+        -- produce a comma-ordered list of tags per user (portable)
+        SELECT 
+            u.Id AS UserId,
+            COALESCE(
+              STRING_AGG(t.TagName, ',' ORDER BY tag_count DESC, t.TagName),
+              ''
+            ) AS TopTagsAll
+        FROM Users u
+        JOIN Posts p ON p.OwnerUserId = u.Id
+        LEFT JOIN (
+            SELECT p2.Id AS PostId,
+                   TRIM(BOTH '<>' FROM p2.Tags) AS rawtags
+            FROM Posts p2
+            WHERE p2.Tags IS NOT NULL
+        ) pt ON pt.PostId = p.Id
+        LEFT JOIN (
+            -- explode tags per post in a portable way: split on '><' then later split by comma in outer processing
+            SELECT PostId, Tag
+            FROM (
+                SELECT PostId,
+                       REGEXP_SPLIT_TO_TABLE(rawtags, '\>\s*\<') AS Tag
+                FROM (
+                    SELECT PostId, rawtags
+                    FROM (
+                        SELECT p2.Id AS PostId,
+                               TRIM(BOTH '<>' FROM p2.Tags) AS rawtags
+                        FROM Posts p2
+                        WHERE p2.Tags IS NOT NULL
+                    ) x
+                ) y
+            ) z
+        ) taglist ON taglist.PostId = p.Id
+        LEFT JOIN Tags t ON t.TagName = taglist.Tag
+        GROUP BY u.Id
+    ),
+    
+    -- derive per-user tag counts then pick top tags (portable approach)
+    user_top_tags_expanded AS (
+        SELECT ut.UserId, tt.Tag AS TagName, tt.tag_usage
+        FROM (
+            SELECT u.Id AS UserId, tag.Tag AS Tag
+            FROM Users u
+            JOIN Posts p ON p.OwnerUserId = u.Id
+            CROSS JOIN LATERAL (
+                SELECT REGEXP_SPLIT_TO_TABLE(TRIM(BOTH '<>' FROM p.Tags), '\>\s*\<') AS Tag
+            ) tag
+            WHERE p.Tags IS NOT NULL
+        ) ut
+        JOIN (
+            SELECT Tag, COUNT(*) AS tag_usage
+            FROM (
+                SELECT REGEXP_SPLIT_TO_TABLE(TRIM(BOTH '<>' FROM p.Tags), '\>\s*\<') AS Tag
+                FROM Posts p
+                WHERE p.OwnerUserId IS NOT NULL AND p.Tags IS NOT NULL
+            ) sub
+            GROUP BY Tag
+        ) tt ON tt.Tag = ut.Tag
+    ),
+    
+    user_composite AS (
+        SELECT 
+            u.Id,
+            u.DisplayName,
+            COALESCE(ups.QuestionScoreSum,0) * 0.3
+          + COALESCE(ups.AnswerScoreSum,0) * 0.4
+          + COALESCE(ups.FavoriteSum,0) * 0.1
+          + COALESCE(ubs.GoldBadges,0) * 20
+          + COALESCE(ubs.SilverBadges,0) * 10
+          + COALESCE(ubs.BronzeBadges,0) * 5
+          + COALESCE(uvp.VotePoints,0) * 0.05
+          AS CompositeScore,
+            COALESCE(ups.QuestionCount,0) AS QuestionCount,
+            COALESCE(ups.AnswerCount,0) AS AnswerCount,
+            COALESCE(ups.AcceptedAnswers,0) AS AcceptedAnswers,
+            COALESCE(ubs.TotalBadges,0) AS TotalBadges,
+            CASE WHEN ut.TopTagsAll = '' THEN NULL ELSE ut.TopTagsAll END AS TopTags
+        FROM Users u
+        LEFT JOIN user_post_stats ups ON ups.UserId = u.Id
+        LEFT JOIN user_badge_stats ubs ON ubs.UserId = u.Id
+        LEFT JOIN user_vote_points uvp ON uvp.UserId = u.Id
+        LEFT JOIN user_top_tags ut ON ut.UserId = u.Id
+    )
+
+SELECT 
+    uc.Id,
+    uc.DisplayName,
+    ROUND(uc.CompositeScore::numeric,2) AS CompositeScore,
+    RANK() OVER (ORDER BY uc.CompositeScore DESC) AS RankByScore,
+    uc.QuestionCount,
+    uc.AnswerCount,
+    uc.AcceptedAnswers,
+    uc.TotalBadges,
+    -- return TopTags as array by splitting comma list; if null keep null
+    CASE WHEN uc.TopTags IS NULL THEN NULL
+         WHEN uc.TopTags = '' THEN ARRAY[]::varchar[]
+         ELSE STRING_TO_ARRAY(uc.TopTags, ',')
+    END AS TopTags,
+    CASE 
+        WHEN uc.CompositeScore >= 1000 THEN 'Elite'
+        WHEN uc.CompositeScore >= 500  THEN 'Pro'
+        WHEN uc.CompositeScore >= 200  THEN 'Rising'
+        ELSE 'Novice'
+    END AS Tier,
+    (u.Reputation - uc.CompositeScore) AS ReputationDrift
+FROM user_composite uc
+JOIN Users u ON u.Id = uc.Id
+WHERE uc.CompositeScore IS NOT NULL
+  AND (u.CreationDate < (CAST('2024-10-01' AS date) - INTERVAL '1' YEAR))
+GROUP BY
+    uc.Id,
+    uc.DisplayName,
+    uc.CompositeScore,
+    uc.QuestionCount,
+    uc.AnswerCount,
+    uc.AcceptedAnswers,
+    uc.TotalBadges,
+    uc.TopTags,
+    u.Reputation,
+    u.CreationDate
+
+UNION ALL
+
+SELECT 
+    NULL AS Id,
+    '--- Summary Row ---' AS DisplayName,
+    NULL AS CompositeScore,
+    NULL AS RankByScore,
+    SUM(uc.QuestionCount) AS QuestionCount,
+    SUM(uc.AnswerCount)   AS AnswerCount,
+    SUM(uc.AcceptedAnswers) AS AcceptedAnswers,
+    SUM(uc.TotalBadges)   AS TotalBadges,
+    -- aggregate distinct tags from the TopTags string arrays
+    CASE 
+      WHEN COUNT(uc.TopTags) = 0 THEN ARRAY[]::varchar[]
+      ELSE (
+        SELECT ARRAY_AGG(DISTINCT t) FROM (
+          SELECT UNNEST(STRING_TO_ARRAY(uc2.TopTags, ',')) AS t
+          FROM user_composite uc2
+          WHERE uc2.TopTags IS NOT NULL AND uc2.TopTags <> ''
+        ) sub
+      )
+    END AS TopTags,
+    NULL AS Tier,
+    NULL AS ReputationDrift
+FROM user_composite uc
+GROUP BY 1
+;

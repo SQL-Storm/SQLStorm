@@ -1,0 +1,127 @@
+with recursive RecursiveTagCounts as (
+  select
+    t.Id as TagId,
+    t.TagName,
+    t.Count as InitialCount,
+    coalesce(p.AnswerCount, 0) as AnswersForTag,
+    1 as depth
+  from Tags t
+  left join Posts p on p.Tags like concat('%<', t.TagName, '>%') and p.PostTypeId = 1
+  where t.Count > 1000
+
+  union all
+
+  select
+    rt.TagId,
+    rt.TagName,
+    rt.InitialCount,
+    rt.AnswersForTag + coalesce(p.AnswerCount, 0),
+    rt.depth + 1
+  from RecursiveTagCounts rt
+  join Tags t2 on t2.Id <> rt.TagId and t2.Count > 500
+  join Posts p on p.Tags like concat('%<', t2.TagName, '>%') and p.PostTypeId = 1
+  where rt.depth < 2
+),
+UserBadgeSummary as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    count(distinct case when b.Class = 1 then b.Id end) as GoldBadges,
+    count(distinct case when b.Class = 2 then b.Id end) as SilverBadges,
+    count(distinct case when b.Class = 3 then b.Id end) as BronzeBadges,
+    coalesce(sum(p.Score), 0) as TotalPostScore,
+    rank() over (order by sum(p.Score) desc nulls last) as ScoreRank
+  from Users u
+  left join Badges b on b.UserId = u.Id
+  left join Posts p on p.OwnerUserId = u.Id
+  group by u.Id, u.DisplayName
+),
+RecentClosedQuestions as (
+  select
+    ph.PostId,
+    ph.CreationDate as ClosedDate,
+    crt.Name as CloseReason,
+    p.Title,
+    p.OwnerUserId,
+    u.DisplayName as OwnerName
+  from PostHistory ph
+  join PostHistoryTypes pht on pht.Id = ph.PostHistoryTypeId and pht.Name = 'Post Closed'
+  join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+  join Posts p on p.Id = ph.PostId and p.PostTypeId = 1
+  left join Users u on u.Id = p.OwnerUserId
+  where ph.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '90 days'
+),
+TopUserAnswers as (
+  select
+    a.OwnerUserId,
+    u.DisplayName,
+    count(a.Id) as AnswerCount,
+    avg(a.Score) as AvgAnswerScore,
+    max(a.Score) as MaxAnswerScore,
+    percentile_cont(0.5) within group (order by a.Score) as MedianAnswerScore
+  from Posts a
+  join PostTypes pt on pt.Id = a.PostTypeId and pt.Name = 'Answer'
+  join Users u on u.Id = a.OwnerUserId
+  where a.OwnerUserId is not null
+  group by a.OwnerUserId, u.DisplayName
+  having count(a.Id) > 50
+),
+UserActivityWindow as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    ph.CreationDate,
+    ph.PostId,
+    ph.PostHistoryTypeId,
+    p.Title,
+    row_number() over (partition by u.Id order by ph.CreationDate) as ActivitySeq,
+    lag(ph.CreationDate) over (partition by u.Id order by ph.CreationDate) as PrevActivityDate,
+    extract(epoch from (ph.CreationDate - lag(ph.CreationDate) over (partition by u.Id order by ph.CreationDate))) as SecondsBetweenActivities
+  from PostHistory ph
+  join Users u on u.Id = ph.UserId
+  left join Posts p on p.Id = ph.PostId
+  where ph.UserId is not null
+    and ph.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '1 year'
+),
+ActivityGaps as (
+  select
+    UserId,
+    DisplayName,
+    count(*) filter (where SecondsBetweenActivities > 86400) as LongInactivityPeriods,
+    avg(SecondsBetweenActivities) filter (where SecondsBetweenActivities is not null) as AvgTimeBetweenActivitiesSeconds
+  from UserActivityWindow
+  group by UserId, DisplayName
+)
+select distinct
+  u.Id as UserId,
+  u.DisplayName,
+  u.Reputation,
+  u.CreationDate,
+  u.LastAccessDate,
+  ub.GoldBadges,
+  ub.SilverBadges,
+  ub.BronzeBadges,
+  ub.TotalPostScore,
+  ub.ScoreRank,
+  coalesce(ta.AnswerCount, 0) as TopAnswerCount,
+  coalesce(ta.AvgAnswerScore, 0) as TopAvgAnswerScore,
+  rcq.ClosedDate,
+  rcq.CloseReason,
+  rcq.Title as ClosedQuestionTitle,
+  ag.LongInactivityPeriods,
+  ag.AvgTimeBetweenActivitiesSeconds,
+  rt.TagName,
+  rt.InitialCount,
+  rt.AnswersForTag
+from Users u
+left join UserBadgeSummary ub on ub.UserId = u.Id
+left join TopUserAnswers ta on ta.OwnerUserId = u.Id
+left join RecentClosedQuestions rcq on rcq.OwnerUserId = u.Id
+left join ActivityGaps ag on ag.UserId = u.Id
+left join RecursiveTagCounts rt on rt.TagName = substring(u.Location from 1 for 35)
+where
+  (u.Reputation > 1000 or coalesce(ub.GoldBadges, 0) > 0)
+  and (rcq.CloseReason is null or rcq.ClosedDate > cast('2024-10-01 12:34:56' as timestamp) - interval '30 days')
+  and (ta.AvgAnswerScore is null or ta.AvgAnswerScore > 2)
+order by ub.ScoreRank nulls last, u.Reputation desc
+limit 100;

@@ -1,0 +1,179 @@
+WITH recent_user_activity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreated,
+    u.LastAccessDate,
+    COUNT(p.Id) AS PostCount,
+    AVG(p.Score) AS AvgPostScore,
+    MAX(p.LastActivityDate) AS LastActivity,
+    STRING_AGG(DISTINCT b.Name, ',') AS Badges
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  WHERE u.AccountId IS NOT NULL
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+complex_post_metrics AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.PostTypeId,
+    p.OwnerUserId,
+    COALESCE(p.AcceptedAnswerId, -1) AS AcceptedAnswerId,
+    CASE
+      WHEN p.PostTypeId = 1 THEN (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id)
+      ELSE 0
+    END AS CommentCount,
+    CASE
+      WHEN p.PostTypeId = 1 THEN (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2)
+      ELSE 0
+    END AS UpVotes,
+    CASE
+      WHEN p.PostTypeId = 1 THEN (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3)
+      ELSE 0
+    END AS DownVotes,
+    CASE
+      WHEN p.PostTypeId IN (1,2) THEN (
+        SELECT STRING_AGG(vs.vt_name || ':' || CAST(vs.bounty_amount AS text), '|')
+        FROM (
+          SELECT vt.Name AS vt_name, v.BountyAmount AS bounty_amount
+          FROM Votes v
+          JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+          WHERE v.PostId = p.Id AND v.VoteTypeId IN (2,3,8,9)
+        ) AS vs
+      )
+      ELSE NULL
+    END AS VoteSummary
+  FROM Posts p
+),
+outer_join_example AS (
+  SELECT
+    rp.Id AS RelatedPostId,
+    rp.Title AS RelatedPostTitle,
+    rp2.Id AS LinkedPostId,
+    rp2.Title AS LinkedPostTitle
+  FROM (
+    SELECT Id, Title, PostTypeId FROM Posts
+  ) rp
+  LEFT JOIN PostLinks pl ON pl.RelatedPostId = rp.Id
+  LEFT JOIN Posts rp2 ON rp2.Id = pl.PostId
+  WHERE rp.PostTypeId = 1
+),
+tag_wiki_overlap AS (
+  SELECT
+    t.Id AS TagId,
+    t.TagName,
+    t.Count,
+    p.Id AS PostId,
+    p.Title AS PostTitle,
+    p.CreationDate
+  FROM Tags t
+  JOIN Posts p ON p.Id = t.WikiPostId
+  WHERE t.IsModeratorOnly = FALSE
+),
+date_windows AS (
+  SELECT
+    CAST('2024-10-01' AS date) AS CurrentDate,
+    CAST(DATE_TRUNC('month', CAST('2024-10-01' AS date)) AS timestamp) AS MonthStart,
+    CAST(DATE_TRUNC('year', CAST('2024-10-01' AS date)) AS timestamp) AS YearStart
+),
+combined AS (
+  SELECT
+    rua.UserId,
+    rua.DisplayName,
+    rua.Reputation,
+    cpm.PostId,
+    cpm.Title,
+    cpm.Score,
+    cpm.ViewCount,
+    cpm.CommentCount,
+    cpm.UpVotes,
+    cpm.DownVotes,
+    rw.LastActivity,
+    rua.Badges,
+    rua.UserCreated,
+    rua.LastAccessDate,
+    rua.PostCount,
+    rua.AvgPostScore,
+    cpm.PostTypeId,
+    cpm.OwnerUserId,
+    cpm.AcceptedAnswerId,
+    cpm.CreationDate,
+    cpm.LastActivityDate,
+    cpm.VoteSummary
+  FROM recent_user_activity rua
+  JOIN complex_post_metrics cpm ON cpm.OwnerUserId = rua.UserId
+  LEFT JOIN (
+    SELECT
+      p.Id,
+      p.LastActivityDate AS LastActivity
+    FROM Posts p
+  ) rw ON rw.Id = cpm.PostId
+  WHERE cpm.Score > 0
+  GROUP BY
+    rua.UserId,
+    rua.DisplayName,
+    rua.Reputation,
+    cpm.PostId,
+    cpm.Title,
+    cpm.Score,
+    cpm.ViewCount,
+    cpm.CommentCount,
+    cpm.UpVotes,
+    cpm.DownVotes,
+    rw.LastActivity,
+    rua.Badges,
+    rua.UserCreated,
+    rua.LastAccessDate,
+    rua.PostCount,
+    rua.AvgPostScore,
+    cpm.PostTypeId,
+    cpm.OwnerUserId,
+    cpm.AcceptedAnswerId,
+    cpm.CreationDate,
+    cpm.LastActivityDate,
+    cpm.VoteSummary
+)
+SELECT
+  json_build_object(
+    'benchmark', json_build_object(
+      'description', 'Complex query covering CTEs, window-like aggregations, correlated subqueries, and multiple joins',
+      'date', CAST('2024-10-01 12:34:56' AS timestamp)
+    ),
+    'users', json_agg(DISTINCT json_build_object(
+      'userId', cr.UserId,
+      'displayName', cr.DisplayName,
+      'reputation', cr.Reputation,
+      'userCreated', cr.UserCreated,
+      'lastAccess', cr.LastAccessDate,
+      'postCount', cr.PostCount,
+      'avgPostScore', cr.AvgPostScore,
+      'lastActivity', cr.LastActivity,
+      'badges', cr.Badges
+    )),
+    'posts', json_agg(DISTINCT json_build_object(
+      'postId', cc.PostId,
+      'title', cc.Title,
+      'postType', cc.PostTypeId,
+      'ownerUserId', cc.OwnerUserId,
+      'acceptedAnswer', cc.AcceptedAnswerId,
+      'commentCount', cc.CommentCount,
+      'upVotes', cc.UpVotes,
+      'downVotes', cc.DownVotes,
+      'score', cc.Score,
+      'views', cc.ViewCount,
+      'creationDate', cc.CreationDate,
+      'lastActivityDate', cc.LastActivityDate,
+      'voteSummary', cc.VoteSummary
+    ))
+  ) AS BenchmarkResult
+FROM combined cr
+JOIN combined cc ON TRUE
+LIMIT 1;

@@ -1,0 +1,189 @@
+-- {"query": "1395.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3302} 
+
+WITH UserEngagementSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.Views AS UserProfileViews,
+        u.UpVotes AS UserUpVotesGiven,
+        u.DownVotes AS UserDownVotesGiven,
+        COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = (SELECT Id FROM PostTypes WHERE Name = 'Question') THEN p.Id END) AS TotalQuestionsOwned,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = (SELECT Id FROM PostTypes WHERE Name = 'Answer') THEN p.Id END) AS TotalAnswersOwned,
+        COALESCE(SUM(CASE WHEN vt_p.Name = 'UpMod' AND v_p.PostId = p.Id THEN 1 ELSE 0 END), 0) AS TotalUpvotesReceivedOnOwnedPosts,
+        COALESCE(SUM(CASE WHEN vt_p.Name = 'DownMod' AND v_p.PostId = p.Id THEN 1 ELSE 0 END), 0) AS TotalDownvotesReceivedOnOwnedPosts,
+        COALESCE(SUM(p.AnswerCount), 0) AS TotalAnswersCountOnQuestionsOwned, -- Sum of AnswerCount for questions
+        COALESCE(SUM(p.CommentCount), 0) AS TotalCommentsCountOnOwnedPosts,
+        COALESCE(SUM(p.FavoriteCount), 0) AS TotalFavoritesCountOnOwnedPosts,
+        COALESCE(SUM(CASE WHEN v_usr.VoteTypeId = (SELECT Id FROM VoteTypes WHERE Name = 'BountyStart') THEN v_usr.BountyAmount ELSE 0 END), 0) AS TotalBountyGiven,
+        COALESCE(SUM(CASE WHEN v_usr.VoteTypeId = (SELECT Id FROM VoteTypes WHERE Name = 'BountyClose') THEN v_usr.BountyAmount ELSE 0 END), 0) AS TotalBountyReceived,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMadeByUser,
+        COUNT(DISTINCT b.Id) AS TotalBadgesEarned,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        MAX(b.Date) AS LatestBadgeDate,
+        MIN(p.CreationDate) AS FirstPostDate,
+        MAX(p.CreationDate) AS LatestPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Votes v_usr ON u.Id = v_usr.UserId -- Votes made by the user
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v_p ON p.Id = v_p.PostId -- Votes on posts (potentially received by owner)
+    LEFT JOIN VoteTypes vt_p ON v_p.VoteTypeId = vt_p.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes
+),
+PostTagAnalysis AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId AS PostOwnerId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount AS PostViewCount,
+        unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS TagName
+    FROM Posts p
+    WHERE p.PostTypeId = (SELECT Id FROM PostTypes WHERE Name = 'Question')
+      AND p.Tags IS NOT NULL AND p.Tags != 'null' AND p.Tags != ''
+),
+AggregatedTagStats AS (
+    SELECT
+        pta.PostOwnerId AS UserId,
+        pta.TagName,
+        COUNT(DISTINCT pta.PostId) AS UserTagPosts,
+        SUM(pta.PostScore) AS UserTagScore,
+        AVG(pta.PostScore) AS UserAvgTagScore,
+        RANK() OVER (PARTITION BY pta.PostOwnerId ORDER BY SUM(pta.PostScore) DESC, COUNT(DISTINCT pta.PostId) DESC) AS TagRankForUser,
+        NTILE(4) OVER (ORDER BY SUM(pta.PostScore) DESC) AS GlobalTagScoreQuartile
+    FROM PostTagAnalysis pta
+    GROUP BY pta.PostOwnerId, pta.TagName
+    HAVING COUNT(DISTINCT pta.PostId) >= 5
+),
+UserPostHistoryMetrics AS (
+    SELECT
+        ph.UserId,
+        COUNT(ph.Id) AS TotalHistoryEvents,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN ((SELECT Id FROM PostHistoryTypes WHERE Name = 'Edit Title'), (SELECT Id FROM PostHistoryTypes WHERE Name = 'Edit Body'), (SELECT Id FROM PostHistoryTypes WHERE Name = 'Edit Tags')) THEN ph.Id END) AS EditHistoryCount,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = (SELECT Id FROM PostHistoryTypes WHERE Name = 'Post Closed') THEN ph.Id END) AS ClosedHistoryCount,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = (SELECT Id FROM PostHistoryTypes WHERE Name = 'Post Reopened') THEN ph.Id END) AS ReopenedHistoryCount,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = (SELECT Id FROM PostHistoryTypes WHERE Name = 'Post Deleted') THEN ph.Id END) AS DeletedHistoryCount,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN ((SELECT Id FROM PostHistoryTypes WHERE Name = 'Post Migrated Away'), (SELECT Id FROM PostHistoryTypes WHERE Name = 'Post Migrated Here')) THEN ph.Id END) AS MigratedHistoryCount,
+        MIN(ph.CreationDate) AS FirstHistoryEvent,
+        MAX(ph.CreationDate) AS LatestHistoryEvent
+    FROM PostHistory ph
+    WHERE ph.UserId IS NOT NULL
+    GROUP BY ph.UserId
+),
+UserPostPerformance AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS PostSequenceNumDesc,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS AvgScoreOverall,
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevPostScore,
+        LEAD(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextPostScore,
+        DENSE_RANK() OVER (PARTITION BY p.OwnerUserId, p.PostTypeId ORDER BY p.Score DESC, p.CreationDate DESC) AS PostRankInType
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+),
+TopUserPosts AS (
+    SELECT
+        upp.UserId,
+        MAX(CASE WHEN upp.PostRankInType = 1 AND upp.PostTypeId = (SELECT Id FROM PostTypes WHERE Name = 'Question') THEN upp.Score ELSE NULL END) AS TopQuestionScore,
+        MAX(CASE WHEN upp.PostRankInType = 1 AND upp.PostTypeId = (SELECT Id FROM PostTypes WHERE Name = 'Answer') THEN upp.Score ELSE NULL END) AS TopAnswerScore,
+        AVG(upp.PrevPostScore) FILTER (WHERE upp.PostSequenceNumDesc > 1) AS AvgLaggingPostScore,
+        AVG(upp.NextPostScore) FILTER (WHERE upp.PostSequenceNumDesc <= 10) AS AvgLeadingPostScoreRecent,
+        COUNT(DISTINCT upp.PostId) FILTER (WHERE upp.Score >= 100) AS HighScorePostsCount,
+        COUNT(DISTINCT upp.PostId) FILTER (WHERE upp.Score < 0) AS NegativeScorePostsCount
+    FROM UserPostPerformance upp
+    GROUP BY upp.UserId
+)
+SELECT
+    ues.UserId,
+    ues.DisplayName,
+    ues.Reputation,
+    ues.UserCreationDate,
+    ues.LastAccessDate,
+    EXTRACT(EPOCH FROM (ues.LastAccessDate - ues.UserCreationDate)) / (60 * 60 * 24) AS AccountAgeDays,
+    ues.TotalPostsOwned,
+    ues.TotalQuestionsOwned,
+    ues.TotalAnswersOwned,
+    ues.TotalUpvotesReceivedOnOwnedPosts,
+    ues.TotalDownvotesReceivedOnOwnedPosts,
+    COALESCE(CAST(ues.TotalUpvotesReceivedOnOwnedPosts AS NUMERIC) / NULLIF(ues.TotalPostsOwned, 0), 0) AS AvgUpvotesPerPost,
+    ues.TotalCommentsMadeByUser,
+    ues.TotalBadgesEarned,
+    ues.GoldBadges,
+    ats.TagName AS TopTagByScoreForUser,
+    ats.UserTagPosts AS TopTagPostsCount,
+    ats.UserAvgTagScore AS TopTagAvgScore,
+    ats.GlobalTagScoreQuartile,
+    uhm.TotalHistoryEvents,
+    uhm.EditHistoryCount,
+    uhm.ClosedHistoryCount,
+    uhm.ReopenedHistoryCount,
+    uhm.MigratedHistoryCount,
+    tup.TopQuestionScore,
+    tup.TopAnswerScore,
+    tup.HighScorePostsCount,
+    tup.NegativeScorePostsCount,
+    tup.AvgLaggingPostScore,
+    tup.AvgLeadingPostScoreRecent,
+    CASE
+        WHEN ues.Reputation >= 10000 AND ues.TotalPostsOwned >= 500 THEN 'Veteran_HighImpact'
+        WHEN ues.Reputation >= 5000 AND ues.TotalBadgesEarned >= 50 THEN 'Established_Contributor'
+        WHEN ues.Reputation < 1000 AND ues.TotalPostsOwned < 10 THEN 'Newbie_LowActivity'
+        ELSE 'Regular_User'
+    END AS UserCategory,
+    COALESCE(
+        (SELECT
+            COUNT(DISTINCT pl_sub.RelatedPostId)
+         FROM PostLinks pl_sub
+         WHERE pl_sub.PostId IN (SELECT p_sub.Id FROM Posts p_sub WHERE p_sub.OwnerUserId = ues.UserId)
+           AND pl_sub.LinkTypeId = (SELECT lt.Id FROM LinkTypes lt WHERE lt.Name = 'Duplicate')
+        ), 0
+    ) AS DuplicatedQuestionsLinkedByUserPosts,
+    (SELECT AVG(v.BountyAmount) FROM Votes v WHERE v.UserId = ues.UserId AND v.VoteTypeId = (SELECT Id FROM VoteTypes WHERE Name = 'BountyStart') AND v.CreationDate > ues.LastAccessDate - INTERVAL '1 year') AS RecentAvgBountyGiven,
+    NULLIF(ues.TotalQuestionsOwned, 0) * 100.0 / NULLIF(ues.TotalAnswersOwned + ues.TotalQuestionsOwned, 0) AS QuestionRatioPercentage,
+    (SELECT COUNT(DISTINCT ph.PostId) FROM PostHistory ph WHERE ph.UserId = ues.UserId AND ph.PostHistoryTypeId = (SELECT Id FROM PostHistoryTypes WHERE Name = 'Post Closed') AND ph.Comment LIKE '%Off-topic%') AS OffTopicClosedPostsCount,
+    LOWER(SUBSTRING(COALESCE(ues.DisplayName, 'anonymous'), 1, 3)) || '...' || UPPER(SUBSTRING(COALESCE(ues.DisplayName, 'anonymous'), LENGTH(COALESCE(ues.DisplayName, 'anonymous')) - 2, 3)) AS DisplayNameSignature,
+    TRIM(REPLACE(COALESCE(ues.DisplayName, ''), ' ', '-')) ILIKE 'user-%' AS IsDisplayNameSanitizedPattern,
+    (ues.LastAccessDate - ues.UserCreationDate) < INTERVAL '1 month' AND ues.TotalPostsOwned > 5
+        AND ues.TotalUpvotesReceivedOnOwnedPosts > 10 AND NOT (uhm.ClosedHistoryCount > 0 OR tup.NegativeScorePostsCount > 0)
+        AND EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = ues.UserId AND b.TagBased = TRUE AND b.Class = 2)
+        AS EarlyActiveAndPositiveUserFlag
+FROM UserEngagementSummary ues
+LEFT JOIN AggregatedTagStats ats ON ues.UserId = ats.UserId AND ats.TagRankForUser = 1
+LEFT JOIN UserPostHistoryMetrics uhm ON ues.UserId = uhm.UserId
+LEFT JOIN TopUserPosts tup ON ues.UserId = tup.UserId
+WHERE ues.Reputation > 100
+  AND ues.TotalPostsOwned > 5
+  AND ues.TotalCommentsMadeByUser > 2
+  AND ues.UserCreationDate BETWEEN '2019-01-01' AND '2023-12-31'
+  AND (ues.GoldBadges > 0 OR ues.TotalUpvotesReceivedOnOwnedPosts > 50)
+  AND (COALESCE(uhm.EditHistoryCount, 0) > 0 OR COALESCE(uhm.MigratedHistoryCount, 0) > 0)
+  AND NOT EXISTS (
+      SELECT 1
+      FROM Posts p_no_view
+      WHERE p_no_view.OwnerUserId = ues.UserId
+        AND p_no_view.PostTypeId = (SELECT Id FROM PostTypes WHERE Name = 'Question')
+        AND p_no_view.ViewCount = 0
+        AND p_no_view.CreationDate > ues.LastAccessDate - INTERVAL '6 months'
+  )
+  AND (
+        (COALESCE(tup.NegativeScorePostsCount, 0) = 0 AND COALESCE(ats.UserAvgTagScore, 0) > 5)
+        OR
+        (tup.TopQuestionScore IS NOT NULL AND tup.TopQuestionScore > 100)
+        OR
+        (tup.TopAnswerScore IS NOT NULL AND tup.TopAnswerScore > 50 AND ues.TotalAnswersOwned > 10)
+  )
+ORDER BY ues.Reputation DESC, AccountAgeDays DESC, ues.LastAccessDate DESC
+LIMIT 1000;

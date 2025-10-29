@@ -1,0 +1,132 @@
+with RecursiveUserBadges as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class as BadgeClass,
+        b.Date as BadgeDate,
+        row_number() over (partition by u.Id order by b.Date desc, b.Class asc) as BadgeRank
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    where b.Date >= date '2023-01-01'
+), RankedTopBadges as (
+    select UserId, DisplayName, BadgeName, BadgeClass, BadgeDate
+    from RecursiveUserBadges
+    where BadgeRank <= 3
+), TopQuestionStats as (
+    select
+        p.OwnerUserId,
+        count(distinct p.Id) as TotalQuestions,
+        sum(coalesce(p.ViewCount,0)) as TotalViews,
+        avg(coalesce(p.Score,0)) as AvgScore,
+        max(p.CreationDate) as LastQuestionDate,
+        min(p.CreationDate) as FirstQuestionDate
+    from Posts p
+    where p.PostTypeId = 1
+      and p.OwnerUserId is not null
+    group by p.OwnerUserId
+), TopAnswerStats as (
+    select
+        p.OwnerUserId,
+        count(distinct p.Id) as TotalAnswers,
+        avg(coalesce(p.Score,0)) as AvgAnswerScore,
+        max(p.CreationDate) as LastAnswerDate
+    from Posts p
+    where p.PostTypeId = 2
+      and p.OwnerUserId is not null
+    group by p.OwnerUserId
+), UserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Location,
+        (select count(*) from Comments c where c.UserId = u.Id) as CommentCount,
+        (select count(*) from Votes v where v.UserId = u.Id and v.VoteTypeId = 2) as UpVotesCast,
+        (select count(*) from Votes v where v.UserId = u.Id and v.VoteTypeId = 3) as DownVotesCast,
+        (select count(*) from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 1 and p.ClosedDate is not null) as ClosedQuestionsCount
+    from Users u
+    where u.Reputation > 1000
+), LatestPostEdits as (
+    select
+        ph.PostId,
+        max(ph.CreationDate) as LastEditDate,
+        max(case when ph.PostHistoryTypeId = 10 then ph.Comment else null end) as CloseReasonIdJSON
+    from PostHistory ph
+    group by ph.PostId
+), PostWithLatestEdits as (
+    select
+        p.Id as PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.CreationDate,
+        p.AcceptedAnswerId,
+        e.LastEditDate,
+        e.CloseReasonIdJSON
+    from Posts p
+    left join LatestPostEdits e on p.Id = e.PostId
+), UserComprehensive as (
+    select
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.Location,
+        ua.CommentCount,
+        ua.UpVotesCast,
+        ua.DownVotesCast,
+        ua.ClosedQuestionsCount,
+        coalesce(tq.TotalQuestions,0) as TotalQuestions,
+        coalesce(tq.TotalViews,0) as TotalQuestionViews,
+        coalesce(tq.AvgScore,0) as AvgQuestionScore,
+        coalesce(ta.TotalAnswers,0) as TotalAnswers,
+        coalesce(ta.AvgAnswerScore,0) as AvgAnswerScore
+    from UserActivity ua
+    left join TopQuestionStats tq on ua.UserId = tq.OwnerUserId
+    left join TopAnswerStats ta on ua.UserId = ta.OwnerUserId
+)
+select
+    uc.UserId,
+    uc.DisplayName,
+    uc.Reputation,
+    uc.Location,
+    uc.CommentCount,
+    uc.UpVotesCast,
+    uc.DownVotesCast,
+    uc.ClosedQuestionsCount,
+    uc.TotalQuestions,
+    uc.TotalQuestionViews,
+    uc.AvgQuestionScore,
+    uc.TotalAnswers,
+    uc.AvgAnswerScore,
+    string_agg(distinct (rtb.BadgeName || ' (' || 
+        case rtb.BadgeClass when 1 then 'Gold' when 2 then 'Silver' when 3 then 'Bronze' else 'Unknown' end || ')'), ', ') as RecentBadges,
+    count(distinct pl.Id) as LinkedPostsCount,
+    count(distinct case when ph.PostHistoryTypeId = 10 then ph.Id end) as CloseVotesCount,
+    max(pwl.LastEditDate) as UserLastPostEdit,
+    bool_or(pwl.CloseReasonIdJSON is not null) as HasClosedPost,
+    sum(case when pwl.Tags is not null and position('<java>' in pwl.Tags) > 0 then 1 else 0 end) as JavaTaggedPosts,
+    sum(coalesce(pwl.Score,0)) as TotalPostScore,
+    rank() over (order by uc.Reputation desc, uc.TotalQuestions desc) as UserRankByReputation
+from UserComprehensive uc
+left join RankedTopBadges rtb on uc.UserId = rtb.UserId
+left join PostLinks pl on pl.PostId = pl.PostId and pl.PostId in (
+    select p2.Id from Posts p2 where p2.OwnerUserId = uc.UserId
+)
+left join PostHistory ph on ph.PostId in (
+    select p3.Id from Posts p3 where p3.OwnerUserId = uc.UserId
+)
+left join PostWithLatestEdits pwl on pwl.OwnerUserId = uc.UserId
+where uc.Reputation > 5000
+group by
+    uc.UserId, uc.DisplayName, uc.Reputation, uc.Location, uc.CommentCount,
+    uc.UpVotesCast, uc.DownVotesCast, uc.ClosedQuestionsCount,
+    uc.TotalQuestions, uc.TotalQuestionViews, uc.AvgQuestionScore,
+    uc.TotalAnswers, uc.AvgAnswerScore,
+    rtb.BadgeName, rtb.BadgeClass
+order by UserRankByReputation
+limit 100;

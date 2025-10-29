@@ -1,0 +1,287 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        COUNT(DISTINCT c.Id) AS Comments,
+        COUNT(DISTINCT b.Id) AS Badges,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS TotalQuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS TotalAnswerScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        CAST(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - u.CreationDate)) / 86400 AS INTEGER) AS AccountAgeDays,
+        COALESCE(SUM(p.ViewCount), 0) AS TotalViews,
+        COALESCE(SUM(p.FavoriteCount), 0) AS TotalFavorites,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL THEN p.Id END) AS ClosedQuestions
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.CreationDate
+),
+RankedUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        Views,
+        TotalPosts,
+        Questions,
+        Answers,
+        Comments,
+        Badges,
+        TotalQuestionScore,
+        TotalAnswerScore,
+        LastPostDate,
+        AccountAgeDays,
+        TotalViews,
+        TotalFavorites,
+        ClosedQuestions,
+        ROW_NUMBER() OVER (ORDER BY TotalQuestionScore DESC, TotalAnswerScore DESC) AS RankByScore,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, Views DESC) AS RankByReputation,
+        NTILE(100) OVER (ORDER BY TotalPosts DESC) AS PostActivityPercentile,
+        CASE 
+            WHEN AccountAgeDays > 365 THEN 'Veteran'
+            WHEN AccountAgeDays > 180 THEN 'Active'
+            ELSE 'New'
+        END AS AccountStatus,
+        CASE 
+            WHEN TotalQuestionScore > 1000 THEN 'Expert'
+            WHEN TotalQuestionScore > 500 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END AS QuestionSkillLevel
+    FROM UserActivityStats
+),
+TopTags AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        p.Title AS TagTitle,
+        p.Body AS TagBody,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank,
+        AVG(CAST(p.Score AS DOUBLE PRECISION)) AS AvgScore,
+        COUNT(p.Id) AS PostCount
+    FROM Tags t
+    LEFT JOIN Posts p ON t.WikiPostId = p.Id
+    WHERE t.TagName IS NOT NULL
+    GROUP BY t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId, p.Title, p.Body
+),
+PostComplexity AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.AnswerCount,
+        CHAR_LENGTH(p.Body) AS BodyLength,
+        COALESCE(p.AnswerCount, 0) + COALESCE(p.CommentCount, 0) AS EngagementCount,
+        CASE 
+            WHEN CHAR_LENGTH(p.Body) > 1000 THEN 'Long'
+            WHEN CHAR_LENGTH(p.Body) > 500 THEN 'Medium'
+            ELSE 'Short'
+        END AS PostLengthCategory,
+        CASE 
+            WHEN p.Score > 10 THEN 'HighlyRated'
+            WHEN p.Score > 5 THEN 'ModeratelyRated'
+            ELSE 'LowRated'
+        END AS RatingCategory,
+        COALESCE(SUBSTRING(p.Title FROM '(\w+)(?:\s+\w+)*'), 'NoTitle') AS MainKeyword,
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS ScoreRankInType,
+        DENSE_RANK() OVER (ORDER BY p.ViewCount DESC) AS ViewRank,
+        LAG(p.Score, 1, 0) OVER (ORDER BY p.CreationDate ASC) AS PrevScore,
+        LEAD(p.Score, 1, 0) OVER (ORDER BY p.CreationDate ASC) AS NextScore,
+        p.PostTypeId,
+        p.CreationDate
+    FROM Posts p
+    WHERE p.Body IS NOT NULL AND p.Body != ''
+),
+CombinedAnalysis AS (
+    SELECT 
+        ru.UserId,
+        ru.DisplayName,
+        ru.Reputation,
+        ru.TotalPosts,
+        ru.Questions,
+        ru.Answers,
+        ru.TotalQuestionScore,
+        ru.TotalAnswerScore,
+        ru.PostActivityPercentile,
+        ru.AccountStatus,
+        ru.QuestionSkillLevel,
+        COALESCE(t1.TagName, 'NoTag') AS TopTag1,
+        COALESCE(t2.TagName, 'NoTag') AS TopTag2,
+        COALESCE(t3.TagName, 'NoTag') AS TopTag3,
+        pa.PostId,
+        pa.Title,
+        pa.Score,
+        pa.ViewCount,
+        pa.BodyLength,
+        pa.PostLengthCategory,
+        pa.RatingCategory,
+        pa.MainKeyword
+    FROM RankedUsers ru
+    LEFT JOIN (
+        SELECT TagName FROM TopTags WHERE TagRank = 1
+    ) t1 ON 1 = 1
+    LEFT JOIN (
+        SELECT TagName FROM TopTags WHERE TagRank = 2
+    ) t2 ON 1 = 1
+    LEFT JOIN (
+        SELECT TagName FROM TopTags WHERE TagRank = 3
+    ) t3 ON 1 = 1
+    LEFT JOIN PostComplexity pa ON pa.PostId = (
+        SELECT Id FROM Posts WHERE OwnerUserId = ru.UserId
+        ORDER BY Score DESC
+        LIMIT 1
+    )
+),
+FinalQuery AS (
+    SELECT 
+        ca.UserId,
+        ca.DisplayName,
+        ca.Reputation,
+        ca.TotalPosts,
+        ca.Questions,
+        ca.Answers,
+        ca.TotalQuestionScore,
+        ca.TotalAnswerScore,
+        ca.PostActivityPercentile,
+        ca.AccountStatus,
+        ca.QuestionSkillLevel,
+        ca.TopTag1,
+        ca.TopTag2,
+        ca.TopTag3,
+        ca.PostId,
+        ca.Title,
+        ca.Score,
+        ca.ViewCount,
+        ca.BodyLength,
+        ca.PostLengthCategory,
+        ca.RatingCategory,
+        ca.MainKeyword,
+        CASE 
+            WHEN ca.TotalQuestionScore > 0 THEN (ca.TotalAnswerScore * 1.0) / ca.TotalQuestionScore
+            ELSE 0
+        END AS AnswerToQuestionRatio,
+        CASE 
+            WHEN ca.ViewCount > 0 THEN (ca.Score * 1.0) / ca.ViewCount
+            ELSE 0
+        END AS ScorePerView,
+        CASE 
+            WHEN ca.TotalPosts > 0 THEN (ca.Questions * 1.0) / ca.TotalPosts
+            ELSE 0
+        END AS QuestionPercentage,
+        CASE 
+            WHEN ca.Answers > 0 THEN (ca.TotalAnswerScore * 1.0) / ca.Answers
+            ELSE 0
+        END AS AvgAnswerScore,
+        CASE
+            WHEN ca.Score > 0 AND ca.BodyLength > 0 THEN (
+                (ca.Score * 100.0) / (ca.BodyLength * 1.0)
+            )
+            ELSE 0
+        END AS ScorePerBodyRatio
+    FROM CombinedAnalysis ca
+    WHERE ca.UserId IS NOT NULL
+),
+AggregatedMetrics AS (
+    SELECT 
+        COUNT(*) AS TotalUsers,
+        AVG(Reputation) AS AvgReputation,
+        AVG(TotalPosts) AS AvgPostsPerUser,
+        AVG(Questions) AS AvgQuestionsPerUser,
+        AVG(Answers) AS AvgAnswersPerUser,
+        AVG(TotalQuestionScore) AS AvgQuestionScore,
+        AVG(TotalAnswerScore) AS AvgAnswerScore,
+        AVG(ScorePerView) AS AvgScorePerView,
+        AVG(AnswerToQuestionRatio) AS AvgAnswerToQuestionRatio,
+        AVG(ScorePerBodyRatio) AS AvgScorePerBodyRatio,
+        MAX(Reputation) AS MaxReputation,
+        MAX(TotalPosts) AS MaxPosts,
+        MAX(TotalQuestionScore) AS MaxQuestionScore
+    FROM FinalQuery
+)
+SELECT 
+    f.UserId,
+    f.DisplayName,
+    f.Reputation,
+    f.TotalPosts,
+    f.Questions,
+    f.Answers,
+    f.TotalQuestionScore,
+    f.TotalAnswerScore,
+    f.PostActivityPercentile,
+    f.AccountStatus,
+    f.QuestionSkillLevel,
+    f.TopTag1,
+    f.TopTag2,
+    f.TopTag3,
+    f.PostId,
+    f.Title,
+    f.Score,
+    f.ViewCount,
+    f.BodyLength,
+    f.PostLengthCategory,
+    f.RatingCategory,
+    f.MainKeyword,
+    f.AnswerToQuestionRatio,
+    f.ScorePerView,
+    f.QuestionPercentage,
+    f.AvgAnswerScore,
+    f.ScorePerBodyRatio,
+    CASE 
+        WHEN f.Reputation > (SELECT AVG(Reputation) FROM FinalQuery) THEN 1 
+        ELSE 0 
+    END AS AboveAvgReputation,
+    CASE 
+        WHEN f.TotalPosts > (SELECT AVG(TotalPosts) FROM FinalQuery) THEN 1 
+        ELSE 0 
+    END AS AboveAvgPostCount,
+    CASE 
+        WHEN f.Score > (SELECT AVG(Score) FROM FinalQuery) THEN 1 
+        ELSE 0 
+    END AS AboveAvgScore,
+    CASE 
+        WHEN f.ViewCount > (SELECT AVG(ViewCount) FROM FinalQuery) THEN 1 
+        ELSE 0 
+    END AS AboveAvgViews,
+    CASE 
+        WHEN f.BodyLength > (SELECT AVG(BodyLength) FROM FinalQuery) THEN 1 
+        ELSE 0 
+    END AS AboveAvgBodyLength,
+    (SELECT COUNT(*) FROM FinalQuery WHERE TotalPosts > f.TotalPosts) + 1 AS PostRankWithinGroup,
+    (SELECT COUNT(*) FROM FinalQuery WHERE Score > f.Score) + 1 AS ScoreRankWithinGroup,
+    CASE 
+        WHEN f.TotalPosts > (SELECT AVG(TotalPosts) FROM FinalQuery) * 2 THEN 'HighlyActive'
+        WHEN f.TotalPosts > (SELECT AVG(TotalPosts) FROM FinalQuery) THEN 'Active'
+        ELSE 'Regular'
+    END AS ActivityLevel,
+    CASE 
+        WHEN ABS(f.AnswerToQuestionRatio - (
+            SELECT AVG(AnswerToQuestionRatio) FROM FinalQuery
+        )) < 0.2 THEN 'Consistent'
+        WHEN f.AnswerToQuestionRatio > (
+            SELECT AVG(AnswerToQuestionRatio) FROM FinalQuery
+        ) THEN 'MoreAnswerProportional'
+        ELSE 'LessAnswerProportional'
+    END AS AnswerProportionalityStatus
+FROM FinalQuery f
+WHERE f.UserId IN (
+    SELECT UserId FROM (
+        SELECT 
+            UserId,
+            ROW_NUMBER() OVER (ORDER BY TotalQuestionScore DESC) AS rn
+        FROM FinalQuery
+    ) sub
+    WHERE rn <= 1000
+)
+ORDER BY f.TotalQuestionScore DESC, f.TotalAnswerScore DESC
+LIMIT 1000000;

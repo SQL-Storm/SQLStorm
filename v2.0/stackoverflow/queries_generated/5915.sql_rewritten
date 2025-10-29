@@ -1,0 +1,78 @@
+-- {"query": "5915.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 571} 
+WITH RecentTopQuestions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.ViewCount,
+    p.Score,
+    p.CreationDate,
+    p.OwnerUserId,
+    u.DisplayName AS OwnerName,
+    ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.ViewCount DESC, p.CreationDate DESC) AS rn
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId = 1 -- Questions
+    AND p.ClosedDate IS NULL
+    AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '180 days'
+),
+TopTags AS (
+  SELECT
+    t.TagName,
+    SUM(pv.Score) AS total_score,
+    COUNT(*) AS question_count
+  FROM RecentTopQuestions rtq
+  JOIN Posts pv ON pv.Id = rtq.PostId
+  CROSS APPLY (
+    SELECT unnest(string_to_array(substring(pv.Tags, 2, length(pv.Tags)-2), '><')) AS tag
+  ) AS t
+  WHERE pv.Tags IS NOT NULL
+  GROUP BY t.TagName
+),
+Agg AS (
+  SELECT
+    rtq.PostId,
+    rtq.Title,
+    rtq.ViewCount,
+    rtq.Score,
+    rtq.CreationDate,
+    rtq.OwnerName,
+    rtq.OwnerUserId,
+    rtq.rn,
+    tt.total_score,
+    tt.question_count
+  FROM RecentTopQuestions rtq
+  LEFT JOIN (
+    SELECT
+      tag_name,
+      SUM(total_score) AS total_score,
+      SUM(question_count) AS question_count
+    FROM (
+      SELECT
+        tt.TagName AS tag_name,
+        tt.total_score,
+        tt.question_count
+      FROM TopTags tt
+    ) s
+    GROUP BY tag_name
+  ) tt ON true
+  WHERE rtq.rn <= 50
+)
+SELECT
+  a.PostId,
+  a.Title,
+  a.ViewCount,
+  a.Score,
+  a.CreationDate,
+  a.OwnerName,
+  a.OwnerUserId,
+  a.rn,
+  a.total_score,
+  a.question_count,
+  (SELECT COUNT(*) FROM Comments c WHERE c.PostId = a.PostId) AS CommentCount,
+  (SELECT ARRAY_AGG(vt.Name) FROM Votes v JOIN VoteTypes vt ON v.VoteTypeId = vt.Id WHERE v.PostId = a.PostId) AS VoteTypesSnapshot,
+  (SELECT EXISTS (
+     SELECT 1 FROM PostLinks pl WHERE pl.PostId = a.PostId AND pl.RelatedPostId = a.PostId
+  )) AS HasSelfLink
+FROM Agg a
+ORDER BY a.rn
+LIMIT 100;

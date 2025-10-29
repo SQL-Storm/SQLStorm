@@ -1,0 +1,146 @@
+-- {"query": "2685.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1323} 
+with RecursiveTagCounts as (
+    select
+        t.Id as TagId,
+        t.TagName,
+        coalesce(p.AnswerCount, 0) as AnswersPerTag,
+        coalesce(p.ViewCount, 0) as ViewsPerTag
+    from Tags t
+    left join Posts p on p.PostTypeId = 1 and p.Tags like concat('%<', t.TagName, '>%')
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+),
+UserBadgeAggregation as (
+    select
+        b.UserId,
+        count(case when b.Class = 1 then 1 end) as GoldBadges,
+        count(case when b.Class = 2 then 1 end) as SilverBadges,
+        count(case when b.Class = 3 then 1 end) as BronzeBadges,
+        count(distinct b.Name) as DistinctBadgesCount
+    from Badges b
+    group by b.UserId
+),
+UserActivity as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Location,
+        u.Views,
+        uba.GoldBadges,
+        uba.SilverBadges,
+        uba.BronzeBadges,
+        uba.DistinctBadgesCount,
+        rank() over (order by u.Reputation desc nulls last) as ReputationRank,
+        dense_rank() over (partition by u.Location order by u.Reputation desc nulls last) as LocationReputationRank
+    from Users u
+    left join UserBadgeAggregation uba on u.Id = uba.UserId
+    where u.DisplayName is not null
+),
+PostScoreWindow as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        count(c.Id) as CommentCount,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.CreationDate desc) as ScoreRankUser,
+        avg(p.Score) over (partition by p.OwnerUserId) as AvgScoreUser,
+        case 
+            when p.AcceptedAnswerId is not null then 1 
+            else 0 
+        end as IsAcceptedAnswer
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+    where p.PostTypeId in (1, 2)
+    group by p.Id, p.PostTypeId, p.OwnerUserId, p.Title, p.Tags, p.Score, p.ViewCount, p.CreationDate, p.AcceptedAnswerId
+),
+LatestPostHistories as (
+    select distinct on (ph.PostId)
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.UserId as EditorUserId,
+        ph.UserDisplayName as EditorName,
+        ph.CreationDate as EditDate,
+        ph.Comment as EditComment,
+        ph.Text as EditText
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (4,5,6) -- Edit Title, Edit Body, Edit Tags
+    order by ph.PostId, ph.CreationDate desc
+),
+DuplicateLinkCounts as (
+    select
+        pl.PostId,
+        count(distinct pl.RelatedPostId) as DuplicateCount
+    from PostLinks pl
+    where pl.LinkTypeId = 3
+    group by pl.PostId
+),
+HighImpactPosts as (
+    select
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        dtc.AnswersPerTag,
+        dtc.ViewsPerTag,
+        dlc.DuplicateCount,
+        row_number() over (order by (p.Score * 0.7 + coalesce(dlc.DuplicateCount, 0) * 3 + p.ViewCount * 0.05) desc) as ImpactRank
+    from Posts p
+    left join RecursiveTagCounts dtc on dtc.TagName = substring(p.Tags from '<([^>]+)>')
+    left join DuplicateLinkCounts dlc on p.Id = dlc.PostId
+    where p.PostTypeId = 1
+),
+CorrelatedAnswerCounts as (
+    select
+        q.Id as QuestionId,
+        (select count(1) from Posts a where a.ParentId = q.Id and a.Score > q.Score/2) as HighScoreAnswerCount,
+        (select count(1) from Posts a where a.ParentId = q.Id and a.CreationDate > q.CreationDate + interval '30 days') as LateAnsweredCount
+    from Posts q
+    where q.PostTypeId = 1
+)
+select
+    ua.Id as UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    coalesce(ua.GoldBadges,0) as GoldBadges,
+    coalesce(ua.SilverBadges,0) as SilverBadges,
+    coalesce(ua.BronzeBadges,0) as BronzeBadges,
+    ua.DistinctBadgesCount,
+    ua.Location,
+    ua.ReputationRank,
+    ua.LocationReputationRank,
+    p.Id as PostId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CommentCount,
+    p.ScoreRankUser,
+    p.AvgScoreUser,
+    p.IsAcceptedAnswer,
+    lph.PostHistoryTypeId,
+    lph.EditDate,
+    lph.EditorUserId,
+    lph.EditorName,
+    lph.EditComment,
+    hip.DuplicateCount,
+    hip.AnswersPerTag,
+    hip.ViewsPerTag,
+    cac.HighScoreAnswerCount,
+    cac.LateAnsweredCount
+from UserActivity ua
+inner join PostScoreWindow p on p.OwnerUserId = ua.Id
+left join LatestPostHistories lph on lph.PostId = p.Id
+left join HighImpactPosts hip on hip.Id = p.Id
+left join CorrelatedAnswerCounts cac on cac.QuestionId = p.Id
+where ua.Reputation > 1000
+and p.Score > ua.AvgScoreUser
+and (p.CommentCount > 5 or p.ViewCount > 1000)
+and (lph.EditDate is null or lph.EditDate > ua.CreationDate)
+order by ua.ReputationRank, p.Score desc, p.ViewCount desc
+limit 100;

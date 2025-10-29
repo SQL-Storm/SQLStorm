@@ -1,0 +1,184 @@
+-- {"query": "1777.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2865} 
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Location,
+        U.UpVotes,
+        U.DownVotes,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswers,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(P.CreationDate) AS LastPostCreationDate,
+        MIN(P.CreationDate) AS FirstPostCreationDate,
+        COALESCE(SUM(P.ViewCount), 0) AS TotalPostsViewCount,
+        COALESCE(SUM(P.FavoriteCount), 0) AS TotalPostsFavoriteCount,
+        COALESCE(SUM(P.Score), 0) AS TotalPostsScore,
+        (CAST(U.UpVotes AS NUMERIC) - U.DownVotes) * 1.0 / NULLIF(U.UpVotes + U.DownVotes, 0) AS OverallVoteRatio,
+        -- Correlated subquery for average score of their accepted answers
+        (SELECT AVG(SubP.Score)
+         FROM Posts AS SubP
+         WHERE SubP.OwnerUserId = U.Id
+           AND SubP.PostTypeId = 2
+           AND SubP.Id = (SELECT SubQ.AcceptedAnswerId FROM Posts AS SubQ WHERE SubQ.Id = SubP.ParentId)) AS AvgAcceptedAnswerScore
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    LEFT JOIN Badges AS B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Location, U.UpVotes, U.DownVotes
+),
+PostComplexMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount AS PostCommentCount,
+        P.FavoriteCount,
+        P.AcceptedAnswerId,
+        P.LastEditDate,
+        P.LastActivityDate,
+        P.ClosedDate,
+        P.Tags,
+        CASE WHEN P.AcceptedAnswerId IS NOT NULL THEN TRUE ELSE FALSE END AS HasAcceptedAnswer,
+        DATE_PART('day', P.LastActivityDate - P.CreationDate) AS DaysSinceCreationToLastActivity,
+        -- Calculate average comment score for this post, handling potential NULLs
+        COALESCE((SELECT AVG(CAST(C.Score AS NUMERIC)) FROM Comments AS C WHERE C.PostId = P.Id), 0.0) AS AvgCommentScoreForPost,
+        -- Extract tag count
+        ARRAY_LENGTH(STRING_TO_ARRAY(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><'), 1) AS TagCount,
+        -- Window function: Rank posts by score within each post type, partitioned by owner
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId, P.PostTypeId ORDER BY P.Score DESC, P.CreationDate DESC) AS OwnerPostScoreRank,
+        -- Window function: Lag to find time difference to previous post by same user
+        LAG(P.CreationDate) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate) AS PreviousPostCreationDate,
+        COALESCE(P.ViewCount * 1.0 / NULLIF(P.AnswerCount, 0), 0.0) AS ViewToAnswerRatio
+    FROM Posts AS P
+    WHERE P.PostTypeId IN (1, 2) -- Focusing on Questions and Answers
+      AND P.CreationDate >= '2020-01-01' -- Filter for recent posts for performance
+      AND P.LastActivityDate IS NOT NULL
+),
+HighlyEngagedUsers AS (
+    SELECT
+        UAS.UserId,
+        UAS.DisplayName,
+        UAS.Reputation,
+        UAS.TotalPosts,
+        UAS.TotalComments,
+        COUNT(PCM.PostId) AS HighlyScoredPosts,
+        SUM(CASE WHEN PCM.HasAcceptedAnswer THEN 1 ELSE 0 END) AS AcceptedAnswersCount,
+        -- Aggregate average view-to-answer ratio for their questions
+        AVG(CASE WHEN PCM.PostTypeId = 1 THEN PCM.ViewToAnswerRatio ELSE NULL END) AS AvgQuestionViewToAnswerRatio,
+        -- Correlated subquery to find if user has ever closed a post (via PostHistoryType 10)
+        EXISTS (
+            SELECT 1
+            FROM PostHistory PH
+            WHERE PH.UserId = UAS.UserId
+              AND PH.PostHistoryTypeId = 10
+        ) AS HasClosedPostEver
+    FROM UserActivitySummary AS UAS
+    INNER JOIN PostComplexMetrics AS PCM ON UAS.UserId = PCM.OwnerUserId
+    WHERE PCM.PostScore >= 5
+      AND PCM.PostCommentCount >= 3
+      AND PCM.OwnerPostScoreRank <= 10 -- Only consider top 10 posts by score for each owner/type
+    GROUP BY UAS.UserId, UAS.DisplayName, UAS.Reputation, UAS.TotalPosts, UAS.TotalComments, UAS.OverallVoteRatio
+    HAVING COUNT(PCM.PostId) > 10 -- Users with at least 10 highly scored posts
+),
+PostTagAnalysis AS (
+    SELECT
+        PCM.PostId,
+        PCM.PostTypeId,
+        PCM.OwnerUserId,
+        PCM.PostScore,
+        PCM.TagCount,
+        -- Use string_to_array to expand tags, then unnest for individual tag analysis
+        UNNEST(STRING_TO_ARRAY(SUBSTRING(PCM.Tags, 2, LENGTH(PCM.Tags) - 2), '><')) AS TagName
+    FROM PostComplexMetrics AS PCM
+    WHERE PCM.Tags IS NOT NULL AND LENGTH(PCM.Tags) > 2
+),
+SpecialPosters AS (
+    -- Users who ONLY posted Questions and never Answers (using set operator)
+    SELECT P.OwnerUserId AS UserId
+    FROM Posts P
+    WHERE P.PostTypeId = 1
+    GROUP BY P.OwnerUserId
+    EXCEPT
+    SELECT P.OwnerUserId AS UserId
+    FROM Posts P
+    WHERE P.PostTypeId = 2
+    GROUP BY P.OwnerUserId
+)
+-- Main query combining all CTEs and adding more complexity
+SELECT
+    HEU.DisplayName AS User_DisplayName,
+    HEU.Reputation AS User_Reputation,
+    UAS.Location AS User_Location,
+    UAS.TotalPosts AS User_TotalPosts,
+    UAS.TotalComments AS User_TotalComments,
+    HEU.HighlyScoredPosts AS User_HighlyScoredPosts,
+    HEU.AcceptedAnswersCount AS User_AcceptedAnswersCount,
+    HEU.AvgQuestionViewToAnswerRatio AS User_AvgQuestionViewToAnswerRatio,
+    UAS.GoldBadges AS User_GoldBadges,
+    UAS.SilverBadges AS User_SilverBadges,
+    UAS.BronzeBadges AS User_BronzeBadges,
+    UAS.OverallVoteRatio AS User_OverallVoteRatio,
+    UAS.AvgAcceptedAnswerScore AS User_AvgAcceptedAnswerScore,
+    DATE_PART('day', UAS.LastAccessDate - UAS.UserCreationDate) AS DaysSinceCreationForUser,
+    MAX(PCM.PostScore) AS MaxPostScore,
+    AVG(PCM.ViewCount) AS AvgPostViewCount,
+    SUM(CASE WHEN PCM.HasAcceptedAnswer THEN 1 ELSE 0 END) AS PostsWithAcceptedAnswers,
+    COUNT(DISTINCT PTA.TagName) AS DistinctTagsContributed,
+    -- String aggregation of common tags for this user from their highly scored posts
+    (SELECT STRING_AGG(DISTINCT TA.TagName, ', ')
+     FROM PostTagAnalysis TA
+     WHERE TA.OwnerUserId = HEU.UserId
+       AND TA.PostId IN (SELECT PCM2.PostId FROM PostComplexMetrics PCM2 WHERE PCM2.OwnerUserId = HEU.UserId AND PCM2.PostScore >= 5 AND PCM2.PostCommentCount >= 3)) AS CommonTags,
+    -- Check for users whose last post was a question and it was never closed
+    MAX(CASE WHEN PCM.PostTypeId = 1
+              AND PCM.PostId = (SELECT MAX(P3.Id) FROM Posts P3 WHERE P3.OwnerUserId = HEU.UserId)
+              AND PCM.ClosedDate IS NULL THEN 'Recent Question Unclosed' ELSE 'Other' END) AS RecentPostStatus,
+    -- Complex calculation: Reputation normalized by total activity days * gold badges count (with NULL handling)
+    (CAST(HEU.Reputation AS NUMERIC) / NULLIF(DATE_PART('day', UAS.LastAccessDate - UAS.UserCreationDate) + 1, 0)) * COALESCE(UAS.GoldBadges, 1) AS ReputationActivityEfficiency,
+    -- Conditional check using an EXISTS subquery combined with a JOIN
+    CASE WHEN HEU.HasClosedPostEver THEN 'Moderator-like' ELSE 'Contributor' END AS UserRoleClassification,
+    -- Classify user based on SpecialPosters CTE
+    CASE WHEN SP.UserId IS NOT NULL THEN 'Question-Only Poster' ELSE 'Mixed Poster' END AS UserPostingType,
+    -- Average days between posts for this user, excluding the first one
+    AVG(CASE WHEN PCM.PreviousPostCreationDate IS NOT NULL THEN DATE_PART('day', PCM.PostCreationDate - PCM.PreviousPostCreationDate) ELSE NULL END) AS AvgDaysBetweenPosts,
+    -- Subquery to find the most upvoted comment by this user
+    (SELECT C.Text
+     FROM Comments C
+     WHERE C.UserId = HEU.UserId
+     ORDER BY C.Score DESC, C.CreationDate DESC
+     LIMIT 1) AS TopCommentText
+FROM HighlyEngagedUsers AS HEU
+LEFT JOIN UserActivitySummary AS UAS ON HEU.UserId = UAS.UserId
+LEFT JOIN PostComplexMetrics AS PCM ON HEU.UserId = PCM.OwnerUserId
+LEFT JOIN PostTagAnalysis AS PTA ON HEU.UserId = PTA.OwnerUserId AND PCM.PostId = PTA.PostId -- Join PTA to filter tags to highly engaged posts
+LEFT JOIN SpecialPosters AS SP ON HEU.UserId = SP.UserId -- New join for the set operator CTE
+WHERE UAS.Location IS NOT NULL
+  AND UAS.TotalPosts > 0
+  AND UAS.GoldBadges >= 1 -- Only consider users with at least one gold badge
+  AND HEU.Reputation > 5000
+  -- More complex predicate involving string expression and date comparison
+  AND (LOWER(UAS.Location) LIKE '%london%' OR (UAS.UserCreationDate >= '2022-01-01' AND UAS.LastAccessDate <= '2023-12-31'))
+GROUP BY
+    HEU.UserId, HEU.DisplayName, HEU.Reputation, UAS.Location, UAS.TotalPosts, UAS.TotalComments, HEU.HighlyScoredPosts,
+    HEU.AcceptedAnswersCount, HEU.AvgQuestionViewToAnswerRatio, UAS.GoldBadges, UAS.SilverBadges, UAS.BronzeBadges,
+    UAS.OverallVoteRatio, UAS.AvgAcceptedAnswerScore, UAS.UserCreationDate, UAS.LastAccessDate, HEU.HasClosedPostEver,
+    SP.UserId -- Include SP.UserId in GROUP BY since it's used in the SELECT list
+HAVING
+    COUNT(CASE WHEN PCM.PostTypeId = 1 AND PCM.HasAcceptedAnswer THEN 1 ELSE NULL END) >= 2 -- At least 2 questions with accepted answers
+    AND SUM(CASE WHEN PCM.AvgCommentScoreForPost > 1 THEN 1 ELSE 0 END) >= 3 -- At least 3 posts with average comment score > 1
+ORDER BY
+    ReputationActivityEfficiency DESC,
+    User_HighlyScoredPosts DESC
+LIMIT 100;

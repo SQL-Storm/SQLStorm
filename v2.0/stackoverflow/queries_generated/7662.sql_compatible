@@ -1,0 +1,188 @@
+WITH UserPostStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) as TotalQuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) as TotalAnswerScore,
+        MAX(p.CreationDate) as LastPostDate,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END) as AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE NULL END) as AvgAnswerScore,
+        COUNT(DISTINCT b.Id) as BadgesCount,
+        STRING_AGG(DISTINCT b.Name, ', ') as BadgeNames
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+QuestionStats AS (
+    SELECT 
+        p.Id as QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        p.AcceptedAnswerId,
+        CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END as HasAcceptedAnswer,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END as IsClosed,
+        -- Standard SQL: compute days difference using date subtraction
+        CAST(COALESCE(p.ClosedDate, TIMESTAMP '2024-10-01 12:34:56') AS DATE) - CAST(p.CreationDate AS DATE) as DaysOpen,
+        CASE WHEN p.Score > 0 THEN 
+            CASE WHEN p.AnswerCount = 0 THEN 'No Answers' 
+                 WHEN p.AnswerCount > 0 AND p.AcceptedAnswerId IS NULL THEN 'Unaccepted' 
+                 ELSE 'Accepted' END
+            ELSE 'No Score' 
+        END as QuestionStatus,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) as ScoreRank,
+        RANK() OVER (ORDER BY p.Score DESC) as GlobalScoreRank,
+        PERCENT_RANK() OVER (ORDER BY p.Score) as ScorePercentile
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+AnswerStats AS (
+    SELECT 
+        p.Id as AnswerId,
+        p.ParentId as QuestionId,
+        p.Score,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.LastActivityDate,
+        CASE WHEN p.OwnerUserId IS NOT NULL THEN 1 ELSE 0 END as IsOwner,
+        ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) as AnswerRank,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) as ScoreDenseRank,
+        NTILE(100) OVER (ORDER BY p.Score) as ScoreNtile
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE WHEN t.IsRequired = 1 THEN 'Required' ELSE 'Optional' END as TagType,
+        CASE WHEN t.Count >= 1000 THEN 'Popular' 
+             WHEN t.Count >= 100 THEN 'Moderate' 
+             ELSE 'Rare' END as TagPopularity,
+        LAG(t.Count) OVER (ORDER BY t.Count DESC) - t.Count as CountDifferenceFromPrevious
+    FROM Tags t
+),
+UserActivity AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT v.Id) as VoteCount,
+        COUNT(DISTINCT ph.Id) as PostHistoryCount,
+        COUNT(DISTINCT pl.Id) as PostLinkCount,
+        MAX(c.CreationDate) as LastComment,
+        MAX(v.CreationDate) as LastVote,
+        MAX(ph.CreationDate) as LastPostHistory,
+        MAX(pl.CreationDate) as LastPostLink,
+        CASE WHEN COUNT(DISTINCT c.Id) > 0 THEN 'Active' ELSE 'Inactive' END as CommentActivityStatus,
+        CASE WHEN COUNT(DISTINCT ph.Id) > 0 THEN 'Active' ELSE 'Inactive' END as HistoryActivityStatus
+    FROM Users u
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    LEFT JOIN PostLinks pl ON u.Id = pl.Id
+    GROUP BY u.Id, u.DisplayName
+)
+SELECT 
+    ups.UserId,
+    ups.DisplayName,
+    ups.Reputation,
+    ups.TotalPosts,
+    ups.Questions,
+    ups.Answers,
+    ups.TotalQuestionScore,
+    ups.TotalAnswerScore,
+    ups.AvgQuestionScore,
+    ups.AvgAnswerScore,
+    ups.BadgesCount,
+    ups.BadgeNames,
+    qs.QuestionId,
+    qs.Title,
+    qs.Score as QuestionScore,
+    qs.ViewCount,
+    qs.AnswerCount,
+    qs.CommentCount,
+    qs.DaysOpen,
+    qs.QuestionStatus,
+    qs.ScoreRank,
+    qs.GlobalScoreRank,
+    qs.ScorePercentile,
+    as1.AnswerId,
+    as1.Score as AnswerScore,
+    as1.AnswerRank,
+    as1.ScoreDenseRank,
+    as1.ScoreNtile,
+    ta.TagName,
+    ta.TagCount,
+    ta.TagType,
+    ta.TagPopularity,
+    ua.CommentCount,
+    ua.VoteCount,
+    ua.PostHistoryCount,
+    ua.PostLinkCount,
+    ua.CommentActivityStatus,
+    ua.HistoryActivityStatus,
+    CASE WHEN ups.Reputation > 10000 AND ups.TotalPosts > 100 THEN 'Elite' 
+         WHEN ups.Reputation > 1000 AND ups.TotalPosts > 10 THEN 'Active' 
+         ELSE 'Regular' END as UserTier,
+    CASE WHEN qs.Score > 100 THEN 'Highly Rated'
+         WHEN qs.Score > 50 THEN 'Mid Rated'
+         WHEN qs.Score > 0 THEN 'Low Rated'
+         ELSE 'No Score' END as QuestionQuality,
+    CASE WHEN COALESCE(ups.AvgQuestionScore, 0) > 20 THEN 'Top Questioner'
+         WHEN COALESCE(ups.AvgAnswerScore, 0) > 10 THEN 'Top Answerer'
+         ELSE 'Regular User' END as ContributionLevel,
+    CONCAT(ups.DisplayName, ' - ', ups.Reputation, ' rep') as UserReputationDisplay,
+    CONCAT('Q', qs.QuestionId, ': ', qs.Title) as QuestionDisplay,
+    CASE WHEN ups.BadgesCount > 50 THEN 'Veteran'
+         WHEN ups.BadgesCount > 25 THEN 'Experienced'
+         WHEN ups.BadgesCount > 10 THEN 'Intermediate'
+         ELSE 'Beginner' END as BadgeLevel,
+    CASE WHEN qs.IsClosed = 1 AND qs.DaysOpen > 30 THEN 'Long Closed'
+         WHEN qs.IsClosed = 1 THEN 'Recently Closed'
+         ELSE 'Open' END as QuestionLifecycleState,
+    COALESCE(ups.BadgeNames, 'None') as UserBadges,
+    CASE WHEN qs.QuestionId IS NOT NULL AND as1.AnswerId IS NOT NULL THEN 'Q&A Pair'
+         WHEN qs.QuestionId IS NOT NULL THEN 'Question Only'
+         WHEN as1.AnswerId IS NOT NULL THEN 'Answer Only'
+         ELSE 'None' END as ContentStatus,
+    ABS(ups.TotalQuestionScore - ups.TotalAnswerScore) as ScoreDifference,
+    DENSE_RANK() OVER (ORDER BY ABS(ups.TotalQuestionScore - ups.TotalAnswerScore) DESC) as ScoreDifferenceRank,
+    PERCENT_RANK() OVER (ORDER BY ups.Reputation) as ReputationPercentile
+FROM UserPostStats ups
+LEFT JOIN QuestionStats qs ON ups.UserId = qs.OwnerUserId AND qs.ScoreRank <= 5
+LEFT JOIN AnswerStats as1 ON qs.QuestionId = as1.QuestionId AND as1.AnswerRank <= 3
+LEFT JOIN (
+    SELECT DISTINCT 
+        ta1.TagName,
+        ta1.Count as TagCount,
+        ta1.IsRequired,
+        ta1.IsModeratorOnly,
+        ta1.WikiPostId,
+        ta1.ExcerptPostId
+    FROM Tags ta1
+    WHERE ta1.Count > 50
+) ta ON ta.TagName IN (
+    SELECT unnest(string_to_array(qs.Tags, '><')) 
+    FROM Questions qs 
+    WHERE qs.QuestionId = qs.QuestionId
+)
+LEFT JOIN UserActivity ua ON ups.UserId = ua.UserId
+WHERE ups.TotalPosts > 0
+  AND (ups.Questions > 0 OR ups.Answers > 0)
+  AND (qs.QuestionId IS NOT NULL OR as1.AnswerId IS NOT NULL OR ta.TagName IS NOT NULL)
+ORDER BY ups.Reputation DESC, ups.TotalPosts DESC, qs.Score DESC
+LIMIT 1000;

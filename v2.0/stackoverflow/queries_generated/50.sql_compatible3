@@ -1,0 +1,54 @@
+select
+    h.*,
+    dense_rank() over (order by h.FinalScore desc, h.ViewCount desc nulls last, h.QuestionId) as GlobalRank,
+    dense_rank() over (partition by coalesce(h.AskerRepBand,'Newbie') order by h.FinalScore desc) as RankInBand
+  from highlights h
+)
+select
+  r.GlobalRank,
+  r.RankInBand,
+  r.QuestionId,
+  r.AskedAt,
+  r.AskerId,
+  coalesce(r.AskerName, concat('user#', cast(r.AskerId as text))) as AskerName,
+  coalesce(r.AskerLocation, 'Unknown') as AskerLocation,
+  coalesce(r.AskerRepBand, 'Newbie') as AskerRepBand,
+  round(coalesce(r.AskerPerfScore,0), 3) as AskerPerfScore,
+  r.TagsCsv,
+  r.TagDiversity,
+  r.QuestionScore,
+  r.ViewCount,
+  r.FavoriteCombined,
+  r.AnswerTotal,
+  r.AcceptedCount,
+  r.MaxAnswerScore,
+  round(coalesce(r.AvgAnswerScore,0), 3) as AvgAnswerScore,
+  r.UpVotes,
+  r.DownVotes,
+  r.BountySum,
+  r.DuplicateLinks,
+  r.RelatedLinks,
+  r.CommentCount,
+  r.CommentScoreSum,
+  r.WasEverClosed,
+  r.WasEverReopened,
+  r.WasEverProtected,
+  round(coalesce(r.SecsPerAnswerUntilFirstLink,0), 3) as SecsPerAnswerUntilFirstLink,
+  round(coalesce(r.HoursUntilLastComment,0), 3) as HoursUntilLastComment,
+  r.IsControversial,
+  r.HasStrongAnswer,
+  r.TagCountForRoll,
+  r.BestFavRankInAnyTag,
+  round(coalesce(r.MeanTagAvgScore,0), 3) as MeanTagAvgScore,
+  r.MaxP90ViewsAmongTags,
+  round(r.FinalScore, 3) as FinalScore
+from ranked r
+where
+  (r.FinalScore > 0 and coalesce(r.TagDiversity,0) >= 1)
+  and not (r.WasEverClosed and r.WasEverReopened = false and coalesce(r.ViewCount,0) < 500)
+  and (
+    (r.AskerRepBand in ('Veteran','Legend') and r.AnswerTotal >= 1)
+    or (r.AskerRepBand not in ('Veteran','Legend') and coalesce(r.UpVotes,0) - coalesce(r.DownVotes,0) >= 0)
+  )
+order by r.GlobalRank, r.QuestionId
+limit 200;

@@ -1,0 +1,238 @@
+WITH UserEngagementSummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.UpVotes AS UserUpvotesGiven,
+        U.DownVotes AS UserDownvotesGiven,
+        U.Views AS UserProfileViews,
+        COUNT(DISTINCT P.Id) AS TotalPostsCreated,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(P.ViewCount) AS SumPostViews,
+        SUM(P.Score) AS SumPostScore,
+        SUM(COALESCE(P.FavoriteCount, 0)) AS SumPostFavorites,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        MAX(PH.CreationDate) AS LastPostHistoryEvent,
+        (SELECT COUNT(DISTINCT Q_sub.Id)
+         FROM Posts Q_sub
+         WHERE Q_sub.OwnerUserId = U.Id
+           AND Q_sub.PostTypeId = 1
+           AND Q_sub.AcceptedAnswerId IS NOT NULL
+        ) AS QuestionsWithAcceptedAnswers,
+        (SELECT SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END)
+         FROM Votes V
+         WHERE V.PostId IN (SELECT P_sub.Id FROM Posts P_sub WHERE P_sub.OwnerUserId = U.Id)
+           AND V.VoteTypeId = 2
+        ) AS TotalUpvotesReceivedOnPosts,
+        (SELECT SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END)
+         FROM Votes V
+         WHERE V.PostId IN (SELECT P_sub.Id FROM Posts P_sub WHERE P_sub.OwnerUserId = U.Id)
+           AND V.VoteTypeId = 3
+        ) AS TotalDownvotesReceivedOnPosts
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN PostHistory PH ON U.Id = PH.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate,
+        U.UpVotes, U.DownVotes, U.Views
+),
+PostContentMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.CreationDate,
+        P.LastActivityDate,
+        P.FavoriteCount,
+        P.CommentCount,
+        P.AnswerCount,
+        LENGTH(COALESCE(P.Body, '')) AS BodyLength,
+        LENGTH(COALESCE(P.Title, '')) AS TitleLength,
+        COALESCE(array_length(string_to_array(substring(P.Tags FROM 2 FOR char_length(P.Tags) - 2), '><'), 1), 0) AS TagCount,
+        COUNT(DISTINCT C_ext.Id) AS ExternalCommentCount,
+        AVG(CASE WHEN A.PostTypeId = 2 THEN A.Score END) AS AvgAnswerScore,
+        MAX(CASE WHEN A.PostTypeId = 2 THEN A.CreationDate END) AS LatestAnswerDate,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS TotalEditsToPostContent,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (10, 101, 102, 103, 104, 105) THEN 1 ELSE 0 END) AS WasClosedFlag,
+        COALESCE(P.ClosedDate, TIMESTAMP '1900-01-01 00:00:00') AS ActualClosedDate
+    FROM Posts P
+    LEFT JOIN Comments C_ext ON P.Id = C_ext.PostId AND C_ext.UserId != P.OwnerUserId
+    LEFT JOIN Posts A ON P.Id = A.ParentId AND A.PostTypeId = 2
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    GROUP BY
+        P.Id, P.PostTypeId, P.OwnerUserId, P.Score, P.ViewCount, P.CreationDate, P.LastActivityDate,
+        P.FavoriteCount, P.CommentCount, P.AnswerCount, P.Body, P.Title, P.Tags, P.ClosedDate
+),
+TagPerformance AS (
+    SELECT
+        T.TagName,
+        COUNT(PTA.PostId) AS TaggedPostsCount,
+        SUM(PTA.PostScore) AS TotalTagScore,
+        AVG(PTA.PostScore) AS AverageTagPostScore,
+        COUNT(DISTINCT PTA.OwnerUserId) AS UniqueContributorsToTag,
+        RANK() OVER (ORDER BY COUNT(PTA.PostId) DESC, SUM(PTA.PostScore) DESC) AS TagPopularityRank
+    FROM Tags T
+    INNER JOIN (
+        SELECT
+            P.Id AS PostId,
+            P.Score AS PostScore,
+            P.OwnerUserId,
+            TRIM(value) AS TagName
+        FROM Posts P,
+        LATERAL (
+            SELECT regexp_split_to_table(substring(P.Tags FROM 2 FOR char_length(P.Tags) - 2), '><') AS value
+        ) s
+        WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL AND char_length(P.Tags) > 2
+    ) PTA ON T.TagName = PTA.TagName
+    GROUP BY T.TagName
+),
+UserPostHistoryAggregates AS (
+    SELECT
+        PH.UserId,
+        PH.PostId,
+        COUNT(PH.Id) AS EditCountForPost,
+        MAX(PH.CreationDate) AS LatestEditDate,
+        MIN(PH.CreationDate) AS FirstEditDate,
+        EXTRACT(EPOCH FROM (MAX(PH.CreationDate) - MIN(PH.CreationDate))) / 3600.0 AS TimeSpanBetweenFirstAndLastEditHours,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (1,2,3) THEN PH.Id END) AS InitialContentHistoryEntries,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (4,5,6) THEN PH.Id END) AS ContentEditHistoryEntries,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (10,11,12,13,14,15,19,20,35) THEN PH.Id END) AS StatusChangeHistoryEntries,
+        (SELECT COUNT(*) FROM PostLinks PL WHERE PL.PostId = PH.PostId AND PL.LinkTypeId = 3) AS DuplicateLinksFromPostCount,
+        (SELECT COUNT(*) FROM PostLinks PL WHERE PL.RelatedPostId = PH.PostId AND PL.LinkTypeId = 3) AS IsDuplicatedByCount
+    FROM PostHistory PH
+    WHERE PH.UserId IS NOT NULL
+    GROUP BY PH.UserId, PH.PostId
+),
+UserActivityAndRankings AS (
+    SELECT
+        UES.UserId,
+        UES.DisplayName,
+        UES.Reputation,
+        UES.TotalPostsCreated,
+        UES.TotalQuestions,
+        UES.TotalAnswers,
+        UES.TotalCommentsMade,
+        UES.TotalBadges,
+        UES.SumPostScore,
+        UES.SumPostFavorites,
+        UES.TotalUpvotesReceivedOnPosts,
+        UES.TotalDownvotesReceivedOnPosts,
+        UES.QuestionsWithAcceptedAnswers,
+        UES.UserCreationDate,
+        UES.LastAccessDate,
+        (SELECT COUNT(DISTINCT V.PostId)
+         FROM Votes V
+         WHERE V.UserId = UES.UserId
+           AND V.VoteTypeId = 2
+           AND V.CreationDate >= UES.LastAccessDate - INTERVAL '30 days'
+        ) AS RecentUpvotesGiven,
+        (SELECT COUNT(DISTINCT V.PostId)
+         FROM Votes V
+         WHERE V.UserId = UES.UserId
+           AND V.VoteTypeId = 3
+           AND V.CreationDate >= UES.LastAccessDate - INTERVAL '30 days'
+        ) AS RecentDownvotesGiven,
+        SUM(PCM.PostScore) OVER (PARTITION BY UES.UserId) AS UserTotalPostScoreAgg,
+        AVG(PCM.ViewCount) OVER (PARTITION BY UES.UserId) AS UserAvgPostViews,
+        COUNT(UPHA.PostId) OVER (PARTITION BY UES.UserId, UPHA.PostId) AS UniquePostsWithHistoryEdits_marker,
+        SUM(UPHA.EditCountForPost) OVER (PARTITION BY UES.UserId) AS TotalPostEditsByUser,
+        NTILE(10) OVER (ORDER BY UES.Reputation DESC, UES.TotalUpvotesReceivedOnPosts DESC) AS ReputationDecileRank,
+        ROW_NUMBER() OVER (PARTITION BY UES.UserId ORDER BY UPHA.LatestEditDate DESC, UPHA.PostId DESC) AS rn_post_history_for_user_filter
+    FROM UserEngagementSummary UES
+    LEFT JOIN PostContentMetrics PCM ON UES.UserId = PCM.OwnerUserId
+    LEFT JOIN UserPostHistoryAggregates UPHA ON UES.UserId = UPHA.UserId
+    WHERE UES.Reputation >= 100
+),
+UserHistoryDistinctCounts AS (
+    SELECT
+        UserId,
+        SUM(CASE WHEN UniquePostsWithHistoryEdits_marker IS NOT NULL THEN 1 ELSE 0 END) AS UniquePostsWithHistoryEdits,
+        SUM(TotalPostEditsByUser) AS TotalPostEditsByUser,
+        MAX(rn_post_history_for_user_filter) AS rn_post_history_for_user_filter,
+        MAX(ReputationDecileRank) AS ReputationDecileRank,
+        MAX(UserTotalPostScoreAgg) AS UserTotalPostScoreAgg,
+        MAX(UserAvgPostViews) AS UserAvgPostViews,
+        MAX(DisplayName) AS DisplayName,
+        MAX(Reputation) AS Reputation,
+        MAX(TotalPostsCreated) AS TotalPostsCreated,
+        MAX(TotalQuestions) AS TotalQuestions,
+        MAX(TotalAnswers) AS TotalAnswers,
+        MAX(TotalCommentsMade) AS TotalCommentsMade,
+        MAX(TotalBadges) AS TotalBadges,
+        MAX(SumPostScore) AS SumPostScore,
+        MAX(SumPostFavorites) AS SumPostFavorites,
+        MAX(TotalUpvotesReceivedOnPosts) AS TotalUpvotesReceivedOnPosts,
+        MAX(TotalDownvotesReceivedOnPosts) AS TotalDownvotesReceivedOnPosts,
+        MAX(QuestionsWithAcceptedAnswers) AS QuestionsWithAcceptedAnswers,
+        MAX(UserCreationDate) AS UserCreationDate,
+        MAX(LastAccessDate) AS LastAccessDate,
+        MAX(RecentUpvotesGiven) AS RecentUpvotesGiven,
+        MAX(RecentDownvotesGiven) AS RecentDownvotesGiven
+    FROM UserActivityAndRankings
+    GROUP BY UserId
+)
+SELECT
+    URA.UserId,
+    URA.DisplayName,
+    URA.Reputation,
+    URA.TotalPostsCreated,
+    URA.TotalQuestions,
+    URA.TotalAnswers,
+    URA.TotalCommentsMade,
+    URA.TotalBadges,
+    URA.SumPostScore,
+    URA.SumPostFavorites,
+    URA.TotalUpvotesReceivedOnPosts,
+    URA.TotalDownvotesReceivedOnPosts,
+    URA.QuestionsWithAcceptedAnswers,
+    URA.RecentUpvotesGiven,
+    URA.RecentDownvotesGiven,
+    URA.UserAvgPostViews,
+    UHC.UniquePostsWithHistoryEdits,
+    UHC.TotalPostEditsByUser,
+    UHC.ReputationDecileRank,
+    (
+        SELECT
+            TRIM(value) AS Tag
+        FROM Posts P,
+        LATERAL (
+            SELECT regexp_split_to_table(substring(P.Tags FROM 2 FOR char_length(P.Tags) - 2), '><') AS value
+        ) s
+        WHERE P.OwnerUserId = URA.UserId
+          AND P.PostTypeId = 1
+          AND P.Tags IS NOT NULL AND char_length(P.Tags) > 2
+        GROUP BY Trim(value)
+        ORDER BY COUNT(P.Id) DESC, SUM(P.Score) DESC
+        LIMIT 1
+    ) AS MostFrequentTagByPostsAndScore,
+    TP.TagName AS TopOverallPopularTag,
+    TP.TaggedPostsCount AS TopOverallPopularTagPosts,
+    TP.TotalTagScore AS TopOverallPopularTagScore,
+    TP.TagPopularityRank AS TopOverallPopularTagRank,
+    CAST(URA.QuestionsWithAcceptedAnswers AS DECIMAL) / COALESCE(NULLIF(URA.TotalQuestions, 0), 1.0) AS AcceptedAnswerRatio,
+    CAST(URA.TotalUpvotesReceivedOnPosts AS DECIMAL) / COALESCE(NULLIF(URA.TotalPostsCreated, 0), 1.0) AS AvgUpvotesPerPost,
+    CASE
+        WHEN URA.Reputation > 5000 AND URA.TotalQuestions > 10 AND URA.QuestionsWithAcceptedAnswers > 5 THEN 'Guru'
+        WHEN URA.Reputation > 1000 AND URA.TotalAnswers > 20 AND URA.SumPostScore > 100 THEN 'Expert'
+        WHEN URA.Reputation > 200 AND URA.TotalPostsCreated > 5 THEN 'Contributor'
+        ELSE 'Novice'
+    END AS UserCategory,
+    'Complex StackOverflow User Benchmark Query v1.0' AS QueryIdentifier,
+    AGE(TIMESTAMP '2024-10-01 12:34:56', URA.UserCreationDate) AS UserAge
+FROM UserHistoryDistinctCounts UHC
+JOIN UserActivityAndRankings URA ON UHC.UserId = URA.UserId
+LEFT JOIN TagPerformance TP ON TP.TagPopularityRank = 1
+WHERE URA.rn_post_history_for_user_filter = 1
+  AND UHC.ReputationDecileRank <= 3
+  AND UHC.UserCreationDate < (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '5 year')
+  AND UHC.TotalPostsCreated > 0
+ORDER BY UHC.Reputation DESC, UHC.TotalUpvotesReceivedOnPosts DESC, UHC.TotalPostsCreated DESC
+LIMIT 1000;

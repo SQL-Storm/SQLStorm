@@ -1,0 +1,217 @@
+-- {"query": "3737.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1974} 
+
+/*  Performance‑heavy benchmark query on the StackOverflow schema  */
+WITH
+-- 1. Recent activity per user (last post, last comment, last vote)
+user_last_activity AS (
+    SELECT
+        u.Id                               AS user_id,
+        MAX(p.CreationDate)                AS last_post_dt,
+        MAX(c.CreationDate)                AS last_comment_dt,
+        MAX(v.CreationDate)                AS last_vote_dt,
+        COUNT(*) FILTER (WHERE p.Id IS NOT NULL)      AS post_cnt,
+        COUNT(*) FILTER (WHERE c.Id IS NOT NULL)      AS comment_cnt,
+        COUNT(*) FILTER (WHERE v.Id IS NOT NULL)      AS vote_cnt
+    FROM Users u
+    LEFT JOIN Posts p     ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c  ON c.UserId = u.Id
+    LEFT JOIN Votes v     ON v.UserId = u.Id
+    GROUP BY u.Id
+),
+
+-- 2. Badge aggregation per user, with conditional class weighting
+user_badge_score AS (
+    SELECT
+        b.UserId                                 AS user_id,
+        SUM(
+            CASE b.Class
+                WHEN 1 THEN 1000   -- Gold
+                WHEN 2 THEN 500    -- Silver
+                WHEN 3 THEN 100    -- Bronze
+                ELSE 0
+            END
+        )                                        AS badge_score,
+        STRING_AGG(DISTINCT b.Name, ', ')        AS badge_list
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+-- 3. Tag‑wise question/answer stats, using a correlated subquery for the latest answer date
+tag_stats AS (
+    SELECT
+        t.Id                                     AS tag_id,
+        t.TagName,
+        t.Count                                  AS tag_total_posts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS question_cnt,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS answer_cnt,
+        MAX(
+            (SELECT MAX(p2.CreationDate)
+             FROM Posts p2
+             WHERE p2.ParentId = p.Id
+               AND p2.PostTypeId = 2)
+        )                                        AS latest_answer_dt
+    FROM Tags t
+    LEFT JOIN Posts p
+        ON p.Tags LIKE '%' || t.TagName || '%'
+        AND p.PostTypeId IN (1,2)   -- questions & answers
+    GROUP BY t.Id, t.TagName, t.Count
+),
+
+-- 4. Posts enriched with vote aggregates and close‑reason decoding
+post_enriched AS (
+    SELECT
+        p.Id                                         AS post_id,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        COALESCE(p.Tags, '')                         AS tags_raw,
+        /* Extract first tag for quick lookup */
+        COALESCE(
+            NULLIF(
+                SUBSTRING(p.Tags FROM '\<([^>]+)\>'), ''
+            ),
+            NULL
+        )                                            AS first_tag,
+        /* Vote aggregates */
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id) AS upvote_cnt,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id) AS downvote_cnt,
+        /* Close reason (if any) decoded via JSON text field in PostHistory */
+        MAX(
+            CASE 
+                WHEN ph.PostHistoryTypeId = 10 THEN
+                    COALESCE(
+                        (ph.Comment)::jsonb->>'CloseReasonId',
+                        '0'
+                    )::int
+                ELSE NULL
+            END
+        ) OVER (PARTITION BY p.Id)                 AS close_reason_id,
+        /* Flags whether post has been edited after creation */
+        CASE 
+            WHEN EXISTS (
+                SELECT 1 FROM PostHistory ph2
+                WHERE ph2.PostId = p.Id
+                  AND ph2.PostHistoryTypeId IN (4,5,6)  -- any edit type
+                  AND ph2.CreationDate > p.CreationDate
+            ) THEN 1 ELSE 0
+        END                                          AS has_edits
+    FROM Posts p
+    LEFT JOIN Votes v
+        ON v.PostId = p.Id
+    LEFT JOIN PostHistory ph
+        ON ph.PostId = p.Id
+    WHERE p.PostTypeId IN (1,2)   -- only Q&A
+),
+
+-- 5. Recent duplicate links (duplicate relationships) as a set
+duplicate_links AS (
+    SELECT
+        pl.PostId          AS source_post_id,
+        pl.RelatedPostId   AS target_post_id,
+        pl.CreationDate    AS link_dt
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 3          -- Duplicate
+),
+
+-- 6. Combine users with activity, badges and recent duplicate involvement
+user_profile AS (
+    SELECT
+        u.Id                            AS user_id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(ua.last_post_dt, '1970-01-01')    AS last_post_dt,
+        COALESCE(ua.last_comment_dt, '1970-01-01') AS last_comment_dt,
+        COALESCE(ua.last_vote_dt, '1970-01-01')    AS last_vote_dt,
+        ua.post_cnt,
+        ua.comment_cnt,
+        ua.vote_cnt,
+        COALESCE(ub.badge_score,0)                AS badge_score,
+        ub.badge_list,
+        /* Users who authored a post that is a duplicate of another */
+        EXISTS (
+            SELECT 1 FROM duplicate_links dl
+            JOIN Posts p ON p.Id = dl.source_post_id
+            WHERE p.OwnerUserId = u.Id
+        )                                          AS is_duplicate_author
+    FROM Users u
+    LEFT JOIN user_last_activity ua ON ua.user_id = u.Id
+    LEFT JOIN user_badge_score ub    ON ub.user_id = u.Id
+),
+
+-- 7. Top active users per month (window function with ROW_NUMBER)
+monthly_top_users AS (
+    SELECT
+        up.user_id,
+        up.DisplayName,
+        DATE_TRUNC('month', up.last_post_dt) AS month,
+        up.post_cnt,
+        ROW_NUMBER() OVER (PARTITION BY DATE_TRUNC('month', up.last_post_dt)
+                           ORDER BY up.post_cnt DESC,
+                                            up.badge_score DESC) AS rn
+    FROM user_profile up
+    WHERE up.last_post_dt > '2020-01-01'
+)
+
+-- Final result: a UNION of two heavy result sets
+SELECT
+    'USER_PROFILE'        AS result_type,
+    up.user_id,
+    up.DisplayName,
+    up.Reputation,
+    up.last_post_dt,
+    up.last_comment_dt,
+    up.last_vote_dt,
+    up.post_cnt,
+    up.comment_cnt,
+    up.vote_cnt,
+    up.badge_score,
+    up.badge_list,
+    up.is_duplicate_author,
+    NULL                  AS tag_id,
+    NULL                  AS tag_name,
+    NULL                  AS question_cnt,
+    NULL                  AS answer_cnt,
+    NULL                  AS latest_answer_dt,
+    NULL                  AS post_id,
+    NULL                  AS post_type,
+    NULL                  AS title,
+    NULL                  AS upvote_cnt,
+    NULL                  AS downvote_cnt,
+    NULL                  AS close_reason_id,
+    NULL                  AS has_edits
+FROM user_profile up
+
+UNION ALL
+
+SELECT
+    'MONTHLY_TOP'          AS result_type,
+    mt.user_id,
+    mt.DisplayName,
+    NULL                  AS Reputation,
+    mt.month               AS last_post_dt,
+    NULL                  AS last_comment_dt,
+    NULL                  AS last_vote_dt,
+    mt.post_cnt,
+    NULL                  AS comment_cnt,
+    NULL                  AS vote_cnt,
+    NULL                  AS badge_score,
+    NULL                  AS badge_list,
+    NULL                  AS is_duplicate_author,
+    NULL                  AS tag_id,
+    NULL                  AS tag_name,
+    NULL                  AS question_cnt,
+    NULL                  AS answer_cnt,
+    NULL                  AS latest_answer_dt,
+    NULL                  AS post_id,
+    NULL                  AS post_type,
+    NULL                  AS title,
+    NULL                  AS upvote_cnt,
+    NULL                  AS downvote_cnt,
+    NULL                  AS close_reason_id,
+    NULL                  AS has_edits
+FROM monthly_top_users mt
+WHERE mt.rn <= 5
+
+ORDER BY result_type, last_post_dt DESC NULLS LAST, post_cnt DESC;

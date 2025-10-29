@@ -1,0 +1,242 @@
+-- {"query": "7746.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2567} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT c.Id) as Comments,
+        COUNT(DISTINCT b.Id) as Badges,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        MAX(b.Date) as LastBadgeDate,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Expert'
+            WHEN u.Reputation >= 1000 THEN 'Intermediate'
+            WHEN u.Reputation >= 100 THEN 'Beginner'
+            ELSE 'Newbie'
+        END as ReputationLevel,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) >= 1000 THEN 'Veteran'
+            WHEN COUNT(DISTINCT p.Id) >= 100 THEN 'Experienced'
+            WHEN COUNT(DISTINCT p.Id) >= 10 THEN 'Regular'
+            ELSE 'New'
+        END as PostingExperience,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        COALESCE(AVG(p.Score), 0) as AvgPostScore,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.ViewCount >= 1000 THEN p.Id END) as HighViewQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.Score >= 10 THEN p.Id END) as HighScoreAnswers,
+        DATEDIFF(day, u.CreationDate, cast('2024-10-01 12:34:56' as timestamp)) as DaysSinceRegistration,
+        DATEDIFF(day, u.CreationDate, COALESCE(MAX(p.CreationDate), u.CreationDate)) as ActiveDays
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate
+),
+TopTags AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        AVG(p.Score) as AvgPostScore,
+        COUNT(DISTINCT p.Id) as PostCount,
+        MAX(p.CreationDate) as LastPostDate,
+        STRING_AGG(DISTINCT u.DisplayName, ', ') as Contributors
+    FROM Tags t
+    INNER JOIN Posts p ON p.Tags LIKE '%' + t.TagName + '%'
+    INNER JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+    GROUP BY t.TagName, t.Count
+    HAVING COUNT(DISTINCT p.Id) >= 50
+),
+RankedUsers AS (
+    SELECT 
+        *,
+        ROW_NUMBER() OVER (ORDER BY TotalScore DESC, Reputation DESC) as RankByScore,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, TotalPosts DESC) as RankByReputation,
+        DENSE_RANK() OVER (ORDER BY DaysSinceRegistration DESC) as RankBySeniority,
+        PERCENT_RANK() OVER (ORDER BY TotalScore) as ScorePercentile
+    FROM UserActivityStats
+),
+QuestionAnalysis AS (
+    SELECT 
+        p.Id as QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        p.Tags,
+        CASE 
+            WHEN p.AnswerCount = 0 THEN 'Unanswered'
+            WHEN p.AnswerCount >= 1 AND p.AcceptedAnswerId IS NULL THEN 'Answered'
+            ELSE 'Accepted'
+        END as QuestionStatus,
+        CASE 
+            WHEN DATEDIFF(day, p.CreationDate, cast('2024-10-01 12:34:56' as timestamp)) <= 1 THEN 'New'
+            WHEN DATEDIFF(day, p.CreationDate, cast('2024-10-01 12:34:56' as timestamp)) <= 7 THEN 'Recent'
+            WHEN DATEDIFF(day, p.CreationDate, cast('2024-10-01 12:34:56' as timestamp)) <= 30 THEN 'Old'
+            ELSE 'Very Old'
+        END as AgeCategory,
+        DATEDIFF(day, p.CreationDate, COALESCE(p.ClosedDate, p.LastActivityDate, cast('2024-10-01 12:34:56' as timestamp))) as DurationDays,
+        COALESCE(p.ViewCount, 0) / NULLIF(COALESCE(p.AnswerCount, 0) + 1, 0) as ViewsPerAnswer,
+        COALESCE(p.Score, 0) - COALESCE(p.ViewCount, 0) * 0.01 as AdjustedScore,
+        COUNT(DISTINCT v.Id) as VoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) as Upvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) as Downvotes
+    FROM Posts p
+    INNER JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.CreationDate, p.OwnerUserId, u.DisplayName, p.Tags, p.AcceptedAnswerId, p.ClosedDate, p.LastActivityDate
+),
+ComplexQuestionStats AS (
+    SELECT 
+        *,
+        CASE 
+            WHEN Score > 100 THEN 'High'
+            WHEN Score > 25 THEN 'Medium'
+            WHEN Score > 0 THEN 'Low'
+            ELSE 'Negative'
+        END as ScoreCategory,
+        CASE 
+            WHEN ViewCount > 10000 THEN 'Viral'
+            WHEN ViewCount > 1000 THEN 'Popular'
+            WHEN ViewCount > 100 THEN 'Notable'
+            ELSE 'Normal'
+        END as ViewCategory,
+        CASE 
+            WHEN AnswerCount >= 10 THEN 'HighlyActive'
+            WHEN AnswerCount >= 5 THEN 'Active'
+            WHEN AnswerCount >= 1 THEN 'Answerable'
+            ELSE 'Unanswered'
+        END as EngagementCategory,
+        CASE 
+            WHEN CommentCount >= 5 THEN 'HighlyDiscussed'
+            WHEN CommentCount >= 2 THEN 'Discussed'
+            ELSE 'Minimal'
+        END as DiscussionCategory
+    FROM QuestionAnalysis
+)
+SELECT 
+    'User Analysis Result' as QueryType,
+    COUNT(*) as TotalUsers,
+    AVG(Reputation) as AvgReputation,
+    MAX(Reputation) as MaxReputation,
+    MIN(Reputation) as MinReputation,
+    AVG(TotalPosts) as AvgPosts,
+    AVG(Questions) as AvgQuestions,
+    AVG(Answers) as AvgAnswers,
+    AVG(Comments) as AvgComments,
+    AVG(Badges) as AvgBadges,
+    STRING_AGG(CONCAT(DisplayName, ': ', Reputation, ' rep'), '; ') as TopReputations,
+    'Post Statistics' as QueryType2,
+    COUNT(*) as TotalQuestions,
+    AVG(Score) as AvgQuestionScore,
+    AVG(ViewCount) as AvgViews,
+    AVG(AnswerCount) as AvgAnswers,
+    AVG(CommentCount) as AvgComments,
+    MIN(CreationDate) as EarliestQuestion,
+    MAX(CreationDate) as LatestQuestion,
+    MAX(AgeCategory) as AgeCategories,
+    'Top Tags Analysis' as QueryType3,
+    STRING_AGG(CONCAT(TagName, ' (', TagCount, ')'), '; ') as PopularTags,
+    AVG(AvgPostScore) as AvgTagScore,
+    AVG(PostCount) as AvgTagPosts,
+    STRING_AGG(CONCAT(TagName, ': ', Contributors), '; ') as TagContributors,
+    'Performance Metrics' as QueryType4,
+    COUNT(*) as MetricsRows,
+    STRING_AGG(CONCAT('User ', UserId, ' - ', DisplayName, ' Score: ', TotalScore), '; ') as UserScores
+FROM RankedUsers
+FULL OUTER JOIN ComplexQuestionStats ON 1 = 1
+FULL OUTER JOIN TopTags ON 1 = 1
+WHERE EXISTS (
+    SELECT 1 FROM Posts p 
+    INNER JOIN Users u ON p.OwnerUserId = u.Id 
+    WHERE u.Id IN (SELECT UserId FROM RankedUsers WHERE RankByScore <= 100)
+    AND p.PostTypeId = 1
+    AND p.Score > 0
+)
+AND EXISTS (
+    SELECT 1 FROM Posts p2 
+    WHERE p2.PostTypeId = 2 
+    AND p2.Score > 10
+)
+AND EXISTS (
+    SELECT 1 FROM Tags t 
+    WHERE t.Count > 1000
+)
+UNION ALL
+SELECT 
+    'Correlated Subquery Test' as QueryType,
+    COUNT(DISTINCT u.Id) as TotalUsers,
+    (SELECT AVG(Reputation) FROM Users) as AvgReputation,
+    (SELECT MAX(Reputation) FROM Users) as MaxReputation,
+    (SELECT MIN(Reputation) FROM Users) as MinReputation,
+    (SELECT AVG(TotalPosts) FROM (
+        SELECT COUNT(*) as TotalPosts FROM Posts p GROUP BY OwnerUserId
+    ) t) as AvgPosts,
+    (SELECT AVG(Questions) FROM (
+        SELECT COUNT(CASE WHEN PostTypeId = 1 THEN 1 END) as Questions FROM Posts p GROUP BY OwnerUserId
+    ) t) as AvgQuestions,
+    (SELECT AVG(Answers) FROM (
+        SELECT COUNT(CASE WHEN PostTypeId = 2 THEN 1 END) as Answers FROM Posts p GROUP BY OwnerUserId
+    ) t) as AvgAnswers,
+    NULL as AvgComments,
+    NULL as AvgBadges,
+    NULL as TopReputations,
+    'Nested Subquery Result' as QueryType2,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1) as TotalQuestions,
+    (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) as AvgQuestionScore,
+    (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = 1) as AvgViews,
+    (SELECT AVG(AnswerCount) FROM Posts WHERE PostTypeId = 1) as AvgAnswers,
+    (SELECT AVG(CommentCount) FROM Posts WHERE PostTypeId = 1) as AvgComments,
+    (SELECT MIN(CreationDate) FROM Posts WHERE PostTypeId = 1) as EarliestQuestion,
+    (SELECT MAX(CreationDate) FROM Posts WHERE PostTypeId = 1) as LatestQuestion,
+    NULL as AgeCategories,
+    'CTE Test Results' as QueryType3,
+    NULL as PopularTags,
+    NULL as AvgTagScore,
+    NULL as AvgTagPosts,
+    NULL as TagContributors,
+    'Set Operator Test' as QueryType4,
+    (SELECT COUNT(*) FROM (
+        SELECT Id FROM Users WHERE Id IN (SELECT UserId FROM Badges WHERE Class = 1)
+        INTERSECT
+        SELECT Id FROM Users WHERE Id IN (SELECT OwnerUserId FROM Posts WHERE Score > 100)
+    ) t) as IntersectionCount,
+    STRING_AGG(CONCAT('User ', Id, ' Score: ', Reputation), '; ') as UserReputations
+FROM Users u
+WHERE EXISTS (
+    SELECT 1 FROM Posts p 
+    WHERE p.OwnerUserId = u.Id 
+    AND p.PostTypeId = 1 
+    AND p.Score > 0
+)
+AND u.Id IN (
+    SELECT UserId FROM Badges 
+    WHERE Class = 1 
+    AND Date > '2020-01-01'
+)
+AND u.Id NOT IN (
+    SELECT UserId FROM Votes 
+    WHERE VoteTypeId = 4
+)
+AND u.Reputation BETWEEN (
+    SELECT AVG(Reputation) - STDDEV(Reputation)
+    FROM Users
+) AND (
+    SELECT AVG(Reputation) + STDDEV(Reputation)
+    FROM Users
+)
+ORDER BY QueryType, TotalUsers DESC, AvgReputation DESC
+OFFSET 0 ROWS
+FETCH NEXT 1000 ROWS ONLY;

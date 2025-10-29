@@ -1,0 +1,206 @@
+-- {"query": "1719.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3107} 
+
+WITH UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.UpVotes AS TotalGivenUpVotes,
+        u.DownVotes AS TotalGivenDownVotes,
+        u.Views AS UserProfileViews,
+        COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestionsOwned,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswersOwned,
+        COALESCE(SUM(p.Score), 0) AS TotalPostsScoreReceived,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END), 0) AS TotalQuestionViewsReceived,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        COALESCE(SUM(c.Score), 0) AS TotalCommentScoreMade,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        MAX(p.CreationDate) AS LatestPostDate,
+        MIN(p.CreationDate) AS EarliestPostDate
+    FROM Users AS u
+    LEFT JOIN Posts AS p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments AS c ON u.Id = c.UserId
+    LEFT JOIN Badges AS b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate,
+        u.UpVotes, u.DownVotes, u.Views
+),
+PostDetails AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount AS PostCommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        ph_closed.CreationDate AS ClosedHistoryDate,
+        ph_reopened.CreationDate AS ReopenedHistoryDate,
+        ph_deleted.CreationDate AS DeletedHistoryDate,
+        COALESCE(SUM(co.Score), 0) AS TotalLinkedCommentScore,
+        COUNT(DISTINCT co.Id) AS TotalLinkedComments,
+        COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 1 THEN pl.RelatedPostId END) AS LinkedPostsCount,
+        COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN pl.RelatedPostId END) AS DuplicatePostsCount,
+        (SELECT AVG(ans.Score)
+         FROM Posts AS ans
+         WHERE ans.ParentId = p.Id AND ans.PostTypeId = 2 AND ans.Score > 0
+        ) AS AvgAnswerScoreForQuestion
+    FROM Posts AS p
+    LEFT JOIN PostTypes AS pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Comments AS co ON p.Id = co.PostId
+    LEFT JOIN PostLinks AS pl ON p.Id = pl.PostId
+    LEFT JOIN PostHistory AS ph_closed ON p.Id = ph_closed.PostId AND ph_closed.PostHistoryTypeId = 10
+    LEFT JOIN PostHistory AS ph_reopened ON p.Id = ph_reopened.PostId AND ph_reopened.PostHistoryTypeId = 11
+    LEFT JOIN PostHistory AS ph_deleted ON p.Id = ph_deleted.PostId AND ph_deleted.PostHistoryTypeId = 12
+    GROUP BY
+        p.Id, p.PostTypeId, pt.Name, p.CreationDate, p.Score, p.ViewCount, p.OwnerUserId,
+        p.Title, p.Tags, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.ClosedDate,
+        ph_closed.CreationDate, ph_reopened.CreationDate, ph_deleted.CreationDate
+),
+TagPerformanceMetrics AS (
+    SELECT
+        LOWER(TRIM(UNNEST(string_to_array(TRIM(BOTH '<>' FROM p.Tags), '><')))) AS TagName,
+        COUNT(p.Id) AS TagPostCount,
+        AVG(p.Score) AS AvgTagScore,
+        AVG(p.ViewCount) AS AvgTagViewCount,
+        COUNT(DISTINCT p.OwnerUserId) AS DistinctOwnersForTag
+    FROM Posts AS p
+    WHERE p.Tags IS NOT NULL AND p.PostTypeId = 1
+    GROUP BY LOWER(TRIM(UNNEST(string_to_array(TRIM(BOTH '<>' FROM p.Tags), '><'))))
+    HAVING COUNT(p.Id) >= 10
+)
+SELECT
+    ue.UserId,
+    ue.DisplayName,
+    ue.Reputation,
+    ue.UserCreationDate,
+    ue.LastAccessDate,
+    ue.TotalPostsOwned,
+    ue.TotalQuestionsOwned,
+    ue.TotalAnswersOwned,
+    ue.TotalPostsScoreReceived,
+    ue.TotalCommentScoreMade,
+    ue.GoldBadges,
+    pd.PostId,
+    pd.PostTypeName,
+    pd.PostCreationDate,
+    pd.PostScore,
+    pd.ViewCount,
+    pd.Title,
+    pd.FavoriteCount,
+    pd.TotalLinkedComments,
+    pd.TotalLinkedCommentScore,
+    pd.AvgAnswerScoreForQuestion,
+    tpm.TagName AS TopContributingTag,
+    tpm.AvgTagScore AS TopTagAvgScore,
+    tpm.AvgTagViewCount AS TopTagAvgViewCount,
+    CASE
+        WHEN pd.PostScore >= 100 AND pd.ViewCount >= 10000 AND pd.FavoriteCount >= 50 THEN 'Very High Impact'
+        WHEN pd.PostScore >= 50 AND pd.ViewCount >= 5000 THEN 'High Impact'
+        WHEN pd.PostScore >= 10 AND pd.ViewCount >= 1000 THEN 'Moderate Impact'
+        ELSE 'Low Impact'
+    END AS PostImpactCategory,
+    UPPER(LEFT(COALESCE(ue.DisplayName, 'UNKNOWN'), 3)) || '-' || TO_CHAR(ue.UserId, 'FM0000000') AS UserCode,
+    SUBSTRING(pd.Title, 1, 50) || (CASE WHEN LENGTH(pd.Title) > 50 THEN '...' ELSE '' END) AS ShortTitle,
+    (EXTRACT(EPOCH FROM (NOW() - ue.LastAccessDate)) / 86400)::INT AS DaysSinceLastAccess,
+    COALESCE(pd.ClosedDate, '1900-01-01'::timestamp) AS ActualOrHypotheticalClosedDate,
+    pd.ClosedDate IS NOT NULL AS IsClosedPost,
+    pd.ReopenedHistoryDate IS NOT NULL AS HasBeenReopened,
+    pd.DeletedHistoryDate IS NOT NULL AS HasBeenDeleted,
+    RANK() OVER (PARTITION BY ue.TotalQuestionsOwned > 0 ORDER BY ue.Reputation DESC, ue.TotalPostsScoreReceived DESC) AS UserReputationRank,
+    NTILE(5) OVER (PARTITION BY pd.PostTypeId ORDER BY pd.PostScore DESC, pd.ViewCount DESC) AS PostScoreQuintile,
+    LAG(pd.PostScore, 1, 0) OVER (PARTITION BY ue.UserId ORDER BY pd.PostCreationDate) AS PreviousPostScore,
+    AVG(pd.PostScore) OVER (PARTITION BY pd.PostTypeId, EXTRACT(YEAR FROM pd.PostCreationDate)) AS AvgScoreForPostTypeAndYear,
+    (SELECT MIN(b2.Date) FROM Badges AS b2 WHERE b2.UserId = ue.UserId) AS FirstBadgeDate
+FROM UserEngagement AS ue
+INNER JOIN PostDetails AS pd ON ue.UserId = pd.OwnerUserId
+LEFT JOIN LATERAL (
+    SELECT tpm_sub.TagName, tpm_sub.AvgTagScore, tpm_sub.AvgTagViewCount
+    FROM TagPerformanceMetrics AS tpm_sub
+    WHERE pd.Tags LIKE '%' || '<' || tpm_sub.TagName || '>' || '%'
+    ORDER BY tpm_sub.AvgTagScore DESC, tpm_sub.AvgTagViewCount DESC
+    LIMIT 1
+) AS tpm ON TRUE
+WHERE pd.PostScore >= 20
+  AND (pd.PostTypeId = 1 OR pd.PostTypeId = 2)
+  AND (pd.ClosedDate IS NOT NULL OR pd.DeletedHistoryDate IS NOT NULL)
+  AND (LOWER(pd.Title) LIKE '%api%' OR LOWER(pd.Title) LIKE '%json%' OR LOWER(COALESCE(pd.Tags, '')) LIKE '%<javascript>%' OR LOWER(COALESCE(pd.Tags, '')) LIKE '%<python>%')
+  AND ue.Reputation >= 500
+  AND ue.UserCreationDate >= '2010-01-01'
+  AND (LENGTH(ue.DisplayName) > 5 OR ue.DisplayName IS NULL)
+UNION ALL
+SELECT
+    ue.UserId,
+    ue.DisplayName,
+    ue.Reputation,
+    ue.UserCreationDate,
+    ue.LastAccessDate,
+    ue.TotalPostsOwned,
+    ue.TotalQuestionsOwned,
+    ue.TotalAnswersOwned,
+    ue.TotalPostsScoreReceived,
+    ue.TotalCommentScoreMade,
+    ue.GoldBadges,
+    pd.PostId,
+    pd.PostTypeName,
+    pd.PostCreationDate,
+    pd.PostScore,
+    pd.ViewCount,
+    pd.Title,
+    pd.FavoriteCount,
+    pd.TotalLinkedComments,
+    pd.TotalLinkedCommentScore,
+    pd.AvgAnswerScoreForQuestion,
+    tpm.TagName AS TopContributingTag,
+    tpm.AvgTagScore AS TopTagAvgScore,
+    tpm.AvgTagViewCount AS TopTagAvgViewCount,
+    CASE
+        WHEN pd.PostScore >= 100 AND pd.ViewCount >= 10000 AND pd.FavoriteCount >= 50 THEN 'Very High Impact'
+        WHEN pd.PostScore >= 50 AND pd.ViewCount >= 5000 THEN 'High Impact'
+        WHEN pd.PostScore >= 10 AND pd.ViewCount >= 1000 THEN 'Moderate Impact'
+        ELSE 'Low Impact'
+    END AS PostImpactCategory,
+    UPPER(LEFT(COALESCE(ue.DisplayName, 'UNKNOWN'), 3)) || '-' || TO_CHAR(ue.UserId, 'FM0000000') AS UserCode,
+    SUBSTRING(pd.Title, 1, 50) || (CASE WHEN LENGTH(pd.Title) > 50 THEN '...' ELSE '' END) AS ShortTitle,
+    (EXTRACT(EPOCH FROM (NOW() - ue.LastAccessDate)) / 86400)::INT AS DaysSinceLastAccess,
+    COALESCE(pd.ClosedDate, '1900-01-01'::timestamp) AS ActualOrHypotheticalClosedDate,
+    pd.ClosedDate IS NOT NULL AS IsClosedPost,
+    pd.ReopenedHistoryDate IS NOT NULL AS HasBeenReopened,
+    pd.DeletedHistoryDate IS NOT NULL AS HasBeenDeleted,
+    RANK() OVER (PARTITION BY ue.TotalQuestionsOwned > 0 ORDER BY ue.Reputation DESC, ue.TotalPostsScoreReceived DESC) AS UserReputationRank,
+    NTILE(5) OVER (PARTITION BY pd.PostTypeId ORDER BY pd.PostScore DESC, pd.ViewCount DESC) AS PostScoreQuintile,
+    LAG(pd.PostScore, 1, 0) OVER (PARTITION BY ue.UserId ORDER BY pd.PostCreationDate) AS PreviousPostScore,
+    AVG(pd.PostScore) OVER (PARTITION BY pd.PostTypeId, EXTRACT(YEAR FROM pd.PostCreationDate)) AS AvgScoreForPostTypeAndYear,
+    (SELECT MIN(b2.Date) FROM Badges AS b2 WHERE b2.UserId = ue.UserId) AS FirstBadgeDate
+FROM UserEngagement AS ue
+INNER JOIN PostDetails AS pd ON ue.UserId = pd.OwnerUserId
+LEFT JOIN LATERAL (
+    SELECT tpm_sub.TagName, tpm_sub.AvgTagScore, tpm_sub.AvgTagViewCount
+    FROM TagPerformanceMetrics AS tpm_sub
+    WHERE pd.Tags LIKE '%' || '<' || tpm_sub.TagName || '>' || '%'
+    ORDER BY tpm_sub.AvgTagScore DESC, tpm_sub.AvgTagViewCount DESC
+    LIMIT 1
+) AS tpm ON TRUE
+WHERE pd.PostScore >= 100
+  AND pd.ViewCount >= 1000
+  AND pd.PostTypeId = 1
+  AND pd.AnswerCount >= 3
+  AND pd.FavoriteCount IS NOT NULL
+  AND ue.Reputation >= 1000
+  AND ue.UserCreationDate >= '2015-01-01'
+  AND (pd.ClosedDate IS NULL AND pd.DeletedHistoryDate IS NULL)
+  AND (ue.UserProfileViews > 500 OR ue.TotalQuestionsOwned > 10)
+ORDER BY
+    Reputation DESC,
+    PostScore DESC
+LIMIT 1000;

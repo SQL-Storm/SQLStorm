@@ -1,0 +1,361 @@
+-- {"query": "7951.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 3273} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+        COALESCE(SUM(p.ViewCount), 0) AS TotalViewCount,
+        MAX(p.CreationDate) AS LatestPostDate,
+        MAX(u.LastAccessDate) AS LatestAccessDate,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 3 THEN p.Id END) AS WikiCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 4 THEN p.Id END) AS TagWikiExcerptCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 5 THEN p.Id END) AS TagWikiCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+RankedUsers AS (
+    SELECT 
+        *,
+        ROW_NUMBER() OVER (ORDER BY TotalPostScore DESC, Reputation DESC) AS ScoreRank,
+        RANK() OVER (ORDER BY TotalViewCount DESC) AS ViewRank,
+        DENSE_RANK() OVER (ORDER BY PostCount DESC) AS PostRank,
+        NTILE(100) OVER (ORDER BY Reputation DESC) AS ReputationPercentile
+    FROM UserActivityStats
+),
+UserPostAnalytics AS (
+    SELECT 
+        r.UserId,
+        r.DisplayName,
+        r.Reputation,
+        r.PostCount,
+        r.TotalPostScore,
+        r.QuestionCount,
+        r.AnswerCount,
+        r.WikiCount,
+        r.TagWikiExcerptCount,
+        r.TagWikiCount,
+        CASE 
+            WHEN r.QuestionCount > 0 THEN CAST(r.AnswerCount AS FLOAT) / r.QuestionCount 
+            ELSE 0 
+        END AS AnswerQuestionRatio,
+        CASE 
+            WHEN r.TotalPostScore > 0 THEN CAST(r.TotalPostScore AS FLOAT) / r.PostCount 
+            ELSE 0 
+        END AS AvgScorePerPost,
+        CASE 
+            WHEN r.ViewCount > 0 THEN CAST(r.TotalViewCount AS FLOAT) / r.ViewCount 
+            ELSE 0 
+        END AS AvgViewsPerUser,
+        CASE 
+            WHEN r.BadgeCount > 0 THEN 
+                RANK() OVER (PARTITION BY r.BadgeCount ORDER BY r.Reputation DESC)
+            ELSE 0 
+        END AS BadgeReputationRank,
+        LAG(r.Reputation, 1) OVER (ORDER BY r.Reputation DESC) - r.Reputation AS RepDiffFromPrev,
+        LEAD(r.Reputation, 1) OVER (ORDER BY r.Reputation DESC) - r.Reputation AS RepDiffFromNext,
+        COUNT(*) OVER () AS TotalUsers
+    FROM RankedUsers r
+    WHERE r.PostCount > 0
+),
+ComplexQueryResults AS (
+    SELECT 
+        upa.UserId,
+        upa.DisplayName,
+        upa.Reputation,
+        upa.PostCount,
+        upa.TotalPostScore,
+        upa.QuestionCount,
+        upa.AnswerCount,
+        upa.WikiCount,
+        upa.TagWikiExcerptCount,
+        upa.TagWikiCount,
+        upa.AnswerQuestionRatio,
+        upa.AvgScorePerPost,
+        upa.AvgViewsPerUser,
+        upa.BadgeReputationRank,
+        upa.RepDiffFromPrev,
+        upa.RepDiffFromNext,
+        upa.TotalUsers,
+        CASE 
+            WHEN upa.ScoreRank <= 10 THEN 'Top 10'
+            WHEN upa.ScoreRank <= 50 THEN 'Top 50'
+            WHEN upa.ScoreRank <= 100 THEN 'Top 100'
+            ELSE 'Other'
+        END AS ScoreTier,
+        CASE 
+            WHEN upa.ReputationPercentile <= 10 THEN 'Top 10%'
+            WHEN upa.ReputationPercentile <= 25 THEN 'Top 25%'
+            WHEN upa.ReputationPercentile <= 50 THEN 'Top 50%'
+            ELSE 'Bottom 50%'
+        END AS RepTier,
+        COALESCE(
+            (SELECT COUNT(*) 
+             FROM Posts p 
+             WHERE p.OwnerUserId = upa.UserId 
+             AND p.CreationDate >= DATEADD(DAY, -30, cast('2024-10-01 12:34:56' as timestamp))), 
+            0
+        ) AS RecentPostCount,
+        COALESCE(
+            (SELECT COUNT(*) 
+             FROM Posts p 
+             WHERE p.OwnerUserId = upa.UserId 
+             AND p.PostTypeId = 1 
+             AND p.CreationDate >= DATEADD(DAY, -30, cast('2024-10-01 12:34:56' as timestamp))), 
+            0
+        ) AS RecentQuestionCount,
+        COALESCE(
+            (SELECT COUNT(*) 
+             FROM Posts p 
+             WHERE p.OwnerUserId = upa.UserId 
+             AND p.PostTypeId = 2 
+             AND p.CreationDate >= DATEADD(DAY, -30, cast('2024-10-01 12:34:56' as timestamp))), 
+            0
+        ) AS RecentAnswerCount,
+        -- Complex string manipulation and calculations
+        UPPER(SUBSTRING(upa.DisplayName, 1, 1)) + LOWER(SUBSTRING(upa.DisplayName, 2, LEN(upa.DisplayName) - 1)) AS ProperCaseName,
+        CASE 
+            WHEN upa.Reputation > 10000 THEN 'VIP'
+            WHEN upa.Reputation > 5000 THEN 'Elite'
+            WHEN upa.Reputation > 1000 THEN 'Advanced'
+            WHEN upa.Reputation > 100 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END AS RepLevel,
+        LTRIM(RTRIM(
+            ISNULL(CONCAT(
+                'User ID: ', upa.UserId, 
+                ' | Posts: ', upa.PostCount, 
+                ' | Reputation: ', upa.Reputation,
+                ' | Avg Score: ', ROUND(upa.AvgScorePerPost, 2),
+                ' | Questions: ', upa.QuestionCount
+            ), 'No Data')
+        )) AS UserSummary,
+        CASE 
+            WHEN upa.QuestionCount > 0 AND upa.AnswerCount > 0 THEN 
+                ROUND((CAST(upa.AnswerCount AS FLOAT) / CAST(upa.QuestionCount AS FLOAT)) * 100, 2)
+            ELSE 0 
+        END AS AnswerPercentageOfQuestions,
+        -- Window function with complex grouping
+        AVG(upa.TotalPostScore) OVER (PARTITION BY upa.Reputation / 1000 ORDER BY upa.Reputation ROWS BETWEEN 10 PRECEDING AND CURRENT ROW) AS RollingAvgScore,
+        -- Correlated subquery with complex logic
+        (SELECT TOP 1 p.Title 
+         FROM Posts p 
+         WHERE p.OwnerUserId = upa.UserId 
+         AND p.PostTypeId = 1 
+         AND p.Score = (
+             SELECT MAX(p2.Score) 
+             FROM Posts p2 
+             WHERE p2.OwnerUserId = upa.UserId 
+             AND p2.PostTypeId = 1
+         )
+         ORDER BY p.CreationDate DESC) AS HighestScoringQuestion,
+        -- Set operator with complex filtering
+        CASE 
+            WHEN EXISTS (
+                SELECT 1 FROM Posts p 
+                WHERE p.OwnerUserId = upa.UserId 
+                AND p.PostTypeId = 1 
+                AND p.Score >= 100
+            ) 
+            THEN 'High Scoring Questions'
+            ELSE 'Regular Questions'
+        END AS QuestionCategory,
+        -- NULL handling and conditional logic
+        COALESCE(upa.RepDiffFromPrev, 0) AS RepDiffWithNullHandling,
+        CASE 
+            WHEN upa.Reputation > 0 THEN 
+                ROUND((100.0 * upa.PostCount) / upa.Reputation, 2)
+            ELSE 0 
+        END AS PostToRepRatio,
+        -- Complex date and time calculations
+        DATEDIFF(DAY, upa.LatestPostDate, cast('2024-10-01 12:34:56' as timestamp)) AS DaysSinceLastPost,
+        DATEDIFF(DAY, upa.LatestAccessDate, cast('2024-10-01 12:34:56' as timestamp)) AS DaysSinceLastAccess,
+        -- String manipulation and concatenation
+        CONCAT(
+            'Rank: ', upa.ScoreRank, 
+            ' (', upa.ScoreTier, ')',
+            ' | Rep: ', upa.ReputationPercentile,
+            ' (', upa.RepTier, ')'
+        ) AS UserPerformanceIndicators
+    FROM UserPostAnalytics upa
+),
+FinalAggregation AS (
+    SELECT 
+        COUNT(*) AS TotalUsers,
+        COUNT(DISTINCT CASE WHEN fr.PostCount > 0 THEN fr.UserId END) AS ActiveUsers,
+        AVG(fr.Reputation) AS AvgReputation,
+        MAX(fr.Reputation) AS MaxReputation,
+        MIN(fr.Reputation) AS MinReputation,
+        SUM(fr.PostCount) AS TotalPosts,
+        SUM(fr.TotalPostScore) AS TotalScore,
+        AVG(fr.AnswerQuestionRatio) AS AvgAnswerQuestionRatio,
+        AVG(fr.AvgScorePerPost) AS AvgScorePerPost,
+        AVG(fr.AvgViewsPerUser) AS AvgViewsPerUser,
+        COUNT(DISTINCT CASE WHEN fr.ScoreTier = 'Top 10' THEN fr.UserId END) AS Top10Users,
+        COUNT(DISTINCT CASE WHEN fr.RepTier = 'Top 10%' THEN fr.UserId END) AS Top10PctUsers
+    FROM ComplexQueryResults fr
+),
+UserWithPostDetails AS (
+    SELECT 
+        fr.UserId,
+        fr.DisplayName,
+        fr.Reputation,
+        fr.PostCount,
+        fr.TotalPostScore,
+        fr.QuestionCount,
+        fr.AnswerCount,
+        fr.WikiCount,
+        fr.TagWikiExcerptCount,
+        fr.TagWikiCount,
+        fr.AnswerQuestionRatio,
+        fr.AvgScorePerPost,
+        fr.AvgViewsPerUser,
+        fr.BadgeReputationRank,
+        fr.RepDiffFromPrev,
+        fr.RepDiffFromNext,
+        fr.TotalUsers,
+        fr.ScoreTier,
+        fr.RepTier,
+        fr.RecentPostCount,
+        fr.RecentQuestionCount,
+        fr.RecentAnswerCount,
+        fr.ProperCaseName,
+        fr.RepLevel,
+        fr.UserSummary,
+        fr.AnswerPercentageOfQuestions,
+        fr.RollingAvgScore,
+        fr.HighestScoringQuestion,
+        fr.QuestionCategory,
+        fr.RepDiffWithNullHandling,
+        fr.PostToRepRatio,
+        fr.DaysSinceLastPost,
+        fr.DaysSinceLastAccess,
+        fr.UserPerformanceIndicators,
+        -- Complex filtering conditions
+        CASE 
+            WHEN fr.Reputation > 1000 AND fr.PostCount > 50 AND fr.TotalScore > 1000 
+            THEN 'Elite Contributor'
+            WHEN fr.Reputation > 500 AND fr.PostCount > 10 AND fr.TotalScore > 500 
+            THEN 'Active Contributor'
+            WHEN fr.Reputation > 100 AND fr.PostCount > 1 
+            THEN 'Regular Contributor'
+            ELSE 'New User'
+        END AS ContributionLevel,
+        -- Additional calculations
+        ROUND(
+            CASE 
+                WHEN fr.PostCount > 0 THEN 
+                    CAST((fr.TotalPostScore * 100.0) / NULLIF(fr.PostCount, 0) AS FLOAT)
+                ELSE 0 
+            END, 2
+        ) AS ScorePerPost,
+        CASE 
+            WHEN fr.RepDiffFromPrev < 0 AND fr.RepDiffFromNext < 0 THEN 'Stagnant'
+            WHEN fr.RepDiffFromPrev > 0 AND fr.RepDiffFromNext > 0 THEN 'Active'
+            WHEN fr.RepDiffFromPrev > 0 THEN 'Improving'
+            WHEN fr.RepDiffFromNext > 0 THEN 'Declining'
+            ELSE 'Neutral'
+        END AS RepTrend
+    FROM ComplexQueryResults fr
+)
+-- Final SELECT with union and complex joins
+SELECT
+    'Users' AS RecordType,
+    u.UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.PostCount,
+    u.TotalPostScore,
+    u.QuestionCount,
+    u.AnswerCount,
+    u.WikiCount,
+    u.TagWikiExcerptCount,
+    u.TagWikiCount,
+    u.AnswerQuestionRatio,
+    u.AvgScorePerPost,
+    u.AvgViewsPerUser,
+    u.BadgeReputationRank,
+    u.RepDiffFromPrev,
+    u.RepDiffFromNext,
+    u.TotalUsers,
+    u.ScoreTier,
+    u.RepTier,
+    u.RecentPostCount,
+    u.RecentQuestionCount,
+    u.RecentAnswerCount,
+    u.ProperCaseName,
+    u.RepLevel,
+    u.UserSummary,
+    u.AnswerPercentageOfQuestions,
+    u.RollingAvgScore,
+    u.HighestScoringQuestion,
+    u.QuestionCategory,
+    u.RepDiffWithNullHandling,
+    u.PostToRepRatio,
+    u.DaysSinceLastPost,
+    u.DaysSinceLastAccess,
+    u.UserPerformanceIndicators,
+    u.ContributionLevel,
+    u.ScorePerPost,
+    u.RepTrend
+FROM UserWithPostDetails u
+WHERE u.Reputation > 100 
+AND u.PostCount > 1 
+AND u.TotalScore > 0
+
+UNION ALL
+
+SELECT
+    'Stats' AS RecordType,
+    0 AS UserId,
+    'Overall Statistics' AS DisplayName,
+    CAST(f.TotalUsers AS INT) AS Reputation,
+    CAST(f.ActiveUsers AS INT) AS PostCount,
+    CAST(f.TotalScore AS BIGINT) AS TotalPostScore,
+    0 AS QuestionCount,
+    0 AS AnswerCount,
+    0 AS WikiCount,
+    0 AS TagWikiExcerptCount,
+    0 AS TagWikiCount,
+    0 AS AnswerQuestionRatio,
+    0 AS AvgScorePerPost,
+    0 AS AvgViewsPerUser,
+    0 AS BadgeReputationRank,
+    0 AS RepDiffFromPrev,
+    0 AS RepDiffFromNext,
+    0 AS TotalUsers,
+    'All' AS ScoreTier,
+    'All' AS RepTier,
+    0 AS RecentPostCount,
+    0 AS RecentQuestionCount,
+    0 AS RecentAnswerCount,
+    '' AS ProperCaseName,
+    'All' AS RepLevel,
+    'Summary Statistics' AS UserSummary,
+    0 AS AnswerPercentageOfQuestions,
+    0 AS RollingAvgScore,
+    '' AS HighestScoringQuestion,
+    '' AS QuestionCategory,
+    0 AS RepDiffWithNullHandling,
+    0 AS PostToRepRatio,
+    0 AS DaysSinceLastPost,
+    0 AS DaysSinceLastAccess,
+    '' AS UserPerformanceIndicators,
+    'Summary' AS ContributionLevel,
+    0 AS ScorePerPost,
+    'Summary' AS RepTrend
+FROM FinalAggregation f
+
+ORDER BY RecordType, Reputation DESC, PostCount DESC;

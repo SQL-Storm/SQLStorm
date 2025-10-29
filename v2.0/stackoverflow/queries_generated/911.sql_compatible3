@@ -1,0 +1,328 @@
+with
+user_cohorts as (
+  select
+    u.id as user_id,
+    date_trunc('month', u.creationdate) as cohort_month,
+    u.reputation,
+    u.location,
+    coalesce(nullif(trim(u.displayname), ''), '(anon)') as displayname_norm
+  from users u
+),
+questions as (
+  select
+    p.id as question_id,
+    p.owneruserid as asker_id,
+    p.creationdate as q_created,
+    p.score as q_score,
+    p.viewcount,
+    p.answercount,
+    p.acceptedanswerid,
+    p.title,
+    p.tags,
+    cardinality(string_to_array(substring(p.tags, 2, greatest(length(p.tags)-2,0)), '><')) as tag_count,
+    length(coalesce(p.title, '')) as title_len,
+    length(coalesce(p.body, '')) as body_len,
+    (p.closeddate is not null) as is_closed
+  from posts p
+  where p.posttypeid = 1
+),
+answers as (
+  select
+    a.id as answer_id,
+    a.parentid as question_id,
+    a.owneruserid as answerer_id,
+    a.creationdate as a_created,
+    a.score as a_score,
+    row_number() over (partition by a.parentid order by a.creationdate) as rn_by_time,
+    row_number() over (partition by a.parentid order by a.score desc, a.creationdate) as rn_by_score
+  from posts a
+  where a.posttypeid = 2
+),
+post_votes as (
+  select
+    v.postid,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+    sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_total
+  from votes v
+  group by v.postid
+),
+comment_stats as (
+  select
+    c.postid,
+    count(*) as comment_count,
+    avg(c.score) as avg_comment_score,
+    sum(case when c.text ilike '%thanks%' or c.text ilike '%thank you%' then 1 else 0 end) as thanks_count
+  from comments c
+  group by c.postid
+),
+close_events as (
+  select distinct on (ph.postid)
+    ph.postid,
+    ph.creationdate as closed_at,
+    ph.comment as close_reason_id_raw,
+    cast(nullif(regexp_replace(ph.comment, '[^0-9]', '', 'g'), '') as int) as close_reason_id
+  from posthistory ph
+  where ph.posthistorytypeid = 10
+  order by ph.postid, ph.creationdate desc
+),
+post_link_agg as (
+  select
+    pl.postid,
+    sum(case when pl.linktypeid = 3 then 1 else 0 end) as duplicate_links,
+    sum(case when pl.linktypeid = 1 then 1 else 0 end) as related_links
+  from postlinks pl
+  group by pl.postid
+),
+user_badges as (
+  select
+    b.userid,
+    sum(case when b.class = 1 then 1 else 0 end) as gold,
+    sum(case when b.class = 2 then 1 else 0 end) as silver,
+    sum(case when b.class = 3 then 1 else 0 end) as bronze,
+    sum(case when b.tagbased = true then 1 else 0 end) as tag_badges
+  from badges b
+  group by b.userid
+),
+accepted_answer_flags as (
+  select
+    q.question_id,
+    aa.answer_id as accepted_id,
+    (case when a1.rn_by_time <= 2 then 1 else 0 end) as accepted_among_first_two,
+    (case when a2.rn_by_score = 1 then 1 else 0 end) as accepted_is_top_scored
+  from questions q
+  join answers aa on aa.answer_id = q.acceptedanswerid
+  join answers a1 on a1.answer_id = q.acceptedanswerid
+  join answers a2 on a2.answer_id = q.acceptedanswerid
+),
+question_enriched as (
+  select
+    q.*,
+    coalesce(pv.upvotes,0) as upvotes,
+    coalesce(pv.downvotes,0) as downvotes,
+    coalesce(pv.favorites,0) as favorites,
+    coalesce(pv.bounty_total,0) as bounty_total,
+    coalesce(cs.comment_count,0) as comment_count,
+    coalesce(cs.avg_comment_score,0.0) as avg_comment_score,
+    coalesce(cs.thanks_count,0) as thanks_count,
+    coalesce(pl.related_links,0) as related_links,
+    coalesce(pl.duplicate_links,0) as duplicate_links,
+    ce.close_reason_id,
+    uc.cohort_month,
+    uc.reputation as asker_rep,
+    ub.gold as asker_gold,
+    ub.silver as asker_silver,
+    ub.bronze as asker_bronze,
+    row_number() over (partition by uc.cohort_month order by q.viewcount desc nulls last) as rn_views_in_cohort,
+    (
+      select
+        (array_agg(vv order by vv))[ceil(0.9 * greatest(array_length(array_agg(vv order by vv),1),1))]
+      from (
+        select coalesce(q2.viewcount,0) as vv,
+               q2.q_created,
+               q2.asker_id,
+               q2.question_id,
+               -- ensure reference to users is valid: compute cohort for q2 by joining users table
+               date_trunc('month', u2.creationdate) as q2_cohort_month
+        from questions q2
+        left join users u2 on u2.id = q2.asker_id
+        where q2.q_created is not null
+          and date_trunc('month', u2.creationdate) = uc.cohort_month
+      ) sub
+    ) as p90_views_in_cohort,
+    avg(q.score) over (partition by uc.cohort_month) as avg_qscore_in_cohort,
+    sum(case when q.is_closed then 1 else 0 end) over (partition by uc.cohort_month) as closed_count_in_cohort
+  from questions q
+  left join post_votes pv on pv.postid = q.question_id
+  left join comment_stats cs on cs.postid = q.question_id
+  left join post_link_agg pl on pl.postid = q.question_id
+  left join close_events ce on ce.postid = q.question_id
+  left join users u on u.id = q.asker_id
+  left join user_cohorts uc on uc.user_id = q.asker_id
+  left join user_badges ub on ub.userid = q.asker_id
+),
+answer_rollup as (
+  select
+    a.question_id,
+    count(*) as answer_cnt,
+    min(a.a_created) as first_answer_time,
+    max(a.a_score) as max_answer_score,
+    cast(avg(a.a_score) as numeric(18,4)) as avg_answer_score,
+    sum(case when a.rn_by_time = 1 then 1 else 0 end) as has_early_answer
+  from answers a
+  group by a.question_id
+),
+first_comment_per_q as (
+  select
+    c.postid as question_id,
+    (select c2.text
+     from comments c2
+     where c2.postid = c.postid
+     order by c2.creationdate asc
+     limit 1) as first_comment_text
+  from comments c
+  group by c.postid
+),
+tag_signals as (
+  select
+    q.question_id,
+    case when q.tags ilike '%<sql>%' or q.tags ilike '%<postgresql>%' or q.tags ilike '%<mysql>%' then 1 else 0 end as is_db_tagged,
+    case when q.tags ilike '%<javascript>%' or q.tags ilike '%<python>%' then 1 else 0 end as is_popular_lang,
+    case when q.tag_count >= 5 then 1 else 0 end as many_tags
+  from questions q
+),
+final_calc as (
+  select
+    qe.question_id,
+    qe.asker_id,
+    qe.cohort_month,
+    qe.q_created,
+    qe.title,
+    qe.tags,
+    qe.tag_count,
+    qe.title_len,
+    qe.body_len,
+    qe.q_score,
+    qe.viewcount,
+    qe.answercount,
+    coalesce(ar.answer_cnt, 0) as answer_cnt,
+    qe.upvotes, qe.downvotes, qe.favorites, qe.bounty_total,
+    qe.comment_count, qe.avg_comment_score, qe.thanks_count,
+    qe.related_links, qe.duplicate_links,
+    qe.close_reason_id,
+    coalesce(aaf.accepted_among_first_two, 0) as accepted_among_first_two,
+    coalesce(aaf.accepted_is_top_scored, 0) as accepted_is_top_scored,
+    coalesce(ar.max_answer_score, 0) as max_answer_score,
+    coalesce(ar.avg_answer_score, 0.0) as avg_answer_score,
+    (
+      coalesce(qe.viewcount,0) * 0.001
+      + coalesce(qe.upvotes,0) * 2
+      - coalesce(qe.downvotes,0) * 3
+      + coalesce(qe.favorites,0) * 1.5
+      + coalesce(qe.comment_count,0) * 0.25
+      + least(coalesce(qe.bounty_total,0), 500) * 0.01
+    ) as engagement_score,
+    (
+      coalesce(qe.q_score,0)
+      + coalesce(ar.max_answer_score,0) * 0.5
+      + case when coalesce(aaf.accepted_is_top_scored,0) = 1 then 3 else 0 end
+      - case when qe.is_closed then 5 else 0 end
+    ) as quality_score,
+    extract(epoch from (ar.first_answer_time - qe.q_created)) / 60.0 as mins_to_first_answer,
+    case
+      when coalesce(qe.viewcount,0) = 0 then null
+      else cast(coalesce(qe.upvotes,0) as numeric) / greatest(qe.viewcount,1)
+    end as upvote_view_ratio,
+    case
+      when fc.first_comment_text ilike '%duplicate%' or fc.first_comment_text ilike '%dupe%' then 'dupe_hint'
+      when fc.first_comment_text ilike '%code%' and fc.first_comment_text ilike '%please%' then 'needs_code'
+      when fc.first_comment_text is null then 'no_comment'
+      else 'other'
+    end as first_comment_bucket,
+    ts.is_db_tagged,
+    ts.is_popular_lang,
+    ts.many_tags,
+    row_number() over (order by
+      (
+        coalesce(qe.viewcount,0) * 0.001
+        + coalesce(qe.upvotes,0) * 2
+        - coalesce(qe.downvotes,0) * 3
+        + coalesce(qe.favorites,0) * 1.5
+      ) desc nulls last
+    ) as rn_global_engagement,
+    dense_rank() over (partition by qe.cohort_month order by qe.q_score desc nulls last) as dr_cohort_score,
+    sum(case when qe.is_closed then 1 else 0 end) over () as total_closed_global,
+    qe.p90_views_in_cohort,
+    qe.rn_views_in_cohort,
+    qe.is_closed
+  from question_enriched qe
+  left join answer_rollup ar on ar.question_id = qe.question_id
+  left join accepted_answer_flags aaf on aaf.question_id = qe.question_id
+  left join first_comment_per_q fc on fc.question_id = qe.question_id
+  left join tag_signals ts on ts.question_id = qe.question_id
+),
+cohort_summary as (
+  select
+    cohort_month,
+    count(*) as q_count,
+    avg(engagement_score) as avg_engagement,
+    avg(quality_score) as avg_quality,
+    (
+      select
+        (array_agg(coalesce(mins_to_first_answer, 1e9) order by coalesce(mins_to_first_answer, 1e9)))[ceil(0.5 * array_length(array_agg(coalesce(mins_to_first_answer, 1e9) order by coalesce(mins_to_first_answer, 1e9)),1))] 
+      from final_calc fc2
+      where fc2.cohort_month = final_calc.cohort_month
+    ) as p50_time_to_first_answer
+  from final_calc
+  group by cohort_month
+  union all
+  select
+    cast(null as timestamp) as cohort_month,
+    count(*) as q_count,
+    avg(engagement_score) as avg_engagement,
+    avg(quality_score) as avg_quality,
+    (
+      select
+        (array_agg(coalesce(mins_to_first_answer, 1e9) order by coalesce(mins_to_first_answer, 1e9)))[ceil(0.9 * array_length(array_agg(coalesce(mins_to_first_answer, 1e9) order by coalesce(mins_to_first_answer, 1e9)),1))]
+      from final_calc
+    ) as p50_time_to_first_answer
+  from final_calc
+)
+select
+  f.question_id,
+  coalesce(u.displayname, '(deleted)') as asker_name,
+  to_char(f.cohort_month, 'YYYY-MM') as cohort_ym,
+  f.q_created,
+  left(coalesce(f.title, ''), 120) as title_snippet,
+  coalesce(f.tags, '') as tags,
+  f.tag_count,
+  f.viewcount,
+  f.q_score,
+  f.answer_cnt,
+  f.upvotes,
+  f.downvotes,
+  f.favorites,
+  f.bounty_total,
+  f.comment_count,
+  f.avg_comment_score,
+  f.thanks_count,
+  f.duplicate_links,
+  f.related_links,
+  f.close_reason_id,
+  f.accepted_among_first_two,
+  f.accepted_is_top_scored,
+  round(cast(f.engagement_score as numeric), 3) as engagement_score,
+  round(cast(f.quality_score as numeric), 3) as quality_score,
+  round(cast(f.mins_to_first_answer as numeric), 2) as mins_to_first_answer,
+  f.upvote_view_ratio,
+  f.first_comment_bucket,
+  f.is_db_tagged,
+  f.is_popular_lang,
+  f.many_tags,
+  f.rn_global_engagement,
+  f.dr_cohort_score,
+  cs.q_count as cohort_q_count,
+  cs.avg_engagement as cohort_avg_engagement,
+  cs.avg_quality as cohort_avg_quality,
+  cs.p50_time_to_first_answer as cohort_p50_tfa
+from final_calc f
+left join users u on u.id = f.asker_id
+left join cohort_summary cs on cs.cohort_month = f.cohort_month
+where
+  (
+    (f.is_db_tagged = 1 and f.engagement_score > coalesce(cs.avg_engagement, 0))
+    or (f.is_popular_lang = 1 and f.quality_score >= coalesce(cs.avg_quality, 0))
+    or (f.many_tags = 1 and f.downvotes = 0 and (f.close_reason_id is null))
+  )
+  and (
+    f.viewcount is null
+    or f.viewcount >= coalesce(f.p90_views_in_cohort, 0) / 2
+    or (f.rn_views_in_cohort <= 10)
+  )
+  and coalesce(f.title_len, 0) >= 10
+  and coalesce(f.body_len, 0) >= 50
+order by
+  f.rn_global_engagement nulls last,
+  f.q_created desc
+limit 500;

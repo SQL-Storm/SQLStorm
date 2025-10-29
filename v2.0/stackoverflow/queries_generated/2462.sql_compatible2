@@ -1,0 +1,222 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 AS Level,
+        ARRAY[t.TagName] AS Ancestors
+    FROM Tags t
+    WHERE t.IsModeratorOnly = false
+
+    UNION ALL
+
+    SELECT 
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        r.Level + 1,
+        r.Ancestors || t2.TagName
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r ON array_position(r.Ancestors, t2.TagName) IS NULL
+    WHERE t2.IsModeratorOnly = false AND r.Level < 3
+),
+PostScoresWithBadges AS (
+    SELECT 
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        u.Reputation,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COALESCE(p.Tags, '') AS Tags,
+        (p.Score * 0.6 + p.ViewCount * 0.03 + COALESCE(u.Reputation,0) * 0.001 + 
+         COUNT(DISTINCT b.Id) OVER (PARTITION BY p.OwnerUserId) * 0.5
+        ) AS WeightedImpact
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.OwnerUserId, u.Reputation, p.Tags
+),
+LatestCommentStats AS (
+    SELECT 
+        c.PostId,
+        MAX(c.CreationDate) AS LastCommentDate,
+        AVG(c.Score) AS AvgCommentScore,
+        COUNT(*) AS CommentCount
+    FROM Comments c
+    GROUP BY c.PostId
+),
+LinkedPostsCTE AS (
+    SELECT 
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.LinkTypeId,
+        lt.Name AS LinkTypeName
+    FROM PostLinks pl
+    LEFT JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+),
+AnswerStats AS (
+    SELECT 
+        a.ParentId AS QuestionId,
+        COUNT(DISTINCT a.Id) AS AnswerCount,
+        MAX(a.Score) AS MaxAnswerScore,
+        AVG(a.Score) AS AvgAnswerScore,
+        SUM(CASE WHEN a.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END) AS HasAcceptedAnswer
+    FROM Posts a
+    JOIN Posts q ON a.ParentId = q.Id AND q.PostTypeId = 1
+    WHERE a.PostTypeId = 2
+    GROUP BY a.ParentId
+),
+UserActivityWindow AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.CreationDate) AS RankByReputation,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.CreationDate > (u.CreationDate + INTERVAL '1 year')) AS PostsAfterFirstYear,
+        COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (10, 11, 19, 20) AND ph.CreationDate > (u.CreationDate)) AS ModerationActionCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+UserCloseVotes AS (
+    SELECT
+        ph.UserId,
+        COUNT(DISTINCT ph.PostId) AS CloseVotesCast,
+        COUNT(DISTINCT CASE WHEN ph.Comment IN ('101','102','103','104','105') THEN ph.PostId END) AS ValidCloseReasons
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.UserId
+),
+ComplexTaggedPosts AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.Tags,
+        unnest(string_to_array(substring(p.Tags FROM 2 FOR length(p.Tags)-2), '><')) AS TagName
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+),
+TaggedPostScores AS (
+    SELECT 
+        ctp.Id AS PostId,
+        ctp.Title,
+        ctp.CreationDate,
+        ctp.Score,
+        ctp.ViewCount,
+        ctp.OwnerUserId,
+        ctp.TagName,
+        t.Count AS TagUsageCount,
+        ROW_NUMBER() OVER (
+            PARTITION BY ctp.TagName ORDER BY ctp.Score DESC, ctp.ViewCount DESC
+        ) AS RankInTag
+    FROM ComplexTaggedPosts ctp
+    LEFT JOIN Tags t ON ctp.TagName = t.TagName
+),
+QnAAggregated AS (
+    SELECT
+        pq.Id AS QuestionId,
+        pq.Title,
+        pq.CreationDate,
+        pq.Score AS QuestionScore,
+        pq.ViewCount AS QuestionViews,
+        pa.AnswerCount,
+        pa.MaxAnswerScore,
+        pa.AvgAnswerScore,
+        pa.HasAcceptedAnswer,
+        pswb.GoldBadges,
+        pswb.SilverBadges,
+        pswb.BronzeBadges,
+        pswb.WeightedImpact,
+        lc.LastCommentDate,
+        lc.AvgCommentScore,
+        lc.CommentCount,
+        pq.OwnerUserId
+    FROM Posts pq
+    LEFT JOIN AnswerStats pa ON pq.Id = pa.QuestionId
+    LEFT JOIN PostScoresWithBadges pswb ON pq.Id = pswb.PostId
+    LEFT JOIN LatestCommentStats lc ON pq.Id = lc.PostId
+    WHERE pq.PostTypeId = 1
+    GROUP BY pq.Id, pq.Title, pq.CreationDate, pq.Score, pq.ViewCount, pa.AnswerCount, pa.MaxAnswerScore, pa.AvgAnswerScore, pa.HasAcceptedAnswer, pswb.GoldBadges, pswb.SilverBadges, pswb.BronzeBadges, pswb.WeightedImpact, lc.LastCommentDate, lc.AvgCommentScore, lc.CommentCount, pq.OwnerUserId
+),
+FinalSelection AS (
+    SELECT 
+        qna.QuestionId,
+        qna.Title,
+        qna.CreationDate,
+        qna.QuestionScore,
+        qna.QuestionViews,
+        qna.AnswerCount,
+        qna.MaxAnswerScore,
+        qna.AvgAnswerScore,
+        qna.HasAcceptedAnswer,
+        qna.GoldBadges,
+        qna.SilverBadges,
+        qna.BronzeBadges,
+        qna.WeightedImpact,
+        qna.LastCommentDate,
+        qna.AvgCommentScore,
+        qna.CommentCount,
+        CASE WHEN uac.RankByReputation <= 100 THEN 'Top 100 rep user' ELSE 'Other user' END AS OwnerCategory,
+        uac.PostsAfterFirstYear,
+        uac.ModerationActionCount,
+        COALESCE(ucv.CloseVotesCast,0) AS CloseVotesCast,
+        COALESCE(ucv.ValidCloseReasons,0) AS ValidCloseReasons,
+        substring(qna.Title FROM 1 FOR 50) || COALESCE(' [' || substring(qna.Title FROM 51 FOR 50) || ']', '') AS TitleSnippet,
+        substring(COALESCE(pswb.Tags,''),1, 50) AS TagsSnippet,
+        qna.OwnerUserId
+    FROM QnAAggregated qna
+    LEFT JOIN Users u ON qna.OwnerUserId = u.Id
+    LEFT JOIN UserActivityWindow uac ON u.Id = uac.UserId
+    LEFT JOIN UserCloseVotes ucv ON u.Id = ucv.UserId
+    LEFT JOIN PostScoresWithBadges pswb ON qna.QuestionId = pswb.PostId
+    WHERE qna.HasAcceptedAnswer = 1
+      AND (qna.AnswerCount > 3 OR qna.QuestionViews > 10000)
+      AND (qna.WeightedImpact > 10)
+    GROUP BY qna.QuestionId, qna.Title, qna.CreationDate, qna.QuestionScore, qna.QuestionViews, qna.AnswerCount, qna.MaxAnswerScore, qna.AvgAnswerScore, qna.HasAcceptedAnswer, qna.GoldBadges, qna.SilverBadges, qna.BronzeBadges, qna.WeightedImpact, qna.LastCommentDate, qna.AvgCommentScore, qna.CommentCount, uac.RankByReputation, uac.PostsAfterFirstYear, uac.ModerationActionCount, ucv.CloseVotesCast, ucv.ValidCloseReasons, pswb.Tags, qna.OwnerUserId
+)
+SELECT 
+    fs.QuestionId,
+    fs.TitleSnippet,
+    fs.CreationDate,
+    fs.QuestionScore,
+    fs.QuestionViews,
+    fs.AnswerCount,
+    ROUND(CAST(fs.AvgAnswerScore AS NUMERIC),2) AS AvgAnswerScore,
+    fs.GoldBadges,
+    fs.SilverBadges,
+    fs.BronzeBadges,
+    ROUND(CAST(fs.WeightedImpact AS NUMERIC),2) AS WeightedImpact,
+    fs.LastCommentDate,
+    ROUND(CAST(fs.AvgCommentScore AS NUMERIC),2) AS AvgCommentScore,
+    fs.CommentCount,
+    fs.OwnerCategory,
+    fs.PostsAfterFirstYear,
+    fs.ModerationActionCount,
+    fs.CloseVotesCast,
+    fs.ValidCloseReasons,
+    fs.TagsSnippet,
+    RANK() OVER (PARTITION BY fs.OwnerCategory ORDER BY fs.WeightedImpact DESC) AS ImpactRankInCategory,
+    (
+        SELECT COUNT(DISTINCT c2.UserId)
+        FROM Comments c2
+        WHERE c2.PostId = fs.QuestionId
+          AND c2.UserId IS NOT NULL
+          AND c2.CreationDate > fs.CreationDate
+    ) AS DistinctRecentCommenters,
+    CASE WHEN EXISTS(
+        SELECT 1 FROM LinkedPostsCTE lpc 
+        WHERE lpc.PostId = fs.QuestionId AND lpc.LinkTypeName = 'Duplicate'
+    ) THEN 'Yes' ELSE 'No' END AS HasDuplicateLink
+FROM FinalSelection fs
+ORDER BY fs.WeightedImpact DESC, fs.QuestionViews DESC
+LIMIT 50;

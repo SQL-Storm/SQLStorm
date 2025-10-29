@@ -1,0 +1,181 @@
+with RecursiveTagHierarchy as (
+    select t.Id, t.TagName, t.ExcerptPostId, t.WikiPostId, 1 as Level
+    from Tags t
+    where t.IsModeratorOnly = false and t.IsRequired = false
+
+    union all
+
+    select t2.Id, t2.TagName, t2.ExcerptPostId, t2.WikiPostId, r.Level + 1
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.Id > r.Id
+    where t2.IsModeratorOnly = false and t2.IsRequired = false and r.Level < 3
+), QuestionAnswerAggregates as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.OwnerUserId,
+        count(a.Id) as TotalAnswers,
+        max(a.Score) as MaxAnswerScore,
+        avg(coalesce(a.Score, 0)) as AvgAnswerScore,
+        count(distinct case when v.VoteTypeId = 2 then v.UserId end) as UpVotesCount,
+        count(distinct c.Id) as CommentCountTotal,
+        count(distinct case when pb.PostHistoryTypeId = 10 then pb.Id end) as CloseVotesCount,
+        q.Score
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Votes v on v.PostId = q.Id
+    left join Comments c on c.PostId = q.Id
+    left join PostHistory pb on pb.PostId = q.Id
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.CreationDate, q.OwnerUserId, q.Score
+), UserReputationStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate as UserCreation,
+        count(case when b.Class = 1 then b.Id end) as GoldBadges,
+        count(case when b.Class = 2 then b.Id end) as SilverBadges,
+        count(case when b.Class = 3 then b.Id end) as BronzeBadges,
+
+        rank() over (order by u.Reputation desc) as ReputationRank,
+
+        rank() over (order by (count(case when b.Class = 1 then b.Id end) * 3 + count(case when b.Class = 2 then b.Id end) * 2 + count(case when b.Class = 3 then b.Id end)) desc) as BadgeRank
+
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate
+), PostsWithLinkInfo as (
+    select
+        p.Id as PostId,
+        p.Title,
+        p.OwnerUserId,
+        p.PostTypeId,
+        count(case when lt.Name = 'Duplicate' then pl.Id end) as NumDuplicateLinks,
+        count(case when lt.Name = 'Linked' then pl.Id end) as NumLinkedPosts,
+        count(pl.Id) as TotalLinks
+    from Posts p
+    left join PostLinks pl on pl.PostId = p.Id
+    left join LinkTypes lt on lt.Id = pl.LinkTypeId
+    group by p.Id, p.Title, p.OwnerUserId, p.PostTypeId
+), LatestPostHistoryPerPost as (
+    select ph.PostId,
+        ph.Id as PostHistoryId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate as HistoryDate,
+        ph.UserId,
+        ph.UserDisplayName,
+        ph.Comment,
+        ph.Text
+    from (
+        select ph.*,
+            row_number() over (partition by ph.PostId order by ph.CreationDate desc) as rn
+        from PostHistory ph
+    ) ph
+    where ph.rn = 1
+), ComplexFilteredPosts as (
+    select 
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        (select count(*) from Comments c where c.PostId = p.Id and c.CreationDate > p.CreationDate - interval '30 days') as RecentCommentsCount,
+        (select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 2 and v.CreationDate > p.CreationDate - interval '30 days') as RecentUpvotes,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc) as RnkByUserScore
+    from Posts p
+    where p.PostTypeId = 1
+      and (p.Tags ilike '%<sql>%' or p.Tags ilike '%<database>%')
+      and p.Score > 0
+      and p.ViewCount > 1000
+), UnifiedUserActivity as (
+    select u.Id as UserId, u.DisplayName, 'Post' as ActivityType, p.CreationDate as ActivityDate
+    from Users u
+    join Posts p on p.OwnerUserId = u.Id
+    where p.CreationDate > u.CreationDate + interval '30 days'
+
+    union all
+
+    select u.Id, u.DisplayName, 'Comment', c.CreationDate
+    from Users u
+    join Comments c on c.UserId = u.Id
+    where c.CreationDate > u.CreationDate + interval '30 days'
+
+    union all
+
+    select u.Id, u.DisplayName, 'Badge', b.Date
+    from Users u
+    join Badges b on b.UserId = u.Id
+    where b.Date > u.CreationDate + interval '30 days'
+), UserActivityRanks as (
+    select 
+        ua.UserId,
+        ua.DisplayName,
+        ua.ActivityType,
+        ua.ActivityDate,
+        row_number() over (partition by ua.UserId, ua.ActivityType order by ua.ActivityDate) as ActivityRowNum
+    from UnifiedUserActivity ua
+), ActivityIntervals as (
+    select
+        UserId,
+        ActivityType,
+        avg(lead(ActivityDate) over (partition by UserId, ActivityType order by ActivityDate) - ActivityDate) as AvgInterval
+    from UserActivityRanks
+    group by UserId, ActivityType
+), ConsolidatedUserStats as (
+    select 
+        urs.UserId,
+        urs.DisplayName,
+        urs.Reputation,
+        urs.GoldBadges,
+        urs.SilverBadges,
+        urs.BronzeBadges,
+        coalesce(ai_post.AvgInterval, interval '0') as AvgPostInterval,
+        coalesce(ai_comment.AvgInterval, interval '0') as AvgCommentInterval,
+        coalesce(ai_badge.AvgInterval, interval '0') as AvgBadgeInterval
+    from UserReputationStats urs
+    left join ActivityIntervals ai_post on ai_post.UserId = urs.UserId and ai_post.ActivityType = 'Post'
+    left join ActivityIntervals ai_comment on ai_comment.UserId = urs.UserId and ai_comment.ActivityType = 'Comment'
+    left join ActivityIntervals ai_badge on ai_badge.UserId = urs.UserId and ai_badge.ActivityType = 'Badge'
+)
+select 
+    qqa.QuestionId,
+    qqa.Title as QuestionTitle,
+    concat_ws(' | ', 
+        'Score: ' || qqa.Score,
+        'Answers: ' || qqa.TotalAnswers,
+        'Max Answer Score: ' || coalesce(qqa.MaxAnswerScore, 0),
+        'Avg Answer Score: ' || round(qqa.AvgAnswerScore,2),
+        'Comments: ' || qqa.CommentCountTotal,
+        'Close Votes: ' || qqa.CloseVotesCount
+    ) as QuestionStats,
+    urs.DisplayName as OwnerDisplayName,
+    urs.Reputation as OwnerReputation,
+    urs.GoldBadges,
+    urs.SilverBadges,
+    urs.BronzeBadges,
+    pwi.NumDuplicateLinks,
+    pwi.NumLinkedPosts,
+    lph.PostHistoryTypeId,
+    lph.Comment as LastHistoryComment,
+    coalesce(cfp.RecentUpvotes, 0) as RecentUpvotesLast30Days,
+    cfp.RecentCommentsCount,
+    cu.AvgPostInterval,
+    cu.AvgCommentInterval,
+    cu.AvgBadgeInterval
+from QuestionAnswerAggregates qqa
+join PostsWithLinkInfo pwi on pwi.PostId = qqa.QuestionId
+left join LatestPostHistoryPerPost lph on lph.PostId = qqa.QuestionId
+left join ComplexFilteredPosts cfp on cfp.Id = qqa.QuestionId
+left join ConsolidatedUserStats cu on cu.UserId = qqa.OwnerUserId
+left join UserReputationStats urs on urs.UserId = qqa.OwnerUserId
+where
+    (pwi.NumDuplicateLinks > 0 or lph.PostHistoryTypeId = 10)
+    and qqa.TotalAnswers > 2
+    and (coalesce(cu.GoldBadges,0) + coalesce(cu.SilverBadges,0) + coalesce(cu.BronzeBadges,0)) > 5
+order by qqa.TotalAnswers desc, cu.Reputation desc
+limit 50;

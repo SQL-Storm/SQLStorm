@@ -1,0 +1,172 @@
+WITH UserPostStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        SUM(p.Score) AS TotalScore,
+        AVG(p.Score) AS AvgScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        STRING_AGG(DISTINCT p.Tags, '; ') AS AllTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        TotalPosts,
+        QuestionCount,
+        AnswerCount,
+        TotalScore,
+        AvgScore,
+        LastPostDate,
+        AllTags,
+        ROW_NUMBER() OVER (ORDER BY TotalScore DESC) AS RankByScore,
+        ROW_NUMBER() OVER (ORDER BY TotalPosts DESC) AS RankByPosts
+    FROM UserPostStats
+),
+UserBadges AS (
+    SELECT 
+        b.UserId,
+        COUNT(b.Id) AS BadgeCount,
+        STRING_AGG(b.Name, ', ') AS BadgeNames,
+        STRING_AGG(CASE WHEN b.Class = 1 THEN b.Name ELSE NULL END, ', ') AS GoldBadges,
+        STRING_AGG(CASE WHEN b.Class = 2 THEN b.Name ELSE NULL END, ', ') AS SilverBadges,
+        STRING_AGG(CASE WHEN b.Class = 3 THEN b.Name ELSE NULL END, ', ') AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+QuestionAnalysis AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        COALESCE(p.Tags, '') AS Tags,
+        CASE 
+            WHEN p.AnswerCount > 0 THEN 
+                (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = p.Id AND a.PostTypeId = 2 AND a.Score > 0)
+            ELSE 0 
+        END AS PositiveAnswers,
+        CASE 
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Yes' 
+            ELSE 'No' 
+        END AS HasAcceptedAnswer,
+        CAST(
+            (EXTRACT(EPOCH FROM COALESCE(p.ClosedDate, TIMESTAMP '2024-10-01 12:34:56')) - EXTRACT(EPOCH FROM p.CreationDate))
+            / 86400
+        AS INTEGER) AS DaysOpen,
+        CASE 
+            WHEN p.Score > 10 THEN 'High'
+            WHEN p.Score > 0 THEN 'Medium'
+            ELSE 'Low'
+        END AS ScoreCategory
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+),
+AnswerAnalysis AS (
+    SELECT 
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.Score,
+        a.CreationDate,
+        a.OwnerUserId,
+        u.DisplayName AS AnswererName,
+        a.Body,
+        CASE 
+            WHEN a.Score >= 10 THEN 'Excellent'
+            WHEN a.Score >= 5 THEN 'Good'
+            WHEN a.Score >= 0 THEN 'Fair'
+            ELSE 'Poor'
+        END AS QualityRating,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS RankWithinQuestion
+    FROM Posts a
+    JOIN Users u ON a.OwnerUserId = u.Id
+    WHERE a.PostTypeId = 2
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        COALESCE((SELECT STRING_AGG(p.Title, '; ') FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%'), '') AS SampleQuestions,
+        (SELECT COUNT(*) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%') AS QuestionCount
+    FROM Tags t
+    WHERE t.Count > 100
+)
+SELECT 
+    'Performance Benchmark Report' AS ReportTitle,
+    COUNT(*) AS TotalUsers,
+    COUNT(CASE WHEN tu.RankByScore <= 5 THEN 1 END) AS Top5ScoredUsers,
+    COUNT(CASE WHEN tu.RankByPosts <= 5 THEN 1 END) AS Top5PostUsers,
+    COUNT(CASE WHEN qa.ScoreCategory = 'High' THEN 1 END) AS HighScoreQuestions,
+    COUNT(CASE WHEN qa.HasAcceptedAnswer = 'Yes' THEN 1 END) AS QuestionsWithAcceptedAnswer,
+    COUNT(CASE WHEN aa.RankWithinQuestion = 1 THEN 1 END) AS TopAnswers,
+    COUNT(CASE WHEN ta.QuestionCount > 1000 THEN 1 END) AS PopularTags,
+    AVG(tu.TotalScore) AS AvgUserScore,
+    AVG(qa.Score) AS AvgQuestionScore,
+    AVG(aa.Score) AS AvgAnswerScore,
+    MAX(ta.QuestionCount) AS MaxTagQuestions,
+    STRING_AGG(DISTINCT ta.TagName, ', ') AS PopularTagsList,
+    STRING_AGG(DISTINCT tu.DisplayName, ', ') AS TopUsersList,
+    STRING_AGG(DISTINCT qa.Title, '; ') AS SampleQuestions
+FROM TopUsers tu
+FULL OUTER JOIN QuestionAnalysis qa ON 1=1
+FULL OUTER JOIN AnswerAnalysis aa ON 1=1
+FULL OUTER JOIN TagAnalysis ta ON 1=1
+WHERE tu.UserId IS NOT NULL OR qa.QuestionId IS NOT NULL OR aa.AnswerId IS NOT NULL OR ta.TagName IS NOT NULL
+GROUP BY
+    tu.UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.TotalPosts,
+    tu.QuestionCount,
+    tu.AnswerCount,
+    tu.TotalScore,
+    tu.AvgScore,
+    tu.LastPostDate,
+    tu.AllTags,
+    tu.RankByScore,
+    tu.RankByPosts,
+    qa.QuestionId,
+    qa.Title,
+    qa.Score,
+    qa.ViewCount,
+    qa.AnswerCount,
+    qa.CommentCount,
+    qa.CreationDate,
+    qa.OwnerUserId,
+    qa.OwnerName,
+    qa.Tags,
+    qa.PositiveAnswers,
+    qa.HasAcceptedAnswer,
+    qa.DaysOpen,
+    qa.ScoreCategory,
+    aa.AnswerId,
+    aa.QuestionId,
+    aa.Score,
+    aa.CreationDate,
+    aa.OwnerUserId,
+    aa.AnswererName,
+    aa.Body,
+    aa.QualityRating,
+    aa.RankWithinQuestion,
+    ta.TagName,
+    ta.TagCount,
+    ta.ExcerptPostId,
+    ta.WikiPostId,
+    ta.SampleQuestions,
+    ta.QuestionCount;

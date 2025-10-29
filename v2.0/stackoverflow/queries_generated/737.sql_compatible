@@ -1,0 +1,326 @@
+with
+q as (
+  select
+    p.Id as QuestionId,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.AcceptedAnswerId,
+    coalesce(nullif(trim(p.OwnerDisplayName), ''), u.DisplayName, '(unknown)') as OwnerDisplay,
+    u.Reputation,
+    u.Location
+  from Posts p
+  left join Users u on u.Id = p.OwnerUserId
+  where p.PostTypeId = 1
+),
+answers as (
+  select
+    a.ParentId as QuestionId,
+    a.Id as AnswerId,
+    a.OwnerUserId as AnswerOwnerId,
+    a.Score as AnswerScore,
+    a.CreationDate as AnswerCreationDate,
+    row_number() over (partition by a.ParentId order by a.Score desc, a.Id) as rn_by_score,
+    row_number() over (partition by a.ParentId order by a.CreationDate) as rn_by_age
+  from Posts a
+  where a.PostTypeId = 2
+),
+votes_agg as (
+  select
+    v.PostId,
+    count(case when v.VoteTypeId = 2 then 1 end) as upvotes,
+    count(case when v.VoteTypeId = 3 then 1 end) as downvotes,
+    count(case when v.VoteTypeId = 5 then 1 end) as favorites,
+    count(case when v.VoteTypeId = 8 then 1 end) as bounties_started,
+    sum(case when v.VoteTypeId in (8,9) then v.BountyAmount else 0 end) as bounty_amount_total,
+    min(v.CreationDate) as first_vote_at,
+    max(v.CreationDate) as last_vote_at
+  from Votes v
+  group by v.PostId
+),
+comment_agg as (
+  select
+    c.PostId,
+    count(*) as comment_count,
+    max(c.Score) as max_comment_score,
+    sum(case when c.Score >= 5 then 1 else 0 end) as hot_comment_count,
+    string_agg(substring(c.Text from 1 for 50), ' | ' order by c.Score desc, c.Id) as sample_comments
+  from Comments c
+  group by c.PostId
+),
+edits as (
+  select
+    ph.PostId,
+    count(case when ph.PostHistoryTypeId in (4,5,6) then 1 end) as edit_count,
+    count(case when ph.PostHistoryTypeId = 10 then 1 end) as close_events,
+    min(ph.CreationDate) as first_hist,
+    max(ph.CreationDate) as last_hist,
+    max(case when ph.PostHistoryTypeId in (35,36) then ph.PostHistoryTypeId else null end) as any_migration
+  from PostHistory ph
+  group by ph.PostId
+),
+dupes as (
+  select
+    pl.PostId as QuestionId,
+    count(case when pl.LinkTypeId = 3 then 1 end) as duplicate_marks,
+    count(case when pl.LinkTypeId = 1 then 1 end) as linked_refs,
+    min(pl.CreationDate) as first_link_at,
+    max(pl.CreationDate) as last_link_at
+  from PostLinks pl
+  join Posts p on p.Id = pl.PostId and p.PostTypeId = 1
+  group by pl.PostId
+),
+tag_norm as (
+  select
+    q.QuestionId,
+    unnest(string_to_array(substring(q.Tags from 2 for greatest(length(q.Tags)-2,0)), '><')) as tag
+  from q
+  where q.Tags is not null and length(q.Tags) > 2
+),
+tag_meta as (
+  select
+    tn.QuestionId,
+    count(*) as tag_count,
+    sum(case when lower(tn.tag) like any(array['%sql%','%db%','%postgres%','%mysql%']) then 1 else 0 end) as db_tag_hits,
+    max(case when lower(tn.tag) = 'status-completed' then 1 else 0 end) as has_status_completed
+  from tag_norm tn
+  group by tn.QuestionId
+),
+user_stats as (
+  select
+    u.Id as UserId,
+    count(*) as total_posts,
+    sum(case when p.PostTypeId = 1 then 1 else 0 end) as total_questions,
+    sum(case when p.PostTypeId = 2 then 1 else 0 end) as total_answers,
+    sum(coalesce(p.Score,0)) as total_post_score,
+    percentile_cont(0.9) within group (order by coalesce(p.Score,0)) as p90_post_score
+  from Users u
+  left join Posts p on p.OwnerUserId = u.Id
+  group by u.Id
+),
+best_answer as (
+  select
+    a.QuestionId,
+    a.AnswerId as TopAnswerId,
+    a.AnswerScore as TopAnswerScore
+  from answers a
+  where a.rn_by_score = 1
+),
+first_answer as (
+  select
+    a.QuestionId,
+    a.AnswerId as FirstAnswerId,
+    a.AnswerCreationDate as FirstAnswerAt
+  from answers a
+  where a.rn_by_age = 1
+),
+accepted_answer as (
+  select
+    q.QuestionId,
+    q.AcceptedAnswerId
+  from q
+  where q.AcceptedAnswerId is not null
+),
+activity_span as (
+  select
+    q.QuestionId,
+    cast(extract(epoch from (coalesce(v.last_vote_at, e.last_hist, q.CreationDate) - q.CreationDate)) as bigint) as seconds_to_last_activity,
+    cast(extract(epoch from (coalesce(fa.FirstAnswerAt, q.CreationDate) - q.CreationDate)) as bigint) as seconds_to_first_answer
+  from q
+  left join votes_agg v on v.PostId = q.QuestionId
+  left join edits e on e.PostId = q.QuestionId
+  left join first_answer fa on fa.QuestionId = q.QuestionId
+),
+quality_flags as (
+  select
+    q.QuestionId,
+    case
+      when coalesce(v.upvotes,0) - coalesce(v.downvotes,0) >= 100 then 'exceptional'
+      when coalesce(v.upvotes,0) - coalesce(v.downvotes,0) >= 25 then 'great'
+      when coalesce(v.upvotes,0) - coalesce(v.downvotes,0) >= 5 then 'good'
+      when coalesce(v.upvotes,0) - coalesce(v.downvotes,0) <= -3 then 'controversial'
+      else 'average'
+    end as quality_bucket,
+    case when coalesce(d.duplicate_marks,0) > 0 then 1 else 0 end as is_marked_duplicate,
+    case when q.ViewCount >= 10000 then 1 else 0 end as is_high_traffic,
+    case when q.Score <= 0 and coalesce(c.comment_count,0) > 5 then 1 else 0 end as is_heated_comments
+  from q
+  left join votes_agg v on v.PostId = q.QuestionId
+  left join dupes d on d.QuestionId = q.QuestionId
+  left join comment_agg c on c.PostId = q.QuestionId
+),
+cte_union as (
+  select QuestionId from best_answer
+  union
+  select QuestionId from first_answer
+  union
+  select QuestionId from accepted_answer
+),
+ranked as (
+  select
+    q.QuestionId,
+    q.Title,
+    q.OwnerDisplay,
+    q.Reputation,
+    q.Location,
+    q.Score as QuestionScore,
+    coalesce(v.upvotes,0) as UpVotes,
+    coalesce(v.downvotes,0) as DownVotes,
+    coalesce(v.favorites,0) as Favorites,
+    coalesce(v.bounties_started,0) as BountyStarts,
+    coalesce(v.bounty_amount_total,0) as BountyAmount,
+    coalesce(c.comment_count,0) as CommentCount,
+    coalesce(c.max_comment_score,0) as MaxCommentScore,
+    e.edit_count,
+    e.close_events,
+    d.duplicate_marks,
+    d.linked_refs,
+    t.tag_count,
+    t.db_tag_hits,
+    t.has_status_completed,
+    ba.TopAnswerId,
+    ba.TopAnswerScore,
+    fa.FirstAnswerId,
+    fa.FirstAnswerAt,
+    ac.AcceptedAnswerId,
+    act.seconds_to_last_activity,
+    act.seconds_to_first_answer,
+    q.ViewCount,
+    q.CreationDate,
+    q.Tags,
+    q.OwnerUserId,
+    us.total_posts,
+    us.total_questions,
+    us.total_answers,
+    us.total_post_score,
+    us.p90_post_score,
+    qn.quality_bucket,
+    qn.is_marked_duplicate,
+    qn.is_high_traffic,
+    qn.is_heated_comments,
+    case
+      when ac.AcceptedAnswerId is not null then 'Accepted'
+      when ba.TopAnswerId is not null then 'Answered'
+      else 'Unanswered'
+    end as AnswerState,
+    row_number() over (
+      partition by case when q.OwnerUserId is null then -1 else q.OwnerUserId end
+      order by (coalesce(v.upvotes,0) - coalesce(v.downvotes,0)) desc, q.ViewCount desc, q.QuestionId
+    ) as rn_per_user_by_netvotes,
+    dense_rank() over (
+      order by
+        (coalesce(v.upvotes,0) - coalesce(v.downvotes,0)) desc,
+        coalesce(v.favorites,0) desc,
+        q.ViewCount desc
+    ) as global_popularity_rank
+  from q
+  left join votes_agg v on v.PostId = q.QuestionId
+  left join comment_agg c on c.PostId = q.QuestionId
+  left join edits e on e.PostId = q.QuestionId
+  left join dupes d on d.QuestionId = q.QuestionId
+  left join tag_meta t on t.QuestionId = q.QuestionId
+  left join best_answer ba on ba.QuestionId = q.QuestionId
+  left join first_answer fa on fa.QuestionId = q.QuestionId
+  left join accepted_answer ac on ac.QuestionId = q.QuestionId
+  left join activity_span act on act.QuestionId = q.QuestionId
+  left join Users u on u.Id = q.OwnerUserId
+  left join user_stats us on us.UserId = u.Id
+  left join quality_flags qn on qn.QuestionId = q.QuestionId
+),
+filtering as (
+  select
+    r.*
+  from ranked r
+  where
+    (
+      r.QuestionScore >= 5
+      or (r.UpVotes - r.DownVotes) >= 10
+      or (r.BountyAmount > 0 and r.AnswerState <> 'Accepted')
+      or (r.AnswerState = 'Unanswered' and coalesce(r.seconds_to_first_answer, 315360000) > 86400)
+    )
+    and coalesce(r.tag_count, 0) between 1 and 5
+    and (
+      r.Location is null
+      or r.Location ~* '(us|uk|germany|india|canada|australia)'
+      or length(r.Location) > 10
+    )
+    and not exists (
+      select 1
+      from PostHistory ph
+      where ph.PostId = r.QuestionId
+        and ph.PostHistoryTypeId = 14
+    )
+)
+select
+  f.QuestionId,
+  coalesce(nullif(btrim(f.Title), ''), '(no title)') as Title,
+  f.OwnerDisplay,
+  f.Reputation,
+  f.Location,
+  f.QuestionScore,
+  f.UpVotes,
+  f.DownVotes,
+  (f.UpVotes - f.DownVotes) as NetVotes,
+  f.Favorites,
+  f.BountyStarts,
+  f.BountyAmount,
+  f.CommentCount,
+  f.MaxCommentScore,
+  coalesce(f.edit_count,0) as EditCount,
+  coalesce(f.close_events,0) as CloseEvents,
+  coalesce(f.duplicate_marks,0) as DuplicateMarks,
+  coalesce(f.linked_refs,0) as LinkedRefs,
+  coalesce(f.tag_count,0) as TagCount,
+  coalesce(f.db_tag_hits,0) as DBTagHits,
+  f.has_status_completed,
+  f.TopAnswerId,
+  f.TopAnswerScore,
+  f.FirstAnswerId,
+  f.FirstAnswerAt,
+  f.AcceptedAnswerId,
+  f.seconds_to_last_activity,
+  f.seconds_to_first_answer,
+  f.ViewCount,
+  f.CreationDate,
+  left(coalesce(f.Tags,''), 300) as TagsSnippet,
+  f.AnswerState,
+  f.quality_bucket,
+  f.is_marked_duplicate,
+  f.is_high_traffic,
+  f.is_heated_comments,
+  f.total_posts,
+  f.total_questions,
+  f.total_answers,
+  f.total_post_score,
+  f.p90_post_score,
+  f.rn_per_user_by_netvotes,
+  f.global_popularity_rank,
+  case
+    when f.AcceptedAnswerId is not null and f.TopAnswerId = f.AcceptedAnswerId then 'Accepted=Top'
+    when f.AcceptedAnswerId is not null and f.TopAnswerId is not null then 'Accepted!=Top'
+    when f.AcceptedAnswerId is null and f.TopAnswerId is not null then 'TopOnly'
+    else 'NoAnswers'
+  end as AcceptanceVsTop,
+  case
+    when f.BountyAmount > 500 then 'whale'
+    when f.BountyAmount between 100 and 500 then 'big'
+    when f.BountyAmount between 50 and 99 then 'medium'
+    when f.BountyAmount between 1 and 49 then 'small'
+    else 'none'
+  end as BountyTier
+from filtering f
+where
+  (
+    f.global_popularity_rank <= 1000
+    or f.rn_per_user_by_netvotes <= 3
+    or (f.is_marked_duplicate = 1 and f.quality_bucket in ('great','exceptional'))
+  )
+order by
+  f.global_popularity_rank nulls last,
+  (f.UpVotes - f.DownVotes) desc,
+  f.ViewCount desc,
+  f.QuestionId
+limit 500;

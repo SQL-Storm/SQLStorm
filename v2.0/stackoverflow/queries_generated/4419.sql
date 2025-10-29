@@ -1,0 +1,141 @@
+-- {"query": "4419.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1197} 
+
+WITH
+  RankedQuestions AS (
+    SELECT
+      p.Id AS QuestionId,
+      p.Title AS QuestionTitle,
+      p.OwnerUserId AS QuestionOwnerUserId,
+      p.CreationDate AS QuestionCreationDate,
+      p.Score AS QuestionScore,
+      u.DisplayName AS QuestionOwnerDisplayName,
+      ROW_NUMBER() OVER (
+        PARTITION BY
+          p.OwnerUserId
+        ORDER BY
+          p.CreationDate DESC
+      ) AS RowNum,
+      COUNT(a.Id) OVER (PARTITION BY p.Id) AS AnswerCountForQuestion
+    FROM Posts AS p
+    JOIN Users AS u
+      ON p.OwnerUserId = u.Id
+    WHERE
+      p.PostTypeId = 1 AND p.OwnerUserId IS NOT NULL AND u.DisplayName IS NOT NULL
+  ),
+  AnswerStats AS (
+    SELECT
+      a.ParentId AS QuestionId,
+      COUNT(a.Id) AS TotalAnswers,
+      SUM(CASE WHEN a.Id = p.AcceptedAnswerId THEN 1 ELSE 0 END) AS IsAcceptedAnswerCount,
+      AVG(CAST(a.Score AS DECIMAL(10, 2))) AS AverageAnswerScore,
+      MAX(a.CreationDate) AS LatestAnswerDate
+    FROM Posts AS a
+    JOIN Posts AS p
+      ON a.ParentId = p.Id
+    WHERE
+      a.PostTypeId = 2
+    GROUP BY
+      a.ParentId
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      COUNT(DISTINCT ph.Id) AS PostHistoryCount,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+      COUNT(DISTINCT b.Id) AS BadgeCount,
+      MAX(u.LastAccessDate) AS LastUserAccessDate,
+      COUNT(DISTINCT c.Id) AS CommentCount
+    FROM Users AS u
+    LEFT JOIN PostHistory AS ph
+      ON u.Id = ph.UserId
+    LEFT JOIN Votes AS v
+      ON u.Id = v.UserId
+    LEFT JOIN Badges AS b
+      ON u.Id = b.UserId
+    LEFT JOIN Comments AS c
+      ON u.Id = c.UserId
+    GROUP BY
+      u.Id,
+      u.DisplayName
+  )
+SELECT
+  rq.QuestionId,
+  rq.QuestionTitle,
+  rq.QuestionOwnerDisplayName,
+  rq.QuestionCreationDate,
+  rq.QuestionScore,
+  COALESCE(ans.TotalAnswers, 0) AS TotalAnswers,
+  COALESCE(ans.IsAcceptedAnswerCount, 0) AS AcceptedAnswers,
+  COALESCE(ans.AverageAnswerScore, 0.0) AS AverageAnswerScore,
+  CASE
+    WHEN rq.AnswerCountForQuestion > 0 AND ans.LatestAnswerDate > rq.QuestionCreationDate THEN JULIANDAY(ans.LatestAnswerDate) - JULIANDAY(rq.QuestionCreationDate)
+    ELSE 0
+  END AS AnswerResponseTimeDays,
+  ua.PostHistoryCount,
+  ua.UpVoteCount,
+  ua.DownVoteCount,
+  ua.BadgeCount,
+  ua.LastUserAccessDate,
+  ua.CommentCount,
+  (
+    SELECT
+      COUNT(p_inner.Id)
+    FROM Posts AS p_inner
+    WHERE
+      p_inner.OwnerUserId = rq.QuestionOwnerUserId
+      AND p_inner.PostTypeId = 2 /* Answers */
+      AND p_inner.Score > 10
+  ) AS HighScoringAnswersByOwner,
+  CASE
+    WHEN rq.QuestionScore < 0 THEN 'Negative'
+    WHEN rq.QuestionScore BETWEEN 0 AND 50 THEN 'Low'
+    WHEN rq.QuestionScore BETWEEN 51 AND 500 THEN 'Medium'
+    ELSE 'High'
+  END AS QuestionScoreCategory,
+  IIF(
+    EXISTS(
+      SELECT
+        1
+      FROM PostLinks AS pl
+      WHERE
+        pl.PostId = rq.QuestionId AND pl.LinkTypeId = 3
+    ),
+    'Has Duplicate Link',
+    'No Duplicate Link'
+  ) AS DuplicateStatus,
+  UPPER(SUBSTR(rq.QuestionOwnerDisplayName, 1, 3)) AS OwnerDisplayNamePrefix
+FROM RankedQuestions AS rq
+LEFT JOIN AnswerStats AS ans
+  ON rq.QuestionId = ans.QuestionId
+LEFT JOIN UserActivity AS ua
+  ON rq.QuestionOwnerUserId = ua.UserId
+WHERE
+  rq.RowNum <= 100 AND rq.QuestionScore > 5 AND ua.BadgeCount > 50
+UNION
+SELECT
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL
+FROM Posts AS p_union
+WHERE
+  p_union.PostTypeId = 5 /* Tag Wiki */
+LIMIT 100;

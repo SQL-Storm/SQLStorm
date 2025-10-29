@@ -1,0 +1,154 @@
+-- {"query": "2859.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1449} 
+with RankedAnswers as (
+    select 
+        a.Id,
+        a.ParentId,
+        a.Score,
+        a.CreationDate,
+        a.OwnerUserId,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as rn,
+        count(*) over (partition by a.ParentId) as total_answers,
+        avg(a.Score) over (partition by a.ParentId) as avg_score,
+        max(a.Score) over (partition by a.ParentId) as max_score
+    from Posts a
+    where a.PostTypeId = 2
+),
+QuestionStats as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.OwnerUserId,
+        coalesce(q.Score,0) as QuestionScore,
+        coalesce(q.ViewCount,0) as Views,
+        coalesce(q.AnswerCount,0) as AnswerCount,
+        b.BadgeCount,
+        rt.Name as RecentHistoryType,
+        ch.Name as CloseReason,
+        case when q.ClosedDate is not null then 1 else 0 end as IsClosed,
+        string_agg(distinct t.TagName, ',') as Tags
+    from Posts q
+    left join (
+        select 
+            ph.PostId, 
+            max(pht.Name) as Name
+        from PostHistory ph
+        join PostHistoryTypes pht on pht.Id = ph.PostHistoryTypeId
+        where ph.CreationDate > current_date - interval '30 days'
+        group by ph.PostId
+    ) rt on rt.PostId = q.Id
+    left join PostHistory ph2 on ph2.PostId = q.Id and ph2.PostHistoryTypeId = 10
+    left join CloseReasonTypes ch on ch.Id::varchar = ph2.Comment
+    left join (
+        select UserId, count(*) as BadgeCount
+        from Badges
+        group by UserId
+    ) b on b.UserId = q.OwnerUserId
+    left join Tags t on t.WikiPostId = q.Id
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.CreationDate, q.OwnerUserId, q.Score, q.ViewCount, q.AnswerCount, b.BadgeCount, rt.Name, ch.Name, q.ClosedDate
+),
+UserAggregates as (
+    select 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        coalesce(sum(b.Class=1)::int,0) as GoldBadges,
+        coalesce(sum(b.Class=2)::int,0) as SilverBadges,
+        coalesce(sum(b.Class=3)::int,0) as BronzeBadges,
+        max(p.Score) filter (where p.PostTypeId=1) as MaxQuestionScore,
+        max(p.Score) filter (where p.PostTypeId=2) as MaxAnswerScore,
+        count(distinct ph.PostId) filter (where ph.PostHistoryTypeId in (10,11)) as CloseReopenEvents,
+        lead(u.LastAccessDate) over (order by u.Reputation desc) as NextUserLastAccess,
+        lag(u.LastAccessDate) over (order by u.Reputation desc) as PrevUserLastAccess
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    left join Posts p on p.OwnerUserId = u.Id
+    left join PostHistory ph on ph.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.LastAccessDate
+),
+AnswerDetails as (
+    select 
+        ra.*,
+        u.DisplayName as AnswerOwner,
+        q.Title as QuestionTitle,
+        case when ra.Score > (select avg(Score) from Posts where ParentId = ra.ParentId and PostTypeId=2) then 1 else 0 end as AboveAverageScore,
+        coalesce(v.UpVotes,0) as UpVotes,
+        coalesce(v.DownVotes,0) as DownVotes,
+        coalesce(v.UpVotes,0) - coalesce(v.DownVotes,0) as VoteDifference,
+        length(ra.Body) as BodyLength
+    from RankedAnswers ra
+    join Posts q on q.Id = ra.ParentId and q.PostTypeId = 1
+    left join Users u on u.Id = ra.OwnerUserId
+    left join (
+        select 
+            PostId,
+            sum(case when VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+            sum(case when VoteTypeId = 3 then 1 else 0 end) as DownVotes
+        from Votes
+        group by PostId
+    ) v on v.PostId = ra.Id
+),
+TopQuestionsWithAnswers as (
+    select
+        qs.*,
+        ad.Id as AnswerId,
+        ad.Score as AnswerScore,
+        ad.AnswerOwner,
+        ad.AboveAverageScore,
+        ad.VoteDifference,
+        ad.BodyLength
+    from QuestionStats qs
+    left join AnswerDetails ad on ad.ParentId = qs.QuestionId and ad.rn = 1
+    where qs.AnswerCount > 0
+)
+select 
+    tq.QuestionId,
+    tq.Title as QuestionTitle,
+    tq.Tags,
+    tq.QuestionScore,
+    tq.Views,
+    tq.AnswerCount,
+    tq.BadgeCount as OwnerBadgeCount,
+    ua.DisplayName as OwnerUserName,
+    ua.Reputation as OwnerReputation,
+    ua.GoldBadges,
+    ua.SilverBadges,
+    ua.BronzeBadges,
+    tq.IsClosed,
+    tq.CloseReason,
+    tq.RecentHistoryType,
+    tq.AnswerId,
+    tq.AnswerScore,
+    tq.AnswerOwner,
+    tq.AboveAverageScore,
+    tq.VoteDifference,
+    tq.BodyLength,
+    ua.CloseReopenEvents,
+    ua.NextUserLastAccess,
+    ua.PrevUserLastAccess,
+    case 
+        when tq.AnswerScore > tq.QuestionScore then 'Answer Outscored Question'
+        when tq.AnswerScore = tq.QuestionScore then 'Answer Tied Question'
+        else 'Question Outscored Answer'
+    end as ScoreComparison,
+    case 
+        when tq.Tags ilike '%sql%' then 'Has SQL Tag' 
+        else 'No SQL Tag' 
+    end as SqlTagIndicator
+from TopQuestionsWithAnswers tq
+left join UserAggregates ua on ua.Id = tq.OwnerUserId
+where
+    (
+        (ua.Reputation > 10000 and tq.Views > 5000)
+        or
+        (tq.IsClosed = 1 and ua.GoldBadges > 0)
+    )
+    and
+    (
+        tq.RecentHistoryType is null
+        or
+        tq.RecentHistoryType not in ('Post Closed', 'Post Deleted')
+    )
+order by ua.Reputation desc nulls last, tq.Views desc, tq.QuestionScore desc
+limit 100;

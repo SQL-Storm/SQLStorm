@@ -1,0 +1,117 @@
+-- {"query": "4829.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1302} 
+WITH RankedPostEdits AS (
+    SELECT
+        ph.PostId,
+        ph.UserId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        u.DisplayName AS EditorDisplayName,
+        ROW_NUMBER() OVER(PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate DESC) as rn
+    FROM PostHistory ph
+    JOIN Users u ON ph.UserId = u.Id
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+),
+PostEditCounts AS (
+    SELECT
+        PostId,
+        COUNT(DISTINCT UserId) AS DistinctEditors,
+        SUM(CASE WHEN rn = 1 THEN 1 ELSE 0 END) AS MostRecentEditsCount
+    FROM RankedPostEdits
+    GROUP BY PostId
+),
+RecentQuestions AS (
+    SELECT
+        Id,
+        OwnerUserId,
+        Title,
+        Tags,
+        ViewCount,
+        FavoriteCount,
+        AnswerCount,
+        CreationDate
+    FROM Posts
+    WHERE PostTypeId = 1 -- Question
+      AND CreationDate >= DATE('now', '-365 day')
+),
+UserQuestionStats AS (
+    SELECT
+        rq.OwnerUserId,
+        COUNT(rq.Id) AS TotalQuestions,
+        AVG(rq.ViewCount) AS AvgQuestionViews,
+        SUM(CASE WHEN rq.FavoriteCount > 0 THEN 1 ELSE 0 END) AS QuestionsFavorited,
+        MAX(rq.CreationDate) AS LatestQuestionDate
+    FROM RecentQuestions rq
+    WHERE rq.OwnerUserId IS NOT NULL
+    GROUP BY rq.OwnerUserId
+),
+QuestionTagCounts AS (
+    SELECT
+        p.Id AS PostId,
+        pt.TagName,
+        COUNT(CASE WHEN p.CreationDate >= DATE('now', '-30 day') THEN 1 ELSE NULL END) AS RecentTagCount,
+        COUNT(p.Id) AS TotalTagCount
+    FROM Posts p
+    JOIN (
+        SELECT
+            Id,
+            TRIM(value) AS TagName
+        FROM Posts
+        CROSS APPLY string_to_array(SUBSTRING(Tags, 2, LENGTH(Tags) - 2), '><') AS tag_array
+        CROSS APPLY UNNEST(tag_array) AS pt(value)
+        WHERE Tags IS NOT NULL AND Tags <> ''
+    ) pt ON pt.TagName = SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2) -- Simplistic tag extraction, real one is complex
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, pt.TagName
+)
+SELECT
+    rq.Id AS QuestionId,
+    rq.Title AS QuestionTitle,
+    u.DisplayName AS OriginalPoster,
+    COALESCE(uot.TotalQuestions, 0) AS UserTotalQuestions,
+    COALESCE(uot.AvgQuestionViews, 0.0) AS UserAvgQuestionViews,
+    COALESCE(pec.DistinctEditors, 0) AS QuestionDistinctEditors,
+    COALESCE(pec.MostRecentEditsCount, 0) AS QuestionMostRecentEdits,
+    CASE
+        WHEN rq.AnswerCount IS NULL THEN 'N/A'
+        WHEN rq.AnswerCount = 0 THEN 'No Answers'
+        WHEN rq.AnswerCount > 10 THEN 'Many Answers'
+        ELSE CAST(rq.AnswerCount AS VARCHAR)
+    END AS AnswerSummary,
+    LOWER(REPLACE(REPLACE(rq.Tags, '><', ' '), '<', '')) AS FormattedTags,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = rq.Id AND c.Score > 5) AS HighScoreComments,
+    CASE
+        WHEN qtc.RecentTagCount > 0 THEN 'Active Today'
+        WHEN qtc.TotalTagCount > 100 THEN 'Popular Tag'
+        ELSE 'Standard Tag'
+    END AS TagActivityStatus,
+    CASE
+        WHEN rq.ViewCount IS NULL THEN 0
+        WHEN rq.ViewCount > 1000000 THEN 1000000
+        ELSE rq.ViewCount
+    END AS ClampedViewCount,
+    CASE
+        WHEN rq.FavoriteCount IS NULL OR rq.FavoriteCount = 0 THEN 'Not Favorited'
+        WHEN rq.FavoriteCount >= 5 THEN 'Highly Favorited'
+        ELSE 'Favorited'
+    END AS FavoriteStatus,
+    CASE
+        WHEN rq.CreationDate < DATE('now', '-180 day') AND rq.AnswerCount = 0 THEN 'Old and Unanswered'
+        WHEN rq.CreationDate >= DATE('now', '-7 day') THEN 'Recent'
+        ELSE 'Established'
+    END AS QuestionAgeCategory,
+    CASE
+        WHEN EXISTS (SELECT 1 FROM PostLinks pl WHERE pl.PostId = rq.Id AND pl.LinkTypeId = 3) THEN 'Has Duplicates'
+        ELSE 'No Known Duplicates'
+    END AS DuplicateStatus
+FROM RecentQuestions rq
+LEFT JOIN Users u ON rq.OwnerUserId = u.Id
+LEFT JOIN UserQuestionStats uot ON rq.OwnerUserId = uot.OwnerUserId
+LEFT JOIN PostEditCounts pec ON rq.Id = pec.PostId
+LEFT JOIN QuestionTagCounts qtc ON rq.Id = qtc.PostId
+WHERE rq.Title IS NOT NULL
+  AND LENGTH(rq.Title) > 10
+  AND rq.ViewCount > 100
+  AND COALESCE(rq.FavoriteCount, 0) > 0
+  OR rq.Id IN (SELECT PostId FROM Votes WHERE VoteTypeId = 2 AND UserId = 12345) -- Arbitrary user ID
+ORDER BY rq.CreationDate DESC
+LIMIT 1000;

@@ -1,0 +1,244 @@
+-- {"query": "1728.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3741} 
+
+WITH UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.Views AS UserViews,
+        u.UpVotes AS UserUpVotes,
+        u.DownVotes AS UserDownVotes,
+        COALESCE(u.Location, 'Unknown') AS Location,
+        COUNT(DISTINCT q.Id) AS QuestionCount,
+        COUNT(DISTINCT a.Id) AS AnswerCount,
+        SUM(CASE WHEN q.Id IS NOT NULL THEN q.Score ELSE 0 END) AS TotalQuestionScore,
+        SUM(CASE WHEN a.Id IS NOT NULL THEN a.Score ELSE 0 END) AS TotalAnswerScore,
+        SUM(CASE WHEN q.Id IS NOT NULL AND q.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS AcceptedAnswerCountForQuestions,
+        SUM(CASE WHEN a.AcceptedAnswerId IS NOT NULL AND a.PostTypeId = 2 THEN 1 ELSE 0 END) AS AcceptedAnswerCountByAnswers,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        MAX(b.Date) AS LatestBadgeDate,
+        COUNT(c.Id) AS TotalCommentsMade,
+        SUM(COALESCE(c.Score, 0)) AS TotalCommentScore,
+        MAX(c.CreationDate) AS LatestCommentDate,
+        EXTRACT(EPOCH FROM (u.LastAccessDate - u.CreationDate)) / (3600 * 24) AS UserActivityDurationDays
+    FROM
+        Users u
+    LEFT JOIN Posts q ON u.Id = q.OwnerUserId AND q.PostTypeId = 1
+    LEFT JOIN Posts a ON u.Id = a.OwnerUserId AND a.PostTypeId = 2
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes, u.Location
+),
+PostQualityMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.LastActivityDate,
+        p.Score,
+        p.ViewCount,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        p.CommentCount,
+        COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+        p.Title,
+        p.Tags,
+        p.ClosedDate,
+        (p.Score * 0.6 + p.ViewCount * 0.1 + COALESCE(p.AnswerCount, 0) * 0.15 + COALESCE(p.FavoriteCount, 0) * 0.15) AS DerivedEngagementScore,
+        CASE
+            WHEN p.Body ILIKE '%error%' OR p.Body ILIKE '%bug%' OR p.Body ILIKE '%exception%' THEN TRUE
+            ELSE FALSE
+        END AS ContainsProblemKeywords,
+        CASE
+            WHEN p.Title ILIKE '%sql%' OR p.Tags ILIKE '%<sql>%' OR p.Tags ILIKE '%<database>%' THEN 'SQL/DB'
+            WHEN p.Title ILIKE '%python%' OR p.Tags ILIKE '%<python>%' THEN 'Python'
+            WHEN p.Title ILIKE '%javascript%' OR p.Tags ILIKE '%<javascript>%' THEN 'JavaScript'
+            WHEN p.Title ILIKE '%java%' OR p.Tags ILIKE '%<java>%' THEN 'Java'
+            ELSE 'Other Programming'
+        END AS TechnologyCategory,
+        (SELECT COUNT(DISTINCT co.UserId) FROM Comments co WHERE co.PostId = p.Id AND co.CreationDate > p.CreationDate + INTERVAL '1 hour' AND co.UserId IS NOT NULL) AS UniqueCommentersAfterHour,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId, p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS RnPerUserPostTypeScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS AvgScorePerUser,
+        SUM(p.ViewCount) OVER (PARTITION BY p.PostTypeId) AS TotalViewsPerPostType,
+        LAG(p.CreationDate, 1, p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostCreationDate,
+        COUNT(ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6) AND ph.UserId IS NOT NULL) AS EditCountByUsers,
+        MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6) AND ph.UserId IS NOT NULL) AS LastSignificantEditDate,
+        (SELECT MIN(ph2.CreationDate) FROM PostHistory ph2 WHERE ph2.PostId = p.Id AND ph2.PostHistoryTypeId IN (4,5,6) AND ph2.CreationDate > p.CreationDate) AS FirstEditAfterCreation,
+        (SELECT MIN(ph3.CreationDate) FROM PostHistory ph3 WHERE ph3.PostId = p.Id AND ph3.PostHistoryTypeId = 10) AS FirstClosureDate,
+        (SELECT COUNT(DISTINCT pl.RelatedPostId) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3) AS OutgoingDuplicateLinksCount
+    FROM
+        Posts p
+    LEFT JOIN
+        PostHistory ph ON p.Id = ph.PostId
+    WHERE
+        p.CreationDate >= '2020-01-01' AND p.CreationDate < '2023-01-01' AND p.PostTypeId IN (1, 2)
+),
+CorrelatedPostInsights AS (
+    SELECT
+        pqm.PostId,
+        pqm.OwnerUserId,
+        pqm.PostTypeId,
+        pqm.DerivedEngagementScore,
+        pqm.ContainsProblemKeywords,
+        pqm.TechnologyCategory,
+        pqm.RnPerUserPostTypeScore,
+        pqm.AvgScorePerUser,
+        pqm.EditCountByUsers,
+        pqm.FirstClosureDate,
+        pqm.PostCreationDate,
+        pqm.OutgoingDuplicateLinksCount,
+        EXTRACT(HOUR FROM (pqm.LastSignificantEditDate - pqm.PostCreationDate)) AS HoursToLastSignificantEdit,
+        EXTRACT(DAY FROM (pqm.PostCreationDate - pqm.PreviousPostCreationDate)) AS DaysSincePreviousPost,
+        (
+            SELECT AVG(COALESCE(sub_p.Score, 0))
+            FROM Posts sub_p
+            WHERE sub_p.ParentId = p_original.ParentId AND p_original.PostTypeId = 2 -- Only applicable for answers
+              AND sub_p.PostTypeId = 2
+              AND sub_p.Id != p_original.Id
+              AND sub_p.CreationDate BETWEEN p_original.CreationDate - INTERVAL '1 month' AND p_original.CreationDate + INTERVAL '1 month'
+              AND EXISTS (SELECT 1 FROM Users u_sub WHERE u_sub.Id = sub_p.OwnerUserId AND u_sub.Reputation > 500)
+        ) AS AvgSiblingAnswerScoreWithinMonth
+    FROM
+        PostQualityMetrics pqm
+    LEFT JOIN Posts p_original ON pqm.PostId = p_original.Id
+    WHERE
+        pqm.RnPerUserPostTypeScore <= 5 AND pqm.OwnerUserId IS NOT NULL
+),
+ModerationFlags AS (
+    SELECT
+        ph.PostId,
+        COUNT(ph.Id) FILTER (WHERE ph.PostHistoryTypeId = 10) AS CloseVotesCount,
+        COUNT(ph.Id) FILTER (WHERE ph.PostHistoryTypeId = 11) AS ReopenVotesCount,
+        COUNT(ph.Id) FILTER (WHERE ph.PostHistoryTypeId = 12) AS DeletionVotesCount,
+        MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId = 10) AS LatestCloseVoteDate,
+        MIN(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId = 10 AND ph.Comment = '101') AS FirstDuplicateCloseDate,
+        STRING_AGG(DISTINCT crt.Name, ' | ') FILTER (WHERE ph.PostHistoryTypeId = 10 AND ph.Comment IS NOT NULL AND crt.Name IS NOT NULL) AS DistinctCloseReasons
+    FROM
+        PostHistory ph
+    LEFT JOIN
+        CloseReasonTypes crt ON ph.PostHistoryTypeId = 10 AND ph.Comment = crt.Id::text
+    WHERE
+        ph.PostHistoryTypeId IN (10, 11, 12)
+    GROUP BY
+        ph.PostId
+),
+LinkedContentAnalysis AS (
+    SELECT
+        pl.PostId,
+        COUNT(DISTINCT pl.RelatedPostId) FILTER (WHERE pl.LinkTypeId = 1) AS LinkedPostsCount,
+        COUNT(DISTINCT pl.RelatedPostId) FILTER (WHERE pl.LinkTypeId = 3) AS IncomingDuplicateLinksCount,
+        AVG(rel_p.Score) FILTER (WHERE pl.LinkTypeId = 1) AS AvgLinkedPostScore,
+        MAX(rel_p.LastActivityDate) FILTER (WHERE pl.LinkTypeId = 1) AS LatestActivityOfLinkedPost,
+        STRING_AGG(DISTINCT t.TagName, ', ') FILTER (WHERE t.TagName IS NOT NULL) AS RelatedTagsFromLinkedPosts
+    FROM
+        PostLinks pl
+    JOIN Posts rel_p ON pl.RelatedPostId = rel_p.Id
+    LEFT JOIN Tags t ON t.TagName IN (
+        SELECT UNNEST(string_to_array(SUBSTRING(rel_p.Tags, 2, LENGTH(rel_p.Tags)-2), '><'))
+        WHERE LENGTH(COALESCE(rel_p.Tags, '')) > 2
+    )
+    GROUP BY
+        pl.PostId
+),
+CombinedPostMeta AS (
+    SELECT
+        cpi.PostId,
+        cpi.OwnerUserId,
+        cpi.PostTypeId,
+        cpi.DerivedEngagementScore,
+        cpi.ContainsProblemKeywords,
+        cpi.TechnologyCategory,
+        cpi.RnPerUserPostTypeScore,
+        cpi.AvgScorePerUser,
+        cpi.EditCountByUsers,
+        cpi.FirstClosureDate,
+        cpi.PostCreationDate,
+        cpi.OutgoingDuplicateLinksCount,
+        cpi.HoursToLastSignificantEdit,
+        cpi.DaysSincePreviousPost,
+        cpi.AvgSiblingAnswerScoreWithinMonth,
+        COALESCE(mf.CloseVotesCount, 0) AS PostCloseVotes,
+        COALESCE(mf.ReopenVotesCount, 0) AS PostReopenVotes,
+        mf.FirstDuplicateCloseDate AS PostFirstDuplicateCloseDate,
+        mf.DistinctCloseReasons AS PostDistinctCloseReasons,
+        COALESCE(lca.LinkedPostsCount, 0) AS PostLinkedPostsOut,
+        COALESCE(lca.IncomingDuplicateLinksCount, 0) AS PostIncomingDuplicateLinks,
+        lca.AvgLinkedPostScore AS PostAvgLinkedScore,
+        lca.RelatedTagsFromLinkedPosts AS PostRelatedTagsFromLinkedPosts
+    FROM
+        CorrelatedPostInsights cpi
+    LEFT JOIN ModerationFlags mf ON cpi.PostId = mf.PostId
+    LEFT JOIN LinkedContentAnalysis lca ON cpi.PostId = lca.PostId
+)
+SELECT
+    ue.UserId,
+    ue.DisplayName,
+    ue.Reputation,
+    ue.UserCreationDate,
+    ue.Location,
+    ue.QuestionCount,
+    ue.AnswerCount,
+    ue.GoldBadges,
+    ue.SilverBadges,
+    ue.BronzeBadges,
+    ue.TotalCommentsMade,
+    ue.TotalCommentScore,
+    cpm.PostId AS TopPostId,
+    pt.Name AS TopPostTypeName,
+    cpm.DerivedEngagementScore AS TopPostEngagementScore,
+    cpm.TechnologyCategory AS TopPostTechCategory,
+    cpm.ContainsProblemKeywords AS TopPostHasProblemKeywords,
+    cpm.EditCountByUsers AS TopPostEditCount,
+    cpm.HoursToLastSignificantEdit AS TopPostHoursToLastEdit,
+    cpm.DaysSincePreviousPost AS TopPostDaysSincePrevious,
+    COALESCE(cpm.AvgSiblingAnswerScoreWithinMonth, 0.0) AS TopPostAvgSiblingAnswerScore,
+    cpm.PostCloseVotes,
+    cpm.PostReopenVotes,
+    cpm.PostFirstDuplicateCloseDate,
+    cpm.PostDistinctCloseReasons,
+    cpm.PostLinkedPostsOut,
+    cpm.PostIncomingDuplicateLinks,
+    cpm.PostAvgLinkedScore,
+    cpm.PostRelatedTagsFromLinkedPosts,
+    CASE
+        WHEN ue.Reputation > 100000 AND ue.GoldBadges >= 5 THEN 'Legendary'
+        WHEN ue.Reputation > 25000 AND ue.GoldBadges >= 1 THEN 'Veteran'
+        WHEN ue.Reputation > 5000 THEN 'Experienced'
+        WHEN ue.Reputation > 1000 THEN 'Contributor'
+        ELSE 'Rookie'
+    END AS UserTier,
+    NTILE(10) OVER (ORDER BY ue.Reputation DESC, ue.TotalQuestionScore + ue.TotalAnswerScore DESC) AS ReputationDecile,
+    RANK() OVER (PARTITION BY ue.Location ORDER BY ue.Reputation DESC, ue.UserViews DESC) AS RankInLocation,
+    (ue.Reputation * 0.4 + ue.UserUpVotes * 0.3 + (ue.QuestionCount + ue.AnswerCount) * 0.2 + ue.TotalCommentsMade * 0.1) / POWER(GREATEST(1.0, ue.UserActivityDurationDays), 0.5) AS WeightedInfluenceScore,
+    AVG(COALESCE(p_all.Score, 0)) OVER (PARTITION BY ue.Location) AS AvgLocationPostScore,
+    MIN(EXTRACT(DAY FROM (cpm.PostCreationDate - ue.UserCreationDate))) OVER (PARTITION BY ue.UserId) AS DaysToFirstTopPost,
+    SUM(cpm.PostCloseVotes) OVER (PARTITION BY cpm.TechnologyCategory) AS TotalCloseVotesInTechCategory
+FROM
+    UserEngagement ue
+INNER JOIN
+    CombinedPostMeta cpm ON ue.UserId = cpm.OwnerUserId
+INNER JOIN
+    PostTypes pt ON cpm.PostTypeId = pt.Id
+LEFT JOIN
+    Posts p_all ON ue.UserId = p_all.OwnerUserId AND p_all.CreationDate >= '2020-01-01' AND p_all.CreationDate < '2023-01-01' -- For avg post score in location
+WHERE
+    ue.Reputation > 500
+    AND (ue.QuestionCount + ue.AnswerCount) > 3
+    AND cpm.RnPerUserPostTypeScore = 1 -- Only the single top post (highest score) per user, per post type (either question or answer)
+    AND cpm.TechnologyCategory IN ('SQL/DB', 'Python', 'JavaScript', 'Java')
+    AND (
+        cpm.FirstClosureDate IS NULL
+        OR cpm.FirstClosureDate > cpm.PostCreationDate + INTERVAL '6 months'
+    ) -- Only posts not closed quickly
+    AND cpm.OutgoingDuplicateLinksCount < 2
+    AND cpm.PostIncomingDuplicateLinks < 3
+    AND ue.Location NOT IN ('United States', 'India', 'Germany') -- Exclude some common locations for diversity
+    AND ue.UserActivityDurationDays > 30 -- Active users
+ORDER BY
+    WeightedInfluenceScore DESC, ReputationDecile ASC, TopPostEngagementScore DESC
+LIMIT 5000;

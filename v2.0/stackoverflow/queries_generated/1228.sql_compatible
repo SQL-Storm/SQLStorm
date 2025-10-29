@@ -1,0 +1,206 @@
+WITH UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesGiven,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesGiven,
+        SUM(COALESCE(p.ViewCount, 0)) AS TotalPostViews,
+        MAX(p.CreationDate) AS LatestPostDate,
+        MIN(p.CreationDate) AS EarliestPostDate,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.PostId END) AS PostsEditedCount,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostScoreReceived
+    FROM Users AS u
+    LEFT JOIN Posts AS p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments AS c ON u.Id = c.UserId
+    LEFT JOIN Votes AS v ON u.Id = v.UserId
+    LEFT JOIN PostHistory AS ph ON u.Id = ph.UserId AND p.Id = ph.PostId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+PostHistoricalMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        COUNT(ph.Id) AS TotalHistoryEvents,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditCount,
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (10, 11) THEN ph.CreationDate ELSE NULL END) AS LastCloseReopenDate,
+        (SELECT MIN(ph_sub.CreationDate)
+         FROM PostHistory AS ph_sub
+         WHERE ph_sub.PostId = p.Id
+           AND ph_sub.PostHistoryTypeId IN (4, 5, 6)
+           AND ph_sub.CreationDate > p.CreationDate) AS FirstEditAfterCreationDate,
+        LAG(p.LastActivityDate, 1, p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevPostActivityDate
+    FROM Posts AS p
+    LEFT JOIN PostHistory AS ph ON p.Id = ph.PostId
+    GROUP BY p.Id, p.PostTypeId, p.CreationDate, p.LastEditDate, p.LastActivityDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.OwnerUserId
+),
+TopTagsByPost AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        STRING_AGG(DISTINCT t.TagName, ', ') AS PostTags,
+        COUNT(DISTINCT t.Id) AS UniqueTagCount
+    FROM Posts AS p
+    INNER JOIN Tags AS t ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    WHERE p.Tags IS NOT NULL AND TRIM(p.Tags) <> ''
+    GROUP BY p.Id, p.OwnerUserId
+)
+SELECT
+    ue.UserId,
+    COALESCE(ue.DisplayName, 'Anonymous User') AS UserDisplayName,
+    ue.Reputation,
+    EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS timestamp) - ue.UserCreationDate)) AS DaysSinceAccountCreation,
+    ue.TotalPosts,
+    ue.TotalComments,
+    ue.TotalUpVotesGiven,
+    ue.TotalDownVotesGiven,
+    ue.TotalPostViews,
+    phm.PostId,
+    pt.Name AS PostTypeName,
+    phm.PostCreationDate,
+    phm.LastEditDate,
+    phm.LastActivityDate,
+    phm.Score AS PostScore,
+    phm.ViewCount AS PostViewCount,
+    phm.AnswerCount,
+    phm.CommentCount AS PostCommentCount,
+    phm.FavoriteCount AS PostFavoriteCount,
+    phm.TotalHistoryEvents,
+    phm.EditCount AS PostEditCount,
+    COALESCE(phm.LastCloseReopenDate, TIMESTAMP '1900-01-01 00:00:00') AS PostLastCloseOrReopenEvent,
+    phm.FirstEditAfterCreationDate,
+    (EXTRACT(EPOCH FROM (phm.LastActivityDate - phm.PrevPostActivityDate)) / 3600 / 24) AS DaysSincePreviousPostActivity,
+    COALESCE(ttbp.PostTags, 'N/A') AS TagsAssociatedWithPost,
+    ttbp.UniqueTagCount,
+    AVG(phm.Score) OVER (PARTITION BY ue.UserId) AS AvgPostScoreByUser,
+    RANK() OVER (ORDER BY ue.Reputation DESC, ue.TotalPosts DESC, ue.TotalComments DESC) AS UserRankByActivity,
+    CASE
+        WHEN ue.Reputation > 10000 AND ue.TotalPosts > 50 AND ue.TotalComments > 100 THEN 'High Contributor'
+        WHEN ue.Reputation > 1000 AND ue.TotalPosts > 10 AND ue.TotalComments > 20 THEN 'Moderate Contributor'
+        ELSE 'Casual Contributor'
+    END AS UserContributionLevel,
+    (phm.Score * 0.5 + phm.ViewCount * 0.01 + phm.AnswerCount * 2 + phm.FavoriteCount * 3 + phm.EditCount * 0.1) AS PostEngagementScore,
+    NULLIF(LPAD(CAST(ABS(phm.PostId % 1000) AS text), 3, '0'), '000') AS PostChecksumSuffix,
+    (SELECT COUNT(DISTINCT l.RelatedPostId)
+     FROM PostLinks AS l
+     WHERE l.PostId = phm.PostId AND l.LinkTypeId = 1) AS LinkedPostCount,
+    (SELECT COUNT(DISTINCT l.RelatedPostId)
+     FROM PostLinks AS l
+     WHERE l.PostId = phm.PostId AND l.LinkTypeId = 3) AS DuplicatePostCount,
+    phm.PostCreationDate >= DATE '2022-01-01' AND phm.PostCreationDate < DATE '2023-01-01' AS IsPostFrom2022,
+    p_main.Title AS PostTitle,
+    SUBSTRING(p_main.Body FROM 1 FOR 200) AS PostBodyExcerpt,
+    LENGTH(p_main.Body) AS PostBodyLength,
+    (SELECT STRING_AGG(DISTINCT b.Name, ', ')
+     FROM Badges AS b
+     WHERE b.UserId = ue.UserId
+       AND b.Class = 1
+       AND b.Date >= ue.UserCreationDate
+       AND b.Date < ue.LastAccessDate) AS GoldBadgesEarned,
+    (SELECT ph_inner.Comment
+     FROM PostHistory AS ph_inner
+     WHERE ph_inner.PostId = phm.PostId
+       AND ph_inner.PostHistoryTypeId = 10
+       AND ph_inner.Comment IS NOT NULL
+     ORDER BY ph_inner.CreationDate DESC
+     LIMIT 1) AS LatestCloseReasonComment
+FROM UserEngagement AS ue
+INNER JOIN Posts AS p_main ON ue.UserId = p_main.OwnerUserId
+INNER JOIN PostHistoricalMetrics AS phm ON p_main.Id = phm.PostId
+LEFT JOIN PostTypes AS pt ON phm.PostTypeId = pt.Id
+LEFT JOIN TopTagsByPost AS ttbp ON p_main.Id = ttbp.PostId
+WHERE
+    ue.Reputation > 100 AND ue.TotalPosts > 5
+    AND phm.PostCreationDate BETWEEN DATE '2020-01-01' AND DATE '2023-12-31'
+    AND (p_main.Tags LIKE '%<sql>%' OR p_main.Tags LIKE '%<database>%')
+    AND p_main.CommunityOwnedDate IS NULL
+    AND p_main.ClosedDate IS NULL
+    AND p_main.PostTypeId IN (1, 2)
+    AND p_main.ViewCount > 100
+    AND phm.Score >= 0
+
+UNION ALL
+
+SELECT
+    ue.UserId,
+    COALESCE(ue.DisplayName, 'Unknown User') AS UserDisplayName,
+    ue.Reputation,
+    EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS timestamp) - ue.UserCreationDate)) AS DaysSinceAccountCreation,
+    ue.TotalPosts,
+    ue.TotalComments,
+    ue.TotalUpVotesGiven,
+    ue.TotalDownVotesGiven,
+    ue.TotalPostViews,
+    phm.PostId,
+    pt.Name AS PostTypeName,
+    phm.PostCreationDate,
+    phm.LastEditDate,
+    phm.LastActivityDate,
+    phm.Score AS PostScore,
+    phm.ViewCount AS PostViewCount,
+    phm.AnswerCount,
+    phm.CommentCount AS PostCommentCount,
+    phm.FavoriteCount AS PostFavoriteCount,
+    phm.TotalHistoryEvents,
+    phm.EditCount AS PostEditCount,
+    COALESCE(phm.LastCloseReopenDate, TIMESTAMP '1900-01-01 00:00:00') AS PostLastCloseOrReopenEvent,
+    phm.FirstEditAfterCreationDate,
+    (EXTRACT(EPOCH FROM (phm.LastActivityDate - phm.PrevPostActivityDate)) / 3600 / 24) AS DaysSincePreviousPostActivity,
+    COALESCE(ttbp.PostTags, 'N/A') AS TagsAssociatedWithPost,
+    ttbp.UniqueTagCount,
+    AVG(phm.Score) OVER (PARTITION BY ue.UserId) AS AvgPostScoreByUser,
+    RANK() OVER (ORDER BY ue.Reputation DESC, ue.TotalPosts DESC, ue.TotalComments DESC) AS UserRankByActivity,
+    'Recent Active Posts' AS UserContributionLevel,
+    (phm.Score * 0.5 + phm.ViewCount * 0.01 + phm.AnswerCount * 2 + phm.FavoriteCount * 3 + phm.EditCount * 0.1) AS PostEngagementScore,
+    NULLIF(LPAD(CAST(ABS(phm.PostId % 1000) AS text), 3, '0'), '000') AS PostChecksumSuffix,
+    (SELECT COUNT(DISTINCT l.RelatedPostId)
+     FROM PostLinks AS l
+     WHERE l.PostId = phm.PostId AND l.LinkTypeId = 1) AS LinkedPostCount,
+    (SELECT COUNT(DISTINCT l.RelatedPostId)
+     FROM PostLinks AS l
+     WHERE l.PostId = phm.PostId AND l.LinkTypeId = 3) AS DuplicatePostCount,
+    phm.PostCreationDate >= DATE '2022-01-01' AND phm.PostCreationDate < DATE '2023-01-01' AS IsPostFrom2022,
+    p_main.Title AS PostTitle,
+    SUBSTRING(p_main.Body FROM 1 FOR 200) AS PostBodyExcerpt,
+    LENGTH(p_main.Body) AS PostBodyLength,
+    (SELECT STRING_AGG(DISTINCT b.Name, ', ')
+     FROM Badges AS b
+     WHERE b.UserId = ue.UserId
+       AND b.Class = 2
+       AND b.Date >= ue.UserCreationDate
+       AND b.Date < ue.LastAccessDate) AS SilverBadgesEarned,
+    (SELECT ph_inner.Comment
+     FROM PostHistory AS ph_inner
+     WHERE ph_inner.PostId = phm.PostId
+       AND ph_inner.PostHistoryTypeId = 10
+       AND ph_inner.Comment IS NOT NULL
+     ORDER BY ph_inner.CreationDate DESC
+     LIMIT 1) AS LatestCloseReasonComment
+FROM UserEngagement AS ue
+INNER JOIN Posts AS p_main ON ue.UserId = p_main.OwnerUserId
+INNER JOIN PostHistoricalMetrics AS phm ON p_main.Id = phm.PostId
+LEFT JOIN PostTypes AS pt ON phm.PostTypeId = pt.Id
+LEFT JOIN TopTagsByPost AS ttbp ON p_main.Id = ttbp.PostId
+WHERE
+    ue.LastAccessDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '6 months'
+    AND ue.Reputation > 500
+    AND phm.PostCreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+    AND p_main.PostTypeId = 1
+    AND p_main.AnswerCount > 0
+    AND p_main.Score > 5
+    AND p_main.LastActivityDate IS NOT NULL
+
+ORDER BY UserRankByActivity, PostEngagementScore DESC
+LIMIT 1000;

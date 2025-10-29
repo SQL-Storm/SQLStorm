@@ -1,0 +1,179 @@
+-- {"query": "7232.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1596} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        CASE 
+            WHEN u.Reputation >= 1000000 THEN 'Legendary'
+            WHEN u.Reputation >= 100000 THEN 'Grandmaster'
+            WHEN u.Reputation >= 10000 THEN 'Master'
+            WHEN u.Reputation >= 1000 THEN 'Expert'
+            ELSE 'Regular'
+        END AS ReputationTier
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.ParentId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.Tags,
+        p.FavoriteCount,
+        p.LastActivityDate,
+        COALESCE(p.OwnerDisplayName, 'Anonymous') AS OwnerDisplayName,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+            WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN 'HasAnswers'
+            WHEN p.PostTypeId = 1 THEN 'Unanswered'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostStatus,
+        DATEDIFF(day, p.CreationDate, COALESCE(p.ClosedDate, p.LastActivityDate, GETDATE())) AS AgeInDays,
+        CASE 
+            WHEN p.Score > 100 THEN 'Hot'
+            WHEN p.Score > 50 THEN 'Popular'
+            WHEN p.Score > 10 THEN 'Moderate'
+            ELSE 'Low'
+        END AS PopularityLevel
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) 
+      AND p.CreationDate >= DATEADD(year, -2, GETDATE())
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Trending'
+            WHEN t.Count > 500 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            ELSE 'Niche'
+        END AS TagPopularity,
+        STRING_AGG(
+            CASE 
+                WHEN p.PostTypeId = 1 THEN LEFT(p.Title, 50) + '...'
+                ELSE 'Answer'
+            END, 
+            '; '
+        ) AS ExampleTitles
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE '%' + t.TagName + '%'
+    WHERE t.Count > 0
+    GROUP BY t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId
+),
+UserPostSummary AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        p.PostTypeId,
+        COUNT(p.Id) AS PostCount,
+        SUM(p.Score) AS TotalScore,
+        AVG(p.Score) AS AvgScore,
+        MAX(p.CreationDate) AS LatestPostDate,
+        STRING_AGG(
+            CASE 
+                WHEN p.PostTypeId = 1 THEN LEFT(p.Title, 30)
+                ELSE 'Answer'
+            END, 
+            ' | '
+        ) AS RecentPosts,
+        CASE 
+            WHEN SUM(p.Score) > 10000 THEN 'HighlyActive'
+            WHEN SUM(p.Score) > 5000 THEN 'Active'
+            WHEN SUM(p.Score) > 1000 THEN 'Moderate'
+            ELSE 'Low'
+        END AS ActivityLevel
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE p.CreationDate >= DATEADD(month, -6, GETDATE())
+    GROUP BY u.Id, u.DisplayName, u.Reputation, p.PostTypeId
+)
+SELECT 
+    COUNT(*) AS TotalUsers,
+    COUNT(DISTINCT uas.UserId) AS ActiveUsers,
+    AVG(uas.Reputation) AS AvgReputation,
+    MAX(uas.PostCount) AS MaxPosts,
+    MIN(uas.CommentCount) AS MinComments,
+    COUNT(DISTINCT CASE WHEN uas.ReputationTier = 'Legendary' THEN uas.UserId END) AS LegendaryUsers,
+    (
+        SELECT STRING_AGG(DISTINCT uas.ReputationTier, ', ')
+        FROM UserActivityStats uas
+        WHERE uas.ReputationRank <= 50
+    ) AS TopReputationTier,
+    (
+        SELECT STRING_AGG(DISTINCT pa.PostStatus, ', ')
+        FROM PostAnalysis pa
+        WHERE pa.AgeInDays <= 30
+    ) AS RecentPostStatuses,
+    STRING_AGG(
+        ta.TagName + '(' + CAST(ta.TagCount AS VARCHAR(10)) + ')', 
+        '; '
+    ) AS PopularTags,
+    (
+        SELECT COUNT(*)
+        FROM PostAnalysis pa
+        WHERE pa.PopularityLevel = 'Hot'
+    ) AS HotPostCount,
+    (
+        SELECT STRING_AGG(ups.RecentPosts, '; ')
+        FROM UserPostSummary ups
+        WHERE ups.ActivityLevel = 'HighlyActive'
+    ) AS HighlyActiveUserPosts,
+    (
+        SELECT STRING_AGG(DISTINCT CASE WHEN uas.ReputationTier = 'Master' THEN uas.DisplayName ELSE NULL END, ', ')
+        FROM UserActivityStats uas
+        WHERE uas.ReputationRank <= 200
+    ) AS MasterUsers,
+    (
+        SELECT COUNT(*)
+        FROM Posts p
+        WHERE p.PostTypeId = 1 
+          AND p.Score > 50 
+          AND p.CreationDate >= DATEADD(year, -1, GETDATE())
+    ) AS HighScoreQuestions,
+    (
+        SELECT STRING_AGG(DISTINCT p.Title, ' | ')
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+          AND p.CreationDate >= DATEADD(week, -1, GETDATE())
+          AND p.Tags LIKE '%sql%'
+    ) AS RecentSQLQuestions,
+    (
+        SELECT COUNT(DISTINCT p.OwnerUserId)
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+          AND p.Score > 100
+          AND p.CreationDate >= DATEADD(month, -3, GETDATE())
+    ) AS ActiveHighScorers
+FROM UserActivityStats uas
+CROSS JOIN TagAnalysis ta
+INNER JOIN PostAnalysis pa ON pa.OwnerUserId = uas.UserId
+INNER JOIN UserPostSummary ups ON ups.UserId = uas.UserId
+WHERE uas.Reputation > 100
+  AND uas.LastPostDate >= DATEADD(month, -6, GETDATE())
+  AND pa.CreationDate >= DATEADD(year, -1, GETDATE())
+  AND ups.LatestPostDate >= DATEADD(month, -1, GETDATE())
+  AND ta.TagCount > 10
+  AND pa.Score > 0

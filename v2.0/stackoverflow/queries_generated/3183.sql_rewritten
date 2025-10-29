@@ -1,0 +1,126 @@
+-- {"query": "3183.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2053} 
+WITH
+/* 1️⃣  Best answer per question (ranked by score, then earliest) */
+best_answers AS (
+    SELECT
+        p.Id                     AS answer_id,
+        p.ParentId               AS question_id,
+        p.OwnerUserId            AS user_id,
+        p.Score                  AS answer_score,
+        p.CreationDate           AS answer_date,
+        ROW_NUMBER() OVER (
+            PARTITION BY p.ParentId
+            ORDER BY p.Score DESC, p.CreationDate ASC
+        )                       AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 2                -- answers only
+      AND p.OwnerUserId IS NOT NULL
+),
+top_answers AS (
+    SELECT *
+    FROM best_answers
+    WHERE rn = 1                           -- keep only the top answer per question
+),
+
+/* 2️⃣  Explode tags of every question */
+question_tags AS (
+    SELECT
+        p.Id                       AS question_id,
+        UNNEST(STRING_TO_ARRAY(TRIM(BOTH '<>' FROM p.Tags), '><')) AS tag
+    FROM Posts p
+    WHERE p.PostTypeId = 1               -- questions only
+      AND p.Tags IS NOT NULL
+),
+
+/* 3️⃣  Aggregate per‑user statistics */
+user_agg AS (
+    SELECT
+        u.Id                                   AS user_id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT ta.answer_id)           AS answer_cnt,
+        COALESCE(SUM(ta.answer_score),0)       AS total_answer_score,
+        AVG(ta.answer_score) FILTER (WHERE ta.answer_score IS NOT NULL)
+                                             AS avg_answer_score,
+        COUNT(DISTINCT b.Id)                   AS badge_cnt,
+        MAX(p.LastActivityDate)                AS last_activity,
+        SUM(CASE WHEN t.tag ILIKE '%java%' THEN 1 ELSE 0 END)
+                                             AS java_tag_answers
+    FROM Users u
+    LEFT JOIN top_answers ta        ON ta.user_id = u.Id
+    LEFT JOIN Posts p               ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b              ON b.UserId = u.Id
+    LEFT JOIN question_tags qt      ON qt.question_id = ta.question_id
+    LEFT JOIN Tags t                ON t.TagName = qt.tag
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+/* 4️⃣  Recent voting activity (last 30 days) */
+recent_votes AS (
+    SELECT
+        v.UserId,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 2
+                          AND v.CreationDate >= cast('2024-10-01' as date) - INTERVAL '30 days')
+                                         AS up_votes_30d,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 3
+                          AND v.CreationDate >= cast('2024-10-01' as date) - INTERVAL '30 days')
+                                         AS down_votes_30d
+    FROM Votes v
+    WHERE v.UserId IS NOT NULL
+    GROUP BY v.UserId
+),
+
+/* 5️⃣  Combine aggregates with voting data and derive a label */
+combined AS (
+    SELECT
+        ua.user_id,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.answer_cnt,
+        ua.total_answer_score,
+        ua.avg_answer_score,
+        ua.badge_cnt,
+        ua.last_activity,
+        ua.java_tag_answers,
+        rv.up_votes_30d,
+        rv.down_votes_30d,
+        CASE
+            WHEN ua.java_tag_answers > 0               THEN 'Java Expert'
+            WHEN ua.answer_cnt >= 100                  THEN 'Prolific Answerer'
+            ELSE NULL
+        END                                         AS special_tag
+    FROM user_agg ua
+    LEFT JOIN recent_votes rv ON rv.UserId = ua.user_id
+),
+
+/* 6️⃣  Users with many badges but **no** answers (to test outer‑join & NULL handling) */
+badge_collectors AS (
+    SELECT
+        u.Id                                      AS user_id,
+        u.DisplayName,
+        u.Reputation,
+        0                                         AS answer_cnt,
+        0                                         AS total_answer_score,
+        NULL                                      AS avg_answer_score,
+        COUNT(b.Id)                               AS badge_cnt,
+        NULL::timestamp                           AS last_activity,
+        0                                         AS java_tag_answers,
+        0                                         AS up_votes_30d,
+        0                                         AS down_votes_30d,
+        'Badge Collector'                         AS special_tag
+    FROM Users u
+    JOIN Badges b               ON b.UserId = u.Id
+    LEFT JOIN top_answers ta    ON ta.user_id = u.Id
+    WHERE ta.answer_id IS NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+)
+
+SELECT *
+FROM combined
+
+UNION ALL
+
+SELECT *
+FROM badge_collectors
+ORDER BY reputation DESC, answer_cnt DESC
+LIMIT 100;

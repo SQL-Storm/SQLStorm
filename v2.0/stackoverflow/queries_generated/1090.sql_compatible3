@@ -1,0 +1,230 @@
+WITH UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.CreationDate AS UserCreationDate,
+        u.Reputation,
+        u.UpVotes AS UserUpVotes,
+        u.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestionsOwned,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswersOwned,
+        SUM(p.Score) AS TotalPostScoreReceived,
+        SUM(p.ViewCount) AS TotalPostViewsReceived,
+        MAX(p.LastActivityDate) AS LatestPostActivity,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) AS AvgAnswerScore,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMadeByOrOnUserPosts,
+        COUNT(DISTINCT b.Id) AS TotalBadgesReceived,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges
+    FROM
+        Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId OR p.Id = c.PostId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.CreationDate, u.Reputation, u.UpVotes, u.DownVotes
+),
+PostHistoryEngagement AS (
+    SELECT
+        ph.PostId,
+        COUNT(DISTINCT ph.Id) AS TotalHistoryEvents,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (10, 12) THEN 1 ELSE 0 END) AS CloseDeleteCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (11, 13) THEN 1 ELSE 0 END) AS ReopenUndeleteCount,
+        MAX(ph.CreationDate) AS LastHistoryEventDate,
+        -- ARRAY_AGG may not exist in all dialects; for portability keep it but some DBs will need adjustment
+        ARRAY_AGG(DISTINCT ph.PostHistoryTypeId) AS AllHistoryTypes
+    FROM
+        PostHistory ph
+    GROUP BY
+        ph.PostId
+),
+QuestionDetails AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.OwnerUserId,
+        q.CreationDate AS QuestionCreationDate,
+        q.Score AS QuestionScore,
+        q.ViewCount AS QuestionViewCount,
+        q.AnswerCount AS QuestionAnswerCount,
+        q.FavoriteCount AS QuestionFavoriteCount,
+        q.ClosedDate AS QuestionClosedDate,
+        COALESCE(q.Title, 'Untitled Question') AS QuestionTitle,
+        q.Tags AS QuestionTagsRaw,
+        (SELECT COUNT(DISTINCT a.Id) FROM Posts a WHERE a.ParentId = q.Id AND a.PostTypeId = 2) AS ActualAnswerCount,
+        (SELECT SUM(v.BountyAmount) FROM Votes v WHERE v.PostId = q.Id AND v.VoteTypeId = 8) AS TotalBountyAmount,
+        phe.TotalHistoryEvents,
+        phe.EditCount,
+        phe.CloseDeleteCount,
+        phe.ReopenUndeleteCount,
+        phe.LastHistoryEventDate,
+        phe.AllHistoryTypes,
+        la.RelatedPostId AS LinkedRelatedPostId,
+        lt.Name AS LinkTypeName,
+        CASE WHEN q.AcceptedAnswerId IS NOT NULL THEN CAST(1 AS INTEGER) ELSE CAST(0 AS INTEGER) END AS HasAcceptedAnswer
+    FROM
+        Posts q
+    LEFT JOIN PostHistoryEngagement phe ON q.Id = phe.PostId
+    LEFT JOIN PostLinks la ON q.Id = la.PostId AND la.LinkTypeId IN (1, 3)
+    LEFT JOIN LinkTypes lt ON la.LinkTypeId = lt.Id
+    WHERE
+        q.PostTypeId = 1
+),
+TagPerformance AS (
+    SELECT
+        -- split tags like <tag1><tag2> into rows; portable functions vary by dialect
+        unnest(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><')) AS TagName,
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Score,
+        p.CreationDate
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2
+),
+UserTagStats AS (
+    SELECT
+        tp.OwnerUserId AS UserId,
+        tp.TagName,
+        COUNT(tp.PostId) AS QuestionsWithTag,
+        AVG(tp.Score) AS AvgScoreWithTag,
+        MAX(tp.CreationDate) AS LatestPostWithTag,
+        ROW_NUMBER() OVER (PARTITION BY tp.OwnerUserId ORDER BY COUNT(tp.PostId) DESC, AVG(tp.Score) DESC) AS TagRank
+    FROM TagPerformance tp
+    GROUP BY tp.OwnerUserId, tp.TagName
+),
+UserRecentActivityRank AS (
+    SELECT
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.UserCreationDate,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - uas.UserCreationDate)) / (3600 * 24 * 365.25) AS UserAgeYears,
+        uas.TotalPostsOwned,
+        uas.TotalQuestionsOwned,
+        uas.TotalAnswersOwned,
+        uas.TotalPostScoreReceived,
+        uas.TotalPostViewsReceived,
+        uas.LatestPostActivity,
+        uas.AvgQuestionScore,
+        uas.AvgAnswerScore,
+        uas.TotalCommentsMadeByOrOnUserPosts,
+        uas.TotalBadgesReceived,
+        uas.GoldBadges,
+        uas.SilverBadges,
+        uas.BronzeBadges,
+        RANK() OVER (ORDER BY uas.Reputation DESC, uas.UserUpVotes DESC) AS GlobalReputationRank,
+        NTILE(10) OVER (ORDER BY uas.TotalQuestionsOwned DESC) AS QuestionerDecile,
+        LAG(uas.TotalPostScoreReceived, 1, 0) OVER (ORDER BY uas.LatestPostActivity) AS PreviousUserPostScoreSum,
+        SUM(uas.TotalPostsOwned) OVER (ORDER BY uas.UserCreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativePostsByJoiningUsers,
+        COALESCE(uas.UserUpVotes, 0) - COALESCE(uas.UserDownVotes, 0) AS NetVotesGivenReceived,
+        CASE WHEN EXISTS (
+            SELECT 1
+            FROM Posts ans
+            WHERE ans.OwnerUserId = uas.UserId
+              AND ans.PostTypeId = 2
+              AND ans.Id IN (SELECT q.AcceptedAnswerId FROM Posts q WHERE q.PostTypeId = 1 AND q.AcceptedAnswerId IS NOT NULL)
+        ) THEN CAST(1 AS INTEGER) ELSE CAST(0 AS INTEGER) END AS HasAcceptedAnswersFromOthers
+    FROM
+        UserActivitySummary uas
+    WHERE
+        uas.TotalPostsOwned > 0
+),
+ModerationFlags AS (
+    SELECT
+        ph.UserId,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (10, 12, 14, 19) THEN 1 END) AS UserModActionsCount,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (11, 13, 15, 20) THEN 1 END) AS UserReversalActionsCount,
+        MAX(ph.CreationDate) AS LatestModActionDate
+    FROM PostHistory ph
+    WHERE ph.UserId IS NOT NULL
+      AND ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20, 35, 36)
+    GROUP BY ph.UserId
+)
+SELECT
+    urar.UserId,
+    urar.DisplayName,
+    COALESCE(urar.DisplayName, 'Unknown User') AS DisplayNameCoalesced,
+    urar.Reputation,
+    urar.UserAgeYears,
+    urar.GlobalReputationRank,
+    urar.QuestionerDecile,
+    urar.TotalPostsOwned,
+    urar.TotalQuestionsOwned,
+    urar.TotalAnswersOwned,
+    urar.TotalCommentsMadeByOrOnUserPosts,
+    urar.TotalBadgesReceived,
+    urar.GoldBadges,
+    urar.SilverBadges,
+    urar.BronzeBadges,
+    urar.NetVotesGivenReceived,
+    urar.HasAcceptedAnswersFromOthers,
+    MODF.UserModActionsCount,
+    MODF.UserReversalActionsCount,
+    MODF.LatestModActionDate,
+    SUM(qd.QuestionScore) AS TotalQuestionScoreOfOwnedQuestions,
+    SUM(qd.QuestionViewCount) AS TotalQuestionViewsOfOwnedQuestions,
+    AVG(qd.QuestionAnswerCount) AS AvgAnswersPerOwnedQuestion,
+    COUNT(DISTINCT qd.QuestionId) AS DistinctQuestionsOwned,
+    SUM(CASE WHEN qd.HasAcceptedAnswer = 1 THEN 1 ELSE 0 END) AS QuestionsWithAcceptedAnswer,
+    SUM(CASE WHEN qd.QuestionClosedDate IS NOT NULL THEN 1 ELSE 0 END) AS ClosedQuestionsOwned,
+    AVG(qd.EditCount) AS AvgEditsPerOwnedQuestion,
+    MAX(qd.LastHistoryEventDate) AS LatestHistoryEventOnOwnedQuestion,
+    (
+        SELECT AVG(p_linked.Score)
+        FROM Posts p_linked
+        WHERE p_linked.Id IN (
+            SELECT pl_inner.RelatedPostId
+            FROM PostLinks pl_inner
+            WHERE pl_inner.PostId = qd.QuestionId
+              AND pl_inner.LinkTypeId = 3
+        )
+          AND p_linked.PostTypeId = 1
+    ) AS AvgDuplicateQuestionScore,
+    (
+        SELECT STRING_AGG(uts.TagName, ', ' ORDER BY uts.TagRank)
+        FROM UserTagStats uts
+        WHERE uts.UserId = urar.UserId AND uts.TagRank <= 3
+    ) AS Top3TagsByPerformance,
+    CAST(urar.TotalPostsOwned AS NUMERIC) / NULLIF(urar.TotalCommentsMadeByOrOnUserPosts + urar.TotalBadgesReceived, 0) AS PostToEngagementRatio,
+    (
+        SELECT
+            SUM(sub_q.Score)
+        FROM
+            (
+                SELECT p.Score FROM Posts p WHERE p.OwnerUserId = urar.UserId AND p.PostTypeId = 1 AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+                UNION ALL
+                SELECT p.Score FROM Posts p WHERE p.OwnerUserId = urar.UserId AND p.PostTypeId = 2 AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+            ) AS sub_q
+    ) AS TotalScoreLastYear,
+    CASE
+        WHEN urar.Reputation >= 10000 AND urar.GoldBadges >= 5 AND urar.UserAgeYears >= 5 THEN 'Legendary Contributor'
+        WHEN urar.Reputation >= 5000 AND urar.SilverBadges >= 10 AND (urar.TotalQuestionsOwned + urar.TotalAnswersOwned) >= 100 THEN 'Veteran Member'
+        WHEN urar.Reputation >= 1000 AND urar.TotalPostsOwned >= 50 AND urar.TotalCommentsMadeByOrOnUserPosts >= 20 THEN 'Active Community Member'
+        ELSE 'Aspiring Contributor'
+    END AS UserTierClassification,
+    CASE WHEN EXISTS (
+        SELECT 1
+        FROM QuestionDetails qd_inner
+        WHERE qd_inner.OwnerUserId = urar.UserId
+          AND (
+                EXISTS (SELECT 1 FROM UNNEST(qd_inner.AllHistoryTypes) AS t(type) WHERE t.type = 10)
+                OR EXISTS (SELECT 1 FROM UNNEST(qd_inner.AllHistoryTypes) AS t2(type) WHERE t2.type = 12)
+              )
+    ) THEN CAST(1 AS INTEGER) ELSE CAST(0 AS INTEGER) END AS HasModeratedPosts
+FROM
+    UserRecentActivityRank urar
+LEFT JOIN QuestionDetails qd ON urar.UserId = qd.OwnerUserId
+LEFT JOIN ModerationFlags MODF ON urar.UserId = MODF.UserId
+GROUP BY
+    urar.UserId, urar.DisplayName, urar.Reputation, urar.UserAgeYears, urar.GlobalReputationRank, urar.QuestionerDecile,
+    urar.TotalPostsOwned, urar.TotalQuestionsOwned, urar.TotalAnswersOwned, urar.TotalCommentsMadeByOrOnUserPosts,
+    urar.TotalBadgesReceived, urar.GoldBadges, urar.SilverBadges, urar.BronzeBadges, urar.NetVotesGivenReceived,
+    urar.HasAcceptedAnswersFromOthers, MODF.UserModActionsCount, MODF.UserReversalActionsCount, MODF.LatestModActionDate
+HAVING
+    urar.TotalQuestionsOwned > 0 OR urar.TotalAnswersOwned > 0
+ORDER BY
+    urar.Reputation DESC, SUM(qd.QuestionScore) DESC, MODF.UserModActionsCount DESC
+LIMIT 100;

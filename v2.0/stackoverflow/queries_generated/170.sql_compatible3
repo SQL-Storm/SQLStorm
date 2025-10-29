@@ -1,0 +1,399 @@
+with recent_years as (
+    select generate_series(date_trunc('year', cast('2024-10-01 12:34:56' as timestamp)) - interval '9 years', date_trunc('year', cast('2024-10-01 12:34:56' as timestamp)), interval '1 year') as year_start
+),
+user_activity as (
+    select
+        u.id as user_id,
+        date_trunc('year', u.creationdate) as cohort_year,
+        u.displayname,
+        u.reputation,
+        u.location,
+        coalesce(nullif(trim(u.websiteurl), ''), 'n/a') as websiteurl_norm,
+        u.upvotes,
+        u.downvotes,
+        u.views,
+        greatest(u.upvotes - u.downvotes, 0) as net_votes_nonneg
+    from users u
+),
+posts_norm as (
+    select
+        p.id,
+        p.posttypeid,
+        p.owneruserid,
+        date_trunc('year', p.creationdate) as post_year,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        p.answercount,
+        p.commentcount,
+        p.favoritecount,
+        p.closeddate,
+        p.title,
+        p.tags,
+        case when p.posttypeid = 1 then 1 else 0 end as is_question,
+        case when p.posttypeid = 2 then 1 else 0 end as is_answer
+    from posts p
+),
+tag_unpivot as (
+    select
+        pn.id as post_id,
+        lower(trim(t)) as tag
+    from posts_norm pn,
+    lateral (
+        select unnest(
+            case
+                when pn.tags is not null and length(pn.tags) > 2
+                then string_to_array(substring(pn.tags from 2 for (length(pn.tags) - 2)), '><')
+                else array[]::text[]  -- replaced later in dialects; keep text[] for compatibility
+            end
+        ) as t
+    )
+),
+tag_rank as (
+    select
+        t.tagname,
+        t.count,
+        row_number() over (order by t.count desc, t.tagname) as rn
+    from tags t
+    where t.count > 0
+),
+top_tags as (
+    select tagname
+    from tag_rank
+    where rn <= 50
+),
+post_tag_top as (
+    select tu.post_id, tu.tag
+    from tag_unpivot tu
+    inner join top_tags tt on tt.tagname = tu.tag
+),
+user_badges as (
+    select
+        b.userid,
+        count(case when b.class = 1 then 1 end) as gold_cnt,
+        count(case when b.class = 2 then 1 end) as silver_cnt,
+        count(case when b.class = 3 then 1 end) as bronze_cnt,
+        count(case when b.tagbased = true then 1 end) as tag_badges,
+        min(b.date) as first_badge_at,
+        max(b.date) as last_badge_at
+    from badges b
+    group by b.userid
+),
+votes_agg as (
+    select
+        v.postid,
+        count(case when v.votetypeid = 2 then 1 end) as upvotes,
+        count(case when v.votetypeid = 3 then 1 end) as downvotes,
+        count(case when v.votetypeid = 1 then 1 end) as accepts,
+        count(case when v.votetypeid = 8 then 1 end) as bounties_started,
+        sum(case when v.votetypeid in (8,9) then v.bountyamount else 0 end) as bounty_total
+    from votes v
+    group by v.postid
+),
+post_edit_events as (
+    select
+        ph.postid,
+        count(case when ph.posthistorytypeid in (4,5,6) then 1 end) as edits_cnt,
+        count(case when ph.posthistorytypeid in (10,11,12,13,14,15,19,20) then 1 end) as mod_events_cnt,
+        min(ph.creationdate) as first_event_at,
+        max(ph.creationdate) as last_event_at,
+        max(case when ph.posthistorytypeid = 10 then 1 else 0 end) as was_closed
+    from posthistory ph
+    group by ph.postid
+),
+dup_links as (
+    select
+        pl.postid,
+        count(case when pl.linktypeid = 3 then 1 end) as duplicate_links,
+        count(case when pl.linktypeid = 1 then 1 end) as related_links
+    from postlinks pl
+    group by pl.postid
+),
+question_answer_join as (
+    select
+        q.id as question_id,
+        q.owneruserid as asker_id,
+        q.creationdate as q_created,
+        q.score as q_score,
+        q.viewcount as q_views,
+        q.answercount as q_answercount,
+        q.title as q_title,
+        qa.id as answer_id,
+        qa.owneruserid as answerer_id,
+        qa.creationdate as a_created,
+        qa.score as a_score,
+        (qa.creationdate - q.creationdate) as time_to_answer,
+        case when qa.id = q.acceptedanswerid then 1 else 0 end as is_accepted
+    from posts q
+    left join posts qa
+        on qa.parentid = q.id and qa.posttypeid = 2
+    where q.posttypeid = 1
+),
+answer_quality as (
+    select
+        qa.answer_id,
+        qa.question_id,
+        qa.answerer_id,
+        qa.is_accepted,
+        qa.a_score,
+        qa.time_to_answer,
+        row_number() over (partition by qa.question_id order by qa.is_accepted desc, qa.a_score desc, qa.a_created asc, qa.answer_id) as answer_rank,
+        rank() over (partition by qa.answerer_id order by qa.a_score desc NULLS LAST) as answerer_best_rank
+    from question_answer_join qa
+),
+yearly_user_stats as (
+    select
+        ra.year_start,
+        ua.user_id,
+        ua.displayname,
+        ua.reputation,
+        ua.location,
+        ua.websiteurl_norm,
+        ua.net_votes_nonneg,
+        coalesce(sum(case when pn.is_question = 1 then 1 else 0 end), 0) as questions_posted,
+        coalesce(sum(case when pn.is_answer = 1 then 1 else 0 end), 0) as answers_posted,
+        coalesce(sum(pn.score), 0) as post_score_sum,
+        coalesce(sum(vu.upvotes), 0) as votes_up_on_posts,
+        coalesce(sum(vu.downvotes), 0) as votes_down_on_posts,
+        sum(case when pe.was_closed = 1 then 1 else 0 end) as posts_closed,
+        avg(NULLIF(pn.viewcount,0)) filter (where pn.viewcount is not null) as avg_views,
+        max(pn.creationdate) as last_post_at
+    from recent_years ra
+    join user_activity ua on ua.cohort_year <= ra.year_start
+    left join posts_norm pn on pn.owneruserid = ua.user_id and date_trunc('year', pn.creationdate) = ra.year_start
+    left join votes_agg vu on vu.postid = pn.id
+    left join post_edit_events pe on pe.postid = pn.id
+    group by ra.year_start, ua.user_id, ua.displayname, ua.reputation, ua.location, ua.websiteurl_norm, ua.net_votes_nonneg
+),
+user_engagement as (
+    select
+        yus.year_start,
+        yus.user_id,
+        yus.displayname,
+        yus.reputation,
+        yus.location,
+        yus.websiteurl_norm,
+        yus.net_votes_nonneg,
+        yus.questions_posted,
+        yus.answers_posted,
+        yus.post_score_sum,
+        yus.votes_up_on_posts,
+        yus.votes_down_on_posts,
+        yus.posts_closed,
+        yus.avg_views,
+        yus.last_post_at,
+        ub.gold_cnt,
+        ub.silver_cnt,
+        ub.bronze_cnt,
+        ub.tag_badges,
+        least(coalesce(ub.gold_cnt,0)*3 + coalesce(ub.silver_cnt,0)*2 + coalesce(ub.bronze_cnt,0), 9999) as badge_score,
+        case
+            when (coalesce(ub.gold_cnt,0) + coalesce(ub.silver_cnt,0) + coalesce(ub.bronze_cnt,0)) = 0 then 'none'
+            when coalesce(ub.gold_cnt,0) > 0 then 'gold'
+            when coalesce(ub.silver_cnt,0) > 0 then 'silver'
+            else 'bronze'
+        end as top_badge_class
+    from yearly_user_stats yus
+    left join user_badges ub on ub.userid = yus.user_id
+),
+question_tag_pivot as (
+    select
+        pn.owneruserid as user_id,
+        date_trunc('year', pn.creationdate) as year_start,
+        count(distinct case when ptt.tag in ('javascript','java','python','c#','php') then pn.id end) as big5_tag_questions,
+        count(distinct case when ptt.tag not in ('javascript','java','python','c#','php') then pn.id end) as other_tag_questions
+    from posts_norm pn
+    left join post_tag_top ptt on ptt.post_id = pn.id
+    where pn.is_question = 1
+    group by pn.owneruserid, date_trunc('year', pn.creationdate)
+),
+answer_accept_win as (
+    select
+        aa.answerer_id as user_id,
+        date_trunc('year', (select min(p.creationdate) from posts p where p.id = aa.answer_id)) as year_start,
+        sum(case when aa.is_accepted = 1 then 1 else 0 end) as accepted_answers,
+        sum(1) as total_answers,
+        sum(case when aa.answer_rank = 1 then 1 else 0 end) as top_ranked_answers
+    from answer_quality aa
+    group by aa.answerer_id, date_trunc('year', (select min(p.creationdate) from posts p where p.id = aa.answer_id))
+),
+user_yearly_enriched as (
+    select
+        ue.year_start,
+        ue.user_id,
+        ue.displayname,
+        ue.reputation,
+        ue.location,
+        ue.websiteurl_norm,
+        ue.net_votes_nonneg,
+        ue.questions_posted,
+        ue.answers_posted,
+        ue.post_score_sum,
+        ue.votes_up_on_posts,
+        ue.votes_down_on_posts,
+        ue.posts_closed,
+        ue.avg_views,
+        ue.last_post_at,
+        ue.gold_cnt,
+        ue.silver_cnt,
+        ue.bronze_cnt,
+        ue.tag_badges,
+        ue.badge_score,
+        ue.top_badge_class,
+        coalesce(qtp.big5_tag_questions, 0) as big5_tag_questions,
+        coalesce(qtp.other_tag_questions, 0) as other_tag_questions,
+        coalesce(aaw.accepted_answers, 0) as accepted_answers,
+        coalesce(aaw.total_answers, 0) as total_answers,
+        coalesce(aaw.top_ranked_answers, 0) as top_ranked_answers
+    from user_engagement ue
+    left join question_tag_pivot qtp
+        on qtp.user_id = ue.user_id and qtp.year_start = ue.year_start
+    left join answer_accept_win aaw
+        on aaw.user_id = ue.user_id and aaw.year_start = ue.year_start
+),
+post_outliers as (
+    select
+        pn.id,
+        pn.owneruserid as user_id,
+        pn.creationdate,
+        pn.score,
+        pn.viewcount,
+        pn.posttypeid,
+        vu.upvotes,
+        vu.downvotes,
+        (pn.score - avg(pn.score) over (partition by pn.posttypeid)) /
+            nullif(stddev_pop(pn.score) over (partition by pn.posttypeid), 0) as score_z,
+        (pn.viewcount - avg(pn.viewcount) over (partition by pn.posttypeid)) /
+            nullif(stddev_pop(pn.viewcount) over (partition by pn.posttypeid), 0) as views_z
+    from posts_norm pn
+    left join votes_agg vu on vu.postid = pn.id
+),
+user_outlier_summary as (
+    select
+        po.user_id,
+        date_trunc('year', po.creationdate) as year_start,
+        count(case when po.score_z >= 3 then 1 end) as hi_score_posts,
+        count(case when po.views_z >= 3 then 1 end) as hi_view_posts,
+        count(case when po.score_z <= -3 then 1 end) as low_score_posts
+    from post_outliers po
+    group by po.user_id, date_trunc('year', po.creationdate)
+),
+null_logic_sample as (
+    select
+        u.id as user_id,
+        case
+            when u.location is null or trim(u.location) = '' then 'Unknown'
+            when position(',' in u.location) > 0 then split_part(u.location, ',', 2)
+            else u.location
+        end as location_norm
+    from users u
+),
+final as (
+    select
+        f.year_start,
+        f.user_id,
+        f.displayname,
+        coalesce(nls.location_norm, f.location) as location_norm,
+        f.websiteurl_norm,
+        f.reputation,
+        f.net_votes_nonneg,
+        f.questions_posted,
+        f.answers_posted,
+        f.post_score_sum,
+        f.votes_up_on_posts,
+        f.votes_down_on_posts,
+        f.posts_closed,
+        f.avg_views,
+        f.last_post_at,
+        f.gold_cnt,
+        f.silver_cnt,
+        f.bronze_cnt,
+        f.tag_badges,
+        f.badge_score,
+        f.top_badge_class,
+        f.big5_tag_questions,
+        f.other_tag_questions,
+        f.accepted_answers,
+        f.total_answers,
+        f.top_ranked_answers,
+        coalesce(uos.hi_score_posts,0) as hi_score_posts,
+        coalesce(uos.hi_view_posts,0) as hi_view_posts,
+        coalesce(uos.low_score_posts,0) as low_score_posts,
+        case
+            when coalesce(f.total_answers,0) = 0 then 0.0
+            else round(cast(coalesce(f.accepted_answers,0) as numeric) / nullif(f.total_answers,0), 4)
+        end as accept_rate,
+        case
+            when f.answers_posted + f.questions_posted = 0 then null
+            else round((cast(f.post_score_sum as numeric)) / nullif(f.answers_posted + f.questions_posted, 0), 3)
+        end as avg_score_per_post,
+        case
+            when coalesce(f.votes_down_on_posts,0) = 0 then coalesce(f.votes_up_on_posts,0)
+            else round(cast(coalesce(f.votes_up_on_posts,0) as numeric) / nullif(f.votes_down_on_posts,0), 3)
+        end as up_to_down_ratio,
+        case
+            when f.reputation >= 50000 then 'Legend'
+            when f.reputation >= 10000 then 'Expert'
+            when f.reputation >= 2000 then 'Intermediate'
+            when f.reputation > 0 then 'Beginner'
+            else 'New'
+        end as rep_bucket,
+        dense_rank() over (partition by f.year_start order by coalesce(f.accepted_answers,0) desc, f.reputation desc, f.post_score_sum desc, f.user_id) as yearly_rank,
+        sum(f.post_score_sum) over (partition by f.user_id order by f.year_start rows between unbounded preceding and current row) as cum_score_by_user,
+        lag(f.post_score_sum) over (partition by f.user_id order by f.year_start) as prev_year_score,
+        round(
+            case
+                when lag(f.post_score_sum) over (partition by f.user_id order by f.year_start) is null then null
+                when lag(f.post_score_sum) over (partition by f.user_id order by f.year_start) = 0 then null
+                else (cast(f.post_score_sum as numeric) - lag(f.post_score_sum) over (partition by f.user_id order by f.year_start)) /
+                     nullif(lag(f.post_score_sum) over (partition by f.user_id order by f.year_start), 0)
+            end
+        , 4) as yoy_score_growth,
+        f.avg_views -- include avg_views because it's referenced in outer WHERE
+    from user_yearly_enriched f
+    left join user_outlier_summary uos on uos.user_id = f.user_id and uos.year_start = f.year_start
+    left join null_logic_sample nls on nls.user_id = f.user_id
+),
+topn as (
+    select *
+    from (
+        select
+            final.*,
+            row_number() over (partition by year_start order by yearly_rank, accept_rate desc NULLS LAST, avg_score_per_post desc NULLS LAST, user_id) as rn
+        from final
+    ) sub
+    where rn <= 200
+)
+select
+    t.year_start,
+    t.yearly_rank,
+    t.user_id,
+    t.displayname,
+    t.rep_bucket,
+    t.reputation,
+    t.accept_rate,
+    t.avg_score_per_post,
+    t.up_to_down_ratio,
+    t.questions_posted,
+    t.answers_posted,
+    t.post_score_sum,
+    t.cum_score_by_user,
+    t.prev_year_score,
+    t.yoy_score_growth,
+    t.gold_cnt,
+    t.silver_cnt,
+    t.bronze_cnt,
+    t.tag_badges,
+    t.hi_score_posts,
+    t.hi_view_posts,
+    t.low_score_posts,
+    t.big5_tag_questions,
+    t.other_tag_questions,
+    t.location_norm,
+    t.websiteurl_norm
+from topn t
+where
+    (t.accept_rate is null or t.accept_rate >= 0.1)
+    and coalesce(t.avg_views, 0) >= 0
+    and (t.questions_posted + t.answers_posted) > 0
+order by t.year_start desc, t.yearly_rank asc, t.user_id asc;

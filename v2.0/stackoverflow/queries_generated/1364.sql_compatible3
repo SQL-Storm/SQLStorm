@@ -1,0 +1,207 @@
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.UpVotes,
+        U.DownVotes,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        AVG(CASE WHEN P.PostTypeId IN (1,2) THEN P.Score ELSE NULL END) AS AvgContentScore,
+        MAX(P.LastActivityDate) AS LastActivityOnPost,
+        NTILE(4) OVER (ORDER BY U.Reputation DESC) AS ReputationQuartile,
+        CASE
+            WHEN U.Reputation >= 100000 THEN 'Legendary'
+            WHEN U.Reputation >= 20000 THEN 'Veteran'
+            WHEN U.Reputation >= 1000 THEN 'Contributor'
+            ELSE 'Novice'
+        END AS ReputationTier
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.UpVotes, U.DownVotes
+    HAVING COUNT(DISTINCT P.Id) > 0
+),
+UserBadgeSummary AS (
+    SELECT
+        UserId,
+        COUNT(Id) AS TotalBadges,
+        SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(Date) AS LastBadgeDate
+    FROM Badges
+    GROUP BY UserId
+),
+PostDetails AS (
+    SELECT
+        PQ.Id AS QuestionId,
+        PQ.OwnerUserId AS QuestionOwnerId,
+        PQ.Title AS QuestionTitle,
+        PQ.Body AS QuestionBody,
+        PQ.CreationDate AS QuestionCreationDate,
+        PQ.Score AS QuestionScore,
+        PQ.ViewCount,
+        COALESCE(PQ.AnswerCount, 0) AS AnswerCount,
+        COALESCE(PQ.FavoriteCount, 0) AS FavoriteCount,
+        PQ.ClosedDate,
+        PQ.Tags,
+        PA.Id AS AcceptedAnswerId,
+        PA.CreationDate AS AcceptedAnswerCreationDate,
+        PA.Score AS AcceptedAnswerScore,
+        COALESCE(SUM(CASE WHEN PC.PostId = PQ.Id THEN 1 ELSE 0 END), 0) AS QuestionCommentCount,
+        COALESCE(AVG(CASE WHEN PC.PostId = PQ.Id THEN PC.Score ELSE NULL END), 0.0) AS AvgQuestionCommentScore,
+        MAX(CASE WHEN PH_Edit.PostHistoryTypeId IN (4,5,6) THEN PH_Edit.CreationDate ELSE NULL END) AS LastEditDate,
+        COUNT(CASE WHEN PH_Edit.PostHistoryTypeId IN (4,5,6) THEN 1 ELSE NULL END) AS EditCount,
+        MIN(CASE WHEN PH_Edit.PostHistoryTypeId IN (4,5,6) THEN PH_Edit.CreationDate ELSE NULL END) AS FirstEditDate
+    FROM Posts PQ
+    LEFT JOIN Posts PA ON PQ.AcceptedAnswerId = PA.Id
+    LEFT JOIN Comments PC ON PQ.Id = PC.PostId
+    LEFT JOIN PostHistory PH_Edit ON PQ.Id = PH_Edit.PostId
+    WHERE PQ.PostTypeId = 1
+    GROUP BY
+        PQ.Id, PQ.OwnerUserId, PQ.Title, PQ.Body, PQ.CreationDate, PQ.Score, PQ.ViewCount, PQ.AnswerCount,
+        PQ.FavoriteCount, PQ.ClosedDate, PQ.Tags, PA.Id, PA.CreationDate, PA.Score
+),
+PostClosureEvents AS (
+    SELECT
+        PH.PostId,
+        PH.CreationDate AS EventDate,
+        PH.PostHistoryTypeId,
+        PH.Comment AS EventComment,
+        ROW_NUMBER() OVER (PARTITION BY PH.PostId, PH.PostHistoryTypeId ORDER BY PH.CreationDate DESC) AS rn_latest_event
+    FROM PostHistory PH
+    WHERE PH.PostHistoryTypeId IN (10, 11)
+),
+PostClosureHistory AS (
+    SELECT
+        PCE.PostId,
+        MAX(CASE WHEN PCE.PostHistoryTypeId = 10 THEN PCE.EventDate ELSE NULL END) AS ClosedDateHist,
+        MAX(CASE WHEN PCE.PostHistoryTypeId = 11 THEN PCE.EventDate ELSE NULL END) AS ReopenedDateHist,
+        COUNT(CASE WHEN PCE.PostHistoryTypeId = 10 THEN 1 ELSE NULL END) AS CloseEventCount,
+        COUNT(CASE WHEN PCE.PostHistoryTypeId = 11 THEN 1 ELSE NULL END) AS ReopenEventCount,
+        MAX(CASE WHEN PCE.PostHistoryTypeId = 10 AND PCE.rn_latest_event = 1 THEN PCE.EventComment ELSE NULL END) AS LastCloseReasonComment_Raw
+    FROM PostClosureEvents PCE
+    GROUP BY PCE.PostId
+),
+PostClosureReasonMapped AS (
+    SELECT
+        PCH.PostId,
+        PCH.ClosedDateHist,
+        PCH.ReopenedDateHist,
+        PCH.CloseEventCount,
+        PCH.ReopenEventCount,
+        PCH.LastCloseReasonComment_Raw,
+        CRT.Name AS LastCloseReasonName
+    FROM PostClosureHistory PCH
+    LEFT JOIN CloseReasonTypes CRT
+        ON PCH.LastCloseReasonComment_Raw IS NOT NULL
+        AND PCH.LastCloseReasonComment_Raw ~ '^[0-9]+$'
+        AND CAST(PCH.LastCloseReasonComment_Raw AS SMALLINT) = CRT.Id
+),
+TopQuestionTags AS (
+    SELECT
+        PD.QuestionId,
+        PD.QuestionOwnerId,
+        PD.QuestionScore,
+        TRIM(tag) AS TagName,
+        ROW_NUMBER() OVER (PARTITION BY PD.QuestionId ORDER BY T.Count DESC, T.TagName) AS TagRank
+    FROM PostDetails PD
+    CROSS JOIN LATERAL (
+        WITH RECURSIVE split(idx, rest, tag) AS (
+            SELECT
+                1,
+                CAST(PD.Tags AS VARCHAR(4000)),
+                NULL
+            UNION ALL
+            SELECT
+                idx + 1,
+                CASE
+                    WHEN POSITION('><' IN rest) > 0 THEN SUBSTRING(rest FROM POSITION('><' IN rest) + 2)
+                    ELSE ''
+                END,
+                TRIM(BOTH '<>' FROM CASE
+                    WHEN POSITION('><' IN rest) > 0 THEN SUBSTRING(rest FROM 1 FOR POSITION('><' IN rest))
+                    ELSE rest
+                END)
+            FROM split
+            WHERE rest IS NOT NULL AND rest <> ''
+        )
+        SELECT CAST(tag AS VARCHAR(4000)) AS tag FROM split WHERE tag IS NOT NULL AND tag <> ''
+    ) s(tag)
+    JOIN Tags T ON TRIM(s.tag) = T.TagName
+    WHERE PD.Tags IS NOT NULL AND LENGTH(PD.Tags) > 2
+)
+SELECT
+    UE.UserId,
+    UE.DisplayName,
+    UE.Reputation,
+    UE.ReputationTier,
+    UBS.GoldBadges,
+    PD.QuestionId,
+    PD.QuestionTitle,
+    PD.QuestionCreationDate,
+    PD.QuestionScore,
+    PD.AcceptedAnswerId,
+    PD.AcceptedAnswerCreationDate,
+    PD.AcceptedAnswerScore,
+    PD.AnswerCount,
+    PD.FavoriteCount,
+    PD.ViewCount,
+    PD.EditCount,
+    EXTRACT(EPOCH FROM (PD.LastEditDate - PD.FirstEditDate)) / 3600.0 AS HoursBetweenFirstAndLastEdit,
+    PD.QuestionCommentCount,
+    PD.AvgQuestionCommentScore,
+    PCRM.ClosedDateHist AS ActualClosedDate,
+    PCRM.ReopenedDateHist AS ActualReopenedDate,
+    PCRM.LastCloseReasonName,
+    COALESCE(LT.Name, 'NoLinkedQuestion') AS LinkTypeName,
+    LAG(PD.QuestionScore, 1, 0) OVER (PARTITION BY UE.UserId ORDER BY PD.QuestionCreationDate) AS PreviousQuestionScore,
+    CASE
+        WHEN PD.AcceptedAnswerId IS NOT NULL AND PD.AcceptedAnswerCreationDate IS NOT NULL AND PD.QuestionCreationDate IS NOT NULL THEN
+            EXTRACT(EPOCH FROM (PD.AcceptedAnswerCreationDate - PD.QuestionCreationDate)) / 3600.0
+        ELSE NULL
+    END AS TimeToAcceptedAnswerHours,
+    (SELECT AVG(TQS_Inner.QuestionScore) FROM TopQuestionTags TQS_Inner WHERE TQS_Inner.TagName = TQT_Primary.TagName) AS AvgTagScoreOverall,
+    STRING_AGG(TQT_Primary.TagName, ', ') FILTER (WHERE TQT_Primary.TagRank <= 3) AS Top3QuestionTags,
+    (UE.UpVotes + UE.DownVotes) AS TotalVotesGivenByOwner,
+    NULLIF(UE.UpVotes, 0) / NULLIF(UE.DownVotes, 0) AS UpVoteToDownVoteRatio,
+    UE.TotalQuestions - UE.TotalAnswers AS QuestionAnswerDelta
+FROM UserEngagement UE
+INNER JOIN UserBadgeSummary UBS ON UE.UserId = UBS.UserId
+LEFT JOIN PostDetails PD ON UE.UserId = PD.QuestionOwnerId
+LEFT JOIN PostClosureReasonMapped PCRM ON PD.QuestionId = PCRM.PostId
+LEFT JOIN PostLinks PL ON PD.QuestionId = PL.PostId AND PL.LinkTypeId = 1
+LEFT JOIN LinkTypes LT ON PL.LinkTypeId = LT.Id
+LEFT JOIN TopQuestionTags TQT_Primary ON PD.QuestionId = TQT_Primary.QuestionId AND TQT_Primary.TagRank = 1
+WHERE
+    UE.Reputation >= 10000
+    AND UBS.GoldBadges >= 1
+    AND PD.QuestionId IS NOT NULL
+    AND COALESCE(PCRM.CloseEventCount, 0) > 0
+    AND COALESCE(PCRM.ReopenEventCount, 0) > 0
+    AND (PD.QuestionScore > 10 OR PD.FavoriteCount > 2)
+    AND (PD.QuestionTitle ILIKE '%sql%' OR PD.QuestionTitle ILIKE '%performance%')
+    AND PD.LastEditDate IS NOT NULL
+    AND UE.DisplayName IS NOT NULL AND UE.DisplayName <> ''
+    AND LENGTH(PD.QuestionBody) > 500
+    AND NOT EXISTS (
+        SELECT 1
+        FROM Comments C
+        WHERE C.UserId = UE.UserId
+          AND C.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year')
+          AND C.Text ILIKE '%offensive%'
+    )
+GROUP BY
+    UE.UserId, UE.DisplayName, UE.Reputation, UE.ReputationTier, UBS.GoldBadges,
+    PD.QuestionId, PD.QuestionTitle, PD.QuestionCreationDate, PD.QuestionScore,
+    PD.AcceptedAnswerId, PD.AcceptedAnswerCreationDate, PD.AcceptedAnswerScore,
+    PD.AnswerCount, PD.FavoriteCount, PD.ViewCount, PD.EditCount,
+    PD.LastEditDate, PD.FirstEditDate, PD.QuestionCommentCount, PD.AvgQuestionCommentScore,
+    PCRM.ClosedDateHist, PCRM.ReopenedDateHist, PCRM.LastCloseReasonName, LT.Name,
+    PD.QuestionBody, UE.UpVotes, UE.DownVotes, UE.TotalQuestions, UE.TotalAnswers
+ORDER BY
+    UE.Reputation DESC,
+    PD.QuestionScore DESC,
+    TimeToAcceptedAnswerHours ASC NULLS LAST;

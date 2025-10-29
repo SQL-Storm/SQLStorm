@@ -1,0 +1,174 @@
+WITH
+    user_base AS (
+        SELECT
+            u.Id                              AS user_id,
+            u.DisplayName                     AS display_name,
+            COALESCE(u.Location, 'Unknown')   AS location,
+            u.Reputation,
+            u.CreationDate,
+            (SELECT p.Title
+               FROM Posts p
+              WHERE p.OwnerUserId = u.Id
+                AND p.Title IS NOT NULL
+              ORDER BY p.CreationDate DESC
+              LIMIT 1)                      AS latest_post_title
+        FROM Users u
+    ),
+
+    badge_stats AS (
+        SELECT
+            b.UserId                         AS user_id,
+            COUNT(*)                         AS total_badges,
+            SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_badges,
+            SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_badges,
+            SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_badges,
+            -- use a portable aggregation for badge names
+            STRING_AGG(DISTINCT b.Name, '; ') FILTER (WHERE b.Name IS NOT NULL) AS badge_names
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+
+    post_stats AS (
+        SELECT
+            p.OwnerUserId                     AS user_id,
+            COUNT(*)                         AS total_posts,
+            COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS questions,
+            COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS answers,
+            AVG(p.Score)                     AS avg_score,
+            MAX(p.CreationDate)              AS last_post_date
+        FROM Posts p
+        GROUP BY p.OwnerUserId
+    ),
+
+    recent_votes AS (
+        SELECT
+            v.UserId                         AS user_id,
+            COUNT(*)                         AS total_votes_30d,
+            COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS up_votes_30d,
+            COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS down_votes_30d
+        FROM Votes v
+        WHERE v.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '30 days')
+        GROUP BY v.UserId
+    ),
+
+    top_tags AS (
+        SELECT
+            t.TagName,
+            t.Count                         AS tag_use_count,
+            COALESCE(e.Title, '(no excerpt)') AS sample_excerpt_title,
+            ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS tag_rank
+        FROM Tags t
+        LEFT JOIN Posts e
+               ON e.Id = t.ExcerptPostId
+        -- fix boolean/integer comparison: assume IsModeratorOnly is boolean; compare to FALSE
+        WHERE t.IsModeratorOnly = FALSE
+    ),
+
+    users_no_badges AS (
+        SELECT
+            ub.user_id,
+            ub.display_name,
+            ub.location,
+            ub.reputation,
+            ub.creationdate,
+            CAST(NULL AS integer)               AS total_badges,
+            0                                   AS gold_badges,
+            0                                   AS silver_badges,
+            0                                   AS bronze_badges,
+            CAST(NULL AS text)                  AS badge_names,
+            ps.total_posts,
+            ps.questions,
+            ps.answers,
+            ps.avg_score,
+            ps.last_post_date,
+            rv.total_votes_30d,
+            rv.up_votes_30d,
+            rv.down_votes_30d
+        FROM user_base ub
+        LEFT JOIN badge_stats bs ON bs.user_id = ub.user_id
+        INNER JOIN post_stats ps ON ps.user_id = ub.user_id
+        LEFT  JOIN recent_votes rv ON rv.user_id = ub.user_id
+        WHERE bs.user_id IS NULL
+    )
+SELECT
+    combined.user_id,
+    combined.display_name,
+    combined.location,
+    combined.reputation,
+    combined.creation_date,
+    combined.total_badges,
+    combined.gold_badges,
+    combined.silver_badges,
+    combined.bronze_badges,
+    combined.badge_names,
+    combined.total_posts,
+    combined.questions,
+    combined.answers,
+    combined.avg_score,
+    combined.last_post_date,
+    combined.total_votes_30d,
+    combined.up_votes_30d,
+    combined.down_votes_30d,
+    combined.user_label,
+    combined.rep_per_post,
+    combined.activity_status
+FROM (
+    SELECT
+        ub.user_id,
+        ub.display_name,
+        ub.location,
+        ub.reputation,
+        ub.creation_date,
+        bs.total_badges,
+        bs.gold_badges,
+        bs.silver_badges,
+        bs.bronze_badges,
+        bs.badge_names,
+        ps.total_posts,
+        ps.questions,
+        ps.answers,
+        ROUND(CAST(ps.avg_score AS numeric), 2)        AS avg_score,
+        ps.last_post_date,
+        rv.total_votes_30d,
+        rv.up_votes_30d,
+        rv.down_votes_30d,
+        (ub.display_name || ' [' || ub.location || ']') AS user_label,
+        CASE WHEN ps.total_posts = 0 THEN 0
+             ELSE ROUND(CAST(ub.reputation AS numeric) / ps.total_posts, 2)
+        END                                   AS rep_per_post,
+        CASE WHEN COALESCE(rv.total_votes_30d, 0) > 0 THEN 'ACTIVE' ELSE 'IDLE' END AS activity_status
+    FROM user_base ub
+    INNER JOIN badge_stats bs ON bs.user_id = ub.user_id
+    INNER JOIN post_stats ps  ON ps.user_id = ub.user_id
+    LEFT  JOIN recent_votes rv ON rv.user_id = ub.user_id
+
+    UNION ALL
+
+    SELECT
+        user_id,
+        display_name,
+        location,
+        reputation,
+        creationdate AS creation_date,
+        total_badges,
+        gold_badges,
+        silver_badges,
+        bronze_badges,
+        badge_names,
+        total_posts,
+        questions,
+        answers,
+        avg_score,
+        last_post_date,
+        total_votes_30d,
+        up_votes_30d,
+        down_votes_30d,
+        (display_name || ' [' || location || ']') AS user_label,
+        CASE WHEN total_posts = 0 THEN 0
+             ELSE ROUND(CAST(reputation AS numeric) / total_posts, 2)
+        END AS rep_per_post,
+        CASE WHEN COALESCE(total_votes_30d, 0) > 0 THEN 'ACTIVE' ELSE 'IDLE' END AS activity_status
+    FROM users_no_badges
+) AS combined
+ORDER BY combined.reputation DESC
+LIMIT 100;

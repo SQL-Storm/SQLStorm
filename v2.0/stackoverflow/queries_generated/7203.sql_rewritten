@@ -1,0 +1,229 @@
+-- {"query": "7203.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2585} 
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COALESCE(SUM(p.Score), 0) AS TotalScore,
+        COALESCE(AVG(p.Score), 0) AS AvgScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS UserRank,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 1000 THEN 'Elite'
+            WHEN COUNT(DISTINCT p.Id) > 500 THEN 'Veteran'
+            WHEN COUNT(DISTINCT p.Id) > 100 THEN 'Regular'
+            ELSE 'Newbie'
+        END AS UserCategory,
+        STRING_AGG(DISTINCT t.TagName, ', ') AS UserTags,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN p.Id END) AS AcceptedQuestions
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN (
+        SELECT DISTINCT PostId, UNNEST(STRING_TO_ARRAY(Tags, '<')) AS TagName
+        FROM Posts
+        WHERE Tags IS NOT NULL AND Tags != ''
+    ) t ON p.Id = t.PostId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        TotalPosts,
+        QuestionCount,
+        AnswerCount,
+        BadgeCount,
+        VoteCount,
+        CommentCount,
+        TotalScore,
+        AvgScore,
+        LastPostDate,
+        UserRank,
+        UserCategory,
+        UserTags,
+        AcceptedQuestions,
+        (TotalScore * 1.0 / NULLIF(TotalPosts, 0)) AS ScorePerPost,
+        (UpVotes * 1.0 / NULLIF(DownVotes + UpVotes, 0)) AS UpvoteRatio,
+        EXTRACT(DAYS FROM (cast('2024-10-01 12:34:56' as timestamp) - LastPostDate)) AS DaysSinceLastPost,
+        CASE 
+            WHEN Reputation >= 10000 THEN 10
+            WHEN Reputation >= 5000 THEN 7
+            WHEN Reputation >= 1000 THEN 4
+            ELSE 1
+        END AS ReputationMultiplier
+    FROM UserStats
+    WHERE TotalPosts > 0
+),
+PostActivity AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        p.PostTypeId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.Tags,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostTypeDesc,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserPostRank,
+        ROW_NUMBER() OVER (ORDER BY p.Score DESC) AS PostRank,
+        NTILE(10) OVER (ORDER BY p.Score DESC) AS ScoreQuartile,
+        LAG(p.Score, 1) OVER (ORDER BY p.CreationDate) AS PreviousScore,
+        LAG(p.CreationDate, 1) OVER (ORDER BY p.CreationDate) AS PreviousDate,
+        CASE 
+            WHEN p.Score > 100 THEN 'High'
+            WHEN p.Score > 50 THEN 'Medium'
+            WHEN p.Score > 10 THEN 'Low'
+            ELSE 'Very Low'
+        END AS ScoreLevel,
+        COALESCE(p.Tags, '') AS CleanTags,
+        LENGTH(COALESCE(p.Tags, '')) AS TagsLength,
+        CASE 
+            WHEN p.Tags LIKE '%<%' AND p.Tags LIKE '%>%' THEN TRUE
+            ELSE FALSE 
+        END AS HasTags
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1, 2)
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.IsRequired = 1 THEN 'Required'
+            WHEN t.IsModeratorOnly = 1 THEN 'Moderator Only'
+            ELSE 'Public'
+        END AS TagAccessibility,
+        LENGTH(t.TagName) AS TagLength,
+        POSITION('c++' IN LOWER(t.TagName)) AS CppPosition,
+        POSITION('javascript' IN LOWER(t.TagName)) AS JavaScriptPosition,
+        CASE 
+            WHEN t.TagName LIKE 'c-%' THEN 'C Family'
+            WHEN LOWER(t.TagName) LIKE 'java%' THEN 'Java Family'
+            WHEN LOWER(t.TagName) LIKE 'python%' THEN 'Python Family'
+            WHEN LOWER(t.TagName) LIKE 'c++%' THEN 'C++ Family'
+            WHEN LOWER(t.TagName) LIKE 'javascript%' THEN 'JS Family'
+            ELSE 'Other'
+        END AS TagFamily
+    FROM Tags t
+    WHERE t.TagName IS NOT NULL AND LENGTH(t.TagName) > 0
+),
+AggregatedData AS (
+    SELECT 
+        'General' AS Category,
+        COUNT(*) AS TotalRecords,
+        COUNT(DISTINCT u.Id) AS TotalUsers,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        COUNT(DISTINCT v.Id) AS TotalVotes,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT t.Id) AS TotalTags,
+        SUM(u.Reputation) AS TotalReputation,
+        AVG(u.Reputation) AS AvgReputation,
+        (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1) AS TotalQuestions,
+        (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 2) AS TotalAnswers
+    FROM Users u
+    FULL OUTER JOIN Posts p ON 1=1
+    FULL OUTER JOIN Badges b ON 1=1
+    FULL OUTER JOIN Votes v ON 1=1
+    FULL OUTER JOIN Comments c ON 1=1
+    FULL OUTER JOIN Tags t ON 1=1
+)
+SELECT 
+    t.Id AS TagId,
+    t.TagName,
+    t.Count AS TagCount,
+    t.ExcerptPostId,
+    t.WikiPostId,
+    t.IsModeratorOnly,
+    t.IsRequired,
+    CASE 
+        WHEN t.IsRequired = 1 THEN 'Required'
+        WHEN t.IsModeratorOnly = 1 THEN 'Moderator Only'
+        ELSE 'Public'
+    END AS AccessibilityLevel,
+    LENGTH(t.TagName) AS TagLength,
+    CASE 
+        WHEN t.TagName LIKE 'c-%' THEN 'C Family'
+        WHEN LOWER(t.TagName) LIKE 'java%' THEN 'Java Family'
+        WHEN LOWER(t.TagName) LIKE 'python%' THEN 'Python Family'
+        WHEN LOWER(t.TagName) LIKE 'c++%' THEN 'C++ Family'
+        WHEN LOWER(t.TagName) LIKE 'javascript%' THEN 'JS Family'
+        ELSE 'Other'
+    END AS TagFamily,
+    COALESCE((SELECT COUNT(*) FROM Posts WHERE Tags LIKE '%' || t.TagName || '%'), 0) AS PostsUsingTag,
+    CASE 
+        WHEN t.TagName IN ('java', 'javascript', 'python', 'c++') THEN 1
+        WHEN EXISTS (SELECT 1 FROM Posts WHERE Tags LIKE '%' || t.TagName || '%') THEN 2
+        ELSE 3
+    END AS PriorityLevel,
+    CASE 
+        WHEN EXISTS (SELECT 1 FROM Posts WHERE Tags LIKE '%' || t.TagName || '%') THEN 
+            (SELECT AVG(p.Score) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%')
+        ELSE NULL 
+    END AS AvgScoreForTag,
+    CASE 
+        WHEN t.TagName LIKE '%web%' THEN 'Web Development'
+        WHEN t.TagName LIKE '%database%' THEN 'Database'
+        WHEN t.TagName LIKE '%security%' THEN 'Security'
+        WHEN t.TagName LIKE '%mobile%' THEN 'Mobile Development'
+        ELSE 'Other'
+    END AS TagCategory,
+    RANK() OVER (ORDER BY t.Count DESC) AS PopularRank,
+    DENSE_RANK() OVER (ORDER BY LENGTH(t.TagName) ASC) AS TagLengthRank,
+    PERCENT_RANK() OVER (ORDER BY t.Count) AS CountPercentile,
+    NTILE(4) OVER (ORDER BY t.Count) AS CountQuartile,
+    COALESCE((SELECT COUNT(DISTINCT u.Id) FROM Users u JOIN Posts p ON u.Id = p.OwnerUserId WHERE p.Tags LIKE '%' || t.TagName || '%'), 0) AS ActiveUsersWithTag,
+    COALESCE((SELECT COUNT(*) FROM PostHistory ph WHERE ph.Text LIKE '%' || t.TagName || '%'), 0) AS TagEditsInHistory,
+    LAG(t.Count, 1) OVER (ORDER BY t.Count DESC) AS PreviousTagCount,
+    ROW_NUMBER() OVER (ORDER BY LENGTH(t.TagName) DESC) AS LongestTagIndex,
+    CASE 
+        WHEN t.Count > 1000 THEN 'Very Popular'
+        WHEN t.Count > 500 THEN 'Popular'
+        WHEN t.Count > 100 THEN 'Moderate'
+        ELSE 'Less Popular'
+    END AS PopularityCategory,
+    t.Count * (CASE WHEN t.IsRequired = 1 THEN 2 ELSE 1 END) * (CASE WHEN t.IsModeratorOnly = 1 THEN 1.5 ELSE 1 END) AS TagScore,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.Text LIKE '%' || t.TagName || '%') > 0 AS HasEditHistory,
+    (SELECT COUNT(DISTINCT u.Id) FROM Users u JOIN Posts p ON u.Id = p.OwnerUserId WHERE p.Tags LIKE '%' || t.TagName || '%') > 0 AS HasActiveUsers,
+    'Tag' AS Source,
+    COALESCE((SELECT STRING_AGG(DISTINCT u.DisplayName, ', ') 
+             FROM Users u 
+             JOIN Posts p ON u.Id = p.OwnerUserId 
+             WHERE p.Tags LIKE '%' || t.TagName || '%'), '') AS ActiveUserNames,
+    (SELECT COUNT(*) FROM Posts WHERE Tags LIKE '%' || t.TagName || '%') AS PostCountForTag,
+    (SELECT AVG(p.Score) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%') AS AvgPostScore,
+    (SELECT MAX(p.CreationDate) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%') AS LastPostWithTag,
+    (SELECT MIN(p.CreationDate) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%') AS FirstPostWithTag,
+    (SELECT COUNT(*) FROM Votes v JOIN Posts p ON v.PostId = p.Id WHERE p.Tags LIKE '%' || t.TagName || '%') AS TotalVotesForTag,
+    COALESCE((SELECT COUNT(*) FROM Comments c JOIN Posts p ON c.PostId = p.Id WHERE p.Tags LIKE '%' || t.TagName || '%'), 0) AS TotalCommentsForTag
+FROM Tags t
+WHERE t.TagName IS NOT NULL AND LENGTH(TRIM(t.TagName)) > 0
+    AND t.Count > 0
+HAVING (SELECT COUNT(*) FROM Posts WHERE Tags LIKE '%' || t.TagName || '%') > 0
+ORDER BY t.Count DESC, TagLengthRank ASC, RANK() OVER (ORDER BY t.Count DESC)
+LIMIT 500;

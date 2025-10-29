@@ -1,0 +1,276 @@
+-- {"query": "522.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2932} 
+with recent_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.location,
+    coalesce(nullif(trim(u.websiteurl), ''), 'unknown') as websiteurl_norm
+  from users u
+  where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+user_activity as (
+  select
+    ru.user_id,
+    count(distinct p.id) filter (where p.posttypeid in (1,2)) as total_posts,
+    count(*) filter (where c.id is not null) as total_comments,
+    count(*) filter (where v.votetypeid = 2) as upvotes_given,
+    count(*) filter (where v.votetypeid = 3) as downvotes_given,
+    sum(coalesce(p.score,0)) as post_score_sum,
+    sum(coalesce(case when p.posttypeid = 1 then p.viewcount end,0)) as question_views_sum,
+    max(greatest(coalesce(p.lastactivitydate, p.creationdate), coalesce(c.creationdate, p.creationdate), coalesce(v.creationdate, p.creationdate))) as last_activity
+  from recent_users ru
+  left join posts p on p.owneruserid = ru.user_id
+  left join comments c on c.userid = ru.user_id
+  left join votes v on v.userid = ru.user_id
+  group by ru.user_id
+),
+user_badges as (
+  select
+    b.userid as user_id,
+    count(*) as badges_total,
+    count(*) filter (where b.class = 1) as gold_count,
+    count(*) filter (where b.class = 2) as silver_count,
+    count(*) filter (where b.class = 3) as bronze_count,
+    count(*) filter (where b.tagbased = 1) as tag_badges
+  from badges b
+  group by b.userid
+),
+first_last_post as (
+  select
+    p.owneruserid as user_id,
+    min(p.creationdate) as first_post_date,
+    max(p.creationdate) as last_post_date,
+    min(p.id) filter (where p.creationdate = min(p.creationdate) over (partition by p.owneruserid)) as first_post_id,
+    max(p.id) filter (where p.creationdate = max(p.creationdate) over (partition by p.owneruserid)) as last_post_id
+  from posts p
+  where p.owneruserid is not null
+  group by p.owneruserid
+),
+question_metrics as (
+  select
+    q.owneruserid as user_id,
+    count(*) as questions,
+    avg(nullif(q.answercount,0)) as avg_answers,
+    avg(q.score) as avg_q_score,
+    percentile_cont(0.9) within group (order by coalesce(q.viewcount,0)) as p90_views,
+    count(*) filter (where q.acceptedanswerid is not null) as accepted_count,
+    count(*) filter (where q.closeddate is not null) as closed_count
+  from posts q
+  where q.posttypeid = 1
+  group by q.owneruserid
+),
+answer_metrics as (
+  select
+    a.owneruserid as user_id,
+    count(*) as answers,
+    avg(a.score) as avg_a_score,
+    count(*) filter (where exists (
+      select 1
+      from posts q
+      where q.id = a.parentid
+        and q.acceptedanswerid = a.id
+    )) as accepted_answers,
+    sum(coalesce(a.score,0)) filter (where a.creationdate >= now() - interval '90 days') as last90_answer_score
+  from posts a
+  where a.posttypeid = 2
+  group by a.owneruserid
+),
+postlinks_agg as (
+  select
+    p.owneruserid as user_id,
+    count(*) filter (where pl.linktypeid = 1) as linked_out_count,
+    count(*) filter (where pl.linktypeid = 3 and pl.postid = p.id) as marked_duplicate_of,
+    count(*) filter (where pl.linktypeid = 3 and pl.relatedpostid = p.id) as has_duplicates_pointing_here
+  from posts p
+  left join postlinks pl on pl.postid = p.id or pl.relatedpostid = p.id
+  where p.owneruserid is not null
+  group by p.owneruserid
+),
+edits_and_closures as (
+  select
+    ph.userid as user_id,
+    count(*) filter (where ph.posthistorytypeid in (4,5,6,7,8,9,24)) as edits_made,
+    count(*) filter (where ph.posthistorytypeid in (10)) as closes_voted_events,
+    count(*) filter (where ph.posthistorytypeid in (11)) as reopens_voted_events
+  from posthistory ph
+  group by ph.userid
+),
+tag_expertise as (
+  select
+    p.owneruserid as user_id,
+    lower(trim(t.tag)) as tag_name,
+    count(*) as tag_posts,
+    avg(p.score) as tag_avg_score,
+    row_number() over (partition by p.owneruserid order by count(*) desc, avg(p.score) desc, lower(trim(t.tag))) as rn
+  from posts p
+  cross join lateral unnest(string_to_array(substring(p.tags, 2, greatest(length(p.tags)-2,0)), '><')) as t(tag)
+  where p.posttypeid = 1
+    and p.tags is not null
+    and p.owneruserid is not null
+  group by p.owneruserid, lower(trim(t.tag))
+),
+top_tags as (
+  select user_id,
+         string_agg(tag_name || ':' || tag_posts::text, ', ' order by rn) filter (where rn <= 5) as top5_tags
+  from tag_expertise
+  group by user_id
+),
+vote_received as (
+  select
+    p.owneruserid as user_id,
+    count(*) filter (where v.votetypeid = 2) as upvotes_received,
+    count(*) filter (where v.votetypeid = 3) as downvotes_received,
+    count(*) filter (where v.votetypeid = 1) as accepts_received
+  from posts p
+  left join votes v on v.postid = p.id
+  where p.owneruserid is not null
+  group by p.owneruserid
+),
+quality_score as (
+  select
+    ru.user_id,
+    (
+      coalesce(um.post_score_sum,0)
+      + coalesce(vm.upvotes_received,0)*2
+      - coalesce(vm.downvotes_received,0)
+      + coalesce(am.accepted_answers,0)*5
+      + coalesce(qm.accepted_count,0)*3
+      - coalesce(qm.closed_count,0)*4
+      + least(coalesce(ub.gold_count,0)*10 + coalesce(ub.silver_count,0)*5 + coalesce(ub.bronze_count,0)*1, 500)
+    )::numeric as raw_quality
+  from recent_users ru
+  left join user_activity um on um.user_id = ru.user_id
+  left join answer_metrics am on am.user_id = ru.user_id
+  left join question_metrics qm on qm.user_id = ru.user_id
+  left join user_badges ub on ub.user_id = ru.user_id
+  left join vote_received vm on vm.user_id = ru.user_id
+),
+ranked as (
+  select
+    ru.user_id,
+    ru.displayname,
+    ru.reputation,
+    ru.creationdate,
+    ru.location,
+    ua.total_posts,
+    ua.total_comments,
+    ua.upvotes_given,
+    ua.downvotes_given,
+    ua.post_score_sum,
+    ua.question_views_sum,
+    ua.last_activity,
+    coalesce(qm.questions,0) as questions,
+    coalesce(qm.avg_answers,0) as avg_answers_per_q,
+    coalesce(qm.avg_q_score,0) as avg_q_score,
+    coalesce(qm.p90_views,0) as p90_q_views,
+    coalesce(am.answers,0) as answers,
+    coalesce(am.avg_a_score,0) as avg_a_score,
+    coalesce(am.accepted_answers,0) as accepted_answers,
+    coalesce(am.last90_answer_score,0) as last90_answer_score,
+    coalesce(ub.badges_total,0) as badges_total,
+    coalesce(ub.gold_count,0) as gold_badges,
+    coalesce(ub.silver_count,0) as silver_badges,
+    coalesce(ub.bronze_count,0) as bronze_badges,
+    coalesce(ub.tag_badges,0) as tag_badges,
+    coalesce(pl.linked_out_count,0) as links_made,
+    coalesce(pl.marked_duplicate_of,0) as marked_duplicate_of,
+    coalesce(pl.has_duplicates_pointing_here,0) as has_duplicates_pointing_here,
+    coalesce(ea.edits_made,0) as edits_made,
+    coalesce(ea.closes_voted_events,0) as closes_voted_events,
+    coalesce(ea.reopens_voted_events,0) as reopens_voted_events,
+    coalesce(tt.top5_tags, 'none') as top5_tags,
+    coalesce(vm.upvotes_received,0) as upvotes_received,
+    coalesce(vm.downvotes_received,0) as downvotes_received,
+    coalesce(vm.accepts_received,0) as accepts_received,
+    qs.raw_quality,
+    dense_rank() over (order by qs.raw_quality desc nulls last, ru.reputation desc, ua.post_score_sum desc, ru.user_id) as quality_rank,
+    lag(qs.raw_quality) over (order by qs.raw_quality desc nulls last) as prev_quality,
+    lead(qs.raw_quality) over (order by qs.raw_quality desc nulls last) as next_quality
+  from recent_users ru
+  left join user_activity ua on ua.user_id = ru.user_id
+  left join question_metrics qm on qm.user_id = ru.user_id
+  left join answer_metrics am on am.user_id = ru.user_id
+  left join user_badges ub on ub.user_id = ru.user_id
+  left join postlinks_agg pl on pl.user_id = ru.user_id
+  left join edits_and_closures ea on ea.user_id = ru.user_id
+  left join top_tags tt on tt.user_id = ru.user_id
+  left join vote_received vm on vm.user_id = ru.user_id
+  left join quality_score qs on qs.user_id = ru.user_id
+),
+with_peer as (
+  select
+    r.*,
+    (
+      select avg(r2.raw_quality)
+      from ranked r2
+      where r2.quality_rank between r.quality_rank - 5 and r.quality_rank + 5
+    ) as peer_quality_avg
+  from ranked r
+),
+anomalies as (
+  select
+    wp.*,
+    case
+      when coalesce(wp.total_posts,0) = 0 and (coalesce(wp.total_comments,0) > 20 or coalesce(wp.upvotes_given,0) > 50) then 'lurker'
+      when coalesce(wp.questions,0) > 0 and coalesce(wp.answers,0) = 0 and coalesce(wp.avg_q_score,0) < 0 then 'low-q-only'
+      when coalesce(wp.answers,0) > 50 and coalesce(wp.accepted_answers,0) = 0 then 'answerer-no-accepts'
+      when coalesce(wp.downvotes_given,0) > coalesce(wp.upvotes_given,0)*2 and coalesce(wp.downvotes_given,0) > 20 then 'heavy-downvoter'
+      when coalesce(wp.closed_voted_events,0) > 0 and coalesce(wp.reopens_voted_events,0) = 0 then 'closer-only'
+      else 'normal'
+    end as behavior_flag
+  from with_peer wp
+),
+final_score as (
+  select
+    a.*,
+    (coalesce(a.raw_quality,0) - coalesce(a.peer_quality_avg,0))::numeric as quality_vs_peers,
+    case when a.last_activity < now() - interval '180 days' then 1 else 0 end as inactive_flag
+  from anomalies a
+)
+select
+  f.user_id,
+  f.displayname,
+  f.reputation,
+  f.location,
+  f.total_posts,
+  f.total_comments,
+  f.questions,
+  f.answers,
+  f.avg_q_score,
+  f.avg_a_score,
+  f.accepted_answers,
+  f.upvotes_received,
+  f.downvotes_received,
+  f.accepts_received,
+  f.gold_badges,
+  f.silver_badges,
+  f.bronze_badges,
+  f.links_made,
+  f.marked_duplicate_of,
+  f.has_duplicates_pointing_here,
+  f.edits_made,
+  f.closes_voted_events,
+  f.reopens_voted_events,
+  f.top5_tags,
+  f.raw_quality,
+  f.quality_rank,
+  f.peer_quality_avg,
+  f.quality_vs_peers,
+  f.behavior_flag,
+  f.inactive_flag,
+  coalesce(fl.first_post_date, ru.creationdate) as first_post_date,
+  fl.last_post_date
+from final_score f
+left join first_last_post fl on fl.user_id = f.user_id
+left join recent_users ru on ru.user_id = f.user_id
+where (
+  f.behavior_flag <> 'normal'
+  or f.raw_quality >= (
+    select percentile_cont(0.95) within group (order by coalesce(raw_quality,0))
+    from final_score
+  )
+)
+order by f.quality_rank nulls last, f.raw_quality desc nulls last, f.user_id
+limit 200;

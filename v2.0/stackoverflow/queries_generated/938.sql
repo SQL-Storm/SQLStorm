@@ -1,0 +1,345 @@
+-- {"query": "938.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3451} 
+with
+params as (
+    select
+        timestamp '2015-01-01' as start_date,
+        timestamp '2021-12-31' as end_date,
+        10 as min_reputation,
+        5 as min_comments_per_post,
+        3 as min_answers_per_question
+),
+-- Active users within date range with rank by activity
+active_users as (
+    select
+        u.Id as user_id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        coalesce(nullif(trim(u.Location), ''), 'Unknown') as Location,
+        u.UpVotes,
+        u.DownVotes,
+        u.Views,
+        count(distinct p.Id) filter (where p.CreationDate between (select start_date from params) and (select end_date from params)) as posts_in_range,
+        count(distinct c.Id) filter (where c.CreationDate between (select start_date from params) and (select end_date from params)) as comments_in_range,
+        dense_rank() over (order by coalesce(u.UpVotes - u.DownVotes, 0) desc, u.Reputation desc, u.Id) as activity_rank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location, u.UpVotes, u.DownVotes, u.Views
+),
+-- Questions and answers with tag arrays, plus derived metrics
+qa as (
+    select
+        q.Id as question_id,
+        q.OwnerUserId as asker_id,
+        q.CreationDate as question_date,
+        q.Score as question_score,
+        q.ViewCount as question_views,
+        q.Title as question_title,
+        q.Tags,
+        coalesce(q.AnswerCount, 0) as answer_count,
+        q.AcceptedAnswerId,
+        string_to_array(substring(q.Tags, 2, greatest(length(q.Tags)-2, 0)), '><') as tag_arr
+    from Posts q
+    where q.PostTypeId = 1
+      and q.CreationDate between (select start_date from params) and (select end_date from params)
+),
+answers as (
+    select
+        a.Id as answer_id,
+        a.ParentId as question_id,
+        a.OwnerUserId as answerer_id,
+        a.CreationDate as answer_date,
+        a.Score as answer_score
+    from Posts a
+    where a.PostTypeId = 2
+      and a.CreationDate between (select start_date from params) and (select end_date from params)
+),
+-- First answer per question and time-to-first-answer
+first_answer as (
+    select
+        a.question_id,
+        a.answer_id,
+        a.answerer_id,
+        a.answer_date,
+        a.answer_score,
+        row_number() over (partition by a.question_id order by a.answer_date asc, a.answer_id) as rn,
+        extract(epoch from (a.answer_date - q.question_date)) / 3600.0 as hours_to_answer
+    from answers a
+    join qa q on q.question_id = a.question_id
+),
+-- Comments per post and top commenters
+post_comment_stats as (
+    select
+        c.PostId,
+        count(*) as comment_count,
+        max(c.CreationDate) as last_comment_date,
+        count(*) filter (where c.Score > 0) as upvoted_comment_count,
+        max(c.Score) as max_comment_score
+    from Comments c
+    where c.CreationDate between (select start_date from params) and (select end_date from params)
+    group by c.PostId
+),
+-- Votes aggregated per post
+post_vote_agg as (
+    select
+        v.PostId,
+        count(*) filter (where v.VoteTypeId = 2) as upvotes,
+        count(*) filter (where v.VoteTypeId = 3) as downvotes,
+        count(*) filter (where v.VoteTypeId = 5) as favorites,
+        sum(coalesce(v.BountyAmount,0)) filter (where v.VoteTypeId in (8,9)) as bounty_total,
+        min(v.CreationDate) filter (where v.VoteTypeId in (8,9)) as first_bounty_date
+    from Votes v
+    where v.CreationDate between (select start_date from params) and (select end_date from params)
+    group by v.PostId
+),
+-- Close/duplicate history for questions
+question_flags as (
+    select
+        ph.PostId as question_id,
+        max(ph.CreationDate) filter (where ph.PostHistoryTypeId = 10) as last_close_vote_date,
+        max(ph.CreationDate) filter (where ph.PostHistoryTypeId = 11) as last_reopen_date,
+        count(*) filter (where ph.PostHistoryTypeId = 10) as close_vote_events,
+        count(*) filter (where ph.PostHistoryTypeId in (35,36)) as migration_events
+    from PostHistory ph
+    join qa q on q.question_id = ph.PostId
+    group by ph.PostId
+),
+-- Duplicate relationships
+duplicates as (
+    select
+        pl.PostId as duplicate_question_id,
+        pl.RelatedPostId as canonical_question_id,
+        min(pl.CreationDate) as first_link_date
+    from PostLinks pl
+    where pl.LinkTypeId = 3
+    group by pl.PostId, pl.RelatedPostId
+),
+-- Tag popularity snapshot
+tag_popularity as (
+    select
+        lower(t.TagName) as tag,
+        t.Count as global_tag_count
+    from Tags t
+),
+-- Expand question tags
+question_tags as (
+    select
+        q.question_id,
+        unnest(q.tag_arr) as tag
+    from qa q
+),
+-- Question-level tag metrics
+question_tag_metrics as (
+    select
+        qt.question_id,
+        avg(tp.global_tag_count)::numeric(18,2) as avg_tag_popularity,
+        min(tp.global_tag_count) as min_tag_popularity,
+        max(tp.global_tag_count) as max_tag_popularity,
+        count(*) as tag_count
+    from question_tags qt
+    left join tag_popularity tp on tp.tag = lower(qt.tag)
+    group by qt.question_id
+),
+-- User badge summary
+user_badges as (
+    select
+        b.UserId,
+        count(*) as total_badges,
+        count(*) filter (where b.Class = 1) as gold_badges,
+        count(*) filter (where b.Class = 2) as silver_badges,
+        count(*) filter (where b.Class = 3) as bronze_badges,
+        count(*) filter (where b.TagBased = 1) as tag_badges,
+        min(b.Date) as first_badge_date,
+        max(b.Date) as last_badge_date
+    from Badges b
+    group by b.UserId
+),
+-- Compute per-question engagement score using multiple signals
+question_engagement as (
+    select
+        q.question_id,
+        q.asker_id,
+        q.question_date,
+        q.question_score,
+        q.question_views,
+        coalesce(pva.upvotes,0) as q_upvotes,
+        coalesce(pva.downvotes,0) as q_downvotes,
+        coalesce(pva.favorites,0) as q_favorites,
+        coalesce(pva.bounty_total,0) as q_bounty_total,
+        case when q.AcceptedAnswerId is not null then 1 else 0 end as has_accepted_answer,
+        coalesce(pcs.comment_count,0) as comment_count,
+        coalesce(pcs.upvoted_comment_count,0) as upvoted_comment_count,
+        coalesce(qtm.avg_tag_popularity, 0) as avg_tag_popularity,
+        coalesce(qtm.tag_count, 0) as tag_count,
+        coalesce(qf.close_vote_events,0) as close_vote_events,
+        coalesce(qf.migration_events,0) as migration_events,
+        fa.hours_to_answer as hours_to_first_answer,
+        case when d.duplicate_question_id is not null then 1 else 0 end as is_marked_duplicate,
+        -- composite engagement score
+        (
+            coalesce(pva.upvotes,0)*2
+            - coalesce(pva.downvotes,0)
+            + coalesce(pva.favorites,0)*1.5
+            + least(coalesce(q.question_views,0)/100.0, 50)
+            + case when q.AcceptedAnswerId is not null then 10 else 0 end
+            + greatest(0, 20 - coalesce(fa.hours_to_answer, 200)/10.0)
+            + coalesce(pva.bounty_total,0)/50.0
+            + coalesce(pcs.upvoted_comment_count,0)*0.5
+            - coalesce(qf.close_vote_events,0)*5
+            - case when d.duplicate_question_id is not null then 8 else 0 end
+        )::numeric(18,2) as engagement_score
+    from qa q
+    left join post_vote_agg pva on pva.PostId = q.question_id
+    left join post_comment_stats pcs on pcs.PostId = q.question_id
+    left join question_tag_metrics qtm on qtm.question_id = q.question_id
+    left join question_flags qf on qf.question_id = q.question_id
+    left join duplicates d on d.duplicate_question_id = q.question_id
+    left join lateral (
+        select hours_to_answer
+        from first_answer fa
+        where fa.question_id = q.question_id and fa.rn = 1
+        limit 1
+    ) fa on true
+),
+-- Users who asked with sufficient engagement
+qualified_questions as (
+    select
+        qe.*,
+        row_number() over (partition by qe.asker_id order by qe.engagement_score desc, qe.question_date desc) as asker_q_rank
+    from question_engagement qe
+    where qe.engagement_score > 0
+),
+-- Aggregate per user across their top N questions
+per_user_agg as (
+    select
+        qq.asker_id as user_id,
+        count(*) as top_questions,
+        avg(qq.engagement_score)::numeric(18,2) as avg_engagement_score,
+        sum(case when qq.has_accepted_answer=1 then 1 else 0 end) as accepted_count,
+        avg(coalesce(qq.hours_to_first_answer, 240.0))::numeric(18,2) as avg_hours_to_first_answer,
+        sum(qq.q_upvotes) as sum_upvotes,
+        sum(qq.q_downvotes) as sum_downvotes,
+        sum(qq.q_favorites) as sum_favorites,
+        sum(qq.q_bounty_total) as sum_bounty,
+        max(qq.question_views) as max_views,
+        count(*) filter (where qq.is_marked_duplicate = 1) as duplicates_count
+    from qualified_questions qq
+    where qq.asker_q_rank <= 5
+    group by qq.asker_id
+),
+-- Join with active users and badges, filter by thresholds
+candidate_users as (
+    select
+        au.*,
+        coalesce(ba.total_badges,0) as total_badges,
+        coalesce(ba.gold_badges,0) as gold_badges,
+        coalesce(ba.silver_badges,0) as silver_badges,
+        coalesce(ba.bronze_badges,0) as bronze_badges,
+        coalesce(ba.tag_badges,0) as tag_badges,
+        pua.top_questions,
+        pua.avg_engagement_score,
+        pua.accepted_count,
+        pua.avg_hours_to_first_answer,
+        pua.sum_upvotes,
+        pua.sum_downvotes,
+        pua.sum_favorites,
+        pua.sum_bounty,
+        pua.max_views,
+        pua.duplicates_count
+    from active_users au
+    left join user_badges ba on ba.UserId = au.user_id
+    left join per_user_agg pua on pua.user_id = au.user_id
+    where au.Reputation >= (select min_reputation from params)
+),
+-- Compute comment density per user's posts
+user_post_comment_density as (
+    select
+        p.OwnerUserId as user_id,
+        count(distinct p.Id) as posts_count,
+        coalesce(sum(pcs.comment_count),0) as total_comments,
+        (coalesce(sum(pcs.comment_count),0)::numeric / nullif(count(distinct p.Id),0))::numeric(18,2) as comments_per_post
+    from Posts p
+    left join post_comment_stats pcs on pcs.PostId = p.Id
+    where p.CreationDate between (select start_date from params) and (select end_date from params)
+    group by p.OwnerUserId
+),
+-- Windowed rank among candidates
+ranked_candidates as (
+    select
+        cu.*,
+        ucd.comments_per_post,
+        row_number() over (
+            partition by coalesce(nullif(cu.Location,'Unknown'),'Unknown')
+            order by
+                coalesce(cu.avg_engagement_score,0) desc,
+                coalesce(cu.sum_upvotes - cu.sum_downvotes,0) desc,
+                coalesce(cu.gold_badges,0) desc,
+                cu.activity_rank asc,
+                cu.user_id
+        ) as location_rank
+    from candidate_users cu
+    left join user_post_comment_density ucd on ucd.user_id = cu.user_id
+    where coalesce(ucd.comments_per_post, 0) >= (select min_comments_per_post from params)
+)
+select
+    rc.user_id,
+    rc.DisplayName,
+    rc.Location,
+    rc.Reputation,
+    rc.activity_rank,
+    rc.posts_in_range,
+    rc.comments_in_range,
+    rc.total_badges,
+    rc.gold_badges,
+    rc.silver_badges,
+    rc.bronze_badges,
+    rc.tag_badges,
+    rc.top_questions,
+    rc.avg_engagement_score,
+    rc.accepted_count,
+    rc.avg_hours_to_first_answer,
+    rc.sum_upvotes,
+    rc.sum_downvotes,
+    rc.sum_favorites,
+    rc.sum_bounty,
+    rc.max_views,
+    rc.duplicates_count,
+    rc.comments_per_post,
+    -- Derived string fields and null/empty handling
+    coalesce(nullif(rc.DisplayName,''), concat('user#', rc.user_id::varchar)) as safe_display_name,
+    case
+        when rc.avg_engagement_score >= 50 then 'elite'
+        when rc.avg_engagement_score >= 25 then 'strong'
+        when rc.avg_engagement_score >= 10 then 'regular'
+        when rc.avg_engagement_score is null then 'inactive'
+        else 'emerging'
+    end as engagement_tier,
+    -- Quality ratio with careful null logic
+    (
+        (coalesce(rc.sum_upvotes,0)::numeric + rc.accepted_count*2)
+        / nullif(greatest(1, coalesce(rc.sum_upvotes,0) + coalesce(rc.sum_downvotes,0)), 0)
+    )::numeric(9,4) as quality_ratio,
+    -- Sparse composite score for final ordering
+    (
+        coalesce(rc.avg_engagement_score,0)*3
+        + coalesce(rc.gold_badges,0)*5
+        + coalesce(rc.silver_badges,0)*2
+        + coalesce(rc.bronze_badges,0)*1
+        + least(coalesce(rc.Reputation,0)/100.0, 50)
+        + greatest(0, 10 - coalesce(rc.avg_hours_to_first_answer,240.0)/24.0)
+        + coalesce(rc.comments_per_post,0)
+        - coalesce(rc.duplicates_count,0)*2
+    )::numeric(18,2) as final_score
+from ranked_candidates rc
+where rc.top_questions is not null
+  and rc.top_questions >= 1
+  and rc.location_rank <= 50
+  and exists (
+      select 1
+      from qa q
+      where q.asker_id = rc.user_id
+        and q.answer_count >= (select min_answers_per_question from params)
+  )
+order by final_score desc, rc.avg_engagement_score desc, rc.gold_badges desc, rc.activity_rank asc, rc.user_id
+limit 500;

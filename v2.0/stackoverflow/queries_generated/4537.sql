@@ -1,0 +1,142 @@
+-- {"query": "4537.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1228} 
+
+WITH
+  RankedAnswers AS (
+    SELECT
+      p.Id AS AnswerId,
+      p.ParentId AS QuestionId,
+      p.OwnerUserId,
+      p.Score,
+      p.CreationDate,
+      ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS rn
+    FROM Posts AS p
+    WHERE
+      p.PostTypeId = 2 AND p.ParentId IS NOT NULL
+  ),
+  HighScoringQuestions AS (
+    SELECT
+      Id AS QuestionId,
+      OwnerUserId,
+      Title,
+      Tags,
+      AnswerCount,
+      FavoriteCount,
+      ClosedDate,
+      ROW_NUMBER() OVER (ORDER BY Score DESC, CreationDate DESC) AS q_rn
+    FROM Posts
+    WHERE
+      PostTypeId = 1 AND Score > 100 AND AnswerCount > 5
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate AS UserCreationDate,
+      COUNT(p.Id) AS PostsCreated,
+      SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsAsked,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersGiven,
+      COUNT(DISTINCT b.Id) AS BadgesEarned
+    FROM Users AS u
+    LEFT JOIN Posts AS p
+      ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges AS b
+      ON u.Id = b.UserId
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate
+    HAVING
+      u.Reputation > 1000
+  ),
+  QuestionDetails AS (
+    SELECT
+      q.QuestionId,
+      q.Title,
+      q.Tags,
+      q.AnswerCount,
+      q.FavoriteCount,
+      q.ClosedDate,
+      ua.UserId AS QuestionOwnerId,
+      ua.DisplayName AS QuestionOwnerDisplayName,
+      ua.Reputation AS QuestionOwnerReputation,
+      ra.AnswerId AS BestAnswerId,
+      ra.OwnerUserId AS BestAnswerOwnerId,
+      ra.Score AS BestAnswerScore,
+      ra.CreationDate AS BestAnswerCreationDate
+    FROM HighScoringQuestions AS q
+    LEFT JOIN RankedAnswers AS ra
+      ON q.QuestionId = ra.QuestionId AND ra.rn = 1
+    LEFT JOIN UserActivity AS ua
+      ON q.OwnerUserId = ua.UserId
+  )
+SELECT
+  CASE
+    WHEN qd.ClosedDate IS NOT NULL THEN 'Closed'
+    WHEN qd.FavoriteCount > 50 THEN 'Highly Favorited'
+    ELSE 'Active'
+  END AS QuestionStatusCategory,
+  qd.Title AS QuestionTitle,
+  REPLACE(qd.Tags, '><', ' | ') AS FormattedTags,
+  qd.AnswerCount,
+  qd.FavoriteCount,
+  qd.QuestionOwnerDisplayName,
+  qd.QuestionOwnerReputation,
+  COALESCE(qd.BestAnswerScore, 0) AS ScoreOfBestAnswer,
+  CASE
+    WHEN qd.BestAnswerOwnerId IS NOT NULL THEN (
+      SELECT
+        DisplayName
+      FROM Users
+      WHERE
+        Id = qd.BestAnswerOwnerId
+    )
+    ELSE 'Community'
+  END AS BestAnswerOwnerDisplayName,
+  DATEDIFF(
+    'day',
+    qd.BestAnswerCreationDate,
+    qd.ClosedDate
+  ) AS DaysBetweenBestAnswerAndClose,
+  SUM(CAST(SUBSTRING(qd.Tags FROM 2 FOR LENGTH(qd.Tags) - 2) AS VARCHAR(35))) OVER (PARTITION BY qd.QuestionOwnerId) AS TotalTagLengthForOwner,
+  AVG(CAST(qd.AnswerCount AS DECIMAL(10, 2))) OVER (PARTITION BY qd.QuestionOwnerId) AS AvgAnswerCountForOwner
+FROM QuestionDetails AS qd
+WHERE
+  qd.QuestionOwnerReputation > 5000
+UNION ALL
+SELECT
+  'Less Active Question' AS QuestionStatusCategory,
+  p.Title AS QuestionTitle,
+  REPLACE(p.Tags, '><', ' / ') AS FormattedTags,
+  p.AnswerCount,
+  p.FavoriteCount,
+  u.DisplayName AS QuestionOwnerDisplayName,
+  u.Reputation AS QuestionOwnerReputation,
+  COALESCE(
+    (
+      SELECT
+        Score
+      FROM Posts AS ans
+      WHERE
+        ans.ParentId = p.Id AND ans.PostTypeId = 2
+      ORDER BY
+        ans.Score DESC
+      LIMIT 1
+    ),
+    0
+  ) AS ScoreOfBestAnswer,
+  'Unknown' AS BestAnswerOwnerDisplayName,
+  NULL AS DaysBetweenBestAnswerAndClose,
+  NULL AS TotalTagLengthForOwner,
+  NULL AS AvgAnswerCountForOwner
+FROM Posts AS p
+JOIN Users AS u
+  ON p.OwnerUserId = u.Id
+LEFT JOIN PostLinks AS pl
+  ON p.Id = pl.PostId
+WHERE
+  p.PostTypeId = 1 AND p.Score < 10 AND p.AnswerCount < 2 AND pl.LinkTypeId IS NULL
+ORDER BY
+  QuestionOwnerReputation DESC,
+  FavoriteCount DESC;

@@ -1,0 +1,126 @@
+-- {"query": "2098.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1084} 
+with RecursiveBadges as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class,
+        row_number() over (partition by u.Id order by b.Date desc) as BadgeRank
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    where b.TagBased = 0 or b.TagBased is null
+),
+QuestionsWithAnswers as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.OwnerUserId,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        count(a.Id) as TotalAnswers,
+        max(a.Score) as MaxAnswerScore,
+        max(case when a.Id = q.AcceptedAnswerId then a.Score else null end) as AcceptedAnswerScore,
+        bool_or(a.Score > 10) as HasHighScoreAnswer
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.CreationDate, q.OwnerUserId, q.Score, q.ViewCount, q.AcceptedAnswerId
+),
+UserActivity as (
+    select
+        u.Id,
+        u.DisplayName,
+        count(distinct p.Id) as TotalPosts,
+        count(distinct c.Id) as TotalComments,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as TotalUpVotesGiven,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as TotalDownVotesGiven,
+        max(p.Score) as MaxPostScore,
+        count(distinct b.Id) as BadgeCount,
+        max(b.Class) as HighestBadgeClass
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+CloseReasonsCount as (
+    select
+        ph.PostId,
+        crt.Name as CloseReason,
+        count(*) as CloseVotesCount
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    where ph.PostHistoryTypeId = 10 and ph.Comment is not null and ph.Comment ~ '^\d+$'
+    group by ph.PostId, crt.Name
+),
+TaggedQuestions AS (
+    select 
+        p.Id,
+        unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><')) as SingleTag
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+),
+TopTags AS (
+    select
+        SingleTag,
+        count(*) as QuestionCount,
+        row_number() over (order by count(*) desc) as Rank
+    from TaggedQuestions
+    group by SingleTag
+),
+PostScoreWindow AS (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.Score,
+        p.CreationDate,
+        avg(p.Score) over (partition by p.PostTypeId order by p.CreationDate rows between 7 preceding and current row) as MovingAvgScore7Days,
+        rank() over (partition by p.PostTypeId order by p.Score desc) as ScoreRank
+    from Posts p
+)
+select
+    q.QuestionId,
+    q.Title,
+    q.CreationDate,
+    coalesce(ua.DisplayName, 'anonymous') as OwnerDisplayName,
+    q.QuestionScore,
+    q.ViewCount,
+    q.TotalAnswers,
+    q.MaxAnswerScore,
+    q.AcceptedAnswerScore,
+    q.HasHighScoreAnswer,
+    crc.CloseReason,
+    crc.CloseVotesCount,
+    ts.Rank as TagPopularRank,
+    ts.QuestionCount as TagQuestionCount,
+    ua.TotalPosts,
+    ua.TotalComments,
+    ua.TotalUpVotesGiven,
+    ua.TotalDownVotesGiven,
+    ua.MaxPostScore,
+    ua.BadgeCount,
+    ua.HighestBadgeClass,
+    rb.BadgeName as LatestBadge,
+    rb.Class as LatestBadgeClass,
+    psw.MovingAvgScore7Days,
+    psw.ScoreRank
+from QuestionsWithAnswers q
+left join CloseReasonsCount crc on crc.PostId = q.QuestionId
+left join TaggedQuestions tq on tq.Id = q.QuestionId
+left join TopTags ts on ts.SingleTag = tq.SingleTag
+left join UserActivity ua on ua.Id = q.OwnerUserId
+left join RecursiveBadges rb on rb.UserId = ua.Id and rb.BadgeRank = 1
+left join PostScoreWindow psw on psw.Id = q.QuestionId
+where
+    (q.QuestionScore > 5 or q.TotalAnswers > 3)
+    and 
+    (
+        crc.CloseVotesCount is null or crc.CloseVotesCount < 3
+    )
+    and (
+        ts.Rank is null or ts.Rank <= 10
+    )
+order by q.CreationDate desc
+limit 100;

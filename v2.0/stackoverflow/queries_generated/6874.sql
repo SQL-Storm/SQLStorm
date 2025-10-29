@@ -1,0 +1,40 @@
+-- {"query": "6874.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-micro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 476} 
+
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN pt.Name = 'Question' THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN pt.Name = 'Answer' THEN 1 ELSE 0 END) AS TotalAnswers,
+    SUM(CASE WHEN p.Score > 0 THEN 1 ELSE 0 END) AS TotalPositiveScorePosts,
+    MAX(p.LastActivityDate) AS LastActivePost,
+    MAX(CASE WHEN p.ClosedDate IS NOT NULL THEN p.ClosedDate ELSE p.LastActivityDate END) AS LastClosedOrActive,
+    MAX(CASE WHEN pl.LinkTypeId = 3 THEN p.Id ELSE NULL END) AS DuplicatePostId,
+    b.Name AS LatestBadge,
+    ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.LastActivityDate DESC) AS RecentActivityRank,
+    COALESCE(SUM(v.BountyAmount), 0) AS TotalBountyAmount
+FROM 
+    Users u
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    PostTypes pt ON p.PostTypeId = pt.Id
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId AND v.VoteTypeId = 8
+LEFT JOIN 
+    PostLinks pl ON p.Id = pl.PostId
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId = 3
+WHERE 
+    u.Reputation > 100 AND 
+    p.CreationDate >= DATEADD(year, -2, GETDATE())
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation, b.Name
+HAVING 
+    COUNT(DISTINCT p.Id) > 10 AND 
+    MAX(p.LastActivityDate) > DATEADD(month, -6, GETDATE())
+ORDER BY 
+    TotalBountyAmount DESC, 
+    RecentActivityRank ASC;

@@ -1,0 +1,98 @@
+WITH RecentPosts AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30' DAY
+),
+UserStats AS (
+    SELECT
+        u.Id                                   AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COALESCE(SUM(p.Score), 0)                         AS TotalPostScore,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.FavoriteCount ELSE 0 END), 0) AS QuestionFavorites,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Id END)   AS CloseVotesGiven
+    FROM Users u
+    LEFT JOIN Badges b        ON b.UserId = u.Id
+    LEFT JOIN Posts p         ON p.OwnerUserId = u.Id
+    LEFT JOIN PostHistory ph  ON ph.UserId = u.Id AND ph.PostHistoryTypeId = 10
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopUsers AS (
+    SELECT
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.GoldBadges,
+        us.SilverBadges,
+        us.BronzeBadges,
+        us.TotalPostScore,
+        us.QuestionFavorites,
+        us.CloseVotesGiven,
+        ROW_NUMBER() OVER (ORDER BY us.Reputation DESC, us.TotalPostScore DESC) AS ReputationRank,
+        (us.GoldBadges * 100 + us.SilverBadges * 10 + us.BronzeBadges)            AS BadgeScore
+    FROM UserStats us
+    WHERE us.Reputation > 1000
+)
+SELECT
+    tu.UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.ReputationRank,
+    tu.GoldBadges,
+    tu.SilverBadges,
+    tu.BronzeBadges,
+    tu.BadgeScore,
+    tu.TotalPostScore,
+    tu.QuestionFavorites,
+    tu.CloseVotesGiven,
+    (SELECT COUNT(DISTINCT tag)
+     FROM (
+       SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2), '><')) AS tag
+       FROM Posts p
+       WHERE p.OwnerUserId = tu.UserId AND p.Tags IS NOT NULL
+     ) t
+    )                                                                       AS TaggedPostCount,
+    COALESCE(rp.Score,0)                                                   AS LatestScore30Days,
+    CASE
+        WHEN tu.BadgeScore > 500 THEN 'Elite'
+        WHEN tu.BadgeScore > 200 THEN 'Pro'
+        ELSE 'Member'
+    END                                                                    AS Tier,
+    CONCAT('https://stackoverflow.com/users/', tu.UserId)                  AS ProfileURL,
+    COALESCE(rp.rn,0)                                                       AS RecentPostRank
+FROM TopUsers tu
+LEFT JOIN (
+    SELECT rp.OwnerUserId, rp.Score, rp.rn
+    FROM RecentPosts rp
+    WHERE rp.rn = 1
+) rp ON rp.OwnerUserId = tu.UserId
+WHERE (tu.TotalPostScore + COALESCE(rp.Score,0)) > 5000
+
+UNION ALL
+
+SELECT
+    NULL               AS UserId,
+    'Aggregate'        AS DisplayName,
+    NULL               AS Reputation,
+    NULL               AS ReputationRank,
+    SUM(tu.GoldBadges)   AS GoldBadges,
+    SUM(tu.SilverBadges) AS SilverBadges,
+    SUM(tu.BronzeBadges) AS BronzeBadges,
+    NULL               AS BadgeScore,
+    SUM(tu.TotalPostScore)   AS TotalPostScore,
+    SUM(tu.QuestionFavorites) AS QuestionFavorites,
+    SUM(tu.CloseVotesGiven)   AS CloseVotesGiven,
+    NULL               AS LatestScore30Days,
+    NULL               AS Tier,
+    NULL               AS ProfileURL,
+    NULL               AS RecentPostRank
+FROM TopUsers tu
+HAVING COUNT(*) > 0;

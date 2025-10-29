@@ -1,0 +1,161 @@
+WITH
+UserBadgeCounts AS (
+    SELECT
+        u.Id                         AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END)    AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END)    AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END)    AS BronzeBadges,
+        SUM(CASE WHEN b.TagBased = 1 THEN 1 ELSE 0 END) AS TagBasedBadges
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+RecentPosts AS (
+    SELECT
+        p.OwnerUserId                AS UserId,
+        p.Id                         AS PostId,
+        p.PostTypeId,
+        p.Score,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+),
+TopRecentPosts AS (
+    SELECT *
+    FROM RecentPosts
+    WHERE rn <= 3
+),
+
+PostVoteAgg AS (
+    SELECT
+        v.PostId,
+        SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        SUM(CASE WHEN vt.Id = 5 THEN 1 ELSE 0 END) AS Favorites
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY v.PostId
+),
+
+TagScore AS (
+    SELECT
+        t.TagName,
+        AVG(p.Score)               AS AvgScore,
+        COUNT(p.Id)                AS QuestionCount
+    FROM Posts p
+    JOIN LATERAL (
+        SELECT unnest(string_to_array(trim(both '<>' FROM p.Tags), '><')) AS Tag
+    ) tl ON TRUE
+    JOIN Tags t ON t.TagName = tl.Tag
+    WHERE p.PostTypeId = 1
+    GROUP BY t.TagName
+),
+TagRank AS (
+    SELECT
+        TagName,
+        AvgScore,
+        QuestionCount,
+        RANK() OVER (ORDER BY AvgScore DESC) AS ScoreRank
+    FROM TagScore
+),
+
+UserPostCounts AS (
+    SELECT
+        OwnerUserId                AS UserId,
+        SUM(CASE WHEN PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        SUM(CASE WHEN AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS AcceptedAnswerCount
+    FROM Posts
+    GROUP BY OwnerUserId
+)
+
+SELECT
+    ub.UserId,
+    ub.DisplayName,
+    ub.Reputation,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ub.TagBasedBadges,
+    up.QuestionCount,
+    up.AnswerCount,
+    up.AcceptedAnswerCount,
+    COALESCE(pv.TotalUpVotes,0)      AS TotalUpVotes,
+    COALESCE(pv.TotalDownVotes,0)    AS TotalDownVotes,
+    COALESCE(pv.TotalFavorites,0)    AS TotalFavorites,
+    CASE WHEN tr.ScoreRank IS NOT NULL AND tr.ScoreRank <= 5
+         THEN tr.TagName || '(' || CAST(tr.ScoreRank AS VARCHAR) || ')'
+         ELSE NULL END AS TopTagRank,
+    trp.PostId    AS LatestPostId,
+    trp.Title     AS LatestPostTitle,
+    trp.Score     AS LatestPostScore,
+    COALESCE(pva.UpVotes,0)  AS LatestPostUpVotes,
+    COALESCE(pva.DownVotes,0)AS LatestPostDownVotes,
+    trp.CreationDate,
+    trp.rn
+FROM UserBadgeCounts      ub
+LEFT JOIN UserPostCounts up
+       ON up.UserId = ub.UserId
+LEFT JOIN (
+    SELECT
+        p.OwnerUserId                                   AS UserId,
+        SUM(COALESCE(pv.UpVotes,0))      AS TotalUpVotes,
+        SUM(COALESCE(pv.DownVotes,0))    AS TotalDownVotes,
+        SUM(COALESCE(pv.Favorites,0))    AS TotalFavorites
+    FROM Posts p
+    LEFT JOIN PostVoteAgg pv ON pv.PostId = p.Id
+    GROUP BY p.OwnerUserId
+) pv
+       ON pv.UserId = ub.UserId
+LEFT JOIN TopRecentPosts trp
+       ON trp.UserId = ub.UserId
+LEFT JOIN PostVoteAgg pva
+       ON pva.PostId = trp.PostId
+LEFT JOIN LATERAL (
+    SELECT unnest(string_to_array(trim(both '<>' FROM trp.Tags), '><')) AS Tag
+) tp ON TRUE
+LEFT JOIN TagRank tr
+       ON tr.TagName = tp.Tag
+GROUP BY
+    ub.UserId, ub.DisplayName, ub.Reputation,
+    ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges, ub.TagBasedBadges,
+    up.QuestionCount, up.AnswerCount, up.AcceptedAnswerCount,
+    pv.TotalUpVotes, pv.TotalDownVotes, pv.TotalFavorites,
+    tr.TagName, tr.ScoreRank,
+    trp.PostId, trp.Title, trp.Score, trp.CreationDate, trp.rn,
+    pva.UpVotes, pva.DownVotes
+HAVING COUNT(*) > 0
+ORDER BY ub.Reputation DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    NULL AS UserId,
+    NULL AS DisplayName,
+    NULL AS Reputation,
+    NULL AS GoldBadges,
+    NULL AS SilverBadges,
+    NULL AS BronzeBadges,
+    NULL AS TagBasedBadges,
+    NULL AS QuestionCount,
+    NULL AS AnswerCount,
+    NULL AS AcceptedAnswerCount,
+    NULL AS TotalUpVotes,
+    NULL AS TotalDownVotes,
+    NULL AS TotalFavorites,
+    NULL AS TopTagRank,
+    NULL AS LatestPostId,
+    NULL AS LatestPostTitle,
+    NULL AS LatestPostScore,
+    NULL AS LatestPostUpVotes,
+    NULL AS LatestPostDownVotes,
+    NULL AS CreationDate,
+    NULL AS rn
+WHERE NOT EXISTS (SELECT 1 FROM Users WHERE Reputation IS NOT NULL);

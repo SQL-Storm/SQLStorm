@@ -1,0 +1,101 @@
+-- {"query": "4102.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1330} 
+
+WITH UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN pt.Name = 'Question' THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN pt.Name = 'Answer' THEN 1 ELSE 0 END) AS AnswerCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        AVG(p.Score) AS AveragePostScore,
+        MAX(p.CreationDate) AS LastPostCreationDate,
+        CASE
+            WHEN u.DownVotes > u.UpVotes * 1.5 THEN 'High Negative Ratio'
+            WHEN u.UpVotes > u.DownVotes * 2 THEN 'High Positive Ratio'
+            ELSE 'Balanced Ratio'
+        END AS VoteRatioStatus,
+        ROW_NUMBER() OVER(ORDER BY u.Reputation DESC, u.CreationDate ASC) AS UserRankByReputation
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.DisplayName IS NOT NULL AND u.AboutMe IS NOT NULL AND LENGTH(u.AboutMe) > 100
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.UpVotes, u.DownVotes
+),
+PostLinkAnalysis AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name AS LinkType,
+        DATEDIFF(day, p.CreationDate, pl.CreationDate) AS DaysSincePostCreation,
+        CASE
+            WHEN p.Score > 10 AND pl.CreationDate > p.CreationDate + INTERVAL '30 days' THEN 'Delayed High-Value Link'
+            WHEN p.Score < 0 AND pl.CreationDate < p.CreationDate + INTERVAL '7 days' THEN 'Early Low-Value Link'
+            ELSE 'Standard Link'
+        END AS LinkValueIndicator,
+        ROW_NUMBER() OVER(PARTITION BY pl.PostId ORDER BY pl.CreationDate DESC) AS LinkSequence
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    JOIN Posts p ON pl.PostId = p.Id
+    WHERE lt.Name = 'Duplicate' OR lt.Name = 'Linked'
+),
+PostHistorySummaries AS (
+    SELECT
+        ph.PostId,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 5 THEN ph.Id ELSE NULL END) AS BodyEdits,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 4 THEN ph.Id ELSE NULL END) AS TitleEdits,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 4 THEN ph.CreationDate ELSE NULL END) AS LastTitleEditDate,
+        MIN(CASE WHEN ph.PostHistoryTypeId = 2 THEN ph.CreationDate ELSE NULL END) AS InitialBodyCreationDate,
+        AVG(ph.Comment) FILTER (WHERE ph.PostHistoryTypeId = 10) AS AvgCloseReasonScore,
+        STRING_AGG(DISTINCT ph.Comment, '; ') WITHIN GROUP (ORDER BY ph.CreationDate) AS AllCommentsOnHistory
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (2, 4, 5, 10)
+    GROUP BY ph.PostId
+    HAVING COUNT(DISTINCT ph.Id) > 2
+)
+SELECT
+    ue.DisplayName AS UserDisplayName,
+    ue.Reputation,
+    ue.TotalPosts,
+    ue.QuestionCount,
+    ue.AnswerCount,
+    ue.CommentCount,
+    ue.BadgeCount,
+    ue.AveragePostScore,
+    ue.LastPostCreationDate,
+    ue.VoteRatioStatus,
+    ue.UserRankByReputation,
+    pla.LinkType AS MostRecentLinkType,
+    pla.DaysSincePostCreation AS DaysToFirstLink,
+    pla.LinkValueIndicator AS FirstLinkIndicator,
+    phs.BodyEdits,
+    phs.TitleEdits,
+    phs.LastTitleEditDate,
+    phs.InitialBodyCreationDate,
+    phs.AllCommentsOnHistory,
+    COALESCE(p.AnswerCount, 0) AS ActualAnswerCount,
+    COALESCE(p.CommentCount, 0) AS ActualCommentCount,
+    CASE
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        ELSE 'Active'
+    END AS PostStatus,
+    p.Score AS PostScore,
+    p.ViewCount,
+    p.FavoriteCount,
+    TRIM(SUBSTRING(p.Tags, 2, POSITION('>' IN p.Tags) - 2)) AS FirstTag,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpvoteCount,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id AND c.Score < 0) AS NegativeScoreComments
+FROM UserEngagement ue
+JOIN Posts p ON ue.UserId = p.OwnerUserId
+LEFT JOIN PostLinkAnalysis pla ON p.Id = pla.PostId AND pla.LinkSequence = 1
+LEFT JOIN PostHistorySummaries phs ON p.Id = phs.PostId
+WHERE p.CreationDate > '2022-01-01'
+  AND p.PostTypeId = 1 -- Only consider questions
+ORDER BY ue.Reputation DESC, p.CreationDate DESC
+LIMIT 1000;

@@ -1,0 +1,334 @@
+with
+recent_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    date_trunc('month', u.creationdate) as created_month,
+    coalesce(nullif(trim(split_part(coalesce(u.location, ''), ',', 1)), ''), 'Unknown') as country_guess,
+    count(case when b.class = 1 then 1 end) as gold_count,
+    count(case when b.class = 2 then 1 end) as silver_count,
+    count(case when b.class = 3 then 1 end) as bronze_count,
+    max(b.date) as last_badge_at,
+    sum(u.upvotes - u.downvotes) over () as global_karma_sum
+  from users u
+  left join badges b on b.userid = u.id
+  where u.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+  group by u.id, u.displayname, u.reputation, created_month, country_guess
+),
+user_questions as (
+  select
+    p.id as question_id,
+    p.owneruserid as user_id,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.answercount,
+    p.favoritecount,
+    p.commentcount,
+    p.tags,
+    coalesce(array_length(string_to_array(substring(p.tags, 2, greatest(length(p.tags)-2,0)), '><'), 1), 0) as tag_count
+  from posts p
+  where p.posttypeid = 1
+    and p.owneruserid is not null
+),
+answers as (
+  select
+    a.id as answer_id,
+    a.parentid as question_id,
+    a.owneruserid as answer_owner_id,
+    a.score as answer_score,
+    a.creationdate as answer_created
+  from posts a
+  where a.posttypeid = 2
+),
+question_votes as (
+  select
+    v.postid as question_id,
+    v.votetypeid,
+    count(*) as vote_count,
+    min(v.creationdate) as first_vote_at,
+    max(v.creationdate) as last_vote_at
+  from votes v
+  join posts p on p.id = v.postid and p.posttypeid = 1
+  group by v.postid, v.votetypeid
+),
+question_comments as (
+  select
+    c.postid as question_id,
+    count(*) as comment_cnt,
+    avg(coalesce(c.score, 0)) as avg_comment_score,
+    max(c.creationdate) as last_comment_at
+  from comments c
+  join posts p on p.id = c.postid and p.posttypeid = 1
+  group by c.postid
+),
+question_history_flags as (
+  select
+    ph.postid as question_id,
+    bool_or(ph.posthistorytypeid = 10) as ever_closed,
+    bool_or(ph.posthistorytypeid = 11) as ever_reopened,
+    bool_or(ph.posthistorytypeid = 19) as ever_protected,
+    max(case when ph.posthistorytypeid = 10 then ph.creationdate end) as closed_at,
+    max(case when ph.posthistorytypeid = 11 then ph.creationdate end) as reopened_at
+  from posthistory ph
+  where ph.posthistorytypeid in (10,11,19)
+  group by ph.postid
+),
+duplicate_links as (
+  select
+    pl.postid as dup_question_id,
+    count(case when pl.linktypeid = 3 then 1 end) as dup_count,
+    count(case when pl.linktypeid = 1 then 1 end) as linked_count,
+    min(pl.creationdate) as first_link_at
+  from postlinks pl
+  group by pl.postid
+),
+tag_stats as (
+  select
+    t.tagname,
+    t.count as tag_total_count,
+    ntile(10) over (order by t.count desc nulls last) as popularity_decile
+  from tags t
+),
+question_tags as (
+  select
+    q.question_id,
+    lower(trim(tg)) as tagname
+  from user_questions q
+  cross join lateral unnest(
+    case
+      when q.tags is null then array[]::varchar[]  -- kept as empty array literal compatible with many PG-like engines
+      else string_to_array(substring(q.tags, 2, greatest(length(q.tags)-2,0)), '><')
+    end
+  ) as tg
+),
+question_tag_features as (
+  select
+    qt.question_id,
+    count(*) as distinct_tag_count,
+    sum(ts.tag_total_count) as sum_tag_popularity,
+    avg(cast(ts.tag_total_count as numeric)) as avg_tag_popularity,
+    max(ts.popularity_decile) as max_popularity_decile,
+    string_agg(qt.tagname, '|' order by ts.tag_total_count desc nulls last) as tags_concat
+  from question_tags qt
+  left join tag_stats ts on ts.tagname = qt.tagname
+  group by qt.question_id
+),
+user_question_agg as (
+  select
+    q.user_id,
+    count(*) as q_count,
+    avg(cast(q.score as numeric)) as avg_q_score,
+    percentile_cont(0.5) within group (order by q.score) as median_q_score,
+    max(q.viewcount) as max_q_views,
+    sum(case when q.score > 0 then 1 else 0 end) as positive_qs,
+    sum(q.commentcount) as total_q_comments
+  from user_questions q
+  group by q.user_id
+),
+answer_agg as (
+  select
+    q.owneruserid as question_owner_id,
+    count(*) as answers_total,
+    avg(cast(a.score as numeric)) as avg_answer_score,
+    count(case when a.score >= 1 then 1 end) as upvoted_answers,
+    min(a.creationdate) as earliest_answer_at
+  from posts q
+  join posts a on a.parentid = q.id and a.posttypeid = 2
+  where q.posttypeid = 1
+  group by q.owneruserid
+),
+question_featured as (
+  select
+    q.question_id,
+    q.user_id,
+    q.creationdate,
+    q.score,
+    q.viewcount,
+    q.answercount,
+    q.favoritecount,
+    q.commentcount,
+    coalesce(qtf.distinct_tag_count, 0) as distinct_tag_count,
+    coalesce(qtf.sum_tag_popularity, 0) as sum_tag_popularity,
+    coalesce(qtf.avg_tag_popularity, 0) as avg_tag_popularity,
+    coalesce(qtf.max_popularity_decile, 0) as max_popularity_decile,
+    coalesce(qtf.tags_concat, '') as tags_concat,
+    coalesce(max(case when qv.votetypeid = 2 then qv.vote_count end), 0) as upvotes,
+    coalesce(max(case when qv.votetypeid = 3 then qv.vote_count end), 0) as downvotes,
+    qc.comment_cnt,
+    qc.avg_comment_score,
+    qh.ever_closed,
+    qh.ever_reopened,
+    qh.ever_protected,
+    qh.closed_at,
+    qh.reopened_at,
+    dl.dup_count,
+    dl.linked_count,
+    dl.first_link_at
+  from user_questions q
+  left join question_tag_features qtf on qtf.question_id = q.question_id
+  left join question_votes qv on qv.question_id = q.question_id
+  left join question_comments qc on qc.question_id = q.question_id
+  left join question_history_flags qh on qh.question_id = q.question_id
+  left join duplicate_links dl on dl.dup_question_id = q.question_id
+  group by
+    q.question_id, q.user_id, q.creationdate, q.score, q.viewcount, q.answercount, q.favoritecount, q.commentcount,
+    qtf.distinct_tag_count, qtf.sum_tag_popularity, qtf.avg_tag_popularity, qtf.max_popularity_decile, qtf.tags_concat,
+    qc.comment_cnt, qc.avg_comment_score,
+    qh.ever_closed, qh.ever_reopened, qh.ever_protected, qh.closed_at, qh.reopened_at,
+    dl.dup_count, dl.linked_count, dl.first_link_at
+),
+scored_questions as (
+  select
+    qf.*,
+    (
+      coalesce(qf.upvotes,0) * 3
+      - coalesce(qf.downvotes,0) * 5
+      + coalesce(qf.score,0) * 2
+      + least(coalesce(qf.viewcount,0) / 100.0, 100.0)
+      + coalesce(qf.answercount,0) * 1.5
+      + coalesce(qf.favoritecount,0) * 2
+      + case when coalesce(qf.ever_closed,false) then -20 else 0 end
+      + case when coalesce(qf.dup_count,0) > 0 then -10 else 0 end
+      + case when coalesce(qf.max_popularity_decile,0) <= 3 then 10 else 0 end
+      + case when coalesce(qf.distinct_tag_count,0) between 3 and 5 then 5 else 0 end
+      + coalesce(qf.commentcount,0) * 0.25
+    ) as quality_score
+  from question_featured qf
+),
+question_with_user as (
+  select
+    sq.*,
+    ru.displayname,
+    ru.reputation,
+    ru.country_guess,
+    ru.gold_count, ru.silver_count, ru.bronze_count,
+    ru.last_badge_at,
+    uqa.q_count,
+    uqa.avg_q_score,
+    uqa.median_q_score,
+    uqa.max_q_views,
+    uqa.positive_qs,
+    uqa.total_q_comments,
+    aa.answers_total,
+    aa.avg_answer_score,
+    aa.upvoted_answers,
+    aa.earliest_answer_at,
+    row_number() over (partition by sq.user_id order by sq.quality_score desc nulls last, sq.viewcount desc nulls last) as rn_per_user,
+    rank() over (order by sq.quality_score desc nulls last) as rank_global
+  from scored_questions sq
+  join recent_users ru on ru.user_id = sq.user_id
+  left join user_question_agg uqa on uqa.user_id = sq.user_id
+  left join answer_agg aa on aa.question_owner_id = sq.user_id
+),
+peer_similarity as (
+  select
+    q1.question_id,
+    q2.question_id as peer_id,
+    (
+      select
+        cast(count(*) as numeric)
+        /
+        nullif(
+          (
+            count(*) + (select count(*) from unnest(string_to_array(replace(q2.tags_concat,'|',','), ',')) as t2) -
+            count(*)
+          ), 0
+        )
+      from unnest(string_to_array(replace(q1.tags_concat,'|',','), ',')) as t
+      where lower(trim(t)) in (
+        select lower(trim(x)) from unnest(string_to_array(replace(q2.tags_concat,'|',','), ',')) as x
+      )
+    ) as jaccard_sim
+  from question_with_user q1
+  join question_with_user q2
+    on q1.question_id <> q2.question_id
+    and q1.user_id <> q2.user_id
+    and abs(extract(epoch from (q1.creationdate - q2.creationdate))) <= 60*60*24*365
+  where q1.tags_concat <> '' and q2.tags_concat <> ''
+),
+peer_best as (
+  select
+    question_id,
+    max(jaccard_sim) as best_peer_sim
+  from peer_similarity
+  group by question_id
+),
+temporal_rank as (
+  select
+    qwu.*,
+    date_trunc('month', qwu.creationdate) as month_bucket,
+    ntile(100) over (partition by date_trunc('month', qwu.creationdate) order by qwu.quality_score desc nulls last) as month_percentile
+  from question_with_user qwu
+)
+select
+  t.question_id,
+  t.user_id,
+  t.displayname,
+  t.reputation,
+  t.country_guess,
+  t.creationdate,
+  t.score,
+  t.viewcount,
+  t.answercount,
+  t.favoritecount,
+  t.commentcount,
+  t.distinct_tag_count,
+  t.sum_tag_popularity,
+  t.avg_tag_popularity,
+  t.max_popularity_decile,
+  t.tags_concat,
+  t.upvotes,
+  t.downvotes,
+  t.comment_cnt,
+  t.avg_comment_score,
+  t.ever_closed,
+  t.ever_reopened,
+  t.ever_protected,
+  t.closed_at,
+  t.reopened_at,
+  t.dup_count,
+  t.linked_count,
+  t.first_link_at,
+  t.quality_score,
+  t.rn_per_user,
+  t.rank_global,
+  t.month_bucket,
+  t.month_percentile,
+  pb.best_peer_sim,
+  (
+    select count(*)
+    from posts a
+    join posts q on q.id = a.parentid and q.posttypeid = 1
+    where a.posttypeid = 2
+      and a.owneruserid = t.user_id
+      and (q.owneruserid is distinct from t.user_id)
+  ) as answers_on_others_questions,
+  coalesce(nullif(split_part(t.displayname || '|' || coalesce(t.country_guess,'NA'), '|', 2), ''), 'NA') as country_token,
+  case
+    when t.ever_closed is true and t.ever_reopened is true and coalesce(t.dup_count,0) > 0 then 'closed-reopened-dup'
+    when t.ever_closed is true and coalesce(t.dup_count,0) > 0 then 'closed-dup'
+    when t.ever_closed is true then 'closed'
+    when t.ever_protected is true then 'protected'
+    else 'open'
+  end as moderation_status
+from temporal_rank t
+left join peer_best pb on pb.question_id = t.question_id
+where
+  (
+    (t.quality_score >= (
+        select avg(quality_score) + stddev_pop(quality_score)
+        from scored_questions
+      )
+    )
+    or (t.month_percentile <= 10 and t.viewcount >= 1000)
+    or (t.upvotes - t.downvotes >= 10 and coalesce(t.dup_count,0) = 0)
+  )
+  and (t.country_guess is not null or t.reputation > 1000)
+  and (t.tags_concat is not null and length(t.tags_concat) > 0)
+order by
+  t.rank_global nulls last,
+  t.rn_per_user,
+  t.question_id
+limit 500;

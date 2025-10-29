@@ -1,0 +1,128 @@
+WITH recent_questions AS (
+  SELECT p.Id,
+         p.Title,
+         p.Tags,
+         p.CreationDate,
+         p.OwnerUserId,
+         p.ViewCount,
+         p.Score,
+         p.CommentCount,
+         p.AnswerCount,
+         p.LastActivityDate
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '180 days'
+),
+top_tags AS (
+  SELECT u.Id AS UserId,
+         u.DisplayName,
+         u.Reputation,
+         b.Name AS BadgeName,
+         b.Date AS BadgeDate,
+         t.TagName
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  LEFT JOIN LATERAL (
+      SELECT unnest(string_to_array(trim(both '<>' FROM p.Tags), '<>')) AS TagName
+      FROM Posts p
+      WHERE p.OwnerUserId = u.Id
+        AND p.PostTypeId = 1
+        AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '365 days'
+      LIMIT 1
+  ) t ON true
+  WHERE b.Class = 1
+),
+activity_rank AS (
+  SELECT rp.Id,
+         rp.Title,
+         rp.Tags,
+         ROW_NUMBER() OVER (
+           PARTITION BY rp.OwnerUserId
+           ORDER BY rp.ViewCount DESC, rp.Score DESC, rp.LastActivityDate DESC
+         ) AS rn
+  FROM recent_questions rp
+),
+correlated_subqry AS (
+  SELECT q.Id,
+         q.Title,
+         q.Tags,
+         q.CreationDate,
+         (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = q.Id) AS AnswerCountFromChildren,
+         (SELECT AVG(v.BountyAmount) FROM Votes v WHERE v.PostId = q.Id AND v.BountyAmount IS NOT NULL) AS AvgBounty
+  FROM recent_questions q
+),
+complex_pred AS (
+  SELECT *
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND (p.Score > 0 OR p.ViewCount > 100)
+    AND EXISTS (
+      SELECT 1
+      FROM Votes v
+      WHERE v.PostId = p.Id
+        AND v.VoteTypeId IN (2, 3)
+        AND v.CreationDate >= p.CreationDate
+    )
+    AND (p.Tags LIKE '%<sql>%'
+         OR p.Tags LIKE '%<postgres>%'
+         OR p.Tags LIKE '%<tsql>%')
+),
+most_common_tag AS (
+  SELECT TagName AS TopTag, COUNT(*) AS Cnt
+  FROM (
+    SELECT unnest(string_to_array(trim(both '<>' FROM p.Tags), '<>')) AS TagName
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '365 days'
+  ) s
+  GROUP BY TagName
+)
+SELECT
+  r.Id AS QuestionId,
+  r.Title,
+  r.Tags,
+  r.CreationDate,
+  r.OwnerUserId,
+  u.DisplayName AS OwnerDisplayName,
+  u.Reputation,
+  r.ViewCount,
+  r.Score,
+  r.CommentCount,
+  r.AnswerCount,
+  a_rank.rn AS ActivityRank,
+  t.TopTag,
+  ar.AvgBounty,
+  cr.Name AS CloseReason,
+  hb.BadgeName AS GoldBadge,
+  hb.BadgeDate AS BadgeDate,
+  ar2.RecentOpen
+FROM recent_questions r
+LEFT JOIN Users u ON u.Id = r.OwnerUserId
+LEFT JOIN (
+  SELECT Id, ROW_NUMBER() OVER (PARTITION BY Id ORDER BY LastActivityDate DESC) AS rn
+  FROM Posts
+) a_rank ON a_rank.Id = r.Id
+LEFT JOIN (
+  SELECT TopTag
+  FROM most_common_tag
+  ORDER BY Cnt DESC
+  LIMIT 1
+) t ON true
+LEFT JOIN correlated_subqry ar ON ar.Id = r.Id
+-- Removed reference to non-existent TopTags table; use top_tags CTE if per-user tags needed
+LEFT JOIN top_tags tt ON tt.UserId = r.OwnerUserId
+LEFT JOIN (
+  SELECT Name
+  FROM CloseReasonTypes
+) cr ON 1=1
+LEFT JOIN (
+  SELECT Name AS BadgeName, Date AS BadgeDate
+  FROM Badges
+  WHERE Class = 1
+) hb ON 1=1
+LEFT JOIN (
+  SELECT 1 AS RecentOpen
+) ar2 ON 1=1
+WHERE r.Id IS NOT NULL
+ORDER BY r.CreationDate DESC
+LIMIT 100;

@@ -1,0 +1,143 @@
+WITH top_users AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS rn
+    FROM Users u
+    WHERE u.Reputation > 1000
+),
+recent_questions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        COALESCE(NULLIF(p.Tags, ''), '<none>')                                       AS raw_tags,
+        string_to_array(substring(p.Tags FROM 2 FOR (length(p.Tags)-2)), '><')       AS tag_array,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '30 days'
+),
+tag_stats AS (
+    SELECT
+        t.TagName,
+        COUNT(CASE WHEN p.Score >= 0 THEN 1 END)               AS pos_score_cnt,
+        COUNT(CASE WHEN p.Score < 0 THEN 1 END)                AS neg_score_cnt,
+        CAST(AVG(p.Score) AS numeric(10,2))                    AS avg_score,
+        SUM(p.ViewCount)                                       AS total_views
+    FROM Tags t
+    JOIN Posts p ON p.Tags ILIKE '%' || t.TagName || '%'
+    WHERE p.PostTypeId = 1
+    GROUP BY t.TagName
+),
+user_activity AS (
+    SELECT
+        u.Id,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 5 THEN 1 END)   AS edits_made,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.PostId END) AS upvotes_given,
+        COUNT(DISTINCT b.Id)                                  AS badges_earned,
+        MAX(p.CreationDate)                                   AS last_post_date
+    FROM Users u
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+    LEFT JOIN Votes v        ON v.UserId = u.Id
+    LEFT JOIN Badges b       ON b.UserId = u.Id
+    LEFT JOIN Posts p        ON p.OwnerUserId = u.Id
+    GROUP BY u.Id
+),
+recent_links AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name    AS link_type,
+        pl.CreationDate
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    WHERE pl.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '30 days'
+)
+
+SELECT
+    tu.rn                                    AS user_rank,
+    tu.Id                                    AS user_id,
+    tu.DisplayName,
+    tu.Reputation,
+    ua.edits_made,
+    ua.upvotes_given,
+    ua.badges_earned,
+    COALESCE(ua.last_post_date, CAST('1970-01-01' AS timestamp)) AS last_post_date,
+    COALESCE(rq.Id, 0)                       AS recent_question_id,
+    rq.Title,
+    rq.CreationDate                           AS question_date,
+    rq.Score                                  AS question_score,
+    rq.ViewCount                              AS question_views,
+    CASE
+        WHEN rq.raw_tags = '<none>' THEN NULL
+        ELSE (
+            SELECT string_agg(t.TagName, ', ')
+            FROM unnest(rq.tag_array) AS tg(tag)
+            JOIN Tags t ON t.TagName = tg.tag
+        )
+    END                                       AS tag_list,
+    ts.pos_score_cnt,
+    ts.neg_score_cnt,
+    ts.avg_score,
+    ts.total_views,
+    COALESCE(l.link_type, 'none')             AS recent_link_type,
+    l.CreationDate                            AS link_created_at
+FROM top_users tu
+LEFT JOIN user_activity ua   ON ua.Id = tu.Id
+LEFT JOIN recent_questions rq ON rq.OwnerUserId = tu.Id
+LEFT JOIN tag_stats ts       ON ts.TagName = ANY(rq.tag_array)
+LEFT JOIN recent_links l     ON l.PostId = rq.Id
+WHERE tu.rn <= 100
+GROUP BY
+    tu.rn,
+    tu.Id,
+    tu.DisplayName,
+    tu.Reputation,
+    ua.edits_made,
+    ua.upvotes_given,
+    ua.badges_earned,
+    ua.last_post_date,
+    rq.Id,
+    rq.Title,
+    rq.raw_tags,
+    rq.tag_array,
+    rq.CreationDate,
+    rq.Score,
+    rq.ViewCount,
+    ts.pos_score_cnt,
+    ts.neg_score_cnt,
+    ts.avg_score,
+    ts.total_views,
+    l.link_type,
+    l.CreationDate
+ORDER BY tu.rn, rq.CreationDate DESC
+LIMIT 500
+
+UNION ALL
+
+SELECT
+    NULL::int          AS user_rank,
+    NULL::int          AS user_id,
+    NULL::varchar      AS DisplayName,
+    NULL::int          AS Reputation,
+    NULL::int          AS edits_made,
+    NULL::int          AS upvotes_given,
+    NULL::int          AS badges_earned,
+    NULL::timestamp    AS last_post_date,
+    NULL::int          AS recent_question_id,
+    NULL::varchar      AS Title,
+    NULL::timestamp    AS question_date,
+    NULL::int          AS question_score,
+    NULL::int          AS question_views,
+    NULL::varchar      AS tag_list,
+    NULL::int          AS pos_score_cnt,
+    NULL::int          AS neg_score_cnt,
+    NULL::numeric      AS avg_score,
+    NULL::bigint       AS total_views,
+    NULL::varchar      AS recent_link_type,
+    NULL::timestamp    AS link_created_at
+FROM generate_series(1,5) gs(id);

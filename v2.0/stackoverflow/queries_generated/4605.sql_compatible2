@@ -1,0 +1,92 @@
+WITH RankedQuestions AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate AS QuestionCreationDate,
+        ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.ViewCount DESC) AS QuestionRank
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Score > 100 AND p.AnswerCount >= 5
+),
+UserQuestionActivity AS (
+    SELECT
+        q.QuestionId,
+        q.Title AS QuestionTitle,
+        q.QuestionCreationDate,
+        q.QuestionRank,
+        u.Id AS UserId,
+        u.DisplayName AS UserDisplayName,
+        u.Reputation AS UserReputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(c.Id) AS CommentCountOnQuestion,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCountOnQuestion,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCountOnQuestion,
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20) THEN ph.CreationDate ELSE NULL END) AS LastModerationDate,
+        (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = q.QuestionId AND a.OwnerUserId = u.Id) AS AnswersByThisUser
+    FROM RankedQuestions q
+    JOIN Users u ON q.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON q.QuestionId = c.PostId AND c.UserId = u.Id
+    LEFT JOIN Votes v ON q.QuestionId = v.PostId AND v.UserId = u.Id
+    LEFT JOIN PostHistory ph ON q.QuestionId = ph.PostId AND ph.UserId = u.Id AND ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20)
+    GROUP BY
+        q.QuestionId,
+        q.Title,
+        q.QuestionCreationDate,
+        q.QuestionRank,
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate
+),
+QuestionDetailsWithLag AS (
+    SELECT
+        qua.QuestionId,
+        qua.QuestionTitle,
+        qua.QuestionCreationDate,
+        qua.QuestionRank,
+        qua.UserId,
+        qua.UserDisplayName,
+        qua.UserReputation,
+        qua.UserCreationDate,
+        qua.CommentCountOnQuestion,
+        qua.UpVoteCountOnQuestion,
+        qua.DownVoteCountOnQuestion,
+        qua.LastModerationDate,
+        qua.AnswersByThisUser,
+        LAG(qua.UserReputation, 1, 0) OVER (PARTITION BY qua.QuestionId ORDER BY qua.UserReputation DESC) AS PreviousUserReputation,
+        ROW_NUMBER() OVER (PARTITION BY qua.QuestionId ORDER BY qua.UserReputation DESC) AS UserRankForQuestion
+    FROM UserQuestionActivity qua
+)
+SELECT
+    cdl.QuestionId,
+    cdl.QuestionTitle,
+    cdl.QuestionCreationDate,
+    cdl.QuestionRank,
+    cdl.UserId,
+    cdl.UserDisplayName,
+    cdl.UserReputation,
+    cdl.UserCreationDate,
+    cdl.CommentCountOnQuestion,
+    cdl.UpVoteCountOnQuestion,
+    cdl.DownVoteCountOnQuestion,
+    cdl.AnswersByThisUser,
+    cdl.PreviousUserReputation,
+    CASE
+        WHEN cdl.UserRankForQuestion = 1 THEN 'Primary Owner'
+        WHEN cdl.UserRankForQuestion <= 3 AND cdl.AnswersByThisUser >= 2 AND cdl.UserReputation > cdl.PreviousUserReputation * 1.5 THEN 'Key Contributor'
+        WHEN cdl.UserRankForQuestion > 3 AND cdl.AnswersByThisUser > 0 AND cdl.UserReputation < 1000 THEN 'Minor Contributor'
+        WHEN cdl.LastModerationDate IS NOT NULL AND cdl.UserReputation > 50000 THEN 'Moderated Power User'
+        ELSE 'Other Participant'
+    END AS UserRole,
+    CAST(EXTRACT(EPOCH FROM (cdl.QuestionCreationDate - cdl.UserCreationDate)) / 86400 AS INTEGER) AS DaysToFirstQuestion,
+    UPPER(SUBSTR(cdl.UserDisplayName, 1, 3)) AS DisplayNamePrefix,
+    CASE
+        WHEN cdl.UserReputation BETWEEN 1 AND 1000 THEN 'Novice'
+        WHEN cdl.UserReputation BETWEEN 1001 AND 10000 THEN 'Intermediate'
+        WHEN cdl.UserReputation > 10000 THEN 'Expert'
+        ELSE 'Unknown'
+    END AS ReputationLevel,
+    COALESCE(cdl.LastModerationDate, DATE '1970-01-01') AS EffectiveLastModerationDate
+FROM QuestionDetailsWithLag cdl
+WHERE cdl.UserRankForQuestion <= 5
+ORDER BY cdl.QuestionRank, cdl.UserRankForQuestion;

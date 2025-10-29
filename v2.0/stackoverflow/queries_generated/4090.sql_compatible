@@ -1,0 +1,113 @@
+WITH PostEngagement AS (
+    SELECT
+        p.Id AS PostId,
+        pt.Name AS PostType,
+        COALESCE(p.Score, 0) AS Score,
+        COALESCE(p.ViewCount, 0) AS ViewCount,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        COALESCE(p.CommentCount, 0) AS CommentCount,
+        COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+        COALESCE(v.VoteCount, 0) AS VoteCount,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+        ROW_NUMBER() OVER (ORDER BY COALESCE(p.Score, 0) DESC) AS ScoreRank,
+        DENSE_RANK() OVER (PARTITION BY pt.Name ORDER BY COALESCE(p.ViewCount, 0) DESC) AS ViewRankByType,
+        LAG(COALESCE(p.CreationDate, TIMESTAMP '1970-01-01'), 1, TIMESTAMP '1970-01-01') OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostDate,
+        p.OwnerUserId,
+        p.Tags
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN (
+        SELECT PostId, COUNT(Id) AS VoteCount
+        FROM Votes
+        WHERE VoteTypeId IN (2, 3)
+        GROUP BY PostId
+    ) v ON p.Id = v.PostId
+    WHERE p.OwnerUserId IS NOT NULL AND p.OwnerUserId <> -1
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT ph.Id) AS PostHistoryEvents,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 1 THEN 1 ELSE 0 END) AS InitialEdits,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS SubsequentEdits,
+        AVG(EXTRACT(EPOCH FROM (MIN(p.CreationDate) - u.CreationDate)) / 60.0) AS AvgTimeToFirstPost
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+TagPopularity AS (
+    SELECT
+        t.TagName,
+        t.Count AS TagPostCount,
+        COUNT(DISTINCT pl.PostId) AS DuplicateLinkCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    LEFT JOIN PostLinks pl ON t.Id = pl.LinkTypeId AND pl.LinkTypeId = 3
+    GROUP BY t.TagName, t.Count
+)
+SELECT
+    pe.PostId,
+    pe.PostType,
+    pe.Score,
+    pe.ViewCount,
+    pe.AnswerCount,
+    pe.CommentCount,
+    pe.FavoriteCount,
+    pe.VoteCount,
+    pe.IsClosed,
+    pe.ScoreRank,
+    pe.ViewRankByType,
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.UserCreationDate,
+    ua.PostHistoryEvents,
+    ua.InitialEdits,
+    ua.SubsequentEdits,
+    ua.AvgTimeToFirstPost,
+    tp.TagName,
+    tp.TagPostCount,
+    tp.DuplicateLinkCount,
+    tp.QuestionCount,
+    CASE
+        WHEN pe.PostType = 'Question' AND tp.TagName IS NOT NULL THEN
+            UPPER(SUBSTRING(tp.TagName FROM 1 FOR 1)) || LOWER(SUBSTRING(tp.TagName FROM 2)) || ' - ' ||
+            CAST(
+                EXTRACT(DAY FROM (COALESCE(p_latest.LastActivityDate, TIMESTAMP '1970-01-01') - COALESCE(pe.PreviousPostDate, TIMESTAMP '1970-01-01')))
+                AS VARCHAR
+            ) || ' days since last post'
+        ELSE 'N/A'
+    END AS TaggedPostInfo,
+    COALESCE(u.Location, 'Unknown Location') AS UserLocation,
+    COALESCE(u.WebsiteUrl, 'No Website') AS UserWebsite,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = pe.PostId AND c.UserId IS NULL) AS AnonymousComments,
+    (
+        SELECT COUNT(*)
+        FROM PostHistory ph
+        WHERE ph.PostId = pe.PostId AND ph.PostHistoryTypeId IN (10, 11)
+    ) AS CloseReopenVoteCount
+FROM PostEngagement pe
+LEFT JOIN Users u ON pe.OwnerUserId = u.Id
+LEFT JOIN Posts p_latest ON pe.PostId = p_latest.Id
+LEFT JOIN UserActivity ua ON pe.OwnerUserId = ua.UserId
+LEFT JOIN TagPopularity tp ON tp.TagName IN (
+    SELECT TRIM(value) FROM (
+        SELECT regexp_split_to_table(REPLACE(REPLACE(pe.Tags, '<', ''), '>', ''), E'\\s+') AS value
+    ) s
+)
+WHERE pe.Score > 0 OR pe.ViewCount > 1000
+UNION ALL
+SELECT
+    NULL AS PostId, NULL AS PostType, NULL AS Score, NULL AS ViewCount, NULL AS AnswerCount, NULL AS CommentCount,
+    NULL AS FavoriteCount, NULL AS VoteCount, NULL AS IsClosed, NULL AS ScoreRank, NULL AS ViewRankByType,
+    NULL AS UserId, NULL AS DisplayName, NULL AS Reputation, NULL AS UserCreationDate, NULL AS PostHistoryEvents,
+    NULL AS InitialEdits, NULL AS SubsequentEdits, NULL AS AvgTimeToFirstPost, NULL AS TagName, NULL AS TagPostCount,
+    NULL AS DuplicateLinkCount, NULL AS QuestionCount, NULL AS TaggedPostInfo, NULL AS UserLocation, NULL AS UserWebsite,
+    NULL AS AnonymousComments, NULL AS CloseReopenVoteCount
+FROM Users
+WHERE NOT EXISTS (SELECT 1 FROM Posts WHERE OwnerUserId = Users.Id);

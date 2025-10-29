@@ -1,0 +1,174 @@
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.Views,
+        U.UpVotes,
+        U.DownVotes,
+        U.LastAccessDate,
+        U.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(COALESCE(P.Score, 0)) AS TotalPostScore,
+        SUM(COALESCE(P.ViewCount, 0)) AS TotalPostViews,
+        SUM(COALESCE(P.AnswerCount, 0)) AS TotalAnswersToQuestions,
+        SUM(COALESCE(P.CommentCount, 0)) AS TotalCommentsOnPosts,
+        MAX(P.CreationDate) AS LatestPostDate,
+        MIN(P.CreationDate) AS EarliestPostDate,
+        COUNT(DISTINCT T.tag_name) AS DistinctTagsUsed,
+        (SELECT COUNT(B.Id) FROM Badges B WHERE B.UserId = U.Id AND B.Class = 1) AS GoldBadgeCount
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN LATERAL regexp_split_to_table(SUBSTRING(P.Tags FROM 2 FOR CHARACTER_LENGTH(P.Tags) - 2), '><') AS T(tag_name) ON P.Tags IS NOT NULL
+    WHERE P.PostTypeId IN (1, 2)
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.Views, U.UpVotes, U.DownVotes, U.LastAccessDate, U.CreationDate
+),
+PostCommentActivity AS (
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        COUNT(C.Id) AS TotalCommentsReceived,
+        SUM(COALESCE(C.Score, 0)) AS TotalCommentScore,
+        MAX(C.CreationDate) AS LatestCommentDate,
+        (SELECT AVG(LENGTH(C2.Text)) FROM Comments C2 WHERE C2.PostId = P.Id AND C2.UserId IS NOT NULL) AS AvgCommentLength,
+        MAX(CASE WHEN LOWER(C.Text) LIKE '%thank you%' OR LOWER(C.Text) LIKE '%thanks%' THEN 1 ELSE 0 END) AS HasGratitudeComment
+    FROM Posts P
+    LEFT JOIN Comments C ON P.Id = C.PostId
+    WHERE P.PostTypeId IN (1, 2)
+    GROUP BY P.Id, P.OwnerUserId
+),
+PostEditAndCloseHistory AS (
+    SELECT
+        PH.PostId,
+        COUNT(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.Id END) AS TotalEdits,
+        COUNT(DISTINCT PH.UserId) AS DistinctEditors,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 AND PH.Comment ~ '^[0-9]+$' THEN CAST(PH.Comment AS INTEGER) ELSE NULL END) AS LatestCloseReasonId,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.CreationDate ELSE NULL END) AS ClosedDateFromHistory,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 10 AND PH.Comment IN ('1', '101') THEN 1 ELSE 0 END) AS DuplicateCloseVotes,
+        MIN(CASE WHEN PH.PostHistoryTypeId = 5 THEN PH.CreationDate ELSE NULL END) OVER (PARTITION BY PH.PostId) AS FirstBodyEditDate
+    FROM PostHistory PH
+    WHERE PH.PostHistoryTypeId IN (4, 5, 6, 10)
+    GROUP BY PH.PostId
+),
+UserPostPerformance AS (
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId AS UserId,
+        P.PostTypeId,
+        P.Title,
+        P.CreationDate AS PostCreationDate,
+        COALESCE(P.Score, 0) AS PostScore,
+        COALESCE(P.ViewCount, 0) AS PostViewCount,
+        COALESCE(P.AnswerCount, 0) AS PostAnswerCount,
+        COALESCE(P.FavoriteCount, 0) AS PostFavoriteCount,
+        COALESCE(PCA.TotalCommentsReceived, 0) AS PostTotalCommentsReceived,
+        COALESCE(PCA.TotalCommentScore, 0) AS PostTotalCommentScore,
+        COALESCE(PECH.TotalEdits, 0) AS PostTotalEdits,
+        COALESCE(PECH.DistinctEditors, 0) AS PostDistinctEditors,
+        PECH.LatestCloseReasonId,
+        PECH.DuplicateCloseVotes,
+        PECH.FirstBodyEditDate,
+        (
+            (COALESCE(P.Score, 0) * 1.5)
+            + (COALESCE(P.ViewCount, 0) / 100.0)
+            + (CASE WHEN P.AcceptedAnswerId IS NOT NULL THEN 10 ELSE 0 END)
+            + (COALESCE(P.AnswerCount, 0) * 2)
+            + (COALESCE(PCA.TotalCommentsReceived, 0) * 0.5)
+            + (CASE WHEN PECH.FirstBodyEditDate IS NOT NULL AND PECH.FirstBodyEditDate < P.CreationDate + INTERVAL '1 hour' THEN 5 ELSE 0 END)
+            + (COALESCE(PCA.AvgCommentLength, 0) * 0.1)
+            - (PECH.DuplicateCloseVotes * 20)
+        ) AS PostQualityScore,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY ((COALESCE(P.Score, 0) * 1.5) + (COALESCE(P.ViewCount, 0) / 100.0) + (CASE WHEN P.AcceptedAnswerId IS NOT NULL THEN 10 ELSE 0 END)) DESC, P.CreationDate DESC) AS rn_user_post_quality,
+        AVG(COALESCE(P.Score, 0)) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate) AS RunningAvgUserPostScore
+    FROM Posts P
+    LEFT JOIN PostCommentActivity PCA ON P.Id = PCA.PostId
+    LEFT JOIN PostEditAndCloseHistory PECH ON P.Id = PECH.PostId
+    WHERE P.PostTypeId IN (1, 2)
+)
+SELECT
+    UE.UserId,
+    COALESCE(UE.DisplayName, 'Anonymous User') AS UserDisplayName,
+    UE.Reputation,
+    UE.GoldBadgeCount,
+    UE.TotalPostsOwned,
+    UE.TotalQuestions,
+    UE.TotalAnswers,
+    UE.TotalPostScore,
+    UE.TotalPostViews,
+    UE.TotalCommentsOnPosts,
+    UE.DistinctTagsUsed,
+    UE.LatestPostDate,
+    UE.LastAccessDate,
+    (
+        (UE.Reputation / 1000.0)
+        + (UE.TotalPostScore / 10.0)
+        + (UE.TotalAnswers * 5.0)
+        + (UE.GoldBadgeCount * 50.0)
+        + (UE.TotalCommentsOnPosts / 2.0)
+        + (CASE WHEN UE.LatestPostDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6 months' THEN 20 ELSE 0 END)
+        - (UE.DownVotes / 5.0)
+        + (COALESCE(TPP.RunningAvgUserPostScore, 0) * 0.5)
+    ) AS MasterExplainerScore,
+    TPP.Title AS TopPostTitle,
+    TPP.PostScore AS TopPostScore,
+    TPP.PostViewCount AS TopPostViewCount,
+    TPP.PostTotalEdits AS TopPostEditCount,
+    TPP.PostTotalCommentsReceived AS TopPostCommentCount,
+    TPP.PostQualityScore AS TopPostQualityScore,
+    TPP.PostCreationDate AS TopPostCreationDate,
+    CASE
+        WHEN TPP.LatestCloseReasonId IN (1, 101) THEN 'Closed as Duplicate'
+        WHEN TPP.LatestCloseReasonId IS NOT NULL THEN 'Closed for Other Reason'
+        WHEN TPP.DuplicateCloseVotes > 0 THEN 'Had Duplicate Close Votes'
+        ELSE 'Not Closed as Duplicate'
+    END AS TopPostClosureStatus,
+    CR.Name AS TopPostCloseReasonName,
+    'User joined ' || TO_CHAR(UE.UserCreationDate, 'YYYY-MM-DD') || ' and made ' || UE.TotalPostsOwned || ' posts.' AS UserSummaryText,
+    COALESCE(CAST(UE.Reputation AS NUMERIC) / NULLIF(UE.TotalPostsOwned, 0), 0) AS AvgReputationPerPost,
+    CASE WHEN UE.LastAccessDate > UE.LatestPostDate THEN 'Active After Last Post' ELSE 'Inactive After Last Post' END AS UserActivityStatus,
+    EXISTS (
+        SELECT 1
+        FROM PostLinks PL
+        WHERE PL.PostId = TPP.PostId
+          AND PL.LinkTypeId = 3
+          AND PL.RelatedPostId IN (SELECT P_Sub.Id FROM Posts P_Sub WHERE P_Sub.OwnerUserId = UE.UserId)
+    ) AS HasInternalDuplicateLink,
+    (
+        SELECT AVG(P_Other.Score)
+        FROM Posts P_Other
+        WHERE P_Other.OwnerUserId = UE.UserId AND P_Other.Id != TPP.PostId AND P_Other.PostTypeId IN (1,2)
+    ) AS AvgOtherPostScore,
+    COALESCE(
+        CAST(TPP.PostTotalCommentsReceived AS NUMERIC) / NULLIF(TPP.PostTotalEdits, 0),
+        0
+    ) AS CommentsPerEditRatio,
+    COALESCE(
+        CAST(SUM(CASE WHEN P_UserAnswers.AcceptedAnswerId = P_UserAnswers.Id THEN 1 ELSE 0 END) OVER (PARTITION BY UE.UserId) AS NUMERIC)
+        / NULLIF(UE.TotalAnswers, 0),
+        0
+    ) AS AcceptedAnswerRatio
+FROM UserEngagement UE
+LEFT JOIN UserPostPerformance TPP ON UE.UserId = TPP.UserId AND TPP.rn_user_post_quality = 1
+LEFT JOIN CloseReasonTypes CR ON TPP.LatestCloseReasonId = CR.Id
+LEFT JOIN Posts P_UserAnswers ON UE.UserId = P_UserAnswers.OwnerUserId AND P_UserAnswers.PostTypeId = 2
+WHERE
+    UE.TotalPostsOwned > 50
+    AND UE.Reputation > 10000
+    AND UE.GoldBadgeCount >= 1
+    AND UE.TotalAnswers > 10
+    AND COALESCE(TPP.PostTotalCommentsReceived, 0) > 5
+    AND COALESCE(TPP.DuplicateCloseVotes, 0) = 0
+    AND UE.LastAccessDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+    AND UE.UserCreationDate < CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 years'
+    AND (LOWER(UE.DisplayName) NOT LIKE '%bot%' OR UE.DisplayName IS NULL)
+    AND UE.TotalPostsOwned > UE.TotalQuestions
+GROUP BY
+    UE.UserId, UE.DisplayName, UE.Reputation, UE.GoldBadgeCount, UE.TotalPostsOwned, UE.TotalQuestions, UE.TotalAnswers,
+    UE.TotalPostScore, UE.TotalPostViews, UE.TotalCommentsOnPosts, UE.DistinctTagsUsed, UE.LatestPostDate,
+    UE.LastAccessDate, UE.UserCreationDate, TPP.Title, TPP.PostScore, TPP.PostViewCount, TPP.PostTotalEdits,
+    TPP.PostTotalCommentsReceived, TPP.PostQualityScore, TPP.PostCreationDate, TPP.LatestCloseReasonId,
+    TPP.DuplicateCloseVotes, CR.Name, TPP.RunningAvgUserPostScore
+ORDER BY MasterExplainerScore DESC, UE.Reputation DESC
+LIMIT 100;

@@ -1,0 +1,344 @@
+-- {"query": "797.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3298} 
+with
+q_posts as (
+  select p.Id as QuestionId,
+         p.Title,
+         p.OwnerUserId as AskerId,
+         p.CreationDate as QuestionDate,
+         p.Score as QuestionScore,
+         p.ViewCount,
+         p.Tags,
+         coalesce(p.AnswerCount, 0) as AnswerCount
+  from Posts p
+  where p.PostTypeId = 1
+),
+a_posts as (
+  select a.Id as AnswerId,
+         a.ParentId as QuestionId,
+         a.OwnerUserId as AnswererId,
+         a.Score as AnswerScore,
+         a.CreationDate as AnswerDate,
+         a.Body as AnswerBody
+  from Posts a
+  where a.PostTypeId = 2
+),
+first_answers as (
+  select ap.QuestionId,
+         ap.AnswerId,
+         ap.AnswererId,
+         ap.AnswerScore,
+         ap.AnswerDate,
+         row_number() over (partition by ap.QuestionId order by ap.AnswerDate asc, ap.AnswerId) as rn
+  from a_posts ap
+),
+accepted as (
+  select q.QuestionId,
+         q.Title,
+         q.AskerId,
+         q.QuestionDate,
+         q.QuestionScore,
+         q.ViewCount,
+         q.Tags,
+         q.AnswerCount,
+         p2.Id as AcceptedAnswerId,
+         p2.OwnerUserId as AcceptedAnswererId,
+         p2.Score as AcceptedAnswerScore,
+         p2.CreationDate as AcceptedAnswerDate
+  from q_posts q
+  left join Posts p1 on p1.Id = q.QuestionId
+  left join Posts p2 on p2.Id = p1.AcceptedAnswerId
+),
+fa as (
+  select fa.QuestionId,
+         fa.AnswerId as FirstAnswerId,
+         fa.AnswererId as FirstAnswererId,
+         fa.AnswerScore as FirstAnswerScore,
+         fa.AnswerDate as FirstAnswerDate
+  from first_answers fa
+  where fa.rn = 1
+),
+comment_stats as (
+  select c.PostId,
+         count(*) as CommentCount,
+         sum(case when c.Score > 0 then 1 else 0 end) as PosComments,
+         max(c.CreationDate) as LastCommentDate
+  from Comments c
+  group by c.PostId
+),
+vote_agg as (
+  select v.PostId,
+         sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+         sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes,
+         sum(case when vt.Name = 'Favorite' then 1 else 0 end) as Favorites,
+         sum(case when vt.Name = 'BountyStart' then coalesce(v.BountyAmount,0) else 0 end) as BountyStarted,
+         sum(case when vt.Name = 'BountyClose' then coalesce(v.BountyAmount,0) else 0 end) as BountyAwarded,
+         min(v.CreationDate) as FirstVoteDate,
+         max(v.CreationDate) as LastVoteDate
+  from Votes v
+  join VoteTypes vt on vt.Id = v.VoteTypeId
+  group by v.PostId
+),
+link_agg as (
+  select pl.PostId,
+         sum(case when lt.Name = 'Linked' then 1 else 0 end) as LinkedCount,
+         sum(case when lt.Name = 'Duplicate' then 1 else 0 end) as DuplicateCount,
+         max(case when lt.Name = 'Duplicate' then pl.RelatedPostId end) as AnyDuplicateOf
+  from PostLinks pl
+  join LinkTypes lt on lt.Id = pl.LinkTypeId
+  group by pl.PostId
+),
+close_events as (
+  select ph.PostId,
+         count(*) filter (where ph.PostHistoryTypeId = 10) as CloseVotes,
+         max(case when ph.PostHistoryTypeId = 10 then ph.CreationDate end) as LastCloseVoteDate,
+         max(case when ph.PostHistoryTypeId = 11 then ph.CreationDate end) as ReopenDate,
+         max(case when ph.PostHistoryTypeId = 10 then ph.Comment end) as LastCloseReasonId
+  from PostHistory ph
+  group by ph.PostId
+),
+user_badges as (
+  select b.UserId,
+         sum(case when b.Class = 1 then 1 else 0 end) as Gold,
+         sum(case when b.Class = 2 then 1 else 0 end) as Silver,
+         sum(case when b.Class = 3 then 1 else 0 end) as Bronze,
+         count(*) as TotalBadges,
+         max(b.Date) as LastBadgeDate
+  from Badges b
+  group by b.UserId
+),
+user_stats as (
+  select u.Id as UserId,
+         u.Reputation,
+         u.CreationDate as UserCreationDate,
+         u.DisplayName,
+         u.Location,
+         u.Views as ProfileViews,
+         u.UpVotes as UUpVotes,
+         u.DownVotes as UDownVotes,
+         ub.Gold, ub.Silver, ub.Bronze, ub.TotalBadges,
+         ub.LastBadgeDate
+  from Users u
+  left join user_badges ub on ub.UserId = u.Id
+),
+tag_split as (
+  select
+    q.QuestionId,
+    unnest(string_to_array(substring(coalesce(q.Tags,''), 2, greatest(length(coalesce(q.Tags,'')) - 2, 0)), '><')) as tag
+  from q_posts q
+),
+primary_tag as (
+  select QuestionId,
+         (array_agg(tag order by tag))[1] as PrimaryTag
+  from tag_split
+  group by QuestionId
+),
+question_activity as (
+  select
+    q.QuestionId,
+    coalesce(v.UpVotes,0) - coalesce(v.DownVotes,0) as NetVotes,
+    coalesce(v.Favorites,0) as Favorites,
+    coalesce(v.BountyStarted,0) as BountyStarted,
+    coalesce(v.BountyAwarded,0) as BountyAwarded,
+    coalesce(c.CommentCount,0) as CommentCount,
+    coalesce(c.PosComments,0) as PositiveComments,
+    greatest(coalesce(v.LastVoteDate, q.QuestionDate), coalesce(c.LastCommentDate, q.QuestionDate), q.QuestionDate) as LastInteraction
+  from q_posts q
+  left join vote_agg v on v.PostId = q.QuestionId
+  left join comment_stats c on c.PostId = q.QuestionId
+),
+answerer_quality as (
+  select
+    a.AnswererId as UserId,
+    count(*) as AnswersCount,
+    avg(a.AnswerScore::numeric) as AvgAnswerScore,
+    percentile_cont(0.5) within group (order by a.AnswerScore) as MedianAnswerScore,
+    sum(case when a.AnswerScore >= 1 then 1 else 0 end) as NonNegAnswers
+  from a_posts a
+  group by a.AnswererId
+),
+asker_quality as (
+  select
+    q.AskerId as UserId,
+    count(*) as QuestionsCount,
+    avg(q.QuestionScore::numeric) as AvgQuestionScore,
+    sum(case when q.AnswerCount > 0 then 1 else 0 end) as QuestionsWithAnswers
+  from q_posts q
+  group by q.AskerId
+),
+accepted_vs_first as (
+  select
+    a.QuestionId,
+    case when ac.AcceptedAnswerId is null then 'none'
+         when ac.AcceptedAnswerId = f.FirstAnswerId then 'first'
+         else 'later'
+    end as AcceptedTiming,
+    case when ac.AcceptedAnswerId is null then null
+         else extract(epoch from (ac.AcceptedAnswerDate - q.QuestionDate))::bigint
+    end as AcceptLatencySec,
+    case when ac.AcceptedAnswerId is null then null
+         else extract(epoch from (ac.AcceptedAnswerDate - f.FirstAnswerDate))::bigint
+    end as FirstToAcceptDeltaSec
+  from accepted ac
+  join q_posts q on q.QuestionId = ac.QuestionId
+  left join fa f on f.QuestionId = ac.QuestionId
+  left join a_posts a on a.QuestionId = ac.QuestionId
+  group by a.QuestionId, ac.AcceptedAnswerId, ac.AcceptedAnswerDate, f.FirstAnswerId, f.FirstAnswerDate, q.QuestionDate
+),
+per_question_rollup as (
+  select
+    q.QuestionId,
+    q.Title,
+    q.AskerId,
+    ps.PrimaryTag,
+    qa.NetVotes,
+    qa.Favorites,
+    qa.BountyStarted,
+    qa.BountyAwarded,
+    qa.CommentCount,
+    qa.PositiveComments,
+    qa.LastInteraction,
+    ac.AcceptedAnswerId,
+    ac.AcceptedAnswererId,
+    ac.AcceptedAnswerScore,
+    ac.AcceptedAnswerDate,
+    fa.FirstAnswerId,
+    fa.FirstAnswererId,
+    fa.FirstAnswerScore,
+    fa.FirstAnswerDate,
+    coalesce(ev.AcceptedTiming, 'none') as AcceptedTiming,
+    ev.AcceptLatencySec,
+    ev.FirstToAcceptDeltaSec,
+    la.LinkedCount,
+    la.DuplicateCount,
+    la.AnyDuplicateOf,
+    ce.CloseVotes,
+    ce.LastCloseVoteDate,
+    ce.ReopenDate,
+    ce.LastCloseReasonId
+  from q_posts q
+  left join primary_tag ps on ps.QuestionId = q.QuestionId
+  left join question_activity qa on qa.QuestionId = q.QuestionId
+  left join accepted ac on ac.QuestionId = q.QuestionId
+  left join fa on fa.QuestionId = q.QuestionId
+  left join accepted_vs_first ev on ev.QuestionId = q.QuestionId
+  left join link_agg la on la.PostId = q.QuestionId
+  left join close_events ce on ce.PostId = q.QuestionId
+),
+ranked_questions as (
+  select
+    pqr.*,
+    dense_rank() over (partition by coalesce(pqr.PrimaryTag, '_untagged_') order by coalesce(pqr.NetVotes, -2147483648) desc, pqr.QuestionId) as RankInTag,
+    row_number() over (order by coalesce(pqr.NetVotes, -2147483648) desc, coalesce(pqr.Favorites,0) desc, pqr.QuestionId) as GlobalRowNum
+  from per_question_rollup pqr
+),
+user_enrichment as (
+  select
+    rq.QuestionId,
+    rq.Title,
+    rq.PrimaryTag,
+    rq.NetVotes,
+    rq.Favorites,
+    rq.CommentCount,
+    rq.AcceptedTiming,
+    rq.AcceptLatencySec,
+    rq.FirstToAcceptDeltaSec,
+    rq.LinkedCount,
+    rq.DuplicateCount,
+    rq.CloseVotes,
+    rq.RankInTag,
+    rq.GlobalRowNum,
+    ask.UserId as AskerId,
+    ask.Reputation as AskerRep,
+    ask.DisplayName as AskerName,
+    aq.QuestionsCount,
+    aq.AvgQuestionScore,
+    aq.QuestionsWithAnswers,
+    ans.UserId as AcceptedAnswererId,
+    ans.Reputation as AcceptedRep,
+    anq.AnswersCount as AcceptedUserAnswers,
+    anq.AvgAnswerScore as AcceptedUserAvgAnsScore
+  from ranked_questions rq
+  left join user_stats ask on ask.UserId = rq.AskerId
+  left join asker_quality aq on aq.UserId = rq.AskerId
+  left join user_stats ans on ans.UserId = rq.AcceptedAnswererId
+  left join answerer_quality anq on anq.UserId = rq.AcceptedAnswererId
+),
+score_buckets as (
+  select
+    ue.*,
+    case
+      when ue.NetVotes is null then 'unknown'
+      when ue.NetVotes >= 50 then 'legendary'
+      when ue.NetVotes >= 20 then 'great'
+      when ue.NetVotes >= 10 then 'good'
+      when ue.NetVotes >= 0 then 'ok'
+      else 'controversial'
+    end as ScoreBucket
+  from user_enrichment ue
+),
+finalized as (
+  select
+    s.*,
+    case
+      when s.DuplicateCount > 0 then 'duplicate'
+      when s.CloseVotes > 0 and s.ReopenDate is null then 'closed'
+      when s.CloseVotes > 0 and s.ReopenDate is not null then 'reopened'
+      else 'open'
+    end as ClosureState,
+    case
+      when coalesce(s.AcceptLatencySec, 3153600000) < 3600 then 'accepted <1h'
+      when coalesce(s.AcceptLatencySec, 3153600000) < 86400 then 'accepted <1d'
+      when s.AcceptLatencySec is null then 'no accept'
+      else 'accepted >=1d'
+    end as AcceptSpeed
+  from score_buckets s
+)
+select
+  f.QuestionId,
+  coalesce(f.Title, '(no title)') as Title,
+  coalesce(f.PrimaryTag, '_untagged_') as PrimaryTag,
+  f.ScoreBucket,
+  f.ClosureState,
+  f.AcceptedTiming,
+  f.AcceptSpeed,
+  f.NetVotes,
+  f.Favorites,
+  f.CommentCount,
+  f.LinkedCount,
+  f.DuplicateCount,
+  f.CloseVotes,
+  f.RankInTag,
+  f.GlobalRowNum,
+  f.AskerId,
+  coalesce(f.AskerName, '(unknown)') as AskerName,
+  coalesce(f.AskerRep, 0) as AskerRep,
+  coalesce(f.QuestionsCount, 0) as AskerQuestions,
+  round(coalesce(f.AvgQuestionScore, 0), 2) as AskerAvgQScore,
+  coalesce(f.QuestionsWithAnswers, 0) as AskerQsWithAnswers,
+  f.AcceptedAnswererId,
+  coalesce(f.AcceptedRep, 0) as AcceptedRep,
+  coalesce(f.AcceptedUserAnswers, 0) as AcceptedUserAnswers,
+  round(coalesce(f.AcceptedUserAvgAnsScore, 0), 2) as AcceptedUserAvgAnsScore,
+  coalesce(f.AcceptLatencySec, -1) as AcceptLatencySec,
+  coalesce(f.FirstToAcceptDeltaSec, -1) as FirstToAcceptDeltaSec,
+  to_char(coalesce((select max(p.CreationDate) from Posts p where p.Id = f.QuestionId), now()), 'YYYY-MM-DD"T"HH24:MI:SS') as QuestionCreatedAtIso,
+  case when f.NetVotes is null then 'no-votes' when f.NetVotes >= 0 then 'non-negative' else 'negative' end as NetVoteSign,
+  case when position('sql' in lower(coalesce((select p2.Title from Posts p2 where p2.Id = f.QuestionId), ''))) > 0 then 1 else 0 end as TitleMentionsSQL
+from finalized f
+where
+  (
+    f.PrimaryTag is null
+    or f.NetVotes is null
+    or f.NetVotes >= 10
+    or (f.DuplicateCount > 0 and f.NetVotes >= 0)
+    or (f.CloseVotes > 0 and f.AcceptedTiming <> 'none')
+  )
+  and (
+    f.AskerRep is null
+    or f.AskerRep >= 1000
+    or (f.AskerRep between 100 and 999 and f.ScoreBucket in ('good','great','legendary'))
+  )
+order by
+  coalesce(f.NetVotes, -2147483648) desc,
+  f.GlobalRowNum
+limit 500;

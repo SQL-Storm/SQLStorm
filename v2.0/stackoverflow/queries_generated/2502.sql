@@ -1,0 +1,169 @@
+-- {"query": "2502.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1464} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 as Level,
+        array[t.Id] as AncestorPath
+    from Tags t
+    where not t.IsRequired = 1
+    union all
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        r.Level + 1,
+        r.AncestorPath || t2.Id
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.IsRequired = 1 and t2.Id <> all(r.AncestorPath)
+    where array_length(r.AncestorPath, 1) < 5
+),
+QuestionStats as (
+    select
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        u.Reputation,
+        u.DisplayName,
+        coalesce(p.AnswerCount,0) as AnswerCount,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc) as rn
+    from Posts p
+    join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId = 1 and p.CreationDate >= current_date - interval '1 year'
+),
+UserBadgeSummary as (
+    select
+        b.UserId,
+        count(*) filter (where b.Class = 1) as GoldBadges,
+        count(*) filter (where b.Class = 2) as SilverBadges,
+        count(*) filter (where b.Class = 3) as BronzeBadges,
+        count(distinct b.Name) as DistinctBadges,
+        max(b.Date) as LastBadgeDate
+    from Badges b
+    group by b.UserId
+),
+AnswerDetails as (
+    select
+        a.Id,
+        a.ParentId as QuestionId,
+        a.Score,
+        a.CreationDate,
+        a.OwnerUserId,
+        rank() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as ScoreRank
+    from Posts a
+    where a.PostTypeId = 2
+),
+LatestPostHistoryEdits as (
+    select distinct on (ph.PostId)
+        ph.PostId,
+        ph.Id as EdtId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        ph.UserId,
+        ph.UserDisplayName,
+        ph.Comment
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (4,5,6,10,11)
+    order by ph.PostId, ph.CreationDate desc
+),
+DuplicateLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        p.Title as RelatedQuestionTitle,
+        u.DisplayName as RelatedQuestionOwner,
+        row_number() over (partition by pl.PostId order by p.CreationDate desc) as DupRank
+    from PostLinks pl
+    join Posts p on pl.RelatedPostId = p.Id and p.PostTypeId = 1
+    left join Users u on p.OwnerUserId = u.Id
+    where pl.LinkTypeId = 3
+),
+ComplexUserInfo as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Location,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        coalesce(ub.DistinctBadges, 0) as DistinctBadges,
+        (select count(*) from Posts p2 where p2.OwnerUserId = u.Id and p2.Score > 10) as HighScorePosts,
+        (select count(*) from Comments c where c.UserId = u.Id and c.Score > 5) as HighScoreComments
+    from Users u
+    left join UserBadgeSummary ub on u.Id = ub.UserId
+    where u.Reputation > 1000
+),
+FinalResult as (
+    select 
+        qs.Id as QuestionId,
+        qs.Title,
+        qs.CreationDate,
+        qs.Score as QuestionScore,
+        qs.ViewCount,
+        qs.AnswerCount,
+        qs.DisplayName as QuestionOwner,
+        qs.Reputation as OwnerReputation,
+        coalesce(ud.GoldBadges, 0) as OwnerGoldBadges,
+        coalesce(ud.SilverBadges, 0) as OwnerSilverBadges,
+        coalesce(ud.BronzeBadges, 0) as OwnerBronzeBadges,
+        ad.Id as TopAnswerId,
+        ad.Score as TopAnswerScore,
+        ad.CreationDate as TopAnswerCreationDate,
+        uad.DisplayName as TopAnswerOwner,
+        extract(epoch from (ad.CreationDate - qs.CreationDate))/3600 as HoursToTopAnswer,
+        lph.PostHistoryTypeId as LastEditType,
+        case 
+          when lph.PostHistoryTypeId = 10 then 'Closed'
+          when lph.PostHistoryTypeId = 11 then 'Reopened'
+          when lph.PostHistoryTypeId in (4,5,6) then 'Edited'
+          else 'Other'
+        end as LastEditStatus,
+        dup.RelatedPostId as DuplicateOf,
+        dup.RelatedQuestionTitle,
+        dup.RelatedQuestionOwner,
+        concat(substring(qs.Title from 1 for 30), case when length(qs.Title) > 30 then '...' else '' end) as ShortTitle,
+        case 
+            when qs.Score > 100 then 'Popular'
+            when qs.AnswerCount = 0 then 'Unanswered'
+            else 'Normal'
+        end as QuestionCategory
+    from QuestionStats qs
+    left join ComplexUserInfo ud on qs.OwnerUserId = ud.UserId
+    left join AnswerDetails ad on ad.ParentId = qs.Id and ad.ScoreRank = 1
+    left join Users uad on ad.OwnerUserId = uad.Id
+    left join LatestPostHistoryEdits lph on lph.PostId = qs.Id
+    left join DuplicateLinks dup on dup.PostId = qs.Id and dup.DupRank = 1
+    where qs.rn = 1
+)
+select 
+    fr.QuestionId,
+    fr.ShortTitle,
+    fr.QuestionCategory,
+    fr.QuestionScore,
+    fr.ViewCount,
+    fr.AnswerCount,
+    fr.QuestionOwner,
+    fr.OwnerReputation,
+    fr.OwnerGoldBadges,
+    fr.OwnerSilverBadges,
+    fr.OwnerBronzeBadges,
+    fr.TopAnswerId,
+    fr.TopAnswerScore,
+    fr.HoursToTopAnswer,
+    fr.LastEditStatus,
+    coalesce(fr.DuplicateOf, null) as DuplicateOfPostId,
+    fr.RelatedQuestionTitle,
+    fr.RelatedQuestionOwner
+from FinalResult fr
+order by fr.QuestionScore desc, fr.ViewCount desc
+limit 100;

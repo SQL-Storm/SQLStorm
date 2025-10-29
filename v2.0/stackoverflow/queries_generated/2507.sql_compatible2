@@ -1,0 +1,206 @@
+WITH RECURSIVE RecursiveCTE AS (
+    SELECT 
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        1 AS Level,
+        ARRAY[p.Id] AS Path
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+    UNION ALL
+    SELECT 
+        a.Id,
+        a.PostTypeId,
+        a.OwnerUserId,
+        a.CreationDate,
+        a.Score,
+        a.ViewCount,
+        a.Tags,
+        r.Level + 1,
+        -- concatenate array and scalar by converting scalar to single-element array, then concatenating
+        r.Path || ARRAY[a.Id]
+    FROM Posts a
+    JOIN RecursiveCTE r ON a.ParentId = r.PostId
+    WHERE a.PostTypeId = 2
+      AND NOT a.Id = ANY(r.Path)
+),
+UserBadgeRanks AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        b.Class,
+        COUNT(*) AS BadgeCount
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, b.Class
+),
+PostCommentStats AS (
+    SELECT
+        p.Id AS PostId,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        MAX(c.CreationDate) AS LastCommentDate,
+        STRING_AGG(DISTINCT COALESCE(NULLIF(c.UserDisplayName, ''), 'Anonymous'), ', ') AS CommenterNames
+    FROM Posts p
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    GROUP BY p.Id
+),
+QuestionAnswerVotes AS (
+    SELECT 
+        q.Id AS QuestionId,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS QuestionUpVotes,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS QuestionDownVotes,
+        COUNT(DISTINCT a.Id) AS AnswerCount,
+        COALESCE(SUM(a.Score), 0) AS AnswerScoreSum,
+        COALESCE(SUM(CASE WHEN av.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS AnswerUpVotes,
+        COALESCE(SUM(CASE WHEN av.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS AnswerDownVotes
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    LEFT JOIN Votes v ON v.PostId = q.Id
+    LEFT JOIN Votes av ON av.PostId = a.Id
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id
+),
+RecentPostHistories AS (
+    SELECT ph.PostId,
+        ph.CreationDate,
+        ph.PostHistoryTypeId,
+        ph.Comment AS CloseReason,
+        ph.UserId,
+        ph.UserDisplayName
+    FROM (
+        SELECT ph.*,
+               ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+        FROM PostHistory ph
+        WHERE ph.PostHistoryTypeId IN (10, 11)
+    ) ph
+    WHERE ph.rn = 1
+),
+UserActivityWindow AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) OVER (PARTITION BY u.Id) AS QuestionPosts,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) OVER (PARTITION BY u.Id) AS AnswerPosts,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.CreationDate DESC) AS RecentPostRank,
+        AVG(p.Score) OVER (PARTITION BY u.Id) AS AveragePostScore
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+),
+DuplicateLinks AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate,
+        p1.Title AS PostTitle,
+        p2.Title AS RelatedPostTitle
+    FROM PostLinks pl
+    JOIN Posts p1 ON p1.Id = pl.PostId
+    JOIN Posts p2 ON p2.Id = pl.RelatedPostId
+    WHERE pl.LinkTypeId = 3
+),
+FinalAggregated AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.Tags,
+        COALESCE(qav.QuestionUpVotes,0) AS QUpVotes,
+        COALESCE(qav.QuestionDownVotes,0) AS QDownVotes,
+        COALESCE(qav.AnswerCount,0) AS AnswerCount,
+        COALESCE(qav.AnswerScoreSum,0) AS AnswerScore,
+        COALESCE(qav.AnswerUpVotes,0) AS AnswerUpVotes,
+        COALESCE(qav.AnswerDownVotes,0) AS AnswerDownVotes,
+        pcs.CommentCount,
+        pcs.LastCommentDate,
+        pcs.CommenterNames,
+        rph.PostHistoryTypeId,
+        rph.CloseReason,
+        u.DisplayName AS OwnerName,
+        u.Reputation AS OwnerReputation,
+        u.CreationDate AS OwnerCreationDate,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        STRING_AGG(DISTINCT dt.Name, ', ') AS PostHistoryTypeNames,
+        -- compute tag count by splitting and counting non-empty elements
+        (SELECT COUNT(*) FROM UNNEST(string_to_array(q.Tags, '><')) AS t(tag) WHERE t.tag <> '') AS TagCount
+    FROM Posts q
+    LEFT JOIN QuestionAnswerVotes qav ON qav.QuestionId = q.Id
+    LEFT JOIN PostCommentStats pcs ON pcs.PostId = q.Id
+    LEFT JOIN RecentPostHistories rph ON rph.PostId = q.Id
+    LEFT JOIN Users u ON u.Id = q.OwnerUserId
+    LEFT JOIN (
+       SELECT UserId,
+           COUNT(*) FILTER (WHERE Class = 1) AS GoldBadges,
+           COUNT(*) FILTER (WHERE Class = 2) AS SilverBadges,
+           COUNT(*) FILTER (WHERE Class = 3) AS BronzeBadges
+       FROM Badges
+       GROUP BY UserId
+    ) ub ON ub.UserId = q.OwnerUserId
+    LEFT JOIN LATERAL (
+        SELECT DISTINCT pht.Name
+        FROM PostHistoryTypes pht
+        JOIN PostHistory ph ON ph.PostHistoryTypeId = pht.Id AND ph.PostId = q.Id
+    ) dt ON TRUE
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount, q.Tags,
+        qav.QuestionUpVotes, qav.QuestionDownVotes,
+        qav.AnswerCount, qav.AnswerScoreSum, qav.AnswerUpVotes, qav.AnswerDownVotes,
+        pcs.CommentCount, pcs.LastCommentDate, pcs.CommenterNames,
+        rph.PostHistoryTypeId, rph.CloseReason,
+        u.DisplayName, u.Reputation, u.CreationDate,
+        ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges
+)
+SELECT 
+    fa.QuestionId,
+    fa.Title,
+    fa.CreationDate,
+    fa.Score,
+    fa.ViewCount,
+    fa.QUpVotes,
+    fa.QDownVotes,
+    fa.AnswerCount,
+    fa.AnswerScore,
+    fa.AnswerUpVotes,
+    fa.AnswerDownVotes,
+    fa.CommentCount,
+    fa.LastCommentDate,
+    LEFT(fa.CommenterNames, 100) AS CommenterNamesSample,
+    COALESCE(fa.PostHistoryTypeId, 0) AS LastPostHistoryTypeId,
+    CASE WHEN fa.CloseReason IS NOT NULL THEN fa.CloseReason ELSE 'Open' END AS CloseStatus,
+    fa.OwnerName,
+    fa.OwnerReputation,
+    fa.OwnerCreationDate,
+    COALESCE(fa.GoldBadges, 0) AS GoldBadges,
+    COALESCE(fa.SilverBadges, 0) AS SilverBadges,
+    COALESCE(fa.BronzeBadges, 0) AS BronzeBadges,
+    fa.PostHistoryTypeNames,
+    fa.TagCount,
+    CASE 
+        WHEN fa.Score > 10 AND fa.ViewCount > 1000 THEN 'Hot Question' 
+        WHEN fa.Score <= 0 THEN 'Low Quality' 
+        ELSE 'Normal' 
+    END AS QuestionStatus,
+    (SELECT COUNT(*) FROM DuplicateLinks dl WHERE dl.PostId = fa.QuestionId) AS DuplicateCount,
+    -- normalized tags: split, trim, lower, distinct, aggregate
+    array_to_string(ARRAY_AGG(DISTINCT LOWER(TRIM(t.tag)) ORDER BY LOWER(TRIM(t.tag))), ', ') AS NormalizedTags
+FROM FinalAggregated fa
+LEFT JOIN LATERAL (
+    SELECT tag FROM UNNEST(string_to_array(fa.Tags, '><')) AS t(tag)
+) t ON TRUE
+GROUP BY
+    fa.QuestionId, fa.Title, fa.CreationDate, fa.Score, fa.ViewCount, fa.QUpVotes, fa.QDownVotes,
+    fa.AnswerCount, fa.AnswerScore, fa.AnswerUpVotes, fa.AnswerDownVotes, fa.CommentCount,
+    fa.LastCommentDate, fa.CommenterNames, fa.PostHistoryTypeId, fa.CloseReason,
+    fa.OwnerName, fa.OwnerReputation, fa.OwnerCreationDate, fa.GoldBadges, fa.SilverBadges,
+    fa.BronzeBadges, fa.PostHistoryTypeNames, fa.TagCount
+ORDER BY fa.Score DESC NULLS LAST, fa.ViewCount DESC NULLS LAST
+LIMIT 50;

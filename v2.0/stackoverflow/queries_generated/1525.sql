@@ -1,0 +1,168 @@
+-- {"query": "1525.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2676} 
+
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.UpVotes,
+        U.DownVotes,
+        U.Views AS UserViews,
+        COUNT(DISTINCT P.Id) FILTER (WHERE P.PostTypeId = 1) AS TotalQuestions,
+        COUNT(DISTINCT P.Id) FILTER (WHERE P.PostTypeId = 2) AS TotalAnswers,
+        SUM(P.Score) FILTER (WHERE P.PostTypeId = 1) AS TotalQuestionScore,
+        SUM(P.Score) FILTER (WHERE P.PostTypeId = 2) AS TotalAnswerScore,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        MAX(B.Date) AS LastBadgeDate,
+        (EXTRACT(EPOCH FROM (U.LastAccessDate - U.CreationDate)) / 86400.0) AS AccountAgeDays,
+        (U.UpVotes * 0.5 + U.DownVotes * 0.1 + U.Views * 0.05 + COUNT(DISTINCT P.Id) * 2 + COUNT(DISTINCT B.Id) * 0.8) AS EngagementScoreBase,
+        AVG(CASE WHEN V.VoteTypeId = 2 THEN 1.0 ELSE 0.0 END) OVER (PARTITION BY U.Id) AS AvgUpvoteRatio
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    LEFT JOIN Badges AS B ON U.Id = B.UserId
+    LEFT JOIN Votes AS V ON U.Id = V.UserId
+    WHERE U.Reputation >= 1000
+      AND U.LastAccessDate >= (NOW() - INTERVAL '1 year')
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.UpVotes, U.DownVotes, U.Views
+),
+PostHistoryAggregates AS (
+    SELECT
+        PH.PostId,
+        COUNT(PH.Id) AS TotalHistoryEntries,
+        COUNT(PH.Id) FILTER (WHERE PH.PostHistoryTypeId IN (4, 5, 6)) AS TotalEdits,
+        MAX(PH.CreationDate) AS LastEditDateHistory,
+        MIN(PH.CreationDate) AS FirstEditDateHistory,
+        COUNT(DISTINCT PH.UserId) AS UniqueEditors,
+        SUM(CASE WHEN PH.Comment LIKE '%typo%' THEN 1 ELSE 0 END) AS TypoFixes,
+        SUM(CASE WHEN PH.Comment LIKE '%format%' THEN 1 ELSE 0 END) AS FormatFixes,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN 'Closed'
+                 WHEN PH.PostHistoryTypeId = 11 THEN 'Reopened'
+                 WHEN PH.PostHistoryTypeId = 12 THEN 'Deleted'
+                 WHEN PH.PostHistoryTypeId = 13 THEN 'Undeleted'
+                 ELSE NULL END) AS LastPostStatusChange
+    FROM PostHistory AS PH
+    WHERE PH.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 10, 11, 12, 13, 14, 15, 19, 20, 35, 36) -- Initial, Edits, Close/Reopen/Delete/Undelete/Lock/Unlock/Protect/Unprotect/Migrated
+    GROUP BY PH.PostId
+),
+QuestionDetails AS (
+    SELECT
+        Q.Id AS QuestionId,
+        Q.OwnerUserId,
+        Q.CreationDate AS QuestionCreationDate,
+        Q.Score AS QuestionScore,
+        Q.ViewCount,
+        Q.AnswerCount,
+        Q.FavoriteCount,
+        Q.Title,
+        Q.Body,
+        Q.Tags,
+        Q.AcceptedAnswerId,
+        COALESCE(A.Score, 0) AS AcceptedAnswerScore,
+        COALESCE(A.OwnerUserId, -1) AS AcceptedAnswerOwnerUserId,
+        (SELECT COUNT(DISTINCT PL.RelatedPostId)
+         FROM PostLinks AS PL
+         WHERE PL.PostId = Q.Id AND PL.LinkTypeId = 3) AS DuplicateCount, -- Correlated subquery for duplicates
+        (SELECT MAX(V.CreationDate)
+         FROM Votes AS V
+         WHERE V.PostId = Q.Id AND V.VoteTypeId = 5) AS LastFavoritedDate,
+        (LENGTH(Q.Tags) - LENGTH(REPLACE(Q.Tags, '><', '')) + 1) / 2 AS TagCount, -- Assumes tags are like '<tag1><tag2>'
+        CASE
+            WHEN Q.ClosedDate IS NOT NULL AND Q.CommunityOwnedDate IS NOT NULL THEN 'Closed & Community-Owned'
+            WHEN Q.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN Q.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+            ELSE 'Open'
+        END AS QuestionStatus,
+        ROW_NUMBER() OVER (PARTITION BY Q.OwnerUserId ORDER BY Q.ViewCount DESC, Q.CreationDate DESC) AS QuestionViewRank,
+        AVG(Q.Score) OVER (PARTITION BY Q.OwnerUserId) AS AvgQuestionScoreByOwner,
+        LAG(Q.CreationDate, 1, Q.CreationDate) OVER (PARTITION BY Q.OwnerUserId ORDER BY Q.CreationDate) AS PreviousQuestionDate,
+        (SELECT C.Text FROM Comments AS C WHERE C.PostId = Q.Id ORDER BY C.CreationDate DESC LIMIT 1) AS LatestCommentText -- Correlated subquery for latest comment
+    FROM Posts AS Q
+    LEFT JOIN Posts AS A ON Q.AcceptedAnswerId = A.Id
+    WHERE Q.PostTypeId = 1
+      AND Q.CreationDate >= (NOW() - INTERVAL '2 years')
+      AND Q.ViewCount > 50
+),
+AnswerDetails AS (
+    SELECT
+        A.Id AS AnswerId,
+        A.ParentId AS QuestionId,
+        A.OwnerUserId AS AnswerOwnerUserId,
+        A.CreationDate AS AnswerCreationDate,
+        A.Score AS AnswerScore,
+        A.Body AS AnswerBody,
+        RANK() OVER (PARTITION BY A.ParentId ORDER BY A.Score DESC, A.CreationDate ASC) AS AnswerScoreRank,
+        COALESCE(SUM(V.BountyAmount) OVER (PARTITION BY A.Id), 0) AS TotalBountyReceived,
+        (SELECT COUNT(DISTINCT C.Id) FROM Comments AS C WHERE C.PostId = A.Id AND C.CreationDate >= (NOW() - INTERVAL '6 months')) AS RecentAnswerComments,
+        'Answer' AS PostTypeIdentifier,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY A.Id) AS AnswerUpVotes,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) OVER (PARTITION BY A.Id) AS AnswerDownVotes
+    FROM Posts AS A
+    LEFT JOIN Votes AS V ON A.Id = V.PostId AND V.VoteTypeId IN (2, 3, 8, 9) -- Up/Down/Bounty votes
+    WHERE A.PostTypeId = 2
+      AND A.CreationDate >= (NOW() - INTERVAL '2 years')
+)
+SELECT
+    UE.UserId,
+    UE.DisplayName,
+    UE.Reputation,
+    UE.AccountAgeDays,
+    UE.EngagementScoreBase,
+    UE.TotalQuestions,
+    UE.TotalAnswers,
+    COALESCE(UE.TotalQuestionScore, 0) + COALESCE(UE.TotalAnswerScore, 0) AS CombinedPostScore,
+    QD.QuestionId,
+    QD.QuestionCreationDate,
+    QD.QuestionScore,
+    QD.ViewCount AS QuestionViewCount,
+    QD.AnswerCount AS QuestionAnswerCount,
+    QD.FavoriteCount AS QuestionFavoriteCount,
+    QD.Title AS QuestionTitle,
+    QD.Tags AS QuestionTags,
+    QD.TagCount,
+    QD.QuestionStatus,
+    QD.QuestionViewRank,
+    QD.AvgQuestionScoreByOwner,
+    QD.PreviousQuestionDate,
+    PH.TotalEdits AS QuestionEdits,
+    PH.LastEditDateHistory AS QuestionLastEditDate,
+    PH.UniqueEditors AS QuestionUniqueEditors,
+    PH.LastPostStatusChange AS QuestionLastStatusChange,
+    AD.AnswerId,
+    AD.AnswerCreationDate,
+    AD.AnswerScore,
+    AD.AnswerScoreRank,
+    AD.TotalBountyReceived,
+    AD.RecentAnswerComments,
+    (QD.QuestionScore * 0.6 + QD.ViewCount * 0.2 + QD.FavoriteCount * 0.15 + QD.AcceptedAnswerScore * 0.05) AS QuestionValueMetric,
+    COALESCE(AD.AnswerScore, 0) * (CASE WHEN QD.AcceptedAnswerId = AD.AnswerId THEN 1.5 ELSE 1.0 END) AS WeightedAnswerScore,
+    LOWER(LEFT(REPLACE(REPLACE(COALESCE(UE.DisplayName, 'unknown'), ' ', ''), '.', ''), 5) || '-' ||
+    SUBSTRING(MD5(COALESCE(QD.Title, 'no_title')), 1, 8) || '-' ||
+    TO_CHAR(COALESCE(QD.QuestionCreationDate, UE.UserCreationDate), 'YYYYMMDD') || '-' ||
+    TRIM(BOTH '<>' FROM COALESCE(SUBSTRING(QD.Tags, 2, LENGTH(QD.Tags) - 2), 'untagged'))) AS CompositeKeyIdentifier,
+    (SELECT COUNT(DISTINCT V.UserId) FROM Votes AS V WHERE V.PostId = QD.QuestionId AND V.VoteTypeId = 5) AS QuestionFavoriteUsersCount,
+    COALESCE(QD.LatestCommentText, 'No recent comment') AS LatestCommentContent,
+    (AD.AnswerUpVotes - AD.AnswerDownVotes) AS NetAnswerVotes,
+    (SELECT AVG(C.Score) FROM Comments AS C WHERE C.PostId = QD.QuestionId) AS AvgQuestionCommentScore,
+    (SELECT AVG(C.Score) FROM Comments AS C WHERE C.PostId = AD.AnswerId) AS AvgAnswerCommentScore
+FROM UserEngagement AS UE
+LEFT JOIN QuestionDetails AS QD ON UE.UserId = QD.OwnerUserId
+LEFT JOIN PostHistoryAggregates AS PH ON QD.QuestionId = PH.PostId
+LEFT JOIN AnswerDetails AS AD ON QD.QuestionId = AD.QuestionId AND (UE.UserId = AD.AnswerOwnerUserId OR QD.AcceptedAnswerId = AD.AnswerId)
+WHERE UE.EngagementScoreBase > 1000
+  AND (QD.QuestionId IS NOT NULL OR UE.TotalAnswers > 0)
+  AND (QD.QuestionTitle LIKE '%sql%' OR QD.QuestionBody LIKE '%database%' OR QD.Tags LIKE '%<performance>%' OR AD.AnswerBody LIKE '%optimization%')
+  AND QD.QuestionViewRank <= 5
+  AND AD.AnswerScoreRank = 1
+  AND (QD.QuestionStatus = 'Answered' OR QD.AcceptedAnswerId IS NULL)
+  AND (PH.TotalEdits > 1 OR PH.TotalEdits IS NULL)
+ORDER BY
+    UE.Reputation DESC,
+    QuestionValueMetric DESC NULLS LAST,
+    AD.WeightedAnswerScore DESC NULLS LAST,
+    NetAnswerVotes DESC NULLS LAST
+LIMIT 1000;

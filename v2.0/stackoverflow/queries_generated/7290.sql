@@ -1,0 +1,327 @@
+-- {"query": "7290.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2705} 
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) as rn,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as avg_score,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) as post_count,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+        LEAD(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as next_score
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserActivity AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as post_count,
+        COUNT(DISTINCT c.Id) as comment_count,
+        COUNT(DISTINCT b.Id) as badge_count,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) as question_count,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) as answer_count,
+        MAX(p.CreationDate) as latest_activity,
+        STRING_AGG(DISTINCT p.Tags, ', ') as all_tags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostStats AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.ParentId,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Question with Accepted Answer'
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NULL THEN 'Question without Accepted Answer'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as post_category,
+        COALESCE(p.AnswerCount, 0) + COALESCE(p.CommentCount, 0) + COALESCE(p.FavoriteCount, 0) as engagement_score,
+        CASE 
+            WHEN p.Score > 0 AND p.Score <= 10 THEN 'Low'
+            WHEN p.Score > 10 AND p.Score <= 50 THEN 'Medium'
+            WHEN p.Score > 50 THEN 'High'
+            ELSE 'None'
+        END as score_category,
+        LENGTH(p.Title) as title_length,
+        ARRAY_LENGTH(STRING_TO_ARRAY(p.Tags, '<'), 1) as tag_count,
+        EXTRACT(DAY FROM (p.LastActivityDate - p.CreationDate)) as days_active,
+        CASE 
+            WHEN p.LastActivityDate IS NOT NULL AND p.LastActivityDate > CURRENT_TIMESTAMP - INTERVAL '30 days' THEN 'Active'
+            WHEN p.LastActivityDate IS NOT NULL AND p.LastActivityDate > CURRENT_TIMESTAMP - INTERVAL '90 days' THEN 'Inactive'
+            ELSE 'Very Inactive'
+        END as activity_status
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+ComplexCalculations AS (
+    SELECT 
+        ps.Id,
+        ps.PostTypeId,
+        ps.OwnerUserId,
+        ps.Score,
+        ps.ViewCount,
+        ps.Title,
+        ps.Tags,
+        ps.AnswerCount,
+        ps.CommentCount,
+        ps.FavoriteCount,
+        ps.CreationDate,
+        ps.LastActivityDate,
+        ps.ParentId,
+        ps.post_category,
+        ps.engagement_score,
+        ps.score_category,
+        ps.title_length,
+        ps.tag_count,
+        ps.days_active,
+        ps.activity_status,
+        (ps.engagement_score * ps.score_category::INT) as weighted_engagement,
+        COALESCE(
+            (SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = ps.OwnerUserId AND p.PostTypeId = ps.PostTypeId),
+            0
+        ) as user_avg_score,
+        COALESCE(
+            (SELECT AVG(ps2.engagement_score) FROM PostStats ps2 WHERE ps2.OwnerUserId = ps.OwnerUserId),
+            0
+        ) as user_avg_engagement,
+        (ps.engagement_score - COALESCE((SELECT AVG(ps3.engagement_score) FROM PostStats ps3 WHERE ps3.OwnerUserId = ps.OwnerUserId), 0)) as engagement_diff,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = ps.Id AND v.VoteTypeId IN (2, 3)) as vote_count,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = ps.Id) as comment_count_real,
+        CASE 
+            WHEN ps.PostTypeId = 1 AND ps.AcceptedAnswerId IS NOT NULL THEN 
+                (SELECT Score FROM Posts WHERE Id = ps.AcceptedAnswerId)
+            ELSE 0
+        END as accepted_answer_score,
+        CASE 
+            WHEN ps.PostTypeId = 1 AND ps.AnswerCount > 0 THEN 
+                (SELECT AVG(Score) FROM Posts WHERE ParentId = ps.Id AND PostTypeId = 2)
+            ELSE 0
+        END as avg_answer_score
+    FROM PostStats ps
+),
+FinalAnalysis AS (
+    SELECT 
+        cp.Id,
+        cp.PostTypeId,
+        cp.OwnerUserId,
+        cp.Score,
+        cp.ViewCount,
+        cp.Title,
+        cp.Tags,
+        cp.AnswerCount,
+        cp.CommentCount,
+        cp.FavoriteCount,
+        cp.CreationDate,
+        cp.LastActivityDate,
+        cp.ParentId,
+        cp.post_category,
+        cp.engagement_score,
+        cp.score_category,
+        cp.title_length,
+        cp.tag_count,
+        cp.days_active,
+        cp.activity_status,
+        cp.weighted_engagement,
+        cp.user_avg_score,
+        cp.user_avg_engagement,
+        cp.engagement_diff,
+        cp.vote_count,
+        cp.comment_count_real,
+        cp.accepted_answer_score,
+        cp.avg_answer_score,
+        CASE 
+            WHEN cp.engagement_diff > 0 THEN 'Above User Average'
+            WHEN cp.engagement_diff < 0 THEN 'Below User Average'
+            ELSE 'At User Average'
+        END as engagement_performance,
+        CASE 
+            WHEN cp.score_category = 'High' AND cp.engagement_score > 100 THEN 'Highly Engaging'
+            WHEN cp.score_category = 'Medium' AND cp.engagement_score > 50 THEN 'Moderately Engaging'
+            WHEN cp.score_category = 'Low' AND cp.engagement_score > 20 THEN 'Low Engagement'
+            ELSE 'Minimal Engagement'
+        END as engagement_level,
+        ROW_NUMBER() OVER (ORDER BY cp.engagement_score DESC) as global_rank,
+        RANK() OVER (PARTITION BY cp.OwnerUserId ORDER BY cp.engagement_score DESC) as user_rank,
+        DENSE_RANK() OVER (ORDER BY cp.engagement_score DESC) as dense_global_rank
+    FROM ComplexCalculations cp
+)
+SELECT 
+    fa.Id,
+    fa.PostTypeId,
+    fa.OwnerUserId,
+    fa.Score,
+    fa.ViewCount,
+    fa.Title,
+    fa.Tags,
+    fa.AnswerCount,
+    fa.CommentCount,
+    fa.FavoriteCount,
+    fa.CreationDate,
+    fa.LastActivityDate,
+    fa.ParentId,
+    fa.post_category,
+    fa.engagement_score,
+    fa.score_category,
+    fa.title_length,
+    fa.tag_count,
+    fa.days_active,
+    fa.activity_status,
+    fa.weighted_engagement,
+    fa.user_avg_score,
+    fa.user_avg_engagement,
+    fa.engagement_diff,
+    fa.vote_count,
+    fa.comment_count_real,
+    fa.accepted_answer_score,
+    fa.avg_answer_score,
+    fa.engagement_performance,
+    fa.engagement_level,
+    fa.global_rank,
+    fa.user_rank,
+    fa.dense_global_rank,
+    CASE 
+        WHEN fa.engagement_score > (SELECT AVG(engagement_score) FROM FinalAnalysis) THEN 'Above Global Average'
+        WHEN fa.engagement_score < (SELECT AVG(engagement_score) FROM FinalAnalysis) THEN 'Below Global Average'
+        ELSE 'At Global Average'
+    END as global_performance,
+    (
+        SELECT COUNT(*) 
+        FROM FinalAnalysis fa2 
+        WHERE fa2.engagement_score > fa.engagement_score
+    ) as rank_position,
+    (
+        SELECT COUNT(*) 
+        FROM FinalAnalysis fa3 
+        WHERE fa3.OwnerUserId = fa.OwnerUserId
+    ) as user_post_count,
+    (
+        SELECT AVG(engagement_score) 
+        FROM FinalAnalysis fa4 
+        WHERE fa4.OwnerUserId = fa.OwnerUserId
+    ) as user_avg_engagement_score,
+    (
+        SELECT MAX(CreationDate) 
+        FROM Posts p 
+        WHERE p.OwnerUserId = fa.OwnerUserId
+    ) as last_post_date,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.OwnerUserId = fa.OwnerUserId
+    ) as total_posts,
+    (
+        SELECT COUNT(*) 
+        FROM Votes v 
+        JOIN Posts p ON v.PostId = p.Id 
+        WHERE p.OwnerUserId = fa.OwnerUserId
+    ) as total_votes_on_user_posts,
+    (
+        SELECT STRING_AGG(DISTINCT p.Tags, ', ') 
+        FROM Posts p 
+        WHERE p.OwnerUserId = fa.OwnerUserId
+    ) as user_all_tags,
+    (
+        SELECT COUNT(DISTINCT b.UserId) 
+        FROM Badges b 
+        WHERE b.UserId = fa.OwnerUserId
+    ) as user_badge_count,
+    (
+        SELECT COUNT(*) 
+        FROM Comments c 
+        WHERE c.UserId = fa.OwnerUserId
+    ) as user_comment_count,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.OwnerUserId = fa.OwnerUserId AND p.PostTypeId = 1
+    ) as user_question_count,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.OwnerUserId = fa.OwnerUserId AND p.PostTypeId = 2
+    ) as user_answer_count,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p1 
+        WHERE p1.OwnerUserId = fa.OwnerUserId AND p1.PostTypeId = 1 AND p1.AcceptedAnswerId IS NOT NULL
+    ) as user_question_with_accepted_answer,
+    (
+        SELECT AVG(Score) 
+        FROM Posts p 
+        WHERE p.OwnerUserId = fa.OwnerUserId AND p.PostTypeId = 1
+    ) as user_avg_question_score,
+    (
+        SELECT AVG(Score) 
+        FROM Posts p 
+        WHERE p.OwnerUserId = fa.OwnerUserId AND p.PostTypeId = 2
+    ) as user_avg_answer_score
+FROM FinalAnalysis fa
+INNER JOIN UserActivity ua ON fa.OwnerUserId = ua.UserId
+LEFT JOIN (
+    SELECT 
+        p.OwnerUserId,
+        COUNT(DISTINCT p.Id) as active_posts
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+    GROUP BY p.OwnerUserId
+) active ON fa.OwnerUserId = active.OwnerUserId
+LEFT JOIN (
+    SELECT 
+        ps.OwnerUserId,
+        AVG(ps.engagement_score) as avg_engagement
+    FROM PostStats ps
+    GROUP BY ps.OwnerUserId
+) avg_eng ON fa.OwnerUserId = avg_eng.OwnerUserId
+WHERE fa.engagement_score > 0
+    AND fa.engagement_score IS NOT NULL
+    AND fa.OwnerUserId IS NOT NULL
+    AND fa.Title IS NOT NULL
+    AND LENGTH(fa.Title) > 0
+    AND (
+        (fa.PostTypeId = 1 AND fa.AnswerCount IS NOT NULL)
+        OR (fa.PostTypeId = 2 AND fa.ParentId IS NOT NULL)
+        OR (fa.PostTypeId IN (1, 2))
+    )
+    AND (
+        fa.CreationDate >= '2010-01-01 00:00:00' 
+        OR fa.LastActivityDate >= '2010-01-01 00:00:00'
+    )
+    AND (
+        (
+            SELECT COUNT(*) 
+            FROM Posts p 
+            WHERE p.OwnerUserId = fa.OwnerUserId 
+            AND p.CreationDate >= '2010-01-01 00:00:00'
+        ) > 0
+    )
+ORDER BY fa.engagement_score DESC, fa.global_rank ASC
+LIMIT 5000;

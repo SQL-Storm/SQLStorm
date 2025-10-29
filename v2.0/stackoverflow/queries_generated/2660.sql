@@ -1,0 +1,148 @@
+-- {"query": "2660.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1475} 
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        p.CreationDate as TagExcerptCreation,
+        u.DisplayName as TagExcerptOwner
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Id = t.ExcerptPostId
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE t.IsModeratorOnly = 0 AND t.IsRequired = 0
+
+    UNION ALL
+
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        p2.CreationDate,
+        u2.DisplayName
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy rth ON t2.Id = rth.Id
+    LEFT JOIN Posts p2 ON p2.Id = t2.ExcerptPostId
+    LEFT JOIN Users u2 ON u2.Id = p2.OwnerUserId
+    WHERE t2.IsModeratorOnly = 0 AND t2.IsRequired = 0
+),
+UserScoreWindow AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        SUM(COALESCE(p.Score, 0)) OVER (PARTITION BY u.Id ORDER BY p.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS AccumulatedScore,
+        COUNT(p.Id) OVER (PARTITION BY u.Id) AS PostCount,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.Id) AS RankByReputation
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    WHERE u.Reputation > 1000
+),
+QuestionAnswerLink AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title AS QuestionTitle,
+        q.CreationDate AS QuestionCreationDate,
+        q.Score AS QuestionScore,
+        a.Id AS AnswerId,
+        a.Score AS AnswerScore,
+        a.OwnerUserId AS AnswerOwner,
+        a.CreationDate AS AnswerCreationDate,
+        pl.LinkTypeId,
+        lt.Name AS LinkTypeName
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    LEFT JOIN PostLinks pl ON pl.PostId = q.Id AND pl.RelatedPostId = a.Id
+    LEFT JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    WHERE q.PostTypeId = 1
+    AND q.ClosedDate IS NULL
+),
+VotesPerPost AS (
+    SELECT
+        v.PostId,
+        SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotesCount,
+        SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotesCount,
+        SUM(CASE WHEN vt.Name = 'Favorite' THEN 1 ELSE 0 END) AS FavoriteCount,
+        COUNT(v.Id) AS TotalVotes
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY v.PostId
+),
+TopActiveUsers AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        COUNT(DISTINCT ph.PostId) AS EditsCount,
+        MAX(ph.CreationDate) AS LastEditDate,
+        COALESCE(SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END), 0) AS GoldBadges,
+        COALESCE(SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END), 0) AS SilverBadges,
+        COALESCE(SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END), 0) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id AND ph.PostHistoryTypeId IN (4,5,6) -- edits (title, body and tags)
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Reputation > 10000
+    GROUP BY u.Id, u.DisplayName
+    HAVING COUNT(DISTINCT ph.PostId) > 10
+),
+UserAnswerRatio AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        QuestionCount,
+        AnswerCount,
+        CASE WHEN QuestionCount = 0 THEN NULL
+             ELSE ROUND(CAST(AnswerCount AS numeric) / QuestionCount, 3)
+        END AS AnswerToQuestionRatio
+    FROM (
+        SELECT
+            u.Id,
+            u.DisplayName,
+            COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+            COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount
+        FROM Users u
+        LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+        GROUP BY u.Id, u.DisplayName
+    ) u
+)
+SELECT
+    q.QuestionId,
+    q.QuestionTitle,
+    q.QuestionCreationDate,
+    q.QuestionScore,
+    q.AnswerId,
+    q.AnswerScore,
+    COALESCE(u.DisplayName, 'Unknown') AS AnswerOwnerName,
+    v.UpVotesCount,
+    v.DownVotesCount,
+    v.FavoriteCount,
+    us.AccumulatedScore,
+    us.PostCount,
+    us.RankByReputation,
+    tau.EditsCount,
+    tau.GoldBadges,
+    tau.SilverBadges,
+    tau.BronzeBadges,
+    uar.AnswerToQuestionRatio,
+    CONCAT(
+        COALESCE(tth.TagName, 'N/A'), ' (#', COALESCE(CAST(tth.Count AS varchar), '0'), ')',
+        ' Excerpt created on: ', COALESCE(TO_CHAR(tth.TagExcerptCreation, 'YYYY-MM-DD'), 'N/A'),
+        ' by ', COALESCE(tth.TagExcerptOwner, 'N/A')
+    ) AS TagInfo
+FROM QuestionAnswerLink q
+LEFT JOIN Users u ON u.Id = q.AnswerOwner
+LEFT JOIN VotesPerPost v ON v.PostId = COALESCE(q.AnswerId, q.QuestionId)
+LEFT JOIN UserScoreWindow us ON us.Id = u.Id
+LEFT JOIN TopActiveUsers tau ON tau.Id = u.Id
+LEFT JOIN UserAnswerRatio uar ON uar.UserId = u.Id
+LEFT JOIN LATERAL (
+    SELECT tt.TagName, tt.Count, tt.TagExcerptCreation, tt.TagExcerptOwner
+    FROM RecursiveTagHierarchy tt
+    WHERE q.QuestionTitle ILIKE '%' || tt.TagName || '%'
+    ORDER BY tt.Count DESC NULLS LAST
+    LIMIT 1
+) tth ON TRUE
+WHERE q.LinkTypeId IS NULL OR q.LinkTypeId <> 3  -- exclude duplicate link types
+AND q.QuestionScore > 5
+AND (v.UpVotesCount IS NULL OR v.UpVotesCount > v.DownVotesCount)
+AND (tau.EditsCount IS NULL OR tau.EditsCount >= 0)
+ORDER BY q.QuestionScore DESC, v.UpVotesCount DESC NULLS LAST
+LIMIT 50;

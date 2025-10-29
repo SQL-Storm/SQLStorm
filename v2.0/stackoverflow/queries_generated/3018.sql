@@ -1,0 +1,93 @@
+-- {"query": "3018.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1931} 
+
+WITH latest_posts AS (
+    SELECT 
+        p.OwnerUserId,
+        p.Id AS PostId,
+        p.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+),
+user_badge_summary AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS gold_cnt,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS silver_cnt,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS bronze_cnt,
+        STRING_AGG(DISTINCT b.Name, ', ') AS badge_names
+    FROM Badges b
+    GROUP BY b.UserId
+),
+user_vote_summary AS (
+    SELECT 
+        v.PostId,
+        SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS up_votes,
+        SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS down_votes
+    FROM Votes v
+    JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    GROUP BY v.PostId
+),
+question_tag_stats AS (
+    SELECT 
+        p.OwnerUserId,
+        UNNEST(string_to_array(trim(both '<>' FROM p.Tags), '><')) AS tag,
+        COUNT(*) AS question_cnt
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+    GROUP BY p.OwnerUserId, tag
+),
+top_tags_per_user AS (
+    SELECT 
+        OwnerUserId,
+        STRING_AGG(tag || ':' || question_cnt, ', ') 
+            OVER (PARTITION BY OwnerUserId 
+                  ORDER BY question_cnt DESC
+                  ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS tag_summary
+    FROM (
+        SELECT *,
+               ROW_NUMBER() OVER (PARTITION BY OwnerUserId ORDER BY question_cnt DESC) AS rn
+        FROM question_tag_stats
+    ) qts
+    WHERE qts.rn <= 5
+)
+
+SELECT 
+    u.Id                                   AS UserId,
+    u.DisplayName,
+    COALESCE(ubs.gold_cnt, 0)               AS GoldBadges,
+    COALESCE(ubs.silver_cnt, 0)             AS SilverBadges,
+    COALESCE(ubs.bronze_cnt, 0)             AS BronzeBadges,
+    COALESCE(ubs.badge_names, '')           AS BadgeList,
+    lp.PostId                               AS LatestPostId,
+    lp.CreationDate                         AS LatestPostDate,
+    COALESCE(vs.up_votes, 0)                AS LatestPostUpVotes,
+    COALESCE(vs.down_votes, 0)              AS LatestPostDownVotes,
+    COALESCE(tt.tag_summary, '')            AS TopTags,
+    RANK() OVER (ORDER BY COALESCE(ubs.gold_cnt,0) DESC,
+                            COALESCE(ubs.silver_cnt,0) DESC) AS ReputationRank
+FROM Users u
+LEFT JOIN user_badge_summary ubs ON u.Id = ubs.UserId
+LEFT JOIN latest_posts lp       ON u.Id = lp.OwnerUserId AND lp.rn = 1
+LEFT JOIN user_vote_summary vs ON lp.PostId = vs.PostId
+LEFT JOIN top_tags_per_user tt ON u.Id = tt.OwnerUserId
+WHERE u.Reputation > 10000
+
+UNION ALL
+
+SELECT 
+    NULL                                    AS UserId,
+    'Aggregate'                             AS DisplayName,
+    SUM(COALESCE(ubs.gold_cnt,0))            AS GoldBadges,
+    SUM(COALESCE(ubs.silver_cnt,0))          AS SilverBadges,
+    SUM(COALESCE(ubs.bronze_cnt,0))          AS BronzeBadges,
+    NULL                                     AS BadgeList,
+    NULL                                     AS LatestPostId,
+    NULL                                     AS LatestPostDate,
+    NULL                                     AS LatestPostUpVotes,
+    NULL                                     AS LatestPostDownVotes,
+    NULL                                     AS TopTags,
+    NULL                                     AS ReputationRank
+FROM Users u
+LEFT JOIN user_badge_summary ubs ON u.Id = ubs.UserId
+WHERE u.Reputation > 10000;

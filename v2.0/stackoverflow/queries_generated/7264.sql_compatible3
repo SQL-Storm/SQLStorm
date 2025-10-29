@@ -1,0 +1,259 @@
+WITH UserPostStats AS (
+  SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(p.Id) AS TotalPosts,
+    COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+    COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswerCount,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS TotalQuestionScore,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS TotalAnswerScore,
+    AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END) AS AvgQuestionScore,
+    AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE NULL END) AS AvgAnswerScore,
+    MAX(p.CreationDate) AS LastPostDate
+  FROM Users u
+  LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+  WHERE u.Id IS NOT NULL
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopTags AS (
+  SELECT 
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId,
+    t.WikiPostId,
+    CASE 
+      WHEN t.Count > 1000 THEN 'High'
+      WHEN t.Count > 100 THEN 'Medium'
+      ELSE 'Low'
+    END AS TagLevel,
+    ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS Rank
+  FROM Tags t
+  WHERE t.TagName IS NOT NULL
+),
+PostActivity AS (
+  SELECT 
+    p.Id AS PostId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.PostTypeId,
+    p.Tags,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    CAST(
+      EXTRACT(EPOCH FROM (COALESCE(p.ClosedDate, p.LastActivityDate, TIMESTAMP '2024-10-01 12:34:56') - p.CreationDate))
+      / 86400 AS INTEGER
+    ) AS AgeInDays,
+    CASE 
+      WHEN p.PostTypeId = 1 AND p.Score > 10 THEN 'HighlyVotedQuestion'
+      WHEN p.PostTypeId = 1 AND p.Score > 0 THEN 'RegularQuestion'
+      WHEN p.PostTypeId = 2 AND p.Score > 5 THEN 'HighlyVotedAnswer'
+      WHEN p.PostTypeId = 2 AND p.Score > 0 THEN 'RegularAnswer'
+      ELSE 'Other'
+    END AS PostCategory,
+    COALESCE(p.LastActivityDate, p.CreationDate) AS EffectiveActivityDate
+  FROM Posts p
+  WHERE p.Id IS NOT NULL AND p.CreationDate IS NOT NULL
+),
+MainReport AS (
+  SELECT 
+    'Performance Benchmark Report' AS ReportTitle,
+    COUNT(*) AS TotalRecords,
+    COUNT(DISTINCT ups.UserId) AS ActiveUsers,
+    COUNT(DISTINCT pa.PostId) AS TotalPosts,
+    COUNT(CASE WHEN pa.PostCategory LIKE '%Question%' THEN 1 END) AS TotalQuestions,
+    COUNT(CASE WHEN pa.PostCategory LIKE '%Answer%' THEN 1 END) AS TotalAnswers,
+    (SELECT COUNT(*) FROM Badges) AS TotalBadges,
+    (SELECT COUNT(*) FROM Comments) AS TotalComments,
+    (SELECT COUNT(*) FROM PostLinks) AS TotalLinks,
+    (SELECT AVG(Score) FROM Posts) AS AvgPostScore,
+    (SELECT AVG(Reputation) FROM Users) AS AvgUserReputation,
+    SUM(CASE WHEN pa.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+    SUM(CASE WHEN pa.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+    SUM(pa.ViewCount) AS TotalViews,
+    SUM(pa.Score) AS TotalScore,
+    MAX(pa.CreationDate) AS LatestPostDate,
+    MIN(pa.CreationDate) AS EarliestPostDate,
+    AVG(pa.AgeInDays) AS AvgAgeInDays,
+    STRING_AGG(CASE WHEN pt.Rank <= 10 THEN pt.TagName ELSE NULL END, ', ' ORDER BY pt.Rank) AS TopTags,
+    COUNT(*) OVER () AS TotalRows,
+    ROW_NUMBER() OVER (ORDER BY ups.Reputation DESC) AS ReputationRank,
+    CASE 
+      WHEN ups.Reputation > 100000 THEN 'Elite'
+      WHEN ups.Reputation > 50000 THEN 'Veteran'
+      WHEN ups.Reputation > 10000 THEN 'Experienced'
+      ELSE 'Beginner'
+    END AS UserTier,
+    ups.UserId,
+    ups.DisplayName,
+    ups.TotalPosts AS UpsTotalPosts,
+    ups.LastPostDate AS UpsLastPostDate,
+    pa.PostId AS PaPostId,
+    pa.Title AS PaTitle,
+    pa.EffectiveActivityDate AS PaEffectiveActivityDate,
+    pt.TagName AS PtTagName,
+    pt.Rank AS PtRank,
+    pt.TagLevel AS PtTagLevel
+  FROM UserPostStats ups
+  FULL OUTER JOIN PostActivity pa ON ups.UserId = pa.OwnerUserId
+  LEFT JOIN TopTags pt ON (pt.TagLevel = 'High' OR pt.Rank <= 5)
+  WHERE (ups.UserId IS NOT NULL OR pa.PostId IS NOT NULL)
+  GROUP BY 
+    ups.UserId, ups.DisplayName, ups.Reputation, ups.TotalPosts, ups.QuestionCount, 
+    ups.AnswerCount, ups.TotalQuestionScore, ups.TotalAnswerScore, ups.AvgQuestionScore, 
+    ups.AvgAnswerScore, ups.LastPostDate, pa.PostId, pa.Title, pa.Score, pa.ViewCount, 
+    pa.CreationDate, pa.OwnerUserId, pa.PostTypeId, pa.Tags, pa.AnswerCount, pa.CommentCount,
+    pa.FavoriteCount, pa.AgeInDays, pa.PostCategory, pa.EffectiveActivityDate, pt.TagName, pt.Count, pt.ExcerptPostId, pt.WikiPostId, pt.TagLevel, pt.Rank, ups.TotalPosts, ups.LastPostDate
+  HAVING 
+    COUNT(*) > 0 
+    AND (COUNT(ups.UserId) > 0 OR COUNT(pa.PostId) > 0)
+    AND (MAX(pa.CreationDate) > TIMESTAMP '2020-01-01' OR MAX(ups.LastPostDate) > TIMESTAMP '2020-01-01')
+    AND (COUNT(*) = (SELECT COUNT(*) FROM Users) OR COUNT(*) = (SELECT COUNT(*) FROM Posts))
+),
+SummaryReport AS (
+  SELECT 
+    'Statistical Summary' AS ReportTitle,
+    CAST(NULL AS BIGINT) AS TotalRecords,
+    CAST(NULL AS BIGINT) AS ActiveUsers,
+    CAST(NULL AS BIGINT) AS TotalPosts,
+    CAST(NULL AS BIGINT) AS TotalQuestions,
+    CAST(NULL AS BIGINT) AS TotalAnswers,
+    CAST(NULL AS BIGINT) AS TotalBadges,
+    CAST(NULL AS BIGINT) AS TotalComments,
+    CAST(NULL AS BIGINT) AS TotalLinks,
+    (SELECT AVG(Score) FROM Votes) AS AvgPostScore,
+    (SELECT AVG(Reputation) FROM Users) AS AvgUserReputation,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+    SUM(p.ViewCount) AS TotalViews,
+    SUM(p.Score) AS TotalScore,
+    MAX(p.CreationDate) AS LatestPostDate,
+    MIN(p.CreationDate) AS EarliestPostDate,
+    AVG(
+      CAST(
+        EXTRACT(EPOCH FROM (COALESCE(p.ClosedDate, p.LastActivityDate, TIMESTAMP '2024-10-01 12:34:56') - p.CreationDate))
+        / 86400 AS INTEGER
+      )::DOUBLE PRECISION
+    ) AS AvgAgeInDays,
+    STRING_AGG(p.Tags, ', ' ORDER BY p.Id) AS TopTags,
+    COUNT(*) OVER () AS TotalRows,
+    CAST(NULL AS BIGINT) AS ReputationRank,
+    CASE 
+      WHEN AVG(u.Reputation) > 100000 THEN 'Elite'
+      ELSE 'Standard'
+    END AS UserTier,
+    u.Reputation AS GroupReputation
+  FROM Posts p
+  JOIN Users u ON u.Id = p.OwnerUserId
+  WHERE 
+    p.Id IS NOT NULL
+    AND p.CreationDate IS NOT NULL
+    AND p.Score IS NOT NULL
+    AND (p.PostTypeId IN (1, 2) OR p.PostTypeId IS NULL)
+    AND u.Reputation IS NOT NULL 
+    AND u.Reputation > 0
+    AND NOT EXISTS (
+      SELECT 1 FROM Posts p2 
+      WHERE p2.Id = p.Id 
+      AND p2.Title IS NULL
+    )
+    AND COALESCE(p.ParentId, 0) > 0
+    AND LENGTH(COALESCE(p.Title, '')) > 0
+    AND (
+      p.Score > 0 
+      OR EXISTS (
+        SELECT 1 FROM Votes v 
+        WHERE v.PostId = p.Id 
+        AND v.VoteTypeId IN (1, 2, 3)
+      )
+    )
+    AND COALESCE(p.AnswerCount, 0) >= 0
+    AND COALESCE(p.CommentCount, 0) >= 0
+    AND COALESCE(p.FavoriteCount, 0) >= 0
+    AND CAST(
+        EXTRACT(EPOCH FROM (COALESCE(p.ClosedDate, p.LastActivityDate, TIMESTAMP '2024-10-01 12:34:56') - p.CreationDate))
+        / 86400 AS INTEGER
+    ) >= -365
+  GROUP BY u.Reputation
+)
+SELECT 
+  ReportTitle,
+  TotalRecords,
+  ActiveUsers,
+  TotalPosts,
+  TotalQuestions,
+  TotalAnswers,
+  TotalBadges,
+  TotalComments,
+  TotalLinks,
+  AvgPostScore,
+  AvgUserReputation,
+  QuestionCount,
+  AnswerCount,
+  TotalViews,
+  TotalScore,
+  LatestPostDate,
+  EarliestPostDate,
+  AvgAgeInDays,
+  TopTags,
+  TotalRows,
+  ReputationRank,
+  UserTier,
+  -- columns that exist only in MainReport: provide NULLs for SummaryReport rows to make column counts match
+  UserId,
+  DisplayName,
+  UpsTotalPosts,
+  UpsLastPostDate,
+  PaPostId,
+  PaTitle,
+  PaEffectiveActivityDate,
+  PtTagName,
+  PtRank,
+  PtTagLevel
+FROM MainReport
+
+UNION ALL
+
+SELECT 
+  ReportTitle,
+  TotalRecords,
+  ActiveUsers,
+  TotalPosts,
+  TotalQuestions,
+  TotalAnswers,
+  TotalBadges,
+  TotalComments,
+  TotalLinks,
+  AvgPostScore,
+  AvgUserReputation,
+  QuestionCount,
+  AnswerCount,
+  TotalViews,
+  TotalScore,
+  LatestPostDate,
+  EarliestPostDate,
+  AvgAgeInDays,
+  TopTags,
+  TotalRows,
+  ReputationRank,
+  UserTier,
+  NULL AS UserId,
+  NULL AS DisplayName,
+  NULL AS UpsTotalPosts,
+  NULL AS UpsLastPostDate,
+  NULL AS PaPostId,
+  NULL AS PaTitle,
+  NULL AS PaEffectiveActivityDate,
+  NULL AS PtTagName,
+  NULL AS PtRank,
+  NULL AS PtTagLevel
+FROM SummaryReport
+
+ORDER BY 
+  CASE WHEN ReportTitle = 'Performance Benchmark Report' THEN 1 ELSE 2 END,
+  UpsTotalPosts DESC NULLS LAST,
+  AvgUserReputation DESC NULLS LAST;

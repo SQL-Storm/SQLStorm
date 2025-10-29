@@ -1,0 +1,245 @@
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Views AS UserViews,
+        U.UpVotes AS UserUpVotes,
+        U.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestionsOwned,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswersOwned,
+        SUM(CASE WHEN P.PostTypeId IN (1, 2) THEN P.Score ELSE 0 END) AS TotalPostScore,
+        AVG(CASE WHEN P.PostTypeId IN (1, 2) THEN P.Score ELSE NULL END) AS AvgPostScore,
+        MAX(P.LastActivityDate) AS LastPostActivity,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        SUM(C.Score) AS TotalCommentScore,
+        MAX(C.CreationDate) AS LastCommentActivity,
+        COALESCE(MAX(P.LastActivityDate), MAX(C.CreationDate), U.LastAccessDate) AS OverallLastActivity
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Views, U.UpVotes, U.DownVotes
+),
+PostEditActivity AS (
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.ViewCount,
+        P.Score AS PostScore,
+        P.AcceptedAnswerId,
+        P.PostTypeId,
+        COUNT(DISTINCT PH_Edit.Id) AS EditCount,
+        COUNT(DISTINCT CASE WHEN PH_Edit.PostHistoryTypeId IN (7, 8, 9) THEN PH_Edit.Id END) AS RollbackCount,
+        COUNT(DISTINCT CASE WHEN PH_Edit.PostHistoryTypeId = 10 THEN PH_Edit.Id END) AS CloseCount,
+        COUNT(DISTINCT CASE WHEN PH_Edit.PostHistoryTypeId = 11 THEN PH_Edit.Id END) AS ReopenCount,
+        MAX(PH_Edit.CreationDate) AS LastEditDate,
+        NULLIF(COUNT(DISTINCT CASE WHEN PH_Edit.PostHistoryTypeId IN (4, 5, 6) THEN PH_Edit.Id END), 0) AS ActualEditCount,
+        (
+            SELECT MAX(PH_Inner.CreationDate)
+            FROM PostHistory PH_Inner
+            WHERE PH_Inner.PostId = P.Id
+              AND PH_Inner.PostHistoryTypeId IN (1, 2, 3)
+              AND PH_Inner.CreationDate < P.CreationDate + INTERVAL '1 hour'
+        ) AS InitialHistoryTimestamp
+    FROM Posts AS P
+    LEFT JOIN PostHistory AS PH_Edit ON P.Id = PH_Edit.PostId
+    WHERE P.PostTypeId IN (1, 2)
+    GROUP BY P.Id, P.OwnerUserId, P.CreationDate, P.ViewCount, P.Score, P.AcceptedAnswerId, P.PostTypeId
+),
+PostTagsExpanded AS (
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        P.Score,
+        P.ViewCount,
+        TRIM(UNNEST(string_to_array(SUBSTRING(P.Tags FROM 2 FOR GREATEST(LENGTH(P.Tags) - 2, 0)), '><'))) AS TagName
+    FROM Posts AS P
+    WHERE P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2 AND P.PostTypeId = 1
+),
+TopTagsAndUsers AS (
+    SELECT
+        PTE.TagName,
+        T.Id AS TagId,
+        SUM(PTE.ViewCount) AS TotalTagViewCount,
+        COUNT(PTE.PostId) AS TotalPostsWithTag,
+        AVG(PTE.Score) AS AvgTagPostScore,
+        ROW_NUMBER() OVER (ORDER BY SUM(PTE.ViewCount) DESC, COUNT(PTE.PostId) DESC) AS TagRank
+    FROM PostTagsExpanded AS PTE
+    JOIN Tags AS T ON PTE.TagName = T.TagName
+    GROUP BY PTE.TagName, T.Id
+    HAVING COUNT(PTE.PostId) > 50
+),
+DuplicateLinkAnalysis AS (
+    SELECT
+        PL1.PostId AS OriginalPostId,
+        PL2.RelatedPostId AS UltimateDuplicateId,
+        COUNT(DISTINCT PL2.Id) AS DuplicateChainLength
+    FROM PostLinks AS PL1
+    JOIN PostLinks AS PL2 ON PL1.RelatedPostId = PL2.PostId
+    WHERE PL1.LinkTypeId = 3
+      AND PL2.LinkTypeId = 3
+      AND PL1.PostId != PL2.RelatedPostId
+    GROUP BY PL1.PostId, PL2.RelatedPostId
+    HAVING COUNT(DISTINCT PL2.Id) > 1
+),
+RankedAnswers AS (
+    SELECT
+        A.Id AS AnswerId,
+        A.ParentId AS QuestionId,
+        A.OwnerUserId AS AnswererUserId,
+        A.Score AS AnswerScore,
+        A.CreationDate AS AnswerCreationDate,
+        ROW_NUMBER() OVER (PARTITION BY A.ParentId ORDER BY A.Score DESC, A.CreationDate ASC) AS AnswerRank
+    FROM Posts AS A
+    WHERE A.PostTypeId = 2
+),
+UserBadgeActivity AS (
+    SELECT
+        B.UserId,
+        COUNT(B.Id) AS TotalBadges,
+        COUNT(CASE WHEN B.Class = 1 THEN B.Id END) AS GoldBadges,
+        COUNT(CASE WHEN B.Class = 2 THEN B.Id END) AS SilverBadges,
+        COUNT(CASE WHEN B.Date > (CAST('2024-10-01' AS DATE) - INTERVAL '1 year') THEN B.Id END) AS RecentBadges,
+        NTILE(10) OVER (ORDER BY COUNT(B.Id) DESC) AS BadgeCountDecile
+    FROM Badges AS B
+    GROUP BY B.UserId
+),
+AdvancedPostMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.CreationDate,
+        P.ClosedDate,
+        COALESCE(P.ContentLicense, 'Unknown_License') AS EffectiveLicense,
+        SUM(COALESCE(C.Score, 0)) AS TotalCommentScoresOnPost,
+        AVG(EXTRACT(EPOCH FROM (C.CreationDate - P.CreationDate))) AS AvgCommentTimeSincePost,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (10, 101, 102, 103, 104, 105) THEN PH.CreationDate ELSE NULL END) AS LastClosureEvent,
+        MAX(CASE WHEN PH.Comment IS NOT NULL AND PH.Comment LIKE '%off-topic%' THEN 1 ELSE 0 END) AS HadOffTopicCloseReason
+    FROM Posts AS P
+    LEFT JOIN Comments AS C ON P.Id = C.PostId
+    LEFT JOIN PostHistory AS PH ON P.Id = PH.PostId AND PH.PostHistoryTypeId IN (10, 101, 102, 103, 104, 105, 11)
+    GROUP BY P.Id, P.OwnerUserId, P.Score, P.ViewCount, P.AnswerCount, P.CommentCount, P.FavoriteCount, P.CreationDate, P.ClosedDate, P.ContentLicense
+),
+FirstMain AS (
+    SELECT
+        UE.UserId,
+        UE.DisplayName,
+        UE.Reputation,
+        UE.TotalPostsOwned,
+        UE.TotalQuestionsOwned,
+        UE.TotalAnswersOwned,
+        UE.AvgPostScore,
+        UE.OverallLastActivity,
+        PA.Id AS HighestScoringAnswerId,
+        PA.Score AS HighestScoringAnswerScore,
+        RA.AnswerRank,
+        TS.TagName AS MostFrequentTag,
+        TS.TotalTagViewCount AS MostFrequentTagViews,
+        UB.GoldBadges,
+        UB.RecentBadges,
+        UB.BadgeCountDecile,
+        APM.TotalCommentScoresOnPost AS TopAnswerCommentScore,
+        APM.AvgCommentTimeSincePost AS TopAnswerAvgCommentTime,
+        APM.HadOffTopicCloseReason AS HadOffTopicFlagOnTopAnswer,
+        SUM(PEA.EditCount) OVER (PARTITION BY UE.UserId) AS UserTotalEdits,
+        AVG(PEA.PostScore) OVER (PARTITION BY UE.UserId) AS UserAvgPostScoreOverall,
+        RANK() OVER (ORDER BY UE.Reputation DESC, UE.TotalPostScore DESC) AS OverallUserRank,
+        CASE
+            WHEN UE.Reputation > 50000 AND UE.AvgPostScore > 10 THEN 'Elite Contributor'
+            WHEN UB.GoldBadges > 2 OR UB.RecentBadges > 5 THEN 'Recognized Expert'
+            WHEN UE.TotalAnswersOwned > 50 AND UE.TotalPostScore > 500 THEN 'Prolific Answerer'
+            ELSE 'Active Participant'
+        END AS UserCategory,
+        EXISTS (
+            SELECT 1
+            FROM DuplicateLinkAnalysis DLA
+            WHERE DLA.OriginalPostId = PEA.PostId AND PEA.OwnerUserId = UE.UserId
+        ) AS HasDuplicateSourcePost,
+        REPLACE(TRIM(SUBSTRING(UE.DisplayName FROM 1 FOR 10)), ' ', '_') || '_' || UPPER(SUBSTRING(COALESCE(UE."Location", 'Unknown') FROM 1 FOR 3)) AS UserSignature
+    FROM UserEngagement AS UE
+    LEFT JOIN PostEditActivity AS PEA ON UE.UserId = PEA.OwnerUserId
+    LEFT JOIN RankedAnswers AS RA ON UE.UserId = RA.AnswererUserId AND RA.AnswerRank = 1
+    LEFT JOIN Posts AS PA ON RA.AnswerId = PA.Id
+    LEFT JOIN (
+        SELECT
+            PTE.OwnerUserId AS UserId,
+            PTE.TagName,
+            TTU.TotalTagViewCount,
+            ROW_NUMBER() OVER (PARTITION BY PTE.OwnerUserId ORDER BY COUNT(PTE.PostId) DESC, TTU.TotalTagViewCount DESC) AS Rn
+        FROM PostTagsExpanded AS PTE
+        JOIN TopTagsAndUsers AS TTU ON PTE.TagName = TTU.TagName
+        GROUP BY PTE.OwnerUserId, PTE.TagName, TTU.TotalTagViewCount
+    ) AS TS ON UE.UserId = TS.UserId AND TS.Rn = 1
+    LEFT JOIN UserBadgeActivity AS UB ON UE.UserId = UB.UserId
+    LEFT JOIN AdvancedPostMetrics AS APM ON PA.Id = APM.PostId
+    WHERE UE.TotalPostsOwned > 5
+      AND UE.Reputation > 1000
+      AND (UE.OverallLastActivity >= (CAST('2024-10-01' AS DATE) - INTERVAL '6 months') OR UE.TotalQuestionsOwned > 10)
+      AND (PEA.ActualEditCount IS NULL OR PEA.ActualEditCount > 0)
+      AND (PA.Score > 5 OR PA.AcceptedAnswerId IS NOT NULL)
+      AND (UPPER(UE.DisplayName) NOT LIKE '%BOT%' OR UE.DisplayName IS NULL)
+      AND (UE.UserCreationDate < (CAST('2024-10-01' AS DATE) - INTERVAL '1 year') OR UB.GoldBadges > 0)
+),
+SecondMain AS (
+    SELECT
+        CAST(NULL AS BIGINT) AS UserId,
+        'COMMUNITY_POST_ANALYSIS' AS DisplayName,
+        P.Score AS Reputation,
+        P.AnswerCount AS TotalPostsOwned,
+        P.ViewCount AS TotalQuestionsOwned,
+        PH.EditCount AS TotalAnswersOwned,
+        PH.RollbackCount AS AvgPostScore,
+        P.LastActivityDate AS OverallLastActivity,
+        P.Id AS HighestScoringAnswerId,
+        P.Score AS HighestScoringAnswerScore,
+        CAST(NULL AS INTEGER) AS AnswerRank,
+        (SELECT PTE_sub.TagName FROM PostTagsExpanded PTE_sub WHERE PTE_sub.PostId = P.Id LIMIT 1) AS MostFrequentTag,
+        TTU_union.TotalTagViewCount AS MostFrequentTagViews,
+        CAST(NULL AS INTEGER) AS GoldBadges,
+        CAST(NULL AS INTEGER) AS RecentBadges,
+        CAST(NULL AS INTEGER) AS BadgeCountDecile,
+        APM.TotalCommentScoresOnPost AS TopAnswerCommentScore,
+        APM.AvgCommentTimeSincePost AS TopAnswerAvgCommentTime,
+        APM.HadOffTopicCloseReason AS HadOffTopicFlagOnTopAnswer,
+        PH.EditCount AS UserTotalEdits,
+        PH.CloseCount AS UserAvgPostScoreOverall,
+        RANK() OVER (ORDER BY P.Score DESC, P.ViewCount DESC) AS OverallUserRank,
+        'High-Impact Post' AS UserCategory,
+        EXISTS (SELECT 1 FROM DuplicateLinkAnalysis DLA WHERE DLA.OriginalPostId = P.Id) AS HasDuplicateSourcePost,
+        REPLACE(TRIM(SUBSTRING(P.Title FROM 1 FOR 15)), ' ', '_') || '_' || UPPER(SUBSTRING(COALESCE(P.ContentLicense, 'NONE') FROM 1 FOR 3)) AS UserSignature
+    FROM Posts AS P
+    INNER JOIN PostEditActivity AS PH ON P.Id = PH.PostId
+    LEFT JOIN AdvancedPostMetrics AS APM ON P.Id = APM.PostId
+    LEFT JOIN (SELECT TagName, TotalTagViewCount FROM TopTagsAndUsers WHERE TagRank <= 10) AS TTU_union ON EXISTS (
+        SELECT 1 FROM PostTagsExpanded PTE_union WHERE PTE_union.PostId = P.Id AND PTE_union.TagName = TTU_union.TagName
+    )
+    WHERE P.PostTypeId = 1
+      AND P.Score > 50
+      AND P.ViewCount > 1000
+      AND PH.EditCount > 5
+      AND (PH.CloseCount > 0 OR PH.RollbackCount > 0)
+      AND P.CreationDate > (CAST('2024-10-01' AS DATE) - INTERVAL '2 years')
+      AND (P.Body LIKE '%performance%' OR P.Title LIKE '%benchmark%')
+)
+SELECT *
+FROM (
+    SELECT * FROM FirstMain
+    ORDER BY OverallUserRank ASC, OverallLastActivity DESC
+    LIMIT 500
+) AS F
+UNION ALL
+SELECT *
+FROM (
+    SELECT * FROM SecondMain
+    ORDER BY OverallUserRank ASC
+    LIMIT 250
+) AS S;

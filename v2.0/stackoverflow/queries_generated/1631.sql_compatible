@@ -1,0 +1,204 @@
+WITH UserEngagementSummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Views AS TotalProfileViews,
+        U.UpVotes AS TotalUpVotesGiven,
+        U.DownVotes AS TotalDownVotesGiven,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsAsked,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersPosted,
+        SUM(CASE WHEN P.PostTypeId = 1 AND P.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS QuestionsWithAcceptedAnswer,
+        SUM(CASE WHEN P.PostTypeId = 2 AND P.Id = PARENT_POST.AcceptedAnswerId THEN 1 ELSE 0 END) AS AcceptedAnswersCount,
+        MAX(P.CreationDate) AS LatestPostCreationDate,
+        MIN(P.CreationDate) AS EarliestPostCreationDate,
+        COUNT(DISTINCT B.Id) AS TotalBadgesEarned,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Posts PARENT_POST ON P.ParentId = PARENT_POST.Id AND P.PostTypeId = 2
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Views, U.UpVotes, U.DownVotes
+),
+PostHistoricalMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        P.PostTypeId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.FavoriteCount,
+        P.AcceptedAnswerId,
+        P.ParentId,
+        P.ClosedDate,
+        P.CommunityOwnedDate,
+        P.LastEditDate,
+        P.LastActivityDate,
+        P.Tags,
+        (SELECT COUNT(PH.Id) FROM PostHistory PH WHERE PH.PostId = P.Id AND PH.PostHistoryTypeId IN (4, 5, 6)) AS ContentEditCount,
+        (SELECT MAX(PH.CreationDate) FROM PostHistory PH WHERE PH.PostId = P.Id AND PH.PostHistoryTypeId IN (4, 5, 6)) AS LatestContentEditDate,
+        (SELECT MIN(PH.CreationDate) FROM PostHistory PH WHERE PH.PostId = P.Id AND PH.PostHistoryTypeId IN (10, 101) AND PH.Comment IS NOT NULL) AS FirstCloseVoteDate,
+        (SELECT COUNT(V.Id) FROM Votes V WHERE V.PostId = P.Id AND V.VoteTypeId = 2) AS UpVoteCount,
+        (SELECT COUNT(V.Id) FROM Votes V WHERE V.PostId = P.Id AND V.VoteTypeId = 3) AS DownVoteCount,
+        (
+            SELECT SUM(V.BountyAmount)
+            FROM Votes V
+            WHERE V.PostId = P.Id AND V.VoteTypeId IN (8, 9)
+        ) AS TotalBountyPostedOrReceived,
+        (
+            SELECT MAX(V.CreationDate)
+            FROM Votes V
+            WHERE V.PostId = P.Id AND V.VoteTypeId = 1
+        ) AS AcceptedAnswerVoteDate,
+        (
+            SELECT string_agg(T.TagName, ',')
+            FROM (
+                SELECT TRIM(UNNEST(string_to_array(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags) - 2), '><'))) AS TagName
+            ) AS TagList
+            JOIN Tags T ON TagList.TagName = T.TagName
+            GROUP BY T.TagName, T.Count
+            ORDER BY T.Count DESC
+            LIMIT 3
+        ) AS Top3TagsString,
+        (
+            SELECT COUNT(PL.Id)
+            FROM PostLinks PL
+            WHERE PL.PostId = P.Id AND PL.LinkTypeId = 1
+        ) AS LinkedPostsCount,
+        (
+            SELECT COUNT(PL.Id)
+            FROM PostLinks PL
+            WHERE PL.PostId = P.Id AND PL.LinkTypeId = 3
+        ) AS DuplicateLinksCount
+    FROM Posts P
+),
+MonthlyReputationGrowth AS (
+    SELECT
+        UES.UserId,
+        UES.Reputation,
+        UES.UserCreationDate,
+        UES.LatestPostCreationDate,
+        EXTRACT(YEAR FROM UES.UserCreationDate) AS CreationYear,
+        EXTRACT(MONTH FROM UES.UserCreationDate) AS CreationMonth,
+        UES.Reputation - COALESCE(LAG(UES.Reputation, 1, 0) OVER (PARTITION BY UES.UserId ORDER BY UES.LatestPostCreationDate), 0) AS ReputationChangeSinceLastActivity,
+        RANK() OVER (PARTITION BY EXTRACT(YEAR FROM UES.UserCreationDate), EXTRACT(MONTH FROM UES.UserCreationDate) ORDER BY UES.Reputation DESC, UES.UserId ASC) AS ReputationRankInCohort,
+        ROW_NUMBER() OVER (PARTITION BY UES.UserId ORDER BY UES.LatestPostCreationDate DESC) AS rn_user_latest_activity_for_rank
+    FROM UserEngagementSummary UES
+),
+HighImpactContributors AS (
+    SELECT UES.UserId
+    FROM UserEngagementSummary UES
+    WHERE UES.Reputation >= 50000
+    AND UES.AcceptedAnswersCount >= 50
+    AND UES.GoldBadges >= 5
+    UNION
+    SELECT UES.UserId
+    FROM UserEngagementSummary UES
+    WHERE UES.TotalQuestionsAsked >= 100
+    AND UES.QuestionsWithAcceptedAnswer >= 75
+    AND UES.TotalUpVotesGiven > 10000
+)
+SELECT
+    UES.UserId,
+    UES.DisplayName,
+    UES.Reputation,
+    UES.UserCreationDate,
+    UES.LastAccessDate,
+    UES.TotalProfileViews,
+    UES.TotalQuestionsAsked,
+    UES.TotalAnswersPosted,
+    UES.AcceptedAnswersCount,
+    UES.GoldBadges,
+    UES.SilverBadges,
+    UES.BronzeBadges,
+    COALESCE(UES.Reputation * 1.0 / NULLIF(EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - UES.UserCreationDate)), 0), 0) AS AvgDailyReputationGrowth,
+    EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - UES.LastAccessDate)) AS DaysSinceLastActivity,
+    MRG.ReputationRankInCohort,
+    MRG.ReputationChangeSinceLastActivity,
+    CASE
+        WHEN UES.Reputation >= 100000 AND UES.GoldBadges >= 10 THEN 'Elite Developer'
+        WHEN UES.Reputation >= 25000 AND UES.GoldBadges >= 3 THEN 'Senior Contributor'
+        WHEN UES.Reputation >= 5000 THEN 'Mid-Level Enthusiast'
+        ELSE 'Junior Member'
+    END AS UserTier,
+    COUNT(PHM.PostId) AS TotalActivePostsWithMetrics,
+    AVG(PHM.PostScore) AS AveragePostScoreOwned,
+    AVG(PHM.ViewCount) AS AveragePostViewCountOwned,
+    MAX(PHM.FavoriteCount) AS MaxFavoriteCountOnOwnedPost,
+    COALESCE(SUM(PHM.TotalBountyPostedOrReceived), 0) AS TotalBountyInvolvedInOwnedPosts,
+    (
+        SELECT PHT.Name
+        FROM PostHistory PHT
+        WHERE PHT.UserId = UES.UserId
+        ORDER BY PHT.CreationDate DESC
+        LIMIT 1
+    ) AS LastPostHistoryType,
+    COALESCE(LP.PostScore, 0) AS LastQuestionScore,
+    COALESCE(LP.ViewCount, 0) AS LastQuestionViewCount,
+    COALESCE(LP.ContentEditCount, 0) AS LastQuestionEditCount,
+    COALESCE(EXTRACT(EPOCH FROM (LP.ClosedDate - LP.PostCreationDate)) / 3600.0, -1) AS LastQuestionHoursToClose,
+    COALESCE(LP.Top3TagsString, 'N/A') AS LastQuestionTopTags,
+    CASE
+        WHEN LP.AcceptedAnswerId IS NOT NULL THEN TRUE
+        WHEN LP.PostTypeId = 1 AND LP.AcceptedAnswerId IS NULL AND CAST('2024-10-01 12:34:56' AS TIMESTAMP) - LP.PostCreationDate > INTERVAL '30 days' THEN FALSE
+        ELSE NULL
+    END AS LastQuestionHasAcceptedAnswer,
+    (
+        SELECT SUM(LENGTH(COALESCE(C.Text, '')))
+        FROM Comments C
+        WHERE C.UserId = UES.UserId
+        AND C.CreationDate BETWEEN UES.LastAccessDate - INTERVAL '6 months' AND UES.LastAccessDate
+        AND C.Score > 0
+    ) AS PositiveCommentTextLengthLast6Months,
+    CASE WHEN UES.UserId IN (SELECT UserId FROM HighImpactContributors) THEN TRUE ELSE FALSE END AS IsHighImpactContributor
+FROM UserEngagementSummary UES
+LEFT JOIN MonthlyReputationGrowth MRG ON UES.UserId = MRG.UserId AND MRG.rn_user_latest_activity_for_rank = 1
+LEFT JOIN PostHistoricalMetrics PHM ON UES.UserId = PHM.OwnerUserId
+LEFT JOIN LATERAL (
+    SELECT pd_latest.*
+    FROM PostHistoricalMetrics pd_latest
+    WHERE pd_latest.OwnerUserId = UES.UserId
+      AND pd_latest.PostTypeId = 1
+    ORDER BY pd_latest.PostCreationDate DESC
+    LIMIT 1
+) LP ON TRUE
+WHERE
+    UES.Reputation > 100
+    AND UES.TotalPostsOwned + UES.TotalCommentsMade > 0
+GROUP BY
+    UES.UserId,
+    UES.DisplayName,
+    UES.Reputation,
+    UES.UserCreationDate,
+    UES.LastAccessDate,
+    UES.TotalProfileViews,
+    UES.TotalQuestionsAsked,
+    UES.TotalAnswersPosted,
+    UES.AcceptedAnswersCount,
+    UES.GoldBadges,
+    UES.SilverBadges,
+    UES.BronzeBadges,
+    MRG.ReputationRankInCohort,
+    MRG.ReputationChangeSinceLastActivity,
+    LP.PostScore,
+    LP.ViewCount,
+    LP.ContentEditCount,
+    LP.ClosedDate,
+    LP.PostCreationDate,
+    LP.Top3TagsString,
+    LP.AcceptedAnswerId,
+    LP.PostTypeId
+HAVING
+    COUNT(PHM.PostId) > 0 OR UES.TotalCommentsMade > 0
+ORDER BY
+    UES.Reputation DESC,
+    DaysSinceLastActivity ASC
+LIMIT 5000;

@@ -1,0 +1,238 @@
+WITH UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestionsOwned,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswersOwned,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostScoreOwned,
+        SUM(COALESCE(p.ViewCount, 0)) AS TotalPostViewsOwned,
+        SUM(COALESCE(p.FavoriteCount, 0)) AS TotalPostFavoritesOwned,
+        SUM(CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END) AS TotalClosedPostsOwned,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN v_up.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesGiven,
+        SUM(CASE WHEN v_down.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesGiven
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId AND p.CreationDate >= DATE '2020-01-01' AND p.CreationDate < DATE '2021-01-01'
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId AND c.CreationDate >= DATE '2020-01-01' AND c.CreationDate < DATE '2021-01-01'
+    LEFT JOIN
+        Votes v_up ON u.Id = v_up.UserId AND v_up.VoteTypeId = 2 AND v_up.CreationDate >= DATE '2020-01-01' AND v_up.CreationDate < DATE '2021-01-01'
+    LEFT JOIN
+        Votes v_down ON u.Id = v_down.UserId AND v_down.VoteTypeId = 3 AND v_down.CreationDate >= DATE '2020-01-01' AND v_down.CreationDate < DATE '2021-01-01'
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+PostHistoryAggregates AS (
+    SELECT
+        ph.PostId,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.Id END) AS EditCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Id END) AS CloseCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.Id END) AS ReopenCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 12 THEN ph.Id END) AS DeleteCount,
+        MAX(ph.CreationDate) AS LastHistoryActivityDate,
+        MIN(ph.CreationDate) AS FirstHistoryActivityDate,
+        EXTRACT(EPOCH FROM (MIN(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN ph.CreationDate END) - MIN(ph.CreationDate))) / 3600 AS TimeToFirstEditHours
+    FROM
+        PostHistory ph
+    INNER JOIN
+        Posts p ON ph.PostId = p.Id
+    WHERE
+        p.CreationDate >= DATE '2020-01-01' AND p.CreationDate < DATE '2021-01-01'
+    GROUP BY
+        ph.PostId
+),
+UserTagContributions AS (
+    SELECT
+        OwnerUserId AS UserId,
+        TagName,
+        TagCount,
+        ROW_NUMBER() OVER (PARTITION BY OwnerUserId ORDER BY TagCount DESC, TagName ASC) AS TagRank
+    FROM (
+        SELECT
+            p.OwnerUserId,
+            LOWER(TRIM(t.tag)) AS TagName,
+            COUNT(*) AS TagCount
+        FROM
+            Posts p,
+            LATERAL (SELECT UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR GREATEST(0, LENGTH(p.Tags)-2)), '><')) AS tag) t
+        WHERE
+            p.PostTypeId = 1
+            AND p.OwnerUserId IS NOT NULL
+            AND p.Tags IS NOT NULL
+            AND LENGTH(p.Tags) > 2
+            AND p.CreationDate >= DATE '2020-01-01' AND p.CreationDate < DATE '2021-01-01'
+        GROUP BY
+            p.OwnerUserId, LOWER(TRIM(t.tag))
+    ) AS UserTagCounts
+),
+ComplexUserScores AS (
+    SELECT
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.UserCreationDate,
+        uas.LastAccessDate,
+        uas.TotalPostsOwned,
+        uas.TotalQuestionsOwned,
+        uas.TotalAnswersOwned,
+        uas.TotalPostScoreOwned,
+        uas.TotalPostViewsOwned,
+        uas.TotalPostFavoritesOwned,
+        uas.TotalCommentsMade,
+        uas.TotalUpvotesGiven,
+        uas.TotalDownvotesGiven,
+        MAX(COALESCE(pha.EditCount, 0)) AS MaxEditsOnAUserPost,
+        AVG(COALESCE(pha.EditCount, 0)) AS AvgEditsOnUserPosts,
+        MAX(COALESCE(pha.CloseCount, 0)) AS MaxClosesOnAUserPost,
+        STRING_AGG(CASE WHEN utc.TagRank <= 3 THEN utc.TagName || ' (' || utc.TagCount || ')' ELSE NULL END, '; ') FILTER (WHERE utc.TagRank <= 3) AS Top3Tags,
+        (
+            uas.Reputation * 0.1
+            + uas.TotalPostScoreOwned * 0.05
+            + uas.TotalPostViewsOwned * 0.001
+            + uas.TotalCommentsMade * 0.2
+            + (uas.TotalUpvotesGiven - uas.TotalDownvotesGiven) * 0.05
+            + COALESCE(SUM(pha.EditCount), 0) * 0.02
+            - COALESCE(SUM(pha.CloseCount), 0) * 0.1
+        ) AS CompositeEngagementScore,
+        RANK() OVER (ORDER BY (
+            uas.Reputation * 0.1
+            + uas.TotalPostScoreOwned * 0.05
+            + uas.TotalPostViewsOwned * 0.001
+            + uas.TotalCommentsMade * 0.2
+            + (uas.TotalUpvotesGiven - uas.TotalDownvotesGiven) * 0.05
+            + COALESCE(SUM(pha.EditCount), 0) * 0.02
+            - COALESCE(SUM(pha.CloseCount), 0) * 0.1
+        ) DESC) AS OverallEngagementRank,
+        AVG(uas.Reputation) OVER (PARTITION BY EXTRACT(YEAR FROM uas.UserCreationDate)) AS AvgReputationForCreationYear,
+        LAG(uas.Reputation, 1, 0) OVER (ORDER BY uas.Reputation DESC) AS PrevReputationInRank
+    FROM
+        UserActivitySummary uas
+    LEFT JOIN
+        Posts p_hist_link ON uas.UserId = p_hist_link.OwnerUserId AND p_hist_link.CreationDate >= DATE '2020-01-01' AND p_hist_link.CreationDate < DATE '2021-01-01'
+    LEFT JOIN
+        PostHistoryAggregates pha ON p_hist_link.Id = pha.PostId
+    LEFT JOIN
+        UserTagContributions utc ON uas.UserId = utc.UserId
+    GROUP BY
+        uas.UserId, uas.DisplayName, uas.Reputation, uas.UserCreationDate, uas.LastAccessDate,
+        uas.TotalPostsOwned, uas.TotalQuestionsOwned, uas.TotalAnswersOwned,
+        uas.TotalPostScoreOwned, uas.TotalPostViewsOwned, uas.TotalPostFavoritesOwned,
+        uas.TotalCommentsMade, uas.TotalUpvotesGiven, uas.TotalDownvotesGiven
+    HAVING
+        uas.TotalPostsOwned > 0 OR uas.TotalCommentsMade > 0 OR uas.TotalUpvotesGiven > 0
+),
+FinalUserSelection AS (
+    SELECT
+        'EngagedContributor' AS UserCategory,
+        cus.UserId,
+        COALESCE(cus.DisplayName, 'AnonymousUser') AS UserDisplayName,
+        cus.Reputation,
+        cus.TotalPostsOwned,
+        cus.TotalQuestionsOwned,
+        cus.TotalAnswersOwned,
+        cus.TotalPostScoreOwned,
+        cus.TotalCommentsMade,
+        cus.TotalUpvotesGiven,
+        cus.TotalDownvotesGiven,
+        cus.MaxEditsOnAUserPost,
+        cus.AvgEditsOnUserPosts,
+        cus.Top3Tags,
+        ROUND(cus.CompositeEngagementScore, 2) AS FinalEngagementScore,
+        cus.OverallEngagementRank,
+        cus.AvgReputationForCreationYear,
+        cus.PrevReputationInRank,
+        CASE
+            WHEN u.AboutMe IS NOT NULL AND LENGTH(u.AboutMe) > 500 THEN 'Verbose'
+            WHEN u.AboutMe IS NOT NULL AND LENGTH(u.AboutMe) > 100 THEN 'Detailed'
+            WHEN u.AboutMe IS NOT NULL THEN 'Brief'
+            ELSE 'NoAboutMe'
+        END AS AboutMeDescription,
+        u.Location,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = cus.UserId AND b.Name IN ('Autobiographer', 'Editor', 'Custodian') AND b.Date >= DATE '2020-01-01' AND b.Date < DATE '2021-01-01') AS RelevantBadgeCount,
+        NULLIF(CAST(cus.TotalAnswersOwned AS NUMERIC) / NULLIF(cus.TotalQuestionsOwned, 0), 0) AS AnswerToQuestionRatio
+    FROM
+        ComplexUserScores cus
+    INNER JOIN
+        Users u ON cus.UserId = u.Id
+    WHERE
+        cus.OverallEngagementRank <= 100
+        AND (u.Location LIKE '%USA%' OR u.Location IS NULL)
+        AND (u.LastAccessDate >= DATE '2020-06-01' OR u.CreationDate >= DATE '2020-01-01')
+        AND (cus.TotalQuestionsOwned > 5 OR cus.TotalAnswersOwned > 10)
+        AND cus.Reputation > cus.AvgReputationForCreationYear
+),
+CommunityCuratedSelection AS (
+    WITH OtherUserEdits AS (
+        SELECT
+            ph.PostId,
+            COUNT(DISTINCT ph.Id) AS OtherEditorCount,
+            STRING_AGG(DISTINCT u_editor.DisplayName, ', ') FILTER (WHERE u_editor.DisplayName IS NOT NULL) AS OtherEditors
+        FROM
+            PostHistory ph
+        INNER JOIN
+            Posts p ON ph.PostId = p.Id
+        LEFT JOIN
+            Users u_editor ON ph.UserId = u_editor.Id
+        WHERE
+            ph.PostHistoryTypeId IN (4, 5, 6)
+            AND ph.UserId IS NOT NULL
+            AND ph.UserId != p.OwnerUserId
+            AND p.CreationDate >= DATE '2020-01-01' AND p.CreationDate < DATE '2021-01-01'
+        GROUP BY
+            ph.PostId
+        HAVING
+            COUNT(DISTINCT ph.Id) >= 3
+    )
+    SELECT
+        'CommunityCuratedUser' AS UserCategory,
+        u_curated.Id AS UserId,
+        COALESCE(u_curated.DisplayName, 'CuratedAnon') AS UserDisplayName,
+        u_curated.Reputation,
+        CAST(COUNT(DISTINCT p_curated.Id) AS BIGINT) AS TotalPostsOwned,
+        CAST(COUNT(DISTINCT CASE WHEN p_curated.PostTypeId = 1 THEN p_curated.Id END) AS BIGINT) AS TotalQuestionsOwned,
+        CAST(COUNT(DISTINCT CASE WHEN p_curated.PostTypeId = 2 THEN p_curated.Id END) AS BIGINT) AS TotalAnswersOwned,
+        SUM(p_curated.Score) AS TotalPostScoreOwned,
+        NULL AS TotalCommentsMade,
+        NULL AS TotalUpvotesGiven,
+        CAST(SUM(CASE WHEN vt.VoteTypeId = 3 THEN 1 ELSE 0 END) AS INTEGER) AS TotalDownvotesGiven,
+        CAST(MAX(oue.OtherEditorCount) AS BIGINT) AS MaxEditsOnAUserPost,
+        AVG(oue.OtherEditorCount)::numeric AS AvgEditsOnUserPosts,
+        NULL AS Top3Tags,
+        (SUM(p_curated.Score) * 0.1 + COUNT(DISTINCT oue.PostId) * 0.5)::numeric AS FinalEngagementScore,
+        DENSE_RANK() OVER (ORDER BY (SUM(p_curated.Score) * 0.1 + COUNT(DISTINCT oue.PostId) * 0.5) DESC) AS OverallEngagementRank,
+        NULL AS AvgReputationForCreationYear,
+        NULL AS PrevReputationInRank,
+        'EditedByCommunity' AS AboutMeDescription,
+        u_curated.Location,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u_curated.Id AND b.Name = 'Disciplined' AND b.Date >= DATE '2020-01-01' AND b.Date < DATE '2021-01-01')::bigint AS RelevantBadgeCount,
+        NULLIF(CAST(COUNT(DISTINCT CASE WHEN p_curated.PostTypeId = 2 THEN p_curated.Id END) AS NUMERIC) / NULLIF(COUNT(DISTINCT CASE WHEN p_curated.PostTypeId = 1 THEN p_curated.Id END), 0), 0) AS AnswerToQuestionRatio
+    FROM
+        Users u_curated
+    INNER JOIN
+        Posts p_curated ON u_curated.Id = p_curated.OwnerUserId AND p_curated.CreationDate >= DATE '2020-01-01' AND p_curated.CreationDate < DATE '2021-01-01'
+    INNER JOIN
+        OtherUserEdits oue ON p_curated.Id = oue.PostId
+    LEFT JOIN
+        Votes vt ON p_curated.Id = vt.PostId AND vt.CreationDate >= DATE '2020-01-01' AND vt.CreationDate < DATE '2021-01-01'
+    WHERE
+        u_curated.CreationDate < DATE '2020-01-01'
+    GROUP BY
+        u_curated.Id, u_curated.DisplayName, u_curated.Reputation, u_curated.Location
+    HAVING
+        COUNT(DISTINCT oue.PostId) > 2
+    ORDER BY
+        OverallEngagementRank ASC
+    LIMIT 20
+)
+SELECT * FROM FinalUserSelection
+UNION ALL
+SELECT * FROM CommunityCuratedSelection
+ORDER BY
+    UserCategory DESC, FinalEngagementScore DESC
+LIMIT 200;

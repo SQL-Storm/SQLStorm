@@ -1,0 +1,319 @@
+-- {"query": "7318.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2827} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        MAX(b.Date) as LastBadgeDate,
+        DATEDIFF(CURRENT_TIMESTAMP, u.CreationDate) as AccountAgeDays,
+        DATEDIFF(CURRENT_TIMESTAMP, COALESCE(MAX(p.CreationDate), u.CreationDate)) as DaysSinceLastActivity,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Expert'
+            WHEN u.Reputation >= 5000 THEN 'Advanced'
+            WHEN u.Reputation >= 1000 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as ReputationLevel,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 1000 THEN 'High Volume'
+            WHEN COUNT(DISTINCT p.Id) > 100 THEN 'Medium Volume'
+            WHEN COUNT(DISTINCT p.Id) > 10 THEN 'Low Volume'
+            ELSE 'New User'
+        END as ActivityLevel,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), ', ') as TagFocus
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate
+),
+EngagementMetrics AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.PostCount,
+        uas.QuestionCount,
+        uas.AnswerCount,
+        uas.CommentCount,
+        uas.BadgeCount,
+        uas.AccountAgeDays,
+        uas.DaysSinceLastActivity,
+        uas.ReputationLevel,
+        uas.ActivityLevel,
+        uas.TagFocus,
+        ROW_NUMBER() OVER (ORDER BY uas.Reputation DESC, uas.PostCount DESC) as RankByReputation,
+        ROW_NUMBER() OVER (ORDER BY uas.PostCount DESC, uas.Reputation DESC) as RankByActivity,
+        CASE 
+            WHEN uas.PostCount > 0 THEN ROUND(CAST(uas.AnswerCount AS FLOAT) / CAST(uas.QuestionCount AS FLOAT) * 100, 2)
+            ELSE 0 
+        END as AnswerToQuestionRatio,
+        CASE 
+            WHEN uas.BadgeCount > 0 THEN ROUND(CAST(uas.CommentCount AS FLOAT) / CAST(uas.BadgeCount AS FLOAT), 2)
+            ELSE 0 
+        END as CommentsPerBadge,
+        CASE 
+            WHEN uas.AccountAgeDays > 0 THEN ROUND(CAST(uas.PostCount AS FLOAT) / CAST(uas.AccountAgeDays AS FLOAT), 2)
+            ELSE 0 
+        END as PostsPerDay,
+        COALESCE(
+            (SELECT COUNT(*) 
+             FROM Votes v 
+             JOIN Posts p ON v.PostId = p.Id 
+             WHERE v.UserId = uas.UserId 
+             AND p.PostTypeId = 1), 0
+        ) as QuestionUpvotes,
+        COALESCE(
+            (SELECT COUNT(*) 
+             FROM Votes v 
+             JOIN Posts p ON v.PostId = p.Id 
+             WHERE v.UserId = uas.UserId 
+             AND p.PostTypeId = 2), 0
+        ) as AnswerUpvotes,
+        (
+            SELECT COUNT(*) 
+            FROM Posts p 
+            WHERE p.OwnerUserId = uas.UserId 
+            AND p.Score > 100 
+            AND p.PostTypeId = 1
+        ) as HighScoreQuestions,
+        (
+            SELECT COUNT(*) 
+            FROM Posts p 
+            WHERE p.OwnerUserId = uas.UserId 
+            AND p.Score > 100 
+            AND p.PostTypeId = 2
+        ) as HighScoreAnswers
+    FROM UserActivityStats uas
+),
+FilteredUsers AS (
+    SELECT 
+        em.UserId,
+        em.DisplayName,
+        em.Reputation,
+        em.PostCount,
+        em.QuestionCount,
+        em.AnswerCount,
+        em.CommentCount,
+        em.BadgeCount,
+        em.AccountAgeDays,
+        em.DaysSinceLastActivity,
+        em.ReputationLevel,
+        em.ActivityLevel,
+        em.TagFocus,
+        em.RankByReputation,
+        em.RankByActivity,
+        em.AnswerToQuestionRatio,
+        em.CommentsPerBadge,
+        em.PostsPerDay,
+        em.QuestionUpvotes,
+        em.AnswerUpvotes,
+        em.HighScoreQuestions,
+        em.HighScoreAnswers,
+        CASE 
+            WHEN em.HighScoreQuestions > 10 OR em.HighScoreAnswers > 25 THEN 'Active Elite'
+            WHEN em.PostsPerDay > 0.1 OR em.Reputation > 1000 THEN 'Regular Contributor'
+            WHEN em.AccountAgeDays < 365 OR em.PostCount > 10 THEN 'Active Member'
+            ELSE 'Inactive User'
+        END as StatusTier
+    FROM EngagementMetrics em
+    WHERE em.PostCount > 0 
+    AND em.AccountAgeDays > 30
+),
+PerformanceBenchmark AS (
+    SELECT 
+        fu.UserId,
+        fu.DisplayName,
+        fu.Reputation,
+        fu.PostCount,
+        fu.QuestionCount,
+        fu.AnswerCount,
+        fu.CommentCount,
+        fu.BadgeCount,
+        fu.AccountAgeDays,
+        fu.DaysSinceLastActivity,
+        fu.ReputationLevel,
+        fu.ActivityLevel,
+        fu.TagFocus,
+        fu.RankByReputation,
+        fu.RankByActivity,
+        fu.AnswerToQuestionRatio,
+        fu.CommentsPerBadge,
+        fu.PostsPerDay,
+        fu.QuestionUpvotes,
+        fu.AnswerUpvotes,
+        fu.HighScoreQuestions,
+        fu.HighScoreAnswers,
+        fu.StatusTier,
+        (
+            SELECT COUNT(*) 
+            FROM PostHistory ph 
+            WHERE ph.UserId = fu.UserId 
+            AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)
+        ) as EditActivityCount,
+        (
+            SELECT COUNT(*) 
+            FROM PostHistory ph 
+            WHERE ph.UserId = fu.UserId 
+            AND ph.PostHistoryTypeId = 10
+        ) as CloseCount,
+        (
+            SELECT STRING_AGG(DISTINCT ph.Comment, ', ') 
+            FROM PostHistory ph 
+            WHERE ph.UserId = fu.UserId 
+            AND ph.Comment IS NOT NULL 
+            AND ph.Comment != ''
+            AND ph.CreationDate >= DATEADD('month', -6, CURRENT_TIMESTAMP)
+        ) as RecentComments,
+        (
+            SELECT COUNT(*) 
+            FROM PostHistory ph 
+            WHERE ph.UserId = fu.UserId 
+            AND ph.CreationDate >= DATEADD('year', -1, CURRENT_TIMESTAMP)
+            AND ph.PostHistoryTypeId = 24
+        ) as EditSuggestionsCount,
+        CASE 
+            WHEN fu.Reputation > 25000 AND fu.PostCount > 500 THEN 'Power User'
+            WHEN fu.Reputation > 5000 AND fu.PostCount > 200 THEN 'Experienced'
+            WHEN fu.Reputation > 1000 AND fu.PostCount > 50 THEN 'Regular'
+            ELSE 'Newbie'
+        END as UserCategory,
+        COALESCE(
+            (SELECT AVG(p.Score) 
+             FROM Posts p 
+             WHERE p.OwnerUserId = fu.UserId 
+             AND p.PostTypeId IN (1, 2)), 0
+        ) as AvgPostScore,
+        (
+            SELECT STRING_AGG(DISTINCT t.TagName, ', ') 
+            FROM Tags t 
+            JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+            WHERE p.OwnerUserId = fu.UserId
+            GROUP BY fu.UserId
+            HAVING COUNT(*) > 5
+        ) as PopularTags,
+        (
+            SELECT COUNT(*) 
+            FROM Badges b 
+            WHERE b.UserId = fu.UserId 
+            AND b.Class = 1
+        ) as GoldBadgeCount,
+        (
+            SELECT COUNT(*) 
+            FROM Badges b 
+            WHERE b.UserId = fu.UserId 
+            AND b.Class = 2
+        ) as SilverBadgeCount,
+        (
+            SELECT COUNT(*) 
+            FROM Badges b 
+            WHERE b.UserId = fu.UserId 
+            AND b.Class = 3
+        ) as BronzeBadgeCount
+    FROM FilteredUsers fu
+)
+SELECT 
+    pb.UserId,
+    pb.DisplayName,
+    pb.Reputation,
+    pb.PostCount,
+    pb.QuestionCount,
+    pb.AnswerCount,
+    pb.CommentCount,
+    pb.BadgeCount,
+    pb.AccountAgeDays,
+    pb.DaysSinceLastActivity,
+    pb.ReputationLevel,
+    pb.ActivityLevel,
+    pb.TagFocus,
+    pb.RankByReputation,
+    pb.RankByActivity,
+    pb.AnswerToQuestionRatio,
+    pb.CommentsPerBadge,
+    pb.PostsPerDay,
+    pb.QuestionUpvotes,
+    pb.AnswerUpvotes,
+    pb.HighScoreQuestions,
+    pb.HighScoreAnswers,
+    pb.StatusTier,
+    pb.EditActivityCount,
+    pb.CloseCount,
+    pb.RecentComments,
+    pb.EditSuggestionsCount,
+    pb.UserCategory,
+    pb.AvgPostScore,
+    pb.PopularTags,
+    pb.GoldBadgeCount,
+    pb.SilverBadgeCount,
+    pb.BronzeBadgeCount,
+    CASE 
+        WHEN pb.Reputation > 100000 THEN 'Top Tier'
+        WHEN pb.Reputation > 50000 THEN 'High Level'
+        WHEN pb.Reputation > 10000 THEN 'Mid Level'
+        ELSE 'Low Level'
+    END as PerformanceTier,
+    CASE 
+        WHEN pb.EditSuggestionsCount > 50 THEN 'Active Editor'
+        WHEN pb.EditSuggestionsCount > 25 THEN 'Moderate Editor'
+        WHEN pb.EditSuggestionsCount > 5 THEN 'Occasional Editor'
+        ELSE 'No Editor'
+    END as EditingActivity,
+    ROUND(CAST(pb.Reputation AS FLOAT) * CAST(pb.PostsPerDay AS FLOAT) / 1000, 2) as ActivityScore,
+    CAST(SQRT(CAST(pb.PostCount AS FLOAT) * CAST(pb.Reputation AS FLOAT)) AS INTEGER) as ProductivityIndex,
+    COALESCE(NULLIF(pb.HighestScore, 0), 1) as NormalizedScore,
+    CASE 
+        WHEN pb.AvgPostScore > 10 AND pb.PostsPerDay > 0.5 THEN 'High Quality Contributor'
+        WHEN pb.AvgPostScore > 2 AND pb.PostsPerDay > 0.2 THEN 'Medium Quality Contributor'
+        WHEN pb.AvgPostScore > 0 AND pb.PostsPerDay > 0.05 THEN 'Low Quality Contributor'
+        ELSE 'Inactive Contributor'
+    END as QualityLabel,
+    (pb.PostsPerDay * 30) as MonthlyPostEstimate,
+    pb.RecentComments,
+    COALESCE(pb.PopularTags, 'None') as TagFocusDisplay,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.OwnerUserId = pb.UserId 
+        AND p.ViewCount > 1000
+    ) as HighViewPostCount,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.OwnerUserId = pb.UserId 
+        AND p.Score > 50
+    ) as HighScorePostCount,
+    CASE 
+        WHEN pb.BadgeCount > 100 THEN 'Veteran'
+        WHEN pb.BadgeCount > 50 THEN 'Seasoned'
+        WHEN pb.BadgeCount > 10 THEN 'Experienced'
+        ELSE 'Novice'
+    END as BadgeExperience,
+    CASE 
+        WHEN pb.UserCategory = 'Power User' THEN pb.PostCount * 0.1
+        WHEN pb.UserCategory = 'Experienced' THEN pb.PostCount * 0.07
+        WHEN pb.UserCategory = 'Regular' THEN pb.PostCount * 0.05
+        ELSE pb.PostCount * 0.02
+    END as CategoryBoost,
+    pb.EditSuggestionsCount + pb.CloseCount + pb.QuestionUpvotes + pb.AnswerUpvotes as TotalEngagement,
+    CAST(
+        (pb.PostCount + pb.AnswerCount + pb.QuestionCount) / 
+        (COALESCE(pb.AccountAgeDays, 1) * 1.0) 
+        AS FLOAT
+    ) as DailyContributionRate
+FROM PerformanceBenchmark pb
+WHERE pb.PostCount > 10
+AND pb.Reputation > 100
+AND pb.DaysSinceLastActivity < 365
+AND (pb.RecentComments IS NOT NULL OR pb.EditSuggestionsCount > 0)
+ORDER BY pb.PostsPerDay DESC, pb.Reputation DESC, pb.PostCount DESC
+LIMIT 1000;

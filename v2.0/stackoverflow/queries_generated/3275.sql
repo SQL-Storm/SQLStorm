@@ -1,0 +1,98 @@
+-- {"query": "3275.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1927} 
+
+WITH UserStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(b.Id)          FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id)          FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id)          FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        COUNT(DISTINCT t.TagName)                         AS DistinctTagCount
+    FROM Users u
+    LEFT JOIN Badges   b ON b.UserId = u.Id
+    LEFT JOIN Posts    p ON p.OwnerUserId = u.Id
+    LEFT JOIN LATERAL (
+        SELECT regexp_split_to_table(p.Tags, '<|>') AS Tag
+    ) pt ON true
+    LEFT JOIN Tags    t ON t.TagName = pt.Tag
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopUsers AS (
+    SELECT *
+    FROM UserStats
+    ORDER BY Reputation DESC
+    FETCH FIRST 50 ROWS ONLY
+),
+UserPostRanks AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.Score,
+        p.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate DESC) AS RankByScore,
+        COUNT(*)     OVER (PARTITION BY p.OwnerUserId)                                 AS TotalPosts,
+        COALESCE(p.AcceptedAnswerId, 0)                                                AS AcceptedAnswerFlag
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+),
+UserActivity AS (
+    SELECT
+        u.Id,
+        COALESCE(SUM(v.UpVotes - v.DownVotes),0)                                   AS VoteBalance,
+        COALESCE(SUM(c.Score),0)                                                   AS CommentScore,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId = 10 AND ph.Comment IS NOT NULL) AS CloseVoteCount
+    FROM Users u
+    LEFT JOIN Votes       v  ON v.UserId = u.Id
+    LEFT JOIN Comments    c  ON c.UserId = u.Id
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+    GROUP BY u.Id
+),
+RecentClosedQuestions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        ph.CreationDate                              AS ClosedDate,
+        CAST(ph.Comment AS int)                      AS CloseReasonId,
+        COALESCE(crt.Name,'Unknown')                 AS CloseReasonName,
+        ROW_NUMBER() OVER (ORDER BY ph.CreationDate DESC) AS RN
+    FROM Posts p
+    JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS int)
+    WHERE p.PostTypeId = 1
+),
+Aggregated AS (
+    SELECT
+        tu.Id,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.GoldBadges,
+        tu.SilverBadges,
+        tu.BronzeBadges,
+        tu.QuestionCount,
+        tu.AnswerCount,
+        ua.VoteBalance,
+        ua.CommentScore,
+        ua.CloseVoteCount,
+        upr.RankByScore,
+        upr.TotalPosts,
+        rc.Title,
+        rc.CloseReasonName,
+        rc.ClosedDate
+    FROM TopUsers tu
+    LEFT JOIN UserActivity ua ON ua.Id = tu.Id
+    LEFT JOIN UserPostRanks upr ON upr.OwnerUserId = tu.Id AND upr.RankByScore <= 3
+    LEFT JOIN LATERAL (
+        SELECT rc.Title, rc.CloseReasonName, rc.ClosedDate
+        FROM RecentClosedQuestions rc
+        WHERE rc.RN = 1
+        ORDER BY rc.ClosedDate DESC
+        LIMIT 1
+    ) rc ON true
+)
+SELECT *
+FROM Aggregated
+ORDER BY Reputation DESC, GoldBadges DESC, RankByScore NULLS LAST;

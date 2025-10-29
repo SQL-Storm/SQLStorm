@@ -1,0 +1,197 @@
+-- {"query": "2260.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1669} 
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        ARRAY[t.TagName] AS TagPath
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0 AND t.IsRequired = 0
+
+    UNION ALL
+
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.TagPath || t.TagName
+    FROM Tags t
+    JOIN RecursiveTagHierarchy r ON t.Id <> r.Id
+    WHERE NOT t.TagName = ANY(r.TagPath)
+      AND t.IsModeratorOnly = 0
+      AND t.IsRequired = 0
+      AND t.Count < r.Count
+), UserBadgeCounts AS (
+    SELECT 
+        b.UserId,
+        b.Class,
+        COUNT(*) AS BadgeCount,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Badges b
+    WHERE b.TagBased = 0
+    GROUP BY b.UserId, b.Class
+), UserReputationInfo AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COALESCE(SUM(vb.BadgeCount),0) AS TotalBadges
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN UserBadgeCounts vb ON vb.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+), PostActivityWindow AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS ScoreRank,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS RecentRank,
+        LEAD(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS NextScore,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS PrevScore
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+), QualifiedPosts AS (
+    SELECT 
+        pa.Id,
+        pa.PostTypeId,
+        pa.CreationDate,
+        pa.Score,
+        pa.ViewCount,
+        pa.Tags,
+        pa.OwnerUserId,
+        pa.ScoreRank,
+        pa.RecentRank,
+        u.DisplayName AS OwnerName,
+        u.Reputation,
+        ubc.Class AS BadgeClass,
+        ubc.BadgeCount
+    FROM PostActivityWindow pa
+    JOIN Users u ON u.Id = pa.OwnerUserId
+    LEFT JOIN UserBadgeCounts ubc ON ubc.UserId = pa.OwnerUserId
+    WHERE pa.ScoreRank <= 5
+), ClosedQuestions AS (
+    SELECT DISTINCT
+        ph.PostId,
+        crt.Name as CloseReason,
+        ph.CreationDate AS ClosedDate
+    FROM PostHistory ph
+    JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS SMALLINT)
+    WHERE ph.PostHistoryTypeId = 10 -- Post Closed
+), DuplicateLinks AS (
+    SELECT 
+        pl.PostId,
+        pl.RelatedPostId
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 3 -- Duplicate
+), AnswerScores AS (
+    SELECT
+        a.ParentId AS QuestionId,
+        AVG(a.Score) AS AvgAnswerScore,
+        MAX(a.Score) AS MaxAnswerScore,
+        COUNT(*) AS AnswerCount
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+    GROUP BY a.ParentId
+), PostCommentStats AS (
+    SELECT 
+        c.PostId,
+        COUNT(*) AS CommentCount,
+        AVG(c.Score) AS AvgCommentScore,
+        MAX(c.Score) AS MaxCommentScore
+    FROM Comments c
+    GROUP BY c.PostId
+), ComplexResults AS (
+    SELECT 
+        qp.Id AS PostId,
+        qp.PostTypeId,
+        qp.CreationDate,
+        qp.Score,
+        qp.ViewCount,
+        qp.Tags,
+        qp.OwnerUserId,
+        qp.OwnerName,
+        qp.Reputation,
+        qp.BadgeClass,
+        qp.BadgeCount,
+        cq.CloseReason,
+        cq.ClosedDate,
+        dl.RelatedPostId AS DuplicateOfPostId,
+        COALESCE(ascores.AvgAnswerScore, 0) AS AvgAnswerScore,
+        COALESCE(ascores.MaxAnswerScore, 0) AS MaxAnswerScore,
+        COALESCE(ascores.AnswerCount, 0) AS AnswerCount,
+        COALESCE(pcs.CommentCount, 0) AS CommentCount,
+        COALESCE(pcs.AvgCommentScore, 0) AS AvgCommentScore,
+        COALESCE(pcs.MaxCommentScore, 0) AS MaxCommentScore,
+        CASE 
+            WHEN qp.Tags IS NOT NULL THEN 
+                array_to_string(
+                    array(
+                        SELECT unnest(string_to_array(substring(qp.Tags,2,length(qp.Tags)-2), '><')) 
+                        ORDER BY length(unnest)
+                    ), ', '
+                )
+            ELSE NULL
+        END AS SortedTags,
+        ROW_NUMBER() OVER (PARTITION BY qp.OwnerUserId ORDER BY qp.Score DESC, qp.ViewCount DESC) AS PostRankingByUser
+    FROM QualifiedPosts qp
+    LEFT JOIN ClosedQuestions cq ON cq.PostId = qp.Id
+    LEFT JOIN DuplicateLinks dl ON dl.PostId = qp.Id
+    LEFT JOIN AnswerScores ascores ON ascores.QuestionId = qp.Id
+    LEFT JOIN PostCommentStats pcs ON pcs.PostId = qp.Id
+    WHERE qp.Score > (
+        SELECT AVG(p2.Score) 
+        FROM Posts p2 
+        WHERE p2.OwnerUserId = qp.OwnerUserId AND p2.PostTypeId = qp.PostTypeId
+    )
+)
+SELECT 
+    cr.PostId,
+    cr.OwnerName,
+    cr.Reputation,
+    CASE cr.PostTypeId
+        WHEN 1 THEN 'Question'
+        WHEN 2 THEN 'Answer'
+        ELSE 'Other'
+    END AS PostType,
+    cr.CreationDate,
+    cr.Score,
+    cr.ViewCount,
+    cr.CommentCount,
+    cr.AvgCommentScore,
+    cr.MaxCommentScore,
+    cr.AnswerCount,
+    cr.AvgAnswerScore,
+    cr.MaxAnswerScore,
+    cr.CloseReason,
+    cr.ClosedDate,
+    cr.DuplicateOfPostId,
+    cr.BadgeClass,
+    cr.BadgeCount,
+    cr.SortedTags,
+    cr.PostRankingByUser,
+    CASE 
+        WHEN cr.CloseReason IS NOT NULL THEN 'Closed'
+        WHEN cr.DuplicateOfPostId IS NOT NULL THEN 'Duplicate'
+        ELSE 'Active'
+    END AS PostStatus,
+    LENGTH(cr.SortedTags) - LENGTH(REPLACE(cr.SortedTags, ',', '')) + 1 AS TagCountInSortedTags,
+    COALESCE(u.Views, 0) AS UserViews,
+    COALESCE(u.UpVotes, 0) - COALESCE(u.DownVotes, 0) AS UserNetVotes,
+    CONCAT(
+        COALESCE(u.Location, 'Unknown'), ' | ', 
+        COALESCE(u.WebsiteUrl, 'NoWebsite')
+    ) AS UserLocationWebsite,
+    CASE WHEN cr.CloseReason IS NOT NULL THEN cr.ClosedDate - cr.CreationDate ELSE NULL END AS DaysToClose
+FROM ComplexResults cr
+LEFT JOIN Users u ON u.Id = cr.OwnerUserId
+WHERE cr.PostRankingByUser <= 3
+  AND (cr.Reputation > 1000 OR cr.BadgeCount > 5 OR cr.AnswerCount > 0)
+ORDER BY cr.Reputation DESC, cr.Score DESC, cr.CreationDate DESC
+LIMIT 100;

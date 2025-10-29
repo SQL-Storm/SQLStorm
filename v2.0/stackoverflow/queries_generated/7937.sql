@@ -1,0 +1,186 @@
+-- {"query": "7937.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1844} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        MAX(b.Date) as LastBadgeDate,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Elite'
+            WHEN u.Reputation > 5000 THEN 'Expert'
+            WHEN u.Reputation > 1000 THEN 'Advanced'
+            ELSE 'Beginner'
+        END as ReputationLevel,
+        CASE 
+            WHEN EXISTS (SELECT 1 FROM Posts p2 WHERE p2.OwnerUserId = u.Id AND p2.PostTypeId = 1) THEN 'QuestionPoster'
+            WHEN EXISTS (SELECT 1 FROM Posts p3 WHERE p3.OwnerUserId = u.Id AND p3.PostTypeId = 2) THEN 'Answerer'
+            ELSE 'Observer'
+        END as UserRole
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostComplexityAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 
+                CASE 
+                    WHEN p.AnswerCount = 0 THEN 'No Answers'
+                    WHEN p.AnswerCount >= 1 AND p.AnswerCount <= 3 THEN 'Few Answers'
+                    WHEN p.AnswerCount > 3 AND p.AnswerCount <= 10 THEN 'Some Answers'
+                    ELSE 'Many Answers'
+                END
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as AnswerStatus,
+        CASE 
+            WHEN p.ViewCount > 1000 THEN 'High Traffic'
+            WHEN p.ViewCount > 500 THEN 'Medium Traffic'
+            WHEN p.ViewCount > 100 THEN 'Low Traffic'
+            ELSE 'Very Low Traffic'
+        END as TrafficLevel,
+        DATEDIFF(DAY, p.CreationDate, COALESCE(p.ClosedDate, GETDATE())) as PostAgeDays,
+        COALESCE(p.Tags, '') as Tags,
+        LEN(COALESCE(p.Tags, '')) as TagLength,
+        (SELECT COUNT(*) FROM Posts p2 WHERE p2.ParentId = p.Id AND p2.PostTypeId = 2) as AnswerCountWithDeleted,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) as UpVoteCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) as DownVoteCount
+    FROM Posts p
+    WHERE p.CreationDate >= '2015-01-01'
+),
+UserEngagementMetrics AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.PostCount,
+        uas.CommentCount,
+        uas.BadgeCount,
+        uas.ReputationLevel,
+        uas.UserRole,
+        ROW_NUMBER() OVER (ORDER BY uas.PostCount DESC, uas.Reputation DESC) as EngagementRank,
+        PERCENT_RANK() OVER (ORDER BY uas.PostCount) as PostPercentile,
+        AVG(uas.PostCount) OVER (PARTITION BY uas.ReputationLevel) as AvgPostsPerLevel,
+        CASE 
+            WHEN uas.PostCount > (SELECT AVG(PostCount) FROM UserActivityStats) THEN 'AboveAvg'
+            ELSE 'BelowAvg'
+        END as PostPerformance
+    FROM UserActivityStats uas
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        pca.PostId,
+        pca.Title,
+        pca.Score,
+        pca.ViewCount,
+        pca.AnswerStatus,
+        pca.TrafficLevel,
+        pca.TagLength,
+        pca.PostAgeDays,
+        pca.AnswerCountWithDeleted,
+        pca.UpVoteCount,
+        pca.DownVoteCount,
+        CASE 
+            WHEN pca.Score > 100 THEN 'HighlyVoted'
+            WHEN pca.Score > 50 THEN 'ModeratelyVoted'
+            WHEN pca.Score > 0 THEN 'LowVoted'
+            ELSE 'ZeroOrNegative'
+        END as VoteStatus,
+        CASE 
+            WHEN pca.AnswerCountWithDeleted > 0 AND pca.ViewCount > 100 THEN 'ActiveQuestion'
+            WHEN pca.AnswerCountWithDeleted = 0 AND pca.ViewCount > 50 THEN 'LowActivityQuestion'
+            ELSE 'PassiveQuestion'
+        END as QuestionActivity,
+        RANK() OVER (PARTITION BY pca.PostTypeId ORDER BY pca.Score DESC) as TopScoreRank,
+        DENSE_RANK() OVER (ORDER BY pca.Score DESC) as OverallScoreRank,
+        LAG(pca.Score, 1) OVER (ORDER BY pca.Score DESC) - pca.Score as ScoreDifferenceFromNext,
+        NTILE(4) OVER (ORDER BY pca.Score) as ScoreQuartile,
+        COALESCE(NULLIF(SUBSTRING(pca.Tags, 2, LEN(pca.Tags) - 2), ''), 'No Tags') as CleanedTags
+    FROM PostComplexityAnalysis pca
+)
+SELECT 
+    uem.UserId,
+    uem.DisplayName,
+    uem.Reputation,
+    uem.PostCount,
+    uem.CommentCount,
+    uem.BadgeCount,
+    uem.ReputationLevel,
+    uem.UserRole,
+    uem.EngagementRank,
+    uem.PostPercentile,
+    uem.AvgPostsPerLevel,
+    uem.PostPerformance,
+    cpa.PostId,
+    cpa.Title,
+    cpa.Score,
+    cpa.ViewCount,
+    cpa.AnswerStatus,
+    cpa.TrafficLevel,
+    cpa.TagLength,
+    cpa.PostAgeDays,
+    cpa.AnswerCountWithDeleted,
+    cpa.UpVoteCount,
+    cpa.DownVoteCount,
+    cpa.VoteStatus,
+    cpa.QuestionActivity,
+    cpa.TopScoreRank,
+    cpa.OverallScoreRank,
+    cpa.ScoreDifferenceFromNext,
+    cpa.ScoreQuartile,
+    cpa.CleanedTags,
+    CASE 
+        WHEN uem.PostPerformance = 'AboveAvg' 
+             AND cpa.VoteStatus IN ('HighlyVoted', 'ModeratelyVoted') 
+             AND cpa.QuestionActivity IN ('ActiveQuestion', 'LowActivityQuestion') 
+        THEN 'HighlyEngaging' 
+        WHEN uem.PostPerformance = 'BelowAvg' 
+             AND cpa.VoteStatus = 'ZeroOrNegative' 
+             AND cpa.QuestionActivity = 'PassiveQuestion' 
+        THEN 'LowEngagement' 
+        ELSE 'MediumEngagement' 
+    END as EngagementCategory,
+    ROW_NUMBER() OVER (PARTITION BY uem.UserId ORDER BY cpa.Score DESC) as UserPostRanking,
+    RANK() OVER (ORDER BY cpa.Score DESC, cpa.ViewCount DESC) as GlobalPostRanking,
+    DENSE_RANK() OVER (ORDER BY cpa.PostAgeDays ASC) as NewestPostsRank,
+    PERCENT_RANK() OVER (ORDER BY cpa.ViewCount) as ViewPercentile,
+    CONCAT(
+        'User:', uem.UserId, 
+        ' | Post:', cpa.PostId, 
+        ' | Status:', cpa.VoteStatus, 
+        ' | Age:', cpa.PostAgeDays, 
+        ' | Tags:', CASE WHEN cpa.TagLength > 10 THEN 'Many' ELSE 'Few' END
+    ) as PostSummary
+FROM UserEngagementMetrics uem
+INNER JOIN ComplexPostAnalysis cpa ON uem.UserId = cpa.OwnerUserId
+WHERE 
+    uem.PostCount > 0 
+    AND uem.Reputation >= 100
+    AND cpa.Score > -10
+    AND (cpa.QuestionActivity IN ('ActiveQuestion', 'LowActivityQuestion') OR cpa.PostTypeId = 2)
+ORDER BY 
+    uem.Reputation DESC,
+    cpa.Score DESC,
+    cpa.ViewCount DESC
+LIMIT 1000;

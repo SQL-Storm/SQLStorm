@@ -1,0 +1,170 @@
+-- {"query": "4246.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1495} 
+WITH
+  TopUsers AS (
+    SELECT
+      UserId,
+      COUNT(*) AS NumComments
+    FROM Comments
+    WHERE
+      UserId IS NOT NULL
+    GROUP BY
+      UserId
+    HAVING
+      COUNT(*) > 100
+  ),
+  PostStats AS (
+    SELECT
+      p.Id AS PostId,
+      p.PostTypeId,
+      pt.Name AS PostTypeName,
+      p.OwnerUserId,
+      u.DisplayName AS OwnerDisplayName,
+      p.CreationDate,
+      p.Score,
+      p.ViewCount,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      p.ClosedDate,
+      CASE
+        WHEN p.ClosedDate IS NOT NULL THEN 1
+        ELSE 0
+      END AS IsClosed,
+      ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS PostNumberForUser,
+      AVG(CAST(p.Score AS DECIMAL(10, 2))) OVER (PARTITION BY p.OwnerUserId) AS AvgScoreForUser,
+      SUM(p.ViewCount) OVER (PARTITION BY p.OwnerUserId) AS TotalViewsForUser,
+      COUNT(c.Id) OVER (PARTITION BY p.OwnerUserId) AS TotalCommentsForUser
+    FROM Posts AS p
+    JOIN PostTypes AS pt
+      ON p.PostTypeId = pt.Id
+    LEFT JOIN Users AS u
+      ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments AS c
+      ON p.Id = c.PostId
+    WHERE
+      p.PostTypeId IN (1, 2) /* Questions and Answers */
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate AS UserCreationDate,
+      COUNT(DISTINCT ph.PostId) AS NumPostsModified,
+      MAX(ph.CreationDate) AS LastModificationDate
+    FROM Users AS u
+    JOIN PostHistory AS ph
+      ON u.Id = ph.UserId
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6) /* Edit Title, Edit Body, Edit Tags */
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate
+    HAVING
+      COUNT(DISTINCT ph.PostId) > 5
+  )
+SELECT
+  ps.PostId,
+  ps.PostTypeName,
+  ps.OwnerUserId,
+  ps.OwnerDisplayName,
+  ps.CreationDate,
+  ps.Score,
+  ps.ViewCount,
+  ps.AnswerCount,
+  ps.CommentCount,
+  ps.FavoriteCount,
+  ps.IsClosed,
+  ps.PostNumberForUser,
+  ps.AvgScoreForUser,
+  ps.TotalViewsForUser,
+  ps.TotalCommentsForUser,
+  tu.NumComments AS UserTopComments,
+  ua.NumPostsModified AS UserPostsModified,
+  ua.LastModificationDate AS UserLastModificationDate,
+  CASE
+    WHEN ps.Score > 100 AND ps.AnswerCount > 10 THEN 'Highly Rated & Answered'
+    WHEN ps.Score < 0 THEN 'Negatively Scored'
+    WHEN ps.IsClosed = 1 THEN 'Closed Post'
+    WHEN ps.FavoriteCount > 50 THEN 'Highly Favorited'
+    ELSE 'Standard'
+  END AS PostCategorization,
+  LOWER(SUBSTRING(ps.OwnerDisplayName FROM 1 FOR 3)) AS OwnerNamePrefix,
+  COALESCE(ps.ClosedDate, ps.LastActivityDate) AS RelevantCloseOrActivityDate,
+  CASE
+    WHEN ps.OwnerUserId = (
+      SELECT
+        OwnerUserId
+      FROM Posts
+      WHERE
+        Id = ps.PostId
+    ) THEN 'Self-Owned'
+    ELSE 'Not Self-Owned'
+  END AS OwnershipStatus,
+  (
+    SELECT
+      COUNT(*)
+    FROM Comments AS c_inner
+    WHERE
+      c_inner.PostId = ps.PostId AND c_inner.UserId = ps.OwnerUserId
+  ) AS OwnerCommentsOnOwnPost,
+  COALESCE(ps.OwnerDisplayName, 'Community') AS DisplayNameOrCommunity,
+  CASE
+    WHEN ps.Score > 0 OR ps.AnswerCount > 0 THEN CAST(ps.Score AS FLOAT) / NULLIF(ps.AnswerCount, 0)
+    ELSE 0
+  END AS ScorePerAnswer,
+  CASE
+    WHEN ps.PostTypeId = 1 THEN SUBSTRING(ps.OwnerDisplayName FROM 1 FOR POSITION(' ' IN ps.OwnerDisplayName) - 1)
+    ELSE 'N/A'
+  END AS OwnerFirstName,
+  'PostLink' AS LinkType,
+  pl.RelatedPostId
+FROM PostStats AS ps
+LEFT JOIN TopUsers AS tu
+  ON ps.OwnerUserId = tu.UserId
+LEFT JOIN UserActivity AS ua
+  ON ps.OwnerUserId = ua.UserId
+LEFT JOIN PostLinks AS pl
+  ON ps.PostId = pl.PostId AND pl.LinkTypeId = 1 /* Linked */
+WHERE
+  ps.Score > 0
+  AND ps.ViewCount > 1000
+  AND ps.OwnerUserId IS NOT NULL
+  AND ps.OwnerDisplayName NOT LIKE '%Anonymous%'
+  AND ua.LastModificationDate > ps.CreationDate
+UNION
+SELECT
+  NULL AS PostId,
+  NULL AS PostTypeName,
+  NULL AS OwnerUserId,
+  NULL AS OwnerDisplayName,
+  NULL AS CreationDate,
+  NULL AS Score,
+  NULL AS ViewCount,
+  NULL AS AnswerCount,
+  NULL AS CommentCount,
+  NULL AS FavoriteCount,
+  NULL AS IsClosed,
+  NULL AS PostNumberForUser,
+  NULL AS AvgScoreForUser,
+  NULL AS TotalViewsForUser,
+  NULL AS TotalCommentsForUser,
+  NULL AS UserTopComments,
+  NULL AS UserPostsModified,
+  NULL AS UserLastModificationDate,
+  'Union Placeholder' AS PostCategorization,
+  NULL AS OwnerNamePrefix,
+  NULL AS RelevantCloseOrActivityDate,
+  NULL AS OwnershipStatus,
+  NULL AS OwnerCommentsOnOwnPost,
+  NULL AS DisplayNameOrCommunity,
+  NULL AS ScorePerAnswer,
+  NULL AS OwnerFirstName,
+  'CommentLink' AS LinkType,
+  cl.PostId AS RelatedPostId
+FROM Comments AS cl
+WHERE
+  cl.Score > 5 AND cl.UserId IS NOT NULL
+LIMIT 100;

@@ -1,0 +1,324 @@
+-- {"query": "7820.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 3202} 
+WITH UserEngagement AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT b.Id) as Badges,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        COUNT(DISTINCT c.Id) as CommentsMade,
+        COUNT(DISTINCT pl.Id) as LinksCreated,
+        AVG(CAST(p.Score AS FLOAT)) as AvgPostScore,
+        MAX(p.CreationDate) as LastPostDate,
+        ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) as PostRank,
+        RANK() OVER (ORDER BY u.Reputation DESC) as ReputationRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN PostLinks pl ON u.Id = pl.Id
+    WHERE u.AccountId IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostStats AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END as HasAcceptedAnswer,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END as IsClosed,
+        DATEDIFF(day, p.CreationDate, COALESCE(p.ClosedDate, cast('2024-10-01 12:34:56' as timestamp))) as AgeInDays,
+        COALESCE(p.Tags, '') as TagString,
+        SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2) as CleanTags,
+        STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><') as TagsArray,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) as ScoreRankByType,
+        RANK() OVER (ORDER BY p.ViewCount DESC) as ViewRank,
+        DENSE_RANK() OVER (ORDER BY p.CreationDate DESC) as RecencyRank
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        COALESCE(t.Count, 0) as EffectiveCount,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            WHEN t.Count > 10 THEN 'Niche'
+            ELSE 'Rare'
+        END as TagCategory,
+        CASE 
+            WHEN t.IsRequired = 1 THEN 'Required Tag'
+            WHEN t.IsModeratorOnly = 1 THEN 'Moderator Only Tag'
+            ELSE 'Regular Tag'
+        END as TagType,
+        (SELECT COUNT(*) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%') as RelatedPosts,
+        (SELECT AVG(Score) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%') as AvgScore,
+        STRING_AGG(DISTINCT p.OwnerUserId, ',') as AssociatedUsers
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    GROUP BY t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId, t.IsRequired, t.IsModeratorOnly
+),
+AdvancedStats AS (
+    SELECT 
+        ps.PostId,
+        ps.Title,
+        ps.Score,
+        ps.ViewCount,
+        ps.AnswerCount,
+        ps.CommentCount,
+        ps.FavoriteCount,
+        ps.CreationDate,
+        ps.OwnerUserId,
+        ps.PostTypeId,
+        ps.HasAcceptedAnswer,
+        ps.IsClosed,
+        ps.AgeInDays,
+        ps.ScoreRankByType,
+        ps.ViewRank,
+        ps.RecencyRank,
+        ps.TagsArray,
+        CASE 
+            WHEN ps.Score > 100 THEN 'Highly Upvoted'
+            WHEN ps.Score > 10 THEN 'Moderately Upvoted'
+            WHEN ps.Score > 0 THEN 'Slightly Upvoted'
+            ELSE 'Not Upvoted'
+        END as UpvoteStatus,
+        CASE 
+            WHEN ps.ViewCount > 1000 THEN 'Viral'
+            WHEN ps.ViewCount > 100 THEN 'Popular'
+            WHEN ps.ViewCount > 10 THEN 'Moderate'
+            ELSE 'Underground'
+        END as PopularityLevel,
+        CASE 
+            WHEN ps.CommentCount > 50 THEN 'Very Active'
+            WHEN ps.CommentCount > 10 THEN 'Moderately Active'
+            ELSE 'Quiet'
+        END as CommentActivity,
+        CASE 
+            WHEN ps.AnswerCount > 20 THEN 'Highly Answered'
+            WHEN ps.AnswerCount > 5 THEN 'Moderately Answered'
+            WHEN ps.AnswerCount > 0 THEN 'Slightly Answered'
+            ELSE 'No Answers'
+        END as AnswerStatus,
+        COALESCE(
+            (SELECT STRING_AGG(b.Name, ', ') 
+             FROM Badges b 
+             WHERE b.UserId = ps.OwnerUserId 
+             AND b.Date BETWEEN ps.CreationDate AND ps.CreationDate + INTERVAL '30 days'),
+            'No Recent Badges'
+        ) as RecentBadges,
+        COALESCE(
+            (SELECT STRING_AGG(pp.Title, ' | ') 
+             FROM Posts pp 
+             WHERE pp.ParentId = ps.PostId),
+            'No Related Posts'
+        ) as RelatedPostTitles,
+        COALESCE(
+            (SELECT COUNT(*) 
+             FROM PostHistory ph 
+             WHERE ph.PostId = ps.PostId 
+             AND ph.PostHistoryTypeId IN (1, 2, 3)),
+            0
+        ) as EditCount,
+        COALESCE(
+            (SELECT COUNT(*) 
+             FROM Comments c 
+             WHERE c.PostId = ps.PostId 
+             AND c.Score > 5),
+            0
+        ) as HighScoreComments,
+        CASE 
+            WHEN EXISTS (
+                SELECT 1 FROM PostHistory ph 
+                WHERE ph.PostId = ps.PostId 
+                AND ph.PostHistoryTypeId = 10
+            ) THEN 'Was Closed'
+            ELSE 'Not Closed'
+        END as ClosureStatus
+    FROM PostStats ps
+),
+UserActivityByPostType AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        COUNT(p.Id) as TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) as Questions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) as Answers,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END) as AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE NULL END) as AvgAnswerScore,
+        COUNT(Badges.Id) as BadgesEarned,
+        MAX(CASE WHEN p.PostTypeId = 1 THEN p.CreationDate END) as LastQuestionDate,
+        MAX(CASE WHEN p.PostTypeId = 2 THEN p.CreationDate END) as LastAnswerDate,
+        DATEDIFF(day, MIN(p.CreationDate), MAX(p.CreationDate)) as ActiveDays,
+        (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = u.Id AND p2.ViewCount > 1000) as ViralPosts
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges ON u.Id = Badges.UserId
+    GROUP BY u.Id, u.DisplayName
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        a.Title,
+        a.Score,
+        a.ViewCount,
+        a.AnswerCount,
+        a.CommentCount,
+        a.OwnerUserId,
+        u.DisplayName as OwnerName,
+        a.CreationDate,
+        a.TagString,
+        a.ScoreRankByType,
+        a.ViewRank,
+        a.RecencyRank,
+        a.UpvoteStatus,
+        a.PopularityLevel,
+        a.CommentActivity,
+        a.AnswerStatus,
+        a.ClosureStatus,
+        a.EditCount,
+        a.HighScoreComments,
+        a.RecentBadges,
+        a.RelatedPostTitles,
+        'Post-' || a.PostId as PostIdentifier,
+        CONCAT('Score: ', a.Score, ' | Views: ', a.ViewCount, ' | Answers: ', a.AnswerCount) as SummaryMetrics,
+        CASE 
+            WHEN a.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) 
+            AND a.ViewCount > (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = 1)
+            THEN 'Premium Quality'
+            WHEN a.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) 
+            OR a.ViewCount > (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = 1)
+            THEN 'Above Average'
+            ELSE 'Below Average'
+        END as QualityLevel,
+        ROW_NUMBER() OVER (ORDER BY a.Score DESC, a.ViewCount DESC) as OverallRank,
+        COUNT(*) OVER() as TotalPosts,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = a.OwnerUserId) as UserPostCount,
+        (SELECT AVG(Score) FROM Posts p WHERE p.OwnerUserId = a.OwnerUserId) as UserAvgScore,
+        a.AgeInDays,
+        CASE 
+            WHEN a.AgeInDays > 365 THEN 'Old Post'
+            WHEN a.AgeInDays > 30 THEN 'Recent Post'
+            WHEN a.AgeInDays > 7 THEN 'Weekly Post'
+            ELSE 'Daily Post'
+        END as TimeCategory,
+        CASE 
+            WHEN ARRAY_LENGTH(a.TagsArray, 1) > 3 THEN 'Multi-Tagged'
+            WHEN ARRAY_LENGTH(a.TagsArray, 1) = 1 THEN 'Single Tagged'
+            ELSE 'Tag-Minimal'
+        END as TaggingIntensity,
+        CASE 
+            WHEN COALESCE(a.AnswerCount, 0) = 0 AND a.PostTypeId = 1 THEN 'Unanswered Question'
+            WHEN COALESCE(a.AnswerCount, 0) > 0 AND a.PostTypeId = 1 THEN 'Answered Question'
+            WHEN a.PostTypeId = 2 THEN 'Answer Post'
+            ELSE 'Unknown'
+        END as PostNature,
+        CASE 
+            WHEN a.Score > 50 THEN 'High Impact'
+            WHEN a.Score > 20 THEN 'Medium Impact'
+            WHEN a.Score > 5 THEN 'Low Impact'
+            ELSE 'Minimal Impact'
+        END as ImpactLevel,
+        CASE 
+            WHEN a.CommentCount > 10 THEN a.CommentCount * 0.1 + a.ViewCount * 0.05
+            ELSE a.ViewCount * 0.1
+        END as EngagementScore,
+        CASE 
+            WHEN a.FavoriteCount IS NOT NULL AND a.FavoriteCount > 0 
+            THEN 100 * (a.FavoriteCount::FLOAT / NULLIF((SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = a.OwnerUserId), 0))
+            ELSE 0
+        END as FavoritePercentage,
+        RANK() OVER (PARTITION BY a.OwnerUserId ORDER BY a.Score DESC) as OwnerScoreRank,
+        LAG(a.Score, 1) OVER (ORDER BY a.CreationDate DESC) as PrevScore,
+        LAG(a.ViewCount, 1) OVER (ORDER BY a.CreationDate DESC) as PrevViewCount,
+        (a.Score - COALESCE(LAG(a.Score, 1) OVER (ORDER BY a.CreationDate DESC), 0)) as ScoreChange,
+        CASE 
+            WHEN a.IsClosed = 1 THEN 'Closed'
+            WHEN a.HasAcceptedAnswer = 1 THEN 'Accepted'
+            ELSE 'Open'
+        END as StatusIndicator,
+        COALESCE(
+            (SELECT STRING_AGG(ut.Name, ', ') 
+             FROM Users u2 
+             JOIN Posts p ON p.OwnerUserId = u2.Id
+             JOIN Posts p3 ON p3.ParentId = p.Id
+             JOIN UserEngagement ue ON ue.UserId = u2.Id
+             WHERE p3.Id = a.PostId 
+             AND u2.Id NOT IN (u.Id)),
+            'No Contributors'
+        ) as SecondaryContributors
+    FROM AdvancedStats a
+    JOIN Users u ON a.OwnerUserId = u.Id
+    WHERE a.Score > -1000000
+)
+SELECT 
+    PostIdentifier,
+    Title,
+    Score,
+    ViewCount,
+    AnswerCount,
+    CommentCount,
+    SummaryMetrics,
+    QualityLevel,
+    OverallRank,
+    TotalPosts,
+    UserPostCount,
+    UserAvgScore,
+    AgeInDays,
+    TimeCategory,
+    TaggingIntensity,
+    PostNature,
+    ImpactLevel,
+    EngagementScore,
+    FavoritePercentage,
+    OwnerScoreRank,
+    ScoreChange,
+    StatusIndicator,
+    SecondaryContributors,
+    CASE 
+        WHEN Score > 100 AND ViewCount > 500 THEN 'Viral Potential'
+        WHEN Score > 50 AND ViewCount > 200 THEN 'Good Potential'
+        WHEN Score > 10 AND ViewCount > 100 THEN 'Average Potential'
+        ELSE 'Low Potential'
+    END as PotentialRating
+FROM ComplexPostAnalysis
+WHERE PostNature IN ('Answered Question', 'Answer Post', 'Unanswered Question')
+AND (Score > 0 OR ViewCount > 0)
+AND (TaggingIntensity = 'Multi-Tagged' OR TaggingIntensity = 'Single Tagged')
+AND NOT (PostIdentifier LIKE '%Post-1000000%' OR PostIdentifier LIKE '%Post-2000000%')
+AND (FavoritePercentage > 5 OR FavoritePercentage IS NULL)
+AND NOT EXISTS (
+    SELECT 1 FROM Posts p 
+    WHERE p.Id = PostIdentifier::INTEGER 
+    AND p.PostTypeId = 3
+)
+AND NOT EXISTS (
+    SELECT 1 FROM Posts p 
+    WHERE p.Id = PostIdentifier::INTEGER 
+    AND p.PostTypeId = 4
+)
+AND (ScoreChange BETWEEN -100 AND 100 OR ScoreChange IS NULL)
+AND (ScoreChange > 0 OR ScoreChange IS NULL)
+AND (EngagementScore > 10 OR EngagementScore IS NULL)
+AND (ImpactLevel IN ('High Impact', 'Medium Impact', 'Low Impact'))
+AND NOT (OwnerScoreRank = 1 AND OverallRank <= 10)
+AND (TimeCategory IN ('Old Post', 'Recent Post', 'Weekly Post', 'Daily Post'))
+ORDER BY OverallRank ASC, Score DESC, ViewCount DESC
+LIMIT 10000;

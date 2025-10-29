@@ -1,0 +1,93 @@
+WITH RankedUserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN pt.Name = 'Question' THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN pt.Name = 'Answer' THEN 1 ELSE 0 END) AS AnswerCount,
+        AVG(p.Score) AS AveragePostScore,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.Id) AS ReputationRank,
+        LAG(u.Reputation, 1, 0) OVER (ORDER BY u.Reputation DESC, u.Id) AS PreviousReputation
+    FROM Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE u.CreationDate >= DATE '2010-01-01'
+      AND u.DownVotes < 100
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+HighEngagementPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.AnswerCount,
+        COUNT(c.Id) AS CommentCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.AnswerCount DESC) AS PostRankForUser,
+        AVG(p.CommentCount) OVER (PARTITION BY p.OwnerUserId) AS AvgCommentCountForUser
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    WHERE p.PostTypeId = 1 -- Questions only
+      AND p.CreationDate >= (cast('2024-10-01' as date) - INTERVAL '1 year')
+      AND p.AnswerCount > 5
+      AND p.FavoriteCount > 10
+    GROUP BY p.Id, p.OwnerUserId, p.Title, p.CreationDate, p.Score, p.AnswerCount, p.CommentCount
+    HAVING COUNT(c.Id) > AVG(p.CommentCount) OVER (PARTITION BY p.OwnerUserId) * 2
+),
+UserPostPerformance AS (
+    SELECT
+        rua.UserId,
+        rua.DisplayName,
+        rua.Reputation,
+        rua.TotalPosts,
+        rua.AnswerCount,
+        rua.AveragePostScore,
+        hep.PostId AS HighEngagementPostId,
+        hep.Title AS HighEngagementPostTitle,
+        hep.Score AS HighEngagementPostScore,
+        (rua.Reputation * 1.0 / (rua.TotalPosts + 1)) AS ReputationPerPost
+    FROM RankedUserActivity rua
+    LEFT JOIN HighEngagementPosts hep ON rua.UserId = hep.OwnerUserId AND hep.PostRankForUser = 1
+    WHERE rua.TotalPosts > 50
+),
+LatestEdits AS (
+    SELECT
+        ph.PostId,
+        MAX(ph.CreationDate) AS LatestEditDate,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditCount
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6) -- Title, Body, Tags edits
+    GROUP BY ph.PostId
+    HAVING MAX(ph.CreationDate) >= (cast('2024-10-01' as date) - INTERVAL '3 months')
+)
+SELECT
+    upp.UserId,
+    upp.DisplayName,
+    upp.Reputation,
+    upp.TotalPosts,
+    upp.AnswerCount,
+    upp.AveragePostScore,
+    upp.ReputationPerPost,
+    upp.HighEngagementPostId,
+    upp.HighEngagementPostTitle,
+    upp.HighEngagementPostScore,
+    le_post.LatestEditDate,
+    le_post.EditCount,
+    CASE
+        WHEN upp.Reputation > 10000 AND upp.AnswerCount > 500 THEN 'High Authority'
+        WHEN upp.Reputation < 500 AND upp.TotalPosts < 10 THEN 'New Contributor'
+        ELSE 'Regular Contributor'
+    END AS UserTier,
+    COALESCE(u.Location, 'Unknown Location') AS UserLocation,
+    CASE WHEN upp.HighEngagementPostId IS NOT NULL THEN 'Yes' ELSE 'No' END AS HasHighEngagementPost,
+    CAST((cast('2024-10-01' as date) - DATE(u.CreationDate)) AS INTEGER) AS AccountAgeDays,
+    (SELECT COUNT(*) FROM Votes v WHERE v.UserId = upp.UserId AND v.VoteTypeId = 2) AS TotalUpvotesGiven
+FROM UserPostPerformance upp
+LEFT JOIN Users u ON upp.UserId = u.Id
+LEFT JOIN LatestEdits le_post ON upp.HighEngagementPostId = le_post.PostId
+WHERE upp.AveragePostScore > 0
+   OR upp.TotalPosts > 1000
+ORDER BY upp.Reputation DESC, upp.TotalPosts DESC
+LIMIT 100;

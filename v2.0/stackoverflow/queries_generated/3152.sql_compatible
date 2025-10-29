@@ -1,0 +1,147 @@
+WITH
+    user_badges AS (
+        SELECT
+            b.UserId,
+            SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_cnt,
+            SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_cnt,
+            SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_cnt,
+            COUNT(*)                                      AS total_badges
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+    latest_activity AS (
+        SELECT
+            u.Id AS user_id,
+            GREATEST(
+                COALESCE(u.LastAccessDate, TIMESTAMP '1970-01-01 00:00:00'),
+                COALESCE(p.LastActivityDate, TIMESTAMP '1970-01-01 00:00:00'),
+                COALESCE(c.CreationDate, TIMESTAMP '1970-01-01 00:00:00')
+            ) AS last_seen
+        FROM Users u
+        LEFT JOIN LATERAL (
+            SELECT MAX(LastActivityDate) AS LastActivityDate
+            FROM Posts p
+            WHERE p.OwnerUserId = u.Id
+        ) p ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT MAX(CreationDate) AS CreationDate
+            FROM Comments c
+            WHERE c.UserId = u.Id
+        ) c ON TRUE
+    ),
+    question_stats AS (
+        SELECT
+            p.OwnerUserId AS user_id,
+            COUNT(*)                                 AS question_cnt,
+            AVG(p.Score)                             AS avg_score,
+            PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) AS median_score,
+            STDDEV_POP(p.Score)                      AS stddev_score
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+          AND p.OwnerUserId IS NOT NULL
+        GROUP BY p.OwnerUserId
+    ),
+    user_tags AS (
+        SELECT
+            p.OwnerUserId               AS user_id,
+            UNNEST(STRING_TO_ARRAY(
+                REGEXP_REPLACE(p.Tags, '^<|>$', '', 'g'),
+                '><'
+            ))                         AS tag
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+          AND p.Tags IS NOT NULL
+    ),
+    top_tags AS (
+        SELECT
+            ut.user_id,
+            STRING_AGG(ut.tag, ', ' ORDER BY cnt DESC) AS top_3_tags
+        FROM (
+            SELECT
+                user_id,
+                tag,
+                COUNT(*) AS cnt,
+                ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY COUNT(*) DESC) AS rn
+            FROM user_tags
+            GROUP BY user_id, tag
+        ) ut
+        WHERE ut.rn <= 3
+        GROUP BY ut.user_id
+    ),
+    gold_and_bronze AS (
+        SELECT ub.UserId
+        FROM user_badges ub
+        WHERE ub.gold_cnt > 0 AND ub.bronze_cnt > 0
+    ),
+    gold_only AS (
+        SELECT ub.UserId
+        FROM user_badges ub
+        WHERE ub.gold_cnt > 0
+          AND ub.silver_cnt = 0
+          AND ub.bronze_cnt = 0
+    )
+
+SELECT
+    u.Id                                 AS user_id,
+    COALESCE(u.DisplayName, 'Anonymous') AS display_name,
+    u.Reputation,
+    COALESCE(qs.question_cnt, 0)          AS total_questions,
+    ROUND(COALESCE(qs.avg_score, 0)::numeric, 2)   AS avg_question_score,
+    COALESCE(qs.median_score, 0)          AS median_question_score,
+    ROUND(COALESCE(qs.stddev_score, 0)::numeric, 2) AS stddev_question_score,
+    COALESCE(b.gold_cnt, 0)               AS gold_badges,
+    COALESCE(b.silver_cnt, 0)             AS silver_badges,
+    COALESCE(b.bronze_cnt, 0)             AS bronze_badges,
+    COALESCE(t.top_3_tags, '')            AS top_tags,
+    la.last_seen                         AS last_activity,
+    CASE
+        WHEN g.UserId IS NOT NULL THEN 'Gold+Bronze'
+        WHEN go.UserId IS NOT NULL THEN 'Gold Only'
+        ELSE 'Other'
+    END                                   AS badge_category,
+    ROUND(
+        (u.Reputation * 0.4) +
+        ((COALESCE(b.gold_cnt,0) * 50) +
+         (COALESCE(b.silver_cnt,0) * 20) +
+         (COALESCE(b.bronze_cnt,0) * 5)) * 0.3 +
+        (EXTRACT(EPOCH FROM (CAST(TIMESTAMP '2024-10-01 12:34:56' AS TIMESTAMP) - la.last_seen)) / 86400) * -0.2,
+        2
+    ) AS activity_index
+FROM Users u
+LEFT JOIN user_badges b      ON b.UserId = u.Id
+LEFT JOIN question_stats qs  ON qs.user_id = u.Id
+LEFT JOIN top_tags t         ON t.user_id = u.Id
+LEFT JOIN latest_activity la ON la.user_id = u.Id
+LEFT JOIN gold_and_bronze g   ON g.UserId = u.Id
+LEFT JOIN gold_only go        ON go.UserId = u.Id
+WHERE u.Id NOT IN (SELECT UserId FROM Users WHERE AccountId IS NULL)
+ORDER BY activity_index DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    u.Id,
+    COALESCE(u.DisplayName, 'Anonymous'),
+    u.Reputation,
+    COALESCE(qs.question_cnt,0),
+    ROUND(COALESCE(qs.avg_score,0)::numeric,2),
+    COALESCE(qs.median_score,0),
+    ROUND(COALESCE(qs.stddev_score,0)::numeric,2),
+    0,0,0,
+    COALESCE(t.top_3_tags,''),
+    la.last_seen,
+    'No Badges',
+    ROUND(
+        (u.Reputation * 0.4) +
+        (EXTRACT(EPOCH FROM (CAST(TIMESTAMP '2024-10-01 12:34:56' AS TIMESTAMP) - la.last_seen)) / 86400) * -0.2,
+        2
+    ) AS activity_index
+FROM Users u
+LEFT JOIN question_stats qs  ON qs.user_id = u.Id
+LEFT JOIN top_tags t         ON t.user_id = u.Id
+LEFT JOIN latest_activity la ON la.user_id = u.Id
+WHERE NOT EXISTS (SELECT 1 FROM user_badges ub WHERE ub.UserId = u.Id)
+  AND COALESCE(qs.question_cnt,0) > 0
+ORDER BY activity_index DESC
+LIMIT 50;

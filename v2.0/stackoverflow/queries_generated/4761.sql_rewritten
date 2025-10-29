@@ -1,0 +1,120 @@
+-- {"query": "4761.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1329} 
+WITH QuestionCounts AS (
+    SELECT
+        p.OwnerUserId,
+        COUNT(p.Id) AS TotalQuestions,
+        SUM(CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END) AS ClosedQuestions,
+        AVG(p.AnswerCount) AS AvgAnswersPerQuestion,
+        MAX(p.FavoriteCount) AS MaxFavorites
+    FROM Posts p
+    WHERE p.PostTypeId = 1 -- Questions
+    GROUP BY p.OwnerUserId
+),
+AnswerMetrics AS (
+    SELECT
+        a.OwnerUserId,
+        COUNT(a.Id) AS TotalAnswers,
+        AVG(a.Score) AS AvgAnswerScore,
+        SUM(CASE WHEN a.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END) AS AcceptedAnswerCount
+    FROM Posts a
+    JOIN Posts q ON a.ParentId = q.Id
+    WHERE a.PostTypeId = 2 -- Answers
+    GROUP BY a.OwnerUserId
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Views AS ProfileViews,
+        COALESCE(qc.TotalQuestions, 0) AS NumQuestions,
+        COALESCE(qc.ClosedQuestions, 0) AS NumClosedQuestions,
+        qc.AvgAnswersPerQuestion,
+        qc.MaxFavorites,
+        COALESCE(am.TotalAnswers, 0) AS NumAnswers,
+        am.AvgAnswerScore,
+        am.AcceptedAnswerCount,
+        (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id AND c.Score > 5) AS HighScoreComments,
+        (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 2 AND v.CreationDate > DATE('now', '-1 year')) AS RecentUpvotesGiven
+    FROM Users u
+    LEFT JOIN QuestionCounts qc ON u.Id = qc.OwnerUserId
+    LEFT JOIN AnswerMetrics am ON u.Id = am.OwnerUserId
+),
+TagPopularity AS (
+    SELECT
+        t.TagName,
+        t.Count AS TagCount,
+        COUNT(DISTINCT pt.OwnerUserId) AS DistinctQuestioners,
+        SUM(pt.AnswerCount) AS TotalAnswersForTag
+    FROM Tags t
+    JOIN Posts pt ON pt.Tags LIKE '%' || t.TagName || '%' AND pt.PostTypeId = 1
+    GROUP BY t.TagName, t.Count
+    HAVING t.Count > 1000
+),
+RecentClosedQuestions AS (
+    SELECT
+        PostId,
+        Comment AS CloseReasonComment,
+        CreationDate AS CloseDate
+    FROM PostHistory
+    WHERE PostHistoryTypeId = 10 -- Post Closed
+    AND CreationDate >= DATE('now', '-30 days')
+)
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.CreationDate,
+    ua.ProfileViews,
+    ua.NumQuestions,
+    ua.NumClosedQuestions,
+    ROUND(ua.AvgAnswersPerQuestion, 2) AS AvgAnswersPerQuestion,
+    ua.MaxFavorites,
+    ua.NumAnswers,
+    ROUND(ua.AvgAnswerScore, 2) AS AvgAnswerScore,
+    ua.AcceptedAnswerCount,
+    ua.HighScoreComments,
+    ua.RecentUpvotesGiven,
+    tp.TagName AS MostPopularTagName,
+    tp.TagCount AS MostPopularTagCount,
+    tp.DistinctQuestioners AS DistinctUsersAskingTag,
+    tp.TotalAnswersForTag AS TotalAnswersForPopularTag,
+    CASE
+        WHEN ua.Reputation > 10000 THEN 'High Reputation'
+        WHEN ua.Reputation > 1000 THEN 'Medium Reputation'
+        ELSE 'Low Reputation'
+    END AS ReputationLevel,
+    COALESCE(rcq.CloseReasonComment, 'No Recent Close Reason') AS RecentCloseReason,
+    DENSE_RANK() OVER (ORDER BY ua.Reputation DESC) AS ReputationRank,
+    ROW_NUMBER() OVER (PARTITION BY CASE WHEN ua.Reputation > 1000 THEN 'High' ELSE 'Low' END ORDER BY ua.CreationDate DESC) AS RecentUserNumber
+FROM UserActivity ua
+LEFT JOIN TagPopularity tp ON tp.TagName = (SELECT TagName FROM TagPopularity ORDER BY TagCount DESC LIMIT 1)
+LEFT JOIN RecentClosedQuestions rcq ON ua.UserId = (SELECT UserId FROM RecentClosedQuestions ORDER BY CloseDate DESC LIMIT 1)
+WHERE ua.NumQuestions > 5 OR ua.NumAnswers > 10
+UNION ALL
+SELECT
+    NULL AS UserId,
+    'System Aggregate' AS DisplayName,
+    AVG(Reputation) AS Reputation,
+    MIN(CreationDate) AS CreationDate,
+    SUM(ProfileViews) AS ProfileViews,
+    SUM(NumQuestions) AS NumQuestions,
+    SUM(NumClosedQuestions) AS NumClosedQuestions,
+    AVG(AvgAnswersPerQuestion) AS AvgAnswersPerQuestion,
+    MAX(MaxFavorites) AS MaxFavorites,
+    SUM(NumAnswers) AS NumAnswers,
+    AVG(AvgAnswerScore) AS AvgAnswerScore,
+    SUM(AcceptedAnswerCount) AS AcceptedAnswerCount,
+    SUM(HighScoreComments) AS HighScoreComments,
+    SUM(RecentUpvotesGiven) AS RecentUpvotesGiven,
+    'Overall Average' AS MostPopularTagName,
+    AVG(TagCount) AS MostPopularTagCount,
+    SUM(DistinctQuestioners) AS DistinctUsersAskingTag,
+    SUM(TotalAnswersForTag) AS TotalAnswersForPopularTag,
+    'Aggregate Level' AS ReputationLevel,
+    'N/A' AS RecentCloseReason,
+    NULL AS ReputationRank,
+    NULL AS RecentUserNumber
+FROM UserActivity ua
+LEFT JOIN TagPopularity tp ON tp.TagName = (SELECT TagName FROM TagPopularity ORDER BY TagCount DESC LIMIT 1);

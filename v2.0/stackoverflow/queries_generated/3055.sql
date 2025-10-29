@@ -1,0 +1,130 @@
+-- {"query": "3055.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2144} 
+
+WITH TagStats AS (
+    SELECT
+        t.TagName,
+        COUNT(p.Id)                                   AS QuestionCount,
+        SUM(p.Score)                                  AS TotalScore,
+        MAX(p.CreationDate)                           AS LatestQuestionDate
+    FROM Tags t
+    LEFT JOIN Posts p
+        ON p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+        AND p.PostTypeId = 1                -- only questions
+    GROUP BY t.TagName
+),
+
+UserActivity AS (
+    SELECT
+        u.Id                                          AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.UpVotes,0) - COALESCE(u.DownVotes,0) AS NetVotes,
+        COUNT(DISTINCT p.Id)                          AS PostsAuthored,
+        COUNT(DISTINCT c.Id)                          AS CommentsMade,
+        MAX(p.CreationDate)                           AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts    p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId      = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes
+),
+
+TopGoldBadges AS (
+    SELECT
+        b.UserId,
+        STRING_AGG(b.Name, ', ')                      AS GoldBadges,
+        MAX(b.Date)                                   AS LatestGoldBadge
+    FROM Badges b
+    WHERE b.Class = 1                                 -- gold badges only
+    GROUP BY b.UserId
+),
+
+RecentEdits AS (
+    SELECT
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        ph.UserId,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId
+                           ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4,5,6)               -- edit title/body/tags
+),
+
+UserLatestQuestion AS (
+    SELECT
+        u.Id                                            AS UserId,
+        (SELECT p.Id
+         FROM Posts p
+         WHERE p.OwnerUserId = u.Id
+           AND p.PostTypeId = 1
+         ORDER BY p.CreationDate DESC
+         LIMIT 1)                                       AS LatestQuestionId
+    FROM Users u
+)
+
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.NetVotes,
+    ua.PostsAuthored,
+    ua.CommentsMade,
+    COALESCE(tgb.GoldBadges, 'None')                    AS GoldBadges,
+    COALESCE(tgb.LatestGoldBadge,
+             TIMESTAMP '1970-01-01 00:00:00')           AS LatestGoldBadge,
+    ts.TagName,
+    ts.QuestionCount,
+    ts.TotalScore,
+    ts.LatestQuestionDate,
+    CASE
+        WHEN ts.TotalScore IS NULL           THEN 'No Questions'
+        WHEN ts.TotalScore > 1000            THEN 'Hot Tag'
+        ELSE                                 'Regular Tag'
+    END                                                AS TagCategory,
+    re.PostId                                          AS RecentlyEditedPostId,
+    re.PostHistoryTypeId,
+    re.CreationDate                                    AS EditDate,
+    re.UserId                                          AS EditorUserId
+FROM UserActivity ua
+FULL OUTER JOIN TopGoldBadges tgb
+    ON tgb.UserId = ua.UserId
+LEFT JOIN UserLatestQuestion ulq
+    ON ulq.UserId = ua.UserId
+LEFT JOIN LATERAL (
+    SELECT UNNEST(string_to_array(p.Tags, '><'))::varchar AS TagName,
+           p.Id                                            AS PostId
+    FROM Posts p
+    WHERE p.Id = ulq.LatestQuestionId
+) pt
+    ON TRUE
+LEFT JOIN TagStats ts
+    ON ts.TagName = pt.TagName
+LEFT JOIN RecentEdits re
+    ON re.PostId = pt.PostId
+   AND re.rn = 1
+WHERE ua.Reputation > 1000
+   OR tgb.GoldBadges IS NOT NULL
+   OR ts.QuestionCount IS NOT NULL
+
+UNION ALL
+
+SELECT
+    NULL                                              AS UserId,
+    NULL                                              AS DisplayName,
+    NULL                                              AS Reputation,
+    NULL                                              AS NetVotes,
+    NULL                                              AS PostsAuthored,
+    NULL                                              AS CommentsMade,
+    NULL                                              AS GoldBadges,
+    NULL                                              AS LatestGoldBadge,
+    t.TagName,
+    t.QuestionCount,
+    t.TotalScore,
+    t.LatestQuestionDate,
+    'Tag Summary'                                     AS TagCategory,
+    NULL,
+    NULL,
+    NULL
+FROM TagStats t
+WHERE t.QuestionCount > 100
+ORDER BY Reputation DESC NULLS LAST;

@@ -1,0 +1,298 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        COUNT(DISTINCT c.Id) AS Comments,
+        COUNT(DISTINCT b.Id) AS Badges,
+        MAX(p.CreationDate) AS LastPostDate,
+        COALESCE(SUM(p.Score), 0) AS TotalScore,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+                ROUND(CAST(SUM(p.Score) AS NUMERIC) / NULLIF(COUNT(DISTINCT p.Id),0)::numeric, 2)
+            ELSE 0 
+        END AS AvgScorePerPost,
+        STRING_AGG(DISTINCT LEFT(p.Tags, 20), ', ') AS TagSummary
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= TIMESTAMP '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopUsers AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.TotalPosts,
+        uas.Questions,
+        uas.Answers,
+        uas.Comments,
+        uas.Badges,
+        uas.LastPostDate,
+        uas.TotalScore,
+        uas.AvgScorePerPost,
+        uas.TagSummary,
+        ROW_NUMBER() OVER (ORDER BY uas.TotalScore DESC, uas.Reputation DESC) AS RankScore,
+        DENSE_RANK() OVER (ORDER BY uas.TotalPosts DESC) AS RankPosts,
+        NTILE(10) OVER (ORDER BY uas.Reputation DESC) AS ReputationQuantile
+    FROM UserActivityStats uas
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.Tags,
+        p.ParentId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END AS PostTypeDesc,
+        CASE 
+            WHEN p.Score > 0 THEN CONCAT('High ', CASE WHEN p.PostTypeId = 1 THEN 'Question' ELSE 'Answer' END)
+            ELSE CONCAT('Low ', CASE WHEN p.PostTypeId = 1 THEN 'Question' ELSE 'Answer' END)
+        END AS ScoreCategory,
+        COALESCE(
+            (SELECT COUNT(*) FROM Posts WHERE ParentId = p.Id AND PostTypeId = 2 AND Score > 0),
+            0
+        ) AS HighScoreAnswers,
+        LAG(p.CreationDate, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostDate,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousScore,
+        ROW_NUMBER() OVER (ORDER BY p.Score DESC) AS ScoreRank,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS UserAvgScore,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND CHAR_LENGTH(p.Tags) > 3 
+            THEN string_to_array(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2), '><')
+            ELSE ARRAY[]::character varying[]
+        END AS TagArray
+    FROM Posts p
+    WHERE p.CreationDate >= TIMESTAMP '2015-01-01'
+),
+ComplexQuery AS (
+    SELECT 
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.TotalPosts,
+        tu.Questions,
+        tu.Answers,
+        tu.Comments,
+        tu.Badges,
+        tu.LastPostDate,
+        tu.TotalScore,
+        tu.AvgScorePerPost,
+        tu.TagSummary,
+        tu.RankScore,
+        tu.RankPosts,
+        tu.ReputationQuantile,
+        pa.PostId,
+        pa.Title,
+        pa.Body,
+        pa.Score AS PostScore,
+        pa.ViewCount,
+        pa.CreationDate AS PostCreationDate,
+        pa.PostTypeId,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.Tags AS PostTags,
+        pa.PostTypeDesc,
+        pa.ScoreCategory,
+        pa.HighScoreAnswers,
+        pa.PreviousPostDate,
+        pa.PreviousScore,
+        pa.ScoreRank,
+        pa.UserAvgScore,
+        pa.TagArray,
+        CASE 
+            WHEN pa.ScoreRank <= 10 THEN CONCAT('Top ', pa.ScoreRank, ' Scoring Post')
+            WHEN pa.ScoreRank BETWEEN 11 AND 50 THEN CONCAT('Mid ', pa.ScoreRank, ' Scoring Post')
+            ELSE CONCAT('Lower ', pa.ScoreRank, ' Scoring Post')
+        END AS PostPerformanceTier,
+        CASE 
+            WHEN pa.Score > 0 AND pa.ViewCount > 0 
+            THEN ROUND((CAST(pa.Score AS NUMERIC) / NULLIF(pa.ViewCount,0)) * 1000, 2)
+            ELSE 0 
+        END AS ScorePerThousandViews,
+        COALESCE(
+            (SELECT COUNT(*) 
+             FROM PostHistory ph 
+             WHERE ph.PostId = pa.PostId 
+               AND ph.PostHistoryTypeId IN (1, 2, 4, 5, 6) 
+               AND ph.CreationDate > TIMESTAMP '2020-01-01'),
+            0
+        ) AS RecentEdits,
+        CASE 
+            WHEN pa.Tags IS NOT NULL THEN CHAR_LENGTH(pa.Tags)
+            ELSE 0 
+        END AS TagLength,
+        CAST(DATE_PART('day', CAST('2024-10-01 12:34:56' AS TIMESTAMP) - pa.CreationDate) AS INTEGER) AS DaysSincePost,
+        CASE WHEN pa.PreviousPostDate IS NOT NULL 
+            THEN CAST(DATE_PART('day', pa.CreationDate - pa.PreviousPostDate) AS INTEGER)
+            ELSE NULL
+        END AS DaysBetweenPosts,
+        CASE WHEN pa.PreviousScore IS NOT NULL 
+            THEN pa.Score - pa.PreviousScore
+            ELSE NULL
+        END AS ScoreChange
+    FROM TopUsers tu
+    INNER JOIN PostAnalysis pa ON tu.UserId = pa.OwnerUserId
+    WHERE (
+        pa.PostTypeDesc IN ('Question', 'Answer') 
+        AND pa.Score > 0 
+        AND pa.ViewCount > 10
+    )
+    AND (
+        (tu.TotalPosts > 100 AND tu.Reputation > 10000)
+        OR (tu.TotalPosts > 50 AND tu.Reputation > 5000)
+        OR (tu.TotalPosts > 25 AND tu.Reputation > 1000)
+    )
+)
+SELECT *
+FROM (
+    SELECT 
+        cq.UserId,
+        cq.DisplayName,
+        cq.Reputation,
+        cq.TotalPosts,
+        cq.Questions,
+        cq.Answers,
+        cq.Comments,
+        cq.Badges,
+        cq.LastPostDate,
+        cq.TotalScore,
+        cq.AvgScorePerPost,
+        cq.TagSummary,
+        cq.RankScore,
+        cq.RankPosts,
+        cq.ReputationQuantile,
+        cq.PostId,
+        cq.Title,
+        cq.Body,
+        cq.PostScore,
+        cq.ViewCount,
+        cq.PostCreationDate,
+        cq.PostTypeId,
+        cq.AnswerCount,
+        cq.CommentCount,
+        cq.PostTags,
+        cq.PostTypeDesc,
+        cq.ScoreCategory,
+        cq.HighScoreAnswers,
+        cq.PreviousPostDate,
+        cq.PreviousScore,
+        cq.ScoreRank,
+        cq.UserAvgScore,
+        cq.TagArray,
+        cq.PostPerformanceTier,
+        cq.ScorePerThousandViews,
+        cq.RecentEdits,
+        cq.TagLength,
+        cq.DaysSincePost,
+        cq.DaysBetweenPosts,
+        cq.ScoreChange,
+        CASE 
+            WHEN cq.TotalPosts > 50 THEN 'Highly Active'
+            WHEN cq.TotalPosts > 25 THEN 'Active'
+            WHEN cq.TotalPosts > 10 THEN 'Moderate'
+            ELSE 'Low'
+        END AS ActivityLevel,
+        CASE 
+            WHEN cq.ScorePerThousandViews > 5 THEN 'High Engagement'
+            WHEN cq.ScorePerThousandViews > 2 THEN 'Medium Engagement'
+            ELSE 'Low Engagement'
+        END AS EngagementLevel,
+        CASE 
+            WHEN cq.ReputationQuantile <= 3 THEN 'Top Tier'
+            WHEN cq.ReputationQuantile <= 6 THEN 'High Tier'
+            WHEN cq.ReputationQuantile <= 8 THEN 'Medium Tier'
+            ELSE 'Low Tier'
+        END AS ReputationTier,
+        COUNT(*) OVER () AS TotalResults,
+        RANK() OVER (ORDER BY cq.PostScore DESC) AS PostRank,
+        PERCENT_RANK() OVER (ORDER BY cq.PostScore DESC) AS PostPercentile
+    FROM ComplexQuery cq
+    WHERE 
+        (cq.PostScore > (SELECT AVG(cq2.PostScore) FROM ComplexQuery cq2) * 1.5)
+        AND (
+            (cq.RecentEdits > 0 AND cq.ScorePerThousandViews > 3)
+            OR (cq.PostTypeDesc = 'Question' AND cq.AnswerCount >= 3)
+            OR (cq.PostTypeDesc = 'Answer' AND cq.ScoreChange > 2)
+        )
+        AND (
+            EXISTS (
+                SELECT 1 FROM Tags t 
+                WHERE t.TagName IN ('sql', 'python', 'java') 
+                  AND (
+                        COALESCE(cq.TagArray, ARRAY[]::character varying[]) && ARRAY[t.TagName] 
+                      )
+            )
+        )
+    UNION ALL
+    SELECT 
+        NULL AS UserId,
+        'TOTAL SUMMARY' AS DisplayName,
+        0 AS Reputation,
+        COUNT(*) AS TotalPosts,
+        0 AS Questions,
+        0 AS Answers,
+        0 AS Comments,
+        0 AS Badges,
+        NULL AS LastPostDate,
+        SUM(PostScore) AS TotalScore,
+        AVG(PostScore) AS AvgScorePerPost,
+        NULL AS TagSummary,
+        0 AS RankScore,
+        0 AS RankPosts,
+        0 AS ReputationQuantile,
+        NULL AS PostId,
+        NULL AS Title,
+        NULL AS Body,
+        NULL AS PostScore,
+        NULL AS ViewCount,
+        NULL AS PostCreationDate,
+        NULL AS PostTypeId,
+        NULL AS AnswerCount,
+        NULL AS CommentCount,
+        NULL AS PostTags,
+        NULL AS PostTypeDesc,
+        NULL AS ScoreCategory,
+        NULL AS HighScoreAnswers,
+        NULL AS PreviousPostDate,
+        NULL AS PreviousScore,
+        NULL AS ScoreRank,
+        NULL AS UserAvgScore,
+        NULL AS TagArray,
+        NULL AS PostPerformanceTier,
+        AVG(ScorePerThousandViews) AS ScorePerThousandViews,
+        NULL AS RecentEdits,
+        NULL AS TagLength,
+        NULL AS DaysSincePost,
+        NULL AS DaysBetweenPosts,
+        NULL AS ScoreChange,
+        'SUMMARY' AS ActivityLevel,
+        'AGGREGATE' AS EngagementLevel,
+        'OVERALL' AS ReputationTier,
+        COUNT(*) OVER () AS TotalResults,
+        0 AS PostRank,
+        0 AS PostPercentile
+    FROM ComplexQuery
+) final
+ORDER BY 
+    CASE WHEN final.UserId IS NULL THEN 1 ELSE 0 END,
+    final.PostScore DESC NULLS LAST,
+    final.TotalScore DESC NULLS LAST
+LIMIT 1000;

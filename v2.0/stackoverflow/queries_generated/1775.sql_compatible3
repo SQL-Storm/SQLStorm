@@ -1,0 +1,186 @@
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.UpVotes,
+        U.DownVotes,
+        U.Views,
+        U.CreationDate,
+        U.LastAccessDate,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS QuestionsOwnedCount,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS AnswersOwnedCount,
+        SUM(P.Score) AS TotalPostScoreOwned,
+        COUNT(DISTINCT B.Id) AS TotalBadgesCount,
+        MAX(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS HasGoldBadge,
+        DENSE_RANK() OVER (ORDER BY U.Reputation DESC, U.UpVotes DESC, U.LastAccessDate DESC) AS ReputationRank
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Badges AS B ON U.Id = B.UserId
+    WHERE U.LastAccessDate >= DATE '2023-01-01'
+      AND U.Reputation > 1000
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.UpVotes, U.DownVotes, U.Views, U.CreationDate, U.LastAccessDate
+),
+PostModerationEvents AS (
+    SELECT
+        PH.PostId,
+        COUNT(PH.Id) AS HistoryEntryCount,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (10, 101, 102, 103, 104, 105) THEN 1 ELSE 0 END) AS WasClosed,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS WasReopened,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (4,5,6) THEN PH.CreationDate ELSE NULL END) AS LastEditHistoryDate,
+        STRING_AGG(DISTINCT CR.Name, '; ') AS CloseReasonsArray
+    FROM PostHistory AS PH
+    LEFT JOIN CloseReasonTypes AS CR ON PH.Comment = CAST(CR.Id AS VARCHAR(50))
+    WHERE PH.PostHistoryTypeId IN (4, 5, 6, 10, 11, 101, 102, 103, 104, 105)
+    GROUP BY PH.PostId
+),
+QuestionTagAnalysis AS (
+    SELECT
+        P.Id AS QuestionId,
+        P.Title,
+        P.Score AS QuestionScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.OwnerUserId,
+        P.CreationDate,
+        P.LastActivityDate,
+        P.Tags,
+        (SELECT COUNT(C.Id) FROM Comments AS C WHERE C.PostId = P.Id AND C.CreationDate > COALESCE(P.LastEditDate, P.CreationDate)) AS PostEditCommentsCount,
+        AVG(CASE WHEN A.PostTypeId = 2 THEN A.Score END) OVER (PARTITION BY P.Id) AS AvgAnswerScore,
+        FIRST_VALUE(U.DisplayName) OVER (PARTITION BY P.Id ORDER BY A.Score DESC NULLS LAST) AS BestAnswererDisplayName
+    FROM Posts AS P
+    LEFT JOIN Posts AS A ON P.Id = A.ParentId AND A.PostTypeId = 2
+    LEFT JOIN Users AS U ON A.OwnerUserId = U.Id
+    WHERE P.PostTypeId = 1
+      AND P.Tags LIKE '%<performance>%'
+      AND P.ViewCount > 500
+      AND P.AnswerCount >= 1
+),
+HighImpactUserQuestions AS (
+    SELECT
+        QTA.QuestionId,
+        QTA.Title,
+        QTA.QuestionScore,
+        QTA.ViewCount,
+        QTA.AnswerCount,
+        QTA.OwnerUserId,
+        QTA.CreationDate,
+        QTA.LastActivityDate,
+        QTA.Tags,
+        QTA.PostEditCommentsCount,
+        QTA.AvgAnswerScore,
+        QTA.BestAnswererDisplayName,
+        PME.WasClosed,
+        PME.WasReopened,
+        PME.LastEditHistoryDate,
+        PME.CloseReasonsArray,
+        'High_Impact_User' AS SourceCategory
+    FROM QuestionTagAnalysis AS QTA
+    INNER JOIN UserEngagement AS UE ON QTA.OwnerUserId = UE.UserId
+    LEFT JOIN PostModerationEvents AS PME ON QTA.QuestionId = PME.PostId
+    WHERE UE.ReputationRank <= 1000
+      AND QTA.QuestionScore >= 50
+      AND QTA.CreationDate >= DATE '2022-01-01'
+),
+ModeratedActiveQuestions AS (
+    SELECT
+        QTA.QuestionId,
+        QTA.Title,
+        QTA.QuestionScore,
+        QTA.ViewCount,
+        QTA.AnswerCount,
+        QTA.OwnerUserId,
+        QTA.CreationDate,
+        QTA.LastActivityDate,
+        QTA.Tags,
+        QTA.PostEditCommentsCount,
+        QTA.AvgAnswerScore,
+        QTA.BestAnswererDisplayName,
+        PME.WasClosed,
+        PME.WasReopened,
+        PME.LastEditHistoryDate,
+        PME.CloseReasonsArray,
+        'Moderated_Active' AS SourceCategory
+    FROM QuestionTagAnalysis AS QTA
+    INNER JOIN PostModerationEvents AS PME ON QTA.QuestionId = PME.PostId
+    WHERE (PME.WasClosed = 1 OR PME.WasReopened = 1 OR PME.LastEditHistoryDate IS NOT NULL)
+      AND QTA.AnswerCount >= 5
+      AND QTA.CreationDate >= DATE '2022-01-01'
+),
+FinalQuestionSet AS (
+    SELECT * FROM HighImpactUserQuestions
+    UNION ALL
+    SELECT * FROM ModeratedActiveQuestions
+)
+SELECT DISTINCT
+    UE.UserId,
+    COALESCE(UE.DisplayName, 'Anonymous User') AS OwnerDisplayName,
+    UE.Reputation,
+    UE.QuestionsOwnedCount,
+    UE.AnswersOwnedCount,
+    UE.ReputationRank,
+    FQS.QuestionId,
+    FQS.Title AS QuestionTitle,
+    FQS.QuestionScore,
+    FQS.ViewCount AS QuestionViews,
+    FQS.AnswerCount AS QuestionAnswers,
+    FQS.CreationDate AS QuestionCreationDate,
+    FQS.LastActivityDate AS QuestionLastActivityDate,
+    FQS.PostEditCommentsCount,
+    FQS.AvgAnswerScore,
+    COALESCE(FQS.BestAnswererDisplayName, 'No Best Answerer') AS TopAnswererDisplayName,
+    FQS.WasClosed,
+    FQS.WasReopened,
+    STRING_AGG(FQS.CloseReasonsArray, '; ') AS CloseReasons,
+    SUM(V.BountyAmount) AS TotalBountyGiven,
+    COUNT(DISTINCT CASE WHEN V.VoteTypeId = 2 THEN V.Id END) AS UpVotesOnUserQuestions,
+    COUNT(DISTINCT CASE WHEN V.VoteTypeId = 3 THEN V.Id END) AS DownVotesOnUserQuestions,
+    COUNT(DISTINCT PL.RelatedPostId) AS LinkedPostsCount,
+    NULLIF(AVG(FQS.ViewCount) OVER (PARTITION BY RepPercentile), 0) AS AvgViewsInRepPercentile,
+    (UE.Reputation * 0.005 + UE.TotalBadgesCount * 1.5 - UE.DownVotes * 0.05 + FQS.QuestionScore * 0.1 + FQS.AnswerCount * 0.7)
+    * (FQS.ViewCount / NULLIF(FQS.PostEditCommentsCount + 1, 0)) AS CalculatedEngagementImpact,
+    UPPER(SUBSTRING(FQS.Tags FROM 1 FOR 20)) AS TagsPrefixUpper,
+    REPLACE(TRIM(BOTH '<>' FROM FQS.Tags), '><', ', ') AS FormattedTags,
+    CASE
+        WHEN FQS.WasClosed = 1 AND FQS.WasReopened = 0 THEN 'Closed_and_Final'
+        WHEN FQS.WasClosed = 1 AND FQS.WasReopened = 1 THEN 'Closed_and_Reopened'
+        WHEN FQS.AvgAnswerScore > 10 AND FQS.PostEditCommentsCount > 3 THEN 'Highly_Engaged_and_Well_Answered'
+        WHEN FQS.CreationDate < (CAST('2024-10-01' AS DATE) - INTERVAL '1' YEAR) AND FQS.LastActivityDate > (CAST('2024-10-01' AS DATE) - INTERVAL '3' MONTH) THEN 'Long_Lived_Active'
+        ELSE 'General_Activity'
+    END AS QuestionActivityCategory,
+    (SELECT C.Text FROM Comments AS C WHERE C.PostId = FQS.QuestionId AND C.UserId = FQS.OwnerUserId ORDER BY C.CreationDate DESC LIMIT 1) AS LastOwnerComment,
+    RepPercentile
+FROM (
+    SELECT
+        FQS.*,
+        UE.UserId AS UEUserId,
+        NTILE(20) OVER (ORDER BY UE.Reputation DESC) AS RepPercentile
+    FROM FinalQuestionSet AS FQS
+    INNER JOIN UserEngagement AS UE ON FQS.OwnerUserId = UE.UserId
+) AS FQS
+INNER JOIN UserEngagement AS UE ON FQS.OwnerUserId = UE.UserId
+LEFT JOIN Votes AS V ON FQS.QuestionId = V.PostId AND V.UserId = UE.UserId AND V.VoteTypeId IN (2, 3, 8, 9)
+LEFT JOIN PostLinks AS PL ON FQS.QuestionId = PL.PostId AND PL.LinkTypeId = 1
+WHERE FQS.QuestionScore > 5
+  AND FQS.ViewCount > 100
+  AND EXISTS (SELECT 1 FROM Badges B_sub WHERE B_sub.UserId = UE.UserId AND LOWER(B_sub.Name) LIKE LOWER('%analyst%'))
+GROUP BY
+    UE.UserId, UE.DisplayName, UE.Reputation, UE.QuestionsOwnedCount, UE.AnswersOwnedCount, UE.ReputationRank,
+    FQS.QuestionId, FQS.Title, FQS.QuestionScore, FQS.ViewCount, FQS.AnswerCount, FQS.CreationDate, FQS.LastActivityDate,
+    FQS.Tags, FQS.PostEditCommentsCount, FQS.AvgAnswerScore, FQS.BestAnswererDisplayName,
+    FQS.WasClosed, FQS.WasReopened, FQS.CloseReasonsArray, FQS.OwnerUserId,
+    FQS.LastEditHistoryDate, UE.TotalBadgesCount, UE.DownVotes,
+    UPPER(SUBSTRING(FQS.Tags FROM 1 FOR 20)), REPLACE(TRIM(BOTH '<>' FROM FQS.Tags), '><', ', '),
+    RepPercentile,
+    COALESCE(UE.DisplayName, 'Anonymous User'),
+    COALESCE(FQS.BestAnswererDisplayName, 'No Best Answerer'),
+    FQS.PostEditCommentsCount, FQS.ViewCount
+HAVING
+    COUNT(DISTINCT CASE WHEN V.VoteTypeId = 2 THEN V.Id END) > 0
+    OR UE.AnswersOwnedCount > 10
+ORDER BY
+    CalculatedEngagementImpact DESC,
+    UE.Reputation DESC,
+    FQS.CreationDate DESC
+LIMIT 5000;

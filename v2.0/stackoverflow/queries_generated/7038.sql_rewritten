@@ -1,0 +1,219 @@
+-- {"query": "7038.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2844} 
+WITH UserPostStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS TotalQuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS TotalAnswerScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        STRING_AGG(DISTINCT p.Tags, ', ') AS AllTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.CreationDate >= '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+RankedUsers AS (
+    SELECT 
+        *,
+        ROW_NUMBER() OVER (ORDER BY TotalQuestionScore DESC, TotalAnswerScore DESC) AS RankByScore,
+        DENSE_RANK() OVER (ORDER BY Reputation DESC) AS RankByReputation,
+        NTILE(10) OVER (ORDER BY TotalPosts DESC) AS PopularityQuartile
+    FROM UserPostStats
+),
+TopTags AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        AVG(CAST(p.Score AS FLOAT)) AS AvgScore,
+        COUNT(p.Id) AS PostCount,
+        STRING_AGG(DISTINCT u.DisplayName, ', ') AS TopUsers
+    FROM Tags t
+    JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE t.Count > 100
+    GROUP BY t.TagName, t.Count
+    HAVING COUNT(p.Id) > 50
+),
+PostActivity AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.CreationDate,
+        p.ViewCount,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostType,
+        DATEDIFF(day, p.CreationDate, p.LastActivityDate) AS DaysSinceActivity,
+        CASE 
+            WHEN p.LastActivityDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '7 days' THEN 'Active'
+            WHEN p.LastActivityDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days' THEN 'Recently Active'
+            ELSE 'Inactive'
+        END AS ActivityStatus,
+        COALESCE(p.AcceptedAnswerId, 0) AS HasAcceptedAnswer,
+        ISNULL(p.AnswerCount, 0) AS AnswerCount,
+        ISNULL(p.CommentCount, 0) AS CommentCount,
+        CASE 
+            WHEN p.Score > 100 THEN 'Highly Voted'
+            WHEN p.Score > 50 THEN 'Moderately Voted'
+            WHEN p.Score > 10 THEN 'Low Voted'
+            ELSE 'Very Low Voted'
+        END AS ScoreCategory,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevScore,
+        LAG(p.CreationDate, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevPostDate
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1,2)
+),
+UserMetrics AS (
+    SELECT 
+        ru.UserId,
+        ru.DisplayName,
+        ru.Reputation,
+        ru.TotalPosts,
+        ru.Questions,
+        ru.Answers,
+        ru.TotalQuestionScore,
+        ru.TotalAnswerScore,
+        ru.LastPostDate,
+        COALESCE(ru.AllTags, '') AS AllTags,
+        ru.RankByScore,
+        ru.RankByReputation,
+        ru.PopularityQuartile,
+        CASE 
+            WHEN ru.TotalPosts > 50 THEN 'Expert'
+            WHEN ru.TotalPosts > 20 THEN 'Intermediate'
+            WHEN ru.TotalPosts > 5 THEN 'Novice'
+            ELSE 'Beginner'
+        END AS ExperienceLevel,
+        (ru.TotalQuestionScore + ru.TotalAnswerScore) / NULLIF(ru.TotalPosts, 0) AS AvgScorePerPost,
+        AVG(ru.TotalPostScore) OVER (ORDER BY ru.RankByScore ROWS BETWEEN 10 PRECEDING AND 10 FOLLOWING) AS MovingAvgScore,
+        DENSE_RANK() OVER (ORDER BY ru.TotalQuestionScore + ru.TotalAnswerScore DESC) AS OverallRank,
+        PERCENT_RANK() OVER (ORDER BY ru.TotalQuestionScore + ru.TotalAnswerScore) * 100 AS ScorePercentile
+    FROM RankedUsers ru
+    LEFT JOIN (
+        SELECT 
+            OwnerUserId,
+            SUM(Score) AS TotalPostScore
+        FROM Posts
+        GROUP BY OwnerUserId
+    ) ps ON ru.UserId = ps.OwnerUserId
+),
+TagAnalysis AS (
+    SELECT 
+        ta.TagName,
+        ta.Count,
+        ta.AvgScore,
+        ta.PostCount,
+        ta.TopUsers,
+        ROW_NUMBER() OVER (ORDER BY ta.Count DESC) AS TagRank,
+        RANK() OVER (ORDER BY ta.AvgScore DESC) AS AvgScoreRank,
+        PERCENT_RANK() OVER (ORDER BY ta.Count) * 100 AS CountPercentile,
+        CASE 
+            WHEN ta.Count > 1000 THEN 'Popular'
+            WHEN ta.Count > 500 THEN 'Moderately Popular'
+            WHEN ta.Count > 100 THEN 'Niche'
+            ELSE 'Rare'
+        END AS PopularityLevel
+    FROM TopTags ta
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        pa.PostId,
+        pa.Title,
+        pa.Score,
+        pa.CreationDate,
+        pa.ViewCount,
+        pa.OwnerUserId,
+        pa.OwnerName,
+        pa.PostType,
+        pa.DaysSinceActivity,
+        pa.ActivityStatus,
+        pa.HasAcceptedAnswer,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.ScoreCategory,
+        pa.PrevScore,
+        pa.PrevPostDate,
+        DATEDIFF(day, pa.PrevPostDate, pa.CreationDate) AS DaysBetweenPosts,
+        CASE 
+            WHEN pa.PrevScore IS NOT NULL AND pa.Score > pa.PrevScore THEN 'Improving'
+            WHEN pa.PrevScore IS NOT NULL AND pa.Score < pa.PrevScore THEN 'Declining'
+            WHEN pa.PrevScore IS NULL THEN 'New'
+            ELSE 'Stable'
+        END AS ScoreTrend,
+        COALESCE(pa.AnswerCount, 0) - COALESCE(pa.CommentCount, 0) AS NetEngagement,
+        NULLIF(pa.ViewCount, 0) / NULLIF(pa.Score, 0) AS ViewsPerScore,
+        RANK() OVER (PARTITION BY pa.OwnerUserId ORDER BY pa.Score DESC) AS UserPostRank,
+        NTILE(4) OVER (ORDER BY pa.Score) AS ScoreQuartile,
+        ROW_NUMBER() OVER (ORDER BY pa.Score DESC) AS GlobalRank,
+        LAG(pa.Score, 1) OVER (ORDER BY pa.Score DESC) AS NextHigherScore,
+        LAG(pa.CreationDate, 1) OVER (ORDER BY pa.Score DESC) AS NextHigherScoreDate,
+        DATEDIFF(day, LAG(pa.CreationDate, 1) OVER (ORDER BY pa.Score DESC), pa.CreationDate) AS DaysToNextHigher
+    FROM PostActivity pa
+    WHERE pa.Score > 0
+)
+SELECT 
+    MAX(CASE WHEN cm.ExperienceLevel = 'Expert' THEN 1 ELSE 0 END) AS NumExperts,
+    MAX(CASE WHEN cm.ExperienceLevel = 'Intermediate' THEN 1 ELSE 0 END) AS NumIntermediate,
+    MAX(CASE WHEN cm.ExperienceLevel = 'Novice' THEN 1 ELSE 0 END) AS NumNovices,
+    MAX(CASE WHEN cm.ExperienceLevel = 'Beginner' THEN 1 ELSE 0 END) AS NumBeginners,
+    AVG(cm.Reputation) AS AvgReputation,
+    AVG(cm.AvgScorePerPost) AS AvgScorePerPost,
+    MAX(cm.TotalPosts) AS MaxPosts,
+    MIN(cm.LastPostDate) AS EarliestPostDate,
+    COUNT(DISTINCT cm.UserId) AS TotalUsers,
+    COUNT(DISTINCT CASE WHEN cm.RankByScore <= 10 THEN cm.UserId END) AS Top10ScoreRankUsers,
+    SUM(cm.TotalQuestionScore) AS TotalQuestionScore,
+    SUM(cm.TotalAnswerScore) AS TotalAnswerScore,
+    AVG(cm.ScorePercentile) AS AvgScorePercentile,
+    STRING_AGG(DISTINCT CASE WHEN cm.TotalPosts > 100 THEN cm.DisplayName END, ', ') AS HighPostUsers,
+    STRING_AGG(DISTINCT CASE WHEN cm.AvgScorePerPost > 10 THEN cm.DisplayName END, ', ') AS HighAvgScoreUsers,
+    COUNT(DISTINCT CASE WHEN pa.Score > 1000 THEN pa.PostId END) AS HighScorePosts,
+    COUNT(DISTINCT CASE WHEN pa.Score > 500 THEN pa.PostId END) AS MediumScorePosts,
+    COUNT(DISTINCT CASE WHEN pa.Score < 10 THEN pa.PostId END) AS LowScorePosts,
+    COUNT(DISTINCT CASE WHEN pa.ActivityStatus = 'Active' THEN pa.PostId END) AS ActivePosts,
+    COUNT(DISTINCT CASE WHEN ta.PopularityLevel = 'Popular' THEN ta.TagName END) AS PopularTags,
+    COUNT(DISTINCT CASE WHEN ta.PopularityLevel = 'Niche' THEN ta.TagName END) AS NicheTags,
+    COUNT(DISTINCT CASE WHEN ta.PopularityLevel = 'Rare' THEN ta.TagName END) AS RareTags,
+    STRING_AGG(DISTINCT CASE WHEN pa.Score > 100 THEN pa.Title END, ', ') AS HighScorePostTitles,
+    AVG(pa.DaysSinceActivity) AS AvgDaysSinceActivity,
+    MAX(pa.DaysSinceActivity) AS MaxDaysSinceActivity,
+    MIN(pa.DaysSinceActivity) AS MinDaysSinceActivity,
+    STDEV(pa.DaysSinceActivity) AS StdDevDaysSinceActivity,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Score > 1000) AS HighVotedQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 2 AND Score > 1000) AS HighVotedAnswers,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND AnswerCount > 10) AS QuestionsWithManyAnswers,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 2 AND Score > 50) AS HighScoringAnswers,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND ViewCount > 10000) AS HighlyViewedQuestions,
+    (SELECT COUNT(*) FROM Posts p JOIN Posts a ON p.Id = a.ParentId WHERE a.Score > 100) AS HighScoreAnswersToQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%java%') AS JavaQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%python%') AS PythonQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%c%') AS CQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%javascript%') AS JavaScriptQuestions,
+    STRING_AGG(DISTINCT CASE WHEN cm.ScorePercentile > 90 THEN cm.DisplayName END, ', ') AS TopPercentileUsers,
+    COUNT(DISTINCT CASE WHEN cm.PopularityQuartile = 1 THEN cm.UserId END) AS TopQuartileUsers,
+    COUNT(DISTINCT CASE WHEN cm.PopularityQuartile = 4 THEN cm.UserId END) AS BottomQuartileUsers,
+    COUNT(DISTINCT CASE WHEN pa.ScoreCategory = 'Highly Voted' THEN pa.PostId END) AS HighlyVotedPosts,
+    COUNT(DISTINCT CASE WHEN pa.ScoreCategory = 'Moderately Voted' THEN pa.PostId END) AS ModeratelyVotedPosts,
+    COUNT(DISTINCT CASE WHEN pa.ScoreCategory = 'Low Voted' THEN pa.PostId END) AS LowVotedPosts,
+    COUNT(DISTINCT CASE WHEN pa.ScoreCategory = 'Very Low Voted' THEN pa.PostId END) AS VeryLowVotedPosts,
+    CASE 
+        WHEN COUNT(DISTINCT cm.UserId) > 0 THEN 
+            (COUNT(DISTINCT CASE WHEN cm.TotalPosts > 50 THEN cm.UserId END) * 100.0 / COUNT(DISTINCT cm.UserId))
+        ELSE 0 
+    END AS ExpertPercentage,
+    STRING_AGG(DISTINCT CASE WHEN cm.TotalPosts > 50 AND cm.AvgScorePerPost > 20 THEN cm.DisplayName END, ', ') AS ActiveExpertUsers,
+    STRING_AGG(DISTINCT CASE WHEN pa.Score > 100 AND pa.ViewCount > 1000 THEN pa.Title END, ', ') AS PopularHighScorePosts
+FROM UserMetrics cm
+FULL OUTER JOIN ComplexPostAnalysis pa ON 1=1
+FULL OUTER JOIN TagAnalysis ta ON 1=1
+WHERE cm.UserId IS NOT NULL OR pa.PostId IS NOT NULL OR ta.TagName IS NOT NULL;

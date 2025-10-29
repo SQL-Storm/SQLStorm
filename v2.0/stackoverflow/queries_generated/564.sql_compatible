@@ -1,0 +1,420 @@
+with
+q as (
+  select
+    p.Id as QuestionId,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Title,
+    p.Tags,
+    coalesce(p.AnswerCount, 0) as AnswerCount,
+    p.AcceptedAnswerId,
+    date_trunc('month', p.CreationDate) as MonthBucket
+  from Posts p
+  where p.PostTypeId = 1
+),
+a as (
+  select
+    pa.Id as AnswerId,
+    pa.ParentId as QuestionId,
+    pa.OwnerUserId as AnswerUserId,
+    pa.Score as AnswerScore,
+    pa.CreationDate as AnswerCreationDate
+  from Posts pa
+  where pa.PostTypeId = 2
+),
+first_answer as (
+  select
+    a.QuestionId,
+    min(a.AnswerCreationDate) as FirstAnswerAt
+  from a
+  group by a.QuestionId
+),
+accepted as (
+  select
+    q.QuestionId,
+    q.AcceptedAnswerId,
+    a.AnswerUserId as AcceptedUserId,
+    a.AnswerScore as AcceptedAnswerScore,
+    a.AnswerCreationDate as AcceptedAnswerAt
+  from q
+  left join a on a.AnswerId = q.AcceptedAnswerId
+),
+q_votes as (
+  select
+    v.PostId as QuestionId,
+    sum(case when v.VoteTypeId = 2 then 1 when v.VoteTypeId = 3 then -1 else 0 end) as NetVotes,
+    sum(case when v.VoteTypeId = 5 then 1 else 0 end) as Favorites,
+    count(*) as TotalVotes
+  from Votes v
+  join Posts p on p.Id = v.PostId and p.PostTypeId = 1
+  group by v.PostId
+),
+a_votes as (
+  select
+    a.ParentId as QuestionId,
+    sum(case when v.VoteTypeId = 2 then 1 when v.VoteTypeId = 3 then -1 else 0 end) as NetAnswerVotes,
+    count(*) filter (where v.VoteTypeId in (2,3)) as TotalAnswerVotes
+  from Votes v
+  join Posts pa on pa.Id = v.PostId and pa.PostTypeId = 2
+  join Posts a on a.Id = pa.Id
+  group by a.ParentId
+),
+q_edits as (
+  select
+    ph.PostId as QuestionId,
+    count(*) filter (where ph.PostHistoryTypeId in (4,5,6)) as EditCount,
+    max(ph.CreationDate) filter (where ph.PostHistoryTypeId in (4,5,6)) as LastEditAt,
+    count(*) filter (where ph.PostHistoryTypeId = 10) as CloseVotesRecorded,
+    max(case when ph.PostHistoryTypeId = 10 then cast(ph.Comment as integer) else null end) as LastCloseReasonId
+  from PostHistory ph
+  join Posts p on p.Id = ph.PostId and p.PostTypeId = 1
+  group by ph.PostId
+),
+dup_links as (
+  select
+    pl.PostId as QuestionId,
+    count(*) filter (where pl.LinkTypeId = 3) as DuplicateLinks,
+    count(*) filter (where pl.LinkTypeId = 1) as LinkedLinks
+  from PostLinks pl
+  group by pl.PostId
+),
+tag_split as (
+  select
+    q.QuestionId,
+    unnest(string_to_array(substring(q.Tags, 2, greatest(length(q.Tags)-2,0)), '><')) as TagName
+  from q
+  where q.Tags is not null and q.Tags like '<%>'
+),
+tag_info as (
+  select
+    ts.QuestionId,
+    t.TagName,
+    t.Count as GlobalTagCount,
+    coalesce(t.IsModeratorOnly, 0) as IsModeratorOnly,
+    coalesce(t.IsRequired, 0) as IsRequired
+  from tag_split ts
+  left join Tags t on lower(t.TagName) = lower(ts.TagName)
+),
+q_tag_stats as (
+  select
+    QuestionId,
+    count(*) as TagCount,
+    sum(case when IsModeratorOnly = 1 then 1 else 0 end) as ModOnlyTagCount,
+    sum(case when IsRequired = 1 then 1 else 0 end) as RequiredTagCount,
+    min(GlobalTagCount) as MinTagPopularity,
+    max(GlobalTagCount) as MaxTagPopularity,
+    avg(cast(GlobalTagCount as numeric)) as AvgTagPopularity
+  from tag_info
+  group by QuestionId
+),
+u as (
+  select
+    u.Id as UserId,
+    u.CreationDate,
+    u.Reputation,
+    coalesce(u.Location, '') as Location,
+    coalesce(u.WebsiteUrl, '') as WebsiteUrl,
+    coalesce(u.DisplayName, '') as DisplayName,
+    u.UpVotes,
+    u.DownVotes,
+    u.Views
+  from Users u
+),
+u_badges as (
+  select
+    b.UserId,
+    count(*) as BadgeCount,
+    count(*) filter (where b.Class = 1) as GoldBadges,
+    count(*) filter (where b.Class = 2) as SilverBadges,
+    count(*) filter (where b.Class = 3) as BronzeBadges,
+    max(b.Date) as LastBadgeAt
+  from Badges b
+  group by b.UserId
+),
+comment_stats as (
+  select
+    c.PostId as QuestionId,
+    count(*) as CommentCount,
+    sum(c.Score) as CommentScoreSum,
+    avg(c.Score) as CommentScoreAvg,
+    max(c.CreationDate) as LastCommentAt
+  from Comments c
+  join Posts p on p.Id = c.PostId and p.PostTypeId = 1
+  group by c.PostId
+),
+answerer_diversity as (
+  select
+    a.QuestionId,
+    count(distinct a.AnswerUserId) as DistinctAnswerers
+  from a
+  group by a.QuestionId
+),
+first_activity as (
+  select
+    q.QuestionId,
+    least(
+      q.CreationDate,
+      coalesce(fa.FirstAnswerAt, timestamp '9999-12-31'),
+      coalesce(qe.LastEditAt, timestamp '9999-12-31'),
+      coalesce(cs.LastCommentAt, timestamp '9999-12-31')
+    ) as FirstActivityAt
+  from q
+  left join first_answer fa on fa.QuestionId = q.QuestionId
+  left join q_edits qe on qe.QuestionId = q.QuestionId
+  left join comment_stats cs on cs.QuestionId = q.QuestionId
+),
+ranked_questions as (
+  select
+    q.QuestionId,
+    q.OwnerUserId,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    q.Title,
+    q.Tags,
+    q.AnswerCount,
+    q.MonthBucket,
+    dense_rank() over (partition by date_trunc('year', q.CreationDate) order by q.Score desc, q.ViewCount desc, q.AnswerCount desc, q.QuestionId) as PopularityRankYr,
+    row_number() over (partition by q.MonthBucket order by q.ViewCount desc, q.Score desc, q.QuestionId) as ViewRankMo
+  from q
+),
+user_activity as (
+  select
+    q.OwnerUserId as UserId,
+    count(*) as QuestionsAuthored,
+    sum(q.ViewCount) as TotalViewsAuthored,
+    sum(q.Score) as TotalScoreAuthored,
+    avg(cast(q.Score as numeric)) as AvgScoreAuthored
+  from q
+  where q.OwnerUserId is not null
+  group by q.OwnerUserId
+),
+outliers as (
+  select
+    q.QuestionId,
+    case when q.ViewCount > (select percentile_cont(0.99) within group (order by ViewCount) from q) then 1 else 0 end as Is99pViewOutlier,
+    case when q.Score > (select percentile_cont(0.99) within group (order by Score) from q) then 1 else 0 end as Is99pScoreOutlier
+  from q
+),
+final_agg as (
+  select
+    rq.QuestionId,
+    rq.OwnerUserId,
+    rq.CreationDate,
+    rq.Score,
+    rq.ViewCount,
+    rq.Title,
+    rq.Tags,
+    rq.AnswerCount,
+    rq.MonthBucket,
+    rq.PopularityRankYr,
+    rq.ViewRankMo,
+    coalesce(qv.NetVotes, 0) as NetVotes,
+    coalesce(qv.Favorites, 0) as Favorites,
+    coalesce(qv.TotalVotes, 0) as TotalVotes,
+    coalesce(av.NetAnswerVotes, 0) as NetAnswerVotes,
+    coalesce(av.TotalAnswerVotes, 0) as TotalAnswerVotes,
+    coalesce(qe.EditCount, 0) as EditCount,
+    qe.LastEditAt,
+    qe.CloseVotesRecorded,
+    qe.LastCloseReasonId,
+    coalesce(dl.DuplicateLinks, 0) as DuplicateLinks,
+    coalesce(dl.LinkedLinks, 0) as LinkedLinks,
+    coalesce(qts.TagCount, 0) as TagCount,
+    qts.ModOnlyTagCount,
+    qts.RequiredTagCount,
+    qts.MinTagPopularity,
+    qts.MaxTagPopularity,
+    qts.AvgTagPopularity,
+    cs.CommentCount,
+    cs.CommentScoreSum,
+    cs.CommentScoreAvg,
+    cs.LastCommentAt,
+    ad.DistinctAnswerers,
+    fa.FirstAnswerAt,
+    ac.AcceptedAnswerId,
+    ac.AcceptedUserId,
+    ac.AcceptedAnswerScore,
+    ac.AcceptedAnswerAt,
+    ua.QuestionsAuthored,
+    ua.TotalViewsAuthored,
+    ua.TotalScoreAuthored,
+    ua.AvgScoreAuthored,
+    u.Reputation as OwnerReputation,
+    ub.BadgeCount,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ub.LastBadgeAt,
+    f.FirstActivityAt,
+    o.Is99pViewOutlier,
+    o.Is99pScoreOutlier,
+    case
+      when ac.AcceptedAnswerAt is not null and fa.FirstAnswerAt is not null
+        then cast(extract(epoch from (ac.AcceptedAnswerAt - fa.FirstAnswerAt)) as bigint)
+      else null
+    end as SecsFromFirstAnswerToAccept,
+    case
+      when fa.FirstAnswerAt is not null
+        then cast(extract(epoch from (fa.FirstAnswerAt - rq.CreationDate)) as bigint)
+      else null
+    end as SecsToFirstAnswer,
+    case
+      when rq.ViewCount > 0 then round((cast(rq.Score as numeric) / rq.ViewCount) * 1000, 3)
+      else null
+    end as ScorePerKViews,
+    case
+      when rq.AnswerCount > 0 then round((coalesce(av.NetAnswerVotes,0)::numeric / rq.AnswerCount), 3)
+      else null
+    end as AvgNetVotesPerAnswer,
+    case
+      when cs.CommentCount is null or cs.CommentCount = 0 then 'No comments'
+      when cs.CommentCount < 3 then 'Few comments'
+      when cs.CommentCount < 10 then 'Some comments'
+      else 'Many comments'
+    end as CommentBand,
+    case
+      when qe.LastCloseReasonId in (101,1) then 'Duplicate'
+      when qe.LastCloseReasonId in (102,2) then 'Off-topic'
+      when qe.LastCloseReasonId in (103) then 'Needs details/clarity'
+      when qe.LastCloseReasonId in (104) then 'Needs more focus'
+      when qe.LastCloseReasonId in (105) then 'Opinion-based'
+      when qe.LastCloseReasonId is null then 'Not closed'
+      else 'Other'
+    end as CloseReasonGroup
+  from ranked_questions rq
+  left join q_votes qv on qv.QuestionId = rq.QuestionId
+  left join a_votes av on av.QuestionId = rq.QuestionId
+  left join q_edits qe on qe.QuestionId = rq.QuestionId
+  left join dup_links dl on dl.QuestionId = rq.QuestionId
+  left join q_tag_stats qts on qts.QuestionId = rq.QuestionId
+  left join comment_stats cs on cs.QuestionId = rq.QuestionId
+  left join answerer_diversity ad on ad.QuestionId = rq.QuestionId
+  left join first_answer fa on fa.QuestionId = rq.QuestionId
+  left join accepted ac on ac.QuestionId = rq.QuestionId
+  left join user_activity ua on ua.UserId = rq.OwnerUserId
+  left join u on u.UserId = rq.OwnerUserId
+  left join u_badges ub on ub.UserId = rq.OwnerUserId
+  left join first_activity f on f.QuestionId = rq.QuestionId
+  left join outliers o on o.QuestionId = rq.QuestionId
+),
+scored as (
+  select
+    f.*,
+    round((
+      coalesce(ln(nullif(f.ViewCount,0)), 0)
+      + coalesce(ln(nullif(f.Score + 10,0)), 0) * 1.5
+      + coalesce(ln(nullif(f.TotalVotes + 5,0)), 0) * 0.8
+      + coalesce(ln(nullif(f.Favorites + 1,0)), 0) * 0.7
+      + coalesce(ln(nullif(f.EditCount + 1,0)), 0) * 0.4
+      + coalesce(ln(nullif(f.CommentCount + 1,0)), 0) * 0.5
+      + case when f.AcceptedAnswerId is not null then 0.6 else 0 end
+      + case when f.Is99pViewOutlier = 1 then 1.0 else 0 end
+      + case when f.Is99pScoreOutlier = 1 then 1.0 else 0 end
+      + coalesce(ln(nullif(f.DistinctAnswerers + 1,0)), 0) * 0.6
+      + coalesce(ln(nullif(cast(f.AvgTagPopularity as numeric) + 1,0)), 0) * 0.3
+    ), 3) as BenchmarkScore
+  from final_agg f
+),
+yearly_rollup as (
+  select
+    date_trunc('year', CreationDate) as YearBucket,
+    count(*) as Questions,
+    avg(cast(Score as numeric)) as AvgScore,
+    avg(cast(ViewCount as numeric)) as AvgViews,
+    percentile_cont(0.5) within group (order by Score) as P50Score,
+    percentile_cont(0.9) within group (order by ViewCount) as P90Views
+  from scored
+  group by date_trunc('year', CreationDate)
+),
+user_quality as (
+  select
+    OwnerUserId as UserId,
+    count(*) as Qs,
+    avg(BenchmarkScore) as AvgBench,
+    percentile_cont(0.75) within group (order by BenchmarkScore) as P75Bench
+  from scored
+  where OwnerUserId is not null
+  group by OwnerUserId
+),
+top_users as (
+  select
+    uq.UserId,
+    uq.Qs,
+    uq.AvgBench,
+    uq.P75Bench,
+    dense_rank() over (order by uq.AvgBench desc nulls last, uq.Qs desc, uq.UserId) as UserBenchRank
+  from user_quality uq
+),
+blended as (
+  select
+    s.*,
+    tu.UserBenchRank,
+    yr.AvgViews as YrAvgViews,
+    yr.AvgScore as YrAvgScore,
+    yr.P50Score as YrP50Score,
+    yr.P90Views as YrP90Views
+  from scored s
+  left join top_users tu on tu.UserId = s.OwnerUserId
+  left join yearly_rollup yr on yr.YearBucket = date_trunc('year', s.CreationDate)
+)
+select
+  b.QuestionId,
+  b.Title,
+  coalesce(nullif(trim(b.Tags), ''), '<none>') as Tags,
+  b.OwnerUserId,
+  b.OwnerReputation,
+  b.Score,
+  b.ViewCount,
+  b.AnswerCount,
+  b.NetVotes,
+  b.Favorites,
+  b.DistinctAnswerers,
+  b.AcceptedAnswerId,
+  b.CommentCount,
+  b.EditCount,
+  b.DuplicateLinks,
+  b.TagCount,
+  b.MinTagPopularity,
+  b.MaxTagPopularity,
+  b.AvgTagPopularity,
+  b.CloseReasonGroup,
+  b.CommentBand,
+  b.PopularityRankYr,
+  b.ViewRankMo,
+  b.BenchmarkScore,
+  b.UserBenchRank,
+  b.SecsToFirstAnswer,
+  b.SecsFromFirstAnswerToAccept,
+  b.FirstActivityAt,
+  b.LastEditAt,
+  b.LastCommentAt,
+  b.MonthBucket,
+  b.YrAvgViews,
+  b.YrAvgScore,
+  b.YrP50Score,
+  b.YrP90Views
+from blended b
+where
+  (
+    (b.Score >= 5 and b.ViewCount >= 1000)
+    or (b.AcceptedAnswerId is null and coalesce(b.AnswerCount,0) >= 3 and coalesce(b.NetVotes,0) >= 2)
+    or (b.Tags ilike '%<sql>%' and b.Score >= 0)
+  )
+  and (
+    b.CloseReasonGroup in ('Not closed','Duplicate')
+    or (b.EditCount > 0 and b.LastEditAt > b.CreationDate)
+  )
+  and (
+    position('how' in lower(coalesce(b.Title, ''))) = 1
+    or position('why' in lower(coalesce(b.Title, ''))) = 1
+    or b.Title ~* '(best|efficient|performance|optimi[sz]e)'
+  )
+order by
+  b.BenchmarkScore desc nulls last,
+  b.ViewCount desc,
+  b.Score desc,
+  b.QuestionId
+limit 500;

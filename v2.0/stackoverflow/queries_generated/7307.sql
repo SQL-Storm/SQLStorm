@@ -1,0 +1,220 @@
+-- {"query": "7307.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2169} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT c.Id) as Comments,
+        COUNT(DISTINCT b.Id) as Badges,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, COUNT(DISTINCT p.Id) DESC) as RankByReputation,
+        DENSE_RANK() OVER (ORDER BY u.Views DESC) as RankByViews,
+        NTILE(100) OVER (ORDER BY u.Reputation) as ReputationPercentile
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostAnalytics AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Question with accepted answer'
+            WHEN p.PostTypeId = 1 THEN 'Question without accepted answer'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as PostTypeDescription,
+        COALESCE(p.Tags, '') as CleanTags,
+        CASE 
+            WHEN p.Score > 100 THEN 'Highly Voted'
+            WHEN p.Score > 50 THEN 'Moderately Voted'
+            WHEN p.Score > 0 THEN 'Slightly Voted'
+            ELSE 'No Votes'
+        END as VoteCategory,
+        DATEDIFF(day, p.CreationDate, COALESCE(p.ClosedDate, p.LastActivityDate, CURRENT_TIMESTAMP)) as DaysActive
+    FROM Posts p
+    WHERE p.CreationDate >= '2015-01-01'
+),
+ComplexJoinResults AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.TotalPosts,
+        uas.Questions,
+        uas.Answers,
+        uas.Comments,
+        uas.Badges,
+        pa.Id as PostId,
+        pa.PostTypeId,
+        pa.ParentId,
+        pa.Score,
+        pa.ViewCount,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.FavoriteCount,
+        pa.Title,
+        pa.Tags,
+        pa.PostTypeDescription,
+        pa.VoteCategory,
+        pa.DaysActive,
+        CASE 
+            WHEN pa.PostTypeId = 1 AND pa.AnswerCount > 0 THEN (pa.AnswerCount * 100.0 / NULLIF(pa.ViewCount, 0))
+            ELSE 0 
+        END as AnswerRatioToViews,
+        CASE 
+            WHEN pa.PostTypeId = 1 THEN COALESCE(pa.Score, 0) - COALESCE(pa.CommentCount, 0) - COALESCE(pa.FavoriteCount, 0)
+            ELSE COALESCE(pa.Score, 0)
+        END as AdjustedScore,
+        CASE 
+            WHEN pa.Score > 0 AND pa.ViewCount > 0 THEN ABS(pa.Score - pa.ViewCount) 
+            ELSE 0 
+        END as ScoreViewDeviation,
+        'Top ' + CAST(uas.RankByReputation as VARCHAR(10)) + ' Reputation User' as UserProfile,
+        LAG(pa.Score) OVER (PARTITION BY uas.UserId ORDER BY pa.CreationDate) as PreviousPostScore,
+        LEAD(pa.Score) OVER (PARTITION BY uas.UserId ORDER BY pa.CreationDate) as NextPostScore,
+        AVG(pa.Score) OVER (PARTITION BY uas.UserId) as AvgUserScore,
+        ROW_NUMBER() OVER (PARTITION BY uas.UserId ORDER BY pa.Score DESC) as BestPostRank,
+        RANK() OVER (ORDER BY pa.Score DESC) as AllTimeScoreRank,
+        COUNT(*) OVER (PARTITION BY uas.UserId) as PostsPerUser
+    FROM UserActivityStats uas
+    INNER JOIN PostAnalytics pa ON uas.UserId = pa.OwnerUserId
+    WHERE pa.Score > COALESCE((SELECT AVG(Score) FROM PostAnalytics), 0)
+),
+CorrelatedSubqueryResults AS (
+    SELECT 
+        cjr.UserId,
+        cjr.DisplayName,
+        cjr.Reputation,
+        cjr.TotalPosts,
+        cjr.Questions,
+        cjr.Answers,
+        cjr.Comments,
+        cjr.Badges,
+        cjr.PostId,
+        cjr.PostTypeId,
+        cjr.ParentId,
+        cjr.Score,
+        cjr.ViewCount,
+        cjr.AnswerCount,
+        cjr.CommentCount,
+        cjr.FavoriteCount,
+        cjr.Title,
+        cjr.Tags,
+        cjr.PostTypeDescription,
+        cjr.VoteCategory,
+        cjr.DaysActive,
+        cjr.AnswerRatioToViews,
+        cjr.AdjustedScore,
+        cjr.ScoreViewDeviation,
+        cjr.UserProfile,
+        cjr.PreviousPostScore,
+        cjr.NextPostScore,
+        cjr.AvgUserScore,
+        cjr.BestPostRank,
+        cjr.AllTimeScoreRank,
+        cjr.PostsPerUser,
+        CASE 
+            WHEN cjr.Score > (SELECT AVG(Score) FROM PostAnalytics WHERE PostTypeId = 1) 
+                 AND cjr.ViewCount > (SELECT AVG(ViewCount) FROM PostAnalytics WHERE PostTypeId = 1)
+                 AND cjr.Answers > 0 THEN TRUE
+            ELSE FALSE 
+        END as HighQualityQuestion,
+        CASE 
+            WHEN EXISTS (
+                SELECT 1 FROM Posts p2 
+                WHERE p2.OwnerUserId = cjr.UserId 
+                AND p2.Score > cjr.Score * 1.5 
+                AND p2.CreationDate > cjr.CreationDate
+            ) THEN 'Has Higher Scoring Descendants'
+            ELSE 'No Higher Scoring Descendants'
+        END as DescendantQuality,
+        CASE 
+            WHEN cjr.Tags IS NULL OR cjr.Tags = '' THEN 'No Tags'
+            WHEN CHARINDEX('>', cjr.Tags) > 0 THEN 'Multiple Tags'
+            ELSE 'Single Tag'
+        END as TagClassification,
+        COALESCE(
+            (SELECT TOP 1 Name FROM Badges b WHERE b.UserId = cjr.UserId ORDER BY b.Date DESC),
+            'No Recent Badges'
+        ) as RecentBadgeName,
+        (SELECT COUNT(*) FROM Posts p3 WHERE OwnerUserId = cjr.UserId AND Score > 100) as HighScorePosts,
+        CASE 
+            WHEN (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = cjr.PostId AND ph.PostHistoryTypeId IN (10, 11, 12, 13)) > 0 
+            THEN 'Has History of Status Changes'
+            ELSE 'No Status History'
+        END as HistoryStatus,
+        CASE 
+            WHEN DATEDIFF(day, cjr.LastPostDate, CURRENT_TIMESTAMP) > 365 
+            THEN 'Inactive User'
+            ELSE 'Active User'
+        END as UserStatus
+    FROM ComplexJoinResults cjr
+),
+SetOperatorTest AS (
+    SELECT UserId, DisplayName, TotalPosts, PostId FROM CorrelatedSubqueryResults
+    UNION
+    SELECT UserId, DisplayName, Questions, PostId FROM CorrelatedSubqueryResults
+    INTERSECT
+    SELECT UserId, DisplayName, Badges, PostId FROM CorrelatedSubqueryResults
+),
+FinalAggregatedResult AS (
+    SELECT 
+        CAST(SUM(AdjustedScore) AS DECIMAL(18,2)) as TotalAdjustedScore,
+        CAST(AVG(AdjustedScore) AS DECIMAL(18,2)) as AvgAdjustedScore,
+        MAX(Reputation) as MaxReputation,
+        MIN(Reputation) as MinReputation,
+        COUNT(*) as TotalRecords,
+        COUNT(DISTINCT UserId) as UniqueUsers,
+        COUNT(DISTINCT PostId) as UniquePosts,
+        COUNT(DISTINCT CASE WHEN VoteCategory = 'Highly Voted' THEN PostId END) as HighlyVotedPosts,
+        COALESCE(SUM(AnswerRatioToViews), 0) as TotalAnswerRatioToViews,
+        CAST(AVG(ScoreViewDeviation) AS DECIMAL(18,2)) as AvgScoreViewDeviation,
+        STRING_AGG(DISTINCT DisplayName, ', ') as UserNames,
+        STRING_AGG(DISTINCT PostTypeDescription, '; ') as PostTypes,
+        STRING_AGG(CASE WHEN Tags IS NOT NULL THEN Tags ELSE 'NULL_TAGS' END, ' | ') as AllTags,
+        'Performance Benchmark Completed' as ProcessingStatus
+    FROM CorrelatedSubqueryResults
+)
+SELECT 
+    far.TotalAdjustedScore,
+    far.AvgAdjustedScore,
+    far.MaxReputation,
+    far.MinReputation,
+    far.TotalRecords,
+    far.UniqueUsers,
+    far.UniquePosts,
+    far.HighlyVotedPosts,
+    far.TotalAnswerRatioToViews,
+    far.AvgScoreViewDeviation,
+    far.UserNames,
+    far.PostTypes,
+    far.AllTags,
+    far.ProcessingStatus,
+    CASE WHEN far.TotalRecords > 0 THEN 'Success' ELSE 'Failed' END as TestResult,
+    CASE WHEN far.UniqueUsers > 10000 THEN 'High Volume' ELSE 'Normal Volume' END as VolumeClassification,
+    'Complex StackOverflow Query' as QueryType
+FROM FinalAggregatedResult far
+WHERE (far.TotalRecords > 0 OR far.UniqueUsers > 0)
+ORDER BY far.TotalAdjustedScore DESC
+OFFSET 0 ROWS FETCH NEXT 1 ROWS ONLY;

@@ -1,0 +1,181 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        AVG(p.Score) as AvgPostScore,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags)-2)), ', ') as AllTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= CAST('2010-01-01' AS TIMESTAMP)
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        PostCount,
+        QuestionCount,
+        AnswerCount,
+        BadgeCount,
+        AVG(AvgPostScore) as AvgScore,
+        RANK() OVER (ORDER BY Reputation DESC, PostCount DESC) as UserRank
+    FROM UserStats
+    GROUP BY UserId, DisplayName, Reputation, PostCount, QuestionCount, AnswerCount, BadgeCount
+),
+PostsWithComplexity AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.ParentId,
+        p.PostTypeId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as PostType,
+        CASE 
+            WHEN p.Score > 100 THEN 'HighlyVoted'
+            WHEN p.Score > 50 THEN 'ModeratelyVoted'
+            WHEN p.Score > 10 THEN 'LowVoted'
+            ELSE 'VeryLowVoted'
+        END as VoteCategory,
+        COALESCE(p.Tags, '') as Tags,
+        CHAR_LENGTH(p.Body) as BodyLength,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags <> '' AND CHAR_LENGTH(p.Tags) > 10 THEN 
+                REGEXP_SPLIT_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags)-2)), '><')
+            ELSE CAST(ARRAY[] AS TEXT[])
+        END as TagArray,
+        DENSE_RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) as ScoreRank,
+        ROW_NUMBER() OVER (ORDER BY p.CreationDate DESC) as NewestPostOrder,
+        LAG(p.Score) OVER (ORDER BY p.CreationDate) as PrevScore,
+        LEAD(p.Score) OVER (ORDER BY p.CreationDate) as NextScore,
+        (p.Score - COALESCE(LAG(p.Score) OVER (ORDER BY p.CreationDate), 0)) as ScoreChangeFromPrevious
+    FROM Posts p
+    WHERE p.CreationDate >= CAST('2015-01-01' AS TIMESTAMP)
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        p.PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostType,
+        p.VoteCategory,
+        p.ScoreRank,
+        p.NewestPostOrder,
+        p.ScoreChangeFromPrevious,
+        p.BodyLength,
+        CASE 
+            WHEN p.TagArray IS NOT NULL THEN CARDINALITY(p.TagArray)
+            ELSE 0
+        END as TagCount,
+        CASE 
+            WHEN p.PostType = 'Question' THEN 
+                (SELECT STRING_AGG(DISTINCT b.Name, ', ') 
+                 FROM Badges b 
+                 WHERE b.UserId = p.OwnerUserId AND b.TagBased = FALSE)
+            ELSE NULL
+        END as UserBadges,
+        CASE 
+            WHEN p.PostType = 'Answer' THEN 
+                (SELECT q.Title 
+                 FROM Posts q 
+                 WHERE q.Id = p.ParentId
+                 LIMIT 1)
+            ELSE NULL
+        END as QuestionTitle,
+        CASE 
+            WHEN p.PostType = 'Question' THEN 
+                (SELECT COUNT(*) 
+                 FROM Posts a 
+                 WHERE a.ParentId = p.PostId AND a.PostTypeId = 2)
+            ELSE 0
+        END as AnswerCountForQuestion,
+        CASE 
+            WHEN EXISTS (SELECT 1 FROM Comments c WHERE c.PostId = p.PostId AND c.Score > 10) THEN 'HighCommentActivity'
+            WHEN EXISTS (SELECT 1 FROM Comments c WHERE c.PostId = p.PostId) THEN 'SomeCommentActivity'
+            ELSE 'NoCommentActivity'
+        END as CommentActivityLevel
+    FROM PostsWithComplexity p
+)
+SELECT 
+    tu.UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.PostCount,
+    tu.QuestionCount,
+    tu.AnswerCount,
+    tu.BadgeCount,
+    tu.AvgScore,
+    tu.UserRank,
+    ca.PostId,
+    ca.Title,
+    ca.Score,
+    ca.ViewCount,
+    ca.AnswerCountForQuestion,
+    ca.CommentCount,
+    ca.CreationDate,
+    ca.PostType,
+    ca.VoteCategory,
+    ca.ScoreRank,
+    ca.NewestPostOrder,
+    ca.ScoreChangeFromPrevious,
+    ca.BodyLength,
+    ca.TagCount,
+    ca.UserBadges,
+    ca.QuestionTitle,
+    ca.CommentActivityLevel,
+    CASE 
+        WHEN ca.Score > (SELECT AVG(Score) FROM ComplexPostAnalysis) THEN 'AboveAverage'
+        WHEN ca.Score > (SELECT AVG(Score) FROM ComplexPostAnalysis) * 0.5 THEN 'BelowAverageButNotPoor'
+        ELSE 'Poor'
+    END as PerformanceCategory,
+    (CASE 
+        WHEN ca.PostType = 'Question' THEN ca.AnswerCountForQuestion
+        WHEN ca.PostType = 'Answer' THEN 0
+        ELSE NULL
+    END) as EffectiveEngagement,
+    (SELECT COUNT(*) 
+     FROM Votes v 
+     WHERE v.PostId = ca.PostId AND v.VoteTypeId IN (2, 3)) as TotalVotes,
+    (SELECT COUNT(*) 
+     FROM Comments c 
+     WHERE c.PostId = ca.PostId) as TotalComments,
+    CASE 
+        WHEN ca.Score > 100 AND ca.ViewCount > 1000 THEN 'Viral'
+        WHEN ca.Score > 50 AND ca.ViewCount > 500 THEN 'Popular'
+        WHEN ca.Score > 25 THEN 'Notable'
+        ELSE 'Routine'
+    END as PopularityLevel,
+    CAST('2024-10-01 12:34:56' AS TIMESTAMP) - ca.CreationDate as IntervalSinceCreation,
+    EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - ca.CreationDate)) as DaysSinceCreation,
+    LAG(ca.Score) OVER (ORDER BY ca.CreationDate) as PreviousScore,
+    LEAD(ca.Score) OVER (ORDER BY ca.CreationDate) as NextScore
+FROM TopUsers tu
+INNER JOIN ComplexPostAnalysis ca ON tu.UserId = ca.OwnerUserId
+WHERE tu.UserRank <= 100 
+    AND (ca.Score > 10 OR ca.ViewCount > 100)
+ORDER BY tu.UserRank, ca.Score DESC, ca.CreationDate DESC
+LIMIT 500;

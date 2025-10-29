@@ -1,0 +1,215 @@
+-- {"query": "1547.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3532} 
+
+WITH UserBaseStats AS (
+    -- CTE 1: Summarize user's fundamental activity and create a weighted score
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.UpVotes,
+        U.DownVotes,
+        U.Views AS UserProfileViews,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        (U.Reputation * 0.5) + (U.UpVotes * 0.1) - (U.DownVotes * 0.05) + (COUNT(DISTINCT P.Id) * 2) + (COUNT(DISTINCT C.Id) * 0.75) AS WeightedUserScore
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    LEFT JOIN Badges AS B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.UpVotes, U.DownVotes, U.Views
+    HAVING COUNT(DISTINCT P.Id) > 0 OR COUNT(DISTINCT C.Id) > 0 OR COUNT(DISTINCT B.Id) > 0
+),
+PostActivityMetrics AS (
+    -- CTE 2: Calculate detailed metrics for individual posts, focusing on Questions and Answers
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.AcceptedAnswerId,
+        P.ParentId,
+        P.Title,
+        P.Tags,
+        P.ClosedDate,
+        COALESCE((SELECT SUM(CASE WHEN V.VoteTypeId IN (2,5) THEN 1 ELSE -1 END) FROM Votes AS V WHERE V.PostId = P.Id), 0) AS NetVotes,
+        (SELECT COUNT(DISTINCT V.Id) FROM Votes AS V WHERE V.PostId = P.Id AND V.VoteTypeId IN (2, 3, 5)) AS TotalVotesCast,
+        (SELECT COUNT(DISTINCT PH.Id) FROM PostHistory AS PH WHERE PH.PostId = P.Id AND PH.PostHistoryTypeId IN (4, 5, 6)) AS EditCount,
+        (SELECT COUNT(DISTINCT PH.Id) FROM PostHistory AS PH WHERE PH.PostId = P.Id AND PH.PostHistoryTypeId = 10) AS CloseCount,
+        (SELECT COUNT(DISTINCT PH.Id) FROM PostHistory AS PH WHERE PH.PostId = P.Id AND PH.PostHistoryTypeId = 11) AS ReopenCount,
+        CASE
+            WHEN P.PostTypeId = 1 AND P.ViewCount > 0
+            THEN CAST(P.Score + COALESCE(P.FavoriteCount, 0) + (P.CommentCount * 0.5) + (COALESCE(P.AnswerCount,0) * 1.5) AS DOUBLE PRECISION) / P.ViewCount
+            ELSE 0.0
+        END AS QuestionEngagementRatio,
+        CASE
+            WHEN P.PostTypeId = 2 AND P.ParentId IS NOT NULL AND P.Score > 0
+            THEN CAST(P.Score + (P.CommentCount * 0.5) AS DOUBLE PRECISION) / (
+                SELECT GREATEST(COALESCE(SUM(V_Parent.BountyAmount), 0), 1)
+                FROM Votes AS V_Parent
+                WHERE V_Parent.PostId = P.ParentId AND V_Parent.VoteTypeId = 8 AND V_Parent.BountyAmount IS NOT NULL
+            )
+            ELSE 0.0
+        END AS AnswerPerformanceMetric,
+        COALESCE(P.OwnerUserId, -1) AS OwnerUserId_NotNull, -- Handle community owned posts / deleted users with a placeholder
+        STRING_TO_ARRAY(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags)-2), '><') AS TagArray
+    FROM Posts AS P
+    WHERE P.PostTypeId IN (1, 2)
+    AND P.CreationDate >= '2022-01-01' -- Limit data for recent activity
+    AND P.Body IS NOT NULL AND LENGTH(P.Body) > 50
+),
+TagUsageAndPerformance AS (
+    -- CTE 3: Analyze overall performance metrics for tags
+    SELECT
+        T.TagName,
+        COUNT(DISTINCT PAM.PostId) AS TagPostCount,
+        AVG(PAM.Score) AS AvgTagScore,
+        SUM(PAM.NetVotes) AS TotalTagNetVotes,
+        SUM(PAM.EditCount) AS TotalTagEdits,
+        SUM(PAM.CloseCount) AS TotalTagCloseCount,
+        SUM(PAM.ReopenCount) AS TotalTagReopenCount
+    FROM PostActivityMetrics AS PAM
+    CROSS JOIN UNNEST(PAM.TagArray) AS T(TagName)
+    WHERE PAM.Tags IS NOT NULL AND LENGTH(PAM.Tags) > 2
+    GROUP BY T.TagName
+    HAVING COUNT(DISTINCT PAM.PostId) > 50
+),
+ControversialPosts AS (
+    -- CTE 4: Identify posts that are deemed controversial based on downvotes, reopens, or significant close history
+    SELECT
+        PAM.PostId,
+        PAM.Title,
+        PAM.OwnerUserId_NotNull AS OwnerUserId,
+        PAM.Score,
+        PAM.CommentCount,
+        PAM.CloseCount,
+        PAM.ReopenCount,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvoteCount,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvoteCount,
+        SUM(CASE WHEN V.VoteTypeId = 4 THEN 1 ELSE 0 END) AS OffensiveVotes,
+        (CAST(SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DOUBLE PRECISION) / NULLIF(SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) + SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END), 0)) AS DownvoteRatio,
+        MAX(PH.CreationDate) FILTER (WHERE PH.PostHistoryTypeId = 10) AS LastClosedDate -- Conditional aggregation for last close date
+    FROM PostActivityMetrics AS PAM
+    INNER JOIN Votes AS V ON PAM.PostId = V.PostId
+    LEFT JOIN PostHistory AS PH ON PAM.PostId = PH.PostId AND PH.PostHistoryTypeId IN (10, 11)
+    WHERE PAM.PostTypeId = 1 -- Only consider questions for controversy
+    GROUP BY PAM.PostId, PAM.Title, PAM.OwnerUserId_NotNull, PAM.Score, PAM.CommentCount, PAM.CloseCount, PAM.ReopenCount
+    HAVING SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) > 5 -- At least 5 downvotes
+    AND (CAST(SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DOUBLE PRECISION) / NULLIF(SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) + SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END), 0)) > 0.3 -- More than 30% downvotes
+    OR PAM.ReopenCount >= 2 -- Or reopened at least twice
+    OR (PAM.CloseCount > 0 AND PAM.EditCount > 5) -- Or a closed post with many edits
+),
+UserPostAggregates AS (
+    -- CTE 5: Aggregate post-related metrics per user from PostActivityMetrics
+    SELECT
+        PAM.OwnerUserId_NotNull AS OwnerUserId,
+        COUNT(PAM.PostId) AS UserTotalPosts,
+        AVG(PAM.Score) AS UserAvgPostScore,
+        MAX(PAM.ViewCount) AS UserMaxPostViews,
+        SUM(PAM.EditCount) AS UserTotalPostEdits,
+        AVG(PAM.QuestionEngagementRatio) FILTER (WHERE PAM.PostTypeId = 1) AS UserAvgQuestionEngagement, -- Conditional AVG for questions
+        AVG(PAM.AnswerPerformanceMetric) FILTER (WHERE PAM.PostTypeId = 2) AS UserAvgAnswerPerformance, -- Conditional AVG for answers
+        MIN(PAM.PostCreationDate) AS FirstPostDate,
+        MAX(PAM.PostCreationDate) AS LastPostDate,
+        COUNT(DISTINCT PAM.PostId) FILTER (WHERE PAM.ClosedDate IS NOT NULL) AS ClosedPostsCount,
+        COUNT(DISTINCT PAM.PostId) FILTER (WHERE PAM.AcceptedAnswerId IS NOT NULL) AS AcceptedAnswersPostsCount
+    FROM PostActivityMetrics AS PAM
+    WHERE PAM.OwnerUserId_NotNull != -1 -- Exclude the community user's posts
+    GROUP BY PAM.OwnerUserId_NotNull
+    HAVING COUNT(PAM.PostId) > 2 -- Consider users with at least 3 posts
+),
+UserTopTagRank AS (
+    -- CTE 6: Determine the top contributing tag for each user based on sum of post scores
+    SELECT
+        U.Id AS UserId,
+        T.TagName,
+        SUM(P.Score) AS TagScoreSum,
+        COUNT(P.Id) AS TagPostCount,
+        ROW_NUMBER() OVER (PARTITION BY U.Id ORDER BY SUM(P.Score) DESC, COUNT(P.Id) DESC) as rn
+    FROM Users U
+    JOIN Posts P ON U.Id = P.OwnerUserId
+    CROSS JOIN UNNEST(STRING_TO_ARRAY(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags)-2), '><')) AS T(TagName)
+    WHERE P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2
+    GROUP BY U.Id, T.TagName
+)
+-- Main Query: Combine information from all CTEs to generate two distinct reports using UNION ALL
+SELECT
+    'High-Engagement Users Report' AS ReportCategory,
+    UBS.UserId,
+    UBS.DisplayName,
+    UBS.Reputation,
+    UBS.WeightedUserScore,
+    UPOA.UserTotalPosts,
+    UBS.TotalComments,
+    UBS.TotalBadges,
+    UTTR.TagName AS TopContributingTag,
+    TUP.AvgTagScore AS TopTagAvgScore,
+    UPOA.UserAvgPostScore,
+    UPOA.UserMaxPostViews,
+    UPOA.UserTotalPostEdits,
+    UPOA.UserAvgQuestionEngagement,
+    UPOA.UserAvgAnswerPerformance,
+    UPOA.ClosedPostsCount,
+    UPOA.AcceptedAnswersPostsCount,
+    (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP - UBS.LastAccessDate) / 86400)::INT AS DaysSinceLastAccess, -- Calculate days since last access
+    CONCAT(LEFT(COALESCE(UBS.DisplayName, 'Unknown'), 5), '...', RIGHT(COALESCE(UBS.DisplayName, 'Unknown'), 3)) AS DisplayNameSnippet, -- String manipulation
+    ROW_NUMBER() OVER (ORDER BY UBS.WeightedUserScore DESC, UPOA.UserAvgPostScore DESC NULLS LAST) AS OverallRank, -- Window function for ranking
+    (SELECT AVG(CP_Inner.DownvoteRatio) FROM ControversialPosts CP_Inner WHERE CP_Inner.OwnerUserId = UBS.UserId) AS AvgControversialPostRatio, -- Correlated subquery for user's average controversy
+    CASE
+        WHEN UBS.GoldBadges >= 3 AND UBS.Reputation > 50000 THEN 'Gold Tier Contributor'
+        WHEN UBS.TotalBadges >= 10 AND UBS.Reputation > 10000 THEN 'Silver Tier Contributor'
+        WHEN UBS.TotalPosts >= 50 AND UBS.TotalComments >= 20 THEN 'Bronze Tier Contributor'
+        ELSE 'Aspiring Contributor'
+    END AS ContributorTier
+FROM UserBaseStats AS UBS
+INNER JOIN UserPostAggregates AS UPOA ON UBS.UserId = UPOA.OwnerUserId
+LEFT JOIN UserTopTagRank AS UTTR ON UBS.UserId = UTTR.UserId AND UTTR.rn = 1
+LEFT JOIN TagUsageAndPerformance AS TUP ON UTTR.TagName = TUP.TagName
+WHERE UBS.WeightedUserScore > (SELECT PERCENTILE_CONT(0.90) WITHIN GROUP (ORDER BY WeightedUserScore) FROM UserBaseStats) -- Filter for top 10% by weighted score
+AND UPOA.UserTotalPosts >= 10
+AND UBS.LastAccessDate >= CURRENT_TIMESTAMP - INTERVAL '1 year' -- Active in the last year
+AND COALESCE(UBS.DisplayName, '') NOT LIKE '%bot%' -- Exclude bots using string pattern and NULL logic
+UNION ALL
+SELECT
+    'Controversial Content Creators Report' AS ReportCategory,
+    UBS.UserId,
+    UBS.DisplayName,
+    UBS.Reputation,
+    UBS.WeightedUserScore,
+    UPOA.UserTotalPosts,
+    UBS.TotalComments,
+    UBS.TotalBadges,
+    UTTR.TagName AS TopContributingTag,
+    TUP.AvgTagScore AS TopTagAvgScore,
+    UPOA.UserAvgPostScore,
+    UPOA.UserMaxPostViews,
+    UPOA.UserTotalPostEdits,
+    UPOA.UserAvgQuestionEngagement,
+    UPOA.UserAvgAnswerPerformance,
+    UPOA.ClosedPostsCount,
+    UPOA.AcceptedAnswersPostsCount,
+    (EXTRACT(EPOCH FROM CURRENT_TIMESTAMP - UBS.LastAccessDate) / 86400)::INT AS DaysSinceLastAccess,
+    CONCAT(LEFT(COALESCE(UBS.DisplayName, 'Unknown'), 5), '...', RIGHT(COALESCE(UBS.DisplayName, 'Unknown'), 3)) AS DisplayNameSnippet,
+    ROW_NUMBER() OVER (ORDER BY CP.DownvoteRatio DESC, CP.LastClosedDate DESC NULLS LAST) AS OverallRank, -- Ranking based on controversy metrics
+    CP.DownvoteRatio AS AvgControversialPostRatio, -- Specific controversial post ratio
+    'High-Risk Contributor' AS ContributorTier
+FROM UserBaseStats AS UBS
+INNER JOIN ControversialPosts AS CP ON UBS.UserId = CP.OwnerUserId -- Join only users linked to controversial posts
+LEFT JOIN UserPostAggregates AS UPOA ON UBS.UserId = UPOA.OwnerUserId
+LEFT JOIN UserTopTagRank AS UTTR ON UBS.UserId = UTTR.UserId AND UTTR.rn = 1
+LEFT JOIN TagUsageAndPerformance AS TUP ON UTTR.TagName = TUP.TagName
+WHERE UBS.Reputation > 500 -- Only consider established users
+AND CP.DownvoteRatio > 0.4 -- Filter for highly controversial posts
+AND CP.ReopenCount >= 1 -- And posts that were reopened at least once
+ORDER BY ReportCategory, OverallRank
+LIMIT 200;

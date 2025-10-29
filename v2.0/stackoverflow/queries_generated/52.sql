@@ -1,0 +1,443 @@
+-- {"query": "52.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 4011} 
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        u.location,
+        coalesce(nullif(trim(u.websiteurl), ''), 'none') as websiteurl_norm,
+        date_trunc('month', u.creationdate) as created_month
+    from users u
+    where u.creationdate >= now() - interval '5 years'
+),
+user_badge_counts as (
+    select
+        b.userid,
+        count(*) as badge_count,
+        count(*) filter (where b.class = 1) as gold_count,
+        count(*) filter (where b.class = 2) as silver_count,
+        count(*) filter (where b.class = 3) as bronze_count,
+        max(b.date) as last_badge_date
+    from badges b
+    group by b.userid
+),
+question_activity as (
+    select
+        p.owneruserid as user_id,
+        count(*) filter (where p.posttypeid = 1) as questions,
+        count(*) filter (where p.posttypeid = 2) as answers,
+        sum(coalesce(p.score,0)) as post_score_sum,
+        sum(coalesce(p.viewcount,0)) filter (where p.posttypeid = 1) as question_views,
+        sum(case when p.posttypeid = 1 and p.acceptedanswerid is not null then 1 else 0 end) as accepted_questions,
+        max(p.lastactivitydate) as last_post_activity
+    from posts p
+    where p.owneruserid is not null
+    group by p.owneruserid
+),
+comment_stats as (
+    select
+        c.userid as user_id,
+        count(*) as comment_count,
+        sum(coalesce(c.score,0)) as comment_score_sum,
+        max(c.creationdate) as last_comment_date
+    from comments c
+    where c.userid is not null
+    group by c.userid
+),
+vote_summary as (
+    select
+        v.userid as user_id,
+        count(*) filter (where v.votetypeid = 2) as upvotes_cast,
+        count(*) filter (where v.votetypeid = 3) as downvotes_cast,
+        count(*) filter (where v.votetypeid in (8,9)) as bounty_events,
+        sum(coalesce(v.bountyamount,0)) filter (where v.votetypeid in (8,9)) as bounty_amount_total,
+        max(v.creationdate) as last_vote_date
+    from votes v
+    where v.userid is not null
+    group by v.userid
+),
+user_close_events as (
+    select
+        ph.userid as user_id,
+        count(*) filter (where ph.posthistorytypeid = 10) as close_votes_recorded,
+        count(*) filter (where ph.posthistorytypeid = 11) as reopen_votes_recorded,
+        max(ph.creationdate) as last_close_event
+    from posthistory ph
+    where ph.userid is not null
+      and ph.posthistorytypeid in (10,11)
+    group by ph.userid
+),
+duplicate_links as (
+    select
+        pl.postid,
+        pl.relatedpostid,
+        pl.linktypeid,
+        pl.creationdate
+    from postlinks pl
+    where pl.linktypeid = 3
+),
+user_dup_network as (
+    select
+        q.owneruserid as user_id,
+        count(distinct dl.postid) as dup_marked_questions,
+        count(distinct dl.relatedpostid) as dup_targets_referenced,
+        max(dl.creationdate) as last_dup_seen
+    from duplicate_links dl
+    join posts q on q.id = dl.postid and q.posttypeid = 1
+    group by q.owneruserid
+),
+tag_usage as (
+    select
+        p.owneruserid as user_id,
+        t.tag,
+        count(*) as uses
+    from (
+        select
+            p.id,
+            p.owneruserid,
+            unnest(string_to_array(substring(p.tags, 2, greatest(length(p.tags)-2,0)), '><')) as tag
+        from posts p
+        where p.posttypeid = 1
+          and p.tags is not null
+    ) p
+    join lateral (select p.tag) t on true
+    group by p.owneruserid, t.tag
+),
+top_tag_per_user as (
+    select distinct on (tu.user_id)
+        tu.user_id,
+        tu.tag as top_tag,
+        tu.uses as top_tag_uses
+    from tag_usage tu
+    order by tu.user_id, tu.uses desc, tu.tag
+),
+monthly_user_activity as (
+    select
+        u.id as user_id,
+        date_trunc('month', p.creationdate) as month_bucket,
+        count(*) filter (where p.posttypeid = 1) as q_count,
+        count(*) filter (where p.posttypeid = 2) as a_count,
+        sum(coalesce(p.score,0)) as post_score_sum
+    from users u
+    left join posts p on p.owneruserid = u.id
+    group by u.id, date_trunc('month', p.creationdate)
+),
+activity_trend as (
+    select
+        mua.user_id,
+        mua.month_bucket,
+        mua.q_count,
+        mua.a_count,
+        mua.post_score_sum,
+        coalesce(
+            lag(mua.q_count + mua.a_count) over (partition by mua.user_id order by mua.month_bucket),
+            0
+        ) as prev_posts,
+        (mua.q_count + mua.a_count) - coalesce(lag(mua.q_count + mua.a_count) over (partition by mua.user_id order by mua.month_bucket),0) as post_delta
+    from monthly_user_activity mua
+),
+recent_activity_window as (
+    select
+        at.user_id,
+        sum(at.q_count + at.a_count) filter (where at.month_bucket >= date_trunc('month', now()) - interval '12 months') as posts_last_12m,
+        sum(at.post_score_sum) filter (where at.month_bucket >= date_trunc('month', now()) - interval '12 months') as post_score_last_12m,
+        avg(at.post_delta) filter (where at.month_bucket >= date_trunc('month', now()) - interval '12 months') as avg_monthly_delta_12m
+    from activity_trend at
+    group by at.user_id
+),
+question_quality as (
+    select
+        q.owneruserid as user_id,
+        percentile_cont(0.5) within group (order by coalesce(q.score,0)) as median_q_score,
+        avg(coalesce(q.viewcount,0)) as avg_q_views,
+        sum(case when q.closeddate is not null then 1 else 0 end) as closed_q_count,
+        sum(case when q.acceptedanswerid is not null then 1 else 0 end) as accepted_q_count
+    from posts q
+    where q.posttypeid = 1
+    group by q.owneruserid
+),
+answer_quality as (
+    select
+        a.owneruserid as user_id,
+        avg(coalesce(a.score,0)) as avg_a_score,
+        count(*) filter (where coalesce(a.score,0) > 0) as positive_answers,
+        count(*) filter (where coalesce(a.score,0) < 0) as negative_answers
+    from posts a
+    where a.posttypeid = 2
+    group by a.owneruserid
+),
+user_profile_norm as (
+    select
+        ru.user_id,
+        ru.displayname,
+        ru.reputation,
+        ru.creationdate,
+        ru.location,
+        ru.websiteurl_norm,
+        ru.created_month,
+        length(coalesce(ru.location, '')) as location_len,
+        case
+            when ru.displayname ~ '^\s*$' then '[anonymous]'
+            else ru.displayname
+        end as displayname_norm
+    from recent_users ru
+),
+post_ownerless_counts as (
+    select
+        u.id as user_id,
+        count(*) as ownerless_posts_seen
+    from users u
+    left join posts p on p.owneruserid is null and p.lasteditoruserid = u.id
+    group by u.id
+),
+-- Correlated subquery example: user’s highest scoring post and title length
+user_top_post as (
+    select
+        u.id as user_id,
+        (
+            select p2.id
+            from posts p2
+            where p2.owneruserid = u.id
+            order by coalesce(p2.score, -2147483648) desc nulls last, p2.id
+            limit 1
+        ) as top_post_id,
+        (
+            select coalesce(length(p3.title),0)
+            from posts p3
+            where p3.id = (
+                select p4.id
+                from posts p4
+                where p4.owneruserid = u.id
+                order by coalesce(p4.score, -2147483648) desc nulls last, p4.id
+                limit 1
+            )
+        ) as top_post_title_len
+    from users u
+),
+-- Set operator example: users who both asked and answered in the last year
+askers_last_year as (
+    select distinct p.owneruserid as user_id
+    from posts p
+    where p.posttypeid = 1
+      and p.creationdate >= now() - interval '12 months'
+      and p.owneruserid is not null
+),
+answerers_last_year as (
+    select distinct p.owneruserid as user_id
+    from posts p
+    where p.posttypeid = 2
+      and p.creationdate >= now() - interval '12 months'
+      and p.owneruserid is not null
+),
+dual_role_last_year as (
+    (select user_id from askers_last_year)
+    intersect
+    (select user_id from answerers_last_year)
+),
+final as (
+    select
+        upn.user_id,
+        upn.displayname_norm as displayname,
+        upn.reputation,
+        upn.creationdate,
+        upn.location,
+        upn.websiteurl_norm,
+        ubc.badge_count,
+        ubc.gold_count,
+        ubc.silver_count,
+        ubc.bronze_count,
+        ubc.last_badge_date,
+        qa.questions,
+        qa.answers,
+        qa.post_score_sum,
+        qa.question_views,
+        qa.accepted_questions,
+        qa.last_post_activity,
+        cs.comment_count,
+        cs.comment_score_sum,
+        cs.last_comment_date,
+        vs.upvotes_cast,
+        vs.downvotes_cast,
+        vs.bounty_events,
+        vs.bounty_amount_total,
+        vs.last_vote_date,
+        uce.close_votes_recorded,
+        uce.reopen_votes_recorded,
+        uce.last_close_event,
+        udn.dup_marked_questions,
+        udn.dup_targets_referenced,
+        udn.last_dup_seen,
+        ttp.top_tag,
+        ttp.top_tag_uses,
+        raw.posts_last_12m,
+        raw.post_score_last_12m,
+        raw.avg_monthly_delta_12m,
+        qq.median_q_score,
+        qq.avg_q_views,
+        qq.closed_q_count,
+        qq.accepted_q_count,
+        aq.avg_a_score,
+        aq.positive_answers,
+        aq.negative_answers,
+        poc.ownerless_posts_seen,
+        utp.top_post_id,
+        utp.top_post_title_len,
+        case
+            when drly.user_id is not null then 1
+            else 0
+        end as dual_role_last_year,
+        -- complicated predicate-derived bucket
+        case
+            when coalesce(qa.answers,0) >= 50 and coalesce(aq.avg_a_score,0) >= 2 then 'Answer Power User'
+            when coalesce(qa.questions,0) >= 20 and coalesce(qq.avg_q_views,0) >= 1000 then 'Question Magnet'
+            when coalesce(ubc.gold_count,0) >= 5 then 'Gold Collector'
+            when coalesce(vs.bounty_amount_total,0) >= 500 then 'Bounty Hunter'
+            when coalesce(raw.posts_last_12m,0) = 0 then 'Dormant'
+            else 'Active'
+        end as activity_bucket,
+        -- string expressions and NULL logic
+        trim(both ' ' from coalesce(upn.location, 'Unknown')) || ' | ' ||
+        coalesce(ttp.top_tag, 'no-tag') || ' | rep=' || coalesce(upn.reputation::text, '0') as profile_summary,
+        -- window functions over final dataset
+        row_number() over (order by coalesce(qa.answers,0) desc, coalesce(qa.questions,0) desc, upn.reputation desc, upn.user_id) as rownum_desc_activity,
+        rank() over (order by coalesce(ubc.badge_count,0) desc, upn.reputation desc) as rank_by_badges,
+        dense_rank() over (order by coalesce(raw.posts_last_12m,0) desc) as dense_rank_recent_posts,
+        sum(coalesce(qa.post_score_sum,0)) over (partition by coalesce(ttp.top_tag,'[none]')) as total_score_by_top_tag_partition
+    from user_profile_norm upn
+    left join user_badge_counts ubc on ubc.userid = upn.user_id
+    left join question_activity qa on qa.user_id = upn.user_id
+    left join comment_stats cs on cs.user_id = upn.user_id
+    left join vote_summary vs on vs.user_id = upn.user_id
+    left join user_close_events uce on uce.user_id = upn.user_id
+    left join user_dup_network udn on udn.user_id = upn.user_id
+    left join top_tag_per_user ttp on ttp.user_id = upn.user_id
+    left join recent_activity_window raw on raw.user_id = upn.user_id
+    left join question_quality qq on qq.user_id = upn.user_id
+    left join answer_quality aq on aq.user_id = upn.user_id
+    left join post_ownerless_counts poc on poc.user_id = upn.user_id
+    left join user_top_post utp on utp.user_id = upn.user_id
+    left join dual_role_last_year drly on drly.user_id = upn.user_id
+),
+-- Outer join to enrich with tag metadata via user's top tag (may be null)
+tag_enriched as (
+    select
+        f.*,
+        tg.count as top_tag_global_count,
+        tg.ismoderatoronly,
+        tg.isrequired
+    from final f
+    left join tags tg on tg.tagname = f.top_tag
+),
+-- Apply complex filtering and ordering for benchmarking
+filtered as (
+    select
+        te.*
+    from tag_enriched te
+    where
+        -- complicated predicates mixing null logic and expressions
+        (
+            coalesce(te.reputation,0) > 100
+            and (coalesce(te.answers,0) + coalesce(te.questions,0)) >= 5
+        )
+        and (
+            te.top_tag is null
+            or te.top_tag_global_count is null
+            or te.top_tag_global_count > 100
+        )
+        and not (
+            te.activity_bucket = 'Dormant'
+            and coalesce(te.posts_last_12m,0) > 0
+        )
+        and (
+            te.last_post_activity is null
+            or te.last_post_activity >= te.creationdate
+            or te.last_post_activity >= now() - interval '3 years'
+        )
+        and (
+            te.displayname is not null
+            and length(te.displayname) between 3 and 40
+        )
+        and (
+            te.websiteurl_norm = 'none'
+            or te.websiteurl_norm ilike 'http%'
+        )
+),
+scored as (
+    select
+        fl.*,
+        -- composite score using mixed metrics
+        (
+            0.30 * ln(1 + coalesce(fl.reputation,0)) +
+            0.25 * ln(1 + coalesce(fl.answers,0)) +
+            0.15 * ln(1 + coalesce(fl.questions,0)) +
+            0.10 * coalesce(fl.avg_a_score,0) +
+            0.05 * coalesce(fl.median_q_score,0) +
+            0.05 * ln(1 + coalesce(fl.badge_count,0)) +
+            0.05 * ln(1 + coalesce(fl.post_score_last_12m,0)) +
+            0.05 * case when fl.dual_role_last_year = 1 then 1 else 0 end
+        ) as composite_score
+    from filtered fl
+),
+-- windowing over composite score with partitions
+ranked as (
+    select
+        s.*,
+        ntile(10) over (order by s.composite_score desc nulls last) as decile_overall,
+        rank() over (partition by coalesce(s.top_tag,'[none]') order by s.composite_score desc nulls last) as rank_within_top_tag,
+        avg(s.composite_score) over () as avg_score_global
+    from scored s
+)
+select
+    r.user_id,
+    r.displayname,
+    r.reputation,
+    r.top_tag,
+    r.top_tag_uses,
+    r.top_tag_global_count,
+    r.questions,
+    r.answers,
+    r.posts_last_12m,
+    r.post_score_last_12m,
+    r.avg_a_score,
+    r.median_q_score,
+    r.badge_count,
+    r.gold_count,
+    r.silver_count,
+    r.bronze_count,
+    r.dup_marked_questions,
+    r.dup_targets_referenced,
+    r.activity_bucket,
+    r.profile_summary,
+    r.composite_score,
+    r.decile_overall,
+    r.rank_within_top_tag,
+    r.avg_score_global,
+    -- demonstrate outer join nulls: enrich with accepted rate safely
+    case
+        when coalesce(r.questions,0) = 0 then null
+        else round(100.0 * coalesce(r.accepted_q_count,0) / nullif(r.questions,0)::numeric, 2)
+    end as accepted_rate_pct,
+    -- show last activity across sources
+    greatest(
+        coalesce(r.last_post_activity, to_timestamp(0)),
+        coalesce(r.last_comment_date, to_timestamp(0)),
+        coalesce(r.last_vote_date, to_timestamp(0)),
+        coalesce(r.last_close_event, to_timestamp(0)),
+        coalesce(r.last_dup_seen, to_timestamp(0))
+    ) as last_activity_overall,
+    -- string transformation sample
+    upper(substr(coalesce(r.displayname,''), 1, 20)) as displayname_upper_prefix
+from ranked r
+where
+    -- final where with complex expression
+    (
+        r.decile_overall <= 7
+        or (r.rank_within_top_tag <= 25 and coalesce(r.top_tag_uses,0) >= 3)
+    )
+order by
+    r.decile_overall,
+    r.rank_within_top_tag,
+    r.composite_score desc,
+    r.user_id
+limit 500;

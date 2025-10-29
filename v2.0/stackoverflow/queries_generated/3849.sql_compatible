@@ -1,0 +1,163 @@
+WITH UserStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1)                         AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2)                         AS AnswerCount,
+        SUM(COALESCE(v.UpVotes,0) - COALESCE(v.DownVotes,0))                AS NetScore,
+        MAX(p.CreationDate)                                                AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT
+            PostId,
+            SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes
+        GROUP BY PostId
+    ) v ON v.PostId = p.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+BadgeRanks AS (
+    SELECT
+        b.UserId,
+        COUNT(*)                                                      AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 3
+                 WHEN b.Class = 2 THEN 2
+                 ELSE 1 END)                                         AS BadgeScore,
+        -- STRING_AGG with DISTINCT is not available in all dialects; emulate by aggregating distinct names via subquery
+        (SELECT STRING_AGG(x.Name, ',') FROM (SELECT DISTINCT Name FROM Badges bb WHERE bb.UserId = b.UserId AND bb.TagBased = 0) x) AS NamedBadges,
+        (SELECT STRING_AGG(x.Name, ',') FROM (SELECT DISTINCT Name FROM Badges bb WHERE bb.UserId = b.UserId AND bb.TagBased = 1) x) AS TagBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+TagCooccurrence AS (
+    SELECT
+        t1.TagName AS TagA,
+        t2.TagName AS TagB,
+        COUNT(*)   AS CooccurCount
+    FROM Posts p
+    -- Use a generic string-splitting approach: some dialects have different functions. Here emulate by joining on extracted tags via a numbers table approach if regexp_split_to_table not available.
+    -- For compatibility assume Tags are like "<tag1><tag2>" and use recursive CTE to split.
+    CROSS JOIN LATERAL (
+        SELECT TagName, ord
+        FROM (
+            SELECT
+                TRIM(BOTH '<>' FROM split_tag) AS TagName,
+                ROW_NUMBER() OVER () AS ord
+            FROM (
+                SELECT regexp_split_to_table(p.Tags, '[><]') AS split_tag
+            ) st
+        ) s
+    ) t1
+    CROSS JOIN LATERAL (
+        SELECT TagName, ord
+        FROM (
+            SELECT
+                TRIM(BOTH '<>' FROM split_tag) AS TagName,
+                ROW_NUMBER() OVER () AS ord
+            FROM (
+                SELECT regexp_split_to_table(p.Tags, '[><]') AS split_tag
+            ) st
+        ) s
+    ) t2
+    WHERE t1.TagName < t2.TagName
+    GROUP BY t1.TagName, t2.TagName
+    HAVING COUNT(*) > 100
+),
+
+TopContributors AS (
+    SELECT
+        us.Id,
+        us.DisplayName,
+        us.Reputation,
+        us.QuestionCount,
+        us.AnswerCount,
+        COALESCE(br.BadgeCount,0) AS BadgeCount,
+        COALESCE(br.BadgeScore,0) AS BadgeScore,
+        ROW_NUMBER() OVER (ORDER BY us.Reputation DESC, us.AnswerCount DESC) AS Rank
+    FROM UserStats us
+    LEFT JOIN BadgeRanks br ON br.UserId = us.Id
+    WHERE us.Reputation > 10000
+),
+
+RecentClosedQuestions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Tags,
+        ph.CreationDate                              AS ClosedDate,
+        ph.Comment                                    AS CloseReason,
+        u.DisplayName                                AS OwnerName,
+        COALESCE(vc.UpVotes,0) - COALESCE(vc.DownVotes,0) AS NetScore,
+        ROW_NUMBER() OVER (PARTITION BY ph.Comment ORDER BY ph.CreationDate DESC) AS rn
+    FROM Posts p
+    JOIN PostHistory ph
+      ON ph.PostId = p.Id
+     AND ph.PostHistoryTypeId = 10                -- Closed
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    LEFT JOIN (
+        SELECT
+            PostId,
+            SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes
+        GROUP BY PostId
+    ) vc ON vc.PostId = p.Id
+    WHERE p.PostTypeId = 1                         -- Questions only
+)
+
+-- First part: TopContributors joined to RecentClosedQuestions
+SELECT
+    tc.Rank,
+    tc.DisplayName,
+    tc.Reputation,
+    tc.QuestionCount,
+    tc.AnswerCount,
+    tc.BadgeCount,
+    tc.BadgeScore,
+    COALESCE(rc.Title, 'N/A')      AS RecentClosedTitle,
+    COALESCE(rc.CloseReason, 'None') AS CloseReason,
+    rc.NetScore                    AS ClosedNetScore,
+    (COALESCE(tc.BadgeScore,0) + COALESCE(rc.NetScore,0)) AS CompositeScore
+FROM TopContributors tc
+FULL OUTER JOIN (
+    SELECT *
+    FROM (
+        SELECT DISTINCT ON (CloseReason) *
+        FROM RecentClosedQuestions
+        WHERE rn = 1
+        ORDER BY CloseReason, ClosedDate DESC
+    ) sub
+) rc
+  ON rc.CloseReason = (
+        SELECT cr.CloseReason
+        FROM RecentClosedQuestions cr
+        WHERE cr.Id = tc.Id
+        ORDER BY cr.ClosedDate DESC
+        LIMIT 1
+     )
+WHERE tc.Rank <= 50
+ORDER BY CompositeScore DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    NULL::INT AS Rank,
+    (t.TagA || '/' || t.TagB) AS DisplayName,
+    NULL::INT AS Reputation,
+    NULL::INT AS QuestionCount,
+    NULL::INT AS AnswerCount,
+    NULL::INT AS BadgeCount,
+    NULL::INT AS BadgeScore,
+    NULL::TEXT AS RecentClosedTitle,
+    NULL::TEXT AS CloseReason,
+    NULL::INT AS ClosedNetScore,
+    t.CooccurCount AS CompositeScore
+FROM TagCooccurrence t
+ORDER BY CompositeScore DESC
+LIMIT 20;

@@ -1,0 +1,189 @@
+WITH RECURSIVE PostEngagement AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        COALESCE(u.Reputation, 0) AS OwnerReputation,
+        ROW_NUMBER() OVER (ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1, 2)
+),
+PostMetrics AS (
+    SELECT
+        pe.PostId,
+        pe.PostTypeId,
+        pe.OwnerUserId,
+        pe.OwnerReputation,
+        pe.Score,
+        pe.ViewCount,
+        pe.CommentCount,
+        pe.FavoriteCount,
+        pe.AnswerCount,
+        CASE
+            WHEN pe.PostTypeId = 1 THEN COALESCE(pe.Score, 0) + COALESCE(pe.ViewCount, 0)
+            ELSE COALESCE(pe.Score, 0)
+        END AS CompositeScore,
+        CASE
+            WHEN pe.PostTypeId = 1 THEN
+                CASE
+                    WHEN EXISTS (SELECT 1 FROM Posts a WHERE a.ParentId = pe.PostId AND a.Score > 0) THEN 1
+                    ELSE 0
+                END
+            ELSE 0
+        END AS HasAcceptedAnswerWithScore,
+        pe.CreationDate
+    FROM PostEngagement pe
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT pm.PostId) AS TotalPosts,
+        SUM(CASE WHEN pm.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN pm.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        AVG(pm.Score) AS AvgPostScore,
+        MAX(pm.CreationDate) AS LastPostDate,
+        SUM(CASE WHEN pm.HasAcceptedAnswerWithScore = 1 THEN 1 ELSE 0 END) AS AcceptedAnswersCount
+    FROM Users u
+    JOIN PostMetrics pm ON u.Id = pm.OwnerUserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+TagPopularity AS (
+    SELECT
+        TRIM(t.TagName) AS TagName,
+        COUNT(DISTINCT pl.PostId) AS PostsWithTag,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsWithTag,
+        AVG(p.Score) AS AvgTagQuestionScore,
+        MAX(p.CreationDate) AS LatestTagQuestionDate
+    FROM Tags t
+    LEFT JOIN Posts p ON CAST(p.Tags AS VARCHAR) LIKE '%' || t.TagName || '%' AND p.PostTypeId = 1
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+    GROUP BY TRIM(t.TagName)
+    HAVING COUNT(DISTINCT pl.PostId) > 100
+),
+CommentAnalysis AS (
+    SELECT
+        c.PostId,
+        COUNT(c.Id) AS CommentCount,
+        AVG(c.Score) AS AvgCommentScore,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM Comments c
+    GROUP BY c.PostId
+),
+PostWithAllMetrics AS (
+    SELECT
+        pm.PostId,
+        pm.PostTypeId,
+        pm.OwnerUserId,
+        pm.OwnerReputation,
+        pm.Score,
+        pm.ViewCount,
+        pm.CommentCount,
+        pm.FavoriteCount,
+        pm.AnswerCount,
+        pm.CompositeScore,
+        pm.HasAcceptedAnswerWithScore,
+        COALESCE(ca.CommentCount, 0) AS ActualCommentCount,
+        COALESCE(ca.AvgCommentScore, 0) AS AvgCommentScore,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL THEN 1
+            ELSE 0
+        END AS IsClosed,
+        CASE
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 1
+            ELSE 0
+        END AS IsCommunityOwned,
+        CASE
+            WHEN pm.OwnerReputation > 50000 AND pm.Score > 100 THEN 'HighValue'
+            WHEN pm.OwnerReputation > 10000 AND pm.Score > 20 THEN 'MediumValue'
+            ELSE 'Standard'
+        END AS ValueSegment,
+        p.CreationDate
+    FROM PostMetrics pm
+    JOIN Posts p ON pm.PostId = p.Id
+    LEFT JOIN CommentAnalysis ca ON pm.PostId = ca.PostId
+)
+SELECT
+    pwam.PostId,
+    pwam.PostTypeId,
+    pt.Name AS PostTypeName,
+    pwam.OwnerUserId,
+    u.DisplayName AS OwnerDisplayName,
+    pwam.OwnerReputation,
+    pwam.Score,
+    pwam.ViewCount,
+    pwam.CommentCount,
+    pwam.FavoriteCount,
+    pwam.CompositeScore,
+    pwam.HasAcceptedAnswerWithScore,
+    pwam.ActualCommentCount,
+    pwam.AvgCommentScore,
+    pwam.IsClosed,
+    pwam.IsCommunityOwned,
+    pwam.ValueSegment,
+    ua.TotalPosts AS OwnerTotalPosts,
+    ua.QuestionCount AS OwnerQuestionCount,
+    ua.AnswerCount AS OwnerAnswerCount,
+    ua.AvgPostScore AS OwnerAvgPostScore,
+    ua.AcceptedAnswersCount AS OwnerAcceptedAnswers,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = pwam.PostId AND pl.LinkTypeId = 3) AS DuplicateLinksTo,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.RelatedPostId = pwam.PostId AND pl.LinkTypeId = 3) AS IsDuplicateOf,
+    (
+        SELECT STRING_AGG(tp.TagName, ', ')
+        FROM TagPopularity tp
+        WHERE EXISTS (
+            SELECT 1
+            FROM Posts p_inner
+            WHERE p_inner.Id = pwam.PostId AND CAST(p_inner.Tags AS VARCHAR) LIKE '%' || tp.TagName || '%'
+        )
+    ) AS TopRelevantTags,
+    CASE
+        WHEN pwam.OwnerReputation < 100 AND pwam.IsClosed = 1 THEN 'LowRepClosed'
+        WHEN pwam.Score > 50 AND ua.TotalPosts > 1000 THEN 'PopularHighRepUser'
+        WHEN pwam.ViewCount > 10000 AND pwam.AnswerCount > 10 THEN 'HighViewLowAnswer'
+        ELSE 'General'
+    END AS PerformanceCategory,
+    pwam.CreationDate
+FROM PostWithAllMetrics pwam
+JOIN PostTypes pt ON pwam.PostTypeId = pt.Id
+LEFT JOIN Users u ON pwam.OwnerUserId = u.Id
+LEFT JOIN UserActivity ua ON pwam.OwnerUserId = ua.UserId
+WHERE pwam.OwnerReputation > 0
+  AND pwam.Score >= -5
+  AND pwam.CreationDate BETWEEN DATE '2023-01-01' AND DATE '2024-01-01'
+GROUP BY
+    pwam.PostId,
+    pwam.PostTypeId,
+    pt.Name,
+    pwam.OwnerUserId,
+    u.DisplayName,
+    pwam.OwnerReputation,
+    pwam.Score,
+    pwam.ViewCount,
+    pwam.CommentCount,
+    pwam.FavoriteCount,
+    pwam.CompositeScore,
+    pwam.HasAcceptedAnswerWithScore,
+    pwam.ActualCommentCount,
+    pwam.AvgCommentScore,
+    pwam.IsClosed,
+    pwam.IsCommunityOwned,
+    pwam.ValueSegment,
+    ua.TotalPosts,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.AvgPostScore,
+    ua.AcceptedAnswersCount,
+    pwam.CreationDate,
+    pwam.CreationDate -- ensure CreationDate (used in select) is grouped
+ORDER BY pwam.CompositeScore DESC
+LIMIT 1000;

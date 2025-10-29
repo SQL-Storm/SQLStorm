@@ -1,0 +1,189 @@
+-- {"query": "2916.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1797} 
+
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COALESCE(SUM(v.VoteTypeId = 2)::int,0) AS UpVotesReceived,
+        COALESCE(SUM(v.VoteTypeId = 3)::int,0) AS DownVotesReceived,
+        MAX(p.CreationDate) AS LastPostDate,
+        AGE(NOW(), u.CreationDate) AS AccountAge,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+), TopUsers AS (
+    SELECT UserId, DisplayName, ReputationRank
+    FROM UserActivity
+    WHERE ReputationRank <= 20
+), QuestionDetails AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        STRING_AGG(DISTINCT pt.Name, ', ') FILTER (WHERE pt.Id IS NOT NULL) AS PostTypesInThread,
+        -- Extract tags array from string '<tag1><tag2><tag3>' to array
+        string_to_array(substring(p.Tags FROM 2 FOR length(p.Tags)-2), '><') AS TagArray
+    FROM Posts p
+    LEFT JOIN Posts a ON a.ParentId = p.Id
+    LEFT JOIN PostTypes pt ON pt.Id = a.PostTypeId
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.Tags
+), AnswerRanks AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.OwnerUserId,
+        a.Score,
+        a.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerScoreRank,
+        COUNT(*) OVER (PARTITION BY a.ParentId) AS TotalAnswers
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+), UserBadges AS (
+    SELECT
+        b.UserId,
+        b.Class,
+        COUNT(*) AS BadgeCount
+    FROM Badges b
+    GROUP BY b.UserId, b.Class
+), LatestEdits AS (
+    SELECT ph.PostId, ph.UserId, ph.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS EditRank
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4,5,6) -- Title, Body, Tags edits
+), CloseReasonsCount AS (
+    SELECT 
+        ph.PostId,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId = 10) AS CloseEvents,
+        COUNT(DISTINCT ph.Comment) FILTER (WHERE ph.PostHistoryTypeId = 10) AS CloseReasonTypesCount
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+),
+UserLinkSummary AS (
+    SELECT
+        pl.PostId,
+        pl.LinkTypeId,
+        COUNT(*) AS OutgoingLinksCount,
+        COUNT(DISTINCT pl.RelatedPostId) AS DistinctRelatedPosts
+    FROM PostLinks pl
+    GROUP BY pl.PostId, pl.LinkTypeId
+)
+SELECT
+    q.QuestionId,
+    q.Title,
+    ua.DisplayName AS QuestionOwner,
+    ua.ReputationRank,
+    ua.QuestionCount,
+    ua.AnswerCount AS UserAnswers,
+    ua.CommentCount AS UserComments,
+    ua.UpVotesReceived,
+    ua.DownVotesReceived,
+    ua.AccountAge,
+    q.Score AS QuestionScore,
+    q.ViewCount,
+    q.AnswerCount,
+    q.PostTypesInThread,
+    COALESCE(badg.BadgeCount,0) FILTER (WHERE badg.Class = 1) AS GoldBadges,
+    COALESCE(badg.BadgeCount,0) FILTER (WHERE badg.Class = 2) AS SilverBadges,
+    COALESCE(badg.BadgeCount,0) FILTER (WHERE badg.Class = 3) AS BronzeBadges,
+    cr.CloseEvents,
+    cr.CloseReasonTypesCount,
+    lr.UserId AS LastEditorUserId,
+    uedit.DisplayName AS LastEditorDisplayName,
+    lr.CreationDate AS LastEditDate,
+    ar.AnswerId AS TopAnswerId,
+    aru.DisplayName AS TopAnswerOwner,
+    ar.Score AS TopAnswerScore,
+    ar.AnswerScoreRank,
+    ar.TotalAnswers,
+    array_to_string(q.TagArray, ', ') AS Tags,
+    ulink.LinkTypeId,
+    ulink.OutgoingLinksCount,
+    ulink.DistinctRelatedPosts,
+    -- Complex Expression: Score per View normalized with log transform and null-safe division
+    CASE 
+        WHEN q.ViewCount > 0 THEN LOG(GREATEST(q.Score + 1, 1)) / LOG(q.ViewCount + 1)
+        ELSE NULL
+    END AS ScorePerViewLog,
+    -- String expressions combining owner's name with question title length
+    ua.DisplayName || ' - LenTitle:' || LENGTH(q.Title) AS DisplayNameTitleLen,
+    -- NULL-safe predicate: whether question is answered by user with higher rep
+    CASE 
+        WHEN EXISTS (
+            SELECT 1 FROM Posts ans
+            JOIN Users ansu ON ans.OwnerUserId = ansu.Id
+            WHERE ans.ParentId = q.QuestionId
+            AND ans.PostTypeId = 2
+            AND ansu.Reputation > ua.Reputation
+            LIMIT 1
+        )
+        THEN 'Yes' ELSE 'No' END AS HasHigherRepAnswer,
+    -- Correlated subquery for average comment length on question
+    (
+        SELECT AVG(LENGTH(c.Text))
+        FROM Comments c
+        WHERE c.PostId = q.QuestionId
+          AND c.Text IS NOT NULL
+    ) AS AvgCommentLength
+FROM QuestionDetails q
+JOIN UserActivity ua ON ua.UserId = q.OwnerUserId
+LEFT JOIN UserBadges badg ON badg.UserId = q.OwnerUserId
+LEFT JOIN CloseReasonsCount cr ON cr.PostId = q.QuestionId
+LEFT JOIN LatestEdits lr ON lr.PostId = q.QuestionId AND lr.EditRank = 1
+LEFT JOIN Users uedit ON uedit.Id = lr.UserId
+LEFT JOIN AnswerRanks ar ON ar.QuestionId = q.QuestionId AND ar.AnswerScoreRank = 1
+LEFT JOIN Users aru ON aru.Id = ar.OwnerUserId
+LEFT JOIN UserLinkSummary ulink ON ulink.PostId = q.QuestionId
+WHERE q.AnswerCount >= 5
+  AND ua.ReputationRank <= 20
+UNION
+SELECT
+    p.Id AS QuestionId,
+    p.Title,
+    u.DisplayName AS QuestionOwner,
+    NULL AS ReputationRank,
+    0 AS QuestionCount,
+    0 AS UserAnswers,
+    0 AS UserComments,
+    0 AS UpVotesReceived,
+    0 AS DownVotesReceived,
+    AGE(NOW(), u.CreationDate),
+    p.Score AS QuestionScore,
+    p.ViewCount,
+    p.AnswerCount,
+    NULL AS PostTypesInThread,
+    0 AS GoldBadges,
+    0 AS SilverBadges,
+    0 AS BronzeBadges,
+    0 AS CloseEvents,
+    0 AS CloseReasonTypesCount,
+    NULL AS LastEditorUserId,
+    NULL AS LastEditorDisplayName,
+    NULL AS LastEditDate,
+    NULL AS TopAnswerId,
+    NULL AS TopAnswerOwner,
+    NULL AS TopAnswerScore,
+    NULL AS AnswerScoreRank,
+    NULL AS TotalAnswers,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL
+FROM Posts p
+LEFT JOIN Users u ON u.Id = p.OwnerUserId
+WHERE p.PostTypeId = 1
+  AND p.AnswerCount = 0
+ORDER BY ReputationRank NULLS LAST, Score DESC, ViewCount DESC
+LIMIT 100;

@@ -1,0 +1,39 @@
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN p.Id ELSE NULL END) AS TotalUpVotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN p.Id ELSE NULL END) AS TotalDownVotes,
+    MAX(u.CreationDate) AS LastAccountActivity,
+    b.Name AS LatestBadge,
+    ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.LastActivityDate DESC) AS MostRecentPostActivity,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END), 0) AS TotalQuestionScore,
+    STRING_AGG(t.TagName, ', ') AS PopularTags
+FROM 
+    Users u
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+LEFT JOIN (
+    SELECT 
+        Id,
+        -- produce an array of tag names without angle brackets
+        regexp_split_to_array(regexp_replace(Tags, '[<>]', ' '), '\s+') FILTER (WHERE regexp_split_to_array(regexp_replace(Tags, '[<>]', ' '), '\s+') IS NOT NULL) AS TagArray
+    FROM Posts
+    WHERE PostTypeId = 1
+) ptags ON p.Id = ptags.Id
+LEFT JOIN LATERAL (
+    SELECT tag AS TagName, ROW_NUMBER() OVER () AS TagOrdinal, COUNT(*) OVER (PARTITION BY tag) AS TagCount
+    FROM UNNEST(ptags.TagArray) AS t(tag)
+) t ON TRUE
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation, b.Name, p.LastActivityDate
+HAVING 
+    COUNT(DISTINCT p.Id) > 100
+ORDER BY 
+    TotalPosts DESC, 
+    TotalQuestionScore DESC;

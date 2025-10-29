@@ -1,0 +1,160 @@
+WITH RecursiveUserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS TotalUpVotesOnPosts,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.CreationDate ASC) AS Ranking
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id AND v.VoteTypeId = 2
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+TopUsers AS (
+    SELECT UserId, DisplayName, Reputation, CreationDate, QuestionsCount, AnswersCount, BadgeCount, TotalUpVotesOnPosts, Ranking
+    FROM RecursiveUserActivity
+    WHERE Ranking <= 100
+),
+UserAnswerStats AS (
+    SELECT 
+        a.OwnerUserId,
+        COUNT(a.Id) AS TotalAnswers,
+        AVG(a.Score) AS AvgAnswerScore,
+        SUM(CASE WHEN EXISTS (
+            SELECT 1 FROM Posts q WHERE q.Id = a.ParentId AND q.AcceptedAnswerId = a.Id
+        ) THEN 1 ELSE 0 END) AS AcceptedAnswersCount,
+        MAX(a.CreationDate) AS LastAnswerDate
+    FROM Posts a
+    WHERE a.PostTypeId = 2 AND a.OwnerUserId IS NOT NULL
+    GROUP BY a.OwnerUserId
+),
+QuestionWithCloseInfo AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        COALESCE(closed.CloseReasonName, 'Not Closed') AS CloseReason,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        STRING_AGG(DISTINCT COALESCE(u.DisplayName, 'anonymous'), ', ') FILTER (WHERE c.UserId IS NOT NULL) AS Commenters,
+        CASE WHEN q.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS HasAcceptedAnswer
+    FROM Posts q
+    LEFT JOIN PostHistory ph ON ph.PostId = q.Id AND ph.PostHistoryTypeId = 10
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS SMALLINT)
+    LEFT JOIN (
+        SELECT ph.PostId, MAX(crt.Name) AS CloseReasonName
+        FROM PostHistory ph
+        JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS SMALLINT)
+        WHERE ph.PostHistoryTypeId = 10
+        GROUP BY ph.PostId
+    ) closed ON closed.PostId = q.Id
+    LEFT JOIN Comments c ON c.PostId = q.Id
+    LEFT JOIN Users u ON u.Id = c.UserId
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount, closed.CloseReasonName, q.AcceptedAnswerId
+),
+UserBadgeCategoryCount AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserPostActivityRanked AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.Score DESC, p.ViewCount DESC) AS PostRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+    WHERE u.Id IN (SELECT UserId FROM TopUsers)
+),
+TagTopPosts AS (
+    SELECT
+        t.TagName,
+        p.Id AS PostId,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName
+    FROM Tags t
+    JOIN LATERAL (
+        SELECT p.*
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+          AND p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+        ORDER BY p.Score DESC
+        LIMIT 3
+    ) p ON TRUE
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+)
+SELECT
+    tu.UserId,
+    tu.DisplayName,
+    -- User activity summary
+    tu.Reputation,
+    tu.QuestionsCount,
+    tu.AnswersCount,
+    COALESCE(ub.GoldBadges, 0) AS GoldBadges,
+    COALESCE(ub.SilverBadges, 0) AS SilverBadges,
+    COALESCE(ub.BronzeBadges, 0) AS BronzeBadges,
+    COALESCE(ua.TotalAnswers, 0) AS TotalAnswers,
+    ua.AvgAnswerScore,
+    COALESCE(ua.AcceptedAnswersCount, 0) AS AcceptedAnswersCount,
+    ua.LastAnswerDate,
+    -- Extract titles of top 2 posts by score for user, concatenated with safe substring and NULL handling
+    COALESCE(STRING_AGG(SUBSTRING(up.Title FROM 1 FOR 50) || ' (' || up.Score || ')', ' | ' ORDER BY up.PostRank), '') AS TopPostTitles,
+    -- Aggregate tags from their top posts
+    (SELECT STRING_AGG(DISTINCT ttt.TagName, ', ')
+     FROM TagTopPosts ttt
+     WHERE ttt.OwnerUserId = tu.UserId) AS TopTags,
+    -- Correlated subquery to find count of comments user made on posts with score > 10 or is closed
+    (SELECT COUNT(*)
+     FROM Comments c
+     JOIN Posts p2 ON p2.Id = c.PostId
+     WHERE c.UserId = tu.UserId AND (p2.Score > 10 OR EXISTS (SELECT 1 FROM PostHistory ph2 WHERE ph2.PostId = p2.Id AND ph2.PostHistoryTypeId = 10))
+    ) AS CommentsOnHighScoreOrClosedPosts,
+    -- Using CASE and COALESCE to classify users by reputation and badges
+    CASE 
+        WHEN tu.Reputation >= 20000 THEN 'Legendary'
+        WHEN tu.Reputation BETWEEN 10000 AND 19999 THEN 'Expert'
+        WHEN tu.Reputation BETWEEN 1000 AND 9999 THEN 'Experienced'
+        WHEN tu.Reputation < 1000 THEN 'Newbie'
+        ELSE 'Unknown'
+    END AS ReputationClass,
+    CASE
+        WHEN COALESCE(ub.GoldBadges,0) > 10 THEN 'Gold Collector'
+        WHEN COALESCE(ub.SilverBadges,0) > 20 THEN 'Silver Collector'
+        WHEN COALESCE(ub.BronzeBadges,0) > 50 THEN 'Bronze Collector'
+        ELSE 'Badge Seeker'
+    END AS BadgeClass
+FROM TopUsers tu
+LEFT JOIN UserAnswerStats ua ON ua.OwnerUserId = tu.UserId
+LEFT JOIN UserBadgeCategoryCount ub ON ub.UserId = tu.UserId
+LEFT JOIN UserPostActivityRanked up ON up.UserId = tu.UserId AND up.PostRank <= 2
+GROUP BY 
+    tu.UserId, 
+    tu.DisplayName, 
+    tu.Reputation, 
+    tu.QuestionsCount, 
+    tu.AnswersCount, 
+    ub.GoldBadges, 
+    ub.SilverBadges, 
+    ub.BronzeBadges, 
+    ua.TotalAnswers, 
+    ua.AvgAnswerScore, 
+    ua.AcceptedAnswersCount, 
+    ua.LastAnswerDate;

@@ -1,0 +1,287 @@
+-- {"query": "559.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3088} 
+with recent_users as (
+  select u.id as user_id,
+         u.displayname,
+         u.reputation,
+         u.creationdate,
+         u.location,
+         coalesce(nullif(trim(u.websiteurl), ''), 'n/a') as websiteurl_norm,
+         date_trunc('month', u.creationdate) as signup_month
+  from users u
+  where u.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+),
+user_activity as (
+  select u.user_id,
+         count(distinct p.id) filter (where p.posttypeid in (1,2)) as total_posts,
+         count(distinct p.id) filter (where p.posttypeid = 1) as questions,
+         count(distinct p.id) filter (where p.posttypeid = 2) as answers,
+         sum(greatest(p.score,0)) as nonneg_post_score,
+         sum(coalesce(c_cnt.c_count,0)) as comments_on_posts
+  from recent_users u
+  left join posts p
+    on p.owneruserid = u.user_id
+   and p.creationdate >= u.creationdate
+  left join lateral (
+    select p2.id as post_id, count(*) as c_count
+    from comments c2
+    join posts p2 on p2.id = c2.postid
+    where p2.owneruserid = u.user_id
+    group by p2.id
+  ) as c_cnt
+    on c_cnt.post_id = p.id
+  group by u.user_id
+),
+votes_by_kind as (
+  select v.userid as user_id,
+         sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes_cast,
+         sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes_cast,
+         sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_total_cast
+  from votes v
+  where v.userid is not null
+    and v.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+  group by v.userid
+),
+received_votes as (
+  select p.owneruserid as user_id,
+         sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes_received,
+         sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes_received,
+         count(*) filter (where v.votetypeid in (8,9)) as bounty_events_received,
+         sum(coalesce(v.bountyamount,0)) filter (where v.votetypeid = 9) as bounty_awarded
+  from votes v
+  join posts p on p.id = v.postid
+  where p.owneruserid is not null
+    and v.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+  group by p.owneruserid
+),
+badge_rollup as (
+  select b.userid as user_id,
+         count(*) as badges_total,
+         count(*) filter (where b.class = 1) as gold,
+         count(*) filter (where b.class = 2) as silver,
+         count(*) filter (where b.class = 3) as bronze,
+         sum(case when b.tagbased = 1 then 1 else 0 end) as tagbadges
+  from badges b
+  where b.date >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+  group by b.userid
+),
+question_quality as (
+  select q.owneruserid as user_id,
+         count(*) as q_count,
+         avg(nullif(q.viewcount,0)) as avg_views,
+         avg(q.score) as avg_score,
+         sum(case when q.acceptedanswerid is not null then 1 else 0 end) as accepted_count,
+         percentile_disc(0.9) within group (order by coalesce(q.viewcount,0)) as p90_views
+  from posts q
+  where q.posttypeid = 1
+    and q.owneruserid is not null
+    and q.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+  group by q.owneruserid
+),
+answer_quality as (
+  select a.owneruserid as user_id,
+         count(*) as a_count,
+         avg(a.score) as avg_a_score,
+         sum(case when a.score > 0 then 1 else 0 end) as positive_answers
+  from posts a
+  where a.posttypeid = 2
+    and a.owneruserid is not null
+    and a.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+  group by a.owneruserid
+),
+edits_and_closures as (
+  select ph.userid as user_id,
+         count(*) filter (where ph.posthistorytypeid in (4,5,6,7,8,9,24)) as edit_events,
+         count(*) filter (where ph.posthistorytypeid in (10,11)) as close_reopen,
+         count(*) filter (where ph.posthistorytypeid = 10 and ph.comment::int in (101,102,103,104,105)) as modern_closes,
+         count(*) filter (where ph.posthistorytypeid = 10 and ph.comment::int in (1,2,3,4,7,10,20)) as legacy_closes
+  from posthistory ph
+  where ph.userid is not null
+    and ph.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+  group by ph.userid
+),
+duplicate_links as (
+  select pl.postid as post_id,
+         count(*) filter (where pl.linktypeid = 3) as dup_count
+  from postlinks pl
+  where pl.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+  group by pl.postid
+),
+tag_influence as (
+  select p.owneruserid as user_id,
+         t.tagname,
+         sum(p.score) as tag_score,
+         count(*) as tag_posts,
+         row_number() over (partition by p.owneruserid order by sum(p.score) desc, count(*) desc, min(p.creationdate)) as rn
+  from posts p
+  cross join lateral unnest(string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')) as tag(tagname)
+  where p.owneruserid is not null
+    and p.posttypeid in (1,2)
+    and p.tags is not null
+    and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+  group by p.owneruserid, t.tagname
+),
+top_tag as (
+  select user_id,
+         tagname as top_tagname,
+         tag_score as top_tag_score,
+         tag_posts as top_tag_posts
+  from tag_influence
+  where rn = 1
+),
+post_engagement as (
+  select p.owneruserid as user_id,
+         avg(coalesce(p.viewcount,0)) as avg_post_views,
+         avg(coalesce(p.commentcount,0)) as avg_post_comments,
+         avg(coalesce(p.favoritecount,0)) as avg_post_favs
+  from posts p
+  where p.owneruserid is not null
+    and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+    and p.posttypeid in (1,2)
+  group by p.owneruserid
+),
+activity_timeline as (
+  select u.user_id,
+         date_trunc('month', p.creationdate) as month,
+         count(*) as posts_in_month
+  from recent_users u
+  left join posts p on p.owneruserid = u.user_id
+                   and p.posttypeid in (1,2)
+                   and p.creationdate >= u.creationdate
+  group by u.user_id, date_trunc('month', p.creationdate)
+),
+activity_gaps as (
+  select user_id,
+         avg(extract(epoch from (month - lag(month) over (partition by user_id order by month))) / 86400.0) as avg_days_between_posts
+  from activity_timeline
+  where month is not null
+  group by user_id
+),
+derived_scores as (
+  select u.user_id,
+         u.displayname,
+         u.reputation,
+         u.location,
+         u.websiteurl_norm,
+         ua.total_posts,
+         ua.questions,
+         ua.answers,
+         rv.upvotes_received,
+         rv.downvotes_received,
+         vb.upvotes_cast,
+         vb.downvotes_cast,
+         coalesce(b.badges_total,0) as badges_total,
+         coalesce(b.gold,0) as gold,
+         coalesce(b.silver,0) as silver,
+         coalesce(b.bronze,0) as bronze,
+         coalesce(qq.q_count,0) as q_count,
+         coalesce(qq.avg_views,0) as avg_q_views,
+         coalesce(qq.p90_views,0) as p90_q_views,
+         coalesce(qq.accepted_count,0) as accepted_q,
+         coalesce(aq.a_count,0) as a_count,
+         coalesce(aq.avg_a_score,0) as avg_a_score,
+         coalesce(e.edit_events,0) as edit_events,
+         coalesce(e.close_reopen,0) as close_reopen_events,
+         coalesce(e.modern_closes,0) as modern_closes,
+         coalesce(e.legacy_closes,0) as legacy_closes,
+         coalesce(pe.avg_post_views,0) as avg_post_views,
+         coalesce(pe.avg_post_comments,0) as avg_post_comments,
+         coalesce(pe.avg_post_favs,0) as avg_post_favs,
+         coalesce(g.avg_days_between_posts, 9999) as avg_days_between_posts,
+         coalesce(tt.top_tagname, 'unclassified') as top_tagname,
+         coalesce(tt.top_tag_score,0) as top_tag_score,
+         coalesce(tt.top_tag_posts,0) as top_tag_posts,
+         -- composite quality scores
+         (coalesce(ua.answers,0) * 2 + coalesce(ua.questions,0)) as activity_weight,
+         (coalesce(rv.upvotes_received,0) - coalesce(rv.downvotes_received,0)) as net_received_votes,
+         (coalesce(vb.upvotes_cast,0) - coalesce(vb.downvotes_cast,0)) as net_cast_votes,
+         (coalesce(qq.avg_views,0) * 0.01 + coalesce(aq.avg_a_score,0) * 2 + coalesce(ua.nonneg_post_score,0) * 0.5) as content_score_raw
+  from recent_users u
+  left join user_activity ua on ua.user_id = u.user_id
+  left join votes_by_kind vb on vb.user_id = u.user_id
+  left join received_votes rv on rv.user_id = u.user_id
+  left join badge_rollup b on b.user_id = u.user_id
+  left join question_quality qq on qq.user_id = u.user_id
+  left join answer_quality aq on aq.user_id = u.user_id
+  left join edits_and_closures e on e.user_id = u.user_id
+  left join post_engagement pe on pe.user_id = u.user_id
+  left join activity_gaps g on g.user_id = u.user_id
+  left join top_tag tt on tt.user_id = u.user_id
+),
+ranked as (
+  select d.*,
+         -- normalized scores with NULL handling
+         case when d.total_posts > 0 then d.content_score_raw / d.total_posts else 0 end as content_score_per_post,
+         (d.net_received_votes + d.badges_total * 3 + d.gold * 10 + d.silver * 3 + d.bronze) as prestige_points,
+         row_number() over (order by
+           coalesce(d.content_score_raw,0) desc,
+           coalesce(d.net_received_votes,0) desc,
+           coalesce(d.reputation,0) desc
+         ) as global_rank,
+         dense_rank() over (partition by d.top_tagname order by coalesce(d.content_score_raw,0) desc) as tag_rank,
+         percentile_disc(0.75) within group (order by coalesce(d.avg_post_views,0)) over () as p75_views_global
+  from derived_scores d
+),
+anomalies as (
+  select r.user_id,
+         case
+           when r.avg_days_between_posts > 365 and r.total_posts >= 5 then 'sporadic'
+           when r.total_posts = 0 then 'inactive'
+           when r.content_score_per_post > 10 and r.total_posts < 5 then 'high-impact-low-volume'
+           else 'normal'
+         end as activity_class
+  from ranked r
+),
+dupe_heavy_questions as (
+  select q.owneruserid as user_id,
+         count(*) as dup_marked_questions
+  from posts q
+  left join duplicate_links dl on dl.post_id = q.id
+  where q.posttypeid = 1
+    and q.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+    and q.owneruserid is not null
+    and coalesce(dl.dup_count,0) > 0
+  group by q.owneruserid
+)
+select r.user_id,
+       r.displayname,
+       r.reputation,
+       r.location,
+       r.websiteurl_norm,
+       r.total_posts,
+       r.questions,
+       r.answers,
+       r.avg_post_views,
+       r.avg_post_comments,
+       r.avg_post_favs,
+       r.net_received_votes,
+       r.net_cast_votes,
+       r.badges_total,
+       r.gold,
+       r.silver,
+       r.bronze,
+       r.content_score_raw,
+       r.content_score_per_post,
+       r.prestige_points,
+       r.top_tagname,
+       r.top_tag_score,
+       r.top_tag_posts,
+       r.global_rank,
+       r.tag_rank,
+       r.p75_views_global,
+       a.activity_class,
+       coalesce(dhq.dup_marked_questions,0) as dup_marked_questions,
+       -- label buckets for benchmarking
+       case
+         when r.content_score_per_post >= 15 then 'S-tier'
+         when r.content_score_per_post >= 8 then 'A-tier'
+         when r.content_score_per_post >= 4 then 'B-tier'
+         when r.content_score_per_post >= 1 then 'C-tier'
+         else 'D-tier'
+       end as quality_tier
+from ranked r
+left join anomalies a on a.user_id = r.user_id
+left join dupe_heavy_questions dhq on dhq.user_id = r.user_id
+where (r.total_posts > 0 or r.prestige_points > 0 or r.badges_total > 0)
+  and (r.top_tagname is not null or r.global_rank <= 10000)
+order by quality_tier, r.global_rank
+limit 1000;

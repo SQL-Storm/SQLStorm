@@ -1,0 +1,189 @@
+WITH
+  RankedPosts AS (
+    SELECT
+      p.Id AS PostId,
+      p.Title,
+      p.OwnerUserId,
+      p.CreationDate,
+      p.Score,
+      p.ViewCount,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      u.DisplayName AS OwnerDisplayName,
+      ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS ScoreRank,
+      SUM(CASE WHEN c.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+      COUNT(c.Id) AS TotalVotes,
+      AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS AvgPostScore,
+      CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed
+    FROM
+      Posts p
+      LEFT JOIN Users u
+        ON p.OwnerUserId = u.Id
+      LEFT JOIN Votes c
+        ON p.Id = c.PostId
+    WHERE
+      p.PostTypeId = 1
+      AND p.OwnerUserId IS NOT NULL
+      AND p.OwnerUserId > 0
+    GROUP BY
+      p.Id,
+      p.Title,
+      p.OwnerUserId,
+      p.CreationDate,
+      p.Score,
+      p.ViewCount,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      u.DisplayName,
+      p.ClosedDate
+  ),
+  UserContribution AS (
+    SELECT
+      ph.UserId,
+      COUNT(DISTINCT ph.PostId) AS PostsEdited,
+      SUM(CASE WHEN ph.PostHistoryTypeId IN (2, 5) THEN 1 ELSE 0 END) AS BodyEdits,
+      SUM(CASE WHEN ph.PostHistoryTypeId IN (1, 4, 7) THEN 1 ELSE 0 END) AS TitleEdits,
+      SUM(CASE WHEN ph.PostHistoryTypeId IN (3, 6, 9) THEN 1 ELSE 0 END) AS TagEdits,
+      COUNT(CASE WHEN ph.Comment IS NOT NULL AND ph.Comment <> '' THEN 1 END) AS CommentsMade
+    FROM
+      PostHistory ph
+    WHERE
+      ph.UserId IS NOT NULL
+      AND ph.UserId > 0
+    GROUP BY
+      ph.UserId
+  ),
+  FrequentVoters AS (
+    SELECT
+      UserId,
+      COUNT(*) AS VoteCount
+    FROM
+      Votes
+    WHERE
+      VoteTypeId = 2
+      AND UserId IS NOT NULL
+      AND UserId > 0
+    GROUP BY
+      UserId
+    HAVING
+      COUNT(*) > 100
+  )
+SELECT
+  rp.PostId,
+  rp.Title,
+  rp.OwnerUserId,
+  rp.OwnerDisplayName,
+  rp.CreationDate,
+  rp.Score,
+  rp.ViewCount,
+  rp.AnswerCount,
+  rp.CommentCount,
+  rp.FavoriteCount,
+  rp.ScoreRank,
+  rp.UpVoteCount,
+  rp.TotalVotes,
+  rp.AvgPostScore,
+  rp.IsClosed,
+  uc.PostsEdited,
+  uc.BodyEdits,
+  uc.TitleEdits,
+  uc.TagEdits,
+  uc.CommentsMade,
+  CASE
+    WHEN rp.FavoriteCount > 1000 AND rp.Score > 500 THEN 'Very Popular High Score'
+    WHEN rp.FavoriteCount > 500 AND rp.Score > 200 THEN 'Popular High Score'
+    WHEN rp.Score > 100 THEN 'High Score'
+    WHEN rp.FavoriteCount > 100 THEN 'Popular'
+    ELSE 'Standard'
+  END AS PostCategory,
+  CASE
+    WHEN u.Reputation > 100000 THEN 'Expert'
+    WHEN u.Reputation > 50000 THEN 'Experienced'
+    WHEN u.Reputation > 10000 THEN 'Intermediate'
+    WHEN u.Reputation > 1000 THEN 'Novice'
+    ELSE 'Beginner'
+  END AS UserTier,
+  CASE
+    WHEN COALESCE(fv.VoteCount, 0) > 0 THEN 'Frequent Voter'
+    ELSE 'Standard Voter'
+  END AS VoterStatus,
+  CASE
+    WHEN rp.OwnerDisplayName LIKE '% Moderator' THEN 'Moderator_Owned'
+    ELSE 'User_Owned'
+  END AS OwnershipType
+FROM
+  RankedPosts rp
+  LEFT JOIN UserContribution uc
+    ON rp.OwnerUserId = uc.UserId
+  LEFT JOIN Users u
+    ON rp.OwnerUserId = u.Id
+  LEFT JOIN FrequentVoters fv
+    ON rp.OwnerUserId = fv.UserId
+WHERE
+  rp.Score > 10
+  AND rp.AnswerCount > 0
+  AND rp.CreationDate BETWEEN '2023-01-01' AND '2023-12-31'
+  AND rp.OwnerDisplayName IS NOT NULL
+
+UNION
+
+SELECT
+  rp.PostId,
+  rp.Title,
+  rp.OwnerUserId,
+  rp.OwnerDisplayName,
+  rp.CreationDate,
+  rp.Score,
+  rp.ViewCount,
+  rp.AnswerCount,
+  rp.CommentCount,
+  rp.FavoriteCount,
+  rp.ScoreRank,
+  rp.UpVoteCount,
+  rp.TotalVotes,
+  rp.AvgPostScore,
+  rp.IsClosed,
+  uc.PostsEdited,
+  uc.BodyEdits,
+  uc.TitleEdits,
+  uc.TagEdits,
+  uc.CommentsMade,
+  CASE
+    WHEN rp.FavoriteCount > 1000 AND rp.Score > 500 THEN 'Very Popular High Score'
+    WHEN rp.FavoriteCount > 500 AND rp.Score > 200 THEN 'Popular High Score'
+    WHEN rp.Score > 100 THEN 'High Score'
+    WHEN rp.FavoriteCount > 100 THEN 'Popular'
+    ELSE 'Standard'
+  END AS PostCategory,
+  CASE
+    WHEN u.Reputation > 100000 THEN 'Expert'
+    WHEN u.Reputation > 50000 THEN 'Experienced'
+    WHEN u.Reputation > 10000 THEN 'Intermediate'
+    WHEN u.Reputation > 1000 THEN 'Novice'
+    ELSE 'Beginner'
+  END AS UserTier,
+  CASE
+    WHEN COALESCE(fv.VoteCount, 0) > 0 THEN 'Frequent Voter'
+    ELSE 'Standard Voter'
+  END AS VoterStatus,
+  CASE
+    WHEN rp.OwnerDisplayName LIKE '% Moderator' THEN 'Moderator_Owned'
+    ELSE 'User_Owned'
+  END AS OwnershipType
+FROM
+  RankedPosts rp
+  LEFT JOIN UserContribution uc
+    ON rp.OwnerUserId = uc.UserId
+  LEFT JOIN Users u
+    ON rp.OwnerUserId = u.Id
+  LEFT JOIN FrequentVoters fv
+    ON rp.OwnerUserId = fv.UserId
+WHERE
+  rp.Score < -5
+  AND rp.CreationDate BETWEEN '2023-01-01' AND '2023-12-31'
+  AND rp.OwnerDisplayName IS NOT NULL
+ORDER BY
+  Score DESC,
+  FavoriteCount DESC;

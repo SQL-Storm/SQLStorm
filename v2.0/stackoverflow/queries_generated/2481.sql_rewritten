@@ -1,0 +1,129 @@
+-- {"query": "2481.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1312} 
+with RecursiveUserReputation AS (
+    select u.Id, u.Reputation, 1 as depth
+    from Users u
+    where u.Reputation > 1000
+  union all
+    select u.Id, u.Reputation, rur.depth + 1
+    from Users u
+    join RecursiveUserReputation rur on u.Id = rur.Id
+    where rur.depth < 1
+),
+DetailedPostStats AS (
+    select
+        p.Id as PostId,
+        p.PostTypeId,
+        pt.Name as PostTypeName,
+        u.Id as OwnerUserId,
+        u.DisplayName as OwnerName,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.AcceptedAnswerId,
+        COALESCE(p.Title,'') as Title,
+        p.Tags,
+        p.FavoriteCount,
+        LEAD(p.Score) over (partition by p.PostTypeId order by p.CreationDate desc) as NextPostScore,
+        RANK() over (partition by p.PostTypeId order by p.Score desc) as ScoreRank,
+        COUNT(c.Id) as CommentCount,
+        MAX(v.CreationDate) as LastVoteDate,
+        SUM(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        SUM(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+        EXISTS (
+            select 1 from PostLinks pl
+            where pl.PostId = p.Id and pl.LinkTypeId = 3 -- duplicates
+        ) as HasDuplicateLink
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    join PostTypes pt on p.PostTypeId = pt.Id
+    left join Comments c on c.PostId = p.Id
+    left join Votes v on v.PostId = p.Id
+    where p.CreationDate >= (cast('2024-10-01' as date) - interval '1 year')
+    group by p.Id, p.PostTypeId, pt.Name, u.Id, u.DisplayName, p.Score, p.ViewCount, p.CreationDate, p.AcceptedAnswerId, p.Title, p.Tags, p.FavoriteCount
+),
+FilteredTagQuestions AS (
+    select 
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        array_agg(distinct t.TagName order by t.Count desc) as PopularTags
+    from Posts p
+    cross join lateral (
+        select unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')) as TagName
+    ) as tags
+    join Tags t on t.TagName = tags.TagName
+    where p.PostTypeId = 1 and p.CreationDate >= (cast('2024-10-01' as date) - interval '6 months')
+    group by p.Id, p.Title, p.Tags, p.CreationDate, p.Score, p.ViewCount, p.OwnerUserId
+    having count(*) > 1
+),
+UserBadgeCounts AS (
+    select 
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount,
+        max(b.Date) as LastBadgeDate
+    from Badges b
+    group by b.UserId, b.Class
+),
+BadgePivot AS (
+    select
+        ubc.UserId,
+        max(case when ubc.Class = 1 then ubc.BadgeCount else 0 end) as GoldBadges,
+        max(case when ubc.Class = 2 then ubc.BadgeCount else 0 end) as SilverBadges,
+        max(case when ubc.Class = 3 then ubc.BadgeCount else 0 end) as BronzeBadges
+    from UserBadgeCounts ubc
+    group by ubc.UserId
+)
+select 
+    dps.PostId,
+    dps.Title,
+    dps.PostTypeName,
+    dps.OwnerUserId,
+    dps.OwnerName,
+    dps.Score,
+    dps.ViewCount,
+    dps.FavoriteCount,
+    dps.CommentCount,
+    dps.UpVotes,
+    dps.DownVotes,
+    dps.LastVoteDate,
+    coalesce(bp.GoldBadges,0) as GoldBadges,
+    coalesce(bp.SilverBadges,0) as SilverBadges,
+    coalesce(bp.BronzeBadges,0) as BronzeBadges,
+    case when dps.HasDuplicateLink then 'Yes' else 'No' end as HasDuplicateLink,
+    ftq.PopularTags,
+    rur.depth as UserReputationDepth,
+    case 
+        when dps.Score > 10 and dps.ViewCount > 1000 then 'HighImpact'
+        when dps.Score between 1 and 10 and dps.ViewCount between 100 and 1000 then 'MediumImpact'
+        else 'LowImpact'
+    end as ImpactCategory,
+    ltrim(rtrim(translate(coalesce(dps.Title,'') || ' ' || coalesce(dps.OwnerName,''), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'))) as NormalizedTitle,
+    case when dps.AcceptedAnswerId is not null 
+        then (select Score from Posts where Id = dps.AcceptedAnswerId)
+        else null
+    end as AcceptedAnswerScore,
+    (
+        select count(*)
+        from PostHistory ph
+        where ph.PostId = dps.PostId 
+          and ph.PostHistoryTypeId in (10,12) -- Closed or Deleted 
+          and ph.CreationDate > (cast('2024-10-01' as date) - interval '1 year')
+    ) as CloseOrDeleteEvents,
+    (
+        select string_agg(distinct lh.Name, ', ')
+        from PostLinks pl2
+        join LinkTypes lh on pl2.LinkTypeId = lh.Id
+        where pl2.PostId = dps.PostId
+    ) as LinkTypesEncountered
+from DetailedPostStats dps
+left join FilteredTagQuestions ftq on ftq.Id = dps.PostId
+left join BadgePivot bp on bp.UserId = dps.OwnerUserId
+left join RecursiveUserReputation rur on rur.Id = dps.OwnerUserId
+where dps.ScoreRank <= 500
+order by dps.Score desc, dps.ViewCount desc
+limit 100;

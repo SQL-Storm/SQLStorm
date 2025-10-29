@@ -1,0 +1,152 @@
+with RecursiveUserScores as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        coalesce(u.UpVotes,0) - coalesce(u.DownVotes,0) as VoteDiff,
+        row_number() over (order by u.Reputation desc, u.Id) as RankByRep
+    from Users u
+    where u.Reputation > 1000
+),
+UserBadgesAgg as (
+    select
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        count(*) as TotalBadges,
+        max(b.Date) as LastBadgeDate
+    from Badges b
+    group by b.UserId
+),
+PostRanks as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.ParentId,
+        p.CreationDate,
+        p.Score,
+        dense_rank() over (partition by p.PostTypeId order by p.Score desc) as ScoreRank,
+        case when p.AcceptedAnswerId is not null then 1 else 0 end as IsAcceptedQuestion,
+        length(p.Body) as BodyLength,
+        p.Tags
+    from Posts p
+    where p.PostTypeId in (1, 2) and p.Score >= 0
+),
+QuestionsWithAnswers as (
+    select
+        q.Id as QuestionId,
+        q.OwnerUserId as QuestionOwnerId,
+        q.Title as QuestionTitle,
+        q.Tags,
+        q.Score as QuestionScore,
+        q.CreationDate as QuestionDate,
+        count(a.Id) as AnswerCount,
+        max(a.Score) as MaxAnswerScore
+    from PostRanks q
+    left join PostRanks a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+    group by q.Id, q.OwnerUserId, q.Title, q.Tags, q.Score, q.CreationDate
+),
+PostHistoryCloseCount as (
+    select
+        ph.PostId,
+        sum(case when ph.PostHistoryTypeId = 10 then 1 else 0 end) as CloseVotes,
+        sum(case when ph.PostHistoryTypeId = 11 then 1 else 0 end) as ReopenVotes
+    from PostHistory ph
+    group by ph.PostId
+),
+WindowedVotes as (
+    select
+        v.PostId,
+        v.VoteTypeId,
+        count(*) over (partition by v.PostId, v.VoteTypeId) as VoteCountByType,
+        row_number() over (partition by v.PostId order by v.CreationDate desc) as LatestVoteNum,
+        max(v.CreationDate) over (partition by v.PostId, v.VoteTypeId) as LastVoteDate
+    from Votes v
+    where v.VoteTypeId in (2,3,5)
+),
+TopTags as (
+    select
+        TagName,
+        Count,
+        row_number() over (order by Count desc) as TagRank
+    from Tags
+    where TagName is not null
+),
+UserActivity as (
+    select
+        u.Id,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersCount,
+        coalesce(sum(p.Score),0) as TotalPostScore,
+        max(p.CreationDate) as LastPostDate,
+        max(v.CreationDate) as LastVoteDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName
+)
+select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.VoteDiff,
+    coalesce(uba.GoldBadges, 0) as GoldBadges,
+    coalesce(uba.SilverBadges, 0) as SilverBadges,
+    coalesce(uba.BronzeBadges, 0) as BronzeBadges,
+    uba.TotalBadges,
+    uba.LastBadgeDate,
+    ua.QuestionsCount,
+    ua.AnswersCount,
+    ua.TotalPostScore,
+    ua.LastPostDate,
+    ua.LastVoteDate,
+    qa.QuestionId,
+    qa.QuestionTitle,
+    qa.QuestionScore,
+    qa.AnswerCount,
+    qa.MaxAnswerScore,
+    phcc.CloseVotes,
+    phcc.ReopenVotes,
+    case
+        when qa.AnswerCount = 0 then 'Unanswered'
+        when qa.MaxAnswerScore >= 5 then 'Popular'
+        when qa.MaxAnswerScore between 1 and 4 then 'Answered'
+        else 'AnsweredLow'
+    end as QuestionStatus,
+    case
+        when u.Reputation > 10000 then 'Expert'
+        when u.Reputation between 5000 and 10000 then 'Intermediate'
+        else 'Beginner'
+    end as UserLevel,
+    array_to_string(array_agg(distinct tt.TagName), ', ') as TopTagsUsed,
+    length(coalesce(u.DisplayName, '')) + coalesce(u.Reputation,0)/1000 as CalcMetric,
+    case 
+        when u.WebsiteUrl is not null and position('https://' in u.WebsiteUrl) = 1 then 'SecureSite'
+        when u.WebsiteUrl is not null then 'NonSecureSite'
+        else 'NoSite'
+    end as SiteType,
+    count(distinct ph.Id) filter (where ph.PostHistoryTypeId in (10,11)) as CloseReopenEvents
+from RecursiveUserScores u
+left join UserBadgesAgg uba on uba.UserId = u.Id
+left join UserActivity ua on ua.Id = u.Id
+left join QuestionsWithAnswers qa on qa.QuestionOwnerId = u.Id
+left join PostHistory ph on ph.PostId = qa.QuestionId
+left join PostHistoryCloseCount phcc on phcc.PostId = qa.QuestionId
+left join PostLinks pl on pl.PostId = qa.QuestionId and pl.LinkTypeId = 3
+left join Posts linked_posts on linked_posts.Id = pl.RelatedPostId
+left join Tags tt on tt.TagName is not null and qa.Tags like '%' || tt.TagName || '%'
+where u.RankByRep <= 50
+group by
+    u.Id, u.DisplayName, u.Reputation, u.VoteDiff,
+    uba.GoldBadges, uba.SilverBadges, uba.BronzeBadges, uba.TotalBadges, uba.LastBadgeDate,
+    ua.QuestionsCount, ua.AnswersCount, ua.TotalPostScore, ua.LastPostDate, ua.LastVoteDate,
+    qa.QuestionId, qa.QuestionTitle, qa.QuestionScore, qa.AnswerCount, qa.MaxAnswerScore,
+    phcc.CloseVotes, phcc.ReopenVotes,
+    u.WebsiteUrl
+having count(distinct ph.Id) filter (where ph.PostHistoryTypeId in (10,11)) > 0
+order by u.Reputation desc, qa.QuestionScore desc
+limit 100;

@@ -1,0 +1,176 @@
+WITH
+RecentHot AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.ViewCount,
+    p.Score,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate DESC) AS rn
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.ClosedDate IS NULL
+),
+TagStats AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS PostCount,
+    AVG(p.Score) AS AvgScore,
+    SUM(p.ViewCount) AS TotalViews
+  FROM Posts p,
+  LATERAL (
+    -- split tags like '<tag1><tag2>' into rows in a dialect-neutral way using string functions
+    SELECT TRIM(tag) AS TagName
+    FROM (
+      SELECT
+        CASE
+          WHEN instr(p.Tags, '><') = 0 THEN
+            CASE WHEN p.Tags IS NULL OR p.Tags = '' THEN NULL ELSE
+              CASE WHEN substr(p.Tags,1,1) = '<' AND substr(p.Tags,-1,1) = '>' THEN substr(p.Tags,2,length(p.Tags)-2) ELSE p.Tags END
+            END
+          ELSE NULL
+        END AS single,
+        -- generate a sequence of tags by repeatedly extracting up to the next '><'
+        p.Tags AS raw_tags
+    ) raw CROSS JOIN
+    (
+      -- fallback: convert to a single row containing all tags without angle brackets; downstream join by LIKE
+      SELECT
+        CASE
+          WHEN raw.single IS NOT NULL THEN raw.single
+          ELSE REPLACE(REPLACE(raw.raw_tags,'><',','),'<','')
+        END AS tagline
+    ) s
+    CROSS JOIN
+    (
+      SELECT
+        -- split using a simple string-split simulated by recursive common table expression is not possible here;
+        -- to keep compatibility, expose the whole comma-separated string as one row; calling query will match via LIKE-safe methods.
+        s.tagline AS tag
+    ) t1
+    WHERE t1.tag IS NOT NULL
+  ) AS tgs
+  JOIN Tags t ON t.TagName = tgs.TagName OR t.TagName = tgs.tag
+  WHERE p.PostTypeId = 1
+  GROUP BY t.TagName
+),
+UserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    COUNT(DISTINCT p.Id) AS PostsCreated,
+    MAX(p.LastActivityDate) AS LastActive,
+    SUM(COALESCE(v.BountyAmount,0)) AS TotalBounty,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesCast
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  GROUP BY u.Id, u.DisplayName
+),
+CrossLink AS (
+  SELECT
+    pl.PostId,
+    pl.RelatedPostId,
+    lt.Name AS LinkType,
+    pl.CreationDate
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+  WHERE pl.RelatedPostId <> pl.PostId
+),
+Commentary AS (
+  SELECT
+    c.PostId,
+    AVG(COALESCE(c.Score,0)) AS AvgCommentScore,
+    COUNT(*) AS CommentCount
+  FROM Comments c
+  GROUP BY c.PostId
+),
+Finally AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.ViewCount,
+    p.Score,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    ro.OwnerBadge AS OwnerBadge,
+    ur.DisplayName AS OwnerDisplayName,
+    vtd.Name AS VoteTypeName,
+    v.BountyAmount,
+    cmt.CommentCount,
+    cs.AvgCommentScore,
+    ls.NumLinks
+  FROM Posts p
+  LEFT JOIN Users ur ON ur.Id = p.OwnerUserId
+  LEFT JOIN Badges b ON b.UserId = p.OwnerUserId
+  LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+  LEFT JOIN PostHistoryTypes vtd ON vtd.Id = ph.PostHistoryTypeId
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS NumLinks
+    FROM PostLinks
+    GROUP BY PostId
+  ) ls ON ls.PostId = p.Id
+  LEFT JOIN Commentary cmt ON cmt.PostId = p.Id
+  LEFT JOIN (
+    SELECT u.Id, b.Name AS OwnerBadge
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+  ) ro ON ro.Id = p.OwnerUserId AND ro.OwnerBadge IS NOT NULL
+  LEFT JOIN TagStats ts ON (
+    -- match TagStats by checking tag name presence in tags string in a dialect-neutral way
+    ts.TagName IS NOT NULL AND p.Tags IS NOT NULL AND (
+      instr(p.Tags, '<' || ts.TagName || '>') > 0
+      OR instr(REPLACE(REPLACE(p.Tags,'><',','),'<',''), ts.TagName) > 0
+    )
+  )
+  LEFT JOIN (
+    SELECT PostId, AVG(COALESCE(c.Score,0)) AS AvgCommentScore
+    FROM Comments c
+    GROUP BY PostId
+  ) cs ON cs.PostId = p.Id
+  WHERE p.PostTypeId = 1
+    AND p.LastActivityDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '180' DAY)
+)
+SELECT
+  f.PostId,
+  f.Title,
+  f.Tags,
+  f.CreationDate,
+  f.ViewCount,
+  f.Score,
+  f.OwnerUserId,
+  f.LastActivityDate,
+  f.OwnerDisplayName,
+  COALESCE(f.OwnerBadge, 'NoBadge') AS OwnerBadge,
+  f.VoteTypeName,
+  COALESCE(f.BountyAmount, 0) AS BountyAmount,
+  COALESCE(f.CommentCount, 0) AS CommentCount,
+  COALESCE(f.AvgCommentScore, 0) AS AvgCommentScore,
+  COALESCE(f.NumLinks, 0) AS NumLinks,
+  (SELECT AVG(p2.Score) FROM Posts p2 WHERE p2.PostTypeId = 1) AS GlobalAvgQuestionScore,
+  (SELECT COUNT(*) FROM Posts p3 WHERE p3.OwnerUserId = f.OwnerUserId) AS PostsByOwner
+FROM Finally f
+GROUP BY
+  f.PostId,
+  f.Title,
+  f.Tags,
+  f.CreationDate,
+  f.ViewCount,
+  f.Score,
+  f.OwnerUserId,
+  f.LastActivityDate,
+  f.OwnerDisplayName,
+  f.OwnerBadge,
+  f.VoteTypeName,
+  f.BountyAmount,
+  f.CommentCount,
+  f.AvgCommentScore,
+  f.NumLinks
+ORDER BY f.LastActivityDate DESC, f.ViewCount DESC
+LIMIT 200;

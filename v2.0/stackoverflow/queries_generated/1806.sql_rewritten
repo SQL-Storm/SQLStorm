@@ -1,0 +1,215 @@
+-- {"query": "1806.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2878} 
+WITH UserActivitySummary AS (
+    -- Summarizes user activity: reputation, post/comment counts, and badge information
+    SELECT
+        u.Id AS UserId,
+        COALESCE(u.DisplayName, 'Anonymous User') AS DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.Views AS UserProfileViews,
+        u.UpVotes AS TotalUpvotesGiven,
+        u.DownVotes AS TotalDownvotesGiven,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsPosted,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersPosted,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        COUNT(DISTINCT b.Id) AS UniqueBadgesCount,
+        MAX(b.Date) AS LastBadgeDate,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Users AS u
+    LEFT JOIN Posts AS p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments AS c ON u.Id = c.UserId
+    LEFT JOIN Badges AS b ON u.Id = b.UserId
+    WHERE u.Reputation >= 10000
+      AND u.LastAccessDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes
+),
+PostVersionHistory AS (
+    -- Tracks post editing activity, focusing on original owner edits and deletion/reopening status
+    SELECT
+        ph.PostId,
+        p.OwnerUserId,
+        MAX(CASE WHEN pht.Name LIKE 'Edit %' AND ph.UserId = p.OwnerUserId THEN ph.CreationDate ELSE NULL END) AS LastOwnerEditDate,
+        COUNT(DISTINCT ph.RevisionGUID) FILTER (WHERE ph.UserId = p.OwnerUserId AND pht.Name LIKE 'Edit %') AS OwnerEditCount,
+        BOOL_OR(pht.Name = 'Post Closed') AS WasClosed,
+        BOOL_OR(pht.Name = 'Post Reopened') AS WasReopened,
+        BOOL_OR(pht.Name = 'Post Deleted') AS WasDeleted,
+        MIN(ph.CreationDate) FILTER (WHERE pht.Name = 'Post Deleted') AS DeletionDate
+    FROM PostHistory AS ph
+    JOIN PostHistoryTypes AS pht ON ph.PostHistoryTypeId = pht.Id
+    LEFT JOIN Posts AS p ON ph.PostId = p.Id
+    WHERE pht.Id IN (4, 5, 6, 10, 11, 12)
+    GROUP BY ph.PostId, p.OwnerUserId
+),
+PostDetailedMetrics AS (
+    -- Combines post data with detailed activity and calculated metrics
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Title,
+        p.Body,
+        p.Tags,
+        p.CreationDate AS PostCreationDate,
+        p.LastActivityDate,
+        p.ViewCount,
+        p.Score,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        phv.LastOwnerEditDate,
+        phv.OwnerEditCount,
+        phv.WasClosed,
+        phv.WasReopened,
+        phv.WasDeleted,
+        phv.DeletionDate,
+        -- Calculate time difference between creation and last activity in days
+        EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate)) / (60*60*24) AS ActivitySpanDays,
+        -- Extract primary tag from Tags string, handling NULLs
+        COALESCE(
+            NULLIF(SUBSTRING(p.Tags FROM 2 FOR POSITION('>' IN p.Tags) - 2), ''),
+            'untagged'
+        ) AS PrimaryTag,
+        -- Check if post body contains common code indicators (case-insensitive)
+        (LOWER(p.Body) LIKE '%<pre><code>%' OR LOWER(p.Body) LIKE '%```%') AS ContainsCodeSnippet,
+        -- Correlated subquery: Check if this post has any linked duplicates
+        EXISTS (
+            SELECT 1
+            FROM PostLinks AS pl
+            WHERE (pl.PostId = p.Id OR pl.RelatedPostId = p.Id)
+              AND pl.LinkTypeId = (SELECT Id FROM LinkTypes WHERE Name = 'Duplicate')
+        ) AS HasDuplicateLink
+    FROM Posts AS p
+    LEFT JOIN PostVersionHistory AS phv ON p.Id = phv.PostId AND p.OwnerUserId = phv.OwnerUserId
+    WHERE p.PostTypeId IN (1, 2)
+      AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '2 years'
+      AND p.Score > 5
+      AND p.Body IS NOT NULL
+      -- Exclude posts that were deleted very quickly
+      AND NOT (COALESCE(phv.WasDeleted, FALSE) AND p.CreationDate IS NOT NULL AND phv.DeletionDate IS NOT NULL AND (phv.DeletionDate - p.CreationDate) < INTERVAL '1 day')
+),
+RankedPostsByTag AS (
+    -- Ranks posts within their primary tag by score, and calculates tag aggregates
+    SELECT
+        pm.*,
+        ROW_NUMBER() OVER (PARTITION BY pm.PrimaryTag ORDER BY pm.Score DESC, pm.ViewCount DESC) AS RankInTag,
+        AVG(pm.Score) OVER (PARTITION BY pm.PrimaryTag) AS AvgTagScore,
+        COUNT(pm.PostId) OVER (PARTITION BY pm.PrimaryTag) AS TotalPostsInTag,
+        SUM(pm.ViewCount) OVER (PARTITION BY pm.PrimaryTag) AS TotalTagViewCount,
+        -- Lead/Lag to find the score difference with the next/previous post in the same tag, ordered by creation date
+        LAG(pm.Score, 1, 0) OVER (PARTITION BY pm.PrimaryTag ORDER BY pm.PostCreationDate) AS PrevPostScoreInTag,
+        LEAD(pm.Score, 1, 0) OVER (PARTITION BY pm.PrimaryTag ORDER BY pm.PostCreationDate) AS NextPostScoreInTag
+    FROM PostDetailedMetrics AS pm
+    WHERE pm.PrimaryTag <> 'untagged'
+),
+HighQualityPosts AS (
+    -- Filters for high-quality questions and answers, combining with user activity
+    SELECT
+        rp.PostId,
+        rp.PostTypeId,
+        rp.OwnerUserId,
+        us.DisplayName AS OwnerDisplayName,
+        rp.Title,
+        rp.PrimaryTag,
+        rp.Score,
+        rp.ViewCount,
+        rp.CommentCount,
+        rp.FavoriteCount,
+        rp.LastOwnerEditDate,
+        rp.OwnerEditCount,
+        rp.WasClosed,
+        rp.WasReopened,
+        rp.HasDuplicateLink,
+        rp.ContainsCodeSnippet,
+        rp.RankInTag,
+        rp.AvgTagScore,
+        rp.TotalPostsInTag,
+        us.Reputation AS OwnerReputation,
+        us.UniqueBadgesCount AS OwnerBadges,
+        us.QuestionsPosted AS OwnerQuestions,
+        us.AnswersPosted AS OwnerAnswers,
+        us.CommentsMade AS OwnerComments,
+        -- Calculate a "ContributionScore" for the owner based on post metrics and user activity
+        (rp.Score * 1.5 + COALESCE(rp.FavoriteCount, 0) * 2 + rp.OwnerEditCount * 0.5 + rp.CommentCount * 0.1) * (1 + us.UniqueBadgesCount / 10.0) AS ContributionScore,
+        -- Conditional calculation for "EngagementRatio"
+        CASE
+            WHEN rp.ViewCount > 0 THEN CAST(rp.CommentCount + COALESCE(rp.FavoriteCount, 0) + rp.Score AS DECIMAL) / rp.ViewCount
+            ELSE 0
+        END AS EngagementRatio
+    FROM RankedPostsByTag AS rp
+    JOIN UserActivitySummary AS us ON rp.OwnerUserId = us.UserId
+    WHERE rp.Score > rp.AvgTagScore
+      AND rp.RankInTag <= 10
+      AND rp.EngagementRatio > 0.005
+      AND (rp.PostTypeId = 1 OR rp.OwnerEditCount > 0)
+)
+-- Main query: Combine high-quality questions and answers into a unified result set
+SELECT
+    'Question' AS RecordType,
+    hqp.PostId,
+    hqp.OwnerUserId,
+    hqp.OwnerDisplayName,
+    hqp.OwnerReputation,
+    hqp.Title,
+    hqp.PrimaryTag,
+    hqp.Score,
+    hqp.ViewCount,
+    hqp.FavoriteCount,
+    hqp.LastOwnerEditDate,
+    hqp.OwnerEditCount,
+    hqp.HasDuplicateLink,
+    hqp.ContainsCodeSnippet,
+    hqp.WasClosed,
+    hqp.WasReopened,
+    hqp.ContributionScore,
+    hqp.EngagementRatio,
+    (SELECT COUNT(DISTINCT pl.RelatedPostId) FROM PostLinks pl WHERE pl.PostId = hqp.PostId AND pl.LinkTypeId = (SELECT Id FROM LinkTypes WHERE Name = 'Linked')) AS LinkedPostsCount,
+    (SELECT AVG(v.BountyAmount) FROM Votes v WHERE v.PostId = hqp.PostId AND v.VoteTypeId = (SELECT Id FROM VoteTypes WHERE Name = 'BountyStart')) AS AverageBountyAmount
+FROM HighQualityPosts AS hqp
+WHERE hqp.PostTypeId = 1
+  AND COALESCE(hqp.WasReopened, FALSE) IS FALSE
+  AND COALESCE(hqp.ContainsCodeSnippet, FALSE) IS TRUE
+  AND hqp.OwnerBadges >= 3
+  AND hqp.PrimaryTag IN ('javascript', 'python', 'c#', 'java', 'sql', 'database', 'html', 'css')
+  AND hqp.ContributionScore > 500
+UNION ALL
+SELECT
+    'Answer' AS RecordType,
+    hqp.PostId,
+    hqp.OwnerUserId,
+    hqp.OwnerDisplayName,
+    hqp.OwnerReputation,
+    COALESCE(
+        (SELECT p_q.Title FROM Posts p_q WHERE p_q.Id = (SELECT p_a.ParentId FROM Posts p_a WHERE p_a.Id = hqp.PostId)),
+        '[Parent Question Title Not Found]'
+    ) AS ParentQuestionTitle,
+    hqp.PrimaryTag,
+    hqp.Score,
+    hqp.ViewCount,
+    hqp.FavoriteCount,
+    hqp.LastOwnerEditDate,
+    hqp.OwnerEditCount,
+    hqp.HasDuplicateLink,
+    hqp.ContainsCodeSnippet,
+    hqp.WasClosed,
+    hqp.WasReopened,
+    hqp.ContributionScore,
+    hqp.EngagementRatio,
+    (SELECT COUNT(DISTINCT c.Id) FROM Comments c WHERE c.PostId = hqp.PostId AND c.UserId IS NOT NULL) AS CommentsByRegisteredUsers,
+    (SELECT SUM(v.BountyAmount) FROM Votes v WHERE v.PostId = hqp.PostId AND v.VoteTypeId = (SELECT Id FROM VoteTypes WHERE Name = 'BountyClose')) AS TotalBountyReceived
+FROM HighQualityPosts AS hqp
+WHERE hqp.PostTypeId = 2
+  AND hqp.Score >= 50
+  AND hqp.OwnerEditCount >= 2
+  AND hqp.OwnerReputation > 20000
+  AND hqp.PrimaryTag IN ('javascript', 'python', 'c#', 'java', 'sql', 'database', 'html', 'css')
+  AND NOT EXISTS (
+      SELECT 1 FROM Posts parent_post
+      WHERE parent_post.Id = (SELECT p_a.ParentId FROM Posts p_a WHERE p_a.Id = hqp.PostId)
+        AND parent_post.AcceptedAnswerId = hqp.PostId
+        AND parent_post.ClosedDate IS NOT NULL
+  )
+ORDER BY ContributionScore DESC, OwnerReputation DESC
+LIMIT 500;

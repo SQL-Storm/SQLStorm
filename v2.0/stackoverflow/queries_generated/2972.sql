@@ -1,0 +1,108 @@
+-- {"query": "2972.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1164} 
+
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        u.Id AS UserId,
+        u.DisplayName,
+        ROW_NUMBER() OVER (PARTITION BY t.Id ORDER BY p.CreationDate DESC) AS RecentPostRank
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE t.IsModeratorOnly = 0
+),
+UserBadgeAgg AS (
+    SELECT
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldCount,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverCount,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeCount,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserActivityWindow AS (
+    SELECT
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Id AS PostId,
+        p.Score,
+        COUNT(c.Id) AS CommentCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserPostRank,
+        FIRST_VALUE(p.Title) OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC NULLS LAST) AS TopScoredPostTitle
+    FROM Posts p
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    WHERE p.OwnerUserId IS NOT NULL AND p.PostTypeId IN (1,2)
+    GROUP BY p.OwnerUserId, p.PostTypeId, p.Id, p.Score, p.CreationDate, p.Title
+),
+FilteredTopUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        ua.GoldCount,
+        ua.SilverCount,
+        ua.BronzeCount,
+        ua.LastBadgeDate,
+        MAX(uw.Score) AS MaxPostScore,
+        COUNT(DISTINCT uw.PostId) AS TotalPosts,
+        AVG(COALESCE(uw.CommentCount,0)) AS AvgCommentsPerPost,
+        MAX(uw.TopScoredPostTitle) AS OverallTopPostTitle
+    FROM Users u
+    LEFT JOIN UserBadgeAgg ua ON ua.UserId = u.Id
+    LEFT JOIN UserActivityWindow uw ON uw.OwnerUserId = u.Id
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, ua.GoldCount, ua.SilverCount, ua.BronzeCount, ua.LastBadgeDate
+    HAVING COUNT(DISTINCT uw.PostId) > 5
+),
+ClosedQuestionsWithDuplicateFlag AS (
+    SELECT
+        ph.PostId,
+        MIN(CAST(CASE WHEN ph.PostHistoryTypeId = 10 THEN CAST(ph.Comment AS INT) ELSE NULL END AS INT)) AS CloseReasonId,
+        EXISTS (
+            SELECT 1 FROM PostLinks pl WHERE pl.PostId = ph.PostId AND pl.LinkTypeId = 3
+        ) AS HasDuplicateLink
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.PostId
+),
+ComplexFinal AS (
+    SELECT DISTINCT
+        ft.UserId,
+        ft.DisplayName,
+        ft.Reputation,
+        ft.GoldCount,
+        ft.SilverCount,
+        ft.BronzeCount,
+        ft.LastBadgeDate,
+        ft.MaxPostScore,
+        ft.TotalPosts,
+        ft.AvgCommentsPerPost,
+        ft.OverallTopPostTitle,
+        t.TagName,
+        CASE 
+            WHEN cq.PostId IS NOT NULL THEN 'Closed'
+            ELSE 'Open'
+        END AS QuestionStatus,
+        cq.CloseReasonId,
+        cq.HasDuplicateLink,
+        -- Complex string expression: concatenate tagname with user displayname and their top post title
+        CONCAT_WS(' | ', t.TagName, ft.DisplayName, COALESCE(ft.OverallTopPostTitle, 'No Top Post')) AS TagUserPostSummary,
+        -- Complex calculation: weighted score based on badges and post score with NULL logic
+        COALESCE(ft.GoldCount,0) * 5 + COALESCE(ft.SilverCount,0) * 3 + COALESCE(ft.BronzeCount,0) * 1 + COALESCE(ft.MaxPostScore,0) AS WeightedUserScore,
+        -- Window function calculation: rank users by weighted score within each tag
+        RANK() OVER (PARTITION BY t.TagName ORDER BY COALESCE(ft.GoldCount,0)*5 + COALESCE(ft.SilverCount,0)*3 + COALESCE(ft.BronzeCount,0) + COALESCE(ft.MaxPostScore,0) DESC) AS RankWithinTag
+    FROM FilteredTopUsers ft
+    JOIN RecursiveTagHierarchy t ON t.UserId = ft.UserId AND t.RecentPostRank <= 3
+    LEFT JOIN ClosedQuestionsWithDuplicateFlag cq ON cq.PostId = t.PostId
+    WHERE ft.AvgCommentsPerPost > 1
+)
+SELECT *
+FROM ComplexFinal cf
+WHERE cf.RankWithinTag <= 5
+  AND (cf.QuestionStatus = 'Open' OR (cf.CloseReasonId IS NOT NULL AND cf.CloseReasonId NOT IN (2, 102))) -- exclude off-topic closes
+ORDER BY cf.TagName, cf.WeightedUserScore DESC;

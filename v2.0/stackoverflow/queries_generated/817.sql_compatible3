@@ -1,0 +1,382 @@
+with recent_questions as (
+    select
+        p.Id as QuestionId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.Tags,
+        coalesce(p.Title, '(no title)') as Title,
+        date_trunc('month', p.CreationDate) as MonthBucket
+    from Posts p
+    where p.PostTypeId = 1
+      and p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+),
+accepted_answers as (
+    select
+        q.QuestionId,
+        a.Id as AcceptedAnswerId,
+        a.OwnerUserId as AcceptedOwnerId,
+        a.Score as AcceptedScore,
+        a.CreationDate as AcceptedCreationDate
+    from recent_questions q
+    left join Posts pq on pq.Id = q.QuestionId
+    left join Posts a on a.Id = pq.AcceptedAnswerId and a.PostTypeId = 2
+),
+first_answer_per_q as (
+    select
+        pa.ParentId as QuestionId,
+        pa.Id as FirstAnswerId,
+        pa.OwnerUserId as FirstAnswerOwnerId,
+        pa.Score as FirstAnswerScore,
+        pa.CreationDate as FirstAnswerCreationDate
+    from (
+        select
+            pa.*,
+            row_number() over (partition by pa.ParentId order by pa.CreationDate asc, pa.Id asc) as rn
+        from Posts pa
+        join recent_questions q on q.QuestionId = pa.ParentId
+        where pa.PostTypeId = 2
+    ) pa
+    where pa.rn = 1
+),
+votes_agg as (
+    select
+        v.PostId,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+        sum(case when v.VoteTypeId = 5 then 1 else 0 end) as Favorites,
+        sum(case when v.VoteTypeId in (8,9) then coalesce(v.BountyAmount,0) else 0 end) as BountyFlow
+    from Votes v
+    where v.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+    group by v.PostId
+),
+comment_agg as (
+    select
+        c.PostId,
+        count(*) as CommentCount,
+        max(c.CreationDate) as LastCommentDate,
+        sum(case when c.Score > 0 then 1 else 0 end) as PositiveComments
+    from Comments c
+    group by c.PostId
+),
+user_metrics as (
+    select
+        u.Id as UserId,
+        u.Reputation,
+        u.UpVotes as LifetimeUpVotes,
+        u.DownVotes as LifetimeDownVotes,
+        u.Views as ProfileViews,
+        date_trunc('month', u.CreationDate) as UserCohort
+    from Users u
+),
+tag_expansion as (
+    select
+        q.QuestionId,
+        unnest(string_to_array(substring(q.Tags, 2, length(q.Tags)-2), '><')) as TagName
+    from recent_questions q
+    where q.Tags is not null and q.Tags like '<%>'
+),
+tag_meta as (
+    select
+        te.QuestionId,
+        te.TagName,
+        t.Count as TagGlobalCount,
+        t.IsModeratorOnly,
+        t.IsRequired
+    from tag_expansion te
+    left join Tags t on t.TagName = te.TagName
+),
+link_dupes as (
+    select
+        pl.PostId as QuestionId,
+        sum(case when pl.LinkTypeId = 3 then 1 else 0 end) as DuplicateLinks,
+        sum(case when pl.LinkTypeId = 1 then 1 else 0 end) as LinkedLinks
+    from PostLinks pl
+    join recent_questions q on q.QuestionId = pl.PostId
+    group by pl.PostId
+),
+closure_events as (
+    select
+        ph.PostId as QuestionId,
+        min(case when ph.PostHistoryTypeId = 10 then ph.CreationDate end) as FirstClosedAt,
+        max(case when ph.PostHistoryTypeId = 11 then ph.CreationDate end) as LastReopenedAt,
+        sum(case when ph.PostHistoryTypeId = 10 then 1 else 0 end) as CloseVotesEvents,
+        sum(case when ph.PostHistoryTypeId = 11 then 1 else 0 end) as ReopenEvents,
+        -- fallback: take most common numeric comment value if any
+        (
+          select ph2.Comment
+          from PostHistory ph2
+          where ph2.PostId = ph.PostId
+            and ph2.PostHistoryTypeId in (10,11)
+            and ph2.Comment ~ '^[0-9]+$'
+          order by count(*) over (partition by ph2.Comment) desc
+          limit 1
+        ) as RawCloseCommentSample
+    from PostHistory ph
+    join recent_questions q on q.QuestionId = ph.PostId
+    where ph.PostHistoryTypeId in (10,11)
+    group by ph.PostId
+),
+question_activity as (
+    select
+        q.QuestionId,
+        q.MonthBucket,
+        q.Score as QScore,
+        q.ViewCount,
+        vq.UpVotes as QUpVotes,
+        vq.DownVotes as QDownVotes,
+        vq.Favorites as QFavorites,
+        vq.BountyFlow as QBountyFlow,
+        coalesce(cq.CommentCount,0) as QCommentCount,
+        cq.LastCommentDate as QLastCommentDate
+    from recent_questions q
+    left join votes_agg vq on vq.PostId = q.QuestionId
+    left join comment_agg cq on cq.PostId = q.QuestionId
+),
+answer_activity as (
+    select
+        coalesce(fa.QuestionId, aa.QuestionId) as QuestionId,
+        fa.FirstAnswerId,
+        fa.FirstAnswerScore,
+        aa.AcceptedAnswerId,
+        aa.AcceptedScore,
+        extract(epoch from (aa.AcceptedCreationDate - q.CreationDate)) as SecondsToAccepted,
+        extract(epoch from (fa.FirstAnswerCreationDate - q.CreationDate)) as SecondsToFirstAnswer,
+        va.UpVotes as AUpVotes,
+        va.DownVotes as ADownVotes,
+        va.Favorites as AFavorites,
+        va.BountyFlow as ABountyFlow,
+        coalesce(ca.CommentCount,0) as ACommentCount
+    from first_answer_per_q fa
+    full outer join accepted_answers aa on aa.QuestionId = fa.QuestionId
+    join recent_questions q on q.QuestionId = coalesce(fa.QuestionId, aa.QuestionId)
+    left join votes_agg va on va.PostId = coalesce(aa.AcceptedAnswerId, fa.FirstAnswerId)
+    left join comment_agg ca on ca.PostId = coalesce(aa.AcceptedAnswerId, fa.FirstAnswerId)
+),
+user_roles as (
+    select
+        q.QuestionId,
+        q.OwnerUserId as AskerId,
+        aa.AcceptedOwnerId as AcceptedAnswererId,
+        fa.FirstAnswerOwnerId as FirstAnswererId
+    from recent_questions q
+    left join accepted_answers aa on aa.QuestionId = q.QuestionId
+    left join first_answer_per_q fa on fa.QuestionId = q.QuestionId
+),
+badge_snap as (
+    select
+        b.UserId,
+        count(*) as TotalBadges,
+        sum(case when b.Class = 1 then 1 else 0 end) as Gold,
+        sum(case when b.Class = 2 then 1 else 0 end) as Silver,
+        sum(case when b.Class = 3 then 1 else 0 end) as Bronze,
+        sum(case when coalesce(b.TagBased, false) = true then 1 else 0 end) as TagBadges
+    from Badges b
+    group by b.UserId
+),
+role_user_enriched as (
+    select
+        ur.QuestionId,
+        ur.AskerId,
+        ua.Reputation as AskerRep,
+        coalesce(bu.TotalBadges,0) as AskerBadges,
+        ur.AcceptedAnswererId,
+        uacc.Reputation as AcceptedRep,
+        coalesce(bacc.TotalBadges,0) as AcceptedBadges,
+        ur.FirstAnswererId,
+        uf.Reputation as FirstRep,
+        coalesce(bf.TotalBadges,0) as FirstBadges
+    from user_roles ur
+    left join user_metrics ua on ua.UserId = ur.AskerId
+    left join badge_snap bu on bu.UserId = ur.AskerId
+    left join user_metrics uacc on uacc.UserId = ur.AcceptedAnswererId
+    left join badge_snap bacc on bacc.UserId = ur.AcceptedAnswererId
+    left join user_metrics uf on uf.UserId = ur.FirstAnswererId
+    left join badge_snap bf on bf.UserId = ur.FirstAnswererId
+),
+title_quality as (
+    select
+        q.QuestionId,
+        length(q.Title) as TitleLen,
+        (coalesce(array_length(regexp_matches(lower(q.Title), '(how|why|what|when|where|can|should|is|are)'),1),0) > 0) as IsInterrogative,
+        (q.Title ~ '\\?$') as EndsWithQuestionMark,
+        regexp_replace(coalesce(q.Title,''), '\\s+', ' ', 'g') as NormalizedTitle,
+        (length(coalesce(q.Title,'')) - length(replace(coalesce(q.Title,''), ' ', ''))) + 1 as ApproxWordCount
+    from recent_questions q
+),
+tag_rollup as (
+    select
+        tm.QuestionId,
+        count(*) as TagCount,
+        sum(case when coalesce(tm.IsModeratorOnly, false) = true then 1 else 0 end) as ModeratorOnlyTags,
+        sum(case when coalesce(tm.IsRequired, false) = true then 1 else 0 end) as RequiredTags,
+        max(tm.TagGlobalCount) as MaxTagPopularity,
+        min(tm.TagGlobalCount) as MinTagPopularity
+    from tag_meta tm
+    group by tm.QuestionId
+),
+quality_scores as (
+    select
+        qa.QuestionId,
+        qa.QScore,
+        qa.ViewCount,
+        coalesce(qa.QUpVotes,0) - coalesce(qa.QDownVotes,0) as QNetVotes,
+        coalesce(aa.AcceptedScore,0) as AcceptedScore,
+        coalesce(aa.FirstAnswerScore,0) as FirstAnswerScore,
+        coalesce(qa.QFavorites,0) + coalesce(aa.AFavorites,0) as TotalFavorites,
+        (case when aa.AcceptedAnswerId is not null then 1 else 0 end) as HasAccepted,
+        greatest(0, coalesce(qa.QBountyFlow,0) + coalesce(aa.ABountyFlow,0)) as TotalBountyFlow,
+        coalesce(qa.QCommentCount,0) + coalesce(aa.ACommentCount,0) as TotalComments,
+        coalesce(aa.SecondsToFirstAnswer, null) as SecondsToFirstAnswer,
+        coalesce(aa.SecondsToAccepted, null) as SecondsToAccepted
+    from question_activity qa
+    left join answer_activity aa on aa.QuestionId = qa.QuestionId
+),
+ranked_questions as (
+    select
+        qs.QuestionId,
+        qs.QScore,
+        qs.ViewCount,
+        qs.QNetVotes,
+        qs.AcceptedScore,
+        qs.FirstAnswerScore,
+        qs.TotalFavorites,
+        qs.HasAccepted,
+        qs.TotalBountyFlow,
+        qs.TotalComments,
+        qs.SecondsToFirstAnswer,
+        qs.SecondsToAccepted,
+        tr.TagCount,
+        tr.ModeratorOnlyTags,
+        tr.RequiredTags,
+        tr.MaxTagPopularity,
+        tr.MinTagPopularity,
+        tq.TitleLen,
+        tq.IsInterrogative,
+        tq.EndsWithQuestionMark,
+        tq.ApproxWordCount,
+        ra.MonthBucket,
+        ld.DuplicateLinks,
+        ld.LinkedLinks,
+        ce.FirstClosedAt,
+        ce.LastReopenedAt,
+        ce.CloseVotesEvents,
+        ce.ReopenEvents,
+        row_number() over (partition by ra.MonthBucket order by qs.QNetVotes desc, qs.ViewCount desc, qs.TotalFavorites desc) as RankInMonth,
+        rank() over (order by (qs.QNetVotes + qs.TotalFavorites + coalesce(qs.AcceptedScore,0) + coalesce(qs.FirstAnswerScore,0)) desc) as GlobalRank,
+        dense_rank() over (partition by (case when qs.HasAccepted=1 then 'accepted' else 'unaccepted' end) order by qs.ViewCount desc) as RankByAcceptance
+    from quality_scores qs
+    join recent_questions ra on ra.QuestionId = qs.QuestionId
+    left join tag_rollup tr on tr.QuestionId = qs.QuestionId
+    left join title_quality tq on tq.QuestionId = qs.QuestionId
+    left join link_dupes ld on ld.QuestionId = qs.QuestionId
+    left join closure_events ce on ce.QuestionId = qs.QuestionId
+),
+dupe_clusters as (
+    select
+        q.QuestionId,
+        sum(case when pl.LinkTypeId = 3 and pl.PostId = q.QuestionId then 1 else 0 end) as OutgoingDupes,
+        sum(case when pl.LinkTypeId = 3 and pl.RelatedPostId = q.QuestionId then 1 else 0 end) as IncomingDupes
+    from recent_questions q
+    left join PostLinks pl on (pl.PostId = q.QuestionId or pl.RelatedPostId = q.QuestionId)
+    group by q.QuestionId
+),
+null_safety as (
+    select
+        rq.QuestionId,
+        rq.QScore,
+        rq.ViewCount,
+        rq.QNetVotes,
+        rq.AcceptedScore,
+        rq.FirstAnswerScore,
+        rq.TotalFavorites,
+        rq.HasAccepted,
+        rq.TotalBountyFlow,
+        rq.TotalComments,
+        rq.SecondsToFirstAnswer,
+        rq.SecondsToAccepted,
+        rq.TagCount,
+        rq.ModeratorOnlyTags,
+        rq.RequiredTags,
+        rq.MaxTagPopularity,
+        rq.MinTagPopularity,
+        rq.TitleLen,
+        rq.IsInterrogative,
+        rq.EndsWithQuestionMark,
+        rq.ApproxWordCount,
+        rq.MonthBucket,
+        rq.DuplicateLinks,
+        rq.LinkedLinks,
+        rq.FirstClosedAt,
+        rq.LastReopenedAt,
+        rq.CloseVotesEvents,
+        rq.ReopenEvents,
+        rq.RankInMonth,
+        rq.GlobalRank,
+        rq.RankByAcceptance,
+        coalesce(dc.OutgoingDupes,0) as OutgoingDupes,
+        coalesce(dc.IncomingDupes,0) as IncomingDupes,
+        coalesce(rq.RequiredTags,0) as RequiredTagsSafe,
+        coalesce(rq.ModeratorOnlyTags,0) as ModeratorOnlyTagsSafe
+    from ranked_questions rq
+    left join dupe_clusters dc on dc.QuestionId = rq.QuestionId
+)
+select
+    ns.QuestionId,
+    ns.MonthBucket,
+    ns.GlobalRank,
+    ns.RankInMonth,
+    ns.RankByAcceptance,
+    ns.QNetVotes,
+    ns.ViewCount,
+    ns.TotalFavorites,
+    ns.TotalComments,
+    ns.TotalBountyFlow,
+    ns.HasAccepted,
+    ns.SecondsToFirstAnswer,
+    ns.SecondsToAccepted,
+    ns.TagCount,
+    ns.RequiredTagsSafe as RequiredTags,
+    ns.ModeratorOnlyTagsSafe as ModeratorOnlyTags,
+    ns.MaxTagPopularity,
+    ns.MinTagPopularity,
+    ns.TitleLen,
+    ns.IsInterrogative,
+    ns.EndsWithQuestionMark,
+    ns.ApproxWordCount,
+    ns.DuplicateLinks,
+    ns.LinkedLinks,
+    ns.FirstClosedAt,
+    ns.LastReopenedAt,
+    ns.CloseVotesEvents,
+    ns.ReopenEvents,
+    ns.OutgoingDupes,
+    ns.IncomingDupes,
+    ru.AskerId,
+    ru.AskerRep,
+    ru.AskerBadges,
+    ru.AcceptedAnswererId,
+    ru.AcceptedRep,
+    ru.AcceptedBadges,
+    ru.FirstAnswererId,
+    ru.FirstRep,
+    ru.FirstBadges
+from null_safety ns
+left join role_user_enriched ru on ru.QuestionId = ns.QuestionId
+where (
+        ns.QNetVotes + coalesce(ns.TotalFavorites,0)
+        + case when ns.HasAccepted = 1 then 5 else 0 end
+        + least(10, coalesce(ns.TotalComments,0))
+        + case when ns.SecondsToFirstAnswer is not null then 1 else 0 end
+      ) >= (
+        select percentile_cont(0.75) within group (order by (rq.QNetVotes + coalesce(rq.TotalFavorites,0) + case when rq.HasAccepted=1 then 5 else 0 end + least(10, coalesce(rq.TotalComments,0)) + case when rq.SecondsToFirstAnswer is not null then 1 else 0 end))
+        from ranked_questions rq
+      )
+  and coalesce(ns.TagCount,0) between 1 and 5
+  and (
+        ns.FirstClosedAt is null
+        or (ns.ReopenEvents > 0 and ns.LastReopenedAt >= ns.FirstClosedAt)
+      )
+order by ns.GlobalRank, ns.RankInMonth, ns.QuestionId
+limit 500;

@@ -1,0 +1,163 @@
+-- {"query": "3890.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2685} 
+
+/*  Benchmark query mixing CTEs, window functions, outer joins, correlated subqueries,
+    string handling, NULL logic and a set operator.  */
+WITH 
+/* 1️⃣  Basic per‑user aggregates */
+usr_stats AS (
+    SELECT 
+        u.Id                                                    AS uid,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.Views,0)                                      AS views,
+        (SELECT COUNT(*) FROM Badges b      WHERE b.UserId = u.Id) AS badge_cnt,
+        (SELECT COUNT(*) FROM Posts p       WHERE p.OwnerUserId = u.Id) AS post_cnt,
+        (SELECT COUNT(*) FROM Posts p
+           WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1)   AS question_cnt,
+        (SELECT COUNT(*) FROM Posts p
+           WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2)   AS answer_cnt,
+        (SELECT MAX(CreationDate) FROM Posts p
+           WHERE p.OwnerUserId = u.Id)                         AS last_post_dt,
+        (SELECT MAX(CreationDate) FROM Comments c
+           WHERE c.UserId = u.Id)                               AS last_comment_dt,
+        (SELECT MAX(CreationDate) FROM PostHistory ph
+           WHERE ph.UserId = u.Id)                              AS last_hist_dt
+    FROM Users u
+),
+
+/* 2️⃣  Score aggregates per user */
+usr_scores AS (
+    SELECT 
+        p.OwnerUserId                              AS uid,
+        SUM(p.Score)                               AS total_score,
+        AVG(p.Score)                               AS avg_score,
+        MAX(p.Score)                               AS max_score,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 1)   AS q_posted,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 2)   AS a_posted
+    FROM Posts p
+    GROUP BY p.OwnerUserId
+),
+
+/* 3️⃣  Vote activity per user */
+usr_votes AS (
+    SELECT 
+        v.UserId                                    AS uid,
+        COUNT(*)                                    AS votes_cast,
+        SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END)  AS up_votes,
+        SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END)  AS down_votes
+    FROM Votes v
+    JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    GROUP BY v.UserId
+),
+
+/* 4️⃣  Most recent activity (any source) */
+usr_recent AS (
+    SELECT 
+        u.Id                                         AS uid,
+        GREATEST(
+            COALESCE(us.last_post_dt,      TIMESTAMP '1970‑01‑01'),
+            COALESCE(us.last_comment_dt,   TIMESTAMP '1970‑01‑01'),
+            COALESCE(us.last_hist_dt,      TIMESTAMP '1970‑01‑01')
+        )                                            AS most_recent_activity
+    FROM Users u
+    JOIN usr_stats us ON us.uid = u.Id
+),
+
+/* 5️⃣  Tag usage – top 5 tags per user (window function) */
+usr_tags AS (
+    SELECT 
+        pt.OwnerUserId                               AS uid,
+        TRIM(BOTH '<>' FROM tag_raw)                 AS tag_name,
+        ROW_NUMBER() OVER (PARTITION BY pt.OwnerUserId
+                           ORDER BY cnt DESC)       AS rn
+    FROM Posts pt
+    CROSS JOIN LATERAL regexp_split_to_table(pt.Tags, '><') AS tag_raw
+    LEFT JOIN LATERAL (
+        SELECT Count(*) AS cnt
+        FROM Posts p2
+        WHERE p2.Tags ILIKE '%'||tag_raw||'%'
+    ) tcnt ON true
+    WHERE pt.PostTypeId = 1               -- only questions have tag strings
+),
+
+/* 6️⃣  “Active” and “Inactive” user slices for the set operator */
+active_users AS (
+    SELECT 
+        u.uid,
+        u.DisplayName,
+        u.Reputation,
+        u.views,
+        us.badge_cnt,
+        us.post_cnt,
+        us.question_cnt,
+        us.answer_cnt,
+        sc.total_score,
+        sc.avg_score,
+        sc.max_score,
+        vt.votes_cast,
+        vt.up_votes,
+        vt.down_votes,
+        rc.most_recent_activity,
+        COALESCE(u.Location,'Unknown')              AS location,
+        COALESCE(NULLIF(u.AboutMe,''),'No bio')     AS about_snippet,
+        STRING_AGG(DISTINCT tg.tag_name, ', ') 
+            FILTER (WHERE tg.rn <= 5)               AS top_5_tags,
+        (SELECT COUNT(*) FROM Comments c
+           WHERE c.UserId = u.uid
+             AND c.CreationDate > CURRENT_DATE - INTERVAL '30 days') AS recent_comment_cnt,
+        (SELECT COUNT(*) FROM Posts p
+           WHERE p.OwnerUserId = u.uid
+             AND p.CreationDate > CURRENT_DATE - INTERVAL '30 days') AS recent_post_cnt
+    FROM usr_stats u
+    LEFT JOIN usr_scores sc ON sc.uid = u.uid
+    LEFT JOIN usr_votes vt  ON vt.uid = u.uid
+    LEFT JOIN usr_recent rc ON rc.uid = u.uid
+    LEFT JOIN usr_tags tg   ON tg.uid = u.uid
+    WHERE u.Reputation > 1000
+    GROUP BY 
+        u.uid,u.DisplayName,u.Reputation,u.views,
+        us.badge_cnt,us.post_cnt,us.question_cnt,us.answer_cnt,
+        sc.total_score,sc.avg_score,sc.max_score,
+        vt.votes_cast,vt.up_votes,vt.down_votes,
+        rc.most_recent_activity,
+        u.Location,u.AboutMe
+),
+
+inactive_users AS (
+    SELECT 
+        u.uid,
+        u.DisplayName,
+        u.Reputation,
+        u.views,
+        us.badge_cnt,
+        us.post_cnt,
+        us.question_cnt,
+        us.answer_cnt,
+        sc.total_score,
+        sc.avg_score,
+        sc.max_score,
+        vt.votes_cast,
+        vt.up_votes,
+        vt.down_votes,
+        rc.most_recent_activity,
+        COALESCE(u.Location,'Unknown')              AS location,
+        COALESCE(NULLIF(u.AboutMe,''),'No bio')     AS about_snippet,
+        NULL                                        AS top_5_tags,
+        0                                          AS recent_comment_cnt,
+        0                                          AS recent_post_cnt
+    FROM usr_stats u
+    LEFT JOIN usr_scores sc ON sc.uid = u.uid
+    LEFT JOIN usr_votes vt  ON vt.uid = u.uid
+    LEFT JOIN usr_recent rc ON rc.uid = u.uid
+    WHERE u.Reputation BETWEEN 100 AND 1000
+)
+SELECT *
+FROM active_users
+ORDER BY total_score DESC NULLS LAST
+LIMIT 100
+
+UNION ALL
+
+SELECT *
+FROM inactive_users
+WHERE FALSE;   -- the UNION ALL guarantees identical column order but returns no rows from the second branch

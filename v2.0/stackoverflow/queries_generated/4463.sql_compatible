@@ -1,0 +1,201 @@
+WITH
+  RankedPosts AS (
+    SELECT
+      p.Id AS PostId,
+      p.OwnerUserId,
+      p.PostTypeId,
+      p.CreationDate AS PostCreationDate,
+      p.Score AS PostScore,
+      p.ViewCount AS PostViewCount,
+      p.AnswerCount,
+      p.FavoriteCount,
+      p.ClosedDate,
+      pt.Name AS PostTypeName,
+      ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS PostRank,
+      COALESCE(
+        (
+          SELECT
+            SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END)
+          FROM
+            Votes v
+          JOIN
+            VoteTypes vt
+            ON v.VoteTypeId = vt.Id
+          WHERE
+            v.PostId = p.Id
+        ),
+        0
+      ) AS UpVoteCount,
+      COALESCE(
+        (
+          SELECT
+            SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END)
+          FROM
+            Votes v2
+          JOIN
+            VoteTypes vt2
+            ON v2.VoteTypeId = vt2.Id
+          WHERE
+            v2.PostId = p.Id
+        ),
+        0
+      ) AS DownVoteCount,
+      CASE
+        WHEN p.PostTypeId = 1 THEN 'Question'
+        WHEN p.PostTypeId = 2 THEN 'Answer'
+        WHEN p.PostTypeId = 5 THEN 'Tag Wiki'
+        ELSE 'Other'
+      END AS SimplifiedPostType
+    FROM
+      Posts p
+    JOIN
+      PostTypes pt
+      ON p.PostTypeId = pt.Id
+    WHERE
+      p.OwnerUserId IS NOT NULL AND p.OwnerUserId <> -1
+  ),
+  UserActivity AS (
+    SELECT
+      rp.OwnerUserId,
+      COUNT(rp.PostId) AS TotalPosts,
+      SUM(rp.PostScore) AS TotalScore,
+      AVG(rp.PostViewCount) AS AverageViewCount,
+      SUM(rp.UpVoteCount) AS TotalUpVotes,
+      SUM(rp.DownVoteCount) AS TotalDownVotes,
+      SUM(CASE WHEN rp.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+      SUM(CASE WHEN rp.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+      COUNT(CASE WHEN rp.ClosedDate IS NOT NULL THEN rp.PostId ELSE NULL END) AS ClosedPostCount,
+      MAX(rp.PostRank) AS HighestPostRank
+    FROM
+      RankedPosts rp
+    GROUP BY
+      rp.OwnerUserId
+  ),
+  RecentUserActivity AS (
+    SELECT
+      rp.OwnerUserId,
+      COUNT(rp.PostId) AS RecentPosts,
+      AVG(rp.PostScore) AS RecentAverageScore,
+      SUM(rp.UpVoteCount) AS RecentTotalUpVotes
+    FROM
+      RankedPosts rp
+    WHERE
+      rp.PostCreationDate >= (cast('2024-10-01' as date) - INTERVAL '90 days')
+    GROUP BY
+      rp.OwnerUserId
+  ),
+  UserContributions AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate AS UserCreationDate,
+      ua.TotalPosts,
+      ua.TotalScore,
+      ua.AverageViewCount,
+      ua.TotalUpVotes,
+      ua.TotalDownVotes,
+      ua.QuestionCount,
+      ua.AnswerCount,
+      ua.ClosedPostCount,
+      rua.RecentPosts,
+      rua.RecentAverageScore,
+      rua.RecentTotalUpVotes,
+      CASE
+        WHEN ua.TotalPosts > 0 THEN CAST(ua.TotalUpVotes AS DOUBLE PRECISION) / ua.TotalPosts
+        ELSE 0
+      END AS AvgUpVotesPerPost,
+      CASE
+        WHEN ua.TotalPosts > 0 THEN CAST(ua.TotalScore AS DOUBLE PRECISION) / ua.TotalPosts
+        ELSE 0
+      END AS AvgScorePerPost,
+      CASE
+        WHEN ua.QuestionCount > 0 THEN CAST(ua.AnswerCount AS DOUBLE PRECISION) / ua.QuestionCount
+        ELSE 0
+      END AS AnswerToQuestionRatio,
+      RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM
+      Users u
+    LEFT JOIN
+      UserActivity ua
+      ON u.Id = ua.OwnerUserId
+    LEFT JOIN
+      RecentUserActivity rua
+      ON u.Id = rua.OwnerUserId
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate,
+      ua.TotalPosts,
+      ua.TotalScore,
+      ua.AverageViewCount,
+      ua.TotalUpVotes,
+      ua.TotalDownVotes,
+      ua.QuestionCount,
+      ua.AnswerCount,
+      ua.ClosedPostCount,
+      rua.RecentPosts,
+      rua.RecentAverageScore,
+      rua.RecentTotalUpVotes
+  ),
+  TopQuestions AS (
+    SELECT
+      rp.OwnerUserId,
+      rp.PostId,
+      rp.PostTypeName,
+      rp.PostScore,
+      rp.FavoriteCount,
+      rp.UpVoteCount,
+      rp.DownVoteCount,
+      rp.AnswerCount,
+      CASE
+        WHEN rp.PostScore > 100 AND rp.FavoriteCount > 10 THEN 'High Value'
+        WHEN rp.PostScore < 0 THEN 'Negative Score'
+        ELSE 'Standard'
+      END AS PostQualityCategory
+    FROM
+      RankedPosts rp
+    WHERE
+      rp.PostTypeId = 1 AND rp.PostRank <= 10
+  )
+SELECT
+  uc.UserId,
+  uc.DisplayName,
+  uc.Reputation,
+  uc.UserCreationDate,
+  uc.TotalPosts,
+  uc.TotalScore,
+  uc.AverageViewCount,
+  uc.TotalUpVotes,
+  uc.TotalDownVotes,
+  uc.QuestionCount,
+  uc.AnswerCount,
+  uc.ClosedPostCount,
+  uc.RecentPosts,
+  uc.RecentAverageScore,
+  uc.RecentTotalUpVotes,
+  uc.AvgUpVotesPerPost,
+  uc.AvgScorePerPost,
+  uc.AnswerToQuestionRatio,
+  uc.ReputationRank,
+  tq.PostId AS TopQuestionId,
+  tq.PostTypeName AS TopQuestionType,
+  tq.PostScore AS TopQuestionScore,
+  tq.FavoriteCount AS TopQuestionFavoriteCount,
+  tq.UpVoteCount AS TopQuestionUpVotes,
+  tq.DownVoteCount AS TopQuestionDownVotes,
+  tq.AnswerCount AS TopQuestionAnswerCount,
+  tq.PostQualityCategory
+FROM
+  UserContributions uc
+LEFT JOIN
+  TopQuestions tq
+  ON uc.UserId = tq.OwnerUserId
+WHERE
+  uc.Reputation > 1000
+  AND uc.AvgScorePerPost > 5
+  AND uc.AnswerToQuestionRatio < 5
+ORDER BY
+  uc.Reputation DESC,
+  uc.TotalScore DESC;

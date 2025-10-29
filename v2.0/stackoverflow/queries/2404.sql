@@ -1,0 +1,107 @@
+with RecursiveUserBadges as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class,
+        row_number() over (partition by u.Id order by b.Class, b.Date) as BadgeRank
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    where b.Date between cast('2024-10-01' as date) - interval '365 day' and cast('2024-10-01' as date)
+),
+TopUserBadges as (
+    select * from RecursiveUserBadges where BadgeRank <= 5
+),
+PostLinkDetails as (
+    select pl.Id as LinkId, pl.PostId, pl.RelatedPostId, pl.LinkTypeId, lt.Name as LinkTypeName,
+           p1.Title as PostTitle, p2.Title as RelatedPostTitle
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    join Posts p1 on p1.Id = pl.PostId
+    join Posts p2 on p2.Id = pl.RelatedPostId
+),
+QuestionAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        count(a.Id) filter (where a.Id is not null) as AnswerCount,
+        max(a.Score) filter (where a.Id is not null) as HighestAnswerScore,
+        cast(avg(a.Score) filter (where a.Id is not null) as numeric(10,2)) as AverageAnswerScore
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.Score, q.ViewCount, q.Tags
+),
+UserActivityWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        coalesce(sum(vt.UpVotes),0) as TotalUpVotes,
+        coalesce(sum(vt.DownVotes),0) as TotalDownVotes,
+        row_number() over (order by count(p.Id) filter (where p.PostTypeId = 1) desc) as UserRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join (
+        select
+            p.OwnerUserId,
+            sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+            sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes
+        from Posts p
+        left join Votes v on v.PostId = p.Id
+        group by p.OwnerUserId
+    ) vt on vt.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName
+),
+QuestionsWithComplexTags as (
+    select
+        q.Id,
+        q.Title,
+        q.Tags,
+        unnest(string_to_array(substring(q.Tags from 2 for char_length(q.Tags) - 2), '><')) as Tag,
+        q.Score
+    from Posts q
+    where q.PostTypeId = 1 and q.Tags is not null and q.Tags <> ''
+),
+TagCounts as (
+    select Tag, count(*) as TagUseCount
+    from QuestionsWithComplexTags
+    group by Tag
+),
+FinalSelection as (
+    select distinct
+        quct.Id as QuestionId,
+        quct.Title,
+        quct.Tag,
+        tc.TagUseCount,
+        quct.Score as QuestionScore,
+        jas.AnswerCount,
+        jas.HighestAnswerScore,
+        jas.AverageAnswerScore,
+        uaw.DisplayName as OwnerName,
+        uaw.QuestionCount,
+        uaw.AnswerCount as UserAnswerCount,
+        topBadge.BadgeName,
+        topBadge.Class as BadgeClass,
+        pld.LinkTypeName,
+        case 
+            when pld.RelatedPostId is null then 'No Related Post' 
+            else pld.RelatedPostTitle 
+        end as RelatedPostTitle,
+        row_number() over (partition by quct.Tag order by quct.Score desc) as TagRank
+    from QuestionsWithComplexTags quct
+    left join TagCounts tc on tc.Tag = quct.Tag
+    left join QuestionAnswerStats jas on jas.QuestionId = quct.Id
+    left join Users u on u.Id = (select OwnerUserId from Posts where Id = quct.Id)
+    left join UserActivityWindow uaw on uaw.UserId = u.Id
+    left join TopUserBadges topBadge on topBadge.UserId = u.Id and topBadge.BadgeRank = 1
+    left join PostLinkDetails pld on pld.PostId = quct.Id and pld.LinkTypeId = 3
+)
+select *
+from FinalSelection
+where TagRank <= 3 and TagUseCount > 50
+order by Tag, QuestionScore desc, AnswerCount desc;

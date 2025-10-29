@@ -1,0 +1,220 @@
+WITH UserPostStats AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(p.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsOwned,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersOwned,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostScoreByOwner,
+        AVG(COALESCE(p.Score, 0)) AS AvgPostScoreByOwner,
+        SUM(COALESCE(p.ViewCount, 0)) AS TotalPostViewsByOwner,
+        SUM(COALESCE(p.FavoriteCount, 0)) AS TotalFavoriteCountByOwner
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+PostDetailsExtended AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.LastActivityDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount AS DirectCommentCount,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        COALESCE(
+            NULLIF(TRIM(SUBSTRING(p.Tags FROM 2 FOR CASE WHEN POSITION('><' IN p.Tags) > 0 THEN POSITION('><' IN p.Tags) - 2 ELSE CHAR_LENGTH(p.Tags) - 2 END)), ''),
+            'untagged'
+        ) AS PrimaryTag,
+        COALESCE(p.Title, '[Untitled Post]') AS PostTitle,
+        p.ClosedDate,
+        (SELECT SUM(CASE WHEN v.VoteTypeId IN (2, 3) THEN 1 ELSE 0 END) FROM Votes v WHERE v.PostId = p.Id) AS TotalVotesFromTable,
+        EXISTS (SELECT 1 FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (17, 35, 36)) AS WasMigrated,
+        CASE
+            WHEN p.ViewCount > 0 THEN (SELECT COUNT(v_inner.Id) FROM Votes v_inner WHERE v_inner.PostId = p.Id AND v_inner.VoteTypeId IN (2,3))::numeric / p.ViewCount
+            ELSE 0.0
+        END AS VoteToViewRatio,
+        EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS timestamp) - COALESCE(p.LastActivityDate, p.CreationDate))) AS DaysSinceLastActivity,
+        (SELECT COUNT(DISTINCT ph_editors.UserId) FROM PostHistory ph_editors WHERE ph_editors.PostId = p.Id AND ph_editors.PostHistoryTypeId IN (4, 5, 6)) AS DistinctEditorCount
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+PostEngagementSummary AS (
+    SELECT
+        pde.PostId,
+        pde.PostTypeId,
+        pde.OwnerUserId,
+        pde.PrimaryTag,
+        pde.PostScore,
+        pde.PostTitle,
+        pde.TotalVotesFromTable,
+        pde.VoteToViewRatio,
+        pde.DaysSinceLastActivity,
+        pde.DistinctEditorCount,
+        pde.WasMigrated,
+        COUNT(DISTINCT c.Id) AS TotalCommentsOnPost,
+        SUM(COALESCE(c.Score, 0)) AS TotalCommentScoreOnPost,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6, 8) THEN 1 ELSE 0 END) AS TotalEditEvents,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS TotalCloseEvents,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS TotalReopenEvents,
+        RANK() OVER (PARTITION BY pde.PrimaryTag ORDER BY pde.PostScore DESC, pde.PostCreationDate DESC) AS PostRankInTag
+    FROM PostDetailsExtended pde
+    LEFT JOIN Comments c ON pde.PostId = c.PostId
+    LEFT JOIN PostHistory ph ON pde.PostId = ph.PostId
+    GROUP BY
+        pde.PostId, pde.PostTypeId, pde.OwnerUserId, pde.PrimaryTag, pde.PostScore, pde.PostTitle,
+        pde.TotalVotesFromTable, pde.VoteToViewRatio, pde.DaysSinceLastActivity, pde.DistinctEditorCount, pde.WasMigrated, pde.PostCreationDate
+),
+UserOverallMetrics AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.Location,
+        u.UpVotes AS UpVotesGiven,
+        u.DownVotes AS DownVotesGiven,
+        ups.TotalPostsOwned,
+        ups.QuestionsOwned,
+        ups.AnswersOwned,
+        ups.TotalPostScoreByOwner,
+        ups.AvgPostScoreByOwner,
+        ups.TotalPostViewsByOwner,
+        ups.TotalFavoriteCountByOwner,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COALESCE(SUM(CASE WHEN b.Class IN (1, 2) THEN 1 ELSE 0 END) * 1.0 / NULLIF(COUNT(DISTINCT b.Id), 0), 0.0) AS HighClassBadgeRatio,
+        EXISTS (SELECT 1 FROM Badges b_inner WHERE b_inner.UserId = u.Id AND b_inner.Name = 'Enthusiast') AS HasEnthusiastBadge
+    FROM Users u
+    LEFT JOIN UserPostStats ups ON u.Id = ups.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Location,
+        u.UpVotes, u.DownVotes, ups.TotalPostsOwned, ups.QuestionsOwned, ups.AnswersOwned,
+        ups.TotalPostScoreByOwner, ups.AvgPostScoreByOwner, ups.TotalPostViewsByOwner, ups.TotalFavoriteCountByOwner
+),
+WeightedUserInfluence AS (
+    SELECT
+        uom.UserId,
+        uom.DisplayName,
+        uom.Reputation,
+        uom.TotalPostsOwned,
+        uom.QuestionsOwned,
+        uom.AnswersOwned,
+        uom.TotalBadges,
+        uom.GoldBadges,
+        uom.HighClassBadgeRatio,
+        uom.HasEnthusiastBadge,
+        SUM(COALESCE(pes.PostScore, 0)) AS SumOfPostScores,
+        SUM(COALESCE(pes.TotalCommentsOnPost, 0)) AS SumOfCommentsOnPosts,
+        SUM(COALESCE(pes.TotalEditEvents, 0)) AS SumOfEditEvents,
+        SUM(COALESCE(pes.TotalCloseEvents, 0)) AS SumOfCloseEvents,
+        SUM(COALESCE(pes.TotalReopenEvents, 0)) AS SumOfReopenEvents,
+        (
+            (uom.Reputation * 0.4) +
+            (COALESCE(uom.AvgPostScoreByOwner, 0.0) * 0.5) +
+            (COALESCE(SUM(pes.TotalVotesFromTable), 0) * 0.05) +
+            (COALESCE(SUM(pes.TotalCommentsOnPost), 0) * 0.02) +
+            (COALESCE(SUM(pes.TotalEditEvents), 0) * 0.01) +
+            (COALESCE(uom.HighClassBadgeRatio, 0.0) * 100) +
+            (COALESCE(uom.TotalFavoriteCountByOwner, 0) * 0.03) +
+            (COALESCE(CAST(uom.AnswersOwned AS numeric) / NULLIF(uom.QuestionsOwned + uom.AnswersOwned, 0), 0.0) * 50)
+        ) AS RawInfluenceScore,
+        'G:' || COALESCE(CAST(uom.GoldBadges AS VARCHAR), '0') ||
+        ',S:' || COALESCE(CAST(uom.SilverBadges AS VARCHAR), '0') ||
+        ',B:' || COALESCE(CAST(uom.BronzeBadges AS VARCHAR), '0') AS BadgeSummary
+    FROM UserOverallMetrics uom
+    LEFT JOIN PostEngagementSummary pes ON uom.UserId = pes.OwnerUserId
+    GROUP BY
+        uom.UserId, uom.DisplayName, uom.Reputation, uom.TotalPostsOwned, uom.QuestionsOwned, uom.AnswersOwned,
+        uom.TotalBadges, uom.GoldBadges, uom.HighClassBadgeRatio, uom.HasEnthusiastBadge,
+        uom.AvgPostScoreByOwner, uom.TotalFavoriteCountByOwner, uom.SilverBadges, uom.BronzeBadges
+),
+TopTagsByInfluence AS (
+    SELECT
+        PrimaryTag,
+        COUNT(PostId) AS TaggedPostsCount,
+        SUM(PostScore) AS TagTotalScore,
+        AVG(VoteToViewRatio) AS TagAvgVoteToViewRatio,
+        RANK() OVER (ORDER BY SUM(PostScore) DESC, COUNT(PostId) DESC) AS TagScoreRank
+    FROM PostEngagementSummary
+    WHERE PrimaryTag IS NOT NULL AND PrimaryTag != 'untagged'
+    GROUP BY PrimaryTag
+    HAVING COUNT(PostId) >= 10
+),
+NegativeImpactUsers AS (
+    (
+        SELECT v.UserId
+        FROM Votes v
+        WHERE v.VoteTypeId = 3
+        GROUP BY v.UserId
+        HAVING COUNT(*) > 50
+    )
+    EXCEPT
+    (
+        SELECT p.OwnerUserId AS UserId
+        FROM Posts p
+        WHERE p.PostTypeId = 2 AND p.AcceptedAnswerId IS NOT NULL
+        GROUP BY p.OwnerUserId
+    )
+    UNION
+    (
+        SELECT b.UserId
+        FROM Badges b
+        WHERE b.Class = 1
+        GROUP BY b.UserId
+    )
+)
+SELECT
+    wui.UserId,
+    wui.DisplayName,
+    wui.Reputation,
+    wui.TotalPostsOwned,
+    wui.QuestionsOwned,
+    wui.AnswersOwned,
+    wui.SumOfPostScores,
+    wui.SumOfCommentsOnPosts,
+    wui.SumOfEditEvents,
+    wui.SumOfCloseEvents,
+    wui.TotalBadges,
+    wui.GoldBadges,
+    wui.BadgeSummary,
+    wui.RawInfluenceScore,
+    RANK() OVER (ORDER BY wui.RawInfluenceScore DESC, wui.Reputation DESC) AS OverallInfluenceRank,
+    COALESCE(CAST(wui.Reputation AS numeric) / NULLIF(MAX(uom.Reputation) OVER (PARTITION BY uom.Location), 0), 0.0) AS RepPercentageInLocation,
+    AVG(wui.RawInfluenceScore) OVER (
+        ORDER BY uom.UserCreationDate
+        BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+    ) AS AvgInfluenceScoreAroundJoinDate,
+    (
+        SELECT ttb.PrimaryTag
+        FROM PostEngagementSummary pes_inner
+        JOIN TopTagsByInfluence ttb ON pes_inner.PrimaryTag = ttb.PrimaryTag
+        WHERE pes_inner.OwnerUserId = wui.UserId
+        GROUP BY ttb.PrimaryTag, ttb.TagScoreRank
+        ORDER BY COUNT(pes_inner.PostId) DESC, ttb.TagScoreRank ASC
+        LIMIT 1
+    ) AS MostInfluentialTagContributed,
+    CASE
+        WHEN wui.UserId IN (SELECT UserId FROM NegativeImpactUsers) AND wui.Reputation > 1000 THEN 'HighReputationNegative'
+        WHEN wui.UserId IN (SELECT UserId FROM NegativeImpactUsers) THEN 'NegativeImpactUser'
+        ELSE 'PositiveContributor'
+    END AS UserContributionCategorization
+FROM WeightedUserInfluence wui
+INNER JOIN UserOverallMetrics uom ON wui.UserId = uom.UserId
+WHERE
+    wui.TotalPostsOwned > 0
+    AND wui.Reputation > 100
+GROUP BY
+    wui.UserId, wui.DisplayName, wui.Reputation, wui.TotalPostsOwned, wui.QuestionsOwned, wui.AnswersOwned,
+    wui.SumOfPostScores, wui.SumOfCommentsOnPosts, wui.SumOfEditEvents, wui.SumOfCloseEvents,
+    wui.TotalBadges, wui.GoldBadges, wui.BadgeSummary, wui.RawInfluenceScore,
+    uom.UserCreationDate, uom.Reputation, uom.Location, uom.UserId
+ORDER BY OverallInfluenceRank ASC, wui.Reputation DESC
+LIMIT 100;

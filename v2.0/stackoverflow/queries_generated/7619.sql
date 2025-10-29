@@ -1,0 +1,234 @@
+-- {"query": "7619.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2314} 
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.CreationDate,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Elite'
+            WHEN u.Reputation >= 1000 THEN 'Veteran'
+            WHEN u.Reputation >= 100 THEN 'Member'
+            ELSE 'Newbie'
+        END as ReputationTier,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) as ReputationRank,
+        AVG(p.Score) as AvgPostScore,
+        STRING_AGG(DISTINCT CASE WHEN p.PostTypeId = 1 THEN 'Q' WHEN p.PostTypeId = 2 THEN 'A' ELSE 'O' END, ',') as PostTypes
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.Reputation, u.CreationDate, u.DisplayName
+),
+PostMetrics AS (
+    SELECT 
+        p.Id as PostId,
+        p.PostTypeId,
+        p.ParentId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 
+                CASE 
+                    WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+                    WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+                    WHEN p.AnswerCount > 0 THEN 'Has Answers'
+                    ELSE 'Unanswered'
+                END
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as PostStatus,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as UserPostRank,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) as ScoreRank,
+        NTILE(100) OVER (ORDER BY p.ViewCount DESC) as ViewDecile,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PrevScore,
+        LAG(p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PrevPostDate,
+        (p.Score - LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate)) as ScoreChange,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2 THEN 
+                (LENGTH(p.Tags) - LENGTH(REPLACE(p.Tags, '><', '')) + 1)
+            ELSE 0
+        END as TagCount
+    FROM Posts p
+),
+UserActivity AS (
+    SELECT 
+        u.Id as UserId,
+        COUNT(DISTINCT ph.Id) as HistoryCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (1, 2, 3) THEN ph.Id END) as EditCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Id END) as CloseCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 12 THEN ph.Id END) as DeleteCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 13 THEN ph.Id END) as UndeleteCount,
+        STRING_AGG(DISTINCT ph.PostHistoryTypeId::VARCHAR, ',') as HistoryTypes
+    FROM Users u
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId OR u.Id = ph.UserId
+    GROUP BY u.Id
+),
+TagPopularity AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as PopularityRank,
+        AVG(p.Score) as AvgScore,
+        COUNT(p.Id) as PostsWithTag
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    GROUP BY t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId
+)
+SELECT 
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.ReputationTier,
+    us.PostCount,
+    us.CommentCount,
+    us.BadgeCount,
+    us.ReputationRank,
+    us.AvgPostScore,
+    us.PostTypes,
+    pm.PostId,
+    pm.PostTypeId,
+    pm.Title,
+    pm.Score,
+    pm.ViewCount,
+    pm.PostStatus,
+    pm.TagCount,
+    pm.ScoreChange,
+    pm.ScoreRank,
+    pm.ViewDecile,
+    ua.HistoryCount,
+    ua.EditCount,
+    ua.CloseCount,
+    ua.DeleteCount,
+    ua.UndeleteCount,
+    tp.TagName,
+    tp.TagCount as TagPopularity,
+    tp.PopularityRank,
+    tp.AvgScore as TagAvgScore,
+    CASE 
+        WHEN us.PostCount > 0 AND us.Reputation > 1000 THEN 
+            ROUND((CAST(us.CommentCount AS REAL) / CAST(us.PostCount AS REAL)) * 100, 2)
+        ELSE NULL
+    END as CommentsPerPostRatio,
+    CASE 
+        WHEN pm.ScoreChange IS NOT NULL AND pm.PrevScore IS NOT NULL AND pm.PrevScore != 0 THEN
+            ROUND(((CAST(pm.ScoreChange AS REAL) / CAST(pm.PrevScore AS REAL)) * 100), 2)
+        ELSE NULL
+    END as ScoreGrowthRate,
+    CASE 
+        WHEN pm.UserPostRank = 1 AND us.PostCount > 5 THEN 'Top Poster'
+        WHEN pm.UserPostRank = 1 AND pm.PostStatus = 'Answered' THEN 'Top Answerer'
+        WHEN pm.UserPostRank = 1 AND pm.PostStatus = 'Closed' THEN 'Top Closer'
+        ELSE NULL
+    END as ActivityType,
+    CASE 
+        WHEN pm.PostTypeId = 1 AND pm.PostStatus = 'Answered' THEN 
+            (SELECT COUNT(*) FROM Posts p2 WHERE p2.ParentId = pm.PostId)
+        ELSE NULL
+    END as AnswerCountForQuestion,
+    CASE 
+        WHEN pm.ViewCount > 10000 AND pm.Score > 100 THEN 'Trending'
+        WHEN pm.ViewCount > 5000 AND pm.Score > 50 THEN 'Popular'
+        WHEN pm.ViewCount > 1000 AND pm.Score > 10 THEN 'Moderate'
+        ELSE 'Low'
+    END as PostCategory,
+    -- Complex NULL handling and conditional logic
+    CASE 
+        WHEN us.Reputation >= 10000 AND us.PostCount > 100 AND us.BadgeCount > 50 THEN 'Super Elite'
+        WHEN us.Reputation >= 5000 AND us.PostCount > 50 AND us.BadgeCount > 25 THEN 'Elite'
+        WHEN us.Reputation >= 2000 AND us.PostCount > 20 AND us.BadgeCount > 10 THEN 'Veteran'
+        ELSE 'Regular'
+    END as UserClassification,
+    -- Correlated subquery with window functions
+    (SELECT COUNT(*) 
+     FROM Posts p3 
+     WHERE p3.OwnerUserId = us.UserId 
+       AND p3.CreationDate > '2023-01-01' 
+       AND EXISTS (
+           SELECT 1 
+           FROM PostHistory ph3 
+           WHERE ph3.PostId = p3.Id 
+             AND ph3.CreationDate > '2023-01-01'
+       )
+    ) as RecentActivePosts,
+    -- Set operator usage with multiple UNIONs
+    CASE 
+        WHEN pm.TagCount > 0 THEN 
+            (SELECT STRING_AGG(DISTINCT SUBSTRING(pm.Tags, 3, LENGTH(pm.Tags) - 4), ',') 
+             FROM Posts p4 
+             WHERE p4.Id = pm.PostId AND pm.Tags IS NOT NULL
+             UNION
+             SELECT STRING_AGG(t.TagName, ',') 
+             FROM Tags t 
+             WHERE t.TagName IN (SELECT UNNEST(STRING_TO_ARRAY(pm.Tags, '><')) WHERE NOT (UNNEST = '' OR UNNEST IS NULL))
+            )
+        ELSE NULL
+    END as ExtractedTags,
+    -- String manipulation and expressions
+    CASE 
+        WHEN us.DisplayName IS NOT NULL AND LENGTH(us.DisplayName) > 15 THEN 
+            CONCAT(UPPER(SUBSTRING(us.DisplayName, 1, 15)), '...')
+        ELSE COALESCE(us.DisplayName, 'Anonymous')
+    END as ShortDisplayName,
+    -- Window function with complex partitioning
+    AVG(pm.Score) OVER (
+        PARTITION BY us.UserId, pm.PostTypeId 
+        ORDER BY pm.CreationDate 
+        ROWS BETWEEN 5 PRECEDING AND CURRENT ROW
+    ) as RollingAvgScore,
+    -- Conditional aggregation
+    SUM(CASE WHEN pm.PostTypeId = 1 THEN pm.ViewCount ELSE 0 END) OVER (PARTITION BY us.UserId) as TotalQuestionViews,
+    SUM(CASE WHEN pm.PostTypeId = 2 THEN pm.ViewCount ELSE 0 END) OVER (PARTITION BY us.UserId) as TotalAnswerViews
+FROM UserStats us
+INNER JOIN PostMetrics pm ON us.UserId = pm.OwnerUserId
+LEFT JOIN UserActivity ua ON us.UserId = ua.UserId
+LEFT JOIN TagPopularity tp ON (
+    EXISTS (
+        SELECT 1 FROM Posts p5 
+        WHERE p5.Id = pm.PostId 
+          AND p5.Tags LIKE '%' || tp.TagName || '%'
+    )
+)
+WHERE (
+    us.Reputation > 500 OR 
+    (us.PostCount > 10 AND us.CommentCount > 10) OR
+    (pm.Score > 100 AND pm.ViewCount > 1000)
+)
+AND (
+    pm.PostTypeId IN (1, 2) OR 
+    pm.PostStatus IN ('Answered', 'Closed')
+)
+AND (
+    ua.HistoryCount >= 100 OR 
+    COALESCE(pm.ScoreChange, 0) > 50 OR
+    ua.DeleteCount > 5
+)
+AND (
+    tp.TagCount > 100 OR 
+    tp.PopularityRank <= 5
+)
+AND (
+    LENGTH(pm.Title) >= 10 OR 
+    pm.Title IS NULL
+)
+AND EXISTS (
+    SELECT 1 
+    FROM Posts p6 
+    WHERE p6.OwnerUserId = us.UserId 
+      AND p6.CreationDate >= DATEADD('month', -6, CURRENT_DATE)
+)
+ORDER BY us.ReputationRank, pm.Score DESC, pm.CreationDate DESC
+LIMIT 5000;

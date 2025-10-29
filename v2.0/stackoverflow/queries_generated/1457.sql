@@ -1,0 +1,178 @@
+-- {"query": "1457.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3013} 
+
+WITH UserInteractionSummary AS (
+    -- Summarizes user activity: post counts, comment counts, vote counts (received and cast), and latest activity
+    SELECT
+        U.Id AS UserId,
+        U.Reputation,
+        U.DisplayName,
+        U.CreationDate AS UserCreationDate,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS UserTotalUpVotesCast, -- UpVotes *cast by* the user
+        U.DownVotes AS UserTotalDownVotesCast, -- DownVotes *cast by* the user
+        MAX(COALESCE(P.LastActivityDate, C.CreationDate, B.Date, V_Received.CreationDate, V_Cast.CreationDate)) AS LastActivityDate,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsOwned,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersOwned,
+        COUNT(DISTINCT C.Id) AS TotalCommentsOwned, -- comments *by* the user
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(CASE WHEN V_Received.VoteTypeId IN (2, 8, 16) THEN 1 ELSE 0 END) AS TotalUpVotesReceivedByPosts, -- UpMod, BountyStart, ApproveEditSuggestion on posts *owned by* the user
+        SUM(CASE WHEN V_Received.VoteTypeId IN (3, 10, 12) THEN 1 ELSE 0 END) AS TotalDownVotesReceivedByPosts, -- DownMod, Deletion, Spam on posts *owned by* the user
+        SUM(CASE WHEN V_Received.VoteTypeId = 1 THEN 1 ELSE 0 END) AS TotalAcceptedAnswersReceived -- Accepted by originator on posts *owned by* the user
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN Votes V_Received ON P.Id = V_Received.PostId -- Votes received on user's posts
+    LEFT JOIN Votes V_Cast ON U.Id = V_Cast.UserId -- Votes cast by the user
+    GROUP BY U.Id, U.Reputation, U.DisplayName, U.CreationDate, U.Views, U.UpVotes, U.DownVotes
+),
+PostDetails AS (
+    -- Aggregates details for each post, including edit history and related posts
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount AS DirectCommentCount, -- This is a direct column in Posts, not from Comments table
+        P.FavoriteCount,
+        P.ClosedDate,
+        LENGTH(P.Body) AS BodyLength,
+        LENGTH(P.Title) AS TitleLength,
+        COALESCE(P.Tags, '') AS TagsString,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4,5,6) THEN 1 ELSE 0 END) AS EditCount, -- Title, Body, Tags edits
+        MAX(PH.CreationDate) AS LastEditDateFromHistory,
+        CAST(SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS NUMERIC) / NULLIF(COUNT(V.Id), 0) AS UpVoteRatio,
+        COUNT(DISTINCT PL_Linked.RelatedPostId) AS LinkedPostCount,
+        COUNT(DISTINCT PL_Duplicate.RelatedPostId) AS DuplicatePostCount,
+        EXTRACT(EPOCH FROM (P.LastActivityDate - P.CreationDate)) / 3600 AS HoursSinceCreationToLastActivity, -- In hours
+        CASE
+            WHEN P.Tags LIKE '%<sql>%' THEN 'SQL Related'
+            WHEN P.Tags LIKE '%<database>%' OR P.Tags LIKE '%<db>%' THEN 'Database Related'
+            WHEN P.Tags LIKE '%<python>%' THEN 'Python Related'
+            WHEN P.Tags LIKE '%<java>%' THEN 'Java Related'
+            ELSE 'Other Programming'
+        END AS TagCategory
+    FROM Posts P
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    LEFT JOIN Votes V ON P.Id = V.PostId AND V.VoteTypeId IN (1,2,3,4,5,6,7,10,11,12) -- All relevant vote types for general engagement
+    LEFT JOIN PostLinks PL_Linked ON P.Id = PL_Linked.PostId AND PL_Linked.LinkTypeId = 1 -- Linked posts
+    LEFT JOIN PostLinks PL_Duplicate ON P.Id = PL_Duplicate.PostId AND PL_Duplicate.LinkTypeId = 3 -- Duplicate posts
+    GROUP BY
+        P.Id, P.PostTypeId, P.OwnerUserId, P.CreationDate, P.Score, P.ViewCount, P.AnswerCount,
+        P.CommentCount, P.FavoriteCount, P.ClosedDate, P.Body, P.Title, P.Tags, P.LastActivityDate
+),
+RankedPosts AS (
+    -- Ranks user's posts based on a combined score and identifies their 'best' question and answer
+    SELECT
+        PD.*,
+        ROW_NUMBER() OVER(PARTITION BY PD.OwnerUserId, PD.PostTypeId ORDER BY PD.PostScore DESC, PD.ViewCount DESC, PD.AnswerCount DESC) AS RnPostTypeRank,
+        SUM(PD.PostScore) OVER(PARTITION BY PD.OwnerUserId) AS UserTotalPostScore,
+        AVG(PD.PostScore) OVER(PARTITION BY PD.OwnerUserId) AS UserAvgPostScore,
+        NTILE(10) OVER(ORDER BY PD.PostScore DESC, PD.ViewCount DESC) AS PostScoreDecile,
+        LAG(PD.PostCreationDate, 1, PD.PostCreationDate) OVER(PARTITION BY PD.OwnerUserId ORDER BY PD.PostCreationDate) AS PrevPostCreationDate,
+        EXTRACT(EPOCH FROM (PD.PostCreationDate - LAG(PD.PostCreationDate, 1, PD.PostCreationDate) OVER(PARTITION BY PD.OwnerUserId ORDER BY PD.PostCreationDate))) / (24 * 3600) AS DaysSinceLastPost -- In days
+    FROM PostDetails PD
+    WHERE PD.OwnerUserId IS NOT NULL AND PD.PostTypeId IN (1, 2)
+),
+UserBadgeBreakdown AS (
+    -- Counts different classes of badges for each user
+    SELECT
+        U.Id AS UserId,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Users U
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id
+),
+CorrelatedPostChecks AS (
+    -- Checks for specific conditions on posts (e.g., highly edited, controversial)
+    SELECT
+        P.PostId,
+        P.OwnerUserId AS PostOwnerId,
+        CASE
+            WHEN P.EditCount > 5 AND P.PostScore < 0 THEN 'HighlyEditedControversial'
+            WHEN P.ClosedDate IS NOT NULL AND P.PostScore > 50 AND P.PostTypeId = 1 THEN 'HighScoreClosedQuestion'
+            WHEN P.ViewCount > 100000 AND P.AnswerCount = 0 AND P.PostTypeId = 1 THEN 'HighlyViewedUnanswered'
+            WHEN P.BodyLength < 100 AND P.PostScore > 100 AND P.PostTypeId = 2 THEN 'ConciseHighScoreAnswer'
+            ELSE NULL
+        END AS SpecialPostType
+    FROM RankedPosts P
+    WHERE P.RnPostTypeRank = 1
+)
+SELECT
+    UIS.UserId,
+    U.DisplayName,
+    U.Reputation,
+    UIS.UserProfileViews,
+    UIS.LastActivityDate,
+    UIS.TotalPostsOwned,
+    UIS.TotalQuestionsOwned,
+    UIS.TotalAnswersOwned,
+    UIS.TotalCommentsOwned,
+    UIS.TotalBadges,
+    UBB.GoldBadges,
+    UBB.SilverBadges,
+    UBB.BronzeBadges,
+    COALESCE(TOP_Q.PostId, -1) AS TopQuestionId,
+    COALESCE(TOP_Q.PostScore, 0) AS TopQuestionScore,
+    COALESCE(TOP_Q.TitleLength, 0) AS TopQuestionTitleLength,
+    COALESCE(TOP_Q.TagsString, 'N/A') AS TopQuestionTags,
+    COALESCE(TOP_Q.ViewCount, 0) AS TopQuestionViewCount,
+    COALESCE(TOP_Q.DaysSinceLastPost, 0) AS DaysBetweenTopQAndPrevPost,
+    COALESCE(TOP_A.PostId, -1) AS TopAnswerId,
+    COALESCE(TOP_A.PostScore, 0) AS TopAnswerScore,
+    COALESCE(TOP_A.BodyLength, 0) AS TopAnswerBodyLength,
+    COALESCE(TOP_A.UpVoteRatio, 0.0) AS TopAnswerUpVoteRatio,
+    UIS.TotalUpVotesReceivedByPosts,
+    UIS.TotalDownVotesReceivedByPosts,
+    UIS.TotalAcceptedAnswersReceived,
+    TOP_Q.PostScoreDecile AS TopQuestionScoreDecile,
+    TOP_A.PostScoreDecile AS TopAnswerScoreDecile,
+    (SELECT COUNT(DISTINCT PH.PostId)
+     FROM PostHistory PH
+     WHERE PH.UserId = U.Id
+       AND PH.PostHistoryTypeId IN (4, 5, 6)
+       AND PH.PostId NOT IN (SELECT P_Inner.Id FROM Posts P_Inner WHERE P_Inner.OwnerUserId = U.Id)
+    ) AS EditsOnOthersPostsCount,
+    (SELECT SUM(V_Bounty.BountyAmount)
+     FROM Votes V_Bounty
+     WHERE V_Bounty.UserId = U.Id AND V_Bounty.VoteTypeId = 8
+    ) AS TotalBountyGiven,
+    (SELECT COALESCE(CPC.SpecialPostType, 'None')
+     FROM CorrelatedPostChecks CPC
+     WHERE CPC.PostOwnerId = U.Id
+       AND CPC.SpecialPostType IS NOT NULL
+     LIMIT 1
+    ) AS HasSpecialPostCondition,
+    CASE
+        WHEN U.Reputation > 10000 AND UIS.TotalPostsOwned > 100 THEN 'Veteran_HighRep_Contributor'
+        WHEN U.LastAccessDate > NOW() - INTERVAL '30 days' AND UIS.TotalCommentsOwned > 10 AND U.Reputation > 500 THEN 'ActiveCommenter_Engaged'
+        WHEN UIS.TotalQuestionsOwned > UIS.TotalAnswersOwned * 2 AND U.Reputation > 200 THEN 'Question_Heavy_Initiator'
+        WHEN U.Location IS NULL OR TRIM(U.Location) = '' THEN 'Location_Unknown'
+        WHEN U.AboutMe IS NOT NULL AND LENGTH(U.AboutMe) > 200 THEN 'Detailed_AboutMe'
+        ELSE 'General_User'
+    END AS UserCategory,
+    EXTRACT(EPOCH FROM (UIS.LastActivityDate - UIS.UserCreationDate)) / (24 * 3600) AS DaysSinceCreationToLastActivity,
+    LOWER(U.DisplayName) LIKE '%moderator%' OR LOWER(U.DisplayName) LIKE '%admin%' AS IsModeratorOrAdminInName,
+    NULLIF(UIS.TotalQuestionsOwned, 0) / NULLIF(UIS.TotalAnswersOwned, 0) AS Q_to_A_Ratio,
+    (SELECT LENGTH(COALESCE(TQ_Body.Body, '')) - LENGTH(REPLACE(LOWER(COALESCE(TQ_Body.Body, '')), 'sql', '')) ) / 3 AS SqlKeywordCountInTopQBody
+FROM Users U
+LEFT JOIN UserInteractionSummary UIS ON U.Id = UIS.UserId
+LEFT JOIN RankedPosts TOP_Q ON U.Id = TOP_Q.OwnerUserId AND TOP_Q.PostTypeId = 1 AND TOP_Q.RnPostTypeRank = 1
+LEFT JOIN RankedPosts TOP_A ON U.Id = TOP_A.OwnerUserId AND TOP_A.PostTypeId = 2 AND TOP_A.RnPostTypeRank = 1
+LEFT JOIN UserBadgeBreakdown UBB ON U.Id = UBB.UserId
+WHERE
+    U.Reputation > 50
+    AND (
+        UIS.TotalPostsOwned > 0
+        OR UIS.TotalCommentsOwned > 0
+        OR U.Views > 100
+        OR UBB.GoldBadges > 0
+    )
+ORDER BY U.Reputation DESC, U.CreationDate ASC
+LIMIT 1000;

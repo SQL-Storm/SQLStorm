@@ -1,0 +1,191 @@
+-- {"query": "3069.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2656} 
+
+/*  Comprehensive benchmarking query for the StackOverflow data model */
+WITH 
+/* --------------------------------------------------------------
+   1. Aggregate badge counts per user (Gold, Silver, Bronze)
+   -------------------------------------------------------------- */
+BadgeAgg AS (
+    SELECT 
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+/* --------------------------------------------------------------
+   2. Count questions and answers posted by each user
+   -------------------------------------------------------------- */
+PostAgg AS (
+    SELECT 
+        p.OwnerUserId AS UserId,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        COUNT(*) FILTER (WHERE p.Score IS NOT NULL) AS TotalPosts,
+        AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL) AS AvgScore
+    FROM Posts p
+    GROUP BY p.OwnerUserId
+),
+
+/* --------------------------------------------------------------
+   3. Vote tallies per user (up‑votes and down‑votes they cast)
+   -------------------------------------------------------------- */
+VoteAgg AS (
+    SELECT 
+        v.UserId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesCast,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesCast
+    FROM Votes v
+    GROUP BY v.UserId
+),
+
+/* --------------------------------------------------------------
+   4. Recent activity dates (latest post activity and latest comment)
+   -------------------------------------------------------------- */
+RecentActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        GREATEST(
+            MAX(p.LastActivityDate)   FILTER (WHERE p.LastActivityDate IS NOT NULL),
+            MAX(c.CreationDate)       FILTER (WHERE c.CreationDate IS NOT NULL)
+        ) AS LastActivityDate
+    FROM Users u
+    LEFT JOIN Posts    p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId      = u.Id
+    GROUP BY u.Id
+),
+
+/* --------------------------------------------------------------
+   5. Tag‑centric statistics (post count, avg. score, top contributors)
+   -------------------------------------------------------------- */
+TagStats AS (
+    SELECT 
+        t.TagName,
+        COUNT(p.Id)                              AS TaggedPostCount,
+        AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL) AS AvgTagScore,
+        STRING_AGG(DISTINCT u.DisplayName, ', ') 
+            FILTER (WHERE u.Id IS NOT NULL) 
+            ORDER BY u.Reputation DESC
+            LIMIT 5                              AS TopContributors
+    FROM Tags t
+    LEFT JOIN Posts p 
+        ON p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+    LEFT JOIN Users u 
+        ON p.OwnerUserId = u.Id
+    GROUP BY t.TagName
+),
+
+/* --------------------------------------------------------------
+   6. Core user profile rows (joins the aggregates above)
+   -------------------------------------------------------------- */
+UserProfile AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        COALESCE(b.GoldBadges,   0)   AS GoldBadges,
+        COALESCE(b.SilverBadges, 0)   AS SilverBadges,
+        COALESCE(b.BronzeBadges, 0)   AS BronzeBadges,
+        COALESCE(p.QuestionCount, 0) AS QuestionCount,
+        COALESCE(p.AnswerCount,   0) AS AnswerCount,
+        COALESCE(p.TotalPosts,    0) AS TotalPosts,
+        COALESCE(p.AvgScore,      0) AS AvgPostScore,
+        COALESCE(v.UpVotesCast,   0) AS UpVotesCast,
+        COALESCE(v.DownVotesCast, 0) AS DownVotesCast,
+        ra.LastActivityDate,
+        CASE 
+            WHEN u.Reputation >= 20000 THEN 'Legend'
+            WHEN u.Reputation >= 10000 THEN 'Veteran'
+            WHEN u.Reputation >= 5000  THEN 'Experienced'
+            ELSE 'Member' 
+        END AS ReputationTier,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, p.QuestionCount DESC) AS RankByRep
+    FROM Users u
+    LEFT JOIN BadgeAgg      b  ON b.UserId = u.Id
+    LEFT JOIN PostAgg       p  ON p.UserId = u.Id
+    LEFT JOIN VoteAgg       v  ON v.UserId = u.Id
+    LEFT JOIN RecentActivity ra ON ra.UserId = u.Id
+),
+
+/* --------------------------------------------------------------
+   7. Users with *no* posts but with at least one badge (edge case)
+   -------------------------------------------------------------- */
+BadgeOnlyUsers AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(b.GoldBadges,   0) AS GoldBadges,
+        COALESCE(b.SilverBadges, 0) AS SilverBadges,
+        COALESCE(b.BronzeBadges, 0) AS BronzeBadges,
+        0 AS QuestionCount,
+        0 AS AnswerCount,
+        0 AS TotalPosts,
+        0 AS AvgPostScore,
+        0 AS UpVotesCast,
+        0 AS DownVotesCast,
+        NULL AS LastActivityDate,
+        'BadgeOnly' AS ReputationTier,
+        NULL AS RankByRep
+    FROM Users u
+    LEFT JOIN BadgeAgg b ON b.UserId = u.Id
+    WHERE NOT EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id)
+      AND (b.GoldBadges + b.SilverBadges + b.BronzeBadges) > 0
+),
+
+/* --------------------------------------------------------------
+   8. Union of “active” users and “badge‑only” users for final set
+   -------------------------------------------------------------- */
+CombinedUsers AS (
+    SELECT * FROM UserProfile
+    UNION ALL
+    SELECT * FROM BadgeOnlyUsers
+)
+
+SELECT 
+    cu.Id,
+    cu.DisplayName,
+    cu.Reputation,
+    cu.ReputationTier,
+    cu.RankByRep,
+    cu.GoldBadges,
+    cu.SilverBadges,
+    cu.BronzeBadges,
+    cu.QuestionCount,
+    cu.AnswerCount,
+    cu.TotalPosts,
+    ROUND(cu.AvgPostScore, 2) AS AvgPostScore,
+    cu.UpVotesCast,
+    cu.DownVotesCast,
+    cu.LastActivityDate,
+    /* Pull the most “interesting” tag for the user – the one 
+       with highest average score among tags they have contributed to */
+    ts.TagName,
+    ts.TaggedPostCount,
+    ROUND(ts.AvgTagScore, 2) AS AvgTagScore,
+    ts.TopContributors
+FROM CombinedUsers cu
+LEFT JOIN LATERAL (
+    SELECT 
+        t.TagName,
+        t.TaggedPostCount,
+        t.AvgTagScore,
+        t.TopContributors
+    FROM TagStats t
+    WHERE t.TagName IN (
+        SELECT regexp_replace(regexp_replace(p.Tags, '^<', ''), '>$', '')
+        FROM Posts p
+        WHERE p.OwnerUserId = cu.Id
+    )
+    ORDER BY t.AvgTagScore DESC NULLS LAST
+    LIMIT 1
+) ts ON TRUE
+WHERE cu.RankByRep IS NULL       -- include badge‑only users (no rank)
+   OR cu.RankByRep <= 200       -- top‑200 users by reputation
+ORDER BY 
+    CASE WHEN cu.RankByRep IS NULL THEN 999999 ELSE cu.RankByRep END,
+    cu.Reputation DESC;

@@ -1,0 +1,246 @@
+-- {"query": "234.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2416} 
+with recent_posts as (
+  select
+    p.id,
+    p.posttypeid,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.ownweruserid,
+    p.title,
+    p.tags,
+    p.answercount,
+    p.commentcount,
+    p.favoritecount,
+    p.closeddate,
+    p.lastactivitydate,
+    p.acceptedanswerid,
+    p.parentid
+  from posts p
+  where p.creationdate >= (select date_trunc('month', max(creationdate)) - interval '6 months' from posts)
+),
+user_activity as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate as user_created,
+    u.location,
+    coalesce(nullif(trim(split_part(coalesce(u.websiteurl, ''), '/', 3)), ''), 'unknown') as user_domain,
+    sum(coalesce(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end,0)) as net_votes_cast,
+    count(distinct case when v.votetypeid in (2,3) then v.id end) as total_votes_cast,
+    count(distinct b.id) filter (where b.class = 1) as gold_badges,
+    count(distinct b.id) filter (where b.class = 2) as silver_badges,
+    count(distinct b.id) filter (where b.class = 3) as bronze_badges,
+    max(b.date) as last_badge_date
+  from users u
+  left join votes v on v.userid = u.id and v.creationdate >= (select date_trunc('month', max(creationdate)) - interval '6 months' from votes)
+  left join badges b on b.userid = u.id
+  group by u.id, u.displayname, u.reputation, u.creationdate, u.location, coalesce(nullif(trim(split_part(coalesce(u.websiteurl, ''), '/', 3)), ''), 'unknown')
+),
+post_engagement as (
+  select
+    rp.id as post_id,
+    rp.posttypeid,
+    rp.creationdate,
+    rp.score,
+    rp.viewcount,
+    rp.owneruserid,
+    rp.title,
+    rp.tags,
+    rp.answercount,
+    rp.commentcount,
+    rp.favoritecount,
+    rp.acceptedanswerid,
+    rp.parentid,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    count(distinct c.id) as comments,
+    count(distinct pl.id) filter (where pl.linktypeid = 3) as duplicates_marked,
+    count(distinct pl.id) filter (where pl.linktypeid = 1) as links_out,
+    max(c.creationdate) as last_comment_date
+  from recent_posts rp
+  left join votes v on v.postid = rp.id
+  left join comments c on c.postid = rp.id
+  left join postlinks pl on pl.postid = rp.id
+  group by rp.id, rp.posttypeid, rp.creationdate, rp.score, rp.viewcount, rp.owneruserid, rp.title, rp.tags, rp.answercount, rp.commentcount, rp.favoritecount, rp.acceptedanswerid, rp.parentid
+),
+tag_expansion as (
+  select
+    pe.post_id,
+  unnest(string_to_array(substring(pe.tags from 2 for length(pe.tags)-2), '><')) as tag
+  from post_engagement pe
+  where pe.posttypeid = 1 and pe.tags is not null and pe.tags like '<%>'
+),
+tag_stats as (
+  select
+    te.tag,
+    count(distinct pe.post_id) as q_count,
+    sum(pe.viewcount) as total_views,
+    avg(pe.score) as avg_score,
+    percentile_cont(0.9) within group (order by pe.viewcount) as p90_views
+  from tag_expansion te
+  join post_engagement pe on pe.post_id = te.post_id
+  group by te.tag
+),
+accepted_answerers as (
+  select
+    q.id as question_id,
+    a.owneruserid as answerer_id
+  from posts q
+  join posts a on a.id = q.acceptedanswerid and a.posttypeid = 2
+  where q.posttypeid = 1
+),
+user_post_summary as (
+  select
+    pe.owneruserid as user_id,
+    count(*) filter (where pe.posttypeid = 1) as questions_authored,
+    count(*) filter (where pe.posttypeid = 2) as answers_authored,
+    sum(pe.viewcount) filter (where pe.posttypeid = 1) as question_views,
+    sum(pe.score) as total_post_score,
+    sum(pe.upvotes - pe.downvotes) as net_votes_received,
+    count(*) filter (where pe.score > 0) as positive_posts,
+    count(*) filter (where pe.score < 0) as negative_posts,
+    count(distinct case when pe.posttypeid = 2 then pe.parentid end) as distinct_questions_answered,
+    count(distinct case when pe.posttypeid = 1 then pe.id end) filter (
+      where exists (
+        select 1
+        from posts a2
+        where a2.parentid = pe.id
+          and a2.posttypeid = 2
+          and a2.score >= 1
+      )
+    ) as questions_with_upvoted_answer
+  from post_engagement pe
+  group by pe.owneruserid
+),
+question_close_reasons as (
+  select
+    ph.postid as question_id,
+    max(ph.creationdate) as last_close_event_date,
+    max(case when ph.posthistorytypeid = 10 then ph.comment end) as last_close_reason_code_text,
+    sum(case when ph.posthistorytypeid = 10 then 1 else 0 end) as close_events
+  from posthistory ph
+  where ph.posthistorytypeid in (10, 11)
+  group by ph.postid
+),
+dup_clusters as (
+  select
+    greatest(pl.postid, pl.relatedpostid) as a,
+    least(pl.postid, pl.relatedpostid) as b,
+    min(pl.creationdate) as first_seen
+  from postlinks pl
+  where pl.linktypeid = 3
+  group by 1,2
+),
+cluster_roots as (
+  select
+    a as post_id
+  from dup_clusters
+  union
+  select
+    b as post_id
+  from dup_clusters
+),
+cluster_sizes as (
+  select
+    cr.post_id,
+    1 + (
+      select count(*)
+      from dup_clusters dc
+      where dc.a = cr.post_id or dc.b = cr.post_id
+    ) as cluster_size
+  from cluster_roots cr
+),
+top_users as (
+  select
+    ua.user_id,
+    ua.displayname,
+    ua.reputation,
+    ua.user_domain,
+    ua.location,
+    ua.net_votes_cast,
+    ups.questions_authored,
+    ups.answers_authored,
+    ups.question_views,
+    ups.total_post_score,
+    ups.net_votes_received,
+    coalesce(ua.gold_badges,0) as gold_badges,
+    coalesce(ua.silver_badges,0) as silver_badges,
+    coalesce(ua.bronze_badges,0) as bronze_badges,
+    row_number() over (order by coalesce(ups.total_post_score,0) desc, ua.reputation desc) as rn
+  from user_activity ua
+  left join user_post_summary ups on ups.user_id = ua.user_id
+)
+select
+  tu.user_id,
+  tu.displayname,
+  tu.reputation,
+  tu.user_domain,
+  tu.location,
+  tu.gold_badges,
+  tu.silver_badges,
+  tu.bronze_badges,
+  tu.questions_authored,
+  tu.answers_authored,
+  tu.question_views,
+  tu.total_post_score,
+  tu.net_votes_cast,
+  tu.net_votes_received,
+  -- normalized engagement metrics
+  round(100.0 * coalesce(tu.total_post_score,0) / nullif(tu.answers_authored + tu.questions_authored,0), 2) as avg_score_per_post,
+  round(100.0 * coalesce(tu.net_votes_received,0) / nullif(tu.answers_authored + tu.questions_authored,0), 2) as net_votes_per_post,
+  -- accepted answer rate for this user's answered questions
+  round(100.0 * (
+    select count(*)::numeric
+    from posts a
+    join posts q on q.id = a.parentid and q.posttypeid = 1
+    where a.posttypeid = 2
+      and a.owneruserid = tu.user_id
+      and q.acceptedanswerid = a.id
+  ) / nullif(coalesce(tu.answers_authored,0),0), 2) as accepted_answer_rate_pct,
+  -- top tags user interacted with (string_agg with window to stress)
+  (
+    select string_agg(tag || ':' || q_count::text, ', ' order by q_count desc)
+    from (
+      select ts.tag, ts.q_count
+      from tag_stats ts
+      where ts.tag in (
+        select distinct unnest(string_to_array(substring(p.tags from 2 for length(p.tags)-2), '><'))
+        from posts p
+        where p.owneruserid = tu.user_id
+          and p.posttypeid = 1
+      )
+      order by ts.q_count desc
+      limit 5
+    ) x
+  ) as top_tags_summary,
+  -- recent question signal with close reasons
+  (
+    select string_agg(coalesce(crt.name, 'Unknown') || ':' || to_char(qcr.last_close_event_date, 'YYYY-MM-DD'), '; ' order by qcr.last_close_event_date desc)
+    from question_close_reasons qcr
+    left join closerreasontypes crt on crt.id::text = nullif(qcr.last_close_reason_code_text,'')
+    where qcr.question_id in (
+      select p2.id from posts p2 where p2.posttypeid = 1 and p2.owneruserid = tu.user_id
+    )
+  ) as close_reason_timeline,
+  -- activity recency signal
+  (
+    select max(pe.last_comment_date)
+    from post_engagement pe
+    where pe.owneruserid = tu.user_id
+  ) as last_comment_seen,
+  -- duplicate cluster participation
+  (
+    select count(distinct cs.post_id) filter (where cs.cluster_size > 1)
+    from cluster_sizes cs
+    join posts p on p.id = cs.post_id
+    where p.owneruserid = tu.user_id
+  ) as dup_cluster_posts,
+  -- rolling window stats with window functions
+  avg(coalesce(ups2.total_post_score,0)) over (order by tu.rn rows between 10 preceding and current row) as rolling_avg_score,
+  sum(coalesce(ups2.answers_authored,0)) over (order by tu.rn rows between unbounded preceding and current row) as cumulative_answers
+from top_users tu
+left join user_post_summary ups2 on ups2.user_id = tu.user_id
+where tu.rn <= 200
+order by coalesce(tu.total_post_score,0) desc, tu.reputation desc;

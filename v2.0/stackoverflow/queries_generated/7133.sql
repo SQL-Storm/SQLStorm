@@ -1,0 +1,386 @@
+-- {"query": "7133.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 4571} 
+WITH PostStats AS (
+    SELECT 
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Title,
+        p.Tags,
+        p.Body,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS UserPostRank,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) AS TotalPostsByUser,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS AvgScoreByUser,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Question with Accepted Answer'
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NULL THEN 'Question without Accepted Answer'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostCategory,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) AS ScoreRank,
+        RANK() OVER (ORDER BY p.ViewCount DESC) AS ViewRank,
+        CASE 
+            WHEN p.Score > (SELECT AVG(Score) FROM Posts) THEN 'AboveAverage'
+            WHEN p.Score < (SELECT AVG(Score) FROM Posts) THEN 'BelowAverage'
+            ELSE 'Average'
+        END AS ScorePerformance,
+        COALESCE(p.Title, '') AS TitleOrEmpty,
+        COALESCE(p.Tags, '') AS TagsOrEmpty,
+        LENGTH(p.Body) AS BodyLength,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND LENGTH(p.Tags) > 0 THEN ARRAY_LENGTH(STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><'), 1)
+            ELSE 0
+        END AS NumberOfTags,
+        EXTRACT(YEAR FROM p.CreationDate) AS CreationYear,
+        EXTRACT(MONTH FROM p.CreationDate) AS CreationMonth,
+        CONCAT('Post_', p.Id, '_', p.OwnerUserId) AS PostIdentifier,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AnswerCount > 2 THEN 'HighlyAnsweredQuestion'
+            WHEN p.PostTypeId = 1 THEN 'RegularQuestion'
+            WHEN p.PostTypeId = 2 THEN 'RegularAnswer'
+            ELSE 'OtherPost'
+        END AS PostClassification,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousScore,
+        LEAD(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextScore,
+        PERCENT_RANK() OVER (ORDER BY p.Score) AS ScorePercentile,
+        NTILE(10) OVER (ORDER BY p.Score) AS ScoreDecile,
+        SUM(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ROWS UNBOUNDED PRECEDING) AS RunningTotalScore,
+        ROW_NUMBER() OVER (ORDER BY p.CreationDate) AS GlobalPostOrder,
+        CASE 
+            WHEN p.LastActivityDate IS NOT NULL AND (p.LastActivityDate - p.CreationDate) > INTERVAL '30 days' THEN 'LongLived'
+            WHEN (p.LastActivityDate - p.CreationDate) > INTERVAL '10 days' THEN 'MediumLived'
+            ELSE 'ShortLived'
+        END AS PostLifespanCategory
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserEngagement AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.LastAccessDate,
+        u.DisplayName,
+        COUNT(DISTINCT ps.PostId) AS TotalPosts,
+        AVG(ps.Score) AS AvgPostScore,
+        SUM(ps.Score) AS TotalScore,
+        COUNT(DISTINCT CASE WHEN ps.PostTypeId = 1 THEN ps.PostId END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN ps.PostTypeId = 2 THEN ps.PostId END) AS TotalAnswers,
+        MAX(ps.CreationDate) AS LatestPostDate,
+        MIN(ps.CreationDate) AS EarliestPostDate,
+        AVG(EXTRACT(EPOCH FROM (ps.LastActivityDate - ps.CreationDate))/86400) AS AvgActivityDurationDays,
+        STRING_AGG(DISTINCT ps.PostCategory, ', ') AS PostCategories,
+        STRING_AGG(DISTINCT ps.PostClassification, ', ') AS PostClassifications,
+        CASE 
+            WHEN COUNT(DISTINCT ps.PostId) > 100 THEN 'HighlyActive'
+            WHEN COUNT(DISTINCT ps.PostId) > 50 THEN 'ModeratelyActive'
+            WHEN COUNT(DISTINCT ps.PostId) > 10 THEN 'SlightlyActive'
+            ELSE 'Inactive'
+        END AS ActivityLevel,
+        COUNT(DISTINCT ps.PostId) FILTER (WHERE ps.Score > 100) AS HighScorePosts,
+        COUNT(DISTINCT ps.PostId) FILTER (WHERE ps.Score < 0) AS NegativeScorePosts,
+        COUNT(DISTINCT ps.PostId) FILTER (WHERE ps.ViewCount > 1000) AS PopularPosts,
+        AVG(ps.ViewCount) FILTER (WHERE ps.ViewCount > 500) AS AvgPopularPostViews,
+        MAX(ps.ViewCount) AS MaxPostViews,
+        MIN(ps.ViewCount) AS MinPostViews,
+        AVG(ps.AnswerCount) AS AvgAnswerCount,
+        SUM(ps.AnswerCount) AS TotalAnswersGiven,
+        AVG(ps.CommentCount) AS AvgCommentCount,
+        SUM(ps.CommentCount) AS TotalCommentsGiven,
+        AVG(ps.FavoriteCount) AS AvgFavoriteCount,
+        SUM(ps.FavoriteCount) AS TotalFavorites,
+        COUNT(DISTINCT ps.PostId) FILTER (WHERE ps.HasAcceptedAnswer = 1) AS QuestionsWithAcceptedAnswers,
+        AVG(CASE WHEN ps.HasAcceptedAnswer = 1 THEN ps.AnswerCount ELSE NULL END) AS AvgAnswerCountOnAccepted,
+        COUNT(DISTINCT ps.PostId) - COUNT(DISTINCT CASE WHEN ps.PostTypeId = 1 THEN ps.PostId END) AS NonQuestionPosts,
+        STRING_AGG(DISTINCT p.Title, ' | ') FILTER (WHERE ps.PostTypeId = 1) AS UserQuestionTitles
+    FROM Users u
+    JOIN PostStats ps ON u.Id = ps.OwnerUserId
+    LEFT JOIN (
+        SELECT DISTINCT PostId, 1 AS HasAcceptedAnswer 
+        FROM Posts 
+        WHERE AcceptedAnswerId IS NOT NULL
+    ) pa ON ps.PostId = pa.PostId
+    GROUP BY u.Id, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.LastAccessDate, u.DisplayName
+),
+TagAnalysis AS (
+    SELECT 
+        t.Id AS TagId,
+        t.TagName,
+        t.Count AS TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        COALESCE(p.Title, '') AS ExcerptTitle,
+        COALESCE(p.Tags, '') AS ExcerptTags,
+        COALESCE(p.Body, '') AS ExcerptBody,
+        CASE 
+            WHEN t.Count > 1000 THEN 'VeryPopular'
+            WHEN t.Count > 500 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'ModeratelyPopular'
+            ELSE 'LessPopular'
+        END AS PopularityLevel,
+        CASE 
+            WHEN t.Count > (SELECT AVG(Count) FROM Tags) THEN 'AboveAverage'
+            WHEN t.Count < (SELECT AVG(Count) FROM Tags) THEN 'BelowAverage'
+            ELSE 'Average'
+        END AS CountPerformance,
+        CASE 
+            WHEN t.IsRequired = 1 THEN 'RequiredTag'
+            WHEN t.IsModeratorOnly = 1 THEN 'ModeratorOnlyTag'
+            ELSE 'StandardTag'
+        END AS TagType,
+        LAG(t.Count, 1) OVER (ORDER BY t.Count DESC) AS PreviousTagCount,
+        LEAD(t.Count, 1) OVER (ORDER BY t.Count DESC) AS NextTagCount,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank,
+        DENSE_RANK() OVER (ORDER BY t.Count DESC) AS TagDenseRank,
+        PERCENT_RANK() OVER (ORDER BY t.Count) AS TagPercentile,
+        NTILE(5) OVER (ORDER BY t.Count) AS TagQuintile,
+        SUM(t.Count) OVER (ORDER BY t.Count DESC ROWS UNBOUNDED PRECEDING) AS RunningTagTotal,
+        CASE 
+            WHEN t.ExcerptPostId IS NOT NULL THEN 'HasExcerpt'
+            ELSE 'NoExcerpt'
+        END AS HasExcerpt,
+        CASE 
+            WHEN t.WikiPostId IS NOT NULL THEN 'HasWiki'
+            ELSE 'NoWiki'
+        END AS HasWiki,
+        COALESCE(LENGTH(p.Body), 0) AS ExcerptBodyLength,
+        CASE 
+            WHEN t.Count > (SELECT AVG(Count) FROM Tags) * 2 THEN 'SignificantlyAboveAverage'
+            WHEN t.Count > (SELECT AVG(Count) FROM Tags) THEN 'AboveAverage'
+            WHEN t.Count < (SELECT AVG(Count) FROM Tags) / 2 THEN 'SignificantlyBelowAverage'
+            ELSE 'Normal'
+        END AS TagCountCategory,
+        STRING_AGG(DISTINCT p.Title, ', ') AS AssociatedQuestions,
+        STRING_AGG(DISTINCT p.Tags, ', ') AS AssociatedTagStrings
+    FROM Tags t
+    LEFT JOIN Posts p ON t.ExcerptPostId = p.Id
+),
+TopPosts AS (
+    SELECT 
+        ps.PostId,
+        ps.OwnerUserId,
+        ps.Score,
+        ps.ViewCount,
+        ps.AnswerCount,
+        ps.CommentCount,
+        ps.FavoriteCount,
+        ps.Title,
+        ps.Tags,
+        ps.Body,
+        ps.PostCategory,
+        ps.ScorePerformance,
+        ps.ScoreRank,
+        ps.ViewRank,
+        ps.PostClassification,
+        ps.PostLifespanCategory,
+        ps.CreationYear,
+        ps.CreationMonth,
+        ps.TotalPostsByUser,
+        ps.AvgScoreByUser,
+        ps.UserPostRank,
+        u.DisplayName AS OwnerDisplayName,
+        u.Reputation AS OwnerReputation,
+        CASE 
+            WHEN ps.Score > (SELECT AVG(Score) FROM Posts) * 1.5 THEN 'Exceptional'
+            WHEN ps.Score > (SELECT AVG(Score) FROM Posts) THEN 'AboveAverage'
+            WHEN ps.Score < (SELECT AVG(Score) FROM Posts) * 0.5 THEN 'BelowAverage'
+            ELSE 'Normal'
+        END AS PerformanceCategory,
+        ROW_NUMBER() OVER (ORDER BY ps.Score DESC, ps.ViewCount DESC) AS OverallRank,
+        DENSE_RANK() OVER (ORDER BY ps.Score DESC) AS DenseScoreRank,
+        RANK() OVER (ORDER BY ps.ViewCount DESC) AS ViewCountRank,
+        NTILE(100) OVER (ORDER BY ps.Score DESC) AS ScorePercentileRank,
+        LAG(ps.Score, 1) OVER (ORDER BY ps.Score DESC) AS PreviousScore,
+        LEAD(ps.Score, 1) OVER (ORDER BY ps.Score DESC) AS NextScore,
+        CASE 
+            WHEN ps.Score > (SELECT PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY Score) FROM Posts) THEN 'Top5Percent'
+            WHEN ps.Score > (SELECT PERCENTILE_CONT(0.90) WITHIN GROUP (ORDER BY Score) FROM Posts) THEN 'Top10Percent'
+            WHEN ps.Score > (SELECT PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY Score) FROM Posts) THEN 'Top25Percent'
+            ELSE 'LowerPercentile'
+        END AS ScoreBracket,
+        CASE 
+            WHEN ps.ViewCount > (SELECT PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY ViewCount) FROM Posts) THEN 'Top5PercentViews'
+            WHEN ps.ViewCount > (SELECT PERCENTILE_CONT(0.90) WITHIN GROUP (ORDER BY ViewCount) FROM Posts) THEN 'Top10PercentViews'
+            WHEN ps.ViewCount > (SELECT PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY ViewCount) FROM Posts) THEN 'Top25PercentViews'
+            ELSE 'LowerPercentileViews'
+        END AS ViewBracket,
+        ps.RunningTotalScore,
+        ps.GlobalPostOrder,
+        ps.PostIdentifier,
+        ps.BodyLength,
+        ps.NumberOfTags,
+        ps.AvgActivityDurationDays
+    FROM PostStats ps
+    JOIN Users u ON ps.OwnerUserId = u.Id
+    WHERE ps.PostTypeId IN (1,2)
+),
+UserPostAnalysis AS (
+    SELECT 
+        up.UserId,
+        up.TotalPosts,
+        up.AvgPostScore,
+        up.TotalScore,
+        up.TotalQuestions,
+        up.TotalAnswers,
+        up.LatestPostDate,
+        up.EarliestPostDate,
+        up.AvgActivityDurationDays,
+        up.PostCategories,
+        up.PostClassifications,
+        up.ActivityLevel,
+        up.HighScorePosts,
+        up.NegativeScorePosts,
+        up.PopularPosts,
+        up.AvgPopularPostViews,
+        up.MaxPostViews,
+        up.MinPostViews,
+        up.AvgAnswerCount,
+        up.TotalAnswersGiven,
+        up.AvgCommentCount,
+        up.TotalCommentsGiven,
+        up.AvgFavoriteCount,
+        up.TotalFavorites,
+        up.QuestionsWithAcceptedAnswers,
+        up.AvgAnswerCountOnAccepted,
+        up.NonQuestionPosts,
+        up.UserQuestionTitles,
+        CASE 
+            WHEN up.TotalPosts > (SELECT AVG(TotalPosts) FROM UserEngagement) THEN 'AboveAverageUser'
+            WHEN up.TotalPosts < (SELECT AVG(TotalPosts) FROM UserEngagement) THEN 'BelowAverageUser'
+            ELSE 'AverageUser'
+        END AS ActivityPerformance,
+        DENSE_RANK() OVER (ORDER BY up.TotalScore DESC) AS ScoreRank,
+        DENSE_RANK() OVER (ORDER BY up.TotalPosts DESC) AS PostCountRank,
+        DENSE_RANK() OVER (ORDER BY up.TotalQuestions DESC) AS QuestionCountRank,
+        DENSE_RANK() OVER (ORDER BY up.TotalAnswersGiven DESC) AS AnswerCountRank,
+        RANK() OVER (ORDER BY up.Reputation DESC) AS ReputationRank,
+        ROW_NUMBER() OVER (ORDER BY up.TotalQuestions DESC, up.TotalAnswersGiven DESC) AS CombinedRank
+    FROM UserEngagement up
+)
+SELECT 
+    TOPP.PostId,
+    TOPP.OwnerUserId,
+    TOPP.OwnerDisplayName,
+    TOPP.OwnerReputation,
+    TOPP.Score,
+    TOPP.ViewCount,
+    TOPP.AnswerCount,
+    TOPP.CommentCount,
+    TOPP.FavoriteCount,
+    TOPP.Title,
+    TOPP.Tags,
+    TOPP.PostCategory,
+    TOPP.PostClassification,
+    TOPP.ScorePerformance,
+    TOPP.ScoreBracket,
+    TOPP.ViewBracket,
+    TOPP.CreationYear,
+    TOPP.CreationMonth,
+    TOPP.PostLifespanCategory,
+    TOPP.PerformanceCategory,
+    TOPP.UserPostRank,
+    TOPP.TotalPostsByUser,
+    TOPP.AvgScoreByUser,
+    TOPP.BodyLength,
+    TOPP.NumberOfTags,
+    TOPP.ScoreRank,
+    TOPP.ViewRank,
+    TOPP.OverallRank,
+    TOPP.DenseScoreRank,
+    TOPP.ViewCountRank,
+    TOPP.ScorePercentileRank,
+    TOPP.RunningTotalScore,
+    TOPP.GlobalPostOrder,
+    TOPP.PostIdentifier,
+    TOPP.AvgActivityDurationDays,
+    UPA.TotalPosts AS UserTotalPosts,
+    UPA.AvgPostScore AS UserAvgPostScore,
+    UPA.TotalScore AS UserTotalScore,
+    UPA.TotalQuestions AS UserTotalQuestions,
+    UPA.TotalAnswers AS UserTotalAnswers,
+    UPA.ActivityLevel AS UserActivityLevel,
+    UPA.ActivityPerformance AS UserActivityPerformance,
+    UPA.ScoreRank AS UserScoreRank,
+    UPA.PostCountRank AS UserPostCountRank,
+    CASE 
+        WHEN EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = TOPP.OwnerUserId AND b.Name IN ('GoodAnswer', 'GreatAnswer')) THEN 'HasHighValueBadges'
+        WHEN EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = TOPP.OwnerUserId AND b.Name IN ('ExcellentAnswer', 'OutstandingAnswer')) THEN 'HasTopBadges'
+        ELSE 'NoSpecialBadges'
+    END AS BadgeStatus,
+    CASE 
+        WHEN UPA.TotalPosts > (SELECT AVG(TotalPosts) FROM UserEngagement) * 3 THEN 'UltraActiveUser'
+        WHEN UPA.TotalPosts > (SELECT AVG(TotalPosts) FROM UserEngagement) * 2 THEN 'VeryActiveUser'
+        WHEN UPA.TotalPosts > (SELECT AVG(TotalPosts) FROM UserEngagement) THEN 'ActiveUser'
+        ELSE 'NormalUser'
+    END AS UserActivityBracket,
+    (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = TOPP.OwnerUserId AND p2.Score > 1000) AS HighScorePostsByUser,
+    (SELECT COUNT(*) FROM Posts p3 WHERE p3.OwnerUserId = TOPP.OwnerUserId AND p3.AnswerCount >= 10) AS HighlyAnsweredQuestions,
+    (SELECT COUNT(*) FROM Posts p4 WHERE p4.OwnerUserId = TOPP.OwnerUserId AND p4.ViewCount BETWEEN 100 AND 1000) AS MediumPopularPosts,
+    CASE 
+        WHEN (TOPP.ViewCount - (SELECT AVG(ViewCount) FROM Posts)) > 500 THEN 'SignificantlyPopular'
+        WHEN (TOPP.ViewCount - (SELECT AVG(ViewCount) FROM Posts)) > 100 THEN 'ModeratelyPopular'
+        WHEN (TOPP.ViewCount - (SELECT AVG(ViewCount) FROM Posts)) > 0 THEN 'SlightlyPopular'
+        ELSE 'NormalPopular'
+    END AS ViewPopularityLevel,
+    COALESCE((SELECT STRING_AGG(b.Name, ', ') FROM Badges b WHERE b.UserId = TOPP.OwnerUserId), 'NoBadges') AS UserBadges,
+    COALESCE((SELECT STRING_AGG(DISTINCT ps.PostCategory, ', ') FROM PostStats ps WHERE ps.OwnerUserId = TOPP.OwnerUserId), 'NoPosts') AS UserPostCategories,
+    CASE 
+        WHEN TOPP.Score > (SELECT AVG(Score) + STDDEV_POP(Score) FROM Posts) THEN 'AboveStdDev'
+        WHEN TOPP.Score < (SELECT AVG(Score) - STDDEV_POP(Score) FROM Posts) THEN 'BelowStdDev'
+        ELSE 'Normal'
+    END AS ScoreStdDevCategory,
+    CASE 
+        WHEN TOPP.Score > (SELECT PERCENTILE_CONT(0.90) WITHIN GROUP (ORDER BY Score) FROM Posts) AND TOPP.ViewCount > (SELECT PERCENTILE_CONT(0.90) WITHIN GROUP (ORDER BY ViewCount) FROM Posts) THEN 'ElitePost'
+        WHEN TOPP.Score > (SELECT PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY Score) FROM Posts) AND TOPP.ViewCount > (SELECT PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY ViewCount) FROM Posts) THEN 'HighPerformingPost'
+        ELSE 'RegularPost'
+    END AS PostPerformanceCategory,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = TOPP.PostId AND v.VoteTypeId = 1) AS AcceptVotes,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = TOPP.PostId AND v.VoteTypeId IN (2, 3)) AS UpDownVotes,
+    ROUND(((SELECT COUNT(*) FROM Votes v WHERE v.PostId = TOPP.PostId AND v.VoteTypeId IN (2, 3)))::FLOAT / NULLIF((SELECT COUNT(*) FROM Votes v WHERE v.PostId = TOPP.PostId), 0), 2) AS VoteRatio,
+    CASE 
+        WHEN EXISTS (SELECT 1 FROM Posts p WHERE p.ParentId = TOPP.PostId AND p.PostTypeId = 2) THEN 'AnswerInQuestion'
+        ELSE 'NoAnswers'
+    END AS AnswerStatus,
+    CASE 
+        WHEN EXISTS (SELECT 1 FROM PostLinks pl WHERE pl.PostId = TOPP.PostId) THEN 'LinkedPost'
+        ELSE 'UnlinkedPost'
+    END AS LinkStatus,
+    CONCAT('Category:', TOPP.PostCategory, ', Performance:', TOPP.PerformanceCategory, ', TagCount:', TOPP.NumberOfTags) AS ExtendedPostInfo
+FROM TopPosts TOPP
+JOIN UserPostAnalysis UPA ON TOPP.OwnerUserId = UPA.UserId
+WHERE TOPP.PostId IS NOT NULL 
+  AND UPA.UserId IS NOT NULL
+  AND TOPP.Score > 0
+  AND TOPP.ViewCount > 0
+  AND TOPP.AnswerCount >= 0
+  AND (UPA.TotalPosts > 0 OR UPA.TotalQuestions > 0)
+  AND TOPP.PostId IN (
+    SELECT PostId 
+    FROM PostHistory 
+    WHERE PostHistoryTypeId IN (1, 2, 3, 4, 5, 6) 
+      AND CreationDate IS NOT NULL
+  )
+  AND UPA.TotalPosts > (
+    SELECT AVG(TotalPosts) FROM UserEngagement
+  )
+  AND NOT EXISTS (
+    SELECT 1 
+    FROM Comments c 
+    WHERE c.PostId = TOPP.PostId 
+      AND c.Score < -10
+  )
+ORDER BY 
+    TOPP.OverallRank ASC,
+    TOPP.ViewCount DESC,
+    TOPP.Score DESC,
+    TOPP.OwnerReputation DESC;

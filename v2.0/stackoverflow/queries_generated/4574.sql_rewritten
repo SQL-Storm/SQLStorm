@@ -1,0 +1,191 @@
+-- {"query": "4574.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1726} 
+WITH
+  RankedPostHistory AS (
+    SELECT
+      ph.PostId,
+      ph.PostHistoryTypeId,
+      ph.UserId,
+      ph.CreationDate,
+      ph.Comment,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) as rn
+    FROM PostHistory AS ph
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+  ),
+  LatestEdits AS (
+    SELECT
+      rph.PostId,
+      rph.UserId AS LastEditorUserId,
+      rph.CreationDate AS LastEditDate,
+      CASE
+        WHEN ph.PostHistoryTypeId = 4 THEN 1
+        WHEN ph.PostHistoryTypeId = 5 THEN 2
+        WHEN ph.PostHistoryTypeId = 6 THEN 3
+        ELSE 0
+      END AS EditType
+    FROM RankedPostHistory AS rph
+    JOIN PostHistory AS ph
+      ON rph.PostId = ph.PostId AND rph.CreationDate = ph.CreationDate AND rph.UserId = ph.UserId AND rph.PostHistoryTypeId = ph.PostHistoryTypeId
+    WHERE
+      rph.rn = 1
+  ),
+  AggregatedEdits AS (
+    SELECT
+      PostId,
+      COUNT(*) AS NumberOfEdits,
+      STRING_AGG(EditType::VARCHAR, ',' ORDER BY EditType) AS EditTypes
+    FROM LatestEdits
+    GROUP BY
+      PostId
+  ),
+  QuestionDetails AS (
+    SELECT
+      p.Id AS QuestionId,
+      p.Title AS QuestionTitle,
+      p.OwnerUserId,
+      u.DisplayName AS OwnerDisplayName,
+      p.CreationDate AS QuestionCreationDate,
+      p.Score AS QuestionScore,
+      p.AnswerCount,
+      p.FavoriteCount,
+      p.Tags,
+      p.ViewCount,
+      COALESCE(p.ClosedDate, '1900-01-01') AS NormalizedClosedDate,
+      LEAD(p.CreationDate, 1, '2100-01-01') OVER (ORDER BY p.CreationDate) AS NextQuestionCreationDate
+    FROM Posts AS p
+    LEFT JOIN Users AS u
+      ON p.OwnerUserId = u.Id
+    WHERE
+      p.PostTypeId = 1 -- Questions
+  ),
+  AnswerStats AS (
+    SELECT
+      a.ParentId AS QuestionId,
+      COUNT(a.Id) AS TotalAnswers,
+      SUM(CASE WHEN a.Id = p.AcceptedAnswerId THEN 1 ELSE 0 END) AS AcceptedAnswerCount,
+      MAX(a.Score) AS MaxAnswerScore,
+      AVG(a.Score) AS AvgAnswerScore,
+      COUNT(CASE WHEN a.OwnerUserId = q.OwnerUserId THEN 1 ELSE NULL END) AS OwnerAnswerCount
+    FROM Posts AS a
+    LEFT JOIN Posts AS q
+      ON a.ParentId = q.Id
+    WHERE
+      a.PostTypeId = 2 -- Answers
+    GROUP BY
+      a.ParentId
+  ),
+  CommentSummary AS (
+    SELECT
+      c.PostId,
+      COUNT(c.Id) AS TotalComments,
+      SUM(c.Score) AS TotalCommentScore,
+      STRING_AGG(SUBSTRING(c.Text FROM 1 FOR 50), ' | ' ORDER BY c.CreationDate) AS CommentSnippets
+    FROM Comments AS c
+    GROUP BY
+      c.PostId
+  ),
+  UserActivity AS (
+    SELECT
+      UserId,
+      COUNT(Id) AS PostCount,
+      MAX(CreationDate) AS LastPostDate
+    FROM Posts
+    WHERE
+      OwnerUserId IS NOT NULL
+    GROUP BY
+      UserId
+    UNION ALL
+    SELECT
+      UserId,
+      COUNT(Id) AS PostCount,
+      MAX(CreationDate) AS LastPostDate
+    FROM Comments
+    WHERE
+      UserId IS NOT NULL
+    GROUP BY
+      UserId
+  ),
+  RankedUserActivity AS (
+    SELECT
+      UserId,
+      PostCount,
+      LastPostDate,
+      ROW_NUMBER() OVER (ORDER BY PostCount DESC, LastPostDate DESC) AS UserRank
+    FROM UserActivity
+  ),
+  HighReputationUsers AS (
+    SELECT
+      Id,
+      DisplayName,
+      Reputation,
+      Views,
+      UpVotes,
+      DownVotes
+    FROM Users
+    WHERE
+      Reputation > 100000
+  )
+SELECT
+  q.QuestionTitle,
+  q.OwnerDisplayName,
+  q.QuestionScore,
+  q.AnswerCount,
+  COALESCE(as.TotalAnswers, 0) AS TotalAnswers,
+  COALESCE(as.AcceptedAnswerCount, 0) AS AcceptedAnswers,
+  COALESCE(as.MaxAnswerScore, 0) AS MaxAnswerScore,
+  COALESCE(as.AvgAnswerScore, 0.0) AS AvgAnswerScore,
+  COALESCE(cs.TotalComments, 0) AS TotalCommentsOnQuestion,
+  COALESCE(cs.TotalCommentScore, 0) AS TotalCommentScoreOnQuestion,
+  COALESCE(ae.NumberOfEdits, 0) AS NumberOfEdits,
+  COALESCE(ae.EditTypes, 'N/A') AS EditTypes,
+  CASE
+    WHEN q.NormalizedClosedDate <> '1900-01-01' THEN 'Closed'
+    ELSE 'Open'
+  END AS QuestionStatus,
+  q.Tags,
+  q.ViewCount AS QuestionViewCount,
+  COALESCE(hru.DisplayName, 'Standard User') AS TopUserDisplayName,
+  COALESCE(hru.Reputation, 0) AS TopUserReputation,
+  q.NextQuestionCreationDate,
+  (q.NextQuestionCreationDate - q.QuestionCreationDate) AS TimeToNextQuestion,
+  SUBSTRING(cs.CommentSnippets FROM 1 FOR 100) AS FirstCommentSnippet
+FROM QuestionDetails AS q
+FULL OUTER JOIN AnswerStats AS as_
+  ON q.QuestionId = as_.QuestionId
+FULL OUTER JOIN CommentSummary AS cs
+  ON q.QuestionId = cs.PostId
+FULL OUTER JOIN AggregatedEdits AS ae
+  ON q.QuestionId = ae.PostId
+LEFT JOIN RankedUserActivity AS rua
+  ON q.OwnerUserId = rua.UserId
+LEFT JOIN HighReputationUsers AS hru
+  ON rua.UserRank = 1 AND rua.UserId = hru.Id
+WHERE
+  q.QuestionScore > 10
+  AND q.AnswerCount > 2
+  AND q.FavoriteCount > 5
+  AND q.QuestionViewCount > 1000
+  AND q.NormalizedClosedDate = '1900-01-01'
+  AND (
+    q.Tags LIKE '%<sql>%' OR q.Tags LIKE '%<performance>%'
+  )
+  AND EXISTS (
+    SELECT
+      1
+    FROM PostLinks AS pl
+    WHERE
+      pl.PostId = q.QuestionId AND pl.LinkTypeId = 3 -- Duplicate links
+  )
+  AND (
+    COALESCE(as_.AvgAnswerScore, 0) > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 2)
+  )
+  AND q.OwnerUserId NOT IN (
+    SELECT
+      UserId
+    FROM Badges
+    WHERE
+      Name LIKE '%Tagger%'
+  )
+ORDER BY
+  q.QuestionScore DESC,
+  q.FavoriteCount DESC;

@@ -1,0 +1,57 @@
+-- {"query": "5430.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 566} 
+SELECT
+  u.DisplayName AS UserName,
+  u.Reputation,
+  p.Id AS PostId,
+  p.Title,
+  p.PostTypeId,
+  p.CreationDate,
+  p.Score,
+  p.ViewCount,
+  p.CommentCount,
+  p.AnswerCount,
+  p.Tags,
+  COALESCE(p.LastActivityDate, p.CreationDate) AS LastActivity,
+  pv.TotalUpVotes,
+  pv.TotalDownVotes,
+  CASE
+    WHEN vh.Id IS NOT NULL THEN vh.Name
+    ELSE 'Unknown' 
+  END AS HistoryEventType,
+  COALESCE(b.TotalGoldBadges, 0) AS GoldBadgesCount,
+  COALESCE(b.TotalSilverBadges, 0) AS SilverBadgesCount,
+  COALESCE(b.TotalBronzeBadges, 0) AS BronzeBadgesCount
+FROM
+  Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN (
+    SELECT
+      PostId,
+      SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS TotalUpVotes,
+      SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS TotalDownVotes
+    FROM Votes v
+      JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    GROUP BY PostId
+  ) pv ON p.Id = pv.PostId
+  LEFT JOIN PostHistory vh ON p.Id = vh.PostId
+    AND vh.PostHistoryTypeId IN (1, 2, 16, 50, 66) -- representative history types
+  LEFT JOIN (
+    SELECT
+      p2.Id AS PostId,
+      SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS TotalGoldBadges,
+      SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS TotalSilverBadges,
+      SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS TotalBronzeBadges
+    FROM Posts p2
+      LEFT JOIN Badges b ON b.UserId = p2.OwnerUserId
+    GROUP BY p2.Id
+  ) b ON p.Id = b.PostId
+WHERE
+  p.PostTypeId IN (1, 2) -- Questions and Answers
+  AND p.CreationDate >= (SELECT DATEADD(year, -2, GETDATE()))
+  AND (p.Tags LIKE '%<sql>%'
+       OR p.Tags LIKE '%<performance>%'
+       OR p.Tags LIKE '%<benchmark>%')
+ORDER BY
+  LastActivity DESC,
+  p.Score DESC
+OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY;

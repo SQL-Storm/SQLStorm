@@ -1,0 +1,139 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 AS Level,
+        ARRAY[t.TagName] AS TagPath
+    FROM Tags t
+    WHERE t.IsRequired = FALSE
+
+    UNION ALL
+
+    SELECT
+        c.Id,
+        c.TagName,
+        c.Count + p.Count AS Count,
+        p.Level + 1 AS Level,
+        p.TagPath || c.TagName
+    FROM Tags c
+    JOIN Tags p ON c.WikiPostId = p.ExcerptPostId
+    JOIN RecursiveTagHierarchy r ON p.Id = r.Id
+    WHERE c.IsModeratorOnly = FALSE
+),
+FilteredBadges AS (
+    SELECT
+        b.UserId,
+        b.Name AS BadgeName,
+        b.Class,
+        b.Date,
+        u.Reputation,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC) AS rn
+    FROM Badges b
+    JOIN Users u ON b.UserId = u.Id
+    WHERE u.Reputation > 10000
+      AND b.Date >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 year')
+),
+UserTopBadges AS (
+    SELECT UserId, BadgeName, Class, Date
+    FROM FilteredBadges
+    WHERE rn = 1
+),
+RecentTopPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        u.DisplayName AS OwnerName,
+        u.Reputation AS OwnerRep,
+        u.Id AS OwnerUserId,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.Score DESC, p.ViewCount DESC) AS rn
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')
+      AND p.Score > 10
+      AND p.Tags IS NOT NULL
+),
+PostCommentAggregates AS (
+    SELECT
+        p.Id AS PostId,
+        COALESCE(SUM(c.Score),0) AS TotalCommentScore,
+        COUNT(c.Id) AS CommentCount,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM Posts p
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    GROUP BY p.Id
+),
+AcceptedAnswerInfo AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.AcceptedAnswerId,
+        a.OwnerUserId AS AnswerOwnerId,
+        u.Reputation AS AnswerOwnerRep,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerCreationDate
+    FROM Posts q
+    LEFT JOIN Posts a ON q.AcceptedAnswerId = a.Id
+    LEFT JOIN Users u ON a.OwnerUserId = u.Id
+    WHERE q.PostTypeId = 1
+),
+PostLinksAndDuplicates AS (
+    SELECT
+        p.Id AS PostId,
+        COUNT(DISTINCT CASE WHEN lt.Name = 'Linked' THEN pl.Id END) AS LinkedCount,
+        COUNT(DISTINCT CASE WHEN lt.Name = 'Duplicate' THEN pl.Id END) AS DuplicateCount,
+        STRING_AGG(DISTINCT lt.Name, ',') AS LinkTypesInvolved
+    FROM Posts p
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id OR pl.RelatedPostId = p.Id
+    LEFT JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    GROUP BY p.Id
+)
+SELECT
+    rtp.PostId,
+    rtp.Title,
+    rtp.Score,
+    rtp.ViewCount,
+    rtp.Tags,
+    rtp.OwnerName,
+    rtp.OwnerRep,
+    ua.BadgeName AS OwnerTopBadge,
+    pca.TotalCommentScore,
+    pca.CommentCount,
+    pca.LastCommentDate,
+    aa.AnswerOwnerId,
+    aa.AnswerOwnerRep,
+    aa.AnswerScore,
+    aa.AnswerCreationDate,
+    pla.LinkedCount,
+    pla.DuplicateCount,
+    pla.LinkTypesInvolved,
+    CASE
+        WHEN rtp.ViewCount > 10000 THEN 'High View'
+        WHEN rtp.Score > 100 THEN 'High Score'
+        ELSE 'Normal'
+    END AS PostClassification,
+    COALESCE(
+        'TopBadge: ' || COALESCE(ua.BadgeName, 'None') || ' / Comments: ' || COALESCE(CAST(pca.CommentCount AS text), '0'),
+        'NoData'
+    ) AS SummaryInfo,
+    RANK() OVER (PARTITION BY ua.BadgeName ORDER BY rtp.Score DESC, pca.TotalCommentScore DESC) AS PopularityRank
+FROM RecentTopPosts rtp
+LEFT JOIN UserTopBadges ua ON rtp.OwnerUserId = ua.UserId
+LEFT JOIN PostCommentAggregates pca ON rtp.PostId = pca.PostId
+LEFT JOIN AcceptedAnswerInfo aa ON rtp.PostId = aa.QuestionId
+LEFT JOIN PostLinksAndDuplicates pla ON rtp.PostId = pla.PostId
+WHERE rtp.rn <= 5
+  AND (
+      EXISTS (
+          SELECT 1 FROM RecursiveTagHierarchy rth
+          WHERE rtp.Tags LIKE '%' || rth.TagName || '%'
+            AND rth.Level <= 3
+            AND (rth.Count > 5000 OR rtp.Score > 50)
+      )
+      OR COALESCE(pla.DuplicateCount, 0) > 0
+  )
+ORDER BY PopularityRank, rtp.Score DESC, pca.TotalCommentScore DESC
+LIMIT 50;

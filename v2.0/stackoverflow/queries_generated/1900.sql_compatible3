@@ -1,0 +1,172 @@
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT P.Id) AS TotalPostsAuthored,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestionsAsked,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswersProvided,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        COALESCE(SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS TotalUpVotesGiven,
+        COALESCE(SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS TotalDownVotesGiven,
+        SUM(COALESCE(P.Score, 0)) AS TotalPostScoreReceived,
+        SUM(COALESCE(C.Score, 0)) AS TotalCommentScoreReceived,
+        MAX(P.CreationDate) AS LatestPostDate,
+        MAX(C.CreationDate) AS LatestCommentDate,
+        AVG(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - P.CreationDate))/3600) AS AvgHoursSincePostCreation
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Votes V ON U.Id = V.UserId
+    WHERE U.Reputation > 100
+      AND U.LastAccessDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year')
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate
+),
+QuestionEngagementMetrics AS (
+    SELECT
+        Q.Id AS QuestionId,
+        Q.Title AS QuestionTitle,
+        Q.OwnerUserId,
+        Q.CreationDate AS QuestionCreationDate,
+        Q.Score AS QuestionScore,
+        Q.ViewCount,
+        Q.AnswerCount AS DeclaredAnswerCount,
+        COALESCE(SUM(A.Score), 0) AS TotalAnswerScore,
+        COALESCE(COUNT(DISTINCT A.Id), 0) AS ActualAnswerCount,
+        COALESCE(SUM(CASE WHEN A.Id = Q.AcceptedAnswerId THEN A.Score ELSE 0 END), 0) AS AcceptedAnswerScore,
+        COUNT(DISTINCT C.Id) AS QuestionCommentCount,
+        RANK() OVER (PARTITION BY DATE_TRUNC('month', Q.CreationDate) ORDER BY Q.Score DESC, Q.ViewCount DESC) AS MonthlyQuestionRank,
+        NTILE(4) OVER (ORDER BY Q.ViewCount DESC, Q.Score DESC, Q.CreationDate ASC) AS ViewScoreQuartile,
+        CASE
+            WHEN Q.AcceptedAnswerId IS NOT NULL AND Q.AnswerCount > 0 AND Q.Score >= 10 AND Q.FavoriteCount >= 3 THEN 'HighQualitySolved'
+            WHEN Q.AcceptedAnswerId IS NOT NULL AND Q.AnswerCount > 0 AND Q.Score < 10 THEN 'Solved'
+            WHEN Q.AnswerCount > 0 AND Q.Score >= 5 THEN 'EngagedUnsolved'
+            WHEN Q.AnswerCount = 0 AND Q.Score >= 2 AND Q.ViewCount > 50 THEN 'NotAnsweredButViewed'
+            ELSE 'LowEngagement'
+        END AS QuestionCategory,
+        (SELECT COUNT(DISTINCT V2.UserId) FROM Votes V2 WHERE V2.PostId = Q.Id AND V2.VoteTypeId = 5) AS FavoriteCountActual
+    FROM Posts Q
+    LEFT JOIN Posts A ON Q.Id = A.ParentId AND A.PostTypeId = 2
+    LEFT JOIN Comments C ON Q.Id = C.PostId
+    WHERE Q.PostTypeId = 1
+      AND Q.CreationDate BETWEEN (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 years') AND (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 month')
+      AND Q.Tags IS NOT NULL
+      AND Q.Title IS NOT NULL
+    GROUP BY Q.Id, Q.Title, Q.OwnerUserId, Q.CreationDate, Q.Score, Q.ViewCount, Q.AnswerCount, Q.AcceptedAnswerId, Q.FavoriteCount
+    HAVING COUNT(DISTINCT A.Id) > 0 OR Q.ViewCount > 50
+),
+ModerationEventTimeline AS (
+    SELECT
+        PH.PostId,
+        PH.UserId AS ModeratorId,
+        U.DisplayName AS ModeratorDisplayName,
+        PH.PostHistoryTypeId,
+        PHT.Name AS HistoryTypeName,
+        PH.CreationDate AS EventDate,
+        LAG(PHT.Name) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) AS PreviousEventTypeName,
+        LEAD(PHT.Name) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) AS NextEventTypeName,
+        CASE
+            WHEN PH.PostHistoryTypeId = 10 AND PH.Comment LIKE '%101%' THEN 'Duplicate'
+            WHEN PH.PostHistoryTypeId = 10 AND PH.Comment LIKE '%102%' THEN 'Off-topic'
+            WHEN PH.PostHistoryTypeId = 10 AND PH.Comment LIKE '%103%' THEN 'Needs Clarity'
+            WHEN PH.PostHistoryTypeId = 10 AND PH.Comment LIKE '%1%' THEN 'Old Duplicate'
+            ELSE NULL
+        END AS CloseReasonCategory,
+        NULLIF(SUBSTRING(PH.Text FROM POSITION('"OriginalQuestionIds": [' IN PH.Text) + LENGTH('"OriginalQuestionIds": [')), ']}}') AS OriginalQuestionIdsRaw
+    FROM PostHistory PH
+    INNER JOIN PostHistoryTypes PHT ON PH.PostHistoryTypeId = PHT.Id
+    LEFT JOIN Users U ON PH.UserId = U.Id
+    WHERE PH.PostHistoryTypeId IN (10, 11, 12, 13, 19, 20, 35, 36)
+      AND PH.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '3 years')
+),
+TagPerformanceStats AS (
+    SELECT
+        t.TagName AS TagName,
+        COUNT(DISTINCT p.Id) AS TaggedPostCount,
+        COALESCE(SUM(p.Score), 0) AS TotalTagScore,
+        COALESCE(AVG(p.Score), 0.0) AS AvgTagScore,
+        COALESCE(SUM(p.ViewCount), 0) AS TotalTagViewCount,
+        COALESCE(AVG(p.ViewCount), 0.0) AS AvgTagViewCount,
+        MAX(p.CreationDate) AS LatestTagPostDate,
+        DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC, SUM(p.Score) DESC) AS TagPopularityRank,
+        (SELECT COUNT(DISTINCT B.UserId) FROM Badges B WHERE B.Name = t.TagName AND B.TagBased = TRUE) AS TagBadgeHolders
+    FROM Posts p
+    CROSS JOIN LATERAL (
+        SELECT UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><')) AS TagName
+    ) t
+    WHERE p.Tags IS NOT NULL
+      AND p.PostTypeId IN (1, 2, 4, 5)
+      AND p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '5 years')
+    GROUP BY t.TagName
+    HAVING COUNT(DISTINCT p.Id) > 100
+)
+SELECT
+    UAS.UserId,
+    UAS.DisplayName,
+    UAS.Reputation,
+    UAS.TotalQuestionsAsked,
+    UAS.TotalAnswersProvided,
+    QEM.QuestionTitle,
+    QEM.QuestionScore,
+    QEM.ViewCount AS QuestionViewCount,
+    QEM.ActualAnswerCount,
+    QEM.QuestionCategory,
+    QEM.MonthlyQuestionRank,
+    TPS.TagName,
+    TPS.TaggedPostCount,
+    TPS.TotalTagScore,
+    TPS.TagPopularityRank,
+    TPS.TagBadgeHolders,
+    MET.HistoryTypeName AS LastModerationAction,
+    MET.EventDate AS LastModerationDate,
+    MET.CloseReasonCategory,
+    COALESCE(MET.ModeratorDisplayName, 'Community') AS ActionBy,
+    (SELECT COUNT(DISTINCT B.Id) FROM Badges B WHERE B.UserId = UAS.UserId AND B.Class = 1 AND B.Date > UAS.UserCreationDate) AS GoldBadgesCount,
+    (SELECT AVG(CASE WHEN V.VoteTypeId = 2 THEN 1.0 ELSE 0 END) FROM Votes V WHERE V.PostId = QEM.QuestionId AND V.CreationDate BETWEEN QEM.QuestionCreationDate AND (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 day')) AS AvgUpVoteRatioForQuestion,
+    CASE
+        WHEN UAS.Reputation > 5000 AND QEM.QuestionCategory = 'HighQualitySolved' AND TPS.TagPopularityRank <= 100 AND QEM.FavoriteCountActual > 5 THEN 'EliteContributor'
+        WHEN UAS.Reputation > 1000 AND QEM.ActualAnswerCount > 5 AND QEM.MonthlyQuestionRank <= 50 THEN 'HighImpactAuthor'
+        WHEN MET.HistoryTypeName = 'Post Closed' AND MET.CloseReasonCategory = 'Duplicate' AND POSITION(UAS.DisplayName IN COALESCE(MET.OriginalQuestionIdsRaw, '')) > 0 THEN 'SelfDupModerator'
+        ELSE 'GeneralUser'
+    END AS UserPersonaClassification,
+    (
+        SELECT SUM(P_sub.Score)
+        FROM Posts P_sub
+        WHERE P_sub.OwnerUserId = UAS.UserId
+          AND P_sub.PostTypeId = 2
+          AND P_sub.CreationDate BETWEEN UAS.UserCreationDate AND UAS.LatestPostDate
+          AND P_sub.Score > (
+              SELECT AVG(P_avg.Score) FROM Posts P_avg WHERE P_avg.PostTypeId = 2 AND P_avg.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '3 years')
+          )
+    ) AS ScoreOfAboveAverageAnswersByAuthor,
+    AVG(UAS.AvgHoursSincePostCreation) OVER (PARTITION BY QEM.QuestionCategory) AS AvgHoursToPostInCategory,
+    NULLIF(COALESCE(UAS.TotalUpVotesGiven,0) - COALESCE(UAS.TotalDownVotesGiven,0), 0) AS NetVotesGiven
+FROM UserActivitySummary UAS
+LEFT JOIN QuestionEngagementMetrics QEM ON UAS.UserId = QEM.OwnerUserId
+LEFT JOIN ModerationEventTimeline MET ON QEM.QuestionId = MET.PostId
+    AND MET.EventDate = (
+        SELECT MAX(MET2.EventDate)
+        FROM ModerationEventTimeline MET2
+        WHERE MET2.PostId = QEM.QuestionId
+          AND MET2.EventDate <= TIMESTAMP '2024-10-01 12:34:56'
+    )
+LEFT JOIN TagPerformanceStats TPS ON QEM.QuestionTitle LIKE '%' || TPS.TagName || '%' ESCAPE '\'
+WHERE (UAS.TotalQuestionsAsked > 0 OR UAS.TotalAnswersProvided > 0)
+  AND UAS.TotalUpVotesGiven > UAS.TotalDownVotesGiven * 2
+  AND QEM.ViewScoreQuartile = 1
+  AND QEM.QuestionCategory IN ('HighQualitySolved', 'EngagedUnsolved')
+  AND TPS.TagPopularityRank <= 200
+  AND MET.HistoryTypeName IS NOT NULL
+  AND LENGTH(UAS.DisplayName) BETWEEN 5 AND 20
+  AND UAS.DisplayName SIMILAR TO '[A-Za-z0-9_ -]+'
+GROUP BY
+    UAS.UserId, UAS.DisplayName, UAS.Reputation, UAS.TotalQuestionsAsked, UAS.TotalAnswersProvided,
+    QEM.QuestionTitle, QEM.QuestionScore, QEM.ViewCount, QEM.ActualAnswerCount, QEM.QuestionCategory, QEM.MonthlyQuestionRank, QEM.FavoriteCountActual, QEM.QuestionId, QEM.ViewScoreQuartile,
+    TPS.TagName, TPS.TaggedPostCount, TPS.TotalTagScore, TPS.TagPopularityRank, TPS.TagBadgeHolders,
+    MET.HistoryTypeName, MET.EventDate, MET.CloseReasonCategory, MET.ModeratorDisplayName,
+    UAS.UserCreationDate, UAS.LatestPostDate, MET.OriginalQuestionIdsRaw, UAS.AvgHoursSincePostCreation
+HAVING COUNT(DISTINCT QEM.QuestionId) > 0
+   AND (UAS.TotalUpVotesGiven > 50 OR UAS.TotalPostScoreReceived > 100)
+ORDER BY UAS.Reputation DESC, QEM.QuestionScore DESC, TPS.TagPopularityRank ASC
+LIMIT 1000;

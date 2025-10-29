@@ -1,0 +1,337 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+        LEAD(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as next_score,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING) as moving_avg_score,
+        NTILE(4) OVER (ORDER BY p.Score) as quartile
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserStats AS (
+    SELECT 
+        u.Id,
+        u.Reputation,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) as total_posts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as answers,
+        SUM(p.Score) as total_score,
+        AVG(p.Score) as avg_score,
+        MAX(p.CreationDate) as last_post_date,
+        COALESCE(SUM(CASE WHEN p.Score > 0 THEN p.Score ELSE 0 END), 0) as positive_score,
+        COALESCE(SUM(CASE WHEN p.Score < 0 THEN p.Score ELSE 0 END), 0) as negative_score,
+        STRING_AGG(DISTINCT p.Tags, ', ') as all_tags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.Reputation, u.DisplayName
+),
+TopUsers AS (
+    SELECT 
+        Id,
+        Reputation,
+        DisplayName,
+        total_posts,
+        questions,
+        answers,
+        total_score,
+        avg_score,
+        last_post_date,
+        positive_score,
+        negative_score,
+        all_tags,
+        ROW_NUMBER() OVER (ORDER BY total_score DESC, Reputation DESC) as rank_by_score
+    FROM UserStats
+    WHERE total_posts > 0
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as post_id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName as owner_name,
+        CASE WHEN p.PostTypeId = 1 THEN 'Question' ELSE 'Answer' END as post_type,
+        CASE 
+            WHEN p.AnswerCount > 0 THEN 'Has Answers'
+            WHEN p.Score < 0 THEN 'Negative Score'
+            WHEN p.CommentCount > 10 THEN 'Highly Commented'
+            ELSE 'Standard'
+        END as post_category,
+        CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate)) / 86400 AS INTEGER) as days_since_creation,
+        p.Tags,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags != '' THEN 
+                array_length(string_to_array(substring(p.Tags, 2, char_length(p.Tags)-2), '><'), 1)
+            ELSE 0
+        END as tag_count,
+        COALESCE((SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id), 0) as comment_count,
+        COALESCE((SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2), 0) as upvotes,
+        COALESCE((SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3), 0) as downvotes,
+        COALESCE((SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 5), 0) as favorites,
+        CASE 
+            WHEN p.Score > 100 THEN 'Very Popular'
+            WHEN p.Score > 50 THEN 'Popular'
+            WHEN p.Score > 10 THEN 'Moderately Popular'
+            ELSE 'Low Popular'
+        END as popularity_level,
+        p.LastActivityDate,
+        CASE WHEN p.LastActivityDate > p.CreationDate THEN CAST(EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate)) / 86400 AS INTEGER) ELSE 0 END as days_active
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.Id IS NOT NULL
+),
+ComplexMetrics AS (
+    SELECT 
+        pa.post_id,
+        pa.Title,
+        pa.Score,
+        pa.ViewCount,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.CreationDate,
+        pa.OwnerUserId,
+        pa.owner_name,
+        pa.post_type,
+        pa.post_category,
+        pa.days_since_creation,
+        pa.tag_count,
+        pa.comment_count,
+        pa.upvotes,
+        pa.downvotes,
+        pa.favorites,
+        pa.popularity_level,
+        pa.LastActivityDate,
+        pa.days_active,
+        SUM(pa.Score) OVER (ORDER BY pa.CreationDate ROWS BETWEEN 30 PRECEDING AND CURRENT ROW) as cumulative_score_30day,
+        AVG(pa.ViewCount) OVER (ORDER BY pa.CreationDate ROWS BETWEEN 30 PRECEDING AND CURRENT ROW) as avg_views_30day,
+        RANK() OVER (ORDER BY pa.Score DESC) as score_rank,
+        DENSE_RANK() OVER (ORDER BY pa.ViewCount DESC) as view_rank,
+        CASE 
+            WHEN pa.days_since_creation <= 30 AND pa.Score > 50 THEN 'New Hot Topic'
+            WHEN pa.days_since_creation > 30 AND pa.Score > 100 THEN 'Established Hot Topic'
+            WHEN pa.Score > 10 THEN 'Regular Topic'
+            ELSE 'Low Engagement Topic'
+        END as topic_status,
+        COALESCE(
+            (SELECT Name FROM PostTypes pt WHERE pt.Id = pa.post_type::int),
+            'Unknown'
+        ) as post_type_name,
+        CASE 
+            WHEN pa.upvotes > pa.downvotes AND pa.upvotes > 10 THEN 'Upvoted'
+            WHEN pa.downvotes > pa.upvotes AND pa.downvotes > 10 THEN 'Downvoted'
+            WHEN pa.upvotes = pa.downvotes AND pa.upvotes > 5 THEN 'Balanced'
+            ELSE 'Neutral'
+        END as voting_trend,
+        CASE 
+            WHEN pa.AnswerCount = 0 AND pa.post_type = 'Question' THEN 'Unanswered'
+            WHEN pa.AnswerCount > 0 THEN 'Answered'
+            WHEN pa.CommentCount >= 5 THEN 'Active Discussion'
+            ELSE 'Low Engagement Question'
+        END as question_status,
+        (pa.upvotes - pa.downvotes) as net_votes,
+        (CASE WHEN pa.ViewCount > 0 THEN (pa.Score * 100.0 / pa.ViewCount) ELSE 0 END) as score_per_view,
+        (CASE WHEN pa.favorites > 0 THEN (pa.CommentCount * 1.0 / pa.favorites) ELSE 0 END) as comments_per_favorite,
+        CASE 
+            WHEN pa.CommentCount > 50 THEN 'Very Active'
+            WHEN pa.CommentCount > 20 THEN 'Active'
+            WHEN pa.CommentCount > 5 THEN 'Moderate'
+            ELSE 'Inactive'
+        END as comment_level
+    FROM PostAnalysis pa
+),
+FinalAnalysis AS (
+    SELECT 
+        cma.post_id,
+        cma.Title,
+        cma.Score,
+        cma.ViewCount,
+        cma.AnswerCount,
+        cma.CommentCount,
+        cma.CreationDate,
+        cma.OwnerUserId,
+        cma.owner_name,
+        cma.post_type,
+        cma.post_category,
+        cma.days_since_creation,
+        cma.tag_count,
+        cma.comment_count,
+        cma.upvotes,
+        cma.downvotes,
+        cma.favorites,
+        cma.popularity_level,
+        cma.LastActivityDate,
+        cma.days_active,
+        cma.cumulative_score_30day,
+        cma.avg_views_30day,
+        cma.score_rank,
+        cma.view_rank,
+        cma.topic_status,
+        cma.post_type_name,
+        cma.voting_trend,
+        cma.question_status,
+        cma.net_votes,
+        cma.score_per_view,
+        cma.comments_per_favorite,
+        cma.comment_level,
+        CASE 
+            WHEN cma.score_rank <= 100 THEN 'Top 100'
+            WHEN cma.score_rank <= 500 THEN 'Top 500'
+            WHEN cma.score_rank <= 1000 THEN 'Top 1000'
+            ELSE 'Below 1000'
+        END as rank_category,
+        CASE 
+            WHEN cma.ViewCount >= 10000 THEN 'Viral'
+            WHEN cma.ViewCount >= 1000 THEN 'Popular'
+            WHEN cma.ViewCount >= 100 THEN 'Moderately Popular'
+            ELSE 'Low Views'
+        END as view_category,
+        CASE 
+            WHEN cma.days_active > 100 THEN 'Long Lived'
+            WHEN cma.days_active > 50 THEN 'Medium Lived'
+            WHEN cma.days_active > 10 THEN 'Short Lived'
+            ELSE 'Very Short Lived'
+        END as activity_duration,
+        CASE 
+            WHEN cma.Score > 100 AND cma.ViewCount > 1000 AND cma.AnswerCount > 0 THEN 'High Impact'
+            WHEN cma.Score > 50 AND cma.ViewCount > 500 THEN 'Moderate Impact'
+            WHEN cma.Score > 25 AND cma.ViewCount > 100 THEN 'Low Impact'
+            ELSE 'Low Engagement'
+        END as impact_level,
+        CASE 
+            WHEN EXISTS (
+                SELECT 1 FROM PostLinks pl 
+                WHERE pl.PostId = cma.post_id AND pl.LinkTypeId = 3
+            ) THEN 'Duplicate'
+            WHEN EXISTS (
+                SELECT 1 FROM PostHistory ph 
+                WHERE ph.PostId = cma.post_id AND ph.PostHistoryTypeId IN (12, 13)
+            ) THEN 'Deleted/Undeleted'
+            WHEN EXISTS (
+                SELECT 1 FROM PostHistory ph 
+                WHERE ph.PostId = cma.post_id AND ph.PostHistoryTypeId = 10
+            ) THEN 'Closed'
+            ELSE 'Active'
+        END as life_cycle_status,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = cma.OwnerUserId AND b.Class = 1) as gold_badges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = cma.OwnerUserId AND b.Class = 2) as silver_badges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = cma.OwnerUserId AND b.Class = 3) as bronze_badges,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = cma.OwnerUserId AND p.PostTypeId = 1) as total_questions,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = cma.OwnerUserId AND p.PostTypeId = 2) as total_answers,
+        COALESCE(
+            (SELECT AVG(p2.ViewCount) FROM Posts p2 WHERE p2.OwnerUserId = cma.OwnerUserId AND p2.Id != cma.post_id),
+            0
+        ) as avg_user_views,
+        COALESCE(
+            (SELECT SUM(p2.Score) FROM Posts p2 WHERE p2.OwnerUserId = cma.OwnerUserId AND p2.Id != cma.post_id),
+            0
+        ) as other_posts_score,
+        (SELECT MIN(p3.Score) FROM Posts p3 WHERE p3.OwnerUserId = cma.OwnerUserId AND p3.Id != cma.post_id) as min_score_others,
+        (SELECT MAX(p4.Score) FROM Posts p4 WHERE p4.OwnerUserId = cma.OwnerUserId AND p4.Id != cma.post_id) as max_score_others,
+        (SELECT AVG(p5.Score) FROM Posts p5 WHERE p5.OwnerUserId = cma.OwnerUserId AND p5.Id != cma.post_id) as avg_score_others
+    FROM ComplexMetrics cma
+)
+SELECT 
+    fa.post_id,
+    fa.Title,
+    fa.Score,
+    fa.ViewCount,
+    fa.AnswerCount,
+    fa.CommentCount,
+    fa.CreationDate,
+    fa.OwnerUserId,
+    fa.owner_name,
+    fa.post_type,
+    fa.post_category,
+    fa.days_since_creation,
+    fa.tag_count,
+    fa.comment_count,
+    fa.upvotes,
+    fa.downvotes,
+    fa.favorites,
+    fa.popularity_level,
+    fa.LastActivityDate,
+    fa.days_active,
+    fa.cumulative_score_30day,
+    fa.avg_views_30day,
+    fa.score_rank,
+    fa.view_rank,
+    fa.topic_status,
+    fa.post_type_name,
+    fa.voting_trend,
+    fa.question_status,
+    fa.net_votes,
+    fa.score_per_view,
+    fa.comments_per_favorite,
+    fa.comment_level,
+    fa.rank_category,
+    fa.view_category,
+    fa.activity_duration,
+    fa.impact_level,
+    fa.life_cycle_status,
+    fa.gold_badges,
+    fa.silver_badges,
+    fa.bronze_badges,
+    fa.total_questions,
+    fa.total_answers,
+    fa.avg_user_views,
+    fa.other_posts_score,
+    fa.min_score_others,
+    fa.max_score_others,
+    fa.avg_score_others,
+    RANK() OVER (ORDER BY fa.days_since_creation) as creation_rank,
+    RANK() OVER (ORDER BY fa.tag_count) as tag_count_rank,
+    RANK() OVER (ORDER BY fa.net_votes) as net_votes_rank,
+    RANK() OVER (ORDER BY fa.score_per_view DESC) as score_view_rank,
+    CASE 
+        WHEN fa.Score > (SELECT AVG(Score) FROM Posts) THEN 'Above Avg Score'
+        ELSE 'Below Avg Score'
+    END as score_comparison,
+    CASE 
+        WHEN fa.ViewCount > (SELECT AVG(ViewCount) FROM Posts) THEN 'Above Avg View'
+        ELSE 'Below Avg View'
+    END as view_comparison
+FROM FinalAnalysis fa
+WHERE fa.post_id IS NOT NULL
+    AND fa.Title IS NOT NULL
+    AND fa.owner_name IS NOT NULL
+    AND fa.score_rank IS NOT NULL
+    AND fa.rank_category IS NOT NULL
+    AND fa.view_category IS NOT NULL
+    AND fa.activity_duration IS NOT NULL
+    AND fa.impact_level IS NOT NULL
+    AND fa.life_cycle_status IS NOT NULL
+    AND fa.gold_badges IS NOT NULL
+    AND fa.silver_badges IS NOT NULL
+    AND fa.bronze_badges IS NOT NULL
+    AND fa.total_questions IS NOT NULL
+    AND fa.total_answers IS NOT NULL
+    AND fa.avg_user_views IS NOT NULL
+    AND fa.other_posts_score IS NOT NULL
+    AND fa.min_score_others IS NOT NULL
+    AND fa.max_score_others IS NOT NULL
+    AND fa.avg_score_others IS NOT NULL
+    AND fa.creation_rank IS NOT NULL
+    AND fa.tag_count_rank IS NOT NULL
+    AND fa.net_votes_rank IS NOT NULL
+    AND fa.score_view_rank IS NOT NULL
+    AND fa.score_comparison IS NOT NULL
+    AND fa.view_comparison IS NOT NULL
+ORDER BY fa.Score DESC, fa.ViewCount DESC, fa.CreationDate DESC
+LIMIT 5000;

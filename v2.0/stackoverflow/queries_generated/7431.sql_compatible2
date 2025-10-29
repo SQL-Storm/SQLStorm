@@ -1,0 +1,272 @@
+WITH RECURSIVE PostHierarchy AS (
+    SELECT 
+        p.Id,
+        p.ParentId,
+        p.PostTypeId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        0 AS Level,
+        CAST(p.Id AS VARCHAR(1000)) AS Path
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.ParentId IS NULL
+
+    UNION ALL
+
+    SELECT 
+        p.Id,
+        p.ParentId,
+        p.PostTypeId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        ph.Level + 1,
+        CAST(ph.Path || '->' || CAST(p.Id AS VARCHAR(1000)) AS VARCHAR(1000)) AS Path
+    FROM Posts p
+    INNER JOIN PostHierarchy ph ON p.ParentId = ph.Id
+    WHERE ph.Level < 5
+),
+UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        COALESCE(SUM(p.Score), 0) AS TotalScore,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        COALESCE(p.ViewCount, 0) AS ViewCount,
+        COALESCE(p.Score, 0) AS Score,
+        CASE 
+            WHEN t.Count > 100 THEN 'Popular'
+            WHEN t.Count > 50 THEN 'Moderate'
+            WHEN t.Count > 10 THEN 'Rare'
+            ELSE 'Very Rare'
+        END AS PopularityLevel,
+        CASE 
+            WHEN EXISTS (SELECT 1 FROM Posts p2 WHERE p2.Tags LIKE '%' || t.TagName || '%') THEN 1
+            ELSE 0
+        END AS HasPosts
+    FROM Tags t
+    LEFT JOIN Posts p ON t.WikiPostId = p.Id
+),
+PostActivity AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        COALESCE(u.DisplayName, 'Unknown') AS OwnerName,
+        COALESCE(ph.Path, 'Root') AS PostPath,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserPostRank,
+        RANK() OVER (ORDER BY p.Score DESC) AS ScoreRank,
+        DENSE_RANK() OVER (ORDER BY p.ViewCount DESC) AS ViewRank,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS AvgUserScore,
+        MAX(p.CreationDate) OVER (PARTITION BY p.OwnerUserId) AS RecentUserPost,
+        LAG(p.Score, 1) OVER (ORDER BY p.CreationDate) AS PreviousScore,
+        LAG(p.ViewCount, 1) OVER (ORDER BY p.CreationDate) AS PreviousViewCount,
+        (p.Score - LAG(p.Score, 1) OVER (ORDER BY p.CreationDate)) AS ScoreChange,
+        (p.ViewCount - LAG(p.ViewCount, 1) OVER (ORDER BY p.CreationDate)) AS ViewChange
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN PostHierarchy ph ON p.Id = ph.Id
+    WHERE p.PostTypeId IN (1, 2)
+),
+FilteredUsers AS (
+    SELECT 
+        us.Id,
+        us.DisplayName,
+        us.Reputation,
+        us.Views,
+        us.TotalScore,
+        us.PostCount,
+        us.QuestionCount,
+        us.AnswerCount,
+        us.BadgeCount,
+        CASE 
+            WHEN us.PostCount > 0 AND us.BadgeCount = 0 THEN 'NoBadges'
+            WHEN us.PostCount = 0 THEN 'NoPosts'
+            WHEN us.Reputation > 1000 THEN 'Veteran'
+            ELSE 'Regular'
+        END AS UserCategory,
+        ROW_NUMBER() OVER (ORDER BY us.TotalScore DESC) AS ScoreRank,
+        DENSE_RANK() OVER (ORDER BY us.Reputation DESC) AS RepRank
+    FROM UserStats us
+    WHERE us.PostCount > 0
+),
+ComplexResults AS (
+    SELECT 
+        pa.Id,
+        pa.Title,
+        pa.Score,
+        pa.ViewCount,
+        pa.OwnerUserId,
+        pa.OwnerName,
+        pa.PostTypeId,
+        pa.PostPath,
+        pa.UserPostRank,
+        pa.ScoreRank,
+        pa.ViewRank,
+        pa.AvgUserScore,
+        pa.ScoreChange,
+        pa.ViewChange,
+        pa.CreationDate,
+        pa.LastActivityDate,
+        CASE 
+            WHEN pa.Score > 100 THEN 'HighlyVoted'
+            WHEN pa.Score > 50 THEN 'ModeratelyVoted'
+            WHEN pa.Score > 0 THEN 'SlightlyVoted'
+            ELSE 'NoVotes'
+        END AS VotingLevel,
+        CASE 
+            WHEN pa.ViewCount > 1000 THEN 'Viral'
+            WHEN pa.ViewCount > 500 THEN 'Popular'
+            WHEN pa.ViewCount > 100 THEN 'Moderate'
+            ELSE 'Limited'
+        END AS Popularity,
+        (COALESCE(pa.Score, 0) + COALESCE(pa.ViewCount, 0)) * (CASE WHEN (julianday('2024-10-01 12:34:56') - julianday(pa.CreationDate)) > 30 THEN 0.5 ELSE 1 END) AS AdjustedScore,
+        CAST((julianday(pa.LastActivityDate) - julianday(pa.CreationDate)) AS INTEGER) AS ActiveDurationDays,
+        CASE 
+            WHEN pa.ScoreChange > 10 THEN 'RapidGrowth'
+            WHEN pa.ScoreChange < -10 THEN 'RapidDecline'
+            WHEN pa.ScoreChange > 0 THEN 'Growing'
+            WHEN pa.ScoreChange < 0 THEN 'Declining'
+            ELSE 'Stable'
+        END AS Trend,
+        CASE 
+            WHEN pa.ViewChange > 100 THEN 'RapidGrowthViews'
+            WHEN pa.ViewChange < -100 THEN 'RapidDeclineViews'
+            ELSE 'StableViews'
+        END AS ViewTrend,
+        pa.PreviousScore,
+        pa.PreviousViewCount
+    FROM PostActivity pa
+)
+SELECT 
+    cr.Id,
+    cr.Title,
+    cr.Score,
+    cr.ViewCount,
+    cr.OwnerUserId,
+    cr.OwnerName,
+    cr.PostTypeId,
+    cr.PostPath,
+    cr.UserPostRank,
+    cr.ScoreRank,
+    cr.ViewRank,
+    cr.AvgUserScore,
+    cr.ScoreChange,
+    cr.ViewChange,
+    cr.CreationDate,
+    cr.LastActivityDate,
+    cr.VotingLevel,
+    cr.Popularity,
+    cr.AdjustedScore,
+    cr.ActiveDurationDays,
+    cr.Trend,
+    cr.ViewTrend,
+    fu.UserCategory,
+    fu.ScoreRank AS UserScoreRank,
+    fu.RepRank AS UserRepRank,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p2 
+        WHERE p2.OwnerUserId = cr.OwnerUserId 
+          AND p2.CreationDate > cr.CreationDate
+    ) AS FuturePostsCount,
+    (
+        SELECT p3.Score
+        FROM Posts p3
+        WHERE p3.OwnerUserId = cr.OwnerUserId
+          AND p3.Id != cr.Id
+        ORDER BY p3.Score DESC
+        LIMIT 1
+    ) AS TopScoreByOwner,
+    (
+        SELECT COUNT(*) 
+        FROM Comments cm 
+        WHERE cm.PostId = cr.Id
+    ) AS CommentCount,
+    (
+        SELECT COUNT(*) 
+        FROM Votes v 
+        WHERE v.PostId = cr.Id 
+          AND v.VoteTypeId = 2
+    ) AS UpvoteCount,
+    (
+        SELECT COUNT(*) 
+        FROM Votes v 
+        WHERE v.PostId = cr.Id 
+          AND v.VoteTypeId = 3
+    ) AS DownvoteCount,
+    (
+        SELECT COUNT(*) 
+        FROM Badges b 
+        WHERE b.UserId = cr.OwnerUserId
+          AND b.Date > datetime('2024-10-01 12:34:56', '-6 months')
+    ) AS RecentBadges,
+    (
+        SELECT MAX(p4.Score) 
+        FROM Posts p4 
+        WHERE p4.OwnerUserId = cr.OwnerUserId
+    ) AS MaxScoreByUser,
+    (
+        SELECT MIN(p5.CreationDate) 
+        FROM Posts p5 
+        WHERE p5.OwnerUserId = cr.OwnerUserId
+    ) AS FirstPostDate,
+    CASE 
+        WHEN cr.Score > (SELECT AVG(Score) FROM Posts) THEN 'AboveAverage'
+        ELSE 'BelowAverage'
+    END AS PerformanceLevel,
+    (
+        SELECT GROUP_CONCAT(t.TagName, ', ')
+        FROM Posts p6 
+        INNER JOIN (
+            SELECT TRIM(SUBSTR(p7.Tags, 2, INSTR(p7.Tags, '>') - 2)) AS TagName
+            FROM Posts p7
+            WHERE p7.Id = cr.Id
+              AND p7.Tags IS NOT NULL AND p7.Tags != ''
+              AND INSTR(p7.Tags, '>') > 0
+        ) t ON t.TagName != ''
+        WHERE p6.Id = cr.Id
+    ) AS AllTags,
+    (
+        'Score: ' || cr.Score || ', ViewDiff: ' || (cr.ViewCount - COALESCE(cr.PreviousViewCount, 0)) || ', ScoreDiff: ' || (cr.Score - COALESCE(cr.PreviousScore, 0))
+    ) AS SummaryMetrics
+FROM ComplexResults cr
+INNER JOIN FilteredUsers fu ON cr.OwnerUserId = fu.Id
+WHERE cr.AdjustedScore > 0
+  AND cr.ActiveDurationDays > 30
+  AND (cr.VotingLevel IN ('HighlyVoted', 'ModeratelyVoted') OR cr.Popularity IN ('Viral', 'Popular'))
+  AND fu.UserCategory IN ('Veteran', 'Regular')
+  AND cr.Title IS NOT NULL
+  AND cr.Title != ''
+ORDER BY cr.AdjustedScore DESC, cr.CreationDate DESC
+LIMIT 1000;

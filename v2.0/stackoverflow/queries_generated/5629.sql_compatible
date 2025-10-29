@@ -1,0 +1,122 @@
+WITH top_users AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.AccountId,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.LastAccessDate DESC) AS rn
+  FROM Users u
+),
+recent_activities AS (
+  SELECT
+    p.Id AS PostId,
+    p.OwnerUserId,
+    p.PostTypeId,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    COALESCE(vs.total_votes, 0) AS TotalVotes,
+    COALESCE(cd.comment_count, 0) AS CommentCount,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn_owner
+  FROM Posts p
+  LEFT JOIN (
+    SELECT PostId, SUM(CASE WHEN VoteTypeId IN (2,3,14,16) THEN 1 ELSE 0 END) AS total_votes
+    FROM Votes
+    GROUP BY PostId
+  ) vs ON p.Id = vs.PostId
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS comment_count
+    FROM Comments
+    GROUP BY PostId
+  ) cd ON p.Id = cd.PostId
+  WHERE p.PostTypeId IN (1,2)
+),
+cohort AS (
+  SELECT
+    t.UserId,
+    t.DisplayName,
+    t.Reputation,
+    t.CreationDate,
+    t.LastAccessDate,
+    t.Location,
+    t.Views,
+    t.UpVotes,
+    t.DownVotes,
+    t.AccountId,
+    t.rn
+  FROM top_users t
+  LEFT JOIN LATERAL (
+    SELECT 1 AS keep
+  ) l ON true
+  WHERE t.rn <= 100
+),
+complex_stats AS (
+  SELECT
+    u.UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.AccountId,
+    MAX(p.Score) OVER (PARTITION BY u.UserId) AS MaxPostScore,
+    AVG(p.Score) OVER (PARTITION BY u.UserId) AS AvgPostScore,
+    SUM(p.ViewCount) OVER (PARTITION BY u.UserId) AS TotalViewsByUser,
+    COUNT(DISTINCT p.Id) OVER (PARTITION BY u.UserId) AS PostsByUser
+  FROM cohort u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.UserId
+  LEFT JOIN recent_activities r ON r.OwnerUserId = u.UserId
+)
+SELECT
+  u.UserId,
+  u.DisplayName,
+  u.Reputation,
+  u.CreationDate,
+  u.LastAccessDate,
+  u.Location,
+  u.Views,
+  u.UpVotes,
+  u.DownVotes,
+  u.AccountId,
+  u.MaxPostScore,
+  u.AvgPostScore,
+  u.TotalViewsByUser,
+  u.PostsByUser,
+  ARRAY_AGG(DISTINCT a.Title) FILTER (WHERE a.PostTypeId = 1) AS RecentQuestionTitles,
+  ARRAY_AGG(DISTINCT a.Title) FILTER (WHERE a.PostTypeId = 2) AS RecentAnswerTitles
+FROM complex_stats u
+LEFT JOIN LATERAL (
+  SELECT p.Title, p.PostTypeId
+  FROM Posts p
+  WHERE p.OwnerUserId = u.UserId
+  ORDER BY p.CreationDate DESC
+  LIMIT 5
+) AS a ON true
+GROUP BY
+  u.UserId,
+  u.DisplayName,
+  u.Reputation,
+  u.CreationDate,
+  u.LastAccessDate,
+  u.Location,
+  u.Views,
+  u.UpVotes,
+  u.DownVotes,
+  u.AccountId,
+  u.MaxPostScore,
+  u.AvgPostScore,
+  u.TotalViewsByUser,
+  u.PostsByUser
+ORDER BY u.Reputation DESC, u.LastAccessDate DESC
+LIMIT 200;

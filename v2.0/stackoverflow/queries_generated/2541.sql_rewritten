@@ -1,0 +1,210 @@
+-- {"query": "2541.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1899} 
+with RecursiveTags as (
+    select 
+        t.Id,
+        t.TagName,
+        coalesce(t.Count,0) as TagCount,
+        coalesce(p.ViewCount,0) as QuestionViewCount,
+        row_number() over (order by t.Count desc nulls last) as Rank
+    from Tags t
+    left join Posts p 
+      on p.Id = t.ExcerptPostId and p.PostTypeId = 1
+    where t.TagName is not null
+
+    union all
+
+    select 
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        p2.ViewCount,
+        rt.Rank + 1
+    from Tags t2
+    join RecursiveTags rt on t2.Id = rt.Id + 1
+    left join Posts p2 on p2.Id = t2.ExcerptPostId and p2.PostTypeId = 1
+    where t2.TagName is not null and rt.Rank < 50
+),
+
+BadgeAgg as (
+    select 
+        b.UserId,
+        count(case when b.Class = 1 then 1 end) as GoldBadges,
+        count(case when b.Class = 2 then 1 end) as SilverBadges,
+        count(case when b.Class = 3 then 1 end) as BronzeBadges,
+        count(*) as TotalBadges
+    from Badges b
+    group by b.UserId
+),
+
+UserScores as (
+    select 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        coalesce(bagg.GoldBadges,0) as GoldBadges,
+        coalesce(bagg.SilverBadges,0) as SilverBadges,
+        coalesce(bagg.BronzeBadges,0) as BronzeBadges,
+        coalesce(bagg.TotalBadges,0) as TotalBadges,
+        dense_rank() over (order by u.Reputation desc nulls last) as RepRank
+    from Users u
+    left join BadgeAgg bagg on bagg.UserId = u.Id
+),
+
+TopPosts as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Tags,
+        row_number() over (partition by p.PostTypeId order by p.Score desc nulls last) as ScoreRank,
+        coalesce(a.AcceptedAnswerExists, false) as HasAcceptedAnswer
+    from Posts p
+    left join (
+        select distinct AcceptedAnswerId, true as AcceptedAnswerExists from Posts where AcceptedAnswerId is not null
+    ) a on a.AcceptedAnswerId = p.Id
+    where p.PostTypeId in (1,2)
+),
+
+QuestionsWithAnswerStats as (
+    select 
+        q.Id as QuestionId,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViews,
+        q.CreationDate as QuestionCreation,
+        q.OwnerUserId as QuestionOwner,
+        q.Tags,
+        count(a.Id) filter (where a.PostTypeId = 2) as AnswerCount,
+        avg(a.Score) filter (where a.PostTypeId = 2) as AvgAnswerScore,
+        max(a.Score) filter (where a.PostTypeId = 2) as MaxAnswerScore,
+        sum(case when a.Id = q.AcceptedAnswerId then 1 else 0 end) as HasAcceptedAnswer
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+    group by q.Id, q.Score, q.ViewCount, q.CreationDate, q.OwnerUserId, q.Tags, q.AcceptedAnswerId
+),
+
+UserLatestActivity as (
+    select distinct on (ph.UserId) ph.UserId, ph.PostId, ph.CreationDate as ActivityDate
+    from PostHistory ph
+    where ph.UserId is not null
+    order by ph.UserId, ph.CreationDate desc
+),
+
+HighActivityUsers as (
+    select 
+        u.Id,
+        u.DisplayName,
+        u.LastAccessDate,
+        coalesce(phact.ActivityDate, u.LastAccessDate) as LatestActivity,
+        u.Reputation,
+        user_scores.GoldBadges,
+        user_scores.SilverBadges,
+        user_scores.BronzeBadges,
+        user_scores.TotalBadges,
+        row_number() over (order by coalesce(phact.ActivityDate, u.LastAccessDate) desc) as ActivityRank
+    from Users u
+    left join UserLatestActivity phact on phact.UserId = u.Id
+    left join UserScores user_scores on user_scores.Id = u.Id
+    where u.Reputation > 1000 and (u.LastAccessDate > '2023-01-01' or phact.ActivityDate > '2023-01-01')
+),
+
+PostComplexTags as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.Tags,
+        unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags) - 2), '><')) as Tag
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+),
+
+LinkedPostsDup as (
+    select 
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.LinkTypeId,
+        lt.Name as LinkTypeName,
+        p1.Score as PostScore,
+        p2.Score as RelatedPostScore
+    from PostLinks pl
+    join LinkTypes lt on pl.LinkTypeId = lt.Id
+    join Posts p1 on p1.Id = pl.PostId
+    join Posts p2 on p2.Id = pl.RelatedPostId
+    where pl.LinkTypeId in (1, 3)
+),
+
+-- Correlated subquery example for each user, get count of questions with accepted answer
+UserQuestionAcceptedCount as (
+    select 
+        u.Id as UserId,
+        (select count(*) 
+         from Posts pq
+         where pq.OwnerUserId = u.Id and pq.PostTypeId = 1 and pq.AcceptedAnswerId is not null) as AcceptedQuestionsCount
+    from Users u
+),
+
+FinalStats as (
+    select 
+        h.Id as UserId,
+        h.DisplayName,
+        h.Reputation,
+        h.LatestActivity,
+        h.GoldBadges,
+        h.SilverBadges,
+        h.BronzeBadges,
+        h.TotalBadges,
+        uqc.AcceptedQuestionsCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersCount,
+        avg(p.Score) as AvgPostScore,
+        sum(p.ViewCount) filter (where p.PostTypeId = 1) as TotalQuestionViews,
+        string_agg(distinct pt.Name, ', ') as UserPostTypes,
+        bool_or(p.ClosedDate is not null) as HasClosedQuestions,
+        max(p.Score) as MaxPostScore,
+        -- Window calculation: rank posts by score per user
+        max(row_number() over (partition by p.OwnerUserId order by p.Score desc)) as MaxPostScoreRank
+    from HighActivityUsers h
+    left join Posts p on p.OwnerUserId = h.Id
+    left join PostTypes pt on pt.Id = p.PostTypeId
+    left join UserQuestionAcceptedCount uqc on uqc.UserId = h.Id
+    group by h.Id, h.DisplayName, h.Reputation, h.LatestActivity, h.GoldBadges, h.SilverBadges, h.BronzeBadges, h.TotalBadges, uqc.AcceptedQuestionsCount
+)
+
+select
+    f.UserId,
+    f.DisplayName,
+    f.Reputation,
+    f.LatestActivity,
+    f.GoldBadges,
+    f.SilverBadges,
+    f.BronzeBadges,
+    f.TotalBadges,
+    f.AcceptedQuestionsCount,
+    f.QuestionsCount,
+    f.AnswersCount,
+    f.AvgPostScore,
+    f.TotalQuestionViews,
+    f.UserPostTypes,
+    f.HasClosedQuestions,
+    f.MaxPostScore,
+    f.MaxPostScoreRank,
+    case 
+        when f.GoldBadges > 5 then 'Elite User'
+        when f.SilverBadges > 10 then 'Advanced User'
+        else 'Regular User'
+    end as UserLevel,
+    -- String expression with NULL logic
+    coalesce(u.WebsiteUrl, 'No Website') as Website,
+    coalesce(nullif(u.Location,''), 'Unknown') as Location,
+    -- Calculate days since last activity
+    extract(day from cast('2024-10-01 12:34:56' as timestamp) - f.LatestActivity) as DaysSinceLastActivity
+from FinalStats f
+join Users u on u.Id = f.UserId
+where f.QuestionsCount > 10
+and f.AvgPostScore > 1.5
+order by f.GoldBadges desc, f.Reputation desc, f.LatestActivity desc
+limit 100;

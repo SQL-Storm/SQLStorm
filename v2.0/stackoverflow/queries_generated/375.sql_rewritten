@@ -1,0 +1,273 @@
+-- {"query": "375.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2380} 
+with
+params as (
+  select
+    date_trunc('month', cast('2024-10-01 12:34:56' as timestamp)) - interval '24 months' as from_month,
+    date_trunc('month', cast('2024-10-01 12:34:56' as timestamp)) as to_month
+),
+months as (
+  select generate_series((select from_month from params), (select to_month from params), interval '1 month')::date as month_start
+),
+question_base as (
+  select
+    p.Id,
+    p.CreationDate::date as created_date,
+    date_trunc('month', p.CreationDate)::date as month_start,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.Title,
+    p.Tags,
+    p.AcceptedAnswerId,
+    p.ClosedDate,
+    p.LastActivityDate
+  from Posts p
+  where p.PostTypeId = 1
+    and p.CreationDate >= (select from_month from params)
+    and p.CreationDate < (select to_month from params) + interval '1 month'
+),
+answers as (
+  select
+    a.ParentId as QuestionId,
+    count(*) as answer_count,
+    max(a.Score) as max_answer_score,
+    min(a.CreationDate) as first_answer_date,
+    max(a.CreationDate) as last_answer_date
+  from Posts a
+  where a.PostTypeId = 2
+  group by a.ParentId
+),
+accepted_latency as (
+  select
+    q.Id as QuestionId,
+    extract(epoch from (acc.CreationDate - q.CreationDate))/3600.0 as hours_to_accept
+  from question_base q
+  left join Posts acc on acc.Id = q.AcceptedAnswerId
+),
+votes_agg as (
+  select
+    v.PostId,
+    sum(case when v.VoteTypeId = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.VoteTypeId = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.VoteTypeId = 5 then 1 else 0 end) as favorites,
+    sum(case when v.VoteTypeId = 8 then coalesce(v.BountyAmount,0) else 0 end) as bounty_started,
+    sum(case when v.VoteTypeId = 9 then coalesce(v.BountyAmount,0) else 0 end) as bounty_awarded
+  from Votes v
+  group by v.PostId
+),
+postlinks_dups as (
+  select
+    pl.PostId,
+    count(*) filter (where pl.LinkTypeId = 3) as duplicate_links,
+    count(*) filter (where pl.LinkTypeId = 1) as linked_links
+  from PostLinks pl
+  group by pl.PostId
+),
+close_events as (
+  select
+    ph.PostId,
+    min(ph.CreationDate) filter (where ph.PostHistoryTypeId = 10) as first_closed_at,
+    max(ph.CreationDate) filter (where ph.PostHistoryTypeId = 11) as last_reopened_at,
+    count(*) filter (where ph.PostHistoryTypeId = 10) as close_votes_events
+  from PostHistory ph
+  where ph.PostHistoryTypeId in (10,11)
+  group by ph.PostId
+),
+users_norm as (
+  select
+    u.Id,
+    u.Reputation,
+    u.CreationDate,
+    coalesce(nullif(trim(u.Location), ''), 'Unknown') as LocationNorm,
+    coalesce(nullif(trim(u.DisplayName), ''), concat('user_', u.Id::varchar)) as DisplayNameNorm,
+    u.UpVotes,
+    u.DownVotes,
+    u.Views
+  from Users u
+),
+tag_explode as (
+  select
+    q.Id as QuestionId,
+    unnest(string_to_array(substring(q.Tags, 2, length(q.Tags)-2), '><')) as tag
+  from question_base q
+  where q.Tags is not null and length(q.Tags) >= 2
+),
+tag_stats as (
+  select
+    te.QuestionId,
+    te.tag,
+    t.Count as tag_global_count,
+    row_number() over (partition by te.QuestionId order by t.Count desc nulls last, te.tag) as tag_rank_by_popularity
+  from tag_explode te
+  left join Tags t on t.TagName = te.tag
+),
+title_signals as (
+  select
+    q.Id as QuestionId,
+    length(coalesce(q.Title, '')) as title_len,
+    regexp_count(coalesce(q.Title,''), '\?') as question_marks,
+    case when lower(coalesce(q.Title,'')) ~ '\bhow\b|\bwhy\b|\bwhat\b|\bcan\b' then 1 else 0 end as interrogative_flag
+  from question_base q
+),
+comment_agg as (
+  select
+    c.PostId,
+    count(*) as comment_count,
+    max(c.Score) as max_comment_score,
+    min(c.CreationDate) as first_comment_at
+  from Comments c
+  group by c.PostId
+),
+user_month_metrics as (
+  select
+    q.month_start,
+    q.OwnerUserId as UserId,
+    count(*) as user_questions,
+    sum(coalesce(v.Score,0)) as user_q_score,
+    sum(coalesce(q.ViewCount,0)) as user_q_views
+  from question_base q
+  left join Posts v on v.Id = q.Id
+  group by q.month_start, q.OwnerUserId
+),
+denorm as (
+  select
+    m.month_start,
+    q.Id as QuestionId,
+    q.OwnerUserId,
+    un.DisplayNameNorm,
+    un.Reputation,
+    un.LocationNorm,
+    q.Score as q_score,
+    q.ViewCount as q_views,
+    q.AcceptedAnswerId,
+    a.answer_count,
+    a.max_answer_score,
+    al.hours_to_accept,
+    va.upvotes,
+    va.downvotes,
+    va.favorites,
+    va.bounty_started,
+    va.bounty_awarded,
+    pl.duplicate_links,
+    pl.linked_links,
+    ce.first_closed_at,
+    ce.last_reopened_at,
+    ce.close_votes_events,
+    ts.tag,
+    ts.tag_global_count,
+    ts.tag_rank_by_popularity,
+    ti.title_len,
+    ti.question_marks,
+    ti.interrogative_flag,
+    ca.comment_count,
+    ca.max_comment_score,
+    ca.first_comment_at,
+    um.user_questions,
+    um.user_q_score,
+    um.user_q_views,
+    q.ClosedDate,
+    q.LastActivityDate
+  from months m
+  left join question_base q on q.month_start = m.month_start
+  left join users_norm un on un.Id = q.OwnerUserId
+  left join answers a on a.QuestionId = q.Id
+  left join accepted_latency al on al.QuestionId = q.Id
+  left join votes_agg va on va.PostId = q.Id
+  left join postlinks_dups pl on pl.PostId = q.Id
+  left join close_events ce on ce.PostId = q.Id
+  left join tag_stats ts on ts.QuestionId = q.Id and ts.tag_rank_by_popularity <= 3
+  left join title_signals ti on ti.QuestionId = q.Id
+  left join comment_agg ca on ca.PostId = q.Id
+  left join user_month_metrics um on um.month_start = q.month_start and um.UserId = q.OwnerUserId
+),
+scored as (
+  select
+    d.*,
+    coalesce(d.q_score,0)
+      + coalesce(d.upvotes,0)*0.8
+      - coalesce(d.downvotes,0)*0.5
+      + least(coalesce(d.answer_count,0), 5)*0.6
+      + case when d.AcceptedAnswerId is not null then 2 else 0 end
+      + ln(1 + greatest(coalesce(d.q_views,0),0)) as engagement_score_raw,
+    case
+      when d.ClosedDate is not null then 1
+      when d.duplicate_links > 0 then 0.5
+      else 0
+    end as risk_flag_raw
+  from denorm d
+),
+normalized as (
+  select
+    s.*,
+    percentile_disc(0.5) within group (order by s.engagement_score_raw) over (partition by s.month_start) as p50_eng,
+    percentile_disc(0.9) within group (order by s.engagement_score_raw) over (partition by s.month_start) as p90_eng,
+    avg(s.engagement_score_raw) over (partition by s.month_start) as avg_eng,
+    stddev_pop(s.engagement_score_raw) over (partition by s.month_start) as std_eng
+  from scored s
+),
+final_calc as (
+  select
+    n.*,
+    case
+      when n.std_eng is null or n.std_eng = 0 then null
+      else (n.engagement_score_raw - n.avg_eng)/n.std_eng
+    end as engagement_zscore,
+    case
+      when n.engagement_score_raw is null or n.p90_eng is null or n.p90_eng = 0 then null
+      else n.engagement_score_raw / nullif(n.p90_eng,0)
+    end as engagement_index,
+    case
+      when coalesce(n.close_votes_events,0) >= 2 then 'High'
+      when coalesce(n.duplicate_links,0) >= 1 then 'Medium'
+      when n.ClosedDate is not null then 'Closed'
+      else 'Low'
+    end as moderation_risk_level
+  from normalized n
+),
+ranked as (
+  select
+    fc.*,
+    row_number() over (
+      partition by fc.month_start
+      order by
+        fc.engagement_index desc nulls last,
+        fc.engagement_zscore desc nulls last,
+        coalesce(fc.q_views,0) desc,
+        coalesce(fc.answer_count,0) desc,
+        fc.QuestionId
+    ) as month_rank
+  from final_calc fc
+)
+select
+  r.month_start,
+  r.month_rank,
+  r.QuestionId,
+  coalesce(r.DisplayNameNorm, 'unknown') as owner_display_name,
+  coalesce(r.LocationNorm, 'Unknown') as owner_location,
+  coalesce(r.tag, '(no tag)') as top_tag,
+  r.tag_rank_by_popularity,
+  r.tag_global_count,
+  r.q_score,
+  r.q_views,
+  r.answer_count,
+  r.max_answer_score,
+  round(coalesce(r.hours_to_accept, -1)::numeric, 2) as hours_to_accept,
+  r.upvotes,
+  r.downvotes,
+  r.favorites,
+  r.bounty_started,
+  r.bounty_awarded,
+  r.duplicate_links,
+  r.linked_links,
+  r.comment_count,
+  r.max_comment_score,
+  r.first_comment_at,
+  r.first_closed_at,
+  r.last_reopened_at,
+  r.close_votes_events,
+  r.moderation_risk_level,
+  round(coalesce(r.engagement_index,0)::numeric, 4) as engagement_index,
+  round(coalesce(r.engagement_zscore,0)::numeric, 4) as engagement_zscore
+from ranked r
+where r.month_rank <= 50
+order by r.month_start, r.month_rank, r.QuestionId;

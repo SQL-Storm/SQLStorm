@@ -1,0 +1,129 @@
+WITH ranked_posts AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.Body,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.OwnerDisplayName,
+    p.LastEditorUserId,
+    p.LastEditorDisplayName,
+    p.LastEditDate,
+    p.ContentLicense,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.ProfileImageUrl,
+    /* EmailHash column removed/replaced because it does not exist in Users */
+    u.AccountId,
+    b.Class AS BadgeClass,
+    b.Name AS BadgeName,
+    b.Date AS BadgeDate,
+    b.TagBased,
+    vh.VoteCount
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS VoteCount
+    FROM Votes
+    WHERE VoteTypeId IN (2, 3)
+    GROUP BY PostId
+  ) vh ON vh.PostId = p.Id
+  WHERE p.PostTypeId IN (1, 2)
+    AND (p.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days'))
+),
+cte_tags AS (
+  SELECT
+    rp.PostId,
+    rp.Title,
+    rp.Tags,
+    CASE
+      WHEN rp.Tags IS NULL THEN NULL
+      ELSE string_to_array(substr(rp.Tags, 2, char_length(rp.Tags)-2), '><')
+    END AS tag_list,
+    rp.CreationDate,
+    rp.ViewCount,
+    rp.Score,
+    rp.OwnerUserId,
+    rp.OwnerDisplayName,
+    rp.Reputation,
+    rp.BadgeName,
+    rp.BadgeDate
+  FROM ranked_posts rp
+),
+tag_cross AS (
+  SELECT
+    t.PostId,
+    t.Title,
+    t.tag_list,
+    t.CreationDate,
+    t.ViewCount,
+    t.Score,
+    t.OwnerUserId,
+    t.OwnerDisplayName,
+    t.Reputation,
+    t.BadgeName,
+    t.BadgeDate
+  FROM cte_tags t
+),
+windowed AS (
+  SELECT
+    pc.PostId,
+    pc.Title,
+    pc.tag_list,
+    pc.Reputation,
+    pc.ViewCount,
+    pc.Score,
+    pc.BadgeDate,
+    ROW_NUMBER() OVER (
+      PARTITION BY pc.Title
+      ORDER BY pc.Reputation DESC, pc.Score DESC, pc.ViewCount DESC
+    ) AS rn
+  FROM tag_cross pc
+  WHERE pc.tag_list IS NOT NULL
+),
+final AS (
+  SELECT
+    w.PostId,
+    w.Title,
+    w.tag_list,
+    w.Reputation,
+    w.ViewCount,
+    w.Score,
+    w.BadgeDate,
+    w.rn,
+    CASE
+      WHEN w.rn = 1 THEN 'Top match'
+      ELSE 'Other'
+    END AS MatchQuality
+  FROM windowed w
+)
+SELECT
+  f.PostId,
+  f.Title,
+  f.tag_list,
+  f.Reputation,
+  f.ViewCount,
+  f.Score,
+  f.BadgeDate,
+  f.rn,
+  f.MatchQuality,
+  (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = f.PostId) AS RelatedPostsCount,
+  (SELECT MAX(p3.LastActivityDate) FROM Posts p3 WHERE p3.OwnerUserId = f.PostId) AS LastOwnerActivity
+FROM final f
+ORDER BY f.MatchQuality DESC, f.Score DESC, f.ViewCount DESC
+LIMIT 100;

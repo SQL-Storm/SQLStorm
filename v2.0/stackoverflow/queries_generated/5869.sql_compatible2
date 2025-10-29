@@ -1,0 +1,100 @@
+WITH
+RecentEdits AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.ViewCount,
+    p.Score,
+    p.OwnerUserId,
+    p.Tags,
+    p.PostTypeId,
+    p.LastActivityDate,
+    MAX(ph.CreationDate) AS LastEditDate
+  FROM Posts p
+  LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+  GROUP BY
+    p.Id, p.Title, p.CreationDate, p.ViewCount, p.Score,
+    p.OwnerUserId, p.Tags, p.PostTypeId, p.LastActivityDate
+),
+TagMetrics AS (
+  SELECT
+    t.TagName,
+    COUNT(*) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+    AVG(p.Score) AS AvgScore,
+    SUM(p.ViewCount) AS TotalViews,
+    MAX(p.LastActivityDate) AS LastActive
+  FROM Posts p
+  CROSS JOIN LATERAL (
+    SELECT unnest(string_to_array(coalesce(p.Tags, ''), '><')) AS tag
+  ) tg
+  LEFT JOIN Tags t ON t.TagName = tg.tag
+  GROUP BY t.TagName
+),
+Related AS (
+  SELECT
+    pl.PostId,
+    pl.RelatedPostId,
+    lt.Name AS LinkType,
+    COALESCE(v.SumVotes, 0) AS SumVotes
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+  LEFT JOIN (
+    SELECT vt.PostId, SUM(CASE WHEN vt.VoteTypeId = 2 THEN 1 ELSE 0 END) AS SumVotes
+    FROM Votes vt
+    GROUP BY vt.PostId
+  ) v ON v.PostId = pl.RelatedPostId
+),
+Ranked AS (
+  SELECT
+    re.PostId,
+    re.Title,
+    re.CreationDate,
+    re.LastEditDate,
+    re.ViewCount,
+    re.Score,
+    re.PostTypeId,
+    ROW_NUMBER() OVER (PARTITION BY re.PostTypeId ORDER BY re.LastActivityDate DESC, re.Score DESC, re.ViewCount DESC) AS rn
+  FROM RecentEdits re
+)
+SELECT
+  p.Id AS PostId,
+  p.PostTypeId,
+  pt.Name AS PostTypeName,
+  u.DisplayName AS Owner,
+  p.Title,
+  p.Tags,
+  p.CreationDate,
+  p.LastActivityDate,
+  re.LastEditDate,
+  p.ViewCount,
+  p.Score,
+  p.FavoriteCount,
+  COALESCE(closed.Name, 'Open') AS ClosedStatus,
+  (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCount,
+  (CASE WHEN p.OwnerUserId IS NULL THEN 'Unknown' ELSE u.DisplayName END) AS OwnerDisplay,
+  (CASE WHEN p.Body ~ 'https?://[^ ]+' THEN 'ContainsLink' ELSE 'NoLink' END) AS BodyLinkIndicator,
+  (SELECT COUNT(*) FROM PostLinks pl2 WHERE pl2.PostId = p.Id) AS LinkCount,
+  rw.rnk AS RankWithinType
+FROM Posts p
+JOIN PostTypes pt ON pt.Id = p.PostTypeId
+LEFT JOIN Users u ON u.Id = p.OwnerUserId
+LEFT JOIN Ranked re ON re.PostId = p.Id
+LEFT JOIN (
+  SELECT
+    p2.Id,
+    p2.PostTypeId,
+    p2.LastActivityDate,
+    ROW_NUMBER() OVER (PARTITION BY p2.PostTypeId ORDER BY p2.LastActivityDate DESC) AS rnk
+  FROM Posts p2
+  GROUP BY p2.Id, p2.PostTypeId, p2.LastActivityDate
+) rw ON rw.Id = p.Id
+LEFT JOIN (
+  SELECT Id, Name FROM CloseReasonTypes
+) closed ON closed.Id = p.ClosedDate::int
+WHERE
+  p.LastActivityDate IS NOT NULL
+  AND p.ViewCount > 0
+  AND (p.Score > 0 OR p.FavoriteCount > 0)
+ORDER BY p.LastActivityDate DESC
+LIMIT 100;

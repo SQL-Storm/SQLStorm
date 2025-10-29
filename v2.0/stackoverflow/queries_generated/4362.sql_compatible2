@@ -1,0 +1,138 @@
+WITH RankedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        pt.Name AS PostTypeName,
+        ROW_NUMBER() OVER(PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.FavoriteCount DESC) as rn
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.Score > 0 AND p.CreationDate > (CAST('2024-10-01' AS date) - INTERVAL '1 year')
+),
+UserPostStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS TotalAnswerScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE NULL END) AS AvgAnswerScore,
+        MAX(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS MaxAnswerScore,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName
+),
+TopUsersByQuestions AS (
+    SELECT
+        UserId,
+        DisplayName,
+        QuestionCount,
+        TotalAnswerScore,
+        ROW_NUMBER() OVER(ORDER BY QuestionCount DESC, TotalAnswerScore DESC) as user_rn
+    FROM UserPostStats
+    WHERE QuestionCount > 10
+),
+TagEngagement AS (
+    SELECT
+        t.TagName,
+        COUNT(DISTINCT p.Id) AS TaggedPostCount,
+        SUM(p.Score) AS TotalScoreForTag,
+        AVG(p.Score) AS AvgScoreForTag,
+        MAX(p.Score) AS MaxScoreForTag
+    FROM Tags t
+    JOIN Posts p ON POSITION(t.TagName IN p.Tags) > 0
+    WHERE p.PostTypeId = 1 AND p.Score > 0
+    GROUP BY t.TagName
+    HAVING COUNT(DISTINCT p.Id) > 50
+),
+ClosedPostReasons AS (
+    SELECT
+        p.Id AS PostId,
+        crt.Name AS CloseReason,
+        COUNT(ph.Id) AS NumberOfCloseEvents
+    FROM Posts p
+    JOIN PostHistory ph ON p.Id = ph.PostId
+    JOIN CloseReasonTypes crt ON CAST(ph.Comment AS INTEGER) = crt.Id
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY p.Id, crt.Name
+    HAVING COUNT(ph.Id) >= 2
+),
+PostAggregations AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate))/60 AS MinutesToLastActivity,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.FavoriteCount > 100 THEN 'Highly Favorited'
+            WHEN p.Score > 100 THEN 'Highly Scored'
+            ELSE 'Standard'
+        END AS PostStatus,
+        COUNT(c.Id) AS CommentCountOnPost,
+        SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicateLinkCount,
+        (
+            SELECT COUNT(*)
+            FROM PostHistory ph2
+            WHERE ph2.PostId = p.Id AND ph2.PostHistoryTypeId IN (5, 8)
+        ) AS BodyEditCount
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+    WHERE p.PostTypeId = 1 AND p.CreationDate > DATE '2020-01-01'
+    GROUP BY
+        p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.ClosedDate, p.LastActivityDate
+)
+SELECT
+    rp.PostId,
+    rp.Title AS QuestionTitle,
+    rp.PostTypeName,
+    rp.Score AS QuestionScore,
+    rp.AnswerCount AS QuestionAnswerCount,
+    rp.FavoriteCount AS QuestionFavoriteCount,
+    rp.CreationDate AS QuestionCreationDate,
+    COALESCE(pa.PostStatus, 'N/A') AS DerivedPostStatus,
+    COALESCE(pa.MinutesToLastActivity, -1) AS MinutesSinceCreationToActivity,
+    COALESCE(pa.CommentCountOnPost, 0) AS TotalCommentsOnQuestion,
+    COALESCE(pa.DuplicateLinkCount, 0) AS DuplicateLinks,
+    COALESCE(pa.BodyEditCount, 0) AS BodyRevisionCount,
+    COALESCE(cl.CloseReason, 'Not Closed') AS LastCloseReason,
+    COALESCE(te.TagName, 'No Tags') AS PrimaryTag,
+    COALESCE(te.TaggedPostCount, 0) AS TaggedPostCountForPrimaryTag,
+    COALESCE(te.AvgScoreForTag, 0.0) AS AvgScoreForPrimaryTag,
+    tuq.DisplayName AS TopQuestioner,
+    tuq.QuestionCount AS TopQuestionerTotalQuestions,
+    ups.UpVoteCount AS UserUpVotes,
+    ups.DownVoteCount AS UserDownVotes,
+    ups.BadgeCount AS UserBadges,
+    ups.TotalAnswerScore AS UserTotalAnswerScore,
+    ups.AvgAnswerScore AS UserAvgAnswerScore
+FROM RankedPosts rp
+LEFT JOIN PostAggregations pa ON rp.PostId = pa.PostId
+LEFT JOIN ClosedPostReasons cl ON rp.PostId = cl.PostId AND cl.NumberOfCloseEvents = (
+    SELECT MAX(NumberOfCloseEvents) FROM ClosedPostReasons cpr WHERE cpr.PostId = rp.PostId
+)
+LEFT JOIN (
+    SELECT TagName, TaggedPostCount, AvgScoreForTag, ROW_NUMBER() OVER(ORDER BY TaggedPostCount DESC) as tag_rn
+    FROM TagEngagement
+) te ON te.tag_rn = 1
+LEFT JOIN TopUsersByQuestions tuq ON tuq.user_rn = 1
+LEFT JOIN UserPostStats ups ON rp.OwnerUserId = ups.UserId
+WHERE rp.rn <= 100
+ORDER BY rp.Score DESC, rp.FavoriteCount DESC
+LIMIT 200;

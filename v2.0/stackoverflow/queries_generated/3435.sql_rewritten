@@ -1,0 +1,157 @@
+-- {"query": "3435.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1777} 
+WITH 
+-- 1. Gather user basic stats and recent activity
+user_stats AS (
+    SELECT 
+        u.Id                                      AS user_id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        COALESCE(u.Views, 0)                      AS total_views,
+        COALESCE(u.UpVotes, 0) - COALESCE(u.DownVotes, 0) AS net_votes,
+        -- recent post activity (last 30 days)
+        (SELECT MAX(p.CreationDate) 
+         FROM Posts p 
+         WHERE p.OwnerUserId = u.Id 
+           AND p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '30 days') AS recent_post_date,
+        -- recent comment activity (last 30 days)
+        (SELECT MAX(c.CreationDate) 
+         FROM Comments c 
+         WHERE c.UserId = u.Id 
+           AND c.CreationDate >= cast('2024-10-01' as date) - INTERVAL '30 days') AS recent_comment_date
+    FROM Users u
+),
+
+-- 2. Badge aggregation per user (including tag‑based flag)
+badge_counts AS (
+    SELECT 
+        b.UserId                                 AS user_id,
+        COUNT(*)                                 AS total_badges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_badges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_badges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_badges,
+        SUM(CASE WHEN b.TagBased = 1 THEN 1 ELSE 0 END) AS tag_badges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+-- 3. Post performance metrics per user (questions only)
+question_metrics AS (
+    SELECT 
+        p.OwnerUserId                              AS user_id,
+        COUNT(*)                                   AS question_count,
+        AVG(p.Score)                               AS avg_question_score,
+        AVG(p.ViewCount)                           AS avg_view_count,
+        SUM(p.FavoriteCount)                       AS total_favorites,
+        SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS questions_with_accepted,
+        MAX(p.CreationDate)                        AS latest_question_date
+    FROM Posts p
+    WHERE p.PostTypeId = 1                -- Question
+    GROUP BY p.OwnerUserId
+),
+
+-- 4. Answer performance per user (answers only)
+answer_metrics AS (
+    SELECT 
+        p.OwnerUserId                              AS user_id,
+        COUNT(*)                                   AS answer_count,
+        AVG(p.Score)                               AS avg_answer_score,
+        SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS accepted_answers,
+        MAX(p.CreationDate)                        AS latest_answer_date
+    FROM Posts p
+    WHERE p.PostTypeId = 2                -- Answer
+    GROUP BY p.OwnerUserId
+),
+
+-- 5. Vote summary per user (votes they cast)
+vote_summary AS (
+    SELECT 
+        v.UserId                                    AS user_id,
+        COUNT(*)                                    AS total_votes_cast,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes_cast,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes_cast,
+        SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS favorites_cast
+    FROM Votes v
+    WHERE v.UserId IS NOT NULL
+    GROUP BY v.UserId
+),
+
+-- 6. Recent tag usage per user (derived from question tags)
+tag_usage AS (
+    SELECT 
+        p.OwnerUserId                              AS user_id,
+        unnest(string_to_array(trim(both '<>' FROM p.Tags), '><')) AS tag,
+        COUNT(*)                                   AS tag_uses
+    FROM Posts p
+    WHERE p.PostTypeId = 1                         -- Question
+      AND p.Tags IS NOT NULL
+    GROUP BY p.OwnerUserId, tag
+),
+
+-- 7. Top 3 tags per user based on usage (window function)
+top_tags AS (
+    SELECT 
+        user_id,
+        tag,
+        tag_uses,
+        ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY tag_uses DESC, tag) AS rn
+    FROM tag_usage
+),
+
+-- 8. Assemble final enriched user profile
+final_profile AS (
+    SELECT 
+        us.user_id,
+        us.DisplayName,
+        us.Reputation,
+        us.total_views,
+        us.net_votes,
+        COALESCE(bc.total_badges,0)                AS total_badges,
+        COALESCE(bc.gold_badges,0)                 AS gold_badges,
+        COALESCE(bc.silver_badges,0)               AS silver_badges,
+        COALESCE(bc.bronze_badges,0)               AS bronze_badges,
+        COALESCE(bc.tag_badges,0)                  AS tag_badges,
+        COALESCE(qm.question_count,0)              AS question_count,
+        COALESCE(qm.avg_question_score,0)          AS avg_question_score,
+        COALESCE(qm.avg_view_count,0)              AS avg_view_count,
+        COALESCE(qm.total_favorites,0)             AS total_favorites,
+        COALESCE(qm.questions_with_accepted,0)    AS questions_with_accepted,
+        COALESCE(am.answer_count,0)                AS answer_count,
+        COALESCE(am.avg_answer_score,0)            AS avg_answer_score,
+        COALESCE(am.accepted_answers,0)            AS accepted_answers,
+        COALESCE(vs.total_votes_cast,0)            AS total_votes_cast,
+        COALESCE(vs.upvotes_cast,0)                AS upvotes_cast,
+        COALESCE(vs.downvotes_cast,0)              AS downvotes_cast,
+        COALESCE(vs.favorites_cast,0)              AS favorites_cast,
+        -- Concatenate top 3 tags into a pipe‑separated string
+        (SELECT string_agg(t.tag, '|') 
+         FROM top_tags t 
+         WHERE t.user_id = us.user_id AND t.rn <= 3) AS top_three_tags,
+        -- Boolean flag: recently active (post or comment in last 30 days)
+        CASE 
+            WHEN GREATEST(
+                    COALESCE(us.recent_post_date, TIMESTAMP '1970-01-01'), 
+                    COALESCE(us.recent_comment_date, TIMESTAMP '1970-01-01')
+                 ) >= cast('2024-10-01' as date) - INTERVAL '30 days' THEN 1
+            ELSE 0
+        END AS is_recently_active,
+        -- Days since account creation
+        DATE_PART('day', cast('2024-10-01' as date) - us.CreationDate) AS days_since_creation,
+        -- Reputation per day (avoid division by zero)
+        ROUND(us.Reputation / NULLIF(DATE_PART('day', cast('2024-10-01' as date) - us.CreationDate),0)::numeric,2) 
+                                                     AS rep_per_day
+    FROM user_stats us
+    LEFT JOIN badge_counts bc      ON bc.user_id = us.user_id
+    LEFT JOIN question_metrics qm  ON qm.user_id = us.user_id
+    LEFT JOIN answer_metrics am    ON am.user_id = us.user_id
+    LEFT JOIN vote_summary vs      ON vs.user_id = us.user_id
+)
+
+SELECT *
+FROM final_profile
+WHERE total_badges >= 5
+   OR (question_count + answer_count) >= 50
+   OR rep_per_day > 10
+ORDER BY rep_per_day DESC, Reputation DESC
+LIMIT 100;

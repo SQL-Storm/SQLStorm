@@ -1,0 +1,150 @@
+with RecursiveRankedPosts as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        u.Reputation as OwnerReputation,
+        u.DisplayName as OwnerName,
+        coalesce(p.Score * 0.7 + p.ViewCount * 0.2 + p.FavoriteCount * 3.0 + u.Reputation * 0.001, 0) as WeightedScore,
+        row_number() over(partition by p.PostTypeId order by coalesce(p.Score * 0.7 + p.ViewCount * 0.2 + p.FavoriteCount * 3.0 + u.Reputation * 0.001, 0) desc) as rn
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId in (1,2)
+), 
+FilteredPosts as (
+    select * from RecursiveRankedPosts where rn <= 100
+),
+QuestionAnswerPairs as (
+    select 
+        q.Id as QuestionId,
+        q.Title as QuestionTitle,
+        q.Tags as QuestionTags,
+        q.ViewCount as QuestionViews,
+        q.Score as QuestionScore,
+        q.OwnerUserId as QuestionOwnerId,
+        q.OwnerName as QuestionOwner,
+        q.WeightedScore as QuestionWeightedScore,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreationDate,
+        a.OwnerUserId as AnswerOwnerId,
+        au.DisplayName as AnswerOwnerName,
+        a.WeightedScore as AnswerWeightedScore
+    from FilteredPosts q 
+    left join FilteredPosts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Users au on a.OwnerUserId = au.Id
+    where q.PostTypeId = 1
+),
+CommentStats as (
+    select
+        p.Id as PostId,
+        count(c.Id) as TotalComments,
+        sum(case when c.UserId is not null then 1 else 0 end) filter (where c.Text ilike '%performance%') as CommentsMentioningPerformance,
+        max(c.CreationDate) as LastCommentDate
+    from Posts p 
+    left join Comments c on c.PostId = p.Id
+    group by p.Id
+),
+UserBadgeSummary as (
+    select 
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        count(*) as TotalBadges,
+        max(b.Date) as LatestBadgeDate
+    from Badges b
+    group by b.UserId
+),
+AnswerRankings as (
+    select
+        qap.*,
+        row_number() over(partition by qap.QuestionId order by qap.AnswerScore desc, qap.AnswerCreationDate asc) as AnswerRank
+    from QuestionAnswerPairs qap
+),
+AggregatedLinks as (
+    select
+        pl.PostId,
+        lt.Name as LinkTypeName,
+        count(distinct pl.RelatedPostId) as RelatedPostCount
+    from PostLinks pl
+    inner join LinkTypes lt on pl.LinkTypeId = lt.Id
+    group by pl.PostId, lt.Name
+),
+TagUsage as (
+    select
+        lower(tag) as Tag,
+        count(*) as QuestionCount
+    from (
+        select unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags) - 2), '><')) as tag
+        from Posts p 
+        where p.PostTypeId = 1 and p.Tags is not null
+    ) tags
+    group by lower(tag)
+    having count(*) > 10
+),
+TopTagsWithScores as (
+    select 
+        tu.Tag,
+        tu.QuestionCount,
+        avg(coalesce(p.Score,0)) as AverageScore,
+        avg(coalesce(p.ViewCount,0)) as AverageViewCount
+    from TagUsage tu
+    inner join Posts p on p.PostTypeId = 1 and p.Tags is not null and p.Tags ilike ('%' || '<' || tu.Tag || '>' || '%')
+    group by tu.Tag, tu.QuestionCount
+),
+FinalOutput as (
+    select 
+        ar.QuestionId,
+        ar.QuestionTitle,
+        ar.QuestionTags,
+        ar.QuestionViews,
+        ar.QuestionScore,
+        ar.QuestionOwner,
+        coalesce(ubs.GoldBadges,0) as QuestionOwnerGoldBadges,
+        coalesce(ubs.SilverBadges,0) as QuestionOwnerSilverBadges,
+        coalesce(ubs.BronzeBadges,0) as QuestionOwnerBronzeBadges,
+        ar.AnswerId,
+        ar.AnswerScore,
+        ar.AnswerCreationDate,
+        coalesce(aru.DisplayName,'(deleted)') as AnswerOwnerName,
+        coalesce(arb.TotalBadges, 0) as AnswerOwnerTotalBadges,
+        ar.AnswerRank,
+        cs.TotalComments,
+        cs.CommentsMentioningPerformance,
+        cs.LastCommentDate,
+        al.LinkTypeName,
+        al.RelatedPostCount,
+        ttws.Tag,
+        ttws.QuestionCount as TagQuestionCount,
+        ttws.AverageScore as TagAverageScore,
+        ttws.AverageViewCount as TagAverageViewCount,
+        ar.QuestionWeightedScore,
+        ar.AnswerWeightedScore
+    from AnswerRankings ar
+    left join Users ubs on ar.QuestionOwnerId = ubs.Id
+    left join UserBadgeSummary arb on ar.AnswerOwnerId = arb.UserId
+    left join Users aru on ar.AnswerOwnerId = aru.Id
+    left join CommentStats cs on cs.PostId = ar.QuestionId
+    left join AggregatedLinks al on al.PostId = ar.QuestionId
+    left join TopTagsWithScores ttws on ar.QuestionTags ilike ('%' || '<' || ttws.Tag || '>' || '%')
+    where ar.AnswerRank <= 3
+)
+select *
+from FinalOutput
+where 
+    (QuestionViews > 1000 or QuestionScore > 5)
+    and (AnswerScore > 0 or AnswerId is null)
+    and (CommentsMentioningPerformance > 0 or LinkTypeName is not null)
+order by QuestionWeightedScore desc, AnswerWeightedScore desc, CommentsMentioningPerformance desc nulls last
+limit 100;

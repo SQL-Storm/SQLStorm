@@ -1,0 +1,192 @@
+-- {"query": "1451.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2916} 
+WITH UserContributionSummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        AVG(CASE WHEN P.Score IS NOT NULL THEN P.Score ELSE 0 END) AS AvgPostScore,
+        MAX(P.CreationDate) AS LastPostDate,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        COUNT(DISTINCT VH.PostId) FILTER (WHERE VH.VoteTypeId = 2) AS TotalUpvotesGiven,
+        COUNT(DISTINCT VH.PostId) FILTER (WHERE VH.VoteTypeId = 3) AS TotalDownvotesGiven,
+        ROW_NUMBER() OVER (ORDER BY U.Reputation DESC, COUNT(DISTINCT P.Id) DESC) AS UserRankByReputation,
+        FIRST_VALUE(B.Name) OVER (PARTITION BY U.Id ORDER BY B.Date DESC) AS LatestBadgeName, -- Window function: latest badge
+        LAG(U.LastAccessDate, 1, U.CreationDate) OVER (PARTITION BY U.Id ORDER BY U.LastAccessDate) AS PrevLastAccessDate -- Window function: time between user accesses (more meaningful if multiple access dates were logged per user, but serves as an example)
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN Votes VH ON U.Id = VH.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate
+),
+PostDetailedMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.OwnerUserId,
+        P.AcceptedAnswerId,
+        P.ParentId,
+        P.LastActivityDate,
+        P.ClosedDate,
+        COALESCE(P.FavoriteCount, 0) AS FavoriteCount,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesReceived,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesReceived,
+        COUNT(DISTINCT PH.Id) AS TotalHistoryEntries,
+        EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - P.CreationDate)) / (60 * 60 * 24) AS PostAgeDays,
+        EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - P.LastActivityDate)) / (60 * 60 * 24) AS DaysSinceLastActivity,
+        AVG(P_Ans.Score) FILTER (WHERE P.PostTypeId = 1 AND P_Ans.PostTypeId = 2) AS AvgAnswerScore,
+        RANK() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.ViewCount DESC) AS RankByEngagement,
+        NULLIF(SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) * 1.0 / NULLIF(SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS DownvoteToUpvoteRatio,
+        MAX(CASE WHEN L.LinkTypeId = 3 THEN 1 ELSE 0 END) AS HasDuplicateLink,
+        COUNT(DISTINCT C.Id) FILTER (WHERE C.UserId IS NULL) AS AnonymousCommentsCount -- Count of comments by anonymous users
+    FROM Posts P
+    LEFT JOIN Votes V ON P.Id = V.PostId
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    LEFT JOIN Posts P_Ans ON P.Id = P_Ans.ParentId AND P_Ans.PostTypeId = 2
+    LEFT JOIN PostLinks L ON P.Id = L.PostId
+    LEFT JOIN Comments C ON P.Id = C.PostId
+    GROUP BY P.Id, P.PostTypeId, P.CreationDate, P.Score, P.ViewCount, P.AnswerCount, P.CommentCount, P.OwnerUserId,
+             P.AcceptedAnswerId, P.ParentId, P.LastActivityDate, P.ClosedDate, P.FavoriteCount
+),
+PostEvolutionTracking AS (
+    SELECT
+        PH.PostId,
+        MIN(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.CreationDate ELSE NULL END) AS FirstEditDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.CreationDate ELSE NULL END) AS LastEditDate,
+        COUNT(DISTINCT PH.UserId) AS DistinctEditors,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (10, 12) THEN 1 ELSE 0 END) AS WasClosedOrDeleted,
+        AVG(EXTRACT(EPOCH FROM (LAG(PH.CreationDate) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate DESC) - PH.CreationDate))) AS AvgTimeBetweenEditsSeconds
+    FROM PostHistory PH
+    WHERE PH.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13)
+    GROUP BY PH.PostId
+)
+SELECT
+    'HighReputationUserQuestion' AS QueryType,
+    UCS.DisplayName AS AuthorDisplayName,
+    UCS.Reputation,
+    UCS.TotalQuestions,
+    PDM.PostId,
+    P.Title AS QuestionTitle,
+    P.Tags AS QuestionTags,
+    PDM.PostScore,
+    PDM.ViewCount,
+    PDM.AnswerCount,
+    PDM.CommentCount,
+    PDM.FavoriteCount,
+    PDM.TotalUpvotesReceived,
+    PDM.TotalDownvotesReceived,
+    PDM.DownvoteToUpvoteRatio,
+    PET.FirstEditDate,
+    PET.LastEditDate,
+    PET.DistinctEditors,
+    PDM.PostAgeDays,
+    PDM.DaysSinceLastActivity,
+    (SELECT COUNT(DISTINCT C.Id) FROM Comments C WHERE C.PostId = PDM.PostId AND C.UserId = UCS.UserId) AS AuthorCommentsOnOwnPost,
+    COALESCE(PDM.AvgAnswerScore, 0.0) AS AverageScoreOfAnswers,
+    CASE
+        WHEN PDM.DownvoteToUpvoteRatio IS NOT NULL AND PDM.DownvoteToUpvoteRatio > 0.5 THEN 'Potentially Controversial'
+        WHEN PDM.ClosedDate IS NOT NULL THEN 'Closed Question'
+        WHEN PDM.AcceptedAnswerId IS NOT NULL THEN 'Answered & Accepted'
+        ELSE 'Open Question'
+    END AS QuestionStatus,
+    REPLACE(REPLACE(P.Tags, '>', ' '), '<', '') AS CleanedTags,
+    LENGTH(P.Body) AS BodyLength,
+    POSITION('sql' IN LOWER(P.Body)) AS HasSqlKeywordInBody,
+    NULLIF(UCS.TotalBadges, 0) AS UserBadgesIfAny,
+    UCS.UserRankByReputation,
+    EXTRACT(WEEK FROM PDM.PostCreationDate) AS WeekOfCreation,
+    PDM.HasDuplicateLink,
+    PDM.AnonymousCommentsCount
+FROM UserContributionSummary UCS
+JOIN Posts P ON UCS.UserId = P.OwnerUserId
+JOIN PostDetailedMetrics PDM ON P.Id = PDM.PostId
+LEFT JOIN PostEvolutionTracking PET ON P.Id = PET.PostId
+WHERE P.PostTypeId = 1
+  AND UCS.Reputation > 15000
+  AND PDM.TotalUpvotesReceived > 75
+  AND PDM.ViewCount > 5000
+  AND PDM.PostAgeDays > 730
+  AND P.AcceptedAnswerId IS NOT NULL
+  AND COALESCE(PET.DistinctEditors, 0) >= 2 -- At least two distinct editors (owner + one more, or two non-owners)
+  AND (LOWER(P.Tags) LIKE '%<javascript>%' OR LOWER(P.Tags) LIKE '%<node.js>%')
+  AND NOT EXISTS (
+      SELECT 1
+      FROM PostHistory PH_DelClose
+      WHERE PH_DelClose.PostId = P.Id
+        AND PH_DelClose.PostHistoryTypeId IN (12, 10)
+        AND NOT EXISTS (
+            SELECT 1
+            FROM PostHistory PH_ReopenUndelete
+            WHERE PH_ReopenUndelete.PostId = P.Id
+              AND PH_ReopenUndelete.CreationDate > PH_DelClose.CreationDate
+              AND PH_ReopenUndelete.PostHistoryTypeId IN (11, 13)
+        )
+  )
+  AND PDM.AnonymousCommentsCount < PDM.CommentCount -- At least some comments are not anonymous
+
+UNION ALL
+
+SELECT
+    'ActiveRecentQuestion' AS QueryType,
+    COALESCE(UCS.DisplayName, 'Community') AS AuthorDisplayName,
+    COALESCE(UCS.Reputation, 0) AS Reputation,
+    COALESCE(UCS.TotalQuestions, 0) AS TotalQuestions,
+    PDM.PostId,
+    P.Title AS QuestionTitle,
+    P.Tags AS QuestionTags,
+    PDM.PostScore,
+    PDM.ViewCount,
+    PDM.AnswerCount,
+    PDM.CommentCount,
+    PDM.FavoriteCount,
+    PDM.TotalUpvotesReceived,
+    PDM.TotalDownvotesReceived,
+    PDM.DownvoteToUpvoteRatio,
+    PET.FirstEditDate,
+    PET.LastEditDate,
+    PET.DistinctEditors,
+    PDM.PostAgeDays,
+    PDM.DaysSinceLastActivity,
+    (SELECT COUNT(C2.Id) FROM Comments C2 WHERE C2.PostId = PDM.PostId AND C2.UserId = P.OwnerUserId) AS AuthorCommentsOnOwnPost,
+    COALESCE(PDM.AvgAnswerScore, 0.0) AS AverageScoreOfAnswers,
+    CASE
+        WHEN PDM.DownvoteToUpvoteRatio IS NOT NULL AND PDM.DownvoteToUpvoteRatio > 0.5 THEN 'Potentially Controversial'
+        WHEN PDM.ClosedDate IS NOT NULL THEN 'Closed Question'
+        WHEN PDM.AcceptedAnswerId IS NOT NULL THEN 'Answered & Accepted'
+        ELSE 'Open Question'
+    END AS QuestionStatus,
+    REPLACE(REPLACE(P.Tags, '>', ' '), '<', '') AS CleanedTags,
+    LENGTH(P.Body) AS BodyLength,
+    POSITION('python' IN LOWER(P.Body)) AS HasPythonKeywordInBody,
+    COALESCE(UCS.TotalBadges, 0) AS UserBadgesIfAny,
+    COALESCE(UCS.UserRankByReputation, 999999) AS UserRankByReputation,
+    EXTRACT(WEEK FROM PDM.PostCreationDate) AS WeekOfCreation,
+    PDM.HasDuplicateLink,
+    PDM.AnonymousCommentsCount
+FROM Posts P
+JOIN PostDetailedMetrics PDM ON P.Id = PDM.PostId
+LEFT JOIN UserContributionSummary UCS ON P.OwnerUserId = UCS.UserId
+LEFT JOIN PostEvolutionTracking PET ON P.Id = PET.PostId
+WHERE P.PostTypeId = 1
+  AND PDM.DaysSinceLastActivity < 60
+  AND PDM.TotalUpvotesReceived > 20
+  AND P.CreationDate BETWEEN (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '3 year') AND (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '6 month')
+  AND PDM.AnswerCount > 1
+  AND (P.OwnerUserId IS NULL OR NOT EXISTS (
+      SELECT 1 FROM Users U_low WHERE U_low.Id = P.OwnerUserId AND U_low.Reputation < 2000
+  ))
+  AND (NOT (LOWER(P.Tags) LIKE '%<php>%' OR LOWER(P.Tags) LIKE '%<wordpress>%') OR P.AcceptedAnswerId IS NOT NULL)
+  AND P.OwnerUserId IS NOT NULL -- Exclude strictly community-owned posts
+  AND PDM.RankByEngagement <= 1000 -- Only top 1000 engaged questions
+ORDER BY QuestionStatus DESC, Reputation DESC, PostAgeDays ASC
+LIMIT 5000;

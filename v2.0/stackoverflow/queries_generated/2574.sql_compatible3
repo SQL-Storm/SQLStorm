@@ -1,0 +1,241 @@
+WITH RecursiveUserBadgeCount AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.Id) AS Rnk,
+        u.Reputation
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(b.Id) > 0
+),
+TopUsersWithQuestionCounts AS (
+    SELECT
+        r.UserId,
+        r.DisplayName,
+        r.GoldBadges,
+        r.SilverBadges,
+        r.BronzeBadges,
+        r.Rnk,
+        COALESCE(q.QuestionCount, 0) AS QuestionCount,
+        COALESCE(a.AnswerCount, 0) AS AnswerCount,
+        COALESCE(vTotal.TotalVotes, 0) AS TotalVotes,
+        COALESCE(vUp.UpVotes, 0) AS UpVotes,
+        COALESCE(vDown.DownVotes, 0) AS DownVotes,
+        r.Reputation
+    FROM RecursiveUserBadgeCount r
+    LEFT JOIN (
+        SELECT OwnerUserId, COUNT(*) AS QuestionCount
+        FROM Posts
+        WHERE PostTypeId = 1
+        GROUP BY OwnerUserId
+    ) q ON q.OwnerUserId = r.UserId
+    LEFT JOIN (
+        SELECT OwnerUserId, COUNT(*) AS AnswerCount
+        FROM Posts
+        WHERE PostTypeId = 2
+        GROUP BY OwnerUserId
+    ) a ON a.OwnerUserId = r.UserId
+    LEFT JOIN (
+        SELECT p.OwnerUserId, COUNT(*) AS TotalVotes
+        FROM Votes v
+        JOIN Posts p ON p.Id = v.PostId
+        WHERE p.OwnerUserId IS NOT NULL
+        GROUP BY p.OwnerUserId
+    ) vTotal ON vTotal.OwnerUserId = r.UserId
+    LEFT JOIN (
+        SELECT p.OwnerUserId, COUNT(*) AS UpVotes
+        FROM Votes v
+        JOIN Posts p ON p.Id = v.PostId
+        WHERE v.VoteTypeId = 2
+        GROUP BY p.OwnerUserId
+    ) vUp ON vUp.OwnerUserId = r.UserId
+    LEFT JOIN (
+        SELECT p.OwnerUserId, COUNT(*) AS DownVotes
+        FROM Votes v
+        JOIN Posts p ON p.Id = v.PostId
+        WHERE v.VoteTypeId = 3
+        GROUP BY p.OwnerUserId
+    ) vDown ON vDown.OwnerUserId = r.UserId
+    WHERE r.Rnk <= 100
+),
+QuestionsWithDuplicateCounts AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        COUNT(pl.Id) FILTER (WHERE lt.Name = 'Duplicate') AS DuplicateCount,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Tags
+    FROM Posts p
+    LEFT JOIN PostLinks pl ON pl.RelatedPostId = p.Id
+    LEFT JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Title, p.OwnerUserId, p.Score, p.ViewCount, p.CreationDate, p.Tags
+),
+UserRecentActiveQuestions AS (
+    SELECT
+        q.Id,
+        q.Title,
+        q.OwnerUserId,
+        q.DuplicateCount,
+        q.Score,
+        q.ViewCount,
+        q.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY q.OwnerUserId ORDER BY q.CreationDate DESC) AS RecentRank
+    FROM QuestionsWithDuplicateCounts q
+    WHERE q.DuplicateCount = 0
+),
+UserTopQuestions AS (
+    SELECT
+        r.UserId,
+        r.DisplayName,
+        raq.Id AS QuestionId,
+        raq.Title,
+        raq.Score,
+        raq.ViewCount,
+        raq.CreationDate
+    FROM TopUsersWithQuestionCounts r
+    LEFT JOIN UserRecentActiveQuestions raq ON raq.OwnerUserId = r.UserId AND raq.RecentRank <= 3
+),
+UserAnswerStats AS (
+    SELECT
+        p.ParentId AS QuestionId,
+        COUNT(*) AS AnswerCount,
+        AVG(p.Score) AS AvgAnswerScore,
+        SUM(p.Score) AS SumAnswerScore,
+        MAX(p.Score) AS MaxAnswerScore
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+    GROUP BY p.ParentId
+),
+UserQuestionComments AS (
+    SELECT
+        p.Id AS PostId,
+        COUNT(c.Id) AS CommentCount,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM Posts p
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id
+),
+QuestionCloseStatus AS (
+    SELECT
+        ph.PostId,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS IsClosed,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) AS ClosedDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN cr.Name END) AS CloseReasonName
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes cr ON TRY_CAST(ph.Comment AS INTEGER) = cr.Id
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.PostId
+),
+FinalReport AS (
+    SELECT
+        u.UserId,
+        u.DisplayName,
+        u.GoldBadges,
+        u.SilverBadges,
+        u.BronzeBadges,
+        u.Reputation,
+        u.QuestionCount,
+        u.AnswerCount,
+        u.TotalVotes,
+        u.UpVotes,
+        u.DownVotes,
+        uq.QuestionId,
+        uq.Title AS QuestionTitle,
+        uq.Score AS QuestionScore,
+        uq.ViewCount AS QuestionViews,
+        us.AnswerCount AS QuestionAnswerCount,
+        us.AvgAnswerScore,
+        us.MaxAnswerScore,
+        uqc.CommentCount AS QuestionCommentCount,
+        COALESCE(qcs.IsClosed, 0) AS QuestionIsClosed,
+        qcs.CloseReasonName,
+        qcs.ClosedDate,
+        u.Rnk AS UserRank,
+        RANK() OVER (PARTITION BY u.UserId ORDER BY uq.Score DESC) AS QuestionScoreRank,
+        uq.CreationDate
+    FROM TopUsersWithQuestionCounts u
+    LEFT JOIN UserTopQuestions uq ON uq.UserId = u.UserId
+    LEFT JOIN UserAnswerStats us ON us.QuestionId = uq.QuestionId
+    LEFT JOIN UserQuestionComments uqc ON uqc.PostId = uq.QuestionId
+    LEFT JOIN QuestionCloseStatus qcs ON qcs.PostId = uq.QuestionId
+)
+SELECT
+    UserRank,
+    UserId,
+    DisplayName,
+    GoldBadges,
+    SilverBadges,
+    BronzeBadges,
+    Reputation,
+    QuestionCount,
+    AnswerCount,
+    TotalVotes,
+    UpVotes,
+    DownVotes,
+    QuestionId,
+    QuestionTitle,
+    QuestionScore,
+    QuestionViews,
+    QuestionAnswerCount,
+    AvgAnswerScore,
+    MaxAnswerScore,
+    QuestionCommentCount,
+    QuestionIsClosed,
+    CloseReasonName,
+    ClosedDate,
+    QuestionScoreRank,
+    CASE
+        WHEN QuestionIsClosed = 1 THEN
+            ('CLOSED - Reason: ' || COALESCE(CloseReasonName, 'Unknown')
+                   || '; Days Open: '
+                   || CAST(EXTRACT(day FROM (COALESCE(ClosedDate, TIMESTAMP '2024-10-01 12:34:56') - CreationDate)) AS INTEGER))
+        ELSE
+            'OPEN'
+    END AS QuestionStatus,
+    SUBSTRING(QuestionTitle FROM 1 FOR 10) || '...' AS QuestionTitleSnippet
+FROM FinalReport uq
+JOIN Users u ON u.Id = uq.UserId
+WHERE uq.QuestionId IS NOT NULL
+
+UNION ALL
+
+SELECT
+    9999 AS UserRank,
+    NULL AS UserId,
+    'Totals and Averages' AS DisplayName,
+    SUM(GoldBadges) AS GoldBadges,
+    SUM(SilverBadges) AS SilverBadges,
+    SUM(BronzeBadges) AS BronzeBadges,
+    SUM(Reputation) AS Reputation,
+    SUM(QuestionCount) AS QuestionCount,
+    SUM(AnswerCount) AS AnswerCount,
+    SUM(TotalVotes) AS TotalVotes,
+    SUM(UpVotes) AS UpVotes,
+    SUM(DownVotes) AS DownVotes,
+    NULL AS QuestionId,
+    NULL AS QuestionTitle,
+    CAST(AVG(QuestionScore) AS INTEGER) AS QuestionScore,
+    CAST(AVG(QuestionViews) AS INTEGER) AS QuestionViews,
+    CAST(AVG(QuestionAnswerCount) AS INTEGER) AS QuestionAnswerCount,
+    CAST(AVG(AvgAnswerScore) AS DECIMAL(10,2)) AS AvgAnswerScore,
+    MAX(MaxAnswerScore) AS MaxAnswerScore,
+    CAST(AVG(QuestionCommentCount) AS INTEGER) AS QuestionCommentCount,
+    NULL AS QuestionIsClosed,
+    NULL AS CloseReasonName,
+    NULL AS ClosedDate,
+    NULL AS QuestionScoreRank,
+    'Summary Row' AS QuestionStatus,
+    NULL AS QuestionTitleSnippet
+FROM FinalReport uq
+JOIN Users u ON u.Id = uq.UserId
+ORDER BY UserRank, QuestionScore DESC
+LIMIT 50;

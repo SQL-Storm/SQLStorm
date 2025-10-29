@@ -1,0 +1,166 @@
+WITH 
+UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.Location, '<unknown>') AS Location,
+        (
+            SELECT COUNT(*) 
+            FROM Posts p 
+            WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1
+        ) AS QuestionCount,
+        (
+            SELECT COUNT(*) 
+            FROM Posts p 
+            WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2
+        ) AS AnswerCount,
+        (
+            SELECT COUNT(*) 
+            FROM Comments c 
+            WHERE c.UserId = u.Id
+        ) AS CommentCount,
+        (
+            SELECT COUNT(*) 
+            FROM Badges b 
+            WHERE b.UserId = u.Id
+        ) AS BadgeCount,
+        (
+            SELECT MAX(p.CreationDate) 
+            FROM Posts p 
+            WHERE p.OwnerUserId = u.Id
+        ) AS LastPostDate
+    FROM Users u
+),
+TopTags AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS rn
+    FROM Tags t
+    WHERE COALESCE(t.IsModeratorOnly, 0) = 0
+),
+UserRecentPosts AS (
+    SELECT 
+        p.OwnerUserId,
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+),
+UserTagInfo AS (
+    WITH src AS (
+        SELECT 
+            p.OwnerUserId,
+            TRIM(BOTH '<>' FROM p.Tags) AS tagstring
+        FROM Posts p
+        WHERE p.Tags IS NOT NULL
+    )
+    SELECT 
+        pt.OwnerUserId,
+        pt.TagName,
+        ROW_NUMBER() OVER (PARTITION BY pt.OwnerUserId ORDER BY tt.Count DESC) AS rn
+    FROM (
+        SELECT value AS TagName, OwnerUserId
+        FROM (
+            WITH RECURSIVE splitter(remaining, OwnerUserId) AS (
+                SELECT src.tagstring, src.OwnerUserId FROM src
+                UNION ALL
+                SELECT
+                    CASE 
+                        WHEN POSITION('><' IN remaining) = 0 THEN ''
+                        ELSE SUBSTRING(remaining FROM POSITION('><' IN remaining) + 2)
+                    END,
+                    OwnerUserId
+                FROM splitter
+                WHERE remaining <> ''
+            ),
+            extracted AS (
+                SELECT
+                    CASE
+                        WHEN POSITION('><' IN remaining) = 0 THEN TRIM(remaining)
+                        ELSE TRIM(SUBSTRING(remaining FROM 1 FOR POSITION('><' IN remaining) - 1))
+                    END AS value,
+                    OwnerUserId
+                FROM splitter
+                WHERE remaining <> ''
+            )
+            SELECT value, OwnerUserId FROM extracted WHERE value <> ''
+        ) AS derived_values
+    ) pt(TagName, OwnerUserId)
+    JOIN Tags tt ON tt.TagName = pt.TagName
+),
+Combined AS (
+    SELECT 
+        us.Id,
+        us.DisplayName,
+        us.Reputation,
+        us.Location,
+        us.QuestionCount,
+        us.AnswerCount,
+        us.CommentCount,
+        us.BadgeCount,
+        us.LastPostDate,
+        COALESCE(urp.Title, '<no recent post>') AS RecentPostTitle,
+        COALESCE(urp.Score, 0) AS RecentPostScore,
+        CASE 
+            WHEN us.Reputation > 20000 THEN 'Elite'
+            WHEN us.Reputation > 5000 THEN 'Power'
+            ELSE 'Regular'
+        END AS ReputationTier,
+        CASE WHEN COUNT(CASE WHEN uti.rn <= 5 THEN 1 END) > 0
+             THEN STRING_AGG(CASE WHEN uti.rn <= 5 THEN uti.TagName END, ', ')
+             ELSE NULL
+        END AS Top5Tags
+    FROM UserStats us
+    LEFT JOIN UserRecentPosts urp ON urp.OwnerUserId = us.Id AND urp.rn = 1
+    LEFT JOIN UserTagInfo uti ON uti.OwnerUserId = us.Id
+    GROUP BY 
+        us.Id, us.DisplayName, us.Reputation, us.Location,
+        us.QuestionCount, us.AnswerCount, us.CommentCount,
+        us.BadgeCount, us.LastPostDate,
+        urp.Title, urp.Score
+    HAVING COUNT(CASE WHEN uti.rn <= 5 THEN 1 END) > 0
+),
+MainRows AS (
+    SELECT 
+        c.Id,
+        c.DisplayName,
+        c.Reputation,
+        c.Location,
+        c.QuestionCount,
+        c.AnswerCount,
+        c.CommentCount,
+        c.BadgeCount,
+        c.LastPostDate,
+        c.RecentPostTitle,
+        c.RecentPostScore,
+        c.ReputationTier,
+        c.Top5Tags
+    FROM Combined c
+    ORDER BY c.Reputation DESC
+    LIMIT 100
+),
+AggregateSummary AS (
+    SELECT 
+        CAST(NULL AS INTEGER) AS Id,
+        'Aggregate Summary' AS DisplayName,
+        CAST(NULL AS INTEGER) AS Reputation,
+        CAST(NULL AS VARCHAR(4000)) AS Location,
+        SUM(QuestionCount) AS QuestionCount,
+        SUM(AnswerCount) AS AnswerCount,
+        SUM(CommentCount) AS CommentCount,
+        SUM(BadgeCount) AS BadgeCount,
+        CAST(NULL AS TIMESTAMP) AS LastPostDate,
+        CAST(NULL AS VARCHAR(4000)) AS RecentPostTitle,
+        CAST(NULL AS INTEGER) AS RecentPostScore,
+        CAST(NULL AS VARCHAR(50)) AS ReputationTier,
+        CAST(NULL AS VARCHAR(4000)) AS Top5Tags
+    FROM Combined
+)
+SELECT * FROM MainRows
+UNION ALL
+SELECT * FROM AggregateSummary;

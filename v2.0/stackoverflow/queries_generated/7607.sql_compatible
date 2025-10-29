@@ -1,0 +1,211 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as avg_score,
+        CASE 
+            WHEN p.Score > 100 THEN 'High'
+            WHEN p.Score > 50 THEN 'Medium'
+            ELSE 'Low'
+        END as score_category,
+        COALESCE(p.Tags, '') as normalized_tags,
+        CHAR_LENGTH(p.Title) as title_length,
+        CAST((EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate)) / 86400) AS INTEGER) as days_since_creation,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN 'QuestionWithAnswers'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as post_type_category
+    FROM Posts p
+    WHERE p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 years')
+),
+UserActivity AS (
+    SELECT 
+        u.Id as user_id,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as total_posts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) as question_count,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) as answer_count,
+        SUM(p.Score) as total_score,
+        AVG(p.Score) as avg_score,
+        MAX(p.CreationDate) as last_activity,
+        STRING_AGG(p.Title, '; ') as recent_titles,
+        COUNT(DISTINCT c.Id) as comment_count,
+        COUNT(DISTINCT b.Id) as badge_count,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END) as total_question_views
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '3 years')
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as tag_count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE WHEN t.IsRequired = 1 THEN 'Required' ELSE 'Optional' END as tag_type,
+        COALESCE((SELECT COUNT(*) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%'), 0) as posts_with_tag,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            ELSE 'Niche'
+        END as tag_popularity
+    FROM Tags t
+    WHERE t.Count > 10
+),
+ComplexPosts AS (
+    SELECT 
+        rp.Id as post_id,
+        rp.Title,
+        rp.Score,
+        rp.score_category,
+        rp.days_since_creation,
+        rp.post_type_category,
+        rp.normalized_tags,
+        rp.title_length,
+        ua.user_id,
+        ua.DisplayName as author_name,
+        ua.total_posts,
+        ua.question_count,
+        ua.answer_count,
+        ua.avg_score as user_avg_score,
+        (rp.Score - ua.avg_score) as score_deviation,
+        CASE 
+            WHEN (rp.Score - ua.avg_score) > 50 THEN 'AboveAverage'
+            WHEN (rp.Score - ua.avg_score) < -50 THEN 'BelowAverage'
+            ELSE 'Normal'
+        END as score_status,
+        ta.tag_popularity,
+        ta.tag_count,
+        CASE 
+            WHEN rp.TagCount > 10 THEN 'HighlyTagged'
+            WHEN rp.TagCount > 5 THEN 'ModeratelyTagged'
+            ELSE 'SparseTagged'
+        END as tagging_frequency,
+        (rp.AnswerCount + rp.CommentCount) as engagement_measure,
+        CASE 
+            WHEN (rp.AnswerCount + rp.CommentCount) > 100 THEN 'HighEngagement'
+            WHEN (rp.AnswerCount + rp.CommentCount) > 50 THEN 'MediumEngagement'
+            ELSE 'LowEngagement'
+        END as engagement_level,
+        rp.OwnerUserId,
+        rp.rn
+    FROM RankedPosts rp
+    INNER JOIN UserActivity ua ON rp.OwnerUserId = ua.user_id
+    LEFT JOIN (
+        SELECT 
+            t.TagName,
+            t.Count as tag_count,
+            CASE 
+                WHEN t.Count > 1000 THEN 'Popular'
+                WHEN t.Count > 100 THEN 'Moderate'
+                ELSE 'Niche'
+            END as tag_popularity
+        FROM Tags t
+        WHERE t.Count > 10
+    ) ta ON rp.normalized_tags LIKE '%' || ta.TagName || '%'
+    WHERE rp.rn = 1
+),
+PostHistoryAnalysis AS (
+    SELECT 
+        ph.PostId,
+        COUNT(*) as history_count,
+        MAX(ph.CreationDate) as last_history_entry,
+        COUNT(DISTINCT ph.PostHistoryTypeId) as distinct_history_types,
+        STRING_AGG(ph.Comment, ', ') as comments_summary,
+        CASE 
+            WHEN COUNT(*) > 50 THEN 'ExtremelyActive'
+            WHEN COUNT(*) > 20 THEN 'Active'
+            WHEN COUNT(*) > 5 THEN 'ModeratelyActive'
+            ELSE 'Inactive'
+        END as activity_level
+    FROM PostHistory ph
+    JOIN Posts p ON ph.PostId = p.Id
+    WHERE ph.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6 months')
+    GROUP BY ph.PostId
+),
+FinalAnalysis AS (
+    SELECT 
+        cp.post_id,
+        cp.Title,
+        cp.Score,
+        cp.author_name,
+        cp.total_posts,
+        cp.user_avg_score,
+        cp.tag_popularity,
+        cp.engagement_level,
+        cp.content_quality,
+        cp.temporal_impact,
+        cp.visibility_level,
+        ROW_NUMBER() OVER (ORDER BY cp.Score DESC, cp.engagement_measure DESC) as rank_by_score_and_engagement,
+        CASE 
+            WHEN cp.user_avg_score > 100 THEN 'ExpertAuthor'
+            WHEN cp.user_avg_score > 50 THEN 'ExperiencedAuthor'
+            ELSE 'NoviceAuthor'
+        END as author_experience,
+        CONCAT(
+            cp.Title, 
+            ' | ', 
+            'Score:', cp.Score::text, 
+            ' | ', 
+            'Tags:', REGEXP_REPLACE(cp.normalized_tags, '<|>', ' ', 'g')
+        ) as title_score_tag_summary,
+        pha.activity_level,
+        pha.history_count,
+        pha.last_history_entry,
+        cp.engagement_measure,
+        cp.score_status,
+        cp.days_since_creation,
+        cp.total_question_views,
+        cp.tag_count
+    FROM ComplexPosts cp
+    LEFT JOIN PostHistoryAnalysis pha ON cp.post_id = pha.PostId
+)
+SELECT 
+    fa.post_id,
+    fa.Title as title,
+    fa.Score as score,
+    fa.author_name,
+    fa.total_posts,
+    fa.user_avg_score,
+    fa.tag_popularity,
+    fa.engagement_level,
+    fa.content_quality,
+    fa.temporal_impact,
+    fa.visibility_level,
+    fa.rank_by_score_and_engagement,
+    fa.author_experience,
+    fa.title_score_tag_summary,
+    fa.history_count,
+    fa.last_history_entry,
+    fa.activity_level
+FROM FinalAnalysis fa
+WHERE fa.content_quality IN ('Elite', 'HighValue', 'Valuable')
+  AND fa.author_experience IN ('ExpertAuthor', 'ExperiencedAuthor')
+  AND fa.visibility_level IN ('Viral', 'WellKnown', 'Recognized')
+  AND (fa.days_since_creation <= 365 OR fa.days_since_creation IS NULL)
+  AND fa.Score > 0
+ORDER BY 
+    fa.Score DESC,
+    fa.engagement_measure DESC,
+    fa.rank_by_score_and_engagement ASC
+OFFSET 100 ROWS
+FETCH NEXT 100 ROWS ONLY;

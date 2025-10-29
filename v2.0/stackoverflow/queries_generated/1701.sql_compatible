@@ -1,0 +1,191 @@
+WITH UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        COALESCE(u.Location, 'Unknown') AS UserLocation,
+        COUNT(DISTINCT p.Id) AS TotalPostsCreated,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersCount,
+        COUNT(DISTINCT c.Id) AS CommentsMadeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END) AS AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE NULL END) AS AvgAnswerScore,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.ViewCount) FILTER (WHERE p.PostTypeId = 1) AS MedianQuestionViews
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation >= 1000 AND u.LastAccessDate >= DATE '2023-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Location
+    HAVING COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) >= 5
+),
+QuestionPerformance AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.OwnerUserId,
+        q.Title,
+        q.CreationDate,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        q.CommentCount AS QuestionCommentCount,
+        q.FavoriteCount,
+        (string_to_array(SUBSTRING(q.Tags FROM 2 FOR LENGTH(q.Tags) - 2), '><'))[1] AS PrimaryTag,
+        CASE
+            WHEN q.ViewCount > 100 THEN (q.Score * 1.0 / q.ViewCount) * 100
+            ELSE 0.0
+        END AS NormalizedScorePer100Views,
+        (
+            SELECT COUNT(ph.Id)
+            FROM PostHistory ph
+            WHERE ph.PostId = q.Id
+              AND ph.PostHistoryTypeId = 10
+              AND ph.CreationDate >= q.CreationDate
+        ) AS CloseVoteCount,
+        RANK() OVER (
+            PARTITION BY EXTRACT(YEAR FROM q.CreationDate), (string_to_array(SUBSTRING(q.Tags FROM 2 FOR LENGTH(q.Tags) - 2), '><'))[1]
+            ORDER BY q.Score DESC, q.ViewCount DESC
+        ) AS RankInYearTag,
+        (q.Body LIKE '%<pre><code>%' OR q.Body LIKE '%<code>%') AS HasCodeSnippet
+    FROM Posts q
+    WHERE q.PostTypeId = 1
+      AND q.CreationDate >= DATE '2023-01-01'
+      AND q.OwnerUserId IS NOT NULL
+      AND q.Tags IS NOT NULL AND LENGTH(q.Tags) > 2
+),
+AnswerPerformance AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.OwnerUserId AS AnswerOwnerUserId,
+        a.CreationDate AS AnswerCreationDate,
+        a.Score AS AnswerScore,
+        a.CommentCount AS AnswerCommentCount,
+        EXTRACT(EPOCH FROM (COALESCE(a.LastActivityDate, a.CreationDate) - a.CreationDate)) / (60*60*24) AS AnswerAgeInDays,
+        AVG(a.Score) OVER (PARTITION BY a.OwnerUserId, a.ParentId) AS AvgScoreForUserOnQuestion,
+        CASE WHEN a.Id = q_parent.AcceptedAnswerId THEN TRUE ELSE FALSE END AS IsAcceptedAnswer,
+        (a.Body LIKE '%thank you%' OR a.Body LIKE '%Thanks%') AS ContainsGratitude
+    FROM Posts a
+    INNER JOIN Posts q_parent ON a.ParentId = q_parent.Id
+    WHERE a.PostTypeId = 2
+      AND a.OwnerUserId IS NOT NULL
+      AND a.CreationDate >= DATE '2023-01-01'
+),
+CombinedPostEngagement AS (
+    SELECT
+        p.Id AS EntityId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        'Question' AS EntityType,
+        COALESCE(p.Title, SUBSTRING(p.Body FROM 1 FOR 100)) AS EntityTitleOrExcerpt,
+        NULL AS ParentQuestionId,
+        (string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><'))[1] AS PrimaryTag
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.CreationDate >= DATE '2023-01-01'
+
+    UNION ALL
+
+    SELECT
+        a.Id AS EntityId,
+        a.OwnerUserId,
+        a.PostTypeId,
+        a.CreationDate,
+        a.Score,
+        NULL AS ViewCount,
+        a.CommentCount,
+        a.FavoriteCount,
+        'Answer' AS EntityType,
+        SUBSTRING(a.Body FROM 1 FOR 100) AS EntityTitleOrExcerpt,
+        a.ParentId AS ParentQuestionId,
+        (string_to_array(SUBSTRING(q.Tags FROM 2 FOR LENGTH(q.Tags) - 2), '><'))[1] AS PrimaryTag
+    FROM Posts a
+    INNER JOIN Posts q ON a.ParentId = q.Id
+    WHERE a.PostTypeId = 2 AND a.CreationDate >= DATE '2023-01-01'
+)
+SELECT
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.UserLocation,
+    uas.QuestionsCount,
+    uas.AnswersCount,
+    uas.GoldBadges,
+    qpm.QuestionId,
+    qpm.Title AS QuestionTitle,
+    qpm.QuestionScore,
+    qpm.ViewCount AS QuestionViews,
+    qpm.PrimaryTag AS QuestionPrimaryTag,
+    qpm.RankInYearTag,
+    qpm.CloseVoteCount,
+    qpm.HasCodeSnippet,
+    ap.AnswerId,
+    ap.AnswerScore,
+    ap.IsAcceptedAnswer,
+    ap.AnswerAgeInDays,
+    ap.ContainsGratitude,
+    cpe.EntityType,
+    cpe.EntityTitleOrExcerpt,
+    cpe.Score AS EntityScore,
+    cpe.ViewCount AS EntityViewCount,
+    cpe.CommentCount AS EntityCommentCount,
+    AVG(CASE WHEN cpe.PostTypeId = 1 THEN cpe.Score ELSE NULL END) OVER (PARTITION BY uas.UserId, qpm.PrimaryTag) AS AvgUserQuestionScoreInTag,
+    MAX(ph.CreationDate) AS LastPostHistoryEventDate,
+    SUM(CASE WHEN vt_main.Name = 'UpMod' THEN 1 ELSE 0 END) AS TotalUpvotesOnUserPosts,
+    SUM(CASE WHEN vt_main.Name = 'DownMod' THEN 1 ELSE 0 END) AS TotalDownvotesOnUserPosts,
+    CASE
+        WHEN uas.QuestionsCount > 0 AND uas.AnswersCount > 0
+        THEN (COALESCE(uas.AvgQuestionScore, 0) * 0.7 + COALESCE(uas.AvgAnswerScore, 0) * 0.3) * (uas.GoldBadges + uas.SilverBadges * 0.5 + uas.BronzeBadges * 0.25)
+        WHEN uas.QuestionsCount > 0 THEN COALESCE(uas.AvgQuestionScore, 0) * uas.GoldBadges
+        WHEN uas.AnswersCount > 0 THEN COALESCE(uas.AvgAnswerScore, 0) * uas.GoldBadges
+        ELSE 0
+    END AS WeightedUserImpactScore,
+    pl.LinkTypeId AS RelatedLinkType,
+    lt.Name AS RelatedLinkTypeName,
+    COUNT(DISTINCT pl.Id) AS NumberOfRelatedPosts,
+    (
+        SELECT tag_name
+        FROM (
+            SELECT UNNEST(string_to_array(SUBSTRING(p_sub.Tags FROM 2 FOR LENGTH(p_sub.Tags) - 2), '><')) AS tag_name, p_sub.Score
+            FROM Posts p_sub
+            WHERE p_sub.OwnerUserId = uas.UserId
+              AND p_sub.PostTypeId = 1
+              AND p_sub.Tags IS NOT NULL AND LENGTH(p_sub.Tags) > 2
+        ) AS user_post_tags
+        GROUP BY tag_name
+        ORDER BY SUM(Score) DESC
+        LIMIT 1
+    ) AS TopScoringTagForUser
+FROM UserActivitySummary uas
+INNER JOIN QuestionPerformance qpm ON uas.UserId = qpm.OwnerUserId
+LEFT JOIN AnswerPerformance ap ON qpm.QuestionId = ap.QuestionId AND uas.UserId = ap.AnswerOwnerUserId
+LEFT JOIN CombinedPostEngagement cpe ON uas.UserId = cpe.OwnerUserId AND qpm.QuestionId = cpe.ParentQuestionId
+LEFT JOIN PostHistory ph ON uas.UserId = ph.UserId
+LEFT JOIN PostLinks pl ON qpm.QuestionId = pl.PostId AND pl.LinkTypeId = 1
+LEFT JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+LEFT JOIN Votes v_main ON qpm.QuestionId = v_main.PostId
+LEFT JOIN VoteTypes vt_main ON v_main.VoteTypeId = vt_main.Id
+WHERE qpm.QuestionScore > 10 AND qpm.ViewCount > 500
+  AND (qpm.PrimaryTag LIKE 'sql' OR qpm.PrimaryTag LIKE 'database' OR qpm.PrimaryTag LIKE 'performance')
+  AND qpm.HasCodeSnippet = TRUE
+  AND (ap.IsAcceptedAnswer = TRUE OR ap.AnswerId IS NULL)
+  AND uas.GoldBadges > 0
+GROUP BY
+    uas.UserId, uas.DisplayName, uas.Reputation, uas.UserLocation, uas.QuestionsCount, uas.AnswersCount,
+    uas.GoldBadges, uas.SilverBadges, uas.BronzeBadges, uas.AvgQuestionScore, uas.AvgAnswerScore,
+    qpm.QuestionId, qpm.Title, qpm.QuestionScore, qpm.ViewCount, qpm.PrimaryTag, qpm.RankInYearTag,
+    qpm.CloseVoteCount, qpm.HasCodeSnippet,
+    ap.AnswerId, ap.AnswerScore, ap.IsAcceptedAnswer, ap.AnswerAgeInDays, ap.ContainsGratitude,
+    cpe.EntityType, cpe.EntityTitleOrExcerpt, cpe.Score, cpe.ViewCount, cpe.CommentCount,
+    pl.LinkTypeId, lt.Name, uas.UserId, qpm.PrimaryTag
+ORDER BY WeightedUserImpactScore DESC, TotalUpvotesOnUserPosts DESC, LastPostHistoryEventDate DESC
+LIMIT 100;

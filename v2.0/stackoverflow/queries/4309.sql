@@ -1,0 +1,123 @@
+WITH
+  RankedPosts AS (
+    SELECT
+      p.Id,
+      p.OwnerUserId,
+      p.PostTypeId,
+      p.Score,
+      p.ViewCount,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      p.CreationDate,
+      u.DisplayName AS OwnerDisplayName,
+      COALESCE(u.Reputation, 0) AS OwnerReputation,
+      ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS PostRank,
+      LAG(p.Score, 1, 0) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate) AS PreviousScore,
+      LEAD(p.Score, 1, 0) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate) AS NextScore,
+      SUM(p.Score) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS RunningTotalScore
+    FROM Posts p
+    LEFT JOIN Users u
+      ON p.OwnerUserId = u.Id
+    WHERE
+      p.PostTypeId IN (1, 2) AND p.Score IS NOT NULL
+  ),
+  TopPosts AS (
+    SELECT
+      Id,
+      OwnerUserId,
+      PostTypeId,
+      Score,
+      ViewCount,
+      AnswerCount,
+      CommentCount,
+      FavoriteCount,
+      CreationDate,
+      OwnerDisplayName,
+      OwnerReputation,
+      PostRank,
+      PreviousScore,
+      NextScore,
+      RunningTotalScore
+    FROM RankedPosts
+    WHERE
+      PostRank <= 100
+  ),
+  HighActivityUsers AS (
+    SELECT
+      OwnerUserId AS UserId,
+      COUNT(Id) AS PostCount,
+      SUM(Score) AS TotalScore
+    FROM Posts
+    WHERE
+      OwnerUserId IS NOT NULL
+    GROUP BY
+      OwnerUserId
+    HAVING
+      COUNT(Id) > 500
+  ),
+  RecentEdits AS (
+    SELECT
+      ph.PostId,
+      MAX(ph.CreationDate) AS LastEditDate
+    FROM PostHistory ph
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6)
+    GROUP BY
+      ph.PostId
+  )
+SELECT
+  tp.Id AS PostId,
+  tp.PostTypeId,
+  tp.Score,
+  tp.ViewCount,
+  tp.OwnerDisplayName,
+  tp.OwnerReputation,
+  tp.PostRank,
+  tp.PreviousScore,
+  tp.NextScore,
+  tp.RunningTotalScore,
+  CASE
+    WHEN tp.Score > 0 AND tp.PreviousScore > 0 THEN tp.Score * 1.0 / tp.PreviousScore
+    WHEN tp.Score > 0 AND tp.PreviousScore IS NULL THEN tp.Score
+    ELSE 0
+  END AS ScoreIncreaseRatio,
+  hau.PostCount AS UserPostCount,
+  hau.TotalScore AS UserTotalScore,
+  CASE
+    WHEN re.LastEditDate IS NOT NULL THEN
+      CASE
+        WHEN tp.CreationDate < re.LastEditDate THEN 'Edited After Creation'
+        ELSE 'Edited Before Creation'
+      END
+    ELSE 'Never Edited'
+  END AS EditStatus,
+  CASE
+    WHEN tp.OwnerReputation > 10000 AND tp.FavoriteCount > 100 THEN 'Highly Reputed & Favored'
+    WHEN tp.OwnerReputation < 1000 THEN 'Low Reputation'
+    ELSE 'Mid Tier'
+  END AS UserTier,
+  (
+    SELECT
+      COUNT(c.Id)
+    FROM Comments c
+    WHERE
+      c.PostId = tp.Id
+      AND c.Score > 5
+      AND c.CreationDate BETWEEN tp.CreationDate AND tp.CreationDate + INTERVAL '7' DAY
+  ) AS RecentHighScoringComments
+FROM TopPosts tp
+LEFT JOIN HighActivityUsers hau
+  ON tp.OwnerUserId = hau.UserId
+LEFT JOIN RecentEdits re
+  ON tp.Id = re.PostId
+WHERE
+  tp.Score > 50
+  AND tp.ViewCount > 1000
+  AND tp.OwnerReputation >= 1000
+  AND tp.RunningTotalScore < 1000000
+  AND SUBSTRING(tp.OwnerDisplayName FROM 1 FOR 1) <> 'X'
+ORDER BY
+  tp.Score DESC,
+  tp.ViewCount DESC
+LIMIT 50;

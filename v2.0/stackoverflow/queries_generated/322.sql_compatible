@@ -1,0 +1,346 @@
+with recent_posts as (
+    select
+        p.id,
+        p.posttypeid,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        p.ownseruserid,
+        p.owneruserid,
+        p.title,
+        p.tags,
+        coalesce(p.answercount, 0) as answercount,
+        p.closeddate,
+        p.lastactivitydate
+    from posts p
+    where p.creationdate >= (select max(creationdate) - interval '365 days' from posts)
+),
+user_activity as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate as user_created,
+        u.location,
+        u.websiteurl,
+        u.upvotes,
+        u.downvotes,
+        u.views,
+        count(distinct b.id) filter (where b.class = 1) as gold_badges,
+        count(distinct b.id) filter (where b.class = 2) as silver_badges,
+        count(distinct b.id) filter (where b.class = 3) as bronze_badges,
+        count(*) filter (where b.tagbased = 1) as tag_badges,
+        count(*) filter (where b.tagbased = 0) as named_badges
+    from users u
+    left join badges b on b.userid = u.id
+    group by u.id, u.displayname, u.reputation, u.creationdate, u.location, u.websiteurl, u.upvotes, u.downvotes, u.views
+),
+votes_agg as (
+    select
+        v.postid,
+        count(*) filter (where v.votetypeid = 2) as upvotes,
+        count(*) filter (where v.votetypeid = 3) as downvotes,
+        sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_total,
+        min(v.creationdate) as first_vote_at,
+        max(v.creationdate) as last_vote_at
+    from votes v
+    group by v.postid
+),
+comments_agg as (
+    select
+        c.postid,
+        count(*) as comment_count,
+        avg(c.score) as avg_comment_score,
+        max(c.creationdate) as last_comment_at,
+        count(*) filter (where c.userid is null) as anon_comment_count
+    from comments c
+    group by c.postid
+),
+postlinks_agg as (
+    select
+        pl.postid,
+        count(*) filter (where pl.linktypeid = 1) as linked_count,
+        count(*) filter (where pl.linktypeid = 3) as duplicate_count,
+        count(distinct pl.relatedpostid) as distinct_related
+    from postlinks pl
+    group by pl.postid
+),
+closures as (
+    select
+        ph.postid,
+        min(ph.creationdate) as first_closed_at,
+        max(ph.creationdate) as last_closed_at,
+        count(*) filter (where ph.posthistorytypeid = 10) as close_events,
+        count(*) filter (where ph.posthistorytypeid = 11) as reopen_events,
+        max(case when ph.posthistorytypeid = 10 then nullif(ph.comment, '') end) as last_close_reason_id_raw
+    from posthistory ph
+    where ph.posthistorytypeid in (10,11)
+    group by ph.postid
+),
+close_reasons as (
+    select
+        c.postid,
+        crt.name as last_close_reason_name
+    from closures c
+    left join lateral (
+        select
+            crt2.name as crt_name
+        from posthistory ph2
+        join closerasontypes crt2 on crt2.id = cast(ph2.comment as smallint)
+        where ph2.postid = c.postid
+          and ph2.posthistorytypeid = 10
+          and ph2.creationdate = c.last_closed_at
+        limit 1
+    ) x on true
+    left join closerasontypes crt on crt.name = x.crt_name
+),
+question_answer_map as (
+    select
+        q.id as question_id,
+        q.acceptedanswerid,
+        count(a.id) as total_answers,
+        max(a.score) as max_answer_score,
+        avg(a.score) as avg_answer_score,
+        max(a.creationdate) as last_answer_at
+    from posts q
+    left join posts a
+      on a.parentid = q.id
+     and a.posttypeid = 2
+    where q.posttypeid = 1
+    group by q.id, q.acceptedanswerid
+),
+tag_explode as (
+    select
+        p.id as post_id,
+        lower(trim(tg)) as tag
+    from posts p
+    cross join lateral unnest(
+        case
+            when p.tags is null then array[]::varchar[]
+            else string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')
+        end
+    ) as t(tg)
+),
+tag_stats as (
+    select
+        te.post_id,
+        count(*) as tag_count,
+        max(case when te.tag ~ '^(sql|postgres|mysql|tsql)$' then 1 else 0 end) as is_db_tagged,
+        string_agg(te.tag, ',' order by te.tag) as tags_csv
+    from tag_explode te
+    group by te.post_id
+),
+activity_timeline as (
+    select
+        p.id as post_id,
+        p.creationdate as created_at,
+        p.lastactivitydate as last_activity_at,
+        coalesce(v.first_vote_at, p.creationdate) as first_interaction_at,
+        greatest(
+            coalesce(v.last_vote_at, p.lastactivitydate),
+            coalesce(ca.last_comment_at, p.lastactivitydate),
+            p.lastactivitydate
+        ) as last_interaction_at
+    from posts p
+    left join votes_agg v on v.postid = p.id
+    left join comments_agg ca on ca.postid = p.id
+),
+post_quality as (
+    select
+        rp.id as post_id,
+        rp.posttypeid,
+        rp.creationdate,
+        rp.score,
+        rp.viewcount,
+        rp.answercount,
+        coalesce(va.upvotes,0) - coalesce(va.downvotes,0) as net_votes,
+        coalesce(va.bounty_total,0) as bounty_total,
+        coalesce(ca.comment_count,0) as comment_count,
+        coalesce(ca.avg_comment_score,0) as avg_comment_score,
+        coalesce(pl.linked_count,0) as linked_count,
+        coalesce(pl.duplicate_count,0) as duplicate_count,
+        coalesce(pl.distinct_related,0) as distinct_related,
+        coalesce(ts.tag_count,0) as tag_count,
+        coalesce(ts.is_db_tagged,0) as is_db_tagged,
+        ts.tags_csv,
+        at.created_at,
+        at.last_activity_at,
+        at.first_interaction_at,
+        at.last_interaction_at,
+        extract(epoch from (at.last_interaction_at - at.first_interaction_at)) / 3600.0 as interaction_span_hours,
+        case
+            when rp.viewcount is null or rp.viewcount = 0 then null
+            else (cast(rp.score as numeric) / nullif(rp.viewcount,0)) end as score_per_view,
+        case
+            when rp.answercount > 0 then 1 else 0 end as has_answers
+    from recent_posts rp
+    left join votes_agg va on va.postid = rp.id
+    left join comments_agg ca on ca.postid = rp.id
+    left join postlinks_agg pl on pl.postid = rp.id
+    left join tag_stats ts on ts.post_id = rp.id
+    left join activity_timeline at on at.post_id = rp.id
+),
+ranked_posts as (
+    select
+        pq.*,
+        qa.acceptedanswerid,
+        qa.total_answers,
+        qa.max_answer_score,
+        qa.avg_answer_score,
+        row_number() over (partition by pq.is_db_tagged order by coalesce(pq.net_votes, -999999) desc, pq.viewcount desc, pq.creationdate desc) as rn_top_net,
+        row_number() over (order by coalesce(pq.score_per_view,-999999) desc) as rn_spv,
+        dense_rank() over (order by coalesce(pq.interaction_span_hours, -1) desc) as dr_longest_active,
+        ntile(10) over (order by coalesce(pq.viewcount,0)) as view_ntile
+    from post_quality pq
+    left join question_answer_map qa on qa.question_id = pq.post_id
+),
+user_join as (
+    select
+        rp.post_id,
+        u.displayname as owner_name,
+        ua.reputation,
+        ua.gold_badges,
+        ua.silver_badges,
+        ua.bronze_badges,
+        ua.tag_badges,
+        ua.named_badges
+    from ranked_posts rp
+    left join posts p on p.id = rp.post_id
+    left join user_activity ua on ua.user_id = p.owneruserid
+    left join users u on u.id = p.owneruserid
+),
+final_scoring as (
+    select
+        rp.post_id,
+        rp.posttypeid,
+        rp.creationdate,
+        rp.score,
+        rp.viewcount,
+        rp.answercount,
+        rp.net_votes,
+        rp.bounty_total,
+        rp.comment_count,
+        rp.avg_comment_score,
+        rp.linked_count,
+        rp.duplicate_count,
+        rp.distinct_related,
+        rp.tag_count,
+        rp.is_db_tagged,
+        rp.tags_csv,
+        rp.interaction_span_hours,
+        rp.score_per_view,
+        rp.has_answers,
+        rp.acceptedanswerid,
+        rp.total_answers,
+        rp.max_answer_score,
+        rp.avg_answer_score,
+        rp.rn_top_net,
+        rp.rn_spv,
+        rp.dr_longest_active,
+        rp.view_ntile,
+        uj.owner_name,
+        uj.reputation,
+        uj.gold_badges,
+        uj.silver_badges,
+        uj.bronze_badges,
+        uj.tag_badges,
+        uj.named_badges,
+        coalesce(rp.net_votes,0) * 2
+        + coalesce(rp.score,0) * 3
+        + coalesce(rp.viewcount,0) / 50.0
+        + coalesce(rp.comment_count,0) * 0.5
+        + coalesce(rp.linked_count,0) * 1.0
+        - coalesce(rp.duplicate_count,0) * 2.0
+        + case when rp.has_answers = 1 then 5 else 0 end
+        + least(coalesce(rp.tag_count,0), 5)
+        + coalesce(uj.reputation,0) / 1000.0
+        + coalesce(rp.bounty_total,0) / 100.0
+        + coalesce(rp.avg_answer_score,0)
+        + case when rp.is_db_tagged = 1 then 3 else 0 end
+        as composite_score
+    from ranked_posts rp
+    left join user_join uj on uj.post_id = rp.post_id
+),
+dupe_chains as (
+    select
+        p.id as post_id,
+        count(pl2.relatedpostid) as dup_chain_len
+    from posts p
+    left join postlinks pl1 on pl1.postid = p.id and pl1.linktypeid = 3
+    left join postlinks pl2 on pl2.postid = pl1.relatedpostid and pl2.linktypeid = 3
+    group by p.id
+),
+final as (
+    select
+        fs.*,
+        cr.last_close_reason_name,
+        dc.dup_chain_len,
+        case when fs.viewcount = 0 or fs.viewcount is null then null else cast(fs.net_votes as numeric) / nullif(fs.viewcount,0) end as net_per_view,
+        sum(fs.net_votes) over (order by fs.creationdate rows between unbounded preceding and current row) as running_net_votes,
+        avg(fs.score) over (partition by fs.posttypeid) as avg_score_by_type,
+        percent_rank() over (order by fs.composite_score) as pct_composite,
+        lag(fs.composite_score) over (order by fs.composite_score) as prev_comp,
+        lead(fs.composite_score) over (order by fs.composite_score) as next_comp
+    from final_scoring fs
+    left join close_reasons cr on cr.postid = fs.post_id
+    left join dupe_chains dc on dc.post_id = fs.post_id
+)
+select
+    f.post_id,
+    f.posttypeid,
+    f.creationdate,
+    f.score,
+    f.viewcount,
+    f.answercount,
+    f.net_votes,
+    f.bounty_total,
+    f.comment_count,
+    f.avg_comment_score,
+    f.linked_count,
+    f.duplicate_count,
+    f.distinct_related,
+    f.tag_count,
+    f.is_db_tagged,
+    f.tags_csv,
+    f.interaction_span_hours,
+    f.score_per_view,
+    f.has_answers,
+    f.acceptedanswerid,
+    f.total_answers,
+    f.max_answer_score,
+    f.avg_answer_score,
+    f.composite_score,
+    f.last_close_reason_name,
+    f.dup_chain_len,
+    f.net_per_view,
+    f.running_net_votes,
+    f.avg_score_by_type,
+    f.pct_composite,
+    f.prev_comp,
+    f.next_comp
+from final f
+where
+    (
+      f.is_db_tagged = 1
+      or f.composite_score > (
+          select avg(composite_score) + stddev_pop(composite_score)
+          from final_scoring
+      )
+    )
+  and coalesce(f.duplicate_count,0) <= 5
+  and (
+      f.last_close_reason_name is null
+      or f.last_close_reason_name not ilike '%opinion%'
+  )
+  and (
+      f.net_votes is not null
+      and f.net_votes >= (
+        select percentile_disc(0.25) within group (order by coalesce(net_votes,0))
+        from final_scoring
+      )
+  )
+order by
+    f.composite_score desc,
+    f.net_votes desc,
+    f.viewcount desc
+limit 500;

@@ -1,0 +1,150 @@
+-- {"query": "3184.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2618} 
+
+/*  Complex performance‑benchmark query on the StackOverflow schema  */
+WITH
+    /*  Basic per‑user activity  */
+    user_activity AS (
+        SELECT
+            u.id                                   AS user_id,
+            u.reputation,
+            COALESCE(u.views,0)                    AS total_views,
+            COALESCE(u.upvotes,0) - COALESCE(u.downvotes,0) AS net_votes,
+            (SELECT COUNT(*) FROM badges b WHERE b.userid = u.id AND b.class = 1) AS gold_badges,
+            (SELECT COUNT(*) FROM badges b WHERE b.userid = u.id AND b.class = 2) AS silver_badges,
+            (SELECT COUNT(*) FROM badges b WHERE b.userid = u.id AND b.class = 3) AS bronze_badges,
+            (SELECT MAX(date) FROM badges b WHERE b.userid = u.id)                AS last_badge_date
+        FROM users u
+    ),
+
+    /*  Posts authored by each user  */
+    post_stats AS (
+        SELECT
+            p.owneruserid                         AS user_id,
+            COUNT(*)        FILTER (WHERE p.posttypeid = 1) AS question_cnt,
+            COUNT(*)        FILTER (WHERE p.posttypeid = 2) AS answer_cnt,
+            SUM(COALESCE(p.score,0))               AS total_post_score,
+            MAX(p.creationdate)                  AS last_post_date,
+            STRING_AGG(DISTINCT p.tags, ';') FILTER (WHERE p.tags IS NOT NULL) AS all_tags
+        FROM posts p
+        WHERE p.owneruserid IS NOT NULL
+        GROUP BY p.owneruserid
+    ),
+
+    /*  Vote aggregates per post  */
+    vote_agg AS (
+        SELECT
+            v.postid,
+            SUM(CASE WHEN v.votetypeid = 2 THEN 1
+                     WHEN v.votetypeid = 3 THEN -1
+                     ELSE 0 END)                     AS net_vote_score,
+            COUNT(*) FILTER (WHERE v.votetypeid = 5) AS favorite_cnt
+        FROM votes v
+        GROUP BY v.postid
+    ),
+
+    /*  Combine post‑level vote data back to users  */
+    user_votes AS (
+        SELECT
+            p.owneruserid                              AS user_id,
+            SUM(v.net_vote_score)                      AS user_net_vote_score,
+            SUM(v.favorite_cnt)                        AS user_favorite_cnt
+        FROM posts p
+        LEFT JOIN vote_agg v ON v.postid = p.id
+        GROUP BY p.owneruserid
+    ),
+
+    /*  Resolve top tags per user (limited to 5)  */
+    user_top_tags AS (
+        SELECT
+            ps.user_id,
+            STRING_AGG(t.tagname, ',') AS top_tags
+        FROM post_stats ps
+        LEFT JOIN LATERAL (
+            SELECT t.tagname
+            FROM UNNEST(string_to_array(ps.all_tags, ';')) AS tstr
+            JOIN tags t ON t.tagname = tstr
+            ORDER BY t.count DESC
+            LIMIT 5
+        ) t ON true
+        GROUP BY ps.user_id
+    ),
+
+    /*  Final enriched user score set  */
+    user_score AS (
+        SELECT
+            ua.user_id,
+            ua.reputation,
+            ua.total_views,
+            ua.net_votes,
+            ua.gold_badges,
+            ua.silver_badges,
+            ua.bronze_badges,
+            ps.question_cnt,
+            ps.answer_cnt,
+            ps.total_post_score,
+            uv.user_net_vote_score,
+            uv.user_favorite_cnt,
+            CASE
+                WHEN ua.reputation > 20000 THEN 'Elite'
+                WHEN ua.reputation > 10000 THEN 'Pro'
+                WHEN ua.reputation > 5000  THEN 'Experienced'
+                ELSE 'Novice'
+            END                                          AS reputation_tier,
+            ROW_NUMBER() OVER (ORDER BY
+                (ua.reputation
+                 + ua.net_votes
+                 + ua.gold_badges   *100
+                 + ua.silver_badges *50
+                 + ua.bronze_badges *20
+                 + ps.total_post_score
+                 + uv.user_net_vote_score) DESC)       AS reputation_rank,
+            tt.top_tags
+        FROM user_activity ua
+        LEFT JOIN post_stats ps    ON ps.user_id = ua.user_id
+        LEFT JOIN user_votes uv   ON uv.user_id = ua.user_id
+        LEFT JOIN user_top_tags tt ON tt.user_id = ua.user_id
+    )
+
+/*  Main result set plus a UNION‑ALL summary row  */
+SELECT
+    us.user_id,
+    u.displayname,
+    us.reputation,
+    us.question_cnt,
+    us.answer_cnt,
+    us.total_post_score,
+    us.user_net_vote_score,
+    us.user_favorite_cnt,
+    us.reputation_tier,
+    us.reputation_rank,
+    COALESCE(us.top_tags, 'None')                     AS top_tags,
+    CASE
+        WHEN us.last_badge_date IS NULL               THEN 'Never'
+        WHEN us.last_badge_date < CURRENT_DATE - INTERVAL '1 year' THEN 'Stale'
+        ELSE 'Active'
+    END                                              AS badge_recency_status
+FROM user_score us
+JOIN users u ON u.id = us.user_id
+WHERE us.question_cnt + us.answer_cnt > 0
+
+UNION ALL
+
+SELECT
+    NULL                                            AS user_id,
+    'Aggregate Summary'                             AS displayname,
+    NULL                                            AS reputation,
+    SUM(us.question_cnt)                            AS question_cnt,
+    SUM(us.answer_cnt)                              AS answer_cnt,
+    SUM(us.total_post_score)                        AS total_post_score,
+    SUM(us.user_net_vote_score)                     AS net_vote_score,
+    SUM(us.user_favorite_cnt)                       AS favorite_cnt,
+    NULL                                            AS reputation_tier,
+    NULL                                            AS reputation_rank,
+    NULL                                            AS top_tags,
+    NULL                                            AS badge_recency_status
+FROM user_score us
+WHERE us.question_cnt + us.answer_cnt > 0
+
+ORDER BY
+    reputation_rank NULLS LAST,
+    question_cnt DESC;

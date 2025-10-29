@@ -1,0 +1,202 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.ViewCount,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Elite'
+            WHEN u.Reputation >= 5000 THEN 'Senior'
+            WHEN u.Reputation >= 1000 THEN 'Junior'
+            ELSE 'Beginner'
+        END AS RepLevel
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.AccountId IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.ViewCount, u.UpVotes, u.DownVotes
+),
+TopQuestions AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        STRING_AGG(t.TagName, ', ') AS TagsList,
+        CASE 
+            WHEN p.AnswerCount = 0 THEN 'No Answers'
+            WHEN p.AnswerCount = 1 THEN 'One Answer'
+            WHEN p.AnswerCount > 1 AND p.AnswerCount < 10 THEN 'Few Answers'
+            ELSE 'Many Answers'
+        END AS AnswerCategory,
+        (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = p.Id AND a.PostTypeId = 2) AS ActualAnswerCount
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT 
+            p.Id AS PostId,
+            UNNEST(STRING_TO_ARRAY(REGEXP_REPLACE(p.Tags, '[<>]', '', 'g'), '<')) AS TagName
+        FROM Posts p
+        WHERE p.Tags IS NOT NULL AND p.PostTypeId = 1
+    ) t ON p.Id = t.PostId
+    WHERE p.PostTypeId = 1
+        AND p.CreationDate > TIMESTAMP '2020-01-01'
+        AND p.Score > 50
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.CreationDate, p.OwnerUserId, u.DisplayName
+),
+QuestionHistory AS (
+    SELECT 
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.UserId,
+        ph.CreationDate,
+        ph.Comment,
+        ph.Text,
+        CASE 
+            WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15) THEN COALESCE(ph.Comment, 'Unknown Action')
+            WHEN ph.PostHistoryTypeId IN (33, 34) THEN 'Notice: ' || COALESCE(ph.Comment, 'N/A')
+            ELSE 'Other Edit'
+        END AS HistoryAction,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS RecentHistory,
+        LAG(ph.CreationDate, 1) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS PrevEditDate
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 24, 33, 34)
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        COUNT(*) AS TotalActivity,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN 1 ELSE 0 END) AS CloseActivity,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 24 THEN 1 ELSE 0 END) AS EditActivity,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (33, 34) THEN 1 ELSE 0 END) AS NoticeActivity,
+        AVG(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - ph.CreationDate)) / 86400) AS AvgDaysSinceActivity,
+        STRING_AGG(DISTINCT p.Title, ', ') AS RecentTitles
+    FROM Users u
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    LEFT JOIN Posts p ON ph.PostId = p.Id
+    WHERE ph.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year')
+    GROUP BY u.Id
+)
+SELECT 
+    'Performance Benchmark Report' AS ReportTitle,
+    COUNT(DISTINCT us.UserId) AS ActiveUsers,
+    COUNT(DISTINCT tq.QuestionId) AS HighScoreQuestions,
+    COUNT(DISTINCT ph.PostId) AS ActivePosts,
+    SUM(CASE WHEN us.RepLevel = 'Elite' THEN 1 ELSE 0 END) AS EliteUsers,
+    SUM(CASE WHEN us.RepLevel = 'Senior' THEN 1 ELSE 0 END) AS SeniorUsers,
+    ROUND(AVG(us.AvgPostScore)::numeric, 2) AS AvgUserPostScore,
+    ROUND(AVG(tq.Score)::numeric, 2) AS AvgQuestionScore,
+    STRING_AGG(
+        us.DisplayName || ' (' || us.RepLevel || ') - ' || 
+        (CASE WHEN tq.QuestionId IS NOT NULL THEN 'Q' || CAST(tq.QuestionId AS varchar) || ': ' || COALESCE(tq.Title, '') ELSE 'No Question' END),
+        '; '
+    ) AS SampleUserQuestions,
+    STRING_AGG(
+        ph.HistoryAction || ' on ' || COALESCE(p.Title, 'Unknown Post') || ' by ' || COALESCE(u.DisplayName, 'Anonymous'),
+        ' | '
+    ) AS RecentActivityLog,
+    COALESCE(
+        STRING_AGG(
+            CASE 
+                WHEN uah.TotalActivity > 100 THEN COALESCE(u.DisplayName, 'User') || ' - Active'
+                WHEN uah.TotalActivity > 50 THEN COALESCE(u.DisplayName, 'User') || ' - Moderately Active'
+                ELSE COALESCE(u.DisplayName, 'User') || ' - Less Active'
+            END, 
+            ', '
+        ), 
+        'No Activity Data'
+    ) AS UserActivityLevel,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p2 
+        JOIN PostHistory ph2 ON p2.Id = ph2.PostId 
+        WHERE ph2.CreationDate > TIMESTAMP '2022-01-01' 
+            AND ph2.PostHistoryTypeId = 24
+    ) AS RecentEditsCount,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p2 
+        JOIN PostHistory ph2 ON p2.Id = ph2.PostId 
+        WHERE ph2.CreationDate > TIMESTAMP '2022-01-01' 
+            AND ph2.PostHistoryTypeId IN (10, 11, 12, 13)
+    ) AS RecentCloseActions,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p2 
+        WHERE p2.CreationDate > TIMESTAMP '2020-01-01' 
+            AND p2.Score > 1000
+    ) AS SuperHighScorePosts,
+    ROUND(AVG(COALESCE(us.AvgPostScore, 0))::numeric, 2) AS OverallAvgScore,
+    (
+        SELECT COUNT(DISTINCT u2.Id) 
+        FROM Users u2 
+        LEFT JOIN Posts p2 ON u2.Id = p2.OwnerUserId 
+        WHERE p2.Id IS NULL 
+            AND u2.CreationDate > TIMESTAMP '2020-01-01'
+    ) AS InactiveUsers,
+    (
+        SELECT COUNT(*) 
+        FROM Badges b2 
+        JOIN Users u3 ON b2.UserId = u3.Id 
+        WHERE b2.Date > TIMESTAMP '2022-01-01' 
+            AND b2.Class = 1
+    ) AS RecentGoldBadges,
+    (
+        SELECT 
+            'Questions with ' ||
+            (CASE WHEN MAX(tq2.AnswerCount) = 0 THEN 'zero' ELSE 'some' END) ||
+            ' answers; Avg. answer count: ' ||
+            ROUND(AVG(CAST(tq2.AnswerCount AS numeric)), 2)
+        FROM TopQuestions tq2
+    ) AS AnswerStatistics,
+    (
+        SELECT 
+            CASE 
+                WHEN COUNT(*) > 1000 THEN 'Large Dataset'
+                WHEN COUNT(*) > 100 THEN 'Medium Dataset'
+                ELSE 'Small Dataset'
+            END
+        FROM Users u4
+    ) AS DatasetSizeIndicator
+FROM UserStats us
+FULL OUTER JOIN TopQuestions tq ON us.UserId = tq.OwnerUserId
+LEFT JOIN QuestionHistory ph ON tq.QuestionId = ph.PostId AND ph.RecentHistory = 1
+LEFT JOIN Posts p ON ph.PostId = p.Id
+LEFT JOIN Users u ON ph.UserId = u.Id
+LEFT JOIN UserActivity uah ON us.UserId = uah.UserId
+WHERE (us.UserId IS NOT NULL OR tq.QuestionId IS NOT NULL)
+GROUP BY 
+    us.RepLevel,
+    us.Reputation,
+    us.DisplayName,
+    us.UserId,
+    us.AvgPostScore,
+    tq.Score,
+    tq.QuestionId,
+    tq.Title,
+    ph.HistoryAction,
+    ph.PostId,
+    p.Title,
+    u.DisplayName,
+    uah.TotalActivity,
+    u.Id
+HAVING 
+    COUNT(*) > 0
+ORDER BY 
+    us.Reputation DESC,
+    tq.Score DESC
+LIMIT 500;

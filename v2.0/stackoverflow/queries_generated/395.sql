@@ -1,0 +1,330 @@
+-- {"query": "395.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3369} 
+with params as (
+  select
+    50::int as top_n_users,
+    365::int as recent_days,
+    0.5::numeric as heavy_editor_ratio
+),
+recent_posts as (
+  select p.*
+  from Posts p
+  join params pr on true
+  where p.CreationDate >= now() - (pr.recent_days || ' days')::interval
+    and p.PostTypeId in (1,2)
+),
+user_activity as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate as UserCreationDate,
+    coalesce(sum(case when rp.PostTypeId = 1 then 1 else 0 end),0) as RecentQuestions,
+    coalesce(sum(case when rp.PostTypeId = 2 then 1 else 0 end),0) as RecentAnswers,
+    coalesce(count(distinct rp.Id),0) as RecentPosts,
+    coalesce(sum(rp.Score),0) as RecentPostScore,
+    coalesce(sum(rp.ViewCount),0) as RecentViews,
+    coalesce(sum(rp.CommentCount),0) as RecentCommentCount,
+    count(distinct c.Id) filter (where c.CreationDate >= now() - interval '365 days') as RecentCommentsMade,
+    count(distinct v.Id) filter (where v.VoteTypeId in (2,3) and v.CreationDate >= now() - interval '365 days') as RecentVotesCast,
+    count(distinct b.Id) filter (where b.Date >= now() - interval '365 days') as RecentBadges,
+    max(rp.LastActivityDate) as LastActivityOnPosts
+  from Users u
+  left join recent_posts rp on rp.OwnerUserId = u.Id
+  left join Comments c on c.UserId = u.Id
+  left join Votes v on v.UserId = u.Id
+  left join Badges b on b.UserId = u.Id
+  group by u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+heavy_edit_posts as (
+  select
+    ph.PostId,
+    sum(case when ph.PostHistoryTypeId in (4,5,6,7,8,9,24) then 1 else 0 end) as EditEvents,
+    count(*) as TotalHistoryEvents
+  from PostHistory ph
+  group by ph.PostId
+),
+post_quality as (
+  select
+    rp.Id as PostId,
+    rp.PostTypeId,
+    rp.OwnerUserId,
+    rp.Score,
+    rp.ViewCount,
+    rp.AnswerCount,
+    rp.FavoriteCount,
+    rp.CommentCount,
+    rp.CreationDate,
+    rp.LastActivityDate,
+    h.EditEvents,
+    h.TotalHistoryEvents,
+    case
+      when h.TotalHistoryEvents > 0 then h.EditEvents::numeric / h.TotalHistoryEvents
+      else null
+    end as EditRatio,
+    case
+      when coalesce(h.EditEvents,0) >= 3 then 1
+      when coalesce(h.EditEvents,0) = 0 then 0
+      else 0.5
+    end as EditHeavinessScore,
+    case when rp.Tags is null then 0 else cardinality(string_to_array(substring(rp.Tags, 2, length(rp.Tags)-2), '><')) end as TagCount,
+    case when rp.PostTypeId = 1 and rp.AcceptedAnswerId is not null then 1 else 0 end as HasAcceptedAnswer
+  from recent_posts rp
+  left join heavy_edit_posts h on h.PostId = rp.Id
+),
+post_text_signals as (
+  select
+    p.Id as PostId,
+    length(coalesce(p.Body,'')) as BodyLen,
+    length(coalesce(p.Title,'')) as TitleLen,
+    (position('<code>' in coalesce(p.Body,'')) > 0)::int as HasCode,
+    (position('<a ' in coalesce(p.Body,'')) > 0)::int as HasLinks,
+    (position('<img' in coalesce(p.Body,'')) > 0)::int as HasImages,
+    (regexp_matches(coalesce(p.Tags,''), '(?i)(java|python|javascript|c\+\+|c#|rust|go|sql)')) is not null as IsPopularTag
+  from recent_posts p
+),
+dup_clusters as (
+  select
+    pl.RelatedPostId as CanonicalId,
+    count(*) filter (where pl.LinkTypeId = 3) as DuplicateCount,
+    min(pl.CreationDate) as FirstDupSeen,
+    max(pl.CreationDate) as LastDupSeen
+  from PostLinks pl
+  where pl.LinkTypeId = 3
+  group by pl.RelatedPostId
+),
+engagement as (
+  select
+    rp.Id as PostId,
+    coalesce(sum(case when v.VoteTypeId = 2 then 1 when v.VoteTypeId = 3 then -1 else 0 end),0) as NetVotes,
+    count(*) filter (where v.VoteTypeId = 5) as Favorites,
+    count(distinct c.Id) as CommentEvents,
+    count(distinct v.Id) as VoteEvents,
+    min(v.CreationDate) as FirstVoteAt,
+    min(c.CreationDate) as FirstCommentAt
+  from recent_posts rp
+  left join Votes v on v.PostId = rp.Id
+  left join Comments c on c.PostId = rp.Id
+  group by rp.Id
+),
+owner_badge_mix as (
+  select
+    u.Id as UserId,
+    sum(case when b.Class = 1 then 1 else 0 end) as Gold,
+    sum(case when b.Class = 2 then 1 else 0 end) as Silver,
+    sum(case when b.Class = 3 then 1 else 0 end) as Bronze,
+    sum(case when b.TagBased = 1 then 1 else 0 end) as TagBadges
+  from Users u
+  left join Badges b on b.UserId = u.Id
+  group by u.Id
+),
+question_outcomes as (
+  select
+    q.Id as QuestionId,
+    q.OwnerUserId,
+    q.Score,
+    q.ViewCount,
+    q.AnswerCount,
+    q.AcceptedAnswerId,
+    q.ClosedDate,
+    q.CommunityOwnedDate,
+    q.Tags,
+    case when q.ClosedDate is not null then 1 else 0 end as IsClosed,
+    case when q.AcceptedAnswerId is not null then 1 else 0 end as IsResolved
+  from recent_posts q
+  where q.PostTypeId = 1
+),
+accepted_answerers as (
+  select
+    a.ParentId as QuestionId,
+    a.OwnerUserId as AnswererId,
+    a.Score as AnswerScore,
+    a.CreationDate as AnswerDate,
+    row_number() over (partition by a.ParentId order by a.Score desc nulls last, a.Id) as AnswerRankByScore
+  from Posts a
+  where a.PostTypeId = 2
+),
+user_rankings as (
+  select
+    ua.*,
+    obm.Gold, obm.Silver, obm.Bronze, obm.TagBadges,
+    row_number() over (order by ua.RecentPostScore desc, ua.RecentPosts desc, ua.RecentViews desc) as ActivityRank,
+    percent_rank() over (order by ua.RecentPostScore desc) as ScorePercentile
+  from user_activity ua
+  left join owner_badge_mix obm on obm.UserId = ua.UserId
+),
+scored_posts as (
+  select
+    pq.PostId,
+    pq.PostTypeId,
+    pq.OwnerUserId,
+    pq.Score,
+    pq.ViewCount,
+    pq.AnswerCount,
+    pq.FavoriteCount,
+    pq.CommentCount,
+    pq.CreationDate,
+    pq.LastActivityDate,
+    pq.EditEvents,
+    pq.TotalHistoryEvents,
+    pq.EditRatio,
+    pq.EditHeavinessScore,
+    pq.TagCount,
+    pq.HasAcceptedAnswer,
+    pts.BodyLen,
+    pts.TitleLen,
+    pts.HasCode::int as HasCode,
+    pts.HasLinks::int as HasLinks,
+    pts.HasImages::int as HasImages,
+    pts.IsPopularTag::int as IsPopularTag,
+    e.NetVotes,
+    e.Favorites,
+    e.CommentEvents,
+    e.VoteEvents,
+    e.FirstVoteAt,
+    e.FirstCommentAt,
+    dc.DuplicateCount,
+    dc.FirstDupSeen,
+    dc.LastDupSeen,
+    (
+      coalesce(pq.Score,0)*1.0
+      + coalesce(e.NetVotes,0)*0.8
+      + coalesce(pq.ViewCount,0)*0.01
+      + coalesce(pq.AnswerCount,0)*2.0
+      + coalesce(pq.FavoriteCount,0)*1.5
+      + coalesce(pq.CommentCount,0)*0.4
+      + coalesce(pts.HasCode::int,0)*3.0
+      + coalesce(pts.HasLinks::int,0)*0.7
+      + coalesce(pts.HasImages::int,0)*0.5
+      + coalesce(pts.IsPopularTag::int,0)*1.2
+      - coalesce(dc.DuplicateCount,0)*2.5
+      - case when pq.EditRatio is not null and pq.EditRatio > 0.8 then 1.0 else 0.0 end
+    ) as QualityScore
+  from post_quality pq
+  left join post_text_signals pts on pts.PostId = pq.PostId
+  left join engagement e on e.PostId = pq.PostId
+  left join dup_clusters dc on dc.CanonicalId = pq.PostId
+),
+owner_summary as (
+  select
+    sp.OwnerUserId as UserId,
+    count(*) as PostsCount,
+    avg(sp.QualityScore) as AvgQuality,
+    stddev_pop(sp.QualityScore) as QualityStd,
+    sum(case when sp.PostTypeId = 1 then 1 else 0 end) as Questions,
+    sum(case when sp.PostTypeId = 2 then 1 else 0 end) as Answers,
+    sum(case when sp.HasAcceptedAnswer = 1 then 1 else 0 end) as AcceptedQuestions,
+    sum(coalesce(sp.ViewCount,0)) as TotalViews,
+    sum(coalesce(sp.NetVotes,0)) as TotalNetVotes
+  from scored_posts sp
+  group by sp.OwnerUserId
+),
+flag_heavy_edit_users as (
+  select
+    os.UserId,
+    os.PostsCount,
+    os.AvgQuality,
+    os.QualityStd,
+    os.Questions,
+    os.Answers,
+    os.AcceptedQuestions,
+    os.TotalViews,
+    os.TotalNetVotes,
+    ua.RecentPosts,
+    ua.RecentPostScore,
+    ua.RecentViews,
+    ua.RecentCommentCount,
+    ua.RecentCommentsMade,
+    ua.RecentVotesCast,
+    ur.ScorePercentile,
+    case
+      when os.PostsCount > 0 and (
+        select avg(coalesce(sp.EditRatio,0))
+        from scored_posts sp
+        where sp.OwnerUserId = os.UserId
+      ) > (select heavy_editor_ratio from params)
+      then 1 else 0
+    end as IsHeavyEditor
+  from owner_summary os
+  join user_activity ua on ua.UserId = os.UserId
+  left join user_rankings ur on ur.UserId = os.UserId
+),
+top_users as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    ur.ActivityRank,
+    row_number() over (order by
+      coalesce(os.AvgQuality,0) desc,
+      coalesce(u.Reputation,0) desc,
+      coalesce(ur.ActivityRank,999999)
+    ) as QualityRank
+  from Users u
+  left join owner_summary os on os.UserId = u.Id
+  left join user_rankings ur on ur.UserId = u.Id
+  qualify row_number() over (order by coalesce(os.AvgQuality,0) desc, u.Reputation desc) <= (select top_n_users from params)
+),
+final_posts as (
+  select
+    sp.*,
+    u.DisplayName as OwnerName,
+    u.Reputation as OwnerRep,
+    tu.QualityRank,
+    dense_rank() over (partition by sp.OwnerUserId order by sp.QualityScore desc, sp.Id) as RankWithinOwner
+  from scored_posts sp
+  join top_users tu on tu.UserId = sp.OwnerUserId
+  join Users u on u.Id = sp.OwnerUserId
+),
+resolved_vs_closed as (
+  select
+    qo.QuestionId,
+    qo.OwnerUserId,
+    qo.IsResolved,
+    qo.IsClosed,
+    case
+      when qo.IsResolved = 1 and qo.IsClosed = 0 then 'ResolvedOpen'
+      when qo.IsResolved = 0 and qo.IsClosed = 1 then 'ClosedUnresolved'
+      when qo.IsResolved = 1 and qo.IsClosed = 1 then 'ResolvedClosed'
+      else 'OpenUnresolved'
+    end as OutcomeBucket
+  from question_outcomes qo
+)
+select
+  fp.OwnerUserId,
+  fp.OwnerName,
+  fp.OwnerRep,
+  fp.QualityRank as UserQualityRank,
+  count(*) as PostCount,
+  avg(fp.QualityScore) as AvgPostQuality,
+  percentile_disc(0.5) within group (order by fp.QualityScore) as MedianPostQuality,
+  max(fp.QualityScore) as BestPostQuality,
+  min(fp.QualityScore) as WorstPostQuality,
+  sum(case when fp.PostTypeId = 1 then 1 else 0 end) as Questions,
+  sum(case when fp.PostTypeId = 2 then 1 else 0 end) as Answers,
+  sum(fp.HasAcceptedAnswer) as AcceptedQuestions,
+  sum(fp.NetVotes) as TotalNetVotes,
+  sum(fp.ViewCount) as TotalViews,
+  avg(extract(epoch from (fp.LastActivityDate - fp.CreationDate)) / 3600.0) as AvgHoursToLastActivity,
+  sum(case when rvc.OutcomeBucket = 'ClosedUnresolved' then 1 else 0 end) as ClosedUnresolvedQs,
+  sum(case when rvc.OutcomeBucket = 'ResolvedOpen' then 1 else 0 end) as ResolvedOpenQs,
+  sum(coalesce(fp.DuplicateCount,0)) as DuplicatesAgainst,
+  sum(case when fp.EditRatio is not null and fp.EditRatio > 0.8 then 1 else 0 end) as VeryHeavilyEditedPosts,
+  string_agg(distinct case when fp.TagCount > 0 then substring(coalesce((select Title from Posts t where t.Id = fp.PostId and fp.PostTypeId in (4,5)), ''), 1, 0) end, ',') as DummyStringAggForStress,
+  (
+    select json_build_object(
+      'UserId', ua.UserId,
+      'RecentPosts', ua.RecentPosts,
+      'RecentCommentsMade', ua.RecentCommentsMade,
+      'RecentVotesCast', ua.RecentVotesCast,
+      'IsHeavyEditor', fhe.IsHeavyEditor
+    )
+    from user_activity ua
+    left join flag_heavy_edit_users fhe on fhe.UserId = ua.UserId
+    where ua.UserId = fp.OwnerUserId
+  ) as ActivitySummary
+from final_posts fp
+left join resolved_vs_closed rvc on rvc.OwnerUserId = fp.OwnerUserId and rvc.QuestionId = fp.PostId
+group by fp.OwnerUserId, fp.OwnerName, fp.OwnerRep, fp.QualityRank
+having count(*) > 0
+order by AvgPostQuality desc, TotalNetVotes desc, TotalViews desc
+limit 100;

@@ -1,0 +1,157 @@
+-- {"query": "4204.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1544} 
+
+WITH
+  RankedPosts AS (
+    SELECT
+      p.Id,
+      p.OwnerUserId,
+      p.PostTypeId,
+      p.CreationDate,
+      p.Score,
+      p.ViewCount,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      p.ClosedDate,
+      p.CommunityOwnedDate,
+      ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn,
+      CASE
+        WHEN p.PostTypeId = 1 THEN COUNT(c.Id) OVER (PARTITION BY p.Id)
+        ELSE 0
+      END AS CommentCountForQuestion,
+      CASE
+        WHEN p.PostTypeId = 1 THEN LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate)
+        ELSE 0
+      END AS PreviousPostScore,
+      AVG(CAST(p.Score AS REAL)) OVER (PARTITION BY p.OwnerUserId) AS AvgUserScore,
+      CASE WHEN p.Tags LIKE '%<sql>%' THEN 1 ELSE 0 END AS HasSqlTag
+    FROM
+      Posts AS p
+      LEFT JOIN Comments AS c ON p.Id = c.PostId
+    WHERE
+      p.OwnerUserId IS NOT NULL AND p.OwnerUserId != -1
+  ),
+  UserActivity AS (
+    SELECT
+      rp.OwnerUserId,
+      COUNT(DISTINCT rp.Id) AS TotalPosts,
+      SUM(rp.Score) AS TotalScore,
+      SUM(rp.ViewCount) AS TotalViews,
+      SUM(rp.AnswerCount) AS TotalAnswers,
+      SUM(rp.CommentCount) AS TotalComments,
+      COUNT(CASE WHEN rp.rn <= 5 THEN rp.Id END) AS Top5Posts,
+      AVG(rp.CommentCountForQuestion) AS AvgCommentsPerQuestion,
+      SUM(rp.HasSqlTag) AS SqlTagPostCount
+    FROM
+      RankedPosts AS rp
+    WHERE
+      rp.PostTypeId = 1
+    GROUP BY
+      rp.OwnerUserId
+  ),
+  ReputationGain AS (
+    SELECT
+      u.Id AS UserId,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived,
+      SUM(CASE WHEN v.VoteTypeId = 8 THEN v.BountyAmount ELSE 0 END) AS BountyGiven,
+      COUNT(CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+      COUNT(CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+      COUNT(CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges
+    FROM
+      Users AS u
+      LEFT JOIN Votes AS v ON u.Id = v.UserId
+      LEFT JOIN Badges AS b ON u.Id = b.UserId
+    GROUP BY
+      u.Id
+  )
+SELECT
+  u.DisplayName,
+  u.Reputation,
+  u.CreationDate,
+  u.LastAccessDate,
+  ua.TotalPosts,
+  ua.TotalScore,
+  ua.TotalViews,
+  ua.TotalAnswers,
+  ua.TotalComments,
+  ua.Top5Posts,
+  ua.AvgCommentsPerQuestion,
+  ua.SqlTagPostCount,
+  COALESCE(rg.UpVotesReceived, 0) AS TotalUpVotesReceived,
+  COALESCE(rg.DownVotesReceived, 0) AS TotalDownVotesReceived,
+  COALESCE(rg.BountyGiven, 0) AS TotalBountyGiven,
+  rg.GoldBadges,
+  rg.SilverBadges,
+  rg.BronzeBadges,
+  CASE
+    WHEN u.Views > 1000000 THEN 'Very High'
+    WHEN u.Views > 100000 THEN 'High'
+    WHEN u.Views > 10000 THEN 'Medium'
+    ELSE 'Low'
+  END AS ViewCategory,
+  CASE
+    WHEN u.WebsiteUrl IS NULL THEN 'No Website'
+    WHEN u.WebsiteUrl LIKE '%stackoverflow.com%' THEN 'Stack Overflow Related'
+    ELSE 'External Website'
+  END AS WebsiteType,
+  DATEDIFF(day, u.CreationDate, GETDATE()) AS DaysSinceCreation,
+  CASE
+    WHEN ua.TotalPosts IS NULL THEN 'Inactive'
+    WHEN ua.TotalPosts > 1000 AND ua.TotalScore > 50000 THEN 'Power User'
+    WHEN ua.TotalPosts > 100 AND ua.TotalScore > 1000 THEN 'Active Contributor'
+    ELSE 'Emerging'
+  END AS UserActivityLevel,
+  CASE
+    WHEN MAX(rp.Score) OVER (PARTITION BY u.Id) > 1000 THEN 'HighScorePostExists'
+    ELSE 'NoHighScorePost'
+  END AS HighScorePostIndicator,
+  CASE
+    WHEN EXISTS (
+      SELECT
+        1
+      FROM
+        Posts AS p_sub
+      WHERE
+        p_sub.OwnerUserId = u.Id AND p_sub.ClosedDate IS NOT NULL
+    ) THEN 'HasClosedPosts'
+    ELSE 'NoClosedPosts'
+  END AS ClosedPostStatus
+FROM
+  Users AS u
+  LEFT JOIN UserActivity AS ua ON u.Id = ua.OwnerUserId
+  LEFT JOIN ReputationGain AS rg ON u.Id = rg.UserId
+  LEFT JOIN RankedPosts AS rp ON u.Id = rp.OwnerUserId
+WHERE
+  u.AccountId IS NOT NULL
+  AND (
+    u.DisplayName LIKE '%John%' OR u.DisplayName LIKE '%Jane%'
+  )
+GROUP BY
+  u.Id,
+  u.DisplayName,
+  u.Reputation,
+  u.CreationDate,
+  u.LastAccessDate,
+  u.Views,
+  u.WebsiteUrl,
+  ua.TotalPosts,
+  ua.TotalScore,
+  ua.TotalViews,
+  ua.TotalAnswers,
+  ua.TotalComments,
+  ua.Top5Posts,
+  ua.AvgCommentsPerQuestion,
+  ua.SqlTagPostCount,
+  rg.UpVotesReceived,
+  rg.DownVotesReceived,
+  rg.BountyGiven,
+  rg.GoldBadges,
+  rg.SilverBadges,
+  rg.BronzeBadges
+HAVING
+  SUM(rp.Score) > 0 OR u.Reputation > 1000
+ORDER BY
+  u.Reputation DESC,
+  DATEDIFF(day, u.CreationDate, GETDATE()) ASC
+LIMIT 100;

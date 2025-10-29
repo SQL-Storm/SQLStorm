@@ -1,0 +1,160 @@
+-- {"query": "3168.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2483} 
+
+/*  Benchmark query – combines CTEs, window functions, outer joins, 
+    correlated subqueries, set operators, string handling and NULL logic   */
+WITH
+    /*-------------------------------------------------------------
+        User-level aggregates: badge counts, vote counts, last activity
+      -------------------------------------------------------------*/
+    user_stats AS (
+        SELECT
+            u.id                                   AS user_id,
+            u.displayname,
+            u.reputation,
+            COUNT(b.id) FILTER (WHERE b.class = 1) AS gold_badges,
+            COUNT(b.id) FILTER (WHERE b.class = 2) AS silver_badges,
+            COUNT(b.id) FILTER (WHERE b.class = 3) AS bronze_badges,
+            SUM(CASE WHEN v.votetypeid = 2 THEN 1 ELSE 0 END) AS up_votes_given,
+            SUM(CASE WHEN v.votetypeid = 3 THEN 1 ELSE 0 END) AS down_votes_given,
+            MAX(u.lastaccessdate)                 AS last_seen
+        FROM users u
+        LEFT JOIN badges b   ON b.userid   = u.id
+        LEFT JOIN votes  v   ON v.userid   = u.id
+        GROUP BY u.id, u.displayname, u.reputation
+    ),
+
+    /*-------------------------------------------------------------
+        Recent posts (last 30 days) with row number per author
+      -------------------------------------------------------------*/
+    recent_posts AS (
+        SELECT
+            p.id                                   AS post_id,
+            p.owneruserid,
+            p.posttypeid,
+            p.score,
+            p.creationdate,
+            p.title,
+            COALESCE(p.tags, '')                   AS tags_raw,
+            ROW_NUMBER() OVER (
+                PARTITION BY p.owneruserid
+                ORDER BY p.creationdate DESC
+            )                                      AS rn
+        FROM posts p
+        WHERE p.creationdate >= CURRENT_DATE - INTERVAL '30 days'
+    ),
+
+    /*-------------------------------------------------------------
+        Explode tags into one row per tag per post
+      -------------------------------------------------------------*/
+    exploded_tags AS (
+        SELECT
+            rp.post_id,
+            rp.owneruserid,
+            UNNEST(
+                STRING_TO_ARRAY(
+                    TRIM(BOTH '<>' FROM rp.tags_raw),
+                    '><'
+                )
+            )                                      AS tag_name
+        FROM recent_posts rp
+        WHERE rp.tags_raw <> ''
+    ),
+
+    /*-------------------------------------------------------------
+        Tag-level stats from the exploded set
+      -------------------------------------------------------------*/
+    tag_stats AS (
+        SELECT
+            t.tagname                              AS tag,
+            COUNT(*)                               AS usage_cnt,
+            SUM(rp.score)                          AS total_score,
+            AVG(rp.score)                          AS avg_score
+        FROM exploded_tags et
+        JOIN recent_posts rp ON rp.post_id = et.post_id
+        JOIN tags t          ON t.tagname = et.tag_name
+        GROUP BY t.tagname
+    ),
+
+    /*-------------------------------------------------------------
+        Rank questions by score & view count, also compute recency percentile
+      -------------------------------------------------------------*/
+    question_rank AS (
+        SELECT
+            p.id,
+            p.title,
+            p.score,
+            p.viewcount,
+            p.answercount,
+            RANK() OVER (ORDER BY p.score DESC, p.viewcount DESC)   AS score_rank,
+            PERCENT_RANK() OVER (ORDER BY p.creationdate)          AS recency_pct
+        FROM posts p
+        WHERE p.posttypeid = 1   -- only questions
+    )
+
+--====================================================================
+-- Final SELECT combines everything, uses lateral join, correlated
+-- subquery, CASE expression, NULL handling and a UNION ALL dummy set
+--====================================================================
+SELECT
+    us.user_id,
+    us.displayname,
+    us.reputation,
+    us.gold_badges,
+    us.silver_badges,
+    us.bronze_badges,
+    us.up_votes_given,
+    us.down_votes_given,
+    us.last_seen,
+    COALESCE(qr.score_rank, 0)           AS top_question_rank,
+    COALESCE(qr.recency_pct, 0)          AS recency_percentile,
+    COALESCE(ts.tag, 'NoTag')            AS sample_tag,
+    COALESCE(ts.usage_cnt, 0)            AS tag_usage_cnt,
+    COALESCE(ts.avg_score, 0)            AS tag_avg_score,
+    CASE
+        WHEN us.reputation > 20000 THEN 'Veteran'
+        WHEN us.reputation > 10000 THEN 'Experienced'
+        WHEN us.reputation > 1000  THEN 'Intermediate'
+        ELSE 'Newbie'
+    END                                 AS reputation_level,
+    (SELECT COUNT(*) FROM comments c
+        WHERE c.userid = us.user_id
+          AND c.creationdate >= CURRENT_DATE - INTERVAL '7 days') AS recent_comments,
+    (SELECT MAX(v.creationdate) FROM votes v
+        WHERE v.userid = us.user_id)    AS last_vote_date
+FROM user_stats us
+LEFT JOIN LATERAL (
+    /* most‑used tag for this user (if any) */
+    SELECT
+        ts.tag,
+        ts.usage_cnt,
+        ts.avg_score
+    FROM tag_stats ts
+    ORDER BY ts.usage_cnt DESC
+    LIMIT 1
+) ts ON true
+LEFT JOIN LATERAL (
+    /* highest‑scoring question of the user */
+    SELECT
+        qr.score_rank,
+        qr.recency_pct
+    FROM question_rank qr
+    WHERE qr.id = (
+        SELECT p.id
+        FROM posts p
+        WHERE p.owneruserid = us.user_id
+          AND p.posttypeid = 1
+        ORDER BY p.score DESC
+        LIMIT 1
+    )
+) qr ON true
+WHERE us.reputation IS NOT NULL
+ORDER BY us.reputation DESC
+LIMIT 100
+
+UNION ALL
+
+/* Dummy rows to stress the planner – generated on‑the‑fly */
+SELECT
+    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
+FROM generate_series(1,5) g;

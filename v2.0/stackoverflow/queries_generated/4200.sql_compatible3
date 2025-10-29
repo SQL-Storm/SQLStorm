@@ -1,0 +1,154 @@
+WITH PostScores AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        pt.Name AS PostTypeName,
+        COALESCE(p.AnswerCount, 0) + COALESCE(p.CommentCount, 0) + COALESCE(p.FavoriteCount, 0) AS EngagementScore,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS RankByScore,
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousDayScore
+    FROM
+        Posts p
+    JOIN
+        PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE
+        p.OwnerUserId IS NOT NULL AND p.OwnerUserId > 0
+),
+UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT ps.PostId) AS TotalPosts,
+        SUM(ps.EngagementScore) AS TotalEngagementScore,
+        AVG(ps.Score) AS AveragePostScore,
+        MAX(ps.RankByScore) AS HighestRankedPost
+    FROM
+        Users u
+    LEFT JOIN
+        PostScores ps ON u.Id = ps.OwnerUserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+CommentActivity AS (
+    SELECT
+        c.UserId,
+        COUNT(c.Id) AS CommentCount,
+        COUNT(DISTINCT c.PostId) AS DistinctPostsCommentedOn,
+        SUM(CASE WHEN c.Score > 0 THEN 1 ELSE 0 END) AS PositiveComments,
+        SUM(CASE WHEN c.Score < 0 THEN 1 ELSE 0 END) AS NegativeComments,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM
+        Comments c
+    WHERE
+        c.UserId IS NOT NULL AND c.UserId > 0
+    GROUP BY
+        c.UserId
+),
+PostHistorySummary AS (
+    SELECT
+        ph.UserId,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (1, 2, 3) THEN 1 END) AS InitialEdits,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 END) AS SubsequentEdits,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (7, 8, 9) THEN 1 END) AS Rollbacks,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 END) AS PostsClosed,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 19 THEN 1 END) AS PostsProtected
+    FROM
+        PostHistory ph
+    WHERE
+        ph.UserId IS NOT NULL AND ph.UserId > 0
+    GROUP BY
+        ph.UserId
+),
+UserNetVotes AS (
+    SELECT
+        v.UserId,
+        COUNT(CASE WHEN vt.Name = 'UpMod' THEN 1 END) AS TotalUpVotes,
+        COUNT(CASE WHEN vt.Name = 'DownMod' THEN 1 END) AS TotalDownVotes,
+        SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) - SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS NetVoteScore
+    FROM
+        Votes v
+    JOIN
+        VoteTypes vt ON v.VoteTypeId = vt.Id
+    WHERE
+        v.UserId IS NOT NULL AND v.UserId > 0
+    GROUP BY
+        v.UserId
+)
+SELECT
+    ue.UserId,
+    ue.DisplayName,
+    ue.Reputation,
+    ue.UserCreationDate,
+    ue.TotalPosts,
+    ue.TotalEngagementScore,
+    ue.AveragePostScore,
+    ue.HighestRankedPost,
+    COALESCE(ca.CommentCount, 0) AS UserCommentCount,
+    COALESCE(ca.DistinctPostsCommentedOn, 0) AS PostsCommentedOn,
+    COALESCE(ca.PositiveComments, 0) AS PositiveComments,
+    COALESCE(ca.NegativeComments, 0) AS NegativeComments,
+    COALESCE(phs.InitialEdits, 0) AS InitialEdits,
+    COALESCE(phs.SubsequentEdits, 0) AS SubsequentEdits,
+    COALESCE(phs.Rollbacks, 0) AS Rollbacks,
+    COALESCE(phs.PostsClosed, 0) AS PostsClosed,
+    COALESCE(phs.PostsProtected, 0) AS PostsProtected,
+    COALESCE(unv.TotalUpVotes, 0) AS UserTotalUpVotes,
+    COALESCE(unv.TotalDownVotes, 0) AS UserTotalDownVotes,
+    COALESCE(unv.NetVoteScore, 0) AS UserNetVoteScore,
+    CASE
+        WHEN ue.TotalPosts > 1000 AND ue.AveragePostScore > 50 THEN 'Highly Engaged & Productive'
+        WHEN ue.TotalPosts > 500 AND ue.Reputation > 10000 THEN 'Experienced Contributor'
+        WHEN ue.TotalPosts > 100 AND ue.AveragePostScore > 10 THEN 'Active Participant'
+        WHEN ue.Reputation > 5000 THEN 'Reputable User'
+        ELSE 'Standard User'
+    END AS UserTier,
+    (ps_high.Score - ps_low.Score) AS ScoreRangeForTopPosts,
+    ue.TotalPosts * ue.AveragePostScore AS WeightedEngagement,
+    CAST(
+      EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - ue.UserCreationDate)) / 86400
+      AS INTEGER
+    ) AS DaysSinceCreation,
+    CASE
+        WHEN ca.LastCommentDate IS NULL THEN 'Never Commented'
+        ELSE CAST(CAST((EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - ca.LastCommentDate)) / 86400) AS INTEGER) AS TEXT) || ' days ago'
+    END AS TimeSinceLastComment,
+    CASE
+        WHEN phs.SubsequentEdits > phs.InitialEdits THEN 'More Edits Than Initial'
+        WHEN phs.SubsequentEdits < phs.InitialEdits THEN 'Fewer Edits Than Initial'
+        WHEN phs.SubsequentEdits = phs.InitialEdits AND phs.SubsequentEdits > 0 THEN 'Equal Edits'
+        ELSE 'No Significant Edits'
+    END AS EditPattern,
+    CAST(SUM(CASE WHEN ps.Score > 0 THEN ps.Score ELSE 0 END) OVER (ORDER BY ue.UserId ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS DECIMAL(18,2)) / NULLIF(SUM(CASE WHEN ps.Score IS NULL THEN 0 ELSE ps.Score END) OVER (ORDER BY ue.UserId ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),0) AS CumulativeScorePercentage
+FROM
+    UserEngagement ue
+LEFT JOIN
+    CommentActivity ca ON ue.UserId = ca.UserId
+LEFT JOIN
+    PostHistorySummary phs ON ue.UserId = phs.UserId
+LEFT JOIN
+    UserNetVotes unv ON ue.UserId = unv.UserId
+LEFT JOIN
+    PostScores ps ON ue.UserId = ps.OwnerUserId
+LEFT JOIN
+    PostScores ps_high ON ue.UserId = ps_high.OwnerUserId AND ps_high.RankByScore = 1
+LEFT JOIN
+    PostScores ps_low ON ue.UserId = ps_low.OwnerUserId AND ps_low.RankByScore = (SELECT MAX(RankByScore) FROM PostScores WHERE OwnerUserId = ue.UserId)
+WHERE
+    ue.TotalPosts > 5 AND ue.Reputation > 100
+GROUP BY
+    ue.UserId, ue.DisplayName, ue.Reputation, ue.UserCreationDate, ue.TotalPosts, ue.TotalEngagementScore, ue.AveragePostScore, ue.HighestRankedPost,
+    ca.CommentCount, ca.DistinctPostsCommentedOn, ca.PositiveComments, ca.NegativeComments,
+    phs.InitialEdits, phs.SubsequentEdits, phs.Rollbacks, phs.PostsClosed, phs.PostsProtected,
+    unv.TotalUpVotes, unv.TotalDownVotes, unv.NetVoteScore, ca.LastCommentDate, ps_high.Score, ps_low.Score
+HAVING
+    SUM(CASE WHEN ps.Score IS NULL THEN 0 ELSE ps.Score END) > 0
+ORDER BY
+    ue.Reputation DESC, ue.TotalEngagementScore DESC, ue.TotalPosts DESC;

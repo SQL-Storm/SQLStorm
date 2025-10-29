@@ -1,0 +1,69 @@
+-- {"query": "6417.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-micro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 504} 
+
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    MAX(u.CreationDate) AS LatestAccountActivity,
+    MAX(p.LastActivityDate) AS LatestPostActivity,
+    b.Class AS BadgeClass,
+    t.TagName
+FROM 
+    Users u
+LEFT JOIN 
+    (SELECT 
+         UserId, 
+         MIN(Date) AS FirstBadgeDate, 
+         Class, 
+         TagBased
+     FROM 
+         Badges
+     GROUP BY 
+         UserId, Class, TagBased) b ON u.Id = b.UserId
+LEFT JOIN 
+    (SELECT 
+         Id, 
+         Name
+     FROM 
+         Tags
+     WHERE 
+         IsRequired = 0 AND IsModeratorOnly = 0) t ON (
+         SELECT 
+             t1.Id
+         FROM 
+             Posts p
+         JOIN 
+             (SELECT 
+                  PostId, 
+                  ARRAY_AGG(TagName ORDER BY TagName) AS TagNames
+              FROM 
+                  (SELECT 
+                       p.Id AS PostId, 
+                       t.TagName 
+                   FROM 
+                       Posts p
+                   JOIN 
+                       Tags t ON t.ExcerptPostId = p.Id
+                   GROUP BY 
+                       p.Id, t.TagName) sub
+              GROUP BY 
+                  PostId) tt ON p.Id = tt.PostId
+         WHERE 
+             tt.TagNames @> ARRAY[t.TagName]) 
+    ON TRUE
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+WHERE 
+    u.Reputation > 10000
+    AND p.Score > 0
+    AND p.LastEditDate > (CURRENT_DATE - INTERVAL '1 year')
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation, b.Class
+HAVING 
+    COUNT(DISTINCT p.Id) > 100
+ORDER BY 
+    u.Reputation DESC, 
+    TotalPosts DESC
+LIMIT 10;

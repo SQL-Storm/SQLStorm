@@ -1,0 +1,392 @@
+-- {"query": "7526.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 3283} 
+WITH UserActivityMetrics AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT c.Id) as Comments,
+        COUNT(DISTINCT b.Id) as Badges,
+        MAX(p.CreationDate) as LastPostDate,
+        DATEDIFF(day, u.CreationDate, GETDATE()) as AccountAgeDays,
+        ROUND(
+            CAST(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS FLOAT) / 
+            NULLIF(COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END), 0), 2
+        ) as AvgQuestionScore,
+        ROUND(
+            CAST(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS FLOAT) / 
+            NULLIF(COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END), 0), 2
+        ) as AvgAnswerScore,
+        (SELECT COUNT(*) 
+         FROM Posts p2 
+         WHERE p2.OwnerUserId = u.Id 
+         AND p2.PostTypeId = 1 
+         AND p2.ClosedDate IS NOT NULL
+        ) as ClosedQuestions,
+        (SELECT COUNT(*) 
+         FROM Posts p3 
+         WHERE p3.OwnerUserId = u.Id 
+         AND p3.PostTypeId = 2 
+         AND p3.Score > 0
+        ) as PositiveAnswerCount
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate
+),
+TopUsers AS (
+    SELECT 
+        UserId, 
+        DisplayName, 
+        Reputation,
+        TotalPosts,
+        Questions,
+        Answers,
+        Comments,
+        Badges,
+        LastPostDate,
+        AccountAgeDays,
+        AvgQuestionScore,
+        AvgAnswerScore,
+        ClosedQuestions,
+        PositiveAnswerCount,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, TotalPosts DESC) as RankByReputation,
+        ROW_NUMBER() OVER (ORDER BY TotalPosts DESC, Reputation DESC) as RankByActivity,
+        NTILE(10) OVER (ORDER BY Reputation DESC) as ReputationDecile
+    FROM UserActivityMetrics
+),
+QuestionStats AS (
+    SELECT 
+        p.Id as QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        u.Reputation as OwnerReputation,
+        DATEDIFF(day, p.CreationDate, GETDATE()) as AgeInDays,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN DATEDIFF(day, p.CreationDate, p.ClosedDate)
+            ELSE NULL 
+        END as DaysToClose,
+        CASE 
+            WHEN p.Score >= 10 THEN 'High'
+            WHEN p.Score >= 5 THEN 'Medium'
+            ELSE 'Low'
+        END as ScoreCategory,
+        COALESCE(
+            (
+                SELECT STRING_AGG(t.TagName, ', ')
+                FROM (
+                    SELECT value as TagName
+                    FROM STRING_SPLIT(REPLACE(REPLACE(p.Tags, '<', ''), '>', ''), '><')
+                    WHERE value != ''
+                ) t
+            ), 'No Tags'
+        ) as TagsList,
+        (
+            SELECT COUNT(*) 
+            FROM Comments c 
+            WHERE c.PostId = p.Id
+            AND c.UserId IS NOT NULL
+        ) as CommentedByUsers,
+        (
+            SELECT COUNT(DISTINCT UserId) 
+            FROM Votes v 
+            WHERE v.PostId = p.Id 
+            AND v.VoteTypeId = 2
+        ) as UpvotesCount,
+        (
+            SELECT COUNT(DISTINCT UserId) 
+            FROM Votes v 
+            WHERE v.PostId = p.Id 
+            AND v.VoteTypeId = 3
+        ) as DownvotesCount
+    FROM Posts p
+    INNER JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1
+    AND p.CreationDate >= DATEADD(year, -1, GETDATE())
+),
+AnswerQuality AS (
+    SELECT 
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.Score,
+        a.CreationDate,
+        a.OwnerUserId,
+        a.LastEditDate,
+        u.DisplayName as OwnerName,
+        u.Reputation as OwnerReputation,
+        DATEDIFF(day, a.CreationDate, GETDATE()) as AgeInDays,
+        p.Title as QuestionTitle,
+        CASE 
+            WHEN a.Score >= 10 THEN 'Excellent'
+            WHEN a.Score >= 5 THEN 'Good'
+            WHEN a.Score >= 0 THEN 'Average'
+            ELSE 'Low'
+        END as QualityLevel,
+        (
+            CASE 
+                WHEN EXISTS (
+                    SELECT 1 
+                    FROM Votes v 
+                    WHERE v.PostId = a.Id 
+                    AND v.VoteTypeId = 1
+                ) THEN 'Accepted'
+                ELSE 'Not Accepted'
+            END
+        ) as IsAccepted,
+        (
+            SELECT COUNT(DISTINCT UserId) 
+            FROM Votes v 
+            WHERE v.PostId = a.Id 
+            AND v.VoteTypeId = 2
+        ) as Upvotes,
+        (
+            SELECT COUNT(DISTINCT UserId) 
+            FROM Votes v 
+            WHERE v.PostId = a.Id 
+            AND v.VoteTypeId = 3
+        ) as Downvotes
+    FROM Posts a
+    INNER JOIN Users u ON u.Id = a.OwnerUserId
+    INNER JOIN Posts p ON p.Id = a.ParentId
+    WHERE a.PostTypeId = 2
+    AND a.CreationDate >= DATEADD(year, -2, GETDATE())
+),
+UserPostAggregations AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) as QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) as AnswerCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) as TotalQuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) as TotalAnswerScore,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END) as AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE NULL END) as AvgAnswerScore,
+        MAX(p.CreationDate) as LatestPostDate,
+        COUNT(DISTINCT p.Tags) as UniqueTagCount,
+        MAX(p.ViewCount) as MaxViews,
+        COUNT(DISTINCT p.AnswerCount) as DistinctAnswerCount,
+        CASE 
+            WHEN MAX(p.CreationDate) < DATEADD(month, -3, GETDATE()) THEN 'Inactive'
+            WHEN MAX(p.CreationDate) < DATEADD(month, -1, GETDATE()) THEN 'Low Activity'
+            ELSE 'Active'
+        END as ActivityStatus
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+TagUsageAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as UsageCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Very Popular'
+            WHEN t.Count > 500 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            ELSE 'Rare'
+        END as PopularityLevel,
+        (
+            SELECT COUNT(*) 
+            FROM Posts p 
+            WHERE p.Tags LIKE '%' + t.TagName + '%'
+            AND p.PostTypeId = 1
+        ) as QuestionsWithTag,
+        (
+            SELECT AVG(p.Score) 
+            FROM Posts p 
+            WHERE p.Tags LIKE '%' + t.TagName + '%'
+            AND p.PostTypeId = 1
+        ) as AvgScoreForTag
+    FROM Tags t
+    WHERE t.Count > 50
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.OwnerUserId,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.ParentId,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Question with Accepted Answer'
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NULL THEN 'Question without Accepted Answer'
+            WHEN p.PostTypeId = 2 AND p.ParentId IS NOT NULL THEN 'Answer'
+            ELSE 'Other'
+        END as PostCategory,
+        (
+            SELECT COUNT(*) 
+            FROM PostHistory ph 
+            WHERE ph.PostId = p.Id 
+            AND ph.PostHistoryTypeId IN (2, 5, 8)
+        ) as EditCount,
+        (
+            SELECT COUNT(*) 
+            FROM PostHistory ph 
+            WHERE ph.PostId = p.Id 
+            AND ph.PostHistoryTypeId IN (10, 11, 12)
+        ) as StatusChangeCount,
+        (
+            SELECT COUNT(*) 
+            FROM PostHistory ph 
+            WHERE ph.PostId = p.Id 
+            AND ph.PostHistoryTypeId IN (15, 14, 19, 20)
+        ) as ModerationActionCount,
+        (
+            SELECT STRING_AGG(
+                CASE 
+                    WHEN ph.PostHistoryTypeId = 1 THEN 'Initial Title'
+                    WHEN ph.PostHistoryTypeId = 2 THEN 'Initial Body'
+                    WHEN ph.PostHistoryTypeId = 3 THEN 'Initial Tags'
+                    WHEN ph.PostHistoryTypeId = 4 THEN 'Edit Title'
+                    WHEN ph.PostHistoryTypeId = 5 THEN 'Edit Body'
+                    WHEN ph.PostHistoryTypeId = 6 THEN 'Edit Tags'
+                    WHEN ph.PostHistoryTypeId = 10 THEN 'Post Closed'
+                    WHEN ph.PostHistoryTypeId = 11 THEN 'Post Reopened'
+                    WHEN ph.PostHistoryTypeId = 12 THEN 'Post Deleted'
+                    ELSE 'Other'
+                END, ', '
+            )
+            FROM PostHistory ph 
+            WHERE ph.PostId = p.Id 
+            AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 10, 11, 12)
+        ) as EditHistoryTypes
+    FROM Posts p
+),
+UserRankings AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        (
+            SELECT COUNT(*) 
+            FROM Votes v 
+            WHERE v.UserId = u.Id 
+            AND v.VoteTypeId IN (2, 3, 5, 8)
+        ) as VoteCount,
+        (
+            SELECT COUNT(*) 
+            FROM Badges b 
+            WHERE b.UserId = u.Id
+        ) as BadgeCount,
+        (
+            SELECT COUNT(*) 
+            FROM Comments c 
+            WHERE c.UserId = u.Id
+        ) as CommentCount,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) as ReputationRank,
+        RANK() OVER (ORDER BY u.Reputation DESC) as ReputationRankWithTies,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) as ReputationRankWithoutGaps
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+)
+SELECT 
+    COUNT(*) as TotalUsers,
+    SUM(CASE WHEN u.Reputation >= 10000 THEN 1 ELSE 0 END) as TopTierUsers,
+    AVG(u.Reputation) as AvgReputation,
+    AVG(CAST(TopUsers.TotalPosts as FLOAT)) as AvgPostsPerUser,
+    MAX(TopUsers.Reputation) as MaxReputation,
+    MIN(TopUsers.Reputation) as MinReputation,
+    AVG(CAST(TopUsers.Questions as FLOAT)) as AvgQuestionsPerUser,
+    AVG(CAST(TopUsers.Answers as FLOAT)) as AvgAnswersPerUser,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.PostTypeId = 1 
+        AND p.CreationDate >= DATEADD(day, -7, GETDATE())
+    ) as NewQuestionsLastWeek,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.PostTypeId = 2 
+        AND p.CreationDate >= DATEADD(day, -7, GETDATE())
+    ) as NewAnswersLastWeek,
+    (
+        SELECT COUNT(*) 
+        FROM Comments c 
+        WHERE c.CreationDate >= DATEADD(day, -7, GETDATE())
+    ) as NewCommentsLastWeek,
+    (
+        SELECT COUNT(*) 
+        FROM Badges b 
+        WHERE b.Date >= DATEADD(day, -30, GETDATE())
+    ) as NewBadgesLastMonth,
+    (
+        SELECT COUNT(*) 
+        FROM Votes v 
+        WHERE v.CreationDate >= DATEADD(day, -30, GETDATE())
+    ) as NewVotesLastMonth,
+    (
+        SELECT COUNT(DISTINCT ph.PostId) 
+        FROM PostHistory ph 
+        WHERE ph.CreationDate >= DATEADD(day, -30, GETDATE())
+        AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 10, 11, 12)
+    ) as PostsModifiedLastMonth,
+    (
+        SELECT STRING_AGG(
+            CASE 
+                WHEN COUNT(*) >= 10 THEN 'Active User'
+                ELSE 'Inactive User'
+            END, ', '
+        ) 
+        FROM (
+            SELECT u.Id, COUNT(p.Id) as PostCount
+            FROM Users u
+            INNER JOIN Posts p ON p.OwnerUserId = u.Id
+            WHERE p.CreationDate >= DATEADD(month, -3, GETDATE())
+            GROUP BY u.Id
+        ) active_users
+    ) as ActivityCategories,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.Score >= 100
+        AND p.PostTypeId = 1
+    ) as HighScoreQuestions,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.Score >= 50
+        AND p.PostTypeId = 2
+    ) as HighScoreAnswers
+FROM Users u
+LEFT JOIN TopUsers ON TopUsers.UserId = u.Id
+WHERE u.Id IN (
+    SELECT UserId 
+    FROM UserActivityMetrics 
+    WHERE TotalPosts > 0
+)
+AND NOT EXISTS (
+    SELECT 1 
+    FROM Posts p1 
+    WHERE p1.OwnerUserId = u.Id 
+    AND p1.PostTypeId = 1 
+    AND p1.Score >= 100
+    AND p1.ClosedDate IS NOT NULL
+)
+HAVING COUNT(*) > 0
+ORDER BY (SELECT NULL);

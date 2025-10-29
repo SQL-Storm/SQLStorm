@@ -1,0 +1,426 @@
+-- {"query": "777.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3778} 
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        u.location,
+        date_trunc('month', u.creationdate) as signup_month,
+        row_number() over (partition by date_trunc('month', u.creationdate) order by u.reputation desc, u.id) as rn_in_month
+    from users u
+    where u.creationdate >= now() - interval '5 years'
+),
+top_users as (
+    select ru.*
+    from recent_users ru
+    where ru.rn_in_month <= 50
+),
+user_posts as (
+    select
+        p.id as post_id,
+        p.posttypeid,
+        p.owneruserid as user_id,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        p.answercount,
+        p.commentcount,
+        coalesce(p.favoritecount, 0) as favoritecount,
+        (p.tags) as tags_raw,
+        case when p.posttypeid = 1 then 1 else 0 end as is_question,
+        case when p.posttypeid = 2 then 1 else 0 end as is_answer
+    from posts p
+    where p.owneruserid is not null
+),
+accepted_answerers as (
+    select distinct a.owneruserid as user_id
+    from posts q
+    join posts a on a.id = q.acceptedanswerid
+    where q.posttypeid = 1
+),
+user_badge_facts as (
+    select
+        b.userid as user_id,
+        count(*) filter (where b.class = 1) as gold_badges,
+        count(*) filter (where b.class = 2) as silver_badges,
+        count(*) filter (where b.class = 3) as bronze_badges,
+        count(*) filter (where b.tagbased = 1) as tag_badges,
+        min(b.date) as first_badge_date,
+        max(b.date) as last_badge_date
+    from badges b
+    group by b.userid
+),
+votes_agg as (
+    select
+        v.postid,
+        count(*) filter (where v.votetypeid = 2) as upvotes,
+        count(*) filter (where v.votetypeid = 3) as downvotes,
+        count(*) filter (where v.votetypeid = 8) as bounties_started,
+        sum(v.bountyamount) filter (where v.votetypeid in (8,9)) as bounty_amount_total,
+        count(*) filter (where v.votetypeid = 5) as favorites_legacy
+    from votes v
+    group by v.postid
+),
+comments_agg as (
+    select
+        c.postid,
+        count(*) as comment_count,
+        max(c.creationdate) as last_comment_date,
+        avg(nullif(c.score, 0)) as avg_comment_score_nonzero
+    from comments c
+    group by c.postid
+),
+post_edit_events as (
+    select
+        ph.postid,
+        count(*) filter (where ph.posthistorytypeid in (4,5,6)) as edit_events,
+        min(ph.creationdate) filter (where ph.posthistorytypeid in (4,5,6)) as first_edit_date,
+        count(*) filter (where ph.posthistorytypeid in (10)) as closed_votes_recorded,
+        count(*) filter (where ph.posthistorytypeid in (11)) as reopened_events,
+        max(ph.creationdate) filter (where ph.posthistorytypeid in (12)) as last_delete_vote
+    from posthistory ph
+    group by ph.postid
+),
+post_links_agg as (
+    select
+        pl.postid,
+        count(*) filter (where pl.linktypeid = 1) as linked_out_count,
+        count(*) filter (where pl.linktypeid = 3) as duplicate_marks,
+        count(distinct pl.relatedpostid) filter (where pl.linktypeid = 3) as distinct_dupe_targets
+    from postlinks pl
+    group by pl.postid
+),
+question_tag_explode as (
+    select
+        p.id as post_id,
+        unnest(string_to_array(substring(p.tags, 2, greatest(length(p.tags)-2,0)), '><')) as tag
+    from posts p
+    where p.posttypeid = 1 and p.tags is not null and length(p.tags) > 2
+),
+tag_rank as (
+    select
+        qte.tag,
+        count(*) as tag_q_count,
+        row_number() over (order by count(*) desc, tag) as tag_popularity_rank
+    from question_tag_explode qte
+    group by qte.tag
+),
+user_post_enriched as (
+    select
+        up.post_id,
+        up.user_id,
+        up.posttypeid,
+        up.creationdate,
+        up.score,
+        up.viewcount,
+        up.answercount,
+        up.commentcount,
+        up.favoritecount,
+        coalesce(va.upvotes, 0) as upvotes,
+        coalesce(va.downvotes, 0) as downvotes,
+        coalesce(va.bounties_started, 0) as bounties_started,
+        coalesce(va.bounty_amount_total, 0) as bounty_amount_total,
+        coalesce(va.favorites_legacy, 0) as favorites_legacy,
+        coalesce(ca.comment_count, 0) as comment_count_calc,
+        ca.last_comment_date,
+        ca.avg_comment_score_nonzero,
+        coalesce(pe.edit_events, 0) as edit_events,
+        pe.first_edit_date,
+        coalesce(pe.closed_votes_recorded, 0) as closed_votes_recorded,
+        coalesce(pe.reopened_events, 0) as reopened_events,
+        pla.linked_out_count,
+        pla.duplicate_marks,
+        pla.distinct_dupe_targets
+    from user_posts up
+    left join votes_agg va on va.postid = up.post_id
+    left join comments_agg ca on ca.postid = up.post_id
+    left join post_edit_events pe on pe.postid = up.post_id
+    left join post_links_agg pla on pla.postid = up.post_id
+),
+user_activity as (
+    select
+        upe.user_id,
+        count(*) filter (where upe.posttypeid = 1) as q_count,
+        count(*) filter (where upe.posttypeid = 2) as a_count,
+        sum(upe.score) as total_score,
+        avg(upe.score) as avg_post_score,
+        sum(upe.viewcount) filter (where upe.posttypeid = 1) as total_question_views,
+        sum(upe.upvotes) as total_upvotes,
+        sum(upe.downvotes) as total_downvotes,
+        sum(upe.bounty_amount_total) as total_bounty_amount,
+        sum(upe.edit_events) as total_edits,
+        max(upe.last_comment_date) as last_interaction,
+        sum(coalesce(upe.favoritecount,0) + coalesce(upe.favorites_legacy,0)) as total_favorites_all,
+        sum(coalesce(upe.closed_votes_recorded,0)) as total_close_events,
+        sum(coalesce(upe.reopened_events,0)) as total_reopens
+    from user_post_enriched upe
+    group by upe.user_id
+),
+monthly_user_activity as (
+    select
+        upe.user_id,
+        date_trunc('month', upe.creationdate) as month,
+        count(*) as posts_in_month,
+        sum(upe.score) as score_in_month,
+        sum(upe.upvotes) as upvotes_in_month,
+        sum(case when upe.posttypeid = 1 then 1 else 0 end) as q_in_month,
+        sum(case when upe.posttypeid = 2 then 1 else 0 end) as a_in_month
+    from user_post_enriched upe
+    group by upe.user_id, date_trunc('month', upe.creationdate)
+),
+monthly_user_rank as (
+    select
+        mua.*,
+        dense_rank() over (partition by month order by score_in_month desc, upvotes_in_month desc, posts_in_month desc, user_id) as rank_in_month
+    from monthly_user_activity mua
+),
+user_quality_flags as (
+    select
+        ua.user_id,
+        case when ua.total_downvotes > ua.total_upvotes then 1 else 0 end as more_down_than_up,
+        case when ua.total_close_events > ua.total_reopens then 1 else 0 end as more_closes_than_reopens,
+        case when ua.total_bounty_amount > 0 then 1 else 0 end as has_bounties,
+        case when ua.total_question_views >= 100000 then 1 else 0 end as high_views,
+        case when ua.total_edits >= 10 then 1 else 0 end as frequent_editor
+    from user_activity ua
+),
+user_summary as (
+    select
+        tu.user_id,
+        tu.displayname,
+        tu.reputation,
+        tu.signup_month,
+        ua.q_count,
+        ua.a_count,
+        ua.total_score,
+        ua.avg_post_score,
+        ua.total_question_views,
+        ua.total_upvotes,
+        ua.total_downvotes,
+        ua.total_bounty_amount,
+        ua.total_edits,
+        ua.last_interaction,
+        ua.total_favorites_all,
+        ub.gold_badges,
+        ub.silver_badges,
+        ub.bronze_badges,
+        ub.tag_badges,
+        ub.first_badge_date,
+        ub.last_badge_date,
+        uflag.more_down_than_up,
+        uflag.more_closes_than_reopens,
+        uflag.has_bounties,
+        uflag.high_views,
+        uflag.frequent_editor,
+        case when aa.user_id is not null then 1 else 0 end as has_any_accepted_answer
+    from top_users tu
+    left join user_activity ua on ua.user_id = tu.user_id
+    left join user_badge_facts ub on ub.user_id = tu.user_id
+    left join user_quality_flags uflag on uflag.user_id = tu.user_id
+    left join accepted_answerers aa on aa.user_id = tu.user_id
+),
+user_tag_prefs as (
+    select
+        qte.tag,
+        p.owneruserid as user_id,
+        count(*) as tag_posts,
+        avg(p.score) as tag_avg_score,
+        sum(p.viewcount) as tag_views,
+        min(p.creationdate) as first_tag_post,
+        max(p.creationdate) as last_tag_post
+    from posts p
+    join question_tag_explode qte on qte.post_id = p.id
+    where p.owneruserid is not null
+    group by qte.tag, p.owneruserid
+),
+user_top_tags as (
+    select
+        utp.user_id,
+        utp.tag,
+        utp.tag_posts,
+        utp.tag_avg_score,
+        utp.tag_views,
+        tr.tag_popularity_rank,
+        row_number() over (partition by utp.user_id order by utp.tag_posts desc, utp.tag_avg_score desc, utp.tag_views desc, utp.tag) as rn_by_user
+    from user_tag_prefs utp
+    left join tag_rank tr on tr.tag = utp.tag
+),
+normalized_scores as (
+    select
+        us.user_id,
+        sqrt(greatest(us.total_upvotes - us.total_downvotes, 0)) as sqrt_net_votes,
+        log(10, greatest(us.total_question_views + 1, 1)) as log_views,
+        coalesce(us.total_bounty_amount,0) / nullif(us.q_count + us.a_count,0) as bounty_per_post
+    from user_summary us
+),
+bench_series as (
+    select
+        us.user_id,
+        us.displayname,
+        us.reputation,
+        us.signup_month,
+        us.q_count,
+        us.a_count,
+        us.total_score,
+        us.avg_post_score,
+        us.total_question_views,
+        us.total_upvotes,
+        us.total_downvotes,
+        us.total_bounty_amount,
+        us.total_edits,
+        us.last_interaction,
+        us.total_favorites_all,
+        us.gold_badges,
+        us.silver_badges,
+        us.bronze_badges,
+        us.tag_badges,
+        us.first_badge_date,
+        us.last_badge_date,
+        us.more_down_than_up,
+        us.more_closes_than_reopens,
+        us.has_bounties,
+        us.high_views,
+        us.frequent_editor,
+        us.has_any_accepted_answer,
+        ns.sqrt_net_votes,
+        ns.log_views,
+        ns.bounty_per_post,
+        coalesce(ut.tag, '(no tag)') as top_tag,
+        ut.tag_posts as top_tag_posts,
+        ut.tag_avg_score as top_tag_avg_score,
+        ut.tag_views as top_tag_views,
+        ut.tag_popularity_rank,
+        mur.month as active_month,
+        mur.rank_in_month
+    from user_summary us
+    left join normalized_scores ns on ns.user_id = us.user_id
+    left join user_top_tags ut on ut.user_id = us.user_id and ut.rn_by_user = 1
+    left join monthly_user_rank mur on mur.user_id = us.user_id
+),
+dupe_network as (
+    select
+        q.id as question_id,
+        count(distinct pl.relatedpostid) as dupe_targets,
+        count(*) as dupe_marks,
+        max(pl.creationdate) as last_dupe_mark
+    from posts q
+    left join postlinks pl on pl.postid = q.id and pl.linktypeid = 3
+    where q.posttypeid = 1
+    group by q.id
+),
+question_health as (
+    select
+        q.id as question_id,
+        q.owneruserid as user_id,
+        q.score,
+        q.viewcount,
+        q.answercount,
+        q.commentcount,
+        case
+            when q.closeddate is not null then 1
+            when coalesce(dn.dupe_marks,0) > 0 then 1
+            else 0
+        end as likely_low_quality,
+        coalesce(dn.dupe_targets,0) as dupe_targets,
+        dn.last_dupe_mark
+    from posts q
+    left join dupe_network dn on dn.question_id = q.id
+    where q.posttypeid = 1
+),
+user_question_health as (
+    select
+        qh.user_id,
+        count(*) as questions_total,
+        sum(case when qh.likely_low_quality = 1 then 1 else 0 end) as questions_flagged_low_quality,
+        avg(qh.score) as avg_q_score,
+        avg(qh.viewcount) as avg_q_views,
+        avg(qh.answercount) as avg_q_answers
+    from question_health qh
+    group by qh.user_id
+),
+final as (
+    select
+        bs.user_id,
+        bs.displayname,
+        bs.reputation,
+        bs.signup_month,
+        bs.active_month,
+        bs.rank_in_month,
+        bs.q_count,
+        bs.a_count,
+        bs.total_score,
+        round(bs.avg_post_score::numeric, 2) as avg_post_score,
+        bs.total_question_views,
+        bs.total_upvotes,
+        bs.total_downvotes,
+        bs.total_bounty_amount,
+        bs.total_edits,
+        bs.last_interaction,
+        bs.total_favorites_all,
+        bs.gold_badges,
+        bs.silver_badges,
+        bs.bronze_badges,
+        bs.tag_badges,
+        bs.first_badge_date,
+        bs.last_badge_date,
+        bs.more_down_than_up,
+        bs.more_closes_than_reopens,
+        bs.has_bounties,
+        bs.high_views,
+        bs.frequent_editor,
+        bs.has_any_accepted_answer,
+        coalesce(bs.sqrt_net_votes, 0) as sqrt_net_votes,
+        coalesce(bs.log_views, 0) as log_views,
+        bs.bounty_per_post,
+        bs.top_tag,
+        bs.top_tag_posts,
+        bs.top_tag_avg_score,
+        bs.top_tag_views,
+        bs.tag_popularity_rank,
+        uqh.questions_total,
+        uqh.questions_flagged_low_quality,
+        uqh.avg_q_score,
+        uqh.avg_q_views,
+        uqh.avg_q_answers,
+        case
+            when bs.reputation >= 100000 then 'legend'
+            when bs.reputation >= 25000 then 'expert'
+            when bs.reputation >= 5000 then 'advanced'
+            when bs.reputation >= 1000 then 'intermediate'
+            else 'newbie'
+        end as reputation_bucket,
+        case
+            when bs.total_upvotes + bs.total_downvotes = 0 then null
+            else (bs.total_upvotes::numeric / nullif(bs.total_upvotes + bs.total_downvotes, 0))::numeric
+        end as upvote_ratio,
+        coalesce(uqh.questions_flagged_low_quality::numeric / nullif(uqh.questions_total,0), 0) as low_quality_ratio
+    from bench_series bs
+    left join user_question_health uqh on uqh.user_id = bs.user_id
+)
+select *
+from final
+where
+    (reputation_bucket in ('expert','legend') or (avg_post_score > 1 and upvote_ratio > 0.6))
+    and coalesce(low_quality_ratio, 0) < 0.5
+    and (
+        top_tag is null
+        or top_tag_popularity_rank <= 200
+        or (top_tag_avg_score > 2 and top_tag_posts >= 3)
+    )
+    and (
+        last_interaction is null
+        or last_interaction >= now() - interval '3 years'
+    )
+    and (
+        has_bounties = 1
+        or sqrt_net_votes > 25
+        or total_question_views >= 50000
+        or total_favorites_all >= 25
+    )
+order by
+    reputation_bucket desc,
+    coalesce(rank_in_month, 999999),
+    total_score desc,
+    user_id
+limit 500;

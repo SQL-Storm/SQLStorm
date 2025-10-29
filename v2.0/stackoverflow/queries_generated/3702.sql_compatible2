@@ -1,0 +1,135 @@
+WITH UserStats AS (
+    SELECT
+        u.Id                                          AS UserId,
+        u.DisplayName                                 AS DisplayName,
+        u.Reputation                                  AS Reputation,
+        COALESCE(SUM(p.Score), 0)                      AS TotalScore,
+        COUNT(DISTINCT p.Id)                          AS PostCount,
+        COUNT(DISTINCT b.Id)                          AS BadgeCount,
+        MAX(p.CreationDate)                           AS LastPostDate,
+        MAX(v.CreationDate)                           AS LastVoteDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC,
+                                 COALESCE(SUM(p.Score),0) DESC) AS RepRank
+    FROM Users u
+    LEFT JOIN Posts  p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId      = u.Id
+    LEFT JOIN Votes  v ON v.UserId      = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+TagInfo AS (
+    SELECT
+        t.TagName,
+        t.Count                                   AS TagUseCount,
+        COALESCE(e.Title, w.Title, 'Unnamed')     AS TagTitle,
+        CASE WHEN t.IsModeratorOnly = 1 THEN 'ModOnly' ELSE 'Public' END AS Visibility,
+        ROW_NUMBER() OVER (PARTITION BY t.IsModeratorOnly
+                           ORDER BY t.Count DESC) AS TagRank
+    FROM Tags t
+    LEFT JOIN Posts e ON e.Id = t.ExcerptPostId
+    LEFT JOIN Posts w ON w.Id = t.WikiPostId
+),
+
+RecentClosedQuestions AS (
+    SELECT
+        p.Id                                    AS PostId,
+        p.Title                                 AS Title,
+        p.CreationDate                          AS CreationDate,
+        ph.CreationDate                         AS ClosedDate,
+        CAST(ph.Comment AS INTEGER)             AS CloseReasonId,
+        ROW_NUMBER() OVER (PARTITION BY CAST(ph.Comment AS INTEGER)
+                           ORDER BY ph.CreationDate DESC) AS CloseReasonRank
+    FROM Posts p
+    JOIN PostHistory ph
+          ON ph.PostId = p.Id
+         AND ph.PostHistoryTypeId = 10               -- Close event
+    WHERE p.PostTypeId = 1                           -- Questions only
+),
+
+UserLastVoteType AS (
+    SELECT
+        v.UserId,
+        (SELECT vt.Name
+         FROM VoteTypes vt
+         WHERE vt.Id = v.VoteTypeId) AS LastVoteType
+    FROM Votes v
+    WHERE v.CreationDate =
+          (SELECT MAX(v2.CreationDate)
+           FROM Votes v2
+           WHERE v2.UserId = v.UserId)
+    GROUP BY v.UserId, v.VoteTypeId
+)
+
+SELECT
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.TotalScore,
+    us.PostCount,
+    us.BadgeCount,
+    us.LastPostDate,
+    us.LastVoteDate,
+    us.RepRank,
+    ti.TagName,
+    ti.TagUseCount,
+    ti.Visibility,
+    ti.TagRank,
+    rcq.Title                      AS ClosedQuestionTitle,
+    rcq.ClosedDate,
+    cr.Name                        AS CloseReasonName,
+    rcq.CloseReasonRank,
+    ulvt.LastVoteType
+FROM UserStats us
+FULL OUTER JOIN TagInfo ti
+       ON ti.TagRank = (us.RepRank % 10) + 1
+LEFT JOIN RecentClosedQuestions rcq
+       ON rcq.CloseReasonRank = (us.RepRank % 5) + 1
+LEFT JOIN CloseReasonTypes cr
+       ON cr.Id = rcq.CloseReasonId
+LEFT JOIN UserLastVoteType ulvt
+       ON ulvt.UserId = us.UserId
+WHERE (us.RepRank <= 100 OR ti.TagRank <= 100)
+GROUP BY
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.TotalScore,
+    us.PostCount,
+    us.BadgeCount,
+    us.LastPostDate,
+    us.LastVoteDate,
+    us.RepRank,
+    ti.TagName,
+    ti.TagUseCount,
+    ti.Visibility,
+    ti.TagRank,
+    rcq.Title,
+    rcq.ClosedDate,
+    cr.Name,
+    rcq.CloseReasonRank,
+    ulvt.LastVoteType
+ORDER BY us.RepRank
+OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY
+
+UNION ALL
+
+SELECT
+    NULL AS UserId,
+    NULL AS DisplayName,
+    NULL AS Reputation,
+    NULL AS TotalScore,
+    NULL AS PostCount,
+    NULL AS BadgeCount,
+    NULL AS LastPostDate,
+    NULL AS LastVoteDate,
+    NULL AS RepRank,
+    NULL AS TagName,
+    NULL AS TagUseCount,
+    NULL AS Visibility,
+    NULL AS TagRank,
+    NULL AS ClosedQuestionTitle,
+    NULL AS ClosedDate,
+    NULL AS CloseReasonName,
+    NULL AS CloseReasonRank,
+    NULL AS LastVoteType
+WHERE 1 = 0;

@@ -1,0 +1,156 @@
+with recursive RecursiveTagHierarchy as (
+    select t.Id, t.TagName, t.Count, 0 as Depth, array[t.TagName] as Path
+    from Tags t
+    where t.IsRequired = true
+    union all
+    select c.Id, c.TagName, c.Count, r.Depth + 1, r.Path || c.TagName
+    from Tags c
+    join RecursiveTagHierarchy r on c.WikiPostId = r.Id
+    where c.IsModeratorOnly = false
+),
+UserBadgeAgg as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount,
+        bool_or(b.TagBased) as HasTagBasedBadge
+    from Badges b
+    group by b.UserId, b.Class
+),
+PostScoreRanked as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        rank() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as ScoreRank,
+        dense_rank() over (partition by p.PostTypeId order by coalesce(p.AnswerCount,0) desc) as AnswerCountRank,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as UserPostRecencyRank
+    from Posts p
+    where p.PostTypeId in (1,2)
+),
+AnswerCountCorrelated as (
+    select
+        q.Id as QuestionId,
+        (select count(1) from Posts a where a.ParentId = q.Id and a.Score >= q.Score/2 and a.CreationDate > q.CreationDate - interval '30 days') as RelevantAnswerCount
+    from Posts q
+    where q.PostTypeId = 1
+),
+UserActivityWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) over (partition by u.Id order by p.CreationDate rows between 30 preceding and current row) as RecentQuestions,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) over (partition by u.Id order by p.CreationDate rows between 30 preceding and current row) as RecentAnswers,
+        max(v.CreationDate) filter (where v.VoteTypeId = 2) over (partition by u.Id order by v.CreationDate rows between 90 preceding and current row) as LastUpvoteDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Votes v on v.UserId = u.Id
+),
+CombinedPostLinkVotes as (
+    select
+        pl.PostId,
+        count(distinct pl.RelatedPostId) as LinkedPostCount,
+        count(distinct case when pl.LinkTypeId = 3 then pl.RelatedPostId end) as DuplicatePostCount,
+        coalesce(sum(v1.Score), 0) as TotalVoteScore
+    from PostLinks pl
+    left join Posts p1 on p1.Id = pl.PostId
+    left join Votes v1 on v1.PostId = pl.PostId
+    group by pl.PostId
+),
+CloseReasonSummary as (
+    select
+        pht.PostId,
+        crt.Name as CloseReasonName,
+        count(*) as CloseVotes
+    from PostHistory pht
+    join PostHistoryTypes phtt on pht.PostHistoryTypeId = phtt.Id
+    join CloseReasonTypes crt on cast(pht.Comment as integer) = crt.Id
+    where pht.PostHistoryTypeId = 10
+    group by pht.PostId, crt.Name
+),
+FinalDataSet as (
+    select
+        p.Id as PostId,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        p.CreationDate,
+        ua.RecentQuestions,
+        ua.RecentAnswers,
+        ua.LastUpvoteDate,
+        uba.BadgeCount,
+        uba.Class as BadgeClass,
+        uba.HasTagBasedBadge,
+        pq.RelevantAnswerCount,
+        plv.LinkedPostCount,
+        plv.DuplicatePostCount,
+        plv.TotalVoteScore,
+        crs.CloseReasonName,
+        crs.CloseVotes,
+        rh.Depth as TagDepth,
+        rh.Path as TagHierarchyPath,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc) as OwnerTopScoringPostRank,
+        case
+            when p.ClosedDate is not null then 'Closed'
+            when p.AcceptedAnswerId is not null then 'Accepted'
+            else 'Open'
+        end as Status,
+        coalesce(p.Score,0)*coalesce(p.ViewCount,1) as ScoreViewProduct,
+        coalesce(p.Score,0) * 1.0 / nullif(p.ViewCount,0) as ScorePerViewRatio,
+        upper(coalesce(p.Title,'[No Title]')) as TitleUpper,
+        lower(split_part(coalesce(p.Title,''), ' ', 1)) as TitleFirstWord
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    left join UserActivityWindow ua on ua.UserId = p.OwnerUserId
+    left join UserBadgeAgg uba on uba.UserId = p.OwnerUserId and uba.Class = 1
+    left join AnswerCountCorrelated pq on pq.QuestionId = p.Id
+    left join CombinedPostLinkVotes plv on plv.PostId = p.Id
+    left join CloseReasonSummary crs on crs.PostId = p.Id
+    left join RecursiveTagHierarchy rh on rh.TagName = regexp_split_to_table(coalesce(p.Tags,''), '><')
+    where p.PostTypeId = 1
+)
+select distinct
+    fd.PostId,
+    fd.Title,
+    fd.Score,
+    fd.ViewCount,
+    fd.OwnerUserId,
+    fd.OwnerName,
+    fd.CreationDate,
+    fd.RecentQuestions,
+    fd.RecentAnswers,
+    fd.LastUpvoteDate,
+    fd.BadgeCount,
+    fd.BadgeClass,
+    fd.HasTagBasedBadge,
+    fd.RelevantAnswerCount,
+    fd.LinkedPostCount,
+    fd.DuplicatePostCount,
+    fd.TotalVoteScore,
+    fd.CloseReasonName,
+    fd.CloseVotes,
+    fd.TagDepth,
+    array_to_string(fd.TagHierarchyPath, ' > ') as TagHierarchy,
+    fd.OwnerTopScoringPostRank,
+    fd.Status,
+    fd.ScoreViewProduct,
+    fd.ScorePerViewRatio,
+    fd.TitleUpper,
+    fd.TitleFirstWord
+from FinalDataSet fd
+where fd.Score >= (
+    select percentile_cont(0.75) within group (order by Score)
+    from Posts
+    where PostTypeId = 1
+)
+and fd.RecentAnswers > 5
+and (fd.BadgeCount > 0 or fd.HasTagBasedBadge = true)
+and (fd.CloseVotes is null or fd.CloseVotes < 3)
+order by fd.Score desc, fd.ViewCount desc, fd.CreationDate desc
+limit 100;

@@ -1,0 +1,263 @@
+-- {"query": "7262.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2614} 
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        AVG(p.Score) as AvgPostScore,
+        MAX(p.CreationDate) as LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopPosts AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) as ScoreRank,
+        DENSE_RANK() OVER (ORDER BY p.ViewCount DESC) as ViewRank,
+        LAG(p.Score) OVER (ORDER BY p.CreationDate) as PrevScore,
+        LEAD(p.Score) OVER (ORDER BY p.CreationDate) as NextScore,
+        AVG(p.Score) OVER (PARTITION BY p.PostTypeId) as AvgScoreByType
+    FROM Posts p
+    INNER JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1, 2) AND p.Score > 0
+),
+PostAnalysis AS (
+    SELECT 
+        tp.PostId,
+        tp.Title,
+        tp.Score,
+        tp.ViewCount,
+        tp.OwnerName,
+        tp.ScoreRank,
+        tp.ViewRank,
+        tp.PrevScore,
+        tp.NextScore,
+        tp.AvgScoreByType,
+        CASE 
+            WHEN tp.Score > tp.AvgScoreByType THEN 'Above Average'
+            WHEN tp.Score < tp.AvgScoreByType THEN 'Below Average'
+            ELSE 'Average'
+        END as ScoreCategory,
+        CASE 
+            WHEN tp.ViewCount > 1000 THEN 'High Traffic'
+            WHEN tp.ViewCount > 500 THEN 'Medium Traffic'
+            WHEN tp.ViewCount > 100 THEN 'Low Traffic'
+            ELSE 'Very Low Traffic'
+        END as TrafficLevel,
+        (tp.Score - COALESCE(tp.PrevScore, 0)) as ScoreChange,
+        ABS(tp.Score - tp.AvgScoreByType) as ScoreDeviation,
+        DATEDIFF(day, tp.CreationDate, CURRENT_TIMESTAMP) as DaysSinceCreation,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = tp.PostId) as CommentCount,
+        CASE 
+            WHEN tp.Tags IS NOT NULL AND tp.Tags LIKE '%<%' THEN 
+                (SELECT COUNT(*) FROM unnest(string_to_array(substring(tp.Tags, 2, length(tp.Tags)-2), '><')) as tag)
+            ELSE 0
+        END as TagCount
+    FROM TopPosts tp
+    WHERE tp.ScoreRank <= 50
+),
+UserActivity AS (
+    SELECT 
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.PostCount,
+        us.CommentCount,
+        us.BadgeCount,
+        us.AvgPostScore,
+        us.LastPostDate,
+        CASE 
+            WHEN us.PostCount > 100 THEN 'Highly Active'
+            WHEN us.PostCount > 50 THEN 'Moderately Active'
+            WHEN us.PostCount > 10 THEN 'Low Activity'
+            ELSE 'Inactive'
+        END as ActivityLevel,
+        CASE 
+            WHEN us.Reputation > 100000 THEN 'Elite'
+            WHEN us.Reputation > 50000 THEN 'Expert'
+            WHEN us.Reputation > 10000 THEN 'Advanced'
+            ELSE 'Regular'
+        END as ReputationLevel,
+        RANK() OVER (ORDER BY us.PostCount DESC) as PostRank,
+        DENSE_RANK() OVER (ORDER BY us.Reputation DESC) as RepRank,
+        NTILE(4) OVER (ORDER BY us.Reputation) as ReputationQuartile,
+        LAG(us.PostCount) OVER (ORDER BY us.Reputation DESC) as PrevPostCount,
+        LEAD(us.PostCount) OVER (ORDER BY us.Reputation DESC) as NextPostCount
+    FROM UserStats us
+    WHERE us.PostCount > 0
+),
+ComplexAnalysis AS (
+    SELECT 
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.PostCount,
+        ua.CommentCount,
+        ua.BadgeCount,
+        ua.AvgPostScore,
+        ua.LastPostDate,
+        ua.ActivityLevel,
+        ua.ReputationLevel,
+        ua.PostRank,
+        ua.RepRank,
+        ua.ReputationQuartile,
+        ua.PrevPostCount,
+        ua.NextPostCount,
+        (ua.PostCount - COALESCE(ua.PrevPostCount, 0)) as PostCountChange,
+        (ua.Reputation - COALESCE(ua.RepRank, 0)) as RepChange,
+        CASE 
+            WHEN ua.PostCount > (SELECT AVG(PostCount) FROM UserActivity) THEN 'Above Average Posts'
+            ELSE 'Below Average Posts'
+        END as PostCountStatus,
+        CASE 
+            WHEN ua.Reputation > (SELECT AVG(Reputation) FROM UserActivity) THEN 'Above Average Rep'
+            ELSE 'Below Average Rep'
+        END as RepStatus,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = ua.UserId AND p.PostTypeId = 1) as QuestionCount,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = ua.UserId AND p.PostTypeId = 2) as AnswerCount,
+        COALESCE((SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = ua.UserId AND p.Score > 100), 0) as HighScorePosts
+    FROM UserActivity ua
+    WHERE ua.Reputation > 5000 AND ua.PostCount > 10
+),
+FinalAnalysis AS (
+    SELECT 
+        ca.UserId,
+        ca.DisplayName,
+        ca.Reputation,
+        ca.ReputationLevel,
+        ca.PostCount,
+        ca.CommentCount,
+        ca.BadgeCount,
+        ca.QuestionCount,
+        ca.AnswerCount,
+        ca.HighScorePosts,
+        ca.AvgPostScore,
+        ca.LastPostDate,
+        ca.ActivityLevel,
+        ca.PostRank,
+        ca.RepRank,
+        ca.ReputationQuartile,
+        ca.PostCountChange,
+        ca.RepChange,
+        ca.PostCountStatus,
+        ca.RepStatus,
+        CASE 
+            WHEN ca.PostCount > 100 AND ca.Reputation > 50000 THEN 'Elite Contributor'
+            WHEN ca.PostCount > 50 AND ca.Reputation > 25000 THEN 'Veteran Contributor'
+            WHEN ca.PostCount > 20 AND ca.Reputation > 10000 THEN 'Experienced Contributor'
+            ELSE 'Contributor'
+        END as ContributorTier,
+        ROW_NUMBER() OVER (ORDER BY ca.Reputation DESC, ca.PostCount DESC) as OverallRank,
+        DENSE_RANK() OVER (ORDER BY ca.Reputation DESC) as ReputationRank,
+        NTILE(5) OVER (ORDER BY ca.Reputation DESC) as ReputationalPercentile,
+        (SELECT COUNT(*) FROM Tags t WHERE t.Count > 1000) as PopularTags
+    FROM ComplexAnalysis ca
+    WHERE ca.Reputation > 10000
+),
+CombinedStats AS (
+    SELECT 
+        fa.UserId,
+        fa.DisplayName,
+        fa.Reputation,
+        fa.ReputationLevel,
+        fa.PostCount,
+        fa.CommentCount,
+        fa.BadgeCount,
+        fa.QuestionCount,
+        fa.AnswerCount,
+        fa.HighScorePosts,
+        fa.AvgPostScore,
+        fa.LastPostDate,
+        fa.ActivityLevel,
+        fa.PostRank,
+        fa.RepRank,
+        fa.ReputationQuartile,
+        fa.PostCountChange,
+        fa.RepChange,
+        fa.PostCountStatus,
+        fa.RepStatus,
+        fa.ContributorTier,
+        fa.OverallRank,
+        fa.ReputationRank,
+        fa.ReputationalPercentile,
+        fa.PopularTags,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = fa.UserId AND p.CreationDate >= DATEADD(year, -1, CURRENT_TIMESTAMP)) as RecentPosts,
+        (SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = fa.UserId AND p.CreationDate >= DATEADD(year, -1, CURRENT_TIMESTAMP)) as RecentAvgScore,
+        (SELECT COUNT(DISTINCT c.PostId) FROM Comments c WHERE c.UserId = fa.UserId AND c.CreationDate >= DATEADD(year, -1, CURRENT_TIMESTAMP)) as RecentComments,
+        (SELECT COUNT(DISTINCT b.Id) FROM Badges b WHERE b.UserId = fa.UserId AND b.Date >= DATEADD(year, -1, CURRENT_TIMESTAMP)) as RecentBadges
+    FROM FinalAnalysis fa
+    WHERE fa.PostCount > 20 AND fa.Reputation > 10000
+)
+SELECT 
+    cs.UserId,
+    cs.DisplayName,
+    cs.Reputation,
+    cs.ReputationLevel,
+    cs.PostCount,
+    cs.CommentCount,
+    cs.BadgeCount,
+    cs.QuestionCount,
+    cs.AnswerCount,
+    cs.HighScorePosts,
+    cs.AvgPostScore,
+    cs.LastPostDate,
+    cs.ActivityLevel,
+    cs.PostRank,
+    cs.RepRank,
+    cs.ReputationQuartile,
+    cs.PostCountChange,
+    cs.RepChange,
+    cs.PostCountStatus,
+    cs.RepStatus,
+    cs.ContributorTier,
+    cs.OverallRank,
+    cs.ReputationRank,
+    cs.ReputationalPercentile,
+    cs.PopularTags,
+    cs.RecentPosts,
+    cs.RecentAvgScore,
+    cs.RecentComments,
+    cs.RecentBadges,
+    CASE 
+        WHEN cs.RecentAvgScore > cs.AvgPostScore THEN 'Improved Performance'
+        WHEN cs.RecentAvgScore < cs.AvgPostScore THEN 'Declining Performance'
+        ELSE 'Stable Performance'
+    END as PerformanceTrend,
+    CASE 
+        WHEN cs.RecentBadges > 0 AND cs.RecentComments > 0 THEN 'Active Community Engagement'
+        WHEN cs.RecentBadges > 0 THEN 'Badge Focus'
+        WHEN cs.RecentComments > 0 THEN 'Comment Engagement'
+        ELSE 'Passive Engagement'
+    END as EngagementType,
+    CONCAT('User-', cs.UserId, '-Tier-', cs.ContributorTier) as UserIdentifier,
+    (cs.PostCount * cs.Reputation) / NULLIF(cs.RepRank, 0) as ComplexScore,
+    DATEDIFF(day, cs.LastPostDate, CURRENT_TIMESTAMP) as DaysSinceLastPost,
+    (CASE WHEN cs.RecentPosts > 0 THEN 1 ELSE 0 END + 
+     CASE WHEN cs.RecentComments > 0 THEN 1 ELSE 0 END + 
+     CASE WHEN cs.RecentBadges > 0 THEN 1 ELSE 0 END) as RecentActivityLevel,
+    POWER(cs.Reputation, 0.5) as ReputationSquareRoot,
+    LOG(cs.Reputation + 1) as ReputationLog,
+    COALESCE(cs.RecentPosts, 0) + COALESCE(cs.RecentComments, 0) + COALESCE(cs.RecentBadges, 0) as TotalRecentActivity,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = cs.UserId AND p.Score > 0 AND p.CreationDate >= DATEADD(month, -6, CURRENT_TIMESTAMP)) as RecentPositiveScorePosts,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = cs.UserId AND p.Score < 0 AND p.CreationDate >= DATEADD(month, -6, CURRENT_TIMESTAMP)) as RecentNegativeScorePosts,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = cs.UserId AND p.Score = 0 AND p.CreationDate >= DATEADD(month, -6, CURRENT_TIMESTAMP)) as RecentZeroScorePosts
+FROM CombinedStats cs
+ORDER BY cs.Reputation DESC, cs.PostCount DESC, cs.LastPostDate DESC
+OFFSET 0 ROWS FETCH NEXT 1000 ROWS ONLY;

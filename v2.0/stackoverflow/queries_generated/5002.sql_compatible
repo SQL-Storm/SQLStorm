@@ -1,0 +1,226 @@
+WITH RankedPosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.Body,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.LastEditorUserId,
+    p.LastEditDate,
+    p.ContentLicense,
+    u.Reputation,
+    u.DisplayName,
+    u.CreationDate AS UserCreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.ProfileImageUrl,
+    u.Location,
+    u.WebsiteUrl,
+    u.EmailHash,
+    u.AccountId,
+    -- Subqueries / expressions
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentDensity,
+    (SELECT AVG(v.BountyAmount) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 8) AS AvgBounty,
+    (SELECT STRING_AGG(t.Name, ',') FROM (
+        SELECT NULLIF(pt, '') AS Name
+        FROM UNNEST(string_to_array(p.Tags, '><')) AS t(pt)
+    ) AS t_names
+     WHERE t_names.Name IS NOT NULL) AS TagList
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId = 1
+),
+Windowed AS (
+  SELECT
+    rp.PostId,
+    rp.PostTypeId,
+    rp.OwnerUserId,
+    rp.Title,
+    rp.Tags,
+    rp.CreationDate,
+    rp.LastActivityDate,
+    rp.Score,
+    rp.ViewCount,
+    rp.CommentCount,
+    rp.AnswerCount,
+    rp.FavoriteCount,
+    rp.Body,
+    rp.ParentId,
+    rp.AcceptedAnswerId,
+    rp.LastEditorUserId,
+    rp.LastEditDate,
+    rp.ContentLicense,
+    rp.Reputation,
+    rp.DisplayName,
+    rp.UserCreationDate,
+    rp.LastAccessDate,
+    rp.Views,
+    rp.UpVotes,
+    rp.DownVotes,
+    rp.ProfileImageUrl,
+    rp.Location,
+    rp.WebsiteUrl,
+    rp.EmailHash,
+    rp.AccountId,
+    rp.CommentDensity,
+    rp.AvgBounty,
+    rp.TagList,
+    ROW_NUMBER() OVER (
+      PARTITION BY rp.OwnerUserId
+      ORDER BY rp.LastActivityDate DESC, rp.CreationDate DESC
+    ) AS rn,
+    RANK() OVER (
+      ORDER BY rp.Score DESC, rp.ViewCount DESC, rp.CommentDensity DESC
+    ) AS score_rank
+  FROM RankedPosts rp
+),
+Agg AS (
+  SELECT
+    w.OwnerUserId,
+    COUNT(*) AS TotalQuestions,
+    SUM(w.Score) AS SumScores,
+    AVG(w.Score) AS AvgScore,
+    MAX(w.ViewCount) AS MaxViews,
+    MIN(w.CreationDate) AS FirstQuestionDate,
+    MAX(w.LastActivityDate) AS LastActive
+  FROM Windowed w
+  GROUP BY w.OwnerUserId
+),
+Filtered AS (
+  SELECT
+    w.PostId,
+    w.PostTypeId,
+    w.OwnerUserId,
+    w.Title,
+    w.Tags,
+    w.CreationDate,
+    w.LastActivityDate,
+    w.Score,
+    w.ViewCount,
+    w.CommentCount,
+    w.AnswerCount,
+    w.FavoriteCount,
+    w.Body,
+    w.ParentId,
+    w.AcceptedAnswerId,
+    w.LastEditorUserId,
+    w.LastEditDate,
+    w.ContentLicense,
+    w.Reputation,
+    w.DisplayName,
+    w.UserCreationDate,
+    w.LastAccessDate,
+    w.Views,
+    w.UpVotes,
+    w.DownVotes,
+    w.ProfileImageUrl,
+    w.Location,
+    w.WebsiteUrl,
+    w.EmailHash,
+    w.AccountId,
+    w.CommentDensity,
+    w.AvgBounty,
+    w.TagList,
+    w.rn,
+    w.score_rank,
+    a.TotalQuestions,
+    a.SumScores,
+    a.AvgScore,
+    a.MaxViews,
+    a.FirstQuestionDate,
+    a.LastActive
+  FROM Windowed w
+  LEFT JOIN Agg a ON w.OwnerUserId = a.OwnerUserId
+  WHERE w.rn <= 5 -- top 5 latest by user
+    AND w.score_rank >= 1
+
+  UNION ALL
+
+  SELECT
+    w.PostId,
+    w.PostTypeId,
+    w.OwnerUserId,
+    w.Title,
+    w.Tags,
+    w.CreationDate,
+    w.LastActivityDate,
+    w.Score,
+    w.ViewCount,
+    w.CommentCount,
+    w.AnswerCount,
+    w.FavoriteCount,
+    w.Body,
+    w.ParentId,
+    w.AcceptedAnswerId,
+    w.LastEditorUserId,
+    w.LastEditDate,
+    w.ContentLicense,
+    w.Reputation,
+    w.DisplayName,
+    w.UserCreationDate,
+    w.LastAccessDate,
+    w.Views,
+    w.UpVotes,
+    w.DownVotes,
+    w.ProfileImageUrl,
+    w.Location,
+    w.WebsiteUrl,
+    w.EmailHash,
+    w.AccountId,
+    w.CommentDensity,
+    w.AvgBounty,
+    w.TagList,
+    w.rn,
+    w.score_rank,
+    a.TotalQuestions,
+    a.SumScores,
+    a.AvgScore,
+    a.MaxViews,
+    a.FirstQuestionDate,
+    a.LastActive
+  FROM Windowed w
+  LEFT JOIN Agg a ON w.OwnerUserId = a.OwnerUserId
+  WHERE w.OwnerUserId IS NULL
+),
+Final AS (
+  SELECT
+    f.PostId,
+    f.Title,
+    f.Tags,
+    f.CreationDate,
+    f.LastActivityDate,
+    f.Score,
+    f.ViewCount,
+    f.CommentCount,
+    f.AnswerCount,
+    f.FavoriteCount,
+    f.Reputation,
+    f.DisplayName,
+    f.TagList,
+    f.TotalQuestions,
+    f.SumScores,
+    f.AvgScore,
+    f.MaxViews,
+    f.FirstQuestionDate,
+    f.LastActive
+  FROM Filtered f
+  ORDER BY
+    f.LastActivityDate DESC NULLS LAST,
+    f.Score DESC,
+    f.ViewCount DESC
+)
+SELECT *
+FROM Final
+LIMIT 100;

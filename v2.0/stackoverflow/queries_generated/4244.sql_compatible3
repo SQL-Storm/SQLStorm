@@ -1,0 +1,151 @@
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.LastActivityDate) AS LastPostActivityDate,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+        AVG(p.Score) AS AveragePostScore,
+        SUM(CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END) AS ClosedPostCount,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.CreationDate ASC) AS ReputationRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    WHERE u.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '1 year')
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+PostEngagement AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        pt.Name AS PostType,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        CASE
+            WHEN p.PostTypeId = 1 THEN (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = p.Id AND a.PostTypeId = 2)
+            ELSE 0
+        END AS AnswerCountForQuestion,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCountOnPost,
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS ScoreRankByType,
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate) AS PreviousPostScore
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '6 months')
+),
+-- Standard SQL: parse tag-like strings like '<tag1><tag2>' by removing outer angle brackets and splitting on '><'
+-- Use a portable splitting approach: recursive CTE to split tag strings
+TagPairs AS (
+    SELECT
+        p.Id AS PostId,
+        TRIM(BOTH '<' FROM TRIM(BOTH '>' FROM COALESCE(p.Tags, ''))) AS tags_str
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '1 year')
+),
+SplitTags AS (
+    SELECT
+        PostId,
+        CASE WHEN tags_str = '' THEN NULL ELSE tags_str END AS rest,
+        NULL::text AS tag,
+        1 AS lvl
+    FROM TagPairs
+    UNION ALL
+    SELECT
+        st.PostId,
+        CASE
+            WHEN position('><' IN st.rest) > 0 THEN substring(st.rest FROM position('><' IN st.rest) + 2)
+            ELSE ''
+        END AS rest,
+        CASE
+            WHEN position('><' IN st.rest) > 0 THEN substring(st.rest FROM 1 FOR position('><' IN st.rest)-1)
+            ELSE st.rest
+        END AS tag,
+        st.lvl + 1
+    FROM SplitTags st
+    WHERE st.rest IS NOT NULL AND st.rest <> ''
+),
+NormalizedTags AS (
+    SELECT DISTINCT
+        COALESCE(tag, '') AS TagName,
+        PostId
+    FROM SplitTags
+    WHERE tag IS NOT NULL AND tag <> ''
+),
+TagPopularity AS (
+    SELECT
+        t.TagName,
+        t.Count AS TagPostCount,
+        COUNT(DISTINCT nt.PostId) AS TotalQuestionsWithTag,
+        AVG(p.Score) AS AverageScoreForTagQuestions
+    FROM Tags t
+    LEFT JOIN NormalizedTags nt ON nt.TagName = t.TagName
+    LEFT JOIN Posts p ON p.Id = nt.PostId
+    GROUP BY t.TagName, t.Count
+    HAVING COUNT(DISTINCT nt.PostId) > 100
+)
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.UserCreationDate,
+    ua.TotalPosts,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.BadgeCount,
+    ua.UpVoteCount,
+    ua.DownVoteCount,
+    ua.AveragePostScore,
+    ua.ClosedPostCount,
+    pe.PostId,
+    pe.Title,
+    pe.PostType,
+    pe.PostCreationDate,
+    pe.Score,
+    pe.ViewCount,
+    pe.CommentCount,
+    pe.FavoriteCount,
+    pe.AnswerCountForQuestion,
+    pe.CommentCountOnPost,
+    pe.ScoreRankByType,
+    pe.PreviousPostScore,
+    tp.TagName,
+    tp.TagPostCount,
+    tp.TotalQuestionsWithTag,
+    tp.AverageScoreForTagQuestions,
+    CASE
+        WHEN ua.Reputation > 10000 AND pe.Score > 50 THEN 'High_Rep_High_Score_Post'
+        WHEN ua.UserCreationDate < (CAST('2024-10-01' AS date) - INTERVAL '3 years') AND pe.ViewCount > 5000 THEN 'Old_User_Popular_Post'
+        WHEN pe.AnswerCountForQuestion = 0 AND pe.CommentCountOnPost > 5 THEN 'Unanswered_Engaged_Post'
+        ELSE 'Standard'
+    END AS PostEngagementCategory,
+    COALESCE(ua.DisplayName, 'Anonymous') AS DisplayNameOrAnonymous,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = pe.PostId AND pl.LinkTypeId = 1) AS OutgoingLinks,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.RelatedPostId = pe.PostId AND pl.LinkTypeId = 3) AS DuplicateOfCount,
+    CASE
+        WHEN ua.LastPostActivityDate IS NULL THEN 'No_Activity'
+        WHEN ua.LastPostActivityDate >= (CAST('2024-10-01' AS date) - INTERVAL '30 days') THEN 'Active_Last_30_Days'
+        ELSE 'Inactive'
+    END AS UserActivityStatus,
+    ua.ReputationRank
+FROM UserActivity ua
+FULL OUTER JOIN PostEngagement pe ON ua.UserId = pe.OwnerUserId
+LEFT JOIN TagPopularity tp ON EXISTS (
+    SELECT 1
+    FROM NormalizedTags nt
+    JOIN Posts p2 ON p2.Id = nt.PostId
+    WHERE nt.TagName = tp.TagName
+      AND p2.Id = pe.PostId
+)
+WHERE ua.UserId IS NOT NULL OR pe.PostId IS NOT NULL
+ORDER BY ua.Reputation DESC NULLS LAST, pe.Score DESC NULLS LAST, tp.TagPostCount DESC NULLS LAST;

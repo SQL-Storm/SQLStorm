@@ -1,0 +1,181 @@
+-- {"query": "2152.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1853} 
+with RecursiveTagHierarchy as (
+    -- Build a hierarchy of tags linked by post link duplicates (simulated hierarchy)
+    select t.Id, t.TagName, array[t.TagName] as TagPath, 1 as level
+    from Tags t
+    where t.IsModeratorOnly = 0
+    union all
+    select t2.Id, t2.TagName, rth.TagPath || t2.TagName, level+1
+    from RecursiveTagHierarchy rth
+    join Posts p on p.Tags like ('%<' || rth.TagName || '>%') and p.PostTypeId = 1
+    join PostLinks pl on pl.PostId = p.Id and pl.LinkTypeId = 3 -- duplicate links
+    join Posts p2 on pl.RelatedPostId = p2.Id
+    join Tags t2 on p2.Tags like ('%<' || t2.TagName || '>%')
+    where t2.TagName <> all(rth.TagPath)
+    and level < 3
+),
+UserActivity as (
+    -- Aggregate user reputations and vote counts, including NULL logic and conditional computations
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        coalesce(sum(v.VoteTypeId = 2)::int,0) as UpVotesGiven,
+        coalesce(sum(v.VoteTypeId = 3)::int,0) as DownVotesGiven,
+        coalesce(sum(votesUp.VoteCount),0) as TotalUpVotesReceived,
+        coalesce(sum(votesDown.VoteCount),0) as TotalDownVotesReceived,
+        -- Window function to rank users by reputation
+        rank() over (order by u.Reputation desc) as ReputationRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    left join (
+        select p.OwnerUserId, count(*) as VoteCount
+        from Votes v
+        join Posts p on p.Id = v.PostId
+        where v.VoteTypeId = 2
+        group by p.OwnerUserId
+    ) votesUp on votesUp.OwnerUserId = u.Id
+    left join (
+        select p.OwnerUserId, count(*) as VoteCount
+        from Votes v
+        join Posts p on p.Id = v.PostId
+        where v.VoteTypeId = 3
+        group by p.OwnerUserId
+    ) votesDown on votesDown.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+),
+PostEngagement as (
+    -- Calculate engagement metrics per question, including complexity with nulls, string expressions and joins
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        u.DisplayName as OwnerName,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        coalesce(q.AnswerCount, 0) as Answers,
+        coalesce(q.CommentCount, 0) as Comments,
+        coalesce(q.FavoriteCount, 0) as Favorites,
+        coalesce(closedReasons.Name, 'Open') as CloseReason,
+        max(coalesce(ph.CreationDate, q.LastActivityDate)) as LastActivity,
+        -- Calculate total badges of owner (gold + silver weighted higher)
+        coalesce(badges.BadgeScore, 0) as OwnerBadgeScore,
+        -- Complex conditional expression for hotness score (fictional)
+        case
+            when q.ViewCount > 10000 and q.Score > 50 then 
+                q.Score * 2 + q.FavoriteCount * 3 + q.AnswerCount * 5
+            when q.ClosedDate is not null then 
+                q.Score/2 + q.AnswerCount
+            else
+                q.Score + q.AnswerCount * 3
+        end as HotnessScore
+    from Posts q
+    left join Users u on u.Id = q.OwnerUserId
+    left join CloseReasonTypes closedReasons on closedReasons.Id = (
+        select cast(ph.CloseReasonId as smallint)
+        from PostHistory ph
+        where ph.PostId = q.Id and ph.PostHistoryTypeId = 10 -- Post closed
+        order by ph.CreationDate desc
+        limit 1
+    )
+    left join (
+        select UserId, sum(
+            case 
+                when Class = 1 then 5
+                when Class = 2 then 3
+                else 1
+            end
+        ) as BadgeScore
+        from Badges
+        group by UserId
+    ) badges on badges.UserId = q.OwnerUserId
+    left join PostHistory ph on ph.PostId = q.Id
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.OwnerUserId, u.DisplayName, q.CreationDate, q.Score, q.ViewCount, q.AnswerCount, q.CommentCount, q.FavoriteCount, closedReasons.Name, q.ClosedDate, badges.BadgeScore
+),
+AnswerQuality as (
+    -- Analyze answers with window functions, string processing and correlated subquery
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId,
+        u.DisplayName as AnswererName,
+        a.Score,
+        a.CreationDate,
+        -- Length of answer body excluding HTML tags by regex replace
+        length(regexp_replace(a.Body, '<[^>]*>', '', 'g')) as AnswerTextLength,
+        -- Rank answers per question by score desc
+        rank() over (partition by a.ParentId order by a.Score desc) as AnswerRank,
+        -- Count comments on answer
+        (select count(*) from Comments c where c.PostId = a.Id) as CommentCount,
+        -- Is this answer accepted?
+        case when q.AcceptedAnswerId = a.Id then 1 else 0 end as IsAccepted,
+        -- Time difference in hours from question creation to answer creation
+        extract(epoch from (a.CreationDate - q.CreationDate))/3600 as HoursToAnswer
+    from Posts a
+    join Posts q on q.Id = a.ParentId and q.PostTypeId = 1
+    left join Users u on u.Id = a.OwnerUserId
+    where a.PostTypeId = 2
+),
+AnswerAggregate as (
+    -- Aggregate answers per question filtering by complex predicates
+    select
+        aq.QuestionId,
+        count(*) as TotalAnswers,
+        sum(case when IsAccepted = 1 then 1 else 0 end) as AcceptedAnswers,
+        avg(AnswerTextLength) as AvgAnswerLength,
+        max(Score) as MaxAnswerScore,
+        percentile_cont(0.5) within group (order by Score) as MedianAnswerScore,
+        avg(HoursToAnswer) filter (where HoursToAnswer <= 48) as AvgAnswerWithin2Days
+    from AnswerQuality aq
+    group by aq.QuestionId
+),
+FinalOutput as (
+    select
+        pe.QuestionId,
+        pe.Title,
+        pe.OwnerName,
+        ua.Reputation,
+        pe.Score as QuestionScore,
+        pe.ViewCount as QuestionViews,
+        pe.Answers as QuestionAnswerCount,
+        ag.TotalAnswers,
+        ag.AcceptedAnswers,
+        ag.AvgAnswerLength,
+        ag.MaxAnswerScore,
+        ag.MedianAnswerScore,
+        ag.AvgAnswerWithin2Days,
+        pe.CloseReason,
+        pe.HotnessScore,
+        pe.OwnerBadgeScore,
+        ua.UpVotesGiven,
+        ua.DownVotesGiven,
+        ua.TotalUpVotesReceived,
+        ua.TotalDownVotesReceived,
+        ua.ReputationRank,
+        -- Complex string concatenation combining tags and owners truncated and NULL logic
+        coalesce(
+            substring(
+                string_agg(distinct rth.TagName, ', ') over (partition by pe.QuestionId) from 1 for 100
+            ),
+            'No Tags'
+        ) as RelatedTags,
+        -- Conditional null-safe date difference showing how many days since last activity
+        case 
+            when pe.LastActivity is not null then
+                extract(day from cast('2024-10-01 12:34:56' as timestamp) - pe.LastActivity)
+            else null
+        end as DaysSinceLastActivity
+    from PostEngagement pe
+    left join UserActivity ua on ua.UserId = pe.OwnerUserId
+    left join RecursiveTagHierarchy rth on rth.TagName = any(string_to_array(substring(pe.Title from '<(.*?)>'), '><'))
+    left join AnswerAggregate ag on ag.QuestionId = pe.QuestionId
+    order by pe.HotnessScore desc nulls last
+    limit 50
+)
+
+select * from FinalOutput;

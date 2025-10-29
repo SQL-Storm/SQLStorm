@@ -1,0 +1,262 @@
+-- {"query": "7416.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2317} 
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.UpVotes,
+        u.DownVotes,
+        u.Views,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Elite'
+            WHEN u.Reputation >= 1000 THEN 'Veteran'
+            WHEN u.Reputation >= 100 THEN 'Member'
+            ELSE 'Newbie'
+        END as ReputationTier,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        AVG(p.Score) as AvgScore,
+        MAX(p.CreationDate) as LastPostDate,
+        COALESCE(MAX(c.CreationDate), u.CreationDate) as LastActivityDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes, u.Views
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        PostCount,
+        CommentCount,
+        BadgeCount,
+        TotalScore,
+        AvgScore,
+        LastPostDate,
+        LastActivityDate,
+        ROW_NUMBER() OVER (ORDER BY TotalScore DESC) as RankByScore,
+        DENSE_RANK() OVER (ORDER BY Reputation DESC) as RankByReputation,
+        PERCENT_RANK() OVER (ORDER BY Reputation DESC) as ReputationPercentile
+    FROM UserStats
+),
+QuestionStats AS (
+    SELECT 
+        p.Id as QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><') as TagArray,
+        p.AcceptedAnswerId,
+        CASE 
+            WHEN p.AnswerCount > 0 THEN 
+                COALESCE(
+                    (SELECT AVG(a.Score) FROM Posts a WHERE a.ParentId = p.Id AND a.PostTypeId = 2), 
+                    0
+                )
+            ELSE 0 
+        END as AvgAnswerScore,
+        CASE 
+            WHEN p.CreationDate >= DATEADD(DAY, -30, CURRENT_TIMESTAMP) THEN 'Recent'
+            WHEN p.CreationDate >= DATEADD(DAY, -90, CURRENT_TIMESTAMP) THEN 'Quarterly'
+            ELSE 'Old'
+        END as TemporalCategory,
+        COALESCE(p.AnswerCount, 0) + COALESCE(p.CommentCount, 0) as EngagementScore
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+    AND p.CreationDate >= '2018-01-01'
+),
+AnswerStats AS (
+    SELECT 
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.Score,
+        a.CreationDate,
+        a.OwnerUserId,
+        a.LastEditDate,
+        a.Body,
+        CASE 
+            WHEN a.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 2) THEN 1
+            ELSE 0 
+        END as HighScore,
+        DATEDIFF(DAY, a.CreationDate, COALESCE(a.LastEditDate, a.CreationDate)) as EditAgeDays
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+    AND a.CreationDate >= '2018-01-01'
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        COALESCE(p.ViewCount, 0) as TagViews,
+        STRING_TO_ARRAY(SUBSTRING(t.ExcerptPostId::VARCHAR, 2, LENGTH(t.ExcerptPostId::VARCHAR)-2), '><') as ExtractedTags
+    FROM Tags t
+    LEFT JOIN Posts p ON t.ExcerptPostId = p.Id
+),
+ComplexActivity AS (
+    SELECT 
+        'Questions' as ActivityType,
+        COUNT(*) as ActivityCount,
+        SUM(CASE WHEN Score > 100 THEN 1 ELSE 0 END) as HighScoreQuestions,
+        AVG(Score) as AvgScore,
+        STRING_AGG(DISTINCT TagArray[1], ', ') as MostFrequentTags
+    FROM QuestionStats
+    UNION ALL
+    SELECT 
+        'Answers' as ActivityType,
+        COUNT(*) as ActivityCount,
+        SUM(CASE WHEN Score > 50 THEN 1 ELSE 0 END) as HighScoreAnswers,
+        AVG(Score) as AvgScore,
+        NULL as MostFrequentTags
+    FROM AnswerStats
+    UNION ALL
+    SELECT 
+        'Comments' as ActivityType,
+        COUNT(*) as ActivityCount,
+        0 as HighScoreQuestions,
+        NULL as AvgScore,
+        NULL as MostFrequentTags
+    FROM Comments
+    WHERE CreationDate >= '2018-01-01'
+),
+PerformanceMetrics AS (
+    SELECT 
+        q.QuestionId,
+        q.Title,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.An EngagementScore,
+        u.DisplayName as OwnerName,
+        u.Reputation as OwnerReputation,
+        u.UpVotes as OwnerUpVotes,
+        CASE 
+            WHEN u.Id IN (SELECT UserId FROM Badges WHERE Name IN ('Favorite Question', 'Great Question')) THEN 'Elite Poster'
+            WHEN u.Id IN (SELECT UserId FROM Badges WHERE Name IN ('Popular Question', 'Notable Question')) THEN 'Popular Poster'
+            ELSE 'Regular Poster'
+        END as PosterTier,
+        COALESCE(q.AvgAnswerScore, 0) as AvgAnswerScore,
+        q.TemporalCategory,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        CASE 
+            WHEN q.Tags IS NOT NULL THEN 
+                (SELECT COUNT(*) FROM UNNEST(STRING_TO_ARRAY(SUBSTRING(q.Tags, 2, LENGTH(q.Tags)-2), '><')) AS tag)
+            ELSE 0 
+        END as TagCount,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY q.Score DESC) as RankWithinUser,
+        RANK() OVER (ORDER BY q.Score DESC) as GlobalRank,
+        NTILE(10) OVER (ORDER BY q.Score DESC) as ScoreDecile,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY q.Score) OVER () as MedianScore
+    FROM QuestionStats q
+    INNER JOIN TopUsers u ON q.OwnerUserId = u.UserId
+    LEFT JOIN Comments c ON q.QuestionId = c.PostId
+    WHERE u.RankByReputation <= 100
+    AND q.TemporalCategory = 'Recent'
+)
+SELECT 
+    p.QuestionId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.EngagementScore,
+    p.OwnerName,
+    p.OwnerReputation,
+    p.OwnerUpVotes,
+    p.PosterTier,
+    p.AvgAnswerScore,
+    p.TemporalCategory,
+    p.CommentCount,
+    p.TagCount,
+    p.RankWithinUser,
+    p.GlobalRank,
+    p.ScoreDecile,
+    p.MedianScore,
+    CASE 
+        WHEN p.Score > p.MedianScore THEN 'Above Median'
+        WHEN p.Score < p.MedianScore THEN 'Below Median'
+        ELSE 'At Median'
+    END as ScorePosition,
+    ABS(p.Score - p.MedianScore) as ScoreDeviation,
+    CASE 
+        WHEN p.TagCount > 5 THEN 'High Tag Density'
+        WHEN p.TagCount > 2 THEN 'Medium Tag Density'
+        ELSE 'Low Tag Density' 
+    END as TagDensity,
+    CASE 
+        WHEN p.AnswerCount > 0 AND p.AvgAnswerScore > 25 THEN 'Highly Engaged Question'
+        WHEN p.AnswerCount > 0 AND p.AvgAnswerScore > 5 THEN 'Moderately Engaged Question'
+        ELSE 'Low Engagement Question'
+    END as EngagementLevel,
+    DENSE_RANK() OVER (ORDER BY p.ViewCount DESC) as ViewRank,
+    RANK() OVER (ORDER BY p.AnswerCount DESC) as AnswerRank,
+    COALESCE(
+        (SELECT COUNT(*) FROM AnswerStats a WHERE a.QuestionId = p.QuestionId AND a.HighScore = 1), 
+        0
+    ) as HighScoreAnswers
+FROM PerformanceMetrics p
+WHERE p.Score > 50
+AND p.ViewCount > 100
+AND p.AnswerCount >= 0
+AND p.TagCount BETWEEN 1 AND 10
+ORDER BY p.Score DESC, p.ViewCount DESC, p.AnswerCount DESC
+LIMIT 500
+EXCEPT
+SELECT 
+    p.QuestionId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.EngagementScore,
+    p.OwnerName,
+    p.OwnerReputation,
+    p.OwnerUpVotes,
+    p.PosterTier,
+    p.AvgAnswerScore,
+    p.TemporalCategory,
+    p.CommentCount,
+    p.TagCount,
+    p.RankWithinUser,
+    p.GlobalRank,
+    p.ScoreDecile,
+    p.MedianScore,
+    CASE 
+        WHEN p.Score > p.MedianScore THEN 'Above Median'
+        WHEN p.Score < p.MedianScore THEN 'Below Median'
+        ELSE 'At Median'
+    END as ScorePosition,
+    ABS(p.Score - p.MedianScore) as ScoreDeviation,
+    CASE 
+        WHEN p.TagCount > 5 THEN 'High Tag Density'
+        WHEN p.TagCount > 2 THEN 'Medium Tag Density'
+        ELSE 'Low Tag Density' 
+    END as TagDensity,
+    CASE 
+        WHEN p.AnswerCount > 0 AND p.AvgAnswerScore > 25 THEN 'Highly Engaged Question'
+        WHEN p.AnswerCount > 0 AND p.AvgAnswerScore > 5 THEN 'Moderately Engaged Question'
+        ELSE 'Low Engagement Question'
+    END as EngagementLevel,
+    DENSE_RANK() OVER (ORDER BY p.ViewCount DESC) as ViewRank,
+    RANK() OVER (ORDER BY p.AnswerCount DESC) as AnswerRank,
+    COALESCE(
+        (SELECT COUNT(*) FROM AnswerStats a WHERE a.QuestionId = p.QuestionId AND a.HighScore = 1), 
+        0
+    ) as HighScoreAnswers
+FROM PerformanceMetrics p
+WHERE p.Score < 10
+AND p.ViewCount < 50
+AND p.AnswerCount < 1
+ORDER BY p.Score ASC, p.ViewCount ASC, p.AnswerCount ASC
+LIMIT 500;

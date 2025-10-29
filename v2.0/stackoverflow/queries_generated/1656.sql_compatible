@@ -1,0 +1,174 @@
+WITH UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - u.LastAccessDate)) / 86400.0 AS DaysSinceLastAccess,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswers,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        (SELECT COUNT(b.Id) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+        (SELECT COUNT(DISTINCT ph.Id) FROM PostHistory ph WHERE ph.UserId = u.Id AND ph.PostHistoryTypeId IN (4,5,6)) AS TotalEditsMade
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    WHERE u.Reputation >= 1000
+      AND u.LastAccessDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.UpVotes, u.DownVotes
+),
+PostDetailedMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.LastActivityDate,
+        p.ClosedDate,
+        p.AcceptedAnswerId,
+        CASE
+            WHEN p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2 THEN string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><')
+            ELSE NULL
+        END AS TagArray,
+        p.Title,
+        LENGTH(COALESCE(p.Body, '')) AS BodyLength,
+        COALESCE(p.LastEditorUserId, p.OwnerUserId) AS EffectiveLastEditorId,
+        (SELECT COUNT(ph.Id) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4,5,6)) AS PostEditCount,
+        (SELECT MAX(ph.CreationDate) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4,5,6)) AS LatestEditDate,
+        CASE
+            WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN 'QuestionWithAnswers'
+            WHEN p.PostTypeId = 1 AND p.AnswerCount = 0 THEN 'QuestionNoAnswers'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'OtherPostType'
+        END AS PostCategory,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id) AS UpvoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id) AS DownvoteCount,
+        NTILE(4) OVER (ORDER BY p.Score DESC) AS ScoreQuartile
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (2,3)
+    WHERE p.PostTypeId IN (1, 2)
+      AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 year'
+),
+PostTagAnalysis AS (
+    SELECT
+        pdm.PostId,
+        pdm.PostCreationDate,
+        pdm.OwnerUserId,
+        TRIM(tag_val) AS TagName,
+        pdm.Score,
+        pdm.ViewCount,
+        pdm.CommentCount,
+        pdm.PostCategory,
+        pdm.PostEditCount
+    FROM PostDetailedMetrics pdm
+    LEFT JOIN LATERAL (
+        SELECT unnest_val AS tag_val
+        FROM UNNEST(pdm.TagArray) AS t(unnest_val)
+    ) AS tags ON TRUE
+    WHERE tags.tag_val IS NOT NULL AND TRIM(tags.tag_val) != ''
+)
+SELECT
+    uas.DisplayName AS AuthorDisplayName,
+    uas.Reputation,
+    uas.TotalPosts,
+    pdm.PostId,
+    pdm.Title,
+    pdm.PostCreationDate,
+    pdm.Score,
+    pdm.ViewCount,
+    pdm.UpvoteCount,
+    pdm.DownvoteCount,
+    pdm.PostCategory,
+    pdm.PostEditCount,
+    pdm.BodyLength,
+    pdm.ScoreQuartile,
+    pdm.TagArray,
+    pta.TagName AS RepresentativeTag,
+    qa.RelatedPostId AS DuplicatedPostId,
+    qa.DuplicateTitle,
+    EXISTS (
+        SELECT 1
+        FROM PostHistory ph_corr
+        WHERE ph_corr.PostHistoryTypeId IN (4, 5, 6)
+          AND ph_corr.UserId = uas.UserId
+          AND ph_corr.PostId != pdm.PostId
+          AND EXISTS (
+                SELECT 1
+                FROM Posts p_corr_inner
+                WHERE p_corr_inner.Id = ph_corr.PostId
+                  AND p_corr_inner.OwnerUserId IS NOT NULL
+                  AND p_corr_inner.OwnerUserId != uas.UserId
+          )
+    ) AS HasEditedOthersPosts,
+    CASE
+        WHEN pdm.PostTypeId = 1 AND pdm.AcceptedAnswerId IS NOT NULL THEN
+            CASE
+                WHEN (SELECT MIN(a.CreationDate) FROM Posts a WHERE a.Id = pdm.AcceptedAnswerId) IS NOT NULL
+                     AND (SELECT MIN(a.CreationDate) FROM Posts a WHERE a.Id = pdm.AcceptedAnswerId) <= (pdm.PostCreationDate + INTERVAL '7 day')
+                THEN 'AcceptedQuickly'
+                ELSE 'AcceptedLater'
+            END
+        WHEN pdm.PostTypeId = 1 AND pdm.AcceptedAnswerId IS NULL THEN 'NoAcceptedAnswer'
+        ELSE NULL
+    END AS AcceptedAnswerStatus,
+    LAG(pdm.Score, 1, 0) OVER (PARTITION BY uas.UserId ORDER BY pdm.PostCreationDate) AS PreviousPostScore,
+    COALESCE(pdm.FavoriteCount, 0) AS ActualFavoriteCount,
+    AVG(pdm.Score) OVER (PARTITION BY pta.TagName) AS AvgScoreForTag,
+    RANK() OVER (PARTITION BY pta.TagName ORDER BY pdm.Score DESC, pdm.ViewCount DESC) AS RankInTagByScore
+FROM UserActivitySummary uas
+INNER JOIN PostDetailedMetrics pdm ON uas.UserId = pdm.OwnerUserId
+LEFT JOIN LATERAL (
+    SELECT
+        pl.RelatedPostId,
+        dp.Title AS DuplicateTitle
+    FROM PostLinks pl
+    JOIN Posts dp ON pl.RelatedPostId = dp.Id
+    WHERE pl.PostId = pdm.PostId AND pl.LinkTypeId = 3
+    ORDER BY pl.CreationDate DESC
+    LIMIT 1
+) qa ON pdm.PostTypeId = 1
+LEFT JOIN PostTagAnalysis pta ON pdm.PostId = pta.PostId AND pta.TagName IS NOT NULL AND pta.PostCreationDate = pdm.PostCreationDate
+WHERE (pdm.Score > 0 OR pdm.ViewCount > 100)
+  AND pdm.BodyLength > 50
+UNION ALL
+SELECT
+    uas.DisplayName AS AuthorDisplayName,
+    uas.Reputation,
+    uas.TotalPosts,
+    pdm.PostId,
+    pdm.Title,
+    pdm.PostCreationDate,
+    pdm.Score,
+    pdm.ViewCount,
+    pdm.UpvoteCount,
+    pdm.DownvoteCount,
+    pdm.PostCategory,
+    pdm.PostEditCount,
+    pdm.BodyLength,
+    pdm.ScoreQuartile,
+    pdm.TagArray,
+    pta.TagName AS RepresentativeTag,
+    NULL AS DuplicatedPostId,
+    NULL AS DuplicateTitle,
+    FALSE AS HasEditedOthersPosts,
+    NULL AS AcceptedAnswerStatus,
+    LAG(pdm.Score, 1, 0) OVER (PARTITION BY uas.UserId ORDER BY pdm.PostCreationDate) AS PreviousPostScore,
+    COALESCE(pdm.FavoriteCount, 0) AS ActualFavoriteCount,
+    AVG(pdm.Score) OVER (PARTITION BY pta.TagName) AS AvgScoreForTag,
+    RANK() OVER (PARTITION BY pta.TagName ORDER BY pdm.Score DESC, pdm.ViewCount DESC) AS RankInTagByScore
+FROM UserActivitySummary uas
+INNER JOIN PostDetailedMetrics pdm ON uas.UserId = pdm.OwnerUserId
+LEFT JOIN PostTagAnalysis pta ON pdm.PostId = pta.PostId AND pta.TagName IS NOT NULL AND pta.PostCreationDate = pdm.PostCreationDate
+WHERE pdm.PostEditCount >= 5
+  AND pdm.Score <= 5
+  AND pdm.PostCreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+ORDER BY Reputation DESC, PostCreationDate DESC, RankInTagByScore ASC;

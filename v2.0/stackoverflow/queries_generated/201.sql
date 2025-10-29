@@ -1,0 +1,296 @@
+-- {"query": "201.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3066} 
+with
+-- recent active users with diverse activity
+active_users as (
+  select u.id as user_id,
+         u.displayname,
+         u.reputation,
+         u.creationdate,
+         u.location,
+         coalesce(nullif(trim(u.websiteurl), ''), 'N/A') as websiteurl,
+         percentile_disc(0.5) within group (order by u.reputation) over () as global_rep_median,
+         row_number() over (order by u.lastaccessdate desc, u.id) as rn_desc_lastaccess
+  from users u
+  where u.lastaccessdate >= now() - interval '365 days'
+),
+-- question posts with derived metrics
+questions as (
+  select p.id as post_id,
+         p.owneruserid,
+         p.creationdate,
+         p.score,
+         p.viewcount,
+         p.title,
+         p.tags,
+         p.answercount,
+         p.closeddate,
+         p.communityowneddate,
+         case when p.closeddate is not null then 1 else 0 end as is_closed,
+         case when p.acceptedanswerid is not null then 1 else 0 end as has_accepted,
+         coalesce(array_length(string_to_array(substring(p.tags, 2, greatest(length(p.tags)-2,0)), '><'), 1), 0) as tag_count
+  from posts p
+  where p.posttypeid = 1
+),
+-- answers with QA relationships
+answers as (
+  select a.id as answer_id,
+         a.parentid as question_id,
+         a.owneruserid as answer_owner_id,
+         a.score as answer_score,
+         a.creationdate as answer_created
+  from posts a
+  where a.posttypeid = 2
+),
+-- vote aggregates by post
+vote_agg as (
+  select v.postid,
+         sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+         sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+         sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+         sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_total,
+         count(*) as total_votes,
+         min(v.creationdate) as first_vote_at,
+         max(v.creationdate) as last_vote_at
+  from votes v
+  group by v.postid
+),
+-- comments aggregation for questions
+comment_agg as (
+  select c.postid,
+         count(*) as comment_count,
+         max(c.score) as max_comment_score,
+         min(c.creationdate) as first_comment_at,
+         max(c.creationdate) as last_comment_at
+  from comments c
+  group by c.postid
+),
+-- accepted answer response time per question
+accepted_answer_times as (
+  select q.post_id,
+         a.answer_id,
+         a.answer_owner_id,
+         extract(epoch from (a.answer_created - q.creationdate))::bigint as seconds_to_first_answer,
+         case when q.has_accepted = 1 and q.post_id = pq.id then
+           extract(epoch from (pa.creationdate - q.creationdate))::bigint
+         end as seconds_to_accepted
+  from questions q
+  left join lateral (
+    select a1.*
+    from answers a1
+    where a1.question_id = q.post_id
+    order by a1.answer_created asc
+    limit 1
+  ) a on true
+  left join posts pq on pq.id = q.post_id
+  left join posts pa on pa.id = pq.acceptedanswerid
+),
+-- post history events for closes and migrations
+ph_events as (
+  select ph.postid,
+         sum(case when ph.posthistorytypeid = 10 then 1 else 0 end) as close_events,
+         sum(case when ph.posthistorytypeid = 11 then 1 else 0 end) as reopen_events,
+         sum(case when ph.posthistorytypeid in (35,36) then 1 else 0 end) as migration_events,
+         max(case when ph.posthistorytypeid = 10 then ph.creationdate end) as last_close_at,
+         max(case when ph.posthistorytypeid = 11 then ph.creationdate end) as last_reopen_at
+  from posthistory ph
+  group by ph.postid
+),
+-- duplicates links
+dupe_links as (
+  select pl.postid as duplicate_post_id,
+         pl.relatedpostid as original_post_id,
+         pl.creationdate as dup_link_created,
+         lt.name as link_type
+  from postlinks pl
+  join linktypes lt on lt.id = pl.linktypeid
+  where pl.linktypeid = 3
+),
+-- tag popularity bucket
+tag_popularity as (
+  select t.tagname,
+         t.count as tag_usage_count,
+         ntile(5) over (order by t.count desc nulls last) as usage_bucket
+  from tags t
+),
+-- explode question tags
+question_tag as (
+  select q.post_id,
+         lower(trim(both ' ' from tag)) as tag
+  from questions q
+  cross join lateral unnest(
+    coalesce(string_to_array(substring(q.tags, 2, greatest(length(q.tags)-2,0)), '><'), array[]::varchar[])
+  ) as tag
+),
+-- aggregate tag metrics per question
+question_tag_agg as (
+  select qt.post_id,
+         avg(tp.tag_usage_count) as avg_tag_usage,
+         max(tp.usage_bucket) as worst_usage_bucket,
+         count(*) as tag_assigned_count
+  from question_tag qt
+  left join tag_popularity tp on tp.tagname = qt.tag
+  group by qt.post_id
+),
+-- user badges summary
+user_badges as (
+  select b.userid,
+         count(*) filter (where b.class = 1) as gold_count,
+         count(*) filter (where b.class = 2) as silver_count,
+         count(*) filter (where b.class = 3) as bronze_count,
+         count(*) as total_badges,
+         max(b.date) as last_badge_at
+  from badges b
+  group by b.userid
+),
+-- windowed metrics per user across questions
+user_question_metrics as (
+  select q.owneruserid as user_id,
+         count(*) as q_count,
+         sum(q.score) as q_score_sum,
+         avg(q.score) as q_score_avg,
+         sum(q.viewcount) as q_views_sum,
+         avg(q.viewcount) as q_views_avg,
+         sum(case when q.has_accepted = 1 then 1 else 0 end) as q_with_accept,
+         sum(case when q.is_closed = 1 then 1 else 0 end) as q_closed
+  from questions q
+  where q.owneruserid is not null
+  group by q.owneruserid
+),
+-- time series buckets for question creation
+question_time_buckets as (
+  select date_trunc('month', q.creationdate) as month,
+         count(*) as questions_in_month,
+         avg(q.score) as avg_score_in_month
+  from questions q
+  group by 1
+),
+-- compute per-question composite score using various components
+question_scoring as (
+  select q.post_id,
+         q.owneruserid,
+         q.creationdate,
+         q.score,
+         q.viewcount,
+         coalesce(va.upvotes,0) as upvotes,
+         coalesce(va.downvotes,0) as downvotes,
+         coalesce(va.favorites,0) as favorites,
+         coalesce(va.bounty_total,0) as bounty_total,
+         coalesce(ca.comment_count,0) as comment_count,
+         coalesce(ca.max_comment_score,0) as max_comment_score,
+         coalesce(extract(epoch from (q.closeddate - q.creationdate))::bigint, null) as seconds_to_close,
+         coalesce(aat.seconds_to_first_answer, null) as seconds_to_first_answer,
+         coalesce(aat.seconds_to_accepted, null) as seconds_to_accepted,
+         coalesce(qta.avg_tag_usage, 0) as avg_tag_usage,
+         coalesce(qta.worst_usage_bucket, 5) as tag_usage_bucket,
+         case
+           when q.viewcount is null or q.viewcount = 0 then null
+           else round((q.score::numeric / nullif(q.viewcount,0)) * 1000, 4)
+         end as score_per_1k_views,
+         case
+           when coalesce(va.upvotes,0)+coalesce(va.downvotes,0) = 0 then null
+           else round(va.upvotes::numeric / (va.upvotes + va.downvotes), 4)
+         end as upvote_ratio,
+         case when q.has_accepted = 1 then 1 else 0 end as has_accepted
+  from questions q
+  left join vote_agg va on va.postid = q.post_id
+  left join comment_agg ca on ca.postid = q.post_id
+  left join accepted_answer_times aat on aat.post_id = q.post_id
+  left join question_tag_agg qta on qta.post_id = q.post_id
+),
+-- percentile ranks and window stats over questions
+question_ranks as (
+  select qs.*,
+         percentile_disc(0.5) within group (order by score) over () as score_median,
+         percentile_disc(0.9) within group (order by viewcount) over () as views_p90,
+         rank() over (order by coalesce(favorites,0) desc, coalesce(upvotes,0) desc, post_id) as pop_rank,
+         dense_rank() over (order by coalesce(avg_tag_usage,0) desc) as dense_tag_pop_rank
+  from question_scoring qs
+),
+-- correlate duplicates and originals
+dupe_union as (
+  select d.duplicate_post_id as post_id, 'DUPLICATE' as relation, d.original_post_id as related_post_id, d.dup_link_created
+  from dupe_links d
+  union all
+  select d.original_post_id as post_id, 'ORIGINAL' as relation, d.duplicate_post_id as related_post_id, d.dup_link_created
+  from dupe_links d
+)
+select
+  qr.post_id,
+  left(coalesce(qr.title, p.title, ''), 120) as title_snippet,
+  au.displayname as owner_display_name,
+  coalesce(au.location, 'Unknown') as owner_location,
+  au.reputation as owner_reputation,
+  ub.total_badges,
+  ub.gold_count,
+  ub.silver_count,
+  ub.bronze_count,
+  uqm.q_count as owner_q_count,
+  uqm.q_score_avg as owner_q_avg_score,
+  qr.score,
+  qr.viewcount,
+  qr.upvotes,
+  qr.downvotes,
+  qr.favorites,
+  qr.bounty_total,
+  qr.comment_count,
+  qr.max_comment_score,
+  qr.has_accepted,
+  qr.seconds_to_first_answer,
+  qr.seconds_to_accepted,
+  qr.seconds_to_close,
+  qr.score_per_1k_views,
+  qr.upvote_ratio,
+  qr.avg_tag_usage,
+  qr.tag_usage_bucket,
+  qr.score_median,
+  qr.views_p90,
+  qr.pop_rank,
+  qr.dense_tag_pop_rank,
+  ph.close_events,
+  ph.reopen_events,
+  ph.migration_events,
+  ph.last_close_at,
+  ph.last_reopen_at,
+  string_agg(distinct du.relation || ':' || du.related_post_id::text, ', ' order by du.relation, du.related_post_id) as dup_relations,
+  coalesce(qr.viewcount,0) - coalesce(lag(qr.viewcount) over (order by qr.post_id), 0) as viewcount_delta_prev,
+  case
+    when qr.viewcount > coalesce(qr.views_p90,0) then 'HYPER-VIEWED'
+    when qr.score >= coalesce(qr.score_median,0) and coalesce(qr.upvote_ratio,0) >= 0.75 then 'WELL-RECEIVED'
+    when qr.is_closed = 1 then 'CLOSED'
+    else 'NORMAL'
+  end as classification,
+  date_trunc('month', qr.creationdate) as created_month,
+  count(*) over (partition by date_trunc('month', qr.creationdate)) as questions_in_same_month
+from question_ranks qr
+left join posts p on p.id = qr.post_id
+left join active_users au on au.user_id = qr.owneruserid
+left join user_badges ub on ub.userid = qr.owneruserid
+left join user_question_metrics uqm on uqm.user_id = qr.owneruserid
+left join ph_events ph on ph.postid = qr.post_id
+left join dupe_union du on du.post_id = qr.post_id
+where
+  -- complicated predicate mixing null logic and expressions
+  (
+    (qr.upvote_ratio is null and qr.viewcount < coalesce(qr.views_p90, 0))
+    or
+    (qr.upvote_ratio is not null and qr.upvote_ratio >= 0.6 and coalesce(qr.score_per_1k_views, 0) >= 1.0)
+  )
+  and coalesce(qr.tag_usage_bucket, 5) <= 4
+  and (
+    qr.creationdate >= now() - interval '5 years'
+    or (qr.has_accepted = 1 and qr.bounty_total > 0)
+  )
+group by
+  qr.post_id, qr.title, p.title, au.displayname, au.location, au.reputation,
+  ub.total_badges, ub.gold_count, ub.silver_count, ub.bronze_count,
+  uqm.q_count, uqm.q_score_avg,
+  qr.score, qr.viewcount, qr.upvotes, qr.downvotes, qr.favorites, qr.bounty_total, qr.comment_count, qr.max_comment_score,
+  qr.has_accepted, qr.seconds_to_first_answer, qr.seconds_to_accepted, qr.seconds_to_close, qr.score_per_1k_views, qr.upvote_ratio,
+  qr.avg_tag_usage, qr.tag_usage_bucket, qr.score_median, qr.views_p90, qr.pop_rank, qr.dense_tag_pop_rank,
+  ph.close_events, ph.reopen_events, ph.migration_events, ph.last_close_at, ph.last_reopen_at,
+  qr.creationdate, qr.is_closed
+order by
+  classification desc,
+  qr.pop_rank,
+  qr.post_id
+limit 500;

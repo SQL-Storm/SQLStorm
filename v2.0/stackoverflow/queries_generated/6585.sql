@@ -1,0 +1,48 @@
+-- {"query": "6585.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-micro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 486} 
+
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    u.EmailHash,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 1 THEN p.Id END) AS InitialTitles,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 2 THEN p.Id END) AS InitialBodies,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 10 THEN p.Id END) AS ClosedPosts,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN p.Id END) AS UpVotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN p.Id END) AS DownVotes,
+    COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN p.Id END) AS Duplicates,
+    MAX(p.Score) AS HighestScore,
+    AVG(p.ViewCount) AS AvgViewCount,
+    STRING_AGG(DISTINCT t.TagName, ', ') AS Tags,
+    (
+        SELECT COUNT(*) 
+        FROM Badges b 
+        WHERE b.UserId = u.Id AND b.Class = 1
+    ) AS GoldBadges,
+    (
+        SELECT SUM(Score) 
+        FROM Comments c 
+        WHERE c.UserId = u.Id
+    ) AS TotalCommentScore
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+LEFT JOIN 
+    PostLinks pl ON p.Id = pl.PostId
+LEFT JOIN 
+    Tags t ON p.Id = t.ExcerptPostId
+WHERE 
+    u.Reputation > 10000
+    AND p.CreationDate >= DATEADD(year, -5, CURRENT_TIMESTAMP)
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation, u.Location, u.EmailHash
+HAVING 
+    COUNT(DISTINCT p.Id) > 100
+ORDER BY 
+    u.Reputation DESC, TotalPosts DESC;

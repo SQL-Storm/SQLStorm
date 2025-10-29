@@ -1,0 +1,235 @@
+-- {"query": "1824.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3144} 
+
+WITH UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        COALESCE(u.DisplayName, 'Anonymous User') AS DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswers,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostScore,
+        SUM(CASE WHEN v_up.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesGiven, -- UpMod votes by user
+        SUM(CASE WHEN v_down.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesGiven, -- DownMod votes by user
+        MAX(GREATEST(p.LastActivityDate, c.CreationDate, u.LastAccessDate)) AS LatestUserActivity
+    FROM
+        Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v_up ON u.Id = v_up.UserId AND v_up.VoteTypeId = 2
+    LEFT JOIN Votes v_down ON u.Id = v_down.UserId AND v_down.VoteTypeId = 3
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+PostEngagementDetails AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount AS PostCommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.CommunityOwnedDate,
+        p.AcceptedAnswerId,
+        p.Title,
+        p.Tags,
+        (
+            SELECT MAX(ph.CreationDate)
+            FROM PostHistory ph
+            WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4, 5, 6, 8, 9, 24) -- Edit types
+        ) AS LastEditDate,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS PostUpvoteCount,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS PostDownvoteCount,
+        COUNT(DISTINCT co.Id) AS TotalPostComments,
+        -- Window function to rank posts by score within their PostType, handling ties
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC NULLS LAST, p.CreationDate DESC) AS PostScoreRankByType,
+        -- Check for close/reopen history using conditional aggregation
+        MAX(CASE WHEN ph_close.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS WasClosed,
+        MAX(CASE WHEN ph_reopen.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS WasReopened,
+        -- Correlated subquery to get the latest close reason name, if applicable
+        (
+            SELECT crt.Name
+            FROM PostHistory ph_reason
+            JOIN CloseReasonTypes crt ON ph_reason.Comment = CAST(crt.Id AS VARCHAR) -- Assuming Comment stores Id as string
+            WHERE ph_reason.PostId = p.Id AND ph_reason.PostHistoryTypeId = 10
+            ORDER BY ph_reason.CreationDate DESC
+            LIMIT 1
+        ) AS LatestCloseReasonName,
+        -- Calculate an engagement ratio, using COALESCE and NULLIF for robustness
+        COALESCE(p.Score, 0) * COALESCE(p.FavoriteCount, 1) / NULLIF(COALESCE(p.ViewCount, 0) + COALESCE(p.CommentCount, 0), 0) AS EngagementRatio
+    FROM
+        Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    LEFT JOIN Comments co ON p.Id = co.PostId
+    LEFT JOIN PostHistory ph_close ON p.Id = ph_close.PostId AND ph_close.PostHistoryTypeId = 10
+    LEFT JOIN PostHistory ph_reopen ON p.Id = ph_reopen.PostId AND ph_reopen.PostHistoryTypeId = 11
+    GROUP BY
+        p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount,
+        p.CommentCount, p.FavoriteCount, p.ClosedDate, p.CommunityOwnedDate, p.AcceptedAnswerId,
+        p.Title, p.Tags
+),
+TagPerformance AS (
+    SELECT
+        t.TagName,
+        COUNT(DISTINCT p.Id) AS PostsWithTag,
+        SUM(COALESCE(p.Score, 0)) AS TotalTagScore,
+        AVG(COALESCE(p.ViewCount, 0)) AS AvgTagViewCount,
+        -- Correlated subquery to find the display name of the user with the highest sum of post scores for this tag
+        (
+            SELECT u.DisplayName
+            FROM Posts p_inner
+            JOIN Users u ON p_inner.OwnerUserId = u.Id
+            WHERE p_inner.Id IN (
+                SELECT sub_p.Id FROM Posts sub_p, unnest(string_to_array(TRIM(sub_p.Tags, '<>'), '><')) AS tags_arr(tag)
+                WHERE tags_arr.tag = t.TagName
+            )
+            GROUP BY u.DisplayName
+            ORDER BY SUM(COALESCE(p_inner.Score, 0)) DESC NULLS LAST
+            LIMIT 1
+        ) AS TopUserByScoreForTag,
+        NTILE(5) OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS TagPopularityQuintile
+    FROM
+        Tags t
+    JOIN Posts p ON p.Tags LIKE CONCAT('%<', t.TagName, '>%' ) AND p.Tags IS NOT NULL
+    GROUP BY
+        t.TagName
+),
+UserBadgeAchievements AS (
+    SELECT
+        b.UserId,
+        COUNT(b.Id) AS TotalBadges,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        MAX(b.Date) AS LastBadgeDate
+    FROM
+        Badges b
+    GROUP BY
+        b.UserId
+),
+UsersWithQuestionsButNoAnswers AS (
+    SELECT DISTINCT uas.UserId
+    FROM UserActivitySummary uas
+    WHERE uas.TotalQuestions > 0
+    EXCEPT
+    SELECT DISTINCT uas.UserId
+    FROM UserActivitySummary uas
+    WHERE uas.TotalAnswers > 0
+)
+SELECT
+    uas.UserId,
+    uas.DisplayName AS UserName,
+    uas.Reputation,
+    uas.UserCreationDate,
+    uas.LatestUserActivity,
+    uas.TotalPosts,
+    uas.TotalQuestions,
+    uas.TotalAnswers,
+    uas.TotalComments,
+    uba.TotalBadges,
+    uba.GoldBadges,
+    uba.SilverBadges,
+    uba.BronzeBadges,
+    uba.LastBadgeDate,
+    (uas.TotalUpvotesGiven - uas.TotalDownvotesGiven) AS NetVotesGivenByUser,
+    -- Correlated subquery: Get average score of posts by user in the same calendar year as their account creation
+    (
+        SELECT AVG(p_corr.Score)
+        FROM Posts p_corr
+        WHERE p_corr.OwnerUserId = uas.UserId
+          AND EXTRACT(YEAR FROM p_corr.CreationDate) = EXTRACT(YEAR FROM uas.UserCreationDate)
+          AND p_corr.Score IS NOT NULL
+    ) AS AvgPostScoreInCreationYear,
+    -- Correlated subquery: Get the title of the user's highest scoring question
+    (
+        SELECT ped_corr.Title
+        FROM PostEngagementDetails ped_corr
+        WHERE ped_corr.OwnerUserId = uas.UserId AND ped_corr.PostTypeId = 1
+        ORDER BY ped_corr.Score DESC NULLS LAST
+        LIMIT 1
+    ) AS HighestScoringQuestionTitle,
+    -- Correlated subquery with LAG-like logic: Average days between consecutive edits for posts owned by the user
+    (
+        SELECT
+            AVG(EXTRACT(EPOCH FROM (ph_curr.CreationDate - ph_prev.CreationDate)) / (60 * 60 * 24))
+        FROM PostHistory ph_curr
+        JOIN PostHistory ph_prev ON ph_curr.PostId = ph_prev.PostId
+                                AND ph_prev.CreationDate = (
+                                    SELECT MAX(ph_inner.CreationDate)
+                                    FROM PostHistory ph_inner
+                                    WHERE ph_inner.PostId = ph_curr.PostId
+                                      AND ph_inner.CreationDate < ph_curr.CreationDate
+                                      AND ph_inner.PostHistoryTypeId IN (4, 5, 6, 8, 9, 24) -- Edit types
+                                )
+        WHERE ph_curr.PostHistoryTypeId IN (4, 5, 6, 8, 9, 24)
+          AND EXISTS (SELECT 1 FROM Posts p_alias WHERE p_alias.OwnerUserId = uas.UserId AND p_alias.Id = ph_curr.PostId)
+    ) AS AvgDaysBetweenEditsForOwnedPosts,
+    -- NTILE for user reputation distribution across the entire user base
+    NTILE(10) OVER (ORDER BY uas.Reputation DESC) AS ReputationDecile,
+    peds.PostId AS SamplePostId,
+    peds.Title AS SamplePostTitle,
+    peds.PostCreationDate AS SamplePostDate,
+    peds.Score AS SamplePostScore,
+    peds.ViewCount AS SamplePostViewCount,
+    peds.PostUpvoteCount,
+    peds.PostDownvoteCount,
+    peds.TotalPostComments,
+    peds.LastEditDate,
+    peds.WasClosed,
+    peds.WasReopened,
+    peds.LatestCloseReasonName,
+    peds.EngagementRatio,
+    tp.TagName AS PrimaryTagNameOfSamplePost,
+    tp.PostsWithTag AS PrimaryTagPostsCount,
+    tp.TotalTagScore AS PrimaryTagTotalScore,
+    tp.AvgTagViewCount AS PrimaryTagAvgViewCount,
+    tp.TagPopularityQuintile AS PrimaryTagPopularityQuintile,
+    -- String aggregation for types of links associated with the sample post
+    (SELECT STRING_AGG(lt.Name, ', ') FROM PostLinks pl JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id WHERE pl.PostId = peds.PostId AND lt.Name IS NOT NULL) AS LinkedPostTypes,
+    CASE
+        WHEN uwsbqna.UserId IS NOT NULL THEN 'Yes'
+        ELSE 'No'
+    END AS PostedQuestionsOnlyNoAnswers,
+    -- Complex Calculation: Dynamic Age-Adjusted Score Metric with NULL handling
+    (
+        COALESCE(peds.Score, 0) * (1 + COALESCE(peds.FavoriteCount, 0)) /
+        NULLIF(
+            (EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - peds.PostCreationDate)) / (60 * 60 * 24 * 30.4375)) -- Age in months
+            + COALESCE(peds.ViewCount, 1),
+        0)
+    ) AS DynamicAgeAdjustedScoreMetric
+FROM
+    UserActivitySummary uas
+LEFT JOIN UserBadgeAchievements uba ON uas.UserId = uba.UserId
+LEFT JOIN PostEngagementDetails peds ON uas.UserId = peds.OwnerUserId
+                                       AND peds.PostScoreRankByType = 1 -- Select the user's top-scoring post of any type
+LEFT JOIN LATERAL ( -- LATERAL join to find the 'most popular' tag for the sample post, based on global tag performance
+    SELECT
+        t_inner.TagName,
+        tp_inner.PostsWithTag,
+        tp_inner.TotalTagScore,
+        tp_inner.AvgTagViewCount,
+        tp_inner.TagPopularityQuintile
+    FROM
+        unnest(string_to_array(TRIM(COALESCE(peds.Tags, ''), '<>'), '><')) AS tag_name_unnest(TagName)
+    JOIN TagPerformance tp_inner ON tag_name_unnest.TagName = tp_inner.TagName
+    ORDER BY tp_inner.PostsWithTag DESC
+    LIMIT 1
+) AS tp ON peds.Tags IS NOT NULL -- Only attempt if post has tags
+LEFT JOIN UsersWithQuestionsButNoAnswers uwsbqna ON uas.UserId = uwsbqna.UserId
+WHERE
+    uas.Reputation > 5000 -- Filter for more active/established users
+    AND peds.PostId IS NOT NULL -- Ensure we only consider users who have a top post
+    AND peds.PostTypeId = 1 -- Focus the sample post on questions for specific analysis
+    AND peds.ViewCount IS NOT NULL AND peds.ViewCount > 0 -- Ensure view count is meaningful for ratio
+ORDER BY
+    uas.Reputation DESC,
+    peds.EngagementRatio DESC
+LIMIT 1000;

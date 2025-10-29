@@ -1,0 +1,154 @@
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        count(distinct c.Id) as CommentCount,
+        coalesce(sum(vb.BountyAmount), 0) as TotalBountiesStarted,
+        max(ph.CreationDate) as LastActivityDate,
+        row_number() over (partition by u.Id order by ph.CreationDate desc nulls last) as rn
+    from
+        Users u
+        left join Posts p on p.OwnerUserId = u.Id
+        left join Comments c on c.UserId = u.Id
+        left join Votes vb on vb.UserId = u.Id and vb.VoteTypeId = 8 -- BountyStart
+        left join PostHistory ph on ph.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate
+), FilteredUserActivity as (
+    select * from RecursiveUserActivity where rn = 1
+), UserBadgeRanking as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount,
+        rank() over(partition by b.Class order by count(*) desc) as BadgeRank
+    from Badges b
+    group by b.UserId, b.Class
+), UserTopBadges as (
+    select
+        u.Id as UserId,
+        -- emulate selecting first 3 elements of array_agg: use array_slice for dialects that support it; otherwise keep full array
+        (array_agg(distinct b.Name order by b.Date desc nulls last) filter (where b.Class = 1))[1:3] as TopGoldBadges,
+        (array_agg(distinct b.Name order by b.Date desc nulls last) filter (where b.Class = 2))[1:3] as TopSilverBadges,
+        (array_agg(distinct b.Name order by b.Date desc nulls last) filter (where b.Class = 3))[1:3] as TopBronzeBadges
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id
+), QuestionAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.OwnerUserId as QuestionUserId,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.CreationDate,
+        q.Tags,
+        q.AnswerCount,
+        a.Id as AnswerId,
+        a.OwnerUserId as AnswerUserId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreationDate,
+        a.ParentId,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+), HighPerformingAnswers as (
+    select * from QuestionAnswerStats where AnswerRank = 1 and AnswerScore > 10
+), DuplicateLinks as (
+    select
+        pl.PostId as DuplicatePostId,
+        pl.RelatedPostId as OriginalPostId,
+        pl.CreationDate as LinkCreationDate
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId and lt.Name = 'Duplicate'
+), UserCloseReasons as (
+    select
+        ph.UserId,
+        crt.Name as CloseReason,
+        count(*) as CloseVotesCount
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where ph.PostHistoryTypeId = 10
+    group by ph.UserId, crt.Name
+), UserTagEngagement as (
+    select
+        u.Id as UserId,
+        unnest(string_to_array(trim(both '<>' from p.Tags), '><')) as Tag,
+        count(*) as PostsInTag
+    from Users u
+    join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 1
+    group by u.Id, Tag
+), UserTopTags as (
+    select
+        UserId,
+        Tag,
+        PostsInTag,
+        rank() over (partition by UserId order by PostsInTag desc) as TagRank
+    from UserTagEngagement
+), ComplexUserSummary as (
+    select
+        fua.UserId,
+        fua.DisplayName,
+        fua.Reputation,
+        fua.CreationDate,
+        fua.QuestionCount,
+        fua.AnswerCount,
+        fua.CommentCount,
+        fua.TotalBountiesStarted,
+        fua.LastActivityDate,
+        utb.TopGoldBadges,
+        utb.TopSilverBadges,
+        utb.TopBronzeBadges,
+        array_agg(distinct ut.Tag order by ut.PostsInTag desc) filter (where ut.TagRank <= 3) as Top3Tags,
+        coalesce(uc.CloseVotesCount,0) as CloseVotesGiven,
+        coalesce(sum(ha.AnswerScore), 0) as SumHighPerformingAnswerScores
+    from FilteredUserActivity fua
+    left join UserTopBadges utb on utb.UserId = fua.UserId
+    left join UserTopTags ut on ut.UserId = fua.UserId and ut.TagRank <=3
+    left join UserCloseReasons uc on uc.UserId = fua.UserId
+    left join HighPerformingAnswers ha on ha.AnswerUserId = fua.UserId
+    group by
+        fua.UserId, fua.DisplayName, fua.Reputation, fua.CreationDate,
+        fua.QuestionCount, fua.AnswerCount, fua.CommentCount,
+        fua.TotalBountiesStarted, fua.LastActivityDate,
+        utb.TopGoldBadges, utb.TopSilverBadges, utb.TopBronzeBadges,
+        uc.CloseVotesCount
+)
+select 
+    cus.UserId,
+    cus.DisplayName,
+    cus.Reputation,
+    cus.QuestionCount,
+    cus.AnswerCount,
+    cus.CommentCount,
+    cus.TotalBountiesStarted,
+    to_char(cus.LastActivityDate, 'YYYY-MM-DD') as LastActive,
+    concat_ws(', ', 
+        coalesce(cus.TopGoldBadges[1], 'N/A'),
+        coalesce(cus.TopGoldBadges[2], 'N/A'),
+        coalesce(cus.TopGoldBadges[3], 'N/A')) as Top3GoldBadges,
+    concat_ws(', ',
+        coalesce(cus.TopSilverBadges[1], 'N/A'),
+        coalesce(cus.TopSilverBadges[2], 'N/A'),
+        coalesce(cus.TopSilverBadges[3], 'N/A')) as Top3SilverBadges,
+    concat_ws(', ',
+        coalesce(cus.TopBronzeBadges[1], 'N/A'),
+        coalesce(cus.TopBronzeBadges[2], 'N/A'),
+        coalesce(cus.TopBronzeBadges[3], 'N/A')) as Top3BronzeBadges,
+    array_to_string(cus.Top3Tags, ', ') as MostActiveTags,
+    cus.CloseVotesGiven,
+    cus.SumHighPerformingAnswerScores,
+    case when cus.Reputation > 10000 then 'Elite'
+         when cus.Reputation > 1000 then 'Experienced'
+         else 'Newbie' end as ReputationLevel,
+    case when cus.QuestionCount = 0 then null 
+         else round(cast(cus.AnswerCount as numeric) / cast(cus.QuestionCount as numeric), 3) end as AnswersPerQuestionRatio
+from ComplexUserSummary cus
+where cus.QuestionCount > 5
+  and cus.TotalBountiesStarted > 0
+  and (case when cus.Reputation > 10000 then 'Elite' when cus.Reputation > 1000 then 'Experienced' else 'Newbie' end) in ('Elite','Experienced')
+order by cus.Reputation desc, cus.AnswerCount desc
+limit 100;

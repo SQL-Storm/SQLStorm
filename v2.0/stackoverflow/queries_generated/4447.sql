@@ -1,0 +1,136 @@
+-- {"query": "4447.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1507} 
+
+WITH
+  -- Calculate average score for questions and their accepted answers,
+  -- considering only posts older than a certain date and from specific users.
+  AvgQuestionAnswerScore AS (
+    SELECT
+      q.Id AS QuestionId,
+      q.Title,
+      q.CreationDate AS QuestionCreationDate,
+      q.OwnerUserId AS QuestionOwnerUserId,
+      AVG(COALESCE(a.Score, 0)) AS AvgAnswerScore,
+      q.Score AS QuestionScore,
+      COUNT(a.Id) AS AnswerCount,
+      q.FavoriteCount,
+      -- Calculate days since creation for questions, ensuring it's not NULL
+      DATEDIFF(day, q.CreationDate, GETDATE()) AS DaysSinceCreation
+    FROM Posts AS q
+    LEFT JOIN Posts AS a
+      ON q.Id = a.ParentId AND a.PostTypeId = 2 -- Ensure 'a' is an answer
+    WHERE
+      q.PostTypeId = 1 -- Filter for questions
+      AND q.CreationDate < '2023-01-01' -- Older posts
+      AND q.OwnerUserId BETWEEN 1000 AND 5000 -- Specific user range
+      AND q.Score > 0 -- Only questions with positive score
+    GROUP BY
+      q.Id,
+      q.Title,
+      q.CreationDate,
+      q.OwnerUserId,
+      q.Score,
+      q.FavoriteCount
+  ),
+  -- Rank users by their total upvotes, considering only those with more than N badges.
+  RankedUsers AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate AS UserCreationDate,
+      u.Views AS UserViews,
+      COUNT(b.Id) AS BadgeCount,
+      RANK() OVER (ORDER BY u.UpVotes DESC) AS UpVoteRank,
+      ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY u.LastAccessDate DESC) AS LastAccessRank
+    FROM Users AS u
+    LEFT JOIN Badges AS b
+      ON u.Id = b.UserId
+    WHERE
+      u.UpVotes > 100 -- Users with significant upvotes
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate,
+      u.Views,
+      u.UpVotes,
+      u.LastAccessDate
+    HAVING
+      COUNT(b.Id) > 5 -- Users with more than 5 badges
+  ),
+  -- Identify posts with more than a certain number of comments and recent activity.
+  ActivePosts AS (
+    SELECT
+      p.Id AS PostId,
+      p.Title,
+      p.CreationDate AS PostCreationDate,
+      p.LastActivityDate,
+      COUNT(c.Id) AS CommentCount,
+      -- Calculate the difference in days between the last activity and creation date
+      DATEDIFF(day, p.CreationDate, p.LastActivityDate) AS ActivityDurationDays
+    FROM Posts AS p
+    JOIN Comments AS c
+      ON p.Id = c.PostId
+    WHERE
+      p.CreationDate > '2022-01-01' -- Recent posts
+      AND p.ViewCount > 1000 -- High view count
+    GROUP BY
+      p.Id,
+      p.Title,
+      p.CreationDate,
+      p.LastActivityDate
+    HAVING
+      COUNT(c.Id) > 10 -- More than 10 comments
+  )
+  -- Final selection combining information from CTEs and other tables.
+SELECT
+  aqas.Title AS QuestionTitle,
+  aqas.QuestionScore,
+  aqas.AvgAnswerScore,
+  aqas.FavoriteCount,
+  aqas.DaysSinceCreation,
+  ru.DisplayName AS TopUserDisplayName,
+  ru.Reputation AS TopUserReputation,
+  ru.UpVoteRank,
+  ru.LastAccessRank,
+  ap.Title AS ActivePostTitle,
+  ap.CommentCount,
+  ap.ActivityDurationDays,
+  -- String manipulation for post tags, handling potential NULLs and empty strings.
+  CASE
+    WHEN p.Tags IS NULL OR p.Tags = '' OR p.Tags = '""' THEN 'No Tags'
+    ELSE SUBSTRING(p.Tags, 2, LEN(p.Tags) - 2) -- Remove leading/trailing quotes
+  END AS FormattedTags,
+  -- Complex predicate involving NULL checks and date comparisons.
+  CASE
+    WHEN p.ClosedDate IS NOT NULL AND DATEDIFF(month, p.ClosedDate, GETDATE()) < 6 THEN 'Recently Closed'
+    WHEN p.CommunityOwnedDate IS NOT NULL AND DATEDIFF(year, p.CommunityOwnedDate, GETDATE()) < 1 THEN 'Community Owned (Recent)'
+    WHEN p.LastEditDate IS NULL THEN 'No Edits'
+    ELSE 'Edited'
+  END AS PostStatus,
+  -- Window function to calculate cumulative score for users based on their post scores.
+  SUM(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativeUserScore,
+  -- Set operator to combine data from different types of posts, showcasing different join conditions.
+  CASE WHEN p.PostTypeId = 1 THEN 'Question' WHEN p.PostTypeId = 2 THEN 'Answer' ELSE 'Other' END AS PostTypeDescription
+FROM Posts AS p
+-- Left join to include posts even if they don't have corresponding entries in AvgQuestionAnswerScore
+LEFT JOIN AvgQuestionAnswerScore AS aqas
+  ON p.Id = aqas.QuestionId AND p.PostTypeId = 1 -- Ensure matching on QuestionId for questions
+-- Inner join to ensure only users with calculated ranks are included
+INNER JOIN RankedUsers AS ru
+  ON p.OwnerUserId = ru.UserId
+-- Left join to include posts even if they are not in the ActivePosts CTE
+LEFT JOIN ActivePosts AS ap
+  ON p.Id = ap.PostId
+WHERE
+  p.Score > 5 -- Filter for posts with a significant score
+  AND ru.LastAccessRank = 1 -- Only users with the most recent access
+  AND (
+    aqas.QuestionId IS NOT NULL -- Posts that are questions with answers
+    OR ap.PostId IS NOT NULL -- Or posts that are active
+    OR p.PostTypeId <> 1 -- Or any other post type
+  )
+  AND p.ContentLicense = 'CC BY-SA 4.0' -- Specific content license
+ORDER BY
+  p.LastActivityDate DESC,
+  ru.Reputation DESC;

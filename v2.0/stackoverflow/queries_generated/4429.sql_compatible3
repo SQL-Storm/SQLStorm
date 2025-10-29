@@ -1,0 +1,171 @@
+WITH
+  UserPostCounts AS (
+    SELECT
+      OwnerUserId,
+      COUNT(Id) AS TotalPosts
+    FROM
+      Posts
+    WHERE
+      OwnerUserId IS NOT NULL
+    GROUP BY
+      OwnerUserId
+  ),
+  PostScoreRank AS (
+    SELECT
+      Id,
+      OwnerUserId,
+      Score,
+      ROW_NUMBER() OVER (PARTITION BY OwnerUserId ORDER BY Score DESC) AS ScoreRank
+    FROM
+      Posts
+    WHERE
+      PostTypeId = 1
+  ),
+  RecentEditDates AS (
+    SELECT
+      PostId,
+      MAX(CreationDate) AS LastEditDate
+    FROM
+      PostHistory
+    WHERE
+      PostHistoryTypeId IN (4, 5, 6)
+    GROUP BY
+      PostId
+  ),
+  UserTopTags AS (
+    SELECT
+      p.OwnerUserId,
+      t.TagName,
+      COUNT(*) AS TagPostCount,
+      ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY COUNT(*) DESC) AS TagRank
+    FROM
+      Posts p
+      JOIN Tags t
+        ON t.TagName = ANY(
+          regexp_split_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><')
+        )
+    WHERE
+      p.PostTypeId = 1
+      AND p.OwnerUserId IS NOT NULL
+      AND t.TagName NOT LIKE '%-%'
+    GROUP BY
+      p.OwnerUserId,
+      t.TagName
+  ),
+  PostTypeCounts AS (
+    SELECT
+      OwnerUserId,
+      PostTypeId,
+      COUNT(*) AS PostCount
+    FROM
+      Posts
+    GROUP BY
+      OwnerUserId,
+      PostTypeId
+  ),
+  MaxPostTypePerUser AS (
+    SELECT
+      OwnerUserId,
+      MAX(PostCount) AS MaxPostCount
+    FROM
+      PostTypeCounts
+    GROUP BY
+      OwnerUserId
+  )
+SELECT
+  u.Id AS UserId,
+  u.DisplayName,
+  COALESCE(upc.TotalPosts, 0) AS TotalPostsCreated,
+  COALESCE(psr.Score, 0) AS TopQuestionScore,
+  COALESCE(
+    FLOOR(
+      EXTRACT(epoch FROM (CAST('2024-10-01' AS date) - CAST(u.LastAccessDate AS date))) / (365.25 * 24 * 3600)
+    )::integer,
+    0
+  ) AS YearsSinceLastAccess,
+  CASE
+    WHEN u.WebsiteUrl IS NOT NULL THEN 'HasWebsite'
+    WHEN u.AboutMe LIKE '%SQL%' THEN 'LikesSQL'
+    ELSE 'NoSpecialIndicator'
+  END AS UserIndicator,
+  COALESCE(
+    CASE
+      WHEN u.Location IS NOT NULL AND POSITION(',' IN u.Location) > 0
+      THEN CONCAT(SUBSTRING(u.Location FROM 1 FOR POSITION(',' IN u.Location) - 1), ' (Approx)')
+      ELSE NULL
+    END,
+    'UnknownLocation'
+  ) AS ApproximateLocation,
+  COALESCE(
+    (
+      SELECT
+        COUNT(*)
+      FROM
+        Comments c
+      WHERE
+        c.UserId = u.Id
+        AND c.Score > 5
+        AND c.CreationDate > u.CreationDate + INTERVAL '1 year'
+    ),
+    0
+  ) AS HighScoreCommentsAfterFirstYear,
+  COALESCE(pt.Name, 'NoPostType') AS MostFrequentPostType,
+  CASE
+    WHEN red.LastEditDate IS NOT NULL THEN red.LastEditDate
+    ELSE u.CreationDate
+  END AS EffectiveLastEditOrCreationDate,
+  utt.TagName AS FavoriteTag,
+  COUNT(DISTINCT ph.Id) AS PostHistoryCount
+FROM
+  Users u
+LEFT JOIN
+  UserPostCounts upc
+  ON u.Id = upc.OwnerUserId
+LEFT JOIN
+  PostScoreRank psr
+  ON u.Id = psr.OwnerUserId
+  AND psr.ScoreRank = 1
+LEFT JOIN
+  PostTypeCounts
+  ON u.Id = PostTypeCounts.OwnerUserId
+LEFT JOIN
+  MaxPostTypePerUser mpt
+  ON u.Id = mpt.OwnerUserId
+LEFT JOIN
+  PostTypes pt
+  ON PostTypeCounts.PostTypeId = pt.Id
+  AND PostTypeCounts.PostCount = mpt.MaxPostCount
+LEFT JOIN
+  RecentEditDates red
+  ON u.Id = red.PostId
+LEFT JOIN
+  UserTopTags utt
+  ON u.Id = utt.OwnerUserId
+  AND utt.TagRank = 1
+LEFT JOIN
+  PostHistory ph
+  ON u.Id = ph.UserId
+  AND ph.PostId = u.Id
+WHERE
+  u.Reputation > 1000
+  AND u.DownVotes < u.UpVotes * 0.1
+GROUP BY
+  u.Id,
+  u.DisplayName,
+  upc.TotalPosts,
+  psr.Score,
+  u.LastAccessDate,
+  u.WebsiteUrl,
+  u.AboutMe,
+  u.Location,
+  pt.Name,
+  red.LastEditDate,
+  utt.TagName,
+  u.CreationDate,
+  u.Reputation,
+  u.DownVotes,
+  u.UpVotes
+ORDER BY
+  u.Reputation DESC,
+  YearsSinceLastAccess ASC
+LIMIT 100;

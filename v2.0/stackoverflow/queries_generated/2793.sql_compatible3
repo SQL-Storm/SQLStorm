@@ -1,0 +1,186 @@
+WITH QuestionStats AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+        u.Id AS OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        u.Reputation,
+        CASE
+            WHEN p.Tags IS NULL OR p.Tags = '' THEN ARRAY[]::TEXT[]  -- keep shape for dialects that support ARRAY literal
+            ELSE (
+                SELECT array_agg(t) FROM (
+                    SELECT trim(tgt) AS t
+                    FROM (
+                        SELECT UNNEST(string_to_array(replace(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><', '|'), '|')) AS tgt
+                    ) s
+                    WHERE trim(tgt) <> ''
+                ) sub
+            )
+        END AS TagArray
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+      AND p.ClosedDate IS NULL
+),
+AnswerWithVotes AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.Score AS AnswerScore,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVotes,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownVotes,
+        a.CreationDate AS AnswerCreationDate,
+        u.Id AS OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        RANK() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS RankByScore
+    FROM Posts a
+    LEFT JOIN Votes v ON a.Id = v.PostId
+    LEFT JOIN Users u ON a.OwnerUserId = u.Id
+    WHERE a.PostTypeId = 2
+    GROUP BY a.Id, a.ParentId, a.Score, a.CreationDate, u.Id, u.DisplayName
+),
+TopAnswers AS (
+    SELECT *
+    FROM AnswerWithVotes
+    WHERE RankByScore = 1
+),
+QuestionWithTopAnswer AS (
+    SELECT
+        q.QuestionId,
+        q.Title,
+        q.CreationDate AS QuestionCreationDate,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        q.FavoriteCount,
+        q.OwnerUserId,
+        q.OwnerDisplayName,
+        q.Reputation AS OwnerReputation,
+        q.TagArray,
+        ta.AnswerId,
+        ta.AnswerScore,
+        ta.UpVotes,
+        ta.DownVotes,
+        ta.AnswerCreationDate,
+        ta.OwnerUserId AS AnswerOwnerUserId,
+        ta.OwnerDisplayName AS AnswerOwnerDisplayName
+    FROM QuestionStats q
+    LEFT JOIN TopAnswers ta ON q.QuestionId = ta.QuestionId
+),
+BadgesAgg AS (
+    SELECT
+        UserId,
+        COUNT(CASE WHEN Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN Class = 3 THEN 1 END) AS BronzeBadges,
+        COUNT(DISTINCT Name) AS DistinctBadges
+    FROM Badges
+    GROUP BY UserId
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(DISTINCT p.Id) AS PostsCount,
+        COUNT(DISTINCT c.Id) AS CommentsCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        LEAD(u.LastAccessDate) OVER (ORDER BY u.Reputation DESC, u.Id) AS NextUserLastAccessDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    GROUP BY u.Id, u.LastAccessDate, u.Reputation
+)
+SELECT
+    q.QuestionId,
+    q.Title,
+    q.QuestionCreationDate,
+    q.QuestionScore,
+    q.ViewCount,
+    q.AnswerCount,
+    q.FavoriteCount,
+    q.OwnerUserId,
+    q.OwnerDisplayName,
+    q.OwnerReputation,
+    COALESCE(b.GoldBadges, 0) AS OwnerGoldBadges,
+    COALESCE(b.SilverBadges, 0) AS OwnerSilverBadges,
+    COALESCE(b.BronzeBadges, 0) AS OwnerBronzeBadges,
+    COALESCE(b.DistinctBadges, 0) AS OwnerDistinctBadges,
+    q.AnswerId,
+    q.AnswerScore,
+    q.UpVotes,
+    q.DownVotes,
+    q.AnswerCreationDate,
+    q.AnswerOwnerUserId,
+    q.AnswerOwnerDisplayName,
+    ua.PostsCount AS AnswerOwnerPostsCount,
+    ua.CommentsCount AS AnswerOwnerCommentsCount,
+    ua.LastPostDate AS AnswerOwnerLastPostDate,
+    ua.LastCommentDate AS AnswerOwnerLastCommentDate,
+    ua.NextUserLastAccessDate,
+    (
+        SELECT AVG(t.Count)
+        FROM (
+            SELECT UNNEST(q.TagArray) AS tg
+        ) AS tags
+        JOIN Tags t ON tags.tg = t.TagName
+        WHERE t.Count > 1000
+    ) AS AvgPopularTagCount,
+    (
+        SELECT cht.Name
+        FROM PostHistory ph
+        JOIN PostHistoryTypes cht ON ph.PostHistoryTypeId = cht.Id
+        LEFT JOIN CloseReasonTypes crt ON TRY_CAST(ph.Comment AS INTEGER) = crt.Id
+        WHERE ph.PostId = q.QuestionId
+          AND ph.PostHistoryTypeId = 10
+        ORDER BY ph.CreationDate DESC
+        LIMIT 1
+    ) AS LatestCloseReason,
+    (
+        SELECT STRING_AGG(tg, ' | ' ORDER BY tg)
+        FROM (
+            SELECT UNNEST(q.TagArray) AS tg
+            LIMIT 3
+        ) AS LimitedTags
+    ) AS Top3TagsConcatenated,
+    RANK() OVER (ORDER BY (NULLIF(q.QuestionScore,0) * 1.0) / NULLIF(q.ViewCount,0) DESC NULLS LAST) AS ScoreViewRatioRank
+FROM QuestionWithTopAnswer q
+LEFT JOIN BadgesAgg b ON q.OwnerUserId = b.UserId
+LEFT JOIN UserActivity ua ON q.AnswerOwnerUserId = ua.UserId
+WHERE q.QuestionCreationDate > DATE '2018-01-01'
+  AND (q.AnswerScore IS NULL OR q.AnswerScore >= 0)
+GROUP BY
+    q.QuestionId,
+    q.Title,
+    q.QuestionCreationDate,
+    q.QuestionScore,
+    q.ViewCount,
+    q.AnswerCount,
+    q.FavoriteCount,
+    q.OwnerUserId,
+    q.OwnerDisplayName,
+    q.OwnerReputation,
+    b.GoldBadges,
+    b.SilverBadges,
+    b.BronzeBadges,
+    b.DistinctBadges,
+    q.AnswerId,
+    q.AnswerScore,
+    q.UpVotes,
+    q.DownVotes,
+    q.AnswerCreationDate,
+    q.AnswerOwnerUserId,
+    q.AnswerOwnerDisplayName,
+    ua.PostsCount,
+    ua.CommentsCount,
+    ua.LastPostDate,
+    ua.LastCommentDate,
+    ua.NextUserLastAccessDate,
+    q.TagArray
+HAVING COALESCE(q.AnswerScore, 0) + q.QuestionScore > 10
+ORDER BY ScoreViewRatioRank
+LIMIT 100;

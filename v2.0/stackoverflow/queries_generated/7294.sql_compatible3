@@ -1,0 +1,163 @@
+WITH UserActivityCTE AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(p.Score) as MaxPostScore,
+        AVG(p.Score) as AvgPostScore,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags)-2)), ', ') as AllTags,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 100 THEN 'High'
+            WHEN COUNT(DISTINCT p.Id) > 50 THEN 'Medium'
+            ELSE 'Low'
+        END as ActivityLevel,
+        (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId IN (2,3,4)) as TotalVotes,
+        (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = u.Id AND p2.PostTypeId = 1 AND p2.ClosedDate IS NOT NULL) as ClosedQuestions,
+        (SELECT COUNT(*) FROM Posts p3 WHERE p3.OwnerUserId = u.Id AND p3.PostTypeId = 2 AND p3.Score > 100) as HighScoringAnswers
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+RankedUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        Views,
+        UpVotes,
+        DownVotes,
+        PostCount,
+        CommentCount,
+        BadgeCount,
+        LastPostDate,
+        MaxPostScore,
+        AvgPostScore,
+        AllTags,
+        ActivityLevel,
+        TotalVotes,
+        ClosedQuestions,
+        HighScoringAnswers,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, PostCount DESC) as RankByReputation,
+        DENSE_RANK() OVER (ORDER BY ActivityLevel DESC, PostCount DESC) as RankByActivity,
+        PERCENT_RANK() OVER (ORDER BY Views DESC) as PercentileViews
+    FROM UserActivityCTE
+),
+PostStats AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Tags,
+        CASE 
+            WHEN p.Score > 100 THEN 'Hot'
+            WHEN p.Score > 50 THEN 'Popular'
+            WHEN p.Score > 0 THEN 'Good'
+            ELSE 'Neutral'
+        END as ScoreCategory,
+        CAST(EXTRACT(EPOCH FROM (COALESCE(p.ClosedDate, p.LastActivityDate, TIMESTAMP '2024-10-01 12:34:56') - p.CreationDate))/86400 AS INTEGER) as AgeInDays,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 
+                (SELECT COUNT(*) FROM Posts p2 WHERE p2.ParentId = p.Id AND p2.PostTypeId = 2 AND p2.Score > 0)
+            ELSE 0
+        END as AnswerCountWithScore,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId IN (2,3)) as TotalVotesOnPost,
+        (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId = 1) as EditCount,
+        p.PostTypeId
+    FROM Posts p
+    WHERE p.PostTypeId IN (1,2) AND p.DeletedDate IS NULL
+),
+TopPosts AS (
+    SELECT 
+        Id,
+        Title,
+        Score,
+        ViewCount,
+        AnswerCount,
+        CommentCount,
+        OwnerUserId,
+        CreationDate,
+        LastActivityDate,
+        Tags,
+        ScoreCategory,
+        AgeInDays,
+        AnswerCountWithScore,
+        TotalVotesOnPost,
+        EditCount,
+        PostTypeId,
+        ROW_NUMBER() OVER (ORDER BY Score DESC, ViewCount DESC) as RankByScore,
+        RANK() OVER (PARTITION BY PostTypeId ORDER BY Score DESC) as RankByType
+    FROM PostStats
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        p.Title as SampleTitle,
+        p.Score as SampleScore,
+        p.OwnerUserId as SamplePosterId,
+        DENSE_RANK() OVER (ORDER BY t.Count DESC) as PopularityRank
+    FROM Tags t
+    INNER JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    WHERE p.PostTypeId = 1 AND p.Score > 0
+    LIMIT 1000
+)
+SELECT 
+    'User Benchmark Report' as ReportTitle,
+    COUNT(*) as TotalUsers,
+    AVG(Reputation) as AvgReputation,
+    MAX(Reputation) as MaxReputation,
+    COUNT(DISTINCT CASE WHEN ActivityLevel = 'High' THEN UserId END) as HighActivityUsers,
+    COUNT(DISTINCT CASE WHEN ActivityLevel = 'Medium' THEN UserId END) as MediumActivityUsers,
+    COUNT(DISTINCT CASE WHEN ActivityLevel = 'Low' THEN UserId END) as LowActivityUsers,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Score > 100) as HighScoreQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 2 AND Score > 100) as HighScoreAnswers,
+    (SELECT STRING_AGG(DISTINCT TagName, ', ') FROM TagAnalysis WHERE PopularityRank <= 10) as TopTags,
+    (SELECT AVG(Score) FROM Posts) as OverallAvgPostScore
+FROM RankedUsers
+WHERE RankByReputation <= 1000
+UNION ALL
+SELECT 
+    'Post Performance Overview' as ReportTitle,
+    COUNT(*) as TotalUsers,
+    0::numeric AS AvgReputation_REPLACEMENT,
+    0::numeric AS MaxReputation_REPLACEMENT,
+    0 as HighActivityUsers,
+    0 as MediumActivityUsers,
+    0 as LowActivityUsers,
+    COUNT(*) as HighScoreQuestions,
+    0 as HighScoreAnswers,
+    STRING_AGG(DISTINCT ScoreCategory, ', ') as TopTags,
+    AVG(Score) as OverallAvgPostScore
+FROM TopPosts
+WHERE RankByScore <= 1000
+UNION ALL
+SELECT 
+    'Tag Popularity Analysis' as ReportTitle,
+    0 as TotalUsers,
+    0 as AvgReputation,
+    0 as MaxReputation,
+    0 as HighActivityUsers,
+    0 as MediumActivityUsers,
+    0 as LowActivityUsers,
+    0 as HighScoreQuestions,
+    0 as HighScoreAnswers,
+    'All tags' as TopTags,
+    0 as OverallAvgPostScore
+FROM TagAnalysis
+WHERE PopularityRank <= 50
+ORDER BY ReportTitle;

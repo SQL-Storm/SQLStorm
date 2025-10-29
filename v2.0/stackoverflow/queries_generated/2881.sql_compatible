@@ -1,0 +1,204 @@
+with RecursiveUserReps as (
+    select 
+        u.Id,
+        u.Reputation,
+        case when u.Location is null or length(trim(u.Location))=0 then 'Unknown' else u.Location end as UserLocation,
+        u.CreationDate,
+        u.DisplayName,
+        row_number() over (partition by coalesce(nullif(u.Location,''),'Unknown') order by u.Reputation desc, u.CreationDate) as LocRank
+    from 
+        Users u
+    where u.Reputation > 1000
+),
+RecentPostStats as (
+    select 
+        p.OwnerUserId,
+        count(*) filter (where p.PostTypeId = 1) as QuestionsCount,
+        count(*) filter (where p.PostTypeId = 2) as AnswersCount,
+        avg(p.Score) as AvgScore,
+        max(p.CreationDate) as LastPostDate,
+        sum(p.ViewCount) as TotalViews,
+        string_agg(distinct substring(p.Tags from '<([^>]+)>'), ',' order by substring(p.Tags from '<([^>]+)>')) as DistinctTags
+    from 
+        Posts p
+    where 
+        p.CreationDate > cast('2024-10-01' as date) - interval '365 days'
+        and p.OwnerUserId is not null
+    group by p.OwnerUserId
+),
+UserBadgeRanks as (
+    select 
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount,
+        dense_rank() over (partition by b.UserId order by b.Class) as BadgeClassRank
+    from 
+        Badges b
+    group by b.UserId, b.Class
+),
+UserCloseVotes as (
+    select 
+        ph.UserId,
+        count(distinct ph.PostId) as CloseVotesCast,
+        count(distinct case when ph.PostHistoryTypeId = 10 then ph.PostId end) as PostClosedCount,
+        count(distinct case when ph.PostHistoryTypeId = 11 then ph.PostId end) as PostReopenedCount
+    from 
+        PostHistory ph
+    where 
+        ph.PostHistoryTypeId in (10,11)
+        and ph.UserId is not null
+        and ph.CreationDate > cast('2024-10-01' as date) - interval '2 years'
+    group by ph.UserId
+),
+UserTopQuestionScore as (
+    select 
+        p.OwnerUserId,
+        max(p.Score) as MaxQuestionScore
+    from 
+        Posts p
+    where 
+        p.PostTypeId = 1
+        and p.OwnerUserId is not null
+    group by p.OwnerUserId
+),
+UserFinalStats as (
+    select 
+        rur.Id as UserId,
+        rur.DisplayName,
+        rur.UserLocation,
+        rur.Reputation,
+        rur.CreationDate,
+        rs.QuestionsCount,
+        rs.AnswersCount,
+        coalesce(rs.AvgScore,0) as AvgPostScore,
+        coalesce(rs.TotalViews,0) as TotalPostViews,
+        coalesce(ub.GoldBadges,0) as GoldBadges,
+        coalesce(ub.SilverBadges,0) as SilverBadges,
+        coalesce(ub.BronzeBadges,0) as BronzeBadges,
+        coalesce(cv.CloseVotesCast,0) as CloseVotesCast,
+        coalesce(cv.PostClosedCount,0) as PostClosedCount,
+        coalesce(cv.PostReopenedCount,0) as PostReopenedCount,
+        coalesce(uts.MaxQuestionScore,0) as MaxQuestionScore,
+        rank() over (order by 
+            rur.Reputation * 0.4 + 
+            coalesce(ub.GoldBadges,0)*100 + 
+            coalesce(ub.SilverBadges,0)*50 + 
+            coalesce(ub.BronzeBadges,0)*20 + 
+            (coalesce(rs.QuestionsCount,0) + coalesce(rs.AnswersCount,0))*5 
+        desc) as OverallRank
+    from 
+        RecursiveUserReps rur
+        left join RecentPostStats rs on rur.Id = rs.OwnerUserId
+        left join (
+            select 
+                UserId,
+                sum(case when Class=1 then BadgeCount else 0 end) as GoldBadges,
+                sum(case when Class=2 then BadgeCount else 0 end) as SilverBadges,
+                sum(case when Class=3 then BadgeCount else 0 end) as BronzeBadges
+            from UserBadgeRanks
+            group by UserId
+        ) ub on ub.UserId = rur.Id
+        left join UserCloseVotes cv on cv.UserId = rur.Id
+        left join UserTopQuestionScore uts on uts.OwnerUserId = rur.Id
+),
+QuestionWithAnswerCounts as (
+    select 
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        q.CreationDate,
+        count(a.Id) as AnswerCount,
+        max(a.Score) as MaxAnswerScore,
+        sum(coalesce(a.Score,0)) as TotalAnswerScore,
+        row_number() over (partition by q.Id order by max(a.Score) desc nulls last) as AnswerRankByScore
+    from 
+        Posts q
+        left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.OwnerUserId, q.Score, q.ViewCount, q.Tags, q.CreationDate
+),
+TagCorrelation as (
+    select 
+        t1.TagName as Tag1,
+        t2.TagName as Tag2,
+        count(*) as CoOccurrenceCount
+    from 
+        Posts p1,
+        lateral unnest(string_to_array(substring(p1.Tags from 2 for length(p1.Tags)-2), '><')) as t1(TagName),
+        lateral unnest(string_to_array(substring(p1.Tags from 2 for length(p1.Tags)-2), '><')) as t2(TagName)
+    where 
+        t1.TagName < t2.TagName
+        and p1.PostTypeId = 1
+    group by t1.TagName, t2.TagName
+    having count(*) > 500
+),
+FinalSelection as (
+    select 
+        ufs.UserId,
+        ufs.DisplayName,
+        ufs.UserLocation,
+        ufs.Reputation,
+        ufs.CreationDate as UserCreated,
+        ufs.QuestionsCount,
+        ufs.AnswersCount,
+        ufs.AvgPostScore,
+        ufs.TotalPostViews,
+        ufs.GoldBadges,
+        ufs.SilverBadges,
+        ufs.BronzeBadges,
+        ufs.CloseVotesCast,
+        ufs.PostClosedCount,
+        ufs.PostReopenedCount,
+        ufs.MaxQuestionScore,
+        qac.QuestionId,
+        qac.Title as QuestionTitle,
+        qac.QuestionScore,
+        qac.ViewCount as QuestionViews,
+        qac.AnswerCount,
+        qac.MaxAnswerScore,
+        qac.TotalAnswerScore,
+        tc.Tag2 as MostCoOccurringTag,
+        row_number() over (partition by ufs.UserId order by qac.QuestionScore desc nulls last) as QRank
+    from 
+        UserFinalStats ufs
+        left join QuestionWithAnswerCounts qac on qac.OwnerUserId = ufs.UserId
+        left join TagCorrelation tc on tc.Tag1 = any (string_to_array(substring(qac.Tags from 2 for length(qac.Tags)-2), '><'))
+)
+select 
+    f.UserId,
+    f.DisplayName,
+    f.UserLocation,
+    f.Reputation,
+    f.UserCreated,
+    f.QuestionsCount,
+    f.AnswersCount,
+    f.AvgPostScore,
+    f.TotalPostViews,
+    f.GoldBadges,
+    f.SilverBadges,
+    f.BronzeBadges,
+    f.CloseVotesCast,
+    f.PostClosedCount,
+    f.PostReopenedCount,
+    f.MaxQuestionScore,
+    f.QuestionId,
+    f.QuestionTitle,
+    f.QuestionScore,
+    f.QuestionViews,
+    f.AnswerCount,
+    f.MaxAnswerScore,
+    f.TotalAnswerScore,
+    f.MostCoOccurringTag
+from 
+    FinalSelection f
+where 
+    (f.QuestionsCount is not null or f.AnswersCount is not null)
+    and (f.QRank <= 3 or f.QRank is null)
+order by 
+    f.Reputation desc, 
+    f.QuestionScore desc nulls last,
+    f.MaxAnswerScore desc nulls last
+limit 100;

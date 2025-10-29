@@ -1,0 +1,136 @@
+WITH
+RecentlyActivePosts AS (
+  SELECT
+    p.Id,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Title,
+    p.Tags,
+    p.Score,
+    p.ViewCount,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount
+  FROM Posts p
+  WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30' DAY
+),
+TagAggregates AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS TagPostCount,
+    AVG(p.Score) AS AvgPostScore,
+    SUM(p.ViewCount) AS TotalViews,
+    MAX(p.LastActivityDate) AS LastActive
+  FROM Tags t
+  JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+  WHERE p.PostTypeId = 1
+  GROUP BY t.TagName
+),
+TopContributors AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(*) AS PostsCreated,
+    SUM(p.Score) AS ScoreSum,
+    MAX(p.CreationDate) AS FirstPostDate
+  FROM Users u
+  JOIN Posts p ON p.OwnerUserId = u.Id
+  WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '365' DAY
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+EngagementMetrics AS (
+  SELECT
+    p.Id AS PostId,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    COALESCE(cs.CommentCount, 0) AS CommentCount,
+    COALESCE(vs.UpMod, 0) AS UpMod,
+    COALESCE(vs.DownMod, 0) AS DownMod
+  FROM RecentlyActivePosts p
+  LEFT JOIN (
+    SELECT PostId, SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpMod,
+           SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownMod
+    FROM Votes
+    GROUP BY PostId
+  ) vs ON vs.PostId = p.Id
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS CommentCount
+    FROM Comments
+    GROUP BY PostId
+  ) cs ON cs.PostId = p.Id
+),
+ComplexPrediction AS (
+  SELECT
+    e.PostId,
+    e.OwnerUserId,
+    e.Score,
+    e.ViewCount,
+    e.CommentCount,
+    e.UpMod,
+    e.DownMod,
+    (e.Score * 1.0 + e.UpMod * 2.0 - e.DownMod) AS ScoreIndex,
+    ROW_NUMBER() OVER (ORDER BY (e.Score * 1.0 + e.UpMod * 2.0 - e.DownMod) DESC,
+                       e.ViewCount DESC) AS rn
+  FROM EngagementMetrics e
+)
+SELECT
+  p.Id AS PostId,
+  p.Title,
+  p.Tags,
+  p.CreationDate,
+  p.LastActivityDate,
+  p.OwnerDisplayName,
+  p.Score,
+  p.ViewCount,
+  p.CommentCount,
+  p.AnswerCount,
+  COALESCE(a.TotalViewsForTag, 0) AS TotalViewsForTag,
+  ta.TagName,
+  ta.TagPostCount,
+  ta.AvgPostScore,
+  ku.DisplayName AS TopContributor,
+  ku.Reputation AS TopContributorRep,
+  ku.PostsCreated AS TopContributorPosts,
+  cm.ScoreIndex,
+  cm.rn
+FROM TopContributors ku
+JOIN Posts p ON p.OwnerUserId = ku.UserId
+LEFT JOIN TagAggregates ta ON p.Tags LIKE '%' || ta.TagName || '%'
+LEFT JOIN (
+  SELECT cp.PostId AS PostId, cp.ScoreIndex, cp.rn
+  FROM ComplexPrediction cp
+) cm ON cm.PostId = p.Id
+LEFT JOIN (
+  SELECT t.TagName, p2.Id AS Id, SUM(0) AS TotalViewsForTag
+  FROM Tags t
+  LEFT JOIN Posts p2 ON p2.Tags LIKE '%' || t.TagName || '%'
+  GROUP BY t.TagName, p2.Id
+) a ON a.Id = p.Id
+WHERE p.PostTypeId = 1
+  AND p.OwnerUserId = ku.UserId
+GROUP BY
+  p.Id,
+  p.Title,
+  p.Tags,
+  p.CreationDate,
+  p.LastActivityDate,
+  p.OwnerDisplayName,
+  p.Score,
+  p.ViewCount,
+  p.CommentCount,
+  p.AnswerCount,
+  a.TotalViewsForTag,
+  ta.TagName,
+  ta.TagPostCount,
+  ta.AvgPostScore,
+  ku.DisplayName,
+  ku.Reputation,
+  ku.PostsCreated,
+  cm.ScoreIndex,
+  cm.rn
+ORDER BY cm.ScoreIndex DESC NULLS LAST, p.LastActivityDate DESC
+LIMIT 100;

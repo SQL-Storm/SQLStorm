@@ -1,0 +1,309 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.LastActivityDate,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevScore,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS UserPostRank,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) AS GlobalScoreRank,
+        NTILE(10) OVER (ORDER BY p.Score) AS ScoreDecile,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN 'QuestionWithAnswers'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 1 AND p.AnswerCount = 0 THEN 'QuestionNoAnswers'
+            ELSE 'Other'
+        END AS PostCategory
+    FROM Posts p
+    WHERE p.CreationDate >= TIMESTAMP '2019-01-01' 
+      AND p.CreationDate < TIMESTAMP '2021-01-01'
+      AND (p.PostTypeId IN (1, 2) OR p.PostTypeId = 5)
+),
+UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.CreationDate,
+        COUNT(DISTINCT p.Id) AS TotalPostsCreated,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsAsked,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersGiven,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        COUNT(DISTINCT b.Id) AS BadgesReceived,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(p.Score) AS MaxPostScore,
+        SUM(p.ViewCount) AS TotalViews,
+        STRING_AGG(DISTINCT u.Location, '; ') AS Locations,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= TIMESTAMP '2019-01-01'
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes, u.CreationDate, u.Location
+    HAVING COUNT(DISTINCT p.Id) > 0
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        rp.Id AS PostId,
+        rp.PostTypeId,
+        rp.Title,
+        rp.Tags,
+        rp.Score,
+        rp.ViewCount,
+        rp.CreationDate,
+        rp.AnswerCount,
+        rp.CommentCount,
+        rp.FavoriteCount,
+        COALESCE(rp.PrevScore, 0) AS PrevScore,
+        CASE 
+            WHEN rp.UserPostRank = 1 AND rp.Score > 100 THEN 'TopScoringFirstPost'
+            WHEN rp.Score > LAG(rp.Score) OVER (PARTITION BY rp.OwnerUserId ORDER BY rp.CreationDate) THEN 'ImprovedScore'
+            WHEN rp.Score < LAG(rp.Score) OVER (PARTITION BY rp.OwnerUserId ORDER BY rp.CreationDate) THEN 'DegradedScore'
+            ELSE 'StableScore'
+        END AS ScoreTrend,
+        CASE 
+            WHEN rp.Score > 100 AND rp.PostTypeId = 1 THEN 'HighScoreQuestion'
+            WHEN rp.Score > 50 AND rp.PostTypeId = 2 THEN 'HighScoreAnswer'
+            WHEN rp.Score > 50 AND rp.PostTypeId = 1 THEN 'HighScoreQuestion'  
+            ELSE 'RegularPost'
+        END AS PostImportance,
+        rp.GlobalScoreRank,
+        rp.ScoreDecile,
+        rp.PostCategory,
+        CAST((CAST('2024-10-01 12:34:56' AS TIMESTAMP) - rp.CreationDate) AS INTERVAL) AS _interval_days,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - rp.CreationDate)) / 86400 AS DaysSinceCreation,
+        CASE 
+            WHEN rp.AnswerCount >= 5 THEN 'WellAnswered'
+            WHEN rp.AnswerCount >= 1 THEN 'PartiallyAnswered' 
+            ELSE 'Unanswered'
+        END AS AnswerStatus,
+        CASE 
+            WHEN rp.CommentCount >= 10 THEN 'HighCommentActivity'
+            WHEN rp.CommentCount >= 5 THEN 'ModerateCommentActivity'
+            WHEN rp.CommentCount >= 1 THEN 'LowCommentActivity'
+            ELSE 'NoComments'
+        END AS CommentActivityLevel,
+        rp.OwnerUserId
+    FROM RankedPosts rp
+),
+TagStatistics AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.IsRequired,
+        t.IsModeratorOnly,
+        p.Id AS PostId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Title
+    FROM Tags t
+    INNER JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    WHERE t.Count > 10
+      AND p.PostTypeId = 1
+      AND p.CreationDate >= TIMESTAMP '2019-01-01'
+),
+UserComplexityAnalysis AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.Views,
+        uas.UpVotes,
+        uas.DownVotes,
+        uas.TotalPostsCreated,
+        uas.QuestionsAsked,
+        uas.AnswersGiven,
+        uas.CommentsMade,
+        uas.BadgesReceived,
+        uas.AvgPostScore,
+        uas.MaxPostScore,
+        uas.TotalViews,
+        uas.Locations,
+        uas.LastPostDate,
+        CASE 
+            WHEN uas.Reputation > 10000 THEN 'HighReputation'
+            WHEN uas.Reputation > 5000 THEN 'MediumReputation'
+            WHEN uas.Reputation > 1000 THEN 'LowReputation'
+            ELSE 'VeryLowReputation'
+        END AS ReputationLevel,
+        CASE 
+            WHEN uas.TotalPostsCreated > 100 THEN 'HighlyActive'
+            WHEN uas.TotalPostsCreated > 50 THEN 'ModeratelyActive'
+            WHEN uas.TotalPostsCreated > 10 THEN 'OccasionallyActive'
+            ELSE 'Inactive'
+        END AS ActivityLevel,
+        CASE 
+            WHEN uas.AvgPostScore > 50 THEN 'HighScoring'
+            WHEN uas.AvgPostScore > 20 THEN 'ModerateScoring'
+            WHEN uas.AvgPostScore > 5 THEN 'LowScoring'
+            ELSE 'VeryLowScoring'
+        END AS ScoringLevel,
+        CASE 
+            WHEN uas.BadgesReceived > 10 THEN 'BadgeEnthusiast'
+            WHEN uas.BadgesReceived > 5 THEN 'OccasionalBadgeUser'
+            WHEN uas.BadgesReceived > 0 THEN 'BadgeBeginner'
+            ELSE 'NoBadges'
+        END AS BadgeLevel,
+        (uas.UpVotes - uas.DownVotes) AS NetVotes
+    FROM UserActivityStats uas
+),
+PostAnalysis AS (
+    SELECT 
+        cpa.PostId,
+        cpa.PostTypeId,
+        cpa.Title,
+        cpa.Tags,
+        cpa.Score,
+        cpa.ViewCount,
+        cpa.CreationDate,
+        cpa.AnswerCount,
+        cpa.CommentCount,
+        cpa.FavoriteCount,
+        cpa.PrevScore,
+        cpa.ScoreTrend,
+        cpa.PostImportance,
+        cpa.GlobalScoreRank,
+        cpa.ScoreDecile,
+        cpa.PostCategory,
+        cpa.DaysSinceCreation,
+        cpa.AnswerStatus,
+        cpa.CommentActivityLevel,
+        COALESCE(uta.DisplayName, 'Unknown') AS OwnerDisplayName,
+        COALESCE(uta.Reputation, 0) AS OwnerReputation,
+        COALESCE(uta.Views, 0) AS OwnerViews,
+        COALESCE(uta.NetVotes, 0) AS OwnerNetVotes,
+        COALESCE(uta.ActivityLevel, 'Unknown') AS OwnerActivityLevel,
+        COALESCE(uta.ReputationLevel, 'Unknown') AS OwnerReputationLevel,
+        (cpa.Score * 1.0 / NULLIF(uta.Reputation, 0)) AS ScoreToReputationRatio,
+        CASE 
+            WHEN cpa.Score > (uta.AvgPostScore * 1.2) THEN 'AboveAverage'
+            WHEN cpa.Score > (uta.AvgPostScore * 0.8) THEN 'Average'
+            ELSE 'BelowAverage'
+        END AS ScoreVsUserAverage,
+        CASE WHEN uas.LastPostDate IS NOT NULL THEN EXTRACT(EPOCH FROM (uas.LastPostDate - cpa.CreationDate)) / 86400 ELSE NULL END AS DaysSinceUserLastPost,
+        cpa.OwnerUserId
+    FROM ComplexPostAnalysis cpa
+    LEFT JOIN UserComplexityAnalysis uta ON cpa.OwnerUserId = uta.UserId
+    LEFT JOIN UserActivityStats uas ON cpa.OwnerUserId = uas.UserId
+),
+TagAndPostIntegration AS (
+    SELECT 
+        pa.PostId,
+        pa.PostTypeId,
+        pa.Title,
+        pa.Tags,
+        pa.Score,
+        pa.ViewCount,
+        pa.CreationDate,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.FavoriteCount,
+        pa.PrevScore,
+        pa.ScoreTrend,
+        pa.PostImportance,
+        pa.GlobalScoreRank,
+        pa.ScoreDecile,
+        pa.PostCategory,
+        pa.DaysSinceCreation,
+        pa.AnswerStatus,
+        pa.CommentActivityLevel,
+        pa.OwnerDisplayName,
+        pa.OwnerReputation,
+        pa.OwnerViews,
+        pa.OwnerNetVotes,
+        pa.OwnerActivityLevel,
+        pa.OwnerReputationLevel,
+        pa.ScoreToReputationRatio,
+        pa.ScoreVsUserAverage,
+        pa.DaysSinceUserLastPost,
+        pa.OwnerUserId,
+        ts.TagName,
+        ts.Count AS TagCount,
+        ts.IsRequired,
+        ts.IsModeratorOnly,
+        ts.Score AS TagScore,
+        ts.ViewCount AS TagViewCount,
+        ts.CreationDate AS TagCreationDate,
+        ts.Title AS TagTitle,
+        CASE 
+            WHEN pa.Tags LIKE '%' || ts.TagName || '%' THEN 'TagPresentInPost'
+            ELSE 'TagNotInPost'
+        END AS TagInclusionStatus
+    FROM PostAnalysis pa
+    LEFT JOIN TagStatistics ts ON pa.Tags LIKE '%' || ts.TagName || '%'
+)
+SELECT 
+    tpi.PostId,
+    tpi.PostTypeId,
+    tpi.Title,
+    tpi.Tags,
+    tpi.Score,
+    tpi.ViewCount,
+    tpi.CreationDate,
+    tpi.AnswerCount,
+    tpi.CommentCount,
+    tpi.FavoriteCount,
+    tpi.PrevScore,
+    tpi.ScoreTrend,
+    tpi.PostImportance,
+    tpi.GlobalScoreRank,
+    tpi.ScoreDecile,
+    tpi.PostCategory,
+    tpi.DaysSinceCreation,
+    tpi.AnswerStatus,
+    tpi.CommentActivityLevel,
+    tpi.OwnerDisplayName,
+    tpi.OwnerReputation,
+    tpi.OwnerViews,
+    tpi.OwnerNetVotes,
+    tpi.OwnerActivityLevel,
+    tpi.OwnerReputationLevel,
+    tpi.ScoreToReputationRatio,
+    tpi.ScoreVsUserAverage,
+    tpi.DaysSinceUserLastPost,
+    tpi.TagName,
+    tpi.TagCount,
+    tpi.IsRequired,
+    tpi.IsModeratorOnly,
+    tpi.TagScore,
+    tpi.TagViewCount,
+    tpi.TagCreationDate,
+    tpi.TagTitle,
+    tpi.TagInclusionStatus,
+    CASE 
+        WHEN tpi.Score >= 100 AND tpi.AnswerStatus LIKE 'Well%' THEN 'HighValueWellAnswered'
+        WHEN tpi.Score >= 50 AND tpi.AnswerStatus LIKE 'Well%' THEN 'MediumValueWellAnswered'
+        WHEN tpi.Score >= 100 AND tpi.CommentActivityLevel LIKE 'High%' THEN 'HighValueHighActivity'
+        WHEN tpi.Score >= 50 AND tpi.CommentActivityLevel LIKE 'High%' THEN 'MediumValueHighActivity'
+        WHEN tpi.Score >= 100 THEN 'HighValue'
+        WHEN tpi.Score >= 50 THEN 'MediumValue'
+        ELSE 'LowValue'
+    END AS PostValueCategory,
+    COUNT(*) OVER (PARTITION BY tpi.OwnerUserId) AS PostsPerUser,
+    AVG(tpi.Score) OVER (PARTITION BY tpi.OwnerUserId) AS AvgScorePerUser,
+    RANK() OVER (ORDER BY tpi.Score DESC) AS GlobalRankByScore,
+    NTILE(20) OVER (ORDER BY tpi.Score DESC) AS ScoreQuantile,
+    SUM(tpi.ViewCount) OVER (ORDER BY tpi.Score DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativeViews,
+    tpi.OwnerUserId
+FROM TagAndPostIntegration tpi
+WHERE tpi.DaysSinceCreation <= 30
+  AND tpi.TagName IS NOT NULL
+  AND tpi.OwnerReputation > 1000
+  AND tpi.PostCategory IN ('QuestionWithAnswers', 'QuestionNoAnswers', 'Answer')
+ORDER BY tpi.Score DESC, tpi.DaysSinceCreation ASC
+FETCH FIRST 1000 ROWS ONLY;

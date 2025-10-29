@@ -1,0 +1,230 @@
+with RecursiveUserBadges as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        b.Id as BadgeId,
+        b.Name as BadgeName,
+        row_number() over (partition by u.Id order by b.Date desc) as BadgeRank
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    where u.Reputation > 1000
+),
+FilteredBadges as (
+    select * from RecursiveUserBadges where BadgeRank <= 5
+),
+PostStats as (
+    select
+        p.Id as PostId,
+        p.PostTypeId,
+        pt.Name as PostTypeName,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.Tags,
+        coalesce(pl.LinkedCount, 0) as LinkedPostsCount,
+        coalesce(vt.UpVotes, 0) as TotalUpVotes,
+        coalesce(vt.DownVotes, 0) as TotalDownVotes
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    left join PostTypes pt on p.PostTypeId = pt.Id
+    left join (
+        select
+            PostId,
+            count(*) filter (where LinkTypeId = 1) as LinkedCount
+        from PostLinks
+        group by PostId
+    ) pl on p.Id = pl.PostId
+    left join (
+        select
+            PostId,
+            sum(case when VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+            sum(case when VoteTypeId = 3 then 1 else 0 end) as DownVotes
+        from Votes
+        group by PostId
+    ) vt on p.Id = vt.PostId
+    where p.PostTypeId in (1,2)
+),
+RankedPosts as (
+    select
+        ps.*,
+        rank() over (
+            partition by ps.PostTypeId
+            order by ps.Score desc, ps.ViewCount desc, ps.FavoriteCount desc
+        ) as ScoreRank
+    from PostStats ps
+),
+LatestPostHistory as (
+    select
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        pht.Name as HistoryTypeName,
+        ph.CreationDate as HistoryDate,
+        ph.UserId as EditorUserId,
+        u.DisplayName as EditorName,
+        ph.Comment,
+        ph.Text
+    from (
+        select distinct on (ph.PostId) ph.*
+        from PostHistory ph
+        order by ph.PostId, ph.CreationDate desc
+    ) ph
+    join PostHistoryTypes pht on ph.PostHistoryTypeId = pht.Id
+    left join Users u on ph.UserId = u.Id
+),
+PostsWithHistory as (
+    select
+        rp.*,
+        lph.PostHistoryTypeId,
+        lph.HistoryTypeName,
+        lph.HistoryDate,
+        lph.EditorUserId,
+        lph.EditorName,
+        lph.Comment,
+        lph.Text
+    from RankedPosts rp
+    left join LatestPostHistory lph on rp.PostId = lph.PostId
+),
+QuestionsWithAcceptedAnswerDetails as (
+    select
+        pwh.PostId as QuestionId,
+        pwh.Title as QuestionTitle,
+        pwh.Score as QuestionScore,
+        pwh.ViewCount as QuestionViews,
+        pwh.AnswerCount,
+        pwh.Tags,
+        pwh.AcceptedAnswerId as AcceptedAnswerId,
+        a.Id as AnswerId,
+        a.Score as AcceptedAnswerScore,
+        a.CreationDate as AcceptedAnswerCreationDate,
+        a.OwnerUserId as AcceptedAnswerOwnerUserId,
+        u.DisplayName as AcceptedAnswerOwnerName,
+        a.Body as AcceptedAnswerBodySnippet,
+        pwh.HistoryTypeName as LastPostHistoryType,
+        pwh.HistoryDate as LastHistoryDate,
+        pwh.EditorName as LastEditor
+    from PostsWithHistory pwh
+    left join Posts a on a.Id = pwh.AcceptedAnswerId
+    left join Users u on a.OwnerUserId = u.Id
+    where pwh.PostTypeId = 1 and pwh.AcceptedAnswerId is not null
+),
+QuestionsWithDuplicateLinks as (
+    select
+        q.QuestionId,
+        count(distinct pl.RelatedPostId) as DuplicateCount
+    from QuestionsWithAcceptedAnswerDetails q
+    left join PostLinks pl on pl.PostId = q.QuestionId and pl.LinkTypeId = 3
+    group by q.QuestionId
+),
+QuestionStats as (
+    select
+        q.QuestionId,
+        q.QuestionTitle,
+        q.QuestionScore,
+        q.QuestionViews,
+        q.AnswerCount,
+        q.Tags,
+        q.AcceptedAnswerId,
+        q.AcceptedAnswerScore,
+        q.AcceptedAnswerCreationDate,
+        q.AcceptedAnswerOwnerUserId,
+        q.AcceptedAnswerOwnerName,
+        q.AcceptedAnswerBodySnippet,
+        q.LastPostHistoryType,
+        q.LastHistoryDate,
+        q.LastEditor,
+        dup.DuplicateCount,
+        coalesce(dup.DuplicateCount, 0) + q.AnswerCount as TotalResponses,
+        (case when q.AnswerCount > 0 then cast(q.QuestionScore as double precision) / q.AnswerCount else null end) as ScorePerAnswer
+    from QuestionsWithAcceptedAnswerDetails q
+    left join QuestionsWithDuplicateLinks dup on q.QuestionId = dup.QuestionId
+),
+FilteredQuestions as (
+    select * from QuestionStats
+    where
+        (DuplicateCount > 0 or AnswerCount > 5)
+        and Tags is not null
+        and LastHistoryDate > (cast('2024-10-01' as date) - interval '180 day')
+),
+AggregatedTagStats as (
+    select
+        tag,
+        count(*) as QuestionCount,
+        avg(QuestionScore) as AvgQuestionScore,
+        avg(AnswerCount) as AvgAnswerCount,
+        avg(TotalResponses) as AvgTotalResponses,
+        avg(ScorePerAnswer) as AvgScorePerAnswer,
+        sum(coalesce(DuplicateCount,0)) as TotalDuplicateCount
+    from (
+        select
+            fq.*,
+            unnest(string_to_array(substring(fq.Tags from 2 for char_length(fq.Tags)-2), '><')) as tag
+        from FilteredQuestions fq
+    ) tagged
+    group by tag
+),
+RankedTagStats as (
+    select
+        ats.*,
+        row_number() over (order by AvgQuestionScore desc nulls last, AvgAnswerCount desc nulls last) as TagRank
+    from AggregatedTagStats ats
+),
+TopTagsWithBadges as (
+    select
+        rts.tag as TagName,
+        rts.QuestionCount,
+        round(rts.AvgQuestionScore::numeric, 2) as AverageQuestionScore,
+        round(rts.AvgAnswerCount::numeric, 2) as AverageAnswerCount,
+        round(rts.AvgTotalResponses::numeric, 2) as AverageTotalResponses,
+        round(rts.AvgScorePerAnswer::numeric, 4) as AverageScorePerAnswerAnswer,
+        rts.TotalDuplicateCount,
+        rts.TagRank,
+        fb.BadgeName,
+        fb.Date as BadgeAwardedDate,
+        fb.BadgeRank,
+        case
+            when rts.AvgScorePerAnswer > 10 then 'High Interest'
+            when rts.AvgScorePerAnswer between 5 and 10 then 'Moderate Interest'
+            else 'Low Interest'
+        end as InterestLevel
+    from RankedTagStats rts
+    left join LATERAL (
+        select fb.BadgeName, fb.Date, fb.BadgeRank, fb.DisplayName
+        from FilteredBadges fb
+        where fb.DisplayName = (
+            select u.DisplayName
+            from Users u
+            join Posts p on u.Id = p.OwnerUserId
+            where p.Tags like '%' || rts.tag || '%'
+            limit 1
+        )
+        order by fb.Date desc
+        limit 1
+    ) fb on true
+    where rts.TagRank <= 20
+)
+select * from TopTagsWithBadges
+union all
+select
+    'Overall' as TagName,
+    count(distinct p.Id) as QuestionCount,
+    avg(p.Score) as AverageQuestionScore,
+    avg(p.AnswerCount) as AverageAnswerCount,
+    avg(coalesce(p.AnswerCount,0) + coalesce(pl.LinkedCount,0)) as AverageTotalResponses,
+    avg(case when p.AnswerCount > 0 then cast(p.Score as double precision) / p.AnswerCount else null end) as AverageScorePerAnswerAnswer,
+    sum(coalesce(pl.LinkedCount,0)) as TotalDuplicateCount,
+    null as TagRank,
+    null as BadgeName,
+    null as BadgeAwardedDate,
+    null as BadgeRank,
+    'Aggregated' as InterestLevel
+from Posts p
+left join (
+    select PostId, count(*) filter (where LinkTypeId = 3) as LinkedCount from PostLinks group by PostId
+) pl on p.Id = pl.PostId
+where p.PostTypeId = 1
+order by TagName;

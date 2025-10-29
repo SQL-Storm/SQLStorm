@@ -1,0 +1,145 @@
+-- {"query": "3623.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1601} 
+
+/*  Comprehensive performance‑benchmark query on the StackOverflow schema  */
+WITH
+    /* 1️⃣ Base user activity aggregation */
+    UserActivity AS (
+        SELECT
+            u.Id                                   AS UserId,
+            u.DisplayName,
+            u.Reputation,
+            COALESCE(u.Location, '(unknown)')       AS Location,
+            COUNT(DISTINCT p.Id)                    AS TotalPosts,
+            COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+            COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+            SUM(COALESCE(p.Score,0))                AS PostScoreSum,
+            AVG(COALESCE(p.Score,0))                AS AvgPostScore,
+            MAX(COALESCE(p.CreationDate, '1970-01-01')) AS LastPostDate,
+            COUNT(DISTINCT v.Id)                    AS VotesCast,
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesGiven,
+            SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesGiven,
+            COUNT(DISTINCT b.Id)                    AS BadgesEarned,
+            SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+            SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+            SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+        FROM Users u
+        LEFT JOIN Posts   p ON p.OwnerUserId = u.Id
+        LEFT JOIN Votes   v ON v.UserId = u.Id
+        LEFT JOIN Badges  b ON b.UserId = u.Id
+        GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location
+    ),
+
+    /* 2️⃣ Tag‑level stats for each user (derived from Questions) */
+    UserTagStats AS (
+        SELECT
+            p.OwnerUserId                           AS UserId,
+            UNNEST(string_to_array(
+                    TRIM(BOTH '<>' FROM COALESCE(p.Tags, '')),
+                    '><'))                         AS Tag,
+            COUNT(*)                                AS QuestionsWithTag,
+            AVG(COALESCE(p.Score,0))                AS AvgScorePerTag
+        FROM Posts p
+        WHERE p.PostTypeId = 1                      -- only questions
+          AND p.Tags IS NOT NULL
+        GROUP BY p.OwnerUserId, Tag
+    ),
+
+    /* 3️⃣ Rank users by a composite activity metric */
+    RankedUsers AS (
+        SELECT
+            ua.*,
+            ROW_NUMBER() OVER (ORDER BY
+                (ua.Reputation * 0.4) +
+                (ua.PostScoreSum * 0.3) +
+                (ua.GoldBadges * 100) +
+                (ua.SilverBadges * 20) +
+                (ua.BronzeBadges * 5) DESC) AS ActivityRank
+        FROM UserActivity ua
+    ),
+
+    /* 4️⃣ Users meeting complex eligibility criteria (correlated subquery) */
+    EligibleUsers AS (
+        SELECT
+            ru.UserId,
+            ru.DisplayName,
+            ru.Reputation,
+            ru.TotalPosts,
+            ru.Questions,
+            ru.Answers,
+            ru.ActivityRank
+        FROM RankedUsers ru
+        WHERE ru.Reputation > 2000
+           OR EXISTS (
+                SELECT 1
+                FROM Posts p
+                WHERE p.OwnerUserId = ru.UserId
+                  AND p.PostTypeId = 2          -- answers
+                  AND p.Score > 10
+           )
+           AND (ru.Location IS NOT NULL AND ru.Location <> '')
+    ),
+
+    /* 5️⃣ Union with synthetic “anonymous” record for benchmarking null handling */
+    BenchmarkSet AS (
+        SELECT
+            eu.UserId,
+            eu.DisplayName,
+            eu.Reputation,
+            eu.TotalPosts,
+            eu.Questions,
+            eu.Answers,
+            eu.ActivityRank,
+            COALESCE(uts.Tag, '(none)')           AS TopTag,
+            COALESCE(uts.QuestionsWithTag,0)      AS TagQuestionCount,
+            COALESCE(uts.AvgScorePerTag,0)        AS TagAvgScore
+        FROM EligibleUsers eu
+        LEFT JOIN LATERAL (
+            SELECT *
+            FROM UserTagStats uts
+            WHERE uts.UserId = eu.UserId
+            ORDER BY uts.QuestionsWithTag DESC, uts.AvgScorePerTag DESC
+            LIMIT 1
+        ) uts ON TRUE
+
+        UNION ALL
+
+        SELECT
+            NULL                                   AS UserId,
+            'Anonymous'                            AS DisplayName,
+            0                                      AS Reputation,
+            0                                      AS TotalPosts,
+            0                                      AS Questions,
+            0                                      AS Answers,
+            NULL                                   AS ActivityRank,
+            '(none)'                               AS TopTag,
+            0                                      AS TagQuestionCount,
+            0                                      AS TagAvgScore
+    )
+
+SELECT
+    bs.UserId,
+    bs.DisplayName,
+    bs.Reputation,
+    bs.TotalPosts,
+    bs.Questions,
+    bs.Answers,
+    bs.ActivityRank,
+    bs.TopTag,
+    bs.TagQuestionCount,
+    ROUND(bs.TagAvgScore::numeric,2)           AS TagAvgScoreRounded,
+    /* Complex string expression mixing NULL logic */
+    CONCAT(
+        CASE WHEN bs.Reputation IS NULL OR bs.Reputation = 0 THEN 'Newbie' ELSE 'Pro' END,
+        ' - ',
+        COALESCE(bs.DisplayName, 'NoName')
+    )                                          AS UserLabel,
+    /* Indicator if user is “super‑active” */
+    CASE
+        WHEN bs.ActivityRank IS NOT NULL AND bs.ActivityRank <= 10 THEN TRUE
+        ELSE FALSE
+    END                                      AS IsTop10
+FROM BenchmarkSet bs
+ORDER BY
+    bs.ActivityRank NULLS LAST,
+    bs.Reputation DESC,
+    bs.TotalPosts DESC;

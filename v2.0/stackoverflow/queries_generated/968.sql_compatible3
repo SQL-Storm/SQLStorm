@@ -1,0 +1,433 @@
+with params as (
+    select
+        100 as top_n_questions,
+        interval '365 days' as recent_window,
+        interval '30 days' as active_window
+),
+recent_questions as (
+    select
+        p.Id as QuestionId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        coalesce(p.AnswerCount, 0) as AnswerCount,
+        case when p.ClosedDate is null then 0 else 1 end as IsClosed
+    from Posts p
+    where p.PostTypeId = 1
+      and p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - (select recent_window from params)
+),
+question_activity as (
+    select
+        q.QuestionId,
+        q.OwnerUserId,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.IsClosed,
+        q.Title,
+        q.Tags,
+        q.CreationDate,
+        count(distinct a.Id) filter (where a.Id is not null) as AnswersSeen,
+        count(distinct c.Id) filter (where c.Id is not null) as CommentsSeen,
+        count(*) filter (where v.VoteTypeId = 2) as UpVotesOnQ,
+        count(*) filter (where v.VoteTypeId = 3) as DownVotesOnQ,
+        count(*) filter (where v.VoteTypeId = 5) as FavoritesOnQ
+    from recent_questions q
+    left join Posts a
+        on a.ParentId = q.QuestionId
+        and a.PostTypeId = 2
+        and a.CreationDate >= q.CreationDate
+    left join Comments c
+        on c.PostId = q.QuestionId
+        and c.CreationDate >= q.CreationDate
+    left join Votes v
+        on v.PostId = q.QuestionId
+        and v.CreationDate >= q.CreationDate
+    group by q.QuestionId, q.OwnerUserId, q.Score, q.ViewCount, q.AnswerCount, q.IsClosed, q.Title, q.Tags, q.CreationDate
+),
+user_stats as (
+    select
+        u.Id as UserId,
+        u.Reputation,
+        u.CreationDate as UserCreated,
+        u.Location,
+        u.UpVotes as UserUpVotes,
+        u.DownVotes as UserDownVotes,
+        u.Views as ProfileViews,
+        count(distinct b.Id) as BadgeCount,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.Reputation, u.CreationDate, u.Location, u.UpVotes, u.DownVotes, u.Views
+),
+dup_links as (
+    select
+        pl.PostId as DuplicateOf,
+        count(*) as DuplicateCount,
+        min(pl.CreationDate) as FirstDupDate
+    from PostLinks pl
+    where pl.LinkTypeId = 3
+    group by pl.PostId
+),
+post_edits as (
+    select
+        ph.PostId,
+        count(*) filter (where ph.PostHistoryTypeId in (4,5,6)) as EditCount,
+        max(ph.CreationDate) as LastEditDate,
+        count(*) filter (where ph.PostHistoryTypeId = 10) as CloseEvents,
+        count(*) filter (where ph.PostHistoryTypeId = 11) as ReopenEvents,
+        count(*) filter (where ph.PostHistoryTypeId in (33,34)) as NoticeEvents
+    from PostHistory ph
+    group by ph.PostId
+),
+question_window_stats as (
+    select
+        qa.QuestionId,
+        qa.OwnerUserId,
+        qa.Score,
+        qa.ViewCount,
+        qa.AnswerCount,
+        qa.IsClosed,
+        qa.Title,
+        qa.Tags,
+        qa.CreationDate,
+        qa.AnswersSeen,
+        qa.CommentsSeen,
+        qa.UpVotesOnQ,
+        qa.DownVotesOnQ,
+        qa.FavoritesOnQ,
+        count(distinct a2.Id) filter (
+            where a2.CreationDate >= qa.CreationDate
+              and a2.CreationDate < qa.CreationDate + (select active_window from params)
+        ) as AnswersInFirstWindow,
+        count(distinct c2.Id) filter (
+            where c2.CreationDate >= qa.CreationDate
+              and c2.CreationDate < qa.CreationDate + (select active_window from params)
+        ) as CommentsInFirstWindow
+    from question_activity qa
+    left join Posts a2
+        on a2.ParentId = qa.QuestionId and a2.PostTypeId = 2
+    left join Comments c2
+        on c2.PostId = qa.QuestionId
+    group by qa.QuestionId, qa.OwnerUserId, qa.Score, qa.ViewCount, qa.AnswerCount, qa.IsClosed, qa.Title, qa.Tags, qa.CreationDate, qa.AnswersSeen, qa.CommentsSeen, qa.UpVotesOnQ, qa.DownVotesOnQ, qa.FavoritesOnQ
+),
+tag_explode as (
+    select
+        qw.QuestionId,
+        unnest(string_to_array(substring(qw.Tags, 2, greatest(length(qw.Tags)-2, 0)), '><')) as TagName
+    from question_window_stats qw
+    where qw.Tags is not null and qw.Tags like '<%>'
+),
+tag_rank as (
+    select
+        te.QuestionId,
+        te.TagName,
+        t.Count as TagGlobalCount,
+        row_number() over (partition by te.QuestionId order by coalesce(t.Count, 0) desc, te.TagName) as TagRankByGlobalPopularity
+    from tag_explode te
+    left join Tags t on t.TagName = te.TagName
+),
+agg_tag as (
+    select
+        tr.QuestionId,
+        string_agg(tr.TagName, '|') filter (where tr.TagRankByGlobalPopularity <= 3) as Top3TagsByPopularity,
+        avg(cast(tr.TagGlobalCount as numeric)) as AvgTagGlobalCount
+    from tag_rank tr
+    group by tr.QuestionId
+),
+answerer_multiplicity as (
+    select
+        a.ParentId as QuestionId,
+        count(distinct a.OwnerUserId) filter (where a.OwnerUserId is not null) as DistinctAnswerers,
+        count(*) as TotalAnswers,
+        max(a.Score) as MaxAnswerScore,
+        avg(cast(a.Score as numeric)) as AvgAnswerScore
+    from Posts a
+    where a.PostTypeId = 2
+    group by a.ParentId
+),
+vote_skew as (
+    select
+        qa.QuestionId,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+        sum(case when v.VoteTypeId not in (2,3) then 1 else 0 end) as OtherVotes,
+        stddev_pop(case when v.VoteTypeId in (2,3) then v.VoteTypeId end) as UDTypeStdDev
+    from question_activity qa
+    left join Votes v on v.PostId = qa.QuestionId
+    group by qa.QuestionId
+),
+owner_recent_activity as (
+    select
+        u.Id as UserId,
+        count(*) filter (where p.PostTypeId = 1 and p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days') as QuestionsLast30d,
+        count(*) filter (where p.PostTypeId = 2 and p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days') as AnswersLast30d,
+        max(p.LastActivityDate) as LastPostActivity
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id
+),
+scored as (
+    select
+        qw.QuestionId,
+        qw.Title,
+        qw.Tags,
+        qw.CreationDate,
+        qw.Score as QScore,
+        qw.ViewCount,
+        qw.AnswerCount,
+        qw.AnswersSeen,
+        qw.CommentsSeen,
+        qw.UpVotesOnQ,
+        qw.DownVotesOnQ,
+        qw.FavoritesOnQ,
+        qw.AnswersInFirstWindow,
+        qw.CommentsInFirstWindow,
+        qw.IsClosed,
+        us.Reputation,
+        us.BadgeCount,
+        us.GoldBadges,
+        us.SilverBadges,
+        us.BronzeBadges,
+        coalesce(dl.DuplicateCount, 0) as DuplicateCount,
+        pe.EditCount,
+        pe.LastEditDate,
+        pe.CloseEvents,
+        pe.ReopenEvents,
+        pe.NoticeEvents,
+        at.Top3TagsByPopularity,
+        at.AvgTagGlobalCount,
+        am.DistinctAnswerers,
+        am.TotalAnswers,
+        am.MaxAnswerScore,
+        am.AvgAnswerScore,
+        vs.UpVotes,
+        vs.DownVotes,
+        vs.OtherVotes,
+        vs.UDTypeStdDev,
+        ora.QuestionsLast30d,
+        ora.AnswersLast30d,
+        ora.LastPostActivity,
+        (
+            coalesce(qw.ViewCount,0) * 0.001
+          + coalesce(qw.UpVotesOnQ,0) * 2
+          - coalesce(qw.DownVotesOnQ,0) * 1.5
+          + coalesce(qw.FavoritesOnQ,0) * 1.2
+          + coalesce(am.DistinctAnswerers,0) * 1.0
+          + coalesce(am.MaxAnswerScore,0) * 0.5
+          + case when qw.IsClosed = 1 then -5 else 0 end
+          + case when dl.DuplicateCount is not null and dl.DuplicateCount > 0 then -3 else 0 end
+          + least(coalesce(us.Reputation,0) / 1000.0, 10)
+          + case when pe.EditCount is null then 0 when pe.EditCount = 0 then 0 else ln(1 + pe.EditCount) end
+          + case when vs.UDTypeStdDev is null then 0 else (1.0 / (1.0 + vs.UDTypeStdDev)) end
+          + case when at.AvgTagGlobalCount is null then 0 else ln(1 + at.AvgTagGlobalCount) end
+          + case when ora.LastPostActivity is null then 0 else
+                case when ora.LastPostActivity >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days' then 1 else 0 end
+            end
+        ) as CompositeScore
+    from question_window_stats qw
+    left join user_stats us on us.UserId = qw.OwnerUserId
+    left join dup_links dl on dl.DuplicateOf = qw.QuestionId
+    left join post_edits pe on pe.PostId = qw.QuestionId
+    left join agg_tag at on at.QuestionId = qw.QuestionId
+    left join answerer_multiplicity am on am.QuestionId = qw.QuestionId
+    left join vote_skew vs on vs.QuestionId = qw.QuestionId
+    left join owner_recent_activity ora on ora.UserId = qw.OwnerUserId
+),
+ranked as (
+    select
+        s.QuestionId,
+        s.Title,
+        s.Tags,
+        s.CreationDate,
+        s.QScore,
+        s.ViewCount,
+        s.AnswerCount,
+        s.AnswersSeen,
+        s.CommentsSeen,
+        s.UpVotesOnQ,
+        s.DownVotesOnQ,
+        s.FavoritesOnQ,
+        s.AnswersInFirstWindow,
+        s.CommentsInFirstWindow,
+        s.IsClosed,
+        s.Reputation,
+        s.BadgeCount,
+        s.GoldBadges,
+        s.SilverBadges,
+        s.BronzeBadges,
+        s.DuplicateCount,
+        s.EditCount,
+        s.LastEditDate,
+        s.CloseEvents,
+        s.ReopenEvents,
+        s.NoticeEvents,
+        s.Top3TagsByPopularity,
+        s.AvgTagGlobalCount,
+        s.DistinctAnswerers,
+        s.TotalAnswers,
+        s.MaxAnswerScore,
+        s.AvgAnswerScore,
+        s.UpVotes,
+        s.DownVotes,
+        s.OtherVotes,
+        s.UDTypeStdDev,
+        s.QuestionsLast30d,
+        s.AnswersLast30d,
+        s.LastPostActivity,
+        s.CompositeScore,
+        row_number() over (
+            order by s.CompositeScore desc,
+                     coalesce(s.ViewCount,0) desc,
+                     s.CreationDate desc
+        ) as rn,
+        rank() over (order by s.CompositeScore desc) as rnk,
+        percent_rank() over (order by s.CompositeScore desc) as pct_rnk,
+        ntile(10) over (order by s.CompositeScore desc) as decile
+    from scored s
+),
+dedup_title as (
+    select
+        r.QuestionId,
+        r.Title,
+        r.Tags,
+        r.CreationDate,
+        r.QScore,
+        r.ViewCount,
+        r.AnswerCount,
+        r.AnswersSeen,
+        r.CommentsSeen,
+        r.UpVotesOnQ,
+        r.DownVotesOnQ,
+        r.FavoritesOnQ,
+        r.AnswersInFirstWindow,
+        r.CommentsInFirstWindow,
+        r.IsClosed,
+        r.Reputation,
+        r.BadgeCount,
+        r.GoldBadges,
+        r.SilverBadges,
+        r.BronzeBadges,
+        r.DuplicateCount,
+        r.EditCount,
+        r.LastEditDate,
+        r.CloseEvents,
+        r.ReopenEvents,
+        r.NoticeEvents,
+        r.Top3TagsByPopularity,
+        r.AvgTagGlobalCount,
+        r.DistinctAnswerers,
+        r.TotalAnswers,
+        r.MaxAnswerScore,
+        r.AvgAnswerScore,
+        r.UpVotes,
+        r.DownVotes,
+        r.OtherVotes,
+        r.UDTypeStdDev,
+        r.QuestionsLast30d,
+        r.AnswersLast30d,
+        r.LastPostActivity,
+        r.CompositeScore,
+        r.rn,
+        r.rnk,
+        r.pct_rnk,
+        r.decile,
+        regexp_replace(lower(coalesce(r.Title,'')), '[^a-z0-9]+', ' ', 'g') as NormTitle
+    from ranked r
+),
+title_groups as (
+    select
+        d.QuestionId,
+        d.NormTitle,
+        min(d.rn) over (partition by d.NormTitle) as BestRNInTitleGroup,
+        count(*) over (partition by d.NormTitle) as TitleGroupSize
+    from dedup_title d
+),
+final as (
+    select
+        d.QuestionId,
+        d.Title,
+        d.Tags,
+        d.CreationDate,
+        d.QScore,
+        d.ViewCount,
+        d.AnswerCount,
+        d.AnswersSeen,
+        d.CommentsSeen,
+        d.UpVotesOnQ,
+        d.DownVotesOnQ,
+        d.FavoritesOnQ,
+        d.AnswersInFirstWindow,
+        d.CommentsInFirstWindow,
+        d.IsClosed,
+        d.Reputation,
+        d.BadgeCount,
+        d.GoldBadges,
+        d.SilverBadges,
+        d.BronzeBadges,
+        d.DuplicateCount,
+        d.EditCount,
+        d.LastEditDate,
+        d.CloseEvents,
+        d.ReopenEvents,
+        d.NoticeEvents,
+        d.Top3TagsByPopularity,
+        d.AvgTagGlobalCount,
+        d.DistinctAnswerers,
+        d.TotalAnswers,
+        d.MaxAnswerScore,
+        d.AvgAnswerScore,
+        d.UpVotes,
+        d.DownVotes,
+        d.OtherVotes,
+        d.UDTypeStdDev,
+        d.QuestionsLast30d,
+        d.AnswersLast30d,
+        d.LastPostActivity,
+        d.CompositeScore,
+        d.rn,
+        d.rnk,
+        d.pct_rnk,
+        d.decile,
+        tg.TitleGroupSize,
+        case
+            when tg.BestRNInTitleGroup = d.rn then 'leader'
+            else 'follower'
+        end as TitleGroupRole
+    from dedup_title d
+    join title_groups tg on tg.QuestionId = d.QuestionId
+    where d.rn <= (select top_n_questions from params)
+)
+select
+    f.*,
+    (
+        select count(*) from Posts a
+        where a.PostTypeId = 2
+          and a.CreationDate >= f.CreationDate
+          and exists (
+              select 1
+              from tag_explode tq
+              join tag_explode ta on ta.QuestionId = a.ParentId and tq.TagName = ta.TagName
+              where tq.QuestionId = f.QuestionId
+              limit 1
+          )
+    ) as AnswersSharingAnyTagAfterQ,
+    exists (
+        select 1 from PostHistory ph
+        where ph.PostId = f.QuestionId
+          and ph.PostHistoryTypeId = 10
+          and ((ph.Comment IS NOT NULL AND ph.Comment ~ '\\y10\\y') or (ph.Text IS NOT NULL AND upper(ph.Text) LIKE '%DUPLICATE%'))
+    ) as HasDupCloseSignal,
+    not exists (
+        select f.QuestionId
+        intersect
+        select phs.PostId from PostHistory phs where phs.PostHistoryTypeId in (35,37)
+    ) as NotMigratedAwayOrSource
+from final f
+order by f.rn;

@@ -1,0 +1,369 @@
+with q as (
+  select
+    p.Id as QuestionId,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    coalesce(p.AnswerCount, 0) as AnswerCount
+  from Posts p
+  where p.PostTypeId = 1
+),
+a as (
+  select
+    pa.Id as AnswerId,
+    pa.ParentId as QuestionId,
+    pa.OwnerUserId as AnswerOwnerId,
+    pa.Score as AnswerScore,
+    pa.CreationDate as AnswerCreationDate
+  from Posts pa
+  where pa.PostTypeId = 2
+),
+accepted as (
+  select
+    q.QuestionId,
+    q.Title,
+    q.OwnerUserId,
+    q.Score as QuestionScore,
+    q.ViewCount,
+    q.Tags,
+    q.CreationDate as QuestionCreationDate,
+    p2.Id as AcceptedAnswerId,
+    p2.OwnerUserId as AcceptedUserId,
+    p2.Score as AcceptedScore,
+    p2.CreationDate as AcceptedCreationDate
+  from Posts p2
+  join q on q.QuestionId = p2.ParentId
+  where p2.Id = (select p.AcceptedAnswerId from Posts p where p.Id = q.QuestionId)
+),
+votes_per_post as (
+  select
+    v.PostId,
+    sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+    sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+    sum(case when v.VoteTypeId in (8,9) then coalesce(v.BountyAmount,0) else 0 end) as BountyTotal,
+    count(*) as TotalVotes,
+    min(v.CreationDate) as FirstVoteDate,
+    max(v.CreationDate) as LastVoteDate
+  from Votes v
+  group by v.PostId
+),
+comment_metrics as (
+  select
+    c.PostId,
+    count(*) as CommentCount,
+    sum(c.Score) as CommentScoreSum,
+    max(c.Score) as MaxCommentScore,
+    min(c.CreationDate) as FirstCommentDate,
+    max(c.CreationDate) as LastCommentDate
+  from Comments c
+  group by c.PostId
+),
+edit_activity as (
+  select
+    ph.PostId,
+    count(*) filter (where ph.PostHistoryTypeId in (4,5,6,7,8,9,24)) as EditCount,
+    count(*) filter (where ph.PostHistoryTypeId = 10) as CloseVotesCount,
+    max(ph.CreationDate) filter (where ph.PostHistoryTypeId in (4,5,6,7,8,9,24)) as LastEditDate,
+    max(ph.CreationDate) as LastPHDate
+  from PostHistory ph
+  group by ph.PostId
+),
+dup_links as (
+  select
+    pl.PostId as DuplicateOf,
+    count(*) filter (where pl.LinkTypeId = 3) as DuplicateCount,
+    count(*) filter (where pl.LinkTypeId = 1) as LinkedCount
+  from PostLinks pl
+  group by pl.PostId
+),
+owner as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate as UserCreationDate,
+    u.Location,
+    u.UpVotes as UserUpVotes,
+    u.DownVotes as UserDownVotes,
+    u.Views as ProfileViews
+  from Users u
+),
+tag_explode as (
+  select
+    q.QuestionId,
+    unnest(string_to_array(substring(q.Tags, 2, greatest(length(q.Tags)-2,0)), '><')) as Tag
+  from q
+  where q.Tags is not null and q.Tags like '<%>'
+),
+tag_stats as (
+  select
+    te.QuestionId,
+    array_agg(te.Tag order by te.Tag) as TagList,
+    count(*) as TagCount
+  from tag_explode te
+  group by te.QuestionId
+),
+answer_stats as (
+  select
+    a.QuestionId,
+    count(*) as Answers,
+    avg(cast(a.AnswerScore as numeric)) as AvgAnswerScore,
+    max(a.AnswerScore) as MaxAnswerScore,
+    min(a.AnswerCreationDate) as FirstAnswerDate,
+    max(a.AnswerCreationDate) as LastAnswerDate
+  from a
+  group by a.QuestionId
+),
+answerer_rep as (
+  select
+    a.QuestionId,
+    percentile_cont(0.5) within group (order by coalesce(u.Reputation,0)) as MedianAnswererRep,
+    avg(cast(coalesce(u.Reputation,0) as numeric)) as AvgAnswererRep
+  from a
+  left join Users u on u.Id = a.AnswerOwnerId
+  group by a.QuestionId
+),
+question_activity as (
+  select
+    q.QuestionId,
+    q.Title,
+    q.OwnerUserId,
+    q.Score as QuestionScore,
+    q.ViewCount,
+    q.Tags,
+    q.CreationDate as QuestionCreationDate,
+    vs.UpVotes as QUp,
+    vs.DownVotes as QDown,
+    vs.TotalVotes as QVotes,
+    vs.BountyTotal as QBounty,
+    cm.CommentCount as QComments,
+    cm.CommentScoreSum as QCommentScoreSum,
+    ea.EditCount as QEdits,
+    ea.CloseVotesCount as QCloseVotes,
+    ea.LastEditDate as QLastEditDate,
+    dl.DuplicateCount,
+    dl.LinkedCount
+  from q
+  left join votes_per_post vs on vs.PostId = q.QuestionId
+  left join comment_metrics cm on cm.PostId = q.QuestionId
+  left join edit_activity ea on ea.PostId = q.QuestionId
+  left join dup_links dl on dl.DuplicateOf = q.QuestionId
+),
+accepted_enriched as (
+  select
+    ac.QuestionId,
+    ac.AcceptedAnswerId,
+    ac.AcceptedUserId,
+    ac.AcceptedScore,
+    ac.AcceptedCreationDate,
+    vu.UpVotes as AUp,
+    vu.DownVotes as ADown,
+    cm.CommentCount as AComments,
+    ea.EditCount as AEdits
+  from accepted ac
+  left join votes_per_post vu on vu.PostId = ac.AcceptedAnswerId
+  left join comment_metrics cm on cm.PostId = ac.AcceptedAnswerId
+  left join edit_activity ea on ea.PostId = ac.AcceptedAnswerId
+),
+owner_stats as (
+  select
+    q.OwnerUserId as UserId,
+    count(*) as QuestionsByOwner,
+    avg(cast(q.Score as numeric)) as AvgQScoreByOwner,
+    sum(coalesce(vs.UpVotes,0)) as SumQUpByOwner,
+    sum(coalesce(vs.DownVotes,0)) as SumQDownByOwner
+  from q
+  left join votes_per_post vs on vs.PostId = q.QuestionId
+  group by q.OwnerUserId
+),
+answer_owner_stats as (
+  select
+    a.AnswerOwnerId as UserId,
+    count(*) as AnswersByUser,
+    avg(cast(a.AnswerScore as numeric)) as AvgAScoreByUser
+  from a
+  group by a.AnswerOwnerId
+),
+recent_activity as (
+  select
+    q.QuestionId,
+    greatest(
+      coalesce(q.CreationDate, timestamp '1970-01-01'),
+      coalesce(ea.LastPHDate, timestamp '1970-01-01'),
+      coalesce(cm.LastCommentDate, timestamp '1970-01-01')
+    ) as LastActivityGuess
+  from q
+  left join edit_activity ea on ea.PostId = q.QuestionId
+  left join comment_metrics cm on cm.PostId = q.QuestionId
+),
+scored as (
+  select
+    qa.QuestionId,
+    qa.Title,
+    qa.OwnerUserId,
+    qa.QuestionScore,
+    qa.ViewCount,
+    qa.Tags,
+    qa.QuestionCreationDate,
+    ts.TagList,
+    ts.TagCount,
+    coalesce(ans.Answers, 0) as Answers,
+    ans.AvgAnswerScore,
+    ans.MaxAnswerScore,
+    ar.MedianAnswererRep,
+    ar.AvgAnswererRep,
+    ae.AcceptedAnswerId,
+    ae.AcceptedUserId,
+    ae.AcceptedScore,
+    ae.AcceptedCreationDate,
+    ae.AUp as AcceptedUpvotes,
+    ae.ADown as AcceptedDownvotes,
+    ae.AComments as AcceptedComments,
+    ae.AEdits as AcceptedEdits,
+    ra.LastActivityGuess,
+    case
+      when qa.ViewCount is null then null
+      when qa.ViewCount = 0 then null
+      else round(cast((qa.QUp - qa.QDown) as numeric) / nullif(qa.ViewCount,0), 6)
+    end as NetVotesPerView,
+    case when qa.QCloseVotes >= 3 then 1 else 0 end as IsLikelyClosed
+  from question_activity qa
+  left join tag_stats ts on ts.QuestionId = qa.QuestionId
+  left join answer_stats ans on ans.QuestionId = qa.QuestionId
+  left join answerer_rep ar on ar.QuestionId = qa.QuestionId
+  left join accepted_enriched ae on ae.QuestionId = qa.QuestionId
+  left join recent_activity ra on ra.QuestionId = qa.QuestionId
+),
+ranked as (
+  select
+    s.*,
+    row_number() over (order by coalesce(s.AcceptedScore, -2147483648) desc) as rn1,
+    row_number() over (partition by coalesce(cast(s.TagList as text), '') order by s.QuestionScore desc, s.ViewCount desc) as rn_by_taglist,
+    dense_rank() over (order by coalesce(s.NetVotesPerView, -1) desc) as drv
+  from scored s
+),
+combined_users as (
+  select
+    o.UserId,
+    o.DisplayName,
+    o.Reputation,
+    coalesce(os.QuestionsByOwner,0) as QuestionsByOwner,
+    os.AvgQScoreByOwner,
+    os.SumQUpByOwner,
+    os.SumQDownByOwner,
+    coalesce(aos.AnswersByUser,0) as AnswersByUser,
+    aos.AvgAScoreByUser
+  from owner o
+  left join owner_stats os on os.UserId = o.UserId
+  left join answer_owner_stats aos on aos.UserId = o.UserId
+),
+topq as (
+  select
+    r.*
+  from ranked r
+  where r.rn1 <= 100
+),
+topu as (
+  select
+    cu.*
+  from combined_users cu
+  where coalesce(cu.Reputation,0) > 0
+),
+final_union as (
+  select
+    'Q' as EntityType,
+    cast(tq.QuestionId as text) as EntityId,
+    substring(coalesce(tq.Title, ''), 1, 120) as Label,
+    tq.QuestionScore as ScoreA,
+    coalesce(tq.ViewCount,0) as ScoreB,
+    coalesce(tq.Answers,0) as ScoreC,
+    cast(tq.TagList as text) as DimA,
+    to_char(coalesce(tq.AcceptedCreationDate, tq.QuestionCreationDate), 'YYYY-MM-DD"T"HH24:MI:SS') as DimB,
+    to_char(coalesce(tq.LastActivityGuess, tq.QuestionCreationDate), 'YYYY-MM-DD"T"HH24:MI:SS') as DimC,
+    tq.IsLikelyClosed as FlagA,
+    tq.NetVotesPerView as MetricA,
+    tq.drv as RankBucket
+  from topq tq
+  union all
+  select
+    'U' as EntityType,
+    cast(tu.UserId as text) as EntityId,
+    coalesce(nullif(trim(tu.DisplayName), ''), '(unknown)') as Label,
+    coalesce(tu.Reputation,0) as ScoreA,
+    coalesce(tu.QuestionsByOwner,0) as ScoreB,
+    coalesce(tu.AnswersByUser,0) as ScoreC,
+    nullif(
+      trim(
+        regexp_replace(
+          regexp_replace(coalesce(tu.Location,''), '\s+', ' ', 'g'),
+          '[^A-Za-z0-9 ,._\-()/]', '', 'g'
+        )
+      ),
+      ''
+    ) as DimA,
+    to_char(coalesce(tu.UserCreationDate, timestamp '1970-01-01'), 'YYYY-MM-DD"T"HH24:MI:SS') as DimB,
+    null as DimC,
+    case when coalesce(tu.SumQDownByOwner,0) > coalesce(tu.SumQUpByOwner,0) then 1 else 0 end as FlagA,
+    nullif(round(cast(coalesce(tu.AvgAScoreByUser,0) as numeric), 4), cast(0 as numeric)) as MetricA,
+    width_bucket(coalesce(tu.Reputation,0), 0, 100000, 10) as RankBucket
+  from topu tu
+),
+with_gaps as (
+  select
+    fu.*,
+    lag(fu.ScoreA) over (partition by fu.EntityType order by fu.ScoreA desc, fu.EntityId) as PrevScoreA,
+    lead(fu.ScoreA) over (partition by fu.EntityType order by fu.ScoreA desc, fu.EntityId) as NextScoreA
+  from final_union fu
+),
+gap_annotated as (
+  select
+    wg.*,
+    case when wg.PrevScoreA is not null then (wg.ScoreA - wg.PrevScoreA) end as GapFromPrev,
+    case when wg.NextScoreA is not null then (wg.ScoreA - wg.NextScoreA) end as GapToNext
+  from with_gaps wg
+)
+select
+  ga.EntityType,
+  ga.EntityId,
+  ga.Label,
+  ga.ScoreA,
+  ga.ScoreB,
+  ga.ScoreC,
+  ga.DimA,
+  ga.DimB,
+  ga.DimC,
+  ga.FlagA,
+  ga.MetricA,
+  ga.RankBucket,
+  ga.GapFromPrev,
+  ga.GapToNext
+from gap_annotated ga
+where
+  (
+    ga.EntityType = 'Q'
+    and (
+      ga.ScoreA >= (
+        select percentile_cont(0.9) within group (order by coalesce(QuestionScore,0))
+        from scored
+      )
+      or coalesce(ga.FlagA,0) = 1
+      or ga.MetricA is not null
+    )
+  )
+  or (
+    ga.EntityType = 'U'
+    and (
+      ga.RankBucket >= 5
+      or ga.FlagA = 1
+      or lower(ga.Label) like '%admin%'
+    )
+  )
+order by
+  ga.EntityType asc,
+  ga.RankBucket desc,
+  ga.ScoreA desc,
+  ga.EntityId asc
+limit 500;

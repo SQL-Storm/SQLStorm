@@ -1,0 +1,308 @@
+with recent_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.location,
+    u.reputation,
+    u.creationdate,
+    u.lastaccessdate,
+    coalesce(
+      nullif(trim(split_part(coalesce(u.websiteurl, ''), '/', 3)), ''),
+      case when position('@' in coalesce(u.email, '')) > 0 then split_part(coalesce(u.email, ''), '@', 2) else null end,
+      'unknown'
+    ) as domain_hint
+  from users u
+  where u.creationdate >= (
+    select max(creationdate) - interval '365 days' from users
+  )
+),
+tagged_questions as (
+  select
+    p.id as question_id,
+    p.owneruserid,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.favoritecount,
+    p.answercount,
+    p.title,
+    p.tags,
+    array_length(string_to_array(substring(p.tags, 2, greatest(length(p.tags) - 2, 0)), '><'), 1) as tag_count
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= (
+      select max(creationdate) - interval '365 days' from posts where posttypeid = 1
+    )
+    and (p.closeddate is null or p.closeddate > p.creationdate + interval '1 day')
+),
+answers as (
+  select
+    a.id as answer_id,
+    a.parentid as question_id,
+    a.owneruserid as answer_owner_id,
+    a.creationdate as answer_date,
+    a.score as answer_score
+  from posts a
+  where a.posttypeid = 2
+),
+first_answer as (
+  select
+    question_id,
+    min(answer_date) as first_answer_date,
+    (
+      select a2.answer_owner_id
+      from answers a2
+      where a2.question_id = answers.question_id
+      order by a2.answer_date asc
+      limit 1
+    ) as first_answerer_id
+  from answers
+  group by question_id
+),
+vote_aggs as (
+  select
+    v.postid,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.votetypeid = 8 then coalesce(v.bountyamount, 0) else 0 end) as bounty_started,
+    sum(case when v.votetypeid = 9 then coalesce(v.bountyamount, 0) else 0 end) as bounty_awarded,
+    count(*) filter (where v.votetypeid in (2,3)) as total_votes
+  from votes v
+  group by v.postid
+),
+comment_pulse as (
+  select
+    c.postid,
+    count(*) as comment_count,
+    max(c.creationdate) as last_comment_date,
+    sum(case when c.score >= 5 then 1 else 0 end) as high_impact_comments
+  from comments c
+  where c.creationdate >= (
+    select max(creationdate) - interval '365 days' from comments
+  )
+  group by c.postid
+),
+history_flags as (
+  select
+    ph.postid,
+    max(case when ph.posthistorytypeid in (10,35) then 1 else 0 end) as was_closed_or_migrated,
+    max(case when ph.posthistorytypeid = 11 then 1 else 0 end) as was_reopened,
+    max(case when ph.posthistorytypeid in (12,13) then 1 else 0 end) as was_deleted_or_undeleted,
+    max(case when ph.posthistorytypeid = 50 then 1 else 0 end) as community_bump
+  from posthistory ph
+  group by ph.postid
+),
+dup_links as (
+  select
+    pl.postid as question_id,
+    count(*) filter (where pl.linktypeid = 3) as duplicate_links,
+    count(*) filter (where pl.linktypeid = 1) as linked_links
+  from postlinks pl
+  group by pl.postid
+),
+tag_stats as (
+  select
+    tq.question_id,
+    sum(t.count) as sum_tag_popularity,
+    avg(cast(t.count as numeric)) as avg_tag_popularity,
+    max(t.count) as max_tag_popularity
+  from tagged_questions tq
+  cross join lateral (
+    select unnest(string_to_array(substring(tq.tags, 2, greatest(length(tq.tags) - 2, 0)), '><')) as tag_name
+  ) utt
+  left join tags t
+    on lower(t.tagname) = lower(utt.tag_name)
+  group by tq.question_id
+),
+user_badges as (
+  select
+    b.userid,
+    sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+    sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+    sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+    sum(case when b.tagbased = 1 then 1 else 0 end) as tag_badges
+  from badges b
+  group by b.userid
+),
+question_enriched as (
+  select
+    tq.question_id,
+    tq.owneruserid,
+    tq.creationdate,
+    tq.score,
+    tq.viewcount,
+    tq.favoritecount,
+    tq.answercount,
+    tq.title,
+    tq.tags,
+    tq.tag_count,
+    fs.first_answer_date,
+    fs.first_answerer_id,
+    va.upvotes,
+    va.downvotes,
+    va.bounty_started,
+    va.bounty_awarded,
+    coalesce(va.total_votes, 0) as total_votes,
+    cp.comment_count,
+    cp.last_comment_date,
+    cp.high_impact_comments,
+    hf.was_closed_or_migrated,
+    hf.was_reopened,
+    hf.was_deleted_or_undeleted,
+    hf.community_bump,
+    dl.duplicate_links,
+    dl.linked_links,
+    ts.sum_tag_popularity,
+    ts.avg_tag_popularity,
+    ts.max_tag_popularity
+  from tagged_questions tq
+  left join first_answer fs on fs.question_id = tq.question_id
+  left join vote_aggs va on va.postid = tq.question_id
+  left join comment_pulse cp on cp.postid = tq.question_id
+  left join history_flags hf on hf.postid = tq.question_id
+  left join dup_links dl on dl.question_id = tq.question_id
+  left join tag_stats ts on ts.question_id = tq.question_id
+),
+user_enriched as (
+  select
+    ru.user_id,
+    ru.displayname,
+    ru.location,
+    ru.reputation,
+    ru.creationdate as user_created,
+    ru.lastaccessdate as user_last_access,
+    ru.domain_hint,
+    ub.gold_badges,
+    ub.silver_badges,
+    ub.bronze_badges,
+    ub.tag_badges,
+    coalesce(ub.gold_badges, 0) + coalesce(ub.silver_badges, 0) + coalesce(ub.bronze_badges, 0) as total_badges
+  from recent_users ru
+  left join user_badges ub on ub.userid = ru.user_id
+),
+activity_by_user as (
+  select
+    ue.user_id,
+    count(distinct qe.question_id) as questions_asked,
+    sum(coalesce(qe.answercount, 0)) as answers_received,
+    sum(coalesce(qe.upvotes, 0)) as question_upvotes,
+    sum(coalesce(qe.downvotes, 0)) as question_downvotes,
+    sum(coalesce(qe.bounty_awarded, 0)) as bounties_awarded_on_questions,
+    avg(nullif(qe.viewcount, 0)) as avg_views_per_question,
+    max(qe.creationdate) as last_question_date
+  from user_enriched ue
+  left join question_enriched qe on qe.owneruserid = ue.user_id
+  group by ue.user_id
+),
+answer_activity as (
+  select
+    a.answer_owner_id as user_id,
+    count(*) as answers_posted,
+    avg(a.answer_score) as avg_answer_score,
+    max(a.answer_date) as last_answer_date
+  from answers a
+  where a.answer_date >= (
+    select max(creationdate) - interval '365 days' from posts where posttypeid = 2
+  )
+  group by a.answer_owner_id
+),
+combined as (
+  select
+    ue.user_id,
+    ue.displayname,
+    ue.location,
+    ue.reputation,
+    ue.user_created,
+    ue.user_last_access,
+    ue.domain_hint,
+    ue.gold_badges,
+    ue.silver_badges,
+    ue.bronze_badges,
+    ue.tag_badges,
+    ue.total_badges,
+    abu.questions_asked,
+    abu.answers_received,
+    abu.question_upvotes,
+    abu.question_downvotes,
+    abu.bounties_awarded_on_questions,
+    abu.avg_views_per_question,
+    abu.last_question_date,
+    aa.answers_posted,
+    aa.avg_answer_score,
+    aa.last_answer_date
+  from user_enriched ue
+  left join activity_by_user abu on abu.user_id = ue.user_id
+  left join answer_activity aa on aa.user_id = ue.user_id
+),
+ranked as (
+  select
+    c.*,
+    coalesce(questions_asked, 0) + coalesce(answers_posted, 0) as posts_last_year,
+    coalesce(question_upvotes, 0) - coalesce(question_downvotes, 0) as net_question_votes,
+    case
+      when coalesce(questions_asked, 0) = 0 then null
+      else (coalesce(answers_received, 0) * 1.0 / nullif(questions_asked, 0))
+    end as ans_per_question_ratio,
+    percentile_disc(0.9) within group (order by coalesce(avg_views_per_question, 0)) over () as p90_avg_views,
+    row_number() over (order by coalesce(reputation, 0) desc, coalesce(total_badges, 0) desc, coalesce(answers_posted, 0) desc) as rep_rank,
+    dense_rank() over (order by coalesce(posts_last_year, 0) desc) as activity_rank,
+    ntile(10) over (order by coalesce(net_question_votes, 0) desc) as vote_decile
+  from combined c
+),
+normalized as (
+  select
+    r.*,
+    case when p90_avg_views > 0 then least(coalesce(avg_views_per_question, 0) / p90_avg_views, 1) else 0 end as views_score_norm,
+    case when reputation > 0 then ln(reputation + 1) / ln((select greatest(max(reputation), 1) from users)) else 0 end as rep_score_norm,
+    case when total_badges > 0 then (gold_badges * 3 + silver_badges * 2 + bronze_badges * 1) * 1.0 / (total_badges * 3) else 0 end as badge_mix_norm,
+    case when posts_last_year > 0 then (ln(posts_last_year + 9) / ln(10)) / 2 else 0 end as activity_norm,
+    case when net_question_votes is null then 0 when net_question_votes < 0 then 0 else least(net_question_votes, 50) * 1.0 / 50 end as sentiment_norm
+  from ranked r
+),
+scored as (
+  select
+    n.*,
+    (
+      0.35 * rep_score_norm +
+      0.20 * activity_norm +
+      0.15 * views_score_norm +
+      0.20 * badge_mix_norm +
+      0.10 * sentiment_norm
+    ) as composite_score
+  from normalized n
+),
+top_users as (
+  select
+    s.*,
+    row_number() over (order by composite_score desc nulls last) as overall_rank
+  from scored s
+)
+select
+  tu.overall_rank,
+  tu.user_id,
+  tu.displayname,
+  tu.location,
+  tu.domain_hint,
+  tu.reputation,
+  tu.total_badges,
+  tu.gold_badges,
+  tu.silver_badges,
+  tu.bronze_badges,
+  coalesce(tu.questions_asked, 0) as questions_asked,
+  coalesce(tu.answers_posted, 0) as answers_posted,
+  round(coalesce(tu.ans_per_question_ratio, 0), 3) as ans_per_question_ratio,
+  coalesce(tu.avg_answer_score, 0) as avg_answer_score,
+  coalesce(tu.avg_views_per_question, 0) as avg_views_per_question,
+  tu.vote_decile,
+  tu.rep_rank,
+  tu.activity_rank,
+  round(tu.composite_score, 4) as composite_score,
+  case
+    when tu.last_question_date is null and tu.last_answer_date is null then 'no activity'
+    when greatest(coalesce(tu.last_question_date, timestamp 'epoch'), coalesce(tu.last_answer_date, timestamp 'epoch')) >= timestamp '2024-10-01 12:34:56' - interval '30 days' then 'active_30d'
+    when greatest(coalesce(tu.last_question_date, timestamp 'epoch'), coalesce(tu.last_answer_date, timestamp 'epoch')) >= timestamp '2024-10-01 12:34:56' - interval '90 days' then 'active_90d'
+    else 'stale'
+  end as recency_bucket
+from top_users tu
+where tu.overall_rank <= 250
+order by tu.overall_rank;

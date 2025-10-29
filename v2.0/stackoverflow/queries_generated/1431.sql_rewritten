@@ -1,0 +1,221 @@
+-- {"query": "1431.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3769} 
+WITH UserEngagementSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.CreationDate AS UserCreationDate,
+        u.Reputation,
+        u.Views AS UserProfileViews,
+        u.UpVotes AS UserUpVotes,
+        u.DownVotes AS UserDownVotes,
+        u.Location,
+        u.AboutMe,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COALESCE(AVG(p.Score), 0) AS AveragePostScore,
+        COALESCE(SUM(p.ViewCount), 0) AS TotalPostViewCount,
+        MAX(p.CreationDate) AS LatestPostDate,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        MAX(c.CreationDate) AS LatestCommentDate,
+        -- Complicated calculation: Reputation per day active, handling potential division by zero
+        u.Reputation / NULLIF(EXTRACT(DAY FROM (cast('2024-10-01 12:34:56' as timestamp) - u.CreationDate)) + 1, 0) AS ReputationPerDay,
+        -- Correlated subquery: Get the maximum score of any question owned by this user
+        (SELECT MAX(s.Score) FROM Posts s WHERE s.OwnerUserId = u.Id AND s.PostTypeId = 1) AS MaxQuestionScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    GROUP BY u.Id, u.CreationDate, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.Location, u.AboutMe
+),
+PostHistoryDetails AS (
+    SELECT
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate AS HistoryDate,
+        ph.UserId AS HistoryEditorUserId,
+        crt.Name AS CloseReasonName,
+        -- Window function: Get the creation date of the previous history event for the same post
+        LAG(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS PreviousHistoryDate,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn_latest_history_event, -- Rank for latest history event
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId, ph.PostHistoryTypeId ORDER BY ph.CreationDate DESC) AS rn_latest_history_type -- Rank for latest history event of a specific type (e.g., latest close)
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON ph.PostHistoryTypeId = 10 AND ph.Comment = crt.Id::varchar
+),
+PostEditAndCloseMetrics_Agg AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        MAX(phd.HistoryDate) AS LastEditOrHistoryDate,
+        -- Complicated predicate: Count specific types of edits (Title, Body, Tags)
+        COUNT(CASE WHEN phd.PostHistoryTypeId IN (4, 5, 6) THEN phd.PostId END) AS EditCount,
+        -- Count duplicate close votes
+        SUM(CASE WHEN phd.PostHistoryTypeId = 10 AND phd.CloseReasonName = 'Duplicate' THEN 1 ELSE 0 END) AS DuplicateCloseCount,
+        -- Complicated calculation: Average time between all history events for the post, filtering out first event
+        AVG(EXTRACT(EPOCH FROM (phd.HistoryDate - phd.PreviousHistoryDate))) FILTER (WHERE phd.PreviousHistoryDate IS NOT NULL) AS AvgTimeBetweenHistorySeconds,
+        -- Window function: Rank questions by score and view count within their creation year
+        MAX(CASE WHEN p.PostTypeId = 1 THEN RANK() OVER (PARTITION BY p.PostTypeId, EXTRACT(YEAR FROM p.CreationDate) ORDER BY p.Score DESC, p.ViewCount DESC) ELSE NULL END) AS QuestionRankByScoreInYear,
+        -- Correlated subquery: Get the latest close reason for this post if it was closed
+        (SELECT CloseReasonName FROM PostHistoryDetails WHERE PostId = p.Id AND PostHistoryTypeId = 10 AND rn_latest_history_type = 1 ORDER BY HistoryDate DESC LIMIT 1) AS LatestCloseReasonForPost
+    FROM Posts p
+    LEFT JOIN PostHistoryDetails phd ON p.Id = phd.PostId
+    GROUP BY p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Title, p.Tags, p.Score, p.ViewCount
+),
+TagInsight AS (
+    SELECT
+        unnest_tag.TagName,
+        COUNT(p.Id) AS TagPostCount,
+        COALESCE(AVG(p.Score), 0) AS AvgTagScore,
+        COUNT(DISTINCT p.OwnerUserId) AS UniqueTagUsers,
+        MAX(p.CreationDate) AS LatestTagPostDate
+    FROM Posts p
+    -- String expression and UNNEST for tags, then LATERAL join for performance
+    JOIN LATERAL unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS unnest_tag(TagName) ON true
+    WHERE p.Tags IS NOT NULL AND p.Tags != '' AND p.PostTypeId = 1 -- Only analyze tags on questions
+    GROUP BY unnest_tag.TagName
+),
+QuestionAnswerDetails AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.OwnerUserId AS QuestionOwnerId,
+        q.CreationDate AS QuestionCreationDate,
+        q.Score AS QuestionScore,
+        q.AcceptedAnswerId,
+        a.CreationDate AS AcceptedAnswerCreationDate,
+        a.Score AS AcceptedAnswerScore,
+        a.OwnerUserId AS AcceptedAnswerOwnerId,
+        -- Complicated calculation: Time to accept an answer in hours
+        EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate)) / 3600.0 AS TimeToAcceptAnswerHours,
+        (a.Score - q.Score) AS ScoreDifference
+    FROM Posts q
+    JOIN Posts a ON q.AcceptedAnswerId = a.Id
+    WHERE q.PostTypeId = 1 AND q.AcceptedAnswerId IS NOT NULL
+)
+SELECT
+    ues.UserId,
+    u.DisplayName,
+    ues.Reputation,
+    ues.ReputationPerDay,
+    ues.TotalPosts,
+    ues.TotalQuestions,
+    ues.TotalAnswers,
+    ues.AveragePostScore,
+    ues.MaxQuestionScore,
+    COALESCE(ues.Location, 'Unknown') AS UserLocation, -- NULL logic
+    SUBSTRING(COALESCE(ues.AboutMe, ''), 1, 100) AS AboutMeSnippet, -- String expression with NULL handling
+    COUNT(b.Id) AS TotalBadges,
+    SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+    SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+    SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+    -- Max edit count for user's questions
+    MAX(pec_agg.EditCount) FILTER (WHERE pec_agg.PostTypeId = 1) AS MaxQuestionEditsByUser,
+    -- Average time between history events for user's questions
+    AVG(pec_agg.AvgTimeBetweenHistorySeconds) FILTER (WHERE pec_agg.PostTypeId = 1) AS AvgTimeBetweenQuestionHistoryByUser,
+    -- Average time for user's accepted answers and score difference, using OUTER JOIN logic
+    COALESCE(AVG(qad.TimeToAcceptAnswerHours) FILTER (WHERE qad.AcceptedAnswerOwnerId = ues.UserId), 0) AS AvgTimeToAcceptForUserAnswers,
+    COALESCE(AVG(qad.ScoreDifference) FILTER (WHERE qad.AcceptedAnswerOwnerId = ues.UserId), 0) AS AvgScoreDiffForUserAnswers,
+    -- Correlated subquery: Identify the user's most used tag and provide its global statistics
+    (
+        SELECT ti.TagName || ' (Global Avg Score: ' || ti.AvgTagScore::varchar || ', Posts: ' || ti.TagPostCount::varchar || ')'
+        FROM TagInsight ti
+        JOIN (
+            SELECT
+                unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS TagName,
+                COUNT(p.Id) AS UserTagPostCount
+            FROM Posts p
+            WHERE p.OwnerUserId = ues.UserId AND p.Tags IS NOT NULL AND p.Tags != '' AND p.PostTypeId = 1
+            GROUP BY unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'))
+            ORDER BY UserTagPostCount DESC, TagName
+            LIMIT 1
+        ) AS UserTopTag ON ti.TagName = UserTopTag.TagName
+    ) AS TopUsedTagWithStats,
+    -- Correlated subquery: Sum of scores of posts linked *from* this user's questions
+    (
+        SELECT SUM(rp.Score)
+        FROM Posts p_q
+        JOIN PostLinks pl ON p_q.Id = pl.PostId
+        JOIN Posts rp ON pl.RelatedPostId = rp.Id
+        WHERE p_q.OwnerUserId = ues.UserId AND p_q.PostTypeId = 1 AND pl.LinkTypeId = 1 AND rp.Score > 0
+    ) AS SumOfLinkedPostScores,
+    -- Window function: Divide users into 10 deciles based on combined reputation, posts, and average score
+    NTILE(10) OVER (ORDER BY ues.Reputation DESC, ues.TotalPosts DESC, ues.AveragePostScore DESC) AS ReputationDecile,
+    -- Complicated predicate/expression: Classify user role based on activity and reputation
+    CASE
+        WHEN ues.TotalQuestions > 0 AND ues.TotalAnswers > 0 AND ues.Reputation > 1000 AND u.LastAccessDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '90 days' THEN 'Proactive Contributor'
+        WHEN ues.TotalQuestions > 0 AND ues.TotalAnswers > 0 THEN 'General Contributor'
+        WHEN ues.TotalQuestions > 0 THEN 'Questioner'
+        WHEN ues.TotalAnswers > 0 THEN 'Answerer'
+        WHEN u.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days' THEN 'New User'
+        ELSE 'Lurker / Inactive'
+    END AS UserRoleClassification,
+    COALESCE(NULLIF(TRIM(ues.AboutMe), ''), 'No "About Me" provided') AS AboutMeContentIndicator, -- NULL logic, string expression
+    u.LastAccessDate,
+    MAX(pec_agg.DuplicateCloseCount) FILTER (WHERE pec_agg.PostTypeId = 1) AS UserQuestionDuplicateCloseCount,
+    -- Correlated subquery: Get the latest close reason for any of the user's posts
+    (
+        SELECT pec_agg_sub.LatestCloseReasonForPost
+        FROM PostEditAndCloseMetrics_Agg pec_agg_sub
+        WHERE pec_agg_sub.OwnerUserId = u.Id AND pec_agg_sub.LatestCloseReasonForPost IS NOT NULL
+        ORDER BY pec_agg_sub.LastEditOrHistoryDate DESC
+        LIMIT 1
+    ) AS LatestCloseReasonForUserPosts
+FROM Users u
+JOIN UserEngagementSummary ues ON u.Id = ues.UserId -- Main join with user activity summary
+LEFT JOIN Badges b ON u.Id = b.UserId -- Outer join for badges
+LEFT JOIN PostEditAndCloseMetrics_Agg pec_agg ON u.Id = pec_agg.OwnerUserId -- Outer join for post history metrics for user's posts
+LEFT JOIN QuestionAnswerDetails qad ON u.Id = qad.QuestionOwnerId OR u.Id = qad.AcceptedAnswerOwnerId -- Outer join for question/answer details
+WHERE u.Reputation > 100 OR ues.TotalPosts > 0 OR ues.TotalComments > 0 -- Filter for active or somewhat reputable users
+GROUP BY ues.UserId, u.DisplayName, ues.Reputation, ues.ReputationPerDay, ues.TotalPosts, ues.TotalQuestions, ues.TotalAnswers, ues.AveragePostScore, ues.MaxQuestionScore, ues.Location, ues.AboutMe, u.LastAccessDate
+
+UNION ALL -- Set operator: Combine the previous result with a separate query for high-reputation influencers
+
+-- Second part: Users with high reputation (potential moderators/influencers) and specific badge classes.
+-- This part focuses on a distinct group and different metrics, potentially less activity but high influence.
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.Reputation / NULLIF(EXTRACT(DAY FROM (cast('2024-10-01 12:34:56' as timestamp) - u.CreationDate)) + 1, 0) AS ReputationPerDay,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    COALESCE(AVG(p.Score), 0) AS AveragePostScore,
+    (SELECT MAX(s.Score) FROM Posts s WHERE s.OwnerUserId = u.Id AND s.PostTypeId = 1) AS MaxQuestionScore,
+    COALESCE(u.Location, 'Unknown') AS UserLocation,
+    SUBSTRING(COALESCE(u.AboutMe, ''), 1, 100) AS AboutMeSnippet,
+    COUNT(b.Id) AS TotalBadges,
+    SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+    SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+    SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+    0 AS MaxQuestionEditsByUser, -- Not directly calculated in this branch
+    NULL AS AvgTimeBetweenQuestionHistoryByUser, -- Not directly calculated in this branch
+    0 AS AvgTimeToAcceptForUserAnswers, -- Not directly calculated in this branch
+    0 AS AvgScoreDiffForUserAnswers, -- Not directly calculated in this branch
+    NULL AS TopUsedTagWithStats, -- Not directly calculated in this branch
+    NULL AS SumOfLinkedPostScores, -- Not directly calculated in this branch
+    NULL AS ReputationDecile, -- NTILE not applicable across UNION, calculated only in first branch
+    'High-Rep Influencer' AS UserRoleClassification, -- Specific role for this branch
+    COALESCE(NULLIF(TRIM(u.AboutMe), ''), 'No "About Me" provided') AS AboutMeContentIndicator,
+    u.LastAccessDate,
+    0 AS UserQuestionDuplicateCloseCount,
+    -- Correlated subquery: Latest post close reason where this user was the editor (e.g., moderator who closed it)
+    (
+        SELECT phd.CloseReasonName
+        FROM PostHistoryDetails phd
+        WHERE phd.HistoryEditorUserId = u.Id AND phd.PostHistoryTypeId = 10
+        ORDER BY phd.HistoryDate DESC
+        LIMIT 1
+    ) AS LatestCloseReasonForUserPosts
+FROM Users u
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+-- Complicated predicate: High reputation users with at least one gold badge
+WHERE u.Reputation >= 10000 AND EXISTS (SELECT 1 FROM Badges b_sub WHERE b_sub.UserId = u.Id AND b_sub.Class = 1)
+GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location, u.AboutMe, u.LastAccessDate
+HAVING SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) > 0 OR u.Reputation >= 50000 -- Ensure they have gold badges or very high rep
+ORDER BY Reputation DESC, LastAccessDate DESC
+LIMIT 1000;

@@ -1,0 +1,92 @@
+WITH
+ActivePosts AS (
+  SELECT p.Id,
+         p.PostTypeId,
+         p.OwnerUserId,
+         p.Score,
+         p.ViewCount,
+         p.CreationDate,
+         p.LastActivityDate,
+         p.Title,
+         p.Tags,
+         p.AnswerCount,
+         p.CommentCount,
+         p.FavoriteCount
+  FROM Posts p
+  WHERE p.PostTypeId IN (1,2)
+),
+PostTags AS (
+  SELECT ap.Id AS PostId,
+         TRIM(BOTH '<>' FROM NULLIF(SUBSTRING(ap.Tags FROM 1 FOR (CASE WHEN POSITION('><' IN ap.Tags) = 0 THEN CHAR_LENGTH(ap.Tags) ELSE POSITION('><' IN ap.Tags)-1 END)), '')) AS TagName,
+         CASE WHEN POSITION('><' IN ap.Tags) = 0 THEN '' ELSE SUBSTRING(ap.Tags FROM POSITION('><' IN ap.Tags)+2) END AS Remainder
+  FROM ActivePosts ap
+  WHERE ap.Tags IS NOT NULL AND ap.Tags <> ''
+  UNION ALL
+  SELECT pt.PostId,
+         TRIM(BOTH '<>' FROM NULLIF(SUBSTRING(pt.Remainder FROM 1 FOR (CASE WHEN POSITION('><' IN pt.Remainder) = 0 THEN CHAR_LENGTH(pt.Remainder) ELSE POSITION('><' IN pt.Remainder)-1 END)), '')) AS TagName,
+         CASE WHEN POSITION('><' IN pt.Remainder) = 0 THEN '' ELSE SUBSTRING(pt.Remainder FROM POSITION('><' IN pt.Remainder)+2) END AS Remainder
+  FROM PostTags pt
+  WHERE pt.Remainder IS NOT NULL AND pt.Remainder <> ''
+),
+TagStats AS (
+  SELECT pt.TagName,
+         COUNT(*) AS TagPostCount,
+         AVG(p.Score) AS AvgScore,
+         SUM(p.ViewCount) AS TotalViews
+  FROM PostTags pt
+  JOIN Posts p ON p.Id = pt.PostId
+  LEFT JOIN Tags t ON t.TagName = pt.TagName
+  GROUP BY pt.TagName
+),
+TopTags AS (
+  SELECT TagName,
+         TagPostCount,
+         AvgScore,
+         TotalViews,
+         ROW_NUMBER() OVER (ORDER BY TagPostCount DESC, AvgScore DESC) AS rn
+  FROM TagStats
+)
+SELECT
+  a.Id AS PostId,
+  a.PostTypeId,
+  a.OwnerUserId,
+  u.DisplayName AS OwnerDisplayName,
+  a.Title,
+  a.Tags,
+  a.Score,
+  a.ViewCount,
+  a.CreationDate,
+  a.LastActivityDate,
+  a.AnswerCount,
+  a.CommentCount,
+  a.FavoriteCount,
+  COALESCE(vt.VoteCount, 0) AS VoteCount,
+  vb.TotalBadges,
+  tg.TagName,
+  s.AvgScore AS TagAvgScore,
+  s.TotalViews AS TagTotalViews
+FROM ActivePosts a
+LEFT JOIN Users u ON a.OwnerUserId = u.Id
+LEFT JOIN (
+  SELECT PostId, COUNT(*) AS VoteCount
+  FROM Votes
+  WHERE VoteTypeId IN (2,3)
+  GROUP BY PostId
+) vt ON a.Id = vt.PostId
+LEFT JOIN (
+  SELECT UserId, COUNT(*) AS TotalBadges
+  FROM Badges
+  GROUP BY UserId
+) vb ON a.OwnerUserId = vb.UserId
+LEFT JOIN (
+  SELECT tt.TagName
+  FROM TopTags tt
+  WHERE tt.rn = 1
+) tg ON tg.TagName IS NOT NULL
+LEFT JOIN (
+  SELECT tt.TagName, tt.TagPostCount, tt.AvgScore, tt.TotalViews
+  FROM TopTags tt
+  WHERE tt.rn = 1
+) s ON s.TagName = tg.TagName
+ORDER BY a.CreationDate DESC
+LIMIT 100;

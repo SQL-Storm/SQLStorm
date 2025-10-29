@@ -1,0 +1,120 @@
+-- {"query": "1885.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1496} 
+
+WITH InterestingQuestions AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title AS QuestionTitle,
+        p.OwnerUserId,
+        p.CreationDate AS QuestionCreationDate,
+        p.Score AS QuestionScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.Tags,
+        p.AcceptedAnswerId,
+        -- Non-correlated subquery to fetch initial vote counts for questions
+        (SELECT COUNT(v.Id) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS QuestionUpvotes,
+        (SELECT COUNT(v.Id) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS QuestionDownvotes,
+        CASE
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN TRUE
+            ELSE FALSE
+        END AS HasAcceptedAnswer
+    FROM Posts p
+    WHERE
+        p.PostTypeId = 1 -- Only questions
+        AND p.CreationDate >= (CURRENT_TIMESTAMP - INTERVAL '3 year') -- Questions from the last 3 years
+        AND p.ViewCount >= 1000 -- Popular questions
+        AND p.Score >= 5 -- Well-received questions
+        AND p.Tags IS NOT NULL -- Must have tags
+        AND p.AnswerCount > 0 -- Must have at least one answer
+),
+PostVoteAggregates AS (
+    -- Aggregate total upvotes, downvotes, and favorites for all relevant posts
+    SELECT
+        v.PostId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotes,
+        SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS TotalFavorites
+    FROM Votes v
+    WHERE v.VoteTypeId IN (2, 3, 5)
+    GROUP BY v.PostId
+),
+ControversialPostHistoryEvents AS (
+    -- Identify specific controversial events from post history
+    SELECT
+        ph.PostId,
+        ph.CreationDate AS EventDate,
+        ph.UserId AS EventUserId,
+        ph.PostHistoryTypeId,
+        ph.Comment,
+        cr.Name AS CloseReasonTypeName,
+        CASE
+            WHEN ph.PostHistoryTypeId IN (10, 101, 102, 103, 104, 105) THEN 'Closed'
+            WHEN ph.PostHistoryTypeId = 11 THEN 'Reopened'
+            WHEN ph.PostHistoryTypeId = 12 THEN 'Deleted'
+            WHEN ph.PostHistoryTypeId = 13 THEN 'Undeleted'
+            WHEN ph.PostHistoryTypeId = 19 THEN 'Protected'
+            WHEN ph.PostHistoryTypeId = 20 THEN 'Unprotected'
+            WHEN ph.PostHistoryTypeId IN (35, 36) THEN 'Migrated'
+            ELSE 'Other_Controversy'
+        END AS EventCategory
+    FROM PostHistory ph
+    -- LEFT JOIN to CloseReasonTypes for close reasons (NULL if not a close event)
+    LEFT JOIN CloseReasonTypes cr ON ph.PostHistoryTypeId = 10 AND ph.Comment = CAST(cr.Id AS VARCHAR(400))
+    WHERE
+        ph.PostHistoryTypeId IN (10, 11, 12, 13, 19, 20, 35, 36, 101, 102, 103, 104, 105) -- Specific event types
+        AND ph.CreationDate >= (CURRENT_TIMESTAMP - INTERVAL '2 year') -- Recent events
+),
+HighlyEngagingPosts AS (
+    -- Combine "controversial" questions and "highly downvoted" answers using UNION ALL
+    SELECT
+        iq.QuestionId AS PostId,
+        iq.QuestionTitle AS PostTitle,
+        iq.CreationDate,
+        iq.OwnerUserId AS OriginalOwnerUserId,
+        COALESCE(pva.TotalUpvotes, 0) AS TotalUpvotes,
+        COALESCE(pva.TotalDownvotes, 0) AS TotalDownvotes,
+        COALESCE(pva.TotalFavorites, 0) AS TotalFavorites,
+        'Question_Controversial_History' AS PostCategory,
+        1 AS PostTypeIdIdentifier, -- Identifier for questions
+        iq.Tags,
+        iq.HasAcceptedAnswer,
+        -- Correlated subquery to find the most frequent close reason if the question was closed
+        (
+            SELECT cr_sub.Name
+            FROM ControversialPostHistoryEvents cph_sub
+            JOIN CloseReasonTypes cr_sub ON cph_sub.Comment = CAST(cr_sub.Id AS VARCHAR(400))
+            WHERE cph_sub.PostId = iq.QuestionId
+            AND cph_sub.EventCategory = 'Closed'
+            GROUP BY cr_sub.Name
+            ORDER BY COUNT(*) DESC
+            LIMIT 1
+        ) AS MostFrequentCloseReason
+    FROM InterestingQuestions iq
+    LEFT JOIN PostVoteAggregates pva ON iq.QuestionId = pva.PostId
+    WHERE EXISTS ( -- Only include questions with some controversial history
+        SELECT 1
+        FROM ControversialPostHistoryEvents cpe
+        WHERE cpe.PostId = iq.QuestionId
+        AND cpe.EventCategory IN ('Closed', 'Deleted', 'Reopened', 'Protected', 'Migrated')
+    )
+
+    UNION ALL
+
+    SELECT
+        ans.Id AS PostId,
+        COALESCE(ans.Title, 'Answer to: ' || SUBSTRING(pq.Title, 1, 40) || '...') AS PostTitle, -- Fallback title for answers
+        ans.CreationDate,
+        ans.OwnerUserId AS OriginalOwnerUserId,
+        COALESCE(pva.TotalUpvotes, 0) AS TotalUpvotes,
+        COALESCE(pva.TotalDownvotes, 0) AS TotalDownvotes,
+        COALESCE(pva.TotalFavorites, 0) AS TotalFavorites,
+        'Answer_High_Downvote_Ratio' AS PostCategory,
+        2 AS PostTypeIdIdentifier, -- Identifier for answers
+        NULL AS Tags, -- Answers do not have tags
+        FALSE AS HasAcceptedAnswer,
+        NULL AS MostFrequentCloseReason
+    FROM Posts ans
+    JOIN Posts pq ON ans.ParentId = pq.Id -- Join to get parent question title
+    LEFT JOIN PostVoteAggregates pva ON ans.Id = pva.PostId
+    WHERE

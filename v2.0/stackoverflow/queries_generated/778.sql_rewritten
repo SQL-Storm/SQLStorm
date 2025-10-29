@@ -1,0 +1,369 @@
+-- {"query": "778.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3880} 
+with recent_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.location,
+    coalesce(nullif(trim(u.websiteurl), ''), 'N/A') as websiteurl_norm,
+    date_trunc('month', u.creationdate) as cohort_month
+  from users u
+  where u.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+),
+badge_rollup as (
+  select
+    b.userid,
+    count(*) as total_badges,
+    sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+    sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+    sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+    sum(case when b.tagbased = 1 then 1 else 0 end) as tag_based_badges,
+    min(b.date) as first_badge_date,
+    max(b.date) as last_badge_date
+  from badges b
+  group by b.userid
+),
+user_posts as (
+  select
+    p.owneruserid as user_id,
+    count(*) filter (where p.posttypeid = 1) as q_count,
+    count(*) filter (where p.posttypeid = 2) as a_count,
+    count(*) filter (where p.posttypeid not in (1,2) or p.posttypeid is null) as other_count,
+    sum(coalesce(p.score,0)) as total_post_score,
+    sum(coalesce(p.viewcount,0)) as total_views,
+    max(p.creationdate) as last_post_date
+  from posts p
+  where p.owneruserid is not null
+  group by p.owneruserid
+),
+user_votes as (
+  select
+    v.userid as user_id,
+    count(*) filter (where v.votetypeid = 2) as upvotes_cast,
+    count(*) filter (where v.votetypeid = 3) as downvotes_cast,
+    count(*) filter (where v.votetypeid = 5) as favorites_cast,
+    count(*) filter (where v.votetypeid in (8,9)) as bounties_interactions,
+    sum(coalesce(v.bountyamount,0)) filter (where v.votetypeid in (8,9)) as total_bounty_amount
+  from votes v
+  where v.userid is not null
+  group by v.userid
+),
+post_engagement as (
+  select
+    p.owneruserid as user_id,
+    count(distinct c.id) as comment_count_received,
+    count(distinct v.id) filter (where v.votetypeid = 2) as upvotes_received,
+    count(distinct v.id) filter (where v.votetypeid = 3) as downvotes_received,
+    count(distinct v.id) filter (where v.votetypeid in (8,9)) as bounty_txn_received,
+    sum(coalesce(v.bountyamount,0)) filter (where v.votetypeid in (8,9)) as bounty_amount_received
+  from posts p
+  left join comments c on c.postid = p.id
+  left join votes v on v.postid = p.id
+  where p.owneruserid is not null
+  group by p.owneruserid
+),
+question_quality as (
+  select
+    q.owneruserid as user_id,
+    count(*) as questions_total,
+    avg(coalesce(q.score,0)) as avg_q_score,
+    percentile_cont(0.5) within group (order by coalesce(q.score,0)) as median_q_score,
+    avg(coalesce(q.viewcount,0)) as avg_q_views,
+    count(*) filter (where q.acceptedanswerid is not null) as accepted_count,
+    count(*) filter (where q.closeddate is not null) as closed_count
+  from posts q
+  where q.posttypeid = 1
+  group by q.owneruserid
+),
+answer_quality as (
+  select
+    a.owneruserid as user_id,
+    count(*) as answers_total,
+    avg(coalesce(a.score,0)) as avg_a_score,
+    percentile_cont(0.5) within group (order by coalesce(a.score,0)) as median_a_score
+  from posts a
+  where a.posttypeid = 2
+  group by a.owneruserid
+),
+dup_links as (
+  select
+    pl.postid,
+    count(*) filter (where pl.linktypeid = 3) as dup_links_out,
+    count(*) filter (where pl.linktypeid = 1) as linked_out
+  from postlinks pl
+  group by pl.postid
+),
+post_meta as (
+  select
+    p.owneruserid as user_id,
+    sum(coalesce(dl.dup_links_out,0)) as dup_links_out_sum,
+    sum(coalesce(dl.linked_out,0)) as linked_out_sum,
+    sum(case when p.tags is null then 0 else cardinality(string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')) end) as total_tag_mentions
+  from posts p
+  left join dup_links dl on dl.postid = p.id
+  where p.owneruserid is not null
+  group by p.owneruserid
+),
+post_edits as (
+  select
+    ph.userid as editor_id,
+    count(*) filter (where ph.posthistorytypeid in (4,5,6,24)) as edit_events,
+    count(distinct ph.postid) filter (where ph.posthistorytypeid in (4,5,6,24)) as edited_posts,
+    count(*) filter (where ph.posthistorytypeid in (10,11,12,13,14,15,19,20)) as mod_events,
+    min(ph.creationdate) as first_edit_date,
+    max(ph.creationdate) as last_edit_date
+  from posthistory ph
+  where ph.userid is not null
+  group by ph.userid
+),
+user_activity_timeline as (
+  select
+    u.id as user_id,
+    date_trunc('month', coalesce(p.creationdate, c.creationdate, v.creationdate, u.creationdate)) as activity_month,
+    count(distinct p.id) as posts_made,
+    count(distinct c.id) as comments_made,
+    count(distinct v.id) as votes_cast
+  from users u
+  left join posts p on p.owneruserid = u.id
+  left join comments c on c.userid = u.id
+  left join votes v on v.userid = u.id
+  group by u.id, date_trunc('month', coalesce(p.creationdate, c.creationdate, v.creationdate, u.creationdate))
+),
+activity_rank as (
+  select
+    user_id,
+    activity_month,
+    posts_made,
+    comments_made,
+    votes_cast,
+    row_number() over (partition by user_id order by posts_made desc, comments_made desc, votes_cast desc, activity_month desc) as best_month_rank
+  from user_activity_timeline
+),
+top_month as (
+  select user_id, activity_month as best_activity_month, posts_made, comments_made, votes_cast
+  from activity_rank
+  where best_month_rank = 1
+),
+tag_inference as (
+  select
+    p.owneruserid as user_id,
+    lower(trim(regexp_split_to_table(coalesce(substring(p.tags, 2, length(p.tags)-2), ''), '><'))) as tagname
+  from posts p
+  where p.posttypeid = 1
+),
+top_tags as (
+  select
+    t.user_id,
+    t.tagname,
+    count(*) as tag_hits,
+    dense_rank() over (partition by t.user_id order by count(*) desc, t.tagname asc) as tag_rank
+  from tag_inference t
+  group by t.user_id, t.tagname
+),
+top3_tags as (
+  select user_id, string_agg(tagname, ', ' order by tag_rank) as top_tags
+  from top_tags
+  where tag_rank <= 3
+  group by user_id
+),
+user_nulls as (
+  select
+    u.id as user_id,
+    case when u.displayname is null or trim(u.displayname) = '' then 1 else 0 end as has_null_displayname,
+    case when u.location is null or trim(u.location) = '' then 1 else 0 end as has_null_location,
+    case when u.websiteurl is null or trim(u.websiteurl) = '' then 1 else 0 end as has_null_website
+  from users u
+),
+quality_scores as (
+  select
+    ru.user_id,
+    coalesce(q.questions_total,0) as questions_total,
+    coalesce(a.answers_total,0) as answers_total,
+    coalesce(q.avg_q_score,0) as avg_q_score,
+    coalesce(a.avg_a_score,0) as avg_a_score,
+    coalesce(pe.upvotes_received,0) - coalesce(pe.downvotes_received,0) as net_votes_received,
+    coalesce(um.total_post_score,0) as total_post_score,
+    case
+      when coalesce(a.answers_total,0) = 0 then null
+      else round(coalesce(a.avg_a_score,0)::numeric * ln(1 + coalesce(a.answers_total,0)), 2)
+    end as answer_quality_index,
+    case
+      when coalesce(q.questions_total,0) = 0 then null
+      else round(coalesce(q.avg_q_score,0)::numeric * sqrt(coalesce(q.questions_total,0)), 2)
+    end as question_quality_index
+  from recent_users ru
+  left join question_quality q on q.user_id = ru.user_id
+  left join answer_quality a on a.user_id = ru.user_id
+  left join post_engagement pe on pe.user_id = ru.user_id
+  left join user_posts um on um.user_id = ru.user_id
+),
+ranked_users as (
+  select
+    ru.user_id,
+    ru.displayname,
+    ru.reputation,
+    ru.cohort_month,
+    coalesce(br.total_badges,0) as total_badges,
+    coalesce(br.gold_badges,0) as gold_badges,
+    coalesce(br.silver_badges,0) as silver_badges,
+    coalesce(br.bronze_badges,0) as bronze_badges,
+    coalesce(up.q_count,0) as q_count,
+    coalesce(up.a_count,0) as a_count,
+    coalesce(up.other_count,0) as other_count,
+    coalesce(up.total_views,0) as total_views,
+    coalesce(up.total_post_score,0) as total_post_score,
+    coalesce(uv.upvotes_cast,0) as upvotes_cast,
+    coalesce(uv.downvotes_cast,0) as downvotes_cast,
+    coalesce(uv.favorites_cast,0) as favorites_cast,
+    coalesce(uv.total_bounty_amount,0) as bounty_amount_cast,
+    coalesce(pe.comment_count_received,0) as comments_received,
+    coalesce(pe.upvotes_received,0) as upvotes_received,
+    coalesce(pe.downvotes_received,0) as downvotes_received,
+    coalesce(pm.dup_links_out_sum,0) as dup_links_out_sum,
+    coalesce(pm.linked_out_sum,0) as linked_out_sum,
+    coalesce(pm.total_tag_mentions,0) as total_tag_mentions,
+    coalesce(ed.edit_events,0) as edit_events,
+    coalesce(ed.mod_events,0) as mod_events,
+    qs.answer_quality_index,
+    qs.question_quality_index,
+    n.has_null_displayname,
+    n.has_null_location,
+    n.has_null_website,
+    tm.best_activity_month,
+    tm.posts_made as best_month_posts,
+    tm.comments_made as best_month_comments,
+    tm.votes_cast as best_month_votes,
+    tt.top_tags,
+    row_number() over (
+      order by
+        coalesce(qs.answer_quality_index,0) + coalesce(qs.question_quality_index,0) + ln(1 + greatest(ru.reputation,0)) desc,
+        coalesce(br.total_badges,0) desc,
+        coalesce(up.total_post_score,0) desc
+    ) as perf_rank
+  from recent_users ru
+  left join badge_rollup br on br.userid = ru.user_id
+  left join user_posts up on up.user_id = ru.user_id
+  left join user_votes uv on uv.user_id = ru.user_id
+  left join post_engagement pe on pe.user_id = ru.user_id
+  left join post_meta pm on pm.user_id = ru.user_id
+  left join post_edits ed on ed.editor_id = ru.user_id
+  left join quality_scores qs on qs.user_id = ru.user_id
+  left join user_nulls n on n.user_id = ru.user_id
+  left join top_month tm on tm.user_id = ru.user_id
+  left join top3_tags tt on tt.user_id = ru.user_id
+),
+cohort_stats as (
+  select
+    cohort_month,
+    count(*) as users_in_cohort,
+    avg(reputation) as avg_rep,
+    percentile_cont(0.9) within group (order by reputation) as p90_rep,
+    avg(coalesce(answer_quality_index,0)) as avg_answer_qi,
+    avg(coalesce(question_quality_index,0)) as avg_question_qi
+  from ranked_users
+  group by cohort_month
+),
+final_users as (
+  select
+    r.*,
+    cs.users_in_cohort,
+    cs.avg_rep as cohort_avg_rep,
+    cs.p90_rep as cohort_p90_rep,
+    cs.avg_answer_qi as cohort_avg_aqi,
+    cs.avg_question_qi as cohort_avg_qqi,
+    case
+      when r.total_badges = 0 and r.reputation < 50 and r.q_count + r.a_count = 0 then 'lurker'
+      when r.gold_badges > 0 or r.answer_quality_index > 10 then 'elite'
+      when r.reputation >= 1000 then 'established'
+      when r.q_count > r.a_count then 'asker-leaning'
+      when r.a_count > r.q_count then 'answerer-leaning'
+      else 'mixed'
+    end as user_archetype
+  from ranked_users r
+  left join cohort_stats cs on cs.cohort_month = r.cohort_month
+),
+dup_closures as (
+  select
+    ph.postid,
+    sum(1) filter (where ph.posthistorytypeid = 10 and ph.comment in ('1','101')) as duplicate_closes,
+    sum(1) filter (where ph.posthistorytypeid = 11) as reopens
+  from posthistory ph
+  group by ph.postid
+),
+question_flags as (
+  select
+    p.id as post_id,
+    p.owneruserid as user_id,
+    coalesce(dc.duplicate_closes,0) as duplicate_closes,
+    coalesce(dc.reopens,0) as reopens,
+    case when coalesce(dc.duplicate_closes,0) > 0 then 1 else 0 end as ever_marked_duplicate
+  from posts p
+  left join dup_closures dc on dc.postid = p.id
+  where p.posttypeid = 1
+),
+user_dup_penalty as (
+  select
+    qf.user_id,
+    sum(qf.ever_marked_duplicate) as dup_marked_questions,
+    sum(greatest(qf.duplicate_closes - qf.reopens, 0)) as net_dup_closures
+  from question_flags qf
+  group by qf.user_id
+)
+select
+  fu.user_id,
+  coalesce(nullif(fu.displayname,''), concat('user-', fu.user_id::text)) as displayname,
+  fu.reputation,
+  fu.perf_rank,
+  fu.user_archetype,
+  fu.cohort_month,
+  fu.users_in_cohort,
+  fu.cohort_avg_rep,
+  fu.cohort_p90_rep,
+  fu.q_count,
+  fu.a_count,
+  fu.other_count,
+  fu.total_views,
+  fu.total_post_score,
+  fu.upvotes_cast,
+  fu.downvotes_cast,
+  fu.favorites_cast,
+  fu.bounty_amount_cast,
+  fu.comments_received,
+  fu.upvotes_received,
+  fu.downvotes_received,
+  fu.dup_links_out_sum,
+  fu.linked_out_sum,
+  fu.total_tag_mentions,
+  fu.edit_events,
+  fu.mod_events,
+  fu.answer_quality_index,
+  fu.question_quality_index,
+  fu.best_activity_month,
+  fu.best_month_posts,
+  fu.best_month_comments,
+  fu.best_month_votes,
+  coalesce(fu.top_tags, 'none') as top_tags,
+  fu.has_null_displayname,
+  fu.has_null_location,
+  fu.has_null_website,
+  coalesce(udp.dup_marked_questions,0) as dup_marked_questions,
+  coalesce(udp.net_dup_closures,0) as net_dup_closures,
+  round(
+    greatest(0,
+      (coalesce(fu.answer_quality_index,0) * 0.5) +
+      (coalesce(fu.question_quality_index,0) * 0.4) +
+      (ln(1 + greatest(fu.reputation,0)) * 0.3) +
+      (coalesce(fu.upvotes_received,0) - coalesce(fu.downvotes_received,0)) * 0.05 +
+      (coalesce(fu.total_post_score,0) * 0.02) +
+      (least(coalesce(fu.edit_events,0), 500) * 0.01) -
+      (coalesce(udp.net_dup_closures,0) * 0.2)
+    )::numeric
+  , 2) as composite_perf_score
+from final_users fu
+left join user_dup_penalty udp on udp.user_id = fu.user_id
+where
+  (fu.reputation >= 100 or fu.answer_quality_index is not null or fu.question_quality_index is not null)
+  and not (fu.has_null_displayname = 1 and fu.has_null_location = 1 and fu.has_null_website = 1)
+order by composite_perf_score desc nulls last, fu.perf_rank asc
+limit 250;

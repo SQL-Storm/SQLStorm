@@ -1,0 +1,453 @@
+with
+recent_users as (
+  select u.id as user_id,
+         u.displayname,
+         u.reputation,
+         u.creationdate,
+         u.location,
+         coalesce(u.websiteurl, '') as websiteurl,
+         date_trunc('month', u.creationdate) as create_month
+  from users u
+  where u.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+),
+user_badge_rollup as (
+  select b.userid,
+         count(*) as total_badges,
+         sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+         sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+         sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+         max(b.date) as last_badge_date
+  from badges b
+  group by b.userid
+),
+question_posts as (
+  select p.id,
+         p.owneruserid,
+         p.creationdate,
+         p.score,
+         p.viewcount,
+         p.answercount,
+         p.favoritecount,
+         p.title,
+         p.tags,
+         p.acceptedanswerid,
+         p.closeddate,
+         p.lastactivitydate
+  from posts p
+  where p.posttypeid = 1
+),
+answer_posts as (
+  select p.id,
+         p.parentid as question_id,
+         p.owneruserid,
+         p.creationdate,
+         p.score
+  from posts p
+  where p.posttypeid = 2
+),
+q_activity as (
+  select q.id as question_id,
+         q.owneruserid,
+         q.creationdate as q_created,
+         q.score as q_score,
+         q.viewcount,
+         q.answercount,
+         q.favoritecount,
+         q.title,
+         q.tags,
+         q.acceptedanswerid,
+         q.closeddate,
+         q.lastactivitydate,
+         coalesce(sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end), 0) as net_votes,
+         sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started,
+         sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded,
+         count(distinct c.id) filter (where c.id is not null) as comments_count
+  from question_posts q
+  left join votes v on v.postid = q.id
+  left join comments c on c.postid = q.id
+  group by q.id, q.owneruserid, q.creationdate, q.score, q.viewcount, q.answercount, q.favoritecount, q.title, q.tags, q.acceptedanswerid, q.closeddate, q.lastactivitydate
+),
+accepted_answer as (
+  select a.id as answer_id,
+         a.question_id,
+         a.owneruserid as answer_owner_id,
+         a.creationdate as a_created,
+         a.score as a_score
+  from answer_posts a
+),
+duplicates as (
+  select pl.postid as dup_post_id,
+         pl.relatedpostid as original_post_id,
+         pl.creationdate as dup_link_date
+  from postlinks pl
+  join linktypes lt on lt.id = pl.linktypeid and lower(lt.name) like '%duplicate%'
+),
+tag_expansion as (
+  select q.question_id,
+         unnest(string_to_array(substring(q.tags, 2, length(q.tags) - 2), '><')) as tagname
+  from q_activity q
+  where q.tags is not null and q.tags like '<%>'
+),
+tag_popularity as (
+  select te.tagname,
+         count(*) as tag_q_count,
+         count(*) filter (where qa.q_score >= 5) as tag_q_popular_count
+  from tag_expansion te
+  join q_activity qa on qa.question_id = te.question_id
+  group by te.tagname
+),
+user_posting as (
+  select ru.user_id,
+         count(*) filter (where qp.id is not null) as q_count,
+         count(*) filter (where ap.id is not null) as a_count,
+         coalesce(sum(qp.score), 0) as q_score_sum,
+         coalesce(sum(ap.score), 0) as a_score_sum,
+         max(coalesce(qp.creationdate, ap.creationdate)) as last_post_date
+  from recent_users ru
+  left join posts qp on qp.posttypeid = 1 and qp.owneruserid = ru.user_id
+  left join posts ap on ap.posttypeid = 2 and ap.owneruserid = ru.user_id
+  group by ru.user_id
+),
+first_q_edit as (
+  select ph.postid,
+         min(ph.creationdate) filter (where ph.posthistorytypeid in (4,5,6)) as first_edit_date
+  from posthistory ph
+  group by ph.postid
+),
+q_timings as (
+  select qa.question_id,
+         qa.q_created,
+         aa.a_created as accepted_created,
+         extract(epoch from (aa.a_created - qa.q_created)) as secs_to_accepted,
+         fe.first_edit_date,
+         extract(epoch from (fe.first_edit_date - qa.q_created)) as secs_to_first_edit
+  from q_activity qa
+  left join accepted_answer aa on aa.answer_id = qa.acceptedanswerid
+  left join first_q_edit fe on fe.postid = qa.question_id
+),
+commenter_diversity as (
+  select q.id as question_id,
+         count(distinct c.userid) filter (where c.userid is not null) as distinct_commenters,
+         max(c.creationdate) as latest_comment_date
+  from posts q
+  left join comments c on c.postid = q.id
+  where q.posttypeid = 1
+  group by q.id
+),
+user_engagement as (
+  select ru.user_id,
+         count(distinct qa.question_id) as questions_authored,
+         sum(qa.viewcount) as total_views,
+         sum(qa.net_votes) as total_net_votes,
+         sum(qa.answercount) as total_answers_received,
+         sum(case when qa.acceptedanswerid is not null then 1 else 0 end) as with_accepted,
+         avg(nullif(qa.viewcount,0)) as avg_views_nonzero,
+         max(qa.lastactivitydate) as last_q_activity
+  from recent_users ru
+  join q_activity qa on qa.owneruserid = ru.user_id
+  group by ru.user_id
+),
+ranked_users as (
+  select
+    ru.user_id,
+    ru.displayname,
+    ru.reputation,
+    ru.creationdate,
+    ru.location,
+    up.q_count,
+    up.a_count,
+    up.q_score_sum,
+    up.a_score_sum,
+    coalesce(ubr.total_badges, 0) as total_badges,
+    coalesce(ubr.gold_badges, 0) as gold_badges,
+    coalesce(ubr.silver_badges, 0) as silver_badges,
+    coalesce(ubr.bronze_badges, 0) as bronze_badges,
+    ue.questions_authored,
+    ue.total_views,
+    ue.total_net_votes,
+    ue.total_answers_received,
+    ue.with_accepted,
+    up.last_post_date,
+    coalesce(ubr.last_badge_date, ru.creationdate) as last_badge_date,
+    rank() over (order by coalesce(ue.total_net_votes,0) + coalesce(up.a_score_sum,0) + coalesce(up.q_score_sum,0) desc,
+                          coalesce(ue.total_views,0) desc,
+                          ru.reputation desc) as activity_rank
+  from recent_users ru
+  left join user_badge_rollup ubr on ubr.userid = ru.user_id
+  left join user_posting up on up.user_id = ru.user_id
+  left join user_engagement ue on ue.user_id = ru.user_id
+),
+dup_groups as (
+  select d.original_post_id,
+         count(*) as dup_count,
+         min(d.dup_link_date) as first_dup_date,
+         max(d.dup_link_date) as last_dup_date
+  from duplicates d
+  group by d.original_post_id
+),
+hot_candidates as (
+  select qa.question_id,
+         qa.q_created,
+         qa.title,
+         qa.viewcount,
+         qa.net_votes,
+         qa.answercount,
+         cd.distinct_commenters,
+         tp.tag_q_count,
+         row_number() over (order by qa.viewcount desc, qa.net_votes desc, qa.answercount desc) as rn_views_votes
+  from q_activity qa
+  left join commenter_diversity cd on cd.question_id = qa.question_id
+  left join lateral (
+     select max(tp.tag_q_count) as tag_q_count
+     from tag_expansion te
+     join tag_popularity tp on tp.tagname = te.tagname
+     where te.question_id = qa.question_id
+  ) tp on true
+),
+user_top_tags as (
+  select qa.owneruserid as user_id,
+         te.tagname,
+         count(*) as tag_qs_authored,
+         sum(qa.net_votes) as tag_net_votes,
+         row_number() over (partition by qa.owneruserid order by count(*) desc, sum(qa.net_votes) desc) as rn
+  from q_activity qa
+  join tag_expansion te on te.question_id = qa.question_id
+  group by qa.owneruserid, te.tagname
+),
+latest_close_reasons as (
+  select ph.postid,
+         max(ph.creationdate) as last_close_event_date,
+         max(case when ph.posthistorytypeid = 10 then ph.comment end) filter (where ph.posthistorytypeid = 10) as last_close_reason_code
+  from posthistory ph
+  where ph.posthistorytypeid in (10,11)
+  group by ph.postid
+),
+close_reason_names as (
+  select lcr.postid,
+         lcr.last_close_event_date,
+         crt.name as close_reason_name
+  from latest_close_reasons lcr
+  left join closeresontypes crt on cast(crt.id as varchar) = nullif(lcr.last_close_reason_code,'')
+),
+user_time_series as (
+  select ru.user_id,
+         ru.create_month,
+         count(*) over (partition by ru.user_id order by ru.create_month rows between unbounded preceding and current row) as cumulative_months
+  from recent_users ru
+),
+final_questions as (
+  select
+    qa.question_id,
+    qa.owneruserid,
+    qa.q_created,
+    qa.q_score,
+    qa.viewcount,
+    qa.answercount,
+    qa.favoritecount,
+    qa.title,
+    qa.tags,
+    qa.acceptedanswerid,
+    qa.closeddate,
+    qa.lastactivitydate,
+    qa.net_votes,
+    qa.bounty_started,
+    qa.bounty_awarded,
+    qt.secs_to_accepted,
+    qt.secs_to_first_edit,
+    cd.distinct_commenters,
+    hc.rn_views_votes,
+    coalesce(dg.dup_count, 0) as dup_count,
+    crn.close_reason_name,
+    case
+      when qa.closeddate is not null and crn.close_reason_name is null then 'Closed (unknown reason)'
+      when qa.closeddate is not null then 'Closed: ' || crn.close_reason_name
+      when qa.acceptedanswerid is not null then 'Resolved'
+      when qa.answercount > 0 then 'Answered'
+      else 'Open'
+    end as status_label
+  from q_activity qa
+  left join q_timings qt on qt.question_id = qa.question_id
+  left join commenter_diversity cd on cd.question_id = qa.question_id
+  left join hot_candidates hc on hc.question_id = qa.question_id
+  left join dup_groups dg on dg.original_post_id = qa.question_id
+  left join close_reason_names crn on crn.postid = qa.question_id
+),
+score_buckets as (
+  select fq.question_id,
+         case
+           when coalesce(fq.net_votes, fq.q_score, 0) >= 50 then '50+'
+           when coalesce(fq.net_votes, fq.q_score, 0) >= 20 then '20-49'
+           when coalesce(fq.net_votes, fq.q_score, 0) >= 10 then '10-19'
+           when coalesce(fq.net_votes, fq.q_score, 0) >= 1 then '1-9'
+           when coalesce(fq.net_votes, fq.q_score, 0) = 0 then '0'
+           else 'negative'
+         end as score_bucket
+  from final_questions fq
+),
+user_quality as (
+  select
+    ru.user_id,
+    ru.displayname,
+    ru.reputation,
+    ru.location,
+    ru.websiteurl,
+    ru.creationdate,
+    ru.create_month,
+    coalesce(rk.activity_rank, 999999) as activity_rank,
+    up.q_count,
+    up.a_count,
+    ue.total_views,
+    ue.total_net_votes,
+    ue.total_answers_received,
+    coalesce(ubr.total_badges,0) as total_badges,
+    coalesce(ubr.gold_badges,0) as gold_badges,
+    coalesce(ubr.silver_badges,0) as silver_badges,
+    coalesce(ubr.bronze_badges,0) as bronze_badges,
+    ts.cumulative_months,
+    row_number() over (order by coalesce(ue.total_net_votes,0) desc, coalesce(ubr.gold_badges,0) desc, coalesce(up.a_count,0) desc) as quality_rank
+  from recent_users ru
+  left join ranked_users rk on rk.user_id = ru.user_id
+  left join user_posting up on up.user_id = ru.user_id
+  left join user_engagement ue on ue.user_id = ru.user_id
+  left join user_badge_rollup ubr on ubr.userid = ru.user_id
+  left join user_time_series ts on ts.user_id = ru.user_id and ts.create_month = ru.create_month
+),
+unioned as (
+  select
+    'user' as entity_type,
+    cast(uq.user_id as text) as entity_id,
+    uq.displayname as label,
+    uq.reputation as metric_primary,
+    uq.quality_rank as metric_secondary,
+    cast(null as integer) as metric_aux,
+    uq.total_badges as metric_aux2,
+    uq.location as dim1,
+    uq.websiteurl as dim2,
+    to_char(uq.creationdate, 'YYYY-MM-DD') as dim3,
+    cast(null as text) as dim4,
+    cast(null as text) as dim5,
+    cast(null as timestamp) as t1,
+    cast(null as timestamp) as t2
+  from user_quality uq
+  where uq.quality_rank <= 500
+
+  union all
+
+  select
+    'question' as entity_type,
+    cast(fq.question_id as text) as entity_id,
+    substring(coalesce(fq.title,'') from 1 for 100) as label,
+    fq.viewcount as metric_primary,
+    coalesce(fq.net_votes, fq.q_score, 0) as metric_secondary,
+    fq.answercount as metric_aux,
+    fq.bounty_awarded as metric_aux2,
+    scoreb.score_bucket as dim1,
+    case when fq.dup_count > 0 then 'has-duplicates' else 'unique' end as dim2,
+    coalesce(fq.status_label, 'Open') as dim3,
+    fq.tags as dim4,
+    coalesce(cast(fq.rn_views_votes as text),'') as dim5,
+    fq.q_created as t1,
+    fq.lastactivitydate as t2
+  from final_questions fq
+  left join score_buckets scoreb on scoreb.question_id = fq.question_id
+  where fq.viewcount is not null
+),
+windowed as (
+  select
+    u.entity_type,
+    u.entity_id,
+    u.label,
+    u.metric_primary,
+    u.metric_secondary,
+    u.metric_aux,
+    u.metric_aux2,
+    u.dim1,
+    u.dim2,
+    u.dim3,
+    u.dim4,
+    u.dim5,
+    u.t1,
+    u.t2,
+    dense_rank() over (partition by u.entity_type order by u.metric_primary desc nulls last, u.metric_secondary desc nulls last) as dr_primary,
+    percent_rank() over (partition by u.entity_type order by u.metric_secondary) as pr_secondary,
+    lag(u.metric_primary) over (partition by u.entity_type order by u.metric_primary desc) as prev_metric_primary,
+    lead(u.metric_primary) over (partition by u.entity_type order by u.metric_primary desc) as next_metric_primary
+  from unioned u
+),
+filtered as (
+  select w.entity_type,
+         w.entity_id,
+         w.label,
+         w.metric_primary,
+         w.metric_secondary,
+         w.metric_aux,
+         w.metric_aux2,
+         w.dim1,
+         w.dim2,
+         w.dim3,
+         w.dim4,
+         w.dim5,
+         w.t1,
+         w.t2,
+         w.dr_primary,
+         w.pr_secondary,
+         w.prev_metric_primary,
+         w.next_metric_primary
+  from windowed w
+  where
+    (
+      w.entity_type = 'user'
+      and coalesce(w.metric_primary,0) >= 100
+      and (w.metric_secondary <= 1000 or w.pr_secondary <= 0.95)
+    )
+    or
+    (
+      w.entity_type = 'question'
+      and (w.metric_primary >= 1000 or (w.metric_secondary >= 10 and w.dim2 = 'unique'))
+    )
+),
+dedup as (
+  select f.entity_type,
+         f.entity_id,
+         f.label,
+         f.metric_primary,
+         f.metric_secondary,
+         f.metric_aux,
+         f.metric_aux2,
+         f.dim1,
+         f.dim2,
+         f.dim3,
+         f.dim4,
+         f.dim5,
+         f.t1,
+         f.t2,
+         f.dr_primary,
+         f.pr_secondary,
+         f.prev_metric_primary,
+         f.next_metric_primary,
+         row_number() over (partition by f.entity_type, f.entity_id order by f.metric_primary desc nulls last, f.metric_secondary desc nulls last) as rn
+  from filtered f
+)
+select
+  d.entity_type,
+  d.entity_id,
+  d.label,
+  d.metric_primary,
+  d.metric_secondary,
+  d.metric_aux,
+  d.metric_aux2,
+  d.dim1,
+  d.dim2,
+  d.dim3,
+  d.dim4,
+  d.dim5,
+  d.t1,
+  d.t2,
+  d.dr_primary,
+  d.pr_secondary,
+  d.prev_metric_primary,
+  d.next_metric_primary
+from dedup d
+where d.rn = 1
+order by d.entity_type, d.metric_primary desc nulls last, d.metric_secondary desc nulls last, d.entity_id
+limit 2000;

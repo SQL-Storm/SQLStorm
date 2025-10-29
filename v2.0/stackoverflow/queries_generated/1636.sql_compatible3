@@ -1,0 +1,178 @@
+WITH UserEngagementSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestionsOwned,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        SUM(COALESCE(p.ViewCount, 0)) AS TotalPostViews,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostScore,
+        MAX(COALESCE(p.LastActivityDate, TIMESTAMP '1900-01-01')) AS LatestPostActivity,
+        MAX(COALESCE(c.CreationDate, TIMESTAMP '1900-01-01')) AS LatestCommentActivity
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+PostDetailAnalysis AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.LastActivityDate,
+        COALESCE(p.Tags, '><') AS RawTags,
+        CHAR_LENGTH(p.Body) AS BodyLength,
+        (CASE WHEN LOWER(p.Body) LIKE '%performance%' OR LOWER(p.Body) LIKE '%optimization%' THEN TRUE ELSE FALSE END) AS ContainsPerformanceKeywords,
+        (CASE WHEN LOWER(p.Title) LIKE '%slow%' OR LOWER(p.Title) LIKE '%fast%' THEN TRUE ELSE FALSE END) AS ContainsSpeedKeywords,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived,
+        (SELECT COUNT(DISTINCT pl_in.LinkTypeId) FROM PostLinks pl_in WHERE pl_in.RelatedPostId = p.Id) AS IncomingLinkTypeCount
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE p.PostTypeId = 1
+    GROUP BY
+        p.Id, p.OwnerUserId, p.CreationDate, p.Title, p.Body, p.Score, p.ViewCount,
+        p.AnswerCount, p.CommentCount, p.FavoriteCount, p.ClosedDate, p.LastActivityDate, p.Tags
+),
+UserBadgeTimeline AS (
+    SELECT
+        b.UserId,
+        b.Name AS BadgeName,
+        b.Date AS BadgeAwardDate,
+        b.Class,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId, b.Class ORDER BY b.Date ASC) AS BadgeRankInClass,
+        COUNT(b.Id) OVER (PARTITION BY b.UserId) AS TotalBadgesForUser,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) OVER (PARTITION BY b.UserId) AS GoldBadgesCount,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY b.UserId) AS SilverBadgesCount,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) OVER (PARTITION BY b.UserId) AS BronzeBadgesCount,
+        AVG(EXTRACT(EPOCH FROM (b.Date - ues.UserCreationDate)) / 86400.0) OVER (PARTITION BY b.UserId) AS AvgDaysToBadgeFromCreation
+    FROM Badges b
+    JOIN UserEngagementSummary ues ON b.UserId = ues.UserId
+),
+PostHistoryAndCommentActivity AS (
+    SELECT
+        ph.PostId,
+        ph.CreationDate AS EventDate,
+        ph.UserId AS EventUserId,
+        'PostHistory' AS EventSource,
+        ph.PostHistoryTypeId AS HistoryTypeId,
+        COALESCE(ph.Comment, 'N/A') AS EventDescription
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6, 10, 11)
+    UNION ALL
+    SELECT
+        c.PostId,
+        c.CreationDate AS EventDate,
+        c.UserId AS EventUserId,
+        'Comment' AS EventSource,
+        NULL AS HistoryTypeId,
+        c.Text AS EventDescription
+    FROM Comments c
+    WHERE c.Score >= 3
+)
+SELECT
+    pda.PostId,
+    pda.Title AS QuestionTitle,
+    ues.DisplayName AS OwnerDisplayName,
+    ues.Reputation AS OwnerReputation,
+    pda.PostCreationDate,
+    pda.Score AS QuestionScore,
+    pda.ViewCount AS QuestionViews,
+    pda.AnswerCount,
+    pda.CommentCount AS QuestionCommentsCount,
+    pda.FavoriteCount,
+    pda.ClosedDate AS QuestionClosedDate,
+    pda.BodyLength,
+    pda.ContainsPerformanceKeywords,
+    pda.ContainsSpeedKeywords,
+    pda.UpVotesReceived,
+    pda.DownVotesReceived,
+    (CAST(pda.UpVotesReceived AS NUMERIC) - pda.DownVotesReceived) AS NetVotes,
+    (CASE WHEN (pda.DownVotesReceived + pda.UpVotesReceived) = 0 THEN NULL ELSE CAST(pda.UpVotesReceived AS NUMERIC) / (pda.DownVotesReceived + pda.UpVotesReceived) END) AS UpvoteRatio,
+    pda.IncomingLinkTypeCount,
+    (SELECT AVG(CHAR_LENGTH(c_len.Text))
+     FROM Comments c_len
+     WHERE c_len.PostId = pda.PostId AND c_len.UserId IS NOT NULL
+       AND c_len.Text IS NOT NULL AND CHAR_LENGTH(TRIM(c_len.Text)) > 0
+    ) AS AverageCommentLength,
+    STRING_AGG(DISTINCT t.TagName, '; ') FILTER (WHERE t.TagName IS NOT NULL AND t.Count > 100) AS PopularQuestionTags,
+    ubt.GoldBadgesCount,
+    ubt.SilverBadgesCount,
+    ubt.BronzeBadgesCount,
+    MAX(CASE WHEN ubt.BadgeRankInClass = 1 AND ubt.Class = 1 THEN ubt.BadgeName END) OVER (PARTITION BY pda.OwnerUserId) AS FirstGoldBadgeAwarded,
+    MIN(EXTRACT(EPOCH FROM (pda.PostCreationDate - ues.UserCreationDate)) / 86400.0) OVER (PARTITION BY pda.OwnerUserId) AS DaysToFirstQuestion,
+    MAX(phca.EventDate) FILTER (WHERE phca.EventSource = 'PostHistory' AND phca.HistoryTypeId IN (4,5,6)) AS LatestEditEventDate,
+    MAX(phca.EventDate) FILTER (WHERE phca.EventSource = 'Comment') AS LatestSignificantCommentDate,
+    CASE
+        WHEN pda.ClosedDate IS NOT NULL AND pda.Score < 0 THEN 'Closed & Negative'
+        WHEN pda.ClosedDate IS NOT NULL AND pda.Score >= 0 THEN 'Closed & Neutral/Positive'
+        WHEN pda.Score > 50 AND pda.CommentCount > 20 THEN 'Highly Engaged'
+        WHEN pda.ViewCount > 10000 AND pda.AnswerCount = 0 THEN 'Popular Unanswered'
+        ELSE 'Other Question Type'
+    END AS PostCategorization,
+    ROW_NUMBER() OVER (ORDER BY pda.Score DESC, pda.ViewCount DESC, pda.CommentCount DESC) AS GlobalEngagementRank,
+    RANK() OVER (PARTITION BY pda.OwnerUserId ORDER BY pda.Score DESC, pda.ViewCount DESC) AS RankWithinOwnerPosts,
+    LAG(pda.PostCreationDate, 1, ues.UserCreationDate) OVER (PARTITION BY pda.OwnerUserId ORDER BY pda.PostCreationDate) AS PreviousQuestionDate,
+    DATE_PART('day', pda.PostCreationDate - LAG(pda.PostCreationDate, 1, ues.UserCreationDate) OVER (PARTITION BY pda.OwnerUserId ORDER BY pda.PostCreationDate)) AS DaysSincePreviousQuestion,
+    (SELECT CASE WHEN p_inner.CommunityOwnedDate IS NOT NULL AND COUNT(ph_edit.Id) > 5 THEN 'Community Wiki & Heavily Edited' ELSE 'Regular Status' END
+     FROM Posts p_inner
+     LEFT JOIN PostHistory ph_edit ON p_inner.Id = ph_edit.PostId AND ph_edit.PostHistoryTypeId IN (4,5,6)
+     WHERE p_inner.Id = pda.PostId
+     GROUP BY p_inner.CommunityOwnedDate
+    ) AS CommunityWikiStatus,
+    COALESCE(
+        (SELECT MAX(ph_mig.CreationDate)
+         FROM PostHistory ph_mig
+         WHERE ph_mig.PostId = pda.PostId AND ph_mig.PostHistoryTypeId IN (35, 36)
+        ), TIMESTAMP '1900-01-01'
+    ) AS LastMigrationDate
+FROM PostDetailAnalysis pda
+JOIN UserEngagementSummary ues ON pda.OwnerUserId = ues.UserId
+LEFT JOIN LATERAL (
+    SELECT UNNEST(string_to_array(SUBSTRING(pda.RawTags FROM 2 FOR (CHAR_LENGTH(pda.RawTags)-2)), '><')) AS TagName
+) AS unnested_tags ON TRUE
+LEFT JOIN Tags t ON unnested_tags.TagName = t.TagName
+LEFT JOIN UserBadgeTimeline ubt ON ues.UserId = ubt.UserId
+LEFT JOIN PostHistoryAndCommentActivity phca ON pda.PostId = phca.PostId
+WHERE
+    ues.Reputation > 7500
+    AND pda.ViewCount > 2000
+    AND pda.CommentCount > 10
+    AND pda.BodyLength BETWEEN 300 AND 4000
+    AND pda.ClosedDate IS NOT NULL
+    AND (LOWER(pda.RawTags) LIKE '%<sql>%' OR LOWER(pda.RawTags) LIKE '%<database>%' OR LOWER(pda.RawTags) LIKE '%<performance>%')
+    AND EXISTS (
+        SELECT 1
+        FROM Badges b_gold
+        WHERE b_gold.UserId = ues.UserId AND b_gold.Class = 1
+    )
+    AND NOT EXISTS (
+        SELECT 1
+        FROM PostHistory ph_deleted
+        WHERE ph_deleted.PostId = pda.PostId AND ph_deleted.PostHistoryTypeId = 12
+    )
+    AND pda.UpVotesReceived > pda.DownVotesReceived * 1.5
+    AND pda.IncomingLinkTypeCount > 0
+GROUP BY
+    pda.PostId, pda.Title, ues.DisplayName, ues.Reputation, pda.PostCreationDate, pda.Score,
+    pda.ViewCount, pda.AnswerCount, pda.CommentCount, pda.FavoriteCount, pda.ClosedDate,
+    pda.BodyLength, pda.ContainsPerformanceKeywords, pda.ContainsSpeedKeywords,
+    pda.UpVotesReceived, pda.DownVotesReceived, pda.IncomingLinkTypeCount,
+    ues.UserId, ues.UserCreationDate, ubt.GoldBadgesCount, ubt.SilverBadgesCount,
+    ubt.BronzeBadgesCount, ubt.BadgeRankInClass, ubt.Class, ubt.BadgeName, phca.EventDate, phca.EventSource, phca.HistoryTypeId
+HAVING
+    COUNT(DISTINCT t.TagName) > 2
+    AND SUM(CASE WHEN t.TagName = 'sql' THEN 1 ELSE 0 END) > 0
+ORDER BY
+    ues.Reputation DESC, pda.Score DESC, pda.ViewCount DESC, pda.PostCreationDate DESC
+LIMIT 250;

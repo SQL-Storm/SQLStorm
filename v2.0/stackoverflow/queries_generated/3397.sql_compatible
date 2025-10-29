@@ -1,0 +1,103 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.OwnerUserId,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS rn,
+        COALESCE(u.Reputation, 0) AS UserRep,
+        LENGTH(p.Title) AS TitleLen,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpVotesCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS DownVotesCount,
+        (SELECT STRING_AGG(t.TagName, ',') FROM Tags t
+         JOIN PostTags pt2 ON pt2.TagId = t.Id AND pt2.PostId = p.Id) AS TagList,
+        COALESCE(NULLIF(p.ViewCount, 0), -1) AS ViewCountAdj,
+        ('Q_' || CAST(p.Id AS VARCHAR)) AS QKey
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= DATE '2020-01-01'
+),
+UserBadgeStats AS (
+    SELECT 
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+TopCommenters AS (
+    SELECT 
+        c.PostId,
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(*) AS CommentCount,
+        ROW_NUMBER() OVER (PARTITION BY c.PostId ORDER BY COUNT(*) DESC) AS rn
+    FROM Comments c
+    JOIN Users u ON c.UserId = u.Id
+    GROUP BY c.PostId, u.Id, u.DisplayName
+),
+ClosedPostsInfo AS (
+    SELECT 
+        ph.PostId,
+        MIN(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) AS ClosedDate,
+        MIN(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Comment END) AS CloseReasonId
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.PostId
+)
+SELECT 
+    rp.Id,
+    rp.Title,
+    rp.CreationDate,
+    rp.Score,
+    rp.UserRep,
+    rp.TitleLen,
+    rp.UpVotesCount,
+    rp.DownVotesCount,
+    rp.TagList,
+    rp.ViewCountAdj,
+    rp.QKey,
+    COALESCE(ubs.GoldBadges, 0) AS GoldBadges,
+    COALESCE(ubs.SilverBadges, 0) AS SilverBadges,
+    COALESCE(ubs.BronzeBadges, 0) AS BronzeBadges,
+    ci.ClosedDate,
+    cr.Name AS CloseReason,
+    tc.DisplayName AS TopCommenter,
+    tc.CommentCount AS TopCommenterCount
+FROM RankedPosts rp
+LEFT JOIN UserBadgeStats ubs ON rp.OwnerUserId = ubs.UserId
+LEFT JOIN ClosedPostsInfo ci ON rp.Id = ci.PostId
+LEFT JOIN CloseReasonTypes cr ON CAST(ci.CloseReasonId AS SMALLINT) = cr.Id
+LEFT JOIN (
+    SELECT PostId, DisplayName, CommentCount
+    FROM TopCommenters
+    WHERE rn = 1
+) tc ON rp.Id = tc.PostId
+WHERE rp.rn <= 10
+ORDER BY rp.Score DESC
+
+UNION ALL
+
+SELECT 
+    NULL AS Id,
+    '--- Summary ---' AS Title,
+    NULL AS CreationDate,
+    NULL AS Score,
+    NULL AS UserRep,
+    NULL AS TitleLen,
+    NULL AS UpVotesCount,
+    NULL AS DownVotesCount,
+    NULL AS TagList,
+    NULL AS ViewCountAdj,
+    NULL AS QKey,
+    SUM(COALESCE(ubs.GoldBadges, 0)) AS GoldBadges,
+    SUM(COALESCE(ubs.SilverBadges, 0)) AS SilverBadges,
+    SUM(COALESCE(ubs.BronzeBadges, 0)) AS BronzeBadges,
+    NULL AS ClosedDate,
+    NULL AS CloseReason,
+    NULL AS TopCommenter,
+    NULL AS TopCommenterCount
+FROM UserBadgeStats ubs;

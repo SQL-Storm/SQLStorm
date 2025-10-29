@@ -1,0 +1,188 @@
+with recursive RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate as PostCreationDate,
+        p.Title,
+        cast(null as timestamp) as LastCommentDate,
+        0 as CommentsCount
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    where u.Reputation > 1000
+
+    union all
+
+    select
+        rua.UserId,
+        rua.DisplayName,
+        rua.Reputation,
+        rua.PostId,
+        rua.PostTypeId,
+        rua.Score,
+        rua.ViewCount,
+        rua.PostCreationDate,
+        rua.Title,
+        greatest(coalesce(rua.LastCommentDate, timestamp '1970-01-01'), c.CreationDate) as LastCommentDate,
+        rua.CommentsCount + 1 as CommentsCount
+    from RecursiveUserActivity rua
+    join Comments c on c.PostId = rua.PostId
+    where c.CreationDate > coalesce(rua.LastCommentDate, timestamp '1970-01-01')
+),
+RankedPosts as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        u.DisplayName as OwnerDisplayName,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Tags,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc) as PostRank,
+        count(*) over (partition by p.OwnerUserId) as PostCount
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId in (1, 2)
+),
+BadgeCounts as (
+    select 
+        UserId,
+        sum(case when Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when Class = 3 then 1 else 0 end) as BronzeBadges,
+        count(*) as TotalBadges
+    from Badges
+    group by UserId
+),
+PostLinkSummary as (
+    select 
+        pl.PostId,
+        count(case when lt.Name = 'Linked' then 1 end) as LinkedCount,
+        count(case when lt.Name = 'Duplicate' then 1 end) as DuplicateCount
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    group by pl.PostId
+),
+UserVoteStats as (
+    select
+        p.OwnerUserId,
+        count(v.Id) as TotalVotes,
+        sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+        sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes,
+        avg(p.Score) as AvgPostScore
+    from Votes v
+    join VoteTypes vt on vt.Id = v.VoteTypeId
+    join Posts p on p.Id = v.PostId
+    where p.OwnerUserId is not null
+    group by p.OwnerUserId
+),
+TopTags as (
+    select
+        regexp_split_to_table(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><') as Tag,
+        count(*) as UsageCount
+    from Posts p
+    where p.Tags is not null and p.PostTypeId = 1
+    group by Tag
+    having count(*) > 50
+    order by UsageCount desc
+    limit 10
+),
+QuestionsWithCloseInfo as (
+    select
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        COALESCE(pc.Name, 'Open') as CloseReason,
+        (select count(*) from PostHistory ph where ph.PostId = p.Id and ph.PostHistoryTypeId = 10) as CloseVotes,
+        (select count(*) from PostHistory ph where ph.PostId = p.Id and ph.PostHistoryTypeId = 11) as ReopenVotes
+    from Posts p
+    left join PostHistoryTypes pc on pc.Id = (
+        select ph.PostHistoryTypeId
+        from PostHistory ph
+        where ph.PostId = p.Id and ph.PostHistoryTypeId = 10
+        order by ph.CreationDate desc
+        limit 1
+    )
+    where p.PostTypeId = 1
+    and p.CreationDate > (timestamp '2024-10-01 12:34:56' - interval '1 year')
+),
+UserActivitySummary as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) as QuestionsAsked,
+        count(distinct a.Id) as AnswersProvided,
+        coalesce(bc.GoldBadges, 0) as GoldBadges,
+        coalesce(bc.SilverBadges, 0) as SilverBadges,
+        coalesce(bc.BronzeBadges, 0) as BronzeBadges,
+        coalesce(uvs.UpVotes, 0) as UpVotes,
+        coalesce(uvs.DownVotes, 0) as DownVotes,
+        coalesce(sum(case when p.Score > 10 then 1 else 0 end), 0) as HighScoringPosts
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 1
+    left join Posts a on a.OwnerUserId = u.Id and a.PostTypeId = 2
+    left join BadgeCounts bc on bc.UserId = u.Id
+    left join UserVoteStats uvs on uvs.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName, bc.GoldBadges, bc.SilverBadges, bc.BronzeBadges, uvs.UpVotes, uvs.DownVotes
+),
+FinalResultSet as (
+    select
+        uas.UserId,
+        uas.DisplayName,
+        uas.QuestionsAsked,
+        uas.AnswersProvided,
+        uas.GoldBadges,
+        uas.SilverBadges,
+        uas.BronzeBadges,
+        uas.UpVotes,
+        uas.DownVotes,
+        uas.HighScoringPosts,
+        array_agg(tt.Tag) filter (where tt.Tag is not null) as FavoriteTags,
+        (select avg(p.Score) from Posts p where p.OwnerUserId = uas.UserId) as AvgUserPostScore,
+        max(p.CreationDate) as MostRecentPostDate
+    from UserActivitySummary uas
+    left join Posts p on p.OwnerUserId = uas.UserId
+    left join lateral (
+        select Tag from TopTags tt 
+        join Posts p2 on position(('<' || tt.Tag || '>') in coalesce(p2.Tags, '')) > 0
+        where p2.OwnerUserId = uas.UserId
+        group by Tag
+        order by count(*) desc
+        limit 3
+    ) tt on true
+    group by 
+        uas.UserId,
+        uas.DisplayName,
+        uas.QuestionsAsked,
+        uas.AnswersProvided,
+        uas.GoldBadges,
+        uas.SilverBadges,
+        uas.BronzeBadges,
+        uas.UpVotes,
+        uas.DownVotes,
+        uas.HighScoringPosts
+)
+select
+    frs.*,
+    case
+        when frs.HighScoringPosts > 10 then 'Expert'
+        when frs.HighScoringPosts between 5 and 10 then 'Intermediate'
+        else 'Beginner'
+    end as UserLevel,
+    case
+        when frs.AvgUserPostScore > 50 then 1
+        else 0
+    end as HasHighAverageScore,
+    coalesce(pls.LinkedCount, 0) as TotalLinkedPosts,
+    coalesce(pls.DuplicateCount, 0) as TotalDuplicatePosts
+from FinalResultSet frs
+left join Posts p on p.OwnerUserId = frs.UserId
+left join PostLinkSummary pls on pls.PostId = p.Id
+where frs.QuestionsAsked > 5
+order by frs.GoldBadges desc, frs.HighScoringPosts desc, frs.UpVotes desc
+limit 50;

@@ -1,0 +1,259 @@
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate,
+        U.LastAccessDate,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS UserUpVotes,
+        U.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT PQ.Id) AS TotalQuestionsOwned,
+        COUNT(DISTINCT PA.Id) AS TotalAnswersOwned,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9) AND PH.UserId = U.Id THEN 1 ELSE 0 END) AS TotalSelfEdits,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) AND PH.UserId <> U.Id THEN 1 ELSE 0 END) AS TotalEditsOnOthers,
+        AVG(COALESCE(P.Score, 0)) AS AvgPostScoreOwned,
+        COUNT(DISTINCT T.TagName) AS DistinctTagsUsedInQuestions,
+        COALESCE(U.Location, 'Unspecified') AS UserLocation,
+        LENGTH(COALESCE(U.AboutMe, '')) AS AboutMeLength
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Posts PQ ON U.Id = PQ.OwnerUserId AND PQ.PostTypeId = 1
+    LEFT JOIN Posts PA ON U.Id = PA.OwnerUserId AND PA.PostTypeId = 2
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN PostHistory PH ON U.Id = PH.UserId
+    LEFT JOIN (
+        SELECT DISTINCT P_Tags.OwnerUserId,
+               UNNEST(STRING_TO_ARRAY(SUBSTRING(P_Tags.Tags FROM 2 FOR CHAR_LENGTH(P_Tags.Tags)-2), '><')) AS TagName
+        FROM Posts P_Tags
+        WHERE P_Tags.PostTypeId = 1 AND P_Tags.Tags IS NOT NULL AND CHAR_LENGTH(P_Tags.Tags) > 2
+    ) T ON U.Id = T.OwnerUserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Views, U.UpVotes, U.DownVotes, U.Location, U.AboutMe
+),
+PostDetailsExtended AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount AS PostViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.Tags,
+        EXTRACT(YEAR FROM P.CreationDate) AS PostYear,
+        AVG(P_sub.Score) FILTER (WHERE P_sub.CreationDate <= P.CreationDate) OVER (PARTITION BY P.OwnerUserId ORDER BY P_sub.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS RunningAvgOwnerScore,
+        DENSE_RANK() OVER (PARTITION BY P.PostTypeId, EXTRACT(YEAR FROM P.CreationDate) ORDER BY P.Score DESC, P.CreationDate ASC) AS RankByScoreInPostTypeYear,
+        (SELECT Q.Score FROM Posts Q WHERE Q.Id = P.ParentId AND P.PostTypeId = 2) AS ParentQuestionScore,
+        COALESCE(P.ClosedDate, TIMESTAMP '9999-12-31 00:00:00') AS EffectiveClosedDate,
+        (P.Score * COALESCE(P.ViewCount, 1) * COALESCE(P.FavoriteCount, 0)) AS PostEngagementMetric
+    FROM Posts P
+    LEFT JOIN Posts P_sub ON P.OwnerUserId = P_sub.OwnerUserId
+    WHERE P.OwnerUserId IS NOT NULL
+),
+TagPerformance AS (
+    SELECT
+        P.PostId,
+        P.OwnerUserId,
+        P.PostScore,
+        UNNEST(STRING_TO_ARRAY(SUBSTRING(P.Tags FROM 2 FOR CHAR_LENGTH(P.Tags)-2), '><')) AS TagName,
+        P.PostCreationDate
+    FROM PostDetailsExtended P
+    WHERE P.Tags IS NOT NULL AND P.PostTypeId = 1 AND CHAR_LENGTH(P.Tags) > 2
+),
+AggregatedTagMetrics AS (
+    SELECT
+        TP.TagName,
+        SUM(TP.PostScore) AS TotalTagScore,
+        COUNT(DISTINCT TP.PostId) AS TotalPostsWithTag,
+        AVG(TP.PostScore) AS AverageTagPostScore,
+        COUNT(DISTINCT TP.OwnerUserId) AS TotalUsersUsingTag,
+        DENSE_RANK() OVER (ORDER BY SUM(TP.PostScore) DESC, COUNT(DISTINCT TP.PostId) DESC) AS TagScoreRank
+    FROM TagPerformance TP
+    GROUP BY TP.TagName
+),
+UserBadgeContribution AS (
+    SELECT
+        U.Id AS UserId,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        SUM(CASE WHEN B.TagBased = TRUE THEN 1 ELSE 0 END) AS TagBasedBadges,
+        SUM(CASE WHEN B.TagBased = FALSE THEN 1 ELSE 0 END) AS NamedBadges,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        NTILE(5) OVER (ORDER BY COUNT(DISTINCT B.Id) DESC, U.Reputation DESC) AS BadgeQuintile
+    FROM Users U
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.Reputation
+),
+UserVoteBehavior AS (
+    SELECT
+        V.UserId,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesCast,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesCast,
+        SUM(CASE WHEN V.VoteTypeId = 1 THEN 1 ELSE 0 END) AS AcceptedAnswersVoted,
+        SUM(CASE WHEN V.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoritesCast,
+        SUM(COALESCE(V.BountyAmount, 0)) AS TotalBountyActivity,
+        LAG(SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END), 1, 0) OVER (PARTITION BY V.UserId ORDER BY MAX(V.CreationDate) ASC) AS PrevUpVotes,
+        LEAD(SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END), 1, 0) OVER (PARTITION BY V.UserId ORDER BY MAX(V.CreationDate) ASC) AS NextDownVotes
+    FROM Votes V
+    WHERE V.UserId IS NOT NULL
+    GROUP BY V.UserId
+),
+MainQueryData AS (
+    SELECT
+        UAS.UserId,
+        UAS.DisplayName,
+        UAS.Reputation,
+        UAS.CreationDate,
+        UAS.LastAccessDate,
+        UAS.UserProfileViews,
+        UAS.UserUpVotes,
+        UAS.UserDownVotes,
+        UAS.TotalPostsOwned,
+        UAS.TotalQuestionsOwned,
+        UAS.TotalAnswersOwned,
+        UAS.TotalCommentsMade,
+        UAS.TotalSelfEdits,
+        UAS.TotalEditsOnOthers,
+        UAS.AvgPostScoreOwned,
+        UAS.DistinctTagsUsedInQuestions,
+        UAS.UserLocation,
+        UAS.AboutMeLength,
+        UBC.GoldBadges,
+        UBC.SilverBadges,
+        UBC.BronzeBadges,
+        UBC.TotalBadges,
+        UBC.BadgeQuintile,
+        UVB.UpVotesCast,
+        UVB.DownVotesCast,
+        UVB.AcceptedAnswersVoted,
+        UVB.FavoritesCast,
+        UVB.TotalBountyActivity,
+        UVB.PrevUpVotes,
+        UVB.NextDownVotes,
+        SUM(PDE.PostScore) AS TotalPostsScore,
+        MAX(PDE.PostViewCount) AS MaxPostViewCount,
+        AVG(PDE.RunningAvgOwnerScore) AS AvgRunningOwnerScore,
+        AVG(PDE.ParentQuestionScore) AS AvgParentQuestionScoreForAnswers,
+        MAX(PDE.PostEngagementMetric) AS MaxPostEngagementMetric,
+        COUNT(DISTINCT ATGM.TagName) AS CountOfHighlyRankedTagsUsed,
+        STRING_AGG(DISTINCT ATGM.TagName, ' | ') AS UniqueHighlyRankedTags
+    FROM UserActivitySummary UAS
+    LEFT JOIN UserBadgeContribution UBC ON UAS.UserId = UBC.UserId
+    LEFT JOIN UserVoteBehavior UVB ON UAS.UserId = UVB.UserId
+    LEFT JOIN PostDetailsExtended PDE ON UAS.UserId = PDE.OwnerUserId
+    LEFT JOIN (
+        SELECT
+            TP.OwnerUserId,
+            TP.TagName
+        FROM TagPerformance TP
+        JOIN AggregatedTagMetrics ATM ON TP.TagName = ATM.TagName
+        WHERE ATM.TotalTagScore > 5000 AND ATM.TagScoreRank <= 20
+        GROUP BY TP.OwnerUserId, TP.TagName
+    ) ATGM ON UAS.UserId = ATGM.OwnerUserId
+    WHERE UAS.Reputation > 500 AND UAS.LastAccessDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '3' YEAR)
+    GROUP BY
+        UAS.UserId, UAS.DisplayName, UAS.Reputation, UAS.CreationDate, UAS.LastAccessDate, UAS.UserProfileViews, UAS.UserUpVotes, UAS.UserDownVotes,
+        UAS.TotalPostsOwned, UAS.TotalQuestionsOwned, UAS.TotalAnswersOwned, UAS.TotalCommentsMade, UAS.TotalSelfEdits, UAS.TotalEditsOnOthers,
+        UAS.AvgPostScoreOwned, UAS.DistinctTagsUsedInQuestions, UAS.UserLocation, UAS.AboutMeLength,
+        UBC.GoldBadges, UBC.SilverBadges, UBC.BronzeBadges, UBC.TotalBadges, UBC.BadgeQuintile,
+        UVB.UpVotesCast, UVB.DownVotesCast, UVB.AcceptedAnswersVoted, UVB.FavoritesCast, UVB.TotalBountyActivity, UVB.PrevUpVotes, UVB.NextDownVotes
+    HAVING COUNT(PDE.PostId) > 0
+)
+(
+    SELECT
+        MD.UserId,
+        MD.DisplayName,
+        MD.Reputation,
+        MD.TotalPostsOwned,
+        MD.TotalSelfEdits,
+        MD.TotalEditsOnOthers,
+        MD.GoldBadges,
+        MD.SilverBadges,
+        MD.TotalBadges,
+        MD.UpVotesCast,
+        MD.DownVotesCast,
+        MD.TotalPostsScore,
+        MD.MaxPostViewCount,
+        MD.UniqueHighlyRankedTags,
+        'HighlyInfluential_ActiveEditor' AS UserInfluenceType,
+        (MD.Reputation * 0.4 + MD.TotalSelfEdits * 0.3 + MD.TotalEditsOnOthers * 0.3) AS InfluenceScore,
+        COALESCE(MD.UserLocation, 'N/A') AS FinalLocation,
+        EXISTS (
+            SELECT 1
+            FROM PostHistory PH_corr
+            JOIN Posts P_closed ON PH_corr.PostId = P_closed.Id
+            WHERE PH_corr.UserId = MD.UserId
+              AND PH_corr.PostHistoryTypeId IN (4,5,6)
+              AND P_closed.ClosedDate IS NOT NULL
+              AND PH_corr.CreationDate < P_closed.ClosedDate
+        ) AS EditedClosedPostBeforeClosure,
+        (MD.UserUpVotes - MD.UserDownVotes - COALESCE(MD.PrevUpVotes, 0)) AS NetVoteChange,
+        MD.LastAccessDate,
+        MD.AboutMeLength,
+        MD.TotalQuestionsOwned,
+        MD.AvgRunningOwnerScore,
+        MD.DisplayName AS ExtraDisplayName -- ensure same number of columns/positions
+    FROM MainQueryData MD
+    WHERE
+        MD.Reputation > 15000
+        AND MD.GoldBadges >= 3
+        AND MD.TotalSelfEdits + MD.TotalEditsOnOthers > 100
+        AND MD.TotalQuestionsOwned > 10
+        AND MD.AvgRunningOwnerScore > 10
+        AND MD.DisplayName IS NOT NULL
+        AND MD.AboutMeLength IS NOT NULL AND MD.AboutMeLength > 50
+    ORDER BY InfluenceScore DESC, MD.LastAccessDate DESC
+    LIMIT 500
+)
+UNION ALL
+(
+    SELECT
+        MD.UserId,
+        MD.DisplayName,
+        MD.Reputation,
+        MD.TotalPostsOwned,
+        MD.TotalSelfEdits,
+        MD.TotalEditsOnOthers,
+        MD.GoldBadges,
+        MD.SilverBadges,
+        MD.TotalBadges,
+        MD.UpVotesCast,
+        MD.DownVotesCast,
+        MD.TotalPostsScore,
+        MD.MaxPostViewCount,
+        MD.UniqueHighlyRankedTags,
+        'Influential_CommunityContributor' AS UserInfluenceType,
+        (MD.Reputation * 0.5 + MD.TotalCommentsMade * 0.2 + MD.TotalBountyActivity * 0.3) AS InfluenceScore,
+        UPPER(SUBSTRING(COALESCE(MD.UserLocation, 'UNKNOWN') FROM 1 FOR 1)) || SUBSTRING(COALESCE(MD.UserLocation, 'UNKNOWN') FROM 2) AS FinalLocation,
+        EXISTS (
+            SELECT 1
+            FROM Posts P_q
+            JOIN Posts P_ans ON P_q.AcceptedAnswerId = P_ans.Id
+            WHERE P_q.OwnerUserId = MD.UserId
+              AND P_q.PostTypeId = 1
+              AND P_ans.Score > 50
+              AND P_ans.CreationDate > MD.CreationDate
+        ) AS AcceptedHighScoringAnswerForOwnQuestion,
+        (COALESCE(MD.NextDownVotes, 0) - COALESCE(MD.DownVotesCast, 0)) AS NetDownVoteChange,
+        MD.CreationDate,
+        MD.DisplayName AS ExtraDisplayName -- align with previous select
+    FROM MainQueryData MD
+    WHERE
+        MD.Reputation > 5000
+        AND MD.BronzeBadges >= 20
+        AND MD.TotalCommentsMade > 200
+        AND MD.TotalAnswersOwned > 50
+        AND MD.AvgPostScoreOwned > 5
+        AND MD.DistinctTagsUsedInQuestions > 3
+        AND MD.DisplayName NOT LIKE '%test%'
+        AND NULLIF(MD.TotalPostsOwned, 0) IS NOT NULL
+    ORDER BY InfluenceScore DESC, MD.CreationDate ASC
+    LIMIT 500
+)
+ORDER BY Reputation DESC, InfluenceScore DESC
+LIMIT 1000;

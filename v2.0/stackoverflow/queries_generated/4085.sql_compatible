@@ -1,0 +1,183 @@
+WITH RelevantPosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.CreationDate AS PostCreationDate,
+    p.Score AS PostScore,
+    p.ViewCount AS PostViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ClosedDate,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation AS OwnerReputation,
+    u.CreationDate AS OwnerCreationDate,
+    ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.CreationDate DESC) AS rn_by_type_score,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id) AS UpVoteCount,
+    COUNT(c.Id) OVER (PARTITION BY p.Id) AS CommentCountOver,
+    LAG(p.Score, 1, 0) OVER (ORDER BY p.CreationDate) AS PreviousDayScore,
+    p.Id AS grp_id,
+    p.PostTypeId AS grp_posttypeid,
+    p.OwnerUserId AS grp_owneruserid,
+    p.CreationDate AS grp_creationdate,
+    p.Score AS grp_score,
+    p.ViewCount AS grp_viewcount,
+    p.AnswerCount AS grp_answercount,
+    p.CommentCount AS grp_commentcount,
+    p.FavoriteCount AS grp_favoritecount,
+    p.ClosedDate AS grp_closeddate,
+    u.DisplayName AS grp_displayname,
+    u.Reputation AS grp_reputation,
+    u.CreationDate AS grp_ownercreationdate
+  FROM Posts p
+  LEFT JOIN Users u
+    ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v
+    ON p.Id = v.PostId
+  LEFT JOIN Comments c
+    ON p.Id = c.PostId
+  WHERE
+    p.PostTypeId IN (1, 2) AND p.CreationDate >= CAST('2023-01-01' AS timestamp)
+),
+RankedQuestions AS (
+  SELECT
+    rp.PostId,
+    rp.PostTypeId,
+    rp.PostScore,
+    rp.OwnerDisplayName,
+    rp.OwnerReputation,
+    rp.OwnerCreationDate,
+    rp.UpVoteCount,
+    rp.CommentCountOver,
+    rp.PostViewCount,
+    rp.PostCreationDate,
+    (rp.PostScore * 1.5) + (rp.UpVoteCount * 0.8) + (rp.CommentCountOver * 0.2) AS CompositeScore,
+    CASE WHEN rp.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS PostStatus,
+    rp.rn_by_type_score,
+    rp.grp_id,
+    rp.grp_posttypeid,
+    rp.grp_owneruserid,
+    rp.grp_creationdate,
+    rp.grp_score,
+    rp.grp_viewcount,
+    rp.grp_answercount,
+    rp.grp_commentcount,
+    rp.grp_favoritecount,
+    rp.grp_closeddate,
+    rp.grp_displayname,
+    rp.grp_reputation,
+    rp.grp_ownercreationdate
+  FROM RelevantPosts rp
+  WHERE
+    rp.PostTypeId = 1 AND rp.rn_by_type_score <= 100
+),
+RankedAnswers AS (
+  SELECT
+    rp.PostId,
+    rp.PostTypeId,
+    rp.PostScore,
+    rp.OwnerDisplayName,
+    rp.OwnerReputation,
+    rp.OwnerCreationDate,
+    rp.UpVoteCount,
+    rp.CommentCountOver,
+    rp.PostViewCount,
+    rp.PostCreationDate,
+    CASE
+      WHEN EXISTS (
+        SELECT 1
+        FROM Posts q
+        WHERE q.Id = (
+          SELECT a.ParentId FROM Posts a WHERE a.Id = rp.PostId
+        ) AND q.AcceptedAnswerId = rp.PostId
+      ) THEN 'Accepted'
+      ELSE 'Not Accepted'
+    END AS AnswerStatus,
+    rp.rn_by_type_score,
+    rp.grp_id,
+    rp.grp_posttypeid,
+    rp.grp_owneruserid,
+    rp.grp_creationdate,
+    rp.grp_score,
+    rp.grp_viewcount,
+    rp.grp_answercount,
+    rp.grp_commentcount,
+    rp.grp_favoritecount,
+    rp.grp_closeddate,
+    rp.grp_displayname,
+    rp.grp_reputation,
+    rp.grp_ownercreationdate
+  FROM RelevantPosts rp
+  WHERE
+    rp.PostTypeId = 2 AND rp.rn_by_type_score <= 200
+),
+UserActivity AS (
+  SELECT
+    UserId,
+    COUNT(Id) AS VoteCount,
+    SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+    SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+    MAX(CreationDate) AS LastVoteDate
+  FROM Votes
+  WHERE
+    CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1' YEAR)
+  GROUP BY
+    UserId
+  HAVING
+    COUNT(Id) > 10
+),
+UserPostAnalysis AS (
+  SELECT
+    p.OwnerUserId,
+    COUNT(p.Id) AS PostCount,
+    AVG(p.Score) AS AvgScore,
+    SUM(p.AnswerCount) AS TotalAnswerCount,
+    SUM(p.CommentCount) AS TotalCommentCount
+  FROM Posts p
+  WHERE
+    p.OwnerUserId IS NOT NULL AND p.OwnerUserId > 0
+  GROUP BY
+    p.OwnerUserId
+)
+SELECT
+  rq.PostId AS QuestionId,
+  rq.PostScore AS QuestionScore,
+  rq.OwnerDisplayName AS QuestionOwner,
+  rq.OwnerReputation AS QuestionOwnerReputation,
+  rq.UpVoteCount AS QuestionUpVotes,
+  rq.CommentCountOver AS QuestionComments,
+  rq.PostViewCount AS QuestionViews,
+  rq.PostCreationDate AS QuestionDate,
+  rq.PostStatus AS QuestionStatus,
+  ra.PostId AS BestAnswerId,
+  ra.PostScore AS BestAnswerScore,
+  ra.OwnerDisplayName AS BestAnswerOwner,
+  ra.OwnerReputation AS BestAnswerOwnerReputation,
+  ra.UpVoteCount AS BestAnswerUpVotes,
+  ra.CommentCountOver AS BestAnswerComments,
+  ua.VoteCount AS UserTotalVotesLastYear,
+  upa.PostCount AS UserTotalPosts,
+  upa.AvgScore AS UserAvgPostScore,
+  CASE
+    WHEN rq.CompositeScore > 1000 AND ra.AnswerStatus = 'Accepted' AND LENGTH(rq.OwnerDisplayName) > 5 AND SUBSTRING(rq.OwnerDisplayName, 1, 3) <> 'An ' THEN 'High Engagement Question'
+    WHEN rq.PostStatus = 'Closed' AND ra.PostScore < 0 THEN 'Problematic Closed Question'
+    WHEN ra.AnswerStatus = 'Accepted' AND ra.PostScore > 50 THEN 'Highly Valued Answer'
+    ELSE 'Standard Post'
+  END AS PerformanceCategory
+FROM RankedQuestions rq
+LEFT JOIN RankedAnswers ra
+  ON rq.PostId = (
+    SELECT AcceptedAnswerId FROM Posts WHERE Id = rq.PostId
+  )
+LEFT JOIN UserActivity ua
+  ON rq.grp_owneruserid = ua.UserId
+LEFT JOIN UserPostAnalysis upa
+  ON rq.grp_owneruserid = upa.OwnerUserId
+WHERE
+  rq.PostScore > 10 OR ra.PostScore > 5 OR rq.UpVoteCount > 10 OR ra.UpVoteCount > 5 OR ua.VoteCount IS NOT NULL
+ORDER BY
+  rq.CompositeScore DESC,
+  ra.PostScore DESC,
+  rq.PostCreationDate DESC
+LIMIT 100;

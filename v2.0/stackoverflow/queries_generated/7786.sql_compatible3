@@ -1,0 +1,248 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        SUM(COALESCE(p.Score, 0)) AS TotalScore,
+        AVG(COALESCE(p.Score, 0)) AS AvgScore,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags) - 2)), ', ') AS AllTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        PostCount,
+        CommentCount,
+        BadgeCount,
+        LastPostDate,
+        LastCommentDate,
+        QuestionCount,
+        AnswerCount,
+        TotalScore,
+        AvgScore,
+        AllTags,
+        ROW_NUMBER() OVER (ORDER BY TotalScore DESC) AS ScoreRank,
+        ROW_NUMBER() OVER (ORDER BY PostCount DESC) AS PostRank,
+        RANK() OVER (ORDER BY Reputation DESC) AS RepRank
+    FROM UserActivityStats
+),
+-- Helper to split tag strings into rows using standard SQL: recursive CTE to emulate unnest/string_to_array
+SplitTags AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        TRIM(BOTH '<' FROM TRIM(BOTH '>' FROM p.Tags)) AS tags_str
+    FROM Posts p
+    WHERE p.Tags IS NOT NULL AND p.Tags <> ''
+),
+TagTokens AS (
+    SELECT
+        PostId,
+        OwnerUserId,
+        PostTypeId,
+        CASE
+            WHEN tags_str = '' THEN NULL
+            WHEN POSITION('<' IN tags_str) = 0 THEN tags_str
+            ELSE SUBSTRING(tags_str FROM 1 FOR (CASE WHEN POSITION('<' IN tags_str) = 0 THEN CHAR_LENGTH(tags_str) ELSE POSITION('<' IN tags_str) - 1 END))
+        END AS token,
+        CASE
+            WHEN POSITION('<' IN tags_str) = 0 THEN ''
+            ELSE SUBSTRING(tags_str FROM (CASE WHEN POSITION('<' IN tags_str) = 0 THEN 0 ELSE POSITION('<' IN tags_str) + 1 END))
+        END AS rest,
+        1 AS lvl
+    FROM SplitTags
+    UNION ALL
+    SELECT
+        PostId,
+        OwnerUserId,
+        PostTypeId,
+        CASE
+            WHEN rest = '' THEN NULL
+            WHEN POSITION('<' IN rest) = 0 THEN rest
+            ELSE SUBSTRING(rest FROM 1 FOR (CASE WHEN POSITION('<' IN rest) = 0 THEN CHAR_LENGTH(rest) ELSE POSITION('<' IN rest) - 1 END))
+        END AS token,
+        CASE
+            WHEN POSITION('<' IN rest) = 0 THEN ''
+            ELSE SUBSTRING(rest FROM (POSITION('<' IN rest) + 1))
+        END AS rest,
+        lvl + 1
+    FROM TagTokens
+    WHERE rest IS NOT NULL AND rest <> ''
+),
+NormalizedTags AS (
+    SELECT
+        OwnerUserId AS UserId,
+        token AS TagName,
+        PostId,
+        PostTypeId
+    FROM TagTokens
+    WHERE token IS NOT NULL AND token <> ''
+),
+GlobalTagCounts AS (
+    SELECT
+        TagName,
+        COUNT(*) AS count
+    FROM NormalizedTags
+    WHERE PostTypeId = 1
+    GROUP BY TagName
+),
+UserTagCounts AS (
+    SELECT
+        nt.UserId,
+        nt.TagName,
+        COUNT(*) AS Count
+    FROM NormalizedTags nt
+    WHERE nt.PostTypeId = 1
+    GROUP BY nt.UserId, nt.TagName
+),
+UserTagAnalysis AS (
+    SELECT 
+        utc.UserId,
+        utc.TagName,
+        utc.Count AS TagCount,
+        AVG(utc.Count) OVER (PARTITION BY utc.UserId) AS AvgTagCountPerUser,
+        PERCENT_RANK() OVER (ORDER BY utc.Count) AS TagCountPercentile,
+        CASE 
+            WHEN utc.Count > (SELECT AVG(count) FROM GlobalTagCounts) THEN 'AboveAverage'
+            WHEN utc.Count < (SELECT AVG(count) FROM GlobalTagCounts) THEN 'BelowAverage'
+            ELSE 'Average'
+        END AS TagPerformance
+    FROM UserTagCounts utc
+)
+SELECT 
+    tu.UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.PostCount,
+    tu.CommentCount,
+    tu.BadgeCount,
+    tu.LastPostDate,
+    tu.LastCommentDate,
+    tu.QuestionCount,
+    tu.AnswerCount,
+    tu.TotalScore,
+    tu.AvgScore,
+    tu.AllTags,
+    tu.ScoreRank,
+    tu.PostRank,
+    tu.RepRank,
+    COALESCE(uta.TagName, 'No Tags') AS MostActiveTag,
+    COALESCE(uta.TagCount, 0) AS TagActivityCount,
+    CASE 
+        WHEN uta.TagCount > uta.AvgTagCountPerUser THEN 'Highly Active'
+        WHEN uta.TagCount < uta.AvgTagCountPerUser THEN 'Less Active'
+        ELSE 'Average Activity'
+    END AS ActivityLevel,
+    uta.TagCountPercentile,
+    uta.TagPerformance,
+    CASE 
+        WHEN tu.Reputation > 10000 AND tu.PostCount > 100 THEN 'Elite Contributor'
+        WHEN tu.Reputation > 5000 AND tu.QuestionCount > 50 THEN 'Active Contributor'
+        WHEN tu.PostCount > 50 THEN 'Regular Participant'
+        ELSE 'Occasional Participant'
+    END AS ParticipantLevel,
+    CASE 
+        WHEN tu.BadgeCount > 50 THEN 'Award Winning'
+        WHEN tu.BadgeCount > 25 THEN 'Well Recognized'
+        WHEN tu.BadgeCount > 10 THEN 'Recognized'
+        ELSE 'Newcomer'
+    END AS RecognitionLevel,
+    (tu.TotalScore - LAG(tu.TotalScore) OVER (ORDER BY tu.ScoreRank)) AS ScoreDifferenceFromPrevious,
+    LAG(tu.DisplayName) OVER (ORDER BY tu.ScoreRank) AS PreviousTopScorer,
+    (SELECT COUNT(*) FROM Users u2 WHERE u2.Reputation > tu.Reputation) AS RepRankingAbove,
+    (SELECT COUNT(*) FROM TopUsers tu2 WHERE tu2.ScoreRank < tu.ScoreRank) AS UsersAboveInScoreRank,
+    DENSE_RANK() OVER (ORDER BY tu.Reputation) AS ReputationRank,
+    NTILE(4) OVER (ORDER BY tu.Reputation) AS ReputationQuartile,
+    ('User #' || tu.UserId || ': ' || tu.DisplayName) AS UserIdentifier,
+    CASE 
+        WHEN tu.LastPostDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days' THEN 'Active Last Month'
+        WHEN tu.LastPostDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days' THEN 'Active Last Quarter'
+        WHEN tu.LastPostDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year' THEN 'Active Last Year'
+        ELSE 'Inactive'
+    END AS ActivityStatus,
+    ROUND((tu.QuestionCount * 100.0 / NULLIF(tu.PostCount, 0)), 2) AS QuestionPercentage,
+    ROUND((tu.AnswerCount * 100.0 / NULLIF(tu.PostCount, 0)), 2) AS AnswerPercentage,
+    CASE 
+        WHEN tu.PostCount > 0 THEN (tu.AnswerCount * 100.0 / tu.PostCount)
+        ELSE 0
+    END AS AnswerToPostRatio,
+    (tu.BadgeCount * 1.0 / NULLIF(tu.PostCount, 0)) AS BadgePerPostRatio,
+    NULLIF(STRING_AGG(DISTINCT uta.TagName, ', '), '') AS TagList,
+    COUNT(*) OVER () AS TotalUsersInAnalysis,
+    (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = tu.UserId AND p2.PostTypeId = 1) AS QuestionCountForUser,
+    (SELECT COUNT(*) FROM Posts p3 WHERE p3.OwnerUserId = tu.UserId AND p3.PostTypeId = 2) AS AnswerCountForUser,
+    (SELECT SUM(p4.Score) FROM Posts p4 WHERE p4.OwnerUserId = tu.UserId AND p4.PostTypeId = 1) AS TotalQuestionScore,
+    (SELECT SUM(p5.Score) FROM Posts p5 WHERE p5.OwnerUserId = tu.UserId AND p5.PostTypeId = 2) AS TotalAnswerScore,
+    CASE 
+        WHEN tu.QuestionCount > 0 THEN (tu.AnswerCount * 1.0 / tu.QuestionCount)
+        ELSE NULL
+    END AS AnswerToQuestionRatio,
+    COALESCE(
+        (SELECT STRING_AGG(DISTINCT SUBSTRING(ut2.Tags FROM 2 FOR (CHAR_LENGTH(ut2.Tags) - 2)), ', ') 
+         FROM Posts ut2 
+         WHERE ut2.OwnerUserId = tu.UserId 
+           AND ut2.PostTypeId = 1 
+           AND ut2.Tags IS NOT NULL 
+           AND ut2.Tags <> ''), 
+        ''
+    ) AS UserQuestionTags,
+    (SELECT COUNT(*) FROM Posts p6 WHERE p6.OwnerUserId = tu.UserId AND p6.Score = (SELECT MAX(p7.Score) FROM Posts p7 WHERE p7.OwnerUserId = tu.UserId)) AS PostsWithMaxScore,
+    (SELECT COUNT(*) FROM Posts p8 WHERE p8.OwnerUserId = tu.UserId AND p8.CreationDate <= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year') AS OldPostsCount,
+    (CASE WHEN tu.PostCount > 0 THEN 
+        (SELECT AVG(p9.Score) FROM Posts p9 WHERE p9.OwnerUserId = tu.UserId AND p9.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days')
+     ELSE NULL END) AS AvgScoreLast30Days
+FROM TopUsers tu
+LEFT JOIN (
+    SELECT 
+        uta_inner.UserId,
+        uta_inner.TagName,
+        uta_inner.TagCount,
+        uta_inner.AvgTagCountPerUser,
+        uta_inner.TagCountPercentile,
+        uta_inner.TagPerformance,
+        ROW_NUMBER() OVER (PARTITION BY uta_inner.UserId ORDER BY uta_inner.TagCount DESC) AS rn
+    FROM UserTagAnalysis uta_inner
+) uta ON tu.UserId = uta.UserId AND uta.rn = 1
+WHERE tu.RepRank <= 100
+  AND (uta.TagName IS NULL OR uta.TagName NOT IN ('javascript', 'python', 'java', 'c++'))
+  AND (tu.Reputation > 1000 OR tu.PostCount > 10 OR tu.BadgeCount > 5)
+  AND (tu.ScoreRank <= 50 OR tu.PostRank <= 50 OR tu.RepRank <= 30)
+GROUP BY
+    tu.UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.PostCount,
+    tu.CommentCount,
+    tu.BadgeCount,
+    tu.LastPostDate,
+    tu.LastCommentDate,
+    tu.QuestionCount,
+    tu.AnswerCount,
+    tu.TotalScore,
+    tu.AvgScore,
+    tu.AllTags,
+    tu.ScoreRank,
+    tu.PostRank,
+    tu.RepRank,
+    uta.TagName,
+    uta.TagCount,
+    uta.AvgTagCountPerUser,
+    uta.TagCountPercentile,
+    uta.TagPerformance
+ORDER BY tu.ScoreRank, tu.RepRank, tu.PostCount DESC
+LIMIT 100;

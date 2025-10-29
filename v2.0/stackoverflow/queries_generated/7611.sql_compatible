@@ -1,0 +1,82 @@
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN p.Id END) AS QuestionsWithAcceptedAnswers,
+    COUNT(DISTINCT b.Id) AS BadgesReceived,
+    COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+    COALESCE(SUM(p.Score), 0) AS TotalScore,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END), 0) AS QuestionScore,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END), 0) AS AnswerScore,
+    COALESCE(AVG(p.Score), 0) AS AverageScore,
+    MAX(p.CreationDate) AS LatestPostDate,
+    MIN(p.CreationDate) AS FirstPostDate,
+    CAST(EXTRACT(EPOCH FROM (MAX(p.CreationDate) - MIN(p.CreationDate))) / 86400 AS INTEGER) AS ActiveDays,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END), 0) AS TotalQuestionViews,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.ViewCount ELSE 0 END), 0) AS TotalAnswerViews,
+    COUNT(DISTINCT c.Id) AS CommentCount,
+    COUNT(DISTINCT pl.Id) AS LinkCount,
+    STRING_AGG(DISTINCT t.TagName, ', ') AS TagsUsed,
+    CASE 
+        WHEN COUNT(DISTINCT p.Id) > 100 THEN 'Elite'
+        WHEN COUNT(DISTINCT p.Id) > 50 THEN 'Veteran'
+        WHEN COUNT(DISTINCT p.Id) > 10 THEN 'Regular'
+        ELSE 'Newbie'
+    END AS UserCategory,
+    CASE 
+        WHEN EXISTS(SELECT 1 FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 2) THEN 'Upvoter'
+        WHEN EXISTS(SELECT 1 FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 3) THEN 'Downvoter'
+        ELSE 'Neutral'
+    END AS VotingPattern,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN p.Id END) AS QuestionsWithAnswers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AnswerCount = 0 THEN p.Id END) AS QuestionsWithNoAnswers,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 2 AND p.Score > 0 THEN p.Score ELSE 0 END), 0) AS PositiveAnswers,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 2 AND p.Score < 0 THEN p.Score ELSE 0 END), 0) AS NegativeAnswers,
+    COUNT(DISTINCT CASE WHEN p.LastActivityDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30 day') THEN p.Id END) AS RecentPosts,
+    COALESCE(STRING_AGG(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Title END, ' | '), 'No Questions') AS RecentQuestionTitles,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL THEN p.Id END) AS ClosedQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.LastEditDate IS NOT NULL THEN p.Id END) AS EditedAnswers,
+    AVG(CASE WHEN p.PostTypeId = 1 THEN p.AnswerCount ELSE NULL END) AS AvgAnswersPerQuestion,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) * 1.0 / NULLIF(COUNT(DISTINCT p.Id),0), 0) AS QuestionRatio,
+    (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = u.Id AND p2.PostTypeId = 1 AND p2.Score >= 100) AS HighScoreQuestions,
+    (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = u.Id AND p2.PostTypeId = 2 AND p2.Score >= 100) AS HighScoreAnswers,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(DISTINCT p.Id),0), 0) AS QuestionPercentage,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(DISTINCT p.Id),0), 0) AS AnswerPercentage,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 1 AND p.Tags IS NOT NULL THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(DISTINCT p.Id),0), 0) AS TaggedQuestionsPercentage,
+    COALESCE(SUM(CASE WHEN p.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(DISTINCT p.Id),0), 0) AS AboveAveragePostsPercentage
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN Comments c ON u.Id = c.UserId
+LEFT JOIN PostLinks pl ON u.Id = pl.Id
+LEFT JOIN (
+    SELECT DISTINCT p.OwnerUserId, t.TagName
+    FROM Posts p
+    LEFT JOIN (
+        SELECT Id, UNNEST(string_to_array(SUBSTRING(Tags, 2, LENGTH(Tags)-2), '><')) AS TagName
+        FROM Posts
+        WHERE Tags IS NOT NULL AND Tags <> ''
+    ) t ON p.Id = t.Id
+    WHERE p.PostTypeId = 1 AND p.OwnerUserId IS NOT NULL
+) t ON u.Id = t.OwnerUserId
+WHERE u.Id IN (
+    SELECT u2.Id
+    FROM Users u2
+    LEFT JOIN Posts p2 ON u2.Id = p2.OwnerUserId
+    GROUP BY u2.Id
+    HAVING COUNT(DISTINCT p2.Id) > 0
+      AND MAX(p2.CreationDate) >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '365 day')
+      AND COUNT(DISTINCT CASE WHEN p2.PostTypeId = 1 THEN p2.Id END) > 10
+)
+GROUP BY u.Id, u.DisplayName, u.Reputation
+HAVING COUNT(DISTINCT p.Id) > 5
+   AND COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 0
+   AND COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) >= 0
+ORDER BY TotalScore DESC, Reputation DESC
+OFFSET 100 ROWS
+FETCH NEXT 100 ROWS ONLY;

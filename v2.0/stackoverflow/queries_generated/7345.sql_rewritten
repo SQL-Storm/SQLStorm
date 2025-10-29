@@ -1,0 +1,314 @@
+-- {"query": "7345.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2774} 
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.Score > 10 THEN 'HighlyVotedQuestion'
+            WHEN p.PostTypeId = 2 AND p.Score > 5 THEN 'HighlyVotedAnswer'
+            WHEN p.PostTypeId = 1 AND p.Score <= 10 THEN 'NormalQuestion'
+            WHEN p.PostTypeId = 2 AND p.Score <= 5 THEN 'NormalAnswer'
+            ELSE 'Other'
+        END as post_category,
+        COALESCE(p.Tags, '') as cleaned_tags,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags != '' THEN 
+                (SELECT COUNT(*) FROM unnest(string_to_array(trim(trim(p.Tags, '<>'), '><')) AS tag)
+            ELSE 0 
+        END as tag_count
+    FROM Posts p
+),
+UserActivity AS (
+    SELECT 
+        u.Id as user_id,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.CreationDate as user_creation_date,
+        (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = u.Id AND PostTypeId = 1) as question_count,
+        (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = u.Id AND PostTypeId = 2) as answer_count,
+        (SELECT COUNT(*) FROM Comments WHERE UserId = u.Id) as comment_count,
+        (SELECT COUNT(*) FROM Votes WHERE UserId = u.Id) as vote_count,
+        (SELECT COUNT(*) FROM Badges WHERE UserId = u.Id) as badge_count,
+        (SELECT AVG(Score) FROM Posts WHERE OwnerUserId = u.Id AND PostTypeId = 1) as avg_question_score,
+        (SELECT AVG(Score) FROM Posts WHERE OwnerUserId = u.Id AND PostTypeId = 2) as avg_answer_score,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Elite'
+            WHEN u.Reputation >= 1000 THEN 'Advanced'
+            WHEN u.Reputation >= 100 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as reputation_level,
+        COALESCE(u.DisplayName, 'Anonymous') as display_name
+    FROM Users u
+),
+PostAnalysis AS (
+    SELECT 
+        rp.Id,
+        rp.PostTypeId,
+        rp.ParentId,
+        rp.OwnerUserId,
+        rp.Score,
+        rp.ViewCount,
+        rp.CreationDate,
+        rp.Title,
+        rp.Tags,
+        rp.AnswerCount,
+        rp.CommentCount,
+        rp.FavoriteCount,
+        rp.post_category,
+        rp.tag_count,
+        CASE 
+            WHEN rp.Score > 0 AND rp.Score < 10 THEN 'Low'
+            WHEN rp.Score >= 10 AND rp.Score < 50 THEN 'Medium'
+            WHEN rp.Score >= 50 THEN 'High'
+            ELSE 'Zero'
+        END as score_category,
+        DATEDIFF(day, rp.CreationDate, cast('2024-10-01 12:34:56' as timestamp)) as days_since_creation,
+        CASE 
+            WHEN rp.rn = 1 THEN 'MostRecent'
+            WHEN rp.rn = 2 THEN 'SecondMostRecent'
+            WHEN rp.rn = 3 THEN 'ThirdMostRecent'
+            ELSE 'Older'
+        END as recency_rank,
+        COALESCE(rp.prev_score, 0) as previous_score,
+        CASE 
+            WHEN rp.prev_score IS NOT NULL AND rp.Score > rp.prev_score THEN 'Increased'
+            WHEN rp.prev_score IS NOT NULL AND rp.Score < rp.prev_score THEN 'Decreased'
+            ELSE 'NoChange'
+        END as score_trend
+    FROM RankedPosts rp
+    WHERE rp.rn <= 3
+),
+TagDistribution AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.IsRequired,
+        t.IsModeratorOnly,
+        CASE 
+            WHEN t.Count >= 1000 THEN 'Popular'
+            WHEN t.Count >= 100 THEN 'Moderate'
+            WHEN t.Count >= 10 THEN 'Small'
+            ELSE 'Rare'
+        END as popularity_level,
+        (SELECT AVG(Count) FROM Tags) as avg_tag_count
+    FROM Tags t
+),
+CombinedData AS (
+    SELECT 
+        pa.Id,
+        pa.PostTypeId,
+        pa.ParentId,
+        pa.OwnerUserId,
+        pa.Score,
+        pa.ViewCount,
+        pa.CreationDate,
+        pa.Title,
+        pa.Tags,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.FavoriteCount,
+        pa.post_category,
+        pa.tag_count,
+        pa.score_category,
+        pa.days_since_creation,
+        pa.recency_rank,
+        pa.previous_score,
+        pa.score_trend,
+        ua.user_id,
+        ua.Reputation,
+        ua.Views,
+        ua.UpVotes,
+        ua.DownVotes,
+        ua.user_creation_date,
+        ua.question_count,
+        ua.answer_count,
+        ua.comment_count,
+        ua.vote_count,
+        ua.badge_count,
+        ua.avg_question_score,
+        ua.avg_answer_score,
+        ua.reputation_level,
+        ua.display_name,
+        td.TagName,
+        td.Count as tag_count_detail,
+        td.IsRequired,
+        td.IsModeratorOnly,
+        td.popularity_level,
+        td.avg_tag_count,
+        CASE 
+            WHEN pa.Score > (ua.avg_question_score * 1.5) AND pa.PostTypeId = 1 THEN 'ExceptionalQuestion'
+            WHEN pa.Score > (ua.avg_answer_score * 1.5) AND pa.PostTypeId = 2 THEN 'ExceptionalAnswer'
+            ELSE 'Normal'
+        END as performance_indicator,
+        CASE 
+            WHEN pa.tag_count > 5 THEN 'TagHeavy'
+            WHEN pa.tag_count > 2 THEN 'TagModerate'
+            ELSE 'TagLight'
+        END as tag_density,
+        CASE 
+            WHEN pa.AnswerCount > 10 AND pa.PostTypeId = 1 THEN 'WellAnsweredQuestion'
+            WHEN pa.AnswerCount = 0 AND pa.PostTypeId = 1 THEN 'UnansweredQuestion'
+            ELSE 'OtherQuestion'
+        END as answer_status,
+        CASE 
+            WHEN pa.CommentCount IS NULL THEN 0
+            ELSE pa.CommentCount
+        END as normalized_comments,
+        CASE 
+            WHEN pa.FavoriteCount IS NULL THEN 0
+            ELSE pa.FavoriteCount
+        END as normalized_favorites,
+        ROW_NUMBER() OVER (ORDER BY pa.Score DESC, pa.ViewCount DESC) as overall_rank,
+        RANK() OVER (PARTITION BY pa.PostTypeId ORDER BY pa.Score DESC) as type_rank,
+        DENSE_RANK() OVER (ORDER BY pa.Score DESC) as dense_score_rank,
+        PERCENT_RANK() OVER (ORDER BY pa.Score DESC) as score_percentile
+    FROM PostAnalysis pa
+    LEFT JOIN UserActivity ua ON pa.OwnerUserId = ua.user_id
+    LEFT JOIN TagDistribution td ON td.TagName = ANY(string_to_array(trim(trim(pa.Tags, '<>'), '><'), '><'))
+    WHERE EXISTS (
+        SELECT 1 FROM Posts p 
+        WHERE p.Id = pa.Id 
+        AND (p.Score > 0 OR p.ViewCount > 0 OR p.AnswerCount > 0)
+    )
+)
+SELECT 
+    cd.Id,
+    cd.PostTypeId,
+    cd.OwnerUserId,
+    cd.Score,
+    cd.ViewCount,
+    cd.CreationDate,
+    cd.Title,
+    cd.Tags,
+    cd.AnswerCount,
+    cd.CommentCount,
+    cd.FavoriteCount,
+    cd.post_category,
+    cd.tag_count,
+    cd.score_category,
+    cd.days_since_creation,
+    cd.recency_rank,
+    cd.previous_score,
+    cd.score_trend,
+    cd.user_id,
+    cd.Reputation,
+    cd.Views,
+    cd.UpVotes,
+    cd.DownVotes,
+    cd.user_creation_date,
+    cd.question_count,
+    cd.answer_count,
+    cd.comment_count,
+    cd.vote_count,
+    cd.badge_count,
+    cd.avg_question_score,
+    cd.avg_answer_score,
+    cd.reputation_level,
+    cd.display_name,
+    cd.TagName,
+    cd.tag_count_detail,
+    cd.IsRequired,
+    cd.IsModeratorOnly,
+    cd.popularity_level,
+    cd.avg_tag_count,
+    cd.performance_indicator,
+    cd.tag_density,
+    cd.answer_status,
+    cd.normalized_comments,
+    cd.normalized_favorites,
+    cd.overall_rank,
+    cd.type_rank,
+    cd.dense_score_rank,
+    cd.score_percentile,
+    CASE 
+        WHEN cd.Reputation >= 10000 AND cd.overall_rank <= 100 THEN 'TopPerformer'
+        WHEN cd.Reputation >= 1000 AND cd.overall_rank <= 1000 THEN 'GoodPerformer'
+        WHEN cd.Reputation >= 100 AND cd.overall_rank <= 10000 THEN 'AveragePerformer'
+        ELSE 'StandardPerformer'
+    END as user_performance_level,
+    CASE 
+        WHEN cd.Score >= 100 AND cd.AnswerCount > 0 THEN 'HighValueAnswer'
+        WHEN cd.Score >= 50 AND cd.PostTypeId = 1 THEN 'HighValueQuestion'
+        WHEN cd.Score >= 20 THEN 'MediumValue'
+        ELSE 'LowValue'
+    END as content_value,
+    CASE 
+        WHEN cd.days_since_creation <= 7 AND cd.Score > 0 THEN 'RecentHighValue'
+        WHEN cd.days_since_creation <= 30 AND cd.Score > 10 THEN 'RecentMediumValue'
+        WHEN cd.days_since_creation > 30 AND cd.Score > 5 THEN 'OldValue'
+        ELSE 'LowValue'
+    END as recency_adjusted_value,
+    CASE 
+        WHEN cd.ViewCount > 500 AND cd.Score > 20 THEN 'ViralContent'
+        WHEN cd.ViewCount > 100 AND cd.Score > 10 THEN 'PopularContent'
+        WHEN cd.ViewCount > 10 AND cd.Score > 5 THEN 'StandardContent'
+        ELSE 'LowTraffic'
+    END as traffic_level,
+    CASE 
+        WHEN cd.Score > 0 AND cd.CommentCount > 10 THEN 'HighlyDiscussed'
+        WHEN cd.Score > 0 AND cd.CommentCount > 5 THEN 'ModeratelyDiscussed'
+        WHEN cd.Score > 0 THEN 'LowlyDiscussed'
+        ELSE 'Undiscussed'
+    END as discussion_level,
+    CASE 
+        WHEN cd.overall_rank <= 10 THEN 1 
+        WHEN cd.overall_rank <= 100 THEN 2
+        WHEN cd.overall_rank <= 1000 THEN 3
+        ELSE 4
+    END as rank_level,
+    ABS(cd.Score - (SELECT AVG(Score) FROM Posts WHERE PostTypeId = cd.PostTypeId)) as score_deviation,
+    COALESCE(cd.normalized_comments, 0) AS final_comments,
+    COALESCE(cd.normalized_favorites, 0) AS final_favorites,
+    CASE 
+        WHEN cd.PostTypeId IN (1, 2) AND cd.AnswerCount IS NOT NULL THEN 
+            CAST(cd.AnswerCount AS FLOAT) / NULLIF(cd.AnswerCount + cd.CommentCount, 0)
+        ELSE 0.0
+    END as answer_comment_ratio,
+    CASE 
+        WHEN cd.Reputation > 0 THEN 
+            CAST(cd.Score AS FLOAT) / NULLIF(cd.Reputation, 0)
+        ELSE 0.0
+    END as score_reputation_ratio,
+    CASE 
+        WHEN cd.avg_question_score > 0 THEN 
+            CAST(cd.Score AS FLOAT) / NULLIF(cd.avg_question_score, 0)
+        ELSE 0.0
+    END as score_vs_avg_question_score,
+    CASE 
+        WHEN cd.avg_answer_score > 0 THEN 
+            CAST(cd.Score AS FLOAT) / NULLIF(cd.avg_answer_score, 0)
+        ELSE 0.0
+    END as score_vs_avg_answer_score,
+    CASE 
+        WHEN cd.score_percentile >= 0.9 THEN 'Top10Percentile'
+        WHEN cd.score_percentile >= 0.75 THEN 'Top25Percentile'
+        WHEN cd.score_percentile >= 0.5 THEN 'Top50Percentile'
+        ELSE 'BelowMedian'
+    END as percentile_level
+FROM CombinedData cd
+WHERE cd.Score IS NOT NULL AND cd.Score >= 0
+AND (cd.Reputation > 0 OR cd.Reputation IS NULL)
+AND (cd.ViewCount > 0 OR cd.ViewCount IS NULL)
+HAVING cd.Score > (
+    SELECT AVG(Score) + 
+           (SELECT STDDEV(Score) FROM Posts WHERE PostTypeId = cd.PostTypeId)
+    FROM Posts 
+    WHERE PostTypeId = cd.PostTypeId
+)
+ORDER BY cd.Score DESC, cd.ViewCount DESC, cd.CreationDate DESC
+LIMIT 1000
+OFFSET 0;

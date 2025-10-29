@@ -1,0 +1,208 @@
+-- {"query": "2661.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1896} 
+
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 AS Level,
+        ARRAY[t.TagName] AS Path
+    FROM Tags t
+    WHERE t.IsRequired = 1
+
+    UNION ALL
+
+    SELECT
+        child.Id,
+        child.TagName,
+        child.Count,
+        child.IsModeratorOnly,
+        child.IsRequired,
+        p.Level + 1,
+        p.Path || child.TagName
+    FROM Tags child
+    JOIN PostLinks pl ON pl.PostId = child.ExcerptPostId
+    JOIN RecursiveTagHierarchy p ON pl.RelatedPostId = p.ExcerptPostId
+    WHERE child.TagName IS NOT NULL AND NOT child.TagName = ANY(p.Path)
+),
+UserActivityStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsAsked,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersGiven,
+        SUM(COALESCE(p.Score,0)) AS TotalPostScore,
+        AVG(COALESCE(p.Score,0)) FILTER (WHERE p.PostTypeId IN (1,2)) AS AvgPostScore,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        COUNT(DISTINCT b.Id) AS BadgesEarned,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+PostWithCloseInfo AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.AcceptedAnswerId,
+        COALESCE(
+            (
+                SELECT MAX(ph2.CreationDate)
+                FROM PostHistory ph2
+                WHERE ph2.PostId = p.Id AND ph2.PostHistoryTypeId = 10
+            ), NULL) AS CloseDate,
+        COALESCE(
+            (
+                SELECT STRING_AGG(DISTINCT crt.Name, ', ' ORDER BY crt.Name)
+                FROM PostHistory ph
+                JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS INT)
+                WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+            ), 'Open') AS CloseReasons
+    FROM Posts p
+),
+RankedAnswers AS (
+    SELECT
+        a.*,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank,
+        COUNT(*) OVER (PARTITION BY a.ParentId) AS TotalAnswers
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+),
+TopAnswerDetails AS (
+    SELECT
+        ra.ParentId AS QuestionId,
+        ra.Id AS AnswerId,
+        ra.Score AS AnswerScore,
+        ra.CreationDate AS AnswerCreationDate,
+        ra.AnswerRank,
+        ra.TotalAnswers,
+        u.DisplayName AS AnswerOwner,
+        u.Reputation AS AnswerOwnerReputation
+    FROM RankedAnswers ra
+    LEFT JOIN Users u ON u.Id = ra.OwnerUserId
+    WHERE ra.AnswerRank = 1
+),
+UserVoteSummary AS (
+    SELECT
+        v.UserId,
+        vt.Name AS VoteType,
+        COUNT(*) AS VoteCount,
+        SUM(COALESCE(v.BountyAmount, 0)) AS TotalBounty
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE v.UserId IS NOT NULL
+    GROUP BY v.UserId, vt.Name
+),
+FilteredQuestions AS (
+    SELECT
+        pwi.Id,
+        pwi.Title,
+        pwi.CreationDate,
+        pwi.Score,
+        pwi.ViewCount,
+        pwi.Tags,
+        pwi.CloseDate,
+        pwi.CloseReasons,
+        COUNT(DISTINCT c.Id) AS CommentsCount,
+        COALESCE(ta.AnswerId, -1) AS TopAnswerId,
+        COALESCE(ta.AnswerScore, 0) AS TopAnswerScore,
+        COALESCE(ta.AnswerOwner, 'unknown') AS TopAnswerOwner,
+        COALESCE(ta.AnswerOwnerReputation, 0) AS TopAnswerOwnerReputation,
+        ta.TotalAnswers,
+        ROW_NUMBER() OVER (ORDER BY pwi.Score DESC, pwi.ViewCount DESC) AS RankByScoreView
+    FROM PostWithCloseInfo pwi
+    LEFT JOIN Comments c ON c.PostId = pwi.Id
+    LEFT JOIN TopAnswerDetails ta ON ta.QuestionId = pwi.Id
+    WHERE pwi.PostTypeId = 1
+      AND (pwi.CloseDate IS NULL OR pwi.CloseDate > CURRENT_DATE - INTERVAL '30 day')
+      AND pwi.Score >= 0
+    GROUP BY
+        pwi.Id, pwi.Title, pwi.CreationDate, pwi.Score, pwi.ViewCount, pwi.Tags,
+        pwi.CloseDate, pwi.CloseReasons,
+        ta.AnswerId, ta.AnswerScore, ta.AnswerOwner, ta.AnswerOwnerReputation, ta.TotalAnswers
+),
+StringProcessedTags AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        unnest(string_to_array(trim(both '<>' from q.Tags), '><')) AS Tag
+    FROM Posts q
+    WHERE q.PostTypeId = 1
+      AND q.Tags IS NOT NULL
+),
+TagPopularityStats AS (
+    SELECT
+        spt.Tag,
+        COUNT(DISTINCT spt.QuestionId) AS QuestionCount,
+        AVG(q.Score) AS AvgQuestionScore,
+        MAX(q.ViewCount) AS MaxViewCount
+    FROM StringProcessedTags spt
+    JOIN Posts q ON q.Id = spt.QuestionId
+    GROUP BY spt.Tag
+),
+QuestionsWithHighImpactTags AS (
+    SELECT DISTINCT q.*
+    FROM FilteredQuestions q
+    JOIN StringProcessedTags spt ON spt.QuestionId = q.Id
+    JOIN TagPopularityStats tps ON tps.Tag = spt.Tag
+    WHERE tps.QuestionCount > 1000 AND tps.AvgQuestionScore > 5
+),
+FinalResults AS (
+    SELECT
+        fq.Id AS QuestionId,
+        fq.Title,
+        fq.CreationDate,
+        fq.Score,
+        fq.ViewCount,
+        fq.Tags,
+        fq.CloseDate,
+        fq.CloseReasons,
+        fq.CommentsCount,
+        fq.TopAnswerId,
+        fq.TopAnswerScore,
+        fq.TopAnswerOwner,
+        fq.TopAnswerOwnerReputation,
+        fq.TotalAnswers,
+        STRING_AGG(DISTINCT spt.Tag, ', ') AS TagList,
+        ROW_NUMBER() OVER (PARTITION BY fq.TopAnswerOwner ORDER BY fq.Score DESC) AS RankPerAnswerer,
+        ua.Reputation AS QuestionOwnerReputation,
+        ua.QuestionsAsked,
+        ua.AnswersGiven,
+        ua.TotalPostScore,
+        ua.BadgesEarned,
+        ua.GoldBadges,
+        ua.SilverBadges,
+        ua.BronzeBadges,
+        COALESCE(uvs.VoteCount, 0) AS TotalVotesByOwner,
+        COALESCE(uvs.TotalBounty, 0) AS TotalBountyByOwner
+    FROM QuestionsWithHighImpactTags fq
+    LEFT JOIN StringProcessedTags spt ON spt.QuestionId = fq.Id
+    LEFT JOIN Users u ON u.DisplayName = fq.TopAnswerOwner
+    LEFT JOIN UserActivityStats ua ON ua.UserId = u.Id
+    LEFT JOIN UserVoteSummary uvs ON uvs.UserId = u.Id
+    GROUP BY
+        fq.Id, fq.Title, fq.CreationDate, fq.Score, fq.ViewCount, fq.Tags, fq.CloseDate, fq.CloseReasons,
+        fq.CommentsCount, fq.TopAnswerId, fq.TopAnswerScore, fq.TopAnswerOwner, fq.TopAnswerOwnerReputation,
+        fq.TotalAnswers,
+        ua.Reputation, ua.QuestionsAsked, ua.AnswersGiven, ua.TotalPostScore, ua.BadgesEarned,
+        ua.GoldBadges, ua.SilverBadges, ua.BronzeBadges,
+        uvs.VoteCount, uvs.TotalBounty
+)
+SELECT *
+FROM FinalResults
+WHERE RankPerAnswerer = 1
+ORDER BY Score DESC, ViewCount DESC
+LIMIT 50;

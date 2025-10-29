@@ -1,0 +1,164 @@
+WITH UserEngagementStats AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.Views AS UserViews,
+        COALESCE(SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END), 0) AS TotalQuestions,
+        COALESCE(SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END), 0) AS TotalAnswers,
+        COALESCE(COUNT(DISTINCT P.Id), 0) AS TotalPosts,
+        COALESCE(COUNT(DISTINCT C.Id), 0) AS TotalComments,
+        COALESCE(SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS TotalUpVotesGiven,
+        COALESCE(SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS TotalDownVotesGiven,
+        MAX(COALESCE(P.LastActivityDate, C.CreationDate, U.LastAccessDate)) AS LastUserActivity,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Votes V ON U.Id = V.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.Views
+),
+PostDetailsExtended AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.AcceptedAnswerId,
+        P.ClosedDate,
+        P.LastEditDate,
+        P.LastActivityDate,
+        P.Title,
+        P.Body,
+        NULLIF(SUBSTRING(P.Tags FROM 2 FOR (POSITION('>' IN P.Tags) - 2)), '') AS FirstTag,
+        CHAR_LENGTH(P.Body) AS BodyLength,
+        ROUND(CAST(P.Score AS NUMERIC) / NULLIF(P.ViewCount, 0) * 100, 2) AS ScoreViewRatio,
+        (P.AcceptedAnswerId IS NOT NULL) AS HasAcceptedAnswer,
+        (SELECT AVG(C.Score) FROM Comments C WHERE C.PostId = P.Id AND C.Score IS NOT NULL) AS AvgCommentScoreOnPost,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.CreationDate DESC) AS PostTypeScoreRank
+    FROM Posts P
+    WHERE P.OwnerUserId IS NOT NULL
+),
+PostHistoryAggregates AS (
+    SELECT
+        PH.PostId,
+        COUNT(DISTINCT PH.Id) AS TotalHistoryEvents,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (35, 36) THEN 1 ELSE 0 END) AS MigrationCount
+    FROM PostHistory PH
+    WHERE PH.PostHistoryTypeId IN (4,5,6,10,11,35,36)
+    GROUP BY PH.PostId
+),
+UserTagUsage AS (
+    SELECT
+        P.OwnerUserId AS UserId,
+        COUNT(DISTINCT NULLIF(SUBSTRING(P.Tags FROM 2 FOR (POSITION('>' IN P.Tags) - 2)), '')) AS DistinctFirstTagsUsed,
+        STRING_AGG(DISTINCT NULLIF(SUBSTRING(P.Tags FROM 2 FOR (POSITION('>' IN P.Tags) - 2)), ''), ', ') AS AllFirstTagsUsed
+    FROM Posts P
+    WHERE P.OwnerUserId IS NOT NULL AND P.Tags IS NOT NULL AND P.PostTypeId = 1
+    GROUP BY P.OwnerUserId
+),
+HighImpactPosts AS (
+    SELECT PD.PostId, PD.OwnerUserId, PD.Title, PD.Score, PD.PostTypeScoreRank
+    FROM PostDetailsExtended PD
+    JOIN PostHistoryAggregates PHA ON PD.PostId = PHA.PostId
+    WHERE (PHA.CloseCount > 0 AND PHA.ReopenCount > 0)
+       OR (PD.Score > (SELECT AVG(Score) * 5 FROM Posts WHERE Score IS NOT NULL AND PostTypeId = 1))
+    UNION ALL
+    SELECT PD.PostId, PD.OwnerUserId, PD.Title, PD.Score, PD.PostTypeScoreRank
+    FROM PostDetailsExtended PD
+    WHERE PD.FavoriteCount > (SELECT AVG(FavoriteCount) * 3 FROM Posts WHERE FavoriteCount IS NOT NULL AND PostTypeId = 1)
+)
+SELECT
+    UES.UserId,
+    UES.DisplayName,
+    UES.Reputation,
+    CASE
+        WHEN UES.Reputation >= 100000 THEN 'Legendary'
+        WHEN UES.Reputation >= 25000 THEN 'Elite'
+        WHEN UES.Reputation >= 5000 THEN 'Veteran'
+        ELSE 'Active Contributor'
+    END AS ReputationTier,
+    UES.UserCreationDate,
+    UES.TotalPosts,
+    UES.TotalQuestions,
+    UES.TotalAnswers,
+    UES.TotalComments,
+    UES.LastUserActivity,
+    UES.GoldBadges,
+    UES.SilverBadges,
+    UES.BronzeBadges,
+    ROUND(AVG(PDE.ScoreViewRatio), 2) AS AveragePostScoreViewRatio,
+    (SELECT ROUND(AVG(C.Score), 2) FROM Comments C WHERE C.UserId = UES.UserId AND C.Score IS NOT NULL) AS UserAvgCommentScore,
+    (
+        SELECT
+            MAX(p_lag.CreationDate) - MIN(p_lag.CreationDate)
+        FROM (
+            SELECT
+                p_inner.CreationDate,
+                p_inner.OwnerUserId,
+                ROW_NUMBER() OVER (PARTITION BY p_inner.OwnerUserId ORDER BY p_inner.CreationDate DESC) AS rn
+            FROM Posts p_inner
+            WHERE p_inner.OwnerUserId = UES.UserId
+        ) AS p_lag
+        WHERE p_lag.rn <= 2
+        GROUP BY p_lag.OwnerUserId
+        HAVING COUNT(p_lag.CreationDate) >= 2
+    ) AS TimeBetweenLastTwoPosts,
+    UTA.DistinctFirstTagsUsed,
+    UTA.AllFirstTagsUsed,
+    MAX(CASE WHEN PDE.PostTypeId = 1 AND PDE.PostTypeScoreRank = 1 THEN PDE.Title END) AS TopQuestionTitle,
+    MAX(CASE WHEN PDE.PostTypeId = 1 AND PDE.PostTypeScoreRank = 1 THEN PDE.Score END) AS TopQuestionScore,
+    SUM(CASE WHEN PDE.BodyLength > (SELECT AVG(BodyLength) FROM PostDetailsExtended WHERE PostTypeId = PDE.PostTypeId AND BodyLength IS NOT NULL) THEN 1 ELSE 0 END) AS AboveAvgBodyLengthPosts,
+    COUNT(DISTINCT HIP.PostId) AS CountOfHighImpactPosts,
+    SUM(CASE WHEN PDE.PostTypeId = 1 AND PDE.Score = 0 AND PDE.PostCreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30 days') THEN 1 ELSE 0 END) AS UnansweredRecentQuestionsCount,
+    COALESCE(SUM(PostVotesReceived.UpVotesReceived), 0) AS TotalPostUpVotesReceived,
+    COALESCE(SUM(PostVotesReceived.DownVotesReceived), 0) AS TotalPostDownVotesReceived,
+    (
+        SELECT U_Editor.DisplayName
+        FROM PostHistory PH_Inner
+        JOIN Posts P_Inner ON PH_Inner.PostId = P_Inner.Id
+        LEFT JOIN Users U_Editor ON PH_Inner.UserId = U_Editor.Id
+        WHERE P_Inner.OwnerUserId = UES.UserId
+          AND PH_Inner.PostHistoryTypeId IN (4,5,6)
+        GROUP BY U_Editor.DisplayName
+        ORDER BY COUNT(*) DESC, U_Editor.DisplayName ASC
+        LIMIT 1
+    ) AS MostFrequentEditorOfAnyUserPost
+FROM UserEngagementStats UES
+LEFT JOIN PostDetailsExtended PDE ON UES.UserId = PDE.OwnerUserId
+LEFT JOIN PostHistoryAggregates PHA ON PDE.PostId = PHA.PostId
+LEFT JOIN UserTagUsage UTA ON UES.UserId = UTA.UserId
+LEFT JOIN HighImpactPosts HIP ON UES.UserId = HIP.OwnerUserId
+LEFT JOIN (
+    SELECT V.PostId,
+           SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+           SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived
+    FROM Votes V
+    GROUP BY V.PostId
+) AS PostVotesReceived ON PDE.PostId = PostVotesReceived.PostId
+WHERE UES.Reputation > 1000
+  AND UES.TotalPosts > 10
+  AND (
+        UES.GoldBadges > 0
+        OR (UES.TotalQuestions > 50 AND (SELECT AVG(ScoreViewRatio) FROM PostDetailsExtended WHERE OwnerUserId = UES.UserId) > 1.5)
+      )
+GROUP BY
+    UES.UserId, UES.DisplayName, UES.Reputation, UES.UserCreationDate, UES.TotalPosts,
+    UES.TotalQuestions, UES.TotalAnswers, UES.TotalComments, UES.LastUserActivity,
+    UES.GoldBadges, UES.SilverBadges, UES.BronzeBadges, UTA.DistinctFirstTagsUsed, UTA.AllFirstTagsUsed
+HAVING COUNT(DISTINCT PDE.PostId) > 0
+ORDER BY UES.Reputation DESC, AveragePostScoreViewRatio DESC
+LIMIT 500;

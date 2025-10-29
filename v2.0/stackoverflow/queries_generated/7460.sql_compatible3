@@ -1,0 +1,221 @@
+WITH UserActivity AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        MAX(b.Date) as LastBadgeDate,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Elite'
+            WHEN u.Reputation >= 1000 THEN 'Veteran'
+            WHEN u.Reputation >= 100 THEN 'Member'
+            ELSE 'Newbie'
+        END as RepLevel,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        COALESCE(SUM(p.ViewCount), 0) as TotalViews,
+        ROUND(CAST(COUNT(DISTINCT p.Id) AS NUMERIC) / NULLIF(EXTRACT(epoch FROM (TIMESTAMP '2024-10-01 12:34:56' - u.CreationDate)) / 86400, 0) * 30, 2) as AvgPostsPerMonth,
+        ROUND(CAST(SUM(p.Score) AS NUMERIC) / NULLIF(COUNT(DISTINCT p.Id), 0) , 2) as AvgScorePerPost,
+        STRING_AGG(p.Title, '; ') as PostTitles
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.PostTypeId,
+        p.ParentId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.LastActivityDate,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            WHEN p.PostTypeId = 4 THEN 'TagWikiExcerpt'
+            WHEN p.PostTypeId = 5 THEN 'TagWiki'
+            WHEN p.PostTypeId = 6 THEN 'ModeratorNomination'
+            WHEN p.PostTypeId = 7 THEN 'WikiPlaceholder'
+            WHEN p.PostTypeId = 8 THEN 'PrivilegeWiki'
+            ELSE 'Unknown'
+        END as PostTypeDesc,
+        COALESCE(p.AnswerCount, 0) as AnswerCountAdjusted,
+        COALESCE(p.CommentCount, 0) as CommentCountAdjusted,
+        COALESCE(p.FavoriteCount, 0) as FavoriteCountAdjusted,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NULL AND EXISTS(SELECT 1 FROM Posts WHERE ParentId = p.Id AND PostTypeId = 2) THEN 'Unanswered'
+            ELSE 'Not Applicable'
+        END as QuestionStatus,
+        CAST((EXTRACT(epoch FROM (p.LastActivityDate - p.CreationDate)) / 86400) AS INTEGER) as DaysActive,
+        CASE 
+            WHEN p.ViewCount > 1000 THEN 'High View'
+            WHEN p.ViewCount > 100 THEN 'Medium View'
+            ELSE 'Low View'
+        END as ViewCategory,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ASC) as UserPostRank,
+        RANK() OVER (ORDER BY p.Score DESC) as ScoreRank,
+        DENSE_RANK() OVER (ORDER BY p.ViewCount DESC) as ViewRank,
+        NTILE(4) OVER (ORDER BY p.Score DESC) as ScoreQuartile,
+        LAG(p.Score) OVER (ORDER BY p.CreationDate) as PrevScore,
+        LEAD(p.Score) OVER (ORDER BY p.CreationDate) as NextScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as AvgScorePerUser,
+        MAX(p.ViewCount) OVER (PARTITION BY p.OwnerUserId) as MaxViewPerUser,
+        MIN(p.Score) OVER (PARTITION BY p.OwnerUserId) as MinScorePerUser
+    FROM Posts p
+    WHERE p.Id IS NOT NULL
+),
+UserEngagement AS (
+    SELECT 
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.RepLevel,
+        ua.PostCount,
+        ua.CommentCount,
+        ua.BadgeCount,
+        ua.TotalScore,
+        ua.TotalViews,
+        ua.AvgPostsPerMonth,
+        ua.AvgScorePerPost,
+        CASE WHEN ua.PostCount > 0 THEN CAST(ua.CommentCount AS NUMERIC) / CAST(ua.PostCount AS NUMERIC) ELSE 0 END as CommentsPerPost,
+        CASE WHEN ua.PostCount > 0 THEN CAST(ua.BadgeCount AS NUMERIC) / CAST(ua.PostCount AS NUMERIC) ELSE 0 END as BadgesPerPost,
+        CASE WHEN ua.Reputation > 0 THEN CAST(ua.PostCount AS NUMERIC) / CAST(ua.Reputation AS NUMERIC) ELSE 0 END as PostsPerRep,
+        CASE 
+            WHEN ua.PostCount > 0 THEN 
+                CASE 
+                    WHEN ua.TotalScore >= 1000 THEN 'Top Performer'
+                    WHEN ua.TotalScore >= 100 THEN 'Good Performer'
+                    WHEN ua.TotalScore >= 10 THEN 'Average Performer'
+                    ELSE 'New Contributor'
+                END
+            ELSE 'No Posts'
+        END as PerformanceLevel,
+        STRING_AGG(pa.Title, '; ') as UserPostTitles
+    FROM UserActivity ua
+    LEFT JOIN PostAnalysis pa ON ua.UserId = pa.OwnerUserId
+    WHERE ua.UserId IS NOT NULL
+    GROUP BY ua.UserId, ua.DisplayName, ua.Reputation, ua.RepLevel, ua.PostCount, ua.CommentCount, ua.BadgeCount, ua.TotalScore, ua.TotalViews, ua.AvgPostsPerMonth, ua.AvgScorePerPost
+),
+ComplexPostMetrics AS (
+    SELECT 
+        pa.PostId,
+        pa.PostTypeId,
+        pa.OwnerUserId,
+        pa.Score,
+        pa.ViewCount,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.FavoriteCount,
+        pa.ScoreRank,
+        pa.ViewRank,
+        pa.ScoreQuartile,
+        pa.UserPostRank,
+        pa.DaysActive,
+        pa.ViewCategory,
+        pa.QuestionStatus,
+        pa.AvgScorePerUser,
+        pa.MaxViewPerUser,
+        pa.MinScorePerUser,
+        CASE 
+            WHEN pa.Score > pa.AvgScorePerUser THEN 'Above Average Score'
+            WHEN pa.Score < pa.AvgScorePerUser THEN 'Below Average Score'
+            ELSE 'Average Score'
+        END as ScoreComparison,
+        CASE 
+            WHEN pa.ViewCount > pa.MaxViewPerUser THEN 'Peak View'
+            WHEN pa.ViewCount = pa.MaxViewPerUser THEN 'Max View'
+            ELSE 'Below Max View'
+        END as ViewComparison,
+        CAST((EXTRACT(epoch FROM (TIMESTAMP '2024-10-01 12:34:56' - pa.CreationDate)) / 86400) AS INTEGER) as DaysSinceCreation,
+        CASE 
+            WHEN (EXTRACT(epoch FROM (TIMESTAMP '2024-10-01 12:34:56' - pa.CreationDate)) / 86400) <= 30 THEN 'New Post'
+            WHEN (EXTRACT(epoch FROM (TIMESTAMP '2024-10-01 12:34:56' - pa.CreationDate)) / 86400) <= 90 THEN 'Recent Post'
+            WHEN (EXTRACT(epoch FROM (TIMESTAMP '2024-10-01 12:34:56' - pa.CreationDate)) / 86400) <= 365 THEN 'Old Post'
+            ELSE 'Archived Post'
+        END as TimeCategory,
+        COALESCE(SUBSTRING(pa.Tags FROM 2 FOR (CHAR_LENGTH(pa.Tags) - 2)), 'No Tags') as RawTags,
+        (CASE WHEN pa.Tags IS NULL THEN 0 ELSE (array_length(string_to_array(COALESCE(SUBSTRING(pa.Tags FROM 2 FOR (CHAR_LENGTH(pa.Tags) - 2)), ''), '><'), 1)) END) as TagCount
+    FROM PostAnalysis pa
+    WHERE pa.PostId IS NOT NULL
+)
+SELECT 
+    ue.UserId,
+    ue.DisplayName,
+    ue.Reputation,
+    ue.RepLevel,
+    ue.PostCount,
+    ue.CommentCount,
+    ue.BadgeCount,
+    ue.TotalScore,
+    ue.TotalViews,
+    ue.AvgPostsPerMonth,
+    ue.AvgScorePerPost,
+    ue.CommentsPerPost,
+    ue.BadgesPerPost,
+    ue.PostsPerRep,
+    ue.PerformanceLevel,
+    STRING_AGG(CAST(cpm.PostId AS TEXT), ', ') as PostIds,
+    STRING_AGG(CAST(cpm.Score AS TEXT), ', ') as Scores,
+    STRING_AGG(CAST(cpm.ViewCount AS TEXT), ', ') as Views,
+    STRING_AGG(CAST(cpm.AnswerCount AS TEXT), ', ') as Answers,
+    STRING_AGG(CAST(cpm.CommentCount AS TEXT), ', ') as Comments,
+    STRING_AGG(CAST(cpm.FavoriteCount AS TEXT), ', ') as Favorites,
+    STRING_AGG(cpm.QuestionStatus, '; ') as QuestionStatuses,
+    STRING_AGG(cpm.ViewCategory, '; ') as ViewCategories,
+    STRING_AGG(cpm.TimeCategory, '; ') as TimeCategories,
+    STRING_AGG(CAST(cpm.TagCount AS TEXT), ', ') as TagCounts,
+    COUNT(*) OVER () as TotalUsers,
+    AVG(cpm.Score) OVER () as OverallAvgScore,
+    MAX(cpm.Score) OVER () as OverallMaxScore,
+    MIN(cpm.Score) OVER () as OverallMinScore,
+    (SELECT COUNT(*) FROM ComplexPostMetrics WHERE Score > (SELECT AVG(Score) FROM ComplexPostMetrics)) as PostsAboveAvg,
+    (SELECT COUNT(*) FROM ComplexPostMetrics WHERE Score < (SELECT AVG(Score) FROM ComplexPostMetrics)) as PostsBelowAvg,
+    (SELECT UserId FROM Posts WHERE Score = (SELECT MAX(Score) FROM Posts) LIMIT 1) as TopScoringUser,
+    ('Users who are ' || ue.RepLevel || ' with ' || CAST(ue.PostCount AS TEXT) || ' posts and ' || CAST(ue.TotalScore AS TEXT) || ' total score') as UserDescription
+FROM UserEngagement ue
+LEFT JOIN ComplexPostMetrics cpm ON ue.UserId = cpm.OwnerUserId
+WHERE ue.UserId > 0
+GROUP BY 
+    ue.UserId, 
+    ue.DisplayName, 
+    ue.Reputation, 
+    ue.RepLevel, 
+    ue.PostCount, 
+    ue.CommentCount, 
+    ue.BadgeCount, 
+    ue.TotalScore, 
+    ue.TotalViews, 
+    ue.AvgPostsPerMonth, 
+    ue.AvgScorePerPost, 
+    ue.CommentsPerPost, 
+    ue.BadgesPerPost, 
+    ue.PostsPerRep, 
+    ue.PerformanceLevel
+HAVING 
+    COUNT(cpm.PostId) > 0 
+    AND (COUNT(cpm.PostId) > 1 OR COUNT(cpm.PostId) = 1)
+ORDER BY 
+    ue.TotalScore DESC,
+    ue.PostCount DESC,
+    ue.Reputation DESC,
+    ue.BadgeCount DESC
+OFFSET 0
+LIMIT 1000;

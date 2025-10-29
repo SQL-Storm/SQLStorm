@@ -1,0 +1,129 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        COALESCE(p.Score, 0) AS PostScore,
+        ROW_NUMBER() OVER (PARTITION BY t.Id ORDER BY p.CreationDate DESC) AS RecentPostRank
+    FROM
+        Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    WHERE
+        t.IsModeratorOnly = FALSE
+),
+FilteredPosts AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.Title,
+        p.Tags,
+        u.Reputation,
+        u.Location,
+        u.CreationDate AS UserCreationDate,
+        u.DisplayName AS UserName,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS RankByScoreView
+    FROM
+        Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE
+        p.PostTypeId IN (1, 2)
+        AND p.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '365 days')
+),
+AggregatedVotes AS (
+    SELECT
+        v.PostId,
+        COUNT(CASE WHEN vt.Name = 'UpMod' THEN 1 END) AS UpVotes,
+        COUNT(CASE WHEN vt.Name = 'DownMod' THEN 1 END) AS DownVotes,
+        COUNT(CASE WHEN vt.Name = 'Favorite' THEN 1 END) AS Favorites
+    FROM
+        Votes v
+    INNER JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY
+        v.PostId
+),
+PostWithVotes AS (
+    SELECT
+        fp.*,
+        COALESCE(av.UpVotes, 0) AS UpVotes,
+        COALESCE(av.DownVotes, 0) AS DownVotes,
+        COALESCE(av.Favorites, 0) AS FavoriteCount
+    FROM
+        FilteredPosts fp
+    LEFT JOIN AggregatedVotes av ON av.PostId = fp.Id
+),
+CorrelatedComments AS (
+    SELECT
+        p.Id AS PostId,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id AND c.CreationDate > p.CreationDate) AS CommentsAfterCreation,
+        (SELECT MAX(c.Score) FROM Comments c WHERE c.PostId = p.Id) AS MaxCommentScore
+    FROM
+        Posts p
+    WHERE
+        p.PostTypeId = 1
+),
+LinkInfo AS (
+    SELECT
+        pl.PostId,
+        SUM(CASE WHEN lt.Name = 'Duplicate' THEN 1 ELSE 0 END) AS DuplicateLinks,
+        SUM(CASE WHEN lt.Name = 'Linked' THEN 1 ELSE 0 END) AS LinkedPosts
+    FROM
+        PostLinks pl
+    INNER JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    GROUP BY
+        pl.PostId
+)
+SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.RankByScoreView,
+    p.UpVotes,
+    p.DownVotes,
+    p.FavoriteCount,
+    u.DisplayName AS OwnerName,
+    u.Reputation,
+    u.Location,
+    COALESCE(c.CommentsAfterCreation, 0) AS CommentsAfterCreation,
+    COALESCE(c.MaxCommentScore, 0) AS MaxCommentScore,
+    COALESCE(li.DuplicateLinks, 0) AS DuplicateLinks,
+    COALESCE(li.LinkedPosts, 0) AS LinkedPosts,
+    ROW_NUMBER() OVER (PARTITION BY u.Location ORDER BY p.Score DESC, p.ViewCount DESC) AS RankWithinLocation,
+    CASE 
+        WHEN p.Score > 100 AND p.ViewCount > 5000 THEN 'High Impact'
+        WHEN p.Score BETWEEN 50 AND 100 THEN 'Medium Impact'
+        ELSE 'Low Impact'
+    END AS ImpactCategory,
+    NULLIF(u.WebsiteUrl, '') AS WebsiteUrl,
+    COALESCE(CHAR_LENGTH(p.Title) - CHAR_LENGTH(REPLACE(p.Title, ' ', '')) + 1, 0) AS TitleWordCount,
+    CASE 
+        WHEN p.AnswerCount = 0 THEN NULL
+        ELSE p.Score * 1.0 / p.AnswerCount
+    END AS ScorePerAnswer,
+    EXISTS (
+      SELECT 1 FROM Badges b 
+      WHERE b.UserId = p.OwnerUserId AND b.Class = 1
+    ) AS HasGoldBadge,
+    CASE
+        WHEN p.LastActivityDate IS NULL THEN 'No Activity Recorded'
+        WHEN p.LastActivityDate < (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '180 days') THEN 'Inactive'
+        ELSE 'Active'
+    END AS ActivityStatus
+FROM
+    PostWithVotes p
+LEFT JOIN Users u ON u.Id = p.OwnerUserId
+LEFT JOIN CorrelatedComments c ON c.PostId = p.Id
+LEFT JOIN LinkInfo li ON li.PostId = p.Id
+WHERE
+    p.RankByScoreView <= 100
+ORDER BY
+    p.Score DESC,
+    p.ViewCount DESC
+LIMIT 100;

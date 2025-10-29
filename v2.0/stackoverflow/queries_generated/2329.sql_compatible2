@@ -1,0 +1,114 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT t.Id, t.TagName, t.Count, 1 AS Level
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0 AND t.IsRequired = 0
+    UNION ALL
+    SELECT t2.Id, t2.TagName, t2.Count, rh.Level + 1
+    FROM Tags t2
+    INNER JOIN RecursiveTagHierarchy rh ON t2.Count < rh.Count AND t2.Id <> rh.Id
+    WHERE rh.Level < 3
+), UsersWithBadgeCounts AS (
+    SELECT u.Id, u.DisplayName, u.Reputation,
+           COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+           COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+           COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+           COALESCE(SUM(p.Score),0) AS TotalPostScore
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId IN (1,2)
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+), TopQuestions AS (
+    SELECT p.Id, p.Title, p.CreationDate, p.OwnerUserId, p.Score, p.ViewCount,
+           ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate ASC) AS rn,
+           LAG(p.Score,1,0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS PrevScore
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.CreationDate > (CAST('2024-10-01' AS date) - INTERVAL '365 days')
+), LatestCommentPerPost AS (
+    SELECT c.PostId, c.Id AS CommentId, c.Text, c.CreationDate, c.UserId,
+           ROW_NUMBER() OVER (PARTITION BY c.PostId ORDER BY c.CreationDate DESC, c.Id DESC) AS rn
+    FROM Comments c
+), PostAnswerStats AS (
+    SELECT p.ParentId AS QuestionId,
+           COUNT(p.Id) AS AnswerCount,
+           MAX(p.Score) AS MaxAnswerScore,
+           AVG(p.Score) AS AvgAnswerScore
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+    GROUP BY p.ParentId
+), MainResults AS (
+    SELECT DISTINCT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.GoldBadges, u.SilverBadges, u.BronzeBadges,
+      u.TotalPostScore,
+      q.Id AS QuestionId,
+      q.Title,
+      q.CreationDate AS QuestionCreationDate,
+      q.Score AS QuestionScore,
+      q.ViewCount AS QuestionViews,
+      q.PrevScore AS PreviousHighestScore,
+      COALESCE(pa.AnswerCount,0) AS TotalAnswers,
+      COALESCE(pa.MaxAnswerScore,0) AS HighestAnswerScore,
+      COALESCE(pa.AvgAnswerScore,0) AS AverageAnswerScore,
+      c.CommentId AS LatestCommentId,
+      c.Text AS LatestCommentText,
+      c.CreationDate AS LatestCommentDate,
+      CASE 
+        WHEN q.Score > 100 AND COALESCE(pa.AnswerCount,0) > 5 THEN 'Popular'
+        WHEN q.Score BETWEEN 20 AND 100 AND COALESCE(pa.AnswerCount,0) BETWEEN 1 AND 5 THEN 'Moderate'
+        ELSE 'Low'
+      END AS PopularityCategory,
+      (SUBSTRING(COALESCE(t.TagName,'') FROM 1 FOR 10) || ' (Lvl ' || COALESCE(CAST(rh.Level AS varchar),'N/A') || ')') AS SampleTagInfo
+    FROM UsersWithBadgeCounts u
+    LEFT JOIN TopQuestions q ON q.OwnerUserId = u.Id AND q.rn = 1
+    LEFT JOIN LatestCommentPerPost c ON c.PostId = q.Id AND c.rn = 1
+    LEFT JOIN PostAnswerStats pa ON pa.QuestionId = q.Id
+    LEFT JOIN LATERAL (
+      SELECT rt.Id, rt.TagName, rt.Level
+      FROM RecursiveTagHierarchy rt
+      JOIN Posts p2 ON p2.Tags LIKE '%' || rt.TagName || '%'
+      WHERE p2.Id = q.Id
+      ORDER BY rt.Level ASC
+      LIMIT 1
+    ) rh ON TRUE
+    WHERE u.Reputation > 1000
+      AND (
+        (q.CreationDate > (CAST('2024-10-01' AS date) - INTERVAL '180 days') AND q.Score >= 10)
+        OR q.Score IS NULL
+      )
+)
+SELECT *
+FROM MainResults
+ORDER BY Reputation DESC, QuestionScore DESC NULLS LAST
+LIMIT 100
+
+UNION ALL
+
+SELECT
+  u.Id AS UserId,
+  u.DisplayName,
+  u.Reputation,
+  0 AS GoldBadges, 0 AS SilverBadges, 0 AS BronzeBadges,
+  0 AS TotalPostScore,
+  NULL::bigint AS QuestionId,
+  NULL::varchar AS Title,
+  NULL::timestamp AS QuestionCreationDate,
+  NULL::int AS QuestionScore,
+  NULL::int AS QuestionViews,
+  NULL::int AS PreviousHighestScore,
+  0 AS TotalAnswers,
+  0 AS HighestAnswerScore,
+  0 AS AverageAnswerScore,
+  NULL::bigint AS LatestCommentId,
+  NULL::text AS LatestCommentText,
+  NULL::timestamp AS LatestCommentDate,
+  'No Questions' AS PopularityCategory,
+  NULL::varchar AS SampleTagInfo
+FROM Users u
+WHERE NOT EXISTS (
+  SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1
+)
+AND u.Reputation > 1000
+ORDER BY u.Reputation DESC
+LIMIT 20;

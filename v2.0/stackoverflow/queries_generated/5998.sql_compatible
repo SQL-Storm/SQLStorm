@@ -1,0 +1,85 @@
+WITH RecentActivePosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.Tags,
+    p.LastActivityDate,
+    ROW_NUMBER() OVER (ORDER BY p.LastActivityDate DESC) AS rn
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.ClosedDate IS NULL
+    AND p.LastActivityDate IS NOT NULL
+),
+ExplodedTags AS (
+  SELECT
+    rap.PostId,
+    tkn AS TagName
+  FROM RecentActivePosts rap,
+  LATERAL (
+    SELECT unnest(string_to_array(substr(rap.Tags, 2, length(rap.Tags) - 2), '><')) AS tkn
+  ) AS tagvals
+),
+QuestionTagMetrics AS (
+  SELECT
+    et.TagName,
+    COUNT(*) AS QuestionCount,
+    AVG(p.Score) AS AvgScore,
+    MAX(p.ViewCount) AS MaxViews,
+    SUM(CASE WHEN p.Score > 0 THEN 1 ELSE 0 END) AS PositiveScoreCount
+  FROM ExplodedTags et
+  INNER JOIN Posts p ON p.Id = et.PostId
+  GROUP BY et.TagName
+),
+TopContributors AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    COUNT(*) AS PostCount,
+    SUM(p.Score) AS TotalScore,
+    SUM(p.ViewCount) AS TotalViews,
+    ROW_NUMBER() OVER (ORDER BY SUM(p.Score) DESC, COUNT(*) DESC) AS rn
+  FROM RecentActivePosts rap
+  INNER JOIN Posts p ON p.Id = rap.PostId
+  INNER JOIN Users u ON u.Id = p.OwnerUserId
+  GROUP BY u.Id, u.DisplayName
+  HAVING COUNT(*) > 0
+)
+SELECT
+  hc.UserId,
+  hc.DisplayName,
+  tc.TagName,
+  tc.QuestionCount,
+  tc.AvgScore,
+  tc.MaxViews,
+  tc.PositiveScoreCount,
+  hc.PostCount,
+  hc.TotalScore,
+  hc.TotalViews,
+  ROW_NUMBER() OVER (PARTITION BY hc.UserId ORDER BY rap.LastActivityDate DESC) AS UserQuestionRank,
+  rap.Title AS QuestionTitle,
+  rap.CreationDate AS QuestionCreated,
+  rap.LastActivityDate AS QuestionLastActive,
+  rap.Score AS QuestionScore,
+  rap.ViewCount AS QuestionViews
+FROM TopContributors hc
+LEFT JOIN Users u ON u.Id = hc.UserId
+LEFT JOIN LATERAL (
+  SELECT
+    rap2.PostId,
+    rap2.Title,
+    rap2.CreationDate,
+    rap2.LastActivityDate,
+    rap2.Score,
+    rap2.ViewCount
+  FROM RecentActivePosts rap2
+  WHERE rap2.OwnerUserId = hc.UserId
+  ORDER BY rap2.LastActivityDate DESC
+  LIMIT 5
+) rap ON true
+LEFT JOIN QuestionTagMetrics tc ON true
+ORDER BY hc.TotalScore DESC
+LIMIT 100;

@@ -1,0 +1,137 @@
+WITH
+  RankedAnswers AS (
+    SELECT
+      p.Id AS PostId,
+      p.ParentId AS QuestionId,
+      p.OwnerUserId,
+      p.Score,
+      p.CreationDate,
+      ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS rn
+    FROM Posts p
+    WHERE
+      p.PostTypeId = 2 AND p.ParentId IS NOT NULL
+  ),
+  QuestionDetails AS (
+    SELECT
+      q.Id AS QuestionId,
+      q.Title AS QuestionTitle,
+      q.Tags AS QuestionTags,
+      q.OwnerUserId AS QuestionOwnerUserId,
+      q.CreationDate AS QuestionCreationDate,
+      q.AcceptedAnswerId,
+      q.AnswerCount,
+      q.FavoriteCount,
+      q.ViewCount,
+      q.Score AS QuestionScore,
+      COALESCE(q.ClosedDate, q.CommunityOwnedDate) AS StatusDate,
+      CASE
+        WHEN q.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN q.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        ELSE 'Active'
+      END AS QuestionStatus
+    FROM Posts q
+    WHERE
+      q.PostTypeId = 1
+  ),
+  UserEngagement AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate,
+      COUNT(DISTINCT ph.PostId) AS PostHistoryCount,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotes,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotes,
+      COUNT(DISTINCT b.Id) AS BadgeCount,
+      MAX(CASE WHEN b.Class = 1 THEN b.Name END) AS GoldBadge,
+      MAX(CASE WHEN b.Class = 2 THEN b.Name END) AS SilverBadge,
+      MAX(CASE WHEN b.Class = 3 THEN b.Name END) AS BronzeBadge
+    FROM Users u
+    LEFT JOIN PostHistory ph
+      ON u.Id = ph.UserId
+    LEFT JOIN Votes v
+      ON u.Id = v.UserId
+    LEFT JOIN Badges b
+      ON u.Id = b.UserId
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate
+  )
+SELECT
+  qd.QuestionId,
+  qd.QuestionTitle,
+  qd.QuestionTags,
+  qd.QuestionOwnerUserId,
+  ue.DisplayName AS QuestionOwnerDisplayName,
+  ue.Reputation AS QuestionOwnerReputation,
+  qd.QuestionCreationDate,
+  qd.AcceptedAnswerId,
+  qd.AnswerCount,
+  qd.FavoriteCount,
+  qd.ViewCount,
+  qd.QuestionScore,
+  qd.QuestionStatus,
+  qd.StatusDate,
+  ra.PostId AS BestAnswerId,
+  ra.OwnerUserId AS BestAnswerOwnerUserId,
+  ue_ba.DisplayName AS BestAnswerOwnerDisplayName,
+  ue_ba.Reputation AS BestAnswerOwnerReputation,
+  ra.Score AS BestAnswerScore,
+  ra.CreationDate AS BestAnswerCreationDate,
+  CASE
+    WHEN ra.Score > qd.QuestionScore * 0.5 THEN 'High Engagement Answer'
+    WHEN ra.Score IS NULL THEN 'No Answers Yet'
+    ELSE 'Standard Answer'
+  END AS AnswerQualityIndicator,
+  CASE
+    WHEN qd.AcceptedAnswerId IS NOT NULL AND qd.AcceptedAnswerId = ra.PostId THEN 'Is Accepted'
+    WHEN qd.AcceptedAnswerId IS NOT NULL THEN 'Not Accepted'
+    ELSE 'No Accepted Answer'
+  END AS AnswerAcceptanceStatus,
+  COALESCE(
+    (
+      SELECT
+        SUM(c.Score)
+      FROM Comments c
+      WHERE
+        c.PostId = qd.QuestionId
+    ),
+    0
+  ) AS TotalQuestionCommentsScore,
+  (
+    SELECT
+      COUNT(*)
+    FROM PostLinks pl
+    WHERE
+      pl.PostId = qd.QuestionId AND pl.LinkTypeId = 3
+  ) AS DuplicateLinksCount,
+  ue.DisplayName AS QuestionOwnerProfileLink,
+  CASE
+    WHEN ue.CreationDate < DATE '2010-01-01' AND ue.Reputation > 10000 THEN 'Early Adopter High Rep User'
+    WHEN ue.CreationDate >= DATE '2020-01-01' AND ue.BadgeCount > 50 THEN 'Newer Power User'
+    ELSE 'Standard User'
+  END AS UserTier,
+  REPLACE(LOWER(qd.QuestionTags), '><', ', ') AS FormattedTags
+FROM QuestionDetails qd
+LEFT JOIN RankedAnswers ra
+  ON qd.QuestionId = ra.QuestionId AND ra.rn = 1
+LEFT JOIN UserEngagement ue
+  ON qd.QuestionOwnerUserId = ue.UserId
+LEFT JOIN UserEngagement ue_ba
+  ON ra.OwnerUserId = ue_ba.UserId
+WHERE
+  (
+    qd.QuestionScore > 0 OR qd.AnswerCount > 0 OR qd.FavoriteCount > 0
+    OR qd.QuestionStatus <> 'Active'
+    OR qd.QuestionOwnerUserId IS NOT NULL
+  )
+  AND ue.Reputation > (
+    SELECT
+      AVG(u2.Reputation)
+    FROM Users u2
+  ) * 1.5
+ORDER BY
+  qd.QuestionCreationDate DESC
+LIMIT 1000;

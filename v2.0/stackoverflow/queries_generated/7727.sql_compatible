@@ -1,0 +1,207 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COALESCE(SUM(p.Score), 0) AS TotalScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        CAST('2024-10-01 12:34:56' AS TIMESTAMP) - u.CreationDate AS AccountAgeInterval,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - u.CreationDate)) / 86400 AS AccountAgeDays,
+        CASE 
+            WHEN u.Reputation >= 100000 THEN 'Elite'
+            WHEN u.Reputation >= 10000 THEN 'High'
+            WHEN u.Reputation >= 1000 THEN 'Medium'
+            WHEN u.Reputation >= 100 THEN 'Low'
+            ELSE 'New'
+        END AS ReputationTier
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.CreationDate
+),
+PostComplexity AS (
+    SELECT 
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CommentCount,
+        p.AnswerCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Tags,
+        COALESCE(p.AnswerCount, 0) AS AnswerCountVal,
+        COALESCE(p.CommentCount, 0) AS CommentCountVal,
+        CASE WHEN p.PostTypeId = 1 THEN 'Question' ELSE 'Answer' END AS PostType,
+        CASE 
+            WHEN p.Score < 0 THEN 'Negative'
+            WHEN p.Score = 0 THEN 'Neutral'
+            WHEN p.Score BETWEEN 1 AND 5 THEN 'Low'
+            WHEN p.Score BETWEEN 6 AND 20 THEN 'Medium'
+            WHEN p.Score BETWEEN 21 AND 100 THEN 'High'
+            WHEN p.Score > 100 THEN 'Very High'
+            ELSE 'Unknown'
+        END AS ScoreCategory,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags <> '' THEN 
+                (CHAR_LENGTH(p.Tags) - CHAR_LENGTH(REPLACE(p.Tags, '>', '')) + 1)
+            ELSE 0
+        END AS TagCount,
+        (EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate)) / 86400) AS DaysSinceLastActivity,
+        (EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - p.CreationDate)) / 86400) AS DaysSinceCreation,
+        CASE 
+            WHEN p.AnswerCount > 0 THEN 
+                CAST(p.Score AS DOUBLE PRECISION) / NULLIF(p.AnswerCount, 0)
+            ELSE NULL 
+        END AS ScorePerAnswer,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserPostRank
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserPerformanceMetrics AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.PostCount,
+        uas.CommentCount,
+        uas.BadgeCount,
+        uas.QuestionCount,
+        uas.AnswerCount,
+        uas.TotalScore,
+        uas.AccountAgeDays,
+        uas.ReputationTier,
+        AVG(pcm.Score) AS AvgPostScore,
+        MAX(pcm.Score) AS MaxPostScore,
+        MIN(pcm.Score) AS MinPostScore,
+        STDDEV_POP(pcm.Score) AS ScoreStdDev,
+        AVG(pcm.ViewCount) AS AvgViewCount,
+        AVG(pcm.DaysSinceLastActivity) AS AvgDaysSinceActivity,
+        COUNT(pcm.PostId) AS ActivePostCount,
+        STRING_AGG(pcm.Title, '; ' ORDER BY pcm.CreationDate DESC) AS RecentTitles,
+        CASE 
+            WHEN uas.QuestionCount > 0 THEN 
+                CAST(uas.TotalScore AS DOUBLE PRECISION) / NULLIF(uas.QuestionCount, 0)
+            ELSE 0 
+        END AS AvgScorePerQuestion,
+        CASE 
+            WHEN uas.AnswerCount > 0 THEN 
+                CAST(uas.TotalScore AS DOUBLE PRECISION) / NULLIF(uas.AnswerCount, 0)
+            ELSE 0 
+        END AS AvgScorePerAnswer
+    FROM UserActivityStats uas
+    LEFT JOIN PostComplexity pcm ON uas.UserId = pcm.OwnerUserId
+    GROUP BY uas.UserId, uas.DisplayName, uas.Reputation, uas.PostCount, 
+             uas.CommentCount, uas.BadgeCount, uas.QuestionCount, 
+             uas.AnswerCount, uas.TotalScore, uas.AccountAgeDays, uas.ReputationTier
+),
+TopPostsByScore AS (
+    SELECT 
+        Id AS PostId,
+        Score,
+        Title,
+        OwnerUserId,
+        ROW_NUMBER() OVER (ORDER BY Score DESC) AS RankByScore,
+        RANK() OVER (ORDER BY Score DESC) AS RankByScoreWithTies,
+        DENSE_RANK() OVER (ORDER BY Score DESC) AS DenseRankByScore,
+        PERCENT_RANK() OVER (ORDER BY Score DESC) AS PercentileRank,
+        NTILE(10) OVER (ORDER BY Score DESC) AS Decile
+    FROM Posts 
+    WHERE PostTypeId = 1 AND Score IS NOT NULL
+),
+UserPostDistribution AS (
+    SELECT 
+        UserId,
+        COUNT(*) AS TotalPosts,
+        COUNT(CASE WHEN PostTypeId = 1 THEN 1 END) AS Questions,
+        COUNT(CASE WHEN PostTypeId = 2 THEN 1 END) AS Answers,
+        COUNT(CASE WHEN PostTypeId = 3 THEN 1 END) AS Wikis,
+        COUNT(*) * 100.0 / (SELECT COUNT(*) FROM Posts) AS PercentOfAllPosts,
+        AVG(Score) AS AvgScore,
+        SUM(Score) AS TotalScore,
+        MAX(Score) AS MaxScore,
+        MIN(Score) AS MinScore
+    FROM Posts 
+    GROUP BY UserId
+)
+SELECT 
+    upm.UserId,
+    upm.DisplayName,
+    upm.Reputation,
+    upm.PostCount,
+    upm.QuestionCount,
+    upm.AnswerCount,
+    upm.BadgeCount,
+    upm.TotalScore,
+    upm.AvgScorePerQuestion,
+    upm.AvgScorePerAnswer,
+    upm.AvgPostScore,
+    upm.MaxPostScore,
+    upm.MinPostScore,
+    upm.ScoreStdDev,
+    upm.AccountAgeDays,
+    upm.ReputationTier,
+    upm.RecentTitles,
+    tps.RankByScore,
+    tps.RankByScoreWithTies,
+    tps.DenseRankByScore,
+    tps.PercentileRank,
+    tps.Decile,
+    tps.Score AS TopScore,
+    tps.Title AS TopTitle,
+    CASE 
+        WHEN upm.PostCount > 0 AND upm.TotalScore > 0 THEN 
+            CAST(upm.TotalScore AS DOUBLE PRECISION) / NULLIF(upm.PostCount, 0)
+        ELSE 0 
+    END AS AvgScorePerPost,
+    CASE 
+        WHEN upm.Reputation > 10000 THEN 'Legendary'
+        WHEN upm.Reputation > 5000 THEN 'Veteran'
+        WHEN upm.Reputation > 1000 THEN 'Contributor'
+        ELSE 'Member'
+    END AS ReputationLevel,
+    CASE 
+        WHEN upm.QuestionCount > 100 THEN 'Expert'
+        WHEN upm.QuestionCount > 50 THEN 'Advanced'
+        WHEN upm.QuestionCount > 10 THEN 'Intermediate'
+        ELSE 'Beginner'
+    END AS QuestionExpertise,
+    CASE 
+        WHEN upm.AnswerCount > 1000 THEN 'Master'
+        WHEN upm.AnswerCount > 500 THEN 'Senior'
+        WHEN upm.AnswerCount > 100 THEN 'Experienced'
+        ELSE 'Novice'
+    END AS AnswerExpertise,
+    upm.ActivePostCount,
+    upm.AvgViewCount,
+    upm.AvgDaysSinceActivity,
+    CASE 
+        WHEN upm.ActivePostCount > 0 AND upm.AvgDaysSinceActivity > 30 THEN 'Inactive'
+        WHEN upm.ActivePostCount > 0 AND upm.AvgDaysSinceActivity > 7 THEN 'Moderately Active'
+        ELSE 'Active'
+    END AS ActivityLevel,
+    CASE 
+        WHEN upm.BadgeCount > 50 THEN 'Gold Badge Holder'
+        WHEN upm.BadgeCount > 20 THEN 'Silver Badge Holder'
+        WHEN upm.BadgeCount > 5 THEN 'Bronze Badge Holder'
+        ELSE 'Bronze Badge Holder'
+    END AS BadgeLevel,
+    CASE 
+        WHEN upm.PostCount > 1000 THEN 'Top Contributor'
+        WHEN upm.PostCount > 500 THEN 'High Contributor'
+        WHEN upm.PostCount > 100 THEN 'Regular Contributor'
+        ELSE 'Occasional Contributor'
+    END AS ContributionLevel
+FROM UserPerformanceMetrics upm
+LEFT JOIN TopPostsByScore tps ON upm.UserId = tps.OwnerUserId
+WHERE upm.PostCount > 0
+ORDER BY upm.TotalScore DESC, upm.Reputation DESC, upm.AccountAgeDays ASC
+OFFSET 0 ROWS FETCH NEXT 1000 ROWS ONLY;

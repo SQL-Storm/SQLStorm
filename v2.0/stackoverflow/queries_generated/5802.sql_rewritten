@@ -1,0 +1,131 @@
+-- {"query": "5802.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 985} 
+WITH RecentActivePosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.PostTypeId,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.LastActivityDate,
+    COALESCE(p.AnswerCount, 0) AS AnswerCount,
+    ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.LastActivityDate DESC) AS rn
+  FROM Posts p
+  WHERE p.LastActivityDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '90 days'
+),
+TopQuestions AS (
+  SELECT
+    r.PostId,
+    r.Title,
+    r.CreationDate,
+    r.OwnerUserId,
+    r.Score,
+    r.ViewCount,
+    r.Tags,
+    r.AnswerCount,
+    r.LastActivityDate
+  FROM RecentActivePosts r
+  WHERE r.PostTypeId = 1 -- Questions
+    AND r.rn <= 5
+),
+QuestionTagStats AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS QuestionCount,
+    AVG(q.Score) AS AvgScore,
+    SUM(q.ViewCount) AS TotalViews,
+    SUM(q.AnswerCount) AS TotalAnswers
+  FROM TopQuestions q
+  CROSS JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(q.Tags, 2, length(q.Tags)-2), '><')) AS TagName
+  ) AS t
+  GROUP BY t.TagName
+),
+ActiveUsers AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.ProfileImageUrl,
+    u.EmailHash,
+    COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpvotesGiven,
+    COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownvotesGiven
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.UserId = u.Id AND v.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '365 days'
+  GROUP BY u.Id
+),
+BadgeActivity AS (
+  SELECT
+    b.UserId,
+    COUNT(*) AS BadgeCount,
+    MAX(b.Date) AS LastBadgeDate
+  FROM Badges b
+  GROUP BY b.UserId
+),
+Final AS (
+  SELECT
+    q.PostId,
+    q.Title,
+    q.CreationDate AS PostCreationDate,
+    q.OwnerUserId,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation,
+    q.Score,
+    q.ViewCount,
+    q.LastActivityDate,
+    q.AnswerCount,
+    STRING_AGG(t.TagName, ',') AS TagsUsed,
+    jsonb_build_object(
+      'Upvotes', COALESCE(a.UpvotesGiven, 0),
+      'Downvotes', COALESCE(a.DownvotesGiven, 0),
+      'BadgeCount', COALESCE(bd.BadgeCount, 0),
+      'LastBadgeDate', to_char(COALESCE(bd.LastBadgeDate, TIMESTAMP 'epoch'), 'YYYY-MM-DD')
+    ) AS UserStats,
+    qt.TagName,
+    qt.QuestionCount,
+    qt.AvgScore,
+    qt.TotalViews,
+    qt.TotalAnswers
+  FROM TopQuestions q
+  LEFT JOIN Users u ON u.Id = q.OwnerUserId
+  LEFT JOIN ActiveUsers a ON a.UserId = q.OwnerUserId
+  LEFT JOIN BadgeActivity bd ON bd.UserId = q.OwnerUserId
+  LEFT JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(q.Tags, 2, length(q.Tags)-2), '><')) AS TagName
+  ) AS ttags ON true
+  LEFT JOIN QuestionTagStats qt ON qt.TagName = ttags.TagName
+  GROUP BY
+    q.PostId, q.Title, q.CreationDate, q.OwnerUserId, u.DisplayName, u.Reputation,
+    q.Score, q.ViewCount, q.LastActivityDate, q.AnswerCount,
+    qt.TagName, qt.QuestionCount, qt.AvgScore, qt.TotalViews, qt.TotalAnswers
+)
+SELECT
+  PostId,
+  Title,
+  PostCreationDate,
+  OwnerUserId,
+  OwnerDisplayName,
+  Reputation,
+  Score,
+  ViewCount,
+  LastActivityDate,
+  AnswerCount,
+  TagsUsed,
+  UserStats,
+  TagName,
+  QuestionCount,
+  AvgScore,
+  TotalViews,
+  TotalAnswers
+FROM Final
+ORDER BY LastActivityDate DESC
+LIMIT 100;

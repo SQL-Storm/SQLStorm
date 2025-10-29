@@ -1,0 +1,237 @@
+-- {"query": "1515.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3275} 
+WITH UserActivitySummary AS (
+    -- Summarizes user activity: post counts, comment counts, vote counts, reputation, and last activity.
+    -- Includes a window function to rank users by reputation and complex ratio calculations.
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.UpVotes AS TotalUpVotes,
+        U.DownVotes AS TotalDownVotes,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswers,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        SUM(P.Score) AS TotalPostScore,
+        SUM(P.ViewCount) AS TotalQuestionViews,
+        MAX(COALESCE(P.LastActivityDate, C.CreationDate, U.LastAccessDate)) AS UserLastActivity,
+        -- Calculate upvote/downvote ratio, handling potential division by zero with NULLIF
+        CAST(U.UpVotes AS NUMERIC) / NULLIF(U.DownVotes, 0) AS UpDownVoteRatio,
+        DENSE_RANK() OVER (ORDER BY U.Reputation DESC, U.Id ASC) AS ReputationRank
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.UpVotes, U.DownVotes
+),
+PostDetailsRaw AS (
+    -- Gathers detailed post information, including accepted answer details and editor details.
+    -- Includes a scalar subquery to get owner reputation at post creation.
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.Body,
+        P.OwnerUserId,
+        P.OwnerDisplayName,
+        P.LastEditorUserId,
+        U_Editor.DisplayName AS LastEditorDisplayName,
+        P.LastEditDate,
+        P.LastActivityDate,
+        P.Title,
+        P.Tags, -- Keep raw tags here for unnesting in a separate CTE
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.ClosedDate,
+        P.AcceptedAnswerId,
+        PA.CreationDate AS AcceptedAnswerCreationDate,
+        PA.OwnerUserId AS AcceptedAnswerOwnerUserId,
+        PA.Score AS AcceptedAnswerScore,
+        -- Calculate time to accept an answer in hours, if applicable
+        CASE
+            WHEN P.PostTypeId = 1 AND P.AcceptedAnswerId IS NOT NULL THEN
+                EXTRACT(EPOCH FROM (PA.CreationDate - P.CreationDate)) / 3600.0
+            ELSE NULL
+        END AS TimeToAcceptedAnswerHours,
+        -- Boolean flag if the post has been edited by someone other than the original owner
+        CASE
+            WHEN P.OwnerUserId IS NOT NULL AND P.LastEditorUserId IS NOT NULL AND P.OwnerUserId != P.LastEditorUserId THEN TRUE
+            ELSE FALSE
+        END AS EditedByOtherUser,
+        -- Correlated subquery to fetch the owner's reputation at the time of post creation
+        (SELECT U_Owner.Reputation FROM Users U_Owner WHERE U_Owner.Id = P.OwnerUserId) AS OwnerReputationAtPostCreation
+    FROM Posts P
+    INNER JOIN PostTypes PT ON P.PostTypeId = PT.Id
+    LEFT JOIN Users U_Editor ON P.LastEditorUserId = U_Editor.Id
+    LEFT JOIN Posts PA ON P.AcceptedAnswerId = PA.Id
+    WHERE P.PostTypeId IN (1, 2) -- Focus on Questions (1) and Answers (2)
+    AND P.CreationDate >= '2023-01-01' -- Filter for recent posts for performance
+),
+PostTagsUnnested AS (
+    -- Uses string_to_array and LATERAL UNNEST to expand the 'Tags' string into individual tag rows.
+    SELECT
+        PDR.PostId,
+        TRIM(tag_val) AS TagName
+    FROM PostDetailsRaw PDR,
+    LATERAL UNNEST(string_to_array(substring(PDR.Tags, 2, length(PDR.Tags)-2), '><')) AS tag_val
+    WHERE PDR.Tags IS NOT NULL AND LENGTH(PDR.Tags) > 2
+),
+PostHistoryEvents AS (
+    -- Tracks key historical events for posts, using window functions (ROW_NUMBER, LAG) to analyze event sequences.
+    SELECT
+        PH.PostId,
+        PH.CreationDate AS EventDate,
+        PHT.Name AS HistoryTypeName,
+        PH.UserId AS EventUserId,
+        U_Event.DisplayName AS EventUserDisplayName,
+        PH.Comment AS HistoryComment,
+        PH.Text AS HistoryText,
+        ROW_NUMBER() OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate, PH.Id) AS EventSequence,
+        LAG(PH.CreationDate, 1, PH.CreationDate) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate, PH.Id) AS PreviousEventDate,
+        -- Calculate time difference in hours between consecutive history events
+        EXTRACT(EPOCH FROM (PH.CreationDate - LAG(PH.CreationDate, 1, PH.CreationDate) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate, PH.Id))) / 3600.0 AS HoursSincePreviousEvent
+    FROM PostHistory PH
+    INNER JOIN PostHistoryTypes PHT ON PH.PostHistoryTypeId = PHT.Id
+    LEFT JOIN Users U_Event ON PH.UserId = U_Event.Id
+    WHERE PH.PostHistoryTypeId IN (
+        1,  -- Initial Title
+        2,  -- Initial Body
+        5,  -- Edit Body
+        6,  -- Edit Tags
+        10, -- Post Closed
+        11, -- Post Reopened
+        12, -- Post Deleted
+        13, -- Post Undeleted
+        19, -- Question Protected
+        20  -- Question Unprotected
+    )
+),
+TagBasedAggregates AS (
+    -- Aggregates metrics per tag, including counts, average scores, and a correlated subquery for latest post date.
+    SELECT
+        T.Id AS TagId,
+        T.TagName,
+        T.Count AS GlobalTagCount,
+        COUNT(DISTINCT PTU.PostId) AS PostsWithTag,
+        AVG(PDR.PostScore) AS AverageScoreForTag,
+        AVG(PDR.ViewCount) AS AverageViewCountForTag,
+        SUM(PDR.AnswerCount) AS TotalAnswersForTag,
+        -- Correlated subquery to find the most recent post creation date for the current tag
+        (SELECT MAX(P_inner.CreationDate)
+         FROM Posts P_inner
+         WHERE EXISTS (SELECT 1 FROM PostTagsUnnested PTU_inner WHERE PTU_inner.PostId = P_inner.Id AND PTU_inner.TagName = T.TagName)) AS LatestPostDateForTag
+    FROM Tags T
+    INNER JOIN PostTagsUnnested PTU ON T.TagName = PTU.TagName
+    INNER JOIN PostDetailsRaw PDR ON PTU.PostId = PDR.PostId
+    WHERE T.Count > 1000 -- Focus on more popular tags to limit data volume for aggregation
+    GROUP BY T.Id, T.TagName, T.Count
+)
+-- Main Query: Combines all CTEs to generate a comprehensive report on user engagement and post status.
+SELECT
+    UAS.UserId,
+    UAS.DisplayName,
+    UAS.Reputation,
+    UAS.TotalQuestions,
+    UAS.TotalAnswers,
+    UAS.TotalComments,
+    UAS.TotalPostScore,
+    UAS.TotalQuestionViews,
+    UAS.UpDownVoteRatio,
+    UAS.ReputationRank,
+    PDR.PostId,
+    PDR.PostTypeName,
+    PDR.PostCreationDate,
+    PDR.PostScore,
+    PDR.ViewCount,
+    PDR.Title,
+    PDR.Tags,
+    PDR.TimeToAcceptedAnswerHours,
+    PDR.EditedByOtherUser,
+    PDR.OwnerReputationAtPostCreation,
+    PH.EventDate AS LatestPostEventDate,
+    PH.HistoryTypeName AS LatestPostHistoryType,
+    PH.HoursSincePreviousEvent AS TimeSincePrevEventHours,
+    PrimaryTagAgg.TagName AS PrimaryTagName, -- The most popular tag associated with the post
+    PrimaryTagAgg.AverageScoreForTag,
+    PrimaryTagAgg.LatestPostDateForTag,
+    -- Complex CASE expression for determining a post's status category
+    CASE
+        WHEN PDR.ClosedDate IS NOT NULL THEN 'CLOSED'
+        WHEN PDR.AcceptedAnswerId IS NOT NULL THEN 'ANSWERED & ACCEPTED'
+        WHEN PDR.AnswerCount > 0 THEN 'ANSWERED'
+        ELSE 'OPEN'
+    END AS PostStatusCategory,
+    -- Window function: NTILE to categorize users into 5 groups based on their total post score
+    NTILE(5) OVER (ORDER BY UAS.TotalPostScore DESC) AS PostScoreQuintile,
+    -- Use COALESCE and SUM with CASE for robust badge count aggregation, handling NULLs
+    COALESCE(SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END), 0) AS GoldBadges,
+    COALESCE(SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END), 0) AS SilverBadges,
+    COALESCE(SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END), 0) AS BronzeBadges,
+    -- Complicated expression: Weighted engagement score for a post
+    (PDR.PostScore * 0.7 + PDR.ViewCount * 0.1 + PDR.CommentCount * 0.15 + PDR.FavoriteCount * 0.05) AS WeightedPostEngagementScore,
+    -- Scalar subquery to count upvotes for the current post
+    (SELECT COUNT(V.Id) FROM Votes V WHERE V.PostId = PDR.PostId AND V.VoteTypeId = 2) AS UpVoteCountForPost,
+    -- Correlated subquery in a CASE statement for a boolean flag:
+    -- Identifies users who have more than 3 answers with a score of 10+ but have less than 50 total upvotes.
+    CASE
+        WHEN EXISTS (
+            SELECT 1
+            FROM Posts P_sub
+            WHERE P_sub.OwnerUserId = UAS.UserId
+            AND P_sub.PostTypeId = 2 -- Is an answer
+            AND P_sub.Score >= 10
+            GROUP BY P_sub.OwnerUserId -- Necessary for HAVING clause
+            HAVING COUNT(P_sub.Id) > 3
+        ) AND UAS.TotalUpVotes < 50
+        THEN TRUE ELSE FALSE
+    END AS UserNeedsMoreUpvotesFlag
+FROM UserActivitySummary UAS
+INNER JOIN PostDetailsRaw PDR ON UAS.UserId = PDR.OwnerUserId
+LEFT JOIN LATERAL ( -- LATERAL JOIN to get the latest post history event for each post
+    SELECT *
+    FROM PostHistoryEvents PHE_lat
+    WHERE PHE_lat.PostId = PDR.PostId
+    ORDER BY PHE_lat.EventSequence DESC
+    LIMIT 1
+) PH ON TRUE
+LEFT JOIN LATERAL ( -- LATERAL JOIN to select the most popular tag and its aggregates for each post
+    SELECT TBA.*
+    FROM PostTagsUnnested PTU_lat
+    INNER JOIN TagBasedAggregates TBA ON PTU_lat.TagName = TBA.TagName
+    WHERE PTU_lat.PostId = PDR.PostId
+    ORDER BY TBA.GlobalTagCount DESC, TBA.TagName ASC -- Prioritize by global tag popularity
+    LIMIT 1
+) PrimaryTagAgg ON TRUE
+LEFT JOIN Badges B ON UAS.UserId = B.UserId
+WHERE
+    UAS.Reputation > 1000 -- Filter for users with significant reputation
+    AND PDR.PostScore > 5 -- Filter for posts with reasonable scores
+    AND PDR.ViewCount > 50 -- Filter for posts with a good number of views
+    AND (
+        PDR.Title ILIKE '%sql%' OR PDR.Body ILIKE '%database%' OR PDR.Tags ILIKE '%<postgresql>%' -- String expressions for content filtering
+    )
+    AND NOT EXISTS ( -- NOT EXISTS subquery to exclude deleted posts
+        SELECT 1
+        FROM PostHistory PH_sub
+        WHERE PH_sub.PostId = PDR.PostId
+        AND PH_sub.PostHistoryTypeId = 12 -- Post Deleted type
+    )
+GROUP BY
+    UAS.UserId, UAS.DisplayName, UAS.Reputation, UAS.TotalQuestions, UAS.TotalAnswers, UAS.TotalComments,
+    UAS.TotalPostScore, UAS.TotalQuestionViews, UAS.UpDownVoteRatio, UAS.ReputationRank,
+    PDR.PostId, PDR.PostTypeName, PDR.PostCreationDate, PDR.PostScore, PDR.ViewCount, PDR.Title, PDR.Tags,
+    PDR.TimeToAcceptedAnswerHours, PDR.EditedByOtherUser, PDR.OwnerReputationAtPostCreation,
+    PH.EventDate, PH.HistoryTypeName, PH.HoursSincePrevEventHours,
+    PrimaryTagAgg.TagName, PrimaryTagAgg.AverageScoreForTag, PrimaryTagAgg.LatestPostDateForTag,
+    PDR.ClosedDate, PDR.AcceptedAnswerId, PDR.AnswerCount, PDR.CommentCount, PDR.FavoriteCount
+HAVING
+    COALESCE(SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END), 0) >= 1 -- Filter users with at least one gold badge
+    AND (UAS.TotalAnswers > 0 OR UAS.TotalQuestions > 0) -- Ensure the user has actually posted
+ORDER BY
+    WeightedPostEngagementScore DESC, UAS.ReputationRank ASC
+LIMIT 100;

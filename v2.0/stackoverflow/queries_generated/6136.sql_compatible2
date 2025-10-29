@@ -1,0 +1,93 @@
+SELECT 
+    u.DisplayName,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    MAX(u.Reputation) AS MaxReputation,
+    MIN(u.CreationDate) AS EarliestUser,
+    AVG(p.Score) AS AvgPostScore,
+    SUM(v.BountyAmount) AS TotalBountyAmount,
+    b_latest.Name AS TopBadge,
+    t_most.TagName AS MostUsedTag
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Badges b_all ON u.Id = b_all.UserId
+LEFT JOIN 
+    (SELECT 
+         UserId, 
+         MAX(Date) AS MaxDate 
+     FROM 
+         Badges 
+     GROUP BY 
+         UserId) bb ON u.Id = bb.UserId
+LEFT JOIN 
+    (SELECT 
+         UserId, 
+         Name 
+     FROM 
+         Badges b2
+     WHERE 
+         Date = (SELECT MAX(Date) FROM Badges WHERE UserId = b2.UserId)
+    ) b_latest ON u.Id = b_latest.UserId
+LEFT JOIN 
+    Votes v ON u.Id = v.UserId AND v.VoteTypeId = 8
+LEFT JOIN 
+    (SELECT 
+         p.OwnerUserId, 
+         COUNT(DISTINCT t.Id) AS TagCount 
+     FROM 
+         Posts p
+     JOIN 
+         Tags t ON replace(replace(regexp_replace(p.Tags, '<([^>]+)>', '\1', 'g'), '<', ''), '>', '') = CAST(t.Id AS TEXT)
+     GROUP BY 
+         p.OwnerUserId) tt ON u.Id = tt.OwnerUserId
+LEFT JOIN 
+    (SELECT 
+         u_tags.UserId,
+         t_outer.TagName
+     FROM (
+         SELECT 
+             OwnerUserId AS UserId,
+             TagId,
+             COUNT(*) AS CountPerTag
+         FROM 
+             PostTags -- assuming a normalized PostTags table; if not available, adapt accordingly
+         GROUP BY 
+             OwnerUserId, TagId
+     ) u_tags
+     JOIN Tags t_outer ON t_outer.Id = u_tags.TagId
+     JOIN (
+         SELECT 
+             UserId, 
+             MAX(CountPerTag) AS MaxCount
+         FROM (
+             SELECT 
+                 OwnerUserId AS UserId,
+                 TagId,
+                 COUNT(*) AS CountPerTag
+             FROM 
+                 PostTags
+             GROUP BY 
+                 OwnerUserId, TagId
+         ) sub
+         GROUP BY UserId
+     ) tc ON u_tags.UserId = tc.UserId AND u_tags.CountPerTag = tc.MaxCount
+    ) t_most ON u.Id = t_most.UserId
+WHERE 
+    u.Reputation > 1000
+    AND p.LastActivityDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1' YEAR)
+    AND v.BountyAmount > 0
+GROUP BY 
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    b_latest.Name,
+    t_most.TagName
+HAVING 
+    COUNT(DISTINCT p.Id) > 50
+ORDER BY 
+    AvgPostScore DESC, 
+    TotalPosts DESC;

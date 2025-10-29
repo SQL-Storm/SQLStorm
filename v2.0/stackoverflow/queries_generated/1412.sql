@@ -1,0 +1,186 @@
+-- {"query": "1412.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2738} 
+
+WITH RecentHighImpactQuestions AS (
+    SELECT
+        P.Id AS QuestionId,
+        P.Title,
+        P.CreationDate,
+        P.Score AS QuestionScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.OwnerUserId,
+        P.AcceptedAnswerId,
+        TRIM(BOTH '<>' FROM SPLIT_PART(P.Tags, '><', 1)) AS PrimaryTag,
+        LENGTH(P.Body) AS BodyLength,
+        CASE
+            WHEN P.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN P.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+            ELSE 'Open'
+        END AS QuestionStatus,
+        -- Check if post body contains external links
+        CASE
+            WHEN POSITION('<a href=' IN P.Body) > 0 THEN TRUE
+            ELSE FALSE
+        END AS ContainsExternalLink
+    FROM Posts P
+    WHERE
+        P.PostTypeId = 1
+        AND P.CreationDate >= (NOW() - INTERVAL '6 months') -- Questions from the last 6 months
+        AND (P.Score >= 5 OR P.ViewCount >= 100) -- Minimum impact criteria
+        AND P.Tags IS NOT NULL -- Must have tags for categorization
+),
+UserEngagementSummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.UpVotes + U.DownVotes AS TotalVotesCast,
+        COUNT(DISTINCT P.Id) AS TotalPostsCreated,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(U.LastAccessDate) AS UserLastActivity,
+        -- Calculate the average age of badges for this user
+        AVG(EXTRACT(DAY FROM (NOW() - B.Date))) AS AvgBadgeAgeDays
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    WHERE U.Id IN (SELECT OwnerUserId FROM RecentHighImpactQuestions WHERE OwnerUserId IS NOT NULL)
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.UpVotes, U.DownVotes
+),
+PostHistoricalActivity AS (
+    SELECT
+        PH.PostId AS QuestionId,
+        COUNT(PH.Id) AS TotalHistoryEvents,
+        COUNT(DISTINCT PH.UserId) AS UniqueEditors,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6, 8, 9) THEN 1 ELSE 0 END) AS MajorEditOrRollbackCount, -- Title, Body, Tags edits/rollbacks
+        -- Calculate average time in seconds between edits for a post, ignoring the very first entry
+        AVG(EXTRACT(EPOCH FROM (PH.CreationDate - LAG(PH.CreationDate) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate)))) FILTER (WHERE LAG(PH.CreationDate) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) IS NOT NULL) AS AvgSecondsBetweenEdits,
+        -- Count specific close reasons if available in Comment field
+        SUM(CASE WHEN PH.PostHistoryTypeId = 10 AND PH.Comment = '101' THEN 1 ELSE 0 END) AS DuplicateCloseVotes
+    FROM PostHistory PH
+    WHERE PH.PostId IN (SELECT QuestionId FROM RecentHighImpactQuestions)
+    GROUP BY PH.PostId
+),
+AnswerMetrics AS (
+    SELECT
+        A.ParentId AS QuestionId,
+        A.Id AS AnswerId,
+        A.Score AS AnswerScore,
+        A.CreationDate AS AnswerCreationDate,
+        A.OwnerUserId AS AnswerOwnerId,
+        LENGTH(A.Body) AS AnswerBodyLength,
+        ROW_NUMBER() OVER (PARTITION BY A.ParentId ORDER BY A.Score DESC, A.CreationDate ASC) AS AnswerRankByScore,
+        SUM(CASE WHEN A.Id = RHQ.AcceptedAnswerId THEN 1 ELSE 0 END) OVER (PARTITION BY A.ParentId) AS HasAcceptedAnswer
+    FROM Posts A
+    INNER JOIN RecentHighImpactQuestions RHQ ON A.ParentId = RHQ.QuestionId
+    WHERE A.PostTypeId = 2
+)
+SELECT
+    RHQ.QuestionId,
+    RHQ.Title,
+    RHQ.CreationDate,
+    RHQ.QuestionScore,
+    RHQ.ViewCount,
+    RHQ.AnswerCount,
+    RHQ.PrimaryTag,
+    RHQ.QuestionStatus,
+    RHQ.BodyLength,
+    RHQ.ContainsExternalLink,
+    UE.DisplayName AS QuestionOwnerDisplayName,
+    UE.Reputation AS QuestionOwnerReputation,
+    UE.GoldBadges AS QuestionOwnerGoldBadges,
+    COALESCE(UE.AvgBadgeAgeDays, 0) AS AvgOwnerBadgeAgeDays, -- Handle NULL for users with no badges
+    PHA.TotalHistoryEvents AS QuestionEditHistoryCount,
+    PHA.UniqueEditors AS QuestionUniqueEditors,
+    COALESCE(PHA.AvgSecondsBetweenEdits, 0) AS AvgSecondsBetweenQuestionEdits,
+    PHA.MajorEditOrRollbackCount,
+    PHA.DuplicateCloseVotes,
+    AM.AnswerScore AS AcceptedAnswerScore,
+    AM.AnswerOwnerId AS AcceptedAnswerOwnerId,
+    AM.AnswerBodyLength AS AcceptedAnswerBodyLength,
+    -- Correlated subquery: Get the most recent comment text for this question by a moderator
+    (
+        SELECT C.Text
+        FROM Comments C
+        INNER JOIN Users CU ON C.UserId = CU.Id
+        LEFT JOIN Badges B ON CU.Id = B.UserId AND B.Name = 'Moderator' -- Assuming 'Moderator' badge exists for mods
+        WHERE C.PostId = RHQ.QuestionId
+          AND B.Name IS NOT NULL
+        ORDER BY C.CreationDate DESC
+        LIMIT 1
+    ) AS LatestModCommentText,
+    -- Calculate a "Hotness Index" using a complex weighted expression, including recent activity and history
+    ROUND(
+        (RHQ.QuestionScore * 1.5) +
+        (RHQ.ViewCount / 150.0) +
+        (RHQ.AnswerCount * 2.5) +
+        (COALESCE(PHA.MajorEditOrRollbackCount, 0) * 0.75) +
+        (UE.Reputation / 2500.0) +
+        (SELECT COUNT(V.Id) FROM Votes V WHERE V.PostId = RHQ.QuestionId AND V.VoteTypeId = 2 AND V.CreationDate >= (NOW() - INTERVAL '1 month')) * 3.0 + -- Recent upvotes
+        (SELECT COUNT(C.Id) FROM Comments C WHERE C.PostId = RHQ.QuestionId AND C.CreationDate >= (NOW() - INTERVAL '1 month')) * 1.5 -- Recent comments
+    )::NUMERIC(10, 2) AS HotnessIndex,
+    -- Window function: Rank questions by HotnessIndex within their primary tag, handling potential NULLs in calculation
+    RANK() OVER (PARTITION BY RHQ.PrimaryTag ORDER BY (
+        (RHQ.QuestionScore * 1.5) +
+        (RHQ.ViewCount / 150.0) +
+        (RHQ.AnswerCount * 2.5) +
+        (COALESCE(PHA.MajorEditOrRollbackCount, 0) * 0.75) +
+        (COALESCE(UE.Reputation, 0) / 2500.0) +
+        (SELECT COUNT(V.Id) FROM Votes V WHERE V.PostId = RHQ.QuestionId AND V.VoteTypeId = 2 AND V.CreationDate >= (NOW() - INTERVAL '1 month')) * 3.0 +
+        (SELECT COUNT(C.Id) FROM Comments C WHERE C.PostId = RHQ.QuestionId AND C.CreationDate >= (NOW() - INTERVAL '1 month')) * 1.5
+    ) DESC) AS HotnessRankWithinTag,
+    -- Non-correlated subquery: Find the average score of all answers for this question
+    (
+        SELECT COALESCE(AVG(A.Score), 0)
+        FROM Posts A
+        WHERE A.ParentId = RHQ.QuestionId AND A.PostTypeId = 2
+    ) AS AverageAnswerScore,
+    -- CTE with a Set Operator: Combine questions that are duplicates or linked, then check if this question is in that set
+    CASE
+        WHEN RHQ.QuestionId IN (
+            SELECT PL.PostId FROM PostLinks PL WHERE PL.LinkTypeId IN (1, 3) AND PL.CreationDate >= (NOW() - INTERVAL '3 months') -- Recent links
+            UNION ALL
+            SELECT PL.RelatedPostId FROM PostLinks PL WHERE PL.LinkTypeId IN (1, 3) AND PL.CreationDate >= (NOW() - INTERVAL '3 months')
+        ) THEN 'Recently_Related_or_Duplicated'
+        ELSE 'Standalone'
+    END AS LinkStatus,
+    -- String expression: Concatenate owner info if available, handling NULLs and applying conditional formatting
+    CONCAT_WS(' | ',
+        COALESCE(UE.DisplayName, 'Unknown User'),
+        CASE WHEN UE.Reputation IS NOT NULL AND UE.Reputation > 10000 THEN 'Elite Rep: ' || UE.Reputation::TEXT
+             WHEN UE.Reputation IS NOT NULL THEN 'Rep: ' || UE.Reputation::TEXT
+             ELSE NULL END,
+        CASE WHEN UE.GoldBadges > 0 THEN '🏆 Gold: ' || UE.GoldBadges::TEXT ELSE NULL END
+    ) AS QuestionOwnerSummary,
+    -- Complex string pattern matching and NULL handling for tags
+    CASE
+        WHEN RHQ.PrimaryTag ILIKE 'data%' OR RHQ.PrimaryTag IN ('sql', 'database', 'big-data', 'machine-learning') THEN 'Data-Science_Related'
+        WHEN RHQ.PrimaryTag ILIKE '%web%' OR RHQ.PrimaryTag IN ('javascript', 'html', 'css', 'frontend', 'backend', 'api') THEN 'Web_Development_Related'
+        WHEN RHQ.PrimaryTag IS NULL THEN 'Untagged_Or_Unknown'
+        ELSE 'General_Programming'
+    END AS TagCategory
+FROM RecentHighImpactQuestions RHQ
+LEFT JOIN UserEngagementSummary UE ON RHQ.OwnerUserId = UE.UserId
+LEFT JOIN PostHistoricalActivity PHA ON RHQ.QuestionId = PHA.QuestionId
+LEFT JOIN AnswerMetrics AM ON RHQ.AcceptedAnswerId = AM.AnswerId AND RHQ.QuestionId = AM.QuestionId -- Join on AcceptedAnswerId and confirm ParentId matches QuestionId
+WHERE
+    RHQ.QuestionStatus = 'Answered'
+    AND RHQ.BodyLength BETWEEN 500 AND 5000 -- Filter by reasonable body length
+    AND RHQ.ContainsExternalLink IS TRUE -- Focus on questions with external references
+    AND (UE.Reputation IS NULL OR UE.Reputation >= 1000) -- Filter for questions by high-rep users or community-owned posts
+    AND (
+        SELECT COUNT(C.Id)
+        FROM Comments C
+        WHERE C.PostId = RHQ.QuestionId
+        AND C.CreationDate >= (NOW() - INTERVAL '3 months')
+    ) >= 2 -- At least 2 comments in the last 3 months
+    AND (
+        PHA.DuplicateCloseVotes = 0 OR PHA.DuplicateCloseVotes IS NULL -- Exclude questions that were closed as duplicate (or don't have this info)
+    )
+ORDER BY
+    HotnessIndex DESC, RHQ.CreationDate DESC, QuestionOwnerReputation DESC
+LIMIT 1000;

@@ -1,0 +1,245 @@
+SELECT 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) as TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN p.Id END) as QuestionsWithAcceptedAnswers,
+    COUNT(DISTINCT b.Id) as Badges,
+    SUM(COALESCE(p.Score, 0)) as TotalScore,
+    AVG(COALESCE(p.Score, 0)) as AverageScore,
+    MAX(p.CreationDate) as LastPostDate,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.ViewCount > 100 THEN p.Id END) as HighViewQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.Score > 10 THEN p.Id END) as HighScoreAnswers,
+    CASE 
+        WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.ViewCount > 100 THEN p.Id END) > 0 
+        THEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.Score > 10 THEN p.Id END) * 1.0 / COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.ViewCount > 100 THEN p.Id END)
+        ELSE 0 
+    END as AnswerQualityRatio,
+    STRING_AGG(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Title END, '; ') as QuestionTitles,
+    STRING_AGG(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Body END, '; ') as AnswerBodies,
+    COALESCE(
+        (SELECT COUNT(*) 
+         FROM Votes v 
+         WHERE v.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = u.Id) 
+         AND v.VoteTypeId IN (2, 3)), 0) as VoteCount,
+    COALESCE(
+        (SELECT COUNT(*) 
+         FROM Comments c 
+         WHERE c.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = u.Id)), 0) as CommentCount,
+    (SELECT COUNT(*) 
+     FROM Posts p2 
+     WHERE p2.OwnerUserId = u.Id 
+     AND p2.PostTypeId = 1 
+     AND p2.ClosedDate IS NOT NULL) as ClosedQuestions,
+    (SELECT COUNT(*) 
+     FROM Posts p3 
+     WHERE p3.OwnerUserId = u.Id 
+     AND p3.PostTypeId = 2 
+     AND p3.ParentId IN (SELECT Id FROM Posts WHERE OwnerUserId = u.Id AND PostTypeId = 1 AND ClosedDate IS NOT NULL)) as AnsweredClosedQuestions,
+    CASE 
+        WHEN COUNT(DISTINCT p.Id) > 0 
+        THEN COUNT(DISTINCT b.Id) * 100.0 / COUNT(DISTINCT p.Id) 
+        ELSE 0 
+    END as BadgeEfficiency,
+    (SELECT COUNT(*) 
+     FROM Posts p4 
+     WHERE p4.OwnerUserId = u.Id 
+     AND p4.PostTypeId = 1 
+     AND p4.CreationDate > DATE '2020-01-01' 
+     AND p4.CreationDate < DATE '2021-01-01') as Questions2020,
+    (SELECT COUNT(*) 
+     FROM Posts p5 
+     WHERE p5.OwnerUserId = u.Id 
+     AND p5.PostTypeId = 2 
+     AND p5.CreationDate > DATE '2020-01-01' 
+     AND p5.CreationDate < DATE '2021-01-01') as Answers2020,
+    COALESCE(
+        (SELECT AVG(Score) 
+         FROM Posts p6 
+         WHERE p6.OwnerUserId = u.Id 
+         AND p6.PostTypeId = 1), 0) as AvgQuestionScore,
+    COALESCE(
+        (SELECT AVG(Score) 
+         FROM Posts p7 
+         WHERE p7.OwnerUserId = u.Id 
+         AND p7.PostTypeId = 2), 0) as AvgAnswerScore,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN p.Id END) as QuestionsWithAnswers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.CommentCount > 0 THEN p.Id END) as QuestionsWithComments,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.CommentCount > 0 THEN p.Id END) as AnswersWithComments,
+    (
+        SELECT COUNT(*) 
+        FROM PostHistory ph 
+        WHERE ph.UserId = u.Id 
+        AND ph.PostHistoryTypeId = 2 
+        AND ph.CreationDate >= DATE '2020-01-01'
+    ) as BodyEdits2020,
+    (
+        SELECT COUNT(*) 
+        FROM PostHistory ph 
+        WHERE ph.UserId = u.Id 
+        AND ph.PostHistoryTypeId = 4 
+        AND ph.CreationDate >= DATE '2020-01-01'
+    ) as TitleEdits2020,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.Tags IS NOT NULL AND p.Tags != '' THEN p.Id END) as TaggedQuestions,
+    (
+        SELECT STRING_AGG(DISTINCT pt.Name, ', ') 
+        FROM PostHistory ph 
+        JOIN PostHistoryTypes pt ON ph.PostHistoryTypeId = pt.Id 
+        WHERE ph.UserId = u.Id 
+        AND ph.CreationDate >= DATE '2020-01-01'
+        GROUP BY ph.UserId
+    ) as ActivityTypes2020,
+    (
+        SELECT COUNT(*) 
+        FROM PostLinks pl 
+        JOIN Posts p8 ON pl.PostId = p8.Id 
+        WHERE p8.OwnerUserId = u.Id 
+        AND pl.LinkTypeId = 1
+    ) as LinkedPosts,
+    (
+        SELECT COUNT(*) 
+        FROM PostLinks pl 
+        JOIN Posts p9 ON pl.PostId = p9.Id 
+        WHERE p9.OwnerUserId = u.Id 
+        AND pl.LinkTypeId = 3
+    ) as DuplicatePosts,
+    (
+        SELECT SUM(CASE WHEN p10.PostTypeId = 1 THEN 1 ELSE 0 END) * 1.0 / 
+               NULLIF(SUM(CASE WHEN p10.PostTypeId = 2 THEN 1 ELSE 0 END), 0)
+        FROM Posts p10 
+        WHERE p10.OwnerUserId = u.Id
+    ) as QuestionAnswerRatio,
+    CASE 
+        WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.ViewCount > 100 THEN p.Id END) = 0 
+        THEN 0 
+        ELSE 
+            SUM(COALESCE(p.ViewCount, 0)) / 
+            COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.ViewCount > 100 THEN p.Id END)
+    END as AverageViewsPerHighViewQuestion,
+    (
+        SELECT STRING_AGG(DISTINCT p11.Title, ', ') 
+        FROM (
+            SELECT p11.Title, p11.CreationDate
+            FROM Posts p11
+            WHERE p11.OwnerUserId = u.Id 
+            AND p11.PostTypeId = 1
+            AND p11.CreationDate >= DATE '2020-01-01'
+            ORDER BY p11.CreationDate DESC
+            LIMIT 5
+        ) sub
+    ) as RecentQuestions,
+    (
+        SELECT STRING_AGG(DISTINCT p12.Body, ' | ') 
+        FROM (
+            SELECT p12.Body, p12.CreationDate
+            FROM Posts p12
+            WHERE p12.OwnerUserId = u.Id 
+            AND p12.PostTypeId = 2
+            AND p12.CreationDate >= DATE '2020-01-01'
+            ORDER BY p12.CreationDate DESC
+            LIMIT 5
+        ) sub
+    ) as RecentAnswers,
+    (
+        SELECT COUNT(DISTINCT v2.PostId) 
+        FROM Votes v2 
+        WHERE v2.UserId = u.Id 
+        AND v2.VoteTypeId = 5
+    ) as FavoritePosts,
+    (
+        SELECT COUNT(DISTINCT v3.UserId) 
+        FROM Votes v3 
+        WHERE v3.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = u.Id)
+        AND v3.UserId IS NOT NULL
+    ) as UniqueVoters,
+    (
+        SELECT COUNT(DISTINCT ph2.PostId) 
+        FROM PostHistory ph2 
+        WHERE ph2.UserId = u.Id 
+        AND ph2.PostHistoryTypeId = 10
+    ) as PostClosures,
+    (
+        SELECT COUNT(DISTINCT ph3.PostId) 
+        FROM PostHistory ph3 
+        WHERE ph3.UserId = u.Id 
+        AND ph3.PostHistoryTypeId = 11
+    ) as PostReopenings,
+    (
+        SELECT COALESCE(SUM(CASE WHEN ph4.PostHistoryTypeId IN (12, 13) THEN 1 ELSE 0 END), 0) 
+        FROM PostHistory ph4 
+        WHERE ph4.UserId = u.Id 
+    ) as PostDeletionsAndRestorations,
+    (
+        SELECT COUNT(DISTINCT p13.Id) 
+        FROM Posts p13 
+        WHERE p13.OwnerUserId = u.Id 
+        AND p13.ContentLicense = 'CC BY-SA 4.0'
+    ) as CCBySALicensePosts,
+    (
+        SELECT COUNT(DISTINCT p14.Id) 
+        FROM Posts p14 
+        WHERE p14.OwnerUserId = u.Id 
+        AND p14.Tags IS NOT NULL 
+        AND p14.Tags LIKE '%<%'
+    ) as TaggedPosts,
+    (
+        SELECT STRING_AGG(DISTINCT SUBSTRING(p15.Tags FROM 1 FOR 30), ', ') 
+        FROM Posts p15 
+        WHERE p15.OwnerUserId = u.Id 
+        AND p15.Tags IS NOT NULL 
+        AND p15.Tags LIKE '%<%'
+        AND p15.CreationDate >= DATE '2020-01-01'
+    ) as RecentTagStrings,
+    (
+        SELECT STRING_AGG(DISTINCT b2.Name, ', ') 
+        FROM Badges b2 
+        WHERE b2.UserId = u.Id
+        AND b2.Date >= DATE '2020-01-01'
+    ) as RecentBadges,
+    (
+        SELECT COUNT(DISTINCT b3.Id) 
+        FROM Badges b3 
+        WHERE b3.UserId = u.Id 
+        AND b3.Class = 1
+    ) as GoldBadges,
+    (
+        SELECT COUNT(DISTINCT b4.Id) 
+        FROM Badges b4 
+        WHERE b4.UserId = u.Id 
+        AND b4.Class = 2
+    ) as SilverBadges,
+    (
+        SELECT COUNT(DISTINCT b5.Id) 
+        FROM Badges b5 
+        WHERE b5.UserId = u.Id 
+        AND b5.Class = 3
+    ) as BronzeBadges,
+    (
+        SELECT STRING_AGG(DISTINCT CASE WHEN b6.TagBased = 1 THEN b6.Name END, ', ') 
+        FROM Badges b6 
+        WHERE b6.UserId = u.Id
+        AND b6.TagBased = 1
+    ) as TagBasedBadges,
+    (
+        SELECT STRING_AGG(DISTINCT CASE WHEN b7.TagBased = 0 THEN b7.Name END, ', ') 
+        FROM Badges b7 
+        WHERE b7.UserId = u.Id
+        AND b7.TagBased = 0
+    ) as NamedBadges
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN Badges b ON u.Id = b.UserId
+WHERE u.CreationDate >= DATE '2019-01-01'
+    AND u.Reputation > 1000
+    AND (
+        EXISTS (SELECT 1 FROM Posts p1 WHERE p1.OwnerUserId = u.Id AND p1.PostTypeId = 1)
+        OR EXISTS (SELECT 1 FROM Posts p2 WHERE p2.OwnerUserId = u.Id AND p2.PostTypeId = 2)
+        OR EXISTS (SELECT 1 FROM Badges b1 WHERE b1.UserId = u.Id)
+    )
+GROUP BY u.Id, u.DisplayName, u.Reputation
+HAVING COUNT(DISTINCT p.Id) > 10 
+    AND COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 0
+ORDER BY u.Reputation DESC, TotalPosts DESC
+LIMIT 500;

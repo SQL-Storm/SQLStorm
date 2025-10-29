@@ -1,0 +1,143 @@
+WITH
+    TopUsers AS (
+        SELECT u.Id,
+               u.DisplayName,
+               u.Reputation,
+               u.CreationDate,
+               COALESCE(u.Location, '[unknown]')                      AS Location,
+               COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1)       AS GoldBadges,
+               COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2)       AS SilverBadges,
+               COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3)       AS BronzeBadges,
+               SUM(CASE WHEN v.VoteTypeId = 2 THEN 1
+                        WHEN v.VoteTypeId = 3 THEN -1 ELSE 0 END) AS NetVoteScore,
+               ROW_NUMBER() OVER (ORDER BY u.Reputation DESC)       AS RepRank
+        FROM   Users u
+        LEFT   JOIN Badges   b ON b.UserId = u.Id
+        LEFT   JOIN Votes    v ON v.UserId = u.Id
+        GROUP  BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location
+        HAVING COUNT(*) FILTER (WHERE b.Id IS NOT NULL) >= 5
+    ),
+    TagStats AS (
+        SELECT t.TagName,
+               t.Count                                   AS TagUseCount,
+               COALESCE(p.Title, '[no title]')           AS ExcerptTitle,
+               COALESCE(w.Title, '[no wiki]')            AS WikiTitle,
+               ROW_NUMBER() OVER (PARTITION BY t.IsModeratorOnly
+                                  ORDER BY t.Count DESC) AS TagRank
+        FROM   Tags t
+        LEFT   JOIN Posts p ON p.Id = t.ExcerptPostId
+        LEFT   JOIN Posts w ON w.Id = t.WikiPostId
+    ),
+    RecentActivity AS (
+        SELECT u.Id                                   AS UserId,
+               MAX(p.CreationDate)                    AS LastPostDate,
+               MAX(c.CreationDate)                    AS LastCommentDate,
+               MAX(v.CreationDate)                    AS LastVoteDate
+        FROM   Users u
+        LEFT   JOIN Posts    p ON p.OwnerUserId = u.Id
+        LEFT   JOIN Comments c ON c.UserId      = u.Id
+        LEFT   JOIN Votes    v ON v.UserId      = u.Id
+        GROUP  BY u.Id
+    ),
+    QuestionAnswerUnion AS (
+        SELECT p.Id,
+               p.Title,
+               p.CreationDate,
+               p.Score,
+               p.ViewCount,
+               p.AnswerCount,
+               p.FavoriteCount,
+               p.Tags,
+               'Question'                                 AS PostKind,
+               p.OwnerUserId                              AS OwnerId,
+               CAST(NULL AS INTEGER)                       AS ParentId,
+               COALESCE(ph.Comment, '')                  AS CloseReason
+        FROM   Posts p
+        LEFT   JOIN PostHistory ph
+               ON ph.PostId = p.Id
+              AND ph.PostHistoryTypeId = 10
+        WHERE  p.PostTypeId = 1
+
+        UNION ALL
+
+        SELECT a.Id,
+               q.Title,
+               a.CreationDate,
+               a.Score,
+               CAST(NULL AS INTEGER) AS ViewCount,
+               CAST(NULL AS INTEGER) AS AnswerCount,
+               CAST(NULL AS INTEGER) AS FavoriteCount,
+               q.Tags,
+               'Answer'                                   AS PostKind,
+               a.OwnerUserId,
+               a.ParentId,
+               CAST(NULL AS TEXT)                          AS CloseReason
+        FROM   Posts a
+        JOIN   Posts q ON q.Id = a.ParentId AND q.PostTypeId = 1
+        WHERE  a.PostTypeId = 2
+    )
+SELECT
+    tu.Id,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.GoldBadges,
+    tu.SilverBadges,
+    tu.BronzeBadges,
+    tu.NetVoteScore,
+    tu.RepRank,
+    ra.LastPostDate,
+    ra.LastCommentDate,
+    ra.LastVoteDate,
+    qa.PostKind,
+    qa.Title,
+    qa.CreationDate,
+    qa.Score,
+    qa.ViewCount,
+    qa.AnswerCount,
+    qa.FavoriteCount,
+    CASE
+        WHEN qa.Tags IS NOT NULL THEN
+            (SELECT string_agg(t.TagName, ', ' ORDER BY t.TagName)
+                 FROM   (SELECT UNNEST(string_to_array(TRIM(BOTH '<' FROM TRIM(BOTH '>' FROM qa.Tags)), '><')) AS tag) AS tags_tbl
+                 JOIN   Tags t ON t.TagName = tags_tbl.tag
+                 WHERE  t.Count > 0)
+        ELSE NULL
+    END                                             AS TagList,
+    qa.CloseReason,
+    ROW_NUMBER() OVER (PARTITION BY tu.Id ORDER BY qa.CreationDate DESC) AS RecentPostRank,
+    CASE
+        WHEN qa.PostKind = 'Question' AND qa.AnswerCount IS NOT NULL AND qa.AnswerCount > 0
+            THEN qa.Score / NULLIF(qa.AnswerCount,0)
+        ELSE CAST(qa.Score AS FLOAT)
+    END                                             AS ScorePerAnswer,
+    COALESCE(qa.ViewCount,0) - COALESCE(qa.FavoriteCount,0) AS ViewsMinusFavorites
+FROM   TopUsers         tu
+LEFT   JOIN RecentActivity   ra  ON ra.UserId = tu.Id
+LEFT   JOIN QuestionAnswerUnion qa ON qa.OwnerId = tu.Id
+LEFT   JOIN TagStats          ts ON ts.TagName = ANY (string_to_array(TRIM(BOTH '<' FROM TRIM(BOTH '>' FROM qa.Tags)), '><'))
+WHERE  (qa.PostKind = 'Question' AND qa.Score > 0)
+   OR  (qa.PostKind = 'Answer'   AND qa.Score >= 5)
+GROUP BY
+    tu.Id,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.GoldBadges,
+    tu.SilverBadges,
+    tu.BronzeBadges,
+    tu.NetVoteScore,
+    tu.RepRank,
+    ra.LastPostDate,
+    ra.LastCommentDate,
+    ra.LastVoteDate,
+    qa.PostKind,
+    qa.Title,
+    qa.CreationDate,
+    qa.Score,
+    qa.ViewCount,
+    qa.AnswerCount,
+    qa.FavoriteCount,
+    qa.Tags,
+    qa.CloseReason
+ORDER  BY tu.RepRank,
+         qa.CreationDate DESC
+LIMIT  100;

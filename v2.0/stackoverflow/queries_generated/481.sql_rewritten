@@ -1,0 +1,347 @@
+-- {"query": "481.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3197} 
+with recent_activity as (
+  select
+    p.id as post_id,
+    p.posttypeid,
+    p.owneruserid,
+    p.acceptedanswerid,
+    p.parentid,
+    p.creationdate,
+    p.lastactivitydate,
+    p.score,
+    p.viewcount,
+    p.title,
+    p.tags,
+    u.displayname as owner_name,
+    u.reputation as owner_rep,
+    date_trunc('month', p.creationdate) as created_month,
+    coalesce(p.viewcount, 0) + greatest(p.score, 0) * 10 as popularity_score
+  from posts p
+  left join users u on u.id = p.owneruserid
+  where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+),
+vote_stats as (
+  select
+    v.postid,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started,
+    sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded,
+    min(v.creationdate) as first_vote_at,
+    max(v.creationdate) as last_vote_at,
+    count(*) as total_votes
+  from votes v
+  where v.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+  group by v.postid
+),
+comment_stats as (
+  select
+    c.postid,
+    count(*) as comments_count,
+    max(c.creationdate) as last_comment_at,
+    sum(case when c.score > 0 then 1 else 0 end) as positive_comments
+  from comments c
+  where c.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+  group by c.postid
+),
+link_dupes as (
+  select
+    pl.postid,
+    sum(case when pl.linktypeid = 3 then 1 else 0 end) as dup_links,
+    sum(case when pl.linktypeid = 1 then 1 else 0 end) as linked_refs,
+    count(*) as link_total
+  from postlinks pl
+  where pl.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+  group by pl.postid
+),
+close_events as (
+  select
+    ph.postid,
+    count(*) filter (where ph.posthistorytypeid = 10) as closes,
+    count(*) filter (where ph.posthistorytypeid = 11) as reopens,
+    max(ph.creationdate) filter (where ph.posthistorytypeid in (10,11)) as last_close_or_reopen_at,
+    max(case when ph.posthistorytypeid = 10 then nullif(ph.comment, '') end) as last_close_reason_id,
+    max(ph.creationdate) as last_history_at
+  from posthistory ph
+  where ph.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+  group by ph.postid
+),
+owner_badges as (
+  select
+    b.userid,
+    count(*) as total_badges,
+    sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+    sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+    sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+    sum(case when b.tagbased = 1 then 1 else 0 end) as tag_badges
+  from badges b
+  where b.date >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+  group by b.userid
+),
+question_core as (
+  select
+    ra.*,
+    vs.upvotes,
+    vs.downvotes,
+    vs.total_votes,
+    vs.bounty_started,
+    vs.bounty_awarded,
+    cs.comments_count,
+    cs.last_comment_at,
+    ld.dup_links,
+    ld.linked_refs,
+    ce.closes,
+    ce.reopens,
+    ce.last_close_or_reopen_at,
+    ce.last_history_at,
+    ob.total_badges,
+    ob.gold_badges,
+    ob.silver_badges,
+    ob.bronze_badges,
+    ob.tag_badges
+  from recent_activity ra
+  left join vote_stats vs on vs.postid = ra.post_id
+  left join comment_stats cs on cs.postid = ra.post_id
+  left join link_dupes ld on ld.postid = ra.post_id
+  left join close_events ce on ce.postid = ra.post_id
+  left join owner_badges ob on ob.userid = ra.owneruserid
+  where ra.posttypeid = 1
+),
+answer_core as (
+  select
+    ra.*,
+    vs.upvotes,
+    vs.downvotes,
+    vs.total_votes,
+    vs.bounty_started,
+    vs.bounty_awarded,
+    cs.comments_count,
+    cs.last_comment_at,
+    ld.dup_links,
+    ld.linked_refs,
+    ce.closes,
+    ce.reopens,
+    ce.last_close_or_reopen_at,
+    ce.last_history_at,
+    ob.total_badges,
+    ob.gold_badges,
+    ob.silver_badges,
+    ob.bronze_badges,
+    ob.tag_badges
+  from recent_activity ra
+  left join vote_stats vs on vs.postid = ra.post_id
+  left join comment_stats cs on cs.postid = ra.post_id
+  left join link_dupes ld on ld.postid = ra.post_id
+  left join close_events ce on ce.postid = ra.post_id
+  left join owner_badges ob on ob.userid = ra.owneruserid
+  where ra.posttypeid = 2
+),
+qa_pairs as (
+  select
+    q.post_id as question_id,
+    q.title as question_title,
+    q.tags as question_tags,
+    q.owneruserid as question_ownerid,
+    q.owner_name as question_owner,
+    q.owner_rep as question_owner_rep,
+    q.creationdate as question_created,
+    q.lastactivitydate as question_lastactivity,
+    q.score as question_score,
+    q.viewcount as question_views,
+    q.upvotes as q_upvotes,
+    q.downvotes as q_downvotes,
+    q.total_votes as q_votes,
+    q.comments_count as q_comments,
+    q.closes as q_closes,
+    q.reopens as q_reopens,
+    q.dup_links as q_dup_links,
+    q.linked_refs as q_linked_refs,
+    q.popularity_score as q_popularity,
+    a.post_id as answer_id,
+    a.owneruserid as answer_ownerid,
+    a.owner_name as answer_owner,
+    a.owner_rep as answer_owner_rep,
+    a.creationdate as answer_created,
+    a.lastactivitydate as answer_lastactivity,
+    a.score as answer_score,
+    a.upvotes as a_upvotes,
+    a.downvotes as a_downvotes,
+    a.total_votes as a_votes,
+    a.comments_count as a_comments,
+    a.popularity_score as a_popularity,
+    case when q.acceptedanswerid = a.post_id then 1 else 0 end as is_accepted
+  from question_core q
+  left join answer_core a
+    on a.parentid = q.post_id
+),
+answered_stats as (
+  select
+    question_id,
+    max(case when is_accepted = 1 then 1 else 0 end) as has_accepted,
+    count(*) filter (where answer_id is not null) as answer_count,
+    max(answer_score) as best_answer_score,
+    max(a_upvotes) as best_answer_upvotes,
+    min(answer_created) as first_answer_at,
+    max(answer_created) as last_answer_at
+  from qa_pairs
+  group by question_id
+),
+tag_explode as (
+  select
+    q.post_id,
+    unnest(string_to_array(substring(q.tags, 2, length(q.tags)-2), '><')) as tag
+  from question_core q
+  where q.tags is not null
+),
+tag_stats as (
+  select
+    t.tag,
+    count(distinct te.post_id) as questions_with_tag,
+    sum(qc.viewcount) as views_for_tag,
+    sum(qc.score) as score_for_tag
+  from tag_explode te
+  join question_core qc on qc.post_id = te.post_id
+  join tags t on t.tagname = te.tag
+  group by t.tag
+),
+user_activity as (
+  select
+    u.id as user_id,
+    count(distinct p.id) filter (where p.posttypeid = 1) as questions_asked,
+    count(distinct p.id) filter (where p.posttypeid = 2) as answers_given,
+    sum(coalesce(p.score,0)) as total_post_score,
+    sum(coalesce(p.viewcount,0)) as total_views,
+    max(p.lastactivitydate) as last_post_activity
+  from users u
+  left join posts p on p.owneruserid = u.id
+  group by u.id
+),
+ranked_questions as (
+  select
+    q.*,
+    asx.has_accepted,
+    asx.answer_count,
+    asx.best_answer_score,
+    asx.best_answer_upvotes,
+    asx.first_answer_at,
+    asx.last_answer_at,
+    row_number() over (partition by date_trunc('month', q.creationdate) order by q.popularity desc nulls last) as rn_pop_month,
+    dense_rank() over (order by coalesce(q.viewcount,0) desc) as dr_views_global,
+    percentile_disc(0.9) within group (order by q.viewcount) over () as p90_views_global
+  from question_core q
+  left join answered_stats asx on asx.question_id = q.post_id
+),
+heavy_hitters as (
+  select
+    rq.*
+  from ranked_questions rq
+  where
+    (rq.rn_pop_month <= 50
+     or rq.dr_views_global <= 200
+     or (rq.viewcount is not null and rq.viewcount >= rq.p90_views_global))
+),
+owner_quality as (
+  select
+    q.question_ownerid as user_id,
+    count(*) as questions_count,
+    avg(coalesce(q.question_score,0)) as avg_q_score,
+    avg(coalesce(asx.answer_count,0)) as avg_answers,
+    sum(case when asx.has_accepted = 1 then 1 else 0 end) as questions_with_accepted
+  from heavy_hitters q
+  left join answered_stats asx on asx.question_id = q.post_id
+  group by q.question_ownerid
+),
+null_playground as (
+  select
+    rq.post_id,
+    coalesce(nullif(trim(both from rq.title), ''), '[untitled]') as safe_title,
+    case
+      when rq.tags is null then array[]::varchar[]
+      else string_to_array(substring(rq.tags, 2, length(rq.tags)-2), '><')
+    end as tag_array,
+    case when rq.owner_name is null or rq.owner_name ~ '^\s*$' then '[anon]' else rq.owner_name end as safe_owner_name
+  from ranked_questions rq
+)
+select
+  rq.post_id,
+  np.safe_title as title,
+  rq.question_owner as owner_name,
+  rq.question_owner_rep as owner_rep,
+  rq.question_created as created_at,
+  rq.question_lastactivity as last_activity_at,
+  rq.question_views as views,
+  rq.question_score as score,
+  rq.q_upvotes as upvotes,
+  rq.q_downvotes as downvotes,
+  rq.q_comments as comments,
+  rq.q_closes as close_events,
+  rq.q_reopens as reopen_events,
+  rq.q_dup_links as duplicate_links,
+  rq.q_linked_refs as linked_references,
+  asx.answer_count,
+  asx.has_accepted,
+  asx.first_answer_at,
+  asx.last_answer_at,
+  round(coalesce(rq.q_popularity::numeric, 0), 2) as popularity_score,
+  case
+    when asx.answer_count is null or asx.answer_count = 0 then 'Unanswered'
+    when asx.has_accepted = 1 then 'Resolved'
+    when asx.has_accepted = 0 then 'Active'
+    else 'Unknown'
+  end as resolution_state,
+  array_length(np.tag_array, 1) as tag_count,
+  (select string_agg(t.tag, ', ' order by t.tag)
+   from tag_explode t
+   where t.post_id = rq.post_id) as tags_list,
+  coalesce(uq.avg_q_score, 0) as owner_avg_q_score,
+  coalesce(uq.avg_answers, 0) as owner_avg_answers_on_hh,
+  coalesce(uq.questions_with_accepted, 0) as owner_hh_with_accepted,
+  ua.questions_asked,
+  ua.answers_given,
+  ua.total_post_score,
+  ua.total_views as owner_total_views,
+  ua.last_post_activity as owner_last_post_activity,
+  rq.rn_pop_month as rank_in_month,
+  rq.dr_views_global as rank_global_views,
+  ts_top.tag as top_tag_by_views,
+  ts_top.views_for_tag as top_tag_views,
+  ts_top.score_for_tag as top_tag_score
+from ranked_questions rq
+left join answered_stats asx on asx.question_id = rq.post_id
+left join null_playground np on np.post_id = rq.post_id
+left join owner_quality uq on uq.user_id = rq.question_ownerid
+left join user_activity ua on ua.user_id = rq.question_ownerid
+left join lateral (
+  select ts.tag, ts.views_for_tag, ts.score_for_tag
+  from tag_explode te
+  join tag_stats ts on ts.tag = te.tag
+  where te.post_id = rq.post_id
+  order by ts.views_for_tag desc nulls last, ts.score_for_tag desc nulls last, ts.tag
+  limit 1
+) ts_top on true
+where
+  -- complicated predicate combining null logic, date ranges, score thresholds, and text search
+  (
+    (rq.question_views >= 1000 and rq.question_score >= 5)
+    or (rq.q_upvotes - coalesce(rq.q_downvotes,0) >= 10)
+    or (asx.answer_count >= 3 and asx.has_accepted = 1)
+  )
+  and (
+    rq.question_created between date_trunc('year', cast('2024-10-01 12:34:56' as timestamp)) - interval '3 years'
+                          and date_trunc('year', cast('2024-10-01 12:34:56' as timestamp)) + interval '1 year' - interval '1 day'
+  )
+  and (
+    np.safe_title ilike any (array['%performance%', '%optimiz%', '%index%', '%join%', '%CTE%'])
+    or exists (
+      select 1
+      from tag_explode te
+      where te.post_id = rq.post_id
+        and te.tag ilike any (array['%sql%', '%postgres%', '%tuning%'])
+    )
+  )
+order by
+  rq.rn_pop_month nulls last,
+  rq.dr_views_global nulls last,
+  rq.question_views desc nulls last,
+  rq.question_created desc
+limit 500;

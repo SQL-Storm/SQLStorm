@@ -1,0 +1,132 @@
+WITH 
+    UserStats AS (
+        SELECT 
+            u.Id                         AS UserId,
+            u.DisplayName,
+            u.Reputation,
+            COUNT(b.Id)                  AS BadgeCount,
+            SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS QuestionScoreSum,
+            SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS AnswerScoreSum,
+            COUNT(p.Id)                  AS TotalPosts
+        FROM Users u
+        LEFT JOIN Badges b   ON b.UserId = u.Id
+        LEFT JOIN Posts p    ON p.OwnerUserId = u.Id
+        GROUP BY u.Id, u.DisplayName, u.Reputation
+    ),
+    TagUsage AS (
+        SELECT 
+            p.Id                               AS PostId,
+            p.Tags,
+            CASE 
+                WHEN p.Tags IS NULL THEN 0
+                ELSE cardinality(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags)-2), '><'))
+            END                                AS TagCount
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+    ),
+    TopPosts AS (
+        SELECT 
+            p.Id,
+            p.Title,
+            p.Score,
+            p.ViewCount,
+            p.CreationDate,
+            COALESCE(p.Tags,'')                AS Tags,
+            tu.TagCount,
+            ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS rn,
+            p.OwnerUserId
+        FROM Posts p
+        LEFT JOIN TagUsage tu ON tu.PostId = p.Id
+        WHERE p.PostTypeId = 1
+          AND p.CreationDate >= DATE '2020-01-01'
+    ),
+    CommentStats AS (
+        SELECT 
+            c.PostId,
+            COUNT(*)                        AS CommentCount,
+            MAX(c.CreationDate)             AS LastCommentDate
+        FROM Comments c
+        GROUP BY c.PostId
+    ),
+    RecentVotes AS (
+        SELECT 
+            v.PostId,
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes v
+        WHERE v.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '30' DAY)
+        GROUP BY v.PostId
+    ),
+    SelectedPosts AS (
+        SELECT 
+            tp.Id,
+            tp.Title,
+            tp.Score,
+            tp.ViewCount,
+            tp.Tags,
+            tp.TagCount,
+            cs.CommentCount,
+            rv.UpVotes,
+            rv.DownVotes,
+            tp.OwnerUserId
+        FROM TopPosts tp
+        LEFT JOIN CommentStats cs ON cs.PostId = tp.Id
+        LEFT JOIN RecentVotes rv   ON rv.PostId = tp.Id
+        WHERE tp.rn = 1
+    ),
+    PrimaryResult AS (
+        SELECT 
+            us.UserId,
+            us.DisplayName,
+            us.Reputation,
+            us.BadgeCount,
+            us.QuestionScoreSum,
+            us.AnswerScoreSum,
+            us.TotalPosts,
+            sp.Id                              AS TopPostId,
+            sp.Title                           AS TopPostTitle,
+            sp.Score                           AS TopPostScore,
+            sp.ViewCount                       AS TopPostViews,
+            sp.TagCount                        AS TopPostTagCount,
+            COALESCE(sp.CommentCount,0)        AS TopPostCommentCount,
+            COALESCE(sp.UpVotes,0) - COALESCE(sp.DownVotes,0) AS TopPostVoteBalance
+        FROM UserStats us
+        LEFT JOIN SelectedPosts sp 
+               ON sp.Id = (
+                    SELECT p2.Id 
+                    FROM Posts p2 
+                    WHERE p2.OwnerUserId = us.UserId 
+                      AND p2.PostTypeId = 1 
+                    ORDER BY p2.Score DESC 
+                    LIMIT 1
+                  )
+        WHERE us.Reputation > 10000 
+           OR us.BadgeCount >= 5
+        ORDER BY us.Reputation DESC, us.BadgeCount DESC
+        LIMIT 100
+    ),
+    SecondaryResult AS (
+        SELECT 
+            u.Id                               AS UserId,
+            u.DisplayName,
+            u.Reputation,
+            0               AS BadgeCount,
+            0               AS QuestionScoreSum,
+            0               AS AnswerScoreSum,
+            0               AS TotalPosts,
+            CAST(NULL AS INTEGER)             AS TopPostId,
+            CAST(NULL AS VARCHAR)             AS TopPostTitle,
+            CAST(NULL AS INTEGER)             AS TopPostScore,
+            CAST(NULL AS INTEGER)             AS TopPostViews,
+            CAST(NULL AS INTEGER)             AS TopPostTagCount,
+            CAST(NULL AS INTEGER)             AS TopPostCommentCount,
+            CAST(NULL AS INTEGER)             AS TopPostVoteBalance
+        FROM Users u
+        WHERE NOT EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id)
+          AND u.CreationDate < DATE '2010-01-01'
+        ORDER BY u.Reputation DESC
+        LIMIT 10
+    )
+SELECT * FROM PrimaryResult
+UNION ALL
+SELECT * FROM SecondaryResult;

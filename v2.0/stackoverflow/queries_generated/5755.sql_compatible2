@@ -1,0 +1,55 @@
+SELECT
+  u.Id AS UserId,
+  u.DisplayName AS UserName,
+  u.Reputation,
+  u.CreationDate AS UserCreationDate,
+  u.LastAccessDate,
+  COALESCE(u.Location, 'Unknown') AS Location,
+  COUNT(DISTINCT p.Id) AS TotalPosts,
+  SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+  SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+  AVG(CASE WHEN v.PostId IS NOT NULL THEN COALESCE(v.VoteTypeId, 0) ELSE NULL END) AS AvgVotesPerPost,
+  MAX(p.LastActivityDate) AS LastActivityDate,
+  STRING_AGG(DISTINCT t.Name, ',') AS TagNames,
+  SUM(CASE
+        WHEN v.VoteTypeId = 2 THEN 1
+        WHEN v.VoteTypeId = 6 THEN -1
+        ELSE 0
+      END) AS NetVoteScore,
+  (SELECT COUNT(*) FROM Badges b2 WHERE b2.UserId = u.Id) AS BadgeCount,
+  SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+  SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+  SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+FROM
+  Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+  LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+  LEFT JOIN Tags t ON t.Id = (
+    SELECT tg.Id FROM Tags tg WHERE tg.ExcerptPostId = p.Id OR tg.WikiPostId = p.Id LIMIT 1
+  )
+  LEFT JOIN Badges b ON b.UserId = u.Id
+WHERE
+  u.AccountId IS NOT NULL
+  AND u.Reputation > 100
+  AND (
+    p.CreationDate IS NULL
+    OR p.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+  )
+GROUP BY
+  u.Id,
+  u.DisplayName,
+  u.Reputation,
+  u.CreationDate,
+  u.LastAccessDate,
+  u.Location,
+  p.LastActivityDate,
+  t.Name,
+  b.Class
+HAVING
+  COUNT(DISTINCT p.Id) > 5
+ORDER BY
+  NetVoteScore DESC,
+  TotalPosts DESC
+LIMIT 100;

@@ -1,0 +1,159 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 AS Depth
+    FROM Tags t
+    WHERE t.IsRequired = 1
+
+    UNION ALL
+
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.IsModeratorOnly,
+        t2.IsRequired,
+        r.Depth + 1
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r ON t2.Id <> r.Id AND t2.Count > r.Count / 2
+    WHERE r.Depth < 3
+),
+UserScoreStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId IN (1, 2)) AS AvgPostScore,
+        SUM(COALESCE(p.FavoriteCount, 0)) AS TotalFavorites,
+        MAX(p.CreationDate) AS LastPostDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.CreationDate) AS ReputationRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    WHERE u.Reputation IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+PostHistoryAggregates AS (
+    SELECT
+        ph.PostId,
+        COUNT(DISTINCT ph.PostHistoryTypeId) AS DistinctEditTypes,
+        MAX(ph.CreationDate) AS LastEditDate,
+        MIN(ph.CreationDate) AS FirstEditDate,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN 1 ELSE 0 END) AS CloseOpenVotes,
+        STRING_AGG(DISTINCT ph.Comment, ' | ') FILTER (WHERE ph.Comment IS NOT NULL) AS CloseReasons
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+),
+TopPosts AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        us.DisplayName AS OwnerName,
+        us.ReputationRank,
+        pha.DistinctEditTypes,
+        pha.LastEditDate,
+        pha.CloseOpenVotes,
+        pha.CloseReasons,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC, p.CreationDate DESC) AS RankByUser
+    FROM Posts p
+    LEFT JOIN UserScoreStats us ON p.OwnerUserId = us.UserId
+    LEFT JOIN PostHistoryAggregates pha ON p.Id = pha.PostId
+    WHERE p.PostTypeId = 1 AND p.Score > 10
+),
+DetailedPostLinks AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name AS LinkTypeName,
+        p2.Title AS RelatedTitle,
+        p2.Score AS RelatedScore
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    JOIN Posts p2 ON pl.RelatedPostId = p2.Id
+    WHERE lt.Name IN ('Duplicate', 'Linked')
+),
+ComplexUserBadgeInfo AS (
+    SELECT
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        SUM(CASE WHEN b.TagBased = 1 THEN 1 ELSE 0 END) AS TagBasedCount,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+)
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    cus.GoldBadges,
+    cus.SilverBadges,
+    cus.BronzeBadges,
+    cus.TagBasedCount,
+    us.QuestionCount,
+    us.AnswerCount,
+    us.AvgPostScore,
+    us.TotalFavorites,
+    us.ReputationRank,
+    tp.Title AS TopQuestionTitle,
+    COALESCE(NULLIF(tp.Tags, ''), '<no tags>') AS TagsList,
+    tp.Score AS TopQuestionScore,
+    tp.ViewCount AS TopQuestionViews,
+    tp.DistinctEditTypes,
+    tp.CloseOpenVotes,
+    tp.CloseReasons,
+    dtl.LinkTypeName,
+    dtl.RelatedTitle,
+    dtl.RelatedScore,
+    CASE
+        WHEN u.LastAccessDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30' DAY THEN 'Active'
+        WHEN u.LastAccessDate BETWEEN CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90' DAY AND CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30' DAY THEN 'Inactive'
+        ELSE 'Dormant'
+    END AS UserActivityStatus,
+    LENGTH(COALESCE(u.AboutMe, '')) AS AboutMeLength,
+    COALESCE(u.Location, 'Unknown Location') AS Location,
+    ROW_NUMBER() OVER (PARTITION BY COALESCE(u.Location, 'Unknown') ORDER BY u.Reputation DESC) AS LocationReputationRank,
+    CONCAT(
+        COALESCE(u.DisplayName, 'Anonymous'),
+        ' (Reputation: ',
+        COALESCE(CAST(u.Reputation AS varchar), 'N/A'),
+        ') @ ',
+        COALESCE(u.Location, 'No Location Provided'),
+        CASE WHEN COALESCE(cus.GoldBadges,0) > 0 THEN ' [Gold+' ELSE '' END,
+        CASE WHEN COALESCE(cus.SilverBadges,0) > 0 THEN ' Silver+' ELSE '' END,
+        CASE WHEN COALESCE(cus.BronzeBadges,0) > 0 THEN ' Bronze' ELSE '' END,
+        ')'
+    ) AS UserSummary
+FROM Users u
+LEFT JOIN UserScoreStats us ON us.UserId = u.Id
+LEFT JOIN ComplexUserBadgeInfo cus ON cus.UserId = u.Id
+LEFT JOIN (
+    SELECT 
+        tp1.*
+    FROM TopPosts tp1
+    WHERE tp1.RankByUser = 1
+) tp ON tp.OwnerUserId = u.Id
+LEFT JOIN LATERAL (
+    SELECT dl.LinkTypeName, dl.RelatedTitle, dl.RelatedScore
+    FROM DetailedPostLinks dl
+    WHERE dl.PostId = tp.Id
+    ORDER BY dl.RelatedScore DESC
+    LIMIT 1
+) dtl ON TRUE
+WHERE u.Reputation > 1000
+AND (
+    tp.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365' DAY
+    OR tp.CreationDate IS NULL
+)
+ORDER BY us.ReputationRank
+LIMIT 100;

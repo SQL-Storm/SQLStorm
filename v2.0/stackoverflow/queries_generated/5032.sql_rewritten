@@ -1,0 +1,195 @@
+-- {"query": "5032.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1162} 
+WITH
+RecentActivePosts AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.PostTypeId,
+    p.Tags,
+    p.ViewCount,
+    p.Score,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.OwnerDisplayName,
+    p.LastEditorUserId,
+    p.LastEditDate,
+    p.ContentLicense
+  FROM Posts p
+  WHERE p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+),
+TopQuestionThemes AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS TagCount
+  FROM Tags tg
+  JOIN Posts p ON p.Tags LIKE CONCAT('%<', tg.TagName, '>%') OR p.Tags LIKE CONCAT('%', tg.TagName, '%')
+  JOIN Tag AS t ON t.Id = tg.Id
+  GROUP BY t.TagName
+),
+CrossJoined AS (
+  SELECT
+    p1.Id AS PostId,
+    p1.Title,
+    p1.OwnerUserId,
+    p1.CreationDate,
+    p1.LastActivityDate,
+    p1.Score,
+    p1.ViewCount,
+    p1.AnswerCount,
+    p1.CommentCount,
+    p1.FavoriteCount,
+    p1.Tags,
+    p1.PostTypeId,
+    u1.Reputation AS OwnerReputation,
+    u1.DisplayName AS OwnerDisplayName,
+    u2.Reputation AS EditorReputation,
+    u2.DisplayName AS EditorDisplayName,
+    vh.Name AS HistoryType,
+    ph.CreationDate AS HistoryDate,
+    ph.Text AS HistoryText
+  FROM RecentActivePosts p1
+  LEFT JOIN Users u1 ON p1.OwnerUserId = u1.Id
+  LEFT JOIN PostHistory ph ON ph.PostId = p1.Id
+  LEFT JOIN PostHistoryTypes vh ON ph.PostHistoryTypeId = vh.Id
+  LEFT JOIN Users u2 ON p1.LastEditorUserId = u2.Id
+),
+Windowed AS (
+  SELECT
+    PostId,
+    Title,
+    OwnerUserId,
+    CreationDate,
+    LastActivityDate,
+    Score,
+    ViewCount,
+    AnswerCount,
+    CommentCount,
+    FavoriteCount,
+    Tags,
+    PostTypeId,
+    OwnerReputation,
+    OwnerDisplayName,
+    EditorReputation,
+    EditorDisplayName,
+    HistoryType,
+    HistoryDate,
+    HistoryText,
+    ROW_NUMBER() OVER (
+      PARTITION BY PostId
+      ORDER BY HistoryDate DESC NULLS LAST
+    ) AS rn
+  FROM CrossJoined
+),
+Filtered AS (
+  SELECT
+    PostId,
+    Title,
+    OwnerUserId,
+    CreationDate,
+    LastActivityDate,
+    Score,
+    ViewCount,
+    AnswerCount,
+    CommentCount,
+    FavoriteCount,
+    Tags,
+    PostTypeId,
+    OwnerReputation,
+    OwnerDisplayName,
+    EditorReputation,
+    EditorDisplayName,
+    HistoryType,
+    HistoryDate,
+    HistoryText
+  FROM Windowed
+  WHERE rn = 1
+),
+Aggregated AS (
+  SELECT
+    a.PostId,
+    a.Title,
+    a.OwnerUserId,
+    a.CreationDate,
+    a.LastActivityDate,
+    a.Score,
+    a.ViewCount,
+    a.AnswerCount,
+    a.CommentCount,
+    a.FavoriteCount,
+    a.Tags,
+    a.PostTypeId,
+    a.OwnerReputation,
+    a.OwnerDisplayName,
+    a.EditorReputation,
+    a.EditorDisplayName,
+    a.HistoryType,
+    a.HistoryDate,
+    a.HistoryText,
+    (a.Score * 0.8 + a.ViewCount * 0.2) AS CompositeScore,
+    CASE
+      WHEN a.ViewCount > 1000 THEN 'Popular'
+      WHEN a.Score > 10 THEN 'Trending'
+      ELSE 'New/Unpopular'
+    END AS Popularity
+  FROM Filtered a
+),
+Final AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.Tags,
+    p.PostTypeId,
+    a.OwnerReputation,
+    a.OwnerDisplayName,
+    a.EditorReputation,
+    a.EditorDisplayName,
+    a.HistoryType,
+    a.HistoryDate,
+    a.HistoryText,
+    a.CompositeScore,
+    a.Popularity,
+    COALESCE(SUM(v.BountyAmount) OVER (PARTITION BY p.Id), 0) AS TotalBounty
+  FROM Posts p
+  LEFT JOIN Aggregated a ON p.Id = a.PostId
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  WHERE p.PostTypeId IN (1, 2) -- Questions and Answers
+    AND (p.Tags IS NOT NULL OR p.Title IS NOT NULL)
+)
+SELECT
+  PostId,
+  Title,
+  OwnerUserId,
+  CreationDate,
+  LastActivityDate,
+  Score,
+  ViewCount,
+  AnswerCount,
+  CommentCount,
+  FavoriteCount,
+  Tags,
+  PostTypeId,
+  OwnerReputation,
+  OwnerDisplayName,
+  EditorReputation,
+  EditorDisplayName,
+  HistoryType,
+  HistoryDate,
+  HistoryText,
+  CompositeScore,
+  Popularity,
+  TotalBounty
+FROM Final
+ORDER BY CompositeScore DESC, TotalBounty DESC
+LIMIT 200;

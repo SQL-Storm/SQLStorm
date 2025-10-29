@@ -1,0 +1,183 @@
+-- {"query": "1132.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3097} 
+WITH UserEngagement AS (
+    -- Calculate various engagement metrics for users
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.Location,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+        COALESCE(SUM(c.Score), 0) AS TotalCommentScore,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE NULL END) AS AvgQuestionViewCount,
+        MAX(p.LastActivityDate) AS LastPostActivity,
+        MAX(c.CreationDate) AS LastCommentActivity
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location
+),
+PostTagsProcessed AS (
+    -- Pre-process tags from posts into an array for easier querying
+    SELECT
+        p.Id AS PostId,
+        ARRAY_AGG(LOWER(TRIM(tag))) FILTER (WHERE TRIM(tag) <> '') AS TagsArray
+    FROM Posts p
+    -- Check for non-NULL tags and ensure it's not just an empty '<>'
+    LEFT JOIN UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><')) AS tag ON TRUE
+    WHERE p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2
+    GROUP BY p.Id
+),
+PostQualityMetrics AS (
+    -- Evaluate the quality and activity of posts, specifically questions and answers
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        ptp.TagsArray AS PostTagsArray, -- Using the pre-processed tags array
+        COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6)) AS EditCount, -- Title, Body, Tags edits
+        COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId = 11) AS ReopenCount,
+        COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId = 10) AS CloseCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate DESC) AS UserPostRankByScore,
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.ViewCount DESC) AS PostTypeViewRank
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    LEFT JOIN PostTagsProcessed ptp ON p.Id = ptp.PostId -- Join with processed tags
+    WHERE p.PostTypeId IN (1, 2) -- Only questions and answers
+    GROUP BY p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, ptp.TagsArray
+),
+PotentialDuplicateAnalysis AS (
+    -- Identify questions that are potential duplicates or linked to others, with their linked post metrics
+    SELECT
+        pl.PostId AS QuestionId,
+        pl.RelatedPostId AS LinkedPostId,
+        lt.Name AS LinkType,
+        p_linked.Score AS LinkedPostScore,
+        p_linked.ViewCount AS LinkedPostViewCount,
+        p_linked.AnswerCount AS LinkedPostAnswerCount,
+        COUNT(DISTINCT c.Id) AS LinkedPostCommentCount,
+        LAG(p_linked.CreationDate, 1, '1970-01-01'::timestamp) OVER (PARTITION BY pl.PostId ORDER BY pl.CreationDate) AS PrevLinkDate
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    JOIN Posts p_linked ON pl.RelatedPostId = p_linked.Id
+    LEFT JOIN Comments c ON p_linked.Id = c.PostId
+    WHERE lt.Id IN (1, 3) -- Linked or Duplicate
+    GROUP BY pl.PostId, pl.RelatedPostId, lt.Name, p_linked.Score, p_linked.ViewCount, p_linked.AnswerCount, pl.CreationDate, p_linked.CreationDate
+),
+UserBadgeSummary AS (
+    SELECT
+        UserId,
+        SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(DISTINCT Name) FILTER (WHERE TagBased = TRUE) AS UniqueTagBadges,
+        MAX(Date) AS LatestBadgeDate
+    FROM Badges
+    GROUP BY UserId
+)
+-- Main Query: Identify highly engaged and influential users/posts with complex filtering and aggregation
+SELECT
+    ue.UserId,
+    ue.DisplayName,
+    ue.Reputation,
+    ue.TotalPosts,
+    ue.QuestionCount,
+    ue.AnswerCount,
+    ue.TotalPostScore,
+    ue.TotalCommentScore,
+    ue.AvgQuestionViewCount,
+    EXTRACT(YEAR FROM AGE(cast('2024-10-01' as date), ue.UserCreationDate)) AS YearsOnPlatform,
+    COALESCE(ubs.GoldBadges, 0) AS GoldBadgesCount,
+    COALESCE(ubs.SilverBadges, 0) AS SilverBadgesCount,
+    COALESCE(ubs.BronzeBadges, 0) AS BronzeBadgesCount,
+    COALESCE(ubs.UniqueTagBadges, 0) AS UniqueTagBadgesCount,
+    NTILE(100) OVER (ORDER BY ue.Reputation DESC) AS ReputationPercentile, -- Top 100 percentiles of reputation
+    AVG(pqm.PostScore) OVER (PARTITION BY ue.UserId) AS UserAvgPostScore,
+    MAX(pqm.EditCount) OVER (PARTITION BY ue.UserId) AS MaxPostEditsByAnyUserPost,
+    SUM(CASE WHEN pqm.PostTypeId = 1 AND 'sql' = ANY(COALESCE(pqm.PostTagsArray, '{}')) THEN 1 ELSE 0 END) AS SqlQuestionCount, -- Check for 'sql' tag in the array
+    SUM(CASE WHEN pqm.PostTypeId = 2 AND pqm.PostScore > 50 THEN 1 ELSE 0 END) AS HighScoreAnswerCount,
+    (SELECT COUNT(v.Id) FROM Votes v WHERE v.PostId = pqm.PostId AND v.VoteTypeId = 2) AS PostUpvoteCount, -- Correlated subquery for upvotes per post
+    CASE
+        WHEN ue.Reputation > 10000 AND COALESCE(ubs.GoldBadges, 0) > 5 THEN 'Guru'
+        WHEN ue.Reputation > 5000 AND COALESCE(ubs.SilverBadges, 0) > 10 THEN 'Expert'
+        WHEN ue.TotalPosts > 100 AND ue.AnswerCount > ue.QuestionCount THEN 'Contributor'
+        ELSE 'Active'
+    END AS UserInfluenceCategory,
+    COALESCE(ue.Location, 'Unspecified Location') AS UserLocation_Coalesced,
+    LAG(ue.Reputation, 1) OVER (PARTITION BY COALESCE(ue.Location, 'NULL_LOCATION') ORDER BY ue.CreationDate) AS PreviousUserReputationInLocation
+FROM UserEngagement ue
+LEFT JOIN PostQualityMetrics pqm ON ue.UserId = pqm.OwnerUserId
+LEFT JOIN UserBadgeSummary ubs ON ue.UserId = ubs.UserId
+WHERE
+    ue.Reputation > 500
+    AND ue.TotalPosts > 10
+    AND (ue.AvgQuestionViewCount IS NULL OR ue.AvgQuestionViewCount > 500)
+    AND EXISTS (
+        -- Correlated subquery: check if the user has posted at least one question with a related duplicate
+        SELECT 1
+        FROM PotentialDuplicateAnalysis pda
+        JOIN Posts q ON pda.QuestionId = q.Id
+        WHERE q.OwnerUserId = ue.UserId
+        AND pda.LinkType = 'Duplicate'
+        AND pda.LinkedPostScore > 10
+        LIMIT 1
+    )
+    AND (
+        -- Complex OR condition for post quality, using COALESCE for PostTagsArray
+        (pqm.PostTypeId = 1 AND pqm.PostScore > 20 AND pqm.AnswerCount > 2 AND 'c#' = ANY(COALESCE(pqm.PostTagsArray, '{}')))
+        OR
+        (pqm.PostTypeId = 2 AND pqm.PostScore > 50 AND pqm.EditCount > 0 AND pqm.PostTypeViewRank <= 1000)
+    )
+    AND ue.DisplayName IS NOT NULL AND LENGTH(TRIM(ue.DisplayName)) > 3
+    AND ue.UserCreationDate >= '2015-01-01' -- Focus on relatively recent users
+
+UNION ALL
+
+-- Second part of the UNION: Find users who have very actively participated in closed/reopened posts, regardless of overall reputation
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+    COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+    COALESCE(SUM(c.Score), 0) AS TotalCommentScore,
+    AVG(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE NULL END) AS AvgQuestionViewCount,
+    EXTRACT(YEAR FROM AGE(cast('2024-10-01' as date), u.CreationDate)) AS YearsOnPlatform,
+    COALESCE(ubs.GoldBadges, 0) AS GoldBadgesCount,
+    COALESCE(ubs.SilverBadges, 0) AS SilverBadgesCount,
+    COALESCE(ubs.BronzeBadges, 0) AS BronzeBadgesCount,
+    COALESCE(ubs.UniqueTagBadges, 0) AS UniqueTagBadgesCount,
+    NTILE(100) OVER (ORDER BY u.Reputation DESC) AS ReputationPercentile,
+    AVG(p.Score) FILTER (WHERE p.OwnerUserId = u.Id) AS UserAvgPostScore,
+    MAX(ph_closed.PostHistoryTypeId) FILTER (WHERE ph_closed.PostHistoryTypeId IN (10, 11)) AS MaxPostEditsByAnyUserPost, -- using this column for a different metric here, just for complexity
+    SUM(CASE WHEN p.PostTypeId = 1 AND p.Tags LIKE '%<java>%' THEN 1 ELSE 0 END) AS JavaQuestionCount,
+    SUM(CASE WHEN p.PostTypeId = 2 AND p.Score < -5 THEN 1 ELSE 0 END) AS LowScoreAnswerCount,
+    (SELECT COUNT(v.Id) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS PostDownvoteCount, -- Correlated subquery for downvotes per post
+    'EngagedInCloseActivity' AS UserInfluenceCategory,
+    COALESCE(u.Location, 'Unspecified Location') AS UserLocation_Coalesced,
+    LEAD(u.Reputation, 1, 0) OVER (PARTITION BY COALESCE(u.Location, 'NULL_LOCATION') ORDER BY u.CreationDate) AS NextUserReputationInLocation
+FROM Users u
+JOIN Posts p ON u.Id = p.OwnerUserId
+JOIN PostHistory ph_closed ON p.Id = ph_closed.PostId
+LEFT JOIN Comments c ON u.Id = c.UserId
+LEFT JOIN UserBadgeSummary ubs ON u.Id = ubs.UserId
+WHERE
+    (ph_closed.PostHistoryTypeId = 10 OR ph_closed.PostHistoryTypeId = 11) -- Post Closed or Reopened
+    AND ph_closed.CreationDate >= '2022-01-01' -- Recent close/reopen activity
+    AND u.Reputation BETWEEN 100 AND 1000 -- Focus on users not necessarily 'Gurus' but active in moderation
+    AND p.CommentCount > 5 -- Posts with significant discussion
+    AND p.LastActivityDate > p.CreationDate + INTERVAL '1 day' -- Post has seen some activity after creation
+GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location, ubs.GoldBadges, ubs.SilverBadges, ubs.BronzeBadges, ubs.UniqueTagBadges
+HAVING COUNT(DISTINCT ph_closed.PostId) > 2 -- User involved in at least 3 distinct closed/reopened posts
+ORDER BY Reputation DESC, UserCreationDate ASC;

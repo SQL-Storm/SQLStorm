@@ -1,0 +1,122 @@
+-- {"query": "4550.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1128} 
+WITH
+  RankedPosts AS (
+    SELECT
+      p.Id AS PostId,
+      p.PostTypeId,
+      p.OwnerUserId,
+      p.Title,
+      p.Score,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      p.ViewCount,
+      ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS ScoreRank,
+      DENSE_RANK() OVER (ORDER BY p.CreationDate) AS DateRank,
+      LAG(p.Score, 1, 0) OVER (ORDER BY p.CreationDate) AS PreviousScore,
+      LEAD(p.Score, 1, 0) OVER (ORDER BY p.CreationDate) AS NextScore,
+      CASE
+        WHEN p.ClosedDate IS NOT NULL THEN 1
+        ELSE 0
+      END AS IsClosed,
+      CASE
+        WHEN p.CommunityOwnedDate IS NOT NULL THEN 1
+        ELSE 0
+      END AS IsCommunityOwned,
+      SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2) AS CleanTags
+    FROM Posts AS p
+    WHERE
+      p.PostTypeId IN (1, 2) AND p.Score > 0
+  ),
+  UserPostAggregates AS (
+    SELECT
+      rp.OwnerUserId,
+      COUNT(rp.PostId) AS TotalPosts,
+      SUM(rp.Score) AS TotalScore,
+      AVG(rp.AnswerCount) AS AvgAnswers,
+      MAX(rp.FavoriteCount) AS MaxFavorites,
+      SUM(rp.IsClosed) AS ClosedPostsCount
+    FROM RankedPosts AS rp
+    GROUP BY
+      rp.OwnerUserId
+  ),
+  TagPerformance AS (
+    SELECT
+      t.TagName,
+      COUNT(p.Id) AS PostCount,
+      SUM(p.Score) AS TotalScore,
+      AVG(p.ViewCount) AS AvgViews,
+      SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount
+    FROM Posts AS p
+    INNER JOIN Tags AS t
+      ON ',' || p.Tags || ',' LIKE '%,' || t.TagName || ',%'
+    WHERE
+      p.PostTypeId IN (1, 2) AND t.TagName IS NOT NULL AND p.Score > 0
+    GROUP BY
+      t.TagName
+    HAVING
+      COUNT(p.Id) > 50
+  ),
+  RecentActivity AS (
+    SELECT
+      p.OwnerUserId,
+      MAX(p.LastActivityDate) AS LastActivity
+    FROM Posts AS p
+    WHERE
+      p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+    GROUP BY
+      p.OwnerUserId
+  )
+SELECT
+  u.DisplayName,
+  upa.TotalPosts,
+  upa.TotalScore,
+  upa.AvgAnswers,
+  upa.MaxFavorites,
+  upa.ClosedPostsCount,
+  rp.Score AS PostScore,
+  rp.ViewCount AS PostViewCount,
+  rp.CommentCount AS PostCommentCount,
+  rp.ScoreRank,
+  rp.DateRank,
+  rp.PreviousScore,
+  rp.NextScore,
+  CASE
+    WHEN rp.IsClosed = 1 THEN 'Closed'
+    ELSE 'Open'
+  END AS PostStatus,
+  CASE
+    WHEN rp.IsCommunityOwned = 1 THEN 'Community Owned'
+    ELSE 'User Owned'
+  END AS OwnershipStatus,
+  tp.TagName,
+  tp.PostCount AS TagPostCount,
+  tp.TotalScore AS TagTotalScore,
+  tp.AvgViews AS TagAvgViews,
+  CASE
+    WHEN ra.LastActivity IS NOT NULL THEN 'Active Recently'
+    ELSE 'Inactive'
+  END AS UserActivityStatus,
+  COALESCE(u.EmailHash, 'N/A') AS EmailHashStatus,
+  CASE
+    WHEN u.WebsiteUrl IS NULL OR TRIM(u.WebsiteUrl) = '' THEN 'No Website'
+    WHEN u.WebsiteUrl LIKE '%stackoverflow.com%' THEN 'Stack Overflow Related'
+    ELSE 'External Website'
+  END AS WebsiteType
+FROM Users AS u
+JOIN UserPostAggregates AS upa
+  ON u.Id = upa.OwnerUserId
+JOIN RankedPosts AS rp
+  ON u.Id = rp.OwnerUserId
+LEFT JOIN TagPerformance AS tp
+  ON ',' || rp.CleanTags || ',' LIKE '%,' || tp.TagName || ',%'
+LEFT JOIN RecentActivity AS ra
+  ON u.Id = ra.OwnerUserId
+WHERE
+  upa.TotalPosts > 10 AND tp.TagPostCount > 100 AND rp.Score > 50
+ORDER BY
+  upa.TotalScore DESC,
+  rp.Score DESC,
+  tp.TagTotalScore DESC
+LIMIT 100;

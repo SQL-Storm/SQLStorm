@@ -1,0 +1,178 @@
+-- {"query": "2635.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1539} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        0 as Level,
+        array[t.TagName] as Path
+    from tags t
+    where t.IsModeratorOnly = 0
+
+    union all
+
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Level + 1,
+        r.Path || t.TagName
+    from tags t
+    join RecursiveTagHierarchy r on char_length(t.TagName) > char_length(r.TagName)
+    where t.IsModeratorOnly = 0
+      and not t.TagName = any(r.Path)
+      and left(t.TagName, char_length(r.TagName)) = r.TagName
+),
+UserPostStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        coalesce(sum(vc.Score),0) as TotalPostScore,
+        max(case when p.PostTypeId = 1 then p.ViewCount else 0 end) as MaxQuestionViewCount,
+        array_agg(distinct ph.PostHistoryTypeId) filter (where ph.PostHistoryTypeId is not null) as UserEditTypes
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Votes v on v.PostId = p.Id and v.VoteTypeId=2 -- upvotes only
+    left join Posts vc on vc.Id = v.PostId
+    left join PostHistory ph on ph.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+RecentHighScoringAnswers as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId,
+        a.Score,
+        a.CreationDate,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate desc) as rn
+    from Posts a
+    where a.PostTypeId = 2
+      and a.CreationDate >= now() - interval '180 days'
+),
+TopAnswersWithAcceptStatus as (
+    select
+        r.AnswerId,
+        r.QuestionId,
+        r.OwnerUserId,
+        r.Score,
+        r.CreationDate,
+        case when q.AcceptedAnswerId = r.AnswerId then true else false end as IsAccepted
+    from RecentHighScoringAnswers r
+    left join Posts q on q.Id = r.QuestionId
+    where r.rn <= 3
+),
+UserBadgesSummary as (
+    select
+        UserId,
+        count(*) filter (where Class = 1) as GoldBadges,
+        count(*) filter (where Class = 2) as SilverBadges,
+        count(*) filter (where Class = 3) as BronzeBadges,
+        bool_or(TagBased = 1) as HasTagBasedBadge,
+        bool_or(TagBased = 0) as HasNamedBadge
+    from Badges
+    group by UserId
+),
+UserActivitySegmentation as (
+    select
+        u.Id,
+        u.DisplayName,
+        case
+            when u.LastAccessDate < now() - interval '365 days' then 'Dormant'
+            when u.LastAccessDate between now() - interval '365 days' and now() - interval '30 days' then 'Inactive'
+            when u.LastAccessDate > now() - interval '30 days' then 'Active'
+            else 'Unknown'
+        end as ActivityStatus
+    from Users u
+),
+QuestionsWithDuplicateLinks as (
+    select
+        p.Id as QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        count(distinct pl.RelatedPostId) filter (where lt.Name = 'Duplicate') as DuplicateCount,
+        string_agg(distinct u.DisplayName, ', ') filter (where u.DisplayName is not null) as DuplicateOwners
+    from Posts p
+    left join PostLinks pl on pl.PostId = p.Id
+    left join LinkTypes lt on lt.Id = pl.LinkTypeId
+    left join Posts dp on dp.Id = pl.RelatedPostId
+    left join Users u on u.Id = dp.OwnerUserId
+    where p.PostTypeId = 1
+    group by p.Id, p.Title, p.OwnerUserId
+),
+CloseReasonsSummary as (
+    select
+        ph.PostId,
+        crt.Name as CloseReasonName,
+        count(*) as CloseVotesCount
+    from PostHistory ph
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int) 
+    where ph.PostHistoryTypeId = 10
+    group by ph.PostId, crt.Name
+),
+UserCommentEngagement as (
+    select
+        c.UserId,
+        count(distinct c.PostId) as DistinctPostsCommented,
+        avg(c.Score) as AvgCommentScore,
+        count(*) as TotalComments,
+        count(*) filter (where c.Text like '%thanks%' or c.Text like '%thank you%') as ThankCommentsCount
+    from Comments c
+    group by c.UserId
+),
+FinalResults as (
+    select
+        u.DisplayName,
+        up.QuestionCount,
+        up.AnswerCount,
+        up.TotalPostScore,
+        up.MaxQuestionViewCount,
+        bs.GoldBadges,
+        bs.SilverBadges,
+        bs.BronzeBadges,
+        uas.ActivityStatus,
+        coalesce(crs.CloseVotesCount,0) as CloseVotesOnUserQuestions,
+        coalesce(uc.ThankCommentsCount,0) as ThankCommentsInComments,
+        duplicated.DuplicateCount,
+        duplicated.DuplicateOwners,
+        array_to_string(up.UserEditTypes, ', ') as EditTypes,
+        tagh.Level as TagHierarchyLevel,
+        tagh.Path as TagHierarchyPath
+    from UserPostStats up
+    join Users u on u.Id = up.UserId
+    left join UserBadgesSummary bs on bs.UserId = up.UserId
+    left join UserActivitySegmentation uas on uas.Id = up.UserId
+    left join CloseReasonsSummary crs on crs.PostId in (select Id from Posts where OwnerUserId = up.UserId and PostTypeId = 1)
+    left join UserCommentEngagement uc on uc.UserId = up.UserId
+    left join QuestionsWithDuplicateLinks duplicated on duplicated.OwnerUserId = up.UserId
+    left join LATERAL (
+        select *
+        from RecursiveTagHierarchy
+        order by Level desc
+        limit 1
+    ) tagh on true
+    where up.QuestionCount > 5
+    order by up.TotalPostScore desc nulls last, bs.GoldBadges desc nulls last
+    limit 25
+)
+select * from FinalResults
+union all
+select
+    'Summary' as DisplayName,
+    sum(QuestionCount),
+    sum(AnswerCount),
+    sum(TotalPostScore),
+    max(MaxQuestionViewCount),
+    sum(GoldBadges),
+    sum(SilverBadges),
+    sum(BronzeBadges),
+    'N/A',
+    sum(CloseVotesOnUserQuestions),
+    sum(ThankCommentsInComments),
+    sum(DuplicateCount),
+    null,
+    null,
+    null,
+    null
+from FinalResults;

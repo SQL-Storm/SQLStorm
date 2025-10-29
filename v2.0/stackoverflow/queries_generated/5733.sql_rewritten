@@ -1,0 +1,119 @@
+-- {"query": "5733.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 876} 
+WITH recent_users AS (
+  SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.WebsiteUrl,
+    u.EmailHash,
+    u.AccountId
+  FROM Users u
+  WHERE u.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '365 days'
+),
+top_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.OwnerUserId,
+    p.AcceptedAnswerId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.CommentCount,
+    p.LastActivityDate,
+    p.LastEditDate,
+    p.FavoriteCount,
+    p.ParentId,
+    p.PostTypeId,
+    p.ContentLicense
+  FROM Posts p
+  WHERE p.PostTypeId = 1 -- Question
+    AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '180 days'
+),
+question_tag_stats AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS question_count,
+    AVG(p.Score) AS avg_score,
+    MAX(p.ViewCount) AS max_views
+  FROM top_questions tq
+  JOIN UNNEST(string_to_array(substring(tq.Tags, 2, length(tq.Tags)-2), '><')) AS t(TagName)
+  ON TRUE
+  GROUP BY t.TagName
+),
+recent_votes AS (
+  SELECT
+    v.PostId,
+    v.VoteTypeId,
+    v.UserId,
+    v.CreationDate,
+    v.BountyAmount,
+    uv.DisplayName AS VoterName
+  FROM Votes v
+  LEFT JOIN Users uv ON v.UserId = uv.Id
+  WHERE v.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '90 days'
+),
+combined AS (
+  SELECT
+    tq.PostId,
+    tq.Title,
+    tq.OwnerUserId,
+    tq.CreationDate AS QuestionCreationDate,
+    tq.Score,
+    tq.ViewCount,
+    tq.LastActivityDate,
+    tq.LastEditDate,
+    jsonb_build_object(
+      'tags', (SELECT jsonb_agg(TagName) FROM UNNEST(string_to_array(substring(tq.Tags, 2, length(tq.Tags)-2), '><')) AS TagName),
+      'tags_count', (SELECT COUNT(*) FROM UNNEST(string_to_array(substring(tq.Tags, 2, length(tq.Tags)-2), '><')) AS TagName)
+    ) AS TagInfo,
+    row_number() OVER (PARTITION BY tq.OwnerUserId ORDER BY tq.CreationDate DESC) AS rn
+  FROM top_questions tq
+)
+SELECT
+  c.PostId,
+  c.Title,
+  c.OwnerUserId,
+  u.DisplayName AS OwnerDisplayName,
+  u.Reputation,
+  c.QuestionCreationDate,
+  c.Score,
+  c.ViewCount,
+  c.LastActivityDate,
+  c.LastEditDate,
+  c.TagInfo,
+  COALESCE(vs.latest_voter, '{}'::jsonb) AS RecentVotes,
+  tags_stat.TagName AS TopTag,
+  tg.question_count AS QuestionsWithTag,
+  tg.avg_score AS AvgScoreForTag,
+  tg.max_views AS MaxViewsForTag
+FROM combined c
+LEFT JOIN Users u ON c.OwnerUserId = u.Id
+LEFT JOIN (
+  SELECT
+    v.PostId,
+    jsonb_agg(jsonb_build_object('User', v.VoterName, 'Date', v.CreationDate, 'Type', v.VoteTypeId)) AS latest_voter
+  FROM recent_votes v
+  GROUP BY v.PostId
+) vs ON c.PostId = vs.PostId
+LEFT JOIN LATERAL (
+  SELECT tg.TagName
+  FROM question_tag_stats tg
+  ORDER BY tg.question_count DESC
+  LIMIT 1
+) AS tags_stat ON true
+LEFT JOIN (
+  SELECT TagName, question_count, avg_score, max_views
+  FROM question_tag_stats
+  ORDER BY question_count DESC
+  LIMIT 5
+) tg ON true
+ORDER BY c.QuestionCreationDate DESC
+LIMIT 100;

@@ -1,0 +1,313 @@
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        u.location,
+        u.upvotes,
+        u.downvotes,
+        coalesce(nullif(trim(u.websiteurl), ''), 'n/a') as normalized_website,
+        row_number() over (order by u.creationdate desc, u.id desc) as rn
+    from users u
+    where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+user_activity as (
+    select
+        u.user_id,
+        count(distinct p.id) filter (where p.posttypeid in (1,2)) as total_posts,
+        count(*) filter (where c.id is not null) as total_comments,
+        sum(greatest(p.score, 0)) as nonneg_post_score,
+        sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end) as net_votes_received,
+        sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started,
+        sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded
+    from recent_users u
+    left join posts p on p.owneruserid = u.user_id
+    left join comments c on c.userid = u.user_id
+    left join votes v on v.postid = p.id
+    group by u.user_id
+),
+user_badges as (
+    select
+        b.userid as user_id,
+        count(*) as badge_count,
+        count(*) filter (where b.class = 1) as gold_count,
+        count(*) filter (where b.class = 2) as silver_count,
+        count(*) filter (where b.class = 3) as bronze_count,
+        count(*) filter (where b.tagbased = true) as tag_badges
+    from badges b
+    where b.date >= (select max(date) - interval '365 days' from badges)
+    group by b.userid
+),
+question_stats as (
+    select
+        p.owneruserid as user_id,
+        count(*) as q_count,
+        sum(p.viewcount) as q_views,
+        avg(nullif(p.viewcount,0)) as avg_q_views,
+        sum(case when p.acceptedanswerid is not null then 1 else 0 end) as q_with_accept,
+        percentile_disc(0.5) within group (order by coalesce(p.score,0)) as q_score_p50
+    from posts p
+    where p.posttypeid = 1
+    group by p.owneruserid
+),
+answer_stats as (
+    select
+        p.owneruserid as user_id,
+        count(*) as a_count,
+        sum(coalesce(p.score,0)) as a_score_sum,
+        avg(coalesce(p.score,0)) as a_score_avg,
+        percentile_disc(0.9) within group (order by coalesce(p.score,0)) as a_score_p90
+    from posts p
+    where p.posttypeid = 2
+    group by p.owneruserid
+),
+closure_info as (
+    select
+        ph.postid,
+        min(ph.creationdate) as first_closed_at,
+        max(case when ph.posthistorytypeid = 11 then ph.creationdate end) as last_reopened_at,
+        max(case when ph.posthistorytypeid = 10 then cast(nullif(regexp_replace(ph.comment, '[^0-9]', '', 'g'), '') as integer) end) as last_close_reason_id
+    from posthistory ph
+    where ph.posthistorytypeid in (10,11)
+    group by ph.postid
+),
+dup_links as (
+    select
+        pl.relatedpostid as canonical_id,
+        count(*) as dup_inbound_count
+    from postlinks pl
+    where pl.linktypeid = 3
+    group by pl.relatedpostid
+),
+tag_unpivot as (
+    select
+        p.id as post_id,
+        lower(trim(tg)) as tag
+    from posts p
+    cross join lateral (
+        select unnest(
+            case
+                when p.tags is not null and length(p.tags) >= 2
+                    then string_to_array(substring(p.tags from 2 for length(p.tags)-2), '><')
+                else array[]::varchar[] -- keep as-is for dialects that support it; otherwise replace with CAST('{}' AS varchar[])
+            end
+        ) as tg
+    ) t
+    where p.posttypeid = 1
+),
+user_top_tag as (
+    select
+        q.owneruserid as user_id,
+        tu.tag,
+        count(*) as tag_q_count,
+        row_number() over (partition by q.owneruserid order by count(*) desc, min(q.creationdate)) as tag_rank
+    from posts q
+    join tag_unpivot tu on tu.post_id = q.id
+    where q.posttypeid = 1
+    group by q.owneruserid, tu.tag
+),
+post_engagement as (
+    select
+        p.id as post_id,
+        p.owneruserid as user_id,
+        p.posttypeid,
+        p.creationdate,
+        p.score,
+        count(distinct v.userid) filter (where v.votetypeid in (2,3)) as voters,
+        sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+        sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+        count(distinct c.id) as comments
+    from posts p
+    left join votes v on v.postid = p.id and v.votetypeid in (2,3)
+    left join comments c on c.postid = p.id
+    where p.posttypeid in (1,2)
+    group by p.id, p.owneruserid, p.posttypeid, p.creationdate, p.score
+),
+user_engagement_rollup as (
+    select
+        pe.user_id,
+        sum(pe.voters) as voters_total,
+        sum(pe.upvotes) as upvotes_total,
+        sum(pe.downvotes) as downvotes_total,
+        sum(pe.comments) as comments_total,
+        avg(pe.score) as avg_post_score,
+        stddev_pop(pe.score) as std_post_score,
+        max(pe.creationdate) as last_post_at
+    from post_engagement pe
+    group by pe.user_id
+),
+recent_hotness as (
+    select
+        p.owneruserid as user_id,
+        sum(case when ph.posthistorytypeid = 52 then 1 when ph.posthistorytypeid = 53 then -1 else 0 end) as hot_events_net
+    from posts p
+    left join posthistory ph on ph.postid = p.id and ph.posthistorytypeid in (52,53)
+    group by p.owneruserid
+),
+ranked_users as (
+    select
+        ru.*,
+        ua.total_posts,
+        ua.total_comments,
+        ua.nonneg_post_score,
+        ua.net_votes_received,
+        ua.bounty_started,
+        ua.bounty_awarded,
+        coalesce(qs.q_count,0) as q_count,
+        coalesce(qs.q_views,0) as q_views,
+        qs.avg_q_views,
+        coalesce(qs.q_with_accept,0) as q_with_accept,
+        qs.q_score_p50,
+        coalesce(as2.a_count,0) as a_count,
+        as2.a_score_sum,
+        as2.a_score_avg,
+        as2.a_score_p90,
+        coalesce(ub.badge_count,0) as badge_count,
+        coalesce(ub.gold_count,0) as gold_count,
+        coalesce(ub.silver_count,0) as silver_count,
+        coalesce(ub.bronze_count,0) as bronze_count,
+        coalesce(ub.tag_badges,0) as tag_badges,
+        coalesce(uer.voters_total,0) as voters_total,
+        coalesce(uer.upvotes_total,0) as upvotes_total,
+        coalesce(uer.downvotes_total,0) as downvotes_total,
+        coalesce(uer.comments_total,0) as comments_total,
+        uer.avg_post_score,
+        uer.std_post_score,
+        uer.last_post_at,
+        coalesce(rh.hot_events_net,0) as hot_events_net,
+        utt.tag as top_tag,
+        utt.tag_q_count
+    from recent_users ru
+    left join user_activity ua on ua.user_id = ru.user_id
+    left join question_stats qs on qs.user_id = ru.user_id
+    left join answer_stats as2 on as2.user_id = ru.user_id
+    left join user_badges ub on ub.user_id = ru.user_id
+    left join user_engagement_rollup uer on uer.user_id = ru.user_id
+    left join recent_hotness rh on rh.user_id = ru.user_id
+    left join lateral (
+        select tag, tag_q_count
+        from user_top_tag utt2
+        where utt2.user_id = ru.user_id and utt2.tag_rank = 1
+        limit 1
+    ) as utt on true
+),
+penalized_scores as (
+    select
+        r.*,
+        case
+            when r.total_posts = 0 then 0
+            else cast(
+                (
+                    0.35 * coalesce(r.a_score_avg,0) +
+                    0.25 * coalesce(r.q_score_p50,0) +
+                    0.20 * ln(1 + coalesce(r.q_views,0)) +
+                    0.10 * coalesce(r.badge_count,0) +
+                    0.10 * coalesce(r.hot_events_net,0)
+                )
+                - 0.15 * coalesce(r.downvotes_total,0)
+                - 0.10 * coalesce(r.comments_total,0) / nullif(r.total_posts,0)
+                - 0.05 * coalesce(r.std_post_score,0)
+            AS numeric)  -- cast to numeric to allow rounding below
+        end as composite_score_raw
+    from ranked_users r
+),
+penalized_scores_rounded as (
+    select
+        ps.*,
+        case
+            when ps.total_posts = 0 then 0
+            else round(ps.composite_score_raw::double precision, 3)
+        end as composite_score
+    from penalized_scores ps
+),
+user_closure_impact as (
+    select
+        p.owneruserid as user_id,
+        count(*) as closed_q_count,
+        count(*) filter (where ci.last_close_reason_id = 101) as closed_as_duplicate,
+        min(ci.first_closed_at) as first_closed_at,
+        max(ci.last_reopened_at) as last_reopened_at
+    from posts p
+    join closure_info ci on ci.postid = p.id
+    where p.posttypeid = 1
+    group by p.owneruserid
+),
+user_duplicate_canonical as (
+    select
+        q.owneruserid as user_id,
+        sum(coalesce(dl.dup_inbound_count,0)) as canonical_weight
+    from posts q
+    left join dup_links dl on dl.canonical_id = q.id
+    where q.posttypeid = 1
+    group by q.owneruserid
+),
+final_rank as (
+    select
+        psr.*,
+        coalesce(uci.closed_q_count,0) as closed_q_count,
+        coalesce(uci.closed_as_duplicate,0) as closed_as_duplicate,
+        uci.first_closed_at,
+        uci.last_reopened_at,
+        coalesce(udc.canonical_weight,0) as canonical_weight,
+        dense_rank() over (
+            order by
+                psr.composite_score desc,
+                psr.reputation desc,
+                psr.a_count desc,
+                psr.q_count desc,
+                psr.user_id asc
+        ) as overall_rank
+    from penalized_scores_rounded psr
+    left join user_closure_impact uci on uci.user_id = psr.user_id
+    left join user_duplicate_canonical udc on udc.user_id = psr.user_id
+)
+select
+    fr.overall_rank,
+    fr.user_id,
+    fr.displayname,
+    fr.location,
+    fr.normalized_website,
+    fr.reputation,
+    fr.creationdate,
+    fr.total_posts,
+    fr.q_count,
+    fr.a_count,
+    fr.a_score_avg,
+    fr.q_score_p50,
+    fr.avg_q_views,
+    fr.voters_total,
+    fr.upvotes_total,
+    fr.downvotes_total,
+    fr.comments_total,
+    fr.badge_count,
+    fr.gold_count,
+    fr.silver_count,
+    fr.bronze_count,
+    fr.tag_badges,
+    fr.hot_events_net,
+    fr.top_tag,
+    fr.tag_q_count,
+    fr.closed_q_count,
+    fr.closed_as_duplicate,
+    fr.canonical_weight,
+    fr.composite_score,
+    fr.last_post_at
+from final_rank fr
+where
+    (
+        fr.top_tag is null
+        or fr.top_tag not in (
+            select lower(tagname)
+            from tags
+            where ismoderatoronly = 1 or isrequired = 1
+        )
+    )
+    and (
+        fr.composite_score > (
+            select avg(composite_score) from penalized_scores_rounded
+        )
+        or fr.gold_count > 0
+    )
+order by fr.overall_rank
+limit 200;

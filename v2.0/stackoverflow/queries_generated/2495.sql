@@ -1,0 +1,132 @@
+-- {"query": "2495.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1566} 
+with RecursiveTagCounts as (
+    select t.Id, t.TagName, t.Count,
+           dense_rank() over (order by t.Count desc) as RankDesc,
+           dense_rank() over (order by t.Count) as RankAsc
+    from Tags t
+), UserBadgeStats as (
+    select 
+        u.Id as UserId, u.DisplayName,
+        count(distinct case when b.Class = 1 then b.Id end) as GoldBadges,
+        count(distinct case when b.Class = 2 then b.Id end) as SilverBadges,
+        count(distinct case when b.Class = 3 then b.Id end) as BronzeBadges,
+        coalesce(sum(b.TagBased::int),0) as TagBasedBadges
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+), PostScoreStats as (
+    select 
+        p.Id, p.PostTypeId, p.OwnerUserId,
+        p.CreationDate,
+        coalesce(p.Score,0) as Score,
+        coalesce(p.ViewCount, 0) as ViewCount,
+        row_number() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as ScoreRank,
+        lag(p.Score) over (partition by p.PostTypeId order by p.CreationDate) as PrevScore,
+        lead(p.Score) over (partition by p.PostTypeId order by p.CreationDate) as NextScore,
+        -- Calculate length of title and body with NULL handling
+        length(coalesce(p.Title,'')) as TitleLength,
+        length(coalesce(p.Body,'')) as BodyLength,
+        -- Extract first tag if available (tags format: '<tag1><tag2>...')
+        substring(
+            substring(p.Tags from 2 for length(p.Tags)-2)
+            from 1 for coalesce(nullif(position('>' in substring(p.Tags from 2 for length(p.Tags)-2)),0)-1,0)
+        ) as FirstTag
+    from Posts p
+    where p.PostTypeId in (1,2)
+), PostLinkDuplicates as (
+    select pl.PostId, pl.RelatedPostId
+    from PostLinks pl
+    where pl.LinkTypeId = 3 -- Duplicate
+), UserActivitySummary as (
+    select 
+        u.Id,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as UserQuestions,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as UserAnswers,
+        count(distinct c.Id) as CommentsMade,
+        coalesce(max(p.CreationDate), timestamp '1900-01-01') as LastPostDate,
+        coalesce(max(c.CreationDate), timestamp '1900-01-01') as LastCommentDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    group by u.Id
+), CloseReasonSummary as (
+    select cht.Name as CloseReason, count(ph.Id) as CloseCount
+    from PostHistory ph
+    join PostHistoryTypes chtt on ph.PostHistoryTypeId = chtt.Id
+    join CloseReasonTypes cht on cast(ph.Comment as int) = cht.Id
+    where ph.PostHistoryTypeId = 10 -- Post Closed
+    group by cht.Name
+), DuplicateQuestionsWithAnswers as (
+    select distinct q.Id as QuestionId, q.Title, q.OwnerUserId, a.Id as AnswerId, a.Score as AnswerScore,
+           u.DisplayName as QuestionOwner, auser.DisplayName as AnswerOwner
+    from Posts q
+    left join PostLinkDuplicates d on d.PostId = q.Id
+    left join Posts a on a.ParentId = q.Id
+    left join Users u on u.Id = q.OwnerUserId
+    left join Users auser on auser.Id = a.OwnerUserId
+    where q.PostTypeId = 1
+      and d.PostId is not null
+      and a.Id is not null
+), UserRankedBadges as (
+    select
+        ub.UserId, ub.DisplayName, ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges, ub.TagBasedBadges,
+        rank() over (order by ub.GoldBadges desc, ub.SilverBadges desc, ub.BronzeBadges desc) as BadgeRank
+    from UserBadgeStats ub
+)
+select 
+    r.Id as TagId,
+    r.TagName,
+    r.Count as TagCount,
+    r.RankDesc,
+    r.RankAsc,
+    urs.UserQuestions,
+    urs.UserAnswers,
+    urs.CommentsMade,
+    urs.LastPostDate,
+    urs.LastCommentDate,
+    ubd.GoldBadges,
+    ubd.SilverBadges,
+    ubd.BronzeBadges,
+    ubd.TagBasedBadges,
+    ubd.BadgeRank,
+    coalesce(p.ScoreRank,0) as PostScoreRank,
+    p.TitleLength,
+    p.BodyLength,
+    p.FirstTag,
+    cr.CloseReason,
+    cr.CloseCount,
+    dq.QuestionId,
+    dq.Title as DuplicateQuestionTitle,
+    dq.QuestionOwner,
+    dq.AnswerId,
+    dq.AnswerScore,
+    dq.AnswerOwner,
+    -- String expression example: concatenated owner display and first tag
+    coalesce(u.DisplayName,'[deleted]') || ' - ' || coalesce(p.FirstTag, '[no tag]') as OwnerTagSummary,
+    -- Complicated predicate: Posts with high score and accepted answers or recent activity within 7 days
+    case 
+        when p.Score > 10 and p.Id in (select AcceptedAnswerId from Posts where AcceptedAnswerId is not null)
+              or p.LastActivityDate > current_timestamp - interval '7 day' then 1 
+        else 0 
+    end as HotPostFlag,
+    -- Correlated Subquery to count comments per post with NULL handling
+    (select count(*) from Comments c where c.PostId = p.Id and c.Score > 0) as PositiveCommentsCount,
+    -- Using NULL logic: Display User WebsiteUrl or fallback to Location or 'N/A'
+    coalesce(u.WebsiteUrl, u.Location, 'N/A') as ContactInfo,
+    -- Set operator example: union of users who answered or commented
+    (select count(distinct ua.Id) from (
+        select OwnerUserId as Id from Posts where ParentId = p.Id and OwnerUserId is not null
+        union
+        select UserId from Comments where PostId = p.Id and UserId is not null
+    ) as ua) as UniqueContributors
+from RecursiveTagCounts r
+left join UserActivitySummary urs on urs.Id = (select OwnerUserId from Posts where Tags like '%' || r.TagName || '%'
+                                               and OwnerUserId is not null limit 1)
+left join UserRankedBadges ubd on ubd.UserId = urs.Id
+left join Posts p on p.Tags like '%' || r.TagName || '%' and p.PostTypeId = 1
+left join CloseReasonSummary cr on 1=1
+left join DuplicateQuestionsWithAnswers dq on dq.QuestionId = p.Id
+left join Users u on u.Id = p.OwnerUserId
+where r.RankDesc <= 50
+order by r.RankDesc, ubd.BadgeRank, p.ScoreRank desc
+limit 100;

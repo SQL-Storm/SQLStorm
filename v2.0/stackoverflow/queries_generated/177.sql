@@ -1,0 +1,270 @@
+-- {"query": "177.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2891} 
+with recent_users as (
+  select u.id as user_id,
+         u.displayname,
+         u.reputation,
+         u.creationdate,
+         coalesce(nullif(trim(split_part(coalesce(u.location,''), ',', 1)), ''), 'Unknown') as region_hint,
+         date_trunc('month', u.creationdate) as cohort_month
+  from users u
+  where u.creationdate >= now() - interval '5 years'
+),
+post_activity as (
+  select p.id as post_id,
+         p.owneruserid as user_id,
+         p.posttypeid,
+         p.creationdate,
+         p.score,
+         p.viewcount,
+         p.answercount,
+         p.commentcount,
+         p.favoritecount,
+         p.closeddate,
+         p.tags,
+         case when p.posttypeid = 1 then 1 else 0 end as is_question,
+         case when p.posttypeid = 2 then 1 else 0 end as is_answer
+  from posts p
+  where p.creationdate >= (select min(creationdate) from recent_users)
+),
+tag_unpivot as (
+  select pa.post_id,
+         unnest(string_to_array(substring(coalesce(pa.tags,''), 2, greatest(length(coalesce(pa.tags,'')) - 2, 0)), '><')) as tagname
+  from post_activity pa
+  where pa.tags is not null and pa.is_question = 1
+),
+user_badges as (
+  select b.userid as user_id,
+         count(*) filter (where b.class = 1) as gold_badges,
+         count(*) filter (where b.class = 2) as silver_badges,
+         count(*) filter (where b.class = 3) as bronze_badges,
+         max(b.date) as last_badge_date
+  from badges b
+  group by b.userid
+),
+vote_agg as (
+  select v.postid as post_id,
+         count(*) filter (where v.votetypeid = 2) as upvotes,
+         count(*) filter (where v.votetypeid = 3) as downvotes,
+         count(*) filter (where v.votetypeid = 5) as favorites,
+         sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_total,
+         min(v.creationdate) as first_vote_date,
+         max(v.creationdate) as last_vote_date
+  from votes v
+  group by v.postid
+),
+comment_agg as (
+  select c.postid as post_id,
+         count(*) as comment_count,
+         max(c.creationdate) as last_comment_date
+  from comments c
+  group by c.postid
+),
+postlinks_agg as (
+  select pl.postid as post_id,
+         count(*) filter (where pl.linktypeid = 1) as linked_count,
+         count(*) filter (where pl.linktypeid = 3) as duplicate_count
+  from postlinks pl
+  group by pl.postid
+),
+question_answer_latency as (
+  select q.id as question_id,
+         min(a.creationdate) as first_answer_time,
+         extract(epoch from (min(a.creationdate) - q.creationdate)) as secs_to_first_answer
+  from posts q
+  left join posts a
+    on a.parentid = q.id
+   and a.posttypeid = 2
+  where q.posttypeid = 1
+  group by q.id
+),
+accepted_answer_latency as (
+  select q.id as question_id,
+         aa.creationdate as accepted_answer_time,
+         extract(epoch from (aa.creationdate - q.creationdate)) as secs_to_accepted
+  from posts q
+  left join posts aa
+    on aa.id = q.acceptedanswerid
+  where q.posttypeid = 1
+),
+edit_events as (
+  select ph.postid as post_id,
+         count(*) filter (where ph.posthistorytypeid in (4,5,6)) as edits_count,
+         max(ph.creationdate) filter (where ph.posthistorytypeid in (4,5,6)) as last_edit_date,
+         count(*) filter (where ph.posthistorytypeid = 10) as close_votes_events,
+         max(case when ph.posthistorytypeid = 10 then try_cast(ph.comment as int) end) as last_close_reason_id
+  from posthistory ph
+  group by ph.postid
+),
+user_post_rollup as (
+  select pa.user_id,
+         count(*) as total_posts,
+         count(*) filter (where pa.is_question = 1) as total_questions,
+         count(*) filter (where pa.is_answer = 1) as total_answers,
+         sum(coalesce(pa.score,0)) as sum_score,
+         sum(coalesce(va.upvotes,0)) as sum_upvotes,
+         sum(coalesce(va.downvotes,0)) as sum_downvotes,
+         sum(coalesce(va.favorites,0)) as sum_favorites,
+         sum(coalesce(va.bounty_total,0)) as sum_bounty,
+         max(pa.creationdate) as last_post_date
+  from post_activity pa
+  left join vote_agg va on va.post_id = pa.id
+  group by pa.user_id
+),
+question_quality as (
+  select pa.post_id,
+         pa.user_id,
+         pa.creationdate,
+         pa.score,
+         pa.viewcount,
+         coalesce(qa.secs_to_first_answer, 86400*365*50) as secs_to_first_answer,
+         coalesce(aal.secs_to_accepted, 86400*365*50) as secs_to_accepted,
+         coalesce(va.upvotes,0) as upvotes,
+         coalesce(va.downvotes,0) as downvotes,
+         coalesce(va.favorites,0) as favorites,
+         coalesce(pl.duplicate_count,0) as duplicate_count,
+         coalesce(ed.edits_count,0) as edits_count,
+         case when pa.closeddate is not null then 1 else 0 end as is_closed,
+         case when pa.acceptedanswerid is not null then 1 else 0 end as has_accepted_answer
+  from posts pa
+  left join vote_agg va on va.post_id = pa.id
+  left join postlinks_agg pl on pl.post_id = pa.id
+  left join question_answer_latency qa on qa.question_id = pa.id
+  left join accepted_answer_latency aal on aal.question_id = pa.id
+  left join edit_events ed on ed.post_id = pa.id
+  where pa.posttypeid = 1
+),
+ranked_questions as (
+  select qq.*,
+         row_number() over (partition by date_trunc('month', qq.creationdate) order by qq.score desc nulls last, qq.viewcount desc nulls last) as rn_month_top,
+         ntile(100) over (order by qq.viewcount desc nulls last) as view_ntile_100,
+         dense_rank() over (order by qq.favorites desc nulls last) as favorite_rank
+  from question_quality qq
+),
+tag_stats as (
+  select tu.tagname,
+         count(*) as q_count,
+         avg(least(qq.secs_to_first_answer, 86400*365)) as avg_secs_to_first_answer_capped,
+         avg(qq.score) as avg_score,
+         sum(case when qq.has_accepted_answer = 1 then 1 else 0 end)::numeric / nullif(count(*),0) as acceptance_rate
+  from tag_unpivot tu
+  join question_quality qq on qq.post_id = tu.post_id
+  group by tu.tagname
+),
+user_engagement as (
+  select ru.user_id,
+         coalesce(upr.total_posts,0) as total_posts,
+         coalesce(upr.total_questions,0) as total_questions,
+         coalesce(upr.total_answers,0) as total_answers,
+         coalesce(upr.sum_score,0) as sum_score,
+         coalesce(upr.sum_upvotes,0) as sum_upvotes,
+         coalesce(upr.sum_downvotes,0) as sum_downvotes,
+         coalesce(upr.sum_favorites,0) as sum_favorites,
+         coalesce(upr.sum_bounty,0) as sum_bounty,
+         coalesce(ub.gold_badges,0) as gold_badges,
+         coalesce(ub.silver_badges,0) as silver_badges,
+         coalesce(ub.bronze_badges,0) as bronze_badges,
+         greatest(coalesce(ub.last_badge_date, timestamp 'epoch'), coalesce(upr.last_post_date, timestamp 'epoch')) as last_activity_date,
+         ru.displayname,
+         ru.reputation,
+         ru.cohort_month,
+         ru.region_hint
+  from recent_users ru
+  left join user_post_rollup upr on upr.user_id = ru.user_id
+  left join user_badges ub on ub.user_id = ru.user_id
+),
+cohort_rank as (
+  select ue.*,
+         row_number() over (partition by ue.cohort_month order by ue.sum_score desc, ue.reputation desc, ue.total_posts desc) as rn_in_cohort,
+         sum(ue.sum_upvotes - ue.sum_downvotes) over (partition by ue.region_hint order by ue.last_activity_date rows between unbounded preceding and current row) as net_votes_running_region
+  from user_engagement ue
+),
+top_questions_per_user as (
+  select rq.user_id,
+         array_agg(rq.post_id order by rq.score desc nulls last, rq.viewcount desc nulls last)[:5] as top5_question_ids
+  from ranked_questions rq
+  group by rq.user_id
+),
+bad_closure as (
+  select q.post_id,
+         case
+           when q.is_closed = 1 and q.score > 0 and coalesce(q.duplicate_count,0) = 0 then 1
+           else 0
+         end as suspicious_close_flag
+  from question_quality q
+),
+final_scored as (
+  select cr.user_id,
+         cr.displayname,
+         cr.region_hint,
+         cr.cohort_month,
+         cr.reputation,
+         cr.total_posts,
+         cr.total_questions,
+         cr.total_answers,
+         cr.sum_score,
+         cr.sum_upvotes,
+         cr.sum_downvotes,
+         cr.sum_favorites,
+         cr.sum_bounty,
+         cr.gold_badges,
+         cr.silver_badges,
+         cr.bronze_badges,
+         cr.last_activity_date,
+         coalesce(tqpu.top5_question_ids, '{}') as top5_question_ids,
+         percentile_disc(0.5) within group (order by rq.view_ntile_100) as median_view_ntile_of_questions,
+         sum(bc.suspicious_close_flag) as suspicious_closes,
+         avg(case when rq.secs_to_first_answer < 86400*365*20 then rq.secs_to_first_answer end) as avg_secs_to_first_answer_capped,
+         count(rq.post_id) filter (where rq.rn_month_top <= 10) as top10_monthly_questions,
+         max(rq.favorite_rank) filter (where rq.favorite_rank <= 1000) as best_favorite_rank_under_1k
+  from cohort_rank cr
+  left join ranked_questions rq on rq.user_id = cr.user_id
+  left join top_questions_per_user tqpu on tqpu.user_id = cr.user_id
+  left join bad_closure bc on bc.post_id = rq.post_id
+  group by cr.user_id, cr.displayname, cr.region_hint, cr.cohort_month, cr.reputation, cr.total_posts, cr.total_questions, cr.total_answers, cr.sum_score, cr.sum_upvotes, cr.sum_downvotes, cr.sum_favorites, cr.sum_bounty, cr.gold_badges, cr.silver_badges, cr.bronze_badges, cr.last_activity_date, tqpu.top5_question_ids
+)
+select
+  fs.user_id,
+  fs.displayname,
+  fs.region_hint,
+  fs.cohort_month,
+  fs.reputation,
+  fs.total_posts,
+  fs.total_questions,
+  fs.total_answers,
+  fs.sum_score,
+  fs.sum_upvotes,
+  fs.sum_downvotes,
+  fs.sum_favorites,
+  fs.sum_bounty,
+  fs.gold_badges,
+  fs.silver_badges,
+  fs.bronze_badges,
+  fs.last_activity_date,
+  fs.top5_question_ids,
+  fs.median_view_ntile_of_questions,
+  fs.suspicious_closes,
+  fs.avg_secs_to_first_answer_capped,
+  fs.top10_monthly_questions,
+  fs.best_favorite_rank_under_1k,
+  case
+    when fs.sum_score >= 1000 or fs.gold_badges >= 3 then 'Elite'
+    when fs.sum_score >= 200 or fs.gold_badges >= 1 then 'Advanced'
+    when fs.sum_score >= 50 then 'Intermediate'
+    when fs.total_posts >= 10 then 'Contributor'
+    else 'Newcomer'
+  end as engagement_tier,
+  (fs.sum_upvotes - fs.sum_downvotes) as net_votes,
+  case when coalesce(fs.sum_favorites,0) = 0 then null else round(fs.sum_score::numeric / nullif(fs.sum_favorites,0), 3) end as score_per_favorite,
+  row_number() over (order by (fs.sum_upvotes - fs.sum_downvotes) desc, fs.sum_score desc, fs.reputation desc) as global_rank
+from final_scored fs
+where (
+        fs.total_posts > 0
+        or exists (
+            select 1
+            from posts p
+            where p.owneruserid = fs.user_id
+              and p.creationdate >= fs.cohort_month
+        )
+      )
+order by global_rank
+limit 500;

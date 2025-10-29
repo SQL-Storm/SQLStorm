@@ -1,0 +1,189 @@
+WITH
+  RankedPostHistory AS (
+    SELECT
+      ph.PostId,
+      ph.PostHistoryTypeId,
+      ph.CreationDate,
+      ph.UserId,
+      ph.Comment,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    WHERE
+      ph.PostHistoryTypeId IN (4,5,6)
+  ),
+  LatestPostEdits AS (
+    SELECT
+      rph.PostId,
+      rph.Comment AS EditComment,
+      CASE
+        WHEN rph.PostHistoryTypeId = 4 THEN 'Title'
+        WHEN rph.PostHistoryTypeId = 5 THEN 'Body'
+        WHEN rph.PostHistoryTypeId = 6 THEN 'Tags'
+        ELSE 'Unknown'
+      END AS EditType,
+      rph.UserId AS EditorUserId,
+      u.DisplayName AS EditorDisplayName,
+      CAST(
+        EXTRACT(EPOCH FROM (rph.CreationDate - u.CreationDate)) / 86400
+        AS INTEGER
+      ) AS DaysSinceUserCreation
+    FROM RankedPostHistory rph
+    JOIN Users u
+      ON rph.UserId = u.Id
+    WHERE
+      rph.rn = 1
+  ),
+  PostAggregates AS (
+    SELECT
+      p.Id AS PostId,
+      p.PostTypeId,
+      pt.Name AS PostTypeName,
+      p.OwnerUserId,
+      u_owner.DisplayName AS OwnerDisplayName,
+      p.CreationDate AS PostCreationDate,
+      p.Score AS PostScore,
+      p.ViewCount AS PostViewCount,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      p.ClosedDate,
+      p.CommunityOwnedDate,
+      COUNT(c.Id) AS CommentCountOnPost,
+      COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVoteCount,
+      COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownVoteCount,
+      COALESCE(SUM(CASE WHEN v.VoteTypeId = 8 THEN 1 ELSE 0 END), 0) AS BountyStartCount,
+      MAX(p.LastActivityDate) AS LastPostActivity
+    FROM Posts p
+    LEFT JOIN PostTypes pt
+      ON p.PostTypeId = pt.Id
+    LEFT JOIN Users u_owner
+      ON p.OwnerUserId = u_owner.Id
+    LEFT JOIN Comments c
+      ON p.Id = c.PostId
+    LEFT JOIN Votes v
+      ON p.Id = v.PostId
+    WHERE
+      p.PostTypeId IN (1, 2)
+    GROUP BY
+      p.Id,
+      p.PostTypeId,
+      pt.Name,
+      p.OwnerUserId,
+      u_owner.DisplayName,
+      p.CreationDate,
+      p.Score,
+      p.ViewCount,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      p.ClosedDate,
+      p.CommunityOwnedDate
+  ),
+  UserPostActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName AS UserName,
+      u.Reputation,
+      u.CreationDate AS UserCreationDate,
+      COUNT(DISTINCT pa.PostId) AS TotalPosts,
+      COUNT(DISTINCT CASE WHEN pa.PostTypeId = 1 THEN pa.PostId ELSE NULL END) AS QuestionCount,
+      COUNT(DISTINCT CASE WHEN pa.PostTypeId = 2 THEN pa.PostId ELSE NULL END) AS AnswerCount,
+      AVG(pa.PostScore) AS AvgPostScore,
+      SUM(pa.PostViewCount) AS TotalViewCount,
+      SUM(pa.UpVoteCount) AS TotalUpVotesReceived,
+      SUM(pa.DownVoteCount) AS TotalDownVotesReceived,
+      SUM(pa.BountyStartCount) AS TotalBountyStarts,
+      MAX(pa.LastPostActivity) AS UserLastActivity,
+      COUNT(DISTINCT b.Id) AS BadgeCount
+    FROM Users u
+    LEFT JOIN PostAggregates pa
+      ON u.Id = pa.OwnerUserId
+    LEFT JOIN Badges b
+      ON u.Id = b.UserId
+    WHERE
+      u.Reputation > 100
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate
+  ),
+  RecentActivity AS (
+    SELECT
+      pa.UserId,
+      pa.UserName,
+      pa.Reputation,
+      pa.UserCreationDate,
+      pa.TotalPosts,
+      pa.QuestionCount,
+      pa.AnswerCount,
+      pa.AvgPostScore,
+      pa.TotalViewCount,
+      pa.TotalUpVotesReceived,
+      pa.TotalDownVotesReceived,
+      pa.TotalBountyStarts,
+      pa.UserLastActivity,
+      pa.BadgeCount,
+      lpe.EditComment,
+      lpe.EditType,
+      lpe.EditorDisplayName,
+      lpe.DaysSinceUserCreation,
+      CASE
+        WHEN pa.UserLastActivity > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '7 day') THEN 'Active in last week'
+        WHEN pa.UserLastActivity > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 day') THEN 'Active in last month'
+        ELSE 'Less active'
+      END AS ActivityLevel
+    FROM UserPostActivity pa
+    LEFT JOIN LatestPostEdits lpe
+      ON pa.UserId = lpe.EditorUserId
+    WHERE
+      pa.UserLastActivity IS NOT NULL
+  )
+SELECT
+  ra.UserName,
+  ra.Reputation,
+  ra.ActivityLevel,
+  ra.QuestionCount,
+  ra.AnswerCount,
+  ra.AvgPostScore,
+  ra.TotalViewCount,
+  ra.TotalUpVotesReceived,
+  ra.TotalDownVotesReceived,
+  ra.TotalBountyStarts,
+  ra.BadgeCount,
+  ra.EditComment,
+  ra.EditType,
+  ra.EditorDisplayName,
+  ra.DaysSinceUserCreation,
+  CASE
+    WHEN ra.Reputation > 100000 THEN 'High Reputation'
+    WHEN ra.Reputation BETWEEN 10000 AND 100000 THEN 'Medium Reputation'
+    ELSE 'Low Reputation'
+  END AS ReputationTier,
+  CASE
+    WHEN POSITION('test' IN LOWER(ra.UserName)) > 0 THEN 'Contains "test"'
+    WHEN ra.UserName LIKE '%\_admin%' ESCAPE '\' THEN 'Contains "_admin"'
+    ELSE 'No specific pattern'
+  END AS UserNamePattern,
+  COALESCE(ra.UserLastActivity, ra.UserCreationDate) AS EffectiveLastActivityDate,
+  CASE
+    WHEN ra.UserLastActivity IS NULL THEN 'Never Active'
+    ELSE TO_CHAR(CAST(ra.UserLastActivity AS date), 'YYYY-MM')
+  END AS LastActivityMonth,
+  (
+    SELECT COUNT(*)
+    FROM Badges b_sub
+    WHERE b_sub.UserId = ra.UserId AND b_sub.Name LIKE '%Tag%'
+  ) AS TagBadgeCount,
+  (
+    SELECT SUM(CASE WHEN ph.Comment IS NOT NULL THEN 1 ELSE 0 END)
+    FROM PostHistory ph
+    WHERE ph.UserId = ra.UserId AND ph.PostHistoryTypeId = 10
+  ) AS CloseVoteCountForUser
+FROM RecentActivity ra
+WHERE
+  ra.TotalPosts > 5 AND ra.TotalUpVotesReceived > 10
+ORDER BY
+  ra.Reputation DESC,
+  ra.TotalViewCount DESC
+LIMIT 100;

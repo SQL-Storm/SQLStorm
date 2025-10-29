@@ -1,0 +1,124 @@
+WITH RecentPosts AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        t.Tag
+    FROM Posts p
+    LEFT JOIN LATERAL (
+        SELECT regexp_matches(p.Tags, '[^><]+', 'g')::text[] AS _matches
+    ) m ON p.Tags IS NOT NULL
+    LEFT JOIN LATERAL (
+        SELECT unnest(m._matches) AS Tag
+    ) t ON p.Tags IS NOT NULL
+    WHERE p.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '90 days'
+),
+UserStats AS (
+    SELECT
+        u.Id                                   AS UserId,
+        u.DisplayName,
+        COUNT(rp.Id) FILTER (WHERE rp.PostTypeId = 1) AS QuestionCount,
+        COUNT(rp.Id) FILTER (WHERE rp.PostTypeId = 2) AS AnswerCount,
+        COALESCE(SUM(rp.Score), 0)                     AS TotalScore,
+        AVG(rp.Score) FILTER (WHERE rp.Score IS NOT NULL) AS AvgScore,
+        MAX(rp.CreationDate)                          AS LastPostDate
+    FROM Users u
+    LEFT JOIN RecentPosts rp ON rp.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+TagPopularity AS (
+    SELECT
+        t.TagName,
+        COUNT(*)                     AS TagUseCount,
+        SUM(p.Score)                 AS TagScoreSum,
+        ROW_NUMBER() OVER (ORDER BY COUNT(*) DESC) AS TagRank
+    FROM Tags t
+    JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    GROUP BY t.TagName
+),
+TopUserBadges AS (
+    SELECT
+        b.UserId,
+        STRING_AGG(b.Name, ', ') FILTER (WHERE b.Class = 1) AS GoldBadges,
+        STRING_AGG(b.Name, ', ') FILTER (WHERE b.Class = 2) AS SilverBadges,
+        STRING_AGG(b.Name, ', ') FILTER (WHERE b.Class = 3) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+CorrelatedVotes AS (
+    SELECT
+        v.PostId,
+        (SELECT COUNT(*) FROM Votes v2 WHERE v2.PostId = v.PostId AND v2.VoteTypeId = 2) AS UpVoteCount,
+        (SELECT COUNT(*) FROM Votes v3 WHERE v3.PostId = v.PostId AND v3.VoteTypeId = 3) AS DownVoteCount
+    FROM Votes v
+    GROUP BY v.PostId
+),
+TopPostsPerUser AS (
+    SELECT
+        p.Id                         AS PostId,
+        p.Title,
+        p.Score,
+        p.OwnerUserId,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate DESC) AS RowNumWithinUser
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+)
+SELECT
+    us.UserId,
+    us.DisplayName,
+    us.QuestionCount,
+    us.AnswerCount,
+    us.TotalScore,
+    us.AvgScore,
+    COALESCE(tub.GoldBadges,   '') AS GoldBadges,
+    COALESCE(tub.SilverBadges, '') AS SilverBadges,
+    COALESCE(tub.BronzeBadges, '') AS BronzeBadges,
+    CASE
+        WHEN us.TotalScore > 1000                     THEN 'High'
+        WHEN us.TotalScore BETWEEN 500 AND 1000       THEN 'Medium'
+        ELSE                                              'Low'
+    END                                            AS ScoreTier,
+    tp.PostId,
+    tp.Title,
+    tp.Score                     AS PostScore,
+    cv.UpVoteCount,
+    cv.DownVoteCount,
+    tp.RowNumWithinUser
+FROM TopPostsPerUser tp
+JOIN UserStats us        ON us.UserId = tp.OwnerUserId
+LEFT JOIN TopUserBadges tub ON tub.UserId = us.UserId
+LEFT JOIN CorrelatedVotes cv ON cv.PostId = tp.PostId
+WHERE tp.RowNumWithinUser <= 5
+
+UNION ALL
+
+SELECT
+    NULL                               AS UserId,
+    NULL                               AS DisplayName,
+    NULL                               AS QuestionCount,
+    NULL                               AS AnswerCount,
+    SUM(tp.PostScore)                  AS TotalScore,
+    NULL                               AS AvgScore,
+    NULL                               AS GoldBadges,
+    NULL                               AS SilverBadges,
+    NULL                               AS BronzeBadges,
+    NULL                               AS ScoreTier,
+    NULL                               AS PostId,
+    STRING_AGG(DISTINCT tp.Title, '; ') AS TopTitles,
+    MAX(tp.PostScore)                  AS MaxScore,
+    NULL                               AS UpVoteCount,
+    NULL                               AS DownVoteCount,
+    NULL                               AS RowNumWithinUser
+FROM (
+    SELECT
+        p.Title,
+        p.Score AS PostScore,
+        ROW_NUMBER() OVER (ORDER BY p.Score DESC) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '30 days'
+) tp
+WHERE tp.rn <= 10;

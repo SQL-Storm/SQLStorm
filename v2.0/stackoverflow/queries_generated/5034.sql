@@ -1,0 +1,114 @@
+-- {"query": "5034.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 844} 
+WITH RankedPosts AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.PostTypeId,
+    p.Tags,
+    p.Body,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.LastEditorUserId,
+    p.LastEditDate,
+    p.LastEditorDisplayName,
+    p.OwnerDisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    u.Location,
+    u.UpVotes,
+    u.DownVotes,
+    u.Views
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId = 1
+),
+Tagged AS (
+  SELECT
+    rp.*,
+    t.TagName
+  FROM RankedPosts rp
+  LEFT JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(rp.Tags, 2, length(rp.Tags)-2), '><')) AS TagName
+  ) AS t ON true
+),
+Agg AS (
+  SELECT
+    t.TagName,
+    COUNT(*) FILTER (WHERE t.TagName IS NOT NULL) AS PostCount,
+    SUM(rp.Score) AS ScoreSum,
+    AVG(rp.Score) AS AvgScore,
+    MAX(rp.ViewCount) AS MaxViews,
+    MIN(rp.ViewCount) AS MinViews,
+    COUNT(DISTINCT rp.Id) AS IdCount,
+    SUM(CASE WHEN rp.Reputation > 1000 THEN 1 ELSE 0 END) AS ReputableAuthorPosts
+  FROM Tagged t
+  LEFT JOIN RankedPosts rp ON rp.Id = t.Id
+  GROUP BY ROLLUP(t.TagName)
+),
+RecentActivity AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.OwnerUserId,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.LastActivityDate > NOW() - INTERVAL '30 days'
+),
+HistorySummary AS (
+  SELECT
+    h.PostId,
+    COUNT(*) AS EditCount,
+    MAX(h.CreationDate) AS LastRevisionDate
+  FROM PostHistory h
+  WHERE h.PostHistoryTypeId IN (4,5,6,8,9,10,11,12,13,14,15,16,19,20,33,34)
+  GROUP BY h.PostId
+)
+SELECT
+  rp.Id,
+  rp.Title,
+  rp.CreationDate,
+  rp.LastActivityDate,
+  rp.OwnerUserId,
+  rp.OwnerDisplayName,
+  rp.Reputation,
+  rp.Location,
+  rp.Views,
+  rp.Score,
+  rp.AnswerCount,
+  rp.CommentCount,
+  rp.FavoriteCount,
+  rp.Tags,
+  ra.TagName,
+  a.ScoreSum,
+  a.AvgScore,
+  a.MaxViews,
+  a.MinViews,
+  a.IdCount,
+  a.ReputableAuthorPosts,
+  ra.PostCount,
+  ra.PostCount FILTER (WHERE ra.PostCount IS NULL) AS NullPostCount,
+  ra.TagName,
+  ha.LastRevisionDate,
+  hs.EditCount,
+  hu.DisplayName AS LastEditorDisplayName
+FROM RankedPosts rp
+LEFT JOIN Agg a ON a.TagName = ANY(string_to_array(substring(rp.Tags, 2, length(rp.Tags)-2), '><'))
+LEFT JOIN HistorySummary hs ON hs.PostId = rp.Id
+LEFT JOIN PostHistory ha ON ha.PostId = rp.Id
+LEFT JOIN Users hu ON rp.LastEditorUserId = hu.Id
+LEFT JOIN RecentActivity ra ON ra.OwnerUserId = rp.OwnerUserId
+WHERE rp.LastActivityDate > NOW() - INTERVAL '180 days'
+ORDER BY rp.Score DESC NULLS LAST, rp.LastActivityDate DESC
+LIMIT 100;

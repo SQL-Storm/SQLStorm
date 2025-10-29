@@ -1,0 +1,130 @@
+WITH
+    UserReputation AS (
+        SELECT
+            u.Id                                 AS UserId,
+            u.DisplayName,
+            u.Reputation,
+            RANK() OVER (ORDER BY u.Reputation DESC) AS RepRank
+        FROM Users u
+    ),
+    UserGoldBadge AS (
+        SELECT
+            b.UserId,
+            MAX(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS HasGoldBadge
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+    UserAnswerStats AS (
+        SELECT
+            p.OwnerUserId                      AS UserId,
+            COUNT(*)                             AS AnswerCount,
+            AVG(p.Score)                         AS AvgAnswerScore,
+            MAX(p.CreationDate)                  AS LastAnswerDate
+        FROM Posts p
+        WHERE p.PostTypeId = 2
+          AND p.OwnerUserId IS NOT NULL
+        GROUP BY p.OwnerUserId
+    ),
+    UserTagActivity AS (
+        SELECT
+            a.OwnerUserId                      AS UserId,
+            tag_vals.Tag                         AS Tag,
+            COUNT(*)                           AS TagAnswerCount,
+            ROW_NUMBER() OVER (PARTITION BY a.OwnerUserId
+                               ORDER BY COUNT(*) DESC)          AS TagRank
+        FROM Posts a
+        JOIN Posts q ON a.ParentId = q.Id
+        CROSS JOIN LATERAL (
+            SELECT TRIM(t) AS Tag
+            FROM (
+                SELECT regexp_split_to_table(substring(q.Tags, 2, length(q.Tags)-2), '><') AS t
+            ) s
+        ) AS tag_vals
+        WHERE a.PostTypeId = 2
+          AND q.PostTypeId = 1
+          AND a.OwnerUserId IS NOT NULL
+        GROUP BY a.OwnerUserId, tag_vals.Tag
+    ),
+    LatestPostHistory AS (
+        SELECT
+            ph.PostId,
+            ph.PostHistoryTypeId,
+            ph.CreationDate,
+            ph.Comment,
+            ROW_NUMBER() OVER (PARTITION BY ph.PostId
+                               ORDER BY ph.CreationDate DESC) AS rn
+        FROM PostHistory ph
+    ),
+    MedianReputation AS (
+        SELECT
+            PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY Reputation) AS MedianRep
+        FROM Users
+    ),
+    TopUsers AS (
+        SELECT
+            ur.UserId,
+            ur.DisplayName,
+            ur.Reputation,
+            ur.RepRank,
+            COALESCE(ug.HasGoldBadge, 0)                     AS HasGoldBadge,
+            COALESCE(ua.AnswerCount, 0)                      AS TotalAnswers,
+            ROUND(COALESCE(ua.AvgAnswerScore, 0), 2)         AS AvgAnswerScore,
+            ua.LastAnswerDate,
+            tg.Tag                                           AS TopTag,
+            tg.TagAnswerCount,
+            lp.Comment                                       AS LatestCloseReason,
+            lp.PostHistoryTypeId,
+            CASE
+                WHEN lp.PostHistoryTypeId = 10 THEN 'Closed'
+                WHEN lp.PostHistoryTypeId = 11 THEN 'Reopened'
+                ELSE 'Other'
+            END                                              AS LatestStatus
+        FROM UserReputation ur
+        LEFT JOIN UserGoldBadge ug       ON ur.UserId = ug.UserId
+        LEFT JOIN UserAnswerStats ua     ON ur.UserId = ua.UserId
+        LEFT JOIN UserTagActivity tg     ON ur.UserId = tg.UserId AND tg.TagRank = 1
+        LEFT JOIN LatestPostHistory lp  ON lp.PostId = (
+                SELECT p.Id
+                FROM Posts p
+                WHERE p.OwnerUserId = ur.UserId
+                  AND p.PostTypeId = 1
+                ORDER BY p.CreationDate DESC
+                LIMIT 1
+            )
+            AND lp.rn = 1
+        WHERE ur.RepRank <= 1000
+          AND ur.Reputation > 0
+    )
+SELECT
+    UserId,
+    DisplayName,
+    Reputation,
+    RepRank,
+    HasGoldBadge,
+    TotalAnswers,
+    AvgAnswerScore,
+    LastAnswerDate,
+    TopTag,
+    TagAnswerCount,
+    LatestCloseReason,
+    LatestStatus
+FROM TopUsers
+ORDER BY RepRank
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    NULL::bigint                          AS UserId,
+    'Median Reputation'                   AS DisplayName,
+    mr.MedianRep                           AS Reputation,
+    NULL::integer                         AS RepRank,
+    NULL::integer                         AS HasGoldBadge,
+    NULL::integer                         AS TotalAnswers,
+    NULL::numeric                         AS AvgAnswerScore,
+    NULL::timestamp                       AS LastAnswerDate,
+    NULL::text                            AS TopTag,
+    NULL::integer                         AS TagAnswerCount,
+    NULL::text                            AS LatestCloseReason,
+    NULL::text                            AS LatestStatus
+FROM MedianReputation mr;

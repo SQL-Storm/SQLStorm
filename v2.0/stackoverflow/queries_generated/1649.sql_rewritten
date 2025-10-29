@@ -1,0 +1,222 @@
+-- {"query": "1649.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3384} 
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.Views AS UserViews,
+        U.UpVotes AS UserUpVotesGiven,
+        U.DownVotes AS UserDownVotesGiven,
+        COUNT(DISTINCT P.Id) AS TotalPostsCreated,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestionsCreated,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswersCreated,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT B.Id) AS TotalBadgesEarned,
+        SUM(CASE WHEN VT.Name = 'UpMod' THEN 1 ELSE 0 END) AS TotalUpVotesReceivedOnPosts,
+        SUM(CASE WHEN VT.Name = 'DownMod' THEN 1 ELSE 0 END) AS TotalDownVotesReceivedOnPosts,
+        MAX(P.LastActivityDate) AS LastPostActivityDate,
+        MAX(C.CreationDate) AS LastCommentDate,
+        COUNT(DISTINCT V_Given.Id) AS TotalVotesGivenByThisUser,
+        -- Complex calculation for an 'ActivityScore' based on reputation, votes received, posts, comments, badges, and weighted by recent activity
+        CAST(U.Reputation * 0.7
+        + (COALESCE(SUM(CASE WHEN VT.Name = 'UpMod' THEN 1 ELSE 0 END), 0) * 0.5)
+        - (COALESCE(SUM(CASE WHEN VT.Name = 'DownMod' THEN 1 ELSE 0 END), 0) * 0.2)
+        + (COUNT(DISTINCT P.Id) * 1.5)
+        + (COUNT(DISTINCT C.Id) * 0.8)
+        + (COUNT(DISTINCT B.Id) * 1.0)
+        - (EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - U.LastAccessDate)) / (3600 * 24 * 30.0)) * 0.1 AS NUMERIC) -- Penalize for inactivity in months
+        AS UserActivityScore
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    LEFT JOIN Badges AS B ON U.Id = B.UserId
+    LEFT JOIN Votes AS V_Given ON U.Id = V_Given.UserId -- Votes given by the user
+    LEFT JOIN Votes AS V_Received ON P.Id = V_Received.PostId AND V_Received.VoteTypeId IN (2,3) -- UpMod (2), DownMod (3)
+    LEFT JOIN VoteTypes AS VT ON V_Received.VoteTypeId = VT.Id
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.Views, U.UpVotes, U.DownVotes, U.LastAccessDate
+),
+PostQualityMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.Title,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.OwnerUserId,
+        P.LastEditorUserId,
+        P.LastEditDate,
+        P.LastActivityDate,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.ClosedDate,
+        COUNT(DISTINCT C.Id) AS CommentCountOnPost,
+        COUNT(DISTINCT PH_Edit.UserId) AS DistinctEditors,
+        MAX(CASE WHEN PH_Close.PostHistoryTypeId = 10 THEN PH_Close.CreationDate ELSE NULL END) AS LastCloseDate,
+        -- Correlated subquery to find the most recent close reason name
+        (
+            SELECT CR.Name
+            FROM PostHistory PH_CR
+            JOIN CloseReasonTypes CR ON CR.Id = PH_CR.Comment::smallint
+            WHERE PH_CR.PostId = P.Id
+            AND PH_CR.PostHistoryTypeId = 10 -- Post Closed event
+            ORDER BY PH_CR.CreationDate DESC
+            LIMIT 1
+        ) AS LastCloseReason,
+        -- String expression and NULL logic for a derived post status
+        CASE
+            WHEN P.AcceptedAnswerId IS NOT NULL THEN 'Accepted'
+            WHEN P.ClosedDate IS NOT NULL THEN COALESCE('Closed (' || (SELECT CR.Name FROM CloseReasonTypes CR JOIN PostHistory PH_Closed ON PH_Closed.Comment::smallint = CR.Id WHERE PH_Closed.PostId = P.Id AND PH_Closed.PostHistoryTypeId = 10 ORDER BY PH_Closed.CreationDate DESC LIMIT 1) || ')', 'Closed (Unknown Reason)')
+            WHEN P.AnswerCount > 0 AND P.Score > 5 THEN 'Active & Good'
+            ELSE 'Open'
+        END AS PostStatusDerived,
+        -- Window function: Rank posts by their score within their PostTypeId, breaking ties by creation date
+        RANK() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.CreationDate DESC) AS PostScoreRank,
+        -- Complicated calculation: engagement ratio based on views, comments, and favorites
+        CAST(COALESCE(P.CommentCount, 0) + COALESCE(P.FavoriteCount, 0) * 2 AS NUMERIC) / NULLIF(P.ViewCount, 0) AS EngagementRatio,
+        -- String expression: check if title or tags contains specific keywords, case-insensitive
+        (P.Title ILIKE '%sql%' OR P.Title ILIKE '%database%' OR COALESCE(P.Tags, '') ILIKE '%<sql>%') AS ContainsDBKeywords,
+        -- Calculate average score of its answers (if it's a question)
+        (
+            SELECT AVG(A.Score)
+            FROM Posts A
+            WHERE A.ParentId = P.Id AND A.PostTypeId = 2
+        ) AS AverageAnswerScore,
+        -- Count of distinct users (other than owner) who have edited the post body, title or tags
+        COUNT(DISTINCT
+            CASE WHEN PH_History.PostHistoryTypeId IN (4, 5, 6) AND PH_History.UserId <> P.OwnerUserId THEN PH_History.UserId ELSE NULL END
+        ) AS ExternalContributorEditCount
+    FROM Posts AS P
+    LEFT JOIN Comments AS C ON P.Id = C.PostId
+    LEFT JOIN PostHistory AS PH_Edit ON P.Id = PH_Edit.PostId AND PH_Edit.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+    LEFT JOIN PostHistory AS PH_Close ON P.Id = PH_Close.PostId AND PH_Close.PostHistoryTypeId = 10 -- Post Closed
+    LEFT JOIN PostHistory AS PH_History ON P.Id = PH_History.PostId
+    GROUP BY
+        P.Id, P.PostTypeId, P.Title, P.CreationDate, P.Score, P.ViewCount, P.OwnerUserId, P.LastEditorUserId,
+        P.LastEditDate, P.LastActivityDate, P.CommentCount, P.FavoriteCount, P.ClosedDate, P.AcceptedAnswerId
+),
+TagUsageDiversity AS (
+    SELECT
+        T.TagName,
+        COUNT(DISTINCT P.Id) AS PostsWithTag,
+        AVG(P.Score) AS AvgScoreForTag,
+        MAX(P.CreationDate) AS LastUsedDateForTag,
+        -- Window function: percentage of posts with this tag relative to all posts considered in this CTE
+        CAST(COUNT(DISTINCT P.Id) AS NUMERIC) / NULLIF(SUM(COUNT(DISTINCT P.Id)) OVER (), 0) * 100 AS PercentageOfPostsInTagSet,
+        SUM(CASE WHEN P.ViewCount > 1000 THEN 1 ELSE 0 END) AS HighViewPostsWithTagCount
+    FROM Tags AS T
+    JOIN Posts AS P ON P.Tags LIKE '%<' || T.TagName || '>%' -- Join posts that contain this tag in their Tags string
+    WHERE P.PostTypeId IN (1, 4, 5) -- Questions, TagWikiExcerpt, TagWiki
+    GROUP BY T.TagName
+    HAVING COUNT(DISTINCT P.Id) > 10 -- Only consider tags used in more than 10 posts
+),
+InterestingPostsAndUsers AS (
+    SELECT
+        UE.UserId,
+        UE.DisplayName,
+        UE.Reputation,
+        UE.UserActivityScore,
+        UE.TotalPostsCreated,
+        UE.TotalUpVotesReceivedOnPosts,
+        UE.TotalCommentsMade,
+        PQ.PostId,
+        PQ.Title,
+        PQ.PostScore,
+        PQ.ViewCount,
+        PQ.LastCloseReason,
+        PQ.PostStatusDerived,
+        PQ.EngagementRatio,
+        PQ.ContainsDBKeywords,
+        PQ.AverageAnswerScore,
+        TU.TagName,
+        TU.AvgScoreForTag,
+        -- Conditional aggregation with NULL handling
+        COALESCE(PQ.ExternalContributorEditCount, 0) AS PostExternalContributorEditCount,
+        (EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - PQ.PostCreationDate)) / (3600 * 24 * 365.25)) AS PostAgeYears -- Age of post in years
+    FROM UserEngagement AS UE
+    JOIN PostQualityMetrics AS PQ ON UE.UserId = PQ.OwnerUserId
+    LEFT JOIN Posts AS P_TagLookup ON PQ.PostId = P_TagLookup.Id -- Need Posts again to get Tags for joining with TagUsageDiversity
+    LEFT JOIN TagUsageDiversity AS TU ON P_TagLookup.Tags LIKE '%<' || TU.TagName || '>%'
+    WHERE
+        PQ.PostTypeId = 1 -- Only consider questions
+        AND UE.UserActivityScore > 500 -- Users with significant activity
+        AND PQ.EngagementRatio > 0.01 -- Posts with some engagement relative to views
+        AND PQ.PostScore > 5 -- Reasonably scored posts
+        AND PQ.PostScoreRank <= 1000 -- Top 1000 posts by score within their type
+        AND PQ.ContainsDBKeywords -- Posts related to 'sql' or 'database'
+        AND (PQ.AverageAnswerScore IS NULL OR PQ.AverageAnswerScore > 3) -- Questions with good answers or no answers yet
+        AND (P_TagLookup.ClosedDate IS NULL OR P_TagLookup.ClosedDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year') -- Not too old closed posts
+)
+-- Main query: Combines insights for high-engagement users and posts
+SELECT
+    IPU.UserId,
+    IPU.DisplayName,
+    IPU.Reputation,
+    IPU.UserActivityScore,
+    IPU.TotalPostsCreated,
+    IPU.TotalUpVotesReceivedOnPosts,
+    IPU.TotalCommentsMade,
+    IPU.PostId,
+    IPU.Title,
+    IPU.PostScore,
+    IPU.ViewCount,
+    IPU.EngagementRatio,
+    IPU.PostStatusDerived,
+    IPU.LastCloseReason,
+    IPU.TagName,
+    IPU.AvgScoreForTag,
+    IPU.PostAgeYears,
+    IPU.PostExternalContributorEditCount,
+    -- Final derived value: complex conditional expression categorizing contributions
+    CASE
+        WHEN IPU.Reputation > 10000 AND IPU.PostScore > 10 AND IPU.EngagementRatio > 0.05 THEN 'Elite Contribution'
+        WHEN IPU.UserActivityScore > 1000 AND IPU.PostExternalContributorEditCount > 1 THEN 'Collaborative Excellence'
+        WHEN IPU.PostAgeYears < 0.5 AND IPU.PostScore > 7 AND IPU.TotalCommentsMade > 5 THEN 'Recent Hot Topic'
+        WHEN IPU.LastCloseReason IS NOT NULL AND IPU.LastCloseReason ILIKE '%duplicate%' THEN 'Duplicate (Handled)'
+        ELSE 'General Active'
+    END AS ContributionTier,
+    -- Another window function: NTILE for distribution of engagement ratios into 5 quintiles
+    NTILE(5) OVER (ORDER BY IPU.EngagementRatio DESC) AS EngagementQuintile
+FROM InterestingPostsAndUsers AS IPU
+WHERE
+    IPU.PostAgeYears < 5 -- Focus on relatively recent posts
+    AND IPU.Reputation > 100 -- Filter out very low reputation users
+    AND IPU.PostScore > 0
+    AND IPU.TotalPostsCreated > 0
+    -- Set operator: UNION ALL to include a slightly different perspective/group of users/posts
+UNION ALL
+-- Second part of the UNION ALL: Users with high reputation but fewer posts, whose posts generate a lot of discussion (comments)
+SELECT
+    UE.UserId,
+    UE.DisplayName,
+    UE.Reputation,
+    UE.UserActivityScore,
+    UE.TotalPostsCreated,
+    UE.TotalUpVotesReceivedOnPosts,
+    UE.TotalCommentsMade,
+    PQ.PostId,
+    PQ.Title,
+    PQ.PostScore,
+    PQ.ViewCount,
+    PQ.EngagementRatio,
+    PQ.PostStatusDerived,
+    PQ.LastCloseReason,
+    TU.TagName,
+    TU.AvgScoreForTag,
+    (EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - PQ.PostCreationDate)) / (3600 * 24 * 365.25)) AS PostAgeYears,
+    COALESCE(PQ.ExternalContributorEditCount, 0) AS PostExternalContributorEditCount,
+    'Discussion Magnet' AS ContributionTier, -- Specific tier for this part of the union
+    NTILE(5) OVER (ORDER BY PQ.CommentCountOnPost DESC) AS EngagementQuintile
+FROM UserEngagement AS UE
+JOIN PostQualityMetrics AS PQ ON UE.UserId = PQ.OwnerUserId
+LEFT JOIN Posts AS P_TagLookup ON PQ.PostId = P_TagLookup.Id
+LEFT JOIN TagUsageDiversity AS TU ON P_TagLookup.Tags LIKE '%<' || TU.TagName || '>%'
+WHERE
+    PQ.PostTypeId = 1
+    AND UE.Reputation > 5000 -- High reputation users
+    AND UE.TotalPostsCreated BETWEEN 1 AND 10 -- But not super prolific posters
+    AND PQ.CommentCountOnPost > 10 -- Posts with many comments
+    AND PQ.PostScore > 1 -- At least some positive score
+    AND (EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - PQ.PostCreationDate)) / (3600 * 24 * 365.25)) < 3 -- Posts less than 3 years old
+ORDER BY Reputation DESC, UserActivityScore DESC, EngagementQuintile ASC, PostAgeYears ASC;

@@ -1,0 +1,193 @@
+-- {"query": "4178.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2024} 
+WITH
+  RecentEdits AS (
+    SELECT
+      ph.PostId,
+      ph.UserId AS EditorUserId,
+      u.DisplayName AS EditorDisplayName,
+      ph.CreationDate AS EditDate,
+      ph.PostHistoryTypeId,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory AS ph
+    JOIN Users AS u
+      ON ph.UserId = u.Id
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+  ),
+  PostEngagement AS (
+    SELECT
+      p.Id AS PostId,
+      p.Title,
+      p.PostTypeId,
+      pt.Name AS PostTypeName,
+      p.OwnerUserId,
+      u.DisplayName AS OwnerDisplayName,
+      p.CreationDate AS PostCreationDate,
+      p.Score,
+      p.ViewCount,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      COUNT(DISTINCT c.Id) AS CommentCountTotal,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+      COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN pl.Id ELSE NULL END) AS DuplicateLinkCount
+    FROM Posts AS p
+    LEFT JOIN PostTypes AS pt
+      ON p.PostTypeId = pt.Id
+    LEFT JOIN Users AS u
+      ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments AS c
+      ON p.Id = c.PostId
+    LEFT JOIN Votes AS v
+      ON p.Id = v.PostId
+    LEFT JOIN PostLinks AS pl
+      ON p.Id = pl.PostId
+    WHERE
+      p.CreationDate >= DATE_SUB(cast('2024-10-01 12:34:56' as timestamp), INTERVAL 365 DAY) -- Posts from the last year
+    GROUP BY
+      p.Id,
+      p.Title,
+      p.PostTypeId,
+      pt.Name,
+      p.OwnerUserId,
+      u.DisplayName,
+      p.CreationDate,
+      p.Score,
+      p.ViewCount,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate AS UserCreationDate,
+      COUNT(DISTINCT p.Id) AS PostsCreated,
+      SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditsMade,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesGiven,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesGiven,
+      COUNT(DISTINCT b.Id) AS BadgesEarned
+    FROM Users AS u
+    LEFT JOIN Posts AS p
+      ON u.Id = p.OwnerUserId
+    LEFT JOIN PostHistory AS ph
+      ON u.Id = ph.UserId
+    LEFT JOIN Votes AS v
+      ON u.Id = v.UserId
+    LEFT JOIN Badges AS b
+      ON u.Id = b.UserId
+    WHERE
+      u.Id > 0 -- Exclude community user
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate
+  )
+SELECT
+  pe.Title,
+  pe.PostTypeName,
+  pe.PostCreationDate,
+  pe.Score,
+  pe.ViewCount,
+  pe.FavoriteCount,
+  pe.AnswerCount,
+  pe.CommentCountTotal,
+  pe.UpVoteCount,
+  pe.DownVoteCount,
+  re.EditDate,
+  re.EditorDisplayName,
+  re.PostHistoryTypeId,
+  ua.DisplayName AS TopEditorDisplayName,
+  ua.Reputation AS TopEditorReputation,
+  COALESCE(ua.EditsMade, 0) AS UserTotalEdits,
+  COALESCE(ua.UpvotesGiven, 0) AS UserTotalUpvotes,
+  COALESCE(ua.DownvotesGiven, 0) AS UserTotalDownvotes,
+  COALESCE(ua.BadgesEarned, 0) AS UserTotalBadges,
+  CASE
+    WHEN pe.Score > 100 AND pe.AnswerCount > 5 THEN 'Highly Engaged Question'
+    WHEN pe.CommentCountTotal > 20 THEN 'Very Commented Post'
+    WHEN pe.FavoriteCount > 10 THEN 'Highly Favorited Post'
+    WHEN pe.DuplicateLinkCount > 0 THEN 'Has Duplicate Links'
+    ELSE 'Standard Post'
+  END AS PostCategorization,
+  CASE
+    WHEN re.rn <= 2 AND re.EditDate > DATE_SUB(cast('2024-10-01 12:34:56' as timestamp), INTERVAL 7 DAY) THEN 'Recently Edited'
+    ELSE 'Not Recently Edited'
+  END AS RecentEditStatus,
+  UPPER(SUBSTRING(pe.OwnerDisplayName, 1, 1)) AS OwnerInitial,
+  LENGTH(pe.Title) AS TitleLength,
+  CASE
+    WHEN pe.OwnerUserId IS NULL THEN 'Community Owned'
+    ELSE 'User Owned'
+  END AS OwnershipType,
+  LAG(pe.Score, 1, 0) OVER (ORDER BY pe.CreationDate) AS PreviousPostScore,
+  LEAD(pe.Score, 1, 0) OVER (ORDER BY pe.CreationDate) AS NextPostScore,
+  pe.PostCreationDate::DATE AS PostCreationDay
+FROM PostEngagement AS pe
+LEFT JOIN RecentEdits AS re
+  ON pe.PostId = re.PostId AND re.rn = 1
+LEFT JOIN UserActivity AS ua
+  ON re.EditorUserId = ua.UserId
+WHERE
+  pe.PostTypeName = 'Question'
+  AND pe.Score > 0
+  AND pe.OwnerUserId IS NOT NULL
+  AND ua.Reputation > 5000
+  AND (re.PostHistoryTypeId IN (4, 5) OR re.PostHistoryTypeId IS NULL)
+UNION ALL
+SELECT
+  pe.Title,
+  pe.PostTypeName,
+  pe.PostCreationDate,
+  pe.Score,
+  pe.ViewCount,
+  pe.FavoriteCount,
+  pe.AnswerCount,
+  pe.CommentCountTotal,
+  pe.UpVoteCount,
+  pe.DownVoteCount,
+  re.EditDate,
+  re.EditorDisplayName,
+  re.PostHistoryTypeId,
+  ua.DisplayName AS TopEditorDisplayName,
+  ua.Reputation AS TopEditorReputation,
+  COALESCE(ua.EditsMade, 0) AS UserTotalEdits,
+  COALESCE(ua.UpvotesGiven, 0) AS UserTotalUpvotes,
+  COALESCE(ua.DownvotesGiven, 0) AS UserTotalDownvotes,
+  COALESCE(ua.BadgesEarned, 0) AS UserTotalBadges,
+  CASE
+    WHEN pe.Score > 50 AND pe.CommentCountTotal > 5 THEN 'Moderately Engaged Answer'
+    WHEN pe.UpVoteCount > 10 THEN 'Highly Upvoted Answer'
+    ELSE 'Standard Answer'
+  END AS PostCategorization,
+  CASE
+    WHEN re.rn <= 1 AND re.EditDate > DATE_SUB(cast('2024-10-01 12:34:56' as timestamp), INTERVAL 3 DAY) THEN 'Very Recently Edited'
+    ELSE 'Not Very Recently Edited'
+  END AS RecentEditStatus,
+  SUBSTRING(pe.OwnerDisplayName FROM 1 FOR 1) AS OwnerInitial,
+  LENGTH(pe.Title) AS TitleLength,
+  CASE
+    WHEN pe.OwnerUserId < 0 THEN 'System Owned'
+    ELSE 'User Owned'
+  END AS OwnershipType,
+  LAG(pe.Score, 1, 0) OVER (ORDER BY pe.CreationDate) AS PreviousPostScore,
+  LEAD(pe.Score, 1, 0) OVER (ORDER BY pe.CreationDate) AS NextPostScore,
+  pe.PostCreationDate::DATE AS PostCreationDay
+FROM PostEngagement AS pe
+LEFT JOIN RecentEdits AS re
+  ON pe.PostId = re.PostId AND re.rn = 1
+LEFT JOIN UserActivity AS ua
+  ON re.EditorUserId = ua.UserId
+WHERE
+  pe.PostTypeName = 'Answer'
+  AND pe.Score > 0
+  AND ua.Reputation BETWEEN 1000 AND 5000
+  AND re.PostHistoryTypeId = 5 -- Only body edits for answers
+ORDER BY
+  pe.Score DESC,
+  pe.ViewCount DESC
+LIMIT 1000;

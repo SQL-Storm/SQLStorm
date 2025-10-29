@@ -1,0 +1,125 @@
+WITH 
+usr_agg AS (
+    SELECT
+        u.Id                                    AS user_id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id)                             FILTER (WHERE p.PostTypeId = 1) AS q_cnt,
+        COUNT(p.Id)                             FILTER (WHERE p.PostTypeId = 2) AS a_cnt,
+        SUM(COALESCE(vp.UpVotes,0))            AS total_upvotes,
+        SUM(COALESCE(vp.DownVotes,0))          AS total_downvotes,
+        COUNT(b.Id)                            AS badge_cnt,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS gold_badge_cnt,
+        MAX(u.LastAccessDate)                  AS last_seen
+    FROM Users u
+    LEFT JOIN Posts p        ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT PostId,
+               SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+               SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes
+        GROUP BY PostId
+    ) vp                     ON vp.PostId = p.Id
+    LEFT JOIN Badges b       ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+latest_activity AS (
+    SELECT
+        ua.user_id,
+        GREATEST(
+            COALESCE(lp.max_post_dt, TIMESTAMP '1970-01-01'),
+            COALESCE(lc.max_comment_dt, TIMESTAMP '1970-01-01')
+        ) AS last_activity_ts,
+        CASE
+            WHEN lp.max_post_dt >= lc.max_comment_dt THEN 'Post'
+            WHEN lc.max_comment_dt IS NOT NULL                THEN 'Comment'
+            ELSE NULL
+        END AS last_activity_type
+    FROM usr_agg ua
+    LEFT JOIN (
+        SELECT OwnerUserId AS user_id, MAX(CreationDate) AS max_post_dt
+        FROM Posts
+        GROUP BY OwnerUserId
+    ) lp ON lp.user_id = ua.user_id
+    LEFT JOIN (
+        SELECT UserId AS user_id, MAX(CreationDate) AS max_comment_dt
+        FROM Comments
+        GROUP BY UserId
+    ) lc ON lc.user_id = ua.user_id
+),
+user_tag_stats AS (
+    SELECT
+        u.Id                                 AS user_id,
+        t.TagName,
+        COUNT(*)                             AS answer_cnt_on_tag,
+        ROUND(AVG(a.Score),2)                AS avg_score_on_tag
+    FROM Users u
+    JOIN Posts a ON a.OwnerUserId = u.Id AND a.PostTypeId = 2
+    JOIN Posts q ON q.Id = a.ParentId AND q.PostTypeId = 1
+    CROSS JOIN LATERAL (
+        SELECT unnest(string_to_array(
+                TRIM(BOTH '<>' FROM q.Tags), '><')) AS tag
+    ) AS taglist
+    JOIN Tags t ON t.TagName = taglist.tag
+    GROUP BY u.Id, t.TagName
+),
+gold_badge_users AS (
+    SELECT user_id, DisplayName, Reputation
+    FROM usr_agg
+    WHERE gold_badge_cnt > 0
+),
+top_score_users AS (
+    SELECT user_id, DisplayName, Reputation
+    FROM usr_agg
+    ORDER BY (q_cnt * 5 + a_cnt * 2 + total_upvotes - total_downvotes) DESC
+    LIMIT 100
+),
+unioned_users AS (
+    SELECT * FROM gold_badge_users
+    UNION
+    SELECT * FROM top_score_users
+),
+ranked_users AS (
+    SELECT
+        uu.*,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, user_id) AS rep_rank,
+        RANK()        OVER (ORDER BY (q_cnt * 5 + a_cnt * 2 + total_upvotes - total_downvotes) DESC) AS activity_rank
+    FROM unioned_users uu
+    LEFT JOIN usr_agg ua ON ua.user_id = uu.user_id
+)
+SELECT
+    ru.user_id,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.rep_rank,
+    ru.activity_rank,
+    ua.q_cnt,
+    ua.a_cnt,
+    ua.total_upvotes,
+    ua.total_upvotes - ua.total_downvotes          AS net_votes,
+    ua.badge_cnt,
+    ua.gold_badge_cnt,
+    COALESCE(la.last_activity_ts, TIMESTAMP '1970-01-01') AS last_activity,
+    la.last_activity_type,
+    COALESCE(
+      string_agg(DISTINCT uts.TagName, ', ')
+        FILTER (WHERE uts.answer_cnt_on_tag > 0)
+        OVER (PARTITION BY ru.user_id ORDER BY uts.answer_cnt_on_tag DESC
+              ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING),
+      'None'
+    ) AS top_answer_tags,
+    CASE 
+        WHEN ua.gold_badge_cnt >= 5 OR (ua.total_upvotes - ua.total_downvotes) > 1000 THEN 'PowerUser'
+        ELSE 'RegularUser'
+    END AS user_category
+FROM ranked_users ru
+LEFT JOIN usr_agg ua            ON ua.user_id = ru.user_id
+LEFT JOIN latest_activity la   ON la.user_id = ru.user_id
+LEFT JOIN user_tag_stats uts   ON uts.user_id = ru.user_id
+GROUP BY
+    ru.user_id, ru.DisplayName, ru.Reputation,
+    ru.rep_rank, ru.activity_rank,
+    ua.q_cnt, ua.a_cnt, ua.total_upvotes, ua.total_downvotes,
+    ua.badge_cnt, ua.gold_badge_cnt,
+    la.last_activity_ts, la.last_activity_type,
+    uts.TagName, uts.answer_cnt_on_tag, uts.avg_score_on_tag;

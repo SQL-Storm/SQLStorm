@@ -1,0 +1,92 @@
+WITH RecentPosts AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.PostTypeId,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId
+                           ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE p.CreationDate >= (DATE '2024-10-01' - INTERVAL '30' DAY)
+),
+UserBadgeAgg AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserScoreStats AS (
+    SELECT
+        p.OwnerUserId      AS UserId,
+        AVG(p.Score)       AS AvgScore,
+        MAX(p.Score)       AS MaxScore,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+)
+SELECT
+    u.Id                                     AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    us.AvgScore,
+    us.MaxScore,
+    us.QuestionCount,
+    us.AnswerCount,
+    COALESCE(rp.Score, 0)                    AS RecentPostScore,
+    COALESCE(vc.UpVotes, 0) - COALESCE(vc.DownVotes, 0) AS NetVoteBalance,
+    CASE WHEN u.Location IS NULL THEN 'UNKNOWN' ELSE u.Location END AS LocationFlag
+FROM Users u
+LEFT JOIN UserBadgeAgg  ub ON ub.UserId = u.Id
+LEFT JOIN UserScoreStats us ON us.UserId = u.Id
+LEFT JOIN (
+    SELECT OwnerUserId, Score
+    FROM RecentPosts
+    WHERE rn = 1
+) rp ON rp.OwnerUserId = u.Id
+LEFT JOIN (
+    SELECT
+        v.PostId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+    FROM Votes v
+    GROUP BY v.PostId
+) vc ON vc.PostId = (
+    SELECT MAX(p2.Id)
+    FROM Posts p2
+    WHERE p2.OwnerUserId = u.Id
+)
+WHERE u.Reputation > 1000
+  AND (
+        u.CreationDate < (DATE '2024-10-01' - INTERVAL '5' YEAR)
+        OR u.LastAccessDate > (DATE '2024-10-01' - INTERVAL '30' DAY)
+      )
+ORDER BY u.Reputation DESC, us.AvgScore DESC
+
+UNION ALL
+
+SELECT
+    -1                                    AS UserId,
+    'TOTAL'                               AS DisplayName,
+    SUM(u.Reputation)                     AS Reputation,
+    SUM(ub.GoldBadges)                    AS GoldBadges,
+    SUM(ub.SilverBadges)                  AS SilverBadges,
+    SUM(ub.BronzeBadges)                  AS BronzeBadges,
+    AVG(us.AvgScore)                      AS AvgScore,
+    MAX(us.MaxScore)                      AS MaxScore,
+    SUM(us.QuestionCount)                 AS QuestionCount,
+    SUM(us.AnswerCount)                   AS AnswerCount,
+    CAST(NULL AS INTEGER)                 AS RecentPostScore,
+    CAST(NULL AS INTEGER)                 AS NetVoteBalance,
+    CAST(NULL AS VARCHAR(4000))           AS LocationFlag
+FROM Users u
+LEFT JOIN UserBadgeAgg  ub ON ub.UserId = u.Id
+LEFT JOIN UserScoreStats us ON us.UserId = u.Id;

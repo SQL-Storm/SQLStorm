@@ -1,0 +1,213 @@
+-- {"query": "7592.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1837} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT c.Id) as Comments,
+        COUNT(DISTINCT b.Id) as Badges,
+        AVG(p.Score) as AvgPostScore,
+        MAX(p.CreationDate) as LastPostDate,
+        DATEDIFF('day', u.CreationDate, cast('2024-10-01 12:34:56' as timestamp)) as AccountAgeDays,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Elite'
+            WHEN u.Reputation >= 1000 THEN 'Veteran'
+            WHEN u.Reputation >= 100 THEN 'Regular'
+            ELSE 'Newbie'
+        END as RepTier,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), ', ') as AllTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        TotalPosts,
+        Questions,
+        Answers,
+        Comments,
+        Badges,
+        AvgPostScore,
+        LastPostDate,
+        AccountAgeDays,
+        RepTier,
+        AllTags,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, TotalPosts DESC) as RankByRep,
+        ROW_NUMBER() OVER (ORDER BY TotalPosts DESC, Reputation DESC) as RankByActivity
+    FROM UserActivityStats
+),
+PostPerformance AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        u.DisplayName as OwnerName,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as PostType,
+        CASE 
+            WHEN p.Score >= 100 THEN 'Golden'
+            WHEN p.Score >= 50 THEN 'High'
+            WHEN p.Score >= 10 THEN 'Medium'
+            ELSE 'Low'
+        END as ScoreCategory,
+        DATEDIFF('day', p.CreationDate, cast('2024-10-01 12:34:56' as timestamp)) as AgeInDays,
+        CASE 
+            WHEN p.ViewCount > p.Score * 5 THEN 1
+            ELSE 0
+        END as PopularPost,
+        COALESCE(p.Tags, '') as Tags,
+        LENGTH(p.Tags) as TagsLength,
+        TRIM(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2)) as CleanTags,
+        (SELECT COUNT(*) FROM Posts p2 WHERE p2.ParentId = p.Id) as AnswerCountSubquery,
+        EXISTS (SELECT 1 FROM Posts p3 WHERE p3.ParentId = p.Id AND p3.Score > 0) as HasPositiveAnswer
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.CreationDate >= DATEADD('year', -2, cast('2024-10-01 12:34:56' as timestamp))
+),
+UserEngagement AS (
+    SELECT 
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.TotalPosts,
+        tu.Questions,
+        tu.Answers,
+        tu.Comments,
+        tu.Badges,
+        tu.AvgPostScore,
+        tu.LastPostDate,
+        tu.AccountAgeDays,
+        tu.RepTier,
+        tu.AllTags,
+        tu.RankByRep,
+        tu.RankByActivity,
+        COALESCE(pp.Score, 0) as RecentPostScore,
+        COALESCE(pp.ViewCount, 0) as RecentPostViews,
+        COALESCE(pp.AnswerCount, 0) as RecentPostAnswers,
+        COALESCE(pp.Comments, 0) as RecentPostComments,
+        pp.PostType,
+        pp.ScoreCategory,
+        pp.AgeInDays,
+        pp.PopularPost,
+        pp.Tags,
+        pp.TagsLength,
+        pp.CleanTags,
+        pp.AnswerCountSubquery,
+        pp.HasPositiveAnswer,
+        CASE 
+            WHEN tu.Reputation >= 1000 AND tu.TotalPosts >= 50 THEN 'Active Contributor'
+            WHEN tu.Reputation >= 500 AND tu.TotalPosts >= 25 THEN 'Regular User'
+            WHEN tu.Reputation >= 100 AND tu.TotalPosts >= 10 THEN 'Occasional User'
+            ELSE 'New User'
+        END as UserStatus,
+        RANK() OVER (PARTITION BY tu.RepTier ORDER BY tu.TotalPosts DESC) as TierRank
+    FROM TopUsers tu
+    LEFT JOIN PostPerformance pp ON tu.UserId = pp.OwnerUserId
+),
+ComplexMetrics AS (
+    SELECT 
+        *,
+        (TotalPosts * 1.0 / NULLIF(AccountAgeDays, 0)) as DailyActivityRate,
+        (AvgPostScore * 1.0 / NULLIF(TotalPosts, 0)) as AvgScorePerPost,
+        (UPPER(DisplayName) = DisplayName) as AllCapsDisplayName,
+        CASE 
+            WHEN AccountAgeDays < 30 THEN 'New'
+            WHEN AccountAgeDays < 180 THEN 'Active'
+            WHEN AccountAgeDays < 365 THEN 'Veteran'
+            ELSE 'Legacy'
+        END as AccountStatus,
+        COALESCE(Badges, 0) + COALESCE(Comments, 0) as EngagementIndex,
+        (Questions * 1.0 / NULLIF((Questions + Answers), 0)) as QuestionRatio,
+        (Views * 1.0 / NULLIF(Reputation, 0)) as ViewToRepRatio,
+        CASE 
+            WHEN LastPostDate >= DATEADD('week', -1, cast('2024-10-01 12:34:56' as timestamp)) then 1
+            ELSE 0
+        END as ActiveLastWeek,
+        SUBSTRING(AllTags, 1, 50) as TagsSummary,
+        (REPLICATE(' ', 100) || AllTags) as PaddedTags
+    FROM UserEngagement
+)
+SELECT 
+    UserId,
+    DisplayName,
+    Reputation,
+    TotalPosts,
+    Questions,
+    Answers,
+    Comments,
+    Badges,
+    AvgPostScore,
+    LastPostDate,
+    AccountAgeDays,
+    RepTier,
+    AllTags,
+    RankByRep,
+    RankByActivity,
+    RecentPostScore,
+    RecentPostViews,
+    RecentPostAnswers,
+    RecentPostComments,
+    PostType,
+    ScoreCategory,
+    AgeInDays,
+    PopularPost,
+    Tags,
+    TagsLength,
+    CleanTags,
+    AnswerCountSubquery,
+    HasPositiveAnswer,
+    UserStatus,
+    TierRank,
+    DailyActivityRate,
+    AvgScorePerPost,
+    AllCapsDisplayName,
+    AccountStatus,
+    EngagementIndex,
+    QuestionRatio,
+    ViewToRepRatio,
+    ActiveLastWeek,
+    TagsSummary,
+    PaddedTags,
+    CASE 
+        WHEN DailyActivityRate > 0.5 AND Reputation >= 500 THEN 'Highly Active'
+        WHEN DailyActivityRate > 0.2 AND Reputation >= 200 THEN 'Moderately Active'
+        ELSE 'Inactive'
+    END as ActivityLevel,
+    CASE 
+        WHEN AVG(ScoreCategory = 'Golden') OVER (PARTITION BY RepTier) > 0.3 THEN 'High Quality'
+        WHEN AVG(ScoreCategory = 'High') OVER (PARTITION BY RepTier) > 0.4 THEN 'Medium Quality'
+        ELSE 'Low Quality'
+    END as QualityLevel,
+    DENSE_RANK() OVER (ORDER BY Reputation DESC) as GlobalReputationRank,
+    RANK() OVER (ORDER BY TotalPosts DESC) as GlobalActivityRank,
+    PERCENT_RANK() OVER (ORDER BY Reputation) as ReputationPercentile,
+    NTILE(4) OVER (ORDER BY Reputation) as ReputationQuartile
+FROM ComplexMetrics
+WHERE 
+    AccountAgeDays >= 30 
+    AND (ActiveLastWeek = 1 OR TotalPosts >= 10)
+    AND (Reputation >= 100 OR Badges >= 5 OR Comments >= 10)
+ORDER BY Reputation DESC, TotalPosts DESC
+LIMIT 1000;

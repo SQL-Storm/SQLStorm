@@ -1,0 +1,303 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        MAX(b.Date) AS LastBadgeDate,
+        COALESCE(SUM(p.Score), 0) AS TotalScore,
+        COALESCE(SUM(p.ViewCount), 0) AS TotalViews,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN COALESCE(SUM(p.Score), 0) * 1.0 / COUNT(DISTINCT p.Id)
+            ELSE 0 
+        END AS AvgScorePerPost,
+        STRING_AGG(DISTINCT t.TagName, ', ') AS TagPreferences
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Posts p2 ON p.Id = p2.ParentId
+    LEFT JOIN (
+        SELECT DISTINCT p3.Id AS PostId, TRIM(tag) AS TagName
+        FROM Posts p3,
+        UNNEST(STRING_SPLIT(p3.Tags, '>')) AS tag
+        WHERE p3.PostTypeId = 1 AND TRIM(tag) <> ''
+    ) t ON p.Id = t.PostId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopUsers AS (
+    SELECT 
+        us.*,
+        ROW_NUMBER() OVER (ORDER BY TotalScore DESC, Reputation DESC) AS RankByScore,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, TotalScore DESC) AS RankByReputation,
+        RANK() OVER (ORDER BY AvgScorePerPost DESC) AS RankByAvgScore,
+        DENSE_RANK() OVER (ORDER BY PostCount DESC) AS RankByPostCount
+    FROM UserStats us
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (1, 2, 3) THEN ph.Id END) AS EditCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN ph.Id END) AS ModerationCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (24, 35, 36) THEN ph.Id END) AS SuggestedEditCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (52, 53) THEN ph.Id END) AS HotQuestionCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (10,11,12,13) THEN 1 ELSE 0 END) AS ClosedPostCount,
+        COUNT(DISTINCT ph.PostId) AS PostIdsEdited,
+        STRING_AGG(DISTINCT CASE 
+            WHEN ph.PostHistoryTypeId IN (1, 2, 3) THEN 'Edit'
+            WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN 'Moderation'
+            WHEN ph.PostHistoryTypeId IN (24, 35, 36) THEN 'Suggested Edit'
+            WHEN ph.PostHistoryTypeId IN (52, 53) THEN 'Hot Question'
+            ELSE 'Other'
+        END, ', ') AS ActivityTypes
+    FROM Users u
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    WHERE u.Id > 0
+    GROUP BY u.Id
+),
+QuestionStats AS (
+    SELECT 
+        p2.Id AS QuestionId,
+        COUNT(p3.Id) AS AnswerCount,
+        MAX(p3.Score) AS MaxAnswerScore,
+        AVG(p3.Score) AS AvgAnswerScore,
+        COUNT(DISTINCT p3.OwnerUserId) AS Answerers,
+        STRING_AGG(DISTINCT CAST(p3.OwnerUserId AS VARCHAR), ', ') AS AnswerUserIds,
+        MAX(p3.CreationDate) AS LatestAnswerDate,
+        COUNT(DISTINCT p3.ParentId) AS AnswerCount2,
+        COUNT(DISTINCT CASE WHEN p3.Score > 0 THEN p3.Id END) AS PositiveScoreAnswers
+    FROM Posts p2
+    LEFT JOIN Posts p3 ON p2.Id = p3.ParentId AND p3.PostTypeId = 2
+    WHERE p2.PostTypeId = 1 AND p2.ParentId IS NULL
+    GROUP BY p2.Id
+),
+PostEngagement AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        COALESCE(qs.AnswerCount, 0) AS AnswerCount,
+        COALESCE(qs.MaxAnswerScore, 0) AS MaxAnswerScore,
+        COALESCE(qs.AvgAnswerScore, 0) AS AvgAnswerScore,
+        CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS HasAcceptedAnswer,
+        COALESCE(qs.Answerers, 0) AS Answerers,
+        CASE WHEN p.Score > 0 THEN p.Score ELSE 0 END AS PositiveScore,
+        CASE WHEN p.ViewCount > 0 THEN (p.Score * 100.0 / p.ViewCount) ELSE 0 END AS ScorePerView,
+        CASE WHEN p.CommentCount > 0 THEN (p.Score * 100.0 / p.CommentCount) ELSE 0 END AS ScorePerComment,
+        CAST((EXTRACT(EPOCH FROM (COALESCE(p.LastActivityDate, p.CreationDate) - p.CreationDate)) / 86400) AS INTEGER) AS DaysSinceCreation,
+        CASE 
+            WHEN CAST((EXTRACT(EPOCH FROM (COALESCE(p.LastActivityDate, p.CreationDate) - p.CreationDate)) / 86400) AS INTEGER) > 30 THEN 'Long-Lived' 
+            WHEN CAST((EXTRACT(EPOCH FROM (COALESCE(p.LastActivityDate, p.CreationDate) - p.CreationDate)) / 86400) AS INTEGER) > 7 THEN 'Active' 
+            ELSE 'Recent' 
+        END AS ActivityStatus
+    FROM Posts p
+    LEFT JOIN QuestionStats qs ON p.Id = qs.QuestionId
+    WHERE p.PostTypeId IN (1, 2)
+),
+RecentActivity AS (
+    SELECT 
+        p.Id,
+        p.OwnerUserId AS UserId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CommentCount,
+        p.LastActivityDate,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostType,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate DESC) AS RecentActivityRank
+    FROM Posts p
+    WHERE p.LastActivityDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '7 day')
+),
+TopAnswers AS (
+    SELECT 
+        p.Id,
+        p.OwnerUserId,
+        p.ParentId,
+        p.Title,
+        p.Score,
+        p.CreationDate,
+        p.Body,
+        RANK() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS RankByScore
+    FROM Posts p
+    WHERE p.PostTypeId = 2 AND p.Score > 0
+),
+QuestionTagStats AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        -- create array of tags excluding empty strings
+        ARRAY_REMOVE(STRING_SPLIT(p.Tags, '>'), '') AS TagArray,
+        LENGTH(p.Tags) AS TagLength
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+),
+CombinedStats AS (
+    SELECT 
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.PostCount,
+        tu.CommentCount,
+        tu.BadgeCount,
+        tu.TotalScore,
+        tu.AvgScorePerPost,
+        tu.LastPostDate,
+        tu.LastCommentDate,
+        tu.LastBadgeDate,
+        ua.EditCount,
+        ua.ModerationCount,
+        ua.SuggestedEditCount,
+        ua.HotQuestionCount,
+        ua.ClosedPostCount,
+        CASE 
+            WHEN tu.PostCount > 0 AND tu.CommentCount > 0 THEN (tu.PostCount * 100.0 / (tu.PostCount + tu.CommentCount)) 
+            ELSE 0 
+        END AS PostToCommentRatio,
+        CASE 
+            WHEN tu.BadgeCount > 0 AND tu.Reputation > 0 THEN ((tu.BadgeCount * 1.0) / tu.Reputation) 
+            ELSE 0 
+        END AS BadgeToReputationRatio,
+        CASE 
+            WHEN tu.AvgScorePerPost > 0 THEN (tu.TotalScore * 100.0 / tu.AvgScorePerPost) 
+            ELSE 0 
+        END AS ScoreEfficiency
+    FROM TopUsers tu
+    LEFT JOIN UserActivity ua ON tu.UserId = ua.UserId
+    WHERE tu.PostCount > 0
+),
+TagAnalysis AS (
+    SELECT 
+        CAST(REGEXP_REPLACE(tag, '[^a-zA-Z0-9]', '') AS VARCHAR(35)) AS CleanTag,
+        COUNT(*) AS TagCount,
+        AVG(p.Score) AS AvgScore,
+        AVG(p.ViewCount) AS AvgViews,
+        MAX(p.ViewCount) AS MaxViews,
+        MIN(p.Score) AS MinScore,
+        STRING_AGG(DISTINCT u.DisplayName, ', ') AS TagUsers,
+        STRING_AGG(DISTINCT CASE WHEN p.OwnerUserId IS NOT NULL THEN CAST(p.OwnerUserId AS VARCHAR) ELSE 'N/A' END, ', ') AS OwnerIds
+    FROM QuestionTagStats qts
+    CROSS JOIN LATERAL UNNEST(qts.TagArray) AS tag
+    LEFT JOIN Posts p ON p.Id = qts.QuestionId
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE tag IS NOT NULL AND tag <> ''
+    GROUP BY REGEXP_REPLACE(tag, '[^a-zA-Z0-9]', '')
+),
+TagRankings AS (
+    SELECT 
+        ta.*,
+        RANK() OVER (ORDER BY AvgScore DESC) AS ScoreRank,
+        RANK() OVER (ORDER BY AvgViews DESC) AS ViewsRank,
+        ROW_NUMBER() OVER (ORDER BY TagCount DESC) AS PopularityRank
+    FROM TagAnalysis ta
+)
+SELECT 
+    cs.UserId,
+    cs.DisplayName,
+    cs.Reputation,
+    cs.PostCount,
+    cs.CommentCount,
+    cs.BadgeCount,
+    cs.TotalScore,
+    cs.AvgScorePerPost,
+    cs.EditCount,
+    cs.ModerationCount,
+    cs.LastPostDate,
+    cs.LastCommentDate,
+    CASE 
+        WHEN (cs.PostCount + cs.CommentCount) > 0 THEN ROUND(100.0 * cs.PostCount / (cs.PostCount + cs.CommentCount), 2) 
+        ELSE 0 
+    END AS PostPercentage,
+    CASE 
+        WHEN cs.BadgeCount > 0 THEN ROUND(100.0 * cs.BadgeCount / cs.Reputation, 2) 
+        ELSE 0 
+    END AS BadgeReputationRatio,
+    CASE 
+        WHEN cs.EditCount > 0 THEN ROUND(100.0 * cs.SuggestedEditCount / cs.EditCount, 2) 
+        ELSE 0 
+    END AS SuggestedEditPercentage,
+    CASE 
+        WHEN cs.TotalScore > 0 THEN ROUND(100.0 * cs.HotQuestionCount / cs.TotalScore, 2) 
+        ELSE 0 
+    END AS HotQuestionToScoreRatio,
+    STRING_AGG(DISTINCT CASE 
+        WHEN cs.EditCount > 0 THEN 'Editor'
+        WHEN cs.ModerationCount > 0 THEN 'Moderator'
+        WHEN cs.SuggestedEditCount > 0 THEN 'Suggested Editor'
+        ELSE 'Standard'
+    END, ', ') AS UserType,
+    STRING_AGG(DISTINCT CASE 
+        WHEN cs.PostCount > 10 THEN 'High Poster'
+        WHEN cs.PostCount > 5 THEN 'Medium Poster' 
+        WHEN cs.PostCount > 0 THEN 'Low Poster'
+        ELSE 'No Posts'
+    END, ', ') AS PostingLevel,
+    (
+        SELECT 
+            STRING_AGG(
+                CASE 
+                    WHEN ra.PostType = 'Question' THEN 'Q' 
+                    WHEN ra.PostType = 'Answer' THEN 'A'
+                    ELSE '?'
+                END, 
+                ''
+            )
+        FROM RecentActivity ra
+        WHERE ra.UserId = cs.UserId AND ra.RecentActivityRank <= 5
+    ) AS RecentActivityPattern,
+    (
+        SELECT 
+            COUNT(*) 
+        FROM TopAnswers ta 
+        WHERE ta.OwnerUserId = cs.UserId AND ta.RankByScore <= 5
+    ) AS TopAnswerCount,
+    (
+        SELECT 
+            STRING_AGG(
+                CASE 
+                    WHEN qts.TagLength > 20 THEN 'Long'
+                    WHEN qts.TagLength > 10 THEN 'Medium'
+                    WHEN qts.TagLength > 0 THEN 'Short'
+                    ELSE 'Empty'
+                END, 
+                ', '
+            )
+        FROM QuestionTagStats qts
+        WHERE qts.QuestionId IN (
+            SELECT Id 
+            FROM Posts 
+            WHERE OwnerUserId = cs.UserId 
+            AND ParentId IS NULL
+        )
+    ) AS TagLengthAnalysis
+FROM CombinedStats cs
+WHERE cs.PostCount >= 10
+GROUP BY cs.UserId, cs.DisplayName, cs.Reputation, cs.PostCount, cs.CommentCount, cs.BadgeCount, 
+         cs.TotalScore, cs.AvgScorePerPost, cs.EditCount, cs.ModerationCount, cs.LastPostDate, cs.LastCommentDate,
+         cs.HotQuestionCount, cs.SuggestedEditCount, cs.ClosedPostCount
+HAVING 
+    SUM(CASE WHEN cs.EditCount > 0 THEN 1 ELSE 0 END) > 0
+    OR SUM(CASE WHEN cs.ModerationCount > 0 THEN 1 ELSE 0 END) > 0
+    OR SUM(CASE WHEN cs.HotQuestionCount > 0 THEN 1 ELSE 0 END) > 0
+ORDER BY cs.TotalScore DESC, cs.Reputation DESC
+FETCH FIRST 100 ROWS ONLY;

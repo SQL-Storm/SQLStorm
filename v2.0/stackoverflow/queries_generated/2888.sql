@@ -1,0 +1,164 @@
+-- {"query": "2888.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1444} 
+with RecursiveTopBadges as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        row_number() over (partition by u.Id order by b.Date desc) as rn
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    where b.TagBased = 0 or b.TagBased is null
+),
+FilteredPosts as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.Title,
+        p.Tags,
+        subgroup.TopBadgeName,
+        case when p.Body like '%<code>%' then 1 else 0 end as ContainsCodeSnippet,
+        dense_rank() over (partition by p.OwnerUserId order by p.Score desc) as ScoreRank
+    from Posts p
+    left join (
+        select UserId, BadgeName as TopBadgeName
+        from RecursiveTopBadges
+        where rn = 1
+    ) subgroup on p.OwnerUserId = subgroup.UserId
+    where p.PostTypeId in (1, 2) -- questions and answers only
+),
+TagSplit as (
+    select
+        fp.*,
+        unnest(string_to_array(substring(fp.Tags from 2 for char_length(fp.Tags) - 2), '><')) as SingleTag
+    from FilteredPosts fp
+    where fp.Tags is not null
+),
+AnswerStats as (
+    select
+        parent.Id as QuestionId,
+        count(a.Id) as NumAnswers,
+        avg(a.Score) as AvgAnswerScore,
+        max(a.Score) as MaxAnswerScore,
+        sum(case when a.Score > 10 then 1 else 0 end) as HighScoreAnswers
+    from Posts parent
+    left join Posts a on a.ParentId = parent.Id and a.PostTypeId = 2
+    where parent.PostTypeId = 1
+    group by parent.Id
+),
+TaggedQuestionsWithStats as (
+    select
+        ts.Id,
+        ts.OwnerUserId,
+        ts.Title,
+        ts.SingleTag,
+        ts.TopBadgeName,
+        ts.Score,
+        ts.ViewCount,
+        ts.ContainsCodeSnippet,
+        ts.ScoreRank,
+        ast.NumAnswers,
+        ast.AvgAnswerScore,
+        ast.MaxAnswerScore,
+        ast.HighScoreAnswers
+    from TagSplit ts
+    left join AnswerStats ast on ast.QuestionId = ts.Id
+    where ts.PostTypeId = 1
+),
+UserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) as TotalPosts,
+        sum(p.Score) as TotalScore,
+        count(distinct c.Id) as TotalComments,
+        count(distinct bh.Id) filter (where bh.PostHistoryTypeId = 10) as CloseVotesCast,
+        count(distinct v.Id) filter (where v.VoteTypeId = 2) as UpVotesCast,
+        count(distinct v.Id) filter (where v.VoteTypeId = 3) as DownVotesCast,
+        max(u.Reputation) as MaxReputation
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join PostHistory bh on bh.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+RecentActivityRanked as (
+    select
+        p.Id,
+        p.CreationDate,
+        p.OwnerUserId,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as RecentPostRank
+    from Posts p
+    where p.OwnerUserId is not null
+),
+DistinctTagCounts as (
+    select
+        OwnerUserId,
+        count(distinct SingleTag) as DistinctTagCount
+    from TagSplit
+    group by OwnerUserId
+),
+QuestionAnswerUnion as (
+    select
+        'Question' as PostType,
+        p.Id,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        0 as ParentId
+    from Posts p
+    where p.PostTypeId = 1
+
+    union all
+
+    select
+        'Answer' as PostType,
+        p.Id,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ParentId
+    from Posts p
+    where p.PostTypeId = 2
+)
+select
+    tqws.SingleTag,
+    count(distinct tqws.Id) as QuestionCount,
+    avg(tqws.Score) as AvgQuestionScore,
+    avg(tqws.ViewCount) as AvgQuestionViews,
+    avg(tqws.NumAnswers) as AvgNumAnswersPerQuestion,
+    avg(tqws.AvgAnswerScore) as AvgAnswerScorePerQuestion,
+    max(tqws.MaxAnswerScore) as MaxAnswerScoreOverall,
+    sum(tqws.HighScoreAnswers) as TotalHighScoreAnswers,
+    max(tqws.ContainsCodeSnippet) as AnyCodeSnippets,
+    string_agg(distinct coalesce(tqws.TopBadgeName, 'NoBadge'), ', ' order by tqws.TopBadgeName) as TopBadgesInTag,
+    ua.MaxReputation,
+    ua.TotalPosts,
+    ua.TotalComments,
+    ua.CloseVotesCast,
+    ua.UpVotesCast,
+    ua.DownVotesCast,
+    coalesce(dtc.DistinctTagCount, 0) as DistinctTagsUsedByOwner,
+    (
+        select count(*)
+        from Posts p2
+        where p2.OwnerUserId = ua.UserId
+          and p2.CreationDate > now() - interval '30 days'
+    ) as PostsLast30Days,
+    sum(case when qa.PostType = 'Answer' and qa.Score > 5 then 1 else 0 end) as HighScoreAnswersByUser,
+    coalesce(max(ra.CreationDate), to_timestamp(0)) as LastPostDate
+from TaggedQuestionsWithStats tqws
+inner join Users ua on ua.Id = tqws.OwnerUserId
+left join DistinctTagCounts dtc on dtc.OwnerUserId = tqws.OwnerUserId
+left join QuestionAnswerUnion qa on qa.OwnerUserId = tqws.OwnerUserId
+left join RecentActivityRanked ra on ra.Id = qa.Id and ra.RecentPostRank = 1
+where tqws.SingleTag is not null
+group by tqws.SingleTag, ua.Id, ua.DisplayName, ua.Reputation, ua.Id, ua.Id, ua.Id, ua.Id, ua.Id, ua.Id, ua.Id, ua.Id, dtc.DistinctTagCount
+having avg(tqws.Score) > 1
+order by TotalHighScoreAnswers desc, AvgQuestionScore desc
+limit 50;

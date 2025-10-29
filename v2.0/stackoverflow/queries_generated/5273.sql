@@ -1,0 +1,114 @@
+-- {"query": "5273.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 824} 
+WITH
+recent_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.PostTypeId,
+    p.ParentId,
+    p.ClosedDate
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= NOW() - INTERVAL '30 days'
+),
+top_tags AS (
+  SELECT
+    unnest(string_to_array(substr(p.Tags, 2, length(p.Tags)-2), '><')) AS tag
+  FROM recent_questions r
+  JOIN LATERAL (SELECT r.Tags) t ON true
+),
+tag_popularity AS (
+  SELECT
+    tag,
+    COUNT(*) AS question_count,
+    AVG(p.Score) AS avg_score,
+    SUM(p.ViewCount) AS total_views,
+    MAX(p.CreationDate) AS latest_question
+  FROM (
+    SELECT unnest(string_to_array(substr(r.Tags, 2, length(r.Tags)-2), '><')) AS tag,
+           r.Score,
+           r.ViewCount,
+           r.CreationDate
+    FROM recent_questions r
+  ) s
+  GROUP BY tag
+  ORDER BY question_count DESC
+  LIMIT 20
+),
+activity_by_day AS (
+  SELECT
+    date_trunc('day', p.CreationDate) AS day,
+    COUNT(*) AS questions_created,
+    SUM(CASE WHEN p.Score > 0 THEN 1 ELSE 0 END) AS positive_scores,
+    SUM(CASE WHEN p.ViewCount > 1000 THEN 1 ELSE 0 END) AS high_view_questions
+  FROM recent_questions p
+  GROUP BY date_trunc('day', p.CreationDate)
+),
+complex_stats AS (
+  SELECT
+    q.PostId,
+    q.Title,
+    q.Tags,
+    q.ViewCount,
+    q.Score,
+    q.OwnerUserId,
+    v.UpVotes,
+    v.DownVotes,
+    u.DisplayName,
+    u.Reputation,
+    CASE
+      WHEN q.ClosedDate IS NOT NULL THEN 'Closed'
+      WHEN q.LastActivityDate > q.CreationDate + INTERVAL '7 days' THEN 'Active'
+      ELSE 'New'
+    END AS status_flag,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = q.PostId) AS comment_count
+  FROM recent_questions q
+  LEFT JOIN Posts p2 ON p2.Id = q.PostId
+  LEFT JOIN Users u ON u.Id = q.OwnerUserId
+  LEFT JOIN Votes v ON v.PostId = q.PostId AND v.VoteTypeId IN (2,3)
+  GROUP BY
+    q.PostId, q.Title, q.Tags, q.ViewCount, q.Score, q.OwnerUserId,
+    u.DisplayName, u.Reputation
+),
+cross_ref AS (
+  SELECT
+    c.PostId,
+    c.Title,
+    c.Tags,
+    c.reputation,
+    c.comment_count
+  FROM complex_stats c
+  ORDER BY c.Score DESC
+  LIMIT 100
+)
+SELECT
+  r.PostId,
+  r.Title,
+  r.Tags,
+  r.CreationDate AS creation_date,
+  r.Views AS view_count
+FROM (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.ViewCount AS Views,
+    ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) AS rn
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+) r
+LEFT JOIN post_history ph ON ph.PostId = r.PostId
+WHERE r.rn = 1
+  AND r.Views > 0
+ORDER BY r.CreationDate DESC
+LIMIT 50;

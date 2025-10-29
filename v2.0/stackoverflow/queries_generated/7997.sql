@@ -1,0 +1,278 @@
+-- {"query": "7997.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2704} 
+WITH RankedPosts AS (
+    SELECT 
+        p.Id as PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as UserPostRank,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) as ScoreRank,
+        LAG(p.Score) OVER (ORDER BY p.CreationDate) as PrevScore,
+        LEAD(p.Score) OVER (ORDER BY p.CreationDate) as NextScore,
+        AVG(p.Score) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING) as MovingAvgScore
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) 
+),
+UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        SUM(p.Score) as TotalScore,
+        AVG(p.Score) as AvgScore,
+        MAX(p.CreationDate) as LastPostDate,
+        COUNT(DISTINCT b.Id) as BadgesCount,
+        STRING_AGG(DISTINCT b.Name, ', ') as BadgeNames,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 100 THEN 'Expert'
+            WHEN COUNT(DISTINCT p.Id) > 50 THEN 'Advanced'
+            WHEN COUNT(DISTINCT p.Id) > 10 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as UserLevel,
+        COUNT(DISTINCT CASE WHEN p.Score > 100 THEN p.Id END) as HighScorePosts
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+PostsWithStats AS (
+    SELECT 
+        rp.PostId,
+        rp.PostTypeId,
+        rp.CreationDate,
+        rp.Score,
+        rp.ViewCount,
+        rp.Title,
+        rp.Tags,
+        rp.OwnerUserId,
+        rp.AcceptedAnswerId,
+        rp.AnswerCount,
+        rp.CommentCount,
+        rp.FavoriteCount,
+        rp.UserPostRank,
+        rp.ScoreRank,
+        rp.PrevScore,
+        rp.NextScore,
+        rp.MovingAvgScore,
+        CASE 
+            WHEN rp.Score > (SELECT AVG(Score) FROM Posts) THEN 'Above Average'
+            WHEN rp.Score < (SELECT AVG(Score) FROM Posts) THEN 'Below Average'
+            ELSE 'Average'
+        END as ScoreStatus,
+        CASE 
+            WHEN rp.Tags IS NOT NULL AND rp.Tags != '' THEN 
+                (SELECT COUNT(*) FROM unnest(string_to_array(substring(rp.Tags, 2, length(rp.Tags)-2), '><')) AS tag)
+            ELSE 0
+        END as TagCount,
+        ROW_NUMBER() OVER (PARTITION BY rp.PostTypeId ORDER BY rp.Score DESC) as TopScoreByType,
+        CASE 
+            WHEN rp.OwnerUserId IS NULL THEN 'Deleted User'
+            ELSE 'Active User'
+        END as PostAuthorStatus,
+        COALESCE(
+            (SELECT u.DisplayName FROM Users u WHERE u.Id = rp.OwnerUserId), 
+            'Anonymous'
+        ) as AuthorDisplayName,
+        CASE 
+            WHEN rp.PostTypeId = 1 AND rp.AcceptedAnswerId IS NOT NULL THEN 'Question with Answer'
+            WHEN rp.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as PostCategory,
+        DATEDIFF(day, rp.CreationDate, CURRENT_TIMESTAMP) as DaysSinceCreation,
+        CASE 
+            WHEN rp.ViewCount > 1000 THEN 'High Traffic'
+            WHEN rp.ViewCount > 100 THEN 'Medium Traffic'
+            WHEN rp.ViewCount > 0 THEN 'Low Traffic'
+            ELSE 'No Views'
+        END as TrafficLevel
+    FROM RankedPosts rp
+),
+ComplexAnalysis AS (
+    SELECT 
+        ps.PostId,
+        ps.PostTypeId,
+        ps.CreationDate,
+        ps.Score,
+        ps.ViewCount,
+        ps.Title,
+        ps.Tags,
+        ps.OwnerUserId,
+        ps.AcceptedAnswerId,
+        ps.AnswerCount,
+        ps.CommentCount,
+        ps.FavoriteCount,
+        ps.UserPostRank,
+        ps.ScoreRank,
+        ps.PrevScore,
+        ps.NextScore,
+        ps.MovingAvgScore,
+        ps.ScoreStatus,
+        ps.TagCount,
+        ps.TopScoreByType,
+        ps.PostAuthorStatus,
+        ps.AuthorDisplayName,
+        ps.PostCategory,
+        ps.DaysSinceCreation,
+        ps.TrafficLevel,
+        uas.TotalPosts,
+        uas.Questions,
+        uas.Answers,
+        uas.TotalScore,
+        uas.AvgScore,
+        uas.LastPostDate,
+        uas.BadgesCount,
+        uas.BadgeNames,
+        uas.UserLevel,
+        uas.HighScorePosts,
+        CASE 
+            WHEN ps.Score > (SELECT AVG(Score) FROM Posts) * 1.5 THEN 'Highly Popular'
+            WHEN ps.Score > (SELECT AVG(Score) FROM Posts) THEN 'Popular'
+            ELSE 'Standard'
+        END as PopularityLevel,
+        CASE 
+            WHEN ps.ViewCount > 10000 THEN 'Viral'
+            WHEN ps.ViewCount > 1000 THEN 'Trending'
+            WHEN ps.ViewCount > 100 THEN 'Notable'
+            ELSE 'Regular'
+        END as ViewStatus,
+        CASE 
+            WHEN ps.AnswerCount > 0 AND ps.PostTypeId = 1 THEN (ps.AnswerCount * 100.0 / NULLIF(ps.ViewCount, 0))
+            ELSE 0
+        END as AnswerRatio,
+        COALESCE(
+            (SELECT COUNT(*) FROM Comments c WHERE c.PostId = ps.PostId), 
+            0
+        ) as CommentCountActual,
+        CASE 
+            WHEN ps.Score > 0 THEN 'Positive'
+            WHEN ps.Score < 0 THEN 'Negative'
+            ELSE 'Neutral'
+        END as SentimentScore,
+        CASE 
+            WHEN ps.PostTypeId = 1 AND ps.Score > 0 AND ps.AnswerCount > 0 THEN 'Active Question'
+            WHEN ps.PostTypeId = 2 AND ps.Score > 0 THEN 'Helpful Answer'
+            ELSE 'Neutral Post'
+        END as PostEffectiveness,
+        ROW_NUMBER() OVER (ORDER BY ps.ViewCount DESC, ps.Score DESC) as OverallRank,
+        NTILE(4) OVER (ORDER BY ps.Score) as ScoreQuartile
+    FROM PostsWithStats ps
+    LEFT JOIN UserActivityStats uas ON ps.OwnerUserId = uas.UserId
+    WHERE ps.Score IS NOT NULL
+)
+SELECT 
+    ca.PostId,
+    ca.PostTypeId,
+    ca.CreationDate,
+    ca.Score,
+    ca.ViewCount,
+    ca.Title,
+    ca.Tags,
+    ca.OwnerUserId,
+    ca.AcceptedAnswerId,
+    ca.AnswerCount,
+    ca.CommentCount,
+    ca.FavoriteCount,
+    ca.UserPostRank,
+    ca.ScoreRank,
+    ca.PrevScore,
+    ca.NextScore,
+    ca.MovingAvgScore,
+    ca.ScoreStatus,
+    ca.TagCount,
+    ca.TopScoreByType,
+    ca.PostAuthorStatus,
+    ca.AuthorDisplayName,
+    ca.PostCategory,
+    ca.DaysSinceCreation,
+    ca.TrafficLevel,
+    ca.TotalPosts,
+    ca.Questions,
+    ca.Answers,
+    ca.TotalScore,
+    ca.AvgScore,
+    ca.LastPostDate,
+    ca.BadgesCount,
+    ca.BadgeNames,
+    ca.UserLevel,
+    ca.HighScorePosts,
+    ca.PopularityLevel,
+    ca.ViewStatus,
+    ca.AnswerRatio,
+    ca.CommentCountActual,
+    ca.SentimentScore,
+    ca.PostEffectiveness,
+    ca.OverallRank,
+    ca.ScoreQuartile,
+    CASE 
+        WHEN ca.Score > (SELECT AVG(Score) FROM Posts) AND 
+             ca.ViewCount > (SELECT AVG(ViewCount) FROM Posts) AND 
+             ca.AnswerCount > 0 THEN 'High Impact'
+        WHEN ca.Score > (SELECT AVG(Score) FROM Posts) OR 
+             ca.ViewCount > (SELECT AVG(ViewCount) FROM Posts) THEN 'Good Impact'
+        ELSE 'Standard Impact'
+    END as ImpactLevel,
+    CASE 
+        WHEN ca.TagCount > 4 THEN 'Multi-tagged'
+        WHEN ca.TagCount = 3 THEN 'Three-tagged'
+        WHEN ca.TagCount = 2 THEN 'Two-tagged'
+        WHEN ca.TagCount = 1 THEN 'Single-tagged'
+        ELSE 'Untagged'
+    END as TagComplexity,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = ca.OwnerUserId AND p.CreationDate > DATEADD(month, -6, CURRENT_TIMESTAMP)) as RecentPosts,
+    CASE 
+        WHEN ca.Score > 100 AND ca.ViewCount > 500 THEN 'Elite Post'
+        WHEN ca.Score > 25 AND ca.ViewCount > 100 THEN 'Notable Post'
+        WHEN ca.Score > 5 THEN 'Regular Post'
+        ELSE 'Basic Post'
+    END as PostQuality,
+    ISNULL(NULLIF(ca.Title, ''), 'No Title') as CleanTitle,
+    ISNULL(NULLIF(ca.Tags, ''), 'No Tags') as CleanTags,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = ca.PostId AND pl.LinkTypeId = 3) as DuplicateLinks,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = ca.PostId AND v.VoteTypeId = 2) as Upvotes,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = ca.PostId AND v.VoteTypeId = 3) as Downvotes,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = ca.PostId AND ph.PostHistoryTypeId IN (10,11)) as CloseReopenCount,
+    (SELECT MIN(ph.CreationDate) FROM PostHistory ph WHERE ph.PostId = ca.PostId AND ph.PostHistoryTypeId = 1) as FirstRevisionDate,
+    (SELECT MAX(ph.CreationDate) FROM PostHistory ph WHERE ph.PostId = ca.PostId AND ph.PostHistoryTypeId IN (2,5,6)) as LastEditDate,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = ca.PostId) as HistoryCount,
+    (SELECT STRING_AGG(pht.Name, ', ') 
+     FROM PostHistory ph 
+     JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id 
+     WHERE ph.PostId = ca.PostId 
+     GROUP BY ph.PostId) as HistoryTypes,
+    CASE 
+        WHEN ca.Tags IS NOT NULL AND ca.Tags LIKE '%<%' THEN LENGTH(ca.Tags)
+        ELSE 0 
+    END as TagsLength,
+    CASE 
+        WHEN ca.PostTypeId = 1 THEN (SELECT COUNT(*) FROM Posts p WHERE p.ParentId = ca.PostId AND p.PostTypeId = 2)
+        ELSE 0
+    END as AnswerCountByQuestion,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = ca.PostId AND c.Score > 0) as PositiveComments,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = ca.PostId AND c.UserId IS NOT NULL) as AuthoredComments,
+    CASE 
+        WHEN ca.Score > 50 AND ca.ViewCount > 500 AND ca.CommentCount > 5 THEN 'High Engagement'
+        WHEN ca.Score > 25 AND ca.ViewCount > 100 THEN 'Moderate Engagement'
+        WHEN ca.Score > 5 THEN 'Low Engagement'
+        ELSE 'Minimal Engagement'
+    END as EngagementLevel,
+    (SELECT AVG(p2.Score) FROM Posts p2 WHERE p2.ParentId = ca.PostId) as AvgAnswerScore,
+    (SELECT MAX(p3.Score) FROM Posts p3 WHERE p3.ParentId = ca.PostId) as MaxAnswerScore,
+    (SELECT MIN(p4.Score) FROM Posts p4 WHERE p4.ParentId = ca.PostId) as MinAnswerScore
+FROM ComplexAnalysis ca
+WHERE ca.Score IS NOT NULL
+  AND (ca.ViewCount > 0 OR ca.Score > 0)
+  AND ca.PostAuthorStatus != 'Deleted User'
+  AND ca.PostTypeId IN (1, 2)
+ORDER BY ca.ViewCount DESC, ca.Score DESC, ca.CreationDate DESC
+LIMIT 10000;

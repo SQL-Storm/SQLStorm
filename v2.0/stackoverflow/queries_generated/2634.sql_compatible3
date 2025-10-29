@@ -1,0 +1,236 @@
+WITH RECURSIVE RecursivePostHierarchy AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.AcceptedAnswerId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        0 AS Level,
+        ARRAY[ p.Id ] AS Path
+    FROM Posts p 
+    WHERE p.PostTypeId = 1
+
+    UNION ALL
+
+    SELECT 
+        c.Id,
+        c.PostTypeId,
+        c.ParentId,
+        c.AcceptedAnswerId,
+        c.OwnerUserId,
+        c.CreationDate,
+        c.Score,
+        c.ViewCount,
+        c.Title,
+        c.Tags,
+        c.AnswerCount,
+        c.CommentCount,
+        c.FavoriteCount,
+        rh.Level + 1 AS Level,
+        rh.Path || ARRAY[ c.Id ]
+    FROM Posts c
+    JOIN RecursivePostHierarchy rh ON c.ParentId = rh.Id
+    WHERE c.PostTypeId = 2
+),
+TopScoredAnswers AS (
+    SELECT
+        ParentId,
+        Id AS AnswerId,
+        Score,
+        ROW_NUMBER() OVER (PARTITION BY ParentId ORDER BY Score DESC, CreationDate ASC) AS rn
+    FROM Posts
+    WHERE PostTypeId = 2
+),
+UserBadgeCount AS (
+    SELECT
+        UserId,
+        SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges
+    GROUP BY UserId
+),
+UserActivityStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(MAX(p.CreationDate), u.CreationDate) AS LastPostDate,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswerCount,
+        COUNT(DISTINCT ph.PostId) AS EditedPostsCount,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS UpVotesGiven,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS DownVotesGiven,
+        COALESCE(ub.GoldBadges,0) AS GoldBadges,
+        COALESCE(ub.SilverBadges,0) AS SilverBadges,
+        COALESCE(ub.BronzeBadges,0) AS BronzeBadges,
+        CASE WHEN u.LastAccessDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30 days') THEN 1 ELSE 0 END AS ActiveRecent
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    LEFT JOIN UserBadgeCount ub ON ub.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges
+),
+LatestCommentsWithSentiment AS (
+    SELECT
+        c.PostId,
+        c.Id AS CommentId,
+        c.UserId,
+        c.CreationDate,
+        c.Score,
+        c.Text,
+        length(c.Text) - length(replace(lower(c.Text), 'great', '')) AS MentionGreatCount,
+        CASE 
+            WHEN lower(c.Text) LIKE '%thank%' OR lower(c.Text) LIKE '%appreciate%' THEN 1
+            ELSE 0
+        END AS PositiveSentimentFlag
+    FROM (
+        SELECT *,
+               ROW_NUMBER() OVER (PARTITION BY PostId ORDER BY CreationDate DESC) AS rn
+        FROM Comments
+    ) c
+    WHERE c.rn = 1
+),
+DuplicateLinks AS (
+    SELECT pl.PostId, pl.RelatedPostId
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 3
+),
+QuestionDuplicates AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        ARRAY_AGG(DISTINCT dl.RelatedPostId) FILTER (WHERE dl.RelatedPostId IS NOT NULL) AS DuplicateOf
+    FROM Posts q
+    LEFT JOIN DuplicateLinks dl ON dl.PostId = q.Id
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.Title
+),
+ScoreRankWindow AS (
+    SELECT
+        Id,
+        Score,
+        RANK() OVER (ORDER BY Score DESC) AS ScoreRank
+    FROM Posts
+    WHERE PostTypeId IN (1,2)
+),
+FilteredQuestions AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.AcceptedAnswerId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = p.Id AND a.Score > 10) AS HighScoringAnswers,
+        (SELECT MAX(ph.CreationDate) FROM PostHistory ph WHERE ph.PostId = p.Id) AS LastEditDate,
+        COALESCE(pc.CommentCount, 0) AS CommentCountChecked
+    FROM Posts p
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS CommentCount 
+        FROM Comments 
+        GROUP BY PostId
+    ) pc ON pc.PostId = p.Id
+    WHERE p.PostTypeId = 1 AND p.Score > 5 AND p.ViewCount > 1000
+),
+ComputedExpressions AS (
+    SELECT 
+        fq.Id,
+        fq.Title,
+        fq.Score,
+        fq.ViewCount,
+        fq.AnswerCount,
+        fq.FavoriteCount,
+        fq.Tags,
+        fq.HighScoringAnswers,
+        fq.CommentCountChecked,
+        fq.LastEditDate,
+        (
+            SELECT COUNT(DISTINCT tag) FROM (
+                SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(fq.Tags FROM 2 FOR CHAR_LENGTH(fq.Tags)-2), '><')) AS tag
+            ) t
+        ) AS DistinctTagCount,
+        CHAR_LENGTH(fq.Title) * 1.5 + COALESCE(fq.Score,0) - COALESCE(fq.ViewCount/1000.0,0) AS ComputedPopularityScore,
+        CASE 
+            WHEN fq.FavoriteCount IS NULL OR fq.FavoriteCount = 0 THEN NULL
+            ELSE CAST(fq.Score AS DOUBLE PRECISION) / NULLIF(fq.FavoriteCount,0)
+        END AS ScorePerFavorite,
+        fq.LastEditDate - fq.CreationDate AS EditDelay,
+        (fq.LastEditDate + INTERVAL '7 days') > TIMESTAMP '2024-10-01 12:34:56' AS EditedInLastWeek,
+        fq.CreationDate
+    FROM FilteredQuestions fq
+),
+FinalStats AS (
+    SELECT
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.QuestionCount,
+        uas.AnswerCount,
+        uas.EditedPostsCount,
+        uas.GoldBadges,
+        uas.SilverBadges,
+        uas.BronzeBadges,
+        uas.UpVotesGiven,
+        uas.DownVotesGiven,
+        uas.ActiveRecent,
+        COUNT(DISTINCT ce.Id) FILTER (WHERE ce.PostTypeId = 1) AS UserQuestionsInFiltered,
+        COUNT(DISTINCT ce.Id) FILTER (WHERE ce.PostTypeId = 2) AS UserAnswersInFiltered,
+        AVG(ce.Score) FILTER (WHERE ce.PostTypeId IN (1,2)) AS AverageScore,
+        MAX(ce.ViewCount) FILTER (WHERE ce.PostTypeId = 1) AS MaxQuestionViewCount
+    FROM UserActivityStats uas
+    LEFT JOIN Posts ce ON ce.OwnerUserId = uas.UserId AND ce.Id IN (SELECT Id FROM ComputedExpressions)
+    GROUP BY uas.UserId, uas.DisplayName, uas.Reputation, uas.QuestionCount, uas.AnswerCount, uas.EditedPostsCount, uas.GoldBadges, uas.SilverBadges, uas.BronzeBadges, uas.UpVotesGiven, uas.DownVotesGiven, uas.ActiveRecent
+)
+SELECT 
+    fe.Id AS QuestionId,
+    fe.Title,
+    fe.Score,
+    fe.ViewCount,
+    fe.AnswerCount,
+    fe.FavoriteCount,
+    fe.DistinctTagCount,
+    fe.ComputedPopularityScore,
+    fe.ScorePerFavorite,
+    fe.EditDelay,
+    fe.EditedInLastWeek,
+    ts.AnswerId AS TopAnswerId,
+    ts.Score AS TopAnswerScore,
+    lc.CommentId AS LatestCommentId,
+    lc.UserId AS LatestCommentUserId,
+    lc.MentionGreatCount,
+    lc.PositiveSentimentFlag,
+    qd.DuplicateOf,
+    fs.DisplayName AS QuestionOwnerName,
+    fs.Reputation AS QuestionOwnerReputation,
+    fs.GoldBadges AS OwnerGoldBadges,
+    fs.SilverBadges AS OwnerSilverBadges,
+    fs.BronzeBadges AS OwnerBronzeBadges,
+    fs.ActiveRecent AS OwnerActiveRecent,
+    fs.QuestionCount AS OwnerTotalQuestions,
+    fs.AnswerCount AS OwnerTotalAnswers,
+    fs.AverageScore AS OwnerAveragePostScore
+FROM ComputedExpressions fe
+LEFT JOIN TopScoredAnswers ts ON ts.ParentId = fe.Id AND ts.rn = 1
+LEFT JOIN LatestCommentsWithSentiment lc ON lc.PostId = fe.Id
+LEFT JOIN QuestionDuplicates qd ON qd.QuestionId = fe.Id
+LEFT JOIN FinalStats fs ON fs.UserId = (SELECT OwnerUserId FROM Posts WHERE Id = fe.Id)
+WHERE fe.Score > 10
+ORDER BY fe.ComputedPopularityScore DESC
+LIMIT 100;

@@ -1,0 +1,120 @@
+WITH ranked_posts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.Tags,
+    p.PostTypeId,
+    p.CommentCount,
+    p.FavoriteCount,
+    pc.Name AS ClosedReason,
+    u.Reputation,
+    u.DisplayName AS OwnerDisplayName,
+    v1.Name AS VoteTypeName,
+    ROW_NUMBER() OVER (
+      PARTITION BY p.PostTypeId
+      ORDER BY
+        p.Score DESC,
+        p.ViewCount DESC,
+        p.CreationDate ASC
+    ) AS rn
+  FROM Posts p
+  LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+  LEFT JOIN PostHistoryTypes pht ON pht.Id = ph.PostHistoryTypeId
+  LEFT JOIN CloseReasonTypes pc ON ph.Comment LIKE CONCAT('%', pc.Id, '%')
+  INNER JOIN Users u ON u.Id = p.OwnerUserId
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  LEFT JOIN VoteTypes v1 ON v.VoteTypeId = v1.Id
+  WHERE p.PostTypeId IN (1, 2)
+    AND p.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days')
+    AND (p.OwnerUserId IS NOT NULL OR p.OwnerDisplayName IS NOT NULL)
+),
+aggregated_base AS (
+  SELECT
+    rp.PostId,
+    rp.Title,
+    rp.CreationDate,
+    rp.Score,
+    rp.ViewCount,
+    rp.OwnerUserId,
+    rp.OwnerDisplayName,
+    rp.Reputation,
+    rp.ClosedReason,
+    rp.PostTypeId,
+    rp.LastActivityDate,
+    rp.Tags,
+    rp.rn
+  FROM ranked_posts rp
+  WHERE rp.rn = 1
+),
+aggregated AS (
+  SELECT
+    ab.PostId,
+    ab.Title,
+    ab.CreationDate,
+    ab.Score,
+    ab.ViewCount,
+    ab.OwnerUserId,
+    ab.OwnerDisplayName,
+    ab.Reputation,
+    ab.ClosedReason,
+    ab.PostTypeId,
+    COUNT(*) OVER () AS total_top_per_type,
+    SUM(ab.ViewCount) OVER (PARTITION BY ab.PostTypeId) AS sum_views_by_type,
+    AVG(ab.Score) OVER (PARTITION BY ab.PostTypeId) AS avg_score_by_type,
+    MIN(ab.CreationDate) OVER () AS earliest_post,
+    MAX(ab.LastActivityDate) OVER () AS latest_activity,
+    CAST(NULL AS text) AS all_tags_placeholder
+  FROM aggregated_base ab
+),
+all_tags AS (
+  SELECT STRING_AGG(t.Tags, ',') AS all_tags
+  FROM (
+    SELECT DISTINCT Tags
+    FROM ranked_posts
+    WHERE rn = 1 AND Tags IS NOT NULL
+  ) t
+)
+SELECT
+  ptype.Name AS PostCategory,
+  a.PostId,
+  a.Title,
+  a.CreationDate,
+  a.Reputation,
+  a.OwnerDisplayName,
+  a.Score,
+  a.ViewCount,
+  a.ClosedReason,
+  a.sum_views_by_type AS SumViewsForType,
+  a.avg_score_by_type AS AvgScoreForType,
+  a.earliest_post AS FirstPostDate,
+  a.latest_activity AS LastActivityDate,
+  at.all_tags AS TagsSummary
+FROM aggregated a
+CROSS JOIN all_tags at
+JOIN PostTypes ptype ON ptype.Id = a.PostTypeId
+GROUP BY
+  ptype.Name,
+  a.PostId,
+  a.Title,
+  a.CreationDate,
+  a.Reputation,
+  a.OwnerDisplayName,
+  a.Score,
+  a.ViewCount,
+  a.ClosedReason,
+  a.sum_views_by_type,
+  a.avg_score_by_type,
+  a.earliest_post,
+  a.latest_activity,
+  at.all_tags,
+  a.PostTypeId
+ORDER BY
+  a.PostTypeId,
+  a.Score DESC,
+  a.ViewCount DESC
+LIMIT 100;

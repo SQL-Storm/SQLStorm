@@ -1,0 +1,108 @@
+-- {"query": "3193.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2018} 
+
+WITH UserStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.CreationDate, TIMESTAMP '1970-01-01') AS Created,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS QuestionScoreSum,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS AnswerScoreSum,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Badges b      ON b.UserId = u.Id
+    LEFT JOIN Posts  p      ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+RankedUsers AS (
+    SELECT
+        *,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, GoldBadges DESC, SilverBadges DESC) AS ReputationRank,
+        CASE
+            WHEN QuestionCount = 0 THEN NULL
+            ELSE CAST(AnswerCount AS DECIMAL) / QuestionCount
+        END AS AnswerRatio
+    FROM UserStats
+),
+RecentActivity AS (
+    SELECT
+        u.Id,
+        MAX(v.CreationDate) FILTER (WHERE v.VoteTypeId = 2)               AS LastUpvoteDate,
+        MAX(c.CreationDate) FILTER (WHERE c.Score >= 5)                  AS LastHighScoreCommentDate
+    FROM Users u
+    LEFT JOIN Votes    v ON v.UserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    GROUP BY u.Id
+),
+TopTags AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        STRING_AGG(DISTINCT t.TagName, ',') AS TopTagList
+    FROM Posts p
+    JOIN LATERAL regexp_split_to_table(p.Tags, '[><]') AS tag(tag) ON TRUE
+    JOIN Tags t ON t.TagName = tag.tag
+    WHERE p.PostTypeId = 1 AND p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+)
+SELECT
+    ru.Id,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.ReputationRank,
+    ru.GoldBadges,
+    ru.SilverBadges,
+    ru.BronzeBadges,
+    ru.QuestionScoreSum,
+    ru.AnswerScoreSum,
+    ru.AnswerRatio,
+    COALESCE(tt.TopTagList, '(none)')                     AS TopTags,
+    ra.LastUpvoteDate,
+    ra.LastHighScoreCommentDate,
+    (SELECT p.Title
+        FROM Posts p
+        WHERE p.OwnerUserId = ru.Id
+          AND p.PostTypeId = 1
+        ORDER BY p.CreationDate DESC
+        LIMIT 1)                                         AS LatestQuestionTitle,
+    CASE
+        WHEN ru.LastPostDate IS NULL                      THEN 'Never posted'
+        WHEN ru.LastPostDate < CURRENT_DATE - INTERVAL '1 year' THEN 'Inactive >1y'
+        ELSE 'Active'
+    END                                                AS ActivityStatus
+FROM RankedUsers ru
+LEFT JOIN RecentActivity ra ON ra.Id = ru.Id
+LEFT JOIN TopTags tt       ON tt.UserId = ru.Id
+WHERE ru.ReputationRank <= 1000
+
+UNION ALL
+
+SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    NULL,
+    0,
+    0,
+    0,
+    0,
+    0,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    CASE
+        WHEN u.Reputation < 100 THEN 'LowRep'
+        ELSE 'MidRep'
+    END                                            AS ActivityStatus
+FROM Users u
+WHERE u.Reputation BETWEEN 10 AND 50
+  AND NOT EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = u.Id)
+
+ORDER BY Reputation DESC NULLS LAST, GoldBadges DESC, SilverBadges DESC
+LIMIT 200;

@@ -1,0 +1,288 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN p.Id END) AS QuestionWithAcceptedAnswer,
+        AVG(p.Score) AS AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) AS AvgAnswerScore,
+        SUM(p.ViewCount) AS TotalViews,
+        STRING_AGG(DISTINCT p.Tags, '; ') AS AllTagsUsed,
+        STRING_AGG(DISTINCT b.Name, ', ') AS BadgeNames,
+        STRING_AGG(DISTINCT u.EmailHash, ', ') AS EmailHashes
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views
+),
+TopUsersByActivity AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        PostCount,
+        CommentCount,
+        BadgeCount,
+        LastPostDate,
+        LastCommentDate,
+        QuestionCount,
+        AnswerCount,
+        QuestionWithAcceptedAnswer,
+        AvgQuestionScore,
+        AvgAnswerScore,
+        TotalViews,
+        AllTagsUsed,
+        BadgeNames,
+        EmailHashes,
+        ROW_NUMBER() OVER (ORDER BY PostCount DESC, Reputation DESC) AS ActivityRank,
+        DENSE_RANK() OVER (ORDER BY Reputation DESC) AS ReputationRank,
+        NTILE(10) OVER (ORDER BY Reputation DESC) AS ReputationQuartile
+    FROM UserActivityStats
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ParentId,
+        p.AcceptedAnswerId,
+        u.DisplayName AS OwnerDisplayName,
+        CASE WHEN p.PostTypeId = 1 THEN 'Question' ELSE 'Answer' END AS PostType,
+        CASE 
+            WHEN p.Score > 100 THEN 'Very Popular'
+            WHEN p.Score > 50 THEN 'Popular'
+            WHEN p.Score > 10 THEN 'Moderately Popular'
+            ELSE 'Low'
+        END AS PopularityLevel,
+        CHAR_LENGTH(p.Title) AS TitleLength,
+        CHAR_LENGTH(p.Body) AS BodyLength,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags <> '' THEN 
+                (SELECT COUNT(*) FROM unnest(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><')) AS t(x))
+            ELSE 0
+        END AS TagCount,
+        COALESCE(p.AnswerCount, 0) - COALESCE(p.CommentCount, 0) AS NetActivity,
+        COALESCE(p.Score, 0) + COALESCE(p.ViewCount, 0) + COALESCE(p.FavoriteCount, 0) AS CombinedScore,
+        CAST(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - p.CreationDate)) / 86400 AS integer) * 1 AS AgeInDays,
+        CASE 
+            WHEN p.CreationDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '6 months') THEN 'Recent'
+            WHEN p.CreationDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '12 months') THEN 'Recent-Medium'
+            WHEN p.CreationDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year') THEN 'Medium'
+            ELSE 'Old'
+        END AS AgeCategory,
+        CASE 
+            WHEN COALESCE(p.FavoriteCount,0) > 50 THEN 'Highly Favorited'
+            WHEN COALESCE(p.FavoriteCount,0) > 20 THEN 'Favorited'
+            WHEN COALESCE(p.FavoriteCount,0) > 5 THEN 'Slightly Favorited'
+            ELSE 'Not Favorited'
+        END AS FavoredStatus
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1, 2)
+      AND p.Score > 5
+      AND p.CreationDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years')
+      AND (p.Tags IS NOT NULL AND p.Tags <> '')
+),
+PostHistoryAnalysis AS (
+    SELECT 
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate AS HistoryDate,
+        ph.UserId,
+        ph.UserDisplayName,
+        ph.Text,
+        ph.Comment,
+        ph.RevisionGUID,
+        CASE 
+            WHEN ph.PostHistoryTypeId IN (1, 4, 6) THEN 'Title/Tags/Body Change'
+            WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN 'Status Change'
+            WHEN ph.PostHistoryTypeId IN (14, 15, 19, 20) THEN 'Moderator Action'
+            ELSE 'Other'
+        END AS HistoryCategory,
+        EXTRACT(EPOCH FROM (ph.CreationDate - LAG(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate)))/60 AS MinutesSinceLastEdit,
+        COUNT(*) OVER (PARTITION BY ph.PostId) AS TotalEditsPerPost
+    FROM PostHistory ph
+    WHERE ph.CreationDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 months')
+),
+CombinedAnalysis AS (
+    SELECT 
+        tua.UserId,
+        tua.DisplayName,
+        tua.Reputation,
+        tua.PostCount,
+        tua.CommentCount,
+        tua.QuestionCount,
+        tua.AnswerCount,
+        tua.QuestionWithAcceptedAnswer,
+        tua.AvgQuestionScore,
+        tua.AvgAnswerScore,
+        tua.TotalViews,
+        tua.ReputationRank,
+        tua.ReputationQuartile,
+        cap.PostId,
+        cap.Title,
+        cap.Body,
+        cap.Score,
+        cap.ViewCount,
+        cap.CreationDate,
+        cap.PostType,
+        cap.PopularityLevel,
+        cap.TitleLength,
+        cap.BodyLength,
+        cap.TagCount,
+        cap.NetActivity,
+        cap.CombinedScore,
+        cap.AgeInDays,
+        cap.AgeCategory,
+        cap.FavoredStatus,
+        pha.HistoryDate,
+        pha.HistoryCategory,
+        pha.MinutesSinceLastEdit,
+        pha.TotalEditsPerPost,
+        CASE 
+            WHEN pha.HistoryCategory = 'Title/Tags/Body Change' AND pha.MinutesSinceLastEdit < 30 THEN 'Very Active Editing'
+            WHEN pha.HistoryCategory = 'Title/Tags/Body Change' AND pha.MinutesSinceLastEdit BETWEEN 30 AND 120 THEN 'Active Editing'
+            WHEN pha.HistoryCategory = 'Status Change' AND pha.TotalEditsPerPost > 5 THEN 'Frequent Status Changes'
+            ELSE 'Normal Activity'
+        END AS ActivityPattern,
+        CASE 
+            WHEN tua.Reputation > 10000 AND cap.Score > 50 AND cap.NetActivity > 10 THEN 'High Value Contributor'
+            WHEN tua.Reputation > 5000 AND cap.Score > 25 AND cap.ViewCount > 100 THEN 'Moderate Value Contributor'
+            WHEN tua.Reputation < 500 AND cap.Score < 10 THEN 'New Contributor'
+            ELSE 'Regular Contributor'
+        END AS ContributorTier,
+        ROW_NUMBER() OVER (PARTITION BY tua.UserId ORDER BY cap.CreationDate DESC) AS PostRankPerUser
+    FROM TopUsersByActivity tua
+    JOIN ComplexPostAnalysis cap ON tua.UserId = cap.OwnerUserId
+    LEFT JOIN PostHistoryAnalysis pha ON cap.PostId = pha.PostId
+    WHERE cap.CreationDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '4 weeks')
+),
+FinalAggregation AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        PostCount,
+        CommentCount,
+        QuestionCount,
+        AnswerCount,
+        QuestionWithAcceptedAnswer,
+        AvgQuestionScore,
+        AvgAnswerScore,
+        TotalViews,
+        ReputationRank,
+        ReputationQuartile,
+        COUNT(DISTINCT PostId) AS TotalPosts,
+        MAX(CreationDate) AS MostRecentPost,
+        MIN(CreationDate) AS OldestPost,
+        COUNT(DISTINCT CASE WHEN PopularityLevel = 'Very Popular' THEN PostId END) AS VeryPopularPosts,
+        COUNT(DISTINCT CASE WHEN FavoredStatus = 'Highly Favorited' THEN PostId END) AS HighlyFavoritedPosts,
+        SUM(CASE WHEN AgeCategory = 'Recent' THEN 1 ELSE 0 END) AS RecentPosts,
+        SUM(CASE WHEN AgeCategory = 'Recent-Medium' THEN 1 ELSE 0 END) AS RecentMediumPosts,
+        AVG(Score) AS AvgPostScore,
+        AVG(ViewCount) AS AvgPostViews,
+        AVG(CombinedScore) AS AvgCombinedScore,
+        STRING_AGG(DISTINCT PostType, ', ') AS PostTypes,
+        STRING_AGG(DISTINCT HistoryCategory, ', ') AS HistoryCategories,
+        STRING_AGG(DISTINCT ActivityPattern, ', ') AS ActivityPatterns,
+        STRING_AGG(DISTINCT ContributorTier, ', ') AS ContributorTiers,
+        COUNT(*) AS RecordCount,
+        COUNT(DISTINCT PostId) OVER (PARTITION BY UserId) AS UserPostCount,
+        DENSE_RANK() OVER (ORDER BY AVG(Score) DESC, SUM(ViewCount) DESC) AS PerformanceRank
+    FROM CombinedAnalysis
+    GROUP BY UserId, DisplayName, Reputation, PostCount, CommentCount, QuestionCount, AnswerCount, QuestionWithAcceptedAnswer, AvgQuestionScore, AvgAnswerScore, TotalViews, ReputationRank, ReputationQuartile
+)
+SELECT 
+    'Performance Benchmark Query Results' AS ReportTitle,
+    COUNT(*) AS TotalRecordsProcessed,
+    COUNT(DISTINCT UserId) AS UniqueUsers,
+    COUNT(DISTINCT PostId) AS UniquePosts,
+    MIN(MostRecentPost) AS EarliestRecentPost,
+    MAX(MostRecentPost) AS LatestRecentPost,
+    AVG(Reputation) AS AvgReputation,
+    AVG(PostCount) AS AvgPostsPerUser,
+    AVG(QuestionCount) AS AvgQuestionsPerUser,
+    AVG(AnswerCount) AS AvgAnswersPerUser,
+    AVG(AvgQuestionScore) AS AvgQuestionScore,
+    AVG(AvgAnswerScore) AS AvgAnswerScore,
+    AVG(TotalViews) AS AvgTotalViews,
+    MIN(PerformanceRank) AS BestPerformanceRank,
+    MAX(PerformanceRank) AS WorstPerformanceRank,
+    STRING_AGG(DISTINCT PostTypes, '; ') AS AllPostTypes,
+    STRING_AGG(DISTINCT HistoryCategories, '; ') AS AllHistoryCategories,
+    STRING_AGG(DISTINCT ActivityPatterns, '; ') AS AllActivityPatterns,
+    STRING_AGG(DISTINCT ContributorTiers, '; ') AS AllContributorTiers,
+    'Generated on ' || TO_CHAR(CAST('2024-10-01 12:34:56' AS timestamp), 'MM/DD/YYYY') AS ReportGenerationDate
+FROM FinalAggregation
+HAVING COUNT(*) > 0
+UNION ALL
+SELECT 
+    'Aggregated Summary' AS ReportTitle,
+    COUNT(*) AS TotalRecordsProcessed,
+    COUNT(DISTINCT UserId) AS UniqueUsers,
+    COUNT(DISTINCT PostId) AS UniquePosts,
+    MIN(MostRecentPost) AS EarliestRecentPost,
+    MAX(MostRecentPost) AS LatestRecentPost,
+    AVG(Reputation) AS AvgReputation,
+    AVG(PostCount) AS AvgPostsPerUser,
+    AVG(QuestionCount) AS AvgQuestionsPerUser,
+    AVG(AnswerCount) AS AvgAnswersPerUser,
+    AVG(AvgQuestionScore) AS AvgQuestionScore,
+    AVG(AvgAnswerScore) AS AvgAnswerScore,
+    AVG(TotalViews) AS AvgTotalViews,
+    MIN(PerformanceRank) AS BestPerformanceRank,
+    MAX(PerformanceRank) AS WorstPerformanceRank,
+    STRING_AGG(DISTINCT PostTypes, '; ') AS AllPostTypes,
+    STRING_AGG(DISTINCT HistoryCategories, '; ') AS AllHistoryCategories,
+    STRING_AGG(DISTINCT ActivityPatterns, '; ') AS AllActivityPatterns,
+    STRING_AGG(DISTINCT ContributorTiers, '; ') AS AllContributorTiers,
+    'Generated on ' || TO_CHAR(CAST('2024-10-01 12:34:56' AS timestamp), 'MM/DD/YYYY') AS ReportGenerationDate
+FROM FinalAggregation
+WHERE PerformanceRank < 100
+UNION ALL
+SELECT 
+    'Top Tier Contributors Analysis' AS ReportTitle,
+    COUNT(*) AS TotalRecordsProcessed,
+    COUNT(DISTINCT UserId) AS UniqueUsers,
+    COUNT(DISTINCT PostId) AS UniquePosts,
+    MIN(MostRecentPost) AS EarliestRecentPost,
+    MAX(MostRecentPost) AS LatestRecentPost,
+    AVG(Reputation) AS AvgReputation,
+    AVG(PostCount) AS AvgPostsPerUser,
+    AVG(QuestionCount) AS AvgQuestionsPerUser,
+    AVG(AnswerCount) AS AvgAnswersPerUser,
+    AVG(AvgQuestionScore) AS AvgQuestionScore,
+    AVG(AvgAnswerScore) AS AvgAnswerScore,
+    AVG(TotalViews) AS AvgTotalViews,
+    MIN(PerformanceRank) AS BestPerformanceRank,
+    MAX(PerformanceRank) AS WorstPerformanceRank,
+    STRING_AGG(DISTINCT PostTypes, '; ') AS AllPostTypes,
+    STRING_AGG(DISTINCT HistoryCategories, '; ') AS AllHistoryCategories,
+    STRING_AGG(DISTINCT ActivityPatterns, '; ') AS AllActivityPatterns,
+    STRING_AGG(DISTINCT ContributorTiers, '; ') AS AllContributorTiers,
+    'Generated on ' || TO_CHAR(CAST('2024-10-01 12:34:56' AS timestamp), 'MM/DD/YYYY') AS ReportGenerationDate
+FROM FinalAggregation
+WHERE ContributorTier LIKE '%High Value%'
+  AND Reputation > 10000
+  AND PostCount > 100
+  AND AvgQuestionScore > 20
+ORDER BY TotalRecordsProcessed DESC;

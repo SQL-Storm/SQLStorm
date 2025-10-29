@@ -1,0 +1,136 @@
+WITH 
+UserBadgeSummary AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Reputation IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopUsers AS (
+    SELECT * FROM UserBadgeSummary WHERE ReputationRank <= 100
+),
+UserPostStats AS (
+    SELECT 
+        p.OwnerUserId AS UserId,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId IN (1,2)) AS AvgPostScore,
+        MAX(p.ViewCount) FILTER (WHERE p.PostTypeId = 1) AS MaxQuestionViewCount,
+        SUM(p.FavoriteCount) FILTER (WHERE p.PostTypeId = 1) AS TotalFavorites,
+        SUM(COALESCE(p.AnswerCount,0)) FILTER (WHERE p.PostTypeId = 1) AS SumAnswerCounts,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS AnswerRank
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+TopAnswers AS (
+    SELECT ups.UserId, p.Id AS AnswerId, p.Score, p.CreationDate, p.ParentId AS QuestionId
+    FROM UserPostStats ups
+    JOIN Posts p ON p.OwnerUserId = ups.UserId AND p.PostTypeId = 2
+    WHERE ups.AnswerRank <= 3
+),
+AnswerQuestions AS (
+    SELECT ta.AnswerId, q.Title, q.Tags,
+        (
+            SELECT COUNT(*) FROM Comments c WHERE c.PostId IN (ta.QuestionId, ta.AnswerId)
+        ) AS TotalComments,
+        CASE WHEN q.ClosedDate IS NOT NULL THEN TRUE ELSE FALSE END AS IsClosed
+    FROM TopAnswers ta
+    JOIN Posts q ON q.Id = ta.QuestionId
+),
+UserPostEditInfo AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        MAX(p.LastEditDate) AS LatestEditDate,
+        STRING_AGG(DISTINCT COALESCE(u.DisplayName, p.LastEditorDisplayName), ', ') AS Editors
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.LastEditorUserId
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+TopUserTags AS (
+    SELECT 
+        tag AS TagName,
+        COUNT(*) AS TagCount
+    FROM (
+        SELECT
+            OwnerUserId,
+            TRIM(tag) AS tag
+        FROM Posts,
+        LATERAL (
+            SELECT split_tag
+            FROM (
+                SELECT regexp_split_to_table(
+                    substring(Tags from 2 for length(Tags)-2),
+                    '><'
+                ) AS split_tag
+            ) st
+        ) s
+        WHERE PostTypeId = 1
+          AND OwnerUserId IN (SELECT UserId FROM TopUsers)
+          AND Tags IS NOT NULL
+    ) t
+    GROUP BY tag
+    ORDER BY TagCount DESC
+    LIMIT 5
+),
+FinalUserReport AS (
+    SELECT 
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.GoldBadges,
+        tu.SilverBadges,
+        tu.BronzeBadges,
+        ups.QuestionCount,
+        ups.AnswerCount,
+        ups.AvgPostScore,
+        ups.MaxQuestionViewCount,
+        ups.TotalFavorites,
+        ups.SumAnswerCounts,
+        COALESCE(upedit.LatestEditDate, TIMESTAMP '1970-01-01') AS LatestEditDate,
+        COALESCE(upedit.Editors, 'No Editors') AS Editors,
+        ARRAY_AGG(DISTINCT tut.TagName) FILTER (WHERE tut.TagName IS NOT NULL) AS FavoriteTags
+    FROM TopUsers tu
+    LEFT JOIN (
+        SELECT 
+            OwnerUserId, 
+            COUNT(*) FILTER (WHERE PostTypeId = 1) AS QuestionCount,
+            COUNT(*) FILTER (WHERE PostTypeId = 2) AS AnswerCount,
+            AVG(Score) FILTER (WHERE PostTypeId IN (1,2)) AS AvgPostScore,
+            MAX(ViewCount) FILTER (WHERE PostTypeId = 1) AS MaxQuestionViewCount,
+            SUM(FavoriteCount) FILTER (WHERE PostTypeId =1) AS TotalFavorites,
+            SUM(COALESCE(AnswerCount,0)) FILTER (WHERE PostTypeId =1) AS SumAnswerCounts
+        FROM Posts
+        WHERE OwnerUserId IN (SELECT UserId FROM TopUsers)
+        GROUP BY OwnerUserId
+    ) ups ON ups.OwnerUserId = tu.UserId
+    LEFT JOIN UserPostEditInfo upedit ON upedit.UserId = tu.UserId
+    LEFT JOIN TopUserTags tut ON TRUE
+    GROUP BY tu.UserId, tu.DisplayName, tu.Reputation, tu.GoldBadges, tu.SilverBadges, tu.BronzeBadges,
+        ups.QuestionCount, ups.AnswerCount, ups.AvgPostScore, ups.MaxQuestionViewCount, ups.TotalFavorites,
+        ups.SumAnswerCounts, upedit.LatestEditDate, upedit.Editors
+)
+SELECT 
+    fur.*,
+    (fur.Reputation * 0.5) + 
+    (fur.GoldBadges * 15) + 
+    (fur.SilverBadges * 7) + 
+    (fur.BronzeBadges * 3) + 
+    (COALESCE(fur.QuestionCount,0) * 2) + 
+    (COALESCE(fur.AnswerCount,0) * 3) + 
+    (COALESCE(fur.TotalFavorites,0) * 4) -
+    (
+      EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - fur.LatestEditDate))/86400 * 0.1
+    ) AS UserScore
+FROM FinalUserReport fur
+ORDER BY UserScore DESC, fur.Reputation DESC
+LIMIT 50;

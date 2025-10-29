@@ -1,0 +1,185 @@
+WITH
+  UserPostCounts AS (
+    SELECT
+      OwnerUserId,
+      COUNT(Id) AS PostCount
+    FROM
+      Posts
+    WHERE
+      OwnerUserId IS NOT NULL
+    GROUP BY
+      OwnerUserId
+  ),
+  PostWithTags AS (
+    SELECT
+      p.Id AS PostId,
+      p.Title,
+      p.CreationDate,
+      p.OwnerUserId,
+      p.Score,
+      p.ViewCount,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      p.ClosedDate,
+      pt.Name AS PostTypeName,
+      CASE
+        WHEN p.Tags IS NOT NULL THEN REPLACE(REPLACE(p.Tags, '<', ''), '>', '')
+        ELSE NULL
+      END AS TagsString,
+      CASE
+        WHEN pt.Name = 'Question' THEN COALESCE(p.AnswerCount, 0) + COALESCE(p.CommentCount, 0) + COALESCE(p.FavoriteCount, 0)
+        WHEN pt.Name = 'Answer' THEN COALESCE(p.Score, 0) + COALESCE(p.CommentCount, 0)
+        ELSE COALESCE(p.Score, 0)
+      END AS EngagementMetric,
+      ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserPostRank
+    FROM
+      Posts AS p
+      JOIN PostTypes AS pt ON p.PostTypeId = pt.Id
+  ),
+  TopUsers AS (
+    SELECT
+      upc.OwnerUserId,
+      u.DisplayName,
+      u.Reputation,
+      upc.PostCount,
+      (
+        SELECT
+          SUM(pu.EngagementMetric)
+        FROM
+          PostWithTags AS pu
+        WHERE
+          pu.OwnerUserId = upc.OwnerUserId
+      ) AS TotalEngagement,
+      MAX(pu.CreationDate) AS LastPostDate
+    FROM
+      UserPostCounts AS upc
+      JOIN Users AS u ON upc.OwnerUserId = u.Id
+      JOIN PostWithTags AS pu ON upc.OwnerUserId = pu.OwnerUserId
+    WHERE
+      upc.PostCount > 100
+    GROUP BY
+      upc.OwnerUserId,
+      u.DisplayName,
+      u.Reputation,
+      upc.PostCount
+    HAVING
+      SUM(pu.EngagementMetric) > 10000
+  )
+SELECT
+  twu.DisplayName AS TopUserDisplayName,
+  twu.Reputation AS TopUserReputation,
+  twu.PostCount AS TopUserPostCount,
+  twu.TotalEngagement AS TopUserTotalEngagement,
+  twu.LastPostDate,
+  pwt.PostId,
+  pwt.Title,
+  pwt.PostTypeName,
+  pwt.TagsString,
+  pwt.Score,
+  pwt.ViewCount,
+  pwt.EngagementMetric,
+  CASE
+    WHEN pwt.ClosedDate IS NOT NULL THEN 'Closed'
+    WHEN pwt.FavoriteCount > 50 THEN 'Popular'
+    ELSE 'Active'
+  END AS PostStatus,
+  CASE
+    WHEN pwt.UserPostRank <= 5 THEN 'Early Career'
+    WHEN pwt.UserPostRank <= 20 THEN 'Mid Career'
+    ELSE 'Veteran'
+  END AS UserCareerStage,
+  (
+    SELECT
+      COUNT(*)
+    FROM
+      Comments AS c
+    WHERE
+      c.PostId = pwt.PostId AND c.Score > 5
+  ) AS HighScoreCommentCount,
+  CASE
+    WHEN EXISTS (
+      SELECT
+        1
+      FROM
+        PostLinks AS pl
+      WHERE
+        pl.PostId = pwt.PostId AND pl.LinkTypeId = 3
+    ) THEN 'Linked as Duplicate'
+    ELSE 'Not Linked as Duplicate'
+  END AS DuplicateLinkStatus
+FROM
+  TopUsers AS twu
+  LEFT JOIN PostWithTags AS pwt ON twu.OwnerUserId = pwt.OwnerUserId
+WHERE
+  pwt.EngagementMetric > (
+    SELECT
+      AVG(EngagementMetric)
+    FROM
+      PostWithTags
+    WHERE
+      OwnerUserId = twu.OwnerUserId
+  )
+  AND twu.LastPostDate > (cast('2024-10-01' as date) - INTERVAL '365 days')
+  AND pwt.PostTypeName = 'Question'
+UNION ALL
+SELECT
+  'Community' AS TopUserDisplayName,
+  NULL AS TopUserReputation,
+  COUNT(p.Id) AS TopUserPostCount,
+  SUM(pwt.EngagementMetric) AS TopUserTotalEngagement,
+  MAX(pwt.CreationDate) AS LastPostDate,
+  pwt.PostId,
+  pwt.Title,
+  pwt.PostTypeName,
+  pwt.TagsString,
+  pwt.Score,
+  pwt.ViewCount,
+  pwt.EngagementMetric,
+  CASE
+    WHEN pwt.ClosedDate IS NOT NULL THEN 'Closed'
+    ELSE 'Active'
+  END AS PostStatus,
+  'Community Owned' AS UserCareerStage,
+  (
+    SELECT
+      COUNT(*)
+    FROM
+      Comments AS c
+    WHERE
+      c.PostId = pwt.PostId AND c.Score > 5
+  ) AS HighScoreCommentCount,
+  CASE
+    WHEN EXISTS (
+      SELECT
+        1
+      FROM
+        PostLinks AS pl
+      WHERE
+        pl.PostId = pwt.PostId AND pl.LinkTypeId = 3
+    ) THEN 'Linked as Duplicate'
+    ELSE 'Not Linked as Duplicate'
+  END AS DuplicateLinkStatus
+FROM
+  Posts AS p
+  JOIN PostTypes AS pt ON p.PostTypeId = pt.Id
+  JOIN PostWithTags AS pwt ON p.Id = pwt.PostId
+WHERE
+  p.OwnerUserId = -1
+  AND pt.Name = 'Question'
+  AND pwt.CreationDate > (cast('2024-10-01' as date) - INTERVAL '365 days')
+GROUP BY
+  pwt.PostId,
+  pwt.Title,
+  pwt.PostTypeName,
+  pwt.TagsString,
+  pwt.Score,
+  pwt.ViewCount,
+  pwt.EngagementMetric,
+  pwt.ClosedDate,
+  pwt.FavoriteCount,
+  pwt.UserPostRank
+ORDER BY
+  TopUserReputation DESC,
+  TotalEngagement DESC,
+  LastPostDate DESC;

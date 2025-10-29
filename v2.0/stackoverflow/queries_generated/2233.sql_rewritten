@@ -1,0 +1,178 @@
+-- {"query": "2233.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1652} 
+with RecursiveTagHierarchy as (
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        array[t.TagName] as TagPath,
+        1 as Level
+    from Tags t
+    where t.IsRequired = 1
+    union all
+    select 
+        child.Id,
+        child.TagName,
+        child.Count,
+        parent.TagPath || child.TagName,
+        parent.Level + 1
+    from Tags child
+    join RecursiveTagHierarchy parent on child.Id <> parent.Id and child.Id > parent.Id and char_length(child.TagName) > char_length(parent.TagName)
+    where child.IsRequired = 1
+),
+UserBadgeRank as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        row_number() over (order by u.Reputation desc) as UserRank
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+),
+QuestionAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.Tags,
+        q.OwnerUserId,
+        q.CreationDate as QuestionCreation,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        count(a.Id) as AnswerCount,
+        coalesce(sum(a.Score),0) as TotalAnswerScore,
+        max(a.Score) filter (where a.Score is not null) as MaxAnswerScore,
+        min(a.CreationDate) filter (where a.CreationDate is not null) as FirstAnswerDate
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.Tags, q.OwnerUserId, q.CreationDate, q.Score, q.ViewCount
+),
+TopVotedAnswers as (
+    select 
+        a.Id,
+        a.ParentId as QuestionId,
+        a.Score,
+        a.CreationDate,
+        u.DisplayName as AnswerOwner,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as ScoreRank
+    from Posts a
+    left join Users u on u.Id = a.OwnerUserId
+    where a.PostTypeId = 2
+),
+HighScoreAcceptedAnswers as (
+    select 
+        q.Id as QuestionId,
+        a.Id as AcceptedAnswerId,
+        a.Score as AcceptedAnswerScore,
+        u.DisplayName as AcceptedAnswerOwner,
+        q.Title,
+        q.Tags
+    from Posts q
+    join Posts a on q.AcceptedAnswerId = a.Id
+    left join Users u on u.Id = a.OwnerUserId
+    where q.PostTypeId = 1 and a.Score > (
+        select avg(score)*1.5 from Posts where ParentId = q.Id and PostTypeId = 2
+    )
+),
+RecentClosedQuestionsWithDuplicates as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.ClosedDate,
+        cl.Name as CloseReason,
+        array_agg(distinct dup.RelatedPostId) filter (where lt.Name = 'Duplicate') as DuplicateQuestionIds
+    from Posts q
+    join PostHistory ph on ph.PostId = q.Id and ph.PostHistoryTypeId = 10
+    left join PostLinks dup on dup.PostId = q.Id
+    left join LinkTypes lt on dup.LinkTypeId = lt.Id
+    left join CloseReasonTypes cl on cl.Id::int = ph.Comment::int
+    where q.PostTypeId = 1 and q.ClosedDate is not null and q.CreationDate > (cast('2024-10-01 12:34:56' as timestamp) - interval '6 months')
+    group by q.Id, q.Title, q.CreationDate, q.ClosedDate, cl.Name
+),
+UserActivityWindows as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(p.Id) filter (where p.PostTypeId = 1) as QuestionsCount,
+        count(p.Id) filter (where p.PostTypeId = 2) as AnswersCount,
+        max(p.CreationDate) as LastPostDate,
+        min(p.CreationDate) as FirstPostDate,
+        avg(p.Score) filter (where p.PostTypeId in (1,2)) as AvgPostScore,
+        sum(coalesce(v.UpVotes,0)) - sum(coalesce(v.DownVotes,0)) as NetVotes
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join (
+        select 
+            v.PostId, 
+            sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+            sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes
+        from Votes v
+        join VoteTypes vt on vt.Id = v.VoteTypeId
+        group by v.PostId
+    ) v on v.PostId = p.Id
+    group by u.Id, u.DisplayName
+),
+ComplexStringTagsExplode as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        trim(both '<>' from unnest(string_to_array(q.Tags, '><'))) as Tag
+    from Posts q
+    where q.PostTypeId = 1 and q.Tags is not null
+),
+TagPopularityWithQuestionScore as (
+    select 
+        Tag,
+        count(distinct QuestionId) as QuestionCount,
+        avg(qa.QuestionScore) as AvgQuestionScore,
+        sum(qa.ViewCount) as TotalViews
+    from ComplexStringTagsExplode cte
+    join QuestionAnswerStats qa on qa.QuestionId = cte.QuestionId
+    group by Tag
+    having avg(qa.QuestionScore) > 5
+),
+CombinedUserActivityRank as (
+    select
+        UserId,
+        DisplayName,
+        QuestionsCount,
+        AnswersCount,
+        AvgPostScore,
+        NetVotes,
+        row_number() over (order by QuestionsCount desc, AnswersCount desc, NetVotes desc) as ActivityRank
+    from UserActivityWindows
+)
+
+select
+    qas.QuestionId,
+    qas.Title,
+    qas.AnswerCount,
+    qas.TotalAnswerScore,
+    hca.AcceptedAnswerScore,
+    hca.AcceptedAnswerOwner,
+    ts.Tag,
+    ts.QuestionCount,
+    ts.AvgQuestionScore,
+    ts.TotalViews,
+    ubr.DisplayName as UserWithBadges,
+    ubr.GoldBadges,
+    ubr.SilverBadges,
+    ubr.BronzeBadges,
+    ubr.UserRank,
+    rua.ActivityRank,
+    coalesce(rcq.CloseReason, 'Open') as CloseStatus,
+    rcq.DuplicateQuestionIds
+from QuestionAnswerStats qas
+left join HighScoreAcceptedAnswers hca on hca.QuestionId = qas.QuestionId
+left join ComplexStringTagsExplode cte on cte.QuestionId = qas.QuestionId
+left join TagPopularityWithQuestionScore ts on ts.Tag = cte.Tag
+left join UserBadgeRank ubr on ubr.UserId = qas.OwnerUserId
+left join CombinedUserActivityRank rua on rua.UserId = qas.OwnerUserId
+left join RecentClosedQuestionsWithDuplicates rcq on rcq.QuestionId = qas.QuestionId
+where qas.AnswerCount > 5
+and (hca.AcceptedAnswerScore is null or hca.AcceptedAnswerScore > 10)
+order by ts.TotalViews desc nulls last, qas.AnswerCount desc
+limit 100;

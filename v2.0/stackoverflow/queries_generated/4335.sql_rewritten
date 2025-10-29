@@ -1,0 +1,121 @@
+-- {"query": "4335.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1224} 
+WITH
+  RankedPostEdits AS (
+    SELECT
+      ph.PostId,
+      ph.UserId,
+      ph.UserDisplayName,
+      ph.CreationDate AS EditDate,
+      pht.Name AS EditType,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId, ph.PostHistoryTypeId ORDER BY ph.CreationDate DESC) as rn
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht
+      ON ph.PostHistoryTypeId = pht.Id
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9)
+  ),
+  PostEditStats AS (
+    SELECT
+      re.UserId,
+      re.UserDisplayName,
+      COUNT(DISTINCT re.PostId) AS DistinctPostsEdited,
+      SUM(CASE WHEN re.EditType LIKE '%Edit%' THEN 1 ELSE 0 END) AS TotalEdits,
+      SUM(CASE WHEN re.EditType LIKE '%Rollback%' THEN 1 ELSE 0 END) AS TotalRollbacks,
+      MAX(re.EditDate) AS LastEditActivityDate,
+      AVG(CAST(DATE_PART('day', AGE(re.EditDate, (
+        SELECT
+          MIN(ph2.CreationDate)
+        FROM PostHistory ph2
+        WHERE
+          ph2.PostId = re.PostId AND ph2.PostHistoryTypeId = 2 -- Initial Body
+      )))) AS NUMERIC) AS AvgDaysToFirstEdit
+    FROM RankedPostEdits re
+    GROUP BY
+      re.UserId,
+      re.UserDisplayName
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate AS UserCreationDate,
+      u.Views AS UserViews,
+      COUNT(DISTINCT p.Id) AS PostsCreated,
+      SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsAsked,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersGiven,
+      COUNT(DISTINCT c.Id) AS CommentsMade,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesGiven,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesGiven,
+      COUNT(DISTINCT b.Id) AS BadgesEarned,
+      MAX(p.LastActivityDate) AS LastPostActivity
+    FROM Users u
+    LEFT JOIN Posts p
+      ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c
+      ON u.Id = c.UserId
+    LEFT JOIN Votes v
+      ON u.Id = v.UserId AND v.VoteTypeId IN (2, 3)
+    LEFT JOIN Badges b
+      ON u.Id = b.UserId
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate,
+      u.Views
+  )
+SELECT
+  ua.UserId,
+  ua.DisplayName,
+  ua.Reputation,
+  ua.UserCreationDate,
+  ua.UserViews,
+  ua.PostsCreated,
+  ua.QuestionsAsked,
+  ua.AnswersGiven,
+  ua.CommentsMade,
+  ua.UpvotesGiven,
+  ua.DownvotesGiven,
+  ua.BadgesEarned,
+  ua.LastPostActivity,
+  pes.DistinctPostsEdited,
+  pes.TotalEdits,
+  pes.TotalRollbacks,
+  pes.LastEditActivityDate,
+  pes.AvgDaysToFirstEdit,
+  CASE
+    WHEN ua.Reputation > 100000 THEN 'Legendary'
+    WHEN ua.Reputation > 50000 THEN 'Expert'
+    WHEN ua.Reputation > 10000 THEN 'Experienced'
+    WHEN ua.Reputation > 1000 THEN 'Proficient'
+    WHEN ua.Reputation > 100 THEN 'Novice'
+    ELSE 'Beginner'
+  END AS ReputationTier,
+  COALESCE(CAST(pes.TotalEdits AS VARCHAR), 'No Edits') AS EditStatus,
+  CASE
+    WHEN ua.UserCreationDate < cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '5 year' THEN 'Veteran'
+    WHEN ua.UserCreationDate < cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year' THEN 'Established'
+    WHEN ua.UserCreationDate < cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '3 month' THEN 'Newer'
+    ELSE 'Fresh'
+  END AS MembershipDuration,
+  CASE
+    WHEN pes.AvgDaysToFirstEdit IS NULL THEN -1
+    ELSE ROUND(pes.AvgDaysToFirstEdit, 2)
+  END AS RoundedAvgDaysToFirstEdit
+FROM UserActivity ua
+FULL OUTER JOIN PostEditStats pes
+  ON ua.UserId = pes.UserId
+WHERE
+  (
+    ua.PostsCreated > 10 OR pes.DistinctPostsEdited > 5
+  )
+  AND (
+    ua.DisplayName IS NOT NULL AND ua.DisplayName LIKE '%[^ ]%'
+  )
+  AND ua.UserCreationDate >= '2010-01-01'
+ORDER BY
+  ua.Reputation DESC,
+  ua.UserCreationDate ASC,
+  pes.LastEditActivityDate DESC
+LIMIT 100;

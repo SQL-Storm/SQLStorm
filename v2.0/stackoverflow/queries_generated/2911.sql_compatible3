@@ -1,0 +1,152 @@
+WITH RECURSIVE RecursiveTagPaths AS (
+  SELECT
+    t.Id AS TagId,
+    t.TagName,
+    t.Count,
+    ARRAY[t.TagName] AS AncestorPath,
+    1 AS Depth
+  FROM Tags t
+  WHERE t.IsModeratorOnly = FALSE
+  UNION ALL
+  SELECT
+    c.Id AS TagId,
+    c.TagName,
+    c.Count,
+    r.AncestorPath || c.TagName,
+    r.Depth + 1
+  FROM RecursiveTagPaths r
+  JOIN Tags c ON c.Id = r.Tagid + 1 AND c.IsModeratorOnly = FALSE
+  WHERE r.Depth < 3
+),
+UserBadgeRanks AS (
+  SELECT
+    b.UserId,
+    b.Class,
+    COUNT(*) AS BadgeCount,
+    SUM(CASE WHEN b.TagBased = 1 THEN 1 ELSE 0 END) AS TagBasedBadgeCount
+  FROM Badges b
+  GROUP BY b.UserId, b.Class
+),
+PostScoresWithWindow AS (
+  SELECT
+    p.Id,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    AVG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS MovingAvgScore5,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS RecentPostRank
+  FROM Posts p
+  WHERE p.OwnerUserId IS NOT NULL
+),
+RecentCommentsWithVotes AS (
+  SELECT
+    c.Id AS CommentId,
+    c.PostId,
+    c.UserId,
+    c.CreationDate,
+    c.Text,
+    COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotes,
+    COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVotes
+  FROM Comments c
+  LEFT JOIN Votes v
+    ON v.PostId = c.PostId
+    AND v.UserId = c.UserId
+    AND v.CreationDate > c.CreationDate - INTERVAL '30 day'
+  GROUP BY c.Id, c.PostId, c.UserId, c.CreationDate, c.Text
+),
+QuestionAnswerAggregates AS (
+  SELECT
+    q.Id AS QuestionId,
+    q.Title,
+    q.CreationDate AS QuestionDate,
+    q.Score AS QuestionScore,
+    COUNT(a.Id) FILTER (WHERE a.Score > q.Score) AS AnswersHigherScoreThanQuestion,
+    SUM(a.CommentCount) AS TotalAnswerCommentCount,
+    MAX(a.Score) AS MaxAnswerScore,
+    COUNT(DISTINCT l.RelatedPostId) AS LinkedPostCount,
+    string_agg(DISTINCT concat_ws(':', lt.Name, CAST(l.RelatedPostId AS varchar)), ',' ORDER BY lt.Name) AS LinkTypesAndPosts
+  FROM Posts q
+  LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+  LEFT JOIN PostLinks l ON l.PostId = q.Id
+  LEFT JOIN LinkTypes lt ON lt.Id = l.LinkTypeId
+  WHERE q.PostTypeId = 1
+  GROUP BY q.Id, q.Title, q.CreationDate, q.Score
+),
+UserActivityWithPosts AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreated,
+    COALESCE(pswp.MovingAvgScore5, 0) AS UserRecentAverageScore,
+    COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS TotalQuestions,
+    COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS TotalAnswers,
+    COUNT(DISTINCT b.Id) AS TotalBadges,
+    ub.Class AS BadgeClass,
+    ub.BadgeCount,
+    ub.TagBasedBadgeCount
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN PostScoresWithWindow pswp ON pswp.OwnerUserId = u.Id AND pswp.RecentPostRank = 1
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  LEFT JOIN UserBadgeRanks ub ON ub.UserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, pswp.MovingAvgScore5, ub.Class, ub.BadgeCount, ub.TagBasedBadgeCount
+),
+ClosedQuestionsWithReasons AS (
+  SELECT
+    ph.PostId,
+    crt.Name AS CloseReasonName,
+    COUNT(*) AS CloseVotesCount,
+    MAX(ph.CreationDate) AS LastCloseVoteDate,
+    MIN(ph.UserId) AS FirstCloserUserId
+  FROM PostHistory ph
+  LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS integer)
+  WHERE ph.PostHistoryTypeId = 10
+  GROUP BY ph.PostId, crt.Name
+)
+SELECT 
+  u.UserId,
+  u.DisplayName,
+  u.Reputation,
+  u.UserRecentAverageScore,
+  u.TotalQuestions,
+  u.TotalAnswers,
+  u.TotalBadges,
+  COALESCE(u.BadgeClass, 0) AS BadgeClass,
+  u.BadgeCount,
+  u.TagBasedBadgeCount,
+  q.QuestionId,
+  q.Title,
+  q.QuestionDate,
+  q.QuestionScore,
+  q.AnswersHigherScoreThanQuestion,
+  q.TotalAnswerCommentCount,
+  q.MaxAnswerScore,
+  q.LinkedPostCount,
+  q.LinkTypesAndPosts,
+  cq.CloseReasonName,
+  cq.CloseVotesCount,
+  cq.LastCloseVoteDate,
+  cq.FirstCloserUserId
+FROM UserActivityWithPosts u
+LEFT JOIN QuestionAnswerAggregates q ON q.QuestionId = (
+  SELECT p.Id
+  FROM Posts p
+  WHERE p.OwnerUserId = u.UserId
+    AND p.PostTypeId = 1
+  ORDER BY p.CreationDate DESC
+  LIMIT 1
+)
+LEFT JOIN ClosedQuestionsWithReasons cq ON cq.PostId = q.QuestionId
+WHERE u.Reputation > (
+  SELECT AVG(Reputation) FROM Users WHERE Location IS NOT NULL AND Location <> ''
+)
+AND (u.TotalBadges > 5 OR u.TagBasedBadgeCount > 3)
+AND (
+  (q.AnswersHigherScoreThanQuestion IS NOT NULL AND q.AnswersHigherScoreThanQuestion > 0)
+  OR (q.MaxAnswerScore IS NOT NULL AND q.QuestionScore IS NOT NULL AND q.MaxAnswerScore > q.QuestionScore * 1.5)
+)
+ORDER BY u.Reputation DESC, q.QuestionDate DESC
+LIMIT 100;

@@ -1,0 +1,269 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+        SUM(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ROWS UNBOUNDED PRECEDING) as cumulative_score,
+        CASE 
+            WHEN p.Score > 100 THEN 'High'
+            WHEN p.Score > 50 THEN 'Medium'
+            ELSE 'Low'
+        END as score_category,
+        COALESCE(p.Tags, '') as cleaned_tags,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags LIKE '%<%' THEN STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><')
+            ELSE CAST(ARRAY[] AS VARCHAR[])
+        END as tag_array
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) 
+      AND p.CreationDate >= CAST('2020-01-01' AS timestamp)
+),
+QuestionStats AS (
+    SELECT 
+        q.Id as question_id,
+        q.Title,
+        q.Score,
+        q.ViewCount,
+        q.CreationDate,
+        q.OwnerUserId,
+        COALESCE(q.AnswerCount, 0) as answer_count,
+        COALESCE(q.CommentCount, 0) as comment_count,
+        CASE 
+            WHEN q.AnswerCount IS NULL OR q.AnswerCount = 0 THEN 'No Answers'
+            WHEN q.AnswerCount <= 3 THEN 'Few Answers'
+            WHEN q.AnswerCount <= 10 THEN 'Moderate Answers'
+            ELSE 'Many Answers'
+        END as answer_category,
+        (q.Score * 1.0 / NULLIF(q.ViewCount, 0)) * 1000 as score_per_view_ratio,
+        LTRIM(UPPER(LEFT(q.Title, 1))) as first_letter,
+        LENGTH(q.Title) as title_length,
+        EXISTS(SELECT 1 FROM Comments c WHERE c.PostId = q.Id) as has_comments,
+        q.CommentCount,
+        q.AnswerCount
+    FROM Posts q
+    WHERE q.PostTypeId = 1
+      AND (q.ViewCount IS NOT NULL AND q.ViewCount > 0)
+),
+AnswerStats AS (
+    SELECT 
+        a.Id as answer_id,
+        a.ParentId as question_id,
+        a.OwnerUserId,
+        a.Score,
+        a.CreationDate,
+        a.LastActivityDate,
+        CASE 
+            WHEN a.Score > 50 THEN 'High Quality'
+            WHEN a.Score > 20 THEN 'Medium Quality'
+            ELSE 'Basic Quality'
+        END as quality_level,
+        COALESCE(a.Score, 0) - COALESCE((SELECT AVG(a2.Score) FROM Posts a2 WHERE a2.ParentId = a.ParentId AND a2.PostTypeId = 2), 0) as score_vs_avg,
+        EXTRACT(EPOCH FROM (a.CreationDate - LAG(a.CreationDate) OVER (PARTITION BY a.ParentId ORDER BY a.CreationDate))) / 3600 as hours_since_last_answer
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+),
+UserActivity AS (
+    SELECT 
+        u.Id as user_id,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.CreationDate as user_creation_date,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - u.CreationDate)) / (3600 * 24) as days_since_join,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Expert'
+            WHEN u.Reputation > 1000 THEN 'Advanced'
+            WHEN u.Reputation > 100 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as reputation_level,
+        COALESCE(SUM(p.Score), 0) as total_post_score,
+        COALESCE(COUNT(DISTINCT p.Id), 0) as total_posts_created
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.CreationDate >= CAST('2015-01-01' AS timestamp)
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as tag_count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            ELSE 'Niche'
+        END as popularity_level,
+        COALESCE((SELECT AVG(p.Score) FROM Posts p JOIN LATERAL (
+            SELECT tag
+            FROM UNNEST(ARRAY[]::VARCHAR[]) AS tag  -- placeholder to satisfy syntax; replaced below via join in main query if needed
+        ) u ON p.Tags LIKE '%' || u.tag || '%'), 0) as avg_question_score_by_tag,
+        COUNT(*) OVER () as total_tags
+    FROM Tags t
+),
+PostHistorySummary AS (
+    SELECT 
+        ph.PostId,
+        COUNT(*) as history_count,
+        COUNT(DISTINCT ph.PostHistoryTypeId) as distinct_types,
+        MAX(ph.CreationDate) as last_action_date,
+        STRING_AGG(ph.Comment, ' | ') as action_comments,
+        STRING_AGG(ph.Text, ' | ') as action_texts
+    FROM PostHistory ph
+    WHERE ph.CreationDate >= CAST('2021-01-01' AS timestamp)
+    GROUP BY ph.PostId
+)
+SELECT 
+    -- Main question stats with enriched data
+    qs.question_id,
+    qs.Title,
+    qs.Score,
+    qs.ViewCount,
+    qs.Score / NULLIF(qs.ViewCount, 0) as score_to_view_ratio,
+    qs.answer_category,
+    qs.score_per_view_ratio,
+    
+    -- Author information
+    ua.user_id,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.total_post_score,
+    ua.total_posts_created,
+    
+    -- Post activity metrics
+    ps.history_count,
+    ps.distinct_types,
+    
+    -- Tag analysis
+    ta.TagName,
+    ta.tag_count,
+    ta.popularity_level,
+    
+    -- Answer quality metrics
+    COUNT(DISTINCT asa.answer_id) as total_answers,
+    AVG(asa.Score) as avg_answer_score,
+    MAX(asa.Score) as max_answer_score,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY asa.Score) as median_answer_score,
+    
+    -- Ranking metrics
+    COALESCE(rp.cumulative_score, 0) as user_cumulative_score,
+    CASE 
+        WHEN qs.score_per_view_ratio > 10 THEN 'High Engagement'
+        WHEN qs.score_per_view_ratio > 5 THEN 'Medium Engagement'
+        ELSE 'Low Engagement'
+    END as engagement_level,
+    
+    -- Complex string manipulations
+    CASE 
+        WHEN qs.Title ILIKE '%sql%' THEN 'SQL Related'
+        WHEN qs.Title ILIKE '%python%' THEN 'Python Related'
+        WHEN qs.Title ILIKE '%java%' THEN 'Java Related'
+        ELSE 'Other'
+    END as technology_category,
+    
+    -- Window function based rankings
+    RANK() OVER (ORDER BY qs.Score DESC) as global_score_rank,
+    RANK() OVER (PARTITION BY qs.OwnerUserId ORDER BY qs.Score DESC) as user_score_rank,
+    
+    -- Calculated date differences
+    EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - qs.CreationDate)) / (3600 * 24) as days_since_creation,
+    
+    -- NULL handling combinations
+    COALESCE(qs.CommentCount, 0) + COALESCE(qs.AnswerCount, 0) as engagement_total,
+    
+    -- Multi-table joins and set operations
+    CASE 
+        WHEN qs.has_comments THEN 'Has Comments'
+        WHEN EXISTS(SELECT 1 FROM PostLinks pl WHERE pl.PostId = qs.question_id AND pl.LinkTypeId = 3) THEN 'Is Duplicate'
+        ELSE 'Original Question'
+    END as question_type,
+    
+    -- Correlated subqueries
+    COALESCE((SELECT AVG(s.Score) FROM Posts s WHERE s.OwnerUserId = qs.OwnerUserId), 0) as user_avg_score,
+    
+    -- Conditional aggregations
+    SUM(CASE WHEN asa.Score > 10 THEN 1 ELSE 0 END) as high_value_answers,
+    
+    -- Time series calculations
+    CASE 
+        WHEN EXTRACT(DOW FROM qs.CreationDate) IN (5, 6) THEN 'Weekend'
+        ELSE 'Weekday'
+    END as creation_day_type,
+    
+    -- Complex predicates
+    CASE 
+        WHEN qs.Score > 50 AND qs.ViewCount > 500 AND qs.answer_count > 0 
+            AND qs.score_per_view_ratio > 2 THEN 'High Performing Question'
+        WHEN qs.Score > 20 AND qs.ViewCount > 100 THEN 'Moderate Performing Question'
+        ELSE 'Low Performing Question'
+    END as performance_status,
+    
+    -- String operations and formatting
+    CONCAT(qs.Title, ' - ', ta.TagName) as combined_title_tag,
+    
+    -- Set operations with CTEs
+    CASE 
+        WHEN EXISTS(SELECT 1 FROM PostHistory ph WHERE ph.PostId = qs.question_id AND ph.PostHistoryTypeId IN (10, 11)) THEN 'Has Status Changes'
+        ELSE 'No Status Changes'
+    END as status_change_indicator
+
+FROM QuestionStats qs
+INNER JOIN UserActivity ua ON qs.OwnerUserId = ua.user_id
+LEFT JOIN PostHistorySummary ps ON qs.question_id = ps.PostId
+LEFT JOIN Tags ta ON ta.TagName IN (
+    SELECT tag FROM RankedPosts rp2, UNNEST(rp2.tag_array) AS tag WHERE rp2.Id = qs.question_id
+) AND ta.Count > 10
+LEFT JOIN AnswerStats asa ON qs.question_id = asa.question_id AND asa.Score > 0
+LEFT JOIN RankedPosts rp ON qs.OwnerUserId = rp.OwnerUserId AND rp.rn = 1
+WHERE qs.Score > 0 AND qs.ViewCount > 0
+  AND qs.CommentCount IS NOT NULL
+  AND ta.Count IS NOT NULL
+  AND (ta.popularity_level = 'Popular' OR ta.popularity_level = 'Moderate')
+  AND qs.answer_category IN ('Few Answers', 'Moderate Answers')
+  AND EXISTS(SELECT 1 FROM Posts p WHERE p.Id = qs.question_id AND p.CreationDate > CAST('2020-01-01' AS timestamp))
+  AND ua.Reputation > 100
+  AND EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - qs.CreationDate)) / (3600 * 24) <= 365
+
+GROUP BY 
+    qs.question_id,
+    qs.Title,
+    qs.Score,
+    qs.ViewCount,
+    qs.answer_category,
+    qs.score_per_view_ratio,
+    ua.user_id,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.total_post_score,
+    ua.total_posts_created,
+    ps.history_count,
+    ps.distinct_types,
+    ta.TagName,
+    ta.tag_count,
+    ta.popularity_level,
+    rp.cumulative_score,
+    qs.has_comments,
+    qs.CommentCount,
+    qs.AnswerCount,
+    qs.OwnerUserId,
+    qs.CreationDate
+HAVING 
+    COUNT(DISTINCT asa.answer_id) > 0
+    AND AVG(asa.Score) > 5
+ORDER BY 
+    qs.Score DESC,
+    ta.tag_count DESC,
+    ua.total_post_score DESC
+LIMIT 1000;

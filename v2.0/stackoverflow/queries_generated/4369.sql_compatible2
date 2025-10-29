@@ -1,0 +1,85 @@
+WITH RankedQuestions AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.AnswerCount,
+        ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.CreationDate ASC) AS rn_score,
+        DENSE_RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS dr_user_recent,
+        COUNT(c.Id) OVER (PARTITION BY p.Id) AS comment_count_analytic,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.FavoriteCount > 100 THEN 'Popular'
+            ELSE 'Active'
+        END AS PostStatus
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    WHERE p.PostTypeId = 1
+      AND p.OwnerUserId IS NOT NULL
+    GROUP BY
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.AnswerCount,
+        p.ClosedDate,
+        p.FavoriteCount
+),
+UserPostActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 4 THEN 1 END) AS TitleEdits,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 5 THEN 1 END) AS BodyEdits,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotes,
+        MAX(p.CreationDate) AS LatestPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId AND p.Id = ph.PostId
+    LEFT JOIN Votes v ON u.Id = v.UserId AND p.Id = v.PostId
+    GROUP BY
+        u.Id,
+        u.DisplayName,
+        u.Reputation
+),
+TopUsers AS (
+    SELECT
+        upa.UserId,
+        upa.DisplayName,
+        upa.Reputation,
+        upa.TotalUpVotes,
+        upa.TotalDownVotes,
+        ROW_NUMBER() OVER (ORDER BY upa.Reputation DESC, upa.TotalUpVotes DESC) AS rn_user_rep
+    FROM UserPostActivity upa
+    WHERE upa.Reputation > 5000
+      AND upa.LatestPostDate >= (CAST('2024-10-01' AS date) - INTERVAL '1' YEAR)
+)
+SELECT
+    rq.PostId,
+    rq.Title AS QuestionTitle,
+    rq.PostStatus,
+    rq.Score AS QuestionScore,
+    rq.AnswerCount AS QuestionAnswerCount,
+    rq.comment_count_analytic AS AnalyticCommentCount,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation AS OwnerReputation,
+    COALESCE(tu.TotalUpVotes, 0) AS OwnerTotalUpVotes,
+    COALESCE(tu.TotalDownVotes, 0) AS OwnerTotalDownVotes,
+    CASE
+        WHEN rq.rn_score <= 10 THEN 'Top 10 by Score'
+        WHEN rq.dr_user_recent = 1 THEN 'Most Recent Question by Owner'
+        ELSE 'Other'
+    END AS QuestionCategorization,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = rq.PostId AND pl.LinkTypeId = 3) AS DuplicateLinkCount,
+    (SELECT COUNT(*) FROM Comments c2 WHERE c2.PostId = rq.PostId AND LOWER(c2.Text) LIKE '%interesting%' AND c2.UserId IS NOT NULL) AS InterestingCommentCount
+FROM RankedQuestions rq
+JOIN Users u ON rq.OwnerUserId = u.Id
+LEFT JOIN TopUsers tu ON rq.OwnerUserId = tu.UserId
+WHERE rq.rn_score <= 100 OR rq.dr_user_recent <= 5
+ORDER BY rq.Score DESC, rq.CreationDate ASC
+LIMIT 50;

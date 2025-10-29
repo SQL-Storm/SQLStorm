@@ -1,0 +1,43 @@
+SELECT 
+    u.DisplayName,
+    COUNT(DISTINCT v.PostId) AS TotalVotes,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) AS LastClosedDate,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.CreationDate END) AS LastReopenedDate,
+    STRING_AGG(DISTINCT t.TagName, ', ') AS Tags,
+    ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.CreationDate DESC) AS RecentPost
+FROM 
+    Users u
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    (
+     SELECT 
+         ph.PostId,
+         ph.CreationDate,
+         ph.PostHistoryTypeId,
+         ph.UserId
+     FROM 
+         PostHistory ph
+     WHERE 
+         ph.PostHistoryTypeId IN (10, 11, 12, 13)
+    ) ph ON u.Id = ph.UserId
+LEFT JOIN 
+    Posts p ON ph.PostId = p.Id
+LEFT JOIN 
+    Tags t ON p.Id = t.ExcerptPostId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+WHERE 
+    u.Reputation > 100
+    AND p.PostTypeId = 1
+    AND p.ViewCount > 100
+GROUP BY 
+    u.Id, u.DisplayName, p.CreationDate
+HAVING 
+    COUNT(DISTINCT v.PostId) > 5
+ORDER BY 
+    TotalVotes DESC, 
+    RecentPost ASC
+LIMIT 100;

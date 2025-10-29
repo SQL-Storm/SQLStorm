@@ -1,0 +1,239 @@
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT ph.Id) AS TotalHistoryEntries,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        SUM(p.Score) AS TotalPostScore,
+        SUM(c.Score) AS TotalCommentScore,
+        MAX(u.LastAccessDate) AS LastSeen,
+        MIN(u.CreationDate) AS UserCreationDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+PostMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.Tags,
+        LENGTH(p.Body) AS BodyLength,
+        COUNT(DISTINCT c.Id) AS CommentCountForPost,
+        AVG(c.Score) AS AvgCommentScoreForPost,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesForPost,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesForPost,
+        SUM(CASE WHEN v.VoteTypeId = 1 THEN 1 ELSE 0 END) AS AcceptedVotesForPost,
+        p.ParentId
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    GROUP BY p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.FavoriteCount, p.Tags, LENGTH(p.Body), p.ParentId
+),
+BadgeSummary AS (
+    SELECT
+        b.UserId,
+        COUNT(b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(DISTINCT b.Name) AS UniqueBadgeNames
+    FROM Badges b
+    GROUP BY b.UserId
+),
+PostClosingAnalysis AS (
+    SELECT
+        ph.PostId,
+        ph.UserId AS CloserUserId,
+        ph.CreationDate AS CloseDate,
+        cr.Name AS CloseReason,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn_latest_close
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes cr ON ph.Comment = CAST(cr.Id AS VARCHAR)
+    WHERE ph.PostHistoryTypeId = 10
+),
+AggregatedTagMetrics AS (
+    SELECT
+        OwnerUserId,
+        TagName,
+        TaggedPostCount
+    FROM (
+        SELECT
+            p.OwnerUserId,
+            tag AS TagName,
+            COUNT(p.Id) AS TaggedPostCount,
+            ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY COUNT(p.Id) DESC, tag ASC) as rn
+        FROM Posts p,
+        LATERAL (
+            SELECT unnest(string_to_array(substr(p.Tags, 2, length(p.Tags)-2), '><')) AS tag
+        ) t
+        WHERE p.Tags IS NOT NULL AND p.Tags <> '' AND p.OwnerUserId IS NOT NULL
+        GROUP BY p.OwnerUserId, tag
+    ) AS TagRanked
+    WHERE rn = 1
+),
+UserRankedPosts AS (
+    SELECT
+        pm.PostId,
+        pm.OwnerUserId,
+        pm.PostCreationDate,
+        pm.PostScore,
+        pm.ViewCount,
+        pm.AnswerCount,
+        ROW_NUMBER() OVER (PARTITION BY pm.OwnerUserId ORDER BY pm.PostScore DESC, pm.PostCreationDate DESC) AS rn
+    FROM PostMetrics pm
+),
+UserPostLinkSummary AS (
+    SELECT
+        p.OwnerUserId AS InitiatingUserId,
+        SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicateLinksInitiated,
+        SUM(CASE WHEN pl.LinkTypeId = 1 THEN 1 ELSE 0 END) AS LinkedPostsInitiated
+    FROM PostLinks pl
+    JOIN Posts p ON pl.PostId = p.Id
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+)
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.TotalPosts,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.TotalPostScore,
+    COALESCE(bs.TotalBadges, 0) AS TotalBadges,
+    COALESCE(bs.GoldBadges, 0) AS GoldBadges,
+    COALESCE(bs.SilverBadges, 0) AS SilverBadges,
+    ROUND(CAST(ua.TotalPostScore AS NUMERIC) / NULLIF(ua.TotalPosts, 0), 2) AS AvgPostScorePerUser,
+    NTILE(5) OVER (ORDER BY ua.Reputation DESC) AS ReputationQuintile,
+    ur.PostId AS TopUserPostId,
+    ur.PostCreationDate AS TopUserPostDate,
+    ur.PostScore AS TopUserPostScore,
+    ur.ViewCount AS TopUserPostViews,
+    ur.AnswerCount AS TopUserPostAnswers,
+    COALESCE(atm.TagName, 'NoTags') AS MostPopularTagWritten,
+    COALESCE(atm.TaggedPostCount, 0) AS MostPopularTagPostCount,
+    EXISTS (
+        SELECT 1
+        FROM PostMetrics pm_inner
+        WHERE pm_inner.OwnerUserId = ua.UserId
+        AND pm_inner.PostTypeId = 2
+        AND pm_inner.ParentId IN (
+            SELECT p_q.Id
+            FROM Posts p_q
+            WHERE p_q.PostTypeId = 1
+            AND p_q.ViewCount > (SELECT AVG(ViewCount) * 1.5 FROM Posts WHERE PostTypeId = 1 AND ViewCount IS NOT NULL)
+            LIMIT 50
+        )
+    ) AS AnswersPopularQuestions,
+    (SELECT AVG(Reputation) FROM Users WHERE CreationDate < ua.UserCreationDate AND CreationDate > DATE '2010-01-01') AS AvgReputationAtUserCreationTime,
+    CASE
+        WHEN ua.Reputation > 10000 AND COALESCE(bs.GoldBadges, 0) >= 5 THEN 'Elite User'
+        WHEN ua.Reputation > 1000 AND COALESCE(bs.SilverBadges, 0) >= 10 THEN 'Experienced Contributor'
+        WHEN ua.Reputation > 100 THEN 'Active Member'
+        ELSE 'Novice'
+    END AS UserTier,
+    DENSE_RANK() OVER (ORDER BY ua.TotalPosts DESC, ua.TotalPostScore DESC) AS UserActivityRank,
+    (UPPER(SUBSTR(COALESCE(u.Location, 'Unknown Location'), 1, 10)) || '...' || LOWER(RIGHT(COALESCE(u.Location, 'Unknown Location'), 5))) AS LocationSnippet,
+    MAX(CASE WHEN pca.CloseReason LIKE '%Duplicate%' THEN 1 ELSE 0 END) OVER (PARTITION BY ua.UserId) AS HasClosedDuplicatePost,
+    COALESCE(upls.DuplicateLinksInitiated, 0) AS DuplicateLinksInitiated,
+    COALESCE(upls.LinkedPostsInitiated, 0) AS LinkedPostsInitiated,
+    'High Activity & Gold Badges' AS UserCategoryDescription
+FROM UserActivity ua
+INNER JOIN Users u ON ua.UserId = u.Id
+LEFT JOIN BadgeSummary bs ON ua.UserId = bs.UserId
+LEFT JOIN UserRankedPosts ur ON ua.UserId = ur.OwnerUserId AND ur.rn = 1
+LEFT JOIN AggregatedTagMetrics atm ON ua.UserId = atm.OwnerUserId
+LEFT JOIN PostClosingAnalysis pca ON ua.UserId = pca.CloserUserId
+LEFT JOIN UserPostLinkSummary upls ON ua.UserId = upls.InitiatingUserId
+WHERE
+    ua.TotalPosts > 10
+    AND ua.Reputation > 5000
+    AND COALESCE(bs.GoldBadges, 0) >= 1
+    AND (
+        u.Location IS NOT NULL
+        AND (u.Location LIKE '%City%' OR u.Location LIKE '%State%' OR u.Location LIKE '%Country%' OR u.Location LIKE '%Area%')
+        AND u.CreationDate >= DATE '2015-01-01'
+    )
+    AND EXISTS (SELECT 1 FROM Posts p_check WHERE p_check.OwnerUserId = ua.UserId AND p_check.ViewCount > 1000)
+
+UNION ALL
+
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.TotalPosts,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.TotalPostScore,
+    COALESCE(bs.TotalBadges, 0) AS TotalBadges,
+    COALESCE(bs.GoldBadges, 0) AS GoldBadges,
+    COALESCE(bs.SilverBadges, 0) AS SilverBadges,
+    ROUND(CAST(ua.TotalPostScore AS NUMERIC) / NULLIF(ua.TotalPosts, 0), 2) AS AvgPostScorePerUser,
+    NTILE(5) OVER (ORDER BY ua.Reputation DESC) AS ReputationQuintile,
+    ur.PostId AS TopUserPostId,
+    ur.PostCreationDate AS TopUserPostDate,
+    ur.PostScore AS TopUserPostScore,
+    ur.ViewCount AS TopUserPostViews,
+    ur.AnswerCount AS TopUserPostAnswers,
+    COALESCE(atm.TagName, 'NoTags') AS MostPopularTagWritten,
+    COALESCE(atm.TaggedPostCount, 0) AS MostPopularTagPostCount,
+    EXISTS (
+        SELECT 1
+        FROM PostMetrics pm_inner
+        WHERE pm_inner.OwnerUserId = ua.UserId
+        AND pm_inner.PostTypeId = 2
+        AND pm_inner.ParentId IN (
+            SELECT p_q.Id
+            FROM Posts p_q
+            WHERE p_q.PostTypeId = 1
+            AND p_q.ViewCount > (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = 1 AND ViewCount IS NOT NULL)
+            LIMIT 50
+        )
+    ) AS AnswersPopularQuestions,
+    (SELECT AVG(Reputation) FROM Users WHERE CreationDate < ua.UserCreationDate AND CreationDate > DATE '2010-01-01') AS AvgReputationAtUserCreationTime,
+    CASE
+        WHEN ua.Reputation > 10000 AND COALESCE(bs.GoldBadges, 0) >= 5 THEN 'Elite User'
+        WHEN ua.Reputation > 1000 AND COALESCE(bs.SilverBadges, 0) >= 10 THEN 'Experienced Contributor'
+        WHEN ua.Reputation > 100 THEN 'Active Member'
+        ELSE 'Novice'
+    END AS UserTier,
+    DENSE_RANK() OVER (ORDER BY ua.TotalPosts DESC, ua.TotalPostScore DESC) AS UserActivityRank,
+    (UPPER(SUBSTR(COALESCE(u.Location, 'Unknown Location'), 1, 10)) || '...' || LOWER(RIGHT(COALESCE(u.Location, 'Unknown Location'), 5))) AS LocationSnippet,
+    MAX(CASE WHEN pca.CloseReason LIKE '%Duplicate%' THEN 1 ELSE 0 END) OVER (PARTITION BY ua.UserId) AS HasClosedDuplicatePost,
+    COALESCE(upls.DuplicateLinksInitiated, 0) AS DuplicateLinksInitiated,
+    COALESCE(upls.LinkedPostsInitiated, 0) AS LinkedPostsInitiated,
+    'Medium Activity & No Gold Badges' AS UserCategoryDescription
+FROM UserActivity ua
+INNER JOIN Users u ON ua.UserId = u.Id
+LEFT JOIN BadgeSummary bs ON ua.UserId = bs.UserId
+LEFT JOIN UserRankedPosts ur ON ua.UserId = ur.OwnerUserId AND ur.rn = 1
+LEFT JOIN AggregatedTagMetrics atm ON ua.UserId = atm.OwnerUserId
+LEFT JOIN PostClosingAnalysis pca ON ua.UserId = pca.CloserUserId
+LEFT JOIN UserPostLinkSummary upls ON ua.UserId = upls.InitiatingUserId
+WHERE
+    ua.TotalPosts BETWEEN 5 AND 50
+    AND ua.Reputation BETWEEN 100 AND 5000
+    AND COALESCE(bs.GoldBadges, 0) = 0
+    AND COALESCE(bs.SilverBadges, 0) >= 2
+    AND (
+        u.Location IS NOT NULL
+        AND NOT (u.Location ILIKE '%Unknown%' OR u.Location ILIKE '%N/A%')
+        AND u.LastAccessDate >= DATE '2022-01-01'
+    )
+    AND EXISTS (SELECT 1 FROM Comments c_check WHERE c_check.UserId = ua.UserId AND LENGTH(c_check.Text) > 50)
+ORDER BY
+    Reputation DESC, TotalPosts DESC
+LIMIT 2000 OFFSET 200;

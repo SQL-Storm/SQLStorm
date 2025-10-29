@@ -1,0 +1,211 @@
+-- {"query": "1450.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2798} 
+
+WITH UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COALESCE(u.DisplayName, 'Anonymous') AS UserDisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersCount,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostScore,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL AND p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsWithAcceptedAnswers,
+        SUM(CASE WHEN p_ans.AcceptedAnswerId = p.Id THEN 1 ELSE 0 END) AS AcceptedAnswersGiven,
+        (SELECT MAX(ch.CreationDate) FROM Comments ch WHERE ch.UserId = u.Id AND ch.Score > 0) AS LatestPositiveCommentDate,
+        AVG(CAST(COALESCE(p.ViewCount, 0) AS NUMERIC)) AS AvgPostViewCount,
+        SUM(CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN 1 ELSE 0 END) AS CommunityOwnedPostsCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Posts p_ans ON p_ans.AcceptedAnswerId = p.Id AND p.OwnerUserId = u.Id AND p_ans.PostTypeId = 1
+    GROUP BY u.Id, u.Reputation, u.CreationDate, u.DisplayName, u.LastAccessDate
+    HAVING COUNT(DISTINCT p.Id) > 5
+),
+PostEngagementMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        LENGTH(COALESCE(p.Body, '')) AS BodyLength,
+        COALESCE(p.Title, 'No Title') AS PostTitle,
+        COALESCE(p.Tags, 'No Tags') AS PostTags,
+        p.OwnerUserId,
+        CAST(COALESCE(p.Score, 0) AS NUMERIC) / NULLIF(COALESCE(p.ViewCount, 0), 0) AS ScorePerViewRatio,
+        (SELECT MAX(c.Score) FROM Comments c WHERE c.PostId = p.Id) AS MaxCommentScore,
+        (COALESCE(p.Score, 0) * 10 + COALESCE(p.ViewCount, 0) / 100 + COALESCE(p.FavoriteCount, 0) * 50 + COALESCE(p.AnswerCount, 0) * 20) AS EngagementIndex
+    FROM Posts p
+    WHERE p.CreationDate >= '2020-01-01'
+),
+PostHistoryTrend AS (
+    SELECT
+        ph.PostId,
+        ph.CreationDate AS HistoryDate,
+        ph.PostHistoryTypeId,
+        ph.UserId AS EditorUserId,
+        ph.Comment AS HistoryComment,
+        LEAD(ph.CreationDate, 1, '9999-12-31 23:59:59'::timestamp) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS NextHistoryDate,
+        LAG(ph.CreationDate, 1, '1900-01-01 00:00:00'::timestamp) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS PrevHistoryDate,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn_latest_history,
+        NTILE(4) OVER (ORDER BY ph.CreationDate) AS CreationDateQuartile,
+        CASE
+            WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 'Edit'
+            WHEN ph.PostHistoryTypeId IN (10, 12) THEN 'Moderation'
+            WHEN ph.PostHistoryTypeId IN (1, 2, 3) THEN 'Initial'
+            ELSE 'Other'
+        END AS HistoryCategory,
+        NULLIF(ph.Comment, '') AS NonEmptyHistoryComment
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (1,2,3,4,5,6,10,11,12,13)
+),
+ModerationSummary AS (
+    SELECT
+        ph.PostId,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN 'Closed' ELSE 'Open' END) AS CurrentCloseStatus,
+        MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId = 10) AS LastClosedDate,
+        CR.Name AS CloseReasonName
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes CR ON ph.Comment = CAST(CR.Id AS VARCHAR) AND ph.PostHistoryTypeId = 10
+    WHERE ph.PostHistoryTypeId IN (10, 11)
+    GROUP BY ph.PostId, CR.Name
+)
+SELECT
+    uas.UserId,
+    uas.UserDisplayName,
+    uas.Reputation,
+    uas.TotalPosts,
+    uas.QuestionsCount,
+    uas.AnswersCount,
+    pe.PostId,
+    pe.PostTitle,
+    pe.PostTypeId,
+    pt.Name AS PostTypeName,
+    pe.Score AS PostScore,
+    pe.ViewCount AS PostViewCount,
+    pe.FavoriteCount AS PostFavoriteCount,
+    pe.AnswerCount AS PostAnswerCount,
+    pe.EngagementIndex,
+    pe.BodyLength,
+    pe.ScorePerViewRatio,
+    pe.MaxCommentScore,
+    EXTRACT(EPOCH FROM (uas.LastAccessDate - uas.UserCreationDate)) / 86400 AS UserAgeDays,
+    COALESCE(EXTRACT(EPOCH FROM (pe.PostCreationDate - uas.UserCreationDate)) / 86400, 0) AS DaysSinceUserCreatedPost,
+    ph.HistoryCategory AS LatestPostHistoryCategory,
+    ph.NonEmptyHistoryComment AS LatestHistoryComment,
+    ph.PrevHistoryDate AS PreviousEditDate,
+    EXTRACT(HOUR FROM (ph.HistoryDate - ph.PrevHistoryDate)) AS HoursSincePrevEdit,
+    ms.CurrentCloseStatus,
+    COALESCE(ms.CloseReasonName, 'N/A') AS PostCloseReason,
+    SPLIT_PART(pe.PostTags, '>', 2) AS FirstTagInPost,
+    CASE
+        WHEN uas.Reputation > 10000 AND uas.TotalBadges >= 100 THEN 'Legendary Contributor'
+        WHEN uas.Reputation > 5000 AND uas.TotalPosts > 50 THEN 'Highly Influential'
+        WHEN uas.TotalPosts > 10 AND pe.EngagementIndex > 500 THEN 'Engaged Poster'
+        ELSE 'Casual User'
+    END AS UserInfluenceCategory,
+    AVG(pe.Score) OVER (PARTITION BY uas.UserId ORDER BY pe.PostCreationDate) AS RunningAvgUserPostScore,
+    ROW_NUMBER() OVER (PARTITION BY uas.UserId ORDER BY pe.EngagementIndex DESC) AS UserPostEngagementRank,
+    SUM(CASE WHEN uas.LatestPositiveCommentDate IS NOT NULL AND pe.PostCreationDate > uas.LatestPositiveCommentDate THEN 1 ELSE 0 END) OVER (PARTITION BY uas.UserId) AS PostsAfterPositiveComment
+FROM UserActivitySummary uas
+INNER JOIN Posts main_p ON uas.UserId = main_p.OwnerUserId
+INNER JOIN PostEngagementMetrics pe ON main_p.Id = pe.PostId
+INNER JOIN PostTypes pt ON pe.PostTypeId = pt.Id
+LEFT JOIN (SELECT PostId, HistoryCategory, NonEmptyHistoryComment, PrevHistoryDate, HistoryDate, CreationDateQuartile FROM PostHistoryTrend WHERE rn_latest_history = 1) ph ON pe.PostId = ph.PostId
+LEFT JOIN ModerationSummary ms ON pe.PostId = ms.PostId
+WHERE
+    uas.Reputation > 500
+    AND pe.EngagementIndex > 100
+    AND pe.PostCreationDate BETWEEN uas.UserCreationDate AND uas.LastAccessDate
+    AND (
+        pe.PostTitle LIKE '%SQL%'
+        OR pe.PostTags LIKE '%<database>%'
+        OR pe.BodyLength > 500
+    )
+    AND NOT (pe.PostTypeId = 1 AND COALESCE(pe.AnswerCount, 0) = 0 AND COALESCE(pe.PostScore, 0) < 0)
+    AND ms.CurrentCloseStatus IS DISTINCT FROM 'Closed'
+GROUP BY
+    uas.UserId,
+    uas.UserDisplayName,
+    uas.Reputation,
+    uas.TotalPosts,
+    uas.QuestionsCount,
+    uas.AnswersCount,
+    pe.PostId,
+    pe.PostTitle,
+    pe.PostTypeId,
+    pt.Name,
+    pe.Score,
+    pe.ViewCount,
+    pe.FavoriteCount,
+    pe.AnswerCount,
+    pe.EngagementIndex,
+    pe.BodyLength,
+    pe.ScorePerViewRatio,
+    pe.MaxCommentScore,
+    uas.UserCreationDate,
+    uas.LastAccessDate,
+    pe.PostCreationDate,
+    ph.HistoryCategory,
+    ph.NonEmptyHistoryComment,
+    ph.PrevHistoryDate,
+    ph.HistoryDate,
+    ms.CurrentCloseStatus,
+    ms.CloseReasonName,
+    pe.PostTags,
+    uas.TotalBadges,
+    uas.LatestPositiveCommentDate
+HAVING
+    COUNT(DISTINCT ph.HistoryCategory) > 1
+    AND MAX(ph.CreationDateQuartile) = 4
+ORDER BY
+    uas.Reputation DESC,
+    pe.EngagementIndex DESC,
+    HoursSincePrevEdit ASC
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    u.Id AS UserId,
+    u.DisplayName AS UserDisplayName,
+    u.Reputation,
+    NULL::BIGINT AS TotalPosts,
+    NULL::INTEGER AS QuestionsCount,
+    NULL::INTEGER AS AnswersCount,
+    NULL::INTEGER AS PostId,
+    NULL::VARCHAR(300) AS PostTitle,
+    NULL::SMALLINT AS PostTypeId,
+    NULL::VARCHAR(50) AS PostTypeName,
+    NULL::INTEGER AS PostScore,
+    NULL::INTEGER AS PostViewCount,
+    NULL::INTEGER AS PostFavoriteCount,
+    NULL::INTEGER AS PostAnswerCount,
+    NULL::NUMERIC AS EngagementIndex,
+    NULL::INTEGER AS BodyLength,
+    NULL::NUMERIC AS ScorePerViewRatio,
+    NULL::INTEGER AS MaxCommentScore,
+    NULL::NUMERIC AS UserAgeDays,
+    NULL::NUMERIC AS DaysSinceUserCreatedPost,
+    NULL::VARCHAR(50) AS LatestPostHistoryCategory,
+    NULL::VARCHAR(400) AS LatestHistoryComment,
+    NULL::TIMESTAMP AS PreviousEditDate,
+    NULL::INTEGER AS HoursSincePrevEdit,
+    NULL::VARCHAR(6) AS CurrentCloseStatus,
+    NULL::VARCHAR(50) AS PostCloseReason,
+    NULL::VARCHAR(4000) AS FirstTagInPost,
+    'High Volume Voter Stats' AS UserInfluenceCategory,
+    NULL::NUMERIC AS RunningAvgUserPostScore,
+    NULL::BIGINT AS UserPostEngagementRank,
+    NULL::INTEGER AS PostsAfterPositiveComment
+FROM Users u
+WHERE u.DownVotes > 1000 AND u.UpVotes > 5000
+ORDER BY u.UpVotes DESC, u.DownVotes DESC
+LIMIT 50;

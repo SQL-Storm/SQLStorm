@@ -1,0 +1,219 @@
+WITH UserMetrics AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS UserUpVotesGiven,
+        U.DownVotes AS UserDownVotesGiven,
+        U.Location,
+        COUNT(DISTINCT P_All.Id) AS TotalUserPosts,
+        SUM(CASE WHEN P_All.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P_All.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(COALESCE(P_All.Score, 0)) AS TotalPostScoreSum,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COALESCE(CAST(U.UpVotes AS NUMERIC) / NULLIF(U.DownVotes, 0), 0.0) AS UpToDownVoteRatio,
+        DATE_PART('day', U.LastAccessDate - U.CreationDate) AS DaysActive,
+        (SELECT COUNT(DISTINCT V.PostId) FROM Votes V WHERE V.UserId = U.Id AND V.VoteTypeId = 2) AS UserUpVotedPosts,
+        (SELECT COUNT(DISTINCT V.PostId) FROM Votes V WHERE V.UserId = U.Id AND V.VoteTypeId = 3) AS UserDownVotedPosts
+    FROM Users U
+    LEFT JOIN Posts P_All ON U.Id = P_All.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Views, U.UpVotes, U.DownVotes, U.Location
+),
+PostDetailedStats AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.LastEditDate,
+        P.LastActivityDate,
+        P.Title,
+        P.Tags,
+        P.ParentId,
+        P.AcceptedAnswerId,
+        COALESCE(P.ClosedDate, TIMESTAMP '9999-12-31') AS ClosedDateEffective,
+        (CAST(COALESCE(P.Score, 0) AS NUMERIC) * 0.7 +
+         CAST(COALESCE(P.ViewCount, 0) AS NUMERIC) * 0.02 +
+         CAST(COALESCE(P.AnswerCount, 0) AS NUMERIC) * 0.9 +
+         CAST(COALESCE(P.CommentCount, 0) AS NUMERIC) * 0.4 +
+         CAST(COALESCE(P.FavoriteCount, 0) AS NUMERIC) * 1.5) AS PostEngagementScore,
+        (P.Body ILIKE '%<pre><code>%') AS ContainsCodeSnippet,
+        LENGTH(P.Body) AS BodyLength,
+        CHAR_LENGTH(REPLACE(REPLACE(P.Body, ' ', ''), E'\n', '')) AS BodyCharCountNoWhitespace,
+        (SELECT U_LE.Reputation FROM Users U_LE WHERE U_LE.Id = P.LastEditorUserId) AS LastEditorReputation,
+        RANK() OVER (ORDER BY (CAST(COALESCE(P.Score, 0) AS NUMERIC) * 0.7 + CAST(COALESCE(P.ViewCount, 0) AS NUMERIC) * 0.02 + CAST(COALESCE(P.AnswerCount, 0) AS NUMERIC) * 0.9 + CAST(COALESCE(P.CommentCount, 0) AS NUMERIC) * 0.4 + CAST(COALESCE(P.FavoriteCount, 0) AS NUMERIC) * 1.5) DESC) AS GlobalEngagementRank,
+        AVG(P.Score) OVER (PARTITION BY P.OwnerUserId) AS OwnerAvgPostScore,
+        (SELECT T.TagName FROM Tags T JOIN Posts P_WIKI ON T.WikiPostId = P_WIKI.Id WHERE P_WIKI.Id = P.Id LIMIT 1) AS TagWikiName
+    FROM Posts P
+    WHERE P.OwnerUserId IS NOT NULL
+    AND P.PostTypeId IN (1, 2, 4, 5)
+),
+PostHistoryAggregates AS (
+    SELECT
+        PH.PostId,
+        COUNT(DISTINCT PH.Id) AS TotalHistoryEvents,
+        COUNT(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE NULL END) AS EditCount,
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE NULL END) AS CloseVoteCount,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.CreationDate ELSE NULL END) AS LastEditDateFromHistory,
+        MIN(PH.CreationDate) AS FirstHistoryEventDate,
+        MAX(PH.CreationDate) AS LastHistoryEventDate,
+        EXTRACT(EPOCH FROM (MAX(PH.CreationDate) - MIN(PH.CreationDate))) AS PostLifespanSeconds
+    FROM PostHistory PH
+    WHERE PH.PostHistoryTypeId IS NOT NULL
+    GROUP BY PH.PostId
+),
+LinkedPostAnalysis AS (
+    SELECT
+        P.Id AS PostId,
+        COUNT(DISTINCT PL.RelatedPostId) AS TotalRelatedPostsCount,
+        SUM(CASE WHEN PL.LinkTypeId = 1 THEN 1 ELSE 0 END) AS LinkedFromOtherPosts,
+        SUM(CASE WHEN PL.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicateOfOtherPosts,
+        -- Use array_agg distinct where supported; fallback to string aggregation could be used per dialect
+        ARRAY_AGG(DISTINCT RelatedP.PostTypeId) AS RelatedPostTypesArray
+    FROM Posts P
+    LEFT JOIN PostLinks PL ON P.Id = PL.PostId
+    LEFT JOIN Posts RelatedP ON PL.RelatedPostId = RelatedP.Id
+    GROUP BY P.Id
+),
+UserTopTag AS (
+    SELECT
+        OwnerUserId,
+        TagName,
+        TagPostCount,
+        ROW_NUMBER() OVER (PARTITION BY OwnerUserId ORDER BY TagPostCount DESC, TagName ASC) AS rn
+    FROM (
+        SELECT
+            P.OwnerUserId,
+            TRIM(tag) AS TagName,
+            COUNT(*) AS TagPostCount
+        FROM Posts P,
+        LATERAL (
+            SELECT regexp_split_to_table(
+                SUBSTRING(P.Tags FROM 2 FOR CHAR_LENGTH(P.Tags)-2),
+                '><'
+            ) AS tag
+        ) AS s
+        WHERE P.Tags IS NOT NULL AND P.OwnerUserId IS NOT NULL
+        GROUP BY P.OwnerUserId, TRIM(tag)
+    ) AS UserTagCounts
+    WHERE OwnerUserId IS NOT NULL
+),
+TopTagsByScore AS (
+    SELECT
+        TagName,
+        AVG(PostScore) AS AvgTagScore,
+        SUM(ViewCount) AS TotalTagViews,
+        COUNT(DISTINCT PostId) AS UniquePostsWithTag,
+        ROW_NUMBER() OVER (ORDER BY AVG(PostScore) DESC, SUM(ViewCount) DESC) AS TagScoreRank
+    FROM (
+        SELECT
+            P.Id AS PostId,
+            P.Score AS PostScore,
+            P.ViewCount,
+            TRIM(tag) AS TagName
+        FROM Posts P,
+        LATERAL (
+            SELECT regexp_split_to_table(
+                SUBSTRING(P.Tags FROM 2 FOR CHAR_LENGTH(P.Tags)-2),
+                '><'
+            ) AS tag
+        ) AS s
+        WHERE P.Tags IS NOT NULL AND P.PostTypeId IN (1,2)
+    ) AS PostTags
+    GROUP BY TagName
+    HAVING COUNT(DISTINCT PostId) > 50
+),
+HighlyEngagedPosts AS (
+    SELECT
+        PostId,
+        OwnerUserId,
+        PostCreationDate,
+        Title,
+        PostEngagementScore,
+        'Question' AS PostCategory
+    FROM PostDetailedStats
+    WHERE PostTypeId = 1
+    AND GlobalEngagementRank <= 100
+    UNION ALL
+    SELECT
+        PostId,
+        OwnerUserId,
+        PostCreationDate,
+        Title,
+        PostEngagementScore,
+        'Answer' AS PostCategory
+    FROM PostDetailedStats
+    WHERE PostTypeId = 2
+    AND GlobalEngagementRank <= 100
+)
+SELECT
+    UM.UserId,
+    UM.DisplayName,
+    UM.Reputation,
+    UM.UserCreationDate,
+    UM.TotalQuestions,
+    UM.TotalAnswers,
+    UM.TotalComments,
+    UM.GoldBadges,
+    UM.SilverBadges,
+    UM.BronzeBadges,
+    UM.UpToDownVoteRatio,
+    UM.DaysActive,
+    UM.UserUpVotedPosts,
+    UM.UserDownVotedPosts,
+    PDS.PostId AS TopEngagedPostId,
+    PDS.PostTypeId AS TopEngagedPostType,
+    PDS.Title AS TopEngagedPostTitle,
+    PDS.PostScore AS TopEngagedPostScore,
+    PDS.ViewCount AS TopEngagedPostViewCount,
+    PDS.PostEngagementScore AS TopEngagedPostEngagementScore,
+    PDS.GlobalEngagementRank,
+    PDS.ContainsCodeSnippet,
+    PDS.BodyCharCountNoWhitespace,
+    PDS.LastEditorReputation,
+    PHA.EditCount AS TopEngagedPostEditCount,
+    PHA.CloseVoteCount AS TopEngagedPostCloseVotes,
+    PHA.PostLifespanSeconds AS TopEngagedPostLifespanSeconds,
+    LPA.TotalRelatedPostsCount AS TopEngagedPostRelatedCount,
+    LPA.DuplicateOfOtherPosts AS TopEngagedPostDuplicateCount,
+    LPA.RelatedPostTypesArray AS TopEngagedPostRelatedTypes,
+    UTT.TagName AS UsersTopTag,
+    TTS.AvgTagScore AS UsersTopTagAvgScore,
+    TTS.TotalTagViews AS UsersTopTagTotalViews,
+    HE.PostCategory AS HighlyEngagedCategory,
+    COALESCE(
+        UM.Reputation * 0.1 + PDS.PostEngagementScore * 0.5 + (PHA.EditCount / NULLIF(PHA.TotalHistoryEvents, 0)) * 100,
+        0
+    ) AS UserPostOverallMetric,
+    COALESCE(SUBSTRING(PDS.Title FROM 1 FOR 50), 'N/A') AS TitleExcerpt
+FROM UserMetrics UM
+LEFT JOIN PostDetailedStats PDS ON UM.UserId = PDS.OwnerUserId
+    AND PDS.GlobalEngagementRank = 1
+LEFT JOIN PostHistoryAggregates PHA ON PDS.PostId = PHA.PostId
+LEFT JOIN LinkedPostAnalysis LPA ON PDS.PostId = LPA.PostId
+LEFT JOIN UserTopTag UTT ON UM.UserId = UTT.OwnerUserId AND UTT.rn = 1
+LEFT JOIN TopTagsByScore TTS ON UTT.TagName = TTS.TagName
+LEFT JOIN HighlyEngagedPosts HE ON PDS.PostId = HE.PostId
+WHERE UM.Reputation > 5000
+AND UM.TotalQuestions > 0
+AND UM.TotalAnswers > 0
+AND PDS.PostId IS NOT NULL
+AND PDS.PostCreationDate BETWEEN TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '5 year' AND TIMESTAMP '2024-10-01 12:34:56'
+AND PDS.ClosedDateEffective = TIMESTAMP '9999-12-31'
+AND (UM.Location IS NOT NULL AND (UM.Location LIKE '%United States%' OR UM.Location LIKE '%Canada%'))
+ORDER BY UserPostOverallMetric DESC, UM.Reputation DESC
+LIMIT 5000;

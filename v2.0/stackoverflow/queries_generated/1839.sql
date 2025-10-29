@@ -1,0 +1,233 @@
+-- {"query": "1839.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3655} 
+
+WITH UserEngagementSummary AS (
+    -- Summarizes core user activity, reputation tiers, and provides initial filtering for active users.
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate,
+        U.LastAccessDate,
+        U.UpVotes,
+        U.DownVotes,
+        U.Views AS ProfileViews,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(P.Score) AS TotalPostScore,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        (CAST(U.UpVotes AS NUMERIC) / NULLIF(U.UpVotes + U.DownVotes, 0)) AS UpDownVoteRatio,
+        CASE
+            WHEN U.Reputation >= 100000 THEN 'Legend'
+            WHEN U.Reputation >= 25000 THEN 'Guru'
+            WHEN U.Reputation >= 5000 THEN 'Expert'
+            WHEN U.Reputation >= 1000 THEN 'Pro'
+            ELSE 'Contributor'
+        END AS ReputationTier,
+        U.AboutMe,
+        U.Location,
+        EXTRACT(YEAR FROM AGE(NOW(), U.CreationDate)) AS AccountAgeYears
+    FROM
+        Users U
+    LEFT JOIN
+        Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN
+        Comments C ON U.Id = C.UserId
+    WHERE
+        U.Reputation > 500 -- Focus on more established users
+        AND U.LastAccessDate >= (NOW() - INTERVAL '1 year') -- Recently active users
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.UpVotes, U.DownVotes, U.Views, U.AboutMe, U.Location
+),
+QuestionTagAnalysis AS (
+    -- Parses tags for questions, identifies specific categories (e.g., SQL/Database), and calculates post-specific metrics.
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        P.Title,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.FavoriteCount,
+        P.CreationDate,
+        P.AcceptedAnswerId,
+        (SELECT COUNT(V.Id) FROM Votes V WHERE V.PostId = P.Id AND V.VoteTypeId = 2) AS UpvoteCount,
+        (SELECT COUNT(V.Id) FROM Votes V WHERE V.PostId = P.Id AND V.VoteTypeId = 3) AS DownvoteCount,
+        STRING_AGG(T.TagName, ',') AS PostTagsConcatenated,
+        MAX(CASE WHEN LOWER(T.TagName) LIKE '%sql%' OR LOWER(T.TagName) LIKE '%database%' THEN 1 ELSE 0 END) AS IsSqlOrDatabaseRelated,
+        MAX(CASE WHEN LOWER(T.TagName) LIKE '%python%' OR LOWER(T.TagName) LIKE '%java%' OR LOWER(T.TagName) LIKE '%javascript%' THEN 1 ELSE 0 END) AS IsProgrammingLanguageRelated,
+        -- Window function to rank a user's posts by score and view count
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.Score DESC, P.ViewCount DESC, P.CreationDate DESC) AS UserTopPostRank,
+        -- Window function to rank posts overall by score and view count
+        DENSE_RANK() OVER (ORDER BY P.Score DESC, P.ViewCount DESC) AS OverallTopPostRank
+    FROM
+        Posts P
+    LEFT JOIN
+        (SELECT Id AS PostId, UNNEST(string_to_array(SUBSTRING(Tags FROM 2 FOR LENGTH(Tags)-2), '><')) AS TagName FROM Posts WHERE Tags IS NOT NULL AND Tags != '') AS TaggedPosts ON P.Id = TaggedPosts.PostId
+    LEFT JOIN
+        Tags T ON TaggedPosts.TagName = T.TagName
+    WHERE
+        P.PostTypeId = 1 -- Only questions
+        AND P.CreationDate >= (NOW() - INTERVAL '3 years') -- Recent questions
+    GROUP BY
+        P.Id, P.OwnerUserId, P.Title, P.Score, P.ViewCount, P.AnswerCount, P.FavoriteCount, P.CreationDate, P.AcceptedAnswerId
+),
+PostHistoryDetails AS (
+    -- Extracts specific historical events and calculates time differences using LAG/LEAD.
+    SELECT
+        PH.PostId,
+        PH.CreationDate AS HistoryEventDate,
+        PH.PostHistoryTypeId,
+        PH.UserId AS EventInitiatorUserId,
+        PH.Comment AS HistoryComment,
+        CASE
+            WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 'Edit'
+            WHEN PH.PostHistoryTypeId IN (10) THEN 'Close'
+            WHEN PH.PostHistoryTypeId IN (11) THEN 'Reopen'
+            WHEN PH.PostHistoryTypeId IN (12) THEN 'Delete'
+            WHEN PH.PostHistoryTypeId IN (13) THEN 'Undelete'
+            WHEN PH.PostHistoryTypeId IN (1, 2, 3) THEN 'InitialCreation'
+            ELSE 'Other'
+        END AS HistoryEventType,
+        -- Calculate time difference to the previous history event for the same post
+        EXTRACT(EPOCH FROM (PH.CreationDate - LAG(PH.CreationDate, 1, PH.CreationDate) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate))) AS TimeSincePreviousEventSeconds,
+        -- Determine if this event is the latest for its type
+        ROW_NUMBER() OVER (PARTITION BY PH.PostId, PH.PostHistoryTypeId ORDER BY PH.CreationDate DESC) AS Rn_LatestEventType
+    FROM
+        PostHistory PH
+    WHERE
+        PH.CreationDate >= (NOW() - INTERVAL '3 years')
+        AND PH.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 10, 11, 12, 13)
+),
+AggregatedPostHistorySummary AS (
+    -- Aggregates history events per post, focusing on counts and overall timings.
+    SELECT
+        PostId,
+        COUNT(DISTINCT CASE WHEN HistoryEventType = 'Edit' THEN HistoryEventDate ELSE NULL END) AS UniqueEditCount,
+        SUM(CASE WHEN HistoryEventType = 'Close' THEN 1 ELSE 0 END) AS CloseEventCount,
+        SUM(CASE WHEN HistoryEventType = 'Reopen' THEN 1 ELSE 0 END) AS ReopenEventCount,
+        MAX(CASE WHEN HistoryEventType = 'Close' THEN HistoryEventDate ELSE NULL END) AS LastClosedDate,
+        MIN(HistoryEventDate) FILTER (WHERE HistoryEventType = 'InitialCreation') AS PostInitialCreationDate,
+        MAX(HistoryEventDate) AS LatestHistoryEventDate,
+        -- Average time between all history events for a post
+        AVG(TimeSincePreviousEventSeconds) FILTER (WHERE TimeSincePreviousEventSeconds > 0) AS AvgInterEventTimeSeconds
+    FROM
+        PostHistoryDetails
+    GROUP BY
+        PostId
+),
+UserBadgeSummary AS (
+    -- Summarizes badge counts and checks for specific tag-based badges (e.g., SQL/Database).
+    SELECT
+        U.Id AS UserId,
+        COUNT(B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(CASE WHEN B.TagBased AND (LOWER(B.Name) = 'sql' OR LOWER(B.Name) = 'database') THEN 1 ELSE 0 END) AS HasSqlDatabaseTagBadge,
+        MAX(CASE WHEN B.TagBased AND (LOWER(B.Name) = 'python' OR LOWER(B.Name) = 'java') THEN 1 ELSE 0 END) AS HasProgrammingLanguageTagBadge
+    FROM
+        Users U
+    LEFT JOIN
+        Badges B ON U.Id = B.UserId
+    GROUP BY
+        U.Id
+)
+-- Main Query: Integrates all CTEs to generate a comprehensive user performance benchmark.
+SELECT
+    UES.UserId,
+    UES.DisplayName,
+    UES.Reputation,
+    UES.ReputationTier,
+    UES.AccountAgeYears,
+    UES.UpDownVoteRatio,
+    UBS.TotalBadges,
+    UBS.GoldBadges,
+    UBS.HasSqlDatabaseTagBadge,
+    UBS.HasProgrammingLanguageTagBadge,
+    UES.TotalPosts,
+    UES.TotalQuestions,
+    UES.TotalAnswers,
+    SUM(QTA.Score) AS TotalQuestionScoreReceived,
+    AVG(QTA.Score) AS AverageQuestionScore,
+    AVG(QTA.ViewCount) AS AverageQuestionViews,
+    COUNT(DISTINCT QTA.PostId) FILTER (WHERE QTA.AcceptedAnswerId IS NOT NULL) AS QuestionsWithAcceptedAnswers,
+    COUNT(DISTINCT QTA.PostId) FILTER (WHERE QTA.IsSqlOrDatabaseRelated = 1) AS SqlDatabaseQuestionsCount,
+    COUNT(DISTINCT QTA.PostId) FILTER (WHERE QTA.IsProgrammingLanguageRelated = 1) AS ProgrammingLanguageQuestionsCount,
+    -- Get the title of the user's highest-scoring question
+    MAX(CASE WHEN QTA.UserTopPostRank = 1 THEN QTA.Title ELSE NULL END) AS UsersHighestScoringQuestionTitle,
+    SUM(AHS.UniqueEditCount) AS TotalEditsOnOwnPosts,
+    SUM(AHS.CloseEventCount) AS TotalClosureEventsOnOwnPosts,
+    SUM(AHS.ReopenEventCount) AS TotalReopenEventsOnOwnPosts,
+    AVG(AHS.AvgInterEventTimeSeconds) AS AvgPostHistoryIntervalSeconds,
+    -- Correlated Subquery: Check if the user has ever had a question closed due to being a duplicate of another post (LinkType = 3)
+    EXISTS (
+        SELECT 1
+        FROM PostLinks PL
+        INNER JOIN Posts P_Closed ON PL.PostId = P_Closed.Id
+        WHERE P_Closed.OwnerUserId = UES.UserId
+          AND PL.LinkTypeId = 3 -- Duplicate link type
+        LIMIT 1
+    ) AS HasDuplicateClosedQuestions,
+    -- Correlated Subquery: Count how many times the user's answers were accepted for someone else's question
+    (SELECT COUNT(DISTINCT P_Ans.Id)
+     FROM Posts P_Q
+     INNER JOIN Posts P_Ans ON P_Q.AcceptedAnswerId = P_Ans.Id
+     WHERE P_Ans.OwnerUserId = UES.UserId
+       AND P_Q.OwnerUserId <> UES.UserId
+       AND P_Ans.PostTypeId = 2
+       AND P_Q.CreationDate >= (NOW() - INTERVAL '3 years')
+    ) AS AcceptedAnswersToOthersQuestions,
+    -- String Expression with NULL Logic: Summarize user's location, defaulting if NULL or empty.
+    COALESCE(
+        NULLIF(TRIM(UES.Location), ''),
+        'Location Not Provided'
+    ) AS UserLocationSummary,
+    -- Complicated Calculation: Weighted User Influence Score, emphasizing accepted answers, high reputation, and specific domain expertise.
+    (
+        UES.Reputation * 0.01 +
+        UES.UpVotes * 0.05 -
+        UES.DownVotes * 0.02 +
+        UES.TotalQuestions * 0.5 +
+        UES.TotalAnswers * 0.75 +
+        UBS.GoldBadges * 10 +
+        UBS.SilverBadges * 3 +
+        (SELECT COUNT(DISTINCT P_Ans.Id) FROM Posts P_Q INNER JOIN Posts P_Ans ON P_Q.AcceptedAnswerId = P_Ans.Id WHERE P_Ans.OwnerUserId = UES.UserId AND P_Q.OwnerUserId <> UES.UserId AND P_Ans.PostTypeId = 2) * 2 + -- Accepted answers
+        (SUM(QTA.Score) / NULLIF(COUNT(QTA.PostId), 0)) * 0.1 + -- Avg question score contribution
+        (CASE WHEN UBS.HasSqlDatabaseTagBadge = 1 OR COUNT(DISTINCT QTA.PostId) FILTER (WHERE QTA.IsSqlOrDatabaseRelated = 1) > 0 THEN 5 ELSE 0 END) + -- SQL/DB bonus
+        (CASE WHEN UBS.HasProgrammingLanguageTagBadge = 1 OR COUNT(DISTINCT QTA.PostId) FILTER (WHERE QTA.IsProgrammingLanguageRelated = 1) > 0 THEN 5 ELSE 0 END) -- Programming bonus
+    ) AS UserInfluenceScore,
+    -- Window Function: Rank users based on their calculated influence score
+    RANK() OVER (ORDER BY (
+        UES.Reputation * 0.01 + UES.UpVotes * 0.05 - UES.DownVotes * 0.02 +
+        UES.TotalQuestions * 0.5 + UES.TotalAnswers * 0.75 +
+        UBS.GoldBadges * 10 + UBS.SilverBadges * 3 +
+        (SELECT COUNT(DISTINCT P_Ans.Id) FROM Posts P_Q INNER JOIN Posts P_Ans ON P_Q.AcceptedAnswerId = P_Ans.Id WHERE P_Ans.OwnerUserId = UES.UserId AND P_Q.OwnerUserId <> UES.UserId AND P_Ans.PostTypeId = 2) * 2 +
+        (SUM(QTA.Score) / NULLIF(COUNT(QTA.PostId), 0)) * 0.1 +
+        (CASE WHEN UBS.HasSqlDatabaseTagBadge = 1 OR COUNT(DISTINCT QTA.PostId) FILTER (WHERE QTA.IsSqlOrDatabaseRelated = 1) > 0 THEN 5 ELSE 0 END) +
+        (CASE WHEN UBS.HasProgrammingLanguageTagBadge = 1 OR COUNT(DISTINCT QTA.PostId) FILTER (WHERE QTA.IsProgrammingLanguageRelated = 1) > 0 THEN 5 ELSE 0 END)
+    ) DESC NULLS LAST) AS OverallInfluenceRank
+FROM
+    UserEngagementSummary UES
+LEFT JOIN
+    QuestionTagAnalysis QTA ON UES.UserId = QTA.OwnerUserId
+LEFT JOIN
+    AggregatedPostHistorySummary AHS ON QTA.PostId = AHS.PostId
+LEFT JOIN
+    UserBadgeSummary UBS ON UES.UserId = UBS.UserId
+WHERE
+    UES.TotalPosts > 0 -- Ensure user has some posts
+    AND (
+        UBS.HasSqlDatabaseTagBadge = 1 OR COUNT(DISTINCT QTA.PostId) FILTER (WHERE QTA.IsSqlOrDatabaseRelated = 1) > 0 OR
+        UBS.HasProgrammingLanguageTagBadge = 1 OR COUNT(DISTINCT QTA.PostId) FILTER (WHERE QTA.IsProgrammingLanguageRelated = 1) > 0
+    ) -- Focus on users with specific domain activity/badges
+GROUP BY
+    UES.UserId, UES.DisplayName, UES.Reputation, UES.ReputationTier, UES.AccountAgeYears, UES.UpDownVoteRatio,
+    UBS.TotalBadges, UBS.GoldBadges, UBS.SilverBadges, UBS.HasSqlDatabaseTagBadge, UBS.HasProgrammingLanguageTagBadge,
+    UES.TotalPosts, UES.TotalQuestions, UES.TotalAnswers, UES.Location
+HAVING
+    COUNT(QTA.PostId) >= 5 -- User must have at least 5 relevant questions to be considered
+    AND AVG(QTA.Score) > 0 -- Filter out users whose questions consistently receive zero or negative scores
+ORDER BY
+    UserInfluenceScore DESC, OverallInfluenceRank ASC
+LIMIT 500;

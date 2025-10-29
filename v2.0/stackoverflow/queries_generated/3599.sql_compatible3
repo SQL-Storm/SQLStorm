@@ -1,0 +1,102 @@
+WITH
+    UserAnswers AS (
+        SELECT
+            u.Id                         AS UserId,
+            u.DisplayName,
+            u.Reputation,
+            p.Id                         AS AnswerId,
+            p.CreationDate,
+            p.Score                      AS AnswerScore,
+            p.Tags,
+            p.ParentId                   AS QuestionId,
+            p.LastActivityDate
+        FROM Users u
+        LEFT JOIN Posts p
+            ON p.OwnerUserId = u.Id
+           AND p.PostTypeId = 2
+    ),
+    AnswerTagStats AS (
+        SELECT
+            ua.UserId,
+            LOWER(TRIM(t))                         AS Tag,
+            COUNT(*)                               AS TagAnswerCount,
+            AVG(ua.AnswerScore)                    AS AvgTagScore
+        FROM UserAnswers ua
+        CROSS JOIN LATERAL
+            (SELECT UNNEST(STRING_TO_ARRAY(TRIM(BOTH '<>' FROM ua.Tags), '><')) AS t) AS taglist
+        WHERE ua.Tags IS NOT NULL
+        GROUP BY ua.UserId, LOWER(TRIM(t))
+    ),
+    TopTagsPerUser AS (
+        SELECT
+            ats.UserId,
+            ats.Tag,
+            ats.TagAnswerCount,
+            ats.AvgTagScore,
+            ROW_NUMBER() OVER (PARTITION BY ats.UserId
+                               ORDER BY ats.TagAnswerCount DESC, ats.AvgTagScore DESC) AS rn
+        FROM AnswerTagStats ats
+    ),
+    UserAggregates AS (
+        SELECT
+            u.Id                                                AS UserId,
+            u.DisplayName,
+            u.Reputation,
+            COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score END),0)   AS TotalAnswerScore,
+            COALESCE(COUNT(p.Id),0)                                    AS AnswerCount,
+            MAX(p.LastActivityDate)                                    AS LastActivity,
+            COALESCE((
+                SELECT AVG(v2.Score)
+                FROM Votes v2
+                JOIN Posts p2 ON v2.PostId = p2.Id
+                WHERE v2.VoteTypeId = 2
+                  AND p2.OwnerUserId = u.Id
+            ),0)                                                     AS AvgUpVotesPerPost
+        FROM Users u
+        LEFT JOIN Posts p
+            ON p.OwnerUserId = u.Id
+           AND p.PostTypeId = 2
+        GROUP BY u.Id, u.DisplayName, u.Reputation
+    )
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.TotalAnswerScore,
+    ua.AnswerCount,
+    ua.LastActivity,
+    ua.AvgUpVotesPerPost,
+    tt.Tag,
+    tt.TagAnswerCount,
+    tt.AvgTagScore,
+    tt.rn
+FROM UserAggregates ua
+LEFT JOIN TopTagsPerUser tt
+    ON tt.UserId = ua.UserId
+   AND tt.rn <= 3
+WHERE (ua.Reputation > 10000 OR ua.AnswerCount = 0)
+UNION ALL
+SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    0            AS TotalAnswerScore,
+    0            AS AnswerCount,
+    NULL         AS LastActivity,
+    0            AS AvgUpVotesPerPost,
+    NULL         AS Tag,
+    NULL         AS TagAnswerCount,
+    NULL         AS AvgTagScore,
+    NULL         AS rn
+FROM Users u
+WHERE NOT EXISTS (
+        SELECT 1
+        FROM Posts p
+        WHERE p.OwnerUserId = u.Id
+          AND p.PostTypeId = 2
+      )
+  AND u.Reputation < 5000
+ORDER BY
+    Reputation DESC,
+    UserId,
+    rn;

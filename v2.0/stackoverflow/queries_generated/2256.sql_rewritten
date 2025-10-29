@@ -1,0 +1,170 @@
+-- {"query": "2256.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1597} 
+with RecursivePostHierarchy as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.CreationDate,
+        p.Score,
+        0 as Level,
+        CAST(p.Id AS varchar) as PathIds
+    from Posts p
+    where p.ParentId is null
+
+    union all
+
+    select
+        c.Id,
+        c.PostTypeId,
+        c.OwnerUserId,
+        c.AcceptedAnswerId,
+        c.ParentId,
+        c.CreationDate,
+        c.Score,
+        rh.Level + 1,
+        rh.PathIds || '>' || CAST(c.Id AS varchar)
+    from Posts c
+    join RecursivePostHierarchy rh on c.ParentId = rh.Id
+    where rh.Level < 5
+),
+UserBadgeStats as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    where b.Date > cast('2024-10-01' as date) - interval '365 days'
+    group by b.UserId, b.Class
+),
+LatestCommentPerPost as (
+    select distinct on (c.PostId)
+        c.PostId,
+        c.Id as CommentId,
+        c.UserId as CommentUserId,
+        c.CreationDate as CommentDate,
+        c.Text as CommentText,
+        row_number() over (partition by c.PostId order by c.Score desc nulls last, c.CreationDate desc) as rn
+    from Comments c
+    where c.Text is not null
+    order by c.PostId, c.Score desc nulls last, c.CreationDate desc
+),
+PostLinkCounts as (
+    select
+        pl.PostId,
+        count(case when pl.LinkTypeId = 1 then 1 end) as LinkedCount,
+        count(case when pl.LinkTypeId = 3 then 1 end) as DuplicateCount
+    from PostLinks pl
+    group by pl.PostId
+),
+PostVotesSummary as (
+    select
+        v.PostId,
+        count(*) filter (where v.VoteTypeId = 2) as UpVotes,
+        count(*) filter (where v.VoteTypeId = 3) as DownVotes,
+        count(*) filter (where v.VoteTypeId = 5) as Favorites,
+        max(v.BountyAmount) as MaxBounty,
+        count(*) as TotalVotes
+    from Votes v
+    group by v.PostId
+),
+CloseReasonSummary as (
+    select
+        ph.PostId,
+        crt.Name as CloseReason,
+        min(ph.CreationDate) as FirstCloseDate
+    from PostHistory ph
+    left join CloseReasonTypes crt on cast(ph.Comment as int) = crt.Id
+    where ph.PostHistoryTypeId = 10
+    group by ph.PostId, crt.Name
+),
+UserActivityRanks as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        count(distinct p.Id) filter (where p.PostTypeId=1) as QuestionsCount,
+        count(distinct p.Id) filter (where p.PostTypeId=2) as AnswersCount,
+        rank() over (order by u.Reputation desc) as RepRank,
+        dense_rank() over (partition by date_trunc('year', u.CreationDate) order by u.Reputation desc) as YearlyRepRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+ComplexPostScore as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.Tags,
+        p.Score,
+        coalesce(pv.UpVotes,0) - coalesce(pv.DownVotes,0) as NetVotes,
+        coalesce(plc.LinkedCount,0) as LinkedPosts,
+        coalesce(plc.DuplicateCount,0) as DuplicatePosts,
+        coalesce(ubg.GoldCount,0) as GoldBadges,
+        coalesce(ubg.SilverCount,0) as SilverBadges,
+        coalesce(ubg.BronzeCount,0) as BronzeBadges,
+        (row_number() over (partition by p.PostTypeId order by p.Score desc nulls last)) as PostRank,
+        LAG(p.Score) over (partition by p.PostTypeId order by p.CreationDate) as PrevScore,
+        CASE 
+            WHEN p.Score > 0 THEN power(p.Score, 1.5) + coalesce(pv.UpVotes,0)*2 - coalesce(pv.DownVotes,0)*3 + coalesce(plc.LinkedCount,0)*1.5
+            ELSE p.Score * -1 + coalesce(pv.DownVotes,0)*2
+        END as WeightedScoreEstimate,
+        string_agg(distinct substring(t.TagName from 1 for 3), ',' order by t.TagName) as ShortTagList
+    from Posts p
+    left join PostVotesSummary pv on pv.PostId = p.Id
+    left join PostLinkCounts plc on plc.PostId = p.Id
+    left join (
+        select
+            UserId,
+            sum(case when Class=1 then BadgeCount else 0 end) as GoldCount,
+            sum(case when Class=2 then BadgeCount else 0 end) as SilverCount,
+            sum(case when Class=3 then BadgeCount else 0 end) as BronzeCount
+        from UserBadgeStats
+        group by UserId
+    ) ubg on ubg.UserId = p.OwnerUserId
+    left join lateral (
+        select unnest(string_to_array(trim(both '<>' from coalesce(p.Tags, '')), '><')) as TagName
+    ) t on true
+    group by p.Id, p.PostTypeId, p.Title, p.Tags, p.Score, pv.UpVotes, pv.DownVotes, plc.LinkedCount, plc.DuplicateCount, ubg.GoldCount, ubg.SilverCount, ubg.BronzeCount
+)
+select
+    cps.Id as PostId,
+    cps.PostTypeId,
+    u.DisplayName as OwnerUser,
+    cps.Title,
+    cps.Score,
+    cps.NetVotes,
+    cps.WeightedScoreEstimate,
+    cps.LinkedPosts,
+    cps.DuplicatePosts,
+    cps.GoldBadges,
+    cps.SilverBadges,
+    cps.BronzeBadges,
+    cps.PostRank,
+    cps.PrevScore,
+    lcp.CommentText as LatestTopComment,
+    crs.CloseReason,
+    crs.FirstCloseDate,
+    u.Reputation,
+    u.CreationDate as UserCreationDate,
+    u.QuestionsCount,
+    u.AnswersCount,
+    u.RepRank,
+    u.YearlyRepRank,
+    case
+        when cps.PostRank <= 10 then 'Top10'
+        when cps.PostRank <= 100 then 'Top100'
+        else 'Other'
+    end as PostRankCategory,
+    cps.ShortTagList
+from ComplexPostScore cps
+left join Users u on u.Id = (select OwnerUserId from Posts p where p.Id = cps.Id)
+left join LatestCommentPerPost lcp on lcp.PostId = cps.Id and lcp.rn = 1
+left join CloseReasonSummary crs on crs.PostId = cps.Id
+where cps.PostTypeId in (1, 2)
+  and (cps.Score > 10 or cps.GoldBadges > 0)
+order by cps.WeightedScoreEstimate desc nulls last
+limit 50;

@@ -1,0 +1,134 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+  SELECT t.Id, t.TagName, t.Count, t.IsModeratorOnly, t.IsRequired, 0 AS Level,
+         ARRAY[t.TagName] AS Path
+  FROM Tags t
+  WHERE t.Id IN (
+    SELECT DISTINCT p.Id
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+  )
+  UNION ALL
+  SELECT child.Id, child.TagName, child.Count, child.IsModeratorOnly, child.IsRequired, parent.Level + 1,
+         parent.Path || child.TagName
+  FROM Tags child
+  JOIN RecursiveTagHierarchy parent ON child.Id <> parent.Id AND child.Id > parent.Id
+  WHERE NOT child.TagName = ANY(parent.Path)
+),
+UserActivity AS (
+  SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsAsked,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersGiven,
+    COALESCE(SUM(vb.UpVotes),0) AS TotalUpVotesReceived,
+    COALESCE(SUM(vb.DownVotes),0) AS TotalDownVotesReceived,
+    row_number() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS ActivityRank
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN (
+    SELECT p.OwnerUserId, 
+           SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
+           SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes
+    FROM Votes v 
+    JOIN Posts p ON p.Id = v.PostId
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+  ) vb ON vb.OwnerUserId = u.Id
+  GROUP BY u.Id, u.DisplayName
+),
+QuestionAnswerStats AS (
+  SELECT 
+      q.Id AS QuestionId,
+      q.Title,
+      q.CreationDate AS QuestionDate,
+      q.Score AS QuestionScore,
+      q.ViewCount,
+      (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = q.Id AND a.PostTypeId = 2) AS AnswerCount,
+      (SELECT COUNT(*) FROM Comments c WHERE c.PostId = q.Id) AS CommentCount,
+      COALESCE(a_stats.TopAnswerScore,0) AS TopAnswerScore,
+      a_stats.TopAnswerBody,
+      u.DisplayName AS QuestionOwnerName
+  FROM Posts q
+  LEFT JOIN LATERAL (
+      SELECT a.Score AS TopAnswerScore,
+             substring(a.Body FROM 1 FOR 200) AS TopAnswerBody
+      FROM Posts a
+      WHERE a.ParentId = q.Id AND a.PostTypeId = 2
+      ORDER BY a.Score DESC NULLS LAST
+      LIMIT 1
+  ) a_stats ON true
+  LEFT JOIN Users u ON u.Id = q.OwnerUserId
+  WHERE q.PostTypeId = 1
+),
+BadgeSummary AS (
+  SELECT 
+    b.UserId,
+    COUNT(*) AS BadgeCount,
+    SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+    SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+    SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+    bool_or(b.TagBased) AS HasTagBasedBadges
+  FROM Badges b
+  GROUP BY b.UserId
+),
+UserReputationWindow AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    avg(u.Reputation) OVER () AS AvgReputation,
+    percentile_cont(0.5) WITHIN GROUP (ORDER BY u.Reputation) OVER () AS MedianReputation,
+    rank() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+  FROM Users u
+),
+DistinctTagQuestions AS (
+  SELECT DISTINCT unnest(string_to_array(substring(p.Tags FROM 2 FOR length(p.Tags) - 2), '><')) AS Tag, p.Id AS QuestionId
+  FROM Posts p
+  WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+)
+SELECT 
+  ua.UserId,
+  ua.DisplayName AS User,
+  ua.TotalPosts,
+  ua.QuestionsAsked,
+  ua.AnswersGiven,
+  ua.TotalUpVotesReceived,
+  ua.TotalDownVotesReceived,
+  bs.BadgeCount,
+  bs.GoldBadges,
+  bs.SilverBadges,
+  bs.BronzeBadges,
+  urw.Reputation,
+  urw.AvgReputation,
+  urw.MedianReputation,
+  qa.QuestionId,
+  qa.Title,
+  qa.QuestionDate,
+  qa.QuestionScore,
+  qa.ViewCount,
+  qa.AnswerCount,
+  qa.CommentCount,
+  qa.TopAnswerScore,
+  qa.TopAnswerBody,
+  dtq.Tag,
+  rt.Level AS TagHierarchyLevel,
+  rt.Path AS TagHierarchyPath
+FROM UserActivity ua
+LEFT JOIN BadgeSummary bs ON bs.UserId = ua.UserId
+LEFT JOIN UserReputationWindow urw ON urw.UserId = ua.UserId
+LEFT JOIN LATERAL (
+  SELECT q.*
+  FROM QuestionAnswerStats q
+  WHERE q.QuestionOwnerName = ua.DisplayName
+  ORDER BY q.QuestionScore DESC NULLS LAST
+  LIMIT 1
+) qa ON true
+LEFT JOIN DistinctTagQuestions dtq ON dtq.QuestionId = qa.QuestionId
+LEFT JOIN RecursiveTagHierarchy rt ON rt.TagName = dtq.Tag
+WHERE ua.TotalPosts > 10
+  AND (bs.BadgeCount > 0 OR bs.BadgeCount IS NULL)
+  AND qa.QuestionScore > COALESCE((SELECT avg(Score) FROM Posts WHERE PostTypeId = 1), 0)
+ORDER BY ua.TotalPosts DESC, qa.QuestionScore DESC
+LIMIT 100;

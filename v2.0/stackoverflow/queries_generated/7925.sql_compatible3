@@ -1,0 +1,275 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.AccountId,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        MAX(b.Date) as LastBadgeDate,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Diamond'
+            WHEN u.Reputation >= 5000 THEN 'Platinum'
+            WHEN u.Reputation >= 1000 THEN 'Gold'
+            WHEN u.Reputation >= 100 THEN 'Silver'
+            ELSE 'Bronze'
+        END as Tier,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) as ReputationRank,
+        DENSE_RANK() OVER (ORDER BY u.Views DESC) as ViewRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 0
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes, u.AccountId
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        PostCount,
+        CommentCount,
+        BadgeCount,
+        ReputationRank,
+        ViewRank
+    FROM UserStats
+    WHERE PostCount > 0 OR CommentCount > 0 OR BadgeCount > 0
+    ORDER BY Reputation DESC
+    LIMIT 100
+),
+QuestionStats AS (
+    SELECT 
+        p.Id as QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        p.LastActivityDate,
+        p.ParentId,
+        p.AcceptedAnswerId,
+        (SELECT COUNT(*) FROM Posts WHERE ParentId = p.Id AND PostTypeId = 2) as ActualAnswerCount,
+        (SELECT COUNT(*) FROM Votes WHERE PostId = p.Id AND VoteTypeId = 2) as UpvoteCount,
+        (SELECT COUNT(*) FROM Votes WHERE PostId = p.Id AND VoteTypeId = 3) as DownvoteCount,
+        (SELECT COUNT(*) FROM Comments WHERE PostId = p.Id) as CommentCountByPost,
+        (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = p.OwnerUserId AND PostTypeId = 1) as UserQuestionCount,
+        CASE 
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 
+            ELSE 0 
+        END as HasAcceptedAnswer,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 1 
+            ELSE 0 
+        END as IsClosed,
+        CASE 
+            WHEN p.Tags LIKE '%<sql>%' THEN 1 
+            ELSE 0 
+        END as HasSqlTag,
+        CAST((EXTRACT(EPOCH FROM TIMESTAMP '2024-10-01 12:34:56') - EXTRACT(EPOCH FROM p.CreationDate)) / 86400 AS INTEGER) as DaysSinceCreation,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) as ScoreRank,
+        RANK() OVER (ORDER BY p.ViewCount DESC) as ViewRank,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as UserQuestionSequence
+    FROM Posts p
+    WHERE p.PostTypeId = 1 
+    AND p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 years')
+),
+AnswerStats AS (
+    SELECT 
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.Score,
+        a.CreationDate,
+        a.OwnerUserId,
+        a.LastEditDate,
+        a.Body,
+        CASE 
+            WHEN a.OwnerUserId IS NULL THEN 'Deleted User'
+            ELSE 'Active User'
+        END as UserStatus,
+        DENSE_RANK() OVER (ORDER BY a.Score DESC) as AnswerScoreRank,
+        RANK() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC) as QuestionAnswerRank,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.CreationDate ASC) as ChronologicalAnswerOrder,
+        (SELECT COUNT(*) FROM Votes WHERE PostId = a.Id AND VoteTypeId = 2) as AnswerUpvotes,
+        (SELECT COUNT(*) FROM Votes WHERE PostId = a.Id AND VoteTypeId = 3) as AnswerDownvotes
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+    AND a.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 years')
+),
+UserActivity AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as PostActivity,
+        COUNT(DISTINCT c.Id) as CommentActivity,
+        COUNT(DISTINCT b.Id) as BadgeActivity,
+        COUNT(DISTINCT ph.Id) as HistoryActivity,
+        COUNT(DISTINCT v.Id) as VoteActivity,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) as QuestionActivity,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) as AnswerActivity,
+        (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = u.Id AND PostTypeId = 1 AND CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6 months')) as RecentQuestions,
+        (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = u.Id AND PostTypeId = 2 AND CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6 months')) as RecentAnswers,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) + COUNT(DISTINCT c.Id) + COUNT(DISTINCT b.Id) + COUNT(DISTINCT ph.Id) + COUNT(DISTINCT v.Id) > 1000 THEN 'High'
+            WHEN COUNT(DISTINCT p.Id) + COUNT(DISTINCT c.Id) + COUNT(DISTINCT b.Id) + COUNT(DISTINCT ph.Id) + COUNT(DISTINCT v.Id) > 100 THEN 'Medium'
+            ELSE 'Low'
+        END as ActivityLevel
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    WHERE u.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '3 years')
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            WHEN t.Count > 10 THEN 'Niche'
+            ELSE 'Rare'
+        END as TagPopularity,
+        (SELECT COUNT(*) FROM Posts WHERE Tags LIKE '%' || t.TagName || '%') as TagUsageCount,
+        (SELECT AVG(p.Score) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%') as AvgScoreWithTag,
+        (SELECT COUNT(*) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%') as QuestionCountWithTag,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as TagRank
+    FROM Tags t
+    WHERE t.Count > 0
+)
+SELECT 
+    'Performance Benchmark Report' as ReportTitle,
+    COUNT(*) as TotalRecordsProcessed,
+    COUNT(DISTINCT u.Id) as UniqueUsers,
+    COUNT(DISTINCT p.Id) as TotalPosts,
+    COUNT(DISTINCT c.Id) as TotalComments,
+    COUNT(DISTINCT b.Id) as TotalBadges,
+    COUNT(DISTINCT ph.Id) as TotalHistory,
+    COUNT(DISTINCT v.Id) as TotalVotes,
+    COUNT(DISTINCT t.Id) as TotalTags,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year')) as RecentQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 2 AND CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year')) as RecentAnswers,
+    (SELECT AVG(Reputation) FROM Users) as AvgReputation,
+    (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) as AvgQuestionScore,
+    (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 2) as AvgAnswerScore,
+    (SELECT MAX(CreationDate) FROM Posts) as LatestPostDate,
+    (SELECT MIN(CreationDate) FROM Posts) as EarliestPostDate,
+    (SELECT COUNT(*) FROM Posts WHERE Tags LIKE '%<sql>%') as SQLRelatedQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE Tags LIKE '%<database>%') as DatabaseRelatedQuestions,
+    (SELECT COUNT(*) FROM Badges WHERE Class = 1) as GoldBadges,
+    (SELECT COUNT(*) FROM Badges WHERE Class = 2) as SilverBadges,
+    (SELECT COUNT(*) FROM Badges WHERE Class = 3) as BronzeBadges,
+    (SELECT COUNT(*) FROM Tags WHERE TagName LIKE '%sql%') as SQLTags,
+    (SELECT COUNT(*) FROM Tags WHERE TagName LIKE '%database%') as DatabaseTags,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Score > 100) as HighScoreQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 2 AND Score > 100) as HighScoreAnswers,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND AnswerCount > 10) as HighlyAnsweredQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND CommentCount > 20) as HighlyCommentedQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND ViewCount > 10000) as HighlyViewedQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE LastActivityDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '7 days')) as RecentlyActivePosts,
+    (SELECT COUNT(*) FROM Posts WHERE OwnerUserId IS NULL) as DeletedUserPosts,
+    (SELECT COUNT(*) FROM Posts WHERE OwnerUserId IS NOT NULL) as ActiveUserPosts,
+    (SELECT COUNT(*) FROM Comments WHERE UserId IS NULL) as AnonymousComments,
+    (SELECT COUNT(*) FROM Comments WHERE UserId IS NOT NULL) as AuthenticatedComments,
+    (SELECT COUNT(*) FROM Users WHERE Reputation > 100000) as EliteUsers,
+    (SELECT COUNT(*) FROM Users WHERE Reputation BETWEEN 10000 AND 99999) as VeteranUsers,
+    (SELECT COUNT(*) FROM Users WHERE Reputation BETWEEN 1000 AND 9999) as ExperiencedUsers,
+    (SELECT COUNT(*) FROM Users WHERE Reputation BETWEEN 100 AND 999) as IntermediateUsers,
+    (SELECT COUNT(*) FROM Users WHERE Reputation < 100) as NewUsers,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND ClosedDate IS NOT NULL) as ClosedQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 2 AND ParentId IS NOT NULL) as AnsweredQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND AcceptedAnswerId IS NOT NULL) as QuestionsWithAcceptedAnswers,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND ParentId IS NOT NULL) as AnsweredQuestionsByParent,
+    COUNT(DISTINCT CASE WHEN p.OwnerUserId IN (SELECT UserId FROM TopUsers) THEN p.OwnerUserId END) as TopUserPosts,
+    COUNT(DISTINCT CASE WHEN p.OwnerUserId NOT IN (SELECT UserId FROM TopUsers) THEN p.OwnerUserId END) as RegularUserPosts,
+    COUNT(DISTINCT CASE WHEN p.OwnerUserId IS NULL THEN p.Id ELSE NULL END) as DeletedUserPostsCount,
+    COUNT(DISTINCT CASE WHEN p.OwnerUserId IS NOT NULL THEN p.Id ELSE NULL END) as ActiveUserPostsCount,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id ELSE NULL END) as QuestionPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id ELSE NULL END) as AnswerPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 3 THEN p.Id ELSE NULL END) as WikiPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 4 THEN p.Id ELSE NULL END) as TagWikiExcerptPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 5 THEN p.Id ELSE NULL END) as TagWikiPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 6 THEN p.Id ELSE NULL END) as ModeratorNominationPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 7 THEN p.Id ELSE NULL END) as WikiPlaceholderPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 8 THEN p.Id ELSE NULL END) as PrivilegeWikiPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id ELSE NULL END) as QuestionCount,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id ELSE NULL END) as AnswerCount,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 3 THEN p.Id ELSE NULL END) as WikiCount,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 4 THEN p.Id ELSE NULL END) as TagWikiExcerptCount,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 5 THEN p.Id ELSE NULL END) as TagWikiCount,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 6 THEN p.Id ELSE NULL END) as ModeratorNominationCount,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 7 THEN p.Id ELSE NULL END) as WikiPlaceholderCount,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 8 THEN p.Id ELSE NULL END) as PrivilegeWikiCount,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags IS NOT NULL AND Tags <> '') as QuestionsWithTags,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 2 AND Body IS NOT NULL AND Body <> '') as AnswerWithBody,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Title IS NOT NULL AND Title <> '') as QuestionsWithTitles,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND AnswerCount IS NOT NULL) as QuestionsWithAnswerCount,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND CommentCount IS NOT NULL) as QuestionsWithCommentCount,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND ViewCount IS NOT NULL) as QuestionsWithViewCount,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Score IS NOT NULL) as QuestionsWithScore,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 2 AND Score IS NOT NULL) as AnswersWithScore,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND CreationDate IS NOT NULL) as QuestionsWithCreationDate,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 2 AND CreationDate IS NOT NULL) as AnswersWithCreationDate,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND LastActivityDate IS NOT NULL) as QuestionsWithLastActivityDate,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 2 AND LastActivityDate IS NOT NULL) as AnswersWithLastActivityDate,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND LastEditDate IS NOT NULL) as QuestionsWithLastEditDate,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 2 AND LastEditDate IS NOT NULL) as AnswersWithLastEditDate,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND OwnerUserId IS NOT NULL) as QuestionsWithOwner,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 2 AND OwnerUserId IS NOT NULL) as AnswersWithOwner,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND OwnerUserId IS NULL) as QuestionsWithDeletedOwner,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 2 AND OwnerUserId IS NULL) as AnswersWithDeletedOwner,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND OwnerDisplayName IS NOT NULL) as QuestionsWithOwnerDisplayName,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 2 AND OwnerDisplayName IS NOT NULL) as AnswersWithOwnerDisplayName,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND OwnerDisplayName IS NULL) as QuestionsWithNullOwnerDisplayName,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 2 AND OwnerDisplayName IS NULL) as AnswersWithNullOwnerDisplayName,
+    COUNT(*) as TotalCount
+FROM Users u
+FULL OUTER JOIN Posts p ON u.Id = p.OwnerUserId
+FULL OUTER JOIN Comments c ON u.Id = c.UserId
+FULL OUTER JOIN Badges b ON u.Id = b.UserId
+FULL OUTER JOIN PostHistory ph ON u.Id = ph.UserId
+FULL OUTER JOIN Votes v ON u.Id = v.UserId
+FULL OUTER JOIN Tags t ON 1 = 1
+WHERE (u.Id IS NOT NULL OR p.Id IS NOT NULL OR c.Id IS NOT NULL OR b.Id IS NOT NULL OR ph.Id IS NOT NULL OR v.Id IS NOT NULL OR t.Id IS NOT NULL)
+  AND (
+    (u.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '3 years')) 
+    OR (p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '3 years')) 
+    OR (c.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '3 years')) 
+    OR (b.Date >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '3 years')) 
+    OR (ph.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '3 years')) 
+    OR (v.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '3 years')) 
+    OR t.Id IS NOT NULL
+  )
+  AND (
+    (u.Id IS NOT NULL AND u.Id IN (SELECT UserId FROM TopUsers)) 
+    OR (p.Id IS NOT NULL AND p.Id IN (SELECT QuestionId FROM QuestionStats))
+    OR (c.Id IS NOT NULL)
+    OR (b.Id IS NOT NULL)
+    OR (ph.Id IS NOT NULL)
+    OR (v.Id IS NOT NULL)
+    OR (t.Id IS NOT NULL AND t.Id IN (SELECT Id FROM TagAnalysis))
+  )
+GROUP BY
+    u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes, u.AccountId,
+    p.Id, p.OwnerUserId, p.PostTypeId, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.CreationDate, p.Tags, p.LastActivityDate, p.ParentId, p.AcceptedAnswerId, p.LastEditDate, p.Body, p.OwnerDisplayName,
+    c.Id, c.UserId,
+    b.Id, b.UserId, b.Date,
+    ph.Id, ph.UserId, ph.CreationDate,
+    v.Id, v.UserId, v.CreationDate,
+    t.Id, t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId
+HAVING COUNT(*) > 0;

@@ -1,0 +1,135 @@
+with RecursiveTagHierarchy as (
+    select t.Id, t.TagName, 0 as Level, cast(t.TagName as varchar(1000)) as Path
+    from Tags t
+    where t.Id in (
+        select distinct unnest(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><'))
+        from Posts p
+        where p.PostTypeId = 1 and p.Tags is not null
+        limit 100
+    )
+    union all
+    select t.Id, t.TagName, r.Level + 1,
+        r.Path || ' > ' || t.TagName
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id = r.Id - 1
+    where r.Level < 2
+),
+UserActivity as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersCount,
+        coalesce(sum(v.VotesUp),0) as TotalUpVotes,
+        coalesce(sum(v.VotesDown),0) as TotalDownVotes,
+        coalesce(max(b.Date), timestamp '1970-01-01') as LastBadgeDate
+    from Users u
+    left join Posts p on u.Id = p.OwnerUserId
+    left join (
+        select
+            v.PostId,
+            sum(case when vt.Name = 'UpMod' then 1 else 0 end) as VotesUp,
+            sum(case when vt.Name = 'DownMod' then 1 else 0 end) as VotesDown
+        from Votes v
+        join VoteTypes vt on v.VoteTypeId = vt.Id
+        group by v.PostId
+    ) v on v.PostId = p.Id
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+),
+PostAnswerRanks as (
+    select
+        a.Id,
+        a.ParentId as QuestionId,
+        a.Score,
+        row_number() over(partition by a.ParentId order by a.Score desc, a.Id) as AnswerRank,
+        count(*) over (partition by a.ParentId) as AnswerCount
+    from Posts a
+    where a.PostTypeId = 2
+),
+QuestionStats as (
+    select
+        q.Id,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.OwnerUserId,
+        q.AcceptedAnswerId,
+        coalesce(par.AnswerCount, 0) as AnswerCount,
+        coalesce(max(case when par.AnswerRank = 1 then par.Score end), 0) as TopAnswerScore,
+        q.Tags,
+        substring(q.Tags from '([A-Za-z0-9_]+)') as FirstTag
+    from Posts q
+    left join PostAnswerRanks par on par.QuestionId = q.Id
+    where q.PostTypeId = 1
+    group by q.Id, q.CreationDate, q.Score, q.ViewCount, q.OwnerUserId, q.AcceptedAnswerId, par.AnswerCount, q.Tags, substring(q.Tags from '([A-Za-z0-9_]+)')
+)
+select distinct
+    qs.Id as QuestionId,
+    qs.CreationDate,
+    qs.Score as QuestionScore,
+    qs.ViewCount,
+    ua.DisplayName as QuestionOwner,
+    ua.QuestionsCount,
+    ua.AnswersCount,
+    ua.TotalUpVotes,
+    ua.TotalDownVotes,
+    ua.LastBadgeDate,
+    qs.AnswerCount,
+    qs.TopAnswerScore,
+    qs.Tags,
+    qs.FirstTag,
+    lh.Path as TagHierarchyPath,
+    ph_latest.RevisionGUID as LastEditRevision,
+    ph_latest.CreationDate as LastEditDate,
+    coalesce(cmt_count.CommentCount, 0) as TotalComments,
+    coalesce(closed_reasons.Name, 'Open') as ClosedReason,
+    (
+        select count(*)
+        from Votes v 
+        join VoteTypes vt on v.VoteTypeId = vt.Id
+        where v.PostId = qs.Id
+          and vt.Name = 'Favorite'
+    ) as FavoriteCount,
+    case 
+        when ua.Reputation > 10000 then 'HighReputation' 
+        when ua.Reputation between 1000 and 10000 then 'MediumReputation' 
+        else 'LowReputation' end as ReputationCategory,
+    reverse(coalesce(ua.DisplayName, '') || '_' || coalesce(qs.FirstTag, 'NoTag')) as ReversedUserTag,
+    pl.DuplicateLinkCount,
+    pl.LinkedLinkCount
+from QuestionStats qs
+left join UserActivity ua on ua.UserId = qs.OwnerUserId
+left join lateral (
+    select ph.RevisionGUID, ph.CreationDate
+    from PostHistory ph
+    where ph.PostId = qs.Id
+    order by ph.CreationDate desc
+    limit 1
+) ph_latest on true
+left join (
+    select p.Id as PostId, 
+           count(distinct pl1.Id) filter (where lt.Name = 'Duplicate') as DuplicateLinkCount,
+           count(distinct pl1.Id) filter (where lt.Name = 'Linked') as LinkedLinkCount
+    from Posts p
+    left join PostLinks pl1 on pl1.PostId = p.Id
+    left join LinkTypes lt on pl1.LinkTypeId = lt.Id
+    group by p.Id
+) pl on pl.PostId = qs.Id
+left join (
+    select ph.PostId, crt.Name
+    from PostHistory ph
+    join PostHistoryTypes pht on ph.PostHistoryTypeId = pht.Id
+    left join CloseReasonTypes crt on crt.Id = CASE WHEN ph.Comment ~ '^-?\d+$' THEN cast(ph.Comment as integer) ELSE NULL END
+    where ph.PostHistoryTypeId = 10
+) closed_reasons on closed_reasons.PostId = qs.Id
+left join (
+    select PostId, count(*) as CommentCount
+    from Comments
+    group by PostId
+) cmt_count on cmt_count.PostId = qs.Id
+left join RecursiveTagHierarchy lh on lh.TagName = qs.FirstTag
+where qs.CreationDate > (cast('2024-10-01' as date) - interval '1 year')
+order by ua.Reputation desc, qs.Score desc
+limit 50;

@@ -1,0 +1,214 @@
+WITH UserPosts AS (
+    SELECT
+        p.Id                     AS PostId,
+        p.OwnerUserId            AS UserId,
+        p.PostTypeId,
+        p.Score,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.ViewCount
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+),
+UserTags AS (
+    SELECT
+        up.UserId,
+        LOWER(TRIM(tag))         AS Tag,
+        COUNT(*)                 AS TagCount
+    FROM UserPosts up,
+         LATERAL (
+             SELECT UNNEST(
+                 REGEXP_SPLIT_TO_ARRAY(
+                     TRIM(BOTH '<>' FROM up.Tags),
+                     '><'
+                 )
+             ) AS tag
+         ) t
+    GROUP BY up.UserId, LOWER(TRIM(tag))
+),
+UserTopTag AS (
+    SELECT
+        ut.UserId,
+        ut.Tag,
+        ut.TagCount,
+        ROW_NUMBER() OVER (PARTITION BY ut.UserId ORDER BY ut.TagCount DESC, ut.Tag) AS rn
+    FROM UserTags ut
+),
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        COUNT(*)                                           AS TotalBadges,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END)            AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END)            AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END)            AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserRecentActivity AS (
+    SELECT
+        u.Id                                                AS UserId,
+        GREATEST(
+            COALESCE(u.LastAccessDate, TIMESTAMP '1970-01-01'),
+            COALESCE(pmax.LastPostDate, TIMESTAMP '1970-01-01')
+        )                                                   AS LastActiveDate
+    FROM Users u
+    LEFT JOIN (
+        SELECT OwnerUserId, MAX(CreationDate) AS LastPostDate
+        FROM Posts
+        GROUP BY OwnerUserId
+    ) pmax ON pmax.OwnerUserId = u.Id
+),
+UserStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(ub.TotalBadges, 0)                         AS TotalBadges,
+        COALESCE(ub.GoldBadges, 0)                          AS GoldBadges,
+        COALESCE(ub.SilverBadges, 0)                        AS SilverBadges,
+        COALESCE(ub.BronzeBadges, 0)                        AS BronzeBadges,
+        COUNT(DISTINCT p.Id)                                AS TotalPosts,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END)    AS AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END)    AS AvgAnswerScore,
+        MAX(p.ViewCount)                                    AS MaxViewCount,
+        ura.LastActiveDate,
+        ut.Tag                                               AS TopTag,
+        ut.TagCount                                          AS TopTagCount
+    FROM Users u
+    LEFT JOIN UserBadgeCounts ub   ON ub.UserId = u.Id
+    LEFT JOIN Posts p              ON p.OwnerUserId = u.Id
+    LEFT JOIN UserRecentActivity ura ON ura.UserId = u.Id
+    LEFT JOIN UserTopTag ut       ON ut.UserId = u.Id AND ut.rn = 1
+    GROUP BY u.Id, u.DisplayName, u.Reputation,
+             ub.TotalBadges, ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges,
+             ura.LastActiveDate,
+             ut.Tag, ut.TagCount
+),
+ActiveUsers AS (
+    SELECT
+        s.Id,
+        s.DisplayName,
+        s.Reputation,
+        s.TotalPosts,
+        s.AvgQuestionScore,
+        s.AvgAnswerScore,
+        s.TotalBadges,
+        s.GoldBadges,
+        s.SilverBadges,
+        s.BronzeBadges,
+        s.TopTag,
+        s.TopTagCount,
+        s.LastActiveDate,
+        CASE
+            WHEN s.Reputation > 20000 THEN 'Veteran'
+            WHEN s.Reputation BETWEEN 5000 AND 20000 THEN 'Experienced'
+            WHEN s.Reputation BETWEEN 1000 AND 4999 THEN 'Intermediate'
+            ELSE 'Newbie'
+        END                                          AS ReputationTier,
+        COALESCE(v.UpVotes, 0) - COALESCE(v.DownVotes, 0) AS NetVotes,
+        COALESCE(l.DupCount, 0)                     AS DuplicateLinksCount
+    FROM UserStats s
+    LEFT JOIN (
+        SELECT
+            p.OwnerUserId,
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Posts p
+        LEFT JOIN Votes v ON v.PostId = p.Id
+        GROUP BY p.OwnerUserId
+    ) v ON v.OwnerUserId = s.Id
+    LEFT JOIN (
+        SELECT
+            pl.PostId,
+            COUNT(*) AS DupCount
+        FROM PostLinks pl
+        WHERE pl.LinkTypeId = 3
+        GROUP BY pl.PostId
+    ) l ON l.PostId = s.Id
+    WHERE s.TotalPosts > 0
+),
+InactiveUsers AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        0                                   AS TotalPosts,
+        CAST(NULL AS NUMERIC)               AS AvgQuestionScore,
+        CAST(NULL AS NUMERIC)               AS AvgAnswerScore,
+        0                                   AS TotalBadges,
+        0                                   AS GoldBadges,
+        0                                   AS SilverBadges,
+        0                                   AS BronzeBadges,
+        CAST(NULL AS TEXT)                  AS TopTag,
+        CAST(NULL AS INTEGER)               AS TopTagCount,
+        CAST(NULL AS TIMESTAMP)             AS LastActiveDate,
+        'Inactive'                          AS ReputationTier,
+        0                                   AS NetVotes,
+        0                                   AS DuplicateLinksCount
+    FROM Users u
+    WHERE NOT EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id)
+      AND u.Reputation > 0
+)
+SELECT *
+FROM (
+    SELECT Id,
+           DisplayName,
+           Reputation,
+           TotalPosts,
+           AvgQuestionScore,
+           AvgAnswerScore,
+           TotalBadges,
+           GoldBadges,
+           SilverBadges,
+           BronzeBadges,
+           TopTag,
+           TopTagCount,
+           LastActiveDate,
+           ReputationTier,
+           NetVotes,
+           DuplicateLinksCount
+    FROM ActiveUsers
+    ORDER BY Reputation DESC
+    OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY
+) a
+UNION ALL
+SELECT Id,
+       DisplayName,
+       Reputation,
+       TotalPosts,
+       AvgQuestionScore,
+       AvgAnswerScore,
+       TotalBadges,
+       GoldBadges,
+       SilverBadges,
+       BronzeBadges,
+       TopTag,
+       TopTagCount,
+       LastActiveDate,
+       ReputationTier,
+       NetVotes,
+       DuplicateLinksCount
+FROM (
+    SELECT Id,
+           DisplayName,
+           Reputation,
+           TotalPosts,
+           AvgQuestionScore,
+           AvgAnswerScore,
+           TotalBadges,
+           GoldBadges,
+           SilverBadges,
+           BronzeBadges,
+           TopTag,
+           TopTagCount,
+           LastActiveDate,
+           ReputationTier,
+           NetVotes,
+           DuplicateLinksCount
+    FROM InactiveUsers
+    ORDER BY Reputation DESC
+    LIMIT 20
+) b;

@@ -1,0 +1,119 @@
+WITH UserStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        COALESCE(bc.Gold,   0) AS GoldBadges,
+        COALESCE(bc.Silver, 0) AS SilverBadges,
+        COALESCE(bc.Bronze, 0) AS BronzeBadges,
+        COALESCE(pc.PostCnt,   0) AS PostCount,
+        COALESCE(pc.AnsCnt,   0) AS AnswerCount,
+        (SELECT MAX(p.CreationDate)
+         FROM Posts p
+         WHERE p.OwnerUserId = u.Id) AS LastPostDate
+    FROM Users u
+    LEFT JOIN (
+        SELECT
+            UserId,
+            SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS Gold,
+            SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS Silver,
+            SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS Bronze
+        FROM Badges
+        GROUP BY UserId
+    ) bc ON bc.UserId = u.Id
+    LEFT JOIN (
+        SELECT
+            OwnerUserId,
+            SUM(CASE WHEN PostTypeId = 1 THEN 1 ELSE 0 END) AS PostCnt,
+            SUM(CASE WHEN PostTypeId = 2 THEN 1 ELSE 0 END) AS AnsCnt
+        FROM Posts
+        GROUP BY OwnerUserId
+    ) pc ON pc.OwnerUserId = u.Id
+),
+
+RankedUsers AS (
+    SELECT
+        us.Id,
+        us.DisplayName,
+        us.Reputation,
+        us.GoldBadges,
+        us.SilverBadges,
+        us.BronzeBadges,
+        us.PostCount,
+        us.AnswerCount,
+        us.LastPostDate,
+        COALESCE(avg_s.avg_score, 0)               AS AvgPostScore,
+        ROW_NUMBER() OVER (ORDER BY us.Reputation DESC, avg_s.avg_score DESC) AS ReputationScoreRank,
+        CASE
+            WHEN us.LastAccessDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30' DAY) THEN 'Active'
+            ELSE 'Inactive'
+        END                                        AS RecentActivityFlag,
+        COALESCE(tg.TopTagsCSV, '')                AS TopTagsCSV
+    FROM UserStats us
+    LEFT JOIN LATERAL (
+        SELECT AVG(p.Score) AS avg_score
+        FROM Posts p
+        WHERE p.OwnerUserId = us.Id
+    ) avg_s ON TRUE
+    LEFT JOIN LATERAL (
+        SELECT STRING_AGG(t.TagName, ',' ORDER BY t.TagName) AS TopTagsCSV
+        FROM (
+            SELECT pt_all.raw_tag,
+                   pt_all.p_score
+            FROM (
+                SELECT
+                    TRIM(BOTH '<>' FROM (regexp_matches(p.Tags, '[^<>]+', 'g'))[1]) AS raw_tag,
+                    p.Score AS p_score
+                FROM Posts p
+                WHERE p.OwnerUserId = us.Id
+                  AND p.PostTypeId = 1
+            ) pt_all
+            GROUP BY pt_all.raw_tag, pt_all.p_score
+            ORDER BY MAX(pt_all.p_score) DESC
+            LIMIT 5
+        ) pt
+        JOIN Tags t
+          ON t.TagName = pt.raw_tag
+    ) tg ON TRUE
+)
+
+SELECT
+    Id,
+    DisplayName,
+    Reputation,
+    GoldBadges,
+    SilverBadges,
+    BronzeBadges,
+    PostCount,
+    AnswerCount,
+    LastPostDate,
+    AvgPostScore,
+    ReputationScoreRank,
+    RecentActivityFlag,
+    TopTagsCSV
+FROM RankedUsers
+WHERE ReputationScoreRank <= 100
+
+UNION ALL
+
+SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    0        AS GoldBadges,
+    0        AS SilverBadges,
+    0        AS BronzeBadges,
+    0        AS PostCount,
+    0        AS AnswerCount,
+    NULL     AS LastPostDate,
+    NULL     AS AvgPostScore,
+    NULL     AS ReputationScoreRank,
+    'NoActivity' AS RecentActivityFlag,
+    NULL     AS TopTagsCSV
+FROM Users u
+WHERE NOT EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id)
+
+ORDER BY Reputation DESC
+FETCH FIRST 200 ROWS ONLY;

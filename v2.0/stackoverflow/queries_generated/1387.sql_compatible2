@@ -1,0 +1,144 @@
+WITH UserEngagementSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsAsked,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersProvided,
+        COALESCE(SUM(p.Score), 0) AS CumulativePostScore,
+        COALESCE(AVG(p.ViewCount), 0.0) AS AveragePostViewCount,
+        MAX(p.LastActivityDate) AS LatestPostActivity,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        COALESCE(SUM(c.Score), 0) AS CumulativeCommentScore,
+        COUNT(DISTINCT b.Id) AS TotalBadgesAwarded,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadgesCount,
+        EXTRACT(DAY FROM (u.LastAccessDate - u.CreationDate)) AS DaysSinceAccountCreation,
+        u.UpVotes AS TotalUpVotesGiven,
+        u.DownVotes AS TotalDownVotesGiven
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.UpVotes, u.DownVotes
+),
+PostHistoricalMetrics AS (
+    SELECT
+        ph.PostId,
+        COUNT(ph.Id) AS TotalHistoryEvents,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 END) AS EditRevisionCount,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 END) AS CloseEventCount,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 END) AS ReopenEventCount,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN crt.Name ELSE NULL END) AS LastCloseReason,
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (35, 36) THEN ph.Text ELSE NULL END) AS MigrationDetails,
+        AVG(EXTRACT(EPOCH FROM (ph_edit.CreationDate - ph_initial.CreationDate))) FILTER (WHERE ph_initial.CreationDate IS NOT NULL AND ph_edit.CreationDate IS NOT NULL) AS AvgTimeUntilFirstEditSeconds,
+        SUM(1) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS CumulativeHistoryEvents,
+        MAX(ph.CreationDate) AS MaxCreationDate
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON ph.PostHistoryTypeId = 10 AND crt.Id = CAST(ph.Comment AS SMALLINT)
+    LEFT JOIN PostHistory ph_initial ON ph.PostId = ph_initial.PostId AND ph_initial.PostHistoryTypeId IN (1,2,3)
+    LEFT JOIN PostHistory ph_edit ON ph.PostId = ph_edit.PostId AND ph_edit.PostHistoryTypeId IN (4,5,6) AND ph_edit.CreationDate = (
+        SELECT MIN(ph_sub.CreationDate) FROM PostHistory ph_sub WHERE ph_sub.PostId = ph.PostId AND ph_sub.PostHistoryTypeId IN (4,5,6)
+    )
+    WHERE ph.PostHistoryTypeId NOT IN (50, 52, 53)
+    GROUP BY ph.PostId
+),
+QuestionTagBreakdown AS (
+    SELECT
+        p.Id AS PostId,
+        LOWER(tag_name) AS TagName,
+        p.CreationDate AS QuestionCreationDate
+    FROM Posts p,
+    LATERAL (
+        SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2), '><')) AS tag_name
+    ) AS unnest_tag
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+)
+SELECT
+    ues.UserId,
+    ues.DisplayName,
+    ues.Reputation,
+    ues.QuestionsAsked,
+    ues.AnswersProvided,
+    ues.GoldBadgesCount,
+    ues.DaysSinceAccountCreation,
+    p.Id AS QuestionId,
+    p.Title AS QuestionTitle,
+    p.CreationDate AS QuestionPostDate,
+    p.ViewCount AS QuestionViewCount,
+    p.Score AS QuestionScore,
+    p.AnswerCount AS QuestionAnswerCount,
+    phm.LastCloseReason,
+    phm.EditRevisionCount,
+    phm.AvgTimeUntilFirstEditSeconds,
+    STRING_AGG(DISTINCT qtb.TagName, ' | ') AS QuestionTagsAggregated,
+    (
+        SELECT c.Text
+        FROM Comments c
+        WHERE c.PostId = p.Id
+          AND c.UserId = ues.UserId
+        ORDER BY c.Score DESC, c.CreationDate DESC
+        LIMIT 1
+    ) AS OwnersTopCommentText,
+    (p.Score * 2 + p.ViewCount / 10.0 + COALESCE(p.AnswerCount, 0) * 5) AS QuestionPerformanceMetric,
+    RANK() OVER (PARTITION BY EXTRACT(YEAR FROM p.CreationDate) ORDER BY (p.Score * 2 + p.ViewCount / 10.0 + COALESCE(p.AnswerCount, 0) * 5) DESC) AS QuestionPerformanceRankByYear,
+    CASE
+        WHEN ues.Reputation > 10000 AND ues.GoldBadgesCount >= 5 AND ues.AveragePostViewCount > 5000 THEN 'EliteContributor'
+        WHEN ues.QuestionsAsked > 50 AND ues.AnswersProvided > 100 AND ues.CumulativePostScore > 1000 THEN 'ProdigiousAnswerer'
+        WHEN ues.TotalUpVotesGiven - ues.TotalDownVotesGiven < 0 AND ues.QuestionsAsked = 0 THEN 'PotentialSpammer'
+        WHEN p.ClosedDate IS NOT NULL AND phm.CloseEventCount > 0 AND p.AnswerCount IS NULL THEN 'UnresolvedClosedQuestion'
+        ELSE 'RegularUser'
+    END AS UserContentCategory,
+    UPPER(SUBSTRING(COALESCE(ues.DisplayName, 'ANONYMOUS') FROM 1 FOR 5)) || '-' ||
+    REPLACE(LOWER(SUBSTRING(p.Body FROM 1 FOR 30)), ' ', '_') || '-' ||
+    MD5(p.Title) AS QuestionIdentifierHash,
+    (
+        SELECT COUNT(pl.Id)
+        FROM PostLinks pl
+        WHERE pl.PostId = p.Id AND pl.LinkTypeId = (SELECT Id FROM LinkTypes WHERE Name = 'Linked')
+    ) >= 2 OR (
+        EXISTS (
+            SELECT 1
+            FROM PostLinks pl_dup
+            JOIN Posts p_dup ON pl_dup.RelatedPostId = p_dup.Id
+            WHERE pl_dup.PostId = p.Id
+              AND pl_dup.LinkTypeId = (SELECT Id FROM LinkTypes WHERE Name = 'Duplicate')
+              AND p_dup.Score > 50
+        )
+    ) AS IsHighlyReferencedOrHighScoreDuplicate
+FROM UserEngagementSummary ues
+INNER JOIN Posts p ON ues.UserId = p.OwnerUserId
+LEFT JOIN PostHistoricalMetrics phm ON p.Id = phm.PostId
+LEFT JOIN QuestionTagBreakdown qtb ON p.Id = qtb.PostId
+WHERE
+    p.PostTypeId = 1
+    AND p.CreationDate BETWEEN TIMESTAMP '2021-01-01 00:00:00' AND TIMESTAMP '2023-01-01 00:00:00'
+    AND ues.Reputation > 500
+    AND (
+        (LOWER(p.Title) LIKE '%api%' OR LOWER(p.Title) LIKE '%rest%')
+        OR
+        (LOWER(p.Tags) LIKE '%<javascript>%' AND p.ViewCount > 1000 AND p.AnswerCount > 0)
+    )
+    AND p.Id NOT IN (
+        SELECT ph_c.PostId
+        FROM PostHistory ph_c
+        WHERE ph_c.UserId = -1
+          AND ph_c.PostHistoryTypeId IN (4,5,6)
+          AND NOT EXISTS (
+              SELECT 1 FROM PostHistory ph_o WHERE ph_o.PostId = ph_c.PostId AND ph_o.UserId = p.OwnerUserId AND ph_o.PostHistoryTypeId IN (4,5,6)
+          )
+    )
+    AND phm.AvgTimeUntilFirstEditSeconds IS NOT NULL
+    AND p.AcceptedAnswerId IS NOT NULL
+GROUP BY
+    ues.UserId, ues.DisplayName, ues.Reputation, ues.QuestionsAsked, ues.AnswersProvided, ues.GoldBadgesCount,
+    ues.DaysSinceAccountCreation, ues.TotalUpVotesGiven, ues.TotalDownVotesGiven, ues.AveragePostViewCount,
+    p.Id, p.Title, p.CreationDate, p.ViewCount, p.Score, p.AnswerCount, p.Body, p.Tags, p.OwnerUserId, p.AcceptedAnswerId, p.ClosedDate,
+    phm.LastCloseReason, phm.EditRevisionCount, phm.AvgTimeUntilFirstEditSeconds
+HAVING
+    COUNT(DISTINCT qtb.TagName) > 2
+    AND SUM(p.Score) > 0
+ORDER BY QuestionPerformanceMetric DESC, ues.Reputation DESC
+LIMIT 500;

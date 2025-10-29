@@ -1,0 +1,92 @@
+WITH RankedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        pt.Name AS PostTypeName,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS ScoreRank,
+        AVG(CAST(p.Score AS DOUBLE PRECISION)) OVER (PARTITION BY p.PostTypeId) AS AvgScoreForType,
+        COUNT(c.Id) OVER (PARTITION BY p.Id) AS CommentCountForPost,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+            ELSE 'Active'
+        END AS PostStatus,
+        LAG(p.Score, 1, 0) OVER (ORDER BY p.CreationDate) AS PreviousPostScore
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    WHERE p.OwnerUserId IS NOT NULL
+),
+UserContribution AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (2, 5) THEN 1 END) AS BodyEdits,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 16 THEN 1 ELSE 0 END) AS CommunityOwnedCount,
+        MAX(u.CreationDate) AS LastUserCreationDate,
+        (CAST(COALESCE(u.LastAccessDate, u.CreationDate) AS DATE) - CAST(MIN(u.CreationDate) AS DATE)) AS UserActivitySpan
+    FROM Users u
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+PostLinkAnalysis AS (
+    SELECT
+        pl.PostId,
+        COUNT(pl.RelatedPostId) AS NumberOfLinks,
+        SUM(CASE WHEN lt.Name = 'Duplicate' THEN 1 ELSE 0 END) AS DuplicateLinkCount
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    GROUP BY pl.PostId
+)
+SELECT
+    rp.PostId,
+    rp.PostTypeName,
+    rp.Score,
+    rp.ScoreRank,
+    rp.AvgScoreForType,
+    rp.CommentCountForPost,
+    rp.PostStatus,
+    uc.DisplayName AS OwnerDisplayName,
+    uc.Reputation,
+    uc.BodyEdits,
+    uc.CommunityOwnedCount,
+    COALESCE(pla.NumberOfLinks, 0) AS TotalOutgoingLinks,
+    COALESCE(pla.DuplicateLinkCount, 0) AS TotalDuplicateLinks,
+    rp.CreationDate,
+    CASE
+        WHEN rp.Score > rp.AvgScoreForType * 1.5 AND rp.ScoreRank <= 10 THEN 'High Performer'
+        WHEN rp.Score < rp.AvgScoreForType * 0.5 AND rp.CommentCountForPost > 5 THEN 'Low Engagement/High Comment'
+        WHEN rp.PreviousPostScore IS NOT NULL AND rp.Score > rp.PreviousPostScore * 2 THEN 'Significant Score Increase'
+        WHEN uc.UserActivitySpan > 365 AND uc.Reputation > 10000 THEN 'Experienced User'
+        ELSE 'Standard'
+    END AS PerformanceCategory,
+    rp.Score - LAG(rp.Score, 1, 0) OVER (ORDER BY rp.CreationDate) AS ScoreDifferenceFromPrevious,
+    CASE WHEN rp.PostStatus = 'Closed' AND rp.Score > 0 THEN 'Closed but Scored' ELSE 'Other' END AS ClosedScoredStatus,
+    CONCAT(
+        'Title: ',
+        SUBSTRING(p.Title FROM 1 FOR 50),
+        CASE WHEN CHAR_LENGTH(p.Title) > 50 THEN '...' ELSE '' END,
+        ' | Tags: ',
+        REPLACE(REPLACE(p.Tags, '<', '['), '>', ']'),
+        ' | Owner Score: ',
+        CAST(uc.Reputation AS VARCHAR)
+    ) AS PostSummary,
+    rp.PostTypeId,
+    rp.OwnerUserId
+FROM RankedPosts rp
+JOIN Users uc ON rp.OwnerUserId = uc.Id
+LEFT JOIN PostLinkAnalysis pla ON rp.PostId = pla.PostId
+LEFT JOIN Posts p ON rp.PostId = p.Id
+WHERE rp.PostTypeId = 1
+  AND rp.Score > 5
+  AND uc.Reputation > 100
+  AND rp.CreationDate BETWEEN DATE '2023-01-01' AND DATE '2023-12-31'
+ORDER BY rp.Score DESC
+LIMIT 100;

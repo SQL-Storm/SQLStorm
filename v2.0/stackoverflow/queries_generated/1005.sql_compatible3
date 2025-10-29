@@ -1,0 +1,204 @@
+WITH UserEngagementMetrics AS (
+    SELECT
+        U.Id AS UserId,
+        COALESCE(COUNT(DISTINCT P.Id), 0) AS TotalPosts,
+        COALESCE(SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END), 0) AS QuestionCount,
+        COALESCE(SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END), 0) AS AnswerCount,
+        COALESCE(SUM(P.Score), 0) AS TotalPostScore,
+        COALESCE(COUNT(DISTINCT C.Id), 0) AS TotalComments,
+        COALESCE(SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS TotalUpvotesReceived,
+        COALESCE(SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS TotalDownvotesReceived,
+        COALESCE(COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 AND P.AcceptedAnswerId IS NOT NULL THEN P.AcceptedAnswerId ELSE NULL END), 0) AS AcceptedAnswerForOwnQuestions,
+        COALESCE(COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 AND P_Parent.AcceptedAnswerId = P.Id THEN P.Id ELSE NULL END), 0) AS OwnAnswerAcceptedCount
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Posts P_Parent ON P.ParentId = P_Parent.Id
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Votes V ON P.Id = V.PostId
+    GROUP BY U.Id
+),
+PostHistoryDetails AS (
+    SELECT
+        PH.PostId,
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE NULL END) AS CloseEvents,
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE NULL END) AS ReopenEvents,
+        COUNT(CASE WHEN PH.PostHistoryTypeId IN (35, 36) THEN 1 ELSE NULL END) AS MigrationEvents,
+        COUNT(DISTINCT CASE WHEN PH.UserId <> P.OwnerUserId AND PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.UserId ELSE NULL END) AS UniqueOtherEditors,
+        STRING_AGG(DISTINCT U.DisplayName, '; ') FILTER (WHERE PH.UserId <> P.OwnerUserId AND PH.PostHistoryTypeId IN (4,5,6)) AS OtherEditorsList
+    FROM PostHistory PH
+    JOIN Posts P ON PH.PostId = P.Id
+    LEFT JOIN Users U ON PH.UserId = U.Id
+    WHERE PH.PostHistoryTypeId IN (4, 5, 6, 10, 11, 35, 36)
+    GROUP BY PH.PostId, P.OwnerUserId
+),
+UserHistoryAggregates AS (
+    SELECT
+        P.OwnerUserId AS UserId,
+        COALESCE(SUM(PHD.CloseEvents), 0) AS UserTotalCloseEvents,
+        COALESCE(SUM(PHD.ReopenEvents), 0) AS UserTotalReopenEvents,
+        COALESCE(SUM(PHD.MigrationEvents), 0) AS UserTotalMigrationEvents,
+        COALESCE(SUM(PHD.UniqueOtherEditors), 0) AS UserTotalUniqueOtherEditors,
+        STRING_AGG(DISTINCT PHD.OtherEditorsList, '; ') FILTER (WHERE PHD.OtherEditorsList IS NOT NULL AND PHD.OtherEditorsList <> '') AS CombinedOtherEditors
+    FROM Posts P
+    JOIN PostHistoryDetails PHD ON P.Id = PHD.PostId
+    WHERE P.OwnerUserId IS NOT NULL
+    GROUP BY P.OwnerUserId
+),
+UserTagPairs AS (
+    -- split tags into rows in a portable way without LATERAL
+    SELECT
+        P.OwnerUserId AS UserId,
+        TRIM(split.tag) AS TagName
+    FROM Posts P
+    JOIN (
+        -- produce inner_tags per post
+        SELECT
+            Id AS post_id,
+            CASE WHEN LENGTH(Tags) > 2 THEN SUBSTRING(Tags FROM 2 FOR LENGTH(Tags) - 2) ELSE NULL END AS inner_tags
+        FROM Posts
+    ) t_inner ON t_inner.post_id = P.Id
+    JOIN (
+        -- recursive splitter per row (standard SQL recursive CTE per post)
+        WITH RECURSIVE split_all(post_id, tag_str, rest, tag) AS (
+            SELECT
+                t_inner.post_id,
+                t_inner.inner_tags,
+                t_inner.inner_tags,
+                NULL
+            UNION ALL
+            SELECT
+                post_id,
+                CASE WHEN POSITION('><' IN rest) = 0 THEN '' ELSE SUBSTRING(rest FROM POSITION('><' IN rest) + 2) END,
+                CASE WHEN POSITION('><' IN rest) = 0 THEN '' ELSE SUBSTRING(rest FROM POSITION('><' IN rest) + 2) END,
+                CASE WHEN POSITION('><' IN rest) = 0 THEN rest ELSE SUBSTRING(rest FROM 1 FOR POSITION('><' IN rest) - 1) END
+            FROM split_all
+            WHERE rest <> ''
+        )
+        SELECT post_id, tag FROM split_all WHERE tag IS NOT NULL
+    ) split ON split.post_id = P.Id
+    WHERE P.PostTypeId = 1 AND P.OwnerUserId IS NOT NULL AND P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2
+),
+UserTopTags AS (
+    SELECT
+        UserId,
+        STRING_AGG(TagName, ', ' ORDER BY TagPostCount DESC, TagName) AS TopTagsString,
+        MAX(TagPostCount) AS MaxPostsInSingleTag
+    FROM (
+        SELECT
+            utp.UserId,
+            utp.TagName,
+            COUNT(*) AS TagPostCount,
+            ROW_NUMBER() OVER (PARTITION BY utp.UserId ORDER BY COUNT(*) DESC, utp.TagName) AS rn
+        FROM UserTagPairs utp
+        GROUP BY utp.UserId, utp.TagName
+    ) AS t
+    WHERE rn <= 3
+    GROUP BY UserId
+),
+UserBadgeMetrics AS (
+    SELECT
+        B.UserId,
+        COUNT(CASE WHEN B.Class = 1 THEN 1 ELSE NULL END) AS GoldBadgeCount,
+        COUNT(CASE WHEN B.Class = 2 THEN 1 ELSE NULL END) AS SilverBadgeCount,
+        COUNT(CASE WHEN B.Class = 3 THEN 1 ELSE NULL END) AS BronzeBadgeCount,
+        COUNT(CASE WHEN B.TagBased = TRUE THEN 1 ELSE NULL END) AS TagBasedBadgeCount
+    FROM Badges B
+    GROUP BY B.UserId
+)
+SELECT
+    U.Id AS UserID,
+    U.DisplayName,
+    U.Reputation,
+    U.CreationDate,
+    U.LastAccessDate,
+    U.Views AS ProfileViews,
+    UEM.TotalPosts,
+    UEM.QuestionCount,
+    UEM.AnswerCount,
+    UEM.TotalPostScore,
+    UEM.TotalComments,
+    UEM.TotalUpvotesReceived,
+    UEM.TotalDownvotesReceived,
+    UEM.AcceptedAnswerForOwnQuestions + UEM.OwnAnswerAcceptedCount AS TotalAcceptedAnswers,
+    UHA.UserTotalCloseEvents,
+    UHA.UserTotalReopenEvents,
+    UHA.UserTotalMigrationEvents,
+    UHA.UserTotalUniqueOtherEditors,
+    UTT.TopTagsString,
+    UTT.MaxPostsInSingleTag,
+    CAST(UEM.TotalPostScore AS NUMERIC) / NULLIF(UEM.TotalPosts + UEM.TotalComments, 0) AS AvgEngagementScore,
+    LENGTH(COALESCE(U.AboutMe, '')) AS AboutMeLength,
+    COALESCE(UPPER(SUBSTRING(U.Location FROM 1 FOR 10)), 'N/A') AS ShortLocationUpper,
+    (SELECT COALESCE(MAX(P_Ans.Score), 0) FROM Posts P_Ans WHERE P_Ans.OwnerUserId = U.Id AND P_Ans.PostTypeId = 2) AS CorrelatedMaxPostScore,
+    RANK() OVER (ORDER BY U.Reputation DESC, UEM.TotalPostScore DESC) AS RankMetric,
+    NTILE(10) OVER (ORDER BY UEM.TotalPosts + UEM.TotalComments DESC, U.LastAccessDate DESC) AS DecileMetric,
+    LAG(U.CreationDate, 1, TIMESTAMP '1970-01-01 00:00:00') OVER (ORDER BY U.Reputation DESC) AS LaggedDateMetric,
+    CASE
+        WHEN U.AboutMe IS NULL OR TRIM(U.AboutMe) = '' THEN 'No AboutMe Provided'
+        WHEN LENGTH(U.AboutMe) < 50 THEN 'Short AboutMe'
+        ELSE 'Detailed AboutMe'
+    END AS CategoricalInfo,
+    REPLACE(REPLACE(U.DisplayName, ' ', '_'), '-', '__') AS ModifiedDisplayName,
+    COALESCE(UBM.GoldBadgeCount, 0) AS BadgeMetric1,
+    COALESCE(UBM.SilverBadgeCount, 0) AS BadgeMetric2
+FROM Users U
+LEFT JOIN UserEngagementMetrics UEM ON U.Id = UEM.UserId
+LEFT JOIN UserHistoryAggregates UHA ON U.Id = UHA.UserId
+LEFT JOIN UserTopTags UTT ON U.Id = UTT.UserId
+LEFT JOIN UserBadgeMetrics UBM ON U.Id = UBM.UserId
+WHERE U.Reputation >= 5000
+  AND U.LastAccessDate >= (CAST('2024-10-01' AS date) - INTERVAL '1 year')
+  AND COALESCE(UEM.TotalPosts, 0) >= 50
+  AND (COALESCE(UHA.UserTotalUniqueOtherEditors, 0) >= 3 OR COALESCE(UEM.AcceptedAnswerForOwnQuestions, 0) + COALESCE(UEM.OwnAnswerAcceptedCount, 0) >= 10)
+  AND (U.WebsiteUrl IS NOT NULL OR (U.AboutMe IS NOT NULL AND LENGTH(U.AboutMe) > 100))
+
+UNION ALL
+
+SELECT
+    U.Id AS UserID,
+    U.DisplayName,
+    U.Reputation,
+    U.CreationDate,
+    U.LastAccessDate,
+    U.Views AS ProfileViews,
+    UEM.TotalPosts,
+    UEM.QuestionCount,
+    UEM.AnswerCount,
+    UEM.TotalPostScore,
+    UEM.TotalComments,
+    UEM.TotalUpvotesReceived,
+    UEM.TotalDownvotesReceived,
+    UEM.AcceptedAnswerForOwnQuestions + UEM.OwnAnswerAcceptedCount AS TotalAcceptedAnswers,
+    UHA.UserTotalCloseEvents,
+    UHA.UserTotalReopenEvents,
+    UHA.UserTotalMigrationEvents,
+    UHA.UserTotalUniqueOtherEditors,
+    UTT.TopTagsString,
+    UTT.MaxPostsInSingleTag,
+    CAST(U.UpVotes AS NUMERIC) / NULLIF(U.UpVotes + U.DownVotes, 0) AS AvgUpvoteRatioGiven,
+    LENGTH(COALESCE(U.AboutMe, '')) AS AboutMeLength,
+    COALESCE(LOWER(SUBSTRING(U.Location FROM 1 FOR 10)), 'n/a') AS ShortLocationUpper,
+    (SELECT COALESCE(MAX(P_Q.Score), 0) FROM Posts P_Q WHERE P_Q.OwnerUserId = U.Id AND P_Q.PostTypeId = 1) AS CorrelatedMaxPostScore,
+    RANK() OVER (ORDER BY UEM.TotalUpvotesReceived DESC, U.CreationDate) AS RankMetric,
+    NTILE(5) OVER (ORDER BY UEM.QuestionCount DESC, UEM.AnswerCount DESC) AS DecileMetric,
+    LAG(U.LastAccessDate, 1, TIMESTAMP '1970-01-01 00:00:00') OVER (ORDER BY UEM.TotalPosts ASC) AS LaggedDateMetric,
+    CASE
+        WHEN U.Views >= 500 THEN 'High Profile Views'
+        WHEN U.Views >= 100 THEN 'Moderate Profile Views'
+        ELSE 'Low Profile Views'
+    END AS CategoricalInfo,
+    REPLACE(U.DisplayName, ' ', '-') AS ModifiedDisplayName,
+    COALESCE(UBM.BronzeBadgeCount, 0) AS BadgeMetric1,
+    COALESCE(UBM.TagBasedBadgeCount, 0) AS BadgeMetric2
+FROM Users U
+LEFT JOIN UserEngagementMetrics UEM ON U.Id = UEM.UserId
+LEFT JOIN UserHistoryAggregates UHA ON U.Id = UHA.UserId
+LEFT JOIN UserTopTags UTT ON U.Id = UTT.UserId
+LEFT JOIN UserBadgeMetrics UBM ON U.Id = UBM.UserId
+WHERE U.Reputation BETWEEN 500 AND 4999
+  AND U.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '2 year')
+  AND COALESCE(UEM.TotalPosts, 0) >= 10
+  AND UTT.TopTagsString IS NOT NULL AND (UTT.TopTagsString LIKE '%sql%' OR UTT.TopTagsString LIKE '%python%')
+  AND (U.AboutMe IS NOT NULL AND U.AboutMe LIKE '%developer%')
+ORDER BY Reputation DESC, UserID
+LIMIT 2000;

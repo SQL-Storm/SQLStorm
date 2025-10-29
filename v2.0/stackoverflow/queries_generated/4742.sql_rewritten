@@ -1,0 +1,145 @@
+-- {"query": "4742.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1389} 
+WITH
+  RankedAnswers AS (
+    SELECT
+      p.Id AS PostId,
+      p.ParentId AS QuestionId,
+      p.OwnerUserId,
+      p.CreationDate AS AnswerCreationDate,
+      p.Score AS AnswerScore,
+      ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS rn
+    FROM Posts AS p
+    WHERE
+      p.PostTypeId = 2 AND p.ParentId IS NOT NULL
+  ),
+  QuestionDetails AS (
+    SELECT
+      q.Id AS QuestionId,
+      q.OwnerUserId AS QuestionOwnerUserId,
+      q.Title AS QuestionTitle,
+      q.CreationDate AS QuestionCreationDate,
+      q.Score AS QuestionScore,
+      q.AnswerCount,
+      q.FavoriteCount,
+      q.ViewCount AS QuestionViewCount,
+      COUNT(c.Id) AS CommentCountOnQuestion,
+      MAX(c.CreationDate) AS LastQuestionCommentDate,
+      CASE
+        WHEN q.ClosedDate IS NOT NULL THEN 'Closed'
+        ELSE 'Open'
+      END AS QuestionStatus
+    FROM Posts AS q
+    LEFT JOIN Comments AS c
+      ON q.Id = c.PostId
+    WHERE
+      q.PostTypeId = 1
+    GROUP BY
+      q.Id,
+      q.OwnerUserId,
+      q.Title,
+      q.CreationDate,
+      q.Score,
+      q.AnswerCount,
+      q.FavoriteCount,
+      q.ViewCount,
+      q.ClosedDate
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate AS UserCreationDate,
+      COUNT(CASE WHEN ph.PostHistoryTypeId IN (2, 5) THEN 1 ELSE NULL END) AS BodyEdits,
+      COUNT(CASE WHEN ph.PostHistoryTypeId IN (1, 4) THEN 1 ELSE NULL END) AS TitleEdits,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesGiven,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesGiven,
+      COUNT(DISTINCT b.Id) AS BadgesEarned
+    FROM Users AS u
+    LEFT JOIN PostHistory AS ph
+      ON u.Id = ph.UserId
+    LEFT JOIN Votes AS v
+      ON u.Id = v.UserId
+    LEFT JOIN Badges AS b
+      ON u.Id = b.UserId
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate
+  ),
+  TopAnswers AS (
+    SELECT
+      ra.QuestionId,
+      ra.AnswerId,
+      ra.OwnerUserId AS AnswerOwnerUserId,
+      ra.AnswerScore,
+      ra.AnswerCreationDate,
+      ROW_NUMBER() OVER (PARTITION BY ra.QuestionId ORDER BY ra.AnswerScore DESC, ra.AnswerCreationDate ASC) AS answer_rank
+    FROM RankedAnswers AS ra
+    WHERE
+      ra.rn <= 5 -- Considering top 5 answers per question
+  )
+SELECT
+  qd.QuestionId,
+  qd.QuestionTitle,
+  qd.QuestionOwnerUserId,
+  ua.DisplayName AS QuestionOwnerDisplayName,
+  qd.QuestionScore,
+  qd.QuestionCreationDate,
+  qd.QuestionStatus,
+  qd.AnswerCount,
+  qd.FavoriteCount,
+  qd.QuestionViewCount,
+  qd.CommentCountOnQuestion,
+  qd.LastQuestionCommentDate,
+  ta.AnswerId AS TopAnswerId,
+  ta.AnswerOwnerUserId AS TopAnswerOwnerUserId,
+  ua_ans.DisplayName AS TopAnswerOwnerDisplayName,
+  ta.AnswerScore AS TopAnswerScore,
+  ta.AnswerCreationDate AS TopAnswerCreationDate,
+  ua.Reputation AS QuestionOwnerReputation,
+  ua_ans.Reputation AS TopAnswerOwnerReputation,
+  ua.BodyEdits AS QuestionOwnerBodyEdits,
+  ua.TitleEdits AS QuestionOwnerTitleEdits,
+  ua.UpVotesGiven AS QuestionOwnerUpVotesGiven,
+  ua.DownVotesGiven AS QuestionOwnerDownVotesGiven,
+  ua.BadgesEarned AS QuestionOwnerBadgesEarned,
+  COALESCE(pt.Name, 'Unknown Post Type') AS QuestionPostType,
+  CONCAT(
+    SUBSTRING(COALESCE(ua.DisplayName, 'Anonymous User'), 1, 1),
+    '...' -- Truncate display name for analysis
+  ) AS TruncatedQuestionOwnerName,
+  CASE
+    WHEN qd.QuestionScore > 1000 THEN 'High Score'
+    WHEN qd.QuestionScore > 100 THEN 'Medium Score'
+    ELSE 'Low Score'
+  END AS ScoreCategory,
+  CASE
+    WHEN qd.AnswerCount >= qd.QuestionViewCount / 100 THEN 'High Engagement'
+    WHEN qd.AnswerCount > 0 THEN 'Moderate Engagement'
+    ELSE 'Low Engagement'
+  END AS EngagementLevel,
+  DATEDIFF(day, qd.QuestionCreationDate, cast('2024-10-01 12:34:56' as timestamp)) AS DaysSinceCreation,
+  (
+    SELECT
+      COUNT(*)
+    FROM PostLinks AS pl
+    WHERE
+      pl.PostId = qd.QuestionId AND pl.LinkTypeId = 3
+  ) AS DuplicateLinks
+FROM QuestionDetails AS qd
+LEFT JOIN UserActivity AS ua
+  ON qd.QuestionOwnerUserId = ua.UserId
+LEFT JOIN TopAnswers AS ta
+  ON qd.QuestionId = ta.QuestionId
+LEFT JOIN UserActivity AS ua_ans
+  ON ta.AnswerOwnerUserId = ua_ans.UserId
+LEFT JOIN PostTypes AS pt
+  ON 1 = pt.Id -- Assuming we only want to analyze questions (PostTypeId = 1)
+WHERE
+  qd.QuestionScore IS NOT NULL AND ua.Reputation > 0
+ORDER BY
+  qd.QuestionScore DESC,
+  qd.QuestionCreationDate DESC
+LIMIT 100;

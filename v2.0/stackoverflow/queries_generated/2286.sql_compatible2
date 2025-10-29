@@ -1,0 +1,180 @@
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        p.PostTypeId,
+        p.Id as PostId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate as PostCreation,
+        ph.PostHistoryTypeId,
+        ph.CreationDate as HistoryCreation,
+        ph.UserId as EditorUserId,
+        ph.PostId as HistoryPostId,
+        v.VoteTypeId,
+        v.CreationDate as VoteDate,
+        b.Name as BadgeName,
+        b.Date as BadgeDate,
+        dense_rank() over (partition by u.Id order by p.CreationDate desc) as PostRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join PostHistory ph on ph.PostId = p.Id
+    left join Votes v on v.PostId = p.Id
+    left join Badges b on b.UserId = u.Id
+    where u.Reputation > 1000
+),
+LatestUserPosts as (
+    select distinct on (UserId) UserId, PostId, PostTypeId, Score, ViewCount, PostCreation
+    from RecursiveUserActivity
+    where PostRank = 1
+    order by UserId, PostCreation desc
+),
+PostAnswersAgg as (
+    select
+        p.Id as QuestionId,
+        count(a.Id) as AnswerCount,
+        max(a.Score) as MaxAnswerScore,
+        min(a.Score) as MinAnswerScore,
+        avg(a.Score) as AvgAnswerScore,
+        sum(case when a.OwnerUserId is null then 0 else 1 end) as AnsweredByRegisteredUsers
+    from Posts p
+    left join Posts a on a.ParentId = p.Id and a.PostTypeId = 2
+    where p.PostTypeId = 1
+    group by p.Id
+),
+ComplexUserStats as (
+    select
+        u.Id,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as TotalQuestions,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as TotalAnswers,
+        coalesce(sum(vu.VoteScore), 0) as TotalVoteScore,
+        coalesce(sum(bc.BadgeScore), 0) as BadgeScore,
+        max(p.Score) as MaxPostScore,
+        bool_or(p.ClosedDate is not null) as HasClosedPosts,
+        min(p.CreationDate) as FirstPostDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join (
+        select
+            v.PostId,
+            sum(case when vt.Name = 'UpMod' then 1 when vt.Name = 'DownMod' then -1 else 0 end) as VoteScore
+        from Votes v
+        join VoteTypes vt on vt.Id = v.VoteTypeId
+        group by v.PostId
+    ) vu on vu.PostId = p.Id
+    left join (
+        select
+            UserId,
+            sum(
+                case
+                    when Class = 1 then 100
+                    when Class = 2 then 50
+                    when Class = 3 then 10
+                    else 0
+                end
+            ) as BadgeScore
+        from Badges
+        group by UserId
+    ) bc on bc.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+TagUsage as (
+    select
+        trim(both '<>' from unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags) - 2), '><'))) as Tag,
+        count(p.Id) as PostCount,
+        avg(p.Score) as AvgScore,
+        max(p.ViewCount) as MaxViewCount
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+    group by Tag
+    having count(p.Id) > 10
+),
+DuplicateQuestionLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate,
+        u.DisplayName as OwnerName,
+        q.Title as QuestionTitle,
+        q.Score as QuestionScore,
+        (select count(*) from PostLinks pl2 where pl2.PostId = pl.PostId and pl2.LinkTypeId = 3) as TotalDuplicates
+    from PostLinks pl
+    join Posts q on q.Id = pl.PostId and q.PostTypeId = 1
+    join Users u on u.Id = q.OwnerUserId
+    where pl.LinkTypeId = 3
+),
+UserCommentActivity as (
+    select
+        c.UserId,
+        u.DisplayName,
+        count(c.Id) as CommentCount,
+        count(distinct c.PostId) as DistinctPostsCommented,
+        max(c.CreationDate) as LastCommentDate,
+        bool_or(c.Text ilike '%help%') as AskedForHelp
+    from Comments c
+    left join Users u on u.Id = c.UserId
+    where c.UserId is not null
+    group by c.UserId, u.DisplayName
+),
+FilteredUsers as (
+    select
+        cus.Id,
+        cus.DisplayName,
+        cus.TotalQuestions,
+        cus.TotalAnswers,
+        cus.TotalVoteScore,
+        cus.BadgeScore,
+        cus.MaxPostScore,
+        cus.HasClosedPosts,
+        cus.FirstPostDate,
+        uca.CommentCount,
+        uca.DistinctPostsCommented,
+        uca.LastCommentDate,
+        uca.AskedForHelp
+    from ComplexUserStats cus
+    left join UserCommentActivity uca on uca.UserId = cus.Id
+    where cus.TotalQuestions > 5
+      and cus.TotalAnswers > 5
+      and cus.BadgeScore > 50
+      and (cus.HasClosedPosts = false or cus.HasClosedPosts is null)
+      and uca.CommentCount > 3
+),
+RankedFilteredUsers as (
+    select rfu_all.*,
+        row_number() over (order by rfu_all.TotalVoteScore desc, rfu_all.BadgeScore desc, rfu_all.TotalQuestions desc) as Rank
+    from FilteredUsers rfu_all
+)
+select
+    rfu.Rank,
+    rfu.DisplayName,
+    rfu.TotalQuestions,
+    rfu.TotalAnswers,
+    rfu.TotalVoteScore,
+    rfu.BadgeScore,
+    rfu.MaxPostScore,
+    cast(rfu.FirstPostDate as date) as FirstPostDate,
+    rfu.CommentCount,
+    rfu.DistinctPostsCommented,
+    cast(rfu.LastCommentDate as date) as LastCommentDate,
+    rfu.AskedForHelp,
+    tu.Tag as FrequentTag,
+    tu.PostCount as TagUsageCount,
+    tu.AvgScore as TagAvgScore,
+    tu.MaxViewCount as TagMaxViewCount,
+    coalesce(paa.AnswerCount, 0) as QuestionAnswerCount,
+    coalesce(paa.MaxAnswerScore, 0) as HighestAnswerScore,
+    coalesce(paa.MinAnswerScore, 0) as LowestAnswerScore,
+    coalesce(paa.AvgAnswerScore, 0) as AverageAnswerScore
+from RankedFilteredUsers rfu
+left join LatestUserPosts lup on lup.UserId = rfu.Id
+left join PostAnswersAgg paa on paa.QuestionId = lup.PostId
+left join TagUsage tu on tu.Tag = (
+    select trim(both '<>' from unnest(string_to_array(substring(p2.Tags from 2 for length(p2.Tags) - 2), '><')))
+    from Posts p2
+    where p2.Id = lup.PostId and p2.Tags is not null
+    limit 1
+)
+order by rfu.Rank
+limit 100;

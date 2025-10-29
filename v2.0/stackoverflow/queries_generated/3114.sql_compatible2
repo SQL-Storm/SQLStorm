@@ -1,0 +1,135 @@
+WITH UserStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.UpVotes, 0) - COALESCE(u.DownVotes, 0) AS NetVotes,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswerCount,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes
+),
+RecentVotes AS (
+    SELECT
+        v.UserId,
+        COUNT(*) AS VoteCount,
+        SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVoteCount,
+        MAX(v.CreationDate) AS LastVoteDate
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE v.CreationDate >= (DATE '2024-10-01' - INTERVAL '30' DAY)
+    GROUP BY v.UserId
+),
+TagPopularity AS (
+    SELECT
+        t.TagName,
+        t.Count AS TagUseCount,
+        COALESCE(e.ExcerptLength, 0) + COALESCE(w.WikiLength, 0) AS ContentLength,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank
+    FROM Tags t
+    LEFT JOIN (
+        SELECT p.Id, LENGTH(p.Body) AS ExcerptLength
+        FROM Posts p
+    ) e ON e.Id = t.ExcerptPostId
+    LEFT JOIN (
+        SELECT p.Id, LENGTH(p.Body) AS WikiLength
+        FROM Posts p
+    ) w ON w.Id = t.WikiPostId
+    WHERE t.IsModeratorOnly = 0
+),
+TopPosts AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS RankInType
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+      AND p.Score IS NOT NULL
+),
+PostTags AS (
+    SELECT
+        p.OwnerUserId,
+        TRIM(tag) AS TagName
+    FROM Posts p,
+    LATERAL (
+        SELECT regexp_split_to_table(substring(p.Tags, 2, char_length(p.Tags)-2), '>') AS value
+    ) AS split(tag)
+    WHERE p.Tags IS NOT NULL
+)
+SELECT
+    us.Id AS UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.NetVotes,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    us.QuestionCount,
+    us.AnswerCount,
+    us.LastPostDate,
+    COALESCE(rv.VoteCount, 0) AS RecentVoteCount,
+    COALESCE(rv.UpVoteCount, 0) AS RecentUpVotes,
+    COALESCE(rv.DownVoteCount, 0) AS RecentDownVotes,
+    rv.LastVoteDate,
+    tp.Id AS TopQuestionId,
+    tp.Title AS TopQuestionTitle,
+    tp.Score AS TopQuestionScore,
+    tp.ViewCount AS TopQuestionViews,
+    tp.CreationDate AS TopQuestionDate,
+    CASE
+        WHEN tp.RankInType = 1 THEN 'Top Question'
+        WHEN tp.RankInType = 2 THEN 'Second Question'
+        ELSE NULL
+    END AS QuestionTier,
+    STRING_AGG(DISTINCT tg.TagName, ', ') AS PopularTags
+FROM UserStats us
+LEFT JOIN RecentVotes rv ON rv.UserId = us.Id
+LEFT JOIN TopPosts tp ON tp.OwnerUserId = us.Id
+    AND tp.PostTypeId = 1
+    AND tp.RankInType <= 2
+LEFT JOIN PostTags ptg ON ptg.OwnerUserId = us.Id
+LEFT JOIN TagPopularity tg ON tg.TagName = ptg.TagName
+GROUP BY
+    us.Id, us.DisplayName, us.Reputation, us.NetVotes,
+    us.GoldBadges, us.SilverBadges, us.BronzeBadges,
+    us.QuestionCount, us.AnswerCount, us.LastPostDate,
+    rv.VoteCount, rv.UpVoteCount, rv.DownVoteCount, rv.LastVoteDate,
+    tp.Id, tp.Title, tp.Score, tp.ViewCount, tp.CreationDate, tp.RankInType
+HAVING SUM(CASE WHEN us.Reputation > 10000 THEN 1 ELSE 0 END) > 0
+ORDER BY us.Reputation DESC
+LIMIT 100
+UNION ALL
+SELECT
+    NULL AS UserId,
+    NULL AS DisplayName,
+    NULL AS Reputation,
+    NULL AS NetVotes,
+    NULL AS GoldBadges,
+    NULL AS SilverBadges,
+    NULL AS BronzeBadges,
+    NULL AS QuestionCount,
+    NULL AS AnswerCount,
+    NULL AS LastPostDate,
+    NULL AS RecentVoteCount,
+    NULL AS RecentUpVotes,
+    NULL AS RecentDownVotes,
+    NULL AS LastVoteDate,
+    NULL AS TopQuestionId,
+    NULL AS TopQuestionTitle,
+    NULL AS TopQuestionScore,
+    NULL AS TopQuestionViews,
+    NULL AS TopQuestionDate,
+    NULL AS QuestionTier,
+    NULL AS PopularTags;

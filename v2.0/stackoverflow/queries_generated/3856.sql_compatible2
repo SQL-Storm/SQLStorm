@@ -1,0 +1,123 @@
+WITH
+    RecentPosts AS (
+        SELECT
+            p.Id,
+            p.OwnerUserId,
+            p.PostTypeId,
+            p.Score,
+            p.CreationDate,
+            CASE WHEN p.PostTypeId = 1 THEN p.AnswerCount ELSE NULL END AS AnswerCount,
+            COALESCE(p.FavoriteCount, 0) AS FavoriteCount
+        FROM Posts p
+        WHERE p.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '180 days'
+    ),
+    UserPostAgg AS (
+        SELECT
+            u.Id AS UserId,
+            COUNT(rp.Id) FILTER (WHERE rp.PostTypeId = 1) AS QuestionCount,
+            COUNT(rp.Id) FILTER (WHERE rp.PostTypeId = 2) AS AnswerCount,
+            SUM(rp.Score)                                 AS TotalScore,
+            AVG(rp.Score)                                 AS AvgScore,
+            SUM(rp.FavoriteCount)                         AS TotalFavorites,
+            MAX(rp.CreationDate)                          AS LastPostDate
+        FROM Users u
+        LEFT JOIN RecentPosts rp ON rp.OwnerUserId = u.Id
+        GROUP BY u.Id
+    ),
+    BadgeAgg AS (
+        SELECT
+            b.UserId,
+            COUNT(*) FILTER (WHERE b.Class = 1)                 AS GoldBadges,
+            COUNT(*) FILTER (WHERE b.Class = 2)                 AS SilverBadges,
+            COUNT(*) FILTER (WHERE b.Class = 3)                 AS BronzeBadges,
+            SUM(CASE WHEN COALESCE(b.TagBased, FALSE) = TRUE THEN 1 ELSE 0 END)    AS TagBasedBadges
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+    VoteAgg AS (
+        SELECT
+            v.PostId,
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+            SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoriteVotes
+        FROM Votes v
+        GROUP BY v.PostId
+    ),
+    UserVoteSummary AS (
+        SELECT
+            up.OwnerUserId                                     AS UserId,
+            COALESCE(SUM(va.UpVotes), 0)                        AS TotalUpVotes,
+            COALESCE(SUM(va.DownVotes), 0)                      AS TotalDownVotes,
+            COALESCE(SUM(va.FavoriteVotes), 0)                  AS TotalFavoriteVotes
+        FROM Posts up
+        LEFT JOIN VoteAgg va ON va.PostId = up.Id
+        GROUP BY up.OwnerUserId
+    ),
+    TagUsage AS (
+        SELECT
+            p.OwnerUserId                                      AS UserId,
+            UNNEST(string_to_array(TRIM(BOTH '<>' FROM p.Tags), '><')) AS Tag,
+            COUNT(*)                                           AS TagCount
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+          AND p.Tags IS NOT NULL
+        GROUP BY p.OwnerUserId, Tag
+    ),
+    TopUserTags AS (
+        SELECT
+            tu.UserId,
+            STRING_AGG(tu.Tag, ', ' ORDER BY tu.TagCount DESC) AS TopTags
+        FROM (
+            SELECT
+                tu.*,
+                ROW_NUMBER() OVER (PARTITION BY tu.UserId ORDER BY tu.TagCount DESC) AS rn
+            FROM TagUsage tu
+        ) tu
+        WHERE tu.rn <= 5
+        GROUP BY tu.UserId
+    ),
+    Combined AS (
+        SELECT
+            u.Id,
+            u.DisplayName,
+            COALESCE(up.QuestionCount, 0)      AS Questions,
+            COALESCE(up.AnswerCount, 0)        AS Answers,
+            COALESCE(up.TotalScore, 0)         AS ScoreSum,
+            COALESCE(b.GoldBadges, 0)          AS Gold,
+            COALESCE(b.SilverBadges, 0)        AS Silver,
+            COALESCE(b.BronzeBadges, 0)        AS Bronze,
+            COALESCE(vs.TotalUpVotes, 0)       AS UpVotes,
+            COALESCE(vs.TotalDownVotes, 0)     AS DownVotes,
+            COALESCE(tut.TopTags, '')          AS TopTags,
+            ROW_NUMBER() OVER (
+                ORDER BY COALESCE(up.TotalScore, 0) + COALESCE(vs.TotalUpVotes, 0) * 2 DESC
+            )                                 AS RankScore
+        FROM Users u
+        LEFT JOIN UserPostAgg up      ON up.UserId = u.Id
+        LEFT JOIN BadgeAgg b          ON b.UserId = u.Id
+        LEFT JOIN UserVoteSummary vs  ON vs.UserId = u.Id
+        LEFT JOIN TopUserTags tut     ON tut.UserId = u.Id
+    )
+SELECT *
+FROM Combined
+WHERE RankScore <= 100
+
+UNION ALL
+
+SELECT
+    NULL                           AS Id,
+    'Aggregated Totals'            AS DisplayName,
+    SUM(Questions)                 AS Questions,
+    SUM(Answers)                   AS Answers,
+    SUM(ScoreSum)                  AS ScoreSum,
+    SUM(Gold)                      AS Gold,
+    SUM(Silver)                    AS Silver,
+    SUM(Bronze)                    AS Bronze,
+    SUM(UpVotes)                   AS UpVotes,
+    SUM(DownVotes)                 AS DownVotes,
+    NULL                           AS TopTags,
+    NULL                           AS RankScore
+FROM Combined
+WHERE RankScore IS NOT NULL
+
+ORDER BY RankScore ASC NULLS LAST;

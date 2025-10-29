@@ -1,0 +1,320 @@
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate AS UserLastAccessDate,
+        U.Reputation,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS TotalUpvotesGiven,
+        U.DownVotes AS TotalDownvotesGiven,
+        COUNT(DISTINCT P.Id) AS TotalPostsByOwner,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestionsByOwner,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswersByOwner,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT B.Id) AS TotalBadgesEarned,
+        COUNT(DISTINCT CASE WHEN B.Class = 1 THEN B.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN B.Class = 2 THEN B.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN B.Class = 3 THEN B.Id END) AS BronzeBadges,
+        SUM(P.Score) AS TotalPostScoreOwned,
+        COALESCE(AVG(P.Score), 0.0) AS AvgPostScoreOwned,
+        COUNT(DISTINCT V.PostId) AS UniquePostsVotedOn,
+        COUNT(CASE WHEN V.VoteTypeId = 2 THEN V.Id END) AS UpvotesCastBySelf,
+        COUNT(CASE WHEN V.VoteTypeId = 3 THEN V.Id END) AS DownvotesCastBySelf,
+        MAX(P.LastActivityDate) AS LastPostActivityDate,
+        MAX(C.CreationDate) AS LastCommentDate,
+        CAST(EXTRACT(EPOCH FROM (U.LastAccessDate - U.CreationDate)) / (60 * 60 * 24) AS INTEGER) AS AccountAgeDays,
+        NULLIF(U.Reputation, 0) AS ReputationNotNull,
+        AVG(U.Reputation) OVER () AS GlobalAvgReputation,
+        COALESCE(U.Location, 'Earth') AS UserLocation,
+        MAX(B.Date) AS LatestBadgeDate,
+        MIN(B.Date) AS EarliestBadgeDate,
+        LEAD(U.CreationDate) OVER (ORDER BY U.CreationDate) AS NextUserCreationDate,
+        LAG(U.CreationDate) OVER (ORDER BY U.CreationDate) AS PrevUserCreationDate
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN Votes V ON U.Id = V.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.CreationDate, U.LastAccessDate, U.Reputation, U.Views, U.UpVotes, U.DownVotes, U.Location
+),
+PostDetailMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        COALESCE(P.Title, 'Untitled Post') AS PostTitle,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.LastActivityDate,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        LENGTH(P.Body) AS BodyCharacterLength,
+        LENGTH(P.Title) AS TitleCharacterLength,
+        COALESCE(NULLIF(array_length(string_to_array(TRIM(BOTH '<>' FROM P.Tags), '><'), 1), NULL), 0) AS TagCount,
+        COALESCE(SUM(C.Score), 0) AS TotalCommentScore,
+        COUNT(DISTINCT C.UserId) AS UniqueCommenters,
+        CAST(ROUND((EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - P.CreationDate)) / (60 * 60 * 24 * 30.4375)), 2) AS NUMERIC) AS MonthsSincePostCreation,
+        CASE
+            WHEN P.ClosedDate IS NOT NULL AND P.PostTypeId = 1 THEN 'Closed Question'
+            WHEN P.AcceptedAnswerId IS NOT NULL AND P.PostTypeId = 1 THEN 'Question with Accepted Answer'
+            WHEN P.PostTypeId = 2 AND P.ParentId IS NOT NULL THEN 'Answer Post'
+            WHEN P.PostTypeId = 1 AND COALESCE(P.ViewCount, 0) = 0 THEN 'Zero View Question'
+            ELSE 'Other/Open Post'
+        END AS PostDetailedStatus,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.Score DESC, P.CreationDate DESC) AS OwnerPostRankByScore,
+        LAG(P.CreationDate, 1, P.CreationDate) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate) AS PrevPostByOwnerCreationDate,
+        LEAD(P.CreationDate, 1, P.CreationDate) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate) AS NextPostByOwnerCreationDate,
+        COALESCE(PH.Comment, 'No History Comment') AS LatestHistoryComment,
+        PH.PostHistoryTypeId AS LatestPostHistoryType,
+        PH_Type.Name AS LatestPostHistoryTypeName,
+        COUNT(DISTINCT PH.Id) AS TotalHistoryEntriesForPost
+    FROM Posts P
+    LEFT JOIN PostTypes PT ON P.PostTypeId = PT.Id
+    LEFT JOIN Comments C ON P.Id = C.PostId
+    LEFT JOIN (
+        SELECT Id, PostId, PostHistoryTypeId, Comment, CreationDate,
+               ROW_NUMBER() OVER (PARTITION BY PostId ORDER BY CreationDate DESC) as rn
+        FROM PostHistory
+    ) PH ON P.Id = PH.PostId AND PH.rn = 1
+    LEFT JOIN PostHistoryTypes PH_Type ON PH.PostHistoryTypeId = PH_Type.Id
+    GROUP BY
+        P.Id, P.PostTypeId, PT.Name, P.Title, P.OwnerUserId, P.CreationDate, P.LastActivityDate,
+        P.Score, P.ViewCount, P.AnswerCount, P.CommentCount, P.FavoriteCount, P.Body, P.Tags,
+        P.ClosedDate, P.AcceptedAnswerId, P.ParentId, PH.Comment, PH.PostHistoryTypeId, PH_Type.Name
+),
+TagUsageStatistics AS (
+    SELECT
+        T.TagName,
+        T.Id AS TagId,
+        T.Count AS GlobalTagCount,
+        COUNT(DISTINCT PostTags.PostId) AS NumberOfPostsTagged,
+        COALESCE(AVG(PostTags.Score), 0.0) AS AvgPostScoreWithTag,
+        DENSE_RANK() OVER (ORDER BY T.Count DESC, COUNT(DISTINCT PostTags.PostId) DESC) AS TagPopularityRank,
+        STRING_AGG(DISTINCT CAST(PL.LinkTypeId AS VARCHAR) || ':' || CAST(PL.RelatedPostId AS VARCHAR), '; ') FILTER (WHERE PL.Id IS NOT NULL) AS LinkedPostReferences
+    FROM Tags T
+    LEFT JOIN (
+        SELECT
+            P.Id AS PostId,
+            P.Score,
+            UNNEST(string_to_array(TRIM(BOTH '<>' FROM P.Tags), '><')) AS ExtractedTag
+        FROM Posts P
+        WHERE P.Tags IS NOT NULL AND P.Tags != ''
+    ) PostTags ON T.TagName = PostTags.ExtractedTag
+    LEFT JOIN PostLinks PL ON PostTags.PostId = PL.PostId
+    GROUP BY
+        T.TagName, T.Id, T.Count
+),
+PostTopTag AS (
+    SELECT
+        P.Id AS PostId,
+        (SELECT TUS.TagName
+         FROM (
+             SELECT UNNEST(string_to_array(TRIM(BOTH '<>' FROM P_inner.Tags), '><')) AS PostTag
+             FROM Posts P_inner
+             WHERE P_inner.Id = P.Id AND P_inner.Tags IS NOT NULL AND P_inner.Tags != ''
+         ) PostTagsInner
+         INNER JOIN TagUsageStatistics TUS ON PostTagsInner.PostTag = TUS.TagName
+         ORDER BY TUS.TagPopularityRank ASC, TUS.GlobalTagCount DESC
+         LIMIT 1
+        ) AS MostPopularTagNameOnPost
+    FROM Posts P
+    WHERE P.Tags IS NOT NULL AND P.Tags != ''
+),
+HighImpactUsers AS (
+    SELECT
+        UAS.UserId,
+        UAS.DisplayName,
+        'HighReputation_Active' AS UserCategory
+    FROM UserActivitySummary UAS
+    WHERE UAS.Reputation > (SELECT AVG(Reputation) * 2 FROM Users WHERE DisplayName IS NOT NULL)
+      AND UAS.TotalPostsByOwner >= 50
+      AND UAS.TotalCommentsMade >= 100
+      AND UAS.GoldBadges >= 2
+),
+ExpertContributors AS (
+    SELECT
+        UAS.UserId,
+        UAS.DisplayName,
+        'Expert_AcceptedAnswers' AS UserCategory
+    FROM UserActivitySummary UAS
+    INNER JOIN (
+        SELECT
+            P.OwnerUserId,
+            COUNT(DISTINCT P.Id) AS AcceptedAnswersCount
+        FROM Posts P
+        WHERE P.PostTypeId = 2
+          AND EXISTS (SELECT 1 FROM Posts Q WHERE Q.AcceptedAnswerId = P.Id)
+        GROUP BY P.OwnerUserId
+        HAVING COUNT(DISTINCT P.Id) >= 10
+    ) AcceptedAnswers ON UAS.UserId = AcceptedAnswers.OwnerUserId
+    WHERE UAS.GoldBadges >= 3
+      AND UAS.TotalQuestionsByOwner >= 5
+      AND EXISTS (SELECT 1 FROM Badges B WHERE B.UserId = UAS.UserId AND LOWER(B.Name) LIKE '%editor%')
+)
+SELECT
+    UAS.UserId,
+    UAS.DisplayName,
+    UAS.Reputation,
+    UAS.TotalPostsByOwner,
+    UAS.TotalQuestionsByOwner,
+    UAS.TotalAnswersByOwner,
+    UAS.TotalCommentsMade,
+    UAS.GoldBadges,
+    UAS.SilverBadges,
+    UAS.BronzeBadges,
+    UAS.AccountAgeDays,
+    UAS.UserLocation,
+    UAS.GlobalAvgReputation,
+    UAS.ReputationNotNull,
+    PD.PostId AS TopScoringPostId,
+    PD.PostTitle AS TopScoringPostTitle,
+    PD.PostTypeName AS TopScoringPostType,
+    PD.Score AS TopScoringPostScore,
+    PD.ViewCount AS TopScoringPostViewCount,
+    PD.TagCount AS TopScoringPostTagCount,
+    PD.MonthsSincePostCreation,
+    PD.PostDetailedStatus,
+    TPTI.MostPopularTagName AS TopPostTagName,
+    TPTI.GlobalTagCount AS TopPostTagGlobalCount,
+    TPTI.AvgPostScoreWithTag AS TopPostTagAvgScore,
+    TPTI.TagPopularityRank AS TopPostTagRank,
+    (SELECT MAX(SQ_P.LastActivityDate)
+     FROM Posts SQ_P
+     WHERE SQ_P.OwnerUserId = UAS.UserId
+       AND SQ_P.PostTypeId = 1) AS LastQuestionActivityDate,
+    (SELECT STRING_AGG(DISTINCT B2.Name, ', ')
+     FROM Badges B2
+     WHERE B2.UserId = UAS.UserId AND B2.Class = 1
+       AND EXISTS (SELECT 1 FROM Badges B3 WHERE B3.UserId = UAS.UserId)) AS GoldBadgeNames,
+    CASE
+        WHEN UAS.Reputation > 50000 AND UAS.TotalBadgesEarned > 100 THEN 'Legendary Contributor'
+        WHEN UAS.TotalQuestionsByOwner > 50 OR UAS.TotalAnswersByOwner > 100 THEN 'Prolific Author'
+        WHEN UAS.TotalCommentsMade > 500 THEN 'Community Engager'
+        WHEN LOWER(UAS.UserLocation) LIKE '%america%' THEN 'North American User'
+        ELSE 'Active Member'
+    END AS UserEngagementTier,
+    (SELECT COUNT(DISTINCT PostId) FROM Votes WHERE UserId = UAS.UserId AND VoteTypeId = 5) AS FavoritePostsCount,
+    LAG(UAS.Reputation, 1, 0) OVER (ORDER BY UAS.Reputation DESC) AS PrevReputationUser,
+    RANK() OVER (ORDER BY UAS.Reputation DESC, UAS.TotalPostsByOwner DESC) AS GlobalReputationRank,
+    'General User' AS UserCategoryTag,
+    PD.LatestHistoryComment,
+    PD.LatestPostHistoryTypeName,
+    PD.TotalHistoryEntriesForPost
+FROM UserActivitySummary UAS
+LEFT JOIN PostDetailMetrics PD ON UAS.UserId = PD.OwnerUserId AND PD.OwnerPostRankByScore = 1
+LEFT JOIN (
+    SELECT
+        PTT.PostId,
+        TUS.TagName AS MostPopularTagName,
+        TUS.GlobalTagCount,
+        TUS.AvgPostScoreWithTag,
+        TUS.TagPopularityRank
+    FROM PostTopTag PTT
+    INNER JOIN TagUsageStatistics TUS ON PTT.MostPopularTagNameOnPost = TUS.TagName
+) TPTI ON PD.PostId = TPTI.PostId
+WHERE UAS.TotalPostsByOwner > 0
+  AND UAS.AccountAgeDays IS NOT NULL
+  AND UAS.DisplayName IS NOT NULL
+  AND (UAS.UserId % 10) = 0
+  AND UAS.Reputation > 100
+
+UNION ALL
+
+SELECT
+    H.UserId,
+    H.DisplayName,
+    UAS.Reputation,
+    UAS.TotalPostsByOwner,
+    UAS.TotalQuestionsByOwner,
+    UAS.TotalAnswersByOwner,
+    UAS.TotalCommentsMade,
+    UAS.GoldBadges,
+    UAS.SilverBadges,
+    UAS.BronzeBadges,
+    UAS.AccountAgeDays,
+    UAS.UserLocation,
+    UAS.GlobalAvgReputation,
+    UAS.ReputationNotNull,
+    NULL AS TopScoringPostId,
+    NULL AS TopScoringPostTitle,
+    NULL AS TopScoringPostType,
+    NULL AS TopScoringPostScore,
+    NULL AS TopScoringPostViewCount,
+    NULL AS TopScoringPostTagCount,
+    NULL AS MonthsSincePostCreation,
+    NULL AS PostDetailedStatus,
+    NULL AS TopPostTagName,
+    NULL AS TopPostTagGlobalCount,
+    NULL AS TopPostTagAvgScore,
+    NULL AS TopPostTagRank,
+    (SELECT MAX(SQ_P.LastActivityDate)
+     FROM Posts SQ_P
+     WHERE SQ_P.OwnerUserId = H.UserId AND SQ_P.PostTypeId = 1) AS LastQuestionActivityDate,
+    (SELECT STRING_AGG(DISTINCT B2.Name, ', ')
+     FROM Badges B2
+     WHERE B2.UserId = H.UserId AND B2.Class = 1
+       AND EXISTS (SELECT 1 FROM Badges B3 WHERE B3.UserId = H.UserId)) AS GoldBadgeNames,
+    H.UserCategory AS UserEngagementTier,
+    (SELECT COUNT(DISTINCT PostId) FROM Votes WHERE UserId = H.UserId AND VoteTypeId = 5) AS FavoritePostsCount,
+    LAG(UAS.Reputation, 1, 0) OVER (ORDER BY UAS.Reputation DESC) AS PrevReputationUser,
+    RANK() OVER (ORDER BY UAS.Reputation DESC, UAS.TotalPostsByOwner DESC) AS GlobalReputationRank,
+    'High Impact' AS UserCategoryTag,
+    NULL AS LatestHistoryComment,
+    NULL AS LatestPostHistoryTypeName,
+    NULL AS TotalHistoryEntriesForPost
+FROM HighImpactUsers H
+JOIN UserActivitySummary UAS ON H.UserId = UAS.UserId
+WHERE (UAS.UserId % 10) = 0
+
+UNION ALL
+
+SELECT
+    E.UserId,
+    E.DisplayName,
+    UAS.Reputation,
+    UAS.TotalPostsByOwner,
+    UAS.TotalQuestionsByOwner,
+    UAS.TotalAnswersByOwner,
+    UAS.TotalCommentsMade,
+    UAS.GoldBadges,
+    UAS.SilverBadges,
+    UAS.BronzeBadges,
+    UAS.AccountAgeDays,
+    UAS.UserLocation,
+    UAS.GlobalAvgReputation,
+    UAS.ReputationNotNull,
+    NULL AS TopScoringPostId,
+    NULL AS TopScoringPostTitle,
+    NULL AS TopScoringPostType,
+    NULL AS TopScoringPostScore,
+    NULL AS TopScoringPostViewCount,
+    NULL AS TopScoringPostTagCount,
+    NULL AS MonthsSincePostCreation,
+    NULL AS PostDetailedStatus,
+    NULL AS TopPostTagName,
+    NULL AS TopPostTagGlobalCount,
+    NULL AS TopPostTagAvgScore,
+    NULL AS TopPostTagRank,
+    (SELECT MAX(SQ_P.LastActivityDate)
+     FROM Posts SQ_P
+     WHERE SQ_P.OwnerUserId = E.UserId AND SQ_P.PostTypeId = 1) AS LastQuestionActivityDate,
+    (SELECT STRING_AGG(DISTINCT B2.Name, ', ')
+     FROM Badges B2
+     WHERE B2.UserId = E.UserId AND B2.Class = 1
+       AND EXISTS (SELECT 1 FROM Badges B3 WHERE B3.UserId = E.UserId)) AS GoldBadgeNames,
+    E.UserCategory AS UserEngagementTier,
+    (SELECT COUNT(DISTINCT PostId) FROM Votes WHERE UserId = E.UserId AND VoteTypeId = 5) AS FavoritePostsCount,
+    LAG(UAS.Reputation, 1, 0) OVER (ORDER BY UAS.Reputation DESC) AS PrevReputationUser,
+    RANK() OVER (ORDER BY UAS.Reputation DESC, UAS.TotalPostsByOwner DESC) AS GlobalReputationRank,
+    'Expert Contributor' AS UserCategoryTag,
+    NULL AS LatestHistoryComment,
+    NULL AS LatestPostHistoryTypeName,
+    NULL AS TotalHistoryEntriesForPost
+FROM ExpertContributors E
+JOIN UserActivitySummary UAS ON E.UserId = UAS.UserId
+WHERE (UAS.UserId % 10) = 0;

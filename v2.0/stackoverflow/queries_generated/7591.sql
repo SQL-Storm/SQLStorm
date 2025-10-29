@@ -1,0 +1,233 @@
+-- {"query": "7591.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2291} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        AVG(p.Score) as AvgPostScore,
+        STRING_AGG(DISTINCT p.Tags, '; ') as AllTags,
+        COALESCE(SUM(p.ViewCount), 0) as TotalViews,
+        COALESCE(SUM(p.FavoriteCount), 0) as TotalFavorites,
+        COALESCE(SUM(CASE WHEN p.Score > 0 THEN p.Score ELSE 0 END), 0) as TotalUpvotes,
+        COALESCE(SUM(CASE WHEN p.Score < 0 THEN ABS(p.Score) ELSE 0 END), 0) as TotalDownvotes
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TagRankings AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as RankByCount,
+        AVG(t.Count) OVER () as AvgTagCount,
+        PERCENT_RANK() OVER (ORDER BY t.Count) as PercentileRank,
+        CASE 
+            WHEN t.Count > (SELECT AVG(Count) FROM Tags) * 1.5 THEN 'High'
+            WHEN t.Count < (SELECT AVG(Count) FROM Tags) * 0.5 THEN 'Low'
+            ELSE 'Medium'
+        END as TagCategory,
+        LAG(t.Count) OVER (ORDER BY t.Count DESC) - t.Count as CountDifferenceFromPrevious
+    FROM Tags t
+),
+PostComplexity AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.ParentId,
+        p.PostTypeId,
+        LENGTH(p.Body) as BodyLength,
+        LENGTH(p.Title) as TitleLength,
+        LENGTH(p.Tags) as TagsLength,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags != '' THEN ARRAY_LENGTH(string_to_array(p.Tags, '><'), 1) 
+            ELSE 0 
+        END as TagCount,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN (p.AnswerCount::FLOAT / (p.AnswerCount + 1)) 
+            ELSE 0 
+        END as AnswerRatio,
+        CASE 
+            WHEN p.ViewCount > 0 THEN (p.Score::FLOAT / p.ViewCount) 
+            ELSE 0 
+        END as ScorePerView,
+        CASE 
+            WHEN p.CreationDate IS NOT NULL AND p.LastActivityDate IS NOT NULL THEN 
+                EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate)) / 86400 
+            ELSE 0 
+        END as DaysActive,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PreviousScore,
+        LAG(p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PreviousPostDate
+    FROM Posts p
+),
+UserEngagement AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT v.Id) as TotalVotes,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) as UpVoteCount,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) as DownVoteCount,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 5 THEN v.Id END) as FavoriteCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) as UpVoteWeight,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) as DownVoteWeight,
+        SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) as FavoriteWeight,
+        AVG(v.CreationDate) as AvgVoteDate
+    FROM Users u
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+ComplexPosts AS (
+    SELECT 
+        pc.PostId,
+        pc.Title,
+        pc.Body,
+        pc.Score,
+        pc.ViewCount,
+        pc.AnswerCount,
+        pc.CommentCount,
+        pc.FavoriteCount,
+        pc.CreationDate,
+        pc.OwnerUserId,
+        pc.ParentId,
+        pc.PostTypeId,
+        pc.BodyLength,
+        pc.TitleLength,
+        pc.TagsLength,
+        pc.TagCount,
+        pc.AnswerRatio,
+        pc.ScorePerView,
+        pc.DaysActive,
+        pc.PreviousScore,
+        pc.PreviousPostDate,
+        CASE 
+            WHEN pc.BodyLength > (SELECT AVG(BodyLength) FROM PostComplexity) * 1.2 THEN 'Very Long'
+            WHEN pc.BodyLength < (SELECT AVG(BodyLength) FROM PostComplexity) * 0.8 THEN 'Very Short'
+            ELSE 'Normal'
+        END as BodyLengthCategory,
+        CASE 
+            WHEN ABS(COALESCE(pc.Score - pc.PreviousScore, 0)) > (SELECT STDDEV(Score) FROM PostComplexity) THEN 'High Volatility'
+            ELSE 'Stable'
+        END as ScoreVolatility,
+        COALESCE(
+            (SELECT SUM(COUNT(*)) OVER (ORDER BY p.CreationDate) 
+             FROM Posts p 
+             WHERE p.OwnerUserId = pc.OwnerUserId 
+             AND p.CreationDate <= pc.CreationDate 
+             AND p.Score >= 0),
+            0
+        ) as CumulativePositiveScore,
+        RANK() OVER (ORDER BY pc.Score DESC) as ScoreRank,
+        DENSE_RANK() OVER (ORDER BY pc.ViewCount DESC) as ViewCountRank,
+        ROW_NUMBER() OVER (ORDER BY pc.CreationDate ASC) as CreationOrder
+    FROM PostComplexity pc
+)
+SELECT 
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.PostCount,
+    uas.CommentCount,
+    uas.BadgeCount,
+    uas.QuestionCount,
+    uas.AnswerCount,
+    uas.AvgPostScore,
+    uas.TotalViews,
+    uas.TotalFavorites,
+    uas.TotalUpvotes,
+    uas.TotalDownvotes,
+    ta.TagName,
+    ta.Count as TagCount,
+    ta.RankByCount,
+    ta.PercentileRank,
+    ta.TagCategory,
+    cp.PostId,
+    cp.Title,
+    cp.BodyLength,
+    cp.ScorePerView,
+    cp.ScoreRank,
+    cp.ViewCountRank,
+    ues.TotalVotes,
+    ues.UpVoteCount,
+    ues.DownVoteCount,
+    ues.FavoriteCount,
+    CASE 
+        WHEN uas.Reputation > (SELECT AVG(Reputation) FROM Users) * 1.5 THEN 'Elite'
+        WHEN uas.Reputation < (SELECT AVG(Reputation) FROM Users) * 0.5 THEN 'Beginner'
+        ELSE 'Regular'
+    END as ReputationTier,
+    CASE 
+        WHEN uas.PostCount > 100 THEN 'Highly Active'
+        WHEN uas.PostCount > 50 THEN 'Active'
+        WHEN uas.PostCount > 10 THEN 'Moderate'
+        ELSE 'Inactive'
+    END as ActivityLevel,
+    CASE 
+        WHEN uas.QuestionCount > 0 AND uas.AnswerCount > 0 THEN 
+            ROUND((uas.AnswerCount::FLOAT / uas.QuestionCount) * 100, 2) || '%'
+        ELSE 'N/A'
+    END as AnswerQuestionRatio,
+    CASE 
+        WHEN cp.Score > 0 AND cp.ViewCount > 0 THEN 
+            ROUND((cp.Score::FLOAT / cp.ViewCount) * 1000, 2) || ' per 1000 views'
+        ELSE 'No data'
+    END as EngagementMetric,
+    CASE 
+        WHEN uas.BadgeCount > 100 THEN 'Veteran'
+        WHEN uas.BadgeCount > 50 THEN 'Experienced'
+        WHEN uas.BadgeCount > 10 THEN 'Novice'
+        ELSE 'Newbie'
+    END as BadgeExpertiseLevel,
+    COALESCE((
+        SELECT COUNT(*) 
+        FROM PostHistory ph 
+        WHERE ph.PostId = cp.PostId 
+        AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)
+        AND ph.CreationDate > cp.CreationDate
+    ), 0) as EditCount,
+    (uas.Reputation + uas.PostCount * 10 + uas.CommentCount * 5 + uas.BadgeCount * 20) as UserScore,
+    (cp.BodyLength * 0.3 + cp.ViewCount * 0.1 + cp.FavoriteCount * 2 + cp.AnswerCount * 0.5) as PostComplexityScore
+FROM UserActivityStats uas
+LEFT JOIN Tags ta ON ta.Count = (
+    SELECT MAX(t2.Count) 
+    FROM Tags t2 
+    WHERE t2.Count <= uas.TotalViews
+)
+LEFT JOIN ComplexPosts cp ON cp.OwnerUserId = uas.UserId
+LEFT JOIN UserEngagement ues ON ues.UserId = uas.UserId
+WHERE uas.UserId IS NOT NULL
+AND (
+    (uas.Reputation > 1000 AND uas.PostCount > 50) 
+    OR (uas.BadgeCount > 50 AND uas.CommentCount > 100)
+    OR (cp.Score > 100 AND cp.ViewCount > 1000)
+)
+ORDER BY 
+    uas.Reputation DESC,
+    uas.PostCount DESC,
+    uas.TotalViews DESC,
+    cp.Score DESC,
+    uas.BadgeCount DESC,
+    cp.ViewCount DESC
+LIMIT 1000;

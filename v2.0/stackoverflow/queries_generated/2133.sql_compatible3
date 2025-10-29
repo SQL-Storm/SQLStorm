@@ -1,0 +1,158 @@
+with recursive RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        0 as Level,
+        cast(t.TagName as varchar(500)) as FullPath
+    from Tags t
+    where t.Id in (
+        select distinct tagid from (
+            select cast(unnest(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')) as integer) as tagid
+            from Posts p
+            where p.PostTypeId = 1 and p.Tags is not null
+            limit 1000
+        ) sub
+    )
+    union all
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        r.Level + 1,
+        r.FullPath || '>' || t.TagName
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id = r.Id + 1
+    where r.Level < 2
+),
+UserActivityRanked as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionsAsked,
+        count(distinct case when p2.PostTypeId = 2 then p2.Id end) as AnswersGiven,
+        count(distinct b.Id) as BadgesEarned,
+        rank() over (partition by extract(year from u.CreationDate) order by u.Reputation desc) as ReputationRankYearly,
+        lead(u.Reputation) over (order by u.Reputation desc) as NextHigherReputation,
+        lag(u.Reputation) over (order by u.Reputation desc) as NextLowerReputation,
+        coalesce(u.WebsiteUrl, 'N/A') as WebsiteURLDisplay,
+        case when u.Location is null or length(trim(u.Location)) = 0 then 'Unknown' else u.Location end as LocationNormalized,
+        u.CreationDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Posts p2 on p2.OwnerUserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.WebsiteUrl, u.Location
+    having count(distinct case when p.PostTypeId = 1 then p.Id end) > 0
+),
+QuestionWithAcceptedAnswerAndVotes as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        coalesce(a.Score, 0) as AcceptedAnswerScore,
+        coalesce(av.UpVotes, 0) as AcceptedAnswerUpVotes,
+        coalesce(av.DownVotes, 0) as AcceptedAnswerDownVotes,
+        q.Tags,
+        (
+            select string_agg(lt.Name, ', ' order by lt.Name)
+            from PostLinks pl
+            join LinkTypes lt on lt.Id = pl.LinkTypeId
+            where pl.PostId = q.Id
+        ) as LinkedTypes
+    from Posts q
+    left join Posts a on a.Id = q.AcceptedAnswerId
+    left join (
+        select
+            v.PostId,
+            sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+            sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes
+        from Votes v
+        join VoteTypes vt on vt.Id = v.VoteTypeId
+        group by v.PostId
+    ) av on av.PostId = a.Id
+    where q.PostTypeId = 1
+    and q.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '3' year
+),
+CommentScoresPerUser as (
+    select
+        c.UserId,
+        sum(c.Score) as TotalCommentScore,
+        count(c.Id) as CommentCount,
+        max(c.CreationDate) as LastCommentDate
+    from Comments c
+    where c.UserId is not null
+    group by c.UserId
+),
+UserBadgeDiversity as (
+    select
+        b.UserId,
+        count(distinct b.Name) as DistinctBadgeNames,
+        count(distinct b.Class) as BadgeClassesCount,
+        max(case when b.TagBased = 1 then 1 else 0 end) = 1 as HasTagBasedBadge
+    from Badges b
+    group by b.UserId
+)
+select distinct
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.QuestionsAsked,
+    u.AnswersGiven,
+    u.BadgesEarned,
+    u.ReputationRankYearly,
+    u.NextHigherReputation,
+    u.NextLowerReputation,
+    u.WebsiteURLDisplay,
+    u.LocationNormalized,
+    coalesce(cs.TotalCommentScore,0) as CommentScore,
+    coalesce(cs.CommentCount,0) as NumberOfComments,
+    cs.LastCommentDate,
+    bd.DistinctBadgeNames,
+    bd.BadgeClassesCount,
+    bd.HasTagBasedBadge,
+    qt.QuestionId,
+    case when char_length(qt.Title) > 80 then substring(qt.Title from 1 for 80) || '...' else qt.Title end as QuestionTitleSnippet,
+    qt.Score as QuestionScore,
+    qt.ViewCount as QuestionViews,
+    qt.AcceptedAnswerScore,
+    qt.AcceptedAnswerUpVotes,
+    qt.AcceptedAnswerDownVotes,
+    qt.LinkedTypes,
+    string_agg(r.FullPath, ' | ' order by r.FullPath) as TagHierarchySample
+from UserActivityRanked u
+left join CommentScoresPerUser cs on cs.UserId = u.Id
+left join UserBadgeDiversity bd on bd.UserId = u.Id
+left join lateral (
+    select qwt.*
+    from QuestionWithAcceptedAnswerAndVotes qwt
+    where qwt.QuestionId in (
+        select p.Id
+        from Posts p
+        where p.OwnerUserId = u.Id
+    )
+    order by qwt.Score desc nulls last
+    fetch first 1 row only
+) qt on true
+left join RecursiveTagHierarchy r on position(r.TagName in coalesce(qt.Tags, '')) > 0
+where u.ReputationRankYearly <= 50
+group by
+    u.Id, u.DisplayName, u.Reputation, u.QuestionsAsked, u.AnswersGiven, u.BadgesEarned, u.ReputationRankYearly,
+    u.NextHigherReputation, u.NextLowerReputation, u.WebsiteURLDisplay, u.LocationNormalized,
+    cs.TotalCommentScore, cs.CommentCount, cs.LastCommentDate,
+    bd.DistinctBadgeNames, bd.BadgeClassesCount, bd.HasTagBasedBadge,
+    qt.QuestionId, qt.Title, qt.Score, qt.ViewCount,
+    qt.AcceptedAnswerScore, qt.AcceptedAnswerUpVotes, qt.AcceptedAnswerDownVotes, qt.LinkedTypes
+having (
+    (u.BadgesEarned > 10 and coalesce(cs.TotalCommentScore,0) > 100) or
+    (qt.AcceptedAnswerScore > qt.Score / 2 and qt.Score > 10)
+)
+order by u.ReputationRankYearly, u.Reputation desc
+fetch first 100 rows only;

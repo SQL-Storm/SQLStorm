@@ -1,0 +1,157 @@
+-- {"query": "1599.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2032} 
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.Views AS UserViews,
+        U.UpVotes AS UserUpVotes,
+        U.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswers,
+        SUM(P.Score) AS TotalPostScore,
+        -- Using FILTER for specific aggregation
+        AVG(P.Score) FILTER (WHERE P.PostTypeId IN (1, 2)) AS AvgRelevantPostScore,
+        SUM(COALESCE(P.FavoriteCount, 0)) AS TotalFavoriteCount,
+        MAX(P.CreationDate) AS LatestPostDate,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        -- Correlated subquery for total comments made by user
+        (SELECT COUNT(DISTINCT C.Id) FROM Comments C WHERE C.UserId = U.Id) AS TotalCommentsMade,
+        -- Correlated subquery for average comment score made by user, handling potential NULL scores
+        (SELECT AVG(C.Score) FROM Comments C WHERE C.UserId = U.Id AND C.Score IS NOT NULL) AS AvgCommentScoreMade,
+        -- Correlated subquery for total posts edited by the user (self-edits)
+        (SELECT COUNT(DISTINCT PH.PostId) FROM PostHistory PH WHERE PH.UserId = U.Id AND PH.PostHistoryTypeId IN (4,5,6)) AS TotalPostsEditedBySelf
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.Views, U.UpVotes, U.DownVotes
+    HAVING COUNT(P.Id) > 5 -- Only consider users with more than 5 posts
+),
+PostHistoricalMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.OwnerUserId,
+        P.LastEditDate,
+        P.LastActivityDate,
+        P.ClosedDate,
+        P.CommunityOwnedDate,
+        P.Tags,
+        -- Window function: Rank posts by score for each owner
+        DENSE_RANK() OVER (PARTITION BY P.OwnerUserId ORDER BY P.Score DESC, P.CreationDate ASC) AS RankByScoreForOwner,
+        -- Window function: Get previous edit date
+        LAG(P.LastEditDate, 1, P.CreationDate) OVER (PARTITION BY P.OwnerUserId ORDER BY P.LastEditDate ASC) AS PrevEditDate,
+        -- Correlated subquery for unique editors count for a post
+        (
+            SELECT COUNT(DISTINCT PH_INNER.UserId)
+            FROM PostHistory PH_INNER
+            WHERE PH_INNER.PostId = P.Id
+              AND PH_INNER.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Body, Tags
+        ) AS UniqueEditorsCount,
+        -- Correlated subquery for average comment score for a post
+        (
+            SELECT AVG(C_INNER.Score)
+            FROM Comments C_INNER
+            WHERE C_INNER.PostId = P.Id AND C_INNER.Score IS NOT NULL
+        ) AS AvgPostCommentScore,
+        -- Correlated subquery for latest comment date for a post
+        (
+            SELECT MAX(C_INNER.CreationDate)
+            FROM Comments C_INNER
+            WHERE C_INNER.PostId = P.Id
+        ) AS LatestCommentDate
+    FROM Posts P
+    WHERE P.PostTypeId IN (1, 2) -- Questions and Answers
+      AND P.CreationDate >= '2020-01-01' -- Filter for recent activity
+      AND P.OwnerUserId IS NOT NULL -- Ensure there's an owner for joining with UserActivitySummary
+),
+PostEditActivity AS (
+    SELECT
+        PH.PostId,
+        PH.UserId AS EditorUserId,
+        PH.CreationDate AS EditDate,
+        PH.PostHistoryTypeId,
+        -- Window function: Sequence of edits for a post
+        ROW_NUMBER() OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate ASC) AS EditSequence,
+        -- Window function: Previous edit date for a post
+        LAG(PH.CreationDate) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate ASC) AS PreviousEditDate,
+        -- Calculation: Hours since previous edit, with NULL handling
+        COALESCE(EXTRACT(EPOCH FROM (PH.CreationDate - LAG(PH.CreationDate) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate ASC))) / 3600, 0) AS HoursSincePreviousEdit,
+        -- Conditional logic for event type
+        CASE
+            WHEN PH.PostHistoryTypeId IN (10, 11) THEN 'Close/Reopen Event'
+            WHEN PH.PostHistoryTypeId IN (12, 13) THEN 'Delete/Undelete Event'
+            WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 'Content Edit Event'
+            ELSE 'Other Event'
+        END AS HistoryEventType,
+        -- NULL logic and join for CloseReasonType
+        CR.Name AS CloseReason
+    FROM PostHistory PH
+    LEFT JOIN CloseReasonTypes CR ON PH.PostHistoryTypeId = 10 AND CR.Id = CAST(PH.Comment AS smallint)
+    WHERE PH.PostHistoryTypeId IN (4, 5, 6, 10, 11, 12, 13) -- Edits, Close/Reopen, Delete/Undelete
+),
+TagPerformance AS (
+    SELECT
+        P.Id AS PostId,
+        TRIM(UNNEST(string_to_array(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags) - 2), '><'))) AS TagName,
+        P.OwnerUserId
+    FROM Posts P
+    WHERE P.Tags IS NOT NULL AND P.Tags != '' AND P.Tags LIKE '%>%' -- Ensure tags are present and formatted
+),
+AggregatedTagStats AS (
+    SELECT
+        TP.TagName,
+        COUNT(DISTINCT TP.PostId) AS TotalTaggedPosts,
+        AVG(PM.PostScore) AS AvgScoreForTag,
+        SUM(PM.ViewCount) AS TotalViewCountForTag,
+        COUNT(DISTINCT PM.OwnerUserId) AS UniqueAuthorsForTag,
+        RANK() OVER (ORDER BY COUNT(DISTINCT TP.PostId) DESC, SUM(PM.ViewCount) DESC) AS TagPopularityRank
+    FROM TagPerformance TP
+    JOIN PostHistoricalMetrics PM ON TP.PostId = PM.PostId
+    GROUP BY TP.TagName
+    HAVING COUNT(DISTINCT TP.PostId) > 100 -- Only consider tags with significant usage
+),
+UserTopTagSelection AS (
+    -- Identify the top tag for each user based on their posts
+    SELECT
+        TP.OwnerUserId AS UserId,
+        TP.TagName,
+        COUNT(*) AS TagCount,
+        ROW_NUMBER() OVER(PARTITION BY TP.OwnerUserId ORDER BY COUNT(*) DESC, TP.TagName ASC) as rn
+    FROM TagPerformance TP
+    WHERE TP.OwnerUserId IS NOT NULL
+    GROUP BY TP.OwnerUserId, TP.TagName
+)
+-- Main query combining all insights
+SELECT
+    UAS.UserId,
+    UAS.DisplayName,
+    UAS.Reputation,
+    UAS.TotalPosts,
+    UAS.TotalQuestions,
+    UAS.TotalAnswers,
+    UAS.TotalPostsEditedBySelf,
+    PM.PostId,
+    PM.PostCreationDate,
+    PM.PostScore,
+    PM.ViewCount,
+    PM.AnswerCount,
+    PM.UniqueEditorsCount,
+    PM.AvgPostCommentScore,
+    PM.RankByScoreForOwner,
+    ATS.TagName AS TopContributingTag,
+    ATS.AvgScoreForTag AS TopTagAvgScore,
+    ATS.TagPopularityRank AS TopTagRank,
+    PH_Summary.TotalContentEdits,
+    PH_Summary.TotalCloseReopenEvents,
+    COALESCE(ROUND(EXTRACT(EPOCH

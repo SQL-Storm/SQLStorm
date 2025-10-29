@@ -1,0 +1,139 @@
+with recursive TagHierarchy as (
+    select 
+        t.Id, 
+        t.TagName, 
+        1 as Level,
+        array[t.Id] as Path
+    from Tags t
+    where t.IsModeratorOnly = false
+    union all
+    select 
+        t2.Id, 
+        t2.TagName,
+        th.Level + 1,
+        th.Path || t2.Id
+    from Tags t2
+    join TagHierarchy th on 
+        t2.Id <> all(th.Path)
+        and t2.Count < (select Count from Tags where Id = th.Id)
+        and t2.IsModeratorOnly = false
+),
+UserPostStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        coalesce(sum(p.Score),0) as TotalPostScore,
+        max(p.CreationDate) as LastPostDate,
+        coalesce(sum(case when v.VoteTypeId = 2 then 1 else 0 end),0) as TotalUpVotes,
+        coalesce(sum(case when v.VoteTypeId = 3 then 1 else 0 end),0) as TotalDownVotes,
+        coalesce(
+          (select count(*) from Badges b where b.UserId = u.Id and b.Class = 1),
+          0) as GoldBadges,
+        coalesce(
+          (select count(*) from Badges b where b.UserId = u.Id and b.Class = 2),
+          0) as SilverBadges,
+        coalesce(
+          (select count(*) from Badges b where b.UserId = u.Id and b.Class = 3),
+          0) as BronzeBadges
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Votes v on v.PostId = p.Id
+    group by u.Id, u.DisplayName
+),
+RecentHotQuestions as (
+    select
+        p.Id,
+        p.OwnerUserId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        rank() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc) as RankByScore
+    from Posts p
+    join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 52
+    where p.PostTypeId = 1
+),
+QuestionsWithCloseReason as (
+    select 
+        p.Id as QuestionId,
+        p.Title,
+        ph.Comment AS CloseReasonId,
+        crt.Name as CloseReason,
+        p.ClosedDate,
+        (select count(*) from Comments c where c.PostId = p.Id) as CommentCount,
+        coalesce(p.FavoriteCount,0) as Favorites
+    from Posts p
+    left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 10
+    left join CloseReasonTypes crt on crt.Id = ph.Comment
+    where p.PostTypeId = 1
+),
+AnswerStats as (
+    select 
+        p.ParentId as QuestionId,
+        count(*) as AnswerCount,
+        avg(p.Score) as AvgAnswerScore,
+        max(p.Score) as MaxAnswerScore,
+        min(p.Score) as MinAnswerScore
+    from Posts p
+    where p.PostTypeId = 2
+    group by p.ParentId
+)
+select 
+    u.UserId,
+    u.DisplayName,
+    u.QuestionCount,
+    u.AnswerCount,
+    u.TotalPostScore,
+    u.GoldBadges,
+    u.SilverBadges,
+    u.BronzeBadges,
+    rhq.Title as TopHotQuestionTitle,
+    rhq.Score as TopHotQuestionScore,
+    rhq.ViewCount as TopHotQuestionViews,
+    qcr.CloseReason,
+    qcr.CommentCount as QuestionComments,
+    qcr.Favorites as QuestionFavorites,
+    ans.AnswerCount as QuestionAnswerCount,
+    ans.AvgAnswerScore,
+    ans.MaxAnswerScore,
+    ans.MinAnswerScore,
+    case 
+        when (u.TotalUpVotes + u.TotalDownVotes) > 0 then round(100.0 * u.TotalUpVotes / (u.TotalUpVotes + u.TotalDownVotes), 2)
+        else null 
+    end as UpVoteRatioPercent,
+    (substring(u.DisplayName from 1 for 3) || '_user_' || u.UserId) as MaskedUserName,
+    (select string_agg(th.TagName, ', ' order by th.Level desc) 
+     from TagHierarchy th 
+     join Posts p2 on p2.Tags like ('%<' || th.TagName || '>%') and p2.OwnerUserId = u.UserId
+     limit 3) as TopTags
+from UserPostStats u
+left join RecentHotQuestions rhq on rhq.OwnerUserId = u.UserId and rhq.RankByScore = 1
+left join QuestionsWithCloseReason qcr on qcr.QuestionId = rhq.Id
+left join AnswerStats ans on ans.QuestionId = rhq.Id
+where u.QuestionCount > 5 and u.TotalPostScore > 1000
+group by
+    u.UserId,
+    u.DisplayName,
+    u.QuestionCount,
+    u.AnswerCount,
+    u.TotalPostScore,
+    u.GoldBadges,
+    u.SilverBadges,
+    u.BronzeBadges,
+    rhq.Title,
+    rhq.Score,
+    rhq.ViewCount,
+    qcr.CloseReason,
+    qcr.CommentCount,
+    qcr.Favorites,
+    ans.AnswerCount,
+    ans.AvgAnswerScore,
+    ans.MaxAnswerScore,
+    ans.MinAnswerScore,
+    u.TotalUpVotes,
+    u.TotalDownVotes,
+    u.UserId  -- included again to ensure MaskedUserName expression grouping (redundant but harmless)
+order by u.TotalPostScore desc, u.QuestionCount desc
+limit 50;

@@ -1,0 +1,149 @@
+-- {"query": "5163.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1067} 
+WITH
+RecentActivePosts AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.Tags,
+    p.FavoriteCount,
+    p.ContentLicense
+  FROM Posts p
+  WHERE p.LastActivityDate >= NOW() - INTERVAL '30 days'
+),
+TopAuthors AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.WebsiteUrl,
+    u.Location,
+    u.AboutMe,
+    u.ProfileImageUrl,
+    u.EmailHash,
+    u.AccountId,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.UpVotes DESC, u.LastAccessDate DESC) AS rn
+  FROM Users u
+  WHERE u.Reputation > 1000
+),
+TagHotness AS (
+  SELECT
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId,
+    ps.Id AS PostId,
+    ps.Title AS PostTitle,
+    ps.OwnerUserId AS PostOwner,
+    ps.CreationDate AS PostCreation,
+    ps.LastActivityDate AS PostLastActivity
+  FROM Tags t
+  JOIN Posts ps ON t.Id = ps.Id
+  WHERE t.IsModeratorOnly = 0
+),
+Combined AS (
+  SELECT
+    rap.Id AS PostId,
+    rap.Title AS PostTitle,
+    rap.PostTypeId,
+    rap.OwnerUserId AS AuthorId,
+    rap.CreationDate,
+    rap.LastActivityDate,
+    rap.Score,
+    rap.ViewCount,
+    rap.AnswerCount,
+    rap.CommentCount,
+    rap.Tags,
+    rap.FavoriteCount,
+    rap.ContentLicense,
+    ba.UserId AS AuthorUserId,
+    ba.DisplayName AS AuthorDisplayName,
+    ba.Reputation AS AuthorReputation,
+    ba.LastAccessDate AS AuthorLastAccess
+  FROM RecentActivePosts rap
+  LEFT JOIN TopAuthors ba ON rap.OwnerUserId = ba.UserId
+  UNION ALL
+  SELECT
+    th.Id AS PostId,
+    th.Title AS PostTitle,
+    th.PostTypeId,
+    th.OwnerUserId AS AuthorId,
+    th.CreationDate,
+    th.LastActivityDate,
+    th.Score,
+    th.ViewCount,
+    th.AnswerCount,
+    th.CommentCount,
+    th.Tags,
+    th.FavoriteCount,
+    th.ContentLicense,
+    NULL AS AuthorUserId,
+    NULL AS AuthorDisplayName,
+    NULL AS AuthorReputation,
+    NULL AS AuthorLastAccess
+  FROM Posts th
+  WHERE th.Id IN (SELECT PostId FROM TagHotness)
+)
+SELECT
+  c.PostId,
+  c.PostTitle,
+  c.PostTypeId,
+  c.AuthorId,
+  c.AuthorDisplayName,
+  c.AuthorReputation,
+  c.AuthorLastAccess,
+  c.CreationDate,
+  c.LastActivityDate,
+  c.Score,
+  c.ViewCount,
+  c.AnswerCount,
+  c.CommentCount,
+  c.Tags,
+  c.FavoriteCount,
+  c.ContentLicense,
+  ARRAY_AGG(DISTINCT vl.TagName) FILTER (WHERE vl.TagName IS NOT NULL) AS RankedTags,
+  (SELECT COUNT(*) FROM Votes v WHERE v.PostId = c.PostId AND v.VoteTypeId = 2) AS UpVotesGivenToPost,
+  (SELECT COUNT(*) FROM Votes v WHERE v.PostId = c.PostId AND v.VoteTypeId = 3) AS DownVotesGivenToPost,
+  (SELECT COUNT(*) FROM Comments cm WHERE cm.PostId = c.PostId) AS CommentCountTotal
+FROM (
+  SELECT
+    p.PostId,
+    p.PostTitle,
+    p.PostTypeId,
+    p.AuthorId,
+    p.AuthorDisplayName,
+    p.AuthorReputation,
+    p.AuthorLastAccess,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.Tags,
+    p.FavoriteCount,
+    p.ContentLicense
+  FROM Combined p
+  LEFT JOIN Tags t ON t.ExcerptPostId = p.PostId
+  LEFT JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS TagName
+  ) AS vl ON TRUE
+  WHERE p.PostTypeId IN (1,2)
+) AS c
+GROUP BY
+  c.PostId, c.PostTitle, c.PostTypeId, c.AuthorId, c.AuthorDisplayName, c.AuthorReputation, c.AuthorLastAccess,
+  c.CreationDate, c.LastActivityDate, c.Score, c.ViewCount, c.AnswerCount, c.CommentCount, c.Tags, c.FavoriteCount,
+  c.ContentLicense
+ORDER BY c.LastActivityDate DESC, c.Score DESC
+LIMIT 100;

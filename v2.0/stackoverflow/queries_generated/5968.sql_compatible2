@@ -1,0 +1,211 @@
+WITH RankedPosts AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.Body,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.LastEditorUserId,
+    p.LastActivityDate,
+    p.Tags,
+    p.PostTypeId,
+    p.AcceptedAnswerId,
+    p.ParentId,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ContentLicense,
+    u.Reputation,
+    u.DisplayName,
+    u.AccountId,
+    u.CreationDate AS UserCreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.Views AS UserViews,
+    u.UpVotes,
+    u.DownVotes,
+    u.ProfileImageUrl,
+    u.EmailHash AS EmailHash,
+    u.WebsiteUrl,
+    u.AboutMe,
+    -- window function: rolling sum of views per week for the author
+    SUM(p.ViewCount) OVER (
+      PARTITION BY p.OwnerUserId
+      ORDER BY p.CreationDate
+      ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
+    ) AS Rolling7DayViews
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId IN (1, 2)
+),
+ConnectedStats AS (
+  SELECT
+    rp.Id,
+    rp.Title,
+    rp.Body,
+    rp.CreationDate,
+    rp.Score,
+    rp.ViewCount,
+    rp.OwnerUserId,
+    rp.LastEditorUserId,
+    rp.LastActivityDate,
+    rp.Tags,
+    rp.PostTypeId,
+    rp.AcceptedAnswerId,
+    rp.ParentId,
+    rp.CommentCount,
+    rp.FavoriteCount,
+    rp.ContentLicense,
+    rp.Reputation,
+    rp.DisplayName,
+    rp.AccountId,
+    rp.UserCreationDate,
+    rp.LastAccessDate,
+    rp.Location,
+    rp.UserViews,
+    rp.UpVotes,
+    rp.DownVotes,
+    rp.ProfileImageUrl,
+    rp.EmailHash,
+    rp.WebsiteUrl,
+    rp.AboutMe,
+    rp.Rolling7DayViews,
+    -- correlated subquery: count of comments for this post
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = rp.Id) AS CommentCountForPost,
+    -- correlated subquery with potential NULL handling for AcceptedAnswerId
+    (SELECT a.Id FROM Posts a WHERE a.Id = rp.AcceptedAnswerId) AS AcceptedAnswerPostId
+  FROM RankedPosts rp
+),
+Aggregates AS (
+  SELECT
+    cs.Id,
+    cs.Title,
+    cs.Body,
+    cs.CreationDate,
+    cs.Score,
+    cs.ViewCount,
+    cs.OwnerUserId,
+    cs.LastEditorUserId,
+    cs.LastActivityDate,
+    cs.Tags,
+    cs.PostTypeId,
+    cs.AcceptedAnswerId,
+    cs.ParentId,
+    cs.CommentCount,
+    cs.FavoriteCount,
+    cs.ContentLicense,
+    cs.Reputation,
+    cs.DisplayName,
+    cs.AccountId,
+    cs.UserCreationDate,
+    cs.LastAccessDate,
+    cs.Location,
+    cs.UserViews,
+    cs.UpVotes,
+    cs.DownVotes,
+    cs.ProfileImageUrl,
+    cs.EmailHash,
+    cs.WebsiteUrl,
+    cs.AboutMe,
+    cs.Rolling7DayViews,
+    cs.CommentCountForPost,
+    cs.AcceptedAnswerPostId,
+    -- set operator: rough activity score combining views, comments, and favorites
+    (cs.ViewCount * 2 + cs.CommentCountForPost * 3 + COALESCE(cs.FavoriteCount, 0)) AS ActivityScore
+  FROM ConnectedStats cs
+),
+CrossJoined AS (
+  SELECT
+    a.Id,
+    a.Title,
+    a.Body,
+    a.CreationDate,
+    a.Score,
+    a.ViewCount,
+    a.OwnerUserId,
+    a.LastEditorUserId,
+    a.LastActivityDate,
+    a.Tags,
+    a.PostTypeId,
+    a.AcceptedAnswerId,
+    a.ParentId,
+    a.CommentCount,
+    a.FavoriteCount,
+    a.ContentLicense,
+    a.Reputation,
+    a.DisplayName,
+    a.AccountId,
+    a.UserCreationDate,
+    a.LastAccessDate,
+    a.Location,
+    a.UserViews,
+    a.UpVotes,
+    a.DownVotes,
+    a.ProfileImageUrl,
+    a.EmailHash,
+    a.WebsiteUrl,
+    a.AboutMe,
+    a.Rolling7DayViews,
+    a.CommentCountForPost,
+    a.AcceptedAnswerPostId,
+    a.ActivityScore,
+    -- string expression: normalized title for search benchmarking
+    LOWER(REGEXP_REPLACE(a.Title, '[^a-zA-Z0-9\\s]', '', 'g')) AS TitleNormalized,
+    -- Tag-based relation: number of tags parsed from Tags field (format: "<tag1><tag2>")
+    (CASE
+       WHEN a.Tags IS NULL THEN 0
+       ELSE CARDINALITY(string_to_array(SUBSTRING(a.Tags FROM 2 FOR LENGTH(a.Tags)-2), '><'))
+     END) AS TagCount
+  FROM Aggregates a
+)
+SELECT
+  cj.Id,
+  cj.Title,
+  cj.Body,
+  cj.CreationDate,
+  cj.Score,
+  cj.ViewCount,
+  cj.OwnerUserId,
+  cj.DisplayName AS OwnerDisplayName,
+  cj.Reputation,
+  cj.UserCreationDate,
+  cj.LastAccessDate,
+  cj.Location,
+  cj.UserViews AS Views,
+  cj.UpVotes,
+  cj.DownVotes,
+  cj.ProfileImageUrl,
+  cj.EmailHash,
+  cj.WebsiteUrl,
+  cj.AboutMe,
+  cj.LastEditorUserId,
+  cj.LastActivityDate,
+  cj.Tags,
+  cj.PostTypeId,
+  cj.AcceptedAnswerId,
+  cj.ParentId,
+  cj.CommentCount,
+  cj.FavoriteCount,
+  cj.ContentLicense,
+  cj.Rolling7DayViews,
+  cj.CommentCountForPost,
+  cj.AcceptedAnswerPostId,
+  cj.ActivityScore,
+  cj.TitleNormalized,
+  cj.TagCount
+FROM CrossJoined cj
+WHERE
+  cj.ActivityScore > 100
+  AND cj.PostTypeId = 1
+  AND EXISTS (
+    SELECT 1
+    FROM Votes v
+    WHERE v.PostId = cj.Id
+      AND v.VoteTypeId IN (2, 12)
+      AND v.CreationDate >= cj.CreationDate - INTERVAL '30 days'
+  )
+ORDER BY
+  cj.ActivityScore DESC,
+  cj.CreationDate DESC
+LIMIT 100;

@@ -1,0 +1,154 @@
+WITH recent_activity AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.ContentLicense,
+    u.Reputation,
+    u.DisplayName AS OwnerDisplayName,
+    u.Location,
+    u.AboutMe,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.AccountId,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate DESC) AS rn
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+),
+tag_metrics AS (
+  SELECT
+    t.tag AS TagName,
+    COUNT(*) AS TagQuestionCount,
+    SUM(p.Score) AS TagTotalScore,
+    AVG(p.Score) AS TagAvgScore,
+    SUM(p.ViewCount) AS TagTotalViews
+  FROM Posts p
+  JOIN LATERAL (
+    SELECT regexp_split_to_table(REGEXP_REPLACE(COALESCE(p.Tags, ''), '[<>]', '', 'g'), ',') AS tag
+  ) t ON true
+  LEFT JOIN Tags tg ON tg.WikiPostId = p.Id OR tg.ExcerptPostId = p.Id
+  WHERE p.PostTypeId = 1
+  GROUP BY t.tag
+),
+correlated_history AS (
+  SELECT
+    ph.PostId,
+    ph.PostHistoryTypeId,
+    ph.UserId,
+    ph.CreationDate,
+    ph.Comment,
+    ph.Text
+  FROM PostHistory ph
+  WHERE ph.PostHistoryTypeId IN (10,11,12,16,52,53)
+),
+complex_post_expressions AS (
+  SELECT
+    rp.PostId,
+    rp.RelatedPostId,
+    l.Name AS LinkTypeName,
+    lc.Name AS CloseReasonName,
+    v1.VoteTypeName AS UpOrDownVoteName,
+    CASE
+      WHEN p.CreationDate < CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years' THEN TRUE
+      ELSE FALSE
+    END AS IsOldPost,
+    p.Title || ' [' || COALESCE(p.Tags, '') || ']' AS TitleWithTags,
+    LENGTH(p.Body) AS BodyLength
+  FROM PostLinks rp
+  INNER JOIN Posts p ON rp.PostId = p.Id
+  LEFT JOIN LinkTypes l ON rp.LinkTypeId = l.Id
+  LEFT JOIN CloseReasonTypes lc ON EXISTS (
+      SELECT 1 FROM PostHistory ph2
+      WHERE ph2.PostId = rp.PostId AND ph2.PostHistoryTypeId = 10 AND ph2.comment IS NOT NULL
+  )
+  LEFT JOIN Votes v ON v.PostId = rp.RelatedPostId AND v.VoteTypeId = 2
+  LEFT JOIN VoteTypes v1 ON v.VoteTypeId = v1.Id
+  WHERE p.PostTypeId = 1
+),
+cte_with_window AS (
+  SELECT
+    r.PostId,
+    r.PostTypeId,
+    r.Title,
+    r.Tags,
+    r.CreationDate,
+    r.LastActivityDate,
+    r.OwnerUserId,
+    r.Score,
+    r.ViewCount,
+    r.CommentCount,
+    r.AnswerCount,
+    r.FavoriteCount,
+    r.ContentLicense,
+    r.Reputation,
+    r.OwnerDisplayName,
+    r.Location,
+    r.AboutMe,
+    r.Views,
+    r.UpVotes,
+    r.DownVotes,
+    r.AccountId,
+    ROW_NUMBER() OVER (PARTITION BY r.OwnerUserId ORDER BY r.LastActivityDate DESC) AS rn
+  FROM recent_activity r
+  WHERE r.rn = 1
+)
+SELECT
+  cte.OwnerDisplayName,
+  cte.Reputation,
+  (cte.Title || ' [' || COALESCE(cte.Tags, '') || ']') AS TitleWithTags,
+  tm.TagName,
+  tm.TagQuestionCount,
+  tm.TagTotalScore,
+  tm.TagAvgScore,
+  tm.TagTotalViews,
+  CASE
+    WHEN cte.CreationDate < CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years' THEN TRUE
+    ELSE FALSE
+  END AS IsOldPost,
+  LENGTH(p.Body) AS BodyLength,
+  ch.PostHistoryTypeId,
+  ch.UserId AS HistoryUserId,
+  ch.CreationDate AS HistoryDate,
+  ch.Comment AS HistoryComment,
+  cu.DisplayName AS HistoryUserDisplayName
+FROM cte_with_window cte
+LEFT JOIN correlated_history ch ON ch.PostId = cte.PostId
+LEFT JOIN Users cu ON cu.Id = ch.UserId
+LEFT JOIN tag_metrics tm ON tm.TagName = ANY(regexp_split_to_array(REGEXP_REPLACE(COALESCE(cte.Tags, ''), '[<>]', '', 'g'), ','))
+LEFT JOIN Posts p ON p.Id = cte.PostId
+GROUP BY
+  cte.OwnerDisplayName,
+  cte.Reputation,
+  TitleWithTags,
+  tm.TagName,
+  tm.TagQuestionCount,
+  tm.TagTotalScore,
+  tm.TagAvgScore,
+  tm.TagTotalViews,
+  IsOldPost,
+  LENGTH(p.Body),
+  ch.PostHistoryTypeId,
+  ch.UserId,
+  ch.CreationDate,
+  ch.Comment,
+  cu.DisplayName,
+  cte.LastActivityDate,
+  cte.Title,
+  cte.Tags,
+  cte.CreationDate,
+  p.Body,
+  cte.PostId
+ORDER BY cte.LastActivityDate DESC
+LIMIT 100;

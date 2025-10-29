@@ -1,0 +1,88 @@
+WITH RecentEdits AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title AS OriginalTitle,
+        p.OwnerUserId AS OriginalOwnerUserId,
+        ph.UserId AS EditorUserId,
+        ph.CreationDate AS EditDate,
+        ROW_NUMBER() OVER(PARTITION BY p.Id ORDER BY ph.CreationDate DESC) AS rn
+    FROM Posts p
+    JOIN PostHistory ph ON p.Id = ph.PostId
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6)
+      AND p.CreationDate BETWEEN (cast('2024-10-01' as date) - INTERVAL '365 day') AND cast('2024-10-01' as date)
+      AND p.OwnerUserId IS NOT NULL
+),
+PostEditStats AS (
+    SELECT
+        re.PostId,
+        re.OriginalTitle,
+        re.OriginalOwnerUserId,
+        u.DisplayName AS EditorDisplayName,
+        re.EditDate,
+        COUNT(DISTINCT ph.Id) AS RevisionCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 4 THEN 1 ELSE 0 END) AS TitleEdits,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 5 THEN 1 ELSE 0 END) AS BodyEdits,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 6 THEN 1 ELSE 0 END) AS TagEdits,
+        AVG(CASE WHEN ph.PostHistoryTypeId = 5 THEN LENGTH(ph.Text) ELSE NULL END) AS AvgBodyEditLength
+    FROM RecentEdits re
+    JOIN Users u ON re.EditorUserId = u.Id
+    JOIN PostHistory ph ON re.PostId = ph.PostId
+      AND ph.RevisionGUID = (
+          SELECT ph2.RevisionGUID
+          FROM PostHistory ph2
+          WHERE ph2.PostId = re.PostId
+            AND ph2.CreationDate = re.EditDate
+            AND ph2.UserId = re.EditorUserId
+          LIMIT 1
+      )
+    WHERE re.rn = 1
+    GROUP BY re.PostId, re.OriginalTitle, re.OriginalOwnerUserId, u.DisplayName, re.EditDate
+)
+SELECT
+    pes.PostId,
+    pes.OriginalTitle,
+    u_orig.DisplayName AS OriginalOwnerDisplayName,
+    pes.EditorDisplayName,
+    pes.EditDate,
+    pes.RevisionCount,
+    pes.TitleEdits,
+    pes.BodyEdits,
+    pes.TagEdits,
+    ROUND(pes.AvgBodyEditLength::numeric, 2) AS AverageBodyEditLength,
+    CASE
+        WHEN pes.TagEdits > 0 AND pes.TagEdits > pes.BodyEdits * 1.5 THEN 'Tag Heavy Editor'
+        WHEN pes.BodyEdits > 0 AND pes.BodyEdits > pes.TagEdits * 1.5 THEN 'Content Focused Editor'
+        WHEN pes.TitleEdits > 0 THEN 'Title Focused Editor'
+        ELSE 'Balanced Editor'
+    END AS EditStyle,
+    COALESCE(p.AnswerCount, 0) AS AnswerCountOnEdit,
+    COALESCE(p.CommentCount, 0) AS CommentCountOnEdit,
+    p.Score AS ScoreOnEdit,
+    CASE
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        ELSE 'Active'
+    END AS PostStatus,
+    CASE
+        WHEN u_orig.Reputation IS NULL THEN 'Unknown Reputation'
+        WHEN u_orig.Reputation BETWEEN 0 AND 99 THEN 'New User'
+        WHEN u_orig.Reputation BETWEEN 100 AND 499 THEN 'Novice'
+        WHEN u_orig.Reputation BETWEEN 500 AND 1999 THEN 'Contributor'
+        WHEN u_orig.Reputation BETWEEN 2000 AND 9999 THEN 'Member'
+        WHEN u_orig.Reputation >= 10000 THEN 'High Reputation'
+        ELSE 'Undefined Reputation'
+    END AS OriginalOwnerReputationTier,
+    CASE
+        WHEN p.Tags IS NULL OR p.Tags = '' THEN 'No Tags'
+        WHEN p.Tags LIKE '%<sql>%' THEN 'SQL Tag Present'
+        WHEN p.Tags LIKE '%<python>%' THEN 'Python Tag Present'
+        WHEN LENGTH(p.Tags) > 100 THEN 'Extensive Tags'
+        ELSE 'Moderate Tags'
+    END AS TagComplexity
+FROM PostEditStats pes
+JOIN Posts p ON pes.PostId = p.Id
+LEFT JOIN Users u_orig ON pes.OriginalOwnerUserId = u_orig.Id
+WHERE pes.RevisionCount > 1
+  AND pes.AvgBodyEditLength IS NOT NULL
+ORDER BY pes.EditDate DESC, pes.RevisionCount DESC
+LIMIT 1000;

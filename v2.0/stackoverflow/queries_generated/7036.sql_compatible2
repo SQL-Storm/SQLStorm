@@ -1,0 +1,165 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+        AVG(p.Score) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate ROWS BETWEEN 10 PRECEDING AND CURRENT ROW) as moving_avg_score,
+        CASE 
+            WHEN p.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = p.PostTypeId) THEN 'Above Average'
+            WHEN p.Score < (SELECT AVG(Score) FROM Posts WHERE PostTypeId = p.PostTypeId) THEN 'Below Average'
+            ELSE 'Average'
+        END as score_category
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) 
+      AND p.CreationDate >= TIMESTAMP '2021-01-01 00:00:00'
+),
+UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as post_count,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as question_count,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as answer_count,
+        SUM(p.Score) as total_score,
+        AVG(p.Score) as avg_score,
+        MAX(p.CreationDate) as latest_activity
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.CreationDate >= TIMESTAMP '2020-01-01 00:00:00'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        COALESCE(p.Title, 'No Title') as excerpt_title,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 500 THEN 'Moderate'
+            ELSE 'Niche'
+        END as tag_popularity,
+        REVERSE(SUBSTRING(t.TagName FROM 1 FOR 3)) as reversed_tag_prefix
+    FROM Tags t
+    LEFT JOIN Posts p ON t.ExcerptPostId = p.Id
+    WHERE t.Count > 50
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        rp.Id as PostId,
+        rp.Title,
+        rp.Score,
+        rp.ViewCount,
+        rp.Tags,
+        rp.Score - COALESCE(rp.prev_score, 0) as score_change,
+        rp.moving_avg_score,
+        rp.score_category,
+        CASE 
+            WHEN rp.Score > 100 AND rp.ViewCount > 1000 THEN 'High Impact'
+            WHEN rp.Score > 50 AND rp.ViewCount > 500 THEN 'Medium Impact'
+            WHEN rp.Score > 10 AND rp.ViewCount > 100 THEN 'Low Impact'
+            ELSE 'Minimal Impact'
+        END as impact_level,
+        CAST((JULIANDAY(TIMESTAMP '2024-10-01 12:34:56') - JULIANDAY(rp.CreationDate)) AS INTEGER) as days_since_post,
+        ('Post #' || CAST(rp.Id AS VARCHAR) || ' - ' || COALESCE(rp.Title, 'Untitled')) as post_identifier,
+        COALESCE(
+            (SELECT vt.Name 
+             FROM PostHistory ph 
+             INNER JOIN VoteTypes vt ON ph.PostHistoryTypeId = vt.Id 
+             WHERE ph.PostId = rp.Id AND ph.PostHistoryTypeId IN (10, 11, 12, 13)
+             ORDER BY ph.CreationDate DESC
+             LIMIT 1), 
+            'Not Closed/Reopened/Deleted'
+        ) as last_action_type,
+        CASE 
+            WHEN rp.Tags IS NULL OR rp.Tags = '' THEN 'No Tags'
+            WHEN POSITION('>' IN rp.Tags) > 0 THEN 'Multiple Tags'
+            ELSE 'Single Tag'
+        END as tag_structure,
+        CASE 
+            WHEN rp.Score >= 0 THEN RPAD('', (rp.Score / 10), '★')
+            ELSE ''
+        END as score_stars,
+        rp.CreationDate
+    FROM RankedPosts rp
+    WHERE rp.rn <= 5
+)
+SELECT 
+    ca.PostId,
+    ca.Title,
+    ca.Score,
+    ca.ViewCount,
+    ca.score_change,
+    ca.moving_avg_score,
+    ca.impact_level,
+    ca.days_since_post,
+    ca.post_identifier,
+    ca.last_action_type,
+    ca.tag_structure,
+    ca.score_stars,
+    us.DisplayName as Author,
+    us.Reputation as AuthorReputation,
+    us.post_count as AuthorPostCount,
+    us.avg_score as AuthorAvgScore,
+    ta.TagName,
+    ta.Count as TagCount,
+    ta.tag_popularity,
+    ta.reversed_tag_prefix,
+    CASE 
+        WHEN ca.days_since_post < 30 THEN 'New'
+        WHEN ca.days_since_post < 90 THEN 'Recent'
+        WHEN ca.days_since_post < 365 THEN 'Established'
+        ELSE 'Legacy'
+    END as post_age_category,
+    CASE 
+        WHEN ca.Score > 50 AND ca.ViewCount > 500 AND us.post_count > 10 THEN 'Active Contributor'
+        WHEN ca.Score > 100 AND ca.ViewCount > 1000 THEN 'Top Performer'
+        WHEN ca.Score <= 10 AND us.avg_score <= 10 THEN 'Beginner'
+        ELSE 'Regular'
+    END as user_category,
+    DENSE_RANK() OVER (ORDER BY ca.Score DESC) as rank_by_score,
+    PERCENT_RANK() OVER (ORDER BY ca.Score) * 100 as percentile_score,
+    SUM(ca.Score) OVER (ORDER BY ca.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) as cumulative_score,
+    LAG(ca.Score) OVER (ORDER BY ca.CreationDate) as prev_post_score,
+    LAG(ca.PostId) OVER (ORDER BY ca.CreationDate) as prev_post_id,
+    CASE 
+        WHEN EXISTS (SELECT 1 FROM Comments c WHERE c.PostId = ca.PostId AND c.Score > 10) THEN 'Highly Commented'
+        ELSE 'Low Comment Volume'
+    END as comment_status,
+    (ca.Score * 1.1) + (ca.ViewCount * 0.05) + (COALESCE(ca.moving_avg_score, 0) * 0.01) as composite_score,
+    REPLACE(ca.Tags, '<', '') as cleaned_tags,
+    CASE 
+        WHEN ca.Title LIKE '%' OR ca.Title LIKE '%error%' OR ca.Title LIKE '%bug%' THEN 'Technical'
+        ELSE 'General'
+    END as content_type,
+    CASE 
+        WHEN ca.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'Above Question Avg'
+        WHEN ca.Score < (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'Below Question Avg'
+        ELSE 'Average Question'
+    END as question_comparison,
+    ROW_NUMBER() OVER (PARTITION BY ca.impact_level ORDER BY ca.Score DESC) as level_rank,
+    NULLIF((ca.ViewCount * 100.0 / NULLIF(ca.Score, 0)), 0) as view_score_ratio
+FROM ComplexPostAnalysis ca
+LEFT JOIN UserStats us ON ca.PostId = us.UserId OR ca.Score = us.total_score
+LEFT JOIN TagAnalysis ta ON ta.TagName = SUBSTRING(ca.Tags FROM 2 FOR (CHAR_LENGTH(ca.Tags) - 2))
+WHERE ca.PostId IS NOT NULL
+  AND (ca.Score > 0 OR ca.ViewCount > 0)
+  AND (ca.days_since_post > 0 OR ca.days_since_post IS NULL)
+  AND (ca.impact_level IS NOT NULL)
+ORDER BY ca.CreationDate DESC, ca.Score DESC
+OFFSET 0 ROWS
+FETCH NEXT 100 ROWS ONLY;

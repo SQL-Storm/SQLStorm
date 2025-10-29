@@ -1,0 +1,182 @@
+-- {"query": "3426.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2000} 
+WITH
+/* --------------------------------------------------------------
+   1. Tags that are “large” (more than 5 000 occurrences)   
+   -------------------------------------------------------------- */
+LargeTags AS (
+    SELECT  t.Id                         AS TagId,
+            t.TagName,
+            t.Count
+    FROM    Tags t
+    WHERE   t.Count > 5000
+),
+
+/* --------------------------------------------------------------
+   2. Questions posted in the last 12 months with at least one
+      of the large tags (tags column is stored like "<tag1><tag2>")
+   -------------------------------------------------------------- */
+RecentQuestions AS (
+    SELECT  p.Id                         AS QuestionId,
+            p.Title,
+            p.CreationDate,
+            p.OwnerUserId               AS QuestionOwnerId,
+            unnest(string_to_array(
+                     substring(p.Tags FROM 2 FOR length(p.Tags)-2),
+                     '><'))                AS TagName
+    FROM    Posts p
+    WHERE   p.PostTypeId = 1                                   -- Question
+      AND   p.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '12 months')
+),
+
+/* --------------------------------------------------------------
+   3. Answers to the recent questions (also limited to last 12 months)
+   -------------------------------------------------------------- */
+RecentAnswers AS (
+    SELECT  a.Id                         AS AnswerId,
+            a.ParentId                   AS QuestionId,
+            a.OwnerUserId                AS AnswerOwnerId,
+            a.Score,
+            a.CreationDate
+    FROM    Posts a
+    WHERE   a.PostTypeId = 2                                   -- Answer
+      AND   a.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '12 months')
+),
+
+/* --------------------------------------------------------------
+   4. Latest vote date per answer (correlated sub‑query later)   
+   -------------------------------------------------------------- */
+AnswerLatestVote AS (
+    SELECT  v.PostId                     AS AnswerId,
+            MAX(v.CreationDate)          AS LatestVoteDate
+    FROM    Votes v
+    WHERE   v.VoteTypeId IN (2,3)       -- UpMod / DownMod
+    GROUP BY v.PostId
+),
+
+/* --------------------------------------------------------------
+   5. Users that have earned at least one Gold badge (Class = 1)
+   -------------------------------------------------------------- */
+GoldBadgeUsers AS (
+    SELECT  DISTINCT b.UserId            AS UserId
+    FROM    Badges b
+    WHERE   b.Class = 1
+),
+
+/* --------------------------------------------------------------
+   6. Aggregate per (Tag, User) the answering activity
+   -------------------------------------------------------------- */
+TagUserStats AS (
+    SELECT
+        lt.TagName,
+        u.Id                                    AS UserId,
+        COALESCE(u.DisplayName, '[deleted]')   AS UserDisplay,
+        COUNT(DISTINCT ra.AnswerId)             AS AnswersGiven,
+        SUM(ra.Score)                           AS TotalAnswerScore,
+        AVG(ra.Score)                           AS AvgAnswerScore,
+        MAX(rq.CreationDate)                    AS MostRecentQuestionAnswered,
+        MAX(alv.LatestVoteDate)                 AS MostRecentVoteOnAnyAnswer,
+        COUNT(DISTINCT b.Id)                    AS BadgeCount,
+        MAX(CASE WHEN gb.UserId IS NOT NULL THEN 1 ELSE 0 END) AS HasGoldBadge,
+        /* Row‑number within each tag ordered by total score descending */
+        ROW_NUMBER() OVER (PARTITION BY lt.TagName
+                           ORDER BY SUM(ra.Score) DESC,
+                                    COUNT(DISTINCT ra.AnswerId) DESC) AS TagRank
+    FROM
+        LargeTags lt
+        LEFT JOIN RecentQuestions rq
+               ON lt.TagName = rq.TagName
+        LEFT JOIN RecentAnswers ra
+               ON ra.QuestionId = rq.QuestionId
+        LEFT JOIN Users u
+               ON u.Id = ra.AnswerOwnerId
+        LEFT JOIN AnswerLatestVote alv
+               ON alv.AnswerId = ra.AnswerId
+        LEFT JOIN Badges b
+               ON b.UserId = u.Id
+        LEFT JOIN GoldBadgeUsers gb
+               ON gb.UserId = u.Id
+    WHERE
+        u.Id IS NOT NULL                                   -- filter out deleted users early
+        AND (u.Reputation > 10000
+             OR gb.UserId IS NOT NULL)                     -- high‑rep or gold badge
+        AND (u.Location IS NOT NULL AND u.Location <> '') -- location known
+    GROUP BY
+        lt.TagName,
+        u.Id,
+        u.DisplayName,
+        gb.UserId
+),
+
+/* --------------------------------------------------------------
+   7. Top‑3 contributors per tag (by TagRank)
+   -------------------------------------------------------------- */
+TopContributors AS (
+    SELECT *
+    FROM   TagUserStats
+    WHERE  TagRank <= 3
+),
+
+/* --------------------------------------------------------------
+   8. Users with high reputation but no answers in the period,
+      to be UNION‑ed for workload diversity
+   -------------------------------------------------------------- */
+HighRepNoAnswers AS (
+    SELECT
+        NULL                              AS TagName,
+        u.Id                              AS UserId,
+        COALESCE(u.DisplayName, '[deleted]') AS UserDisplay,
+        0                                 AS AnswersGiven,
+        0                                 AS TotalAnswerScore,
+        NULL                              AS AvgAnswerScore,
+        NULL                              AS MostRecentQuestionAnswered,
+        NULL                              AS MostRecentVoteOnAnyAnswer,
+        COUNT(b.Id)                       AS BadgeCount,
+        MAX(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS HasGoldBadge,
+        NULL                              AS TagRank
+    FROM   Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE  u.Reputation >= 20000
+      AND  NOT EXISTS (
+            SELECT 1
+            FROM   RecentAnswers ra
+            WHERE  ra.AnswerOwnerId = u.Id
+          )
+    GROUP BY u.Id, u.DisplayName
+)
+
+/* --------------------------------------------------------------
+   Final result set – union of top contributors and high‑rep silent users
+   -------------------------------------------------------------- */
+SELECT
+    COALESCE(t.TagName, 'N/A')                 AS Tag,
+    t.UserId,
+    t.UserDisplay,
+    t.AnswersGiven,
+    t.TotalAnswerScore,
+    ROUND(t.AvgAnswerScore::numeric,2)        AS AvgScore,
+    t.MostRecentQuestionAnswered,
+    t.MostRecentVoteOnAnyAnswer,
+    t.BadgeCount,
+    CASE WHEN t.HasGoldBadge = 1 THEN 'YES' ELSE 'NO' END AS HasGoldBadge,
+    t.TagRank
+FROM   TopContributors t
+
+UNION ALL
+
+SELECT
+    'N/A'                                      AS Tag,
+    h.UserId,
+    h.UserDisplay,
+    h.AnswersGiven,
+    h.TotalAnswerScore,
+    NULL                                       AS AvgScore,
+    NULL                                       AS MostRecentQuestionAnswered,
+    NULL                                       AS MostRecentVoteOnAnyAnswer,
+    h.BadgeCount,
+    CASE WHEN h.HasGoldBadge = 1 THEN 'YES' ELSE 'NO' END AS HasGoldBadge,
+    NULL                                       AS TagRank
+FROM   HighRepNoAnswers h
+ORDER BY
+    Tag,
+    TagRank NULLS LAST,
+    TotalAnswerScore DESC;

@@ -1,0 +1,48 @@
+-- {"query": "6765.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-micro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 511} 
+
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id ELSE NULL END) AS TotalQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id ELSE NULL END) AS TotalAnswers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 3 THEN p.Id ELSE NULL END) AS TotalWikis,
+    SUM(p.Score) AS TotalScore,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN p.AnswerCount ELSE 0 END) AS TotalAnswersToQuestions,
+    MAX(u.LastAccessDate) AS LastAccessDate,
+    b.Class,
+    t.TagName,
+    ph.RevisionGUID,
+    ph.CreationDate AS LastEditDate,
+    v.VoteTypeId
+FROM 
+    Users u
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    (SELECT 
+        PostId,
+        MAX(CASE WHEN PostHistoryTypeId = 2 THEN RevisionGUID ELSE NULL END) AS RevisionGUID,
+        MAX(CASE WHEN PostHistoryTypeId = 2 THEN CreationDate ELSE NULL END) AS CreationDate
+     FROM 
+        PostHistory
+     GROUP BY 
+        PostId) ph ON p.Id = ph.PostId
+LEFT JOIN 
+    Tags t ON p.Id = t.ExcerptPostId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+WHERE 
+    p.PostTypeId IN (1, 2, 3)
+    AND u.Reputation > 100
+    AND (u.LastAccessDate IS NOT NULL OR u.LastAccessDate > NOW() - INTERVAL '30 days')
+    AND (b.Id IS NOT NULL OR b.Id = 0)
+    AND p.Score > 0
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation, b.Class, t.TagName, ph.RevisionGUID, ph.CreationDate, v.VoteTypeId
+HAVING 
+    COUNT(DISTINCT p.Id) > 5
+ORDER BY 
+    u.Reputation DESC, TotalScore DESC;

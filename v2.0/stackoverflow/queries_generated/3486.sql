@@ -1,0 +1,147 @@
+-- {"query": "3486.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2573} 
+
+WITH UserGoldBadge AS (
+    SELECT UserId
+    FROM Badges
+    WHERE Class = 1
+    GROUP BY UserId
+),
+
+UserStats AS (
+    SELECT 
+        u.Id                                   AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(b.Id)                            AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1)   AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2)   AS AnswerCount,
+        COALESCE(SUM(vu.VoteCount),0)                AS UpVotesGiven,
+        COALESCE(SUM(vd.VoteCount),0)                AS DownVotesGiven,
+        (
+            SELECT AVG(Score)
+            FROM Posts a
+            WHERE a.PostTypeId = 2
+              AND a.OwnerUserId = u.Id
+        )                                         AS AvgAnswerScore
+    FROM Users u
+    LEFT JOIN Badges b   ON b.UserId = u.Id
+    LEFT JOIN Posts  p   ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT UserId, COUNT(*) AS VoteCount
+        FROM Votes
+        WHERE VoteTypeId = 2
+        GROUP BY UserId
+    ) vu ON vu.UserId = u.Id
+    LEFT JOIN (
+        SELECT UserId, COUNT(*) AS VoteCount
+        FROM Votes
+        WHERE VoteTypeId = 3
+        GROUP BY UserId
+    ) vd ON vd.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+TopQuestions AS (
+    SELECT
+        p.OwnerUserId,
+        p.Id                                    AS QuestionId,
+        p.Title,
+        p.Score,
+        p.CreationDate,
+        p.ViewCount,
+        p.FavoriteCount,
+        p.Tags,
+        ROW_NUMBER() OVER (
+            PARTITION BY p.OwnerUserId
+            ORDER BY p.Score DESC, p.CreationDate
+        )                                      AS rn,
+        COUNT(a.Id)                             AS AnswerCnt,
+        COALESCE(SUM(vu.VoteCount),0)           AS UpVotes,
+        COALESCE(SUM(vd.VoteCount),0)           AS DownVotes,
+        COALESCE(SUM(vc.VoteCount),0)           AS CommentVotes,
+        (
+            SELECT MAX(CreationDate)
+            FROM Posts a2
+            WHERE a2.ParentId = p.Id
+        )                                      AS LastAnswerDate
+    FROM Posts p
+    LEFT JOIN Posts a   ON a.ParentId = p.Id AND a.PostTypeId = 2
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS VoteCount
+        FROM Votes
+        WHERE VoteTypeId = 2
+        GROUP BY PostId
+    ) vu ON vu.PostId = p.Id
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS VoteCount
+        FROM Votes
+        WHERE VoteTypeId = 3
+        GROUP BY PostId
+    ) vd ON vd.PostId = p.Id
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS VoteCount
+        FROM Votes
+        WHERE VoteTypeId = 5
+        GROUP BY PostId
+    ) vc ON vc.PostId = p.Id
+    WHERE p.PostTypeId = 1
+    GROUP BY 
+        p.OwnerUserId, p.Id, p.Title, p.Score,
+        p.CreationDate, p.ViewCount, p.FavoriteCount, p.Tags
+),
+
+AggregatedTags AS (
+    SELECT
+        u.Id                                 AS UserId,
+        STRING_AGG(
+            DISTINCT TRIM(BOTH '><' FROM UNNEST(string_to_array(p.Tags, '><'))),
+            ','
+        )                                    AS AllTags
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id
+                AND p.PostTypeId = 1
+                AND p.Tags IS NOT NULL
+    GROUP BY u.Id
+)
+
+SELECT
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.TotalBadges,
+    us.GoldBadges,
+    us.QuestionCount,
+    us.AnswerCount,
+    ROUND(
+        CASE WHEN us.DownVotesGiven = 0 THEN NULL
+             ELSE us.UpVotesGiven::numeric / us.DownVotesGiven
+        END, 2
+    )                                        AS UpDownRatio,
+    us.AvgAnswerScore,
+    tq.QuestionId,
+    tq.Title,
+    tq.Score                AS QuestionScore,
+    tq.ViewCount,
+    tq.FavoriteCount,
+    tq.AnswerCnt,
+    tq.UpVotes,
+    tq.DownVotes,
+    tq.CommentVotes,
+    CASE 
+        WHEN tq.LastAnswerDate IS NULL THEN 'No Answers'
+        ELSE TO_CHAR(tq.LastAnswerDate, 'YYYY-MM-DD')
+    END                                      AS LastAnswerDate,
+    COALESCE(at.AllTags, '')                AS UserTags,
+    CASE
+        WHEN tq.Tags IS NULL THEN 'NoTags'
+        ELSE REPLACE(REPLACE(tq.Tags, '<', ''), '>', ',')
+    END                                      AS TagList
+FROM UserStats us
+JOIN UserGoldBadge ug      ON ug.UserId = us.UserId
+LEFT JOIN TopQuestions tq ON tq.OwnerUserId = us.UserId AND tq.rn <= 3
+LEFT JOIN AggregatedTags at ON at.UserId = us.UserId
+WHERE us.Reputation > 10000
+  AND (us.GoldBadges > 0 OR us.TotalBadges > 10)
+  AND (tq.QuestionId IS NOT NULL OR us.QuestionCount = 0)
+ORDER BY us.Reputation DESC, us.UserId, tq.rn;

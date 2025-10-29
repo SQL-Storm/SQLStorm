@@ -1,0 +1,155 @@
+-- {"query": "5751.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1201} 
+WITH
+RecentActivePosts AS (
+  SELECT
+    p.Id,
+    p.PostTypeId,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.Body,
+    p.LastEditorUserId,
+    p.LastEditDate
+  FROM Posts p
+  WHERE p.CreationDate >= NOW() - INTERVAL '30 days'
+),
+TagInfo AS (
+  SELECT
+    t.Id AS TagId,
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId,
+    t.WikiPostId,
+    t.IsModeratorOnly,
+    t.IsRequired
+  FROM Tags t
+),
+TopTagWikis AS (
+  SELECT
+    w.Id AS WikiPostId,
+    w.Title AS WikiTitle,
+    w.CreationDate AS WikiCreated,
+    w.OwnerUserId AS WikiOwner,
+    w.OwnerDisplayName,
+    w.Body AS WikiBody,
+    ROW_NUMBER() OVER (PARTITION BY w.OwnerUserId ORDER BY w.CreationDate DESC) AS rn
+  FROM Posts w
+  WHERE w.PostTypeId = 5 -- TagWiki
+),
+HighImpactUsers AS (
+  SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    u.LastAccessDate,
+    u.AccountId,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesGiven,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesGiven
+  FROM Users u
+  LEFT JOIN Votes v ON v.UserId = u.Id
+  GROUP BY
+    u.Id, u.DisplayName, u.Reputation, u.Location, u.LastAccessDate, u.AccountId
+),
+CrossPostActivity AS (
+  SELECT
+    ph.PostId,
+    ph.PostHistoryTypeId,
+    MAX(ph.CreationDate) AS LastHistoryDate
+  FROM PostHistory ph
+  GROUP BY ph.PostId, ph.PostHistoryTypeId
+),
+CorrelatedCommentStats AS (
+  SELECT
+    c.PostId,
+    COUNT(*) AS CommentCount,
+    MAX(c.CreationDate) AS LastCommentDate
+  FROM Comments c
+  GROUP BY c.PostId
+),
+PostLinkDepth AS (
+  SELECT
+    pl.PostId,
+    pl.RelatedPostId,
+    lt.Name AS LinkTypeName,
+    ROW_NUMBER() OVER (PARTITION BY pl.PostId ORDER BY pl.CreationDate DESC) AS seq
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+)
+SELECT
+  rp.Id AS PostId,
+  rp.Title AS PostTitle,
+  rp.PostTypeId,
+  pt.Name AS PostTypeName,
+  rp.OwnerUserId,
+  u.DisplayName AS OwnerDisplayName,
+  rp.CreationDate AS PostCreationDate,
+  rp.LastActivityDate,
+  rp.Score,
+  rp.ViewCount,
+  rp.Tags,
+  rp.Body,
+  COALESCE(ac.CommentCount, 0) AS CommentCount,
+  COALESCE(hv.UpVotesReceived, 0) AS UpVotesReceived,
+  COALESCE(hv.DownVotesReceived, 0) AS DownVotesReceived,
+  COALESCE(pv.TotalVotes, 0) AS TotalVotes,
+  COALESCE(cur.LastHistoryDate, rp.LastEditDate) AS LastEditedOrCreated,
+  COALESCE(ti.TagName, rp.Tags) AS PrimaryTagOrTags,
+  t.Count AS TagUsageCount,
+  w.WikiTitle,
+  w.WikiCreated,
+  w.WikiOwner,
+  w.WikiBody,
+  a.TotalAnswers,
+  c.LastCommentDate,
+  pc.seq AS LinkDepth
+FROM Posts rp
+JOIN PostTypes pt ON rp.PostTypeId = pt.Id
+LEFT JOIN Users u ON rp.OwnerUserId = u.Id
+LEFT JOIN (
+  SELECT
+    ve.PostId,
+    SUM(CASE WHEN ve.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+    SUM(CASE WHEN ve.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived
+  FROM Votes ve
+  GROUP BY ve.PostId
+) hv ON hv.PostId = rp.Id
+LEFT JOIN (
+  SELECT PostId, SUM(CASE WHEN VoteTypeId IN (2,3,16,8,9) THEN 1 ELSE 0 END) AS TotalVotes
+  FROM Votes
+  GROUP BY PostId
+) pv ON pv.PostId = rp.Id
+LEFT JOIN LATERAL (
+  SELECT MAX(ph.CreationDate) AS LastHistoryDate
+  FROM PostHistory ph
+  WHERE ph.PostId = rp.Id
+) cur ON TRUE
+LEFT JOIN (
+  SELECT
+    t.TagName,
+    t.Count
+  FROM Tags t
+) ti ON rp.Tags LIKE '%' || ti.TagName || '%'
+LEFT JOIN TopTagWikis w ON w.WikiPostId = rp.Id
+LEFT JOIN (
+  SELECT
+    p.ParentId,
+    COUNT(*) AS TotalAnswers
+  FROM Posts p
+  WHERE p.PostTypeId = 2
+  GROUP BY p.ParentId
+) a ON a.ParentId = rp.Id
+LEFT JOIN CorrelatedCommentStats c ON c.PostId = rp.Id
+LEFT JOIN PostLinkDepth pc ON pc.PostId = rp.Id
+WHERE rp.CreationDate >= NOW() - INTERVAL '60 days'
+ORDER BY rp.LastActivityDate DESC
+LIMIT 100;

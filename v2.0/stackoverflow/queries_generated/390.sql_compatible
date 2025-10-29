@@ -1,0 +1,335 @@
+with recent_users as (
+    select u.id as user_id,
+           u.displayname,
+           u.reputation,
+           u.creationdate,
+           coalesce(nullif(trim(split_part(coalesce(u.location,''), ',', 1)), ''), 'Unknown') as region_hint
+    from users u
+    where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+questions as (
+    select p.id as qid,
+           p.creationdate,
+           p.owneruserid,
+           p.title,
+           p.tags,
+           p.viewcount,
+           p.score,
+           p.answercount,
+           p.acceptedanswerid,
+           case when p.closeddate is not null then 1 else 0 end as is_closed
+    from posts p
+    where p.posttypeid = 1
+),
+answers as (
+    select a.id as aid,
+           a.parentid as qid,
+           a.owneruserid,
+           a.score as a_score,
+           a.creationdate as a_created
+    from posts a
+    where a.posttypeid = 2
+),
+votes_agg as (
+    select v.postid,
+           sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+           sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+           sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started,
+           sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded,
+           count(*) as total_votes
+    from votes v
+    where v.creationdate >= (select coalesce(min(p.creationdate), timestamp '1970-01-01') from posts p)
+    group by v.postid
+),
+commenters as (
+    select c.postid,
+           count(*) as comment_count,
+           count(distinct c.userid) filter (where c.userid is not null) as distinct_commenters
+    from comments c
+    group by c.postid
+),
+post_edits as (
+    select ph.postid,
+           count(*) filter (where ph.posthistorytypeid in (4,5,6)) as edits,
+           min(ph.creationdate) filter (where ph.posthistorytypeid in (4,5,6)) as first_edit,
+           max(ph.creationdate) filter (where ph.posthistorytypeid in (4,5,6)) as last_edit,
+           count(*) filter (where ph.posthistorytypeid = 10) as close_votes_events
+    from posthistory ph
+    group by ph.postid
+),
+dupe_links as (
+    select pl.postid as dup_qid,
+           count(*) filter (where pl.linktypeid = 3) as duplicate_links,
+           count(*) filter (where pl.linktypeid = 1) as linked_links
+    from postlinks pl
+    group by pl.postid
+),
+tags_expanded as (
+    select q.qid,
+           unnest(string_to_array(substring(q.tags, 2, greatest(length(q.tags)-2,0)), '><')) as tag
+    from questions q
+    where q.tags is not null and q.tags like '<%>'
+),
+tag_rankings as (
+    select te.tag,
+           count(*) as tag_q_count,
+           sum(q.viewcount) as tag_total_views,
+           avg(cast(q.score as numeric)) as tag_avg_score
+    from tags_expanded te
+    join questions q on q.qid = te.qid
+    group by te.tag
+),
+user_activity as (
+    select u.id as user_id,
+           coalesce(sum(case when p.posttypeid = 1 then 1 else 0 end),0) as q_count,
+           coalesce(sum(case when p.posttypeid = 2 then 1 else 0 end),0) as a_count,
+           coalesce(sum(case when p.posttypeid in (1,2) then p.score else 0 end),0) as total_post_score,
+           max(p.lastactivitydate) as last_post_activity
+    from users u
+    left join posts p on p.owneruserid = u.id
+    group by u.id
+),
+acc_answer_latency as (
+    select q.qid,
+           min(a.a_created) filter (where q.acceptedanswerid = a.aid) as accepted_answer_time,
+           q.creationdate as q_created
+    from questions q
+    left join answers a on a.qid = q.qid
+    group by q.qid, q.creationdate
+),
+first_answer as (
+    select a.qid,
+           min(a.a_created) as first_answer_time
+    from answers a
+    group by a.qid
+),
+quality_window as (
+    select q.qid,
+           q.title,
+           q.owneruserid,
+           q.creationdate,
+           q.viewcount,
+           q.score,
+           q.answercount,
+           q.acceptedanswerid,
+           coalesce(va.upvotes,0) as upvotes,
+           coalesce(va.downvotes,0) as downvotes,
+           coalesce(va.total_votes,0) as total_votes,
+           coalesce(va.bounty_started,0) as bounty_started,
+           coalesce(va.bounty_awarded,0) as bounty_awarded,
+           coalesce(cm.comment_count,0) as comment_count,
+           coalesce(cm.distinct_commenters,0) as distinct_commenters,
+           coalesce(pe.edits,0) as edit_count,
+           pe.first_edit,
+           pe.last_edit,
+           q.is_closed,
+           coalesce(dl.duplicate_links,0) as duplicate_links,
+           coalesce(dl.linked_links,0) as linked_links,
+           fa.first_answer_time,
+           al.accepted_answer_time
+    from questions q
+    left join votes_agg va on va.postid = q.qid
+    left join commenters cm on cm.postid = q.qid
+    left join post_edits pe on pe.postid = q.qid
+    left join dupe_links dl on dl.dup_qid = q.qid
+    left join first_answer fa on fa.qid = q.qid
+    left join acc_answer_latency al on al.qid = q.qid
+),
+scored as (
+    select qw.qid,
+           qw.title,
+           qw.owneruserid,
+           qw.creationdate,
+           qw.viewcount,
+           qw.score,
+           qw.answercount,
+           qw.acceptedanswerid,
+           qw.upvotes,
+           qw.downvotes,
+           qw.total_votes,
+           qw.bounty_started,
+           qw.bounty_awarded,
+           qw.comment_count,
+           qw.distinct_commenters,
+           qw.edit_count,
+           qw.first_edit,
+           qw.last_edit,
+           qw.is_closed,
+           qw.duplicate_links,
+           qw.linked_links,
+           qw.first_answer_time,
+           qw.accepted_answer_time,
+           extract(epoch from (coalesce(qw.first_answer_time, qw.creationdate) - qw.creationdate)) / 3600.0 as hrs_to_first_answer,
+           extract(epoch from (coalesce(qw.accepted_answer_time, qw.creationdate) - qw.creationdate)) / 3600.0 as hrs_to_accept,
+           case when qw.total_votes = 0 then null else (cast(qw.upvotes as numeric) - cast(qw.downvotes as numeric)) / nullif(cast(qw.total_votes as numeric),0) end as vote_balance,
+           case when qw.viewcount = 0 then 0 else (cast(qw.score as numeric) / nullif(cast(qw.viewcount as numeric),0)) end as score_per_view,
+           (coalesce(qw.upvotes,0)*2 + coalesce(qw.bounty_awarded,0)/100 + greatest(qw.score,0) - coalesce(qw.downvotes,0) - (case when qw.is_closed = 1 then 5 else 0 end) - coalesce(qw.duplicate_links,0))::numeric as composite_signal,
+           qw.* 
+    from quality_window qw
+),
+user_enriched as (
+    select ru.user_id,
+           ru.displayname,
+           ru.reputation,
+           ru.creationdate as user_created,
+           ru.region_hint,
+           ua.q_count,
+           ua.a_count,
+           ua.total_post_score,
+           ua.last_post_activity,
+           rank() over (order by ua.q_count desc nulls last, ua.a_count desc nulls last, ru.reputation desc) as user_rank
+    from recent_users ru
+    left join user_activity ua on ua.user_id = ru.user_id
+),
+question_ranked as (
+    select s.qid,
+           s.title,
+           s.owneruserid,
+           s.creationdate,
+           s.viewcount,
+           s.score,
+           s.answercount,
+           s.acceptedanswerid,
+           s.upvotes,
+           s.downvotes,
+           s.total_votes,
+           s.bounty_started,
+           s.bounty_awarded,
+           s.comment_count,
+           s.distinct_commenters,
+           s.edit_count,
+           s.first_edit,
+           s.last_edit,
+           s.is_closed,
+           s.duplicate_links,
+           s.linked_links,
+           s.first_answer_time,
+           s.accepted_answer_time,
+           s.hrs_to_first_answer,
+           s.hrs_to_accept,
+           s.vote_balance,
+           s.score_per_view,
+           s.composite_signal,
+           dense_rank() over (order by s.composite_signal desc nulls last, s.viewcount desc, s.score desc, s.answercount desc) as q_quality_rank,
+           ntile(20) over (order by coalesce(s.vote_balance,-1) desc nulls last) as vote_balance_bucket,
+           row_number() over (partition by s.owneruserid order by s.composite_signal desc nulls last) as rn_by_owner
+    from scored s
+),
+top_questions as (
+    select qr.qid,
+           qr.title,
+           qr.owneruserid,
+           qr.creationdate,
+           qr.viewcount,
+           qr.score,
+           qr.answercount,
+           qr.acceptedanswerid,
+           qr.upvotes,
+           qr.downvotes,
+           qr.total_votes,
+           qr.bounty_started,
+           qr.bounty_awarded,
+           qr.comment_count,
+           qr.distinct_commenters,
+           qr.edit_count,
+           qr.first_edit,
+           qr.last_edit,
+           qr.is_closed,
+           qr.duplicate_links,
+           qr.linked_links,
+           qr.first_answer_time,
+           qr.accepted_answer_time,
+           qr.hrs_to_first_answer,
+           qr.hrs_to_accept,
+           qr.vote_balance,
+           qr.score_per_view,
+           qr.composite_signal,
+           qr.q_quality_rank,
+           qr.vote_balance_bucket,
+           qr.rn_by_owner
+    from question_ranked qr
+    where qr.rn_by_owner <= 3
+),
+tag_mix as (
+    select tq.qid,
+           string_agg(distinct te.tag, '|' order by te.tag) as tagset,
+           count(distinct te.tag) as tag_cnt
+    from top_questions tq
+    left join tags_expanded te on te.qid = tq.qid
+    group by tq.qid
+),
+badge_agg as (
+    select b.userid,
+           count(*) as badges_total,
+           sum(case when b.class = 1 then 1 else 0 end) as gold,
+           sum(case when b.class = 2 then 1 else 0 end) as silver,
+           sum(case when b.class = 3 then 1 else 0 end) as bronze,
+           sum(case when b.tagbased = true then 1 else 0 end) as tagbadges
+    from badges b
+    group by b.userid
+),
+final as (
+    select
+        tq.qid,
+        coalesce(u.displayname, p.ownerdisplayname, 'anonymous') as owner_name,
+        ue.region_hint,
+        ue.user_rank,
+        ue.reputation as owner_rep,
+        coalesce(ba.badges_total,0) as owner_badges,
+        coalesce(ba.gold,0) as owner_gold,
+        coalesce(ba.silver,0) as owner_silver,
+        coalesce(ba.bronze,0) as owner_bronze,
+        tq.title,
+        tq.viewcount,
+        tq.score,
+        tq.answercount,
+        tq.upvotes,
+        tq.downvotes,
+        tq.total_votes,
+        tq.bounty_started,
+        tq.bounty_awarded,
+        tq.comment_count,
+        tq.distinct_commenters,
+        tq.edit_count,
+        tq.first_edit,
+        tq.last_edit,
+        tq.is_closed,
+        tq.duplicate_links,
+        tq.linked_links,
+        tq.first_answer_time,
+        tq.accepted_answer_time,
+        tq.hrs_to_first_answer,
+        tq.hrs_to_accept,
+        tq.vote_balance,
+        tq.score_per_view,
+        tq.composite_signal,
+        tq.q_quality_rank,
+        tq.vote_balance_bucket,
+        tm.tagset,
+        tm.tag_cnt,
+        case
+            when tm.tag_cnt is null or tm.tag_cnt = 0 then 'untagged'
+            when tm.tag_cnt = 1 then 'single-tag'
+            when tm.tag_cnt between 2 and 4 then 'multi-tag'
+            else 'broad-tag'
+        end as tag_group
+    from top_questions tq
+    left join posts p on p.id = tq.qid
+    left join users u on u.id = p.owneruserid
+    left join user_enriched ue on ue.user_id = p.owneruserid
+    left join badge_agg ba on ba.userid = p.owneruserid
+    left join tag_mix tm on tm.qid = tq.qid
+)
+select *
+from final f
+where (
+        f.vote_balance is distinct from null
+        and f.hrs_to_first_answer is not null
+        and (f.bounty_awarded >= 0 and (f.bounty_started is null or f.bounty_started >= f.bounty_awarded))
+      )
+   or (
+        f.vote_balance is null
+        and (f.is_closed = 1 or f.duplicate_links > 0 or f.edit_count > 3)
+      )
+order by f.q_quality_rank, f.viewcount desc, f.qid
+limit 500;

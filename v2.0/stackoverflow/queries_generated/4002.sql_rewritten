@@ -1,0 +1,240 @@
+-- {"query": "4002.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2112} 
+WITH
+  RankedPosts AS (
+    SELECT
+      p.Id AS PostId,
+      p.OwnerUserId,
+      p.PostTypeId,
+      p.CreationDate AS PostCreationDate,
+      p.Score AS PostScore,
+      p.ViewCount AS PostViewCount,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      pt.Name AS PostTypeName,
+      ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS ScoreRank,
+      AVG(p.Score) OVER (PARTITION BY p.PostTypeId) AS AvgScoreForType,
+      COUNT(*) OVER (PARTITION BY p.PostTypeId) AS PostCountForType,
+      LAG(p.Score, 1, 0) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate) AS PreviousPostScore,
+      LEAD(p.Score, 1, 0) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate) AS NextPostScore,
+      SUM(p.ViewCount) OVER (ORDER BY p.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativeViews
+    FROM
+      Posts AS p
+      JOIN PostTypes AS pt
+      ON p.PostTypeId = pt.Id
+    WHERE
+      p.OwnerUserId IS NOT NULL
+      AND p.CreationDate BETWEEN '2023-01-01' AND '2023-12-31'
+  ),
+  UserPostStats AS (
+    SELECT
+      rp.OwnerUserId,
+      rp.PostTypeId,
+      COUNT(rp.PostId) AS NumberOfPosts,
+      SUM(rp.PostScore) AS TotalScore,
+      AVG(rp.PostScore) AS AverageScore,
+      MAX(rp.PostScore) AS MaxScore,
+      SUM(rp.PostViewCount) AS TotalViews,
+      AVG(rp.PostViewCount) AS AverageViews,
+      COUNT(CASE WHEN rp.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+      COUNT(CASE WHEN rp.PostTypeId = 2 THEN 1 END) AS AnswerCount
+    FROM
+      RankedPosts AS rp
+    WHERE
+      rp.OwnerUserId > 0
+    GROUP BY
+      rp.OwnerUserId,
+      rp.PostTypeId
+  ),
+  TopUsers AS (
+    SELECT
+      ups.OwnerUserId,
+      u.DisplayName,
+      SUM(ups.NumberOfPosts) AS TotalPosts,
+      SUM(ups.TotalScore) AS GrandTotalScore,
+      SUM(ups.TotalViews) AS GrandTotalViews,
+      MAX(ups.AverageScore) AS MaxAvgScoreAcrossTypes,
+      SUM(ups.AnswerCount) AS TotalAnswers,
+      SUM(ups.QuestionCount) AS TotalQuestions
+    FROM
+      UserPostStats AS ups
+      JOIN Users AS u
+      ON ups.OwnerUserId = u.Id
+    WHERE
+      ups.NumberOfPosts > 10 -- Consider users with at least some activity
+    GROUP BY
+      ups.OwnerUserId,
+      u.DisplayName
+    ORDER BY
+      GrandTotalScore DESC
+    LIMIT 100
+  )
+SELECT
+  tu.DisplayName,
+  tu.TotalPosts,
+  tu.GrandTotalScore,
+  tu.GrandTotalViews,
+  tu.MaxAvgScoreAcrossTypes,
+  tu.TotalAnswers,
+  tu.TotalQuestions,
+  (
+    SELECT
+      COUNT(DISTINCT ph.PostId)
+    FROM
+      PostHistory AS ph
+      JOIN RankedPosts AS rp
+      ON ph.PostId = rp.PostId
+    WHERE
+      ph.PostHistoryTypeId = 5 -- Edit Body
+      AND ph.UserId = tu.OwnerUserId
+      AND rp.OwnerUserId = tu.OwnerUserId
+      AND rp.PostTypeId = 1 -- Only consider edits to questions for this example
+      AND ph.CreationDate < rp.PostCreationDate + INTERVAL '7 day'
+  ) AS EditsToOwnQuestionsWithinWeek,
+  CASE
+    WHEN tu.TotalQuestions > 0 THEN CAST(tu.TotalAnswers AS REAL) / tu.TotalQuestions
+    ELSE 0.0
+  END AS AvgAnswersPerQuestion,
+  CASE
+    WHEN EXISTS (
+      SELECT
+        1
+      FROM
+        Badges AS b
+      WHERE
+        b.UserId = tu.OwnerUserId AND b.Name LIKE '%gold%' AND b.Class = 1
+    ) THEN 'Has Gold Badge'
+    ELSE 'No Gold Badge'
+  END AS GoldBadgeStatus,
+  COALESCE(u.Location, 'Unknown Location') AS UserLocation,
+  COALESCE(u.WebsiteUrl, 'No Website') AS UserWebsite,
+  CASE
+    WHEN u.Views > 100000 THEN 'High Visitor'
+    WHEN u.Views > 10000 THEN 'Medium Visitor'
+    ELSE 'Low Visitor'
+  END AS VisitorCategory,
+  u.Reputation,
+  u.DownVotes,
+  u.UpVotes,
+  (
+    SELECT
+      COUNT(DISTINCT p.Id)
+    FROM
+      Posts AS p
+      LEFT JOIN Comments AS c
+      ON p.Id = c.PostId
+    WHERE
+      p.OwnerUserId = tu.OwnerUserId
+      AND p.PostTypeId = 1
+      AND c.Id IS NULL -- Posts with no comments
+  ) AS QuestionsWithoutComments,
+  (
+    SELECT
+      SUM(rp.PostScore)
+    FROM
+      RankedPosts AS rp
+    WHERE
+      rp.OwnerUserId = tu.OwnerUserId
+      AND rp.PostTypeId = 2 -- Answers
+      AND rp.Score > (
+        SELECT
+          AVG(rp2.Score)
+        FROM
+          RankedPosts AS rp2
+        WHERE
+          rp2.OwnerUserId = tu.OwnerUserId
+          AND rp2.PostTypeId = 2
+      )
+  ) AS ScoreOfAnswersAboveAverage,
+  LOWER(SUBSTRING(tu.DisplayName FROM 1 FOR 3)) AS FirstThreeCharsOfDisplayName
+FROM
+  TopUsers AS tu
+  JOIN Users AS u
+  ON tu.OwnerUserId = u.Id
+WHERE
+  u.Reputation > 5000
+UNION
+SELECT
+  tu.DisplayName,
+  tu.TotalPosts,
+  tu.GrandTotalScore,
+  tu.GrandTotalViews,
+  tu.MaxAvgScoreAcrossTypes,
+  tu.TotalAnswers,
+  tu.TotalQuestions,
+  (
+    SELECT
+      COUNT(DISTINCT ph.PostId)
+    FROM
+      PostHistory AS ph
+      JOIN RankedPosts AS rp
+      ON ph.PostId = rp.PostId
+    WHERE
+      ph.PostHistoryTypeId = 5 -- Edit Body
+      AND ph.UserId = tu.OwnerUserId
+      AND rp.OwnerUserId = tu.OwnerUserId
+      AND rp.PostTypeId = 1 -- Only consider edits to questions for this example
+      AND ph.CreationDate < rp.PostCreationDate + INTERVAL '7 day'
+  ) AS EditsToOwnQuestionsWithinWeek,
+  CASE
+    WHEN tu.TotalQuestions > 0 THEN CAST(tu.TotalAnswers AS REAL) / tu.TotalQuestions
+    ELSE 0.0
+  END AS AvgAnswersPerQuestion,
+  CASE
+    WHEN EXISTS (
+      SELECT
+        1
+      FROM
+        Badges AS b
+      WHERE
+        b.UserId = tu.OwnerUserId AND b.Name LIKE '%gold%' AND b.Class = 1
+    ) THEN 'Has Gold Badge'
+    ELSE 'No Gold Badge'
+  END AS GoldBadgeStatus,
+  COALESCE(u.Location, 'Unknown Location') AS UserLocation,
+  COALESCE(u.WebsiteUrl, 'No Website') AS UserWebsite,
+  CASE
+    WHEN u.Views > 100000 THEN 'High Visitor'
+    WHEN u.Views > 10000 THEN 'Medium Visitor'
+    ELSE 'Low Visitor'
+  END AS VisitorCategory,
+  u.Reputation,
+  u.DownVotes,
+  u.UpVotes,
+  (
+    SELECT
+      COUNT(DISTINCT p.Id)
+    FROM
+      Posts AS p
+      LEFT JOIN Comments AS c
+      ON p.Id = c.PostId
+    WHERE
+      p.OwnerUserId = tu.OwnerUserId
+      AND p.PostTypeId = 1
+      AND c.Id IS NULL -- Posts with no comments
+  ) AS QuestionsWithoutComments,
+  (
+    SELECT
+      SUM(rp.PostScore)
+    FROM
+      RankedPosts AS rp
+    WHERE
+      rp.OwnerUserId = tu.OwnerUserId
+      AND rp.PostTypeId = 2 -- Answers
+      AND rp.Score > (
+        SELECT
+          AVG(rp2.Score)
+        FROM
+          RankedPosts AS rp2
+        WHERE
+          rp2.OwnerUserId = tu.OwnerUserId
+          AND rp2.PostTypeId = 2
+      )
+  ) AS ScoreOfAnswersAboveAverage,
+  LOWER(SUBSTRING(tu.DisplayName FROM 1 FOR 3)) AS FirstThreeCharsOfDisplayName
+FROM
+  TopUsers AS tu
+  JOIN Users AS u
+  ON tu.OwnerUserId = u.Id
+WHERE
+  u.Reputation <= 5000;

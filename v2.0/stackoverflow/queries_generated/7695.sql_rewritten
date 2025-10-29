@@ -1,0 +1,205 @@
+-- {"query": "7695.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1803} 
+WITH PostStats AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Title,
+        p.Tags,
+        p.Body,
+        COALESCE(p.AcceptedAnswerId, 0) AS AcceptedAnswerId,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.PostTypeId = 1 AND p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+            WHEN p.PostTypeId = 2 AND p.Score > 0 THEN 'Accepted Answer'
+            WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN 'Answered'
+            ELSE 'Unanswered'
+        END AS PostStatus,
+        DATEDIFF('DAY', p.CreationDate, COALESCE(p.ClosedDate, p.LastActivityDate, cast('2024-10-01 12:34:56' as timestamp))) AS DaysActive,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserPostRank,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) AS TotalUserPosts,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS AvgUserScore,
+        NTILE(10) OVER (ORDER BY p.ViewCount DESC) AS ViewDecile,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags != '' THEN 
+                ARRAY_LENGTH(STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><'), 1)
+            ELSE 0
+        END AS TagCount
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserReputationAnalysis AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.ViewCount AS UserViews,
+        u.UpVotes,
+        u.DownVotes,
+        u.CreationDate AS UserCreationDate,
+        DATEDIFF('DAY', u.CreationDate, cast('2024-10-01 12:34:56' as timestamp)) AS DaysSinceRegistration,
+        COALESCE(SUM(ps.Score), 0) AS TotalScore,
+        COALESCE(AVG(ps.Score), 0) AS AveragePostScore,
+        COUNT(ps.Id) AS PostCount,
+        MAX(ps.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN PostStats ps ON u.Id = ps.OwnerUserId
+    WHERE u.Reputation > 100
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.ViewCount, u.UpVotes, u.DownVotes, u.CreationDate
+),
+TopTags AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.IsRequired = 1 THEN 'Required Tag'
+            WHEN t.IsModeratorOnly = 1 THEN 'Moderator Only Tag'
+            ELSE 'Regular Tag'
+        END AS TagType,
+        DENSE_RANK() OVER (ORDER BY t.Count DESC) AS TagRank
+    FROM Tags t
+    WHERE t.Count > 100
+),
+PostHistorySummary AS (
+    SELECT 
+        ph.PostId,
+        COUNT(*) AS HistoryCount,
+        MAX(ph.CreationDate) AS LastEditDate,
+        COUNT(DISTINCT ph.UserId) AS UniqueEditors,
+        STRING_AGG(ph.PostHistoryTypeId, ', ') AS EditTypes,
+        STRING_AGG(COALESCE(ph.Comment, ''), ', ') AS Comments
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+),
+CommentAnalysis AS (
+    SELECT 
+        c.PostId,
+        c.Score AS CommentScore,
+        c.Text,
+        c.CreationDate AS CommentDate,
+        c.UserId,
+        c.UserDisplayName,
+        CASE 
+            WHEN LENGTH(c.Text) > 50 THEN 'Long Comment'
+            WHEN LENGTH(c.Text) < 10 THEN 'Short Comment'
+            ELSE 'Medium Comment'
+        END AS CommentLengthCat
+    FROM Comments c
+    WHERE LENGTH(c.Text) > 0
+),
+ComplexQueryResults AS (
+    SELECT 
+        ps.Id AS PostId,
+        ps.Title,
+        ps.PostStatus,
+        ps.Tags,
+        ps.Score,
+        ps.ViewCount,
+        ps.AnswerCount,
+        ps.CommentCount,
+        ps.FavoriteCount,
+        ps.DaysActive,
+        ps.TagCount,
+        ps.UserPostRank,
+        ps.TotalUserPosts,
+        ps.AvgUserScore,
+        ps.ViewDecile,
+        u.DisplayName AS AuthorName,
+        u.Reputation AS AuthorReputation,
+        ura.TotalScore AS UserTotalScore,
+        ura.AveragePostScore AS UserAvgScore,
+        ura.PostCount AS UserPostCount,
+        ps.CreationDate AS PostCreated,
+        ps.LastActivityDate AS PostLastActivity,
+        COALESCE(phs.HistoryCount, 0) AS EditCount,
+        COALESCE(phs.UniqueEditors, 0) AS UniqueEditUsers,
+        phs.LastEditDate,
+        COALESCE(ta.TagCount, 0) AS AssociatedTags,
+        COALESCE(ta.TagRank, 0) AS TagRanking,
+        CASE 
+            WHEN ps.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'Above Average'
+            WHEN ps.Score < (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'Below Average'
+            ELSE 'Average'
+        END AS ScoreQuality,
+        CASE 
+            WHEN ps.ViewCount > (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = 1) THEN 'Popular'
+            WHEN ps.ViewCount < (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = 1) THEN 'Less Popular'
+            ELSE 'Standard'
+        END AS Popularity,
+        CASE 
+            WHEN ps.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) 
+                 AND ps.ViewCount > (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = 1) 
+                 AND ps.CommentCount > 0 THEN 'High Quality'
+            WHEN ps.Score < (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) 
+                 AND ps.ViewCount < (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = 1) THEN 'Low Quality'
+            ELSE 'Mixed Quality'
+        END AS QualityAssessment,
+        CASE 
+            WHEN ps.PostTypeId = 1 AND ps.AcceptedAnswerId > 0 THEN 1
+            WHEN ps.PostTypeId = 1 AND ps.AnswerCount = 0 THEN 0
+            ELSE NULL
+        END AS HasAnswer,
+        COUNT(ca.PostId) OVER (PARTITION BY ps.Id) AS CommentCountForPost,
+        STRING_AGG(DISTINCT ca.UserDisplayName, ', ') OVER (PARTITION BY ps.Id) AS Commentators
+    FROM PostStats ps
+    JOIN Users u ON ps.OwnerUserId = u.Id
+    JOIN UserReputationAnalysis ura ON u.Id = ura.UserId
+    LEFT JOIN PostHistorySummary phs ON ps.Id = phs.PostId
+    LEFT JOIN TopTags ta ON ps.Tags LIKE '%' || ta.TagName || '%'
+    LEFT JOIN CommentAnalysis ca ON ps.Id = ca.PostId
+    WHERE ps.PostStatus IN ('Answered', 'Closed')
+      AND ps.ViewCount > 50
+      AND ps.Score > 0
+      AND ps.DaysActive > 30
+      AND ps.TotalUserPosts > 5
+      AND ura.AveragePostScore > 5
+)
+SELECT 
+    PostId,
+    Title,
+    PostStatus,
+    Tags,
+    Score,
+    ViewCount,
+    AnswerCount,
+    CommentCount,
+    FavoriteCount,
+    DaysActive,
+    TagCount,
+    UserPostRank,
+    TotalUserPosts,
+    AvgUserScore,
+    ViewDecile,
+    AuthorName,
+    AuthorReputation,
+    UserTotalScore,
+    UserAvgScore,
+    UserPostCount,
+    PostCreated,
+    PostLastActivity,
+    EditCount,
+    UniqueEditUsers,
+    LastEditDate,
+    AssociatedTags,
+    TagRanking,
+    ScoreQuality,
+    Popularity,
+    QualityAssessment,
+    HasAnswer,
+    CommentCountForPost,
+    Commentators
+FROM ComplexQueryResults
+WHERE ScoreQuality IN ('Above Average', 'Popular')
+   OR QualityAssessment = 'High Quality'
+   OR (EditCount > 10 AND UniqueEditUsers > 3)
+ORDER BY ViewCount DESC, Score DESC, LastEditDate DESC
+LIMIT 1000;

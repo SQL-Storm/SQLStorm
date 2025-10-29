@@ -1,0 +1,109 @@
+WITH
+  RankedQuestions AS (
+    SELECT
+      p.Id AS PostId,
+      p.Title,
+      p.OwnerUserId,
+      p.CreationDate AS PostCreationDate,
+      ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE
+      p.PostTypeId = 1 AND p.OwnerUserId IS NOT NULL
+  ),
+  UserPostStats AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      (
+        SELECT
+          COUNT(*)
+        FROM Posts p_ans
+        JOIN RankedQuestions p_q ON p_ans.ParentId = p_q.PostId
+        WHERE
+          p_ans.OwnerUserId = u.Id
+      ) AS AnswerCountForUserQuestions,
+      (
+        SELECT
+          SUM(p_hist.CommentLength)
+        FROM (
+          SELECT
+            LENGTH(ph.Comment) AS CommentLength
+          FROM PostHistory ph
+          WHERE
+            ph.UserId = u.Id AND ph.PostHistoryTypeId IN (4, 5, 6)
+        ) p_hist
+      ) AS TotalEditCommentLength,
+      COALESCE(
+        (
+          SELECT
+            MAX(b.Date)
+          FROM Badges b
+          WHERE
+            b.UserId = u.Id AND b.Class = 1
+        ),
+        TIMESTAMP '1970-01-01 00:00:00'
+      ) AS GoldBadgeDate
+    FROM Users u
+  ),
+  RecentQuestions AS (
+    SELECT
+      rq.PostId,
+      rq.Title,
+      rq.OwnerUserId,
+      rq.PostCreationDate
+    FROM RankedQuestions rq
+    WHERE
+      rq.rn <= 5
+  )
+SELECT
+  ups.UserId,
+  ups.DisplayName,
+  ups.Reputation,
+  COALESCE(ups.TotalEditCommentLength, 0) AS TotalEditCommentLength,
+  ups.GoldBadgeDate,
+  COUNT(rq.PostId) AS RecentQuestionCount,
+  STRING_AGG(rq.Title, ' | ') AS RecentQuestionTitles,
+  (
+    SELECT
+      CASE
+        WHEN SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) > SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) THEN 'More Upvotes'
+        WHEN SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) < SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) THEN 'More Downvotes'
+        ELSE 'Equal Votes'
+      END
+    FROM Votes v
+    WHERE
+      v.UserId = ups.UserId AND v.VoteTypeId IN (2, 3)
+  ) AS VoteBalance,
+  CASE
+    WHEN ups.Reputation > 10000 THEN 'High Rep'
+    WHEN ups.Reputation BETWEEN 5000 AND 10000 THEN 'Medium Rep'
+    ELSE 'Low Rep'
+  END AS ReputationCategory,
+  CASE
+    WHEN ups.AnswerCountForUserQuestions > 5 THEN 'Prolific Answerer'
+    ELSE 'Regular Answerer'
+  END AS AnswererType,
+  CAST(ups.GoldBadgeDate AS DATE) AS GoldBadgeEarnedDate,
+  CASE
+    WHEN LAG(ups.Reputation, 1, 0) OVER (ORDER BY ups.Reputation DESC) IS NULL THEN 'Highest Reputation'
+    WHEN ups.Reputation < LAG(ups.Reputation, 1, 0) OVER (ORDER BY ups.Reputation DESC) THEN 'Not Top Tier'
+    ELSE 'Tied Top Tier'
+  END AS ReputationRank
+FROM UserPostStats ups
+LEFT JOIN RecentQuestions rq
+  ON ups.UserId = rq.OwnerUserId
+WHERE
+  ups.Reputation > 100
+GROUP BY
+  ups.UserId,
+  ups.DisplayName,
+  ups.Reputation,
+  ups.TotalEditCommentLength,
+  ups.GoldBadgeDate,
+  ups.AnswerCountForUserQuestions
+HAVING
+  COUNT(rq.PostId) > 0 OR ups.Reputation > 50000
+ORDER BY
+  ups.Reputation DESC
+FETCH FIRST 100 ROWS ONLY;

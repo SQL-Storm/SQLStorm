@@ -1,0 +1,115 @@
+-- {"query": "4796.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 846} 
+
+WITH
+  RecentQuestions AS (
+    SELECT
+      Id,
+      OwnerUserId,
+      Title,
+      Tags,
+      AnswerCount,
+      FavoriteCount,
+      CAST(
+        (
+          CASE
+            WHEN FavoriteCount IS NULL THEN 0
+            ELSE FavoriteCount
+          END
+        ) AS FLOAT
+      ) / NULLIF(CASE WHEN AnswerCount = 0 THEN 1 ELSE AnswerCount END, 0) AS FavoriteAnswerRatio
+    FROM Posts
+    WHERE
+      PostTypeId = 1 AND CreationDate > DATE('now', '-30 day') AND AnswerCount IS NOT NULL
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      COUNT(DISTINCT ph.Id) AS PostHistoryCount,
+      MAX(ph.CreationDate) AS LastPostHistoryDate,
+      SUM(
+        CASE
+          WHEN ph.PostHistoryTypeId IN (2, 5) THEN 1
+          ELSE 0
+        END
+      ) AS BodyEdits
+    FROM Users AS u
+    LEFT JOIN PostHistory AS ph
+      ON u.Id = ph.UserId
+    WHERE
+      u.CreationDate > DATE('now', '-90 day')
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation
+  ),
+  TagPerformance AS (
+    SELECT
+      t.TagName,
+      COUNT(DISTINCT p.Id) AS QuestionsWithTag,
+      AVG(rq.FavoriteAnswerRatio) AS AvgFavoriteAnswerRatio
+    FROM Tags AS t
+    INNER JOIN Posts AS p
+      ON t.Id = (
+        SELECT
+          Id
+        FROM Tags
+        WHERE
+          TagName = SUBSTRING(p.Tags, 2, CHARINDEX('>', p.Tags) - 2)
+      )
+    LEFT JOIN RecentQuestions AS rq
+      ON p.Id = rq.Id
+    WHERE
+      p.PostTypeId = 1
+    GROUP BY
+      t.TagName
+    HAVING
+      COUNT(DISTINCT p.Id) > 10
+  )
+SELECT
+  rq.Title,
+  rq.Tags,
+  ua.DisplayName AS OwnerDisplayName,
+  ua.Reputation,
+  ua.PostHistoryCount,
+  ua.BodyEdits,
+  tp.TagName,
+  tp.QuestionsWithTag,
+  tp.AvgFavoriteAnswerRatio,
+  rq.FavoriteAnswerRatio AS CurrentQuestionFavAnswerRatio,
+  COALESCE(
+    (
+      SELECT
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END)
+      FROM Votes AS v
+      WHERE
+        v.PostId = rq.Id AND v.VoteTypeId = 2
+    ),
+    0
+  ) AS UpVoteCount,
+  COALESCE(
+    (
+      SELECT
+        COUNT(DISTINCT c.Id)
+      FROM Comments AS c
+      WHERE
+        c.PostId = rq.Id AND c.CreationDate > DATE('now', '-7 day')
+    ),
+    0
+  ) AS RecentCommentCount,
+  CASE
+    WHEN rq.AnswerCount > 50 THEN 'High Answer Count'
+    WHEN rq.FavoriteAnswerRatio > 0.5 THEN 'Highly Favorited Per Answer'
+    ELSE 'Standard'
+  END AS QuestionCategory
+FROM RecentQuestions AS rq
+LEFT JOIN UserActivity AS ua
+  ON rq.OwnerUserId = ua.UserId
+LEFT JOIN TagPerformance AS tp
+  ON tp.TagName = SUBSTRING(rq.Tags, 2, CHARINDEX('>', rq.Tags) - 2)
+WHERE
+  ua.Reputation > 1000
+ORDER BY
+  rq.CreationDate DESC
+LIMIT 100;

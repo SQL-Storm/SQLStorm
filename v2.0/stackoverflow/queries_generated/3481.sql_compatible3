@@ -1,0 +1,151 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.AboutMe, '') AS AboutMe,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END) AS TotalQuestionViews,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotesGiven,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVotesGiven
+    FROM Users u
+    LEFT JOIN Badges b       ON b.UserId = u.Id
+    LEFT JOIN Posts p        ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v        ON v.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.AboutMe
+),
+
+QuestionMetrics AS (
+    SELECT 
+        q.Id,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        q.FavoriteCount,
+        q.ViewCount,
+        q.Tags,
+        q.OwnerUserId,
+        q.AnswerCount,
+        COALESCE(q.AcceptedAnswerId, 0) AS AcceptedAnswerId,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = q.Id) AS CommentCount,
+        (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = q.Id AND pl.LinkTypeId = 3) AS DuplicateCount,
+        ROW_NUMBER() OVER (PARTITION BY q.OwnerUserId ORDER BY q.CreationDate DESC) AS RecentRank
+    FROM Posts q
+    WHERE q.PostTypeId = 1
+),
+
+TagExplode AS (
+    SELECT 
+        qm.Id AS PostId,
+        TRIM(BOTH '<>' FROM UNNEST(string_to_array(qm.Tags, '><'))) AS Tag
+    FROM QuestionMetrics qm
+    WHERE qm.Tags IS NOT NULL
+),
+
+TagStats AS (
+    SELECT 
+        t.TagName AS Tag,
+        COUNT(*) AS TagUseCount,
+        SUM(qm.Score) AS TotalTagScore,
+        ROUND(AVG(qm.ViewCount), 2) AS AvgTagViews
+    FROM TagExplode te
+    JOIN QuestionMetrics qm ON qm.Id = te.PostId
+    JOIN Tags t ON t.TagName = te.Tag
+    GROUP BY t.TagName
+),
+
+RecentBadges AS (
+    SELECT 
+        b.UserId,
+        STRING_AGG(b.Name, ', ') FILTER (WHERE b.Date >= (CAST('2024-10-01' AS date) - INTERVAL '30 days')) AS RecentBadgeList
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+MainResults AS (
+    SELECT 
+        us.Id,
+        us.DisplayName,
+        us.Reputation,
+        us.GoldBadges,
+        us.SilverBadges,
+        us.BronzeBadges,
+        us.TotalQuestionViews,
+        us.AnswerCount,
+        us.UpVotesGiven,
+        us.DownVotesGiven,
+        rb.RecentBadgeList,
+        qm.Title                     AS LatestQuestionTitle,
+        qm.CreationDate              AS LatestQuestionDate,
+        qm.Score                     AS LatestQuestionScore,
+        qm.FavoriteCount             AS LatestQuestionFavorites,
+        qm.ViewCount                 AS LatestQuestionViews,
+        qm.CommentCount,
+        qm.DuplicateCount,
+        CASE 
+            WHEN qm.AcceptedAnswerId <> 0 THEN 'Accepted' 
+            ELSE 'Unaccepted' 
+        END                         AS AcceptanceStatus,
+        COALESCE(ts.TagUseCount,0)   AS TopTagUseCount,
+        COALESCE(ts.TotalTagScore,0) AS TopTagScore,
+        ts.AvgTagViews
+    FROM UserStats us
+    LEFT JOIN RecentBadges rb               ON rb.UserId = us.Id
+    LEFT JOIN LATERAL (
+        SELECT qmm.*
+        FROM QuestionMetrics qmm
+        WHERE qmm.OwnerUserId = us.Id
+        ORDER BY qmm.CreationDate DESC
+        LIMIT 1
+    ) qm ON TRUE
+    LEFT JOIN LATERAL (
+        SELECT tss.*
+        FROM TagStats tss
+        WHERE tss.Tag = (
+            SELECT te.Tag
+            FROM TagExplode te
+            WHERE te.PostId = qm.Id
+            ORDER BY te.Tag NULLS LAST
+            LIMIT 1
+        )
+    ) ts ON TRUE
+    WHERE us.Reputation > 10000
+      AND us.GoldBadges > 0
+      AND (us.TotalQuestionViews + us.AnswerCount) > 500
+      AND (us.UpVotesGiven - us.DownVotesGiven) > 100
+)
+
+SELECT *
+FROM MainResults
+ORDER BY Reputation DESC, GoldBadges DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT 
+    CAST(NULL AS bigint) AS Id,
+    CAST(NULL AS text) AS DisplayName,
+    CAST(NULL AS bigint) AS Reputation,
+    CAST(NULL AS int) AS GoldBadges,
+    CAST(NULL AS int) AS SilverBadges,
+    CAST(NULL AS int) AS BronzeBadges,
+    CAST(NULL AS bigint) AS TotalQuestionViews,
+    CAST(NULL AS int) AS AnswerCount,
+    CAST(NULL AS int) AS UpVotesGiven,
+    CAST(NULL AS int) AS DownVotesGiven,
+    CAST(NULL AS text) AS RecentBadgeList,
+    CAST(NULL AS text) AS LatestQuestionTitle,
+    CAST(NULL AS timestamp) AS LatestQuestionDate,
+    CAST(NULL AS int) AS LatestQuestionScore,
+    CAST(NULL AS int) AS LatestQuestionFavorites,
+    CAST(NULL AS bigint) AS LatestQuestionViews,
+    CAST(NULL AS int) AS CommentCount,
+    CAST(NULL AS int) AS DuplicateCount,
+    CAST(NULL AS text) AS AcceptanceStatus,
+    CAST(NULL AS int) AS TopTagUseCount,
+    CAST(NULL AS bigint) AS TopTagScore,
+    CAST(NULL AS numeric) AS AvgTagViews
+WHERE NOT EXISTS (SELECT 1 FROM Users WHERE Reputation > 10000);

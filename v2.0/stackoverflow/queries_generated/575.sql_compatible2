@@ -1,0 +1,423 @@
+with recent_users as (
+  select u.id as user_id,
+         u.displayname,
+         u.reputation,
+         u.creationdate,
+         u.location,
+         coalesce(nullif(trim(split_part(coalesce(u.websiteurl,''), '/', 3)), ''), 'unknown.host') as website_host
+  from users u
+  where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+questions as (
+  select p.id as qid,
+         p.creationdate as q_created,
+         p.score as q_score,
+         p.viewcount as q_views,
+         p.owneruserid as q_ownerid,
+         p.title,
+         p.tags,
+         p.acceptedanswerid
+  from posts p
+  where p.posttypeid = 1
+),
+answers as (
+  select a.id as aid,
+         a.parentid as qid,
+         a.creationdate as a_created,
+         a.score as a_score,
+         a.owneruserid as a_ownerid
+  from posts a
+  where a.posttypeid = 2
+),
+q_activity as (
+  select q.qid,
+         count(a.aid) as answer_count,
+         coalesce(sum(case when a.a_score > 0 then 1 else 0 end), 0) as pos_answer_cnt,
+         max(a.a_score) as max_answer_score,
+         min(a.a_score) as min_answer_score,
+         avg(a.a_score) as avg_answer_score
+  from questions q
+  left join answers a on a.qid = q.qid
+  group by q.qid
+),
+vote_agg as (
+  select v.postid,
+         sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+         sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+         sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+         sum(case when v.votetypeid = 8 then coalesce(v.bountyamount, 0) else 0 end) as bounty_started,
+         sum(case when v.votetypeid = 9 then coalesce(v.bountyamount, 0) else 0 end) as bounty_awarded
+  from votes v
+  group by v.postid
+),
+comment_agg as (
+  select c.postid,
+         count(*) as comment_count,
+         max(c.score) as max_comment_score,
+         sum(case when c.score > 0 then 1 else 0 end) as pos_comment_cnt,
+         sum(char_length(c.text)) as total_comment_text_len
+  from comments c
+  group by c.postid
+),
+close_events as (
+  select ph.postid,
+         min(case when ph.posthistorytypeid = 10 then ph.creationdate end) as first_closed,
+         max(case when ph.posthistorytypeid = 11 then ph.creationdate end) as last_reopened,
+         sum(case when ph.posthistorytypeid = 10 then 1 else 0 end) as close_votes_events,
+         string_agg(distinct crt.name, ', ' order by crt.name) as close_reasons
+  from posthistory ph
+  left join close_reason_types crt
+    on crt.id = nullif(ph.comment, '')
+       and ph.posthistorytypeid = 10
+  group by ph.postid
+),
+duplicates as (
+  select pl.postid as dup_qid,
+         count(*) filter (where pl.linktypeid = 3) as dup_count,
+         count(*) filter (where pl.linktypeid = 1) as linked_count,
+         min(pl.creationdate) as first_link_date
+  from postlinks pl
+  group by pl.postid
+),
+tag_extract as (
+  select q.qid,
+         unnest(string_to_array(substring(coalesce(q.tags,''), 2, greatest(char_length(coalesce(q.tags,'')) - 2, 0)), '><')) as tagname
+  from questions q
+),
+tag_rank as (
+  select te.qid,
+         te.tagname,
+         t.count as global_tag_count,
+         row_number() over (partition by te.qid order by coalesce(t.count, 0) desc, te.tagname) as tag_rank_by_pop
+  from tag_extract te
+  left join tags t on t.tagname = te.tagname
+),
+accepted as (
+  select q.qid,
+         case when q.acceptedanswerid is not null then 1 else 0 end as has_accepted,
+         aa.a_score as accepted_score,
+         aa.a_created as accepted_created
+  from questions q
+  left join answers aa on aa.aid = q.acceptedanswerid
+),
+owner_stats as (
+  select u.id as ownerid,
+         count(*) filter (where p.posttypeid = 1) as total_questions,
+         count(*) filter (where p.posttypeid = 2) as total_answers,
+         avg(nullif(p.score, 0)) as avg_post_score_nonzero,
+         max(p.viewcount) as max_views_any_post
+  from users u
+  left join posts p on p.owneruserid = u.id
+  group by u.id
+),
+recent_q as (
+  select q.id    as qid,
+         q.creationdate as q_created,
+         q.score  as q_score,
+         q.viewcount as q_views,
+         q.owneruserid as q_ownerid,
+         q.title,
+         q.tags,
+         q.acceptedanswerid,
+         qa.answer_count,
+         qa.pos_answer_cnt,
+         qa.max_answer_score,
+         qa.min_answer_score,
+         qa.avg_answer_score,
+         va.upvotes,
+         va.downvotes,
+         va.favorites,
+         va.bounty_started,
+         va.bounty_awarded,
+         ca.comment_count,
+         ca.max_comment_score,
+         ca.pos_comment_cnt,
+         ca.total_comment_text_len,
+         ce.first_closed,
+         ce.last_reopened,
+         ce.close_votes_events,
+         ce.close_reasons,
+         du.dup_count,
+         du.linked_count,
+         du.first_link_date,
+         ac.has_accepted,
+         ac.accepted_score,
+         ac.accepted_created
+  from posts q
+  left join q_activity qa on qa.qid = q.id
+  left join vote_agg va on va.postid = q.id
+  left join comment_agg ca on ca.postid = q.id
+  left join close_events ce on ce.postid = q.id
+  left join duplicates du on du.dup_qid = q.id
+  left join accepted ac on ac.qid = q.id
+  where q.posttypeid = 1
+    and q.creationdate >= (select max(creationdate) - interval '180 days' from posts where posttypeid = 1)
+),
+scored as (
+  select rq.qid,
+         rq.q_created,
+         rq.q_score,
+         rq.q_views,
+         rq.q_ownerid,
+         rq.title,
+         rq.tags,
+         rq.acceptedanswerid,
+         rq.answer_count,
+         rq.pos_answer_cnt,
+         rq.max_answer_score,
+         rq.min_answer_score,
+         rq.avg_answer_score,
+         rq.upvotes,
+         rq.downvotes,
+         rq.favorites,
+         rq.bounty_started,
+         rq.bounty_awarded,
+         rq.comment_count,
+         rq.max_comment_score,
+         rq.pos_comment_cnt,
+         rq.total_comment_text_len,
+         rq.first_closed,
+         rq.last_reopened,
+         rq.close_votes_events,
+         rq.close_reasons,
+         rq.dup_count,
+         rq.linked_count,
+         rq.first_link_date,
+         rq.has_accepted,
+         rq.accepted_score,
+         rq.accepted_created,
+         greatest(rq.q_score, coalesce(rq.upvotes, 0) - coalesce(rq.downvotes, 0)) as engagement_score,
+         (coalesce(rq.q_views, 0) + 10 * coalesce(rq.answer_count, 0) + 25 * coalesce(rq.favorites, 0))
+           / nullif(extract(epoch from (timestamp '2024-10-01 12:34:56' - rq.q_created))/86400.0 + 1, 0) as hotness_per_day,
+         case
+           when rq.has_accepted = 1 then 'accepted'
+           when rq.answer_count > 0 then 'answered'
+           when rq.first_closed is not null and rq.last_reopened is null then 'closed'
+           when rq.first_closed is not null and rq.last_reopened is not null then 'reopened'
+           else 'open'
+         end as status_bucket
+  from recent_q rq
+),
+ranked as (
+  select s.*,
+         row_number() over (
+           partition by coalesce(s.status_bucket, 'open')
+           order by s.hotness_per_day desc nulls last, s.engagement_score desc nulls last, s.qid
+         ) as bucket_rank,
+         dense_rank() over (
+           order by (coalesce(s.upvotes, 0) + coalesce(s.favorites, 0) * 2 - coalesce(s.downvotes, 0)) desc nulls last
+         ) as global_pop_rank
+  from scored s
+),
+owner_enriched as (
+  select r.*,
+         u.displayname as owner_name,
+         u.reputation as owner_rep,
+         u.location as owner_location,
+         ru.website_host as owner_host,
+         os.total_questions as owner_qs,
+         os.total_answers as owner_as,
+         os.avg_post_score_nonzero as owner_avg_nonzero_score,
+         os.max_views_any_post as owner_max_views
+  from ranked r
+  left join users u on u.id = r.q_ownerid
+  left join recent_users ru on ru.user_id = r.q_ownerid
+  left join owner_stats os on os.ownerid = r.q_ownerid
+),
+top_tags as (
+  select tr.qid,
+         string_agg(tr.tagname, ', ' order by tr.tag_rank_by_pop) as top3_tags
+  from tag_rank tr
+  where tr.tag_rank_by_pop <= 3
+  group by tr.qid
+),
+calc as (
+  select oe.qid,
+         oe.q_created,
+         oe.q_score,
+         oe.q_views,
+         oe.q_ownerid,
+         oe.title,
+         oe.tags,
+         oe.acceptedanswerid,
+         oe.answer_count,
+         oe.pos_answer_cnt,
+         oe.max_answer_score,
+         oe.min_answer_score,
+         oe.avg_answer_score,
+         oe.upvotes,
+         oe.downvotes,
+         oe.favorites,
+         oe.bounty_started,
+         oe.bounty_awarded,
+         oe.comment_count,
+         oe.max_comment_score,
+         oe.pos_comment_cnt,
+         oe.total_comment_text_len,
+         oe.first_closed,
+         oe.last_reopened,
+         oe.close_votes_events,
+         oe.close_reasons,
+         oe.dup_count,
+         oe.linked_count,
+         oe.first_link_date,
+         oe.has_accepted,
+         oe.accepted_score,
+         oe.accepted_created,
+         oe.engagement_score,
+         oe.hotness_per_day,
+         oe.status_bucket,
+         oe.bucket_rank,
+         oe.global_pop_rank,
+         oe.owner_name,
+         oe.owner_rep,
+         oe.owner_location,
+         oe.owner_host,
+         oe.owner_qs,
+         oe.owner_as,
+         oe.owner_avg_nonzero_score,
+         oe.owner_max_views,
+         tt.top3_tags,
+         (coalesce(oe.q_views, 0) + 5 * coalesce(oe.answer_count, 0) + 3 * coalesce(oe.comment_count, 0)
+          + 20 * coalesce(oe.has_accepted, 0) + 2 * coalesce(oe.pos_comment_cnt, 0)
+          + 10 * (case when oe.dup_count > 0 then 1 else 0 end)
+         ) as composite_signal,
+         case
+           when position('python' in lower(coalesce(oe.title, ''))) > 0 then 1
+           when position('java' in lower(coalesce(oe.title, ''))) > 0 then 1
+           when position('javascript' in lower(coalesce(oe.title, ''))) > 0 then 1
+           else 0
+         end as lang_hit,
+         case
+           when coalesce(oe.owner_location, '') ilike any(array['%us%','%usa%','%united states%','%ca%','%canada%']) then 'NA'
+           when coalesce(oe.owner_location, '') ilike any(array['%uk%','%united kingdom%','%de%','%fr%','%es%','%it%']) then 'EU'
+           when coalesce(oe.owner_location, '') = '' then 'Unknown'
+           else 'Other'
+         end as owner_region
+  from owner_enriched oe
+  left join top_tags tt on tt.qid = oe.qid
+),
+elig as (
+  select c.qid,
+         c.q_created,
+         c.q_score,
+         c.q_views,
+         c.q_ownerid,
+         c.title,
+         c.tags,
+         c.acceptedanswerid,
+         c.answer_count,
+         c.pos_answer_cnt,
+         c.max_answer_score,
+         c.min_answer_score,
+         c.avg_answer_score,
+         c.upvotes,
+         c.downvotes,
+         c.favorites,
+         c.bounty_started,
+         c.bounty_awarded,
+         c.comment_count,
+         c.max_comment_score,
+         c.pos_comment_cnt,
+         c.total_comment_text_len,
+         c.first_closed,
+         c.last_reopened,
+         c.close_votes_events,
+         c.close_reasons,
+         c.dup_count,
+         c.linked_count,
+         c.first_link_date,
+         c.has_accepted,
+         c.accepted_score,
+         c.accepted_created,
+         c.engagement_score,
+         c.hotness_per_day,
+         c.status_bucket,
+         c.bucket_rank,
+         c.global_pop_rank,
+         c.owner_name,
+         c.owner_rep,
+         c.owner_location,
+         c.owner_host,
+         c.owner_qs,
+         c.owner_as,
+         c.owner_avg_nonzero_score,
+         c.owner_max_views,
+         c.top3_tags,
+         c.composite_signal,
+         c.lang_hit,
+         c.owner_region,
+         case when c.status_bucket in ('open','answered','accepted')
+               and coalesce(c.downvotes, 0) <= coalesce(c.upvotes, 0)
+               and coalesce(c.close_votes_events, 0) = 0
+               and coalesce(c.q_views, 0) >= 0
+             then 1 else 0 end as eligible
+  from calc c
+),
+thresholds as (
+  select
+    percentile_disc(0.9) within group (order by hotness_per_day) as p90_hotness,
+    percentile_disc(0.9) within group (order by engagement_score) as p90_engagement,
+    percentile_disc(0.9) within group (order by composite_signal) as p90_composite
+  from elig
+)
+select
+  e.qid,
+  coalesce(e.title, '(no title)') as title,
+  coalesce(e.top3_tags, '') as top_tags,
+  e.status_bucket,
+  e.bucket_rank,
+  e.global_pop_rank,
+  e.q_created,
+  e.q_score,
+  e.q_views,
+  e.answer_count,
+  e.has_accepted,
+  e.accepted_score,
+  e.upvotes,
+  e.downvotes,
+  e.favorites,
+  e.comment_count,
+  e.hotness_per_day,
+  e.engagement_score,
+  e.composite_signal,
+  e.owner_name,
+  e.owner_rep,
+  e.owner_region,
+  e.owner_host,
+  e.owner_qs,
+  e.owner_as,
+  e.owner_avg_nonzero_score,
+  e.owner_max_views,
+  e.close_reasons,
+  e.dup_count,
+  e.linked_count,
+  e.first_link_date,
+  case
+    when e.eligible = 1
+     and e.hotness_per_day >= t.p90_hotness
+     and (e.engagement_score >= t.p90_engagement or e.composite_signal >= t.p90_composite)
+    then 'P90 HOT'
+    when e.eligible = 1 then 'Eligible'
+    else 'Filtered'
+  end as selection_flag
+from elig e
+cross join thresholds t
+where (
+    e.eligible = 1
+    or (e.status_bucket in ('closed','reopened') and coalesce(e.close_reasons, '') <> '')
+    or (e.lang_hit = 1 and e.hotness_per_day is not null)
+  )
+and (
+    e.bucket_rank <= 100
+    or e.global_pop_rank <= 500
+    or (e.dup_count > 0 and e.answer_count >= 1)
+  )
+order by
+  selection_flag desc,
+  e.status_bucket,
+  e.bucket_rank,
+  e.hotness_per_day desc nulls last,
+  e.engagement_score desc nulls last,
+  e.qid
+limit 1000;

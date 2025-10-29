@@ -1,0 +1,225 @@
+WITH UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END), 0) AS QuestionCount,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END), 0) AS AnswerCount,
+        COALESCE(COUNT(DISTINCT c.Id), 0) AS TotalCommentsWritten,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS TotalUpvotesGiven,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS TotalDownvotesGiven,
+        COALESCE(SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END), 0) AS GoldBadges,
+        COALESCE(SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END), 0) AS SilverBadges,
+        COALESCE(SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END), 0) AS BronzeBadges,
+        MAX(p.CreationDate) AS LatestPostDate,
+        MAX(c.CreationDate) AS LatestCommentDate
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId
+    LEFT JOIN
+        Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+    HAVING
+        COALESCE(COUNT(DISTINCT p.Id), 0) > 5
+        OR COALESCE(COUNT(DISTINCT c.Id), 0) > 10
+        OR COALESCE(SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END), 0) > 0
+),
+PostEditHistoryAndLinks AS (
+    SELECT
+        ph.PostId,
+        COUNT(ph.Id) AS TotalHistoryEntries,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.Id END) AS EditCount,
+        MIN(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN ph.CreationDate END) AS FirstEditDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN ph.CreationDate END) AS LastEditDate,
+        STRING_AGG(DISTINCT CAST(pl.LinkTypeId AS VARCHAR), ',') AS AllLinkTypes,
+        COUNT(DISTINCT pl.RelatedPostId) AS RelatedPostCount
+    FROM
+        PostHistory ph
+    LEFT JOIN
+        PostLinks pl ON ph.PostId = pl.PostId
+    GROUP BY
+        ph.PostId
+    HAVING
+        COUNT(ph.Id) > 1
+),
+PostCommentSummary AS (
+    SELECT
+        PostId,
+        COUNT(Id) AS CommentCount,
+        MIN(CreationDate) AS FirstCommentDate,
+        MAX(CreationDate) AS LastCommentDate,
+        AVG(Score) AS AverageCommentScore
+    FROM
+        Comments
+    GROUP BY
+        PostId
+),
+QuestionAnswerAcceptedInfo AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.AcceptedAnswerId,
+        q.AnswerCount,
+        q.FavoriteCount,
+        q.ClosedDate,
+        a.Score AS AcceptedAnswerScore,
+        a.CreationDate AS AcceptedAnswerCreationDate,
+        u_ans.DisplayName AS AcceptedAnswerOwnerDisplayName,
+        (q.AcceptedAnswerId IS NOT NULL AND u_ans.Reputation > 5000) AS IsHighRepAccepted
+    FROM
+        Posts q
+    LEFT JOIN
+        Posts a ON q.AcceptedAnswerId = a.Id
+    LEFT JOIN
+        Users u_ans ON a.OwnerUserId = u_ans.Id
+    WHERE
+        q.PostTypeId = 1
+),
+TopTagsByPostCount AS (
+    SELECT
+        LOWER(TRIM(unnested_tag)) AS TagName,
+        COUNT(p.Id) AS PostCount,
+        RANK() OVER (ORDER BY COUNT(p.Id) DESC) AS TagRank
+    FROM
+        Posts p,
+        LATERAL UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags)-2)), '><')) AS unnested_tag
+    WHERE
+        p.Tags IS NOT NULL
+        AND p.PostTypeId = 1
+    GROUP BY
+        LOWER(TRIM(unnested_tag))
+    HAVING
+        COUNT(p.Id) > 100
+),
+AggregatedPostPerformance AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.LastActivityDate,
+        p.Title,
+        p.PostTypeId,
+        COALESCE(pes.EditCount, 0) AS TotalEdits,
+        pes.FirstEditDate,
+        pes.LastEditDate,
+        EXTRACT(EPOCH FROM (CASE WHEN pes.FirstEditDate IS NOT NULL THEN (pes.FirstEditDate - p.CreationDate) ELSE NULL END)) / 3600.0 AS TimeToFirstEditHours,
+        COALESCE(pcs.CommentCount, 0) AS TotalComments,
+        pcs.AverageCommentScore,
+        qaai.AcceptedAnswerId,
+        qaai.AcceptedAnswerScore,
+        qaai.AnswerCount,
+        qaai.FavoriteCount,
+        qaai.ClosedDate,
+        qaai.IsHighRepAccepted,
+        DENSE_RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS RankByOwnerScore,
+        (SELECT COUNT(DISTINCT c.UserId) FROM Comments c WHERE c.PostId = p.Id AND c.UserId IS NOT NULL) AS DistinctCommenters,
+        (SELECT COUNT(DISTINCT v.UserId) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId IN (2,3) AND v.UserId IS NOT NULL) AS DistinctVoters,
+        CASE
+            WHEN p.FavoriteCount > 100 AND p.Score > 500 THEN 'Highly Viral'
+            WHEN p.FavoriteCount > 50 AND p.Score > 200 THEN 'Very Popular'
+            WHEN p.ViewCount > 100000 AND p.Score > 100 THEN 'High Traffic'
+            ELSE 'Standard'
+        END AS PostImpactCategory,
+        NULLIF(TRIM(SUBSTRING(p.Body FROM (POSITION('<p>' IN p.Body) + 3) FOR (POSITION('</p>' IN p.Body) - POSITION('<p>' IN p.Body) - 3))), '') AS FirstParagraphSummary,
+        COALESCE(pes.AllLinkTypes, 'No Links') AS PostLinkCategories,
+        p.FavoriteCount,
+        p.Body
+    FROM
+        Posts p
+    LEFT JOIN
+        PostEditHistoryAndLinks pes ON p.Id = pes.PostId
+    LEFT JOIN
+        PostCommentSummary pcs ON p.Id = pcs.PostId
+    LEFT JOIN
+        QuestionAnswerAcceptedInfo qaai ON p.Id = qaai.QuestionId
+    WHERE
+        p.OwnerUserId IS NOT NULL
+        AND p.CreationDate >= TIMESTAMP '2020-01-01'
+        AND (p.PostTypeId IN (1, 2) OR (p.PostTypeId = 4 AND p.Score > 0))
+),
+TopTagSingle AS (
+    SELECT TagName, PostCount FROM TopTagsByPostCount WHERE TagRank = 1
+)
+SELECT
+    uas.UserId,
+    uas.DisplayName AS UserDisplayName,
+    uas.Reputation,
+    uas.LastAccessDate,
+    uas.QuestionCount,
+    uas.AnswerCount,
+    uas.TotalCommentsWritten,
+    app.PostId,
+    app.PostCreationDate,
+    app.Title AS PostTitle,
+    app.Score AS PostScore,
+    app.ViewCount AS PostViewCount,
+    app.TotalEdits,
+    app.TimeToFirstEditHours,
+    app.TotalComments AS PostCommentCount,
+    app.AverageCommentScore,
+    app.AcceptedAnswerId,
+    app.AcceptedAnswerScore,
+    app.AnswerCount AS QuestionAnswerCount,
+    app.FavoriteCount,
+    app.ClosedDate,
+    app.IsHighRepAccepted,
+    app.RankByOwnerScore,
+    app.DistinctCommenters,
+    app.DistinctVoters,
+    app.PostImpactCategory,
+    app.FirstParagraphSummary,
+    tt.TagName AS TopAssociatedTag,
+    tt.PostCount AS TopTagPostCount,
+    EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - uas.LastAccessDate)) AS DaysSinceLastAccess,
+    COALESCE(app.PostLinkCategories, 'N/A') AS LinkSummary,
+    (SELECT COUNT(p_sub.Id)
+     FROM Posts p_sub
+     WHERE p_sub.OwnerUserId = uas.UserId
+       AND p_sub.Score > 50
+       AND (SELECT COUNT(*) FROM Comments c2 WHERE c2.PostId = p_sub.Id) > 10
+       AND p_sub.CreationDate > uas.UserCreationDate + INTERVAL '1 year'
+    ) AS PostsWithHighEngagementCount,
+    NULLIF(UPPER(SUBSTRING(COALESCE(uas.DisplayName, 'UNKNOWN') FROM 1 FOR 1)) || LPAD('*', GREATEST(CHAR_LENGTH(COALESCE(uas.DisplayName, 'UNKNOWN')) - 1, 0), '*'), '*') AS MaskedUserInitial
+FROM
+    UserActivitySummary uas
+INNER JOIN
+    AggregatedPostPerformance app ON uas.UserId = app.OwnerUserId
+LEFT JOIN
+    Posts p_main ON app.PostId = p_main.Id
+LEFT JOIN
+    TopTagSingle tt ON
+    app.PostTypeId = 1
+    AND EXISTS (
+        SELECT 1
+        FROM LATERAL UNNEST(STRING_TO_ARRAY(SUBSTRING(p_main.Tags FROM 2 FOR (CHAR_LENGTH(p_main.Tags)-2)), '><')) AS post_tag
+        WHERE LOWER(TRIM(post_tag)) = tt.TagName
+    )
+WHERE
+    uas.Reputation > 1000
+    AND app.Score >= 10
+    AND app.RankByOwnerScore <= 3
+    AND app.PostImpactCategory <> 'Standard'
+    AND app.FirstParagraphSummary IS NOT NULL
+    AND app.FirstParagraphSummary LIKE 'The %'
+    AND (app.ClosedDate IS NULL OR app.ClosedDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year')
+    AND uas.LastAccessDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6 months'
+    AND NOT EXISTS (
+        SELECT 1
+        FROM Posts p_title_check
+        WHERE p_title_check.Id = app.PostId
+          AND CHAR_LENGTH(COALESCE(p_title_check.Title, '')) > 150
+    )
+ORDER BY
+    uas.Reputation DESC,
+    app.Score DESC,
+    app.ViewCount DESC
+LIMIT 1000;

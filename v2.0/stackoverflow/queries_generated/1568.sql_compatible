@@ -1,0 +1,218 @@
+WITH UserProfileSummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.Views AS TotalUserViews,
+        U.UpVotes AS TotalUpVotesGiven,
+        U.DownVotes AS TotalDownVotesGiven,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate AS UserLastAccessDate,
+        COUNT(B.Id) AS BadgeCount,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadgeCount,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadgeCount,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadgeCount,
+        (U.Reputation * 0.1 + U.Views * 0.005 + U.UpVotes * 0.5 - U.DownVotes * 0.2 + COUNT(B.Id) * 1.5
+         + SUM(CASE WHEN B.Class = 1 THEN 10 ELSE 0 END)
+        ) AS UserActivityScore
+    FROM
+        Users U
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.Views, U.UpVotes, U.DownVotes, U.CreationDate, U.LastAccessDate
+    HAVING
+        U.Reputation > 1000
+        AND COUNT(B.Id) > 0
+),
+PostContentAnalysis AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.Title,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount AS PostViewCount,
+        P.AnswerCount,
+        P.CommentCount AS DirectCommentCount,
+        P.FavoriteCount,
+        P.LastEditDate,
+        P.ClosedDate,
+        P.LastActivityDate,
+        COALESCE(P.Tags, '<no-tags>') AS TagsString,
+        COALESCE(PT.Name, 'Unknown Post Type') AS PostTypeName,
+        EXTRACT(EPOCH FROM (P.LastActivityDate - P.CreationDate)) / 3600 AS HoursSinceCreationToLastActivity,
+        (
+            SELECT COUNT(C_sub.Id)
+            FROM Comments C_sub
+            WHERE C_sub.PostId = P.Id
+            AND C_sub.CreationDate >= P.CreationDate
+        ) AS TotalPostCommentCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6, 24) THEN 1 ELSE 0 END) AS EditCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (10, 12) THEN 1 ELSE 0 END) AS CloseDeleteCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (11, 13) THEN 1 ELSE 0 END) AS ReopenUndeleteCount,
+        CASE
+            WHEN P.ClosedDate IS NOT NULL AND SUM(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) > 0 THEN 'ClosedAndReopened'
+            WHEN SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6, 24) THEN 1 ELSE 0 END) >= 3 THEN 'HeavilyEdited'
+            WHEN P.Score < 0 AND P.CommentCount > 5 THEN 'DownvotedButDiscussed'
+            ELSE 'Normal'
+        END AS PostStatusCategory,
+        (SUM(CASE WHEN PH.PostHistoryTypeId IN (10, 12) THEN 1 ELSE 0 END) * 5
+         + SUM(CASE WHEN PH.PostHistoryTypeId IN (11, 13) THEN 1 ELSE 0 END) * 7
+         + ABS(P.Score) * 0.1
+         + COUNT(DISTINCT C.Id) * 0.5
+        ) AS PostControversyIndex
+    FROM
+        Posts P
+    INNER JOIN PostTypes PT ON P.PostTypeId = PT.Id
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    LEFT JOIN Comments C ON P.Id = C.PostId
+    WHERE
+        P.PostTypeId IN (1, 2)
+        AND P.CreationDate >= DATE '2021-01-01'
+        AND P.OwnerUserId IS NOT NULL
+    GROUP BY
+        P.Id, P.PostTypeId, P.OwnerUserId, P.Title, P.CreationDate, P.Score, P.ViewCount,
+        P.AnswerCount, P.CommentCount, P.FavoriteCount, P.LastEditDate, P.ClosedDate,
+        P.LastActivityDate, P.Tags, PT.Name
+    HAVING
+        P.Score > -10
+        OR P.CommentCount > 2
+),
+DetailedPostLinkage AS (
+    SELECT
+        PCA.PostId,
+        PCA.OwnerUserId,
+        COUNT(PL.Id) AS TotalLinks,
+        SUM(CASE WHEN PL.LinkTypeId = 1 THEN 1 ELSE 0 END) AS LinkedFromOtherPostsCount,
+        SUM(CASE WHEN PL.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicateOfOtherPostsCount,
+        (
+            SELECT P_Related.Title
+            FROM PostLinks PL_Inner
+            INNER JOIN Posts P_Related ON PL_Inner.RelatedPostId = P_Related.Id
+            WHERE PL_Inner.PostId = PCA.PostId
+            AND PL_Inner.LinkTypeId = 3
+            GROUP BY P_Related.Title, P_Related.CreationDate
+            ORDER BY COUNT(PL_Inner.Id) DESC, P_Related.CreationDate DESC
+            LIMIT 1
+        ) AS MostLinkedDuplicateTitle,
+        (
+            SELECT CRT.Name
+            FROM PostHistory PH_CR
+            INNER JOIN CloseReasonTypes CRT ON CAST(PH_CR.Comment AS SMALLINT) = CRT.Id
+            WHERE PH_CR.PostId = PCA.PostId
+            AND PH_CR.PostHistoryTypeId = 10
+            ORDER BY PH_CR.CreationDate DESC
+            LIMIT 1
+        ) AS LatestCloseReasonTypeName
+    FROM
+        PostContentAnalysis PCA
+    LEFT JOIN PostLinks PL ON PCA.PostId = PL.PostId
+    GROUP BY
+        PCA.PostId, PCA.OwnerUserId
+),
+UserPostOverallImpact AS (
+    SELECT
+        UPS.UserId,
+        UPS.DisplayName,
+        UPS.Reputation,
+        PCA.PostId,
+        PCA.Title AS PostTitle,
+        PCA.PostTypeName,
+        PCA.PostScore,
+        PCA.PostViewCount,
+        PCA.TotalPostCommentCount,
+        PCA.PostControversyIndex,
+        DPL.TotalLinks,
+        DPL.MostLinkedDuplicateTitle,
+        DPL.LatestCloseReasonTypeName,
+        PCA.PostStatusCategory,
+        PCA.TagsString,
+        (PCA.PostScore * 1.0 + PCA.PostViewCount * 0.05 + PCA.TotalPostCommentCount * 0.8 + COALESCE(DPL.TotalLinks, 0) * 2.0
+         + CASE WHEN PCA.PostStatusCategory = 'ClosedAndReopened' THEN 50 ELSE 0 END
+         + CASE WHEN PCA.PostStatusCategory = 'HeavilyEdited' THEN 25 ELSE 0 END
+         + PCA.PostControversyIndex * 1.2
+        ) AS PostImpactScore,
+        ROW_NUMBER() OVER (PARTITION BY UPS.UserId ORDER BY (PCA.PostScore + PCA.TotalPostCommentCount * 2) DESC, PCA.PostViewCount DESC) AS RankWithinUserByScoreComments,
+        AVG(PCA.PostScore) OVER (PARTITION BY UPS.UserId ORDER BY PCA.PostCreationDate ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) AS UserRecentAvgPostScore,
+        (CAST(PCA.TotalPostCommentCount AS NUMERIC) / NULLIF(SUM(PCA.TotalPostCommentCount) OVER (PARTITION BY UPS.UserId), 0)) * 100 AS PctUserCommentsOnThisPost,
+        PCA.PostScore - LAG(PCA.PostScore, 1, 0) OVER (PARTITION BY UPS.UserId ORDER BY PCA.PostCreationDate) AS ScoreDifferenceFromPreviousPost,
+        PCA.HoursSinceCreationToLastActivity
+    FROM
+        UserProfileSummary UPS
+    INNER JOIN PostContentAnalysis PCA ON UPS.UserId = PCA.OwnerUserId
+    LEFT JOIN DetailedPostLinkage DPL ON PCA.PostId = DPL.PostId
+    WHERE
+        PCA.HoursSinceCreationToLastActivity > 24*7
+),
+TagPerformanceMetrics AS (
+    SELECT
+        TRIM(tag.value) AS TagName,
+        AVG(P.Score) AS AvgScoreForTag,
+        AVG(P.ViewCount) AS AvgViewCountForTag,
+        COUNT(DISTINCT P.Id) AS TotalPostsForTag,
+        (AVG(P.Score) * 0.7 + AVG(P.ViewCount) * 0.03 + COUNT(DISTINCT P.Id) * 0.5) AS TagPopularityScore
+    FROM
+        Posts P
+    CROSS JOIN LATERAL regexp_split_to_table(substring(P.Tags FROM 2 FOR length(P.Tags) - 2), '><') AS tag(value)
+    WHERE
+        P.Tags IS NOT NULL
+        AND P.PostTypeId = 1
+        AND P.CreationDate >= DATE '2022-01-01'
+    GROUP BY
+        TRIM(tag.value)
+    HAVING
+        COUNT(DISTINCT P.Id) > 10
+)
+SELECT
+    UPOI.UserId,
+    UPOI.DisplayName,
+    UPOI.Reputation,
+    UPOI.PostId,
+    UPOI.PostTitle,
+    UPOI.PostTypeName,
+    UPOI.PostScore,
+    UPOI.PostViewCount,
+    UPOI.TotalPostCommentCount,
+    UPOI.TotalLinks,
+    UPOI.MostLinkedDuplicateTitle,
+    UPOI.LatestCloseReasonTypeName,
+    UPOI.PostStatusCategory,
+    UPOI.PostImpactScore,
+    UPOI.RankWithinUserByScoreComments,
+    UPOI.UserRecentAvgPostScore,
+    UPOI.PctUserCommentsOnThisPost,
+    UPOI.ScoreDifferenceFromPreviousPost,
+    TPM.TagName,
+    TPM.AvgScoreForTag,
+    TPM.AvgViewCountForTag,
+    TPM.TagPopularityScore,
+    'User [' || COALESCE(UPOI.DisplayName, 'N/A') || '] (' || UPOI.UserId || ') posted "'
+    || COALESCE(SUBSTRING(UPOI.PostTitle, 1, 50), 'Untitled Post') || (CASE WHEN LENGTH(UPOI.PostTitle) > 50 THEN '...' ELSE '' END)
+    || '" which is a ' || COALESCE(UPOI.PostTypeName, 'unknown') || '.'
+    || CASE
+        WHEN UPOI.PostImpactScore > 500 AND UPOI.RankWithinUserByScoreComments = 1 THEN ' This is their top performing post and highly influential.'
+        WHEN UPOI.PostStatusCategory = 'ClosedAndReopened' AND UPOI.PostScore < 10 THEN ' This post was controversial, being closed and reopened, reflecting a resilient contribution.'
+        WHEN UPOI.PctUserCommentsOnThisPost > 30 AND UPOI.TotalPostCommentCount > 10 THEN ' This post is a key discussion point, attracting a significant share of their comments.'
+        WHEN UPOI.ScoreDifferenceFromPreviousPost < -20 AND UPOI.PostScore < 0 THEN ' This post saw a significant negative score drop, potentially indicating a less successful contribution.'
+        ELSE ' A regular contribution with notable characteristics.'
+    END AS UserPostElaborateDescription,
+    COALESCE(CAST(UPOI.TotalLinks AS VARCHAR) || ' links found' || CASE WHEN UPOI.MostLinkedDuplicateTitle IS NOT NULL THEN ' (e.g., duplicated by: "' || UPOI.MostLinkedDuplicateTitle || '")' ELSE '' END, 'No related links detected.') AS PostLinkDetails,
+    COALESCE('Primary Close Reason: ' || UPOI.LatestCloseReasonTypeName, 'Not explicitly closed or reason unknown.') AS PostClosureStatus,
+    (UPOI.PostImpactScore * 0.4 + TPM.TagPopularityScore * 0.2 + UPOI.Reputation * 0.005 + UPOI.PostControversyIndex * 0.1) AS OverallCombinedRankMetric
+FROM
+    UserPostOverallImpact UPOI
+LEFT JOIN TagPerformanceMetrics TPM ON EXISTS (
+        SELECT 1
+        FROM regexp_split_to_table(substring(UPOI.TagsString FROM 2 FOR length(UPOI.TagsString) - 2), '><') AS pt(tag_name)
+        WHERE TRIM(pt.tag_name) = TPM.TagName
+    )
+WHERE
+    UPOI.PostImpactScore > 75
+    AND UPOI.Reputation > 2500
+    AND UPOI.UserRecentAvgPostScore > 5
+    AND UPOI.ScoreDifferenceFromPreviousPost BETWEEN -30 AND 50
+    AND UPOI.TotalPostCommentCount >= 3
+ORDER BY
+    OverallCombinedRankMetric DESC, UPOI.PostImpactScore DESC, UPOI.Reputation DESC
+LIMIT 200;

@@ -1,0 +1,174 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        ARRAY[t.Id] AS Path,
+        1 AS Depth,
+        t.ExcerptPostId
+    FROM Tags t
+    WHERE t.IsModeratorOnly = false
+
+    UNION ALL
+
+    SELECT
+        child.Id,
+        child.TagName,
+        rth.Path || child.Id,
+        rth.Depth + 1,
+        child.ExcerptPostId
+    FROM Tags child
+    JOIN PostLinks pl ON pl.PostId = child.ExcerptPostId AND pl.LinkTypeId = 1
+    JOIN RecursiveTagHierarchy rth ON pl.RelatedPostId = rth.ExcerptPostId
+    WHERE child.Id <> ALL(rth.Path)
+),
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        b.Class,
+        COUNT(*) AS BadgesCount
+    FROM Badges b
+    GROUP BY b.UserId, b.Class
+),
+PostVoteStats AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotes,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVotes,
+        MAX(v.CreationDate) AS LastVoteDate
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    GROUP BY p.Id, p.PostTypeId, p.OwnerUserId
+),
+UserActivityRank AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        ROW_NUMBER() OVER (PARTITION BY EXTRACT(YEAR FROM u.CreationDate) ORDER BY u.Reputation DESC NULLS LAST) AS RankInYear
+    FROM Users u
+    WHERE u.Reputation > 0
+),
+ComplexPosts AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        ph.CreationDateTitle AS LastTitleEdit,
+        ph2.CreationDateBody AS LastBodyEdit,
+        COALESCE(pc.BadgesGold, 0) AS GoldBadges,
+        COALESCE(pc.BadgesSilver, 0) AS SilverBadges,
+        COALESCE(pc.BadgesBronze, 0) AS BronzeBadges,
+        p.Score * GREATEST(p.ViewCount,1) / NULLIF((COALESCE(ph2.CreationDateBody, p.CreationDate) - p.CreationDate) + INTERVAL '1 second', INTERVAL '0 second') AS EngagementIndex
+    FROM Posts p
+    LEFT JOIN LATERAL (
+        SELECT MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId IN (1,4,7)) AS CreationDateTitle
+        FROM PostHistory ph
+        WHERE ph.PostId = p.Id
+    ) ph ON true
+    LEFT JOIN LATERAL (
+        SELECT MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId IN (2,5,8)) AS CreationDateBody
+        FROM PostHistory ph
+        WHERE ph.PostId = p.Id
+    ) ph2 ON true
+    LEFT JOIN (
+        SELECT
+            b.UserId,
+            SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS BadgesGold,
+            SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS BadgesSilver,
+            SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BadgesBronze
+        FROM Badges b
+        GROUP BY b.UserId
+    ) pc ON pc.UserId = p.OwnerUserId
+    WHERE p.PostTypeId = 1
+),
+AnswerStats AS (
+    SELECT
+        p.ParentId AS QuestionId,
+        COUNT(p.Id) AS AnswerCount,
+        AVG(p.Score) AS AvgAnswerScore,
+        MAX(p.Score) AS MaxAnswerScore,
+        MIN(p.Score) AS MinAnswerScore,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE NULL END) AS TotalUpVotesOnAnswers
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    WHERE p.PostTypeId = 2
+    GROUP BY p.ParentId
+),
+ClosedQuestions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        cht.Name AS CloseReason,
+        ph.CreationDate AS CloseDate
+    FROM Posts p
+    JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+    JOIN CloseReasonTypes cht ON cht.Id = CAST(ph.Comment AS INTEGER) AND ph.Comment ~ '^\d+$'
+    WHERE p.PostTypeId = 1 AND ph.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '180 day')
+),
+FinalSet AS (
+    SELECT
+        cp.Id,
+        cp.Title,
+        cp.Tags,
+        cp.Score,
+        cp.ViewCount,
+        cp.EngagementIndex,
+        ua.RankInYear,
+        COALESCE(asn.AnswerCount,0) AS AnswerCount,
+        COALESCE(asn.AvgAnswerScore,0) AS AvgAnswerScore,
+        COALESCE(asn.MaxAnswerScore,0) AS MaxAnswerScore,
+        COALESCE(asn.MinAnswerScore,0) AS MinAnswerScore,
+        COALESCE(asn.TotalUpVotesOnAnswers,0) AS TotalUpVotesOnAnswers,
+        cp.GoldBadges,
+        cp.SilverBadges,
+        cp.BronzeBadges,
+        cq.CloseReason,
+        cq.CloseDate,
+        cp.OwnerUserId
+    FROM ComplexPosts cp
+    LEFT JOIN UserActivityRank ua ON ua.UserId = cp.OwnerUserId
+    LEFT JOIN AnswerStats asn ON asn.QuestionId = cp.Id
+    LEFT JOIN ClosedQuestions cq ON cq.Id = cp.Id
+)
+SELECT 
+    fs.Id AS QuestionId,
+    fs.Title,
+    split_part(fs.Tags, '><',1) AS FirstTag,
+    fs.Score,
+    fs.ViewCount,
+    fs.EngagementIndex,
+    fs.AnswerCount,
+    fs.AvgAnswerScore,
+    fs.MaxAnswerScore,
+    fs.MinAnswerScore,
+    fs.TotalUpVotesOnAnswers,
+    fs.GoldBadges,
+    fs.SilverBadges,
+    fs.BronzeBadges,
+    fs.RankInYear,
+    CASE WHEN fs.CloseReason IS NULL THEN 'Open' ELSE fs.CloseReason END AS Status,
+    fs.CloseDate,
+    dense_rank() OVER (ORDER BY fs.EngagementIndex DESC NULLS LAST) AS EngagementRank,
+    COALESCE(ut.Reputation, 0) AS OwnerReputation,
+    CASE WHEN fs.OwnerUserId IS NULL THEN 'Anonymous' ELSE ut.DisplayName END AS OwnerDisplayName,
+    length(fs.Title) AS TitleLength,
+    CASE 
+        WHEN fs.Score > 0 AND fs.AnswerCount > 0 THEN ROUND(CAST(fs.Score AS numeric) / NULLIF(fs.AnswerCount,0),3)
+        ELSE NULL
+    END AS ScorePerAnswer,
+    (
+        SELECT COUNT(*) 
+        FROM PostHistory ph 
+        WHERE ph.PostId = fs.Id AND ph.PostHistoryTypeId IN (4,5,6,10,11)
+    ) AS simulate_complexity
+FROM FinalSet fs
+LEFT JOIN Users ut ON ut.Id = fs.OwnerUserId
+WHERE (fs.Score > 10 OR fs.AnswerCount > 5) 
+    AND (fs.EngagementIndex IS NOT NULL AND fs.EngagementIndex > 100)
+ORDER BY EngagementRank, fs.ViewCount DESC
+LIMIT 100;

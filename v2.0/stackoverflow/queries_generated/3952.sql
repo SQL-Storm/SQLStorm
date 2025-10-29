@@ -1,0 +1,112 @@
+-- {"query": "3952.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2105} 
+
+WITH 
+UserBadgeAgg AS (
+    SELECT 
+        UserId,
+        SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END)          AS GoldBadges,
+        SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END)          AS SilverBadges,
+        SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END)          AS BronzeBadges,
+        COUNT(*)                                            AS TotalBadges
+    FROM Badges
+    GROUP BY UserId
+),
+UserPostAgg AS (
+    SELECT 
+        OwnerUserId                                   AS UserId,
+        COUNT(*) FILTER (WHERE PostTypeId = 1)       AS QuestionCount,
+        COUNT(*) FILTER (WHERE PostTypeId = 2)       AS AnswerCount,
+        SUM(ViewCount)                               AS TotalViews,
+        MAX(CreationDate)                            AS LastPostDate,
+        SUM(CASE WHEN Score >= 0 THEN Score ELSE 0 END)  AS PositiveScoreSum,
+        SUM(CASE WHEN Score <  0 THEN Score ELSE 0 END)  AS NegativeScoreSum
+    FROM Posts
+    GROUP BY OwnerUserId
+),
+UserVoteAgg AS (
+    SELECT 
+        p.OwnerUserId                                 AS UserId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 5)           AS FavoriteVotes
+    FROM Votes v
+    JOIN Posts p ON v.PostId = p.Id
+    GROUP BY p.OwnerUserId
+),
+UserTagStats AS (
+    SELECT 
+        p.OwnerUserId                                 AS UserId,
+        t.TagName,
+        COUNT(*)                                      AS TagUsage,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY COUNT(*) DESC) AS TagRank
+    FROM Posts p
+    JOIN LATERAL regexp_split_to_table(p.Tags, '\>\<') AS tn(tag) ON true
+    JOIN Tags t ON t.TagName = tn.tag
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+    GROUP BY p.OwnerUserId, t.TagName
+),
+TopTags AS (
+    SELECT 
+        UserId,
+        STRING_AGG(TagName, ', ') FILTER (WHERE TagRank <= 3) AS TopThreeTags
+    FROM UserTagStats
+    GROUP BY UserId
+),
+Combined AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        COALESCE(ub.GoldBadges,   0)                 AS GoldBadges,
+        COALESCE(ub.SilverBadges, 0)                 AS SilverBadges,
+        COALESCE(ub.BronzeBadges, 0)                 AS BronzeBadges,
+        COALESCE(up.QuestionCount,0)                 AS Questions,
+        COALESCE(up.AnswerCount,  0)                 AS Answers,
+        COALESCE(up.TotalViews,   0)                 AS Views,
+        COALESCE(uv.UpVotes,      0)                 AS PostUpVotes,
+        COALESCE(uv.DownVotes,    0)                 AS PostDownVotes,
+        COALESCE(uv.FavoriteVotes,0)                 AS Favorites,
+        tt.TopThreeTags,
+        CASE 
+            WHEN up.LastPostDate IS NULL THEN 'Never posted'
+            ELSE to_char(up.LastPostDate, 'YYYY-MM-DD')
+        END                                          AS LastPost,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+    LEFT JOIN UserBadgeAgg ub ON ub.UserId = u.Id
+    LEFT JOIN UserPostAgg  up ON up.UserId = u.Id
+    LEFT JOIN UserVoteAgg  uv ON uv.UserId = u.Id
+    LEFT JOIN TopTags      tt ON tt.UserId = u.Id
+),
+NoPostUsers AS (
+    SELECT 
+        u.Id,
+        u.DisplayName
+    FROM Users u
+    LEFT JOIN UserPostAgg up ON up.UserId = u.Id
+    WHERE up.UserId IS NULL
+)
+SELECT *
+FROM Combined
+WHERE ReputationRank <= 100
+
+UNION ALL
+
+SELECT 
+    Id,
+    DisplayName,
+    0 AS GoldBadges,
+    0 AS SilverBadges,
+    0 AS BronzeBadges,
+    0 AS Questions,
+    0 AS Answers,
+    0 AS Views,
+    0 AS PostUpVotes,
+    0 AS PostDownVotes,
+    0 AS Favorites,
+    NULL AS TopThreeTags,
+    'Never posted' AS LastPost,
+    NULL AS ReputationRank
+FROM NoPostUsers
+
+ORDER BY ReputationRank NULLS LAST, GoldBadges DESC, SilverBadges DESC
+LIMIT 150;

@@ -1,0 +1,191 @@
+-- {"query": "7314.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1835} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT c.Id) as TotalComments,
+        COUNT(DISTINCT b.Id) as TotalBadges,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END), 0) as QuestionCount,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END), 0) as AnswerCount,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN p.Id END) as AcceptedQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.Score > 0 THEN p.Id END) as PositiveAnswers,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.AnswerCount ELSE NULL END) as AvgAnswersPerQuestion
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 100
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopTags AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        CASE 
+            WHEN t.Count > 1000 THEN 'High'
+            WHEN t.Count > 500 THEN 'Medium'
+            ELSE 'Low'
+        END as TagLevel,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as TagRank
+    FROM Tags t
+    WHERE t.Count > 100
+),
+PostEngagement AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CommentCount,
+        u.DisplayName as Author,
+        p.OwnerUserId,
+        CASE 
+            WHEN p.ParentId IS NOT NULL THEN 'Answer'
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            ELSE 'Other'
+        END as PostType,
+        CASE 
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 1
+            ELSE 0
+        END as HasAcceptedAnswer,
+        p.Score * (1 + COALESCE(p.ViewCount, 0) / 1000.0) as EngagementScore,
+        DATEDIFF('DAY', p.CreationDate, CURRENT_TIMESTAMP) as AgeInDays,
+        CASE 
+            WHEN p.LastActivityDate > DATEADD('DAY', -7, CURRENT_TIMESTAMP) THEN 'Active'
+            WHEN p.LastActivityDate > DATEADD('DAY', -30, CURRENT_TIMESTAMP) THEN 'Recently Active'
+            ELSE 'Inactive'
+        END as ActivityStatus
+    FROM Posts p
+    INNER JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1, 2) 
+),
+ComplexQueryResults AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.TotalPosts,
+        uas.TotalComments,
+        uas.TotalBadges,
+        uas.QuestionCount,
+        uas.AnswerCount,
+        uas.TotalScore,
+        uas.LastPostDate,
+        uas.AcceptedQuestions,
+        uas.PositiveAnswers,
+        uas.AvgAnswersPerQuestion,
+        tt.TagName,
+        tt.Count as TagCount,
+        tt.TagLevel,
+        tt.TagRank,
+        pe.PostId,
+        pe.Title,
+        pe.Score as PostScore,
+        pe.ViewCount as PostViewCount,
+        pe.CommentCount as PostCommentCount,
+        pe.PostType,
+        pe.HasAcceptedAnswer,
+        pe.EngagementScore,
+        pe.AgeInDays,
+        pe.ActivityStatus,
+        CASE 
+            WHEN uas.Reputation > 10000 THEN 'Veteran'
+            WHEN uas.Reputation > 1000 THEN 'Experienced'
+            WHEN uas.Reputation > 100 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as ReputationTier,
+        CASE 
+            WHEN uas.TotalPosts > 100 THEN 'High Productivity'
+            WHEN uas.TotalPosts > 50 THEN 'Moderate Productivity'
+            WHEN uas.TotalPosts > 10 THEN 'Low Productivity'
+            ELSE 'Minimal Activity'
+        END as ProductivityLevel,
+        CASE 
+            WHEN tt.TagCount > 500 AND uas.QuestionCount > 10 THEN 'Expert Level'
+            WHEN tt.TagCount > 100 AND uas.QuestionCount > 5 THEN 'Advanced Level'
+            WHEN uas.QuestionCount > 2 THEN 'Beginner Level'
+            ELSE 'Explorer Level'
+        END as ExpertiseLevel
+    FROM UserActivityStats uas
+    CROSS JOIN TopTags tt
+    LEFT JOIN PostEngagement pe ON uas.UserId = pe.OwnerUserId
+    WHERE uas.Reputation > 1000 
+        AND tt.TagCount > 1000
+        AND (uas.QuestionCount > 5 OR uas.AnswerCount > 10)
+    ORDER BY uas.Reputation DESC, tt.Count DESC
+)
+SELECT 
+    UserId,
+    DisplayName,
+    Reputation,
+    TotalPosts,
+    TotalComments,
+    TotalBadges,
+    QuestionCount,
+    AnswerCount,
+    TotalScore,
+    LastPostDate,
+    AcceptedQuestions,
+    PositiveAnswers,
+    AvgAnswersPerQuestion,
+    TagName,
+    TagCount,
+    TagLevel,
+    TagRank,
+    PostId,
+    Title,
+    PostScore,
+    PostViewCount,
+    PostCommentCount,
+    PostType,
+    HasAcceptedAnswer,
+    EngagementScore,
+    AgeInDays,
+    ActivityStatus,
+    ReputationTier,
+    ProductivityLevel,
+    ExpertiseLevel,
+    ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY EngagementScore DESC) as UserPostRank,
+    LAG(DisplayName) OVER (ORDER BY Reputation DESC) as PreviousUser,
+    LEAD(ReputationTier) OVER (ORDER BY TotalScore DESC) as NextReputationTier,
+    AVG(Reputation) OVER (ORDER BY DisplayName ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING) as MovingAverageReputation,
+    NTILE(4) OVER (ORDER BY TotalScore DESC) as ScoreQuartile,
+    CASE 
+        WHEN Reputation > (SELECT AVG(Reputation) FROM Users WHERE Reputation > 100) THEN 'Above Average'
+        WHEN Reputation < (SELECT AVG(Reputation) FROM Users WHERE Reputation > 100) THEN 'Below Average'
+        ELSE 'Average'
+    END as ReputationComparison,
+    CONCAT(DisplayName, ' (', ReputationTier, ')') as UserDetail,
+    CASE 
+        WHEN TagName LIKE '%sql%' OR TagName LIKE '%database%' THEN 'Database Focus'
+        WHEN TagName LIKE '%java%' OR TagName LIKE '%spring%' THEN 'Java Focus'
+        ELSE 'General Focus'
+    END as FocusArea,
+    ABS(TotalScore - (SELECT AVG(TotalScore) FROM UserActivityStats)) as ScoreDeviation,
+    CASE 
+        WHEN PostId IS NOT NULL THEN 'Active Contributor'
+        ELSE 'Inactive Contributor'
+    END as ContributionStatus,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = UserId AND b.Class = 1) as GoldBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = UserId AND b.Class = 2) as SilverBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = UserId AND b.Class = 3) as BronzeBadges
+FROM ComplexQueryResults
+WHERE 
+    (Reputation > 5000 OR TotalScore > 1000)
+    AND (ActivityStatus IN ('Active', 'Recently Active') OR ActivityStatus IS NULL)
+    AND (PostType = 'Question' OR PostType IS NULL)
+    AND TagLevel IN ('High', 'Medium')
+    AND AgeInDays BETWEEN 1 AND 365
+    AND ReputationTier IN ('Veteran', 'Experienced')
+    AND ProductivityLevel IN ('High Productivity', 'Moderate Productivity')
+    AND ExpertiseLevel IN ('Expert Level', 'Advanced Level')
+    AND EngagementScore > 100
+    AND (ABS(TotalScore - (SELECT AVG(TotalScore) FROM UserActivityStats)) > 100 OR TotalScore IS NULL)
+ORDER BY Reputation DESC, TagCount DESC, EngagementScore DESC
+LIMIT 1000
+OFFSET 500;

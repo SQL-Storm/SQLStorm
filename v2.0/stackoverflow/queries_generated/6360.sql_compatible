@@ -1,0 +1,52 @@
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    MAX(u.CreationDate) AS LatestCreationDate,
+    MIN(p.LastActivityDate) AS EarliestPostActivity,
+    b.Name AS LatestBadge,
+    ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.Score DESC) AS TopScorePost,
+    (
+        SELECT LISTAGG(t.TagName, ', ') WITHIN GROUP (ORDER BY t.TagName)
+        FROM Tags t
+        WHERE t.Id IN (
+            SELECT pt.TagId
+            FROM PostTags pt
+            WHERE pt.PostId = p.Id
+        )
+    ) AS Tags,
+    CASE 
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        ELSE 'Active'
+    END AS PostStatus
+FROM 
+    Users u
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    (
+        SELECT ph.PostId, ph.RevisionGUID, ph.CreationDate
+        FROM PostHistory ph
+        WHERE ph.PostHistoryTypeId = 10
+    ) ph ON p.Id = ph.PostId
+WHERE 
+    u.Reputation > 1000
+    AND p.Score >= 0
+GROUP BY 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    b.Name,
+    p.Score,
+    p.ClosedDate,
+    p.CommunityOwnedDate
+HAVING 
+    COUNT(DISTINCT p.Id) > 10
+ORDER BY 
+    u.Reputation DESC, 
+    TotalPosts DESC;

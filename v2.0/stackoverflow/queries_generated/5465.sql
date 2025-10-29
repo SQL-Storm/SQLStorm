@@ -1,0 +1,114 @@
+-- {"query": "5465.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 865} 
+WITH ranked_posts AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Title,
+    p.Tags,
+    p.OwnerUserId,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ContentLicense,
+    u.Reputation,
+    u.DisplayName AS OwnerDisplayName,
+    u.AccountId,
+    u.LastAccessDate,
+    u.Location,
+    u.WebsiteUrl,
+    u.Views AS UserViews,
+    u.UpVotes,
+    u.DownVotes,
+    -- window function: time since creation
+    EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - p.CreationDate)) AS AgeSeconds
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId IN (1, 2) -- questions and answers
+),
+correlated_cte AS (
+  SELECT
+    rp.PostId,
+    rp.Title,
+    rp.Tags,
+    rp.OwnerUserId,
+    rp.Reputation,
+    rp.AgeSeconds,
+    (
+      SELECT AVG(v.BountyAmount)
+      FROM Votes v
+      WHERE v.PostId = rp.PostId
+        AND v.VoteTypeId = 18 -- BountyStart (historical; using 18 as example)
+    ) AS AvgBounty
+  FROM ranked_posts rp
+),
+join_hints AS (
+  SELECT
+    c.PostId,
+    c.Title,
+    c.OwnerUserId,
+    c.Reputation,
+    c.AgeSeconds,
+    c.AvgBounty,
+    -- correlated subquery: count of tags (split-like operation on Tags string)
+    (
+      SELECT COUNT(*) FROM (
+        SELECT trim(t) AS t
+        FROM unnest(string_to_array(c.Tags, '><')) AS t
+        WHERE t <> ''
+      ) AS s
+    ) AS TagCount,
+    -- compute a score with multiple factors
+    (c.Reputation * 0.5) + (c.AgeSeconds / 3600.0) - COALESCE(c.AvgBounty, 0) AS CompositeScore
+  FROM correlated_cte c
+),
+final AS (
+  SELECT
+    jh.PostId,
+    jh.Title,
+    jh.OwnerUserId,
+    jh.Reputation,
+    jh.AgeSeconds,
+    jh.AvgBounty,
+    jh.TagCount,
+    jh.CompositeScore,
+    -- complex predicate with NULL handling
+    CASE
+      WHEN jh.TagCount > 5 THEN 'high_tag_activity'
+      WHEN jh.TagCount = 0 THEN 'no_tags'
+      ELSE 'moderate_tags'
+    END AS TagActivityCategory,
+    -- advanced window: rank within 1 day window by CompositeScore
+    ROW_NUMBER() OVER (
+      PARTITION BY CASE
+        WHEN jh.TagCount > 5 THEN 'high_tag_activity'
+        WHEN jh.TagCount = 0 THEN 'no_tags'
+        ELSE 'moderate_tags'
+      END
+      ORDER BY jh.CompositeScore DESC, jh.AgeSeconds ASC, jh.AvgBounty DESC NULLS LAST
+    ) AS RankInCategory
+  FROM join_hints jh
+)
+SELECT
+  PostId,
+  Title,
+  OwnerUserId,
+  Reputation,
+  AgeSeconds,
+  AvgBounty,
+  TagCount,
+  CompositeScore,
+  TagActivityCategory,
+  RankInCategory,
+  /* additional derived metrics for benchmarking */
+  (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = final.OwnerUserId AND p2.PostTypeId = 1) AS QuestionsByOwner,
+  (SELECT MAX(LastEditDate) FROM Posts p3 WHERE p3.OwnerUserId = final.OwnerUserId) AS LastOwnerEditDate,
+  (SELECT COUNT(*) FROM Comments c WHERE c.UserId = final.OwnerUserId) AS CommentsByOwner
+FROM final
+WHERE RankInCategory <= 100
+ORDER BY RankInCategory ASC, CompositeScore DESC;

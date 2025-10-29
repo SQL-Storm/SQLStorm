@@ -1,0 +1,92 @@
+-- {"query": "3106.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 3433} 
+WITH
+UserStats AS (
+    SELECT u.Id AS UserId,
+           u.DisplayName,
+           u.Reputation,
+           COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+           COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+           COALESCE(SUM(p.Score) FILTER (WHERE p.PostTypeId = 1),0) AS QuestionScore,
+           COALESCE(SUM(p.Score) FILTER (WHERE p.PostTypeId = 2),0) AS AnswerScore,
+           COALESCE(SUM(v.BountyAmount) FILTER (WHERE v.VoteTypeId = 8),0) -
+           COALESCE(SUM(v.BountyAmount) FILTER (WHERE v.VoteTypeId = 9),0) AS NetBounty
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+UserBadgeStats AS (
+    SELECT b.UserId,
+           COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+           COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+           COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+           MAX(b.Date) AS LatestBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+),
+RecentActivity AS (
+    SELECT u.Id AS UserId,
+           GREATEST(
+               COALESCE(MAX(p.LastActivityDate), TIMESTAMP '1970-01-01'),
+               COALESCE(MAX(v.CreationDate), TIMESTAMP '1970-01-01')
+           ) AS LastOverallActivity
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    GROUP BY u.Id
+),
+GlobalTopTags AS (
+    SELECT t.TagName,
+           ROW_NUMBER() OVER (ORDER BY COUNT(*) DESC) AS rn
+    FROM Posts p
+    JOIN LATERAL regexp_split_to_table(p.Tags, '[><]') AS tag(tagname) ON true
+    JOIN Tags t ON t.TagName = tag.tagname
+    WHERE p.PostTypeId = 1
+    GROUP BY t.TagName
+)
+SELECT us.UserId,
+       us.DisplayName,
+       us.Reputation,
+       us.QuestionCount,
+       us.AnswerCount,
+       us.QuestionScore,
+       us.AnswerScore,
+       us.NetBounty,
+       COALESCE(ubs.GoldBadges,0)   AS GoldBadges,
+       COALESCE(ubs.SilverBadges,0) AS SilverBadges,
+       COALESCE(ubs.BronzeBadges,0) AS BronzeBadges,
+       ubs.LatestBadgeDate,
+       ra.LastOverallActivity,
+       CASE WHEN us.AnswerCount = 0 THEN NULL
+            ELSE ROUND(1.0 * us.AnswerScore / us.AnswerCount, 2)
+       END AS AvgAnswerScore,
+       (SELECT STRING_AGG(tt.TagName, ', ')
+        FROM (SELECT TagName FROM GlobalTopTags WHERE rn <= 5) tt) AS Top5GlobalTags
+FROM UserStats us
+LEFT JOIN UserBadgeStats ubs ON ubs.UserId = us.UserId
+LEFT JOIN RecentActivity ra ON ra.UserId = us.UserId
+WHERE us.Reputation > 1000
+ORDER BY us.Reputation DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT NULL,
+       '--- Summary ---',
+       NULL,
+       SUM(us.QuestionCount),
+       SUM(us.AnswerCount),
+       SUM(us.QuestionScore),
+       SUM(us.AnswerScore),
+       SUM(us.NetBounty),
+       SUM(COALESCE(ubs.GoldBadges,0)),
+       SUM(COALESCE(ubs.SilverBadges,0)),
+       SUM(COALESCE(ubs.BronzeBadges,0)),
+       MAX(ubs.LatestBadgeDate),
+       MAX(ra.LastOverallActivity),
+       NULL,
+       NULL
+FROM UserStats us
+LEFT JOIN UserBadgeStats ubs ON ubs.UserId = us.UserId
+LEFT JOIN RecentActivity ra ON ra.UserId = us.UserId
+WHERE us.Reputation > 1000;

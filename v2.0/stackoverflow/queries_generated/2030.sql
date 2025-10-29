@@ -1,0 +1,148 @@
+-- {"query": "2030.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1326} 
+with RecursiveUserBadges as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class,
+        row_number() over (partition by u.Id order by b.Date desc) as BadgeRank
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    where b.TagBased = 0 or b.TagBased is null
+), UserTopBadges as (
+    select UserId, DisplayName, BadgeName, Class from RecursiveUserBadges where BadgeRank <= 3
+), QuestionAnswerStats as (
+    select 
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionDate,
+        q.Score as QuestionScore,
+        coalesce(a.AnswerCount,0) as AnswerCount,
+        coalesce(a.TopAnswerScore,0) as TopAnswerScore,
+        coalesce(a.TopAnswerOwnerRep,0) as TopAnswerOwnerReputation,
+        q.OwnerUserId,
+        u.Reputation as QuestionOwnerRep
+    from Posts q
+    left join (
+        select 
+            ParentId,
+            count(*) as AnswerCount,
+            max(Score) as TopAnswerScore,
+            max(u.Reputation) as TopAnswerOwnerRep
+        from Posts a
+        left join Users u on a.OwnerUserId = u.Id
+        where a.PostTypeId = 2
+        group by ParentId
+    ) a on q.Id = a.ParentId
+    left join Users u on q.OwnerUserId = u.Id
+    where q.PostTypeId = 1
+), PostCloseReasons as (
+    select 
+        ph.PostId,
+        crt.Name as CloseReason
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    where ph.PostHistoryTypeId = 10
+), PostWithCloseInfo as (
+    select 
+        qas.*,
+        pcr.CloseReason
+    from QuestionAnswerStats qas
+    left join PostCloseReasons pcr on qas.QuestionId = pcr.PostId
+), RankedQuestions as (
+    select 
+        *,
+        dense_rank() over (order by (AnswerCount * 2 + QuestionScore + TopAnswerScore + TopAnswerOwnerReputation/1000.0) desc) as PopularityRank
+    from PostWithCloseInfo
+), QuestionsWithComments as (
+    select
+        q.Id,
+        q.Title,
+        q.Tags,
+        q.CreationDate,
+        q.Score,
+        coalesce(c.CommentCount, 0) as CommentCount
+    from Posts q
+    left join (
+        select PostId, count(*) as CommentCount
+        from Comments
+        group by PostId
+    ) c on q.Id = c.PostId
+    where q.PostTypeId = 1
+), TagDetails as (
+    select
+        t.Id as TagId,
+        t.TagName,
+        t.Count as TagUseCount,
+        coalesce(wp.ViewCount, 0) as WikiViewCount,
+        coalesce(wp.Score, 0) as WikiScore,
+        case when t.IsModeratorOnly = 1 then 'ModeratorOnly' else 'Normal' end as TagType
+    from Tags t
+    left join Posts wp on t.WikiPostId = wp.Id
+), UserActivity as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct p.Id) as PostsCount,
+        count(distinct c.Id) as CommentsCount,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotesGiven,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotesGiven,
+        max(p.CreationDate) as LatestPostDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+), DuplicateLinkInfo as (
+    select 
+        pl.PostId,
+        pl.RelatedPostId,
+        pt.Name as LinkTypeName,
+        p1.Title as PostTitle,
+        p2.Title as RelatedPostTitle
+    from PostLinks pl
+    join LinkTypes pt on pl.LinkTypeId = pt.Id
+    join Posts p1 on pl.PostId = p1.Id
+    join Posts p2 on pl.RelatedPostId = p2.Id
+    where pt.Name = 'Duplicate'
+)
+select 
+    rq.QuestionId,
+    rq.Title as QuestionTitle,
+    rq.CreationDate,
+    rq.QuestionScore,
+    rq.AnswerCount,
+    rq.TopAnswerScore,
+    rq.TopAnswerOwnerReputation,
+    rq.CloseReason,
+    utb.BadgeName,
+    utb.Class as BadgeClass,
+    qa.CommentsCount as QuestionComments,
+    td.TagName,
+    td.TagUseCount,
+    td.WikiViewCount,
+    td.TagType,
+    ua.PostsCount as UserPostsCount,
+    ua.CommentsCount as UserCommentsCount,
+    ua.UpVotesGiven,
+    ua.DownVotesGiven,
+    ua.LatestPostDate,
+    dli.RelatedPostId,
+    dli.RelatedPostTitle
+from RankedQuestions rq
+left join UserTopBadges utb on rq.OwnerUserId = utb.UserId and utb.BadgeRank = 1
+left join QuestionsWithComments qa on rq.QuestionId = qa.Id
+left join lateral (
+    select 
+        array_to_string(array_agg(distinct unnest(string_to_array(substring(q.Tags from 2 for char_length(q.Tags)-2), '><'))), ', ') as AggTags,
+        unnest(string_to_array(substring(q.Tags from 2 for char_length(q.Tags)-2), '><')) as TagName
+    from Posts q where q.Id = rq.QuestionId
+    limit 1
+) tn on true
+left join TagDetails td on td.TagName = tn.TagName
+left join UserActivity ua on ua.Id = rq.OwnerUserId
+left join DuplicateLinkInfo dli on dli.PostId = rq.QuestionId
+where rq.PopularityRank <= 100
+order by rq.PopularityRank, rq.QuestionId
+limit 200;

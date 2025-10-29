@@ -1,0 +1,114 @@
+-- {"query": "7300.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1456} 
+SELECT 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) as TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+    COUNT(DISTINCT b.Id) as Badges,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId IN (2,3) THEN v.Id END) as VoteCount,
+    COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) as UpVotes,
+    COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) as DownVotes,
+    AVG(p.Score) as AvgPostScore,
+    MAX(p.CreationDate) as LastPostDate,
+    MIN(p.CreationDate) as FirstPostDate,
+    DATEDIFF(cast('2024-10-01 12:34:56' as timestamp), u.CreationDate) as AccountAgeDays,
+    CASE 
+        WHEN u.Reputation >= 10000 THEN 'Elite'
+        WHEN u.Reputation >= 1000 THEN 'Veteran'
+        WHEN u.Reputation >= 100 THEN 'Regular'
+        ELSE 'Newbie'
+    END as UserTier,
+    (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = u.Id AND PostTypeId = 1 AND Score > 100) as HighScoreQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = u.Id AND PostTypeId = 2 AND Score > 50) as HighScoreAnswers,
+    (SELECT COUNT(*) FROM Comments WHERE UserId = u.Id) as CommentCount,
+    (SELECT COUNT(*) FROM Votes WHERE UserId = u.Id AND VoteTypeId IN (8,9)) as BountyCount,
+    (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = u.Id AND PostTypeId = 1 AND AcceptedAnswerId IS NOT NULL) as QuestionsWithAcceptedAnswers,
+    (SELECT COUNT(*) FROM Posts p2 INNER JOIN Votes v2 ON p2.Id = v2.PostId WHERE p2.OwnerUserId = u.Id AND v2.VoteTypeId = 1) as AcceptedAnswers,
+    (SELECT COUNT(*) FROM PostLinks pl INNER JOIN Posts p3 ON pl.PostId = p3.Id WHERE p3.OwnerUserId = u.Id AND pl.LinkTypeId = 3) as DuplicatePosts,
+    CONCAT('https://stackoverflow.com/users/', u.Id, '/', REPLACE(UPPER(u.DisplayName), ' ', '-')) as ProfileUrl,
+    CAST(ROW_NUMBER() OVER (ORDER BY SUM(p.Score) DESC) AS VARCHAR(10)) as Ranking,
+    (SELECT AVG(Score) FROM Posts WHERE OwnerUserId = u.Id) as AvgUserScore,
+    (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = u.Id AND CreationDate >= DATEADD(month, -6, cast('2024-10-01 12:34:56' as timestamp))) as RecentPosts,
+    (SELECT STRING_AGG(BadgeName, ', ') WITHIN GROUP (ORDER BY BadgeName) FROM (
+        SELECT b.Name as BadgeName
+        FROM Badges b
+        WHERE b.UserId = u.Id
+        ORDER BY b.Date
+        LIMIT 5
+    ) sub) as RecentBadges,
+    (CASE WHEN u.EmailHash IS NULL THEN 'No Email' ELSE 'Email Exists' END) as EmailStatus,
+    COALESCE((
+        SELECT COUNT(DISTINCT ph.PostId)
+        FROM PostHistory ph
+        WHERE ph.UserId = u.Id
+        AND ph.PostHistoryTypeId IN (1,2,3,4,5,6)
+        AND ph.CreationDate >= DATEADD(year, -1, cast('2024-10-01 12:34:56' as timestamp))
+    ), 0) as RecentEdits,
+    (CASE 
+        WHEN (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = u.Id AND AnswerCount > 0) > 0 
+        THEN 'Active Answerer' 
+        ELSE 'Inactive' 
+    END) as AnswererStatus,
+    (SELECT COUNT(DISTINCT p4.Id) 
+     FROM Posts p4 
+     WHERE p4.OwnerUserId = u.Id 
+     AND EXISTS (
+         SELECT 1 FROM Posts p5 
+         WHERE p5.ParentId = p4.Id 
+         AND p5.Score > 10
+     )) as QuestionsWithHighScoringAnswers,
+    (SELECT COUNT(*) 
+     FROM Posts p6 
+     WHERE p6.OwnerUserId = u.Id 
+     AND p6.ViewCount > 1000) as PopularQuestions,
+    (SELECT COUNT(*) 
+     FROM Posts p7 
+     WHERE p7.OwnerUserId = u.Id 
+     AND p7.CommentCount > 10) as HighlyCommentedPosts,
+    (SELECT AVG(COUNT(*)) 
+     OVER (ORDER BY p8.CreationDate ROWS BETWEEN 29 PRECEDING AND CURRENT ROW)
+     FROM Posts p8 
+     WHERE p8.OwnerUserId = u.Id 
+     GROUP BY DATE(p8.CreationDate)
+    ) as RollingAvgDailyPosts,
+    (SELECT STRING_AGG(DISTINCT SUBSTRING(p9.Tags, 2, LENGTH(p9.Tags) - 2), ', ')
+     FROM Posts p9 
+     WHERE p9.OwnerUserId = u.Id 
+     AND p9.Tags IS NOT NULL 
+     AND LENGTH(p9.Tags) > 2
+    ) as TagUsage,
+    COALESCE(
+        (SELECT p10.Title 
+         FROM Posts p10 
+         WHERE p10.OwnerUserId = u.Id 
+         AND p10.PostTypeId = 1 
+         AND p10.Score = (
+             SELECT MAX(p11.Score) 
+             FROM Posts p11 
+             WHERE p11.OwnerUserId = u.Id 
+             AND p11.PostTypeId = 1
+         )
+         LIMIT 1
+        ), 'No High Score Question'
+    ) as HighestScoringQuestion
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN Votes v ON u.Id = v.UserId
+WHERE u.Reputation >= 100
+  AND u.AccountId IS NOT NULL
+  AND u.CreationDate >= DATEADD(year, -2, cast('2024-10-01 12:34:56' as timestamp))
+  AND (u.WebsiteUrl IS NOT NULL OR u.Location IS NOT NULL)
+  AND NOT EXISTS (
+      SELECT 1 FROM Posts p12 
+      WHERE p12.OwnerUserId = u.Id 
+      AND p12.PostTypeId = 1 
+      AND p12.ClosedDate IS NOT NULL
+  )
+GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.EmailHash, u.WebsiteUrl, u.Location
+HAVING COUNT(DISTINCT p.Id) > 0
+   AND COALESCE(SUM(p.Score), 0) >= 100
+ORDER BY SUM(p.Score) DESC, COUNT(DISTINCT b.Id) DESC
+LIMIT 500;

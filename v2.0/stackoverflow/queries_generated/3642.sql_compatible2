@@ -1,0 +1,137 @@
+WITH
+badge_counts AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze
+    FROM Badges b
+    GROUP BY b.UserId
+),
+user_stats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(bc.gold,0)   AS gold_badges,
+        COALESCE(bc.silver,0) AS silver_badges,
+        COALESCE(bc.bronze,0) AS bronze_badges,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS q_cnt,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS a_cnt,
+        COALESCE(
+            (SELECT AVG(p.Score)
+             FROM Posts p
+             WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1),
+            0) AS avg_q_score,
+        (SELECT MAX(p.LastActivityDate)
+         FROM Posts p
+         WHERE p.OwnerUserId = u.Id) AS last_post_activity
+    FROM Users u
+    LEFT JOIN badge_counts bc ON bc.UserId = u.Id
+),
+ranked_users AS (
+    SELECT
+        us.Id,
+        us.DisplayName,
+        us.Reputation,
+        us.gold_badges,
+        us.silver_badges,
+        us.bronze_badges,
+        us.q_cnt,
+        us.a_cnt,
+        us.avg_q_score,
+        us.last_post_activity,
+        us.rn
+    FROM (
+        SELECT
+            us.*,
+            ROW_NUMBER() OVER (ORDER BY us.Reputation DESC,
+                                     us.gold_badges DESC,
+                                     us.avg_q_score DESC) AS rn
+        FROM user_stats us
+        WHERE us.Reputation >= 10000
+    ) us
+),
+question_tags AS (
+    SELECT
+        p.Id               AS q_id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.OwnerUserId,
+        UNNEST(string_to_array(SUBSTR(p.Tags,2,LENGTH(p.Tags)-2), '><')) AS tag,
+        COALESCE(v.up,0) - COALESCE(v.down,0) AS vote_delta,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL          THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL  THEN 'CommunityOwned'
+            ELSE 'Open'
+        END AS status
+    FROM Posts p
+    LEFT JOIN (
+        SELECT
+            v.PostId,
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS up,
+            SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS down
+        FROM Votes v
+        GROUP BY v.PostId
+    ) v ON v.PostId = p.Id
+    WHERE p.PostTypeId = 1
+      AND p.Tags IS NOT NULL
+      AND (p.Tags LIKE '%<sql>%'
+           OR p.Tags LIKE '%<performance>%')
+),
+recent_comments AS (
+    SELECT
+        c.UserId,
+        MAX(c.CreationDate) AS last_comment_dt
+    FROM Comments c
+    GROUP BY c.UserId
+),
+final_report AS (
+    SELECT
+        ru.Id,
+        ru.DisplayName,
+        ru.Reputation,
+        ru.gold_badges,
+        ru.silver_badges,
+        ru.bronze_badges,
+        ru.q_cnt,
+        ru.a_cnt,
+        ROUND(ru.avg_q_score::numeric,2)               AS avg_q_score,
+        ru.last_post_activity,
+        rc.last_comment_dt,
+        STRING_AGG(DISTINCT qt.tag, ',') FILTER (WHERE qt.tag IS NOT NULL) AS tags_used,
+        COUNT(DISTINCT qt.q_id)               AS tagged_q_cnt,
+        SUM(qt.vote_delta)                    AS total_vote_delta,
+        MAX(CASE WHEN qt.status = 'Closed' THEN 1 ELSE 0 END) AS has_closed_q,
+        ru.rn
+    FROM ranked_users ru
+    LEFT JOIN recent_comments rc ON rc.UserId = ru.Id
+    LEFT JOIN question_tags qt   ON qt.OwnerUserId = ru.Id
+    GROUP BY
+        ru.Id, ru.DisplayName, ru.Reputation,
+        ru.gold_badges, ru.silver_badges, ru.bronze_badges,
+        ru.q_cnt, ru.a_cnt, ru.avg_q_score,
+        ru.last_post_activity, rc.last_comment_dt, ru.rn
+    HAVING COUNT(DISTINCT qt.q_id) > 5
+)
+SELECT
+    Id,
+    DisplayName,
+    Reputation,
+    gold_badges,
+    silver_badges,
+    bronze_badges,
+    q_cnt,
+    a_cnt,
+    avg_q_score,
+    last_post_activity,
+    last_comment_dt,
+    tags_used,
+    tagged_q_cnt,
+    total_vote_delta,
+    has_closed_q,
+    rn
+FROM final_report
+ORDER BY rn
+LIMIT 20;

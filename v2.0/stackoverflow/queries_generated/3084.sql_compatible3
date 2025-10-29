@@ -1,0 +1,116 @@
+WITH 
+usr_stats AS (
+    SELECT 
+        u.Id                               AS user_id,
+        u.DisplayName                      AS display_name,
+        u.Reputation,
+        COUNT(p.Id)                        AS post_cnt,
+        COALESCE(SUM(p.Score),0)           AS total_score,
+        COALESCE(AVG(p.Score),0)           AS avg_score,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY COALESCE(SUM(p.Score),0) DESC) AS rn_score
+    FROM Users u
+    LEFT JOIN Posts p
+           ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+badge_agg AS (
+    SELECT 
+        b.UserId                              AS user_id,
+        MAX(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS has_gold,
+        MAX(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS has_silver,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_cnt
+    FROM Badges b
+    GROUP BY b.UserId
+),
+top_tags AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS tag_rank
+    FROM Tags t
+    WHERE t.IsModeratorOnly = FALSE
+    ORDER BY t.Count DESC
+    LIMIT 50
+),
+usr_tag_activity AS (
+    SELECT 
+        u.Id                                 AS user_id,
+        tt.TagName,
+        COUNT(CASE WHEN p.Score > 0 THEN 1 END)  AS pos_posts,
+        COUNT(CASE WHEN p.Score < 0 THEN 1 END)  AS neg_posts
+    FROM Users u
+    JOIN Posts p
+          ON p.OwnerUserId = u.Id
+    CROSS JOIN LATERAL (
+        SELECT unnest(string_to_array(
+                     substring(p.Tags FROM 2 FOR char_length(p.Tags)-2), '><')) AS TagName
+    ) AS pt
+    JOIN top_tags tt
+          ON tt.TagName = pt.TagName
+    GROUP BY u.Id, tt.TagName
+),
+recent_votes AS (
+    SELECT 
+        u.Id                                 AS user_id,
+        COALESCE(SUM(CASE WHEN vt.Name = 'UpMod'   THEN 1 ELSE 0 END),0) AS up_votes,
+        COALESCE(SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END),0) AS down_votes,
+        MAX(v.CreationDate)                  AS last_vote_ts
+    FROM Users u
+    LEFT JOIN LATERAL (
+        SELECT p.Id
+        FROM Posts p
+        WHERE p.OwnerUserId = u.Id
+        ORDER BY p.CreationDate DESC
+        LIMIT 1
+    ) AS latest_post ON TRUE
+    LEFT JOIN Votes v
+           ON v.PostId = latest_post.Id
+    LEFT JOIN VoteTypes vt
+           ON vt.Id = v.VoteTypeId
+    WHERE v.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '30 days')
+    GROUP BY u.Id
+),
+exclusion_set AS (
+    SELECT u.Id AS user_id
+    FROM Users u
+    WHERE u.EmailHash IS NULL
+       OR u.Reputation < 100
+)
+SELECT
+    us.user_id,
+    us.display_name,
+    us.Reputation,
+    us.post_cnt,
+    us.total_score,
+    us.avg_score,
+    ba.has_gold,
+    ba.has_silver,
+    ba.bronze_cnt,
+    uta.TagName,
+    uta.pos_posts,
+    uta.neg_posts,
+    rv.up_votes,
+    rv.down_votes,
+    rv.last_vote_ts
+FROM usr_stats us
+LEFT JOIN badge_agg ba
+       ON ba.user_id = us.user_id
+LEFT JOIN usr_tag_activity uta
+       ON uta.user_id = us.user_id
+LEFT JOIN recent_votes rv
+       ON rv.user_id = us.user_id
+WHERE us.Reputation > 10000
+  AND (ba.has_gold = 1 OR ba.bronze_cnt >= 5)
+  AND (uta.pos_posts > uta.neg_posts OR uta.pos_posts IS NULL)
+  AND us.rn_score = 1
+
+UNION ALL
+
+SELECT
+    NULL AS user_id,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL
+
+EXCEPT
+
+SELECT
+    e.user_id,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL
+FROM exclusion_set e;

@@ -1,0 +1,205 @@
+-- {"query": "1128.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3096} 
+
+WITH UserEngagementSummary AS (
+    -- Aggregates user-level metrics, including reputation rank, badge counts, and vote statistics.
+    -- Incorporates window functions for percentile and ranking, and NULL logic with COALESCE.
+    SELECT
+        U.Id AS UserId,
+        COALESCE(U.DisplayName, 'Anonymous User') AS UserDisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate AS UserLastAccessDate,
+        U.UpVotes AS UserUpVotesReceived,
+        U.DownVotes AS UserDownVotesReceived,
+        COUNT(DISTINCT Q.Id) AS QuestionCount,
+        COUNT(DISTINCT A.Id) AS AnswerCount,
+        COUNT(DISTINCT C.Id) AS CommentCount,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadgeCount,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadgeCount,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadgeCount,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesGivenByMe,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesGivenByMe,
+        AVG(COALESCE(P_All.Score, 0.0)) AS AvgPostScoreByMe,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY U.Reputation) OVER () AS MedianOverallReputation,
+        RANK() OVER (ORDER BY U.Reputation DESC, U.CreationDate ASC) AS ReputationRank
+    FROM
+        Users U
+    LEFT JOIN Posts Q ON U.Id = Q.OwnerUserId AND Q.PostTypeId = 1 -- Questions by user
+    LEFT JOIN Posts A ON U.Id = A.OwnerUserId AND A.PostTypeId = 2 -- Answers by user
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN Votes V ON U.Id = V.UserId -- Votes given by user
+    LEFT JOIN Posts P_All ON U.Id = P_All.OwnerUserId -- All posts by user for average score calculation
+    WHERE U.Reputation > 500 AND U.Views > 100 -- Filter for users with significant activity/visibility
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.UpVotes, U.DownVotes
+),
+PostActivityDetails AS (
+    -- Gathers post-level metrics, including edit history counts, time-based calculations, and post-type specific averages.
+    -- Uses date arithmetic and a window function for ranking posts within a user.
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.LastEditDate AS PostLastEditDate,
+        P.LastActivityDate AS PostLastActivityDate,
+        P.Score AS PostScore,
+        P.ViewCount AS PostViewCount,
+        COALESCE(P.Title, SUBSTRING(P.Body, 1, 100)) AS PostTitleExcerpt, -- String expression with NULL logic
+        P.Tags,
+        P.AnswerCount,
+        P.FavoriteCount,
+        COUNT(DISTINCT PH.Id) AS HistoryEntryCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9) THEN 1 ELSE 0 END) AS EditCount, -- Title, Body, Tags edits/rollbacks
+        SUM(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseVoteCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenVoteCount,
+        (EXTRACT(EPOCH FROM (NOW() - P.CreationDate)) / 86400) AS DaysSinceCreation, -- Days since creation
+        (EXTRACT(EPOCH FROM (P.LastActivityDate - P.CreationDate)) / 3600) AS HoursToFirstActivity, -- Hours to first activity
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.Score DESC, P.CreationDate DESC) AS UserPostRankByScore,
+        AVG(P.Score) OVER (PARTITION BY P.PostTypeId) AS AvgScoreForPostType,
+        MAX(P.LastEditDate) OVER (PARTITION BY P.OwnerUserId) AS LatestEditByOwner
+    FROM
+        Posts P
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    WHERE
+        P.PostTypeId IN (1, 2) -- Focus on Questions and Answers
+        AND P.CreationDate >= '2020-01-01' -- Filter for more recent posts
+        AND P.ViewCount IS NOT NULL -- Exclude posts without view count
+    GROUP BY
+        P.Id, P.PostTypeId, P.OwnerUserId, P.CreationDate, P.LastEditDate, P.LastActivityDate,
+        P.Score, P.ViewCount, P.Title, P.Body, P.Tags, P.AnswerCount, P.FavoriteCount
+),
+ComplexLinkAnalysis AS (
+    -- Analyzes post links and includes correlated subqueries for detailed comment and duplicate post information.
+    SELECT
+        P.Id AS PostId,
+        COUNT(DISTINCT PL_Linked.RelatedPostId) AS LinkedPostCount,
+        COUNT(DISTINCT PL_Dup.RelatedPostId) AS DuplicatePostCount,
+        MAX(CASE WHEN PL_Linked.LinkTypeId = 1 THEN PL_Linked.CreationDate ELSE NULL END) AS LatestLinkedDate,
+        MIN(CASE WHEN PL_Dup.LinkTypeId = 3 THEN PL_Dup.CreationDate ELSE NULL END) AS EarliestDuplicateDate,
+        (SELECT COUNT(DISTINCT C_Sub.Id)
+         FROM Comments C_Sub
+         WHERE C_Sub.PostId = P.Id
+           AND C_Sub.CreationDate > COALESCE(P.LastEditDate, P.CreationDate) -- Correlated subquery, NULL logic for date comparison
+           AND LENGTH(C_Sub.Text) > 50) AS RecentLongCommentCount, -- String expression for comment length
+        (SELECT P_Rel.Title
+         FROM PostLinks PL_Rel_Inner
+         JOIN Posts P_Rel ON PL_Rel_Inner.RelatedPostId = P_Rel.Id
+         WHERE PL_Rel_Inner.PostId = P.Id AND PL_Rel_Inner.LinkTypeId = 3 -- Correlated subquery to find a duplicate post's title
+         ORDER BY P_Rel.Score DESC
+         LIMIT 1) AS MostVotedDuplicateTitle
+    FROM
+        Posts P
+    LEFT JOIN PostLinks PL_Linked ON P.Id = PL_Linked.PostId AND PL_Linked.LinkTypeId = 1
+    LEFT JOIN PostLinks PL_Dup ON P.Id = PL_Dup.PostId AND PL_Dup.LinkTypeId = 3
+    WHERE P.PostTypeId IN (1, 2)
+    GROUP BY P.Id, P.LastEditDate, P.CreationDate
+),
+GroupA AS (
+    -- Identifies highly engaged contributors to 'sql' tagged questions, requiring at least one gold badge and high post score.
+    SELECT
+        UES.UserId,
+        UES.UserDisplayName,
+        UES.Reputation,
+        UES.ReputationRank,
+        PAD.PostId,
+        PAD.PostTitleExcerpt,
+        PAD.PostScore,
+        PAD.PostViewCount,
+        PAD.EditCount AS PostEditHistoryCount,
+        CLA.LinkedPostCount,
+        CLA.MostVotedDuplicateTitle,
+        (PAD.PostViewCount * 1.0 / NULLIF(PAD.AnswerCount, 0)) AS ViewPerAnswerRatio, -- Calculation with NULL handling
+        'Highly Engaged SQL Contributor' AS CategoryDescription,
+        (SELECT COUNT(DISTINCT V_Inner.UserId) FROM Votes V_Inner WHERE V_Inner.PostId = PAD.PostId AND V_Inner.VoteTypeId = 2) AS UniqueUpVoters -- Correlated subquery
+    FROM
+        UserEngagementSummary UES
+    INNER JOIN PostActivityDetails PAD ON UES.UserId = PAD.OwnerUserId
+    LEFT JOIN ComplexLinkAnalysis CLA ON PAD.PostId = CLA.PostId
+    WHERE
+        UES.GoldBadgeCount >= 1
+        AND PAD.PostScore > 20
+        AND PAD.Tags LIKE '%<sql>%' -- String pattern matching
+        AND PAD.PostTypeId = 1
+        AND PAD.CloseVoteCount = 0
+),
+GroupB AS (
+    -- Identifies active answerers in 'database' or 'mysql' tags, requiring a silver badge and minimum answer count.
+    SELECT
+        UES.UserId,
+        UES.UserDisplayName,
+        UES.Reputation,
+        UES.ReputationRank,
+        PAD.PostId,
+        PAD.PostTitleExcerpt,
+        PAD.PostScore,
+        PAD.PostViewCount,
+        PAD.EditCount AS PostEditHistoryCount,
+        CLA.LinkedPostCount,
+        CLA.MostVotedDuplicateTitle,
+        (PAD.PostViewCount * 1.0 / NULLIF(PAD.AnswerCount, 0)) AS ViewPerAnswerRatio,
+        'Active Database Answerer' AS CategoryDescription,
+        (SELECT COUNT(DISTINCT V_Inner.UserId) FROM Votes V_Inner WHERE V_Inner.PostId = PAD.PostId AND V_Inner.VoteTypeId = 2) AS UniqueUpVoters
+    FROM
+        UserEngagementSummary UES
+    INNER JOIN PostActivityDetails PAD ON UES.UserId = PAD.OwnerUserId
+    LEFT JOIN ComplexLinkAnalysis CLA ON PAD.PostId = CLA.PostId
+    WHERE
+        UES.AnswerCount >= 5
+        AND PAD.PostScore > 10
+        AND (PAD.Tags LIKE '%<database>%' OR PAD.Tags LIKE '%<mysql>%')
+        AND PAD.PostTypeId = 2
+        AND PAD.ReopenVoteCount = 0
+        AND UES.SilverBadgeCount >=1
+)
+-- Final SELECT statement combining the two groups using UNION ALL, then joining with original CTEs for additional detail.
+-- Includes complex calculations, more correlated subqueries, and multi-level sorting.
+SELECT
+    Combined.UserId,
+    Combined.UserDisplayName,
+    Combined.Reputation,
+    Combined.ReputationRank,
+    Combined.PostId,
+    Combined.PostTitleExcerpt,
+    Combined.PostScore,
+    Combined.PostViewCount,
+    Combined.PostEditHistoryCount,
+    Combined.LinkedPostCount,
+    Combined.MostVotedDuplicateTitle,
+    Combined.ViewPerAnswerRatio,
+    Combined.CategoryDescription,
+    Combined.UniqueUpVoters,
+    UES_Main.QuestionCount,
+    UES_Main.AnswerCount,
+    UES_Main.GoldBadgeCount,
+    UES_Main.SilverBadgeCount,
+    UES_Main.BronzeBadgeCount,
+    UES_Main.AvgPostScoreByMe,
+    UES_Main.UserUpVotesReceived,
+    UES_Main.UserDownVotesReceived,
+    PAD_Main.DaysSinceCreation,
+    PAD_Main.HoursToFirstActivity,
+    (UES_Main.TotalUpVotesGivenByMe * 1.0 / NULLIF(UES_Main.TotalUpVotesGivenByMe + UES_Main.TotalDownVotesGivenByMe, 0)) AS UpvoteRatioGivenByMe, -- Calculation with NULL handling
+    SQRT(UES_Main.Reputation * (UES_Main.GoldBadgeCount + UES_Main.SilverBadgeCount * 0.5 + UES_Main.BronzeBadgeCount * 0.2)) AS WeightedUserInfluenceScore, -- Complex mathematical expression
+    COALESCE(CLA_Main.RecentLongCommentCount, 0) AS RecentLongCommentsOnPost,
+    COALESCE(PAD_Main.FavoriteCount, 0) + COALESCE(CLA_Main.LinkedPostCount, 0) * 2 AS EngagementIndex, -- Complex calculation with NULL handling
+    (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = Combined.UserId AND PostTypeId = 1 AND CreationDate >= '2023-01-01') AS RecentQuestionCount, -- Correlated subquery from main SELECT
+    ROW_NUMBER() OVER (PARTITION BY Combined.CategoryDescription ORDER BY Combined.PostScore DESC, Combined.PostViewCount DESC) AS RankWithinCategory -- Window function
+FROM
+    (
+        SELECT * FROM GroupA
+        UNION ALL -- Set operator
+        SELECT * FROM GroupB
+    ) AS Combined
+INNER JOIN UserEngagementSummary UES_Main ON Combined.UserId = UES_Main.UserId
+INNER JOIN PostActivityDetails PAD_Main ON Combined.PostId = PAD_Main.PostId
+LEFT JOIN ComplexLinkAnalysis CLA_Main ON Combined.PostId = CLA_Main.PostId
+WHERE
+    Combined.PostViewCount > UES_Main.MedianOverallReputation * 10 -- Complex predicate relating post views to overall reputation distribution
+    AND Combined.UniqueUpVoters >= 5
+    AND (Combined.MostVotedDuplicateTitle IS NULL OR Combined.MostVotedDuplicateTitle NOT ILIKE '%beginner%') -- NULL logic with string expression (case-insensitive)
+    AND PAD_Main.HoursToFirstActivity < 48
+ORDER BY
+    WeightedUserInfluenceScore DESC, EngagementIndex DESC, RankWithinCategory ASC
+LIMIT 750;

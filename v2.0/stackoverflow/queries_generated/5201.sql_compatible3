@@ -1,0 +1,150 @@
+WITH
+RecentPostScores AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.Tags,
+    p.AnswerCount,
+    p.CommentCount,
+    COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+    ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score + COALESCE(p.ViewCount,0)*0.5 + COALESCE(p.FavoriteCount,0)*2 DESC) AS rn_by_score
+  FROM Posts p
+  WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '180 days'
+    AND (p.PostTypeId = 1 OR p.PostTypeId = 2)
+),
+TopQuestions AS (
+  SELECT
+    r.PostId,
+    r.PostTypeId,
+    r.Title,
+    r.CreationDate,
+    r.LastActivityDate,
+    r.Score,
+    r.ViewCount,
+    r.OwnerUserId,
+    r.Tags,
+    r.AnswerCount,
+    r.CommentCount,
+    r.FavoriteCount,
+    r.rn_by_score
+  FROM RecentPostScores r
+  WHERE r.PostTypeId = 1 AND r.rn_by_score <= 10
+),
+UserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.ProfileImageUrl,
+    u.Location,
+    u.WebsiteUrl,
+    u.AboutMe,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '365 days') AS PostsLastYear,
+    (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id AND c.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '365 days') AS CommentsLastYear
+  FROM Users u
+  WHERE u.Reputation > 100
+),
+BadgeSummary AS (
+  SELECT
+    b.UserId,
+    COUNT(*) AS BadgeCount,
+    STRING_AGG(b.Name, ',') AS Badges
+  FROM Badges b
+  GROUP BY b.UserId
+),
+RecentTagWikis AS (
+  SELECT
+    t.Id AS TagWikiId,
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId,
+    t.WikiPostId,
+    t.IsModeratorOnly,
+    t.IsRequired
+  FROM Tags t
+  WHERE t.TagName IS NOT NULL
+),
+CrossLink AS (
+  SELECT
+    pl.PostId,
+    pl.RelatedPostId,
+    pl.LinkTypeId,
+    lt.Name AS LinkTypeName
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+  WHERE pl.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '365 days'
+),
+ClosedReasons AS (
+  SELECT ph.PostId, MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Comment END) AS LastCloseReason
+  FROM PostHistory ph
+  WHERE ph.PostId IS NOT NULL
+  GROUP BY ph.PostId
+)
+SELECT
+  t.PostId,
+  t.Title,
+  t.CreationDate,
+  t.LastActivityDate,
+  t.Score,
+  t.ViewCount,
+  t.AnswerCount,
+  t.CommentCount,
+  t.FavoriteCount,
+  t.OwnerUserId,
+  u.DisplayName AS OwnerDisplayName,
+  u.Reputation AS OwnerReputation,
+  u.Location AS OwnerLocation,
+  u.WebsiteUrl AS OwnerWebsite,
+  u.AboutMe AS OwnerAbout,
+  u.PostsLastYear,
+  u.CommentsLastYear,
+  rb.Badges AS OwnerBadges,
+  t.Tags,
+  rg.TagName AS RecentTagWiki,
+  crp.LastCloseReason,
+  t.rn_by_score
+FROM TopQuestions t
+JOIN UserActivity u ON t.OwnerUserId = u.UserId
+LEFT JOIN BadgeSummary rb ON u.UserId = rb.UserId
+LEFT JOIN RecentTagWikis rg ON rg.TagWikiId = t.PostId
+LEFT JOIN ClosedReasons crp ON crp.PostId = t.PostId
+ORDER BY t.rn_by_score ASC
+LIMIT 1
+
+UNION ALL
+
+SELECT
+  NULL::INTEGER AS PostId,
+  NULL::VARCHAR(300) AS Title,
+  NULL::TIMESTAMP AS CreationDate,
+  NULL::TIMESTAMP AS LastActivityDate,
+  NULL::INTEGER AS Score,
+  NULL::INTEGER AS ViewCount,
+  NULL::INTEGER AS AnswerCount,
+  NULL::INTEGER AS CommentCount,
+  NULL::INTEGER AS FavoriteCount,
+  NULL::INTEGER AS OwnerUserId,
+  NULL::VARCHAR(40) AS OwnerDisplayName,
+  NULL::INTEGER AS OwnerReputation,
+  NULL::VARCHAR(100) AS OwnerLocation,
+  NULL::VARCHAR(200) AS OwnerWebsite,
+  NULL::TEXT AS OwnerAbout,
+  NULL::INTEGER AS PostsLastYear,
+  NULL::INTEGER AS CommentsLastYear,
+  NULL::TEXT AS OwnerBadges,
+  NULL::VARCHAR(4000) AS Tags,
+  NULL::TEXT AS RecentTagWiki,
+  NULL::TEXT AS LastCloseReason,
+  NULL::INTEGER AS rn_by_score
+WHERE 1=0;

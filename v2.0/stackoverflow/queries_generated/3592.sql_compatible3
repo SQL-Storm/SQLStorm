@@ -1,0 +1,181 @@
+WITH UserStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadges,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS QuestionCount,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS AnswerCount,
+        (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id) AS CommentCount
+    FROM Users u
+),
+
+TagStats AS (
+    SELECT
+        t.TagName,
+        COUNT(p.Id)                                          AS TaggedPostCount,
+        AVG(p.Score)                                         AS AvgScore,
+        STRING_AGG(DISTINCT u.DisplayName, ', ')            AS TopContributors
+    FROM Tags t
+    JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    GROUP BY t.TagName
+    HAVING COUNT(p.Id) > 0
+),
+
+RecentVotes AS (
+    SELECT
+        v.PostId,
+        SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END)          AS UpVotes,
+        SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END)          AS DownVotes,
+        SUM(CASE WHEN vt.Id IN (1,2,3) THEN 1 ELSE 0 END)  AS TotalVotes,
+        MAX(v.CreationDate)                                 AS LastVoteDate
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE v.CreationDate >= (DATE '2024-10-01' - INTERVAL '30' DAY)
+    GROUP BY v.PostId
+),
+
+MainResults AS (
+    SELECT
+        us.Id,
+        us.DisplayName,
+        us.Reputation,
+        us.GoldBadges,
+        us.SilverBadges,
+        us.BronzeBadges,
+        us.QuestionCount,
+        us.AnswerCount,
+        us.CommentCount,
+        COALESCE(rv.UpVotes, 0)                               AS RecentUpVotes,
+        COALESCE(rv.DownVotes, 0)                             AS RecentDownVotes,
+        ROW_NUMBER() OVER (ORDER BY us.Reputation DESC, us.GoldBadges DESC, us.Id)    AS ReputationRank,
+        CASE
+            WHEN us.Reputation > 20000 OR us.GoldBadges >= 5 THEN 'PowerUser'
+            WHEN us.Reputation BETWEEN 10000 AND 20000      THEN 'Experienced'
+            WHEN us.Reputation < 1000                       THEN 'Newbie'
+            ELSE 'Regular'
+        END                                                  AS UserTier,
+        COALESCE(ts.AvgScore, 0)                              AS AvgTagScore,
+        COALESCE(ts.TaggedPostCount, 0)                       AS TaggedPostCount,
+        ts.TopContributors
+    FROM UserStats us
+    LEFT JOIN RecentVotes rv
+           ON rv.PostId = (
+                SELECT p.Id
+                FROM Posts p
+                WHERE p.OwnerUserId = us.Id
+                ORDER BY p.CreationDate DESC
+                FETCH FIRST 1 ROWS WITH TIES
+              )
+    LEFT JOIN (
+            SELECT
+                t.AvgScore,
+                t.TaggedPostCount,
+                t.TopContributors,
+                t.TagName
+            FROM TagStats t
+        ) t_all ON TRUE
+    LEFT JOIN LATERAL (
+            SELECT
+                t_all.AvgScore,
+                t_all.TaggedPostCount,
+                t_all.TopContributors
+            FROM (
+                SELECT DISTINCT
+                    TRIM(tag) AS tag
+                FROM (
+                    SELECT
+                        REPLACE(REPLACE(p.Tags, '<', ''), '>', CHR(10)) AS tag_string
+                    FROM Posts p
+                    WHERE p.OwnerUserId = us.Id
+                    ORDER BY p.CreationDate DESC
+                    FETCH FIRST 1 ROWS WITH TIES
+                ) tsplit,
+                UNNEST(string_to_array(tsplit.tag_string, CHR(10))) AS tag
+            ) tags
+            JOIN TagStats t_all ON t_all.TagName = tags.tag
+            ORDER BY t_all.TaggedPostCount DESC
+            FETCH FIRST 1 ROWS WITH TIES
+        ) ts ON TRUE
+    WHERE us.Reputation IS NOT NULL
+),
+
+FinalUnion AS (
+    SELECT * FROM MainResults
+    ORDER BY ReputationRank
+    LIMIT 100
+),
+
+FinalUnionWithSeparator AS (
+    SELECT * FROM FinalUnion
+
+    UNION ALL
+
+    SELECT
+        CAST(NULL AS BIGINT) AS Id,
+        '---' AS DisplayName,
+        CAST(NULL AS INTEGER) AS Reputation,
+        CAST(NULL AS INTEGER) AS GoldBadges,
+        CAST(NULL AS INTEGER) AS SilverBadges,
+        CAST(NULL AS INTEGER) AS BronzeBadges,
+        CAST(NULL AS INTEGER) AS QuestionCount,
+        CAST(NULL AS INTEGER) AS AnswerCount,
+        CAST(NULL AS INTEGER) AS CommentCount,
+        CAST(NULL AS INTEGER) AS RecentUpVotes,
+        CAST(NULL AS INTEGER) AS RecentDownVotes,
+        CAST(NULL AS INTEGER) AS ReputationRank,
+        CAST(NULL AS VARCHAR(50)) AS UserTier,
+        CAST(NULL AS NUMERIC) AS AvgTagScore,
+        CAST(NULL AS INTEGER) AS TaggedPostCount,
+        CAST(NULL AS VARCHAR(1000)) AS TopContributors
+),
+
+ExceptBlock AS (
+    SELECT
+        Id,
+        DisplayName,
+        Reputation,
+        GoldBadges,
+        SilverBadges,
+        BronzeBadges,
+        QuestionCount,
+        AnswerCount,
+        CommentCount,
+        RecentUpVotes,
+        RecentDownVotes,
+        ReputationRank,
+        UserTier,
+        AvgTagScore,
+        TaggedPostCount,
+        TopContributors
+    FROM (
+        SELECT
+            us.Id,
+            us.DisplayName,
+            us.Reputation,
+            us.GoldBadges,
+            us.SilverBadges,
+            us.BronzeBadges,
+            us.QuestionCount,
+            us.AnswerCount,
+            us.CommentCount,
+            COALESCE(rv.UpVotes,0) AS RecentUpVotes,
+            COALESCE(rv.DownVotes,0) AS RecentDownVotes,
+            ROW_NUMBER() OVER (ORDER BY us.Reputation DESC, us.Id) AS ReputationRank,
+            CAST(NULL AS VARCHAR(50)) AS UserTier,
+            CAST(NULL AS NUMERIC) AS AvgTagScore,
+            CAST(NULL AS INTEGER) AS TaggedPostCount,
+            CAST(NULL AS VARCHAR(1000)) AS TopContributors
+        FROM UserStats us
+        LEFT JOIN RecentVotes rv ON 1=0
+    ) sub
+)
+
+SELECT * FROM FinalUnionWithSeparator
+EXCEPT
+SELECT * FROM ExceptBlock
+ORDER BY ReputationRank DESC;

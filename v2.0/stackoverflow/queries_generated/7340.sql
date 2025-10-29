@@ -1,0 +1,248 @@
+-- {"query": "7340.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2620} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT c.Id) as Comments,
+        COUNT(DISTINCT b.Id) as Badges,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        MAX(b.Date) as LastBadgeDate,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) as TotalQuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) as TotalAnswerScore,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) as AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) as AvgAnswerScore,
+        STRING_AGG(DISTINCT p.Tags, '; ') as AllTags,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.ViewCount > 100 THEN p.Id END) as HighViewQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.Score > 10 THEN p.Id END) as HighScoreAnswers,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AnswerCount > 5 THEN p.Id END) as MultiAnsweredQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.FavoriteCount > 2 THEN p.Id END) as FavoriteQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL THEN p.Id END) as ClosedQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.CommunityOwnedDate IS NOT NULL THEN p.Id END) as CommunityOwnedQuestions
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+RankedUsers AS (
+    SELECT 
+        *,
+        ROW_NUMBER() OVER (ORDER BY TotalQuestionScore DESC, TotalAnswerScore DESC) as ScoreRank,
+        RANK() OVER (ORDER BY Reputation DESC) as ReputationRank,
+        DENSE_RANK() OVER (ORDER BY TotalPosts DESC) as PostRank,
+        PERCENT_RANK() OVER (ORDER BY TotalQuestionScore) as ScorePercentile,
+        NTILE(10) OVER (ORDER BY Reputation) as ReputationDecile,
+        LAG(UserId, 1) OVER (ORDER BY TotalQuestionScore DESC) as PrevUserScore,
+        LEAD(UserId, 1) OVER (ORDER BY TotalQuestionScore DESC) as NextUserScore,
+        AVG(TotalQuestionScore) OVER (ORDER BY TotalQuestionScore ROWS BETWEEN 4 PRECEDING AND 4 FOLLOWING) as ScoreMovingAvg,
+        FIRST_VALUE(UserId) OVER (ORDER BY TotalQuestionScore DESC) as TopScorer,
+        LAST_VALUE(UserId) OVER (ORDER BY TotalQuestionScore DESC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) as BottomScorer
+    FROM UserActivityStats
+),
+PostTagAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        CASE WHEN p.PostTypeId = 1 THEN 'Question' ELSE 'Answer' END as PostType,
+        COALESCE(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), 'No Tags') as CleanTags,
+        STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><') as TagArray,
+        CASE 
+            WHEN p.ViewCount > 500 THEN 'High View'
+            WHEN p.ViewCount > 100 THEN 'Medium View'
+            WHEN p.ViewCount > 0 THEN 'Low View'
+            ELSE 'No Views'
+        END as ViewCategory,
+        CASE 
+            WHEN p.AnswerCount > 10 THEN 'Many Answers'
+            WHEN p.AnswerCount > 5 THEN 'Some Answers'
+            WHEN p.AnswerCount > 0 THEN 'Few Answers'
+            ELSE 'No Answers'
+        END as AnswerCategory,
+        CASE 
+            WHEN p.Score > 50 THEN 'Very High Score'
+            WHEN p.Score > 10 THEN 'High Score'
+            WHEN p.Score > 0 THEN 'Positive Score'
+            ELSE 'Non-positive Score'
+        END as ScoreCategory,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) as ScoreRankInType,
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.ViewCount DESC) as ViewRankInType
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+ComplexUserActivity AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Elite'
+            WHEN u.Reputation > 5000 THEN 'Veteran'
+            WHEN u.Reputation > 1000 THEN 'Active'
+            ELSE 'Beginner'
+        END as RepCategory,
+        CASE 
+            WHEN u.Views > 1000 THEN 'High View'
+            WHEN u.Views > 100 THEN 'Medium View'
+            ELSE 'Low View'
+        END as ViewCategory,
+        CASE 
+            WHEN u.UpVotes > 1000 THEN 'Great Contributor'
+            WHEN u.UpVotes > 100 THEN 'Good Contributor'
+            ELSE 'Regular Contributor'
+        END as ContributionLevel,
+        (u.UpVotes * 1.5 + u.DownVotes * -0.5 + u.Reputation * 0.001) as ContributionScore,
+        DENSE_RANK() OVER (ORDER BY (u.UpVotes * 1.5 + u.DownVotes * -0.5 + u.Reputation * 0.001) DESC) as ContributionRank,
+        CASE 
+            WHEN u.DownVotes > u.UpVotes * 0.5 AND u.UpVotes > 100 THEN 'Controversial'
+            WHEN u.DownVotes > u.UpVotes * 0.2 AND u.UpVotes > 100 THEN 'Moderately Controversial'
+            WHEN u.DownVotes < u.UpVotes * 0.2 AND u.UpVotes > 100 THEN 'Popular'
+            ELSE 'Neutral'
+        END as PopularityStatus,
+        NULLIF((u.UpVotes - u.DownVotes) / (1.0 * NULLIF(u.UpVotes + u.DownVotes, 0)), 0) as NetVoteRatio,
+        (u.UpVotes + u.DownVotes) / NULLIF(u.Views, 0) as EngagementRatio
+    FROM Users u
+    WHERE u.Reputation > 100
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Very Popular'
+            WHEN t.Count > 500 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            ELSE 'Rare'
+        END as PopularityLevel,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as PopularityRank,
+        AVG(t.Count) OVER (ORDER BY t.Count ROWS BETWEEN 4 PRECEDING AND 4 FOLLOWING) as MovingAvgCount,
+        LAG(t.Count, 1) OVER (ORDER BY t.Count DESC) as PrevTagCount,
+        LEAD(t.Count, 1) OVER (ORDER BY t.Count DESC) as NextTagCount,
+        PERCENT_RANK() OVER (ORDER BY t.Count) as CountPercentile
+    FROM Tags t
+    WHERE t.Count > 50
+),
+FinalPerformanceTest AS (
+    SELECT 
+        'User Analysis Results' as TestCategory,
+        COUNT(*) as ResultCount,
+        'Complex multi-table joins, aggregations, window functions' as TestDescription,
+        MAX(Reputation) as MaxReputation,
+        MIN(Reputation) as MinReputation,
+        AVG(Reputation) as AvgReputation,
+        SUM(TotalPosts) as TotalUserPosts,
+        STRING_AGG(CONCAT(DisplayName, ':', TotalPosts), '; ') as UserPostSummary
+    FROM RankedUsers
+    WHERE TotalPosts > 10
+    
+    UNION ALL
+    
+    SELECT 
+        'Post Analysis Results' as TestCategory,
+        COUNT(*) as ResultCount,
+        'Multiple JOINs, STRING operations, CASE expressions' as TestDescription,
+        MAX(Score) as MaxScore,
+        MIN(Score) as MinScore,
+        AVG(Score) as AvgScore,
+        SUM(ViewCount) as TotalViews,
+        STRING_AGG(CONCAT(Title, '(', Score, ')'), '; ') as PostScoreSummary
+    FROM PostTagAnalysis
+    WHERE Tags IS NOT NULL AND Tags != ''
+    
+    UNION ALL
+    
+    SELECT 
+        'Tag Analysis Results' as TestCategory,
+        COUNT(*) as ResultCount,
+        'Window functions with different frames, ranking, filtering' as TestDescription,
+        MAX(Count) as MaxTagCount,
+        MIN(Count) as MinTagCount,
+        AVG(Count) as AvgTagCount,
+        SUM(Count) as TotalTagCount,
+        STRING_AGG(CONCAT(TagName, ':', Count), '; ') as TagSummary
+    FROM TagAnalysis
+    WHERE PopularityLevel IN ('Very Popular', 'Popular')
+    
+    UNION ALL
+    
+    SELECT 
+        'User-Post Joined Results' as TestCategory,
+        COUNT(*) as ResultCount,
+        'Correlated subqueries, complex predicates, multiple joins' as TestDescription,
+        MAX(u.Reputation) as MaxReputation,
+        MIN(u.Reputation) as MinReputation,
+        AVG(u.Reputation) as AvgReputation,
+        SUM(p.Score) as TotalPostScore,
+        STRING_AGG(CONCAT(u.DisplayName, '(', p.Score, ')'), '; ') as UserPostSummary
+    FROM Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Reputation > (SELECT AVG(Reputation) FROM Users)
+      AND p.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1)
+      AND p.CreationDate > (
+          SELECT MAX(CreationDate) - INTERVAL '30 days' 
+          FROM Posts 
+          WHERE PostTypeId = 1
+      )
+      AND u.Id IN (
+          SELECT DISTINCT OwnerUserId 
+          FROM Posts 
+          WHERE PostTypeId IN (1, 2) 
+            AND CreationDate > '2010-01-01'
+      )
+)
+SELECT 
+    TestCategory,
+    ResultCount,
+    TestDescription,
+    MaxReputation,
+    MinReputation,
+    AvgReputation,
+    TotalPostScore,
+    TotalUserPosts,
+    TotalViews,
+    TotalTagCount,
+    STRING_AGG(UserPostSummary, ' | ') as CombinedSummary,
+    COUNT(*) OVER () as TotalTestCategories
+FROM FinalPerformanceTest
+WHERE ResultCount > 0
+GROUP BY 
+    TestCategory, 
+    ResultCount, 
+    TestDescription, 
+    MaxReputation, 
+    MinReputation, 
+    AvgReputation, 
+    TotalPostScore, 
+    TotalUserPosts, 
+    TotalViews, 
+    TotalTagCount
+HAVING 
+    COUNT(*) > 0
+    AND MAX(Reputation) IS NOT NULL
+    AND MIN(Reputation) IS NOT NULL
+    AND AVG(Reputation) IS NOT NULL
+ORDER BY 
+    CASE TestCategory 
+        WHEN 'User Analysis Results' THEN 1
+        WHEN 'Post Analysis Results' THEN 2
+        WHEN 'Tag Analysis Results' THEN 3
+        WHEN 'User-Post Joined Results' THEN 4
+    END,
+    ResultCount DESC
+LIMIT 100;

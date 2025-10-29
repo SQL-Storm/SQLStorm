@@ -1,0 +1,141 @@
+-- {"query": "3575.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2107} 
+
+/*  Performance‑benchmarking query – heavy on CTEs, joins, window functions, 
+    set operators, string handling and NULL logic                                            */
+WITH recent_questions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.Tags
+    FROM Posts p
+    WHERE p.PostTypeId = 1                              -- only questions
+      AND p.CreationDate > CURRENT_DATE - INTERVAL '30 days'
+),
+closed_questions AS (
+    SELECT
+        ph.PostId,
+        ph.CreationDate      AS ClosedDate,
+        NULLIF(ph.Comment, '')::int AS CloseReasonId      -- comment holds close‑reason id
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10                     -- Post Closed
+),
+questions_with_close AS (
+    SELECT
+        q.*,
+        c.ClosedDate,
+        c.CloseReasonId
+    FROM recent_questions q
+    LEFT JOIN closed_questions c
+           ON q.Id = c.PostId
+),
+user_answers AS (
+    SELECT
+        a.OwnerUserId,
+        a.ParentId          AS QuestionId,
+        a.Score             AS AnswerScore,
+        a.CreationDate,
+        a.Id                AS AnswerId
+    FROM Posts a
+    WHERE a.PostTypeId = 2                      -- only answers
+      AND a.OwnerUserId IS NOT NULL
+),
+answer_aggregates AS (
+    SELECT
+        ua.OwnerUserId,
+        COUNT(*)                         AS AnswerCount,
+        AVG(ua.AnswerScore)::NUMERIC(10,2) AS AvgAnswerScore,
+        MAX(ua.CreationDate)             AS LastAnswerDate
+    FROM user_answers ua
+    GROUP BY ua.OwnerUserId
+),
+badge_aggregates AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldCnt,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverCnt,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeCnt
+    FROM Badges b
+    GROUP BY b.UserId
+),
+question_tags AS (
+    /*  Split the <tag1><tag2>… string into rows – uses PostgreSQL functions */
+    SELECT
+        q.Id                AS QuestionId,
+        UNNEST(STRING_TO_ARRAY(SUBSTRING(q.Tags, 2, LENGTH(q.Tags)-2), '><')) AS Tag
+    FROM questions_with_close q
+    WHERE q.Tags IS NOT NULL
+),
+popular_tags AS (
+    SELECT
+        t.Tag,
+        COUNT(*) AS TagUseCount
+    FROM question_tags t
+    GROUP BY t.Tag
+    HAVING COUNT(*) > 10
+),
+user_question_stats AS (
+    SELECT
+        u.Id                                    AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(a.AnswerCount,0)               AS TotalAnswers,
+        COALESCE(a.AvgAnswerScore,0)            AS AvgScore,
+        COALESCE(b.GoldCnt,0)                   AS GoldBadges,
+        COALESCE(b.SilverCnt,0)                 AS SilverBadges,
+        COALESCE(b.BronzeCnt,0)                 AS BronzeBadges,
+        COUNT(DISTINCT q.Id) FILTER (WHERE q.ClosedDate IS NOT NULL) AS ClosedQuestionsAnswered,
+        STRING_AGG(DISTINCT tg.Tag, ', ') FILTER (WHERE tg.Tag IS NOT NULL) AS CommonTags
+    FROM Users u
+    LEFT JOIN answer_aggregates a        ON u.Id = a.OwnerUserId
+    LEFT JOIN badge_aggregates b         ON u.Id = b.UserId
+    LEFT JOIN Posts p                    ON p.OwnerUserId = u.Id AND p.PostTypeId = 2
+    LEFT JOIN questions_with_close q    ON p.ParentId = q.Id
+    LEFT JOIN question_tags tg           ON q.Id = tg.QuestionId
+    LEFT JOIN popular_tags pt            ON tg.Tag = pt.Tag
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation,
+        a.AnswerCount, a.AvgAnswerScore,
+        b.GoldCnt, b.SilverCnt, b.BronzeCnt
+    HAVING u.Reputation > 1000
+       AND COALESCE(a.AnswerCount,0) >= 5
+),
+ranked_users AS (
+    SELECT
+        *,
+        ROW_NUMBER() OVER (ORDER BY TotalAnswers DESC, Reputation DESC) AS rk
+    FROM user_question_stats
+)
+SELECT
+    rk,
+    UserId,
+    DisplayName,
+    Reputation,
+    TotalAnswers,
+    AvgScore,
+    GoldBadges,
+    SilverBadges,
+    BronzeBadges,
+    ClosedQuestionsAnswered,
+    CommonTags
+FROM ranked_users
+WHERE rk <= 50
+
+UNION ALL
+
+/*  Grand total row – demonstrates set operator usage  */
+SELECT
+    NULL AS rk,
+    'TOTAL' AS UserId,
+    NULL AS DisplayName,
+    NULL AS Reputation,
+    SUM(TotalAnswers)               AS TotalAnswers,
+    AVG(AvgScore)                   AS AvgScore,
+    SUM(GoldBadges)                 AS GoldBadges,
+    SUM(SilverBadges)               AS SilverBadges,
+    SUM(BronzeBadges)               AS BronzeBadges,
+    SUM(ClosedQuestionsAnswered)   AS ClosedQuestionsAnswered,
+    NULL AS CommonTags
+FROM ranked_users;

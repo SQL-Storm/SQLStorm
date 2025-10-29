@@ -1,0 +1,165 @@
+WITH Q AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.CommentCount,
+    p.AcceptedAnswerId,
+    p.PostTypeId,
+    p.ParentId,
+    p.Body,
+    p.FavoriteCount,
+    p.ContentLicense,
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.Location,
+    u.WebsiteUrl,
+    u.EmailHash,
+    u.AccountId,
+    b.Class AS BadgeClass,
+    b.Name AS BadgeName,
+    b.Date AS BadgeDate
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  WHERE p.PostTypeId = 1
+),
+Agg AS (
+  SELECT
+    Q.PostId,
+    Q.Title,
+    Q.CreationDate,
+    Q.Score,
+    Q.ViewCount,
+    Q.Tags,
+    Q.OwnerUserId,
+    Q.LastActivityDate,
+    Q.CommentCount,
+    Q.AcceptedAnswerId,
+    Q.ParentId,
+    Q.Body,
+    Q.FavoriteCount,
+    Q.ContentLicense,
+    Q.UserId,
+    Q.DisplayName,
+    Q.Reputation,
+    Q.UserCreationDate,
+    Q.LastAccessDate,
+    Q.Views,
+    Q.UpVotes,
+    Q.DownVotes,
+    Q.Location,
+    Q.WebsiteUrl,
+    Q.EmailHash,
+    Q.AccountId,
+    STRING_AGG(DISTINCT (b.Name || '#' || CAST(b.Date AS varchar)), '|') AS BadgeInfo
+  FROM Q
+  LEFT JOIN Badges b ON b.UserId = Q.UserId
+  GROUP BY
+    Q.PostId, Q.Title, Q.CreationDate, Q.Score, Q.ViewCount, Q.Tags, Q.OwnerUserId,
+    Q.LastActivityDate, Q.CommentCount, Q.AcceptedAnswerId, Q.ParentId, Q.Body,
+    Q.FavoriteCount, Q.ContentLicense, Q.UserId, Q.DisplayName, Q.Reputation,
+    Q.UserCreationDate, Q.LastAccessDate, Q.Views, Q.UpVotes, Q.DownVotes,
+    Q.Location, Q.WebsiteUrl, Q.EmailHash, Q.AccountId
+),
+Ref AS (
+  SELECT
+    a.PostId,
+    a.Title,
+    a.CreationDate,
+    a.Score,
+    a.ViewCount,
+    a.Tags,
+    a.OwnerUserId,
+    a.LastActivityDate,
+    a.CommentCount,
+    a.AcceptedAnswerId,
+    a.ParentId,
+    a.Body,
+    a.FavoriteCount,
+    a.ContentLicense,
+    a.UserId,
+    a.DisplayName,
+    a.Reputation,
+    a.UserCreationDate,
+    a.LastAccessDate,
+    a.Views,
+    a.UpVotes,
+    a.DownVotes,
+    a.Location,
+    a.WebsiteUrl,
+    a.EmailHash,
+    a.AccountId,
+    a.BadgeInfo,
+    (
+      SELECT MAX(pl.CreationDate)
+      FROM PostLinks pl
+      WHERE pl.PostId = a.PostId
+    ) AS LastLinkDate,
+    ROW_NUMBER() OVER (
+      PARTITION BY CAST(a.CreationDate AS date)
+      ORDER BY a.Reputation DESC, a.Score DESC
+    ) AS DayRank
+  FROM Agg a
+)
+SELECT
+  r.PostId,
+  r.Title,
+  r.CreationDate,
+  r.Score,
+  r.ViewCount,
+  r.Tags,
+  r.OwnerUserId,
+  r.LastActivityDate,
+  r.CommentCount,
+  r.AcceptedAnswerId,
+  r.ParentId,
+  r.Body,
+  r.FavoriteCount,
+  r.ContentLicense,
+  r.UserId,
+  r.DisplayName,
+  r.Reputation,
+  r.UserCreationDate,
+  r.LastAccessDate,
+  r.Views,
+  r.UpVotes,
+  r.DownVotes,
+  r.Location,
+  r.WebsiteUrl,
+  r.EmailHash,
+  r.AccountId,
+  r.BadgeInfo,
+  r.LastLinkDate,
+  r.DayRank
+FROM Ref r
+WHERE
+  (
+    CASE
+      WHEN r.BadgeInfo IS NULL THEN 0
+      ELSE (
+        SELECT COUNT(*)
+        FROM Badges b2
+        WHERE b2.UserId = r.UserId
+      )
+    END
+  ) >= 2
+  OR EXISTS (
+    SELECT 1
+    FROM Badges b3
+    WHERE b3.UserId = r.UserId
+      AND b3.Date >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365' DAY)
+  )
+ORDER BY r.DayRank, r.CreationDate DESC
+FETCH FIRST 100 ROWS ONLY;

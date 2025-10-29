@@ -1,0 +1,153 @@
+-- {"query": "2919.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1649} 
+with UserPostStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        coalesce(sum(p.Score),0) as TotalPostScore,
+        coalesce(sum(case when v.VoteTypeId = 2 then 1 else 0 end),0) as UpVotes,
+        coalesce(sum(case when v.VoteTypeId = 3 then 1 else 0 end),0) as DownVotes,
+        coalesce(max(p.Score),0) as MaxPostScore,
+        avg(p.Score) filter (where p.Score is not null) as AvgPostScore,
+        min(p.CreationDate) as FirstPostDate,
+        max(p.LastActivityDate) as LastPostActivity,
+        string_agg(distinct b.Name, ',') filter (where b.Id is not null) as Badges,
+        count(distinct b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(distinct b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(distinct b.Id) filter (where b.Class = 3) as BronzeBadges,
+        bool_or(p.ClosedDate is not null) as HasClosedPost
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Votes v on v.PostId = p.Id
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+),
+TopUsers as (
+    select *
+    from UserPostStats
+    where QuestionCount > 10 and AnswerCount > 10 and Reputation > 1000
+),
+RecentClosedQuestions as (
+    select p.Id, p.OwnerUserId, p.Title, p.CreationDate, p.ClosedDate, ph.Comment as CloseReasonJson,
+        (select crt.Name
+         from CloseReasonTypes crt
+         where crt.Id = try_cast(ph.Comment as int)
+         limit 1) as CloseReasonName
+    from Posts p
+    inner join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 10
+    where p.PostTypeId = 1 and p.ClosedDate > now() - interval '1 year'
+),
+UserRecentClosedCounts as (
+    select OwnerUserId,
+        count(*) as RecentClosedCount
+    from RecentClosedQuestions
+    group by OwnerUserId
+),
+QuestionsWithAnswers as (
+    select q.Id as QuestionId, q.Title, q.Tags, q.OwnerUserId, q.CreationDate as QuestionCreationDate,
+        a.Id as AnswerId, a.OwnerUserId as AnswerOwnerUserId, a.Score as AnswerScore,
+        row_number() over (partition by q.Id order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+),
+AcceptedAnswerStats as (
+    select q.Id as QuestionId, q.AcceptedAnswerId, a.Score as AcceptedAnswerScore,
+        a.OwnerUserId as AcceptedAnswerUserId,
+        coalesce(a.Score,0) - coalesce(max_ans_score.MaxScore,0) as ScoreDiffFromMax
+    from Posts q
+    left join Posts a on a.Id = q.AcceptedAnswerId
+    left join (
+        select ParentId, max(Score) as MaxScore
+        from Posts
+        where PostTypeId = 2
+        group by ParentId
+    ) max_ans_score on max_ans_score.ParentId = q.Id
+    where q.PostTypeId = 1
+),
+TagAgg as (
+    select
+        tag,
+        count(distinct p.Id) as QuestionCount,
+        avg(p.Score) as AvgScore,
+        max(p.Score) as MaxScore
+    from Posts p
+    cross join lateral unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) as tag
+    where p.PostTypeId = 1
+    group by tag
+),
+UserBadgeRank as (
+    select
+        ub.UserId,
+        ub.Name,
+        ub.Class,
+        row_number() over (partition by ub.UserId order by ub.Class, ub.Date desc) as BadgeRank
+    from Badges ub
+),
+UserTopBadges as (
+    select u.Id as UserId, b.Name as TopBadgeName, b.Class as TopBadgeClass
+    from Users u
+    left join UserBadgeRank b on b.UserId = u.Id and b.BadgeRank = 1
+),
+CombinedStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        ups.QuestionCount,
+        ups.AnswerCount,
+        ups.TotalPostScore,
+        coalesce(urc.RecentClosedCount,0) as RecentClosedCount,
+        utb.TopBadgeName,
+        utb.TopBadgeClass,
+        coalesce(aas.ScoreDiffFromMax,0) as AcceptedAnswerScoreDiff,
+        coalesce(ta.QuestionCount,0) as TagQuestionCount,
+        ta.AvgScore as TagAvgScore,
+        ta.MaxScore as TagMaxScore
+    from Users u
+    left join UserPostStats ups on ups.UserId = u.Id
+    left join UserRecentClosedCounts urc on urc.OwnerUserId = u.Id
+    left join UserTopBadges utb on utb.UserId = u.Id
+    left join AcceptedAnswerStats aas on aas.AcceptedAnswerUserId = u.Id
+    left join TagAgg ta on ta.tag = (select (string_to_array(ups.Badges, ','))[1]) -- pick first badge name from aggregated badges as a proxy tag
+    where ups.UserId is not null
+)
+select 
+    cs.UserId,
+    cs.DisplayName,
+    cs.QuestionCount,
+    cs.AnswerCount,
+    cs.TotalPostScore,
+    cs.RecentClosedCount,
+    cs.TopBadgeName,
+    case cs.TopBadgeClass
+        when 1 then 'Gold'
+        when 2 then 'Silver'
+        when 3 then 'Bronze'
+        else 'None'
+    end as TopBadgeClass,
+    cs.AcceptedAnswerScoreDiff,
+    cs.TagQuestionCount,
+    cs.TagAvgScore,
+    cs.TagMaxScore,
+    ps.CreationYear,
+    count(distinct ps.PostId) as PostsPerYear,
+    first_value(ps.PostTitle) over (partition by cs.UserId order by ps.CreationDate) as FirstPostTitle,
+    last_value(ps.PostTitle) over (partition by cs.UserId order by ps.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) as LastPostTitle
+from CombinedStats cs
+left join (
+    select
+        p.OwnerUserId,
+        p.Id as PostId,
+        p.Title as PostTitle,
+        extract(year from p.CreationDate) as CreationYear,
+        p.CreationDate
+    from Posts p
+    where p.OwnerUserId is not null
+) ps on ps.OwnerUserId = cs.UserId
+group by 
+    cs.UserId, cs.DisplayName, cs.QuestionCount, cs.AnswerCount, cs.TotalPostScore, cs.RecentClosedCount, cs.TopBadgeName, cs.TopBadgeClass, cs.AcceptedAnswerScoreDiff, cs.TagQuestionCount, cs.TagAvgScore, cs.TagMaxScore, ps.CreationYear
+having count(distinct ps.PostId) > 5
+order by cs.TotalPostScore desc nulls last, cs.QuestionCount desc nulls last
+limit 50;

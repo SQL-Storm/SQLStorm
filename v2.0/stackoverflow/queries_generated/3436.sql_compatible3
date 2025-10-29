@@ -1,0 +1,118 @@
+WITH user_activity AS (
+    SELECT
+        u.Id                         AS user_id,
+        u.DisplayName                AS user_name,
+        u.Reputation                 AS reputation,
+        COALESCE(u.UpVotes, 0)       - COALESCE(u.DownVotes, 0) AS net_votes,
+        COUNT(p.Id)                  FILTER (WHERE p.PostTypeId = 1) AS question_cnt,
+        COUNT(p.Id)                  FILTER (WHERE p.PostTypeId = 2) AS answer_cnt,
+        SUM(COALESCE(p.Score, 0))    FILTER (WHERE p.PostTypeId = 1) AS question_score,
+        SUM(COALESCE(p.Score, 0))    FILTER (WHERE p.PostTypeId = 2) AS answer_score,
+        COUNT(b.Id)                  AS badge_cnt,
+        MAX(p.CreationDate)          AS last_post_date,
+        MAX(v.CreationDate)          AS last_vote_date,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.Id) AS reputation_rank
+    FROM Users u
+    LEFT JOIN Posts p          ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b         ON b.UserId = u.Id
+    LEFT JOIN Votes v          ON v.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes
+),
+
+tag_performance AS (
+    SELECT
+        t.Id                                 AS tag_id,
+        t.TagName                            AS tag_name,
+        COUNT(p.Id)                          AS question_cnt,
+        SUM(COALESCE(p.Score, 0))            AS total_score,
+        AVG(COALESCE(p.Score, 0))            AS avg_score,
+        SUM(COALESCE(p.ViewCount, 0))        AS total_views,
+        MAX(p.CreationDate)                  AS latest_question_date,
+        COUNT(DISTINCT p.OwnerUserId)        AS distinct_authors,
+        ROW_NUMBER() OVER (ORDER BY COUNT(p.Id) DESC, t.Id) AS popularity_rank
+    FROM Tags t
+    LEFT JOIN Posts p
+      ON p.PostTypeId = 1
+     AND p.Tags IS NOT NULL
+     AND POSITION('<' || t.TagName || '>' IN p.Tags) > 0
+    GROUP BY t.Id, t.TagName
+),
+
+recent_closures AS (
+    SELECT
+        ph.PostId,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) AS closed_at,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.CreationDate END) AS reopened_at,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Comment END)       AS close_reason_code
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (10, 11)
+    GROUP BY ph.PostId
+),
+
+high_achievers AS (
+    SELECT user_id, user_name, reputation, badge_cnt, answer_score
+    FROM user_activity
+    WHERE badge_cnt >= 50
+    UNION ALL
+    SELECT user_id, user_name, reputation, badge_cnt, answer_score
+    FROM user_activity
+    WHERE answer_score >= 1000
+),
+
+tp_map AS (
+    /* Replace non-inner join on subquery by joining Posts directly to tag_performance and user_activity.
+       For each user, find tags of questions the user asked; pick the minimum tag_name (if any) */
+    SELECT
+        ua_inner.user_id,
+        MIN(tp_inner.tag_name) FILTER (WHERE tp_inner.question_cnt > 0) AS tag_name
+    FROM user_activity ua_inner
+    LEFT JOIN Posts p
+      ON p.OwnerUserId = ua_inner.user_id
+     AND p.PostTypeId = 1
+     AND p.Tags IS NOT NULL
+    LEFT JOIN tag_performance tp_inner
+      ON POSITION('<' || tp_inner.tag_name || '>' IN p.Tags) > 0
+    GROUP BY ua_inner.user_id
+)
+
+SELECT
+    ua.user_id,
+    ua.user_name,
+    ua.reputation,
+    ua.net_votes,
+    ua.question_cnt,
+    ua.answer_cnt,
+    ua.question_score,
+    ua.answer_score,
+    ua.badge_cnt,
+    ua.reputation_rank,
+    tp.tag_name,
+    tp.question_cnt      AS tag_question_cnt,
+    tp.avg_score         AS tag_avg_score,
+    tp.total_views       AS tag_total_views,
+    tp.popularity_rank,
+    ph.closed_at,
+    ph.reopened_at,
+    COALESCE(crt.Name, 'Unknown') AS close_reason_text,
+    CASE
+        WHEN ph.closed_at IS NOT NULL AND ph.reopened_at IS NULL THEN 'Closed'
+        WHEN ph.closed_at IS NOT NULL AND ph.reopened_at IS NOT NULL THEN 'Reopened'
+        ELSE 'Open'
+    END AS current_status,
+    ha.badge_cnt        AS high_achiever_badges,
+    ha.answer_score     AS high_achiever_answer_score
+FROM user_activity ua
+LEFT JOIN recent_closures ph ON ph.PostId = (
+        SELECT p2.Id
+        FROM Posts p2
+        WHERE p2.OwnerUserId = ua.user_id
+          AND p2.PostTypeId = 1
+        ORDER BY p2.CreationDate DESC
+        LIMIT 1
+    )
+LEFT JOIN PostHistoryTypes crt   ON crt.Id = TRY_CAST(ph.close_reason_code AS INTEGER)
+LEFT JOIN tp_map tp_map          ON tp_map.user_id = ua.user_id
+LEFT JOIN tag_performance tp     ON tp.tag_name = tp_map.tag_name
+LEFT JOIN high_achievers ha      ON ha.user_id = ua.user_id
+ORDER BY ua.reputation_rank
+LIMIT 100;

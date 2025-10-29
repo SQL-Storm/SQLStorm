@@ -1,0 +1,82 @@
+select
+  rq.rownum,
+  rq.engagement_dr,
+  rq.engagement_decile,
+  rq.question_id,
+  q.title,
+  q.creationdate as question_created,
+  q.viewcount,
+  q.score as question_score,
+  q.answercount,
+  q.commentcount,
+  q.favoritecount,
+  q.closeddate,
+  rq.engagement_score,
+  rq.accepted_answer_hours,
+  rq.accepted_answer_quality_bucket,
+  rq.answers_total,
+  rq.answers_positive,
+  rq.net_votes,
+  rq.votes_last_30d,
+  rq.edit_events,
+  rq.dup_links,
+  rq.rel_links,
+  rq.avg_tag_popularity,
+  rq.is_closed,
+  ue.user_id as asker_id,
+  coalesce(ue.displayname, q.displayname, 'anonymous') as asker_displayname,
+  ue.user_segment,
+  ue.reputation,
+  ue.gold_badges,
+  ue.silver_badges,
+  ue.bronze_badges,
+  ue.contrib_score,
+  ue.contrib_rank,
+  tc.top_commenter_userid,
+  coalesce(au.displayname, 'n/a') as top_commenter_displayname,
+  trim(both ' ' from
+    coalesce(q.title, '')
+    || case when q.tags is not null then ' [' || regexp_replace(q.tags, '[<>]', '', 'g') || ']' else '' end
+  ) as question_summary
+from (
+  select
+    es.question_id,
+    es.asker_id,
+    es.engagement_score,
+    es.views,
+    es.post_score,
+    es.net_votes,
+    es.favorites,
+    es.bounty,
+    es.answers_total,
+    es.answers_positive,
+    es.votes_last_30d,
+    es.edit_events,
+    es.dup_links,
+    es.rel_links,
+    es.avg_tag_popularity,
+    es.is_closed,
+    qc.accepted_answer_hours,
+    qc.accepted_answer_quality_bucket,
+    row_number() over (order by es.engagement_score desc, es.views desc, es.post_score desc, es.net_votes desc) as rownum,
+    dense_rank() over (order by es.engagement_score desc) as engagement_dr,
+    ntile(10) over (order by es.engagement_score desc) as engagement_decile,
+    es.engagement_score as engagement_score -- keep for ordering in outer query
+  from engagement_scored es
+  left join qa_quality qc on qc.question_id = es.question_id
+) rq
+join posts_norm q on q.id = rq.question_id
+left join user_enriched ue on ue.user_id = rq.asker_id
+left join top_commenter tc on tc.question_id = rq.question_id
+left join users au on au.id = tc.top_commenter_userid
+where
+  (
+    (rq.engagement_decile <= 3 and rq.accepted_answer_hours is not null)
+    or (rq.engagement_score >= 200 and rq.answers_total >= 1)
+    or (rq.is_closed = 0 and rq.avg_tag_popularity > 0 and rq.votes_last_30d >= 5)
+  )
+  and coalesce(q.viewcount,0) >= 10
+  and (q.closeddate is null or q.closeddate > q.creationdate)
+  and (ue.user_segment is distinct from 'unknown' or ue.contrib_rank <= 100)
+order by rq.engagement_score desc, rq.rownum
+limit 500;

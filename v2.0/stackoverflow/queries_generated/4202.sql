@@ -1,0 +1,153 @@
+-- {"query": "4202.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1291} 
+
+WITH
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      COUNT(DISTINCT p.Id) AS PostCount,
+      COUNT(DISTINCT c.Id) AS CommentCount,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+      MAX(p.CreationDate) AS LastPostDate,
+      u.CreationDate AS UserCreationDate,
+      (
+        SELECT
+          COUNT(*)
+        FROM
+          Badges b
+        WHERE
+          b.UserId = u.Id
+      ) AS BadgeCount,
+      ROW_NUMBER() OVER (
+        ORDER BY
+          u.Reputation DESC
+      ) AS ReputationRank
+    FROM
+      Users u
+      LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+      LEFT JOIN Comments c ON u.Id = c.UserId
+      LEFT JOIN Votes v ON u.Id = v.UserId
+    WHERE
+      u.Id BETWEEN 1 AND 10000 -- Limit to a subset of users for performance
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.CreationDate,
+      u.Reputation
+  ),
+  PostEngagement AS (
+    SELECT
+      p.Id AS PostId,
+      p.OwnerUserId,
+      pt.Name AS PostType,
+      p.Title,
+      p.Score,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      (
+        SELECT
+          COUNT(*)
+        FROM
+          PostHistory ph
+        WHERE
+          ph.PostId = p.Id
+          AND ph.PostHistoryTypeId IN (4, 5, 6) -- Edits
+      ) AS EditCount,
+      DENSE_RANK() OVER (
+        ORDER BY
+          p.Score DESC
+      ) AS ScoreRank
+    FROM
+      Posts p
+      JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE
+      p.CreationDate >= DATE_SUB(CURDATE(), INTERVAL 1 YEAR) -- Posts from the last year
+      AND p.PostTypeId IN (1, 2) -- Questions and Answers
+  ),
+  TagPopularity AS (
+    SELECT
+      t.TagName,
+      COUNT(pl.PostId) AS LinkedPostCount,
+      AVG(p.Score) AS AveragePostScore,
+      SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicateLinkCount
+    FROM
+      Tags t
+      LEFT JOIN PostLinks pl ON t.Id = pl.LinkTypeId -- Incorrect join, should be on PostId/RelatedPostId
+      LEFT JOIN Posts p ON pl.PostId = p.Id -- Incorrect join, should be on PostId/RelatedPostId
+    WHERE
+      t.TagName NOT LIKE '#%' -- Exclude system tags
+    GROUP BY
+      t.TagName
+    HAVING
+      COUNT(pl.PostId) > 10 -- Only consider tags with more than 10 linked posts
+  )
+SELECT
+  ua.DisplayName,
+  ua.Reputation,
+  ua.BadgeCount,
+  ua.UserCreationDate,
+  ua.PostCount,
+  ua.CommentCount,
+  ua.UpVoteCount,
+  ua.DownVoteCount,
+  pe.PostType,
+  pe.Title,
+  pe.Score,
+  pe.ScoreRank,
+  pe.AnswerCount,
+  pe.FavoriteCount,
+  pe.EditCount,
+  tp.TagName,
+  tp.LinkedPostCount,
+  tp.AveragePostScore,
+  tp.DuplicateLinkCount,
+  CASE
+    WHEN ua.LastPostDate IS NULL THEN 'Never Posted'
+    WHEN ua.LastPostDate < DATE_SUB(CURDATE(), INTERVAL 30 DAY) THEN 'Inactive'
+    ELSE 'Active'
+  END AS UserActivityStatus,
+  CONCAT(
+    ua.DisplayName,
+    ' - ',
+    tp.TagName,
+    ' (Score: ',
+    pe.Score,
+    ')'
+  ) AS CompositeIdentifier,
+  COALESCE(ua.DisplayName, 'Anonymous') AS DisplayNameOrAnonymous
+FROM
+  UserActivity ua
+  JOIN PostEngagement pe ON ua.UserId = pe.OwnerUserId
+  JOIN TagPopularity tp ON tp.TagName IN (
+    SELECT
+      SUBSTRING_INDEX(SUBSTRING_INDEX(p.Tags, '><', n.n), '><', -1)
+    FROM
+      (
+        SELECT 1 AS n UNION ALL
+        SELECT 2 UNION ALL
+        SELECT 3 UNION ALL
+        SELECT 4 UNION ALL
+        SELECT 5 UNION ALL
+        SELECT 6 UNION ALL
+        SELECT 7 UNION ALL
+        SELECT 8 UNION ALL
+        SELECT 9 UNION ALL
+        SELECT 10
+      ) n
+      INNER JOIN Posts p ON p.Id = pe.PostId
+    WHERE
+      n.n <= LENGTH(p.Tags) - LENGTH(REPLACE(p.Tags, '><', '')) + 1
+  )
+WHERE
+  ua.ReputationRank <= 100 -- Top 100 users by reputation
+  AND pe.ScoreRank <= 50 -- Top 50 posts by score
+  AND tp.DuplicateLinkCount > 5 -- Tags with more than 5 duplicate links
+  AND ua.DisplayName IS NOT NULL
+  AND pe.Title IS NOT NULL
+  AND tp.TagName IS NOT NULL
+ORDER BY
+  ua.Reputation DESC,
+  pe.Score DESC,
+  tp.LinkedPostCount DESC;

@@ -1,0 +1,333 @@
+with recent_posts as (
+  select
+    p.id,
+    p.posttypeid,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.owneruserid,
+    p.title,
+    p.tags,
+    coalesce(nullif(trim(p.ownerdisplayname), ''), u.displayname, '[anonymous]') as owner_name,
+    u.reputation,
+    case when p.posttypeid = 1 then p.answercount else null end as answercount
+  from posts p
+  left join users u on u.id = p.owneruserid
+  where p.creationdate >= (select max(creationdate) - interval '365 days' from posts)
+),
+tag_expanded as (
+  select
+    rp.*,
+    lower(trim(x.tag)) as tag
+  from recent_posts rp
+  cross join lateral unnest(string_to_array(substring(coalesce(rp.tags,''), 2, greatest(length(coalesce(rp.tags,'')) - 2, 0)), '><')) as x(tag)
+),
+score_buckets as (
+  select
+    rp.id,
+    rp.posttypeid,
+    rp.creationdate,
+    rp.score,
+    rp.viewcount,
+    rp.owner_name,
+    rp.reputation,
+    rp.title,
+    rp.answercount,
+    case
+      when rp.score >= 50 then '50+'
+      when rp.score >= 20 then '20-49'
+      when rp.score >= 10 then '10-19'
+      when rp.score >= 0 then '0-9'
+      else 'neg'
+    end as score_band
+  from recent_posts rp
+),
+comment_stats as (
+  select
+    c.postid,
+    count(*) as comment_count,
+    avg(c.score) as avg_comment_score,
+    sum(case when c.score > 0 then 1 else 0 end) filter (where c.userid is not null) as pos_user_comments,
+    max(c.creationdate) as last_comment_at
+  from comments c
+  group by c.postid
+),
+vote_rollup as (
+  select
+    v.postid,
+    sum(case when vt.name = 'UpMod' then 1 else 0 end) as upvotes,
+    sum(case when vt.name = 'DownMod' then 1 else 0 end) as downvotes,
+    sum(case when vt.name = 'Favorite' then 1 else 0 end) as favorites,
+    sum(case when vt.name in ('BountyStart','BountyClose') then coalesce(v.bountyamount,0) else 0 end) as bounty_total,
+    count(*) filter (where vt.name in ('Deletion','Undeletion','Spam')) as mod_events
+  from votes v
+  join votetypes vt on vt.id = v.votetypeid
+  where v.creationdate >= (select max(creationdate) - interval '365 days' from votes)
+  group by v.postid
+),
+postlink_dims as (
+  select
+    pl.postid,
+    sum(case when lt.name = 'Linked' then 1 else 0 end) as link_out_count,
+    sum(case when lt.name = 'Duplicate' then 1 else 0 end) as dup_out_count
+  from postlinks pl
+  join linktypes lt on lt.id = pl.linktypeid
+  group by pl.postid
+),
+dup_inbound as (
+  select
+    pl.relatedpostid as postid,
+    sum(case when lt.name = 'Duplicate' then 1 else 0 end) as dup_in_count
+  from postlinks pl
+  join linktypes lt on lt.id = pl.linktypeid
+  group by pl.relatedpostid
+),
+close_events as (
+  select
+    ph.postid,
+    count(*) filter (where ph.posthistorytypeid = 10) as close_votes,
+    count(*) filter (where ph.posthistorytypeid = 11) as reopen_votes,
+    max(ph.creationdate) filter (where ph.posthistorytypeid = 10) as closed_at,
+    max(ph.creationdate) filter (where ph.posthistorytypeid = 11) as reopened_at,
+    max(case when ph.posthistorytypeid = 10 then nullif(ph.comment,'') end) as last_close_reason_raw
+  from posthistory ph
+  where ph.posthistorytypeid in (10,11)
+  group by ph.postid
+),
+accepted_answers as (
+  select
+    q.id as question_id,
+    a.id as answer_id,
+    a.owneruserid as answerer_id,
+    a.score as answer_score,
+    a.creationdate as answer_date
+  from posts q
+  join posts a on a.id = q.acceptedanswerid
+),
+owner_badge_rank as (
+  select
+    b.userid,
+    count(*) filter (where b.class = 1) as gold,
+    count(*) filter (where b.class = 2) as silver,
+    count(*) filter (where b.class = 3) as bronze,
+    rank() over (order by count(*) filter (where b.class = 1) desc, count(*) filter (where b.class = 2) desc, count(*) filter (where b.class = 3) desc, min(b.date)) as badge_rank
+  from badges b
+  group by b.userid
+),
+tag_density as (
+  select
+    te.id,
+    count(distinct te.tag) as tag_count,
+    string_agg(distinct te.tag, ',' order by te.tag) as tags_csv
+  from tag_expanded te
+  group by te.id
+),
+activity_window as (
+  select
+    p.id,
+    p.creationdate,
+    p.lastactivitydate,
+    extract(epoch from coalesce(p.lastactivitydate, p.creationdate) - p.creationdate) / 3600.0 as hours_active,
+    percentile_disc(0.5) within group (order by coalesce(p.viewcount,0)) over () as median_views_overall
+  from posts p
+),
+owner_engagement as (
+  select
+    rp.owner_name,
+    count(*) as posts_count,
+    avg(coalesce(cs.comment_count,0)) as avg_comments_per_post,
+    avg(coalesce(vr.upvotes,0) - coalesce(vr.downvotes,0)) as avg_net_votes
+  from recent_posts rp
+  left join comment_stats cs on cs.postid = rp.id
+  left join vote_rollup vr on vr.postid = rp.id
+  group by rp.owner_name
+),
+question_answer_latency as (
+  select
+    q.id as question_id,
+    min(a.creationdate) - q.creationdate as first_answer_latency,
+    count(a.id) as answers_total
+  from posts q
+  left join posts a on a.parentid = q.id and a.posttypeid = 2
+  where q.posttypeid = 1
+  group by q.id, q.creationdate
+),
+post_quality as (
+  select
+    sb.id,
+    sb.posttypeid,
+    sb.score,
+    coalesce(vr.upvotes,0) as upvotes,
+    coalesce(vr.downvotes,0) as downvotes,
+    coalesce(cs.comment_count,0) as comments,
+    coalesce(vr.favorites,0) as favorites,
+    coalesce(pd.link_out_count,0) + coalesce(di.dup_in_count,0) as link_signal,
+    coalesce(qal.answers_total,0) as answers_total,
+    case
+      when sb.posttypeid = 1 and coalesce(qal.answers_total,0) = 0 and coalesce(ce.close_votes,0) > 0 then 'low'
+      when sb.score >= 20 or coalesce(vr.upvotes,0) - coalesce(vr.downvotes,0) >= 20 then 'high'
+      when sb.score < 0 and coalesce(ce.close_votes,0) > 0 then 'low'
+      when coalesce(vr.favorites,0) >= 5 then 'medium'
+      else 'medium'
+    end as quality_bucket
+  from score_buckets sb
+  left join vote_rollup vr on vr.postid = sb.id
+  left join comment_stats cs on cs.postid = sb.id
+  left join postlink_dims pd on pd.postid = sb.id
+  left join dup_inbound di on di.postid = sb.id
+  left join close_events ce on ce.postid = sb.id
+  left join question_answer_latency qal on qal.question_id = sb.id
+),
+user_activity_rank as (
+  select
+    rp.owner_name,
+    dense_rank() over (order by count(*) desc, avg(rp.score) desc nulls last) as activity_rank
+  from recent_posts rp
+  group by rp.owner_name
+),
+title_signals as (
+  select
+    rp.id,
+    length(coalesce(rp.title,'')) as title_len,
+    regexp_count(coalesce(rp.title,''), '\?') as qmarks,
+    regexp_count(lower(coalesce(rp.title,'')), '\b(how|why|what|best|issue|error)\b') as keyword_hits,
+    case when lower(coalesce(rp.title,'')) similar to '%(help|urgent|asap)%' then 1 else 0 end as needy_flag
+  from recent_posts rp
+),
+final as (
+  select
+    rp.id,
+    rp.posttypeid,
+    rp.creationdate,
+    rp.title,
+    td.tags_csv,
+    td.tag_count,
+    rp.owner_name,
+    rp.reputation,
+    sb.score_band,
+    pq.quality_bucket,
+    coalesce(vr.upvotes,0) as upvotes,
+    coalesce(vr.downvotes,0) as downvotes,
+    (coalesce(vr.upvotes,0) - coalesce(vr.downvotes,0)) as net_votes,
+    coalesce(vr.favorites,0) as favorites,
+    coalesce(vr.bounty_total,0) as bounty_total,
+    coalesce(cs.comment_count,0) as comment_count,
+    cs.avg_comment_score,
+    cs.last_comment_at,
+    ce.close_votes,
+    ce.reopen_votes,
+    ce.closed_at,
+    ce.reopened_at,
+    nullif(trim(ce.last_close_reason_raw), '') as last_close_reason_raw,
+    coalesce(pd.link_out_count,0) as link_out_count,
+    coalesce(di.dup_in_count,0) as dup_in_count,
+    aw.hours_active,
+    aw.median_views_overall,
+    ts.title_len,
+    ts.qmarks,
+    ts.keyword_hits,
+    ts.needy_flag,
+    oar.posts_count as owner_posts_count,
+    oar.avg_comments_per_post,
+    oar.avg_net_votes,
+    uar.activity_rank,
+    obr.gold,
+    obr.silver,
+    obr.bronze,
+    obr.badge_rank,
+    aa.answer_id as accepted_answer_id,
+    aa.answer_score as accepted_answer_score,
+    qal.first_answer_latency
+  from recent_posts rp
+  left join score_buckets sb on sb.id = rp.id
+  left join tag_density td on td.id = rp.id
+  left join comment_stats cs on cs.postid = rp.id
+  left join vote_rollup vr on vr.postid = rp.id
+  left join postlink_dims pd on pd.postid = rp.id
+  left join dup_inbound di on di.postid = rp.id
+  left join close_events ce on ce.postid = rp.id
+  left join activity_window aw on aw.id = rp.id
+  left join title_signals ts on ts.id = rp.id
+  left join owner_engagement oar on oar.owner_name = rp.owner_name
+  left join user_activity_rank uar on uar.owner_name = rp.owner_name
+  left join owner_badge_rank obr on obr.userid = rp.owneruserid
+  left join accepted_answers aa on aa.question_id = rp.id
+  left join question_answer_latency qal on qal.question_id = rp.id
+),
+ranked as (
+  select
+    f.*,
+    row_number() over (
+      partition by f.quality_bucket
+      order by (f.net_votes + f.favorites*2 + coalesce(f.accepted_answer_score,0)) desc
+    ) as quality_rownum,
+    percent_rank() over (order by f.net_votes) as net_vote_pct,
+    ntile(10) over (order by coalesce(f.viewcount,0)) as view_ntile
+  from (
+    select
+      final.*,
+      p.viewcount
+    from final
+    join posts p on p.id = final.id
+  ) f
+)
+select
+  r.id,
+  r.posttypeid,
+  r.creationdate,
+  r.title,
+  r.tags_csv,
+  r.tag_count,
+  r.owner_name,
+  r.reputation,
+  r.score_band,
+  r.quality_bucket,
+  r.upvotes,
+  r.downvotes,
+  r.net_votes,
+  r.net_vote_pct,
+  r.favorites,
+  r.bounty_total,
+  r.comment_count,
+  r.avg_comment_score,
+  r.last_comment_at,
+  r.close_votes,
+  r.reopen_votes,
+  r.closed_at,
+  r.reopened_at,
+  r.last_close_reason_raw,
+  r.link_out_count,
+  r.dup_in_count,
+  r.hours_active,
+  r.median_views_overall,
+  r.title_len,
+  r.qmarks,
+  r.keyword_hits,
+  r.needy_flag,
+  r.owner_posts_count,
+  r.avg_comments_per_post,
+  r.avg_net_votes,
+  r.activity_rank,
+  r.gold,
+  r.silver,
+  r.bronze,
+  r.badge_rank,
+  r.accepted_answer_id,
+  r.accepted_answer_score,
+  r.first_answer_latency,
+  r.quality_rownum,
+  r.view_ntile
+from ranked r
+where
+  (
+    r.quality_bucket = 'high' and r.quality_rownum <= 50
+  ) or (
+    r.quality_bucket <> 'high' and coalesce(r.net_votes, -999) >= (
+      select percentile_disc(0.75) within group (order by coalesce(vr.upvotes,0) - coalesce(vr.downvotes,0))
+      from vote_rollup vr
+    )
+  )
+order by
+  r.quality_bucket asc,
+  r.quality_rownum asc,
+  r.net_votes desc;

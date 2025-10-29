@@ -1,0 +1,52 @@
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    MAX(u.CreationDate) AS LatestAccountActivity,
+    MAX(p.LastActivityDate) AS LatestPostActivity,
+    AVG(p.Score) AS AvgPostScore,
+    MAX(ph.CreationDate) AS LatestPostHistoryEntry,
+    SUM(CASE WHEN v_up.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotes,
+    SUM(CASE WHEN v_down.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotes,
+    COALESCE(string_agg(DISTINCT t.TagName, ', '), '') AS Tags,
+    SUM(CASE WHEN b_gold.Class = 1 THEN 1 ELSE 0 END) AS GoldBadgeCount,
+    SUM(CASE WHEN b_silver.Class = 2 THEN 1 ELSE 0 END) AS SilverBadgeCount,
+    SUM(CASE WHEN b_bronze.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadgeCount
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN
+    Votes v_up ON v_up.PostId = p.Id AND v_up.VoteTypeId = 2
+LEFT JOIN
+    Votes v_down ON v_down.PostId = p.Id AND v_down.VoteTypeId = 3
+LEFT JOIN
+    PostTags pt ON pt.PostId = p.Id
+LEFT JOIN
+    Tags t ON t.Id = pt.TagId
+LEFT JOIN
+    Badges b_all ON b_all.UserId = u.Id
+LEFT JOIN
+    Badges b_gold ON b_gold.UserId = u.Id AND b_gold.Class = 1
+LEFT JOIN
+    Badges b_silver ON b_silver.UserId = u.Id AND b_silver.Class = 2
+LEFT JOIN
+    Badges b_bronze ON b_bronze.UserId = u.Id AND b_bronze.Class = 3
+WHERE 
+    u.Reputation > 10000
+GROUP BY 
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    ph.CreationDate
+HAVING 
+    COUNT(DISTINCT p.Id) > 100
+ORDER BY 
+    u.Reputation DESC, 
+    TotalPosts DESC;

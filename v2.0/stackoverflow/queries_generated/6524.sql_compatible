@@ -1,0 +1,43 @@
+SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 1 THEN p.Id END) AS TotalQuestions,
+    AVG(p.Score) AS AvgScore,
+    MAX(p.LastActivityDate) AS LastActive,
+    MAX(CASE WHEN p.PostTypeId = 1 THEN p.LastEditDate END) AS LastQuestionEdit,
+    SUM(v.BountyAmount) AS TotalBounty,
+    MAX(b.Date) AS LastBadgeEarned,
+    MAX(CASE WHEN p.PostTypeId = 1 THEN p.ClosedDate END) AS LastClosedQuestion,
+    MAX(CASE WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN p.LastEditDate END) AS LastAnsweredQuestion,
+    MAX(CASE WHEN pl.LinkTypeId = 3 THEN p.Id END) AS DuplicatePostId,
+    MAX(CASE WHEN pl.LinkTypeId = 1 THEN p.Id END) AS LinkedPostId,
+    -- emulate MySQL GROUP_CONCAT+SUBSTRING_INDEX for top 10 tags is dialect-specific; simple concatenation ordered by tag
+    STRING_AGG(DISTINCT p.Tags, ',') WITHIN GROUP (ORDER BY p.Tags) AS TopTags
+FROM
+    Users u
+LEFT JOIN
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN
+    PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN
+    Votes v ON p.Id = v.PostId
+LEFT JOIN
+    Badges b ON u.Id = b.UserId
+LEFT JOIN
+    PostLinks pl ON p.Id = pl.PostId
+WHERE
+    u.Reputation > 10000
+    AND (p.CreationDate IS NULL OR p.CreationDate >= (cast('2024-10-01' as date) - INTERVAL '1' YEAR))
+    AND (ph.PostHistoryTypeId IN (1, 2) OR ph.PostHistoryTypeId IS NULL)
+GROUP BY
+    u.Id,
+    u.DisplayName,
+    u.Reputation
+HAVING
+    AVG(p.Score) > 100
+    OR SUM(v.BountyAmount) > 1000
+ORDER BY
+    TotalPosts DESC,
+    AvgScore DESC;

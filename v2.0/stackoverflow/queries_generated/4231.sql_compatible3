@@ -1,0 +1,177 @@
+WITH RECURSIVE PostHierarchy AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        CAST(NULL AS INTEGER) AS ParentPostId,
+        0 AS Depth
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+    UNION ALL
+    SELECT
+        a.Id AS PostId,
+        a.Title,
+        a.OwnerUserId,
+        a.PostTypeId,
+        a.CreationDate,
+        a.Score,
+        a.AnswerCount,
+        a.CommentCount,
+        a.FavoriteCount,
+        a.ClosedDate,
+        ph.PostId AS ParentPostId,
+        ph.Depth + 1 AS Depth
+    FROM Posts a
+    JOIN PostHierarchy ph ON a.ParentId = ph.PostId
+    WHERE a.PostTypeId = 2
+),
+UserPostStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT ph.PostId) AS TotalPosts,
+        SUM(CASE WHEN ph.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN ph.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        AVG(ph.Score) AS AvgPostScore,
+        MAX(ph.CreationDate) AS LastPostDate,
+        SUM(ph.FavoriteCount) AS TotalFavoritesGiven,
+        COUNT(DISTINCT v.Id) AS TotalUpVotesReceived,
+        SUM(CASE WHEN ph.ClosedDate IS NOT NULL THEN 1 ELSE 0 END) AS TotalClosedPosts
+    FROM Users u
+    LEFT JOIN PostHierarchy ph ON u.Id = ph.OwnerUserId
+    LEFT JOIN Votes v ON ph.PostId = v.PostId AND v.VoteTypeId = 2
+    GROUP BY u.Id, u.DisplayName
+),
+TagPopularity AS (
+    SELECT
+        t.TagName,
+        COUNT(DISTINCT p.Id) AS TaggedQuestionCount,
+        SUM(p.AnswerCount) AS TotalAnswersForTag,
+        AVG(p.Score) AS AvgQuestionScoreForTag,
+        MAX(p.CreationDate) AS LastQuestionDateForTag
+    FROM Tags t
+    JOIN Posts p ON p.PostTypeId = 1
+    JOIN (
+        SELECT
+            p2.Id AS PostId,
+            REGEXP_REPLACE(p2.Tags, '^<|>$', '') AS TagsTrimmed
+        FROM Posts p2
+        WHERE p2.PostTypeId = 1
+    ) ptrim ON ptrim.PostId = p.Id
+    JOIN (
+        SELECT
+            pt.PostId,
+            TRIM(tag) AS TagValue
+        FROM (
+            SELECT
+                PostId,
+                UNNEST(string_to_array(TagsTrimmed, '><')) AS tag
+            FROM (
+                SELECT
+                    p3.PostId,
+                    p3.TagsTrimmed
+                FROM (
+                    SELECT p2.Id AS PostId, REGEXP_REPLACE(p2.Tags, '^<|>$', '') AS TagsTrimmed
+                    FROM Posts p2
+                    WHERE p2.PostTypeId = 1
+                ) p3
+            ) sub
+        ) pt
+    ) split ON split.PostId = p.Id
+    WHERE split.TagValue = t.TagName
+    GROUP BY t.TagName
+)
+SELECT
+    ph.PostId,
+    ph.Title,
+    ph.Depth,
+    u.DisplayName AS PostOwnerDisplayName,
+    u.Reputation AS PostOwnerReputation,
+    ph.Score AS PostScore,
+    ph.AnswerCount AS PostAnswerCount,
+    ph.CommentCount AS PostCommentCount,
+    ph.FavoriteCount AS PostFavoriteCount,
+    ph.ClosedDate,
+    CASE
+        WHEN ph.ClosedDate IS NOT NULL AND ph.PostTypeId = 1 THEN
+            (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = ph.PostId AND pl.LinkTypeId = 3)
+        ELSE 0
+    END AS DuplicateLinksCount,
+    COALESCE(ups.TotalUpVotesReceived, 0) AS PostUpvotesCount,
+    COALESCE(t.TaggedQuestionCount, 0) AS TaggedQuestionsCount,
+    COALESCE(t.TotalAnswersForTag, 0) AS TotalAnswersForTag,
+    COALESCE(t.AvgQuestionScoreForTag, 0) AS AvgQuestionScoreForTag,
+    CASE
+        WHEN u.Id IS NOT NULL THEN
+            (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1)
+        ELSE 0
+    END AS UserGoldBadges,
+    CASE
+        WHEN u.Id IS NOT NULL THEN
+            (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2)
+        ELSE 0
+    END AS UserSilverBadges,
+    CASE
+        WHEN u.Id IS NOT NULL THEN
+            (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3)
+        ELSE 0
+    END AS UserBronzeBadges,
+    (
+        SELECT COUNT(ph2.Id)
+        FROM PostHistory ph2
+        WHERE ph2.PostId = ph.PostId
+        AND ph2.PostHistoryTypeId IN (4, 5, 6)
+        AND ph2.UserId IS NOT NULL
+        AND ph2.UserId <> ph.OwnerUserId
+    ) AS OtherUserEditsCount,
+    CASE WHEN u.WebsiteUrl IS NOT NULL AND u.WebsiteUrl <> '' THEN 'HasWebsite' ELSE 'NoWebsite' END AS UserWebsiteStatus,
+    DATE_PART('day', CAST('2024-10-01 12:34:56' AS TIMESTAMP) - u.CreationDate) AS UserAgeInDays,
+    DATE_PART('day', CAST('2024-10-01 12:34:56' AS TIMESTAMP) - ph.CreationDate) AS PostAgeWhenClosedOrNow
+FROM PostHierarchy ph
+LEFT JOIN Users u ON ph.OwnerUserId = u.Id
+LEFT JOIN UserPostStats ups ON u.Id = ups.UserId
+LEFT JOIN TagPopularity t ON ph.Title LIKE '%' || t.TagName || '%'
+WHERE ph.Depth <= 2
+AND ph.Score > 10
+AND u.Reputation > 1000
+AND EXISTS (
+    SELECT 1
+    FROM Comments c
+    WHERE c.PostId = ph.PostId
+    AND c.Score < 0
+    AND c.UserId IS NOT NULL
+)
+UNION ALL
+SELECT
+    CAST(NULL AS INTEGER) AS PostId,
+    CAST(NULL AS VARCHAR) AS Title,
+    CAST(NULL AS INTEGER) AS Depth,
+    CAST(NULL AS VARCHAR) AS PostOwnerDisplayName,
+    CAST(NULL AS INTEGER) AS PostOwnerReputation,
+    CAST(NULL AS INTEGER) AS PostScore,
+    CAST(NULL AS INTEGER) AS PostAnswerCount,
+    CAST(NULL AS INTEGER) AS PostCommentCount,
+    CAST(NULL AS INTEGER) AS PostFavoriteCount,
+    CAST(NULL AS TIMESTAMP) AS ClosedDate,
+    CAST(NULL AS INTEGER) AS DuplicateLinksCount,
+    CAST(NULL AS INTEGER) AS PostUpvotesCount,
+    tp.TagName,
+    CAST(NULL AS INTEGER) AS TotalAnswersForTag,
+    CAST(NULL AS NUMERIC) AS AvgQuestionScoreForTag,
+    CAST(NULL AS INTEGER) AS UserGoldBadges,
+    CAST(NULL AS INTEGER) AS UserSilverBadges,
+    CAST(NULL AS INTEGER) AS UserBronzeBadges,
+    CAST(NULL AS INTEGER) AS OtherUserEditsCount,
+    CAST(NULL AS VARCHAR) AS UserWebsiteStatus,
+    CAST(NULL AS NUMERIC) AS UserAgeInDays,
+    CAST(NULL AS NUMERIC) AS PostAgeWhenClosedOrNow
+FROM TagPopularity tp
+WHERE tp.TaggedQuestionCount > 1000
+ORDER BY PostScore DESC NULLS LAST;

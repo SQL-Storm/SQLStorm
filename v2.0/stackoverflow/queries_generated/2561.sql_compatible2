@@ -1,0 +1,116 @@
+with RecursiveUserBadges as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class,
+        row_number() over (partition by u.Id order by b.Class, b.Date desc) as rn
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    where (b.TagBased = false) or (b.TagBased is null)
+),
+UserTopBadges as (
+    select UserId, DisplayName, BadgeName, Class
+    from RecursiveUserBadges
+    where rn <= 3
+),
+PostScoreStats as (
+    select 
+        p.OwnerUserId,
+        count(case when p.PostTypeId = 1 then 1 end) as QuestionCount,
+        count(case when p.PostTypeId = 2 then 1 end) as AnswerCount,
+        coalesce(avg(p.Score),0) as AvgScore,
+        max(p.Score) as MaxScore,
+        min(p.Score) as MinScore,
+        sum(coalesce(p.ViewCount,0)) as TotalViews
+    from Posts p
+    where p.OwnerUserId is not null
+    group by p.OwnerUserId
+),
+ClosedQuestions as (
+    select
+        p.Id,
+        p.OwnerUserId,
+        pht.Name as CloseReason,
+        ph.CreationDate as CloseDate
+    from Posts p
+    inner join PostHistory ph on p.Id = ph.PostId
+    inner join PostHistoryTypes pht on ph.PostHistoryTypeId = pht.Id
+    where p.PostTypeId = 1 and pht.Name like 'Post Closed%'
+),
+UserQuestionWindow as (
+    select
+        p.Id,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate) as QuestionNumber,
+        count(*) over (partition by p.OwnerUserId) as TotalQuestions,
+        lag(p.Score) over (partition by p.OwnerUserId order by p.CreationDate) as PrevScore
+    from Posts p
+    where p.PostTypeId = 1 and p.OwnerUserId is not null
+),
+DuplicateLinks as (
+    select pl.PostId, pl.RelatedPostId, u.DisplayName as OwnerDisplayName, p.OwnerUserId
+    from PostLinks pl
+    join LinkTypes lt on pl.LinkTypeId = lt.Id
+    join Posts p on pl.PostId = p.Id
+    join Users u on p.OwnerUserId = u.Id
+    where lt.Name = 'Duplicate'
+),
+UserRecentComments as (
+    select 
+        c.UserId,
+        u.DisplayName,
+        count(*) as CommentCount,
+        max(c.CreationDate) as LastCommentDate
+    from Comments c
+    join Users u on c.UserId = u.Id
+    group by c.UserId, u.DisplayName
+)
+select 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.Location,
+    coalesce(ps.QuestionCount,0) as QuestionsPosted,
+    coalesce(ps.AnswerCount,0) as AnswersPosted,
+    round(ps.AvgScore,2) as AveragePostScore,
+    ps.MaxScore,
+    ps.MinScore,
+    ps.TotalViews,
+    coalesce(rc.CommentCount,0) as CommentsMade,
+    rc.LastCommentDate,
+    -- use aggregate without DISTINCT + ORDER BY by aggregating (class, badgename) then extracting names
+    array_agg(utb.BadgeName) filter (where utb.BadgeName is not null) as TopBadges,
+    dup.CountDuplicateLinks,
+    closed.CloseCount,
+    closed.ReasonSummary,
+    qwin.QuestionNumber,
+    qwin.TotalQuestions,
+    case when qwin.PrevScore is null then 'N/A' else concat('PrevScore:', qwin.PrevScore) end as PreviousQuestionScore
+from Users u
+left join PostScoreStats ps on u.Id = ps.OwnerUserId
+left join UserRecentComments rc on u.Id = rc.UserId
+left join (
+    select OwnerUserId as UserId, count(*) as CountDuplicateLinks
+    from DuplicateLinks
+    group by OwnerUserId
+) dup on u.Id = dup.UserId
+left join (
+    select OwnerUserId, count(*) as CloseCount, string_agg(distinct CloseReason, ', ') as ReasonSummary
+    from ClosedQuestions
+    group by OwnerUserId
+) closed on u.Id = closed.OwnerUserId
+left join UserQuestionWindow qwin on u.Id = qwin.OwnerUserId and qwin.QuestionNumber = 1
+left join UserTopBadges utb on u.Id = utb.UserId
+group by 
+    u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location, ps.QuestionCount, ps.AnswerCount, ps.AvgScore, ps.MaxScore, ps.MinScore, ps.TotalViews,
+    rc.CommentCount, rc.LastCommentDate, dup.CountDuplicateLinks,
+    closed.CloseCount, closed.ReasonSummary, qwin.QuestionNumber, qwin.TotalQuestions, qwin.PrevScore
+having 
+    (coalesce(ps.QuestionCount,0) > 5 or coalesce(ps.AnswerCount,0) > 10) 
+    and (rc.CommentCount > 20 or rc.CommentCount is null)
+order by u.Reputation desc nulls last, QuestionsPosted desc nulls last
+limit 100;

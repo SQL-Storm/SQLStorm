@@ -1,0 +1,89 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.Title,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.LastActivityDate,
+        U.DisplayName AS OwnerDisplayName,
+        U.Reputation,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.ViewCount DESC) AS "Rank"
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId = 1 AND P.Score > 0 AND P.ViewCount > 100
+),
+BadgeCounts AS (
+    SELECT 
+        U.Id AS UserId, 
+        U.DisplayName, 
+        COUNT(B.Id) AS BadgeCount
+    FROM 
+        Users U
+    JOIN 
+        Badges B ON U.Id = B.UserId
+    GROUP BY 
+        U.Id, U.DisplayName
+),
+CommentStats AS (
+    SELECT 
+        P.Id AS PostId, 
+        COUNT(C.Id) AS CommentCount
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Comments C ON P.Id = C.PostId
+    GROUP BY 
+        P.Id
+)
+SELECT 
+    RP.Id AS PostId,
+    RP.Title,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.LastActivityDate,
+    RP."Rank" AS Rank,
+    COALESCE(BC.BadgeCount, 0) AS BadgeCount,
+    (SELECT LISTAGG(DISTINCT CL.Name, ', ') WITHIN GROUP (ORDER BY CL.Name) FROM CloseReasonTypes CL WHERE CL.Id = PH.CloseReasonId) AS CloseReason,
+    COALESCE(CS.CommentCount, 0) AS CommentCount,
+    U.Reputation,
+    U.DisplayName AS OwnerDisplayName,
+    CASE 
+        WHEN RP.Score > 100 THEN 'High'
+        WHEN RP.Score BETWEEN 50 AND 100 THEN 'Medium'
+        ELSE 'Low'
+    END AS ScoreTier,
+    CASE 
+        WHEN RP.ViewCount > 1000 THEN 'Popular'
+        WHEN RP.ViewCount BETWEEN 500 AND 1000 THEN 'Moderate'
+        ELSE 'Less Popular'
+    END AS ViewTier
+FROM 
+    RankedPosts RP
+LEFT JOIN 
+    BadgeCounts BC ON RP.OwnerDisplayName = BC.DisplayName
+LEFT JOIN 
+    CommentStats CS ON RP.Id = CS.PostId
+LEFT JOIN 
+    Users U ON RP.OwnerDisplayName = U.DisplayName
+LEFT JOIN 
+    PostHistory PH ON RP.Id = PH.PostId AND PH.PostHistoryTypeId = 10
+GROUP BY
+    RP.Id,
+    RP.Title,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.LastActivityDate,
+    RP."Rank",
+    BC.BadgeCount,
+    PH.CloseReasonId,
+    CS.CommentCount,
+    U.Reputation,
+    U.DisplayName
+ORDER BY 
+    RP.Score DESC, RP.ViewCount DESC;

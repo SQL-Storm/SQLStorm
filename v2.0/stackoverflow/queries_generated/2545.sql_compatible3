@@ -1,0 +1,148 @@
+with RecursiveUserBadges as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class,
+        row_number() over (partition by u.Id order by b.Date desc) as BadgeRank
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    where u.Reputation > 1000
+),
+TopUserBadges as (
+    select * from RecursiveUserBadges where BadgeRank <= 3
+),
+UserActivity as (
+    select
+        u.Id,
+        u.DisplayName,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionsAsked,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswersGiven,
+        count(distinct c.Id) as CommentsMade,
+        coalesce(sum(case when v.VoteTypeId = 2 then 1 else 0 end),0) as TotalUpvotesGiven,
+        coalesce(sum(case when v.VoteTypeId = 3 then 1 else 0 end),0) as TotalDownvotesGiven,
+        case 
+            when count(p.Id) = 0 then null 
+            else round(avg(p.Score),2) 
+        end as AvgPostScore,
+        greatest(
+            coalesce(max(p.LastActivityDate), timestamp '1970-01-01'),
+            coalesce(max(c.CreationDate), timestamp '1970-01-01')
+        ) as LastActivity
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+QuestionDuplicates as (
+    select pl.PostId, count(distinct pl.RelatedPostId) as DuplicateCount
+    from PostLinks pl
+    inner join LinkTypes lt on lt.Id = pl.LinkTypeId and lt.Name = 'Duplicate'
+    group by pl.PostId
+),
+PostScores as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        (select count(*) from Comments c where c.PostId = p.Id) as CommentCount,
+        case when p.ClosedDate is not null then 1 else 0 end as IsClosed,
+        coalesce(qd.DuplicateCount, 0) as DuplicateCount
+    from Posts p
+    left join QuestionDuplicates qd on p.Id = qd.PostId
+    where p.PostTypeId in (1, 2)
+),
+AnswerRanks as (
+    select
+        p.Id,
+        p.ParentId,
+        p.Score,
+        row_number() over (partition by p.ParentId order by p.Score desc, p.CreationDate asc) as AnswerRank
+    from Posts p
+    where p.PostTypeId = 2 and p.ParentId is not null
+),
+HighScoringAcceptedAnswers as (
+    select 
+        p.Id as QuestionId,
+        p.Title,
+        a.Id as AcceptedAnswerId,
+        a.Score as AcceptedAnswerScore,
+        ar.AnswerRank
+    from Posts p
+    inner join Posts a on a.Id = p.AcceptedAnswerId
+    inner join AnswerRanks ar on ar.Id = a.Id
+    where p.PostTypeId = 1 and a.Score > 10 and ar.AnswerRank > 1
+),
+TagPopularity as (
+    select 
+        unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')) as Tag,
+        count(*) as TagUsageCount,
+        avg(p.Score) as AvgScorePerTag
+    from Posts p
+    where p.PostTypeId = 1
+    group by unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><'))
+),
+RecentEdits as (
+    select
+        ph_info.PostId,
+        max(ph_info.MaxCreationDate) as LastEditDate,
+        json_agg(ph_info.UserId order by ph_info.MaxCreationDate desc) as EditorsUserIds
+    from (
+        select ph.PostId, ph.UserId, max(ph.CreationDate) as MaxCreationDate
+        from PostHistory ph
+        where ph.PostHistoryTypeId in (4,5,6) and ph.UserId is not null
+        group by ph.PostId, ph.UserId
+    ) ph_info
+    group by ph_info.PostId
+)
+select 
+    ua.UserId,
+    ua.DisplayName,
+    ua.QuestionsAsked,
+    ua.AnswersGiven,
+    ua.CommentsMade,
+    ua.TotalUpvotesGiven,
+    ua.TotalDownvotesGiven,
+    ua.AvgPostScore,
+    ua.LastActivity,
+    string_agg(distinct tub.BadgeName || '(' || 
+        case tub.Class 
+            when 1 then 'Gold' 
+            when 2 then 'Silver' 
+            when 3 then 'Bronze' 
+            else 'Unknown' end || ')', ', ') as TopBadges,
+    ps.Id as PostId,
+    ps.Title as PostTitle,
+    ps.PostTypeId,
+    ps.Score as PostScore,
+    ps.ViewCount,
+    ps.CommentCount,
+    ps.IsClosed,
+    ps.DuplicateCount,
+    re.LastEditDate,
+    rank() over (partition by ua.UserId order by ps.Score desc) as PostScoreRank,
+    array_agg(distinct tp.Tag || ':' || cast(tp.TagUsageCount as varchar) || '(' || cast(round(tp.AvgScorePerTag,2) as varchar) || ')') filter (
+        where ps.Tags is not null and tp.Tag is not null and strpos(ps.Tags, '<' || tp.Tag || '>') > 0
+    ) as PostTagsPopularity,
+    exists (
+        select 1 from HighScoringAcceptedAnswers hsa where hsa.QuestionId = ps.Id
+    ) as HasHighScoreAcceptedAnswerNotTopRank,
+    ua.UserId as grp_UserId
+from UserActivity ua
+left join TopUserBadges tub on tub.UserId = ua.UserId
+left join PostScores ps on ps.OwnerUserId = ua.UserId
+left join RecentEdits re on re.PostId = ps.Id
+left join TagPopularity tp on strpos(ps.Tags, '<' || tp.Tag || '>') > 0
+where ua.LastActivity > (timestamp '2024-10-01 12:34:56' - interval '180 day')
+group by ua.UserId, ua.DisplayName, ua.QuestionsAsked, ua.AnswersGiven, ua.CommentsMade,
+    ua.TotalUpvotesGiven, ua.TotalDownvotesGiven, ua.AvgPostScore, ua.LastActivity,
+    ps.Id, ps.Title, ps.PostTypeId, ps.Score, ps.ViewCount, ps.CommentCount, ps.IsClosed,
+    ps.DuplicateCount, re.LastEditDate, ua.UserId
+order by ua.UserId, ps.Score desc
+limit 100;

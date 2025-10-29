@@ -1,0 +1,107 @@
+WITH
+RecentTopPosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.PostTypeId,
+    ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.ViewCount DESC, p.Score DESC, p.CreationDate DESC) AS rn
+  FROM Posts p
+  WHERE p.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days'
+),
+TagRelations AS (
+  SELECT
+    t.TagName,
+    rp.PostId,
+    rp.Title,
+    rp.Score,
+    rp.ViewCount,
+    rp.CreationDate,
+    rp.OwnerUserId,
+    rp.LastActivityDate,
+    rp.PostTypeId
+  FROM RecentTopPosts rp
+  CROSS JOIN LATERAL (
+    SELECT unnest(string_to_array(substr(rp.Tags, 2, LENGTH(rp.Tags)-2), '><')) AS TagName
+  ) AS t
+  WHERE rp.PostTypeId = 1
+),
+UserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT tp.PostId) AS PostsViewed,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesGiven,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesGiven,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN COALESCE(v.BountyAmount,0) ELSE 0 END) AS BountiesEarned
+  FROM Users u
+  LEFT JOIN Posts tp ON tp.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.PostId = tp.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopBadgeWinners AS (
+  SELECT
+    b.UserId,
+    b.Name AS BadgeName,
+    b.Date,
+    b.Class
+  FROM Badges b
+  WHERE b.TagBased = 0
+    AND b.Class IN (1,2,3)
+),
+Combined AS (
+  SELECT
+    tr.PostId,
+    tr.Title,
+    NULL AS Tags,
+    tr.Score,
+    tr.ViewCount,
+    tr.CreationDate,
+    tr.LastActivityDate,
+    tr.OwnerUserId,
+    'Tag' AS Source,
+    tr.TagName
+  FROM TagRelations tr
+  UNION ALL
+  SELECT
+    u.UserId,
+    NULL AS Title,
+    NULL AS Tags,
+    NULL AS Score,
+    NULL AS ViewCount,
+    NULL AS CreationDate,
+    NULL AS LastActivityDate,
+    NULL AS OwnerUserId,
+    'User' AS Source,
+    NULL AS TagName
+  FROM UserActivity u
+)
+SELECT
+  COALESCE(c.PostId, uact.UserId) AS EntityId,
+  c.Source,
+  c.Title,
+  c.Tags,
+  c.Score,
+  c.ViewCount,
+  c.CreationDate,
+  c.LastActivityDate,
+  usr.DisplayName AS OwnerDisplayName,
+  usr.Reputation,
+  b.BadgeName,
+  b.Date AS BadgeDate,
+  b.Class AS BadgeClass
+FROM
+  Combined c
+  LEFT JOIN Users usr ON c.OwnerUserId = usr.Id
+  LEFT JOIN UserActivity uact ON c.Source = 'User' AND c.PostId IS NULL AND uact.UserId = c.PostId -- keeps join safe for User rows
+  LEFT JOIN TopBadgeWinners b ON b.UserId = usr.Id
+ORDER BY
+  CASE WHEN c.Source = 'Tag' THEN 1 ELSE 2 END,
+  c.CreationDate DESC
+LIMIT 100;

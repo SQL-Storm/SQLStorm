@@ -1,0 +1,271 @@
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        COALESCE(U.DisplayName, 'Anonymous User') AS DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS UserTotalUpVotes,
+        U.DownVotes AS UserTotalDownVotes,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswers,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        MAX(COALESCE(P.LastActivityDate, P.CreationDate, C.CreationDate, B.Date, U.LastAccessDate)) AS LastKnownActivity,
+        AVG(CASE WHEN P.Score IS NOT NULL THEN P.Score ELSE 0 END) AS AvgPostScore,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN P.ViewCount ELSE 0 END) AS TotalQuestionViews,
+        MIN(U.CreationDate) OVER (PARTITION BY U.AccountId) AS FirstAccountCreationDate
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate,
+        U.Views, U.UpVotes, U.DownVotes, U.AccountId
+),
+PostDetailsExtended AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.OwnerUserId,
+        COALESCE(P.Title, 'N/A') AS PostTitle,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.LastActivityDate,
+        P.AcceptedAnswerId,
+        P.ParentId,
+        P.Tags,
+        CASE WHEN P.Tags IS NULL OR P.Tags = '' THEN NULL
+             ELSE string_to_array(substring(P.Tags FROM 2 FOR char_length(P.Tags) - 2), '><')
+        END AS TagArray,
+        CASE
+            WHEN P.ClosedDate IS NOT NULL AND P.PostTypeId = 1 THEN 'Closed Question'
+            WHEN P.CommunityOwnedDate IS NOT NULL THEN 'Community Wiki'
+            WHEN P.AcceptedAnswerId IS NOT NULL THEN 'Has Accepted Answer'
+            WHEN P.PostTypeId = 1 AND P.AnswerCount = 0 THEN 'Unanswered Question'
+            ELSE 'Open'
+        END AS PostStatus,
+        COUNT(DISTINCT PH.Id) AS RevisionCount,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId, P.PostTypeId ORDER BY P.CreationDate DESC) AS rn_user_posttype,
+        LAG(P.CreationDate, 1, P.CreationDate) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate) AS PreviousPostDate,
+        -- compute last edit timestamp per post and difference to previous such edit
+        (
+          MAX(CASE WHEN PH.PostHistoryTypeId IN (4,5,6) THEN PH.CreationDate END) OVER (PARTITION BY P.Id)
+          - LAG(MAX(CASE WHEN PH.PostHistoryTypeId IN (4,5,6) THEN PH.CreationDate END) OVER (PARTITION BY P.Id), 1, P.CreationDate) OVER ()
+        ) AS TimeBetweenEdits
+    FROM Posts P
+    INNER JOIN PostTypes PT ON P.PostTypeId = PT.Id
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    LEFT JOIN Votes V ON P.Id = V.PostId
+    GROUP BY
+        P.Id, P.PostTypeId, PT.Name, P.OwnerUserId, P.Title, P.CreationDate, P.Score,
+        P.ViewCount, P.AnswerCount, P.CommentCount, P.FavoriteCount, P.LastActivityDate,
+        P.AcceptedAnswerId, P.ParentId, P.Tags, P.ClosedDate, P.CommunityOwnedDate
+),
+TagPerformanceMetrics AS (
+    SELECT
+        T.TagName,
+        T.Id AS TagId,
+        COUNT(DISTINCT Q.PostId) AS TotalQuestionsWithTag,
+        AVG(Q.PostScore) AS AvgQuestionScoreForTag,
+        MAX(Q.PostCreationDate) AS LatestQuestionActivity,
+        (
+         SELECT U.DisplayName
+         FROM Users U
+         JOIN (
+             SELECT PDE.OwnerUserId, SUM(PDE.PostScore) AS TotalScore
+             FROM PostDetailsExtended PDE
+             WHERE PDE.PostTypeId = 1
+               AND PDE.Tags LIKE '%' || '<' || T.TagName || '>' || '%'
+             GROUP BY PDE.OwnerUserId
+             ORDER BY TotalScore DESC, PDE.OwnerUserId
+             LIMIT 1
+         ) TagTopUser ON U.Id = TagTopUser.OwnerUserId
+        ) AS TopContributingUserForTag,
+        SUM(CASE WHEN Q.PostStatus = 'Closed Question' THEN 1 ELSE 0 END) AS ClosedQuestionsCount
+    FROM Tags T
+    INNER JOIN PostDetailsExtended Q ON Q.PostTypeId = 1 AND Q.Tags LIKE '%' || '<' || T.TagName || '>' || '%'
+    GROUP BY T.TagName, T.Id
+),
+UserBadgeOverview AS (
+    SELECT
+        B.UserId,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(B.Date) AS LatestBadgeDate,
+        (SELECT Name FROM Badges b2 WHERE b2.UserId = B.UserId ORDER BY b2.Date DESC LIMIT 1) AS MostRecentBadgeName
+    FROM Badges B
+    GROUP BY B.UserId
+)
+
+SELECT
+    UAS.UserId,
+    UAS.DisplayName,
+    UAS.Reputation,
+    UAS.UserCreationDate,
+    UAS.LastKnownActivity,
+    UAS.TotalPosts,
+    UAS.TotalQuestions,
+    UAS.TotalAnswers,
+    UAS.TotalComments,
+    UAS.TotalBadges,
+    UBO.GoldBadges,
+    UBO.SilverBadges,
+    UBO.BronzeBadges,
+    UBO.MostRecentBadgeName,
+    PDE.PostId,
+    PDE.PostTypeName,
+    PDE.PostTitle,
+    PDE.PostCreationDate,
+    PDE.PostScore,
+    PDE.ViewCount,
+    PDE.AnswerCount,
+    PDE.CommentCount,
+    PDE.FavoriteCount,
+    PDE.PostStatus,
+    PDE.RevisionCount,
+    PDE.UpVoteCount,
+    PDE.DownVoteCount,
+    EXTRACT(EPOCH FROM (PDE.LastActivityDate - PDE.PostCreationDate)) / 3600 AS HoursSincePostCreation,
+    EXTRACT(EPOCH FROM (PDE.PostCreationDate - PDE.PreviousPostDate)) / 86400 AS DaysBetweenUserPosts,
+    EXTRACT(EPOCH FROM PDE.TimeBetweenEdits) / 60 AS MinutesBetweenEdits,
+    T.TagName AS RelatedTagName,
+    TPM.TotalQuestionsWithTag,
+    TPM.AvgQuestionScoreForTag,
+    TPM.TopContributingUserForTag,
+    TPM.ClosedQuestionsCount,
+    DENSE_RANK() OVER (
+        PARTITION BY CASE WHEN UAS.TotalPosts < 10 THEN 'Low'
+                          WHEN UAS.TotalPosts BETWEEN 10 AND 100 THEN 'Medium'
+                          ELSE 'High' END
+        ORDER BY UAS.Reputation DESC, UAS.UserId
+    ) AS RankByReputationSegment,
+    (CAST(PDE.DownVoteCount AS NUMERIC) / NULLIF(PDE.UpVoteCount + PDE.DownVoteCount, 0)) * PDE.CommentCount AS ControversyScore,
+    NULLIF(UAS.TotalPosts, 0) / NULLIF(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - UAS.UserCreationDate)) / (3600 * 24 * 365.25), 0) AS PostsPerYearActive,
+    CASE
+        WHEN PDE.PostTypeName = 'Question' AND PDE.PostTitle ILIKE '%performance%' AND PDE.ViewCount > 50000 THEN 'High-Performance Question'
+        WHEN PDE.PostTypeName = 'Answer' AND PDE.PostScore > 100 AND PDE.RevisionCount > 3 THEN 'Highly Refined Answer'
+        WHEN PDE.Tags IS NOT NULL AND PDE.Tags LIKE '%<java>%' AND PDE.Tags LIKE '%<android>%' THEN 'Java Android Specific'
+        WHEN PDE.PostStatus = 'Closed Question' AND TPM.ClosedQuestionsCount > TPM.TotalQuestionsWithTag * 0.5 THEN 'Problematic Tag Question'
+        ELSE 'General Interest'
+    END AS PostCategory,
+    (SELECT COUNT(1) > 0
+        FROM PostHistory PH_sub
+        WHERE PH_sub.PostId = PDE.PostId
+          AND PH_sub.PostHistoryTypeId = 1 AND PH_sub.CreationDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')
+    ) AS HasRecentInitialHistory,
+    CASE
+        WHEN UAS.UserCreationDate < (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '10 years') AND UAS.UserTotalUpVotes > 10000 THEN 'Veteran Influencer'
+        WHEN UAS.UserCreationDate < (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '5 years') AND UAS.UserTotalUpVotes > 1000 THEN 'Established Contributor'
+        ELSE 'Newer User'
+    END AS UserSeniorityLevel
+FROM UserActivitySummary UAS
+LEFT JOIN UserBadgeOverview UBO ON UAS.UserId = UBO.UserId
+LEFT JOIN PostDetailsExtended PDE ON UAS.UserId = PDE.OwnerUserId
+LEFT JOIN LATERAL (
+    SELECT t.TagName
+    FROM unnest(COALESCE(PDE.TagArray, ARRAY[]::text[])) AS t(TagName)
+) T ON PDE.TagArray IS NOT NULL
+LEFT JOIN TagPerformanceMetrics TPM ON T.TagName = TPM.TagName
+WHERE
+    UAS.Reputation >= 5000
+    AND (PDE.PostId IS NULL OR PDE.rn_user_posttype <= 3)
+    AND (
+        PDE.PostScore IS NULL OR PDE.PostScore >= 5
+        OR
+        (PDE.PostTypeName = 'Question' AND PDE.ViewCount > 1000 AND PDE.AnswerCount > 0)
+    )
+    AND UAS.LastKnownActivity > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 year')
+    AND (UAS.TotalBadges IS NULL OR UAS.TotalBadges > 5)
+    AND (TPM.AvgQuestionScoreForTag IS NULL OR TPM.AvgQuestionScoreForTag > 10)
+    AND NOT EXISTS (
+        SELECT 1 FROM Posts P_sub
+        WHERE P_sub.OwnerUserId = UAS.UserId
+          AND P_sub.CreationDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')
+          AND P_sub.Tags LIKE '%' || '<c++>' || '%'
+        GROUP BY P_sub.OwnerUserId
+        HAVING COUNT(P_sub.Id) > 10
+    )
+
+UNION ALL
+
+SELECT
+    U.Id AS UserId,
+    COALESCE(U.DisplayName, 'Inactive User') AS DisplayName,
+    U.Reputation,
+    U.CreationDate AS UserCreationDate,
+    U.LastAccessDate AS LastKnownActivity,
+    (SELECT COUNT(P.Id) FROM Posts P WHERE P.OwnerUserId = U.Id) AS TotalPosts,
+    (SELECT COUNT(P.Id) FROM Posts P WHERE P.OwnerUserId = U.Id AND P.PostTypeId = 1) AS TotalQuestions,
+    (SELECT COUNT(P.Id) FROM Posts P WHERE P.OwnerUserId = U.Id AND P.PostTypeId = 2) AS TotalAnswers,
+    (SELECT COUNT(C.Id) FROM Comments C WHERE C.UserId = U.Id) AS TotalComments,
+    (SELECT COUNT(B.Id) FROM Badges B WHERE B.UserId = U.Id) AS TotalBadges,
+    SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+    SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+    SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+    MAX(B.Date) AS LatestBadgeDate,
+    (SELECT Name FROM Badges b2 WHERE b2.UserId = U.Id ORDER BY b2.Date DESC LIMIT 1) AS MostRecentBadgeName,
+    P_active.Id AS PostId,
+    PT_active.Name AS PostTypeName,
+    COALESCE(P_active.Title, 'N/A') AS PostTitle,
+    P_active.CreationDate AS PostCreationDate,
+    P_active.Score AS PostScore,
+    P_active.ViewCount,
+    P_active.AnswerCount,
+    P_active.CommentCount,
+    P_active.FavoriteCount,
+    CASE WHEN P_active.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Active' END AS PostStatus,
+    COUNT(DISTINCT PH_active.Id) AS RevisionCount,
+    SUM(CASE WHEN V_active.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+    SUM(CASE WHEN V_active.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+    EXTRACT(EPOCH FROM (P_active.LastActivityDate - P_active.CreationDate)) / 3600 AS HoursSincePostCreation,
+    NULL AS DaysBetweenUserPosts,
+    NULL AS MinutesBetweenEdits,
+    T_active.TagName AS RelatedTagName,
+    (SELECT COUNT(DISTINCT P2.Id) FROM Posts P2 WHERE P2.Tags ILIKE '%' || T_active.TagName || '%' AND P2.PostTypeId = 1) AS TotalQuestionsWithTag,
+    (SELECT AVG(P2.Score) FROM Posts P2 WHERE P2.Tags ILIKE '%' || T_active.TagName || '%' AND P2.PostTypeId = 1) AS AvgQuestionScoreForTag,
+    NULL AS TopContributingUserForTag,
+    (SELECT COUNT(DISTINCT P2.Id) FROM Posts P2 WHERE P2.Tags ILIKE '%' || T_active.TagName || '%' AND P2.PostTypeId = 1 AND P2.ClosedDate IS NOT NULL) AS ClosedQuestionsCount,
+    0 AS RankByReputationSegment,
+    CAST(SUM(CASE WHEN V_mod.VoteTypeId IN (3,10,12) THEN 1 ELSE 0 END) AS NUMERIC) / NULLIF(COUNT(V_mod.Id), 0) AS ControversyScore,
+    NULLIF((SELECT COUNT(P3.Id) FROM Posts P3 WHERE P3.OwnerUserId = U.Id), 0) / NULLIF(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - U.CreationDate)) / (3600 * 24 * 365.25), 0) AS PostsPerYearActive,
+    'Moderation Interest' AS PostCategory,
+    FALSE AS HasRecentInitialHistory,
+    'Moderator Candidate' AS UserSeniorityLevel
+FROM Users U
+INNER JOIN Badges B ON U.Id = B.UserId
+INNER JOIN Posts P_active ON U.Id = P_active.OwnerUserId
+INNER JOIN PostTypes PT_active ON P_active.PostTypeId = PT_active.Id
+LEFT JOIN PostHistory PH_active ON P_active.Id = PH_active.PostId
+LEFT JOIN Votes V_active ON P_active.Id = V_active.PostId
+INNER JOIN Votes V_mod ON U.Id = V_mod.UserId AND V_mod.VoteTypeId IN (3, 10, 12)
+LEFT JOIN LATERAL (
+    SELECT t.TagName FROM unnest(
+        CASE WHEN P_active.Tags IS NULL OR P_active.Tags = '' THEN ARRAY[]::text[]
+             ELSE string_to_array(substring(P_active.Tags FROM 2 FOR char_length(P_active.Tags) - 2), '><')
+        END
+    ) AS t(TagName)
+) T_active ON TRUE
+WHERE
+    U.Reputation >= 20000
+    AND U.LastAccessDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')
+    AND (SELECT COUNT(V_sub.Id) FROM Votes V_sub WHERE V_sub.UserId = U.Id AND V_sub.VoteTypeId IN (10, 12)) > 50
+    AND P_active.CreationDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 years')
+GROUP BY
+    U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate,
+    P_active.Id, PT_active.Name, P_active.Title, P_active.CreationDate, P_active.Score,
+    P_active.ViewCount, P_active.AnswerCount, P_active.CommentCount, P_active.FavoriteCount,
+    P_active.ClosedDate, P_active.LastActivityDate, T_active.TagName
+HAVING COUNT(DISTINCT V_mod.Id) > 100
+ORDER BY Reputation DESC, PostScore DESC
+LIMIT 7500;

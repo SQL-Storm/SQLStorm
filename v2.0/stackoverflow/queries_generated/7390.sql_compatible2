@@ -1,0 +1,251 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) as TotalQuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) as TotalAnswerScore,
+        MAX(p.CreationDate) as LatestPostDate,
+        EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - MAX(p.CreationDate)))/86400.0 as DaysSinceLastPost,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 
+            THEN AVG(CAST(p.Score AS DOUBLE PRECISION))
+            ELSE 0 
+        END as AvgPostScore,
+        STRING_AGG(DISTINCT t.TagName, ', ') as UserTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Posts p2 ON p.Id = p2.ParentId
+    LEFT JOIN Tags t ON p2.Tags LIKE '%' || t.TagName || '%'
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopUsersByReputation AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        PostCount,
+        CommentCount,
+        BadgeCount,
+        QuestionCount,
+        AnswerCount,
+        TotalQuestionScore,
+        TotalAnswerScore,
+        LatestPostDate,
+        DaysSinceLastPost,
+        AvgPostScore,
+        UserTags,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC) as RepRank,
+        PERCENT_RANK() OVER (ORDER BY Reputation) as RepPercentile,
+        NTILE(100) OVER (ORDER BY Reputation) as RepQuintile
+    FROM UserActivityStats
+),
+UserEngagementMetrics AS (
+    SELECT 
+        tur.UserId,
+        tur.DisplayName,
+        tur.Reputation,
+        tur.PostCount,
+        tur.CommentCount,
+        tur.BadgeCount,
+        tur.QuestionCount,
+        tur.AnswerCount,
+        tur.TotalQuestionScore,
+        tur.TotalAnswerScore,
+        tur.LatestPostDate,
+        tur.DaysSinceLastPost,
+        tur.AvgPostScore,
+        (tur.PostCount + tur.CommentCount) as TotalEngagement,
+        CASE 
+            WHEN tur.PostCount > 0 THEN (tur.AnswerCount * 100.0 / tur.PostCount)
+            ELSE 0 
+        END as AnswerPercentage,
+        CASE 
+            WHEN tur.QuestionCount > 0 THEN (tur.TotalQuestionScore * 1.0 / tur.QuestionCount)
+            ELSE 0 
+        END as AvgQuestionScore,
+        CASE 
+            WHEN tur.AnswerCount > 0 THEN (tur.TotalAnswerScore * 1.0 / tur.AnswerCount)
+            ELSE 0 
+        END as AvgAnswerScore,
+        CASE 
+            WHEN tur.BadgeCount > 0 THEN tur.BadgeCount * 100.0 / (tur.PostCount + 1)
+            ELSE 0 
+        END as BadgeEfficiency
+    FROM TopUsersByReputation tur
+    INNER JOIN Users tu ON tu.Id = tur.UserId
+    WHERE tur.RepQuintile <= 10
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.ParentId,
+        p.PostTypeId,
+        LENGTH(p.Body) as BodyLength,
+        (SELECT COUNT(*) FROM regexp_split_to_table(coalesce(p.Body, ''), '\s+') AS w WHERE w <> '') as WordCount,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) as CommentCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) as Upvotes,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) as Downvotes,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 
+                (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = p.Id AND a.PostTypeId = 2)
+            ELSE 0 
+        END as AnswerCount,
+        COALESCE(
+            (SELECT STRING_AGG(v.UserDisplayName, ', ') 
+             FROM Votes v 
+             WHERE v.PostId = p.Id AND v.VoteTypeId = 5),
+            'No Favorites'
+        ) as FavoriteUsers,
+        CASE 
+            WHEN p.Score >= 1000 THEN 'Elite'
+            WHEN p.Score >= 100 THEN 'High'
+            WHEN p.Score >= 10 THEN 'Medium'
+            ELSE 'Low'
+        END as ScoreLevel,
+        p.OwnerUserId,
+        CASE 
+            WHEN p.OwnerUserId IS NULL THEN 'Deleted User'
+            ELSE (SELECT u.DisplayName FROM Users u WHERE u.Id = p.OwnerUserId)
+        END as OwnerDisplayName
+    FROM Posts p
+    WHERE p.CreationDate >= DATE '2021-01-01'
+),
+CombinedStats AS (
+    SELECT 
+        uem.UserId,
+        uem.DisplayName,
+        uem.Reputation,
+        uem.PostCount,
+        uem.CommentCount,
+        uem.BadgeCount,
+        uem.QuestionCount,
+        uem.AnswerCount,
+        uem.TotalQuestionScore,
+        uem.TotalAnswerScore,
+        uem.LatestPostDate,
+        uem.DaysSinceLastPost,
+        uem.AvgPostScore,
+        uem.TotalEngagement,
+        uem.AnswerPercentage,
+        uem.AvgQuestionScore,
+        uem.AvgAnswerScore,
+        uem.BadgeEfficiency,
+        COALESCE(pa.PostId, 0) as MostActivePostId,
+        COALESCE(pa.Title, 'No Title') as MostActivePostTitle,
+        COALESCE(pa.Score, 0) as MostActivePostScore,
+        COALESCE(pa.BodyLength, 0) as MostActivePostLength,
+        COALESCE(pa.WordCount, 0) as MostActivePostWordCount,
+        COALESCE(pa.CommentCount, 0) as MostActivePostComments,
+        COALESCE(pa.AnswerCount, 0) as MostActivePostAnswers,
+        COALESCE(pa.ScoreLevel, 'Unknown') as PostScoreLevel,
+        COALESCE(pa.OwnerDisplayName, 'N/A') as PostOwnerName,
+        CASE 
+            WHEN uem.Reputation >= 10000 THEN 'Master'
+            WHEN uem.Reputation >= 1000 THEN 'Expert'
+            WHEN uem.Reputation >= 100 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as ReputationTier,
+        CASE 
+            WHEN uem.BadgeEfficiency >= 50 THEN 'Highly Engaged'
+            WHEN uem.BadgeEfficiency >= 20 THEN 'Moderate'
+            ELSE 'Low'
+        END as EngagementLevel,
+        ABS(uem.AvgPostScore - AVG(uem.AvgPostScore) OVER()) as ScoreDeviation,
+        RANK() OVER (ORDER BY uem.TotalEngagement DESC) as EngagementRank,
+        DENSE_RANK() OVER (ORDER BY uem.Reputation DESC) as RepRankFinal
+    FROM UserEngagementMetrics uem
+    LEFT JOIN PostAnalysis pa ON pa.OwnerUserId = uem.UserId
+    WHERE uem.PostCount > 0
+),
+FinalAggregates AS (
+    SELECT 
+        SUM(PostCount) as TotalPosts,
+        SUM(CommentCount) as TotalComments,
+        SUM(BadgeCount) as TotalBadges,
+        SUM(QuestionCount) as TotalQuestions,
+        SUM(AnswerCount) as TotalAnswers,
+        AVG(Reputation) as AvgReputation,
+        AVG(AvgPostScore) as AvgPostScore,
+        AVG(TotalEngagement) as AvgEngagement,
+        SUM(CASE WHEN AnswerPercentage >= 50 THEN 1 ELSE 0 END) as HighAnswerRatioUsers,
+        SUM(CASE WHEN BadgeEfficiency >= 30 THEN 1 ELSE 0 END) as HighBadgeEfficiencyUsers,
+        MAX(Reputation) as MaxReputation,
+        MIN(Reputation) as MinReputation,
+        COUNT(*) as UserCount,
+        AVG(DaysSinceLastPost) as AvgDaysSinceLastPost,
+        AVG(AnswerPercentage) as AvgAnswerRatio,
+        AVG(BadgeEfficiency) as AvgBadgeEfficiency,
+        STRING_AGG(DISTINCT DisplayName, '; ') as AllUserNames,
+        STRING_AGG(DISTINCT PostScoreLevel, ', ') as UniqueScoreLevels,
+        COUNT(DISTINCT ReputationTier) as ReputationTiers,
+        SUM(CASE WHEN EngagementLevel = 'Highly Engaged' THEN 1 ELSE 0 END) as HighlyEngagedUsers
+    FROM CombinedStats
+)
+SELECT 
+    fa.TotalPosts,
+    fa.TotalComments,
+    fa.TotalBadges,
+    fa.TotalQuestions,
+    fa.TotalAnswers,
+    ROUND(CAST(fa.AvgReputation AS numeric), 2) as AvgReputation,
+    ROUND(CAST(fa.AvgPostScore AS numeric), 2) as AvgPostScore,
+    ROUND(CAST(fa.AvgEngagement AS numeric), 2) as AvgEngagement,
+    fa.HighAnswerRatioUsers,
+    fa.HighBadgeEfficiencyUsers,
+    fa.MaxReputation,
+    fa.MinReputation,
+    fa.UserCount,
+    ROUND(CAST(fa.AvgDaysSinceLastPost AS numeric), 2) as AvgDaysSinceLastPost,
+    ROUND(CAST(fa.AvgAnswerRatio AS numeric), 2) as AvgAnswerRatio,
+    ROUND(CAST(fa.AvgBadgeEfficiency AS numeric), 2) as AvgBadgeEfficiency,
+    CASE 
+        WHEN fa.AllUserNames IS NOT NULL AND LENGTH(fa.AllUserNames) > 0 THEN 
+            'Users: ' || SUBSTRING(fa.AllUserNames FROM 1 FOR 200) || '...'
+        ELSE 'No Users'
+    END as UserListPreview,
+    CASE 
+        WHEN fa.UniqueScoreLevels IS NOT NULL THEN 
+            string_to_array(fa.UniqueScoreLevels, ', ')
+        ELSE ARRAY[]::varchar
+    END as ScoreLevelsArray,
+    fa.ReputationTiers,
+    fa.HighlyEngagedUsers,
+    CASE 
+        WHEN fa.UserCount > 0 AND fa.HighlyEngagedUsers > 0 THEN 
+            ROUND(CAST((fa.HighlyEngagedUsers * 100.0 / fa.UserCount) AS numeric), 2)
+        ELSE 0 
+    END as HighlyEngagedPercentage,
+    (SELECT COUNT(*) FROM Posts p WHERE p.CreationDate >= DATE '2023-01-01') as Posts2023Count,
+    (SELECT COUNT(*) FROM Users u WHERE u.CreationDate >= DATE '2023-01-01') as NewUsers2023Count,
+    (SELECT ROUND(CAST(AVG(Reputation) AS numeric), 2) FROM Users u WHERE u.CreationDate >= DATE '2023-01-01') as AvgNewUserReputation,
+    CASE 
+        WHEN fa.TotalQuestions > 0 THEN 
+            ROUND(CAST((fa.TotalAnswers * 100.0 / fa.TotalQuestions) AS numeric), 2)
+        ELSE 0 
+    END as AnswerToQuestionRatio,
+    (SELECT COUNT(*) FROM Votes v WHERE v.VoteTypeId = 2) as TotalUpvotes,
+    (SELECT COUNT(*) FROM Votes v WHERE v.VoteTypeId = 3) as TotalDownvotes,
+    (SELECT COUNT(*) FROM Comments c WHERE c.CreationDate >= DATE '2023-01-01') as NewComments2023,
+    (SELECT COUNT(*) FROM Posts p WHERE p.PostTypeId = 1 AND p.CreationDate >= DATE '2023-01-01') as NewQuestions2023
+FROM FinalAggregates fa
+WHERE fa.UserCount > 0
+ORDER BY fa.AvgReputation DESC
+LIMIT 1;

@@ -1,0 +1,240 @@
+WITH UserAggregatedStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.CreationDate AS UserCreationDate,
+        u.Location,
+        u.Views AS UserProfileViews,
+        u.UpVotes AS TotalUpVotesGiven,
+        u.DownVotes AS TotalDownVotesGiven,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS QuestionsWithAcceptedAnswer,
+        SUM(CASE WHEN p_ans_parent.AcceptedAnswerId = p.Id THEN 1 ELSE 0 END) AS AcceptedAnswersReceived,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        SUM(p.Score) AS TotalPostsScore,
+        SUM(c.Score) AS TotalCommentsScore,
+        COUNT(DISTINCT ph_edit.PostId) AS UniqueEditedPostsCount,
+        SUM(CASE WHEN ph_edit.UserId = u.Id AND ph_edit.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS OwnPostEditEvents,
+        SUM(CASE WHEN ph_edit.UserId IS NOT NULL AND ph_edit.UserId != u.Id AND ph_edit.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS OtherPostEditEvents
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Posts p_ans_parent ON p.PostTypeId = 2 AND p.ParentId = p_ans_parent.Id
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN PostHistory ph_edit ON p.Id = ph_edit.PostId AND ph_edit.PostHistoryTypeId IN (4, 5, 6)
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.CreationDate, u.Location, u.Views, u.UpVotes, u.DownVotes
+),
+PostDetailedHistoryBase AS (
+    SELECT
+        p.Id AS PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate AS PhCreationDate,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        p.LastEditDate,
+        p.ClosedDate,
+        p.CommunityOwnedDate,
+        p.ViewCount,
+        p.Score,
+        p.AnswerCount,
+        p.CommentCount AS PostCommentCount,
+        p.FavoriteCount
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+),
+PostDetailedHistory AS (
+    SELECT
+        PostId,
+        PostTypeId,
+        PostCreationDate,
+        LastEditDate,
+        ClosedDate,
+        CommunityOwnedDate,
+        ViewCount,
+        Score,
+        AnswerCount,
+        PostCommentCount,
+        FavoriteCount,
+        COUNT(DISTINCT CASE WHEN PostHistoryTypeId = 10 THEN PhCreationDate END) AS ClosureEvents,
+        COUNT(DISTINCT CASE WHEN PostHistoryTypeId = 11 THEN PhCreationDate END) AS ReopenEvents,
+        MAX(CASE WHEN PostHistoryTypeId IN (4,5,6) THEN PhCreationDate END) AS LastContentEditHistoryDate,
+        MIN(CASE WHEN PostHistoryTypeId = 10 THEN PhCreationDate END) AS FirstClosedDate,
+        AVG(NULLIF(CloseToReopenDays,0)) AS AvgDaysBetweenCloseAndReopen
+    FROM (
+        SELECT
+            pdhb.*,
+            CASE
+                WHEN PostHistoryTypeId = 11 THEN
+                    EXTRACT(EPOCH FROM (PhCreationDate - prev_PhCreationDate)) / (60 * 60 * 24.0)
+                ELSE NULL
+            END AS CloseToReopenDays
+        FROM (
+            SELECT
+                PostId,
+                PostHistoryTypeId,
+                PhCreationDate,
+                PostTypeId,
+                PostCreationDate,
+                LastEditDate,
+                ClosedDate,
+                CommunityOwnedDate,
+                ViewCount,
+                Score,
+                AnswerCount,
+                PostCommentCount,
+                FavoriteCount,
+                LAG(PhCreationDate) OVER (PARTITION BY PostId ORDER BY PhCreationDate) AS prev_PhCreationDate
+            FROM PostDetailedHistoryBase
+        ) pdhb
+    ) t
+    GROUP BY PostId, PostTypeId, PostCreationDate, LastEditDate, ClosedDate, CommunityOwnedDate,
+             ViewCount, Score, AnswerCount, PostCommentCount, FavoriteCount
+),
+TagGlobalStats AS (
+    SELECT
+        LOWER(TRIM(unnest_tag.tag_name)) AS TagName,
+        COUNT(p.Id) AS GlobalTaggedPostsCount,
+        SUM(p.Score) AS GlobalTaggedPostsTotalScore,
+        AVG(p.Score) AS GlobalTaggedPostsAvgScore
+    FROM Posts p
+    CROSS JOIN LATERAL UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><')) AS unnest_tag(tag_name)
+    WHERE p.Tags IS NOT NULL AND p.Tags <> ''
+    GROUP BY LOWER(TRIM(unnest_tag.tag_name))
+),
+PostCommentSummary AS (
+    SELECT
+        c.PostId,
+        COUNT(c.Id) AS TotalComments,
+        SUM(c.Score) AS TotalCommentsScore,
+        AVG(c.Score) AS AverageCommentScore,
+        COUNT(DISTINCT c.UserId) AS UniqueCommenters,
+        STRING_AGG(CASE WHEN LENGTH(c.Text) > 10 THEN SUBSTRING(c.Text FROM 1 FOR 20) || '...' ELSE c.Text END, ' || ') FILTER (WHERE c.Score > 5) AS HighScoreCommentSnippets
+    FROM Comments c
+    GROUP BY c.PostId
+),
+HighValuePosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.AcceptedAnswerId,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        'Question' AS PostCategory,
+        NULL AS ParentQuestionTitle,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS UserPostRank
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.Score > 100
+      AND p.AnswerCount > 5
+      AND p.ViewCount > 10000
+    UNION ALL
+    SELECT
+        a.Id AS PostId,
+        a.OwnerUserId,
+        a.PostTypeId,
+        a.Score,
+        a.ViewCount,
+        a.AcceptedAnswerId,
+        a.CreationDate,
+        a.Title,
+        a.Tags,
+        'AcceptedAnswer' AS PostCategory,
+        q.Title AS ParentQuestionTitle,
+        ROW_NUMBER() OVER (PARTITION BY a.OwnerUserId ORDER BY a.Score DESC) AS UserPostRank
+    FROM Posts a
+    JOIN Posts q ON a.ParentId = q.Id
+    WHERE a.PostTypeId = 2
+      AND a.Score > 50
+      AND q.AcceptedAnswerId = a.Id
+      AND a.OwnerUserId IS NOT NULL
+)
+SELECT
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.Location,
+    EXTRACT(YEAR FROM uas.UserCreationDate) AS UserCreationYear,
+    uas.TotalPosts,
+    uas.TotalQuestions,
+    uas.AcceptedAnswersReceived,
+    uas.TotalBadges,
+    uas.OwnPostEditEvents,
+    uas.OtherPostEditEvents,
+    hvp.PostId,
+    hvp.PostCategory,
+    hvp.Title AS PostTitle,
+    hvp.Score AS PostScore,
+    hvp.ViewCount AS PostViewCount,
+    hvp.AcceptedAnswerId,
+    hvp.CreationDate AS PostCreationDate,
+    hvp.ParentQuestionTitle,
+    pdh.ClosureEvents,
+    pdh.ReopenEvents,
+    pdh.AvgDaysBetweenCloseAndReopen,
+    pcs.TotalComments AS PostTotalComments,
+    pcs.AverageCommentScore AS PostAverageCommentScore,
+    pcs.HighScoreCommentSnippets,
+    NTILE(10) OVER (ORDER BY uas.Reputation DESC) AS ReputationBand,
+    EXISTS (
+        SELECT 1
+        FROM Badges b
+        JOIN Tags t ON b.Name = t.TagName
+        WHERE b.UserId = uas.UserId
+          AND b.TagBased = TRUE
+          AND LOWER(TRIM(t.TagName)) IN (
+              SELECT LOWER(TRIM(unnest_tag.tag_name))
+              FROM UNNEST(string_to_array(SUBSTRING(hvp.Tags FROM 2 FOR LENGTH(hvp.Tags) - 2), '><')) AS unnest_tag(tag_name)
+          )
+    ) AS HasTagBadgeForPost,
+    (hvp.Score * hvp.ViewCount * COALESCE(pcs.TotalComments, 1) * CASE WHEN hvp.AcceptedAnswerId IS NOT NULL THEN 1.5 ELSE 1.0 END) / NULLIF(uas.TotalPostsScore + uas.TotalCommentsScore, 0.0) AS WeightedPostUserInfluence,
+    LENGTH(COALESCE(p_body.Body, '')) AS QuestionBodyLength,
+    SUBSTRING(p_body.Body FROM 1 FOR 100) AS QuestionBodyExcerpt,
+    STRING_AGG(DISTINCT lt.Name, ', ') FILTER (WHERE pl.LinkTypeId IS NOT NULL) AS RelatedLinkTypes,
+    (SELECT COUNT(DISTINCT pl_sub.RelatedPostId) FROM PostLinks pl_sub WHERE pl_sub.PostId = hvp.PostId AND pl_sub.LinkTypeId = 3) AS NumDuplicateLinks
+FROM UserAggregatedStats uas
+INNER JOIN HighValuePosts hvp ON uas.UserId = hvp.OwnerUserId
+LEFT JOIN PostDetailedHistory pdh ON hvp.PostId = pdh.PostId
+LEFT JOIN PostCommentSummary pcs ON hvp.PostId = pcs.PostId
+LEFT JOIN Posts p_body ON hvp.PostId = p_body.Id AND hvp.PostCategory = 'Question'
+LEFT JOIN PostLinks pl ON hvp.PostId = pl.PostId
+LEFT JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+LEFT JOIN TagGlobalStats tgs ON tgs.TagName IN (
+    SELECT LOWER(TRIM(unnest_tag.tag_name))
+    FROM UNNEST(string_to_array(SUBSTRING(hvp.Tags FROM 2 FOR LENGTH(hvp.Tags) - 2), '><')) AS unnest_tag(tag_name)
+)
+WHERE
+    uas.Reputation > 10000
+    AND hvp.UserPostRank <= 3
+    AND hvp.CreationDate > DATE '2020-01-01'
+    AND pdh.ClosureEvents > 0 AND pdh.ReopenEvents > 0
+    AND (LENGTH(uas.Location) > 5 OR uas.Location IS NULL)
+    AND NOT EXISTS (
+        SELECT 1 FROM Comments neg_c WHERE neg_c.UserId = uas.UserId AND neg_c.Score < -1
+    )
+    AND EXISTS (
+        SELECT 1 FROM Posts p_tag
+        CROSS JOIN LATERAL UNNEST(string_to_array(SUBSTRING(p_tag.Tags FROM 2 FOR LENGTH(p_tag.Tags) - 2), '><')) AS t_tag(tag_name)
+        WHERE p_tag.OwnerUserId = uas.UserId
+          AND p_tag.ViewCount > 50000
+          AND LOWER(TRIM(t_tag.tag_name)) IN ('sql', 'database', 'postgresql', 'mysql')
+    )
+GROUP BY
+    uas.UserId, uas.DisplayName, uas.Reputation, uas.Location, uas.UserCreationDate, uas.TotalPosts,
+    uas.TotalQuestions, uas.AcceptedAnswersReceived, uas.TotalBadges, uas.OwnPostEditEvents, uas.OtherPostEditEvents,
+    hvp.PostId, hvp.PostCategory, hvp.Title, hvp.Score, hvp.ViewCount, hvp.AcceptedAnswerId, hvp.CreationDate,
+    hvp.ParentQuestionTitle, pdh.ClosureEvents, pdh.ReopenEvents, pdh.AvgDaysBetweenCloseAndReopen,
+    pcs.TotalComments, pcs.AverageCommentScore, pcs.HighScoreCommentSnippets,
+    p_body.Body, uas.TotalPostsScore, uas.TotalCommentsScore, lt.Name, pl.LinkTypeId, tgs.TagName
+HAVING
+    COUNT(DISTINCT tgs.TagName) >= 1
+    AND SUM(CASE WHEN pl.LinkTypeId = 1 THEN 1 ELSE 0 END) > 0
+ORDER BY
+    uas.Reputation DESC, WeightedPostUserInfluence DESC
+LIMIT 50;

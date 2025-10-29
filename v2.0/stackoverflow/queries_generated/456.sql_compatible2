@@ -1,0 +1,289 @@
+with recent_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.location,
+    coalesce(nullif(trim(u.websiteurl), ''), 'n/a') as websiteurl,
+    count(case when b.class = 1 then 1 end) as gold_badges,
+    count(case when b.class = 2 then 1 end) as silver_badges,
+    count(case when b.class = 3 then 1 end) as bronze_badges,
+    max(b.date) as last_badge_at
+  from users u
+  left join badges b
+    on b.userid = u.id
+  where u.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+  group by u.id, u.displayname, u.reputation, u.creationdate, u.location, coalesce(nullif(trim(u.websiteurl), ''), 'n/a')
+),
+posts_enriched as (
+  select
+    p.id,
+    p.posttypeid,
+    p.creationdate,
+    p.owneruserid,
+    p.title,
+    p.tags,
+    p.score,
+    p.viewcount,
+    p.answercount,
+    p.favoritecount,
+    p.commentcount,
+    p.closeddate,
+    p.acceptedanswerid,
+    p.parentid,
+    case
+      when p.posttypeid = 1 then 'Question'
+      when p.posttypeid = 2 then 'Answer'
+      else 'Other'
+    end as posttype_name,
+    nullif(split_part(substring(p.tags from 2 for greatest(length(p.tags)-2,0)), '><', 1), '') as primary_tag
+  from posts p
+  where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+),
+activity_cte as (
+  select
+    pe.id as post_id,
+    pe.owneruserid as user_id,
+    pe.posttypeid,
+    pe.posttype_name,
+    pe.creationdate,
+    pe.score,
+    pe.viewcount,
+    pe.answercount,
+    pe.favoritecount,
+    pe.commentcount,
+    pe.closeddate,
+    pe.primary_tag,
+    avg(pe.score) over (partition by pe.owneruserid, pe.posttypeid) as avg_score_user_type,
+    sum(pe.viewcount) over (partition by pe.owneruserid) as total_views_user,
+    row_number() over (partition by pe.owneruserid order by pe.score desc) as rn_score_desc,
+    rank() over (partition by pe.owneruserid, coalesce(pe.primary_tag,'(none)') order by pe.viewcount desc) as rnk_view_by_tag,
+    count(*) over (partition by pe.owneruserid) as posts_per_user_window
+  from posts_enriched pe
+),
+q_close_reasons as (
+  select
+    ph.postid,
+    min(ph.creationdate) as first_closed_at,
+    min(
+      case
+        when ph.posthistorytypeid = 10
+         and ph.comment ~ '^[0-9]+$'
+        then cast(ph.comment as integer)
+      end
+    ) as first_close_reason_id
+  from posthistory ph
+  where ph.posthistorytypeid = 10
+  group by ph.postid
+),
+dup_links as (
+  select pl.postid, count(*) as dup_count
+  from postlinks pl
+  where pl.linktypeid = 3
+  group by pl.postid
+),
+vote_agg as (
+  select
+    v.postid,
+    count(case when v.votetypeid = 2 then 1 end) as upvotes,
+    count(case when v.votetypeid = 3 then 1 end) as downvotes,
+    count(case when v.votetypeid = 5 then 1 end) as favorites,
+    count(case when v.votetypeid = 8 then 1 end) as bounties_started,
+    sum(case when v.votetypeid in (8,9) then v.bountyamount else 0 end) as bounty_total
+  from votes v
+  where v.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+  group by v.postid
+),
+comment_snippets as (
+  select
+    c.postid,
+    string_agg(left(c.text, 50), ' | ' order by c.score desc, c.creationdate asc) as top_comment_snippets,
+    count(*) as comment_cnt,
+    max(c.creationdate) as last_comment_at
+  from comments c
+  where c.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+  group by c.postid
+),
+user_post_mix as (
+  select
+    u.user_id,
+    sum(case when a.posttypeid = 1 then 1 else 0 end) as q_cnt,
+    sum(case when a.posttypeid = 2 then 1 else 0 end) as a_cnt,
+    avg(case when a.posttypeid = 1 then a.score end) as avg_q_score,
+    avg(case when a.posttypeid = 2 then a.score end) as avg_a_score
+  from recent_users u
+  left join activity_cte a
+    on a.user_id = u.user_id
+  group by u.user_id
+),
+tag_perf as (
+  select
+    coalesce(a.primary_tag, '(none)') as tag,
+    count(*) as posts,
+    avg(a.score) as avg_score,
+    percentile_cont(0.9) within group (order by a.viewcount) as p90_views
+  from activity_cte a
+  group by coalesce(a.primary_tag, '(none)')
+),
+chosen_users as (
+  select
+    ru.user_id,
+    ru.displayname,
+    ru.reputation,
+    ru.creationdate,
+    ru.location,
+    ru.websiteurl,
+    ru.gold_badges,
+    ru.silver_badges,
+    ru.bronze_badges,
+    ru.last_badge_at,
+    upm.q_cnt,
+    upm.a_cnt,
+    upm.avg_q_score,
+    upm.avg_a_score
+  from recent_users ru
+  join user_post_mix upm
+    on upm.user_id = ru.user_id
+  where coalesce(upm.q_cnt,0) + coalesce(upm.a_cnt,0) >= 5
+    and ru.reputation >= (
+      select percentile_cont(0.9) within group (order by reputation) from recent_users
+    )
+),
+answers_to_own_questions as (
+  select a.id as answer_id, a.owneruserid as user_id, a.parentid as question_id
+  from posts a
+  join posts q on q.id = a.parentid
+  where a.posttypeid = 2
+    and q.posttypeid = 1
+    and a.owneruserid = q.owneruserid
+),
+user_quality_score as (
+  select
+    cu.user_id,
+    (
+      0.4 * coalesce(avg(case when a.posttypeid = 1 then a.score end), 0)
+      + 0.4 * coalesce(avg(case when a.posttypeid = 2 then a.score end), 0)
+      + 0.2 * ln(1 + coalesce(avg(a.viewcount),0))
+    ) as quality_score
+  from chosen_users cu
+  left join activity_cte a
+    on a.user_id = cu.user_id
+  group by cu.user_id
+),
+question_accept_rate as (
+  select
+    u.user_id,
+    avg(case when q.acceptedanswerid is not null then 1.0 else 0.0 end) as accept_rate
+  from chosen_users u
+  left join posts q
+    on q.owneruserid = u.user_id and q.posttypeid = 1
+  group by u.user_id
+),
+posttype_names as (
+  select id, name from posttypes
+),
+close_reason_names as (
+  select id, name from closereasontypes
+),
+final_posts as (
+  select
+    a.user_id,
+    a.post_id,
+    a.posttype_name,
+    a.creationdate,
+    a.score,
+    a.viewcount,
+    a.answercount,
+    a.favoritecount,
+    a.commentcount,
+    a.primary_tag,
+    a.avg_score_user_type,
+    a.total_views_user,
+    a.rn_score_desc,
+    a.rnk_view_by_tag,
+    qcr.first_closed_at,
+    crn.name as close_reason_name,
+    dl.dup_count,
+    va.upvotes,
+    va.downvotes,
+    va.favorites as favorites_votes,
+    va.bounty_total,
+    cs.top_comment_snippets,
+    cs.comment_cnt,
+    cs.last_comment_at
+  from activity_cte a
+  left join q_close_reasons qcr on qcr.postid = a.post_id
+  left join close_reason_names crn on crn.id = qcr.first_close_reason_id
+  left join dup_links dl on dl.postid = a.post_id
+  left join vote_agg va on va.postid = a.post_id
+  left join comment_snippets cs on cs.postid = a.post_id
+)
+select
+  cu.user_id,
+  cu.displayname,
+  cu.reputation,
+  cu.location,
+  cu.websiteurl,
+  cu.gold_badges,
+  cu.silver_badges,
+  cu.bronze_badges,
+  coalesce(to_char(cast(cu.last_badge_at as timestamp), 'YYYY-MM-DD'), 'never') as last_badge_at,
+  coalesce(cu.q_cnt,0) as questions,
+  coalesce(cu.a_cnt,0) as answers,
+  round(coalesce(cu.avg_q_score,0), 2) as avg_q_score,
+  round(coalesce(cu.avg_a_score,0), 2) as avg_a_score,
+  round(coalesce(qar.accept_rate,0), 3) as accept_rate,
+  round(coalesce(uqs.quality_score,0), 3) as quality_score,
+  coalesce(pt.name, 'Unknown') as top_posttype_by_score,
+  fp.post_id,
+  fp.posttype_name,
+  fp.primary_tag,
+  fp.score,
+  fp.viewcount,
+  fp.answercount,
+  fp.favoritecount,
+  fp.commentcount,
+  fp.upvotes,
+  fp.downvotes,
+  fp.favorites_votes,
+  fp.bounty_total,
+  fp.dup_count,
+  coalesce(fp.close_reason_name, 'Open/Unknown') as close_reason,
+  case
+    when fp.first_closed_at is not null then 'Closed'
+    when fp.dup_count > 0 then 'Duplicate-linked'
+    else 'Active'
+  end as post_status,
+  left(coalesce(fp.top_comment_snippets, ''), 250) as comment_samples
+from chosen_users cu
+left join user_quality_score uqs on uqs.user_id = cu.user_id
+left join question_accept_rate qar on qar.user_id = cu.user_id
+left join lateral (
+  select a2.posttypeid, avg(a2.score) as avs
+  from activity_cte a2
+  where a2.user_id = cu.user_id
+  group by a2.posttypeid
+  order by avs desc
+  limit 1
+) tpt on true
+left join posttype_names pt on pt.id = tpt.posttypeid
+left join lateral (
+  select fp.*
+  from final_posts fp
+  where fp.user_id = cu.user_id
+  order by
+    case when fp.posttype_name = 'Question' then 0 else 1 end,
+    fp.score desc,
+    fp.viewcount desc
+  limit 1
+) fp on true
+where exists (
+  select 1
+  from answers_to_own_questions aoq
+  where aoq.user_id = cu.user_id
+)
+and coalesce(uqs.quality_score, 0) >
+  (select avg(quality_score) from user_quality_score)
+order by uqs.quality_score desc, cu.reputation desc, cu.user_id
+limit 250;

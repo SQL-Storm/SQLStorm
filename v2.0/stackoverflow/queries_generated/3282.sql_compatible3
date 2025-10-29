@@ -1,0 +1,178 @@
+WITH
+TopUsers AS (
+    SELECT 
+        u.Id                               AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(b.Id)                        AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(u.CreationDate)               AS FirstSeen
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Reputation > 20000
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(b.Id) >= 10
+),
+ExplodedTags AS (
+    SELECT
+        p.Id                                   AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS TagName
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days'
+),
+TagPostStats AS (
+    SELECT
+        et.TagName,
+        COUNT(*)                                      AS QuestionCount,
+        AVG(et.Score)                                 AS AvgScore,
+        MAX(et.Score)                                 AS MaxScore,
+        MIN(et.CreationDate)                          AS FirstQuestionDate,
+        MAX(et.CreationDate)                          AS LastQuestionDate,
+        ROW_NUMBER() OVER (PARTITION BY et.TagName ORDER BY AVG(et.Score) DESC) AS RankByAvgScore
+    FROM ExplodedTags et
+    GROUP BY et.TagName
+),
+UserPostAgg AS (
+    SELECT
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.BadgeCount,
+        tu.GoldBadges,
+        tu.SilverBadges,
+        tu.BronzeBadges,
+        COUNT(p.Id)                                    AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsAsked,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersGiven,
+        COALESCE(SUM(p.Score),0)                       AS NetScore,
+        AVG(p.ViewCount)                               AS AvgViews,
+        MAX(p.CreationDate)                            AS LastActivity,
+        (SELECT COUNT(*) 
+         FROM Comments c 
+         WHERE c.UserId = tu.UserId)                  AS TotalCommentsMade,
+        (SELECT AVG(a.Score) 
+         FROM Posts a 
+         WHERE a.OwnerUserId = tu.UserId 
+           AND a.PostTypeId = 2)                      AS AvgAnswerScore
+    FROM TopUsers tu
+    LEFT JOIN Posts p ON p.OwnerUserId = tu.UserId
+    GROUP BY
+        tu.UserId, tu.DisplayName, tu.Reputation,
+        tu.BadgeCount, tu.GoldBadges, tu.SilverBadges, tu.BronzeBadges
+),
+PostVoteSummary AS (
+    SELECT
+        v.PostId,
+        SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END)    AS UpVotes,
+        SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END)    AS DownVotes,
+        COUNT(*)                                      AS TotalVotes
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE v.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days'
+      AND vt.Id IN (2,3)
+    GROUP BY v.PostId
+)
+SELECT
+    upa.UserId                          AS UserId,
+    upa.DisplayName                     AS DisplayName,
+    upa.Reputation                      AS Reputation,
+    upa.BadgeCount                      AS BadgeCount,
+    upa.GoldBadges                      AS GoldBadges,
+    upa.SilverBadges                    AS SilverBadges,
+    upa.BronzeBadges                    AS BronzeBadges,
+    upa.TotalPosts                      AS TotalPosts,
+    upa.QuestionsAsked                  AS QuestionsAsked,
+    upa.AnswersGiven                    AS AnswersGiven,
+    upa.NetScore                        AS NetScore,
+    upa.AvgViews                        AS AvgViews,
+    upa.LastActivity                    AS LastActivity,
+    upa.TotalCommentsMade               AS TotalCommentsMade,
+    upa.AvgAnswerScore                  AS AvgAnswerScore,
+    CAST(NULL AS varchar)               AS TagName,
+    CAST(NULL AS int)                   AS QuestionCount,
+    CAST(NULL AS numeric)               AS AvgScore,
+    CAST(NULL AS int)                   AS MaxScore,
+    CAST(NULL AS timestamp)             AS TagFirstSeen,
+    CAST(NULL AS timestamp)             AS TagLastSeen,
+    CAST(NULL AS int)                   AS TagRankByAvgScore,
+    CAST(NULL AS int)                   AS PostId,
+    CAST(NULL AS int)                   AS UpVotes,
+    CAST(NULL AS int)                   AS DownVotes,
+    CAST(NULL AS int)                   AS TotalVotes
+FROM UserPostAgg upa
+
+UNION ALL
+
+SELECT
+    CAST(NULL AS int),
+    CAST(NULL AS varchar),
+    CAST(NULL AS int),
+    CAST(NULL AS int),
+    CAST(NULL AS int),
+    CAST(NULL AS int),
+    CAST(NULL AS int),
+    CAST(NULL AS int),
+    CAST(NULL AS int),
+    CAST(NULL AS int),
+    CAST(NULL AS int),
+    CAST(NULL AS numeric),
+    CAST(NULL AS timestamp),
+    CAST(NULL AS int),
+    CAST(NULL AS numeric),
+    tps.TagName,
+    tps.QuestionCount,
+    tps.AvgScore,
+    tps.MaxScore,
+    tps.FirstQuestionDate,
+    tps.LastQuestionDate,
+    tps.RankByAvgScore,
+    CAST(NULL AS int),
+    CAST(NULL AS int),
+    CAST(NULL AS int),
+    CAST(NULL AS int)
+FROM TagPostStats tps
+WHERE tps.RankByAvgScore <= 10
+
+UNION ALL
+
+SELECT
+    CAST(NULL AS int),
+    CAST(NULL AS varchar),
+    CAST(NULL AS int),
+    CAST(NULL AS int),
+    CAST(NULL AS int),
+    CAST(NULL AS int),
+    CAST(NULL AS int),
+    CAST(NULL AS int),
+    CAST(NULL AS int),
+    CAST(NULL AS int),
+    CAST(NULL AS int),
+    CAST(NULL AS numeric),
+    CAST(NULL AS timestamp),
+    CAST(NULL AS int),
+    CAST(NULL AS numeric),
+    CAST(NULL AS varchar),
+    CAST(NULL AS int),
+    CAST(NULL AS numeric),
+    CAST(NULL AS int),
+    CAST(NULL AS timestamp),
+    CAST(NULL AS timestamp),
+    CAST(NULL AS int),
+    pvs.PostId,
+    pvs.UpVotes,
+    pvs.DownVotes,
+    pvs.TotalVotes
+FROM PostVoteSummary pvs
+WHERE pvs.TotalVotes > 100
+ORDER BY
+    UserId DESC,
+    TagName ASC,
+    PostId DESC;

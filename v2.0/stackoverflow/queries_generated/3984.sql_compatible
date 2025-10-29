@@ -1,0 +1,130 @@
+WITH
+UserBadges AS (
+    SELECT
+        b.UserId,
+        COUNT(*)                               AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        STRING_AGG(DISTINCT b.Name, '; ')       AS BadgeNames
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+UserVotes AS (
+    SELECT
+        v.UserId,
+        COUNT(*)                                 AS TotalVotes,
+        SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        AVG(CASE WHEN vt.Id = 2 THEN 1 ELSE -1 END) AS NetVoteScore
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY v.UserId
+),
+
+UserPosts AS (
+    SELECT
+        p.OwnerUserId                                        AS UserId,
+        COUNT(CASE WHEN pt.Id = 1 THEN 1 END)                AS QuestionCount,
+        COUNT(CASE WHEN pt.Id = 2 THEN 1 END)                AS AnswerCount,
+        AVG(CASE WHEN pt.Id = 1 THEN p.Score END)            AS AvgQuestionScore,
+        AVG(CASE WHEN pt.Id = 2 THEN p.Score END)            AS AvgAnswerScore,
+        MAX(p.CreationDate)                                  AS LastPostDate,
+        SUM(p.ViewCount)                                     AS TotalViews,
+        COUNT(CASE WHEN pt.Id = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 1 END) AS QuestionsWithAccepted
+    FROM Posts p
+    JOIN PostTypes pt ON pt.Id = p.PostTypeId
+    GROUP BY p.OwnerUserId
+),
+
+RecentComments AS (
+    SELECT
+        u.Id                                              AS UserId,
+        (SELECT MAX(c.CreationDate)
+         FROM Comments c
+         WHERE c.UserId = u.Id)                           AS LastCommentDate,
+        (SELECT COUNT(*)
+         FROM Comments c
+         WHERE c.UserId = u.Id
+           AND c.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30' DAY) AS CommentsLast30Days
+    FROM Users u
+),
+
+UserTagMetrics AS (
+    SELECT
+        p.OwnerUserId                                 AS UserId,
+        UNNEST(string_to_array(TRIM(BOTH '<>' FROM p.Tags), '><')) AS Tag,
+        COUNT(*)                                      AS TagUseCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.Tags IS NOT NULL
+    GROUP BY p.OwnerUserId, Tag
+),
+
+UserRanks AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(ub.TotalBadges, 0)         AS TotalBadges,
+        COALESCE(up.QuestionCount, 0)      AS QuestionCount,
+        COALESCE(up.AnswerCount, 0)        AS AnswerCount,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, COALESCE(ub.TotalBadges,0) DESC) AS RepBadgeRank,
+        RANK()       OVER (ORDER BY (COALESCE(up.QuestionCount,0)+COALESCE(up.AnswerCount,0)) DESC) AS ActivityRank
+    FROM Users u
+    LEFT JOIN UserBadges ub ON ub.UserId = u.Id
+    LEFT JOIN UserPosts up  ON up.UserId = u.Id
+)
+
+SELECT
+    ur.Id                                   AS UserId,
+    ur.DisplayName,
+    ur.Reputation,
+    ur.TotalBadges,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ub.BadgeNames,
+    uv.TotalVotes,
+    uv.UpVotes,
+    uv.DownVotes,
+    ROUND(uv.NetVoteScore,2)               AS NetVoteScore,
+    up.QuestionCount,
+    up.AnswerCount,
+    up.AvgQuestionScore,
+    up.AvgAnswerScore,
+    up.TotalViews,
+    up.QuestionsWithAccepted,
+    rc.LastCommentDate,
+    rc.CommentsLast30Days,
+    ur.RepBadgeRank,
+    ur.ActivityRank,
+    (SELECT STRING_AGG(t.Tag || ':' || CAST(t.TagUseCount AS VARCHAR), ', ')
+     FROM (
+         SELECT Tag, TagUseCount
+         FROM UserTagMetrics utm
+         WHERE utm.UserId = ur.Id
+         ORDER BY TagUseCount DESC
+         LIMIT 3
+     ) t)                                   AS TopTags,
+    CASE WHEN GREATEST(up.LastPostDate, rc.LastCommentDate) IS NULL
+         THEN 'NeverActive'
+         WHEN GREATEST(up.LastPostDate, rc.LastCommentDate) < CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '180' DAY
+         THEN 'Dormant'
+         ELSE 'Active'
+    END                                    AS ActivityStatus
+FROM UserRanks ur
+LEFT JOIN UserBadges ub     ON ub.UserId = ur.Id
+LEFT JOIN UserVotes uv      ON uv.UserId = ur.Id
+LEFT JOIN UserPosts up      ON up.UserId = ur.Id
+LEFT JOIN RecentComments rc ON rc.UserId = ur.Id
+FULL OUTER JOIN (
+    SELECT DISTINCT UserId FROM Badges
+    EXCEPT SELECT DISTINCT OwnerUserId FROM Posts
+) bonly ON bonly.UserId = ur.Id
+WHERE ur.Reputation > 1000
+   OR ub.TotalBadges IS NOT NULL
+   OR (uv.TotalVotes IS NOT NULL AND uv.TotalVotes > 0)
+ORDER BY ur.RepBadgeRank
+LIMIT 200;

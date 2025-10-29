@@ -1,0 +1,159 @@
+-- {"query": "4310.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1872} 
+
+WITH PostEngagement AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Title,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS ActualCommentCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpVoteCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS DownVoteCount,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL THEN 1
+            ELSE 0
+        END AS IsClosed,
+        DATEDIFF(day, p.CreationDate, GETDATE()) AS DaysSinceCreation,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserPostRank,
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostScore
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views AS UserViews,
+        u.UpVotes AS UserUpVotes,
+        u.DownVotes AS UserDownVotes,
+        u.CreationDate AS UserCreationDate,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadges,
+        MAX(pe.CreationDate) AS LastPostCreationDate,
+        AVG(pe.Score) AS AveragePostScore,
+        SUM(pe.ViewCount) AS TotalPostViews,
+        SUM(pe.FavoriteCount) AS TotalFavoriteCount,
+        COUNT(pe.PostId) AS TotalPosts,
+        SUM(CASE WHEN pe.IsClosed = 1 THEN 1 ELSE 0 END) AS TotalClosedPosts,
+        AVG(pe.DaysSinceCreation) AS AverageDaysSinceCreation
+    FROM Users u
+    LEFT JOIN PostEngagement pe ON u.Id = pe.OwnerUserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate
+),
+QuestionDetails AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        DATEDIFF(day, p.CreationDate, GETDATE()) AS DaysOpen,
+        ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.ViewCount DESC) AS GlobalQuestionRank
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+AnswerDetails AS (
+    SELECT
+        p.Id AS AnswerId,
+        p.ParentId AS QuestionId,
+        p.OwnerUserId,
+        p.Score,
+        p.CreationDate AS AnswerCreationDate,
+        ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS RankForQuestion
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+),
+TopAnswers AS (
+    SELECT
+        ad.QuestionId,
+        ad.AnswerId,
+        ad.OwnerUserId AS AnswerOwnerUserId,
+        ad.Score AS AnswerScore,
+        ad.AnswerCreationDate,
+        ROW_NUMBER() OVER (PARTITION BY ad.QuestionId ORDER BY ad.Score DESC, ad.AnswerCreationDate ASC) AS AnswerRank
+    FROM AnswerDetails ad
+    WHERE ad.AnswerRank <= 3
+)
+SELECT
+    ua.DisplayName AS UserDisplayName,
+    ua.Reputation,
+    ua.GoldBadges,
+    ua.SilverBadges,
+    ua.BronzeBadges,
+    ua.UserViews,
+    ua.UserUpVotes,
+    ua.UserDownVotes,
+    ua.TotalPosts,
+    ua.TotalClosedPosts,
+    ua.AveragePostScore,
+    ua.TotalPostViews,
+    ua.TotalFavoriteCount,
+    ua.AverageDaysSinceCreation,
+    COALESCE(qd.Title, 'No Title') AS QuestionTitle,
+    qd.Score AS QuestionScore,
+    qd.ViewCount AS QuestionViewCount,
+    qd.AnswerCount AS QuestionAnswerCount,
+    qd.FavoriteCount AS QuestionFavoriteCount,
+    ta.AnswerScore AS TopAnswerScore,
+    ta.AnswerOwnerUserId AS TopAnswerOwnerUserId,
+    CASE
+        WHEN ua.Reputation > 100000 THEN 'Legendary'
+        WHEN ua.Reputation > 50000 THEN 'Expert'
+        WHEN ua.Reputation > 10000 THEN 'Experienced'
+        WHEN ua.Reputation > 1000 THEN 'Intermediate'
+        ELSE 'Novice'
+    END AS ReputationLevel,
+    COALESCE(LENGTH(ua.DisplayName), 0) AS DisplayNameLength,
+    UPPER(SUBSTRING(ua.DisplayName, 1, 3)) AS DisplayNamePrefix,
+    CASE
+        WHEN ua.UserCreationDate < DATEADD(year, -5, GETDATE()) THEN 'Veteran'
+        WHEN ua.UserCreationDate < DATEADD(year, -1, GETDATE()) THEN 'Established'
+        ELSE 'Newer'
+    END AS UserTenure,
+    CASE
+        WHEN qd.GlobalQuestionRank <= 100 THEN 'Top 100 Question'
+        WHEN qd.GlobalQuestionRank <= 1000 THEN 'Top 1000 Question'
+        ELSE 'Regular Question'
+    END AS QuestionTier,
+    CASE
+        WHEN ta.AnswerRank = 1 THEN 'Best Answer'
+        WHEN ta.AnswerRank <= 3 THEN 'Top 3 Answer'
+        ELSE 'Other Answer'
+    END AS AnswerQuality,
+    CASE
+        WHEN ua.LastPostCreationDate IS NULL THEN 'No Posts'
+        WHEN DATEDIFF(day, ua.LastPostCreationDate, GETDATE()) < 7 THEN 'Active Recently'
+        ELSE 'Inactive'
+    END AS UserActivityStatus,
+    CASE
+        WHEN qd.ClosedDate IS NOT NULL AND DATEDIFF(day, qd.ClosedDate, GETDATE()) < 30 THEN 'Recently Closed'
+        WHEN qd.ClosedDate IS NOT NULL THEN 'Closed Long Ago'
+        ELSE 'Open'
+    END AS QuestionStatus,
+    ua.Reputation + (ua.UserUpVotes * 5) - (ua.UserDownVotes * 2) AS CalculatedScore,
+    CONCAT(
+        ua.DisplayName,
+        '-',
+        CAST(ua.Reputation AS VARCHAR)
+    ) AS UserIdentifier,
+    ua.Reputation % 100 AS ReputationModulo,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.UserId = ua.UserId) AS UserHistoryEntries,
+    (SELECT COUNT(DISTINCT ph.PostId) FROM PostHistory ph WHERE ph.UserId = ua.UserId) AS UserHistoryPostsModified,
+    (SELECT AVG(CAST(DATEDIFF(minute, ph.CreationDate, GETDATE()) AS FLOAT)) FROM PostHistory ph WHERE ph.UserId = ua.UserId AND ph.Comment IS NOT NULL) AS AvgCommentLengthInMinutes
+FROM UserActivity ua
+LEFT JOIN QuestionDetails qd ON ua.UserId = qd.OwnerUserId
+LEFT JOIN TopAnswers ta ON qd.QuestionId = ta.QuestionId AND ta.AnswerRank = 1 -- Only join for the best answer to avoid Cartesian product issues
+WHERE ua.TotalPosts > 0
+ORDER BY ua.Reputation DESC, ua.TotalPosts DESC;

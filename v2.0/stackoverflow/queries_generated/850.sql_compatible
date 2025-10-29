@@ -1,0 +1,410 @@
+with
+recent_users as (
+  select u.id as user_id,
+         u.displayname,
+         u.reputation,
+         u.creationdate,
+         coalesce(nullif(trim(split_part(coalesce(u.location,''), ',', 1)), ''), 'Unknown') as region_hint
+  from users u
+  where u.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+),
+question_posts as (
+  select p.id,
+         p.owneruserid,
+         p.creationdate,
+         p.score,
+         p.viewcount,
+         p.title,
+         p.tags,
+         p.answercount,
+         p.acceptedanswerid,
+         p.closeddate
+  from posts p
+  where p.posttypeid = 1
+),
+answer_posts as (
+  select a.id,
+         a.parentid,
+         a.owneruserid,
+         a.creationdate,
+         a.score
+  from posts a
+  where a.posttypeid = 2
+),
+badge_summary as (
+  select b.userid,
+         count(*) filter (where b.class = 1) as gold_count,
+         count(*) filter (where b.class = 2) as silver_count,
+         count(*) filter (where b.class = 3) as bronze_count,
+         count(*) as total_badges,
+         max(b.date) as last_badge_date
+  from badges b
+  group by b.userid
+),
+votes_agg as (
+  select v.postid,
+         count(*) filter (where v.votetypeid = 2) as upvotes,
+         count(*) filter (where v.votetypeid = 3) as downvotes,
+         count(*) filter (where v.votetypeid = 5) as favorites,
+         sum(coalesce(v.bountyamount,0)) filter (where v.votetypeid in (8,9)) as bounty_total,
+         count(*) filter (where v.votetypeid in (8,9)) as bounty_events
+  from votes v
+  group by v.postid
+),
+comment_activity as (
+  select c.postid,
+         count(*) as comment_count,
+         max(c.creationdate) as last_comment_date,
+         sum(case when c.score >= 5 then 1 else 0 end) as high_scored_comments
+  from comments c
+  group by c.postid
+),
+tag_expansion as (
+  select q.id as post_id,
+         unnest(string_to_array(substring(coalesce(q.tags,''), 2, greatest(length(coalesce(q.tags,'')) - 2,0)), '><')) as tagname
+  from question_posts q
+),
+top_tags as (
+  select te.tagname,
+         count(*) as tag_usage
+  from tag_expansion te
+  group by te.tagname
+  having count(*) > 50
+),
+q_metrics as (
+  select q.id as question_id,
+         q.owneruserid as owner_id,
+         q.creationdate as q_created,
+         q.score as q_score,
+         q.viewcount as q_views,
+         q.title,
+         q.answercount,
+         q.acceptedanswerid,
+         q.closeddate,
+         coalesce(va.upvotes,0) as q_upvotes,
+         coalesce(va.downvotes,0) as q_downvotes,
+         coalesce(va.favorites,0) as q_favorites,
+         coalesce(va.bounty_total,0) as q_bounty_total,
+         coalesce(ca.comment_count,0) as q_comment_count,
+         ca.last_comment_date
+  from question_posts q
+  left join votes_agg va on va.postid = q.id
+  left join comment_activity ca on ca.postid = q.id
+),
+a_metrics as (
+  select a.parentid as question_id,
+         count(*) as answers_total,
+         max(a.score) as best_answer_score,
+         avg(a.score) as avg_answer_score,
+         min(a.creationdate) filter (where a.score = (select max(a2.score) from answer_posts a2 where a2.parentid = a.parentid)) as best_answer_first_seen,
+         count(*) filter (where a.score > 0) as positive_answers,
+         count(*) filter (where a.score < 0) as negative_answers
+  from answer_posts a
+  group by a.parentid
+),
+accepted_answer_info as (
+  select a.id as answer_id,
+         a.parentid as question_id,
+         a.owneruserid as aa_owner_id,
+         a.score as aa_score,
+         a.creationdate as aa_created
+  from posts a
+  where a.posttypeid = 2
+),
+link_dupes as (
+  select pl.relatedpostid as canonical_id,
+         count(*) filter (where pl.linktypeid = 3) as dupes_count,
+         count(*) filter (where pl.linktypeid = 1) as linked_count
+  from postlinks pl
+  group by pl.relatedpostid
+),
+edit_events as (
+  select ph.postid,
+         count(*) filter (where ph.posthistorytypeid in (4,5,6)) as edits,
+         count(*) filter (where ph.posthistorytypeid in (24)) as suggested_applied,
+         count(*) filter (where ph.posthistorytypeid in (10)) as closed_votes,
+         count(*) filter (where ph.posthistorytypeid in (11)) as reopened_votes,
+         max(ph.creationdate) as last_edit_or_event
+  from posthistory ph
+  group by ph.postid
+),
+owner_activity as (
+  select u.id as owner_id,
+         u.displayname,
+         u.reputation,
+         u.creationdate,
+         u.views,
+         u.upvotes,
+         u.downvotes,
+         coalesce(bs.total_badges,0) as total_badges,
+         coalesce(bs.gold_count,0) as gold_count,
+         coalesce(bs.silver_count,0) as silver_count,
+         coalesce(bs.bronze_count,0) as bronze_count,
+         bs.last_badge_date
+  from users u
+  left join badge_summary bs on bs.userid = u.id
+),
+q_with_top_tags as (
+  select q.question_id,
+         string_agg(distinct case when tt.tagname is not null then lower(tt.tagname) else null end, ',') as major_tags,
+         count(*) filter (where tt.tagname is not null) as major_tag_count
+  from q_metrics q
+  left join tag_expansion te on te.post_id = q.question_id
+  left join top_tags tt on tt.tagname = te.tagname
+  group by q.question_id
+),
+question_enriched as (
+  select q.question_id,
+         q.owner_id,
+         q.q_created,
+         q.q_score,
+         q.q_views,
+         q.title,
+         q.answercount,
+         q.acceptedanswerid,
+         q.closeddate,
+         q.q_upvotes,
+         q.q_downvotes,
+         q.q_favorites,
+         q.q_bounty_total,
+         q.q_comment_count,
+         q.last_comment_date,
+         coalesce(a.answers_total,0) as answers_total,
+         coalesce(a.best_answer_score,null) as best_answer_score,
+         coalesce(a.avg_answer_score,null) as avg_answer_score,
+         coalesce(a.positive_answers,0) as positive_answers,
+         coalesce(a.negative_answers,0) as negative_answers,
+         aa.answer_id as accepted_answer_id,
+         aa.aa_owner_id,
+         aa.aa_score,
+         aa.aa_created,
+         ld.dupes_count,
+         ld.linked_count,
+         ee.edits,
+         ee.suggested_applied,
+         ee.closed_votes,
+         ee.reopened_votes,
+         ee.last_edit_or_event,
+         qt.major_tags,
+         qt.major_tag_count
+  from q_metrics q
+  left join a_metrics a on a.question_id = q.question_id
+  left join accepted_answer_info aa on aa.answer_id = q.acceptedanswerid
+  left join link_dupes ld on ld.canonical_id = q.question_id
+  left join edit_events ee on ee.postid = q.question_id
+  left join q_with_top_tags qt on qt.question_id = q.question_id
+),
+owner_rank as (
+  select qe.question_id,
+         oe.owner_id,
+         oe.displayname,
+         oe.reputation,
+         oe.upvotes - oe.downvotes as net_votes,
+         oe.total_badges,
+         oe.gold_count,
+         oe.silver_count,
+         oe.bronze_count,
+         row_number() over (partition by oe.owner_id order by qe.q_views desc, qe.q_score desc, qe.q_created desc) as rn_top_by_views
+  from question_enriched qe
+  join owner_activity oe on oe.owner_id = qe.owner_id
+),
+activity_windows as (
+  select qe.question_id,
+         qe.owner_id,
+         qe.q_created,
+         qe.q_score,
+         qe.q_views,
+         qe.title,
+         qe.answercount,
+         qe.acceptedanswerid,
+         qe.closeddate,
+         qe.q_upvotes,
+         qe.q_downvotes,
+         qe.q_favorites,
+         qe.q_bounty_total,
+         qe.q_comment_count,
+         qe.last_comment_date,
+         qe.answers_total,
+         qe.best_answer_score,
+         qe.avg_answer_score,
+         qe.positive_answers,
+         qe.negative_answers,
+         qe.accepted_answer_id,
+         qe.aa_owner_id,
+         qe.aa_score,
+         qe.aa_created,
+         qe.dupes_count,
+         qe.linked_count,
+         qe.edits,
+         qe.suggested_applied,
+         qe.closed_votes,
+         qe.reopened_votes,
+         qe.last_edit_or_event,
+         qe.major_tags,
+         qe.major_tag_count,
+         count(*) over (partition by date_trunc('month', qe.q_created)) as monthly_question_volume,
+         avg(qe.q_views) over (partition by date_trunc('month', qe.q_created)) as monthly_avg_views,
+         sum(coalesce(qe.q_favorites,0)) over (order by qe.q_created rows between unbounded preceding and current row) as running_favorites,
+         lag(qe.q_score) over (partition by qe.owner_id order by qe.q_created) as prev_owner_qscore,
+         lead(qe.q_score) over (partition by qe.owner_id order by qe.q_created) as next_owner_qscore,
+         percent_rank() over (order by qe.q_views) as views_percentile,
+         ntile(10) over (order by coalesce(qe.q_upvotes,0) - coalesce(qe.q_downvotes,0) desc) as net_vote_decile
+  from question_enriched qe
+),
+final_scored as (
+  select aw.question_id,
+         aw.owner_id,
+         aw.owner_id as ow_marker,
+         aw.displayname as aw_displayname,
+         aw.q_created,
+         aw.q_score,
+         aw.q_views,
+         aw.title,
+         aw.answercount,
+         aw.acceptedanswerid,
+         aw.closeddate,
+         aw.q_upvotes,
+         aw.q_downvotes,
+         aw.q_favorites,
+         aw.q_bounty_total,
+         aw.q_comment_count,
+         aw.last_comment_date,
+         aw.answers_total,
+         aw.best_answer_score,
+         aw.avg_answer_score,
+         aw.positive_answers,
+         aw.negative_answers,
+         aw.accepted_answer_id,
+         aw.aa_owner_id,
+         aw.aa_score,
+         aw.aa_created,
+         aw.dupes_count,
+         aw.linked_count,
+         aw.edits,
+         aw.suggested_applied,
+         aw.closed_votes,
+         aw.reopened_votes,
+         aw.last_edit_or_event,
+         aw.major_tags,
+         aw.major_tag_count,
+         aw.monthly_question_volume,
+         aw.monthly_avg_views,
+         aw.running_favorites,
+         aw.prev_owner_qscore,
+         aw.next_owner_qscore,
+         aw.views_percentile,
+         aw.net_vote_decile,
+         ork.displayname as owner_displayname,
+         ork.reputation as owner_reputation,
+         ork.net_votes as owner_net_votes,
+         ork.total_badges as owner_total_badges,
+         ork.gold_count as owner_gold,
+         ork.silver_count as owner_silver,
+         ork.bronze_count as owner_bronze,
+         (case
+            when aw.closeddate is not null then 0.85
+            when aw.dupes_count > 0 then 0.9
+            else 1.0
+          end)
+         * (1.0 + least(coalesce(aw.q_bounty_total,0) / nullif(aw.q_views,0), 2.0)) as closure_bounty_factor,
+         coalesce(aw.q_upvotes,0) - coalesce(aw.q_downvotes,0) as net_votes_q,
+         coalesce(aw.answers_total,0) + coalesce(aw.q_comment_count,0) as interaction_volume,
+         coalesce(aw.best_answer_score, 0) + coalesce(aw.aa_score, 0) as acceptance_strength,
+         (coalesce(aw.q_views,0) * 0.001
+           + (coalesce(aw.q_upvotes,0) - coalesce(aw.q_downvotes,0)) * 2
+           + coalesce(aw.q_favorites,0) * 3
+           + coalesce(aw.answers_total,0) * 1.5
+           + case when aw.aa_score is not null then 5 else 0 end
+           - coalesce(aw.negative_answers,0) * 0.5
+           - case when aw.closeddate is not null then 10 else 0 end
+         ) as raw_engagement_score
+  from activity_windows aw
+  left join owner_rank ork
+    on ork.owner_id = aw.owner_id
+   and ork.rn_top_by_views = 1
+),
+normalized as (
+  select f.*,
+         avg(f.raw_engagement_score) over () as avg_engagement,
+         stddev_pop(f.raw_engagement_score) over () as sd_engagement
+  from final_scored f
+),
+ranked as (
+  select n.*,
+         (n.raw_engagement_score - n.avg_engagement) / nullif(n.sd_engagement,0) as z_engagement,
+         row_number() over (order by n.raw_engagement_score desc nulls last) as rn_overall,
+         dense_rank() over (order by coalesce(n.major_tag_count,0) desc nulls last, n.q_views desc) as dr_by_tags_views
+  from normalized n
+)
+select
+  r.question_id,
+  coalesce(r.title, '(no title)') as title,
+  r.owner_id,
+  r.owner_displayname,
+  r.owner_reputation,
+  r.major_tags,
+  r.q_created,
+  r.q_views,
+  r.q_score,
+  r.net_votes_q,
+  r.q_favorites,
+  r.answers_total,
+  r.accepted_answer_id,
+  r.aa_owner_id,
+  r.aa_score,
+  r.edits,
+  r.suggested_applied,
+  r.dupes_count,
+  r.closed_votes,
+  r.reopened_votes,
+  r.monthly_question_volume,
+  r.monthly_avg_views,
+  r.running_favorites,
+  r.views_percentile,
+  r.net_vote_decile,
+  round(cast(r.raw_engagement_score as numeric), 2) as raw_engagement_score,
+  round(cast(coalesce(r.z_engagement, 0) as numeric), 2) as z_engagement,
+  r.rn_overall,
+  r.dr_by_tags_views,
+  case
+    when r.major_tag_count is null or r.major_tag_count = 0 then 'untagged-major'
+    when position('sql' in coalesce(r.major_tags,'')) > 0 then 'sql-heavy'
+    when position('javascript' in coalesce(r.major_tags,'')) > 0 then 'js-heavy'
+    else 'other-major'
+  end as tag_profile,
+  case
+    when r.last_comment_date is null then 'no-comments'
+    when r.last_comment_date >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days' then 'active-comments'
+    else 'stale-comments'
+  end as comment_recency_bucket,
+  case
+    when r.closeddate is not null then 'closed'
+    when coalesce(r.dupes_count,0) > 0 then 'duplicate-linked'
+    when coalesce(r.edits,0) >= 5 then 'heavily-edited'
+    else 'open'
+  end as moderation_state,
+  round(
+    cast(coalesce(r.raw_engagement_score,0) * coalesce(r.closure_bounty_factor,1.0) as numeric)
+  , 2) as adjusted_score
+from ranked r
+where (
+        r.q_created >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+        and coalesce(r.q_views,0) > 0
+      )
+  and (
+        r.major_tag_count is null
+        or r.major_tag_count >= 1
+      )
+  and not exists (
+        select 1
+        from comments c
+        where c.postid = r.question_id
+          and c.text ilike any (array[
+            '%thanks%',
+            '%thank you%',
+            '%solved%',
+            '%works for me%'
+          ])
+      )
+order by adjusted_score desc nulls last, r.q_views desc
+limit 250;

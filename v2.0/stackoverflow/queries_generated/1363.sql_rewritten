@@ -1,0 +1,155 @@
+-- {"query": "1363.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2460} 
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Location,
+        U.Views AS UserViews,
+        U.UpVotes AS UserUpVotes,
+        U.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswers,
+        COUNT(C.Id) AS TotalCommentsMade,
+        EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - U.CreationDate)) / (3600 * 24 * 365.25) AS AccountAgeYears,
+        COALESCE(U.Location, 'N/A') AS UserLocationNormalized,
+        CASE
+            WHEN U.Location IS NULL OR TRIM(U.Location) = '' THEN 'Unknown'
+            ELSE SUBSTRING(U.Location FROM 1 FOR 50)
+        END AS SimplifiedLocation
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate,
+        U.Location, U.Views, U.UpVotes, U.DownVotes
+),
+PostEngagementMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.LastActivityDate,
+        P.LastEditDate,
+        P.ClosedDate,
+        P.Title,
+        P.Tags,
+        EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - P.CreationDate)) / (3600 * 24) AS PostAgeDays,
+        CAST(P.Score AS DECIMAL) / NULLIF(P.ViewCount, 0) AS ScorePerView,
+        (SELECT AVG(A.Score) FROM Posts AS A WHERE A.ParentId = P.Id AND A.PostTypeId = 2) AS AvgAnswerScoreForQuestion,
+        CASE
+            WHEN P.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN P.LastActivityDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days' AND P.Score > 100 THEN 'Hot & High-Scoring'
+            WHEN P.LastActivityDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '90 days' AND P.CommentCount >= 5 THEN 'Active Discussion'
+            ELSE 'Dormant'
+        END AS PostActivityStatus,
+        LENGTH(P.Body) AS BodyLength,
+        CHAR_LENGTH(REPLACE(P.Body, ' ', '')) AS BodyCharCountNoSpaces,
+        MD5(P.Body) AS BodyHash
+    FROM Posts AS P
+    WHERE P.PostTypeId IN (1, 2) AND P.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '5 years'
+),
+PrimaryTagInfo AS (
+    SELECT
+        P.Id AS PostId,
+        TRIM(SPLIT_PART(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags)-2), '><', 1)) AS PrimaryTagName
+    FROM Posts AS P
+    WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL AND P.Tags != ''
+),
+TagUsageStats AS (
+    SELECT
+        T.TagName,
+        COUNT(P.Id) AS PostsWithTagCount,
+        SUM(P.Score) AS TotalTagScore,
+        AVG(P.Score) AS AverageTagPostScore,
+        COUNT(DISTINCT P.OwnerUserId) AS UniqueTagUsers,
+        MAX(P.CreationDate) AS LastUsedDate
+    FROM Tags AS T
+    JOIN Posts AS P ON P.Tags LIKE '%' || '<' || T.TagName || '>' || '%'
+    WHERE P.PostTypeId = 1
+    GROUP BY T.TagName
+),
+PostHistoryEvents AS (
+    SELECT
+        PH.PostId,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.CreationDate END) AS FirstClosedDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 11 THEN PH.CreationDate END) AS FirstReopenedDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (4,5,6) THEN PH.CreationDate END) AS LastEditDateHistory,
+        COUNT(CASE WHEN PH.PostHistoryTypeId IN (4,5,6) THEN 1 END) AS TotalEditHistoryCount,
+        STRING_AGG(DISTINCT CASE WHEN PH.PostHistoryTypeId = 10 AND PH.Comment ~ '^[0-9]+$' THEN CRT.Name ELSE NULL END, '; ') FILTER (WHERE PH.PostHistoryTypeId = 10) AS AllCloseReasonNames
+    FROM PostHistory AS PH
+    LEFT JOIN CloseReasonTypes AS CRT
+        ON PH.PostHistoryTypeId = 10 AND PH.Comment ~ '^[0-9]+$' AND CAST(PH.Comment AS SMALLINT) = CRT.Id
+    GROUP BY PH.PostId
+)
+SELECT
+    PEM.PostId,
+    PEM.PostTypeId,
+    PEM.Title,
+    PEM.PostActivityStatus,
+    UAS.DisplayName AS PostOwnerDisplayName,
+    UAS.Reputation AS PostOwnerReputation,
+    UAS.AccountAgeYears,
+    PHE.FirstClosedDate,
+    PHE.FirstReopenedDate,
+    PHE.LastEditDateHistory,
+    PHE.TotalEditHistoryCount,
+    PHE.AllCloseReasonNames,
+    PTI.PrimaryTagName,
+    TUS.PostsWithTagCount AS PrimaryTagPostCount,
+    TUS.AverageTagPostScore AS PrimaryTagAvgScore,
+    (PEM.Score * 0.5 + COALESCE(PEM.FavoriteCount, 0) * 2 + PEM.CommentCount * 0.8 + COALESCE(PEM.AnswerCount, 0) * 1.5) AS EngagementScore,
+    (UAS.Reputation * 0.1 + COALESCE(PEM.Score, 0) * 0.5 + COALESCE(PEM.ScorePerView, 0) * 100) AS PostQualityMetric,
+    COALESCE(PEM.BodyCharCountNoSpaces, 0) AS PostBodyCharCount,
+    COALESCE(PEM.ViewCount, 0) AS PostViewCount,
+    COALESCE(PEM.Score, 0) AS PostScore,
+    COALESCE(PEM.PostAgeDays, 0) AS PostAgeDays,
+    COALESCE(PEM.AvgAnswerScoreForQuestion, 0) AS AvgAnswerScore,
+    (SELECT COUNT(B.Id) FROM Badges AS B WHERE B.UserId = UAS.UserId AND B.Class = 1) AS GoldBadgesOfOwner,
+    (SELECT COUNT(V.Id) FROM Votes AS V WHERE V.PostId = PEM.PostId AND V.VoteTypeId = 2) AS UpvoteCountForPost,
+    (SELECT COUNT(V.Id) FROM Votes AS V WHERE V.PostId = PEM.PostId AND V.VoteTypeId = 3) AS DownvoteCountForPost,
+    CASE
+        WHEN PEM.Score > 50 AND PEM.ViewCount > 1000 AND UAS.Reputation > 5000 THEN 'High Impact Post by Experienced User'
+        WHEN PEM.PostActivityStatus = 'Closed' AND PHE.AllCloseReasonNames LIKE '%Duplicate%' THEN 'Closed as Duplicate'
+        WHEN PEM.AvgAnswerScoreForQuestion IS NULL AND PEM.PostTypeId = 1 AND COALESCE(PEM.AnswerCount, 0) = 0 THEN 'Unanswered Question'
+        ELSE 'General'
+    END AS PostCategorization,
+    ROW_NUMBER() OVER (PARTITION BY PEM.PostTypeId ORDER BY PEM.Score DESC, PEM.ViewCount DESC) AS RankByScoreAndViews,
+    NTILE(10) OVER (ORDER BY PEM.PostAgeDays DESC, (PEM.Score * 0.5 + COALESCE(PEM.FavoriteCount, 0) * 2 + PEM.CommentCount * 0.8 + COALESCE(PEM.AnswerCount, 0) * 1.5) ASC) AS PostFreshnessDecile,
+    AVG(PEM.Score) OVER (PARTITION BY PEM.PostTypeId, UAS.SimplifiedLocation) AS AvgScoreByPostTypeAndLocation,
+    SUM(CASE WHEN PEM.PostTypeId = 1 THEN 1 ELSE 0 END) OVER (PARTITION BY UAS.UserId) AS UserQuestionCountWindowed
+FROM PostEngagementMetrics AS PEM
+LEFT JOIN UserActivitySummary AS UAS ON PEM.OwnerUserId = UAS.UserId
+LEFT JOIN PostHistoryEvents AS PHE ON PEM.PostId = PHE.PostId
+LEFT JOIN PrimaryTagInfo AS PTI ON PEM.PostId = PTI.PostId
+LEFT JOIN TagUsageStats AS TUS ON PTI.PrimaryTagName = TUS.TagName
+WHERE
+    PEM.PostId IS NOT NULL
+    AND PEM.PostAgeDays < 365 * 3
+    AND (PEM.Score > 5 OR COALESCE(PEM.FavoriteCount, 0) > 0 OR COALESCE(PEM.CommentCount, 0) > 2)
+    AND (COALESCE(UAS.Reputation, 0) >= 100 OR COALESCE(UAS.TotalQuestions, 0) + COALESCE(UAS.TotalAnswers, 0) > 5)
+    AND (PHE.TotalEditHistoryCount IS NULL OR PHE.TotalEditHistoryCount < 10)
+    AND (PEM.PostTypeId = 1 AND PEM.Title IS NOT NULL AND LENGTH(PEM.Title) > 10)
+    AND (
+        (PEM.PostTypeId = 1 AND COALESCE(PEM.ViewCount, 0) >= 100) OR
+        (PEM.PostTypeId = 2 AND COALESCE(PEM.Score, 0) >= 5)
+    )
+    AND (PTI.PrimaryTagName IS NOT NULL OR PEM.PostTypeId = 2)
+    AND NOT EXISTS (
+        SELECT 1
+        FROM Badges AS B
+        WHERE B.UserId = UAS.UserId AND B.Name LIKE '%Troublemaker%'
+    )
+    AND (PEM.ClosedDate IS NULL OR PHE.AllCloseReasonNames LIKE '%off-topic%' OR PHE.AllCloseReasonNames LIKE '%duplicate%')
+ORDER BY
+    PostQualityMetric DESC,
+    PEM.LastActivityDate DESC
+LIMIT 5000;

@@ -1,0 +1,211 @@
+WITH UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.Views AS UserViews,
+        u.UpVotes AS UserUpVotesGiven,
+        u.DownVotes AS UserDownVotesGiven,
+        COALESCE(COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1), 0) AS TotalQuestions,
+        COALESCE(COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2), 0) AS TotalAnswers,
+        COALESCE(COUNT(DISTINCT p.Id), 0) AS TotalPosts,
+        COALESCE(SUM(p.Score) FILTER (WHERE p.PostTypeId IN (1,2)), 0) AS TotalPostScore,
+        COALESCE(AVG(p.Score) FILTER (WHERE p.PostTypeId IN (1,2)), 0.0) AS AvgPostScore,
+        MIN(p.CreationDate) AS FirstPostDate,
+        MAX(p.CreationDate) AS LastPostDate,
+        COALESCE(COUNT(DISTINCT c.Id), 0) AS TotalCommentsMade,
+        COALESCE(SUM(CASE WHEN pv.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS TotalUpVotesReceived,
+        COALESCE(SUM(CASE WHEN pv.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS TotalDownVotesReceived,
+        COALESCE(SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END), 0) AS GoldBadges,
+        COALESCE(SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END), 0) AS SilverBadges,
+        COALESCE(SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END), 0) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes pv ON p.Id = pv.PostId AND pv.VoteTypeId IN (2, 3)
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Views, u.UpVotes, u.DownVotes
+),
+PostEngagementDetails AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.LastActivityDate,
+        p.ClosedDate,
+        (p.ClosedDate IS NOT NULL) AS IsClosed,
+        EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - p.LastActivityDate)) AS DaysSinceLastActivity,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId IN (2, 3, 4, 10, 11, 12, 16) THEN 1 ELSE 0 END), 0) AS TotalVotesOnPost,
+        COALESCE(COUNT(DISTINCT ph.UserId) FILTER (WHERE ph.UserId IS NOT NULL), 0) AS DistinctEditorsCount,
+        (SELECT COALESCE(u_ans.Reputation, 0)
+         FROM Posts ans
+         JOIN Users u_ans ON ans.OwnerUserId = u_ans.Id
+         WHERE ans.Id = p.AcceptedAnswerId AND p.AcceptedAnswerId IS NOT NULL
+        ) AS AcceptedAnswerOwnerReputation,
+        (SELECT EXISTS (
+            SELECT 1
+            FROM Posts ans_high
+            WHERE ans_high.ParentId = p.Id
+            AND ans_high.Score > 50
+            AND ans_high.OwnerUserId IN (
+                SELECT DISTINCT ph_inner.UserId
+                FROM PostHistory ph_inner
+                WHERE ph_inner.PostId = p.Id AND ph_inner.PostHistoryTypeId IN (4, 5, 6)
+            )
+        )) AS HasHighScoringAnswerByEditor
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId NOT IN (1, 5, 6, 7, 8, 9, 14, 15)
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId IN (4, 5, 6)
+    WHERE p.PostTypeId = 1
+    GROUP BY
+        p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount,
+        p.CommentCount, p.FavoriteCount, p.LastActivityDate, p.ClosedDate, p.AcceptedAnswerId
+),
+TagPostAggregates AS (
+    SELECT
+        unnest(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><')) AS TagName,
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Score AS PostScore,
+        p.CreationDate AS PostCreationDate
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2
+),
+TagSummary AS (
+    SELECT
+        tpa.TagName,
+        COUNT(DISTINCT tpa.PostId) AS TotalQuestionsTagged,
+        COALESCE(AVG(tpa.PostScore), 0.0) AS AvgQuestionScoreForTag,
+        COUNT(DISTINCT tpa.OwnerUserId) AS DistinctUsersContributingToTag,
+        COALESCE(SUM(CASE WHEN b.Class = 1 AND b.TagBased = TRUE THEN 1 ELSE 0 END), 0) AS GoldTagBadgesCount,
+        COALESCE(SUM(CASE WHEN b.Class = 2 AND b.TagBased = TRUE THEN 1 ELSE 0 END), 0) AS SilverTagBadgesCount,
+        COALESCE(SUM(CASE WHEN b.Class = 3 AND b.TagBased = TRUE THEN 1 ELSE 0 END), 0) AS BronzeTagBadgesCount,
+        t.Count AS GlobalTagCount,
+        MAX(tpa.PostCreationDate) AS LastPostInTagDate
+    FROM TagPostAggregates tpa
+    LEFT JOIN Badges b ON tpa.OwnerUserId = b.UserId AND b.TagBased = TRUE AND b.Name = tpa.TagName
+    JOIN Tags t ON tpa.TagName = t.TagName
+    GROUP BY tpa.TagName, t.Count
+),
+TopPostersPerTag AS (
+    SELECT
+        tpa.OwnerUserId AS UserId,
+        tpa.TagName,
+        SUM(tpa.PostScore) AS TagSpecificScore,
+        COUNT(DISTINCT tpa.PostId) AS TagSpecificQuestionCount,
+        RANK() OVER (PARTITION BY tpa.TagName ORDER BY SUM(tpa.PostScore) DESC, COUNT(DISTINCT tpa.PostId) DESC) AS RankInTag
+    FROM TagPostAggregates tpa
+    GROUP BY tpa.OwnerUserId, tpa.TagName
+    HAVING COUNT(DISTINCT tpa.PostId) >= 3 AND SUM(tpa.PostScore) > 10
+),
+RecentHighlyViewedPosts AS (
+    SELECT
+        ped.PostId,
+        ped.OwnerUserId,
+        ped.PostCreationDate,
+        ped.ViewCount,
+        ped.Score,
+        ped.DaysSinceLastActivity,
+        DENSE_RANK() OVER (ORDER BY ped.ViewCount DESC, ped.Score DESC) AS ViewScoreRank
+    FROM PostEngagementDetails ped
+    WHERE ped.PostCreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6 months'
+      AND ped.ViewCount >= 5000
+      AND ped.Score >= 10
+),
+UsersWithHighEngagementAndRecentActivity AS (
+    SELECT
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.TotalQuestions,
+        uas.AvgPostScore,
+        uas.GoldBadges,
+        uas.SilverBadges,
+        uas.BronzeBadges,
+        AVG(u.Reputation) OVER (PARTITION BY u.Location) AS AvgReputationInLocation,
+        RANK() OVER (ORDER BY uas.TotalUpVotesReceived DESC, uas.TotalPosts DESC) AS UpvoteReceiverRank,
+        CASE
+            WHEN (uas.TotalCommentsMade + uas.TotalPosts) = 0 THEN 0.0
+            ELSE CAST(uas.TotalUpVotesReceived AS NUMERIC) / (uas.TotalCommentsMade + uas.TotalPosts)
+        END AS EngagementRatio,
+        uas.LastPostDate
+    FROM UserActivitySummary uas
+    JOIN Users u ON uas.UserId = u.Id
+    WHERE uas.Reputation >= 1000
+      AND uas.TotalPosts >= 10
+      AND uas.LastPostDate IS NOT NULL
+      AND uas.LastPostDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 years'
+),
+UserQuestionCumulativeViews AS (
+    SELECT
+        ped.PostId,
+        ped.OwnerUserId AS UserId,
+        ped.PostCreationDate,
+        ped.ViewCount,
+        SUM(ped.ViewCount) OVER (PARTITION BY ped.OwnerUserId ORDER BY ped.PostCreationDate) AS CumulativeQuestionViewsAtPostDate
+    FROM PostEngagementDetails ped
+    WHERE ped.OwnerUserId IN (SELECT UserId FROM UsersWithHighEngagementAndRecentActivity)
+)
+SELECT
+    uhr.DisplayName,
+    uhr.Reputation,
+    uhr.Reputation / COALESCE(NULLIF(CAST(EXTRACT(YEAR FROM (CAST('2024-10-01' AS DATE) - u.CreationDate)) + 1 AS NUMERIC), 0), 1) AS ReputationPerYear,
+    uhr.TotalQuestions,
+    uhr.AvgPostScore,
+    uhr.GoldBadges,
+    uhr.SilverBadges,
+    uhr.BronzeBadges,
+    uhr.UpvoteReceiverRank,
+    uhr.EngagementRatio,
+    uhr.AvgReputationInLocation,
+    COALESCE(STRING_AGG(DISTINCT ts.TagName, ', ') FILTER (WHERE ts.TagName IS NOT NULL), 'No Popular Tags') AS PopularTagsContributedTo,
+    COALESCE(AVG(ts.AvgQuestionScoreForTag) FILTER (WHERE ts.TagName IS NOT NULL), 0.0) AS AvgScoreInPopularTags,
+    COALESCE(MAX(ts.DistinctUsersContributingToTag) FILTER (WHERE ts.TagName IS NOT NULL), 0) AS MaxContributorsInAnyTag,
+    COALESCE(MAX(ts.GoldTagBadgesCount) FILTER (WHERE ts.TagName IS NOT NULL), 0) AS MaxGoldTagBadgesForAnyTag,
+    BOOL_OR(tpt.RankInTag <= 5 AND tpt.TagName = ts.TagName) AS IsTop5PosterInAnyPopularTag,
+    COALESCE(u.Location, 'Unknown Location') || ' | ' || TO_CHAR(u.LastAccessDate, 'YYYY-MM-DD HH24:MI') AS UserLocationAndLastAccess,
+    (SELECT COUNT(DISTINCT pl_dup.RelatedPostId)
+     FROM PostLinks pl_dup
+     WHERE pl_dup.PostId IN (SELECT p_owner.Id FROM Posts p_owner WHERE p_owner.OwnerUserId = uhr.UserId AND p_owner.PostTypeId = 1)
+     AND pl_dup.LinkTypeId = 3
+    ) AS DuplicatedQuestionsByOwnerCount,
+    (SELECT COALESCE(AVG(ped_sub.Score), 0.0)
+     FROM PostEngagementDetails ped_sub
+     WHERE ped_sub.PostCreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6 months'
+     AND ped_sub.AnswerCount > 3
+     AND ped_sub.PostId NOT IN (SELECT rhvp_sub.PostId FROM RecentHighlyViewedPosts rhvp_sub WHERE rhvp_sub.OwnerUserId = uhr.UserId)
+    ) AS AvgScoreOfActiveQuestionsInCommunity,
+    COUNT(DISTINCT ped.PostId) FILTER (WHERE ped.IsClosed) AS TotalClosedQuestions,
+    COUNT(DISTINCT ped.PostId) FILTER (WHERE ped.HasHighScoringAnswerByEditor) AS QuestionsWithEditorHighScoreAnswer,
+    COALESCE(MAX(ped.DaysSinceLastActivity) FILTER (WHERE ped.PostId IS NOT NULL), 0) AS MaxQuestionDaysSinceActivity,
+    COALESCE(MAX(uqcv.CumulativeQuestionViewsAtPostDate) FILTER (WHERE uqcv.PostId IS NOT NULL), 0) AS LatestCumulativeQuestionViews,
+    BOOL_OR(rhvp.PostId IS NOT NULL) AS HasRecentHotPost
+FROM UsersWithHighEngagementAndRecentActivity uhr
+JOIN Users u ON uhr.UserId = u.Id
+LEFT JOIN PostEngagementDetails ped ON uhr.UserId = ped.OwnerUserId
+LEFT JOIN TagPostAggregates tpa ON uhr.UserId = tpa.OwnerUserId AND ped.PostId = tpa.PostId
+LEFT JOIN TagSummary ts ON tpa.TagName = ts.TagName AND ts.GlobalTagCount > 1000
+LEFT JOIN TopPostersPerTag tpt ON uhr.UserId = tpt.UserId AND tpt.TagName = ts.TagName
+LEFT JOIN RecentHighlyViewedPosts rhvp ON uhr.UserId = rhvp.OwnerUserId
+LEFT JOIN UserQuestionCumulativeViews uqcv ON uhr.UserId = uqcv.UserId
+WHERE
+    uhr.EngagementRatio > 0.05
+    AND (u.Location IS NOT NULL OR u.WebsiteUrl IS NOT NULL)
+    AND (ts.TagName IS NULL OR ts.AvgQuestionScoreForTag > 5)
+GROUP BY
+    uhr.DisplayName, uhr.Reputation, u.CreationDate, uhr.TotalQuestions, uhr.AvgPostScore,
+    uhr.GoldBadges, uhr.SilverBadges, uhr.BronzeBadges, uhr.UpvoteReceiverRank,
+    uhr.EngagementRatio, uhr.AvgReputationInLocation, u.Location, u.LastAccessDate, uhr.UserId
+HAVING
+    COUNT(DISTINCT ped.PostId) FILTER (WHERE ped.PostId IS NOT NULL) >= 5
+    AND SUM(ped.Score) FILTER (WHERE ped.PostId IS NOT NULL) > 50
+ORDER BY
+    uhr.UpvoteReceiverRank ASC, uhr.Reputation DESC, QuestionsWithEditorHighScoreAnswer DESC
+LIMIT 50;

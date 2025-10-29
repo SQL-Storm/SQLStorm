@@ -1,0 +1,175 @@
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN p.Id END) AS QuestionsWithAcceptedAnswer,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.Score > 0 THEN p.Id END) AS HighScoringAnswers,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN COALESCE(p.ViewCount,0) ELSE 0 END) AS TotalQuestionViews,
+    AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS AvgQuestionScore,
+    MAX(CASE WHEN p.PostTypeId = 2 THEN p.Score END) AS MaxAnswerScore,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN p.Id END) AS QuestionsWithAnswers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.CommentCount > 0 THEN p.Id END) AS QuestionsWithComments,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.CommentCount > 0 THEN p.Id END) AS AnswerWithComments,
+    COUNT(DISTINCT b.Id) AS BadgesCount,
+    STRING_AGG(DISTINCT b.Name, ', ' ORDER BY b.Name) AS BadgeNames,
+    COUNT(DISTINCT c.Id) AS CommentCount,
+    COUNT(DISTINCT ph.Id) AS PostHistoryCount,
+    COUNT(DISTINCT pl.Id) AS PostLinkCount,
+    COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVotes,
+    COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownVotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 5 THEN v.Id END) AS FavoriteCount,
+    COALESCE(SUM(CASE WHEN v.VoteTypeId = 8 THEN COALESCE(v.BountyAmount,0) ELSE 0 END), 0) AS TotalBountyAmount,
+    MAX(p.CreationDate) AS LatestPostDate,
+    MIN(p.CreationDate) AS FirstPostDate,
+    EXTRACT(EPOCH FROM (MAX(p.CreationDate) - MIN(p.CreationDate)))/86400 AS ActiveDays,
+    CASE 
+        WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 0 
+        THEN CAST(COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS NUMERIC) / 
+             CAST(COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS NUMERIC)
+        ELSE 0 
+    END AS AnswersPerQuestion,
+    CASE 
+        WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) = 0 
+        THEN 0 
+        ELSE AVG(CAST(p.AnswerCount AS NUMERIC)) 
+    END AS AvgAnswersPerQuestion,
+    STRING_AGG(
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.Title IS NOT NULL AND LENGTH(p.Title) > 0 
+            THEN SUBSTRING(p.Title FROM 1 FOR 50) || '...' 
+            ELSE NULL 
+        END, 
+        '; ' 
+        ORDER BY p.CreationDate DESC
+    ) AS RecentTitles,
+    COALESCE(
+        (SELECT p2.Title 
+         FROM Posts p2 
+         WHERE p2.PostTypeId = 1 
+           AND p2.OwnerUserId = u.Id 
+           AND p2.CreationDate = (
+               SELECT MAX(p3.CreationDate) 
+               FROM Posts p3 
+               WHERE p3.PostTypeId = 1 
+                 AND p3.OwnerUserId = u.Id
+           )
+         FETCH FIRST 1 ROW ONLY
+        ), 
+        'No Questions'
+    ) AS LatestQuestionTitle,
+    COALESCE(
+        (SELECT p4.Title 
+         FROM Posts p4 
+         WHERE p4.PostTypeId = 2 
+           AND p4.OwnerUserId = u.Id 
+           AND p4.CreationDate = (
+               SELECT MAX(p5.CreationDate) 
+               FROM Posts p5 
+               WHERE p5.PostTypeId = 2 
+                 AND p5.OwnerUserId = u.Id
+           )
+         FETCH FIRST 1 ROW ONLY
+        ), 
+        'No Answers'
+    ) AS LatestAnswerTitle,
+    COALESCE(SUM(p.Score), 0) AS TotalScore,
+    COUNT(DISTINCT CASE WHEN p.Score > 0 THEN p.Id END) AS PositiveScorePosts,
+    COUNT(DISTINCT CASE WHEN p.Score < 0 THEN p.Id END) AS NegativeScorePosts,
+    CASE 
+        WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 0 
+        THEN ROUND(
+            CAST(COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.Score > 0 THEN p.Id END) AS NUMERIC) * 100.0 / 
+            CAST(COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS NUMERIC), 2
+        )
+        ELSE 0 
+    END AS AnswerSuccessRate,
+    COUNT(DISTINCT CASE 
+        WHEN p.PostTypeId = 1 AND 
+             p.Score > (SELECT AVG(p1.Score) FROM Posts p1 WHERE p1.PostTypeId = 1) 
+        THEN p.Id 
+    END) AS AboveAvgScoreQuestions,
+    COUNT(DISTINCT CASE 
+        WHEN p.PostTypeId = 2 AND 
+             p.Score > (SELECT AVG(p2.Score) FROM Posts p2 WHERE p2.PostTypeId = 2) 
+        THEN p.Id 
+    END) AS AboveAvgScoreAnswers,
+    COALESCE(
+        (SELECT STRING_AGG(
+            CASE 
+                WHEN LENGTH(pt.Name) > 0 THEN pt.Name 
+                ELSE 'Unknown' 
+            END, 
+            ', '
+        ) 
+        FROM Posts p6
+        INNER JOIN PostTypes pt ON p6.PostTypeId = pt.Id
+        WHERE p6.OwnerUserId = u.Id
+        GROUP BY p6.OwnerUserId
+        FETCH FIRST 1 ROW ONLY
+        ), 
+        'No Posts'
+    ) AS PostTypes,
+    COUNT(DISTINCT CASE 
+        WHEN p.CreationDate >= (DATE '2024-10-01' - INTERVAL '1 month') AND p.CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 month' 
+        THEN p.Id 
+    END) AS PostsLastMonth,
+    COALESCE(
+        (SELECT p7.Title 
+         FROM Posts p7 
+         WHERE p7.OwnerUserId = u.Id 
+           AND p7.PostTypeId = 1 
+           AND p7.Score = (
+               SELECT MAX(p8.Score) 
+               FROM Posts p8 
+               WHERE p8.OwnerUserId = u.Id 
+                 AND p8.PostTypeId = 1
+           )
+         FETCH FIRST 1 ROW ONLY
+        ), 
+        'No Top Question'
+    ) AS TopScoredQuestion,
+    COALESCE(
+        (SELECT p9.Title 
+         FROM Posts p9 
+         WHERE p9.OwnerUserId = u.Id 
+           AND p9.PostTypeId = 2 
+           AND p9.Score = (
+               SELECT MAX(p10.Score) 
+               FROM Posts p10 
+               WHERE p10.OwnerUserId = u.Id 
+                 AND p10.PostTypeId = 2
+           )
+         FETCH FIRST 1 ROW ONLY
+        ), 
+        'No Top Answer'
+    ) AS TopScoredAnswer,
+    COUNT(DISTINCT CASE 
+        WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) AND ph.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '3 months') 
+        THEN ph.Id 
+    END) AS RecentModActions,
+    COUNT(DISTINCT CASE 
+        WHEN LENGTH(COALESCE(p.Tags, '')) > 0 AND p.Tags NOT LIKE '%<>%' AND (p.Tags NOT LIKE '%<%' OR p.Tags LIKE '%<%>%') 
+        THEN p.Id 
+    END) AS TaggedPosts,
+    COUNT(DISTINCT CASE 
+        WHEN p.PostTypeId = 1 AND p.ViewCount > (SELECT AVG(p11.ViewCount) FROM Posts p11 WHERE p11.PostTypeId = 1) 
+        THEN p.Id 
+    END) AS AboveAvgViewQuestions
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN Comments c ON u.Id = c.UserId
+LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+LEFT JOIN PostLinks pl ON u.Id = pl.RelatedPostId
+LEFT JOIN Votes v ON u.Id = v.UserId
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation
+HAVING 
+    COUNT(DISTINCT p.Id) > 0
+ORDER BY 
+    TotalScore DESC,
+    u.Reputation DESC,
+    ActiveDays DESC;

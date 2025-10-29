@@ -1,0 +1,110 @@
+WITH
+  RecentActivity AS (
+    SELECT
+      p.Id AS PostId,
+      p.PostTypeId,
+      p.Title,
+      p.CreationDate,
+      p.LastActivityDate,
+      p.OwnerUserId,
+      p.ViewCount,
+      p.Score,
+      p.Tags,
+      COALESCE(a.CommentCount, 0) AS CommentCount,
+      COALESCE(v.UpModCount, 0) AS UpModCount,
+      COALESCE(v.DownModCount, 0) AS DownModCount,
+      COALESCE(b.BadgeCount, 0) AS BadgeCount
+    FROM Posts p
+    LEFT JOIN (
+      SELECT PostId, COUNT(*) AS CommentCount
+      FROM Comments
+      GROUP BY PostId
+    ) a ON a.PostId = p.Id
+    LEFT JOIN (
+      SELECT v.PostId,
+             SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS UpModCount,
+             SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS DownModCount
+      FROM Votes v
+      JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+      GROUP BY v.PostId
+    ) v ON v.PostId = p.Id
+    LEFT JOIN (
+      SELECT PostId, COUNT(*) AS BadgeCount
+      FROM PostBadges
+      GROUP BY PostId
+    ) b ON b.PostId = p.Id
+  ),
+  TagSimilarity AS (
+    SELECT
+      p1.Id AS PostId,
+      p1.Tags,
+      CASE
+        WHEN p2.Id IS NULL OR p2.Tags IS NULL OR p1.Tags IS NULL THEN 0
+        ELSE (CHAR_LENGTH(p1.Tags) - CHAR_LENGTH(REPLACE(p1.Tags, ('<' || TRIM(p2.Tags) || '>'), ''))) / NULLIF(CHAR_LENGTH(('<' || TRIM(p2.Tags) || '>')), 0)
+      END AS Similarity
+    FROM Posts p1
+    LEFT JOIN Posts p2 ON p1.OwnerUserId = p2.OwnerUserId AND p2.Id <> p1.Id
+  ),
+  ActivityRank AS (
+    SELECT
+      ra.PostId,
+      ra.PostTypeId,
+      ra.Title,
+      ra.CreationDate,
+      ra.LastActivityDate,
+      ra.ViewCount,
+      ra.Score,
+      ra.CommentCount,
+      ra.UpModCount,
+      ra.DownModCount,
+      ra.BadgeCount,
+      ROW_NUMBER() OVER (
+        PARTITION BY ra.PostTypeId
+        ORDER BY (ra.Score * 2) + (ra.ViewCount * 0.5) + (ra.CommentCount * 1.2) + ra.UpModCount - ra.DownModCount DESC
+      ) AS RN
+    FROM RecentActivity ra
+  ),
+  ComplexFilter AS (
+    SELECT
+      ar.PostId,
+      ar.PostTypeId,
+      ar.Title,
+      ar.CreationDate,
+      ar.LastActivityDate,
+      ar.ViewCount,
+      ar.Score,
+      ar.CommentCount,
+      ar.UpModCount,
+      ar.DownModCount,
+      ar.BadgeCount,
+      ar.RN,
+      CASE WHEN ar.ViewCount IS NULL THEN 0 ELSE ar.ViewCount END AS vc,
+      CASE WHEN ar.Score IS NULL THEN 0 ELSE ar.Score END AS sc,
+      CASE WHEN ar.CommentCount IS NULL THEN 0 ELSE ar.CommentCount END AS com,
+      CAST(NULL AS INTEGER) AS SubQueryFlag
+    FROM ActivityRank ar
+  )
+SELECT
+  cf.PostId,
+  cf.Title,
+  cf.CreationDate,
+  cf.LastActivityDate,
+  cf.ViewCount,
+  cf.Score,
+  cf.CommentCount,
+  cf.UpModCount,
+  cf.DownModCount,
+  cf.BadgeCount,
+  cf.vc,
+  cf.sc,
+  cf.com,
+  ts.Similarity
+FROM ComplexFilter cf
+LEFT JOIN TagSimilarity ts ON ts.PostId = cf.PostId
+WHERE
+  cf.RN <= 100
+  AND (
+    (cf.sc > 0 AND cf.com > 0) OR
+    (cf.SubQueryFlag IS NULL OR cf.SubQueryFlag = 1)
+  )
+ORDER BY cf.LastActivityDate DESC, cf.Score DESC;

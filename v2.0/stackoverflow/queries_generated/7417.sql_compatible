@@ -1,0 +1,290 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT c.Id) as TotalComments,
+        COUNT(DISTINCT b.Id) as TotalBadges,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+                AVG(CAST(p.Score AS DOUBLE PRECISION)) 
+            ELSE NULL 
+        END as AvgPostScore,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2), ', ') as AllTagsUsed
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= TIMESTAMP '2010-01-01 00:00:00'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+RankedUsers AS (
+    SELECT 
+        uas.*,
+        ROW_NUMBER() OVER (ORDER BY uas.Reputation DESC, uas.TotalPosts DESC) as RankByReputation,
+        DENSE_RANK() OVER (ORDER BY uas.TotalPosts DESC) as RankByPostCount
+    FROM UserActivityStats uas
+),
+PostActivityAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.Tags,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 
+                COALESCE(p.AnswerCount, 0) * 100.0 / NULLIF(p.ViewCount, 0)
+            ELSE NULL 
+        END as AnswerToViewRatio,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 
+                CASE 
+                    WHEN p.Score >= 10 THEN 'High'
+                    WHEN p.Score >= 5 THEN 'Medium'
+                    ELSE 'Low'
+                END
+            ELSE 'NotApplicable'
+        END as ScoreCategory,
+        CAST(DATE_PART('day', TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate) AS INTEGER) as DaysSinceCreation,
+        SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2) as CleanTags
+    FROM Posts p
+    WHERE p.CreationDate >= TIMESTAMP '2015-01-01 00:00:00'
+      AND p.PostTypeId IN (1, 2)
+),
+TagFrequencyAnalysis AS (
+    SELECT 
+        tag,
+        COUNT(*) as Frequency,
+        STRING_AGG(DISTINCT CAST(p_id AS VARCHAR), ', ') as PostIds
+    FROM (
+        SELECT 
+            unnest(string_to_array(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2), '><')) as tag,
+            p.Id as p_id
+        FROM Posts p
+        WHERE p.Tags IS NOT NULL 
+          AND p.Tags <> ''
+          AND p.PostTypeId = 1
+    ) x
+    GROUP BY tag
+    HAVING COUNT(*) >= 10
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        pa.PostId,
+        pa.Title,
+        pa.Score,
+        pa.ViewCount,
+        pa.CreationDate,
+        pa.OwnerUserId,
+        pa.PostTypeId,
+        pa.AnswerToViewRatio,
+        pa.ScoreCategory,
+        pa.DaysSinceCreation,
+        pa.CleanTags,
+        RANK() OVER (PARTITION BY pa.PostTypeId ORDER BY pa.Score DESC) as ScoreRank,
+        DENSE_RANK() OVER (ORDER BY pa.ViewCount DESC) as ViewRank,
+        NTH_VALUE(pa.Title, 1) OVER (
+            PARTITION BY pa.PostTypeId 
+            ORDER BY pa.CreationDate 
+            ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+        ) as RecentTitle,
+        LAG(pa.Score, 1) OVER (ORDER BY pa.CreationDate) as PrevScore,
+        LEAD(pa.Score, 1) OVER (ORDER BY pa.CreationDate) as NextScore,
+        AVG(pa.Score) OVER (PARTITION BY pa.OwnerUserId) as AvgScorePerUser,
+        CASE 
+            WHEN pa.Score > (SELECT AVG(p2.Score) FROM Posts p2 WHERE p2.PostTypeId = 1) THEN 1
+            ELSE 0 
+        END as IsAboveAverage,
+        CASE 
+            WHEN pa.CleanTags IS NOT NULL AND CHAR_LENGTH(pa.CleanTags) > 0 THEN 
+                (CHAR_LENGTH(pa.CleanTags) - CHAR_LENGTH(REPLACE(pa.CleanTags, '>', ''))) + 1
+            ELSE 0 
+        END as TagCount
+    FROM PostActivityAnalysis pa
+    WHERE pa.Score > 0
+),
+MainAnalysis AS (
+    SELECT 
+        ru.UserId,
+        ru.DisplayName,
+        ru.Reputation,
+        ru.TotalPosts,
+        ru.TotalComments,
+        ru.TotalBadges,
+        ru.LastPostDate,
+        ru.LastCommentDate,
+        ru.AvgPostScore,
+        ru.AllTagsUsed,
+        ru.RankByReputation,
+        ru.RankByPostCount,
+        (
+            SELECT COUNT(*) 
+            FROM Posts p 
+            WHERE p.OwnerUserId = ru.UserId 
+              AND p.PostTypeId = 1
+              AND p.Score >= 10
+        ) as HighScoreQuestions,
+        (
+            SELECT COUNT(*) 
+            FROM Posts p 
+            WHERE p.OwnerUserId = ru.UserId 
+              AND p.PostTypeId = 2
+              AND p.Score >= 5
+        ) as HighScoreAnswers,
+        (
+            SELECT COUNT(*)
+            FROM Votes v
+            JOIN Posts p ON v.PostId = p.Id
+            WHERE p.OwnerUserId = ru.UserId 
+              AND v.VoteTypeId = 2
+              AND v.CreationDate >= TIMESTAMP '2020-01-01 00:00:00'
+        ) as RecentUpvotes,
+        (
+            SELECT STRING_AGG(b.Name, ', ')
+            FROM Badges b
+            WHERE b.UserId = ru.UserId
+              AND b.Date >= TIMESTAMP '2020-01-01 00:00:00'
+            GROUP BY b.UserId
+        ) as RecentBadges,
+        (
+            SELECT COUNT(*)
+            FROM PostHistory ph
+            JOIN Posts p ON ph.PostId = p.Id
+            WHERE p.OwnerUserId = ru.UserId 
+              AND ph.PostHistoryTypeId IN (4, 5, 6)
+              AND ph.CreationDate >= TIMESTAMP '2020-01-01 00:00:00'
+        ) as RecentEdits
+    FROM RankedUsers ru
+    WHERE ru.Reputation > 1000
+),
+FilteredPosts AS (
+    SELECT *
+    FROM ComplexPostAnalysis
+    WHERE ScoreCategory IN ('High', 'Medium')
+      AND TagCount >= 1
+      AND DaysSinceCreation <= 365
+)
+SELECT 
+    'User Performance Report' as ReportType,
+    COUNT(*) as TotalUsers,
+    AVG(Reputation) as AvgReputation,
+    MAX(Reputation) as MaxReputation,
+    MIN(Reputation) as MinReputation,
+    COUNT(DISTINCT UserId) as DistinctUsers,
+    STRING_AGG(
+        (DisplayName || ' (' || Reputation || ')'), 
+        '; '
+    ) as TopUsers,
+    COUNT(*) OVER() as TotalReports,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        JOIN Users u ON p.OwnerUserId = u.Id
+        WHERE u.Id IN (SELECT UserId FROM MainAnalysis)
+          AND p.PostTypeId = 1
+    ) as RelevantQuestions,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        JOIN Users u ON p.OwnerUserId = u.Id
+        WHERE u.Id IN (SELECT UserId FROM MainAnalysis)
+          AND p.PostTypeId = 2
+    ) as RelevantAnswers,
+    (
+        SELECT STRING_AGG(
+            ('Tag: ' || tag || ' - Count: ' || Frequency), 
+            '; '
+        )
+        FROM TagFrequencyAnalysis
+        WHERE Frequency >= 50
+    ) as PopularTags,
+    (
+        SELECT AVG(Score) 
+        FROM FilteredPosts
+    ) as AvgFilteredPostScore
+FROM MainAnalysis
+WHERE TotalPosts > 10
+  AND TotalComments > 5
+  AND LastPostDate >= TIMESTAMP '2020-01-01 00:00:00'
+  AND LastCommentDate >= TIMESTAMP '2020-01-01 00:00:00'
+GROUP BY 
+    ReportType,
+    -- grouping by all non-aggregated selected columns
+    TotalUsers,
+    AvgReputation,
+    MaxReputation,
+    MinReputation,
+    DistinctUsers,
+    TopUsers,
+    TotalReports,
+    RelevantQuestions,
+    RelevantAnswers,
+    PopularTags,
+    AvgFilteredPostScore
+HAVING 
+    COUNT(*) > 0
+EXCEPT
+SELECT 
+    'User Performance Report' as ReportType,
+    COUNT(*) as TotalUsers,
+    AVG(Reputation) as AvgReputation,
+    MAX(Reputation) as MaxReputation,
+    MIN(Reputation) as MinReputation,
+    COUNT(DISTINCT UserId) as DistinctUsers,
+    STRING_AGG(
+        (DisplayName || ' (' || Reputation || ')'), 
+        '; '
+    ) as TopUsers,
+    COUNT(*) OVER() as TotalReports,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        JOIN Users u ON p.OwnerUserId = u.Id
+        WHERE u.Id IN (SELECT UserId FROM MainAnalysis)
+          AND p.PostTypeId = 1
+    ) as RelevantQuestions,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        JOIN Users u ON p.OwnerUserId = u.Id
+        WHERE u.Id IN (SELECT UserId FROM MainAnalysis)
+          AND p.PostTypeId = 2
+    ) as RelevantAnswers,
+    (
+        SELECT STRING_AGG(
+            ('Tag: ' || tag || ' - Count: ' || Frequency), 
+            '; '
+        )
+        FROM TagFrequencyAnalysis
+        WHERE Frequency >= 50
+    ) as PopularTags,
+    (
+        SELECT AVG(Score) 
+        FROM FilteredPosts
+    ) as AvgFilteredPostScore
+FROM MainAnalysis
+WHERE TotalPosts < 5
+   OR TotalComments < 2
+   OR LastPostDate < TIMESTAMP '2019-01-01 00:00:00'
+GROUP BY 
+    ReportType,
+    TotalUsers,
+    AvgReputation,
+    MaxReputation,
+    MinReputation,
+    DistinctUsers,
+    TopUsers,
+    TotalReports,
+    RelevantQuestions,
+    RelevantAnswers,
+    PopularTags,
+    AvgFilteredPostScore;

@@ -1,0 +1,207 @@
+WITH RecursiveUserBadges AS (
+    SELECT
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class,
+        b.Date,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY b.Date DESC) as BadgeRank
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE b.TagBased = FALSE OR b.TagBased = 0
+),
+LatestBadges AS (
+    SELECT
+        UserId,
+        DisplayName,
+        BadgeName,
+        Class,
+        Date
+    FROM RecursiveUserBadges
+    WHERE BadgeRank = 1
+),
+QuestionsWithStats AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        COALESCE(p.ViewCount,0) as Views,
+        COALESCE(p.AnswerCount,0) as Answers,
+        COALESCE(p.FavoriteCount,0) as Favorites,
+        STRING_AGG(DISTINCT lt.Name, ', ') FILTER (WHERE lt.Name IS NOT NULL) AS LinkTypes,
+        STRING_AGG(DISTINCT lh.Name, ', ') FILTER (WHERE lh.Name IS NOT NULL) AS HistoryTypes,
+        COALESCE(pc.CommentCount,0) as CommentCount,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            ELSE 'Open'
+        END as Status,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate) as OwnerTopScoreRanking
+    FROM Posts p
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+    LEFT JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    LEFT JOIN LATERAL (
+        SELECT STRING_AGG(DISTINCT pht.Name, ', ') as Name
+        FROM PostHistory ph
+        JOIN PostHistoryTypes pht ON pht.Id = ph.PostHistoryTypeId
+        WHERE ph.PostId = p.Id
+    ) lh ON true
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) as CommentCount
+        FROM Comments
+        GROUP BY PostId
+    ) pc ON pc.PostId = p.Id
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.FavoriteCount, p.ClosedDate, pc.CommentCount
+),
+TopAnswerersFiltered AS (
+    SELECT
+        a.OwnerUserId,
+        u.DisplayName,
+        COUNT(a.Id) AS AnswerCount,
+        AVG(a.Score) AS AvgAnswerScore,
+        MAX(a.CreationDate) AS MostRecentAnswerDate
+    FROM Posts a
+    JOIN Users u ON u.Id = a.OwnerUserId
+    WHERE a.PostTypeId = 2
+      AND a.Score > (
+          SELECT COALESCE(AVG(p2.Score), 0)
+          FROM Posts p2
+          WHERE p2.PostTypeId = 2
+      )
+    GROUP BY a.OwnerUserId, u.DisplayName
+    HAVING COUNT(a.Id) >= 10
+),
+QuestionAnswerCommentStats AS (
+    SELECT q.Id as QuestionId,
+           q.Title as QuestionTitle,
+           q.OwnerUserId as QuestionOwner,
+           COUNT(DISTINCT a.Id) AS NumberOfAnswers,
+           SUM(COALESCE(c.Score,0)) AS TotalAnswerCommentsScore,
+           MAX(a.Score) AS MaxAnswerScore
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    LEFT JOIN Comments c ON c.PostId = a.Id
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.Title, q.OwnerUserId
+),
+UnionSet AS (
+    SELECT u.Id, u.DisplayName, u.Reputation, CAST(NULL AS INTEGER) AS PostId, CAST(NULL AS VARCHAR(300)) AS PostTitle, CAST(NULL AS INTEGER) AS PostScore, 'UserOnly' as Source
+    FROM Users u
+    WHERE u.Reputation > 5000
+
+    UNION
+
+    SELECT p.OwnerUserId AS Id, u.DisplayName, u.Reputation, p.Id AS PostId, p.Title AS PostTitle, p.Score AS PostScore, 'UserWithPost' as Source
+    FROM Posts p
+    JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1 AND p.Score > 10
+),
+WindowedUsers AS (
+    SELECT
+        Id,
+        DisplayName,
+        Reputation,
+        PostId,
+        PostTitle,
+        PostScore,
+        Source,
+        RANK() OVER (PARTITION BY Source ORDER BY Reputation DESC, COALESCE(PostScore,0) DESC) as RankByRep
+    FROM UnionSet
+),
+QuestionTagsExploded AS (
+    SELECT
+        p.Id as PostId,
+        unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')) as Tag
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+),
+PopularTags AS (
+    SELECT
+        Tag,
+        COUNT(*) AS TagUsageCount,
+        AVG(p.Score) AS AvgTagScore
+    FROM QuestionTagsExploded qte
+    JOIN Posts p ON p.Id = qte.PostId
+    GROUP BY Tag
+    HAVING COUNT(*) > 50
+),
+FinalSelection AS (
+    SELECT
+        qws.Id as QuestionId,
+        qws.Title,
+        qws.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        qws.CreationDate,
+        qws.Score AS QuestionScore,
+        qws.Views,
+        qws.Answers,
+        qws.Favorites,
+        qws.LinkTypes,
+        qws.HistoryTypes,
+        qws.CommentCount,
+        qws.Status,
+        lb.BadgeName AS LatestBadge,
+        tsf.AnswerCount AS OwnerAnswerCountAboveAvg,
+        tsf.AvgAnswerScore AS OwnerAvgAnswerScore,
+        tsf.MostRecentAnswerDate AS OwnerMostRecentAnswer,
+        qacs.NumberOfAnswers,
+        qacs.TotalAnswerCommentsScore,
+        qacs.MaxAnswerScore,
+        pt.Tag as PopularTag,
+        pt.TagUsageCount,
+        pt.AvgTagScore,
+        wusr.RankByRep
+    FROM QuestionsWithStats qws
+    LEFT JOIN Users u ON u.Id = qws.OwnerUserId
+    LEFT JOIN LatestBadges lb ON lb.UserId = qws.OwnerUserId
+    LEFT JOIN TopAnswerersFiltered tsf ON tsf.OwnerUserId = qws.OwnerUserId
+    LEFT JOIN QuestionAnswerCommentStats qacs ON qacs.QuestionId = qws.Id
+    LEFT JOIN QuestionTagsExploded qte ON qte.PostId = qws.Id
+    LEFT JOIN PopularTags pt ON pt.Tag = qte.Tag
+    LEFT JOIN WindowedUsers wusr ON wusr.Id = qws.OwnerUserId AND wusr.Source = 'UserWithPost'
+    WHERE qws.Status = 'Open'
+)
+
+SELECT
+    fs.QuestionId,
+    fs.Title,
+    fs.OwnerUserId,
+    fs.OwnerDisplayName,
+    TO_CHAR(fs.CreationDate, 'YYYY-MM-DD') AS CreationDate,
+    fs.QuestionScore,
+    fs.Views,
+    fs.Answers,
+    fs.Favorites,
+    fs.LinkTypes,
+    fs.HistoryTypes,
+    fs.CommentCount,
+    fs.Status,
+    COALESCE(fs.LatestBadge, 'No Badge') AS LatestBadge,
+    COALESCE(fs.OwnerAnswerCountAboveAvg, 0) AS OwnerAnswerCountAboveAvg,
+    ROUND(COALESCE(fs.OwnerAvgAnswerScore, 0), 2) AS OwnerAvgAnswerScore,
+    TO_CHAR(fs.OwnerMostRecentAnswer, 'YYYY-MM-DD') AS OwnerMostRecentAnswer,
+    fs.NumberOfAnswers,
+    fs.TotalAnswerCommentsScore,
+    fs.MaxAnswerScore,
+    COALESCE(fs.PopularTag, 'No Popular Tag') AS PopularTag,
+    COALESCE(fs.TagUsageCount, 0) AS TagUsageCount,
+    ROUND(COALESCE(fs.AvgTagScore, 0), 2) AS AvgTagScore,
+    fs.RankByRep,
+    CASE
+        WHEN fs.QuestionScore > 50 AND fs.Views > 1000 THEN 'High impact'
+        WHEN fs.QuestionScore BETWEEN 20 AND 50 THEN 'Medium Impact'
+        ELSE 'Low Impact'
+    END AS ImpactCategory,
+    CONCAT(
+        'QTitle: ', SUBSTRING(fs.Title FROM 1 FOR 50), ' | Owner: ', COALESCE(fs.OwnerDisplayName, 'Unknown'),
+        ' | Badge: ', COALESCE(fs.LatestBadge, 'None'),
+        ' | Tags: ', COALESCE(fs.PopularTag, 'None'),
+        ' | Score/View Ratio: ',
+        CASE WHEN fs.Views > 0 THEN CAST(ROUND(CAST(fs.QuestionScore AS NUMERIC)/fs.Views, 4) AS TEXT) ELSE 'N/A' END,
+        ' | Status: ', fs.Status
+    ) AS SummaryInfo
+FROM FinalSelection fs
+ORDER BY fs.RankByRep NULLS LAST, fs.QuestionScore DESC
+LIMIT 100 OFFSET 0;

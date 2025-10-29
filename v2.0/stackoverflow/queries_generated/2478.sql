@@ -1,0 +1,143 @@
+-- {"query": "2478.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1382} 
+with recursive TagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        0 as Level,
+        array[t.Id] as Path
+    from
+        Tags t
+    where
+        t.IsRequired = 1
+
+    union all
+
+    select
+        t.Id,
+        t.TagName,
+        th.Level + 1,
+        th.Path || t.Id
+    from
+        Tags t
+        join TagHierarchy th on t.Count < th.Level * 10 + 50 and not t.Id = any(th.Path)
+    where
+        t.IsModeratorOnly = 0
+),
+UserPostStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(p.Id) filter (where p.PostTypeId = 1) as QuestionsPosted,
+        count(p.Id) filter (where p.PostTypeId = 2) as AnswersPosted,
+        coalesce(sum(vup.VoteCount),0) as TotalUpVotesOnPosts,
+        coalesce(sum(vdown.VoteCount),0) as TotalDownVotesOnPosts,
+        max(p.Score) as MaxPostScore,
+        avg(p.Score) as AvgPostScore,
+        count(distinct b.Id) as BadgesEarned,
+        row_number() over (order by count(p.Id) filter (where p.PostTypeId = 1) desc nulls last) as RankByQuestions
+    from
+        Users u
+        left join Posts p on p.OwnerUserId = u.Id
+        left join (
+            select PostId, count(*) as VoteCount
+            from Votes
+            where VoteTypeId = 2
+            group by PostId
+        ) vup on vup.PostId = p.Id
+        left join (
+            select PostId, count(*) as VoteCount
+            from Votes
+            where VoteTypeId = 3
+            group by PostId
+        ) vdown on vdown.PostId = p.Id
+        left join Badges b on b.UserId = u.Id
+    group by
+        u.Id,
+        u.DisplayName
+),
+CloseStats as (
+    select
+        p.Id as PostId,
+        p.Title,
+        p.CreationDate,
+        p.ClosedDate,
+        coalesce(crt.Name, 'Not Closed') as CloseReason,
+        ph.UserId as CloserUserId,
+        ph.UserDisplayName as CloserUserDisplayName,
+        ph.CreationDate as CloseVoteDate
+    from
+        Posts p
+        left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 10 -- Post Closed
+        left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    where
+        p.PostTypeId = 1
+),
+AnswerRanks as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId,
+        a.Score,
+        rank() over (partition by a.ParentId order by a.Score desc nulls last) as ScoreRank
+    from
+        Posts a
+    where
+        a.PostTypeId = 2
+),
+CorrelatedCommentsCount as (
+    select
+        p.Id as PostId,
+        (select count(*) from Comments c where c.PostId = p.Id and c.Score > 0) as PositiveCommentCount,
+        (select count(*) from Comments c where c.PostId = p.Id and (c.Text ilike '%sql%' or c.Text ilike '%join%' or c.Text ilike '%query%')) as SQLMentionsInComments
+    from
+        Posts p
+),
+TaggedQuestions as (
+    select
+        p.Id,
+        p.Title,
+        p.Tags,
+        unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) as Tag
+    from
+        Posts p
+    where
+        p.PostTypeId = 1
+)
+select
+    u.DisplayName,
+    u.QuestionsPosted,
+    u.AnswersPosted,
+    u.TotalUpVotesOnPosts,
+    u.TotalDownVotesOnPosts,
+    u.BadgesEarned,
+    u.RankByQuestions,
+    coalesce(cs.CloseReason, 'Not Closed') as RecentClosedReason,
+    cs.CloseVoteDate,
+    ar.AnswerId,
+    ar.Score as AnswerScore,
+    ar.ScoreRank,
+    cc.PositiveCommentCount,
+    cc.SQLMentionsInComments,
+    string_agg(distinct tq.Tag, ',') as TagsInUserQuestions,
+    th.Level as MaxTagHierarchyLevel,
+    coalesce(nullif(u.AvgPostScore, 0), 0) as AvgScoreNonZero,
+    (case when u.TotalDownVotesOnPosts > 0 then round(1.0*u.TotalUpVotesOnPosts/u.TotalDownVotesOnPosts, 2) else null end) as UpDownVoteRatio,
+    (select count(*) from PostLinks pl inner join LinkTypes lt on pl.LinkTypeId = lt.Id where pl.PostId = ar.AnswerId and lt.Name = 'Duplicate') as AnswerDuplicateCount,
+    coalesce(u.Reputation, 0) / nullif(date_part('day', current_date - u.CreationDate::date), 1) as ReputationPerDay,
+    (select string_agg(b2.Name || '(' || b2.Date::date || ')', '; ') from Badges b2 where b2.UserId = u.UserId and b2.Date > current_date - interval '365 days' and b2.Class = 1) as RecentGoldBadges
+from
+    UserPostStats u
+    left join CloseStats cs on cs.CloserUserId = u.UserId and cs.CloseVoteDate > current_date - interval '30 days'
+    left join AnswerRanks ar on ar.OwnerUserId = u.UserId and ar.ScoreRank = 1
+    left join CorrelatedCommentsCount cc on cc.PostId = ar.AnswerId
+    left join TaggedQuestions tq on tq.Id in (select Id from Posts where OwnerUserId = u.UserId and PostTypeId = 1 limit 10) -- limits to 10 questions for performance
+    left join (
+        select th2.Level, th2.Path[1] as TopTagId, th2.TagName from TagHierarchy th2
+        order by th2.Level desc limit 1
+    ) th on th.TopTagId = (select TagName from Tags where Id = th.TopTagId limit 1)
+where
+    u.QuestionsPosted > 5
+    and u.AnswersPosted > 10
+order by
+    u.RankByQuestions
+limit 100;

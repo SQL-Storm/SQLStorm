@@ -1,0 +1,195 @@
+-- {"query": "1551.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3198} 
+
+WITH UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS TotalUpvotesReceivedOnPosts,
+        SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS TotalDownvotesReceivedOnPosts,
+        MAX(b.Date) AS LastBadgeDate,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (2, 3) -- UpMod, DownMod received on owner's posts
+    LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+PostDetailsAggregated AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.LastActivityDate,
+        p.AnswerCount,
+        p.CommentCount AS OriginalCommentCount, -- Stored comment count, might differ from actual
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.CommunityOwnedDate,
+        p.Tags,
+        p.Title,
+        p.AcceptedAnswerId,
+        -- Correlated Subquery: Count actual comments
+        (SELECT COUNT(c_sub.Id) FROM Comments c_sub WHERE c_sub.PostId = p.Id) AS ActualCommentCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS ActualUpvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS ActualDownvotes,
+        SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS ActualFavorites -- Note: Favorite votes changed to Saves after Oct 2022
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    GROUP BY
+        p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.OwnerUserId,
+        p.LastActivityDate, p.AnswerCount, p.CommentCount, p.FavoriteCount,
+        p.ClosedDate, p.CommunityOwnedDate, p.Tags, p.Title, p.AcceptedAnswerId
+),
+PostHistoryContext AS (
+    SELECT
+        ph.PostId,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 5 THEN ph.CreationDate END) AS LastBodyEditDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 4 THEN ph.CreationDate END) AS LastTitleEditDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 6 THEN ph.CreationDate END) AS LastTagsEditDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN 'Closed' ELSE NULL END) AS IsClosedViaHistory,
+        (SELECT MIN(ph_sub.CreationDate) FROM PostHistory ph_sub WHERE ph_sub.PostId = ph.PostId AND ph_sub.PostHistoryTypeId = 10) AS FirstCloseDateByHistory,
+        STRING_AGG(DISTINCT crt.Name, '; ') FILTER (WHERE ph.PostHistoryTypeId = 10 AND ph.Comment IS NOT NULL AND crt.Name IS NOT NULL) AS CloseReasonNames
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON ph.PostHistoryTypeId = 10 AND ph.Comment = crt.Id::varchar(50) -- Cast Comment to smallint for join
+    GROUP BY ph.PostId
+)
+SELECT
+    pda.PostId,
+    pda.Title,
+    pt.Name AS PostTypeName,
+    COALESCE(uas.DisplayName, 'Community User') AS OwnerDisplayName,
+    uas.Reputation AS OwnerReputation,
+    pda.PostScore AS CurrentScore,
+    pda.ActualUpvotes,
+    pda.ActualDownvotes,
+    pda.ViewCount,
+    pda.ActualCommentCount,
+    pda.AnswerCount,
+    pda.FavoriteCount,
+    pda.PostCreationDate,
+    pda.LastActivityDate,
+    -- NULL Logic and CASE WHEN for Post Status
+    CASE
+        WHEN pda.ClosedDate IS NOT NULL THEN 'Closed by Date'
+        WHEN phc.IsClosedViaHistory = 'Closed' THEN 'Closed by History'
+        ELSE 'Open'
+    END AS PostStatus,
+    phc.CloseReasonNames,
+    -- Correlated Subquery: Check if owner has a 'Famous Question' badge (Class 1, TagBased False, Name 'Famous Question')
+    (
+        SELECT COUNT(b.Id)
+        FROM Badges b
+        WHERE b.UserId = pda.OwnerUserId
+          AND b.Name = 'Famous Question'
+          AND b.Class = 1
+          AND b.TagBased = FALSE
+    ) AS HasFamousQuestionBadge,
+    -- Complicated Predicate/Expression/Calculation: Time active
+    EXTRACT(EPOCH FROM (pda.LastActivityDate - pda.PostCreationDate)) / 3600.0 AS HoursActiveSinceCreation,
+    -- Complicated Expression: Product of title length and score
+    COALESCE(LENGTH(pda.Title) * pda.PostScore, 0) AS TitleScoreProduct,
+    -- Non-correlated Subquery: Count number of duplicate links
+    (SELECT COUNT(DISTINCT pl_sub.RelatedPostId) FROM PostLinks pl_sub WHERE pl_sub.PostId = pda.PostId AND pl_sub.LinkTypeId = 3) AS NumberOfDuplicates,
+    -- Window Functions: Rank by score within post type
+    ROW_NUMBER() OVER (PARTITION BY pt.Name ORDER BY pda.PostScore DESC, pda.ViewCount DESC) AS RankInPostTypeByScore,
+    -- Window Functions: Average score of owner's posts
+    AVG(pda.PostScore) OVER (PARTITION BY uas.UserId) AS AvgScoreOfOwnersPosts,
+    -- Window Functions: Previous post score by owner
+    LAG(pda.PostScore, 1, 0) OVER (PARTITION BY uas.UserId ORDER BY pda.PostCreationDate) AS PrevPostScoreByOwner,
+    -- CASE WHEN for conditional categorization
+    CASE
+        WHEN pda.PostScore >= 100 THEN 'Very High Score'
+        WHEN pda.PostScore >= 50 THEN 'High Score'
+        WHEN pda.PostScore >= 10 THEN 'Moderate Score'
+        ELSE 'Low Score'
+    END AS ScoreCategory,
+    -- String Expressions: Modified Title
+    REPLACE(REPLACE(REPLACE(pda.Title, 'SQL', 'Database Query'), 'C#', 'CSharp'), 'Java', 'JVM Language') AS ModifiedTitle,
+    -- String Expression: Number of Tags
+    ARRAY_LENGTH(string_to_array(SUBSTRING(pda.Tags, 2, LENGTH(pda.Tags) - 2), '><'), 1) AS NumberOfTags,
+    -- Accepted Answer Details using LEFT JOIN and COALESCE
+    COALESCE(aa.Score, 0) AS AcceptedAnswerScore,
+    COALESCE(LENGTH(aa.Body), 0) AS AcceptedAnswerBodyLength,
+    -- EXISTS Subquery: Check for unusual answers being questions
+    EXISTS (SELECT 1 FROM Posts ans WHERE ans.ParentId = pda.PostId AND ans.PostTypeId = 1) AS HasQuestionAsAnswer,
+    -- Complicated Predicate with String Functions: Database related tags
+    (pda.Tags ILIKE '%<sql>%' OR pda.Tags ILIKE '%<postgresql>%' OR pda.Tags ILIKE '%<mysql>%') AS IsDatabaseRelated,
+    -- Conditional Expression: More gold than silver badges
+    CASE WHEN uas.GoldBadges > uas.SilverBadges THEN TRUE ELSE FALSE END AS MoreGoldThanSilverBadges
+FROM PostDetailsAggregated pda
+INNER JOIN PostTypes pt ON pda.PostTypeId = pt.Id
+LEFT JOIN UserActivitySummary uas ON pda.OwnerUserId = uas.UserId
+LEFT JOIN PostHistoryContext phc ON pda.PostId = phc.PostId
+LEFT JOIN Posts aa ON pda.AcceptedAnswerId = aa.Id -- For accepted answer details
+WHERE
+    pda.PostTypeId = 1 -- Only questions
+    -- Non-correlated Subquery in WHERE: Filter by score above average
+    AND pda.PostScore > (SELECT AVG(p_inner.Score) FROM Posts p_inner WHERE p_inner.PostTypeId = 1 AND p_inner.OwnerUserId IS NOT NULL)
+    AND pda.LastActivityDate BETWEEN '2022-01-01' AND '2023-12-31'
+    AND pda.ViewCount > 1000
+    -- Complicated Predicate with NULL logic and string expression
+    AND (pda.Tags IS NULL OR POSITION('<database>' IN LOWER(pda.Tags)) = 0) -- Exclude generic database tag
+    -- NULL logic and complicated predicate
+    AND (uas.Reputation IS NULL OR uas.Reputation > 500)
+    -- NOT EXISTS Subquery: Exclude posts that don't link to others
+    AND NOT EXISTS (SELECT 1 FROM PostLinks pl_exists WHERE pl_exists.PostId = pda.PostId AND pl_exists.LinkTypeId = 1)
+UNION ALL -- Set Operator: Combine with highly upvoted answers from prolific users
+SELECT
+    p.Id AS PostId,
+    LEFT(p.Body, 100) AS Title, -- Use first 100 chars of body for answer 'title'
+    pt.Name AS PostTypeName,
+    COALESCE(uas.DisplayName, 'Community User') AS OwnerDisplayName,
+    uas.Reputation AS OwnerReputation,
+    p.Score AS CurrentScore,
+    (SELECT SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) FROM Votes v WHERE v.PostId = p.Id) AS ActualUpvotes,
+    (SELECT SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) FROM Votes v WHERE v.PostId = p.Id) AS ActualDownvotes,
+    NULL AS ViewCount, -- Answers don't have ViewCount directly
+    (SELECT COUNT(c_sub.Id) FROM Comments c_sub WHERE c_sub.PostId = p.Id) AS ActualCommentCount,
+    NULL AS AnswerCount, -- Answers don't have AnswerCount
+    NULL AS FavoriteCount, -- Answers don't have FavoriteCount
+    p.CreationDate AS PostCreationDate,
+    p.LastActivityDate,
+    'Answer' AS PostStatus, -- Answers don't have a closed status in the same way
+    NULL AS CloseReasonNames,
+    0 AS HasFamousQuestionBadge, -- Not applicable for answers
+    EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate)) / 3600.0 AS HoursActiveSinceCreation,
+    COALESCE(LENGTH(p.Body) * p.Score, 0) AS TitleScoreProduct, -- Using body length for answers
+    0 AS NumberOfDuplicates, -- Not applicable for answers
+    ROW_NUMBER() OVER (PARTITION BY pt.Name ORDER BY p.Score DESC) AS RankInPostTypeByScore,
+    AVG(p.Score) OVER (PARTITION BY uas.UserId) AS AvgScoreOfOwnersPosts,
+    LAG(p.Score, 1, 0) OVER (PARTITION BY uas.UserId ORDER BY p.CreationDate) AS PrevPostScoreByOwner,
+    CASE
+        WHEN p.Score >= 50 THEN 'Highly Valued Answer'
+        WHEN p.Score >= 20 THEN 'Valued Answer'
+        ELSE 'Regular Answer'
+    END AS ScoreCategory,
+    REPLACE(SUBSTRING(p.Body, 1, 100), CHR(10), ' ') AS ModifiedTitle, -- first 100 chars of body for answers
+    0 AS NumberOfTags, -- Not applicable for answers
+    0 AS AcceptedAnswerScore,
+    0 AS AcceptedAnswerBodyLength,
+    FALSE AS HasQuestionAsAnswer,
+    (p.Body ILIKE '%transaction%' OR p.Body ILIKE '%concurrency%') AS IsDatabaseRelated, -- Check body for answers content
+    CASE WHEN uas.GoldBadges > uas.SilverBadges THEN TRUE ELSE FALSE END AS MoreGoldThanSilverBadges
+FROM Posts p
+INNER JOIN PostTypes pt ON p.PostTypeId = pt.Id
+INNER JOIN UserActivitySummary uas ON p.OwnerUserId = uas.UserId
+WHERE
+    p.PostTypeId = 2 -- Only answers
+    AND p.Score > 20
+    AND uas.TotalPostsOwned > 50 -- Filter by prolific users
+    AND p.CreationDate >= '2023-01-01'
+    AND p.ParentId IS NOT NULL -- Must be an answer to a question
+    AND p.LastEditDate IS NOT NULL -- Has been edited at least once (NULL logic)
+ORDER BY PostCreationDate DESC, CurrentScore DESC;

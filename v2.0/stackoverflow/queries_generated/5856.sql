@@ -1,0 +1,150 @@
+-- {"query": "5856.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1029} 
+WITH
+FilteredPosts AS (
+  SELECT
+    p.Id,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.ViewCount,
+    p.Score,
+    p.CommentCount,
+    p.AnswerCount,
+    p.LastActivityDate,
+    p.FavoriteCount,
+    p.ContentLicense,
+    p.LastEditorUserId,
+    p.LastEditDate,
+    p.ParentId
+  FROM Posts p
+  WHERE p.PostTypeId IN (1,2) -- Questions and Answers
+),
+UserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.Location,
+    u.WebsiteUrl,
+    u.AboutMe,
+    u.ProfileImageUrl,
+    u.EmailHash,
+    u.AccountId,
+    ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY u.LastAccessDate DESC) AS rn
+  FROM Users u
+),
+TagsExploded AS (
+  SELECT
+    p.Id AS PostId,
+    trim(t.value, ' <>') AS Tag
+  FROM FilteredPosts p
+  CROSS APPLY (
+    SELECT value AS value
+    FROM string_split(p.Tags, '><')
+    WHERE p.Tags IS NOT NULL
+  ) AS t
+),
+-- Edges: compute a performance-centric set of joins and windowed aggregates
+PostHistoryAgg AS (
+  SELECT
+    ph.PostId,
+    ph.PostHistoryTypeId,
+    ph.CreationDate,
+    ph.UserId,
+    ph.Comment,
+    ph.Text,
+    ph.RevisionGUID
+  FROM PostHistory ph
+  WHERE ph.CreationDate >= DATEADD(year, -2, GETDATE()) -- recent history window
+),
+LinkInfo AS (
+  SELECT
+    pl.PostId,
+    pl.RelatedPostId,
+    l.Name AS LinkTypeName,
+    l.Id AS LinkTypeId,
+    pl.CreationDate
+  FROM PostLinks pl
+  JOIN LinkTypes l ON pl.LinkTypeId = l.Id
+  WHERE l.Id IN (1,3) -- Linked and Duplicate links
+),
+TagStats AS (
+  SELECT
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId,
+    t.WikiPostId,
+    t.IsModeratorOnly,
+    t.IsRequired
+  FROM Tags t
+  WHERE t.IsModeratorOnly = 0
+),
+RecentVotes AS (
+  SELECT
+    v.PostId,
+    v.VoteTypeId,
+    v.UserId,
+    v.CreationDate,
+    v.BountyAmount,
+    ROW_NUMBER() OVER (PARTITION BY v.PostId ORDER BY v.CreationDate DESC) AS rn
+  FROM Votes v
+  WHERE v.CreationDate >= DATEADD(year, -1, GETDATE())
+),
+TopContributors AS (
+  SELECT
+    u.UserId,
+    u.DisplayName,
+    SUM(CASE WHEN u.Reputation IS NULL THEN 0 ELSE u.Reputation END) OVER () AS TotalRep,
+    ROW_NUMBER() OVER (ORDER BY SUM(u.Reputation) OVER () DESC) AS rk
+  FROM UserActivity u
+  WHERE u.rn = 1
+)
+SELECT
+  p.Id AS PostId,
+  p.Title,
+  p.Tags,
+  p.PostTypeId,
+  p.CreationDate,
+  p.ViewCount,
+  p.Score,
+  p.CommentCount,
+  p.AnswerCount,
+  p.LastActivityDate,
+  p.FavoriteCount,
+  p.ContentLicense,
+  u.UserId AS OwnerUserId,
+  u.DisplayName AS OwnerDisplayName,
+  u.Reputation AS OwnerReputation,
+  ua1.UserCreationDate,
+  ua1.LastAccessDate,
+  ua1.Location,
+  ua1.WebsiteUrl,
+  ua1.AboutMe,
+  ua1.Views AS UserViews,
+  ta.Tag,
+  ha.PostId AS HistoryPostId,
+  ha.PostHistoryTypeId,
+  ha.CreationDate AS HistoryDate,
+  ha.Comment AS HistoryComment,
+  rk.rk AS TopRank
+FROM FilteredPosts p
+LEFT JOIN UserActivity ua1 ON p.OwnerUserId = ua1.UserId AND ua1.rn = 1
+LEFT JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN TagsExploded ta ON p.Id = ta.PostId
+LEFT JOIN PostHistoryAgg ha ON p.Id = ha.PostId
+LEFT JOIN LinkInfo li ON p.Id = li.PostId
+LEFT JOIN TopContributors rk ON u.Id = rk.UserId
+WHERE
+  p.Score > -5
+  AND (p.ViewCount > 0 OR p.AnswerCount > 0)
+ORDER BY
+  p.CreationDate DESC
+OFFSET 0 ROWS
+FETCH FIRST 100 ROWS ONLY;

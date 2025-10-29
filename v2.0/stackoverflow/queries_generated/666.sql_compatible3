@@ -1,0 +1,392 @@
+with recent_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.location,
+    coalesce(nullif(trim(u.websiteurl), ''), 'N/A') as websiteurl_norm,
+    row_number() over (order by u.creationdate desc, u.id) as rn
+  from users u
+  where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+user_badges as (
+  select
+    b.userid,
+    count(*) as total_badges,
+    sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+    sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+    sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+    min(b.date) as first_badge_date,
+    max(b.date) as last_badge_date
+  from badges b
+  group by b.userid
+),
+user_posts as (
+  select
+    p.owneruserid as userid,
+    sum(case when p.posttypeid = 1 then 1 else 0 end) as questions,
+    sum(case when p.posttypeid = 2 then 1 else 0 end) as answers,
+    sum(coalesce(p.viewcount,0)) as total_views,
+    sum(coalesce(p.score,0)) as total_post_score,
+    avg(nullif(p.score,0)) filter (where p.score is not null) as avg_nonzero_score,
+    max(p.creationdate) as last_post_date
+  from posts p
+  where p.owneruserid is not null
+  group by p.owneruserid
+),
+user_votes as (
+  select
+    v.userid,
+    count(*) filter (where v.votetypeid = 2) as upvotes_cast,
+    count(*) filter (where v.votetypeid = 3) as downvotes_cast,
+    count(*) filter (where v.votetypeid = 8) as bounties_started,
+    sum(coalesce(v.bountyamount,0)) filter (where v.votetypeid in (8,9)) as bounty_amount_total,
+    min(v.creationdate) as first_vote_date,
+    max(v.creationdate) as last_vote_date
+  from votes v
+  where v.userid is not null
+  group by v.userid
+),
+question_quality as (
+  select
+    q.id as question_id,
+    q.owneruserid as asker_id,
+    q.creationdate as question_date,
+    q.score as question_score,
+    q.viewcount as question_views,
+    q.acceptedanswerid,
+    string_agg(t.tagname, '|' order by t.tagname) as tag_list,
+    count(a.id) as answer_count,
+    max(a.score) as best_answer_score,
+    avg(a.score) filter (where a.score is not null) as avg_answer_score
+  from posts q
+  left join lateral (
+    select unnest(string_to_array(substring(q.tags, 2, length(q.tags)-2), '><')) as tagname
+  ) tag on true
+  left join tags t on lower(t.tagname) = lower(tag.tagname)
+  left join posts a on a.parentid = q.id and a.posttypeid = 2
+  where q.posttypeid = 1
+  group by q.id, q.owneruserid, q.creationdate, q.score, q.viewcount, q.acceptedanswerid
+),
+dup_clusters as (
+  select
+    pl.relatedpostid as canonical_id,
+    count(*) filter (where pl.linktypeid = 3) as dup_inbound_count,
+    count(*) filter (where pl.linktypeid = 1) as links_inbound_count
+  from postlinks pl
+  group by pl.relatedpostid
+),
+closure_events as (
+  select
+    ph.postid,
+    min(ph.creationdate) filter (where ph.posthistorytypeid = 10) as first_closed_date,
+    max(ph.creationdate) filter (where ph.posthistorytypeid = 11) as last_reopened_date,
+    max(crid.last_close_reason_id) as last_close_reason_id
+  from posthistory ph
+  left join lateral (
+    select regexp_replace(coalesce(ph.comment,''), '(^[[:space:]]*([0-9]+)).*', '\2') as last_close_reason_id_text
+  ) crid on ph.posthistorytypeid = 10
+  -- convert the extracted text to integer in the outer query (using cast in aggregates is not portable),
+  -- here we keep it as text and later validate with a regex-like check before casting where supported
+  where ph.posthistorytypeid in (10,11)
+  group by ph.postid
+),
+question_metrics as (
+  select
+    qq.question_id,
+    qq.asker_id,
+    qq.question_date,
+    qq.question_score,
+    qq.question_views,
+    qq.answer_count,
+    qq.best_answer_score,
+    qq.avg_answer_score,
+    qq.tag_list,
+    coalesce(dc.dup_inbound_count,0) as dup_inbound_count,
+    coalesce(dc.links_inbound_count,0) as links_inbound_count,
+    case when qq.acceptedanswerid is not null then 1 else 0 end as has_accepted_answer,
+    ce.first_closed_date,
+    ce.last_reopened_date,
+    case
+      when ce.last_close_reason_id ~ '^[0-9]+$' then cast(ce.last_close_reason_id as integer)
+      else null
+    end as last_close_reason_id
+  from question_quality qq
+  left join dup_clusters dc on dc.canonical_id = qq.question_id
+  left join closure_events ce on ce.postid = qq.question_id
+),
+user_activity_agg as (
+  select
+    up.userid,
+    count(*) filter (where p.posttypeid = 1 and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '90 days') as recent_questions_90d,
+    count(*) filter (where p.posttypeid = 2 and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '90 days') as recent_answers_90d,
+    max(p.lastactivitydate) as last_activity,
+    sum(coalesce(p.commentcount,0)) as total_comments_on_posts
+  from users u
+  left join posts p on p.owneruserid = u.id
+  left join (select distinct owneruserid as userid from posts where owneruserid is not null) up on up.userid = u.id
+  group by up.userid
+),
+per_user_tag_focus as (
+  select
+    q.owneruserid as userid,
+    lower(tag.tagname) as tagname,
+    count(*) as q_count,
+    avg(q.score) as avg_q_score,
+    percentile_cont(0.5) within group (order by q.viewcount) as median_views
+  from posts q
+  join lateral (
+    select unnest(string_to_array(substring(q.tags, 2, length(q.tags)-2), '><')) as tagname
+  ) tag on true
+  where q.posttypeid = 1
+  group by q.owneruserid, lower(tag.tagname)
+),
+top_tag_per_user as (
+  select distinct on (pt.userid)
+    pt.userid,
+    pt.tagname as top_tag,
+    pt.q_count as top_tag_q_count,
+    pt.avg_q_score as top_tag_avg_q_score
+  from per_user_tag_focus pt
+  order by pt.userid, pt.q_count desc nulls last, pt.avg_q_score desc nulls last, pt.tagname
+),
+accepted_answerers as (
+  select
+    a.owneruserid as userid,
+    count(*) as accepted_answers,
+    avg(a.score) as avg_acc_answer_score,
+    sum(a.score) as sum_acc_answer_score
+  from posts q
+  join posts a on a.id = q.acceptedanswerid and a.posttypeid = 2
+  where q.posttypeid = 1 and a.owneruserid is not null
+  group by a.owneruserid
+),
+commenter_sentiment as (
+  select
+    c.userid,
+    avg(length(c.text)) as avg_comment_len,
+    sum(case when lower(c.text) similar to '%(thank|great|helpful|awesome|nice)%' then 1 else 0 end) as pos_hits,
+    sum(case when lower(c.text) similar to '%(bad|wrong|useless|terrible|hate)%' then 1 else 0 end) as neg_hits
+  from comments c
+  where c.userid is not null
+  group by c.userid
+),
+user_ranked as (
+  select
+    ru.user_id,
+    ru.displayname,
+    ru.reputation,
+    ru.creationdate,
+    ru.location,
+    ru.websiteurl_norm,
+    coalesce(ub.total_badges,0) as total_badges,
+    coalesce(ub.gold_badges,0) as gold_badges,
+    coalesce(ub.silver_badges,0) as silver_badges,
+    coalesce(ub.bronze_badges,0) as bronze_badges,
+    ub.first_badge_date,
+    ub.last_badge_date,
+    coalesce(ups.questions,0) as questions,
+    coalesce(ups.answers,0) as answers,
+    coalesce(ups.total_views,0) as total_views,
+    coalesce(ups.total_post_score,0) as total_post_score,
+    ups.avg_nonzero_score,
+    ups.last_post_date,
+    coalesce(uv.upvotes_cast,0) as upvotes_cast,
+    coalesce(uv.downvotes_cast,0) as downvotes_cast,
+    coalesce(uv.bounties_started,0) as bounties_started,
+    coalesce(uv.bounty_amount_total,0) as bounty_amount_total,
+    uv.first_vote_date,
+    uv.last_vote_date,
+    coalesce(ua.recent_questions_90d,0) as recent_questions_90d,
+    coalesce(ua.recent_answers_90d,0) as recent_answers_90d,
+    ua.last_activity,
+    coalesce(ua.total_comments_on_posts,0) as total_comments_on_posts,
+    coalesce(tt.top_tag, '(none)') as top_tag,
+    coalesce(tt.top_tag_q_count,0) as top_tag_q_count,
+    tt.top_tag_avg_q_score,
+    coalesce(aa.accepted_answers,0) as accepted_answers,
+    aa.avg_acc_answer_score,
+    coalesce(cs.avg_comment_len,0) as avg_comment_len,
+    coalesce(cs.pos_hits,0) as pos_hits,
+    coalesce(cs.neg_hits,0) as neg_hits,
+    row_number() over (
+      order by
+        coalesce(ups.total_post_score,0) desc,
+        coalesce(uv.upvotes_cast,0) desc,
+        coalesce(ub.gold_badges,0) desc,
+        ru.reputation desc,
+        ru.user_id
+    ) as activity_rank
+  from recent_users ru
+  left join user_badges ub on ub.userid = ru.user_id
+  left join user_posts ups on ups.userid = ru.user_id
+  left join user_votes uv on uv.userid = ru.user_id
+  left join user_activity_agg ua on ua.userid = ru.user_id
+  left join top_tag_per_user tt on tt.userid = ru.user_id
+  left join accepted_answerers aa on aa.userid = ru.user_id
+  left join commenter_sentiment cs on cs.userid = ru.user_id
+),
+question_scored as (
+  select
+    qm.*,
+    case
+      when qm.question_views is null then 0
+      when qm.question_views = 0 then 0
+      else ln(1 + qm.question_views)
+    end as ln_views,
+    case when qm.answer_count > 0 then 1 else 0 end as has_answers_flag,
+    case when qm.first_closed_date is not null and (qm.last_reopened_date is null or qm.first_closed_date > qm.last_reopened_date) then 1 else 0 end as currently_closed_flag,
+    coalesce(qm.best_answer_score, 0) - coalesce(qm.avg_answer_score, 0) as answer_score_delta
+  from question_metrics qm
+),
+user_question_rollup as (
+  select
+    qs.asker_id as userid,
+    count(*) as q_total,
+    avg(qs.question_score) as q_avg_score,
+    avg(qs.ln_views) as q_avg_ln_views,
+    sum(qs.has_answers_flag) as q_with_answers,
+    sum(qs.has_accepted_answer) as q_with_accept,
+    sum(qs.currently_closed_flag) as q_currently_closed,
+    sum(qs.dup_inbound_count) as q_dup_inbound_total,
+    max(qs.answer_score_delta) as max_answer_score_delta,
+    max(qs.question_date) as last_question_date
+  from question_scored qs
+  group by qs.asker_id
+),
+score_buckets as (
+  select
+    ur.user_id,
+    width_bucket(coalesce(ur.total_post_score,0), -50, 1000, 10) as score_bucket
+  from user_ranked ur
+),
+dense_activity as (
+  select
+    ur.user_id,
+    dense_rank() over (order by coalesce(ur.recent_answers_90d,0) + coalesce(ur.recent_questions_90d,0) desc, ur.user_id) as dense_activity_rank
+  from user_ranked ur
+),
+final_users as (
+  select
+    ur.*,
+    uq.q_total,
+    uq.q_avg_score,
+    uq.q_avg_ln_views,
+    uq.q_with_answers,
+    uq.q_with_accept,
+    uq.q_currently_closed,
+    uq.q_dup_inbound_total,
+    uq.max_answer_score_delta,
+    uq.last_question_date,
+    sb.score_bucket,
+    da.dense_activity_rank
+  from user_ranked ur
+  left join user_question_rollup uq on uq.userid = ur.user_id
+  left join score_buckets sb on sb.user_id = ur.user_id
+  left join dense_activity da on da.user_id = ur.user_id
+),
+license_mix as (
+  select
+    p.owneruserid as userid,
+    count(*) filter (where p.contentlicense ilike '%by-sa%') as cc_by_sa_count,
+    count(*) filter (where p.contentlicense ilike '%by%') as cc_by_count,
+    count(*) filter (where p.contentlicense is null) as license_nulls,
+    count(*) as total_posts
+  from posts p
+  where p.owneruserid is not null
+  group by p.owneruserid
+),
+closed_reason_breakdown as (
+  select
+    q.owneruserid as userid,
+    crt.name as close_reason_name,
+    count(*) as close_reason_count
+  from posts q
+  join posthistory ph on ph.postid = q.id and ph.posthistorytypeid = 10
+  left join closereasontypes crt on crt.id = (
+    case
+      when regexp_replace(coalesce(ph.comment,''), '(^[[:space:]]*([0-9]+)).*', '\2') ~ '^[0-9]+$'
+        then cast(regexp_replace(coalesce(ph.comment,''), '(^[[:space:]]*([0-9]+)).*', '\2') as integer)
+      else null
+    end
+  )
+  where q.posttypeid = 1
+  group by q.owneruserid, crt.name
+),
+closed_reason_pivot as (
+  select
+    crb.userid,
+    sum(case when crb.close_reason_name ilike '%duplicate%' then crb.close_reason_count else 0 end) as close_dup,
+    sum(case when crb.close_reason_name ilike '%off-topic%' then crb.close_reason_count else 0 end) as close_offtopic,
+    sum(case when crb.close_reason_name ilike '%clarity%' then crb.close_reason_count else 0 end) as close_needs_clarity,
+    sum(case when crb.close_reason_name ilike '%focus%' then crb.close_reason_count else 0 end) as close_needs_focus,
+    sum(case when crb.close_reason_name ilike '%opinion%' then crb.close_reason_count else 0 end) as close_opinion,
+    sum(case when crb.close_reason_name is null then crb.close_reason_count else 0 end) as close_unknown
+  from closed_reason_breakdown crb
+  group by crb.userid
+)
+select
+  fu.user_id,
+  fu.displayname,
+  fu.reputation,
+  fu.location,
+  fu.websiteurl_norm,
+  fu.activity_rank,
+  fu.dense_activity_rank,
+  fu.score_bucket,
+  fu.questions,
+  fu.answers,
+  fu.total_views,
+  fu.total_post_score,
+  fu.avg_nonzero_score,
+  fu.recent_questions_90d,
+  fu.recent_answers_90d,
+  fu.accepted_answers,
+  fu.upvotes_cast,
+  fu.downvotes_cast,
+  fu.bounties_started,
+  fu.bounty_amount_total,
+  fu.total_badges,
+  fu.gold_badges,
+  fu.silver_badges,
+  fu.bronze_badges,
+  fu.top_tag,
+  fu.top_tag_q_count,
+  fu.top_tag_avg_q_score,
+  fu.q_total,
+  fu.q_avg_score,
+  fu.q_avg_ln_views,
+  fu.q_with_answers,
+  fu.q_with_accept,
+  fu.q_currently_closed,
+  fu.q_dup_inbound_total,
+  fu.max_answer_score_delta,
+  fu.last_question_date,
+  fu.first_badge_date,
+  fu.last_badge_date,
+  fu.first_vote_date,
+  fu.last_vote_date,
+  fu.last_post_date,
+  fu.last_activity,
+  coalesce(lm.cc_by_sa_count,0) as cc_by_sa_posts,
+  coalesce(lm.cc_by_count,0) as cc_by_posts,
+  coalesce(lm.license_nulls,0) as license_null_posts,
+  coalesce(lm.total_posts,0) as posts_with_license_count,
+  coalesce(crp.close_dup,0) as closes_duplicate,
+  coalesce(crp.close_offtopic,0) as closes_offtopic,
+  coalesce(crp.close_needs_clarity,0) as closes_needs_clarity,
+  coalesce(crp.close_needs_focus,0) as closes_needs_focus,
+  coalesce(crp.close_opinion,0) as closes_opinion,
+  coalesce(crp.close_unknown,0) as closes_unknown
+from final_users fu
+left join license_mix lm on lm.userid = fu.user_id
+left join closed_reason_pivot crp on crp.userid = fu.user_id
+where
+  coalesce(fu.answers,0) + coalesce(fu.questions,0) > 0
+  and (fu.reputation > 100 or fu.total_post_score > 50 or fu.gold_badges > 0)
+  and not (fu.top_tag = '(none)' and fu.questions = 0)
+order by
+  fu.activity_rank asc,
+  fu.user_id
+limit 500;

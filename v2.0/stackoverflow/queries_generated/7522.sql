@@ -1,0 +1,243 @@
+-- {"query": "7522.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2268} 
+WITH PostStats AS (
+  SELECT 
+    p.Id,
+    p.PostTypeId,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.Title,
+    p.Tags,
+    p.Body,
+    p.ParentId,
+    CASE 
+      WHEN p.PostTypeId = 1 THEN 'Question'
+      WHEN p.PostTypeId = 2 THEN 'Answer'
+      WHEN p.PostTypeId = 3 THEN 'Wiki'
+      WHEN p.PostTypeId = 4 THEN 'TagWikiExcerpt'
+      WHEN p.PostTypeId = 5 THEN 'TagWiki'
+      WHEN p.PostTypeId = 6 THEN 'ModeratorNomination'
+      WHEN p.PostTypeId = 7 THEN 'WikiPlaceholder'
+      WHEN p.PostTypeId = 8 THEN 'PrivilegeWiki'
+      ELSE 'Unknown'
+    END AS PostTypeName,
+    COALESCE(p.Title, '') AS CleanTitle,
+    COALESCE(p.Tags, '') AS CleanTags,
+    LEN(p.Tags) AS TagsLength,
+    CASE 
+      WHEN p.Tags IS NOT NULL AND p.Tags != '' THEN 
+        (SELECT COUNT(*) FROM STRING_SPLIT(SUBSTRING(p.Tags, 2, LEN(p.Tags)-2), '><'))
+      ELSE 0 
+    END AS TagCount,
+    CASE 
+      WHEN p.Score > 0 THEN 'Positive'
+      WHEN p.Score < 0 THEN 'Negative'
+      ELSE 'Neutral'
+    END AS ScoreCategory,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserPostRank,
+    DATEDIFF(day, p.CreationDate, GETDATE()) AS DaysSinceCreation
+  FROM Posts p
+  WHERE p.PostTypeId IN (1, 2) 
+    AND p.CreationDate >= DATEADD(year, -2, GETDATE())
+),
+UserActivity AS (
+  SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    COUNT(DISTINCT ps.Id) AS TotalPosts,
+    COUNT(CASE WHEN ps.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+    COUNT(CASE WHEN ps.PostTypeId = 2 THEN 1 END) AS AnswerCount,
+    SUM(ps.Score) AS TotalScore,
+    AVG(ps.Score) AS AvgScore,
+    MAX(ps.CreationDate) AS LatestActivity,
+    STRING_AGG(ps.Title, '; ') AS RecentTitles,
+    STRING_AGG(CASE WHEN ps.Tags IS NOT NULL THEN ps.Tags ELSE '' END, '; ') AS RecentTagList
+  FROM Users u
+  LEFT JOIN PostStats ps ON u.Id = ps.OwnerUserId
+  WHERE u.Reputation > 1000
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopTags AS (
+  SELECT 
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId,
+    t.WikiPostId,
+    CASE 
+      WHEN t.Count > 1000 THEN 'High'
+      WHEN t.Count > 100 THEN 'Medium'
+      ELSE 'Low'
+    END AS PopularityLevel,
+    ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank,
+    NTILE(4) OVER (ORDER BY t.Count DESC) AS Quartile
+  FROM Tags t
+  WHERE t.Count > 50
+),
+AnswerStats AS (
+  SELECT 
+    ps.ParentId,
+    COUNT(*) AS AnswerCount,
+    SUM(ps.Score) AS TotalAnswerScore,
+    AVG(ps.Score) AS AvgAnswerScore,
+    MAX(ps.CreationDate) AS LatestAnswerDate,
+    STRING_AGG(ps.Title, '; ') WITHIN GROUP (ORDER BY ps.CreationDate) AS AnswerTitles,
+    COUNT(DISTINCT ps.OwnerUserId) AS AnswererCount
+  FROM PostStats ps
+  WHERE ps.PostTypeId = 2
+  GROUP BY ps.ParentId
+),
+QuestionWithAnswers AS (
+  SELECT 
+    ps.Id AS QuestionId,
+    ps.Title,
+    ps.Score,
+    ps.AnswerCount,
+    ps.CommentCount,
+    ps.ViewCount,
+    ps.CreationDate,
+    ps.OwnerUserId,
+    ps.Tags,
+    ps.TagCount,
+    ps.ScoreCategory,
+    ps.DaysSinceCreation,
+    asa.AnswerCount AS ActualAnswerCount,
+    asa.TotalAnswerScore,
+    asa.AvgAnswerScore,
+    asa.LatestAnswerDate,
+    asa.AnswerTitles,
+    asa.AnswererCount,
+    CASE 
+      WHEN ps.AnswerCount = 0 THEN 'No Answers'
+      WHEN ps.AnswerCount = 1 THEN 'One Answer'
+      WHEN ps.AnswerCount > 1 AND ps.AnswerCount <= 5 THEN 'Few Answers'
+      ELSE 'Many Answers'
+    END AS AnswerVolumeCategory,
+    CASE 
+      WHEN ps.AnswerCount > 0 AND ps.Score > 5 THEN 'Well Answered'
+      WHEN ps.AnswerCount > 0 AND ps.Score <= 5 THEN 'Few Points'
+      ELSE 'Unanswered'
+    END AS AnswerQuality
+  FROM PostStats ps
+  LEFT JOIN AnswerStats asa ON ps.Id = asa.ParentId
+  WHERE ps.PostTypeId = 1
+)
+SELECT 
+  qwa.QuestionId,
+  qwa.Title,
+  qwa.Score,
+  qwa.AnswerCount,
+  qwa.CommentCount,
+  qwa.ViewCount,
+  qwa.CreationDate,
+  qwa.OwnerUserId,
+  qwa.Tags,
+  qwa.TagCount,
+  qwa.ScoreCategory,
+  qwa.DaysSinceCreation,
+  qwa.AnswerVolumeCategory,
+  qwa.AnswerQuality,
+  ua.DisplayName,
+  ua.Reputation,
+  ua.TotalPosts,
+  ua.QuestionCount,
+  ua.AnswerCount AS UserAnswerCount,
+  ua.TotalScore,
+  ua.AvgScore,
+  ut.TagName,
+  ut.Count AS TagCount,
+  ut.PopularityLevel,
+  ut.Quartile,
+  CASE 
+    WHEN qwa.Score > (SELECT AVG(Score) FROM QuestionWithAnswers WHERE AnswerQuality = 'Well Answered') THEN 'Above Average Score'
+    WHEN qwa.Score < (SELECT AVG(Score) FROM QuestionWithAnswers WHERE AnswerQuality = 'Well Answered') THEN 'Below Average Score'
+    ELSE 'Average Score'
+  END AS ScorePerformanceIndicator,
+  CASE 
+    WHEN qwa.AnswerCount > 0 THEN 
+      (qwa.Score + qwa.AnswerCount * 10 + qwa.CommentCount * 5) * 1.5
+    ELSE 
+      qwa.Score + (qwa.ViewCount / 100) 
+  END AS ComplexPerformanceScore,
+  COALESCE(qwa.AnswerTitles, '') AS AnswerTitlesConcatenated,
+  REPLACE(LOWER(qwa.Title), ' ', '-') AS TitleSlug,
+  CONCAT('Q', qwa.QuestionId, '-', FORMAT(qwa.CreationDate, 'yyyy-MM-dd')) AS QuestionIdentifier,
+  CASE 
+    WHEN EXISTS (SELECT 1 FROM PostHistory ph WHERE ph.PostId = qwa.QuestionId AND ph.PostHistoryTypeId = 10) 
+    THEN 'Closed'
+    WHEN EXISTS (SELECT 1 FROM PostHistory ph WHERE ph.PostId = qwa.QuestionId AND ph.PostHistoryTypeId = 11) 
+    THEN 'Reopened'
+    WHEN EXISTS (SELECT 1 FROM Posts p WHERE p.Id = qwa.QuestionId AND p.ClosedDate IS NOT NULL) 
+    THEN 'Closed'
+    ELSE 'Open'
+  END AS QuestionStatus,
+  CASE 
+    WHEN qwa.DaysSinceCreation <= 1 THEN 'Fresh'
+    WHEN qwa.DaysSinceCreation <= 7 THEN 'Recent'
+    WHEN qwa.DaysSinceCreation <= 30 THEN 'Old'
+    ELSE 'Very Old'
+  END AS TemporalAgeCategory,
+  CASE 
+    WHEN qwa.Score > 0 AND qwa.AnswerCount > 0 THEN 
+      CAST(qwa.Score AS FLOAT) / CAST(qwa.AnswerCount AS FLOAT) 
+    ELSE 0 
+  END AS ScorePerAnswer,
+  CASE 
+    WHEN ua.Reputation > 10000 THEN 'Expert'
+    WHEN ua.Reputation > 1000 THEN 'Intermediate'
+    ELSE 'Beginner'
+  END AS UserExpertiseLevel,
+  CASE 
+    WHEN qwa.AnswerCount = 0 THEN 0
+    WHEN qwa.AnswerCount >= 5 THEN 1
+    ELSE 0
+  END AS IsHighVolumeQuestion,
+  DENSE_RANK() OVER (ORDER BY qwa.Score DESC) AS RankingByScore,
+  PERCENT_RANK() OVER (ORDER BY qwa.Score) AS PercentileRanking,
+  qwa.LatestAnswerDate,
+  qwa.AnswererCount,
+  qwa.TotalAnswerScore,
+  qwa.AvgAnswerScore,
+  STRING_SPLIT(qwa.Tags, '><') AS TagSplit,
+  CONCAT(
+    CASE WHEN qwa.Score > 0 THEN '+' ELSE '' END, 
+    qwa.Score
+  ) AS FormattedScore,
+  CASE 
+    WHEN qwa.CommentCount > 0 THEN 
+      FORMAT(qwa.CommentCount, 'N0') + ' comments' 
+    ELSE 'No comments'
+  END AS CommentDisplay,
+  CASE 
+    WHEN qwa.ViewCount > 1000 THEN 'Popular'
+    WHEN qwa.ViewCount > 100 THEN 'Moderately Popular'
+    ELSE 'Low View'
+  END AS PopularityLevel,
+  ROW_NUMBER() OVER (ORDER BY qwa.CreationDate DESC) AS MostRecentQuestionRank,
+  CASE 
+    WHEN DATEDIFF(day, qwa.CreationDate, GETDATE()) < 1 THEN 1
+    ELSE 0 
+  END AS IsTodayQuestion
+FROM QuestionWithAnswers qwa
+JOIN UserActivity ua ON qwa.OwnerUserId = ua.UserId
+JOIN TopTags ut ON CAST(SUBSTRING(qwa.Tags, 2, 35) AS VARCHAR(35)) = ut.TagName
+WHERE qwa.Score > -5
+  AND qwa.AnswerCount >= 0
+  AND qwa.DaysSinceCreation <= 365
+  AND (ISNULL(qwa.AnswerCount, 0) >= 0 OR ISNULL(qwa.Score, 0) >= -10)
+ORDER BY CASE 
+  WHEN RIGHT(qwa.Title, 3) = 'SQL' THEN 0
+  WHEN RIGHT(qwa.Title, 3) = 'XML' THEN 1
+  WHEN RIGHT(qwa.Title, 3) = 'C#' THEN 2
+  ELSE 3
+END,
+qwa.Score DESC,
+qwa.CreationDate DESC
+OPTION (RECOMPILE);

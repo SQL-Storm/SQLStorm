@@ -1,0 +1,200 @@
+-- {"query": "2513.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1995} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 as Level,
+        array[t.Id] as Path
+    from Tags t
+    where t.IsModeratorOnly = 0
+
+    union all
+
+    select
+        child.Id,
+        child.TagName,
+        child.Count,
+        child.ExcerptPostId,
+        child.WikiPostId,
+        parent.Level + 1,
+        parent.Path || child.Id
+    from Tags child
+    join PostLinks pl on pl.PostId = child.ExcerptPostId and pl.LinkTypeId = 1
+    join RecursiveTagHierarchy parent on parent.ExcerptPostId = pl.RelatedPostId
+    where child.IsModeratorOnly = 0
+        and not child.Id = any(parent.Path)
+),
+UserBadgeStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct b.Id) as TotalBadges,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.CreationDate as QuestionCreation,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        a.Id as AnswerId,
+        a.OwnerUserId as AnswerOwnerUserId,
+        a.CreationDate as AnswerCreation,
+        a.Score as AnswerScore,
+        row_number() over (partition by q.Id order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+),
+TopAnswerers as (
+    select
+        pas.AnswerOwnerUserId as UserId,
+        count(distinct pas.AnswerId) as NumberOfTopAnswers,
+        avg(pas.AnswerScore) as AvgTopAnswerScore
+    from PostAnswerStats pas
+    where pas.AnswerRank = 1
+    group by pas.AnswerOwnerUserId
+),
+UserActivityWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsAsked,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersGiven,
+        count(distinct c.Id) as CommentsMade,
+        row_number() over (partition by u.Id order by p.CreationDate desc) as LastPostRank,
+        min(p.CreationDate) over (partition by u.Id) as FirstPostDate,
+        max(p.CreationDate) over (partition by u.Id) as LastPostDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+HighlyActiveUsers as (
+    select
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.QuestionsAsked,
+        ua.AnswersGiven,
+        ua.CommentsMade,
+        ua.FirstPostDate,
+        ua.LastPostDate,
+        coalesce(ta.NumberOfTopAnswers, 0) as NumberOfTopAnswers,
+        coalesce(ta.AvgTopAnswerScore, 0) as AvgTopAnswerScore,
+        coalesce(ubs.TotalBadges, 0) as TotalBadges,
+        coalesce(ubs.GoldBadges, 0) as GoldBadges,
+        coalesce(ubs.SilverBadges, 0) as SilverBadges,
+        coalesce(ubs.BronzeBadges, 0) as BronzeBadges,
+        (ua.AnswersGiven::float / nullif(ua.QuestionsAsked,0)) as AnswerToQuestionRatio,
+        greatest(0, ua.Reputation - 1000) / 1000.0 as RepTier
+    from UserActivityWindow ua
+    left join TopAnswerers ta on ta.UserId = ua.UserId
+    left join UserBadgeStats ubs on ubs.UserId = ua.UserId
+    where ua.Reputation > 1000
+        and (ua.QuestionsAsked + ua.AnswersGiven + ua.CommentsMade) > 50
+),
+RecentClosedQuestions as (
+    select
+        ph.PostId,
+        ph.CreationDate as CloseDate,
+        ph.Comment as CloseReasonId,
+        crt.Name as CloseReasonName,
+        p.Title,
+        p.OwnerUserId,
+        u.DisplayName as OwnerDisplayName,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        (select count(*) from Comments c where c.PostId = ph.PostId) as CommentCount
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    join Posts p on p.Id = ph.PostId and p.PostTypeId = 1
+    left join Users u on u.Id = p.OwnerUserId
+    where ph.PostHistoryTypeId = 10 -- Post Closed
+      and ph.CreationDate > cast('2024-10-01' as date) - interval '30 days'
+),
+RankedTagsByActivity as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        count(distinct p.Id) as QuestionCountWithTag,
+        max(p.Score) as MaxPostScore,
+        avg(p.Score) as AvgPostScore,
+        percentile_cont(0.5) within group (order by p.Score) as MedianPostScore,
+        row_number() over (order by count(distinct p.Id) desc) as TagPopularityRank
+    from Tags t
+    left join Posts p on p.PostTypeId = 1 and position('<' || t.TagName || '>' in p.Tags) > 0
+    group by t.Id, t.TagName, t.Count
+),
+CombinedResult as (
+    select
+        hau.UserId,
+        hau.DisplayName as UserName,
+        hau.Reputation,
+        hau.QuestionsAsked,
+        hau.AnswersGiven,
+        hau.CommentsMade,
+        hau.NumberOfTopAnswers,
+        hau.AvgTopAnswerScore,
+        hau.TotalBadges,
+        hau.GoldBadges,
+        hau.SilverBadges,
+        hau.BronzeBadges,
+        hau.AnswerToQuestionRatio,
+        hau.RepTier,
+        rt.TagName,
+        rt.QuestionCountWithTag,
+        rt.MaxPostScore,
+        rt.AvgPostScore,
+        rt.MedianPostScore,
+        rcq.Title as RecentlyClosedQuestionTitle,
+        rcq.CloseReasonName,
+        rcq.CloseDate
+    from HighlyActiveUsers hau
+    left join RankedTagsByActivity rt on rt.TagPopularityRank <= 5
+    left join lateral (
+        select
+            q.Title,
+            q.CloseReasonName,
+            q.CloseDate
+        from RecentClosedQuestions q
+        where q.OwnerUserId = hau.UserId
+        order by q.CloseDate desc
+        limit 1
+    ) rcq on true
+)
+select
+    cr.UserId,
+    cr.UserName,
+    format('Rep: %s, Qs: %s, As: %s, Comms: %s', cr.Reputation, cr.QuestionsAsked, cr.AnswersGiven, cr.CommentsMade) as UserSummary,
+    format('TopAnswers: %s (AvgScore: %.2f)', cr.NumberOfTopAnswers, cr.AvgTopAnswerScore) as TopAnswersStats,
+    format('Badges [G/S/B]: %s / %s / %s, Total: %s', cr.GoldBadges, cr.SilverBadges, cr.BronzeBadges, cr.TotalBadges) as BadgeSummary,
+    format('Answer/Question Ratio: %.2f', coalesce(cr.AnswerToQuestionRatio,0)) as AnswerQuestionRatio,
+    format('Reputation Tier Factor: %.3f', coalesce(cr.RepTier,0)) as RepTierFactor,
+    coalesce(cr.TagName, 'N/A') as PopularTagName,
+    coalesce(cr.QuestionCountWithTag, 0) as PopularTagQuestionCount,
+    coalesce(cr.MaxPostScore, 0) as PopularTagMaxScore,
+    round(coalesce(cr.AvgPostScore, 0),2) as PopularTagAvgScore,
+    round(coalesce(cr.MedianPostScore, 0),2) as PopularTagMedianScore,
+    coalesce(cr.RecentlyClosedQuestionTitle, 'None') as LastClosedQuestionTitle,
+    coalesce(cr.CloseReasonName, 'N/A') as LastClosureReason,
+    coalesce(to_char(cr.CloseDate, 'YYYY-MM-DD HH24:MI'), 'N/A') as LastClosureDate
+from CombinedResult cr
+order by cr.Reputation desc, cr.NumberOfTopAnswers desc, cr.TotalBadges desc
+limit 20;

@@ -1,0 +1,331 @@
+with recent_users as (
+  select u.id as user_id,
+         u.displayname,
+         u.reputation,
+         u.creationdate,
+         u.location,
+         coalesce(nullif(trim(lower(u.websiteurl)), ''), 'n/a') as norm_website,
+         row_number() over (order by u.creationdate desc, u.id desc) as rn_global
+  from users u
+  where u.creationdate >= (select date_trunc('month', max(creationdate)) - interval '12 months' from users)
+),
+user_activity as (
+  select u.id as user_id,
+         count(*) filter (where p.posttypeid = 1) as q_count,
+         count(*) filter (where p.posttypeid = 2) as a_count,
+         sum(greatest(p.score,0)) as nonneg_post_score,
+         max(p.lastactivitydate) as last_post_activity
+  from users u
+  left join posts p on p.owneruserid = u.id
+  group by u.id
+),
+comment_stats as (
+  select u.id as user_id,
+         count(c.id) as comment_count,
+         coalesce(avg(nullif(c.score,0)), 0) as avg_nonzero_comment_score,
+         max(c.creationdate) as last_comment_date
+  from users u
+  left join comments c on c.userid = u.id
+  group by u.id
+),
+badge_rollup as (
+  select b.userid as user_id,
+         count(*) as badge_count,
+         sum(case when b.class = 1 then 1 else 0 end) as gold_count,
+         sum(case when b.class = 2 then 1 else 0 end) as silver_count,
+         sum(case when b.class = 3 then 1 else 0 end) as bronze_count,
+         min(b.date) as first_badge_date,
+         max(b.date) as last_badge_date
+  from badges b
+  group by b.userid
+),
+question_details as (
+  select p.id as question_id,
+         p.owneruserid as owner_id,
+         p.creationdate as q_created,
+         p.score as q_score,
+         p.viewcount as q_views,
+         p.answercount as q_answers,
+         p.acceptedanswerid,
+         p.tags,
+         string_to_array(substring(p.tags, 2, length(p.tags)-2), '><') as tag_array
+  from posts p
+  where p.posttypeid = 1
+),
+accepted_answers as (
+  select q.owner_id,
+         count(*) as accepted_given_count,
+         sum(a.score) as accepted_answer_scores
+  from question_details q
+  join posts a on a.id = q.acceptedanswerid
+  group by q.owner_id
+),
+answer_stats as (
+  select p.parentid as question_id,
+         count(*) as answers_count,
+         sum(case when p.score > 0 then 1 else 0 end) as pos_answers,
+         max(p.score) as max_answer_score,
+         sum(case when p.owneruserid is null then 1 else 0 end) as anon_answers
+  from posts p
+  where p.posttypeid = 2
+  group by p.parentid
+),
+hotness as (
+  select q.owner_id,
+         sum((coalesce(q.q_score,0) + coalesce(a.answers_count,0) * 2 + coalesce(q.q_views,0) / 100.0)) as raw_hotness,
+         sum(case when q.q_created >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days' then 1 else 0 end) as recent_q_count
+  from question_details q
+  left join answer_stats a on a.question_id = q.question_id
+  group by q.owner_id
+),
+dup_graph as (
+  select pl.postid as src_qid,
+         pl.relatedpostid as dst_qid,
+         pl.linktypeid
+  from postlinks pl
+  where pl.linktypeid in (1,3)
+),
+dup_metrics as (
+  select q.owner_id,
+         sum(case when dg.linktypeid = 3 then 1 else 0 end) as duplicate_flags,
+         sum(case when dg.linktypeid = 1 then 1 else 0 end) as linked_refs
+  from question_details q
+  left join dup_graph dg on dg.src_qid = q.question_id
+  group by q.owner_id
+),
+close_events as (
+  select ph.postid,
+         ph.userid,
+         count(*) filter (where ph.posthistorytypeid = 10) as close_votes,
+         max(ph.creationdate) filter (where ph.posthistorytypeid = 10) as last_close_date,
+         sum(case when ph.posthistorytypeid = 10 and coalesce(nullif(ph.comment,''),'0') ~ '^[0-9]+$' then 1 else 0 end) as close_with_reason_count
+  from posthistory ph
+  group by ph.postid, ph.userid
+),
+post_quality as (
+  select p.id as post_id,
+         p.owneruserid as owner_id,
+         p.score,
+         coalesce(vu.upv,0) as upvotes,
+         coalesce(vd.downv,0) as downvotes,
+         case when p.score is null then null
+              when coalesce(vu.upv,0)+coalesce(vd.downv,0) = 0 then null
+              else cast(p.score as numeric) / nullif(coalesce(vu.upv,0)+coalesce(vd.downv,0),0) end as score_ratio
+  from posts p
+  left join (
+    select v.postid, count(*) as upv
+    from votes v
+    where v.votetypeid = 2
+    group by v.postid
+  ) vu on vu.postid = p.id
+  left join (
+    select v.postid, count(*) as downv
+    from votes v
+    where v.votetypeid = 3
+    group by v.postid
+  ) vd on vd.postid = p.id
+),
+user_quality as (
+  select pq.owner_id,
+         avg(pq.score_ratio) filter (where pq.score_ratio is not null) as avg_score_ratio,
+         percentile_cont(0.9) within group (order by coalesce(pq.score,0)) as p90_post_score,
+         sum(case when pq.score >= 10 then 1 else 0 end) as high_score_posts
+  from post_quality pq
+  group by pq.owner_id
+),
+tag_expertise as (
+  select q.owner_id,
+         lower(t::text) as tag_name,
+         count(*) as tag_q_count,
+         sum(coalesce(q.q_score,0)) as tag_q_score,
+         row_number() over (partition by q.owner_id order by count(*) desc, sum(coalesce(q.q_score,0)) desc, lower(t::text)) as rn_tag
+  from question_details q
+  cross join lateral unnest(q.tag_array) as t
+  group by q.owner_id, lower(t::text)
+),
+top_tags as (
+  select te.owner_id,
+         string_agg(te.tag_name, ', ' order by te.rn_tag) as top3_tags
+  from tag_expertise te
+  where te.rn_tag <= 3
+  group by te.owner_id
+),
+user_recent_posts as (
+  select p.owneruserid as user_id,
+         count(*) filter (where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days') as posts_30d,
+         sum(p.viewcount) filter (where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days') as views_30d
+  from posts p
+  group by p.owneruserid
+),
+activity_rank as (
+  select u.id as user_id,
+         dense_rank() over (order by coalesce(ua.q_count,0) + coalesce(ua.a_count,0) desc, coalesce(us.posts_30d,0) desc, u.id) as activity_rank
+  from users u
+  left join user_activity ua on ua.user_id = u.id
+  left join user_recent_posts us on us.user_id = u.id
+),
+user_summary as (
+  select u.id as user_id,
+         u.displayname,
+         u.reputation,
+         u.creationdate,
+         u.location,
+         ru.rn_global,
+         ua.q_count,
+         ua.a_count,
+         cs.comment_count,
+         cs.avg_nonzero_comment_score,
+         cs.last_comment_date,
+         br.badge_count,
+         br.gold_count,
+         br.silver_count,
+         br.bronze_count,
+         br.first_badge_date,
+         br.last_badge_date,
+         aa.accepted_given_count,
+         aa.accepted_answer_scores,
+         h.raw_hotness,
+         h.recent_q_count,
+         dm.duplicate_flags,
+         dm.linked_refs,
+         ce.close_votes,
+         ce.last_close_date,
+         ce.close_with_reason_count,
+         uq.avg_score_ratio,
+         uq.p90_post_score,
+         uq.high_score_posts,
+         tt.top3_tags,
+         urp.posts_30d,
+         urp.views_30d,
+         ar.activity_rank,
+         coalesce(ru.norm_website, 'n/a') as normalized_website
+  from users u
+  left join recent_users ru on ru.user_id = u.id
+  left join user_activity ua on ua.user_id = u.id
+  left join comment_stats cs on cs.user_id = u.id
+  left join badge_rollup br on br.user_id = u.id
+  left join accepted_answers aa on aa.owner_id = u.id
+  left join hotness h on h.owner_id = u.id
+  left join dup_metrics dm on dm.owner_id = u.id
+  left join lateral (
+    select sum(ce.close_votes) as close_votes,
+           max(ce.last_close_date) as last_close_date,
+           sum(ce.close_with_reason_count) as close_with_reason_count
+    from close_events ce
+    join posts p on p.id = ce.postid
+    where p.owneruserid = u.id
+  ) ce on true
+  left join user_quality uq on uq.owner_id = u.id
+  left join top_tags tt on tt.owner_id = u.id
+  left join user_recent_posts urp on urp.user_id = u.id
+  left join activity_rank ar on ar.user_id = u.id
+),
+ranked as (
+  select us.*,
+         row_number() over (
+           order by
+             coalesce(us.raw_hotness,0) desc,
+             coalesce(us.avg_score_ratio,0) desc,
+             coalesce(us.reputation,0) desc,
+             coalesce(us.q_count,0) + coalesce(us.a_count,0) desc,
+             us.user_id
+         ) as rn_perf
+  from user_summary us
+),
+bucketed as (
+  select r.*,
+         case
+           when coalesce(r.reputation,0) >= 100000 then 'legend'
+           when coalesce(r.reputation,0) >= 25000 then 'elite'
+           when coalesce(r.reputation,0) >= 10000 then 'expert'
+           when coalesce(r.reputation,0) >= 2000 then 'regular'
+           else 'newbie'
+         end as rep_bucket,
+         case when r.rn_global is null then 'old-timer' else 'recent' end as cohort
+  from ranked r
+),
+null_logic_probe as (
+  select b.*,
+         case when b.avg_score_ratio is null and b.p90_post_score is null then 1 else 0 end as both_null_flag,
+         coalesce(nullif(trim(coalesce(b.top3_tags,'')), ''), 'untagged') as top_tags_or_untagged,
+         nullif(coalesce(b.normalized_website, 'n/a'), 'n/a') as website_if_any
+  from bucketed b
+),
+final_union as (
+  select n.user_id,
+         n.displayname,
+         n.reputation,
+         n.rep_bucket,
+         n.cohort,
+         n.rn_perf as rank_order,
+         n.q_count,
+         n.a_count,
+         n.comment_count,
+         n.badge_count,
+         n.gold_count,
+         n.silver_count,
+         n.bronze_count,
+         n.raw_hotness,
+         n.avg_score_ratio,
+         n.p90_post_score,
+         n.high_score_posts,
+         n.duplicate_flags,
+         n.linked_refs,
+         n.close_votes,
+         n.last_close_date,
+         n.top_tags_or_untagged as tags_summary,
+         n.website_if_any as website,
+         'A' as source_bucket,
+         n.creationdate
+  from null_logic_probe n
+  where n.rep_bucket in ('legend','elite','expert')
+  union all
+  select n.user_id,
+         n.displayname,
+         n.reputation,
+         n.rep_bucket,
+         n.cohort,
+         n.rn_perf,
+         n.q_count,
+         n.a_count,
+         n.comment_count,
+         n.badge_count,
+         n.gold_count,
+         n.silver_count,
+         n.bronze_count,
+         n.raw_hotness,
+         n.avg_score_ratio,
+         n.p90_post_score,
+         n.high_score_posts,
+         n.duplicate_flags,
+         n.linked_refs,
+         n.close_votes,
+         n.last_close_date,
+         n.top_tags_or_untagged,
+         n.website_if_any,
+         'B',
+         n.creationdate
+  from null_logic_probe n
+  where n.rep_bucket not in ('legend','elite','expert')
+),
+correlated_probe as (
+  select fu.*,
+         (
+           select count(*)
+           from posts p
+           where p.owneruserid = fu.user_id
+             and p.creationdate >= fu.creationdate
+         ) as posts_since_join
+  from final_union fu
+)
+select *
+from correlated_probe
+where (
+        (cohort = 'recent' and rank_order <= 500)
+        or
+        (cohort = 'old-timer' and coalesce(raw_hotness,0) > 1000)
+      )
+  and coalesce(avg_score_ratio, 0) >= 0
+  and not (rep_bucket = 'newbie' and coalesce(comment_count,0) = 0)
+order by rep_bucket asc, rank_order asc, user_id asc
+limit 1000;

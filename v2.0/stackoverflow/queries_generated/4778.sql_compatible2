@@ -1,0 +1,219 @@
+WITH
+  AnswerDetails AS (
+    SELECT
+      p.Id AS PostId,
+      p.ParentId AS QuestionId,
+      p.OwnerUserId,
+      p.CreationDate AS AnswerCreationDate,
+      p.Score AS AnswerScore,
+      ROW_NUMBER() OVER (
+        PARTITION BY p.ParentId
+        ORDER BY p.Score DESC, p.CreationDate ASC
+      ) AS RankByScore
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+  ),
+  QuestionStats AS (
+    SELECT
+      q.Id AS QuestionId,
+      q.OwnerUserId AS QuestionOwnerUserId,
+      q.CreationDate AS QuestionCreationDate,
+      q.Title AS QuestionTitle,
+      q.Score AS QuestionScore,
+      q.AnswerCount,
+      q.FavoriteCount,
+      q.ViewCount AS QuestionViewCount,
+      q.ClosedDate,
+      COALESCE(pt.Name, 'Unknown') AS QuestionPostType,
+      (
+        SELECT COUNT(c.Id) FROM Comments c WHERE c.PostId = q.Id
+      ) AS CommentCountOnQuestion,
+      (
+        SELECT SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) - SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END)
+        FROM Votes v
+        WHERE v.PostId = q.Id
+      ) AS NetVoteScoreOnQuestion,
+      (
+        SELECT COUNT(ph.Id) FROM PostHistory ph WHERE ph.PostId = q.Id AND ph.PostHistoryTypeId IN (4, 6)
+      ) AS EditHistoryCountOnQuestion,
+      (
+        SELECT COUNT(pl.Id) FROM PostLinks pl WHERE pl.PostId = q.Id AND pl.LinkTypeId = 3
+      ) AS DuplicateLinkCount
+    FROM Posts q
+    JOIN PostTypes pt ON q.PostTypeId = pt.Id
+    WHERE q.PostTypeId = 1
+  ),
+  UserReputation AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate AS UserCreationDate,
+      u.Views AS UserViews,
+      u.UpVotes AS UserUpVotes,
+      u.DownVotes AS UserDownVotes,
+      CASE WHEN u.WebsiteUrl IS NULL OR u.WebsiteUrl = '' THEN 'No Website' ELSE u.WebsiteUrl END AS UserWebsiteStatus,
+      (
+        SELECT COUNT(b.Id) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1
+      ) AS GoldBadgeCount,
+      (
+        SELECT COUNT(b.Id) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2
+      ) AS SilverBadgeCount,
+      (
+        SELECT COUNT(b.Id) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3
+      ) AS BronzeBadgeCount
+    FROM Users u
+  ),
+  CombinedData AS (
+    SELECT
+      qs.QuestionId,
+      qs.QuestionTitle,
+      qs.QuestionCreationDate,
+      qs.QuestionScore,
+      qs.AnswerCount,
+      qs.FavoriteCount,
+      qs.QuestionViewCount,
+      qs.ClosedDate,
+      qs.QuestionPostType,
+      qs.CommentCountOnQuestion,
+      qs.NetVoteScoreOnQuestion,
+      qs.EditHistoryCountOnQuestion,
+      qs.DuplicateLinkCount,
+      ur_q.DisplayName AS QuestionOwnerDisplayName,
+      ur_q.Reputation AS QuestionOwnerReputation,
+      ur_q.UserCreationDate AS QuestionOwnerCreationDate,
+      ur_q.UserWebsiteStatus AS QuestionOwnerWebsiteStatus,
+      ur_q.GoldBadgeCount AS QuestionOwnerGoldBadges,
+      ur_q.SilverBadgeCount AS QuestionOwnerSilverBadges,
+      ur_q.BronzeBadgeCount AS QuestionOwnerBronzeBadges,
+      ad.PostId AS BestAnswerId,
+      ad.AnswerScore AS BestAnswerScore,
+      ad.AnswerCreationDate AS BestAnswerCreationDate,
+      ur_a.DisplayName AS BestAnswerOwnerDisplayName,
+      ur_a.Reputation AS BestAnswerOwnerReputation,
+      ur_a.UserCreationDate AS BestAnswerOwnerCreationDate,
+      ur_a.UserWebsiteStatus AS BestAnswerOwnerWebsiteStatus,
+      ur_a.GoldBadgeCount AS BestAnswerOwnerGoldBadges,
+      ur_a.SilverBadgeCount AS BestAnswerOwnerSilverBadges,
+      ur_a.BronzeBadgeCount AS BestAnswerOwnerBronzeBadges,
+      CASE
+        WHEN qs.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN qs.AnswerCount = 0 THEN 'Unanswered'
+        WHEN qs.AnswerCount > 0 AND qs.FavoriteCount IS NULL THEN 'No Favorites'
+        ELSE 'Active'
+      END AS QuestionStatus,
+      CAST(
+        (EXTRACT(EPOCH FROM (COALESCE(qs.ClosedDate, TIMESTAMP '2024-10-01 12:34:56') - qs.QuestionCreationDate)) / 86400)
+        AS INTEGER
+      ) AS DaysSinceCreationOrClose,
+      CASE
+        WHEN (qs.AnswerCount + 1) = 0 THEN NULL
+        ELSE (qs.QuestionScore + COALESCE(qs.FavoriteCount,0) + COALESCE(qs.QuestionViewCount,0)) / (qs.AnswerCount + 1)
+      END AS EngagementRatio,
+      SUBSTR(qs.QuestionTitle, 1, (CASE WHEN INSTR(qs.QuestionTitle || ' ', ' ') > 0 THEN INSTR(qs.QuestionTitle || ' ', ' ') - 1 ELSE LENGTH(qs.QuestionTitle) END)) AS FirstWordOfTitle,
+      CASE
+        WHEN qs.QuestionOwnerUserId = ad.OwnerUserId THEN 'Accepted Answer by Owner'
+        ELSE 'Accepted Answer by Other'
+      END AS AnswerOrigin,
+      (ur_q.DisplayName || '-' || CAST(ur_q.Reputation AS VARCHAR)) AS QuestionOwnerIdentifier
+    FROM QuestionStats qs
+    LEFT JOIN AnswerDetails ad ON qs.QuestionId = ad.QuestionId AND ad.RankByScore = 1
+    LEFT JOIN UserReputation ur_q ON qs.QuestionOwnerUserId = ur_q.UserId
+    LEFT JOIN UserReputation ur_a ON ad.OwnerUserId = ur_a.UserId
+    WHERE
+      qs.QuestionViewCount > 100
+      AND qs.QuestionScore > 5
+      AND qs.AnswerCount > 0
+      AND qs.QuestionCreationDate < (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '6' MONTH)
+  )
+SELECT
+  cd.QuestionId,
+  cd.QuestionTitle,
+  cd.QuestionCreationDate,
+  cd.QuestionScore,
+  cd.AnswerCount,
+  cd.FavoriteCount,
+  cd.QuestionViewCount,
+  cd.ClosedDate,
+  cd.QuestionPostType,
+  cd.CommentCountOnQuestion,
+  cd.NetVoteScoreOnQuestion,
+  cd.EditHistoryCountOnQuestion,
+  cd.DuplicateLinkCount,
+  cd.QuestionOwnerDisplayName,
+  cd.QuestionOwnerReputation,
+  cd.QuestionOwnerCreationDate,
+  cd.QuestionOwnerWebsiteStatus,
+  cd.QuestionOwnerGoldBadges,
+  cd.QuestionOwnerSilverBadges,
+  cd.QuestionOwnerBronzeBadges,
+  cd.BestAnswerId,
+  cd.BestAnswerScore,
+  cd.BestAnswerCreationDate,
+  cd.BestAnswerOwnerDisplayName,
+  cd.BestAnswerOwnerReputation,
+  cd.BestAnswerOwnerCreationDate,
+  cd.BestAnswerOwnerWebsiteStatus,
+  cd.BestAnswerOwnerGoldBadges,
+  cd.BestAnswerOwnerSilverBadges,
+  cd.BestAnswerOwnerBronzeBadges,
+  cd.QuestionStatus,
+  cd.DaysSinceCreationOrClose,
+  cd.EngagementRatio,
+  cd.FirstWordOfTitle,
+  cd.AnswerOrigin,
+  cd.QuestionOwnerIdentifier,
+  CASE WHEN cd.QuestionStatus = 'Closed' THEN COALESCE(cr.Name, 'Unknown Close Reason') ELSE NULL END AS CloseReasonName
+FROM CombinedData cd
+LEFT JOIN PostHistory ph ON cd.QuestionId = ph.PostId AND ph.PostHistoryTypeId = 10
+LEFT JOIN CloseReasonTypes cr ON CAST(ph.Comment AS SMALLINT) = cr.Id
+WHERE
+  cd.QuestionOwnerReputation > 5000
+  AND cd.BestAnswerScore > 10
+
+UNION ALL
+
+SELECT
+  cd.QuestionId,
+  cd.QuestionTitle,
+  cd.QuestionCreationDate,
+  cd.QuestionScore,
+  cd.AnswerCount,
+  cd.FavoriteCount,
+  cd.QuestionViewCount,
+  cd.ClosedDate,
+  cd.QuestionPostType,
+  cd.CommentCountOnQuestion,
+  cd.NetVoteScoreOnQuestion,
+  cd.EditHistoryCountOnQuestion,
+  cd.DuplicateLinkCount,
+  cd.QuestionOwnerDisplayName,
+  cd.QuestionOwnerReputation,
+  cd.QuestionOwnerCreationDate,
+  cd.QuestionOwnerWebsiteStatus,
+  cd.QuestionOwnerGoldBadges,
+  cd.QuestionOwnerSilverBadges,
+  cd.QuestionOwnerBronzeBadges,
+  cd.BestAnswerId,
+  cd.BestAnswerScore,
+  cd.BestAnswerCreationDate,
+  cd.BestAnswerOwnerDisplayName,
+  cd.BestAnswerOwnerReputation,
+  cd.BestAnswerOwnerCreationDate,
+  cd.BestAnswerOwnerWebsiteStatus,
+  cd.BestAnswerOwnerGoldBadges,
+  cd.BestAnswerOwnerSilverBadges,
+  cd.BestAnswerOwnerBronzeBadges,
+  cd.QuestionStatus,
+  cd.DaysSinceCreationOrClose,
+  cd.EngagementRatio,
+  cd.FirstWordOfTitle,
+  cd.AnswerOrigin,
+  cd.QuestionOwnerIdentifier,
+  NULL AS CloseReasonName
+FROM CombinedData cd
+WHERE cd.QuestionStatus <> 'Closed'
+ORDER BY
+  QuestionScore DESC,
+  EngagementRatio DESC,
+  DaysSinceCreationOrClose ASC;

@@ -1,0 +1,148 @@
+-- {"query": "5298.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1069} 
+WITH
+RecentActivePosts AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.PostTypeId,
+    p.Tags,
+    p.ViewCount,
+    p.Score,
+    p.LastActivityDate,
+    p.CommentCount,
+    p.AnswerCount,
+    COALESCE(p.AcceptedAnswerId, -1) AS AcceptedAnswerId
+  FROM Posts p
+  WHERE p.CreationDate >= NOW() - INTERVAL '30 days'
+),
+TopTags AS (
+  SELECT
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId,
+    t.WikiPostId
+  FROM Tags t
+  WHERE t.Count > 1000
+),
+UserEngagement AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.ProfileImageUrl,
+    u.EmailHash,
+    u.AccountId,
+    -- computed activity score from last 90 days
+    COALESCE((
+      SELECT SUM(v.BountyAmount)
+      FROM Votes v
+      WHERE v.UserId = u.Id
+        AND v.CreationDate >= NOW() - INTERVAL '90 days'
+    ), 0) AS RecentBounties,
+    COALESCE((
+      SELECT COUNT(*) FROM Posts p2
+      WHERE p2.OwnerUserId = u.Id
+        AND p2.CreationDate >= NOW() - INTERVAL '90 days'
+    ), 0) AS RecentPosts
+  FROM Users u
+  WHERE u.AccountId IS NOT NULL
+),
+ComplexJoin AS (
+  SELECT
+    rap.Id AS PostId,
+    rap.Title,
+    rap.OwnerUserId,
+    rap.PostTypeId,
+    rap.Tags,
+    rap.ViewCount,
+    rap.Score,
+    rap.LastActivityDate,
+    rap.CommentCount,
+    rap.AnswerCount,
+    COALESCE(rap.AcceptedAnswerId, -1) AS AcceptedAnswerId,
+    th.Name AS PostHistoryType,
+    ph.CreationDate AS HistoryDate,
+    ph.UserId AS HistoryUserId,
+    ph.Text,
+    ph.Comment AS HistoryComment,
+    v.VoteTypeId,
+    v.UserId AS VoterUserId,
+    v.CreationDate AS VoteDate,
+    tt.Name AS VoteTypeName
+  FROM RecentActivePosts rap
+  LEFT JOIN PostHistory ph ON ph.PostId = rap.Id
+  LEFT JOIN PostHistoryTypes th ON th.Id = ph.PostHistoryTypeId
+  LEFT JOIN Votes v ON v.PostId = rap.Id
+  LEFT JOIN VoteTypes tt ON tt.Id = v.VoteTypeId
+  WHERE rap.PostTypeId = 1
+    AND rap.LastActivityDate >= NOW() - INTERVAL '60 days'
+    AND (rap.Tags ~* '.*<.*>.*' OR rap.Title IS NOT NULL)
+),
+AdjacentLinks AS (
+  SELECT
+    cl.PostId,
+    cl.RelatedPostId,
+    cl.LinkTypeId,
+    lt.Name AS LinkTypeName
+  FROM PostLinks cl
+  JOIN LinkTypes lt ON lt.Id = cl.LinkTypeId
+  WHERE cl.LinkTypeId IN (1,3)
+),
+TagRelations AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS TagScore
+  FROM Tags t
+  GROUP BY t.TagName
+  HAVING COUNT(*) > 0
+),
+FinalOutput AS (
+  SELECT
+    cu.UserId,
+    cu.DisplayName,
+    cu.Reputation,
+    cu.CreationDate AS UserCreated,
+    cu.LastAccessDate,
+    cu.Location,
+    cu.Views,
+    cu.UpVotes,
+    cu.DownVotes,
+    cu.ProfileImageUrl,
+    cu.EmailHash,
+    cu.AccountId,
+    (
+      SELECT SUM(p.Score)
+      FROM Posts p
+      WHERE p.OwnerUserId = cu.UserId
+    ) AS TotalUserScore,
+    (
+      SELECT COUNT(*) FROM Badges b WHERE b.UserId = cu.UserId
+    ) AS BadgeCount,
+    (
+      SELECT MAX(rap.Score) FROM RecentActivePosts rap WHERE rap.OwnerUserId = cu.UserId
+    ) AS MaxPostScore,
+    (SELECT COUNT(*) FROM AdjacentLinks al WHERE al.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = cu.UserId)) AS LinkedPostsCount,
+    (
+      SELECT STRING_AGG(DISTINCT tt.Name, ',')
+      FROM Votes v2
+      JOIN VoteTypes tt ON tt.Id = v2.VoteTypeId
+      WHERE v2.UserId = cu.UserId
+    ) AS VoteTypesByUser
+  FROM UserEngagement cu
+  ORDER BY cu.Reputation DESC, cu.LastAccessDate DESC
+  LIMIT 100
+)
+SELECT
+  *
+FROM FinalOutput fo
+LEFT JOIN PostHistory ph ON ph.UserId = fo.UserId
+LEFT JOIN PostHistoryTypes pht ON pht.Id = ph.PostHistoryTypeId
+LEFT JOIN Posts p ON p.Id = ph.PostId;

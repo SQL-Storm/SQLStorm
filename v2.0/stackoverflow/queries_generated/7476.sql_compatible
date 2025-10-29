@@ -1,0 +1,256 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) = 0 THEN 'Inactive'
+            WHEN COUNT(DISTINCT p.Id) < 10 THEN 'Newbie'
+            WHEN COUNT(DISTINCT p.Id) < 100 THEN 'Regular'
+            WHEN COUNT(DISTINCT p.Id) < 1000 THEN 'Veteran'
+            ELSE 'Elite'
+        END as UserCategory,
+        ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) as PostRank,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) as ReputationRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= CAST('2010-01-01 00:00:00' AS timestamp)
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopQuestions AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        (SELECT COUNT(*) FROM Posts WHERE ParentId = p.Id AND PostTypeId = 2) as AnswerCountReal,
+        CASE 
+            WHEN p.Score > 100 THEN 'Hot'
+            WHEN p.Score > 50 THEN 'Warm'
+            WHEN p.Score > 10 THEN 'Cool'
+            ELSE 'Cold'
+        END as PostHeat,
+        ROW_NUMBER() OVER (ORDER BY p.Score DESC) as ScoreRank,
+        DENSE_RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) as TypeScoreRank
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Score > 0
+),
+TagAnalysis AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsRequired,
+        t.IsModeratorOnly,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            WHEN t.Count > 10 THEN 'Niche'
+            ELSE 'Rare'
+        END as TagPopularity,
+        ('https://stackoverflow.com/tags/' || t.TagName) as TagLink,
+        REVERSE(SUBSTRING(REVERSE(t.TagName) FROM 1 FOR 3)) as TagSuffix,
+        (SELECT COUNT(*) FROM Posts WHERE Tags LIKE '%' || t.TagName || '%') as PostsWithTag
+    FROM Tags t
+    WHERE t.Count > 0
+),
+UserPostPerformance AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) as TotalPosts,
+        SUM(p.Score) as TotalScore,
+        AVG(p.Score) as AvgScore,
+        MAX(p.Score) as MaxScore,
+        MIN(p.Score) as MinScore,
+        COUNT(CASE WHEN p.Score > 0 THEN 1 END) as PositiveScorePosts,
+        COUNT(CASE WHEN p.Score < 0 THEN 1 END) as NegativeScorePosts,
+        COUNT(CASE WHEN p.Score = 0 THEN 1 END) as ZeroScorePosts,
+        (SELECT COUNT(DISTINCT ph.Id) FROM PostHistory ph WHERE ph.UserId = u.Id AND ph.PostHistoryTypeId IN (2,5,6)) as EditCount,
+        (SELECT COUNT(DISTINCT v.Id) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId IN (2,3)) as VoteCount,
+        ROUND(
+            (COALESCE(SUM(p.Score), 0) * 1.0) / NULLIF(COUNT(p.Id), 0),
+            2
+        ) as ScoreEfficiency,
+        CASE 
+            WHEN COUNT(CASE WHEN p.Score > 0 THEN 1 END) = 0 THEN 'NoUpvotes'
+            WHEN COUNT(CASE WHEN p.Score < 0 THEN 1 END) > COUNT(CASE WHEN p.Score > 0 THEN 1 END) THEN 'NegativeEfficiency'
+            ELSE 'PositiveEfficiency'
+        END as EfficiencyType
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Id IN (SELECT DISTINCT OwnerUserId FROM Posts WHERE PostTypeId = 1)
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+)
+SELECT 
+    'Performance Benchmark Report' as ReportTitle,
+    COUNT(*) as TotalRecords,
+    COUNT(DISTINCT u.Id) as ActiveUsers,
+    COUNT(DISTINCT p.Id) as TotalPosts,
+    COUNT(DISTINCT t.Id) as TotalTags,
+    COUNT(DISTINCT b.Id) as TotalBadges,
+    COUNT(DISTINCT c.Id) as TotalComments,
+    (SELECT COUNT(*) FROM PostHistory) as TotalHistoryEntries,
+    (SELECT AVG(UserPostCount) FROM (
+        SELECT UserId, COUNT(*) as UserPostCount
+        FROM Posts
+        WHERE PostTypeId = 1
+        GROUP BY UserId
+    ) sub) as AvgPostsPerUser,
+    (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) as AvgQuestionScore,
+    (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 2) as AvgAnswerScore,
+    (SELECT COUNT(*) FROM Tags WHERE Count > 100) as PopularTags,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Score > 1000) as HighScoreQuestions,
+    'Generated: ' || CAST('2024-10-01 12:34:56' AS timestamp) as GeneratedAt,
+    'Complexity: High' as ComplexityLevel,
+    CASE 
+        WHEN COUNT(*) > 100000 THEN 'Very Large'
+        WHEN COUNT(*) > 10000 THEN 'Large'
+        WHEN COUNT(*) > 1000 THEN 'Medium'
+        WHEN COUNT(*) > 100 THEN 'Small'
+        ELSE 'Very Small'
+    END as DatasetSize,
+    (SELECT STRING_AGG(ut.Name || ': ' || cnt::text, ', ') FROM (
+         SELECT ut.Name, COUNT(*) as cnt
+         FROM Users u2
+         JOIN PostHistory ph2 ON u2.Id = ph2.UserId
+         JOIN PostHistoryTypes ut ON ph2.PostHistoryTypeId = ut.Id
+         GROUP BY ut.Name
+         ORDER BY cnt DESC
+         LIMIT 3
+     ) x) as TopActivityTypes,
+    (SELECT AVG(Reputation) FROM Users WHERE Id IN (SELECT DISTINCT OwnerUserId FROM Posts WHERE PostTypeId = 1)) as AvgReputation,
+    (SELECT COUNT(DISTINCT UserId) FROM VoteTypes WHERE Id IN (2,3)) as ActiveVoterCount,
+    (SELECT MAX(Reputation) FROM Users) as MaxReputation,
+    (SELECT MIN(Reputation) FROM Users) as MinReputation,
+    (SELECT AVG(EXTRACT(day FROM (MAX(CreationDate) - MIN(CreationDate)))) FROM Posts) as AvgPostAgeDays,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year') as RecentQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 2 AND CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year') as RecentAnswers,
+    (SELECT STRING_AGG(TagName, ', ') FROM (SELECT TagName FROM Tags ORDER BY Count DESC LIMIT 5) s) as TopTags,
+    'Benchmarking Complete' as Status,
+    COALESCE((SELECT STRING_AGG(p.Title || ' (' || p.Score::text || ')', '; ') FROM TopQuestions p WHERE ScoreRank <= 5), 'No top questions') as TopQuestionsSample,
+    COALESCE((SELECT STRING_AGG(u2.DisplayName || ' (' || u2.Reputation::text || ')', '; ') FROM UserActivityStats u2 WHERE PostRank <= 5), 'No top users') as TopUsersSample,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND AnswerCount > 0) as QuestionsWithAnswers,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 2 AND Score > 10) as HighQualityAnswers,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND ViewCount > 1000) as PopularQuestions,
+    'Complex Query with multiple joins, CTEs, window functions, subqueries, aggregations, and complex predicates' as Description
+FROM Users u
+FULL OUTER JOIN Posts p ON u.Id = p.OwnerUserId
+FULL OUTER JOIN Tags t ON t.Id = 1
+FULL OUTER JOIN Badges b ON u.Id = b.UserId
+FULL OUTER JOIN Comments c ON u.Id = c.UserId
+LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+LEFT JOIN Votes v ON u.Id = v.UserId
+LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+LEFT JOIN UserPostPerformance upp ON u.Id = upp.UserId
+LEFT JOIN UserActivityStats uas ON u.Id = uas.UserId
+LEFT JOIN TopQuestions tq ON p.Id = tq.Id
+LEFT JOIN TagAnalysis ta ON t.Id = ta.Id
+WHERE 
+    (u.Id IS NOT NULL OR p.Id IS NOT NULL OR t.Id IS NOT NULL OR b.Id IS NOT NULL OR c.Id IS NOT NULL OR ph.Id IS NOT NULL OR v.Id IS NOT NULL OR pt.Id IS NOT NULL OR upp.UserId IS NOT NULL OR uas.UserId IS NOT NULL OR tq.Id IS NOT NULL OR ta.Id IS NOT NULL)
+    AND (
+        (uas.UserId IS NOT NULL AND uas.UserCategory IN ('Elite', 'Veteran', 'Regular'))
+        OR uas.UserId IS NULL
+    )
+    AND (
+        (tq.Id IS NOT NULL AND (tq.Score > 10 OR tq.ViewCount > 100))
+        OR tq.Id IS NULL
+    )
+    AND (
+        (ta.Id IS NOT NULL AND ta.TagPopularity IN ('Popular', 'Moderate'))
+        OR ta.Id IS NULL
+    )
+    AND (
+        (upp.UserId IS NOT NULL AND upp.ScoreEfficiency > 0)
+        OR upp.UserId IS NULL
+    )
+    AND ( (COUNT(p.Id) FILTER (WHERE p.Id IS NOT NULL) IS NOT NULL) OR (COUNT(c.Id) FILTER (WHERE c.Id IS NOT NULL) IS NOT NULL) )
+    AND (u.Id IS NOT NULL OR u.DisplayName IS NOT NULL OR u.Reputation >= 0)
+    AND (p.Score IS NOT NULL OR p.ViewCount IS NOT NULL OR p.AnswerCount IS NOT NULL)
+    AND (t.Count IS NOT NULL OR t.TagName IS NOT NULL)
+GROUP BY 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    p.Id,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    t.Id,
+    t.TagName,
+    t.Count,
+    b.Id,
+    c.Id,
+    ph.Id,
+    v.Id,
+    pt.Name,
+    upp.UserId,
+    uas.UserId,
+    tq.Id,
+    ta.Id
+HAVING 
+    COUNT(*) > 0
+    AND (
+        (COUNT(p.Id) > 0 AND (COUNT(p.Id) >= 1 OR COUNT(c.Id) >= 1))
+        OR COUNT(p.Id) = 0
+    )
+    AND (
+        (u.Id IS NOT NULL AND u.Reputation >= 0)
+        OR u.Id IS NULL
+    )
+UNION ALL
+SELECT 
+    'Performance Benchmark Report - Summary' as ReportTitle,
+    COUNT(*) as TotalRecords,
+    COUNT(DISTINCT u.Id) as ActiveUsers,
+    0 as TotalPosts,
+    0 as TotalTags,
+    0 as TotalBadges,
+    0 as TotalComments,
+    0 as TotalHistoryEntries,
+    0 as AvgPostsPerUser,
+    0 as AvgQuestionScore,
+    0 as AvgAnswerScore,
+    0 as PopularTags,
+    0 as HighScoreQuestions,
+    'Generated: ' || CAST('2024-10-01 12:34:56' AS timestamp) as GeneratedAt,
+    'Complexity: High' as ComplexityLevel,
+    'Summary' as DatasetSize,
+    'N/A' as TopActivityTypes,
+    0 as AvgReputation,
+    0 as ActiveVoterCount,
+    0 as MaxReputation,
+    0 as MinReputation,
+    0 as AvgPostAgeDays,
+    0 as RecentQuestions,
+    0 as RecentAnswers,
+    'N/A' as TopTags,
+    'Benchmarking Complete' as Status,
+    'N/A' as TopQuestionsSample,
+    'N/A' as TopUsersSample,
+    0 as QuestionsWithAnswers,
+    0 as HighQualityAnswers,
+    0 as PopularQuestions,
+    'Aggregated Summary' as Description
+FROM Users u
+WHERE u.Id IS NOT NULL
+GROUP BY u.Id, u.DisplayName, u.Reputation
+HAVING COUNT(*) > 0
+ORDER BY ReportTitle;

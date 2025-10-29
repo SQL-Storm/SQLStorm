@@ -1,0 +1,153 @@
+-- {"query": "4123.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1942} 
+WITH UserPostStats AS (
+    SELECT
+        p.OwnerUserId,
+        COUNT(p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        AVG(p.Score) AS AverageScore,
+        MAX(p.CommentCount) AS MaxCommentCount,
+        SUM(CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END) AS ClosedPostCount,
+        STRING_AGG(t.TagName, ',') AS UserTags
+    FROM Posts p
+    LEFT JOIN (
+        SELECT
+            p_inner.Id,
+            t_inner.TagName
+        FROM Posts p_inner
+        CROSS APPLY STRING_SPLIT(REPLACE(REPLACE(p_inner.Tags, '<', ''), '>', ''), ',') AS s
+        INNER JOIN Tags t_inner ON s.value = t_inner.TagName
+        WHERE p_inner.Tags IS NOT NULL AND p_inner.PostTypeId = 1
+    ) t ON p.Id = t.Id
+    WHERE p.OwnerUserId IS NOT NULL AND p.OwnerUserId > 0
+    GROUP BY p.OwnerUserId
+),
+UserVoteAnalysis AS (
+    SELECT
+        v.UserId,
+        COUNT(CASE WHEN vt.Name = 'UpMod' THEN v.Id ELSE NULL END) AS UpVoteCount,
+        COUNT(CASE WHEN vt.Name = 'DownMod' THEN v.Id ELSE NULL END) AS DownVoteCount,
+        COUNT(CASE WHEN vt.Name = 'Favorite' THEN v.Id ELSE NULL END) AS FavoriteVoteCount,
+        SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS TotalDownVotesReceived
+    FROM Votes v
+    JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    WHERE v.UserId IS NOT NULL
+    GROUP BY v.UserId
+),
+UserCommentActivity AS (
+    SELECT
+        c.UserId,
+        COUNT(c.Id) AS TotalComments,
+        AVG(c.Score) AS AverageCommentScore,
+        COUNT(CASE WHEN c.UserDisplayName IS NULL THEN c.Id ELSE NULL END) AS AnonymousCommentCount
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+    GROUP BY c.UserId
+),
+UserBadgeDistribution AS (
+    SELECT
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN b.Id ELSE NULL END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN b.Id ELSE NULL END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN b.Id ELSE NULL END) AS BronzeBadges,
+        COUNT(CASE WHEN b.TagBased = 1 THEN b.Id ELSE NULL END) AS TagBadges
+    FROM Badges b
+    WHERE b.UserId IS NOT NULL
+    GROUP BY b.UserId
+),
+RankedUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Views AS ProfileViews,
+        u.UpVotes AS TotalUpVotesGiven,
+        u.DownVotes AS TotalDownVotesGiven,
+        ups.UpVoteCount AS VotesReceivedUp,
+        dvs.DownVoteCount AS VotesReceivedDown,
+        uca.TotalComments,
+        ubd.GoldBadges,
+        ubd.SilverBadges,
+        ubd.BronzeBadges,
+        ups.FavoriteVoteCount,
+        COALESCE(ups.UpVoteCount, 0) + COALESCE(dvs.DownVoteCount, 0) AS TotalVotesOnUser,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.CreationDate ASC) AS ReputationRank
+    FROM Users u
+    LEFT JOIN UserVoteAnalysis ups ON u.Id = ups.UserId
+    LEFT JOIN UserVoteAnalysis dvs ON u.Id = dvs.UserId
+    LEFT JOIN UserCommentActivity uca ON u.Id = uca.UserId
+    LEFT JOIN UserBadgeDistribution ubd ON u.Id = ubd.UserId
+    WHERE u.DisplayName IS NOT NULL AND u.DisplayName <> ''
+)
+SELECT
+    ru.DisplayName,
+    ru.Reputation,
+    ru.ReputationRank,
+    COALESCE(ru.ProfileViews, 0) AS ProfileViews,
+    COALESCE(ru.TotalUpVotesGiven, 0) AS TotalUpVotesGiven,
+    COALESCE(ru.TotalDownVotesGiven, 0) AS TotalDownVotesGiven,
+    COALESCE(ru.VotesReceivedUp, 0) AS TotalUpVotesReceived,
+    COALESCE(ru.VotesReceivedDown, 0) AS TotalDownVotesReceived,
+    COALESCE(ru.TotalVotesOnUser, 0) AS TotalVotesReceived,
+    COALESCE(ru.TotalComments, 0) AS TotalCommentsPosted,
+    COALESCE(ru.GoldBadges, 0) AS GoldBadgesCount,
+    COALESCE(ru.SilverBadges, 0) AS SilverBadgesCount,
+    COALESCE(ru.BronzeBadges, 0) AS BronzeBadgesCount,
+    COALESCE(ups_all.TotalPosts, 0) AS TotalPostsAuthored,
+    COALESCE(ups_all.QuestionCount, 0) AS QuestionsAuthored,
+    COALESCE(ups_all.AnswerCount, 0) AS AnswersAuthored,
+    COALESCE(ups_all.AverageScore, 0.0) AS AvgPostScore,
+    COALESCE(ups_all.MaxCommentCount, 0) AS MaxCommentsPerPost,
+    COALESCE(ups_all.ClosedPostCount, 0) AS ClosedPostsAuthored,
+    CASE
+        WHEN ru.Reputation > 100000 THEN 'High Reputation'
+        WHEN ru.Reputation BETWEEN 5000 AND 100000 THEN 'Medium-High Reputation'
+        WHEN ru.Reputation BETWEEN 1000 AND 4999 THEN 'Medium Reputation'
+        ELSE 'Low Reputation'
+    END AS ReputationTier,
+    CASE
+        WHEN ru.CreationDate < DATE('now', '-5 years') THEN 'Long Tenure'
+        WHEN ru.CreationDate < DATE('now', '-2 years') THEN 'Medium Tenure'
+        ELSE 'Short Tenure'
+    END AS AccountTenure,
+    CASE
+        WHEN ru.TotalUpVotesGiven > ru.TotalDownVotesGiven * 5 THEN 'Net Positive Voter'
+        WHEN ru.TotalDownVotesGiven > ru.TotalUpVotesGiven * 5 THEN 'Net Negative Voter'
+        ELSE 'Balanced Voter'
+    END AS VotingTendency,
+    COALESCE(ups_all.UserTags, 'No Tags') AS PrimaryTags,
+    COUNT(p_linked.Id) AS LinkedPostsCount,
+    SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicateLinksCount,
+    AVG(p_closed.Score) FILTER (WHERE p_closed.Score IS NOT NULL) AS AvgScoreOfClosedPosts
+FROM RankedUsers ru
+LEFT JOIN UserPostStats ups_all ON ru.UserId = ups_all.OwnerUserId
+LEFT JOIN Posts p_linked ON ru.UserId = p_linked.OwnerUserId AND p_linked.PostTypeId = 1
+LEFT JOIN PostLinks pl ON p_linked.Id = pl.PostId
+LEFT JOIN Posts p_closed ON ru.UserId = p_closed.OwnerUserId AND p_closed.ClosedDate IS NOT NULL
+GROUP BY
+    ru.UserId,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.ReputationRank,
+    ru.ProfileViews,
+    ru.TotalUpVotesGiven,
+    ru.TotalDownVotesGiven,
+    ru.VotesReceivedUp,
+    ru.VotesReceivedDown,
+    ru.TotalComments,
+    ru.GoldBadges,
+    ru.SilverBadges,
+    ru.BronzeBadges,
+    ru.FavoriteVoteCount,
+    ru.TotalVotesOnUser,
+    ups_all.TotalPosts,
+    ups_all.QuestionCount,
+    ups_all.AnswerCount,
+    ups_all.AverageScore,
+    ups_all.MaxCommentCount,
+    ups_all.ClosedPostCount,
+    ups_all.UserTags,
+    ru.CreationDate
+ORDER BY ru.ReputationRank
+LIMIT 100;

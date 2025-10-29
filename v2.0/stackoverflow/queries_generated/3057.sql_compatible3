@@ -1,0 +1,156 @@
+WITH 
+    top_users AS (
+        SELECT 
+            u.Id,
+            u.DisplayName,
+            u.Reputation,
+            u.CreationDate,
+            COALESCE(u.Location, 'Unknown') AS Location,
+            ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS rep_rank
+        FROM Users u
+        WHERE u.Reputation > 10000
+    ),
+    user_badge_counts AS (
+        SELECT 
+            b.UserId,
+            SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold,
+            SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver,
+            SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze,
+            COUNT(*) AS total
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+    recent_questions AS (
+        SELECT 
+            p.Id,
+            p.Title,
+            p.CreationDate,
+            p.Score,
+            p.ViewCount,
+            p.OwnerUserId,
+            p.Tags,
+            ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+          AND p.CreationDate >= (DATE '2024-10-01' - INTERVAL '30' DAY)
+    ),
+    latest_comment_per_post AS (
+        SELECT 
+            c.PostId,
+            c.Text AS LatestComment,
+            c.CreationDate AS CommentDate
+        FROM Comments c
+        WHERE c.CreationDate = (
+            SELECT MAX(c2.CreationDate)
+            FROM Comments c2
+            WHERE c2.PostId = c.PostId
+        )
+    ),
+    -- split tags using an inline tally numbers table
+    nums AS (
+        SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5
+        UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9 UNION ALL SELECT 10
+        UNION ALL SELECT 11 UNION ALL SELECT 12 UNION ALL SELECT 13 UNION ALL SELECT 14 UNION ALL SELECT 15
+        UNION ALL SELECT 16 UNION ALL SELECT 17 UNION ALL SELECT 18 UNION ALL SELECT 19 UNION ALL SELECT 20
+        UNION ALL SELECT 21 UNION ALL SELECT 22 UNION ALL SELECT 23 UNION ALL SELECT 24 UNION ALL SELECT 25
+        UNION ALL SELECT 26 UNION ALL SELECT 27 UNION ALL SELECT 28 UNION ALL SELECT 29 UNION ALL SELECT 30
+        UNION ALL SELECT 31 UNION ALL SELECT 32 UNION ALL SELECT 33 UNION ALL SELECT 34 UNION ALL SELECT 35
+        UNION ALL SELECT 36 UNION ALL SELECT 37 UNION ALL SELECT 38 UNION ALL SELECT 39 UNION ALL SELECT 40
+        UNION ALL SELECT 41 UNION ALL SELECT 42 UNION ALL SELECT 43 UNION ALL SELECT 44 UNION ALL SELECT 45
+        UNION ALL SELECT 46 UNION ALL SELECT 47 UNION ALL SELECT 48 UNION ALL SELECT 49 UNION ALL SELECT 50
+        UNION ALL SELECT 51 UNION ALL SELECT 52 UNION ALL SELECT 53 UNION ALL SELECT 54 UNION ALL SELECT 55
+        UNION ALL SELECT 56 UNION ALL SELECT 57 UNION ALL SELECT 58 UNION ALL SELECT 59 UNION ALL SELECT 60
+        UNION ALL SELECT 61 UNION ALL SELECT 62 UNION ALL SELECT 63 UNION ALL SELECT 64 UNION ALL SELECT 65
+        UNION ALL SELECT 66 UNION ALL SELECT 67 UNION ALL SELECT 68 UNION ALL SELECT 69 UNION ALL SELECT 70
+        UNION ALL SELECT 71 UNION ALL SELECT 72 UNION ALL SELECT 73 UNION ALL SELECT 74 UNION ALL SELECT 75
+        UNION ALL SELECT 76 UNION ALL SELECT 77 UNION ALL SELECT 78 UNION ALL SELECT 79 UNION ALL SELECT 80
+        UNION ALL SELECT 81 UNION ALL SELECT 82 UNION ALL SELECT 83 UNION ALL SELECT 84 UNION ALL SELECT 85
+        UNION ALL SELECT 86 UNION ALL SELECT 87 UNION ALL SELECT 88 UNION ALL SELECT 89 UNION ALL SELECT 90
+        UNION ALL SELECT 91 UNION ALL SELECT 92 UNION ALL SELECT 93 UNION ALL SELECT 94 UNION ALL SELECT 95
+        UNION ALL SELECT 96 UNION ALL SELECT 97 UNION ALL SELECT 98 UNION ALL SELECT 99 UNION ALL SELECT 100
+    ),
+    tags_expanded AS (
+        SELECT
+            p.Id AS PostId,
+            TRIM(BOTH '<>' FROM SUBSTR(p.Tags, seg.seg_pos, seg.seg_len)) AS Tag,
+            nums.n AS seq,
+            seg.seg_pos,
+            seg.seg_len
+        FROM Posts p
+        JOIN nums ON 1=1
+        CROSS APPLY (
+            SELECT
+                CASE
+                    WHEN nums.n = 1 THEN INSTR(p.Tags, '<') + 1
+                    ELSE INSTR(p.Tags, '><', 1, nums.n - 1) + 2
+                END AS seg_pos,
+                CASE
+                    WHEN INSTR(p.Tags, '><', 1, nums.n) > 0 THEN INSTR(p.Tags, '><', 1, nums.n) -
+                        CASE WHEN nums.n = 1 THEN INSTR(p.Tags, '<') + 1 ELSE INSTR(p.Tags, '><', 1, nums.n - 1) + 2 END
+                    ELSE
+                        INSTR(p.Tags, '>', CASE WHEN nums.n = 1 THEN INSTR(p.Tags, '<') + 1 ELSE INSTR(p.Tags, '><', 1, nums.n - 1) + 2 END) -
+                        CASE WHEN nums.n = 1 THEN INSTR(p.Tags, '<') + 1 ELSE INSTR(p.Tags, '><', 1, nums.n - 1) + 2 END
+                END AS seg_len
+        ) seg
+        WHERE p.PostTypeId = 1
+          AND p.Tags IS NOT NULL
+          AND seg.seg_pos > 0
+          AND seg.seg_len > 0
+    ),
+    tag_usage AS (
+        SELECT 
+            te.Tag,
+            COUNT(*) AS UsageCount,
+            AVG(p.Score) AS AvgScore
+        FROM tags_expanded te
+        JOIN Posts p ON p.Id = te.PostId
+        GROUP BY te.Tag
+    ),
+    recent_activity AS (
+        SELECT 
+            u.Id AS UserId,
+            u.DisplayName,
+            COALESCE(ub.gold,0) AS GoldBadges,
+            COALESCE(ub.silver,0) AS SilverBadges,
+            COALESCE(ub.bronze,0) AS BronzeBadges,
+            COALESCE(ub.total,0) AS TotalBadges,
+            rq.Id AS RecentQuestionId,
+            rq.Title AS RecentQuestionTitle,
+            rq.Score AS RecentQuestionScore,
+            lc.LatestComment,
+            lc.CommentDate,
+            rq.CreationDate AS RecentQuestionCreationDate,
+            ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY rq.CreationDate DESC) AS QRank
+        FROM top_users u
+        LEFT JOIN user_badge_counts ub      ON ub.UserId = u.Id
+        LEFT JOIN recent_questions rq      ON rq.OwnerUserId = u.Id AND rq.rn = 1
+        LEFT JOIN latest_comment_per_post lc ON lc.PostId = rq.Id
+    )
+SELECT 
+    ra.UserId,
+    ra.DisplayName,
+    ra.GoldBadges,
+    ra.SilverBadges,
+    ra.BronzeBadges,
+    ra.TotalBadges,
+    ra.RecentQuestionId,
+    ra.RecentQuestionTitle,
+    ra.RecentQuestionScore,
+    COALESCE(ra.LatestComment, '(No comments)') AS LatestComment,
+    ra.CommentDate,
+    CASE 
+        WHEN ra.RecentQuestionScore IS NULL THEN NULL
+        WHEN ra.RecentQuestionScore >= 10 THEN 'Hot'
+        WHEN ra.RecentQuestionScore >= 5  THEN 'Warm'
+        ELSE 'Cold'
+    END AS QuestionHeat,
+    tu.Tag,
+    tu.UsageCount,
+    tu.AvgScore
+FROM recent_activity ra
+LEFT JOIN tag_usage tu 
+    ON EXISTS (
+        SELECT 1 FROM tags_expanded te WHERE te.PostId = ra.RecentQuestionId AND te.Tag = tu.Tag
+    )
+WHERE ra.QRank = 1
+ORDER BY ra.GoldBadges DESC, ra.SilverBadges DESC, ra.BronzeBadges DESC, ra.UserId;

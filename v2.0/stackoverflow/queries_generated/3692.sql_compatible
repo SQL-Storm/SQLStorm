@@ -1,0 +1,110 @@
+WITH RECURSIVE
+    tag_questions AS (
+        SELECT
+            p.id                     AS q_id,
+            p.title                  AS q_title,
+            p.creationdate           AS q_created,
+            p.owneruserid            AS q_owner,
+            UNNEST(STRING_TO_ARRAY(TRIM(BOTH '><' FROM p.tags), '><')) AS tag
+        FROM posts p
+        WHERE p.posttypeid = 1
+          AND p.tags IS NOT NULL
+    ),
+
+    user_stats AS (
+        SELECT
+            u.id                                   AS user_id,
+            u.displayname,
+            u.reputation,
+            COUNT(DISTINCT a.id)                           AS answer_cnt,
+            COUNT(DISTINCT CASE WHEN q.acceptedanswerid = a.id THEN a.id END) AS accepted_cnt,
+            AVG(COALESCE(a.score,0))                      AS avg_answer_score,
+            (SELECT COUNT(*)
+               FROM votes v
+               JOIN posts p ON p.id = v.postid
+              WHERE v.votetypeid = 2
+                AND p.owneruserid = u.id)          AS upvote_total
+        FROM users u
+        LEFT JOIN posts a ON a.owneruserid = u.id AND a.posttypeid = 2
+        LEFT JOIN posts q ON q.id = a.parentid
+        GROUP BY u.id, u.displayname, u.reputation
+    ),
+
+    top_users AS (
+        SELECT
+            us.*,
+            ROW_NUMBER() OVER (ORDER BY us.reputation DESC, us.answer_cnt DESC) AS rk
+        FROM user_stats us
+        WHERE us.reputation > 10000
+    ),
+
+    badge_agg AS (
+        SELECT
+            b.userid,
+            STRING_AGG(DISTINCT b.name, ', ')               AS badge_list,
+            MAX(CASE WHEN b.class = 1 THEN 1 ELSE 0 END)    AS has_gold,
+            COUNT(*) FILTER (WHERE b.class = 2)             AS silver_cnt,
+            COUNT(*) FILTER (WHERE b.class = 3)             AS bronze_cnt
+        FROM badges b
+        GROUP BY b.userid
+    ),
+
+    tag_stats AS (
+        SELECT
+            tq.tag,
+            COUNT(DISTINCT tq.q_id)                         AS q_cnt,
+            COUNT(DISTINCT a.id) FILTER (WHERE a.id IS NOT NULL) AS answered_q_cnt
+        FROM tag_questions tq
+        LEFT JOIN posts a
+               ON a.parentid = tq.q_id
+              AND a.posttypeid = 2
+        GROUP BY tq.tag
+    ),
+
+    recent_activity AS (
+        SELECT
+            u.id                               AS user_id,
+            (SELECT MAX(p.lastactivitydate)
+               FROM posts p
+              WHERE p.owneruserid = u.id)    AS last_activity
+        FROM users u
+    )
+
+SELECT
+    tu.user_id,
+    tu.displayname,
+    tu.reputation,
+    tu.answer_cnt,
+    tu.accepted_cnt,
+    ROUND(tu.avg_answer_score::numeric,2)               AS avg_ans_score,
+    tu.upvote_total,
+    COALESCE(ba.badge_list, 'None')            AS badges,
+    CASE WHEN ba.has_gold = 1 THEN 'Yes' ELSE 'No' END AS has_gold_badge,
+    ba.silver_cnt,
+    ba.bronze_cnt,
+    ra.last_activity,
+    ts.tag,
+    ts.q_cnt,
+    ts.answered_q_cnt,
+    ROW_NUMBER() OVER (PARTITION BY tu.user_id ORDER BY ts.q_cnt DESC) AS tag_rank
+FROM top_users tu
+LEFT JOIN badge_agg ba       ON ba.userid = tu.user_id
+LEFT JOIN recent_activity ra ON ra.user_id = tu.user_id
+LEFT JOIN tag_stats ts       ON ts.tag IN (
+        SELECT UNNEST(STRING_TO_ARRAY(TRIM(BOTH '><' FROM p.tags), '><'))
+          FROM posts p
+         WHERE p.owneruserid = tu.user_id
+           AND p.posttypeid = 2
+         LIMIT 5
+    )
+WHERE ts.q_cnt IS NOT NULL
+ORDER BY tu.rk, ts.q_cnt DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+    '---', NULL, NULL, NULL, NULL, NULL,
+    NULL, NULL, NULL
+WHERE NOT EXISTS (SELECT 1 FROM top_users);

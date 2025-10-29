@@ -1,0 +1,140 @@
+WITH
+/* 1. Aggregate post statistics per user */
+user_post_agg AS (
+    SELECT
+        u.id                               AS user_id,
+        u.displayname                      AS display_name,
+        COUNT(p.id) FILTER (WHERE p.posttypeid = 1) AS question_cnt,
+        COUNT(p.id) FILTER (WHERE p.posttypeid = 2) AS answer_cnt,
+        SUM(p.score) FILTER (WHERE p.posttypeid = 1) AS question_score_sum,
+        SUM(p.score) FILTER (WHERE p.posttypeid = 2) AS answer_score_sum,
+        MAX(p.creationdate)                AS last_post_dt
+    FROM users u
+    LEFT JOIN posts p
+           ON p.owneruserid = u.id
+    GROUP BY u.id, u.displayname
+),
+
+/* 2. Aggregate badge counts per user */
+user_badge_agg AS (
+    SELECT
+        b.userid                             AS user_id,
+        COUNT(*) FILTER (WHERE b.class = 1) AS gold_cnt,
+        COUNT(*) FILTER (WHERE b.class = 2) AS silver_cnt,
+        COUNT(*) FILTER (WHERE b.class = 3) AS bronze_cnt,
+        MIN(b.date)                          AS first_badge_dt,
+        MAX(b.date)                          AS last_badge_dt
+    FROM badges b
+    GROUP BY b.userid
+),
+
+/* 3. Votes aggregated per post, then rolled‑up to user level */
+post_vote_agg AS (
+    SELECT
+        p.owneruserid                                 AS user_id,
+        SUM(CASE WHEN v.votetypeid = 2 THEN 1 ELSE 0 END) AS up_votes,
+        SUM(CASE WHEN v.votetypeid = 3 THEN 1 ELSE 0 END) AS down_votes,
+        SUM(CASE WHEN v.votetypeid = 5 THEN 1 ELSE 0 END) AS favorite_votes
+    FROM votes v
+    JOIN posts p ON p.id = v.postid
+    GROUP BY p.owneruserid
+),
+
+/* 4. Recent activity per user */
+user_recent_activity AS (
+    SELECT
+        u.id                              AS user_id,
+        GREATEST(
+            COALESCE(u.lastaccessdate,      TIMESTAMP '1970-01-01'),
+            COALESCE(MAX(p.lastactivitydate),   TIMESTAMP '1970-01-01'),
+            COALESCE(MAX(c.creationdate),      TIMESTAMP '1970-01-01')
+        )                                AS recent_activity_dt
+    FROM users u
+    LEFT JOIN posts    p ON p.owneruserid = u.id
+    LEFT JOIN comments c ON c.userid      = u.id
+    GROUP BY u.id, u.lastaccessdate
+),
+
+/* 5. Tag usage statistics */
+tag_usage AS (
+    SELECT
+        t.tagname,
+        COUNT(p.id)                      AS post_cnt,
+        SUM(p.score)                     AS score_sum,
+        MAX(p.creationdate)              AS last_used_dt
+    FROM tags t
+    JOIN posts p
+      ON p.tags LIKE '%' || t.tagname || '%'
+    GROUP BY t.tagname
+),
+
+/* 6. Top tags */
+top_tags AS (
+    SELECT
+        tagname,
+        post_cnt,
+        ROW_NUMBER() OVER (ORDER BY post_cnt DESC) AS rn
+    FROM tag_usage
+    WHERE post_cnt > 1000
+),
+
+/* 7. Combine all per‑user aggregates, calculate derived columns */
+combined_user AS (
+    SELECT
+        upa.user_id,
+        upa.display_name,
+        upa.question_cnt,
+        upa.answer_cnt,
+        upa.question_score_sum,
+        upa.answer_score_sum,
+        uba.gold_cnt,
+        uba.silver_cnt,
+        uba.bronze_cnt,
+        pva.up_votes,
+        pva.down_votes,
+        pva.favorite_votes,
+        ura.recent_activity_dt,
+        CASE
+            WHEN (upa.question_cnt + upa.answer_cnt) = 0 THEN NULL
+            ELSE CAST((upa.question_score_sum + upa.answer_score_sum) AS DECIMAL) /
+                 NULLIF(upa.question_cnt + upa.answer_cnt, 0)
+        END AS avg_score_per_post,
+        COALESCE(uba.first_badge_dt, TIMESTAMP '1900-01-01') AS first_badge_dt,
+        COALESCE(uba.last_badge_dt,  TIMESTAMP '1900-01-01') AS last_badge_dt
+    FROM user_post_agg      upa
+    LEFT JOIN user_badge_agg uba ON uba.user_id = upa.user_id
+    LEFT JOIN post_vote_agg  pva ON pva.user_id = upa.user_id
+    LEFT JOIN user_recent_activity ura ON ura.user_id = upa.user_id
+    WHERE upa.question_cnt > 0 OR upa.answer_cnt > 0
+)
+
+SELECT *
+FROM combined_user
+WHERE avg_score_per_post > 1.5
+  AND (COALESCE(gold_cnt,0) > 0 OR COALESCE(silver_cnt,0) > 5)
+  AND recent_activity_dt > (CAST('2024-10-01' AS DATE) - INTERVAL '90' DAY)
+ORDER BY avg_score_per_post DESC, gold_cnt DESC
+LIMIT 100
+
+UNION ALL
+
+/* 8. Append a "report" row showing the top‑5 tags (set operator) */
+SELECT
+    CAST(NULL AS INTEGER)            AS user_id,
+    'TOP TAGS'                       AS display_name,
+    CAST(NULL AS INTEGER)            AS question_cnt,
+    CAST(NULL AS INTEGER)            AS answer_cnt,
+    CAST(NULL AS INTEGER)            AS question_score_sum,
+    CAST(NULL AS INTEGER)            AS answer_score_sum,
+    CAST(NULL AS INTEGER)            AS gold_cnt,
+    CAST(NULL AS INTEGER)            AS silver_cnt,
+    CAST(NULL AS INTEGER)            AS bronze_cnt,
+    CAST(NULL AS INTEGER)            AS up_votes,
+    CAST(NULL AS INTEGER)            AS down_votes,
+    CAST(NULL AS INTEGER)            AS favorite_votes,
+    CAST(NULL AS TIMESTAMP)          AS recent_activity_dt,
+    CAST(NULL AS DECIMAL(10,2))      AS avg_score_per_post,
+    CAST(NULL AS TIMESTAMP)          AS first_badge_dt,
+    CAST(NULL AS TIMESTAMP)          AS last_badge_dt
+FROM (SELECT 1) dummy
+ORDER BY 1;

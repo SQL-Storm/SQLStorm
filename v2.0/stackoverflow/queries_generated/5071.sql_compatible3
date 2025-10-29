@@ -1,0 +1,167 @@
+WITH RECURSIVE
+DateSeries AS (
+  SELECT date_trunc('day', CreationDate) AS day
+  FROM Posts
+  WHERE CreationDate IS NOT NULL
+  GROUP BY date_trunc('day', CreationDate)
+  UNION ALL
+  SELECT day + INTERVAL '1 day'
+  FROM DateSeries
+  WHERE day + INTERVAL '1 day' < (SELECT MAX(CreationDate) FROM Posts)
+),
+PostStats AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.CreationDate,
+    p.Title,
+    p.Tags,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.CommentCount,
+    p.LastActivityDate,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    COALESCE(vs.UpModCount, 0) AS UpModCount,
+    COALESCE(vs.DownModCount, 0) AS DownModCount,
+    COALESCE(vs.CloseVotes, 0) AS CloseVotes,
+    COALESCE(vs.ReopenVotes, 0) AS ReopenVotes
+  FROM Posts p
+  LEFT JOIN (
+    SELECT
+      PostId,
+      SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpModCount,
+      SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownModCount,
+      SUM(CASE WHEN VoteTypeId = 6 THEN 1 ELSE 0 END) AS CloseVotes,
+      SUM(CASE WHEN VoteTypeId = 7 THEN 1 ELSE 0 END) AS ReopenVotes
+    FROM Votes
+    GROUP BY PostId
+  ) vs ON vs.PostId = p.Id
+  WHERE p.CreationDate IS NOT NULL
+),
+TopContributors AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(b.Id) AS BadgesCount,
+    SUM(COALESCE(b.Class, 0)) AS BadgeValue
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TagActivity AS (
+  WITH RECURSIVE tag_split(post_id, tags_remaining, tag) AS (
+    SELECT CAST(p.Id AS BIGINT) AS post_id,
+           CAST(p.Tags AS VARCHAR(4000)) AS tags_remaining,
+           CAST(NULL AS VARCHAR(4000)) AS tag
+    FROM Posts p
+    WHERE p.Tags IS NOT NULL
+    UNION ALL
+    SELECT
+      post_id,
+      CASE
+        WHEN position('><' IN tags_remaining) > 0
+          THEN substring(tags_remaining FROM position('><' IN tags_remaining) + 2)
+        ELSE ''
+      END AS tags_remaining,
+      CASE
+        WHEN position('><' IN tags_remaining) > 0
+          THEN trim(BOTH '<>' FROM substring(tags_remaining FROM 1 FOR position('><' IN tags_remaining)))
+        ELSE trim(BOTH '<>' FROM tags_remaining)
+      END AS tag
+    FROM tag_split
+    WHERE tags_remaining IS NOT NULL AND tags_remaining <> ''
+  )
+  SELECT
+    ts.tag AS TagName,
+    COUNT(*) AS TagPostCount,
+    AVG(p.Score) AS AvgScore,
+    SUM(p.ViewCount) AS TotalViews
+  FROM tag_split ts
+  JOIN Posts p ON p.Id = ts.post_id
+  WHERE ts.tag IS NOT NULL AND ts.tag <> ''
+  GROUP BY ts.tag
+),
+LatestUserEditRanked AS (
+  SELECT
+    ph.PostId,
+    ph.Text,
+    ph.CreationDate,
+    ph.UserId,
+    ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+  FROM PostHistory ph
+  WHERE ph.PostHistoryTypeId IN (5, 8, 16)
+)
+SELECT
+  ps.PostId AS PostId,
+  ps.PostTypeId,
+  pt.Name AS PostTypeName,
+  ps.Title,
+  ps.Tags,
+  ps.OwnerUserId,
+  u.DisplayName AS OwnerDisplayName,
+  u.Reputation AS OwnerReputation,
+  ps.Score,
+  ps.ViewCount,
+  ps.CommentCount,
+  ps.LastActivityDate,
+  pc.Name AS CloseReason,
+  pcId.Name AS ClosedByReason,
+  NULLIF(ps.UpModCount, 0) AS UpModVotes,
+  NULLIF(ps.DownModCount, 0) AS DownModVotes,
+  NULLIF(ps.CloseVotes, 0) AS CloseVotes,
+  NULLIF(ps.ReopenVotes, 0) AS ReopenVotes,
+  ba.BadgesCount,
+  ba.BadgeValue,
+  tg.TagName,
+  ta.TagPostCount,
+  ta.AvgScore,
+  ta.TotalViews,
+  lit.Text AS LatestBodyEdit
+FROM PostStats ps
+JOIN PostTypes pt ON pt.Id = ps.PostTypeId
+LEFT JOIN Users u ON u.Id = ps.OwnerUserId
+LEFT JOIN LATERAL (
+  SELECT CAST(ph.Comment AS INTEGER) AS cr_id
+  FROM PostHistory ph
+  WHERE ph.PostId = ps.PostId AND ph.PostHistoryTypeId = 10
+  ORDER BY ph.CreationDate DESC
+  LIMIT 1
+) phc ON TRUE
+LEFT JOIN CloseReasonTypes pc ON pc.Id = phc.cr_id
+LEFT JOIN PostHistoryTypes pcId ON pcId.Id = 10
+LEFT JOIN TopContributors ba ON ba.UserId = ps.OwnerUserId
+LEFT JOIN PostLinks pl ON pl.PostId = ps.PostId
+LEFT JOIN (
+  WITH RECURSIVE split_tags(post_id, tags_remaining, tag) AS (
+    SELECT CAST(p.PostId AS BIGINT) AS post_id,
+           CAST(p.Tags AS VARCHAR(4000)) AS tags_remaining,
+           CAST(NULL AS VARCHAR(4000)) AS tag
+    FROM (SELECT PostId, Tags FROM PostStats WHERE Tags IS NOT NULL) p
+    UNION ALL
+    SELECT
+      post_id,
+      CASE
+        WHEN position('><' IN tags_remaining) > 0
+          THEN substring(tags_remaining FROM position('><' IN tags_remaining) + 2)
+        ELSE ''
+      END AS tags_remaining,
+      CASE
+        WHEN position('><' IN tags_remaining) > 0
+          THEN trim(BOTH '<>' FROM substring(tags_remaining FROM 1 FOR position('><' IN tags_remaining)))
+        ELSE trim(BOTH '<>' FROM tags_remaining)
+      END AS tag
+    FROM split_tags
+    WHERE tags_remaining IS NOT NULL AND tags_remaining <> ''
+  )
+  SELECT post_id, tag AS TagName FROM split_tags WHERE tag IS NOT NULL AND tag <> ''
+) tg ON tg.post_id = ps.PostId
+LEFT JOIN TagActivity ta ON ta.TagName = tg.TagName
+LEFT JOIN (
+  SELECT Text, PostId FROM LatestUserEditRanked WHERE rn = 1
+) lit ON lit.PostId = ps.PostId
+WHERE ps.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '365 days')
+ORDER BY ps.Score DESC, ps.ViewCount DESC
+LIMIT 100;

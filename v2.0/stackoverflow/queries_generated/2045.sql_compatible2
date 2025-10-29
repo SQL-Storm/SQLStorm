@@ -1,0 +1,146 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        COALESCE(p.CreationDate, TIMESTAMP '1970-01-01') AS TagCreationDate,
+        1 AS Level
+    FROM Tags t
+    LEFT JOIN Posts p ON t.ExcerptPostId = p.Id
+    WHERE t.IsModeratorOnly = FALSE AND t.IsRequired = FALSE
+
+    UNION ALL
+
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        rh.TagCreationDate,
+        rh.Level + 1
+    FROM Tags t
+    INNER JOIN RecursiveTagHierarchy rh ON t.WikiPostId = rh.Id
+    WHERE rh.Level < 3
+),
+UserActivityRankings AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotes,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS PostCountRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id AND v.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+RecentEngagedQuestions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.Tags,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        MAX(v.CreationDate) AS LastVoteDate,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotes,
+        ROW_NUMBER() OVER (ORDER BY p.CreationDate DESC) AS RecentRank
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1
+      AND p.ClosedDate IS NULL
+      AND p.CreationDate >= (DATE '2024-10-01' - INTERVAL '180 days')
+    GROUP BY p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.Tags, p.OwnerUserId, u.DisplayName
+),
+AnswerStats AS (
+    SELECT
+        a.ParentId AS QuestionId,
+        COUNT(*) AS AnswerCount,
+        AVG(a.Score) AS AvgAnswerScore,
+        MAX(a.Score) AS MaxAnswerScore,
+        MIN(a.Score) AS MinAnswerScore,
+        SUM(CASE WHEN a.OwnerUserId IS NULL THEN 1 ELSE 0 END) AS AnonymousAnswers
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+    GROUP BY a.ParentId
+),
+QuestionCloseReasons AS (
+    SELECT
+        ph.PostId,
+        crt.Name AS CloseReason,
+        MAX(ph.CreationDate) AS CloseDate
+    FROM PostHistory ph
+    INNER JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS SMALLINT)
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.PostId, crt.Name
+),
+CorrelatedRecentComments AS (
+    SELECT 
+        c.PostId,
+        COUNT(*) AS RecentCommentsCount,
+        MAX(c.CreationDate) AS LastCommentDate,
+        STRING_AGG(DISTINCT COALESCE(c.UserDisplayName, '[anonymous]') || ': ' || LEFT(c.Text, 40), ' | ') AS SampleComments
+    FROM Comments c
+    WHERE c.CreationDate > (DATE '2024-10-01' - INTERVAL '30 days')
+    GROUP BY c.PostId
+)
+SELECT 
+    q.Id AS QuestionId,
+    q.Title,
+    q.OwnerUserId,
+    ua.DisplayName AS OwnerDisplayName,
+    ua.ReputationRank,
+    ua.PostCountRank,
+    q.Score AS QuestionScore,
+    q.ViewCount,
+    q.AnswerCount,
+    COALESCE(ans.AnswerCount, 0) AS TotalAnswers,
+    COALESCE(ROUND(CAST(ans.AvgAnswerScore AS NUMERIC), 2), 0) AS AvgAnswerScore,
+    COALESCE(ans.MaxAnswerScore, 0) AS MaxAnswerScore,
+    COALESCE(ans.MinAnswerScore, 0) AS MinAnswerScore,
+    COALESCE(ans.AnonymousAnswers, 0) AS AnonymousAnswerCount,
+    q.Tags,
+    q.LastVoteDate,
+    q.TotalUpVotes AS QuestionUpVotes,
+    q.RecentRank,
+    qcr.CloseReason,
+    qcr.CloseDate,
+    crc.RecentCommentsCount,
+    crc.LastCommentDate,
+    crc.SampleComments,
+    rh.TagName,
+    rh.Count AS TagCount,
+    rh.TagCreationDate,
+    ua.GoldBadges,
+    ua.SilverBadges,
+    ua.BronzeBadges,
+    (CAST(ua.GoldBadges AS TEXT) || 'G/' || CAST(ua.SilverBadges AS TEXT) || 'S/' || CAST(ua.BronzeBadges AS TEXT) || 'B') AS BadgeSummary,
+    CASE 
+        WHEN q.ViewCount > 10000 THEN 'Very Popular'
+        WHEN q.ViewCount BETWEEN 1000 AND 10000 THEN 'Popular'
+        ELSE 'Less Popular'
+    END AS PopularityCategory,
+    LAG(q.Score) OVER (ORDER BY q.Score DESC) AS PrevQuestionScore,
+    LEAD(q.Score) OVER (ORDER BY q.Score DESC) AS NextQuestionScore
+FROM RecentEngagedQuestions q
+LEFT JOIN UserActivityRankings ua ON ua.UserId = q.OwnerUserId
+LEFT JOIN AnswerStats ans ON ans.QuestionId = q.Id
+LEFT JOIN QuestionCloseReasons qcr ON qcr.PostId = q.Id
+LEFT JOIN CorrelatedRecentComments crc ON crc.PostId = q.Id
+LEFT JOIN RecursiveTagHierarchy rh ON rh.TagName = SUBSTRING(q.Tags FROM '<([^>]+)>')
+WHERE ua.PostCountRank <= 100 
+  AND (qcr.CloseReason IS NULL OR qcr.CloseDate < (DATE '2024-10-01' - INTERVAL '90 days'))
+ORDER BY q.Score DESC, q.CreationDate DESC
+LIMIT 50;

@@ -1,0 +1,171 @@
+WITH UserStats AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.UpVotes AS TotalUpVotesGiven,
+        U.DownVotes AS TotalDownVotesGiven,
+        U.Views AS ProfileViews,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsOwned,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersOwned,
+        COALESCE(SUM(P.Score), 0) AS TotalPostScoreReceived,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        COALESCE(SUM(C.Score), 0) AS TotalCommentScoreReceived,
+        COUNT(DISTINCT B.Id) AS TotalBadgesEarned,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        CAST(COALESCE(SUM(P.Score), 0) AS NUMERIC(18, 2)) / NULLIF(COUNT(P.Id), 0) AS AvgPostScorePerUser,
+        (EXTRACT(EPOCH FROM MIN(P.CreationDate) - U.CreationDate) / 86400.0) AS DaysToFirstPost,
+        GREATEST(MAX(P.LastActivityDate), MAX(C.CreationDate), U.LastAccessDate) AS UserLastActivity
+    FROM
+        Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    LEFT JOIN Badges AS B ON U.Id = B.UserId
+    WHERE U.CreationDate >= TIMESTAMP '2010-01-01'
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.UpVotes, U.DownVotes, U.Views
+),
+PostActivityDetails AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount AS PostCommentCount,
+        P.FavoriteCount,
+        P.Title,
+        P.Tags,
+        P.LastEditorUserId,
+        P.LastEditDate,
+        P.LastActivityDate,
+        P.ClosedDate,
+        P.CommunityOwnedDate,
+        COALESCE(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - P.LastEditDate)) / 86400.0, 0) AS DaysSinceLastEdit,
+        COUNT(DISTINCT PH.UserId) FILTER (WHERE PH.UserId IS NOT NULL AND PH.UserId <> P.OwnerUserId AND PH.PostHistoryTypeId IN (4,5,6)) AS DistinctNonOwnerEditorCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (5, 8) THEN 1 ELSE 0 END) AS BodyEditRevisionCount,
+        CAST(COALESCE(SUM(PC.Score), 0) AS NUMERIC(18, 2)) / NULLIF(COUNT(PC.Id), 0) AS AvgCommentScoreForPost,
+        RANK() OVER (PARTITION BY P.PostTypeId, EXTRACT(YEAR FROM P.CreationDate) ORDER BY P.Score DESC, P.ViewCount DESC) AS PostScoreRankInYear,
+        AVG(P.Score) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate ROWS BETWEEN 3 PRECEDING AND 3 FOLLOWING) AS OwnerPostScore7DayMovingAvg,
+        NTILE(10) OVER (PARTITION BY P.PostTypeId ORDER BY P.ViewCount DESC) AS ViewCountDecile
+    FROM
+        Posts AS P
+    LEFT JOIN PostHistory AS PH ON P.Id = PH.PostId
+    LEFT JOIN Comments AS PC ON P.Id = PC.PostId
+    WHERE
+        P.PostTypeId IN (1, 2, 4, 5)
+        AND P.CreationDate BETWEEN TIMESTAMP '2015-01-01' AND TIMESTAMP '2023-12-31'
+        AND P.OwnerUserId IS NOT NULL
+    GROUP BY
+        P.Id, P.PostTypeId, P.OwnerUserId, P.CreationDate, P.Score, P.ViewCount, P.AnswerCount, P.CommentCount, P.FavoriteCount, P.Title, P.Tags, P.LastEditorUserId, P.LastEditDate, P.LastActivityDate, P.ClosedDate, P.CommunityOwnedDate
+),
+TagContext AS (
+    SELECT
+        PAD.PostId,
+        T_unnested.TagName_Expanded,
+        (SELECT MAX(WP.Score) FROM Posts AS WP WHERE WP.Id = T.WikiPostId AND WP.PostTypeId = 5) AS TagWikiScore,
+        EXISTS (
+            SELECT 1
+            FROM PostHistory AS PH_Inner
+            WHERE PH_Inner.PostId = PAD.PostId
+              AND PH_Inner.PostHistoryTypeId = 19
+              AND PH_Inner.CreationDate > PAD.PostCreationDate
+        ) AS IsPostProtectedAfterCreation
+    FROM
+        PostActivityDetails AS PAD
+    LEFT JOIN LATERAL (
+        SELECT UNNEST(string_to_array(substr(PAD.Tags, 2, length(PAD.Tags) - 2), '><')) AS TagName_Expanded
+    ) AS T_unnested ON (PAD.Tags IS NOT NULL AND length(PAD.Tags) > 2)
+    LEFT JOIN Tags AS T ON T_unnested.TagName_Expanded = T.TagName
+    WHERE
+        T_unnested.TagName_Expanded IS NOT NULL
+),
+RecentHighActivityItems AS (
+    SELECT
+        P.Id AS ItemId,
+        P.OwnerUserId AS ItemOwnerId,
+        'Question' AS ItemType,
+        P.CreationDate,
+        P.Score
+    FROM Posts AS P
+    WHERE P.PostTypeId = 1
+      AND P.CreationDate >= TIMESTAMP '2022-01-01'
+      AND P.ViewCount > 10000
+      AND (P.FavoriteCount > 100 OR P.AnswerCount > 20)
+    UNION ALL
+    SELECT
+        U.Id AS ItemId,
+        U.Id AS ItemOwnerId,
+        'User' AS ItemType,
+        U.CreationDate,
+        U.Reputation AS Score
+    FROM Users AS U
+    WHERE U.Reputation > 50000
+      AND U.LastAccessDate >= TIMESTAMP '2023-06-01'
+      AND EXISTS (SELECT 1 FROM Posts P_inner WHERE P_inner.OwnerUserId = U.Id AND P_inner.CreationDate >= TIMESTAMP '2023-01-01' AND P_inner.Score > 50)
+)
+SELECT
+    US.UserId,
+    US.DisplayName,
+    US.Reputation,
+    US.TotalQuestionsOwned,
+    US.TotalAnswersOwned,
+    US.AvgPostScorePerUser,
+    US.DaysToFirstPost,
+    PAD.PostId,
+    PAD.Title,
+    PAD.PostScore,
+    PAD.ViewCount,
+    PAD.PostScoreRankInYear,
+    PAD.DaysSinceLastEdit,
+    PAD.DistinctNonOwnerEditorCount,
+    PAD.BodyEditRevisionCount,
+    TC.TagName_Expanded AS PostTagName,
+    TC.TagWikiScore,
+    TC.IsPostProtectedAfterCreation,
+    LAG(PAD.PostScore, 1, 0) OVER (PARTITION BY US.UserId ORDER BY PAD.PostCreationDate) AS PreviousPostScoreByOwner,
+    LEAD(PAD.PostScore, 1, 0) OVER (PARTITION BY US.UserId ORDER BY PAD.PostCreationDate) AS NextPostScoreByOwner,
+    COALESCE(PAD.FavoriteCount, 0) * 1.5 + COALESCE(PAD.AnswerCount, 0) * 3 + COALESCE(PAD.PostCommentCount, 0) / 2.0 + COALESCE(PAD.ViewCount, 0) / 100.0 AS WeightedEngagementScore,
+    UPPER(SUBSTR(COALESCE(US.DisplayName, 'ANONYMOUS'), 1, 5)) || '_' ||
+    MD5(CAST(PAD.PostId AS TEXT) || COALESCE(TC.TagName_Expanded, 'NO_TAG') || CAST(US.UserId AS TEXT)) || '_' ||
+    REPLACE(LOWER(SUBSTR(COALESCE(PAD.Title, 'NO_TITLE_AVAILABLE'), 1, 25)), ' ', '-') AS ComplexIdentifier,
+    CASE
+        WHEN PAD.ClosedDate IS NOT NULL AND PAD.DaysSinceLastEdit > 180 AND PAD.PostScore < 5 THEN 'Stale_LowScore_Closed'
+        WHEN PAD.CommunityOwnedDate IS NOT NULL AND PAD.DistinctNonOwnerEditorCount > 2 THEN 'Community_Collaborative_Wiki'
+        WHEN PAD.PostScoreRankInYear <= 10 AND PAD.ViewCountDecile <= 2 AND PAD.FavoriteCount > 50 THEN 'Elite_Highly_Viewed_Favorited'
+        WHEN US.DaysToFirstPost IS NOT NULL AND US.DaysToFirstPost > 730 AND US.Reputation > 10000 THEN 'LateBloomer_HighRep'
+        WHEN PAD.OwnerPostScore7DayMovingAvg IS NOT NULL AND PAD.PostScore > PAD.OwnerPostScore7DayMovingAvg * 1.5 THEN 'Owner_Breakout_Post'
+        WHEN TC.IsPostProtectedAfterCreation THEN 'Moderator_Protected_Post'
+        WHEN RHA.ItemId IS NOT NULL AND RHA.ItemType = 'Question' THEN 'Recent_High_Engagement_Question'
+        ELSE 'General_Activity'
+    END AS PostCategorization,
+    (SELECT COUNT(V.Id) FROM Votes AS V WHERE V.PostId = PAD.PostId AND V.VoteTypeId = 4) AS OffensiveVoteCount,
+    (US.TotalPostScoreReceived + US.TotalCommentScoreReceived) * (COALESCE(US.AvgPostScorePerUser, 1.0) / 10.0) + (US.TotalBadgesEarned * (US.GoldBadges + 1)) AS UserContributionWeightedMetric
+FROM
+    UserStats AS US
+INNER JOIN
+    PostActivityDetails AS PAD ON US.UserId = PAD.OwnerUserId
+LEFT JOIN
+    TagContext AS TC ON PAD.PostId = TC.PostId
+LEFT JOIN
+    RecentHighActivityItems AS RHA ON (PAD.PostId = RHA.ItemId AND RHA.ItemType = 'Question') OR (US.UserId = RHA.ItemId AND RHA.ItemType = 'User')
+WHERE
+    US.Reputation > 500
+    AND PAD.PostScore > 0
+    AND PAD.ViewCount > 100
+    AND (
+        (PAD.Tags LIKE '%<sql>%' AND PAD.PostTypeId = 1) OR
+        (PAD.Tags LIKE '%<database>%' AND PAD.PostTypeId = 2) OR
+        (TC.TagName_Expanded IN ('json', 'api', 'performance') AND PAD.PostTypeId IN (1,2))
+    )
+    AND US.LastAccessDate >= TIMESTAMP '2023-01-01'
+    AND (TC.TagWikiScore IS NULL OR TC.TagWikiScore >= 10)
+    AND (PAD.PostCommentCount IS NULL OR PAD.PostCommentCount > 0)
+ORDER BY
+    UserContributionWeightedMetric DESC, WeightedEngagementScore DESC, PAD.PostCreationDate DESC
+LIMIT 10000;

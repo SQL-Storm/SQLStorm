@@ -1,0 +1,124 @@
+WITH recent_user_activity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.ProfileImageUrl,
+    u.Location,
+    u."EmailHash",
+    u.AccountId,
+    COUNT(p.Id) AS PostCount,
+    AVG(p.Score) AS AvgPostScore,
+    MAX(p.LastActivityDate) AS LastActivity
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY
+    u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate,
+    u.Views, u.UpVotes, u.DownVotes, u.ProfileImageUrl, u.Location,
+    u."EmailHash", u.AccountId
+),
+hot_tags AS (
+  SELECT
+    t.TagName,
+    SUM(t.Count) AS TotalTagCount,
+    AVG(t.Count) AS AvgTagCount
+  FROM Tags t
+  GROUP BY t.TagName
+  HAVING SUM(t.Count) > 100
+),
+top_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.OwnerUserId,
+    u.DisplayName AS OwnerDisplayName,
+    ROW_NUMBER() OVER (
+      PARTITION BY p.OwnerUserId
+      ORDER BY p.Score DESC, p.ViewCount DESC, p.LastActivityDate DESC
+    ) AS rn
+  FROM Posts p
+  LEFT JOIN Users u ON u.Id = p.OwnerUserId
+  WHERE p.PostTypeId = 1
+    AND p.ClosedDate IS NULL
+    AND p.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year')
+),
+complex_filter AS (
+  SELECT
+    tq.PostId,
+    tq.Title,
+    tq.Tags,
+    tq.Score,
+    tq.ViewCount,
+    tq.CreationDate,
+    tq.LastActivityDate,
+    tq.OwnerUserId,
+    tq.OwnerDisplayName,
+    HAS_ACCESS_RIGHTS(tq.OwnerUserId) AS HasRights
+  FROM top_questions tq
+  WHERE (tq.Score >= 10 OR tq.ViewCount >= 500)
+    OR (EXTRACT(YEAR FROM tq.CreationDate) = EXTRACT(YEAR FROM TIMESTAMP '2024-10-01 12:34:56'))
+),
+final_rows AS (
+  SELECT
+    cf.PostId,
+    cf.Title,
+    cf.Tags,
+    cf.Score,
+    cf.ViewCount,
+    cf.CreationDate,
+    cf.LastActivityDate,
+    cf.OwnerUserId,
+    cf.OwnerDisplayName,
+    CASE
+      WHEN cf.HasRights = TRUE THEN 'Granted'
+      WHEN cf.HasRights = FALSE THEN 'Denied'
+      ELSE 'Unknown'
+    END AS OwnerRightsStatus,
+    (SELECT COALESCE(MAX(v.BountyAmount), 0)
+     FROM Votes v
+     WHERE v.PostId = cf.PostId AND v.VoteTypeId = 8
+    ) AS MaxBountyOnPost,
+    1 AS IsBenchmarkRow
+  FROM complex_filter cf
+  ORDER BY cf.Score DESC, cf.ViewCount DESC
+  OFFSET 0 ROWS FETCH FIRST 100 ROWS ONLY
+)
+SELECT
+  fr.PostId,
+  fr.Title,
+  fr.Tags,
+  fr.Score,
+  fr.ViewCount,
+  fr.CreationDate,
+  fr.LastActivityDate,
+  fr.OwnerUserId,
+  fr.OwnerDisplayName,
+  fr.OwnerRightsStatus,
+  fr.MaxBountyOnPost,
+  fr.IsBenchmarkRow
+FROM final_rows fr
+LEFT JOIN recent_user_activity rua ON rua.UserId = fr.OwnerUserId
+LEFT JOIN hot_tags ht ON ht.TagName = ANY(string_to_array(SUBSTRING(fr.Tags FROM 2 FOR CHAR_LENGTH(fr.Tags)-2), '><'))
+JOIN LATERAL (
+  SELECT
+    p.Id,
+    p.Title,
+    p.Body,
+    p.LastEditDate
+  FROM Posts p
+  WHERE p.OwnerUserId = fr.OwnerUserId
+  ORDER BY p.LastEditDate DESC
+  LIMIT 1
+) last_post ON TRUE
+WHERE fr.ViewCount IS NOT NULL
+ORDER BY fr.Score DESC, fr.ViewCount DESC, fr.CreationDate DESC;

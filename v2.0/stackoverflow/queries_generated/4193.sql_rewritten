@@ -1,0 +1,107 @@
+-- {"query": "4193.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1232} 
+WITH RankedQuestions AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title AS QuestionTitle,
+        p.OwnerUserId,
+        p.CreationDate AS QuestionCreationDate,
+        p.Score AS QuestionScore,
+        p.AnswerCount,
+        p.FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn_user_question,
+        COUNT(c.Id) OVER (PARTITION BY p.Id) as CommentCountPerQuestion
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    WHERE p.PostTypeId = 1
+),
+UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadges,
+        COALESCE(u.Views, 0) AS TotalViews,
+        COALESCE(u.UpVotes, 0) AS TotalUpVotes,
+        COALESCE(u.DownVotes, 0) AS TotalDownVotes
+    FROM Users u
+),
+AnswerDetails AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.OwnerUserId,
+        a.CreationDate AS AnswerCreationDate,
+        a.Score AS AnswerScore,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) as rn_best_answer,
+        CASE WHEN p.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END AS IsAcceptedAnswer
+    FROM Posts a
+    JOIN Posts p ON a.ParentId = p.Id
+    WHERE a.PostTypeId = 2
+),
+QuestionAggregates AS (
+    SELECT
+        rq.QuestionId,
+        rq.QuestionTitle,
+        rq.OwnerUserId,
+        rq.QuestionCreationDate,
+        rq.QuestionScore,
+        rq.AnswerCount,
+        rq.FavoriteCount,
+        rq.CommentCountPerQuestion,
+        ad.AnswerId AS BestAnswerId,
+        ad.AnswerScore AS BestAnswerScore,
+        ad.IsAcceptedAnswer AS BestAnswerIsAccepted,
+        ue.DisplayName AS QuestionOwnerDisplayName,
+        ue.Reputation AS QuestionOwnerReputation,
+        ue.GoldBadges AS QuestionOwnerGoldBadges,
+        ue.SilverBadges AS QuestionOwnerSilverBadges,
+        ue.BronzeBadges AS QuestionOwnerBronzeBadges,
+        DATEDIFF(day, rq.QuestionCreationDate, cast('2024-10-01 12:34:56' as timestamp)) AS DaysSinceCreation,
+        FORMAT(rq.QuestionCreationDate, 'yyyy-MM') AS CreationMonthYear,
+        CASE WHEN rq.QuestionScore > 100 THEN 'HighScore' WHEN rq.QuestionScore > 10 THEN 'MediumScore' ELSE 'LowScore' END AS ScoreCategory,
+        LOWER(SUBSTRING(rq.QuestionTitle, 1, 50)) AS First50CharsOfTitle
+    FROM RankedQuestions rq
+    LEFT JOIN AnswerDetails ad ON rq.QuestionId = ad.QuestionId AND ad.rn_best_answer = 1
+    LEFT JOIN UserEngagement ue ON rq.OwnerUserId = ue.UserId
+    WHERE rq.rn_user_question <= 5
+)
+SELECT
+    qa.QuestionId,
+    qa.QuestionTitle,
+    qa.QuestionCreationDate,
+    qa.QuestionScore,
+    qa.AnswerCount,
+    qa.FavoriteCount,
+    qa.CommentCountPerQuestion,
+    qa.BestAnswerId,
+    qa.BestAnswerScore,
+    qa.BestAnswerIsAccepted,
+    qa.QuestionOwnerDisplayName,
+    qa.QuestionOwnerReputation,
+    qa.QuestionOwnerGoldBadges,
+    qa.QuestionOwnerSilverBadges,
+    qa.QuestionOwnerBronzeBadges,
+    qa.DaysSinceCreation,
+    qa.CreationMonthYear,
+    qa.ScoreCategory,
+    qa.First50CharsOfTitle,
+    COALESCE(ue_last_editor.DisplayName, 'Community') AS LastEditorDisplayName,
+    ue_last_editor.Reputation AS LastEditorReputation,
+    pl.RelatedPostId,
+    lt.Name AS LinkType
+FROM QuestionAggregates qa
+LEFT JOIN UserEngagement ue_last_editor ON qa.OwnerUserId = ue_last_editor.UserId -- Placeholder for actual last editor, actual join would be more complex
+LEFT JOIN PostLinks pl ON qa.QuestionId = pl.PostId
+LEFT JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+WHERE qa.QuestionScore > 0
+  AND qa.AnswerCount >= 1
+  AND qa.DaysSinceCreation BETWEEN 30 AND 365
+  AND qa.QuestionOwnerReputation > 500
+  AND qa.First50CharsOfTitle LIKE '%how%'
+  AND lt.Name <> 'Linked'
+  OR qa.FavoriteCount > 10
+ORDER BY qa.QuestionScore DESC, qa.FavoriteCount DESC
+LIMIT 100;

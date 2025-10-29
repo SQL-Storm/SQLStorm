@@ -1,0 +1,174 @@
+-- {"query": "3472.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2608} 
+
+WITH recent_questions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        COALESCE(u.Reputation, 0) AS OwnerReputation,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn_owner_recent
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= CURRENT_DATE - INTERVAL '180 days'
+),
+top_five_per_user AS (
+    SELECT *
+    FROM recent_questions
+    WHERE rn_owner_recent <= 5
+),
+tag_aggregates AS (
+    SELECT
+        tag,
+        COUNT(*)                AS TagUseCount,
+        SUM(p.Score)            AS TagScoreSum,
+        AVG(p.Score)            AS TagScoreAvg
+    FROM top_five_per_user p
+    CROSS JOIN LATERAL (
+        SELECT unnest(string_to_array(trim(both '<>' FROM p.Tags), '><')) AS tag
+    ) AS t
+    GROUP BY tag
+),
+badge_points AS (
+    SELECT
+        b.UserId,
+        SUM(CASE b.Class WHEN 1 THEN 1000 WHEN 2 THEN 500 ELSE 100 END) AS BadgePoints
+    FROM Badges b
+    GROUP BY b.UserId
+),
+user_activity AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(bp.BadgePoints, 0) AS BadgePoints,
+        (
+            SELECT COUNT(*)
+            FROM Posts p
+            WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1
+        ) AS QuestionCount,
+        (
+            SELECT COUNT(*)
+            FROM Posts p
+            WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2
+        ) AS AnswerCount,
+        (
+            SELECT COUNT(*)
+            FROM Votes v
+            WHERE v.UserId = u.Id AND v.VoteTypeId = 2
+        ) AS UpVotesGiven,
+        (
+            SELECT COUNT(*)
+            FROM Votes v
+            WHERE v.UserId = u.Id AND v.VoteTypeId = 3
+        ) AS DownVotesGiven,
+        (
+            SELECT COUNT(*)
+            FROM Comments c
+            WHERE c.UserId = u.Id
+        ) AS CommentCount,
+        (
+            SELECT COUNT(*)
+            FROM Badges b
+            WHERE b.UserId = u.Id AND b.Class = 1
+        ) AS GoldBadgeCount
+    FROM Users u
+    LEFT JOIN badge_points bp ON u.Id = bp.UserId
+    WHERE u.CreationDate <= CURRENT_DATE - INTERVAL '1 year'
+),
+post_link_stats AS (
+    SELECT
+        pl.PostId,
+        COUNT(*) FILTER (WHERE lt.Name = 'Linked')    AS LinkedCount,
+        COUNT(*) FILTER (WHERE lt.Name = 'Duplicate') AS DuplicateCount
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    GROUP BY pl.PostId
+),
+answer_summary AS (
+    SELECT
+        a.ParentId                                     AS QuestionId,
+        COUNT(*)                                      AS AnswerCount,
+        AVG(a.Score)                                  AS AvgAnswerScore,
+        MAX(CASE WHEN a.Id = p.AcceptedAnswerId THEN a.Score END) AS MaxAcceptedScore,
+        SUM(CASE WHEN a.Score < 0 THEN 1 ELSE 0 END)  AS NegativeScoreAnswers
+    FROM Posts a
+    LEFT JOIN Posts p ON p.Id = a.ParentId
+    WHERE a.PostTypeId = 2
+    GROUP BY a.ParentId
+),
+combined AS (
+    SELECT
+        q.Id,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        COALESCE(u.DisplayName, '[deleted]') AS OwnerDisplayName,
+        q.OwnerReputation,
+        bp.BadgePoints,
+        t.tag,
+        ta.TagUseCount,
+        ta.TagScoreSum,
+        ta.TagScoreAvg,
+        pls.LinkedCount,
+        pls.DuplicateCount,
+        ans.AnswerCount,
+        ans.AvgAnswerScore,
+        ans.MaxAcceptedScore,
+        ans.NegativeScoreAnswers,
+        CASE WHEN q.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+        COALESCE(q.FavoriteCount, 0) +
+        COALESCE((
+            SELECT COUNT(*)
+            FROM Votes v
+            WHERE v.PostId = q.Id AND v.VoteTypeId = 5
+        ), 0) AS TotalFavorites
+    FROM top_five_per_user q
+    LEFT JOIN Users u ON q.OwnerUserId = u.Id
+    LEFT JOIN badge_points bp ON q.OwnerUserId = bp.UserId
+    LEFT JOIN LATERAL (
+        SELECT unnest(string_to_array(trim(both '<>' FROM q.Tags), '><')) AS tag
+    ) AS t ON true
+    LEFT JOIN tag_aggregates ta ON ta.tag = t.tag
+    LEFT JOIN post_link_stats pls ON pls.PostId = q.Id
+    LEFT JOIN answer_summary ans ON ans.QuestionId = q.Id
+    WHERE q.Score > 0
+      AND (q.ViewCount IS NULL OR q.ViewCount > 0)
+)
+SELECT *
+FROM combined
+WHERE OwnerReputation + COALESCE(BadgePoints, 0) > 5000
+
+UNION ALL
+
+SELECT
+    q.Id,
+    q.Title,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    NULL            AS OwnerDisplayName,
+    NULL            AS OwnerReputation,
+    NULL            AS BadgePoints,
+    NULL            AS tag,
+    NULL            AS TagUseCount,
+    NULL            AS TagScoreSum,
+    NULL            AS TagScoreAvg,
+    NULL            AS LinkedCount,
+    NULL            AS DuplicateCount,
+    NULL            AS AnswerCount,
+    NULL            AS AvgAnswerScore,
+    NULL            AS MaxAcceptedScore,
+    NULL            AS NegativeScoreAnswers,
+    0               AS IsClosed,
+    0               AS TotalFavorites
+FROM recent_questions q
+WHERE q.rn_owner_recent = 1
+  AND q.Score < 0
+ORDER BY CreationDate DESC
+LIMIT 200;

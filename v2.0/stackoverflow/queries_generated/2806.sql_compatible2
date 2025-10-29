@@ -1,0 +1,178 @@
+with RecursiveBadges as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class,
+        row_number() over (partition by u.Id order by b.Date desc) as rn
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    where b.Date > cast('2024-10-01' as date) - interval '1 year'
+),
+UserPostStats as (
+    select
+        u.Id as UserId,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersCount,
+        coalesce(sum(p.Score), 0) as TotalPostScore,
+        max(p.CreationDate) as LastPostDate
+    from Users u
+    left join Posts p on u.Id = p.OwnerUserId
+    group by u.Id
+),
+TopTagsCTE as (
+    select
+        unnest(string_to_array(
+            substring(coalesce(p.Tags, '') from 2 for char_length(coalesce(p.Tags, '')) - 2), '><')) as TagName,
+        count(*) as TagUsageCount
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+    group by TagName
+    order by TagUsageCount desc
+    limit 10
+),
+UserTopTags as (
+    select
+        u.Id as UserId,
+        t.TagName,
+        count(*) as UserTagCount
+    from Users u
+    join Posts p on u.Id = p.OwnerUserId
+    join TopTagsCTE t on position(concat('<', t.TagName, '>') in coalesce(p.Tags, '')) > 0
+    where p.PostTypeId = 1
+    group by u.Id, t.TagName
+),
+PostWithAnswers as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        u.DisplayName as AnswerOwner,
+        coalesce(v.UpVotes, 0) as AnswerUpVotes,
+        coalesce(v.DownVotes, 0) as AnswerDownVotes
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Users u on a.OwnerUserId = u.Id
+    left join (
+        select
+            v.PostId,
+            sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+            sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes
+        from Votes v
+        join VoteTypes vt on v.VoteTypeId = vt.Id
+        group by v.PostId
+    ) v on a.Id = v.PostId
+    where q.PostTypeId = 1
+),
+RankedAnswers as (
+    select
+        QuestionId,
+        AnswerId,
+        AnswerScore,
+        AnswerUpVotes,
+        AnswerDownVotes,
+        row_number() over (partition by QuestionId order by AnswerScore desc, AnswerUpVotes desc) as AnswerRank
+    from PostWithAnswers
+    where AnswerId is not null
+),
+HighQualityAnswers as (
+    select
+        ra.QuestionId,
+        ra.AnswerId,
+        ra.AnswerScore,
+        ra.AnswerUpVotes,
+        ra.AnswerDownVotes
+    from RankedAnswers ra
+    where ra.AnswerRank = 1 and ra.AnswerScore > 10 and ra.AnswerUpVotes - ra.AnswerDownVotes > 5
+),
+QuestionsWithHighQualityAnswers as (
+    select
+        q.QuestionId,
+        q.Title,
+        q.QuestionScore,
+        q.ViewCount,
+        hq.AnswerId,
+        hq.AnswerScore,
+        hq.AnswerUpVotes,
+        hq.AnswerDownVotes
+    from PostWithAnswers q
+    join HighQualityAnswers hq on q.QuestionId = hq.QuestionId
+),
+CloseReasonsCount as (
+    select
+        ph.PostId,
+        crt.Name as CloseReason,
+        count(*) as CloseVotes
+    from PostHistory ph
+    join CloseReasonTypes crt on cast(ph.Comment as integer) = crt.Id
+    where ph.PostHistoryTypeId = 10 and ph.Comment is not null
+    group by ph.PostId, crt.Name
+),
+UserActivityWindows as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        count(*) over (partition by u.Id order by ph.CreationDate range between interval '30 days' preceding and current row) as Activity30d,
+        count(*) over (partition by u.Id order by ph.CreationDate range between interval '365 days' preceding and current row) as Activity365d
+    from Users u
+    left join PostHistory ph on u.Id = ph.UserId
+),
+MergedUserStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        s.QuestionsCount,
+        s.AnswersCount,
+        s.TotalPostScore,
+        s.LastPostDate,
+        -- remove ORDER BY from array_agg to be compatible; include BadgeClass in aggregation inputs via struct-like concatenation
+        array_agg(distinct rb.BadgeName) filter (where rb.rn <= 3) as TopBadges,
+        array_agg(distinct utt.TagName) filter (where utt.UserTagCount > 1) as FavoriteTags
+    from Users u
+    left join UserPostStats s on u.Id = s.UserId
+    left join RecursiveBadges rb on u.Id = rb.UserId
+    left join UserTopTags utt on u.Id = utt.UserId
+    group by u.Id, u.DisplayName, s.QuestionsCount, s.AnswersCount, s.TotalPostScore, s.LastPostDate
+)
+select distinct
+    m.UserId,
+    m.DisplayName,
+    coalesce(m.QuestionsCount, 0) as QuestionsCount,
+    coalesce(m.AnswersCount, 0) as AnswersCount,
+    coalesce(m.TotalPostScore, 0) as TotalPostScore,
+    m.LastPostDate,
+    array_to_string(m.TopBadges, ', ') as TopBadges,
+    array_to_string(m.FavoriteTags, ', ') as FavoriteTags,
+    coalesce(c.CloseVotes, 0) as TotalCloseVotes,
+    c.CloseReason,
+    case
+        when (coalesce(m.QuestionsCount,0) + coalesce(m.AnswersCount,0)) = 0 then null
+        else cast(coalesce(m.TotalPostScore,0) as double precision)/nullif((coalesce(m.QuestionsCount,0) + coalesce(m.AnswersCount,0)),0)
+    end as AvgScorePerPost,
+    case
+        when uaw.Activity365d > 0 then uaw.Activity30d * 100.0 / uaw.Activity365d
+        else null
+    end as Activity30dPercentOfYear,
+    qwa.QuestionId,
+    qwa.Title as HQAQuestionTitle,
+    qwa.QuestionScore,
+    qwa.ViewCount,
+    qwa.AnswerId as HQAAnswerId,
+    qwa.AnswerScore,
+    qwa.AnswerUpVotes,
+    qwa.AnswerDownVotes
+from MergedUserStats m
+left join CloseReasonsCount c on m.UserId = c.PostId
+left join UserActivityWindows uaw on m.UserId = uaw.UserId and uaw.PostHistoryTypeId = 10
+left join QuestionsWithHighQualityAnswers qwa on qwa.QuestionId in (
+    select p.Id from Posts p where p.OwnerUserId = m.UserId and p.PostTypeId = 1
+)
+where coalesce(m.TotalPostScore, 0) > 100
+order by m.TotalPostScore desc, m.UserId
+limit 100;

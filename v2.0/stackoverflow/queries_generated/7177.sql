@@ -1,0 +1,248 @@
+-- {"query": "7177.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2241} 
+WITH UserEngagement AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COUNT(DISTINCT v.Id) as VoteCount,
+        AVG(p.Score) as AvgPostScore,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        MAX(b.Date) as LastBadgeDate,
+        MAX(v.CreationDate) as LastVoteDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    WHERE u.AccountId IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        PostCount,
+        CommentCount,
+        BadgeCount,
+        VoteCount,
+        AvgPostScore,
+        LastPostDate,
+        LastCommentDate,
+        LastBadgeDate,
+        LastVoteDate,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, PostCount DESC) as RankByReputation,
+        ROW_NUMBER() OVER (ORDER BY PostCount DESC, VoteCount DESC) as RankByActivity
+    FROM UserEngagement
+),
+PostStats AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            WHEN p.PostTypeId = 4 THEN 'TagWikiExcerpt'
+            WHEN p.PostTypeId = 5 THEN 'TagWiki'
+            ELSE 'Other'
+        END as PostType,
+        CASE 
+            WHEN p.TagBased = 1 THEN 'Tag-based'
+            ELSE 'Named'
+        END as BadgeType,
+        COALESCE(p.Tags, '') as Tags,
+        COALESCE(p.Title, '') as CleanTitle,
+        ISNULL(p.AcceptedAnswerId, 0) as HasAcceptedAnswer,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+            ELSE 'Active'
+        END as PostStatus,
+        DATEDIFF(day, p.CreationDate, GETDATE()) as AgeInDays,
+        CASE 
+            WHEN p.ViewCount > 1000 THEN 'High'
+            WHEN p.ViewCount > 100 THEN 'Medium'
+            WHEN p.ViewCount > 0 THEN 'Low'
+            ELSE 'None'
+        END as ViewCategory,
+        CASE 
+            WHEN p.Score > 100 THEN 'Highly Voted'
+            WHEN p.Score > 10 THEN 'Moderately Voted'
+            WHEN p.Score > 0 THEN 'Low Voted'
+            ELSE 'No Votes'
+        END as VoteCategory,
+        (SELECT COUNT(*) FROM Posts pp WHERE pp.ParentId = p.Id AND pp.PostTypeId = 2) as AnswerCountWithFilter
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserPostHistory AS (
+    SELECT 
+        ph.PostId,
+        ph.UserId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        ph.Comment,
+        ph.Text,
+        ph.RevisionGUID,
+        CASE 
+            WHEN ph.PostHistoryTypeId IN (1, 4, 6, 7, 8, 9) THEN 'Title/Tag/Body Edit'
+            WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN 'Post Status Change'
+            WHEN ph.PostHistoryTypeId IN (24, 35, 36) THEN 'Content Modification'
+            ELSE 'Other'
+        END as ChangeType,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) as LatestChangeOrder
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (1, 4, 6, 7, 8, 9, 10, 11, 12, 13, 24, 35, 36)
+),
+ComplexQueryResults AS (
+    SELECT 
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.PostCount,
+        tu.CommentCount,
+        tu.BadgeCount,
+        tu.VoteCount,
+        tu.AvgPostScore,
+        tu.LastPostDate,
+        tu.LastCommentDate,
+        tu.LastBadgeDate,
+        tu.LastVoteDate,
+        tu.RankByReputation,
+        tu.RankByActivity,
+        ps.PostId,
+        ps.Title,
+        ps.Score,
+        ps.ViewCount,
+        ps.AnswerCount,
+        ps.CommentCount,
+        ps.FavoriteCount,
+        ps.CreationDate as PostCreationDate,
+        ps.PostType,
+        ps.BadgeType,
+        ps.Tags,
+        ps.CleanTitle,
+        ps.HasAcceptedAnswer,
+        ps.PostStatus,
+        ps.AgeInDays,
+        ps.ViewCategory,
+        ps.VoteCategory,
+        ps.AnswerCountWithFilter,
+        uoh.ChangeType,
+        uoh.CreationDate as ChangeDate,
+        uoh.Comment,
+        uoh.Text,
+        uoh.RevisionGUID,
+        CASE 
+            WHEN ps.PostType = 'Question' AND ps.Score >= 100 AND ps.ViewCount >= 1000 THEN 'Elite Question'
+            WHEN ps.PostType = 'Answer' AND ps.Score >= 50 AND ps.AnswerCountWithFilter > 0 THEN 'Popular Answer'
+            WHEN ps.PostStatus = 'Closed' THEN 'Closed Post'
+            WHEN ps.PostStatus = 'Community Owned' THEN 'Community Owned Post'
+            ELSE 'Regular Post'
+        END as PostClassification,
+        CASE 
+            WHEN tu.PostCount = 0 THEN 'Inactive User'
+            WHEN tu.PostCount < 10 THEN 'New User'
+            WHEN tu.PostCount < 50 THEN 'Active User'
+            WHEN tu.PostCount < 200 THEN 'Veteran User'
+            ELSE 'Elite User'
+        END as UserSegment,
+        ROW_NUMBER() OVER (PARTITION BY tu.UserId ORDER BY ps.CreationDate DESC) as PostRankPerUser,
+        AVG(ps.Score) OVER (PARTITION BY tu.UserId) as AvgScorePerUser,
+        DENSE_RANK() OVER (ORDER BY ps.Score DESC) as GlobalScoreRank,
+        PERCENT_RANK() OVER (ORDER BY ps.Score) as ScorePercentile,
+        NTILE(5) OVER (ORDER BY ps.Score) as ScoreQuintile,
+        LAG(ps.Score, 1) OVER (ORDER BY ps.CreationDate) as PrevScore,
+        LEAD(ps.Score, 1) OVER (ORDER BY ps.CreationDate) as NextScore,
+        SUM(ps.ViewCount) OVER (PARTITION BY tu.UserId ORDER BY ps.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) as CumulativeViews,
+        STDEV(ps.Score) OVER (PARTITION BY tu.UserId) as ScoreStandardDeviation,
+        CONCAT('User: ', tu.DisplayName, ' | Post: ', ps.Title, ' | Score: ', ps.Score, ' | Status: ', ps.PostStatus) as FormattedResult,
+        CASE 
+            WHEN ISNULL(ps.Score, 0) = 0 AND ISNULL(ps.ViewCount, 0) = 0 AND ISNULL(ps.CommentCount, 0) = 0 THEN 'Zero Engagement'
+            WHEN ps.Score > 0 AND ps.ViewCount > 0 AND ps.CommentCount > 0 THEN 'High Engagement'
+            WHEN ps.Score > 0 OR ps.ViewCount > 0 OR ps.CommentCount > 0 THEN 'Moderate Engagement'
+            ELSE 'Low Engagement'
+        END as EngagementLevel
+    FROM TopUsers tu
+    INNER JOIN Posts ps ON tu.UserId = ps.OwnerUserId
+    LEFT JOIN UserPostHistory uoh ON ps.Id = uoh.PostId AND uoh.LatestChangeOrder = 1
+    WHERE ps.PostTypeId IN (1, 2)
+      AND ps.CreationDate >= DATEADD(year, -2, GETDATE())
+      AND (ps.ViewCount > 0 OR ps.Score > 0 OR ps.CommentCount > 0)
+)
+SELECT 
+    UserId,
+    DisplayName,
+    Reputation,
+    PostCount,
+    CommentCount,
+    BadgeCount,
+    VoteCount,
+    AvgPostScore,
+    LastPostDate,
+    LastCommentDate,
+    LastBadgeDate,
+    LastVoteDate,
+    RankByReputation,
+    RankByActivity,
+    PostId,
+    Title,
+    Score,
+    ViewCount,
+    AnswerCount,
+    CommentCount,
+    FavoriteCount,
+    PostCreationDate,
+    PostType,
+    BadgeType,
+    Tags,
+    CleanTitle,
+    HasAcceptedAnswer,
+    PostStatus,
+    AgeInDays,
+    ViewCategory,
+    VoteCategory,
+    AnswerCountWithFilter,
+    ChangeType,
+    ChangeDate,
+    Comment,
+    Text,
+    RevisionGUID,
+    PostClassification,
+    UserSegment,
+    PostRankPerUser,
+    AvgScorePerUser,
+    GlobalScoreRank,
+    ScorePercentile,
+    ScoreQuintile,
+    PrevScore,
+    NextScore,
+    CumulativeViews,
+    ScoreStandardDeviation,
+    FormattedResult,
+    EngagementLevel,
+    COUNT(*) OVER () as TotalResults,
+    MAX(AgeInDays) OVER (PARTITION BY UserId) as MaxUserAge,
+    MIN(AgeInDays) OVER (PARTITION BY UserId) as MinUserAge,
+    SUM(CASE WHEN PostType = 'Question' THEN 1 ELSE 0 END) OVER (PARTITION BY UserId) as QuestionCount,
+    SUM(CASE WHEN PostType = 'Answer' THEN 1 ELSE 0 END) OVER (PARTITION BY UserId) as AnswerCount
+FROM ComplexQueryResults
+WHERE (Score IS NOT NULL AND Score > 0) OR (ViewCount IS NOT NULL AND ViewCount > 0) OR (CommentCount IS NOT NULL AND CommentCount > 0)
+HAVING COUNT(*) > 0
+ORDER BY Reputation DESC, Score DESC
+OPTION (MAXDOP 8, RECOMPILE);

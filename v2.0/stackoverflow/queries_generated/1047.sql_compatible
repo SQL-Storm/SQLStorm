@@ -1,0 +1,169 @@
+WITH UserBaseStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsOwned,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersOwned,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.UpVotes, u.DownVotes
+),
+PostDetailMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.CreationDate AS PostCreationDate,
+        p.LastEditDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.AcceptedAnswerId,
+        COALESCE(CAST(p.Score AS NUMERIC) / NULLIF(p.ViewCount, 0), 0.0) AS ScoreToViewRatio,
+        (SELECT COALESCE(AVG(c.Score), 0) FROM Comments c WHERE c.PostId = p.Id) AS AvgCommentScoreForPost,
+        COUNT(DISTINCT pl_dup.RelatedPostId) FILTER (WHERE pl_dup.LinkTypeId = 3) AS DuplicateLinkedPostCount,
+        COUNT(DISTINCT pl_rel.RelatedPostId) FILTER (WHERE pl_rel.LinkTypeId = 1) AS GeneralLinkedPostCount,
+        MAX(CASE WHEN ph_close.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS WasClosedOnce,
+        MAX(CASE WHEN ph_reopen.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS WasReopenedOnce
+    FROM Posts p
+    LEFT JOIN PostLinks pl_dup ON p.Id = pl_dup.PostId
+    LEFT JOIN PostLinks pl_rel ON p.Id = pl_rel.PostId
+    LEFT JOIN PostHistory ph_close ON p.Id = ph_close.PostId AND ph_close.PostHistoryTypeId = 10
+    LEFT JOIN PostHistory ph_reopen ON p.Id = ph_reopen.PostId AND ph_reopen.PostHistoryTypeId = 11
+    GROUP BY
+        p.Id, p.PostTypeId, p.OwnerUserId, p.Title, p.Tags, p.CreationDate, p.LastEditDate,
+        p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.AcceptedAnswerId
+),
+ImportantPosts AS (
+    SELECT
+        pdm.PostId,
+        pdm.OwnerUserId,
+        pdm.Score,
+        'High_Score_Question' AS PostCategory,
+        pdm.PostCreationDate
+    FROM PostDetailMetrics pdm
+    WHERE pdm.PostTypeId = 1 AND pdm.Score >= 50 AND pdm.ViewCount > 1000
+    UNION ALL
+    SELECT
+        pdm.PostId,
+        pdm.OwnerUserId,
+        pdm.Score,
+        'Accepted_Good_Answer' AS PostCategory,
+        pdm.PostCreationDate
+    FROM PostDetailMetrics pdm
+    WHERE pdm.PostTypeId = 2 AND pdm.AcceptedAnswerId IS NOT NULL AND pdm.Score >= 10 AND pdm.OwnerUserId IS NOT NULL
+),
+PostRevisionActivity AS (
+    SELECT
+        ph.PostId,
+        ph.UserId AS EditorUserId,
+        ph.CreationDate AS RevisionDate,
+        ph.PostHistoryTypeId,
+        LAG(ph.CreationDate, 1, ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS PreviousRevisionDate,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS RevisionSequence
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9)
+),
+PostEditMetrics AS (
+    SELECT
+        pra.PostId,
+        COUNT(pra.PostHistoryTypeId) AS TotalEditEvents,
+        COUNT(DISTINCT pra.EditorUserId) AS DistinctPostEditors,
+        COALESCE(AVG(EXTRACT(EPOCH FROM (pra.RevisionDate - pra.PreviousRevisionDate))) FILTER (WHERE pra.RevisionSequence > 1), 0) AS AvgSecondsBetweenEdits
+    FROM PostRevisionActivity pra
+    GROUP BY pra.PostId
+),
+UserBadgeSummary AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(b.Id) AS TotalBadges
+    FROM Badges b
+    GROUP BY b.UserId
+)
+SELECT
+    ubs.UserId,
+    ubs.DisplayName,
+    ubs.Reputation,
+    ubs.TotalPostsOwned,
+    ubs.TotalQuestionsOwned,
+    ubs.TotalAnswersOwned,
+    ubs.TotalCommentsMade,
+    COALESCE(ubsum.GoldBadges, 0) AS GoldBadges,
+    COALESCE(ubsum.SilverBadges, 0) AS SilverBadges,
+    COALESCE(ubsum.BronzeBadges, 0) AS BronzeBadges,
+    ubs.UserCreationDate,
+    ubs.LastAccessDate,
+    COALESCE(CAST(ubs.Reputation AS NUMERIC) / NULLIF(ubs.TotalPostsOwned + ubs.TotalCommentsMade, 0), ubs.Reputation) AS ReputationPerContribution,
+    DATE_PART('day', AGE(TIMESTAMP '2024-10-01 12:34:56', ubs.LastAccessDate)) AS DaysSinceLastActivity,
+    UPPER(SUBSTRING(COALESCE(ubs.DisplayName, 'UNKNOWN') FROM 1 FOR 3)) || '-' || LPAD(CAST(ubs.UserId AS VARCHAR(8)), 8, '0') AS UserIdentifierHash,
+    COALESCE(AVG(pdm.ScoreToViewRatio) OVER (PARTITION BY ubs.UserId), 0.0) AS AvgOverallScoreToViewRatio,
+    COALESCE(MAX(pdm.Score) OVER (PARTITION BY ubs.UserId), 0) AS MaxPostScore,
+    COALESCE(SUM(pdm.FavoriteCount) OVER (PARTITION BY ubs.UserId), 0) AS TotalFavoriteCountsOnOwnedPosts,
+    COALESCE(SUM(pdm.WasClosedOnce) OVER (PARTITION BY ubs.UserId), 0) AS CountOfClosedOwnedPosts,
+    COALESCE(SUM(pdm.WasReopenedOnce) OVER (PARTITION BY ubs.UserId), 0) AS CountOfReopenedOwnedPosts,
+    COALESCE(SUM(pdm.DuplicateLinkedPostCount) OVER (PARTITION BY ubs.UserId), 0) AS TotalDuplicateLinksFromOwnedPosts,
+    COALESCE(AVG(pem.TotalEditEvents) OVER (PARTITION BY ubs.UserId), 0) AS AvgEditEventsPerOwnedPost,
+    COALESCE(AVG(pem.DistinctPostEditors) OVER (PARTITION BY ubs.UserId), 0) AS AvgDistinctEditorsPerOwnedPost,
+    COALESCE(AVG(pem.AvgSecondsBetweenEdits) OVER (PARTITION BY ubs.UserId), 0) AS AvgPostEditTimeInterval,
+    (
+        SELECT TRIM((unnest(string_to_array(SUBSTRING(p_sub.Tags FROM 2 FOR CHAR_LENGTH(p_sub.Tags)-2), '><'))))
+        FROM Posts p_sub
+        WHERE p_sub.OwnerUserId = ubs.UserId
+          AND p_sub.PostTypeId = 1
+          AND p_sub.Tags IS NOT NULL
+        GROUP BY TRIM((unnest(string_to_array(SUBSTRING(p_sub.Tags FROM 2 FOR CHAR_LENGTH(p_sub.Tags)-2), '><'))))
+        ORDER BY COUNT(p_sub.Id) DESC, 1
+        LIMIT 1
+    ) AS MostFrequentQuestionTag,
+    RANK() OVER (ORDER BY ubs.Reputation DESC, ubs.LastAccessDate DESC) AS GlobalReputationRank,
+    NTILE(100) OVER (ORDER BY ubs.TotalQuestionsOwned + ubs.TotalAnswersOwned DESC) AS GlobalActivityPercentile,
+    LAG(ubs.DisplayName, 1) OVER (ORDER BY ubs.Reputation DESC) AS PreviousRankedUser,
+    FIRST_VALUE(pdm.Title) OVER (PARTITION BY ubs.UserId ORDER BY pdm.Score DESC NULLS LAST, pdm.PostCreationDate DESC) AS TopScoringPostTitle,
+    SUM(CASE WHEN ip.PostCategory = 'High_Score_Question' THEN 1 ELSE 0 END) OVER (PARTITION BY ubs.UserId) AS HighScoreQuestionsCount,
+    SUM(CASE WHEN ip.PostCategory = 'Accepted_Good_Answer' THEN 1 ELSE 0 END) OVER (PARTITION BY ubs.UserId) AS AcceptedGoodAnswersCount
+FROM UserBaseStats ubs
+LEFT JOIN UserBadgeSummary ubsum ON ubs.UserId = ubsum.UserId
+LEFT JOIN PostDetailMetrics pdm ON ubs.UserId = pdm.OwnerUserId
+LEFT JOIN PostEditMetrics pem ON pdm.PostId = pem.PostId
+LEFT JOIN ImportantPosts ip ON pdm.PostId = ip.PostId AND pdm.OwnerUserId = ip.OwnerUserId
+WHERE
+    ubs.Reputation >= 5000
+    AND ubs.TotalPostsOwned >= 20
+    AND ubs.TotalCommentsMade > 5
+    AND (COALESCE(ubsum.GoldBadges, 0) > 0 OR COALESCE(ubsum.SilverBadges, 0) > 2)
+    AND ubs.LastAccessDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year'
+    AND ubs.DisplayName IS NOT NULL AND CHAR_LENGTH(ubs.DisplayName) > 3
+    AND (
+        (pdm.ScoreToViewRatio > 0.01 AND pdm.PostTypeId = 1 AND pdm.Title IS NOT NULL)
+        OR (pdm.Score > 50 AND pdm.PostTypeId = 2 AND pdm.AcceptedAnswerId IS NOT NULL AND pdm.OwnerUserId IS NOT NULL)
+        OR (pdm.PostId IS NULL AND ubs.Reputation > 10000 AND ubs.TotalPostsOwned > 50)
+    )
+    AND NOT EXISTS (
+        SELECT 1
+        FROM Comments c_flag
+        WHERE c_flag.UserId = ubs.UserId
+          AND c_flag.Text ILIKE '%spam%'
+          AND c_flag.CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6 months'
+    )
+GROUP BY
+    ubs.UserId, ubs.DisplayName, ubs.Reputation, ubs.TotalPostsOwned, ubs.TotalQuestionsOwned,
+    ubs.TotalAnswersOwned, ubs.TotalCommentsMade, ubsum.GoldBadges, ubsum.SilverBadges,
+    ubsum.BronzeBadges, ubs.UserCreationDate, ubs.LastAccessDate
+ORDER BY
+    GlobalReputationRank ASC, DaysSinceLastActivity ASC
+LIMIT 1000;

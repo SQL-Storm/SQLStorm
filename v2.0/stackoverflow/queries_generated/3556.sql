@@ -1,0 +1,164 @@
+-- {"query": "3556.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 3236} 
+
+WITH
+-- Aggregate user reputation and badge counts, plus a rank
+UserStats AS (
+    SELECT
+        u.Id                                   AS UserId,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COALESCE(SUM(p.Score), 0)               AS TotalPostScore,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank
+    FROM Users u
+    LEFT JOIN Badges b   ON b.UserId = u.Id
+    LEFT JOIN Posts  p   ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.Reputation, u.CreationDate
+),
+
+-- Tag usage statistics
+TagStats AS (
+    SELECT
+        t.Id                                   AS TagId,
+        t.TagName,
+        t.Count                                 AS TagUseCount,
+        COALESCE(e.AnswerCount, 0)              AS ExcerptAnswers,
+        COALESCE(w.AnswerCount, 0)              AS WikiAnswers,
+        ROW_NUMBER() OVER (PARTITION BY t.TagName ORDER BY t.Count DESC) AS TagRank
+    FROM Tags t
+    LEFT JOIN Posts e ON e.Id = t.ExcerptPostId
+    LEFT JOIN Posts w ON w.Id = t.WikiPostId
+),
+
+-- Recent voting activity per post (last 30 days)
+RecentVotes AS (
+    SELECT
+        v.PostId,
+        MAX(CASE WHEN vt.Id = 2 THEN v.CreationDate END) AS LastUpvote,
+        MAX(CASE WHEN vt.Id = 3 THEN v.CreationDate END) AS LastDownvote,
+        COUNT(*) FILTER (WHERE vt.Id = 2)               AS UpVoteCount,
+        COUNT(*) FILTER (WHERE vt.Id = 3)               AS DownVoteCount
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE v.CreationDate >= CURRENT_DATE - INTERVAL '30 days'
+    GROUP BY v.PostId
+),
+
+-- Core question information plus windowed previous/next scores
+QuestionDetail AS (
+    SELECT
+        p.Id                                   AS QuestionId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.FavoriteCount,
+        p.Tags,
+        COALESCE(a.AnsCount, 0)                AS AnswerCount,
+        COALESCE(c.CommentCount, 0)            AS CommentCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserQuestionSeq,
+        LAG(p.Score)  OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevQuestionScore,
+        LEAD(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextQuestionScore
+    FROM Posts p
+    LEFT JOIN (
+        SELECT ParentId, COUNT(*) AS AnsCount
+        FROM Posts
+        WHERE PostTypeId = 2
+        GROUP BY ParentId
+    ) a ON a.ParentId = p.Id
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS CommentCount
+        FROM Comments
+        GROUP BY PostId
+    ) c ON c.PostId = p.Id
+    WHERE p.PostTypeId = 1
+),
+
+-- De‑normalize tags for each question
+TagExtraction AS (
+    SELECT
+        q.QuestionId,
+        UNNEST(string_to_array(trim(both '<>' FROM q.Tags), '><')) AS TagName
+    FROM QuestionDetail q
+)
+
+SELECT
+    q.QuestionId,
+    q.Title,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    q.FavoriteCount,
+    q.AnswerCount,
+    q.CommentCount,
+    us.Reputation,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    us.RepRank,
+    rv.UpVoteCount,
+    rv.DownVoteCount,
+    COALESCE(rv.LastUpvote,   q.CreationDate) AS LastUpvoteDate,
+    COALESCE(rv.LastDownvote, q.CreationDate) AS LastDownvoteDate,
+    ARRAY_AGG(DISTINCT ts.TagName) FILTER (WHERE ts.TagName IS NOT NULL) AS TagList,
+    MAX(ts.TagUseCount) OVER ()                                              AS MaxTagUseCount,
+    CASE
+        WHEN q.Score IS NULL THEN 0
+        WHEN q.Score < 0    THEN -1
+        ELSE 1
+    END                                                                       AS ScoreSign,
+    CASE
+        WHEN us.Reputation IS NULL               THEN 'NoRep'
+        WHEN us.Reputation > 100000              THEN 'HighRep'
+        ELSE 'RegularRep'
+    END                                                                       AS RepCategory,
+    CASE WHEN q.PrevQuestionScore IS NULL THEN NULL
+         ELSE q.Score - q.PrevQuestionScore END                         AS ScoreDeltaFromPrev,
+    CASE WHEN q.NextQuestionScore IS NULL THEN NULL
+         ELSE q.NextQuestionScore - q.Score END                         AS ScoreDeltaToNext
+FROM QuestionDetail q
+LEFT JOIN UserStats us       ON us.UserId = (SELECT OwnerUserId FROM Posts p2 WHERE p2.Id = q.QuestionId)
+LEFT JOIN RecentVotes rv    ON rv.PostId = q.QuestionId
+LEFT JOIN TagExtraction te  ON te.QuestionId = q.QuestionId
+LEFT JOIN TagStats ts       ON ts.TagName = te.TagName
+GROUP BY
+    q.QuestionId, q.Title, q.CreationDate, q.Score, q.ViewCount,
+    q.FavoriteCount, q.AnswerCount, q.CommentCount,
+    us.Reputation, us.GoldBadges, us.SilverBadges, us.BronzeBadges, us.RepRank,
+    rv.UpVoteCount, rv.DownVoteCount, rv.LastUpvote, rv.LastDownvote,
+    q.PrevQuestionScore, q.NextQuestionScore
+HAVING COUNT(*) > 0
+ORDER BY q.Score DESC NULLS LAST
+LIMIT 100
+
+UNION ALL
+
+-- Small summary row to exercise UNION and constants
+SELECT
+    NULL                     AS QuestionId,
+    'Aggregated Summary'     AS Title,
+    CURRENT_TIMESTAMP        AS CreationDate,
+    NULL                     AS Score,
+    NULL                     AS ViewCount,
+    NULL                     AS FavoriteCount,
+    NULL                     AS AnswerCount,
+    NULL                     AS CommentCount,
+    (SELECT AVG(Reputation) FROM UserStats)   AS Reputation,
+    (SELECT MAX(GoldBadges) FROM UserStats)  AS GoldBadges,
+    (SELECT MAX(SilverBadges) FROM UserStats)AS SilverBadges,
+    (SELECT MAX(BronzeBadges) FROM UserStats)AS BronzeBadges,
+    NULL                     AS RepRank,
+    (SELECT SUM(UpVoteCount)   FROM RecentVotes) AS UpVoteCount,
+    (SELECT SUM(DownVoteCount) FROM RecentVotes) AS DownVoteCount,
+    NULL                     AS LastUpvoteDate,
+    NULL                     AS LastDownvoteDate,
+    NULL                     AS TagList,
+    (SELECT MAX(TagUseCount) FROM TagStats) AS MaxTagUseCount,
+    NULL                     AS ScoreSign,
+    NULL                     AS RepCategory,
+    NULL                     AS ScoreDeltaFromPrev,
+    NULL                     AS ScoreDeltaToNext
+FROM (SELECT 1) AS dummy
+LIMIT 1;

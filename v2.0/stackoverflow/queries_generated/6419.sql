@@ -1,0 +1,36 @@
+-- {"query": "6419.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-micro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 399} 
+
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    COUNT(DISTINCT CASE WHEN pv.VoteTypeId = 2 THEN pv.PostId ELSE NULL END) AS TotalUpVotes,
+    COUNT(DISTINCT CASE WHEN pv.VoteTypeId = 3 THEN pv.PostId ELSE NULL END) AS TotalDownVotes,
+    MAX(u.CreationDate) AS LatestAccountActivity,
+    STRING_AGG(DISTINCT b.Name, ', ') AS BadgesEarned,
+    STRING_AGG(DISTINCT t.TagName, ', ') AS TagsUsed
+FROM 
+    Users u
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Votes pv ON p.Id = pv.PostId
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN 
+    Tags t ON t.ExcerptPostId = p.Id
+WHERE 
+    u.Reputation > 1000
+    AND pv.VoteTypeId IN (2, 3)
+    AND ph.PostHistoryTypeId IN (1, 2, 4, 5)
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation
+HAVING 
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id ELSE NULL END) > 10
+ORDER BY 
+    u.Reputation DESC, 
+    TotalPosts DESC;

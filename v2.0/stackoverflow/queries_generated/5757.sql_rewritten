@@ -1,0 +1,128 @@
+-- {"query": "5757.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1057} 
+WITH
+-- 1) Highly active users by reputation and experience windows
+ActiveUsers AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    -- derived activity score combining recency and volume
+    (CAST(DATEDIFF(day, u.LastAccessDate, cast('2024-10-01 12:34:56' as timestamp)) AS int) * -1
+     + COALESCE((SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id),0)
+     + COALESCE((SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id),0)
+     + COALESCE((SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id),0)
+    ) AS ActivityScore
+  FROM Users u
+),
+-- 2) Tag-based badges for users with correlation to tag topics
+UserTagBadges AS (
+  SELECT
+    b.UserId,
+    b.Name AS BadgeName,
+    b.Date,
+    b.Class,
+    b.TagBased,
+    t.TagName
+  FROM Badges b
+  LEFT JOIN (
+    SELECT DISTINCT TagName FROM Tags
+  ) t ON 1=1
+  WHERE b.TagBased = 1
+),
+-- 3) Complex post history funnel: posts with various events (edits, closures, migrations)
+PostHistoryFunnel AS (
+  SELECT
+    ph.PostId,
+    ph.PostHistoryTypeId,
+    ph.CreationDate,
+    ph.UserId,
+    ph.Text
+  FROM PostHistory ph
+  WHERE ph.PostHistoryTypeId IN (10,11,12,16,36,37,38,66,53)
+),
+-- 4) Aggregated post links by type to stress nested joins and set operators
+PostLinkStats AS (
+  SELECT
+    pl.PostId,
+    pl.RelatedPostId,
+    pl.LinkTypeId,
+    lt.Name AS LinkTypeName
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+),
+-- 5) Windowed rank of posts by score and view count
+PostRank AS (
+  SELECT
+    p.Id,
+    p.Score,
+    p.ViewCount,
+    p.Title,
+    p.CreationDate,
+    ROW_NUMBER() OVER (
+      PARTITION BY p.PostTypeId
+      ORDER BY p.Score DESC NULLS LAST, p.ViewCount DESC NULLS LAST, p.CreationDate ASC
+    ) AS PostRankInType
+  FROM Posts p
+  WHERE p.PostTypeId IN (1,2) -- questions and answers
+),
+-- 6) Correlated subquery: recent comments per post
+RecentComments AS (
+  SELECT
+    c.PostId,
+    COUNT(*) AS RecentCommentCount
+  FROM Comments c
+  WHERE c.CreationDate > DATEADD(day, -30, cast('2024-10-01 12:34:56' as timestamp))
+  GROUP BY c.PostId
+),
+-- 7) Complex predicate: posts with high activity and open for a long time
+ActiveHistoricPosts AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    CASE
+      WHEN p.ClosedDate IS NOT NULL THEN 1
+      ELSE 0
+    END AS IsClosed
+  FROM Posts p
+  LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+  WHERE p.LastActivityDate > DATEADD(day, -180, cast('2024-10-01 12:34:56' as timestamp))
+    AND (p.Score > 5 OR p.ViewCount > 1000)
+    AND COALESCE(p.ClosedDate, '1900-01-01') > '1900-01-01' = FALSE
+)
+SELECT
+  -- 8) Final projection blending multiple aspects
+  au.UserId,
+  au.DisplayName AS UserDisplay,
+  au.Reputation,
+  au.LastAccessDate,
+  aeb.BadgeName AS TagBadge,
+  aeb.TagName,
+  rh.PostId AS HeavyPostId,
+  rh.Title AS HeavyPostTitle,
+  rh.Score AS HeavyPostScore,
+  rh.ViewCount AS HeavyPostViews,
+  pr.PostRankInType AS RankInPostType,
+  wc.RecentCommentCount
+FROM ActiveUsers au
+LEFT JOIN UserTagBadges aeb ON aeb.UserId = au.UserId
+LEFT JOIN PostRank pr ON pr.Id = (
+  SELECT Id FROM Posts p WHERE p.OwnerUserId = au.UserId ORDER BY p.LastActivityDate DESC LIMIT 1
+)
+LEFT JOIN (
+  -- correlate heavy posts with recent activity
+  SELECT p.Id, p.Title, p.Score, p.ViewCount
+  FROM Posts p
+  JOIN PostRank pr2 ON pr2.Id = p.Id
+) rh ON rh.Id = pr.Id
+LEFT JOIN RecentComments wc ON wc.PostId = rh.Id
+WHERE
+  au.Reputation > 1000
+  OR (aeb.TagBased = 1 AND aeb.TagName IS NOT NULL)
+ORDER BY au.Reputation DESC, au.LastAccessDate DESC
+LIMIT 50;

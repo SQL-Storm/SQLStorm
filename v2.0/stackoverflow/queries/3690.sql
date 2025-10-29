@@ -1,0 +1,97 @@
+WITH TagQuestions AS (
+    SELECT
+        t.Id               AS tag_id,
+        t.TagName          AS tag_name,
+        p.Id               AS question_id,
+        p.OwnerUserId      AS owner_user_id,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.ClosedDate,
+        p.FavoriteCount,
+        p.AnswerCount,
+        p.Title,
+        p.Tags
+    FROM Tags t
+    JOIN Posts p
+          ON p.PostTypeId = 1
+    CROSS JOIN LATERAL (
+        SELECT unnest(string_to_array(substr(p.Tags, 2, length(p.Tags)-2), '><')) AS tag
+    ) AS pt
+    WHERE pt.tag = t.TagName
+),
+UserStats AS (
+    SELECT
+        u.Id                                            AS user_id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(q.question_id)                           AS questions_asked,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1)         AS gold_badges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2)         AS silver_badges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3)         AS bronze_badges
+    FROM Users u
+    LEFT JOIN TagQuestions q  ON q.owner_user_id = u.Id
+    LEFT JOIN Badges b        ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TagMetrics AS (
+    SELECT
+        tq.tag_id,
+        tq.tag_name,
+        COUNT(DISTINCT tq.question_id)                                 AS question_cnt,
+        CAST(AVG(tq.Score) AS DECIMAL(10,2))                            AS avg_score,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY tq.ViewCount)       AS median_views,
+        SUM(CASE WHEN tq.ClosedDate IS NOT NULL THEN 1 ELSE 0 END)      AS closed_cnt,
+        MAX(tq.CreationDate)                                           AS most_recent_q,
+        MIN(tq.CreationDate)                                           AS oldest_q
+    FROM TagQuestions tq
+    GROUP BY tq.tag_id, tq.tag_name
+),
+TopUserPerTag AS (
+    SELECT
+        tm.tag_id,
+        us.user_id,
+        us.DisplayName,
+        us.Reputation,
+        ROW_NUMBER() OVER (PARTITION BY tm.tag_id ORDER BY us.Reputation DESC) AS rn
+    FROM TagMetrics tm
+    JOIN UserStats us
+          ON us.user_id IN (
+                SELECT DISTINCT owner_user_id
+                FROM TagQuestions tq
+                WHERE tq.tag_id = tm.tag_id
+          )
+    GROUP BY tm.tag_id, us.user_id, us.DisplayName, us.Reputation
+)
+SELECT
+    tm.tag_name                                   AS tag,
+    tm.question_cnt,
+    tm.avg_score,
+    tm.median_views,
+    tm.closed_cnt,
+    tm.most_recent_q,
+    tm.oldest_q,
+    COALESCE(tu.DisplayName, 'No active user')    AS top_user,
+    tu.Reputation                                 AS top_user_reputation
+FROM TagMetrics tm
+LEFT JOIN (
+    SELECT tag_id, user_id, DisplayName, Reputation
+    FROM TopUserPerTag
+    WHERE rn = 1
+) tu  ON tu.tag_id = tm.tag_id
+WHERE tm.question_cnt > 10
+UNION ALL
+SELECT
+    'All Tags'                                   AS tag,
+    SUM(tm.question_cnt)                        AS question_cnt,
+    CAST(AVG(tm.avg_score) AS DECIMAL(10,2))    AS avg_score,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY tm.median_views) AS median_views,
+    SUM(tm.closed_cnt)                          AS closed_cnt,
+    MAX(tm.most_recent_q)                       AS most_recent_q,
+    MIN(tm.oldest_q)                             AS oldest_q,
+    NULL                                         AS top_user,
+    NULL                                         AS top_user_reputation
+FROM TagMetrics tm
+ORDER BY question_cnt DESC
+LIMIT 100;

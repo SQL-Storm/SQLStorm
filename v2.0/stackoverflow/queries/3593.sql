@@ -1,0 +1,146 @@
+WITH
+usr_stats AS (
+    SELECT
+        u.Id                                 AS user_id,
+        u.Reputation,
+        u.CreationDate                       AS user_created,
+        MAX(p.CreationDate)                  AS last_post_date,
+        COUNT(b.Id)                          AS total_badges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_badges
+    FROM Users u
+    LEFT JOIN Posts p    ON p.OwnerUserId = u.Id          AND p.PostTypeId = 1
+    LEFT JOIN Badges b   ON b.UserId = u.Id
+    GROUP BY u.Id, u.Reputation, u.CreationDate
+),
+top_tags AS (
+    SELECT
+        t.TagName,
+        t.Count               AS tag_use_cnt,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS rn
+    FROM Tags t
+    WHERE t.IsModeratorOnly = FALSE
+),
+q_metrics AS (
+    SELECT
+        p.Id                         AS q_id,
+        p.OwnerUserId                AS author_id,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.FavoriteCount,
+        p.AnswerCount,
+        p.Tags,
+        COALESCE(v.up_votes,0)       AS up_votes,
+        COALESCE(v.down_votes,0)     AS down_votes,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId
+                           ORDER BY p.Score DESC, p.CreationDate DESC) AS rn_per_user
+    FROM Posts p
+    LEFT JOIN (
+        SELECT
+            pv.PostId,
+            SUM(CASE WHEN pv.VoteTypeId = 2 THEN 1 ELSE 0 END) AS up_votes,
+            SUM(CASE WHEN pv.VoteTypeId = 3 THEN 1 ELSE 0 END) AS down_votes
+        FROM Votes pv
+        GROUP BY pv.PostId
+    ) v ON v.PostId = p.Id
+    WHERE p.PostTypeId = 1
+),
+recent_edits AS (
+    SELECT
+        ph.PostId,
+        MAX(ph.CreationDate) AS last_edit
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4,5,6)
+    GROUP BY ph.PostId
+),
+pos_comments AS (
+    SELECT
+        c.PostId,
+        COUNT(*) AS pos_comment_cnt
+    FROM Comments c
+    WHERE c.Score > 0
+    GROUP BY c.PostId
+),
+activity_stream AS (
+    SELECT
+        u.Id          AS user_id,
+        u.DisplayName,
+        u.CreationDate AS activity_date,
+        'UserCreated'  AS activity_type
+    FROM Users u
+    UNION ALL
+    SELECT
+        p.OwnerUserId,
+        u.DisplayName,
+        p.CreationDate,
+        'QuestionPosted'
+    FROM Posts p
+    JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1
+)
+SELECT
+    us.user_id,
+    us.Reputation,
+    us.total_badges,
+    us.gold_badges,
+    q.q_id                              AS question_id,
+    q.Score,
+    q.ViewCount,
+    q.FavoriteCount,
+    q.AnswerCount,
+    q.Tags,
+    q.up_votes,
+    q.down_votes,
+    COALESCE(re.last_edit, q.CreationDate) AS last_activity_date,
+    pc.pos_comment_cnt                  AS positive_comment_cnt,
+    COALESCE(
+      CASE WHEN q.Tags IS NULL THEN NULL
+           ELSE NULL
+      END,
+      NULL
+    ) AS tag_array,
+    tt.TagName,
+    tt.tag_use_cnt,
+    CASE WHEN us.gold_badges = 0 THEN 1 ELSE 0 END AS has_no_gold_badge,
+    ROW_NUMBER() OVER (PARTITION BY us.user_id ORDER BY act.activity_date DESC) AS act_rn
+FROM usr_stats us
+LEFT JOIN q_metrics q
+       ON q.author_id = us.user_id
+      AND q.rn_per_user <= 5
+LEFT JOIN recent_edits re
+       ON re.PostId = q.q_id
+LEFT JOIN pos_comments pc
+       ON pc.PostId = q.q_id
+LEFT JOIN LATERAL (
+    SELECT NULL AS tag
+) AS t ON true
+LEFT JOIN top_tags tt
+       ON tt.TagName = t.tag
+      AND tt.rn <= 10
+LEFT JOIN activity_stream act
+       ON act.user_id = us.user_id
+WHERE us.Reputation > 1000
+  AND (q.Score IS NULL OR q.Score >= 0)
+GROUP BY
+    us.user_id,
+    us.Reputation,
+    us.total_badges,
+    us.gold_badges,
+    q.q_id,
+    q.Score,
+    q.ViewCount,
+    q.FavoriteCount,
+    q.AnswerCount,
+    q.Tags,
+    q.up_votes,
+    q.down_votes,
+    re.last_edit,
+    q.CreationDate,
+    pc.pos_comment_cnt,
+    tt.TagName,
+    tt.tag_use_cnt,
+    act.activity_date
+ORDER BY us.Reputation DESC,
+         q.Score DESC,
+         q.CreationDate DESC
+LIMIT 200;

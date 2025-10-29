@@ -1,0 +1,188 @@
+-- {"query": "3614.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2044} 
+
+/*  Benchmark query:  complex analytics on Users, Posts, Badges, Votes, Comments and Tags  */
+WITH 
+/* ----------------------------------------------------------------------- 
+   1. Basic user activity snapshot (last activity, total posts, avg score) 
+   ----------------------------------------------------------------------- */
+UserActivity AS (
+    SELECT 
+        u.Id                                 AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        MAX(COALESCE(p.LastActivityDate, u.LastAccessDate))   AS LastSeen,
+        COUNT(p.Id)                           FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(p.Id)                           FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        ROUND(AVG(p.Score) 
+              FILTER (WHERE p.PostTypeId IN (1,2)), 2)                AS AvgPostScore,
+        SUM(p.ViewCount)                      FILTER (WHERE p.PostTypeId = 1) AS TotalQuestionViews
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+/* ----------------------------------------------------------------------- 
+   2. Badge aggregation (gold/silver/bronze, tag‑based flag) 
+   ----------------------------------------------------------------------- */
+BadgeAgg AS (
+    SELECT 
+        b.UserId,
+        COUNT(*)                                 AS TotalBadges,
+        COUNT(*) FILTER (WHERE b.Class = 1)      AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2)      AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3)      AS BronzeBadges,
+        STRING_AGG(DISTINCT CASE WHEN b.TagBased = 1 THEN b.Name END, ', ') 
+                                                 FILTER (WHERE b.TagBased = 1) 
+                                                 AS TagBasedBadgeList
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+/* ----------------------------------------------------------------------- 
+   3. Recent voting activity (last 30 days) with windowed rank 
+   ----------------------------------------------------------------------- */
+RecentVotes AS (
+    SELECT 
+        v.UserId,
+        v.VoteTypeId,
+        COUNT(*)                                 AS VoteCount,
+        ROW_NUMBER() OVER (PARTITION BY v.UserId 
+                           ORDER BY COUNT(*) DESC) AS VoteRank
+    FROM Votes v
+    WHERE v.CreationDate >= CURRENT_DATE - INTERVAL '30 days'
+          AND v.UserId IS NOT NULL
+    GROUP BY v.UserId, v.VoteTypeId
+),
+
+/* ----------------------------------------------------------------------- 
+   4. Comment richness per user (average length, presence of code block) 
+   ----------------------------------------------------------------------- */
+CommentStats AS (
+    SELECT 
+        c.UserId,
+        ROUND(AVG(LENGTH(c.Text)), 2)                         AS AvgCommentLength,
+        SUM(CASE WHEN POSITION('<code>' IN c.Text) > 0 THEN 1 ELSE 0 END) 
+                                                            AS CommentsWithCode
+    FROM Comments c
+    WHERE c.CreationDate >= CURRENT_DATE - INTERVAL '180 days'
+    GROUP BY c.UserId
+),
+
+/* ----------------------------------------------------------------------- 
+   5. Tag expertise: users who have answered questions in the top‑10 tags 
+   ----------------------------------------------------------------------- */
+TopTags AS (
+    SELECT t.TagName
+    FROM Tags t
+    ORDER BY t.Count DESC
+    LIMIT 10
+),
+UserTagExpertise AS (
+    SELECT 
+        p.OwnerUserId                                 AS UserId,
+        t.TagName,
+        COUNT(*)                                      AS AnswersInTag
+    FROM Posts p
+    JOIN UNNEST(STRING_TO_ARRAY(TRIM(BOTH '<>' FROM p.Tags), '><')) AS t(TagName) ON TRUE
+    WHERE p.PostTypeId = 2                 -- answers only
+      AND t.TagName IN (SELECT TagName FROM TopTags)
+    GROUP BY p.OwnerUserId, t.TagName
+),
+
+/* ----------------------------------------------------------------------- 
+   6. Union of two user cohorts: (A) high‑reputation active users, (B) new users 
+   ----------------------------------------------------------------------- */
+CohortA AS (
+    SELECT ua.UserId
+    FROM UserActivity ua
+    WHERE ua.Reputation >= 20000
+      AND ua.LastSeen >= CURRENT_DATE - INTERVAL '90 days'
+),
+CohortB AS (
+    SELECT u.Id AS UserId
+    FROM Users u
+    WHERE u.CreationDate >= CURRENT_DATE - INTERVAL '180 days'
+      AND u.Reputation < 1000
+),
+AllCohorts AS (
+    SELECT UserId, 'HighRep'   AS Cohort FROM CohortA
+    UNION ALL
+    SELECT UserId, 'Newbie'    AS Cohort FROM CohortB
+),
+
+/* ----------------------------------------------------------------------- 
+   7. Assemble final view with many joins, NULL handling, and calculations 
+   ----------------------------------------------------------------------- */
+FinalData AS (
+    SELECT 
+        a.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.LastSeen,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.AvgPostScore,
+        ua.TotalQuestionViews,
+        COALESCE(ba.TotalBadges, 0)                AS TotalBadges,
+        COALESCE(ba.GoldBadges, 0)                 AS GoldBadges,
+        COALESCE(ba.SilverBadges, 0)               AS SilverBadges,
+        COALESCE(ba.BronzeBadges, 0)               AS BronzeBadges,
+        COALESCE(ba.TagBasedBadgeList, 'None')    AS TagBasedBadgeList,
+        COALESCE(rv.VoteCount, 0)                  AS RecentVoteCount,
+        COALESCE(cs.AvgCommentLength, 0)           AS AvgCommentLength,
+        COALESCE(cs.CommentsWithCode, 0)           AS CommentsWithCode,
+        a.Cohort,
+        /* derived metric: activity score */
+        (COALESCE(ua.QuestionCount,0) * 1.5 +
+         COALESCE(ua.AnswerCount,0) * 2.0 +
+         COALESCE(ua.TotalQuestionViews,0) * 0.001 +
+         COALESCE(ba.TotalBadges,0) * 0.5 +
+         COALESCE(rv.VoteCount,0) * 0.2)         AS ActivityScore,
+        /* flag users with suspiciously high vote rank (e.g., rank = 1) */
+        CASE 
+            WHEN rv.VoteRank = 1 THEN 'TopVoter'
+            ELSE NULL
+        END                                      AS VoteRankTag,
+        /* concatenate a readable summary */
+        TRIM(
+            COALESCE(ua.DisplayName, 'Anonymous') || ' (' ||
+            CASE WHEN ua.Reputation IS NULL THEN '0' ELSE ua.Reputation::text END || ' rep) - ' ||
+            COALESCE(a.Cohort, 'Other')
+        )                                         AS UserSummary
+    FROM AllCohorts a
+    LEFT JOIN UserActivity ua       ON ua.UserId = a.UserId
+    LEFT JOIN BadgeAgg ba           ON ba.UserId = a.UserId
+    LEFT JOIN RecentVotes rv        ON rv.UserId = a.UserId AND rv.VoteRank = 1
+    LEFT JOIN CommentStats cs       ON cs.UserId = a.UserId
+)
+
+SELECT 
+    fd.UserId,
+    fd.UserSummary,
+    fd.ActivityScore,
+    fd.TotalBadges,
+    fd.GoldBadges,
+    fd.SilverBadges,
+    fd.BronzeBadges,
+    fd.TagBasedBadgeList,
+    fd.RecentVoteCount,
+    fd.VoteRankTag,
+    fd.AvgCommentLength,
+    fd.CommentsWithCode,
+    SUM(ute.AnswersInTag)           AS AnswersInTopTags,
+    STRING_AGG(DISTINCT ute.TagName, ', ') 
+                                    FILTER (WHERE ute.AnswersInTag IS NOT NULL) 
+                                    AS TopTagList
+FROM FinalData fd
+LEFT JOIN UserTagExpertise ute   ON ute.UserId = fd.UserId
+GROUP BY 
+    fd.UserId, fd.UserSummary, fd.ActivityScore, fd.TotalBadges,
+    fd.GoldBadges, fd.SilverBadges, fd.BronzeBadges,
+    fd.TagBasedBadgeList, fd.RecentVoteCount, fd.VoteRankTag,
+    fd.AvgCommentLength, fd.CommentsWithCode
+HAVING 
+    /* keep only users with non‑null activity score and at least one badge */
+    fd.ActivityScore > 0 
+    AND fd.TotalBadges > 0
+ORDER BY fd.ActivityScore DESC
+LIMIT 100;

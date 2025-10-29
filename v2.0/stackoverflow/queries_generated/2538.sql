@@ -1,0 +1,128 @@
+-- {"query": "2538.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1300} 
+with RecursiveBadges as (
+    select b.Id, b.UserId, b.Name, b.Date, b.Class, b.TagBased,
+        row_number() over (partition by b.UserId order by b.Date) as BadgeRank
+    from Badges b
+    where b.Class = 1 -- Gold badges only
+),
+UserStats as (
+    select 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        coalesce((select count(*) from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 1),0) as QuestionCount,
+        coalesce((select count(*) from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 2),0) as AnswerCount,
+        coalesce(sum(vt.Score),0) as VoteScoreSum,
+        max(p.Score) as MaxPostScore,
+        min(p.Score) as MinPostScore,
+        avg(p.Score)::numeric(10,2) as AvgPostScore,
+        count(distinct pb.Id) as GoldBadgesCount
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId in (1,2)
+    left join Votes v on v.PostId = p.Id
+    left join VoteTypes vt on vt.Id = v.VoteTypeId
+    left join RecursiveBadges pb on pb.UserId = u.Id and pb.BadgeRank <= 5
+    group by u.Id, u.DisplayName, u.Reputation
+), 
+QuestionAnswerRatios as (
+    select
+        us.Id,
+        case when us.QuestionCount + us.AnswerCount = 0 then null else us.AnswerCount::float / (us.QuestionCount + us.AnswerCount) end as AnswerRatio,
+        case when us.QuestionCount + us.AnswerCount = 0 then null else us.QuestionCount::float / (us.QuestionCount + us.AnswerCount) end as QuestionRatio
+    from UserStats us
+),
+TaggedPosts as (
+    select 
+        p.Id,
+        p.OwnerUserId,
+        lower(trim(tag)) as Tag
+    from Posts p
+    cross join lateral unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')) as tag
+    where p.PostTypeId = 1
+), 
+PopularTags as (
+    select Tag, count(*) as TagQuestionCount
+    from TaggedPosts
+    group by Tag
+    having count(*) > 1000
+), 
+TopUsersPerTag as (
+    select
+        tp.Tag,
+        tp.OwnerUserId,
+        count(*) as QuestionsByUser,
+        row_number() over (partition by tp.Tag order by count(*) desc) as RankByTag
+    from TaggedPosts tp
+    where tp.Tag in (select Tag from PopularTags)
+    group by tp.Tag, tp.OwnerUserId
+    having count(*) > 10
+), 
+-- Using LEFT JOIN and NULL checks to find users with no gold badges and high reputation
+UsersWithoutGoldButHighRep as (
+    select us.Id, us.DisplayName, us.Reputation
+    from UserStats us
+    left join RecursiveBadges rb on rb.UserId = us.Id and rb.Class = 1
+    where rb.Id is null and us.Reputation > 10000
+),
+LatestPostHistory as (
+    select ph.PostId, ph.UserId, ph.PostHistoryTypeId, ph.CreationDate,
+        row_number() over (partition by ph.PostId order by ph.CreationDate desc) as rn
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (10,11) -- Closed and Reopened
+),
+ClosedAndReopenedPostsWithUser as (
+    select lph.PostId, lph.UserId, lph.PostHistoryTypeId, lph.CreationDate
+    from LatestPostHistory lph
+    where lph.rn = 1
+),
+QuestionsWithClosureStatus as (
+    select p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount,
+        cap.PostHistoryTypeId as ClosureStatus,
+        cap.UserId as ClosureActorId
+    from Posts p
+    left join ClosedAndReopenedPostsWithUser cap on cap.PostId = p.Id
+    where p.PostTypeId = 1
+)
+select 
+    q.Id as QuestionId,
+    q.Title,
+    u.DisplayName as Author,
+    u.Reputation,
+    q.Score,
+    q.ViewCount,
+    case q.ClosureStatus
+        when 10 then 'Closed'
+        when 11 then 'Reopened'
+        else 'Open'
+    end as ClosureStatus,
+    cu.DisplayName as ClosureActor,
+    ts.AvgPostScore,
+    ts.GoldBadgesCount,
+    qa.AnswerRatio,
+    pt.Tag as PopularTag,
+    tum.DisplayName as TopUserInTag,
+    tum.QuestionsByUser as TopUserQuestionsInTag,
+    -- Complex calculation: weighted popularity score combining views, score, and badge influence
+    (q.ViewCount * 0.5 + q.Score * 10 + coalesce(ts.GoldBadgesCount, 0) * 15) as WeightedPopularityScore
+from QuestionsWithClosureStatus q
+inner join Users u on u.Id = q.OwnerUserId
+left join Users cu on cu.Id = q.ClosureActorId
+left join UserStats ts on ts.Id = u.Id
+left join QuestionAnswerRatios qa on qa.Id = u.Id
+left join LATERAL (
+    select pt.Tag
+    from TaggedPosts pt
+    where pt.Id = q.Id and pt.Tag in (select Tag from PopularTags)
+    order by null limit 1
+) pt on true
+left join LATERAL (
+    select tu.Id, tu.DisplayName, tuq.QuestionsByUser
+    from TopUsersPerTag tuq
+    join Users tu on tu.Id = tuq.OwnerUserId
+    where tuq.Tag = pt.Tag
+    order by tuq.QuestionsByUser desc
+    limit 1
+) tum on true
+where q.CreationDate >= current_date - interval '1 year'
+order by WeightedPopularityScore desc NULLS LAST
+limit 50;

@@ -1,0 +1,199 @@
+-- {"query": "2247.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1922} 
+with recursive UserBadgeCounts as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        row_number() over (order by count(b.Id) desc nulls last) as BadgeRank
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+QuestionAnswers as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.AcceptedAnswerId,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreationDate,
+        a.OwnerUserId as AnswerOwnerUserId
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+),
+AvgAnswerScores as (
+    select
+        qa.QuestionId,
+        avg(coalesce(qa.AnswerScore,0)) over (partition by qa.QuestionId) as AvgAnswerScore,
+        max(qa.AnswerScore) over (partition by qa.QuestionId) as MaxAnswerScore,
+        count(qa.AnswerId) over (partition by qa.QuestionId) as AnswerCount
+    from QuestionAnswers qa
+),
+DuplicateQuestionLinks as (
+    select
+        pl.PostId as OriginalQuestionId,
+        pl.RelatedPostId as DuplicateQuestionId,
+        pl.CreationDate
+    from PostLinks pl
+    inner join LinkTypes lt on lt.Id = pl.LinkTypeId and lt.Name = 'Duplicate'
+),
+UserAnswerRanks as (
+    select
+        a.Id as AnswerId,
+        a.OwnerUserId,
+        a.ParentId as QuestionId,
+        rank() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRankPerQuestion
+    from Posts a
+    where a.PostTypeId = 2
+),
+TopRankedAnswers as (
+    select
+        uar.AnswerId,
+        uar.OwnerUserId,
+        uar.QuestionId,
+        uar.AnswerRankPerQuestion
+    from UserAnswerRanks uar
+    where uar.AnswerRankPerQuestion = 1
+),
+ComplexTagsExtraction as (
+    select
+        p.Id as PostId,
+        p.Tags,
+        array_remove(
+            array_remove(
+                string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><'), ''
+            ), NULL
+        ) as TagArrayFiltered
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+),
+TagsUsageStats as (
+    select
+        t.TagName,
+        count(*) as PostsWithTag,
+        sum(p.ViewCount) as TotalViews,
+        avg(p.Score) as AverageScore,
+        max(p.Score) as MaxScore,
+        percentile_cont(0.5) within group (order by p.Score) as MedianScore
+    from Tags t
+    left join Posts p on p.Id = t.ExcerptPostId or p.Id = t.WikiPostId
+    group by t.TagName
+),
+UserQuestionActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct q.Id) as QuestionsCount,
+        count(distinct a.Id) as AnswersCount,
+        coalesce(sum(a.Score), 0) as TotalAnswerScore,
+        coalesce(sum(q.Score), 0) as TotalQuestionScore,
+        coalesce(sum(vup.CountUpVotes), 0) as UserUpVotes,
+        coalesce(sum(vdown.CountDownVotes), 0) as UserDownVotes,
+        coalesce(sum(vfav.CountFavorites), 0) as UserFavorites
+    from Users u
+    left join Posts q on q.OwnerUserId = u.Id and q.PostTypeId = 1
+    left join Posts a on a.OwnerUserId = u.Id and a.PostTypeId = 2
+    left join (
+        select
+            p.OwnerUserId,
+            count(v.Id) as CountUpVotes
+        from Votes v
+        join Posts p on p.Id = v.PostId
+        where v.VoteTypeId = 2
+        group by p.OwnerUserId
+    ) vup on vup.OwnerUserId = u.Id
+    left join (
+        select
+            p.OwnerUserId,
+            count(v.Id) as CountDownVotes
+        from Votes v
+        join Posts p on p.Id = v.PostId
+        where v.VoteTypeId = 3
+        group by p.OwnerUserId
+    ) vdown on vdown.OwnerUserId = u.Id
+    left join (
+        select
+            v.UserId,
+            count(v.Id) as CountFavorites
+        from Votes v
+        where v.VoteTypeId = 5 and v.UserId is not null
+        group by v.UserId
+    ) vfav on vfav.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+QuestionCloseReasonCounts as (
+    select
+        ph.PostId,
+        crt.Name as CloseReason,
+        count(*) as CloseCount
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    where ph.PostHistoryTypeId = 10
+    group by ph.PostId, crt.Name
+),
+RecursiveDuplicateChain as (
+    select
+        pl.PostId as OriginalQuestionId,
+        pl.RelatedPostId as DuplicateQuestionId,
+        1 as Depth
+    from PostLinks pl
+    where pl.LinkTypeId = (select Id from LinkTypes where Name = 'Duplicate')
+    union all
+    select
+        rdc.OriginalQuestionId,
+        pl.RelatedPostId,
+        rdc.Depth + 1
+    from RecursiveDuplicateChain rdc
+    join PostLinks pl on pl.PostId = rdc.DuplicateQuestionId and pl.LinkTypeId = (select Id from LinkTypes where Name = 'Duplicate')
+    where rdc.Depth < 5
+)
+select
+    ubd.UserId,
+    ubd.DisplayName,
+    ubd.GoldBadges,
+    ubd.SilverBadges,
+    ubd.BronzeBadges,
+    uqa.QuestionsCount,
+    uqa.AnswersCount,
+    uqa.TotalAnswerScore,
+    uqa.UserUpVotes,
+    uqa.UserDownVotes,
+    uqa.UserFavorites,
+    coalesce(qacs.AnswerCount,0) as AvgAnswerCountForUserQuestions,
+    coalesce(qacs.MaxAnswerScore,0) as MaxAnswerScoreForUserQuestions,
+    coalesce(qacs.AvgAnswerScore,0) as AvgAnswerScoreForUserQuestions,
+    array_to_string(array_agg(distinct dql2.DuplicateQuestionId), ',') as DuplicateQuestionsIds,
+    avg(case when qcr.CloseCount is not null then qcr.CloseCount else 0 end) as AvgCloseVotesOnUserQuestions,
+    max(case when qcr.CloseCount is not null then qcr.CloseCount else 0 end) as MaxCloseVotesOnUserQuestions
+from UserBadgeCounts ubd
+left join UserQuestionActivity uqa on uqa.UserId = ubd.UserId
+left join (
+    select
+        q.OwnerUserId,
+        avg(coalesce(aa.AnswerCount,0)) as AnswerCount,
+        max(coalesce(aa.MaxAnswerScore,0)) as MaxAnswerScore,
+        avg(coalesce(aa.AvgAnswerScore,0)) as AvgAnswerScore
+    from Posts q
+    left join AvgAnswerScores aa on aa.QuestionId = q.Id
+    where q.PostTypeId = 1
+    group by q.OwnerUserId
+) qacs on qacs.OwnerUserId = ubd.UserId
+left join DuplicateQuestionLinks dql on dql.OriginalQuestionId = any(
+    select Id from Posts where OwnerUserId = ubd.UserId and PostTypeId = 1
+)
+left join RecursiveDuplicateChain dql2 on dql2.OriginalQuestionId = any(
+    select Id from Posts where OwnerUserId = ubd.UserId and PostTypeId = 1
+)
+left join QuestionCloseReasonCounts qcr on qcr.PostId = any(
+    select Id from Posts where OwnerUserId = ubd.UserId and PostTypeId = 1
+)
+group by 
+    ubd.UserId, ubd.DisplayName, ubd.GoldBadges, ubd.SilverBadges, ubd.BronzeBadges,
+    uqa.QuestionsCount, uqa.AnswersCount, uqa.TotalAnswerScore, uqa.UserUpVotes, uqa.UserDownVotes, uqa.UserFavorites,
+    qacs.AnswerCount, qacs.MaxAnswerScore, qacs.AvgAnswerScore
+order by ubd.GoldBadges desc, ubd.SilverBadges desc, ubd.BronzeBadges desc, ubd.UserId
+limit 100;

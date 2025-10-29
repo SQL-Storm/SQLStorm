@@ -1,0 +1,150 @@
+SELECT 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) as TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.ViewCount > 1000 THEN p.Id END) as HighViewQuestions,
+    SUM(COALESCE(p.Score, 0)) as TotalScore,
+    AVG(COALESCE(p.Score, 0)) as AvgScore,
+    MAX(p.CreationDate) as LastPostDate,
+    COUNT(DISTINCT b.Id) as BadgesCount,
+    COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) as GoldBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) as SilverBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) as BronzeBadges,
+    COUNT(DISTINCT c.Id) as CommentsCount,
+    COUNT(DISTINCT ph.Id) as PostHistoryCount,
+    STRING_AGG(DISTINCT t.TagName, ', ') as Tags,
+    COUNT(DISTINCT pl.Id) as LinkedPosts,
+    COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN pl.Id END) as DuplicateLinks,
+    AVG(EXTRACT(EPOCH FROM (p.CreationDate - u.CreationDate)) / 86400.0) as AvgDaysBetweenAccountCreationAndPost,
+    COUNT(DISTINCT CASE WHEN u.LastAccessDate > p.CreationDate THEN p.Id END) as RecentActivityPosts,
+    (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = u.Id AND p2.PostTypeId = 1 AND p2.Score > 100) as HighScoreQuestions,
+    (SELECT COUNT(*) FROM Posts p3 WHERE p3.OwnerUserId = u.Id AND p3.PostTypeId = 2 AND p3.Score > 50) as HighScoreAnswers,
+    CASE 
+        WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+            ROUND((COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) * 100.0 / COUNT(DISTINCT p.Id)), 2)
+        ELSE 0 
+    END as QuestionPercentage,
+    ROW_NUMBER() OVER (ORDER BY SUM(COALESCE(p.Score, 0)) DESC) as RankByScore,
+    DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) as RankByPostCount,
+    LAG(u.Reputation, 1) OVER (ORDER BY u.Reputation DESC) as PreviousUserReputation,
+    LEAD(u.Reputation, 1) OVER (ORDER BY u.Reputation DESC) as NextUserReputation,
+    NTILE(10) OVER (ORDER BY u.Reputation DESC) as ReputationDecile,
+    PERCENT_RANK() OVER (ORDER BY u.Reputation DESC) as ReputationPercentile,
+    COUNT(CASE WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN 1 END) as QuestionsWithAnswers,
+    COUNT(CASE WHEN p.PostTypeId = 1 AND p.AnswerCount = 0 THEN 1 END) as QuestionsWithoutAnswers,
+    COUNT(CASE WHEN p.PostTypeId = 2 AND p.ParentId IS NOT NULL THEN 1 END) as AnsweredQuestions,
+    COUNT(CASE WHEN p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL THEN 1 END) as ClosedQuestions,
+    COUNT(CASE WHEN p.PostTypeId = 1 AND p.CommunityOwnedDate IS NOT NULL THEN 1 END) as CommunityOwnedQuestions,
+    COUNT(CASE WHEN p.PostTypeId = 1 AND p.FavoriteCount > 0 THEN 1 END) as FavoritedQuestions,
+    COUNT(CASE WHEN p.PostTypeId = 1 AND p.CommentCount > 0 THEN 1 END) as CommentedQuestions,
+    (SELECT COUNT(*) FROM Posts p4 WHERE p4.OwnerUserId = u.Id AND p4.PostTypeId = 1 AND p4.AnswerCount = 0) as UnansweredQuestions,
+    CASE 
+        WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 0 THEN 
+            ROUND(AVG(COALESCE(p.AnswerCount, 0)), 2)
+        ELSE 0 
+    END as AvgAnswersPerQuestion,
+    CASE 
+        WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) > 0 THEN 
+            ROUND(AVG(COALESCE(p.Score, 0)), 2)
+        ELSE 0 
+    END as AvgScorePerAnswer,
+    CASE 
+        WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 0 THEN 
+            ROUND(SUM(COALESCE(p.ViewCount, 0)) * 1.0 / COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END), 2)
+        ELSE 0 
+    END as AvgViewsPerQuestion,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId IN (2, 3) THEN v.Id END) as VoteCount,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) as UpVotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) as DownVotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 5 THEN v.Id END) as FavoriteVotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 8 THEN v.Id END) as BountyStartVotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 9 THEN v.Id END) as BountyCloseVotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId IN (10, 11, 12) THEN v.Id END) as DeletionVotes,
+    (SELECT COUNT(*) FROM Posts p5 WHERE p5.OwnerUserId = u.Id AND p5.PostTypeId = 1 AND p5.Score < 0) as NegativeScoreQuestions,
+    (SELECT COUNT(*) FROM Posts p6 WHERE p6.OwnerUserId = u.Id AND p6.PostTypeId = 2 AND p6.Score < 0) as NegativeScoreAnswers,
+    CASE 
+        WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 0 THEN 
+            ROUND(AVG(COALESCE(p.Score, 0) * COALESCE(p.AnswerCount, 0)), 2)
+        ELSE 0 
+    END as AvgScoreTimesAnswerCount,
+    (SELECT STRING_AGG(b2.Name, '; ') FROM Badges b2 WHERE b2.UserId = u.Id AND b2.Class = 1) as GoldBadgeNames,
+    (SELECT STRING_AGG(b2.Name, '; ') FROM Badges b2 WHERE b2.UserId = u.Id AND b2.Class = 2) as SilverBadgeNames,
+    (SELECT STRING_AGG(b2.Name, '; ') FROM Badges b2 WHERE b2.UserId = u.Id AND b2.Class = 3) as BronzeBadgeNames,
+    (SELECT STRING_AGG(t2.TagName, ' | ') FROM Tags t2 INNER JOIN Posts p_tag ON t2.TagName = ANY(string_to_array(COALESCE(p_tag.Tags, ''), '<>')) WHERE p_tag.OwnerUserId = u.Id) as UserTagActivity,
+    CASE 
+        WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 0 THEN 
+            ROUND(COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) * 100.0 / COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END), 2)
+        ELSE 0 
+    END as AnswerRateRatio,
+    CASE 
+        WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+            ROUND(COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) * 1.0 / COUNT(DISTINCT p.Id), 2)
+        ELSE 0 
+    END as QuestionRatio,
+    COUNT(DISTINCT CASE 
+        WHEN p.PostTypeId = 1 AND EXISTS (
+            SELECT 1 FROM PostHistory ph2 
+            WHERE ph2.PostId = p.Id AND ph2.PostHistoryTypeId IN (10, 11, 12, 13)
+        ) THEN p.Id 
+    END) as PostsWithHistoryActions,
+    COUNT(DISTINCT CASE 
+        WHEN p.PostTypeId = 1 AND EXISTS (
+            SELECT 1 FROM Comments c2 
+            WHERE c2.PostId = p.Id AND c2.UserId = u.Id
+        ) THEN p.Id 
+    END) as UserCommentedQuestions,
+    CASE 
+        WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+            ROUND(COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) * 1.0 / (COUNT(DISTINCT p.Id) + 1), 3)
+        ELSE 0 
+    END as QuestionRate,
+    CASE 
+        WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+            ROUND(COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) * 1.0 / (COUNT(DISTINCT p.Id) + 1), 3)
+        ELSE 0 
+    END as AnswerRate,
+    CASE 
+        WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 0 THEN 
+            ROUND(MAX(p.Score) * 1.0 / COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END), 2)
+        ELSE 0 
+    END as AvgMaxScorePerQuestion,
+    CASE 
+        WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) > 0 THEN 
+            ROUND(MAX(p.Score) * 1.0 / COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END), 2)
+        ELSE 0 
+    END as AvgMaxScorePerAnswer,
+    COUNT(DISTINCT CASE 
+        WHEN p.PostTypeId = 1 AND p.Score > (SELECT AVG(score) + STDDEV_POP(score) FROM Posts WHERE PostTypeId = 1) THEN p.Id 
+    END) as AboveAverageQuestions,
+    COUNT(DISTINCT CASE 
+        WHEN p.PostTypeId = 2 AND p.Score > (SELECT AVG(score) + STDDEV_POP(score) FROM Posts WHERE PostTypeId = 2) THEN p.Id 
+    END) as AboveAverageAnswers
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN Comments c ON u.Id = c.UserId
+LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+LEFT JOIN PostLinks pl ON u.Id = pl.PostId
+LEFT JOIN Votes v ON u.Id = v.UserId
+LEFT JOIN Tags t ON t.TagName = ANY(string_to_array(COALESCE(p.Tags, ''), '<>'))
+WHERE u.LastAccessDate > TIMESTAMP '2023-01-01 00:00:00'
+GROUP BY 
+    u.Id, 
+    u.DisplayName, 
+    u.Reputation, 
+    u.CreationDate, 
+    u.LastAccessDate, 
+    u.Location, 
+    u.WebsiteUrl, 
+    u.AboutMe, 
+    u.Views, 
+    u.UpVotes, 
+    u.DownVotes, 
+    u.ProfileImageUrl, 
+    u.AccountId
+HAVING COUNT(DISTINCT p.Id) > 0
+ORDER BY SUM(COALESCE(p.Score, 0)) DESC, COUNT(DISTINCT p.Id) DESC
+LIMIT 100;

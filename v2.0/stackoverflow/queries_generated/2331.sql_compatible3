@@ -1,0 +1,220 @@
+with RecursiveUserStats as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        coalesce(sum(p.Score),0) as TotalPostScore,
+        coalesce(sum(case when v.VoteTypeId = 2 then 1 else 0 end),0) as TotalUpVotes,
+        coalesce(sum(case when v.VoteTypeId = 3 then 1 else 0 end),0) as TotalDownVotes
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Votes v on v.PostId = p.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location
+), RankedPosts as (
+    select
+        p.Id as PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc NULLS LAST, p.CreationDate desc) as UserPostRank,
+        count(*) over (partition by p.OwnerUserId) as TotalUserPosts
+    from Posts p
+), LatestPostEdits as (
+    select 
+        ph.PostId,
+        max(ph.CreationDate) as LastEditDate
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (4,5,6,10,11)
+    group by ph.PostId
+), PostWithEditStatus as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        lpe.LastEditDate,
+        case 
+            when lpe.LastEditDate is null then 'Never Edited'
+            when lpe.LastEditDate < p.CreationDate + interval '1 day' then 'Edited Quickly'
+            else 'Edited Late'
+        end as EditStatus
+    from Posts p
+    left join LatestPostEdits lpe on lpe.PostId = p.Id
+), PostLinkAggregates as (
+    select 
+        pl.PostId,
+        count(distinct pl.RelatedPostId) filter (where pl.LinkTypeId=1) as OutboundLinkedPosts,
+        count(distinct pl.RelatedPostId) filter (where pl.LinkTypeId=3) as DuplicateLinks
+    from PostLinks pl
+    group by pl.PostId
+), UserBadgeSummary as (
+    select 
+        b.UserId,
+        count(*) filter (where b.Class = 1) as GoldBadges,
+        count(*) filter (where b.Class = 2) as SilverBadges,
+        count(*) filter (where b.Class = 3) as BronzeBadges,
+        count(*) as TotalBadges,
+        bool_or(
+          CASE 
+            WHEN b.TagBased IS NULL THEN false 
+            WHEN b.TagBased IN ('t','true','1') THEN true 
+            WHEN b.TagBased IN ('f','false','0') THEN false 
+            ELSE CAST(b.TagBased AS boolean) 
+          END
+        ) as HasTagBasedBadge
+    from Badges b
+    group by b.UserId
+), TopActiveUsers as (
+    select 
+        rus.UserId,
+        rus.DisplayName,
+        rus.Reputation,
+        rus.QuestionCount,
+        rus.AnswerCount,
+        rus.TotalPostScore,
+        rus.TotalUpVotes,
+        rus.TotalDownVotes,
+        coalesce(ubs.GoldBadges,0) as GoldBadges,
+        coalesce(ubs.SilverBadges,0) as SilverBadges,
+        coalesce(ubs.BronzeBadges,0) as BronzeBadges,
+        coalesce(ubs.TotalBadges,0) as TotalBadges,
+        coalesce(ubs.HasTagBasedBadge,false) as HasTagBadge
+    from RecursiveUserStats rus
+    left join UserBadgeSummary ubs on ubs.UserId = rus.UserId
+    where rus.Reputation > 10000 and rus.QuestionCount > 10
+    order by rus.Reputation desc
+    limit 100
+), ComplexPostAnalysis as (
+    select 
+        pwe.Id as PostId,
+        pwe.Title,
+        pwe.Tags,
+        pwe.OwnerUserId,
+        pwe.Score,
+        pwe.ViewCount,
+        pwe.CreationDate,
+        pwe.EditStatus,
+        pla.OutboundLinkedPosts,
+        pla.DuplicateLinks,
+        (length(coalesce(pwe.Tags,'')) - length(replace(coalesce(pwe.Tags,''),'><','')) + 1) as TagCount,
+        case
+            when pwe.PostTypeId = 1 then 'Question'
+            when pwe.PostTypeId = 2 then 'Answer'
+            else 'Other'
+        end as PostType,
+        (
+            select avg(coalesce(p2.Score,0))
+            from PostLinks pl2 
+            join Posts p2 on pl2.RelatedPostId = p2.Id
+            where pl2.PostId = pwe.Id
+        ) as AvgLinkedPostScore,
+        (pwe.Score * 0.7) + (coalesce(pla.OutboundLinkedPosts,0) * 0.2) + (coalesce(pla.DuplicateLinks,0) * 0.1) as WeightedScore
+    from PostWithEditStatus pwe
+    left join PostLinkAggregates pla on pla.PostId = pwe.Id
+    where pwe.PostTypeId in (1,2)
+), PostsWithComments as (
+    select
+        p.Id as PostId,
+        count(c.Id) as CommentCount,
+        sum(coalesce(c.Score,0)) as TotalCommentScore,
+        bool_or(c.UserId is null) as HasAnonymousComments
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+    group by p.Id
+), FinalRanking as (
+    select
+        cpa.PostId,
+        cpa.Title,
+        cpa.PostType,
+        cpa.OwnerUserId,
+        u.DisplayName as OwnerDisplayName,
+        cpa.Score,
+        cpa.ViewCount,
+        cpa.CreationDate,
+        cpa.EditStatus,
+        cpa.OutboundLinkedPosts,
+        cpa.DuplicateLinks,
+        cpa.TagCount,
+        cpa.AvgLinkedPostScore,
+        cpa.WeightedScore,
+        coalesce(pwc.CommentCount, 0) as CommentCount,
+        coalesce(pwc.TotalCommentScore, 0) as TotalCommentScore,
+        pwc.HasAnonymousComments,
+        rank() over (partition by cpa.PostType order by cpa.WeightedScore desc) as WeightedScoreRank,
+        dense_rank() over (order by cpa.TagCount desc, cpa.ViewCount desc) as PopularTagViewRank
+    from ComplexPostAnalysis cpa
+    left join PostsWithComments pwc on pwc.PostId = cpa.PostId
+    left join Users u on u.Id = cpa.OwnerUserId
+    where cpa.Score > 0
+)
+select
+    fr.PostId,
+    fr.Title,
+    fr.PostType,
+    fr.OwnerUserId,
+    fr.OwnerDisplayName,
+    fr.Score,
+    fr.ViewCount,
+    fr.CreationDate,
+    fr.EditStatus,
+    fr.OutboundLinkedPosts,
+    fr.DuplicateLinks,
+    fr.TagCount,
+    CAST(fr.AvgLinkedPostScore AS numeric(10,2)) as AvgLinkedPostScore,
+    CAST(fr.WeightedScore AS numeric(10,2)) as WeightedScore,
+    fr.CommentCount,
+    fr.TotalCommentScore,
+    fr.HasAnonymousComments,
+    fr.WeightedScoreRank,
+    fr.PopularTagViewRank,
+    case
+        when fr.CommentCount = 0 then 'No Comments'
+        when fr.HasAnonymousComments then 'Has Anonymous Comments'
+        else 'Comments by Registered Users'
+    end as CommentUserType,
+    coalesce(fr.OwnerDisplayName, 'Community User') || ' (UserID: ' || CAST(fr.OwnerUserId AS varchar) || ')' as OwnerInfo
+from FinalRanking fr
+where fr.WeightedScoreRank <= 50
+
+union
+
+select
+    ubs.UserId as PostId,
+    'User summary record' as Title,
+    'User' as PostType,
+    ubs.UserId as OwnerUserId,
+    ubs.DisplayName as OwnerDisplayName,
+    ubs.Reputation as Score,
+    CAST(NULL AS bigint) as ViewCount,
+    ubs.CreationDate as CreationDate,
+    'N/A' as EditStatus,
+    CAST(NULL AS bigint) as OutboundLinkedPosts,
+    CAST(NULL AS bigint) as DuplicateLinks,
+    CAST(NULL AS bigint) as TagCount,
+    CAST(NULL AS numeric) as AvgLinkedPostScore,
+    ubs.TotalPostScore as WeightedScore,
+    ubs.AnswerCount as CommentCount,
+    ubs.TotalUpVotes - ubs.TotalDownVotes as TotalCommentScore,
+    false as HasAnonymousComments,
+    CAST(NULL AS bigint) as WeightedScoreRank,
+    CAST(NULL AS bigint) as PopularTagViewRank,
+    'N/A' as CommentUserType,
+    coalesce(ubs.DisplayName, 'Unknown User') || ' (UserID: ' || CAST(ubs.UserId AS varchar) || ')' as OwnerInfo
+from TopActiveUsers ubs
+order by
+    case when PostType = 'User' then 1 else 0 end,
+    WeightedScoreRank NULLS LAST,
+    PopularTagViewRank NULLS LAST,
+    Score desc NULLS LAST,
+    CreationDate desc NULLS LAST;

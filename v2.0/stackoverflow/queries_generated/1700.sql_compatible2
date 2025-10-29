@@ -1,0 +1,259 @@
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.UpVotes,
+        U.DownVotes,
+        U.Views AS UserViews,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS QuestionsAsked,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS AnswersGiven,
+        SUM(COALESCE(P.Score, 0)) AS TotalPostScore,
+        MAX(P.CreationDate) AS LatestPostDate,
+        U.CreationDate AS UserCreationDate,
+        (SELECT COUNT(B.Id) FROM Badges B WHERE B.UserId = U.Id AND B.Class = 1) AS GoldBadges,
+        (SELECT COUNT(V.Id) FROM Votes V WHERE V.UserId = U.Id AND V.VoteTypeId = 5) AS FavoriteVotesGiven
+    FROM
+        Users U
+    LEFT JOIN
+        Posts P ON U.Id = P.OwnerUserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.UpVotes, U.DownVotes, U.Views, U.CreationDate
+),
+AnswerAggregates AS (
+    SELECT
+        A.ParentId AS QuestionId,
+        AVG(A.Score) AS AvgAnswerScore,
+        SUM(A.Score) AS TotalAnswerScore,
+        COUNT(A.Id) AS ActualAnswerCount
+    FROM
+        Posts A
+    WHERE
+        A.PostTypeId = 2
+    GROUP BY
+        A.ParentId
+),
+QuestionHistoryAggregates AS (
+    SELECT
+        PH.PostId AS QuestionId,
+        COUNT(DISTINCT PH.UserId) AS UniqueEditors,
+        MAX(PH.CreationDate) AS LastHistoryEditDate,
+        MIN(PH.CreationDate) AS FirstHistoryEditDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS WasClosedFlag,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS WasReopenedFlag,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.Id END) AS EditHistoryCount,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 AND PH.Comment IS NOT NULL THEN CR.Name ELSE NULL END) AS CloseReasonName
+    FROM
+        PostHistory PH
+    LEFT JOIN
+        CloseReasonTypes CR ON PH.PostHistoryTypeId = 10 AND PH.Comment IS NOT NULL AND CR.Id = CAST(PH.Comment AS smallint)
+    GROUP BY
+        PH.PostId
+),
+QuestionEngagementMetrics AS (
+    SELECT
+        Q.Id AS QuestionId,
+        Q.Title AS QuestionTitle,
+        Q.CreationDate AS QuestionCreationDate,
+        Q.Score AS QuestionScore,
+        Q.ViewCount,
+        Q.AnswerCount AS DeclaredAnswerCount,
+        Q.CommentCount,
+        Q.FavoriteCount,
+        Q.OwnerUserId AS QuestionOwnerId,
+        Q.AcceptedAnswerId,
+        STRING_TO_ARRAY(SUBSTRING(Q.Tags, 2, LENGTH(Q.Tags) - 2), '><') AS TagArray,
+        AA.AvgAnswerScore,
+        AA.TotalAnswerScore,
+        COALESCE(AA.ActualAnswerCount, 0) AS ActualAnswerCount,
+        QHA.UniqueEditors,
+        QHA.LastHistoryEditDate,
+        QHA.FirstHistoryEditDate,
+        QHA.WasClosedFlag,
+        QHA.WasReopenedFlag,
+        QHA.EditHistoryCount,
+        QHA.CloseReasonName,
+        NTILE(4) OVER (ORDER BY Q.ViewCount DESC) AS ViewCountQuartile,
+        RANK() OVER (ORDER BY Q.FavoriteCount DESC NULLS LAST, Q.CreationDate ASC) AS FavoriteRank
+    FROM
+        Posts Q
+    LEFT JOIN
+        AnswerAggregates AA ON Q.Id = AA.QuestionId
+    LEFT JOIN
+        QuestionHistoryAggregates QHA ON Q.Id = QHA.QuestionId
+    WHERE
+        Q.PostTypeId = 1
+),
+ExpertAnswerers AS (
+    SELECT
+        A.Id AS AnswerId,
+        A.ParentId AS QuestionId,
+        A.OwnerUserId AS AnswererUserId,
+        A.Score AS AnswerScore,
+        UAS.Reputation AS AnswererReputation,
+        UAS.GoldBadges AS AnswererGoldBadges,
+        CASE
+            WHEN UAS.Reputation >= 10000 AND UAS.AnswersGiven > 100 AND UAS.TotalPostScore > 5000 THEN 'Elite'
+            WHEN UAS.Reputation >= 5000 AND UAS.AnswersGiven > 50 THEN 'Advanced'
+            WHEN UAS.Reputation >= 1000 THEN 'Intermediate'
+            ELSE 'Novice'
+        END AS AnswererTier,
+        COALESCE(UAS.DisplayName, A.OwnerDisplayName, 'Community User') AS AnswererDisplayName
+    FROM
+        Posts A
+    INNER JOIN
+        UserActivitySummary UAS ON A.OwnerUserId = UAS.UserId
+    WHERE
+        A.PostTypeId = 2
+),
+TagFrequency AS (
+    SELECT
+        t.TagName,
+        COUNT(DISTINCT QEM.QuestionId) AS TaggedQuestionsCount,
+        AVG(QEM.QuestionScore) AS AvgQuestionScoreForTag,
+        AVG(QEM.ViewCount) AS AvgViewCountForTag,
+        COUNT(DISTINCT EA.AnswererUserId) AS UniqueAcceptedAnswerersForTag
+    FROM
+        QuestionEngagementMetrics QEM
+    CROSS JOIN LATERAL
+        UNNEST(QEM.TagArray) AS t(TagName)
+    LEFT JOIN
+        ExpertAnswerers EA ON QEM.AcceptedAnswerId = EA.AnswerId
+    WHERE
+        t.TagName IS NOT NULL
+    GROUP BY
+        t.TagName
+)
+SELECT
+    QEM.QuestionId,
+    QEM.QuestionTitle,
+    QEM.QuestionCreationDate,
+    QEM.QuestionScore,
+    QEM.ViewCount,
+    QEM.DeclaredAnswerCount,
+    QEM.ActualAnswerCount,
+    QEM.CommentCount AS TotalQuestionComments,
+    QEM.FavoriteCount,
+    QEM.AvgAnswerScore,
+    QEM.TotalAnswerScore,
+    UAS_Q.DisplayName AS QuestionOwnerName,
+    UAS_Q.Reputation AS QuestionOwnerReputation,
+    UAS_Q.GoldBadges AS QuestionOwnerGoldBadges,
+    QEM.CloseReasonName,
+    QEM.WasClosedFlag AS WasClosed,
+    QEM.WasReopenedFlag AS WasReopened,
+    QEM.EditHistoryCount,
+    QEM.ViewCountQuartile,
+    QEM.FavoriteRank,
+    EA.AnswererDisplayName,
+    EA.AnswererReputation,
+    EA.AnswererTier,
+    EA.AnswerScore AS AcceptedAnswerScore,
+    COALESCE(TF.TaggedQuestionsCount, 0) AS TagPopularityScore,
+    TF.AvgQuestionScoreForTag,
+    TF.AvgViewCountForTag,
+    TF.UniqueAcceptedAnswerersForTag,
+    SUBSTRING(QEM.QuestionTitle FROM POSITION(' ' IN QEM.QuestionTitle) + 1 FOR LENGTH(QEM.QuestionTitle)) AS TitleSuffix,
+    LOWER(LEFT(QEM.QuestionTitle, 10)) AS TitlePrefixLower,
+    CASE
+        WHEN QEM.ActualAnswerCount = 0 THEN 'Unanswered'
+        WHEN QEM.AcceptedAnswerId IS NOT NULL THEN 'Accepted'
+        ELSE 'Answered (No Accepted)'
+    END AS QuestionStatus,
+    EXTRACT(WEEK FROM QEM.QuestionCreationDate) AS CreationWeek,
+    (UAS_Q.UpVotes - UAS_Q.DownVotes) AS QuestionOwnerNetVotes,
+    (
+        SELECT
+            COUNT(DISTINCT PL.RelatedPostId)
+        FROM
+            PostLinks PL
+        WHERE
+            PL.PostId = QEM.QuestionId AND PL.LinkTypeId = 1
+    ) AS LinkedPostCount,
+    (
+        SELECT
+            COALESCE(AVG(C.Score), 0)
+        FROM
+            Comments C
+        WHERE
+            C.PostId = QEM.QuestionId
+            AND C.UserId = QEM.QuestionOwnerId
+            AND C.CreationDate >= (QEM.QuestionCreationDate - INTERVAL '1 year')
+    ) AS AvgOwnerRecentCommentScore,
+    (
+        SELECT
+            COUNT(DISTINCT A.Id)
+        FROM
+            Posts A
+        WHERE
+            A.ParentId = QEM.QuestionId
+            AND A.OwnerUserId = QEM.QuestionOwnerId
+            AND A.PostTypeId = 2
+    ) AS OwnerSelfAnswersCount,
+    AVG(EA_AllAnswers.AnswererReputation) OVER (PARTITION BY t2.TagName) AS AvgAnswererReputationForTag,
+    SUM(CASE WHEN QEM.QuestionOwnerId = EA.AnswererUserId THEN 1 ELSE 0 END) OVER (PARTITION BY QEM.QuestionId) AS OwnerAcceptedTheirOwnAnswer
+FROM
+    QuestionEngagementMetrics QEM
+INNER JOIN
+    UserActivitySummary UAS_Q ON QEM.QuestionOwnerId = UAS_Q.UserId
+LEFT JOIN
+    ExpertAnswerers EA ON QEM.AcceptedAnswerId = EA.AnswerId
+LEFT JOIN
+    Posts A_All ON QEM.QuestionId = A_All.ParentId AND A_All.PostTypeId = 2
+LEFT JOIN
+    ExpertAnswerers EA_AllAnswers ON A_All.Id = EA_AllAnswers.AnswerId
+LEFT JOIN
+    TagFrequency TF ON TF.TagName IN (
+        SELECT t3.TagName FROM UNNEST(QEM.TagArray) AS t3(TagName)
+    )
+LEFT JOIN LATERAL
+    UNNEST(QEM.TagArray) AS t2(TagName) ON TRUE
+WHERE
+    QEM.QuestionCreationDate >= DATE '2020-01-01'
+    AND QEM.ViewCount >= 500
+    AND QEM.QuestionScore > 20
+    AND QEM.WasClosedFlag = 0
+    AND (QEM.CloseReasonName IS NULL OR QEM.CloseReasonName NOT LIKE '%Duplicate%')
+    AND (UAS_Q.Reputation > 2000 OR UAS_Q.GoldBadges > 0)
+    AND (EA.AnswererTier = 'Elite' OR EA.AnswererTier = 'Advanced' OR QEM.AcceptedAnswerId IS NULL)
+    AND LENGTH(COALESCE(QEM.QuestionTitle, '')) > 10
+GROUP BY
+    QEM.QuestionId,
+    QEM.QuestionTitle,
+    QEM.QuestionCreationDate,
+    QEM.QuestionScore,
+    QEM.ViewCount,
+    QEM.DeclaredAnswerCount,
+    QEM.ActualAnswerCount,
+    QEM.CommentCount,
+    QEM.FavoriteCount,
+    QEM.AvgAnswerScore,
+    QEM.TotalAnswerScore,
+    UAS_Q.DisplayName,
+    UAS_Q.Reputation,
+    UAS_Q.GoldBadges,
+    QEM.CloseReasonName,
+    QEM.WasClosedFlag,
+    QEM.WasReopenedFlag,
+    QEM.EditHistoryCount,
+    QEM.ViewCountQuartile,
+    QEM.FavoriteRank,
+    EA.AnswererDisplayName,
+    EA.AnswererReputation,
+    EA.AnswererTier,
+    EA.AnswerScore,
+    TF.TaggedQuestionsCount,
+    TF.AvgQuestionScoreForTag,
+    TF.AvgViewCountForTag,
+    TF.UniqueAcceptedAnswerersForTag,
+    UAS_Q.UpVotes,
+    UAS_Q.DownVotes,
+    QEM.AcceptedAnswerId,
+    QEM.QuestionOwnerId,
+    t2.TagName,
+    EA_AllAnswers.AnswererReputation,
+    A_All.Id
+ORDER BY
+    QEM.FavoriteRank ASC, QEM.ViewCount DESC, QEM.QuestionCreationDate DESC, QEM.QuestionId ASC
+LIMIT 1000;

@@ -1,0 +1,151 @@
+-- {"query": "2228.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1583} 
+with RecursiveUserBadges as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class,
+        row_number() over (partition by u.Id order by b.Date desc) as BadgeRank,
+        count(*) over (partition by u.Id) as TotalBadges
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    where u.Reputation > 1000
+),
+TopBadges as (
+    select UserId, DisplayName, BadgeName, Class, BadgeRank
+    from RecursiveUserBadges
+    where BadgeRank <= 3
+),
+UserPostStats as (
+    select 
+        u.Id as UserId,
+        count(p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        coalesce(sum(p.Score),0) as TotalPostScore,
+        count(distinct c.Id) as CommentCount
+    from Users u
+    left join Posts p on u.Id = p.OwnerUserId and p.CreationDate >= current_date - interval '1 year'
+    left join Comments c on c.UserId = u.Id and c.CreationDate >= current_date - interval '1 year'
+    where u.Reputation > 1000
+    group by u.Id
+),
+PostLinksDuplicates as (
+    select 
+        pl.PostId, 
+        pl.RelatedPostId, 
+        count(*) over (partition by pl.PostId) as DupLinkCount
+    from PostLinks pl
+    where pl.LinkTypeId = 3
+),
+QuestionCloseStats as (
+    select 
+        ph.PostId,
+        sum(case when ph.PostHistoryTypeId = 10 then 1 else 0 end) as TimesClosed,
+        string_agg(distinct crt.Name, ', ') filter (where ph.PostHistoryTypeId = 10) as CloseReasons
+    from PostHistory ph
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    group by ph.PostId
+),
+RecentActivity as (
+    select
+        p.Id as PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.AnswerCount,
+        p.ViewCount,
+        row_number() over (partition by p.OwnerUserId order by p.LastActivityDate desc) as RecentActivityRank,
+        dense_rank() over (partition by p.PostTypeId order by p.Score desc) as ScoreRankWithinType
+    from Posts p
+    where p.CreationDate >= current_date - interval '1 year'
+),
+AcceptedAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.AcceptedAnswerId,
+        a.Score as AcceptedAnswerScore,
+        a.OwnerUserId as AnswerOwnerUserId,
+        (select count(1) from Votes v where v.PostId = a.Id and v.VoteTypeId = 2) as AcceptedAnswerUpVotes,
+        (select count(1) from Votes v where v.PostId = a.Id and v.VoteTypeId = 3) as AcceptedAnswerDownVotes
+    from Posts q
+    left join Posts a on q.AcceptedAnswerId = a.Id
+    where q.PostTypeId = 1 and q.AcceptedAnswerId is not null
+),
+PostTagsExploded as (
+    select
+        p.Id as PostId,
+        unnest(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')) as Tag
+    from Posts p
+    where p.Tags is not null and p.PostTypeId = 1
+),
+TagStats as (
+    select
+        t.TagName,
+        count(distinct p.Id) as QuestionsWithTag,
+        coalesce(avg(p.Score),0) as AvgScore,
+        max(p.ViewCount) as MaxViewCount,
+        sum(p.AnswerCount) as TotalAnswers
+    from Tags t
+    left join Posts p on p.PostTypeId = 1 and p.Tags like concat('%<', t.TagName, '>%')
+    group by t.TagName
+),
+UserRecentBadges as (
+    select
+        b.UserId,
+        b.Name as BadgeName,
+        b.Date,
+        row_number() over (partition by b.UserId order by b.Date desc) as RecentBadgeRank
+    from Badges b
+    where b.Date >= current_date - interval '6 months'
+)
+select 
+    u.DisplayName,
+    u.Reputation,
+    us.QuestionCount,
+    us.AnswerCount,
+    us.TotalPostScore,
+    us.CommentCount,
+    tb1.BadgeName as TopBadge1,
+    tb2.BadgeName as TopBadge2,
+    tb3.BadgeName as TopBadge3,
+    r.PostId as RecentPostId,
+    r.PostTypeId,
+    r.Score as RecentPostScore,
+    r.AnswerCount as RecentPostAnswerCount,
+    r.ViewCount as RecentPostViewCount,
+    acs.Title as AcceptedQuestionTitle,
+    acs.AcceptedAnswerScore,
+    acs.AcceptedAnswerUpVotes,
+    acs.AcceptedAnswerDownVotes,
+    qcs.TimesClosed,
+    qcs.CloseReasons,
+    string_agg(distinct pte.Tag, ', ') as QuestionTags,
+    (select count(1) from Votes v where v.PostId = r.PostId and v.VoteTypeId = 2) as RecentPostUpVotes,
+    (select count(1) from Votes v where v.PostId = r.PostId and v.VoteTypeId = 3) as RecentPostDownVotes,
+    (select count(1) from Comments c where c.PostId = r.PostId) as RecentPostCommentCount,
+    ts.AvgScore as AvgTagScore,
+    ts.MaxViewCount as MaxTagViewCount,
+    ts.TotalAnswers as TotalTagAnswers
+from Users u
+inner join UserPostStats us on u.Id = us.UserId
+left join TopBadges tb1 on tb1.UserId = u.Id and tb1.BadgeRank = 1
+left join TopBadges tb2 on tb2.UserId = u.Id and tb2.BadgeRank = 2
+left join TopBadges tb3 on tb3.UserId = u.Id and tb3.BadgeRank = 3
+left join RecentActivity r on r.OwnerUserId = u.Id and r.RecentActivityRank = 1
+left join AcceptedAnswerStats acs on acs.OwnerUserId = u.Id
+left join QuestionCloseStats qcs on qcs.PostId = r.PostId
+left join PostTagsExploded pte on pte.PostId = r.PostId
+left join TagStats ts on ts.TagName = pte.Tag
+where u.Reputation > 1000
+group by 
+    u.DisplayName, u.Reputation, us.QuestionCount, us.AnswerCount, us.TotalPostScore, us.CommentCount,
+    tb1.BadgeName, tb2.BadgeName, tb3.BadgeName,
+    r.PostId, r.PostTypeId, r.Score, r.AnswerCount, r.ViewCount,
+    acs.Title, acs.AcceptedAnswerScore, acs.AcceptedAnswerUpVotes, acs.AcceptedAnswerDownVotes,
+    qcs.TimesClosed, qcs.CloseReasons,
+    ts.AvgScore, ts.MaxViewCount, ts.TotalAnswers
+order by us.TotalPostScore desc, us.QuestionCount desc
+limit 100;

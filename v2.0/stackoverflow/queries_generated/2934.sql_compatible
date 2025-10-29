@@ -1,0 +1,182 @@
+with recursive RecursiveTagHierarchy as (
+    select 
+        t.Id, 
+        t.TagName, 
+        t.IsModeratorOnly, 
+        t.IsRequired, 
+        1 as Level,
+        array[t.TagName] as TagPath
+    from Tags t
+    where t.IsRequired = true OR t.IsModeratorOnly = true
+
+    union all
+
+    select 
+        t.Id, 
+        t.TagName, 
+        t.IsModeratorOnly, 
+        t.IsRequired, 
+        r.Level + 1,
+        r.TagPath || t.TagName
+    from Tags t
+    join Posts p on p.Id = t.ExcerptPostId OR p.Id = t.WikiPostId
+    join RecursiveTagHierarchy r on p.Tags ILIKE '%' || r.TagName || '%'
+    where NOT t.TagName = ANY(r.TagPath)
+    AND r.Level < 5
+),
+UserBadgeStats as (
+    select 
+        u.Id as UserId, 
+        u.DisplayName, 
+        count(distinct b.Id) as TotalBadges,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        count(distinct case when b.TagBased = true then b.Id end) as TagBasedBadges,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+TopPostComments as (
+    select distinct on (c.PostId)
+        c.PostId,
+        c.Id as CommentId,
+        c.Text as CommentText,
+        c.Score,
+        c.CreationDate,
+        u.DisplayName as CommentUserName
+    from Comments c
+    left join Users u on u.Id = c.UserId
+    order by c.PostId, c.Score desc nulls last, c.CreationDate asc
+),
+QuestionAnswerScores as (
+    select 
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionCreation,
+        q.OwnerUserId,
+        q.Score as QuestionScore,
+        coalesce(a.TotalAnswerScore, 0) as TotalAnswerScore,
+        coalesce(a.MaxAnswerScore, 0) as MaxAnswerScore
+    from Posts q
+    left join (
+        select 
+            a.ParentId, 
+            sum(a.Score) as TotalAnswerScore,
+            max(a.Score) as MaxAnswerScore
+        from Posts a
+        where a.PostTypeId = 2
+        group by a.ParentId
+    ) a on a.ParentId = q.Id
+    where q.PostTypeId = 1
+),
+WindowedVotes as (
+    select
+        v.PostId,
+        v.VoteTypeId,
+        v.CreationDate,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) over (partition by v.PostId order by v.CreationDate rows between unbounded preceding and current row) as RunningUpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) over (partition by v.PostId order by v.CreationDate rows between unbounded preceding and current row) as RunningDownVotes
+    from Votes v
+),
+PostLinkDuplicates as (
+    select pl.PostId, pl.RelatedPostId
+    from PostLinks pl
+    where pl.LinkTypeId = 3
+),
+TopUsersByReputation as (
+    select u.Id, u.DisplayName, u.Reputation, 
+        row_number() over (order by u.Reputation desc) as Rnk
+    from Users u
+    where u.Reputation > 0
+    limit 100
+),
+FilteredPosts as (
+    select p.*
+    from Posts p
+    where p.CreationDate between (cast('2024-10-01' as date) - INTERVAL '2 years') and cast('2024-10-01' as date)
+    and p.Score >= 5
+    and (p.Tags is not null and p.Tags <> '')
+),
+AnswersWithAcceptedStatus as (
+    select 
+        a.Id, a.ParentId, a.Score,
+        case when q.AcceptedAnswerId = a.Id then true else false end as IsAccepted,
+        a.CreationDate
+    from Posts a
+    join Posts q on q.Id = a.ParentId
+    where a.PostTypeId = 2
+),
+UserPostActivity as (
+    select 
+        u.Id as UserId,
+        count(distinct p.Id) as PostsCount,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionsCount,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswersCount,
+        max(p.CreationDate) as LastPostDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id
+)
+select 
+    qas.QuestionId,
+    qas.Title,
+    qas.QuestionCreation,
+    qas.QuestionScore,
+    qas.TotalAnswerScore,
+    qas.MaxAnswerScore,
+    uas.DisplayName as QuestionAsker,
+    ub.TotalBadges,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ub.TagBasedBadges,
+    ts.CommentText as TopComment,
+    ts.CommentUserName as TopCommentUser,
+    ts.Score as TopCommentScore,
+    sum(wv.RunningUpVotes) as TotalUpVotesOnQuestion,
+    sum(wv.RunningDownVotes) as TotalDownVotesOnQuestion,
+    count(distinct pl.RelatedPostId) as DuplicateCount,
+    string_agg(distinct rth.TagName, ',' order by rth.TagName) as RelatedTagsHierarchy,
+    upa.PostsCount,
+    upa.QuestionsCount,
+    upa.AnswersCount,
+    upa.LastPostDate
+from QuestionAnswerScores qas
+left join Users uas on uas.Id = qas.OwnerUserId
+left join UserBadgeStats ub on ub.UserId = uas.Id
+left join TopPostComments ts on ts.PostId = qas.QuestionId
+left join WindowedVotes wv on wv.PostId = qas.QuestionId
+left join PostLinkDuplicates pl on pl.PostId = qas.QuestionId
+left join LATERAL (
+    select array_agg(distinct r.TagName) as TagName
+    from RecursiveTagHierarchy r
+    where exists (
+        select 1 from Posts p where p.Id = qas.QuestionId and p.Tags ILIKE '%'||r.TagName||'%'
+    )
+) rth on true
+left join UserPostActivity upa on upa.UserId = uas.Id
+where qas.QuestionScore > 10
+group by 
+    qas.QuestionId,
+    qas.Title,
+    qas.QuestionCreation,
+    qas.QuestionScore,
+    qas.TotalAnswerScore,
+    qas.MaxAnswerScore,
+    uas.DisplayName,
+    ub.TotalBadges,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ub.TagBasedBadges,
+    ts.CommentText,
+    ts.CommentUserName,
+    ts.Score,
+    upa.PostsCount,
+    upa.QuestionsCount,
+    upa.AnswersCount,
+    upa.LastPostDate
+order by qas.TotalAnswerScore desc, qas.QuestionScore desc
+limit 25;

@@ -1,0 +1,238 @@
+-- {"query": "1433.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3620} 
+
+WITH UserEngagementStats AS (
+    -- Aggregates various engagement metrics for each user, focusing on posts they own and comments they make.
+    SELECT
+        u.Id AS UserId,
+        COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsAsked,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersProvided,
+        COUNT(c.Id) AS TotalCommentsMade,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScoreByOwner, -- Sum of scores of posts owned by the user
+        COALESCE(AVG(p.Score), 0.0) AS AveragePostScoreByOwner,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) AND ph.UserId = u.Id THEN 1 ELSE 0 END) AS PostsEditedCountByOwner, -- Edits made by the user on their own posts
+        MAX(p.CreationDate) AS LatestPostDate,
+        COUNT(DISTINCT pl.RelatedPostId) FILTER (WHERE pl.LinkTypeId = 3) AS DuplicateLinksInitiated, -- Posts owned by user that link to a duplicate
+        SUM(CASE WHEN pv_rec.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesReceivedOnPosts, -- Upvotes received on posts owned by user
+        SUM(CASE WHEN pv_rec.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesReceivedOnPosts -- Downvotes received on posts owned by user
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND u.Id = ph.UserId -- Post history events created by the user on their own posts
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId -- Links created from posts owned by user
+    LEFT JOIN Votes pv_rec ON p.Id = pv_rec.PostId AND pv_rec.VoteTypeId IN (2, 3) -- Votes received on posts owned by user
+    GROUP BY u.Id
+),
+PostComplexActivity AS (
+    -- Gathers detailed activity information for each post, including edit history, comments, and tags.
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId IN (4, 5, 6)) AS LastEditDateByAnyone, -- Latest edit date by any user
+        COUNT(ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (4, 5, 6)) AS TotalEditCountByAnyone, -- Total edits by any user
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS ClosedEventCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenedEventCount,
+        STRING_AGG(DISTINCT t.TagName, ',') FILTER (WHERE t.TagName IS NOT NULL AND p.Tags LIKE '%' || t.TagName || '%') AS AssociatedTags, -- Aggregates tags, using an inefficient LIKE for complexity
+        SUM(CASE WHEN c.Score >= 1 THEN 1 ELSE 0 END) AS PositiveCommentsCount,
+        COALESCE(AVG(c.Score), 0.0) AS AverageCommentScore,
+        COALESCE(SUM(v_bounty.BountyAmount), 0) AS TotalBountyAmountOffered
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Tags t ON p.Tags LIKE '%' || t.TagName || '%' -- Potentially very slow join for benchmarking
+    LEFT JOIN Votes v_bounty ON p.Id = v_bounty.PostId AND v_bounty.VoteTypeId = 8 -- BountyStart votes
+    GROUP BY p.Id, p.PostTypeId
+),
+UserBadgeSummary AS (
+    -- Summarizes badge information for each user.
+    SELECT
+        b.UserId,
+        COUNT(b.Id) AS TotalBadges,
+        MIN(b.Class) AS HighestBadgeClass, -- 1=Gold, 2=Silver, 3=Bronze
+        STRING_AGG(DISTINCT b.Name, ';') AS AllBadgeNames
+    FROM Badges b
+    GROUP BY b.UserId
+),
+TopActiveUsers AS (
+    -- Identifies the most active users based on their post counts and total scores, ranking them.
+    SELECT
+        ues.UserId,
+        ues.TotalPostsOwned,
+        ROW_NUMBER() OVER (ORDER BY ues.QuestionsAsked DESC, ues.AnswersProvided DESC, ues.TotalPostScoreByOwner DESC) AS UserActivityRank
+    FROM UserEngagementStats ues
+    WHERE ues.TotalPostsOwned > 10 AND ues.TotalPostScoreByOwner > 50
+),
+RecentHighValuePosts AS (
+    -- Finds popular questions from the last two years, ranking them by view count and score within their creation year.
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        pca.TotalEditCountByAnyone,
+        COALESCE(SUM(v_bounty_curr.BountyAmount) FILTER (WHERE v_bounty_curr.VoteTypeId = 8), 0) AS CurrentBounty,
+        RANK() OVER (PARTITION BY EXTRACT(YEAR FROM p.CreationDate) ORDER BY p.ViewCount DESC, p.Score DESC) AS YearlyPopularityRank
+    FROM Posts p
+    JOIN PostComplexActivity pca ON p.Id = pca.PostId
+    LEFT JOIN Votes v_bounty_curr ON p.Id = v_bounty_curr.PostId
+    WHERE p.PostTypeId = 1 -- Questions only
+      AND p.CreationDate >= (CURRENT_TIMESTAMP - INTERVAL '2 year')
+      AND p.ViewCount > 1000
+    GROUP BY p.Id, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Title, pca.TotalEditCountByAnyone
+),
+UsersWithFrequentSinglePostEdits AS (
+    -- Identifies users who have edited a single post multiple times (more than 2 edits on the same post by the same user).
+    SELECT DISTINCT ph.UserId AS UserId
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4,5,6) -- Edit Title, Edit Body, Edit Tags
+    GROUP BY ph.UserId, ph.PostId
+    HAVING COUNT(*) > 2
+)
+-- Main query: Combines user data with various post and activity metrics.
+-- This part selects highly reputable and active users.
+SELECT
+    u.Id AS UserID,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    ue.TotalPostsOwned,
+    ue.QuestionsAsked,
+    ue.AnswersProvided,
+    ue.TotalCommentsMade,
+    ue.TotalPostScoreByOwner,
+    ue.AveragePostScoreByOwner,
+    COALESCE(ub.TotalBadges, 0) AS NumberOfBadges,
+    ub.HighestBadgeClass,
+    ub.AllBadgeNames,
+    rp.Title AS MostPopularQuestionTitleLast2Years,
+    rp.YearlyPopularityRank AS MostPopularQuestionRank,
+    pca_rp.AssociatedTags AS MostPopularPostTags,
+    pca_rp.TotalEditCountByAnyone AS MostPopularPostEditCount,
+    pca_rp.ClosedEventCount AS MostPopularPostClosedCount,
+    pca_rp.PositiveCommentsCount AS MostPopularPostPositiveComments,
+    -- Correlated subquery: counts posts owned by the user that were edited after their last access date.
+    (SELECT COUNT(DISTINCT psub.Id) FROM Posts psub WHERE psub.OwnerUserId = u.Id AND psub.LastEditDate > u.LastAccessDate AND psub.LastEditDate IS NOT NULL) AS PostsEditedAfterLastAccess,
+    COALESCE(tau.UserActivityRank, 999999) AS OverallActivityRank, -- Assigns a high rank if not among the top active posters
+    CASE
+        WHEN u.WebsiteUrl IS NOT NULL AND u.WebsiteUrl LIKE '%stackexchange.com%' THEN 'StackExchange Affiliate'
+        WHEN u.WebsiteUrl IS NOT NULL THEN 'External Website User'
+        ELSE 'No Website'
+    END AS WebsiteCategory,
+    -- Correlated subquery: checks if the user has ever had one of their answers accepted on a question.
+    (SELECT EXISTS (
+        SELECT 1
+        FROM Posts q
+        WHERE q.AcceptedAnswerId IN (
+            SELECT a.Id
+            FROM Posts a
+            WHERE a.OwnerUserId = u.Id AND a.PostTypeId = 2
+        )
+    )) AS HasAcceptedAnswerOnTheirQuestion,
+    -- Correlated subquery: calculates the average score of answers to the user's most popular question.
+    (SELECT AVG(ans.Score)
+     FROM Posts ans
+     WHERE ans.ParentId = rp.PostId
+       AND ans.PostTypeId = 2
+       AND ans.ParentId IS NOT NULL -- Ensure it's an answer to a question
+    ) AS AvgAnswerScoreForTopQuestion,
+    NULLIF(u.Views, 0) AS UserViewsNormalized, -- Returns NULL if user views are 0
+    COALESCE(u.Location, 'Unknown Location') || ' (Rep: ' || u.Reputation::varchar || ')' AS UserLocationAndReputation,
+    -- Correlated subquery: gets a snippet of the latest comment made on any post owned by the user.
+    (SELECT
+        SUBSTRING(c_latest.Text, 1, 50) || '...'
+    FROM Comments c_latest
+    JOIN Posts p_c_latest ON c_latest.PostId = p_c_latest.Id
+    WHERE p_c_latest.OwnerUserId = u.Id
+    ORDER BY c_latest.CreationDate DESC
+    LIMIT 1
+    ) AS LatestCommentSnippetOnTheirPost,
+    ue.UpvotesReceivedOnPosts,
+    ue.DownvotesReceivedOnPosts
+FROM Users u
+LEFT JOIN UserEngagementStats ue ON u.Id = ue.UserId
+LEFT JOIN UserBadgeSummary ub ON u.Id = ub.UserId
+LEFT JOIN RecentHighValuePosts rp ON u.Id = rp.OwnerUserId AND rp.YearlyPopularityRank = 1 -- Get their single top-ranked question
+LEFT JOIN PostComplexActivity pca_rp ON rp.PostId = pca_rp.PostId
+LEFT JOIN TopActiveUsers tau ON u.Id = tau.UserId
+WHERE
+    u.Reputation > 1000
+    AND (ue.QuestionsAsked > 5 OR ue.AnswersProvided > 10) -- Active contributors
+    AND (u.CreationDate >= (CURRENT_TIMESTAMP - INTERVAL '5 year') OR ue.TotalPostsOwned > 50) -- Recently active or very prolific
+    AND (ub.HighestBadgeClass IS NULL OR ub.HighestBadgeClass <= 2) -- Has Silver or Gold badge, or no badges at all
+    AND NOT EXISTS (SELECT 1 FROM UsersWithFrequentSinglePostEdits uwfse WHERE uwfse.UserId = u.Id) -- Exclude users who excessively edit single posts
+    AND (u.AboutMe IS NULL OR LENGTH(u.AboutMe) < 500 OR u.AboutMe LIKE '%developer%' OR u.AboutMe LIKE '%engineer%') -- Filters users based on AboutMe content or length
+    AND u.EmailHash IS NOT NULL -- User must have an email hash
+UNION ALL -- Combines the previous set with a different cohort of users
+-- This part selects moderately reputable users who have at least one highly popular post.
+SELECT
+    u.Id AS UserID,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    ue.TotalPostsOwned,
+    ue.QuestionsAsked,
+    ue.AnswersProvided,
+    ue.TotalCommentsMade,
+    ue.TotalPostScoreByOwner,
+    ue.AveragePostScoreByOwner,
+    COALESCE(ub.TotalBadges, 0) AS NumberOfBadges,
+    ub.HighestBadgeClass,
+    ub.AllBadgeNames,
+    rp.Title AS MostPopularQuestionTitleLast2Years,
+    rp.YearlyPopularityRank AS MostPopularQuestionRank,
+    pca_rp.AssociatedTags AS MostPopularPostTags,
+    pca_rp.TotalEditCountByAnyone AS MostPopularPostEditCount,
+    pca_rp.ClosedEventCount AS MostPopularPostClosedCount,
+    pca_rp.PositiveCommentsCount AS MostPopularPostPositiveComments,
+    (SELECT COUNT(DISTINCT psub.Id) FROM Posts psub WHERE psub.OwnerUserId = u.Id AND psub.LastEditDate > u.LastAccessDate AND psub.LastEditDate IS NOT NULL) AS PostsEditedAfterLastAccess,
+    COALESCE(tau.UserActivityRank, 999999) AS OverallActivityRank,
+    CASE
+        WHEN u.WebsiteUrl IS NOT NULL AND u.WebsiteUrl LIKE '%github.com%' THEN 'GitHub User'
+        WHEN u.WebsiteUrl IS NOT NULL THEN 'Other External Website'
+        ELSE 'No Website'
+    END AS WebsiteCategory,
+    (SELECT EXISTS (
+        SELECT 1
+        FROM Posts q
+        WHERE q.AcceptedAnswerId IN (
+            SELECT a.Id
+            FROM Posts a
+            WHERE a.OwnerUserId = u.Id AND a.PostTypeId = 2
+        )
+    )) AS HasAcceptedAnswerOnTheirQuestion,
+    (SELECT AVG(ans.Score)
+     FROM Posts ans
+     WHERE ans.ParentId = rp.PostId
+       AND ans.PostTypeId = 2
+       AND ans.ParentId IS NOT NULL
+    ) AS AvgAnswerScoreForTopQuestion,
+    NULLIF(u.Views, 0) AS UserViewsNormalized,
+    COALESCE(u.Location, 'Unknown Location') || ' (Rep: ' || u.Reputation::varchar || ')' AS UserLocationAndReputation,
+    (SELECT
+        SUBSTRING(c_latest.Text, 1, 50) || '...'
+    FROM Comments c_latest
+    JOIN Posts p_c_latest ON c_latest.PostId = p_c_latest.Id
+    WHERE p_c_latest.OwnerUserId = u.Id
+    ORDER BY c_latest.CreationDate DESC
+    LIMIT 1
+    ) AS LatestCommentSnippetOnTheirPost,
+    ue.UpvotesReceivedOnPosts,
+    ue.DownvotesReceivedOnPosts
+FROM Users u
+LEFT JOIN UserEngagementStats ue ON u.Id = ue.UserId
+LEFT JOIN UserBadgeSummary ub ON u.Id = ub.UserId
+LEFT JOIN RecentHighValuePosts rp ON u.Id = rp.OwnerUserId
+LEFT JOIN PostComplexActivity pca_rp ON rp.PostId = pca_rp.PostId
+LEFT JOIN TopActiveUsers tau ON u.Id = tau.UserId
+WHERE
+    u.Reputation BETWEEN 500 AND 1000 -- Mid-range reputation
+    AND rp.PostId IS NOT NULL -- Must have a high-value post
+    AND rp.YearlyPopularityRank <= 5 -- The post must be among their top 5 for the year
+    AND ue.TotalPostsOwned BETWEEN 1 AND 20 -- Not overly prolific
+    AND (u.LastAccessDate >= (CURRENT_TIMESTAMP - INTERVAL '1 year') OR u.LastAccessDate IS NULL) -- Recently accessed or never accessed (for old data)
+    AND u.AccountId IS NOT NULL -- User must have an AccountId
+ORDER BY
+    OverallActivityRank, Reputation DESC, UserCreationDate ASC
+LIMIT 1000;

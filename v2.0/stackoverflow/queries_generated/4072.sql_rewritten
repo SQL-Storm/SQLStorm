@@ -1,0 +1,229 @@
+-- {"query": "4072.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2308} 
+WITH
+  UserPostActivity AS (
+    SELECT
+      p.OwnerUserId,
+      COUNT(p.Id) AS PostCount,
+      SUM(CASE WHEN pt.Name = 'Question' THEN 1 ELSE 0 END) AS QuestionCount,
+      SUM(CASE WHEN pt.Name = 'Answer' THEN 1 ELSE 0 END) AS AnswerCount,
+      SUM(p.Score) AS TotalScore,
+      AVG(p.Score) AS AverageScore,
+      MAX(p.CreationDate) AS LatestPostDate
+    FROM Posts AS p
+    JOIN PostTypes AS pt
+      ON p.PostTypeId = pt.Id
+    WHERE
+      p.OwnerUserId IS NOT NULL AND p.OwnerUserId > 0
+    GROUP BY
+      p.OwnerUserId
+  ),
+  UserCommentActivity AS (
+    SELECT
+      c.UserId,
+      COUNT(c.Id) AS CommentCount,
+      AVG(c.Score) AS AverageCommentScore,
+      MAX(c.CreationDate) AS LatestCommentDate
+    FROM Comments AS c
+    WHERE
+      c.UserId IS NOT NULL AND c.UserId > 0
+    GROUP BY
+      c.UserId
+  ),
+  UserVoteActivity AS (
+    SELECT
+      v.UserId,
+      SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVoteCount,
+      SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVoteCount,
+      COUNT(v.Id) AS TotalVoteCount
+    FROM Votes AS v
+    JOIN VoteTypes AS vt
+      ON v.VoteTypeId = vt.Id
+    WHERE
+      v.UserId IS NOT NULL AND v.UserId > 0
+    GROUP BY
+      v.UserId
+  ),
+  UserBadgeDistribution AS (
+    SELECT
+      b.UserId,
+      COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadgeCount,
+      COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadgeCount,
+      COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadgeCount,
+      MAX(b.Date) AS LatestBadgeDate
+    FROM Badges AS b
+    GROUP BY
+      b.UserId
+  ),
+  PostActivitySummary AS (
+    SELECT
+      p.Id AS PostId,
+      p.OwnerUserId,
+      p.Title,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      p.Score,
+      p.ViewCount,
+      p.ClosedDate,
+      DENSE_RANK() OVER (ORDER BY p.Score DESC) AS ScoreRank,
+      ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS RowNumByUser,
+      LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostScore,
+      LEAD(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextPostScore
+    FROM Posts AS p
+    WHERE
+      p.PostTypeId = 1 -- Questions only
+  ),
+  UserAggregatedData AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate AS UserCreationDate,
+      COALESCE(upa.PostCount, 0) AS TotalPosts,
+      COALESCE(upa.QuestionCount, 0) AS TotalQuestions,
+      COALESCE(upa.AnswerCount, 0) AS TotalAnswers,
+      COALESCE(upa.TotalScore, 0) AS TotalPostScore,
+      COALESCE(upa.AverageScore, 0.0) AS AveragePostScore,
+      COALESCE(uca.CommentCount, 0) AS TotalComments,
+      COALESCE(uca.AverageCommentScore, 0.0) AS AverageCommentScore,
+      COALESCE(uva.UpVoteCount, 0) AS TotalUpVotes,
+      COALESCE(uva.DownVoteCount, 0) AS TotalDownVotes,
+      COALESCE(ubd.GoldBadgeCount, 0) AS GoldBadges,
+      COALESCE(ubd.SilverBadgeCount, 0) AS SilverBadges,
+      COALESCE(ubd.BronzeBadgeCount, 0) AS BronzeBadges,
+      CASE
+        WHEN u.Views > 10000 THEN 'High'
+        WHEN u.Views > 1000 THEN 'Medium'
+        ELSE 'Low'
+      END AS ViewCategory,
+      -- Calculate ratio of accepted answers to total answers for users who have answered
+      CASE
+        WHEN COALESCE(upa.AnswerCount, 0) > 0 THEN CAST(COUNT(DISTINCT CASE WHEN p.AcceptedAnswerId IS NOT NULL AND p.AcceptedAnswerId = p.Id THEN p.Id ELSE NULL END) AS REAL) / upa.AnswerCount
+        ELSE 0.0
+      END AS AcceptedAnswerRatio,
+      -- Calculate time since last access in days
+      JULIANDAY(cast('2024-10-01 12:34:56' as timestamp)) - JULIANDAY(u.LastAccessDate) AS DaysSinceLastAccess
+    FROM Users AS u
+    LEFT JOIN UserPostActivity AS upa
+      ON u.Id = upa.OwnerUserId
+    LEFT JOIN UserCommentActivity AS uca
+      ON u.Id = uca.UserId
+    LEFT JOIN UserVoteActivity AS uva
+      ON u.Id = uva.UserId
+    LEFT JOIN UserBadgeDistribution AS ubd
+      ON u.Id = ubd.UserId
+    LEFT JOIN Posts AS p
+      ON u.Id = p.OwnerUserId AND p.PostTypeId = 1 -- Join back to posts to check for accepted answers
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate,
+      upa.PostCount,
+      upa.QuestionCount,
+      upa.AnswerCount,
+      upa.TotalScore,
+      upa.AverageScore,
+      uca.CommentCount,
+      uca.AverageCommentScore,
+      uva.UpVoteCount,
+      uva.DownVoteCount,
+      ubd.GoldBadgeCount,
+      ubd.SilverBadgeCount,
+      ubd.BronzeBadgeCount,
+      u.Views,
+      u.LastAccessDate
+  )
+SELECT
+  pas.PostId,
+  pas.Title,
+  u.DisplayName AS OwnerDisplayName,
+  u.Reputation AS OwnerReputation,
+  u.TotalPosts AS OwnerTotalPosts,
+  u.TotalQuestions AS OwnerTotalQuestions,
+  u.TotalAnswers AS OwnerTotalAnswers,
+  u.TotalComments AS OwnerTotalComments,
+  u.GoldBadges AS OwnerGoldBadges,
+  u.SilverBadges AS OwnerSilverBadges,
+  u.BronzeBadges AS OwnerBronzeBadges,
+  pas.Score AS PostScore,
+  pas.ViewCount AS PostViewCount,
+  pas.AnswerCount AS PostAnswerCount,
+  pas.CommentCount AS PostCommentCount,
+  pas.FavoriteCount AS PostFavoriteCount,
+  CASE
+    WHEN pas.ClosedDate IS NOT NULL THEN 'Closed'
+    ELSE 'Open'
+  END AS PostStatus,
+  pas.ScoreRank,
+  pas.RowNumByUser,
+  pas.PreviousPostScore,
+  pas.NextPostScore,
+  -- Calculate percentage difference in score compared to previous post by the same user
+  CASE
+    WHEN pas.PreviousPostScore > 0 THEN CAST((pas.Score - pas.PreviousPostScore) AS REAL) / pas.PreviousPostScore * 100.0
+    ELSE NULL
+  END AS ScorePercentageChange,
+  -- Check if the post has any associated duplicate links
+  CASE
+    WHEN EXISTS (
+      SELECT
+        1
+      FROM PostLinks AS pl
+      WHERE
+        pl.PostId = pas.PostId AND pl.LinkTypeId = 3
+    ) THEN 'Yes'
+    ELSE 'No'
+  END AS HasDuplicateLink,
+  -- Get the name of the user who created the post with the highest score
+  (
+    SELECT
+      DisplayName
+    FROM Users
+    WHERE
+      Id = (
+        SELECT
+          OwnerUserId
+        FROM Posts
+        ORDER BY
+          Score DESC
+        LIMIT 1
+      )
+  ) AS HighestScoringPostOwner,
+  -- Calculate average score of answers for this question
+  (
+    SELECT
+      AVG(Score)
+    FROM Posts AS ans
+    WHERE
+      ans.ParentId = pas.PostId AND ans.PostTypeId = 2
+  ) AS AverageAnswerScore,
+  -- Count of tags associated with the post
+  (
+    SELECT
+      LENGTH(Tags) - LENGTH(REPLACE(Tags, '><', '')) + 1
+    FROM Posts
+    WHERE
+      Id = pas.PostId AND Tags IS NOT NULL
+  ) AS TagCount,
+  -- Concatenate user's display name with their total post count and view category
+  u.DisplayName || ' (' || u.TotalPosts || ' posts, ' || u.ViewCategory || ' views)' AS UserSummary,
+  -- Check if the user has more gold badges than silver badges
+  CASE
+    WHEN u.GoldBadges > u.SilverBadges THEN 'More Gold'
+    WHEN u.SilverBadges > u.GoldBadges THEN 'More Silver'
+    ELSE 'Equal or None'
+  END AS BadgeBalance,
+  -- Identify posts created within the last 30 days by users with reputation > 1000
+  CASE
+    WHEN JULIANDAY(cast('2024-10-01 12:34:56' as timestamp)) - JULIANDAY(pas.LatestPostDate) <= 30 AND u.Reputation > 1000 THEN 'Recent High Rep User Post'
+    ELSE 'Other'
+  END AS PostRecencyAndReputation
+FROM PostActivitySummary AS pas
+JOIN Users AS u
+  ON pas.OwnerUserId = u.Id
+WHERE
+  pas.RowNumByUser <= 5 -- Top 5 posts per user by creation date
+ORDER BY
+  pas.Score DESC,
+  pas.PostId;

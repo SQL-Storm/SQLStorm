@@ -1,0 +1,133 @@
+WITH
+RecentUserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.Location,
+    u.AboutMe,
+    u.ProfileImageUrl,
+    u.EmailHash,
+    u.AccountId,
+    ROW_NUMBER() OVER (ORDER BY u.LastAccessDate DESC, u.Reputation DESC) AS rn
+  FROM Users u
+  WHERE u.LastAccessDate IS NOT NULL
+),
+TopTags AS (
+  SELECT
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId,
+    t.WikiPostId,
+    ROW_NUMBER() OVER (PARTITION BY t.TagName ORDER BY t.Count DESC, t.Id DESC) AS tag_rn
+  FROM Tags t
+  WHERE COALESCE(t.IsModeratorOnly, 0) = 0
+),
+ActivePosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.OwnerUserId,
+    p.OwnerDisplayName,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    CASE WHEN p.ClosedDate IS NOT NULL THEN TRUE ELSE FALSE END AS ClosedFlag
+  FROM Posts p
+  LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+  LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+  WHERE p.PostTypeId IN (1,2) -- Questions and Answers
+    AND p.ClosedDate IS NULL
+),
+CommentedPosts AS (
+  SELECT
+    a.PostId,
+    COUNT(*) AS CommentCount
+  FROM Comments a
+  GROUP BY a.PostId
+),
+JoinedActivity AS (
+  SELECT
+    ap.PostId,
+    ap.PostTypeId,
+    ap.Title,
+    ap.OwnerUserId,
+    ep.DisplayName AS OwnerDisplayName,
+    ap.CreationDate,
+    ap.LastActivityDate,
+    ap.Score,
+    ap.ViewCount,
+    ap.Tags,
+    ic.CommentCount,
+    COALESCE(ct_total.TotalComments, 0) AS TotalComments,
+    CASE
+      WHEN ap.OwnerUserId IS NULL THEN 'Unknown'
+      ELSE 'Known'
+    END AS OwnerKnown,
+    ap.ClosedFlag
+  FROM ActivePosts ap
+  LEFT JOIN Users ep ON ep.Id = ap.OwnerUserId
+  LEFT JOIN CommentedPosts ic ON ic.PostId = ap.PostId
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS TotalComments
+    FROM Comments
+    GROUP BY PostId
+  ) ct_total ON ct_total.PostId = ap.PostId
+  GROUP BY
+    ap.PostId,
+    ap.PostTypeId,
+    ap.Title,
+    ap.OwnerUserId,
+    ep.DisplayName,
+    ap.CreationDate,
+    ap.LastActivityDate,
+    ap.Score,
+    ap.ViewCount,
+    ap.Tags,
+    ic.CommentCount,
+    ct_total.TotalComments,
+    ap.ClosedFlag
+)
+SELECT
+  ju.PostId,
+  ju.PostTypeId,
+  ju.Title,
+  ju.OwnerUserId,
+  ju.OwnerDisplayName,
+  ju.CreationDate,
+  ju.LastActivityDate,
+  ju.Score,
+  ju.ViewCount,
+  ju.Tags,
+  ju.TotalComments,
+  ju.OwnerKnown,
+  (COALESCE(TO_CHAR(ju.CreationDate, 'YYYY-MM-DD HH24:MI'), '') ||
+   ' | ' ||
+   COALESCE(TO_CHAR(ju.LastActivityDate, 'YYYY-MM-DD HH24:MI'), '') ||
+   ' | ' ||
+   COALESCE(ju.Tags, '')) AS ActivitySignature,
+  DENSE_RANK() OVER (
+    PARTITION BY CAST(ju.LastActivityDate AS DATE)
+    ORDER BY ju.Score DESC, ju.ViewCount DESC
+  ) AS DailyScoreRank,
+  CASE
+    WHEN ju.OwnerUserId IS NULL THEN FALSE
+    WHEN ju.OwnerUserId IN (SELECT Id FROM Users WHERE Reputation > 1000) THEN TRUE
+    ELSE NULL
+  END AS IsPromisingOwner
+FROM JoinedActivity ju
+ORDER BY ju.LastActivityDate DESC
+FETCH FIRST 100 ROWS ONLY;

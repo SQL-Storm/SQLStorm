@@ -1,0 +1,166 @@
+-- {"query": "3105.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1843} 
+
+WITH 
+-- 1. Recent activity (last 90 days) per user
+recent_activity AS (
+    SELECT 
+        u.Id                                 AS UserId,
+        MAX(p.CreationDate)                  AS LastPostDate,
+        MAX(c.CreationDate)                  AS LastCommentDate,
+        MAX(v.CreationDate)                  AS LastVoteDate
+    FROM Users u
+    LEFT JOIN Posts      p ON p.OwnerUserId = u.Id 
+                           AND p.CreationDate >= CURRENT_DATE - INTERVAL '90 days'
+    LEFT JOIN Comments   c ON c.UserId = u.Id 
+                           AND c.CreationDate >= CURRENT_DATE - INTERVAL '90 days'
+    LEFT JOIN Votes      v ON v.UserId = u.Id 
+                           AND v.CreationDate >= CURRENT_DATE - INTERVAL '90 days'
+    GROUP BY u.Id
+),
+
+-- 2. Aggregate badge info per user
+badge_stats AS (
+    SELECT 
+        b.UserId,
+        COUNT(*)                                   AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(b.Date)                                AS LastBadgeDate,
+        STRING_AGG(DISTINCT b.Name, ', ') FILTER (WHERE b.Class = 1) AS GoldBadgeNames,
+        STRING_AGG(DISTINCT b.Name, ', ') FILTER (WHERE b.Class = 2) AS SilverBadgeNames,
+        STRING_AGG(DISTINCT b.Name, ', ') FILTER (WHERE b.Class = 3) AS BronzeBadgeNames
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+-- 3. Vote summary per user (only up/down votes on their posts)
+post_vote_summary AS (
+    SELECT 
+        p.OwnerUserId                               AS UserId,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 2)    AS UpVotesReceived,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 3)    AS DownVotesReceived,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END),0) -
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END),0) AS NetVoteScore
+    FROM Posts p
+    JOIN Votes v ON v.PostId = p.Id
+    GROUP BY p.OwnerUserId
+),
+
+-- 4. Question‑answer performance per user
+qa_performance AS (
+    SELECT 
+        q.OwnerUserId                                            AS UserId,
+        COUNT(q.Id)                                              AS QuestionsAsked,
+        COUNT(a.Id)                                              AS AnswersGiven,
+        AVG(CASE WHEN a.Score IS NOT NULL THEN a.Score END)     AS AvgAnswerScore,
+        SUM(CASE WHEN q.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) 
+                                                                  AS QuestionsWithAccepted,
+        PERCENT_RANK() OVER (ORDER BY AVG(CASE WHEN a.Score IS NOT NULL THEN a.Score END) 
+                              DESC NULLS LAST)               AS AnswerScoreRank
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1                                    -- only questions
+    GROUP BY q.OwnerUserId
+),
+
+-- 5. Tag contribution (tags used in a user's questions)
+user_tag_activity AS (
+    SELECT 
+        p.OwnerUserId                                           AS UserId,
+        UNNEST(string_to_array(TRIM(BOTH '<>' FROM p.Tags), '><')) AS Tag,
+        COUNT(*)                                                AS TagUsageCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1                                     -- questions only
+      AND p.Tags IS NOT NULL
+    GROUP BY p.OwnerUserId, Tag
+),
+
+-- 6. Top tags overall (for ranking)
+top_tags AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        RANK() OVER (ORDER BY t.Count DESC) AS TagRank
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0
+),
+
+-- 7. Users that have never posted but have earned a badge (edge case)
+badge_only_users AS (
+    SELECT DISTINCT 
+        b.UserId
+    FROM Badges b
+    LEFT JOIN Posts p ON p.OwnerUserId = b.UserId
+    WHERE p.Id IS NULL
+),
+
+-- 8. Assemble final per‑user report
+user_report AS (
+    SELECT 
+        u.Id                                 AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(ra.LastPostDate,   TIMESTAMP '1970-01-01') AS LastPostDate,
+        COALESCE(ra.LastCommentDate,TIMESTAMP '1970-01-01') AS LastCommentDate,
+        COALESCE(ra.LastVoteDate,   TIMESTAMP '1970-01-01') AS LastVoteDate,
+        COALESCE(bs.TotalBadges,0)          AS TotalBadges,
+        COALESCE(bs.GoldBadges,0)           AS GoldBadges,
+        COALESCE(bs.SilverBadges,0)         AS SilverBadges,
+        COALESCE(bs.BronzeBadges,0)         AS BronzeBadges,
+        bs.LastBadgeDate,
+        bs.GoldBadgeNames,
+        bs.SilverBadgeNames,
+        bs.BronzeBadgeNames,
+        COALESCE(pvs.UpVotesReceived,0)     AS UpVotesReceived,
+        COALESCE(pvs.DownVotesReceived,0)   AS DownVotesReceived,
+        COALESCE(pvs.NetVoteScore,0)        AS NetVoteScore,
+        COALESCE(qap.QuestionsAsked,0)      AS QuestionsAsked,
+        COALESCE(qap.AnswersGiven,0)        AS AnswersGiven,
+        ROUND(qap.AvgAnswerScore,2)         AS AvgAnswerScore,
+        COALESCE(qap.QuestionsWithAccepted,0) AS QuestionsWithAccepted,
+        qap.AnswerScoreRank,
+        -- Concatenate top 3 tags used by the user
+        (SELECT STRING_AGG(tag, ', ') 
+         FROM (
+              SELECT uta.Tag
+              FROM user_tag_activity uta
+              WHERE uta.UserId = u.Id
+              ORDER BY uta.TagUsageCount DESC
+              LIMIT 3
+         ) sub)                              AS Top3UserTags,
+        -- Flag users who have badges but no posts
+        CASE WHEN bou.UserId IS NOT NULL THEN 1 ELSE 0 END AS BadgeOnlyUserFlag
+    FROM Users u
+    LEFT JOIN recent_activity ra      ON ra.UserId = u.Id
+    LEFT JOIN badge_stats bs          ON bs.UserId = u.Id
+    LEFT JOIN post_vote_summary pvs   ON pvs.UserId = u.Id
+    LEFT JOIN qa_performance qap      ON qap.UserId = u.Id
+    LEFT JOIN badge_only_users bou    ON bou.UserId = u.Id
+)
+
+-- Final output with UNION of two complementary sets:
+SELECT *
+FROM user_report
+WHERE Reputation > 10000
+   OR TotalBadges >= 10
+   OR AnswersGiven >= 500
+ORDER BY Reputation DESC, TotalBadges DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT 
+    NULL AS UserId,
+    '--- Top Tags Summary ---' AS DisplayName,
+    NULL AS Reputation,
+    NULL, NULL, NULL,
+    NULL, NULL, NULL, NULL,
+    NULL, NULL, NULL,
+    NULL, NULL, NULL,
+    NULL, NULL,
+    NULL, NULL,
+    STRING_AGG(t.TagName || ' (' || t.Count || ')', ', ') AS TopTagsList,
+    NULL
+FROM top_tags t
+WHERE t.TagRank <= 10;

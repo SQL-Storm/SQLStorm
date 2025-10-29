@@ -1,0 +1,199 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        COALESCE(p.ViewCount, 0) AS TagExcerptViewCount,
+        ROW_NUMBER() OVER (PARTITION BY t.Id ORDER BY p.CreationDate DESC NULLS LAST) AS ExcerptRank
+    FROM
+        Tags t
+    LEFT JOIN
+        Posts p ON t.ExcerptPostId = p.Id
+    WHERE
+        t.TagName IS NOT NULL
+    UNION ALL
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.IsModeratorOnly,
+        t2.IsRequired,
+        COALESCE(p2.ViewCount,0),
+        1
+    FROM
+        Tags t2
+    JOIN
+        RecursiveTagHierarchy rth ON t2.WikiPostId = rth.Id
+    LEFT JOIN
+        Posts p2 ON t2.ExcerptPostId = p2.Id
+),
+UserReputationWindow AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.Location,
+        u.CreationDate,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS RepRank,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0)
+            - COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS NetVotesReceived
+    FROM
+        Users u
+    LEFT JOIN
+        Badges b ON u.Id = b.UserId
+    LEFT JOIN
+        Votes v ON v.UserId = u.Id
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.Location, u.CreationDate
+),
+TopQuestionsByComplexity AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.Tags,
+        COALESCE(u.DisplayName, '-Anonymous-') AS OwnerName,
+        COALESCE(p.AcceptedAnswerId, -1) AS AcceptedAnswerId,
+        (CAST(LENGTH(COALESCE(p.Body, '')) AS FLOAT)
+         + COALESCE(array_length(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><'), 1), 0) * 100
+         + p.Score * 50
+         + LOG(GREATEST(p.ViewCount,1)) * 10
+        ) AS ComplexityScore
+    FROM
+        Posts p
+    LEFT JOIN
+        Users u ON p.OwnerUserId = u.Id
+    WHERE
+        p.PostTypeId = 1
+        AND p.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+),
+AcceptedAnswersWithComments AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.CreationDate AS AnswerCreationDate,
+        a.Score AS AnswerScore,
+        a.Body AS AnswerBody,
+        u.DisplayName AS AnswerOwner,
+        (SELECT COUNT(1) FROM Comments c WHERE c.PostId = a.Id AND c.Score > 0) AS PositiveCommentsCount,
+        (SELECT AVG(LENGTH(c.Text)) FROM Comments c WHERE c.PostId = a.Id) AS AvgCommentLength
+    FROM
+        Posts a
+    LEFT JOIN Users u ON a.OwnerUserId = u.Id
+    WHERE
+        a.PostTypeId = 2
+),
+UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsAsked,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersGiven,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        MAX(b.Date) AS LastBadgeDate,
+        MIN(p.CreationDate) AS FirstPostDate,
+        MAX(p.CreationDate) AS LastPostDate,
+        COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (10,12,14)) AS ModActionsCount
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN
+        Comments c ON c.UserId = u.Id
+    LEFT JOIN
+        Badges b ON b.UserId = u.Id
+    LEFT JOIN
+        PostHistory ph ON ph.UserId = u.Id
+    GROUP BY
+        u.Id, u.DisplayName
+),
+DuplicateQuestionsWithLinks AS (
+    SELECT DISTINCT
+        p.Id AS QuestionId,
+        p.Title,
+        l.RelatedPostId AS DuplicateOfQuestionId,
+        rq.Title AS DuplicateOfTitle,
+        l.CreationDate AS LinkCreationDate
+    FROM
+        Posts p
+    INNER JOIN
+        PostLinks l ON p.Id = l.PostId
+    INNER JOIN
+        Posts rq ON rq.Id = l.RelatedPostId
+    WHERE
+        p.PostTypeId = 1
+        AND rq.PostTypeId = 1
+        AND l.LinkTypeId = 3
+),
+FinalResults AS (
+    SELECT
+        qs.QuestionId,
+        qs.Title,
+        CAST(qs.CreationDate AS date) AS QuestionDate,
+        qs.ComplexityScore,
+        COALESCE(aa.AnswerId, -1) AS AcceptedAnswerId,
+        aa.AnswerScore,
+        aa.PositiveCommentsCount,
+        ua.DisplayName AS QuestionOwner,
+        ua.QuestionsAsked,
+        ua.AnswersGiven,
+        ua.CommentsMade,
+        (CASE WHEN dq.QuestionId IS NOT NULL THEN TRUE ELSE FALSE END) AS IsDuplicateQuestion,
+        dq.DuplicateOfTitle,
+        ROW_NUMBER() OVER (PARTITION BY ua.UserId ORDER BY qs.ComplexityScore DESC) AS QuestionRankByUser,
+        qs.Score
+    FROM
+        TopQuestionsByComplexity qs
+    LEFT JOIN
+        AcceptedAnswersWithComments aa ON qs.AcceptedAnswerId = aa.AnswerId
+    LEFT JOIN
+        Users ua ON ua.Id = (SELECT OwnerUserId FROM Posts WHERE Id = qs.QuestionId)
+    LEFT JOIN
+        UserActivitySummary uas ON ua.Id = uas.UserId
+    LEFT JOIN
+        DuplicateQuestionsWithLinks dq ON qs.QuestionId = dq.QuestionId
+    WHERE
+        (ua.Reputation > 1000 OR ua.Reputation IS NULL)
+)
+SELECT
+    fr.QuestionDate,
+    fr.Title,
+    fr.ComplexityScore,
+    fr.AcceptedAnswerId,
+    fr.AnswerScore,
+    fr.PositiveCommentsCount,
+    fr.QuestionOwner,
+    fr.QuestionsAsked,
+    fr.AnswersGiven,
+    fr.CommentsMade,
+    fr.IsDuplicateQuestion,
+    fr.DuplicateOfTitle,
+    u.Reputation,
+    u.Location,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    (SELECT COUNT(1) FROM Votes v WHERE v.PostId = fr.QuestionId AND v.VoteTypeId = 2) AS UpVotesOnQuestion,
+    (SELECT COUNT(1) FROM Votes v WHERE v.PostId = fr.QuestionId AND v.VoteTypeId = 3) AS DownVotesOnQuestion,
+    RANK() OVER (ORDER BY fr.ComplexityScore DESC) AS OverallComplexityRank,
+    COALESCE(NULLIF(REGEXP_REPLACE(p.Tags, '[><]', ',', 'g'), ''), '[no tags]') AS FormattedTagList,
+    CASE WHEN fr.AnswerScore IS NULL AND fr.Score < 0 THEN 'Review' ELSE 'OK' END AS ReviewStatus
+FROM
+    FinalResults fr
+INNER JOIN
+    Users u ON u.DisplayName = fr.QuestionOwner
+INNER JOIN
+    UserReputationWindow ub ON ub.Id = u.Id
+INNER JOIN
+    Posts p ON p.Id = fr.QuestionId
+ORDER BY
+    OverallComplexityRank, fr.QuestionOwner
+LIMIT 50;

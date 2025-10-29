@@ -1,0 +1,98 @@
+-- {"query": "5612.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 700} 
+WITH RankedPosts AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.ViewCount,
+    p.Score,
+    p.Tags,
+    p.PostTypeId,
+    p.LastActivityDate,
+    p.AcceptedAnswerId,
+    p.ParentId,
+    p.Body,
+    p.LastEditorUserId,
+    p.LastEditDate,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.ClosedDate,
+    p.ContentLicense,
+    p.OwnerDisplayName,
+    ROW_NUMBER() OVER (
+      PARTITION BY p.OwnerUserId
+      ORDER BY p.Score DESC, p.ViewCount DESC, p.CreationDate DESC
+    ) AS rn_by_owner
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN VoteTypes vt ON vt.Id = (SELECT MIN(vt2.Id) FROM Votes v2 WHERE v2.PostId = p.Id)
+  WHERE p.PostTypeId IN (1, 2) -- Questions and Answers
+),
+TopOwners AS (
+  SELECT
+    rp.OwnerUserId,
+    u.DisplayName,
+    COUNT(*) AS total_posts,
+    SUM(COALESCE(rp.Score,0)) AS score_sum,
+    MAX(rp.ViewCount) AS max_views,
+    MAX(rp.LastActivityDate) AS last_activity
+  FROM RankedPosts rp
+  JOIN Users u ON rp.OwnerUserId = u.Id
+  WHERE rp.rn_by_owner <= 5
+  GROUP BY rp.OwnerUserId, u.DisplayName
+),
+RecentActivity AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.ViewCount,
+    p.Score,
+    p.Tags,
+    p.PostTypeId,
+    ROW_NUMBER() OVER (ORDER BY p.LastActivityDate DESC, p.Score DESC) AS rn
+  FROM Posts p
+  WHERE p.LastActivityDate > NOW() - INTERVAL '30 days'
+    AND p.PostTypeId IN (1,2)
+),
+TagInfluence AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS tag_count,
+    AVG(p.Score) AS avg_post_score,
+    SUM(p.ViewCount) AS total_views
+  FROM Posts p
+  CROSS APPLY (
+    SELECT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS TagName
+  ) AS t
+  GROUP BY t.TagName
+),
+Combined AS (
+  SELECT
+    ro.OwnerUserId AS user_id,
+    ro.DisplayName AS user_display_name,
+    tu.total_posts,
+    tu.score_sum,
+    tu.max_views,
+    tu.last_activity
+  FROM TopOwners tu
+  JOIN Users ro ON ro.Id = tu.OwnerUserId
+  ORDER BY tu.score_sum DESC
+)
+SELECT
+  c.user_id,
+  c.user_display_name,
+  c.total_posts,
+  c.score_sum,
+  c.max_views,
+  c.last_activity,
+  tr.rn_by_owner
+FROM Combined c
+LEFT JOIN RankedPosts rp ON rp.OwnerUserId = c.user_id
+LEFT JOIN RecentActivity ra ON ra.OwnerUserId = c.user_id
+ORDER BY c.score_sum DESC, c.total_posts DESC
+LIMIT 100;

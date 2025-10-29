@@ -1,0 +1,146 @@
+WITH
+user_base AS (
+    SELECT
+        u.Id                      AS user_id,
+        u.DisplayName             AS user_name,
+        u.Reputation              AS reputation,
+        u.CreationDate            AS user_since,
+        COALESCE(u.Views,0)       AS total_views,
+        COALESCE(u.UpVotes,0)     AS up_votes_given,
+        COALESCE(u.DownVotes,0)   AS down_votes_given,
+        COUNT(p.Id)               FILTER (WHERE p.PostTypeId = 1) AS question_cnt,
+        COUNT(p.Id)               FILTER (WHERE p.PostTypeId = 2) AS answer_cnt,
+        COUNT(b.Id)               AS badge_cnt,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_badge_cnt,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_badge_cnt,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_badge_cnt
+    FROM Users u
+    LEFT JOIN Posts p   ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b  ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Views, u.UpVotes, u.DownVotes
+),
+
+question_stats AS (
+    SELECT
+        q.Id                              AS q_id,
+        q.Title                           AS q_title,
+        q.Score                           AS q_score,
+        q.ViewCount                       AS q_views,
+        q.CreationDate                    AS q_created,
+        q.AnswerCount                     AS q_answer_count,
+        COALESCE(q.FavoriteCount,0)       AS q_fav_cnt,
+        CASE WHEN q.Tags IS NOT NULL
+             THEN cardinality(string_to_array(substring(q.Tags, 2, length(q.Tags)-2), '><'))
+             ELSE 0
+        END                               AS q_tag_cnt,
+        (SELECT COUNT(DISTINCT a.OwnerUserId)
+         FROM Posts a
+         WHERE a.PostTypeId = 2
+           AND a.ParentId = q.Id
+           AND a.OwnerUserId IS NOT NULL) AS distinct_answerers,
+        (SELECT MAX(ph.CreationDate)
+         FROM PostHistory ph
+         WHERE ph.PostId = q.Id
+           AND ph.PostHistoryTypeId IN (4,5,6)) AS last_edit_date,
+        q.Tags                            AS q_tags
+    FROM Posts q
+    WHERE q.PostTypeId = 1
+),
+
+ranked_questions AS (
+    SELECT
+        qs.*,
+        NTILE(4) OVER (ORDER BY qs.q_tag_cnt)               AS tag_bucket,
+        RANK()   OVER (PARTITION BY NTILE(4) OVER (ORDER BY qs.q_tag_cnt)
+                         ORDER BY qs.q_score DESC)      AS rank_in_bucket,
+        ROW_NUMBER() OVER (ORDER BY qs.q_score DESC)       AS overall_rank
+    FROM question_stats qs
+),
+
+tag_popularity AS (
+    SELECT
+        t.Id                AS tag_id,
+        t.TagName           AS tag_name,
+        t.Count             AS tag_use_count,
+        COALESCE(e.ExcerptLen,0)   AS excerpt_len,
+        COALESCE(w.WikiLen,0)      AS wiki_len,
+        (SELECT CAST(AVG(p.Score) AS NUMERIC(10,2))
+         FROM Posts p
+         WHERE p.PostTypeId = 1
+           AND p.Tags LIKE '%<'||t.TagName||'>%')           AS avg_q_score,
+        (SELECT COUNT(DISTINCT p.OwnerUserId)
+         FROM Posts p
+         WHERE p.PostTypeId = 1
+           AND p.Tags LIKE '%<'||t.TagName||'>%')           AS distinct_askers
+    FROM Tags t
+    LEFT JOIN Posts e ON e.Id = t.ExcerptPostId
+    LEFT JOIN Posts w ON w.Id = t.WikiPostId
+),
+
+suspicious_votes AS (
+    SELECT
+        v.UserId                         AS voter_id,
+        COUNT(*)                         AS total_votes,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS up_votes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS down_votes,
+        COUNT(*) FILTER (WHERE v.PostId IN (
+            SELECT Id FROM Posts WHERE OwnerUserId = v.UserId
+        ))                               AS self_votes
+    FROM Votes v
+    GROUP BY v.UserId
+    HAVING COUNT(*) > 1000
+),
+
+top_users AS (
+    SELECT user_id, user_name, reputation, gold_badge_cnt
+    FROM user_base
+    WHERE reputation > 20000
+    UNION ALL
+    SELECT user_id, user_name, reputation, gold_badge_cnt
+    FROM user_base
+    WHERE gold_badge_cnt >= 5
+),
+
+clean_top_users AS (
+    SELECT tu.*
+    FROM top_users tu
+    LEFT JOIN suspicious_votes sv ON sv.voter_id = tu.user_id
+    WHERE sv.voter_id IS NULL
+)
+
+SELECT
+    ct.user_id,
+    ct.user_name,
+    ct.reputation,
+    ct.question_cnt,
+    ct.answer_cnt,
+    ct.gold_badge_cnt,
+    ct.silver_badge_cnt,
+    ct.bronze_badge_cnt,
+    rq.q_id,
+    rq.q_title,
+    rq.q_score,
+    rq.q_tag_cnt,
+    rq.tag_bucket,
+    rq.rank_in_bucket,
+    tp.tag_name,
+    tp.avg_q_score,
+    tp.distinct_askers,
+    sv.total_votes,
+    sv.up_votes,
+    sv.down_votes,
+    sv.self_votes
+FROM clean_top_users ct
+LEFT JOIN ranked_questions rq          ON rq.overall_rank <= 10
+LEFT JOIN LATERAL (
+        SELECT *
+        FROM tag_popularity tp
+        WHERE rq.q_tags IS NOT NULL
+          AND tp.tag_name = ANY (string_to_array(substring(rq.q_tags, 2, length(rq.q_tags)-2), '><'))
+        ORDER BY tp.avg_q_score DESC
+        LIMIT 1
+    ) tp ON TRUE
+LEFT JOIN suspicious_votes sv         ON sv.voter_id = ct.user_id
+WHERE ct.reputation IS NOT NULL
+ORDER BY ct.reputation DESC, rq.q_score DESC
+LIMIT 200;

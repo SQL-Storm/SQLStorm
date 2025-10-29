@@ -1,0 +1,178 @@
+-- {"query": "1653.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2571} 
+
+WITH UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.UpVotes,
+        u.DownVotes,
+        u.Views,
+        COALESCE(SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END), 0) AS GoldBadges,
+        COALESCE(SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END), 0) AS SilverBadges,
+        COALESCE(SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END), 0) AS BronzeBadges,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 1) AS AvgQuestionScore,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS TotalAnswersPosted,
+        (u.Reputation * 0.75 + u.UpVotes * 0.5 - u.DownVotes * 0.2 + COALESCE(u.Views, 0) * 0.05 + COUNT(DISTINCT b.Id) * 10) AS DerivedEngagementScore,
+        RANK() OVER (ORDER BY u.Reputation DESC, u.LastAccessDate DESC) AS OverallUserRank
+    FROM
+        Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE
+        u.DisplayName IS NOT NULL
+        AND u.Reputation > 500
+        AND u.LastAccessDate >= (CURRENT_TIMESTAMP - INTERVAL '1 year')
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.UpVotes, u.DownVotes, u.Views
+),
+PostComplexMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.LastActivityDate,
+        p.Title,
+        p.Tags,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.AnswerCount,
+        pt.Name AS PostTypeName,
+        DATE_PART('day', CURRENT_TIMESTAMP - p.CreationDate) AS DaysOld,
+        COALESCE(p.AcceptedAnswerId, -1) AS AcceptedAnswerId,
+        (SELECT COUNT(c.Id) FROM Comments c WHERE c.PostId = p.Id AND c.Score >= 2) AS HighScoreCommentCount,
+        (SELECT MAX(ph.CreationDate) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId = 5) AS LastEditBodyDate,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'CommunityOwned'
+            WHEN p.AnswerCount > 0 AND p.AcceptedAnswerId IS NOT NULL THEN 'AnsweredAndAccepted'
+            WHEN p.AnswerCount > 0 THEN 'Answered'
+            ELSE 'OpenNoAnswers'
+        END AS PostStatusCategory,
+        NULLIF(p.ViewCount, 0) / NULLIF(p.AnswerCount, 0) AS ViewsPerAnswerRatio
+    FROM
+        Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE
+        p.PostTypeId = 1 -- Questions only
+        AND p.ViewCount > 500
+        AND p.Score >= 10
+),
+PostTagAnalysis AS (
+    SELECT
+        pcm.PostId,
+        pcm.OwnerUserId,
+        LOWER(TRIM(UNNEST(string_to_array(SUBSTRING(pcm.Tags, 2, LENGTH(pcm.Tags) - 2), '><')))) AS TagName,
+        pcm.PostScore,
+        pcm.ViewCount,
+        pcm.DaysOld
+    FROM
+        PostComplexMetrics pcm
+    WHERE
+        pcm.Tags IS NOT NULL AND LENGTH(pcm.Tags) > 2
+),
+UserPostHistoryTimeline AS (
+    SELECT
+        ph.UserId,
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate AS HistoryEventDate,
+        pht.Name AS HistoryEventTypeName,
+        ph.Comment,
+        ph.Text AS HistoryRawText,
+        LAG(ph.CreationDate, 1, ph.CreationDate) OVER (PARTITION BY ph.UserId, ph.PostId ORDER BY ph.CreationDate) AS PreviousEventDate,
+        (ph.CreationDate - LAG(ph.CreationDate, 1, ph.CreationDate) OVER (PARTITION BY ph.UserId, ph.PostId ORDER BY ph.CreationDate)) AS TimeSincePreviousEvent,
+        LEAD(ph.CreationDate, 1, ph.CreationDate) OVER (PARTITION BY ph.UserId, ph.PostId ORDER BY ph.CreationDate) AS NextEventDate
+    FROM
+        PostHistory ph
+    JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    WHERE
+        ph.UserId IS NOT NULL
+        AND ph.PostHistoryTypeId IN (2, 5, 10, 11, 12, 13, 19, 20) -- Initial Body, Edit Body, Post Closed, Post Reopened, Post Deleted, Post Undeleted, Question Protected, Question Unprotected
+),
+AggregatedTagStats AS (
+    SELECT
+        pta.TagName,
+        COUNT(DISTINCT pta.PostId) AS TotalPostsWithTag,
+        SUM(pta.PostScore) AS TotalScoreForTag,
+        AVG(pta.ViewCount) AS AvgViewsForTag,
+        DENSE_RANK() OVER (ORDER BY SUM(pta.PostScore) DESC, COUNT(DISTINCT pta.PostId) DESC) AS TagPopularityRank
+    FROM
+        PostTagAnalysis pta
+    GROUP BY
+        pta.TagName
+    HAVING
+        COUNT(DISTINCT pta.PostId) > 50
+)
+SELECT
+    ue.UserId,
+    ue.DisplayName,
+    ue.Reputation,
+    ue.DerivedEngagementScore,
+    ue.OverallUserRank,
+    pcm.PostId,
+    pcm.Title,
+    pcm.PostScore,
+    pcm.ViewCount,
+    pcm.PostStatusCategory,
+    pcm.HighScoreCommentCount,
+    pcm.DaysOld,
+    SUM(CASE WHEN utl.HistoryEventTypeName = 'Edit Body' AND utl.TimeSincePreviousEvent < INTERVAL '10 minutes' THEN 1 ELSE 0 END) OVER (PARTITION BY ue.UserId, pcm.PostId) AS RapidEditCount,
+    COUNT(DISTINCT pta.TagName) AS DistinctTagsContributed,
+    MAX(CASE WHEN phs_latest.HistoryEventTypeName = 'Post Closed' AND phs_latest.HistoryRawText ILIKE '%Duplicate%' THEN 1 ELSE 0 END) AS LatestCloseWasDuplicate,
+    AVG(phs_latest.TimeSincePreviousEvent) FILTER (WHERE phs_latest.HistoryEventTypeName IN ('Edit Body', 'Initial Body')) OVER (PARTITION BY ue.UserId) AS AvgEditTimeLag,
+    COALESCE(ats.TagPopularityRank, 99999) AS PostMainTagPopularityRank,
+    (SELECT AVG(v.BountyAmount) FROM Votes v WHERE v.PostId = pcm.PostId AND v.VoteTypeId = 8) AS AvgBountyAmount,
+    CASE
+        WHEN ue.GoldBadges > 0 AND ue.DerivedEngagementScore > 10000 AND pcm.PostScore > 500 AND pcm.PostStatusCategory = 'AnsweredAndAccepted' THEN 'Veteran Trailblazer'
+        WHEN ue.SilverBadges > 0 AND pcm.ViewCount > 10000 AND pcm.DaysOld < 365 THEN 'Rising Star Author'
+        WHEN pcm.PostStatusCategory = 'Closed' AND ue.Reputation < 2000 THEN 'Novice Controversialist'
+        ELSE 'Active Contributor'
+    END AS UserPostImpactCategory,
+    COALESCE(
+        (SELECT pl.RelatedPostId FROM PostLinks pl WHERE pl.PostId = pcm.PostId AND pl.LinkTypeId = 3 ORDER BY pl.CreationDate DESC LIMIT 1),
+        (SELECT pl.PostId FROM PostLinks pl WHERE pl.RelatedPostId = pcm.PostId AND pl.LinkTypeId = 1 ORDER BY pl.CreationDate DESC LIMIT 1),
+        -1
+    ) AS LatestRelatedPostId
+FROM
+    UserEngagement ue
+INNER JOIN PostComplexMetrics pcm ON ue.UserId = pcm.OwnerUserId
+LEFT JOIN PostTagAnalysis pta ON pcm.PostId = pta.PostId AND pcm.OwnerUserId = pta.OwnerUserId
+LEFT JOIN AggregatedTagStats ats ON pta.TagName = ats.TagName
+LEFT JOIN (
+    SELECT
+        UserId, PostId, HistoryEventTypeName, HistoryRawText, TimeSincePreviousEvent,
+        ROW_NUMBER() OVER (PARTITION BY UserId, PostId ORDER BY HistoryEventDate DESC) as rn
+    FROM UserPostHistoryTimeline
+) phs_latest ON ue.UserId = phs_latest.UserId AND pcm.PostId = phs_latest.PostId AND phs_latest.rn = 1
+LEFT JOIN UserPostHistoryTimeline utl ON ue.UserId = utl.UserId AND pcm.PostId = utl.PostId
+WHERE
+    ue.DerivedEngagementScore > (SELECT AVG(DerivedEngagementScore) FROM UserEngagement) * 1.5 -- Users with significantly higher engagement
+    AND pcm.LastEditBodyDate IS NOT NULL
+    AND pcm.DaysOld < 730 -- Posts less than 2 years old
+    AND (
+        pta.TagName ILIKE '%sql%' OR pta.TagName ILIKE '%performance%' OR pta.TagName ILIKE '%optimization%' OR pta.TagName IS NULL
+    )
+    AND (
+        pcm.ViewsPerAnswerRatio > 5 OR pcm.PostStatusCategory = 'OpenNoAnswers'
+    )
+    AND NOT EXISTS (
+        SELECT 1 FROM Comments c
+        WHERE c.PostId = pcm.PostId
+        AND c.Text ILIKE '%duplicate of%'
+        AND c.CreationDate > (CURRENT_TIMESTAMP - INTERVAL '6 months')
+    )
+GROUP BY
+    ue.UserId, ue.DisplayName, ue.Reputation, ue.DerivedEngagementScore, ue.OverallUserRank,
+    pcm.PostId, pcm.Title, pcm.PostScore, pcm.ViewCount, pcm.PostStatusCategory,
+    pcm.HighScoreCommentCount, pcm.DaysOld,
+    phs_latest.HistoryEventTypeName, phs_latest.HistoryRawText, phs_latest.TimeSincePreviousEvent,
+    ats.TagPopularityRank, ue.GoldBadges, ue.SilverBadges, ue.BronzeBadges
+ORDER BY
+    ue.DerivedEngagementScore DESC, pcm.PostScore DESC, pcm.LastActivityDate DESC
+LIMIT 5000;

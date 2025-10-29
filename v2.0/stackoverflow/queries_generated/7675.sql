@@ -1,0 +1,233 @@
+-- {"query": "7675.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2468} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT c.Id) as TotalComments,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        SUM(COALESCE(p.Score, 0)) as TotalPostScore,
+        MAX(p.CreationDate) as LastPostDate,
+        DATEDIFF(CURRENT_TIMESTAMP, MAX(p.CreationDate)) as DaysSinceLastPost,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+                ROUND(SUM(COALESCE(p.Score, 0)) * 1.0 / COUNT(DISTINCT p.Id), 2)
+            ELSE 0 
+        END as AvgScorePerPost,
+        STRING_AGG(DISTINCT COALESCE(p.Tags, ''), ', ') as AllTagsUsed,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        STRING_AGG(DISTINCT b.Name, ', ') as BadgeNames
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= '2010-01-01 00:00:00'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+RankedUsers AS (
+    SELECT 
+        *,
+        ROW_NUMBER() OVER (ORDER BY TotalPostScore DESC, Reputation DESC) as RankByScore,
+        DENSE_RANK() OVER (ORDER BY BadgeCount DESC, TotalPostScore DESC) as RankByBadges,
+        PERCENT_RANK() OVER (ORDER BY TotalPostScore) as ScorePercentile
+    FROM UserActivityStats
+),
+HighValueUsers AS (
+    SELECT 
+        *,
+        CASE 
+            WHEN TotalPostScore >= 10000 THEN 'High Value'
+            WHEN TotalPostScore >= 5000 THEN 'Medium Value'
+            WHEN TotalPostScore >= 1000 THEN 'Low Value'
+            ELSE 'New User'
+        END as UserValueTier,
+        CASE 
+            WHEN Reputation >= 100000 THEN 'Elite'
+            WHEN Reputation >= 50000 THEN 'Veteran'
+            WHEN Reputation >= 10000 THEN 'Experienced'
+            WHEN Reputation >= 1000 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as RepTier
+    FROM RankedUsers
+),
+PostAnalytics AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Tags,
+        CASE 
+            WHEN p.AnswerCount > 0 THEN 'Has Answers'
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            ELSE 'Other'
+        END as PostCategory,
+        CASE 
+            WHEN p.Score >= 100 THEN 'Highly Upvoted'
+            WHEN p.Score >= 10 THEN 'Moderately Upvoted'
+            WHEN p.Score >= 0 THEN 'Neutral'
+            ELSE 'Downvoted'
+        END as ScoreCategory,
+        DATEDIFF(CURRENT_TIMESTAMP, p.CreationDate) as DaysOld,
+        (p.ViewCount + 1) / (p.AnswerCount + 1) as ViewsPerAnswer,
+        (SELECT COUNT(*) FROM Posts WHERE ParentId = p.Id AND PostTypeId = 2) as ActualAnswerCount,
+        (SELECT COUNT(*) FROM Votes WHERE PostId = p.Id AND VoteTypeId = 2) as UpvoteCount,
+        (SELECT COUNT(*) FROM Votes WHERE PostId = p.Id AND VoteTypeId = 3) as DownvoteCount,
+        (SELECT COUNT(*) FROM Comments WHERE PostId = p.Id) as CommentCountReal
+    FROM Posts p
+    WHERE p.CreationDate >= '2015-01-01 00:00:00'
+      AND p.PostTypeId IN (1, 2)
+),
+TagFrequency AS (
+    SELECT 
+        TagName,
+        Count,
+        ExcerptPostId,
+        WikiPostId,
+        CASE 
+            WHEN Count >= 1000 THEN 'Trending'
+            WHEN Count >= 100 THEN 'Popular'
+            WHEN Count >= 10 THEN 'Moderate'
+            ELSE 'Niche'
+        END as TagPopularity,
+        DENSE_RANK() OVER (ORDER BY Count DESC) as PopularityRank
+    FROM Tags
+    WHERE Count > 0
+),
+UserPostRelationships AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        p.Id as PostId,
+        p.Title as PostTitle,
+        p.Score as PostScore,
+        p.CreationDate as PostCreationDate,
+        p.Tags,
+        CASE 
+            WHEN p.OwnerUserId = u.Id THEN 'Own'
+            WHEN EXISTS(SELECT 1 FROM Votes v WHERE v.PostId = p.Id AND v.UserId = u.Id) THEN 'Voted'
+            ELSE 'Other'
+        END as RelationshipType,
+        RANK() OVER (PARTITION BY u.Id ORDER BY p.Score DESC) as PostRankByScore
+    FROM Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId OR p.Id IN (
+        SELECT PostId FROM Votes WHERE UserId = u.Id AND VoteTypeId = 2
+    )
+    WHERE u.Id IN (SELECT UserId FROM Badges GROUP BY UserId HAVING COUNT(*) >= 5)
+),
+CrossValidation AS (
+    SELECT 
+        'User Activity Validation' as TestName,
+        COUNT(*) as RecordCount,
+        COUNT(DISTINCT UserId) as UniqueUsers,
+        MIN(CreationDate) as MinDate,
+        MAX(CreationDate) as MaxDate,
+        AVG(Reputation) as AvgReputation,
+        SUM(TotalPosts) as TotalPosts,
+        SUM(TotalComments) as TotalComments,
+        STRING_AGG(DISTINCT DisplayName, ', ') as AllUserNames
+    FROM HighValueUsers
+    WHERE TotalPosts > 0
+    
+    UNION ALL
+    
+    SELECT 
+        'Post Validation' as TestName,
+        COUNT(*) as RecordCount,
+        COUNT(DISTINCT PostId) as UniquePosts,
+        MIN(CreationDate) as MinDate,
+        MAX(CreationDate) as MaxDate,
+        AVG(Score) as AvgScore,
+        SUM(ViewCount) as TotalViews,
+        SUM(CommandCountReal) as TotalComments,
+        STRING_AGG(DISTINCT PostTitle, ', ') as AllPostTitles
+    FROM PostAnalytics
+    
+    UNION ALL
+    
+    SELECT 
+        'Tag Validation' as TestName,
+        COUNT(*) as RecordCount,
+        COUNT(DISTINCT TagName) as UniqueTags,
+        NULL as MinDate,
+        NULL as MaxDate,
+        NULL as AvgScore,
+        NULL as TotalViews,
+        NULL as TotalComments,
+        STRING_AGG(DISTINCT TagName, ', ') as AllTags
+    FROM TagFrequency
+)
+SELECT 
+    hvu.UserId,
+    hvu.DisplayName,
+    hvu.Reputation,
+    hvu.TotalPosts,
+    hvu.TotalComments,
+    hvu.QuestionCount,
+    hvu.AnswerCount,
+    hvu.TotalPostScore,
+    hvu.DaysSinceLastPost,
+    hvu.AvgScorePerPost,
+    hvu.BadgeCount,
+    hvu.BadgeNames,
+    hvu.UserValueTier,
+    hvu.RepTier,
+    hvu.RankByScore,
+    hvu.RankByBadges,
+    hvu.ScorePercentile,
+    MAX(pa.Score) as MaxPostScore,
+    MIN(pa.Score) as MinPostScore,
+    AVG(pa.ViewCount) as AvgViewCount,
+    STRING_AGG(pa.PostTitle, '; ') as UserPostTitles,
+    STRING_AGG(COALESCE(pa.Tags, ''), ',') as UserTags,
+    COUNT(DISTINCT CASE WHEN pa.PostCategory = 'Has Answers' THEN pa.PostId END) as QWithAnswers,
+    COUNT(DISTINCT CASE WHEN pa.ScoreCategory = 'Highly Upvoted' THEN pa.PostId END) as HighlyUpvotedPosts,
+    STRING_AGG(DISTINCT tf.TagName, ', ') as TrendingTags,
+    COUNT(DISTINCT tf.TagName) as TrendingTagCount,
+    (SELECT GROUP_CONCAT(CONCAT('Tag: ', TagName, ', Count: ', Count) SEPARATOR '; ') 
+     FROM TagFrequency 
+     WHERE Count > 100 
+     ORDER BY Count DESC 
+     LIMIT 10) as TopTagsInfo,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = hvu.UserId AND b.Class = 1) as GoldBadgeCount,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = hvu.UserId AND b.Class = 2) as SilverBadgeCount,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = hvu.UserId AND b.Class = 3) as BronzeBadgeCount,
+    CASE 
+        WHEN hvu.BadgeCount >= 20 THEN 'Awarded'
+        WHEN hvu.BadgeCount >= 10 THEN 'Active'
+        WHEN hvu.BadgeCount >= 5 THEN 'Getting Started'
+        ELSE 'New'
+    END as BadgeStatus,
+    EXISTS(SELECT 1 FROM Posts p WHERE p.OwnerUserId = hvu.UserId AND p.Score >= 100) as HasHighScoringPost,
+    (SELECT MAX(p.Score) FROM Posts p WHERE p.OwnerUserId = hvu.UserId) as HighestUserPostScore,
+    COALESCE((SELECT SUM(p.Score) FROM Posts p WHERE p.OwnerUserId = hvu.UserId), 0) as TotalUserPostScore,
+    COALESCE((SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = hvu.UserId), 0) as AvgUserPostScore,
+    (SELECT COUNT(*) FROM Comments c WHERE c.UserId = hvu.UserId) as TotalUserComments,
+    (SELECT COUNT(*) FROM Votes v WHERE v.UserId = hvu.UserId AND v.VoteTypeId = 2) as TotalUpvotesReceived,
+    (SELECT COUNT(*) FROM Votes v WHERE v.UserId = hvu.UserId AND v.VoteTypeId = 3) as TotalDownvotesReceived,
+    CONCAT('User ', hvu.UserId, ' - ', hvu.DisplayName) as CombinedIdDisplayName
+FROM HighValueUsers hvu
+LEFT JOIN PostAnalytics pa ON hvu.UserId = pa.OwnerUserId
+LEFT JOIN TagFrequency tf ON tf.TagName IN (
+    SELECT UNNEST(string_to_array(pa.Tags, '><')) as tag
+    FROM PostAnalytics pa 
+    WHERE pa.OwnerUserId = hvu.UserId AND pa.Tags IS NOT NULL
+)
+WHERE hvu.UserValueTier IN ('High Value', 'Medium Value') 
+    AND hvu.RepTier IN ('Elite', 'Veteran', 'Experienced')
+GROUP BY 
+    hvu.UserId, hvu.DisplayName, hvu.Reputation, hvu.TotalPosts, hvu.TotalComments,
+    hvu.QuestionCount, hvu.AnswerCount, hvu.TotalPostScore, hvu.DaysSinceLastPost,
+    hvu.AvgScorePerPost, hvu.BadgeCount, hvu.BadgeNames, hvu.UserValueTier,
+    hvu.RepTier, hvu.RankByScore, hvu.RankByBadges, hvu.ScorePercentile
+HAVING COUNT(pa.PostId) >= 1
+ORDER BY hvu.TotalPostScore DESC, hvu.Reputation DESC
+LIMIT 1000;

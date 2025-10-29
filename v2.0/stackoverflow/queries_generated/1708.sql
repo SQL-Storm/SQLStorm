@@ -1,0 +1,192 @@
+-- {"query": "1708.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3387} 
+
+WITH UserEngagement AS (
+    -- Gathers comprehensive engagement metrics for each user, including posts, comments, votes given, and badge counts.
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName AS UserName,
+        u.Reputation,
+        u.Views AS UserViews,
+        COUNT(DISTINCT p.Id) AS TotalPostsContributed,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT b.Id) AS TotalBadgesEarned,
+        SUM(CASE WHEN v.VoteTypeId = (SELECT Id FROM VoteTypes WHERE Name = 'UpMod') THEN 1 ELSE 0 END) AS TotalUpVotesGiven,
+        SUM(CASE WHEN v.VoteTypeId = (SELECT Id FROM VoteTypes WHERE Name = 'DownMod') THEN 1 ELSE 0 END) AS TotalDownVotesGiven
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views
+),
+PostDetails AS (
+    -- Extracts core information for questions (PostTypeId = 1), including accepted answer details and parsed tags.
+    SELECT
+        q.Id AS QuestionId,
+        q.Title AS QuestionTitle,
+        q.Body AS QuestionBody,
+        q.CreationDate AS QuestionCreationDate,
+        q.OwnerUserId AS QuestionOwnerUserId,
+        q.OwnerDisplayName AS QuestionOwnerDisplayName,
+        q.Score AS QuestionScore,
+        q.ViewCount AS QuestionViewCount,
+        q.AnswerCount AS QuestionAnswerCount,
+        q.CommentCount AS QuestionCommentCount,
+        q.FavoriteCount AS QuestionFavoriteCount,
+        q.ClosedDate AS QuestionClosedDate,
+        q.CommunityOwnedDate AS QuestionCommunityOwnedDate,
+        q.Tags AS QuestionTagsRaw,
+        aa.Id AS AcceptedAnswerId,
+        aa.Score AS AcceptedAnswerScore,
+        aa.CreationDate AS AcceptedAnswerCreationDate,
+        aa.OwnerUserId AS AcceptedAnswerOwnerUserId,
+        aa.OwnerDisplayName AS AcceptedAnswerOwnerDisplayName,
+        STRING_TO_ARRAY(SUBSTRING(q.Tags, 2, LENGTH(q.Tags) - 2), '><') AS TagArray -- Parses the '><' delimited tags into an array
+    FROM Posts q
+    LEFT JOIN Posts aa ON q.AcceptedAnswerId = aa.Id -- Joins to get accepted answer details
+    WHERE q.PostTypeId = (SELECT Id FROM PostTypes WHERE Name = 'Question') -- Filters for questions only
+),
+PostActivityMetrics AS (
+    -- Aggregates various activities for each question, such as upvotes, downvotes, comments, edits, and moderation events.
+    SELECT
+        pd.QuestionId,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = (SELECT Id FROM VoteTypes WHERE Name = 'UpMod') THEN v.Id END) AS TotalUpvotes,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = (SELECT Id FROM VoteTypes WHERE Name = 'DownMod') THEN v.Id END) AS TotalDownvotes,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = (SELECT Id FROM VoteTypes WHERE Name = 'Favorite') THEN v.Id END) AS TotalFavorites,
+        COUNT(DISTINCT ch.Id) AS TotalCommentsOnQuestion,
+        COUNT(DISTINCT ph_all.Id) AS TotalHistoryEvents,
+        COUNT(DISTINCT CASE WHEN ph_edit.PostHistoryTypeId IN (
+            (SELECT Id FROM PostHistoryTypes WHERE Name = 'Edit Title'),
+            (SELECT Id FROM PostHistoryTypes WHERE Name = 'Edit Body'),
+            (SELECT Id FROM PostHistoryTypes WHERE Name = 'Edit Tags')
+        ) THEN ph_edit.Id END) AS TotalEdits,
+        MAX(CASE WHEN ph_edit.PostHistoryTypeId IN (4, 5, 6) THEN ph_edit.CreationDate ELSE NULL END) AS LastEditDate,
+        MIN(CASE WHEN ph_edit.PostHistoryTypeId IN (4, 5, 6) THEN ph_edit.CreationDate ELSE NULL END) AS FirstEditDate,
+        COUNT(DISTINCT CASE WHEN ph_close.PostHistoryTypeId = (SELECT Id FROM PostHistoryTypes WHERE Name = 'Post Closed') THEN ph_close.Id END) AS CloseCount,
+        COUNT(DISTINCT CASE WHEN ph_reopen.PostHistoryTypeId = (SELECT Id FROM PostHistoryTypes WHERE Name = 'Post Reopened') THEN ph_reopen.Id END) AS ReopenCount,
+        MAX(CASE WHEN ph_close.PostHistoryTypeId = (SELECT Id FROM PostHistoryTypes WHERE Name = 'Post Closed') THEN ph_close.CreationDate ELSE NULL END) AS LastClosedDate,
+        MAX(CASE WHEN ph_mig.PostHistoryTypeId IN ((SELECT Id FROM PostHistoryTypes WHERE Name = 'Post Migrated Away'), (SELECT Id FROM PostHistoryTypes WHERE Name = 'Post Migrated Here')) THEN ph_mig.CreationDate ELSE NULL END) AS LastMigrationDate
+    FROM PostDetails pd
+    LEFT JOIN Votes v ON pd.QuestionId = v.PostId
+    LEFT JOIN Comments ch ON pd.QuestionId = ch.PostId
+    LEFT JOIN PostHistory ph_close ON pd.QuestionId = ph_close.PostId AND ph_close.PostHistoryTypeId = (SELECT Id FROM PostHistoryTypes WHERE Name = 'Post Closed')
+    LEFT JOIN PostHistory ph_reopen ON pd.QuestionId = ph_reopen.PostId AND ph_reopen.PostHistoryTypeId = (SELECT Id FROM PostHistoryTypes WHERE Name = 'Post Reopened')
+    LEFT JOIN PostHistory ph_edit ON pd.QuestionId = ph_edit.PostId AND ph_edit.PostHistoryTypeId IN (4, 5, 6)
+    LEFT JOIN PostHistory ph_mig ON pd.QuestionId = ph_mig.PostId AND ph_mig.PostHistoryTypeId IN (35, 36)
+    LEFT JOIN PostHistory ph_all ON pd.QuestionId = ph_all.PostId -- Used for TotalHistoryEvents
+    GROUP BY pd.QuestionId
+),
+PostEditAnalysis AS (
+    -- Provides detailed analysis of post edits using window functions to calculate time intervals between successive edits.
+    SELECT
+        ph.PostId,
+        ph.Id AS HistoryId,
+        ph.CreationDate AS EditDate,
+        ph.UserId AS EditorUserId,
+        ph.PostHistoryTypeId AS EditTypeId,
+        LAG(ph.CreationDate, 1, ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS PreviousEditDate,
+        DATE_PART('day', ph.CreationDate - LAG(ph.CreationDate, 1, ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate)) AS DaysSincePreviousEdit
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (
+        (SELECT Id FROM PostHistoryTypes WHERE Name = 'Edit Title'),
+        (SELECT Id FROM PostHistoryTypes WHERE Name = 'Edit Body'),
+        (SELECT Id FROM PostHistoryTypes WHERE Name = 'Edit Tags')
+    )
+),
+ModeratorDecisionEvents AS (
+    -- Tracks explicit moderator actions such as locking, protecting, and closing reasons.
+    SELECT
+        ph.PostId,
+        MAX(CASE WHEN ph.PostHistoryTypeId = (SELECT Id FROM PostHistoryTypes WHERE Name = 'Post Locked') THEN ph.CreationDate ELSE NULL END) AS LastLockDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = (SELECT Id FROM PostHistoryTypes WHERE Name = 'Question Protected') THEN ph.CreationDate ELSE NULL END) AS LastProtectDate,
+        SUM(CASE WHEN ph.PostHistoryTypeId = (SELECT Id FROM PostHistoryTypes WHERE Name = 'Post Locked') THEN 1 ELSE 0 END) AS TotalLocks,
+        SUM(CASE WHEN ph.PostHistoryTypeId = (SELECT Id FROM PostHistoryTypes WHERE Name = 'Question Protected') THEN 1 ELSE 0 END) AS TotalProtections,
+        STRING_AGG(DISTINCT crt.Name, '; ') FILTER (WHERE ph.PostHistoryTypeId = (SELECT Id FROM PostHistoryTypes WHERE Name = 'Post Closed') AND crt.Name IS NOT NULL) AS FinalCloseReasons,
+        MAX(CASE WHEN ph.PostHistoryTypeId = (SELECT Id FROM PostHistoryTypes WHERE Name = 'Post Migrated Away') THEN ph.CreationDate ELSE NULL END) AS MigratedAwayDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = (SELECT Id FROM PostHistoryTypes WHERE Name = 'Post Migrated Here') THEN ph.CreationDate ELSE NULL END) AS MigratedHereDate
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON ph.Comment = crt.Id::text -- Assumes comment contains CloseReasonTypeId for 'Post Closed'
+    WHERE ph.PostHistoryTypeId IN (
+        (SELECT Id FROM PostHistoryTypes WHERE Name = 'Post Locked'),
+        (SELECT Id FROM PostHistoryTypes WHERE Name = 'Question Protected'),
+        (SELECT Id FROM PostHistoryTypes WHERE Name = 'Post Closed'),
+        (SELECT Id FROM PostHistoryTypes WHERE Name = 'Post Migrated Away'),
+        (SELECT Id FROM PostHistoryTypes WHERE Name = 'Post Migrated Here')
+    )
+    GROUP BY ph.PostId
+),
+AnswerVotes AS (
+    -- Aggregates vote counts for all answers associated with each question.
+    SELECT
+        pd.QuestionId,
+        SUM(CASE WHEN v.VoteTypeId = (SELECT Id FROM VoteTypes WHERE Name = 'UpMod') THEN 1 ELSE 0 END) AS TotalAnswerUpvotes,
+        SUM(CASE WHEN v.VoteTypeId = (SELECT Id FROM VoteTypes WHERE Name = 'DownMod') THEN 1 ELSE 0 END) AS TotalAnswerDownvotes,
+        SUM(CASE WHEN v.VoteTypeId = (SELECT Id FROM VoteTypes WHERE Name = 'Offensive') THEN 1 ELSE 0 END) AS TotalAnswerOffensiveVotes
+    FROM PostDetails pd
+    JOIN Posts a ON pd.QuestionId = a.ParentId AND a.PostTypeId = (SELECT Id FROM PostTypes WHERE Name = 'Answer')
+    LEFT JOIN Votes v ON a.Id = v.PostId
+    GROUP BY pd.QuestionId
+),
+QuestionBase AS (
+    -- Consolidates data from all previous CTEs into a base for further analysis and final selection.
+    SELECT
+        pd.QuestionId,
+        pd.QuestionTitle,
+        pd.QuestionBody,
+        pd.QuestionCreationDate,
+        COALESCE(ue_q.UserName, pd.QuestionOwnerDisplayName, 'Deleted User') AS QuestionOwnerName, -- NULL logic with COALESCE
+        ue_q.Reputation AS QuestionOwnerReputation,
+        pd.QuestionScore AS InitialQuestionScore,
+        pam.TotalUpvotes AS QuestionUpvotes,
+        pam.TotalDownvotes AS QuestionDownvotes,
+        pam.TotalFavorites AS QuestionFavorites,
+        pd.QuestionViewCount,
+        pd.QuestionAnswerCount,
+        pd.QuestionCommentCount,
+        pd.QuestionFavoriteCount,
+        pd.QuestionClosedDate,
+        pd.QuestionCommunityOwnedDate,
+        pam.TotalEdits,
+        pam.LastEditDate,
+        DATE_PART('day', AGE(CURRENT_TIMESTAMP, pam.LastEditDate)) AS DaysSinceLastEdit, -- Date calculation
+        (SELECT COUNT(DISTINCT pea.HistoryId) FROM PostEditAnalysis pea WHERE pea.PostId = pd.QuestionId AND pea.DaysSincePreviousEdit <= 7) AS EditsInFirstWeek, -- Correlated subquery
+        pam.CloseCount,
+        pam.ReopenCount,
+        pam.LastClosedDate,
+        mde.TotalLocks,
+        mde.TotalProtections,
+        mde.FinalCloseReasons,
+        mde.MigratedAwayDate,
+        mde.MigratedHereDate,
+        av.TotalAnswerUpvotes,
+        av.TotalAnswerDownvotes,
+        av.TotalAnswerOffensiveVotes,
+        pd.AcceptedAnswerId,
+        pd.AcceptedAnswerScore,
+        COALESCE(ue_aa.UserName, pd.AcceptedAnswerOwnerDisplayName, 'Unknown Answerer') AS AcceptedAnswerOwnerName,
+        COALESCE(TRIM(pd.TagArray[1]), 'untagged') AS PrimaryTag, -- String manipulation and NULL handling
+        (pd.QuestionCommentCount + pam.TotalUpvotes + pam.TotalDownvotes + pam.TotalFavorites) * 1.0 / NULLIF(pd.QuestionViewCount, 0.001) AS EngagementRatio, -- Complex calculation with NULLIF
+        CASE -- Complex predicate/expression with string search
+            WHEN LOWER(pd.QuestionTitle) LIKE '%problem%' OR LOWER(pd.QuestionTitle) LIKE '%issue%' THEN 'Problematic'
+            WHEN LOWER(pd.QuestionTitle) LIKE '%best practice%' OR LOWER(pd.QuestionTitle) LIKE '%solution%' THEN 'Solution-Oriented'
+            WHEN pd.QuestionTitle IS NULL THEN 'No Title'
+            ELSE 'Neutral'
+        END AS TitleSentiment,
+        NTILE(4) OVER (ORDER BY (pd.QuestionCommentCount + pam.TotalUpvotes + pam.TotalDownvotes + pam.TotalFavorites) * 1.0 / NULLIF(pd.QuestionViewCount, 0.001) DESC) AS EngagementQuartile, -- Window function
+        (SELECT COUNT(b.Id) FROM Badges b WHERE b.UserId = pd.QuestionOwnerUserId AND b.Class = 1) AS OwnerGoldBadgeCount, -- Correlated subquery
+        (
+            SELECT c.Text
+            FROM Comments c
+            WHERE c.PostId = pd.QuestionId
+            ORDER BY c.CreationDate DESC
+            LIMIT 1
+        ) AS LatestCommentText, -- Correlated subquery for latest comment
+        CASE -- Complicated predicate/expression using dynamic averages from subqueries
+            WHEN pd.QuestionViewCount > (SELECT AVG(ViewCount) * 3 FROM Posts WHERE PostTypeId = (SELECT Id FROM PostTypes WHERE Name = 'Question'))
+                 AND pd.QuestionCommentCount > (SELECT AVG(CommentCount) * 2 FROM Posts WHERE PostTypeId = (SELECT Id FROM PostTypes WHERE Name = 'Question')) THEN 'Very High Activity'
+            WHEN pd.QuestionViewCount > (SELECT AVG(ViewCount) * 1.5 FROM Posts WHERE PostTypeId = (SELECT Id FROM PostTypes WHERE Name = 'Question'))
+                 OR pd.QuestionCommentCount > (SELECT AVG(CommentCount) * 1.5 FROM Posts WHERE PostTypeId = (SELECT Id FROM PostTypes WHERE Name = 'Question')) THEN 'High Activity'
+            ELSE 'Moderate/Low Activity'
+        END AS QuestionActivityLevel,
+        NULLIF(DATE_PART('day', AGE(pd.AcceptedAnswerCreationDate, pd.QuestionCreationDate)), -1) AS TimeToAcceptedAnswerDays, -- NULL logic and date calculation
+        (ARRAY_TO_STRING(pd.TagArray, ', ') LIKE '%sql%' OR ARRAY_TO_STRING(pd.TagArray, ', ') LIKE '%database%') AS IsSQLOrDatabaseRelated

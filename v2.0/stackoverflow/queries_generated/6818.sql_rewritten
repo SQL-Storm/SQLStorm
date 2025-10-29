@@ -1,0 +1,54 @@
+-- {"query": "6818.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-micro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 519} 
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    MAX(u.CreationDate) AS LatestAccountActivity,
+    MAX(p.LastActivityDate) AS LatestPostActivity,
+    b.Class,
+    t.TagName,
+    ph.RevisionGUID,
+    ph.Comment,
+    v.VoteTypeId,
+    v.BountyAmount,
+    c.Text AS CommentText,
+    l.LinkTypeId,
+    l.RelatedPostId
+FROM 
+    Users u
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    (SELECT 
+        PostId, 
+        MAX(CASE WHEN PostHistoryTypeId = 2 THEN RevisionGUID END) AS RevisionGUID,
+        MAX(CASE WHEN PostHistoryTypeId = 10 THEN Comment END) AS Comment
+     FROM 
+        PostHistory
+     GROUP BY 
+        PostId) ph ON p.Id = ph.PostId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+LEFT JOIN 
+    Comments c ON p.Id = c.PostId
+LEFT JOIN 
+    PostLinks l ON p.Id = l.PostId
+LEFT JOIN 
+    Tags t ON p.Tags LIKE '%' || t.TagName || '%'
+WHERE 
+    u.Reputation > 1000
+    AND p.Score > 0
+    AND p.ViewCount > 100
+    AND (v.VoteTypeId = 2 OR v.VoteTypeId = 3)
+    AND p.LastEditDate > p.CreationDate
+GROUP BY 
+    u.DisplayName, u.Reputation, b.Class, t.TagName, ph.RevisionGUID, ph.Comment, v.VoteTypeId, v.BountyAmount, c.Text, l.LinkTypeId, l.RelatedPostId
+HAVING 
+    COUNT(DISTINCT v.Id) > 1
+ORDER BY 
+    u.Reputation DESC, p.LastActivityDate DESC
+LIMIT 100;

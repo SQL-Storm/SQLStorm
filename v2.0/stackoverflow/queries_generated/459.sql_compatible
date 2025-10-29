@@ -1,0 +1,329 @@
+with
+-- Top users by reputation decile with activity metrics
+user_activity as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    coalesce(nullif(trim(split_part(coalesce(u.location, ''), ',', 1)), ''), 'Unknown') as country_guess,
+    sum(case when p.posttypeid = 1 then 1 else 0 end) as question_count,
+    sum(case when p.posttypeid = 2 then 1 else 0 end) as answer_count,
+    sum(coalesce(p.score, 0)) as total_post_score,
+    sum(coalesce(p.viewcount, 0)) filter (where p.posttypeid = 1) as total_question_views,
+    count(distinct c.id) as comment_count,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes_cast,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes_cast,
+    max(u.lastaccessdate) as last_seen
+  from users u
+  left join posts p on p.owneruserid = u.id
+  left join comments c on c.userid = u.id
+  left join votes v on v.userid = u.id
+  group by u.id, u.displayname, u.reputation, u.creationdate, country_guess
+),
+rep_deciles as (
+  select
+    ua.*,
+    ntile(10) over (order by ua.reputation desc nulls last) as rep_decile
+  from user_activity ua
+),
+-- Posts with tag array, classify content richness and null-safe title length
+post_enriched as (
+  select
+    p.id,
+    p.posttypeid,
+    p.owneruserid,
+    p.parentid,
+    p.acceptedanswerid,
+    p.creationdate,
+    p.lastactivitydate,
+    p.score,
+    p.viewcount,
+    p.title,
+    p.tags,
+    string_to_array(substring(p.tags, 2, greatest(length(p.tags)-2, 0)), '><') as taglist,
+    case
+      when p.body is null then 0
+      when length(regexp_replace(p.body, '<[^>]*>', '', 'g')) >= 4000 then 3
+      when length(regexp_replace(p.body, '<[^>]*>', '', 'g')) >= 1000 then 2
+      when length(regexp_replace(p.body, '<[^>]*>', '', 'g')) >= 300 then 1
+      else 0
+    end as content_richness,
+    coalesce(length(nullif(trim(p.title), '')), 0) as title_len
+  from posts p
+),
+-- Answer-Question linkage with duplicate and close metadata
+qa as (
+  select
+    q.id as question_id,
+    q.owneruserid as asker_id,
+    q.creationdate as q_created,
+    q.score as q_score,
+    q.viewcount as q_views,
+    q.acceptedanswerid,
+    q.title as q_title,
+    q.taglist as q_tags,
+    a.id as answer_id,
+    a.owneruserid as answerer_id,
+    a.creationdate as a_created,
+    a.score as a_score,
+    pl_dup.relatedpostid as dup_of_question_id,
+    exists (
+      select 1 from posthistory ph
+      where ph.postid = q.id and ph.posthistorytypeid = 10
+    ) as was_closed
+  from post_enriched q
+  left join post_enriched a on a.parentid = q.id and a.posttypeid = 2
+  left join postlinks pl_dup
+    on pl_dup.postid = q.id and pl_dup.linktypeid = 3
+  where q.posttypeid = 1
+),
+-- First answer per question and acceptance info
+answers_ranked as (
+  select
+    qa.*,
+    row_number() over (partition by qa.question_id order by qa.a_created asc nulls last, qa.a_score desc nulls last, qa.answer_id) as answer_rank,
+    min(qa.a_created) over (partition by qa.question_id) as first_answer_time,
+    count(*) filter (where qa.answer_id is not null) over (partition by qa.question_id) as answer_count_calc
+  from qa
+),
+-- Aggregate per question
+question_agg as (
+  select
+    q.question_id,
+    q.asker_id,
+    min(q.q_created) as q_created,
+    max(q.q_score) as q_score,
+    max(q.q_views) as q_views,
+    max(case when q.was_closed then 1 else 0 end) as was_closed,
+    max(case when q.answer_id = q.acceptedanswerid then 1 else 0 end) as has_accepted,
+    min(q.a_created) as first_answer_created,
+    max(q.acceptedanswerid) as accepted_answer_id,
+    count(q.answer_id) as answer_count,
+    max(q.dup_of_question_id) as dup_of_question_id
+  from answers_ranked q
+  group by q.question_id, q.asker_id
+),
+-- Windowed user metrics over time buckets
+user_time_buckets as (
+  select
+    re.user_id,
+    date_trunc('month', re.creationdate) as month_bucket,
+    count(*) filter (where pe.posttypeid = 1) as questions_in_month,
+    count(*) filter (where pe.posttypeid = 2) as answers_in_month,
+    sum(pe.score) as post_score_in_month
+  from rep_deciles re
+  left join post_enriched pe on pe.owneruserid = re.user_id
+  group by re.user_id, date_trunc('month', re.creationdate)
+),
+user_trends as (
+  select
+    utb.user_id,
+    utb.month_bucket,
+    utb.questions_in_month,
+    utb.answers_in_month,
+    utb.post_score_in_month,
+    sum(utb.post_score_in_month) over (partition by utb.user_id order by utb.month_bucket rows between unbounded preceding and current row) as cum_score,
+    avg(utb.post_score_in_month) over (partition by utb.user_id order by utb.month_bucket rows between 2 preceding and current row) as mov_avg_score3
+  from user_time_buckets utb
+),
+-- Badge summary per user by class with pivot-like aggregates
+badge_summary as (
+  select
+    b.userid,
+    sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+    sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+    sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+    sum(case when b.tagbased = 1 then 1 else 0 end) as tag_badges,
+    count(*) as total_badges,
+    min(b.date) as first_badge_date,
+    max(b.date) as last_badge_date
+  from badges b
+  group by b.userid
+),
+-- Compute per-tag question difficulty proxy (avg score normalized)
+tag_difficulty as (
+  select
+    t.tagname,
+    avg(q.q_score) as avg_q_score,
+    percentile_cont(0.5) within group (order by q.q_score) as med_q_score,
+    count(*) as q_cnt
+  from question_agg qa
+  join post_enriched q on q.id = qa.question_id
+  join lateral unnest(q.taglist) as t(tagname) on true
+  group by t.tagname
+),
+-- Pick top tags by count
+top_tags as (
+  select tagname, q_cnt, avg_q_score, med_q_score,
+         row_number() over (order by q_cnt desc, coalesce(avg_q_score, 0) desc) as rn
+  from tag_difficulty
+),
+-- Users' affinity to top tags via answers
+user_tag_affinity as (
+  select
+    a.owneruserid as user_id,
+    t.tagname,
+    count(*) as answers_in_tag,
+    avg(a.score) as avg_answer_score_in_tag
+  from post_enriched a
+  join post_enriched q on q.id = a.parentid and q.posttypeid = 1
+  join lateral unnest(q.taglist) as t(tagname) on true
+  where a.posttypeid = 2
+    and exists (select 1 from top_tags tt where tt.tagname = t.tagname and tt.rn <= 100)
+  group by a.owneruserid, t.tagname
+),
+-- Combine user core stats, badges, trends, and tag affinities
+user_core as (
+  select
+    re.user_id,
+    re.displayname,
+    re.country_guess,
+    re.reputation,
+    re.rep_decile,
+    re.question_count,
+    re.answer_count,
+    re.total_post_score,
+    re.total_question_views,
+    re.comment_count,
+    re.upvotes_cast,
+    re.downvotes_cast,
+    bs.gold_badges,
+    bs.silver_badges,
+    bs.bronze_badges,
+    bs.tag_badges,
+    bs.total_badges,
+    bs.first_badge_date,
+    bs.last_badge_date,
+    coalesce((select max(cum_score) from user_trends ut where ut.user_id = re.user_id), 0) as lifetime_cum_score
+  from rep_deciles re
+  left join badge_summary bs on bs.userid = re.user_id
+),
+-- Correlated subquery to compute time-to-first-answer per user
+user_q_metrics as (
+  select
+    uc.user_id,
+    count(*) as total_questions,
+    avg(qag.answer_count) as avg_answers_per_q,
+    avg(extract(epoch from (qag.first_answer_created - qag.q_created)) / 3600.0) filter (where qag.first_answer_created is not null) as avg_hours_to_first_answer,
+    sum(case when qag.has_accepted = 1 then 1 else 0 end) as accepted_count,
+    sum(case when qag.was_closed = 1 then 1 else 0 end) as closed_count
+  from user_core uc
+  left join question_agg qag on qag.asker_id = uc.user_id
+  group by uc.user_id
+),
+-- Identify potentially self-answered questions (accepted answer by same user within short time)
+self_answer_signals as (
+  select
+    q.question_id,
+    case when a.owneruserid = q.asker_id then 1 else 0 end as self_answer_flag,
+    extract(epoch from (a.creationdate - q.q_created)) / 3600.0 as hours_to_self_answer
+  from question_agg q
+  join posts a on a.id = q.accepted_answer_id
+),
+-- Final assemble with set operations: active vs dormant users
+active_users as (
+  select user_id from user_core where coalesce(lifetime_cum_score, 0) > 50 or coalesce(answer_count,0) + coalesce(question_count,0) >= 10
+),
+dormant_users as (
+  select user_id from user_core where coalesce(lifetime_cum_score, 0) <= 50 and coalesce(answer_count,0) + coalesce(question_count,0) < 10
+),
+-- Ranking within deciles
+user_ranked as (
+  select
+    uc.*,
+    uq.total_questions,
+    uq.avg_answers_per_q,
+    uq.avg_hours_to_first_answer,
+    uq.accepted_count,
+    uq.closed_count,
+    dense_rank() over (partition by uc.rep_decile order by coalesce(uc.total_post_score,0) desc, coalesce(uc.reputation,0) desc) as rank_in_decile
+  from user_core uc
+  left join user_q_metrics uq on uq.user_id = uc.user_id
+)
+select
+  ur.user_id,
+  ur.displayname,
+  ur.country_guess,
+  ur.rep_decile,
+  ur.rank_in_decile,
+  ur.reputation,
+  ur.question_count,
+  ur.answer_count,
+  ur.total_post_score,
+  ur.total_question_views,
+  ur.comment_count,
+  ur.upvotes_cast,
+  ur.downvotes_cast,
+  coalesce(ur.gold_badges,0) as gold_badges,
+  coalesce(ur.silver_badges,0) as silver_badges,
+  coalesce(ur.bronze_badges,0) as bronze_badges,
+  coalesce(ur.tag_badges,0) as tag_badges,
+  coalesce(ur.total_badges,0) as total_badges,
+  ur.first_badge_date,
+  ur.last_badge_date,
+  ur.lifetime_cum_score,
+  coalesce(ur.total_questions,0) as total_questions,
+  round(coalesce(ur.avg_answers_per_q,0)::double precision, 2) as avg_answers_per_q,
+  round(coalesce(ur.avg_hours_to_first_answer,0)::double precision, 2) as avg_hours_to_first_answer,
+  coalesce(ur.accepted_count,0) as accepted_questions,
+  coalesce(ur.closed_count,0) as closed_questions,
+  case
+    when ur.user_id in (select user_id from active_users) then 'Active'
+    when ur.user_id in (select user_id from dormant_users) then 'Dormant'
+    else 'Moderate'
+  end as activity_segment,
+  coalesce((
+    select string_agg(t.tagname || ':' || least(9999, uta.answers_in_tag)::text || '/' || coalesce(round(uta.avg_answer_score_in_tag::double precision,2)::text,'0'), ' | ' order by uta.answers_in_tag desc, uta.avg_answer_score_in_tag desc, t.tagname)
+    from (
+      select uta.tagname, uta.answers_in_tag, uta.avg_answer_score_in_tag
+      from user_tag_affinity uta
+      where uta.user_id = ur.user_id
+      order by uta.answers_in_tag desc, uta.avg_answer_score_in_tag desc, uta.tagname
+      limit 5
+    ) t
+  ), 'No top-tag activity') as top_tag_affinity_summary,
+  coalesce((
+    select count(*) from posts p
+    where p.owneruserid = ur.user_id
+      and p.posttypeid = 2
+      and p.score >= 2
+      and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+  ), 0) as answers_last_year_ge2score,
+  coalesce((
+    select avg(p.score)
+    from posts p
+    where p.owneruserid = ur.user_id and p.posttypeid = 2
+      and p.parentid in (
+        select question_id from question_agg where was_closed = 0 and coalesce(q_views,0) >= 100
+      )
+  ), 0) as avg_answer_score_on_open_popular_questions,
+  coalesce((
+    select string_agg(
+      cast(qa.question_id as text) || ':' ||
+      case when sas.self_answer_flag = 1 and sas.hours_to_self_answer <= 24 then 'FastSelfAccept'
+           when sas.self_answer_flag = 1 then 'SelfAccept'
+           else 'Other'
+      end
+      , ','
+      ) filter (where sas.self_answer_flag = 1)
+    from question_agg qa
+    left join self_answer_signals sas on sas.question_id = qa.question_id
+    where qa.asker_id = ur.user_id
+  ), '') as self_answer_flags
+from user_ranked ur
+where
+  (
+    coalesce(ur.answer_count,0) >= 5
+    or (coalesce(ur.question_count,0) >= 3 and coalesce(ur.total_post_score,0) >= 10)
+    or (ur.rep_decile <= 2 and coalesce(ur.total_badges,0) >= 1)
+  )
+  and not (
+    coalesce(ur.downvotes_cast,0) > coalesce(ur.upvotes_cast,0) * 2
+    and coalesce(ur.total_post_score,0) < 0
+  )
+order by
+  ur.rep_decile asc,
+  ur.rank_in_decile asc,
+  ur.user_id
+limit 200;

@@ -1,0 +1,110 @@
+-- {"query": "3103.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2118} 
+WITH UserStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS Questions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS Answers,
+        COALESCE(SUM(p.Score), 0) AS TotalScore,
+        COALESCE(AVG(p.Score), 0) AS AvgScore,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(b.Class) AS HighestBadgeClass
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopPosts AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Score,
+        p.CreationDate,
+        p.OwnerUserId,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC NULLS LAST) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+UserVotes AS (
+    SELECT
+        v.UserId,
+        COUNT(*) FILTER (WHERE vt.Name = 'UpMod') AS UpVotesGiven,
+        COUNT(*) FILTER (WHERE vt.Name = 'DownMod') AS DownVotesGiven,
+        COUNT(*) FILTER (WHERE vt.Name = 'Favorite') AS FavoritesGiven
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY v.UserId
+),
+TagStats AS (
+    SELECT
+        t.TagName,
+        COUNT(p.Id) AS QuestionCount,
+        AVG(p.Score) AS AvgQuestionScore,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS ClosedCount
+    FROM Tags t
+    JOIN Posts p ON p.Tags ILIKE '%' || t.TagName || '%'
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+    WHERE p.PostTypeId = 1
+    GROUP BY t.TagName
+),
+RecentComments AS (
+    SELECT
+        c.PostId,
+        STRING_AGG(TRIM(c.Text), '; ') AS CommentsAgg,
+        MAX(c.CreationDate) AS LatestComment
+    FROM Comments c
+    WHERE c.CreationDate > CURRENT_DATE - INTERVAL '30 days'
+    GROUP BY c.PostId
+)
+SELECT
+    us.Id,
+    us.DisplayName,
+    us.Reputation,
+    us.TotalPosts,
+    us.Questions,
+    us.Answers,
+    us.TotalScore,
+    us.AvgScore,
+    us.BadgeCount,
+    us.HighestBadgeClass,
+    uv.UpVotesGiven,
+    uv.DownVotesGiven,
+    uv.FavoritesGiven,
+    tp.Id AS TopQuestionId,
+    tp.Title AS TopQuestionTitle,
+    tp.Score AS TopQuestionScore,
+    rc.CommentsAgg,
+    rc.LatestComment
+FROM UserStats us
+LEFT JOIN UserVotes uv ON uv.UserId = us.Id
+LEFT JOIN TopPosts tp ON tp.OwnerUserId = us.Id AND tp.rn = 1
+LEFT JOIN RecentComments rc ON rc.PostId = tp.Id
+WHERE us.Reputation > 10000
+  AND (us.TotalScore IS NULL OR us.TotalScore <> 0)
+  AND (us.BadgeCount > 0 OR uv.FavoritesGiven > 5)
+ORDER BY us.Reputation DESC, us.TotalScore DESC
+UNION ALL
+SELECT
+    NULL,
+    'Aggregate Summary',
+    NULL,
+    SUM(us.TotalPosts),
+    SUM(us.Questions),
+    SUM(us.Answers),
+    SUM(us.TotalScore),
+    AVG(us.AvgScore),
+    SUM(us.BadgeCount),
+    MAX(us.HighestBadgeClass),
+    SUM(uv.UpVotesGiven),
+    SUM(uv.DownVotesGiven),
+    SUM(uv.FavoritesGiven),
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL
+FROM UserStats us
+LEFT JOIN UserVotes uv ON uv.UserId = us.Id
+WHERE us.Reputation > 5000;

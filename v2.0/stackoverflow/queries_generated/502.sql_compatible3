@@ -1,0 +1,260 @@
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.location,
+        u.creationdate,
+        lead(u.creationdate) over (partition by coalesce(nullif(trim(u.location), ''), 'Unknown') order by u.creationdate) as next_user_in_location,
+        row_number() over (partition by coalesce(nullif(trim(u.location), ''), 'Unknown') order by u.reputation desc, u.id) as rep_rank_in_location
+    from users u
+    where u.creationdate >= (select date_trunc('year', max(creationdate)) from users)
+),
+question_activity as (
+    select
+        p.id as question_id,
+        p.owneruserid as owner_user_id,
+        p.creationdate as question_date,
+        p.score as question_score,
+        p.viewcount,
+        p.title,
+        p.tags,
+        array_length(string_to_array(substring(p.tags, 2, greatest(length(p.tags)-2, 0)), '><'), 1) as tag_count,
+        coalesce(p.answercount, 0) as answer_count,
+        exists (
+            select 1
+            from posthistory ph
+            where ph.postid = p.id
+              and ph.posthistorytypeid = 10
+              and (ph.comment in ('101','102','103','104','105') or ph.comment in ('1','2','3','4','7','10','20'))
+        ) as was_closed,
+        count(c.id) filter (where c.creationdate >= p.creationdate and c.creationdate < p.creationdate + interval '7 days') as comments_first_week,
+        sum(v2.vote_weight) as vote_score_extended
+    from posts p
+    left join comments c on c.postid = p.id
+    left join lateral (
+        select
+            case v.votetypeid
+                when 2 then 1
+                when 3 then -1
+                when 5 then 0
+                when 8 then coalesce(nullif(v.bountyamount,0), 0) / 100.0
+                when 9 then coalesce(nullif(v.bountyamount,0), 0) / 100.0
+                when 12 then -2
+                else 0
+            end as vote_weight
+        from votes v
+        where v.postid = p.id
+    ) v2 on true
+    where p.posttypeid = 1
+      and p.creationdate >= (select date_trunc('year', max(creationdate)) from posts)
+    group by p.id, p.owneruserid, p.creationdate, p.score, p.viewcount, p.title, p.tags, p.answercount
+),
+answer_stats as (
+    select
+        q.id as question_id,
+        min(a.creationdate) as first_answer_date,
+        count(*) as total_answers,
+        count(*) filter (where a.score > 0) as positive_answers,
+        avg(cast(a.score as numeric)) as avg_answer_score,
+        max(a.score) as max_answer_score,
+        count(distinct a.owneruserid) as distinct_answerers
+    from posts q
+    left join posts a
+        on a.parentid = q.id
+       and a.posttypeid = 2
+    where q.posttypeid = 1
+      and q.creationdate >= (select date_trunc('year', max(creationdate)) from posts)
+    group by q.id
+),
+recent_badges as (
+    select
+        b.userid,
+        count(*) filter (where b.class = 1) as gold_badges,
+        count(*) filter (where b.class = 2) as silver_badges,
+        count(*) filter (where b.class = 3) as bronze_badges,
+        count(*) filter (where cast(b.tagbased as integer) = 1) as tag_badges,
+        max(b.date) as last_badge_date
+    from badges b
+    group by b.userid
+),
+duplicate_map as (
+    select
+        pl.postid as dup_post_id,
+        pl.relatedpostid as original_post_id,
+        min(pl.creationdate) as first_mark_date
+    from postlinks pl
+    where pl.linktypeid = 3
+    group by pl.postid, pl.relatedpostid
+),
+tag_expansion as (
+    select
+        qa.question_id,
+        unnest(string_to_array(substring(qa.tags, 2, greatest(length(qa.tags)-2, 0)), '><')) as tag
+    from question_activity qa
+    join posts q on q.id = qa.question_id
+),
+tag_popularity as (
+    select
+        te.tag,
+        count(*) as tag_usage_recent,
+        sum(qa.viewcount) as tag_views_recent
+    from tag_expansion te
+    join question_activity qa on qa.question_id = te.question_id
+    group by te.tag
+),
+user_engagement as (
+    select
+        u.id as user_id,
+        coalesce(sum(case when p.posttypeid = 1 then 1 else 0 end), 0) as questions_asked,
+        coalesce(sum(case when p.posttypeid = 2 then 1 else 0 end), 0) as answers_posted,
+        coalesce(sum(v2.upvotes),0) as upvotes_cast,
+        coalesce(sum(v2.downvotes),0) as downvotes_cast,
+        coalesce(sum(v2.favorites),0) as favorites_cast,
+        coalesce(sum(case when p.posttypeid = 1 then p.viewcount else 0 end),0) as total_views_on_questions
+    from users u
+    left join posts p on p.owneruserid = u.id
+    left join lateral (
+        select
+            count(*) filter (where v.votetypeid = 2) as upvotes,
+            count(*) filter (where v.votetypeid = 3) as downvotes,
+            count(*) filter (where v.votetypeid = 5) as favorites
+        from votes v
+        where v.userid = u.id
+    ) v2 on true
+    group by u.id
+),
+quality_scoring as (
+    select
+        qa.question_id,
+        qa.owner_user_id,
+        qa.question_date,
+        qa.question_score,
+        qa.viewcount,
+        qa.tag_count,
+        qa.answer_count,
+        qa.comments_first_week,
+        qa.vote_score_extended,
+        ans.first_answer_date,
+        ans.total_answers,
+        ans.positive_answers,
+        ans.avg_answer_score,
+        ans.max_answer_score,
+        case
+            when ans.first_answer_date is null then null
+            else extract(epoch from (ans.first_answer_date - qa.question_date))/3600.0
+        end as hours_to_first_answer,
+        case when qa.was_closed then 1 else 0 end as was_closed_int,
+        case when dm.original_post_id is not null then 1 else 0 end as is_marked_duplicate,
+        coalesce(tp.tag_usage_recent, 0) as tag_popularity_recent,
+        coalesce(tp.tag_views_recent, 0) as tag_views_recent
+    from question_activity qa
+    left join answer_stats ans on ans.question_id = qa.question_id
+    left join duplicate_map dm on dm.dup_post_id = qa.question_id
+    left join lateral (
+        select
+            cast(avg(tp.tag_usage_recent) as integer) as tag_usage_recent,
+            cast(avg(tp.tag_views_recent) as bigint) as tag_views_recent
+        from tag_expansion te
+        join tag_popularity tp on tp.tag = te.tag
+        where te.question_id = qa.question_id
+    ) tp on true
+),
+owner_rollup as (
+    select
+        qs.owner_user_id,
+        count(*) as questions_recent,
+        avg(cast(qs.question_score as numeric)) as avg_q_score_recent,
+        avg(coalesce(qs.hours_to_first_answer, 48.0)) as avg_hours_to_first_answer_recent,
+        sum(qs.was_closed_int) as closed_count_recent,
+        sum(qs.is_marked_duplicate) as duplicate_count_recent
+    from quality_scoring qs
+    group by qs.owner_user_id
+),
+post_edit_churn as (
+    select
+        p.id as post_id,
+        count(*) filter (where ph.posthistorytypeid in (4,5,6,7,8,9)) as edit_events,
+        min(ph.creationdate) filter (where ph.posthistorytypeid in (4,5,6)) as first_edit_date,
+        max(ph.creationdate) filter (where ph.posthistorytypeid in (4,5,6)) as last_edit_date
+    from posts p
+    left join posthistory ph on ph.postid = p.id
+    where p.posttypeid = 1
+      and p.creationdate >= (select date_trunc('year', max(creationdate)) from posts)
+    group by p.id
+),
+final as (
+    select
+        qs.question_id,
+        qs.owner_user_id,
+        coalesce(u.displayname, p.ownerdisplayname, '(anonymous)') as owner_name,
+        u.location,
+        ru.rep_rank_in_location,
+        u.reputation,
+        coalesce(ue.questions_asked,0) as owner_questions_total,
+        coalesce(ue.answers_posted,0) as owner_answers_total,
+        coalesce(rb.gold_badges,0) as gold_badges,
+        coalesce(rb.silver_badges,0) as silver_badges,
+        coalesce(rb.bronze_badges,0) as bronze_badges,
+        qs.question_date,
+        qs.question_score,
+        qs.viewcount,
+        qs.tag_count,
+        qs.answer_count,
+        qs.comments_first_week,
+        qs.vote_score_extended,
+        qs.first_answer_date,
+        qs.total_answers,
+        qs.positive_answers,
+        qs.avg_answer_score,
+        qs.max_answer_score,
+        qs.hours_to_first_answer,
+        qs.was_closed_int,
+        qs.is_marked_duplicate,
+        qs.tag_popularity_recent,
+        qs.tag_views_recent,
+        pe.edit_events,
+        case
+            when pe.first_edit_date is null then null
+            else extract(epoch from (coalesce(pe.last_edit_date, qs.question_date) - qs.question_date))/3600.0
+        end as hours_until_last_edit,
+        oru.questions_recent as owner_questions_recent,
+        oru.avg_q_score_recent,
+        oru.avg_hours_to_first_answer_recent,
+        oru.closed_count_recent as owner_closed_recent,
+        oru.duplicate_count_recent as owner_dupe_recent,
+        rank() over (order by qs.viewcount desc nulls last, qs.question_score desc, qs.answer_count desc, qs.vote_score_extended desc) as popularity_rank,
+        dense_rank() over (partition by coalesce(nullif(trim(u.location), ''), 'Unknown') order by qs.question_score desc nulls last) as score_rank_in_location,
+        coalesce(nullif(trim(p.title), ''), '[no title]') as normalized_title,
+        left(coalesce(p.title, ''), 60) || case when length(coalesce(p.title, '')) > 60 then '...' else '' end as title_preview,
+        case
+            when qs.was_closed_int = 1 and qs.is_marked_duplicate = 1 then 'Closed:Duplicate'
+            when qs.was_closed_int = 1 then 'Closed:Other'
+            when qs.is_marked_duplicate = 1 then 'DuplicateOnly'
+            else 'Open'
+        end as closure_bucket
+    from quality_scoring qs
+    join posts p on p.id = qs.question_id
+    left join users u on u.id = qs.owner_user_id
+    left join recent_users ru on ru.user_id = qs.owner_user_id
+    left join user_engagement ue on ue.user_id = qs.owner_user_id
+    left join recent_badges rb on rb.userid = qs.owner_user_id
+    left join owner_rollup oru on oru.owner_user_id = qs.owner_user_id
+    left join post_edit_churn pe on pe.post_id = qs.question_id
+)
+select *
+from final
+where
+    (
+        (was_closed_int = 1 and coalesce(tag_count, 0) >= 1)
+        or (is_marked_duplicate = 1 and coalesce(viewcount, 0) > 0)
+        or (avg_answer_score is null and coalesce(answer_count, 0) = 0)
+    )
+    and (
+        reputation >= coalesce((select percentile_disc(0.5) within group (order by reputation) from users), 0)
+        or rep_rank_in_location <= 10
+        or location is null
+    )
+    and not (position(lower('python') in lower(coalesce(tags, '')) ) > 0)
+order by popularity_rank, question_date desc
+limit 500;

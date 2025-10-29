@@ -1,0 +1,324 @@
+-- {"query": "110.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3266} 
+with recent_users as (
+  select u.id as user_id,
+         u.displayname,
+         u.reputation,
+         u.creationdate,
+         coalesce(nullif(trim(u.location), ''), 'Unknown') as location_norm,
+         date_trunc('month', u.creationdate) as signup_month
+  from users u
+  where u.creationdate >= now() - interval '3 years'
+),
+q_posts as (
+  select p.id as post_id,
+         p.owneruserid as user_id,
+         p.creationdate,
+         p.score,
+         p.viewcount,
+         p.answercount,
+         p.title,
+         p.tags,
+         p.closeddate,
+         p.acceptedanswerid
+  from posts p
+  where p.posttypeid = 1
+),
+a_posts as (
+  select p.id as post_id,
+         p.parentid as question_id,
+         p.owneruserid as user_id,
+         p.creationdate,
+         p.score
+  from posts p
+  where p.posttypeid = 2
+),
+user_activity as (
+  select ru.user_id,
+         ru.displayname,
+         ru.reputation,
+         ru.location_norm,
+         ru.signup_month,
+         count(distinct qp.post_id) as questions_asked,
+         count(distinct ap.post_id) as answers_posted,
+         sum(coalesce(qp.viewcount, 0)) as question_views,
+         sum(case when qp.closeddate is not null then 1 else 0 end) as questions_closed,
+         sum(coalesce(qp.score, 0)) as question_score,
+         sum(coalesce(ap.score, 0)) as answer_score,
+         sum(case when qp.acceptedanswerid is not null then 1 else 0 end) as questions_with_accept,
+         count(distinct case when ap.score > 0 then ap.post_id end) as positive_answers
+  from recent_users ru
+  left join q_posts qp on qp.owneruserid = ru.user_id
+  left join a_posts ap on ap.user_id = ru.user_id
+  group by ru.user_id, ru.displayname, ru.reputation, ru.location_norm, ru.signup_month
+),
+votes_agg as (
+  select v.postid,
+         sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+         sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+         sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started,
+         sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded
+  from votes v
+  where v.creationdate >= now() - interval '3 years'
+  group by v.postid
+),
+comments_agg as (
+  select c.postid,
+         count(*) as comments_count,
+         max(c.creationdate) as last_comment_date
+  from comments c
+  where c.creationdate >= now() - interval '3 years'
+  group by c.postid
+),
+post_links_dupes as (
+  select pl.postid,
+         count(*) filter (where pl.linktypeid = 3) as duplicate_links,
+         count(*) filter (where pl.linktypeid = 1) as linked_links
+  from postlinks pl
+  where pl.creationdate >= now() - interval '3 years'
+  group by pl.postid
+),
+tag_expansion as (
+  select qp.post_id,
+         unnest(string_to_array(substring(qp.tags, 2, greatest(length(qp.tags)-2,0)), '><')) as tag
+  from q_posts qp
+  where qp.tags is not null and qp.tags like '<%>%'
+),
+top_tags as (
+  select te.tag,
+         count(*) as tag_count
+  from tag_expansion te
+  group by te.tag
+),
+user_tag_mix as (
+  select qp.owneruserid as user_id,
+         count(*) as tagged_questions,
+         count(distinct te.tag) as distinct_tags,
+         max(tt.tag_count) as max_tag_popularity,
+         sum(case when tt.tag_count >= 1000 then 1 else 0 end) as questions_with_popular_tags
+  from q_posts qp
+  join tag_expansion te on te.post_id = qp.post_id
+  left join top_tags tt on tt.tag = te.tag
+  group by qp.owneruserid
+),
+post_engagement as (
+  select p.id as post_id,
+         p.posttypeid,
+         p.owneruserid as user_id,
+         coalesce(va.upvotes, 0) as upvotes,
+         coalesce(va.downvotes, 0) as downvotes,
+         coalesce(va.bounty_started, 0) as bounty_started,
+         coalesce(va.bounty_awarded, 0) as bounty_awarded,
+         coalesce(ca.comments_count, 0) as comments_count,
+         ca.last_comment_date,
+         coalesce(pld.duplicate_links, 0) as duplicate_links,
+         coalesce(pld.linked_links, 0) as linked_links
+  from posts p
+  left join votes_agg va on va.postid = p.id
+  left join comments_agg ca on ca.postid = p.id
+  left join post_links_dupes pld on pld.postid = p.id
+  where p.creationdate >= now() - interval '3 years'
+),
+answer_accepts as (
+  select a.user_id,
+         count(*) as answers_accepted
+  from a_posts a
+  join q_posts q on q.acceptedanswerid = a.post_id
+  group by a.user_id
+),
+close_reasons as (
+  select ph.postid,
+         max(crt.name) filter (where ph.posthistorytypeid = 10 and crt.id::text = ph.comment) as close_reason_name,
+         count(*) filter (where ph.posthistorytypeid = 10) as close_events
+  from posthistory ph
+  left join closereasontypes crt
+    on ph.posthistorytypeid = 10 and crt.id::text = ph.comment
+  where ph.creationdate >= now() - interval '3 years'
+  group by ph.postid
+),
+user_post_eng as (
+  select pe.user_id,
+         count(*) as posts_total,
+         sum(case when pe.posttypeid = 1 then 1 else 0 end) as questions_total,
+         sum(case when pe.posttypeid = 2 then 1 else 0 end) as answers_total,
+         sum(pe.upvotes) as upvotes_total,
+         sum(pe.downvotes) as downvotes_total,
+         sum(pe.bounty_started) as bounty_started_total,
+         sum(pe.bounty_awarded) as bounty_awarded_total,
+         sum(pe.comments_count) as comments_total,
+         sum(pe.duplicate_links) as duplicate_links_total,
+         sum(pe.linked_links) as linked_links_total,
+         max(pe.last_comment_date) as last_comment_date_max
+  from post_engagement pe
+  group by pe.user_id
+),
+user_badges as (
+  select b.userid as user_id,
+         count(*) as badges_total,
+         count(*) filter (where b.class = 1) as gold_badges,
+         count(*) filter (where b.class = 2) as silver_badges,
+         count(*) filter (where b.class = 3) as bronze_badges,
+         count(*) filter (where b.tagbased = 1) as tag_badges
+  from badges b
+  where b.date >= now() - interval '3 years'
+  group by b.userid
+),
+quality_scores as (
+  select ua.user_id,
+         case
+           when ua.answers_posted + ua.questions_asked = 0 then null
+           else round(
+             (
+              0.4 * nullif(ua.question_score,0)::numeric +
+              0.6 * nullif(ua.answer_score,0)::numeric +
+              0.2 * coalesce(ape.upvotes_total - ape.downvotes_total,0)::numeric +
+              0.1 * coalesce(ua.questions_with_accept,0)::numeric +
+              0.05 * coalesce(aacc.answers_accepted,0)::numeric
+             )
+             / greatest(1, ua.answers_posted + ua.questions_asked)
+           , 4)
+         end as content_quality_score
+  from user_activity ua
+  left join user_post_eng ape on ape.user_id = ua.user_id
+  left join answer_accepts aacc on aacc.user_id = ua.user_id
+),
+ranked_users as (
+  select ua.*,
+         coalesce(ut.tagged_questions, 0) as tagged_questions,
+         coalesce(ut.distinct_tags, 0) as distinct_tags,
+         coalesce(ut.max_tag_popularity, 0) as max_tag_popularity,
+         coalesce(ut.questions_with_popular_tags, 0) as questions_with_popular_tags,
+         coalesce(upe.posts_total, 0) as posts_total,
+         coalesce(upe.upvotes_total, 0) as upvotes_total,
+         coalesce(upe.downvotes_total, 0) as downvotes_total,
+         coalesce(upe.comments_total, 0) as comments_total,
+         coalesce(upe.duplicate_links_total, 0) as duplicate_links_total,
+         coalesce(upe.linked_links_total, 0) as linked_links_total,
+         upe.last_comment_date_max,
+         coalesce(ub.badges_total, 0) as badges_total,
+         coalesce(ub.gold_badges, 0) as gold_badges,
+         coalesce(ub.silver_badges, 0) as silver_badges,
+         coalesce(ub.bronze_badges, 0) as bronze_badges,
+         coalesce(ub.tag_badges, 0) as tag_badges,
+         qs.content_quality_score,
+         row_number() over (
+           partition by ua.location_norm
+           order by coalesce(qs.content_quality_score, -1) desc, ua.reputation desc, ua.user_id
+         ) as loc_rank,
+         dense_rank() over (
+           order by coalesce(qs.content_quality_score, -1) desc
+         ) as global_quality_rank,
+         percent_rank() over (
+           order by coalesce(qs.content_quality_score, -1) desc
+         ) as quality_percentile,
+         ntile(10) over (
+           order by coalesce(qs.content_quality_score, -1) desc
+         ) as quality_decile
+  from user_activity ua
+  left join user_tag_mix ut on ut.user_id = ua.user_id
+  left join user_post_eng upe on upe.user_id = ua.user_id
+  left join user_badges ub on ub.user_id = ua.user_id
+  left join quality_scores qs on qs.user_id = ua.user_id
+),
+anomalies as (
+  select ru.user_id,
+         case
+           when ru.posts_total = 0 and (ru.upvotes_total > 0 or ru.downvotes_total > 0) then 'VotesWithoutPosts'
+           when ru.questions_closed > 0 and coalesce(crt.close_events,0) = 0 then 'ClosedNoHistory'
+           when ru.answers_posted > 0 and coalesce(aacc.answers_accepted,0) = 0 then 'NoAcceptedAnswers'
+           else null
+         end as anomaly_type
+  from ranked_users ru
+  left join (
+    select ph2.postid, count(*) as close_events
+    from posthistory ph2
+    where ph2.posthistorytypeid = 10
+      and ph2.creationdate >= now() - interval '3 years'
+    group by ph2.postid
+  ) crt on crt.postid in (
+    select qp.post_id from q_posts qp where qp.owneruserid = ru.user_id
+  )
+  left join answer_accepts aacc on aacc.user_id = ru.user_id
+),
+user_anomaly_counts as (
+  select user_id,
+         count(*) filter (where anomaly_type is not null) as anomaly_count
+  from anomalies
+  group by user_id
+),
+final_scored as (
+  select ru.*,
+         coalesce(uac.anomaly_count, 0) as anomaly_count,
+         -- composite benchmark score mixes quality, engagement, and novelty signals
+         round((
+           coalesce(ru.content_quality_score, 0) * 0.6
+           + ln(greatest(1, ru.posts_total)) * 0.2
+           + ln(greatest(1, ru.distinct_tags + ru.badges_total)) * 0.1
+           + (ru.upvotes_total - ru.downvotes_total) * 0.05
+           - ru.anomaly_count * 0.25
+         )::numeric, 5) as benchmark_score
+  from ranked_users ru
+  left join user_anomaly_counts uac on uac.user_id = ru.user_id
+)
+select
+  fs.user_id,
+  fs.displayname,
+  fs.location_norm as location,
+  fs.reputation,
+  fs.signup_month,
+  fs.questions_asked,
+  fs.answers_posted,
+  fs.posts_total,
+  fs.upvotes_total,
+  fs.downvotes_total,
+  fs.comments_total,
+  fs.tagged_questions,
+  fs.distinct_tags,
+  fs.badges_total,
+  fs.gold_badges,
+  fs.silver_badges,
+  fs.bronze_badges,
+  fs.tag_badges,
+  fs.questions_closed,
+  fs.questions_with_accept,
+  fs.content_quality_score,
+  fs.global_quality_rank,
+  fs.quality_percentile,
+  fs.quality_decile,
+  fs.loc_rank,
+  fs.anomaly_count,
+  fs.benchmark_score,
+  case
+    when fs.benchmark_score is null then 'Unknown'
+    when fs.benchmark_score >= percentile_disc(0.9) within group (order by fs.benchmark_score) over ()
+      then 'Top10%'
+    when fs.benchmark_score >= percentile_disc(0.75) within group (order by fs.benchmark_score) over ()
+      then 'Top25%'
+    when fs.benchmark_score >= percentile_disc(0.5) within group (order by fs.benchmark_score) over ()
+      then 'Top50%'
+    else 'Bottom50%'
+  end as performance_band,
+  -- include a correlated subquery for most-used tag name
+  (
+    select te2.tag
+    from tag_expansion te2
+    join q_posts qp2 on qp2.post_id = te2.post_id
+    where qp2.owneruserid = fs.user_id
+    group by te2.tag
+    order by count(*) desc, te2.tag
+    limit 1
+  ) as top_tag,
+  -- include close reason distribution as concatenated string
+  (
+    select string_agg(distinct coalesce(cr.close_reason_name, 'Unknown'), ', ' order by coalesce(cr.close_reason_name, 'Unknown'))
+    from close_reasons cr
+    where cr.postid in (select post_id from q_posts qp3 where qp3.owneruserid = fs.user_id)
+  ) as close_reasons_seen
+from final_scored fs
+where coalesce(fs.content_quality_score, 0) >= (
+  select avg(coalesce(content_quality_score,0)) from final_scored
+)
+or fs.badges_total >= (
+  select percentile_disc(0.95) within group (order by badges_total) from final_scored
+)
+order by fs.benchmark_score desc nulls last, fs.global_quality_rank, fs.user_id
+limit 500;

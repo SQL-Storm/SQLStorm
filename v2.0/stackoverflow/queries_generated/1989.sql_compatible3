@@ -1,0 +1,227 @@
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        COALESCE(SUM(P.Score), 0) AS TotalPostScore,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        MAX(P.CreationDate) AS LatestPostDate,
+        MAX(C.CreationDate) AS LatestCommentDate,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate
+),
+PostQualityHistory AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.CreationDate AS PostCreationDate,
+        P.LastEditDate,
+        P.ClosedDate,
+        P.Tags,
+        P.AcceptedAnswerId,
+        (SELECT COUNT(PH_sub.Id) FROM PostHistory PH_sub WHERE PH_sub.PostId = P.Id AND PH_sub.PostHistoryTypeId IN (5, 6, 4)) AS TotalEditCount,
+        (SELECT PH_closer.UserId FROM PostHistory PH_closer WHERE PH_closer.PostId = P.Id AND PH_closer.PostHistoryTypeId = 10 ORDER BY PH_closer.CreationDate DESC LIMIT 1) AS LastCloserId,
+        (SELECT CR.Name FROM PostHistory PH_close_reason LEFT JOIN CloseReasonTypes CR ON CR.Id = CAST(PH_close_reason.Comment AS SMALLINT) WHERE PH_close_reason.PostId = P.Id AND PH_close_reason.PostHistoryTypeId = 10 ORDER BY PH_close_reason.CreationDate DESC LIMIT 1) AS LastCloseReason,
+        LAG(P.LastEditDate, 1, P.CreationDate) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate) AS PreviousPostActivityDate,
+        RANK() OVER (PARTITION BY P.OwnerUserId, P.PostTypeId ORDER BY P.Score DESC, P.ViewCount DESC) AS RankByUserPostTypeScoreViews
+    FROM Posts P
+    WHERE P.OwnerUserId IS NOT NULL
+),
+TagPerformance AS (
+    SELECT
+        Tag.TagName,
+        COUNT(DISTINCT PQH.PostId) AS PostsWithTag,
+        AVG(PQH.PostScore) AS AvgTagPostScore,
+        SUM(PQH.ViewCount) AS TotalTagViews
+    FROM PostQualityHistory PQH
+    JOIN Tags Tag ON EXISTS (
+        SELECT 1
+        FROM (
+            SELECT TRIM(tagname) AS TagName_unnested
+            FROM (
+                SELECT regexp_split_to_table(
+                    CASE
+                        WHEN left(PQH.Tags,1) = '<' AND right(PQH.Tags,1) = '>' THEN substring(PQH.Tags FROM 2 FOR char_length(PQH.Tags)-2)
+                        ELSE PQH.Tags
+                    END,
+                    '><'
+                ) AS tagname
+            ) s
+        ) t
+        WHERE lower(t.TagName_unnested) = lower(Tag.TagName)
+    )
+    WHERE PQH.Tags IS NOT NULL AND PQH.Tags <> ''
+    GROUP BY Tag.TagName
+    HAVING COUNT(DISTINCT PQH.PostId) >= 50 AND SUM(PQH.ViewCount) > 10000
+),
+HighValueContributions AS (
+    SELECT
+        P.OwnerUserId AS UserId,
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.Score AS ContributionScore,
+        P.CreationDate AS ContributionDate,
+        'TopQuestion' AS ContributionType
+    FROM Posts P
+    WHERE P.PostTypeId = 1 AND P.Score >= 100 AND P.ViewCount >= 5000
+    UNION ALL
+    SELECT
+        P.OwnerUserId AS UserId,
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.Score AS ContributionScore,
+        P.CreationDate AS ContributionDate,
+        'TopAnswer' AS ContributionType
+    FROM Posts P
+    WHERE P.PostTypeId = 2 AND P.Score >= 75 AND P.ParentId IS NOT NULL
+),
+HighlyEngagedUsers AS (
+    SELECT
+        C.UserId
+    FROM Comments C
+    WHERE C.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '3 months') AND C.Score >= 1
+    GROUP BY C.UserId
+    HAVING COUNT(C.Id) >= 10
+    EXCEPT
+    SELECT
+        C_owner.UserId
+    FROM Comments C_owner
+    JOIN Posts P_owner ON C_owner.PostId = P_owner.Id
+    WHERE C_owner.UserId = P_owner.OwnerUserId
+    GROUP BY C_owner.UserId
+    HAVING COUNT(C_owner.Id) = COUNT(DISTINCT C_owner.PostId)
+),
+TopTagPerUser AS (
+    SELECT
+        OwnerUserId,
+        TagName,
+        AvgTagPostScore,
+        TotalTagViews
+    FROM (
+        SELECT
+            PQH.OwnerUserId,
+            lower(t.TagName_unnested) AS TagName,
+            AVG(PQH.PostScore) OVER (PARTITION BY PQH.OwnerUserId, lower(t.TagName_unnested)) AS AvgTagPostScore,
+            SUM(PQH.ViewCount) OVER (PARTITION BY PQH.OwnerUserId, lower(t.TagName_unnested)) AS TotalTagViews,
+            ROW_NUMBER() OVER (
+                PARTITION BY PQH.OwnerUserId
+                ORDER BY AVG(PQH.PostScore) OVER (PARTITION BY PQH.OwnerUserId, lower(t.TagName_unnested)) DESC,
+                         SUM(PQH.ViewCount) OVER (PARTITION BY PQH.OwnerUserId, lower(t.TagName_unnested)) DESC
+            ) AS rn
+        FROM PostQualityHistory PQH,
+             LATERAL (
+               SELECT regexp_split_to_table(
+                 CASE
+                   WHEN left(PQH.Tags,1) = '<' AND right(PQH.Tags,1) = '>' THEN substring(PQH.Tags FROM 2 FOR char_length(PQH.Tags)-2)
+                   ELSE PQH.Tags
+                 END,
+                 '><'
+               ) AS TagName_unnested
+             ) t
+        WHERE PQH.Tags IS NOT NULL AND PQH.Tags <> ''
+    ) sub
+    WHERE sub.rn = 1
+),
+RecentHighQualityPosts AS (
+    SELECT
+        PQH_recent.OwnerUserId,
+        AVG(PQH_recent.PostScore) AS AvgRecentScore
+    FROM PostQualityHistory PQH_recent
+    WHERE PQH_recent.PostCreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6 months')
+      AND PQH_recent.PostScore >= 5
+    GROUP BY PQH_recent.OwnerUserId
+    HAVING COUNT(PQH_recent.PostId) >= 3
+),
+HighValueContributionSummary AS (
+    SELECT
+        hvc.UserId,
+        MAX(hvc.ContributionScore) AS MaxContributionScore,
+        (
+            SELECT hvc2.ContributionType
+            FROM HighValueContributions hvc2
+            WHERE hvc2.UserId = hvc.UserId
+            ORDER BY hvc2.ContributionScore DESC, hvc2.ContributionDate DESC
+            LIMIT 1
+        ) AS ContributionType
+    FROM HighValueContributions hvc
+    GROUP BY hvc.UserId
+)
+SELECT
+    UE.UserId,
+    UE.DisplayName,
+    UE.Reputation,
+    UE.TotalPosts,
+    UE.QuestionCount,
+    UE.AnswerCount,
+    UE.TotalBadges,
+    UE.TotalPostScore,
+    UE.TotalCommentsMade,
+    UE.LatestPostDate,
+    UE.LatestCommentDate,
+    TP.TagName AS TopPerformingTag,
+    TP.AvgTagPostScore,
+    TP.TotalTagViews,
+    RecentHighQualityPosts.AvgRecentScore,
+    COALESCE(HighValueContributionSummary.MaxContributionScore, 0) AS MaxHighValueContributionScore,
+    HighValueContributionSummary.ContributionType AS MaxContributionType,
+    (EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - UE.UserCreationDate)) / 86400.0) / 365.25 AS YearsOnPlatform,
+    COALESCE(PQH_MaxQ.PostScore, 0) AS MaxQuestionScore,
+    COALESCE(PQH_MaxA.PostScore, 0) AS MaxAnswerScore,
+    ROW_NUMBER() OVER (
+        ORDER BY
+            UE.Reputation DESC,
+            UE.TotalPostScore DESC,
+            RecentHighQualityPosts.AvgRecentScore DESC,
+            HighValueContributionSummary.MaxContributionScore DESC,
+            UE.LastAccessDate DESC
+    ) AS GlobalUserRank,
+    (SELECT AVG(Score) FROM Comments C_sub WHERE C_sub.UserId = UE.UserId AND C_sub.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 month')) AS AvgRecentCommentScoreByOwner,
+    EXISTS (SELECT 1 FROM Posts P_inner WHERE P_inner.OwnerUserId = UE.UserId AND P_inner.ClosedDate IS NOT NULL AND P_inner.ClosedDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6 months')) AS HasRecentClosedPost,
+    CASE
+        WHEN UE.Reputation >= 10000 AND UE.TotalBadges >= 50 AND UE.QuestionCount >= 20 AND HighValueContributionSummary.ContributionType IS NOT NULL THEN 'High Impact User (Verified)'
+        WHEN UE.Reputation >= 5000 AND UE.TotalBadges >= 20 AND RecentHighQualityPosts.AvgRecentScore IS NOT NULL THEN 'Mid Tier Contributor (Active)'
+        WHEN HEU.UserId IS NOT NULL AND UE.TotalPosts = 0 THEN 'Highly Engaged Commenter Only'
+        WHEN HEU.UserId IS NOT NULL THEN 'Highly Engaged Commenter & Poster'
+        ELSE 'General Contributor'
+    END AS UserEngagementCategory,
+    (SELECT P_link.Title
+     FROM Posts P_link
+     JOIN PostLinks PL ON P_link.Id = PL.PostId
+     WHERE P_link.OwnerUserId = UE.UserId AND P_link.PostTypeId = 1 AND PL.LinkTypeId = 1
+     ORDER BY P_link.Score DESC
+     LIMIT 1
+    ) AS TopLinkedQuestionTitle
+FROM UserEngagement UE
+LEFT JOIN TopTagPerUser TP ON UE.UserId = TP.OwnerUserId
+LEFT JOIN RecentHighQualityPosts ON UE.UserId = RecentHighQualityPosts.OwnerUserId
+LEFT JOIN HighValueContributionSummary ON UE.UserId = HighValueContributionSummary.UserId
+LEFT JOIN HighlyEngagedUsers HEU ON UE.UserId = HEU.UserId
+LEFT JOIN PostQualityHistory PQH_MaxQ ON UE.UserId = PQH_MaxQ.OwnerUserId AND PQH_MaxQ.PostTypeId = 1 AND PQH_MaxQ.RankByUserPostTypeScoreViews = 1
+LEFT JOIN PostQualityHistory PQH_MaxA ON UE.UserId = PQH_MaxA.OwnerUserId AND PQH_MaxA.PostTypeId = 2 AND PQH_MaxA.RankByUserPostTypeScoreViews = 1
+WHERE
+    UE.Reputation >= 500
+    AND UE.TotalPosts > 0
+    AND (
+        (UE.LatestPostDate IS NOT NULL AND UE.LatestPostDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'))
+        OR
+        (UE.LatestCommentDate IS NOT NULL AND UE.LatestCommentDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6 months'))
+        OR
+        HEU.UserId IS NOT NULL
+    )
+    AND UE.DisplayName IS NOT NULL AND LENGTH(TRIM(UE.DisplayName)) > 0
+    AND UE.UserCreationDate < (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '3 months')
+ORDER BY GlobalUserRank ASC, UE.LastAccessDate DESC
+LIMIT 50;

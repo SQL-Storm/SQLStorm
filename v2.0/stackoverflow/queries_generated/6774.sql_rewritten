@@ -1,0 +1,47 @@
+-- {"query": "6774.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-micro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 447} 
+SELECT 
+    u.DisplayName,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    SUM(CASE WHEN p.ViewCount > 1000 THEN 1 ELSE 0 END) AS PopularPosts,
+    COUNT(DISTINCT v.PostId) AS TotalVotes,
+    COUNT(DISTINCT CASE WHEN b.TagBased = 0 THEN b.Id ELSE NULL END) AS NamedBadges,
+    COUNT(DISTINCT CASE WHEN b.TagBased = 1 THEN b.Id ELSE NULL END) AS TagBadges,
+    MAX(u.Reputation) AS MaxReputation,
+    AVG(u.Views) AS AvgViews,
+    MIN(p.LastActivityDate) AS FirstActivityDate,
+    (
+        SELECT COUNT(*) 
+        FROM PostLinks pl 
+        WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3
+    ) AS DuplicateCount,
+    (
+        SELECT STRING_AGG(DISTINCT t.TagName, ', ')
+        FROM Tags t
+        WHERE t.Id IN (
+            SELECT TagId 
+            FROM PostTags pt 
+            WHERE pt.PostId = p.Id
+        )
+    ) AS TagsList
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    PostLinks pl ON p.Id = pl.PostId
+LEFT JOIN 
+    PostTags pt ON p.Id = pt.PostId
+WHERE 
+    u.Id IS NOT NULL
+GROUP BY 
+    u.DisplayName
+HAVING 
+    COUNT(DISTINCT p.Id) > 100
+ORDER BY 
+    TotalPosts DESC;

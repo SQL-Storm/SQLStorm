@@ -1,0 +1,183 @@
+-- {"query": "2268.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1652} 
+
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 AS Level,
+        ARRAY[t.Id] AS AncestorPath
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0
+
+    UNION ALL
+
+    SELECT
+        child.Id,
+        child.TagName,
+        child.Count,
+        child.ExcerptPostId,
+        child.WikiPostId,
+        parent.Level + 1 AS Level,
+        parent.AncestorPath || child.Id
+    FROM Tags child
+    JOIN PostLinks pl ON pl.PostId = child.ExcerptPostId
+    JOIN RecursiveTagHierarchy parent ON pl.RelatedPostId = parent.ExcerptPostId
+    WHERE NOT child.Id = ANY(parent.AncestorPath)
+), UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersCount,
+        COALESCE(SUM(vtUp.VoteCount), 0) AS TotalUpVotes,
+        COALESCE(SUM(vtDown.VoteCount), 0) AS TotalDownVotes,
+        MAX(p.Score) FILTER (WHERE p.PostTypeId IN (1,2)) AS MaxPostScore,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId IN (1,2)) AS AvgPostScore,
+        COALESCE(MAX(b.Class), 4) AS HighestBadgeClass -- 1=Gold best, default 4 if none
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS VoteCount
+        FROM Votes
+        WHERE VoteTypeId = 2
+        GROUP BY PostId
+    ) vtUp ON vtUp.PostId = p.Id
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS VoteCount
+        FROM Votes
+        WHERE VoteTypeId = 3
+        GROUP BY PostId
+    ) vtDown ON vtDown.PostId = p.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+), TopQuestions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.Tags,
+        p.OwnerUserId,
+        ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.ViewCount DESC) AS Rank
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.ClosedDate IS NULL
+      AND p.CreationDate > CURRENT_TIMESTAMP - INTERVAL '1 year'
+      AND p.Tags IS NOT NULL
+), AnswersWithParentInfo AS (
+    SELECT
+        a.Id,
+        a.ParentId,
+        a.Score,
+        a.CreationDate,
+        a.OwnerUserId,
+        q.Title AS ParentQuestionTitle,
+        q.Score AS ParentQuestionScore,
+        q.ViewCount AS ParentQuestionViewCount,
+        q.Tags AS ParentQuestionTags
+    FROM Posts a
+    LEFT JOIN Posts q ON q.Id = a.ParentId AND q.PostTypeId = 1
+    WHERE a.PostTypeId = 2
+), UserBadgesRanked AS (
+    SELECT
+        b.UserId,
+        b.Name,
+        b.Date,
+        b.Class,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC) AS BadgeRank
+    FROM Badges b
+), CloseReasonsCount AS (
+    SELECT 
+        cht.Name AS CloseReasonName,
+        COUNT(ph.Id) AS CloseCount
+    FROM PostHistory ph
+    LEFT JOIN PostHistoryTypes pht ON pht.Id = ph.PostHistoryTypeId
+    LEFT JOIN CloseReasonTypes cht ON CAST(ph.Comment AS INT) = cht.Id
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY cht.Name
+), CombinedScores AS (
+    SELECT
+        u.UserId,
+        u.DisplayName,
+        u.QuestionsCount,
+        u.AnswersCount,
+        u.TotalUpVotes,
+        u.TotalDownVotes,
+        u.MaxPostScore,
+        u.AvgPostScore,
+        u.HighestBadgeClass,
+        COALESCE(ts.Rank, NULL) AS TopQuestionRank,
+        ts.Title AS TopQuestionTitle,
+        ts.Score AS TopQuestionScore,
+        ts.ViewCount AS TopQuestionViewCount
+    FROM UserActivity u
+    LEFT JOIN (
+        SELECT DISTINCT ON (p.OwnerUserId)
+            p.OwnerUserId,
+            p.Id,
+            p.Title,
+            p.Score,
+            p.ViewCount,
+            ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS Rank
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+    ) ts ON ts.OwnerUserId = u.UserId AND ts.Rank = 1
+)
+SELECT
+    cs.UserId,
+    cs.DisplayName,
+    cs.QuestionsCount,
+    cs.AnswersCount,
+    cs.TotalUpVotes,
+    cs.TotalDownVotes,
+    cs.MaxPostScore,
+    cs.AvgPostScore,
+    cs.HighestBadgeClass,
+    cs.TopQuestionTitle,
+    cs.TopQuestionScore,
+    cs.TopQuestionViewCount,
+    STRING_AGG(DISTINCT t.TagName, ', ') AS InterestedTags,
+    STRING_AGG(DISTINCT ub.Name || ' (Class ' || ub.Class || ')', '; ') FILTER (WHERE ub.BadgeRank <= 3) AS RecentBadges,
+    cr.CloseReasonName,
+    cr.CloseCount,
+    ROW_NUMBER() OVER (ORDER BY cs.TotalUpVotes DESC, cs.QuestionsCount DESC) AS UserRank,
+    COUNT(*) OVER () AS TotalUsersConsidered,
+    CASE
+        WHEN cs.AvgPostScore IS NULL THEN 'No posts'
+        WHEN cs.AvgPostScore > 10 THEN 'Excellent'
+        WHEN cs.AvgPostScore BETWEEN 5 AND 10 THEN 'Good'
+        ELSE 'Average'
+    END AS PostQualityCategory,
+    CASE
+        WHEN cs.HighestBadgeClass = 1 THEN 'Gold Badge Holder'
+        WHEN cs.HighestBadgeClass = 2 THEN 'Silver Badge Holder'
+        WHEN cs.HighestBadgeClass = 3 THEN 'Bronze Badge Holder'
+        ELSE 'No Badge'
+    END AS BadgeStatus,
+    CONCAT(
+        LEFT(COALESCE(cs.TopQuestionTitle, 'N/A'), 50),
+        CASE WHEN LENGTH(COALESCE(cs.TopQuestionTitle, '')) > 50 THEN '...' ELSE '' END
+    ) AS TopQuestionTitleShortened
+FROM CombinedScores cs
+LEFT JOIN RecursiveTagHierarchy t ON t.Id = ANY(
+    (SELECT array_agg(DISTINCT CAST(trim(tag) AS INT))
+     FROM unnest(string_to_array(
+       regexp_replace(cs.TopQuestionTitle || ',' || cs.DisplayName, '[^a-zA-Z0-9]', ' ', 'g'), ' ')) AS tag) -- simulate tag extraction from title/displayname, fake example
+)
+LEFT JOIN UserBadgesRanked ub ON ub.UserId = cs.UserId
+LEFT JOIN CloseReasonsCount cr ON TRUE
+WHERE cs.QuestionsCount > 5 OR cs.AnswersCount > 10
+ORDER BY cs.TotalUpVotes DESC, cs.UserRank
+LIMIT 100
+UNION
+SELECT
+    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+    NULL, NULL, NULL, NULL,
+    'Total close reasons and counts:' || STRING_AGG(cr.CloseReasonName || ': ' || cr.CloseCount, '; '),
+    NULL, NULL, NULL, NULL
+FROM CloseReasonsCount cr;

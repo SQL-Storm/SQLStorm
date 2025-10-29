@@ -1,0 +1,151 @@
+-- {"query": "3020.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2297} 
+
+WITH UserStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(b.GoldBadgeCount, 0)   AS GoldBadgeCount,
+        COALESCE(b.SilverBadgeCount, 0) AS SilverBadgeCount,
+        COALESCE(b.BronzeBadgeCount, 0) AS BronzeBadgeCount,
+        (
+            SELECT COUNT(*) 
+            FROM Posts p 
+            WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1
+        ) AS QuestionCount,
+        (
+            SELECT COUNT(*) 
+            FROM Posts p 
+            WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2
+        ) AS AnswerCount,
+        (
+            SELECT AVG(CAST(p.Score AS numeric))
+            FROM Posts p 
+            WHERE p.OwnerUserId = u.Id
+        ) AS AvgPostScore
+    FROM Users u
+    LEFT JOIN (
+        SELECT
+            UserId,
+            SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadgeCount,
+            SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadgeCount,
+            SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadgeCount
+        FROM Badges
+        GROUP BY UserId
+    ) b ON b.UserId = u.Id
+),
+
+RecentActivity AS (
+    SELECT
+        p.OwnerUserId               AS UserId,
+        p.CreationDate,
+        p.Id                        AS PostId,
+        p.Title,
+        COALESCE(NULLIF(p.Tags, ''), '<none>') AS TagsRaw,
+        CASE
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END                         AS PostKind,
+        ROW_NUMBER() OVER (
+            PARTITION BY p.OwnerUserId
+            ORDER BY p.CreationDate DESC
+        )                          AS rn
+    FROM Posts p
+    WHERE p.CreationDate >= CURRENT_DATE - INTERVAL '30 day'
+),
+
+TagStats AS (
+    SELECT
+        t.TagName,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 1) AS QuestionTagCount,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 2) AS AnswerTagCount,
+        SUM(p.Score)                               AS TotalScore,
+        STRING_AGG(DISTINCT u.DisplayName, ', ') FILTER (WHERE u.Id IS NOT NULL) AS Contributors
+    FROM Tags t
+    LEFT JOIN Posts p
+        ON p.Tags LIKE '%' || t.TagName || '%'
+    LEFT JOIN Users u
+        ON u.Id = p.OwnerUserId
+    GROUP BY t.TagName
+),
+
+TopPosts AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        u.DisplayName AS OwnerName,
+        RANK() OVER (ORDER BY p.Score DESC, p.ViewCount DESC) AS ScoreRank
+    FROM Posts p
+    JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1
+      AND p.Score IS NOT NULL
+)
+
+SELECT
+    us.Id,
+    us.DisplayName,
+    us.Reputation,
+    us.GoldBadgeCount,
+    us.SilverBadgeCount,
+    us.BronzeBadgeCount,
+    us.QuestionCount,
+    us.AnswerCount,
+    ROUND(us.AvgPostScore::numeric, 2)           AS AvgScore,
+    ra.PostId                                    AS RecentPostId,
+    ra.Title                                     AS RecentPostTitle,
+    ra.PostKind,
+    ra.TagsRaw,
+    tp.Title                                     AS TopQuestionTitle,
+    tp.Score                                     AS TopQuestionScore,
+    tp.ScoreRank,
+    COALESCE(ts.QuestionTagCount, 0)             AS TagQuestionCount,
+    COALESCE(ts.AnswerTagCount, 0)               AS TagAnswerCount,
+    COALESCE(ts.TotalScore, 0)                   AS TagTotalScore,
+    ts.Contributors
+FROM UserStats us
+LEFT JOIN LATERAL (
+    SELECT *
+    FROM RecentActivity ra
+    WHERE ra.UserId = us.Id
+    ORDER BY ra.rn
+    LIMIT 1
+) ra ON TRUE
+LEFT JOIN TopPosts tp
+    ON tp.OwnerName = us.DisplayName AND tp.ScoreRank = 1
+LEFT JOIN TagStats ts
+    ON ts.TagName = ANY (string_to_array(ra.TagsRaw, '><'))
+WHERE us.Reputation > 1000
+  AND (us.GoldBadgeCount + us.SilverBadgeCount) > 5
+  AND (us.QuestionCount + us.AnswerCount) > 10
+ORDER BY us.Reputation DESC, us.GoldBadgeCount DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    NULL,
+    'Summary',
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    SUM(us.QuestionCount),
+    SUM(us.AnswerCount),
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    SUM(ts.QuestionTagCount),
+    SUM(ts.AnswerTagCount),
+    SUM(ts.TotalScore),
+    NULL
+FROM UserStats us
+FULL OUTER JOIN TagStats ts ON TRUE
+WHERE us.Reputation > 1000;

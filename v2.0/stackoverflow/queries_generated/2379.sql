@@ -1,0 +1,179 @@
+-- {"query": "2379.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1777} 
+with RecursiveUserBadgeCounts as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        b.Class,
+        count(*) as BadgeCount
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, b.Class
+),
+LatestPostActivity as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.AcceptedAnswerId,
+        row_number() over(partition by p.OwnerUserId order by p.LastActivityDate desc nulls last) as rn
+    from Posts p
+    where p.OwnerUserId is not null and p.OwnerUserId <> -1
+),
+RankedUserPosts as (
+    select
+        lpa.*,
+        ru.BadgeCount as GoldBadges,
+        coalesce(ru2.BadgeCount,0) as SilverBadges,
+        coalesce(ru3.BadgeCount,0) as BronzeBadges
+    from LatestPostActivity lpa
+    left join RecursiveUserBadgeCounts ru on lpa.OwnerUserId = ru.UserId and ru.Class = 1
+    left join RecursiveUserBadgeCounts ru2 on lpa.OwnerUserId = ru2.UserId and ru2.Class = 2
+    left join RecursiveUserBadgeCounts ru3 on lpa.OwnerUserId = ru3.UserId and ru3.Class = 3
+    where lpa.rn <= 5
+),
+DuplicateLinks as (
+    select pl.PostId, count(pl.Id) as DuplicateLinkCount
+    from PostLinks pl
+    where pl.LinkTypeId = 3
+    group by pl.PostId
+),
+ComplexPostMetrics as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.FavoriteCount,
+        p.Tags,
+        coalesce(dl.DuplicateLinkCount, 0) as DuplicateReferences,
+        (select count(*) from Comments c where c.PostId = p.Id and c.Score >= 2) as HighlyRatedComments,
+        (select avg(VoteTypeId) from Votes v where v.PostId = p.Id and v.VoteTypeId in (2,3)) as AvgVoteType,
+        case
+            when p.Tags is null or p.Tags = '' then 'No Tags'
+            else substring(p.Tags from 2 for char_length(p.Tags)-2)
+        end as CleanedTags,
+        row_number() over (partition by p.OwnerUserId order by p.ViewCount desc nulls last) as ViewRank
+    from Posts p
+    left join DuplicateLinks dl on p.Id = dl.PostId
+    where p.PostTypeId in (1, 2)
+),
+UserPostSummary as (
+    select
+        p.OwnerUserId,
+        count(*) as TotalPosts,
+        sum(case when p.PostTypeId = 1 then 1 else 0 end) as QuestionCount,
+        sum(case when p.PostTypeId = 2 then 1 else 0 end) as AnswerCount,
+        avg(p.Score) as AvgScore,
+        avg(p.ViewCount) as AvgViewCount,
+        avg(p.FavoriteCount) as AvgFavoriteCount,
+        sum(p.DuplicateReferences) as TotalDuplicateRefs,
+        sum(p.HighlyRatedComments) as TotalHighlyRatedComments,
+        avg(p.AvgVoteType) as AvgVoteType,
+        max(p.ViewRank) as MaxViewRank
+    from ComplexPostMetrics p
+    group by p.OwnerUserId
+),
+UserActivityLeadLag as (
+    select
+        u.Id,
+        u.DisplayName,
+        ua.TotalPosts,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.AvgScore,
+        ua.AvgViewCount,
+        ua.AvgFavoriteCount,
+        ua.TotalDuplicateRefs,
+        ua.TotalHighlyRatedComments,
+        ua.AvgVoteType,
+        ua.MaxViewRank,
+        lag(ua.TotalPosts) over (order by ua.TotalPosts desc nulls last) as PreviousUserPostCount,
+        lead(ua.TotalPosts) over (order by ua.TotalPosts desc nulls last) as NextUserPostCount
+    from Users u
+    left join UserPostSummary ua on u.Id = ua.OwnerUserId
+    where ua.TotalPosts IS NOT NULL
+),
+UserBadgesCTE as (
+    select
+        b.UserId,
+        max(case when b.Class = 1 then b.Date else null end) as LastGoldBadgeDate,
+        max(case when b.Class = 2 then b.Date else null end) as LastSilverBadgeDate,
+        max(case when b.Class = 3 then b.Date else null end) as LastBronzeBadgeDate
+    from Badges b
+    group by b.UserId
+)
+select
+    ual.Id as UserId,
+    ual.DisplayName,
+    ual.TotalPosts,
+    ual.QuestionCount,
+    ual.AnswerCount,
+    coalesce(ub.LastGoldBadgeDate, timestamp '1970-01-01') as LastGoldBadgeDate,
+    coalesce(ub.LastSilverBadgeDate, timestamp '1970-01-01') as LastSilverBadgeDate,
+    coalesce(ub.LastBronzeBadgeDate, timestamp '1970-01-01') as LastBronzeBadgeDate,
+    ual.AvgScore,
+    ual.AvgViewCount,
+    ual.AvgFavoriteCount,
+    ual.TotalDuplicateRefs,
+    ual.TotalHighlyRatedComments,
+    ual.AvgVoteType,
+    ual.MaxViewRank,
+    -- Calculate a complex engagement metric
+    (ual.TotalPosts * 0.3 + ual.AvgScore * 2 + ual.TotalHighlyRatedComments * 1.5 - ual.TotalDuplicateRefs * 1.2) /
+    nullif((extract(epoch from current_timestamp - coalesce(ub.LastGoldBadgeDate, ub.LastSilverBadgeDate, ub.LastBronzeBadgeDate))) / 86400 + 1, 0) as EngagementScore,
+    -- String expression concatenations and NULL logic
+    coalesce(ual.DisplayName, 'Unknown') || ' (' || cast(ual.TotalPosts as varchar) || ' posts, ' || 
+    coalesce(cast(ual.AvgScore as varchar), '0') || ' avg score)' as SummaryText,
+    -- Outer join subquery: latest answer with highest score per user
+    (
+        select pa.Id from Posts pa
+        where pa.OwnerUserId = ual.Id and pa.PostTypeId = 2
+        order by pa.Score desc nulls last, pa.CreationDate desc nulls last
+        limit 1
+    ) as TopAnswerId,
+    -- Correlated subquery counting distinct tags for user's questions
+    (
+        select count(distinct unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')))
+        from Posts p
+        where p.OwnerUserId = ual.Id and p.PostTypeId = 1 and p.Tags is not null
+    ) as DistinctQuestionTags
+from UserActivityLeadLag ual
+left join UserBadgesCTE ub on ual.Id = ub.UserId
+where ual.TotalPosts > 10 and ual.AvgScore is not null and ual.DisplayName is not null
+order by EngagementScore desc
+limit 100
+union
+select
+    ual.Id,
+    coalesce(ual.DisplayName, 'Deleted User'),
+    ual.TotalPosts,
+    ual.QuestionCount,
+    ual.AnswerCount,
+    timestamp '1970-01-01',
+    timestamp '1970-01-01',
+    timestamp '1970-01-01',
+    ual.AvgScore,
+    ual.AvgViewCount,
+    ual.AvgFavoriteCount,
+    ual.TotalDuplicateRefs,
+    ual.TotalHighlyRatedComments,
+    ual.AvgVoteType,
+    ual.MaxViewRank,
+    0.0 as EngagementScore,
+    'Deleted or Anonymous User' as SummaryText,
+    NULL as TopAnswerId,
+    0 as DistinctQuestionTags
+from Users ual
+where ual.Id not in (
+    select Id from UserActivityLeadLag
+)
+order by EngagementScore desc
+limit 10;

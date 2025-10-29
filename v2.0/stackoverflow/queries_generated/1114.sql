@@ -1,0 +1,168 @@
+-- {"query": "1114.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2664} 
+
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.Reputation,
+        U.CreationDate,
+        U.LastAccessDate,
+        U.Views,
+        U.UpVotes AS UserGivenUpVotes,
+        U.DownVotes AS UserGivenDownVotes,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestionsOwned,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswersOwned,
+        SUM(COALESCE(P.Score, 0)) AS TotalPostsScoreReceived,
+        SUM(COALESCE(P.ViewCount, 0)) AS TotalPostsViewCount,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        SUM(COALESCE(C.Score, 0)) AS TotalCommentScoreReceived,
+        COUNT(DISTINCT V_given.PostId) FILTER (WHERE V_given.VoteTypeId = 2) AS PostsUpvotedByUser,
+        COUNT(DISTINCT V_given.PostId) FILTER (WHERE V_given.VoteTypeId = 3) AS PostsDownvotedByUser,
+        MAX(P.CreationDate) AS LastPostDate,
+        MIN(P.CreationDate) AS FirstPostDate,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(DISTINCT P_accepted.Id) AS AcceptedAnswersGivenByThisUserCount,
+        LAG(U.Reputation, 1, 0) OVER (ORDER BY U.CreationDate, U.Id) AS PreviousUserReputationByCreationDate -- Example of LAG over Users
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Posts P_accepted ON P.Id = P_accepted.AcceptedAnswerId AND U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Votes V_given ON U.Id = V_given.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.Reputation, U.CreationDate, U.LastAccessDate, U.Views, U.UpVotes, U.DownVotes
+),
+PostHistoryAggregated AS (
+    SELECT
+        PH.PostId,
+        COUNT(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 END) AS EditCount,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (10, 12) THEN 1 ELSE 0 END) AS WasClosedOrDeletedEver,
+        MAX(PH.CreationDate) AS LastHistoryDate,
+        MIN(PH.CreationDate) AS FirstHistoryDate,
+        -- Average time in hours between sequential edits for a given post
+        AVG(EXTRACT(EPOCH FROM (PH.CreationDate - LAG(PH.CreationDate, 1, PH.CreationDate) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate))) / 3600.0)
+            FILTER (WHERE LAG(PH.CreationDate, 1, PH.CreationDate) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) != PH.CreationDate) AS AvgHoursBetweenSequentialEdits
+    FROM PostHistory PH
+    GROUP BY PH.PostId
+),
+UserTagContributionRaw AS (
+    SELECT
+        P.OwnerUserId AS UserId,
+        UNNEST(string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags)-2), '><')) AS TagName,
+        P.Id AS PostId,
+        P.Score
+    FROM Posts P
+    WHERE P.PostTypeId = 1 AND P.OwnerUserId IS NOT NULL AND P.Tags IS NOT NULL AND P.Tags != ''
+),
+TopTagsSummary AS (
+    SELECT
+        UTR.UserId,
+        UTR.TagName AS TopContributingTagName,
+        COUNT(UTR.PostId) AS TopTagPostsCount,
+        SUM(UTR.Score) AS TopTagScore,
+        ROW_NUMBER() OVER (PARTITION BY UTR.UserId ORDER BY SUM(UTR.Score) DESC, COUNT(UTR.PostId) DESC) AS rn_tag_score
+    FROM UserTagContributionRaw UTR
+    GROUP BY UTR.UserId, UTR.TagName
+),
+GlobalTagPerformance AS (
+    SELECT
+        UTR.TagName,
+        COUNT(UTR.PostId) AS GlobalPostsWithTag,
+        SUM(UTR.Score) AS GlobalTagTotalScore,
+        AVG(UTR.Score) AS GlobalTagAverageScore,
+        RANK() OVER (ORDER BY SUM(UTR.Score) DESC, COUNT(UTR.PostId) DESC) AS GlobalTagRank
+    FROM UserTagContributionRaw UTR
+    GROUP BY UTR.TagName
+    HAVING COUNT(UTR.PostId) > 50
+)
+SELECT
+    UAS.UserId,
+    U.DisplayName,
+    UAS.Reputation,
+    UAS.CreationDate,
+    UAS.LastAccessDate,
+    UAS.Views,
+    UAS.PreviousUserReputationByCreationDate, -- Example of LAG output
+    UAS.TotalPostsOwned,
+    UAS.TotalQuestionsOwned,
+    UAS.TotalAnswersOwned,
+    UAS.TotalPostsScoreReceived,
+    UAS.TotalPostsViewCount,
+    UAS.TotalCommentsMade,
+    UAS.TotalCommentScoreReceived,
+    UAS.TotalBadges,
+    UAS.GoldBadges,
+    UAS.SilverBadges,
+    UAS.BronzeBadges,
+    UAS.AcceptedAnswersGivenByThisUserCount,
+    -- Complex calculated fields using NULL logic and expressions
+    (UAS.Reputation / GREATEST(1, EXTRACT(EPOCH FROM (UAS.LastAccessDate - UAS.CreationDate)) / 86400.0))::numeric(10, 2) AS ReputationPerDayActive,
+    (UAS.TotalPostsOwned * 5 + UAS.TotalCommentsMade * 2 + UAS.UserGivenUpVotes + UAS.PostsUpvotedByUser) AS TotalEngagementScore,
+    TTS.TopContributingTagName,
+    TTS.TopTagPostsCount,
+    TTS.TopTagScore,
+    GTP.GlobalTagAverageScore AS TopTagGlobalAvgScore,
+    GTP.GlobalTagRank AS TopTagRankInSystem,
+    COALESCE(SUM(PHA.EditCount), 0) AS UserTotalEditCount,
+    MAX(PHA.WasClosedOrDeletedEver) AS HasEverHadClosedOrDeletedPost,
+    COALESCE(AVG(PHA.AvgHoursBetweenSequentialEdits), 0)::numeric(10, 2) AS AveragePostEditIntervalHours,
+    -- Correlated subquery: Number of unique PostHistoryTypes associated with user's posts
+    (
+        SELECT COUNT(DISTINCT PH_sub.PostHistoryTypeId)
+        FROM PostHistory PH_sub
+        JOIN Posts P_sub ON PH_sub.PostId = P_sub.Id
+        WHERE P_sub.OwnerUserId = UAS.UserId
+    ) AS UniqueHistoryTypesOnPosts,
+    -- Another correlated subquery: Count of high-scoring answers from this user that were accepted
+    (
+        SELECT COUNT(P_acc_sub.Id)
+        FROM Posts P_acc_sub
+        WHERE P_acc_sub.OwnerUserId = UAS.UserId
+          AND P_acc_sub.PostTypeId = 2
+          AND P_acc_sub.AcceptedAnswerId IS NOT NULL
+          AND P_acc_sub.Score > 50
+    ) AS HighScoreAcceptedAnswers,
+    -- Window function: Calculate rolling average of user's reputation growth based on creation date of similar users
+    AVG(UAS.Reputation) OVER (ORDER BY UAS.CreationDate ROWS BETWEEN 10 PRECEDING AND CURRENT ROW) AS RollingAvgReputationGrowth,
+    -- String expressions and NULL logic in a complex CASE statement for profiling
+    CASE
+        WHEN U.AboutMe IS NOT NULL AND (U.AboutMe LIKE '%developer%' OR U.AboutMe LIKE '%engineer%' OR U.AboutMe LIKE '%programmer%')
+             AND U.WebsiteUrl IS NOT NULL
+        THEN 'Professional & Online'
+        WHEN U.AboutMe IS NOT NULL AND U.AboutMe LIKE '%student%'
+        THEN 'Student'
+        WHEN U.Location IS NOT NULL AND U.Location LIKE '%remote%' AND U.WebsiteUrl IS NULL
+        THEN 'Remote but Offline'
+        ELSE COALESCE(UPPER(LEFT(U.Location, 1)) || SUBSTRING(LOWER(U.Location), 2), 'Unknown Location Type')
+    END AS UserProfileType,
+    -- More complex calculation: "User Influence Score" including other subqueries and NULL handling
+    (
+        (UAS.Reputation * 0.5) +
+        (UAS.TotalPostsScoreReceived * 0.3) +
+        (UAS.TotalCommentsMade * 0.1) +
+        (COALESCE(UAS.GoldBadges, 0) * 100 + COALESCE(UAS.SilverBadges, 0) * 50) +
+        (SELECT COUNT(DISTINCT P_fav.Id) FROM Posts P_fav WHERE P_fav.FavoriteCount > 0 AND P_fav.OwnerUserId = UAS.UserId) * 25 +
+        (SELECT COUNT(DISTINCT PL_link.RelatedPostId) FROM PostLinks PL_link JOIN Posts P_link_owner ON PL_link.PostId = P_link_owner.Id WHERE P_link_owner.OwnerUserId = UAS.UserId AND PL_link.LinkTypeId = 1) * 5
+    )::numeric(18, 2) AS UserInfluenceScore
+FROM UserActivitySummary UAS
+JOIN Users U ON UAS.UserId = U.Id
+LEFT JOIN TopTagsSummary TTS ON UAS.UserId = TTS.UserId AND TTS.rn_tag_score = 1
+LEFT JOIN GlobalTagPerformance GTP ON TTS.TopContributingTagName = GTP.TagName
+LEFT JOIN Posts P_owned ON UAS.UserId = P_owned.OwnerUserId
+LEFT JOIN PostHistoryAggregated PHA ON P_owned.Id = PHA.PostId
+WHERE UAS.Reputation > 5000
+  AND UAS.TotalPostsOwned >= 10
+  AND UAS.LastAccessDate > (CURRENT_TIMESTAMP - INTERVAL '6 months')
+  AND U.DisplayName IS NOT NULL
+  AND U.AboutMe IS NOT NULL
+GROUP BY
+    UAS.UserId, U.DisplayName, UAS.Reputation, UAS.CreationDate, UAS.LastAccessDate, UAS.Views,
+    UAS.PreviousUserReputationByCreationDate, UAS.TotalPostsOwned, UAS.TotalQuestionsOwned, UAS.TotalAnswersOwned, UAS.TotalPostsScoreReceived,
+    UAS.TotalPostsViewCount, UAS.TotalCommentsMade, UAS.TotalCommentScoreReceived, UAS.TotalBadges,
+    UAS.GoldBadges, UAS.SilverBadges, UAS.BronzeBadges, UAS.AcceptedAnswersGivenByThisUserCount,
+    TTS.TopContributingTagName, TTS.TopTagPostsCount, TTS.TopTagScore,
+    GTP.GlobalTagAverageScore, GTP.GlobalTagRank, U.AboutMe, U.WebsiteUrl, U.Location
+ORDER BY UserInfluenceScore DESC, Reputation DESC
+LIMIT 100;

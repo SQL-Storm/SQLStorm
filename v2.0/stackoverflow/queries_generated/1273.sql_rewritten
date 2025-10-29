@@ -1,0 +1,274 @@
+-- {"query": "1273.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 4012} 
+WITH UserStats AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.UpVotes AS UserUpVotes,
+        U.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        MIN(P.CreationDate) AS FirstPostDate,
+        MAX(P.CreationDate) AS LastPostDate,
+        MAX(B.Date) AS LastBadgeDate,
+        COUNT(DISTINCT CASE WHEN B.Class = 1 THEN B.Id ELSE NULL END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN B.Class = 2 THEN B.Id ELSE NULL END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN B.Class = 3 THEN B.Id ELSE NULL END) AS BronzeBadges
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.UpVotes, U.DownVotes
+),
+PostEngagement AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount AS QuestionAnswerCount, -- Only for PostTypeId = 1
+        P.CommentCount AS PostCommentCount,
+        P.FavoriteCount,
+        P.LastActivityDate,
+        -- Use a sentinel date for NULLs in ClosedDate for easier comparison
+        COALESCE(P.ClosedDate, '9999-12-31 23:59:59'::timestamp) AS EffectiveClosedDate,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived,
+        -- Scalar subquery: Count number of distinct edits
+        (SELECT COUNT(DISTINCT PH.Id) FROM PostHistory PH WHERE PH.PostId = P.Id AND PH.PostHistoryTypeId IN (4,5,6,9)) AS TotalEditsHistoryCount,
+        -- Scalar subquery: Get last edit date from history
+        (SELECT MAX(PH.CreationDate) FROM PostHistory PH WHERE PH.PostId = P.Id AND PH.PostHistoryTypeId IN (4,5,6,9)) AS LastEditDateFromHistory,
+        -- Correlated subquery: Calculate average score of answers for a question
+        CASE
+            WHEN P.PostTypeId = 1 THEN
+                COALESCE((SELECT AVG(A.Score) FROM Posts A WHERE A.ParentId = P.Id AND A.PostTypeId = 2), 0)
+            ELSE 0
+        END AS AvgAnswerScoreForQuestion
+    FROM Posts P
+    LEFT JOIN Votes V ON P.Id = V.PostId AND V.VoteTypeId IN (2,3)
+    GROUP BY P.Id, P.PostTypeId, P.OwnerUserId, P.CreationDate, P.Score, P.ViewCount, P.AnswerCount, P.CommentCount, P.FavoriteCount, P.ClosedDate, P.LastActivityDate
+),
+TagAnalysis AS (
+    SELECT
+        P.Id AS PostId,
+        P.Tags,
+        -- PostgreSQL specific string_to_array and array_length for tag count
+        ARRAY_LENGTH(string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><'), 1) AS NumberOfTagsOnPost,
+        -- Correlated subquery: Find the most popular tag for the post based on global tag counts
+        (
+            SELECT T.TagName
+            FROM Tags T
+            WHERE P.Tags LIKE '%' || T.TagName || '%' -- Potentially slow, but complex
+            ORDER BY T.Count DESC, T.TagName -- Tie-breaker for consistency
+            LIMIT 1
+        ) AS TopTagOnPostByGlobalCount
+    FROM Posts P
+    WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL AND LENGTH(TRIM(P.Tags)) > 2
+),
+PostLinkSummary AS (
+    SELECT
+        PL.PostId,
+        COUNT(CASE WHEN PL.LinkTypeId = 1 THEN 1 ELSE NULL END) AS LinkedPostsCount,
+        COUNT(CASE WHEN PL.LinkTypeId = 3 THEN 1 ELSE NULL END) AS DuplicatePostsCount,
+        SUM(CASE WHEN PL.LinkTypeId = 1 THEN 1 ELSE 0 END) + SUM(CASE WHEN PL.LinkTypeId = 3 THEN 1 ELSE 0 END) AS TotalLinks
+    FROM PostLinks PL
+    GROUP BY PL.PostId
+),
+BaseQueryResults AS (
+    SELECT
+        U.UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.UserCreationDate,
+        U.LastAccessDate,
+        U.TotalPosts,
+        U.QuestionCount,
+        U.AnswerCount,
+        U.TotalComments,
+        U.TotalBadges,
+        U.GoldBadges,
+        U.SilverBadges,
+        U.BronzeBadges,
+        P.PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.PostCreationDate,
+        P.PostScore,
+        P.ViewCount,
+        P.QuestionAnswerCount,
+        P.PostCommentCount,
+        P.FavoriteCount,
+        P.UpVotesReceived,
+        P.DownVotesReceived,
+        P.TotalEditsHistoryCount,
+        P.AvgAnswerScoreForQuestion,
+        TA.NumberOfTagsOnPost,
+        TA.TopTagOnPostByGlobalCount,
+        PLS.LinkedPostsCount,
+        PLS.DuplicatePostsCount,
+        PLS.TotalLinks,
+        -- Use COALESCE to get title from question or answer record
+        COALESCE(Qs.Title, Ans.Title) AS PostTitle,
+        LENGTH(COALESCE(Qs.Body, Ans.Body)) AS PostBodyLength,
+        -- Window function: Rank posts by score for each user
+        RANK() OVER (PARTITION BY U.UserId ORDER BY P.PostScore DESC, P.PostCreationDate DESC) AS RankPostByScoreForUser,
+        -- Window function: Get the creation date of the next post by the same user
+        LEAD(P.PostCreationDate, 1, '9999-12-31 23:59:59'::timestamp) OVER (PARTITION BY U.UserId ORDER BY P.PostCreationDate) AS NextPostDateByUser,
+        -- Window function: Cumulative sum of upvotes for a user over time
+        SUM(P.UpVotesReceived) OVER (PARTITION BY U.UserId ORDER BY P.PostCreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativeUpvotesForUser,
+        -- Complex calculation with conditional logic, NULL handling, and date arithmetic
+        ROUND(
+            CASE
+                WHEN P.PostTypeId = 1 AND P.QuestionAnswerCount > 0
+                THEN (CAST(P.PostScore AS NUMERIC) + P.AvgAnswerScoreForQuestion * P.QuestionAnswerCount) / (P.QuestionAnswerCount + 1.0)
+                WHEN P.PostTypeId = 2 AND P.PostScore > 0
+                THEN P.PostScore * (1.0 + CAST(P.TotalEditsHistoryCount AS NUMERIC) / NULLIF(EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - P.PostCreationDate)) / (60 * 60 * 24), 0))
+                ELSE COALESCE(P.PostScore, 0)
+            END, 2
+        ) AS WeightedEngagementScore,
+        -- String expression: Uppercase first 5 characters of the title
+        UPPER(SUBSTRING(COALESCE(Qs.Title, 'NO TITLE PROVIDED'), 1, 5)) AS TitlePrefix,
+        -- Correlated subquery: Count unique users who edited the post (excluding original author)
+        (
+            SELECT COUNT(DISTINCT PH2.UserId)
+            FROM PostHistory PH2
+            WHERE PH2.PostId = P.PostId
+              AND PH2.PostHistoryTypeId IN (4, 5, 6) -- Edit events
+              AND PH2.CreationDate > P.PostCreationDate -- Edited after creation
+              AND PH2.UserId IS NOT NULL
+              AND PH2.UserId != P.OwnerUserId -- Exclude original owner's edits
+        ) AS UniqueEditorsCountExclOwner,
+        -- Correlated EXISTS subquery: Check if the post was closed by a moderator
+        EXISTS (
+            SELECT 1
+            FROM PostHistory PH_closed
+            WHERE PH_closed.PostId = P.PostId
+              AND PH_closed.PostHistoryTypeId = 10 -- Post Closed
+              AND PH_closed.UserId IS NOT NULL -- Closed by an actual user (moderator)
+              AND PH_closed.CreationDate > P.PostCreationDate
+        ) AS WasModeratorClosed,
+        -- Correlated scalar subquery: Get the text of the most recent comment with a positive score
+        (
+            SELECT C_sub.Text
+            FROM Comments C_sub
+            WHERE C_sub.PostId = P.PostId AND C_sub.Score > 0
+            ORDER BY C_sub.CreationDate DESC
+            LIMIT 1
+        ) AS LatestPositiveCommentText,
+        'HighRepUserPost' AS ResultSourceType -- Identifier for UNION ALL
+    FROM UserStats U
+    LEFT JOIN PostEngagement P ON U.UserId = P.OwnerUserId
+    LEFT JOIN PostTypes PT ON P.PostTypeId = PT.Id
+    LEFT JOIN Posts Qs ON P.PostId = Qs.Id AND P.PostTypeId = 1 -- Join for question specific details
+    LEFT JOIN Posts Ans ON P.PostId = Ans.Id AND P.PostTypeId = 2 -- Join for answer specific details
+    LEFT JOIN TagAnalysis TA ON P.PostId = TA.PostId
+    LEFT JOIN PostLinkSummary PLS ON P.PostId = PLS.PostId
+    WHERE U.Reputation > 1000
+      AND P.PostCreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '5 year') -- Filter for recent activity
+      AND (P.PostScore > 5 OR P.ViewCount > 500) -- Engagement filter
+      AND (
+            (P.PostTypeId = 1 AND P.QuestionAnswerCount > 0 AND TA.TopTagOnPostByGlobalCount IS NOT NULL) OR
+            (P.PostTypeId = 2 AND P.TotalEditsHistoryCount > 0)
+        )
+      AND (P.EffectiveClosedDate = '9999-12-31 23:59:59'::timestamp OR P.EffectiveClosedDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year') -- Not too old closed posts or not closed
+),
+TopLinkedPosts AS (
+    -- This CTE identifies highly linked/duplicated posts regardless of owner's reputation
+    -- It re-calculates some metrics to ensure column alignment for UNION ALL
+    SELECT
+        NULL::INT AS UserId, -- Placeholder for alignment
+        NULL::VARCHAR(40) AS DisplayName,
+        NULL::INT AS Reputation,
+        NULL::TIMESTAMP AS UserCreationDate,
+        NULL::TIMESTAMP AS LastAccessDate,
+        NULL::BIGINT AS TotalPosts,
+        NULL::BIGINT AS QuestionCount,
+        NULL::BIGINT AS AnswerCount,
+        NULL::BIGINT AS TotalComments,
+        NULL::BIGINT AS TotalBadges,
+        NULL::BIGINT AS GoldBadges,
+        NULL::BIGINT AS SilverBadges,
+        NULL::BIGINT AS BronzeBadges,
+        P.Id AS PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount AS QuestionAnswerCount,
+        P.CommentCount AS PostCommentCount,
+        P.FavoriteCount,
+        COALESCE(SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVotesReceived,
+        COALESCE(SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownVotesReceived,
+        (SELECT COUNT(DISTINCT PH.Id) FROM PostHistory PH WHERE PH.PostId = P.Id AND PH.PostHistoryTypeId IN (4,5,6,9)) AS TotalEditsHistoryCount,
+        COALESCE((SELECT AVG(A.Score) FROM Posts A WHERE A.ParentId = P.Id AND A.PostTypeId = 2), 0) AS AvgAnswerScoreForQuestion,
+        TA.NumberOfTagsOnPost,
+        TA.TopTagOnPostByGlobalCount,
+        PLS.LinkedPostsCount,
+        PLS.DuplicatePostsCount,
+        PLS.TotalLinks,
+        COALESCE(P.Title, 'Generic Post Title') AS PostTitle,
+        LENGTH(COALESCE(P.Body, '')) AS PostBodyLength,
+        NULL::BIGINT AS RankPostByScoreForUser, -- Placeholder
+        NULL::TIMESTAMP AS NextPostDateByUser,
+        NULL::BIGINT AS CumulativeUpvotesForUser,
+        ROUND(
+            CASE
+                WHEN P.PostTypeId = 1 AND P.AnswerCount > 0
+                THEN (CAST(P.Score AS NUMERIC) + COALESCE((SELECT AVG(A.Score) FROM Posts A WHERE A.ParentId = P.Id AND A.PostTypeId = 2), 0) * P.AnswerCount) / (P.AnswerCount + 1.0)
+                WHEN P.PostTypeId = 2 AND P.Score > 0
+                THEN P.Score * (1.0 + CAST((SELECT COUNT(DISTINCT PH.Id) FROM PostHistory PH WHERE PH.PostId = P.Id AND PH.PostHistoryTypeId IN (4,5,6,9)) AS NUMERIC) / NULLIF(EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - P.CreationDate)) / (60 * 60 * 24), 0))
+                ELSE COALESCE(P.Score, 0)
+            END, 2
+        ) AS WeightedEngagementScore,
+        UPPER(SUBSTRING(COALESCE(P.Title, 'NO TITLE PROVIDED'), 1, 5)) AS TitlePrefix,
+        (
+            SELECT COUNT(DISTINCT PH2.UserId)
+            FROM PostHistory PH2
+            WHERE PH2.PostId = P.Id
+              AND PH2.PostHistoryTypeId IN (4, 5, 6)
+              AND PH2.CreationDate > P.CreationDate
+              AND PH2.UserId IS NOT NULL
+              AND PH2.UserId != P.OwnerUserId
+        ) AS UniqueEditorsCountExclOwner,
+        EXISTS (
+            SELECT 1
+            FROM PostHistory PH_closed
+            WHERE PH_closed.PostId = P.Id
+              AND PH_closed.PostHistoryTypeId = 10
+              AND PH_closed.UserId IS NOT NULL
+              AND PH_closed.CreationDate > P.CreationDate
+        ) AS WasModeratorClosed,
+        (
+            SELECT C_sub.Text
+            FROM Comments C_sub
+            WHERE C_sub.PostId = P.Id AND C_sub.Score > 0
+            ORDER BY C_sub.CreationDate DESC
+            LIMIT 1
+        ) AS LatestPositiveCommentText,
+        'TopLinkedPost' AS ResultSourceType
+    FROM Posts P
+    LEFT JOIN Votes V ON P.Id = V.PostId AND V.VoteTypeId IN (2,3)
+    LEFT JOIN PostTypes PT ON P.PostTypeId = PT.Id
+    LEFT JOIN TagAnalysis TA ON P.Id = TA.PostId
+    INNER JOIN PostLinkSummary PLS ON P.Id = PLS.PostId -- INNER JOIN to specifically filter for posts with links
+    WHERE P.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '3 year')
+      AND PLS.TotalLinks > 2 -- Require at least 3 links to be considered 'top linked'
+      AND P.Score > 10
+    GROUP BY P.Id, P.PostTypeId, P.CreationDate, P.Score, P.ViewCount, P.AnswerCount, P.CommentCount, P.FavoriteCount, P.Title, P.Body, PT.Name, TA.NumberOfTagsOnPost, TA.TopTagOnPostByGlobalCount, PLS.LinkedPostsCount, PLS.DuplicatePostsCount, PLS.TotalLinks
+)
+-- Use UNION ALL to combine results from different criteria
+SELECT * FROM BaseQueryResults
+WHERE WeightedEngagementScore > 50 -- Additional filter for highly engaged posts by high-rep users
+UNION ALL
+SELECT * FROM TopLinkedPosts
+WHERE WeightedEngagementScore > 20 -- Additional filter for linked posts, potentially less strict
+ORDER BY ResultSourceType DESC, PostCreationDate DESC, WeightedEngagementScore DESC
+LIMIT 15000;

@@ -1,0 +1,343 @@
+-- {"query": "7061.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2914} 
+WITH UserActivitySummary AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+                CASE 
+                    WHEN COUNT(DISTINCT p.Id) > 100 THEN 'Veteran'
+                    WHEN COUNT(DISTINCT p.Id) > 50 THEN 'Experienced'
+                    WHEN COUNT(DISTINCT p.Id) > 10 THEN 'Active'
+                    ELSE 'New'
+                END
+            ELSE 'Inactive'
+        END as UserLevel,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        COALESCE(SUM(p.ViewCount), 0) as TotalViews,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), ', ') as AllTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId IN (1, 2)
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.AccountId IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopPosts AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        p.PostTypeId,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) as ScoreRank,
+        DENSE_RANK() OVER (ORDER BY p.ViewCount DESC) as ViewRank,
+        PERCENT_RANK() OVER (ORDER BY p.Score) as ScorePercentile,
+        LAG(p.Score) OVER (ORDER BY p.Score DESC) - p.Score as ScoreDifference,
+        NTH_VALUE(p.Score, 3) OVER (ORDER BY p.Score DESC ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) as ThirdHighestScore,
+        CASE 
+            WHEN p.Score > 100 THEN 'HighlyVoted'
+            WHEN p.Score > 50 THEN 'WellVoted' 
+            WHEN p.Score > 10 THEN 'ModeratelyVoted'
+            ELSE 'LowVoted'
+        END as VotingTier
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) 
+        AND p.Score IS NOT NULL
+        AND p.CreationDate > '2020-01-01'
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 500 THEN 'Moderate'
+            WHEN t.Count > 100 THEN 'Niche'
+            ELSE 'Rare'
+        END as PopularityLevel,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as PopularityRank,
+        AVG(t.Count) OVER (ORDER BY t.Count ROWS BETWEEN 5 PRECEDING AND 5 FOLLOWING) as MovingAverage,
+        COALESCE((
+            SELECT COUNT(DISTINCT p.Id) 
+            FROM Posts p 
+            WHERE p.PostTypeId = 1 
+                AND p.Tags LIKE '%' || t.TagName || '%'
+                AND p.CreationDate > DATEADD('YEAR', -2, NOW())
+        ), 0) as RecentQuestionCount,
+        COALESCE((
+            SELECT COUNT(*) 
+            FROM Posts p 
+            JOIN PostHistory ph ON p.Id = ph.PostId 
+            WHERE p.Tags LIKE '%' || t.TagName || '%'
+                AND ph.PostHistoryTypeId = 1
+                AND ph.CreationDate > DATEADD('MONTH', -6, NOW())
+        ), 0) as RecentTagEdits
+    FROM Tags t
+    WHERE t.TagName IS NOT NULL
+),
+UserPerformance AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.PostCount,
+        uas.CommentCount,
+        uas.BadgeCount,
+        uas.UserLevel,
+        uas.TotalScore,
+        uas.TotalViews,
+        CASE 
+            WHEN uas.PostCount > 0 THEN 
+                (CAST(uas.TotalScore AS FLOAT) / CAST(uas.PostCount AS FLOAT))
+            ELSE 0
+        END as AvgScorePerPost,
+        CASE 
+            WHEN uas.TotalViews > 0 THEN 
+                (CAST(uas.PostCount AS FLOAT) / CAST(uas.TotalViews AS FLOAT))
+            ELSE 0
+        END as PostToViewRatio,
+        CASE 
+            WHEN uas.PostCount > 0 THEN 
+                CAST(uas.TotalScore AS FLOAT) / 
+                CAST(uas.PostCount AS FLOAT) * 
+                LOG(CAST(uas.TotalViews AS FLOAT) + 1)
+            ELSE 0
+        END as ComplexPerformanceMetric
+    FROM UserActivitySummary uas
+),
+CombinedResults AS (
+    SELECT 
+        up.UserId,
+        up.DisplayName,
+        up.Reputation,
+        up.PostCount,
+        up.CommentCount,
+        up.BadgeCount,
+        up.UserLevel,
+        up.TotalScore,
+        up.TotalViews,
+        up.AvgScorePerPost,
+        up.PostToViewRatio,
+        up.ComplexPerformanceMetric,
+        tp.Id as TopPostId,
+        tp.Title as TopPostTitle,
+        tp.Score as TopPostScore,
+        tp.ViewCount as TopPostViews,
+        tp.ScoreRank,
+        tp.ViewRank,
+        tp.ScorePercentile,
+        tp.VotingTier,
+        ta.TagName,
+        ta.TagCount,
+        ta.PopularityLevel,
+        ta.PopularityRank,
+        ta.RecentQuestionCount,
+        ta.RecentTagEdits,
+        CASE 
+            WHEN up.PostCount > 0 AND up.TotalViews > 0 AND up.TotalScore > 0 THEN 
+                (up.PostCount * up.TotalViews) / (up.TotalScore + 1)
+            ELSE 0
+        END as ComplexMetric2,
+        CASE 
+            WHEN up.ComplexPerformanceMetric > 100 THEN 'High'
+            WHEN up.ComplexPerformanceMetric > 50 THEN 'Medium'
+            WHEN up.ComplexPerformanceMetric > 10 THEN 'Low'
+            ELSE 'VeryLow'
+        END as PerformanceCategory,
+        COALESCE(
+            (SELECT COUNT(DISTINCT ph.UserId) 
+             FROM PostHistory ph 
+             WHERE ph.PostId = tp.Id 
+                AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5)),
+            0
+        ) as RevisionCount,
+        DATEDIFF('DAY', tp.CreationDate, NOW()) as DaysOld,
+        CASE 
+            WHEN DATEDIFF('DAY', tp.CreationDate, NOW()) > 30 
+                 AND tp.Score > 50 THEN 'StaleButPopular'
+            WHEN DATEDIFF('DAY', tp.CreationDate, NOW()) > 30 
+                 AND tp.Score <= 50 THEN 'Stale'
+            WHEN tp.Score > 100 THEN 'Trending'
+            ELSE 'Normal'
+        END as PostStatus,
+        CASE 
+            WHEN (ta.RecentQuestionCount > 0 AND ta.RecentTagEdits > 0) OR ta.RecentQuestionCount > 100 THEN 'ActiveTag'
+            WHEN ta.RecentQuestionCount > 0 THEN 'PopularTag'
+            ELSE 'StableTag'
+        END as TagStatus,
+        COALESCE(
+            (SELECT SUM(v.BountyAmount) 
+             FROM Votes v 
+             WHERE v.PostId = tp.Id AND v.VoteTypeId = 8),
+            0
+        ) as TotalBounty,
+        COALESCE(
+            (SELECT COUNT(*) 
+             FROM Posts p 
+             WHERE p.ParentId = tp.Id AND p.PostTypeId = 2),
+            0
+        ) as AnswerCount,
+        COALESCE(
+            (SELECT COUNT(*) 
+             FROM Comments c 
+             WHERE c.PostId = tp.Id),
+            0
+        ) as CommentCountForPost
+    FROM UserPerformance up
+    LEFT JOIN TopPosts tp ON up.PostCount > 0 AND tp.ScoreRank <= 3
+    LEFT JOIN TagAnalysis ta ON ta.PopularityRank <= 10
+    WHERE up.UserId IN (
+        SELECT u.Id 
+        FROM Users u 
+        WHERE u.Reputation > 1000
+        AND u.AccountId IS NOT NULL
+        AND EXISTS (
+            SELECT 1 FROM Posts p 
+            WHERE p.OwnerUserId = u.Id 
+            AND p.PostTypeId IN (1, 2)
+        )
+    )
+),
+FinalAggregation AS (
+    SELECT 
+        cr.UserId,
+        cr.DisplayName,
+        cr.Reputation,
+        cr.PostCount,
+        cr.CommentCount,
+        cr.BadgeCount,
+        cr.UserLevel,
+        cr.TotalScore,
+        cr.TotalViews,
+        cr.AvgScorePerPost,
+        cr.PostToViewRatio,
+        cr.ComplexPerformanceMetric,
+        cr.TopPostId,
+        cr.TopPostTitle,
+        cr.TopPostScore,
+        cr.TopPostViews,
+        cr.ScoreRank,
+        cr.ViewRank,
+        cr.ScorePercentile,
+        cr.VotingTier,
+        cr.TagName,
+        cr.TagCount,
+        cr.PopularityLevel,
+        cr.PopularityRank,
+        cr.RecentQuestionCount,
+        cr.RecentTagEdits,
+        cr.ComplexMetric2,
+        cr.PerformanceCategory,
+        cr.RevisionCount,
+        cr.DaysOld,
+        cr.PostStatus,
+        cr.TagStatus,
+        cr.TotalBounty,
+        cr.AnswerCount,
+        cr.CommentCountForPost,
+        CASE 
+            WHEN cr.PostCount > 0 THEN 
+                (cr.Reputation * cr.PostCount * cr.TotalScore) / 
+                (cr.CommentCount + cr.BadgeCount + 1)
+            ELSE 0
+        END as UserProfileScore,
+        COALESCE(
+            (SELECT COUNT(DISTINCT ph.PostHistoryTypeId) 
+             FROM PostHistory ph 
+             WHERE ph.UserId = cr.UserId 
+                AND ph.CreationDate > DATEADD('MONTH', -6, NOW())),
+            0
+        ) as RecentActivityCount,
+        CASE 
+            WHEN cr.UserLevel IN ('Veteran', 'Experienced') AND cr.ScorePercentile > 0.8 THEN 'EliteUser'
+            WHEN cr.UserLevel IN ('Active', 'Veteran') AND cr.PostToViewRatio > 0.01 THEN 'EngagedUser'
+            ELSE 'RegularUser'
+        END as UserCategory
+    FROM CombinedResults cr
+    WHERE cr.UserId IS NOT NULL
+)
+SELECT 
+    fa.UserId,
+    fa.DisplayName,
+    fa.Reputation,
+    fa.PostCount,
+    fa.CommentCount,
+    fa.BadgeCount,
+    fa.UserLevel,
+    fa.TotalScore,
+    fa.TotalViews,
+    fa.AvgScorePerPost,
+    fa.PostToViewRatio,
+    fa.ComplexPerformanceMetric,
+    fa.UserProfileScore,
+    fa.TopPostId,
+    fa.TopPostTitle,
+    fa.TopPostScore,
+    fa.TopPostViews,
+    fa.ScoreRank,
+    fa.ViewRank,
+    fa.ScorePercentile,
+    fa.VotingTier,
+    fa.TagName,
+    fa.TagCount,
+    fa.PopularityLevel,
+    fa.PopularityRank,
+    fa.RecentQuestionCount,
+    fa.RecentTagEdits,
+    fa.ComplexMetric2,
+    fa.PerformanceCategory,
+    fa.RevisionCount,
+    fa.DaysOld,
+    fa.PostStatus,
+    fa.TagStatus,
+    fa.TotalBounty,
+    fa.AnswerCount,
+    fa.CommentCountForPost,
+    fa.RecentActivityCount,
+    fa.UserCategory,
+    CASE 
+        WHEN fa.UserCategory = 'EliteUser' AND fa.TagStatus = 'ActiveTag' THEN 'HighValueUser'
+        WHEN fa.UserCategory IN ('EngagedUser', 'EliteUser') AND fa.PostStatus IN ('Trending', 'StaleButPopular') THEN 'ImpactfulUser'
+        ELSE 'RegularUser'
+    END as UserImpactCategory,
+    ROW_NUMBER() OVER (ORDER BY fa.UserProfileScore DESC) as Ranking,
+    NTILE(10) OVER (ORDER BY fa.TotalScore DESC) as ScoreDecile,
+    PERCENT_RANK() OVER (ORDER BY fa.Reputation DESC) as ReputationPercentile,
+    CUME_DIST() OVER (ORDER BY fa.PostCount DESC) as PostCountDistribution,
+    FIRST_VALUE(fa.DisplayName) OVER (ORDER BY fa.ComplexPerformanceMetric DESC) as TopPerformer
+FROM FinalAggregation fa
+WHERE fa.Reputation > 1000
+    AND (fa.PostCount >= 1 OR fa.CommentCount >= 1 OR fa.BadgeCount >= 1)
+    AND fa.ComplexPerformanceMetric > 0
+    AND fa.TagName IS NOT NULL
+    AND fa.TagStatus IS NOT NULL
+    AND EXISTS (
+        SELECT 1 
+        FROM Posts p 
+        WHERE p.OwnerUserId = fa.UserId 
+            AND p.CreationDate > DATEADD('YEAR', -1, NOW())
+    )
+    AND (
+        (fa.VotingTier = 'HighlyVoted' AND fa.PostStatus = 'Trending') 
+        OR fa.PopularityLevel IN ('Popular', 'Moderate')
+        OR fa.UserCategory IN ('EliteUser', 'EngagedUser')
+    )
+QUALIFY 
+    ROW_NUMBER() OVER (PARTITION BY fa.UserId ORDER BY fa.DaysOld) = 1
+ORDER BY 
+    fa.UserProfileScore DESC,
+    fa.Reputation DESC,
+    fa.PostCount DESC
+LIMIT 1000;

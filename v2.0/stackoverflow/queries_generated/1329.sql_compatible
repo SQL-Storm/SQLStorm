@@ -1,0 +1,66 @@
+SELECT
+        T.TagName,
+        COUNT(DISTINCT P.Id) AS TaggedPostsCount,
+        SUM(P.Score) AS TotalTagScore,
+        COALESCE(AVG(P.Score), 0.0) AS AvgTagPostScore,
+        NTILE(10) OVER (ORDER BY COALESCE(AVG(P.Score), 0.0) DESC, COUNT(DISTINCT P.Id) DESC) AS AvgScoreDecile,
+        MAX(P.Id) AS SamplePostId
+    FROM Tags T
+    JOIN (
+        SELECT Id, TRIM(UNNEST(string_to_array(SUBSTRING(Tags, 2, LENGTH(Tags) - 2), '><'))) AS TagName
+        FROM Posts
+        WHERE Tags IS NOT NULL AND LENGTH(Tags) > 2
+    ) PostTagged ON T.TagName = PostTagged.TagName
+    JOIN Posts P ON PostTagged.Id = P.Id
+    WHERE P.PostTypeId IN (1,2)
+    GROUP BY T.TagName
+) TP ON TP.TagName = PDA.PrimaryTagName
+WHERE P.PostTypeId IN (1,2)
+GROUP BY
+    UE.UserId,
+    UE.DisplayName,
+    UE.Reputation,
+    UE.AccountAgeYears,
+    UE.QuestionsAsked,
+    UE.AnswersGiven,
+    UE.TotalQuestionScore,
+    UE.TotalAnswerScore,
+    UE.AvgAnswerScore,
+    UE.AcceptedAnswersProvided,
+    UE.CommentsMade,
+    UE.GoldBadges,
+    UE.SilverBadges,
+    UE.BronzeBadges,
+    P.Id,
+    P.Title,
+    PT.Name,
+    P.CreationDate,
+    P.LastActivityDate,
+    P.LastEditDate,
+    P.Score,
+    P.ViewCount,
+    P.AnswerCount,
+    P.CommentCount,
+    P.FavoriteCount,
+    PHA.TotalEditEvents,
+    PHA.TotalRollbackEvents,
+    PHA.LatestCloseEventDate,
+    PHA.LatestReopenEventDate,
+    PHA.LatestCloseReasonName,
+    PHA.WasEverDeleted,
+    PHA.WasEverUndeleted,
+    PHA.WasMigratedAway,
+    PHA.WasMigratedHere,
+    PDA.AvgAnswerScoreToQuestion,
+    PDA.TotalCommentsOnPost,
+    PDA.AllPostTags,
+    TP.AvgTagPostScore,
+    TP.AvgScoreDecile,
+    PDA.PrimaryTagName,
+    P.ClosedDate,
+    P.CommunityOwnedDate,
+    P.Body,
+    P.AcceptedAnswerId,
+    UE.HasUpvoted,
+    UE.HasDownvoted,
+    PT.Id;

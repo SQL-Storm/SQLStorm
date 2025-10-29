@@ -1,0 +1,260 @@
+WITH PostStats AS (
+    SELECT 
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.LastActivityDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as UserPostRank,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) as TotalUserPosts,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as AvgUserScore,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PrevScore,
+        NTILE(4) OVER (ORDER BY p.Score) as ScoreQuartile,
+        CASE 
+            WHEN p.Score > 100 THEN 'High'
+            WHEN p.Score > 50 THEN 'Medium'
+            WHEN p.Score > 0 THEN 'Low'
+            ELSE 'Negative'
+        END as ScoreCategory,
+        COALESCE(p.Title, 'No Title') as SafeTitle,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND LENGTH(p.Tags) > 10 THEN 'Has Tags'
+            ELSE 'No Tags'
+        END as TagStatus,
+        CAST(EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate)) / 86400 AS INTEGER) AS DaysActive,
+        ROW_NUMBER() OVER (ORDER BY p.Score DESC) as GlobalScoreRank
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserActivity AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.CreationDate,
+        COUNT(p.Id) as PostCount,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) as QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) as AnswerCount,
+        AVG(p.Score) as AvgScore,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(p.LastActivityDate) as LastActivityDate,
+        STDDEV_SAMP(p.Score) as ScoreStdDev,
+        STRING_AGG(p.Tags, ', ') as AllTags,
+        CASE 
+            WHEN COUNT(p.Id) > 1000 THEN 'Heavy User'
+            WHEN COUNT(p.Id) > 500 THEN 'Regular User'
+            WHEN COUNT(p.Id) > 100 THEN 'Occasional User'
+            ELSE 'New User'
+        END as UserCategory
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        COALESCE(t.Count, 0) as NormalizedCount,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            WHEN t.Count > 10 THEN 'Niche'
+            ELSE 'Rare'
+        END as PopularityLevel,
+        RANK() OVER (ORDER BY t.Count DESC) as TagRank,
+        PERCENT_RANK() OVER (ORDER BY t.Count) as TagPercentile,
+        AVG(t.Count) OVER() as AvgTagCount,
+        MAX(t.Count) OVER() as MaxTagCount
+    FROM Tags t
+    WHERE t.TagName IS NOT NULL
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        ps.PostId,
+        ps.OwnerUserId,
+        ps.Score,
+        ps.ScoreCategory,
+        ps.ScoreQuartile,
+        ps.TagStatus,
+        ps.DaysActive,
+        ps.GlobalScoreRank,
+        ps.UserPostRank,
+        ps.TotalUserPosts,
+        ps.AvgUserScore,
+        ps.PrevScore,
+        ps.Title as PostTitle,
+        ps.Tags,
+        ps.AnswerCount,
+        ps.CommentCount,
+        ps.FavoriteCount,
+        ps.LastActivityDate,
+        ROW_NUMBER() OVER (PARTITION BY ps.OwnerUserId ORDER BY ps.Score DESC) as TopScoreByUser,
+        LAG(ps.Score, 1, 0) OVER (PARTITION BY ps.OwnerUserId ORDER BY ps.CreationDate) as ScoreChange,
+        CASE 
+            WHEN ps.Score > ps.AvgUserScore THEN 'Above Avg'
+            WHEN ps.Score < ps.AvgUserScore THEN 'Below Avg'
+            ELSE 'Avg'
+        END as ScoreVsUserAvg,
+        CASE 
+            WHEN ps.AnswerCount IS NULL OR ps.AnswerCount = 0 THEN 'No Answers'
+            WHEN ps.AnswerCount <= 1 THEN 'Single Answer'
+            WHEN ps.AnswerCount <= 5 THEN 'Few Answers'
+            WHEN ps.AnswerCount <= 10 THEN 'Moderate Answers'
+            ELSE 'Many Answers'
+        END as AnswerDistribution,
+        CASE 
+            WHEN ps.DaysActive <= 7 THEN 'Week'
+            WHEN ps.DaysActive <= 30 THEN 'Month'
+            WHEN ps.DaysActive <= 90 THEN 'Quarter'
+            ELSE 'Year'
+        END as ActivePeriod,
+        CASE 
+            WHEN ps.Score IS NOT NULL AND ps.Score > 0 THEN 
+                CASE 
+                    WHEN ps.Score > 100 THEN 'Gold'
+                    WHEN ps.Score > 50 THEN 'Silver'
+                    ELSE 'Bronze'
+                END
+            ELSE 'No Value'
+        END as ScoreQuality,
+        COALESCE(ps.Title, '') as CleanTitle,
+        LENGTH(COALESCE(ps.Title, '')) as TitleLength,
+        TRIM(BOTH '<>' FROM COALESCE(ps.Tags, '')) as CleanTags,
+        CASE 
+            WHEN COALESCE(ps.Tags, '') LIKE '%<%' THEN 
+                (CARDINALITY(string_to_array(COALESCE(ps.Tags, ''), '><')) - 1)
+            ELSE 0
+        END as TagCountInPost
+    FROM PostStats ps
+)
+SELECT 
+    pa.PostId,
+    pa.OwnerUserId,
+    pa.Score,
+    pa.ScoreCategory,
+    pa.ScoreQuartile,
+    pa.TagStatus,
+    pa.DaysActive,
+    pa.GlobalScoreRank,
+    pa.UserPostRank,
+    pa.TotalUserPosts,
+    ROUND(pa.AvgUserScore, 2) as AvgUserScore,
+    pa.PrevScore,
+    pa.PostTitle,
+    pa.Tags,
+    pa.AnswerCount,
+    pa.CommentCount,
+    pa.FavoriteCount,
+    pa.LastActivityDate,
+    pa.TopScoreByUser,
+    pa.ScoreChange,
+    pa.ScoreVsUserAvg,
+    pa.AnswerDistribution,
+    pa.ActivePeriod,
+    pa.ScoreQuality,
+    pa.CleanTitle,
+    pa.TitleLength,
+    pa.CleanTags,
+    pa.TagCountInPost,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.PostCount,
+    ua.QuestionCount,
+    ua.AnswerCount as UserAnswerCount,
+    ROUND(ua.AvgScore, 2) as UserAvgScore,
+    ua.LastPostDate,
+    ua.LastActivityDate as UserLastActivityDate,
+    ua.UserCategory,
+    ta.TagName,
+    ta.TagCount,
+    ta.PopularityLevel,
+    ta.TagRank,
+    ta.TagPercentile,
+    ROUND(ta.AvgTagCount, 2) as AvgTagCount,
+    ROUND(ta.MaxTagCount, 2) as MaxTagCount,
+    CASE 
+        WHEN pa.TagCountInPost IN (0, 1) THEN 'Minimal Tags'
+        WHEN pa.TagCountInPost IN (2, 3) THEN 'Few Tags'
+        WHEN pa.TagCountInPost IN (4, 5) THEN 'Moderate Tags'
+        WHEN pa.TagCountInPost IN (6, 7, 8) THEN 'Many Tags'
+        ELSE 'Excessive Tags'
+    END as TagDensity,
+    CASE 
+        WHEN pa.ScoreChange > 0 THEN 'Improved'
+        WHEN pa.ScoreChange < 0 THEN 'Declined'
+        WHEN pa.ScoreChange = 0 THEN 'Stable'
+        ELSE 'No Change'
+    END as ScoreTrend,
+    CASE 
+        WHEN pa.AnswerDistribution = 'Many Answers' AND pa.Score > 50 THEN 'High Engagement'
+        WHEN pa.AnswerDistribution = 'Few Answers' AND pa.Score > 25 THEN 'Moderate Engagement'
+        WHEN pa.AnswerDistribution = 'No Answers' AND pa.Score > 10 THEN 'Low Engagement'
+        ELSE 'Irrelevant'
+    END as EngagementLevel,
+    CASE 
+        WHEN pa.ActivePeriod = 'Week' AND pa.Score > 20 THEN 'Fresh Hot Topic'
+        WHEN pa.ActivePeriod = 'Month' AND pa.Score > 100 THEN 'Established Topic'
+        WHEN pa.ActivePeriod = 'Quarter' AND pa.Score > 500 THEN 'Long-term Popular'
+        ELSE 'Niche Topic'
+    END as TopicPopularity,
+    CASE 
+        WHEN pa.Score > 1000 THEN 'Viral'
+        WHEN pa.Score > 500 THEN 'Trending'
+        WHEN pa.Score > 100 THEN 'Prominent'
+        WHEN pa.Score > 50 THEN 'Noticeable'
+        WHEN pa.Score > 10 THEN 'Marginal'
+        ELSE 'Obscure'
+    END as ViralityClassification,
+    'Post Analysis Complete' as AnalysisStatus,
+    CAST('2024-10-01 12:34:56' AS timestamp) as AnalysisTimestamp,
+    'Performance Benchmark Query' as QueryPurpose,
+    ROUND((pa.Score * pa.TagCountInPost + pa.AnswerCount * pa.CommentCount) / (CASE WHEN pa.DaysActive = 0 THEN 1 ELSE pa.DaysActive END), 2) as ActivityDensity,
+    CASE 
+        WHEN pa.Score > 100 AND pa.AnswerCount > 5 THEN 'High Value Question'
+        WHEN pa.Score > 50 AND pa.AnswerCount > 2 THEN 'Medium Value Question'
+        WHEN pa.Score > 10 THEN 'Low Value Question'
+        ELSE 'Low Interest'
+    END as ValueAssessment,
+    CASE 
+        WHEN pa.AnswerDistribution IN ('Many Answers', 'Moderate Answers') AND pa.Score > 50 THEN 'Well Answered'
+        WHEN pa.AnswerDistribution = 'Few Answers' AND pa.Score > 25 THEN 'Partially Answered'
+        WHEN pa.AnswerDistribution = 'No Answers' AND pa.Score > 10 THEN 'Unanswered'
+        ELSE 'Question Classification'
+    END as AnswerStatus,
+    CASE 
+        WHEN pa.TitleLength > 50 THEN 'Long Title'
+        WHEN pa.TitleLength > 25 THEN 'Medium Title'
+        WHEN pa.TitleLength > 0 THEN 'Short Title'
+        ELSE 'No Title'
+    END as TitleLengthCategory,
+    CASE 
+        WHEN ta.TagCount > 1000 THEN 'Viral Tag'
+        WHEN ta.TagCount > 100 THEN 'Popular Tag'
+        WHEN ta.TagCount > 10 THEN 'Moderate Tag'
+        ELSE 'Niche Tag'
+    END as TagPopularityCategory
+FROM ComplexPostAnalysis pa
+LEFT JOIN UserActivity ua ON pa.OwnerUserId = ua.UserId
+LEFT JOIN TagAnalysis ta ON ta.TagName = (
+    SELECT TRIM(BOTH '<>' FROM SPLIT_PART(pa.Tags, '><', 1))
+    FROM (SELECT pa.Tags) AS sub(tags)
+    WHERE pa.Tags IS NOT NULL AND LENGTH(pa.Tags) > 1
+)
+WHERE pa.Score IS NOT NULL 
+    AND pa.PostId IS NOT NULL
+    AND (pa.Score > 0 OR pa.Score < 0)
+ORDER BY pa.GlobalScoreRank, pa.OwnerUserId
+LIMIT 1000;

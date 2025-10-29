@@ -1,0 +1,137 @@
+-- {"query": "5879.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 904} 
+WITH
+RecentActiveQuestions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.CommentCount,
+    p.AnswerCount
+  FROM Posts p
+  WHERE p.PostTypeId = 1 -- Question
+    AND p.CreationDate >= NOW() - INTERVAL '180 days'
+),
+TopTagContrib AS (
+  SELECT
+    q.PostId,
+    unnest(string_to_array(substring(q.Tags, 2, length(q.Tags)-2), '><')) AS TagName,
+    q.Score,
+    q.ViewCount
+  FROM RecentActiveQuestions q
+),
+TagPopularity AS (
+  SELECT
+    TagName,
+    AVG(Score) AS AvgScore,
+    AVG(ViewCount) AS AvgViews,
+    SUM(AnswerCount) AS TotalAnswers
+  FROM TopTagContrib t
+  GROUP BY TagName
+),
+TagInfluence AS (
+  SELECT
+    tp.TagName,
+    tp.AvgScore,
+    tp.AvgViews,
+    tp.TotalAnswers,
+    (tp.AvgScore * 0.6 + tp.AvgViews * 0.4) AS InfluenceScore
+  FROM TagPopularity tp
+),
+TopInfluentialTags AS (
+  SELECT
+    TagName
+  FROM TagInfluence
+  ORDER BY InfluenceScore DESC
+  LIMIT 10
+),
+QualifiedQuestions AS (
+  SELECT
+    q.Id AS QuestionId,
+    q.Title,
+    q.Tags,
+    q.CreationDate,
+    q.LastActivityDate,
+    q.Score,
+    q.ViewCount,
+    q.OwnerUserId
+  FROM RecentActiveQuestions q
+  JOIN LATERAL (
+    SELECT 1
+    FROM unnest(string_to_array(substring(q.Tags, 2, length(q.Tags)-2), '><')) AS t(tag)
+  ) AS tags ON TRUE
+  WHERE EXISTS (
+    SELECT 1
+    FROM TopInfluentialTags t16
+    WHERE position(t16.TagName IN q.Tags) > 0
+  )
+),
+ActivitySnapshot AS (
+  SELECT
+    qi.QuestionId,
+    qi.Title,
+    qi.CreationDate,
+    qi.LastActivityDate,
+    qi.Score,
+    qi.ViewCount,
+    qi.OwnerUserId,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation,
+    COALESCE(vv.UpVotes, 0) AS UpVotes,
+    COALESCE(vv.DownVotes, 0) AS DownVotes
+  FROM QualifiedQuestions qi
+  LEFT JOIN Users u ON u.Id = qi.OwnerUserId
+  LEFT JOIN (
+    SELECT
+      PostId,
+      SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+      SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+    FROM Votes
+    GROUP BY PostId
+  ) vv ON vv.PostId = qi.QuestionId
+),
+FinalAgg AS (
+  SELECT
+    a.QuestionId,
+    a.Title,
+    a.CreationDate,
+    a.LastActivityDate,
+    a.Score,
+    a.ViewCount,
+    a.OwnerUserId,
+    a.OwnerDisplayName,
+    a.Reputation,
+    a.UpVotes,
+    a.DownVotes,
+    CASE
+      WHEN a.ViewCount >= 1000 THEN 'Hot'
+      WHEN a.ViewCount >= 500 AND a.Score >= 5 THEN 'Trending'
+      ELSE 'Normal'
+    END AS StatusCategory,
+    COUNT(*) OVER () AS TotalQualified
+  FROM ActivitySnapshot a
+  ORDER BY a.LastActivityDate DESC
+  LIMIT 50
+)
+SELECT
+  fa.QuestionId,
+  fa.Title,
+  fa.CreationDate,
+  fa.LastActivityDate,
+  fa.Score,
+  fa.ViewCount,
+  fa.OwnerDisplayName,
+  fa.Reputation,
+  fa.UpVotes,
+  fa.DownVotes,
+  fa.StatusCategory,
+  fa.TotalQualified
+FROM FinalAgg fa
+LEFT JOIN PostLinks pl ON pl.PostId = fa.QuestionId
+LEFT JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+WHERE pl.PostId IS NULL OR lt.Id IS NOT NULL
+ORDER BY fa.LastActivityDate DESC, fa.ViewCount DESC;

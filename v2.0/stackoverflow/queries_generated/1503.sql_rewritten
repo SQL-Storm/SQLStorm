@@ -1,0 +1,193 @@
+-- {"query": "1503.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2996} 
+WITH UserPostContribution AS (
+    -- Aggregates various metrics for posts owned by users
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(DISTINCT p.Id) AS TotalPostsCreated,
+        SUM(p.Score) AS TotalPostScoreSum,
+        SUM(COALESCE(p.ViewCount, 0)) AS TotalPostViewsSum,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersCount,
+        SUM(COALESCE(p.AnswerCount, 0)) AS TotalAnswersReceivedOnQuestions,
+        SUM(COALESCE(p.FavoriteCount, 0)) AS TotalFavoritesReceivedOnQuestions,
+        AVG(CAST(p.Score AS NUMERIC)) AS AvgPostScorePerUser,
+        AVG(LENGTH(p.Body)) AS AvgPostBodyLength,
+        AVG(LENGTH(p.Title)) FILTER (WHERE p.PostTypeId = 1) AS AvgQuestionTitleLength, -- Use FILTER clause
+        MAX(p.CreationDate) AS LatestPostCreationDate,
+        MIN(p.CreationDate) AS EarliestPostCreationDate,
+        -- Complex string operation for tags, handling potential NULL tags gracefully
+        AVG(CASE WHEN p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2 THEN ARRAY_LENGTH(STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><'), 1) ELSE 0 END) AS AvgTagsPerQuestion
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+UserCommentActivity AS (
+    -- Aggregates comment statistics for users
+    SELECT
+        c.UserId,
+        COUNT(c.Id) AS TotalCommentsMade,
+        SUM(c.Score) AS TotalCommentScore,
+        AVG(CAST(c.Score AS NUMERIC)) AS AvgCommentScoreMade,
+        MAX(c.CreationDate) AS LatestCommentDate
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+    GROUP BY c.UserId
+),
+UserVoteSummary AS (
+    -- Aggregates votes given by users and votes received on their posts
+    SELECT
+        u.Id AS UserId,
+        COUNT(DISTINCT v_given.Id) AS TotalVotesGiven,
+        SUM(CASE WHEN v_given.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesGiven,
+        SUM(CASE WHEN v_given.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesGiven,
+        SUM(CASE WHEN v_given.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoritesGiven,
+        SUM(COALESCE(vr.UpVotesReceived, 0)) AS UpVotesReceived,
+        SUM(COALESCE(vr.DownVotesReceived, 0)) AS DownVotesReceived,
+        SUM(COALESCE(vr.AcceptedAnswersReceived, 0)) AS AcceptedAnswersForTheirPosts
+    FROM Users u
+    LEFT JOIN Votes v_given ON u.Id = v_given.UserId
+    LEFT JOIN (
+        -- Correlated subquery to get votes received on posts for each user
+        SELECT
+            p.OwnerUserId AS UserId,
+            COUNT(CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS UpVotesReceived,
+            COUNT(CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS DownVotesReceived,
+            COUNT(CASE WHEN v.VoteTypeId = 1 THEN v.Id END) AS AcceptedAnswersReceived
+        FROM Posts p
+        JOIN Votes v ON p.Id = v.PostId
+        WHERE p.OwnerUserId IS NOT NULL
+        GROUP BY p.OwnerUserId
+    ) AS vr ON u.Id = vr.UserId
+    GROUP BY u.Id
+),
+UserBadgeAndEditSummary AS (
+    -- Consolidates badge awards and post editing activity
+    SELECT
+        u.Id AS UserId,
+        COUNT(DISTINCT b.Id) AS TotalBadgesAwarded,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(DISTINCT ph.PostId) AS PostsEditedByMe, -- Number of distinct posts edited by this user
+        COUNT(ph.Id) AS TotalEditsMadeByMe -- Total history entries related to edits
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId AND ph.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9) -- Edit Title, Body, Tags, and Rollbacks
+    GROUP BY u.Id
+),
+PostLinkEngagement AS (
+    -- Calculates various link metrics for posts
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId AS OwnerUserId,
+        COUNT(pl_out.Id) AS OutgoingLinkCount,
+        COUNT(pl_in.Id) AS IncomingLinkCount,
+        COUNT(pl_dup.Id) AS DuplicateSourceCount, -- This post is marked as a duplicate of others
+        COUNT(pl_isdup.Id) AS IsDuplicateOfCount -- Other posts are marked as a duplicate of this one
+    FROM Posts p
+    LEFT JOIN PostLinks pl_out ON p.Id = pl_out.PostId AND pl_out.LinkTypeId = 1 -- Linked to other posts
+    LEFT JOIN PostLinks pl_in ON p.Id = pl_in.RelatedPostId AND pl_in.LinkTypeId = 1 -- Linked FROM other posts
+    LEFT JOIN PostLinks pl_dup ON p.Id = pl_dup.PostId AND pl_dup.LinkTypeId = 3 -- This post is a duplicate of RelatedPostId
+    LEFT JOIN PostLinks pl_isdup ON p.Id = pl_isdup.RelatedPostId AND pl_isdup.LinkTypeId = 3 -- This post is the original of RelatedPostId
+    GROUP BY p.Id, p.OwnerUserId
+),
+UserAggregatedLinkMetrics AS (
+    -- Aggregates PostLinkEngagement metrics per user
+    SELECT
+        ple.OwnerUserId AS UserId,
+        SUM(ple.OutgoingLinkCount) AS TotalOutgoingLinksFromPosts,
+        SUM(ple.IncomingLinkCount) AS TotalIncomingLinksToPosts,
+        SUM(ple.DuplicateSourceCount) AS TotalDuplicateSources,
+        SUM(ple.IsDuplicateOfCount) AS TotalIsDuplicateOf
+    FROM PostLinkEngagement ple
+    WHERE ple.OwnerUserId IS NOT NULL
+    GROUP BY ple.OwnerUserId
+)
+-- Main query to join all CTEs and apply window functions and complex logic
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    u.Views AS ProfileViews,
+    COALESCE(ups.TotalPostsCreated, 0) AS TotalPosts,
+    COALESCE(ups.TotalPostScoreSum, 0) AS TotalPostScore,
+    COALESCE(uca.TotalCommentsMade, 0) AS TotalComments,
+    COALESCE(uvs.UpVotesReceived, 0) AS UpVotesOnPosts,
+    COALESCE(ubas.GoldBadges, 0) AS GoldBadgesCount,
+    COALESCE(ubas.TotalEditsMadeByMe, 0) AS EditsMade,
+    COALESCE(ualm.TotalIncomingLinksToPosts, 0) AS LinksToUsersPosts,
+
+    -- Complex calculation: Engagement Score
+    (
+        (COALESCE(ups.TotalPostScoreSum, 0) * 0.5) +
+        (COALESCE(uca.TotalCommentScore, 0) * 0.2) +
+        (COALESCE(uvs.UpVotesReceived, 0) * 0.8) +
+        (COALESCE(uvs.AcceptedAnswersForTheirPosts, 0) * 1.5) +
+        (COALESCE(ubas.TotalBadgesAwarded, 0) * 0.3) +
+        (COALESCE(ualm.TotalIncomingLinksToPosts, 0) * 0.7)
+    ) AS EngagementScore,
+
+    -- Calculate activity days for user
+    EXTRACT(DAY FROM AGE(u.LastAccessDate, u.CreationDate)) AS DaysSinceCreation,
+
+    -- Ratio of Upvotes to Downvotes received on posts, handling division by zero and NULLs
+    CASE
+        WHEN COALESCE(uvs.DownVotesReceived, 0) > 0 THEN CAST(COALESCE(uvs.UpVotesReceived, 0) AS NUMERIC) / uvs.DownVotesReceived
+        WHEN COALESCE(uvs.UpVotesReceived, 0) > 0 THEN COALESCE(uvs.UpVotesReceived, 0) -- If no downvotes, but upvotes, show upvotes
+        ELSE 0 -- No upvotes or downvotes
+    END AS UpvoteDownvoteRatioPosts,
+
+    -- Window function: Rank users by Reputation within their CreationDate year
+    RANK() OVER (PARTITION BY EXTRACT(YEAR FROM u.CreationDate) ORDER BY u.Reputation DESC, u.Id) AS RankByReputationInYear,
+
+    -- Window function: Moving average of AvgPostScorePerUser for users created around the same time
+    AVG(COALESCE(ups.AvgPostScorePerUser, 0)) OVER (
+        ORDER BY u.CreationDate
+        RANGE BETWEEN INTERVAL '30 days' PRECEDING AND INTERVAL '30 days' FOLLOWING
+    ) AS AvgPostScoreMovingAvg,
+
+    -- Correlated subquery: Get the title of the user's highest-scored question (if any)
+    (
+        SELECT p_top.Title
+        FROM Posts p_top
+        WHERE p_top.OwnerUserId = u.Id AND p_top.PostTypeId = 1 AND p_top.Title IS NOT NULL
+        ORDER BY p_top.Score DESC, p_top.CreationDate DESC
+        LIMIT 1
+    ) AS TopQuestionTitle,
+
+    -- String expression: Concatenate location and website, using COALESCE for NULLs
+    COALESCE(TRIM(u.Location), 'N/A') || ' | ' || COALESCE(LOWER(u.WebsiteUrl), 'no website') AS UserContactInfo,
+
+    -- Conditional expression based on profile views and post count
+    CASE
+        WHEN u.Views > 5000 AND COALESCE(ups.TotalPostsCreated, 0) > 100 AND COALESCE(ubas.GoldBadges, 0) > 0 THEN 'High-Impact Prolific Veteran'
+        WHEN u.Views > 1000 AND COALESCE(ups.TotalPostsCreated, 0) > 50 THEN 'Active Contributor'
+        WHEN u.Reputation > 10000 AND COALESCE(ubas.GoldBadges, 0) > 0 THEN 'Veteran Elite'
+        WHEN COALESCE(ups.TotalPostsCreated, 0) > 10 OR COALESCE(uca.TotalCommentsMade, 0) > 20 THEN 'Emerging User'
+        ELSE 'Casual User'
+    END AS UserSegment,
+
+    -- NULL logic: Check if AboutMe is significantly long and not NULL, using NULLIF
+    CASE WHEN NULLIF(LENGTH(u.AboutMe), 0) IS NOT NULL AND LENGTH(u.AboutMe) > 500 THEN TRUE ELSE FALSE END AS HasElaborateAboutMe
+
+FROM Users u
+LEFT JOIN UserPostContribution ups ON u.Id = ups.UserId
+LEFT JOIN UserCommentActivity uca ON u.Id = uca.UserId
+LEFT JOIN UserVoteSummary uvs ON u.Id = uvs.UserId
+LEFT JOIN UserBadgeAndEditSummary ubas ON u.Id = ubas.UserId
+LEFT JOIN UserAggregatedLinkMetrics ualm ON u.Id = ualm.UserId
+
+WHERE
+    u.Reputation > 1000 -- Filter for reasonably reputable users
+    AND u.LastAccessDate >= u.CreationDate + INTERVAL '90 days' -- Active for at least 3 months
+    AND (
+        COALESCE(ups.TotalPostsCreated, 0) > 5
+        OR COALESCE(uca.TotalCommentsMade, 0) > 10
+        OR COALESCE(ubas.TotalBadgesAwarded, 0) > 2
+    ) -- Must have some significant activity in at least one area
+    AND u.DisplayName IS NOT NULL AND LENGTH(TRIM(u.DisplayName)) > 0 -- Has a proper display name
+    AND (LOWER(COALESCE(u.Location, '')) LIKE '%usa%' OR LOWER(COALESCE(u.Location, '')) LIKE '%india%' OR u.Location IS NULL) -- Location analysis, including NULLs
+
+ORDER BY EngagementScore DESC, u.Reputation DESC, u.CreationDate
+LIMIT 1000;

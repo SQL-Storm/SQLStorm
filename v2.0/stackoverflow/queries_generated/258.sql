@@ -1,0 +1,334 @@
+-- {"query": "258.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3098} 
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        u.location,
+        coalesce(nullif(trim(u.websiteurl), ''), 'unknown') as website_url_norm,
+        greatest(u.upvotes - u.downvotes, 0) as net_votes,
+        row_number() over (order by u.creationdate desc, u.id) as rn
+    from users u
+    where u.creationdate >= (select date_trunc('month', max(p.creationdate)) - interval '365 days' from posts p)
+),
+questions as (
+    select
+        p.id as question_id,
+        p.owneruserid as owner_user_id,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        p.title,
+        p.tags,
+        p.answercount,
+        p.closeddate,
+        p.acceptedanswerid,
+        p.lastactivitydate,
+        case when p.closeddate is null then 0 else 1 end as is_closed
+    from posts p
+    where p.posttypeid = 1
+),
+answers as (
+    select
+        a.id as answer_id,
+        a.parentid as question_id,
+        a.owneruserid as owner_user_id,
+        a.score as answer_score,
+        a.creationdate as answer_creation
+    from posts a
+    where a.posttypeid = 2
+),
+accepted_answers as (
+    select
+        q.question_id,
+        q.acceptedanswerid as accepted_answer_id
+    from questions q
+    where q.acceptedanswerid is not null
+),
+first_answers as (
+    select
+        a.question_id,
+        a.answer_id,
+        a.owner_user_id,
+        a.answer_score,
+        a.answer_creation,
+        row_number() over (partition by a.question_id order by a.answer_creation asc, a.answer_id) as rn_first
+    from answers a
+),
+user_badges as (
+    select
+        b.userid,
+        count(*) as badge_count,
+        sum(case when b.class = 1 then 1 else 0 end) as gold_count,
+        sum(case when b.class = 2 then 1 else 0 end) as silver_count,
+        sum(case when b.class = 3 then 1 else 0 end) as bronze_count,
+        sum(case when b.tagbased = 1 then 1 else 0 end) as tag_badge_count,
+        min(b.date) as first_badge_date,
+        max(b.date) as last_badge_date
+    from badges b
+    group by b.userid
+),
+question_commenters as (
+    select
+        c.postid as question_id,
+        count(*) filter (where c.userid is not null) as comments_with_user,
+        count(*) filter (where c.userid is null) as comments_anon,
+        count(*) as comments_total,
+        max(c.creationdate) as last_comment_date,
+        sum(c.score) as total_comment_score
+    from comments c
+    join posts p on p.id = c.postid and p.posttypeid = 1
+    group by c.postid
+),
+question_votes as (
+    select
+        v.postid as question_id,
+        count(*) filter (where v.votetypeid = 2) as upvotes,
+        count(*) filter (where v.votetypeid = 3) as downvotes,
+        count(*) filter (where v.votetypeid = 5) as favorites,
+        count(*) filter (where v.votetypeid = 8) as bounties_started,
+        sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_total
+    from votes v
+    join posts p on p.id = v.postid and p.posttypeid = 1
+    group by v.postid
+),
+duplicate_links as (
+    select
+        pl.postid as question_id,
+        count(*) filter (where pl.linktypeid = 3) as dup_link_count,
+        count(*) filter (where pl.linktypeid = 1) as plain_link_count,
+        max(pl.creationdate) as last_link_date
+    from postlinks pl
+    group by pl.postid
+),
+close_events as (
+    select
+        ph.postid as question_id,
+        min(case when ph.posthistorytypeid = 10 then ph.creationdate end) as first_close_date,
+        max(case when ph.posthistorytypeid = 11 then ph.creationdate end) as last_reopen_date,
+        max(case when ph.posthistorytypeid = 10 then ph.creationdate end) as last_close_date,
+        count(*) filter (where ph.posthistorytypeid = 10) as close_events,
+        count(*) filter (where ph.posthistorytypeid = 11) as reopen_events,
+        max(case when ph.posthistorytypeid = 10 then nullif(ph.comment,'') end) as last_close_reason_raw
+    from posthistory ph
+    where ph.posthistorytypeid in (10,11)
+    group by ph.postid
+),
+tag_explode as (
+    select
+        q.question_id,
+        unnest(string_to_array(substring(q.tags, 2, length(q.tags)-2), '><')) as tagname
+    from questions q
+    where q.tags is not null and q.tags like '<%>'
+),
+tag_density as (
+    select
+        te.question_id,
+        count(*) as tag_count,
+        string_agg(te.tagname, ',' order by te.tagname) as tag_list
+    from tag_explode te
+    group by te.question_id
+),
+user_activity as (
+    select
+        ru.user_id,
+        count(distinct q.question_id) as questions_posted,
+        count(distinct a.answer_id) as answers_posted,
+        coalesce(sum(q.score), 0) as sum_question_score,
+        coalesce(sum(a.answer_score), 0) as sum_answer_score,
+        max(coalesce(q.lastactivitydate, ru.creationdate)) as last_seen_activity
+    from recent_users ru
+    left join questions q on q.owner_user_id = ru.user_id
+    left join answers a on a.owner_user_id = ru.user_id
+    group by ru.user_id
+),
+accepted_vs_first as (
+    select
+        q.question_id,
+        case when aa.accepted_answer_id is not null then 1 else 0 end as has_accepted,
+        case when fa.rn_first = 1 then fa.answer_id end as first_answer_id,
+        case when aa.accepted_answer_id = fa.answer_id and fa.rn_first = 1 then 1 else 0 end as accepted_is_first,
+        case when aa.accepted_answer_id is not null and aa.accepted_answer_id <> coalesce(fa.answer_id, -1) then 1 else 0 end as accepted_not_first
+    from questions q
+    left join accepted_answers aa on aa.question_id = q.question_id
+    left join first_answers fa on fa.question_id = q.question_id and fa.rn_first = 1
+),
+ranked_questions as (
+    select
+        q.*,
+        coalesce(qv.upvotes,0) - coalesce(qv.downvotes,0) as net_votes,
+        coalesce(qv.favorites,0) as favs,
+        coalesce(qv.bounties_started,0) as bounties_started,
+        coalesce(qv.bounty_total,0) as bounty_total,
+        coalesce(qc.comments_total,0) as comments_total,
+        coalesce(qc.total_comment_score,0) as comment_score_total,
+        coalesce(dl.dup_link_count,0) as duplicates_count,
+        coalesce(dl.plain_link_count,0) as links_count,
+        coalesce(td.tag_count,0) as tag_count,
+        td.tag_list,
+        ce.first_close_date,
+        ce.last_reopen_date,
+        ce.last_close_date,
+        ce.close_events,
+        ce.reopen_events,
+        ce.last_close_reason_raw,
+        case
+            when q.viewcount is null or q.viewcount = 0 then null
+            else q.score::numeric / nullif(q.viewcount,0)
+        end as score_per_view,
+        case
+            when q.answercount is null or q.answercount = 0 then null
+            else q.score::numeric / nullif(q.answercount,0)
+        end as score_per_answer
+    from questions q
+    left join question_votes qv on qv.question_id = q.question_id
+    left join question_commenters qc on qc.question_id = q.question_id
+    left join duplicate_links dl on dl.question_id = q.question_id
+    left join tag_density td on td.question_id = q.question_id
+    left join close_events ce on ce.question_id = q.question_id
+),
+owner_enriched as (
+    select
+        rq.*,
+        ru.displayname as owner_displayname,
+        ru.reputation as owner_reputation,
+        ru.website_url_norm,
+        ru.net_votes as owner_net_votes,
+        ua.questions_posted as owner_q_count,
+        ua.answers_posted as owner_a_count,
+        coalesce(ub.badge_count,0) as owner_badges,
+        coalesce(ub.gold_count,0) as owner_gold,
+        coalesce(ub.silver_count,0) as owner_silver,
+        coalesce(ub.bronze_count,0) as owner_bronze
+    from ranked_questions rq
+    left join recent_users ru on ru.user_id = rq.owner_user_id
+    left join user_activity ua on ua.user_id = rq.owner_user_id
+    left join user_badges ub on ub.userid = rq.owner_user_id
+),
+scored as (
+    select
+        oe.*,
+        avf.has_accepted,
+        avf.accepted_is_first,
+        avf.accepted_not_first,
+        -- composite score using various factors
+        (
+            coalesce(oe.net_votes,0) * 3
+          + coalesce(oe.favs,0) * 2
+          + coalesce(oe.bounty_total,0) * 0.1
+          + coalesce(oe.comment_score_total,0) * 0.5
+          + coalesce(oe.duplicates_count,0) * -5
+          + coalesce(oe.is_closed,0) * -10
+          + case when avf.accepted_is_first = 1 then 7 when avf.has_accepted = 1 then 3 else 0 end
+          + least(coalesce(oe.tag_count,0), 5) -- cap tag diversity
+        )::numeric as composite_score,
+        percent_rank() over (order by coalesce(oe.net_votes,0), coalesce(oe.viewcount,0)) as pr_votes_views,
+        ntile(10) over (order by coalesce(oe.viewcount,0) desc nulls last) as decile_views,
+        row_number() over (partition by coalesce(oe.tag_count,0) order by coalesce(oe.score_per_view,0) desc nulls last) as rn_by_tagcount
+    from owner_enriched oe
+    left join accepted_vs_first avf on avf.question_id = oe.question_id
+),
+topn as (
+    (
+        select s.*
+        from scored s
+        where s.creationdate >= now() - interval '90 days'
+        order by s.composite_score desc nulls last
+        limit 200
+    )
+    union all
+    (
+        select s.*
+        from scored s
+        where s.creationdate < now() - interval '90 days'
+        order by s.pr_votes_views desc nulls last, s.viewcount desc nulls last
+        limit 200
+    )
+),
+dedup as (
+    select
+        t.*,
+        row_number() over (partition by t.question_id order by t.composite_score desc nulls last, t.creationdate desc) as rn
+    from topn t
+)
+select
+    d.question_id,
+    coalesce(d.title, '(no title)') as title,
+    d.creationdate,
+    d.lastactivitydate,
+    d.owner_user_id,
+    coalesce(d.owner_displayname, d.owner_user_id::varchar) as owner_displayname,
+    d.owner_reputation,
+    d.owner_net_votes,
+    d.owner_q_count,
+    d.owner_a_count,
+    d.owner_badges,
+    d.owner_gold,
+    d.owner_silver,
+    d.owner_bronze,
+    d.website_url_norm,
+    d.viewcount,
+    d.score,
+    d.answercount,
+    d.comments_total,
+    d.net_votes,
+    d.favs,
+    d.bounties_started,
+    d.bounty_total,
+    d.duplicates_count,
+    d.links_count,
+    d.tag_count,
+    coalesce(d.tag_list, '') as tag_list,
+    d.is_closed,
+    d.first_close_date,
+    d.last_reopen_date,
+    d.last_close_date,
+    d.close_events,
+    d.reopen_events,
+    d.last_close_reason_raw,
+    d.score_per_view,
+    d.score_per_answer,
+    d.has_accepted,
+    d.accepted_is_first,
+    d.accepted_not_first,
+    d.composite_score,
+    d.pr_votes_views,
+    d.decile_views,
+    d.rn_by_tagcount,
+    -- complicated predicate-driven bucket
+    case
+        when d.is_closed = 1 and d.duplicates_count > 0 then 'closed-duplicate'
+        when d.is_closed = 1 then 'closed-other'
+        when d.has_accepted = 1 and d.score >= 5 then 'answered-popular'
+        when d.has_accepted = 1 then 'answered'
+        when d.answercount >= 1 then 'unaccepted-answered'
+        when d.comments_total > 5 and d.net_votes < 0 then 'controversial'
+        else 'open'
+    end as status_bucket,
+    -- string manipulation sample
+    lower(
+        regexp_replace(
+            coalesce(d.title, ''),
+            '\s+',
+            ' ',
+            'g'
+        )
+    ) as title_slugish,
+    -- null logic example
+    coalesce(nullif(d.owner_displayname, ''), '(user ' || d.owner_user_id::varchar || ')') as owner_displayname_safe
+from dedup d
+where d.rn = 1
+  and (
+        d.tag_count is null
+        or d.tag_count between 1 and 5
+        or (d.tag_count > 5 and d.net_votes >= 0)
+      )
+  and (
+        d.viewcount is null
+        or d.viewcount >= 0
+      )
+order by
+    d.composite_score desc nulls last,
+    d.viewcount desc nulls last,
+    d.creationdate desc;

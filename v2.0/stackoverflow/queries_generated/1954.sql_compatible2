@@ -1,0 +1,191 @@
+WITH UserReputationGrowth AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        MIN(b.Date) AS FirstBadgeDate,
+        MAX(b.Date) AS LastBadgeDate,
+        EXTRACT(DAY FROM (u.LastAccessDate - u.CreationDate)) AS AccountAgeDays,
+        COALESCE(u.Views, 0) AS UserViews,
+        CAST(u.Reputation AS numeric) / NULLIF(EXTRACT(DAY FROM (u.LastAccessDate - u.CreationDate)) + 1, 0) AS AvgReputationPerDay,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.CreationDate ASC) AS RankByReputation
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= TIMESTAMP '2020-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views
+),
+PostHistoryTimeline AS (
+    SELECT
+        ph.Id AS HistoryId,
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        pht.Name AS HistoryTypeName,
+        ph.CreationDate AS HistoryDate,
+        ph.Comment,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate ASC) AS RnHistory,
+        LAG(ph.CreationDate, 1) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate ASC) AS PreviousHistoryDate,
+        LEAD(ph.CreationDate, 1) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate ASC) AS NextHistoryDate
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    WHERE ph.CreationDate >= TIMESTAMP '2020-01-01'
+),
+PostEngagementMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.LastEditDate,
+        p.LastActivityDate,
+        COALESCE(p.Score, 0) AS PostScore,
+        COALESCE(p.ViewCount, 0) AS PostViewCount,
+        COALESCE(p.AnswerCount, 0) AS PostAnswerCount,
+        COALESCE(p.CommentCount, 0) AS PostCommentCount,
+        COALESCE(p.FavoriteCount, 0) AS PostFavoriteCount,
+        p.Title,
+        p.Tags,
+        p.AcceptedAnswerId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesReceived,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesReceived,
+        (SELECT AVG(ap.Score)
+         FROM Posts ap
+         WHERE ap.ParentId = p.Id AND ap.PostTypeId = 2) AS AverageAnswerScore,
+        CASE WHEN EXISTS (SELECT 1 FROM Posts acc_a WHERE acc_a.Id = p.AcceptedAnswerId AND acc_a.PostTypeId = 2) THEN TRUE ELSE FALSE END AS HasAcceptedAnswer,
+        (SELECT MAX(c.Score) FROM Comments c WHERE c.PostId = p.Id AND (p.LastEditDate IS NULL OR c.CreationDate > p.LastEditDate)) AS MaxRecentCommentScore,
+        (CASE
+            WHEN p.Tags IS NULL THEN 0
+            ELSE array_length(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><'), 1)
+         END) AS TagCount,
+        (SELECT MIN(ht.HistoryDate) FROM PostHistoryTimeline ht WHERE ht.PostId = p.Id AND ht.HistoryTypeName = 'Initial Title') AS InitialTitleHistoryDate,
+        (SELECT MAX(ht.HistoryDate) FROM PostHistoryTimeline ht WHERE ht.PostId = p.Id AND ht.HistoryTypeName IN ('Edit Title', 'Edit Body', 'Edit Tags')) AS LastEditHistoryDate,
+        (SELECT MIN(pl.CreationDate) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3) AS FirstDuplicateLinkDate
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= TIMESTAMP '2020-01-01'
+    GROUP BY p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.LastEditDate, p.LastActivityDate,
+             p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.Title, p.Tags, p.AcceptedAnswerId
+    HAVING COALESCE(p.Score, 0) > 10 OR COALESCE(p.ViewCount, 0) > 100
+),
+PostModerationEvents AS (
+    SELECT
+        p.Id AS PostId,
+        COUNT(DISTINCT CASE WHEN phtl.HistoryTypeName = 'Post Closed' THEN phtl.HistoryId ELSE NULL END) AS CloseCount,
+        COUNT(DISTINCT CASE WHEN phtl.HistoryTypeName = 'Post Reopened' THEN phtl.HistoryId ELSE NULL END) AS ReopenCount,
+        MAX(CASE WHEN phtl.HistoryTypeName = 'Post Closed' THEN 1 ELSE 0 END) AS WasClosedEver,
+        MAX(CASE WHEN phtl.HistoryTypeName = 'Post Reopened' THEN 1 ELSE 0 END) AS WasReopenedEver,
+        MAX(CASE WHEN phtl.HistoryTypeName = 'Post Closed' THEN phtl.HistoryDate ELSE NULL END) AS LastClosedDate,
+        MAX(CASE WHEN phtl.HistoryTypeName = 'Post Reopened' THEN phtl.HistoryDate ELSE NULL END) AS LastReopenedDate,
+        (
+            SELECT crc.Name
+            FROM PostHistoryTimeline phtl_inner
+            JOIN CloseReasonTypes crc ON crc.Id = CAST(phtl_inner.Comment AS SMALLINT)
+            WHERE phtl_inner.PostId = p.Id
+              AND phtl_inner.HistoryTypeName = 'Post Closed'
+            ORDER BY phtl_inner.HistoryDate DESC
+            LIMIT 1
+        ) AS LastCloseReason,
+        MIN(CASE WHEN phtl.HistoryTypeName = 'Post Closed' THEN EXTRACT(EPOCH FROM (phtl.HistoryDate - p.CreationDate)) ELSE NULL END) AS TimeToFirstCloseSeconds
+    FROM Posts p
+    LEFT JOIN PostHistoryTimeline phtl ON p.Id = phtl.PostId
+    WHERE p.PostTypeId = 1 AND p.CreationDate >= TIMESTAMP '2020-01-01'
+    GROUP BY p.Id, p.CreationDate
+)
+SELECT
+    URG.UserId,
+    URG.DisplayName AS UserDisplayName,
+    URG.Reputation,
+    URG.TotalBadges,
+    PEM.PostId,
+    PEM.Title AS PostTitle,
+    PEM.PostScore,
+    PEM.PostViewCount,
+    PEM.PostAnswerCount,
+    PEM.PostCommentCount,
+    PEM.HasAcceptedAnswer,
+    PEM.AverageAnswerScore,
+    PEM.MaxRecentCommentScore,
+    PEM.TagCount,
+    replace(replace(lower(PEM.Title), ' ', '_'), '-', '_') AS StandardizedTitleFragment,
+    COALESCE(PME.WasClosedEver, 0) AS IsClosed,
+    COALESCE(PME.LastCloseReason, 'N/A') AS FinalCloseReason,
+    CASE
+        WHEN URG.Reputation > 50000 AND PEM.PostScore > 100 AND PEM.HasAcceptedAnswer = TRUE THEN 'Elite Author - High Impact & Accepted'
+        WHEN URG.Reputation > 10000 AND PEM.PostScore > 50 THEN 'Pro Author - Significant Post'
+        WHEN URG.Reputation > 1000 AND PEM.PostScore > 20 THEN 'Experienced Author - Popular Post'
+        WHEN URG.Reputation < 500 AND PEM.UpvotesReceived > 10 AND PEM.LastEditHistoryDate IS NOT NULL THEN 'Rising Author - Engaged Post'
+        ELSE 'General Activity'
+    END AS EngagementCategory,
+    (SELECT COUNT(DISTINCT cmt.Id)
+     FROM Comments cmt
+     WHERE cmt.PostId = PEM.PostId AND cmt.UserId IS NULL) AS AnonymousCommentCount,
+    EXTRACT(EPOCH FROM (PEM.LastActivityDate - PEM.PostCreationDate)) / 3600.0 AS HoursSinceCreationToLastActivity,
+    NULLIF(URG.GoldBadges, 0) * PEM.PostScore AS WeightedUserPostScore,
+    CASE
+        WHEN PEM.Tags ~ '(<java>|<c#>.+?)' THEN 'Java/C# Related'
+        WHEN PEM.Tags ~ '(<python>|<javascript>.+?)' THEN 'Python/JS Related'
+        ELSE 'Other Tech Stack'
+    END AS TechStackCategory,
+    NULLIF(EXTRACT(DAY FROM (TIMESTAMP '2024-10-01 12:34:56' - PEM.PostCreationDate)), 0) / NULLIF(PEM.PostViewCount, 0) AS PostViewLongevityRatio
+FROM UserReputationGrowth URG
+INNER JOIN PostEngagementMetrics PEM ON URG.UserId = PEM.OwnerUserId
+LEFT JOIN PostModerationEvents PME ON PEM.PostId = PME.PostId
+WHERE
+    URG.AvgReputationPerDay IS NOT NULL
+    AND URG.AccountAgeDays > 60
+    AND PEM.PostTypeId = 1
+    AND (
+        (PEM.PostScore >= 75 AND PEM.PostViewCount >= 7500 AND PEM.PostAnswerCount >= 7)
+        OR
+        (PEM.HasAcceptedAnswer = TRUE AND PEM.AverageAnswerScore >= 15 AND URG.GoldBadges >= 2)
+        OR
+        (PEM.LastEditHistoryDate IS NOT NULL AND (PEM.LastEditHistoryDate - PEM.PostCreationDate) < INTERVAL '15 days' AND COALESCE(PME.WasClosedEver,0) = 0 AND PEM.UpvotesReceived > COALESCE(PEM.DownvotesReceived,0) * 2)
+    )
+    AND EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = URG.UserId AND b.Name IN ('Epic', 'Legendary'))
+    AND (PEM.Tags ILIKE '%<sql>%' OR PEM.Tags ILIKE '%<optimization>%')
+    AND URG.LastAccessDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6 months'
+UNION ALL
+SELECT
+    URG.UserId,
+    URG.DisplayName AS UserDisplayName,
+    URG.Reputation,
+    URG.TotalBadges,
+    PEM.PostId,
+    PEM.Title AS PostTitle,
+    PEM.PostScore,
+    PEM.PostViewCount,
+    PEM.PostAnswerCount,
+    PEM.PostCommentCount,
+    PEM.HasAcceptedAnswer,
+    PEM.AverageAnswerScore,
+    PEM.MaxRecentCommentScore,
+    PEM.TagCount,
+    replace(replace(lower(PEM.Title), ' ', '_'), '-', '_') AS StandardizedTitleFragment,
+    COALESCE(PME.WasClosedEver, 0) AS IsClosed,
+    COALESCE(PME.LastCloseReason, 'N/A') AS FinalCloseReason,
+    'Recently Reopened & Highly Voted' AS EngagementCategory,
+    (SELECT COUNT(DISTINCT cmt.Id) FROM Comments cmt WHERE cmt.PostId = PEM.PostId AND cmt.UserId IS NULL) AS AnonymousCommentCount,
+    EXTRACT(EPOCH FROM (PEM.LastActivityDate - PEM.PostCreationDate)) / 3600.0 AS HoursSinceCreationToLastActivity,
+    NULLIF(URG.GoldBadges, 0) * PEM.PostScore AS WeightedUserPostScore,
+    CASE
+        WHEN PEM.Tags ~ '(<performance>|<benchmark>|<scaling>.+?)' THEN 'Performance Related'
+        WHEN PEM.Tags ~ '(<security>|<privacy>.+?)' THEN 'Security Related'
+        ELSE 'Other Focus'
+    END AS TechStackCategory,
+    NULLIF(EXTRACT(DAY FROM (TIMESTAMP '2024-10-01 12:34:56' - PEM.PostCreationDate)), 0) / NULLIF(PEM.PostViewCount, 0) AS PostViewLongevityRatio
+FROM UserReputationGrowth URG
+INNER JOIN PostEngagementMetrics PEM ON URG.UserId = PEM.OwnerUserId
+INNER JOIN PostModerationEvents PME ON PEM.PostId = PME.PostId
+WHERE
+    URG.Reputation > 5000
+    AND PME.WasReopenedEver = 1
+    AND PEM.UpvotesReceived > 50
+    AND PEM.PostCommentCount >= 5
+    AND EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = URG.UserId AND b.Name = 'Reviewer')
+    AND PEM.LastActivityDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '3 months'
+ORDER BY WeightedUserPostScore DESC, PostViewLongevityRatio ASC
+LIMIT 200;

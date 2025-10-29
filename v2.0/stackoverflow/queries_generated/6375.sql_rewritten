@@ -1,0 +1,67 @@
+-- {"query": "6375.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-micro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 688} 
+SELECT 
+    u.DisplayName, 
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    MAX(p.Score) AS HighestScoredPost,
+    MIN(p.CreationDate) AS FirstPostDate,
+    MAX(p.LastActivityDate) AS LastActivityDate,
+    b.Name AS LatestBadge,
+    v.Name AS MostRecentVote,
+    AVG(p.ViewCount) AS AvgViewsPerPost,
+    AVG(p.Score) AS AvgScorePerPost,
+    STRING_AGG(DISTINCT t.TagName, ', ') AS MostCommonTags
+FROM 
+    Users u
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    (SELECT 
+         ph.PostId, 
+         ph.CreationDate AS LastEditDate, 
+         ph.Text AS LastEditComment,
+         ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+     FROM 
+         PostHistory ph
+     WHERE 
+         ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 19, 20, 35)
+    ) ph ON u.Id = ph.PostId AND ph.rn = 1
+LEFT JOIN 
+    Votes v ON u.Id = v.UserId
+LEFT JOIN 
+    (SELECT 
+         p.OwnerUserId, 
+         MAX(v.CreationDate) AS LastVoteDate
+     FROM 
+         Votes v
+     JOIN 
+         Posts p ON v.PostId = p.Id
+     GROUP BY 
+         p.OwnerUserId
+    ) lv ON u.Id = lv.OwnerUserId
+JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    (SELECT 
+         t.Id, 
+         t.TagName, 
+         STRING_AGG(p.Title, ', ') WITHIN GROUP AS ORDER BY p.CreationDate DESC AS Posts
+     FROM 
+         Tags t
+     JOIN 
+         Posts p ON t.ExcerptPostId = p.Id
+     GROUP BY 
+         t.Id, t.TagName
+    ) t ON FIND_IN_SET(t.Id, p.Tags) > 0
+WHERE 
+    u.Reputation > 1000
+    AND p.CreationDate >= DATE_SUB(cast('2024-10-01 12:34:56' as timestamp), INTERVAL 1 YEAR)
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation, b.Name, v.Name
+HAVING 
+    COUNT(DISTINCT CASE WHEN ph.PostId IS NOT NULL THEN ph.PostId END) > 1
+ORDER BY 
+    u.Reputation DESC, 
+    TotalPosts DESC;

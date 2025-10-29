@@ -1,0 +1,112 @@
+-- {"query": "2105.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1211} 
+with RecursiveBadges as (
+    select b.Id, b.UserId, b.Name, b.Class, b.Date,
+           row_number() over (partition by b.UserId order by b.Date desc) as rn
+    from Badges b
+    where b.TagBased = 0
+),
+LatestBadges as (
+    select Id, UserId, Name, Class, Date
+    from RecursiveBadges
+    where rn <= 3
+),
+PostScoreStats as (
+    select p.OwnerUserId,
+           count(*) filter (where p.PostTypeId = 1) as question_count,
+           count(*) filter (where p.PostTypeId = 2) as answer_count,
+           coalesce(avg(p.Score), 0) as avg_score,
+           coalesce(max(p.Score), 0) as max_score,
+           sum(p.ViewCount) as total_views
+    from Posts p
+    where p.OwnerUserId is not null and p.OwnerUserId <> -1
+    group by p.OwnerUserId
+),
+UserActivityWindow as (
+    select u.Id, u.DisplayName, u.Reputation, u.CreationDate,
+           count(distinct ph.Id) as post_edits,
+           count(distinct c.Id) as comments_made,
+           count(distinct v.Id) filter (where v.VoteTypeId = 2) as upvotes_given,
+           row_number() over (order by u.Reputation desc) as user_rank
+    from Users u
+    left join PostHistory ph on ph.UserId = u.Id and ph.CreationDate > u.CreationDate and ph.CreationDate < current_timestamp
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+DuplicateQuestions as (
+    select distinct pl.PostId as DuplicateQuestionId, pl.RelatedPostId as OriginalQuestionId
+    from PostLinks pl
+    join Posts p1 on p1.Id = pl.PostId and p1.PostTypeId = 1
+    join Posts p2 on p2.Id = pl.RelatedPostId and p2.PostTypeId = 1
+    where pl.LinkTypeId = 3
+),
+TopQuestionsWithAnswers as (
+    select q.Id as QuestionId,
+           q.Title,
+           q.Tags,
+           q.CreationDate as QuestionDate,
+           q.Score as QuestionScore,
+           a.Id as AnswerId,
+           a.CreationDate as AnswerDate,
+           a.Score as AnswerScore,
+           u.Id as OwnerId,
+           u.DisplayName,
+           dense_rank() over (partition by q.Id order by a.Score desc nulls last) as answer_rank,
+           coalesce(lc.CloseReasonId, 0) as CloseReasonId
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Users u on u.Id = q.OwnerUserId
+    left join (
+        select ph.PostId, cast(ph.Comment as int) as CloseReasonId
+        from PostHistory ph
+        where ph.PostHistoryTypeId = 10
+    ) lc on lc.PostId = q.Id
+    where q.PostTypeId = 1
+),
+FrequentTagUsers as (
+    select unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><')) as Tag,
+           p.OwnerUserId
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+),
+UserTagCount as (
+    select Tag, OwnerUserId, count(*) as QuestionCount
+    from FrequentTagUsers
+    group by Tag, OwnerUserId
+),
+TopTagUsers as (
+    select distinct on (Tag) Tag, OwnerUserId, QuestionCount
+    from UserTagCount
+    order by Tag, QuestionCount desc
+)
+select uaw.user_rank, uaw.DisplayName, uaw.Reputation, uaw.CreationDate,
+       pss.question_count, pss.answer_count, pss.avg_score, pss.max_score, pss.total_views,
+       lb.Name as RecentBadgeName, lb.Class as RecentBadgeClass,
+       dq.DuplicateQuestionId, dq.OriginalQuestionId,
+       tqa.QuestionId, tqa.Title,
+       tqa.QuestionDate, tqa.QuestionScore, tqa.AnswerId, tqa.AnswerDate, tqa.AnswerScore,
+       tqa.answer_rank,
+       crt.Name as CloseReasonName,
+       ttu.Tag as TopTag, ttu.OwnerUserId as TopTagUserId, ttu.QuestionCount as TopTagQuestionCount
+from UserActivityWindow uaw
+left join PostScoreStats pss on pss.OwnerUserId = uaw.Id
+left join LatestBadges lb on lb.UserId = uaw.Id
+left join DuplicateQuestions dq on dq.DuplicateQuestionId in (
+    select p.Id from Posts p where p.OwnerUserId = uaw.Id and p.PostTypeId = 1
+)
+left join TopQuestionsWithAnswers tqa on tqa.OwnerId = uaw.Id
+left join CloseReasonTypes crt on crt.Id = tqa.CloseReasonId
+left join TopTagUsers ttu on ttu.OwnerUserId = uaw.Id
+where uaw.Reputation > (
+    select percentile_cont(0.75) within group (order by Reputation) from Users
+)
+and (
+    (pss.avg_score > 5 and pss.question_count > 10)
+    or (pss.answer_count > 20 and pss.total_views > 10000)
+)
+and (
+    lb.Class = 1
+    or lb.Name like '%Expert%'
+)
+order by uaw.user_rank
+limit 100;

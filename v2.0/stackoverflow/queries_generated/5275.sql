@@ -1,0 +1,105 @@
+-- {"query": "5275.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 774} 
+WITH tagged_activity AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.PostTypeId,
+    p.OwnerUserId,
+    array_to_string(string_to_array(p.Tags, '><'), ',') AS TagList,
+    p.Score,
+    p.ViewCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.LastActivityDate,
+    p.LastEditDate,
+    p.ContentLicense
+  FROM Posts p
+  WHERE p.PostTypeId = 1 -- questions
+),
+recent_votes AS (
+  SELECT
+    v.PostId,
+    v.VoteTypeId,
+    v.UserId,
+    v.CreationDate,
+    v.BountyAmount,
+    u.Reputation,
+    u.DisplayName,
+    u.AccountId
+  FROM Votes v
+  LEFT JOIN Users u ON v.UserId = u.Id
+  WHERE v.CreationDate >= NOW() - INTERVAL '90 days'
+),
+top_tag_interactions AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS tag_count,
+    AVG(st.Reputation) AS avg_reputation
+  FROM Tags tg
+  JOIN Posts p ON tg.WikiPostId = p.Id OR tg.Id = p.Id
+  LEFT JOIN unnest(string_to_array(p.Tags, '><')) AS t(TagName) ON TRUE
+  LEFT JOIN Users st ON p.OwnerUserId = st.Id
+  GROUP BY t.TagName
+  ORDER BY tag_count DESC
+  LIMIT 50
+),
+complex_derived AS (
+  SELECT
+    ph.PostId,
+    ph.PostHistoryTypeId,
+    ph.UserId,
+    ph.CreationDate,
+    ph.Text,
+    ph.Comment
+  FROM PostHistory ph
+  WHERE ph.PostHistoryTypeId IN (10, 16, 52, 53) -- close, community ownership, hot questions
+)
+SELECT
+  ta.PostId,
+  ta.Title,
+  ta.TagList,
+  ta.CreationDate AS PostCreationDate,
+  ta.Score,
+  ta.ViewCount,
+  ta.LastActivityDate,
+  ta.LastEditDate,
+  ra.RecentActivityScore AS RecActivityScore,
+  string_agg(DISTINCT v.VoteTypeId::text, ',' ORDER BY v.VoteTypeId) AS VoteTypesAlongPost,
+  u.DisplayName AS OwnerDisplayName,
+  u.Reputation AS OwnerReputation,
+  jsonb_build_object(
+    'TopTags', NULL,
+    'TopInteractors', NULL
+  ) AS Supplement
+FROM tagged_activity ta
+LEFT JOIN (
+  SELECT
+    vv.PostId,
+    SUM(CASE WHEN vv.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+    SUM(CASE WHEN vv.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+  FROM Votes vv
+  GROUP BY vv.PostId
+) v ON ta.PostId = v.PostId
+LEFT JOIN Users u ON ta.OwnerUserId = u.Id
+LEFT JOIN (
+  SELECT PostId, COUNT(*) AS RecentActivityScore
+  FROM recent_votes
+  GROUP BY PostId
+) ra ON ta.PostId = ra.PostId
+LEFT JOIN top_tag_interactions tti ON ta.Title = tti.TagName
+LEFT JOIN complex_derived cd ON ta.PostId = cd.PostId
+GROUP BY
+  ta.PostId,
+  ta.Title,
+  ta.TagList,
+  ta.CreationDate,
+  ta.Score,
+  ta.ViewCount,
+  ta.LastActivityDate,
+  ta.LastEditDate,
+  ra.RecentActivityScore,
+  u.DisplayName,
+  u.Reputation
+ORDER BY ta.CreationDate DESC
+LIMIT 100;

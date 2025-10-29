@@ -1,0 +1,199 @@
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+    COUNT(DISTINCT b.Id) AS Badges,
+    AVG(CAST(p.Score AS DOUBLE PRECISION)) AS AvgScore,
+    MAX(p.ViewCount) AS MaxViews,
+    STRING_AGG(DISTINCT p.Title, ', ') AS PostTitles,
+    STRING_AGG(DISTINCT t.TagName, ', ') AS Tags,
+    COALESCE(
+        (SELECT STRING_AGG(CAST(ph2.PostHistoryTypeId AS VARCHAR), ', ')
+         FROM PostHistory ph2
+         WHERE ph2.PostId = p.Id
+           AND ph2.CreationDate > DATE '2023-01-01'
+           AND ph2.CreationDate < DATE '2024-01-01'
+           AND ph2.PostHistoryTypeId IN (1,2,3,4,5,6)
+        ),
+        'No recent edits'
+    ) AS RecentEdits,
+    CASE 
+        WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 0 
+        THEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) * 100.0 / COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END)
+        ELSE 0 
+    END AS AnswerToQuestionRatio,
+    (SELECT COUNT(*) 
+     FROM Votes v 
+     WHERE v.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = u.Id) 
+       AND v.VoteTypeId IN (2,3)
+       AND v.CreationDate > DATE '2023-01-01'
+    ) AS NetVotes,
+    (SELECT COUNT(*) 
+     FROM Comments c 
+     WHERE c.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = u.Id)
+    ) AS CommentCount,
+    (SELECT COUNT(DISTINCT ph3.PostId) 
+     FROM PostHistory ph3 
+     WHERE ph3.UserId = u.Id 
+       AND ph3.PostHistoryTypeId = 14
+    ) AS PostLockedCount,
+    (SELECT STRING_AGG('Q' || p1.Id || ':' || p1.Title, ' | ')
+     FROM Posts p1
+     INNER JOIN PostLinks pl ON p1.Id = pl.PostId
+     WHERE pl.RelatedPostId IN (SELECT Id FROM Posts WHERE OwnerUserId = u.Id)
+       AND pl.LinkTypeId = 1
+    ) AS LinkedQuestions,
+    LAG(COUNT(DISTINCT p.Id)) OVER (ORDER BY u.CreationDate) AS PrevUserPosts,
+    DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+    NTILE(100) OVER (ORDER BY u.Reputation) AS ReputationPercentile,
+    ROW_NUMBER() OVER (PARTITION BY u.AccountId ORDER BY u.CreationDate) AS AccountUserRank,
+    CASE 
+        WHEN u.WebsiteUrl IS NOT NULL AND u.WebsiteUrl <> '' THEN 'Has Website'
+        ELSE 'No Website'
+    END AS WebsiteStatus,
+    CASE 
+        WHEN u.Location IS NOT NULL AND u.Location <> '' AND u.Location <> ' ' THEN 'Has Location'
+        ELSE 'No Location'
+    END AS LocationStatus,
+    (SELECT COUNT(*) 
+     FROM Badges b2 
+     WHERE b2.UserId = u.Id 
+       AND b2.Date > DATE '2023-01-01'
+    ) AS RecentBadges,
+    (SELECT STRING_AGG(DISTINCT b3.Name, ', ')
+     FROM Badges b3
+     WHERE b3.UserId = u.Id
+       AND b3.Date > DATE '2023-01-01'
+       AND EXISTS (
+           SELECT 1 FROM Posts p2a WHERE p2a.OwnerUserId = b3.UserId AND p2a.PostTypeId = 1
+       )
+    ) AS RecentQuestionBadges,
+    (SELECT AVG(p3.Score)
+     FROM Posts p3
+     WHERE p3.OwnerUserId = u.Id
+       AND p3.PostTypeId = 1
+       AND p3.CreationDate > DATE '2023-01-01'
+    ) AS RecentQuestionAvgScore,
+    (SELECT STRING_AGG(
+        CASE 
+            WHEN ph.comment LIKE '%help%' THEN 'Help Request'
+            WHEN ph.comment LIKE '%thanks%' THEN 'Thanks'
+            ELSE 'Other'
+        END, ', ')
+     FROM Comments ph
+     WHERE ph.UserId = u.Id
+       AND ph.CreationDate > DATE '2023-01-01'
+    ) AS CommentCategoryTrends,
+    (SELECT COUNT(DISTINCT p4.Id)
+     FROM Posts p4
+     INNER JOIN PostLinks pl2 ON p4.Id = pl2.PostId
+     WHERE pl2.RelatedPostId IN (SELECT Id FROM Posts WHERE OwnerUserId = u.Id)
+       AND pl2.LinkTypeId = 3
+    ) AS DuplicateLinkCount,
+    (SELECT COUNT(*) 
+     FROM Votes v2 
+     WHERE v2.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = u.Id) 
+       AND v2.VoteTypeId = 5
+    ) AS FavoriteCount,
+    (SELECT COUNT(DISTINCT ph4.PostId)
+     FROM PostHistory ph4
+     WHERE ph4.UserId = u.Id
+       AND ph4.PostHistoryTypeId IN (10,11,12,13)
+    ) AS PostActionCount,
+    CASE 
+        WHEN u.Reputation > 10000 AND u.Views > 5000 THEN 'High Engagement'
+        WHEN u.Reputation > 5000 AND u.Views > 2000 THEN 'Moderate Engagement'
+        ELSE 'Low Engagement'
+    END AS EngagementLevel,
+    (SELECT COUNT(DISTINCT c3.PostId)
+     FROM Comments c3
+     WHERE c3.UserId = u.Id
+       AND c3.CreationDate > DATE '2023-01-01'
+       AND c3.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = u.Id)
+    ) AS UserCommentsOnOwnPosts,
+    (SELECT STRING_AGG(p5.Title, ' | ')
+     FROM (
+         SELECT Title
+         FROM Posts
+         WHERE OwnerUserId = u.Id
+           AND CreationDate > DATE '2023-01-01'
+           AND PostTypeId = 1
+         ORDER BY Score DESC
+         LIMIT 5
+     ) p5
+    ) AS Top5RecentQuestions,
+    (SELECT COUNT(DISTINCT p6.Id)
+     FROM Posts p6
+     WHERE p6.OwnerUserId = u.Id
+       AND p6.CreationDate > DATE '2023-01-01'
+       AND (p6.CommentCount > 10 OR p6.ViewCount > 1000)
+    ) AS HighTrafficPosts,
+    (SELECT MAX(ph5.CreationDate)
+     FROM PostHistory ph5
+     WHERE ph5.UserId = u.Id
+       AND ph5.PostHistoryTypeId IN (1,2,3)
+    ) AS LastActivityDate,
+    (SELECT COUNT(DISTINCT p7.Id)
+     FROM Posts p7
+     INNER JOIN Votes v3 ON p7.Id = v3.PostId
+     WHERE p7.OwnerUserId = u.Id
+       AND v3.VoteTypeId = 2
+       AND v3.CreationDate > DATE '2023-01-01'
+    ) AS UpvotesReceivedCount,
+    (SELECT AVG(v4.BountyAmount)
+     FROM Votes v4
+     WHERE v4.UserId = u.Id
+       AND v4.VoteTypeId = 8
+       AND v4.CreationDate > DATE '2023-01-01'
+    ) AS AvgBountyAmount,
+    (SELECT COUNT(DISTINCT p8.Id)
+     FROM Posts p8
+     WHERE p8.OwnerUserId = u.Id
+       AND p8.ParentId IS NULL
+       AND p8.PostTypeId = 1
+       AND p8.CreationDate > DATE '2023-01-01'
+    ) AS NewQuestionsCount,
+    (SELECT COUNT(DISTINCT pl3.Id)
+     FROM PostLinks pl3
+     WHERE pl3.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = u.Id)
+       AND pl3.LinkTypeId = 3
+       AND pl3.CreationDate > DATE '2023-01-01'
+    ) AS DuplicateLinkCountRecent,
+    (SELECT STRING_AGG('Tag:' || t2.TagName || ' Count:' || t2.Count, ' | ')
+     FROM Tags t2
+     WHERE t2.Id IN (
+         SELECT DISTINCT p9.Id
+         FROM Posts p9
+         WHERE p9.OwnerUserId = u.Id
+           AND p9.Tags IS NOT NULL
+           AND p9.Tags <> ''
+     )
+    ) AS AssociatedTags,
+    (SELECT COUNT(DISTINCT p10.Id)
+     FROM Posts p10
+     WHERE p10.OwnerUserId = u.Id
+       AND p10.CreationDate > DATE '2023-01-01'
+       AND p10.PostTypeId IN (1,2)
+       AND p10.Score > 10
+    ) AS HighScorePosts
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+LEFT JOIN Tags t ON t.Id IN (
+    SELECT DISTINCT p11.Id
+    FROM Posts p11
+    WHERE p11.OwnerUserId = u.Id
+      AND p11.Tags IS NOT NULL
+      AND p11.Tags <> ''
+)
+WHERE u.CreationDate >= DATE '2022-01-01'
+  AND u.CreationDate < DATE '2024-01-01'
+  AND (u.Reputation > 500 OR u.Views > 100)
+GROUP BY u.Id, u.DisplayName, u.Reputation, u.WebsiteUrl, u.Location, u.AccountId, u.CreationDate, u.Views
+HAVING COUNT(DISTINCT p.Id) > 0
+ORDER BY u.Reputation DESC, COUNT(DISTINCT p.Id) DESC
+LIMIT 1000;

@@ -1,0 +1,355 @@
+with recent_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.location,
+    u.upvotes,
+    u.downvotes,
+    u.websiteurl,
+    row_number() over (order by u.creationdate desc, u.id desc) as rn
+  from users u
+),
+user_badge_agg as (
+  select
+    b.userid,
+    count(*) as total_badges,
+    sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+    sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+    sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+    min(b.date) as first_badge_date,
+    max(b.date) as last_badge_date
+  from badges b
+  group by b.userid
+),
+post_core as (
+  select
+    p.id,
+    p.posttypeid,
+    p.owneruserid,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.answercount,
+    p.commentcount,
+    p.favoritecount,
+    p.title,
+    p.tags,
+    p.acceptedanswerid,
+    p.parentid,
+    p.closeddate,
+    p.communityowneddate
+  from posts p
+  where p.creationdate is not null
+),
+question_meta as (
+  select
+    q.id as question_id,
+    q.owneruserid as asker_id,
+    q.creationdate as asked_at,
+    q.score as q_score,
+    q.viewcount,
+    q.title,
+    q.tags,
+    q.answercount,
+    q.favoritecount,
+    q.closeddate,
+    coalesce(extract(epoch from q.closeddate) - extract(epoch from q.creationdate), 0) as seconds_to_close,
+    case when q.acceptedanswerid is not null then 1 else 0 end as has_accepted_answer
+  from post_core q
+  where q.posttypeid = 1
+),
+answer_meta as (
+  select
+    a.id as answer_id,
+    a.parentid as question_id,
+    a.owneruserid as answerer_id,
+    a.creationdate as answered_at,
+    a.score as a_score
+  from post_core a
+  where a.posttypeid = 2
+),
+first_answer as (
+  select
+    am.question_id,
+    min(am.answered_at) as first_answer_time
+  from answer_meta am
+  group by am.question_id
+),
+time_to_first_answer as (
+  select
+    qm.question_id,
+    case
+      when fa.first_answer_time is null then null
+      else fa.first_answer_time
+    end as first_answer_time,
+    case
+      when fa.first_answer_time is null then null
+      else (fa.first_answer_time - qm.asked_at)
+    end as interval_to_first_answer
+  from question_meta qm
+  left join first_answer fa on fa.question_id = qm.question_id
+),
+votes_agg as (
+  select
+    v.postid,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+    sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_total
+  from votes v
+  group by v.postid
+),
+comments_agg as (
+  select
+    c.postid,
+    count(*) as comment_count,
+    max(c.creationdate) as last_comment_at,
+    sum(case when c.score > 0 then 1 else 0 end) as positive_comment_count
+  from comments c
+  group by c.postid
+),
+linkage as (
+  select
+    pl.postid as question_id,
+    sum(case when pl.linktypeid = 3 then 1 else 0 end) as duplicate_links,
+    sum(case when pl.linktypeid = 1 then 1 else 0 end) as related_links
+  from postlinks pl
+  group by pl.postid
+),
+close_reasons as (
+  select
+    ph.postid as question_id,
+    max(case when ph.posthistorytypeid = 10 then ph.creationdate end) as last_closed_at,
+    max(case when ph.posthistorytypeid = 11 then ph.creationdate end) as last_reopened_at,
+    max(case when ph.posthistorytypeid in (10,11) then ph.posthistorytypeid end) as last_close_reopen_type,
+    max(
+      case
+        when ph.posthistorytypeid = 10 then
+          nullif(regexp_replace(coalesce(ph.comment,''), '[^0-9]', '', 'g'), '')
+        else null
+      end
+    ) as raw_close_reason_code
+  from posthistory ph
+  where ph.posthistorytypeid in (10,11)
+  group by ph.postid
+),
+normalized_close_reason as (
+  select
+    cr.question_id,
+    cr.last_closed_at,
+    cr.last_reopened_at,
+    cr.last_close_reopen_type,
+    case
+      when cr.raw_close_reason_code is null then null
+      when cast(cr.raw_close_reason_code as integer) in (1,101) then 'Duplicate'
+      when cast(cr.raw_close_reason_code as integer) in (2,102) then 'Off-topic'
+      when cast(cr.raw_close_reason_code as integer) in (3,105) then 'Opinion-based'
+      when cast(cr.raw_close_reason_code as integer) in (4,103) then 'Needs details or clarity'
+      when cast(cr.raw_close_reason_code as integer) in (7,104) then 'Needs more focus'
+      when cast(cr.raw_close_reason_code as integer) = 10 then 'General reference'
+      else 'Other'
+    end as close_reason_norm
+  from close_reasons cr
+),
+tag_explode as (
+  select
+    q.question_id,
+    unnest(string_to_array(substring(q.tags from 2 for greatest(char_length(q.tags)-2,0)), '><')) as tagname
+  from question_meta q
+  where q.tags is not null and q.tags like '<%>'
+),
+top_tags as (
+  select
+    te.tagname,
+    count(distinct te.question_id) as tag_q_count
+  from tag_explode te
+  group by te.tagname
+  having count(distinct te.question_id) >= 10
+),
+question_tag_rank as (
+  select
+    te.question_id,
+    te.tagname,
+    tt.tag_q_count,
+    row_number() over (partition by te.question_id order by tt.tag_q_count desc, te.tagname) as tag_rank
+  from tag_explode te
+  join top_tags tt on tt.tagname = te.tagname
+),
+question_primary_tag as (
+  select
+    qtr.question_id,
+    qtr.tagname as primary_tag,
+    qtr.tag_q_count
+  from question_tag_rank qtr
+  where qtr.tag_rank = 1
+),
+user_activity as (
+  select
+    u.id as user_id,
+    count(distinct p.id) filter (where p.posttypeid = 1) as questions_posted,
+    count(distinct p.id) filter (where p.posttypeid = 2) as answers_posted,
+    sum(coalesce(p.score,0)) as total_post_score,
+    max(p.lastactivitydate) as last_activity_at
+  from users u
+  left join posts p on p.owneruserid = u.id
+  group by u.id
+),
+accepted_answerers as (
+  select
+    a.answerer_id as user_id,
+    count(*) filter (where q.acceptedanswerid = a.answer_id) as accepted_answers_given
+  from answer_meta a
+  join question_meta q on q.question_id = a.question_id
+  group by a.answerer_id, q.acceptedanswerid, a.answer_id
+),
+quality_score as (
+  select
+    q.question_id,
+    coalesce(v.upvotes,0) - coalesce(v.downvotes,0) as net_votes,
+    coalesce(v.favorites,0) as favs,
+    coalesce(q.q_score,0) as post_score,
+    coalesce(ca.comment_count,0) as comments,
+    coalesce(lk.related_links,0) as related_links,
+    coalesce(lk.duplicate_links,0) as duplicate_links,
+    round(
+      0.4 * greatest(coalesce(v.upvotes,0) - coalesce(v.downvotes,0),0)
+      + 0.3 * greatest(coalesce(v.favorites,0),0)
+      + 0.2 * greatest(coalesce(q.q_score,0),0)
+      + 0.1 * greatest(coalesce(q.viewcount,0)/nullif(coalesce(q.answercount,1),0),0)
+      - 0.25 * least(coalesce(lk.duplicate_links,0), 5)
+      - 0.05 * least(coalesce(ca.comment_count,0), 50)
+    , 2) as quality_score
+  from question_meta q
+  left join votes_agg v on v.postid = q.question_id
+  left join comments_agg ca on ca.postid = q.question_id
+  left join linkage lk on lk.question_id = q.question_id
+),
+user_rank as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    ua.questions_posted,
+    ua.answers_posted,
+    coalesce(aa.accepted_answers_given,0) as accepted_answers_given,
+    coalesce(ba.total_badges,0) as total_badges,
+    dense_rank() over (
+      order by
+        coalesce(aa.accepted_answers_given,0) desc,
+        ua.answers_posted desc,
+        u.reputation desc,
+        coalesce(ba.total_badges,0) desc,
+        u.id
+    ) as contributor_rank
+  from users u
+  left join user_activity ua on ua.user_id = u.id
+  left join accepted_answerers aa on aa.user_id = u.id
+  left join user_badge_agg ba on ba.userid = u.id
+),
+question_enriched as (
+  select
+    q.question_id,
+    q.asked_at,
+    q.q_score,
+    q.viewcount,
+    q.title,
+    q.tags,
+    q.answercount,
+    q.favoritecount,
+    q.has_accepted_answer,
+    tfa.first_answer_time,
+    tfa.interval_to_first_answer,
+    ncr.close_reason_norm,
+    qa.quality_score,
+    qp.primary_tag,
+    qp.tag_q_count,
+    qc.upvotes,
+    qc.downvotes,
+    qc.favs,
+    qc.comments,
+    qc.related_links,
+    qc.duplicate_links
+  from question_meta q
+  left join time_to_first_answer tfa on tfa.question_id = q.question_id
+  left join normalized_close_reason ncr on ncr.question_id = q.question_id
+  left join quality_score qc on qc.question_id = q.question_id
+  left join question_primary_tag qp on qp.question_id = q.question_id
+),
+recent_hot as (
+  select
+    qe.*,
+    row_number() over (
+      partition by coalesce(qe.primary_tag, '_untagged')
+      order by
+        qe.quality_score desc nulls last,
+        qe.viewcount desc nulls last,
+        qe.answercount desc nulls last,
+        qe.question_id desc
+    ) as tag_hot_rank
+  from question_enriched qe
+  where qe.asked_at >= (timestamp '2024-10-01 12:34:56') - interval '5 years'
+),
+dup_clusters as (
+  select
+    q.question_id,
+    count(*) as dup_links_out,
+    sum(case when pl.linktypeid = 3 then 1 else 0 end) as dup_edges
+  from question_meta q
+  left join postlinks pl on pl.postid = q.question_id and pl.linktypeid = 3
+  group by q.question_id
+),
+select_candidates as (
+  select
+    rh.question_id,
+    rh.primary_tag,
+    rh.tag_hot_rank,
+    rh.quality_score,
+    rh.viewcount,
+    rh.answercount,
+    rh.has_accepted_answer,
+    rh.close_reason_norm,
+    dc.dup_links_out,
+    rh.interval_to_first_answer,
+    case
+      when rh.interval_to_first_answer is null then null
+      else extract(epoch from rh.interval_to_first_answer) / 3600.0
+    end as hours_to_first_answer
+  from recent_hot rh
+  left join dup_clusters dc on dc.question_id = rh.question_id
+  where
+    (rh.quality_score is null or rh.quality_score >= 1.0)
+    and coalesce(dc.dup_links_out,0) <= 3
+    and coalesce(rh.close_reason_norm,'') not in ('Off-topic','Other')
+)
+select
+  sc.primary_tag,
+  count(*) as questions,
+  avg(sc.quality_score) as avg_quality,
+  percentile_cont(0.5) within group (order by sc.viewcount) as p50_views,
+  percentile_cont(0.9) within group (order by sc.viewcount) as p90_views,
+  avg(sc.hours_to_first_answer) as avg_hours_to_first_answer,
+  sum(case when sc.has_accepted_answer = 1 then 1 else 0 end) * 1.0 / nullif(count(*),0) as acceptance_rate,
+  min(sc.tag_hot_rank) as best_rank_in_tag,
+  max(sc.tag_hot_rank) as worst_rank_in_tag
+from select_candidates sc
+group by sc.primary_tag
+having count(*) >= 20
+union all
+select
+  '_global' as primary_tag,
+  count(*) as questions,
+  avg(sc.quality_score) as avg_quality,
+  percentile_cont(0.5) within group (order by sc.viewcount) as p50_views,
+  percentile_cont(0.9) within group (order by sc.viewcount) as p90_views,
+  avg(sc.hours_to_first_answer) as avg_hours_to_first_answer,
+  sum(case when sc.has_accepted_answer = 1 then 1 else 0 end) * 1.0 / nullif(count(*),0) as acceptance_rate,
+  min(sc.tag_hot_rank) as best_rank_in_tag,
+  max(sc.tag_hot_rank) as worst_rank_in_tag
+from select_candidates sc
+order by
+  case when primary_tag = '_global' then 1 else 0 end,
+  avg_quality desc nulls last,
+  questions desc,
+  primary_tag asc;

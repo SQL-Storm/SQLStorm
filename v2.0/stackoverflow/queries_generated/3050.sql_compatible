@@ -1,0 +1,155 @@
+WITH 
+recent_questions AS (
+    SELECT 
+        p.Id                                    AS QuestionId,
+        p.Title,
+        p.CreationDate,
+        p.Score                                 AS QuestionScore,
+        COALESCE(
+            NULLIF(
+                SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags)-2), 
+                ''
+            ), 
+            NULL
+        )                                      AS RawTagString,
+        regexp_split_to_table(
+            COALESCE(
+                NULLIF(
+                    SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags)-2), 
+                    ''
+                ), 
+                ''
+            ), 
+            '\><'
+        )                                      AS Tag
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '30 days'
+),
+
+answers_with_latest_edit AS (
+    SELECT 
+        a.Id                                 AS AnswerId,
+        a.ParentId                           AS QuestionId,
+        a.OwnerUserId                        AS AnswererId,
+        a.Score                              AS AnswerScore,
+        a.CreationDate,
+        (SELECT MAX(ph.CreationDate)
+         FROM PostHistory ph
+         WHERE ph.PostId = a.Id 
+           AND ph.PostHistoryTypeId IN (4,5,6)
+        )                                    AS LastEditDate
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+),
+
+user_answer_stats AS (
+    SELECT 
+        u.Id                                 AS UserId,
+        u.DisplayName,
+        COUNT(a.AnswerId)                    AS AnswerCount,
+        AVG(a.AnswerScore)                   AS AvgAnswerScore,
+        MAX(a.CreationDate)                  AS LastAnswerDate,
+        ROW_NUMBER() OVER (ORDER BY COUNT(a.AnswerId) DESC) AS AnswerRank
+    FROM Users u
+    LEFT JOIN answers_with_latest_edit a
+           ON a.AnswererId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+
+user_badge_stats AS (
+    SELECT 
+        b.UserId,
+        COUNT(*)                              AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(CASE WHEN b.TagBased = 1 THEN b.Name END) AS FirstTagBadge
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+latest_comment_per_answer AS (
+    SELECT 
+        a.AnswerId,
+        (SELECT c.Text
+         FROM Comments c
+         WHERE c.PostId = a.AnswerId
+         ORDER BY c.CreationDate DESC
+         LIMIT 1)                           AS LatestCommentText
+    FROM answers_with_latest_edit a
+),
+
+top_questions_union AS (
+    SELECT 
+        q.QuestionId,
+        q.Title,
+        q.QuestionScore,
+        'Original'        AS Source
+    FROM recent_questions q
+    WHERE q.QuestionScore >= 50
+
+    UNION ALL
+
+    SELECT 
+        pl.PostId        AS QuestionId,
+        p.Title,
+        p.Score          AS QuestionScore,
+        'DuplicateLink'  AS Source
+    FROM PostLinks pl
+    JOIN Posts p ON p.Id = pl.RelatedPostId
+    WHERE pl.LinkTypeId = 3
+      AND p.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '30 days'
+)
+
+SELECT 
+    tq.QuestionId,
+    tq.Title,
+    tq.QuestionScore,
+    tq.Source,
+    STRING_AGG(DISTINCT rq.Tag, ', ')           AS Tags,
+    ua.AnswerCount,
+    ua.AvgAnswerScore,
+    ub.TotalBadges,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ub.FirstTagBadge,
+    lc.LatestCommentText,
+    CASE 
+        WHEN ua.AnswerCount IS NULL THEN 'NoAnswers'
+        WHEN ua.AvgAnswerScore > 10    THEN 'HighQuality'
+        ELSE 'Regular'
+    END                                          AS QualityCategory,
+    COALESCE(ua.LastAnswerDate, CAST(tq.QuestionScore AS TEXT)) AS ReferenceMetric,
+    ua.LastAnswerDate,
+    ua.AnswerRank
+FROM top_questions_union tq
+LEFT JOIN recent_questions rq
+       ON rq.QuestionId = tq.QuestionId
+LEFT JOIN user_answer_stats ua
+       ON ua.UserId = (
+            SELECT a.AnswererId
+            FROM answers_with_latest_edit a
+            WHERE a.QuestionId = tq.QuestionId
+            ORDER BY a.AnswerScore DESC NULLS LAST
+            LIMIT 1
+         )
+LEFT JOIN user_badge_stats ub
+       ON ub.UserId = ua.UserId
+LEFT JOIN latest_comment_per_answer lc
+       ON lc.AnswerId = (
+            SELECT a.AnswerId
+            FROM answers_with_latest_edit a
+            WHERE a.QuestionId = tq.QuestionId
+            ORDER BY a.AnswerScore DESC NULLS LAST
+            LIMIT 1
+         )
+GROUP BY 
+    tq.QuestionId, tq.Title, tq.QuestionScore, tq.Source,
+    ua.AnswerCount, ua.AvgAnswerScore, ub.TotalBadges,
+    ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges,
+    ub.FirstTagBadge, lc.LatestCommentText,
+    ua.LastAnswerDate, ua.AnswerRank
+ORDER BY tq.QuestionScore DESC, ua.AnswerRank NULLS LAST
+LIMIT 100;

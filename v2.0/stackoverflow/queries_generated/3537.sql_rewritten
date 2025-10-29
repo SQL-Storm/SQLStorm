@@ -1,0 +1,146 @@
+-- {"query": "3537.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2381} 
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Views,
+        COALESCE(SUM(p.Score),0)                                      AS TotalPostScore,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1)                   AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2)                   AS AnswerCount,
+        AVG(p.ViewCount) FILTER (WHERE p.PostTypeId = 1)              AS AvgQuestionViews,
+        MAX(p.CreationDate)                                          AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Views
+),
+
+BadgeAgg AS (
+    SELECT 
+        b.UserId,
+        SUM(CASE 
+                WHEN b.Class = 1 THEN 1000 
+                WHEN b.Class = 2 THEN 500 
+                ELSE 100 
+            END)                                                      AS BadgeScore,
+        STRING_AGG(DISTINCT b.Name, ', ') 
+            FILTER (WHERE b.TagBased = 0)                             AS BadgeNames,
+        COUNT(*) FILTER (WHERE b.TagBased = 1)                        AS TagBadgeCount
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+VoteAgg AS (
+    SELECT 
+        v.PostId,
+        SUM(CASE 
+                WHEN v.VoteTypeId = 2 THEN 1    -- upvote
+                WHEN v.VoteTypeId = 3 THEN -1   -- downvote
+                ELSE 0
+            END)                                                      AS NetScore,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 5)                      AS FavoriteCount
+    FROM Votes v
+    GROUP BY v.PostId
+),
+
+TopTags AS (
+    SELECT 
+        t.TagName,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC)                    AS TagRank,
+        t.Count
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0
+),
+
+UserTagActivity AS (
+    SELECT 
+        us.Id                                     AS UserId,
+        COALESCE(string_agg(DISTINCT tg.TagName, ', '), '') AS TagsUsed,
+        COUNT(DISTINCT tg.Id)                     AS DistinctTagCount
+    FROM UserStats us
+    JOIN Posts p ON p.OwnerUserId = us.Id
+    LEFT JOIN LATERAL (
+        SELECT unnest(string_to_array(substring(p.Tags,2,length(p.Tags)-2), '><')) AS tag
+    ) pt ON TRUE
+    LEFT JOIN Tags tg ON tg.TagName = pt.tag
+    GROUP BY us.Id
+),
+
+Combined AS (
+    SELECT 
+        us.Id,
+        us.DisplayName,
+        us.Reputation,
+        us.TotalPostScore,
+        us.QuestionCount,
+        us.AnswerCount,
+        us.AvgQuestionViews,
+        us.LastPostDate,
+        ba.BadgeScore,
+        ba.BadgeNames,
+        ba.TagBadgeCount,
+        COALESCE(vs.FavoriteCount,0)               AS TotalFavorites,
+        COALESCE(vs.NetScore,0)                    AS NetPostScore,
+        uta.TagsUsed,
+        uta.DistinctTagCount,
+        ( us.Reputation * 0.5
+          + us.TotalPostScore * 2
+          + COALESCE(ba.BadgeScore,0)
+          + COALESCE(vs.FavoriteCount,0) * 3
+        )                                           AS CompositeScore
+    FROM UserStats us
+    LEFT JOIN BadgeAgg ba       ON ba.UserId = us.Id
+    LEFT JOIN (
+        SELECT 
+            p.OwnerUserId,
+            SUM(va.FavoriteCount) AS FavoriteCount,
+            SUM(va.NetScore)      AS NetScore
+        FROM Posts p
+        LEFT JOIN VoteAgg va ON va.PostId = p.Id
+        GROUP BY p.OwnerUserId
+    ) vs                      ON vs.OwnerUserId = us.Id
+    LEFT JOIN UserTagActivity uta ON uta.UserId = us.Id
+)
+
+SELECT *
+FROM (
+    SELECT 
+        c.*,
+        ROW_NUMBER() OVER (ORDER BY c.CompositeScore DESC) AS RankOverall,
+        NTILE(10) OVER (ORDER BY c.CompositeScore DESC)    AS Decile,
+        CASE 
+            WHEN c.CompositeScore > 10000 THEN 'Superstar'
+            WHEN c.CompositeScore > 5000  THEN 'PowerUser'
+            WHEN c.CompositeScore > 1000  THEN 'ActiveUser'
+            ELSE 'Casual'
+        END                                                AS Tier
+    FROM Combined c
+) ranked
+WHERE ranked.RankOverall <= 100
+ORDER BY ranked.CompositeScore DESC
+
+UNION ALL
+
+SELECT 
+    NULL                                 AS Id,
+    'Aggregate'                          AS DisplayName,
+    NULL                                 AS Reputation,
+    SUM(TotalPostScore)                  AS TotalPostScore,
+    SUM(QuestionCount)                   AS QuestionCount,
+    SUM(AnswerCount)                     AS AnswerCount,
+    AVG(AvgQuestionViews)                AS AvgQuestionViews,
+    MAX(LastPostDate)                    AS LastPostDate,
+    SUM(BadgeScore)                      AS BadgeScore,
+    NULL                                 AS BadgeNames,
+    SUM(TagBadgeCount)                   AS TagBadgeCount,
+    SUM(TotalFavorites)                  AS TotalFavorites,
+    SUM(NetPostScore)                    AS NetPostScore,
+    NULL                                 AS TagsUsed,
+    NULL                                 AS DistinctTagCount,
+    SUM(CompositeScore)                  AS CompositeScore,
+    NULL                                 AS RankOverall,
+    NULL                                 AS Decile,
+    NULL                                 AS Tier
+FROM Combined
+WHERE CompositeScore IS NOT NULL;

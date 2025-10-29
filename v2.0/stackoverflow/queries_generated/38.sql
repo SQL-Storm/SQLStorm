@@ -1,0 +1,346 @@
+-- {"query": "38.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2977} 
+with recent_questions as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.Score,
+        q.ViewCount,
+        q.CreationDate,
+        q.AcceptedAnswerId,
+        string_to_array(substring(q.Tags, 2, length(q.Tags)-2), '><') as tags_arr
+    from Posts q
+    where q.PostTypeId = 1
+      and q.CreationDate >= (select max(CreationDate) - interval '365 days' from Posts where PostTypeId = 1)
+),
+answer_stats as (
+    select
+        a.ParentId as QuestionId,
+        count(*) as AnswerCount,
+        sum(a.Score) as AnswersScoreSum,
+        avg(a.Score::numeric) as AvgAnswerScore,
+        max(a.CreationDate) as LastAnswerDate
+    from Posts a
+    where a.PostTypeId = 2
+    group by a.ParentId
+),
+accepted_answer as (
+    select
+        qa.Id as AcceptedAnswerId,
+        qa.ParentId as QuestionId,
+        qa.Score as AcceptedAnswerScore,
+        qa.OwnerUserId as AcceptedAnswerOwnerUserId
+    from Posts qa
+    where qa.PostTypeId = 2
+),
+question_votes as (
+    select
+        v.PostId as QuestionId,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+        sum(case when v.VoteTypeId = 5 then 1 else 0 end) as Favorites
+    from Votes v
+    group by v.PostId
+),
+duplicate_links as (
+    select
+        pl.PostId as DuplicateOfQuestionId,
+        pl.RelatedPostId as OriginalQuestionId,
+        min(pl.CreationDate) as FirstDupLinkDate
+    from PostLinks pl
+    where pl.LinkTypeId = 3
+    group by pl.PostId, pl.RelatedPostId
+),
+close_events as (
+    select
+        ph.PostId as QuestionId,
+        min(ph.CreationDate) filter (where ph.PostHistoryTypeId = 10) as FirstClosedDate,
+        max(ph.CreationDate) filter (where ph.PostHistoryTypeId = 11) as LastReopenedDate,
+        max(ph.CreationDate) filter (where ph.PostHistoryTypeId = 10) as LastClosedDate,
+        -- extract close reason where Comment holds CloseReasonId for type 10
+        max(
+            case
+                when ph.PostHistoryTypeId = 10 and ph.Comment ~ '^[0-9]+$'
+                    then ph.Comment::int
+                else null
+            end
+        ) as AnyCloseReasonId
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (10,11)
+    group by ph.PostId
+),
+close_reason_names as (
+    select
+        crt.Id as CloseReasonId,
+        crt.Name as CloseReasonName
+    from CloseReasonTypes crt
+),
+tag_expansion as (
+    select
+        rq.QuestionId,
+        unnest(rq.tags_arr) as tagname
+    from recent_questions rq
+),
+tag_weights as (
+    select
+        te.QuestionId,
+        te.tagname,
+        t.Count as TagGlobalCount,
+        case
+            when t.Count is null or t.Count = 0 then 0.0
+            else ln(1 + 100000.0 / t.Count::numeric)
+        end as TagWeight
+    from tag_expansion te
+    left join Tags t on lower(t.TagName) = lower(te.tagname)
+),
+question_tag_score as (
+    select
+        QuestionId,
+        sum(TagWeight) as TagScore,
+        count(*) as TagCount,
+        max(TagGlobalCount) as MaxTagPopularity
+    from tag_weights
+    group by QuestionId
+),
+owner_stats as (
+    select
+        u.Id as UserId,
+        u.Reputation,
+        u.UpVotes,
+        u.DownVotes,
+        u.Views,
+        u.CreationDate as UserCreationDate,
+        coalesce(nullif(trim(u.Location), ''), 'Unknown') as NormLocation,
+        case when u.WebsiteUrl is null or u.WebsiteUrl = '' then 0 else 1 end as HasWebsite
+    from Users u
+),
+comment_activity as (
+    select
+        c.PostId as QuestionId,
+        count(*) as CommentCount,
+        max(c.CreationDate) as LastCommentDate,
+        sum(case when c.Score >= 5 then 1 else 0 end) as HighScoreComments
+    from Comments c
+    group by c.PostId
+),
+hot_bump_history as (
+    select
+        ph.PostId as QuestionId,
+        max(case when ph.PostHistoryTypeId = 52 then ph.CreationDate end) as BecameHotDate,
+        max(case when ph.PostHistoryTypeId = 53 then ph.CreationDate end) as RemovedHotDate,
+        count(*) filter (where ph.PostHistoryTypeId in (50,52,53)) as NotableEvents
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (50,52,53)
+    group by ph.PostId
+),
+question_core as (
+    select
+        rq.QuestionId,
+        rq.Title,
+        rq.OwnerUserId,
+        rq.Score as QuestionScore,
+        rq.ViewCount,
+        rq.CreationDate as QuestionCreationDate,
+        rq.AcceptedAnswerId
+    from recent_questions rq
+),
+joined as (
+    select
+        qc.QuestionId,
+        qc.Title,
+        qc.OwnerUserId,
+        qc.QuestionScore,
+        qc.ViewCount,
+        qc.QuestionCreationDate,
+        qc.AcceptedAnswerId,
+        coalesce(as1.AnswerCount, 0) as AnswerCount,
+        coalesce(as1.AnswersScoreSum, 0) as AnswersScoreSum,
+        as1.AvgAnswerScore,
+        as1.LastAnswerDate,
+        coalesce(qv.UpVotes, 0) as UpVotes,
+        coalesce(qv.DownVotes, 0) as DownVotes,
+        coalesce(qv.Favorites, 0) as Favorites,
+        dl.OriginalQuestionId,
+        dl.FirstDupLinkDate,
+        ce.FirstClosedDate,
+        ce.LastReopenedDate,
+        ce.LastClosedDate,
+        ce.AnyCloseReasonId,
+        crn.CloseReasonName,
+        coalesce(qts.TagScore, 0.0) as TagScore,
+        qts.TagCount,
+        qts.MaxTagPopularity,
+        ca.CommentCount,
+        ca.LastCommentDate,
+        ca.HighScoreComments,
+        hb.BecameHotDate,
+        hb.RemovedHotDate,
+        hb.NotableEvents
+    from question_core qc
+    left join answer_stats as1 on as1.QuestionId = qc.QuestionId
+    left join question_votes qv on qv.QuestionId = qc.QuestionId
+    left join duplicate_links dl on dl.DuplicateOfQuestionId = qc.QuestionId
+    left join close_events ce on ce.QuestionId = qc.QuestionId
+    left join close_reason_names crn on crn.CloseReasonId = ce.AnyCloseReasonId
+    left join question_tag_score qts on qts.QuestionId = qc.QuestionId
+    left join comment_activity ca on ca.QuestionId = qc.QuestionId
+    left join hot_bump_history hb on hb.QuestionId = qc.QuestionId
+),
+owner_enriched as (
+    select
+        j.*,
+        os.Reputation as OwnerReputation,
+        os.UpVotes as OwnerUpVotes,
+        os.DownVotes as OwnerDownVotes,
+        os.Views as OwnerProfileViews,
+        os.UserCreationDate,
+        os.NormLocation,
+        os.HasWebsite
+    from joined j
+    left join owner_stats os on os.UserId = j.OwnerUserId
+),
+quality_signals as (
+    select
+        oe.*,
+        -- engagement ratio avoiding divide-by-zero, using nullif
+        (oe.UpVotes - oe.DownVotes)::numeric / nullif((oe.UpVotes + oe.DownVotes), 0) as VoteBalanceRatio,
+        coalesce(oe.AnswerCount, 0) + case when oe.AcceptedAnswerId is not null then 1 else 0 end as AnswerSignal,
+        case when oe.BecameHotDate is not null then 1 else 0 end as WasHot,
+        case when oe.FirstClosedDate is not null then 1 else 0 end as WasClosed,
+        case when oe.OriginalQuestionId is not null then 1 else 0 end as WasMarkedDuplicate,
+        -- composite score with varied weights
+        (
+            0.30 * oe.QuestionScore
+          + 0.15 * coalesce(oe.AnswersScoreSum, 0)
+          + 0.25 * coalesce(oe.TagScore, 0)
+          + 0.10 * coalesce(oe.Favorites, 0)
+          + 0.08 * coalesce(oe.CommentCount, 0)
+          + 0.12 * greatest(0, coalesce(oe.OwnerReputation, 0) / 1000.0)
+          - 0.20 * coalesce(oe.WasClosed, 0)
+          - 0.15 * coalesce(oe.WasMarkedDuplicate, 0)
+        ) as CompositeQualityScore
+    from owner_enriched oe
+),
+ranked as (
+    select
+        qs.*,
+        row_number() over (
+            partition by date_trunc('month', qs.QuestionCreationDate)
+            order by qs.CompositeQualityScore desc nulls last, qs.ViewCount desc nulls last, qs.QuestionId
+        ) as MonthlyRank,
+        percent_rank() over (
+            partition by date_trunc('month', qs.QuestionCreationDate)
+            order by qs.CompositeQualityScore desc nulls last
+        ) as MonthlyPercentile,
+        ntile(10) over (
+            partition by date_trunc('month', qs.QuestionCreationDate)
+            order by qs.CompositeQualityScore desc nulls last
+        ) as MonthlyDecile,
+        lag(qs.CompositeQualityScore) over (
+            partition by qs.OwnerUserId
+            order by qs.QuestionCreationDate
+        ) as PrevOwnerQuality,
+        lead(qs.CompositeQualityScore) over (
+            partition by qs.OwnerUserId
+            order by qs.QuestionCreationDate
+        ) as NextOwnerQuality
+    from quality_signals qs
+),
+owner_rolling as (
+    select
+        r.*,
+        avg(r.CompositeQualityScore) over (
+            partition by r.OwnerUserId
+            order by r.QuestionCreationDate
+            rows between 4 preceding and current row
+        ) as OwnerRollingAvg5,
+        count(*) over (
+            partition by r.OwnerUserId
+            order by r.QuestionCreationDate
+            rows between unbounded preceding and current row
+        ) as OwnerCumulativeQuestions
+    from ranked r
+),
+dedupe_with_unioned as (
+    -- union with a filtered set to introduce a set operator and stress duplicates handling
+    select * from owner_rolling
+    union all
+    select * from owner_rolling where WasHot = 1 and MonthlyDecile <= 3
+),
+finalized as (
+    select
+        d.*,
+        dense_rank() over (
+            order by d.CompositeQualityScore desc nulls last, d.ViewCount desc nulls last
+        ) as GlobalDenseRank
+    from (
+        select
+            *,
+            row_number() over (partition by QuestionId order by WasHot desc, NotableEvents desc) as rn
+        from dedupe_with_unioned
+    ) d
+    where d.rn = 1
+)
+select
+    f.QuestionId,
+    coalesce(nullif(trim(f.Title), ''), '[no title]') as Title,
+    f.OwnerUserId,
+    coalesce(f.OwnerReputation, 0) as OwnerReputation,
+    f.NormLocation,
+    f.HasWebsite,
+    f.QuestionScore,
+    f.ViewCount,
+    f.UpVotes,
+    f.DownVotes,
+    f.VoteBalanceRatio,
+    f.Favorites,
+    f.AnswerCount,
+    f.AnswersScoreSum,
+    round(coalesce(f.AvgAnswerScore, 0), 2) as AvgAnswerScore,
+    f.AnswerSignal,
+    f.TagScore,
+    f.TagCount,
+    f.MaxTagPopularity,
+    f.CommentCount,
+    f.HighScoreComments,
+    f.WasHot,
+    f.WasClosed,
+    f.WasMarkedDuplicate,
+    f.AnyCloseReasonId,
+    coalesce(f.CloseReasonName, 'Unknown') as CloseReasonName,
+    f.FirstClosedDate,
+    f.LastReopenedDate,
+    f.BecameHotDate,
+    f.RemovedHotDate,
+    f.QuestionCreationDate,
+    f.LastAnswerDate,
+    f.LastCommentDate,
+    round(coalesce(f.CompositeQualityScore, 0), 4) as CompositeQualityScore,
+    f.MonthlyRank,
+    round(f.MonthlyPercentile, 4) as MonthlyPercentile,
+    f.MonthlyDecile,
+    f.OwnerRollingAvg5,
+    f.OwnerCumulativeQuestions,
+    f.PrevOwnerQuality,
+    f.NextOwnerQuality,
+    f.GlobalDenseRank
+from finalized f
+where
+    coalesce(f.CompositeQualityScore, -1e9) > (
+        select avg(coalesce(CompositeQualityScore, 0)) + stddev(coalesce(CompositeQualityScore, 0)) * 0.25
+        from finalized
+        where date_trunc('quarter', QuestionCreationDate) = date_trunc('quarter', f.QuestionCreationDate)
+    )
+    and (
+        f.WasClosed = 0
+        or (f.WasClosed = 1 and f.LastReopenedDate is not null and f.LastReopenedDate > f.FirstClosedDate)
+    )
+    and (
+        f.TagCount >= 1
+        and (f.MaxTagPopularity is null or f.MaxTagPopularity < 1000000)
+    )
+order by
+    f.CompositeQualityScore desc nulls last,
+    f.ViewCount desc nulls last,
+    f.QuestionId
+limit 250;

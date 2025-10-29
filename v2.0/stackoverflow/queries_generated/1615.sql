@@ -1,0 +1,197 @@
+-- {"query": "1615.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2779} 
+
+WITH PostTagData AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.PostTypeId,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.Title,
+        p.Body,
+        unnest(STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><')) AS TagName
+    FROM Posts AS p
+    WHERE p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2 -- Ensure tags exist and are not empty
+),
+UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(DISTINCT ptd.PostId) AS TotalPostsOwned,
+        COUNT(DISTINCT CASE WHEN ptd.PostTypeId = 1 THEN ptd.PostId END) AS QuestionsAsked,
+        COUNT(DISTINCT CASE WHEN ptd.PostTypeId = 2 THEN ptd.PostId END) AS AnswersGiven,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesGiven,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesGiven,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT b.Id) AS TotalBadgesEarned,
+        MAX(b.Date) AS LastBadgeDate,
+        MIN(ptd.CreationDate) AS FirstPostDate,
+        MAX(p_recent.LastActivityDate) AS LastPostActivity
+    FROM Users AS u
+    LEFT JOIN PostTagData AS ptd ON u.Id = ptd.OwnerUserId
+    LEFT JOIN Posts AS p_recent ON u.Id = p_recent.OwnerUserId -- For LastActivityDate
+    LEFT JOIN Comments AS c ON u.Id = c.UserId
+    LEFT JOIN Votes AS v ON u.Id = v.UserId
+    LEFT JOIN Badges AS b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+PostEngagementMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS CurrentScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount AS PostCachedCommentCount,
+        p.FavoriteCount,
+        p.ParentId,
+        p.AcceptedAnswerId,
+        LENGTH(p.Body) AS BodyLength,
+        LENGTH(p.Title) AS TitleLength,
+        COUNT(DISTINCT co.Id) AS ActualTotalCommentsOnPost,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS PostUpvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS PostDownvotes,
+        COUNT(DISTINCT ph_editors.UserId) AS UniqueEditorsExcludingOwner,
+        MIN(ph_edits.CreationDate) FILTER (WHERE ph_edits.PostHistoryTypeId IN (4,5,6) AND ph_edits.UserId IS NOT NULL AND ph_edits.UserId != p.OwnerUserId) AS FirstEditorEditDate,
+        MAX(ph_edits.CreationDate) FILTER (WHERE ph_edits.PostHistoryTypeId IN (4,5,6) AND ph_edits.UserId IS NOT NULL AND ph_edits.UserId != p.OwnerUserId) AS LastEditorEditDate
+    FROM Posts AS p
+    JOIN PostTypes AS pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Comments AS co ON p.Id = co.PostId
+    LEFT JOIN Votes AS v ON p.Id = v.PostId
+    LEFT JOIN PostHistory AS ph_editors ON p.Id = ph_editors.PostId AND ph_editors.PostHistoryTypeId IN (4,5,6) AND ph_editors.UserId IS NOT NULL AND ph_editors.UserId != p.OwnerUserId
+    LEFT JOIN PostHistory AS ph_edits ON p.Id = ph_edits.PostId
+    GROUP BY
+        p.Id, p.OwnerUserId, p.PostTypeId, pt.Name, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount,
+        p.CommentCount, p.FavoriteCount, p.ParentId, p.AcceptedAnswerId, p.Body, p.Title
+),
+PostHistoryEventSummary AS (
+    SELECT
+        ph.PostId,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Id END) AS CloseEvents,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.Id END) AS ReopenEvents,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate ELSE NULL END) AS LastCloseDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.CreationDate ELSE NULL END) AS LastReopenDate
+    FROM PostHistory AS ph
+    GROUP BY ph.PostId
+),
+TagAggregates AS (
+    SELECT
+        ptd.TagName,
+        COUNT(DISTINCT ptd.PostId) AS TaggedPostsCount,
+        SUM(ptd.Score) AS TotalTagScore,
+        AVG(ptd.Score) AS AvgTagScore,
+        COUNT(DISTINCT ptd.OwnerUserId) AS UniqueOwnerUsers,
+        DENSE_RANK() OVER (ORDER BY SUM(ptd.Score) DESC, COUNT(DISTINCT ptd.PostId) DESC) AS TagScoreRank
+    FROM PostTagData AS ptd
+    WHERE ptd.PostTypeId = 1
+    GROUP BY ptd.TagName
+),
+PostLinkSummary AS (
+    SELECT
+        pl.PostId,
+        COUNT(DISTINCT pl.RelatedPostId) AS RelatedPostsCount,
+        COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN pl.RelatedPostId END) AS DuplicateLinksCount,
+        MAX(pl.CreationDate) AS LastLinkCreationDate
+    FROM PostLinks AS pl
+    GROUP BY pl.PostId
+)
+SELECT
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.TotalPostsOwned,
+    uas.QuestionsAsked,
+    uas.AnswersGiven,
+    pem.PostId,
+    pem.PostTypeName,
+    pem.PostCreationDate,
+    pem.CurrentScore,
+    pem.ViewCount,
+    pem.CachedAnswerCount,
+    pem.ActualTotalCommentsOnPost,
+    pem.BodyLength,
+    pem.TitleLength,
+    ta.TagName AS TopAssociatedTagName,
+    ta.AvgTagScore AS TopTagAvgScore,
+    ta.TagScoreRank AS TopTagRank,
+    ph_sum.LastCloseDate,
+    ph_sum.LastReopenDate,
+    EXTRACT(EPOCH FROM (pem.FirstEditorEditDate - pem.PostCreationDate)) / 3600 AS TimeToFirstExternalEditHours,
+    (
+        SELECT COALESCE(MAX(u_editor.Reputation), 0)
+        FROM PostHistory AS ph_corr
+        JOIN Users AS u_editor ON ph_corr.UserId = u_editor.Id
+        WHERE ph_corr.PostId = pem.PostId
+          AND ph_corr.PostHistoryTypeId IN (4, 5, 6)
+          AND ph_corr.UserId IS NOT NULL
+          AND ph_corr.UserId != pem.OwnerUserId
+    ) AS HighestEditorReputation,
+    COALESCE(
+        CASE
+            WHEN pem.FavoriteCount IS NOT NULL AND pem.FavoriteCount >= 50 AND pem.CurrentScore >= 100 THEN 'Elite Engagement'
+            WHEN pem.FavoriteCount IS NOT NULL AND pem.FavoriteCount >= 10 AND pem.CurrentScore >= 20 THEN 'High Engagement'
+            WHEN pem.FavoriteCount IS NOT NULL AND pem.FavoriteCount > 0 THEN 'Moderate Engagement'
+            ELSE 'Low/No Engagement'
+        END,
+        'Engagement Undetermined'
+    ) AS EngagementTier,
+    RANK() OVER (PARTITION BY pem.PostTypeId ORDER BY (pem.CurrentScore * COALESCE(pem.ViewCount, 1)) DESC, pem.PostCreationDate DESC) AS PostImpactRank,
+    AVG(pem.CurrentScore) OVER (PARTITION BY uas.UserId ORDER BY pem.PostCreationDate ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS Owner7DayAvgPostScore,
+    NTILE(5) OVER (ORDER BY uas.Reputation DESC, uas.TotalBadgesEarned DESC) AS UserReputationQuintile,
+    (uas.Reputation * 0.1)
+    + (uas.TotalBadgesEarned * 5)
+    + (uas.QuestionsAsked * 2)
+    + (uas.AnswersGiven * 1.5)
+    - (uas.TotalDownvotesGiven * 0.5)
+    + (COALESCE(pem.PostUpvotes, 0) * 0.2)
+    + (COALESCE(pem.ViewCount, 0) / 100.0)
+    + (CASE WHEN COALESCE(ph_sum.CloseEvents, 0) > 0 THEN -10 ELSE 0 END)
+    + (CASE WHEN COALESCE(ph_sum.ReopenEvents, 0) > 0 THEN 5 ELSE 0 END)
+    AS CombinedInfluenceScore,
+    pls.RelatedPostsCount,
+    pls.DuplicateLinksCount,
+    parent_post.Title AS ParentPostTitle,
+    accepted_answer.Title AS AcceptedAnswerTitle,
+    accepted_answer.Score AS AcceptedAnswerScore
+FROM UserActivitySummary AS uas
+LEFT JOIN PostEngagementMetrics AS pem ON uas.UserId = pem.OwnerUserId
+LEFT JOIN PostHistoryEventSummary AS ph_sum ON pem.PostId = ph_sum.PostId
+LEFT JOIN PostLinkSummary AS pls ON pem.PostId = pls.PostId
+LEFT JOIN (
+    SELECT DISTINCT ON (ptd.PostId)
+        ptd.PostId,
+        ta.TagName,
+        ta.AvgTagScore,
+        ta.TagScoreRank
+    FROM PostTagData AS ptd
+    JOIN TagAggregates AS ta ON ptd.TagName = ta.TagName
+    ORDER BY ptd.PostId, ta.TagScoreRank ASC, ta.AvgTagScore DESC
+) AS ta ON pem.PostId = ta.PostId
+LEFT JOIN Posts AS parent_post ON pem.PostTypeId = 2 AND pem.ParentId = parent_post.Id
+LEFT JOIN Posts AS accepted_answer ON pem.PostTypeId = 1 AND pem.AcceptedAnswerId IS NOT NULL AND pem.AcceptedAnswerId = accepted_answer.Id
+WHERE
+    uas.Reputation > 5000
+    AND uas.TotalPostsOwned > 10
+    AND pem.ViewCount IS NOT NULL AND pem.ViewCount > 1000
+    AND pem.BodyLength > 200
+    AND pem.PostTypeName IN ('Question', 'Answer')
+    AND ta.TagScoreRank <= 50
+    AND (pem.PostCreationDate BETWEEN '2020-01-01' AND '2023-12-31')
+    AND pem.CurrentScore > (SELECT COALESCE(AVG(p_avg.Score), 0) FROM Posts p_avg WHERE p_avg.PostTypeId = pem.PostTypeId AND p_avg.Score IS NOT NULL)
+    AND (ph_sum.CloseEvents IS NULL OR ph_sum.CloseEvents = 0 OR ph_sum.LastReopenDate IS NOT NULL AND ph_sum.LastReopenDate > ph_sum.LastCloseDate)
+ORDER BY
+    CombinedInfluenceScore DESC,
+    UserReputationQuintile ASC,
+    PostImpactRank ASC
+LIMIT 1000;

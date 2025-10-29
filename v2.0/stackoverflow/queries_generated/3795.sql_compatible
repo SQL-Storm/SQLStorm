@@ -1,0 +1,131 @@
+WITH 
+UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.UpVotes, 0) - COALESCE(u.DownVotes, 0) AS NetVotes,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadges,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS QuestionCount,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS AnswerCount,
+        (SELECT COUNT(*) 
+         FROM Votes v 
+         JOIN VoteTypes vt ON v.VoteTypeId = vt.Id 
+         WHERE v.UserId = u.Id AND vt.Name = 'UpMod') AS UpVotesGiven
+    FROM Users u
+    WHERE u.Reputation > 1000
+),
+TopUsers AS (
+    SELECT 
+        Id,
+        DisplayName,
+        Reputation,
+        NetVotes,
+        GoldBadges,
+        SilverBadges,
+        BronzeBadges,
+        QuestionCount,
+        AnswerCount,
+        UpVotesGiven,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, NetVotes DESC) AS rn
+    FROM UserStats
+),
+TagStats AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagTotalPosts,
+        COALESCE(SUM(p.Score), 0) AS TotalScore,
+        AVG(CAST(p.Score AS DOUBLE PRECISION)) AS AvgScore,
+        COUNT(DISTINCT p.OwnerUserId) AS DistinctContributors,
+        STRING_AGG(DISTINCT p.Title, '; ') FILTER (WHERE p.Title IS NOT NULL) AS SampleQuestionTitles
+    FROM Tags t
+    LEFT JOIN Posts p 
+        ON p.Tags LIKE ('%' || '<' || t.TagName || '>' || '%')
+    GROUP BY t.TagName, t.Count
+    HAVING COUNT(p.Id) > 0
+),
+RecentActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        MAX(v.CreationDate) AS LastVoteDate
+    FROM Users u
+    LEFT JOIN Posts    p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId      = u.Id
+    LEFT JOIN Votes    v ON v.UserId      = u.Id
+    GROUP BY u.Id
+),
+Combined AS (
+    SELECT 
+        tu.Id,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.GoldBadges,
+        tu.SilverBadges,
+        tu.BronzeBadges,
+        tu.QuestionCount,
+        tu.AnswerCount,
+        ra.LastPostDate,
+        ra.LastCommentDate,
+        ra.LastVoteDate,
+        ts.TagName,
+        ts.TotalScore,
+        ts.AvgScore,
+        ts.DistinctContributors
+    FROM TopUsers tu
+    LEFT JOIN RecentActivity ra ON ra.UserId = tu.Id
+    LEFT JOIN LATERAL (
+        SELECT 
+            tg.TagName,
+            tg.TotalScore,
+            tg.AvgScore,
+            tg.DistinctContributors
+        FROM TagStats tg
+        WHERE tg.TagName = ANY (
+            STRING_TO_ARRAY(
+                COALESCE((
+                    SELECT STRING_AGG(tag, ',')
+                    FROM (
+                        SELECT UNNEST(STRING_TO_ARRAY(p.Tags, '><')) AS tag
+                        FROM Posts p
+                        WHERE p.OwnerUserId = tu.Id AND p.PostTypeId = 1
+                        ORDER BY p.CreationDate DESC
+                        LIMIT 5
+                    ) sub
+                ), ''), ',')
+        )
+        ORDER BY tg.TotalScore DESC
+        LIMIT 1
+    ) ts ON TRUE
+    WHERE tu.rn <= 50
+)
+SELECT *
+FROM Combined
+WHERE (Combined.LastPostDate IS NOT NULL AND Combined.LastPostDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '180' DAY))
+   OR (Combined.LastCommentDate IS NOT NULL AND Combined.LastCommentDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '180' DAY))
+
+UNION ALL
+
+SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    0 AS GoldBadges,
+    0 AS SilverBadges,
+    0 AS BronzeBadges,
+    0 AS QuestionCount,
+    0 AS AnswerCount,
+    NULL AS LastPostDate,
+    NULL AS LastCommentDate,
+    NULL AS LastVoteDate,
+    NULL AS TagName,
+    NULL AS TotalScore,
+    NULL AS AvgScore,
+    NULL AS DistinctContributors
+FROM Users u
+WHERE u.Id NOT IN (SELECT Id FROM TopUsers WHERE rn <= 50)
+  AND u.Reputation BETWEEN 500 AND 999
+ORDER BY Reputation DESC, Id;

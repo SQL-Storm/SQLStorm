@@ -1,0 +1,143 @@
+-- {"query": "3855.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 3122} 
+
+WITH
+    -- aggregate badge counts per user
+    UserBadgeAgg AS (
+        SELECT
+            u.Id                              AS UserId,
+            COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+            COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+            COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+            SUM(CASE WHEN b.TagBased = 1 THEN 1 ELSE 0 END) AS TagBadges
+        FROM Users u
+        LEFT JOIN Badges b ON b.UserId = u.Id
+        GROUP BY u.Id
+    ),
+    -- aggregate post statistics per user
+    UserPostAgg AS (
+        SELECT
+            p.OwnerUserId                     AS UserId,
+            COUNT(*) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+            COUNT(*) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+            SUM(p.Score) FILTER (WHERE p.PostTypeId = 1) AS QuestionScoreSum,
+            SUM(p.Score) FILTER (WHERE p.PostTypeId = 2) AS AnswerScoreSum,
+            MAX(p.CreationDate)               AS LastPostDate,
+            MAX(
+                CASE
+                    WHEN p.Tags IS NOT NULL THEN
+                        array_length(string_to_array(trim(both '<>' FROM p.Tags), '><'), 1)
+                    ELSE 0
+                END
+            )                                 AS MaxTagCount
+        FROM Posts p
+        GROUP BY p.OwnerUserId
+    ),
+    -- aggregate vote activity per user
+    UserVoteAgg AS (
+        SELECT
+            v.UserId,
+            COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS UpVotesCast,
+            COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS DownVotesCast,
+            COUNT(*) FILTER (WHERE v.VoteTypeId = 5) AS FavoritesGiven
+        FROM Votes v
+        GROUP BY v.UserId
+    ),
+    -- most recent activity (post or login) per user
+    RecentActivity AS (
+        SELECT
+            u.Id                               AS UserId,
+            COALESCE(p.LastActivityDate, u.LastAccessDate) AS RecentActivityDate
+        FROM Users u
+        LEFT JOIN (
+            SELECT OwnerUserId, MAX(LastActivityDate) AS LastActivityDate
+            FROM Posts
+            GROUP BY OwnerUserId
+        ) p ON p.OwnerUserId = u.Id
+    ),
+    -- tag popularity (used for a later join)
+    TagPopularity AS (
+        SELECT
+            t.TagName,
+            t.Count                       AS TagUseCount,
+            COALESCE(SUM(p.ViewCount),0)  AS TotalViewsForTag,
+            ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank
+        FROM Tags t
+        LEFT JOIN (
+            SELECT pt.TagId, p.ViewCount
+            FROM PostHistory pt
+            JOIN Posts p ON p.Id = pt.PostId
+            WHERE pt.PostHistoryTypeId = 6   -- edit tags
+        ) ph ON ph.TagId = t.Id
+        LEFT JOIN Posts p ON p.Id = ph.TagId
+        GROUP BY t.Id, t.TagName, t.Count
+    ),
+    -- compute a simple "tag affinity" score per user
+    UserTagScore AS (
+        SELECT
+            upa.UserId,
+            SUM(
+                CASE
+                    WHEN POSITION('<' || tg.TagName || '>' IN p.Tags) > 0 THEN 1
+                    ELSE 0
+                END
+            ) AS MatchingTagScore
+        FROM UserPostAgg upa
+        JOIN Posts p ON p.OwnerUserId = upa.UserId AND p.PostTypeId = 1
+        JOIN Tags tg ON POSITION('<' || tg.TagName || '>' IN p.Tags) > 0
+        GROUP BY upa.UserId
+    )
+SELECT
+    u.Id                                 AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COALESCE(uba.GoldBadges,0)           AS GoldBadges,
+    COALESCE(uba.SilverBadges,0)         AS SilverBadges,
+    COALESCE(uba.BronzeBadges,0)         AS BronzeBadges,
+    COALESCE(upa.QuestionCount,0)        AS QuestionsAsked,
+    COALESCE(upa.AnswerCount,0)          AS AnswersGiven,
+    COALESCE(upa.QuestionScoreSum,0) - COALESCE(upa.AnswerScoreSum,0) AS NetScoreDelta,
+    COALESCE(uv.UpVotesCast,0) - COALESCE(uv.DownVotesCast,0)          AS VoteBalance,
+    COALESCE(ra.RecentActivityDate, u.CreationDate)                  AS LastSeen,
+    CASE WHEN u.Location IS NULL THEN 'Unknown' ELSE u.Location END AS Location,
+    COALESCE(uts.MatchingTagScore,0)      AS TagAffinityScore,
+    ROW_NUMBER() OVER (
+        ORDER BY (u.Reputation
+                  + COALESCE(uba.GoldBadges,0) * 1000
+                  + COALESCE(upa.QuestionCount,0) * 10) DESC
+    )                                      AS ReputationRank
+FROM Users u
+LEFT JOIN UserBadgeAgg  uba ON uba.UserId = u.Id
+LEFT JOIN UserPostAgg   upa ON upa.UserId = u.Id
+LEFT JOIN UserVoteAgg   uv  ON uv.UserId = u.Id
+LEFT JOIN RecentActivity ra ON ra.UserId = u.Id
+LEFT JOIN UserTagScore  uts ON uts.UserId = u.Id
+WHERE (u.Reputation > 1000 OR uba.GoldBadges > 0)
+  AND (upa.QuestionCount IS NOT NULL OR upa.AnswerCount IS NOT NULL)
+  AND NOT EXISTS (
+        SELECT 1 FROM Badges b2
+        WHERE b2.UserId = u.Id AND lower(b2.Name) = 'spam'
+      )
+UNION ALL
+SELECT
+    NULL                                 AS UserId,
+    'TOTAL'                              AS DisplayName,
+    SUM(u.Reputation)                    AS Reputation,
+    SUM(COALESCE(uba.GoldBadges,0))      AS GoldBadges,
+    SUM(COALESCE(uba.SilverBadges,0))    AS SilverBadges,
+    SUM(COALESCE(uba.BronzeBadges,0))    AS BronzeBadges,
+    SUM(COALESCE(upa.QuestionCount,0))   AS QuestionsAsked,
+    SUM(COALESCE(upa.AnswerCount,0))     AS AnswersGiven,
+    SUM(COALESCE(upa.QuestionScoreSum,0)) - SUM(COALESCE(upa.AnswerScoreSum,0)) AS NetScoreDelta,
+    SUM(COALESCE(uv.UpVotesCast,0)) - SUM(COALESCE(uv.DownVotesCast,0))       AS VoteBalance,
+    NULL                                 AS LastSeen,
+    NULL                                 AS Location,
+    SUM(COALESCE(uts.MatchingTagScore,0)) AS TagAffinityScore,
+    NULL                                 AS ReputationRank
+FROM Users u
+LEFT JOIN UserBadgeAgg  uba ON uba.UserId = u.Id
+LEFT JOIN UserPostAgg   upa ON upa.UserId = u.Id
+LEFT JOIN UserVoteAgg   uv  ON uv.UserId = u.Id
+LEFT JOIN UserTagScore  uts ON uts.UserId = u.Id
+HAVING COUNT(*) > 0
+ORDER BY ReputationRank NULLS LAST, Reputation DESC
+LIMIT 100;

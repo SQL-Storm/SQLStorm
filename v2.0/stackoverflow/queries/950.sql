@@ -1,0 +1,450 @@
+with recent_questions as (
+    select
+        q.Id as QuestionId,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.OwnerUserId,
+        q.AcceptedAnswerId,
+        q.Title,
+        q.Tags,
+        coalesce(q.AnswerCount, 0) as AnswerCount
+    from Posts q
+    where q.PostTypeId = 1
+      and q.CreationDate >= (select max(CreationDate) - interval '365 days' from Posts)
+),
+answers as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId as AnswerUserId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreationDate
+    from Posts a
+    where a.PostTypeId = 2
+),
+question_stats as (
+    select
+        rq.QuestionId,
+        rq.CreationDate,
+        rq.Score as QuestionScore,
+        rq.ViewCount,
+        rq.OwnerUserId as QuestionUserId,
+        rq.AcceptedAnswerId,
+        rq.Title,
+        rq.Tags,
+        rq.AnswerCount,
+        count(a.AnswerId) as ActualAnswerCount,
+        sum(case when a.AnswerId = rq.AcceptedAnswerId then 1 else 0 end) as HasAccepted,
+        avg(case when a.AnswerId is not null then a.AnswerScore end) as AvgAnswerScore,
+        max(case when a.AnswerId is not null then a.AnswerScore end) as MaxAnswerScore,
+        min(case when a.AnswerId is not null then a.AnswerScore end) as MinAnswerScore,
+        sum(case when a.AnswerScore > 0 then 1 else 0 end) as PosAnswerCount,
+        sum(case when a.AnswerScore <= 0 then 1 else 0 end) as NonPosAnswerCount
+    from recent_questions rq
+    left join answers a on a.QuestionId = rq.QuestionId
+    group by rq.QuestionId, rq.CreationDate, rq.Score, rq.ViewCount, rq.OwnerUserId, rq.AcceptedAnswerId, rq.Title, rq.Tags, rq.AnswerCount
+),
+votes_agg as (
+    select
+        v.PostId,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+        sum(case when v.VoteTypeId = 5 then 1 else 0 end) as Favorites,
+        sum(case when v.VoteTypeId in (8,9) then coalesce(v.BountyAmount,0) else 0 end) as BountyTotal,
+        count(*) as TotalVotes,
+        max(v.CreationDate) as LastVoteDate
+    from Votes v
+    group by v.PostId
+),
+user_activity as (
+    select
+        u.Id as UserId,
+        u.Reputation,
+        u.CreationDate as UserCreationDate,
+        u.LastAccessDate,
+        u.DisplayName,
+        u.UpVotes as GivenUpVotes,
+        u.DownVotes as GivenDownVotes,
+        u.Views as ProfileViews,
+        coalesce(nullif(trim(u.Location), ''), 'Unknown') as LocationNorm
+    from Users u
+),
+badges_agg as (
+    select
+        b.UserId,
+        count(*) as BadgeCount,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldCount,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverCount,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeCount,
+        min(b.Date) as FirstBadgeDate,
+        max(b.Date) as LastBadgeDate
+    from Badges b
+    group by b.UserId
+),
+comments_agg as (
+    select
+        c.PostId,
+        count(*) as CommentCount,
+        avg(c.Score) as AvgCommentScore,
+        max(c.Score) as MaxCommentScore,
+        min(c.Score) as MinCommentScore,
+        max(c.CreationDate) as LastCommentDate
+    from Comments c
+    group by c.PostId
+),
+dupe_links as (
+    select
+        pl.PostId,
+        sum(case when pl.LinkTypeId = 3 then 1 else 0 end) as DuplicateLinks,
+        sum(case when pl.LinkTypeId = 1 then 1 else 0 end) as LinkedLinks,
+        max(pl.CreationDate) as LastLinkDate
+    from PostLinks pl
+    group by pl.PostId
+),
+closed_reasons as (
+    select
+        ph.PostId,
+        max(ph.CreationDate) as LastClosedDate,
+        max(case when ph.PostHistoryTypeId = 10 then ph.Comment end) as LastCloseReasonIdText
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (10)
+    group by ph.PostId
+),
+tags_expanded as (
+    select
+        p.Id as PostId,
+        lower(trim(t)) as tagname
+    from Posts p,
+    lateral (
+        select unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><')) as t
+    ) s
+    where p.PostTypeId = 1
+),
+tag_weights as (
+    select
+        te.PostId,
+        avg(case when t.Count is not null and t.Count <> 0 then ln(t.Count) end) as AvgTagWeight,
+        sum(case when t.IsModeratorOnly then 1 else 0 end) as ModOnlyTagCount,
+        sum(case when t.IsRequired then 1 else 0 end) as RequiredTagCount,
+        count(*) as TagCount
+    from tags_expanded te
+    left join Tags t on lower(t.TagName) = te.tagname
+    group by te.PostId
+),
+hotness as (
+    select
+        qs.QuestionId,
+        qs.CreationDate,
+        qs.ViewCount,
+        qs.QuestionScore,
+        qs.AnswerCount,
+        qa.UpVotes,
+        qa.DownVotes,
+        qa.Favorites,
+        qa.BountyTotal,
+        ca.CommentCount,
+        tw.TagCount,
+        (
+            coalesce(qs.QuestionScore,0) * 1.0
+            + coalesce(qa.UpVotes,0) * 0.7
+            - coalesce(qa.DownVotes,0) * 0.9
+            + coalesce(qs.ActualAnswerCount,0) * 0.6
+            + case when qs.HasAccepted > 0 then 5 else 0 end
+            + least(coalesce(qs.ViewCount,0) / nullif(extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - qs.CreationDate)) / 86400.0,0), 5000)
+            + coalesce(ca.CommentCount,0) * 0.2
+            + coalesce(qa.Favorites,0) * 0.5
+            + ln(1 + coalesce(qa.BountyTotal,0)) * 2
+            + coalesce(tw.TagCount,0) * 0.1
+        ) as HotnessScore
+    from question_stats qs
+    left join votes_agg qa on qa.PostId = qs.QuestionId
+    left join comments_agg ca on ca.PostId = qs.QuestionId
+    left join tag_weights tw on tw.PostId = qs.QuestionId
+),
+ranked as (
+    select
+        h.QuestionId,
+        h.CreationDate,
+        h.ViewCount,
+        h.QuestionScore,
+        h.AnswerCount,
+        h.UpVotes,
+        h.DownVotes,
+        h.Favorites,
+        h.BountyTotal,
+        h.CommentCount,
+        h.TagCount,
+        h.HotnessScore,
+        dense_rank() over (order by h.HotnessScore desc, h.CreationDate desc) as HotRank,
+        percent_rank() over (order by h.HotnessScore) as HotPercentile,
+        ntile(20) over (order by h.HotnessScore desc) as HotVigintile
+    from hotness h
+),
+owner_enriched as (
+    select
+        r.QuestionId,
+        r.CreationDate,
+        r.ViewCount,
+        r.QuestionScore,
+        r.AnswerCount,
+        r.UpVotes,
+        r.DownVotes,
+        r.Favorites,
+        r.BountyTotal,
+        r.CommentCount,
+        r.TagCount,
+        r.HotnessScore,
+        r.HotRank,
+        r.HotPercentile,
+        r.HotVigintile,
+        ua.UserId,
+        ua.Reputation,
+        ua.DisplayName,
+        ua.LocationNorm,
+        ua.ProfileViews,
+        ba.BadgeCount,
+        coalesce(ba.GoldCount,0) as GoldCount,
+        coalesce(ba.SilverCount,0) as SilverCount,
+        coalesce(ba.BronzeCount,0) as BronzeCount
+    from ranked r
+    left join Posts p on p.Id = r.QuestionId
+    left join user_activity ua on ua.UserId = p.OwnerUserId
+    left join badges_agg ba on ba.UserId = ua.UserId
+),
+accept_answer_age as (
+    select
+        q.Id as QuestionId,
+        a.Id as AnswerId,
+        extract(epoch from (a.CreationDate - q.CreationDate)) / 3600.0 as HoursToAccepted
+    from Posts q
+    join Posts a on a.Id = q.AcceptedAnswerId and a.PostTypeId = 2
+    where q.PostTypeId = 1
+),
+accepted_stats as (
+    select
+        aa.QuestionId,
+        aa.HoursToAccepted,
+        ntile(4) over (order by aa.HoursToAccepted) as AcceptSpeedQuartile
+    from accept_answer_age aa
+),
+outer_mix as (
+    select
+        oe.QuestionId,
+        oe.CreationDate,
+        oe.ViewCount,
+        oe.QuestionScore,
+        oe.AnswerCount,
+        oe.UpVotes,
+        oe.DownVotes,
+        oe.Favorites,
+        oe.BountyTotal,
+        oe.CommentCount,
+        oe.TagCount,
+        oe.HotnessScore,
+        oe.HotRank,
+        oe.HotPercentile,
+        oe.HotVigintile,
+        oe.UserId,
+        oe.Reputation,
+        oe.DisplayName,
+        oe.LocationNorm,
+        oe.ProfileViews,
+        oe.BadgeCount,
+        oe.GoldCount,
+        oe.SilverCount,
+        oe.BronzeCount,
+        cs.LastClosedDate,
+        cs.LastCloseReasonIdText,
+        dl.DuplicateLinks,
+        dl.LinkedLinks,
+        tw.AvgTagWeight,
+        tw.ModOnlyTagCount,
+        tw.RequiredTagCount,
+        tw.TagCount as ExpandedTagCount,
+        es.AcceptSpeedQuartile,
+        es.HoursToAccepted,
+        dl.LastLinkDate
+    from owner_enriched oe
+    left join closed_reasons cs on cs.PostId = oe.QuestionId
+    full outer join dupe_links dl on dl.PostId = oe.QuestionId
+    left join tag_weights tw on tw.PostId = oe.QuestionId
+    left join accepted_stats es on es.QuestionId = oe.QuestionId
+),
+string_and_null_fun as (
+    select
+        om.QuestionId,
+        om.CreationDate,
+        om.ViewCount,
+        om.QuestionScore,
+        om.AnswerCount,
+        om.UpVotes,
+        om.DownVotes,
+        om.Favorites,
+        om.BountyTotal,
+        om.CommentCount,
+        om.TagCount,
+        om.HotnessScore,
+        om.HotRank,
+        om.HotPercentile,
+        om.HotVigintile,
+        om.UserId,
+        om.Reputation,
+        om.DisplayName,
+        om.LocationNorm,
+        om.ProfileViews,
+        om.BadgeCount,
+        om.GoldCount,
+        om.SilverCount,
+        om.BronzeCount,
+        om.LastClosedDate,
+        om.LastCloseReasonIdText,
+        om.DuplicateLinks,
+        om.LinkedLinks,
+        om.AvgTagWeight,
+        om.ModOnlyTagCount,
+        om.RequiredTagCount,
+        om.ExpandedTagCount,
+        om.AcceptSpeedQuartile,
+        om.HoursToAccepted,
+        om.LastLinkDate,
+        regexp_replace(coalesce(om.LocationNorm, 'Unknown'), '\s+', ' ', 'g') as LocationClean,
+        case
+            when om.DisplayName is null or om.DisplayName ~ '^\s*$' then '[anonymous]'
+            when char_length(om.DisplayName) > 20 then substring(om.DisplayName from 1 for 17) || '...'
+            else om.DisplayName
+        end as DisplayNameShort,
+        case
+            when om.LastCloseReasonIdText ~ '^\d+$' then
+                case cast(om.LastCloseReasonIdText as integer)
+                    when 101 then 'Duplicate'
+                    when 102 then 'Off-topic'
+                    when 103 then 'Needs details or clarity'
+                    when 104 then 'Needs more focus'
+                    when 105 then 'Opinion-based'
+                    else 'Legacy/Other'
+                end
+            else null
+        end as CloseReasonName
+    from outer_mix om
+),
+window_rollups as (
+    select
+        s.QuestionId,
+        s.CreationDate,
+        s.ViewCount,
+        s.QuestionScore,
+        s.AnswerCount,
+        s.UpVotes,
+        s.DownVotes,
+        s.Favorites,
+        s.BountyTotal,
+        s.CommentCount,
+        s.TagCount,
+        s.HotnessScore,
+        s.HotRank,
+        s.HotPercentile,
+        s.HotVigintile,
+        s.UserId,
+        s.Reputation,
+        s.DisplayName,
+        s.LocationNorm,
+        s.ProfileViews,
+        s.BadgeCount,
+        s.GoldCount,
+        s.SilverCount,
+        s.BronzeCount,
+        s.LastClosedDate,
+        s.LastCloseReasonIdText,
+        s.DuplicateLinks,
+        s.LinkedLinks,
+        s.AvgTagWeight,
+        s.ModOnlyTagCount,
+        s.RequiredTagCount,
+        s.ExpandedTagCount,
+        s.AcceptSpeedQuartile,
+        s.HoursToAccepted,
+        s.LastLinkDate,
+        s.LocationClean,
+        s.DisplayNameShort,
+        s.CloseReasonName,
+        count(*) over () as TotalRows,
+        row_number() over (order by s.HotnessScore desc, s.CreationDate desc) as RowNum,
+        sum(case when s.DuplicateLinks > 0 then 1 else 0 end) over () as AnyDupesCount,
+        avg(s.HotnessScore) over () as GlobalAvgHotness,
+        avg(s.HotnessScore) over (partition by s.HotVigintile) as TileAvgHotness,
+        lag(s.HotnessScore) over (order by s.HotnessScore desc) as PrevHotness,
+        lead(s.HotnessScore) over (order by s.HotnessScore desc) as NextHotness
+    from string_and_null_fun s
+),
+top_decile as (
+    select wr.*
+    from window_rollups wr
+    where wr.HotPercentile >= 0.9
+),
+rest as (
+    select wr.*
+    from window_rollups wr
+    where wr.HotPercentile < 0.9
+),
+combined as (
+    select * from top_decile
+    union all
+    select * from rest
+),
+final_projection as (
+    select
+        c.QuestionId,
+        c.RowNum,
+        c.HotRank,
+        cast(round(c.HotnessScore, 3) as double precision) as HotnessScore,
+        c.HotPercentile,
+        c.HotVigintile,
+        c.CreationDate,
+        c.ViewCount,
+        c.QuestionScore,
+        c.AnswerCount,
+        c.UserId as OwnerUserId,
+        c.DisplayNameShort as OwnerDisplay,
+        c.LocationClean as OwnerLocation,
+        c.Reputation as OwnerReputation,
+        c.BadgeCount,
+        c.GoldCount,
+        c.SilverCount,
+        c.BronzeCount,
+        c.UpVotes,
+        c.DownVotes,
+        c.Favorites,
+        c.BountyTotal,
+        c.CommentCount,
+        c.AvgTagWeight,
+        c.ModOnlyTagCount,
+        c.RequiredTagCount,
+        c.ExpandedTagCount,
+        c.DuplicateLinks,
+        c.LinkedLinks,
+        null as LastVoteDate,
+        null as LastCommentDate,
+        c.LastLinkDate,
+        c.LastClosedDate,
+        c.CloseReasonName,
+        coalesce(c.HoursToAccepted, -1) as HoursToAccepted,
+        c.AcceptSpeedQuartile,
+        null as Title,
+        c.TagCount
+    from combined c
+)
+select *
+from final_projection fp
+where
+    (
+        (fp.ViewCount > 1000 and fp.HotnessScore > 5)
+        or (fp.AcceptSpeedQuartile = 1 and fp.HoursToAccepted between 0 and 24)
+        or (fp.DuplicateLinks is not null and fp.DuplicateLinks > 0)
+        or (fp.CloseReasonName is not null and fp.CloseReasonName in ('Duplicate','Off-topic'))
+    )
+    and coalesce(fp.OwnerReputation, 0) >= 0
+    and (fp.TagCount is null or fp.TagCount >= 1)
+    and (fp.BountyTotal = 0 or fp.BountyTotal is null or fp.BountyTotal > 50)
+order by fp.HotRank, fp.RowNum
+limit 500;

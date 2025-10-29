@@ -1,0 +1,137 @@
+-- {"query": "5630.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1050} 
+WITH
+RecentActivePosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.Tags,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.ContentLicense,
+    u.Reputation AS OwnerReputation,
+    u.DisplayName AS OwnerDisplayName,
+    u.AccountId AS OwnerAccountId
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.LastActivityDate >= NOW() - INTERVAL '30 days'
+),
+TagStats AS (
+  SELECT
+    t.TagName,
+    COUNT(DISTINCT p.PostId) AS PostCount,
+    AVG(p.Score) AS AvgScore,
+    SUM(p.ViewCount) AS TotalViews
+  FROM RecentActivePosts p
+  CROSS JOIN LATERAL (
+    SELECT unnest(string_to_array(substr(p.Tags, 2, length(p.Tags)-2), '><')) AS TagName
+  ) AS t
+  GROUP BY t.TagName
+),
+TopTags AS (
+  SELECT
+    t.TagName,
+    t.PostCount,
+    t.AvgScore,
+    t.TotalViews
+  FROM TagStats t
+  ORDER BY t.TotalViews DESC, t.AvgScore DESC
+  LIMIT 20
+),
+PostsWithHistory AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    ph.PostHistoryTypeId,
+    ph.CreationDate AS HistoryDate,
+    ph.UserId AS HistoryUserId,
+    ph.Text,
+    ph.Comment
+  FROM Posts p
+  LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+  WHERE p.LastActivityDate >= NOW() - INTERVAL '60 days'
+),
+UserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT a.PostId) AS AnswersCount,
+    COUNT(DISTINCT q.PostId) AS QuestionsCount,
+    SUM(v.BountyAmount) AS TotalBounties,
+    MAX(v.CreationDate) AS LastVoteDate
+  FROM Users u
+  LEFT JOIN Posts q ON q.OwnerUserId = u.Id AND q.PostTypeId = 1
+  LEFT JOIN Posts a ON a.OwnerUserId = u.Id AND a.PostTypeId = 2
+  LEFT JOIN Votes v ON v.UserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+  HAVING COUNT(DISTINCT a.PostId) > 0 OR COUNT(DISTINCT q.PostId) > 0
+),
+ComplexQuery AS (
+  SELECT
+    rp.PostId,
+    rp.Title,
+    rp.OwnerDisplayName,
+    rp.OwnerReputation,
+    rp.LastActivityDate,
+    rp.Score,
+    rp.ViewCount,
+    rp.CommentCount,
+    rp.AnswerCount,
+    EXISTS (
+      SELECT 1
+      FROM PostLinks pl
+      WHERE pl.PostId = rp.PostId AND pl.RelatedPostId <> rp.PostId
+    ) AS HasLinks,
+    CASE
+      WHEN rp.Score >= 10 THEN 'High'
+      WHEN rp.Score >= 5 THEN 'Medium'
+      WHEN rp.Score >= 0 THEN 'Low'
+      ELSE 'Negative'
+    END AS ScoreTier,
+    ARRAY_AGG(DISTINCT tt.TagName) FILTER (WHERE tt.TagName IS NOT NULL) AS TagCloud
+  FROM RecentActivePosts rp
+  LEFT JOIN LATERAL (
+    SELECT unnest(string_to_array(substr(rp.Tags, 2, length(rp.Tags)-2), '><')) AS TagName
+  ) AS tt ON TRUE
+  GROUP BY rp.PostId, rp.Title, rp.OwnerDisplayName, rp.OwnerReputation, rp.LastActivityDate, rp.Score, rp.ViewCount, rp.CommentCount, rp.AnswerCount
+)
+SELECT
+  cq.PostId,
+  cq.Title,
+  cq.OwnerDisplayName,
+  cq.OwnerReputation,
+  cq.LastActivityDate,
+  cq.Score,
+  cq.ViewCount,
+  cq.CommentCount,
+  cq.AnswerCount,
+  cq.HasLinks,
+  cq.ScoreTier,
+  cq.TagCloud,
+  uav.UserId AS TopContributorUserId,
+  uav.DisplayName AS TopContributorName,
+  uav.Reputation AS TopContributorReputation,
+  uav.AnswersCount,
+  uav.QuestionsCount,
+  uav.TotalBounties,
+  uav.LastVoteDate,
+  tt.TagName AS TopTagName
+FROM ComplexQuery cq
+LEFT JOIN Posts p2 ON p2.Id = cq.PostId
+LEFT JOIN UserActivity uav ON TRUE
+LEFT JOIN TopTags tt ON TRUE
+ORDER BY cq.LastActivityDate DESC, cq.Score DESC
+LIMIT 200;

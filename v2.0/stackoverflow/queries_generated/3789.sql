@@ -1,0 +1,130 @@
+-- {"query": "3789.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2139} 
+
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COALESCE(SUM(p.Score), 0)               AS TotalPostScore,
+        COUNT(p.Id)                             AS TotalPosts,
+        MAX(p.CreationDate)                     AS LastPostDate
+    FROM Users u
+    LEFT JOIN Badges b  ON b.UserId = u.Id
+    LEFT JOIN Posts  p  ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopUsers AS (
+    SELECT *
+    FROM UserStats
+    ORDER BY Reputation DESC, TotalPostScore DESC
+    LIMIT 100
+),
+UserPosts AS (
+    SELECT 
+        p.Id,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.Tags,
+        ROW_NUMBER() OVER (
+            PARTITION BY p.OwnerUserId 
+            ORDER BY p.Score DESC NULLS LAST, p.CreationDate DESC
+        ) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+TagExplode AS (
+    SELECT 
+        up.Id AS PostId,
+        unnest(string_to_array(substring(up.Tags, 2, length(up.Tags) - 2), '><')) AS TagName
+    FROM UserPosts up
+    WHERE up.Tags IS NOT NULL
+),
+TagStats AS (
+    SELECT 
+        te.TagName,
+        COUNT(*)                     AS TagUseCount,
+        AVG(up.Score)                AS AvgScore
+    FROM TagExplode te
+    JOIN UserPosts up ON up.Id = te.PostId
+    GROUP BY te.TagName
+),
+UserTagAgg AS (
+    SELECT 
+        up.OwnerUserId,
+        jsonb_object_agg(ts.TagName, ts.TagUseCount) 
+            FILTER (WHERE ts.TagUseCount > 5) AS PopularTags
+    FROM UserPosts up
+    JOIN TagStats ts 
+        ON ts.TagName = ANY (string_to_array(substring(up.Tags, 2, length(up.Tags)-2), '><'))
+    GROUP BY up.OwnerUserId
+),
+RecentVotes AS (
+    SELECT 
+        v.PostId,
+        COUNT(*) FILTER (WHERE vt.Name = 'UpMod')   AS UpVotes,
+        COUNT(*) FILTER (WHERE vt.Name = 'DownMod') AS DownVotes,
+        MAX(v.CreationDate)                         AS LastVoteDate
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE v.CreationDate > NOW() - INTERVAL '30 days'
+    GROUP BY v.PostId
+),
+Combined AS (
+    SELECT 
+        tu.Id               AS UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.GoldBadges,
+        tu.SilverBadges,
+        tu.BronzeBadges,
+        tu.TotalPostScore,
+        tu.TotalPosts,
+        tu.LastPostDate,
+        up.Id               AS PostId,
+        up.Title,
+        up.CreationDate     AS PostDate,
+        up.Score,
+        up.ViewCount,
+        up.AnswerCount,
+        up.FavoriteCount,
+        up.Tags,
+        rv.UpVotes,
+        rv.DownVotes,
+        rv.LastVoteDate,
+        COALESCE(uta.PopularTags, '{}'::jsonb) AS PopularTags
+    FROM TopUsers tu
+    LEFT JOIN UserPosts up    ON up.OwnerUserId = tu.Id AND up.rn <= 3
+    LEFT JOIN RecentVotes rv ON rv.PostId = up.Id
+    LEFT JOIN UserTagAgg uta ON uta.OwnerUserId = tu.Id
+)
+SELECT *
+FROM Combined
+WHERE (Combined.Score IS NULL OR Combined.Score < 0)
+  AND (Combined.UpVotes IS NULL OR Combined.UpVotes = 0)
+  AND Combined.Tags IS NOT NULL
+ORDER BY Reputation DESC, TotalPostScore DESC
+UNION ALL
+SELECT 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    0,0,0,
+    0,0,NULL,
+    NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,
+    '{}'::jsonb
+FROM Users u
+WHERE NOT EXISTS (
+        SELECT 1 FROM Posts p 
+        WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1
+     )
+  AND u.Reputation > 10000
+ORDER BY Reputation DESC
+LIMIT 20;

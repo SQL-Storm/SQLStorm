@@ -1,0 +1,322 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LatestPostDate,
+        MAX(c.CreationDate) AS LatestCommentDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Gold'
+            WHEN u.Reputation >= 5000 THEN 'Silver'
+            WHEN u.Reputation >= 1000 THEN 'Bronze'
+            ELSE 'Iron'
+        END AS ReputationTier
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 0
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes
+),
+QuestionStats AS (
+    SELECT 
+        p.OwnerUserId,
+        COUNT(*) AS QuestionCount,
+        AVG(p.Score) AS AvgQuestionScore,
+        MAX(p.ViewCount) AS MaxViewCount,
+        COUNT(DISTINCT p.Tags) AS UniqueTagsCount,
+        STRING_AGG(DISTINCT p.Tags, '; ') AS AllTags
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+    GROUP BY p.OwnerUserId
+),
+AnswerStats AS (
+    SELECT 
+        p.OwnerUserId,
+        COUNT(*) AS AnswerCount,
+        AVG(p.Score) AS AvgAnswerScore,
+        SUM(p.Score) AS TotalAnswerScore,
+        COUNT(DISTINCT p.ParentId) AS UniqueQuestionsAnswered
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+    GROUP BY p.OwnerUserId
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        CAST('2024-10-01 12:34:56' AS timestamp) - u.CreationDate AS AccountAgeInterval,
+        EXTRACT(epoch FROM (CAST('2024-10-01 12:34:56' AS timestamp) - u.CreationDate)) / 86400 AS AccountAgeDays,
+        CAST('2024-10-01 12:34:56' AS timestamp) - u.LastAccessDate AS DaysSinceLastAccessInterval,
+        EXTRACT(epoch FROM (CAST('2024-10-01 12:34:56' AS timestamp) - u.LastAccessDate)) / 86400 AS DaysSinceLastAccess,
+        CASE 
+            WHEN EXTRACT(epoch FROM (CAST('2024-10-01 12:34:56' AS timestamp) - u.LastAccessDate)) / 86400 <= 30 THEN 'Active'
+            WHEN EXTRACT(epoch FROM (CAST('2024-10-01 12:34:56' AS timestamp) - u.LastAccessDate)) / 86400 <= 90 THEN 'Inactive'
+            ELSE 'Very Inactive'
+        END AS ActivityStatus,
+        u.AccountId,
+        COALESCE(us.PostCount, 0) AS TotalPosts,
+        COALESCE(us.CommentCount, 0) AS TotalComments,
+        COALESCE(us.BadgeCount, 0) AS TotalBadges,
+        COALESCE(qs.QuestionCount, 0) AS QuestionsAsked,
+        COALESCE(as1.AnswerCount, 0) AS AnswersGiven,
+        COALESCE(us.PostCount, 0) + COALESCE(us.CommentCount, 0) + COALESCE(us.BadgeCount, 0) AS TotalEngagement,
+        CASE 
+            WHEN (COALESCE(qs.QuestionCount, 0) > 0 AND COALESCE(as1.AnswerCount, 0) > 0) THEN 'Both Questions and Answers'
+            WHEN COALESCE(qs.QuestionCount, 0) > 0 THEN 'Only Questions'
+            WHEN COALESCE(as1.AnswerCount, 0) > 0 THEN 'Only Answers'
+            ELSE 'No Posts'
+        END AS UserPostType
+    FROM Users u
+    LEFT JOIN UserStats us ON u.Id = us.UserId
+    LEFT JOIN QuestionStats qs ON u.Id = qs.OwnerUserId
+    LEFT JOIN AnswerStats as1 ON u.Id = as1.OwnerUserId
+),
+CombinedStats AS (
+    SELECT 
+        ua.UserId,
+        ua.AccountAgeDays,
+        ua.DaysSinceLastAccess,
+        ua.ActivityStatus,
+        ua.AccountId,
+        ua.TotalPosts,
+        ua.TotalComments,
+        ua.TotalBadges,
+        ua.QuestionsAsked,
+        ua.AnswersGiven,
+        ua.TotalEngagement,
+        ua.UserPostType,
+        us.Reputation,
+        us.DisplayName,
+        us.Views,
+        us.UpVotes,
+        us.DownVotes,
+        us.ReputationRank,
+        us.ReputationTier,
+        COALESCE(qs.AvgQuestionScore, 0) AS AvgQuestionScore,
+        COALESCE(qs.MaxViewCount, 0) AS MaxQuestionViewCount,
+        COALESCE(qs.UniqueTagsCount, 0) AS UniqueQuestionTags,
+        COALESCE(as1.AvgAnswerScore, 0) AS AvgAnswerScore,
+        COALESCE(as1.TotalAnswerScore, 0) AS TotalAnswerScore,
+        COALESCE(as1.UniqueQuestionsAnswered, 0) AS UniqueQuestionsAnswered,
+        LAG(ua.TotalEngagement) OVER (ORDER BY ua.UserId) AS PrevUserEngagement,
+        LAG(us.Reputation) OVER (ORDER BY ua.UserId) AS PrevUserReputation,
+        (ua.TotalEngagement - LAG(ua.TotalEngagement) OVER (ORDER BY ua.UserId)) AS EngagementChange,
+        (us.Reputation - LAG(us.Reputation) OVER (ORDER BY ua.UserId)) AS ReputationChange,
+        CASE 
+            WHEN ua.TotalEngagement > 500 THEN 'High Engagement'
+            WHEN ua.TotalEngagement > 100 THEN 'Medium Engagement'
+            WHEN ua.TotalEngagement > 0 THEN 'Low Engagement'
+            ELSE 'No Engagement'
+        END AS EngagementLevel,
+        CASE 
+            WHEN (COALESCE(qs.QuestionCount, 0) + COALESCE(as1.AnswerCount, 0)) > 100 THEN 'High Productivity'
+            WHEN (COALESCE(qs.QuestionCount, 0) + COALESCE(as1.AnswerCount, 0)) > 50 THEN 'Medium Productivity'
+            WHEN (COALESCE(qs.QuestionCount, 0) + COALESCE(as1.AnswerCount, 0)) > 0 THEN 'Low Productivity'
+            ELSE 'No Productivity'
+        END AS ProductivityLevel,
+        CASE 
+            WHEN ua.DaysSinceLastAccess >= 365 THEN 'Inactive'
+            WHEN ua.DaysSinceLastAccess >= 180 THEN 'Almost Inactive'
+            WHEN ua.DaysSinceLastAccess >= 30 THEN 'Inactive but Active'
+            ELSE 'Active'
+        END AS RecentActivityStatus,
+        CASE 
+            WHEN COALESCE(qs.QuestionCount, 0) > 0 THEN 'Question Author'
+            WHEN COALESCE(as1.AnswerCount, 0) > 0 THEN 'Answer Provider'
+            ELSE 'Community Participant'
+        END AS UserRole,
+        CASE 
+            WHEN ua.TotalPosts > 0 AND ua.TotalComments > 0 THEN 'Both Active'
+            WHEN ua.TotalPosts > 0 THEN 'Post Author'
+            WHEN ua.TotalComments > 0 THEN 'Commenter'
+            ELSE 'Passive User'
+        END AS EngagementStyle
+    FROM UserActivity ua
+    LEFT JOIN UserStats us ON ua.UserId = us.UserId
+    LEFT JOIN QuestionStats qs ON ua.UserId = qs.OwnerUserId
+    LEFT JOIN AnswerStats as1 ON ua.UserId = as1.OwnerUserId
+)
+SELECT 
+    cs.UserId,
+    cs.DisplayName,
+    cs.Reputation,
+    cs.ReputationTier,
+    cs.ReputationRank,
+    cs.AccountAgeDays,
+    cs.DaysSinceLastAccess,
+    cs.ActivityStatus,
+    cs.AccountId,
+    cs.TotalPosts,
+    cs.TotalComments,
+    cs.TotalBadges,
+    cs.QuestionsAsked,
+    cs.AnswersGiven,
+    cs.TotalEngagement,
+    cs.UserPostType,
+    cs.AvgQuestionScore,
+    cs.MaxQuestionViewCount,
+    cs.UniqueQuestionTags,
+    cs.AvgAnswerScore,
+    cs.TotalAnswerScore,
+    cs.UniqueQuestionsAnswered,
+    cs.PrevUserEngagement,
+    cs.PrevUserReputation,
+    cs.EngagementChange,
+    cs.ReputationChange,
+    cs.EngagementLevel,
+    cs.ProductivityLevel,
+    cs.RecentActivityStatus,
+    cs.UserRole,
+    cs.EngagementStyle,
+    ROUND(cs.Reputation * 1.0 / NULLIF(cs.AccountAgeDays, 0), 2) AS ReputationPerDay,
+    ROUND(cs.TotalPosts * 1.0 / NULLIF(cs.AccountAgeDays, 0), 2) AS PostsPerDay,
+    ROUND(cs.TotalEngagement * 1.0 / NULLIF(cs.AccountAgeDays, 0), 2) AS EngagementPerDay,
+    CASE 
+        WHEN cs.Reputation > 5000 AND cs.TotalPosts > 100 AND cs.AnswersGiven > 50 THEN 'Elite Contributor'
+        WHEN cs.Reputation > 1000 AND cs.TotalPosts > 50 THEN 'Active Contributor'
+        WHEN cs.Reputation > 500 AND cs.TotalPosts > 20 THEN 'Regular Participant'
+        ELSE 'Casual User'
+    END AS ContributorLevel,
+    CASE 
+        WHEN cs.TotalEngagement >= 1000 THEN 'Top Tier'
+        WHEN cs.TotalEngagement >= 500 THEN 'High Tier'
+        WHEN cs.TotalEngagement >= 100 THEN 'Medium Tier'
+        WHEN cs.TotalEngagement >= 10 THEN 'Low Tier'
+        ELSE 'Beginner Tier'
+    END AS EngagementCategory,
+    COALESCE(cte.TagCount, 0) AS TagCount,
+    STRING_AGG(COALESCE(cte.TagName, 'No Tags'), ', ') AS TagList,
+    (cs.QuestionsAsked + cs.AnswersGiven) AS TotalQuestionsAndAnswers,
+    CASE 
+        WHEN cs.AnswersGiven > 0 AND cs.QuestionsAsked > 0 THEN (cs.AnswersGiven * 100.0 / (cs.AnswersGiven + cs.QuestionsAsked))
+        ELSE 0
+    END AS AnswerPercentage,
+    CASE 
+        WHEN cs.TotalBadges > 0 THEN 
+            'Badge Awarded: ' || STRING_AGG(DISTINCT b.Name, ', ') || ' (Total: ' || cs.TotalBadges || ')'
+        ELSE 'No Badges'
+    END AS BadgeInformation,
+    ROW_NUMBER() OVER (ORDER BY cs.Reputation DESC, cs.QuestionsAsked DESC, cs.AnswersGiven DESC) AS UserRanking,
+    LAG(cs.UserId) OVER (ORDER BY cs.Reputation DESC) AS PreviousTopUserId,
+    LEAD(cs.UserId) OVER (ORDER BY cs.Reputation DESC) AS NextTopUserId,
+    RANK() OVER (ORDER BY cs.Reputation) AS ReputationRanking,
+    DENSE_RANK() OVER (ORDER BY cs.Reputation) AS ReputationDenseRanking,
+    NTILE(10) OVER (ORDER BY cs.Reputation) AS ReputationDecile,
+    PERCENT_RANK() OVER (ORDER BY cs.Reputation) AS ReputationPercentile,
+    CASE 
+        WHEN cs.Reputation > (SELECT AVG(Reputation) FROM Users WHERE Reputation > 0) THEN 'Above Average'
+        ELSE 'Below Average'
+    END AS ReputationStatus,
+    COALESCE(cte.MaxTagCount, 0) AS MaxTagCount,
+    COALESCE(cte.MinTagCount, 0) AS MinTagCount,
+    COALESCE(cte.AvgTagCount, 0) AS AvgTagCount,
+    CASE 
+        WHEN cs.Reputation >= 10000 AND cs.TotalBadges >= 50 THEN 'Legend Status'
+        WHEN cs.Reputation >= 5000 THEN 'Veteran Status'
+        WHEN cs.Reputation >= 1000 THEN 'Active Status'
+        ELSE 'Beginner Status'
+    END AS CommunityStatus,
+    COALESCE(qs.AllTags, '') AS AllTags,
+    cs.UserPostType AS PostType,
+    CASE 
+        WHEN cs.AnswersGiven > cs.QuestionsAsked THEN 'More Answers'
+        WHEN cs.AnswersGiven < cs.QuestionsAsked THEN 'More Questions'
+        ELSE 'Equal Questions and Answers'
+    END AS QuestionAnswerBalance
+FROM CombinedStats cs
+LEFT JOIN (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count AS TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank
+    FROM Tags t
+) cte ON EXISTS (
+    SELECT 1 
+    FROM Posts p 
+    WHERE p.OwnerUserId = cs.UserId 
+      AND p.Tags LIKE '%' || cte.TagName || '%'
+)
+LEFT JOIN (
+    SELECT 
+        p.OwnerUserId,
+        STRING_AGG(t.TagName, ', ') AS AllTags
+    FROM Posts p
+    JOIN (
+        SELECT 
+            unnest(string_to_array(trim(p.Tags, '<>'), '><')) AS TagName,
+            p.Id AS PostId
+        FROM Posts p
+        WHERE p.Tags IS NOT NULL 
+          AND p.Tags != ''
+          AND p.PostTypeId = 1
+    ) t ON t.PostId = p.Id
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+) qs ON cs.UserId = qs.OwnerUserId
+LEFT JOIN Badges b ON cs.UserId = b.UserId
+GROUP BY 
+    cs.UserId,
+    cs.DisplayName,
+    cs.Reputation,
+    cs.ReputationTier,
+    cs.ReputationRank,
+    cs.AccountAgeDays,
+    cs.DaysSinceLastAccess,
+    cs.ActivityStatus,
+    cs.AccountId,
+    cs.TotalPosts,
+    cs.TotalComments,
+    cs.TotalBadges,
+    cs.QuestionsAsked,
+    cs.AnswersGiven,
+    cs.TotalEngagement,
+    cs.UserPostType,
+    cs.AvgQuestionScore,
+    cs.MaxQuestionViewCount,
+    cs.UniqueQuestionTags,
+    cs.AvgAnswerScore,
+    cs.TotalAnswerScore,
+    cs.UniqueQuestionsAnswered,
+    cs.PrevUserEngagement,
+    cs.PrevUserReputation,
+    cs.EngagementChange,
+    cs.ReputationChange,
+    cs.EngagementLevel,
+    cs.ProductivityLevel,
+    cs.RecentActivityStatus,
+    cs.UserRole,
+    cs.EngagementStyle,
+    cs.UserPostType,
+    qs.AllTags,
+    cte.TagCount,
+    cte.TagName,
+    cte.MaxTagCount,
+    cte.MinTagCount,
+    cte.AvgTagCount,
+    b.Name,
+    cs.TotalBadges
+HAVING 
+    cs.Reputation > 0 
+    AND (
+        cs.TotalEngagement >= 10 
+        OR cs.QuestionsAsked >= 1 
+        OR cs.AnswersGiven >= 1
+    )
+ORDER BY 
+    cs.Reputation DESC,
+    cs.TotalEngagement DESC,
+    cs.AccountAgeDays ASC,
+    cs.DaysSinceLastAccess ASC
+LIMIT 1000;

@@ -1,0 +1,55 @@
+-- {"query": "6057.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-micro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 516} 
+
+SELECT 
+    u.DisplayName, 
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    MAX(p.Score) AS HighestScoredPost,
+    MIN(p.CreationDate) AS FirstPost,
+    MAX(p.LastActivityDate) AS LastActivity,
+    b.Name AS LatestBadge,
+    ph.Comment AS LastEditComment,
+    c.Text AS LastComment
+FROM 
+    Users u
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    (SELECT 
+         UserId, 
+         MAX(Date) AS MaxDate
+     FROM 
+         Badges
+     GROUP BY 
+         UserId) bb ON u.Id = bb.UserId AND b.Date = bb.MaxDate
+LEFT JOIN 
+    (SELECT 
+         ph.UserId, 
+         ph.Comment, 
+         ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+     FROM 
+         PostHistory ph
+     WHERE 
+         ph.PostHistoryTypeId IN (2, 5, 6, 8, 10, 11, 12, 13, 14, 15, 19, 20, 35)
+     ) ph ON u.Id = ph.UserId AND ph.rn = 1
+LEFT JOIN 
+    (SELECT 
+         c.PostId, 
+         c.Text, 
+         ROW_NUMBER() OVER (PARTITION BY c.PostId ORDER BY c.CreationDate DESC) AS rn
+     FROM 
+         Comments c
+     ) c ON u.Id = c.UserId AND c.rn = 1
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+WHERE 
+    u.Reputation > 1000
+    AND p.LastActivityDate > p.CreationDate
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation
+HAVING 
+    COUNT(DISTINCT p.Id) > 10
+ORDER BY 
+    u.Reputation DESC;

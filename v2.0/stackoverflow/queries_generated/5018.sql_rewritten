@@ -1,0 +1,71 @@
+-- {"query": "5018.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 529} 
+WITH
+RecentTopPosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.OwnerUserId,
+    u.DisplayName AS OwnerName,
+    ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC, p.CreationDate DESC) AS rn
+  FROM Posts p
+  JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId = 1 -- Questions
+    AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '180 days'
+),
+TagAnalysis AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS TagCount,
+    AVG(p.Score) AS AvgScore,
+    MAX(p.ViewCount) AS MaxViews
+  FROM Tagging tg
+  JOIN Tags t ON tg.TagId = t.Id
+  JOIN Posts p ON p.Id = tg.PostId
+  GROUP BY t.TagName
+),
+CorrelatedNotes AS (
+  SELECT
+    r.PostId,
+    r.Title,
+    r.OwnerName,
+    r.CreationDate,
+    r.Score,
+    r.ViewCount,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = r.PostId) AS CommentCount,
+    (SELECT STRING_AGG(CONCAT('u', c.UserId, ':', c.Score), '|') 
+       FROM Comments c WHERE c.PostId = r.PostId) AS CommentVotes,
+    (SELECT MAX(v.CreationDate) FROM Votes v WHERE v.PostId = r.PostId) AS LastVoteDate
+  FROM RecentTopPosts r
+  WHERE r.rn <= 5
+)
+SELECT
+  c.PostId,
+  c.Title,
+  c.OwnerName,
+  c.CreationDate,
+  c.Score,
+  c.ViewCount,
+  c.CommentCount,
+  c.CommentVotes,
+  c.LastVoteDate,
+  ta.TagName,
+  ta.TagCount,
+  ta.AvgScore,
+  ta.MaxViews
+FROM CorrelatedNotes c
+LEFT JOIN (
+  SELECT
+    p.Id AS PostId,
+    t.TagName,
+    t.Count AS TagCount,
+    t.TagName AS TagAlias
+  FROM Posts p
+  JOIN Tags t ON p.Tags LIKE '%' || t.TagName || '%'
+  WHERE p.PostTypeId = 1
+) ta ON ta.PostId = c.PostId
+ORDER BY c.CreationDate DESC, c.Score DESC
+LIMIT 100;

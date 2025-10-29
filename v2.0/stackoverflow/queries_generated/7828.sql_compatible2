@@ -1,0 +1,155 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS prev_score,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS moving_avg_score
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT r.Id) AS posts_count,
+        SUM(CASE WHEN r.PostTypeId = 1 THEN 1 ELSE 0 END) AS questions_count,
+        SUM(CASE WHEN r.PostTypeId = 2 THEN 1 ELSE 0 END) AS answers_count,
+        AVG(r.Score) AS avg_score,
+        MAX(r.CreationDate) AS last_post_date
+    FROM Users u
+    LEFT JOIN RankedPosts r ON u.Id = r.OwnerUserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > (SELECT AVG(t2.Count) * 1.5 FROM Tags t2) THEN 'High'
+            WHEN t.Count < (SELECT AVG(t2.Count) * 0.5 FROM Tags t2) THEN 'Low'
+            ELSE 'Normal'
+        END AS tag_category,
+        (SELECT COUNT(*) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%') AS post_reference_count
+    FROM Tags t
+),
+QuestionStats AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.CommentCount,
+        q.CreationDate,
+        q.OwnerUserId,
+        q.Tags,
+        CASE WHEN q.AcceptedAnswerId IS NULL THEN 0 ELSE 1 END AS has_accepted_answer,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = q.Id) AS comment_count,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = q.Id AND v.VoteTypeId = 2) AS upvotes_count,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = q.Id AND v.VoteTypeId = 3) AS downvotes_count,
+        CASE 
+            WHEN q.AnswerCount > 0 AND q.Score > 0 THEN 'Active'
+            WHEN q.AnswerCount = 0 AND q.Score >= 0 THEN 'Unanswered'
+            ELSE 'Inactive'
+        END AS question_status
+    FROM Posts q
+    WHERE q.PostTypeId = 1
+)
+SELECT 
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.posts_count,
+    us.questions_count,
+    us.answers_count,
+    us.avg_score,
+    us.last_post_date,
+    ta.TagName,
+    ta.Count AS tag_count,
+    ta.tag_category,
+    qs.QuestionId,
+    qs.Title,
+    qs.Score,
+    qs.ViewCount,
+    qs.AnswerCount,
+    qs.question_status,
+    CASE 
+        WHEN us.posts_count > 10 AND us.avg_score > 50 THEN 'High Contributor'
+        WHEN us.posts_count > 5 AND us.avg_score > 25 THEN 'Medium Contributor'
+        WHEN us.posts_count > 0 THEN 'New Contributor'
+        ELSE 'Inactive'
+    END AS contributor_level,
+    COALESCE((
+        SELECT AVG(r.Score)
+        FROM RankedPosts r
+        WHERE r.OwnerUserId = us.UserId
+          AND r.rn <= 3
+    ), 0) AS recent_avg_score,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = us.UserId AND p.PostTypeId = 1 AND p.CreationDate > DATE '2023-01-01') AS recent_questions,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = us.UserId AND p.PostTypeId = 2 AND p.CreationDate > DATE '2023-01-01') AS recent_answers,
+    COALESCE((
+        SELECT STRING_AGG(t2.TagName, ', ')
+        FROM Tags t2
+        WHERE t2.Id IN (
+            SELECT DISTINCT TRIM(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2)) 
+            FROM Posts p 
+            WHERE p.OwnerUserId = us.UserId AND p.Tags IS NOT NULL
+        )
+    ), 'No Tags') AS user_tags,
+    CASE 
+        WHEN EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = us.UserId AND b.Class = 1) THEN 'Gold Medalist'
+        WHEN EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = us.UserId AND b.Class = 2) THEN 'Silver Medalist'
+        WHEN EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = us.UserId AND b.Class = 3) THEN 'Bronze Medalist'
+        ELSE 'No Badges'
+    END AS medal_status,
+    (SELECT COUNT(DISTINCT ph.PostId) FROM PostHistory ph WHERE ph.UserId = us.UserId) AS edit_count,
+    (SELECT COUNT(DISTINCT v.PostId) FROM Votes v WHERE v.UserId = us.UserId AND v.VoteTypeId IN (2,3)) AS vote_count,
+    (SELECT COUNT(DISTINCT u2.Id) FROM Users u2 WHERE u2.AccountId IN (SELECT AccountId FROM Users WHERE Id = us.UserId) AND u2.Id != us.UserId) AS account_member_count
+FROM UserStats us
+FULL OUTER JOIN TagAnalysis ta ON (ta.Count > 100 OR ta.post_reference_count > 10)
+FULL OUTER JOIN QuestionStats qs 
+    ON (qs.OwnerUserId = us.UserId OR qs.QuestionId IN (
+        SELECT p.Id 
+        FROM Posts p 
+        WHERE p.OwnerUserId = us.UserId AND p.PostTypeId = 1
+    ))
+WHERE 
+    (us.posts_count > 0 OR ta.TagName IS NOT NULL OR qs.QuestionId IS NOT NULL)
+    AND (us.UserId IS NOT NULL OR ta.TagName IS NOT NULL OR qs.QuestionId IS NOT NULL)
+    AND (
+        (us.Reputation > 1000 AND us.avg_score > 10) 
+        OR ta.tag_category IN ('High', 'Low') 
+        OR qs.question_status IN ('Active', 'Unanswered')
+    )
+    AND (
+        (us.last_post_date > DATE '2023-01-01' AND us.posts_count > 5)
+        OR (ta.post_reference_count > 50 AND ta.Count > 500)
+        OR (qs.CreationDate > DATE '2023-01-01' AND qs.AnswerCount > 0)
+    )
+    AND NOT (
+        (us.posts_count = 0 AND ta.tag_category = 'Normal' AND qs.QuestionId IS NULL)
+        OR (us.UserId IS NULL AND ta.TagName IS NULL AND qs.QuestionId IS NULL)
+    )
+ORDER BY 
+    CASE WHEN us.Reputation > 10000 THEN 1 ELSE 2 END,
+    COALESCE(us.last_post_date, DATE '1900-01-01'),
+    ta.Count DESC,
+    qs.Score DESC
+LIMIT 1000;

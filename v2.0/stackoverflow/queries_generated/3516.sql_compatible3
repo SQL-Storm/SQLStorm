@@ -1,0 +1,248 @@
+WITH user_stats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id)                                            AS total_posts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END)      AS questions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END)      AS answers,
+        AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL)       AS avg_score,
+        MAX(p.CreationDate)                                    AS last_post_date,
+        MAX(v.CreationDate)                                    AS last_vote_date
+    FROM Users u
+    LEFT JOIN Posts p   ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v   ON v.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+badge_counts AS (
+    SELECT
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END)                AS gold_badges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END)                AS silver_badges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END)                AS bronze_badges,
+        STRING_AGG(DISTINCT b.Name, ', ')                      AS badge_names
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+-- portable tag splitter: generate numbers and extract tag substrings
+tag_positions AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Tags,
+        nums.pos_num,
+        -- replace Oracle/SQLite INSTR with standard POSITION-like logic using CHARINDEX for SQL Server or POSITION for standard;
+        -- Use a portable approach: locate the nth occurrence by searching progressively with SUBSTRING and POSITION.
+        -- Here we compute the position of the nth '<' and the next '>'
+        NULLIF(
+          CASE
+            WHEN nums.pos_num = 1 THEN POSITION('<' IN p.Tags)
+            ELSE NULL
+          END, 0
+        ) AS open_pos_dummy,
+        NULL AS close_pos_dummy
+    FROM Posts p
+    CROSS JOIN (
+        SELECT 1 AS pos_num UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5
+        UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9 UNION ALL SELECT 10
+        UNION ALL SELECT 11 UNION ALL SELECT 12 UNION ALL SELECT 13 UNION ALL SELECT 14 UNION ALL SELECT 15
+    ) nums
+    WHERE p.Tags IS NOT NULL
+),
+-- Because standard SQL does not have a simple nth-index function portably, implement tag extraction by splitting on '><' pattern.
+-- First normalize tags by removing leading/trailing angle brackets and then split by '><' using a numbers table approach.
+tag_normalized AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        TRIM(BOTH '<>' FROM p.Tags) AS Tags
+    FROM Posts p
+    WHERE p.Tags IS NOT NULL
+),
+tag_split_numbers AS (
+    SELECT
+        tn.PostId,
+        tn.OwnerUserId,
+        tn.Tags,
+        nums.pos_num,
+        -- extract the nth element by splitting on '><' using repeated substring searches:
+        -- find start position of nth element: if pos_num=1 start at 1 else find (n-1)th delimiter position + 3 (length of '><' is 2, but delimiter characters are 2; adjust by 2)
+        CASE
+          WHEN nums.pos_num = 1 THEN 1
+          ELSE COALESCE(NULLIF(
+                 ( 
+                   -- find position of the (n-1)th occurrence of '><' by iterating using substring; portable approach uses repeated nested POSITION via generate rows,
+                   POSITION('><' IN ( -- reduce string to part after previous delimiters by applying a simple loop via substring; emulate with repeated replaces up to max count
+                     regexp_replace(tn.Tags, E'((?:.*?><){' || (nums.pos_num - 1) || '})(.*)', E'\\2')
+                   ))
+                 ,0),1)
+        END AS start_pos,
+        NULL AS end_pos
+    FROM tag_normalized tn
+    CROSS JOIN (
+        SELECT 1 AS pos_num UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5
+        UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9 UNION ALL SELECT 10
+        UNION ALL SELECT 11 UNION ALL SELECT 12 UNION ALL SELECT 13 UNION ALL SELECT 14 UNION ALL SELECT 15
+    ) nums
+),
+-- simpler and more portable: split tags by replacing '><' with a delimiter and then use a regexp_split_to_table where available; fallback to splitting via numbers and substring extraction
+tag_splits AS (
+    SELECT
+        ts.OwnerUserId,
+        TRIM(both ' ' FROM NULLIF(
+            -- try to extract nth element by splitting with regexp splitting if available; use CASE to handle dialects:
+            CASE
+              WHEN POSITION(',' IN ts.Tags) > 0 AND FALSE THEN NULL -- placeholder to keep SQL dialects tolerant
+              ELSE
+                -- direct extraction: get the nth element by splitting on '><' using regexp_replace to isolate the element
+                regexp_replace(ts.Tags, E'^(?:([^><]+)(?:><|$)){0,' || (ts.pos_num - 1) || '}', '')
+            END
+        , '')) AS TagName
+    FROM (
+        SELECT
+            tn.PostId,
+            tn.OwnerUserId,
+            REPLACE(tn.Tags, '><', '||SPLIT||') AS Tags,
+            nums.pos_num
+        FROM tag_normalized tn
+        CROSS JOIN (
+            SELECT 1 AS pos_num UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5
+            UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9 UNION ALL SELECT 10
+            UNION ALL SELECT 11 UNION ALL SELECT 12 UNION ALL SELECT 13 UNION ALL SELECT 14 UNION ALL SELECT 15
+        ) nums
+    ) ts
+    WHERE ts.Tags IS NOT NULL
+),
+-- final portable split using simple substring extraction around the custom delimiter
+tag_items AS (
+    SELECT
+        ts.OwnerUserId,
+        TRIM(BOTH '<> ' FROM
+            CASE
+                WHEN ts.pos_num = 1 THEN
+                    CASE WHEN POSITION('||SPLIT||' IN ts.Tags) = 0 THEN ts.Tags
+                         ELSE SUBSTRING(ts.Tags FROM 1 FOR POSITION('||SPLIT||' IN ts.Tags)-1) END
+                ELSE
+                    -- remove first (pos_num-1) parts and take up to next delimiter
+                    CASE
+                        WHEN POSITION('||SPLIT||' IN regexp_replace(ts.Tags, E'^((?:.*?\\|\\|SPLIT\\|\\|){' || (ts.pos_num - 1) || '})(.*)$', E'\\2')) = 0
+                        THEN regexp_replace(ts.Tags, E'^((?:.*?\\|\\|SPLIT\\|\\|){' || (ts.pos_num - 1) || '})(.*)$', E'\\2')
+                        ELSE SUBSTRING(
+                            regexp_replace(ts.Tags, E'^((?:.*?\\|\\|SPLIT\\|\\|){' || (ts.pos_num - 1) || '})(.*)$', E'\\2')
+                            FROM 1 FOR POSITION('||SPLIT||' IN regexp_replace(ts.Tags, E'^((?:.*?\\|\\|SPLIT\\|\\|){' || (ts.pos_num - 1) || '})(.*)$', E'\\2'))-1)
+                    END
+            END
+        ) AS TagName
+    FROM (
+        SELECT
+            tn.PostId,
+            tn.OwnerUserId,
+            REPLACE(tn.Tags, '><', '||SPLIT||') AS Tags,
+            nums.pos_num
+        FROM tag_normalized tn
+        CROSS JOIN (
+            SELECT 1 AS pos_num UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5
+            UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9 UNION ALL SELECT 10
+            UNION ALL SELECT 11 UNION ALL SELECT 12 UNION ALL SELECT 13 UNION ALL SELECT 14 UNION ALL SELECT 15
+        ) nums
+    ) ts
+    WHERE ts.Tags IS NOT NULL
+),
+
+user_tag_usage AS (
+    SELECT
+        OwnerUserId AS UserId,
+        LOWER(REGEXP_REPLACE(TagName, '\s+', '', 'g')) AS TagName,
+        COUNT(*) AS tag_usage
+    FROM tag_items
+    WHERE TagName IS NOT NULL AND TagName <> ''
+    GROUP BY OwnerUserId, LOWER(REGEXP_REPLACE(TagName, '\s+', '', 'g'))
+),
+
+top_tags AS (
+    SELECT
+        utu.UserId,
+        STRING_AGG(utu.TagName, ', ' ORDER BY utu.tag_usage DESC) AS top_5_tags
+    FROM user_tag_usage utu
+    GROUP BY utu.UserId
+),
+
+recent_activity AS (
+    SELECT
+        u.Id,
+        MAX(p.LastActivityDate)                            AS recent_post_activity,
+        MAX(c.CreationDate)                                 AS recent_comment_activity
+    FROM Users u
+    LEFT JOIN Posts    p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId      = u.Id
+    GROUP BY u.Id
+)
+
+SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    COALESCE(us.total_posts,0)                     AS total_posts,
+    COALESCE(us.questions,0)                       AS questions,
+    COALESCE(us.answers,0)                         AS answers,
+    ROUND(COALESCE(us.avg_score,0),2)              AS avg_score,
+    us.last_post_date,
+    us.last_vote_date,
+    COALESCE(bc.gold_badges,0)                      AS gold_badges,
+    COALESCE(bc.silver_badges,0)                    AS silver_badges,
+    COALESCE(bc.bronze_badges,0)                    AS bronze_badges,
+    bc.badge_names,
+    tt.top_5_tags,
+    ra.recent_post_activity,
+    ra.recent_comment_activity,
+    RANK() OVER (ORDER BY u.Reputation DESC)       AS reputation_rank,
+    CASE
+        WHEN u.Location IS NULL OR TRIM(u.Location) = '' THEN 'Unknown'
+        ELSE u.Location
+    END                                           AS user_location,
+    (SELECT COUNT(*)
+     FROM Votes v
+     WHERE v.UserId = u.Id
+       AND v.VoteTypeId = 2
+       AND v.CreationDate > (CAST('2024-10-01' AS date) - INTERVAL '30' DAY)
+    ) AS upvotes_last_30d
+FROM Users u
+LEFT JOIN user_stats     us ON us.Id = u.Id
+LEFT JOIN badge_counts   bc ON bc.UserId = u.Id
+LEFT JOIN top_tags       tt ON tt.UserId = u.Id
+LEFT JOIN recent_activity ra ON ra.Id = u.Id
+WHERE (u.Reputation > 1000 OR COALESCE(bc.gold_badges,0) > 0)
+
+UNION ALL
+
+SELECT
+    NULL                                          AS Id,
+    'TOTAL'                                       AS DisplayName,
+    SUM(u.Reputation)                             AS Reputation,
+    SUM(COALESCE(us.total_posts,0))               AS total_posts,
+    SUM(COALESCE(us.questions,0))                 AS questions,
+    SUM(COALESCE(us.answers,0))                   AS answers,
+    ROUND(AVG(COALESCE(us.avg_score,0)),2)        AS avg_score,
+    MAX(us.last_post_date)                        AS last_post_date,
+    MAX(us.last_vote_date)                        AS last_vote_date,
+    SUM(COALESCE(bc.gold_badges,0))               AS gold_badges,
+    SUM(COALESCE(bc.silver_badges,0))             AS silver_badges,
+    SUM(COALESCE(bc.bronze_badges,0))             AS bronze_badges,
+    NULL                                          AS badge_names,
+    NULL                                          AS top_5_tags,
+    MAX(ra.recent_post_activity)                 AS recent_post_activity,
+    MAX(ra.recent_comment_activity)              AS recent_comment_activity,
+    NULL                                          AS reputation_rank,
+    NULL                                          AS user_location,
+    NULL                                          AS upvotes_last_30d
+FROM Users u
+LEFT JOIN user_stats     us ON us.Id = u.Id
+LEFT JOIN badge_counts   bc ON bc.UserId = u.Id
+LEFT JOIN recent_activity ra ON ra.Id = u.Id
+GROUP BY ()
+HAVING COUNT(u.Id) > 0
+
+ORDER BY Reputation DESC NULLS LAST
+LIMIT 100;

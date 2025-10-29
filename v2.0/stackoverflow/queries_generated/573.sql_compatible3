@@ -1,0 +1,394 @@
+with recent_posts as (
+    select
+        p.id,
+        p.posttypeid,
+        p.owneruserid,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        p.title,
+        p.tags,
+        p.acceptedanswerid,
+        p.parentid,
+        p.lastactivitydate,
+        coalesce(nullif(trim(p.ownerdisplayname), ''), u.displayname) as owner_name
+    from posts p
+    left join users u on u.id = p.owneruserid
+    where p.creationdate >= (
+        select date_trunc('month', max(creationdate)) - interval '12 months' from posts
+    )
+),
+user_activity as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate as user_creationdate,
+        coalesce(u.location, 'Unknown') as location,
+        sum(case when p.posttypeid = 1 then 1 else 0 end) as questions_last_year,
+        sum(case when p.posttypeid = 2 then 1 else 0 end) as answers_last_year,
+        count(distinct p.id) as posts_last_year,
+        count(distinct c.id) filter (where c.creationdate >= (
+            select date_trunc('month', max(creationdate)) - interval '12 months' from comments
+        )) as comments_last_year,
+        count(distinct b.id) filter (where b.date >= (
+            select date_trunc('month', max(date)) - interval '12 months' from badges
+        )) as badges_last_year
+    from users u
+    left join recent_posts p on p.owneruserid = u.id
+    left join comments c on c.userid = u.id
+    left join badges b on b.userid = u.id
+    group by u.id, u.displayname, u.reputation, u.creationdate, u.location
+),
+vote_agg as (
+    select
+        v.postid,
+        sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+        sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+        sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+        sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_total,
+        min(v.creationdate) as first_vote_at,
+        max(v.creationdate) as last_vote_at
+    from votes v
+    group by v.postid
+),
+postlinks_agg as (
+    select
+        pl.postid,
+        sum(case when pl.linktypeid = 1 then 1 else 0 end) as linked_count,
+        sum(case when pl.linktypeid = 3 then 1 else 0 end) as duplicate_count
+    from postlinks pl
+    group by pl.postid
+),
+edits as (
+    select
+        ph.postid,
+        count(*) filter (where ph.posthistorytypeid in (4,5,6)) as edit_count,
+        min(ph.creationdate) filter (where ph.posthistorytypeid in (4,5,6)) as first_edit_at,
+        max(ph.creationdate) filter (where ph.posthistorytypeid in (4,5,6)) as last_edit_at,
+        count(*) filter (where ph.posthistorytypeid = 10) as close_events,
+        max(case when ph.posthistorytypeid = 10 then (case when ph.comment ~ '^[0-9]+$' then cast(ph.comment as integer) else null end) end) as last_close_reason_id
+    from posthistory ph
+    group by ph.postid
+),
+closed_reasons as (
+    select
+        crt.id as close_reason_id,
+        crt.name as close_reason_name
+    from closereasontypes crt
+),
+normalized_tags as (
+    select
+        rp.id as post_id,
+        unnest(string_to_array(substring(rp.tags, 2, greatest(length(rp.tags)-2,0)), '><')) as tag_name
+    from recent_posts rp
+    where rp.posttypeid = 1
+),
+tag_weights as (
+    select
+        nt.post_id,
+        nt.tag_name,
+        t.count as global_tag_count,
+        case
+            when t.count is null or t.count = 0 then 0.0
+            else 1.0 / sqrt(cast(t.count as numeric))
+        end as inv_sqrt_weight
+    from normalized_tags nt
+    left join tags t on lower(t.tagname) = lower(nt.tag_name)
+),
+post_tag_score as (
+    select
+        post_id,
+        sum(inv_sqrt_weight) as tag_rarity_score,
+        max(global_tag_count) as max_tag_popularity
+    from tag_weights
+    group by post_id
+),
+answer_metrics as (
+    select
+        p_q.id as question_id,
+        count(p_a.id) as answer_count,
+        max(p_a.score) as best_answer_score,
+        avg(p_a.score) filter (where p_a.score is not null) as avg_answer_score,
+        count(*) filter (where p_a.owneruserid is null) as anon_answers
+    from posts p_q
+    left join posts p_a on p_a.parentid = p_q.id and p_a.posttypeid = 2
+    where p_q.posttypeid = 1
+    group by p_q.id
+),
+accepted_latency as (
+    select
+        q.id as question_id,
+        extract(epoch from (a.creationdate - q.creationdate)) / 3600.0 as hours_to_accept
+    from posts q
+    join posts a on a.id = q.acceptedanswerid
+    where q.posttypeid = 1
+),
+recent_user_ranks as (
+    select
+        ua.user_id,
+        ua.displayname,
+        ua.reputation,
+        ua.user_creationdate,
+        ua.location,
+        ua.questions_last_year,
+        ua.answers_last_year,
+        ua.posts_last_year,
+        ua.comments_last_year,
+        ua.badges_last_year,
+        row_number() over (order by ua.posts_last_year desc nulls last, ua.reputation desc) as activity_rank,
+        dense_rank() over (order by ua.reputation desc) as reputation_rank,
+        ntile(10) over (order by ua.reputation desc) as reputation_decile
+    from user_activity ua
+),
+post_core as (
+    select
+        rp.id,
+        rp.posttypeid,
+        rp.owneruserid,
+        rp.creationdate,
+        rp.score,
+        rp.viewcount,
+        rp.title,
+        rp.tags,
+        rp.acceptedanswerid,
+        rp.parentid,
+        rp.lastactivitydate,
+        rp.owner_name,
+        coalesce(va.upvotes, 0) as upvotes,
+        coalesce(va.downvotes, 0) as downvotes,
+        coalesce(va.favorites, 0) as favorites,
+        coalesce(va.bounty_total, 0) as bounty_total,
+        va.first_vote_at,
+        va.last_vote_at,
+        coalesce(pl.linked_count, 0) as linked_count,
+        coalesce(pl.duplicate_count, 0) as duplicate_count,
+        coalesce(e.edit_count, 0) as edit_count,
+        e.first_edit_at,
+        e.last_edit_at,
+        coalesce(e.close_events, 0) as close_events,
+        e.last_close_reason_id,
+        cr.close_reason_name as last_close_reason_name,
+        pts.tag_rarity_score,
+        pts.max_tag_popularity,
+        am.answer_count,
+        am.best_answer_score,
+        am.avg_answer_score,
+        al.hours_to_accept
+    from recent_posts rp
+    left join vote_agg va on va.postid = rp.id
+    left join postlinks_agg pl on pl.postid = rp.id
+    left join edits e on e.postid = rp.id
+    left join closed_reasons cr on cr.close_reason_id = e.last_close_reason_id
+    left join post_tag_score pts on pts.post_id = rp.id
+    left join answer_metrics am on am.question_id = rp.id
+    left join accepted_latency al on al.question_id = rp.id
+),
+post_scored as (
+    select
+        pc.*,
+        case
+            when pc.posttypeid = 1 then
+                0.50 * coalesce(pc.score,0)
+              + 0.25 * coalesce(pc.upvotes - pc.downvotes, 0)
+              + 0.15 * (coalesce(pc.viewcount,0) / nullif(ln(greatest(pc.viewcount,1)+1),0))
+              + 0.10 * coalesce(pc.tag_rarity_score, 0)
+            when pc.posttypeid = 2 then
+                0.60 * coalesce(pc.score,0)
+              + 0.20 * coalesce(pc.upvotes - pc.downvotes, 0)
+              + 0.20 * coalesce(pc.bounty_total, 0)
+            else
+                0.40 * coalesce(pc.score,0)
+              + 0.10 * coalesce(pc.upvotes - pc.downvotes, 0)
+        end as engagement_score,
+        case
+            when pc.close_events > 0 then 1
+            when pc.duplicate_count > 0 then 1
+            else 0
+        end as is_problem_post
+    from post_core pc
+),
+-- compute median and 95th percentile without ordered-set aggregates using windowed rank approach
+post_score_stats as (
+    select
+        ps.*,
+        percent_rank() over (order by coalesce(ps.score,0)) as score_percent_rank,
+        percent_rank() over (order by ps.engagement_score) as engagement_percent_rank
+    from post_scored ps
+),
+post_ranked as (
+    select
+        ps.*,
+        row_number() over (partition by ps.posttypeid order by ps.engagement_score desc nulls last, ps.creationdate desc) as rn_by_type,
+        -- approximate median_score_all as the score where percent_rank >= 0.5 (pick first)
+        (select coalesce(p2.score,0) from (
+            select coalesce(score,0) as score,
+                   percent_rank() over (order by coalesce(score,0)) as pr
+            from post_scored
+        ) t2 where t2.pr >= 0.5 order by pr limit 1) as median_score_all,
+        rank() over (order by coalesce(ps.score,0) desc, coalesce(ps.viewcount,0) desc) as global_score_rank,
+        sum(coalesce(ps.viewcount,0)) over (order by ps.creationdate rows between unbounded preceding and current row) as running_views
+    from post_scored ps
+),
+-- compute 95th percentile engagement threshold separately (non-ordered-set)
+engagement_95 as (
+    select distinct
+        (select engagement_score from (
+            select engagement_score,
+                   row_number() over (order by engagement_score) as rn,
+                   count(*) over () as total_count
+            from post_scored
+        ) t where rn >= ceil(total_count * 0.95) order by rn limit 1) as engagement_95_value
+    from post_scored
+    limit 1
+),
+comment_density as (
+    select
+        p.id as post_id,
+        coalesce(count(c.id),0) as comment_count,
+        extract(epoch from (coalesce(max(c.creationdate), p.lastactivitydate) - p.creationdate))/3600.0 as hours_active,
+        case
+            when extract(epoch from (coalesce(max(c.creationdate), p.lastactivitydate) - p.creationdate))/3600.0 <= 0 then null
+            else (count(c.id) / nullif(extract(epoch from (coalesce(max(c.creationdate), p.lastactivitydate) - p.creationdate))/3600.0, 0))
+        end as comments_per_hour
+    from posts p
+    left join comments c on c.postid = p.id
+    group by p.id, p.creationdate, p.lastactivitydate
+),
+final_enriched as (
+    select
+        pr.id,
+        pr.posttypeid,
+        pr.owneruserid,
+        pr.creationdate,
+        pr.score,
+        pr.viewcount,
+        pr.title,
+        pr.tags,
+        pr.acceptedanswerid,
+        pr.parentid,
+        pr.lastactivitydate,
+        pr.owner_name,
+        pr.upvotes,
+        pr.downvotes,
+        pr.favorites,
+        pr.bounty_total,
+        pr.first_vote_at,
+        pr.last_vote_at,
+        pr.linked_count,
+        pr.duplicate_count,
+        pr.edit_count,
+        pr.first_edit_at,
+        pr.last_edit_at,
+        pr.close_events,
+        pr.last_close_reason_id,
+        pr.last_close_reason_name,
+        pr.tag_rarity_score,
+        pr.max_tag_popularity,
+        pr.answer_count,
+        pr.best_answer_score,
+        pr.avg_answer_score,
+        pr.hours_to_accept,
+        pr.engagement_score,
+        pr.is_problem_post,
+        pr.rn_by_type,
+        pr.median_score_all,
+        pr.global_score_rank,
+        pr.running_views,
+        cd.comment_count,
+        cd.comments_per_hour,
+        rur.user_id,
+        rur.displayname as user_displayname,
+        rur.reputation,
+        rur.activity_rank,
+        rur.reputation_rank,
+        rur.reputation_decile,
+        case
+            when pr.posttypeid = 1 and pr.answer_count is not null and pr.answer_count > 0
+                 and pr.hours_to_accept is not null and pr.hours_to_accept < 24 then 'fast-accepted'
+            when pr.posttypeid = 1 and coalesce(pr.answer_count,0) = 0 and coalesce(pr.viewcount,0) > 1000 then 'unanswered-highview'
+            when pr.is_problem_post = 1 then 'problematic'
+            else 'normal'
+        end as post_bucket
+    from post_ranked pr
+    left join comment_density cd on cd.post_id = pr.id
+    left join recent_user_ranks rur on rur.user_id = pr.owneruserid
+),
+dupe_groups as (
+    select
+        pr.id as base_post_id,
+        dl.relatedpostid as dupe_of_id
+    from postlinks dl
+    join posts pr on pr.id = dl.postid
+    where dl.linktypeid = 3
+),
+clustered as (
+    select
+        fe.*,
+        coalesce(dg.dupe_of_id, fe.id) as cluster_root_id
+    from final_enriched fe
+    left join dupe_groups dg on dg.base_post_id = fe.id
+),
+root_stats as (
+    select
+        cluster_root_id,
+        count(*) as cluster_size,
+        sum(case when is_problem_post = 1 then 1 else 0 end) as cluster_problems,
+        max(engagement_score) as cluster_max_engagement
+    from clustered
+    group by cluster_root_id
+)
+select
+    c.id,
+    c.posttypeid,
+    c.title,
+    c.owner_name,
+    c.user_displayname,
+    c.reputation,
+    c.reputation_decile,
+    c.creationdate,
+    c.lastactivitydate,
+    c.score,
+    c.viewcount,
+    c.upvotes,
+    c.downvotes,
+    c.favorites,
+    c.bounty_total,
+    c.tag_rarity_score,
+    c.max_tag_popularity,
+    c.answer_count,
+    c.best_answer_score,
+    cast(round(c.avg_answer_score::numeric, 2) as numeric) as avg_answer_score,
+    cast(round(c.hours_to_accept::numeric, 2) as numeric) as hours_to_accept,
+    c.edit_count,
+    c.close_events,
+    coalesce(c.last_close_reason_name, 'N/A') as last_close_reason_name,
+    c.linked_count,
+    c.duplicate_count,
+    c.comment_count,
+    cast(round(c.comments_per_hour::numeric, 3) as numeric) as comments_per_hour,
+    cast(round(c.engagement_score::numeric, 3) as numeric) as engagement_score,
+    c.rn_by_type,
+    c.global_score_rank,
+    c.running_views,
+    c.post_bucket,
+    c.cluster_root_id,
+    rs.cluster_size,
+    rs.cluster_problems,
+    rs.cluster_max_engagement,
+    case
+        when c.posttypeid = 1 then 'Q'
+        when c.posttypeid = 2 then 'A'
+        else 'O'
+    end || '-' || lpad(cast(c.id as text), 8, '0') as human_key
+from clustered c
+left join root_stats rs on rs.cluster_root_id = c.cluster_root_id
+left join engagement_95 e95 on 1=1
+where (
+        c.rn_by_type <= 100
+     or c.engagement_score >= coalesce(e95.engagement_95_value, 0)
+     or (c.is_problem_post = 1 and c.viewcount >= coalesce((select avg(viewcount) from posts),0))
+     )
+and coalesce(c.title, '') <> ''
+order by c.engagement_score desc nulls last, c.viewcount desc, c.creationdate desc
+limit 500;

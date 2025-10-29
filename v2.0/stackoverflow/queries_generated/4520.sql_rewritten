@@ -1,0 +1,142 @@
+-- {"query": "4520.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1267} 
+WITH
+  RankedPostEdits AS (
+    SELECT
+      ph.PostId,
+      ph.UserId,
+      ph.CreationDate AS EditDate,
+      ph.PostHistoryTypeId,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory AS ph
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6) /* Edit Title, Edit Body, Edit Tags */
+  ),
+  PostEditSummary AS (
+    SELECT
+      rpe.PostId,
+      COUNT(rpe.PostId) AS TotalEdits,
+      MAX(rpe.EditDate) AS LastEditDate,
+      STRING_AGG(DISTINCT CONCAT(ph_t.Name, ' (', CAST(rpe.PostHistoryTypeId AS VARCHAR), ')'), ', ') AS EditedTypes
+    FROM RankedPostEdits AS rpe
+    JOIN PostHistoryTypes AS ph_t
+      ON rpe.PostHistoryTypeId = ph_t.Id
+    GROUP BY
+      rpe.PostId
+  ),
+  UserQuestionActivity AS (
+    SELECT
+      p.OwnerUserId,
+      COUNT(p.Id) AS QuestionCount,
+      AVG(CAST(p.AnswerCount AS DECIMAL(10, 2))) AS AvgAnswerCount,
+      SUM(p.ViewCount) AS TotalViews
+    FROM Posts AS p
+    WHERE
+      p.PostTypeId = 1 /* Question */ AND p.OwnerUserId IS NOT NULL
+    GROUP BY
+      p.OwnerUserId
+  ),
+  UserAnswerActivity AS (
+    SELECT
+      p.OwnerUserId,
+      COUNT(p.Id) AS AnswerCount,
+      AVG(CAST(p.Score AS DECIMAL(10, 2))) AS AvgAnswerScore
+    FROM Posts AS p
+    WHERE
+      p.PostTypeId = 2 /* Answer */ AND p.OwnerUserId IS NOT NULL
+    GROUP BY
+      p.OwnerUserId
+  ),
+  UserCommentActivity AS (
+    SELECT
+      c.UserId,
+      COUNT(c.Id) AS CommentCount,
+      AVG(CAST(c.Score AS DECIMAL(10, 2))) AS AvgCommentScore
+    FROM Comments AS c
+    WHERE
+      c.UserId IS NOT NULL
+    GROUP BY
+      c.UserId
+  ),
+  MostRecentHotTag AS (
+    SELECT
+      t.TagName,
+      MAX(p.LastActivityDate) AS LastHotDate
+    FROM Tags AS t
+    JOIN Posts AS p
+      ON p.Tags LIKE CONCAT('%<', t.TagName, '>%'
+    WHERE
+      p.Id IN (
+        SELECT
+          PostId
+        FROM PostHistory
+        WHERE
+          PostHistoryTypeId = 52 /* SelectedHotQuestion */
+      )
+    GROUP BY
+      t.TagName
+  )
+SELECT
+  u.Id AS UserId,
+  u.DisplayName,
+  u.Reputation,
+  u.CreationDate AS UserCreationDate,
+  COALESCE(uqa.QuestionCount, 0) AS TotalQuestions,
+  COALESCE(uaa.AnswerCount, 0) AS TotalAnswers,
+  COALESCE(uca.CommentCount, 0) AS TotalComments,
+  COALESCE(pes.TotalEdits, 0) AS PostEditCount,
+  pes.LastEditDate,
+  pes.EditedTypes,
+  uqa.AvgAnswerCount,
+  uqa.TotalViews,
+  uaa.AvgAnswerScore,
+  uca.AvgCommentScore,
+  (
+    SELECT
+      COUNT(*)
+    FROM Badges AS b
+    WHERE
+      b.UserId = u.Id AND b.Class = 1 /* Gold Badge */
+  ) AS GoldBadges,
+  (
+    SELECT
+      COUNT(*)
+    FROM Badges AS b
+    WHERE
+      b.UserId = u.Id AND b.Class = 2 /* Silver Badge */
+  ) AS SilverBadges,
+  (
+    SELECT
+      COUNT(*)
+    FROM Badges AS b
+    WHERE
+      b.UserId = u.Id AND b.Class = 3 /* Bronze Badge */
+  ) AS BronzeBadges,
+  CASE
+    WHEN u.WebsiteUrl IS NULL OR u.WebsiteUrl = '' THEN 'No Website'
+    WHEN u.WebsiteUrl LIKE '%stackoverflow.com%' THEN 'Stack Overflow Related'
+    ELSE 'External Website'
+  END AS WebsiteType,
+  COALESCE(p.AnswerCount, 0) AS DirectAnswerCountForExamplePost,
+  CASE
+    WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+    WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+    ELSE 'Active'
+  END AS PostStatus,
+  mhtt.LastHotDate AS LastHotTagActivityDate
+FROM Users AS u
+LEFT JOIN UserQuestionActivity AS uqa
+  ON u.Id = uqa.OwnerUserId
+LEFT JOIN UserAnswerActivity AS uaa
+  ON u.Id = uaa.OwnerUserId
+LEFT JOIN UserCommentActivity AS uca
+  ON u.Id = uca.UserId
+LEFT JOIN PostEditSummary AS pes
+  ON u.Id = pes.UserId
+LEFT JOIN Posts AS p
+  ON u.Id = p.OwnerUserId AND p.Id = 12345 /* Example Post ID for demonstration */
+LEFT JOIN MostRecentHotTag AS mhtt
+  ON u.DisplayName = mhtt.TagName /* This is a weak join for demonstration, typically TagName would relate to User */
+ORDER BY
+  u.Reputation DESC,
+  UserCreationDate ASC
+LIMIT 100;

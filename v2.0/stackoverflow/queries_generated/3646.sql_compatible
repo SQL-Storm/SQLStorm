@@ -1,0 +1,138 @@
+WITH
+    user_stats AS (
+        SELECT
+            u.id                                 AS user_id,
+            u.displayname                        AS display_name,
+            u.reputation,
+            COUNT(p.id) FILTER (WHERE p.posttypeid = 1)   AS question_cnt,
+            COUNT(p.id) FILTER (WHERE p.posttypeid = 2)   AS answer_cnt,
+            COALESCE(SUM(p.score), 0)                     AS total_score,
+            MAX(p.lastactivitydate)                      AS last_activity,
+            COUNT(b.id)                                  AS badge_cnt,
+            SUM(CASE WHEN b.class = 1 THEN 1 ELSE 0 END) AS gold_badge_cnt,
+            SUM(CASE WHEN b.class = 2 THEN 1 ELSE 0 END) AS silver_badge_cnt,
+            SUM(CASE WHEN b.class = 3 THEN 1 ELSE 0 END) AS bronze_badge_cnt
+        FROM users u
+        LEFT JOIN posts p  ON p.owneruserid = u.id
+        LEFT JOIN badges b ON b.userid      = u.id
+        GROUP BY u.id, u.displayname, u.reputation
+    ),
+    top_tags AS (
+        SELECT
+            t.tagname,
+            t.count,
+            ROW_NUMBER() OVER (ORDER BY t.count DESC) AS rn
+        FROM tags t
+        WHERE t.ismodifieronly = 0
+    ),
+    user_tag_score AS (
+        SELECT
+            us.user_id,
+            tt.tagname,
+            SUM(p.score) FILTER (
+                WHERE p.tags IS NOT NULL
+                  AND POSITION('<' || tt.tagname || '>' IN p.tags) > 0
+            ) AS tag_score,
+            ROW_NUMBER() OVER (
+                PARTITION BY us.user_id
+                ORDER BY SUM(p.score) FILTER (
+                    WHERE p.tags IS NOT NULL
+                      AND POSITION('<' || tt.tagname || '>' IN p.tags) > 0
+                ) DESC
+            ) AS tag_rank
+        FROM user_stats us
+        JOIN posts p   ON p.owneruserid = us.user_id
+        JOIN top_tags tt ON tt.rn <= 10
+        GROUP BY us.user_id, tt.tagname
+    ),
+    recent_votes AS (
+        SELECT
+            v.postid,
+            v.votetypeid,
+            COUNT(*) AS vote_cnt
+        FROM votes v
+        WHERE v.creationdate >= CAST('2024-10-01' AS date) - INTERVAL '30 days'
+        GROUP BY v.postid, v.votetypeid
+    ),
+    accepted_answer_stats AS (
+        SELECT
+            a.owneruserid                             AS answerer_id,
+            COUNT(*)                                 AS accepted_cnt,
+            AVG(a.score)                             AS avg_score_accepted
+        FROM posts q
+        JOIN posts a ON a.id = q.acceptedanswerid
+        WHERE q.posttypeid = 1
+          AND a.posttypeid = 2
+        GROUP BY a.owneruserid
+    ),
+    user_performance AS (
+        SELECT
+            us.user_id,
+            us.display_name,
+            us.reputation,
+            us.question_cnt,
+            us.answer_cnt,
+            us.total_score,
+            us.last_activity,
+            us.badge_cnt,
+            us.gold_badge_cnt,
+            us.silver_badge_cnt,
+            us.bronze_badge_cnt,
+            COALESCE(aa.accepted_cnt, 0)        AS accepted_cnt,
+            COALESCE(aa.avg_score_accepted, 0)  AS avg_score_accepted,
+            RANK()   OVER (ORDER BY us.total_score DESC)   AS score_rank,
+            NTILE(10) OVER (ORDER BY us.reputation DESC)  AS reputation_decile
+        FROM user_stats us
+        LEFT JOIN accepted_answer_stats aa ON aa.answerer_id = us.user_id
+    )
+SELECT
+    up.user_id,
+    up.display_name,
+    up.reputation,
+    up.question_cnt,
+    up.answer_cnt,
+    up.total_score,
+    up.last_activity,
+    up.badge_cnt,
+    up.gold_badge_cnt,
+    up.silver_badge_cnt,
+    up.bronze_badge_cnt,
+    up.accepted_cnt,
+    up.avg_score_accepted,
+    up.score_rank,
+    up.reputation_decile,
+    uts.tagname,
+    uts.tag_score,
+    uts.tag_rank
+FROM user_performance up
+LEFT JOIN user_tag_score uts
+       ON uts.user_id = up.user_id
+      AND uts.tag_rank = 1
+WHERE up.reputation > 1000
+  AND up.last_activity IS NOT NULL
+  AND (up.gold_badge_cnt > 0 OR up.silver_badge_cnt > 5)
+ORDER BY up.score_rank
+FETCH FIRST 100 ROWS ONLY
+
+UNION ALL
+
+SELECT
+    CAST(NULL AS bigint),
+    CAST(NULL AS text),
+    CAST(NULL AS integer),
+    CAST(NULL AS integer),
+    CAST(NULL AS integer),
+    CAST(NULL AS bigint),
+    CAST(NULL AS timestamp),
+    CAST(NULL AS integer),
+    CAST(NULL AS integer),
+    CAST(NULL AS integer),
+    CAST(NULL AS integer),
+    CAST(NULL AS integer),
+    CAST(NULL AS numeric),
+    CAST(NULL AS integer),
+    CAST(NULL AS text),
+    CAST(NULL AS numeric),
+    CAST(NULL AS integer)
+WHERE FALSE
+LIMIT 0;

@@ -1,0 +1,268 @@
+-- {"query": "7963.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 3313} 
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.AccountId,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT b.Id) as Badges,
+        MAX(p.CreationDate) as LastPostDate,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        COALESCE(AVG(p.Score), 0) as AvgScore,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2) FILTER (WHERE p.Tags IS NOT NULL), ', ') as TagSummary
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.AccountId
+),
+RankedUsers AS (
+    SELECT 
+        *,
+        ROW_NUMBER() OVER (ORDER BY TotalScore DESC, Reputation DESC) as ScoreRank,
+        DENSE_RANK() OVER (ORDER BY Reputation DESC) as RepRank,
+        NTILE(100) OVER (ORDER BY Views DESC) as ViewPercentile
+    FROM UserStats
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 
+                COALESCE(p.AnswerCount, 0) * 100.0 / NULLIF(p.ViewCount, 0)
+            WHEN p.PostTypeId = 2 THEN 
+                COALESCE(p.Score, 0) * 100.0 / NULLIF(p.ViewCount, 0)
+            ELSE 0 
+        END as EngagementRate,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN 'Question with Answers'
+            WHEN p.PostTypeId = 1 AND p.AnswerCount IS NULL THEN 'Question (no answers)'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as PostTypeCategory,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) as CommentCountRecursive,
+        (SELECT MAX(v.CreationDate) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId IN (2,3)) as LastVoteDate
+    FROM Posts p
+    WHERE p.CreationDate >= '2010-01-01'::timestamp
+),
+UserPostPerformance AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        COUNT(p.Id) as PostCount,
+        SUM(p.Score) as TotalPostScore,
+        AVG(p.Score) as AvgPostScore,
+        MAX(p.CreationDate) as LastPostDate,
+        STRING_AGG(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Title END, '; ') as QuestionTitles,
+        STRING_AGG(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Title END, '; ') as AnswerTitles,
+        (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = u.Id AND p2.PostTypeId = 1) as QuestionCount,
+        (SELECT COUNT(*) FROM Posts p3 WHERE p3.OwnerUserId = u.Id AND p3.PostTypeId = 2) as AnswerCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE p.CreationDate >= '2010-01-01'::timestamp
+    GROUP BY u.Id, u.DisplayName
+),
+ComplexAnalytics AS (
+    SELECT 
+        p.PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 
+                (SELECT AVG(p2.Score) FROM Posts p2 WHERE p2.PostTypeId = 1 AND p2.CreationDate >= '2010-01-01'::timestamp)
+            WHEN p.PostTypeId = 2 THEN 
+                (SELECT AVG(p3.Score) FROM Posts p3 WHERE p3.PostTypeId = 2 AND p3.CreationDate >= '2010-01-01'::timestamp)
+            ELSE 0 
+        END as CategoryAvgScore,
+        (p.Score - (
+            SELECT AVG(p4.Score) 
+            FROM Posts p4 
+            WHERE p4.PostTypeId = p.PostTypeId 
+            AND p4.CreationDate >= '2010-01-01'::timestamp
+        )) as ScoreDeviation,
+        COALESCE(p.AnswerCount, 0) as AnswerCount,
+        COALESCE(p.CommentCount, 0) as CommentCount,
+        LEAD(p.Score, 1) OVER (ORDER BY p.Score DESC) as NextHigherScore,
+        LAG(p.Score, 1) OVER (ORDER BY p.Score DESC) as NextLowerScore,
+        NTILE(4) OVER (ORDER BY p.Score DESC) as ScoreQuartile,
+        CASE 
+            WHEN p.Score > (
+                SELECT AVG(p5.Score) 
+                FROM Posts p5 
+                WHERE p5.PostTypeId = p.PostTypeId 
+                AND p5.CreationDate >= '2010-01-01'::timestamp
+            ) * 1.5 THEN 'High Performance'
+            WHEN p.Score < (
+                SELECT AVG(p6.Score) 
+                FROM Posts p6 
+                WHERE p6.PostTypeId = p.PostTypeId 
+                AND p6.CreationDate >= '2010-01-01'::timestamp
+            ) * 0.5 THEN 'Low Performance'
+            ELSE 'Average Performance'
+        END as PerformanceCategory,
+        COALESCE(p.FavoriteCount, 0) as FavoriteCount,
+        COALESCE(p.AnswerCount, 0) * COALESCE(p.CommentCount, 0) as EngagementProduct,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.PostId AND v.VoteTypeId IN (2,3)) as TotalVotes,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.PostId) as TotalComments,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND LENGTH(p.Tags) > 10 THEN ARRAY_LENGTH(STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><'), 1)
+            ELSE 0 
+        END as TagCount,
+        p.LastVoteDate
+    FROM PostAnalysis p
+),
+FinalResults AS (
+    SELECT 
+        ru.UserId,
+        ru.DisplayName,
+        ru.Reputation,
+        ru.Views,
+        ru.UpVotes,
+        ru.DownVotes,
+        ru.TotalPosts,
+        ru.Questions,
+        ru.Answers,
+        ru.Badges,
+        ru.LastPostDate,
+        ru.TotalScore,
+        ru.AvgScore,
+        ru.ScoreRank,
+        ru.RepRank,
+        ru.ViewPercentile,
+        upp.PostCount,
+        upp.TotalPostScore,
+        upp.AvgPostScore,
+        upp.QuestionCount,
+        upp.AnswerCount,
+        upp.QuestionTitles,
+        upp.AnswerTitles,
+        CASE 
+            WHEN upp.PostCount > 0 THEN upp.TotalPostScore * 1.0 / upp.PostCount
+            ELSE 0 
+        END as AvgScorePerPost,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = ru.UserId AND p.ParentId IS NULL AND p.PostTypeId = 1) as OriginalQuestions,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = ru.UserId AND p.ParentId IS NOT NULL AND p.PostTypeId = 2) as OriginalAnswers,
+        (SELECT COUNT(DISTINCT b.Name) FROM Badges b WHERE b.UserId = ru.UserId AND b.Class = 1) as GoldBadges,
+        (SELECT COUNT(DISTINCT b.Name) FROM Badges b WHERE b.UserId = ru.UserId AND b.Class = 2) as SilverBadges,
+        (SELECT COUNT(DISTINCT b.Name) FROM Badges b WHERE b.UserId = ru.UserId AND b.Class = 3) as BronzeBadges,
+        (SELECT COUNT(*) FROM Votes v WHERE v.UserId = ru.UserId AND v.VoteTypeId = 1) as AcceptVotes,
+        (SELECT STRING_AGG(DISTINCT b.Name, ', ') FROM Badges b WHERE b.UserId = ru.UserId ORDER BY b.Date DESC LIMIT 5) as RecentBadges,
+        CASE 
+            WHEN ru.Views > 100000 THEN 'High Traffic'
+            WHEN ru.Views > 10000 THEN 'Medium Traffic'
+            WHEN ru.Views > 1000 THEN 'Low Traffic'
+            ELSE 'Very Low Traffic'
+        END as TrafficCategory,
+        (SELECT COUNT(DISTINCT u.Id) from Users u where u.Reputation > ru.Reputation AND u.AccountId = ru.AccountId) as ReputationRankInAccount,
+        COUNT(ca.PostId) OVER (PARTITION BY ru.UserId) as PostAnalysisCount,
+        STRING_AGG(ca.Title, ' | ') FILTER (WHERE ca.Score > 100) as HighScoreTitles,
+        STRING_AGG(CASE WHEN ca.Score > 100 THEN ca.Title END, ' | ') as HighScoreTitleList
+    FROM RankedUsers ru
+    LEFT JOIN UserPostPerformance upp ON ru.UserId = upp.UserId
+    LEFT JOIN ComplexAnalytics ca ON ca.PostId IN (
+        SELECT p.Id FROM Posts p WHERE p.OwnerUserId = ru.UserId
+    )
+    WHERE ru.TotalPosts > 0
+)
+SELECT 
+    fr.UserId,
+    fr.DisplayName,
+    fr.Reputation,
+    fr.Views,
+    fr.UpVotes,
+    fr.DownVotes,
+    fr.TotalPosts,
+    fr.Questions,
+    fr.Answers,
+    fr.Badges,
+    fr.LastPostDate,
+    fr.TotalScore,
+    fr.AvgScore,
+    fr.ScoreRank,
+    fr.RepRank,
+    fr.ViewPercentile,
+    fr.PostCount,
+    fr.TotalPostScore,
+    fr.AvgPostScore,
+    fr.QuestionCount,
+    fr.AnswerCount,
+    fr.QuestionTitles,
+    fr.AnswerTitles,
+    fr.AvgScorePerPost,
+    fr.OriginalQuestions,
+    fr.OriginalAnswers,
+    fr.GoldBadges,
+    fr.SilverBadges,
+    fr.BronzeBadges,
+    fr.AcceptVotes,
+    fr.RecentBadges,
+    fr.TrafficCategory,
+    fr.ReputationRankInAccount,
+    fr.PostAnalysisCount,
+    fr.HighScoreTitles,
+    fr.HighScoreTitleList,
+    CASE 
+        WHEN fr.Reputation > 100000 THEN 'Elite User'
+        WHEN fr.Reputation > 10000 THEN 'Advanced User'
+        WHEN fr.Reputation > 1000 THEN 'Intermediate User'
+        WHEN fr.Reputation > 100 THEN 'Beginner User'
+        ELSE 'New User'
+    END as UserTier,
+    CASE 
+        WHEN fr.PostAnalysisCount > 100 THEN 'Heavy Poster'
+        WHEN fr.PostAnalysisCount > 50 THEN 'Moderate Poster'
+        WHEN fr.PostAnalysisCount > 10 THEN 'Light Poster'
+        ELSE 'Inactive Poster'
+    END as PostingFrequency,
+    COALESCE((SELECT STRING_AGG(DISTINCT tt.TagName, ', ') FROM Tags tt WHERE tt.Count > 1000 AND tt.TagName IS NOT NULL), 'No Popular Tags') as PopularTags,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = fr.UserId AND p.CreationDate >= '2020-01-01'::timestamp) as RecentPosts,
+    (SELECT AVG(p2.Score) FROM Posts p2 WHERE p2.OwnerUserId = fr.UserId AND p2.Score > 0) as AvgRecentScore,
+    (SELECT COUNT(*) FROM VoteTypes vt WHERE vt.Id BETWEEN 1 AND 3) as VoteTypeCount,
+    (SELECT AVG(p3.Score) FROM Posts p3 WHERE p3.OwnerUserId = fr.UserId AND p3.PostTypeId = 1 AND p3.Score > 0) as AvgQuestionScore,
+    (SELECT AVG(p4.Score) FROM Posts p4 WHERE p4.OwnerUserId = fr.UserId AND p4.PostTypeId = 2 AND p4.Score > 0) as AvgAnswerScore,
+    CASE 
+        WHEN fr.Reputation > 50000 AND fr.TotalPosts > 500 THEN 'Veteran Contributor'
+        WHEN fr.Reputation >= 10000 AND fr.TotalPosts > 100 THEN 'Active Contributor'
+        WHEN fr.Reputation >= 1000 AND fr.TotalPosts > 20 THEN 'Emerging Contributor'
+        ELSE 'New Contributor'
+    END as ContributionLevel,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = fr.UserId AND p.PostTypeId = 1 AND p.AnswerCount > 10) as HighAnsweredQuestions,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = fr.UserId AND p.PostTypeId = 2 AND p.Score > 20) as HighScoringAnswers,
+    (SELECT COUNT (*) FROM Badges b WHERE b.UserId = fr.UserId AND b.Date >= '2020-01-01'::timestamp) as RecentBadgesCount,
+    (SELECT STRING_AGG(DISTINCT RIGHT(b.Name, 10), ', ') FROM Badges b WHERE b.UserId = fr.UserId AND b.Class = 1 AND b.Date >= '2020-01-01'::timestamp) as RecentGoldBadgeTypes,
+    (SELECT COUNT(*) FROM Posts p JOIN Votes v ON v.PostId = p.Id WHERE p.OwnerUserId = fr.UserId AND v.VoteTypeId IN (2,3) AND v.CreationDate >= '2020-01-01'::timestamp) as RecentUpvotes,
+    (SELECT STRING_AGG(p.Title, ' | ') FROM Posts p WHERE p.OwnerUserId = fr.UserId AND p.Score > 50 AND p.CreationDate >= '2020-01-01'::timestamp ORDER BY p.Score DESC LIMIT 3) as RecentHighScorePosts,
+    (SELECT COUNT(DISTINCT c.UserId) FROM Comments c JOIN Posts p ON c.PostId = p.Id WHERE p.OwnerUserId = fr.UserId) as CommentorCount,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = fr.UserId AND p.CommentCount > 10) as CommentHeavyPosts,
+    CASE 
+        WHEN fr.Views > 100000 AND fr.Badges > 50 THEN 'Highly Active'
+        WHEN fr.Views > 50000 AND fr.Badges > 25 THEN 'Activity Moderate'
+        WHEN fr.Views > 10000 AND fr.Badges > 10 THEN 'Activity Low'
+        ELSE 'Low Activity'
+    END as ActivityLevel
+FROM FinalResults fr
+WHERE fr.UserId IN (
+    SELECT UserId 
+    FROM (SELECT UserId, COUNT(*) as post_count FROM Posts GROUP BY UserId HAVING COUNT(*) > 10) p
+    WHERE EXISTS (
+        SELECT 1 FROM Users u WHERE u.Id = p.UserId AND u.Reputation > 100
+    )
+)
+ORDER BY fr.Reputation DESC, fr.TotalScore DESC
+LIMIT 1000;

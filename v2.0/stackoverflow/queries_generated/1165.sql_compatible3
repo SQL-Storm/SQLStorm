@@ -1,0 +1,349 @@
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.Views AS UserViews,
+        U.UpVotes AS UserUpVotes,
+        U.DownVotes AS UserDownVotes,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        COALESCE(char_length(U.AboutMe), 0) AS AboutMeLength,
+        NTILE(4) OVER (ORDER BY U.Reputation DESC, U.CreationDate ASC) AS ReputationQuartile,
+        (U.UpVotes + U.DownVotes) AS TotalUserVotes,
+        U.Location,
+        U.WebsiteUrl,
+        U.ProfileImageUrl
+    FROM
+        Users U
+    WHERE
+        U.Reputation >= 1000
+        AND U.LastAccessDate >= DATE '2020-01-01'
+),
+PostEngagementMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.Title,
+        P.Tags,
+        P.LastActivityDate,
+        P.ClosedDate,
+        P.CommunityOwnedDate,
+        P.AcceptedAnswerId,
+        COALESCE(P.Score, 0) * 1.5 + (COALESCE(P.ViewCount, 0) / 20.0) + (COALESCE(P.AnswerCount, 0) * 3.0) + COALESCE(P.CommentCount, 0) + COALESCE(P.FavoriteCount, 0) * 5.0 AS EngagementScore,
+        AVG(P.Score) OVER (PARTITION BY P.PostTypeId ORDER BY P.CreationDate ROWS BETWEEN 1000 PRECEDING AND CURRENT ROW) AS AvgScorePerPostTypeRolling,
+        CASE
+            WHEN P.Tags IS NULL THEN NULL
+            ELSE regexp_split_to_array(substring(P.Tags FROM 2 FOR char_length(P.Tags) - 2), '><')
+        END AS TagArray
+    FROM
+        Posts P
+    WHERE
+        P.PostTypeId IN (1, 2)
+        AND P.CreationDate BETWEEN DATE '2019-01-01' AND DATE '2023-12-31'
+        AND P.Score >= 0
+),
+PostEditEventSeries AS (
+    SELECT
+        PH.PostId,
+        PH.UserId,
+        PH.CreationDate AS EditDate,
+        LAG(PH.CreationDate) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) AS PreviousEditDate,
+        PH.PostHistoryTypeId
+    FROM
+        PostHistory PH
+    WHERE
+        PH.PostHistoryTypeId IN (4, 5, 6)
+),
+PostEditMetrics AS (
+    SELECT
+        PostId,
+        COUNT(DISTINCT UserId) AS DistinctEditors,
+        COUNT(EditDate) AS TotalEdits,
+        AVG(EXTRACT(EPOCH FROM (EditDate - PreviousEditDate))) FILTER (WHERE EditDate != PreviousEditDate) AS AvgSecondsBetweenConsecutiveEdits,
+        MAX(EditDate) AS LastEditDate,
+        MIN(EditDate) AS FirstEditDate
+    FROM
+        PostEditEventSeries
+    GROUP BY
+        PostId
+    HAVING COUNT(EditDate) > 1
+),
+TagPerformance AS (
+    SELECT
+        t AS TagName,
+        PEM.PostId,
+        PEM.Score,
+        PEM.ViewCount
+    FROM
+        PostEngagementMetrics PEM,
+        unnest(PEM.TagArray) AS t
+    WHERE
+        PEM.PostTypeId = 1
+        AND PEM.TagArray IS NOT NULL
+),
+TopTagsByAvgScore AS (
+    SELECT
+        TP.TagName,
+        AVG(TP.Score) AS AvgTagScore,
+        SUM(TP.ViewCount) AS TotalTagViews,
+        COUNT(DISTINCT TP.PostId) AS PostCountForTag,
+        ROW_NUMBER() OVER (ORDER BY AVG(TP.Score) DESC, SUM(TP.ViewCount) DESC, COUNT(DISTINCT TP.PostId) DESC) AS RankByScore
+    FROM
+        TagPerformance TP
+    GROUP BY
+        TP.TagName
+    HAVING
+        COUNT(DISTINCT TP.PostId) > 50
+        AND AVG(TP.Score) > 1
+),
+ModeratorBadges AS (
+    SELECT
+        B.UserId,
+        COUNT(B.Id) AS GoldBadgeCount,
+        MAX(B.Date) AS LatestGoldBadgeDate
+    FROM
+        Badges B
+    WHERE
+        B.Class = 1
+        AND B.TagBased = FALSE
+    GROUP BY
+        B.UserId
+),
+MainContributorAnalysis AS (
+    SELECT
+        UAS.UserId,
+        UAS.DisplayName,
+        UAS.Reputation,
+        UAS.ReputationQuartile,
+        UAS.TotalUserVotes,
+        SUM(COALESCE(PEM.EngagementScore, 0)) AS TotalEngagementScore,
+        AVG(COALESCE(PEM.AvgScorePerPostTypeRolling, 0)) AS AvgRollingScoreForPosts,
+        COUNT(DISTINCT PEM.PostId) AS TotalPostsOwned,
+        SUM(CASE WHEN PEM.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsOwned,
+        SUM(CASE WHEN PEM.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersOwned,
+        MAX(PEM.PostCreationDate) AS LatestPostDate,
+        SUM(COALESCE(PEM.FavoriteCount, 0)) AS TotalFavoriteCounts,
+        SUM(COALESCE(PEM.CommentCount, 0)) AS TotalCommentsOnPostsOwned,
+        SUM(COALESCE(PEM.ViewCount, 0)) AS TotalPostViews,
+        COALESCE(MAX(CASE WHEN PEM.AcceptedAnswerId IS NOT NULL THEN PEM.PostId ELSE NULL END), -1) AS HasAcceptedAnswerOnOwnPost,
+        COALESCE(SUM(PEMET.TotalEdits), 0) AS TotalEditsMadeOnPosts,
+        COALESCE(AVG(PEMET.DistinctEditors), 0) AS AvgDistinctEditorsPerPost,
+        COALESCE(AVG(PEMET.AvgSecondsBetweenConsecutiveEdits), 0) AS AvgPostEditTimeDiffSeconds,
+        COALESCE(MB.GoldBadgeCount, 0) AS UserGoldBadges,
+        (SELECT COUNT(V.Id) FROM Votes V WHERE V.UserId = UAS.UserId AND V.VoteTypeId IN (2,3) AND V.CreationDate >= UAS.LastAccessDate - INTERVAL '3 months') AS RecentVotesGivenCount,
+        COUNT(DISTINCT TL.RelatedPostId) AS LinkedPostsCount,
+        COUNT(DISTINCT TD.RelatedPostId) AS DuplicatePostsCount,
+        RANK() OVER (ORDER BY SUM(COALESCE(PEM.EngagementScore, 0)) DESC, UAS.Reputation DESC, SUM(COALESCE(PEMET.TotalEdits, 0)) DESC) AS OverallContributorRank,
+        (SELECT STRING_AGG(TTBAS.TagName, ', ') FROM TopTagsByAvgScore TTBAS WHERE TTBAS.RankByScore <= 5) AS TopGlobalTagsString,
+        MAX(CASE WHEN PEM.Title ILIKE '%SQL%' OR (PEM.TagArray IS NOT NULL AND EXISTS (SELECT 1 FROM unnest(PEM.TagArray) AS t WHERE t::text ILIKE '%sql%' OR t::text ILIKE '%database%')) THEN 1 ELSE 0 END) AS HasSQLRelatedPost,
+        SUM(CASE WHEN PEM.ClosedDate IS NOT NULL AND PEM.CommunityOwnedDate IS NULL AND PEM.PostTypeId = 1 THEN 1 ELSE 0 END) AS ClosedQuestionsNotCommunityOwned,
+        SUM(CASE WHEN PEM.CommunityOwnedDate IS NOT NULL AND PEM.PostTypeId = 1 THEN 1 ELSE 0 END) AS CommunityOwnedQuestions,
+        COALESCE(UAS.AboutMeLength, 0) / 100.0 AS AboutMeLengthRatio,
+        'Main Contributor' AS ContributorType,
+        UAS.Location,
+        UAS.WebsiteUrl,
+        UAS.ProfileImageUrl,
+        UAS.LastAccessDate,
+        UAS.UserCreationDate,
+        UAS.AboutMeLength,
+        MB.GoldBadgeCount
+    FROM
+        UserActivitySummary UAS
+    LEFT JOIN
+        PostEngagementMetrics PEM ON UAS.UserId = PEM.OwnerUserId
+    LEFT JOIN
+        PostEditMetrics PEMET ON PEM.PostId = PEMET.PostId
+    LEFT JOIN
+        ModeratorBadges MB ON UAS.UserId = MB.UserId
+    LEFT JOIN
+        PostLinks TL ON PEM.PostId = TL.PostId AND TL.LinkTypeId = 1
+    LEFT JOIN
+        PostLinks TD ON PEM.PostId = TD.PostId AND TD.LinkTypeId = 3
+    WHERE
+        UAS.ReputationQuartile = 1
+        AND UAS.LastAccessDate > UAS.UserCreationDate + INTERVAL '1 year'
+        AND (
+                PEM.PostId IS NOT NULL
+                OR UAS.TotalUserVotes > 1000
+            )
+        AND (
+            PEM.Title ILIKE '%performance%'
+            OR (PEM.TagArray IS NOT NULL AND EXISTS (SELECT 1 FROM unnest(PEM.TagArray) AS t WHERE t::text ILIKE '%optimization%' OR t::text ILIKE '%benchmark%'))
+            OR EXISTS (
+                SELECT 1
+                FROM TopTagsByAvgScore TTBAS
+                WHERE PEM.TagArray IS NOT NULL
+                  AND EXISTS (
+                      SELECT 1 FROM unnest(PEM.TagArray) AS at WHERE at::text = TTBAS.TagName
+                  )
+                  AND TTBAS.RankByScore <= 10
+            )
+        )
+    GROUP BY
+        UAS.UserId,
+        UAS.DisplayName,
+        UAS.Reputation,
+        UAS.ReputationQuartile,
+        UAS.TotalUserVotes,
+        UAS.LastAccessDate,
+        UAS.UserCreationDate,
+        UAS.AboutMeLength,
+        MB.GoldBadgeCount,
+        UAS.Location,
+        UAS.WebsiteUrl,
+        UAS.ProfileImageUrl
+    HAVING
+        SUM(COALESCE(PEM.Score, 0)) > 200
+        AND (SUM(COALESCE(PEMET.TotalEdits, 0)) >= 10 OR COUNT(DISTINCT TL.RelatedPostId) + COUNT(DISTINCT TD.RelatedPostId) >= 3)
+),
+CommentatorActivity AS (
+    SELECT
+        UAS.UserId,
+        UAS.DisplayName,
+        UAS.Reputation,
+        UAS.ReputationQuartile,
+        UAS.TotalUserVotes,
+        SUM(COALESCE(C.Score, 0)) * 0.75 AS TotalEngagementScore,
+        0.0 AS AvgRollingScoreForPosts,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsOwned,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersOwned,
+        MAX(C.CreationDate) AS LatestPostDate,
+        0 AS TotalFavoriteCounts,
+        COUNT(C.Id) AS TotalCommentsOnPostsOwned,
+        SUM(P.ViewCount) AS TotalPostViews,
+        MAX(CASE WHEN P.AcceptedAnswerId IS NOT NULL AND P.OwnerUserId = UAS.UserId THEN P.Id ELSE -1 END) AS HasAcceptedAnswerOnOwnPost,
+        0 AS TotalEditsMadeOnPosts,
+        0 AS AvgDistinctEditorsPerPost,
+        0.0 AS AvgPostEditTimeDiffSeconds,
+        COALESCE(MB.GoldBadgeCount, 0) AS UserGoldBadges,
+        (SELECT COUNT(V.Id) FROM Votes V WHERE V.UserId = UAS.UserId AND V.VoteTypeId IN (2,3) AND V.CreationDate >= UAS.LastAccessDate - INTERVAL '3 months') AS RecentVotesGivenCount,
+        0 AS LinkedPostsCount,
+        0 AS DuplicatePostsCount,
+        RANK() OVER (PARTITION BY UAS.ReputationQuartile ORDER BY COUNT(C.Id) DESC, SUM(P.ViewCount) DESC) AS OverallContributorRank,
+        (SELECT STRING_AGG(TTBAS.TagName, ', ') FROM TopTagsByAvgScore TTBAS WHERE TTBAS.RankByScore <= 5) AS TopGlobalTagsString,
+        MAX(CASE WHEN P.Title ILIKE '%SQL%' OR EXISTS (SELECT 1 FROM unnest(regexp_split_to_array(substring(P.Tags FROM 2 FOR char_length(P.Tags) - 2), '><')) AS t WHERE t::text ILIKE '%sql%' OR t::text ILIKE '%database%') THEN 1 ELSE 0 END) AS HasSQLRelatedPost,
+        SUM(CASE WHEN P.ClosedDate IS NOT NULL AND P.CommunityOwnedDate IS NULL AND P.PostTypeId = 1 THEN 1 ELSE 0 END) AS ClosedQuestionsNotCommunityOwned,
+        SUM(CASE WHEN P.CommunityOwnedDate IS NOT NULL AND P.PostTypeId = 1 THEN 1 ELSE 0 END) AS CommunityOwnedQuestions,
+        COALESCE(UAS.AboutMeLength, 0) / 100.0 AS AboutMeLengthRatio,
+        'Comment Contributor' AS ContributorType,
+        UAS.Location,
+        UAS.WebsiteUrl,
+        UAS.ProfileImageUrl,
+        UAS.LastAccessDate,
+        UAS.UserCreationDate,
+        UAS.AboutMeLength,
+        MB.GoldBadgeCount
+    FROM
+        UserActivitySummary UAS
+    INNER JOIN
+        Comments C ON UAS.UserId = C.UserId
+    INNER JOIN
+        Posts P ON C.PostId = P.Id
+    LEFT JOIN
+        ModeratorBadges MB ON UAS.UserId = MB.UserId
+    WHERE
+        UAS.Reputation < 10000
+        AND P.ViewCount > 5000
+        AND C.CreationDate BETWEEN DATE '2021-01-01' AND DATE '2023-12-31'
+        AND P.PostTypeId IN (1, 2)
+        AND char_length(C.Text) > 75
+        AND (UAS.Location IS NOT NULL OR UAS.WebsiteUrl IS NOT NULL OR UAS.ProfileImageUrl IS NOT NULL)
+        AND C.Score >= 0
+    GROUP BY
+        UAS.UserId,
+        UAS.DisplayName,
+        UAS.Reputation,
+        UAS.ReputationQuartile,
+        UAS.TotalUserVotes,
+        UAS.LastAccessDate,
+        UAS.UserCreationDate,
+        UAS.AboutMeLength,
+        MB.GoldBadgeCount,
+        UAS.Location,
+        UAS.WebsiteUrl,
+        UAS.ProfileImageUrl
+    HAVING
+        COUNT(C.Id) >= 25
+        AND SUM(COALESCE(C.Score, 0)) > 10
+        AND MAX(P.ViewCount) > 20000
+)
+SELECT
+    UserId,
+    DisplayName,
+    Reputation,
+    ReputationQuartile,
+    TotalUserVotes,
+    TotalEngagementScore,
+    AvgRollingScoreForPosts,
+    TotalPostsOwned,
+    QuestionsOwned,
+    AnswersOwned,
+    LatestPostDate,
+    TotalFavoriteCounts,
+    TotalCommentsOnPostsOwned,
+    TotalPostViews,
+    HasAcceptedAnswerOnOwnPost,
+    TotalEditsMadeOnPosts,
+    AvgDistinctEditorsPerPost,
+    AvgPostEditTimeDiffSeconds,
+    UserGoldBadges,
+    RecentVotesGivenCount,
+    LinkedPostsCount,
+    DuplicatePostsCount,
+    OverallContributorRank,
+    TopGlobalTagsString,
+    HasSQLRelatedPost,
+    ClosedQuestionsNotCommunityOwned,
+    CommunityOwnedQuestions,
+    AboutMeLengthRatio,
+    ContributorType,
+    Location,
+    WebsiteUrl,
+    ProfileImageUrl
+FROM MainContributorAnalysis
+WHERE OverallContributorRank <= 100
+UNION ALL
+SELECT
+    UserId,
+    DisplayName,
+    Reputation,
+    ReputationQuartile,
+    TotalUserVotes,
+    TotalEngagementScore,
+    AvgRollingScoreForPosts,
+    TotalPostsOwned,
+    QuestionsOwned,
+    AnswersOwned,
+    LatestPostDate,
+    TotalFavoriteCounts,
+    TotalCommentsOnPostsOwned,
+    TotalPostViews,
+    HasAcceptedAnswerOnOwnPost,
+    TotalEditsMadeOnPosts,
+    AvgDistinctEditorsPerPost,
+    AvgPostEditTimeDiffSeconds,
+    UserGoldBadges,
+    RecentVotesGivenCount,
+    LinkedPostsCount,
+    DuplicatePostsCount,
+    OverallContributorRank,
+    TopGlobalTagsString,
+    HasSQLRelatedPost,
+    ClosedQuestionsNotCommunityOwned,
+    CommunityOwnedQuestions,
+    AboutMeLengthRatio,
+    ContributorType,
+    Location,
+    WebsiteUrl,
+    ProfileImageUrl
+FROM CommentatorActivity
+WHERE OverallContributorRank <= 100;

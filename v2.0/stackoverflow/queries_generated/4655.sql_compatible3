@@ -1,0 +1,96 @@
+WITH RankedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.ViewCount DESC) AS ScoreRank,
+        LAG(p.Score, 1, 0) OVER (ORDER BY p.CreationDate) AS PreviousDayScore,
+        LEAD(p.Score, 1, 0) OVER (ORDER BY p.CreationDate) AS NextDayScore,
+        COUNT(c.Id) OVER (PARTITION BY p.OwnerUserId) AS UserCommentCount,
+        AVG(p.Score) OVER (PARTITION BY p.PostTypeId) AS AvgScoreByType,
+        SUM(p.ViewCount) OVER () AS TotalViewCount,
+        p.PostTypeId
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '30' DAY)
+),
+UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(rp.PostId) AS PostsOwned,
+        SUM(rp.Score) AS TotalScore,
+        AVG(rp.Score) AS AvgScore,
+        MAX(rp.CreationDate) AS LastPostDate,
+        COUNT(DISTINCT CASE WHEN rp.AnswerCount > 0 THEN rp.PostId ELSE NULL END) AS PostsWithAnswers
+    FROM Users u
+    JOIN RankedPosts rp ON u.Id = rp.OwnerUserId
+    GROUP BY u.Id, u.DisplayName
+),
+PostPerformance AS (
+    SELECT
+        rp.PostId,
+        rp.Title,
+        rp.Score,
+        rp.ViewCount,
+        rp.UserCommentCount,
+        rp.AvgScoreByType,
+        CASE
+            WHEN rp.Score > (rp.PreviousDayScore * 1.2) AND rp.Score > (rp.NextDayScore * 1.2) THEN 'Trending Up'
+            WHEN rp.Score < (rp.PreviousDayScore * 0.8) AND rp.Score < (rp.NextDayScore * 0.8) THEN 'Trending Down'
+            ELSE 'Stable'
+        END AS Trend,
+        ue.DisplayName AS OwnerDisplayName,
+        ue.PostsOwned,
+        ue.TotalScore AS OwnerTotalScore,
+        rp.TotalViewCount,
+        -- Use standard SQL LENGTH() for character count
+        LENGTH(rp.Title) AS TitleLength,
+        COALESCE(rp.FavoriteCount, 0) AS SafeFavoriteCount,
+        rp.OwnerUserId,
+        rp.ScoreRank,
+        rp.PostTypeId
+    FROM RankedPosts rp
+    LEFT JOIN UserEngagement ue ON rp.OwnerUserId = ue.UserId
+)
+SELECT
+    pp.PostId,
+    pp.Title,
+    pp.Score,
+    pp.ViewCount,
+    pp.UserCommentCount,
+    pp.AvgScoreByType,
+    pp.Trend,
+    pp.OwnerDisplayName,
+    pp.PostsOwned,
+    pp.OwnerTotalScore,
+    pp.TotalViewCount,
+    pp.TitleLength,
+    pp.SafeFavoriteCount,
+    COALESCE(pt.Name, 'Unknown') AS PostType,
+    CASE
+        WHEN pp.Score > 1000 AND pp.ViewCount > 10000 THEN 'High Performance'
+        WHEN pp.Score < 0 AND pp.ViewCount < 100 THEN 'Low Engagement'
+        ELSE 'Average'
+    END AS PerformanceTier,
+    CASE
+        WHEN LENGTH(pp.OwnerDisplayName) > 20 THEN SUBSTR(pp.OwnerDisplayName, 1, 20) || '...'
+        ELSE pp.OwnerDisplayName
+    END AS TruncatedOwnerName,
+    pp.ScoreRank,
+    CASE
+        WHEN ue.LastPostDate IS NOT NULL AND ue.LastPostDate < (CAST('2024-10-01' AS date) - INTERVAL '1' YEAR) THEN 'Inactive Owner'
+        ELSE 'Active Owner'
+    END AS OwnerActivityStatus
+FROM PostPerformance pp
+LEFT JOIN PostTypes pt ON pp.PostTypeId = pt.Id
+LEFT JOIN UserEngagement ue ON pp.OwnerUserId = ue.UserId
+WHERE pp.Score > 0 OR pp.ViewCount > 0
+ORDER BY pp.ScoreRank;

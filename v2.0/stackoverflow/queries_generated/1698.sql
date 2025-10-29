@@ -1,0 +1,242 @@
+-- {"query": "1698.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3869} 
+
+WITH UserSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.UpVotes AS TotalUpVotesReceivedOnProfile,
+        u.DownVotes AS TotalDownVotesReceivedOnProfile,
+        COALESCE(COUNT(DISTINCT p.Id), 0) AS TotalPostsOwned,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END), 0) AS TotalQuestionsOwned,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END), 0) AS TotalAnswersOwned,
+        COALESCE(COUNT(DISTINCT c.Id), 0) AS TotalCommentsMade,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId IN (2, 8) THEN 1 ELSE 0 END), 0) AS TotalUpVotesGiven, -- UpMod, BountyStart
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS TotalDownVotesGiven, -- DownMod
+        COALESCE(SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END), 0) AS GoldBadges,
+        COALESCE(SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END), 0) AS SilverBadges,
+        COALESCE(SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END), 0) AS BronzeBadges,
+        -- Complex calculation: Years active, handling potential zero or negative (though improbable for CreationDate)
+        GREATEST(0, DATE_PART('year', AGE(CURRENT_TIMESTAMP, u.CreationDate))) AS YearsActive,
+        CASE
+            WHEN GREATEST(0, DATE_PART('year', AGE(CURRENT_TIMESTAMP, u.CreationDate))) = 0
+            THEN u.Reputation -- Use raw reputation if less than 1 year active
+            ELSE u.Reputation / GREATEST(1, DATE_PART('year', AGE(CURRENT_TIMESTAMP, u.CreationDate))) -- Ensure divisor is at least 1
+        END AS ReputationPerYearActive,
+        MAX(p.LastActivityDate) AS LastPostActivityDate,
+        -- Window function: Compare reputation to the previous user created
+        LAG(u.Reputation, 1, 0) OVER (ORDER BY u.CreationDate, u.Id) AS PrevUserReputation,
+        -- Use set operators (implicitly via subqueries for flags here for integration)
+        (u.Id IN (SELECT q.OwnerUserId FROM Posts q WHERE q.PostTypeId = 1 EXCEPT SELECT a.OwnerUserId FROM Posts a WHERE a.PostTypeId = 2)) AS IsQuestionOnlyUser,
+        (u.Id IN (SELECT a.OwnerUserId FROM Posts a WHERE a.PostTypeId = 2 EXCEPT SELECT q.OwnerUserId FROM Posts q WHERE q.PostTypeId = 1)) AS IsAnswerOnlyUser
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.UpVotes, u.DownVotes
+),
+PostEngagement AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.Title,
+        p.Tags,
+        p.ParentId,
+        p.AcceptedAnswerId,
+        p.Body,
+        LENGTH(p.Body) AS BodyLength,
+        COUNT(DISTINCT c.Id) AS TotalPostComments,
+        -- Correlated subquery for average answer score
+        (
+            SELECT COALESCE(AVG(a.Score), 0)
+            FROM Posts a
+            WHERE a.ParentId = p.Id AND a.PostTypeId = 2
+        ) AS AvgAnswerScoreForQuestion,
+        CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS HasAcceptedAnswer,
+        -- Window function: Rank posts by score/views within their type
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC, p.CreationDate DESC) AS PostTypeGlobalRank,
+        -- Window function: Rank answers within a question
+        ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS AnswerRankWithinQuestion,
+        -- Window function: Assign posts to deciles based on view count
+        NTILE(10) OVER (ORDER BY p.ViewCount DESC) AS ViewCountDecile,
+        -- String expression: Concatenate title and tags, handling NULLs
+        COALESCE(p.Title, 'Untitled Post') || ' (' || COALESCE(p.Tags, 'No Tags') || ')' AS PostSummaryText,
+        -- Check for linked/duplicate posts
+        MAX(CASE WHEN pl.LinkTypeId = 1 THEN 1 ELSE 0 END) AS HasLinksToOtherPosts,
+        MAX(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS IsDuplicateOfOtherPosts,
+        -- Calculation: Post "freshness" in days since creation
+        EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - p.CreationDate)) / (60 * 60 * 24) AS DaysSincePostCreation
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+    GROUP BY
+        p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount,
+        p.AnswerCount, p.FavoriteCount, p.Title, p.Tags, p.ParentId, p.AcceptedAnswerId, p.Body
+),
+ModerationActivity AS (
+    SELECT
+        ph.PostId,
+        STRING_AGG(DISTINCT crt.Name, ', ') FILTER (WHERE ph.PostHistoryTypeId = 10 AND crt.Name IS NOT NULL) AS CloseReasons,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS WasClosed,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS WasReopened,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 12 THEN 1 ELSE 0 END) AS WasDeleted,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 13 THEN 1 ELSE 0 END) AS WasUndeleted,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN ph.Id END) AS TotalModerationActions,
+        -- Find the user who initiated the first closure
+        FIRST_VALUE(u_closer.DisplayName) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate ASC) AS FirstCloserDisplayName,
+        -- The user involved in the last relevant moderation action or edit
+        LAST_VALUE(u_actor.DisplayName) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate ASC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS LastModerationActorDisplayName,
+        MAX(ph.CreationDate) AS LastModerationActionDate
+    FROM PostHistory ph
+    LEFT JOIN Users u_closer ON ph.UserId = u_closer.Id AND ph.PostHistoryTypeId = 10 -- Only link user for closing action
+    LEFT JOIN Users u_actor ON ph.UserId = u_actor.Id AND ph.PostHistoryTypeId IN (4, 5, 10, 11, 12, 13) -- Link user for edits/moderation actions
+    LEFT JOIN CloseReasonTypes crt ON ph.Comment = crt.Id::text AND ph.PostHistoryTypeId = 10 -- Join close reasons only if it's a close event
+    WHERE ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 10, 11, 12, 13) -- Initial/Edits/Moderation actions
+    GROUP BY ph.PostId
+),
+PostBodyChanges AS (
+    SELECT
+        p.Id AS PostId,
+        ph_init.InitialBody,
+        ph_last.LastEditedBody,
+        COALESCE(pec.EditCount, 0) AS EditCount
+    FROM Posts p
+    LEFT JOIN (
+        SELECT PostId, Text AS InitialBody,
+               ROW_NUMBER() OVER (PARTITION BY PostId ORDER BY CreationDate) as rn
+        FROM PostHistory
+        WHERE PostHistoryTypeId = 2
+    ) ph_init ON p.Id = ph_init.PostId AND ph_init.rn = 1
+    LEFT JOIN (
+        SELECT PostId, Text AS LastEditedBody,
+               ROW_NUMBER() OVER (PARTITION BY PostId ORDER BY CreationDate DESC) as rn
+        FROM PostHistory
+        WHERE PostHistoryTypeId = 5
+    ) ph_last ON p.Id = ph_last.PostId AND ph_last.rn = 1
+    LEFT JOIN (
+        SELECT PostId, COUNT(Id) AS EditCount
+        FROM PostHistory
+        WHERE PostHistoryTypeId IN (4, 5, 6)
+        GROUP BY PostId
+    ) pec ON p.Id = pec.PostId
+)
+-- Main Query to tie everything together
+SELECT
+    us.UserId,
+    us.DisplayName AS UserDisplayName,
+    us.Reputation,
+    us.TotalPostsOwned,
+    us.TotalQuestionsOwned,
+    us.TotalAnswersOwned,
+    us.TotalCommentsMade,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    us.ReputationPerYearActive,
+    us.LastPostActivityDate,
+    us.IsQuestionOnlyUser,
+    us.IsAnswerOnlyUser,
+    pe.PostId,
+    pe.PostTypeId,
+    pt.Name AS PostTypeName,
+    pe.PostCreationDate,
+    pe.Score AS PostScore,
+    pe.ViewCount AS PostViewCount,
+    pe.AnswerCount AS QuestionAnswerCount,
+    pe.FavoriteCount AS QuestionFavoriteCount,
+    pe.Title AS PostTitle,
+    pe.Tags AS PostTags,
+    pe.BodyLength,
+    pe.TotalPostComments,
+    pe.AvgAnswerScoreForQuestion,
+    pe.HasAcceptedAnswer,
+    pe.PostTypeGlobalRank,
+    pe.AnswerRankWithinQuestion,
+    pe.ViewCountDecile,
+    pe.PostSummaryText,
+    pe.HasLinksToOtherPosts,
+    pe.IsDuplicateOfOtherPosts,
+    pe.DaysSincePostCreation,
+    ma.CloseReasons,
+    ma.WasClosed,
+    ma.WasReopened,
+    ma.WasDeleted,
+    ma.WasUndeleted,
+    ma.TotalModerationActions,
+    ma.FirstCloserDisplayName,
+    ma.LastModerationActorDisplayName,
+    ma.LastModerationActionDate,
+    CASE
+        WHEN pe.PostTypeId = 1 AND pe.AvgAnswerScoreForQuestion > 10 AND pe.HasAcceptedAnswer = 1 THEN 'High Quality Question'
+        WHEN pe.PostTypeId = 1 AND pe.AvgAnswerScoreForQuestion <= 5 AND pe.HasAcceptedAnswer = 0 THEN 'Low Engagement Question'
+        WHEN pe.PostTypeId = 2 AND pe.AnswerRankWithinQuestion = 1 AND pe.Score > 5 THEN 'Top Answer'
+        WHEN ma.WasClosed = 1 AND ma.WasReopened = 0 THEN 'Closed Only'
+        WHEN ma.WasClosed = 1 AND ma.WasReopened = 1 THEN 'Closed & Reopened'
+        ELSE 'Standard Post'
+    END AS PostStatusCategory,
+    -- Complex weighted score calculation for post engagement
+    (pe.Score * 0.75 + COALESCE(pe.ViewCount, 0) * 0.05 + pe.TotalPostComments * 0.1 + COALESCE(pe.AnswerCount, 0) * 0.1) *
+    (1 + (pe.HasAcceptedAnswer * 0.2) + (pe.HasLinksToOtherPosts * 0.1)) AS WeightedPostEngagementScore,
+    -- String expression with conditional logic and NULL handling for tags or body excerpt
+    CASE
+        WHEN pe.PostTypeId = 1 AND pe.Tags IS NOT NULL AND LENGTH(pe.Tags) > 2
+        THEN SUBSTRING(pe.Tags, 2, LENGTH(pe.Tags) - 2) -- Remove leading/trailing '<', '>'
+        WHEN pe.Body IS NOT NULL AND LENGTH(pe.Body) > 0
+        THEN LEFT(REPLACE(REPLACE(REPLACE(REPLACE(pe.Body, '<p>', ''), '</p>', ''), '<code>', ''), '</code>', ''), 100) || '...' -- Clean up some HTML and truncate
+        ELSE 'Content N/A'
+    END AS TagsOrBodyExcerpt,
+    -- Identify potential "power users" based on multiple criteria
+    CASE
+        WHEN us.Reputation > 10000 AND us.TotalPostsOwned > 500 AND us.GoldBadges >= 5 THEN 'Power User Elite'
+        WHEN us.Reputation > 5000 AND us.TotalPostsOwned > 200 AND (us.GoldBadges >= 1 OR us.SilverBadges >= 10) THEN 'Advanced Contributor'
+        WHEN us.Reputation > 1000 AND us.TotalPostsOwned > 50 THEN 'Established Contributor'
+        ELSE 'Regular Contributor'
+    END AS UserContributionLevel,
+    -- Determine post edit profile based on edits count and body length changes
+    CASE
+        WHEN pbc.EditCount > 3 THEN 'Heavily Edited Post'
+        WHEN pbc.InitialBody IS NOT NULL AND pbc.LastEditedBody IS NOT NULL
+             AND LENGTH(pbc.InitialBody) > 0
+             AND LENGTH(pbc.LastEditedBody) > 1.2 * LENGTH(pbc.InitialBody) THEN 'Significantly Expanded Body'
+        ELSE 'Normal Edit Profile'
+    END AS PostEditProfile,
+    -- Additional NULL logic: Highlight high-score posts by the community user (OwnerUserId = -1)
+    CASE WHEN pe.OwnerUserId = -1 AND pe.Score > 50 THEN 'Community Owned High Score' ELSE NULL END AS CommunityPostHighlight,
+    -- Identify potential moderation conflicts (closed by one, reopened by another)
+    CASE
+        WHEN ma.WasClosed = 1 AND ma.WasReopened = 1
+             AND ma.FirstCloserDisplayName IS NOT NULL
+             AND ma.FirstCloserDisplayName != ma.LastModerationActorDisplayName -- Last actor involved, could be reopener
+        THEN 'Contentious Moderation'
+        ELSE NULL
+    END AS ModerationConflictFlag,
+    -- Correlated subquery to get the display name of the owner of the accepted answer.
+    (
+        SELECT u_acc.DisplayName
+        FROM Posts p_acc
+        JOIN Users u_acc ON p_acc.OwnerUserId = u_acc.Id
+        WHERE p_acc.Id = pe.AcceptedAnswerId AND p_acc.OwnerUserId IS NOT NULL
+    ) AS AcceptedAnswerOwnerDisplayName
+FROM UserSummary us
+LEFT JOIN PostEngagement pe ON us.UserId = pe.OwnerUserId
+LEFT JOIN PostTypes pt ON pe.PostTypeId = pt.Id
+LEFT JOIN ModerationActivity ma ON pe.PostId = ma.PostId
+LEFT JOIN PostBodyChanges pbc ON pe.PostId = pbc.PostId
+WHERE
+    us.Reputation > 500 -- Filter for more active/established users
+    AND (pe.PostId IS NOT NULL OR us.TotalPostsOwned > 0) -- Ensure users with posts or some activity are included
+    AND (pe.PostTypeId IN (1, 2, 3, 5) OR pe.PostId IS NULL) -- Focus on questions/answers/wikis/tag wikis primarily
+    AND (COALESCE(pe.PostScore, 0) >= -5) -- Filter out extremely downvoted posts, allow NULL scores
+    AND (pe.Tags IS NOT NULL OR pe.PostTypeId NOT IN (1, 4, 5)) -- Questions and Tag wikis should have tags
+    AND NOT (pe.PostTypeId = 1 AND pe.Title IS NULL) -- Questions must have a title
+ORDER BY us.Reputation DESC, pe.DaysSincePostCreation ASC NULLS LAST
+LIMIT 1000;

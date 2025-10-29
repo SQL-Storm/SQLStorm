@@ -1,0 +1,160 @@
+WITH 
+TagStats AS (
+    SELECT 
+        t.TagName,
+        COUNT(p.Id)                                            AS QuestionCount,
+        SUM(p.ViewCount)                                       AS TotalViews,
+        AVG(p.Score)                                           AS AvgScore,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END)      AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END)      AS DownVotes,
+        COUNT(DISTINCT u.Id)                                   AS ActiveUsers
+    FROM Tags t
+    LEFT JOIN Posts p 
+        ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%' 
+        AND p.PostTypeId = 1
+    LEFT JOIN Votes v 
+        ON v.PostId = p.Id
+    LEFT JOIN Users u 
+        ON u.Id = p.OwnerUserId
+    GROUP BY t.TagName
+),
+
+UserRank AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC)                         AS RepRank,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END)                            AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END)                            AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END)                            AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Badges b 
+        ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+RecentClosed AS (
+    SELECT 
+        ph.PostId,
+        MAX(ph.CreationDate)                         AS CloseDate,
+        ph.Comment                                   AS CloseReason
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.PostId, ph.Comment
+),
+
+TopAnswered AS (
+    SELECT 
+        q.Id                                           AS QuestionId,
+        q.Title,
+        q.ViewCount,
+        q.Score,
+        ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY a.Score DESC) AS AnswerRank,
+        a.Id                                           AS AnswerId,
+        a.Score                                        AS AnswerScore,
+        a.CreationDate                                 AS AnswerCreated
+    FROM Posts q
+    LEFT JOIN Posts a 
+        ON a.ParentId = q.Id 
+        AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+),
+
+MainRows AS (
+SELECT 
+    ts.TagName,
+    ts.QuestionCount,
+    ts.TotalViews,
+    ROUND(CAST(ts.AvgScore AS DECIMAL), 2)           AS AvgScore,
+    ts.UpVotes,
+    ts.DownVotes,
+    ts.ActiveUsers,
+    ur.DisplayName,
+    ur.Reputation,
+    ur.RepRank,
+    ur.GoldBadges,
+    ur.SilverBadges,
+    ur.BronzeBadges,
+    rc.CloseDate,
+    rc.CloseReason,
+    ta.Title,
+    ta.ViewCount,
+    ta.Score,
+    ta.AnswerId,
+    ta.AnswerScore,
+    ta.AnswerCreated
+FROM TagStats ts
+LEFT JOIN (
+    SELECT *
+    FROM UserRank
+    WHERE RepRank <= 10
+) ur ON 1=1
+LEFT JOIN LATERAL (
+    SELECT 
+        rc.CloseDate,
+        rc.CloseReason
+    FROM RecentClosed rc
+    WHERE rc.PostId = (
+        SELECT p.Id
+        FROM Posts p
+        WHERE p.Tags LIKE '%' || '<' || ts.TagName || '>' || '%' 
+          AND p.PostTypeId = 1
+        ORDER BY p.CreationDate DESC
+        LIMIT 1
+    )
+    LIMIT 1
+) rc ON TRUE
+LEFT JOIN LATERAL (
+    SELECT 
+        ta.Title,
+        ta.ViewCount,
+        ta.Score,
+        ta.AnswerId,
+        ta.AnswerScore,
+        ta.AnswerCreated
+    FROM TopAnswered ta
+    WHERE ta.QuestionId = (
+        SELECT p.Id
+        FROM Posts p
+        WHERE p.Tags LIKE '%' || '<' || ts.TagName || '>' || '%' 
+          AND p.PostTypeId = 1
+        ORDER BY p.ViewCount DESC
+        LIMIT 1
+    )
+      AND ta.AnswerRank = 1
+    LIMIT 1
+) ta ON TRUE
+WHERE ts.QuestionCount > 0
+)
+
+SELECT *
+FROM MainRows
+ORDER BY TotalViews DESC
+LIMIT 50
+
+UNION ALL
+
+SELECT 
+    'TOTAL'          AS TagName,
+    SUM(ts.QuestionCount)                                   AS QuestionCount,
+    SUM(ts.TotalViews)                                      AS TotalViews,
+    ROUND(CAST(AVG(ts.AvgScore) AS DECIMAL), 2)              AS AvgScore,
+    SUM(ts.UpVotes)                                         AS UpVotes,
+    SUM(ts.DownVotes)                                       AS DownVotes,
+    SUM(ts.ActiveUsers)                                     AS ActiveUsers,
+    CAST(NULL AS VARCHAR)                                   AS DisplayName,
+    CAST(NULL AS INTEGER)                                   AS Reputation,
+    CAST(NULL AS INTEGER)                                   AS RepRank,
+    CAST(NULL AS INTEGER)                                   AS GoldBadges,
+    CAST(NULL AS INTEGER)                                   AS SilverBadges,
+    CAST(NULL AS INTEGER)                                   AS BronzeBadges,
+    CAST(NULL AS TIMESTAMP)                                 AS CloseDate,
+    CAST(NULL AS VARCHAR)                                   AS CloseReason,
+    CAST(NULL AS VARCHAR)                                   AS Title,
+    CAST(NULL AS INTEGER)                                   AS ViewCount,
+    CAST(NULL AS INTEGER)                                   AS Score,
+    CAST(NULL AS INTEGER)                                   AS AnswerId,
+    CAST(NULL AS INTEGER)                                   AS AnswerScore,
+    CAST(NULL AS TIMESTAMP)                                 AS AnswerCreated
+FROM TagStats ts;

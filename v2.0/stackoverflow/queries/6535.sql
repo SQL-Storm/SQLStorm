@@ -1,0 +1,36 @@
+SELECT 
+    u.DisplayName,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 1 THEN p.Id END) AS InitialTitles,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN p.Id END) AS UpVotes,
+    COUNT(DISTINCT CASE WHEN b.TagBased = FALSE THEN t.TagName END) AS NamedBadges,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Comment END) AS CloseReason,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 33 THEN ph.Comment END) AS PostNoticeAdded,
+    AVG(p.Score) AS AvgScore,
+    SUM(p.ViewCount) AS TotalViews,
+    STRING_AGG(t.TagName, ', ' ORDER BY TopTagCount DESC) AS TopTags
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN (
+    SELECT ExcerptPostId, TagName, COUNT(*) AS TopTagCount
+    FROM Tags
+    GROUP BY ExcerptPostId, TagName
+) t ON p.Id = t.ExcerptPostId
+WHERE 
+    u.Reputation > 1000
+    AND p.PostTypeId = 1
+    AND p.LastActivityDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '12 months')
+GROUP BY 
+    u.DisplayName
+HAVING 
+    COUNT(DISTINCT p.Id) > 10
+ORDER BY 
+    TotalPosts DESC;

@@ -1,0 +1,124 @@
+-- {"query": "4272.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1210} 
+
+WITH
+  RankedAnswers AS (
+    SELECT
+      p.Id AS PostId,
+      p.ParentId AS QuestionId,
+      p.OwnerUserId,
+      p.Score,
+      p.CreationDate,
+      ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS AnswerRank,
+      CASE WHEN p.Id = ps.AcceptedAnswerId THEN 1 ELSE 0 END AS IsAccepted,
+      SUM(CASE WHEN c.Id IS NOT NULL THEN 1 ELSE 0 END) OVER (PARTITION BY p.ParentId) AS CommentCountForQuestion
+    FROM Posts AS p
+    LEFT JOIN Posts AS ps
+      ON p.Id = ps.Id AND ps.PostTypeId = 1
+    LEFT JOIN Comments AS c
+      ON p.Id = c.PostId
+    WHERE
+      p.PostTypeId = 2 AND p.ParentId IS NOT NULL
+  ),
+  QuestionDetails AS (
+    SELECT
+      p.Id AS QuestionId,
+      p.OwnerUserId AS QuestionOwnerUserId,
+      p.Title AS QuestionTitle,
+      p.CreationDate AS QuestionCreationDate,
+      p.ViewCount AS QuestionViewCount,
+      p.Score AS QuestionScore,
+      COUNT(ph.Id) AS EditCount,
+      MAX(ph.CreationDate) AS LastEditDate,
+      CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+      (
+        SELECT
+          COUNT(ph2.Id)
+        FROM PostHistory AS ph2
+        WHERE
+          ph2.PostId = p.Id AND ph2.PostHistoryTypeId = 6
+      ) AS TagEditCount,
+      COALESCE(u.DisplayName, 'Unknown User') AS OwnerDisplayName,
+      CASE
+        WHEN u.Reputation > 100000 THEN 'Legendary'
+        WHEN u.Reputation > 50000 THEN 'High Reputation'
+        WHEN u.Reputation > 10000 THEN 'Experienced'
+        WHEN u.Reputation > 1000 THEN 'Intermediate'
+        ELSE 'Beginner'
+      END AS ReputationLevel,
+      CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN (SELECT Score FROM Posts WHERE Id = p.AcceptedAnswerId) ELSE NULL END AS AcceptedAnswerScore,
+      (SELECT COUNT(*) FROM PostLinks AS pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3) AS DuplicateLinkCount,
+      COALESCE(pt.Name, 'Unknown') AS PostTypeName
+    FROM Posts AS p
+    LEFT JOIN Users AS u
+      ON p.OwnerUserId = u.Id
+    LEFT JOIN PostHistory AS ph
+      ON p.Id = ph.PostId AND ph.PostHistoryTypeId IN (4, 5, 6) /* Edit Title, Edit Body, Edit Tags */
+    LEFT JOIN PostTypes AS pt
+      ON p.PostTypeId = pt.Id
+    WHERE
+      p.PostTypeId = 1
+    GROUP BY
+      p.Id,
+      p.OwnerUserId,
+      p.Title,
+      p.CreationDate,
+      p.ViewCount,
+      p.Score,
+      p.ClosedDate,
+      u.DisplayName,
+      u.Reputation,
+      pt.Name
+  )
+SELECT
+  qd.QuestionId,
+  qd.QuestionTitle,
+  qd.QuestionOwnerUserId,
+  qd.OwnerDisplayName,
+  qd.ReputationLevel,
+  qd.QuestionCreationDate,
+  qd.QuestionViewCount,
+  qd.QuestionScore,
+  qd.IsClosed,
+  qd.EditCount,
+  qd.LastEditDate,
+  qd.TagEditCount,
+  qd.PostTypeName,
+  (
+    SELECT
+      COUNT(*)
+    FROM Votes AS v
+    WHERE
+      v.PostId = qd.QuestionId AND v.VoteTypeId = 2 /* UpMod */
+  ) AS UpVoteCount,
+  (
+    SELECT
+      COUNT(*)
+    FROM Votes AS v
+    WHERE
+      v.PostId = qd.QuestionId AND v.VoteTypeId = 3 /* DownMod */
+  ) AS DownVoteCount,
+  CASE
+    WHEN ra.AnswerRank = 1 THEN 'Best'
+    WHEN ra.AnswerRank = 2 THEN 'Second Best'
+    WHEN ra.AnswerRank = 3 THEN 'Third Best'
+    ELSE 'Other'
+  END AS TopAnswerRank,
+  ra.Score AS TopAnswerScore,
+  ra.OwnerUserId AS TopAnswerOwnerUserId,
+  ra.CreationDate AS TopAnswerCreationDate,
+  ra.IsAccepted AS IsTopAnswerAccepted,
+  qd.AcceptedAnswerScore,
+  qd.DuplicateLinkCount,
+  qd.CommentCountForQuestion
+FROM QuestionDetails AS qd
+LEFT JOIN RankedAnswers AS ra
+  ON qd.QuestionId = ra.QuestionId AND ra.AnswerRank <= 3
+WHERE
+  qd.QuestionCreationDate >= '2023-01-01'
+  AND qd.QuestionScore > 10
+  AND qd.OwnerDisplayName LIKE '%a%'
+  OR qd.QuestionViewCount > 10000
+ORDER BY
+  qd.QuestionScore DESC,
+  qd.QuestionViewCount DESC
+LIMIT 100;

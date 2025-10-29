@@ -1,0 +1,59 @@
+-- {"query": "6611.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-micro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 482} 
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.Title,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.LastActivityDate,
+        U.DisplayName,
+        U.Reputation,
+        U.LastAccessDate,
+        ROW_NUMBER() OVER (ORDER BY P.Score DESC, P.ViewCount DESC) AS Rank
+    FROM 
+        Posts P
+    JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId = 1 AND P.Score > 0 AND P.ViewCount > 100
+),
+BadgeCounts AS (
+    SELECT 
+        U.Id AS UserId,
+        COUNT(DISTINCT B.Id) AS BadgeCount
+    FROM 
+        Users U
+    JOIN 
+        Badges B ON U.Id = B.UserId
+    GROUP BY 
+        U.Id
+)
+SELECT 
+    RP.Id,
+    RP.Title,
+    RP.Score,
+    RP.ViewCount,
+    RP.Rank,
+    RP.CreationDate,
+    RP.LastActivityDate,
+    RP.DisplayName,
+    RP.Reputation,
+    RP.LastAccessDate,
+    COALESCE(BC.BadgeCount, 0) AS BadgeCount,
+    CASE 
+        WHEN RP.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'High Scoring'
+        WHEN RP.ViewCount > (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = 1) THEN 'High Viewed'
+        ELSE 'Average'
+    END AS PerformanceCategory,
+    STRING_AGG(T.TagName, ', ') WITHIN GROUP AS ORDER BY T.TagName ASC AS TagList
+FROM 
+    RankedPosts RP
+LEFT JOIN 
+    Tags T ON RP.Id = T.ExcerptPostId
+LEFT JOIN 
+    BadgeCounts BC ON RP.DisplayName = BC.UserId
+GROUP BY 
+    RP.Id, RP.Title, RP.Score, RP.ViewCount, RP.Rank, RP.CreationDate, RP.LastActivityDate, RP.DisplayName, RP.Reputation, RP.LastAccessDate, BC.BadgeCount
+ORDER BY 
+    RP.Rank;

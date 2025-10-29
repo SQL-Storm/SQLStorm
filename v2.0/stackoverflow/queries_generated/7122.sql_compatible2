@@ -1,0 +1,292 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY MAX(p.CreationDate) DESC) as rn
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.AccountId IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopPosts AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.ParentId,
+        p.PostTypeId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            WHEN p.PostTypeId = 5 THEN 'TagWiki'
+            ELSE 'Other'
+        END as PostType,
+        RANK() OVER (ORDER BY p.Score DESC, p.ViewCount DESC) as ScoreRank,
+        DENSE_RANK() OVER (ORDER BY p.CreationDate DESC) as RecencyRank,
+        LAG(p.Score) OVER (ORDER BY p.CreationDate DESC, p.Id) as PrevScore,
+        LEAD(p.Score) OVER (ORDER BY p.CreationDate DESC, p.Id) as NextScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as AvgScorePerUser,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) as PostsPerUser,
+        CASE 
+            WHEN p.PostTypeId = 2 AND p.ParentId IS NOT NULL THEN 
+                (SELECT COUNT(*) FROM Posts WHERE ParentId = p.ParentId)
+            ELSE 0 
+        END as AnswerCountForQuestion
+    FROM Posts p
+    WHERE p.Score > 0 AND p.ViewCount > 0
+),
+PostTagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.IsRequired = TRUE THEN 'Required'
+            WHEN t.IsModeratorOnly = TRUE THEN 'Moderator Only'
+            ELSE 'Regular'
+        END as TagType,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as PopularityRank,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Highly Popular'
+            WHEN t.Count > 100 THEN 'Popular'
+            WHEN t.Count > 10 THEN 'Moderate'
+            ELSE 'Low'
+        END as PopularityLevel
+    FROM Tags t
+    WHERE t.Count > 0
+),
+ComplexUserAnalysis AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.PostCount,
+        uas.CommentCount,
+        uas.BadgeCount,
+        uas.LastPostDate,
+        CASE 
+            WHEN uas.PostCount > 100 THEN 'Veteran'
+            WHEN uas.PostCount > 50 THEN 'Experienced'
+            WHEN uas.PostCount > 10 THEN 'Active'
+            ELSE 'Beginner'
+        END as UserCategory,
+        COALESCE(uas.PostCount, 0) + COALESCE(uas.CommentCount, 0) + COALESCE(uas.BadgeCount, 0) as TotalActivity,
+        CASE 
+            WHEN uas.Reputation > 10000 THEN 'Elite'
+            WHEN uas.Reputation > 1000 THEN 'Expert'
+            WHEN uas.Reputation > 100 THEN 'Intermediate'
+            ELSE 'Novice'
+        END as RepCategory,
+        ROW_NUMBER() OVER (ORDER BY uas.Reputation DESC, uas.PostCount DESC) as RepRank
+    FROM UserActivityStats uas
+    WHERE uas.rn = 1
+),
+CombinedAnalysis AS (
+    SELECT 
+        cua.UserId,
+        cua.DisplayName,
+        cua.Reputation,
+        cua.PostCount,
+        cua.CommentCount,
+        cua.BadgeCount,
+        cua.LastPostDate,
+        cua.UserCategory,
+        cua.TotalActivity,
+        cua.RepCategory,
+        cua.RepRank,
+        tp.PostId,
+        tp.Title,
+        tp.Score,
+        tp.ViewCount,
+        tp.CreationDate,
+        tp.PostType,
+        tp.ScoreRank,
+        tp.RecencyRank,
+        tp.AnswerCountForQuestion,
+        pta.TagName,
+        pta.TagCount,
+        pta.TagType,
+        pta.PopularityLevel,
+        pta.PopularityRank,
+        CASE 
+            WHEN tp.Score > 100 THEN 'High Impact'
+            WHEN tp.Score > 50 THEN 'Medium Impact'
+            WHEN tp.Score > 10 THEN 'Low Impact'
+            ELSE 'Minimal Impact'
+        END as ImpactLevel,
+        CASE 
+            WHEN tp.ViewCount > 5000 THEN 'Viral'
+            WHEN tp.ViewCount > 1000 THEN 'Popular'
+            WHEN tp.ViewCount > 100 THEN 'Moderate'
+            ELSE 'Limited'
+        END as ReachLevel,
+        CASE 
+            WHEN tp.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days') THEN 'Recent'
+            WHEN tp.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days') THEN 'Recent-Moderate'
+            ELSE 'Legacy'
+        END as TimeCategory,
+        (tp.Score * tp.ViewCount) as ScoreViewProduct,
+        CASE 
+            WHEN cua.Reputation > 5000 AND tp.Score > 50 THEN 'Power User High Impact'
+            WHEN cua.Reputation > 2000 AND tp.Score > 25 THEN 'Active Contributor'
+            WHEN cua.Reputation > 1000 AND tp.Score > 10 THEN 'Regular Contributor'
+            ELSE 'Standard User'
+        END as ContributorTier,
+        CAST(100.0 * tp.Score / NULLIF((SELECT MAX(Score) FROM Posts WHERE PostTypeId = 1), 0) AS DECIMAL(5,2)) as ScorePercentile,
+        COALESCE(NULLIF(tp.AnswerCountForQuestion, 0), 0) as EffectiveAnswerCount,
+        COALESCE(NULLIF(tp.AnswerCountForQuestion, 0), 0) * tp.Score as AnswerScoreAdjustment
+    FROM ComplexUserAnalysis cua
+    LEFT JOIN TopPosts tp ON cua.UserId = tp.OwnerUserId
+    LEFT JOIN PostTagAnalysis pta ON tp.Title LIKE '%' || pta.TagName || '%'
+    WHERE tp.Score IS NOT NULL
+),
+FinalQuery AS (
+    SELECT 
+        fa.UserId,
+        fa.DisplayName,
+        fa.Reputation,
+        fa.PostCount,
+        fa.CommentCount,
+        fa.BadgeCount,
+        fa.LastPostDate,
+        fa.UserCategory,
+        fa.TotalActivity,
+        fa.RepCategory,
+        fa.RepRank,
+        fa.PostId,
+        fa.Title,
+        fa.Score,
+        fa.ViewCount,
+        fa.CreationDate,
+        fa.PostType,
+        fa.ScoreRank,
+        fa.RecencyRank,
+        fa.AnswerCountForQuestion,
+        fa.TagName,
+        fa.TagCount,
+        fa.TagType,
+        fa.PopularityLevel,
+        fa.PopularityRank,
+        fa.ImpactLevel,
+        fa.ReachLevel,
+        fa.TimeCategory,
+        fa.ScoreViewProduct,
+        fa.ContributorTier,
+        fa.ScorePercentile,
+        fa.EffectiveAnswerCount,
+        fa.AnswerScoreAdjustment,
+        ROW_NUMBER() OVER (ORDER BY fa.Score DESC, fa.Reputation DESC) as OverallRank,
+        RANK() OVER (PARTITION BY fa.RepCategory ORDER BY fa.Score DESC) as RepCategoryRank,
+        DENSE_RANK() OVER (ORDER BY fa.ScoreRank) as PerformanceRank,
+        COUNT(*) OVER () as TotalRecords,
+        AVG(fa.Score) OVER (PARTITION BY fa.RepCategory) as AvgScoreByRepCategory,
+        MAX(fa.Score) OVER (PARTITION BY fa.UserCategory) as MaxScoreByUserCategory,
+        AVG(fa.ViewCount) OVER () as GlobalAvgViews,
+        STDDEV_POP(fa.ViewCount) OVER () as ViewCountStdDev,
+        PERCENT_RANK() OVER (ORDER BY fa.Score DESC) as ScorePercentileRank,
+        CUME_DIST() OVER (ORDER BY fa.Reputation DESC) as RepPercentile,
+        NTILE(4) OVER (ORDER BY fa.Score DESC) as ScoreQuartile,
+        CASE 
+            WHEN fa.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'Above Average'
+            WHEN fa.Score < (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'Below Average'
+            ELSE 'Average'
+        END as ScoreComparison,
+        CASE 
+            WHEN fa.Reputation > (SELECT AVG(Reputation) FROM Users) THEN 'Above Average Rep'
+            WHEN fa.Reputation < (SELECT AVG(Reputation) FROM Users) THEN 'Below Average Rep'
+            ELSE 'Average Rep'
+        END as RepComparison,
+        CASE WHEN fa.BadgeCount > 0 THEN (SELECT COUNT(*) FROM Badges WHERE UserId = fa.UserId AND Class = 1) ELSE 0 END as GoldBadges,
+        CASE WHEN fa.BadgeCount > 0 THEN (SELECT COUNT(*) FROM Badges WHERE UserId = fa.UserId AND Class = 2) ELSE 0 END as SilverBadges,
+        CASE WHEN fa.BadgeCount > 0 THEN (SELECT COUNT(*) FROM Badges WHERE UserId = fa.UserId AND Class = 3) ELSE 0 END as BronzeBadges,
+        CAST(FLOOR(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - fa.LastPostDate)) / 86400) AS INTEGER) as DaysSinceLastPost,
+        CASE 
+            WHEN (EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - fa.LastPostDate)) / 86400) < 30 THEN 'Active'
+            WHEN (EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - fa.LastPostDate)) / 86400) BETWEEN 30 AND 90 THEN 'Inactive'
+            ELSE 'Very Inactive'
+        END as ActivityStatus
+    FROM CombinedAnalysis fa
+    WHERE fa.Score > 0
+)
+SELECT 
+    UserId,
+    DisplayName,
+    Reputation,
+    PostCount,
+    CommentCount,
+    BadgeCount,
+    LastPostDate,
+    UserCategory,
+    TotalActivity,
+    RepCategory,
+    RepRank,
+    PostId,
+    Title,
+    Score,
+    ViewCount,
+    CreationDate,
+    PostType,
+    ScoreRank,
+    RecencyRank,
+    AnswerCountForQuestion,
+    TagName,
+    TagCount,
+    TagType,
+    PopularityLevel,
+    PopularityRank,
+    ImpactLevel,
+    ReachLevel,
+    TimeCategory,
+    ScoreViewProduct,
+    ContributorTier,
+    ScorePercentile,
+    EffectiveAnswerCount,
+    AnswerScoreAdjustment,
+    OverallRank,
+    RepCategoryRank,
+    PerformanceRank,
+    TotalRecords,
+    AvgScoreByRepCategory,
+    MaxScoreByUserCategory,
+    GlobalAvgViews,
+    ViewCountStdDev,
+    ScorePercentileRank,
+    RepPercentile,
+    ScoreQuartile,
+    ScoreComparison,
+    RepComparison,
+    GoldBadges,
+    SilverBadges,
+    BronzeBadges,
+    DaysSinceLastPost,
+    ActivityStatus,
+    CASE 
+        WHEN Score > 100 AND Reputation > 5000 AND PostCount > 50 THEN 'Top Performer'
+        WHEN Score > 50 AND Reputation > 1000 AND PostCount > 20 THEN 'Strong Performer'
+        WHEN Score > 10 AND Reputation > 100 AND PostCount > 5 THEN 'Moderate Performer'
+        ELSE 'Standard Contributor'
+    END as PerformanceTier
+FROM FinalQuery
+WHERE Score > (
+    SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1
+)
+AND Reputation > (
+    SELECT AVG(Reputation) FROM Users
+)
+AND (PostCount > 0 OR CommentCount > 0 OR BadgeCount > 0)
+AND (Score IS NOT NULL OR Reputation IS NOT NULL)
+ORDER BY Score DESC, RepRank ASC
+OFFSET 0 ROWS
+FETCH NEXT 1000 ROWS ONLY;

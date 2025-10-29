@@ -1,0 +1,331 @@
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+    COUNT(DISTINCT b.Id) AS Badges,
+    COALESCE(SUM(p.Score), 0) AS TotalScore,
+    COALESCE(AVG(p.Score), 0) AS AverageScore,
+    MAX(p.CreationDate) AS LatestPostDate,
+    STRING_AGG(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Title END, '; ') AS QuestionTitles,
+    STRING_AGG(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Body END, '; ') AS AnswerBodies,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p2 
+        WHERE p2.OwnerUserId = u.Id 
+          AND p2.PostTypeId = 1 
+          AND p2.Score > (
+              SELECT AVG(p3.Score) 
+              FROM Posts p3 
+              WHERE p3.PostTypeId = 1 
+                AND p3.OwnerUserId = u.Id
+          )
+    ) AS HighScoringQuestions,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p4 
+        WHERE p4.OwnerUserId = u.Id 
+          AND p4.PostTypeId = 2 
+          AND p4.Score > (
+              SELECT AVG(p5.Score) 
+              FROM Posts p5 
+              WHERE p5.PostTypeId = 2 
+                AND p5.OwnerUserId = u.Id
+          )
+    ) AS HighScoringAnswers,
+    (
+        SELECT COUNT(*) 
+        FROM Comments c 
+        WHERE c.UserId = u.Id 
+          AND c.Score > 0
+    ) AS PositiveComments,
+    (
+        SELECT MAX(c.CreationDate) 
+        FROM Comments c 
+        WHERE c.UserId = u.Id
+    ) AS LatestCommentDate,
+    (
+        SELECT COUNT(DISTINCT p6.Id) 
+        FROM Posts p6 
+        INNER JOIN PostLinks pl ON p6.Id = pl.PostId 
+        WHERE p6.OwnerUserId = u.Id 
+          AND pl.LinkTypeId = 3
+    ) AS DuplicateLinks,
+    (
+        SELECT COUNT(*) 
+        FROM Votes v 
+        WHERE v.UserId = u.Id 
+          AND v.VoteTypeId IN (2, 3)
+    ) AS VoteActivity,
+    (
+        SELECT COUNT(DISTINCT v.PostId) 
+        FROM Votes v 
+        WHERE v.UserId = u.Id 
+          AND v.VoteTypeId IN (2, 3)
+          AND v.CreationDate >= (u.CreationDate - INTERVAL '1 year')
+    ) AS RecentVotingActivity,
+    (
+        SELECT AVG(p7.Score) 
+        FROM Votes v2 
+        INNER JOIN Posts p7 ON v2.PostId = p7.Id 
+        WHERE v2.UserId = u.Id 
+          AND v2.VoteTypeId IN (2, 3)
+    ) AS AvgVoteScore,
+    (
+        SELECT STRING_AGG(DISTINCT t.TagName, ', ') 
+        FROM Posts p8 
+        INNER JOIN (
+            SELECT Id AS PostId, TRIM(BOTH '<>' FROM UNNEST(STRING_TO_ARRAY(Tags, '><'))) AS TagName 
+            FROM Posts 
+            WHERE PostTypeId = 1
+        ) t ON p8.Id = t.PostId 
+        WHERE p8.OwnerUserId = u.Id 
+          AND p8.PostTypeId = 1
+    ) AS TagActivity,
+    (
+        SELECT COUNT(*) 
+        FROM PostHistory ph 
+        WHERE ph.UserId = u.Id 
+          AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 22, 24, 25, 31, 33, 34, 35, 36, 37, 38, 50, 52, 53, 66)
+    ) AS EditActivity,
+    (
+        SELECT COUNT(DISTINCT ph2.PostId) 
+        FROM PostHistory ph2 
+        WHERE ph2.UserId = u.Id 
+          AND ph2.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 22, 24, 25, 31, 33, 34, 35, 36, 37, 38, 50, 52, 53, 66)
+          AND ph2.CreationDate >= (u.CreationDate - INTERVAL '6 months')
+    ) AS RecentEditActivity,
+    (
+        SELECT COUNT(DISTINCT ph3.PostId) 
+        FROM PostHistory ph3 
+        WHERE ph3.UserId = u.Id 
+          AND ph3.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 22, 24, 25, 31, 33, 34, 35, 36, 37, 38, 50, 52, 53, 66)
+          AND ph3.CreationDate >= (u.CreationDate - INTERVAL '1 year')
+    ) AS RecentModerationActivity,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p9 
+        WHERE p9.OwnerUserId = u.Id 
+          AND p9.PostTypeId = 1 
+          AND p9.AnswerCount > 10
+    ) AS PopularQuestions,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p10 
+        WHERE p10.OwnerUserId = u.Id 
+          AND p10.PostTypeId = 2 
+          AND p10.Score > 100
+    ) AS HighScoringAnswers,
+    (
+        SELECT STRING_AGG(DISTINCT p11.Title, ' | ') 
+        FROM Posts p11 
+        WHERE p11.OwnerUserId = u.Id 
+          AND p11.PostTypeId = 1 
+          AND p11.ViewCount > 1000
+    ) AS PopularQuestionTitles,
+    (
+        SELECT COUNT(DISTINCT p12.Id) 
+        FROM Posts p12 
+        INNER JOIN Posts p13 ON p12.ParentId = p13.Id 
+        WHERE p12.OwnerUserId = u.Id 
+          AND p12.PostTypeId = 2 
+          AND p13.OwnerUserId <> u.Id
+    ) AS SharedAnswerCount,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p14 
+        WHERE p14.OwnerUserId = u.Id 
+          AND p14.ParentId IS NOT NULL 
+          AND EXISTS (
+              SELECT 1 
+              FROM Posts p15 
+              WHERE p15.Id = p14.ParentId 
+                AND p15.OwnerUserId = u.Id
+          )
+    ) AS SelfAnsweredQuestions,
+    (
+        SELECT AVG(EXTRACT(EPOCH FROM (p16.LastActivityDate - p16.CreationDate))/86400) 
+        FROM Posts p16 
+        WHERE p16.OwnerUserId = u.Id 
+          AND p16.PostTypeId = 1
+    ) AS AvgQuestionLifespan,
+    (
+        SELECT COUNT(DISTINCT ph4.PostId) 
+        FROM PostHistory ph4 
+        WHERE ph4.UserId = u.Id 
+          AND ph4.PostHistoryTypeId = 24
+    ) AS EditSuggestions,
+    (
+        SELECT COUNT(DISTINCT p17.Id) 
+        FROM Posts p17 
+        WHERE p17.OwnerUserId = u.Id 
+          AND p17.PostTypeId = 1 
+          AND (
+              p17.ViewCount > (
+                  SELECT AVG(p18.ViewCount) 
+                  FROM Posts p18 
+                  WHERE p18.PostTypeId = 1
+              ) 
+              OR p17.Score > (
+                  SELECT AVG(p19.Score) 
+                  FROM Posts p19 
+                  WHERE p19.PostTypeId = 1
+              )
+          )
+    ) AS HighlyVisiblePosts,
+    (
+        SELECT STRING_AGG(DISTINCT ph5.Text, ' || ') 
+        FROM PostHistory ph5 
+        WHERE ph5.UserId = u.Id 
+          AND ph5.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)
+          AND ph5.CreationDate >= (u.CreationDate - INTERVAL '1 year')
+    ) AS RecentEditSummaries,
+    (
+        SELECT COUNT(DISTINCT ph6.Id) 
+        FROM PostHistory ph6 
+        WHERE ph6.UserId = u.Id 
+          AND ph6.PostHistoryTypeId IN (33, 34)
+    ) AS NoticeActivities,
+    (
+        SELECT COUNT(DISTINCT p20.Id) 
+        FROM Posts p20 
+        WHERE p20.OwnerUserId = u.Id 
+          AND EXISTS (
+              SELECT 1 
+              FROM Posts p21 
+              WHERE p21.ParentId = p20.Id 
+                AND p21.OwnerUserId = u.Id
+          )
+    ) AS SelfAnsweredQuestionsCount,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p22 
+        WHERE p22.OwnerUserId = u.Id 
+          AND p22.PostTypeId = 1 
+          AND p22.AnswerCount = 0
+    ) AS UnansweredQuestions,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p23 
+        WHERE p23.OwnerUserId = u.Id 
+          AND p23.PostTypeId = 1 
+          AND COALESCE(p23.TagBased, 0) = 1
+    ) AS TagBasedPosts,
+    (
+        SELECT EXTRACT(EPOCH FROM (MAX(p24.CreationDate) - MIN(p24.CreationDate)))/86400 
+        FROM Posts p24 
+        WHERE p24.OwnerUserId = u.Id 
+          AND p24.PostTypeId = 1
+    ) AS QuestionLifespan,
+    (
+        SELECT COUNT(DISTINCT p25.Id) 
+        FROM Posts p25 
+        INNER JOIN Tags t2 ON p25.Id = t2.ExcerptPostId 
+        WHERE p25.OwnerUserId = u.Id 
+          AND p25.PostTypeId = 3
+    ) AS TagExcerpts,
+    (
+        SELECT COUNT(DISTINCT p26.Id) 
+        FROM Posts p26 
+        INNER JOIN Tags t3 ON p26.Id = t3.WikiPostId 
+        WHERE p26.OwnerUserId = u.Id 
+          AND p26.PostTypeId = 5
+    ) AS TagWikis,
+    (
+        SELECT AVG(p27.Score) 
+        FROM Posts p27 
+        WHERE p27.OwnerUserId = u.Id 
+          AND p27.PostTypeId = 1
+    ) AS AvgQuestionScore,
+    (
+        SELECT AVG(p28.Score) 
+        FROM Posts p28 
+        WHERE p28.OwnerUserId = u.Id 
+          AND p28.PostTypeId = 2
+    ) AS AvgAnswerScore,
+    (
+        SELECT COUNT(DISTINCT p29.Id) 
+        FROM Posts p29 
+        INNER JOIN PostLinks pl2 ON p29.Id = pl2.PostId 
+        WHERE p29.OwnerUserId = u.Id 
+          AND pl2.LinkTypeId = 1
+    ) AS LinkedPosts,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p30 
+        WHERE p30.OwnerUserId = u.Id 
+          AND p30.PostTypeId = 1 
+          AND p30.ViewCount > 10000
+    ) AS ViralQuestions,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p31 
+        WHERE p31.OwnerUserId = u.Id 
+          AND p31.PostTypeId = 2 
+          AND p31.Score > 1000
+    ) AS HighlyVotedAnswers,
+    (
+        SELECT COUNT(DISTINCT p32.Id) 
+        FROM Posts p32 
+        INNER JOIN Posts p33 ON p32.ParentId = p33.Id 
+        WHERE p32.OwnerUserId = u.Id 
+          AND p32.PostTypeId = 2 
+          AND p33.OwnerUserId <> u.Id
+    ) AS CrossAnsweredQuestions,
+    (
+        SELECT COUNT(DISTINCT p34.Id) 
+        FROM Posts p34 
+        WHERE p34.OwnerUserId = u.Id 
+          AND p34.PostTypeId = 1 
+          AND p34.CommentCount > 10
+    ) AS CommentedQuestions,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p35 
+        WHERE p35.OwnerUserId = u.Id 
+          AND p35.PostTypeId = 2 
+          AND p35.CreationDate >= (u.CreationDate - INTERVAL '1 year')
+    ) AS RecentAnswers,
+    (
+        SELECT COUNT(DISTINCT p36.Id) 
+        FROM Posts p36 
+        INNER JOIN PostLinks pl3 ON p36.Id = pl3.RelatedPostId 
+        WHERE p36.OwnerUserId = u.Id 
+          AND pl3.LinkTypeId = 3
+    ) AS DuplicateReferences,
+    (
+        SELECT COALESCE(SUM(p37.Score), 0) 
+        FROM Posts p37 
+        WHERE p37.OwnerUserId = u.Id 
+          AND p37.PostTypeId = 1
+    ) AS TotalQuestionScore,
+    (
+        SELECT COALESCE(SUM(p38.Score), 0) 
+        FROM Posts p38 
+        WHERE p38.OwnerUserId = u.Id 
+          AND p38.PostTypeId = 2
+    ) AS TotalAnswerScore,
+    (
+        SELECT COUNT(DISTINCT p39.Id) 
+        FROM Posts p39 
+        WHERE p39.OwnerUserId = u.Id 
+          AND p39.PostTypeId = 1 
+          AND p39.FavoriteCount > 10
+    ) AS FavoritedQuestions,
+    (
+        SELECT COUNT(DISTINCT p40.Id) 
+        FROM Posts p40 
+        WHERE p40.OwnerUserId = u.Id 
+          AND p40.PostTypeId = 2 
+          AND p40.FavoriteCount > 10
+    ) AS FavoritedAnswers
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN Badges b ON u.Id = b.UserId
+WHERE u.Reputation > 1000
+GROUP BY u.Id, u.DisplayName, u.Reputation
+HAVING COUNT(DISTINCT p.Id) > 0
+ORDER BY TotalScore DESC, TotalPosts DESC
+LIMIT 1000;

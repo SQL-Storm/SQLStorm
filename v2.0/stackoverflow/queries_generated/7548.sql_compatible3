@@ -1,0 +1,307 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        COUNT(DISTINCT b.Id) AS Badges,
+        MAX(p.CreationDate) AS LastPostDate,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Elite'
+            WHEN u.Reputation >= 1000 THEN 'Veteran'
+            WHEN u.Reputation >= 100 THEN 'Regular'
+            ELSE 'Newbie'
+        END AS RepTier,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END), 0) AS TotalQuestionScore,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END), 0) AS TotalAnswerScore,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) AS AvgAnswerScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= DATE '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        COALESCE(p.Tags, '') AS CleanTags,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostTypeDesc,
+        CASE 
+            WHEN p.Score >= 10 THEN 'Highly Voted'
+            WHEN p.Score >= 5 THEN 'Moderately Voted'
+            WHEN p.Score >= 0 THEN 'Neutral'
+            ELSE 'Downvoted'
+        END AS ScoreCategory,
+        CAST(
+            (JULIANDAY(COALESCE(p.ClosedDate, p.LastActivityDate, TIMESTAMP '2024-10-01 12:34:56')) - JULIANDAY(p.CreationDate))
+            AS INTEGER
+        ) AS AgeInDays,
+        CASE 
+            WHEN p.CommentCount > 0 THEN ROUND(p.Score * 1.0 / (p.CommentCount + 1), 2)
+            ELSE p.Score
+        END AS ScorePerComment
+    FROM Posts p
+    WHERE p.CreationDate >= DATE '2015-01-01'
+),
+UserPostActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(p.Id) AS PostCount,
+        SUM(p.Score) AS TotalScore,
+        AVG(p.Score) AS AvgScore,
+        '' AS RecentTitles,
+        MAX(p.CreationDate) AS LastActivity,
+        '' AS PopularTagCombos
+    FROM Users u
+    INNER JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 years')
+    GROUP BY u.Id, u.DisplayName
+),
+ComplexBadges AS (
+    SELECT 
+        b.UserId,
+        b.Name,
+        b.Date,
+        b.Class,
+        COUNT(*) OVER (PARTITION BY b.UserId) AS UserBadgeCount,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Date) AS BadgeRank,
+        CASE 
+            WHEN b.Class = 1 THEN 'Gold'
+            WHEN b.Class = 2 THEN 'Silver'
+            WHEN b.Class = 3 THEN 'Bronze'
+            ELSE 'Unknown'
+        END AS BadgeTier,
+        CASE 
+            WHEN b.Name LIKE '%Excellent%' OR b.Name LIKE '%Master%' OR b.Name LIKE '%Legend%' THEN 1
+            WHEN b.Name LIKE '%Great%' OR b.Name LIKE '%Top%' OR b.Name LIKE '%Best%' THEN 2
+            WHEN b.Name LIKE '%Good%' OR b.Name LIKE '%Regular%' OR b.Name LIKE '%Average%' THEN 3
+            ELSE 4
+        END AS TierPriority
+    FROM Badges b
+    WHERE b.Date >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '3 years')
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count >= 1000 THEN 'Popular'
+            WHEN t.Count >= 500 THEN 'Well-Known'
+            WHEN t.Count >= 100 THEN 'Known'
+            ELSE 'Niche'
+        END AS TagPopularity,
+        DENSE_RANK() OVER (ORDER BY t.Count DESC) AS PopularityRank,
+        LAG(t.Count) OVER (ORDER BY t.Count DESC) AS PreviousCount,
+        (t.Count - LAG(t.Count) OVER (ORDER BY t.Count DESC)) AS CountChange
+    FROM Tags t
+),
+UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COALESCE(SUM(v.Score), 0) AS TotalVotes,
+        COUNT(v.Id) AS VoteCount,
+        AVG(v.Score) AS AvgVoteScore,
+        '' AS VoteTypesUsed
+    FROM Users u
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    WHERE v.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6 months')
+    GROUP BY u.Id, u.DisplayName
+)
+SELECT 
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.Views,
+    us.UpVotes,
+    us.DownVotes,
+    us.TotalPosts,
+    us.Questions,
+    us.Answers,
+    us.Badges,
+    us.RepTier,
+    us.TotalQuestionScore,
+    us.TotalAnswerScore,
+    us.AvgQuestionScore,
+    us.AvgAnswerScore,
+    (COALESCE(ups.RecentTitles, '') || '; ' || COALESCE(ups.PopularTagCombos, '')) AS UserContentProfile,
+    CASE 
+        WHEN (us.TotalAnswerScore * 1.0 / NULLIF(us.TotalQuestionScore, 0)) > 1.5 THEN 'Answer Focused Expert'
+        WHEN us.TotalQuestionScore > us.TotalAnswerScore THEN 'Question Creator'
+        WHEN us.TotalAnswerScore > us.TotalQuestionScore THEN 'Answer Contributor'
+        ELSE 'Balanced Contributor'
+    END AS ContributionStyle,
+    (SELECT STRING_AGG(pa2.ScoreCategory, ', ') FROM PostAnalysis pa2 WHERE pa2.OwnerUserId = us.UserId) AS PostRatingDistribution,
+    (SELECT STRING_AGG(ta2.TagPopularity, ', ') FROM PostAnalysis pa3 JOIN TagAnalysis ta2 ON pa3.CleanTags IS NOT NULL AND pa3.CleanTags <> '' AND ta2.TagName IS NOT NULL WHERE pa3.OwnerUserId = us.UserId) AS TagPreferenceAnalysis,
+    CASE 
+        WHEN us.Badges > 20 THEN 'Active Award Recipient'
+        WHEN us.Badges > 10 THEN 'Frequent Award Recipient'
+        WHEN us.Badges > 5 THEN 'Regular Award Recipient'
+        ELSE 'Occasional Award Recipient'
+    END AS RecognitionLevel,
+    COALESCE(ua.TotalVotes, 0) AS RecentTotalVotes,
+    COALESCE(ua.VoteCount, 0) AS RecentVoteCount,
+    ROUND(CASE WHEN ua.VoteCount = 0 THEN NULL ELSE ua.TotalVotes * 1.0 / ua.VoteCount END, 2) AS VotingIntensity,
+    CASE 
+        WHEN EXISTS (
+            SELECT 1 FROM PostHistory ph 
+            WHERE ph.UserId = us.UserId 
+            AND ph.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '3 months')
+            AND ph.PostHistoryTypeId IN (1,2,3,4,5,6)
+        ) THEN 'Active Editor'
+        ELSE 'Passive Editor'
+    END AS EditingStyle,
+    CAST(
+        CASE 
+            WHEN us.Reputation > 1000000 THEN 100
+            WHEN us.Reputation > 100000 THEN 90
+            WHEN us.Reputation > 10000 THEN 80
+            WHEN us.Reputation > 1000 THEN 70
+            WHEN us.Reputation > 100 THEN 60
+            WHEN us.Reputation > 10 THEN 50
+            ELSE 10
+        END AS FLOAT
+    ) / 100.0 AS PerformanceMultiplier,
+    CASE 
+        WHEN EXISTS (
+            SELECT 1 FROM Posts p JOIN PostHistory ph ON p.Id = ph.PostId
+            WHERE p.OwnerUserId = us.UserId
+            AND ph.PostHistoryTypeId IN (10,12,13,14,15)
+            AND ph.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 years')
+        ) THEN 'Moderation Activities'
+        ELSE 'Regular Participation'
+    END AS ParticipationLevel,
+    COUNT(DISTINCT CASE WHEN pa.PostTypeId = 1 THEN pa.PostId END) AS RecentQuestions,
+    COUNT(DISTINCT CASE WHEN pa.PostTypeId = 2 THEN pa.PostId END) AS RecentAnswers,
+    PERCENT_RANK() OVER (ORDER BY us.TotalPosts DESC) AS PostPopularityRank,
+    AVG(pa.ScorePerComment) AS AvgScorePerComment,
+    (SELECT STRING_AGG(cb.Name, '; ') FROM ComplexBadges cb WHERE cb.UserId = us.UserId) AS RecentBadgeAchievements
+FROM UserStats us
+LEFT JOIN UserPostActivity ups ON us.UserId = ups.UserId
+LEFT JOIN PostAnalysis pa ON us.UserId = pa.OwnerUserId
+LEFT JOIN TagAnalysis ta ON pa.CleanTags IS NOT NULL AND pa.CleanTags <> ''
+LEFT JOIN UserActivityStats ua ON us.UserId = ua.UserId
+LEFT JOIN ComplexBadges b ON us.UserId = b.UserId 
+WHERE us.RepTier IN ('Elite','Veteran','Regular')
+GROUP BY 
+    us.UserId, 
+    us.DisplayName, 
+    us.Reputation, 
+    us.Views, 
+    us.UpVotes, 
+    us.DownVotes, 
+    us.TotalPosts, 
+    us.Questions, 
+    us.Answers, 
+    us.Badges, 
+    us.RepTier, 
+    us.TotalQuestionScore, 
+    us.TotalAnswerScore, 
+    us.AvgQuestionScore, 
+    us.AvgAnswerScore, 
+    ups.RecentTitles, 
+    ups.PopularTagCombos, 
+    ua.TotalVotes, 
+    ua.VoteCount
+HAVING 
+    (us.TotalPosts > 10 OR us.Badges > 5)
+    AND (us.Questions > 0 OR us.Answers > 0)
+ORDER BY us.TotalPosts DESC, us.Reputation DESC
+
+UNION ALL
+
+SELECT 
+    -1 AS UserId,
+    'Total Aggregate Stats' AS DisplayName,
+    SUM(Reputation) AS Reputation,
+    SUM(Views) AS Views,
+    SUM(UpVotes) AS UpVotes,
+    SUM(DownVotes) AS DownVotes,
+    SUM(TotalPosts) AS TotalPosts,
+    SUM(Questions) AS Questions,
+    SUM(Answers) AS Answers,
+    SUM(Badges) AS Badges,
+    '' AS RepTier,
+    SUM(TotalQuestionScore) AS TotalQuestionScore,
+    SUM(TotalAnswerScore) AS TotalAnswerScore,
+    NULL AS AvgQuestionScore,
+    NULL AS AvgAnswerScore,
+    '' AS UserContentProfile,
+    'Aggregate Overview' AS ContributionStyle,
+    (SELECT STRING_AGG(DISTINCT pa2.ScoreCategory, ', ') FROM UserStats us2 LEFT JOIN PostAnalysis pa2 ON us2.UserId = pa2.OwnerUserId WHERE us2.RepTier IN ('Elite','Veteran','Regular') AND (us2.TotalPosts > 10 OR us2.Badges > 5)) AS PostRatingDistribution,
+    (SELECT STRING_AGG(DISTINCT ta2.TagPopularity, ', ') FROM PostAnalysis pa3 JOIN TagAnalysis ta2 ON pa3.CleanTags IS NOT NULL AND pa3.CleanTags <> '' AND ta2.TagName IS NOT NULL WHERE pa3.OwnerUserId IN (SELECT UserId FROM UserStats WHERE RepTier IN ('Elite','Veteran','Regular'))) AS TagPreferenceAnalysis,
+    'System Overview' AS RecognitionLevel,
+    SUM(RecentTotalVotes) AS RecentTotalVotes,
+    SUM(RecentVoteCount) AS RecentVoteCount,
+    NULL AS VotingIntensity,
+    'System Level' AS EditingStyle,
+    1.0 AS PerformanceMultiplier,
+    'System Wide' AS ParticipationLevel,
+    SUM(RecentQuestions) AS RecentQuestions,
+    SUM(RecentAnswers) AS RecentAnswers,
+    NULL AS PostPopularityRank,
+    AVG(AvgScorePerComment) AS AvgScorePerComment,
+    (SELECT STRING_AGG(t.RecentBadgeAchievements, '; ') FROM (
+        SELECT b2.Name AS RecentBadgeAchievements
+        FROM ComplexBadges b2
+        JOIN UserStats usb ON b2.UserId = usb.UserId
+        WHERE usb.RepTier IN ('Elite','Veteran','Regular') AND (usb.TotalPosts > 10 OR usb.Badges > 5)
+    ) t) AS RecentBadgeAchievements
+FROM (
+    SELECT 
+        us.UserId,
+        us.Reputation,
+        us.Views,
+        us.UpVotes,
+        us.DownVotes,
+        us.TotalPosts,
+        us.Questions,
+        us.Answers,
+        us.Badges,
+        us.TotalQuestionScore,
+        us.TotalAnswerScore,
+        pa.ScoreCategory,
+        ta.TagPopularity,
+        ups.RecentTitles,
+        ups.PopularTagCombos,
+        ua.TotalVotes AS RecentTotalVotes,
+        ua.VoteCount AS RecentVoteCount,
+        pa.PostId,
+        pa.CreationDate,
+        pa.OwnerUserId,
+        pa.PostTypeId,
+        pa.ScorePerComment,
+        b.Name AS RecentBadgeAchievements
+    FROM UserStats us
+    LEFT JOIN UserPostActivity ups ON us.UserId = ups.UserId
+    LEFT JOIN PostAnalysis pa ON us.UserId = pa.OwnerUserId
+    LEFT JOIN TagAnalysis ta ON pa.CleanTags IS NOT NULL AND pa.CleanTags <> ''
+    LEFT JOIN UserActivityStats ua ON us.UserId = ua.UserId
+    LEFT JOIN ComplexBadges b ON us.UserId = b.UserId 
+    WHERE us.RepTier IN ('Elite','Veteran','Regular')
+) agg
+WHERE TotalPosts > 10 OR Badges > 5;

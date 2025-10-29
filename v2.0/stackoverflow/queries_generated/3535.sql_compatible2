@@ -1,0 +1,163 @@
+WITH 
+user_stats AS (
+    SELECT 
+        u.Id                                   AS user_id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(b.Id)                            AS total_badges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_badges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_badges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_badges,
+        MAX(u.LastAccessDate)                 AS last_seen,
+        (
+            SELECT DATE_PART('day', CAST('2024-10-01 12:34:56' AS timestamp) - MAX(p.CreationDate))
+            FROM Posts p
+            WHERE p.OwnerUserId = u.Id
+        )                                      AS days_since_last_post
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+question_rank AS (
+    SELECT
+        p.Id                                   AS question_id,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.FavoriteCount,
+        p.AnswerCount,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) 
+                 OVER (PARTITION BY p.Id), 0)      AS up_votes,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) 
+                 OVER (PARTITION BY p.Id), 0)      AS down_votes,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId 
+                           ORDER BY p.Score DESC, p.CreationDate DESC) AS rn,
+        COUNT(*) OVER ()                         AS total_questions,
+        (
+         SELECT STRING_AGG(t.TagName, '|')
+         FROM (
+             SELECT UNNEST(STRING_TO_ARRAY(TRIM(BOTH '<>' FROM p.Tags), '><')) AS txt
+         ) tag
+         JOIN Tags t ON t.TagName = tag.txt
+        ) AS tag_pipe
+    FROM Posts p
+    LEFT JOIN Votes v 
+          ON v.PostId = p.Id AND v.VoteTypeId IN (2,3)
+    WHERE p.PostTypeId = 1
+),
+top_questions AS (
+    SELECT *
+    FROM question_rank
+    WHERE rn <= 5
+),
+dup_links AS (
+    SELECT pl.PostId               AS question_id,
+           COUNT(*)               AS dup_link_cnt
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 3
+    GROUP BY pl.PostId
+),
+badge_less_users AS (
+    SELECT u.Id          AS user_id,
+           u.DisplayName,
+           u.Reputation,
+           0            AS total_badges,
+           0            AS gold_badges,
+           0            AS silver_badges,
+           0            AS bronze_badges,
+           NULL         AS last_seen,
+           NULL         AS days_since_last_post
+    FROM Users u
+    WHERE NOT EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = u.Id)
+),
+main_with_questions AS (
+    SELECT
+        us.user_id,
+        us.DisplayName,
+        us.Reputation,
+        us.total_badges,
+        us.gold_badges,
+        us.silver_badges,
+        us.bronze_badges,
+        us.last_seen,
+        us.days_since_last_post,
+        tq.question_id,
+        tq.Title,
+        tq.CreationDate               AS q_created,
+        tq.Score,
+        tq.ViewCount,
+        tq.FavoriteCount,
+        tq.AnswerCount,
+        tq.up_votes,
+        tq.down_votes,
+        tq.tag_pipe,
+        (
+            SELECT MIN(p2.CreationDate)
+            FROM Posts p2
+            WHERE p2.ParentId = tq.question_id
+              AND p2.PostTypeId = 2
+        )          AS first_answer_date,
+        COALESCE(dl.dup_link_cnt,0)        AS duplicate_link_cnt,
+        CASE 
+            WHEN EXISTS (SELECT 1 
+                         FROM PostHistory ph 
+                         WHERE ph.PostId = tq.question_id 
+                           AND ph.PostHistoryTypeId = 10
+                           AND ph.Comment LIKE '%101%')
+                 THEN 'DuplicateClosed'
+            WHEN EXISTS (SELECT 1 
+                         FROM PostHistory ph 
+                         WHERE ph.PostId = tq.question_id 
+                           AND ph.PostHistoryTypeId = 10)
+                 THEN 'OtherClosed'
+            ELSE 'Open'
+        END                               AS close_status
+    FROM user_stats us
+    LEFT JOIN top_questions tq 
+           ON tq.OwnerUserId = us.user_id
+    LEFT JOIN dup_links dl 
+           ON dl.question_id = tq.question_id
+    WHERE us.Reputation > 10000
+      AND (us.gold_badges > 0 OR us.total_badges >= 10)
+      AND tq.question_id IS NOT NULL
+),
+limited_main AS (
+    SELECT *
+    FROM main_with_questions
+    ORDER BY Reputation DESC, Score DESC
+    LIMIT 100
+),
+limited_badgeless AS (
+    SELECT
+        bl.user_id,
+        bl.DisplayName,
+        bl.Reputation,
+        bl.total_badges,
+        bl.gold_badges,
+        bl.silver_badges,
+        bl.bronze_badges,
+        bl.last_seen,
+        bl.days_since_last_post,
+        NULL AS question_id,
+        NULL AS Title,
+        NULL AS q_created,
+        NULL AS Score,
+        NULL AS ViewCount,
+        NULL AS FavoriteCount,
+        NULL AS AnswerCount,
+        NULL AS up_votes,
+        NULL AS down_votes,
+        NULL AS tag_pipe,
+        NULL AS first_answer_date,
+        0    AS duplicate_link_cnt,
+        'NoData' AS close_status
+    FROM badge_less_users bl
+    WHERE bl.Reputation < 100
+    ORDER BY bl.Reputation ASC
+    LIMIT 50
+)
+SELECT * FROM limited_main
+UNION ALL
+SELECT * FROM limited_badgeless;

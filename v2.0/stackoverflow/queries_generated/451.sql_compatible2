@@ -1,0 +1,296 @@
+WITH params AS (
+    SELECT
+        date_trunc('month', CAST('2024-10-01 12:34:56' AS timestamp)) - interval '24 months' AS start_month,
+        date_trunc('month', CAST('2024-10-01 12:34:56' AS timestamp)) - interval '1 month'  AS end_month
+),
+months AS (
+    SELECT generate_series(start_month, end_month, interval '1 month')::date AS month_start
+    FROM params
+),
+questions AS (
+    SELECT p.Id,
+           CAST(p.CreationDate AS date) AS created_date,
+           p.OwnerUserId,
+           p.Score,
+           p.ViewCount,
+           p.Title,
+           p.Tags,
+           COALESCE(p.AnswerCount, 0) AS AnswerCount,
+           CASE WHEN p.ClosedDate IS NULL THEN 0 ELSE 1 END AS IsClosed,
+           p.AcceptedAnswerId
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+answers AS (
+    SELECT a.Id, a.ParentId, a.OwnerUserId, a.Score, a.CreationDate
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+),
+first_answer AS (
+    SELECT a.ParentId AS QuestionId,
+           MIN(a.CreationDate) AS FirstAnswerDate
+    FROM answers a
+    GROUP BY a.ParentId
+),
+dupes AS (
+    SELECT pl.PostId AS QuestionId,
+           MIN(pl.CreationDate) AS FirstDuplicateMark
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 3
+    GROUP BY pl.PostId
+),
+tag_expanded AS (
+    SELECT q.Id AS QuestionId,
+           unnest(string_to_array(NULLIF(substring(q.Tags FROM 2 FOR greatest(char_length(q.Tags)-2,0)), '><'), '><')) AS TagName
+    FROM questions q
+),
+top_user_badges AS (
+    SELECT b.UserId,
+           SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldCount,
+           SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverCount,
+           SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeCount,
+           COUNT(*) AS TotalBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+user_activity AS (
+    SELECT u.Id AS UserId,
+           u.Reputation,
+           u.UpVotes,
+           u.DownVotes,
+           u.Views AS ProfileViews,
+           COALESCE(tub.TotalBadges, 0) AS TotalBadges,
+           COALESCE(tub.GoldCount, 0) AS GoldBadges,
+           COALESCE(tub.SilverCount, 0) AS SilverBadges,
+           COALESCE(tub.BronzeCount, 0) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN top_user_badges tub ON tub.UserId = u.Id
+),
+question_metrics AS (
+    SELECT
+        q.Id AS QuestionId,
+        CAST(date_trunc('month', q.CreationDate) AS date) AS MonthStart,
+        q.OwnerUserId,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        q.IsClosed,
+        CASE WHEN q.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS HasAccepted,
+        EXTRACT(EPOCH FROM (fa.FirstAnswerDate - q.CreationDate))/60.0 AS MinutesToFirstAnswer,
+        EXTRACT(EPOCH FROM (fa.FirstAnswerDate - q.CreationDate))/3600.0 AS HoursToFirstAnswer,
+        CASE
+            WHEN fa.FirstAnswerDate IS NULL THEN NULL
+            WHEN fa.FirstAnswerDate <= q.CreationDate THEN 0
+            ELSE 1
+        END AS FirstAnswerAfterPost,
+        CASE WHEN d.FirstDuplicateMark IS NULL THEN 0 ELSE 1 END AS IsDuplicateMarked,
+        d.FirstDuplicateMark
+    FROM Posts q
+    LEFT JOIN first_answer fa ON fa.QuestionId = q.Id
+    LEFT JOIN dupes d ON d.QuestionId = q.Id
+    WHERE q.PostTypeId = 1
+),
+votes_agg AS (
+    SELECT
+        v.PostId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS Downvotes,
+        SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS Favorites
+    FROM Votes v
+    GROUP BY v.PostId
+),
+comments_agg AS (
+    SELECT
+        c.PostId,
+        COUNT(*) AS CommentCount,
+        SUM(c.Score) AS CommentScoreSum,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM Comments c
+    GROUP BY c.PostId
+),
+per_month AS (
+    SELECT
+        m.month_start,
+        COUNT(DISTINCT qm.QuestionId) AS Questions,
+        COUNT(DISTINCT CASE WHEN qm.HasAccepted = 1 THEN qm.QuestionId END) AS QuestionsWithAccepted,
+        AVG(NULLIF(qm.MinutesToFirstAnswer, 0)) AS AvgMinutesToFirstAnswer,
+        percentile_cont(0.5) WITHIN GROUP (ORDER BY qm.HoursToFirstAnswer) AS P50HoursToFirstAnswer,
+        percentile_cont(0.9) WITHIN GROUP (ORDER BY qm.HoursToFirstAnswer) AS P90HoursToFirstAnswer,
+        SUM(CASE WHEN qm.IsDuplicateMarked = 1 THEN 1 ELSE 0 END) AS DuplicatesMarked,
+        SUM(qm.IsClosed) AS ClosedCount
+    FROM months m
+    LEFT JOIN question_metrics qm
+      ON date_trunc('month', qm.MonthStart) = m.month_start
+    GROUP BY m.month_start
+),
+user_quality AS (
+    SELECT
+        qa.OwnerUserId AS UserId,
+        COUNT(*) AS QuestionsAuthored,
+        AVG(COALESCE(va.Upvotes,0) - COALESCE(va.Downvotes,0)) AS AvgNetVotes,
+        AVG(qm.QuestionScore) AS AvgQuestionScore,
+        AVG(COALESCE(va.Favorites,0)) AS AvgFavorites,
+        SUM(CASE WHEN qm.HasAccepted = 1 THEN 1 ELSE 0 END) AS AcceptedQuestionCount,
+        AVG(CASE WHEN qm.FirstAnswerAfterPost = 1 THEN qm.HoursToFirstAnswer END) AS AvgHoursToFirstAnswer,
+        SUM(CASE WHEN qm.IsDuplicateMarked = 1 THEN 1 ELSE 0 END) AS DupesOnUserQuestions
+    FROM question_metrics qm
+    JOIN Posts qa ON qa.Id = qm.QuestionId
+    LEFT JOIN votes_agg va ON va.PostId = qm.QuestionId
+    GROUP BY qa.OwnerUserId
+),
+tag_health AS (
+    SELECT
+        te.TagName,
+        COUNT(DISTINCT te.QuestionId) AS QuestionsWithTag,
+        AVG(qm.HoursToFirstAnswer) AS AvgHrsToAns,
+        SUM(CASE WHEN qm.HasAccepted = 1 THEN 1 ELSE 0 END) AS AcceptedCount,
+        SUM(CASE WHEN qm.IsDuplicateMarked = 1 THEN 1 ELSE 0 END) AS Dupes,
+        COUNT(DISTINCT CASE WHEN qm.IsClosed = 1 THEN te.QuestionId END) AS ClosedWithTag,
+        percentile_cont(0.5) WITHIN GROUP (ORDER BY qm.HoursToFirstAnswer) AS P50Hrs,
+        percentile_cont(0.9) WITHIN GROUP (ORDER BY qm.HoursToFirstAnswer) AS P90Hrs
+    FROM tag_expanded te
+    JOIN question_metrics qm ON qm.QuestionId = te.QuestionId
+    GROUP BY te.TagName
+),
+recent_hot_candidates AS (
+    SELECT
+        qm.QuestionId,
+        qm.MonthStart,
+        qm.QuestionScore,
+        COALESCE(va.Upvotes,0) AS Upvotes,
+        COALESCE(va.Downvotes,0) AS Downvotes,
+        COALESCE(va.Favorites,0) AS Favorites,
+        COALESCE(ca.CommentCount,0) AS CommentCount,
+        rank() OVER (PARTITION BY date_trunc('month', qm.MonthStart) ORDER BY (COALESCE(va.Upvotes,0) - COALESCE(va.Downvotes,0)) DESC, qm.ViewCount DESC) AS rnk
+    FROM question_metrics qm
+    LEFT JOIN votes_agg va ON va.PostId = qm.QuestionId
+    LEFT JOIN comments_agg ca ON ca.PostId = qm.QuestionId
+    WHERE qm.MonthStart >= (SELECT start_month FROM params)
+),
+filtered_questions AS (
+    SELECT
+        qm.QuestionId,
+        qm.MonthStart,
+        u.DisplayName AS OwnerName,
+        ua.Reputation,
+        ua.TotalBadges,
+        ua.GoldBadges,
+        ua.SilverBadges,
+        ua.BronzeBadges,
+        qm.QuestionScore,
+        COALESCE(va.Upvotes,0) AS Upvotes,
+        COALESCE(va.Downvotes,0) AS Downvotes,
+        COALESCE(va.Favorites,0) AS Favorites,
+        COALESCE(ca.CommentCount,0) AS CommentCount,
+        COALESCE(ca.CommentScoreSum,0) AS CommentScoreSum,
+        qm.ViewCount,
+        qm.HasAccepted,
+        qm.HoursToFirstAnswer,
+        qm.IsDuplicateMarked,
+        qm.IsClosed,
+        CASE
+            WHEN qm.IsClosed = 1 AND qm.HasAccepted = 1 THEN 'ClosedWithAccepted'
+            WHEN qm.IsClosed = 1 AND qm.HasAccepted = 0 THEN 'ClosedNoAccepted'
+            WHEN qm.IsClosed = 0 AND qm.HasAccepted = 1 THEN 'OpenWithAccepted'
+            ELSE 'OpenNoAccepted'
+        END AS StatusBucket,
+        (COALESCE(va.Upvotes,0) - COALESCE(va.Downvotes,0)) AS NetVotes,
+        (CASE WHEN qm.HoursToFirstAnswer IS NULL THEN 0 ELSE 1 END) AS HasAnswer
+    FROM question_metrics qm
+    LEFT JOIN votes_agg va ON va.PostId = qm.QuestionId
+    LEFT JOIN comments_agg ca ON ca.PostId = qm.QuestionId
+    LEFT JOIN Users u ON u.Id = qm.OwnerUserId
+    LEFT JOIN user_activity ua ON ua.UserId = qm.OwnerUserId
+    WHERE qm.MonthStart BETWEEN (SELECT start_month FROM params) AND (SELECT end_month FROM params)
+),
+ranked_questions AS (
+    SELECT
+        fq.QuestionId,
+        fq.MonthStart,
+        fq.OwnerName,
+        fq.Reputation,
+        fq.TotalBadges,
+        fq.GoldBadges,
+        fq.SilverBadges,
+        fq.BronzeBadges,
+        fq.QuestionScore,
+        fq.HasAccepted,
+        fq.IsDuplicateMarked,
+        fq.IsClosed,
+        fq.HoursToFirstAnswer,
+        fq.NetVotes,
+        fq.Upvotes,
+        fq.Downvotes,
+        fq.Favorites,
+        fq.CommentCount,
+        fq.CommentScoreSum,
+        fq.ViewCount,
+        fq.StatusBucket,
+        fq.HasAnswer,
+        -- view_ntile field will be set from window function below as view_ntile_calc
+        row_number() OVER (PARTITION BY date_trunc('month', fq.MonthStart) ORDER BY fq.NetVotes DESC, fq.ViewCount DESC, fq.Favorites DESC) AS rn_net,
+        dense_rank() OVER (ORDER BY fq.Reputation DESC NULLS LAST) AS dr_user_rep,
+        ntile(10) OVER (ORDER BY fq.ViewCount) AS view_ntile_calc
+    FROM filtered_questions fq
+),
+unioned AS (
+    SELECT
+        'month_agg' AS bucket,
+        to_char(pm.month_start, 'YYYY-MM') AS period,
+        CAST(NULL AS int) AS question_id,
+        CAST(NULL AS varchar) AS owner_name,
+        CAST(NULL AS int) AS reputation,
+        CAST(NULL AS int) AS total_badges,
+        CAST(NULL AS int) AS gold_badges,
+        CAST(NULL AS int) AS silver_badges,
+        CAST(NULL AS int) AS bronze_badges,
+        pm.questions AS metric1,
+        pm.questionswithaccepted AS metric2,
+        pm.duplicatesmarked AS metric3,
+        pm.closedcount AS metric4,
+        pm.avgminutestofirstanswer AS metric5,
+        pm.p50hourstofirstanswer AS metric6,
+        pm.p90hourstofirstanswer AS metric7,
+        CAST(NULL AS int) AS net_votes,
+        CAST(NULL AS int) AS upvotes,
+        CAST(NULL AS int) AS downvotes,
+        CAST(NULL AS int) AS favorites,
+        CAST(NULL AS int) AS comment_count,
+        CAST(NULL AS int) AS comment_score_sum,
+        CAST(NULL AS int) AS view_count,
+        CAST(NULL AS varchar) AS status_bucket,
+        CAST(NULL AS int) AS view_ntile
+    FROM per_month pm
+    UNION ALL
+    SELECT
+        'top_questions' AS bucket,
+        to_char(rq.MonthStart, 'YYYY-MM') AS period,
+        rq.QuestionId,
+        rq.OwnerName,
+        rq.Reputation,
+        rq.TotalBadges,
+        rq.GoldBadges,
+        rq.SilverBadges,
+        rq.BronzeBadges,
+        rq.QuestionScore AS metric1,
+        rq.HasAccepted AS metric2,
+        rq.IsDuplicateMarked AS metric3,
+        rq.IsClosed AS metric4,
+        rq.HoursToFirstAnswer AS metric5,
+        CAST(NULL AS numeric) AS metric6,
+        CAST(NULL AS numeric) AS metric7,
+        rq.NetVotes,
+        rq.Upvotes,
+        rq.Downvotes,
+        rq.Favorites,
+        rq.CommentCount,
+        rq.CommentScoreSum,
+        rq.ViewCount,
+        rq.StatusBucket,
+        rq.view_ntile_calc
+    FROM ranked_questions rq
+    WHERE rq.rn_net <= 50
+)
+SELECT *
+FROM unioned
+ORDER BY bucket, period, COALESCE(question_id, 0) DESC;

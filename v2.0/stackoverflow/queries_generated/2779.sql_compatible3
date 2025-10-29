@@ -1,0 +1,185 @@
+WITH RecentHighScoreQuestions AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        p.CreationDate,
+        p.Score,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate DESC) AS UserTopRank
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '180 days'
+      AND p.Score >= 10
+      AND p.Title IS NOT NULL
+),
+UserBadgeCounts AS (
+    SELECT 
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges b
+    WHERE b.Date >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '365 days'
+    GROUP BY b.UserId
+),
+UserQuestionStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(ubc.GoldBadges, 0) AS GoldBadges,
+        COALESCE(ubc.SilverBadges, 0) AS SilverBadges,
+        COALESCE(ubc.BronzeBadges, 0) AS BronzeBadges,
+        COUNT(rhq.Id) AS RecentHighScoreQuestions,
+        AVG(CASE WHEN rhq.Score > 0 THEN rhq.Score ELSE NULL END) AS AvgQuestionScore,
+        MAX(rhq.Score) AS MaxQuestionScore,
+        MIN(rhq.Score) AS MinQuestionScore,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 10 AND ph.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '365 days' THEN ph.PostId ELSE NULL END) AS TimesPostClosed,
+        COUNT(DISTINCT CASE WHEN c.UserId = u.Id THEN c.Id ELSE NULL END) AS CommentCount
+    FROM Users u
+    LEFT JOIN RecentHighScoreQuestions rhq ON rhq.OwnerUserId = u.Id AND rhq.UserTopRank = 1
+    LEFT JOIN UserBadgeCounts ubc ON ubc.UserId = u.Id
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, ubc.GoldBadges, ubc.SilverBadges, ubc.BronzeBadges
+),
+PostsWithAcceptedAnswers AS (
+    SELECT 
+        p.Id,
+        p.CreationDate,
+        p.Score,
+        COALESCE(a.Score, 0) AS AcceptedAnswerScore,
+        p.Tags,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        STRING_AGG(CASE WHEN c.Score > 0 THEN COALESCE(c.Text, '') ELSE NULL END, ' || ') AS PositiveCommentsConcatenated,
+        LEAD(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextPostScore,
+        CASE WHEN EXISTS (
+            SELECT 1 FROM Votes v
+            WHERE v.PostId = p.Id
+              AND v.VoteTypeId = 4
+              AND v.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '365 days'
+        ) THEN CAST(1 AS BOOLEAN) ELSE CAST(0 AS BOOLEAN) END AS HasRecentOffensiveVote
+    FROM Posts p
+    LEFT JOIN Posts a ON a.Id = p.AcceptedAnswerId
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.CreationDate, p.Score, a.Score, p.Tags, p.OwnerUserId, u.DisplayName
+),
+TagPostPopularity AS (
+    SELECT 
+        tag AS Tag,
+        COUNT(*) AS PostCount,
+        AVG(p.Score) AS AvgScore,
+        MAX(p.Score) AS MaxScore
+    FROM Posts p,
+         UNNEST(
+           STRING_TO_ARRAY(
+             SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2),
+             '><'
+           )
+         ) AS tag
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+    GROUP BY tag
+),
+UserLinkActivity AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(DISTINCT CASE WHEN lt.Name = 'Duplicate' THEN pl.Id ELSE NULL END) AS DuplicateLinksMade,
+        COUNT(DISTINCT CASE WHEN lt.Name = 'Linked' THEN pl.Id ELSE NULL END) AS GeneralLinksMade,
+        COUNT(DISTINCT CASE WHEN lt.Name = 'Duplicate' THEN pl.RelatedPostId ELSE NULL END) AS DuplicateLinksReceived,
+        COUNT(DISTINCT CASE WHEN lt.Name = 'Linked' THEN pl.RelatedPostId ELSE NULL END) AS GeneralLinksReceived
+    FROM Users u
+    LEFT JOIN PostLinks pl ON pl.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = u.Id)
+    LEFT JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    GROUP BY u.Id
+),
+TopHighRep AS (
+    SELECT 
+        uqs.UserId,
+        uqs.DisplayName,
+        uqs.Reputation,
+        uqs.GoldBadges,
+        uqs.SilverBadges,
+        uqs.BronzeBadges,
+        uqs.RecentHighScoreQuestions,
+        uqs.AvgQuestionScore,
+        uqs.MaxQuestionScore,
+        uqs.MinQuestionScore,
+        uqs.TimesPostClosed,
+        uqs.CommentCount,
+        pw.AcceptedAnswerScore,
+        pw.PositiveCommentsConcatenated,
+        pw.NextPostScore,
+        CASE WHEN pw.HasRecentOffensiveVote THEN 'Yes' ELSE 'No' END AS HasRecentOffensiveVote,
+        COALESCE(SUM(tpp.PostCount), 0) AS TotalTaggedPostsCount,
+        ARRAY_REMOVE(ARRAY_AGG(DISTINCT CASE WHEN tpp.AvgScore > 5 THEN tpp.Tag ELSE NULL END), NULL) AS PopularTags,
+        ula.DuplicateLinksMade,
+        ula.GeneralLinksMade,
+        ula.DuplicateLinksReceived,
+        ula.GeneralLinksReceived
+    FROM UserQuestionStats uqs
+    LEFT JOIN PostsWithAcceptedAnswers pw ON pw.OwnerUserId = uqs.UserId
+    LEFT JOIN TagPostPopularity tpp ON tpp.Tag = ANY(STRING_TO_ARRAY(SUBSTRING(COALESCE(pw.Tags, '') FROM 2 FOR GREATEST(LENGTH(COALESCE(pw.Tags, ''))-2,0)), '><'))
+    LEFT JOIN UserLinkActivity ula ON ula.UserId = uqs.UserId
+    WHERE uqs.Reputation > 1000
+    GROUP BY
+        uqs.UserId,
+        uqs.DisplayName,
+        uqs.Reputation,
+        uqs.GoldBadges,
+        uqs.SilverBadges,
+        uqs.BronzeBadges,
+        uqs.RecentHighScoreQuestions,
+        uqs.AvgQuestionScore,
+        uqs.MaxQuestionScore,
+        uqs.MinQuestionScore,
+        uqs.TimesPostClosed,
+        uqs.CommentCount,
+        pw.AcceptedAnswerScore,
+        pw.PositiveCommentsConcatenated,
+        pw.NextPostScore,
+        pw.HasRecentOffensiveVote,
+        ula.DuplicateLinksMade,
+        ula.GeneralLinksMade,
+        ula.DuplicateLinksReceived,
+        ula.GeneralLinksReceived
+    ORDER BY uqs.Reputation DESC, uqs.RecentHighScoreQuestions DESC
+    LIMIT 50
+),
+LowRepFallback AS (
+    SELECT 
+        uqs2.UserId,
+        uqs2.DisplayName,
+        uqs2.Reputation,
+        uqs2.GoldBadges,
+        uqs2.SilverBadges,
+        uqs2.BronzeBadges,
+        uqs2.RecentHighScoreQuestions,
+        uqs2.AvgQuestionScore,
+        uqs2.MaxQuestionScore,
+        uqs2.MinQuestionScore,
+        uqs2.TimesPostClosed,
+        uqs2.CommentCount,
+        CAST(NULL AS NUMERIC) AS AcceptedAnswerScore,
+        CAST(NULL AS TEXT) AS PositiveCommentsConcatenated,
+        CAST(NULL AS NUMERIC) AS NextPostScore,
+        'No' AS HasRecentOffensiveVote,
+        0 AS TotalTaggedPostsCount,
+        CAST(ARRAY[]::TEXT[] AS VARCHAR[]) AS PopularTags,
+        0 AS DuplicateLinksMade,
+        0 AS GeneralLinksMade,
+        0 AS DuplicateLinksReceived,
+        0 AS GeneralLinksReceived
+    FROM UserQuestionStats uqs2
+    WHERE uqs2.Reputation <= 1000
+    ORDER BY uqs2.Reputation DESC, uqs2.RecentHighScoreQuestions DESC
+    LIMIT 50
+)
+
+SELECT * FROM TopHighRep
+UNION ALL
+SELECT * FROM LowRepFallback;

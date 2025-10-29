@@ -1,0 +1,145 @@
+-- {"query": "2302.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1355} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        coalesce(t.ExcerptPostId, 0) as ExcerptPostId,
+        coalesce(t.WikiPostId, 0) as WikiPostId,
+        0 as Level
+    from Tags t
+    where t.IsRequired = 1
+
+    union all
+
+    select
+        child.Id,
+        child.TagName,
+        child.Count,
+        coalesce(child.ExcerptPostId, 0),
+        coalesce(child.WikiPostId, 0),
+        p.Level + 1
+    from Tags child
+    inner join RecursiveTagHierarchy p on child.Id = p.ExcerptPostId
+),
+UserActivity AS (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        coalesce(sum(v.VoteTypeId = 2)::int,0) as UpVotesReceived,
+        coalesce(sum(v.VoteTypeId = 3)::int,0) as DownVotesReceived,
+        max(p.CreationDate) as LastPostDate,
+        coalesce(max(ph.CreationDate), '1900-01-01') as LastEditDate,
+        coalesce(max(b.Date), '1900-01-01') as LastBadgeDate,
+        string_agg(distinct b.Name, ',' order by b.Name) as BadgesEarned,
+        case when u.Location is null or length(trim(u.Location)) = 0 then 'Unknown' else u.Location end as LocationGroup
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Votes v on v.PostId = p.Id
+    left join PostHistory ph on ph.UserId = u.Id and ph.PostId = p.Id
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Location
+),
+TopPostsWithCommentsAndLinks AS (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.Tags,
+        coalesce(c.CommentCount,0) as CommentCount,
+        coalesce(ln.LinkedCount, 0) as LinkedPostsCount,
+        coalesce(dl.DuplicateCount, 0) as DuplicatePostsCount,
+        row_number() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as RankWithinType
+    from Posts p
+    left join (
+        select PostId, count(*) as CommentCount
+        from Comments
+        group by PostId
+    ) c on c.PostId = p.Id
+    left join (
+        select PostId, count(*) as LinkedCount
+        from PostLinks
+        where LinkTypeId = 1 -- Linked
+        group by PostId
+    ) ln on ln.PostId = p.Id
+    left join (
+        select PostId, count(*) as DuplicateCount
+        from PostLinks
+        where LinkTypeId = 3 -- Duplicate
+        group by PostId
+    ) dl on dl.PostId = p.Id
+),
+RankedUserActivity AS (
+  select
+    ua.*,
+    rank() over (partition by LocationGroup order by QuestionCount desc, AnswerCount desc, UpVotesReceived desc) as RankInLocation
+  from UserActivity ua
+)
+select
+    p.Id as PostId,
+    p.Title,
+    p.PostTypeId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.CommentCount,
+    p.LinkedPostsCount,
+    p.DuplicatePostsCount,
+    u.DisplayName as OwnerName,
+    u.QuestionCount,
+    u.AnswerCount,
+    u.UpVotesReceived,
+    u.DownVotesReceived,
+    u.BadgesEarned,
+    r.RankInLocation,
+    t.TagName,
+    t.Level as TagHierarchyLevel,
+    case when p.Tags is null then 0 else array_length(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><'),1) end as NumberOfTags,
+    (select count(*) 
+       from PostHistory ph2 
+       where ph2.PostId = p.Id and ph2.PostHistoryTypeId IN (10,11,12)) as PostCloseReopenActions,
+    case 
+      when p.ClosedDate is not null then 'Closed'
+      when p.AcceptedAnswerId is not null then 'Accepted'
+      else 'Open'
+    end as PostStatus,
+    lnk.RelatedPostId,
+    lnk.LinkTypeId,
+    case 
+      when v.VoteTypeId = 2 then 'Upvote'
+      when v.VoteTypeId = 3 then 'Downvote'
+      when v.VoteTypeId = 5 then 'Favorite'
+      else 'Other'
+    end as VoteTypeName,
+    cmt.Text as RandomCommentSample,
+    ph.Comment as LastCloseReason,
+    row_number() over (partition by u.Id order by p.ViewCount desc) as PostRankByView
+from TopPostsWithCommentsAndLinks p
+join Users u on u.Id = p.OwnerUserId
+left join Tags t on t.TagName = any(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><'))
+left join PostLinks lnk on lnk.PostId = p.Id and lnk.RelatedPostId is not null
+left join Votes v on v.PostId = p.Id and v.UserId = u.Id
+left join LATERAL (
+    select c2.Text
+    from Comments c2
+    where c2.PostId = p.Id
+    order by c2.Score desc nulls last
+    limit 1
+) cmt on true
+left join LATERAL (
+    select ph2.Comment
+    from PostHistory ph2
+    where ph2.PostId = p.Id and ph2.PostHistoryTypeId = 10
+    order by ph2.CreationDate desc
+    limit 1
+) ph on true
+join RankedUserActivity r on r.UserId = u.Id
+where p.RankWithinType <= 100
+order by u.LocationGroup, u.QuestionCount desc, p.Score desc
+limit 500;

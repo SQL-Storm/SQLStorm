@@ -1,0 +1,448 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        COUNT(DISTINCT c.Id) AS Comments,
+        COUNT(DISTINCT b.Id) AS Badges,
+        COUNT(DISTINCT v.Id) AS Votes,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        MAX(v.CreationDate) AS LastVoteDate,
+        CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - u.CreationDate)) / 86400 AS INTEGER) AS AccountAgeDays,
+        CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - COALESCE(MAX(p.CreationDate), u.CreationDate))) / 86400 AS INTEGER) AS ActiveDays,
+        COALESCE(SUM(p.Score), 0) AS TotalScore,
+        COALESCE(SUM(p.ViewCount), 0) AS TotalViews,
+        COALESCE(SUM(p.AnswerCount), 0) AS TotalAnswers,
+        COALESCE(SUM(p.CommentCount), 0) AS TotalComments
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.CreationDate
+),
+PostComplexityAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.ParentId,
+        COALESCE(p.Tags, '') AS Tags,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags <> '' THEN 
+                (CHAR_LENGTH(p.Tags) - CHAR_LENGTH(REPLACE(p.Tags, '><', '')) + 1)
+            ELSE 0 
+        END AS TagCount,
+        CASE 
+            WHEN p.Body IS NOT NULL AND CHAR_LENGTH(p.Body) > 0 THEN 
+                (CHAR_LENGTH(p.Body) - CHAR_LENGTH(REPLACE(p.Body, '<', '')) + 1)
+            ELSE 0 
+        END AS HtmlTagCount,
+        CASE 
+            WHEN p.Body IS NOT NULL THEN 
+                (CHAR_LENGTH(p.Body) - CHAR_LENGTH(REPLACE(p.Body, ' ', '')) + 1)
+            ELSE 0 
+        END AS WordCount,
+        CASE WHEN p.Score > 100 THEN 'High' WHEN p.Score > 10 THEN 'Medium' ELSE 'Low' END AS ScoreCategory,
+        CASE WHEN p.AnswerCount > 5 THEN 'High' WHEN p.AnswerCount > 1 THEN 'Medium' ELSE 'Low' END AS AnswerCategory,
+        CASE WHEN p.CommentCount > 5 THEN 'High' WHEN p.CommentCount > 1 THEN 'Medium' ELSE 'Low' END AS CommentCategory
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserPostPerformance AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.TotalPosts,
+        uas.Questions,
+        uas.Answers,
+        uas.Comments,
+        uas.Badges,
+        uas.Votes,
+        uas.LastPostDate,
+        uas.LastCommentDate,
+        uas.LastVoteDate,
+        uas.AccountAgeDays,
+        uas.ActiveDays,
+        uas.TotalScore,
+        uas.TotalViews,
+        uas.TotalAnswers,
+        uas.TotalComments,
+        CASE 
+            WHEN uas.TotalPosts > 0 THEN 
+                (uas.TotalScore::double precision) / NULLIF(uas.TotalPosts,0)
+            ELSE 0 
+        END AS AvgScorePerPost,
+        CASE 
+            WHEN uas.TotalPosts > 0 THEN 
+                (uas.TotalViews::double precision) / NULLIF(uas.TotalPosts,0)
+            ELSE 0 
+        END AS AvgViewsPerPost,
+        CASE 
+            WHEN uas.TotalAnswers > 0 THEN 
+                (uas.TotalComments::double precision) / NULLIF(uas.TotalAnswers,0)
+            ELSE 0 
+        END AS AvgCommentsPerAnswer,
+        CASE 
+            WHEN uas.TotalPosts > 0 THEN 
+                (uas.Votes::double precision) / NULLIF(uas.TotalPosts,0)
+            ELSE 0 
+        END AS AvgVotesPerPost,
+        ROW_NUMBER() OVER (ORDER BY uas.TotalScore DESC) AS ScoreRank,
+        RANK() OVER (ORDER BY uas.TotalViews DESC) AS ViewRank,
+        DENSE_RANK() OVER (ORDER BY uas.Reputation DESC) AS RepRank
+    FROM UserActivityStats uas
+),
+TopUsers AS (
+    SELECT 
+        upp.UserId,
+        upp.DisplayName,
+        upp.Reputation,
+        upp.TotalPosts,
+        upp.Questions,
+        upp.Answers,
+        upp.Comments,
+        upp.Badges,
+        upp.Votes,
+        upp.LastPostDate,
+        upp.LastCommentDate,
+        upp.LastVoteDate,
+        upp.AccountAgeDays,
+        upp.ActiveDays,
+        upp.TotalScore,
+        upp.TotalViews,
+        upp.TotalAnswers,
+        upp.TotalComments,
+        upp.AvgScorePerPost,
+        upp.AvgViewsPerPost,
+        upp.AvgCommentsPerAnswer,
+        upp.AvgVotesPerPost,
+        upp.ScoreRank,
+        upp.ViewRank,
+        upp.RepRank,
+        CASE 
+            WHEN upp.Reputation > 10000 THEN 'Elite'
+            WHEN upp.Reputation > 5000 THEN 'Veteran'
+            WHEN upp.Reputation > 1000 THEN 'Expert'
+            ELSE 'Regular'
+        END AS RepTier,
+        CASE 
+            WHEN upp.TotalPosts > 1000 THEN 'Master'
+            WHEN upp.TotalPosts > 500 THEN 'Expert'
+            WHEN upp.TotalPosts > 100 THEN 'Novice'
+            ELSE 'Beginner'
+        END AS ActivityTier
+    FROM UserPostPerformance upp
+    WHERE upp.Reputation > 100
+),
+PostAnalysisSummary AS (
+    SELECT 
+        pca.PostId,
+        pca.Title,
+        pca.PostTypeId,
+        pca.Score,
+        pca.ViewCount,
+        pca.AnswerCount,
+        pca.CommentCount,
+        pca.FavoriteCount,
+        pca.CreationDate,
+        pca.OwnerUserId,
+        pca.ParentId,
+        pca.Tags,
+        pca.TagCount,
+        pca.HtmlTagCount,
+        pca.WordCount,
+        pca.ScoreCategory,
+        pca.AnswerCategory,
+        pca.CommentCategory,
+        CASE 
+            WHEN pca.TagCount > 3 THEN 'Heavy Tagged'
+            WHEN pca.TagCount > 1 THEN 'Moderately Tagged'
+            ELSE 'Lightly Tagged'
+        END AS TagIntensity,
+        CASE 
+            WHEN pca.WordCount > 500 THEN 'Very Long'
+            WHEN pca.WordCount > 200 THEN 'Long'
+            WHEN pca.WordCount > 50 THEN 'Medium'
+            ELSE 'Short'
+        END AS PostLength
+    FROM PostComplexityAnalysis pca
+),
+CombinedAnalysis AS (
+    SELECT 
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.TotalPosts,
+        tu.Questions,
+        tu.Answers,
+        tu.Comments,
+        tu.Badges,
+        tu.Votes,
+        tu.AccountAgeDays,
+        tu.ActiveDays,
+        tu.TotalScore,
+        tu.TotalViews,
+        tu.TotalAnswers,
+        tu.TotalComments,
+        tu.AvgScorePerPost,
+        tu.AvgViewsPerPost,
+        tu.AvgCommentsPerAnswer,
+        tu.AvgVotesPerPost,
+        tu.ScoreRank,
+        tu.ViewRank,
+        tu.RepRank,
+        tu.RepTier,
+        tu.ActivityTier,
+        pa.PostId,
+        pa.Title,
+        pa.PostTypeId,
+        pa.Score,
+        pa.ViewCount,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.FavoriteCount,
+        pa.CreationDate,
+        pa.OwnerUserId,
+        pa.ParentId,
+        pa.Tags,
+        pa.TagCount,
+        pa.HtmlTagCount,
+        pa.WordCount,
+        pa.ScoreCategory,
+        pa.AnswerCategory,
+        pa.CommentCategory,
+        pa.TagIntensity,
+        pa.PostLength,
+        CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - pa.CreationDate)) / 86400 AS INTEGER) AS PostAgeDays,
+        CASE 
+            WHEN pa.PostTypeId = 1 THEN 'Question'
+            WHEN pa.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostType
+    FROM TopUsers tu
+    JOIN PostAnalysisSummary pa ON tu.UserId = pa.OwnerUserId
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        ca.UserId,
+        ca.DisplayName,
+        ca.Reputation,
+        ca.TotalPosts,
+        ca.Questions,
+        ca.Answers,
+        ca.Comments,
+        ca.Badges,
+        ca.Votes,
+        ca.AccountAgeDays,
+        ca.ActiveDays,
+        ca.TotalScore,
+        ca.TotalViews,
+        ca.TotalAnswers,
+        ca.TotalComments,
+        ca.AvgScorePerPost,
+        ca.AvgViewsPerPost,
+        ca.AvgCommentsPerAnswer,
+        ca.AvgVotesPerPost,
+        ca.ScoreRank,
+        ca.ViewRank,
+        ca.RepRank,
+        ca.RepTier,
+        ca.ActivityTier,
+        ca.PostId,
+        ca.Title,
+        ca.PostTypeId,
+        ca.Score,
+        ca.ViewCount,
+        ca.AnswerCount,
+        ca.CommentCount,
+        ca.FavoriteCount,
+        ca.CreationDate,
+        ca.ParentId,
+        ca.Tags,
+        ca.TagCount,
+        ca.HtmlTagCount,
+        ca.WordCount,
+        ca.ScoreCategory,
+        ca.AnswerCategory,
+        ca.CommentCategory,
+        ca.TagIntensity,
+        ca.PostLength,
+        ca.PostAgeDays,
+        ca.PostType,
+        CASE 
+            WHEN ca.TagCount > 0 AND ca.WordCount > 50 THEN 
+                (ca.WordCount::double precision) / NULLIF(ca.TagCount,0)
+            ELSE 0 
+        END AS WordsPerTag,
+        CASE 
+            WHEN ca.ViewCount > 0 THEN 
+                (ca.Score::double precision) / NULLIF(ca.ViewCount,0)
+            ELSE 0 
+        END AS ScorePerView,
+        CASE 
+            WHEN ca.AnswerCount > 0 THEN 
+                (ca.CommentCount::double precision) / NULLIF(ca.AnswerCount,0)
+            ELSE 0 
+        END AS CommentsPerAnswer,
+        CASE 
+            WHEN ca.PostAgeDays > 0 THEN 
+                (ca.ViewCount::double precision) / NULLIF(ca.PostAgeDays,0)
+            ELSE 0 
+        END AS DailyViews,
+        ROW_NUMBER() OVER (PARTITION BY ca.PostTypeId ORDER BY ca.Score DESC) AS ScoreRankPerType
+    FROM CombinedAnalysis ca
+    WHERE ca.PostAgeDays > 30 AND ca.Score > 0
+),
+FinalAggregatedData AS (
+    SELECT 
+        cpa.UserId,
+        cpa.DisplayName,
+        cpa.Reputation,
+        cpa.TotalPosts,
+        cpa.Questions,
+        cpa.Answers,
+        cpa.Comments,
+        cpa.Badges,
+        cpa.Votes,
+        cpa.AccountAgeDays,
+        cpa.ActiveDays,
+        cpa.TotalScore,
+        cpa.TotalViews,
+        cpa.TotalAnswers,
+        cpa.TotalComments,
+        cpa.AvgScorePerPost,
+        cpa.AvgViewsPerPost,
+        cpa.AvgCommentsPerAnswer,
+        cpa.AvgVotesPerPost,
+        cpa.ScoreRank,
+        cpa.ViewRank,
+        cpa.RepRank,
+        cpa.RepTier,
+        cpa.ActivityTier,
+        cpa.PostId,
+        cpa.Title,
+        cpa.PostTypeId,
+        cpa.Score,
+        cpa.ViewCount,
+        cpa.AnswerCount,
+        cpa.CommentCount,
+        cpa.FavoriteCount,
+        cpa.CreationDate,
+        cpa.ParentId,
+        cpa.Tags,
+        cpa.TagCount,
+        cpa.HtmlTagCount,
+        cpa.WordCount,
+        cpa.ScoreCategory,
+        cpa.AnswerCategory,
+        cpa.CommentCategory,
+        cpa.TagIntensity,
+        cpa.PostLength,
+        cpa.PostAgeDays,
+        cpa.PostType,
+        cpa.WordsPerTag,
+        cpa.ScorePerView,
+        cpa.CommentsPerAnswer,
+        cpa.DailyViews,
+        cpa.ScoreRankPerType,
+        CASE 
+            WHEN cpa.PostTypeId = 1 AND cpa.AnswerCount > 0 THEN 'QuestionWithAnswers'
+            WHEN cpa.PostTypeId = 2 AND cpa.ParentId IS NOT NULL THEN 'AnswerToQuestion'
+            ELSE 'Other'
+        END AS PostClassification,
+        CASE 
+            WHEN cpa.RepTier = 'Elite' AND cpa.ScoreCategory = 'High' THEN 'EliteHighPerforming'
+            WHEN cpa.RepTier = 'Veteran' AND cpa.ViewCount > 1000 THEN 'VeteranHighReach'
+            WHEN cpa.ActivityTier = 'Master' AND cpa.AnswerCount > 10 THEN 'MasterAnswerer'
+            ELSE 'Standard'
+        END AS UserPostPerformanceCategory,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = cpa.UserId AND p.PostTypeId = 1) AS UserQuestionCount,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = cpa.UserId AND p.PostTypeId = 2) AS UserAnswerCount
+    FROM ComplexPostAnalysis cpa
+)
+SELECT 
+    fd.UserId,
+    fd.DisplayName,
+    fd.Reputation,
+    fd.TotalPosts,
+    fd.Questions,
+    fd.Answers,
+    fd.Comments,
+    fd.Badges,
+    fd.Votes,
+    fd.AccountAgeDays,
+    fd.ActiveDays,
+    fd.TotalScore,
+    fd.TotalViews,
+    fd.TotalAnswers,
+    fd.TotalComments,
+    fd.AvgScorePerPost,
+    fd.AvgViewsPerPost,
+    fd.AvgCommentsPerAnswer,
+    fd.AvgVotesPerPost,
+    fd.ScoreRank,
+    fd.ViewRank,
+    fd.RepRank,
+    fd.RepTier,
+    fd.ActivityTier,
+    fd.PostId,
+    fd.Title,
+    fd.PostTypeId,
+    fd.Score,
+    fd.ViewCount,
+    fd.AnswerCount,
+    fd.CommentCount,
+    fd.FavoriteCount,
+    fd.CreationDate,
+    fd.ParentId,
+    fd.Tags,
+    fd.TagCount,
+    fd.HtmlTagCount,
+    fd.WordCount,
+    fd.ScoreCategory,
+    fd.AnswerCategory,
+    fd.CommentCategory,
+    fd.TagIntensity,
+    fd.PostLength,
+    fd.PostAgeDays,
+    fd.PostType,
+    fd.WordsPerTag,
+    fd.ScorePerView,
+    fd.CommentsPerAnswer,
+    fd.DailyViews,
+    fd.ScoreRankPerType,
+    fd.PostClassification,
+    fd.UserPostPerformanceCategory,
+    fd.UserQuestionCount,
+    fd.UserAnswerCount,
+    CASE 
+        WHEN fd.Reputation < 1000 THEN 'Poor'
+        WHEN fd.Reputation BETWEEN 1000 AND 5000 THEN 'Fair'
+        WHEN fd.Reputation BETWEEN 5000 AND 10000 THEN 'Good'
+        WHEN fd.Reputation BETWEEN 10000 AND 50000 THEN 'Excellent'
+        ELSE 'Outstanding'
+    END AS RepPerformance
+FROM FinalAggregatedData fd
+WHERE fd.TotalScore > 100 
+    AND fd.TotalViews > 100
+    AND fd.AnswerCount > 0
+    AND fd.PostAgeDays BETWEEN 30 AND 365
+    AND (fd.RepTier IN ('Elite', 'Veteran') OR fd.ActivityTier IN ('Master', 'Expert'))
+    AND (fd.PostClassification LIKE '%Question%' OR fd.PostClassification LIKE '%Answer%')
+ORDER BY fd.Score DESC, fd.Reputation DESC, fd.TotalViews DESC
+OFFSET 1000 ROWS
+FETCH NEXT 1000 ROWS ONLY;

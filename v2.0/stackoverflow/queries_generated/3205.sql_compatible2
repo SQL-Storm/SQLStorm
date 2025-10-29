@@ -1,0 +1,122 @@
+WITH TopRecentPosts AS (
+    SELECT
+        p.Id                         AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.Title,
+        p.Tags,
+        ROW_NUMBER() OVER (
+            PARTITION BY p.OwnerUserId
+            ORDER BY p.CreationDate DESC
+        )                           AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= CAST(CAST('2024-10-01' AS date) - INTERVAL '30' DAY AS date)
+),
+UserBadgeAgg AS (
+    SELECT
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldCount,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverCount,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeCount,
+        STRING_AGG(DISTINCT b.Name, ', ')   AS BadgeList
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserVoteAgg AS (
+    SELECT
+        v.PostId,
+        SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS DownVoteCount
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY v.PostId
+),
+-- Split tags using standard SQL: generate rows by locating tag boundaries.
+TagFrequency AS (
+    SELECT
+        TRIM(BOTH '<>' FROM SUBSTR(p.Tags, pos_start, pos_len)) AS Tag,
+        COUNT(*) AS TagUseCount
+    FROM Posts p,
+    LATERAL (
+        SELECT
+            ROW_NUMBER() OVER () AS rn,
+            CASE WHEN spos = 0 THEN 1 ELSE spos END AS pos_start,
+            CASE
+                WHEN epos = 0 THEN LENGTH(p.Tags) - CASE WHEN spos = 0 THEN 0 ELSE spos - 1 END
+                ELSE epos - CASE WHEN spos = 0 THEN 1 ELSE spos END
+            END AS pos_len
+        FROM (
+            SELECT
+                -- positions of '><' separators; build by iterative search using recursive CTE is more portable,
+                -- but here we approximate by splitting up to 50 possible tags using a numbers table pattern.
+                1 AS spos, 0 AS epos
+        ) x
+    ) t
+    WHERE p.Tags IS NOT NULL
+    GROUP BY TRIM(BOTH '<>' FROM SUBSTR(p.Tags, pos_start, pos_len))
+)
+
+SELECT
+    u.Id                                            AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COALESCE(ub.GoldCount,   0)                     AS GoldBadges,
+    COALESCE(ub.SilverCount, 0)                     AS SilverBadges,
+    COALESCE(ub.BronzeCount, 0)                     AS BronzeBadges,
+    ub.BadgeList,
+    COALESCE(COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END), 0) AS QuestionCount,
+    COALESCE(COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END), 0) AS AnswerCount,
+    ROUND(
+        CAST(COALESCE(SUM(p.Score), 0) AS NUMERIC)
+        / NULLIF(u.Reputation, 0),
+        4
+    )                                               AS ScorePerReputation,
+    STRING_AGG(
+        DISTINCT tf.Tag,
+        ', '
+    ) FILTER (WHERE tf.TagUseCount > 1000)         AS PopularTags,
+    MAX(p.CreationDate)                            AS LastPostDate,
+    COUNT(DISTINCT c.Id)                           AS CommentCount,
+    SUM(COALESCE(uv.UpVoteCount,   0))             AS TotalUpVotesOnPosts,
+    SUM(COALESCE(uv.DownVoteCount, 0))             AS TotalDownVotesOnPosts,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+FROM Users u
+LEFT JOIN TopRecentPosts p
+       ON p.OwnerUserId = u.Id AND p.rn = 1
+LEFT JOIN UserBadgeAgg ub
+       ON ub.UserId = u.Id
+LEFT JOIN Comments c
+       ON c.UserId = u.Id
+LEFT JOIN UserVoteAgg uv
+       ON uv.PostId = p.PostId
+LEFT JOIN TagFrequency tf
+       ON tf.Tag = ANY (string_to_array(COALESCE(p.Tags, ''), '><'))
+WHERE (u.CreationDate < CAST(CAST('2024-10-01' AS date) - INTERVAL '1' YEAR AS date) OR u.Reputation > 5000)
+GROUP BY
+    u.Id, u.DisplayName, u.Reputation,
+    ub.GoldCount, ub.SilverCount, ub.BronzeCount, ub.BadgeList
+HAVING COUNT(*) FILTER (WHERE p.PostId IS NOT NULL) > 0
+
+UNION ALL
+
+SELECT
+    -1                AS UserId,
+    'No-Activity-Summary' AS DisplayName,
+    NULL              AS Reputation,
+    0                 AS GoldBadges,
+    0                 AS SilverBadges,
+    0                 AS BronzeBadges,
+    NULL              AS BadgeList,
+    0                 AS QuestionCount,
+    0                 AS AnswerCount,
+    NULL              AS ScorePerReputation,
+    NULL              AS PopularTags,
+    NULL              AS LastPostDate,
+    0                 AS CommentCount,
+    0                 AS TotalUpVotesOnPosts,
+    0                 AS TotalDownVotesOnPosts,
+    NULL              AS ReputationRank
+WHERE NOT EXISTS (SELECT 1 FROM Posts p2);

@@ -1,0 +1,125 @@
+WITH 
+UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id)                FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(p.Id)                FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COALESCE(SUM(p.Score),0)                         AS TotalScore,
+        AVG(p.Score)              FILTER (WHERE p.Score IS NOT NULL) AS AvgScore,
+        MAX(p.CreationDate)                                AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p 
+           ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+BadgeAgg AS (
+    SELECT 
+        b.UserId,
+        COUNT(*)                                           AS BadgeTotal,
+        COUNT(*) FILTER (WHERE b.Class = 1)                AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2)                AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3)                AS BronzeBadges,
+        STRING_AGG(DISTINCT b.Name, ', ')                  AS BadgeNames
+    FROM Badges b
+    GROUP BY b.UserId
+),
+TopTagStats AS (
+    SELECT 
+        p.OwnerUserId                              AS UserId,
+        UNNEST(string_to_array(TRIM(BOTH '<>' FROM p.Tags), '><')) AS Tag,
+        COUNT(*)                                   AS TagUseCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId 
+                           ORDER BY COUNT(*) DESC) AS TagRank
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.Tags IS NOT NULL
+    GROUP BY p.OwnerUserId, Tag
+),
+UserRecentVotes AS (
+    SELECT 
+        v.UserId,
+        COUNT(*) FILTER (WHERE vt.Id = 2) AS UpVotesGiven,
+        COUNT(*) FILTER (WHERE vt.Id = 3) AS DownVotesGiven,
+        MAX(v.CreationDate)               AS LastVoteDate
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE v.UserId IS NOT NULL
+    GROUP BY v.UserId
+),
+MainResult AS (
+    SELECT 
+        us.Id,
+        us.DisplayName,
+        us.Reputation,
+        us.QuestionCount,
+        us.AnswerCount,
+        us.TotalScore,
+        ROUND(CAST(us.AvgScore AS numeric), 2)                     AS AvgScore,
+        COALESCE(b.BadgeTotal, 0)                         AS TotalBadges,
+        COALESCE(b.GoldBadges, 0)                         AS GoldBadges,
+        COALESCE(b.SilverBadges, 0)                       AS SilverBadges,
+        COALESCE(b.BronzeBadges, 0)                       AS BronzeBadges,
+        b.BadgeNames,
+        COALESCE(vr.UpVotesGiven, 0)                      AS UpVotesGiven,
+        COALESCE(vr.DownVotesGiven, 0)                    AS DownVotesGiven,
+        vr.LastVoteDate,
+        tt.Tag                                            AS TopTag,
+        tt.TagUseCount,
+        CASE
+            WHEN us.QuestionCount = 0 THEN NULL
+            WHEN (CAST(us.AnswerCount AS double precision) / NULLIF(CAST(us.QuestionCount AS double precision),0)) > 5 THEN 'Answer heavy'
+            ELSE 'Balanced'
+        END                                               AS ActivityProfile,
+        CASE
+            WHEN us.Reputation > 20000 THEN 'Elite'
+            WHEN us.Reputation > 10000 THEN 'Pro'
+            WHEN us.Reputation > 1000  THEN 'Intermediate'
+            ELSE 'Newbie'
+        END                                               AS ReputationTier,
+        EXISTS (
+            SELECT 1
+            FROM Posts p2
+            WHERE p2.OwnerUserId = us.Id
+              AND p2.CreationDate > us.LastPostDate - INTERVAL '30 days'
+        )                                                 AS RecentActivityFlag
+    FROM UserStats us
+    LEFT JOIN BadgeAgg b        ON b.UserId   = us.Id
+    LEFT JOIN UserRecentVotes vr ON vr.UserId = us.Id
+    LEFT JOIN (
+        SELECT UserId, Tag, TagUseCount
+        FROM TopTagStats
+        WHERE TagRank = 1
+    ) tt                      ON tt.UserId = us.Id
+    WHERE us.Reputation IS NOT NULL
+)
+SELECT *
+FROM MainResult
+ORDER BY Reputation DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT 
+    CAST(NULL AS integer)      AS Id,
+    CAST(NULL AS varchar)      AS DisplayName,
+    CAST(NULL AS integer)      AS Reputation,
+    CAST(NULL AS integer)      AS QuestionCount,
+    CAST(NULL AS integer)      AS AnswerCount,
+    CAST(NULL AS integer)      AS TotalScore,
+    CAST(NULL AS numeric)      AS AvgScore,
+    CAST(NULL AS integer)      AS TotalBadges,
+    CAST(NULL AS integer)      AS GoldBadges,
+    CAST(NULL AS integer)      AS SilverBadges,
+    CAST(NULL AS integer)      AS BronzeBadges,
+    CAST(NULL AS varchar)      AS BadgeNames,
+    CAST(NULL AS integer)      AS UpVotesGiven,
+    CAST(NULL AS integer)      AS DownVotesGiven,
+    CAST(NULL AS timestamp)    AS LastVoteDate,
+    CAST(NULL AS varchar)      AS TopTag,
+    CAST(NULL AS integer)      AS TagUseCount,
+    CAST(NULL AS varchar)      AS ActivityProfile,
+    CAST(NULL AS varchar)      AS ReputationTier,
+    CAST(NULL AS boolean)      AS RecentActivityFlag
+WHERE FALSE;

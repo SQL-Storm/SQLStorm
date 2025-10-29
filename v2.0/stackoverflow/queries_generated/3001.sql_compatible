@@ -1,0 +1,191 @@
+WITH RecentQuestions AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.Title,
+        TRIM(BOTH '<>' FROM p.Tags) AS TagsRaw,
+        -- split tags into rows using a recursive split for portability
+        NULL::text AS Tag -- placeholder column to be populated in splitter below
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '30' DAY
+),
+RecentQuestionsSplit AS (
+    -- portable splitter: iterate over tags by position
+    SELECT
+        rq.Id,
+        rq.OwnerUserId,
+        rq.CreationDate,
+        rq.Score,
+        rq.Title,
+        CASE
+          WHEN pos = 1 THEN
+            CASE WHEN instr = 0 THEN rq.TagsRaw
+                 ELSE SUBSTRING(rq.TagsRaw FROM 1 FOR instr-1)
+            END
+          ELSE
+            CASE WHEN instr = 0 THEN NULL
+                 ELSE SUBSTRING(rq.TagsRaw FROM prev_instr+2 FOR instr - prev_instr - 2)
+            END
+        END AS Tag
+    FROM (
+      SELECT
+        rq.*,
+        generate_series.pos,
+        -- positions of separators '><' - emulate using a numbers table via recursive CTE
+        NULL::integer AS instr,
+        NULL::integer AS prev_instr
+      FROM RecentQuestions rq
+      JOIN (
+        -- generate positions 1..20 (assume max 20 tags per post)
+        SELECT 1 AS pos UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5
+        UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9 UNION ALL SELECT 10
+        UNION ALL SELECT 11 UNION ALL SELECT 12 UNION ALL SELECT 13 UNION ALL SELECT 14 UNION ALL SELECT 15
+        UNION ALL SELECT 16 UNION ALL SELECT 17 UNION ALL SELECT 18 UNION ALL SELECT 19 UNION ALL SELECT 20
+      ) AS generate_series(pos)
+    ) sub
+    CROSS JOIN LATERAL (
+      -- compute instr and prev_instr using repeated searches
+      SELECT
+        (
+          CASE
+            WHEN sub.pos = 1 THEN POSITION('><' IN sub.TagsRaw)
+            ELSE 0
+          END
+        ) AS instr_calc,
+        0 AS prev_instr_calc
+    ) calc
+    -- Note: Because SQL dialects differ for robust string-splitting, if your engine supports UNNEST/STRING_TO_ARRAY use that instead.
+), 
+-- Fallback simpler splitter for engines supporting regexp_split_to_table or UNNEST:
+RecentQuestionsFinal AS (
+    SELECT
+        rq.Id,
+        rq.OwnerUserId,
+        rq.CreationDate,
+        rq.Score,
+        rq.Title,
+        TRIM(t.Tag) AS Tag
+    FROM RecentQuestions rq
+    -- Prefer database-specific splitter; attempt common methods in order:
+    LEFT JOIN LATERAL (
+      SELECT value AS Tag FROM (
+        -- PostgreSQL style
+        SELECT regexp_split_to_table(rq.TagsRaw, E'\\><') AS value
+      ) s
+    ) t ON TRUE
+),
+TagStats AS (
+    SELECT
+        Tag,
+        COUNT(*)                              AS QuestionCount,
+        AVG(Score)                            AS AvgScore,
+        MAX(CreationDate)                     AS LatestQuestion
+    FROM RecentQuestionsFinal
+    GROUP BY Tag
+    HAVING COUNT(*) > 10
+),
+UserActivity AS (
+    SELECT
+        u.Id                                              AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END),0) AS QuestionCount,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END),0) AS AnswerCount,
+        COALESCE(SUM(COALESCE(p.Score,0)),0)                           AS TotalPostScore,
+        COALESCE(COUNT(b.Id),0)                            AS BadgeCount,
+        MAX(p.CreationDate)                               AS LastPostDate,
+        MAX(v.CreationDate)                               AS LastVoteDate
+    FROM Users u
+    LEFT JOIN Posts   p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges  b ON b.UserId      = u.Id
+    LEFT JOIN Votes   v ON v.UserId      = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+UserRecentVotes AS (
+    SELECT
+        u.Id                                                       AS UserId,
+        SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END)                  AS UpVotesGiven,
+        SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END)                  AS DownVotesGiven,
+        SUM(CASE WHEN vt.Id = 5 THEN 1 ELSE 0 END)                  AS FavoritesGiven
+    FROM Users u
+    JOIN Votes v   ON v.UserId = u.Id
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE v.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '90' DAY
+    GROUP BY u.Id
+),
+TopUsers AS (
+    SELECT
+        ua.*,
+        ROW_NUMBER() OVER (ORDER BY ua.Reputation DESC, ua.TotalPostScore DESC) AS ReputationRank,
+        COALESCE(urv.UpVotesGiven,0) - COALESCE(urv.DownVotesGiven,0)           AS NetVotesGiven
+    FROM UserActivity ua
+    LEFT JOIN UserRecentVotes urv ON urv.UserId = ua.UserId
+    WHERE ua.Reputation >= 1000
+),
+UserTags AS (
+    -- derive tags per user (up to 5 recent question tags) in a portable way
+    SELECT DISTINCT
+        p.OwnerUserId AS UserId,
+        TRIM(t.value) AS Tag
+    FROM Posts p
+    CROSS JOIN LATERAL (
+      SELECT regexp_split_to_table(TRIM(BOTH '<>' FROM p.Tags), E'\\><') AS value
+    ) t
+    WHERE p.PostTypeId = 1
+)
+SELECT
+    tu.UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.ReputationRank,
+    tu.QuestionCount,
+    tu.AnswerCount,
+    tu.TotalPostScore,
+    tu.BadgeCount,
+    tu.LastPostDate,
+    tu.LastVoteDate,
+    tu.NetVotesGiven,
+    CASE
+        WHEN tu.BadgeCount >= 10                      THEN 'PowerUser'
+        WHEN tu.QuestionCount > tu.AnswerCount       THEN 'QuestionHeavy'
+        ELSE 'Balanced'
+    END                                          AS UserCategory,
+    COALESCE(ts.AvgScore,0)                      AS RecentTagAvgScore,
+    ts.QuestionCount                            AS RecentTagQuestionCount,
+    STRING_AGG(DISTINCT ts.Tag, ', ') FILTER (WHERE ts.QuestionCount > 20) AS PopularRecentTags
+FROM TopUsers tu
+LEFT JOIN TagStats ts
+       ON ts.Tag IN (
+              SELECT Tag FROM UserTags ut WHERE ut.UserId = tu.UserId LIMIT 5
+          )
+GROUP BY
+    tu.UserId, tu.DisplayName, tu.Reputation, tu.ReputationRank,
+    tu.QuestionCount, tu.AnswerCount, tu.TotalPostScore, tu.BadgeCount,
+    tu.LastPostDate, tu.LastVoteDate, tu.NetVotesGiven,
+    ts.AvgScore, ts.QuestionCount, ts.Tag
+
+UNION ALL
+
+SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    NULL::integer,
+    0,
+    0,
+    0,
+    COALESCE(COUNT(b.Id),0),
+    NULL,
+    NULL,
+    0,
+    'NoPosts'               AS UserCategory,
+    NULL,
+    NULL,
+    NULL
+FROM Users u
+LEFT JOIN Badges b ON b.UserId = u.Id
+WHERE NOT EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id)
+GROUP BY u.Id, u.DisplayName, u.Reputation;

@@ -1,0 +1,233 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) as RepRank,
+        DENSE_RANK() OVER (ORDER BY u.Views DESC) as ViewRank,
+        NTILE(4) OVER (ORDER BY u.Reputation DESC) as Quartile
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.AccountId IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        PostCount,
+        CommentCount,
+        BadgeCount,
+        QuestionCount,
+        AnswerCount,
+        RepRank,
+        ViewRank,
+        Quartile,
+        CASE 
+            WHEN Reputation > 100000 THEN 'Elite'
+            WHEN Reputation > 10000 THEN 'Veteran'
+            WHEN Reputation > 1000 THEN 'Regular'
+            ELSE 'Newbie'
+        END as UserTier,
+        CASE 
+            WHEN PostCount > 1000 THEN 'Active'
+            WHEN PostCount > 100 THEN 'Moderate'
+            WHEN PostCount > 10 THEN 'Casual'
+            ELSE 'Inactive'
+        END as ActivityLevel
+    FROM UserActivityStats
+    WHERE PostCount > 0 OR CommentCount > 0 OR BadgeCount > 0
+),
+PostMetrics AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        p.ParentId,
+        p.AcceptedAnswerId,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN 'Question with Answers'
+            WHEN p.PostTypeId = 1 THEN 'Question without Answers'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as PostCategory,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as UserPostRank,
+        RANK() OVER (ORDER BY p.Score DESC) as ScoreRank,
+        DENSE_RANK() OVER (ORDER BY p.ViewCount DESC) as ViewRank,
+        PERCENT_RANK() OVER (ORDER BY p.Score) as ScorePercentile,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as AvgUserScore,
+        COALESCE(p.Tags, '') as CleanTags
+    FROM Posts p
+    WHERE p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2' YEAR)
+),
+TagAnalysis AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            WHEN t.Count > 10 THEN 'Niche'
+            ELSE 'Obscure'
+        END as TagPopularity,
+        CASE 
+            WHEN t.Count > 1000 AND (CASE WHEN t.IsRequired THEN 1 ELSE 0 END) = 1 THEN 'Highly Important'
+            WHEN t.Count > 100 AND (CASE WHEN t.IsRequired THEN 1 ELSE 0 END) = 1 THEN 'Important'
+            WHEN t.Count > 1000 AND (CASE WHEN t.IsModeratorOnly THEN 1 ELSE 0 END) = 1 THEN 'Moderator Only'
+            ELSE 'General'
+        END as TagClassification
+    FROM Tags t
+    WHERE t.Count > 0
+),
+QuestionComplexity AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        CASE 
+            WHEN COALESCE(p.Tags, '') LIKE '%<%' AND COALESCE(p.Tags, '') LIKE '%>%' THEN 
+                (CHAR_LENGTH(p.Tags) - CHAR_LENGTH(REPLACE(p.Tags, '<', '')) - CHAR_LENGTH(REPLACE(p.Tags, '>', ''))) / 2
+            ELSE 0
+        END as TagCount,
+        CASE 
+            WHEN p.AnswerCount > 5 AND p.Score > 10 THEN 'Highly Engaging'
+            WHEN p.AnswerCount > 2 AND p.Score > 5 THEN 'Engaging'
+            WHEN p.AnswerCount = 0 AND p.Score > 0 THEN 'Unanswered'
+            ELSE 'Low Engagement'
+        END as EngagementLevel,
+        CASE WHEN p.Score > 10 THEN 1 ELSE 0 END as IsHighlyScored,
+        CASE WHEN p.ViewCount > 1000 THEN 1 ELSE 0 END as IsHighlyViewed
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+UserPerformance AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        SUM(p.Score) as TotalScore,
+        AVG(p.Score) as AvgScore,
+        SUM(p.ViewCount) as TotalViews,
+        AVG(p.ViewCount) as AvgViews,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) as MedianScore,
+        STRING_AGG(COALESCE(p.Tags, ''), ', ') as AllTags,
+        MAX(p.CreationDate) as LastActive,
+        CASE WHEN u.Views > 500000 THEN 'Elite Contributor' ELSE 'Regular Contributor' END as ContributionTier
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.AccountId IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+)
+SELECT 
+    tu.UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.PostCount,
+    tu.CommentCount,
+    tu.BadgeCount,
+    tu.QuestionCount,
+    tu.AnswerCount,
+    tu.RepRank,
+    tu.ViewRank,
+    tu.Quartile,
+    tu.UserTier,
+    tu.ActivityLevel,
+    pm.PostId,
+    pm.Title,
+    pm.Score,
+    pm.ViewCount,
+    pm.AnswerCount as PostAnswerCount,
+    pm.CommentCount as PostCommentCount,
+    pm.FavoriteCount,
+    pm.CreationDate as PostCreationDate,
+    pm.PostCategory,
+    pm.UserPostRank,
+    pm.ScoreRank,
+    pm.ViewRank as PostViewRank,
+    pm.ScorePercentile,
+    pm.AvgUserScore,
+    pa.TagName,
+    pa.Count as TagCount,
+    pa.TagPopularity,
+    pa.TagClassification,
+    qc.TagCount as QuestionTagCount,
+    qc.EngagementLevel,
+    qc.IsHighlyScored,
+    qc.IsHighlyViewed,
+    up.TotalPosts,
+    up.Questions,
+    up.Answers,
+    up.TotalScore,
+    up.AvgScore,
+    up.TotalViews,
+    up.AvgViews,
+    up.MedianScore,
+    up.AllTags,
+    up.LastActive,
+    up.ContributionTier,
+    CASE 
+        WHEN tu.Reputation > 50000 AND tu.QuestionCount > 100 AND tu.AnswerCount > 500 THEN 'Top Performer'
+        WHEN tu.Reputation > 10000 AND tu.QuestionCount > 50 THEN 'Mid Performer'
+        WHEN tu.Reputation > 1000 THEN 'New Performer'
+        ELSE 'Novice'
+    END as PerformanceLevel,
+    CASE 
+        WHEN up.AvgScore > 10 AND up.AvgViews > 1000 THEN 'High Quality Contributor'
+        WHEN up.AvgScore > 5 AND up.AvgViews > 500 THEN 'Moderate Contributor'
+        WHEN up.AvgScore > 0 AND up.AvgViews > 100 THEN 'Low Quality Contributor'
+        ELSE 'Inactive Contributor'
+    END as QualityAssessment,
+    ROW_NUMBER() OVER (ORDER BY tu.Reputation DESC, tu.PostCount DESC) as OverallRank,
+    RANK() OVER (PARTITION BY tu.Quartile ORDER BY tu.Reputation DESC) as QuartileRank,
+    DENSE_RANK() OVER (PARTITION BY tu.UserTier ORDER BY tu.Reputation DESC) as TierRank
+FROM TopUsers tu
+LEFT JOIN PostMetrics pm ON tu.UserId = pm.OwnerUserId
+LEFT JOIN TagAnalysis pa ON pa.TagName = SUBSTRING(pm.CleanTags FROM 2 FOR (CHAR_LENGTH(pm.CleanTags) - 2))
+LEFT JOIN QuestionComplexity qc ON pm.PostId = qc.Id
+LEFT JOIN UserPerformance up ON tu.UserId = up.UserId
+WHERE pm.PostId IS NOT NULL OR pa.Id IS NOT NULL OR qc.Id IS NOT NULL
+GROUP BY
+    tu.UserId, tu.DisplayName, tu.Reputation, tu.PostCount, tu.CommentCount, tu.BadgeCount, tu.QuestionCount, tu.AnswerCount, tu.RepRank, tu.ViewRank, tu.Quartile, tu.UserTier, tu.ActivityLevel,
+    pm.PostId, pm.Title, pm.Score, pm.ViewCount, pm.AnswerCount, pm.CommentCount, pm.FavoriteCount, pm.CreationDate, pm.PostCategory, pm.UserPostRank, pm.ScoreRank, pm.ViewRank, pm.ScorePercentile, pm.AvgUserScore, pm.CleanTags,
+    pa.TagName, pa.Count, pa.TagPopularity, pa.TagClassification, pa.Id,
+    qc.Id, qc.TagCount, qc.EngagementLevel, qc.IsHighlyScored, qc.IsHighlyViewed,
+    up.UserId, up.TotalPosts, up.Questions, up.Answers, up.TotalScore, up.AvgScore, up.TotalViews, up.AvgViews, up.MedianScore, up.AllTags, up.LastActive, up.ContributionTier
+ORDER BY tu.Reputation DESC, tu.PostCount DESC, pm.CreationDate DESC
+OFFSET 100 ROWS
+FETCH NEXT 1000 ROWS ONLY;

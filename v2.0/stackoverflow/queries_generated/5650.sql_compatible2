@@ -1,0 +1,136 @@
+WITH
+RecentHot AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.OwnerDisplayName,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.PostTypeId,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate DESC, p.Score DESC) AS rn_owner
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId = 1
+    AND p.ClosedDate IS NULL
+),
+TopTags AS (
+  SELECT
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId,
+    t.WikiPostId,
+    t.IsModeratorOnly,
+    t.IsRequired
+  FROM Tags t
+  WHERE t.IsModeratorOnly = FALSE
+),
+ActiveUsers AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.ProfileImageUrl,
+    u.EmailHash,
+    u.AccountId
+  FROM Users u
+  WHERE u.LastAccessDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '180' DAY
+),
+Combined AS (
+  SELECT
+    rh.PostId,
+    rh.Title,
+    rh.Tags,
+    rh.CreationDate,
+    rh.LastActivityDate,
+    rh.Score,
+    rh.ViewCount,
+    rh.OwnerUserId,
+    ru.UserId AS ActiveUserId,
+    ru.DisplayName AS ActiveDisplayName,
+    rh.CommentCount,
+    rh.AnswerCount,
+    rh.FavoriteCount,
+    rh.PostTypeId,
+    rh.rn_owner,
+    EXISTS (
+      SELECT 1
+      FROM PostLinks pl
+      WHERE pl.PostId = rh.PostId AND pl.RelatedPostId = rh.PostId + 1
+    ) AS SelfLinked
+  FROM RecentHot rh
+  LEFT JOIN ActiveUsers ru ON rh.OwnerUserId = ru.UserId
+  WHERE rh.rn_owner = 1
+),
+StatWindow AS (
+  SELECT
+    c.PostId,
+    c.Title,
+    c.OwnerUserId,
+    c.LastActivityDate,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesFromPost,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesFromPost,
+    AVG(v.BountyAmount) FILTER (WHERE v.BountyAmount IS NOT NULL) AS AvgBounty,
+    COUNT(DISTINCT co.Id) AS CommentCountAll,
+    COUNT(DISTINCT pa.Id) AS AnswerCountAll
+  FROM Combined c
+  LEFT JOIN Votes v ON v.PostId = c.PostId
+  LEFT JOIN Comments co ON co.PostId = c.PostId
+  LEFT JOIN Posts pa ON pa.ParentId = c.PostId
+  GROUP BY c.PostId, c.Title, c.OwnerUserId, c.LastActivityDate
+),
+Final AS (
+  SELECT
+    s.PostId,
+    s.Title,
+    s.OwnerUserId,
+    s.LastActivityDate,
+    s.UpVotesFromPost,
+    s.DownVotesFromPost,
+    s.AvgBounty,
+    s.CommentCountAll,
+    s.AnswerCountAll,
+    /* bring ActiveUserId and ActiveDisplayName into this level by joining back to Combined */
+    c.ActiveUserId,
+    c.ActiveDisplayName,
+    ROW_NUMBER() OVER (ORDER BY s.LastActivityDate DESC, (s.UpVotesFromPost - s.DownVotesFromPost) DESC) AS rn_final
+  FROM StatWindow s
+  LEFT JOIN Combined c ON s.PostId = c.PostId
+)
+SELECT
+  f.PostId,
+  f.Title,
+  f.OwnerUserId,
+  f.LastActivityDate,
+  f.UpVotesFromPost,
+  f.DownVotesFromPost,
+  f.AvgBounty,
+  f.CommentCountAll,
+  f.AnswerCountAll,
+  f.ActiveUserId,
+  f.ActiveDisplayName,
+  (SELECT STRING_AGG(u.DisplayName || ' (' || CAST(u.Reputation AS VARCHAR) || ')', ' | ')
+   FROM Users u
+   WHERE u.Id = f.OwnerUserId) AS OwnerProfileSummary,
+  (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = f.PostId) AS LinkCount,
+  (SELECT ARRAY_AGG(t.TagName) FROM Tags t WHERE t.Id IN (
+        SELECT CAST(tag AS INTEGER)
+        FROM UNNEST(string_to_array(f.Tags, '>')) AS tag
+  )) AS TagArray,
+  f.rn_final
+FROM Final f
+WHERE f.rn_final = 1
+ORDER BY f.LastActivityDate DESC, f.UpVotesFromPost DESC
+LIMIT 50;

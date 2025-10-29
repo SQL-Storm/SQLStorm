@@ -1,0 +1,160 @@
+WITH 
+UserPosts AS (
+    SELECT 
+        u.Id                                   AS UserId,
+        u.DisplayName,
+        COUNT(p.Id)                            AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS Questions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS Answers,
+        AVG(p.Score)                           AS AvgScore,
+        MAX(p.CreationDate)                    AS LastPostDate,
+        MIN(p.CreationDate)                    AS FirstPostDate,
+        COUNT(DISTINCT p.Tags)                 AS DistinctTagSets
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+UserTagStats AS (
+    SELECT 
+        up.UserId,
+        t.Tag,
+        COUNT(*)                               AS TagUsageCount,
+        ROW_NUMBER() OVER (PARTITION BY up.UserId ORDER BY COUNT(*) DESC) AS TagRank
+    FROM UserPosts up
+    JOIN Posts p ON p.OwnerUserId = up.UserId AND p.PostTypeId = 1 AND p.Tags IS NOT NULL
+    CROSS JOIN LATERAL (
+        SELECT UNNEST(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS Tag
+    ) t
+    GROUP BY up.UserId, t.Tag
+),
+RecentVotes AS (
+    SELECT 
+        v.UserId,
+        v.PostId,
+        vt.Name                                 AS VoteType,
+        v.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY v.UserId ORDER BY v.CreationDate DESC) AS rn
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE v.UserId IS NOT NULL
+),
+UserRecentVotes AS (
+    SELECT 
+        rv.UserId,
+        STRING_AGG(
+            (vt.Name || ' on Post ' || rv.PostId || ' at ' || TO_CHAR(rv.CreationDate, 'YYYY-MM-DD HH24:MI')),
+            '; '
+        ) AS RecentVoteLog
+    FROM RecentVotes rv
+    JOIN VoteTypes vt ON vt.Id = (SELECT v2.VoteTypeId FROM Votes v2 WHERE v2.Id = rv.PostId LIMIT 1)
+    WHERE rv.rn <= 5
+    GROUP BY rv.UserId
+),
+UserBadgeStats AS (
+    SELECT 
+        b.UserId,
+        COUNT(*)                                 AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        STRING_AGG(DISTINCT b.Name, ', ')        AS BadgeList
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UsersNoPosts AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName
+    FROM Users u
+    WHERE NOT EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id)
+),
+CombinedUserStats AS (
+    SELECT 
+        up.UserId,
+        up.DisplayName,
+        up.TotalPosts,
+        up.Questions,
+        up.Answers,
+        ROUND(CAST(up.AvgScore AS NUMERIC),2)                AS AvgScore,
+        up.LastPostDate,
+        up.FirstPostDate,
+        up.DistinctTagSets,
+        COALESCE(ub.TotalBadges,0)          AS TotalBadges,
+        COALESCE(ub.GoldBadges,0)           AS GoldBadges,
+        COALESCE(ub.SilverBadges,0)         AS SilverBadges,
+        COALESCE(ub.BronzeBadges,0)         AS BronzeBadges,
+        COALESCE(ub.BadgeList,'')           AS BadgeList,
+        COALESCE(urv.RecentVoteLog,'')      AS RecentVoteLog,
+        STRING_AGG((uts.Tag || ':' || uts.TagUsageCount), ', ' ORDER BY uts.Tag || uts.TagUsageCount) 
+            FILTER (WHERE uts.TagRank <= 3) AS TopTags
+    FROM UserPosts up
+    LEFT JOIN UserBadgeStats ub ON ub.UserId = up.UserId
+    LEFT JOIN UserRecentVotes urv ON urv.UserId = up.UserId
+    LEFT JOIN UserTagStats uts ON uts.UserId = up.UserId
+    GROUP BY 
+        up.UserId, up.DisplayName, up.TotalPosts, up.Questions, up.Answers,
+        up.AvgScore, up.LastPostDate, up.FirstPostDate, up.DistinctTagSets,
+        ub.TotalBadges, ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges,
+        ub.BadgeList, urv.RecentVoteLog
+),
+AllUserMetrics AS (
+    SELECT *
+    FROM CombinedUserStats
+
+    UNION ALL
+
+    SELECT
+        unp.UserId,
+        unp.DisplayName,
+        0                                   AS TotalPosts,
+        0                                   AS Questions,
+        0                                   AS Answers,
+        NULL                                AS AvgScore,
+        NULL                                AS LastPostDate,
+        NULL                                AS FirstPostDate,
+        0                                   AS DistinctTagSets,
+        0                                   AS TotalBadges,
+        0                                   AS GoldBadges,
+        0                                   AS SilverBadges,
+        0                                   AS BronzeBadges,
+        ''                                  AS BadgeList,
+        ''                                  AS RecentVoteLog,
+        ''                                  AS TopTags
+    FROM UsersNoPosts unp
+),
+RankedUsers AS (
+    SELECT 
+        a.*,
+        ROW_NUMBER() OVER (ORDER BY a.TotalPosts DESC, u.Reputation DESC) AS RankByActivity,
+        PERCENT_RANK() OVER (ORDER BY a.TotalPosts)                         AS PostPctRank,
+        COALESCE(a.AvgScore,0) - (SELECT AVG(COALESCE(TotalPosts,0)) FROM AllUserMetrics) AS ScoreDeviation
+    FROM AllUserMetrics a
+    LEFT JOIN Users u ON u.Id = a.UserId
+)
+
+SELECT 
+    ru.RankByActivity,
+    ru.UserId,
+    ru.DisplayName,
+    ru.TotalPosts,
+    ru.Questions,
+    ru.Answers,
+    ru.AvgScore,
+    ru.TotalBadges,
+    ru.GoldBadges,
+    ru.SilverBadges,
+    ru.BronzeBadges,
+    ru.BadgeList,
+    ru.RecentVoteLog,
+    ru.TopTags,
+    ru.PostPctRank,
+    ru.ScoreDeviation,
+    CASE 
+        WHEN ru.TotalPosts = 0 THEN 'Inactive'
+        WHEN ru.TotalPosts BETWEEN 1 AND 10 THEN 'Low Activity'
+        WHEN ru.TotalPosts BETWEEN 11 AND 100 THEN 'Medium Activity'
+        ELSE 'High Activity'
+    END AS ActivityLevel
+FROM RankedUsers ru
+ORDER BY ru.RankByActivity
+LIMIT 100;

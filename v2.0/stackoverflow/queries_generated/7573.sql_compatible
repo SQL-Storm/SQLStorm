@@ -1,0 +1,415 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COUNT(DISTINCT ph.Id) as HistoryCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        MAX(b.Date) as LastBadgeDate,
+        MAX(ph.CreationDate) as LastHistoryDate,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - MAX(p.CreationDate))) / 86400.0 AS DaysSinceLastPost,
+        ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) as PostRank,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) as ReputationRank,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 100 THEN 'Elite'
+            WHEN COUNT(DISTINCT p.Id) > 50 THEN 'Advanced'
+            WHEN COUNT(DISTINCT p.Id) > 10 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as UserLevel,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        COALESCE(AVG(p.Score), 0) as AvgScore,
+        COALESCE(SUM(p.ViewCount), 0) as TotalViews,
+        COALESCE(SUM(p.AnswerCount), 0) as TotalAnswers,
+        COALESCE(SUM(p.CommentCount), 0) as TotalComments
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        PostCount,
+        CommentCount,
+        BadgeCount,
+        HistoryCount,
+        LastPostDate,
+        LastCommentDate,
+        LastBadgeDate,
+        LastHistoryDate,
+        DaysSinceLastPost,
+        PostRank,
+        ReputationRank,
+        UserLevel,
+        TotalScore,
+        AvgScore,
+        TotalViews,
+        TotalAnswers,
+        TotalComments,
+        RANK() OVER (ORDER BY TotalScore DESC) as ScoreRank,
+        RANK() OVER (ORDER BY TotalViews DESC) as ViewRank,
+        RANK() OVER (ORDER BY PostCount DESC) as PostRankOverall
+    FROM UserActivityStats
+    WHERE PostCount > 0
+),
+PostPerformance AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.OwnerDisplayName,
+        p.LastActivityDate,
+        p.Tags,
+        p.PostTypeId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END as PostType,
+        CASE 
+            WHEN p.ViewCount > 1000 THEN 'High'
+            WHEN p.ViewCount > 100 THEN 'Medium'
+            WHEN p.ViewCount > 10 THEN 'Low'
+            ELSE 'Very Low'
+        END as ViewLevel,
+        CASE 
+            WHEN p.Score > 50 THEN 'Very Popular'
+            WHEN p.Score > 20 THEN 'Popular'
+            WHEN p.Score > 5 THEN 'Moderate'
+            ELSE 'Low'
+        END as Popularity,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - p.CreationDate)) / 86400.0 AS AgeInDays,
+        EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate)) / 86400.0 AS ActivityDuration,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - p.LastActivityDate)) / 86400.0 AS DaysSinceLastActivity,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PrevScore,
+        LAG(p.ViewCount, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PrevViews,
+        LEAD(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as NextScore,
+        LEAD(p.ViewCount, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as NextViews,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as AvgScorePerUser,
+        AVG(p.ViewCount) OVER (PARTITION BY p.OwnerUserId) as AvgViewsPerUser,
+        SUM(p.Score) OVER (PARTITION BY p.OwnerUserId) as TotalScorePerUser,
+        SUM(p.ViewCount) OVER (PARTITION BY p.OwnerUserId) as TotalViewsPerUser,
+        NTILE(4) OVER (ORDER BY p.Score) as ScoreQuartile,
+        NTILE(4) OVER (ORDER BY p.ViewCount) as ViewQuartile
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) -- Questions and Answers
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Trending'
+            WHEN t.Count > 500 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            ELSE 'Niche'
+        END as TagPopularity,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as TagRank,
+        LAG(t.Count, 1) OVER (ORDER BY t.Count DESC) as PrevTagCount,
+        LAG(t.Count, 2) OVER (ORDER BY t.Count DESC) as PrevPrevTagCount,
+        LAG(t.Count, 10) OVER (ORDER BY t.Count DESC) as PrevTenTagCount,
+        AVG(t.Count) OVER (ORDER BY t.Count) as AvgTagCount,
+        PERCENT_RANK() OVER (ORDER BY t.Count) as PercentileRank,
+        RANK() OVER (ORDER BY t.Count DESC) as RankInPopularity,
+        DENSE_RANK() OVER (ORDER BY t.Count DESC) as DenseRankInPopularity
+    FROM Tags t
+    WHERE t.TagName IS NOT NULL AND t.TagName != ''
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        pp.PostId,
+        pp.Title,
+        pp.Score,
+        pp.ViewCount,
+        pp.AnswerCount,
+        pp.CommentCount,
+        pp.FavoriteCount,
+        pp.CreationDate,
+        pp.OwnerUserId,
+        pp.OwnerDisplayName,
+        pp.LastActivityDate,
+        pp.Tags,
+        pp.PostType,
+        pp.ViewLevel,
+        pp.Popularity,
+        pp.AgeInDays,
+        pp.ActivityDuration,
+        pp.DaysSinceLastActivity,
+        pp.PrevScore,
+        pp.PrevViews,
+        pp.NextScore,
+        pp.NextViews,
+        pp.AvgScorePerUser,
+        pp.AvgViewsPerUser,
+        pp.TotalScorePerUser,
+        pp.TotalViewsPerUser,
+        pp.ScoreQuartile,
+        pp.ViewQuartile,
+        CASE 
+            WHEN pp.Score > pp.PrevScore AND pp.ViewCount > pp.PrevViews THEN 'Improving'
+            WHEN pp.Score < pp.PrevScore AND pp.ViewCount < pp.PrevViews THEN 'Declining'
+            WHEN pp.Score > pp.PrevScore OR pp.ViewCount > pp.PrevViews THEN 'Growing'
+            ELSE 'Stable'
+        END as TrendStatus,
+        CASE 
+            WHEN pp.ViewCount >= 1000 AND pp.Score >= 20 THEN 'High Impact'
+            WHEN pp.ViewCount >= 500 AND pp.Score >= 10 THEN 'Medium Impact'
+            WHEN pp.ViewCount >= 100 AND pp.Score >= 5 THEN 'Low Impact'
+            ELSE 'Limited Impact'
+        END as ImpactLevel,
+        CASE 
+            WHEN pp.AgeInDays < 30 THEN 'New'
+            WHEN pp.AgeInDays < 90 THEN 'Recent'
+            WHEN pp.AgeInDays < 365 THEN 'Old'
+            ELSE 'Legacy'
+        END as AgeCategory,
+        CASE 
+            WHEN pp.DaysSinceLastActivity < 1 THEN 'Active Now'
+            WHEN pp.DaysSinceLastActivity < 7 THEN 'Recently Active'
+            WHEN pp.DaysSinceLastActivity < 30 THEN 'Inactive'
+            ELSE 'Very Inactive'
+        END as ActivityStatus,
+        ROW_NUMBER() OVER (ORDER BY pp.Score DESC) as ScoreRanking,
+        ROW_NUMBER() OVER (ORDER BY pp.ViewCount DESC) as ViewRanking,
+        ROW_NUMBER() OVER (ORDER BY pp.AnswerCount DESC) as AnswerRanking,
+        ROW_NUMBER() OVER (ORDER BY pp.CommentCount DESC) as CommentRanking,
+        ROW_NUMBER() OVER (ORDER BY pp.FavoriteCount DESC) as FavoriteRanking
+    FROM PostPerformance pp
+),
+TaggedPosts AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Tags,
+        tag_array.TagName,
+        ta.TagCount,
+        ta.TagPopularity,
+        CASE 
+            WHEN ta.TagName IN (
+                SELECT TagName 
+                FROM TagAnalysis 
+                WHERE TagPopularity IN ('Trending', 'Popular')
+            ) THEN 1 
+            ELSE 0 
+        END as IsPopularTag,
+        CASE 
+            WHEN ta.TagName IN (
+                SELECT TagName 
+                FROM TagAnalysis 
+                WHERE TagPopularity = 'Trending'
+            ) THEN 1 
+            ELSE 0 
+        END as IsTrendingTag
+    FROM Posts p
+    CROSS JOIN LATERAL (
+        SELECT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) as TagName
+        WHERE p.Tags IS NOT NULL AND p.Tags != ''
+    ) as tag_array
+    LEFT JOIN TagAnalysis ta ON tag_array.TagName = ta.TagName
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserTagAnalytics AS (
+    SELECT 
+        t.TagName,
+        t.TagCount,
+        t.TagPopularity,
+        COUNT(DISTINCT tp.PostId) as PostsWithTag,
+        COUNT(DISTINCT tp.OwnerUserId) as UsersWithTag,
+        AVG(tp.Score) as AvgScoreForTag,
+        AVG(tp.ViewCount) as AvgViewsForTag,
+        MAX(tp.Score) as MaxScoreForTag,
+        MAX(tp.ViewCount) as MaxViewsForTag,
+        MIN(tp.Score) as MinScoreForTag,
+        MIN(tp.ViewCount) as MinViewsForTag,
+        STDDEV(tp.Score) as ScoreStdDev,
+        STDDEV(tp.ViewCount) as ViewsStdDev,
+        CORR(tp.Score, tp.ViewCount) as ScoreViewCorrelation,
+        CASE 
+            WHEN COUNT(DISTINCT tp.PostId) > 1000 THEN 'High Activity'
+            WHEN COUNT(DISTINCT tp.PostId) > 500 THEN 'Medium Activity'
+            WHEN COUNT(DISTINCT tp.PostId) > 100 THEN 'Low Activity'
+            ELSE 'Very Low Activity'
+        END as ActivityLevel,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY tp.Score) as MedianScore,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY tp.ViewCount) as MedianViews
+    FROM TagAnalysis t
+    LEFT JOIN TaggedPosts tp ON t.TagName = tp.TagName
+    GROUP BY t.TagName, t.TagCount, t.TagPopularity
+),
+AdvancedUserMetrics AS (
+    SELECT 
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.PostCount,
+        tu.CommentCount,
+        tu.BadgeCount,
+        tu.HistoryCount,
+        tu.LastPostDate,
+        tu.LastCommentDate,
+        tu.LastBadgeDate,
+        tu.LastHistoryDate,
+        tu.DaysSinceLastPost,
+        tu.PostRank,
+        tu.ReputationRank,
+        tu.UserLevel,
+        tu.TotalScore,
+        tu.AvgScore,
+        tu.TotalViews,
+        tu.TotalAnswers,
+        tu.TotalComments,
+        tu.ScoreRank,
+        tu.ViewRank,
+        tu.PostRankOverall,
+        CASE 
+            WHEN tu.PostCount >= 100 THEN 'Expert'
+            WHEN tu.PostCount >= 50 THEN 'Advanced User'
+            WHEN tu.PostCount >= 10 THEN 'Regular User'
+            ELSE 'New User'
+        END as UserCategory,
+        CASE 
+            WHEN tu.TotalScore >= 1000 THEN 'High Performer'
+            WHEN tu.TotalScore >= 500 THEN 'Medium Performer'
+            WHEN tu.TotalScore >= 100 THEN 'Low Performer'
+            ELSE 'Beginner Performer'
+        END as PerformanceLevel,
+        COALESCE((tu.PostCount * 1.0 / NULLIF(tu.TotalViews, 0)), 0) as PostingEfficiency,
+        COALESCE((tu.TotalScore * 1.0 / NULLIF(tu.PostCount, 0)), 0) as ScorePerPost,
+        COALESCE((tu.TotalViews * 1.0 / NULLIF(tu.PostCount, 0)), 0) as ViewsPerPost,
+        COALESCE((tu.BadgeCount * 1.0 / NULLIF(tu.PostCount, 0)), 0) as BadgesPerPost,
+        POWER(tu.Reputation, 0.5) as ReputationSquareRoot,
+        LOG(10, NULLIF(tu.Reputation, 0)) as ReputationLog10
+    FROM TopUsers tu
+),
+PostTagMapping AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        p.OwnerDisplayName,
+        STRING_AGG(ta.TagName, ', ') as AllTags,
+        COUNT(ta.TagName) as TagCount,
+        STRING_AGG(CASE WHEN ta.TagPopularity = 'Trending' THEN ta.TagName END, ', ') as TrendingTags,
+        STRING_AGG(CASE WHEN ta.TagPopularity IN ('Trending', 'Popular') THEN ta.TagName END, ', ') as PopularTags,
+        STRING_AGG(CASE WHEN ta.TagPopularity = 'Niche' THEN ta.TagName END, ', ') as NicheTags,
+        COUNT(CASE WHEN ta.TagPopularity = 'Trending' THEN 1 END) as TrendingTagCount,
+        COUNT(CASE WHEN ta.TagPopularity IN ('Trending', 'Popular') THEN 1 END) as PopularTagCount,
+        COUNT(CASE WHEN ta.TagPopularity = 'Niche' THEN 1 END) as NicheTagCount
+    FROM Posts p
+    LEFT JOIN TaggedPosts t ON p.Id = t.PostId
+    LEFT JOIN TagAnalysis ta ON t.TagName = ta.TagName
+    WHERE p.PostTypeId IN (1, 2)
+    GROUP BY p.Id, p.Title, p.Tags, p.OwnerUserId, p.OwnerDisplayName
+),
+FinalAnalysisResult AS (
+    SELECT 
+        'User Analytics' as Category,
+        COUNT(*) as RecordCount,
+        (SELECT COUNT(DISTINCT UserId) FROM TopUsers) as DistinctUsers,
+        (SELECT AVG(Reputation) FROM TopUsers) as AvgReputation,
+        (SELECT AVG(PostCount) FROM TopUsers) as AvgPostsPerUser,
+        (SELECT COUNT(*) FROM Posts WHERE PostTypeId IN (1, 2)) as TotalPosts,
+        'Primary User Analysis' as Description
+    FROM TopUsers
+    
+    UNION ALL
+    
+    SELECT 
+        'Post Performance' as Category,
+        COUNT(*) as RecordCount,
+        (SELECT COUNT(DISTINCT OwnerUserId) FROM PostPerformance) as DistinctUsers,
+        (SELECT AVG(Score) FROM PostPerformance) as AvgReputation,
+        (SELECT AVG(ViewCount) FROM PostPerformance) as AvgPostsPerUser,
+        (SELECT COUNT(*) FROM Posts WHERE PostTypeId IN (1, 2)) as TotalPosts,
+        'Secondary Post Analysis' as Description
+    FROM PostPerformance
+    
+    UNION ALL
+    
+    SELECT 
+        'Tag Analysis' as Category,
+        COUNT(*) as RecordCount,
+        (SELECT COUNT(DISTINCT TagName) FROM TagAnalysis) as DistinctUsers,
+        (SELECT AVG(TagCount) FROM TagAnalysis) as AvgReputation,
+        (SELECT AVG(TagCount) FROM TagAnalysis WHERE TagPopularity = 'Trending') as AvgPostsPerUser,
+        (SELECT COUNT(*) FROM TagAnalysis WHERE TagPopularity = 'Trending') as TotalPosts,
+        'Tertiary Tag Analysis' as Description
+    FROM TagAnalysis
+    
+    UNION ALL
+    
+    SELECT 
+        'User-Tag Correlation' as Category,
+        COUNT(*) as RecordCount,
+        (SELECT COUNT(DISTINCT TagName) FROM UserTagAnalytics) as DistinctUsers,
+        (SELECT AVG(AvgScoreForTag) FROM UserTagAnalytics) as AvgReputation,
+        (SELECT AVG(AvgViewsForTag) FROM UserTagAnalytics) as AvgPostsPerUser,
+        (SELECT COUNT(*) FROM UserTagAnalytics) as TotalPosts,
+        'Quaternary User-Tag Analysis' as Description
+    FROM UserTagAnalytics
+)
+SELECT 
+    fa.Category,
+    fa.RecordCount,
+    fa.DistinctUsers,
+    fa.AvgReputation,
+    fa.AvgPostsPerUser,
+    fa.TotalPosts,
+    fa.Description,
+    CASE 
+        WHEN fa.RecordCount > 1000 THEN 'Large Dataset'
+        WHEN fa.RecordCount > 100 THEN 'Medium Dataset'
+        WHEN fa.RecordCount > 10 THEN 'Small Dataset'
+        ELSE 'Tiny Dataset'
+    END as DatasetSize,
+    ROW_NUMBER() OVER (ORDER BY fa.RecordCount DESC) as DatasetRank,
+    PERCENT_RANK() OVER (ORDER BY fa.RecordCount) as PercentileRank,
+    CUME_DIST() OVER (ORDER BY fa.RecordCount) as CumulativeDistribution,
+    LAG(fa.RecordCount, 1) OVER (ORDER BY fa.RecordCount DESC) as PreviousRecordCount,
+    NTH_VALUE(fa.RecordCount, 2) OVER (ORDER BY fa.RecordCount DESC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) as SecondLargestRecordCount,
+    NTILE(4) OVER (ORDER BY fa.RecordCount) as Quartile,
+    RANK() OVER (ORDER BY fa.AvgReputation DESC) as ReputationRank,
+    DENSE_RANK() OVER (ORDER BY fa.TotalPosts DESC) as PostRank,
+    CASE 
+        WHEN fa.AvgReputation > 1000 THEN 'Highly Reputed'
+        WHEN fa.AvgReputation > 500 THEN 'Moderately Reputed'
+        WHEN fa.AvgReputation > 100 THEN 'Low Reputed'
+        ELSE 'Very Low Reputed'
+    END as ReputationStatus,
+    CASE 
+        WHEN fa.TotalPosts > 10000 THEN 'Very Active'
+        WHEN fa.TotalPosts > 5000 THEN 'Active'
+        WHEN fa.TotalPosts > 1000 THEN 'Moderate'
+        ELSE 'Inactive'
+    END as ActivityStatus,
+    CONCAT(fa.Category, ': ', fa.Description, ' - ', fa.DatasetSize) as ComprehensiveDescription,
+    ABS(fa.RecordCount - (SELECT AVG(RecordCount) FROM FinalAnalysisResult)) as DeviationFromAverage,
+    POWER(fa.RecordCount, 2) as RecordSquare,
+    SQRT(fa.RecordCount) as RecordSquareRoot
+FROM FinalAnalysisResult fa
+WHERE fa.RecordCount > 0
+ORDER BY fa.RecordCount DESC, fa.AvgReputation DESC;

@@ -1,0 +1,171 @@
+with RecursiveUserPosts as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        row_number() over(partition by u.Id order by p.CreationDate desc) as rn
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    where p.PostTypeId in (1, 2)
+), 
+RecentUserPosts as (
+    select * from RecursiveUserPosts where rn <= 10
+),
+PostVotesSummary as (
+    select 
+        p.Id as PostId,
+        count(case when v.VoteTypeId = 2 then 1 end) as UpVotes,
+        count(case when v.VoteTypeId = 3 then 1 end) as DownVotes,
+        count(case when v.VoteTypeId = 5 then 1 end) as Favorites,
+        coalesce(sum(case when v.BountyAmount is not null then v.BountyAmount else 0 end),0) as TotalBounty
+    from Posts p
+    left join Votes v on v.PostId = p.Id
+    group by p.Id
+),
+BadgeRankings as (
+    select 
+        b.UserId,
+        b.Name as BadgeName,
+        b.Class,
+        count(*) over (partition by b.UserId, b.Class) as BadgeCount,
+        dense_rank() over (partition by b.UserId order by b.Class) as BadgeRank
+    from Badges b
+    where b.Date > cast('2024-10-01' as date) - interval '1 year'
+),
+UserReputationSummary as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct p.Id) filter (where p.PostTypeId = 1 and p.ClosedDate is null) as OpenQuestions,
+        count(distinct p.Id) filter (where p.PostTypeId = 1 and p.ClosedDate is not null) as ClosedQuestions,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersProvided,
+        count(distinct ph.Id) filter (where ph.PostHistoryTypeId = 10) as CloseVotesMade,
+        max(p.Score) filter (where p.PostTypeId = 1) as MaxQuestionScore,
+        max(p.Score) filter (where p.PostTypeId = 2) as MaxAnswerScore,
+        string_agg(distinct t.TagName, ', ') filter (where p.PostTypeId = 1 and t.Id is not null) as TaggedQuestions
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Tags t on 
+        t.ExcerptPostId = p.Id or t.WikiPostId = p.Id
+    left join PostHistory ph on ph.UserId = u.Id and ph.PostHistoryTypeId = 10
+    group by u.Id, u.DisplayName, u.Reputation
+),
+DuplicatePostLinks as (
+    select 
+        pl.PostId,
+        pl.RelatedPostId,
+        p1.Title as PostTitle,
+        p2.Title as RelatedPostTitle,
+        case when p1.PostTypeId = 1 then 'Question' else 'Other' end as PostType,
+        case when p2.PostTypeId = 1 then 'Question' else 'Other' end as RelatedPostType
+    from PostLinks pl
+    inner join Posts p1 on p1.Id = pl.PostId
+    inner join Posts p2 on p2.Id = pl.RelatedPostId
+    where pl.LinkTypeId = 3
+),
+UserActivityWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        ph.CreationDate,
+        ph.PostHistoryTypeId,
+        count(*) over (partition by u.Id order by ph.CreationDate 
+            range between interval '7 days' preceding and current row) as SevenDayActivityCount,
+        count(*) over (partition by u.Id order by ph.CreationDate 
+            range between interval '30 days' preceding and current row) as ThirtyDayActivityCount
+    from Users u
+    left join PostHistory ph on ph.UserId = u.Id
+    where ph.CreationDate >= cast('2024-10-01' as date) - interval '60 days'
+),
+QuestionsWithTopAnswerAndComments as (
+    select 
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score as QuestionScore,
+        a.Id as TopAnswerId,
+        a.OwnerUserId as AnswerOwnerUserId,
+        a.Score as AnswerScore,
+        c.CommentCount,
+        coalesce(c.Text, '') as TopCommentText,
+        length(coalesce(c.Text, '')) as TopCommentLength,
+        coalesce(bu.BadgeCount,0) as AnswerOwnerBadges
+    from Posts q
+    left join Posts a 
+        on a.ParentId = q.Id and a.PostTypeId = 2 and a.Score = (
+            select max(score) from Posts where ParentId = q.Id and PostTypeId = 2
+        )
+    left join LATERAL (
+        select c.Text, c.CommentCount from Comments c where c.PostId = q.Id order by c.Score desc limit 1
+    ) c on true
+    left join (
+        select 
+            b.UserId,
+            count(*) as BadgeCount
+        from Badges b 
+        group by b.UserId
+    ) bu on bu.UserId = a.OwnerUserId
+    where q.PostTypeId = 1
+)
+select distinct
+    urs.UserId,
+    urs.DisplayName,
+    urs.Reputation,
+    urs.OpenQuestions,
+    urs.ClosedQuestions,
+    urs.AnswersProvided,
+    urs.MaxQuestionScore,
+    urs.MaxAnswerScore,
+    urs.TaggedQuestions,
+    pvs.UpVotes as TotalPostUpVotes,
+    pvs.DownVotes as TotalPostDownVotes,
+    pvs.Favorites as TotalPostFavorites,
+    pvs.TotalBounty,
+    b.Name as BadgeName,
+    b.Class as BadgeClass,
+    dup.PostId as DuplicatePostId,
+    dup.RelatedPostId as DuplicateOfPostId,
+    dup.PostTitle,
+    dup.RelatedPostTitle,
+    dup.PostType,
+    dup.RelatedPostType,
+    uaw.SevenDayActivityCount,
+    uaw.ThirtyDayActivityCount,
+    qta.QuestionId,
+    qta.Title as QuestionTitle,
+    qta.CreationDate as QuestionCreationDate,
+    qta.QuestionScore,
+    qta.TopAnswerId,
+    qta.AnswerOwnerUserId,
+    qta.AnswerScore,
+    qta.CommentCount,
+    qta.TopCommentLength,
+    qta.AnswerOwnerBadges,
+    case 
+        when urs.OpenQuestions > 0 then round(cast(urs.AnswersProvided as numeric) / urs.OpenQuestions, 2) 
+        else null 
+    end as AnswerToOpenQuestionRatio,
+    case 
+        when urs.Reputation > 10000 then 'Expert' 
+        when urs.Reputation between 1000 and 10000 then 'Intermediate' 
+        else 'Novice' 
+    end as UserLevel,
+    coalesce(substr(urs.DisplayName, 1, 1), 'U') || lower(substring(urs.DisplayName from position(' ' in urs.DisplayName)+1)) as ModifiedDisplayName,
+    (select count(*) from Comments c where c.UserId = urs.UserId and c.CreationDate > cast('2024-10-01' as date) - interval '180 days') as RecentCommentCount
+from UserReputationSummary urs
+left join PostVotesSummary pvs on pvs.PostId = (
+    select p.Id from Posts p where p.OwnerUserId = urs.UserId order by p.Score desc limit 1
+)
+left join Badges b on b.UserId = urs.UserId and b.Class = 1
+left join DuplicatePostLinks dup on dup.PostId in (
+    select PostId from Posts where OwnerUserId = urs.UserId limit 5
+)
+left join UserActivityWindow uaw on uaw.UserId = urs.UserId
+left join QuestionsWithTopAnswerAndComments qta on qta.AnswerOwnerUserId = urs.UserId
+where urs.Reputation > 500
+order by urs.Reputation desc, urs.OpenQuestions desc
+limit 100;

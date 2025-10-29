@@ -1,0 +1,218 @@
+-- {"query": "2956.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2095} 
+with RecursivePostsHierarchy as (
+    select p.Id, p.PostTypeId, p.ParentId, p.Title, 1 as Depth
+    from Posts p
+    where p.PostTypeId = 1 -- questions only
+    union all
+    select c.Id, c.PostTypeId, c.ParentId, c.Title, rh.Depth + 1
+    from Posts c
+    join RecursivePostsHierarchy rh on c.ParentId = rh.Id and c.PostTypeId = 2
+),
+UserBadgeSummary as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        count(b.Id) as TotalBadges,
+        case when count(b.Id) = 0 then 0 else cast(avg(b.Class) as float) end as AvgBadgeClass,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    group by u.Id, u.DisplayName
+),
+PostScoresAgg as (
+    select 
+        PostId,
+        sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+        sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes,
+        sum(case when vt.Name = 'Favorite' then 1 else 0 end) as FavoriteVotes
+    from Votes v
+    join VoteTypes vt on v.VoteTypeId = vt.Id
+    group by PostId
+),
+PostDetailsExt as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        pb.GoldBadges,
+        pb.SilverBadges,
+        pb.BronzeBadges,
+        pb.TotalBadges,
+        coalesce(psa.UpVotes,0) as UpVotes,
+        coalesce(psa.DownVotes,0) as DownVotes,
+        coalesce(psa.FavoriteVotes,0) as FavoriteVotes,
+        row_number() over (partition by p.PostTypeId order by p.Score desc nulls last, p.ViewCount desc nulls last) as RankByScore,
+        dense_rank() over (order by p.OwnerUserId) as OwnerDenseRank,
+        case 
+            when p.Tags is null or p.Tags = '' then '[]' 
+            else '[' || string_agg(distinct replace(regexp_replace(p.Tags, '[<>]', '', 'g'), ',', ''), ', ') || ']' end as NormalizedTags
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    left join UserBadgeSummary pb on u.Id = pb.UserId
+    left join PostScoresAgg psa on p.Id = psa.PostId
+    where p.CreationDate >= '2015-01-01' -- only recent
+),
+TagUsages as (
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        coalesce(avg(pd.Score), 0) as AvgPostScore,
+        count(pd.Id) as PostCount,
+        max(pd.ViewCount) as MaxViewCount,
+        sum(coalesce(pd.UpVotes,0) - coalesce(pd.DownVotes,0)) as NetVotes,
+        bool_or(t.IsModeratorOnly = 1) as HasModeratorOnlyUsage,
+        bool_or(t.IsRequired = 1) as HasRequiredTag
+    from Tags t
+    left join Posts pd on pd.Tags like concat('%<', t.TagName, '>%')
+    group by t.Id, t.TagName, t.Count, t.IsModeratorOnly, t.IsRequired
+),
+RecentClosures as (
+    select 
+        ph.PostId,
+        p.Title,
+        max(ph.CreationDate) as LastClosedDate,
+        max(c.Name) as CloseReason,
+        count(*) as CloseEventCount
+    from PostHistory ph
+    join PostHistoryTypes pht on ph.PostHistoryTypeId = pht.Id and pht.Name = 'Post Closed'
+    join CloseReasonTypes c on ph.Comment::int = c.Id
+    join Posts p on ph.PostId = p.Id
+    where ph.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '1 year'
+    group by ph.PostId, p.Title
+),
+UserActivityWindows as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(p.Id) filter (where p.PostTypeId = 1) as Questions,
+        count(p.Id) filter (where p.PostTypeId = 2) as Answers,
+        count(c.Id) as Comments,
+        sum(v.BountyAmount) as TotalBountiesOffered,
+        max(p.CreationDate) as LastPostDate,
+        min(u.CreationDate) as UserSince,
+        sum(case when p.Score is null then 0 else p.Score end) as TotalPostScore,
+        sum(coalesce(v.VoteTypeId = 2::smallint, 0)) as UpVotesReceived,
+        sum(coalesce(v.VoteTypeId = 3::smallint, 0)) as DownVotesReceived,
+        dense_rank() over (order by count(p.Id) desc) as ActivityRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName
+)
+select 
+    pd.Id as PostId,
+    pd.PostTypeId,
+    pd.Title,
+    pd.CreationDate,
+    pd.Score,
+    pd.ViewCount,
+    pd.Tags,
+    pd.OwnerUserId,
+    pd.OwnerName,
+    pd.GoldBadges,
+    pd.SilverBadges,
+    pd.BronzeBadges,
+    pd.TotalBadges,
+    pd.UpVotes,
+    pd.DownVotes,
+    pd.FavoriteVotes,
+    rh.Depth as AnswerDepth,
+    ru.LastClosedDate,
+    ru.CloseReason,
+    ru.CloseEventCount,
+    tw.TagName,
+    tw.AvgPostScore,
+    tw.PostCount,
+    tw.MaxViewCount,
+    tw.NetVotes,
+    tw.HasModeratorOnlyUsage,
+    tw.HasRequiredTag,
+    ua.Questions,
+    ua.Answers,
+    ua.Comments,
+    ua.TotalBountiesOffered,
+    ua.LastPostDate,
+    ua.UserSince,
+    ua.TotalPostScore,
+    ua.UpVotesReceived,
+    ua.DownVotesReceived,
+    ua.ActivityRank,
+    concat(
+        coalesce(pd.Title, '<No Title>'), ' :: ',
+        pd.NormalizedTags, ' :: OwnerRank = ', pd.OwnerDenseRank
+    ) as CompositeString,
+    /* Correlated Subquery: Number of comments by the post owner on this post */
+    (select count(*) from Comments c where c.PostId = pd.Id and c.UserId = pd.OwnerUserId) as OwnerCommentsCount,
+    /* NULL Logic: prioritize closed posts with recent closure, else null */
+    case when ru.LastClosedDate is not null and ru.LastClosedDate > cast('2024-10-01' as date) - interval '90 days' then 'Recently Closed'
+         when ru.LastClosedDate is not null then 'Closed'
+         else 'Open' end as PostStatus
+from PostDetailsExt pd
+left join RecursivePostsHierarchy rh on pd.Id = rh.Id
+left join RecentClosures ru on pd.Id = ru.PostId
+left join TagUsages tw on pd.Tags like concat('%<', tw.TagName, '>%')
+left join UserActivityWindows ua on pd.OwnerUserId = ua.UserId
+where pd.Score >= 5 and pd.ViewCount > 1000
+union
+select 
+    pd2.Id as PostId,
+    pd2.PostTypeId,
+    pd2.Title,
+    pd2.CreationDate,
+    pd2.Score,
+    pd2.ViewCount,
+    pd2.Tags,
+    pd2.OwnerUserId,
+    pd2.OwnerName,
+    pd2.GoldBadges,
+    pd2.SilverBadges,
+    pd2.BronzeBadges,
+    pd2.TotalBadges,
+    pd2.UpVotes,
+    pd2.DownVotes,
+    pd2.FavoriteVotes,
+    rh2.Depth as AnswerDepth,
+    NULL as LastClosedDate,
+    NULL as CloseReason,
+    NULL as CloseEventCount,
+    NULL as TagName,
+    NULL as AvgPostScore,
+    NULL as PostCount,
+    NULL as MaxViewCount,
+    NULL as NetVotes,
+    NULL as HasModeratorOnlyUsage,
+    NULL as HasRequiredTag,
+    ua2.Questions,
+    ua2.Answers,
+    ua2.Comments,
+    ua2.TotalBountiesOffered,
+    ua2.LastPostDate,
+    ua2.UserSince,
+    ua2.TotalPostScore,
+    ua2.UpVotesReceived,
+    ua2.DownVotesReceived,
+    ua2.ActivityRank,
+    concat(
+        coalesce(pd2.Title, '<No Title>'), ' :: ',
+        pd2.NormalizedTags, ' :: OwnerRank = ', pd2.OwnerDenseRank
+    ) as CompositeString,
+    (select count(*) from Comments c where c.PostId = pd2.Id and c.UserId = pd2.OwnerUserId) as OwnerCommentsCount,
+    'Open' as PostStatus
+from PostDetailsExt pd2
+left join RecursivePostsHierarchy rh2 on pd2.Id = rh2.Id
+left join UserActivityWindows ua2 on pd2.OwnerUserId = ua2.UserId
+where pd2.Score < 5 or pd2.ViewCount <= 1000
+order by Score desc nulls last, ViewCount desc nulls last, CreationDate desc
+limit 100;

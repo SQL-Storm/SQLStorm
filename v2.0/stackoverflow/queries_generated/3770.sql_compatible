@@ -1,0 +1,113 @@
+WITH UserPostStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id)                                    AS PostCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS QuestionScoreSum,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS AnswerScoreSum,
+        MAX(p.CreationDate)                           AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+UserBadgeStats AS (
+    SELECT 
+        b.UserId,
+        COUNT(*)                                 AS BadgeCount,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END)  AS GoldBadgeCount,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END)  AS SilverBadgeCount,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END)  AS BronzeBadgeCount,
+        COUNT(CASE WHEN b.TagBased = TRUE THEN 1 END) AS TagBasedBadgeCount
+    FROM Badges b
+    GROUP BY b.UserId
+),
+TopAnswerPerUser AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.OwnerUserId,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+),
+AnswerVoteAgg AS (
+    SELECT 
+        v.PostId,
+        SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS DownVotes
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY v.PostId
+)
+SELECT
+    u.Id,
+    COALESCE(u.DisplayName, 'Anonymous')            AS DisplayName,
+    u.Reputation,
+    ps.PostCount,
+    ps.QuestionScoreSum,
+    ps.AnswerScoreSum,
+    bs.BadgeCount,
+    bs.GoldBadgeCount,
+    bs.SilverBadgeCount,
+    bs.BronzeBadgeCount,
+    bs.TagBasedBadgeCount,
+    CASE 
+        WHEN ps.AnswerScoreSum > 0 THEN CAST(ps.AnswerScoreSum AS DECIMAL) / NULLIF(ps.PostCount,0)
+        ELSE NULL
+    END                                             AS AvgAnswerScore,
+    ta.Title                                         AS TopAnswerTitle,
+    ta.Score                                         AS TopAnswerScore,
+    av.UpVotes,
+    av.DownVotes,
+    CASE 
+        WHEN u.LastAccessDate > CAST('2024-10-01' AS DATE) - INTERVAL '30 days' THEN 'Active'
+        ELSE 'Inactive'
+    END                                             AS RecentActivityStatus,
+    CASE 
+        WHEN EXISTS (
+            SELECT 1 FROM PostLinks pl 
+            WHERE pl.PostId = ta.Id AND pl.LinkTypeId = 3
+        ) THEN 1 ELSE 0 
+    END                                             AS IsDuplicateLinkPresent
+FROM Users u
+LEFT JOIN UserPostStats ps ON ps.Id = u.Id
+LEFT JOIN UserBadgeStats bs ON bs.UserId = u.Id
+LEFT JOIN (
+    SELECT Id, Title, Score, OwnerUserId
+    FROM TopAnswerPerUser
+    WHERE rn = 1
+) ta ON ta.OwnerUserId = u.Id
+LEFT JOIN AnswerVoteAgg av ON av.PostId = ta.Id
+WHERE (ps.PostCount IS NOT NULL AND ps.PostCount > 0)
+   OR (bs.BadgeCount IS NOT NULL AND bs.BadgeCount >= 5)
+
+UNION ALL
+
+SELECT
+    u.Id,
+    COALESCE(u.DisplayName, 'Anonymous')            AS DisplayName,
+    u.Reputation,
+    0                                               AS PostCount,
+    NULL                                            AS QuestionScoreSum,
+    NULL                                            AS AnswerScoreSum,
+    bs.BadgeCount,
+    bs.GoldBadgeCount,
+    bs.SilverBadgeCount,
+    bs.BronzeBadgeCount,
+    bs.TagBasedBadgeCount,
+    NULL                                            AS AvgAnswerScore,
+    NULL                                            AS TopAnswerTitle,
+    NULL                                            AS TopAnswerScore,
+    0                                               AS UpVotes,
+    0                                               AS DownVotes,
+    'NoPosts'                                       AS RecentActivityStatus,
+    0                                               AS IsDuplicateLinkPresent
+FROM Users u
+LEFT JOIN UserBadgeStats bs ON bs.UserId = u.Id
+WHERE NOT EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id)
+  AND (bs.BadgeCount IS NOT NULL AND bs.BadgeCount >= 10)
+
+ORDER BY Reputation DESC, BadgeCount DESC
+LIMIT 100;

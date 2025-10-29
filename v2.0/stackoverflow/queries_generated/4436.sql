@@ -1,0 +1,150 @@
+-- {"query": "4436.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1439} 
+
+WITH
+  RankedPostEdits AS (
+    SELECT
+      ph.PostId,
+      ph.UserId,
+      ph.CreationDate AS EditDate,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory AS ph
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+  ),
+  UserActivitySummary AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate AS UserCreationDate,
+      COUNT(DISTINCT p.Id) AS TotalPosts,
+      SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+      MAX(p.LastActivityDate) AS LastPostActivityDate,
+      AVG(p.Score) AS AveragePostScore,
+      COUNT(DISTINCT b.Id) AS BadgeCount,
+      STRING_AGG(b.Name, ', ') WITHIN GROUP (ORDER BY b.Date DESC) AS RecentBadges
+    FROM Users AS u
+    LEFT JOIN Posts AS p
+      ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges AS b
+      ON u.Id = b.UserId
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate
+  ),
+  PostPerformance AS (
+    SELECT
+      p.Id AS PostId,
+      p.Title,
+      pt.Name AS PostType,
+      p.CreationDate AS PostCreationDate,
+      p.Score,
+      p.ViewCount,
+      p.FavoriteCount,
+      p.AnswerCount,
+      COALESCE(p.CommunityOwnedDate, p.LastActivityDate) AS EffectiveActivityDate,
+      CASE
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        ELSE 'Active'
+      END AS PostStatus,
+      p.OwnerUserId,
+      u.DisplayName AS OwnerDisplayName,
+      (
+        SELECT
+          COUNT(*)
+        FROM Comments AS c
+        WHERE
+          c.PostId = p.Id AND c.UserId IS NOT NULL
+      ) AS CommentCountByUsers,
+      (
+        SELECT
+          SUM(v.VoteTypeId = 2) -- UpVotes
+        FROM Votes AS v
+        WHERE
+          v.PostId = p.Id
+      ) AS TotalUpVotes,
+      (
+        SELECT
+          SUM(v.VoteTypeId = 3) -- DownVotes
+        FROM Votes AS v
+        WHERE
+          v.PostId = p.Id
+      ) AS TotalDownVotes,
+      (
+        SELECT
+          COUNT(*)
+        FROM PostLinks AS pl
+        WHERE
+          pl.PostId = p.Id AND pl.LinkTypeId = 3 -- Duplicate links
+      ) AS DuplicateLinksCount
+    FROM Posts AS p
+    JOIN PostTypes AS pt
+      ON p.PostTypeId = pt.Id
+    LEFT JOIN Users AS u
+      ON p.OwnerUserId = u.Id
+    WHERE
+      p.Score > 0 OR p.AnswerCount > 0 OR p.FavoriteCount > 0
+  )
+SELECT
+  pp.PostId,
+  pp.Title,
+  pp.PostType,
+  pp.PostCreationDate,
+  pp.Score,
+  pp.ViewCount,
+  pp.FavoriteCount,
+  pp.AnswerCount,
+  pp.PostStatus,
+  uas.DisplayName AS AuthorDisplayName,
+  uas.Reputation AS AuthorReputation,
+  uas.UserCreationDate AS AuthorCreationDate,
+  uas.TotalPosts AS AuthorTotalPosts,
+  uas.QuestionCount AS AuthorQuestionCount,
+  uas.AnswerCount AS AuthorAnswerCount,
+  uas.BadgeCount AS AuthorBadgeCount,
+  uas.RecentBadges AS AuthorRecentBadges,
+  rpe.EditDate AS LastUserEditDate,
+  CASE
+    WHEN pp.TotalUpVotes IS NULL THEN 0
+    ELSE pp.TotalUpVotes
+  END AS CalculatedUpVotes,
+  CASE
+    WHEN pp.TotalDownVotes IS NULL THEN 0
+    ELSE pp.TotalDownVotes
+  END AS CalculatedDownVotes,
+  pp.CommentCountByUsers,
+  pp.DuplicateLinksCount,
+  (
+    pp.Score * 1.0 + pp.ViewCount * 0.01 + pp.FavoriteCount * 0.5 + pp.AnswerCount * 0.2
+  ) AS CompositeScore,
+  UPPER(SUBSTRING(pp.Title, 1, 1)) || SUBSTRING(pp.Title, 2) AS FormattedTitle,
+  CASE
+    WHEN uas.LastPostActivityDate IS NULL THEN 'Never'
+    WHEN uas.LastPostActivityDate < pp.PostCreationDate THEN 'Before Post Creation'
+    ELSE CAST(DATE_PART('day', pp.EffectiveActivityDate - uas.LastPostActivityDate) AS VARCHAR) || ' days ago'
+  END AS DaysSinceLastUserActivity,
+  CASE
+    WHEN pp.PostStatus = 'Closed' AND pp.PostCreationDate < '2020-01-01' THEN 'Old Closed Post'
+    WHEN pp.PostStatus = 'Active' AND pp.Score > 100 THEN 'Highly Scored Active Post'
+    ELSE 'Standard Post'
+  END AS PostCategorization
+FROM PostPerformance AS pp
+LEFT JOIN UserActivitySummary AS uas
+  ON pp.OwnerUserId = uas.UserId
+LEFT JOIN RankedPostEdits AS rpe
+  ON pp.PostId = rpe.PostId AND rpe.rn = 1
+WHERE
+  uas.Reputation > 1000
+  AND pp.PostCreationDate BETWEEN '2022-01-01' AND '2023-12-31'
+  AND (
+    pp.PostType = 'Question' OR pp.PostType = 'Answer'
+  )
+  AND pp.DuplicateLinksCount < 5
+ORDER BY
+  CompositeScore DESC,
+  pp.ViewCount DESC
+LIMIT 1000;

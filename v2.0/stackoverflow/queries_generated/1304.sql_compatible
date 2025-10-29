@@ -1,0 +1,245 @@
+WITH UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.Views AS UserViews,
+        u.UpVotes AS UserUpVotes,
+        u.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+        COALESCE(AVG(p.Score) FILTER (WHERE p.PostTypeId IN (1,2) AND p.Score IS NOT NULL), 0.0) AS AvgQAScore,
+        COALESCE(SUM(p.ViewCount) FILTER (WHERE p.PostTypeId = 1), 0) AS TotalQuestionViews,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT b.Id) AS TotalBadges
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes
+),
+PostProblemIndicators AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.ClosedDate,
+        p.CommunityOwnedDate,
+        p.Score AS PostScore,
+        p.ViewCount AS PostViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9) THEN 1 ELSE 0 END) AS EditRollbackCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseVoteHistoryCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 12 THEN 1 ELSE 0 END) AS DeleteVoteHistoryCount,
+        MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId IN (4, 5, 6)) AS LastEditHistoryDate,
+        COALESCE(
+            MAX(CASE WHEN ph.PostHistoryTypeId = 10 AND ph.Comment IS NOT NULL THEN
+                (SELECT crt.Name FROM CloseReasonTypes crt WHERE crt.Id = CAST(ph.Comment AS SMALLINT) LIMIT 1)
+            ELSE NULL END),
+            'N/A/Not Closed'
+        ) AS ComplexCloseReason
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    GROUP BY p.Id, p.OwnerUserId, p.CreationDate, p.ClosedDate, p.CommunityOwnedDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount
+),
+TaggedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        TRIM(UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><'))) AS TagName,
+        p.Score,
+        p.ViewCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.LastActivityDate,
+        (p.ClosedDate IS NOT NULL) AS IsClosed,
+        (p.LastEditorUserId IS NOT NULL AND p.LastEditorUserId <> p.OwnerUserId) AS IsEditedByOthers,
+        COALESCE(p.Title, 'No Title') AS PostTitleFragment
+    FROM Posts p
+    WHERE p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2
+      AND p.PostTypeId = 1
+),
+UserPostTagAggregates AS (
+    SELECT
+        tp.OwnerUserId AS UserId,
+        tp.TagName,
+        COUNT(tp.PostId) AS TaggedPostCount,
+        SUM(tp.Score) AS TaggedScoreSum,
+        COALESCE(AVG(tp.Score), 0.0) AS TaggedScoreAvg,
+        SUM(CASE WHEN tp.IsClosed THEN 1 ELSE 0 END) AS ClosedTaggedPostCount,
+        SUM(CASE WHEN tp.IsEditedByOthers THEN 1 ELSE 0 END) AS OtherEditedTaggedPostCount,
+        RANK() OVER (PARTITION BY tp.OwnerUserId ORDER BY COUNT(tp.PostId) DESC, SUM(tp.Score) DESC) AS TagRankForUser,
+        (SUM(CASE WHEN tp.IsClosed THEN 1 ELSE 0 END) * 1.5 + SUM(CASE WHEN tp.Score < 0 THEN 1 ELSE 0 END) * 1.0) AS TagControversyScore
+    FROM TaggedPosts tp
+    GROUP BY tp.OwnerUserId, tp.TagName
+),
+RecentUserProblemSummary AS (
+    SELECT
+        ppi.OwnerUserId AS UserId,
+        COUNT(DISTINCT ppi.PostId) AS RecentProblemPostCount,
+        SUM(ppi.EditRollbackCount) AS RecentTotalEditRollbacks,
+        SUM(ppi.CloseVoteHistoryCount) AS RecentCloseVoteHistory,
+        MIN(ppi.PostCreationDate) AS FirstProblemPostDate
+    FROM PostProblemIndicators ppi
+    WHERE ppi.PostCreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 year')
+      AND (ppi.EditRollbackCount > 0 OR ppi.CloseVoteHistoryCount > 0 OR ppi.DeleteVoteHistoryCount > 0)
+    GROUP BY ppi.OwnerUserId
+    HAVING COUNT(DISTINCT ppi.PostId) >= 2
+),
+UserOverallMetrics AS (
+    SELECT
+        ue.UserId,
+        ue.Reputation,
+        ue.UserCreationDate,
+        ue.LastAccessDate,
+        ue.TotalPosts,
+        ue.QuestionCount,
+        ue.AnswerCount,
+        ue.TotalCommentsMade,
+        ue.TotalBadges,
+        ue.AvgQAScore,
+        ue.TotalPostScore,
+        rps.RecentProblemPostCount,
+        rps.RecentTotalEditRollbacks,
+        rps.RecentCloseVoteHistory,
+        DENSE_RANK() OVER (ORDER BY ue.Reputation DESC, ue.TotalPostScore DESC) AS GlobalReputationDenseRank,
+        NTILE(5) OVER (ORDER BY ue.TotalCommentsMade DESC) AS CommenterQuintile,
+        LAG(ue.Reputation, 1, 0) OVER (PARTITION BY EXTRACT(YEAR FROM ue.UserCreationDate) ORDER BY ue.Reputation) AS PrevUserReputationInCreationYearGroup,
+        (SELECT COUNT(DISTINCT c.PostId)
+         FROM Comments c
+         JOIN Posts p ON c.PostId = p.Id
+         WHERE p.OwnerUserId = ue.UserId
+           AND c.CreationDate BETWEEN ue.UserCreationDate AND ue.UserCreationDate + INTERVAL '1 year'
+         GROUP BY p.Id
+         HAVING COUNT(c.Id) > 20
+        ) AS HighCommentInitialPostCount,
+        (SELECT COALESCE(AVG(sub_p.Score), 0.0)
+         FROM Posts sub_p
+         WHERE sub_p.LastEditorUserId = ue.UserId
+           AND sub_p.OwnerUserId IS NOT NULL
+           AND sub_p.OwnerUserId <> ue.UserId
+           AND sub_p.LastEditDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6 months')
+        ) AS AvgScoreOfOtherUserEditedPosts,
+        CASE
+            WHEN ue.TotalPosts = 0 THEN 0.0
+            ELSE (CAST(ue.TotalCommentsMade AS NUMERIC) + ue.TotalBadges * 5 + ue.UserUpVotes * 0.5 - ue.UserDownVotes * 0.2) / ue.TotalPosts
+        END AS EngagementRatio,
+        (ue.DisplayName IS NOT NULL AND ue.DisplayName LIKE '%User%' AND LENGTH(ue.DisplayName) < 10) AS IsGenericShortName
+    FROM UserEngagement ue
+    LEFT JOIN RecentUserProblemSummary rps ON ue.UserId = rps.UserId
+    WHERE ue.TotalPosts > 10
+      AND ue.Reputation > 500
+    GROUP BY ue.UserId, ue.Reputation, ue.UserCreationDate, ue.LastAccessDate, ue.TotalPosts, ue.QuestionCount, ue.AnswerCount,
+             ue.TotalCommentsMade, ue.TotalBadges, ue.AvgQAScore, ue.TotalPostScore, rps.RecentProblemPostCount,
+             rps.RecentTotalEditRollbacks, rps.RecentCloseVoteHistory, ue.DisplayName
+),
+FinalUserTagAnalysis AS (
+    SELECT
+        uom.UserId,
+        uom.Reputation,
+        uom.TotalPosts,
+        uom.QuestionCount,
+        uom.AnswerCount,
+        uom.TotalCommentsMade,
+        uom.TotalBadges,
+        uom.GlobalReputationDenseRank,
+        uom.CommenterQuintile,
+        uom.RecentProblemPostCount,
+        uom.RecentTotalEditRollbacks,
+        uom.RecentCloseVoteHistory,
+        uom.HighCommentInitialPostCount,
+        uom.AvgScoreOfOtherUserEditedPosts,
+        uom.EngagementRatio,
+        uom.IsGenericShortName,
+        MAX(CASE WHEN upta.TagRankForUser = 1 THEN upta.TagName ELSE NULL END) AS TopTagName,
+        MAX(CASE WHEN upta.TagRankForUser = 1 THEN upta.TaggedScoreAvg ELSE NULL END) AS TopTagAvgScore,
+        MAX(CASE WHEN upta.TagRankForUser = 1 THEN upta.TagControversyScore ELSE NULL END) AS TopTagControversyScore,
+        SUM(upta.ClosedTaggedPostCount) AS TotalClosedTaggedPosts,
+        SUM(upta.OtherEditedTaggedPostCount) AS TotalOtherEditedTaggedPosts,
+        COALESCE(ppi.ComplexCloseReason, 'No Closed Posts Found') AS LastKnownPostCloseReason,
+        NULLIF(ppi.PostViewCount, 0) AS LastClosedPostViews,
+        AGE(uom.LastAccessDate, uom.UserCreationDate) AS TimeSinceAccountCreationLastAccessed,
+        (SELECT COUNT(DISTINCT pl.PostId)
+         FROM PostLinks pl
+         JOIN Posts p_linked ON pl.RelatedPostId = p_linked.Id
+         WHERE pl.LinkTypeId = 3
+           AND p_linked.OwnerUserId = uom.UserId
+           AND pl.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '3 years')
+        ) AS RecentDuplicateLinkedPosts
+    FROM UserOverallMetrics uom
+    LEFT JOIN UserPostTagAggregates upta ON uom.UserId = upta.UserId
+    LEFT JOIN PostProblemIndicators ppi ON uom.UserId = ppi.OwnerUserId
+        AND ppi.PostId = (
+            SELECT sub_p.Id
+            FROM Posts sub_p
+            WHERE sub_p.OwnerUserId = uom.UserId AND sub_p.ClosedDate IS NOT NULL
+            ORDER BY sub_p.ClosedDate DESC, sub_p.Id DESC
+            LIMIT 1
+        )
+    GROUP BY uom.UserId, uom.Reputation, uom.TotalPosts, uom.QuestionCount, uom.AnswerCount, uom.TotalCommentsMade,
+             uom.TotalBadges, uom.GlobalReputationDenseRank, uom.CommenterQuintile, uom.RecentProblemPostCount,
+             uom.RecentTotalEditRollbacks, uom.RecentCloseVoteHistory, uom.HighCommentInitialPostCount,
+             uom.AvgScoreOfOtherUserEditedPosts, uom.EngagementRatio, uom.IsGenericShortName,
+             ppi.ComplexCloseReason, ppi.PostViewCount, uom.LastAccessDate, uom.UserCreationDate
+),
+HighEngagedProblematicUsers AS (
+    SELECT
+        futa.UserId,
+        futa.Reputation,
+        'High Engaged Problematic' AS UserCategory,
+        futa.GlobalReputationDenseRank,
+        futa.RecentProblemPostCount,
+        futa.RecentTotalEditRollbacks,
+        futa.TopTagName,
+        futa.TopTagControversyScore,
+        futa.LastKnownPostCloseReason,
+        futa.TotalClosedTaggedPosts,
+        futa.TimeSinceAccountCreationLastAccessed,
+        futa.RecentDuplicateLinkedPosts,
+        futa.AvgScoreOfOtherUserEditedPosts
+    FROM FinalUserTagAnalysis futa
+    WHERE futa.EngagementRatio > 5.0
+      AND futa.RecentProblemPostCount IS NOT NULL
+      AND futa.RecentTotalEditRollbacks > 5
+      AND futa.GlobalReputationDenseRank <= 500
+      AND futa.TopTagControversyScore > 10
+),
+TopTagExpertsCleanUsers AS (
+    SELECT
+        futa.UserId,
+        futa.Reputation,
+        'Top Tag Expert Clean' AS UserCategory,
+        futa.GlobalReputationDenseRank,
+        futa.RecentProblemPostCount,
+        futa.RecentTotalEditRollbacks,
+        futa.TopTagName,
+        futa.TopTagControversyScore,
+        futa.LastKnownPostCloseReason,
+        futa.TotalClosedTaggedPosts,
+        futa.TimeSinceAccountCreationLastAccessed,
+        futa.RecentDuplicateLinkedPosts,
+        futa.AvgScoreOfOtherUserEditedPosts
+    FROM FinalUserTagAnalysis futa
+    WHERE futa.TopTagName IS NOT NULL
+      AND futa.TopTagAvgScore > 15
+      AND COALESCE(futa.RecentProblemPostCount, 0) < 2
+      AND futa.GlobalReputationDenseRank <= 1000
+      AND futa.TopTagControversyScore < 5
+      AND futa.AvgScoreOfOtherUserEditedPosts > 10
+)
+SELECT * FROM HighEngagedProblematicUsers
+WHERE RecentDuplicateLinkedPosts IS NOT NULL AND RecentDuplicateLinkedPosts > 0
+UNION ALL
+SELECT * FROM TopTagExpertsCleanUsers
+WHERE UserCategory = 'Top Tag Expert Clean'
+  AND Reputation > 10000
+  AND LastKnownPostCloseReason = 'N/A/Not Closed'
+ORDER BY Reputation DESC, UserCategory DESC, GlobalReputationDenseRank ASC
+LIMIT 1000;

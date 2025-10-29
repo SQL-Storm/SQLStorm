@@ -1,0 +1,145 @@
+WITH QuestionEdits AS (
+    SELECT
+        ph.PostId,
+        ph.UserId,
+        u.DisplayName AS EditorDisplayName,
+        ph.CreationDate AS EditDate,
+        CAST(ph.CreationDate AS DATE) - CAST(u.CreationDate AS DATE) AS DaysSinceUserCreation,
+        ROW_NUMBER() OVER(PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate) AS EditSequence
+    FROM PostHistory ph
+    JOIN Users u ON ph.UserId = u.Id
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6)
+),
+AggregatedEdits AS (
+    SELECT
+        qe.PostId,
+        qe.UserId,
+        MAX(qe.EditorDisplayName) AS LastEditorDisplayName,
+        MIN(qe.EditDate) AS FirstEditDate,
+        MAX(qe.EditDate) AS LastEditDate,
+        COUNT(qe.PostId) AS TotalEditsByThisUser,
+        AVG(qe.DaysSinceUserCreation) AS AvgDaysSinceUserCreation
+    FROM QuestionEdits qe
+    GROUP BY qe.PostId, qe.UserId
+),
+PostDetails AS (
+    SELECT
+        p.Id AS PostId,
+        pt.Name AS PostType,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate AS PostCreationDate,
+        p.LastActivityDate AS PostLastActivityDate,
+        CAST(p.LastActivityDate AS DATE) - CAST(p.CreationDate AS DATE) AS PostLifespanDays,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+        CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN 1 ELSE 0 END AS IsCommunityOwned,
+        CASE
+            WHEN (p.Tags IS NOT NULL AND (POSITION('<sql>' IN p.Tags) > 0 OR POSITION('<performance>' IN p.Tags) > 0 OR POSITION('<benchmarking>' IN p.Tags) > 0)) THEN 'Performance Related'
+            WHEN (p.Tags IS NOT NULL AND (POSITION('<python>' IN p.Tags) > 0 OR POSITION('<java>' IN p.Tags) > 0 OR POSITION('<c#>' IN p.Tags) > 0)) THEN 'Programming Language Specific'
+            ELSE 'General'
+        END AS TagCategory,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id AND c.Score > 5) AS HighScoringComments,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpVotes,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS DownVotes
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.PostTypeId = 1
+),
+UserPostStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName AS UserName,
+        u.Reputation,
+        u.Views AS UserViews,
+        u.UpVotes AS UserUpVotes,
+        u.DownVotes AS UserDownVotes,
+        COUNT(p.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsOwned,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersOwned,
+        AVG(p.Score) AS AvgPostScore,
+        SUM(p.ViewCount) AS TotalPostViewCount,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+)
+SELECT
+    pd.PostId,
+    pd.Title,
+    pd.PostType,
+    pd.PostCreationDate,
+    pd.PostLastActivityDate,
+    pd.PostLifespanDays,
+    pd.Score,
+    pd.ViewCount,
+    pd.AnswerCount,
+    pd.CommentCount,
+    pd.FavoriteCount,
+    pd.IsClosed,
+    pd.IsCommunityOwned,
+    pd.TagCategory,
+    pd.HighScoringComments,
+    pd.UpVotes AS PostUpVotes,
+    pd.DownVotes AS PostDownVotes,
+    COALESCE(ae.TotalEditsByThisUser, 0) AS EditsByHighestContributor,
+    ae.LastEditDate AS LatestEditDateByHighestContributor,
+    ae.AvgDaysSinceUserCreation AS AvgDaysSinceUserCreationForHighestContributor,
+    COALESCE(ups.TotalPostsOwned, 0) AS UserTotalPostsOwned,
+    COALESCE(ups.TotalQuestionsOwned, 0) AS UserTotalQuestionsOwned,
+    COALESCE(ups.TotalAnswersOwned, 0) AS UserTotalAnswersOwned,
+    COALESCE(ups.AvgPostScore, 0) AS UserAvgPostScore,
+    COALESCE(ups.TotalPostViewCount, 0) AS UserTotalPostViewCount,
+    ups.UserName AS OwnerUserName,
+    ups.Reputation AS OwnerReputation,
+    ups.UserViews AS OwnerUserViews,
+    ups.UserUpVotes AS OwnerUserUpVotes,
+    ups.UserDownVotes AS OwnerUserDownVotes
+FROM PostDetails pd
+LEFT JOIN AggregatedEdits ae ON pd.PostId = ae.PostId
+LEFT JOIN UserPostStats ups ON pd.PostId = (
+    SELECT Id FROM Posts WHERE OwnerUserId = ups.UserId ORDER BY CreationDate DESC LIMIT 1
+)
+WHERE pd.Score > 0
+  AND pd.PostLifespanDays BETWEEN 10 AND 365
+  AND pd.TagCategory = 'Performance Related'
+  AND (pd.CommentCount > 5 OR pd.AnswerCount > 2)
+  AND pd.PostLastActivityDate > DATE '2023-01-01'
+  AND EXISTS (SELECT 1 FROM Comments c WHERE c.PostId = pd.PostId AND POSITION('optimization' IN c.Text) > 0)
+GROUP BY
+    pd.PostId,
+    pd.Title,
+    pd.PostType,
+    pd.PostCreationDate,
+    pd.PostLastActivityDate,
+    pd.PostLifespanDays,
+    pd.Score,
+    pd.ViewCount,
+    pd.AnswerCount,
+    pd.CommentCount,
+    pd.FavoriteCount,
+    pd.IsClosed,
+    pd.IsCommunityOwned,
+    pd.TagCategory,
+    pd.HighScoringComments,
+    pd.UpVotes,
+    pd.DownVotes,
+    COALESCE(ae.TotalEditsByThisUser, 0),
+    ae.LastEditDate,
+    ae.AvgDaysSinceUserCreation,
+    COALESCE(ups.TotalPostsOwned, 0),
+    COALESCE(ups.TotalQuestionsOwned, 0),
+    COALESCE(ups.TotalAnswersOwned, 0),
+    COALESCE(ups.AvgPostScore, 0),
+    COALESCE(ups.TotalPostViewCount, 0),
+    ups.UserName,
+    ups.Reputation,
+    ups.UserViews,
+    ups.UserUpVotes,
+    ups.UserDownVotes
+HAVING SUM(pd.Score) > SUM(pd.DownVotes) * 2
+ORDER BY pd.Score DESC, pd.PostLifespanDays ASC
+LIMIT 100;

@@ -1,0 +1,162 @@
+-- {"query": "4162.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1578} 
+
+WITH
+  RankedPostEdits AS (
+    SELECT
+      ph.PostId,
+      ph.PostHistoryTypeId,
+      ph.UserId,
+      ph.CreationDate,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId, ph.PostHistoryTypeId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory AS ph
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6) AND ph.UserId IS NOT NULL
+  ),
+  PostEditSummaries AS (
+    SELECT
+      rpe.PostId,
+      COUNT(rpe.UserId) AS TotalEdits,
+      MAX(rpe.CreationDate) AS LastEditDate
+    FROM RankedPostEdits AS rpe
+    GROUP BY
+      rpe.PostId
+  ),
+  UserPostActivity AS (
+    SELECT
+      p.OwnerUserId,
+      COUNT(p.Id) AS QuestionCount,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+      SUM(p.ViewCount) AS TotalViews
+    FROM Posts AS p
+    WHERE
+      p.OwnerUserId IS NOT NULL
+    GROUP BY
+      p.OwnerUserId
+  ),
+  UserBadgeCounts AS (
+    SELECT
+      b.UserId,
+      SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+      SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+      SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges AS b
+    GROUP BY
+      b.UserId
+  ),
+  ComplexPostMetrics AS (
+    SELECT
+      p.Id AS PostId,
+      p.Title,
+      p.CreationDate,
+      pt.Name AS PostTypeName,
+      u.DisplayName AS OwnerDisplayName,
+      p.Score,
+      p.ViewCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      COALESCE(pes.TotalEdits, 0) AS TotalEdits,
+      COALESCE(pes.LastEditDate, p.CreationDate) AS LastActivityTimestamp,
+      IIF(p.ClosedDate IS NOT NULL, 1, 0) AS IsClosed,
+      -- Calculating a "quality score" - example: score + (comments * weight1) + (favorite_count * weight2) - (edit_count * weight3)
+      p.Score + (p.CommentCount * 0.5) + (p.FavoriteCount * 1.2) - (COALESCE(pes.TotalEdits, 0) * 0.1) AS QualityScore,
+      -- String manipulation example: extracting tags and checking for a specific tag
+      CASE
+        WHEN p.Tags LIKE '%<sql>%' THEN 'SQL Related'
+        ELSE 'Other'
+      END AS TagCategory,
+      -- Temporal analysis example: days since creation
+      CAST(JULIANDAY('now') - JULIANDAY(p.CreationDate) AS INTEGER) AS DaysSinceCreation,
+      -- NULL logic example: prioritize posts with titles, otherwise use a placeholder
+      COALESCE(p.Title, 'Untitled Post') AS DisplayTitle
+    FROM Posts AS p
+    JOIN PostTypes AS pt
+      ON p.PostTypeId = pt.Id
+    LEFT JOIN Users AS u
+      ON p.OwnerUserId = u.Id
+    LEFT JOIN PostEditSummaries AS pes
+      ON p.Id = pes.PostId
+    WHERE
+      p.PostTypeId = 1 -- Only consider Questions for this metric
+  ),
+  UserEngagement AS (
+    SELECT
+      upa.OwnerUserId,
+      upa.QuestionCount,
+      upa.AnswerCount,
+      upa.TotalViews,
+      COALESCE(ubc.GoldBadges, 0) AS GoldBadges,
+      COALESCE(ubc.SilverBadges, 0) AS SilverBadges,
+      COALESCE(ubc.BronzeBadges, 0) AS BronzeBadges,
+      SUM(cpm.QualityScore) AS TotalQualityScoreContribution
+    FROM UserPostActivity AS upa
+    LEFT JOIN UserBadgeCounts AS ubc
+      ON upa.OwnerUserId = ubc.UserId
+    LEFT JOIN Posts AS p
+      ON upa.OwnerUserId = p.OwnerUserId
+    LEFT JOIN ComplexPostMetrics AS cpm
+      ON p.Id = cpm.PostId
+    GROUP BY
+      upa.OwnerUserId,
+      upa.QuestionCount,
+      upa.AnswerCount,
+      upa.TotalViews,
+      ubc.GoldBadges,
+      ubc.SilverBadges,
+      ubc.BronzeBadges
+  )
+SELECT
+  cpm.PostId,
+  cpm.Title AS QuestionTitle,
+  cpm.PostTypeName,
+  cpm.OwnerDisplayName,
+  cpm.Score,
+  cpm.ViewCount,
+  cpm.CommentCount,
+  cpm.FavoriteCount,
+  cpm.TotalEdits,
+  cpm.QualityScore,
+  cpm.TagCategory,
+  cpm.DaysSinceCreation,
+  cpm.DisplayTitle,
+  ue.QuestionCount AS OwnerQuestionCount,
+  ue.AnswerCount AS OwnerAnswerCount,
+  ue.TotalViews AS OwnerTotalViews,
+  ue.GoldBadges AS OwnerGoldBadges,
+  ue.SilverBadges AS OwnerSilverBadges,
+  ue.BronzeBadges AS OwnerBronzeBadges,
+  ue.TotalQualityScoreContribution AS OwnerTotalQualityScoreContribution,
+  (
+    SELECT
+      AVG(Score)
+    FROM Posts AS p2
+    WHERE
+      p2.OwnerUserId = cpm.OwnerUserId
+      AND p2.PostTypeId = 2 -- Average score of owner's answers
+  ) AS OwnerAvgAnswerScore,
+  CASE
+    WHEN EXISTS (
+      SELECT
+        1
+      FROM PostLinks AS pl
+      WHERE
+        pl.PostId = cpm.PostId AND pl.LinkTypeId = 3
+    ) THEN 'Is Duplicate'
+    ELSE 'Not a Duplicate'
+  END AS DuplicateStatus,
+  CASE
+    WHEN u.Reputation > 10000 THEN 'High Reputation'
+    WHEN u.Reputation > 1000 THEN 'Medium Reputation'
+    ELSE 'Low Reputation'
+  END AS ReputationLevel,
+  CONCAT(u.DisplayName, ' (', u.Reputation, ')') AS UserIdentifier
+FROM ComplexPostMetrics AS cpm
+LEFT JOIN UserEngagement AS ue
+  ON cpm.OwnerUserId = ue.OwnerUserId
+LEFT JOIN Users AS u
+  ON cpm.OwnerUserId = u.Id
+WHERE
+  cpm.DaysSinceCreation > 30 AND cpm.IsClosed = 0
+ORDER BY
+  cpm.QualityScore DESC,
+  cpm.ViewCount DESC
+LIMIT 100;

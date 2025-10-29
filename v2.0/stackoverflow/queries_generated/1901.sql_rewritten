@@ -1,0 +1,179 @@
+-- {"query": "1901.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2987} 
+WITH UserEngagementSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.WebsiteUrl,
+        u.Location,
+        u.AboutMe,
+        u.Views,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS QuestionsWithAcceptedAnswer,
+        SUM(CASE WHEN p.PostTypeId = 2 AND EXISTS (SELECT 1 FROM Posts q WHERE q.Id = p.ParentId AND q.AcceptedAnswerId = p.Id) THEN 1 ELSE 0 END) AS AcceptedAnswersCount,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END) AS AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE NULL END) AS AvgAnswerScore,
+        MAX(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END) AS MaxQuestionViewCount,
+        MIN(p.CreationDate) AS FirstPostDate,
+        MAX(p.CreationDate) AS LastPostDate,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.WebsiteUrl, u.Location, u.AboutMe, u.Views
+),
+UserBadgeAndVoteMetrics AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        MIN(b.Date) AS FirstBadgeDate,
+        MAX(b.Date) AS LastBadgeDate,
+        SUM(CASE WHEN b.Name = 'Good Answer' AND b.Class = 2 THEN 1 ELSE 0 END) AS GoodAnswerBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesReceivedOnPosts,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesReceivedOnPosts
+    FROM
+        Users u
+    LEFT JOIN
+        Badges b ON u.Id = b.UserId
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (2, 3)
+    GROUP BY
+        u.Id
+),
+TopQuestionDetails AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        p.Id AS TopQuestionId,
+        p.Title AS TopQuestionTitle,
+        p.Score AS TopQuestionScore,
+        p.ViewCount AS TopQuestionViewCount,
+        p.Tags AS TopQuestionTags,
+        p.CommentCount AS TopQuestionCommentCount,
+        p.AnswerCount AS TopQuestionAnswerCount,
+        p.CreationDate AS TopQuestionCreationDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC, p.CreationDate DESC) AS rn
+    FROM
+        Posts p
+    WHERE
+        p.PostTypeId = 1
+),
+PostHistoryAggregates AS (
+    SELECT
+        ph.PostId,
+        p.OwnerUserId,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9) AND ph.UserId = p.OwnerUserId THEN 1 ELSE 0 END) AS OwnerEditCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9) AND ph.UserId <> p.OwnerUserId THEN 1 ELSE 0 END) AS OtherEditCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseEvents,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenEvents,
+        MIN(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) AND ph.UserId = p.OwnerUserId THEN EXTRACT(EPOCH FROM (ph.CreationDate - p.CreationDate)) / 86400.0 ELSE NULL END) AS DaysToFirstOwnerEdit
+    FROM
+        PostHistory ph
+    JOIN
+        Posts p ON ph.PostId = p.Id
+    WHERE
+        p.PostTypeId = 1
+        AND ph.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9, 10, 11)
+    GROUP BY
+        ph.PostId, p.OwnerUserId
+)
+SELECT
+    ues.DisplayName,
+    ues.Location,
+    ues.Reputation,
+    ues.Views,
+    COALESCE(ues.AboutMe, 'No "About Me" provided') AS UserAboutMeSnippet,
+    tqd.TopQuestionTitle,
+    tqd.TopQuestionScore,
+    tqd.TopQuestionViewCount,
+    ues.AvgAnswerScore,
+    COALESCE(ubvm.GoodAnswerBadges, 0) AS GoodAnswerBadgeCount,
+    (EXTRACT(EPOCH FROM (ubvm.LastBadgeDate - ubvm.FirstBadgeDate)) / 86400.0) AS DaysBetweenFirstLastBadge,
+    (ues.Reputation / GREATEST(1, EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - ues.UserCreationDate)) / 86400.0)) AS DailyReputationGain,
+    CASE
+        WHEN ues.Reputation >= 20000 AND ues.TotalQuestions >= 20 AND ues.AcceptedAnswersCount >= 10 AND COALESCE(ubvm.GoldBadges, 0) >= 1 THEN 'Stack Guru'
+        WHEN ues.Reputation >= 10000 AND ues.TotalQuestions >= 10 AND ues.AcceptedAnswersCount >= 5 AND COALESCE(ubvm.GoodAnswerBadges, 0) >= 1 THEN 'Highly Engaged & Influential'
+        WHEN ues.Reputation >= 5000 AND ues.TotalQuestions >= 5 AND ues.AcceptedAnswersCount >= 2 AND COALESCE(ubvm.SilverBadges, 0) >= 1 THEN 'Actively Contributing'
+        WHEN ues.Reputation >= 1000 AND ues.TotalPosts >= 10 THEN 'Regular Participant'
+        ELSE 'Casual User'
+    END AS EngagementLevel,
+    pha.OwnerEditCount AS TopQuestionSelfEdits,
+    pha.OtherEditCount AS TopQuestionOtherEdits,
+    pha.CloseEvents AS TopQuestionCloseEvents,
+    pha.ReopenEvents AS TopQuestionReopenEvents,
+    COALESCE(pha.DaysToFirstOwnerEdit, -1) AS DaysToFirstOwnerEdit,
+    CASE
+        WHEN ues.WebsiteUrl IS NOT NULL AND ues.WebsiteUrl LIKE '%//%' AND ues.WebsiteUrl LIKE '%.%' THEN
+            LEFT(ues.WebsiteUrl, POSITION('//' IN ues.WebsiteUrl) + 1) || '...' || SUBSTRING(ues.WebsiteUrl, LENGTH(ues.WebsiteUrl) - POSITION('.' IN REVERSE(ues.WebsiteUrl)) + 1)
+        ELSE 'No Website'
+    END AS AnonymizedWebsiteUrl,
+    (
+        SELECT c.Text
+        FROM Comments c
+        WHERE c.PostId = tqd.TopQuestionId
+          AND c.UserId = ues.UserId
+        ORDER BY c.CreationDate DESC
+        LIMIT 1
+    ) AS LastOwnerCommentOnTopQuestion,
+    EXISTS (
+        SELECT 1
+        FROM PostLinks pl
+        WHERE pl.PostId = tqd.TopQuestionId AND pl.LinkTypeId = 1
+    ) AS HasLinkedTopQuestion,
+    ARRAY_LENGTH(STRING_TO_ARRAY(SUBSTRING(tqd.TopQuestionTags, 2, LENGTH(tqd.TopQuestionTags)-2), '><'), 1) AS NumberOfTagsOnTopQuestion,
+    COALESCE(tqd.TopQuestionScore, 0) * (1.0 + COALESCE(tqd.TopQuestionAnswerCount, 0) / 5.0 + COALESCE(tqd.TopQuestionCommentCount, 0) / 10.0) AS WeightedQuestionImpactScore,
+    RANK() OVER (PARTITION BY (CASE
+        WHEN ues.Reputation >= 20000 AND ues.TotalQuestions >= 20 AND ues.AcceptedAnswersCount >= 10 AND COALESCE(ubvm.GoldBadges, 0) >= 1 THEN 'Stack Guru'
+        WHEN ues.Reputation >= 10000 AND ues.TotalQuestions >= 10 AND ues.AcceptedAnswersCount >= 5 AND COALESCE(ubvm.GoodAnswerBadges, 0) >= 1 THEN 'Highly Engaged & Influential'
+        WHEN ues.Reputation >= 5000 AND ues.TotalQuestions >= 5 AND ues.AcceptedAnswersCount >= 2 AND COALESCE(ubvm.SilverBadges, 0) >= 1 THEN 'Actively Contributing'
+        WHEN ues.Reputation >= 1000 AND ues.TotalPosts >= 10 THEN 'Regular Participant'
+        ELSE 'Casual User'
+    END) ORDER BY ues.Reputation DESC) AS RankWithinEngagementLevel,
+    AVG(ues.Reputation) OVER (PARTITION BY ues.Location) AS AvgReputationInLocation,
+    COALESCE(l.MaxOwnerEditHours, -1) AS MaxHoursBetweenTopQuestionOwnerEdits,
+    COALESCE(l.MinOwnerEditHours, -1) AS MinHoursBetweenTopQuestionOwnerEdits
+FROM
+    Users u_main -- Using an alias to avoid conflict with 'u' in CTEs if they were not explicitly aliased
+JOIN
+    UserEngagementSummary ues ON u_main.Id = ues.UserId
+LEFT JOIN
+    UserBadgeAndVoteMetrics ubvm ON u_main.Id = ubvm.UserId
+JOIN
+    TopQuestionDetails tqd ON u_main.Id = tqd.UserId AND tqd.rn = 1
+LEFT JOIN
+    PostHistoryAggregates pha ON tqd.TopQuestionId = pha.PostId
+LEFT JOIN LATERAL (
+    SELECT
+        MAX(EXTRACT(EPOCH FROM (ph_inner.CreationDate - LAG(ph_inner.CreationDate) OVER (ORDER BY ph_inner.CreationDate))) / 3600.0) FILTER (WHERE LAG(ph_inner.CreationDate) OVER (ORDER BY ph_inner.CreationDate) IS NOT NULL) AS MaxOwnerEditHours,
+        MIN(EXTRACT(EPOCH FROM (ph_inner.CreationDate - LAG(ph_inner.CreationDate) OVER (ORDER BY ph_inner.CreationDate))) / 3600.0) FILTER (WHERE LAG(ph_inner.CreationDate) OVER (ORDER BY ph_inner.CreationDate) IS NOT NULL) AS MinOwnerEditHours
+    FROM PostHistory ph_inner
+    WHERE ph_inner.PostId = tqd.TopQuestionId
+      AND ph_inner.UserId = u_main.Id -- Only owner edits
+      AND ph_inner.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9)
+) l ON TRUE
+WHERE
+    ues.Reputation >= 1000
+    AND ues.TotalQuestions >= 1
+    AND ues.AcceptedAnswersCount >= 1
+    AND ues.MaxQuestionViewCount >= 500
+    AND COALESCE(ubvm.GoodAnswerBadges, 0) >= 1
+    AND (pha.OwnerEditCount IS NULL OR pha.OwnerEditCount < 5)
+    AND ues.Location IS NOT NULL AND ues.Location <> ''
+    AND ues.AboutMe IS NOT NULL AND ues.AboutMe <> ''
+    AND tqd.TopQuestionTags IS NOT NULL AND LENGTH(tqd.TopQuestionTags) > 2
+    AND ues.TotalCommentsMade > 0
+ORDER BY
+    ues.Reputation DESC, DaysBetweenFirstLastBadge DESC, WeightedQuestionImpactScore DESC
+LIMIT 500;

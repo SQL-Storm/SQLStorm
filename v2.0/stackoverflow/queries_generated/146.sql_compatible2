@@ -1,0 +1,361 @@
+with recent_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.location,
+    coalesce(nullif(trim(u.websiteurl), ''), 'n/a') as websiteurl_norm,
+    (u.upvotes - u.downvotes) as net_votes,
+    dense_rank() over (order by u.creationdate desc, u.id desc) as dr_new_users
+  from users u
+),
+question_basics as (
+  select
+    p.id as question_id,
+    p.creationdate,
+    p.owneruserid,
+    p.title,
+    p.tags,
+    p.score as q_score,
+    p.viewcount,
+    p.answercount,
+    coalesce(p.favoritecount, 0) as favoritecount,
+    case when p.closeddate is not null then 1 else 0 end as is_closed
+  from posts p
+  where p.posttypeid = 1
+),
+answer_basics as (
+  select
+    a.id as answer_id,
+    a.parentid as question_id,
+    a.owneruserid as answerer_id,
+    a.score as a_score,
+    a.creationdate as a_creation,
+    row_number() over (partition by a.parentid order by a.score desc nulls last, a.creationdate asc, a.id asc) as rn_score_rank
+  from posts a
+  where a.posttypeid = 2
+),
+accepted_answers as (
+  select
+    q.id as question_id,
+    aa.id as accepted_answer_id,
+    aa.owneruserid as accepted_user_id,
+    aa.score as accepted_score,
+    aa.creationdate as accepted_creation
+  from posts q
+  join posts aa on aa.id = q.acceptedanswerid
+  where q.posttypeid = 1
+),
+agg_votes as (
+  select
+    v.postid,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started,
+    sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded,
+    min(v.creationdate) as first_vote_at,
+    max(v.creationdate) as last_vote_at,
+    count(*) as total_votes
+  from votes v
+  group by v.postid
+),
+comment_stats as (
+  select
+    c.postid,
+    count(*) as comments_cnt,
+    max(c.score) as max_comment_score,
+    sum(case when c.score > 0 then 1 else 0 end) as positive_comments,
+    sum(case when c.userid is null then 1 else 0 end) as anon_comments
+  from comments c
+  group by c.postid
+),
+close_events as (
+  select
+    ph.postid,
+    count(*) filter (where ph.posthistorytypeid = 10) as close_votes_events,
+    min(ph.creationdate) filter (where ph.posthistorytypeid = 10) as first_closed_at,
+    max(ph.creationdate) filter (where ph.posthistorytypeid = 11) as last_reopened_at,
+    string_agg(distinct crt.name, ', ' order by crt.name) as close_reasons
+  from posthistory ph
+  left join (
+    select id, name from close_reason_types
+  ) crt
+    on ph.posthistorytypeid = 10
+   and ph.comment ~ '^[0-9]+$'
+   and cast(crt.id as text) = ph.comment
+  group by ph.postid
+),
+linkage as (
+  select
+    pl.postid as question_id,
+    sum(case when pl.linktypeid = 1 then 1 else 0 end) as linked_cnt,
+    sum(case when pl.linktypeid = 3 then 1 else 0 end) as duplicate_cnt,
+    count(*) as links_total
+  from postlinks pl
+  group by pl.postid
+),
+tag_counts as (
+  select
+    q.question_id,
+    array_length(string_to_array(substring(q.tags, 2, greatest(length(q.tags)-2,0)), '><'), 1) as tag_count,
+    case
+      when q.tags is null then 0
+      when q.tags like '%<sql>%' then 1
+      else 0
+    end as has_sql_tag
+  from question_basics q
+),
+user_activity as (
+  select
+    u.id as user_id,
+    count(*) filter (where p.posttypeid = 1) as q_authored,
+    count(*) filter (where p.posttypeid = 2) as a_authored,
+    sum(coalesce(p.score,0)) as posts_score_sum,
+    max(p.creationdate) as last_post_at
+  from users u
+  left join posts p on p.owneruserid = u.id
+  group by u.id
+),
+question_enriched as (
+  select
+    q.question_id,
+    q.creationdate as q_creation,
+    q.title,
+    coalesce(q.tags, '') as tags,
+    q.q_score,
+    q.viewcount,
+    q.answercount,
+    q.favoritecount,
+    q.is_closed,
+    coalesce(av.upvotes,0) as q_upvotes,
+    coalesce(av.downvotes,0) as q_downvotes,
+    coalesce(av.total_votes,0) as q_total_votes,
+    av.first_vote_at as q_first_vote_at,
+    av.last_vote_at as q_last_vote_at,
+    coalesce(cs.comments_cnt,0) as comments_cnt,
+    coalesce(cs.max_comment_score,0) as max_comment_score,
+    coalesce(lnk.linked_cnt,0) as linked_cnt,
+    coalesce(lnk.duplicate_cnt,0) as duplicate_cnt,
+    coalesce(lnk.links_total,0) as links_total,
+    coalesce(cl.close_votes_events,0) as close_events,
+    cl.first_closed_at,
+    cl.last_reopened_at,
+    cl.close_reasons,
+    tc.tag_count,
+    tc.has_sql_tag
+  from question_basics q
+  left join agg_votes av on av.postid = q.question_id
+  left join comment_stats cs on cs.postid = q.question_id
+  left join linkage lnk on lnk.question_id = q.question_id
+  left join close_events cl on cl.postid = q.question_id
+  left join tag_counts tc on tc.question_id = q.question_id
+),
+answer_enriched as (
+  select
+    ab.question_id,
+    ab.answer_id,
+    ab.answerer_id,
+    ab.a_score,
+    ab.a_creation,
+    ab.rn_score_rank,
+    coalesce(av.upvotes,0) as a_upvotes,
+    coalesce(av.downvotes,0) as a_downvotes,
+    coalesce(av.total_votes,0) as a_total_votes
+  from answer_basics ab
+  left join agg_votes av on av.postid = ab.answer_id
+),
+answer_rollup as (
+  select
+    ae.question_id,
+    count(*) as answers_total,
+    max(ae.a_score) as best_answer_score,
+    avg(cast(ae.a_score as numeric)) as avg_answer_score,
+    max(ae.a_upvotes - ae.a_downvotes) as max_net_answer_votes,
+    min(ae.a_creation) as first_answer_at,
+    max(ae.a_creation) as last_answer_at,
+    count(*) filter (where ae.rn_score_rank = 1) as top_ranked_answers
+  from answer_enriched ae
+  group by ae.question_id
+),
+owner_info as (
+  select
+    q.question_id,
+    u.id as owner_id,
+    coalesce(u.displayname, cast(q.owneruserid as text)) as owner_displayname,
+    u.reputation as owner_reputation,
+    ua.q_authored,
+    ua.a_authored,
+    ua.posts_score_sum,
+    ua.last_post_at,
+    ru.dr_new_users
+  from question_basics q
+  left join users u on u.id = q.owneruserid
+  left join user_activity ua on ua.user_id = u.id
+  left join recent_users ru on ru.user_id = u.id
+),
+accepted_info as (
+  select
+    ac.question_id,
+    ac.accepted_answer_id,
+    ac.accepted_user_id,
+    ac.accepted_score,
+    ac.accepted_creation,
+    ua.reputation as accepted_user_reputation
+  from accepted_answers ac
+  left join users ua on ua.id = ac.accepted_user_id
+),
+quality_signals as (
+  select
+    qe.question_id,
+    case
+      when qe.q_score >= 5 and qe.viewcount >= 1000 and qe.comments_cnt <= 2 and qe.is_closed = 0 then 'excellent'
+      when qe.q_score >= 1 and qe.viewcount >= 100 and qe.is_closed = 0 then 'good'
+      when qe.is_closed = 1 then 'closed'
+      else 'low'
+    end as quality_bucket,
+    case
+      when qe.duplicate_cnt > 0 then 1 else 0
+    end as dup_flag,
+    case
+      when qe.q_total_votes > 0 then (cast(qe.q_upvotes as numeric) - cast(qe.q_downvotes as numeric)) / nullif(cast(qe.q_total_votes as numeric),0)
+      else null
+    end as vote_ratio
+  from question_enriched qe
+),
+top_tags as (
+  select
+    q.question_id,
+    t.tagname,
+    t.count as tag_global_count,
+    row_number() over (partition by q.question_id order by t.count desc nulls last, t.tagname asc) as rn_tag_pop
+  from question_basics q
+  cross join lateral (
+    select unnest(string_to_array(substring(q.tags, 2, greatest(length(q.tags)-2,0)), '><')) as tagname
+  ) ut
+  left join tags t on t.tagname = ut.tagname
+),
+best_tag as (
+  select question_id,
+         tagname as top_tag,
+         tag_global_count
+  from top_tags
+  where rn_tag_pop = 1
+),
+question_score_percentile as (
+  select
+    question_id,
+    q_score,
+    ntile(100) over (order by q_score asc nulls first) as score_percentile
+  from question_basics
+),
+final as (
+  select
+    qe.question_id,
+    qe.q_creation,
+    trim(both from coalesce(qe.title, '')) as title,
+    regexp_replace(coalesce(qe.tags,''), '\s+', '', 'g') as tags_clean,
+    qe.q_score,
+    qe.viewcount,
+    qe.answercount,
+    qe.favoritecount,
+    qe.is_closed,
+    qe.q_upvotes,
+    qe.q_downvotes,
+    qe.q_total_votes,
+    qe.q_first_vote_at,
+    qe.q_last_vote_at,
+    qe.comments_cnt,
+    qe.max_comment_score,
+    qe.linked_cnt,
+    qe.duplicate_cnt,
+    qe.links_total,
+    qe.close_events,
+    qe.first_closed_at,
+    qe.last_reopened_at,
+    coalesce(nullif(qe.close_reasons,''),'none') as close_reasons,
+    qe.tag_count,
+    qe.has_sql_tag,
+    ar.answers_total,
+    ar.best_answer_score,
+    ar.avg_answer_score,
+    ar.max_net_answer_votes,
+    ar.first_answer_at,
+    ar.last_answer_at,
+    oi.owner_id,
+    oi.owner_displayname,
+    oi.owner_reputation,
+    oi.q_authored,
+    oi.a_authored,
+    oi.posts_score_sum,
+    oi.last_post_at,
+    oi.dr_new_users,
+    ai.accepted_answer_id,
+    ai.accepted_user_id,
+    ai.accepted_score,
+    ai.accepted_creation,
+    ai.accepted_user_reputation,
+    qs.quality_bucket,
+    qs.dup_flag,
+    qs.vote_ratio,
+    bt.top_tag,
+    bt.tag_global_count,
+    sp.score_percentile,
+    case
+      when ai.accepted_answer_id is not null then 1 else 0
+    end as has_accepted,
+    case
+      when ar.answers_total is null or ar.answers_total = 0 then 1 else 0
+    end as no_answers_yet,
+    case
+      when qe.viewcount > 0 and qe.q_score > 0 then ln(qe.viewcount + qe.q_score)
+      when qe.viewcount > 0 then ln(cast(qe.viewcount as numeric))
+      else null
+    end as ln_signal,
+    (
+      select left(c2.text, 80)
+      from comments c2
+      where c2.postid = qe.question_id
+      order by c2.creationdate desc, c2.id desc
+      limit 1
+    ) as last_comment_snippet
+  from question_enriched qe
+  left join answer_rollup ar on ar.question_id = qe.question_id
+  left join owner_info oi on oi.question_id = qe.question_id
+  left join accepted_info ai on ai.question_id = qe.question_id
+  left join quality_signals qs on qs.question_id = qe.question_id
+  left join best_tag bt on bt.question_id = qe.question_id
+  left join question_score_percentile sp on sp.question_id = qe.question_id
+),
+ranked as (
+  select
+    f.*,
+    row_number() over (
+      order by
+        case f.quality_bucket when 'excellent' then 1 when 'good' then 2 when 'low' then 3 else 4 end,
+        coalesce(f.accepted_score, -9999) desc,
+        f.q_score desc,
+        f.viewcount desc,
+        f.answers_total desc nulls last,
+        f.question_id desc
+    ) as bench_rank,
+    sum(coalesce(f.q_total_votes,0)) over () as total_votes_all_questions,
+    avg(coalesce(f.avg_answer_score,0)) over () as global_avg_answer_score
+  from final f
+)
+select
+  r.*
+from ranked r
+where
+  (
+    (r.has_sql_tag = 1 and r.dup_flag = 0)
+    or (r.answers_total is not null and r.answers_total >= 2 and r.vote_ratio is not null and r.vote_ratio > 0.2)
+    or (r.is_closed = 1 and coalesce(r.close_events,0) >= 1)
+  )
+  and coalesce(r.owner_reputation,0) + coalesce(r.accepted_user_reputation,0) >= 0
+  and (r.score_percentile >= 50 or r.viewcount > 500)
+  and not (r.no_answers_yet = 1 and r.is_closed = 1)
+  and (r.top_tag is distinct from r.owner_displayname)
+order by
+  r.bench_rank
+limit 500;

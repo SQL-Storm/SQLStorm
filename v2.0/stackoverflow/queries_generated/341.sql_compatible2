@@ -1,0 +1,365 @@
+with
+active_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.lastaccessdate,
+    coalesce(nullif(trim(u.location), ''), 'Unknown') as location_norm,
+    coalesce(u.websiteurl, '') as websiteurl,
+    u.upvotes,
+    u.downvotes,
+    u.views,
+    row_number() over (order by u.reputation desc, u.id) as rn_rep
+  from users u
+  where u.reputation > 0
+    and u.creationdate <= cast('2024-10-01 12:34:56' as timestamp)
+),
+badge_agg as (
+  select
+    b.userid,
+    count(*) as total_badges,
+    sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+    sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+    sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+    min(b.date) as first_badge_date,
+    max(b.date) as last_badge_date
+  from badges b
+  group by b.userid
+),
+questions as (
+  select
+    p.id as qid,
+    p.owneruserid as q_owner_id,
+    p.creationdate as q_created,
+    p.lastactivitydate as q_lastact,
+    p.score as q_score,
+    p.viewcount,
+    p.answercount,
+    p.acceptedanswerid,
+    p.title,
+    p.tags,
+    string_to_array(substring(p.tags, 2, greatest(length(p.tags)-2,0)), '><') as tag_arr,
+    extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - p.creationdate))/86400.0 as age_days
+  from posts p
+  where p.posttypeid = 1
+),
+answers as (
+  select
+    a.id as aid,
+    a.parentid as qid,
+    a.owneruserid as a_owner_id,
+    a.creationdate as a_created,
+    a.lastactivitydate as a_lastact,
+    a.score as a_score,
+    row_number() over (partition by a.parentid order by a.score desc nulls last, a.id) as rn_ans_by_score
+  from posts a
+  where a.posttypeid = 2
+),
+vote_agg as (
+  select
+    v.postid,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started,
+    sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded,
+    count(*) as total_votes,
+    min(v.creationdate) as first_vote_at,
+    max(v.creationdate) as last_vote_at
+  from votes v
+  group by v.postid
+),
+dupe_map as (
+  select
+    pl.postid as dup_qid,
+    pl.relatedpostid as original_qid,
+    min(pl.creationdate) as first_linked_at
+  from postlinks pl
+  where pl.linktypeid = 3
+  group by pl.postid, pl.relatedpostid
+),
+comment_agg as (
+  select
+    c.postid,
+    count(*) as comment_count,
+    max(c.creationdate) as last_comment_at,
+    max(c.score) as max_comment_score
+  from comments c
+  group by c.postid
+),
+close_reasons as (
+  -- move regexp to a lateral to avoid set-returning in aggregate
+  select
+    ph.postid as qid,
+    min(case when ph.posthistorytypeid = 10 then ph.creationdate end) as first_closed_at,
+    max(case when ph.posthistorytypeid = 11 then ph.creationdate end) as last_reopened_at,
+    cast(max(ph_close.close_reason_text_int) as integer) as close_reason_id
+  from posthistory ph
+  left join lateral (
+    select
+      case
+        when ph.posthistorytypeid = 10 then
+          -- extract first digits group from comment; returns text or null
+          (regexp_match_text(match_comment.text_match))[1]
+        else null
+      end as close_reason_text_int
+    from (
+      select
+        case
+          when ph.posthistorytypeid = 10 then
+            -- use regexp_matches equivalent as a single-match function emulation
+            (select regexp_matches(coalesce(ph.comment,''), '([0-9]+)') ) 
+          else null
+        end as text_match
+    ) match_comment
+    -- wrapper function to safely convert array result to text; if null, returns array[] so indexing is safe
+    cross join lateral (
+      select
+        case
+          when match_comment.text_match IS NULL then array[]::text[]
+          else match_comment.text_match
+        end as text_match2
+    ) mt
+    -- inline function replacement: pick mt.text_match2 as regexp_match_text
+    cross join lateral (
+      select mt.text_match2 as text_match_final
+    ) mf
+    -- provide a simple accessor function alias used above
+    cross join lateral (
+      select mf.text_match_final as text_match
+    ) t2
+    -- final adaptor to produce a scalar-like array for upper levels; no additional columns needed
+  ) ph_close on true
+  where ph.posthistorytypeid in (10,11)
+  group by ph.postid
+),
+q_tags as (
+  select
+    q.qid,
+    lower(trim(t.tag)) as tagname
+  from questions q
+  cross join lateral unnest(coalesce(q.tag_arr, array[])) as t(tag)
+),
+tag_rank as (
+  select
+    qt.tagname,
+    count(*) as tag_q_count,
+    dense_rank() over (order by count(*) desc) as dr_tag_pop
+  from q_tags qt
+  group by qt.tagname
+),
+q_top_tag as (
+  select distinct on (qt.qid)
+    qt.qid,
+    qt.tagname,
+    tr.tag_q_count,
+    tr.dr_tag_pop
+  from q_tags qt
+  join tag_rank tr on tr.tagname = qt.tagname
+  order by qt.qid, tr.dr_tag_pop, tr.tagname
+),
+user_answer_activity as (
+  select
+    a.a_owner_id as user_id,
+    cast(a.a_created as date) as d,
+    count(*) as answers_on_day
+  from answers a
+  group by a.a_owner_id, cast(a.a_created as date)
+),
+user_answer_roll90 as (
+  select
+    u.user_id,
+    u.d,
+    sum(u.answers_on_day) over (
+      partition by u.user_id
+      order by u.d
+      rows between 89 preceding and current row
+    ) as answers_rolling_90d
+  from user_answer_activity u
+),
+power_helpers as (
+  select distinct user_id
+  from user_answer_roll90
+  where answers_rolling_90d >= 50
+),
+answer_volatility as (
+  select
+    a.qid,
+    stddev_pop(a.a_score) as ans_score_stddev,
+    avg(a.a_score) as ans_score_avg,
+    count(*) as ans_count
+  from answers a
+  group by a.qid
+),
+effective_votes as (
+  select
+    va.postid,
+    coalesce(va.upvotes,0) - coalesce(va.downvotes,0) as net_votes,
+    coalesce(va.total_votes,0) as total_votes
+  from vote_agg va
+),
+question_activity_rank as (
+  select
+    q.qid,
+    q.q_lastact,
+    q.viewcount,
+    row_number() over (order by q.q_lastact desc nulls last, q.viewcount desc nulls last, q.qid) as rn_activity
+  from questions q
+),
+main as (
+  select
+    q.qid,
+    q.q_owner_id,
+    au.displayname as owner_name,
+    au.reputation as owner_rep,
+    ba.total_badges,
+    ba.gold_badges,
+    ba.silver_badges,
+    ba.bronze_badges,
+    (ph.user_id is not null) as owner_is_power_helper,
+    q.title,
+    q.tags,
+    coalesce(qtt.tagname, '(none)') as top_tag,
+    qtt.dr_tag_pop as top_tag_rank,
+    q.q_created,
+    q.q_lastact,
+    q.age_days,
+    q.q_score,
+    q.viewcount,
+    q.answercount,
+    ev.net_votes as q_net_votes,
+    ev.total_votes as q_total_votes,
+    coalesce(ca.comment_count,0) as comment_count,
+    ca.last_comment_at,
+    ca.max_comment_score,
+    ar.ans_score_stddev,
+    ar.ans_score_avg,
+    ar.ans_count,
+    case when q.acceptedanswerid is not null then 1 else 0 end as has_accepted,
+    (select avg(a2.a_score) from answers a2 where a2.qid = q.qid and a2.rn_ans_by_score <= 3) as top3_ans_avg_score,
+    (select count(*) from answers a3 where a3.qid = q.qid and a3.a_score > 0) as positive_ans_cnt,
+    (select count(*) from comments c2 where c2.postid = q.qid and c2.score > 5) as hot_comments_cnt,
+    cr.close_reason_id,
+    cr.first_closed_at,
+    cr.last_reopened_at,
+    dm.original_qid,
+    dm.first_linked_at as dup_linked_at,
+    qar.rn_activity
+  from questions q
+  left join active_users au on au.user_id = q.q_owner_id
+  left join badge_agg ba on ba.userid = q.q_owner_id
+  left join power_helpers ph on ph.user_id = q.q_owner_id
+  left join q_top_tag qtt on qtt.qid = q.qid
+  left join effective_votes ev on ev.postid = q.qid
+  left join comment_agg ca on ca.postid = q.qid
+  left join answer_volatility ar on ar.qid = q.qid
+  left join close_reasons cr on cr.qid = q.qid
+  left join dupe_map dm on dm.dup_qid = q.qid
+  left join question_activity_rank qar on qar.qid = q.qid
+),
+scored as (
+  select
+    m.*,
+    greatest(0.0,
+      0.4 * ln(1 + coalesce(m.age_days,0)) +
+      0.3 * case when m.has_accepted = 0 then 1 else 0 end +
+      0.2 * coalesce(m.ans_score_stddev, 0) / nullif(abs(coalesce(m.ans_score_avg,0)) + 1,0) +
+      0.1 * case when coalesce(m.q_net_votes,0) < 0 then 1 else 0 end
+    ) as difficulty_score,
+    0.5 * ln(1 + coalesce(m.viewcount,0)) +
+    0.2 * ln(1 + coalesce(m.comment_count,0)) +
+    0.2 * ln(1 + coalesce(m.q_total_votes,0)) +
+    0.1 * ln(1 + (select max(tr2.tag_q_count) from tag_rank tr2) - coalesce(m.top_tag_rank, (select max(tr2.dr_tag_pop) from tag_rank tr2))) as engagement_score,
+    0.6 * ln(1 + coalesce(m.owner_rep,0)) +
+    0.2 * ln(1 + coalesce(m.total_badges,0)) +
+    0.2 * case when m.owner_is_power_helper then 1 else 0 end as owner_quality_score
+  from main m
+),
+ranked as (
+  select
+    s.*,
+    ntile(5) over (order by s.difficulty_score desc nulls last) as difficulty_bucket,
+    ntile(5) over (order by s.engagement_score desc nulls last) as engagement_bucket,
+    ntile(5) over (order by s.owner_quality_score desc nulls last) as owner_bucket,
+    row_number() over (
+      order by
+        s.difficulty_score desc nulls last,
+        s.engagement_score desc nulls last,
+        s.owner_quality_score desc nulls last,
+        s.qid
+    ) as rn_global
+  from scored s
+),
+near_dupes as (
+  select
+    r1.qid as qid_left,
+    r2.qid as qid_right,
+    r1.top_tag,
+    abs(extract(epoch from (r1.q_created - r2.q_created))) as delta_sec,
+    row_number() over (partition by r1.qid order by abs(extract(epoch from (r1.q_created - r2.q_created)))) as rn_near
+  from ranked r1
+  join ranked r2
+    on r1.top_tag = r2.top_tag
+   and r1.qid <> r2.qid
+   and r1.top_tag is not null
+   and abs(extract(epoch from (r1.q_created - r2.q_created))) <= 86400*7
+),
+nearest_neighbor as (
+  select
+    qid_left as qid,
+    qid_right as neighbor_qid,
+    top_tag as neighbor_on_tag,
+    delta_sec
+  from near_dupes
+  where rn_near = 1
+)
+select
+  r.qid,
+  coalesce(r.owner_name, '(unknown)') as owner_name,
+  r.owner_rep,
+  r.total_badges,
+  r.title,
+  r.top_tag,
+  r.q_created,
+  r.q_lastact,
+  r.q_score,
+  r.viewcount,
+  r.answercount,
+  r.has_accepted,
+  r.q_net_votes,
+  r.q_total_votes,
+  r.comment_count,
+  r.ans_count,
+  round(cast(r.difficulty_score as numeric), 4) as difficulty_score,
+  round(cast(r.engagement_score as numeric), 4) as engagement_score,
+  round(cast(r.owner_quality_score as numeric), 4) as owner_quality_score,
+  r.difficulty_bucket,
+  r.engagement_bucket,
+  r.owner_bucket,
+  r.rn_activity as activity_rank,
+  r.close_reason_id,
+  r.first_closed_at,
+  r.last_reopened_at,
+  r.original_qid as duplicate_of_qid,
+  nn.neighbor_qid as nearest_qid_by_tag_time,
+  nn.neighbor_on_tag as neighbor_tag,
+  make_interval(secs => coalesce(nn.delta_sec, 0)) as neighbor_time_delta
+from ranked r
+left join nearest_neighbor nn on nn.qid = r.qid
+where
+  (
+    (r.difficulty_bucket in (4,5) and r.engagement_bucket >= 3)
+    or (r.owner_bucket >= 4 and r.engagement_bucket <= 2 and coalesce(r.q_net_votes,0) <= 0)
+    or (r.close_reason_id in (101,102,103,104,105) and r.first_closed_at is not null and r.last_reopened_at is null)
+  )
+  and (r.top_tag is not null or r.tags is null or r.tags = '')
+  and coalesce(r.viewcount, 0) >= 0
+  and (r.original_qid is null or r.q_created >= coalesce((select q2.q_created from questions q2 where q2.qid = r.original_qid), r.q_created))
+order by
+  r.difficulty_score desc nulls last,
+  r.engagement_score desc nulls last,
+  r.owner_quality_score desc nulls last,
+  r.q_lastact desc nulls last,
+  r.qid
+limit 500;

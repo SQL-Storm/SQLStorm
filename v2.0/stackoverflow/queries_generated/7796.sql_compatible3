@@ -1,0 +1,215 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ParentId,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevScore,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS UserPostRank,
+        NTILE(10) OVER (ORDER BY p.Score DESC) AS ScoreDecile,
+        DENSE_RANK() OVER (ORDER BY p.ViewCount DESC) AS ViewRank,
+        COALESCE(p.Tags, '') AS CleanTags,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN 'QuestionWithAnswers'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostCategory,
+        CASE 
+            WHEN p.Score > 100 THEN 'HighlyVoted'
+            WHEN p.Score > 50 THEN 'ModeratelyVoted'
+            ELSE 'LowVoted'
+        END AS PopularityLevel
+    FROM Posts p
+    WHERE p.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2' YEAR)
+      AND p.Score IS NOT NULL
+),
+UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.AccountId,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        AVG(p.Score) AS AvgScore,
+        MAX(p.Score) AS MaxScore,
+        MIN(p.Score) AS MinScore,
+        STRING_AGG(COALESCE(p.Title, ''), ' | ') AS PostTitles
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '3' YEAR)
+    GROUP BY u.Id, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.AccountId
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            ELSE 'Niche'
+        END AS TagPopularity,
+        RANK() OVER (ORDER BY t.Count DESC) AS TagRank
+    FROM Tags t
+    WHERE t.Count > 0
+),
+PostActivity AS (
+    SELECT 
+        ph.PostId,
+        COUNT(*) AS HistoryCount,
+        MAX(ph.CreationDate) AS LastActivity,
+        MIN(ph.PostHistoryTypeId) AS FirstAction,
+        MAX(ph.PostHistoryTypeId) AS LastAction,
+        STRING_AGG(ph.Comment, ', ') AS ActionComments,
+        AVG(CAST(ph.PostHistoryTypeId AS NUMERIC)) AS AvgActionType
+    FROM PostHistory ph
+    WHERE ph.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6' MONTH)
+    GROUP BY ph.PostId
+),
+CombinedData AS (
+    SELECT 
+        rp.Id AS PostId,
+        rp.PostTypeId,
+        rp.Score,
+        rp.ViewCount,
+        rp.CreationDate,
+        rp.OwnerUserId,
+        rp.Title,
+        rp.Tags,
+        rp.AnswerCount,
+        rp.CommentCount,
+        rp.FavoriteCount,
+        rp.PrevScore,
+        rp.UserPostRank,
+        rp.ScoreDecile,
+        rp.ViewRank,
+        rp.CleanTags,
+        rp.PostCategory,
+        rp.PopularityLevel,
+        us.Reputation,
+        us.Views AS UserViews,
+        us.UpVotes AS UserUpVotes,
+        us.DownVotes AS UserDownVotes,
+        us.TotalPosts,
+        us.QuestionCount,
+        us.AnswerCount AS UserAnswerCount,
+        us.AvgScore AS UserAvgScore,
+        us.MaxScore AS UserMaxScore,
+        us.MinScore AS UserMinScore,
+        ta.TagName,
+        ta."TagCount",
+        ta.TagPopularity,
+        pa.HistoryCount,
+        pa.LastActivity,
+        pa.FirstAction,
+        pa.LastAction,
+        CASE 
+            WHEN rp.Score > us.AvgScore THEN 'AboveAvg'
+            WHEN rp.Score < us.AvgScore THEN 'BelowAvg'
+            ELSE 'Avg'
+        END AS ScoreVsUserAvg,
+        CASE 
+            WHEN rp.PostTypeId = 1 AND rp.AnswerCount > 0 THEN 
+                CASE WHEN rp.Score > 50 THEN 'QuestionHighScore' ELSE 'QuestionLowScore' END
+            WHEN rp.PostTypeId = 2 THEN 
+                CASE WHEN rp.Score > 10 THEN 'AnswerGoodScore' ELSE 'AnswerPoorScore' END
+            ELSE 'Other'
+        END AS QualityAssessment,
+        CASE 
+            WHEN rp.AnswerCount > 0 AND rp.Score > 100 THEN
+                CASE WHEN EXISTS(SELECT 1 FROM PostLinks pl WHERE pl.PostId = rp.Id AND pl.LinkTypeId = 3) THEN 'DuplicateQuestion' ELSE 'NonDuplicateQuestion' END
+            WHEN rp.AnswerCount = 0 AND rp.PostTypeId = 1 THEN 'UnansweredQuestion'
+            ELSE 'Other'
+        END AS QuestionStatus,
+        rp.ParentId
+    FROM RankedPosts rp
+    LEFT JOIN UserStats us ON rp.OwnerUserId = us.UserId
+    LEFT JOIN PostActivity pa ON rp.Id = pa.PostId
+    LEFT JOIN Tags ta ON rp.CleanTags LIKE '%' || ta.TagName || '%'
+    WHERE rp.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1' YEAR)
+)
+SELECT 
+    cd.PostId,
+    cd.PostTypeId,
+    cd.Score,
+    cd.ViewCount,
+    cd.CreationDate,
+    cd.OwnerUserId,
+    cd.Title,
+    cd.Tags,
+    cd.AnswerCount,
+    cd.CommentCount,
+    cd.FavoriteCount,
+    cd.PrevScore,
+    cd.UserPostRank,
+    cd.ScoreDecile,
+    cd.ViewRank,
+    cd.CleanTags,
+    cd.PostCategory,
+    cd.PopularityLevel,
+    cd.Reputation,
+    cd.UserViews,
+    cd.UserUpVotes,
+    cd.UserDownVotes,
+    cd.TotalPosts,
+    cd.QuestionCount,
+    cd.UserAnswerCount,
+    cd.UserAvgScore,
+    cd.UserMaxScore,
+    cd.UserMinScore,
+    cd.TagName,
+    cd."TagCount" AS TagCount,
+    cd.TagPopularity,
+    cd.HistoryCount,
+    cd.LastActivity,
+    cd.FirstAction,
+    cd.LastAction,
+    cd.ScoreVsUserAvg,
+    cd.QualityAssessment,
+    cd.QuestionStatus,
+    CASE 
+        WHEN cd.Score >= 100 AND cd.AnswerCount IS NOT NULL AND cd.AnswerCount > 0 THEN 
+            (SELECT p.Title FROM Posts p WHERE p.Id = cd.ParentId LIMIT 1)
+        ELSE NULL
+    END AS ParentTitle,
+    EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - cd.CreationDate)) / 86400.0 AS DaysSinceCreation,
+    CASE 
+        WHEN cd.HistoryCount > 10 THEN 'HighActivity'
+        WHEN cd.HistoryCount > 5 THEN 'MediumActivity'
+        ELSE 'LowActivity'
+    END AS ActivityLevel,
+    CASE WHEN cd.Score > cd.UserAvgScore THEN 1 ELSE 0 END AS IsAboveUserAverage,
+    STRING_AGG(cd.Title, ' | ') OVER (PARTITION BY cd.OwnerUserId ORDER BY cd.CreationDate ROWS UNBOUNDED PRECEDING) AS UserPostHistory,
+    ROUND(
+        CASE 
+            WHEN cd.ViewCount > 0 THEN CAST(cd.Score AS DOUBLE PRECISION) / CAST(cd.ViewCount AS DOUBLE PRECISION)
+            ELSE 0
+        END, 2
+    ) AS ScorePerView,
+    CASE 
+        WHEN cd.PostCategory = 'QuestionWithAnswers' AND cd.AnswerCount > 5 THEN 'AnswerRichQuestion'
+        WHEN cd.PostCategory = 'QuestionWithAnswers' THEN 'NormalQuestion'
+        ELSE 'OtherQuestionType'
+    END AS QuestionClassification,
+    CASE WHEN EXISTS(
+            SELECT 1 FROM Votes v 
+            WHERE v.PostId = cd.PostId 
+              AND v.VoteTypeId = 2 
+              AND v.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30' DAY)
+        ) THEN 'RecentUpvote' ELSE 'NoRecentUpvote' END AS RecentUpvoteStatus
+FROM CombinedData cd
+ORDER BY cd.CreationDate DESC, cd.Score DESC
+OFFSET 0 ROWS FETCH NEXT 1000 ROWS ONLY;

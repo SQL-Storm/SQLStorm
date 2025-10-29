@@ -1,0 +1,97 @@
+WITH UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(p.CreationDate) AS LatestPostDate,
+        (u.UpVotes - u.DownVotes) AS NetVotesGiven,
+        EXTRACT(DAY FROM (u.LastAccessDate - u.CreationDate)) AS DaysSinceCreation,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpvotesGiven,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownvotesGiven
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.UpVotes, u.DownVotes
+),
+PostHistoricalAnalysis AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        LENGTH(p.Body) AS BodyLength,
+        COUNT(ph_edit.Id) FILTER (WHERE ph_edit.PostHistoryTypeId IN (4, 5, 6)) AS EditCount,
+        COUNT(ph_reopen.Id) FILTER (WHERE ph_reopen.PostHistoryTypeId = 11) AS ReopenCount,
+        MAX(ph_close.CreationDate) AS LastCloseDate,
+        MAX(ph_delete.CreationDate) AS LastDeleteDate,
+        (SELECT COUNT(DISTINCT pl.RelatedPostId)
+         FROM PostLinks pl
+         WHERE pl.PostId = p.Id
+           AND pl.LinkTypeId = 3
+           AND pl.RelatedPostId IN (SELECT sub_p.Id FROM Posts sub_p WHERE sub_p.OwnerUserId IS NOT NULL)
+        ) AS DuplicateLinkCount,
+        STRING_AGG(DISTINCT crt.Name, ' | ') FILTER (WHERE ph_close.PostHistoryTypeId = 10) AS CloseReasons,
+        COUNT(ph_close.Id) FILTER (WHERE ph_close.PostHistoryTypeId = 10) AS CloseCount
+    FROM Posts p
+    LEFT JOIN PostHistory ph_edit ON ph_edit.PostId = p.Id
+    LEFT JOIN PostHistory ph_reopen ON ph_reopen.PostId = p.Id
+    LEFT JOIN PostHistory ph_close ON ph_close.PostId = p.Id
+    LEFT JOIN PostHistory ph_delete ON ph_delete.PostId = p.Id
+    LEFT JOIN CloseReasonTypes crt ON ph_close.Comment = crt.Id
+    GROUP BY p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Body
+),
+FinalAggregates AS (
+    SELECT
+        ue.UserId,
+        ue.DisplayName,
+        ue.Reputation,
+        ue.UserCreationDate,
+        ue.LastAccessDate,
+        ue.TotalPosts,
+        ue.TotalQuestions,
+        ue.TotalAnswers,
+        ue.TotalComments,
+        ue.TotalBadges,
+        ue.GoldBadges,
+        ue.SilverBadges,
+        ue.BronzeBadges,
+        ue.AvgPostScore,
+        ue.LatestPostDate,
+        ue.NetVotesGiven,
+        ue.DaysSinceCreation,
+        ue.UpvotesGiven,
+        ue.DownvotesGiven,
+        pha.PostId,
+        pha.PostTypeId,
+        pha.OwnerUserId,
+        pha.PostCreationDate,
+        pha.PostScore,
+        pha.ViewCount,
+        pha.BodyLength,
+        pha.EditCount,
+        pha.ReopenCount,
+        pha.LastCloseDate,
+        pha.LastDeleteDate,
+        pha.DuplicateLinkCount,
+        pha.CloseReasons,
+        pha.CloseCount
+    FROM UserEngagement ue
+    LEFT JOIN PostHistoricalAnalysis pha ON pha.OwnerUserId = ue.UserId
+)
+SELECT *
+FROM FinalAggregates;

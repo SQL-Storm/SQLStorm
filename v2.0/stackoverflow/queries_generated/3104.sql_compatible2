@@ -1,0 +1,137 @@
+WITH
+user_agg AS (
+    SELECT
+        u.Id                                      AS user_id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.UpVotes,0) - COALESCE(u.DownVotes,0) AS net_votes,
+        COUNT(b.Id)                               FILTER (WHERE b.Class = 1) AS gold_badges,
+        COUNT(b.Id)                               FILTER (WHERE b.Class = 2) AS silver_badges,
+        COUNT(b.Id)                               FILTER (WHERE b.Class = 3) AS bronze_badges,
+        MAX(u.LastAccessDate)                    AS last_access,
+        MIN(u.CreationDate)                      AS first_seen
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes
+),
+answer_stats AS (
+    SELECT
+        a.Id                                              AS answer_id,
+        a.OwnerUserId                                      AS author_id,
+        a.Score                                            AS answer_score,
+        a.CreationDate,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - a.CreationDate))/86400 AS age_days,
+        CASE WHEN a.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END AS is_accepted,
+        UNNEST(
+            CASE
+                WHEN q.Tags IS NOT NULL
+                THEN string_to_array(
+                        substring(q.Tags FROM 2 FOR length(q.Tags)-2),
+                        '><')
+                ELSE ARRAY[]::text[]
+            END
+        )                                        AS tag_name
+    FROM Posts a
+    JOIN Posts q ON q.Id = a.ParentId
+    WHERE a.PostTypeId = 2
+),
+tag_agg AS (
+    SELECT
+        tag_name,
+        COUNT(DISTINCT answer_id)                         AS answers_cnt,
+        AVG(answer_score)                                 AS avg_score,
+        SUM(is_accepted)                                  AS accepted_cnt,
+        ROW_NUMBER() OVER (PARTITION BY tag_name ORDER BY AVG(answer_score) DESC) AS rn_by_score
+    FROM answer_stats
+    GROUP BY tag_name
+),
+latest_vote AS (
+    SELECT
+        p.Id                                            AS post_id,
+        (SELECT vt.Name
+         FROM Votes v
+         JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+         WHERE v.PostId = p.Id
+         ORDER BY v.CreationDate DESC
+         LIMIT 1)                                       AS latest_vote_type
+    FROM Posts p
+),
+combined AS (
+    SELECT
+        ua.user_id,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.net_votes,
+        ua.gold_badges,
+        ua.silver_badges,
+        ua.bronze_badges,
+        ua.last_access,
+        ua.first_seen,
+        COALESCE(COUNT(DISTINCT a.answer_id),0)          AS total_answers,
+        COALESCE(SUM(a.answer_score),0)                  AS sum_answer_score,
+        COALESCE(AVG(a.age_days),0)                     AS avg_answer_age_days,
+        COALESCE(MAX(a.is_accepted),0)                  AS has_accepted_answer,
+        STRING_AGG(DISTINCT lv.latest_vote_type, '|' )
+            FILTER (WHERE lv.latest_vote_type IS NOT NULL) AS vote_types_seen
+    FROM user_agg ua
+    LEFT JOIN answer_stats a ON a.author_id = ua.user_id
+    LEFT JOIN latest_vote lv ON lv.post_id = a.answer_id
+    GROUP BY
+        ua.user_id, ua.DisplayName, ua.Reputation, ua.net_votes,
+        ua.gold_badges, ua.silver_badges, ua.bronze_badges,
+        ua.last_access, ua.first_seen
+),
+first_select AS (
+    SELECT
+        c.user_id,
+        c.DisplayName,
+        c.Reputation,
+        c.net_votes,
+        c.gold_badges,
+        c.silver_badges,
+        c.bronze_badges,
+        c.total_answers,
+        c.sum_answer_score,
+        ROUND(c.avg_answer_age_days,2)            AS avg_answer_age_days,
+        CASE WHEN c.has_accepted_answer = 1 THEN 'YES' ELSE 'NO' END AS has_accepted_answer,
+        COALESCE(NULLIF(c.vote_types_seen,''), 'NONE') AS vote_types_seen,
+        RANK() OVER (ORDER BY
+            (c.Reputation * 0.4) +
+            (c.gold_badges   * 30) +
+            (c.silver_badges * 15) +
+            (c.bronze_badges * 5)  +
+            (c.sum_answer_score * 0.2) DESC) AS overall_rank
+    FROM combined c
+    WHERE c.Reputation > 1000
+       OR c.total_answers >= 10
+),
+second_select AS (
+    SELECT
+        CAST(NULL AS integer)          AS user_id,
+        t.tag_name                     AS DisplayName,
+        CAST(NULL AS integer)          AS Reputation,
+        CAST(NULL AS integer)          AS net_votes,
+        CAST(NULL AS integer)          AS gold_badges,
+        CAST(NULL AS integer)          AS silver_badges,
+        CAST(NULL AS integer)          AS bronze_badges,
+        t.answers_cnt                  AS total_answers,
+        CAST(NULL AS integer)          AS sum_answer_score,
+        ROUND(t.avg_score,2)           AS avg_answer_age_days,
+        CAST(NULL AS varchar(3))       AS has_accepted_answer,
+        CAST(NULL AS varchar)          AS vote_types_seen,
+        t.rn_by_score                  AS overall_rank
+    FROM tag_agg t
+    WHERE t.answers_cnt >= 50
+)
+SELECT * FROM (
+    SELECT * FROM first_select
+    ORDER BY overall_rank
+    LIMIT 200
+) fs
+UNION ALL
+SELECT * FROM (
+    SELECT * FROM second_select
+    ORDER BY overall_rank
+    LIMIT 50
+) ss
+ORDER BY overall_rank;

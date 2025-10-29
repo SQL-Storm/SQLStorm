@@ -1,0 +1,207 @@
+WITH UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        AVG(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate)) / (60*60*24)) AS AvgPostAgeDays
+    FROM Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE
+        u.Reputation >= 500
+        AND u.LastAccessDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1.5 year')
+        AND u.DisplayName IS NOT NULL
+        AND u.DisplayName NOT LIKE 'anon%'
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.UpVotes, u.DownVotes
+    HAVING
+        COUNT(DISTINCT p.Id) > 5
+),
+TrendingTags AS (
+    SELECT
+        LOWER(TRIM(SUBSTRING(tag FROM 1 FOR 50))) AS TagName,
+        SUM(p.Score) AS TagScore,
+        COUNT(p.Id) AS TagQuestionCount
+    FROM Posts p
+    CROSS JOIN LATERAL (
+        SELECT UNNEST(STRING_TO_ARRAY(REPLACE(REPLACE(p.Tags, '><', '|'), '<', ''), '>')) AS tag
+    ) t
+    WHERE
+        p.PostTypeId = 1
+        AND p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '9 months')
+        AND p.Score > 7
+        AND p.Tags IS NOT NULL
+    GROUP BY LOWER(TRIM(SUBSTRING(tag FROM 1 FOR 50)))
+    HAVING
+        COUNT(p.Id) > 30 AND SUM(p.Score) > 150
+    ORDER BY TagScore DESC
+    LIMIT 15
+),
+PostDetailsAndComments AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.ParentId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.LastActivityDate,
+        p.AcceptedAnswerId,
+        p.Title,
+        p.Tags,
+        p.Body,
+        COALESCE(p.LastEditorUserId, -1) AS LastEditorUserId,
+        (
+            SELECT COUNT(c.Id)
+            FROM Comments c
+            WHERE c.PostId = p.Id
+              AND c.CreationDate BETWEEN (p.CreationDate + INTERVAL '1 day') AND (p.CreationDate + INTERVAL '7 day')
+        ) AS CommentsFirstWeek,
+        (
+            SELECT AVG(c.Score)
+            FROM Comments c
+            WHERE c.PostId = p.Id AND c.UserId IS NOT NULL
+        ) AS AvgCommentScoreByLoggedInUsers,
+        (
+            SELECT REPLACE(REPLACE(c_corr.Text, '&nbsp;', ' '), CHR(10), ' ')
+            FROM Comments c_corr
+            WHERE c_corr.PostId = p.Id
+            ORDER BY c_corr.CreationDate DESC
+            LIMIT 1
+        ) AS MostRecentCommentContent
+    FROM Posts p
+    WHERE
+        p.DeletionDate IS NULL
+        AND p.ClosedDate IS NULL
+        AND p.CommunityOwnedDate IS NULL
+        AND p.PostTypeId IN (1, 2)
+),
+PostHistoryAgg AS (
+    SELECT
+        ph.PostId,
+        COUNT(ph.Id) AS TotalHistoryEvents,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditCount,
+        MAX(ph.CreationDate) AS LastHistoryEventDate,
+        MIN(ph.CreationDate) AS FirstHistoryEventDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate ELSE NULL END) AS ClosedDateHistory
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId <= 100
+    GROUP BY ph.PostId
+),
+UserBadgeSummary AS (
+    SELECT
+        b.UserId,
+        COUNT(b.Id) AS TotalGoldSilverBadges,
+        MAX(CASE WHEN b.Class = 1 THEN b.Date ELSE NULL END) AS LastGoldBadgeDate,
+        MAX(CASE WHEN b.Class = 2 THEN b.Date ELSE NULL END) AS LastSilverBadgeDate,
+        MAX(b.Date) FILTER (WHERE b.Class IN (1,2)) AS LatestHighClassBadgeDate,
+        (ARRAY_AGG(b.Name ORDER BY b.Date DESC) FILTER (WHERE b.Class IN (1,2)))[1] AS LatestHighClassBadgeName
+    FROM Badges b
+    WHERE b.Class IN (1, 2)
+    GROUP BY b.UserId
+),
+CombinedPosts AS (
+    SELECT
+        p.PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.PostCreationDate,
+        p.PostScore,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        'Question' AS PostCategory
+    FROM PostDetailsAndComments p
+    WHERE p.PostTypeId = 1
+
+    UNION ALL
+
+    SELECT
+        p.PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.PostCreationDate,
+        p.PostScore,
+        p.ViewCount,
+        parent.Title AS Title,
+        parent.Tags AS Tags,
+        'AcceptedAnswer' AS PostCategory
+    FROM PostDetailsAndComments p
+    JOIN Posts parent ON p.ParentId = parent.Id
+    WHERE p.PostTypeId = 2 AND parent.AcceptedAnswerId = p.PostId
+)
+SELECT
+    ue.UserId,
+    ue.DisplayName,
+    ue.Reputation,
+    ue.UserCreationDate,
+    ue.LastAccessDate,
+    ue.TotalPosts,
+    ue.QuestionCount,
+    ue.AnswerCount,
+    ue.TotalPostScore,
+    ue.AvgPostAgeDays,
+    ubs.TotalGoldSilverBadges,
+    ubs.LatestHighClassBadgeName,
+    ubs.LatestHighClassBadgeDate,
+    COUNT(DISTINCT cbp.PostId) FILTER (WHERE cbp.PostCategory = 'Question' AND cbp.PostScore >= 20) AS HighScoreQuestionsCount,
+    COUNT(DISTINCT cbp.PostId) FILTER (WHERE cbp.PostCategory = 'AcceptedAnswer') AS AcceptedAnswersCount,
+    SUM(cbp.ViewCount) AS TotalViewCountOnCombinedPosts,
+    ROUND(AVG(EXTRACT(EPOCH FROM (pha.LastHistoryEventDate - p.PostCreationDate)) / (60*60*24)), 2) AS AvgDaysToLastEdit,
+    SUM(CASE
+        WHEN p.Title LIKE '%performance%' OR p.Body LIKE '%benchmark%' THEN 1
+        ELSE 0
+    END) AS PostsAboutPerformanceBenchmarking,
+    SUM(CASE
+        WHEN p.PostScore > 50 AND p.CommentsFirstWeek > 5 AND COALESCE(p.AvgCommentScoreByLoggedInUsers, 0) > 2 THEN 1
+        ELSE 0
+    END) AS HighlyEngagingPosts,
+    MAX(COALESCE(p.MostRecentCommentContent, 'No recent comments found for active posts')) AS LastActivityCommentSample,
+    RANK() OVER (ORDER BY ue.Reputation DESC, ue.LastAccessDate DESC) AS GlobalReputationRank,
+    DENSE_RANK() OVER (PARTITION BY DATE_TRUNC('quarter', ue.UserCreationDate) ORDER BY ue.Reputation DESC) AS QuarterlyReputationRank,
+    AVG(ue.TotalPostScore) OVER (PARTITION BY ubs.TotalGoldSilverBadges ORDER BY ue.Reputation) AS AvgScoreByBadgeTier,
+    LAG(ue.Reputation, 1, 0) OVER (ORDER BY ue.UserCreationDate) AS PrevUserReputationByCreationDate
+FROM UserEngagement ue
+LEFT JOIN UserBadgeSummary ubs ON ue.UserId = ubs.UserId
+LEFT JOIN PostDetailsAndComments p ON ue.UserId = p.OwnerUserId
+LEFT JOIN PostHistoryAgg pha ON p.PostId = pha.PostId
+LEFT JOIN CombinedPosts cbp ON ue.UserId = cbp.OwnerUserId
+                           AND p.PostId = cbp.PostId
+WHERE
+    (ue.QuestionCount > 0 OR ue.AnswerCount > 0)
+    AND ue.TotalPostScore > 75
+    AND EXISTS (
+        SELECT 1
+        FROM PostDetailsAndComments p_inner
+        JOIN TrendingTags tt_inner ON p_inner.Tags LIKE '%' || tt_inner.TagName || '%'
+        WHERE p_inner.OwnerUserId = ue.UserId
+          AND p_inner.PostTypeId = 1
+          AND p_inner.PostScore >= 15
+    )
+    AND NOT EXISTS (
+        SELECT 1
+        FROM PostHistory pha_inner
+        WHERE pha_inner.PostId = p.PostId
+          AND pha_inner.PostHistoryTypeId = 10
+          AND pha_inner.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6 months')
+    )
+GROUP BY
+    ue.UserId, ue.DisplayName, ue.Reputation, ue.UserCreationDate, ue.LastAccessDate,
+    ue.TotalPosts, ue.QuestionCount, ue.AnswerCount, ue.TotalPostScore, ue.AvgPostAgeDays,
+    ubs.TotalGoldSilverBadges, ubs.LatestHighClassBadgeName, ubs.LatestHighClassBadgeDate,
+    ue.Reputation, ue.LastAccessDate, DATE_TRUNC('quarter', ue.UserCreationDate), ubs.TotalGoldSilverBadges, ue.UserCreationDate
+ORDER BY
+    GlobalReputationRank ASC, HighlyEngagingPosts DESC
+LIMIT 1000;

@@ -1,0 +1,349 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) as TotalQuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) as TotalAnswerScore,
+        MAX(p.CreationDate) as LatestPostDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.Views DESC) as ReputationRank,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) as ReputationDenseRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopUsers AS (
+    SELECT 
+        *,
+        CASE 
+            WHEN ReputationRank <= 10 THEN 'Top 10'
+            WHEN ReputationRank <= 100 THEN 'Top 100'
+            WHEN ReputationRank <= 1000 THEN 'Top 1000'
+            ELSE 'Others'
+        END as UserTier,
+        CASE 
+            WHEN QuestionCount > 0 AND AnswerCount > 0 THEN 'Active Contributor'
+            WHEN QuestionCount > 0 THEN 'Questioner'
+            WHEN AnswerCount > 0 THEN 'Answerer'
+            ELSE 'Passive User'
+        END as UserActivityLevel
+    FROM UserStats
+    WHERE PostCount > 0
+),
+PostMetrics AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.ParentId,
+        p.PostTypeId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.Tags,
+        COALESCE(p.AcceptedAnswerId, 0) as AcceptedAnswerId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END as PostTypeDesc,
+        CASE 
+            WHEN p.Score >= 100 THEN 'Highly Rated'
+            WHEN p.Score >= 10 THEN 'Moderately Rated'
+            WHEN p.Score >= 0 THEN 'Neutral Rating'
+            ELSE 'Negative Rated'
+        END as ScoreCategory,
+        COALESCE(
+            (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2),
+            0
+        ) as UpvoteCount,
+        COALESCE(
+            (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3),
+            0
+        ) as DownvoteCount,
+        CAST((CAST('2024-10-01 12:34:56' AS timestamp) - p.CreationDate) AS INTERVAL) as AgeInterval,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - p.CreationDate)) / 86400 AS AgeInDays,
+        LENGTH(p.Body) as BodyLength,
+        COALESCE(
+            (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id),
+            0
+        ) as CommentCountActual,
+        COALESCE(
+            (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (1,4,6)),
+            0
+        ) as EditCount,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+            WHEN p.ParentId IS NOT NULL THEN 'Answer'
+            ELSE 'Question'
+        END as PostStatus,
+        NTILE(10) OVER (ORDER BY p.Score DESC) as ScoreDecile,
+        PERCENT_RANK() OVER (ORDER BY p.Score) as ScorePercentile,
+        LAG(p.Score, 1) OVER (ORDER BY p.Score DESC) as PreviousScore,
+        LEAD(p.Score, 1) OVER (ORDER BY p.Score DESC) as NextScore,
+        AVG(p.Score) OVER (ORDER BY p.Id ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING) as MovingAvgScore,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) as ScoreRankWithinType,
+        RANK() OVER (ORDER BY p.Score DESC) as GlobalScoreRank
+    FROM Posts p
+    WHERE p.PostTypeId IN (1,2) AND p.Score >= 0
+),
+UserPostPerformance AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        AVG(p.Score) as AvgPostScore,
+        MIN(p.Score) as MinPostScore,
+        MAX(p.Score) as MaxPostScore,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) as MedianScore,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) as QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) as AnswerCount,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) as AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) as AvgAnswerScore,
+        SUM(p.Score) as TotalScore,
+        DENSE_RANK() OVER (ORDER BY SUM(p.Score) DESC) as TotalScoreRank,
+        COUNT(DISTINCT CASE WHEN p.Score > 0 THEN p.Id END) as PositiveScorePosts,
+        COUNT(DISTINCT CASE WHEN p.Score < 0 THEN p.Id END) as NegativeScorePosts,
+        COUNT(DISTINCT CASE WHEN p.Score = 0 THEN p.Id END) as ZeroScorePosts,
+        STRING_AGG(DISTINCT p.Tags, ' | ') as TagsUsed,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags)-2)), ' | ') as IndividualTags,
+        STDDEV_POP(p.Score) as ScoreStandardDeviation,
+        MAX(p.CreationDate) as LatestPost,
+        EXTRACT(YEAR FROM p.CreationDate) as PostYear,
+        EXTRACT(MONTH FROM p.CreationDate) as PostMonth,
+        COUNT(DISTINCT p.CreationDate) as PostFrequency,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) >= 100 THEN 'Elite Poster'
+            WHEN COUNT(DISTINCT p.Id) >= 50 THEN 'Active Poster'
+            WHEN COUNT(DISTINCT p.Id) >= 10 THEN 'Regular Poster'
+            ELSE 'Occasional Poster'
+        END as PosterCategory
+    FROM Users u
+    INNER JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE p.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 year')
+    GROUP BY u.Id, u.DisplayName, u.Reputation, EXTRACT(YEAR FROM p.CreationDate), EXTRACT(MONTH FROM p.CreationDate)
+),
+TagComplexity AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count >= 1000 THEN 'Very Popular'
+            WHEN t.Count >= 500 THEN 'Popular'
+            WHEN t.Count >= 100 THEN 'Moderately Popular'
+            WHEN t.Count >= 10 THEN 'Less Popular'
+            ELSE 'Rare'
+        END as PopularityLevel,
+        CASE 
+            WHEN CHAR_LENGTH(t.TagName) >= 15 THEN 'Long Tag Name'
+            WHEN CHAR_LENGTH(t.TagName) >= 10 THEN 'Medium Tag Name'
+            ELSE 'Short Tag Name'
+        END as TagNameLength,
+        CHAR_LENGTH(t.TagName) as TagNameLengthValue,
+        CASE 
+            WHEN t.IsRequired = 1 THEN 'Required Tag'
+            WHEN t.IsModeratorOnly = 1 THEN 'Moderator Only Tag'
+            ELSE 'Regular Tag'
+        END as TagType,
+        (SELECT 
+            COUNT(DISTINCT p.Id) 
+         FROM Posts p 
+         WHERE p.Tags LIKE '%' || t.TagName || '%') as PostsWithTag,
+        (SELECT 
+            COUNT(DISTINCT u.Id) 
+         FROM Users u 
+         JOIN Posts p ON u.Id = p.OwnerUserId 
+         WHERE p.Tags LIKE '%' || t.TagName || '%' 
+         AND p.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')
+        ) as ActiveUsersWithTag,
+        COALESCE(
+            (SELECT AVG(p.Score) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%'),
+            0
+        ) as AvgScoreForTag
+    FROM Tags t
+    WHERE t.Count > 0
+),
+ComplexAnalysis AS (
+    SELECT 
+        'Post Analysis' as AnalysisType,
+        CAST(COUNT(*) as VARCHAR(10)) as MetricValue,
+        CAST(SUM(Score) as VARCHAR(20)) as ScoreTotal,
+        CAST(AVG(Score) as VARCHAR(10)) as AvgScore,
+        MAX(CreationDate) as LatestDate,
+        MIN(CreationDate) as EarliestDate
+    FROM PostMetrics
+    UNION ALL
+    SELECT 
+        'User Analysis' as AnalysisType,
+        CAST(COUNT(*) as VARCHAR(10)) as MetricValue,
+        CAST(SUM(Reputation) as VARCHAR(20)) as ScoreTotal,
+        CAST(AVG(Reputation) as VARCHAR(10)) as AvgScore,
+        MAX(LatestPostDate) as LatestDate,
+        MIN(LatestPostDate) as EarliestDate
+    FROM TopUsers
+    UNION ALL
+    SELECT 
+        'Tag Analysis' as AnalysisType,
+        CAST(COUNT(*) as VARCHAR(10)) as MetricValue,
+        CAST(SUM(t.Count) as VARCHAR(20)) as ScoreTotal,
+        CAST(AVG(t.Count) as VARCHAR(10)) as AvgScore,
+        MAX(po.CreationDate) as LatestDate,
+        MIN(po.CreationDate) as EarliestDate
+    FROM PostMetrics p
+    INNER JOIN Posts po ON po.Id = p.PostId
+    INNER JOIN Tags t ON po.Tags LIKE '%' || t.TagName || '%'
+    WHERE t.Count > 0
+    UNION ALL
+    SELECT 
+        'Complex Metrics' as AnalysisType,
+        CAST(ROWS_COUNT as VARCHAR(10)) as MetricValue,
+        CAST(ROWS_SUM as VARCHAR(20)) as ScoreTotal,
+        CAST(ROWS_AVG as VARCHAR(10)) as AvgScore,
+        MAX(CreationDate) as LatestDate,
+        MIN(CreationDate) as EarliestDate
+    FROM (
+        SELECT 
+            COUNT(*) as ROWS_COUNT,
+            SUM(CASE WHEN Score > 100 THEN 1 ELSE 0 END) as ROWS_SUM,
+            AVG(Score) as ROWS_AVG,
+            MAX(CreationDate) as CreationDate
+        FROM PostMetrics
+        WHERE Score BETWEEN 0 AND 1000
+    ) complex_metrics
+),
+CombinedResult AS (
+    SELECT 
+        p.PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeDesc,
+        p.ScoreCategory,
+        p.ScoreDecile,
+        p.ScorePercentile,
+        u.DisplayName as OwnerName,
+        u.Reputation as OwnerReputation,
+        u.PostCount as OwnerTotalPosts,
+        u.QuestionCount as OwnerQuestions,
+        u.AnswerCount as OwnerAnswers,
+        t.TagName,
+        t.Count as TagCount,
+        t.PopularityLevel,
+        CASE 
+            WHEN p.Score >= 100 THEN 'EXCELLENT'
+            WHEN p.Score >= 50 THEN 'GOOD'
+            WHEN p.Score >= 25 THEN 'AVERAGE'
+            WHEN p.Score >= 0 THEN 'POOR'
+            ELSE 'TERRIBLE'
+        END as PerformanceTier,
+        (p.Score * 1.0 / NULLIF(p.ViewCount, 0)) as ScoreToViewRatio,
+        (p.CommentCountActual * 1.0 / NULLIF(p.Score, 0)) as CommentsPerPoint,
+        COALESCE(p.EditCount, 0) as EditCount,
+        CASE 
+            WHEN p.AcceptedAnswerId > 0 THEN 'Has Accepted Answer'
+            ELSE 'No Accepted Answer'
+        END as AnswerStatus,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - p.CreationDate)) / 86400 AS DaysSincePost,
+        p.BodyLength,
+        p.AgeInDays,
+        CASE 
+            WHEN p.Score > (SELECT AVG(Score) FROM PostMetrics) THEN 'Above Average'
+            WHEN p.Score < (SELECT AVG(Score) FROM PostMetrics) THEN 'Below Average'
+            ELSE 'Average'
+        END as ScoreVsAvg,
+        COALESCE(u.UserTier, 'Unknown') as UserTier,
+        COALESCE(u.UserActivityLevel, 'Unknown') as ActivityLevel,
+        CASE 
+            WHEN t.AvgScoreForTag > 100 THEN 'Highly Rated Tag'
+            WHEN t.AvgScoreForTag > 50 THEN 'Moderately Rated Tag'
+            WHEN t.AvgScoreForTag > 0 THEN 'Low Rated Tag'
+            ELSE 'Very Low Rated Tag'
+        END as TagRatingLevel,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.PostId) as TotalVotes,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.PostId) as TotalComments,
+        (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.PostId) as HistoryCount,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) as OverallRank,
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) as TypeSpecificRank,
+        p.PostTypeId,
+        p.EditCount as p_EditCount
+    FROM PostMetrics p
+    INNER JOIN TopUsers u ON p.OwnerUserId = u.UserId
+    LEFT JOIN TagComplexity t ON t.TagName IN (
+        SELECT TRIM(unnest(string_to_array(SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags)-2)), '><')))
+    )
+    WHERE p.Score BETWEEN 0 AND 2000
+    AND p.AgeInDays > 30 
+    AND p.EditCount >= 1
+    GROUP BY
+        p.PostId, p.Title, p.Score, p.ViewCount, p.CreationDate, p.OwnerUserId, p.PostTypeDesc, p.ScoreCategory,
+        p.ScoreDecile, p.ScorePercentile, u.DisplayName, u.Reputation, u.PostCount, u.QuestionCount, u.AnswerCount,
+        t.TagName, t.Count, t.PopularityLevel, p.CommentCountActual, p.EditCount, p.AcceptedAnswerId,
+        p.BodyLength, p.AgeInDays, u.UserTier, u.UserActivityLevel, t.AvgScoreForTag, p.PostTypeId
+)
+SELECT 
+    cr.PostId,
+    cr.Title,
+    cr.Score,
+    cr.ViewCount,
+    cr.OwnerName,
+    cr.OwnerReputation,
+    cr.PostTypeDesc,
+    cr.ScoreCategory,
+    cr.ScoreDecile,
+    cr.ScorePercentile,
+    cr.TagName,
+    cr.TagCount,
+    cr.PopularityLevel,
+    cr.PerformanceTier,
+    cr.ScoreToViewRatio,
+    cr.CommentsPerPoint,
+    EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - cr.CreationDate)) / 86400 AS DaysSincePost,
+    cr.BodyLength,
+    cr.AgeInDays,
+    cr.ScoreVsAvg,
+    cr.UserTier,
+    cr.ActivityLevel,
+    cr.TagRatingLevel,
+    cr.TotalVotes,
+    cr.TotalComments,
+    cr.HistoryCount,
+    cr.OverallRank,
+    cr.TypeSpecificRank
+FROM CombinedResult cr
+WHERE cr.Score > (
+    SELECT AVG(Score) + STDDEV_POP(Score) * 1.5 
+    FROM PostMetrics
+)
+AND cr.OwnerReputation > (
+    SELECT AVG(Reputation) 
+    FROM TopUsers
+)
+AND (
+    cr.TagCount > (
+        SELECT AVG(Count) 
+        FROM TagComplexity
+    )
+    OR cr.Score > 500
+)
+ORDER BY cr.Score DESC, cr.OverallRank ASC, cr.TypeSpecificRank ASC
+LIMIT 5000;

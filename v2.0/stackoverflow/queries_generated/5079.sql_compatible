@@ -1,0 +1,119 @@
+WITH ranked_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.ViewCount,
+    p.Score,
+    p.OwnerUserId,
+    u.Reputation,
+    u.DisplayName AS OwnerDisplayName,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC, p.CreationDate DESC) AS rn
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId = 1 -- Question
+    AND p.ClosedDate IS NULL
+    AND p.Tags IS NOT NULL
+),
+tag_density AS (
+  SELECT
+    t.TagName,
+    AVG(td.Score) AS avg_score_per_post,
+    COUNT(*) AS posts_with_tag,
+    SUM(td.ViewCount) AS total_views
+  FROM (
+    SELECT
+      unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS TagName,
+      p.Score,
+      p.ViewCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.ClosedDate IS NULL
+  ) AS td
+  JOIN Tags t ON LOWER(td.TagName) = LOWER(t.TagName)
+  GROUP BY t.TagName
+),
+recent_activity AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.OwnerUserId,
+    ROW_NUMBER() OVER (ORDER BY p.LastActivityDate DESC, p.CreationDate DESC) AS recent_rank
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.ClosedDate IS NULL
+    AND p.LastActivityDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days'
+),
+complex_post AS (
+  SELECT
+    q.PostId,
+    q.Title,
+    q.Tags,
+    q.CreationDate,
+    q.ViewCount,
+    q.Score,
+    u.Reputation,
+    u.DisplayName AS OwnerDisplayName,
+    CAST(q.ViewCount * 1.0 / NULLIF(q.Score, 0) AS numeric(12,4)) AS score_density,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = q.PostId AND v.VoteTypeId = 2) AS UpMods,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = q.PostId AND v.VoteTypeId = 3) AS DownMods,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY q.PostId) AS upvotes_window
+  FROM Posts q
+  LEFT JOIN Users u ON q.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.PostId = q.PostId
+  WHERE q.PostTypeId = 1
+    AND q.ClosedDate IS NULL
+    AND q.Tags IS NOT NULL
+)
+SELECT
+  rp.PostId,
+  rp.Title,
+  rp.Tags,
+  rp.CreationDate,
+  rp.ViewCount,
+  rp.Score,
+  rp.Reputation,
+  rp.OwnerDisplayName,
+  rd.avg_score_per_post,
+  rd.posts_with_tag,
+  rd.total_views,
+  ra.LastActivityDate,
+  cpost.score_density,
+  cpost.UpMods,
+  cpost.DownMods
+FROM recent_activity ra
+JOIN ranked_questions rq ON rq.PostId = ra.PostId
+JOIN (
+  SELECT
+    t.TagName,
+    AVG(tds.Score) AS avg_score_per_post,
+    COUNT(*) AS posts_with_tag,
+    SUM(tds.ViewCount) AS total_views
+  FROM (
+    SELECT
+      unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS TagName,
+      p.Score,
+      p.ViewCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.ClosedDate IS NULL
+  ) tds
+  JOIN Tags t ON LOWER(tds.TagName) = LOWER(t.TagName)
+  GROUP BY t.TagName
+) AS rd ON rd.TagName = ANY(STRING_TO_ARRAY(REPLACE(LOWER(ra.Tags), '><', ','), ','))
+LEFT JOIN (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+) AS ra2 ON ra2.PostId = ra.PostId
+LEFT JOIN complex_post cpost ON cpost.PostId = ra.PostId
+ORDER BY ra.LastActivityDate DESC
+LIMIT 100;

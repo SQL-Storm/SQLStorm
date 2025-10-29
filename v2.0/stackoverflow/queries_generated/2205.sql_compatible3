@@ -1,0 +1,86 @@
+WITH RECURSIVE RecursivePosts AS (
+    SELECT p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Tags,
+           p.AcceptedAnswerId, CAST(p.Id AS varchar) AS Path, 1 AS Depth
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Score > 10 AND p.ViewCount > 1000
+    UNION ALL
+    SELECT c.Id, c.PostTypeId, c.OwnerUserId, c.CreationDate, c.Score, c.ViewCount, c.Tags,
+           c.AcceptedAnswerId, (r.Path || '>' || CAST(c.Id AS varchar)) AS Path, r.Depth + 1
+    FROM RecursivePosts r
+    JOIN Posts c ON c.ParentId = r.Id
+    WHERE c.PostTypeId = 2 AND c.Score > 0
+),
+UserBadgeCounts AS (
+    SELECT u.Id AS UserId,
+           COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+           COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+           COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id
+),
+MaxVotesPerPost AS (
+    SELECT v.PostId, MAX(v.Score) AS MaxVoteScore
+    FROM Votes v
+    JOIN Posts p ON v.PostId = p.Id
+    WHERE v.VoteTypeId IN (2, 3)
+    GROUP BY v.PostId
+),
+PostCommentsCount AS (
+    SELECT PostId, COUNT(*) AS TotalComments, 
+           COUNT(DISTINCT CASE WHEN UserId IS NULL THEN Id END) AS AnonymousComments,
+           SUM(CASE WHEN Text ~* '(?<!\\w)(fix|bug|error|fail|issue)(?!\\w)' THEN 1 ELSE 0 END) AS BugMentionComments
+    FROM Comments
+    GROUP BY PostId
+),
+RankedPosts AS (
+    SELECT rp.Id, rp.PostTypeId, rp.OwnerUserId, rp.CreationDate, rp.Score, rp.ViewCount, rp.Tags, rp.AcceptedAnswerId,
+           ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges,
+           pc.TotalComments, pc.AnonymousComments, pc.BugMentionComments,
+           row_number() OVER (PARTITION BY rp.OwnerUserId ORDER BY rp.Score DESC, rp.ViewCount DESC) AS UserTopPostRank,
+           rp.Depth
+    FROM RecursivePosts rp
+    LEFT JOIN UserBadgeCounts ub ON ub.UserId = rp.OwnerUserId
+    LEFT JOIN PostCommentsCount pc ON pc.PostId = rp.Id
+    WHERE rp.OwnerUserId IS NOT NULL
+),
+CloseReasonStats AS (
+    SELECT ph.PostId,
+           SUM(CASE WHEN ph.PostHistoryTypeId = 10 AND ph.Comment = '101' THEN 1 ELSE 0 END) AS DuplicateCloseVotes,
+           SUM(CASE WHEN ph.PostHistoryTypeId = 10 AND ph.Comment = '102' THEN 1 ELSE 0 END) AS OffTopicCloseVotes,
+           SUM(CASE WHEN ph.PostHistoryTypeId = 10 AND ph.Comment = '103' THEN 1 ELSE 0 END) AS NeedsDetailsCloseVotes,
+           SUM(CASE WHEN ph.PostHistoryTypeId = 10 AND ph.Comment = '104' THEN 1 ELSE 0 END) AS NeedsMoreFocusCloseVotes,
+           SUM(CASE WHEN ph.PostHistoryTypeId = 10 AND ph.Comment = '105' THEN 1 ELSE 0 END) AS OpinionBasedCloseVotes
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10 AND ph.Comment ~ '^\d+$'
+    GROUP BY ph.PostId
+)
+SELECT rp.Id AS QuestionId,
+       rp.Tags,
+       rp.Score,
+       rp.ViewCount,
+       rp.CreationDate,
+       rp.GoldBadges, rp.SilverBadges, rp.BronzeBadges,
+       rp.TotalComments, rp.AnonymousComments, rp.BugMentionComments,
+       cr.DuplicateCloseVotes, cr.OffTopicCloseVotes, cr.NeedsDetailsCloseVotes, cr.NeedsMoreFocusCloseVotes, cr.OpinionBasedCloseVotes,
+       CASE WHEN rp.AcceptedAnswerId IS NOT NULL THEN 'Has Accepted Answer' ELSE 'No Accepted Answer' END AS AcceptedAnswerStatus,
+       (SELECT COUNT(*) FROM Votes v WHERE v.PostId = rp.Id AND v.VoteTypeId = 2) AS UpVotesCount,
+       (SELECT COUNT(*) FROM Votes v WHERE v.PostId = rp.Id AND v.VoteTypeId = 3) AS DownVotesCount,
+       CASE 
+         WHEN rp.Score > 0 THEN ROUND(CAST(rp.ViewCount AS numeric) / rp.Score,2)
+         ELSE NULL
+       END AS ViewsPerScore,
+       ( (SUBSTRING(rp.Tags FROM 2 FOR CHAR_LENGTH(rp.Tags)-2)) || ' | ' ||
+         'Depth:' || CAST(rp.Depth AS varchar) || ' | ' ||
+         'UserTopPostRank:' || CAST(rp.UserTopPostRank AS varchar)
+       ) AS TagAndRankSummary
+FROM RankedPosts rp
+LEFT JOIN CloseReasonStats cr ON cr.PostId = rp.Id
+WHERE rp.UserTopPostRank <= 3 AND rp.Score >= 5
+  AND (
+    rp.Tags ILIKE '%<sql>%'
+    OR rp.Tags ILIKE '%<performance>%'
+    OR rp.Tags ILIKE '%<benchmark>%'
+  )
+ORDER BY rp.GoldBadges DESC NULLS LAST, rp.Score DESC, rp.ViewCount DESC
+LIMIT 50;

@@ -1,0 +1,116 @@
+-- {"query": "4203.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1006} 
+
+WITH
+  RankedPosts AS (
+    SELECT
+      p.Id AS PostId,
+      p.OwnerUserId,
+      p.CreationDate,
+      p.Score,
+      p.ViewCount,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      pt.Name AS PostTypeName,
+      ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS RowNum
+    FROM Posts AS p
+    JOIN PostTypes AS pt
+      ON p.PostTypeId = pt.Id
+    WHERE
+      p.CreationDate >= DATE('now', '-365 days')
+  ),
+  UserPostCounts AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      COUNT(DISTINCT p.Id) AS TotalPosts,
+      SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+      AVG(p.Score) AS AverageScore
+    FROM Users AS u
+    LEFT JOIN Posts AS p
+      ON u.Id = p.OwnerUserId
+    GROUP BY
+      u.Id,
+      u.DisplayName
+  ),
+  HighEngagementUsers AS (
+    SELECT
+      upc.UserId,
+      upc.DisplayName,
+      upc.TotalPosts,
+      upc.AverageScore,
+      CASE
+        WHEN upc.TotalPosts > 1000 AND upc.AverageScore > 50 THEN 'Highly Engaged'
+        WHEN upc.TotalPosts > 500 AND upc.AverageScore > 25 THEN 'Moderately Engaged'
+        ELSE 'Standard User'
+      END AS EngagementLevel
+    FROM UserPostCounts AS upc
+    WHERE
+      upc.TotalPosts > 50
+  )
+SELECT
+  rp.PostId,
+  rp.PostTypeName,
+  rp.Score,
+  rp.ViewCount,
+  rp.AnswerCount AS PostAnswerCount,
+  rp.CommentCount AS PostCommentCount,
+  rp.FavoriteCount AS PostFavoriteCount,
+  u.DisplayName AS OwnerDisplayName,
+  u.Reputation,
+  heu.EngagementLevel,
+  COALESCE(u.WebsiteUrl, 'No Website') AS UserWebsite,
+  CASE
+    WHEN rp.Score > 1000 THEN 'Exceptional'
+    WHEN rp.Score > 500 THEN 'Excellent'
+    WHEN rp.Score > 100 THEN 'Good'
+    ELSE 'Average'
+  END AS ScoreCategory,
+  CASE
+    WHEN rp.ViewCount * rp.Score > 1000000 THEN 'High Impact'
+    WHEN rp.ViewCount * rp.Score > 500000 THEN 'Medium Impact'
+    ELSE 'Low Impact'
+  END AS ImpactScore,
+  SUBSTRING(u.AboutMe, 1, 50) AS AboutMeExcerpt,
+  (
+    SELECT
+      COUNT(*)
+    FROM Comments AS c
+    WHERE
+      c.PostId = rp.PostId AND c.Score > 5
+  ) AS TopCommentsCount,
+  CASE
+    WHEN EXISTS (
+      SELECT
+        1
+      FROM PostLinks AS pl
+      WHERE
+        pl.PostId = rp.PostId AND pl.LinkTypeId = 3
+    ) THEN 'IsDuplicate'
+    ELSE 'NotDuplicate'
+  END AS DuplicateStatus,
+  (
+    SELECT
+      SUM(v.BountyAmount)
+    FROM Votes AS v
+    WHERE
+      v.PostId = rp.PostId AND v.VoteTypeId = 8
+  ) AS TotalBountyAmount,
+  CASE
+    WHEN rp.PostTypeName = 'Question' AND rp.RowNum <= 10 THEN 'TopQuestion'
+    ELSE 'Other'
+  END AS QuestionRank
+FROM RankedPosts AS rp
+JOIN Users AS u
+  ON rp.OwnerUserId = u.Id
+LEFT JOIN HighEngagementUsers AS heu
+  ON u.Id = heu.UserId
+WHERE
+  rp.RowNum <= 100
+  AND u.DownVotes < u.UpVotes * 2
+  AND rp.Score > 0
+  AND rp.AnswerCount IS NOT NULL
+ORDER BY
+  rp.Score DESC,
+  rp.ViewCount DESC;

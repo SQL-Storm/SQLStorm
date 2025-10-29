@@ -1,0 +1,162 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COALESCE(SUM(p.Score), 0)               AS TotalPostScore,
+        COUNT(p.Id)                             AS TotalPosts,
+        MAX(p.CreationDate)                     AS LastPostDate
+    FROM Users u
+    LEFT JOIN Badges b  ON b.UserId = u.Id
+    LEFT JOIN Posts  p  ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopUsers AS (
+    SELECT *
+    FROM UserStats
+    ORDER BY Reputation DESC, TotalPostScore DESC
+    LIMIT 100
+),
+UserPosts AS (
+    SELECT 
+        p.Id,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.Tags,
+        ROW_NUMBER() OVER (
+            PARTITION BY p.OwnerUserId 
+            ORDER BY p.Score DESC NULLS LAST, p.CreationDate DESC
+        ) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+TagExplode AS (
+    SELECT 
+        up.Id AS PostId,
+        unnest(string_to_array(substring(up.Tags, 2, length(up.Tags) - 2), '><')) AS TagName
+    FROM UserPosts up
+    WHERE up.Tags IS NOT NULL
+),
+TagStats AS (
+    SELECT 
+        te.TagName,
+        COUNT(*)                     AS TagUseCount,
+        AVG(up.Score)                AS AvgScore
+    FROM TagExplode te
+    JOIN UserPosts up ON up.Id = te.PostId
+    GROUP BY te.TagName
+),
+UserTagAgg AS (
+    SELECT 
+        up.OwnerUserId,
+        jsonb_object_agg(ts.TagName, ts.TagUseCount) 
+            FILTER (WHERE ts.TagUseCount > 5) AS PopularTags
+    FROM UserPosts up
+    JOIN TagStats ts 
+        ON ts.TagName = ANY (string_to_array(substring(up.Tags, 2, length(up.Tags)-2), '><'))
+    GROUP BY up.OwnerUserId
+),
+RecentVotes AS (
+    SELECT 
+        v.PostId,
+        COUNT(*) FILTER (WHERE vt.Name = 'UpMod')   AS UpVotes,
+        COUNT(*) FILTER (WHERE vt.Name = 'DownMod') AS DownVotes,
+        MAX(v.CreationDate)                         AS LastVoteDate
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE v.CreationDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days')
+    GROUP BY v.PostId
+),
+Combined AS (
+    SELECT 
+        tu.Id               AS UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.GoldBadges,
+        tu.SilverBadges,
+        tu.BronzeBadges,
+        tu.TotalPostScore,
+        tu.TotalPosts,
+        tu.LastPostDate,
+        up.Id               AS PostId,
+        up.Title,
+        up.CreationDate     AS PostDate,
+        up.Score,
+        up.ViewCount,
+        up.AnswerCount,
+        up.FavoriteCount,
+        up.Tags,
+        rv.UpVotes,
+        rv.DownVotes,
+        rv.LastVoteDate,
+        (CASE WHEN COALESCE(uta.PopularTags, CAST('{}' AS jsonb)) IS NOT NULL THEN TRUE ELSE FALSE END) AS __tmp_flag
+    FROM TopUsers tu
+    LEFT JOIN UserPosts up    ON up.OwnerUserId = tu.Id AND up.rn <= 3
+    LEFT JOIN RecentVotes rv ON rv.PostId = up.Id
+    LEFT JOIN UserTagAgg uta ON uta.OwnerUserId = tu.Id
+)
+SELECT
+    Combined.UserId,
+    Combined.DisplayName,
+    Combined.Reputation,
+    Combined.GoldBadges,
+    Combined.SilverBadges,
+    Combined.BronzeBadges,
+    Combined.TotalPostScore,
+    Combined.TotalPosts,
+    Combined.LastPostDate,
+    Combined.PostId,
+    Combined.Title,
+    Combined.PostDate,
+    Combined.Score,
+    Combined.ViewCount,
+    Combined.AnswerCount,
+    Combined.FavoriteCount,
+    Combined.Tags,
+    Combined.UpVotes,
+    Combined.DownVotes,
+    Combined.LastVoteDate,
+    COALESCE((SELECT PopularTags FROM UserTagAgg uta WHERE uta.OwnerUserId = Combined.UserId), CAST('{}' AS jsonb)) AS PopularTags
+FROM Combined
+WHERE (Combined.Score IS NULL OR Combined.Score < 0)
+  AND (Combined.UpVotes IS NULL OR Combined.UpVotes = 0)
+  AND Combined.Tags IS NOT NULL
+UNION ALL
+SELECT 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    0 AS GoldBadges,
+    0 AS SilverBadges,
+    0 AS BronzeBadges,
+    0 AS TotalPostScore,
+    0 AS TotalPosts,
+    NULL AS LastPostDate,
+    NULL AS PostId,
+    NULL AS Title,
+    NULL AS PostDate,
+    NULL AS Score,
+    NULL AS ViewCount,
+    NULL AS AnswerCount,
+    NULL AS FavoriteCount,
+    NULL AS Tags,
+    NULL AS UpVotes,
+    NULL AS DownVotes,
+    NULL AS LastVoteDate,
+    CAST('{}' AS jsonb) AS PopularTags
+FROM Users u
+WHERE NOT EXISTS (
+        SELECT 1 FROM Posts p 
+        WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1
+     )
+  AND u.Reputation > 10000
+ORDER BY Reputation DESC, TotalPostScore DESC
+LIMIT 20;

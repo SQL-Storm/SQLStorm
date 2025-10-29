@@ -1,0 +1,406 @@
+-- {"query": "7180.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 4419} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) as TotalQuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) as TotalAnswerScore,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) as AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) as AvgAnswerScore,
+        STRING_AGG(DISTINCT p.Tags, ', ') as AllTags,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.ViewCount > 1000 THEN p.Id END) as HighViewQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.Score > 10 THEN p.Id END) as HighScoreAnswers,
+        (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = u.Id AND p2.PostTypeId = 1 AND p2.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1)) as AboveAvgQuestions,
+        (SELECT COUNT(*) FROM Posts p3 WHERE p3.OwnerUserId = u.Id AND p3.PostTypeId = 2 AND p3.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 2)) as AboveAvgAnswers
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+RankedUsers AS (
+    SELECT 
+        *,
+        RANK() OVER (ORDER BY TotalQuestionScore DESC) as QuestionRank,
+        RANK() OVER (ORDER BY TotalAnswerScore DESC) as AnswerRank,
+        RANK() OVER (ORDER BY (TotalQuestionScore + TotalAnswerScore) DESC) as CombinedRank,
+        DENSE_RANK() OVER (PARTITION BY CASE WHEN QuestionCount > 0 THEN 1 ELSE 0 END ORDER BY Reputation DESC) as ReputationRank,
+        PERCENT_RANK() OVER (ORDER BY Reputation) as ReputationPercentile,
+        NTILE(4) OVER (ORDER BY Views) as ViewQuartile
+    FROM UserActivityStats
+),
+UserStatsWithAggregates AS (
+    SELECT 
+        *,
+        QuestionCount + AnswerCount as TotalPosts,
+        CASE WHEN QuestionCount > 0 THEN TotalQuestionScore / QuestionCount ELSE 0 END as AvgQuestionScorePerQuestion,
+        CASE WHEN AnswerCount > 0 THEN TotalAnswerScore / AnswerCount ELSE 0 END as AvgAnswerScorePerAnswer,
+        CASE 
+            WHEN TotalQuestionScore + TotalAnswerScore > 0 THEN 
+                CAST((TotalQuestionScore * 1.0 / (TotalQuestionScore + TotalAnswerScore)) * 100 AS DECIMAL(5,2))
+            ELSE 0 
+        END as QuestionContributionPercentage,
+        CASE 
+            WHEN (QuestionCount + AnswerCount) > 0 THEN 
+                CAST((BadgeCount * 1.0 / (QuestionCount + AnswerCount)) * 100 AS DECIMAL(5,2))
+            ELSE 0 
+        END as BadgeEfficiency,
+        CASE 
+            WHEN Views > 0 THEN 
+                CAST((TotalQuestionScore * 1.0 / Views) * 1000 AS DECIMAL(10,2))
+            ELSE 0 
+        END as ScorePerThousandViews,
+        CASE 
+            WHEN (Reputation > 0 AND Views > 0) THEN 
+                CAST((Reputation * 1.0 / Views) AS DECIMAL(10,2))
+            ELSE 0 
+        END as ReputationToViewsRatio,
+        (SELECT TOP 1 TagName 
+         FROM Tags t 
+         WHERE t.Id IN (SELECT Id FROM Tags WHERE TagName IN (SELECT unnest(string_to_array(AllTags, ', ')))) 
+         ORDER BY t.Count DESC) as MostPopularTag,
+        CASE 
+            WHEN QuestionCount > 0 AND AnswerCount > 0 THEN 
+                CAST((AnswerCount * 1.0 / QuestionCount) AS DECIMAL(5,2))
+            ELSE 0 
+        END as AnswersPerQuestionRatio
+    FROM RankedUsers
+)
+SELECT  
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.AccountId,
+    u.WebsiteUrl,
+    u.Location,
+    u.AboutMe,
+    u.LastAccessDate,
+    u.EmailHash,
+    u.ProfileImageUrl,
+    u.CreationDate,
+    u.Views,
+    CASE 
+        WHEN u.Reputation >= 100000 THEN 'Legendary'
+        WHEN u.Reputation >= 10000 THEN 'Master'
+        WHEN u.Reputation >= 1000 THEN 'Expert'
+        WHEN u.Reputation >= 100 THEN 'Apprentice'
+        WHEN u.Reputation >= 10 THEN 'Newbie'
+        ELSE 'Novice'
+    END as ReputationTier,
+    CASE 
+        WHEN u.Reputation >= 1000 AND u.Views > 5000 THEN 'HighlyActive'
+        WHEN u.Reputation >= 500 AND u.Views > 1000 THEN 'Active'
+        WHEN u.Reputation >= 100 AND u.Views > 500 THEN 'ModeratelyActive'
+        WHEN u.Reputation >= 10 AND u.Views > 100 THEN 'LightlyActive'
+        ELSE 'Inactive'
+    END as ActivityLevel,
+    u.PostCount,
+    u.CommentCount,
+    u.BadgeCount,
+    u.LastPostDate,
+    u.LastCommentDate,
+    u.QuestionCount,
+    u.AnswerCount,
+    u.TotalQuestionScore,
+    u.TotalAnswerScore,
+    u.AvgQuestionScore,
+    u.AvgAnswerScore,
+    u.QuestionRank,
+    u.AnswerRank,
+    u.CombinedRank,
+    u.ReputationRank,
+    u.ReputationPercentile,
+    u.ViewQuartile,
+    u.TotalPosts,
+    u.AvgQuestionScorePerQuestion,
+    u.AvgAnswerScorePerAnswer,
+    u.QuestionContributionPercentage,
+    u.BadgeEfficiency,
+    u.ScorePerThousandViews,
+    u.ReputationToViewsRatio,
+    u.MostPopularTag,
+    u.AnswersPerQuestionRatio,
+    CASE 
+        WHEN u.QuestionCount > 0 THEN 
+            (SELECT TOP 1 ph.Id 
+             FROM PostHistory ph 
+             WHERE ph.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = u.Id AND PostTypeId = 1) 
+             AND ph.PostHistoryTypeId IN (10, 11) 
+             ORDER BY ph.CreationDate DESC)
+        ELSE NULL 
+    END as LastCloseReopenAction,
+    CASE 
+        WHEN u.AnswerCount > 0 THEN 
+            (SELECT TOP 1 p2.Id 
+             FROM Posts p2 
+             WHERE p2.OwnerUserId = u.Id AND p2.PostTypeId = 2 
+             AND p2.Score = (SELECT MAX(p3.Score) FROM Posts p3 WHERE p3.OwnerUserId = u.Id AND p3.PostTypeId = 2))
+        ELSE NULL 
+    END as HighestScoringAnswer,
+    CASE 
+        WHEN u.QuestionCount > 0 THEN 
+            (SELECT TOP 1 p4.Id 
+             FROM Posts p4 
+             WHERE p4.OwnerUserId = u.Id AND p4.PostTypeId = 1 
+             AND p4.ViewCount = (SELECT MAX(p5.ViewCount) FROM Posts p5 WHERE p5.OwnerUserId = u.Id AND p5.PostTypeId = 1))
+        ELSE NULL 
+    END as MostViewedQuestion,
+    CASE 
+        WHEN u.QuestionCount > 0 THEN 
+            (SELECT TOP 1 p6.Id 
+             FROM Posts p6 
+             WHERE p6.OwnerUserId = u.Id AND p6.PostTypeId = 1 
+             AND p6.Score = (SELECT MAX(p7.Score) FROM Posts p7 WHERE p7.OwnerUserId = u.Id AND p7.PostTypeId = 1))
+        ELSE NULL 
+    END as HighestScoringQuestion,
+    CASE 
+        WHEN u.BadgeCount > 0 THEN 
+            (SELECT COUNT(*) 
+             FROM Badges b2 
+             WHERE b2.UserId = u.Id AND b2.Class = 1)
+        ELSE 0 
+    END as GoldBadges,
+    CASE 
+        WHEN u.BadgeCount > 0 THEN 
+            (SELECT COUNT(*) 
+             FROM Badges b3 
+             WHERE b3.UserId = u.Id AND b3.Class = 2)
+        ELSE 0 
+    END as SilverBadges,
+    CASE 
+        WHEN u.BadgeCount > 0 THEN 
+            (SELECT COUNT(*) 
+             FROM Badges b4 
+             WHERE b4.UserId = u.Id AND b4.Class = 3)
+        ELSE 0 
+    END as BronzeBadges,
+    COALESCE(u.HighestScoringQuestion, u.MostViewedQuestion) as TopPostId,
+    CASE 
+        WHEN u.HighViewQuestions > 0 THEN 'MultipleHighViewQuestions'
+        WHEN u.HighViewQuestions = 1 THEN 'SingleHighViewQuestion'
+        ELSE 'NoHighViewQuestions'
+    END as HighViewContentStatus,
+    CASE 
+        WHEN u.HighScoreAnswers > 0 THEN 'MultipleHighScoreAnswers'
+        WHEN u.HighScoreAnswers = 1 THEN 'SingleHighScoreAnswer'
+        ELSE 'NoHighScoreAnswers'
+    END as HighScoreContentStatus,
+    CASE 
+        WHEN u.AboveAvgQuestions > 0 THEN 'MultipleAboveAvgQuestions'
+        WHEN u.AboveAvgQuestions = 1 THEN 'SingleAboveAvgQuestion'
+        ELSE 'NoAboveAvgQuestions'
+    END as AboveAvgQuestionStatus,
+    CASE 
+        WHEN u.AboveAvgAnswers > 0 THEN 'MultipleAboveAvgAnswers'
+        WHEN u.AboveAvgAnswers = 1 THEN 'SingleAboveAvgAnswer'
+        ELSE 'NoAboveAvgAnswers'
+    END as AboveAvgAnswerStatus,
+    CAST(u.ReputationPercentile * 100 AS INT) as ReputationPercentileRank,
+    CASE 
+        WHEN u.Reputation >= 10000 THEN 'EliteContributor'
+        WHEN u.Reputation >= 1000 THEN 'Contributor'
+        WHEN u.Reputation >= 100 THEN 'RegularContributor'
+        ELSE 'NewContributor'
+    END as ContributorTier,
+    CASE 
+        WHEN u.TotalPosts = 0 THEN 0
+        WHEN u.QuestionCount > 0 THEN CAST((u.QuestionCount * 100.0 / u.TotalPosts) AS DECIMAL(5,2))
+        ELSE 0
+    END as QuestionPercentage,
+    CASE 
+        WHEN u.TotalPosts = 0 THEN 0
+        WHEN u.AnswerCount > 0 THEN CAST((u.AnswerCount * 100.0 / u.TotalPosts) AS DECIMAL(5,2))
+        ELSE 0
+    END as AnswerPercentage,
+    CASE 
+        WHEN u.TotalPosts >= 10 THEN 'ActiveUser'
+        WHEN u.TotalPosts >= 5 THEN 'ModerateUser'
+        WHEN u.TotalPosts >= 1 THEN 'BeginnerUser'
+        ELSE 'InactiveUser'
+    END as UserActivityLevel,
+    CASE 
+        WHEN u.Views > 10000 THEN 'ViralContributor'
+        WHEN u.Views > 5000 THEN 'PopularContributor'
+        WHEN u.Views > 1000 THEN 'RecognizedContributor'
+        WHEN u.Views > 100 THEN 'KnownContributor'
+        ELSE 'NewContributor'
+    END as RecognitionLevel,
+    CASE 
+        WHEN u.Reputation > 500 AND u.ViewQuartile = 1 THEN 'HighReputationHighViewUser'
+        WHEN u.Reputation > 500 AND u.ViewQuartile = 4 THEN 'HighReputationLowViewUser'
+        WHEN u.Reputation <= 500 AND u.ViewQuartile = 1 THEN 'LowReputationHighViewUser'
+        ELSE 'NormalUser'
+    END as UserCategory,
+    CASE 
+        WHEN u.QuestionContributionPercentage >= 50 THEN 'QuestionFocus'
+        WHEN u.QuestionContributionPercentage <= 20 THEN 'AnswerFocus'
+        ELSE 'BalancedFocus'
+    END as ContributionFocus,
+    CASE 
+        WHEN u.BadgeEfficiency >= 5 THEN 'EfficientBadgeUser'
+        WHEN u.BadgeEfficiency >= 2 THEN 'RegularBadgeUser'
+        WHEN u.BadgeEfficiency >= 0.5 THEN 'OccasionalBadgeUser'
+        ELSE 'InactiveBadgeUser'
+    END as BadgeEfficiencyLevel,
+    CASE 
+        WHEN u.ScorePerThousandViews >= 10 THEN 'HighValueContributor'
+        WHEN u.ScorePerThousandViews >= 5 THEN 'ValueContributor'
+        WHEN u.ScorePerThousandViews >= 1 THEN 'RegularContributor'
+        ELSE 'NewContributor'
+    END as ValueContributorTier,
+    CASE 
+        WHEN u.ReputationToViewsRatio >= 10 THEN 'HighReputationToViewRatio'
+        WHEN u.ReputationToViewsRatio >= 5 THEN 'ModerateReputationToViewRatio'
+        WHEN u.ReputationToViewsRatio >= 1 THEN 'LowReputationToViewRatio'
+        ELSE 'MinimalReputationToViewRatio'
+    END as ReputationToViewRatioTier,
+    CASE 
+        WHEN u.ReputationRank <= 10 THEN 'TopRanked'
+        WHEN u.ReputationRank <= 100 THEN 'HighRanked'
+        WHEN u.ReputationRank <= 1000 THEN 'ModerateRanked'
+        WHEN u.ReputationRank <= 10000 THEN 'LowRanked'
+        ELSE 'VeryLowRanked'
+    END as RankingTier,
+    CASE 
+        WHEN (u.QuestionCount + u.AnswerCount) >= 100 THEN 'VeteranUser'
+        WHEN (u.QuestionCount + u.AnswerCount) >= 50 THEN 'ExperiencedUser'
+        WHEN (u.QuestionCount + u.AnswerCount) >= 20 THEN 'IntermediateUser'
+        WHEN (u.QuestionCount + u.AnswerCount) >= 1 THEN 'BeginnerUser'
+        ELSE 'NoActivity'
+    END as ExperienceLevel,
+    CASE 
+        WHEN u.AnswersPerQuestionRatio >= 3 THEN 'HighAnswerToQuestionRatio'
+        WHEN u.AnswersPerQuestionRatio >= 1.5 THEN 'ModerateAnswerToQuestionRatio'
+        WHEN u.AnswersPerQuestionRatio >= 0.5 THEN 'LowAnswerToQuestionRatio'
+        ELSE 'MinimalAnswerToQuestionRatio'
+    END as AnswerToQuestionRatioTier,
+    CASE 
+        WHEN u.QuestionRank <= 100 THEN 'TopQuestionWriter'
+        WHEN u.QuestionRank <= 1000 THEN 'HighQuestionWriter'
+        WHEN u.QuestionRank <= 10000 THEN 'ModerateQuestionWriter'
+        ELSE 'LowQuestionWriter'
+    END as QuestionWriterRank,
+    CASE 
+        WHEN u.AnswerRank <= 100 THEN 'TopAnswerer'
+        WHEN u.AnswerRank <= 1000 THEN 'HighAnswerer'
+        WHEN u.AnswerRank <= 10000 THEN 'ModerateAnswerer'
+        ELSE 'LowAnswerer'
+    END as AnswererRank,
+    CASE 
+        WHEN (u.QuestionCount + u.AnswerCount) / (CASE WHEN u.Reputation > 0 THEN u.Reputation ELSE 1 END) >= 0.1 THEN 'HighActivityPerReputation'
+        WHEN (u.QuestionCount + u.AnswerCount) / (CASE WHEN u.Reputation > 0 THEN u.Reputation ELSE 1 END) >= 0.05 THEN 'ModerateActivityPerReputation'
+        WHEN (u.QuestionCount + u.AnswerCount) / (CASE WHEN u.Reputation > 0 THEN u.Reputation ELSE 1 END) >= 0.01 THEN 'LowActivityPerReputation'
+        ELSE 'MinimalActivityPerReputation'
+    END as ActivityPerReputationLevel
+FROM UserStatsWithAggregates u
+WHERE u.Reputation > 10
+  AND u.Views > 10
+  AND (u.QuestionCount > 0 OR u.AnswerCount > 0 OR u.CommentCount > 0)
+  AND EXISTS(
+    SELECT 1 FROM Posts p 
+    WHERE p.OwnerUserId = u.Id 
+    AND (p.PostTypeId = 1 OR p.PostTypeId = 2)
+    AND p.CreationDate >= DATEADD(year, -2, cast('2024-10-01 12:34:56' as timestamp))
+  )
+  AND NOT (
+    (u.QuestionCount = 0 AND u.AnswerCount = 0 AND u.CommentCount = 0) 
+    OR 
+    (u.Reputation = 1 AND u.Views = 0 AND u.UpVotes = 0 AND u.DownVotes = 0)
+  )
+
+UNION ALL
+
+SELECT 
+    NULL as UserId,
+    'TOTAL' as DisplayName,
+    SUM(Reputation) as Reputation,
+    SUM(Views) as Views,
+    SUM(UpVotes) as UpVotes,
+    SUM(DownVotes) as DownVotes,
+    NULL as AccountId,
+    NULL as WebsiteUrl,
+    NULL as Location,
+    NULL as AboutMe,
+    NULL as LastAccessDate,
+    NULL as EmailHash,
+    NULL as ProfileImageUrl,
+    NULL as CreationDate,
+    NULL as Views,
+    'TOTAL' as ReputationTier,
+    'TOTAL' as ActivityLevel,
+    SUM(PostCount) as PostCount,
+    SUM(CommentCount) as CommentCount,
+    SUM(BadgeCount) as BadgeCount,
+    NULL as LastPostDate,
+    NULL as LastCommentDate,
+    SUM(QuestionCount) as QuestionCount,
+    SUM(AnswerCount) as AnswerCount,
+    SUM(TotalQuestionScore) as TotalQuestionScore,
+    SUM(TotalAnswerScore) as TotalAnswerScore,
+    AVG(AvgQuestionScore) as AvgQuestionScore,
+    AVG(AvgAnswerScore) as AvgAnswerScore,
+    NULL as QuestionRank,
+    NULL as AnswerRank,
+    NULL as CombinedRank,
+    NULL as ReputationRank,
+    NULL as ReputationPercentile,
+    NULL as ViewQuartile,
+    SUM(TotalPosts) as TotalPosts,
+    AVG(AvgQuestionScorePerQuestion) as AvgQuestionScorePerQuestion,
+    AVG(AvgAnswerScorePerAnswer) as AvgAnswerScorePerAnswer,
+    AVG(QuestionContributionPercentage) as QuestionContributionPercentage,
+    AVG(BadgeEfficiency) as BadgeEfficiency,
+    AVG(ScorePerThousandViews) as ScorePerThousandViews,
+    AVG(ReputationToViewsRatio) as ReputationToViewsRatio,
+    NULL as MostPopularTag,
+    AVG(AnswersPerQuestionRatio) as AnswersPerQuestionRatio,
+    NULL as LastCloseReopenAction,
+    NULL as HighestScoringAnswer,
+    NULL as MostViewedQuestion,
+    NULL as HighestScoringQuestion,
+    SUM(GoldBadges) as GoldBadges,
+    SUM(SilverBadges) as SilverBadges,
+    SUM(BronzeBadges) as BronzeBadges,
+    NULL as TopPostId,
+    NULL as HighViewContentStatus,
+    NULL as HighScoreContentStatus,
+    NULL as AboveAvgQuestionStatus,
+    NULL as AboveAvgAnswerStatus,
+    NULL as ReputationPercentileRank,
+    'TOTAL' as ContributorTier,
+    AVG(QuestionPercentage) as QuestionPercentage,
+    AVG(AnswerPercentage) as AnswerPercentage,
+    'TOTAL' as UserActivityLevel,
+    'TOTAL' as RecognitionLevel,
+    'TOTAL' as UserCategory,
+    'TOTAL' as ContributionFocus,
+    AVG(BadgeEfficiencyLevel) as BadgeEfficiencyLevel,
+    'TOTAL' as ValueContributorTier,
+    'TOTAL' as ReputationToViewRatioTier,
+    'TOTAL' as RankingTier,
+    'TOTAL' as ExperienceLevel,
+    'TOTAL' as AnswerToQuestionRatioTier,
+    'TOTAL' as QuestionWriterRank,
+    'TOTAL' as AnswererRank,
+    'TOTAL' as ActivityPerReputationLevel
+
+ORDER BY 
+    CASE WHEN UserId IS NULL THEN 1 ELSE 0 END,
+    Reputation DESC,
+    Views DESC,
+    PostCount DESC,
+    BadgeCount DESC;

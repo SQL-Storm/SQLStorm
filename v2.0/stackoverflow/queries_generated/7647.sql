@@ -1,0 +1,321 @@
+-- {"query": "7647.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2832} 
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COALESCE(SUM(p.Score), 0) AS TotalScore,
+        COALESCE(SUM(p.ViewCount), 0) AS TotalViews,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(u.LastAccessDate) AS LastAccessDate,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+                CAST(COUNT(DISTINCT p.Id) AS FLOAT) / 
+                CAST(DATEDIFF(day, u.CreationDate, GETDATE()) AS FLOAT)
+            ELSE 0 
+        END AS PostsPerDay,
+        ROW_NUMBER() OVER (ORDER BY SUM(p.Score) DESC) AS RankByScore,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS RankByReputation
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate, u.LastAccessDate
+),
+TopPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        STRING_SPLIT(p.Tags, '>') AS TagList,
+        COALESCE(p.AnswerCount, 0) AS AnswerCountSafe,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.Score >= 100 
+            THEN 'HighlyVotedQuestion'
+            WHEN p.PostTypeId = 1 AND p.Score < 0 
+            THEN 'LowScoreQuestion'
+            WHEN p.PostTypeId = 2 AND p.Score >= 50 
+            THEN 'HighlyVotedAnswer'
+            ELSE 'Other'
+        END AS PostCategory,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS ScoreRank
+    FROM Posts p
+    WHERE p.CreationDate >= DATEADD(year, -1, GETDATE())
+),
+PostTagAnalysis AS (
+    SELECT 
+        tp.Id,
+        tp.Title,
+        tp.Score,
+        tp.ViewCount,
+        tp.OwnerUserId,
+        tp.AnswerCountSafe,
+        tp.PostCategory,
+        COUNT(pt.Id) AS TagCount,
+        STRING_AGG(t.TagName, ', ') AS AllTags,
+        CASE 
+            WHEN COUNT(pt.Id) > 3 THEN 'ManyTags'
+            WHEN COUNT(pt.Id) = 0 THEN 'NoTags'
+            ELSE 'FewTags'
+        END AS TagComplexity
+    FROM TopPosts tp
+    LEFT JOIN Posts p ON tp.Id = p.Id
+    LEFT JOIN (
+        SELECT 
+            p.Id,
+            t.Id AS TagId,
+            t.TagName
+        FROM Posts p
+        CROSS APPLY STRING_SPLIT(p.Tags, '>') AS splitTags
+        JOIN Tags t ON t.TagName = LTRIM(RTRIM(splitTags.value))
+    ) pt ON p.Id = pt.Id
+    LEFT JOIN Tags t ON pt.TagId = t.Id
+    GROUP BY tp.Id, tp.Title, tp.Score, tp.ViewCount, tp.OwnerUserId, tp.AnswerCountSafe, tp.PostCategory
+),
+UserActivityStats AS (
+    SELECT 
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.PostCount,
+        us.CommentCount,
+        us.BadgeCount,
+        us.TotalScore,
+        us.TotalViews,
+        us.PostsPerDay,
+        us.RankByScore,
+        us.RankByReputation,
+        CASE 
+            WHEN us.PostsPerDay > 1 THEN 'HighlyActive'
+            WHEN us.PostsPerDay BETWEEN 0.1 AND 1 THEN 'ModeratelyActive'
+            ELSE 'Passive'
+        END AS ActivityLevel,
+        IIF(us.CommentCount > 0 AND us.PostCount = 0, 'CommentOnly', 'Active') AS UserStatus
+    FROM UserStats us
+),
+CombinedAnalysis AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.PostCount,
+        uas.CommentCount,
+        uas.BadgeCount,
+        uas.TotalScore,
+        uas.TotalViews,
+        uas.PostsPerDay,
+        uas.RankByScore,
+        uas.RankByReputation,
+        uas.ActivityLevel,
+        uas.UserStatus,
+        pta.Id AS PostId,
+        pta.Title,
+        pta.Score AS PostScore,
+        pta.ViewCount AS PostViewCount,
+        pta.AnswerCountSafe,
+        pta.PostCategory,
+        pta.TagCount,
+        pta.AllTags,
+        pta.TagComplexity,
+        CASE 
+            WHEN uas.UserStatus = 'Active' AND pta.PostCategory = 'HighlyVotedQuestion' THEN 'TopActiveQuestion'
+            WHEN uas.UserStatus = 'Active' AND pta.PostCategory = 'HighlyVotedAnswer' THEN 'TopActiveAnswer'
+            WHEN uas.UserStatus = 'CommentOnly' AND pta.PostCategory = 'HighlyVotedQuestion' THEN 'CommentQuestion'
+            ELSE 'Other'
+        END AS EngagementType
+    FROM UserActivityStats uas
+    INNER JOIN PostTagAnalysis pta ON uas.UserId = pta.OwnerUserId
+    WHERE pta.Score > 50
+    AND (pta.Tags IS NOT NULL OR pta.AllTags IS NOT NULL)
+)
+SELECT 
+    ca.UserId,
+    ca.DisplayName,
+    ca.Reputation,
+    ca.PostCount,
+    ca.CommentCount,
+    ca.BadgeCount,
+    ca.TotalScore,
+    ca.TotalViews,
+    ca.PostsPerDay,
+    ca.RankByScore,
+    ca.RankByReputation,
+    ca.ActivityLevel,
+    ca.UserStatus,
+    ca.PostId,
+    ca.Title,
+    ca.PostScore,
+    ca.PostViewCount,
+    ca.AnswerCountSafe,
+    ca.PostCategory,
+    ca.TagCount,
+    ca.AllTags,
+    ca.TagComplexity,
+    ca.EngagementType,
+    DENSE_RANK() OVER (ORDER BY ca.PostScore DESC) AS GlobalPostRank,
+    PERCENT_RANK() OVER (ORDER BY ca.Reputation DESC) AS ReputationPercentile,
+    CASE 
+        WHEN ca.TagCount > 5 THEN 
+            'Multiple tag expertise'
+        WHEN ca.TagCount = 1 THEN 
+            'Single tag expertise'
+        ELSE 
+            'General contributor'
+    END AS ExpertiseLevel,
+    IIF(ca.PostScore >= 200 AND ca.Reputation >= 1000, 'EliteContributor', 'StandardContributor') AS ContributorTier,
+    IIF(ca.UserStatus = 'Active' AND ca.PostScore > 100 AND ca.TagCount >= 3 AND ca.Reputation >= 500, 
+        'EngagedExpert', 
+        'StandardUser') AS UserClassification,
+    FORMAT(ca.PostScore, 'N0') AS FormattedScore,
+    LTRIM(RTRIM(SUBSTRING(ca.AllTags, 1, 100))) AS ShortenedTags,
+    CASE 
+        WHEN ca.PostCategory IN ('HighlyVotedQuestion', 'HighlyVotedAnswer') 
+        AND ca.TagComplexity = 'ManyTags' 
+        THEN 'ComplexHighValueContent'
+        WHEN ca.PostCategory = 'HighlyVotedQuestion' AND ca.TagCount <= 2
+        THEN 'SimpleHighValueQuestion'
+        ELSE 'StandardContent'
+    END AS ContentComplexity,
+    COALESCE(ca.TotalScore / NULLIF(ca.PostCount, 0), 0) AS AverageScorePerPost,
+    COUNT(*) OVER (PARTITION BY ca.UserId) AS UserPostCount,
+    CASE 
+        WHEN ca.PostCategory IN ('HighlyVotedQuestion', 'HighlyVotedAnswer') 
+        AND ca.Reputation >= 2000
+        THEN 'TopPerformer'
+        WHEN ca.PostCategory IN ('HighlyVotedQuestion', 'HighlyVotedAnswer') 
+        AND ca.Reputation >= 500
+        THEN 'MidRankPerformer'
+        ELSE 'RegularContributor'
+    END AS PerformanceTier,
+    CASE 
+        WHEN EXISTS (
+            SELECT 1 
+            FROM Posts p 
+            WHERE p.OwnerUserId = ca.UserId 
+            AND p.PostTypeId = 1 
+            AND p.Score >= 1000
+        ) THEN 'QuestionMaster'
+        WHEN EXISTS (
+            SELECT 1 
+            FROM Posts p 
+            WHERE p.OwnerUserId = ca.UserId 
+            AND p.PostTypeId = 2 
+            AND p.Score >= 1000
+        ) THEN 'AnswerMaster'
+        ELSE 'GeneralContributor'
+    END AS SpecializationTier
+FROM CombinedAnalysis ca
+WHERE ca.PostCategory IN ('HighlyVotedQuestion', 'HighlyVotedAnswer')
+    AND ca.Reputation >= 500
+    AND ca.PostScore >= 75
+    AND ca.TagCount >= 2
+ORDER BY 
+    ca.PostScore DESC,
+    ca.Reputation DESC,
+    ca.TotalScore DESC
+HAVING 
+    COUNT(*) > 1
+    AND MAX(ca.PostScore) >= 100
+EXCEPT
+SELECT 
+    ca.UserId,
+    ca.DisplayName,
+    ca.Reputation,
+    ca.PostCount,
+    ca.CommentCount,
+    ca.BadgeCount,
+    ca.TotalScore,
+    ca.TotalViews,
+    ca.PostsPerDay,
+    ca.RankByScore,
+    ca.RankByReputation,
+    ca.ActivityLevel,
+    ca.UserStatus,
+    ca.PostId,
+    ca.Title,
+    ca.PostScore,
+    ca.PostViewCount,
+    ca.AnswerCountSafe,
+    ca.PostCategory,
+    ca.TagCount,
+    ca.AllTags,
+    ca.TagComplexity,
+    ca.EngagementType,
+    DENSE_RANK() OVER (ORDER BY ca.PostScore DESC) AS GlobalPostRank,
+    PERCENT_RANK() OVER (ORDER BY ca.Reputation DESC) AS ReputationPercentile,
+    CASE 
+        WHEN ca.TagCount > 5 THEN 
+            'Multiple tag expertise'
+        WHEN ca.TagCount = 1 THEN 
+            'Single tag expertise'
+        ELSE 
+            'General contributor'
+    END AS ExpertiseLevel,
+    IIF(ca.PostScore >= 200 AND ca.Reputation >= 1000, 'EliteContributor', 'StandardContributor') AS ContributorTier,
+    IIF(ca.UserStatus = 'Active' AND ca.PostScore > 100 AND ca.TagCount >= 3 AND ca.Reputation >= 500, 
+        'EngagedExpert', 
+        'StandardUser') AS UserClassification,
+    FORMAT(ca.PostScore, 'N0') AS FormattedScore,
+    LTRIM(RTRIM(SUBSTRING(ca.AllTags, 1, 100))) AS ShortenedTags,
+    CASE 
+        WHEN ca.PostCategory IN ('HighlyVotedQuestion', 'HighlyVotedAnswer') 
+        AND ca.TagComplexity = 'ManyTags' 
+        THEN 'ComplexHighValueContent'
+        WHEN ca.PostCategory = 'HighlyVotedQuestion' AND ca.TagCount <= 2
+        THEN 'SimpleHighValueQuestion'
+        ELSE 'StandardContent'
+    END AS ContentComplexity,
+    COALESCE(ca.TotalScore / NULLIF(ca.PostCount, 0), 0) AS AverageScorePerPost,
+    COUNT(*) OVER (PARTITION BY ca.UserId) AS UserPostCount,
+    CASE 
+        WHEN ca.PostCategory IN ('HighlyVotedQuestion', 'HighlyVotedAnswer') 
+        AND ca.Reputation >= 2000
+        THEN 'TopPerformer'
+        WHEN ca.PostCategory IN ('HighlyVotedQuestion', 'HighlyVotedAnswer') 
+        AND ca.Reputation >= 500
+        THEN 'MidRankPerformer'
+        ELSE 'RegularContributor'
+    END AS PerformanceTier,
+    CASE 
+        WHEN EXISTS (
+            SELECT 1 
+            FROM Posts p 
+            WHERE p.OwnerUserId = ca.UserId 
+            AND p.PostTypeId = 1 
+            AND p.Score >= 1000
+        ) THEN 'QuestionMaster'
+        WHEN EXISTS (
+            SELECT 1 
+            FROM Posts p 
+            WHERE p.OwnerUserId = ca.UserId 
+            AND p.PostTypeId = 2 
+            AND p.Score >= 1000
+        ) THEN 'AnswerMaster'
+        ELSE 'GeneralContributor'
+    END AS SpecializationTier
+FROM CombinedAnalysis ca
+WHERE ca.PostCategory IN ('HighlyVotedQuestion', 'HighlyVotedAnswer')
+    AND ca.Reputation >= 500
+    AND ca.PostScore >= 75
+    AND ca.TagCount >= 2
+    AND ca.ActivityLevel = 'HighlyActive'
+    AND ca.SpecializationTier = 'QuestionMaster'
+ORDER BY 
+    ca.PostScore DESC,
+    ca.Reputation DESC,
+    ca.TotalScore DESC;

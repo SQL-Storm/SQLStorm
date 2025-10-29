@@ -1,0 +1,295 @@
+WITH PostStats AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.Body,
+        p.LastActivityDate,
+        p.ParentId,
+        p.AcceptedAnswerId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostTypeDescription,
+        COALESCE(p.Title, 'No Title') AS CleanTitle,
+        CASE WHEN p.Tags IS NULL THEN 0 ELSE CHAR_LENGTH(p.Tags) END AS TagLength,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags <> '' THEN 
+                (
+                    SELECT COUNT(*) 
+                    FROM (
+                        SELECT regexp_split_to_table(substring(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2), '><') AS tag
+                    ) t
+                )
+            ELSE 0 
+        END AS TagCount,
+        CAST(EXTRACT(day FROM (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate)) AS INTEGER) AS DaysSinceCreation,
+        CASE 
+            WHEN p.Score >= 100 THEN 'High'
+            WHEN p.Score >= 50 THEN 'Medium'
+            ELSE 'Low'
+        END AS ScoreCategory,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS UserRankByScore,
+        RANK() OVER (ORDER BY p.Score DESC) AS GlobalRankByScore,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) AS DenseRankByScore,
+        LAG(p.Score, 1) OVER (ORDER BY p.CreationDate) AS PreviousScore,
+        LEAD(p.Score, 1) OVER (ORDER BY p.CreationDate) AS NextScore,
+        AVG(p.Score) OVER (ORDER BY p.CreationDate ROWS BETWEEN 3 PRECEDING AND 3 FOLLOWING) AS MovingAverageScore,
+        NTILE(4) OVER (ORDER BY p.Score) AS ScoreQuartile,
+        PERCENT_RANK() OVER (ORDER BY p.Score) AS ScorePercentile
+    FROM Posts p
+    WHERE p.CreationDate >= DATE '2010-01-01'
+),
+UserActivity AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.AccountId,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        CASE 
+            WHEN MAX(p.CreationDate) >= DATE '2022-01-01' THEN 'Active'
+            WHEN MAX(p.CreationDate) >= DATE '2020-01-01' THEN 'Moderately Active'
+            ELSE 'Inactive'
+        END AS UserActivityLevel
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.AccountId
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            ELSE 'Niche'
+        END AS TagPopularity,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS PopularityRank
+    FROM Tags t
+    WHERE t.TagName IS NOT NULL AND t.TagName <> ''
+),
+PostHistoryAnalysis AS (
+    SELECT 
+        ph.PostId,
+        COUNT(*) AS HistoryCount,
+        COUNT(DISTINCT ph.PostHistoryTypeId) AS DistinctEventTypes,
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN 1 ELSE 0 END) AS HasModEvents,
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (1, 4, 5, 6) THEN 1 ELSE 0 END) AS HasEditEvents,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 35 THEN 1 ELSE 0 END) AS HasMigrationEvents,
+        MAX(ph.CreationDate) AS LastHistoryDate,
+        STRING_AGG(ph.Comment, '; ') AS AllComments
+    FROM PostHistory ph
+    WHERE ph.CreationDate >= DATE '2020-01-01'
+    GROUP BY ph.PostId
+),
+AnswerQualityCheck AS (
+    SELECT 
+        a.Id,
+        a.PostTypeId,
+        a.Score AS AnswerScore,
+        a.ParentId,
+        p.Title AS QuestionTitle,
+        CASE 
+            WHEN a.Score > 10 AND a.Score = (SELECT MAX(b.Score) FROM Posts b WHERE b.ParentId = a.ParentId AND b.PostTypeId = 2) 
+            THEN 'Top Answer'
+            WHEN a.Score > 5 THEN 'Good Answer'
+            ELSE 'Standard Answer'
+        END AS AnswerQuality,
+        COALESCE((SELECT AVG(b.Score) FROM Posts b WHERE b.ParentId = a.ParentId AND b.PostTypeId = 2), 0) AS AvgAnswerScore,
+        a.LastEditDate,
+        CAST(EXTRACT(day FROM a.LastEditDate - a.CreationDate) AS INTEGER) AS DaysToEdit,
+        CASE 
+            WHEN a.Score > 10 THEN 1
+            ELSE 0 
+        END AS IsHighScore,
+        (a.Score * COALESCE((SELECT AVG(b.Score) FROM Posts b WHERE b.ParentId = a.ParentId AND b.PostTypeId = 2), 1)) AS ModifiedScoreExpression
+    FROM Posts a
+    LEFT JOIN Posts p ON a.ParentId = p.Id
+    WHERE a.PostTypeId = 2 AND p.PostTypeId = 1
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        ps.Id AS PostId,
+        ps.PostTypeId,
+        ps.Title,
+        ps.OwnerUserId,
+        ps.Score,
+        ps.ViewCount,
+        ps.AnswerCount,
+        ps.CommentCount,
+        ps.FavoriteCount,
+        ps.DaysSinceCreation,
+        ps.ScoreCategory,
+        ps.UserRankByScore,
+        ps.GlobalRankByScore,
+        ps.DenseRankByScore,
+        ps.PreviousScore,
+        ps.NextScore,
+        ps.MovingAverageScore,
+        ps.ScoreQuartile,
+        ps.ScorePercentile,
+        ps.TagLength,
+        ps.TagCount,
+        ps.PostTypeDescription,
+        ua.DisplayName AS AuthorName,
+        ua.Reputation AS AuthorReputation,
+        ua.UserActivityLevel,
+        ta.TagName,
+        ta.Count AS TagCountValue,
+        ta.TagPopularity,
+        pha.HistoryCount,
+        pha.DistinctEventTypes,
+        pha.HasModEvents,
+        pha.HasEditEvents,
+        pha.HasMigrationEvents,
+        pha.LastHistoryDate,
+        CASE 
+            WHEN ps.Score > 100 THEN ps.AnswerCount * 2
+            WHEN ps.Score > 50 THEN ps.AnswerCount * 1.5
+            ELSE ps.AnswerCount 
+        END AS AdjustedAnswerCount,
+        CASE 
+            WHEN ps.AnswerCount > 0 THEN ps.Score::numeric / ps.AnswerCount
+            ELSE 0 
+        END AS ScorePerAnswer,
+        CASE 
+            WHEN ps.CommentCount > 0 THEN (ps.Score * 100.0) / ps.CommentCount
+            ELSE 0 
+        END AS ScorePerComment,
+        ABS(ps.Score - COALESCE(pha.HasModEvents, 0)) AS ScoreAdjustment,
+        (ps.Score * 100 / NULLIF(ps.ViewCount, 0)) AS ScoreToViewRatio,
+        CASE 
+            WHEN ps.Score > 0 AND ps.ViewCount > 0 THEN 
+                (ps.Score * 1.0 / ps.ViewCount) * 1000 
+            ELSE 0 
+        END AS EngagementRate,
+        repeat('=', COALESCE(ps.TagCount,0)) AS TagVisualization,
+        substring(ps.Body FROM 1 FOR 100) AS BodySnippet,
+        RIGHT(ps.Tags, 50) AS TagTail,
+        REPLACE(LEFT(ps.Tags, 50), '<', '') AS TagHead
+    FROM PostStats ps
+    LEFT JOIN UserActivity ua ON ps.OwnerUserId = ua.Id
+    LEFT JOIN PostHistoryAnalysis pha ON ps.Id = pha.PostId
+    LEFT JOIN TagAnalysis ta ON ps.Tags LIKE '%' || ta.TagName || '%'
+    WHERE ps.PostTypeId = 1 OR ps.PostTypeId = 2
+),
+FinalAggregatedAnalysis AS (
+    SELECT 
+        cpa.PostId,
+        cpa.Title,
+        cpa.AuthorName,
+        cpa.AuthorReputation,
+        cpa.UserActivityLevel,
+        cpa.TagName,
+        cpa.TagCountValue,
+        cpa.TagPopularity,
+        cpa.HistoryCount,
+        cpa.DistinctEventTypes,
+        cpa.HasModEvents,
+        cpa.HasEditEvents,
+        cpa.HasMigrationEvents,
+        cpa.LastHistoryDate,
+        cpa.Score,
+        cpa.ViewCount,
+        cpa.AnswerCount,
+        cpa.CommentCount,
+        cpa.FavoriteCount,
+        cpa.ScoreCategory,
+        cpa.ScoreQuartile,
+        cpa.ScorePercentile,
+        cpa.DaysSinceCreation,
+        cpa.AdjustedAnswerCount,
+        cpa.ScorePerAnswer,
+        cpa.ScorePerComment,
+        cpa.ScoreToViewRatio,
+        cpa.EngagementRate,
+        cpa.BodySnippet,
+        cpa.TagHead,
+        cpa.TagTail,
+        CASE 
+            WHEN cpa.Score > 50 AND cpa.ViewCount > 1000 THEN 'High Impact'
+            WHEN cpa.Score > 20 AND cpa.ViewCount > 500 THEN 'Medium Impact'
+            ELSE 'Low Impact'
+        END AS ImpactLevel,
+        (cpa.Score * 1.0 / NULLIF(cpa.AnswerCount, 0)) AS QuestionQualityScore,
+        ROW_NUMBER() OVER (ORDER BY cpa.Score DESC, cpa.ViewCount DESC) AS OverallRank
+    FROM ComplexPostAnalysis cpa
+    WHERE cpa.PostId IS NOT NULL
+)
+SELECT 
+    faa.PostId,
+    faa.Title,
+    faa.AuthorName,
+    faa.AuthorReputation,
+    faa.UserActivityLevel,
+    faa.TagName,
+    faa.TagCountValue,
+    faa.TagPopularity,
+    faa.HistoryCount,
+    faa.DistinctEventTypes,
+    faa.HasModEvents,
+    faa.HasEditEvents,
+    faa.HasMigrationEvents,
+    faa.LastHistoryDate,
+    faa.Score,
+    faa.ViewCount,
+    faa.AnswerCount,
+    faa.CommentCount,
+    faa.FavoriteCount,
+    faa.ScoreCategory,
+    faa.ScoreQuartile,
+    faa.ScorePercentile,
+    faa.DaysSinceCreation,
+    faa.AdjustedAnswerCount,
+    faa.ScorePerAnswer,
+    faa.ScorePerComment,
+    faa.ScoreToViewRatio,
+    faa.EngagementRate,
+    faa.BodySnippet,
+    faa.TagHead,
+    faa.TagTail,
+    faa.ImpactLevel,
+    faa.QuestionQualityScore,
+    faa.OverallRank,
+    DENSE_RANK() OVER (PARTITION BY faa.UserActivityLevel ORDER BY faa.Score DESC) AS UserActivityRank,
+    RANK() OVER (PARTITION BY faa.TagPopularity ORDER BY faa.Score DESC) AS TagPopularityRank
+FROM FinalAggregatedAnalysis faa
+WHERE faa.Score > 0
+    AND faa.ViewCount > 0
+    AND (faa.HasModEvents = 1 OR faa.HasEditEvents = 1)
+    AND (
+        faa.TagName IS NOT NULL 
+        OR (faa.ScoreToViewRatio > 0.01 AND faa.EngagementRate > 0.001)
+    )
+    AND (
+        (faa.UserActivityLevel IN ('Active', 'Moderately Active') 
+         AND faa.Score > 20)
+        OR 
+        (faa.UserActivityLevel = 'Inactive' 
+         AND faa.Score > 50 
+         AND faa.ViewCount > 100)
+    )
+ORDER BY faa.Score DESC, faa.ViewCount DESC
+LIMIT 1000;

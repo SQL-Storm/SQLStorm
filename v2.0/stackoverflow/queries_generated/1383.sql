@@ -1,0 +1,187 @@
+-- {"query": "1383.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2785} 
+
+WITH UserReputationTiers AS (
+    -- Classify users into reputation tiers and calculate some basic activity metrics
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.UpVotes,
+        u.DownVotes,
+        u.Views AS ProfileViews,
+        CASE
+            WHEN u.Reputation >= 20000 THEN 'Legendary'
+            WHEN u.Reputation >= 5000 THEN 'Expert'
+            WHEN u.Reputation >= 1000 THEN 'Advanced'
+            WHEN u.Reputation >= 200 THEN 'Active'
+            ELSE 'Novice'
+        END AS ReputationTier,
+        COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        MAX(u.LastAccessDate) AS LastSeenDate,
+        -- Correlated subquery: Check if user has a gold badge
+        EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS HasGoldBadge
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    GROUP BY u.Id, u.Reputation, u.UpVotes, u.DownVotes, u.Views
+),
+PostHistoricalEdits AS (
+    -- Analyze post editing and historical event activity
+    SELECT
+        ph.PostId,
+        COUNT(DISTINCT ph.UserId) AS DistinctEditorCount,
+        MAX(ph.CreationDate) AS LastEditOrHistoryEvent,
+        MIN(CASE WHEN ph.PostHistoryTypeId IN (2, 5, 8) THEN ph.CreationDate END) AS FirstBodyEditDate, -- Initial Body, Edit Body, Rollback Body
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (2, 5, 8) THEN ph.CreationDate END) AS LatestBodyEditDate,
+        ARRAY_AGG(DISTINCT ph.PostHistoryTypeId ORDER BY ph.PostHistoryTypeId) AS AllHistoryTypes, -- Aggregated history types
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN 1 ELSE 0 END) AS MajorEditCount -- Title, Body, Tags edits
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 22, 24, 25, 33, 34, 35, 36, 37, 38, 50, 52, 53, 66)
+    GROUP BY ph.PostId
+),
+QuestionVoteCounts AS (
+    -- Aggregate upvote and downvote counts for questions separately
+    SELECT
+        v.PostId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount
+    FROM Votes v
+    WHERE v.VoteTypeId IN (2, 3) -- UpMod, DownMod
+    GROUP BY v.PostId
+),
+QuestionActivityMetrics AS (
+    -- Combine core question data with edit history and vote counts
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.CreationDate AS QuestionCreationDate,
+        q.ViewCount,
+        q.AnswerCount,
+        q.Score AS QuestionScore,
+        q.FavoriteCount,
+        q.Tags,
+        q.ClosedDate,
+        phist.DistinctEditorCount,
+        phist.MajorEditCount,
+        phist.LastEditOrHistoryEvent,
+        phist.LatestBodyEditDate,
+        -- Complicated calculation: Time from creation to last body edit in hours
+        EXTRACT(EPOCH FROM (COALESCE(phist.LatestBodyEditDate, q.CreationDate) - q.CreationDate)) / 3600 AS HoursSinceFirstEdit,
+        COALESCE(qvc.UpVoteCount, 0) AS TotalUpVotes,
+        COALESCE(qvc.DownVoteCount, 0) AS TotalDownVotes,
+        -- Correlated subquery: Check if there's an accepted answer from a reputable user
+        EXISTS (
+            SELECT 1
+            FROM Posts pa
+            JOIN Users u_ans ON pa.OwnerUserId = u_ans.Id
+            WHERE pa.Id = q.AcceptedAnswerId AND u_ans.Reputation > 1000 AND pa.PostTypeId = 2
+        ) AS HasAcceptedAnswerFromReputableUser,
+        -- String expression: Extract the first tag (if exists), handling potential empty tags
+        TRIM(SPLIT_PART(SUBSTRING(q.Tags FROM 2 FOR LENGTH(q.Tags) - 2), '><', 1)) AS PrimaryTag
+    FROM Posts q
+    JOIN PostHistoricalEdits phist ON q.Id = phist.PostId
+    LEFT JOIN QuestionVoteCounts qvc ON q.Id = qvc.PostId
+    WHERE q.PostTypeId = 1 -- Only consider questions
+),
+CommentEngagement AS (
+    -- Find the highest scored comment for each question using a window function
+    SELECT
+        c.PostId AS QuestionId,
+        c.Text AS TopCommentText,
+        c.Score AS TopCommentScore,
+        c.UserId AS TopCommenterUserId,
+        c.CreationDate AS TopCommentDate,
+        ROW_NUMBER() OVER(PARTITION BY c.PostId ORDER BY c.Score DESC, c.CreationDate DESC) AS rn
+    FROM Comments c
+    WHERE c.PostId IN (SELECT QuestionId FROM QuestionActivityMetrics) -- Optimize by limiting to relevant posts
+)
+-- Main query: Combining all the CTEs and applying various complex constructs
+SELECT
+    qam.QuestionId,
+    qam.Title,
+    qam.QuestionCreationDate,
+    qam.ViewCount,
+    qam.AnswerCount,
+    qam.QuestionScore,
+    COALESCE(qam.FavoriteCount, 0) AS FavoriteCount, -- NULL logic: Handle NULL FavoriteCount
+    qam.Tags,
+    qam.PrimaryTag,
+    qam.DistinctEditorCount,
+    qam.MajorEditCount,
+    qam.LastEditOrHistoryEvent,
+    qam.HoursSinceFirstEdit,
+    qam.HasAcceptedAnswerFromReputableUser,
+    ur_owner.ReputationTier AS OwnerReputationTier,
+    ur_owner.HasGoldBadge AS OwnerHasGoldBadge,
+    qam.TotalUpVotes AS TotalUpVotesOnQuestion,
+    qam.TotalDownVotes AS TotalDownVotesOnQuestion,
+    ce.TopCommentText,
+    COALESCE(ce.TopCommentScore, 0) AS TopCommentScore,
+    ur_commenter.ReputationTier AS TopCommenterReputationTier,
+    ur_commenter.HasGoldBadge AS TopCommenterHasGoldBadge,
+    -- Window function: Rank questions by score within their primary tag
+    RANK() OVER (
+        PARTITION BY qam.PrimaryTag
+        ORDER BY qam.QuestionScore DESC, qam.ViewCount DESC, qam.QuestionId
+    ) AS RankInPrimaryTag,
+    -- Complicated expression/calculation: Calculate a "Relevance Score" using weighted factors
+    (
+        (qam.QuestionScore * 0.5) +
+        (qam.AnswerCount * 1.5) +
+        (qam.ViewCount * 0.001) +
+        (COALESCE(qam.FavoriteCount, 0) * 2.0) +
+        (qam.DistinctEditorCount * 10) +
+        (CASE WHEN ur_owner.HasGoldBadge THEN 50 ELSE 0 END) +
+        (CASE WHEN qam.HasAcceptedAnswerFromReputableUser THEN 30 ELSE 0 END) +
+        (COALESCE(ce.TopCommentScore, 0) * 0.8) +
+        (CASE WHEN qam.ClosedDate IS NULL THEN 20 ELSE 0 END) -- Bonus for open questions
+    ) AS RelevanceScore,
+    -- NULL logic: Display 'Not Closed' if ClosedDate is NULL, otherwise format it
+    COALESCE(TO_CHAR(qam.ClosedDate, 'YYYY-MM-DD HH24:MI:SS'), 'Not Closed') AS FormattedClosedDate,
+    -- String aggregation for related post IDs, using outer join
+    STRING_AGG(DISTINCT pl.RelatedPostId::varchar, ', ') AS RelatedPostIds,
+    -- Correlated subquery in SELECT clause: Get the creation date of the last "rollback body" event, if any
+    (
+        SELECT MAX(ph_rb.CreationDate)
+        FROM PostHistory ph_rb
+        WHERE ph_rb.PostId = qam.QuestionId AND ph_rb.PostHistoryTypeId = 8 -- Rollback Body
+    ) AS LastBodyRollbackDate,
+    -- Window function: Average view count for questions within the same primary tag
+    AVG(qam.ViewCount) OVER (PARTITION BY qam.PrimaryTag) AS AvgViewCountForTag
+FROM QuestionActivityMetrics qam
+LEFT JOIN UserReputationTiers ur_owner ON qam.OwnerUserId = ur_owner.UserId
+LEFT JOIN CommentEngagement ce ON qam.QuestionId = ce.QuestionId AND ce.rn = 1
+LEFT JOIN UserReputationTiers ur_commenter ON ce.TopCommenterUserId = ur_commenter.UserId
+LEFT JOIN PostLinks pl ON qam.QuestionId = pl.PostId AND pl.LinkTypeId IN (1, 3) -- Linked or Duplicate
+WHERE
+    qam.ClosedDate IS NULL -- Predicate: Only open questions
+    AND qam.AnswerCount >= 2 -- Predicate: At least two answers
+    AND qam.QuestionCreationDate >= NOW() - INTERVAL '2 year' -- Predicate: Only questions from the last 2 years
+    -- Complicated predicate: View count must be higher than the average view count for questions in the same primary tag
+    AND qam.ViewCount > (
+        SELECT COALESCE(AVG(ViewCount), 0)
+        FROM Posts
+        WHERE PostTypeId = 1
+          AND Tags ILIKE '%' || qam.PrimaryTag || '%' -- Use ILIKE for case-insensitive tag matching
+          AND CreationDate >= NOW() - INTERVAL '2 year'
+    )
+    -- Complex boolean logic combining string expressions and a correlated subquery
+    AND (
+        (qam.Tags ILIKE '%<sql>%' OR qam.Tags ILIKE '%<database>%') -- String expression: Tags contain 'sql' or 'database' (case-insensitive)
+        OR EXISTS (
+            SELECT 1
+            FROM Posts p_body
+            WHERE p_body.Id = qam.QuestionId AND p_body.Body ILIKE '%performance%' -- Correlated subquery: Body text contains 'performance'
+        )
+    )
+GROUP BY
+    qam.QuestionId, qam.Title, qam.QuestionCreationDate, qam.ViewCount, qam.AnswerCount, qam.QuestionScore, qam.FavoriteCount, qam.Tags, qam.PrimaryTag,
+    qam.DistinctEditorCount, qam.MajorEditCount, qam.LastEditOrHistoryEvent, qam.HoursSinceFirstEdit, qam.HasAcceptedAnswerFromReputableUser,
+    ur_owner.ReputationTier, ur_owner.HasGoldBadge, qam.TotalUpVotes, qam.TotalDownVotes,
+    ce.TopCommentText, ce.TopCommentScore, ur_commenter.ReputationTier, ur_commenter.HasGoldBadge,
+    qam.ClosedDate
+HAVING
+    COUNT(pl.Id) >= 0 -- Ensure RelatedPostIds is always aggregated, effectively not filtering out anything specific, just to demonstrate HAVING
+ORDER BY RelevanceScore DESC, qam.QuestionId
+LIMIT 100;

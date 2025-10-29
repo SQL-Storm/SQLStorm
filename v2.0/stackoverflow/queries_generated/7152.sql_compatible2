@@ -1,0 +1,300 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY MAX(p.CreationDate) DESC) as RecentPostRank,
+        CASE WHEN COUNT(DISTINCT p.Id) > 0 THEN 1 ELSE 0 END as HasPosts,
+        CASE WHEN COUNT(DISTINCT c.Id) > 0 THEN 1 ELSE 0 END as HasComments,
+        CASE WHEN COUNT(DISTINCT b.Id) > 0 THEN 1 ELSE 0 END as HasBadges
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= TIMESTAMP '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+PostPerformanceMetrics AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        CASE WHEN p.PostTypeId = 1 THEN 'Question' ELSE 'Answer' END as PostType,
+        CASE 
+            WHEN p.Score > 10 THEN 'High'
+            WHEN p.Score > 5 THEN 'Medium'
+            ELSE 'Low'
+        END as ScoreLevel,
+        CASE 
+            WHEN p.ViewCount > 1000 THEN 'Popular'
+            WHEN p.ViewCount > 500 THEN 'Noticeable'
+            ELSE 'Quiet'
+        END as ViewLevel,
+        CASE 
+            WHEN p.AnswerCount > 5 THEN 'Well-answered'
+            WHEN p.AnswerCount > 0 THEN 'Answered'
+            ELSE 'Unanswered'
+        END as AnswerStatus,
+        EXTRACT(DAY FROM (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate)) as DaysOld,
+        ABS(p.Score - AVG(p.Score) OVER ()) as ScoreDeviation,
+        PERCENT_RANK() OVER (ORDER BY p.Score) as ScorePercentile,
+        ROW_NUMBER() OVER (ORDER BY p.Score DESC) as ScoreRank
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+TopPerformingUsers AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) as TotalPosts,
+        SUM(p.Score) as TotalScore,
+        AVG(p.Score) as AvgScore,
+        MAX(p.CreationDate) as LastPost,
+        STRING_AGG(DISTINCT CAST(p.PostTypeId AS VARCHAR), ', ') as PostTypes
+    FROM Users u
+    INNER JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE p.CreationDate >= TIMESTAMP '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(p.Id) >= 5
+    ORDER BY TotalScore DESC
+    LIMIT 100
+),
+UserBadgesSummary AS (
+    SELECT 
+        u.Id as UserId,
+        COUNT(b.Id) as TotalBadges,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) as GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) as SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) as BronzeBadges,
+        STRING_AGG(DISTINCT b.Name, ', ') as BadgeNames,
+        STRING_AGG(DISTINCT CASE WHEN b.TagBased = TRUE THEN b.Name ELSE NULL END, ', ') as TagBadges
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id
+),
+PostComplexityAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Body,
+        LENGTH(p.Body) as BodyLength,
+        LENGTH(p.Title) as TitleLength,
+        CAST(p.Body AS TEXT) as CleanBody,
+        TRIM(BOTH '<>' FROM TRIM(p.Title)) as CleanTitle,
+        CASE 
+            WHEN LENGTH(p.Body) > 5000 THEN 'Very Long'
+            WHEN LENGTH(p.Body) > 1000 THEN 'Long'
+            WHEN LENGTH(p.Body) > 500 THEN 'Medium'
+            ELSE 'Short'
+        END as BodyLengthCategory,
+        CASE 
+            WHEN p.Title ~ '^[A-Z][a-zA-Z0-9\s\?\.\!\-]*$' THEN 'Standard'
+            WHEN p.Title ~ '[^a-zA-Z0-9\s]' THEN 'SpecialChars'
+            ELSE 'Other'
+        END as TitleStyle,
+        POSITION('code' IN LOWER(p.Body)) as CodeTagPosition,
+        POSITION('html' IN LOWER(p.Body)) as HtmlTagPosition,
+        CASE 
+            WHEN POSITION('code' IN LOWER(p.Body)) > 0 THEN 1
+            ELSE 0
+        END as CodeTagPresent,
+        CASE 
+            WHEN POSITION('html' IN LOWER(p.Body)) > 0 THEN 1
+            ELSE 0
+        END as HtmlTagPresent,
+        COALESCE(NULLIF(SUBSTRING(p.Tags FROM '^\s*<(.+?)>\s*$'), ''), 'No Tags') as CleanTags,
+        COALESCE(array_length(string_to_array(NULLIF(p.Tags, ''), '><'), 1), 0) as TagCount
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+AggregateMetrics AS (
+    SELECT 
+        'PostMetrics' as MetricType,
+        COUNT(*) as TotalPosts,
+        AVG(Score) as AvgScore,
+        MAX(Score) as MaxScore,
+        MIN(Score) as MinScore,
+        AVG(ViewCount) as AvgViews,
+        SUM(AnswerCount) as TotalAnswers,
+        SUM(CommentCount) as TotalComments
+    FROM Posts
+    GROUP BY 'PostMetrics'
+    
+    UNION ALL
+    
+    SELECT 
+        'UserMetrics' as MetricType,
+        COUNT(*) as TotalUsers,
+        AVG(Reputation) as AvgReputation,
+        MAX(Reputation) as MaxReputation,
+        MIN(Reputation) as MinReputation,
+        AVG(Views) as AvgViews,
+        AVG(UpVotes) as AvgUpVotes,
+        AVG(DownVotes) as AvgDownVotes
+    FROM Users
+    GROUP BY 'UserMetrics'
+    
+    UNION ALL
+    
+    SELECT 
+        'BadgeMetrics' as MetricType,
+        COUNT(*) as TotalBadges,
+        COUNT(CASE WHEN Class = 1 THEN 1 END) as GoldBadges,
+        COUNT(CASE WHEN Class = 2 THEN 1 END) as SilverBadges,
+        COUNT(CASE WHEN Class = 3 THEN 1 END) as BronzeBadges,
+        AVG(1) as AvgBadgeValue,
+        COUNT(DISTINCT UserId) as DistinctUsers,
+        COUNT(DISTINCT Name) as UniqueBadges
+    FROM Badges
+    GROUP BY 'BadgeMetrics'
+)
+SELECT 
+    CASE 
+        WHEN (SELECT COUNT(*) FROM AggregateMetrics) > 10 THEN 
+            'ComplexBenchmarkQuery' 
+        ELSE 
+            'SimpleQuery'
+    END as BenchmarkType,
+    
+    (SELECT COUNT(*) 
+     FROM Posts p2 
+     WHERE p2.OwnerUserId = u.Id 
+       AND p2.CreationDate >= TIMESTAMP '2010-01-01') as UserPostCount,
+    
+    ROW_NUMBER() OVER (
+        PARTITION BY u.Id 
+        ORDER BY COALESCE(
+            (SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = u.Id), 
+            0
+        ) DESC
+    ) as UserScoreRank,
+    
+    TRIM(
+        CONCAT(
+            u.DisplayName, 
+            ' | Reputation: ', 
+            u.Reputation,
+            ' | Posts: ', 
+            COALESCE((SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id), 0)
+        )
+    ) as UserSummary,
+    
+    COALESCE(
+        (SELECT b.TotalBadges FROM UserBadgesSummary b WHERE b.UserId = u.Id),
+        0
+    ) as TotalBadges,
+    
+    (SELECT COUNT(*) FROM (
+        SELECT p.Id FROM Posts p WHERE p.OwnerUserId = u.Id 
+        INTERSECT
+        SELECT v.PostId FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId IN (2, 3)
+    ) AS UserPostsWithVotes) as UserVotes,
+    
+    CASE 
+        WHEN u.Reputation > 100000 THEN 'Elite'
+        WHEN u.Reputation > 50000 THEN 'Veteran'
+        WHEN u.Reputation > 10000 THEN 'Experienced'
+        WHEN u.Reputation > 1000 THEN 'Active'
+        ELSE 'Beginner'
+    END as UserReputationLevel,
+    
+    ROUND(
+        (COALESCE(u.Reputation, 0) * 0.1 + 
+         COALESCE((SELECT COUNT(*) FROM Posts WHERE OwnerUserId = u.Id), 0) * 0.05 +
+         COALESCE((SELECT COUNT(*) FROM Comments WHERE UserId = u.Id), 0) * 0.02 +
+         COALESCE((SELECT COUNT(*) FROM Badges WHERE UserId = u.Id), 0) * 0.01),
+        2
+    ) as UserPerformanceScore,
+    
+    LEFT(UPPER(u.DisplayName), 15) as DisplayNameShort,
+    SUBSTRING(u.EmailHash FROM 1 FOR 8) as EmailHashPreview,
+    
+    NULLIF(
+        CASE 
+            WHEN u.WebsiteUrl IS NOT NULL AND LENGTH(u.WebsiteUrl) > 0 THEN 'HasWebsite'
+            ELSE 'NoWebsite'
+        END,
+        'NoWebsite'
+    ) as WebsiteStatus,
+    
+    (SELECT COUNT(*) FROM TopPerformingUsers tpu WHERE tpu.UserId = u.Id) as IsTopUser,
+    
+    EXTRACT(DAY FROM (TIMESTAMP '2024-10-01 12:34:56' - u.CreationDate)) as DaysSinceRegistration,
+    
+    (SELECT COUNT(*) FROM (
+        SELECT DISTINCT p.OwnerUserId FROM Posts p 
+        WHERE p.OwnerUserId = u.Id 
+        AND EXISTS (
+            SELECT 1 FROM Votes v 
+            WHERE v.PostId = p.Id AND v.VoteTypeId = 2
+        )
+    ) t) as UserWithUpvotedPosts,
+    
+    PERCENT_RANK() OVER (ORDER BY u.Reputation DESC) as ReputationPercentile,
+    
+    (SELECT SUM(1.0 * a.TotalPosts) FROM TopPerformingUsers a) as TotalTopUsers,
+    
+    CASE 
+        WHEN u.Location IS NOT NULL AND LENGTH(TRIM(u.Location)) > 0 THEN 
+            COALESCE(NULLIF(UPPER(TRIM(u.Location)), ''), 'Unknown Location')
+        ELSE 'No Location'
+    END as LocationCategory,
+    
+    (SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = u.Id) as AvgPostScore,
+    
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.Score >= 10) as HighScorePosts,
+    
+    (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id AND c.CreationDate >= TIMESTAMP '2019-01-01') as RecentComments,
+    
+    ROW_NUMBER() OVER (
+        ORDER BY 
+            COALESCE(u.Reputation, 0) DESC,
+            COALESCE((SELECT COUNT(*) FROM Posts WHERE OwnerUserId = u.Id), 0) DESC,
+            COALESCE((SELECT COUNT(*) FROM Badges WHERE UserId = u.Id), 0) DESC
+    ) as OverallRank
+    
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN Comments c ON u.Id = c.UserId
+LEFT JOIN Badges b ON u.Id = b.UserId
+WHERE u.CreationDate >= TIMESTAMP '2010-01-01'
+  AND u.Id IN (
+    SELECT DISTINCT OwnerUserId 
+    FROM Posts 
+    WHERE CreationDate >= TIMESTAMP '2010-01-01'
+    UNION
+    SELECT DISTINCT UserId 
+    FROM Comments 
+    WHERE CreationDate >= TIMESTAMP '2010-01-01'
+  )
+  AND u.Id NOT IN (
+    SELECT DISTINCT UserId 
+    FROM Votes 
+    WHERE VoteTypeId = 10 
+    AND CreationDate >= TIMESTAMP '2010-01-01'
+  )
+  AND (u.Reputation > 100 OR u.Views > 50)
+  AND u.DisplayName IS NOT NULL
+  AND LENGTH(TRIM(u.DisplayName)) > 0
+  AND u.DisplayName NOT SIMILAR TO '%(admin|moderator|test|dummy|sample)%'
+  
+GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.WebsiteUrl, u.Location, u.EmailHash, u.Views
+HAVING COUNT(DISTINCT p.Id) > 0
+   OR COUNT(DISTINCT c.Id) > 0
+   OR COUNT(DISTINCT b.Id) > 0
+ORDER BY COALESCE(u.Reputation, 0) DESC, 
+         (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = u.Id) DESC,
+         (SELECT COUNT(*) FROM Comments WHERE UserId = u.Id) DESC
+LIMIT 5000;

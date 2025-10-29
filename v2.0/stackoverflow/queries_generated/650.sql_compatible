@@ -1,0 +1,296 @@
+with
+active_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        u.location,
+        coalesce(nullif(trim(lower(u.websiteurl)), ''), 'n/a') as norm_website,
+        sum(coalesce(u.upvotes,0) - coalesce(u.downvotes,0)) as vote_delta,
+        count(b.id) filter (where b.class = 1) as gold_badges,
+        count(b.id) filter (where b.class = 2) as silver_badges,
+        count(b.id) filter (where b.class = 3) as bronze_badges,
+        max(b.date) as last_badge_date,
+        count(distinct p.id) as total_posts
+    from users u
+    left join badges b on b.userid = u.id
+    left join posts p on p.owneruserid = u.id
+    where u.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+    group by u.id, u.displayname, u.reputation, u.creationdate, u.location, norm_website
+),
+recent_questions as (
+    select
+        q.id,
+        q.owneruserid,
+        q.creationdate,
+        q.score,
+        q.viewcount,
+        q.title,
+        q.tags,
+        string_to_array(substring(q.tags, 2, greatest(length(q.tags)-2,0)), '><') as tag_array,
+        q.answercount,
+        q.favoritecount,
+        q.closeddate,
+        q.lastactivitydate
+    from posts q
+    where q.posttypeid = 1
+      and q.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+),
+answers as (
+    select
+        a.id as answer_id,
+        a.parentid as question_id,
+        a.owneruserid as answer_owner_id,
+        a.creationdate as answer_date,
+        a.score as answer_score,
+        (a.id = q.acceptedanswerid) as is_accepted
+    from posts a
+    join posts q on q.id = a.parentid and q.posttypeid = 1
+    where a.posttypeid = 2
+      and q.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+),
+question_agg as (
+    select
+        rq.id as question_id,
+        rq.owneruserid as asker_id,
+        rq.creationdate as question_date,
+        rq.score as question_score,
+        rq.viewcount,
+        rq.title,
+        rq.tags,
+        rq.tag_array,
+        rq.answercount,
+        rq.favoritecount,
+        rq.closeddate,
+        rq.lastactivitydate,
+        count(a.answer_id) as answers_total,
+        count(*) filter (where a.is_accepted) as accepted_count,
+        max(a.answer_score) as best_answer_score,
+        min(a.answer_date) as first_answer_time,
+        max(a.answer_date) as last_answer_time,
+        (extract(epoch from (min(a.answer_date) - rq.creationdate)) / 3600.0) as hours_to_first_answer,
+        (extract(epoch from (max(a.answer_date) - rq.creationdate)) / 3600.0) as hours_to_last_answer
+    from recent_questions rq
+    left join answers a on a.question_id = rq.id
+    group by rq.id, rq.owneruserid, rq.creationdate, rq.score, rq.viewcount, rq.title, rq.tags, rq.tag_array, rq.answercount, rq.favoritecount, rq.closeddate, rq.lastactivitydate
+),
+comment_metrics as (
+    select
+        c.postid,
+        count(*) as comments_count,
+        sum(coalesce(c.score,0)) as comments_score_sum,
+        avg(nullif(c.score,0)) filter (where c.score is not null) as comments_score_avg_nonzero,
+        max(c.creationdate) as last_comment_date,
+        sum(case when position('thanks' in lower(c.text)) > 0 then 1 else 0 end) as thanks_count,
+        sum(case when position('please' in lower(c.text)) > 0 then 1 else 0 end) as please_count,
+        sum(case when position('wrong' in lower(c.text)) > 0 or position('bad' in lower(c.text)) > 0 then 1 else 0 end) as negative_hint_count
+    from comments c
+    where c.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+    group by c.postid
+),
+ph_events as (
+    select
+        ph.postid,
+        max(ph.creationdate) filter (where ph.posthistorytypeid in (10,11,14,15,35,36)) as last_moderation_event,
+        count(*) filter (where ph.posthistorytypeid = 10) as close_votes,
+        count(*) filter (where ph.posthistorytypeid = 11) as reopen_votes,
+        count(*) filter (where ph.posthistorytypeid = 14) as lock_events,
+        count(*) filter (where ph.posthistorytypeid = 15) as unlock_events,
+        max(case when ph.posthistorytypeid = 10 then ph.comment end) as last_close_reason_raw
+    from posthistory ph
+    where ph.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+    group by ph.postid
+),
+dup_links as (
+    select
+        pl.postid,
+        count(*) filter (where pl.linktypeid = 3) as duplicate_of_count
+    from postlinks pl
+    where pl.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+    group by pl.postid
+),
+vote_agg as (
+    select
+        v.postid,
+        count(*) filter (where v.votetypeid = 2) as upvotes,
+        count(*) filter (where v.votetypeid = 3) as downvotes,
+        count(*) filter (where v.votetypeid = 5) as favorites,
+        count(*) filter (where v.votetypeid = 8) as bounties_started,
+        count(*) filter (where v.votetypeid = 9) as bounties_closed,
+        sum(v.bountyamount) filter (where v.votetypeid in (8,9)) as bounty_amount_sum,
+        min(v.creationdate) as first_vote_date,
+        max(v.creationdate) as last_vote_date
+    from votes v
+    join posts p on p.id = v.postid and p.posttypeid = 1
+    where v.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+    group by v.postid
+),
+tag_pop as (
+    select
+        t.tagname,
+        t.count as global_tag_count
+    from tags t
+),
+question_tags as (
+    select
+        qa.question_id,
+        unnest(qa.tag_array) as tagname
+    from question_agg qa
+),
+answerer_perf as (
+    select
+        a.answer_owner_id as user_id,
+        count(*) as answers_last3y,
+        count(*) filter (where a.is_accepted) as accepted_answers_last3y,
+        avg(extract(epoch from (a.answer_date - q.question_date)) / 3600.0) as avg_hours_to_answer,
+        percentile_disc(0.5) within group (order by extract(epoch from (a.answer_date - q.question_date)) / 3600.0) as median_hours_to_answer
+    from answers a
+    join question_agg q on q.question_id = a.question_id
+    group by a.answer_owner_id
+),
+tag_score as (
+    select
+        qt.question_id,
+        sum(coalesce(tp.global_tag_count, 0)) as sum_global_tag_count,
+        avg(coalesce(tp.global_tag_count, 0)) as avg_global_tag_count,
+        count(*) as tag_count
+    from question_tags qt
+    left join tag_pop tp on lower(tp.tagname) = lower(qt.tagname)
+    group by qt.question_id
+),
+scores as (
+    select
+        qa.question_id,
+        qa.asker_id,
+        qa.question_date,
+        qa.question_score,
+        qa.viewcount,
+        qa.title,
+        qa.answercount,
+        qa.favoritecount,
+        qa.closeddate,
+        qa.lastactivitydate,
+        coalesce(cm.comments_count,0) as comments_count,
+        coalesce(cm.comments_score_sum,0) as comments_score_sum,
+        coalesce(cm.thanks_count,0) as thanks_count,
+        coalesce(cm.negative_hint_count,0) as negative_hint_count,
+        coalesce(pe.close_votes,0) as close_votes,
+        coalesce(pe.reopen_votes,0) as reopen_votes,
+        coalesce(dl.duplicate_of_count,0) as duplicate_of_count,
+        coalesce(va.upvotes,0) as upvotes,
+        coalesce(va.downvotes,0) as downvotes,
+        coalesce(va.favorites,0) as favorites_votes,
+        coalesce(va.bounty_amount_sum,0) as bounty_amount_sum,
+        qa.answers_total,
+        qa.accepted_count,
+        qa.best_answer_score,
+        qa.hours_to_first_answer,
+        qa.hours_to_last_answer,
+        ts.sum_global_tag_count,
+        ts.avg_global_tag_count,
+        ts.tag_count,
+        (coalesce(va.upvotes,0) - coalesce(va.downvotes,0))::numeric / nullif(1 + qa.answers_total,0) as score_per_answer,
+        case
+            when coalesce(ts.avg_global_tag_count,0) = 0 then null
+            else (qa.viewcount::numeric / nullif(ts.avg_global_tag_count,0))
+        end as normalized_views_by_tag_popularity,
+        (coalesce(qa.best_answer_score,0) + 0.5 * coalesce(qa.accepted_count,0)) - 0.1 * coalesce(cm.negative_hint_count,0) as answer_quality_proxy,
+        (case when qa.closeddate is not null then 1 else 0 end) + least(coalesce(pe.close_votes,0), 5) + 2 * coalesce(dl.duplicate_of_count,0) as controversy_index
+    from question_agg qa
+    left join comment_metrics cm on cm.postid = qa.question_id
+    left join ph_events pe on pe.postid = qa.question_id
+    left join dup_links dl on dl.postid = qa.question_id
+    left join vote_agg va on va.postid = qa.question_id
+    left join tag_score ts on ts.question_id = qa.question_id
+),
+ranked as (
+    select
+        s.*,
+        row_number() over (order by coalesce(s.normalized_views_by_tag_popularity, 0) desc) as rn_views_norm,
+        row_number() over (order by coalesce(s.answer_quality_proxy, -1e9) desc) as rn_answer_quality,
+        row_number() over (order by coalesce(s.controversy_index, -1e9) desc) as rn_controversy,
+        row_number() over (order by coalesce(s.hours_to_first_answer, 1e9) asc) as rn_fast_answered,
+        rank() over (order by coalesce(s.favorites_votes,0) desc, coalesce(s.upvotes,0) desc) as rk_favorited
+    from scores s
+),
+top_answerer as (
+    select
+        a.question_id,
+        a.answer_owner_id as top_answerer_id,
+        a.answer_score,
+        row_number() over (partition by a.question_id order by a.is_accepted desc, a.answer_score desc, a.answer_date asc) as rnk
+    from answers a
+)
+select
+    r.question_id,
+    coalesce(r.title, '(no title)') as title,
+    r.asker_id,
+    au.displayname as asker_name,
+    au.reputation as asker_reputation,
+    au.gold_badges || '/' || au.silver_badges || '/' || au.bronze_badges as badge_mix,
+    coalesce(au.location, 'unknown') as asker_location,
+    r.question_date,
+    r.viewcount,
+    r.question_score,
+    r.upvotes,
+    r.downvotes,
+    r.favorites_votes,
+    r.answercount,
+    r.answers_total,
+    r.accepted_count,
+    r.best_answer_score,
+    round(r.hours_to_first_answer, 2) as hours_to_first_answer,
+    round(r.hours_to_last_answer, 2) as hours_to_last_answer,
+    r.comments_count,
+    r.comments_score_sum,
+    r.close_votes,
+    r.reopen_votes,
+    r.duplicate_of_count,
+    r.controversy_index,
+    round(coalesce(r.normalized_views_by_tag_popularity,0), 2) as norm_views_by_tag_pop,
+    round(coalesce(r.answer_quality_proxy,0), 2) as answer_quality_proxy,
+    r.rn_views_norm,
+    r.rn_answer_quality,
+    r.rn_controversy,
+    r.rn_fast_answered,
+    r.rk_favorited,
+    ta.top_answerer_id,
+    ap.answers_last3y as top_answerer_answers3y,
+    ap.accepted_answers_last3y as top_answerer_accepted3y,
+    round(ap.avg_hours_to_answer, 2) as top_answerer_avg_hours,
+    round(ap.median_hours_to_answer, 2) as top_answerer_median_hours,
+    case
+        when r.closeddate is not null then 'closed'
+        when r.accepted_count > 0 then 'answered'
+        when r.answers_total = 0 and cast('2024-10-01 12:34:56' as timestamp) - r.question_date > interval '30 days' then 'stale'
+        else 'open'
+    end as question_state
+from ranked r
+left join active_users au on au.user_id = r.asker_id
+left join lateral (
+    select ta.question_id, ta.top_answerer_id
+    from top_answerer ta
+    where ta.question_id = r.question_id and ta.rnk = 1
+) ta on true
+left join answerer_perf ap on ap.user_id = ta.top_answerer_id
+where
+    (
+        (r.upvotes - coalesce(r.downvotes,0)) >= 5
+        or (r.favorites_votes >= 3 and coalesce(r.answer_quality_proxy,0) > 1)
+        or (r.closeddate is not null and r.controversy_index >= 3)
+    )
+    and coalesce(r.viewcount,0) > 0
+    and (
+        r.sum_global_tag_count is null
+        or r.avg_global_tag_count <= (select avg(coalesce(tp.count,0)) from tags tp)
+    )
+    and (
+        au.vote_delta is null
+        or au.vote_delta >= (select percentile_disc(0.25) within group (order by coalesce(u.upvotes,0)-coalesce(u.downvotes,0)) from users u)
+    )
+order by
+    r.rn_views_norm asc,
+    r.rn_answer_quality asc,
+    r.question_id
+limit 250;

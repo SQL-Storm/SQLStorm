@@ -1,0 +1,166 @@
+WITH
+RecentActivity AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.Body,
+        COALESCE(p.OwnerDisplayName, '') AS OwnerDisplayName,
+        p.LastEditorDisplayName,
+        p.LastEditDate
+    FROM Posts p
+),
+PostHistoryWithClose AS (
+    SELECT
+        ph.PostId,
+        ph.Text,
+        ph.CreationDate AS HistoryDate,
+        ph.Id AS HistoryId,
+        ph.PostHistoryTypeId,
+        ph.Comment,
+        ph.ContentLicense,
+        ph.UserId
+    FROM PostHistory ph
+    JOIN (
+        SELECT PostId, MAX(CreationDate) AS MaxDate
+        FROM PostHistory
+        GROUP BY PostId
+    ) m ON ph.PostId = m.PostId AND ph.CreationDate = m.MaxDate
+),
+TagInfo AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired
+    FROM Tags t
+),
+RelatedPosts AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name AS LinkTypeName,
+        pl.CreationDate
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+),
+TopUsers AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.AccountId,
+        ROW_NUMBER() OVER (
+            PARTITION BY u.AccountId
+            ORDER BY u.Reputation DESC, u.LastAccessDate DESC
+        ) AS rn
+    FROM Users u
+),
+Composite AS (
+    SELECT
+        rp.PostId,
+        rp.Title,
+        rp.PostTypeId,
+        rp.OwnerUserId,
+        rp.CreationDate,
+        rp.LastActivityDate,
+        rp.Score,
+        rp.ViewCount,
+        rp.Tags,
+        rp.Body,
+        rp.OwnerDisplayName,
+        rp.LastEditorDisplayName,
+        rp.LastEditDate,
+        rp.CommentCount,
+        rp.FavoriteCount,
+        COALESCE(rp.Score, 0)
+        + COALESCE(rp.ViewCount, 0) * 0.01
+        + COALESCE(rp.CommentCount, 0) * 0.05
+        AS CompositeScore
+    FROM RecentActivity rp
+),
+LatestOwnerComment AS (
+    SELECT
+        c.PostId,
+        c.Text AS CommentText,
+        c.CreationDate AS CommentDate,
+        c.UserId AS CommentUserId
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+),
+LatestOwnerCommentPerPost AS (
+    SELECT
+        lc.PostId,
+        lc.CommentText,
+        lc.CommentDate,
+        lc.CommentUserId
+    FROM (
+        SELECT
+            lc.*,
+            ROW_NUMBER() OVER (PARTITION BY lc.PostId ORDER BY lc.CommentDate DESC) AS rn
+        FROM LatestOwnerComment lc
+    ) lc
+    WHERE lc.rn = 1
+)
+SELECT
+    cs.PostId,
+    cs.Title,
+    cs.PostTypeId,
+    ph.Text AS LastPostHistoryText,
+    t.TagName,
+    t2.TagName AS RelatedTagName,
+    ru.DisplayName AS OwnerDisplayName,
+    ru.Reputation AS OwnerReputation,
+    ru2.DisplayName AS EditorDisplayName,
+    ru2.Reputation AS EditorReputation,
+    cs.CompositeScore,
+    ra.LinkTypeName,
+    ra.CreationDate AS LinkCreationDate,
+    ru.rn AS TopUserRank,
+    rov.CommentText AS LatestOwnerComment,
+    rov.CommentDate AS LatestOwnerCommentDate
+FROM Composite cs
+LEFT JOIN PostHistory ph ON ph.PostId = cs.PostId
+LEFT JOIN PostHistory ph2 ON ph2.PostId = cs.PostId
+LEFT JOIN Tags t ON t.ExcerptPostId = cs.PostId
+LEFT JOIN RelatedPosts ra ON ra.PostId = cs.PostId
+LEFT JOIN PostLinks vir ON vir.PostId = cs.PostId
+LEFT JOIN TopUsers ru ON ru.Id = cs.OwnerUserId
+LEFT JOIN TopUsers ru2 ON ru2.Id = cs.LastEditorUserId
+LEFT JOIN LatestOwnerCommentPerPost rov ON rov.PostId = cs.PostId
+LEFT JOIN Tags t2 ON t2.WikiPostId = cs.PostId
+GROUP BY
+    cs.PostId,
+    cs.Title,
+    cs.PostTypeId,
+    ph.Text,
+    t.TagName,
+    t2.TagName,
+    ru.DisplayName,
+    ru.Reputation,
+    ru2.DisplayName,
+    ru2.Reputation,
+    cs.CompositeScore,
+    ra.LinkTypeName,
+    ra.CreationDate,
+    ru.rn,
+    rov.CommentText,
+    rov.CommentDate
+ORDER BY cs.CompositeScore DESC
+LIMIT 200;

@@ -1,0 +1,106 @@
+WITH
+UserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName AS UserName,
+    COUNT(DISTINCT p.Id) FILTER (WHERE p.OwnerUserId = u.Id) AS PostsCreated,
+    COUNT(DISTINCT ph.Id) AS PostHistoryEdits,
+    COUNT(DISTINCT c.Id) AS CommentsMade,
+    COUNT(DISTINCT v.Id) AS VotesCast,
+    MAX(p.CreationDate) AS LastPostDate,
+    MAX(ph.CreationDate) AS LastEditDate
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+  LEFT JOIN Comments c ON c.UserId = u.Id
+  LEFT JOIN Votes v ON v.UserId = u.Id
+  GROUP BY u.Id, u.DisplayName
+),
+UserMetrics AS (
+  SELECT
+    ua.UserId,
+    ua.UserName,
+    COALESCE(PostsCreated,0) * 3.5
+    + COALESCE(PostHistoryEdits,0) * 1.8
+    + COALESCE(CommentsMade,0) * 0.9
+    + COALESCE(VotesCast,0) * 2.1
+    + CASE
+        WHEN LastPostDate IS NULL THEN 0
+        ELSE EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - LastPostDate)) / 86400
+      END * -0.5
+    + CASE
+        WHEN LastEditDate IS NULL THEN 0
+        ELSE EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - LastEditDate)) / 86400
+      END * 0.2 AS ActivityScore
+  FROM UserActivity ua
+),
+TopPosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.OwnerUserId,
+    p.Title,
+    p.PostTypeId,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    ROW_NUMBER() OVER (
+      PARTITION BY p.OwnerUserId
+      ORDER BY
+        (CASE WHEN p.PostTypeId = 1 THEN p.Score * 1.5 ELSE p.Score * 0.8 END)
+        + p.ViewCount * 0.01
+        + EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate)) / 86400 * -0.3
+    ) AS rn
+  FROM Posts p
+  WHERE p.OwnerUserId IS NOT NULL
+),
+TagAnalytics AS (
+  SELECT
+    t.Id AS TagId,
+    t.TagName,
+    t.Count AS TagCount,
+    wa.PostId AS LinkedPostWithTag,
+    pl.LinkTypeId
+  FROM Tags t
+  LEFT JOIN LATERAL (
+    SELECT p.Id AS PostId
+    FROM Posts p
+    WHERE p.Tags LIKE '%' || t.TagName || '%'
+    ORDER BY p.CreationDate DESC
+    LIMIT 1
+  ) wa ON TRUE
+  LEFT JOIN PostLinks pl ON pl.PostId = wa.PostId
+  WHERE (t.IsModeratorOnly = FALSE) OR (t.IsModeratorOnly IS NULL)
+),
+FinalPick AS (
+  SELECT
+    me.UserId,
+    me.UserName,
+    me.ActivityScore,
+    tp.PostId AS TopPostId,
+    tp.Title AS TopPostTitle,
+    tp.PostTypeId AS TopPostType,
+    ta.TagName
+  FROM UserMetrics me
+  LEFT JOIN (
+    SELECT PostId, OwnerUserId, Title, PostTypeId, rn
+    FROM TopPosts
+    WHERE rn = 1
+  ) tp ON tp.OwnerUserId = me.UserId
+  LEFT JOIN TagAnalytics ta ON ta.LinkedPostWithTag = tp.PostId
+  ORDER BY me.ActivityScore DESC
+  LIMIT 100
+)
+SELECT
+  fp.UserId,
+  fp.UserName,
+  fp.ActivityScore,
+  fp.TopPostId,
+  fp.TopPostTitle,
+  CASE fp.TopPostType
+    WHEN 1 THEN 'Question'
+    WHEN 2 THEN 'Answer'
+    ELSE 'Other'
+  END AS TopPostKind,
+  fp.TagName
+FROM FinalPick fp
+ORDER BY fp.ActivityScore DESC, fp.UserName ASC;

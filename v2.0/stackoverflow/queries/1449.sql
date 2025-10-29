@@ -1,0 +1,229 @@
+WITH UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COALESCE(u.Views, 0) AS UserTotalViews,
+        u.UpVotes AS UserTotalUpVotes,
+        u.DownVotes AS UserTotalDownVotes,
+        CAST(u.Reputation AS numeric) / ((EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - u.CreationDate)) / (3600 * 24)) + 1) AS ReputationPerDay,
+        COUNT(DISTINCT q.Id) AS TotalQuestionsAsked,
+        COUNT(DISTINCT a.Id) AS TotalAnswersGiven,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN q.Id IS NOT NULL THEN COALESCE(q.Score, 0) ELSE 0 END) AS TotalQuestionScoreReceived,
+        SUM(CASE WHEN a.Id IS NOT NULL THEN COALESCE(a.Score, 0) ELSE 0 END) AS TotalAnswerScoreReceived,
+        SUM(COALESCE(c.Score, 0)) AS TotalCommentScoreReceived,
+        COUNT(DISTINCT CASE WHEN q.AcceptedAnswerId IS NOT NULL THEN q.Id END) AS QuestionsWithAcceptedAnswers,
+        COUNT(DISTINCT CASE WHEN a.AcceptedAnswerId = a.Id THEN a.Id END) AS AnswersAcceptedByOthers
+    FROM Users u
+    LEFT JOIN Posts q ON u.Id = q.OwnerUserId AND q.PostTypeId = 1
+    LEFT JOIN Posts a ON u.Id = a.OwnerUserId AND a.PostTypeId = 2
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    WHERE u.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '10 year')
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes
+),
+PostTagsExpanded AS (
+    SELECT
+        p.Id AS PostId,
+        TRIM(token) AS TagName
+    FROM Posts p
+    CROSS JOIN LATERAL (
+        SELECT unnest(string_to_array(SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags) - 2)), '><')) AS token
+    ) s
+    WHERE p.Tags IS NOT NULL AND CHAR_LENGTH(p.Tags) > 2
+),
+PostEngagementMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.LastActivityDate,
+        p.Title,
+        p.Body,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        COALESCE(p.AnswerCount, 0) AS ActualAnswerCount,
+        COALESCE(p.CommentCount, 0) AS ActualCommentCount,
+        COALESCE(p.FavoriteCount, 0) AS ActualFavoriteCount,
+        COALESCE(p.ClosedDate, TIMESTAMP '9999-12-31 23:59:59') AS PostClosedDate,
+        (p.Score * 0.6) + (p.ViewCount * 0.02) + (COALESCE(p.FavoriteCount, 0) * 1.5) + (COALESCE(p.AnswerCount, 0) * 1.0) + (COALESCE(p.CommentCount, 0) * 0.5) AS RawEngagementScore,
+        COUNT(DISTINCT ph.Id) AS TotalPostHistoryEvents,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditCount,
+        MAX(ph.CreationDate) AS LastPostEditDate,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (10, 101) THEN 1 ELSE 0 END) AS CloseVotesReceived,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (11) THEN 1 ELSE 0 END) AS ReopenVotesReceived,
+        STRING_AGG(DISTINCT pte.TagName, ' || ') FILTER (WHERE pte.TagName IS NOT NULL) AS ParsedTagsAggregated
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    LEFT JOIN PostTagsExpanded pte ON p.Id = pte.PostId
+    WHERE p.PostTypeId IN (1, 2)
+      AND p.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 year')
+    GROUP BY p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.LastActivityDate, p.Title, p.Body, p.Tags, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.ClosedDate
+),
+RankedAndFilteredPosts AS (
+    SELECT
+        pem.PostId,
+        pem.PostTypeId,
+        pem.OwnerUserId,
+        pem.PostCreationDate,
+        pem.LastActivityDate,
+        pem.Title,
+        pem.Body,
+        pem.Tags,
+        pem.Score,
+        pem.ViewCount,
+        pem.ActualAnswerCount,
+        pem.ActualCommentCount,
+        pem.ActualFavoriteCount,
+        pem.PostClosedDate,
+        pem.RawEngagementScore,
+        pem.TotalPostHistoryEvents,
+        pem.EditCount,
+        pem.LastPostEditDate,
+        pem.CloseVotesReceived,
+        pem.ReopenVotesReceived,
+        pem.ParsedTagsAggregated,
+        RANK() OVER (PARTITION BY pem.PostTypeId ORDER BY pem.RawEngagementScore DESC, pem.LastActivityDate DESC) AS PostEngagementRank,
+        NTILE(5) OVER (ORDER BY pem.RawEngagementScore DESC) AS PostEngagementTile,
+        LAG(pem.LastPostEditDate, 1, pem.PostCreationDate) OVER (PARTITION BY pem.PostId ORDER BY pem.LastPostEditDate) AS PreviousEditDate
+    FROM PostEngagementMetrics pem
+    WHERE pem.RawEngagementScore > 100
+      AND pem.ViewCount > 50
+),
+UserBadgeAchievements AS (
+    SELECT
+        b.UserId,
+        COUNT(b.Id) AS TotalBadgesEarned,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        MAX(b.Date) AS LatestBadgeDate,
+        MIN(b.Date) AS FirstBadgeDate,
+        CASE
+            WHEN COUNT(CASE WHEN b.Class = 1 THEN 1 END) > 0 THEN 'Gold Tier'
+            WHEN COUNT(CASE WHEN b.Class = 2 THEN 1 END) > 0 THEN 'Silver Tier'
+            WHEN COUNT(CASE WHEN b.Class = 3 THEN 1 END) > 0 THEN 'Bronze Tier'
+            ELSE 'No Tier'
+        END AS UserBadgeTier
+    FROM Badges b
+    GROUP BY b.UserId
+),
+MostDiscussedLinkedTags AS (
+    SELECT
+        pl_posts.PostId,
+        tagset.TagName AS MostDiscussedLinkedTag
+    FROM (
+        SELECT DISTINCT PostId FROM PostLinks
+    ) pl_posts
+    LEFT JOIN LATERAL (
+        SELECT t.TagName, ROW_NUMBER() OVER (PARTITION BY t.PostId ORDER BY c.cnt DESC, t.TagName ASC) rn
+        FROM (
+            SELECT pl_inner.PostId, unnest(string_to_array(SUBSTRING(plp.Tags FROM 2 FOR (CHAR_LENGTH(plp.Tags) - 2)), '><')) AS TagName
+            FROM PostLinks pl_inner
+            JOIN Posts plp ON pl_inner.RelatedPostId = plp.Id
+            WHERE plp.Tags IS NOT NULL AND CHAR_LENGTH(plp.Tags) > 2
+              AND pl_inner.LinkTypeId = 1
+              AND pl_inner.PostId = pl_posts.PostId
+        ) t
+        JOIN (
+            SELECT pl_count.PostId, pl_count.TagName, COUNT(*) AS cnt
+            FROM (
+                SELECT pl_inner2.PostId, unnest(string_to_array(SUBSTRING(plp2.Tags FROM 2 FOR (CHAR_LENGTH(plp2.Tags) - 2)), '><')) AS TagName
+                FROM PostLinks pl_inner2
+                JOIN Posts plp2 ON pl_inner2.RelatedPostId = plp2.Id
+                WHERE plp2.Tags IS NOT NULL AND CHAR_LENGTH(plp2.Tags) > 2
+                  AND pl_inner2.LinkTypeId = 1
+                  AND pl_inner2.PostId = pl_posts.PostId
+            ) pl_count
+            GROUP BY pl_count.PostId, pl_count.TagName
+        ) c ON c.PostId = t.PostId AND c.TagName = t.TagName
+        WHERE c.PostId IS NOT NULL
+    ) tagset ON tagset.rn = 1
+),
+MostDiscussedLinkedTagsFinal AS (
+    SELECT DISTINCT PostId, MostDiscussedLinkedTag FROM MostDiscussedLinkedTags
+)
+SELECT
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.ReputationPerDay,
+    uas.TotalQuestionsAsked,
+    uas.TotalAnswersGiven,
+    uas.TotalCommentsMade,
+    uas.TotalQuestionScoreReceived,
+    uas.TotalAnswerScoreReceived,
+    uba.TotalBadgesEarned,
+    uba.GoldBadges,
+    uba.SilverBadges,
+    uba.BronzeBadges,
+    uba.UserBadgeTier,
+    rp.PostId,
+    rp.PostTypeId,
+    rp.PostCreationDate,
+    rp.LastActivityDate,
+    COALESCE(rp.Title, 'Untitled Post') AS PostTitle,
+    SUBSTRING(REPLACE(REPLACE(rp.Body, '<p>', ''), '</p>', ' '), 1, 100) || '...' AS BodySnippet,
+    rp.Score AS PostScore,
+    rp.ViewCount AS PostViewCount,
+    rp.ActualAnswerCount AS PostAnswerCount,
+    rp.ActualCommentCount AS PostCommentCount,
+    rp.ActualFavoriteCount AS PostFavoriteCount,
+    rp.ParsedTagsAggregated,
+    rp.RawEngagementScore,
+    rp.PostEngagementRank,
+    rp.PostEngagementTile,
+    (EXTRACT(EPOCH FROM (rp.LastPostEditDate - rp.PreviousEditDate)) / 3600) AS HoursBetweenLastEdits,
+    rp.CloseVotesReceived,
+    rp.ReopenVotesReceived,
+    EXISTS (
+        SELECT 1
+        FROM Comments co
+        JOIN Users co_u ON co.UserId = co_u.Id
+        WHERE co.PostId = rp.PostId
+          AND co.Score > 5
+          AND ABS(co_u.Reputation - uas.Reputation) <= 5000
+          AND co.CreationDate > (rp.PostCreationDate - INTERVAL '30 days')
+          AND co.CreationDate < (rp.PostCreationDate + INTERVAL '1 year')
+    ) AS HasHighRepCommenter,
+    CASE
+        WHEN rp.PostTypeId = 1 THEN COALESCE(aa.Score, -1)
+        ELSE NULL
+    END AS AcceptedAnswerScore,
+    CASE
+        WHEN rp.PostTypeId = 1 THEN COALESCE(aa.ViewCount, -1)
+        ELSE NULL
+    END AS AcceptedAnswerViews,
+    CASE
+        WHEN rp.PostTypeId = 1 THEN SUBSTRING(REPLACE(REPLACE(COALESCE(aa.Body, 'No Accepted Answer'), '<p>', ''), '</p>', ' '), 1, 50) || '...'
+        ELSE NULL
+    END AS AcceptedAnswerBodyExcerpt,
+    CASE
+        WHEN rp.PostClosedDate <= CAST('2024-10-01 12:34:56' AS timestamp) THEN 'ClosedOrInactive'
+        WHEN rp.ReopenVotesReceived > rp.CloseVotesReceived AND rp.PostClosedDate > CAST('2024-10-01 12:34:56' AS timestamp) THEN 'ReopenedAndActive'
+        WHEN rp.EditCount > 5 AND rp.Score > 100 AND rp.ViewCount > 1000 AND rp.PostTypeId = 1 THEN 'WellMaintainedPopularQuestion'
+        WHEN rp.PostTypeId = 2 AND rp.Score > 50 AND rp.OwnerUserId = uas.UserId AND COALESCE(uba.GoldBadges,0) > 0 THEN 'ExpertAnswer'
+        ELSE 'StandardActivePost'
+    END AS PostHealthCategory,
+    md.MostDiscussedLinkedTag,
+    NULLIF(CHAR_LENGTH(TRIM(REPLACE(rp.Body, ' ', ''))), 0) AS BodyTextLengthWithoutSpaces
+FROM UserActivitySummary uas
+LEFT JOIN UserBadgeAchievements uba ON uas.UserId = uba.UserId
+INNER JOIN RankedAndFilteredPosts rp ON uas.UserId = rp.OwnerUserId
+LEFT JOIN Posts raw_post_for_accepted_ans ON rp.PostId = raw_post_for_accepted_ans.Id AND rp.PostTypeId = 1
+LEFT JOIN Posts aa ON raw_post_for_accepted_ans.AcceptedAnswerId = aa.Id AND aa.PostTypeId = 2
+LEFT JOIN MostDiscussedLinkedTagsFinal md ON md.PostId = rp.PostId
+WHERE uas.Reputation > 7500
+  AND (uas.TotalQuestionsAsked + uas.TotalAnswersGiven) > 5
+  AND rp.PostEngagementRank <= 100
+  AND rp.PostCreationDate BETWEEN (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 year') AND CAST('2024-10-01 12:34:56' AS timestamp)
+  AND (rp.Title ILIKE '%performance%' OR rp.Title ILIKE '%optimization%')
+  AND (rp.ParsedTagsAggregated ILIKE '%<sql>%' OR rp.ParsedTagsAggregated ILIKE '%<database>%')
+  AND rp.PostClosedDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '6 month')
+  AND (rp.ActualFavoriteCount IS NULL OR rp.ActualFavoriteCount > 2)
+ORDER BY uas.Reputation DESC, rp.RawEngagementScore DESC, rp.LastActivityDate DESC
+LIMIT 500;

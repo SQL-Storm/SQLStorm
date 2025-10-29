@@ -1,0 +1,47 @@
+SELECT 
+    u.DisplayName, 
+    u.Reputation AS MaxReputation,
+    u.CreationDate AS EarliestJoined,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    STRING_AGG(DISTINCT p.Tags, ', ' ORDER BY p.Tags) AS PopularTags,
+    AVG(ph.score) AS AvgCommentScore
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Comments c ON p.Id = c.PostId
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+WHERE 
+    u.Id IN (
+        SELECT 
+            ub.UserId 
+        FROM 
+            Badges ub
+        WHERE 
+            ub.Class = 1 AND ub.Date >= DATE '2022-01-01'
+    )
+AND 
+    (p.LastActivityDate IS NULL OR p.CreationDate IS NULL OR p.LastActivityDate > p.CreationDate)
+AND 
+    EXISTS (
+        SELECT 1 
+        FROM Votes v 
+        WHERE 
+            v.PostId = p.Id 
+            AND v.VoteTypeId = 1
+    )
+GROUP BY 
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    PopularTags,
+    AvgCommentScore
+HAVING 
+    AVG(ph.score) > 0
+ORDER BY 
+    TotalPosts DESC, 
+    MaxReputation DESC;

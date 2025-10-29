@@ -1,0 +1,170 @@
+-- {"query": "7206.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1486} 
+WITH 
+    RankedPosts AS (
+        SELECT 
+            p.Id,
+            p.PostTypeId,
+            p.Score,
+            p.ViewCount,
+            p.CreationDate,
+            p.OwnerUserId,
+            p.Title,
+            p.Tags,
+            p.AnswerCount,
+            p.CommentCount,
+            p.FavoriteCount,
+            ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn,
+            LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+            AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as avg_score,
+            CASE 
+                WHEN p.Score > 100 THEN 'High'
+                WHEN p.Score > 50 THEN 'Medium'
+                ELSE 'Low'
+            END as score_category,
+            COALESCE(p.Title, '') || ' - ' || COALESCE(p.Tags, '') as title_tag_combined
+        FROM Posts p
+        WHERE p.PostTypeId IN (1, 2)
+    ),
+    UserStats AS (
+        SELECT 
+            u.Id as UserId,
+            u.Reputation,
+            u.DisplayName,
+            u.Views,
+            u.UpVotes,
+            u.DownVotes,
+            COUNT(DISTINCT r.Id) as total_posts,
+            COUNT(CASE WHEN r.PostTypeId = 1 THEN 1 END) as question_count,
+            COUNT(CASE WHEN r.PostTypeId = 2 THEN 1 END) as answer_count,
+            AVG(r.Score) as avg_post_score,
+            MAX(r.CreationDate) as last_post_date,
+            STRING_AGG(DISTINCT r.Tags, ', ') as all_tags
+        FROM Users u
+        LEFT JOIN RankedPosts r ON u.Id = r.OwnerUserId
+        WHERE u.Reputation > 1000
+        GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes
+    ),
+    ComplexPostAnalysis AS (
+        SELECT 
+            rp.Id as PostId,
+            rp.Title,
+            rp.Score,
+            rp.ViewCount,
+            rp.CreationDate,
+            rp.OwnerUserId,
+            rp.Score - COALESCE(rp.prev_score, 0) as score_change,
+            rp.avg_score,
+            rp.score_category,
+            rp.title_tag_combined,
+            CASE 
+                WHEN rp.AnswerCount > 0 THEN (rp.Score * 1.0 / NULLIF(rp.AnswerCount, 0))
+                ELSE 0
+            END as score_per_answer,
+            CASE 
+                WHEN rp.CommentCount > 0 THEN (rp.Score * 1.0 / NULLIF(rp.CommentCount, 0))
+                ELSE 0
+            END as score_per_comment,
+            LEN(rp.Title) as title_length,
+            ARRAY_LENGTH(STRING_TO_ARRAY(rp.Tags, '>'), 1) as tag_count,
+            DATEDIFF('day', rp.CreationDate, CURRENT_TIMESTAMP) as days_since_creation,
+            CASE 
+                WHEN rp.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'Above Avg'
+                ELSE 'Below Avg'
+            END as score_comparison
+        FROM RankedPosts rp
+        WHERE rp.rn = 1
+    ),
+    ComprehensiveResults AS (
+        SELECT 
+            cpa.PostId,
+            cpa.Title,
+            cpa.Score,
+            cpa.ViewCount,
+            cpa.CreationDate,
+            cpa.OwnerUserId,
+            cpa.score_change,
+            cpa.avg_score,
+            cpa.score_category,
+            cpa.score_per_answer,
+            cpa.score_per_comment,
+            cpa.title_length,
+            cpa.tag_count,
+            cpa.days_since_creation,
+            cpa.score_comparison,
+            us.Reputation,
+            us.DisplayName,
+            us.total_posts,
+            us.question_count,
+            us.answer_count,
+            us.avg_post_score,
+            us.last_post_date,
+            us.all_tags,
+            CASE 
+                WHEN us.total_posts > 50 THEN 'Active'
+                WHEN us.total_posts > 25 THEN 'Moderate'
+                WHEN us.total_posts > 10 THEN 'Beginner'
+                ELSE 'New'
+            END as user_activity_level,
+            COALESCE(us.all_tags, 'No Tags') as clean_tags,
+            CASE 
+                WHEN EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = us.UserId AND b.Name IN ('Gold', 'Silver', 'Bronze')) THEN 'Has Badges'
+                ELSE 'No Badges'
+            END as badge_status
+        FROM ComplexPostAnalysis cpa
+        INNER JOIN UserStats us ON cpa.OwnerUserId = us.UserId
+        WHERE cpa.Score > 20
+        GROUP BY 
+            cpa.PostId, cpa.Title, cpa.Score, cpa.ViewCount, cpa.CreationDate, cpa.OwnerUserId,
+            cpa.score_change, cpa.avg_score, cpa.score_category, cpa.score_per_answer, cpa.score_per_comment,
+            cpa.title_length, cpa.tag_count, cpa.days_since_creation, cpa.score_comparison,
+            us.Reputation, us.DisplayName, us.total_posts, us.question_count, us.answer_count,
+            us.avg_post_score, us.last_post_date, us.all_tags
+    )
+SELECT 
+    cr.PostId,
+    cr.Title,
+    cr.Score,
+    cr.ViewCount,
+    cr.CreationDate,
+    cr.OwnerUserId,
+    cr.score_change,
+    cr.avg_score,
+    cr.score_category,
+    cr.score_per_answer,
+    cr.score_per_comment,
+    cr.title_length,
+    cr.tag_count,
+    cr.days_since_creation,
+    cr.score_comparison,
+    cr.Reputation,
+    cr.DisplayName,
+    cr.total_posts,
+    cr.question_count,
+    cr.answer_count,
+    cr.avg_post_score,
+    cr.last_post_date,
+    cr.all_tags,
+    cr.user_activity_level,
+    cr.clean_tags,
+    cr.badge_status,
+    CASE 
+        WHEN cr.days_since_creation > 365 THEN 'Old Post'
+        WHEN cr.days_since_creation > 90 THEN 'Recent Post'
+        ELSE 'New Post'
+    END as post_age_category,
+    CASE 
+        WHEN cr.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) * 2 THEN 'Exceptional'
+        WHEN cr.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) * 1.5 THEN 'Great'
+        WHEN cr.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'Good'
+        ELSE 'Average'
+    END as post_quality,
+    RANK() OVER (ORDER BY cr.Score DESC) as score_rank,
+    DENSE_RANK() OVER (ORDER BY cr.Reputation DESC) as reputation_rank,
+    NTILE(10) OVER (ORDER BY cr.ViewCount DESC) as view_quartile
+FROM ComprehensiveResults cr
+WHERE cr.user_activity_level IN ('Active', 'Moderate')
+AND cr.score_category IN ('High', 'Medium')
+AND cr.score_comparison = 'Above Avg'
+ORDER BY cr.Score DESC, cr.Reputation DESC
+OFFSET 1000 ROWS
+FETCH NEXT 500 ROWS ONLY;

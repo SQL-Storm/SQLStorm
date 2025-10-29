@@ -1,0 +1,124 @@
+-- {"query": "3166.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2232} 
+
+WITH 
+-- 1️⃣ Top users by reputation with badge counts
+TopUsers AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        COALESCE(u.Reputation,0)               AS Reputation,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadges,
+        ROW_NUMBER() OVER (ORDER BY COALESCE(u.Reputation,0) DESC) AS RepRank
+    FROM Users u
+),
+
+-- 2️⃣ Per‑user post aggregates (questions, answers, scores)
+UserPostStats AS (
+    SELECT 
+        p.OwnerUserId                         AS UserId,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        SUM(COALESCE(p.Score,0))               AS TotalScore,
+        MAX(p.CreationDate)                   AS LastPostDate
+    FROM Posts p
+    GROUP BY p.OwnerUserId
+),
+
+-- 3️⃣ Tag popularity (used for string aggregation later)
+TagPopularity AS (
+    SELECT 
+        t.TagName,
+        t.Count                               AS TagUseCount,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0
+),
+
+-- 4️⃣ Recent voting activity (last 30 days) per post
+RecentVotes AS (
+    SELECT 
+        v.PostId,
+        SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        MAX(v.CreationDate)                         AS LatestVoteDate
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE v.CreationDate >= CURRENT_DATE - INTERVAL '30 days'
+    GROUP BY v.PostId
+)
+
+SELECT
+    tu.Id,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.GoldBadges,
+    tu.SilverBadges,
+    tu.BronzeBadges,
+    ups.QuestionCount,
+    ups.AnswerCount,
+    ups.TotalScore,
+    COALESCE(rv.UpVotes,0)   AS RecentUpVotes,
+    COALESCE(rv.DownVotes,0) AS RecentDownVotes,
+    CASE 
+        WHEN tu.RepRank <= 10  THEN 'Top10'
+        WHEN tu.RepRank <= 100 THEN 'Top100'
+        ELSE 'Other' 
+    END                      AS RepTier,
+    STRING_AGG(DISTINCT tp.TagName, ', ') 
+        FILTER (WHERE tp.TagRank <= 5)          AS TopTrendingTags
+FROM TopUsers tu
+LEFT JOIN UserPostStats ups 
+    ON ups.UserId = tu.Id
+LEFT JOIN LATERAL (
+        SELECT rv.*
+        FROM RecentVotes rv
+        JOIN Posts p ON p.Id = rv.PostId
+        WHERE p.OwnerUserId = tu.Id
+        ORDER BY rv.LatestVoteDate DESC
+        FETCH FIRST 1 ROW ONLY
+    ) rv ON TRUE
+LEFT JOIN LATERAL (
+        SELECT pl.RelatedPostId
+        FROM Posts p
+        JOIN PostLinks pl ON pl.PostId = p.Id
+        WHERE p.OwnerUserId = tu.Id
+        ORDER BY p.Score DESC NULLS LAST
+        FETCH FIRST 1 ROW ONLY
+    ) pl ON TRUE
+LEFT JOIN LATERAL (
+        SELECT t.TagName, t.Count
+        FROM Tags t
+        JOIN PostHistory ph ON ph.PostId = pl.RelatedPostId
+        WHERE ph.PostHistoryTypeId IN (3,6)   -- initial / edit tags
+        ORDER BY t.Count DESC
+        FETCH FIRST 1 ROW ONLY
+    ) tp ON TRUE
+GROUP BY 
+    tu.Id, tu.DisplayName, tu.Reputation, tu.GoldBadges, tu.SilverBadges,
+    tu.BronzeBadges, ups.QuestionCount, ups.AnswerCount, ups.TotalScore,
+    rv.UpVotes, rv.DownVotes, tu.RepRank
+
+UNION ALL
+
+SELECT
+    NULL                                 AS Id,
+    'Aggregated Metrics'                  AS DisplayName,
+    SUM(tu.Reputation)                    AS Reputation,
+    SUM(tu.GoldBadges)                    AS GoldBadges,
+    SUM(tu.SilverBadges)                  AS SilverBadges,
+    SUM(tu.BronzeBadges)                  AS BronzeBadges,
+    SUM(ups.QuestionCount)                AS QuestionCount,
+    SUM(ups.AnswerCount)                  AS AnswerCount,
+    SUM(ups.TotalScore)                   AS TotalScore,
+    SUM(COALESCE(rv.UpVotes,0))           AS RecentUpVotes,
+    SUM(COALESCE(rv.DownVotes,0))         AS RecentDownVotes,
+    NULL                                  AS RepTier,
+    NULL                                  AS TopTrendingTags
+FROM TopUsers tu
+LEFT JOIN UserPostStats ups ON ups.UserId = tu.Id
+LEFT JOIN RecentVotes rv    ON rv.PostId IS NOT NULL
+WHERE tu.RepRank <= 1000
+ORDER BY Reputation DESC NULLS LAST
+LIMIT 50;

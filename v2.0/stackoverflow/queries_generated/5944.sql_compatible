@@ -1,0 +1,101 @@
+WITH RecentActive AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Title,
+    p.Tags,
+    p.ViewCount,
+    p.Score,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.ParentId,
+    p.AcceptedAnswerId
+  FROM Posts p
+  WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days'
+),
+TagStats AS (
+  SELECT
+    ta.TagName,
+    COUNT(*) AS PostCount,
+    SUM(p.ViewCount) AS TotalViews,
+    AVG(p.Score) AS AvgScore,
+    MAX(p.LastActivityDate) AS LastActive
+  FROM RecentActive ra
+  JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(ra.Tags, 2, length(ra.Tags)-2), '><')) AS TagName
+  ) ta ON true
+  JOIN Posts p ON p.Id = ra.PostId
+  GROUP BY ta.TagName
+),
+CorrelatedComments AS (
+  SELECT
+    c.Id AS CommentId,
+    c.PostId,
+    c.UserId,
+    c.Text,
+    c.CreationDate,
+    c.Score,
+    u.DisplayName AS Commenter
+  FROM Comments c
+  LEFT JOIN Users u ON c.UserId = u.Id
+  WHERE c.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '7 days'
+),
+TagLinkAnalysis AS (
+  SELECT
+    ta2.TagName,
+    pl.RelatedPostId,
+    pl.LinkTypeId,
+    v.CreationDate AS LinkCreationDate,
+    MAX(v.CreationDate) OVER (PARTITION BY ta2.TagName) AS LastActive
+  FROM Tags t
+  LEFT JOIN Posts p ON p.Id = t.WikiPostId
+  JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(t.TagName, 2, length(t.TagName)-2), '><')) AS TagName
+  ) ta2 ON true
+  LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+  LEFT JOIN Votes v ON v.PostId = pl.RelatedPostId AND v.VoteTypeId = 7
+  WHERE t.Count > 0
+)
+SELECT
+  ra.PostId AS PostId,
+  ra.Title,
+  ra.Tags,
+  ra.ViewCount,
+  ra.Score,
+  ra.CommentCount,
+  ra.AnswerCount,
+  ra.FavoriteCount,
+  ra.CreationDate AS PostCreationDate,
+  ra.LastActivityDate,
+  (%s) AS BenchmarkMarker,
+  (SELECT COUNT(*) FROM CorrelatedComments cc WHERE cc.PostId = ra.PostId) AS RecentComments,
+  COALESCE(ts.PostCount, 0) AS TagPostCount,
+  COALESCE(ts.TotalViews, 0) AS TagTotalViews,
+  COALESCE(ts.AvgScore, 0) AS TagAvgScore,
+  COALESCE(la.LastActive, TIMESTAMP '1900-01-01') AS LastRelatedTagActive
+FROM RecentActive ra
+LEFT JOIN TagStats ts ON true
+LEFT JOIN CorrelatedComments cc ON cc.PostId = ra.PostId
+LEFT JOIN Tags t ON t.TagName LIKE '%' || ra.Tags || '%'
+LEFT JOIN TagLinkAnalysis la ON la.RelatedPostId = ra.PostId
+GROUP BY
+  ra.PostId,
+  ra.Title,
+  ra.Tags,
+  ra.ViewCount,
+  ra.Score,
+  ra.CommentCount,
+  ra.AnswerCount,
+  ra.FavoriteCount,
+  ra.CreationDate,
+  ra.LastActivityDate,
+  ts.PostCount,
+  ts.TotalViews,
+  ts.AvgScore,
+  la.LastActive
+ORDER BY ra.LastActivityDate DESC, ra.ViewCount DESC
+LIMIT 100;

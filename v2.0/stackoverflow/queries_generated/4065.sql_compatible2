@@ -1,0 +1,140 @@
+WITH RECURSIVE PostThread AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.ParentId,
+        p.AcceptedAnswerId,
+        p.CreationDate,
+        p.Score,
+        p.AnswerCount,
+        p.Title,
+        p.Tags,
+        0 AS Depth,
+        CAST(p.Id AS VARCHAR(1000)) AS Path,
+        p.OwnerUserId AS RootOwnerUserId
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.ParentId IS NULL
+
+    UNION ALL
+
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.ParentId,
+        p.AcceptedAnswerId,
+        p.CreationDate,
+        p.Score,
+        p.AnswerCount,
+        p.Title,
+        p.Tags,
+        pt.Depth + 1 AS Depth,
+        pt.Path || '->' || CAST(p.Id AS VARCHAR(1000)) AS Path,
+        pt.RootOwnerUserId
+    FROM Posts p
+    JOIN PostThread pt ON p.ParentId = pt.Id
+    WHERE p.PostTypeId = 2
+),
+UserPostCounts AS (
+    SELECT
+        OwnerUserId,
+        COUNT(Id) AS TotalPosts,
+        SUM(CASE WHEN PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        AVG(CAST(Score AS DOUBLE PRECISION)) AS AvgScore
+    FROM Posts
+    WHERE OwnerUserId IS NOT NULL AND OwnerUserId <> -1
+    GROUP BY OwnerUserId
+),
+UserBadgeCounts AS (
+    SELECT
+        UserId,
+        COUNT(CASE WHEN Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN Class = 3 THEN 1 END) AS BronzeBadges
+    FROM Badges
+    GROUP BY UserId
+),
+RecentPostActivity AS (
+    SELECT
+        PostId,
+        COUNT(*) AS CommentActivityCount,
+        MAX(CreationDate) AS LastCommentDate
+    FROM Comments
+    WHERE CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '7 days')
+    GROUP BY PostId
+),
+HighScoringAnswers AS (
+    SELECT
+        p.Id,
+        p.ParentId AS QuestionId,
+        p.OwnerUserId,
+        p.Score,
+        ROW_NUMBER() OVER(PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 2 AND p.Score > 5
+)
+SELECT
+    pt.Id AS PostId,
+    pt.PostTypeId,
+    pt.Depth,
+    pt.Path,
+    pt.Score AS PostScore,
+    pt.AnswerCount AS QuestionAnswerCount,
+    pt.Title AS QuestionTitle,
+    pt.Tags AS QuestionTags,
+    pt.CreationDate AS PostCreationDate,
+    u.DisplayName AS PostOwnerDisplayName,
+    COALESCE(upc.TotalPosts, 0) AS TotalUserPosts,
+    COALESCE(upc.QuestionCount, 0) AS UserQuestionCount,
+    COALESCE(upc.AnswerCount, 0) AS UserAnswerCount,
+    COALESCE(upc.AvgScore, 0.0) AS UserAvgScore,
+    COALESCE(ubc.GoldBadges, 0) AS UserGoldBadges,
+    COALESCE(ubc.SilverBadges, 0) AS UserSilverBadges,
+    COALESCE(ubc.BronzeBadges, 0) AS UserBronzeBadges,
+    rpa.CommentActivityCount AS RecentCommentActivity,
+    CASE WHEN pt.PostTypeId = 1 AND pt.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS HasAcceptedAnswer,
+    hsa.Score AS TopAnswerScore,
+    hsa.OwnerUserId AS TopAnswerOwnerUserId,
+    CASE WHEN pt.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+    (pt.ClosedDate - pt.CreationDate) / INTERVAL '1 day' AS DaysToClose,
+    LOWER(SUBSTRING(pt.Tags FROM 2 FOR (POSITION('><' IN (pt.Tags || '><')) - 2))) AS PrimaryTag
+FROM PostThread pt
+LEFT JOIN Users u ON pt.OwnerUserId = u.Id
+LEFT JOIN UserPostCounts upc ON pt.OwnerUserId = upc.OwnerUserId
+LEFT JOIN UserBadgeCounts ubc ON pt.OwnerUserId = ubc.UserId
+LEFT JOIN RecentPostActivity rpa ON pt.Id = rpa.PostId
+LEFT JOIN HighScoringAnswers hsa ON pt.Id = hsa.QuestionId AND hsa.rn = 1
+WHERE pt.Depth < 3
+  AND pt.CreationDate BETWEEN (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year') AND TIMESTAMP '2024-10-01 12:34:56'
+  AND (pt.Score > 10 OR pt.AnswerCount > 5 OR COALESCE(ubc.GoldBadges, 0) > 2)
+  AND pt.OwnerUserId IS NOT NULL
+  AND pt.OwnerUserId <> -1
+  AND (COALESCE(u.Location, '') LIKE '%USA%' OR pt.Id IN (SELECT PostId FROM PostLinks WHERE LinkTypeId = 3))
+GROUP BY
+    pt.Id,
+    pt.PostTypeId,
+    pt.Depth,
+    pt.Path,
+    pt.Score,
+    pt.AnswerCount,
+    pt.Title,
+    pt.Tags,
+    pt.CreationDate,
+    u.DisplayName,
+    upc.TotalPosts,
+    upc.QuestionCount,
+    upc.AnswerCount,
+    upc.AvgScore,
+    ubc.GoldBadges,
+    ubc.SilverBadges,
+    ubc.BronzeBadges,
+    rpa.CommentActivityCount,
+    pt.AcceptedAnswerId,
+    hsa.Score,
+    hsa.OwnerUserId,
+    pt.ClosedDate,
+    pt.OwnerUserId
+ORDER BY pt.Score DESC, pt.CreationDate DESC
+OFFSET 0 ROWS FETCH NEXT 1000 ROWS ONLY;

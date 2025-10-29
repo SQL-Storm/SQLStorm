@@ -1,0 +1,205 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.LastActivityDate,
+        DENSE_RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS ScoreRank,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS UserPostSequence,
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS AvgUserScore,
+        CASE 
+            WHEN p.Score > 100 THEN 'High'
+            WHEN p.Score > 50 THEN 'Medium'
+            ELSE 'Low'
+        END AS ScoreCategory,
+        COALESCE(p.Tags, '') AS CleanTags,
+        CHAR_LENGTH(COALESCE(p.Tags, '')) AS TagLength,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags <> '' THEN 
+                -- split tags like '<tag1><tag2>' into array by removing outer angle brackets and splitting on '><'
+                CARDINALITY(REGEXP_SPLIT_TO_ARRAY(TRIM(BOTH '<' FROM TRIM(BOTH '>' FROM p.Tags)), '><'))
+            ELSE 0 
+        END AS TagCount,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 1
+            WHEN p.PostTypeId = 2 AND p.ParentId IS NOT NULL THEN 1
+            ELSE 0
+        END AS HasRelatedPost,
+        CAST(EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate)) / 86400 AS INTEGER) AS DaysSinceLastActivity
+    FROM Posts p
+    WHERE p.CreationDate >= TIMESTAMP '2019-01-01'
+),
+UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.UpVotes,
+        u.DownVotes,
+        u.Views,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        AVG(p.Score) AS AvgScore,
+        MAX(p.Score) AS MaxScore,
+        MIN(p.Score) AS MinScore,
+        COUNT(DISTINCT p.Tags) AS TagVariety,
+        (u.UpVotes - u.DownVotes) AS NetVotes,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Elite'
+            WHEN u.Reputation >= 1000 THEN 'Advanced'
+            WHEN u.Reputation >= 100 THEN 'Beginner'
+            ELSE 'Newbie'
+        END AS ReputationTier
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id, u.Reputation, u.UpVotes, u.DownVotes, u.Views
+),
+TopTags AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS PopularityRank,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            ELSE 'Niche'
+        END AS TagCategory
+    FROM Tags t
+    WHERE t.Count > 50
+),
+TagActivity AS (
+    SELECT 
+        pt.Id AS PostId,
+        pt.TagName,
+        pt.Count,
+        pt.LastActivityDate,
+        ROW_NUMBER() OVER (PARTITION BY pt.TagName ORDER BY pt.LastActivityDate DESC) AS RecentActivity,
+        LAG(pt.Count, 1, 0) OVER (PARTITION BY pt.TagName ORDER BY pt.LastActivityDate) AS PrevCount,
+        (pt.Count - LAG(pt.Count, 1, 0) OVER (PARTITION BY pt.TagName ORDER BY pt.LastActivityDate)) AS CountChange
+    FROM (
+        SELECT 
+            t.TagName,
+            t.Count,
+            MAX(p.LastActivityDate) AS LastActivityDate,
+            p.Id
+        FROM Tags t
+        JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+        WHERE p.CreationDate >= TIMESTAMP '2020-01-01'
+        GROUP BY t.TagName, t.Count, p.Id
+    ) pt
+),
+PostsWithBadges AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        EXISTS(
+            SELECT 1 
+            FROM Badges b 
+            WHERE b.UserId = p.OwnerUserId 
+              AND b.Date >= p.CreationDate 
+              AND b.Date <= p.LastActivityDate + INTERVAL '7 days'
+        ) AS UserHasRecentBadge,
+        (
+            SELECT COUNT(*)
+            FROM Badges b
+            WHERE b.UserId = p.OwnerUserId
+              AND b.Date BETWEEN p.CreationDate AND p.LastActivityDate
+        ) AS BadgeCount,
+        (
+            SELECT STRING_AGG(b.Name, ', ')
+            FROM Badges b
+            WHERE b.UserId = p.OwnerUserId
+              AND b.Date BETWEEN p.CreationDate AND p.LastActivityDate
+        ) AS BadgeList
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+)
+SELECT
+    rp.Id AS PostId,
+    rp.Title,
+    rp.Score,
+    rp.ViewCount,
+    rp.PostTypeId,
+    rp.OwnerUserId,
+    rp.ScoreCategory,
+    rp.UserPostSequence,
+    CASE 
+        WHEN rp.PrevScore > 0 THEN 
+            ROUND(((CAST(rp.Score AS DECIMAL) - CAST(rp.PrevScore AS DECIMAL)) / NULLIF(CAST(rp.PrevScore AS DECIMAL), 0)) * 100, 2)
+        ELSE NULL 
+    END AS ScoreChangePercent,
+    rp.AvgUserScore,
+    rp.CleanTags,
+    rp.TagCount,
+    rp.HasRelatedPost,
+    rp.DaysSinceLastActivity,
+    us.ReputationTier,
+    us.TotalPosts,
+    us.QuestionCount,
+    us.AnswerCount,
+    us.AvgScore AS UserAvgScore,
+    us.MaxScore AS UserMaxScore,
+    us.NetVotes,
+    tt.PopularityRank,
+    tt.TagCategory,
+    ta.RecentActivity,
+    ta.CountChange,
+    psb.UserHasRecentBadge,
+    psb.BadgeCount,
+    psb.BadgeList,
+    CASE 
+        WHEN rp.Score > us.AvgScore AND us.ReputationTier IN ('Elite', 'Advanced') THEN 'High Performing'
+        WHEN rp.Score < 0 THEN 'Low Performing'
+        ELSE 'Regular'
+    END AS PerformanceCategory,
+    (rp.Score * 0.3 + rp.ViewCount * 0.2 + COALESCE(rp.CommentCount, 0) * 0.1 + COALESCE(rp.AnswerCount, 0) * 0.15 + COALESCE(rp.FavoriteCount, 0) * 0.25) AS WeightedScore
+FROM RankedPosts rp
+LEFT JOIN UserStats us ON rp.OwnerUserId = us.UserId
+LEFT JOIN TopTags tt ON rp.Tags IS NOT NULL 
+    AND rp.Tags <> ''
+    AND tt.TagName IN (
+        SELECT TRIM(tag)
+        FROM UNNEST(REGEXP_SPLIT_TO_ARRAY(TRIM(BOTH '<' FROM TRIM(BOTH '>' FROM rp.Tags)), '><')) AS t(tag)
+        WHERE TRIM(tag) LIKE tt.TagName
+    )
+LEFT JOIN TagActivity ta ON tt.TagName = (
+    SELECT TRIM(tag)
+    FROM UNNEST(REGEXP_SPLIT_TO_ARRAY(TRIM(BOTH '<' FROM TRIM(BOTH '>' FROM rp.Tags)), '><')) AS t(tag)
+    WHERE TRIM(tag) LIKE tt.TagName
+    LIMIT 1
+)
+LEFT JOIN PostsWithBadges psb ON rp.Id = psb.Id
+WHERE rp.ScoreRank <= 100
+    AND us.TotalPosts >= 5
+    AND (tt.PopularityRank <= 50 OR tt.PopularityRank IS NULL)
+    AND rp.DaysSinceLastActivity < 365
+    AND (
+        rp.Score > 50
+        OR (
+            rp.AnswerCount > 0 
+            OR COALESCE(rp.CommentCount, 0) > 3
+        )
+    )
+ORDER BY 
+    rp.Score DESC,
+    psb.BadgeCount DESC,
+    us.Reputation DESC,
+    tt.PopularityRank ASC,
+    rp.DaysSinceLastActivity ASC
+LIMIT 1000;

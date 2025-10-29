@@ -1,0 +1,253 @@
+-- {"query": "1545.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 4060} 
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS UserUpVotesGiven,
+        U.DownVotes AS UserDownVotesGiven,
+        COUNT(DISTINCT P.Id) AS TotalPostsCreated,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsAsked,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersPosted,
+        SUM(P.ViewCount) AS TotalPostViewsReceived,
+        SUM(P.Score) AS TotalPostScoreReceived,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        SUM(COALESCE(C.Score, 0)) AS TotalCommentScoreMade,
+        COUNT(DISTINCT V.PostId) AS TotalPostsVotedOn,
+        COUNT(DISTINCT VP.UserId) AS TotalUniqueUsersVotedForPosts,
+        MAX(P.CreationDate) AS LatestPostCreationDate,
+        MIN(P.CreationDate) AS EarliestPostCreationDate,
+        EXTRACT(DAY FROM (cast('2024-10-01 12:34:56' as timestamp) - U.CreationDate)) AS DaysSinceAccountCreation,
+        AVG(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS AvgGoldBadgePerUser,
+        COUNT(DISTINCT CASE WHEN B.Class = 1 THEN B.Id END) AS GoldBadgesCount,
+        RANK() OVER (ORDER BY U.Reputation DESC, U.UpVotes DESC) AS ReputationRank,
+        (SELECT COUNT(DISTINCT B2.Id) FROM Badges B2 WHERE B2.UserId = U.Id AND B2.Class = 1 AND B2.Date > U.CreationDate + INTERVAL '1 year') AS GoldBadgesAfterFirstYear, -- Correlated subquery
+        (SELECT COUNT(DISTINCT A.Id) FROM Posts A JOIN Posts Q ON A.Id = Q.AcceptedAnswerId WHERE A.OwnerUserId = U.Id) AS TotalAcceptedAnswersByThisUser -- Another correlated subquery
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Votes V ON U.Id = V.UserId -- Votes made by this user
+    LEFT JOIN Votes VP ON P.Id = VP.PostId AND VP.VoteTypeId IN (2,3) -- Votes received on this user's posts (Up/Down)
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.Views, U.UpVotes, U.DownVotes, U.CreationDate
+),
+PostDetailedMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.OwnerUserId,
+        COALESCE(P.OwnerDisplayName, U.DisplayName) AS PostOwnerDisplayName,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        LENGTH(COALESCE(P.Title, '')) AS TitleLength,
+        LENGTH(COALESCE(P.Body, '')) AS BodyLength,
+        P.LastEditDate,
+        P.LastActivityDate,
+        P.ClosedDate,
+        P.CommunityOwnedDate,
+        P.AcceptedAnswerId,
+        CASE
+            WHEN P.AcceptedAnswerId IS NOT NULL THEN 'Has Accepted Answer'
+            WHEN P.PostTypeId = 1 AND P.AcceptedAnswerId IS NULL AND P.AnswerCount > 0 THEN 'No Accepted Answer Yet'
+            WHEN P.PostTypeId = 1 AND P.AnswerCount = 0 THEN 'Unanswered Question'
+            ELSE 'N/A'
+        END AS AcceptedAnswerStatus,
+        SUM(CASE WHEN PV.VoteTypeId = 2 THEN 1 ELSE 0 END) AS PostUpVotesReceived,
+        SUM(CASE WHEN PV.VoteTypeId = 3 THEN 1 ELSE 0 END) AS PostDownVotesReceived,
+        SUM(CASE WHEN PV.VoteTypeId = 5 THEN 1 ELSE 0 END) AS PostFavoritesReceived,
+        COUNT(DISTINCT PC.UserId) AS UniqueCommenters,
+        AVG(COALESCE(PC.Score, 0)) AS AverageCommentScore,
+        SUM(CASE WHEN PL.LinkTypeId = 1 THEN 1 ELSE 0 END) AS LinkedPostsCount,
+        SUM(CASE WHEN PL.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicateLinksCount,
+        (SELECT COUNT(DISTINCT PH.UserId) FROM PostHistory PH WHERE PH.PostId = P.Id AND PH.PostHistoryTypeId IN (4,5,6)) AS UniqueEditorsCount,
+        CAST(EXTRACT(EPOCH FROM (COALESCE(P.LastActivityDate, P.CreationDate) - P.CreationDate)) / 3600.0 AS NUMERIC(10,2)) AS HoursSinceCreationToLastActivity,
+        AVG(P.Score) OVER (PARTITION BY P.PostTypeId ORDER BY P.CreationDate) AS RunningAvgScoreByPostType,
+        NULLIF(P.Score, 0) / NULLIF(P.ViewCount, 0) AS ScoreToViewRatio,
+        COALESCE(P.Tags, '') LIKE '%<sql>%' AS HasSqlTag,
+        COALESCE(P.Tags, '') LIKE '%<postgresql>%' OR COALESCE(P.Tags, '') LIKE '%<mysql>%' OR COALESCE(P.Tags, '') LIKE '%<sql-server>%' AS HasSpecificDatabaseTag,
+        (SELECT MIN(PH_inner.CreationDate) FROM PostHistory PH_inner WHERE PH_inner.PostId = P.Id AND PH_inner.PostHistoryTypeId = 5) AS FirstBodyEditDate -- Correlated subquery
+    FROM Posts P
+    JOIN PostTypes PT ON P.PostTypeId = PT.Id
+    LEFT JOIN Users U ON P.OwnerUserId = U.Id
+    LEFT JOIN Votes PV ON P.Id = PV.PostId
+    LEFT JOIN Comments PC ON P.Id = PC.PostId
+    LEFT JOIN PostLinks PL ON P.Id = PL.PostId
+    GROUP BY
+        P.Id, P.PostTypeId, PT.Name, P.OwnerUserId, P.OwnerDisplayName, U.DisplayName,
+        P.CreationDate, P.Score, P.ViewCount, P.AnswerCount, P.CommentCount, P.FavoriteCount,
+        P.LastEditDate, P.LastActivityDate, P.ClosedDate, P.CommunityOwnedDate, P.AcceptedAnswerId, P.Title, P.Body, P.Tags
+),
+TagAnalysis AS (
+    SELECT
+        T.Id AS TagId,
+        T.TagName,
+        T.Count AS TotalTagUses,
+        SUM(PDM.PostScore) AS TotalScoreForTagPosts,
+        AVG(PDM.PostScore) AS AvgScoreForTagPosts,
+        COUNT(DISTINCT PDM.OwnerUserId) AS UniqueOwnersForTag,
+        MIN(PDM.PostCreationDate) AS EarliestPostWithTag,
+        MAX(PDM.FirstBodyEditDate) AS LatestBodyEditForTagPosts,
+        CASE
+            WHEN T.IsModeratorOnly THEN 'Moderator Only'
+            WHEN T.IsRequired THEN 'Required Tag'
+            ELSE 'Standard'
+        END AS TagTypeStatus,
+        DENSE_RANK() OVER (ORDER BY T.Count DESC, T.TagName ASC) AS TagPopularityRank
+    FROM Tags T
+    JOIN PostDetailedMetrics PDM ON PDM.Tags ILIKE '%<' || T.TagName || '>%'
+    GROUP BY
+        T.Id, T.TagName, T.Count, T.IsModeratorOnly, T.IsRequired
+),
+PostModerationEvents AS (
+    SELECT
+        PH.PostId,
+        PH.CreationDate AS EventDate,
+        PHT.Name AS EventType,
+        U.DisplayName AS ModeratorDisplayName,
+        CR.Name AS CloseReason,
+        LAG(PHT.Name, 1, 'NO_PREVIOUS_EVENT') OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) AS PreviousEventType,
+        LEAD(PHT.Name, 1, 'NO_NEXT_EVENT') OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) AS NextEventType,
+        PH.Comment IS NOT NULL AS HasComment,
+        PH.Text IS NOT NULL AS HasDetailsText,
+        COALESCE(PH.UserDisplayName, U.DisplayName, 'Community') AS ActionPerformerDisplayName
+    FROM PostHistory PH
+    JOIN PostHistoryTypes PHT ON PH.PostHistoryTypeId = PHT.Id
+    LEFT JOIN Users U ON PH.UserId = U.Id
+    LEFT JOIN CloseReasonTypes CR ON PH.PostHistoryTypeId = 10 AND PH.Comment = CR.Id::varchar(50)
+    WHERE PH.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20, 35, 36)
+)
+SELECT
+    'HighReputationRecentActivity' AS QuerySegment,
+    UE.UserId,
+    UE.DisplayName AS UserDisplayName,
+    UE.Reputation,
+    UE.TotalPostsCreated,
+    PDM.PostId,
+    PDM.PostTypeName,
+    PDM.PostCreationDate,
+    PDM.PostScore,
+    PDM.ViewCount,
+    PDM.AnswerCount,
+    PDM.PostUpVotesReceived,
+    PDM.PostDownVotesReceived,
+    PDM.HoursSinceCreationToLastActivity,
+    PDM.ScoreToViewRatio,
+    TA.TagName AS PrimaryAssociatedTag,
+    TA.TotalTagUses,
+    PME.EventType AS LatestModerationEventType,
+    PME.CloseReason,
+    PME.ActionPerformerDisplayName,
+    -- Complex calculated fields
+    (COALESCE(UE.TotalPostScoreReceived, 0) + COALESCE(UE.TotalCommentScoreMade, 0)) * (1.0 + COALESCE(UE.AvgGoldBadgePerUser, 0)) AS WeightedUserContributionScore,
+    (COALESCE(PDM.PostUpVotesReceived, 0) - COALESCE(PDM.PostDownVotesReceived, 0)) / NULLIF(COALESCE(PDM.PostUpVotesReceived, 0) + COALESCE(PDM.PostDownVotesReceived, 0), 0) AS NetVoteRatio,
+    CASE
+        WHEN PDM.PostTypeId = 1 AND PDM.AcceptedAnswerStatus = 'Has Accepted Answer' THEN 'Resolved Question'
+        WHEN PDM.PostTypeId = 1 AND PDM.AcceptedAnswerStatus = 'No Accepted Answer Yet' THEN 'Partially Resolved Question'
+        WHEN PDM.PostTypeId = 1 AND PDM.AcceptedAnswerStatus = 'Unanswered Question' THEN 'Unresolved Question'
+        ELSE 'Not a Question'
+    END AS QuestionResolutionStatus,
+    LENGTH(COALESCE(PDM.PostOwnerDisplayName, UE.DisplayName, 'Unknown')) AS DisplayNameCombinedLength,
+    (PME.PreviousEventType IS NOT NULL AND PME.NextEventType IS NOT NULL AND PME.PreviousEventType != PME.NextEventType) AS EventSequenceChange,
+    (SELECT COUNT(DISTINCT C2.UserId) FROM Comments C2 WHERE C2.PostId = PDM.PostId AND C2.CreationDate < PDM.PostCreationDate + INTERVAL '1 day') AS UniqueEarlyCommenters, -- Non-correlated subquery
+    (SELECT SUM(V2.BountyAmount) FROM Votes V2 WHERE V2.PostId = PDM.PostId AND V2.VoteTypeId = 8) AS TotalBountyOnPost
+FROM UserEngagement UE
+FULL OUTER JOIN PostDetailedMetrics PDM ON UE.UserId = PDM.OwnerUserId
+LEFT JOIN LATERAL (SELECT T.TagName, T.TotalTagUses FROM TagAnalysis T WHERE PDM.Tags ILIKE '%<' || T.TagName || '>%' ORDER BY T.TotalTagUses DESC LIMIT 1) TA ON TRUE -- Use LATERAL for tag selection
+LEFT JOIN LATERAL (
+    SELECT *
+    FROM PostModerationEvents PME_inner
+    WHERE PME_inner.PostId = PDM.PostId
+    ORDER BY PME_inner.EventDate DESC
+    LIMIT 1
+) PME ON TRUE
+WHERE
+    (UE.Reputation > 5000 OR UE.GoldBadgesAfterFirstYear > 0)
+    AND PDM.PostCreationDate BETWEEN '2022-01-01' AND '2023-12-31'
+    AND PDM.PostTypeName IN ('Question', 'Answer')
+    AND PDM.HoursSinceCreationToLastActivity > 72.0 -- Active for at least 3 days
+    AND (PDM.HasSqlTag OR PDM.HasSpecificDatabaseTag)
+    AND PME.EventType IS NOT NULL
+    AND COALESCE(PDM.ScoreToViewRatio, 0) > 0.007
+    AND NOT EXISTS (
+        SELECT 1
+        FROM PostHistory PH_closed
+        WHERE PH_closed.PostId = PDM.PostId
+          AND PH_closed.PostHistoryTypeId = 10
+          AND PH_closed.CreationDate > PDM.LastEditDate
+          AND PH_closed.UserId IS NOT NULL -- Must have been closed by a user, not community
+    )
+
+UNION ALL
+
+SELECT
+    'EngagingOlderPostsByAnyUser' AS QuerySegment,
+    UE.UserId,
+    UE.DisplayName AS UserDisplayName,
+    UE.Reputation,
+    UE.TotalPostsCreated,
+    PDM.PostId,
+    PDM.PostTypeName,
+    PDM.PostCreationDate,
+    PDM.PostScore,
+    PDM.ViewCount,
+    PDM.AnswerCount,
+    PDM.PostUpVotesReceived,
+    PDM.PostDownVotesReceived,
+    PDM.HoursSinceCreationToLastActivity,
+    PDM.ScoreToViewRatio,
+    TA.TagName AS PrimaryAssociatedTag,
+    TA.TotalTagUses,
+    PME.EventType AS LatestModerationEventType,
+    PME.CloseReason,
+    PME.ActionPerformerDisplayName,
+    -- Complex calculated fields
+    (COALESCE(UE.TotalPostScoreReceived, 0) + COALESCE(UE.TotalCommentScoreMade, 0)) * (1.0 + COALESCE(UE.AvgGoldBadgePerUser, 0)) AS WeightedUserContributionScore,
+    (COALESCE(PDM.PostUpVotesReceived, 0) - COALESCE(PDM.PostDownVotesReceived, 0)) / NULLIF(COALESCE(PDM.PostUpVotesReceived, 0) + COALESCE(PDM.PostDownVotesReceived, 0), 0) AS NetVoteRatio,
+    CASE
+        WHEN PDM.PostTypeId = 1 AND PDM.AcceptedAnswerStatus = 'Has Accepted Answer' THEN 'Resolved Question'
+        WHEN PDM.PostTypeId = 1 AND PDM.AcceptedAnswerStatus = 'No Accepted Answer Yet' THEN 'Partially Resolved Question'
+        WHEN PDM.PostTypeId = 1 AND PDM.AcceptedAnswerStatus = 'Unanswered Question' THEN 'Unresolved Question'
+        ELSE 'Not a Question'
+    END AS QuestionResolutionStatus,
+    LENGTH(COALESCE(PDM.PostOwnerDisplayName, UE.DisplayName, 'Unknown')) AS DisplayNameCombinedLength,
+    (PME.PreviousEventType IS NOT NULL AND PME.NextEventType IS NOT NULL AND PME.PreviousEventType != PME.NextEventType) AS EventSequenceChange,
+    (SELECT COUNT(DISTINCT C2.UserId) FROM Comments C2 WHERE C2.PostId = PDM.PostId AND C2.CreationDate < PDM.PostCreationDate + INTERVAL '1 day') AS UniqueEarlyCommenters,
+    (SELECT SUM(V2.BountyAmount) FROM Votes V2 WHERE V2.PostId = PDM.PostId AND V2.VoteTypeId = 8) AS TotalBountyOnPost
+FROM UserEngagement UE
+FULL OUTER JOIN PostDetailedMetrics PDM ON UE.UserId = PDM.OwnerUserId
+LEFT JOIN LATERAL (SELECT T.TagName, T.TotalTagUses FROM TagAnalysis T WHERE PDM.Tags ILIKE '%<' || T.TagName || '>%' ORDER BY T.TotalTagUses DESC LIMIT 1) TA ON TRUE
+LEFT JOIN LATERAL (
+    SELECT *
+    FROM PostModerationEvents PME_inner
+    WHERE PME_inner.PostId = PDM.PostId
+    ORDER BY PME_inner.EventDate DESC
+    LIMIT 1
+) PME ON TRUE
+WHERE
+    PDM.PostScore > 50
+    AND PDM.ViewCount > 5000
+    AND PDM.PostCreationDate BETWEEN '2018-01-01' AND '2021-12-31'
+    AND PDM.PostTypeName = 'Question'
+    AND PDM.AnswerCount > 1
+    AND PDM.CommentCount > 5
+    AND PDM.HoursSinceCreationToLastActivity > 365.0 -- Very active for at least a year
+    AND (PDM.HasSqlTag OR PDM.HasSpecificDatabaseTag)
+    AND PDM.AcceptedAnswerStatus = 'Has Accepted Answer'
+    AND NOT EXISTS (
+        SELECT 1
+        FROM PostLinks PL_dup
+        WHERE PL_dup.PostId = PDM.PostId
+          AND PL_dup.LinkTypeId = 3 -- Is a duplicate
+    )
+ORDER BY
+    WeightedUserContributionScore DESC,
+    PDM.PostScore DESC,
+    PDM.CreationDate ASC
+LIMIT 1000;

@@ -1,0 +1,257 @@
+-- {"query": "7126.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2515} 
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) as QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) as AnswerCount,
+        SUM(CASE WHEN p.PostTypeId IN (3, 5) THEN 1 ELSE 0 END) as WikiCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+RankedUsers AS (
+    SELECT 
+        *,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, PostCount DESC) as RankByReputation,
+        DENSE_RANK() OVER (ORDER BY Views DESC) as RankByViews,
+        PERCENT_RANK() OVER (ORDER BY UpVotes DESC) as UpVotePercentile
+    FROM UserStats
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.Tags,
+        p.ParentId,
+        p.AcceptedAnswerId,
+        p.LastEditDate,
+        COALESCE(p.Tags, '') as NormalizedTags,
+        CASE WHEN p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2 THEN 
+            (SELECT COUNT(*) FROM unnest(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><')) as tag) 
+        ELSE 0 END as TagCount,
+        CASE WHEN p.PostTypeId = 1 THEN 'Question' 
+             WHEN p.PostTypeId = 2 THEN 'Answer' 
+             ELSE 'Other' END as PostTypeDesc,
+        CASE WHEN p.ParentId IS NOT NULL THEN 
+            (SELECT Title FROM Posts WHERE Id = p.ParentId) 
+        END as ParentTitle,
+        DATEDIFF('day', p.CreationDate, p.LastEditDate) as DaysSinceEdit,
+        CASE WHEN p.Score > 0 THEN 'Positive' 
+             WHEN p.Score < 0 THEN 'Negative' 
+             ELSE 'Neutral' END as ScoreCategory
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) AND p.CreationDate >= DATEADD('year', -2, cast('2024-10-01 12:34:56' as timestamp))
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        pa.*,
+        COALESCE(
+            (SELECT COUNT(*) FROM Votes v WHERE v.PostId = pa.PostId AND v.VoteTypeId IN (2, 3)),
+            0
+        ) as VoteCount,
+        COALESCE(
+            (SELECT COUNT(*) FROM Comments c WHERE c.PostId = pa.PostId),
+            0
+        ) as CommentCount2,
+        COALESCE(
+            (SELECT MAX(v.CreationDate) FROM Votes v WHERE v.PostId = pa.PostId AND v.VoteTypeId = 2),
+            pa.CreationDate
+        ) as LastUpvoteDate,
+        COALESCE(
+            (SELECT MIN(v.CreationDate) FROM Votes v WHERE v.PostId = pa.PostId AND v.VoteTypeId = 3),
+            pa.CreationDate
+        ) as LastDownvoteDate,
+        CASE WHEN pa.AcceptedAnswerId IS NOT NULL THEN 
+            (SELECT Score FROM Posts WHERE Id = pa.AcceptedAnswerId) 
+        END as AcceptedAnswerScore,
+        CASE WHEN pa.AnswerCount > 0 THEN 
+            (SELECT AVG(Score) FROM Posts WHERE ParentId = pa.PostId AND PostTypeId = 2) 
+        ELSE 0 END as AvgAnswerScore,
+        DENSE_RANK() OVER (ORDER BY pa.Score DESC, pa.ViewCount DESC) as ScoreViewRank,
+        NTILE(4) OVER (ORDER BY pa.Score) as ScoreQuartile
+    FROM PostAnalysis pa
+),
+FinalAnalysis AS (
+    SELECT 
+        ru.UserId,
+        ru.DisplayName,
+        ru.Reputation,
+        ru.Views,
+        ru.UpVotes,
+        ru.DownVotes,
+        ru.PostCount,
+        ru.CommentCount,
+        ru.BadgeCount,
+        ru.LastPostDate,
+        ru.LastCommentDate,
+        ru.QuestionCount,
+        ru.AnswerCount,
+        ru.WikiCount,
+        ru.RankByReputation,
+        ru.RankByViews,
+        ru.UpVotePercentile,
+        CASE 
+            WHEN ru.Reputation > 100000 THEN 'Elite'
+            WHEN ru.Reputation > 50000 THEN 'Veteran'
+            WHEN ru.Reputation > 10000 THEN 'Active'
+            ELSE 'Beginner'
+        END as ReputationLevel,
+        CASE 
+            WHEN ru.PostCount > 1000 THEN 'Maven'
+            WHEN ru.PostCount > 500 THEN 'Expert'
+            WHEN ru.PostCount > 100 THEN 'Contributor'
+            ELSE 'Regular'
+        END as ContributionLevel,
+        COALESCE(
+            (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = ru.UserId AND p.PostTypeId = 1 AND p.Score > 100),
+            0
+        ) as HighScoreQuestions,
+        COALESCE(
+            (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = ru.UserId AND p.PostTypeId = 2 AND p.Score > 50),
+            0
+        ) as HighScoreAnswers,
+        (SELECT AVG(Score) FROM Posts WHERE OwnerUserId = ru.UserId AND PostTypeId = 1) as AvgQuestionScore,
+        (SELECT AVG(Score) FROM Posts WHERE OwnerUserId = ru.UserId AND PostTypeId = 2) as AvgAnswerScore,
+        COALESCE(
+            (SELECT COUNT(*) FROM Badges b WHERE b.UserId = ru.UserId AND b.Class = 1),
+            0
+        ) as GoldBadges,
+        COALESCE(
+            (SELECT COUNT(*) FROM Badges b WHERE b.UserId = ru.UserId AND b.Class = 2),
+            0
+        ) as SilverBadges,
+        COALESCE(
+            (SELECT COUNT(*) FROM Badges b WHERE b.UserId = ru.UserId AND b.Class = 3),
+            0
+        ) as BronzeBadges,
+        (ru.UpVotes * 1.0 / NULLIF(ru.UpVotes + ru.DownVotes, 0)) as UpVoteRatio
+    FROM RankedUsers ru
+    WHERE ru.PostCount > 0
+),
+AggregateStats AS (
+    SELECT 
+        COUNT(*) as TotalUsers,
+        AVG(Reputation) as AvgReputation,
+        MAX(Reputation) as MaxReputation,
+        AVG(PostCount) as AvgPostCount,
+        AVG(CommentCount) as AvgCommentCount
+    FROM FinalAnalysis
+)
+SELECT 
+    fa.UserId,
+    fa.DisplayName,
+    fa.Reputation,
+    fa.Views,
+    fa.UpVotes,
+    fa.DownVotes,
+    fa.PostCount,
+    fa.CommentCount,
+    fa.BadgeCount,
+    fa.QuestionCount,
+    fa.AnswerCount,
+    fa.WikiCount,
+    fa.ReputationLevel,
+    fa.ContributionLevel,
+    fa.HighScoreQuestions,
+    fa.HighScoreAnswers,
+    fa.AvgQuestionScore,
+    fa.AvgAnswerScore,
+    fa.GoldBadges,
+    fa.SilverBadges,
+    fa.BronzeBadges,
+    fa.UpVoteRatio,
+    CASE 
+        WHEN fa.UpVoteRatio > 0.8 THEN 'Highly Upvoted'
+        WHEN fa.UpVoteRatio > 0.6 THEN 'Moderately Upvoted'
+        WHEN fa.UpVoteRatio > 0.4 THEN 'Slightly Upvoted'
+        ELSE 'Low Upvote Ratio'
+    END as VotingEngagement,
+    (SELECT MAX(a.ScoreViewRank) FROM ComplexPostAnalysis a WHERE a.OwnerUserId = fa.UserId) as TopPostRank,
+    (SELECT COUNT(*) FROM ComplexPostAnalysis a WHERE a.OwnerUserId = fa.UserId AND a.Score > 100) as HighScorePosts,
+    (SELECT STRING_AGG(DISTINCT SUBSTRING(a.Tags FROM 2 FOR LENGTH(a.Tags)-2), ', ') 
+     FROM ComplexPostAnalysis a 
+     WHERE a.OwnerUserId = fa.UserId AND a.Tags IS NOT NULL 
+     AND LENGTH(a.Tags) > 2) as UserTagInterests,
+    (SELECT COUNT(DISTINCT p.Id) 
+     FROM Posts p 
+     WHERE p.OwnerUserId = fa.UserId 
+     AND p.LastEditDate > DATEADD('month', -6, cast('2024-10-01 12:34:56' as timestamp))) as RecentlyEditedPosts,
+    (SELECT COUNT(*) 
+     FROM Votes v 
+     WHERE v.UserId = fa.UserId 
+     AND v.VoteTypeId = 5 
+     AND v.CreationDate > DATEADD('week', -2, cast('2024-10-01 12:34:56' as timestamp))) as RecentFavorites
+FROM FinalAnalysis fa
+WHERE fa.Reputation > (SELECT AvgReputation * 1.5 FROM AggregateStats)
+AND fa.PostCount >= (SELECT AvgPostCount * 0.5 FROM AggregateStats)
+AND (fa.HighScoreQuestions > 0 OR fa.HighScoreAnswers > 0)
+ORDER BY fa.Reputation DESC, fa.PostCount DESC, fa.HighScoreQuestions DESC, fa.HighScoreAnswers DESC
+LIMIT 1000
+EXCEPT
+SELECT 
+    fa.UserId,
+    fa.DisplayName,
+    fa.Reputation,
+    fa.Views,
+    fa.UpVotes,
+    fa.DownVotes,
+    fa.PostCount,
+    fa.CommentCount,
+    fa.BadgeCount,
+    fa.QuestionCount,
+    fa.AnswerCount,
+    fa.WikiCount,
+    fa.ReputationLevel,
+    fa.ContributionLevel,
+    fa.HighScoreQuestions,
+    fa.HighScoreAnswers,
+    fa.AvgQuestionScore,
+    fa.AvgAnswerScore,
+    fa.GoldBadges,
+    fa.SilverBadges,
+    fa.BronzeBadges,
+    fa.UpVoteRatio,
+    CASE 
+        WHEN fa.UpVoteRatio > 0.8 THEN 'Highly Upvoted'
+        WHEN fa.UpVoteRatio > 0.6 THEN 'Moderately Upvoted'
+        WHEN fa.UpVoteRatio > 0.4 THEN 'Slightly Upvoted'
+        ELSE 'Low Upvote Ratio'
+    END as VotingEngagement,
+    (SELECT MAX(a.ScoreViewRank) FROM ComplexPostAnalysis a WHERE a.OwnerUserId = fa.UserId) as TopPostRank,
+    (SELECT COUNT(*) FROM ComplexPostAnalysis a WHERE a.OwnerUserId = fa.UserId AND a.Score > 100) as HighScorePosts,
+    (SELECT STRING_AGG(DISTINCT SUBSTRING(a.Tags FROM 2 FOR LENGTH(a.Tags)-2), ', ') 
+     FROM ComplexPostAnalysis a 
+     WHERE a.OwnerUserId = fa.UserId AND a.Tags IS NOT NULL 
+     AND LENGTH(a.Tags) > 2) as UserTagInterests,
+    (SELECT COUNT(DISTINCT p.Id) 
+     FROM Posts p 
+     WHERE p.OwnerUserId = fa.UserId 
+     AND p.LastEditDate > DATEADD('month', -6, cast('2024-10-01 12:34:56' as timestamp))) as RecentlyEditedPosts,
+    (SELECT COUNT(*) 
+     FROM Votes v 
+     WHERE v.UserId = fa.UserId 
+     AND v.VoteTypeId = 5 
+     AND v.CreationDate > DATEADD('week', -2, cast('2024-10-01 12:34:56' as timestamp))) as RecentFavorites
+FROM FinalAnalysis fa
+WHERE fa.Reputation < (SELECT AvgReputation * 0.2 FROM AggregateStats)
+ORDER BY fa.Reputation ASC, fa.PostCount ASC
+LIMIT 500

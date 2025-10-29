@@ -1,0 +1,247 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+                (COUNT(DISTINCT p.Id) * 100.0) / NULLIF(SUM(p.Score) OVER (PARTITION BY u.Id), 0)
+            ELSE 0 
+        END as EfficiencyRatio,
+        ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) as PostRank,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) as RepRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId 
+    LEFT JOIN Comments c ON u.Id = c.UserId 
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= CAST('2010-01-01' AS timestamp)
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views
+),
+TopUsers AS (
+    SELECT UserId, DisplayName, Reputation, PostCount, CommentCount, BadgeCount
+    FROM UserActivityStats
+    WHERE PostCount > 50 AND CommentCount > 100
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            WHEN p.PostTypeId = 4 THEN 'TagWikiExcerpt'
+            WHEN p.PostTypeId = 5 THEN 'TagWiki'
+            WHEN p.PostTypeId = 6 THEN 'ModeratorNomination'
+            WHEN p.PostTypeId = 7 THEN 'WikiPlaceholder'
+            ELSE 'Other'
+        END as PostType,
+        CASE 
+            WHEN p.Score > 100 THEN 'High'
+            WHEN p.Score > 50 THEN 'Medium'
+            WHEN p.Score > 0 THEN 'Low'
+            ELSE 'Negative'
+        END as ScoreCategory,
+        COALESCE(p.AnswerCount, 0) as AnsweredCount,
+        COALESCE(p.CommentCount, 0) as CommentedCount,
+        LENGTH(p.Tags) as TagLength,
+        TRIM(BOTH '<>' FROM p.Tags) as CleanedTags,
+        -- STRING_TO_ARRAY is Postgres-specific; use a generic split approach where available.
+        -- For portability keep as function name but avoid :: cast
+        STRING_TO_ARRAY(TRIM(BOTH '<>' FROM p.Tags), '><') as TagArray,
+        EXISTS(SELECT 1 FROM Posts ap WHERE ap.ParentId = p.Id AND ap.PostTypeId = 2 AND ap.Score > 0) as HasAcceptedAnswer,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'CommunityOwned'
+            ELSE 'Active'
+        END as Status,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as UserPostSequence
+    FROM Posts p
+    WHERE p.CreationDate >= CAST('2015-01-01' AS timestamp)
+    AND p.PostTypeId IN (1, 2, 5)
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsRequired,
+        t.IsModeratorOnly,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            WHEN t.Count > 10 THEN 'Niche'
+            ELSE 'Rare'
+        END as PopularityLevel,
+        -- STRING_AGG with ORDER BY and LIMIT is Postgres-specific; emulate by using a subquery that selects top 5 titles per tag and then aggregates.
+        (
+            SELECT GROUP_CONCAT(sub.Title, ', ')
+            FROM (
+                SELECT pa.Title
+                FROM Posts pa
+                WHERE pa.PostTypeId = 1
+                  AND pa.Tags LIKE '%' || t.TagName || '%'
+                ORDER BY pa.Score DESC
+                LIMIT 5
+            ) sub
+        ) as RecentQuestions
+    FROM Tags t
+    GROUP BY t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId, t.IsRequired, t.IsModeratorOnly
+),
+ComplexJoinAnalysis AS (
+    SELECT 
+        pa.PostId,
+        pa.Title,
+        pa.Score,
+        pa.ViewCount,
+        pa.OwnerUserId,
+        pa.PostType,
+        pa.ScoreCategory,
+        pa.HasAcceptedAnswer,
+        pa.Status,
+        u.DisplayName as OwnerName,
+        u.Reputation as OwnerReputation,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Elite'
+            WHEN u.Reputation > 1000 THEN 'Expert'
+            WHEN u.Reputation > 100 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as UserLevel,
+        COALESCE(ua.PostCount, 0) as UserPostCount,
+        COALESCE(ua.CommentCount, 0) as UserCommentCount,
+        COALESCE(ua.BadgeCount, 0) as UserBadgeCount,
+        u.Views as UserViews,
+        CASE 
+            WHEN pa.Score > 100 THEN 'HighQuality'
+            WHEN pa.Score > 25 THEN 'GoodQuality'
+            WHEN pa.Score > 0 THEN 'ModerateQuality'
+            ELSE 'LowQuality'
+        END as QualityLevel,
+        CASE 
+            WHEN pa.Tags IS NOT NULL AND LENGTH(pa.Tags) > 0 THEN 
+                (SELECT COUNT(*) FROM UNNEST(pa.TagArray) as tag WHERE tag NOT IN ('', ' '))
+            ELSE 0 
+        END as TagCount,
+        EXISTS(SELECT 1 FROM Votes v WHERE v.PostId = pa.PostId AND v.VoteTypeId = 2) as HasUpvotes,
+        EXISTS(SELECT 1 FROM Votes v WHERE v.PostId = pa.PostId AND v.VoteTypeId = 3) as HasDownvotes,
+        EXISTS(SELECT 1 FROM Comments c WHERE c.PostId = pa.PostId AND c.Score > 5) as HasHighCommentScore,
+        EXISTS(SELECT 1 FROM PostLinks pl WHERE pl.PostId = pa.PostId AND pl.LinkTypeId = 3) as IsDuplicate,
+        (SELECT COUNT(*) FROM PostHistory ph 
+         WHERE ph.PostId = pa.PostId 
+         AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6) 
+         AND ph.CreationDate >= CAST('2018-01-01' AS timestamp)) as EditCount,
+        (SELECT AVG(LENGTH(ph.Text)) FROM PostHistory ph 
+         WHERE ph.PostId = pa.PostId 
+         AND ph.PostHistoryTypeId IN (5)) as AvgEditSize,
+        -- DATEDIFF is not standard; use CAST difference in days for portability (some dialects use DATEDIFF, others use DATE_PART). Use Julian day subtraction.
+        CAST((JULIANDAY(CAST('2024-10-01 12:34:56' AS timestamp)) - JULIANDAY(pa.CreationDate)) AS INTEGER) as AgeInDays
+    FROM PostAnalysis pa
+    JOIN Users u ON pa.OwnerUserId = u.Id
+    LEFT JOIN UserActivityStats ua ON pa.OwnerUserId = ua.UserId
+    WHERE pa.Score >= 0 
+    AND pa.ViewCount >= 10
+),
+FinalAggregation AS (
+    SELECT 
+        cja.*,
+        (UserPostCount * 1.0 / NULLIF(UserCommentCount, 0)) as PostCommentRatio,
+        CASE 
+            WHEN UserPostCount > 0 THEN (UserPostCount * 100.0 / NULLIF(ua.PostCount, 0))
+            ELSE 0 
+        END as UserContributionPercent,
+        CASE 
+            WHEN HasUpvotes AND HasDownvotes THEN 'MixedVotes'
+            WHEN HasUpvotes THEN 'PositiveVotes'
+            WHEN HasDownvotes THEN 'NegativeVotes'
+            ELSE 'NoVotes'
+        END as VotePattern,
+        CASE 
+            WHEN Score > 50 AND ViewCount > 100 THEN 'Trending'
+            WHEN Score > 10 AND ViewCount > 50 THEN 'Popular'
+            WHEN Score >= 0 AND ViewCount > 10 THEN 'Moderate'
+            ELSE 'LowTraffic'
+        END as TrafficLevel,
+        CASE 
+            WHEN AgeInDays <= 30 THEN 'Fresh'
+            WHEN AgeInDays <= 90 THEN 'Recent'
+            WHEN AgeInDays <= 365 THEN 'Stable'
+            ELSE 'Legacy'
+        END as Freshness
+    FROM ComplexJoinAnalysis cja
+    JOIN UserActivityStats ua ON cja.OwnerUserId = ua.UserId
+)
+SELECT 
+    f.PostId,
+    f.Title,
+    f.Score,
+    f.ViewCount,
+    f.OwnerName,
+    f.OwnerReputation,
+    f.UserLevel,
+    f.UserPostCount,
+    f.UserCommentCount,
+    f.UserBadgeCount,
+    f.PostType,
+    f.ScoreCategory,
+    f.Status,
+    f.QualityLevel,
+    f.TagCount,
+    f.VotePattern,
+    f.TrafficLevel,
+    f.Freshness,
+    f.AgeInDays,
+    f.PostCommentRatio,
+    f.UserContributionPercent,
+    -- Use a portable aggregation for tag array formatting; GROUP_CONCAT is common, STRING_AGG is Postgres-specific.
+    (SELECT GROUP_CONCAT(tag, ', ') FROM UNNEST(f.TagArray) as tag WHERE tag NOT IN ('', ' ')) as FormattedTags,
+    CASE 
+        WHEN f.HasAcceptedAnswer THEN 'Yes'
+        ELSE 'No'
+    END as HasAccepted,
+    CASE 
+        WHEN f.HasUpvotes AND NOT f.HasDownvotes THEN 'Upvoted'
+        WHEN f.HasDownvotes AND NOT f.HasUpvotes THEN 'Downvoted'
+        WHEN f.HasUpvotes AND f.HasDownvotes THEN 'Voted'
+        ELSE 'Unvoted'
+    END as VotingStatus,
+    CASE 
+        WHEN f.IsDuplicate THEN 'Duplicate'
+        ELSE 'Original'
+    END as PostStatus,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = f.PostId AND v.VoteTypeId = 5) as FavoriteCount,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = f.PostId AND v.VoteTypeId IN (6, 7)) as CloseReopenCount,
+    (SELECT AVG(v.BountyAmount) FROM Votes v WHERE v.PostId = f.PostId AND v.VoteTypeId = 8) as AvgBounty,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = f.PostId) as CommentCount,
+    CASE 
+        WHEN f.EditCount > 2 THEN 'HeavilyEdited'
+        WHEN f.EditCount > 0 THEN 'Edited'
+        ELSE 'Unedited'
+    END as EditStatus,
+    COALESCE(f.AvgEditSize, 0) as AvgEditSize
+FROM FinalAggregation f
+WHERE f.PostId IS NOT NULL
+AND f.OwnerName IS NOT NULL
+AND (f.UserPostCount > 0 OR f.UserCommentCount > 0 OR f.UserBadgeCount > 0)
+AND f.Score BETWEEN -10 AND 1000
+AND f.ViewCount > 0
+AND f.TagCount >= 0
+AND f.AgeInDays BETWEEN 1 AND 3650
+AND (f.PostType IN ('Question', 'Answer') OR f.PostType IS NULL)
+AND f.Status IN ('Active', 'Closed', 'CommunityOwned') 
+AND f.QualityLevel IN ('HighQuality', 'GoodQuality', 'ModerateQuality', 'LowQuality')
+ORDER BY f.Score DESC, f.ViewCount DESC, f.AgeInDays ASC
+LIMIT 10000;

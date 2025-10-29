@@ -1,0 +1,181 @@
+-- {"query": "1990.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2928} 
+
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesGiven,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesGiven,
+        MAX(P.CreationDate) AS LastPostDate,
+        MIN(P.CreationDate) AS FirstPostDate,
+        SUM(COALESCE(P.Score, 0)) AS TotalPostScoreByOwner,
+        SUM(COALESCE(P.AnswerCount, 0)) AS TotalAnswersToOwnQuestions
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Votes V ON U.Id = V.UserId
+    GROUP BY U.Id
+),
+PostDetails AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.FavoriteCount,
+        P.Tags,
+        P.ParentId,
+        (SELECT AVG(A.Score) FROM Posts A WHERE A.ParentId = P.Id AND A.PostTypeId = 2) AS AverageAnswerScore,
+        COALESCE(
+            EXTRACT(EPOCH FROM (MIN(PA.CreationDate) - P.CreationDate)) / 3600.0, -- Hours to first answer
+            -1.0 -- Indicator for no answers
+        ) AS HoursToFirstAnswer,
+        (SELECT COUNT(DISTINCT PH.PostId) FROM PostHistory PH WHERE PH.PostId = P.Id AND PH.PostHistoryTypeId IN (4,5,6)) AS EditCount,
+        ROW_NUMBER() OVER(PARTITION BY P.OwnerUserId ORDER BY P.CreationDate DESC) AS rn_latest_post
+    FROM Posts P
+    LEFT JOIN Posts PA ON P.Id = PA.ParentId AND PA.PostTypeId = 2 -- To find answers to this question
+    WHERE P.PostTypeId IN (1, 2) -- Only consider Questions and Answers
+    GROUP BY P.Id, P.PostTypeId, P.OwnerUserId, P.CreationDate, P.Score, P.ViewCount, P.FavoriteCount, P.Tags, P.ParentId
+),
+UserBadgeStats AS (
+    SELECT
+        B.UserId,
+        COUNT(B.Id) AS TotalBadges,
+        COUNT(CASE WHEN B.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN B.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN B.Class = 3 THEN 1 END) AS BronzeBadges,
+        MAX(B.Date) AS LastBadgeDate,
+        MIN(B.Date) AS FirstBadgeDate,
+        STRING_AGG(DISTINCT B.Name, ', ') AS AllBadgeNames
+    FROM Badges B
+    GROUP BY B.UserId
+),
+RecentPostHistory AS (
+    SELECT
+        PH.PostId,
+        PH.UserId AS HistoryUserId,
+        PH.CreationDate AS HistoryDate,
+        PH.PostHistoryTypeId,
+        PH.Comment AS HistoryComment,
+        CRT.Name AS CloseReasonName,
+        ROW_NUMBER() OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate DESC) AS rn_latest_history
+    FROM PostHistory PH
+    LEFT JOIN CloseReasonTypes CRT ON PH.PostHistoryTypeId = 10 AND PH.Comment = CRT.Id::text
+    WHERE PH.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15) -- Post closed/reopened/deleted/undeleted/locked/unlocked
+),
+TopTagsPerUser AS (
+    SELECT
+        T.UserId,
+        T.Tag,
+        COUNT(T.PostId) AS PostsWithTag,
+        ROW_NUMBER() OVER (PARTITION BY T.UserId ORDER BY COUNT(T.PostId) DESC) AS rn_tag_rank
+    FROM (
+        SELECT
+            P.OwnerUserId AS UserId,
+            P.Id AS PostId,
+            UNNEST(string_to_array(substring(P.Tags, 2, length(P.Tags)-2), '><')) AS Tag
+        FROM Posts P
+        WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL AND P.Tags != ''
+    ) T
+    WHERE T.UserId IS NOT NULL
+    GROUP BY T.UserId, T.Tag
+),
+BaseUserSet AS (
+    -- Users with high reputation and specific badge criteria
+    SELECT
+        U.Id AS UserId,
+        'HighReputationInfluencer' AS UserCategory
+    FROM Users U
+    JOIN UserBadgeStats UBS ON U.Id = UBS.UserId
+    WHERE
+        U.Reputation > 50000 -- Threshold for high reputation
+        AND COALESCE(UBS.GoldBadges, 0) >= 3
+        AND U.LastAccessDate > NOW() - INTERVAL '6 months'
+        AND EXISTS (SELECT 1 FROM Badges B_corr WHERE B_corr.UserId = U.Id AND B_corr.Name ILIKE '%suffrage%' AND B_corr.Date > U.CreationDate + INTERVAL '1 year')
+    UNION ALL
+    -- Users with high activity (posts/comments) and recent engagement
+    SELECT
+        U.Id AS UserId,
+        'HighActivityContributor' AS UserCategory
+    FROM Users U
+    JOIN UserActivitySummary UAS ON U.Id = UAS.UserId
+    WHERE
+        COALESCE(UAS.TotalPosts, 0) > 200
+        AND COALESCE(UAS.TotalComments, 0) > 500
+        AND UAS.LastPostDate IS NOT NULL AND UAS.LastPostDate > NOW() - INTERVAL '3 months'
+        AND U.Views > (SELECT COALESCE(AVG(U2.Views), 0) FROM Users U2 WHERE U2.CreationDate BETWEEN U.CreationDate - INTERVAL '1 year' AND U.CreationDate + INTERVAL '1 year' AND U2.Id != U.Id)
+)
+SELECT
+    U.Id AS UserIdentifier,
+    U.DisplayName,
+    U.Reputation,
+    U.CreationDate AS UserCreationDate,
+    U.LastAccessDate,
+    U.WebsiteUrl,
+    U.Location,
+    U.AboutMe,
+    COALESCE(UAS.TotalPosts, 0) AS UserTotalPosts,
+    COALESCE(UAS.TotalComments, 0) AS UserTotalComments,
+    COALESCE(UAS.TotalUpvotesGiven, 0) AS UserTotalUpvotesGiven,
+    COALESCE(UAS.TotalDownvotesGiven, 0) AS UserTotalDownvotesGiven,
+    COALESCE(UBS.GoldBadges, 0) AS UserGoldBadges,
+    COALESCE(UBS.SilverBadges, 0) AS UserSilverBadges,
+    COALESCE(UBS.BronzeBadges, 0) AS UserBronzeBadges,
+    COALESCE(UBS.AllBadgeNames, 'No Badges') AS UserAllBadgeNames,
+    UAS.LastPostDate,
+    UAS.FirstPostDate,
+    BS.UserCategory,
+    (U.Reputation - COALESCE(UAS.TotalPostScoreByOwner, 0)) AS RepFromOtherSources,
+    CASE
+        WHEN U.WebsiteUrl IS NOT NULL AND U.AboutMe IS NOT NULL AND LENGTH(U.AboutMe) > 100 THEN 'Extremely Detailed Profile'
+        WHEN U.WebsiteUrl IS NOT NULL AND U.AboutMe IS NOT NULL THEN 'Highly Engaged External'
+        WHEN U.WebsiteUrl IS NOT NULL THEN 'External Link Provided'
+        WHEN U.AboutMe IS NOT NULL THEN 'Bio Provided'
+        ELSE 'Minimal Profile'
+    END AS UserProfileCompleteness,
+    (SELECT COUNT(DISTINCT V.PostId) FROM Votes V WHERE V.UserId = U.Id AND V.VoteTypeId = 5) AS TotalFavoritePostsByUser,
+    P_Latest.Id AS LatestPostId,
+    P_Latest.PostCreationDate AS LatestPostDate,
+    P_Latest.PostScore AS LatestPostScore,
+    P_Latest.ViewCount AS LatestPostViewCount,
+    P_Latest.FavoriteCount AS LatestPostFavoriteCount,
+    P_Latest.AverageAnswerScore AS LatestPostAvgAnswerScore,
+    P_Latest.HoursToFirstAnswer AS LatestPostHoursToFirstAnswer,
+    P_Latest.EditCount AS LatestPostEditCount,
+    REPLACE(REPLACE(COALESCE(P_Latest.Tags, ''), '><', ', '), '<', ''), '>', '') AS LatestPostTagsFormatted,
+    COALESCE(RPH.CloseReasonName, 'N/A') AS LatestPostCloseReason,
+    COALESCE(RPH.HistoryComment, 'No specific history comment') AS LatestPostHistoryComment,
+    TPU.Tag AS TopContributingTag,
+    TPU.PostsWithTag AS TopTagPostCount,
+    (SELECT COUNT(DISTINCT C.Id) FROM Comments C WHERE C.UserId = U.Id AND C.CreationDate > U.LastAccessDate) AS CommentsAfterLastAccess,
+    AVG(P.PostScore) OVER (PARTITION BY U.Location) AS AvgScoreInUserLocation,
+    RANK() OVER (ORDER BY U.Reputation DESC, COALESCE(UAS.TotalPosts, 0) DESC, COALESCE(UBS.GoldBadges, 0) DESC) AS OverallUserRank,
+    LAG(U.Reputation, 1, 0) OVER (ORDER BY U.CreationDate) AS PrevUserReputationByCreationOrder,
+    COALESCE(NULLIF(U.UpVotes, 0) / NULLIF(U.DownVotes, 0)::numeric, 0) AS UpDownVoteRatio,
+    (SELECT COUNT(DISTINCT PH2.PostId) FROM PostHistory PH2 WHERE PH2.UserId = U.Id AND PH2.PostHistoryTypeId IN (1,2,3) AND PH2.CreationDate > (U.CreationDate + INTERVAL '1 year')) AS FirstYearInitialPostHistoryCount,
+    SUM(P.PostScore) OVER (PARTITION BY U.Id ORDER BY P.PostCreationDate ASC RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativePostScore,
+    (SELECT COUNT(DISTINCT PL.PostId) FROM PostLinks PL WHERE PL.RelatedPostId = P_Latest.Id AND PL.LinkTypeId = 1) AS LinksToLatestPostCount,
+    (SELECT COUNT(DISTINCT PL.PostId) FROM PostLinks PL WHERE PL.RelatedPostId = P_Latest.Id AND PL.LinkTypeId = 3) AS DuplicatesOfLatestPostCount,
+    (SELECT COUNT(DISTINCT V.Id) FROM Votes V WHERE V.PostId = P_Latest.Id AND V.VoteTypeId = 2) AS LatestPostUpvotesReceived
+FROM BaseUserSet BS
+JOIN Users U ON BS.UserId = U.Id
+LEFT JOIN UserActivitySummary UAS ON U.Id = UAS.UserId
+LEFT JOIN UserBadgeStats UBS ON U.Id = UBS.UserId
+LEFT JOIN PostDetails P_Latest ON U.Id = P_Latest.OwnerUserId AND P_Latest.rn_latest_post = 1
+LEFT JOIN RecentPostHistory RPH ON P_Latest.Id = RPH.PostId AND RPH.rn_latest_history = 1
+LEFT JOIN TopTagsPerUser TPU ON U.Id = TPU.UserId AND TPU.rn_tag_rank = 1
+LEFT JOIN PostDetails P ON U.Id = P.OwnerUserId -- Join for window functions over all posts by user
+WHERE
+    P_Latest.Id IS NOT NULL -- Ensure the user has at least one post
+    AND (LOWER(U.DisplayName) LIKE '%dev%' OR LOWER(COALESCE(U.AboutMe, '')) LIKE '%sql%')
+    AND (
+        (P_Latest.PostTypeId = 1 AND COALESCE(P_Latest.FavoriteCount, 0) > 10 AND COALESCE(P_Latest.ViewCount, 0) > 5000)
+        OR
+        (P_Latest.PostTypeId = 2 AND COALESCE(P_Latest.PostScore, 0) > 50 AND P_Latest.HoursToFirstAnswer BETWEEN 0 AND 24) -- HoursToFirstAnswer is -1 if no answer
+    )
+ORDER BY
+    OverallUserRank ASC, CumulativePostScore DESC, UserTotalPosts DESC
+LIMIT 1000;

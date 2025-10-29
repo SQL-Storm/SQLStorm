@@ -1,0 +1,118 @@
+-- {"query": "4138.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1126} 
+
+WITH
+  RecentQuestions AS (
+    SELECT
+      p.Id AS QuestionId,
+      p.Title,
+      p.OwnerUserId,
+      p.CreationDate AS QuestionCreationDate,
+      COUNT(a.Id) AS AnswerCount,
+      SUM(CASE WHEN a.OwnerUserId = p.OwnerUserId THEN 1 ELSE 0 END) AS OwnerAnswers,
+      ROW_NUMBER() OVER (ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts AS p
+    LEFT JOIN Posts AS a
+      ON p.Id = a.ParentId
+    WHERE
+      p.PostTypeId = 1 AND p.CreationDate >= DATE('now', '-30 day')
+    GROUP BY
+      p.Id,
+      p.Title,
+      p.OwnerUserId,
+      p.CreationDate
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate AS UserCreationDate,
+      COALESCE(rq.AnswerCount, 0) AS QuestionsAnsweredInLastMonth,
+      COALESCE(
+        (
+          SELECT
+            COUNT(*)
+          FROM Votes AS v
+          WHERE
+            v.UserId = u.Id AND v.VoteTypeId = 2 AND v.CreationDate >= DATE('now', '-30 day')
+        ),
+        0
+      ) AS UpvotesGivenLastMonth,
+      COALESCE(
+        (
+          SELECT
+            SUM(v.BountyAmount)
+          FROM Votes AS v
+          WHERE
+            v.UserId = u.Id AND v.VoteTypeId = 8 AND v.CreationDate >= DATE('now', '-30 day')
+        ),
+        0
+      ) AS BountiesAwardedLastMonth,
+      ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY u.CreationDate DESC) AS user_rn
+    FROM Users AS u
+    LEFT JOIN (
+      SELECT
+        p.OwnerUserId,
+        COUNT(p.Id) AS AnswerCount
+      FROM Posts AS p
+      WHERE
+        p.PostTypeId = 2 AND p.CreationDate >= DATE('now', '-30 day')
+      GROUP BY
+        p.OwnerUserId
+    ) AS rq
+      ON u.Id = rq.OwnerUserId
+  )
+SELECT
+  rq.QuestionId,
+  rq.Title,
+  rq.QuestionCreationDate,
+  ua_owner.DisplayName AS OwnerDisplayName,
+  ua_owner.Reputation AS OwnerReputation,
+  ua_owner.QuestionsAnsweredInLastMonth AS OwnerAnswersLastMonth,
+  ua_owner.UpvotesGivenLastMonth AS OwnerUpvotesGivenLastMonth,
+  ua_owner.BountiesAwardedLastMonth AS OwnerBountiesAwardedLastMonth,
+  COALESCE(ua_last_editor.DisplayName, 'Community') AS LastEditorDisplayName,
+  COALESCE(ua_last_editor.Reputation, 0) AS LastEditorReputation,
+  (
+    SELECT
+      COUNT(*)
+    FROM Comments AS c
+    WHERE
+      c.PostId = rq.QuestionId AND c.UserId = rq.OwnerUserId
+  ) AS OwnerCommentsOnQuestion,
+  CASE
+    WHEN rq.OwnerAnswers > 0 THEN 'Has Owner Answers'
+    WHEN rq.AnswerCount > 0 THEN 'Has Other Answers'
+    ELSE 'No Answers'
+  END AS AnswerStatus,
+  CASE
+    WHEN rq.QuestionCreationDate < DATE('now', '-7 day') AND rq.AnswerCount = 0 THEN 'Stale'
+    WHEN rq.QuestionCreationDate >= DATE('now', '-7 day') AND rq.AnswerCount = 0 THEN 'New'
+    ELSE 'Answered'
+  END AS QuestionAgeStatus,
+  LOWER(REPLACE(rq.Title, ' ', '_')) AS LowercaseTitleWithUnderscores,
+  LENGTH(rq.Title) AS TitleLength,
+  (
+    SELECT
+      COUNT(*)
+    FROM PostLinks AS pl
+    WHERE
+      pl.PostId = rq.QuestionId AND pl.LinkTypeId = 3
+  ) AS DuplicateLinks,
+  CASE
+    WHEN rq.rn BETWEEN 1 AND 100 THEN 'Top 100 Newest'
+    WHEN rq.rn BETWEEN 101 AND 500 THEN 'Next 400 Newest'
+    ELSE 'Older'
+  END AS AgeBucket
+FROM RecentQuestions AS rq
+LEFT JOIN UserActivity AS ua_owner
+  ON rq.OwnerUserId = ua_owner.UserId
+LEFT JOIN Posts AS p_last_edit
+  ON rq.Id = p_last_edit.Id
+LEFT JOIN UserActivity AS ua_last_editor
+  ON p_last_edit.LastEditorUserId = ua_last_editor.UserId
+WHERE
+  rq.OwnerUserId IS NOT NULL AND ua_owner.Reputation > 1000
+ORDER BY
+  rq.QuestionCreationDate DESC
+LIMIT 1000;

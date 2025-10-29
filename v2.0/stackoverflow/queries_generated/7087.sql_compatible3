@@ -1,0 +1,296 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        STRING_AGG(DISTINCT p.Tags, '; ') AS AllTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes
+),
+TopPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS RankByScore,
+        RANK() OVER (ORDER BY p.Score DESC) AS RankOverall,
+        DENSE_RANK() OVER (ORDER BY p.ViewCount DESC) AS RankByViews,
+        NTILE(4) OVER (ORDER BY p.Score DESC) AS Quartile,
+        LAG(p.Score, 1) OVER (ORDER BY p.Score DESC) AS PrevScore,
+        LEAD(p.Score, 1) OVER (ORDER BY p.Score DESC) AS NextScore,
+        AVG(p.Score) OVER (PARTITION BY p.PostTypeId) AS AvgScoreByType,
+        MAX(p.Score) OVER (PARTITION BY p.PostTypeId) AS MaxScoreByType,
+        COUNT(*) OVER (PARTITION BY p.PostTypeId) AS CountByType,
+        CASE 
+            WHEN p.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'High'
+            WHEN p.Score < (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'Low'
+            ELSE 'Average'
+        END AS ScoreCategory
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1, 2) AND p.Score IS NOT NULL
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            WHEN t.Count > 10 THEN 'Niche'
+            ELSE 'Rare'
+        END AS PopularityLevel,
+        (SELECT COUNT(*) FROM Posts WHERE Tags LIKE '%' || t.TagName || '%') AS PostsUsingTag,
+        (SELECT AVG(p.Score) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%') AS AvgScoreForTag,
+        CASE 
+            WHEN t.TagName LIKE 'asp%' THEN 'ASP Series'
+            WHEN t.TagName LIKE 'java%' THEN 'Java Series'
+            WHEN t.TagName LIKE 'c%' THEN 'C Series'
+            ELSE 'Other'
+        END AS TagCategory,
+        CASE 
+            WHEN t.IsRequired = TRUE THEN 'Required'
+            WHEN t.IsModeratorOnly = TRUE THEN 'Moderator Only'
+            ELSE 'General'
+        END AS TagType
+    FROM Tags t
+    WHERE t.Count > 0
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT ph.Id) AS HistoryCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 1 THEN ph.Id END) AS TitleChanges,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 5 THEN ph.Id END) AS BodyEdits,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 6 THEN ph.Id END) AS TagEdits,
+        STRING_AGG(DISTINCT ph.Comment, '; ') AS EditComments,
+        MAX(ph.CreationDate) AS LastActivity,
+        MIN(ph.CreationDate) AS FirstActivity,
+        (CAST(MAX(ph.CreationDate) AS DATE) - CAST(MIN(ph.CreationDate) AS DATE)) AS ActivityDurationDays,
+        CASE 
+            WHEN COUNT(DISTINCT ph.Id) > 100 THEN 'High'
+            WHEN COUNT(DISTINCT ph.Id) > 10 THEN 'Medium'
+            ELSE 'Low'
+        END AS ActivityLevel
+    FROM Users u
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    GROUP BY u.Id, u.DisplayName
+),
+CombinedAnalysis AS (
+    SELECT 
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.Views,
+        us.UpVotes,
+        us.DownVotes,
+        us.PostCount,
+        us.CommentCount,
+        us.BadgeCount,
+        us.AvgPostScore,
+        us.QuestionCount,
+        us.AnswerCount,
+        us.AllTags,
+        CASE 
+            WHEN us.PostCount > 0 THEN (us.QuestionCount * 100.0 / us.PostCount)
+            ELSE 0 
+        END AS QuestionPercentage,
+        CASE 
+            WHEN us.CommentCount > 0 THEN (us.BadgeCount * 100.0 / us.CommentCount)
+            ELSE 0 
+        END AS BadgePerComment,
+        NULL AS DaysSinceLastPost,
+        CASE 
+            WHEN LENGTH(us.AllTags) > 10 THEN 
+                'Multiple tags used'
+            WHEN LENGTH(us.AllTags) > 0 THEN 
+                'Single tag used'
+            ELSE 
+                'No tags used'
+        END AS TagUsagePattern,
+        CASE 
+            WHEN us.Reputation > 10000 THEN 'Expert'
+            WHEN us.Reputation > 1000 THEN 'Advanced'
+            WHEN us.Reputation > 100 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END AS ReputationLevel,
+        CASE 
+            WHEN us.Views > 1000 THEN 'Well Viewed'
+            WHEN us.Views > 100 THEN 'Moderately Viewed'
+            ELSE 'Low Viewed'
+        END AS ViewStatus,
+        CASE 
+            WHEN us.UpVotes > us.DownVotes THEN 'Upvoted'
+            WHEN us.UpVotes < us.DownVotes THEN 'Downvoted'
+            ELSE 'Neutral'
+        END AS VoteStatus
+    FROM UserStats us
+)
+SELECT 
+    ca.UserId,
+    ca.DisplayName,
+    ca.Reputation,
+    ca.PostCount,
+    ca.CommentCount,
+    ca.BadgeCount,
+    ca.AvgPostScore,
+    ca.QuestionCount,
+    ca.AnswerCount,
+    ca.QuestionPercentage,
+    ca.BadgePerComment,
+    ca.TagUsagePattern,
+    ca.ReputationLevel,
+    ca.ViewStatus,
+    ca.VoteStatus,
+    pa.Title,
+    pa.Score,
+    pa.ViewCount,
+    pa.RankByScore,
+    pa.RankOverall,
+    pa.Quartile,
+    pa.ScoreCategory,
+    ta.TagName,
+    ta.TagCount,
+    ta.PopularityLevel,
+    ta.PostsUsingTag,
+    ta.AvgScoreForTag,
+    ta.TagCategory,
+    ta.TagType,
+    ua.HistoryCount,
+    ua.TitleChanges,
+    ua.BodyEdits,
+    ua.TagEdits,
+    ua.ActivityLevel,
+    CASE 
+        WHEN ca.Reputation > 1000 AND pa.Score > 10 AND ta.TagCount > 100 THEN 'High Impact'
+        WHEN ca.Reputation > 1000 AND pa.Score > 5 THEN 'Moderate Impact'
+        WHEN pa.Score > 20 THEN 'High Score Post'
+        WHEN ta.TagCount > 500 THEN 'Popular Tag'
+        ELSE 'Standard'
+    END AS ImpactLevel,
+    COALESCE(pa.Title, 'No Title') AS PostTitleCoalesced,
+    COALESCE(ta.TagName, 'No Tag') AS TagCoalesced,
+    CASE 
+        WHEN ca.Reputation > 10000 THEN 'Elite'
+        WHEN ca.Reputation > 1000 THEN 'Veteran'
+        WHEN ca.Reputation > 100 THEN 'Contributor'
+        ELSE 'Community Member'
+    END AS UserTier,
+    (
+        'User ' 
+        || CAST(ca.UserId AS VARCHAR)
+        || ' - ' 
+        || ca.DisplayName
+        || ' (Rep:'
+        || CAST(ca.Reputation AS VARCHAR)
+        || ', Posts:'
+        || CAST(ca.PostCount AS VARCHAR)
+        || ', Q:'
+        || CAST(ca.QuestionCount AS VARCHAR)
+        || ', A:'
+        || CAST(ca.AnswerCount AS VARCHAR)
+        || ')'
+    ) AS UserSummary,
+    CASE 
+        WHEN ca.QuestionCount > 10 AND ca.AnswerCount > 10 THEN 'Active Questioner'
+        WHEN ca.QuestionCount > 5 AND ca.AnswerCount > 5 THEN 'Regular Participant'
+        WHEN ca.QuestionCount > 0 THEN 'Questioner'
+        WHEN ca.AnswerCount > 0 THEN 'Answerer'
+        ELSE 'Observer'
+    END AS UserRole,
+    CASE 
+        WHEN pa.Score > (SELECT AVG(Score) FROM Posts) + (SELECT STDDEV_SAMP(Score) FROM Posts) THEN 'Above Average'
+        WHEN pa.Score < (SELECT AVG(Score) FROM Posts) - (SELECT STDDEV_SAMP(Score) FROM Posts) THEN 'Below Average'
+        ELSE 'Normal'
+    END AS ScoreComparison,
+    CASE 
+        WHEN ta.TagCount > 1000 THEN 1
+        WHEN ta.TagCount > 100 THEN 2
+        WHEN ta.TagCount > 10 THEN 3
+        ELSE 4
+    END AS TagPriority,
+    ROW_NUMBER() OVER (ORDER BY ca.Reputation DESC, ca.PostCount DESC) AS UserRanking,
+    CASE 
+        WHEN EXISTS (SELECT 1 FROM Posts WHERE OwnerUserId = ca.UserId AND PostTypeId = 1 AND Score > 50) THEN 'Has High Scoring Question'
+        WHEN EXISTS (SELECT 1 FROM Posts WHERE OwnerUserId = ca.UserId AND PostTypeId = 2 AND Score > 20) THEN 'Has High Scoring Answer'
+        ELSE 'No High Scoring Posts'
+    END AS HighScoringIndicator,
+    CASE 
+        WHEN ca.BadgeCount > 10 THEN 'Badge Collector'
+        WHEN ca.BadgeCount > 5 THEN 'Badge Enthusiast'
+        WHEN ca.BadgeCount > 0 THEN 'Badge Seeker'
+        ELSE 'No Badges'
+    END AS BadgeStatus,
+    CASE 
+        WHEN LENGTH(ca.AllTags) > 100 THEN 
+            SUBSTRING(ca.AllTags FROM 1 FOR 100) || '...'
+        ELSE ca.AllTags
+    END AS TrimmedTags,
+    CASE 
+        WHEN ca.Reputation > (SELECT AVG(Reputation) FROM Users) + 
+             (SELECT STDDEV_SAMP(Reputation) FROM Users) THEN 'Above Average Reputation'
+        WHEN ca.Reputation < (SELECT AVG(Reputation) FROM Users) - 
+             (SELECT STDDEV_SAMP(Reputation) FROM Users) THEN 'Below Average Reputation'
+        ELSE 'Average Reputation'
+    END AS ReputationComparison,
+    CASE 
+        WHEN pa.AvgScoreByType > 10 THEN 'High Average Score'
+        WHEN pa.AvgScoreByType > 5 THEN 'Moderate Average Score'
+        ELSE 'Low Average Score'
+    END AS PostTypeAvgScore,
+    CASE 
+        WHEN ca.PostCount > (SELECT AVG(PostCount) FROM UserStats) * 1.5 THEN 'High Activity'
+        WHEN ca.PostCount > (SELECT AVG(PostCount) FROM UserStats) THEN 'Medium Activity'
+        ELSE 'Low Activity'
+    END AS UserActivityLevel,
+    CASE 
+        WHEN pa.RankOverall <= 10 THEN 'Top 10'
+        WHEN pa.RankOverall <= 25 THEN 'Top 25'
+        WHEN pa.RankOverall <= 50 THEN 'Top 50'
+        ELSE 'Below Top 50'
+    END AS ScoreRankStatus,
+    CASE 
+        WHEN pa.RankByViews <= 5 THEN 'Top Viewed'
+        WHEN pa.RankByViews <= 20 THEN 'High Viewed'
+        WHEN pa.RankByViews <= 50 THEN 'Moderate Viewed'
+        ELSE 'Low Viewed'
+    END AS ViewRankStatus
+FROM CombinedAnalysis ca
+LEFT JOIN TopPosts pa ON ca.UserId = pa.OwnerUserId
+LEFT JOIN TagAnalysis ta ON ta.TagName IS NOT NULL
+    AND EXISTS (
+        SELECT 1 FROM Posts p 
+        WHERE p.OwnerUserId = ca.UserId 
+          AND p.Tags LIKE '%' || ta.TagName || '%'
+    )
+LEFT JOIN UserActivity ua ON ca.UserId = ua.UserId
+WHERE ca.Reputation > 1000 
+  AND (pa.Score IS NOT NULL OR ta.TagName IS NOT NULL OR ua.HistoryCount IS NOT NULL)
+ORDER BY 
+    ca.Reputation DESC, 
+    pa.Score DESC, 
+    ta.TagCount DESC,
+    ua.HistoryCount DESC
+LIMIT 1000;

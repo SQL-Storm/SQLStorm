@@ -1,0 +1,83 @@
+-- {"query": "4892.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1084} 
+
+WITH RankedUserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) AS PostCount,
+        SUM(CASE WHEN pt.Name = 'Question' THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN pt.Name = 'Answer' THEN 1 ELSE 0 END) AS AnswerCount,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.Id) AS ReputationRank,
+        DENSE_RANK() OVER (PARTITION BY u.CreationDate::DATE ORDER BY u.Reputation DESC) AS DailyReputationRank
+    FROM Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE u.CreationDate >= DATE '2023-01-01'
+      AND u.Location IS NOT NULL
+      AND u.WebsiteUrl LIKE '%stackoverflow.com%'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+PostInteraction AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.OwnerUserId,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS AvgPostScore,
+        LAG(p.CreationDate, 1, p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostDate
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (2, 3)
+    WHERE p.PostTypeId = 1 -- Questions only
+      AND p.CreationDate BETWEEN DATE '2023-01-01' AND DATE '2023-12-31'
+    GROUP BY p.Id, p.Title, p.OwnerUserId, p.CreationDate
+),
+UserPostMetrics AS (
+    SELECT
+        rua.UserId,
+        rua.DisplayName,
+        rua.Reputation,
+        rua.ReputationRank,
+        rua.DailyReputationRank,
+        COUNT(pi.PostId) AS TotalQuestions,
+        SUM(pi.UpVoteCount) AS TotalUpVotesReceived,
+        SUM(pi.DownVoteCount) AS TotalDownVotesReceived,
+        AVG(pi.AvgPostScore) AS AverageQuestionScore,
+        MAX(pi.CreationDate) AS LastQuestionDate,
+        MIN(pi.CreationDate) AS FirstQuestionDate,
+        MAX(CASE WHEN pi.PreviousPostDate IS NOT NULL THEN pi.CreationDate - pi.PreviousPostDate ELSE INTERVAL '0 days' END) AS MaxTimeBetweenQuestions
+    FROM RankedUserActivity rua
+    JOIN PostInteraction pi ON rua.UserId = pi.OwnerUserId
+    GROUP BY rua.UserId, rua.DisplayName, rua.Reputation, rua.ReputationRank, rua.DailyReputationRank
+)
+SELECT
+    upm.UserId,
+    upm.DisplayName,
+    upm.Reputation,
+    upm.ReputationRank,
+    upm.DailyReputationRank,
+    upm.TotalQuestions,
+    upm.TotalUpVotesReceived,
+    upm.TotalDownVotesReceived,
+    upm.AverageQuestionScore,
+    upm.LastQuestionDate,
+    upm.FirstQuestionDate,
+    upm.MaxTimeBetweenQuestions,
+    CASE
+        WHEN upm.TotalUpVotesReceived > upm.TotalDownVotesReceived * 2 THEN 'High Engagement'
+        WHEN upm.AverageQuestionScore > 10 THEN 'Highly Rated'
+        WHEN upm.TotalQuestions > 100 THEN 'Prolific'
+        ELSE 'Standard User'
+    END AS UserCategory,
+    CASE
+        WHEN EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = upm.UserId AND b.Name LIKE '%Guru%' AND b.Class = 1) THEN 'Gold Guru'
+        WHEN EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = upm.UserId AND b.Name LIKE '%Expert%' AND b.Class = 2) THEN 'Silver Expert'
+        ELSE 'No Special Badge'
+    END AS BadgeStatus
+FROM UserPostMetrics upm
+WHERE upm.Reputation > 1000
+ORDER BY upm.Reputation DESC, upm.UserId
+LIMIT 100;

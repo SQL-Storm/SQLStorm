@@ -1,0 +1,142 @@
+-- {"query": "7867.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1511} 
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+    COALESCE(SUM(p.Score), 0) AS TotalScore,
+    COALESCE(SUM(p.ViewCount), 0) AS TotalViews,
+    COUNT(DISTINCT b.Id) AS BadgesReceived,
+    COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+    (SELECT COUNT(*) 
+     FROM Posts p2 
+     WHERE p2.OwnerUserId = u.Id 
+     AND p2.PostTypeId = 1 
+     AND p2.ClosedDate IS NOT NULL) AS ClosedQuestions,
+    (SELECT COUNT(*) 
+     FROM Posts p3 
+     WHERE p3.OwnerUserId = u.Id 
+     AND p3.PostTypeId = 2 
+     AND p3.Score > 0) AS ValuableAnswers,
+    (SELECT AVG(p4.Score) 
+     FROM Posts p4 
+     WHERE p4.OwnerUserId = u.Id 
+     AND p4.PostTypeId = 1) AS AvgQuestionScore,
+    (SELECT AVG(p5.Score) 
+     FROM Posts p5 
+     WHERE p5.OwnerUserId = u.Id 
+     AND p5.PostTypeId = 2) AS AvgAnswerScore,
+    (SELECT COUNT(DISTINCT ph.PostId) 
+     FROM PostHistory ph 
+     WHERE ph.UserId = u.Id 
+     AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)) AS EditActivity,
+    (SELECT COUNT(*) 
+     FROM Comments c 
+     WHERE c.UserId = u.Id 
+     AND c.Score > 0) AS PositiveComments,
+    (SELECT MAX(c.CreationDate) 
+     FROM Comments c 
+     WHERE c.UserId = u.Id) AS LastCommentDate,
+    (SELECT MAX(p6.LastActivityDate) 
+     FROM Posts p6 
+     WHERE p6.OwnerUserId = u.Id) AS LastActivityDate,
+    CASE 
+        WHEN u.Reputation >= 10000 THEN 'Master'
+        WHEN u.Reputation >= 1000 THEN 'Expert'
+        WHEN u.Reputation >= 100 THEN 'Novice'
+        ELSE 'Newbie'
+    END AS ReputationLevel,
+    COALESCE(
+        (SELECT STRING_AGG(t.TagName, ', ')
+         FROM Posts p7
+         JOIN (
+             SELECT PostId, UNNEST(STRING_TO_ARRAY(REPLACE(REPLACE(Tags, '<', ''), '>', ''), '<')) AS TagName
+             FROM Posts 
+             WHERE OwnerUserId = u.Id AND PostTypeId = 1
+         ) t ON p7.Id = t.PostId
+         WHERE p7.OwnerUserId = u.Id AND p7.PostTypeId = 1
+         GROUP BY p7.OwnerUserId
+         ORDER BY COUNT(*) DESC
+         LIMIT 5), 'No tags') AS TopTags,
+    ROW_NUMBER() OVER(ORDER BY COALESCE(SUM(p.Score), 0) DESC) AS RankByScore,
+    DENSE_RANK() OVER(ORDER BY u.Reputation DESC) AS RankByReputation,
+    (SELECT COUNT(*) 
+     FROM Votes v 
+     WHERE v.UserId = u.Id 
+     AND v.VoteTypeId IN (2, 3)) AS VoteActivity,
+    (SELECT COUNT(DISTINCT v2.PostId) 
+     FROM Votes v2 
+     WHERE v2.UserId = u.Id 
+     AND v2.VoteTypeId = 5) AS FavoritePosts,
+    COALESCE(
+        (SELECT AVG(v3.CreationDate - ph2.CreationDate)
+         FROM Votes v3
+         JOIN PostHistory ph2 ON ph2.PostId = v3.PostId AND ph2.UserId = v3.UserId
+         WHERE v3.UserId = u.Id 
+         AND v3.VoteTypeId IN (2, 3)), 0) AS AvgDaysBetweenVotesAndEdits,
+    (SELECT COUNT(DISTINCT pl.PostId) 
+     FROM PostLinks pl 
+     JOIN Posts p8 ON p8.Id = pl.PostId 
+     WHERE p8.OwnerUserId = u.Id 
+     AND pl.LinkTypeId = 1) AS LinkedPosts,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p9 
+        WHERE p9.OwnerUserId = u.Id 
+        AND p9.CreationDate >= '2020-01-01' 
+        AND p9.CreationDate < '2021-01-01'
+    ) AS PostsIn2020,
+    NULLIF(
+        (SELECT COUNT(DISTINCT ph3.PostId) 
+         FROM PostHistory ph3 
+         WHERE ph3.UserId = u.Id 
+         AND ph3.PostHistoryTypeId = 10), 
+        0
+    ) AS CloseVotes,
+    NULLIF(
+        (SELECT COUNT(DISTINCT ph4.PostId) 
+         FROM PostHistory ph4 
+         WHERE ph4.UserId = u.Id 
+         AND ph4.PostHistoryTypeId = 11), 
+        0
+    ) AS ReopenVotes,
+    (
+        SELECT COUNT(DISTINCT p10.Id) 
+        FROM Posts p10 
+        WHERE p10.OwnerUserId = u.Id 
+        AND p10.PostTypeId = 1 
+        AND EXISTS (
+            SELECT 1 
+            FROM PostHistory ph5 
+            WHERE ph5.PostId = p10.Id 
+            AND ph5.PostHistoryTypeId = 10
+        )
+    ) AS QuestionsWithCloseVotes,
+    (
+        SELECT COUNT(DISTINCT p11.Id) 
+        FROM Posts p11 
+        WHERE p11.OwnerUserId = u.Id 
+        AND p11.PostTypeId = 2 
+        AND EXISTS (
+            SELECT 1 
+            FROM PostHistory ph6 
+            WHERE ph6.PostId = p11.Id 
+            AND ph6.PostHistoryTypeId = 10
+        )
+    ) AS AnswersWithCloseVotes
+FROM Users u
+LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+LEFT JOIN Badges b ON b.UserId = u.Id
+WHERE u.Reputation > 0
+  AND u.CreationDate >= '2010-01-01'
+  AND (u.AccountId IS NULL OR u.AccountId > 0)
+GROUP BY u.Id, u.DisplayName, u.Reputation
+HAVING COUNT(DISTINCT p.Id) >= 1
+   AND (COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 0 
+        OR COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) > 0)
+ORDER BY COALESCE(SUM(p.Score), 0) DESC, COUNT(DISTINCT p.Id) DESC
+LIMIT 10000;

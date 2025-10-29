@@ -1,0 +1,175 @@
+-- {"query": "1361.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2440} 
+WITH UserEngagementMetrics AS (
+    -- CTE 1: Calculates various engagement and activity metrics for each user.
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.DisplayName,
+        u.Views AS UserProfileViews,
+        u.UpVotes AS UserUpVotesGiven,
+        u.DownVotes AS UserDownVotesGiven,
+        COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsOwned,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersOwned,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScoreReceived,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        COALESCE(SUM(c.Score), 0) AS TotalCommentScoreReceived,
+        MAX(p.LastActivityDate) AS LatestPostActivityDate,
+        MAX(c.CreationDate) AS LatestCommentDate,
+        -- A complex derived activity score, incorporating several user attributes.
+        (u.Reputation * 0.15 + u.UpVotes - u.DownVotes + COUNT(DISTINCT p.Id) * 3 + COUNT(DISTINCT c.Id) * 1.5) AS DerivedUserActivityScore,
+        -- Calculate the proportion of upvotes to downvotes, handling division by zero.
+        NULLIF(u.UpVotes, 0) * 1.0 / NULLIF(u.DownVotes, 0) AS UpvoteDownvoteRatio
+    FROM
+        Users AS u
+    LEFT JOIN
+        Posts AS p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Comments AS c ON u.Id = c.UserId
+    GROUP BY
+        u.Id, u.Reputation, u.CreationDate, u.DisplayName, u.Views, u.UpVotes, u.DownVotes
+),
+PostDetailStats AS (
+    -- CTE 2: Gathers detailed statistics for posts, including cross-references and complex post state logic.
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.Body AS PostBodyExcerpt, -- Only using this for potential string analysis, not full text.
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.LastActivityDate,
+        p.LastEditDate,
+        COALESCE(p.AcceptedAnswerId, -1) AS AcceptedAnswerPostId, -- Using -1 as a sentinel for no accepted answer.
+        -- Count linked posts (LinkTypeId = 1) and duplicate posts (LinkTypeId = 3) using correlated subqueries.
+        (SELECT COUNT(pl_linked.Id) FROM PostLinks AS pl_linked WHERE pl_linked.PostId = p.Id AND pl_linked.LinkTypeId = 1) AS CountLinkedPosts,
+        (SELECT COUNT(pl_dup.Id) FROM PostLinks AS pl_dup WHERE pl_dup.PostId = p.Id AND pl_dup.LinkTypeId = 3) AS CountDuplicateLinks,
+        -- Complex CASE statement to determine the PostLifecycleStatus.
+        CASE
+            WHEN p.ClosedDate IS NOT NULL AND EXISTS (SELECT 1 FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId = 10 AND ph.Comment = '101') THEN 'Closed_Duplicate'
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed_OtherReason'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'CommunityOwned'
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Question_AcceptedAnswer'
+            WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN 'Question_Answered'
+            WHEN p.PostTypeId = 1 AND p.AnswerCount = 0 THEN 'Question_Unanswered'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'OtherPostType'
+        END AS PostLifecycleStatus,
+        -- Window function: Rank posts by score within their post type.
+        DENSE_RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.CreationDate DESC) AS PostScoreRankByPostType,
+        -- String expression: Extract the first tag (if available), case-insensitive search for 'sql' in tags.
+        LOWER(SPLIT_PART(REPLACE(REPLACE(p.Tags, '><', '|'), '<', ''), '|', 1)) AS PrimaryTag,
+        CASE WHEN p.Tags LIKE '%<sql>%' OR p.Tags LIKE '%<SQL>%' THEN TRUE ELSE FALSE END AS ContainsSqlTag
+    FROM
+        Posts AS p
+    WHERE
+        p.PostTypeId IN (1, 2) -- Focus on Questions and Answers.
+        AND p.DeletionDate IS NULL -- Assuming a soft delete flag might exist, or filtering implicitly for non-deleted.
+),
+BadgeAchievementInfo AS (
+    -- CTE 3: Gathers information about user badge achievements, focusing on recent or significant badges.
+    SELECT
+        b.UserId,
+        b.Name AS BadgeName,
+        b.Date AS BadgeAwardDate,
+        b.Class AS BadgeClass,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC) AS rn,
+        COUNT(b.Id) OVER (PARTITION BY b.UserId) AS TotalBadgesForUser
+    FROM
+        Badges AS b
+    WHERE
+        b.Class IN (1, 2) -- Gold or Silver badges.
+        AND b.Date >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year') -- Awarded within the last year.
+),
+FrequentCommenters AS (
+    -- CTE 4: Identifies users who frequently comment, using a set operator to combine with specific user groups.
+    SELECT ue.UserId, ue.DisplayName, 'FrequentCommenter' AS UserTypeFlag
+    FROM UserEngagementMetrics ue
+    WHERE ue.TotalCommentsMade > (SELECT AVG(ue2.TotalCommentsMade) * 2 FROM UserEngagementMetrics ue2) -- More than double average comments
+    AND ue.Reputation > 500
+
+    UNION ALL -- Using UNION ALL to include all users from both conditions without de-duplication
+
+    SELECT u.Id AS UserId, u.DisplayName, 'HighReputationUser' AS UserTypeFlag
+    FROM Users u
+    WHERE u.Reputation > 10000
+)
+SELECT
+    uem.UserId,
+    uem.DisplayName,
+    uem.Reputation,
+    uem.UserCreationDate,
+    pds.PostId,
+    pds.Title,
+    pds.PostScore,
+    pds.ViewCount,
+    pds.PostLifecycleStatus,
+    pds.PostCreationDate,
+    uem.TotalPostsOwned,
+    uem.TotalCommentsMade,
+    pds.PrimaryTag,
+    pds.ContainsSqlTag,
+    bai.BadgeName AS RecentSignificantBadge,
+    bai.BadgeAwardDate,
+    bai.TotalBadgesForUser,
+    fc.UserTypeFlag AS UserCategorization,
+    -- Correlated subquery: Find the creation date of the accepted answer for a question.
+    (
+        SELECT
+            pa.CreationDate
+        FROM
+            Posts AS pa
+        WHERE
+            pa.Id = pds.AcceptedAnswerPostId AND pds.AcceptedAnswerPostId != -1
+    ) AS AcceptedAnswerCreationDate,
+    -- Window function: Calculate the average score of all questions from the same primary tag.
+    AVG(CASE WHEN pds.PostTypeId = 1 THEN pds.PostScore END) OVER (PARTITION BY pds.PrimaryTag) AS AvgQuestionScoreForPrimaryTag,
+    -- Complicated expression involving NULL checks and calculations for content quality metric.
+    COALESCE(
+        NULLIF(pds.FavoriteCount, 0) * 0.5 +
+        NULLIF(pds.AnswerCount, 0) * 2.0 +
+        (pds.PostScore * 1.0 / NULLIF(pds.ViewCount, 0)) * 100,
+        0.0
+    ) AS ContentQualityMetric,
+    -- Date difference: Days since last edit, using COALESCE for non-edited posts.
+    DATE_PART('day', cast('2024-10-01 12:34:56' as timestamp) - COALESCE(pds.LastEditDate, pds.PostCreationDate)) AS DaysSinceLastEditOrCreation,
+    -- NULL logic: Check if a user has never edited a post.
+    CASE WHEN pds.LastEditDate IS NULL AND pds.OwnerUserId IS NOT NULL THEN 'NeverEditedByOwner' ELSE 'EditedByOwnerOrOther' END AS EditStatusByOwner,
+    -- String function: Length of the post title.
+    LENGTH(pds.Title) AS TitleLength
+FROM
+    UserEngagementMetrics AS uem
+INNER JOIN
+    PostDetailStats AS pds ON uem.UserId = pds.OwnerUserId
+LEFT JOIN LATERAL (
+    -- Lateral join to find the most recent Gold/Silver badge for a user within the last year.
+    SELECT bai_inner.BadgeName, bai_inner.BadgeAwardDate, bai_inner.TotalBadgesForUser
+    FROM BadgeAchievementInfo AS bai_inner
+    WHERE bai_inner.UserId = uem.UserId AND bai_inner.rn = 1
+) AS bai ON TRUE
+LEFT JOIN
+    FrequentCommenters AS fc ON uem.UserId = fc.UserId
+WHERE
+    uem.Reputation >= 500 -- Minimum reputation filter.
+    AND pds.PostScore > 0 -- Only positive scored posts.
+    AND pds.ViewCount > 100 -- Only popular posts by view count.
+    AND pds.PostScoreRankByPostType <= 50 -- Top 50 posts by score within their type.
+    -- Correlated subquery in WHERE clause: Check for posts that have at least one comment by a high-reputation user.
+    AND EXISTS (
+        SELECT 1
+        FROM Comments AS c_high_rep
+        INNER JOIN Users AS u_high_rep ON c_high_rep.UserId = u_high_rep.Id
+        WHERE c_high_rep.PostId = pds.PostId AND u_high_rep.Reputation > 5000 AND c_high_rep.Score >= 1
+    )
+ORDER BY
+    uem.DerivedUserActivityScore DESC,
+    pds.PostCreationDate DESC,
+    ContentQualityMetric DESC
+LIMIT 1000;

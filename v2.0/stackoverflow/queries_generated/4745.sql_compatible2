@@ -1,0 +1,191 @@
+WITH
+  RankedQuestions AS (
+    SELECT
+      p.Id AS QuestionId,
+      p.OwnerUserId,
+      p.Title,
+      p.CreationDate,
+      p.Score,
+      p.AnswerCount,
+      p.FavoriteCount,
+      ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts AS p
+    WHERE
+      p.PostTypeId = 1
+      AND p.OwnerUserId IS NOT NULL
+  ),
+  UserContributions AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate AS UserCreationDate,
+      COALESCE(COUNT(DISTINCT ph.Id), 0) AS PostHistoryCount,
+      COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS TotalUpVotes,
+      COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS TotalDownVotes,
+      COALESCE(SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END), 0) AS GoldBadges,
+      COALESCE(SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END), 0) AS SilverBadges,
+      COALESCE(SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END), 0) AS BronzeBadges
+    FROM Users AS u
+    LEFT JOIN PostHistory AS ph
+      ON u.Id = ph.UserId
+    LEFT JOIN Votes AS v
+      ON u.Id = v.UserId
+    LEFT JOIN Badges AS b
+      ON u.Id = b.UserId
+    WHERE
+      u.DisplayName IS NOT NULL
+      AND u.DisplayName NOT LIKE '%[^a-zA-Z0-9 ]%'
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate
+  ),
+  HighReputationUsers AS (
+    SELECT
+      UserId
+    FROM UserContributions
+    WHERE
+      Reputation > 10000
+  ),
+  RecentHotQuestions AS (
+    SELECT
+      ph.PostId,
+      ph.CreationDate AS HotDate
+    FROM PostHistory AS ph
+    WHERE
+      ph.PostHistoryTypeId = 52 -- SelectedHotQuestion
+      AND ph.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '30' DAY
+  ),
+  FrequentTagUsers AS (
+    SELECT
+      p.OwnerUserId,
+      t.TagName,
+      COUNT(*) AS TagCount
+    FROM Posts AS p
+    JOIN Tags AS t
+      ON LOWER(t.TagName) = LOWER(
+        -- Extract first tag from the Tags field which is in format '<tag1><tag2>'
+        -- Use standard string functions instead of set-returning regexp_matches
+        COALESCE(
+          NULLIF(
+            -- remove leading '<' if present, then take up to the first '>' occurrence
+            CASE
+              WHEN p.Tags LIKE '<%>' THEN
+                SUBSTRING(p.Tags FROM 2 FOR (POSITION('>' IN p.Tags) - 2 + 1) )
+              ELSE
+                p.Tags
+            END,
+            ''
+          ),
+          ''
+        )
+      )
+    WHERE
+      p.PostTypeId = 1
+      AND p.Tags IS NOT NULL
+      AND p.OwnerUserId IS NOT NULL
+    GROUP BY
+      p.OwnerUserId,
+      t.TagName
+    HAVING
+      COUNT(*) > 5
+  )
+SELECT
+  rq.QuestionId,
+  rq.Title AS QuestionTitle,
+  u.DisplayName AS OwnerDisplayName,
+  u.Reputation AS OwnerReputation,
+  rq.CreationDate AS QuestionCreationDate,
+  rq.Score AS QuestionScore,
+  rq.AnswerCount AS QuestionAnswerCount,
+  rq.FavoriteCount AS QuestionFavoriteCount,
+  COALESCE(
+    (
+      SELECT
+        COUNT(*)
+      FROM Comments AS c
+      WHERE
+        c.PostId = rq.QuestionId
+        AND c.UserId = rq.OwnerUserId
+    ),
+    0
+  ) AS OwnerCommentsOnOwnQuestion,
+  COALESCE(
+    (
+      SELECT
+        COUNT(*)
+      FROM PostLinks AS pl
+      WHERE
+        pl.PostId = rq.QuestionId
+        AND pl.LinkTypeId = 3
+    ),
+    0
+  ) AS DuplicateLinks,
+  CASE
+    WHEN rq.Score > 50 THEN 'High Score'
+    WHEN rq.AnswerCount > 10 THEN 'High Answer Count'
+    ELSE 'Standard'
+  END AS QuestionCategory,
+  CASE
+    WHEN u.GoldBadges > 0 THEN 'Has Gold Badge'
+    WHEN u.SilverBadges > 0 THEN 'Has Silver Badge'
+    ELSE 'No High-Tier Badges'
+  END AS OwnerBadgeStatus,
+  CASE
+    WHEN EXISTS (
+      SELECT
+        1
+      FROM RecentHotQuestions AS rhq
+      WHERE
+        rhq.PostId = rq.QuestionId
+    ) THEN 'Was Hot'
+    ELSE 'Not Recently Hot'
+  END AS HotStatus,
+  CASE
+    WHEN EXISTS (
+      SELECT
+        1
+      FROM FrequentTagUsers AS ftu
+      WHERE
+        ftu.OwnerUserId = rq.OwnerUserId
+        AND ftu.TagCount > 10
+    ) THEN 'Frequent Tagger'
+    ELSE 'Not Frequent Tagger'
+  END AS TaggerProfile,
+  CASE
+    WHEN u.Reputation > (
+      SELECT
+        AVG(Reputation)
+      FROM UserContributions
+    ) THEN 'Above Average Reputation'
+    ELSE 'Below Average Reputation'
+  END AS ReputationVsAverage,
+  CASE
+    WHEN EXISTS (
+      SELECT
+        1
+      FROM HighReputationUsers AS hru
+      WHERE
+        hru.UserId = rq.OwnerUserId
+    ) THEN 'Elite User'
+    ELSE 'Standard User'
+  END AS UserTier
+FROM RankedQuestions AS rq
+LEFT JOIN UserContributions AS u
+  ON rq.OwnerUserId = u.UserId
+WHERE
+  rq.rn <= 5 -- Considering the 5 most recent questions per user
+  AND rq.Score > 0 -- Only consider questions with some score
+  AND rq.FavoriteCount IS NOT NULL -- Ensure favorite count is not NULL
+  AND u.PostHistoryCount > 10 -- User must have some activity history
+  AND SUBSTRING(u.DisplayName FROM 1 FOR 3) LIKE 'A%' -- Owner display name starts with 'A'
+  AND (
+    u.GoldBadges > 0
+    OR u.SilverBadges > 0
+  ) -- User must have at least one gold or silver badge
+  AND rq.CreationDate BETWEEN DATE '2020-01-01' AND DATE '2023-12-31' -- Filter by creation date range
+ORDER BY
+  rq.Score DESC,
+  rq.FavoriteCount DESC;

@@ -1,0 +1,172 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        MAX(b.Date) as LastBadgeDate,
+        AVG(p.Score) as AvgPostScore,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) as QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) as AnswerCount,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags)-2)), ', ') as AllTags,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN p.Id END) as AcceptedQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL THEN p.Id END) as ClosedQuestions
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+RankedUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        Views,
+        UpVotes,
+        DownVotes,
+        PostCount,
+        CommentCount,
+        BadgeCount,
+        LastPostDate,
+        LastCommentDate,
+        LastBadgeDate,
+        AvgPostScore,
+        QuestionCount,
+        AnswerCount,
+        AllTags,
+        AcceptedQuestions,
+        ClosedQuestions,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, PostCount DESC) as RankByReputation,
+        DENSE_RANK() OVER (ORDER BY AvgPostScore DESC) as RankByAvgScore,
+        NTILE(10) OVER (ORDER BY Reputation) as Quintile,
+        LAG(DisplayName) OVER (ORDER BY Reputation) as PreviousUser,
+        LEAD(DisplayName) OVER (ORDER BY Reputation) as NextUser
+    FROM UserStats
+),
+QuestionStats AS (
+    SELECT 
+        p.Id as QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = p.Id AND a.PostTypeId = 2) as TotalAnswers,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) as Upvotes,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) as Downvotes,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) as CommentCount_Sub,
+        (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (10, 11)) as CloseReopenCount,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+            WHEN p.AnswerCount = 0 THEN 'No Answers'
+            ELSE 'Active'
+        END as Status,
+        ABS(p.Score) as AbsoluteScore,
+        COALESCE(p.AcceptedAnswerId, 0) as HasAcceptedAnswer
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+    AND (p.Score IS NOT NULL OR p.ViewCount IS NOT NULL OR p.AnswerCount IS NOT NULL)
+),
+AnswerStats AS (
+    SELECT 
+        p.Id as AnswerId,
+        p.ParentId as QuestionId,
+        p.Score,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Body,
+        (SELECT u.DisplayName FROM Users u WHERE u.Id = p.OwnerUserId) as OwnerDisplayName,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) as Upvotes,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) as Downvotes,
+        CASE WHEN p.OwnerUserId IS NULL THEN 'Deleted User' ELSE 'Regular User' END as UserStatus,
+        ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) as AnswerRank,
+        COUNT(*) OVER (PARTITION BY p.ParentId) as TotalAnswersPerQuestion
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+    AND p.Score >= 0
+),
+TagAnalysis AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        (SELECT COUNT(*) FROM Posts p WHERE p.Tags LIKE ('%' || '<' || t.TagName || '>' || '%')) as QuestionsWithTag,
+        (SELECT AVG(p.Score) FROM Posts p WHERE p.Tags LIKE ('%' || '<' || t.TagName || '>' || '%')) as AvgScoreForTag,
+        (SELECT MAX(p.CreationDate) FROM Posts p WHERE p.Tags LIKE ('%' || '<' || t.TagName || '>' || '%')) as LastQuestionDate
+    FROM Tags t
+    WHERE t.TagName IS NOT NULL
+    AND t.Count > 0
+)
+SELECT 
+    'User Performance Analysis' as ReportType,
+    COUNT(*) as TotalUsers,
+    COUNT(CASE WHEN ru.RankByReputation <= 10 THEN 1 END) as Top10Users,
+    COUNT(CASE WHEN ru.Quintile = 1 THEN 1 END) as TopQuintileUsers,
+    AVG(ru.Reputation) as AvgReputation,
+    AVG(ru.PostCount) as AvgPostCount,
+    AVG(ru.BadgeCount) as AvgBadgeCount,
+    MAX(ru.LastPostDate) as LatestPostDate,
+    (SELECT COUNT(*) FROM QuestionStats qs WHERE qs.Status = 'Closed') as TotalClosedQuestions,
+    (SELECT COUNT(*) FROM AnswerStats ans WHERE ans.AnswerRank = 1) as TopAnswers,
+    (SELECT COUNT(*) FROM TagAnalysis ta WHERE ta.QuestionsWithTag > 100) as PopularTags
+FROM RankedUsers ru
+WHERE ru.Reputation > 1000
+AND ru.PostCount > 0
+AND ru.BadgeCount > 1
+AND EXISTS (SELECT 1 FROM QuestionStats qs WHERE qs.OwnerUserId = ru.UserId)
+AND EXISTS (SELECT 1 FROM AnswerStats ans WHERE ans.OwnerUserId = ru.UserId)
+
+UNION ALL
+
+SELECT 
+    'Performance Metrics' as ReportType,
+    COUNT(DISTINCT qs.QuestionId) as TotalQuestions,
+    COUNT(CASE WHEN qs.Score > 0 THEN 1 END) as PositiveScoreQuestions,
+    COUNT(CASE WHEN qs.ViewCount > 100 THEN 1 END) as HighViewQuestions,
+    AVG(qs.Score) as AvgQuestionScore,
+    AVG(qs.AnswerCount) as AvgAnswerCount,
+    AVG(qs.CommentCount) as AvgCommentCount,
+    MAX(qs.CreationDate) as LatestQuestionDate,
+    COUNT(CASE WHEN qs.Status = 'Closed' THEN 1 END) as ClosedQuestions,
+    COUNT(CASE WHEN qs.Status = 'Active' THEN 1 END) as ActiveQuestions,
+    (SELECT COUNT(*) FROM AnswerStats ans WHERE ans.AnswerRank = 1) * 100.0 / NULLIF(COUNT(*),0) as TopAnswerPercentage
+FROM QuestionStats qs
+WHERE qs.Score IS NOT NULL
+AND qs.AnswerCount IS NOT NULL
+AND qs.CommentCount IS NOT NULL
+
+UNION ALL
+
+SELECT 
+    'Tag Analysis' as ReportType,
+    COUNT(DISTINCT ta.Id) as TotalTags,
+    COUNT(CASE WHEN ta.Count > 1000 THEN 1 END) as HighPopularityTags,
+    AVG(ta.Count) as AvgTagCount,
+    MAX(ta.Count) as MaxTagCount,
+    AVG(ta.AvgScoreForTag) as AvgScorePerTag,
+    MIN(ta.LastQuestionDate) as EarliestTagQuestion,
+    MAX(ta.LastQuestionDate) as LatestTagQuestion,
+    COUNT(CASE WHEN ta.QuestionsWithTag > 100 THEN 1 END) as VeryPopularTags,
+    COUNT(CASE WHEN ta.QuestionsWithTag BETWEEN 50 AND 100 THEN 1 END) as ModeratelyPopularTags,
+    SUM(CASE WHEN COALESCE(ta.IsRequired,0) = 1 THEN 1 ELSE 0 END) as RequiredTags
+FROM TagAnalysis ta
+WHERE ta.TagName IS NOT NULL
+AND ta.Count > 0
+GROUP BY
+    'Tag Analysis'
+HAVING COUNT(*) > 0
+ORDER BY CASE WHEN ReportType = 'User Performance Analysis' THEN 1 WHEN ReportType = 'Performance Metrics' THEN 2 ELSE 3 END;

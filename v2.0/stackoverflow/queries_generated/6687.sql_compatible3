@@ -1,0 +1,76 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.Title,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.LastActivityDate,
+        U.Id AS OwnerUserId,
+        U.DisplayName AS OwnerDisplayName,
+        U.Reputation,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.ViewCount DESC) AS Rank
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId = 1 AND P.Score > 0 AND P.ViewCount > 100
+),
+BadgeCounts AS (
+    SELECT 
+        U.Id AS UserId,
+        COUNT(DISTINCT B.Id) AS BadgeCount
+    FROM 
+        Users U
+    LEFT JOIN 
+        Badges B ON U.Id = B.UserId
+    GROUP BY 
+        U.Id
+)
+SELECT 
+    RP.Id,
+    RP.Title,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.LastActivityDate,
+    RP.Rank,
+    RP.OwnerDisplayName,
+    U.Reputation,
+    RC.BadgeCount,
+    COALESCE(SUM(V.Score), 0) AS TotalVotes,
+    CASE 
+        WHEN RP.Score > 100 THEN 'High'
+        WHEN RP.Score BETWEEN 50 AND 100 THEN 'Medium'
+        ELSE 'Low'
+    END AS ScoreTier,
+    STRING_AGG(T.TagName, ', ' ORDER BY T.TagName) AS Tags
+FROM 
+    RankedPosts RP
+LEFT JOIN 
+    Users U ON RP.OwnerUserId = U.Id
+LEFT JOIN 
+    BadgeCounts RC ON RC.UserId = U.Id
+LEFT JOIN 
+    Votes V ON RP.Id = V.PostId
+LEFT JOIN 
+    PostTags PT ON RP.Id = PT.PostId
+LEFT JOIN 
+    Tags T ON PT.TagId = T.Id
+WHERE 
+    RP.Rank <= 10
+GROUP BY 
+    RP.Id,
+    RP.Title,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.LastActivityDate,
+    RP.Rank,
+    RP.OwnerDisplayName,
+    U.Reputation,
+    RC.BadgeCount
+ORDER BY 
+    TotalVotes DESC,
+    RP.Score DESC;

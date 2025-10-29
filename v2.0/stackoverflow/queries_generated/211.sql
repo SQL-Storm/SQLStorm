@@ -1,0 +1,316 @@
+-- {"query": "211.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3240} 
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.location,
+        u.creationdate,
+        u.upvotes,
+        u.downvotes,
+        coalesce(nullif(trim(split_part(coalesce(u.websiteurl, ''), '/', 3)), ''), 'unknown') as website_host
+    from users u
+    where u.creationdate >= (select date_trunc('month', max(creationdate)) - interval '24 months' from users)
+),
+user_activity as (
+    select
+        p.owneruserid as user_id,
+        count(*) filter (where p.posttypeid = 1) as q_count,
+        count(*) filter (where p.posttypeid = 2) as a_count,
+        sum(coalesce(p.score, 0)) as total_post_score,
+        sum(coalesce(p.viewcount, 0)) as total_views,
+        max(p.lastactivitydate) as last_post_activity,
+        sum(case when p.closeddate is not null then 1 else 0 end) as closed_count,
+        avg(nullif(p.answercount, 0)) as avg_answercount_nonzero
+    from posts p
+    where p.owneruserid is not null
+    group by p.owneruserid
+),
+vote_summaries as (
+    select
+        v.postid,
+        sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+        sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+        count(*) filter (where v.votetypeid in (8,9)) as bounty_events,
+        sum(coalesce(v.bountyamount,0)) as bounty_amount
+    from votes v
+    group by v.postid
+),
+post_tag_expanded as (
+    select
+        p.id as post_id,
+        lower(t) as tag
+    from posts p
+    cross join lateral unnest(string_to_array(substring(coalesce(p.tags,''), 2, greatest(length(coalesce(p.tags,'')) - 2, 0)), '><')) as t
+    where p.posttypeid = 1
+),
+tag_stats as (
+    select
+        p.owneruserid as user_id,
+        count(*) as tagged_qs,
+        count(distinct lower(trim(pte.tag))) as distinct_tags,
+        max(ts.count) as max_tag_global_count,
+        string_agg(distinct pte.tag, ',' order by pte.tag) as tag_list_sample
+    from posts p
+    join post_tag_expanded pte on pte.post_id = p.id
+    left join tags ts on lower(ts.tagname) = lower(pte.tag)
+    where p.posttypeid = 1
+    group by p.owneruserid
+),
+comment_activity as (
+    select
+        c.userid as user_id,
+        count(*) as comment_count,
+        avg(coalesce(c.score,0)) as avg_comment_score,
+        max(c.creationdate) as last_comment_date,
+        count(*) filter (where c.text ilike '%thanks%') as thanks_comments
+    from comments c
+    where c.userid is not null
+    group by c.userid
+),
+answer_accepts as (
+    select
+        a.owneruserid as user_id,
+        count(*) as accepted_answers
+    from posts q
+    join posts a on a.id = q.acceptedanswerid and a.posttypeid = 2
+    group by a.owneruserid
+),
+post_links_summary as (
+    select
+        p.owneruserid as user_id,
+        count(*) filter (where pl.linktypeid = 3) as dup_links,
+        count(*) filter (where pl.linktypeid = 1) as linked_links
+    from posts p
+    left join postlinks pl on pl.postid = p.id
+    where p.owneruserid is not null
+    group by p.owneruserid
+),
+post_history_flags as (
+    select
+        ph.postid,
+        count(*) filter (where ph.posthistorytypeid in (10,11,12,13,14,15,19,20)) as mod_events,
+        max(ph.creationdate) filter (where ph.posthistorytypeid in (10,11)) as last_close_reopen,
+        max(case when ph.posthistorytypeid = 10 then try_cast(ph.comment as int) end) as last_close_reason_raw
+    from posthistory ph
+    group by ph.postid
+),
+user_post_rollup as (
+    select
+        p.owneruserid as user_id,
+        count(*) as post_count,
+        sum(case when p.posttypeid = 1 then 1 else 0 end) as q_posts,
+        sum(case when p.posttypeid = 2 then 1 else 0 end) as a_posts,
+        sum(case when p.score > 0 then 1 else 0 end) as positive_posts,
+        sum(case when p.score < 0 then 1 else 0 end) as negative_posts,
+        avg(coalesce(p.score,0)) as avg_post_score,
+        percentile_cont(0.9) within group (order by coalesce(p.score,0)) as p90_post_score
+    from posts p
+    where p.owneruserid is not null
+    group by p.owneruserid
+),
+post_vote_enriched as (
+    select
+        p.id,
+        p.owneruserid as user_id,
+        p.posttypeid,
+        p.score,
+        p.viewcount,
+        coalesce(vs.upvotes,0) as v_up,
+        coalesce(vs.downvotes,0) as v_down,
+        coalesce(vs.bounty_amount,0) as bounty_amount,
+        coalesce(ph.mod_events,0) as mod_events,
+        ph.last_close_reopen,
+        case coalesce(ph.last_close_reason_raw,0)
+            when 101 then 'Duplicate'
+            when 102 then 'Off-topic'
+            when 103 then 'Needs details or clarity'
+            when 104 then 'Needs more focus'
+            when 105 then 'Opinion-based'
+            else null
+        end as last_close_reason
+    from posts p
+    left join vote_summaries vs on vs.postid = p.id
+    left join post_history_flags ph on ph.postid = p.id
+    where p.owneruserid is not null
+),
+user_windowed as (
+    select
+        u.user_id,
+        u.displayname,
+        u.reputation,
+        u.location,
+        u.website_host,
+        ua.q_count,
+        ua.a_count,
+        ua.total_post_score,
+        ua.total_views,
+        ua.last_post_activity,
+        pr.post_count,
+        pr.q_posts,
+        pr.a_posts,
+        pr.positive_posts,
+        pr.negative_posts,
+        pr.avg_post_score,
+        pr.p90_post_score,
+        coalesce(ca.comment_count,0) as comment_count,
+        coalesce(ca.avg_comment_score,0) as avg_comment_score,
+        ca.last_comment_date,
+        coalesce(ca.thanks_comments,0) as thanks_comments,
+        coalesce(aa.accepted_answers,0) as accepted_answers,
+        coalesce(ts.tagged_qs,0) as tagged_qs,
+        coalesce(ts.distinct_tags,0) as distinct_tags,
+        ts.tag_list_sample,
+        pls.dup_links,
+        pls.linked_links,
+        row_number() over (partition by coalesce(u.location, 'unknown') order by u.reputation desc, u.user_id) as rn_by_location,
+        dense_rank() over (order by coalesce(ua.total_post_score,0) desc) as dr_by_total_score
+    from recent_users u
+    left join user_activity ua on ua.user_id = u.user_id
+    left join user_post_rollup pr on pr.user_id = u.user_id
+    left join comment_activity ca on ca.user_id = u.user_id
+    left join answer_accepts aa on aa.user_id = u.user_id
+    left join tag_stats ts on ts.user_id = u.user_id
+    left join post_links_summary pls on pls.user_id = u.user_id
+),
+user_quality as (
+    select
+        uw.*,
+        case
+            when coalesce(uw.q_count,0) + coalesce(uw.a_count,0) = 0 then null
+            else round((coalesce(uw.total_post_score,0)::numeric) / nullif(coalesce(uw.q_count,0) + coalesce(uw.a_count,0),0), 2)
+        end as avg_score_per_post,
+        case
+            when coalesce(uw.a_count,0) = 0 then null
+            else round((coalesce(uw.accepted_answers,0)::numeric) / nullif(uw.a_count,0), 4)
+        end as accept_rate,
+        case
+            when coalesce(uw.total_views,0) = 0 then null
+            else round((coalesce(uw.total_post_score,0)::numeric) / nullif(uw.total_views,0), 6)
+        end as score_per_view,
+        case
+            when coalesce(uw.negative_posts,0) = 0 then 1.0
+            else round(least(5.0, greatest(0.1, (coalesce(uw.positive_posts,0)::numeric) / nullif(uw.negative_posts,0))), 4)
+        end as positivity_ratio_capped
+    from user_windowed uw
+),
+heavy_posts as (
+    select
+        pve.user_id,
+        count(*) filter (where pve.viewcount >= 1000) as hv_posts,
+        sum(pve.bounty_amount) as total_bounty_earned,
+        max(pve.mod_events) as max_mod_events_on_post,
+        count(*) filter (where pve.last_close_reason is not null) as closed_posts_recent_reasoned,
+        max(pve.last_close_reopen) as last_close_or_reopen_dt
+    from post_vote_enriched pve
+    group by pve.user_id
+),
+ranked_sites as (
+    select
+        website_host,
+        count(distinct user_id) as users_on_host,
+        avg(reputation) as avg_rep_on_host,
+        rank() over (order by count(distinct user_id) desc, avg(reputation) desc) as rk_host_popularity
+    from recent_users
+    group by website_host
+),
+final_users as (
+    select
+        uq.*,
+        hp.hv_posts,
+        hp.total_bounty_earned,
+        hp.max_mod_events_on_post,
+        hp.closed_posts_recent_reasoned,
+        hp.last_close_or_reopen_dt,
+        rs.users_on_host,
+        rs.avg_rep_on_host,
+        rs.rk_host_popularity
+    from user_quality uq
+    left join heavy_posts hp on hp.user_id = uq.user_id
+    left join ranked_sites rs on rs.website_host = uq.website_host
+),
+anomalies as (
+    select
+        fu.user_id,
+        case
+            when fu.avg_score_per_post is null and fu.post_count > 0 then 'NULL avg with posts'
+            when fu.accept_rate > 1 then 'accept_rate > 1'
+            when fu.score_per_view < 0 then 'negative score_per_view'
+            when fu.positivity_ratio_capped < 0.1 then 'low positivity'
+            else null
+        end as anomaly_reason
+    from final_users fu
+),
+top_tags as (
+    select
+        p.owneruserid as user_id,
+        lower(pte.tag) as tag,
+        count(*) as cnt,
+        row_number() over (partition by p.owneruserid order by count(*) desc, lower(pte.tag)) as rn
+    from posts p
+    join post_tag_expanded pte on pte.post_id = p.id
+    group by p.owneruserid, lower(pte.tag)
+)
+select
+    fu.user_id,
+    coalesce(fu.displayname, concat('user-', fu.user_id::varchar)) as displayname,
+    fu.reputation,
+    coalesce(nullif(fu.location, ''), 'unknown') as location,
+    fu.website_host,
+    fu.post_count,
+    fu.q_posts,
+    fu.a_posts,
+    fu.accepted_answers,
+    fu.avg_post_score,
+    fu.p90_post_score,
+    fu.avg_score_per_post,
+    fu.accept_rate,
+    fu.total_post_score,
+    fu.total_views,
+    fu.score_per_view,
+    fu.positive_posts,
+    fu.negative_posts,
+    fu.positivity_ratio_capped,
+    fu.comment_count,
+    fu.avg_comment_score,
+    fu.last_post_activity,
+    fu.last_comment_date,
+    fu.tagged_qs,
+    fu.distinct_tags,
+    left(coalesce(fu.tag_list_sample,''), 120) as tag_list_sample,
+    coalesce(tt1.tag, '(none)') as top_tag_1,
+    tt1.cnt as top_tag_1_cnt,
+    coalesce(tt2.tag, '(none)') as top_tag_2,
+    tt2.cnt as top_tag_2_cnt,
+    fu.dup_links,
+    fu.linked_links,
+    fu.hv_posts,
+    fu.total_bounty_earned,
+    fu.max_mod_events_on_post,
+    fu.closed_posts_recent_reasoned,
+    fu.last_close_or_reopen_dt,
+    fu.users_on_host,
+    fu.avg_rep_on_host,
+    fu.rk_host_popularity,
+    fu.rn_by_location,
+    fu.dr_by_total_score,
+    count(a.anomaly_reason) filter (where a.anomaly_reason is not null) as anomaly_count,
+    string_agg(distinct a.anomaly_reason, '; ') filter (where a.anomaly_reason is not null) as anomalies
+from final_users fu
+left join top_tags tt1 on tt1.user_id = fu.user_id and tt1.rn = 1
+left join top_tags tt2 on tt2.user_id = fu.user_id and tt2.rn = 2
+left join anomalies a on a.user_id = fu.user_id
+where coalesce(fu.q_posts,0) + coalesce(fu.a_posts,0) > 0
+  and (fu.reputation > 1000 or fu.accept_rate is not null or fu.avg_score_per_post is not null)
+group by
+    fu.user_id, fu.displayname, fu.reputation, fu.location, fu.website_host,
+    fu.post_count, fu.q_posts, fu.a_posts, fu.accepted_answers, fu.avg_post_score, fu.p90_post_score,
+    fu.avg_score_per_post, fu.accept_rate, fu.total_post_score, fu.total_views, fu.score_per_view,
+    fu.positive_posts, fu.negative_posts, fu.positivity_ratio_capped, fu.comment_count, fu.avg_comment_score,
+    fu.last_post_activity, fu.last_comment_date, fu.tagged_qs, fu.distinct_tags, fu.tag_list_sample,
+    tt1.tag, tt1.cnt, tt2.tag, tt2.cnt, fu.dup_links, fu.linked_links, fu.hv_posts, fu.total_bounty_earned,
+    fu.max_mod_events_on_post, fu.closed_posts_recent_reasoned, fu.last_close_or_reopen_dt,
+    fu.users_on_host, fu.avg_rep_on_host, fu.rk_host_popularity, fu.rn_by_location, fu.dr_by_total_score
+having coalesce(sum(fu.total_post_score),0) is not null
+order by fu.dr_by_total_score, fu.rn_by_location
+limit 500;

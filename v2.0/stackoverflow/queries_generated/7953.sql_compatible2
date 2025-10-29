@@ -1,0 +1,381 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ParentId,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+        LAG(p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_date,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) as score_rank,
+        NTILE(10) OVER (ORDER BY p.Score) as score_decile,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) as user_post_count,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as user_avg_score
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) 
+      AND p.CreationDate >= DATE '2018-01-01'
+),
+UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as total_posts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) as question_count,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) as answer_count,
+        AVG(p.Score) as avg_score,
+        MAX(p.Score) as max_score,
+        COUNT(DISTINCT b.Id) as badge_count,
+        STRING_AGG(DISTINCT b.Name, ', ') as badge_names
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= DATE '2018-01-01'
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes
+),
+PostAnalysis AS (
+    SELECT 
+        rp.Id,
+        rp.PostTypeId,
+        rp.Score,
+        rp.ViewCount,
+        rp.CreationDate,
+        rp.OwnerUserId,
+        rp.Title,
+        rp.Tags,
+        rp.AnswerCount,
+        rp.CommentCount,
+        rp.FavoriteCount,
+        rp.rn,
+        rp.prev_score,
+        rp.prev_date,
+        rp.score_rank,
+        rp.score_decile,
+        rp.user_post_count,
+        rp.user_avg_score,
+        CASE 
+            WHEN rp.Score > rp.user_avg_score THEN 'AboveAvg'
+            WHEN rp.Score < rp.user_avg_score THEN 'BelowAvg'
+            ELSE 'Avg'
+        END as score_comparison,
+        CASE 
+            WHEN rp.Score >= 100 THEN 'High'
+            WHEN rp.Score >= 50 THEN 'Medium'
+            WHEN rp.Score >= 10 THEN 'Low'
+            ELSE 'VeryLow'
+        END as score_category,
+        COALESCE(rp.Tags, '') as processed_tags,
+        CHAR_LENGTH(COALESCE(rp.Tags, '')) as tag_length,
+        CASE 
+            WHEN rp.Tags LIKE '%<javascript>%' THEN 1 
+            WHEN rp.Tags LIKE '%<python>%' THEN 1
+            WHEN rp.Tags LIKE '%<java>%' THEN 1
+            ELSE 0
+        END as has_popular_lang_tag,
+        CAST((EXTRACT(EPOCH FROM (rp.CreationDate - rp.prev_date)) / 86400) AS BIGINT) as days_since_last_post,
+        EXTRACT(YEAR FROM rp.CreationDate) as post_year,
+        EXTRACT(MONTH FROM rp.CreationDate) as post_month
+    FROM RankedPosts rp
+    WHERE rp.rn = 1
+),
+ActivityMetrics AS (
+    SELECT 
+        pa.Id,
+        pa.PostTypeId,
+        pa.Score,
+        pa.ViewCount,
+        pa.CreationDate,
+        pa.OwnerUserId,
+        pa.Title,
+        pa.Tags,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.FavoriteCount,
+        pa.score_rank,
+        pa.score_decile,
+        pa.user_post_count,
+        pa.user_avg_score,
+        pa.score_comparison,
+        pa.score_category,
+        pa.processed_tags,
+        pa.tag_length,
+        pa.has_popular_lang_tag,
+        pa.days_since_last_post,
+        pa.post_year,
+        pa.post_month,
+        CASE 
+            WHEN pa.ViewCount > 1000 THEN 'HighTraffic'
+            WHEN pa.ViewCount > 500 THEN 'MediumTraffic'
+            WHEN pa.ViewCount > 100 THEN 'LowTraffic'
+            ELSE 'VeryLowTraffic'
+        END as traffic_category,
+        CASE 
+            WHEN pa.CommentCount > 10 THEN 'HighlyCommented'
+            WHEN pa.CommentCount > 5 THEN 'ModeratelyCommented'
+            WHEN pa.CommentCount > 0 THEN 'SlightlyCommented'
+            ELSE 'Uncommented'
+        END as comment_category,
+        CASE 
+            WHEN pa.AnswerCount > 10 THEN 'HighlyAnswered'
+            WHEN pa.AnswerCount > 5 THEN 'ModeratelyAnswered'
+            WHEN pa.AnswerCount > 0 THEN 'SlightlyAnswered'
+            ELSE 'Unanswered'
+        END as answer_category,
+        CASE 
+            WHEN pa.FavoriteCount > 20 THEN 'HighlyFavorited'
+            WHEN pa.FavoriteCount > 10 THEN 'ModeratelyFavorited'
+            WHEN pa.FavoriteCount > 0 THEN 'SlightlyFavorited'
+            ELSE 'Unfavorited'
+        END as favorite_category,
+        (pa.Score + COALESCE(pa.AnswerCount, 0) * 2 + pa.CommentCount * 3 + pa.ViewCount / 100.0) as engagement_score,
+        (pa.Score * 1.5 + pa.AnswerCount + pa.CommentCount * 2 + pa.ViewCount / 100.0 + pa.FavoriteCount * 2) as weighted_score,
+        LN(pa.ViewCount + 1) as log_view_count,
+        SQRT(pa.Score + 1) as sqrt_score
+    FROM PostAnalysis pa
+),
+FinalAnalysis AS (
+    SELECT 
+        am.Id,
+        am.PostTypeId,
+        am.Score,
+        am.ViewCount,
+        am.CreationDate,
+        am.OwnerUserId,
+        am.Title,
+        am.Tags,
+        am.AnswerCount,
+        am.CommentCount,
+        am.FavoriteCount,
+        am.score_rank,
+        am.score_decile,
+        am.user_post_count,
+        am.user_avg_score,
+        am.score_comparison,
+        am.score_category,
+        am.processed_tags,
+        am.tag_length,
+        am.has_popular_lang_tag,
+        am.days_since_last_post,
+        am.post_year,
+        am.post_month,
+        am.traffic_category,
+        am.comment_category,
+        am.answer_category,
+        am.favorite_category,
+        am.engagement_score,
+        am.weighted_score,
+        am.log_view_count,
+        am.sqrt_score,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        us.total_posts,
+        us.question_count,
+        us.answer_count,
+        us.avg_score as user_avg_score_final,
+        us.max_score as user_max_score,
+        us.badge_count,
+        us.badge_names,
+        CASE 
+            WHEN am.PostTypeId = 1 AND am.AnswerCount = 0 THEN 'UnansweredQuestion'
+            WHEN am.PostTypeId = 1 AND am.AnswerCount > 0 THEN 'AnsweredQuestion'
+            WHEN am.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as post_type_classification,
+        CASE 
+            WHEN am.Score > 100 AND am.ViewCount > 500 THEN 'HotPost'
+            WHEN am.Score > 50 AND am.ViewCount > 200 THEN 'PopularPost'
+            WHEN am.Score > 10 AND am.ViewCount > 100 THEN 'ModeratePost'
+            ELSE 'LowTrafficPost'
+        END as popularity_category,
+        DENSE_RANK() OVER (ORDER BY am.engagement_score DESC) as engagement_rank,
+        PERCENT_RANK() OVER (ORDER BY am.engagement_score) as engagement_percentile,
+        (am.engagement_score - LAG(am.engagement_score) OVER (ORDER BY am.engagement_score)) as engagement_delta,
+        LAG(am.engagement_score) OVER (ORDER BY am.engagement_score DESC) as prev_engagement_score,
+        COALESCE(am.Title, '') as normalized_title,
+        CHAR_LENGTH(COALESCE(am.Title, '')) as title_length,
+        COALESCE(am.Tags, '') as normalized_tags,
+        CASE 
+            WHEN am.Tags IS NULL OR CHAR_LENGTH(am.Tags) = 0 THEN 0
+            ELSE CHAR_LENGTH(am.Tags) - CHAR_LENGTH(REPLACE(am.Tags, '<', '')) + 1
+        END as tag_count,
+        CASE 
+            WHEN am.PostTypeId = 1 AND am.AnswerCount = 0 THEN 'Unanswered'
+            WHEN am.PostTypeId = 1 AND am.AnswerCount > 0 THEN 'Answered'
+            WHEN am.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as resolution_status
+    FROM ActivityMetrics am
+    JOIN Users u ON am.OwnerUserId = u.Id
+    JOIN UserStats us ON am.OwnerUserId = us.UserId
+),
+CrossAnalysis AS (
+    SELECT 
+        fa.Id,
+        fa.PostTypeId,
+        fa.Score,
+        fa.ViewCount,
+        fa.CreationDate,
+        fa.OwnerUserId,
+        fa.Title,
+        fa.Tags,
+        fa.AnswerCount,
+        fa.CommentCount,
+        fa.FavoriteCount,
+        fa.score_rank,
+        fa.score_decile,
+        fa.user_post_count,
+        fa.user_avg_score,
+        fa.score_comparison,
+        fa.score_category,
+        fa.processed_tags,
+        fa.tag_length,
+        fa.has_popular_lang_tag,
+        fa.days_since_last_post,
+        fa.post_year,
+        fa.post_month,
+        fa.traffic_category,
+        fa.comment_category,
+        fa.answer_category,
+        fa.favorite_category,
+        fa.engagement_score,
+        fa.weighted_score,
+        fa.log_view_count,
+        fa.sqrt_score,
+        fa.Reputation,
+        fa.DisplayName,
+        fa.Views,
+        fa.UpVotes,
+        fa.DownVotes,
+        fa.total_posts,
+        fa.question_count,
+        fa.answer_count,
+        fa.user_avg_score_final,
+        fa.user_max_score,
+        fa.badge_count,
+        fa.badge_names,
+        fa.post_type_classification,
+        fa.popularity_category,
+        fa.engagement_rank,
+        fa.engagement_percentile,
+        fa.engagement_delta,
+        fa.prev_engagement_score,
+        fa.normalized_title,
+        fa.title_length,
+        fa.normalized_tags,
+        fa.tag_count,
+        fa.resolution_status,
+        CASE 
+            WHEN fa.engagement_score > 1000 THEN 'SuperHigh'
+            WHEN fa.engagement_score > 500 THEN 'High'
+            WHEN fa.engagement_score > 200 THEN 'Medium'
+            WHEN fa.engagement_score > 50 THEN 'Low'
+            ELSE 'VeryLow'
+        END as engagement_level,
+        (fa.engagement_score - (SELECT AVG(engagement_score) FROM FinalAnalysis)) as score_deviation_from_avg,
+        CAST((fa.Score * 1.0 / NULLIF(fa.user_max_score, 0)) * 100 AS NUMERIC) as score_percentage_of_max,
+        CASE 
+            WHEN fa.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) 
+                 AND fa.CommentCount > (SELECT AVG(CommentCount) FROM Posts WHERE PostTypeId = 1)
+                 AND fa.AnswerCount > (SELECT AVG(AnswerCount) FROM Posts WHERE PostTypeId = 1) 
+            THEN 'HighQuality'
+            ELSE 'StandardQuality'
+        END as quality_level
+    FROM FinalAnalysis fa
+)
+SELECT 
+    ca.Id,
+    ca.PostTypeId,
+    ca.Score,
+    ca.ViewCount,
+    ca.CreationDate,
+    ca.OwnerUserId,
+    ca.Title,
+    ca.Tags,
+    ca.AnswerCount,
+    ca.CommentCount,
+    ca.FavoriteCount,
+    ca.score_rank,
+    ca.score_decile,
+    ca.user_post_count,
+    ca.user_avg_score,
+    ca.score_comparison,
+    ca.score_category,
+    ca.processed_tags,
+    ca.tag_length,
+    ca.has_popular_lang_tag,
+    ca.days_since_last_post,
+    ca.post_year,
+    ca.post_month,
+    ca.traffic_category,
+    ca.comment_category,
+    ca.answer_category,
+    ca.favorite_category,
+    ca.engagement_score,
+    ca.weighted_score,
+    ca.log_view_count,
+    ca.sqrt_score,
+    ca.Reputation,
+    ca.DisplayName,
+    ca.Views,
+    ca.UpVotes,
+    ca.DownVotes,
+    ca.total_posts,
+    ca.question_count,
+    ca.answer_count,
+    ca.user_avg_score_final,
+    ca.user_max_score,
+    ca.badge_count,
+    ca.badge_names,
+    ca.post_type_classification,
+    ca.popularity_category,
+    ca.engagement_rank,
+    ca.engagement_percentile,
+    ca.engagement_delta,
+    ca.prev_engagement_score,
+    ca.normalized_title,
+    ca.title_length,
+    ca.normalized_tags,
+    ca.tag_count,
+    ca.resolution_status,
+    ca.engagement_level,
+    ca.score_deviation_from_avg,
+    ca.score_percentage_of_max,
+    ca.quality_level,
+    CAST((ca.engagement_score * ca.Reputation / (NULLIF(ca.total_posts, 0) * 1000.0)) AS NUMERIC(10,2)) as reputation_efficiency_rating,
+    CAST(POWER(ca.Score + 1, 2) - ca.ViewCount AS NUMERIC(10,0)) as adjusted_score,
+    (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = ca.OwnerUserId AND p2.CreationDate > ca.CreationDate) as following_posts_count,
+    CASE WHEN EXISTS (SELECT 1 FROM Votes v WHERE v.PostId = ca.Id AND v.VoteTypeId = 2) THEN 'HasUpvote' ELSE 'NoUpvote' END as vote_status,
+    TRIM(UPPER(COALESCE(ca.Title, ''))) as uppercase_title,
+    SUBSTRING(COALESCE(ca.Tags, ''), 2, CHAR_LENGTH(COALESCE(ca.Tags, '')) - 2) as clean_tags,
+    ROW_NUMBER() OVER (PARTITION BY ca.post_year, ca.post_month ORDER BY ca.engagement_score DESC) as monthly_engagement_rank,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = ca.OwnerUserId AND b.Class = 1) as gold_badges_count,
+    CASE 
+        WHEN ca.user_post_count > 100 AND ca.badge_count > 50 THEN 'EliteUser'
+        WHEN ca.user_post_count > 50 AND ca.badge_count > 25 THEN 'VeteranUser'
+        WHEN ca.user_post_count > 10 AND ca.badge_count > 5 THEN 'RegularUser'
+        ELSE 'NewUser'
+    END as user_status_level,
+    COALESCE(ca.prev_engagement_score, 0) as safe_prev_engagement_score,
+    NULLIF(ca.engagement_score, 0) / NULLIF(ca.user_avg_score, 0) as engagement_to_avg_ratio,
+    ROUND(SQRT(ca.Score) + LN(COALESCE(ca.ViewCount, 1) + 1), 2) as complex_score_metric,
+    ROUND((ca.engagement_score / NULLIF(ca.weighted_score, 0)) * 100, 2) as efficiency_percentage
+FROM CrossAnalysis ca
+WHERE ca.engagement_score > 0
+  AND ca.total_posts > 0
+  AND ca.Reputation > 1000
+ORDER BY ca.engagement_score DESC
+LIMIT 1000;

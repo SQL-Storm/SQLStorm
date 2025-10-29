@@ -1,0 +1,212 @@
+WITH UserEngagementSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate AS UserLastAccessDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+        COALESCE(SUM(p.ViewCount), 0) AS TotalPostViews,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COALESCE(SUM(c.Score), 0) AS TotalCommentScore,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        (
+            SELECT MAX(p_inner.Score)
+            FROM Posts p_inner
+            WHERE p_inner.OwnerUserId = u.Id
+        ) AS MaxPostScoreByUser,
+        (
+            SELECT AVG(p_all.Score)
+            FROM Posts p_all
+            WHERE p_all.Score IS NOT NULL
+        ) AS GlobalAveragePostScore,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END) AS AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE NULL END) AS AvgAnswerScore,
+        COUNT(v.Id) FILTER (WHERE vt.Name = 'UpMod') AS TotalUpVotesGiven,
+        COUNT(v.Id) FILTER (WHERE vt.Name = 'DownMod') AS TotalDownVotesGiven,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 5) AS TotalFavoritesMade
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    GROUP BY u.Id, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+PostContentAnalysis AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        p.OwnerUserId,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        CHAR_LENGTH(p.Body) AS BodyLength,
+        CHAR_LENGTH(p.Title) AS TitleLength,
+        (CHAR_LENGTH(LOWER(p.Body)) - CHAR_LENGTH(REPLACE(LOWER(p.Body), 'code', ''))) / NULLIF(CHAR_LENGTH('code'),0) AS CodeKeywordCount,
+        (COALESCE(p.FavoriteCount, 0) + COALESCE(p.AnswerCount, 0)) / NULLIF(p.ViewCount, 0) AS EngagementRatio,
+        RANK() OVER (PARTITION BY p.PostTypeId, p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate ASC) AS RankInUserPostType,
+        AVG(p.Score) OVER (
+            PARTITION BY p.OwnerUserId
+            ORDER BY p.CreationDate
+            RANGE BETWEEN 2592000 PRECEDING AND CURRENT ROW
+        ) AS AvgOwnerScoreLast30Days,
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostScore,
+        CASE
+            WHEN p.Score > 100 AND p.ViewCount > 10000 AND p.AnswerCount > 5 THEN 'Highly Engaged & Voted'
+            WHEN (p.Score BETWEEN 50 AND 100) OR (p.ViewCount BETWEEN 5000 AND 10000) THEN 'Moderately Popular'
+            WHEN p.ClosedDate IS NOT NULL AND p.Score < 0 THEN 'Closed & Unpopular'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Driven'
+            ELSE 'Standard'
+        END AS PostStatusCategory,
+        COALESCE(p.OwnerDisplayName, 'Anonymous') AS ResolvedOwnerDisplayName,
+        CASE
+            WHEN p.Tags IS NOT NULL AND CHAR_LENGTH(p.Tags) > 2 THEN string_to_array(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2), '><')
+            ELSE ARRAY[]::varchar[]
+        END AS TagArray
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+      AND p.CreationDate >= DATE '2020-01-01'
+),
+TagPerformanceMetrics AS (
+    SELECT
+        UPPER(unnest_tag.tag) AS TagName,
+        COUNT(DISTINCT pca.PostId) AS QuestionsWithTag,
+        AVG(pca.PostScore) AS AverageTagQuestionScore,
+        SUM(pca.ViewCount) AS TotalTagViews,
+        MIN(t.Count) AS MinTagUseCount,
+        MAX(t.Count) AS MaxTagUseCount,
+        SUM(CASE WHEN t.IsModeratorOnly THEN 1 ELSE 0 END) AS ModeratorOnlyTagCount,
+        SUM(CASE WHEN t.ExcerptPostId IS NULL THEN 1 ELSE 0 END) AS TagsWithoutExcerpt
+    FROM PostContentAnalysis pca
+    LEFT JOIN LATERAL unnest(pca.TagArray) AS unnest_tag(tag) ON TRUE
+    LEFT JOIN Tags t ON UPPER(unnest_tag.tag) = UPPER(t.TagName)
+    WHERE unnest_tag.tag IS NOT NULL
+    GROUP BY UPPER(unnest_tag.tag)
+    HAVING COUNT(DISTINCT pca.PostId) > 10
+)
+SELECT
+    ues.UserId,
+    ues.Reputation,
+    ues.UserCreationDate,
+    ues.UserLastAccessDate,
+    ues.TotalPosts,
+    ues.QuestionCount,
+    ues.AnswerCount,
+    ues.TotalPostScore,
+    ues.MaxPostScoreByUser,
+    ues.GlobalAveragePostScore,
+    tpm.TagName,
+    tpm.QuestionsWithTag,
+    tpm.AverageTagQuestionScore,
+    tpm.TotalTagViews,
+    pca.PostId,
+    pca.PostTypeId,
+    pca.PostCreationDate,
+    pca.PostScore,
+    pca.ViewCount,
+    pca.EngagementRatio,
+    pca.RankInUserPostType,
+    pca.AvgOwnerScoreLast30Days,
+    pca.PostStatusCategory,
+    ph.CreationDate AS HistoryDate,
+    ph.PostHistoryTypeId,
+    pht.Name AS HistoryTypeName,
+    ph.Comment AS HistoryComment,
+    closereason.Name AS CloseReason,
+    COALESCE(users_editor.DisplayName, 'Unknown Editor') AS LastEditorDisplayName,
+    pl.LinkTypeId,
+    lt.Name AS LinkTypeName,
+    related_post.Title AS RelatedPostTitle,
+    (ues.TotalPostScore * 0.5 + ues.TotalComments * 0.3 + ues.TotalBadges * 0.2) AS WeightedUserActivityScore,
+    TRIM(SUBSTRING(u.AboutMe FROM POSITION('<p>' IN u.AboutMe) + 3 FOR
+                   CASE WHEN POSITION('</p>' IN u.AboutMe) > POSITION('<p>' IN u.AboutMe)
+                        THEN POSITION('</p>' IN u.AboutMe) - (POSITION('<p>' IN u.AboutMe) + 3)
+                        ELSE CHAR_LENGTH(u.AboutMe)
+                   END)) AS AboutMeFirstParagraph,
+    EXTRACT(DAY FROM (u.LastAccessDate - u.CreationDate)) AS DaysSinceCreationToLastAccess,
+    EXISTS (
+        SELECT 1
+        FROM Badges b_sub
+        WHERE b_sub.UserId = ues.UserId
+          AND b_sub.Class = 1
+          AND b_sub.TagBased = TRUE
+    ) AS HasGoldTagBadge
+FROM Users u
+RIGHT JOIN UserEngagementSummary ues ON u.Id = ues.UserId
+LEFT JOIN PostContentAnalysis pca ON u.Id = pca.OwnerUserId
+LEFT JOIN LATERAL unnest(pca.TagArray) AS unnested_tag(tag) ON TRUE
+LEFT JOIN TagPerformanceMetrics tpm ON UPPER(unnested_tag.tag) = tpm.TagName
+LEFT JOIN PostHistory ph ON pca.PostId = ph.PostId
+LEFT JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+LEFT JOIN CloseReasonTypes closereason ON ph.PostHistoryTypeId = 10 AND ph.Comment = CAST(closereason.Id AS varchar)
+LEFT JOIN Users users_editor ON ph.UserId = users_editor.Id
+LEFT JOIN PostLinks pl ON pca.PostId = pl.PostId
+LEFT JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+LEFT JOIN Posts related_post ON pl.RelatedPostId = related_post.Id
+WHERE
+    ues.Reputation > 1000
+    AND pca.PostScore IS NOT NULL AND pca.ViewCount IS NOT NULL
+    AND (
+        (pca.PostTypeId = 1 AND pca.AnswerCount >= 1)
+        OR (pca.PostTypeId = 2 AND pca.PostScore > 5)
+    )
+    AND (
+        ph.PostHistoryTypeId IN (4, 5, 6, 10, 11)
+        OR (ph.PostHistoryTypeId IS NULL AND u.LastAccessDate > u.CreationDate + INTERVAL '1 year')
+    )
+    AND u.AboutMe IS NOT NULL AND CHAR_LENGTH(u.AboutMe) > 50
+    AND u.Location LIKE '%United States%'
+    AND pca.EngagementRatio IS NOT NULL
+    AND pca.EngagementRatio > (
+        SELECT AVG(EngagementRatio) FROM PostContentAnalysis WHERE EngagementRatio IS NOT NULL
+    )
+GROUP BY
+    ues.UserId,
+    ues.Reputation,
+    ues.UserCreationDate,
+    ues.UserLastAccessDate,
+    ues.TotalPosts,
+    ues.QuestionCount,
+    ues.AnswerCount,
+    ues.TotalPostScore,
+    ues.MaxPostScoreByUser,
+    ues.GlobalAveragePostScore,
+    tpm.TagName,
+    tpm.QuestionsWithTag,
+    tpm.AverageTagQuestionScore,
+    tpm.TotalTagViews,
+    pca.PostId,
+    pca.PostTypeId,
+    pca.PostCreationDate,
+    pca.PostScore,
+    pca.ViewCount,
+    pca.EngagementRatio,
+    pca.RankInUserPostType,
+    pca.AvgOwnerScoreLast30Days,
+    pca.PostStatusCategory,
+    ph.CreationDate,
+    ph.PostHistoryTypeId,
+    pht.Name,
+    ph.Comment,
+    closereason.Name,
+    users_editor.DisplayName,
+    pl.LinkTypeId,
+    lt.Name,
+    related_post.Title,
+    u.AboutMe,
+    u.LastAccessDate,
+    u.CreationDate,
+    u.Location,
+    ues.TotalComments,
+    ues.TotalBadges
+ORDER BY
+    WeightedUserActivityScore DESC,
+    tpm.AverageTagQuestionScore DESC,
+    pca.AvgOwnerScoreLast30Days DESC
+LIMIT 500;

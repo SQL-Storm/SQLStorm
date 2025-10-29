@@ -1,0 +1,107 @@
+WITH
+  RankedPostEdits AS (
+    SELECT
+      ph.PostId,
+      ph.UserId,
+      ph.CreationDate AS EditDate,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6)
+  ),
+  UserActivity AS (
+    SELECT
+      p.OwnerUserId,
+      COUNT(DISTINCT p.Id) AS QuestionCount,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+      COUNT(DISTINCT c.Id) AS CommentCount,
+      SUM(CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS AcceptedAnswerCount,
+      MAX(p.CreationDate) AS LastPostDate
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    WHERE p.OwnerUserId IS NOT NULL AND p.OwnerUserId <> -1
+    GROUP BY p.OwnerUserId
+  ),
+  UserEditStats AS (
+    SELECT
+      rpe.UserId,
+      COUNT(DISTINCT rpe.PostId) AS EditedPostCount,
+      AVG(
+        EXTRACT(EPOCH FROM (rpe.EditDate - p.CreationDate)) / 86400.0
+      ) AS AvgDaysToFirstEdit
+    FROM RankedPostEdits rpe
+    JOIN Posts p ON rpe.PostId = p.Id
+    WHERE rpe.rn = 1
+    GROUP BY rpe.UserId
+  ),
+  UserReputationChange AS (
+    SELECT
+      u.Id AS UserId,
+      u.Reputation,
+      LAG(u.Reputation, 1, u.Reputation) OVER (ORDER BY u.CreationDate) AS PreviousReputation,
+      u.UpVotes AS TotalUpVotes,
+      u.DownVotes AS TotalDownVotes
+    FROM Users u
+  )
+SELECT
+  u.Id AS UserId,
+  u.DisplayName,
+  COALESCE(ua.QuestionCount, 0) AS TotalQuestions,
+  COALESCE(ua.AnswerCount, 0) AS TotalAnswers,
+  COALESCE(ua.CommentCount, 0) AS TotalComments,
+  COALESCE(ua.AcceptedAnswerCount, 0) AS AcceptedAnswers,
+  ues.EditedPostCount AS PostsEdited,
+  (ues.EditedPostCount * 100.0 / NULLIF(COALESCE(ua.QuestionCount, 0) + COALESCE(ua.AnswerCount, 0), 0)) AS EditPercentage,
+  CASE
+    WHEN urc.Reputation > urc.PreviousReputation THEN 'Increased'
+    WHEN urc.Reputation < urc.PreviousReputation THEN 'Decreased'
+    ELSE 'Stable'
+  END AS ReputationTrend,
+  urc.TotalUpVotes,
+  urc.TotalDownVotes,
+  CASE
+    WHEN u.WebsiteUrl IS NULL THEN 'No Website'
+    WHEN u.WebsiteUrl LIKE '%stackoverflow.com%' THEN 'Stack Overflow Related'
+    ELSE 'External Website'
+  END AS WebsiteCategory,
+  CASE
+    WHEN u.Location IS NULL OR u.Location = '' THEN 'Unknown'
+    WHEN u.Location LIKE '%USA%' OR u.Location LIKE '%United States%' THEN 'USA'
+    ELSE 'Other'
+  END AS LocationCategory,
+  CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - u.CreationDate)) / 86400.0 AS DOUBLE PRECISION) AS AccountAgeDays,
+  ua.LastPostDate,
+  CASE WHEN EXISTS (
+    SELECT 1 FROM Badges b WHERE b.UserId = u.Id AND b.Name LIKE '%Tagger%'
+  ) THEN 'Yes' ELSE 'No' END AS HasTaggerBadge,
+  CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - u.LastAccessDate)) / 86400.0 AS DOUBLE PRECISION) AS DaysSinceLastAccess,
+  COUNT(DISTINCT p.Id) AS PostsWithAtLeastOneComment,
+  SUM(p.FavoriteCount) AS TotalFavoriteCount,
+  CASE WHEN EXISTS (
+    SELECT 1 FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3
+  ) THEN 'Has Duplicate Link' ELSE 'No Duplicate Link' END AS DuplicateLinkStatus
+FROM Users u
+LEFT JOIN UserActivity ua ON u.Id = ua.OwnerUserId
+LEFT JOIN UserEditStats ues ON u.Id = ues.UserId
+LEFT JOIN UserReputationChange urc ON u.Id = urc.UserId
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+GROUP BY
+  u.Id,
+  u.DisplayName,
+  ua.QuestionCount,
+  ua.AnswerCount,
+  ua.CommentCount,
+  ua.AcceptedAnswerCount,
+  ues.EditedPostCount,
+  urc.Reputation,
+  urc.PreviousReputation,
+  urc.TotalUpVotes,
+  urc.TotalDownVotes,
+  u.WebsiteUrl,
+  u.Location,
+  u.CreationDate,
+  u.LastAccessDate,
+  ua.LastPostDate
+HAVING (COALESCE(ua.QuestionCount, 0) + COALESCE(ua.AnswerCount, 0) + COALESCE(ua.CommentCount, 0)) > 10
+ORDER BY
+  AccountAgeDays DESC,
+  TotalFavoriteCount DESC;

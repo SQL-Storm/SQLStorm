@@ -1,0 +1,327 @@
+with
+q as (
+  select
+    p.id as question_id,
+    p.creationdate as question_creation,
+    p.owneruserid as asker_id,
+    p.score as question_score,
+    p.viewcount as question_views,
+    p.acceptedanswerid,
+    p.title,
+    lower(trim(tg.tag)) as tag
+  from posts p
+  cross join lateral unnest(
+    case
+      when p.posttypeid = 1 and p.tags is not null and length(p.tags) > 2
+      then string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')
+      else array[]::varchar[]  -- keep ANSI array literal casting where supported
+    end
+  ) as tg(tag)
+  where p.posttypeid = 1
+),
+q_tag_agg as (
+  select
+    question_id,
+    count(*) as tag_count,
+    string_agg(tag, '|' order by tag) as tags_concat
+  from q
+  group by question_id
+),
+answers_ranked as (
+  select
+    a.parentid as question_id,
+    a.id as answer_id,
+    a.owneruserid as answerer_id,
+    a.creationdate as answer_creation,
+    a.score as answer_score,
+    row_number() over (partition by a.parentid order by a.creationdate) as rn,
+    dense_rank() over (partition by a.parentid order by a.score desc, a.creationdate) as score_rank,
+    a.lastactivitydate
+  from posts a
+  where a.posttypeid = 2
+),
+first_answer as (
+  select *
+  from answers_ranked
+  where rn = 1
+),
+vote_window as (
+  select
+    v.postid,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+    count(*) as total_votes,
+    min(v.creationdate) as first_vote_at,
+    max(v.creationdate) as last_vote_at
+  from votes v
+  group by v.postid
+),
+comment_activity as (
+  select
+    p.id as post_id,
+    count(c.id) as comments_count,
+    coalesce(sum(greatest(c.score,0)),0) as nonneg_comment_score,
+    min(c.creationdate) as first_comment_at,
+    max(c.creationdate) as last_comment_at
+  from posts p
+  left join comments c
+    on c.postid = p.id
+  group by p.id
+),
+user_badge_stats as (
+  select
+    u.id as user_id,
+    count(b.id) filter (where b.class = 1) as gold_total,
+    count(b.id) filter (where b.class = 2) as silver_total,
+    count(b.id) filter (where b.class = 3) as bronze_total,
+    count(b.id) as badges_total,
+    max(b.date) as last_badge_at
+  from users u
+  left join badges b on b.userid = u.id
+  group by u.id
+),
+dup_info as (
+  select
+    q.id as question_id,
+    bool_or(pl.linktypeid = 3) as has_duplicate_link,
+    count(*) filter (where pl.linktypeid = 3) as duplicate_link_count,
+    count(*) filter (where pl.linktypeid = 1) as linked_count,
+    max(pl.creationdate) as last_link_at,
+    max(case when ph.posthistorytypeid = 10 then 
+        case when ph.comment ~ '^\d+$' then cast(ph.comment as integer) else null end
+      end) as last_close_reason_id,
+    bool_or(ph.posthistorytypeid = 10) as was_closed,
+    max(ph.creationdate) filter (where ph.posthistorytypeid = 10) as closed_at,
+    bool_or(ph.posthistorytypeid = 11) as was_reopened,
+    max(ph.creationdate) filter (where ph.posthistorytypeid = 11) as reopened_at
+  from posts q
+  left join postlinks pl on pl.postid = q.id
+  left join posthistory ph on ph.postid = q.id and ph.posthistorytypeid in (10,11)
+  where q.posttypeid = 1
+  group by q.id
+),
+tag_pop as (
+  select
+    q.question_id,
+    avg(t.count) as avg_tag_count,
+    max(t.count) as max_tag_count,
+    min(t.count) as min_tag_count,
+    sum(case when t.ismoderatoronly then 1 else 0 end) as mod_only_tags,
+    sum(case when t.isrequired then 1 else 0 end) as required_tags
+  from q
+  left join tags t on t.tagname = q.tag
+  group by q.question_id
+),
+question_scoring as (
+  select
+    p.id as question_id,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.answercount,
+    p.favoritecount,
+    p.commentcount,
+    coalesce(p.viewcount,0) * 0.001
+      + coalesce(p.score,0) * 2.5
+      + coalesce(p.answercount,0) * 1.0
+      + coalesce(p.favoritecount,0) * 0.75
+      + coalesce(p.commentcount,0) * 0.25
+      - case when p.closeddate is not null then 5 else 0 end
+      as composite_score,
+    row_number() over (order by
+      coalesce(p.viewcount,0) desc,
+      coalesce(p.score,0) desc,
+      p.creationdate desc,
+      p.id
+    ) as global_rank
+  from posts p
+  where p.posttypeid = 1
+),
+ttfa as (
+  select
+    q.id as question_id,
+    (select min(a.creationdate) from posts a where a.parentid = q.id) as first_answer_at
+  from posts q
+  where q.posttypeid = 1
+),
+outlier_flags as (
+  select
+    qs.question_id,
+    qs.composite_score,
+    avg(qs.composite_score) over () as avg_score,
+    stddev_pop(qs.composite_score) over () as std_score,
+    case when qs.composite_score > avg(qs.composite_score) over () + 2*stddev_pop(qs.composite_score) over ()
+      then 1 else 0 end as is_high_outlier,
+    case when qs.composite_score < avg(qs.composite_score) over () - 2*stddev_pop(qs.composite_score) over ()
+      then 1 else 0 end as is_low_outlier
+  from question_scoring qs
+),
+owner_stats as (
+  select
+    u.id as user_id,
+    u.reputation,
+    u.creationdate as user_created,
+    u.views as profile_views,
+    coalesce(u.upvotes,0) - coalesce(u.downvotes,0) as net_votes,
+    length(coalesce(u.location,'')) as location_len
+  from users u
+),
+acceptance as (
+  select
+    q.id as question_id,
+    q.acceptedanswerid,
+    fa.answer_id,
+    case when q.acceptedanswerid is not null and q.acceptedanswerid = fa.answer_id then 1 else 0 end as first_answer_was_accepted
+  from posts q
+  left join first_answer fa on fa.question_id = q.id
+  where q.posttypeid = 1
+),
+recent_questions as (
+  select id as question_id
+  from posts
+  where posttypeid = 1 and creationdate >= (select max(creationdate) - interval '90 days' from posts)
+),
+high_view_questions as (
+  select id as question_id
+  from posts
+  where posttypeid = 1 and viewcount >= (select percentile_cont(0.9) within group (order by coalesce(viewcount,0)) from posts where posttypeid = 1)
+),
+set_ops as (
+  select rq.question_id, 'RECENT_ONLY' as bucket
+  from recent_questions rq
+  except
+  select hv.question_id, 'RECENT_ONLY' as bucket
+  from high_view_questions hv
+  union all
+  select hv.question_id, 'HIGH_VIEW_ONLY' as bucket
+  from high_view_questions hv
+  except
+  select rq.question_id, 'HIGH_VIEW_ONLY' as bucket
+  from recent_questions rq
+  union all
+  select rq.question_id, 'RECENT_AND_HIGH' as bucket
+  from recent_questions rq
+  intersect
+  select hv.question_id, 'RECENT_AND_HIGH' as bucket
+  from high_view_questions hv
+),
+bucketed_ranks as (
+  select
+    s.question_id,
+    s.bucket,
+    dense_rank() over (partition by s.bucket order by coalesce(qs.composite_score,0) desc, qs.question_id) as bucket_rank
+  from set_ops s
+  left join question_scoring qs on qs.question_id = s.question_id
+),
+final as (
+  select
+    p.id as question_id,
+    p.title,
+    p.creationdate as asked_at,
+    p.viewcount,
+    p.score as q_score,
+    coalesce(p.answercount,0) as answer_count,
+    qta.tag_count,
+    qta.tags_concat,
+    tp.avg_tag_count,
+    tp.max_tag_count,
+    tp.min_tag_count,
+    tp.mod_only_tags,
+    tp.required_tags,
+    fa.answer_id as first_answer_id,
+    fa.answer_creation,
+    fa.answer_score,
+    vwq.upvotes as q_upvotes,
+    vwq.downvotes as q_downvotes,
+    vwa.upvotes as a_upvotes,
+    vwa.downvotes as a_downvotes,
+    ca_q.comments_count as q_comments,
+    ca_a.comments_count as a_comments,
+    us_asker.reputation as asker_rep,
+    us_answerer.reputation as answerer_rep,
+    ub_asker.badges_total as asker_badges,
+    ub_answerer.badges_total as answerer_badges,
+    di.has_duplicate_link,
+    di.duplicate_link_count,
+    di.was_closed,
+    di.was_reopened,
+    di.last_close_reason_id,
+    qs.composite_score,
+    qs.global_rank,
+    ofl.is_high_outlier,
+    ofl.is_low_outlier,
+    tt.first_answer_at,
+    extract(epoch from (fa.answer_creation - p.creationdate)) as secs_to_first_ans,
+    extract(epoch from (tt.first_answer_at - p.creationdate)) as secs_to_first_ans_correlated,
+    ac.first_answer_was_accepted,
+    so.bucket,
+    br.bucket_rank,
+    case
+      when coalesce(p.viewcount,0) >= 100000 and coalesce(p.score,0) >= 50 then 'LEGEND'
+      when di.was_closed and not di.was_reopened then 'CLOSED'
+      when ac.first_answer_was_accepted = 1 then 'FAST_ACCEPT' 
+      when ofl.is_high_outlier = 1 then 'OUTLIER_HIGH'
+      when ofl.is_low_outlier = 1 then 'OUTLIER_LOW'
+      else coalesce(upper(substring(qta.tags_concat, 1, 12)),'MISC')
+    end as bucket_label,
+    coalesce(nullif(trim(p.ownerdisplayname),''), 'user#' || coalesce(cast(p.owneruserid as text),'?')) as asker_display,
+    coalesce(nullif(trim(a.ownerdisplayname),''), 'user#' || coalesce(cast(a.owneruserid as text),'?')) as answerer_display,
+    -- represent meta as a JSON object using standard JSON construction where json_build_object may be unavailable
+    ('{"q_votes":' || coalesce(cast(vwq.total_votes as text),'0') ||
+     ',"a_votes":' || coalesce(cast(vwa.total_votes as text),'0') ||
+     ',"q_first_vote_at":' || coalesce(to_char(vwq.first_vote_at,'YYYY-MM-DD"T"HH24:MI:SS'), 'null') ||
+     ',"a_first_vote_at":' || coalesce(to_char(vwa.first_vote_at,'YYYY-MM-DD"T"HH24:MI:SS'), 'null') ||
+     ',"q_last_vote_at":' || coalesce(to_char(vwq.last_vote_at,'YYYY-MM-DD"T"HH24:MI:SS'), 'null') ||
+     ',"a_last_vote_at":' || coalesce(to_char(vwa.last_vote_at,'YYYY-MM-DD"T"HH24:MI:SS'), 'null') ||
+     ',"q_first_comment_at":' || coalesce(to_char(ca_q.first_comment_at,'YYYY-MM-DD"T"HH24:MI:SS'), 'null') ||
+     ',"a_first_comment_at":' || coalesce(to_char(ca_a.first_comment_at,'YYYY-MM-DD"T"HH24:MI:SS'), 'null') || '}'
+    ) as meta,
+    p.owneruserid,
+    a.owneruserid,
+    p.ownerdisplayname,
+    a.ownerdisplayname,
+    p.acceptedanswerid,
+    qta.tags_concat as __tags_concat_for_grouping,
+    qs.composite_score as __composite_score_for_grouping,
+    ofl.is_high_outlier as __is_high_outlier_for_grouping,
+    ofl.is_low_outlier as __is_low_outlier_for_grouping
+  from posts p
+  left join q_tag_agg qta on qta.question_id = p.id
+  left join tag_pop tp on tp.question_id = p.id
+  left join first_answer fa on fa.question_id = p.id
+  left join posts a on a.id = fa.answer_id
+  left join vote_window vwq on vwq.postid = p.id
+  left join vote_window vwa on vwa.postid = fa.answer_id
+  left join comment_activity ca_q on ca_q.post_id = p.id
+  left join comment_activity ca_a on ca_a.post_id = fa.answer_id
+  left join owner_stats us_asker on us_asker.user_id = p.owneruserid
+  left join owner_stats us_answerer on us_answerer.user_id = a.owneruserid
+  left join user_badge_stats ub_asker on ub_asker.user_id = p.owneruserid
+  left join user_badge_stats ub_answerer on ub_answerer.user_id = a.owneruserid
+  left join dup_info di on di.question_id = p.id
+  left join question_scoring qs on qs.question_id = p.id
+  left join outlier_flags ofl on ofl.question_id = p.id
+  left join ttfa tt on tt.question_id = p.id
+  left join acceptance ac on ac.question_id = p.id
+  left join set_ops so on so.question_id = p.id
+  left join bucketed_ranks br on br.question_id = p.id and br.bucket = so.bucket
+  where p.posttypeid = 1
+)
+select *
+from final
+where
+  coalesce(viewcount,0) >= 100
+  and (coalesce(q_upvotes,0) - coalesce(q_downvotes,0)) + (coalesce(a_upvotes,0) - coalesce(a_downvotes,0)) >= 0
+  and (
+    (coalesce(tag_count,0) >= 3 and coalesce(avg_tag_count,0) >= 100)
+    or (coalesce(has_duplicate_link,false) = true and coalesce(duplicate_link_count,0) >= 1)
+    or (coalesce(first_answer_was_accepted,0) = 1 and coalesce(secs_to_first_ans,9999999) <= 3600)
+  )
+  and not (coalesce(was_closed,false) = true and was_reopened is distinct from true)
+order by
+  coalesce(bucket,'OTHER') asc,
+  bucket_rank nulls last,
+  global_rank asc,
+  question_id
+limit 500;

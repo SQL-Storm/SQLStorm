@@ -1,0 +1,83 @@
+WITH
+RecentTopQuestions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    u.DisplayName AS OwnerDisplayName,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate DESC) AS rn
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId = 1
+    AND p.ClosedDate IS NULL
+),
+TagMentions AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS TagQuestionCount,
+    AVG(p.Score) AS AvgQuestionScore,
+    MAX(p.ViewCount) AS MaxViewsForTag
+  FROM Tags t
+  JOIN Posts p ON p.Id = t.ExcerptPostId
+  WHERE t.IsModeratorOnly = FALSE
+  GROUP BY t.TagName
+),
+Enriched AS (
+  SELECT
+    r.PostId,
+    r.Title,
+    r.Tags,
+    r.CreationDate,
+    r.Score,
+    r.ViewCount,
+    r.OwnerUserId,
+    r.OwnerDisplayName,
+    tt.TagName,
+    tm.TagQuestionCount,
+    tm.AvgQuestionScore,
+    tm.MaxViewsForTag,
+    r.rn
+  FROM RecentTopQuestions r
+  LEFT JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(r.Tags FROM 2 FOR (char_length(r.Tags)-2)), '><')) AS TagName
+  ) tt ON TRUE
+  LEFT JOIN TagMentions tm ON tm.TagName = tt.TagName
+  WHERE r.rn <= 5
+)
+SELECT
+  e.PostId,
+  e.Title,
+  e.CreationDate,
+  e.Score AS PostScore,
+  e.ViewCount,
+  e.OwnerUserId,
+  e.OwnerDisplayName,
+  e.TagName,
+  e.TagQuestionCount,
+  e.AvgQuestionScore,
+  e.MaxViewsForTag,
+  (SELECT COUNT(*) FROM Comments c WHERE c.PostId = e.PostId) AS CommentCount,
+  (SELECT COUNT(*) FROM Votes v WHERE v.PostId = e.PostId AND v.VoteTypeId = 2) AS Upvotes,
+  (SELECT COUNT(*) FROM Votes v WHERE v.PostId = e.PostId AND v.VoteTypeId = 3) AS Downvotes,
+  (SELECT STRING_AGG(v.VoteTypeId || ':' || TO_CHAR(v.CreationDate, 'YYYY-MM-DD"T"HH24:MI:SS'), ',' ORDER BY v.CreationDate)
+     FROM Votes v WHERE v.PostId = e.PostId) AS VotesTimeline
+FROM Enriched e
+GROUP BY
+  e.PostId,
+  e.Title,
+  e.CreationDate,
+  e.Score,
+  e.ViewCount,
+  e.OwnerUserId,
+  e.OwnerDisplayName,
+  e.TagName,
+  e.TagQuestionCount,
+  e.AvgQuestionScore,
+  e.MaxViewsForTag,
+  e.rn
+ORDER BY e.TagQuestionCount DESC, e.AvgQuestionScore DESC, e.MaxViewsForTag DESC
+FETCH FIRST 100 ROWS ONLY;

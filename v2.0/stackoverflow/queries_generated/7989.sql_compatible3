@@ -1,0 +1,280 @@
+WITH UserPostStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) AS TotalPosts,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswerCount,
+        COALESCE(SUM(p.Score), 0) AS TotalScore,
+        COALESCE(AVG(p.Score), 0) AS AvgScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        COUNT(DISTINCT p.Tags) AS UniqueTagCount,
+        STRING_AGG(DISTINCT p.Tags, ', ') AS AllTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE p.CreationDate >= DATE '2020-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+RankedUsers AS (
+    SELECT 
+        ups.*,
+        ROW_NUMBER() OVER (ORDER BY TotalScore DESC) AS RankByScore,
+        DENSE_RANK() OVER (ORDER BY Reputation DESC) AS RankByReputation,
+        NTILE(100) OVER (ORDER BY TotalScore DESC) AS PercentileByScore
+    FROM UserPostStats ups
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagCount,
+        t.ExcerptPostId,
+        COALESCE(p.Score, 0) AS ExcerptScore,
+        CASE 
+            WHEN t.Count > 100 THEN 'Highly Popular'
+            WHEN t.Count > 50 THEN 'Popular'
+            WHEN t.Count > 10 THEN 'Moderate'
+            ELSE 'Low'
+        END AS PopularityLevel,
+        DENSE_RANK() OVER (ORDER BY t.Count DESC) AS PopularityRank
+    FROM Tags t
+    LEFT JOIN Posts p ON t.ExcerptPostId = p.Id
+    WHERE t.Count > 5
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.ParentId,
+        p.PostTypeId,
+        p.Tags,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Question with Accepted Answer'
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostCategory,
+        CASE 
+            WHEN p.Score > 100 THEN 'Highly Upvoted'
+            WHEN p.Score > 50 THEN 'Upvoted'
+            WHEN p.Score > 0 THEN 'Neutral'
+            WHEN p.Score < 0 THEN 'Downvoted'
+            ELSE 'No Votes'
+        END AS ScoreCategory,
+        LENGTH(p.Title) AS TitleLength,
+        LENGTH(p.Body) AS BodyLength,
+        ABS(DATE '2024-10-01' - CAST(p.CreationDate AS date)) AS DaysSinceCreation,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags <> '' THEN 
+                (SELECT COUNT(*) FROM (
+                    SELECT unnest(string_to_array(SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags) - 2)), '><')) AS tag
+                ) AS t2)
+            ELSE 0
+        END AS TagCount,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCount,
+        COALESCE((SELECT AVG(v.Score) FROM Votes v WHERE v.PostId = p.Id), 0) AS AvgVoteScore,
+        (SELECT COALESCE(COUNT(*), 0) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (10, 11, 12, 13)) AS ModerationEvents,
+        (SELECT COALESCE(MAX(ph.CreationDate), p.CreationDate) FROM PostHistory ph WHERE ph.PostId = p.Id) AS LastActivityDate,
+        CASE 
+            WHEN EXISTS (SELECT 1 FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3) THEN 'Duplicate Found'
+            WHEN EXISTS (SELECT 1 FROM PostLinks pl WHERE pl.RelatedPostId = p.Id AND pl.LinkTypeId = 3) THEN 'Is Duplicate'
+            ELSE 'No Duplicate'
+        END AS DuplicateStatus,
+        CASE 
+            WHEN p.Body LIKE '%<code>%' THEN 'Contains Code'
+            WHEN p.Body LIKE '%<pre>%' THEN 'Contains Preformatted Text'
+            ELSE 'No Markup'
+        END AS ContentStructure
+    FROM Posts p
+    WHERE p.CreationDate >= DATE '2020-01-01'
+      AND p.PostTypeId IN (1, 2)
+      AND p.Score IS NOT NULL
+),
+AggregatedData AS (
+    SELECT 
+        'Post Analysis' AS DataType,
+        COUNT(*) AS RecordCount,
+        COUNT(DISTINCT PostId) AS UniquePosts,
+        AVG(Score) AS AvgScore,
+        MAX(Score) AS MaxScore,
+        MIN(Score) AS MinScore,
+        AVG(ViewCount) AS AvgViews,
+        MAX(ViewCount) AS MaxViews,
+        CAST(NULL AS VARCHAR) AS filler1,
+        CAST(NULL AS INTEGER) AS filler2
+    FROM ComplexPostAnalysis
+    UNION ALL
+    SELECT 
+        'User Analysis' AS DataType,
+        COUNT(*) AS RecordCount,
+        COUNT(DISTINCT UserId) AS UniqueUsers,
+        AVG(TotalScore) AS AvgScore,
+        MAX(TotalScore) AS MaxScore,
+        MIN(TotalScore) AS MinScore,
+        AVG(p.ViewCount) AS AvgViews,
+        MAX(p.ViewCount) AS MaxViews,
+        CAST(NULL AS VARCHAR) AS filler1,
+        CAST(NULL AS INTEGER) AS filler2
+    FROM UserPostStats ups
+    LEFT JOIN Posts p ON ups.UserId = p.OwnerUserId
+    WHERE p.CreationDate >= DATE '2020-01-01'
+    UNION ALL
+    SELECT 
+        'Tag Analysis' AS DataType,
+        COUNT(*) AS RecordCount,
+        COUNT(DISTINCT TagName) AS UniqueTags,
+        AVG(TagCount) AS AvgTagCount,
+        MAX(TagCount) AS MaxTagCount,
+        MIN(TagCount) AS MinTagCount,
+        AVG(TagCount) AS AvgTagCount,
+        MAX(TagCount) AS MaxTagCount,
+        CAST(NULL AS VARCHAR) AS filler1,
+        CAST(NULL AS INTEGER) AS filler2
+    FROM TagAnalysis
+)
+SELECT 
+    'COMPLEX_BENCHMARK_QUERY' AS QueryType,
+    COUNT(*) AS TotalRecordsProcessed,
+    (SELECT COUNT(*) FROM ComplexPostAnalysis) AS ComplexPosts,
+    (SELECT COUNT(*) FROM RankedUsers) AS RankedUsers,
+    (SELECT COUNT(*) FROM TagAnalysis) AS TagAnalysisResults,
+    (SELECT COUNT(*) FROM AggregatedData) AS AggregationResults,
+    STRING_AGG(
+        CASE 
+            WHEN ad.DataType = 'Post Analysis' THEN 
+                CONCAT('Post: ', ad.RecordCount, ' records, Avg Score: ', ROUND(CAST(ad.AvgScore AS numeric), 2))
+            WHEN ad.DataType = 'User Analysis' THEN 
+                CONCAT('User: ', ad.RecordCount, ' records, Avg Score: ', ROUND(CAST(ad.AvgScore AS numeric), 2))
+            WHEN ad.DataType = 'Tag Analysis' THEN 
+                CONCAT('Tag: ', ad.RecordCount, ' records, Avg Count: ', ROUND(CAST(ad.AvgTagCount AS numeric), 2))
+        END, 
+        ', '
+    ) AS SummaryData,
+    CASE 
+        WHEN EXISTS (SELECT 1 FROM ComplexPostAnalysis WHERE Score > 1000) THEN 'High Score Posts Exist'
+        ELSE 'No High Score Posts'
+    END AS HighScoreIndicator,
+    CASE 
+        WHEN EXISTS (SELECT 1 FROM UserPostStats WHERE TotalScore > 50000) THEN 'High Score Users Exist'
+        ELSE 'No High Score Users'
+    END AS HighUserScoreIndicator,
+    ROUND(AVG(CASE WHEN p.Score > 0 THEN 1.0 ELSE 0.0 END) * 100, 2) AS PositiveScoreRate,
+    COUNT(DISTINCT CASE 
+        WHEN p.Tags IS NOT NULL AND p.Tags <> '' 
+        THEN SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags) - 2)) 
+        ELSE NULL 
+    END) AS DistinctTagStrings,
+    COUNT(DISTINCT CASE 
+        WHEN p.ParentId IS NOT NULL 
+        THEN p.ParentId 
+        ELSE NULL 
+    END) AS AnsweredQuestionCount,
+    COUNT(DISTINCT CASE 
+        WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL 
+        THEN p.Id 
+        ELSE NULL 
+    END) AS QuestionsWithAcceptedAnswers,
+    ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS SequentialId
+FROM Posts p
+INNER JOIN RankedUsers ru ON p.OwnerUserId = ru.UserId
+INNER JOIN ComplexPostAnalysis cpa ON p.Id = cpa.PostId
+LEFT JOIN TagAnalysis ta ON EXISTS (
+    SELECT 1 
+    FROM (
+        SELECT unnest(string_to_array(COALESCE(p.Tags, ''), '><')) AS tag
+    ) AS tagtable
+    WHERE tagtable.tag = ta.TagName
+)
+LEFT JOIN AggregatedData ad ON TRUE
+WHERE p.CreationDate >= DATE '2020-01-01'
+  AND p.PostTypeId IN (1, 2)
+  AND p.Score IS NOT NULL
+  AND p.Score <> 0
+  AND COALESCE(p.OwnerUserId, 0) > 0
+  AND EXISTS (
+    SELECT 1 FROM Votes v WHERE v.PostId = p.Id 
+    AND v.VoteTypeId IN (2, 3) 
+    AND v.CreationDate >= DATE '2020-01-01'
+  )
+  AND (
+    CASE 
+        WHEN p.PostTypeId = 1 THEN 
+            COALESCE(p.AnswerCount, 0) > 0 
+        WHEN p.PostTypeId = 2 THEN 
+            COALESCE(p.Score, 0) > 0 
+        ELSE TRUE 
+    END
+  )
+GROUP BY 
+    p.Score,
+    p.OwnerUserId,
+    p.PostTypeId,
+    ad.DataType,
+    ad.RecordCount,
+    ad.AvgScore,
+    ad.AvgTagCount,
+    ru.UserId,
+    p.Id
+HAVING 
+    COUNT(*) >= 1
+    AND AVG(p.Score) > 0
+    AND COUNT(DISTINCT CASE WHEN p.Title IS NOT NULL THEN p.Title ELSE NULL END) > 0
+
+UNION ALL
+
+SELECT 
+    'BENCHMARK_SUMMARY' AS QueryType,
+    COUNT(*) AS TotalRecordsProcessed,
+    COUNT(DISTINCT p.Id) AS ComplexPosts,
+    COUNT(DISTINCT ru.UserId) AS RankedUsers,
+    COUNT(DISTINCT ta.TagName) AS TagAnalysisResults,
+    COUNT(*) AS AggregationResults,
+    STRING_AGG(
+        CASE 
+            WHEN ad.DataType = 'Post Analysis' THEN 
+                CONCAT('PA: ', ad.RecordCount, ' rec, AvgS: ', ROUND(CAST(ad.AvgScore AS numeric), 2), ' maxS: ', ad.MaxScore)
+            WHEN ad.DataType = 'User Analysis' THEN 
+                CONCAT('UA: ', ad.RecordCount, ' rec, AvgS: ', ROUND(CAST(ad.AvgScore AS numeric), 2), ' maxS: ', ad.MaxScore)
+            WHEN ad.DataType = 'Tag Analysis' THEN 
+                CONCAT('TA: ', ad.RecordCount, ' rec, AvgC: ', ROUND(CAST(ad.AvgTagCount AS numeric), 2))
+        END, ', '
+    ) AS SummaryData,
+    'BENCHMARK_COMPLETE' AS HighScoreIndicator,
+    'SUMMARY_COMPLETE' AS HighUserScoreIndicator,
+    ROUND(SUM(CASE WHEN p.Score > 0 THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(*),0), 2) AS PositiveScoreRate,
+    COUNT(DISTINCT COALESCE(p.Tags, '')) AS DistinctTagStrings,
+    COUNT(DISTINCT CASE WHEN p.ParentId IS NOT NULL THEN p.ParentId ELSE NULL END) AS AnsweredQuestionCount,
+    COUNT(DISTINCT CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN p.Id ELSE NULL END) AS QuestionsWithAcceptedAnswers,
+    ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS SequentialId
+FROM (
+    SELECT * FROM ComplexPostAnalysis WHERE Score > 50
+) cp
+INNER JOIN Posts p ON cp.PostId = p.Id
+INNER JOIN RankedUsers ru ON p.OwnerUserId = ru.UserId
+LEFT JOIN TagAnalysis ta ON EXISTS (
+    SELECT 1 
+    FROM (
+        SELECT unnest(string_to_array(COALESCE(p.Tags, ''), '><')) AS tag
+    ) AS tagtable
+    WHERE tagtable.tag = ta.TagName
+)
+LEFT JOIN AggregatedData ad ON TRUE
+WHERE p.CreationDate >= DATE '2020-01-01'
+  AND (p.Score > 0 OR p.Score < 0)
+  AND (
+    EXISTS (SELECT 1 FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId IN (2, 3))
+    OR EXISTS (SELECT 1 FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (10, 11, 12, 13))
+  )
+GROUP BY 
+    ad.DataType,
+    ad.RecordCount,
+    ad.AvgScore,
+    ad.MaxScore,
+    ad.AvgTagCount,
+    ru.UserId
+ORDER BY SequentialId;

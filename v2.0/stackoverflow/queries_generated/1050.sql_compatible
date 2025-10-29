@@ -1,0 +1,247 @@
+WITH UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.Views AS UserViews,
+        u.UpVotes AS UserUpVotes,
+        u.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsAsked,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersGiven,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostScore,
+        SUM(COALESCE(p.ViewCount, 0)) AS TotalPostViewCount,
+        SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL AND p.OwnerUserId = u.Id THEN 1 ELSE 0 END) AS AcceptedAnswersForMyQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 AND p.AcceptedAnswerId IS NOT NULL AND p.ParentId IS NOT NULL AND (SELECT q.AcceptedAnswerId FROM Posts q WHERE q.Id = p.ParentId) = p.Id THEN 1 ELSE 0 END) AS MyAnswersAccepted,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        SUM(COALESCE(c.Score, 0)) AS TotalCommentScore,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        MIN(b.Date) AS FirstBadgeDate,
+        MAX(p.LastActivityDate) AS LastPostActivity,
+        MAX(c.CreationDate) AS LastCommentActivity
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes
+),
+PostHistoryDetails AS (
+    SELECT
+        ph.PostId,
+        ph.UserId AS EditorUserId,
+        COUNT(ph.Id) AS TotalHistoryEventsOnPost,
+        COUNT(DISTINCT ph.UserId) AS UniqueEditorsOnPost,
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.CreationDate END) AS LastEditDateOnPost,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditCountOnPost,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseEventsOnPost,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenEventsOnPost,
+        -- compute WasClosedThenReopenedFlag per post using a subquery to avoid window inside aggregate
+        MAX(CASE WHEN ph.PostHistoryTypeId = 11 AND EXISTS (
+            SELECT 1 FROM PostHistory ph2
+            WHERE ph2.PostId = ph.PostId
+              AND ph2.CreationDate < ph.CreationDate
+              AND ph2.PostHistoryTypeId = 10
+            ORDER BY ph2.CreationDate DESC
+            LIMIT 1
+        ) THEN 1 ELSE 0 END) AS WasClosedThenReopenedFlag
+    FROM PostHistory ph
+    WHERE ph.UserId IS NOT NULL
+    GROUP BY ph.PostId, ph.UserId
+),
+PostHistoryUserAggs AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(DISTINCT ph.PostId) AS TotalOwnedPostsWithHistory,
+        SUM(ph.EditCountOnPost) AS TotalEditsReceivedOnMyPosts,
+        SUM(ph.CloseEventsOnPost) AS TotalCloseEventsOnMyOwnedPosts,
+        SUM(ph.ReopenEventsOnPost) AS TotalReopenEventsOnMyOwnedPosts,
+        SUM(ph.WasClosedThenReopenedFlag) AS OwnedPostsClosedThenReopened
+    FROM Posts p
+    JOIN PostHistoryDetails ph ON p.Id = ph.PostId
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+TagPerformance AS (
+    SELECT
+        TRIM(tag) AS TagName,
+        AVG(p.Score) AS AvgTagScore,
+        COUNT(DISTINCT p.Id) AS QuestionsWithTag
+    FROM Posts p,
+    LATERAL (
+        SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><')) AS tag
+    ) t
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2
+    GROUP BY TRIM(tag)
+    HAVING COUNT(DISTINCT p.Id) > 100
+),
+TopTagsByUser AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        TRIM(tag) AS TagName,
+        COUNT(p.Id) AS TagUsageCount,
+        AVG(p.Score) AS AvgScoreForTag,
+        ROW_NUMBER() OVER(PARTITION BY p.OwnerUserId ORDER BY COUNT(p.Id) DESC, AVG(p.Score) DESC) AS TagRank
+    FROM Posts p,
+    LATERAL (
+        SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><')) AS tag
+    ) t
+    WHERE p.OwnerUserId IS NOT NULL AND p.PostTypeId = 1 AND p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2
+    GROUP BY p.OwnerUserId, TRIM(tag)
+),
+UserOverallEngagement AS (
+    SELECT
+        uas.UserId,
+        u.DisplayName,
+        u.Location,
+        u.AboutMe,
+        uas.Reputation,
+        uas.UserCreationDate,
+        uas.LastAccessDate,
+        (EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - uas.UserCreationDate)) / (3600 * 24 * 365.25)) AS YearsOnPlatform,
+        uas.TotalPostsOwned,
+        uas.QuestionsAsked,
+        uas.AnswersGiven,
+        uas.TotalPostScore,
+        uas.TotalPostViewCount,
+        uas.AcceptedAnswersForMyQuestions,
+        uas.MyAnswersAccepted,
+        uas.TotalCommentsMade,
+        uas.TotalCommentScore,
+        uas.TotalBadges,
+        uas.GoldBadges,
+        uas.FirstBadgeDate,
+        uas.LastPostActivity,
+        uas.LastCommentActivity,
+        COALESCE(NULLIF(uas.TotalPostScore, 0) / NULLIF(uas.TotalPostsOwned, 0), 0.0) AS AvgPostScorePerPost,
+        COALESCE(NULLIF(uas.UserUpVotes, 0) / NULLIF(uas.UserDownVotes, 0), 0.0) AS UpDownVoteRatio,
+        (uas.QuestionsAsked + uas.AnswersGiven + uas.TotalCommentsMade) AS TotalContributions,
+        COALESCE(phua.OwnedPostsClosedThenReopened, 0) AS PostsClosedAndReopenedByUser,
+        COALESCE(phua.TotalEditsReceivedOnMyPosts, 0) AS TotalEditsReceivedOnMyPosts,
+        (
+            SELECT COUNT(DISTINCT tt.TagName)
+            FROM TopTagsByUser tt
+            WHERE tt.UserId = uas.UserId AND tt.TagRank <= 3
+              AND tt.TagName IN (SELECT tp.TagName FROM TagPerformance tp WHERE tp.QuestionsWithTag > 500 AND tp.AvgTagScore > 5)
+        ) AS PopularTopTagsCount,
+        RANK() OVER (ORDER BY
+            (uas.Reputation * 0.4) +
+            (uas.TotalPostScore * 0.2) +
+            (uas.TotalCommentsMade * 0.1) +
+            (uas.TotalBadges * 0.1) +
+            (uas.QuestionsAsked * 0.05) +
+            (uas.AnswersGiven * 0.05) +
+            (uas.MyAnswersAccepted * 0.1) DESC,
+            uas.LastAccessDate DESC
+        ) AS GlobalUserEngagementRank,
+        NTILE(4) OVER (ORDER BY (uas.QuestionsAsked + uas.AnswersGiven + uas.TotalCommentsMade) DESC) AS ContributionQuartile
+    FROM UserActivitySummary uas
+    JOIN Users u ON uas.UserId = u.Id
+    LEFT JOIN PostHistoryUserAggs phua ON uas.UserId = phua.UserId
+    GROUP BY
+        uas.UserId, u.DisplayName, u.Location, u.AboutMe, uas.Reputation, uas.UserCreationDate, uas.LastAccessDate,
+        uas.TotalPostsOwned, uas.QuestionsAsked, uas.AnswersGiven, uas.TotalPostScore, uas.TotalPostViewCount,
+        uas.AcceptedAnswersForMyQuestions, uas.MyAnswersAccepted, uas.TotalCommentsMade, uas.TotalCommentScore,
+        uas.TotalBadges, uas.GoldBadges, uas.FirstBadgeDate, uas.LastPostActivity, uas.LastCommentActivity,
+        uas.UserUpVotes, uas.UserDownVotes, phua.OwnedPostsClosedThenReopened, phua.TotalEditsReceivedOnMyPosts
+),
+FinalResult AS (
+    SELECT
+        uoe.UserId,
+        COALESCE(uoe.DisplayName, 'Anonymous User') AS DisplayName,
+        LOWER(SUBSTRING(COALESCE(uoe.Location, 'Unknown Location'), 1, 20)) AS LocationSnippet,
+        uoe.Reputation,
+        uoe.YearsOnPlatform,
+        CASE
+            WHEN uoe.Reputation >= 100000 THEN 'Legendary'
+            WHEN uoe.Reputation >= 25000 THEN 'Highly Respected'
+            WHEN uoe.Reputation >= 5000 THEN 'Very Active'
+            WHEN uoe.Reputation >= 1000 THEN 'Active Contributor'
+            ELSE 'Newbie/Infrequent'
+        END AS ReputationTier,
+        uoe.TotalPostsOwned,
+        uoe.QuestionsAsked,
+        uoe.AnswersGiven,
+        uoe.TotalCommentsMade,
+        uoe.TotalBadges,
+        uoe.GoldBadges,
+        uoe.AvgPostScorePerPost,
+        uoe.UpDownVoteRatio,
+        uoe.TotalContributions,
+        uoe.PopularTopTagsCount,
+        uoe.PostsClosedAndReopenedByUser,
+        uoe.TotalEditsReceivedOnMyPosts,
+        uoe.GlobalUserEngagementRank,
+        uoe.ContributionQuartile,
+        CASE
+            WHEN uoe.AboutMe IS NOT NULL AND (POSITION('developer' IN LOWER(uoe.AboutMe)) > 0 OR POSITION('engineer' IN LOWER(uoe.AboutMe)) > 0) THEN 'Has Dev/Eng Bio'
+            WHEN uoe.AboutMe IS NOT NULL AND (POSITION('student' IN LOWER(uoe.AboutMe)) > 0 OR POSITION('learning' IN LOWER(uoe.AboutMe)) > 0) THEN 'Has Learning Bio'
+            WHEN uoe.AboutMe IS NOT NULL AND LENGTH(uoe.AboutMe) > 100 THEN 'Detailed Bio'
+            ELSE 'Concise/No Bio'
+        END AS AboutMeCategory,
+        EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS timestamp) - GREATEST(COALESCE(uoe.LastPostActivity, uoe.LastAccessDate), COALESCE(uoe.LastCommentActivity, uoe.LastAccessDate), uoe.LastAccessDate))) AS DaysSinceLastActivity,
+        (
+            SELECT p.Title
+            FROM Posts p
+            WHERE p.OwnerUserId = uoe.UserId AND p.PostTypeId = 1
+            ORDER BY p.Score DESC, p.CreationDate DESC
+            LIMIT 1
+        ) AS TopQuestionTitle,
+        (
+            SELECT COUNT(DISTINCT v.VoteTypeId)
+            FROM Votes v
+            WHERE v.PostId IN (SELECT p2.Id FROM Posts p2 WHERE p2.OwnerUserId = uoe.UserId)
+        ) AS DistinctVoteTypesOnMyPosts,
+        (
+            SELECT AVG(ans.Score)
+            FROM Posts q
+            JOIN Posts ans ON q.AcceptedAnswerId = ans.Id
+            WHERE q.OwnerUserId = uoe.UserId AND q.PostTypeId = 1 AND q.AcceptedAnswerId IS NOT NULL
+        ) AS AvgAcceptedAnswerScoreForMyQuestions,
+        uoe.LastAccessDate
+    FROM UserOverallEngagement uoe
+)
+SELECT
+    fr.UserId,
+    fr.DisplayName,
+    fr.LocationSnippet,
+    fr.Reputation,
+    fr.YearsOnPlatform,
+    fr.ReputationTier,
+    fr.TotalPostsOwned,
+    fr.QuestionsAsked,
+    fr.AnswersGiven,
+    fr.TotalCommentsMade,
+    fr.TotalBadges,
+    fr.GoldBadges,
+    fr.AvgPostScorePerPost,
+    fr.UpDownVoteRatio,
+    fr.TotalContributions,
+    fr.PopularTopTagsCount,
+    fr.PostsClosedAndReopenedByUser,
+    fr.TotalEditsReceivedOnMyPosts,
+    fr.GlobalUserEngagementRank,
+    fr.ContributionQuartile,
+    fr.AboutMeCategory,
+    fr.DaysSinceLastActivity,
+    fr.TopQuestionTitle,
+    fr.DistinctVoteTypesOnMyPosts,
+    fr.AvgAcceptedAnswerScoreForMyQuestions
+FROM FinalResult fr
+WHERE
+    fr.Reputation > 1000
+    AND fr.TotalContributions > 10
+    AND fr.YearsOnPlatform > 1
+    AND fr.ContributionQuartile IN (1, 2)
+    AND fr.LastAccessDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180 days'
+    AND (
+        (fr.QuestionsAsked > 0 AND fr.AnswersGiven > 0)
+        OR (fr.TotalCommentsMade > 50 AND fr.AvgPostScorePerPost > 5)
+    )
+ORDER BY
+    fr.GlobalUserEngagementRank ASC,
+    fr.Reputation DESC,
+    fr.LastAccessDate DESC
+LIMIT 1000;

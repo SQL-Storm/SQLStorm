@@ -1,0 +1,137 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(p.PostCount, 0) AS TotalPosts,
+        COALESCE(v.UpVotes, 0) AS TotalUpVotes,
+        COALESCE(v.DownVotes, 0) AS TotalDownVotes,
+        COALESCE(s.AvgScore, 0) AS AvgPostScore,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank,
+        (SELECT p2.Title
+         FROM Posts p2
+         WHERE p2.OwnerUserId = u.Id
+         ORDER BY p2.CreationDate DESC
+         FETCH FIRST 1 ROW ONLY) AS LatestPostTitle,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadgeCount,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadgeCount,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadgeCount,
+        CASE 
+            WHEN EXISTS (
+                SELECT 1
+                FROM Posts q
+                CROSS JOIN LATERAL regexp_split_to_table(
+                        REPLACE(REPLACE(q.Tags, '<', ''), '>', ''), '\s+'
+                ) AS tag_name
+                JOIN Tags tg ON tg.TagName = tag_name
+                JOIN Badges bg ON bg.UserId = u.Id 
+                               AND bg.TagBased = 1 
+                               AND bg.Name = tg.TagName
+                WHERE q.OwnerUserId = u.Id AND q.PostTypeId = 1
+            ) THEN 1 ELSE 0 
+        END AS HasTagGoldBadge
+    FROM Users u
+    LEFT JOIN (
+        SELECT OwnerUserId, COUNT(*) AS PostCount
+        FROM Posts
+        WHERE OwnerUserId IS NOT NULL
+        GROUP BY OwnerUserId
+    ) p ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT 
+            po.OwnerUserId,
+            SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Posts po
+        JOIN Votes v ON v.PostId = po.Id
+        JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+        GROUP BY po.OwnerUserId
+    ) v ON v.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT OwnerUserId, AVG(CAST(Score AS NUMERIC)) AS AvgScore
+        FROM Posts
+        GROUP BY OwnerUserId
+    ) s ON s.OwnerUserId = u.Id
+    WHERE u.Reputation > 1000
+),
+
+ClosedDupes AS (
+    SELECT 
+        ph.PostId,
+        ph.CreationDate,
+        CAST(ph.Comment AS INTEGER) AS CloseReasonId,
+        CAST(jsonb_array_elements_text(ph.Text) AS INTEGER) AS OriginalQuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId
+    FROM PostHistory ph
+    JOIN Posts p ON p.Id = ph.PostId
+    WHERE ph.PostHistoryTypeId = 10
+      AND ph.Comment = '101'
+      AND ph.Text IS NOT NULL
+),
+
+DuplicatePairs AS (
+    SELECT DISTINCT
+        c1.OriginalQuestionId AS OriginalQ,
+        c2.Id AS DuplicateQ,
+        c1.Title AS OriginalTitle,
+        c2.Title AS DuplicateTitle,
+        c1.Score - c2.Score AS ScoreDiff,
+        CASE 
+            WHEN c2.ViewCount > c1.ViewCount THEN 'DupHigherViews'
+            ELSE 'OrigHigherViews'
+        END AS ViewComparison
+    FROM ClosedDupes c1
+    LEFT JOIN Posts c2 ON c2.Id = c1.OriginalQuestionId
+)
+
+SELECT 
+    us.Id,
+    us.DisplayName,
+    us.Reputation,
+    us.TotalPosts,
+    us.TotalUpVotes,
+    us.TotalDownVotes,
+    ROUND(us.AvgPostScore::numeric, 2) AS AvgScore,
+    us.RepRank,
+    COALESCE(us.LatestPostTitle, '[No Posts]') AS LatestTitle,
+    us.GoldBadgeCount,
+    us.SilverBadgeCount,
+    us.BronzeBadgeCount,
+    CASE us.HasTagGoldBadge WHEN 1 THEN 'YES' ELSE 'NO' END AS TagGoldBadgeFlag,
+    dp.OriginalQ,
+    dp.DuplicateQ,
+    dp.OriginalTitle,
+    dp.DuplicateTitle,
+    dp.ScoreDiff,
+    dp.ViewComparison
+FROM UserStats us
+LEFT JOIN LATERAL (
+    SELECT dp.*
+    FROM DuplicatePairs dp
+    WHERE dp.OriginalQ = (
+        SELECT p.Id
+        FROM Posts p
+        WHERE p.OwnerUserId = us.Id 
+          AND p.PostTypeId = 1
+        ORDER BY p.CreationDate DESC
+        FETCH FIRST 1 ROW ONLY
+    )
+    FETCH FIRST 1 ROW ONLY
+) dp ON TRUE
+WHERE dp.OriginalQ IS NOT NULL
+ORDER BY us.RepRank
+LIMIT 100
+
+UNION ALL
+
+SELECT 
+    CAST(NULL AS INTEGER), CAST(NULL AS VARCHAR), CAST(NULL AS INTEGER), CAST(NULL AS INTEGER), CAST(NULL AS INTEGER),
+    CAST(NULL AS INTEGER), CAST(NULL AS NUMERIC), CAST(NULL AS INTEGER), CAST(NULL AS VARCHAR),
+    CAST(NULL AS INTEGER), CAST(NULL AS INTEGER), CAST(NULL AS INTEGER),
+    CAST(NULL AS VARCHAR), CAST(NULL AS INTEGER), CAST(NULL AS INTEGER),
+    CAST(NULL AS VARCHAR), CAST(NULL AS INTEGER), CAST(NULL AS INTEGER),
+    CAST(NULL AS VARCHAR), CAST(NULL AS VARCHAR), CAST(NULL AS INTEGER), CAST(NULL AS VARCHAR)
+WHERE FALSE;

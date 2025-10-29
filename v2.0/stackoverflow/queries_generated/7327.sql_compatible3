@@ -1,0 +1,322 @@
+WITH UserPostStats AS (
+    SELECT 
+        p.OwnerUserId,
+        COUNT(p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS Questions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS Answers,
+        SUM(p.Score) AS TotalScore,
+        AVG(p.Score) AS AvgScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        STRING_AGG(DISTINCT COALESCE(p.Tags, ''), ', ') AS AllTags
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        CASE 
+            WHEN TIMESTAMP '2024-10-01 12:34:56' - u.CreationDate > INTERVAL '365 day' THEN 'Veteran'
+            WHEN TIMESTAMP '2024-10-01 12:34:56' - u.CreationDate > INTERVAL '180 day' THEN 'Active'
+            ELSE 'New'
+        END AS UserTier,
+        COALESCE(ups.TotalPosts, 0) AS TotalPosts,
+        COALESCE(ups.Questions, 0) AS Questions,
+        COALESCE(ups.Answers, 0) AS Answers,
+        COALESCE(ups.TotalScore, 0) AS TotalScore,
+        COALESCE(ups.AvgScore, 0) AS AvgScore,
+        COALESCE(ups.LastPostDate, u.CreationDate) AS LastActivity,
+        COALESCE(ups.AllTags, '') AS Tags
+    FROM Users u
+    LEFT JOIN UserPostStats ups ON u.Id = ups.OwnerUserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, ups.TotalPosts, ups.Questions, ups.Answers, ups.TotalScore, ups.AvgScore, ups.LastPostDate, ups.AllTags
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        CreationDate,
+        UserTier,
+        TotalPosts,
+        Questions,
+        Answers,
+        TotalScore,
+        AvgScore,
+        LastActivity,
+        Tags,
+        DENSE_RANK() OVER (ORDER BY TotalScore DESC) AS ScoreRank,
+        ROW_NUMBER() OVER (ORDER BY TotalPosts DESC) AS PostRank
+    FROM UserActivity
+    WHERE TotalPosts > 0
+),
+PostStats AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 
+                CASE 
+                    WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+                    WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+                    ELSE 'Unanswered'
+                END
+            ELSE 'N/A'
+        END AS QuestionStatus,
+        COALESCE(p.AnswerCount, 0) AS AnswerCountWithNull,
+        COALESCE(p.ViewCount, 0) AS ViewCountWithNull,
+        CASE 
+            WHEN p.Score > 100 THEN 'High'
+            WHEN p.Score > 50 THEN 'Medium'
+            WHEN p.Score > 0 THEN 'Low'
+            ELSE 'None'
+        END AS ScoreLevel,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND CHAR_LENGTH(p.Tags) > 0 THEN CHAR_LENGTH(p.Tags) - CHAR_LENGTH(REPLACE(p.Tags, '>', '')) + 1
+            ELSE 0
+        END AS TagCount,
+        CAST(CAST(TIMESTAMP '2024-10-01 12:34:56' AS date) - CAST(p.CreationDate AS date) AS integer) AS DaysOld,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS PostOrder,
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevScore,
+        LEAD(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS AvgScorePerUser,
+        RANK() OVER (ORDER BY p.Score DESC) AS GlobalScoreRank
+    FROM Posts p
+    WHERE p.PostTypeId = 1 -- Only questions
+    GROUP BY p.Id, p.PostTypeId, p.ParentId, p.OwnerUserId, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.CreationDate, p.Title, p.Tags, p.AcceptedAnswerId, p.ClosedDate
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Mid'
+            ELSE 'Niche'
+        END AS TagCategory,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS PopularRank,
+        PERCENT_RANK() OVER (ORDER BY t.Count DESC) AS PopularityPercentile,
+        NTH_VALUE(t.TagName, 5) OVER (ORDER BY t.Count DESC) AS FifthMostPopularTag
+    FROM Tags t
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        ps.Id,
+        ps.PostTypeId,
+        ps.ParentId,
+        ps.OwnerUserId,
+        ps.Score,
+        ps.ViewCount,
+        ps.AnswerCountWithNull,
+        ps.CommentCount,
+        ps.FavoriteCount,
+        ps.CreationDate,
+        ps.Title,
+        ps.Tags,
+        ps.QuestionStatus,
+        ps.ScoreLevel,
+        ps.TagCount,
+        ps.DaysOld,
+        ps.PostOrder,
+        ps.PrevScore,
+        ps.NextScore,
+        ps.AvgScorePerUser,
+        ps.GlobalScoreRank,
+        ua.DisplayName AS OwnerName,
+        ua.Reputation AS OwnerReputation,
+        ua.UserTier AS OwnerTier,
+        CASE 
+            WHEN ps.Score > (SELECT AVG(p2.Score) FROM Posts p2 WHERE p2.PostTypeId = 1) 
+             AND ps.ViewCount > (SELECT AVG(p3.ViewCount) FROM Posts p3 WHERE p3.PostTypeId = 1) 
+             AND ps.AnswerCountWithNull >= 1
+            THEN 'HighImpact'
+            ELSE 'Standard'
+        END AS PostImpact,
+        CASE WHEN ps.Score > 0 THEN (ps.Score * ps.ViewCount) / (ps.AnswerCountWithNull + 1.0) ELSE 0 END AS ScoreToViewsRatio,
+        CASE 
+            WHEN ps.TagCount > 3 AND ps.Score > 50 THEN 'WellTagged'
+            WHEN ps.TagCount BETWEEN 1 AND 3 AND ps.Score > 50 THEN 'ModeratelyTagged'
+            ELSE 'PoorlyTagged'
+        END AS TaggingQuality,
+        TRIM(SUBSTRING(ps.Title FROM 1 FOR 
+            CASE WHEN POSITION(' ' IN ps.Title) > 0 THEN POSITION(' ' IN ps.Title) ELSE CHAR_LENGTH(ps.Title) END)) AS FirstWord,
+        NULLIF(CHAR_LENGTH(ps.Title) - CHAR_LENGTH(REPLACE(ps.Title, ' ', '')), -1) AS WordCount,
+        COALESCE(NULLIF((
+                        SELECT ph.CreationDate 
+                        FROM PostHistory ph 
+                        WHERE ph.PostId = ps.Id AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)
+                        ORDER BY ph.CreationDate ASC
+                        LIMIT 1), 
+                        ps.CreationDate), ps.CreationDate) AS FirstEditDate,
+        COALESCE((
+            SELECT COUNT(*) 
+            FROM Comments c 
+            WHERE c.PostId = ps.Id AND c.Text IS NOT NULL
+        ), 0) AS CommentCountWithNulls
+    FROM PostStats ps
+    INNER JOIN TopUsers ua ON ps.OwnerUserId = ua.UserId
+    WHERE ps.Score >= 0 AND ps.AnswerCountWithNull >= 0
+    GROUP BY ps.Id, ps.PostTypeId, ps.ParentId, ps.OwnerUserId, ps.Score, ps.ViewCount, ps.AnswerCountWithNull, ps.CommentCount, ps.FavoriteCount, ps.CreationDate, ps.Title, ps.Tags, ps.QuestionStatus, ps.ScoreLevel, ps.TagCount, ps.DaysOld, ps.PostOrder, ps.PrevScore, ps.NextScore, ps.AvgScorePerUser, ps.GlobalScoreRank, ua.DisplayName, ua.Reputation, ua.UserTier
+)
+
+SELECT 
+    ActivityLevel,
+    TotalQuestions,
+    AvgScore,
+    MinScore,
+    MaxScore,
+    AvgViews,
+    AvgAnswers,
+    TotalFavorites,
+    AvgTagCount,
+    MinAge,
+    MaxAge,
+    DistinctAuthors,
+    AnsweredQuestions,
+    ClosedQuestions,
+    UnansweredQuestions,
+    HighScoreQuestions,
+    ClosedQuestionsCount,
+    HighImpactQuestions,
+    WellTaggedQuestions,
+    PoorlyTaggedQuestions,
+    QuestionStartWords,
+    MinWordCount,
+    MaxWordCount,
+    AvgWordCount,
+    VeteranAuthors,
+    ActiveAuthors,
+    NewAuthors,
+    AvgAuthorScore,
+    HighRatioQuestions,
+    AvgRatio,
+    QuestionsWithEdits,
+    AvgComments,
+    SampleTitles
+FROM (
+    SELECT 
+        CASE 
+            WHEN COUNT(*) = 0 THEN 'No Data Found'
+            WHEN MAX(cpa.GlobalScoreRank) < 10 THEN 'Low Activity'
+            WHEN MAX(cpa.GlobalScoreRank) BETWEEN 10 AND 100 THEN 'Moderate Activity'
+            ELSE 'High Activity'
+        END AS ActivityLevel,
+        COUNT(*) AS TotalQuestions,
+        AVG(cpa.Score) AS AvgScore,
+        MIN(cpa.Score) AS MinScore,
+        MAX(cpa.Score) AS MaxScore,
+        AVG(cpa.ViewCount) AS AvgViews,
+        AVG(cpa.AnswerCountWithNull) AS AvgAnswers,
+        SUM(cpa.FavoriteCount) AS TotalFavorites,
+        AVG(cpa.TagCount) AS AvgTagCount,
+        MIN(cpa.DaysOld) AS MinAge,
+        MAX(cpa.DaysOld) AS MaxAge,
+        COUNT(DISTINCT cpa.OwnerUserId) AS DistinctAuthors,
+        COUNT(DISTINCT CASE WHEN cpa.QuestionStatus = 'Answered' THEN cpa.Id END) AS AnsweredQuestions,
+        COUNT(DISTINCT CASE WHEN cpa.QuestionStatus = 'Closed' THEN cpa.Id END) AS ClosedQuestions,
+        COUNT(DISTINCT CASE WHEN cpa.QuestionStatus = 'Unanswered' THEN cpa.Id END) AS UnansweredQuestions,
+        COUNT(DISTINCT CASE WHEN cpa.ScoreLevel = 'High' THEN cpa.Id END) AS HighScoreQuestions,
+        COUNT(DISTINCT CASE WHEN cpa.QuestionStatus = 'Closed' THEN cpa.Id END) AS ClosedQuestionsCount,
+        COUNT(DISTINCT CASE WHEN cpa.PostImpact = 'HighImpact' THEN cpa.Id END) AS HighImpactQuestions,
+        COUNT(DISTINCT CASE WHEN cpa.TaggingQuality = 'WellTagged' THEN cpa.Id END) AS WellTaggedQuestions,
+        COUNT(DISTINCT CASE WHEN cpa.TaggingQuality = 'PoorlyTagged' THEN cpa.Id END) AS PoorlyTaggedQuestions,
+        STRING_AGG(DISTINCT cpa.FirstWord, ', ') AS QuestionStartWords,
+        MIN(cpa.WordCount) AS MinWordCount,
+        MAX(cpa.WordCount) AS MaxWordCount,
+        AVG(cpa.WordCount) AS AvgWordCount,
+        COUNT(DISTINCT CASE WHEN cpa.OwnerTier = 'Veteran' THEN cpa.OwnerUserId END) AS VeteranAuthors,
+        COUNT(DISTINCT CASE WHEN cpa.OwnerTier = 'Active' THEN cpa.OwnerUserId END) AS ActiveAuthors,
+        COUNT(DISTINCT CASE WHEN cpa.OwnerTier = 'New' THEN cpa.OwnerUserId END) AS NewAuthors,
+        AVG(cpa.AvgScorePerUser) AS AvgAuthorScore,
+        SUM(CASE WHEN cpa.ScoreToViewsRatio > 10 THEN 1 ELSE 0 END) AS HighRatioQuestions,
+        AVG(cpa.ScoreToViewsRatio) AS AvgRatio,
+        COUNT(DISTINCT CASE WHEN cpa.FirstEditDate IS NOT NULL THEN cpa.Id END) AS QuestionsWithEdits,
+        AVG(cpa.CommentCountWithNulls) AS AvgComments,
+        STRING_AGG(DISTINCT RIGHT(cpa.Title, CASE WHEN CHAR_LENGTH(cpa.Title) > 30 THEN 30 ELSE CHAR_LENGTH(cpa.Title) END), ' | ') AS SampleTitles
+    FROM ComplexPostAnalysis cpa
+    WHERE cpa.Id IS NOT NULL
+    GROUP BY 
+        CASE 
+            WHEN COUNT(*) = 0 THEN 'No Data Found'
+            WHEN MAX(cpa.GlobalScoreRank) < 10 THEN 'Low Activity'
+            WHEN MAX(cpa.GlobalScoreRank) BETWEEN 10 AND 100 THEN 'Moderate Activity'
+            ELSE 'High Activity'
+        END
+    HAVING COUNT(*) > 0
+) t
+
+UNION ALL
+
+SELECT 
+    'BenchmarkResult' AS ActivityLevel,
+    COUNT(*) AS TotalQuestions,
+    AVG(cpa.Score) AS AvgScore,
+    MIN(cpa.Score) AS MinScore,
+    MAX(cpa.Score) AS MaxScore,
+    AVG(cpa.ViewCount) AS AvgViews,
+    AVG(cpa.AnswerCountWithNull) AS AvgAnswers,
+    SUM(cpa.FavoriteCount) AS TotalFavorites,
+    AVG(cpa.TagCount) AS AvgTagCount,
+    MIN(cpa.DaysOld) AS MinAge,
+    MAX(cpa.DaysOld) AS MaxAge,
+    COUNT(DISTINCT cpa.OwnerUserId) AS DistinctAuthors,
+    COUNT(DISTINCT CASE WHEN cpa.QuestionStatus = 'Answered' THEN cpa.Id END) AS AnsweredQuestions,
+    COUNT(DISTINCT CASE WHEN cpa.QuestionStatus = 'Closed' THEN cpa.Id END) AS ClosedQuestionsCount,
+    COUNT(DISTINCT CASE WHEN cpa.QuestionStatus = 'Unanswered' THEN cpa.Id END) AS UnansweredQuestions,
+    COUNT(DISTINCT CASE WHEN cpa.ScoreLevel = 'High' THEN cpa.Id END) AS HighScoreQuestions,
+    COUNT(DISTINCT CASE WHEN cpa.QuestionStatus = 'Closed' THEN cpa.Id END) AS ClosedQuestionsCount,
+    COUNT(DISTINCT CASE WHEN cpa.PostImpact = 'HighImpact' THEN cpa.Id END) AS HighImpactQuestions,
+    COUNT(DISTINCT CASE WHEN cpa.TaggingQuality = 'WellTagged' THEN cpa.Id END) AS WellTaggedQuestions,
+    COUNT(DISTINCT CASE WHEN cpa.TaggingQuality = 'PoorlyTagged' THEN cpa.Id END) AS PoorlyTaggedQuestions,
+    STRING_AGG(DISTINCT cpa.FirstWord, ', ') AS QuestionStartWords,
+    MIN(cpa.WordCount) AS MinWordCount,
+    MAX(cpa.WordCount) AS MaxWordCount,
+    AVG(cpa.WordCount) AS AvgWordCount,
+    COUNT(DISTINCT CASE WHEN cpa.OwnerTier = 'Veteran' THEN cpa.OwnerUserId END) AS VeteranAuthors,
+    COUNT(DISTINCT CASE WHEN cpa.OwnerTier = 'Active' THEN cpa.OwnerUserId END) AS ActiveAuthors,
+    COUNT(DISTINCT CASE WHEN cpa.OwnerTier = 'New' THEN cpa.OwnerUserId END) AS NewAuthors,
+    AVG(cpa.AvgScorePerUser) AS AvgAuthorScore,
+    SUM(CASE WHEN cpa.ScoreToViewsRatio > 10 THEN 1 ELSE 0 END) AS HighRatioQuestions,
+    AVG(cpa.ScoreToViewsRatio) AS AvgRatio,
+    COUNT(DISTINCT CASE WHEN cpa.FirstEditDate IS NOT NULL THEN cpa.Id END) AS QuestionsWithEdits,
+    AVG(cpa.CommentCountWithNulls) AS AvgComments,
+    STRING_AGG(DISTINCT RIGHT(cpa.Title, CASE WHEN CHAR_LENGTH(cpa.Title) > 30 THEN 30 ELSE CHAR_LENGTH(cpa.Title) END), ' | ') AS SampleTitles
+FROM ComplexPostAnalysis cpa
+WHERE cpa.Id IS NOT NULL
+    AND cpa.Score > (
+        SELECT PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY Score) 
+        FROM Posts 
+        WHERE PostTypeId = 1
+    )
+    AND cpa.ViewCount > (
+        SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY ViewCount) 
+        FROM Posts 
+        WHERE PostTypeId = 1
+    )
+    AND cpa.AnswerCountWithNull > 0
+    AND cpa.OwnerUserId IN (
+        SELECT UserId 
+        FROM TopUsers 
+        WHERE TotalPosts > 50
+        ORDER BY TotalScore DESC
+        LIMIT 100
+    )
+GROUP BY 'BenchmarkResult'
+ORDER BY TotalQuestions DESC
+LIMIT 10000;

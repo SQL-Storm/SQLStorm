@@ -1,0 +1,173 @@
+-- {"query": "2458.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1696} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 as Level,
+        array[t.TagName] as Path
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+    union all
+    select
+        t.Id,
+        t.TagName,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        r.Level + 1,
+        r.Path || t.TagName
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id <> r.Id  -- self-join condition to expand hierarchy (simulated)
+    where r.Level < 2
+),
+UserBadgeRankings as (
+    select
+        b.UserId,
+        b.Name,
+        b.Class,
+        row_number() over (partition by b.UserId order by b.Class asc, b.Date desc) as BadgeRank
+    from Badges b
+    where b.TagBased = 0
+),
+TopBadgesPerUser as (
+    select
+        u.Id as UserId,
+        concat_ws(' | ', string_agg(distinct ub.Name || '(' || ub.Class || ')', ' ; ' order by ub.BadgeRank asc)) as BadgeSummary
+    from Users u
+    left join UserBadgeRankings ub on u.Id = ub.UserId and ub.BadgeRank <= 5
+    group by u.Id
+),
+PopularPostsWithVotes as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+        count(distinct ph.Id) filter (where ph.PostHistoryTypeId = 10) as CloseVoteCount,
+        count(distinct pl.Id) filter (where pl.LinkTypeId = 3) as DuplicateLinksCount
+    from Posts p
+    left join Votes v on p.Id = v.PostId
+    left join PostHistory ph on p.Id = ph.PostId
+    left join PostLinks pl on p.Id = pl.PostId
+    where p.PostTypeId in (1, 2) -- Questions or Answers
+    group by p.Id, p.PostTypeId, p.OwnerUserId, p.Title, p.CreationDate, p.Score, p.ViewCount, p.Tags
+    having sum(case when v.VoteTypeId = 2 then 1 else 0 end) > 10
+),
+RankedUserPosts as (
+    select
+        p.*,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc) as PostRank
+    from PopularPostsWithVotes p
+    where p.OwnerUserId is not null
+),
+QuestionAnswerAggregates as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionCreation,
+        q.OwnerUserId,
+        q.Tags,
+        count(a.Id) as AnswerCount,
+        avg(a.Score) filter (where a.Id is not null) as AvgAnswerScore,
+        max(a.CreationDate) filter (where a.Id is not null) as LatestAnswerDate
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.CreationDate, q.OwnerUserId, q.Tags
+    having count(a.Id) > 3
+),
+UserActivitySummary as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersCount,
+        sum(p.Score) filter (where p.PostTypeId in (1, 2)) as TotalPostScore,
+        coalesce(tb.BadgeSummary, 'No badges') as BadgeSummary,
+        dense_rank() over (order by u.Reputation desc) as ReputationRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join TopBadgesPerUser tb on tb.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, tb.BadgeSummary
+),
+UserRecentComments as (
+    select
+        c.UserId,
+        count(*) filter (where c.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '30 days') as RecentCommentsCount,
+        max(c.CreationDate) as LastCommentDate
+    from Comments c
+    group by c.UserId
+),
+AnswerWithAcceptedFlag as (
+    select
+        a.Id,
+        a.ParentId,
+        case when q.AcceptedAnswerId = a.Id then 1 else 0 end as IsAcceptedAnswer,
+        a.Score,
+        a.CreationDate
+    from Posts a
+    join Posts q on q.Id = a.ParentId and q.PostTypeId = 1
+    where a.PostTypeId = 2
+),
+UserAcceptedAnswerStats as (
+    select 
+        u.Id as UserId,
+        count(awa.Id) filter (where awa.IsAcceptedAnswer = 1) as AcceptedAnswersCount,
+        avg(awa.Score) filter (where awa.IsAcceptedAnswer = 1) as AvgAcceptedAnswerScore,
+        percentile_cont(0.5) within group (order by (awa.CreationDate - q.CreationDate)) filter (where awa.IsAcceptedAnswer = 1) as MedianAnswerDelay
+    from Users u
+    left join AnswerWithAcceptedFlag awa on awa.ParentId in (select p.Id from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 1)
+    left join Posts q on q.Id = awa.ParentId
+    group by u.Id
+),
+CombinedUserStats as (
+    select
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.QuestionsCount,
+        ua.AnswersCount,
+        ua.TotalPostScore,
+        ua.BadgeSummary,
+        ua.ReputationRank,
+        coalesce(urc.RecentCommentsCount,0) as RecentCommentsCount,
+        coalesce(urc.LastCommentDate, '1900-01-01') as LastCommentDate,
+        coalesce(uaas.AcceptedAnswersCount,0) as AcceptedAnswersCount,
+        coalesce(uaas.AvgAcceptedAnswerScore,0) as AvgAcceptedAnswerScore,
+        coalesce(uaas.MedianAnswerDelay, interval '0') as MedianAnswerDelay
+    from UserActivitySummary ua
+    left join UserRecentComments urc on ua.UserId = urc.UserId
+    left join UserAcceptedAnswerStats uaas on ua.UserId = uaas.UserId
+)
+select
+    c.UserId,
+    c.DisplayName,
+    c.Reputation,
+    c.ReputationRank,
+    c.QuestionsCount,
+    c.AnswersCount,
+    c.TotalPostScore,
+    c.BadgeSummary,
+    c.RecentCommentsCount,
+    c.LastCommentDate,
+    c.AcceptedAnswersCount,
+    round(c.AvgAcceptedAnswerScore::numeric,2) as AvgAcceptedAnswerScore,
+    justify_interval(c.MedianAnswerDelay) as MedianAnswerDelay,
+    qaa.QuestionId,
+    qaa.Title as SampleQuestionTitle,
+    qaa.AnswerCount as QuestionAnswerCount,
+    round(qaa.AvgAnswerScore::numeric,2) as AvgAnswerScore,
+    qaa.LatestAnswerDate
+from CombinedUserStats c
+left join QuestionAnswerAggregates qaa on qaa.OwnerUserId = c.UserId
+where c.Reputation > 5000
+order by c.ReputationRank, qaa.AnswerCount desc nulls last
+limit 50;

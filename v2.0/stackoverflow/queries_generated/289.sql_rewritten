@@ -1,0 +1,384 @@
+-- {"query": "289.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 4131} 
+with
+-- Parameterizable date boundaries
+params as (
+  select
+    date_trunc('month', cast('2024-10-01 12:34:56' as timestamp)) - interval '24 months' as start_utc,
+    cast('2024-10-01 12:34:56' as timestamp) as end_utc
+),
+-- Normalize posts of interest (questions and answers) in the period, with tag array extraction and null-safe owner
+norm_posts as (
+  select
+    p.Id,
+    p.PostTypeId,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    coalesce(p.OwnerDisplayName, u.DisplayName, '[unknown]') as OwnerDisplay,
+    p.Title,
+    p.Tags,
+    case when p.PostTypeId = 1 then string_to_array(substring(p.Tags, 2, greatest(length(p.Tags)-2,0)), '><') else null end as tag_arr
+  from Posts p
+  left join Users u on u.Id = p.OwnerUserId
+  cross join params pr
+  where p.CreationDate between pr.start_utc and pr.end_utc
+    and p.PostTypeId in (1,2)
+),
+-- Compute per-post vote aggregates
+vote_agg as (
+  select
+    v.PostId,
+    sum(case when v.VoteTypeId = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.VoteTypeId = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.VoteTypeId = 8 then coalesce(v.BountyAmount,0) else 0 end) as bounty_started,
+    sum(case when v.VoteTypeId = 9 then coalesce(v.BountyAmount,0) else 0 end) as bounty_awarded,
+    count(*) as total_votes,
+    min(v.CreationDate) as first_vote_at,
+    max(v.CreationDate) as last_vote_at
+  from Votes v
+  join params pr on v.CreationDate between pr.start_utc and pr.end_utc
+  group by v.PostId
+),
+-- Comment aggregates per post
+comment_agg as (
+  select
+    c.PostId,
+    count(*) as comments,
+    sum(case when c.Score > 0 then 1 else 0 end) as pos_comments,
+    max(c.Score) as max_comment_score,
+    min(c.CreationDate) as first_comment_at,
+    max(c.CreationDate) as last_comment_at
+  from Comments c
+  join params pr on c.CreationDate between pr.start_utc and pr.end_utc
+  group by c.PostId
+),
+-- Badge counts per user in window and lifetime
+badge_user as (
+  select
+    u.Id as UserId,
+    count(*) filter (where b.Date between pr.start_utc and pr.end_utc) as badges_in_window,
+    count(*) as badges_all_time,
+    sum(case when b.Class=1 then 1 else 0 end) as golds,
+    sum(case when b.Class=2 then 1 else 0 end) as silvers,
+    sum(case when b.Class=3 then 1 else 0 end) as bronzes,
+    max(b.Date) as last_badge_at
+  from Users u
+  left join Badges b on b.UserId = u.Id
+  cross join params pr
+  group by u.Id
+),
+-- Post history signals: closures, locks, migrations, edits
+history_flags as (
+  select
+    ph.PostId,
+    max(case when ph.PostHistoryTypeId = 10 then 1 else 0 end) as was_closed,
+    max(case when ph.PostHistoryTypeId = 11 then 1 else 0 end) as was_reopened,
+    max(case when ph.PostHistoryTypeId in (14,15) and ph.PostHistoryTypeId=14 then 1 else 0 end) as was_locked,
+    max(case when ph.PostHistoryTypeId in (14,15) and ph.PostHistoryTypeId=15 then 1 else 0 end) as was_unlocked,
+    max(case when ph.PostHistoryTypeId in (4,5,6,24) then 1 else 0 end) as was_edited,
+    sum(case when ph.PostHistoryTypeId = 10 and ph.Comment ~ '^(101|102|103|104|105)$' then 1 else 0 end) as close_votes_with_reason,
+    min(ph.CreationDate) filter (where ph.PostHistoryTypeId in (4,5,6,24)) as first_edit_at,
+    count(*) filter (where ph.PostHistoryTypeId in (4,5,6,24)) as edit_count
+  from PostHistory ph
+  join params pr on ph.CreationDate between pr.start_utc and pr.end_utc
+  group by ph.PostId
+),
+-- Derive question-answer relationships within window
+qa as (
+  select
+    q.Id as QuestionId,
+    q.Title as QuestionTitle,
+    q.CreationDate as QuestionCreated,
+    q.Score as QuestionScore,
+    q.ViewCount as QuestionViews,
+    q.OwnerUserId as QuestionOwnerId,
+    q.OwnerDisplay as QuestionOwnerDisplay,
+    q.tag_arr,
+    q.AcceptedAnswerId,
+    a.Id as AnswerId,
+    a.OwnerUserId as AnswerOwnerId,
+    a.OwnerDisplay as AnswerOwnerDisplay,
+    a.Score as AnswerScore,
+    a.CreationDate as AnswerCreated
+  from norm_posts q
+  left join norm_posts a
+    on a.PostTypeId = 2
+   and a.ParentId = q.Id
+  where q.PostTypeId = 1
+),
+-- Rank answers per question by score and recency
+answer_ranked as (
+  select
+    qa.*,
+    row_number() over (partition by qa.QuestionId order by coalesce(qa.AnswerScore,-2147483648) desc, qa.AnswerCreated desc nulls last) as rn_score_desc,
+    row_number() over (partition by qa.QuestionId order by qa.AnswerCreated asc nulls last) as rn_first_answer,
+    count(qa.AnswerId) over (partition by qa.QuestionId) as answer_count_window
+  from qa
+),
+-- Select best and first answers for each question
+answer_picks as (
+  select
+    QuestionId,
+    max(QuestionTitle) as QuestionTitle,
+    max(QuestionCreated) as QuestionCreated,
+    max(QuestionScore) as QuestionScore,
+    max(QuestionViews) as QuestionViews,
+    max(QuestionOwnerId) as QuestionOwnerId,
+    max(QuestionOwnerDisplay) as QuestionOwnerDisplay,
+    max(accepted_answer_is_first)::int as accepted_answer_is_first,
+    max(accepted_answer_is_top)::int as accepted_answer_is_top,
+    max(answer_count_window) as answer_count_window,
+    max(best_answer_id) as BestAnswerId,
+    max(best_answer_owner_id) as BestAnswerOwnerId,
+    max(best_answer_score) as BestAnswerScore,
+    max(first_answer_id) as FirstAnswerId,
+    max(first_answer_owner_id) as FirstAnswerOwnerId,
+    max(first_answer_score) as FirstAnswerScore,
+    max(first_answer_latency_seconds) as FirstAnswerLatencySeconds,
+    max(best_answer_latency_seconds) as BestAnswerLatencySeconds
+  from (
+    select
+      ar.QuestionId,
+      ar.QuestionTitle,
+      ar.QuestionCreated,
+      ar.QuestionScore,
+      ar.QuestionViews,
+      ar.QuestionOwnerId,
+      ar.QuestionOwnerDisplay,
+      ar.answer_count_window,
+      case when ar.rn_first_answer = 1 then ar.AnswerId end as first_answer_id,
+      case when ar.rn_first_answer = 1 then ar.AnswerOwnerId end as first_answer_owner_id,
+      case when ar.rn_first_answer = 1 then ar.AnswerScore end as first_answer_score,
+      case when ar.rn_first_answer = 1 then extract(epoch from (ar.AnswerCreated - ar.QuestionCreated)) end as first_answer_latency_seconds,
+      case when ar.rn_score_desc = 1 then ar.AnswerId end as best_answer_id,
+      case when ar.rn_score_desc = 1 then ar.AnswerOwnerId end as best_answer_owner_id,
+      case when ar.rn_score_desc = 1 then ar.AnswerScore end as best_answer_score,
+      case when ar.rn_score_desc = 1 then extract(epoch from (ar.AnswerCreated - ar.QuestionCreated)) end as best_answer_latency_seconds,
+      case when ar.AcceptedAnswerId is not null and ar.rn_first_answer = 1 and ar.AnswerId = ar.AcceptedAnswerId then 1 else 0 end as accepted_answer_is_first,
+      case when ar.AcceptedAnswerId is not null and ar.rn_score_desc = 1 and ar.AnswerId = ar.AcceptedAnswerId then 1 else 0 end as accepted_answer_is_top
+    from answer_ranked ar
+  ) s
+  group by QuestionId
+),
+-- Tag expansion for questions
+tags_expanded as (
+  select
+    q.Id as QuestionId,
+    unnest(q.tag_arr) as tagname
+  from norm_posts q
+  where q.PostTypeId = 1
+),
+-- Compute per-tag aggregates and density
+tag_stats as (
+  select
+    te.tagname,
+    count(distinct te.QuestionId) as questions_with_tag,
+    avg(ap.QuestionScore) as avg_question_score,
+    percentile_cont(0.5) within group (order by ap.QuestionViews) as median_views,
+    sum(case when ap.accepted_answer_is_top = 1 then 1 else 0 end) as accepted_equals_top,
+    sum(ap.answer_count_window) as total_answers_seen
+  from tags_expanded te
+  join answer_picks ap on ap.QuestionId = te.QuestionId
+  group by te.tagname
+),
+-- Bring together post-level aggregates and user metrics
+post_enriched as (
+  select
+    q.QuestionId,
+    q.QuestionTitle,
+    q.QuestionCreated,
+    q.QuestionScore,
+    q.QuestionViews,
+    q.QuestionOwnerId,
+    q.QuestionOwnerDisplay,
+    q.answer_count_window,
+    q.BestAnswerId,
+    q.BestAnswerOwnerId,
+    q.BestAnswerScore,
+    q.FirstAnswerId,
+    q.FirstAnswerOwnerId,
+    q.FirstAnswerScore,
+    q.FirstAnswerLatencySeconds,
+    q.BestAnswerLatencySeconds,
+    coalesce(va_q.upvotes,0) as q_upvotes,
+    coalesce(va_q.downvotes,0) as q_downvotes,
+    coalesce(va_q.total_votes,0) as q_total_votes,
+    coalesce(ca_q.comments,0) as q_comments,
+    coalesce(ca_q.pos_comments,0) as q_pos_comments,
+    coalesce(hf.was_closed,0) as was_closed,
+    coalesce(hf.was_reopened,0) as was_reopened,
+    coalesce(hf.was_edited,0) as was_edited,
+    coalesce(hf.edit_count,0) as edit_count,
+    bu_q.badges_all_time as asker_badges_alltime,
+    bu_q.golds as asker_golds,
+    bu_q.silvers as asker_silvers,
+    bu_q.bronzes as asker_bronzes
+  from answer_picks q
+  left join vote_agg va_q on va_q.PostId = q.QuestionId
+  left join comment_agg ca_q on ca_q.PostId = q.QuestionId
+  left join history_flags hf on hf.PostId = q.QuestionId
+  left join badge_user bu_q on bu_q.UserId = q.QuestionOwnerId
+),
+-- Compute rolling activity windows per user for temporal complexity
+user_activity as (
+  select
+    p.OwnerUserId as UserId,
+    date_trunc('week', p.CreationDate) as week,
+    count(*) as posts_in_week,
+    sum(case when p.PostTypeId=1 then 1 else 0 end) as qs_in_week,
+    sum(case when p.PostTypeId=2 then 1 else 0 end) as as_in_week
+  from norm_posts p
+  where p.OwnerUserId is not null
+  group by p.OwnerUserId, date_trunc('week', p.CreationDate)
+),
+user_activity_windowed as (
+  select
+    ua.*,
+    sum(posts_in_week) over (partition by ua.UserId order by ua.week rows between 3 preceding and current row) as posts_last_4w,
+    sum(qs_in_week) over (partition by ua.UserId order by ua.week rows between 3 preceding and current row) as qs_last_4w,
+    sum(as_in_week) over (partition by ua.UserId order by ua.week rows between 3 preceding and current row) as as_last_4w
+  from user_activity ua
+),
+-- Correlated subquery: find if question owner interacted in comments on own question
+asker_commented as (
+  select
+    p.QuestionId,
+    exists (
+      select 1
+      from Comments c
+      where c.PostId = p.QuestionId
+        and c.UserId = p.QuestionOwnerId
+    ) as asker_commented_flag
+  from post_enriched p
+),
+-- Duplicate link indicators
+duplicate_links as (
+  select
+    pl.PostId as QuestionId,
+    count(*) filter (where pl.LinkTypeId = 3) as duplicate_links_count,
+    max(pl.CreationDate) filter (where pl.LinkTypeId = 3) as last_dup_link_at
+  from PostLinks pl
+  join Posts q on q.Id = pl.PostId and q.PostTypeId = 1
+  group by pl.PostId
+),
+-- Outlier detection using z-scores for views and scores
+post_stats as (
+  select
+    pe.*,
+    avg(pe.QuestionViews) over () as avg_views,
+    stddev_pop(pe.QuestionViews) over () as sd_views,
+    avg(pe.QuestionScore) over () as avg_score,
+    stddev_pop(pe.QuestionScore) over () as sd_score
+  from post_enriched pe
+),
+post_with_outlier_flags as (
+  select
+    ps.*,
+    case when ps.sd_views > 0 then (ps.QuestionViews - ps.avg_views) / ps.sd_views else null end as z_views,
+    case when ps.sd_score > 0 then (ps.QuestionScore - ps.avg_score) / ps.sd_score else null end as z_score,
+    case when ps.sd_views > 0 and (ps.QuestionViews - ps.avg_views) / ps.sd_views >= 3 then 1 else 0 end as is_view_outlier,
+    case when ps.sd_score > 0 and (ps.QuestionScore - ps.avg_score) / ps.sd_score >= 3 then 1 else 0 end as is_score_outlier
+  from post_stats ps
+),
+-- Build a string summary, including NULL logic and conditional concatenation
+string_summary as (
+  select
+    p.QuestionId,
+    ('Q#' || p.QuestionId::text) || ': ' ||
+    coalesce(substring(p.QuestionTitle from 1 for 80) || case when length(p.QuestionTitle) > 80 then '…' else '' end, '(no title)') ||
+    ' | Answers=' || coalesce(p.answer_count_window,0)::text ||
+    ' | Score=' || coalesce(p.QuestionScore,0)::text ||
+    ' | Views=' || coalesce(p.QuestionViews,0)::text ||
+    ' | Owner=' || coalesce(p.QuestionOwnerDisplay,'[unknown]') ||
+    case when p.is_view_outlier=1 then ' | VIEW-OUTLIER' else '' end ||
+    case when p.is_score_outlier=1 then ' | SCORE-OUTLIER' else '' end as summary
+  from post_with_outlier_flags p
+),
+-- Per-question consolidated tag stats (top 3 tags by overall tag popularity)
+question_tag_rank as (
+  select
+    te.QuestionId,
+    te.tagname,
+    ts.questions_with_tag,
+    row_number() over (partition by te.QuestionId order by ts.questions_with_tag desc nulls last, te.tagname asc) as rn
+  from tags_expanded te
+  left join tag_stats ts on ts.tagname = te.tagname
+),
+question_top_tags as (
+  select
+    qtr.QuestionId,
+    string_agg(qtr.tagname, ',' order by qtr.rn) as top3_tags
+  from question_tag_rank qtr
+  where qtr.rn <= 3
+  group by qtr.QuestionId
+)
+select
+  p.QuestionId,
+  p.QuestionCreated,
+  p.QuestionScore,
+  p.QuestionViews,
+  p.answer_count_window as AnswerCountWindow,
+  p.q_upvotes,
+  p.q_downvotes,
+  p.q_total_votes,
+  p.q_comments,
+  p.q_pos_comments,
+  p.was_closed,
+  p.was_reopened,
+  p.was_edited,
+  p.edit_count,
+  p.asker_badges_alltime,
+  p.asker_golds,
+  p.asker_silvers,
+  p.asker_bronzes,
+  ap.accepted_answer_is_first,
+  ap.accepted_answer_is_top,
+  p.FirstAnswerLatencySeconds,
+  p.BestAnswerLatencySeconds,
+  coalesce(dl.duplicate_links_count,0) as duplicate_links_count,
+  dl.last_dup_link_at,
+  p.z_views,
+  p.z_score,
+  p.is_view_outlier,
+  p.is_score_outlier,
+  st.summary as summary_text,
+  qt.top3_tags,
+  -- Windowed percentiles and ranks for additional benchmarks
+  percent_rank() over (order by p.QuestionViews) as pr_views,
+  cume_dist() over (order by p.QuestionScore) as cd_score,
+  dense_rank() over (order by p.QuestionScore desc) as dr_score_desc,
+  row_number() over (order by p.QuestionCreated asc) as rn_by_time,
+  -- Complex predicate-based bucket
+  case
+    when p.was_closed=1 then 'closed'
+    when p.answer_count_window=0 then 'unanswered'
+    when ap.accepted_answer_is_top=1 then 'accepted==top'
+    when ap.accepted_answer_is_first=1 then 'accepted==first'
+    else 'answered'
+  end as status_bucket
+from post_with_outlier_flags p
+left join answer_picks ap on ap.QuestionId = p.QuestionId
+left join asker_commented ac on ac.QuestionId = p.QuestionId
+left join duplicate_links dl on dl.QuestionId = p.QuestionId
+left join string_summary st on st.QuestionId = p.QuestionId
+left join question_top_tags qt on qt.QuestionId = p.QuestionId
+where
+  -- Complicated predicate mixing null logic, string search, and numeric thresholds
+  (
+    (p.QuestionScore >= 5 and p.QuestionViews >= 1000)
+    or (p.q_total_votes >= 10 and coalesce(p.q_upvotes - p.q_downvotes,0) >= 5)
+    or (p.was_closed = 1 and p.is_score_outlier = 1)
+    or (p.is_view_outlier = 1 and (qt.top3_tags is null or qt.top3_tags like '%performance%'))
+  )
+  and not (
+    p.was_closed = 1 and p.was_reopened = 1 and p.edit_count = 0
+  )
+order by
+  p.is_view_outlier desc,
+  p.is_score_outlier desc,
+  p.QuestionViews desc nulls last,
+  p.QuestionScore desc nulls last
+limit 500;

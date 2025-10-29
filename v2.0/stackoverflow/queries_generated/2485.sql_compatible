@@ -1,0 +1,87 @@
+with RecursiveUserBadges AS (
+    select u.Id as UserId, u.DisplayName, b.Name as BadgeName, b.Class,
+           ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY b.Date desc) as rn
+      from Users u
+      left join Badges b on u.Id = b.UserId
+      where u.Reputation > 1000
+),
+TopUserBadges as (
+    select UserId, DisplayName, BadgeName, Class
+      from RecursiveUserBadges
+      where rn <= 3
+),
+PostScores as (
+    select p.Id, p.PostTypeId, p.OwnerUserId, p.Title, p.CreationDate, p.Score,
+           (case when p.Tags is not null then array_length(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><'),1) else 0 end) as TagCount,
+           p.ViewCount,
+           dense_rank() over (partition by p.OwnerUserId order by p.CreationDate desc) as RecentRank
+      from Posts p
+      where p.PostTypeId in (1,2)
+),
+PostCommentsCount as (
+    select PostId, count(*) as CommentCount
+      from Comments
+      group by PostId
+),
+AcceptedAnswersCTE as (
+    select q.Id as QuestionId, a.Id as AnswerId, a.Score as AnswerScore,
+           row_number() over (partition by q.Id order by a.Score desc, a.CreationDate asc) as RankByScore
+      from Posts q
+      left join Posts a on a.Id = q.AcceptedAnswerId and a.PostTypeId = 2
+      where q.PostTypeId = 1
+),
+DuplicateLinksCTE as (
+    select pl.PostId, pl.RelatedPostId
+      from PostLinks pl
+      where pl.LinkTypeId = 3
+),
+RecentCloseVotes as (
+    select ph.PostId, prt.Name as CloseReason, ph.CreationDate as CloseVoteDate
+      from PostHistory ph
+      inner join CloseReasonTypes prt on cast(ph.Comment as int) = prt.Id
+      where ph.PostHistoryTypeId = 10
+        and ph.CreationDate > cast('2024-10-01' as date) - interval '30 days'
+),
+UserActivityWindow as (
+    select u.Id as UserId,
+           count(distinct p.Id) as PostsCount,
+           coalesce(sum(p.Score),0) as TotalPostScore,
+           count(distinct c.Id) as CommentsCount,
+           row_number() over (order by count(distinct p.Id) desc) as ActivityRank
+      from Users u
+      left join Posts p on p.OwnerUserId = u.Id and p.CreationDate > cast('2024-10-01' as date) - interval '90 days'
+      left join Comments c on c.UserId = u.Id and c.CreationDate > cast('2024-10-01' as date) - interval '90 days'
+      group by u.Id
+)
+select tu.UserId, tu.DisplayName,
+       string_agg(distinct concat(tu.Class, ':', tu.BadgeName), ', ') as TopBadges,
+       ua.PostsCount, ua.CommentsCount, ua.TotalPostScore,
+       ps.Id as RecentPostId, ps.Title as RecentPostTitle, ps.Score as RecentPostScore, ps.TagCount,
+       coalesce(pc.CommentCount,0) as RecentPostCommentCount,
+       aa.AnswerId as AcceptedAnswerId, aa.AnswerScore, aa.RankByScore,
+       dup.RelatedPostId as DuplicateOf,
+       closev.CloseReason, closev.CloseVoteDate
+  from TopUserBadges tu
+  join UserActivityWindow ua on ua.UserId = tu.UserId
+  left join PostScores ps on ps.OwnerUserId = tu.UserId and ps.RecentRank = 1
+  left join PostCommentsCount pc on pc.PostId = ps.Id
+  left join AcceptedAnswersCTE aa on aa.QuestionId = ps.Id and ps.PostTypeId = 1
+  left join DuplicateLinksCTE dup on dup.PostId = ps.Id
+  left join RecentCloseVotes closev on closev.PostId = ps.Id
+ where ua.ActivityRank <= 50
+ group by tu.UserId, tu.DisplayName, tu.Class, tu.BadgeName,
+          ua.PostsCount, ua.CommentsCount, ua.TotalPostScore,
+          ps.Id, ps.Title, ps.Score, ps.TagCount,
+          pc.CommentCount, aa.AnswerId, aa.AnswerScore, aa.RankByScore,
+          dup.RelatedPostId, closev.CloseReason, closev.CloseVoteDate
+ union
+ select u.Id, u.DisplayName,
+       null,
+       0, 0, 0,
+       null, null, null, 0,
+       null, null, null,
+       null, null
+  from Users u
+ where not exists (select 1 from Posts p where p.OwnerUserId = u.Id)
+ order by PostsCount desc nulls last, TotalPostScore desc nulls last, DisplayName
+ limit 100;

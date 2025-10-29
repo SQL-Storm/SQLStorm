@@ -1,0 +1,257 @@
+-- {"query": "1620.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3201} 
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswers,
+        MAX(P.CreationDate) AS LatestPostDate,
+        SUM(COALESCE(P.Score, 0)) AS TotalPostScore,
+        AVG(COALESCE(P.ViewCount, 0)) AS AveragePostViewCount,
+        -- Calculate the reputation tier based on reputation and total posts
+        CASE
+            WHEN U.Reputation >= 10000 AND COUNT(DISTINCT P.Id) >= 100 THEN 'Legendary'
+            WHEN U.Reputation >= 5000 AND COUNT(DISTINCT P.Id) >= 50 THEN 'Expert'
+            WHEN U.Reputation >= 1000 AND COUNT(DISTINCT P.Id) >= 10 THEN 'Contributor'
+            ELSE 'Novice'
+        END AS UserTier,
+        -- Rank users by reputation within their creation year
+        ROW_NUMBER() OVER (PARTITION BY EXTRACT(YEAR FROM U.CreationDate) ORDER BY U.Reputation DESC, U.Id ASC) AS ReputationRankInYear
+    FROM
+        Users U
+    LEFT JOIN
+        Posts P ON U.Id = P.OwnerUserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate
+),
+PostDetails AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.Title,
+        P.CreationDate,
+        P.Score,
+        P.ViewCount,
+        P.OwnerUserId,
+        P.AcceptedAnswerId,
+        P.ParentId,
+        P.LastActivityDate,
+        P.LastEditorUserId,
+        P.Tags,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.ClosedDate,
+        -- Calculate post activity score
+        (COALESCE(P.Score, 0) * 2) + COALESCE(P.CommentCount, 0) + (COALESCE(P.FavoriteCount, 0) * 3) AS ActivityScore,
+        -- Check if the post has a non-null accepted answer
+        CASE WHEN P.AcceptedAnswerId IS NOT NULL THEN TRUE ELSE FALSE END AS HasAcceptedAnswer,
+        -- Calculate the age of the post in days since last activity
+        EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - P.LastActivityDate)) / 86400 AS DaysSinceLastActivity,
+        -- Extract the first tag (if available) using a safe substring
+        CASE
+            WHEN P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2 AND POSITION('>' IN SUBSTRING(P.Tags, 2)) > 1
+            THEN SUBSTRING(P.Tags, 2, POSITION('>' IN SUBSTRING(P.Tags, 2)) - 1)
+            ELSE NULL
+        END AS FirstTag,
+        -- Count number of tags using string_to_array as hinted in schema
+        COALESCE(CARDINALITY(string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><')), 0) AS TagCount
+    FROM
+        Posts P
+    WHERE
+        P.PostTypeId IN (1, 2) -- Only questions and answers
+        AND P.CreationDate >= '2020-01-01' -- Limit data size for performance
+),
+LatestPostEditHistory AS (
+    SELECT
+        PH.PostId,
+        PH.CreationDate AS LastEditHistoryDate,
+        PH.UserId AS LastEditorHistoryUserId,
+        PHT.Name AS LastHistoryTypeName,
+        PH.Comment AS LastHistoryComment,
+        -- Determine if the last edit was a rollback or deletion-related action
+        CASE
+            WHEN PH.PostHistoryTypeId IN (7, 8, 9, 12, 10) THEN TRUE -- Rollback, Delete, Close
+            ELSE FALSE
+        END AS WasCriticalHistoryAction,
+        ROW_NUMBER() OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate DESC, PH.Id DESC) AS rn
+    FROM
+        PostHistory PH
+    JOIN
+        PostHistoryTypes PHT ON PH.PostHistoryTypeId = PHT.Id
+    WHERE
+        PH.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15) -- Edit, Rollback, Close, Reopen, Delete, Undelete, Lock, Unlock
+),
+AnswerAggregates AS (
+    SELECT
+        P.ParentId AS QuestionId,
+        COUNT(P.Id) AS TotalAnswersToQuestion,
+        SUM(COALESCE(P.Score, 0)) AS TotalAnswerScoreForQuestion,
+        AVG(COALESCE(P.Score, 0)) AS AvgAnswerScoreForQuestion,
+        MAX(P.CreationDate) AS LatestAnswerDateForQuestion
+    FROM
+        Posts P
+    WHERE
+        P.PostTypeId = 2 -- Answers
+    GROUP BY
+        P.ParentId
+),
+BadgesPerUser AS (
+    SELECT
+        B.UserId,
+        COUNT(B.Id) AS TotalBadges,
+        COUNT(CASE WHEN B.Class = 1 THEN B.Id END) AS GoldBadges,
+        COUNT(CASE WHEN B.Class = 2 THEN B.Id END) AS SilverBadges,
+        COUNT(CASE WHEN B.TagBased = TRUE THEN B.Id END) AS TagBasedBadges
+    FROM Badges B
+    GROUP BY B.UserId
+)
+SELECT
+    UE.DisplayName AS User_DisplayName,
+    UE.Reputation AS User_Reputation,
+    UE.UserTier AS User_ReputationTier,
+    UE.ReputationRankInYear AS User_ReputationRankInCreationYear,
+    COALESCE(BP.TotalBadges, 0) AS User_TotalBadges,
+    COALESCE(BP.GoldBadges, 0) AS User_GoldBadges,
+    COALESCE(BP.SilverBadges, 0) AS User_SilverBadges,
+    PD.Title AS Post_Title,
+    PD.PostId AS Post_Id,
+    PT.Name AS Post_TypeName,
+    PD.CreationDate AS Post_CreationDate,
+    PD.Score AS Post_Score,
+    PD.ViewCount AS Post_ViewCount,
+    PD.ActivityScore AS Post_CalculatedActivityScore,
+    PD.HasAcceptedAnswer AS Post_HasAcceptedAnswer,
+    PD.DaysSinceLastActivity AS Post_DaysSinceLastActivity,
+    PD.FirstTag AS Post_MainTag,
+    PD.TagCount AS Post_TagCount,
+    LPEH.LastEditHistoryDate AS Post_LastEditOrHistoryDate,
+    LPEH.LastHistoryTypeName AS Post_LastHistoryType,
+    LPEH.WasCriticalHistoryAction AS Post_HadCriticalCriticalHistoryAction,
+    AA.TotalAnswersToQuestion AS Question_TotalAnswers,
+    AA.AvgAnswerScoreForQuestion AS Question_AverageAnswerScore,
+    -- Correlated Subquery: Get the text of the highest-scoring comment for the post
+    (
+        SELECT
+            C.Text
+        FROM
+            Comments C
+        WHERE
+            C.PostId = PD.PostId
+        ORDER BY
+            C.Score DESC, C.CreationDate DESC
+        LIMIT 1
+    ) AS TopCommentText,
+    -- Window Function: Calculate the average score of posts by the same user in the same month
+    AVG(PD.Score) OVER (PARTITION BY UE.UserId, EXTRACT(MONTH FROM PD.CreationDate) ORDER BY PD.CreationDate) AS AvgMonthlyUserPostScore,
+    -- NULL logic and complex expression for Last Editor
+    COALESCE(
+        (SELECT U2.DisplayName FROM Users U2 WHERE U2.Id = PD.LastEditorUserId),
+        'N/A - Original Post / No Editor'
+    ) AS Post_LastEditorDisplayName,
+    -- Complex classification based on multiple criteria
+    CASE
+        WHEN
+            PD.PostTypeId = 1 -- Question specific criteria
+            AND (LOWER(PD.Title) LIKE '%performance%' OR LOWER(PD.Title) LIKE '%optimization%')
+            AND (PD.FirstTag IN ('sql', 'postgresql', 'mysql', 'database') OR PD.Tags LIKE '%<benchmark>%')
+            AND UE.UserTier IN ('Expert', 'Legendary')
+            AND PD.ActivityScore >= 20
+            AND PD.DaysSinceLastActivity <= 60
+            AND PD.HasAcceptedAnswer IS TRUE
+            AND AA.TotalAnswersToQuestion > 1
+        THEN 'HighValuePerformanceQuestion'
+        WHEN
+            PD.PostTypeId = 2 -- Answer specific criteria
+            AND PD.Score >= 10
+            AND PD.DaysSinceLastActivity <= 45
+            AND UE.UserTier IN ('Expert', 'Legendary', 'Contributor')
+            AND (LPEH.WasCriticalHistoryAction IS FALSE OR LPEH.WasCriticalHistoryAction IS NULL)
+            AND PD.OwnerUserId = LPEH.LastEditorHistoryUserId -- Last editor was the owner
+            AND EXISTS (SELECT 1 FROM Comments C WHERE C.PostId = PD.PostId AND C.CreationDate > PD.CreationDate - INTERVAL '7 days' AND C.Score >= 1) -- Recent positive comment
+        THEN 'TopTierRecentAnswer'
+        WHEN
+            PD.PostTypeId = 1 -- Another question scenario
+            AND PD.Title IS NOT NULL
+            AND PD.Score > 0
+            AND PD.ViewCount > 500
+            AND PD.TagCount >= 3
+            AND (AA.TotalAnswersToQuestion IS NULL OR AA.TotalAnswersToQuestion < 5) -- Not too many answers, still active discussion
+            AND PD.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days' -- Recent question
+            AND PD.ClosedDate IS NULL -- Not closed
+            AND NOT EXISTS (SELECT 1 FROM PostLinks PL WHERE PL.PostId = PD.PostId AND PL.LinkTypeId = 3) -- Not a duplicate
+        THEN 'NewPromisingQuestion'
+        ELSE 'GeneralPost'
+    END AS Post_Classification,
+    -- String aggregate for top 3 related tags
+    (
+        SELECT
+            STRING_AGG(T.TagName, ', ')
+        FROM
+            Tags T
+        WHERE
+            PD.Tags IS NOT NULL AND PD.Tags LIKE CONCAT('%<', T.TagName, '>%')
+        ORDER BY T.Count DESC
+        LIMIT 3
+    ) AS Top3RelatedTags
+FROM
+    UserEngagement UE
+JOIN
+    PostDetails PD ON UE.UserId = PD.OwnerUserId
+JOIN
+    PostTypes PT ON PD.PostTypeId = PT.Id
+LEFT JOIN
+    LatestPostEditHistory LPEH ON PD.PostId = LPEH.PostId AND LPEH.rn = 1
+LEFT JOIN
+    AnswerAggregates AA ON PD.PostId = AA.QuestionId AND PD.PostTypeId = 1 -- Only join for questions
+LEFT JOIN
+    BadgesPerUser BP ON UE.UserId = BP.UserId
+WHERE
+    PD.CreationDate >= '2020-01-01' -- Ensure consistent filtering
+    AND PD.LastActivityDate IS NOT NULL -- Exclude posts with no activity date
+    AND PD.PostTypeId IN (1, 2) -- Ensure only questions and answers
+    AND (
+        ( -- Scenario 1: Highly active, well-maintained questions by reputable users
+            PD.PostTypeId = 1
+            AND PD.HasAcceptedAnswer IS TRUE
+            AND COALESCE(AA.TotalAnswersToQuestion, 0) > 0
+            AND PD.ActivityScore >= 15
+            AND UE.UserTier IN ('Expert', 'Legendary')
+            AND (LPEH.WasCriticalHistoryAction IS FALSE OR LPEH.WasCriticalHistoryAction IS NULL) -- Not critically messed with
+            AND LPEH.LastEditHistoryDate IS NOT NULL -- Has history
+            AND EXISTS (
+                SELECT 1
+                FROM Comments C
+                WHERE C.PostId = PD.PostId
+                AND C.Score > 0
+                AND C.CreationDate > PD.CreationDate - INTERVAL '90 days' -- Recent positive comment
+            )
+        )
+        OR
+        ( -- Scenario 2: Highly upvoted answers from productive contributors
+            PD.PostTypeId = 2
+            AND PD.Score >= 5
+            AND PD.DaysSinceLastActivity <= 60
+            AND UE.UserTier IN ('Contributor', 'Expert', 'Legendary')
+            AND COALESCE(BP.SilverBadges, 0) >= 1 -- User has at least one silver badge
+            AND NOT EXISTS (
+                SELECT 1 FROM Votes V WHERE V.PostId = PD.PostId AND V.VoteTypeId = 4 -- No 'Offensive' votes
+            )
+        )
+        OR
+        ( -- Scenario 3: Newly created popular questions or posts with specific tags
+            PD.PostTypeId = 1
+            AND PD.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '6 months' -- Relatively new
+            AND PD.ViewCount > 1000
+            AND PD.Score > 0
+            AND PD.TagCount >= 2
+            AND (LOWER(PD.Title) LIKE '%api%' OR LOWER(PD.FirstTag) = 'api')
+            AND PD.ClosedDate IS NULL -- Not closed
+            AND (AA.TotalAnswersToQuestion IS NULL OR AA.TotalAnswersToQuestion < 5) -- Not too many answers, still active discussion
+        )
+    )
+ORDER BY
+    UE.Reputation DESC, PD.ActivityScore DESC, PD.CreationDate DESC
+LIMIT 1000;

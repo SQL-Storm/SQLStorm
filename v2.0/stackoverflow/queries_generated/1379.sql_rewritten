@@ -1,0 +1,228 @@
+-- {"query": "1379.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 4165} 
+WITH UserEngagementSummary AS (
+    -- Aggregates user activity, reputation metrics, badge information, and overall post contributions.
+    -- Filters for established and recently active users.
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName AS UserName,
+        u.Reputation,
+        u.UpVotes,
+        u.DownVotes,
+        -- Calculate days active since creation.
+        EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - u.CreationDate)) / (60 * 60 * 24) AS DaysActive,
+        -- Calculate reputation earned per day active, handling potential division by zero.
+        (u.Reputation * 1.0) / NULLIF(EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - u.CreationDate)) / (60 * 60 * 24), 0) AS RepPerDayActive,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        -- Check for presence of a Gold badge (Class = 1).
+        MAX(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS HasGoldBadge,
+        -- Check for specific "Editor" related badges using string matching.
+        MAX(CASE WHEN b.Name ILIKE '%editor%' THEN 1 ELSE 0 END) AS HasEditorBadge,
+        -- Calculate upvote ratio, handling potential division by zero.
+        (u.UpVotes * 1.0) / NULLIF(u.UpVotes + u.DownVotes, 0) AS UpVoteRatio,
+        MAX(u.LastAccessDate) AS LastAccessDate,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        SUM(p.Score) FILTER (WHERE p.PostTypeId IN (1,2)) AS TotalPostScore,
+        SUM(p.ViewCount) FILTER (WHERE p.PostTypeId = 1) AS TotalQuestionViews
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Reputation > 1000 -- Focus on users with significant reputation
+      AND u.LastAccessDate >= cast('2024-10-01' as date) - INTERVAL '180 days' -- Active within the last 6 months
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes, u.CreationDate
+),
+PostVersionAndEngagement AS (
+    -- Processes post history for initial and latest body text, counts edits, and aggregates comment data.
+    -- Also calculates post age and various engagement metrics.
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        -- Calculate post age in days.
+        EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - p.CreationDate)) / (60 * 60 * 24) AS PostAgeDays,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.ViewCount,
+        p.Score,
+        p.AnswerCount,
+        p.CommentCount,
+        COALESCE(p.FavoriteCount, 0) AS FavoriteCount, -- Handle NULL FavoriteCount
+        p.ClosedDate,
+        -- Count specific types of edits (Title, Body, Tags).
+        COUNT(ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (4, 5, 6)) AS EditCount,
+        MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId IN (4, 5, 6)) AS LatestEditHistoryDate,
+        -- Correlated subquery to retrieve the very first body text entry.
+        (SELECT ph_init.Text FROM PostHistory ph_init WHERE ph_init.PostId = p.Id AND ph_init.PostHistoryTypeId = 2 ORDER BY ph_init.CreationDate ASC LIMIT 1) AS InitialBodyText,
+        -- Correlated subquery to retrieve the most recent 'Edit Body' text.
+        (SELECT ph_latest.Text FROM PostHistory ph_latest WHERE ph_latest.PostId = p.Id AND ph_latest.PostHistoryTypeId = 5 ORDER BY ph_latest.CreationDate DESC LIMIT 1) AS LatestEditedBodyText,
+        COALESCE(AVG(c.Score), 0) AS AvgCommentScore, -- Average score of comments on the post.
+        MAX(c.CreationDate) AS LatestCommentDate
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    GROUP BY p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.LastEditDate, p.LastActivityDate, p.ViewCount, p.Score, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.ClosedDate
+),
+TagPerformanceAgg AS (
+    -- Extracts and aggregates tags for each post from the 'Tags' string.
+    SELECT
+        p.Id AS PostId,
+        STRING_AGG(TRIM(UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><'))), ', ') AS AllTags,
+        COUNT(DISTINCT TRIM(UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><')))) AS DistinctTagCount
+    FROM Posts p
+    WHERE p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2 -- Ensure tags exist and are not empty
+    GROUP BY p.Id
+),
+DuplicateLinkAnalysis AS (
+    -- Identifies posts that are duplicates and provides metrics about the original duplicate post.
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId AS DuplicateOfPostId,
+        p_rel.Score AS DuplicatePostScore,
+        p_rel.CreationDate AS DuplicatePostCreationDate,
+        p_rel.ClosedDate AS DuplicatePostClosedDate,
+        -- Calculate days for the duplicate post to be closed.
+        EXTRACT(EPOCH FROM (p_rel.ClosedDate - p_rel.CreationDate)) / (60 * 60 * 24) AS DuplicateClosureDays
+    FROM PostLinks pl
+    JOIN Posts p_rel ON pl.RelatedPostId = p_rel.Id
+    WHERE pl.LinkTypeId = 3 -- LinkType 3 indicates a duplicate relationship
+)
+-- Main Query: Gathers comprehensive data for high-engagement posts by active, reputable users.
+SELECT
+    ues.UserId,
+    ues.UserName,
+    ues.Reputation,
+    ues.RepPerDayActive,
+    ues.TotalBadges,
+    ues.HasGoldBadge,
+    ues.HasEditorBadge,
+    pve.PostId,
+    pt.Name AS PostTypeName,
+    p.Title,
+    pve.PostCreationDate,
+    pve.PostAgeDays,
+    pve.Score AS PostScore,
+    pve.ViewCount,
+    pve.AnswerCount,
+    pve.CommentCount,
+    pve.FavoriteCount,
+    pve.EditCount,
+    pve.AvgCommentScore,
+    -- Generate excerpt from initial body, handling potential NULLs and length.
+    LOWER(TRIM(SUBSTRING(COALESCE(pve.InitialBodyText, ''), 1, 150))) || CASE WHEN LENGTH(COALESCE(pve.InitialBodyText, '')) > 150 THEN '...' ELSE '' END AS InitialBodyExcerpt,
+    -- Generate excerpt from latest body, prioritizing edited body over initial.
+    LOWER(TRIM(SUBSTRING(COALESCE(pve.LatestEditedBodyText, pve.InitialBodyText, ''), 1, 150))) || CASE WHEN LENGTH(COALESCE(pve.LatestEditedBodyText, pve.InitialBodyText, '')) > 150 THEN '...' ELSE '' END AS LatestBodyExcerpt,
+    tpa.AllTags,
+    tpa.DistinctTagCount,
+    dla.DuplicateOfPostId,
+    dla.DuplicatePostScore,
+    dla.DuplicateClosureDays,
+    -- Categorize posts based on type and status.
+    CASE
+        WHEN pve.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Accepted Answered Question'
+        WHEN pve.PostTypeId = 1 AND pve.ClosedDate IS NOT NULL THEN 'Closed Question'
+        WHEN pve.PostTypeId = 1 AND pve.AnswerCount = 0 THEN 'Unanswered Question'
+        WHEN pve.PostTypeId = 2 AND p.ParentId IS NOT NULL THEN 'Answer Post'
+        ELSE 'Other User Post Type'
+    END AS PostStatusCategory,
+    -- Window function: Rank posts by score and views within each user's contributions.
+    ROW_NUMBER() OVER (PARTITION BY ues.UserId ORDER BY pve.Score DESC, pve.ViewCount DESC) AS RankByScoreAndViewsForUser,
+    -- Window function: Calculate average score for the post's type across all posts.
+    AVG(pve.Score) OVER (PARTITION BY pt.Name) AS AvgScoreForPostType,
+    -- Calculate score to view ratio, handling potential division by zero.
+    (pve.Score * 1.0) / NULLIF(pve.ViewCount, 0) AS ScoreToViewRatio,
+    -- Correlated subquery: Count historical bookmarks (VoteTypeId = 5) before feature changes.
+    (SELECT COUNT(DISTINCT v.UserId) FROM Votes v WHERE v.PostId = pve.PostId AND v.VoteTypeId = 5) AS TotalBookmarksHistorical,
+    -- Window function: Calculate user's average score for posts of this specific type.
+    AVG(pve.Score) OVER (PARTITION BY ues.UserId, pve.PostTypeId) AS UserAvgScoreForThisPostType
+FROM PostVersionAndEngagement pve
+JOIN Users p_owner ON pve.OwnerUserId = p_owner.Id
+JOIN UserEngagementSummary ues ON p_owner.Id = ues.UserId
+JOIN Posts p ON pve.PostId = p.Id -- Re-join Posts for additional attributes like Title, AcceptedAnswerId.
+JOIN PostTypes pt ON pve.PostTypeId = pt.Id
+LEFT JOIN DuplicateLinkAnalysis dla ON pve.PostId = dla.PostId
+LEFT JOIN TagPerformanceAgg tpa ON pve.PostId = tpa.PostId
+WHERE pve.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = pve.PostTypeId AND Score > 0 AND ViewCount > 10) -- Correlated subquery: post score is above average for its type, for posts with some views.
+  AND (pve.CommentCount > 2 OR pve.EditCount > 0) -- Posts with notable engagement or edits.
+  AND pve.PostTypeId IN (1, 2) -- Focus on Questions and Answers.
+  AND EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = ues.UserId AND b.Class = 1) -- Ensure user has at least one gold badge.
+  AND pve.InitialBodyText IS NOT NULL AND LENGTH(pve.InitialBodyText) > 150 -- Significant initial body content.
+  AND (p.LastActivityDate >= cast('2024-10-01' as date) - INTERVAL '1 year' OR p.LastEditDate >= cast('2024-10-01' as date) - INTERVAL '1 year') -- Post active within the last year.
+  AND COALESCE(p.ClosedDate, '2050-01-01'::timestamp) > pve.PostCreationDate + INTERVAL '30 days' -- Exclude posts closed very quickly, or not closed at all.
+  AND p.ContentLicense = 'CC BY-SA 4.0' -- Filter by specific content license.
+
+UNION ALL
+
+-- Secondary Query: Focuses on community-owned posts, low-score posts, or specific tag wiki entries.
+-- This part provides a contrasting view for posts with different ownership or engagement patterns.
+SELECT
+    p.OwnerUserId AS UserId, -- Can be NULL for community-owned posts.
+    COALESCE(u.DisplayName, 'Community/Deleted User') AS UserName,
+    COALESCE(u.Reputation, 0) AS Reputation,
+    NULL AS RepPerDayActive, -- Not applicable for potentially unowned posts.
+    NULL AS TotalBadges,
+    NULL AS HasGoldBadge,
+    NULL AS HasEditorBadge,
+    p.Id AS PostId,
+    pt.Name AS PostTypeName,
+    p.Title,
+    p.CreationDate AS PostCreationDate,
+    EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - p.CreationDate)) / (60 * 60 * 24) AS PostAgeDays,
+    p.Score AS PostScore,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+    COUNT(ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (4, 5, 6)) AS EditCount,
+    COALESCE(AVG(c.Score), 0) AS AvgCommentScore,
+    LOWER(TRIM(SUBSTRING(
+        COALESCE(
+            (SELECT ph_init.Text FROM PostHistory ph_init WHERE ph_init.PostId = p.Id AND ph_init.PostHistoryTypeId = 2 ORDER BY ph_init.CreationDate ASC LIMIT 1),
+            p.Body -- Fallback to current body if history missing
+        ),
+        1, 150
+    ))) || CASE WHEN LENGTH(COALESCE(
+            (SELECT ph_init.Text FROM PostHistory ph_init WHERE ph_init.PostId = p.Id AND ph_init.PostHistoryTypeId = 2 ORDER BY ph_init.CreationDate ASC LIMIT 1),
+            p.Body
+        )) > 150 THEN '...' ELSE '' END AS InitialBodyExcerpt,
+    LOWER(TRIM(SUBSTRING(
+        COALESCE(
+            (SELECT ph_latest.Text FROM PostHistory ph_latest WHERE ph_latest.PostId = p.Id AND ph_latest.PostHistoryTypeId = 5 ORDER BY ph_latest.CreationDate DESC LIMIT 1),
+            (SELECT ph_init.Text FROM PostHistory ph_init WHERE ph_init.PostId = p.Id AND ph_init.PostHistoryTypeId = 2 ORDER BY ph_init.CreationDate ASC LIMIT 1),
+            p.Body -- Ultimate fallback to current body
+        ),
+        1, 150
+    ))) || CASE WHEN LENGTH(COALESCE(
+            (SELECT ph_latest.Text FROM PostHistory ph_latest WHERE ph_latest.PostId = p.Id AND ph_latest.PostHistoryTypeId = 5 ORDER BY ph_latest.CreationDate DESC LIMIT 1),
+            (SELECT ph_init.Text FROM PostHistory ph_init WHERE ph_init.PostId = p.Id AND ph_init.PostHistoryTypeId = 2 ORDER BY ph_init.CreationDate ASC LIMIT 1),
+            p.Body
+        )) > 150 THEN '...' ELSE '' END AS LatestBodyExcerpt,
+    STRING_AGG(TRIM(UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><'))), ', ') AS AllTags,
+    COUNT(DISTINCT TRIM(UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><')))) AS DistinctTagCount,
+    dla_comm.DuplicateOfPostId,
+    dla_comm.DuplicatePostScore,
+    dla_comm.DuplicateClosureDays,
+    CASE
+        WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Wiki Post'
+        WHEN p.Score <= 0 AND p.PostTypeId = 1 THEN 'Low Score/Poor Question'
+        WHEN pt.Id IN (4, 5) THEN 'Tag Wiki Entry'
+        ELSE 'Other Low Engagement Post'
+    END AS PostStatusCategory,
+    NULL AS RankByScoreAndViewsForUser, -- Not applicable for this contrasting set.
+    AVG(p.Score) OVER (PARTITION BY pt.Name) AS AvgScoreForPostType,
+    (p.Score * 1.0) / NULLIF(p.ViewCount, 0) AS ScoreToViewRatio,
+    (SELECT COUNT(DISTINCT v.UserId) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 5) AS TotalBookmarksHistorical,
+    NULL AS UserAvgScoreForThisPostType -- Not applicable for community/unowned posts.
+FROM Posts p
+JOIN PostTypes pt ON p.PostTypeId = pt.Id
+LEFT JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN Comments c ON p.Id = c.PostId
+LEFT JOIN DuplicateLinkAnalysis dla_comm ON p.Id = dla_comm.PostId
+WHERE (p.OwnerUserId IS NULL OR p.Score <= 0 OR pt.Id IN (4, 5)) -- Community owned, low score, or tag wiki posts.
+  AND p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '2 years' -- Limit to somewhat recent posts.
+  AND NOT EXISTS (SELECT 1 FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 1) -- Not just a simple linked post.
+  AND COALESCE(p.ViewCount, 0) < 1000 -- Focus on less popular posts for this branch.
+  AND p.ContentLicense = 'CC BY-SA 4.0'
+GROUP BY p.Id, pt.Name, p.Title, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, u.DisplayName, u.Reputation, p.CommunityOwnedDate, p.OwnerUserId, p.Body, dla_comm.DuplicateOfPostId, dla_comm.DuplicatePostScore, dla_comm.DuplicateClosureDays
+ORDER BY Reputation DESC NULLS LAST, PostScore DESC, PostAgeDays ASC;

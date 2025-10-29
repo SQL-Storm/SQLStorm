@@ -1,0 +1,245 @@
+WITH UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostScore,
+        NTILE(5) OVER (ORDER BY u.Reputation DESC, u.CreationDate ASC) AS ReputationTier,
+        DATE_PART('day', AGE(u.LastAccessDate, u.CreationDate)) AS DaysActive,
+        COALESCE(u.Views, 0) AS UserViews,
+        COALESCE(u.UpVotes, 0) AS UserUpVotes,
+        COALESCE(u.DownVotes, 0) AS UserDownVotes
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes
+),
+PostHistoricalMetrics AS (
+    SELECT
+        ph.PostId,
+        MIN(ph.CreationDate) AS FirstHistoryEventDate,
+        MAX(ph.CreationDate) AS LastHistoryEventDate,
+        COUNT(DISTINCT ph.UserId) AS DistinctEditors,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9) THEN 1 ELSE 0 END) AS ContentEditCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (10, 12, 14) THEN 1 ELSE 0 END) AS CloseDeleteLockEvents,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 1 THEN LENGTH(ph.Text) ELSE NULL END) AS InitialBodyLength,
+        DATE_PART('hour', AGE(MAX(ph.CreationDate), MIN(ph.CreationDate))) AS HoursBetweenFirstAndLastEdit
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (1, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)
+    GROUP BY ph.PostId
+),
+QuestionDetails AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.OwnerUserId,
+        p.CreationDate AS QuestionCreationDate,
+        p.Score AS QuestionScore,
+        COALESCE(p.ViewCount, 0) AS ViewCount,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+        p.Title,
+        p.Tags,
+        p.ClosedDate,
+        COALESCE(p.AcceptedAnswerId, -1) AS AcceptedAnswerId,
+        LENGTH(p.Body) AS QuestionBodyLength,
+        COUNT(DISTINCT pl_dup.RelatedPostId) FILTER (WHERE pl_dup.LinkTypeId = 3) AS DuplicateLinkCount,
+        COUNT(DISTINCT pl_linked.RelatedPostId) FILTER (WHERE pl_linked.LinkTypeId = 1) AS LinkedPostCount,
+        SUM(CASE WHEN c.Score > 0 THEN 1 ELSE 0 END) AS PositiveCommentCount,
+        STRING_AGG(DISTINCT TRIM(BOTH '<>' FROM tag_val), ',') AS AssociatedTagNames
+    FROM Posts p
+    LEFT JOIN PostLinks pl_dup ON p.Id = pl_dup.PostId
+    LEFT JOIN PostLinks pl_linked ON p.Id = pl_linked.PostId
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN LATERAL UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><')) AS t(tag_val) ON TRUE
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.FavoriteCount, p.Title, p.Tags, p.ClosedDate, p.AcceptedAnswerId, p.Body
+),
+AnswerDetails AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.OwnerUserId AS AnswerOwnerUserId,
+        a.CreationDate AS AnswerCreationDate,
+        a.Score AS AnswerScore,
+        COALESCE(a.CommentCount, 0) AS AnswerCommentCount,
+        LENGTH(a.Body) AS AnswerBodyLength,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.CreationDate ASC) AS AnswerOrderForQuestion,
+        LAG(a.Score, 1, 0) OVER (PARTITION BY a.ParentId ORDER BY a.CreationDate ASC) AS PreviousAnswerScore,
+        (SELECT COUNT(b.Id) FROM Badges b WHERE b.UserId = a.OwnerUserId AND b.Date < a.CreationDate AND b.Class = 1) AS GoldBadgesAtAnswerTime
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+),
+CombinedPostAnalysis AS (
+    SELECT
+        qd.QuestionId AS PostId,
+        'Question' AS PostType,
+        qd.OwnerUserId,
+        qd.QuestionCreationDate AS CreationDate,
+        qd.QuestionScore AS Score,
+        qd.ViewCount,
+        qd.AnswerCount,
+        qd.FavoriteCount,
+        qd.Title,
+        qd.Tags,
+        qd.AssociatedTagNames,
+        qd.QuestionBodyLength AS BodyLength,
+        phm.DistinctEditors,
+        phm.ContentEditCount,
+        phm.CloseDeleteLockEvents,
+        CAST(NULL AS NUMERIC) AS AnswerScoreRelativeToQuestion,
+        qd.DuplicateLinkCount,
+        qd.LinkedPostCount,
+        qd.PositiveCommentCount,
+        CAST(NULL AS INTEGER) AS AnswerOrder,
+        CAST(NULL AS INTEGER) AS GoldBadgesAtPostTime,
+        (qd.ClosedDate IS NOT NULL) AS IsClosed,
+        qd.AcceptedAnswerId,
+        phm.HoursBetweenFirstAndLastEdit
+    FROM QuestionDetails qd
+    LEFT JOIN PostHistoricalMetrics phm ON qd.QuestionId = phm.PostId
+
+    UNION ALL
+
+    SELECT
+        ad.AnswerId AS PostId,
+        'Answer' AS PostType,
+        ad.AnswerOwnerUserId AS OwnerUserId,
+        ad.AnswerCreationDate AS CreationDate,
+        ad.AnswerScore AS Score,
+        CAST(NULL AS INTEGER) AS ViewCount,
+        CAST(NULL AS INTEGER) AS AnswerCount,
+        CAST(NULL AS INTEGER) AS FavoriteCount,
+        q.Title AS Title,
+        q.Tags AS Tags,
+        qd.AssociatedTagNames,
+        ad.AnswerBodyLength AS BodyLength,
+        phm.DistinctEditors,
+        phm.ContentEditCount,
+        phm.CloseDeleteLockEvents,
+        CASE WHEN q.Score = 0 OR q.Score IS NULL THEN NULL ELSE CAST(ad.AnswerScore AS NUMERIC) / CAST(q.Score AS NUMERIC) END AS AnswerScoreRelativeToQuestion,
+        CAST(NULL AS INTEGER) AS DuplicateLinkCount,
+        CAST(NULL AS INTEGER) AS LinkedPostCount,
+        ad.AnswerCommentCount AS PositiveCommentCount,
+        ad.AnswerOrderForQuestion AS AnswerOrder,
+        ad.GoldBadgesAtAnswerTime AS GoldBadgesAtPostTime,
+        (q.ClosedDate IS NOT NULL) AS IsClosed,
+        q.AcceptedAnswerId,
+        phm.HoursBetweenFirstAndLastEdit
+    FROM AnswerDetails ad
+    INNER JOIN Posts q ON ad.QuestionId = q.Id AND q.PostTypeId = 1
+    LEFT JOIN QuestionDetails qd ON q.Id = qd.QuestionId
+    LEFT JOIN PostHistoricalMetrics phm ON ad.AnswerId = phm.PostId
+),
+FinalAnalysis AS (
+    SELECT
+        cpa.PostId,
+        cpa.PostType,
+        cpa.OwnerUserId,
+        cpa.CreationDate,
+        cpa.Score,
+        cpa.ViewCount,
+        cpa.AnswerCount,
+        cpa.FavoriteCount,
+        cpa.Title,
+        cpa.Tags,
+        cpa.AssociatedTagNames,
+        cpa.BodyLength,
+        cpa.DistinctEditors,
+        cpa.ContentEditCount,
+        cpa.CloseDeleteLockEvents,
+        cpa.AnswerScoreRelativeToQuestion,
+        cpa.DuplicateLinkCount,
+        cpa.LinkedPostCount,
+        cpa.PositiveCommentCount,
+        cpa.AnswerOrder,
+        cpa.GoldBadgesAtPostTime,
+        cpa.IsClosed,
+        cpa.AcceptedAnswerId,
+        cpa.HoursBetweenFirstAndLastEdit,
+        ue.DisplayName AS OwnerDisplayName,
+        ue.Reputation AS OwnerReputation,
+        ue.ReputationTier,
+        ue.DaysActive AS OwnerDaysActive,
+        ue.TotalQuestions AS OwnerTotalQuestions,
+        ue.TotalAnswers AS OwnerTotalAnswers,
+        ue.TotalPostScore AS OwnerTotalPostScore,
+        DATE_PART('day', AGE(cpa.CreationDate, ue.UserCreationDate)) AS DaysSinceOwnerRegistered,
+        (
+            COALESCE(cpa.Score, 0) * 0.4
+            + COALESCE(cpa.ViewCount, 0) * 0.05
+            + COALESCE(cpa.AnswerCount, 0) * 0.15
+            + COALESCE(cpa.FavoriteCount, 0) * 0.2
+            + (CASE WHEN cpa.PostType = 'Answer' AND cpa.PostId = cpa.AcceptedAnswerId THEN 20 ELSE 0 END)
+            - (COALESCE(cpa.CloseDeleteLockEvents, 0) * 10)
+            + (COALESCE(cpa.GoldBadgesAtPostTime, 0) * 2)
+        ) AS ContentQualityScore,
+        CASE
+            WHEN LOWER(cpa.Title) LIKE '%error%' OR LOWER(cpa.Title) LIKE '%bug%' OR LOWER(cpa.Title) LIKE '%problem%' THEN 'Problematic'
+            WHEN LOWER(cpa.Title) LIKE '%how to%' OR LOWER(cpa.Title) LIKE '%guide%' OR LOWER(cpa.Title) LIKE '%tutorial%' THEN 'Instructional'
+            WHEN LENGTH(TRIM(REPLACE(COALESCE(cpa.Title, ''), ' ', ''))) > 80 THEN 'VerboseTitle'
+            WHEN cpa.Title IS NULL THEN 'NoTitle'
+            ELSE 'Neutral'
+        END AS TitleCategory,
+        CASE
+            WHEN cpa.Tags LIKE '%<java>%' OR cpa.Tags LIKE '%<c#>%' OR cpa.Tags LIKE '%<dotnet>%' THEN 'JVM_CLR_Related'
+            WHEN cpa.Tags LIKE '%<python>%' OR cpa.Tags LIKE '%<javascript>%' OR cpa.Tags LIKE '%<nodejs>%' THEN 'Scripting_Web_Related'
+            WHEN cpa.Tags LIKE '%<sql>%' OR cpa.Tags LIKE '%<database>%' THEN 'Database_Related'
+            ELSE 'Other_Tech'
+        END AS TechStackCategory,
+        AVG(cpa.Score) OVER (PARTITION BY ue.ReputationTier) AS AvgScoreInReputationTier,
+        MAX(cpa.CreationDate) OVER (PARTITION BY cpa.OwnerUserId) AS LastPostByOwner,
+        SUM(cpa.Score) OVER (PARTITION BY cpa.OwnerUserId ORDER BY cpa.CreationDate ASC) AS RunningSumOwnerScore,
+        cpa.BodyLength AS PostBodyCharacterCount,
+        (LENGTH(COALESCE(CAST(cpa.BodyLength AS TEXT), '')) - LENGTH(REPLACE(LOWER(COALESCE(CAST(cpa.BodyLength AS TEXT), '')), 'code', ''))) / NULLIF(LENGTH('code'), 0) AS CodeKeywordMentions,
+        (cpa.PostId = cpa.AcceptedAnswerId AND cpa.PostType = 'Answer' AND cpa.OwnerUserId = (SELECT q.OwnerUserId FROM Posts q WHERE q.Id = cpa.AcceptedAnswerId)) AS IsAcceptedAnswerByQuestionOwner
+    FROM CombinedPostAnalysis cpa
+    LEFT JOIN UserEngagement ue ON cpa.OwnerUserId = ue.UserId
+)
+SELECT
+    fa.PostId,
+    fa.PostType,
+    fa.Title,
+    fa.OwnerDisplayName,
+    fa.OwnerReputation,
+    fa.ReputationTier,
+    fa.CreationDate,
+    fa.Score,
+    fa.ViewCount,
+    fa.AnswerCount,
+    fa.FavoriteCount,
+    fa.ContentQualityScore,
+    fa.TitleCategory,
+    fa.TechStackCategory,
+    fa.AvgScoreInReputationTier,
+    fa.LastPostByOwner,
+    fa.IsClosed,
+    fa.DuplicateLinkCount,
+    fa.GoldBadgesAtPostTime,
+    fa.PostBodyCharacterCount,
+    fa.CodeKeywordMentions,
+    fa.IsAcceptedAnswerByQuestionOwner,
+    fa.AssociatedTagNames,
+    fa.AnswerScoreRelativeToQuestion,
+    fa.AnswerOrder,
+    fa.RunningSumOwnerScore,
+    fa.HoursBetweenFirstAndLastEdit
+FROM FinalAnalysis fa
+WHERE
+    fa.OwnerReputation > 5000
+    AND fa.CreationDate >= TIMESTAMP '2021-01-01'
+    AND fa.ContentQualityScore > 75
+    AND (fa.PostType = 'Question' OR (fa.PostType = 'Answer' AND fa.Score > 10 AND fa.AnswerOrder = 1))
+    AND fa.TechStackCategory IN ('JVM_CLR_Related', 'Scripting_Web_Related', 'Database_Related')
+    AND fa.CodeKeywordMentions >= 1
+ORDER BY
+    fa.ContentQualityScore DESC,
+    fa.CreationDate DESC,
+    fa.OwnerReputation DESC,
+    fa.PostId ASC
+LIMIT 5000;

@@ -1,0 +1,79 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.Title,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.LastActivityDate,
+        U.DisplayName AS OwnerDisplayName,
+        P.OwnerUserId,
+        U.Reputation,
+        COUNT(DISTINCT V.Id) AS TotalVotes,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.Score DESC) AS ScoreRank
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    LEFT JOIN 
+        Votes V ON P.Id = V.PostId
+    WHERE 
+        P.PostTypeId = 1 AND P.ViewCount > 100
+    GROUP BY 
+        P.Id, P.Title, P.Score, P.ViewCount, P.CreationDate, P.LastActivityDate, U.DisplayName, P.OwnerUserId, U.Reputation
+),
+BadgesSummary AS (
+    SELECT 
+        B.UserId,
+        COUNT(DISTINCT B.Id) AS BadgeCount,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadgeCount,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadgeCount,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadgeCount
+    FROM 
+        Badges B
+    GROUP BY 
+        B.UserId
+),
+PostTags AS (
+    -- normalize tags string like "<tag1><tag2>" into rows; adjust delimiter logic for different systems
+    SELECT
+        P.Id AS PostId,
+        TRIM(BOTH '<>' FROM regexp_split_to_table(P.Tags, '><')) AS TagName
+    FROM Posts P
+    WHERE P.Tags IS NOT NULL
+)
+SELECT 
+    RP.Id,
+    RP.Title,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.LastActivityDate,
+    RP.OwnerDisplayName,
+    RP.Reputation,
+    RS.BadgeCount,
+    RS.GoldBadgeCount,
+    RS.SilverBadgeCount,
+    RS.BronzeBadgeCount,
+    CASE 
+        WHEN RP.ScoreRank <= 10 THEN 'Top Scorer'
+        WHEN RP.ScoreRank <= 100 THEN 'Active Contributor'
+        ELSE 'Regular Contributor'
+    END AS ContributionLevel,
+    STRING_AGG(TG.TagName, ', ' ORDER BY COUNT(*) DESC) AS TopTags
+FROM 
+    RankedPosts RP
+LEFT JOIN 
+    BadgesSummary RS ON RP.OwnerUserId = RS.UserId
+LEFT JOIN 
+    Posts P ON RP.Id = P.Id
+LEFT JOIN 
+    PostTags TG ON RP.Id = TG.PostId
+LEFT JOIN 
+    Tags TagRef ON TG.TagName = TagRef.TagName
+GROUP BY 
+    RP.Id, RP.Title, RP.Score, RP.ViewCount, RP.CreationDate, RP.LastActivityDate, RP.OwnerDisplayName, RP.Reputation, RS.BadgeCount, RS.GoldBadgeCount, RS.SilverBadgeCount, RS.BronzeBadgeCount, RP.ScoreRank
+ORDER BY 
+    RP.Score DESC, RP.ViewCount DESC;

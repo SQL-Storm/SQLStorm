@@ -1,0 +1,119 @@
+-- {"query": "2637.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1513} 
+with RecursiveTagHierarchy as (
+    select t.Id, t.TagName, t.Count, t.IsModeratorOnly, t.IsRequired,
+           array[t.TagName] as AncestorTags
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+    union all
+    select t.Id, t.TagName, t.Count, t.IsModeratorOnly, t.IsRequired,
+           r.AncestorTags || t.TagName
+    from Tags t
+    join RecursiveTagHierarchy r on r.Id = t.Id - 1 -- arbitrary adjacency for recursion demo
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0 and not t.TagName = any(r.AncestorTags)
+),
+UserBadgesCTE as (
+    select b.UserId,
+           b.Name as BadgeName,
+           b.Class,
+           row_number() over (partition by b.UserId order by b.Date desc) as BadgeRank
+    from Badges b
+    where b.Date >= current_date - interval '365 day'
+),
+UserActivityWindow as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        coalesce(sum(p.Score),0) as TotalPostScore,
+        rank() over (order by coalesce(sum(p.Score),0) desc) as ScoreRank,
+        dense_rank() over (order by u.Reputation desc) as ReputationRank,
+        max(p.CreationDate) as LastPostDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+),
+PostEngagement as (
+    select p.Id as PostId,
+           p.Title,
+           p.PostTypeId,
+           p.CreationDate,
+           p.OwnerUserId,
+           p.Score,
+           p.ViewCount,
+           count(distinct c.Id) as CommentCount,
+           count(distinct v.Id) filter (where v.VoteTypeId = 2) as UpVotes,
+           count(distinct v.Id) filter (where v.VoteTypeId = 3) as DownVotes,
+           sum(case when ph.PostHistoryTypeId = 10 then 1 else 0 end) as CloseVotes,
+           case when p.ClosedDate is not null then 1 else 0 end as IsClosed,
+           row_number() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as RankByScoreView
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+    left join Votes v on v.PostId = p.Id
+    left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 10
+    where p.CreationDate >= current_date - interval '180 day'
+    group by p.Id, p.Title, p.PostTypeId, p.CreationDate, p.OwnerUserId, p.Score, p.ViewCount, p.ClosedDate
+),
+CorrelatedAnswersWithScore as (
+    select ans.Id as AnswerId,
+           ans.ParentId as QuestionId,
+           ans.Score as AnswerScore,
+           (select count(*) from Votes v2 where v2.PostId = ans.Id and v2.VoteTypeId = 3) as AnswerDownVotes,
+           ans.CreationDate
+    from Posts ans
+    where ans.PostTypeId = 2 and ans.Score > 0
+),
+FinalSelectableData as (
+    select p.PostId, p.Title, p.PostTypeId, p.CreationDate, ua.DisplayName as OwnerName,
+           ua.ReputationRank, ua.ScoreRank, ua.QuestionCount, ua.AnswerCount, ua.TotalPostScore,
+           p.CommentCount, p.UpVotes, p.DownVotes, p.CloseVotes, p.IsClosed, p.RankByScoreView,
+           (select max(csub.AnswerScore - csub.AnswerDownVotes) from CorrelatedAnswersWithScore csub where csub.QuestionId = p.PostId) as MaxAnswerNetScore,
+           string_agg(distinct t.TagName, '|') as ConcatenatedTags,
+           -- complex string manipulation: reverse and substring start from space after reversing title (simulate complex expression)
+           reverse(substring(reverse(coalesce(p.Title,'NoTitle')), position(' ' in reverse(coalesce(p.Title,'NoTitle'))) + 1, 50)) as ComplexTitleFragment
+    from PostEngagement p
+    left join Users ua on ua.Id = p.OwnerUserId
+    left join Posts pq on pq.Id = p.PostId and pq.PostTypeId = 1
+    left join Tags t on pq.Tags like '%' || t.TagName || '%'
+    group by p.PostId, p.Title, p.PostTypeId, p.CreationDate, ua.DisplayName, ua.ReputationRank, ua.ScoreRank, ua.QuestionCount, ua.AnswerCount, ua.TotalPostScore,
+             p.CommentCount, p.UpVotes, p.DownVotes, p.CloseVotes, p.IsClosed, p.RankByScoreView
+),
+FilteredByUserAndDate as (
+    select f.*
+    from FinalSelectableData f
+    join UserActivityWindow ua on ua.UserId = (case when f.OwnerName is null then -1 else ua.UserId end)
+    where f.CreationDate between current_date - interval '90 day' and current_date
+      and (f.TotalPostScore > 10 or f.UpVotes > 5)
+),
+UnionSet as (
+    select * from FilteredByUserAndDate where PostTypeId = 1
+    union all
+    select * from FilteredByUserAndDate where PostTypeId = 2
+),
+AggregatedResults as (
+    select PostTypeId,
+           count(*) as TotalPosts,
+           avg(ScoreRank::float) as AvgScoreRank,
+           avg(ReputationRank::float) as AvgReputationRank,
+           sum(CommentCount) as SumComments,
+           sum(UpVotes) as SumUpVotes,
+           sum(CloseVotes) as SumCloseVotes,
+           avg(MaxAnswerNetScore) as AvgMaxAnswerNetScore,
+           bool_and(IsClosed = 0) as AllOpen,
+           min(CreationDate) as EarliestPost,
+           max(CreationDate) as LatestPost
+    from UnionSet
+    group by PostTypeId
+)
+select ar.*,
+       ub.BadgeName,
+       ub.Class as BadgeClass,
+       rh.AncestorTags[array_upper(rh.AncestorTags,1)] as MostRecentAncestorTag
+from AggregatedResults ar
+left join UserBadgesCTE ub on ub.UserId = (
+    select OwnerUserId from Posts p2 where p2.PostTypeId = ar.PostTypeId limit 1
+) and ub.BadgeRank = 1
+left join RecursiveTagHierarchy rh on rh.TagName = (
+    select unnest(string_to_array(min(u.ConcatenatedTags), '|')) from UnionSet u where u.PostTypeId = ar.PostTypeId limit 1
+)
+order by ar.PostTypeId asc;

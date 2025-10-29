@@ -1,0 +1,182 @@
+WITH UserEngagementMetrics AS (
+    SELECT
+        U.Id AS UserId,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswers,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COALESCE(SUM(P.Score), 0) AS TotalPostScore,
+        COALESCE(AVG(P.Score), 0.0) AS AvgPostScore,
+        COALESCE(SUM(P.ViewCount), 0) AS TotalQuestionViews,
+        COALESCE(SUM(P.FavoriteCount), 0) AS TotalFavoriteCounts,
+        MAX(P.CreationDate) AS LastPostCreationDate
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    GROUP BY U.Id
+),
+PostClosureAnalysis AS (
+    SELECT
+        PH_Close.PostId,
+        PH_Close.UserId AS CloserUserId,
+        PH_Reopen.UserId AS ReopenerUserId,
+        PH_Close.CreationDate AS ClosedDate,
+        PH_Reopen.CreationDate AS ReopenedDate,
+        AGE(PH_Reopen.CreationDate, PH_Close.CreationDate) AS TimeToReopenInterval,
+        P.OwnerUserId,
+        P.Title,
+        COALESCE(CR.Name, 'Unknown Reason') AS CloseReasonName,
+        COALESCE(CAST(SUBSTRING(PH_Close.Comment FROM 'ClosedReasonId="(\d+)"') AS INTEGER),
+                 CAST(PH_Close.Comment AS INTEGER)) AS CloseReasonId,
+        ROW_NUMBER() OVER (PARTITION BY PH_Close.PostId ORDER BY PH_Reopen.CreationDate DESC, PH_Close.CreationDate DESC) AS rn_post_reopen_event
+    FROM PostHistory PH_Close
+    INNER JOIN PostHistory PH_Reopen ON PH_Close.PostId = PH_Reopen.PostId
+                                       AND PH_Close.PostHistoryTypeId = 10
+                                       AND PH_Reopen.PostHistoryTypeId = 11
+                                       AND PH_Reopen.CreationDate > PH_Close.CreationDate
+    INNER JOIN Posts P ON PH_Close.PostId = P.Id
+    LEFT JOIN CloseReasonTypes CR ON COALESCE(CAST(SUBSTRING(PH_Close.Comment FROM 'ClosedReasonId="(\d+)"') AS INTEGER),
+                                                CAST(PH_Close.Comment AS INTEGER)) = CR.Id
+    WHERE P.OwnerUserId IS NOT NULL
+),
+UserBadgeMilestones AS (
+    SELECT
+        B.UserId,
+        COUNT(B.Id) AS TotalBadges,
+        COUNT(CASE WHEN B.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN B.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN B.Class = 3 THEN 1 END) AS BronzeBadges,
+        MIN(CASE WHEN B.Class = 1 THEN B.Date END) AS FirstGoldBadgeDate,
+        MIN(CASE WHEN B.Class = 2 THEN B.Date END) AS FirstSilverBadgeDate,
+        MIN(CASE WHEN B.Class = 3 THEN B.Date END) AS FirstBronzeBadgeDate
+    FROM Badges B
+    GROUP BY B.UserId
+),
+TagPerformanceMetrics AS (
+    SELECT
+        TRIM(t) AS TagName,
+        SUM(P.ViewCount) AS TotalTagViews,
+        SUM(P.AnswerCount) AS TotalTagAnswers,
+        COUNT(P.Id) AS TotalTagQuestions
+    FROM Posts P,
+         UNNEST(string_to_array(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags) - 2), '><')) AS t
+    WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2
+    GROUP BY TRIM(t)
+),
+AnalyzedUsers AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        UE.TotalPosts,
+        UE.TotalQuestions,
+        UE.TotalAnswers,
+        UE.TotalComments,
+        UE.AvgPostScore,
+        UE.TotalQuestionViews,
+        UE.TotalFavoriteCounts,
+        B.GoldBadges,
+        B.SilverBadges,
+        B.BronzeBadges,
+        B.FirstGoldBadgeDate,
+        (
+            SELECT TPM.TagName
+            FROM Posts UP,
+                 UNNEST(string_to_array(SUBSTRING(UP.Tags FROM 2 FOR LENGTH(UP.Tags) - 2), '><')) AS user_tag(t)
+            JOIN TagPerformanceMetrics TPM ON TRIM(user_tag.t) = TPM.TagName
+            WHERE UP.OwnerUserId = U.Id
+              AND UP.PostTypeId = 1
+              AND UP.Tags IS NOT NULL AND LENGTH(UP.Tags) > 2
+            GROUP BY TPM.TagName
+            ORDER BY SUM(TPM.TotalTagViews) DESC, SUM(TPM.TotalTagQuestions) DESC
+            LIMIT 1
+        ) AS TopOwnedTagByViews,
+        NTILE(5) OVER (ORDER BY U.Reputation DESC, UE.TotalPosts DESC) AS ReputationActivityTier,
+        EXISTS (
+            SELECT 1
+            FROM Votes V
+            JOIN Posts P_V ON V.PostId = P_V.Id
+            WHERE P_V.OwnerUserId = U.Id
+              AND V.VoteTypeId = 4
+            LIMIT 1
+        ) AS HasOffensiveVotes,
+        COUNT(PCA.PostId) AS TotalClosedReopenedQuestions,
+        COALESCE(AVG(EXTRACT(EPOCH FROM PCA.TimeToReopenInterval)) / 3600.0, 0.0) AS AvgHoursToReopenQuestion,
+        MAX(PCA.ClosedDate) AS LatestQuestionClosedDate,
+        (U.Reputation * COALESCE(UE.AvgPostScore, 0.0) + (COALESCE(B.TotalBadges, 0) * 10.0))
+        / NULLIF(1.0 + COALESCE(AVG(EXTRACT(EPOCH FROM PCA.TimeToReopenInterval)) / 3600.0, 0.0), 0.0) AS UserResponsivenessScore,
+        COALESCE(SUBSTRING(U.AboutMe FROM 1 FOR 50), 'No description') AS AboutMeSnippet,
+        CASE WHEN U.WebsiteUrl IS NULL THEN 'N/A' ELSE 'Provided' END AS HasWebsiteUrl,
+        ARRAY_AGG(DISTINCT PCA.Title || ' (' || COALESCE(PCA.CloseReasonName, 'N/A') || ')') FILTER (WHERE PCA.PostId IS NOT NULL) AS AffectedQuestionTitles
+    FROM Users U
+    LEFT JOIN UserEngagementMetrics UE ON U.Id = UE.UserId
+    LEFT JOIN UserBadgeMilestones B ON U.Id = B.UserId
+    LEFT JOIN PostClosureAnalysis PCA ON U.Id = PCA.OwnerUserId AND PCA.rn_post_reopen_event = 1
+    WHERE U.Reputation > 100
+      AND COALESCE(UE.TotalPosts, 0) > 5
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate,
+        UE.TotalPosts, UE.TotalQuestions, UE.TotalAnswers, UE.TotalComments, UE.AvgPostScore,
+        UE.TotalQuestionViews, UE.TotalFavoriteCounts,
+        B.GoldBadges, B.SilverBadges, B.BronzeBadges, B.FirstGoldBadgeDate,
+        U.AboutMe, U.WebsiteUrl
+    HAVING
+        COUNT(PCA.PostId) >= 1
+        OR COALESCE(B.GoldBadges, 0) >= 1
+),
+TopReputationUsers AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        UE.TotalPosts,
+        UE.TotalQuestions,
+        UE.TotalAnswers,
+        UE.TotalComments,
+        UE.AvgPostScore,
+        UE.TotalQuestionViews,
+        UE.TotalFavoriteCounts,
+        B.GoldBadges,
+        B.SilverBadges,
+        B.BronzeBadges,
+        B.FirstGoldBadgeDate,
+        NULL AS TopOwnedTagByViews,
+        NTILE(5) OVER (ORDER BY U.Reputation DESC) AS ReputationActivityTier,
+        EXISTS (
+            SELECT 1
+            FROM Votes V
+            JOIN Posts P_V ON V.PostId = P_V.Id
+            WHERE P_V.OwnerUserId = U.Id
+              AND V.VoteTypeId = 4
+            LIMIT 1
+        ) AS HasOffensiveVotes,
+        0 AS TotalClosedReopenedQuestions,
+        0.0 AS AvgHoursToReopenQuestion,
+        NULL AS LatestQuestionClosedDate,
+        U.Reputation * COALESCE(UE.AvgPostScore, 0.0) AS UserResponsivenessScore,
+        COALESCE(SUBSTRING(U.AboutMe FROM 1 FOR 50), 'No description') AS AboutMeSnippet,
+        CASE WHEN U.WebsiteUrl IS NULL THEN 'N/A' ELSE 'Provided' END AS HasWebsiteUrl,
+        ARRAY[] AS AffectedQuestionTitles
+    FROM Users U
+    LEFT JOIN UserEngagementMetrics UE ON U.Id = UE.UserId
+    LEFT JOIN UserBadgeMilestones B ON U.Id = B.UserId
+    WHERE U.Reputation > 100000
+      AND U.Id NOT IN (SELECT UserId FROM AnalyzedUsers)
+      AND COALESCE(UE.TotalAnswers, 0) > 50
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate,
+        UE.TotalPosts, UE.TotalQuestions, UE.TotalAnswers, UE.TotalComments, UE.AvgPostScore,
+        UE.TotalQuestionViews, UE.TotalFavoriteCounts,
+        B.GoldBadges, B.SilverBadges, B.BronzeBadges, B.FirstGoldBadgeDate,
+        U.AboutMe, U.WebsiteUrl
+)
+SELECT *
+FROM AnalyzedUsers
+UNION ALL
+SELECT *
+FROM TopReputationUsers
+ORDER BY Reputation DESC, UserResponsivenessScore DESC NULLS LAST;

@@ -1,0 +1,108 @@
+WITH 
+    /* Expand tags from questions */
+    tag_posts AS (
+        SELECT 
+            p.Id                     AS QuestionId,
+            p.OwnerUserId            AS QuestionOwnerId,
+            p.CreationDate,
+            p.Score,
+            UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags)-2)), '><')) AS TagName
+        FROM Posts p
+        WHERE p.PostTypeId = 1                         -- only questions
+          AND p.Tags IS NOT NULL
+    ),
+    /* Answers linked to those questions */
+    answer_posts AS (
+        SELECT 
+            a.Id                      AS AnswerId,
+            a.ParentId                AS QuestionId,
+            a.OwnerUserId             AS AnswerOwnerId,
+            a.CreationDate,
+            a.Score                   AS AnswerScore
+        FROM Posts a
+        WHERE a.PostTypeId = 2                         -- only answers
+    ),
+    /* Aggregate per tag-user */
+    tag_user_agg AS (
+        SELECT 
+            tp.TagName,
+            u.Id                      AS UserId,
+            u.DisplayName,
+            COUNT(DISTINCT ap.QuestionId)          AS AnswersProvided,
+            SUM(ap.AnswerScore)                    AS TotalAnswerScore,
+            AVG(ap.AnswerScore)                    AS AvgAnswerScore,
+            RANK() OVER (PARTITION BY tp.TagName 
+                         ORDER BY SUM(ap.AnswerScore) DESC) AS ScoreRank
+        FROM tag_posts tp
+        JOIN answer_posts ap ON tp.QuestionId = ap.QuestionId
+        JOIN Users u ON ap.AnswerOwnerId = u.Id
+        GROUP BY tp.TagName, u.Id, u.DisplayName
+    ),
+    /* Keep only top-5 users per tag */
+    top_tag_users AS (
+        SELECT *
+        FROM tag_user_agg
+        WHERE ScoreRank <= 5
+    ),
+    /* Badge counts per user */
+    badge_counts AS (
+        SELECT 
+            b.UserId,
+            COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+            COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+            COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+    /* Recent vote totals per post (last 30 days) */
+    recent_votes AS (
+        SELECT 
+            v.PostId,
+            SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes v
+        JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+        WHERE v.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '30 days'
+        GROUP BY v.PostId
+    )
+SELECT 
+    ttu.TagName,
+    ttu.UserId,
+    ttu.DisplayName,
+    ttu.AnswersProvided,
+    ttu.TotalAnswerScore,
+    ROUND(ttu.AvgAnswerScore, 2)                     AS AvgAnswerScore,
+    ttu.ScoreRank,
+    COALESCE(bc.GoldBadges, 0)                       AS GoldBadges,
+    COALESCE(bc.SilverBadges, 0)                     AS SilverBadges,
+    COALESCE(bc.BronzeBadges, 0)                     AS BronzeBadges,
+    COALESCE(rv.UpVotes, 0)                          AS RecentUpVotes,
+    COALESCE(rv.DownVotes, 0)                        AS RecentDownVotes,
+    CASE 
+        WHEN ttu.AvgAnswerScore IS NULL THEN 'NoScore'
+        WHEN ttu.AvgAnswerScore >= 10      THEN 'High'
+        WHEN ttu.AvgAnswerScore >= 5       THEN 'Medium'
+        ELSE                               'Low'
+    END                                               AS ScoreCategory
+FROM top_tag_users ttu
+LEFT JOIN Tags tg 
+       ON tg.TagName = ttu.TagName
+LEFT JOIN badge_counts bc 
+       ON bc.UserId = ttu.UserId
+LEFT JOIN LATERAL (
+    /* most recent answer by the user that belongs to this tag */
+    SELECT rv.UpVotes, rv.DownVotes
+    FROM answer_posts ap
+    JOIN recent_votes rv ON rv.PostId = ap.AnswerId
+    WHERE ap.AnswerOwnerId = ttu.UserId
+      AND EXISTS (
+          SELECT 1
+          FROM tag_posts tp
+          WHERE tp.QuestionId = ap.QuestionId
+            AND tp.TagName = ttu.TagName
+      )
+    ORDER BY ap.CreationDate DESC
+    LIMIT 1
+) rv ON TRUE
+WHERE (tg.IsModeratorOnly = 0 OR tg.IsModeratorOnly IS NULL)
+ORDER BY ttu.TagName, ttu.ScoreRank;

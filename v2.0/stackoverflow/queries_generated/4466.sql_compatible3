@@ -1,0 +1,186 @@
+WITH
+  RankedPostEdits AS (
+    SELECT
+      ph.PostId,
+      ph.PostHistoryTypeId,
+      ph.UserId,
+      ph.CreationDate,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId, ph.PostHistoryTypeId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6)
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      COUNT(DISTINCT p.Id) AS QuestionCount,
+      COUNT(DISTINCT a.Id) AS AnswerCount,
+      SUM(CASE WHEN c.UserId = u.Id THEN 1 ELSE 0 END) AS CommentCount,
+      MAX(u.CreationDate) AS UserCreationDate,
+      AVG(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1.0 ELSE 0.0 END) AS AvgAnswerAcceptedRate
+    FROM Users u
+    LEFT JOIN Posts p
+      ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+    LEFT JOIN Posts a
+      ON u.Id = a.OwnerUserId AND a.PostTypeId = 2
+    LEFT JOIN Comments c
+      ON u.Id = c.UserId
+    GROUP BY
+      u.Id,
+      u.DisplayName
+  ),
+  TagContribution AS (
+    SELECT
+      p.Id AS PostId,
+      TRIM(LOWER(tag)) AS TagName,
+      COUNT(DISTINCT p.Id) OVER (PARTITION BY TRIM(LOWER(tag))) AS TagPostCount,
+      ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY CASE WHEN TRIM(LOWER(tag)) IN ('sql', 'performance', 'query') THEN 1 ELSE 2 END, TRIM(LOWER(tag))) AS TagOrder
+    FROM Posts p,
+    LATERAL (
+      SELECT value AS tag
+      FROM (
+        SELECT
+          regexp_split_to_table(
+            replace(replace(p.Tags, '><', '|'), '<', ''),
+            '\|'
+          ) AS value
+      ) s
+    ) t
+    WHERE
+      p.PostTypeId = 1 AND p.Tags IS NOT NULL
+  ),
+  MostActiveUser AS (
+    SELECT
+      UserId,
+      DisplayName,
+      QuestionCount,
+      AnswerCount,
+      UserCreationDate,
+      AvgAnswerAcceptedRate,
+      ROW_NUMBER() OVER (ORDER BY QuestionCount DESC, AnswerCount DESC) AS UserRank
+    FROM UserActivity
+  )
+SELECT
+  p.Id AS PostId,
+  p.Title,
+  pt.Name AS PostTypeName,
+  u.DisplayName AS OwnerDisplayName,
+  p.CreationDate,
+  p.Score,
+  p.ViewCount,
+  p.AnswerCount,
+  p.CommentCount,
+  p.FavoriteCount,
+  p.ClosedDate,
+  p.CommunityOwnedDate,
+  CASE WHEN p.ClosedDate IS NOT NULL THEN EXTRACT(EPOCH FROM (CAST(p.ClosedDate AS timestamp) - CAST(p.CreationDate AS timestamp)))/86400 ELSE NULL END AS TimeToClose,
+  rp_title.UserId AS LastTitleEditorId,
+  rp_title.CreationDate AS LastTitleEditDate,
+  rp_body.UserId AS LastBodyEditorId,
+  rp_body.CreationDate AS LastBodyEditDate,
+  rp_tags.UserId AS LastTagsEditorId,
+  rp_tags.CreationDate AS LastTagsEditDate,
+  COALESCE(tc.TagName, 'No Specific Tags') AS PrimaryTag,
+  tc.TagPostCount,
+  ua.DisplayName AS MostActiveUser,
+  ua.QuestionCount,
+  ua.AnswerCount,
+  ua.UserCreationDate,
+  ua.AvgAnswerAcceptedRate,
+  COALESCE(
+    (
+      SELECT
+        COUNT(*)
+      FROM Votes v
+      WHERE
+        v.PostId = p.Id AND v.VoteTypeId = 2
+    ),
+    0
+  ) AS UpVoteCount,
+  COALESCE(
+    (
+      SELECT
+        COUNT(*)
+      FROM Votes v
+      WHERE
+        v.PostId = p.Id AND v.VoteTypeId = 3
+    ),
+    0
+  ) AS DownVoteCount,
+  CASE
+    WHEN EXISTS (
+      SELECT
+        1
+      FROM PostLinks pl
+      WHERE
+        pl.PostId = p.Id AND pl.LinkTypeId = 3
+    ) THEN 'Is Duplicate'
+    ELSE 'Not Explicitly Duplicate'
+  END AS DuplicateStatus
+FROM Posts p
+JOIN PostTypes pt
+  ON p.PostTypeId = pt.Id
+LEFT JOIN Users u
+  ON p.OwnerUserId = u.Id
+LEFT JOIN RankedPostEdits rp_title
+  ON p.Id = rp_title.PostId AND rp_title.PostHistoryTypeId = 4 AND rp_title.rn = 1
+LEFT JOIN RankedPostEdits rp_body
+  ON p.Id = rp_body.PostId AND rp_body.PostHistoryTypeId = 5 AND rp_body.rn = 1
+LEFT JOIN RankedPostEdits rp_tags
+  ON p.Id = rp_tags.PostId AND rp_tags.PostHistoryTypeId = 6 AND rp_tags.rn = 1
+LEFT JOIN TagContribution tc
+  ON p.Id = tc.PostId AND tc.TagOrder = 1
+LEFT JOIN MostActiveUser ua
+  ON ua.UserRank = 1
+WHERE
+  (
+    p.PostTypeId = 1
+    AND p.OwnerUserId IS NOT NULL
+    AND p.CreationDate BETWEEN '2023-01-01' AND '2023-12-31'
+    AND LOWER(p.Title) LIKE '%performance%'
+  )
+  OR p.Id IN (
+    SELECT
+      PostId
+    FROM Comments
+    WHERE
+      CHAR_LENGTH(Text) > 500 AND UserId IS NOT NULL
+  )
+UNION ALL
+SELECT
+  p.Id,
+  p.Title,
+  pt.Name,
+  u.DisplayName,
+  p.CreationDate,
+  p.Score,
+  p.ViewCount,
+  p.AnswerCount,
+  p.CommentCount,
+  p.FavoriteCount,
+  p.ClosedDate,
+  p.CommunityOwnedDate,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL
+FROM Posts p
+JOIN PostTypes pt
+  ON p.PostTypeId = pt.Id
+LEFT JOIN Users u
+  ON p.OwnerUserId = u.Id
+WHERE
+  p.PostTypeId = 2 AND p.Score > 100 AND p.ParentId IS NULL;

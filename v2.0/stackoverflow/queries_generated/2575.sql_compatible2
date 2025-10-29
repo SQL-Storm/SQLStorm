@@ -1,0 +1,172 @@
+with recursive RecursivePostTree as (
+    select 
+        p.Id, 
+        p.PostTypeId, 
+        p.ParentId, 
+        p.CreationDate,
+        1 as Depth,
+        array[p.Id] as Path
+    from Posts p
+    where p.ParentId is null
+    union all
+    select 
+        c.Id,
+        c.PostTypeId,
+        c.ParentId,
+        c.CreationDate,
+        rpt.Depth + 1,
+        rpt.Path || c.Id
+    from Posts c
+    join RecursivePostTree rpt on c.ParentId = rpt.Id
+),
+UserBadgeStats as (
+    select
+        u.Id as UserId,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        coalesce(sum(case when b.TagBased = 1 then 1 else 0 end), 0) as TagBadgesCount,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    group by u.Id
+),
+PostVotesAgg as (
+    select 
+        p.Id as PostId,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotesCount,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotesCount,
+        sum(case when v.VoteTypeId = 9 then 1 else 0 end) as BountyCloseCount,
+        count(distinct v.UserId) as UniqueVotersCount,
+        max(v.CreationDate) as LastVoteDate
+    from Posts p
+    left join Votes v on p.Id = v.PostId
+    group by p.Id
+),
+QuestionAnswerRatio as (
+    select 
+        u.Id as UserId,
+        count(distinct q.Id) filter (where q.PostTypeId = 1) as QuestionsCount,
+        count(distinct a.Id) filter (where a.PostTypeId = 2) as AnswersCount,
+        case when count(distinct q.Id) = 0 then null else cast(count(distinct a.Id) as double precision) / count(distinct q.Id) end as AnswerToQuestionRatio
+    from Users u
+    left join Posts q on u.Id = q.OwnerUserId and q.PostTypeId = 1
+    left join Posts a on u.Id = a.OwnerUserId and a.PostTypeId = 2
+    group by u.Id
+),
+PostCloseReasonCounts as (
+    select 
+        p.Id as PostId,
+        sum(case when ph.PostHistoryTypeId = 10 and ph.Comment is not null then 1 else 0 end) as CloseVotes,
+        count(distinct ph.UserId) filter (where ph.PostHistoryTypeId = 10) as DistinctClosers,
+        string_agg(distinct crt.Name, ', ') as CloseReasonNames
+    from Posts p
+    left join PostHistory ph on p.Id = ph.PostId and ph.PostHistoryTypeId = 10
+    left join CloseReasonTypes crt on cast(crt.Id as text) = ph.Comment
+    group by p.Id
+),
+WindowedPostRanks as (
+    select
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        row_number() over (
+            partition by p.OwnerUserId 
+            order by p.Score desc, p.ViewCount desc NULLS LAST, p.CreationDate asc
+        ) as UserTopPostRank,
+        rank() over (
+            order by p.Score desc
+        ) as GlobalScoreRank
+    from Posts p
+    where p.PostTypeId = 1
+),
+InterestingPosts as (
+    select
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        string_to_array(substring(p.Tags from 2 for length(p.Tags) - 2), '><') as TagArray,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        coalesce(pca.CloseVotes, 0) as CloseVotes,
+        coalesce(pca.DistinctClosers, 0) as DistinctClosers,
+        coalesce(pca.CloseReasonNames, '') as CloseReasonNames,
+        pva.UpVotesCount,
+        pva.DownVotesCount,
+        pva.BountyCloseCount,
+        pva.UniqueVotersCount,
+        pva.LastVoteDate
+    from Posts p
+    left join PostCloseReasonCounts pca on p.Id = pca.PostId
+    left join PostVotesAgg pva on p.Id = pva.PostId
+    where p.PostTypeId = 1
+),
+FinalResult as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        u.Views as UserViews,
+        u.UpVotes as UserUpVotes,
+        u.DownVotes as UserDownVotes,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ub.TagBadgesCount,
+        ub.LastBadgeDate,
+        qar.QuestionsCount,
+        qar.AnswersCount,
+        qar.AnswerToQuestionRatio,
+        ip.Id as TopQuestionId,
+        ip.Title as TopQuestionTitle,
+        ip.Score as TopQuestionScore,
+        ip.ViewCount as TopQuestionViews,
+        ip.AnswerCount as TopQuestionAnswers,
+        ip.FavoriteCount as TopQuestionFavorites,
+        ip.CloseVotes as TopQuestionCloseVotes,
+        ip.DistinctClosers as TopQuestionDistinctClosers,
+        ip.CloseReasonNames as TopQuestionCloseReasons,
+        ip.UpVotesCount as TopQuestionUpVotes,
+        ip.DownVotesCount as TopQuestionDownVotes,
+        ip.BountyCloseCount as TopQuestionBountyCloses,
+        ip.UniqueVotersCount as TopQuestionUniqueVoters,
+        ip.LastVoteDate as TopQuestionLastVoteDate,
+        wpr.GlobalScoreRank as TopQuestionGlobalRank
+    from Users u
+    left join UserBadgeStats ub on u.Id = ub.UserId
+    left join QuestionAnswerRatio qar on u.Id = qar.UserId
+    left join WindowedPostRanks wpr on u.Id = wpr.OwnerUserId and wpr.UserTopPostRank = 1
+    left join InterestingPosts ip on wpr.Id = ip.Id
+    where u.Reputation > 1000
+      and ip.Id is not null
+)
+select 
+    fr.*,
+    ((coalesce(fr.Reputation, 0) * 0.2) + 
+     (coalesce(fr.GoldBadges, 0) * 50) +
+     (coalesce(fr.SilverBadges, 0) * 20) + 
+     (coalesce(fr.BronzeBadges, 0) * 5) +
+     (coalesce(fr.AnswersCount, 0) * 2) - 
+     (coalesce(fr.DownVotes, 0) * 1.5) + 
+     (coalesce(fr.TopQuestionScore, 0) * 3) +
+     (coalesce(fr.TopQuestionViews, 0) / nullif(date_part('day', cast('2024-10-01 12:34:56' as timestamp) - fr.TopQuestionLastVoteDate), 0)) * 0.1
+    ) as UserImpactScore,
+    concat(
+        fr.DisplayName,
+        ' [Rep: ', fr.Reputation, '] - Top Question: "', coalesce(fr.TopQuestionTitle, 'N/A'),
+        '" (Score: ', fr.TopQuestionScore, ', Views: ', fr.TopQuestionViews, ') ',
+        'Close Votes: ', fr.TopQuestionCloseVotes, ', Close Reasons: ', nullif(fr.TopQuestionCloseReasons, ''),
+        ' | Global Rank: ', fr.TopQuestionGlobalRank
+    ) as UserSummary
+from FinalResult fr
+where fr.TopQuestionCloseVotes < 5
+order by UserImpactScore desc, fr.TopQuestionScore desc
+limit 50;

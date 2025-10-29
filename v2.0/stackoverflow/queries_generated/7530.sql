@@ -1,0 +1,287 @@
+-- {"query": "7530.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2845} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 3 THEN p.Id END) as Wikis,
+        COUNT(DISTINCT c.Id) as Comments,
+        COUNT(DISTINCT b.Id) as Badges,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(u.LastAccessDate) as LastAccessDate,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        COALESCE(SUM(p.ViewCount), 0) as TotalViews,
+        RANK() OVER (ORDER BY COALESCE(SUM(p.Score), 0) DESC) as ScoreRank,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 1000 THEN 'Expert'
+            WHEN COUNT(DISTINCT p.Id) > 500 THEN 'Advanced'
+            WHEN COUNT(DISTINCT p.Id) > 100 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as ExperienceLevel,
+        CASE 
+            WHEN u.Reputation > 100000 THEN 'Legendary'
+            WHEN u.Reputation > 10000 THEN 'Master'
+            WHEN u.Reputation > 1000 THEN 'Guru'
+            ELSE 'Novice'
+        END as ReputationTier
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= '2010-01-01' 
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostStats AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.LastActivityDate,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.Score >= 100 THEN 1
+            WHEN p.PostTypeId = 1 AND p.Score >= 50 THEN 2
+            WHEN p.PostTypeId = 1 AND p.Score >= 1 THEN 3
+            WHEN p.PostTypeId = 2 AND p.Score >= 20 THEN 1
+            WHEN p.PostTypeId = 2 AND p.Score >= 5 THEN 2
+            ELSE 4
+        END as QualityRank,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) as TopScoreRank,
+        AVG(p.Score) OVER (PARTITION BY p.PostTypeId) as AvgScoreByType,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) as OverallScoreRank,
+        LAG(p.Score, 1) OVER (ORDER BY p.Score DESC) - p.Score as ScoreDifference,
+        p.Score - AVG(p.Score) OVER (PARTITION BY p.PostTypeId) as ScoreDeviationFromAvg
+    FROM Posts p
+    WHERE p.CreationDate >= '2015-01-01'
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.IsRequired,
+        t.IsModeratorOnly,
+        CASE 
+            WHEN t.Count > 10000 THEN 'Popular'
+            WHEN t.Count > 5000 THEN 'Well-Known'
+            WHEN t.Count > 1000 THEN 'Known'
+            ELSE 'Niche'
+        END as PopularityLevel,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        COALESCE(LENGTH(t.TagName), 0) as TagLength,
+        ASCII(UPPER(SUBSTRING(t.TagName, 1, 1))) as FirstCharAscii,
+        REVERSE(t.TagName) as ReversedTag,
+        REPLACE(t.TagName, ' ', '-') as HyphenatedTag
+    FROM Tags t
+    WHERE t.Count > 100
+),
+BadgeRanking AS (
+    SELECT 
+        b.UserId,
+        b.Name,
+        b.Date,
+        b.Class,
+        b.TagBased,
+        COUNT(*) OVER (PARTITION BY b.UserId) as TotalBadges,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC) as BadgeSequence,
+        CASE 
+            WHEN b.Class = 1 THEN 'Gold'
+            WHEN b.Class = 2 THEN 'Silver'
+            ELSE 'Bronze'
+        END as MedalType,
+        CASE 
+            WHEN b.TagBased = 1 THEN 'Tag-based'
+            ELSE 'Named'
+        END as BadgeCategory,
+        COUNT(*) OVER (PARTITION BY b.Class) as ClassCount,
+        COALESCE(DATEDIFF(DAY, LAG(b.Date) OVER (PARTITION BY b.UserId ORDER BY b.Date), b.Date), 0) as DaysSinceLastBadge
+    FROM Badges b
+    WHERE b.Date >= '2018-01-01'
+),
+QuestionTrends AS (
+    SELECT 
+        ps.Id as PostId,
+        ps.Title,
+        ps.Score,
+        ps.AnswerCount,
+        ps.CommentCount,
+        ps.ViewCount,
+        ps.LastActivityDate,
+        ps.CreationDate,
+        ps.QualityRank,
+        ps.ScoreDeviationFromAvg,
+        ps.TopScoreRank,
+        ps.AvgScoreByType,
+        ps.ScoreDifference,
+        ps.OverallScoreRank,
+        CASE
+            WHEN ps.AnswerCount = 0 THEN 'Unanswered'
+            WHEN ps.AnswerCount <= 2 THEN 'Low Answer Count'
+            WHEN ps.AnswerCount <= 5 THEN 'Moderate Answer Count'
+            ELSE 'High Answer Count'
+        END as AnswerTier,
+        CASE
+            WHEN ps.Score >= 100 THEN 'Highly Voted'
+            WHEN ps.Score >= 50 THEN 'Voted'
+            WHEN ps.Score >= 10 THEN 'Moderate Scoring'
+            ELSE 'Low Scoring'
+        END as ScoreTier,
+        CASE
+            WHEN ps.ViewCount >= 5000 THEN 'Viral'
+            WHEN ps.ViewCount >= 1000 THEN 'Popular'
+            WHEN ps.ViewCount >= 100 THEN 'Notable'
+            ELSE 'Obscure'
+        END as ViewTier,
+        CASE
+            WHEN ps.LastActivityDate >= DATEADD(DAY, -7, GETDATE()) THEN 'Recently Active'
+            WHEN ps.LastActivityDate >= DATEADD(DAY, -30, GETDATE()) THEN 'Active'
+            WHEN ps.LastActivityDate >= DATEADD(DAY, -90, GETDATE()) THEN 'Inactive'
+            ELSE 'Very Inactive'
+        END as ActivityStatus,
+        ROW_NUMBER() OVER (ORDER BY ps.Score DESC, ps.ViewCount DESC) as TrendRank,
+        NTILE(4) OVER (ORDER BY ps.Score) as ScoreQuartile,
+        PERCENT_RANK() OVER (ORDER BY ps.ViewCount) as ViewPercentile,
+        CUME_DIST() OVER (ORDER BY ps.Score) as ScoreDistribution
+    FROM PostStats ps
+    WHERE ps.PostTypeId = 1
+),
+UserPostAnalysis AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.TotalPosts,
+        uas.Questions,
+        uas.Answers,
+        uas.Wikis,
+        uas.Comments,
+        uas.Badges,
+        uas.ExperienceLevel,
+        uas.ReputationTier,
+        uas.LastPostDate,
+        uas.LastAccessDate,
+        uas.TotalScore,
+        uas.TotalViews,
+        uas.ScoreRank,
+        (uas.Questions * 100.0 / NULLIF(uas.TotalPosts, 0)) as QuestionPercentage,
+        (uas.Answers * 100.0 / NULLIF(uas.TotalPosts, 0)) as AnswerPercentage,
+        (uas.Comments * 100.0 / NULLIF(uas.TotalPosts, 0)) as CommentPercentage,
+        (uas.Badges * 100.0 / NULLIF(uas.TotalPosts, 0)) as BadgePercentage,
+        CASE 
+            WHEN uas.Questions > uas.Answers THEN 'Question Focused'
+            WHEN uas.Answers > uas.Questions THEN 'Answer Focused'
+            ELSE 'Balanced'
+        END as ContributionStyle
+    FROM UserActivityStats uas
+    WHERE uas.TotalPosts > 0
+)
+SELECT 
+    TOP 1000
+    uqa.UserId,
+    uqa.DisplayName,
+    uqa.Reputation,
+    uqa.TotalPosts,
+    uqa.Questions,
+    uqa.Answers,
+    uqa.Wikis,
+    uqa.Comments,
+    uqa.Badges,
+    uqa.ExperienceLevel,
+    uqa.ReputationTier,
+    uqa.LastPostDate,
+    uqa.LastAccessDate,
+    uqa.TotalScore,
+    uqa.TotalViews,
+    uqa.ScoreRank,
+    uqa.QuestionPercentage,
+    uqa.AnswerPercentage,
+    uqa.CommentPercentage,
+    uqa.BadgePercentage,
+    uqa.ContributionStyle,
+    qt.PostId,
+    qt.Title,
+    qt.Score,
+    qt.AnswerCount,
+    qt.CommentCount,
+    qt.ViewCount,
+    qt.LastActivityDate,
+    qt.CreationDate,
+    qt.QualityRank,
+    qt.ScoreDeviationFromAvg,
+    qt.TopScoreRank,
+    qt.AvgScoreByType,
+    qt.ScoreDifference,
+    qt.OverallScoreRank,
+    qt.AnswerTier,
+    qt.ScoreTier,
+    qt.ViewTier,
+    qt.ActivityStatus,
+    qt.TrendRank,
+    qt.ScoreQuartile,
+    qt.ViewPercentile,
+    qt.ScoreDistribution,
+    ta.TagName,
+    ta.Count,
+    ta.PopularityLevel,
+    ta.TagLength,
+    ta.FirstCharAscii,
+    ta.ReversedTag,
+    ta.HyphenatedTag,
+    br.Name as BadgeName,
+    br.Date as BadgeDate,
+    br.MedalType,
+    br.BadgeCategory,
+    br.TotalBadges,
+    br.BadgeSequence,
+    br.ClassCount,
+    br.DaysSinceLastBadge,
+    'Performance_Benchmark_Result_' + CAST(GETDATE() AS VARCHAR(20)) + '_' + CAST(NEWID() AS VARCHAR(36)) as BenchmarkIdentifier,
+    CASE 
+        WHEN uqa.TotalPosts >= 1000 AND uqa.TotalScore >= 5000 THEN 'Elite Contributor'
+        WHEN uqa.TotalPosts >= 500 AND uqa.TotalScore >= 2500 THEN 'Experienced Contributor'
+        WHEN uqa.TotalPosts >= 100 AND uqa.TotalScore >= 500 THEN 'Active Contributor'
+        WHEN uqa.TotalPosts >= 10 AND uqa.TotalScore >= 100 THEN 'Regular Contributor'
+        ELSE 'New Contributor'
+    END as ContributionLevel,
+    CAST(HASHBYTES('SHA2_256', 
+        CAST(uqa.UserId AS VARCHAR(10)) + 
+        CAST(qt.PostId AS VARCHAR(10)) + 
+        CAST(ta.TagName AS VARCHAR(100)) + 
+        CAST(br.Name AS VARCHAR(50)) + 
+        CAST(uqa.Reputation AS VARCHAR(20)) + 
+        CAST(qt.Score AS VARCHAR(20)) + 
+        CAST(ta.Count AS VARCHAR(20))
+    ) AS VARCHAR(64)) as SampleHash,
+    ROUND((uqa.TotalScore * 1.0 / NULLIF(uqa.TotalPosts, 0)), 2) as AvgScorePerPost,
+    DATEDIFF(DAY, uqa.LastPostDate, GETDATE()) as DaysSinceLastPost,
+    DATEDIFF(DAY, uqa.CreationDate, GETDATE()) as DaysAsMember,
+    CASE 
+        WHEN uqa.LastPostDate >= DATEADD(DAY, -30, GETDATE()) THEN 'Recent Active'
+        WHEN uqa.LastPostDate >= DATEADD(DAY, -90, GETDATE()) THEN 'Active'
+        WHEN uqa.LastPostDate >= DATEADD(DAY, -180, GETDATE()) THEN 'Inactive'
+        ELSE 'Very Inactive'
+    END as UserActivityTier
+FROM UserPostAnalysis uqa
+INNER JOIN QuestionTrends qt ON qt.Score >= uqa.TotalScore
+LEFT JOIN TagAnalysis ta ON ta.TagName LIKE '%' + qt.Title + '%'
+LEFT JOIN BadgeRanking br ON br.UserId = uqa.UserId AND br.BadgeSequence <= 3
+WHERE uqa.TotalPosts > 10 
+    AND qt.Score >= 50 
+    AND (ta.Count IS NULL OR ta.Count >= 500)
+    AND (br.Date IS NULL OR br.Date >= DATEADD(YEAR, -1, GETDATE()))
+ORDER BY uqa.TotalScore DESC, qt.Score DESC, qt.ViewCount DESC, uqa.ContributionLevel DESC, ta.Count DESC;

@@ -1,0 +1,380 @@
+with
+-- recent active users with rank by activity and reputation
+active_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.location,
+    u.creationdate,
+    u.lastaccessdate,
+    u.upvotes,
+    u.downvotes,
+    coalesce(nullif(trim(u.websiteurl), ''), 'unknown') as websiteurl_norm,
+    row_number() over (order by u.lastaccessdate desc, u.reputation desc, u.id) as rn_recent,
+    ntile(10) over (order by u.reputation desc) as rep_decile
+  from users u
+  where u.creationdate >= (select date_trunc('year', max(creationdate)) - interval '4 year' from users)
+),
+-- questions with tag parsing and computed engagement metrics
+q as (
+  select
+    p.id as question_id,
+    p.owneruserid as owner_user_id,
+    p.creationdate as q_created,
+    p.score as q_score,
+    p.viewcount,
+    p.favoritecount,
+    p.answercount,
+    p.title,
+    p.tags,
+    string_to_array(substring(p.tags, 2, length(p.tags)-2), '><') as tag_arr,
+    coalesce(p.commentcount, 0) as commentcount,
+    p.closeddate,
+    p.acceptedanswerid
+  from posts p
+  where p.posttypeid = 1
+),
+-- answers joined to their parent questions
+a as (
+  select
+    pa.id as answer_id,
+    pa.parentid as question_id,
+    pa.owneruserid as answerer_id,
+    pa.creationdate as a_created,
+    pa.score as a_score,
+    case when pa.id = q.acceptedanswerid then 1 else 0 end as is_accepted
+  from posts pa
+  join q on q.question_id = pa.parentid
+  where pa.posttypeid = 2
+),
+-- aggregate answers per question
+a_agg as (
+  select
+    question_id,
+    count(*) as answers_total,
+    sum(is_accepted) as accepted_count,
+    max(a_score) as max_answer_score,
+    min(a_score) as min_answer_score,
+    avg(cast(a_score as numeric)) as avg_answer_score,
+    percentile_cont(0.5) within group (order by a_score) as median_answer_score,
+    min(a_created) as first_answer_time,
+    max(a_created) as last_answer_time
+  from a
+  group by question_id
+),
+-- votes per question and per type
+q_votes as (
+  select
+    v.postid as question_id,
+    v.votetypeid,
+    count(*) as vote_count,
+    sum(coalesce(v.bountyamount,0)) filter (where v.votetypeid in (8,9)) as bounty_sum
+  from votes v
+  where exists (select 1 from q where q.question_id = v.postid)
+  group by v.postid, v.votetypeid
+),
+-- reshape votes into columns
+q_votes_pivot as (
+  select
+    question_id,
+    coalesce(sum(case when votetypeid = 2 then vote_count end),0) as upvotes,
+    coalesce(sum(case when votetypeid = 3 then vote_count end),0) as downvotes,
+    coalesce(sum(case when votetypeid in (8,9) then vote_count end),0) as bounty_events,
+    coalesce(sum(case when votetypeid in (8,9) then bounty_sum end),0) as bounty_amount_total
+  from q_votes
+  group by question_id
+),
+-- comments per question
+q_comments as (
+  select
+    c.postid as question_id,
+    count(*) as comments_total,
+    max(c.score) as max_comment_score,
+    avg(c.score) as avg_comment_score
+  from comments c
+  where exists (select 1 from q where q.question_id = c.postid)
+  group by c.postid
+),
+-- post history signals (closures, reopenings, protections)
+q_history as (
+  select
+    ph.postid as question_id,
+    sum(case when ph.posthistorytypeid = 10 then 1 else 0 end) as close_events,
+    sum(case when ph.posthistorytypeid = 11 then 1 else 0 end) as reopen_events,
+    sum(case when ph.posthistorytypeid = 19 then 1 else 0 end) as protect_events,
+    max(ph.creationdate) filter (where ph.posthistorytypeid in (10,11,19)) as last_moderation_event
+  from posthistory ph
+  where exists (select 1 from q where q.question_id = ph.postid)
+  group by ph.postid
+),
+-- duplicate/linked relationships
+q_links as (
+  select
+    pl.postid as question_id,
+    sum(case when pl.linktypeid = 3 then 1 else 0 end) as duplicate_links,
+    sum(case when pl.linktypeid = 1 then 1 else 0 end) as related_links
+  from postlinks pl
+  where exists (select 1 from q where q.question_id = pl.postid)
+  group by pl.postid
+),
+-- tag popularity snapshot
+tag_pop as (
+  select
+    lower(t.tagname) as tag,
+    t.count as tag_count,
+    cast(t.ismoderatoronly as int) as is_mod_only,
+    cast(t.isrequired as int) as is_required
+  from tags t
+),
+-- explode question tags and enrich with tag popularity
+q_tagged as (
+  select
+    q.question_id,
+    unnest(q.tag_arr) as tag,
+    q.q_created
+  from q
+),
+q_tag_stats as (
+  select
+    qt.question_id,
+    count(*) as tag_count,
+    max(tp.tag_count) as max_tag_global_count,
+    avg(cast(tp.tag_count as numeric)) as avg_tag_global_count,
+    sum(tp.is_required) as required_tag_hits
+  from q_tagged qt
+  left join tag_pop tp on tp.tag = lower(qt.tag)
+  group by qt.question_id
+),
+-- join questions with owner users (outer join to capture deleted owners)
+q_owner as (
+  select
+    q.question_id,
+    q.owner_user_id,
+    au.displayname as owner_name,
+    au.reputation as owner_rep,
+    au.rep_decile,
+    au.rn_recent,
+    au.location as owner_location,
+    au.websiteurl_norm
+  from q
+  left join active_users au on au.user_id = q.owner_user_id
+),
+-- compute engagement scores with window functions
+q_metrics as (
+  select
+    q.question_id,
+    q.title,
+    q.q_created,
+    q.viewcount,
+    q.q_score,
+    q.favoritecount,
+    q.answercount,
+    qa.answers_total,
+    coalesce(qa.accepted_count,0) as accepted_count,
+    qa.first_answer_time,
+    qa.last_answer_time,
+    extract(epoch from (qa.first_answer_time - q.q_created))/3600.0 as hours_to_first_answer,
+    extract(epoch from (qa.last_answer_time - q.q_created))/3600.0 as hours_to_last_answer,
+    qv.upvotes,
+    qv.downvotes,
+    qv.bounty_events,
+    qv.bounty_amount_total,
+    qc.comments_total,
+    qc.max_comment_score,
+    qh.close_events,
+    qh.reopen_events,
+    qh.protect_events,
+    qh.last_moderation_event,
+    ql.duplicate_links,
+    ql.related_links,
+    qts.tag_count,
+    qts.max_tag_global_count,
+    qts.avg_tag_global_count,
+    qts.required_tag_hits,
+    qo.owner_user_id,
+    qo.owner_name,
+    qo.owner_rep,
+    qo.rep_decile,
+    qo.rn_recent,
+    qo.owner_location,
+    qo.websiteurl_norm,
+    -- composite engagement index
+    (
+      coalesce(q.q_score,0)*2
+      + coalesce(qv.upvotes,0)*1.5
+      - coalesce(qv.downvotes,0)*2
+      + least(coalesce(q.viewcount,0)/100.0, 50)
+      + coalesce(q.favoritecount,0)
+      + coalesce(qa.answers_total,0)*3
+      + coalesce(qc.comments_total,0)*0.5
+      + coalesce(qv.bounty_amount_total,0)/50.0
+      - coalesce(ql.duplicate_links,0)*5
+      - case when q.closeddate is not null then 10 else 0 end
+    ) as engagement_index,
+    row_number() over (order by coalesce(q.viewcount,0) desc, coalesce(q.q_score,0) desc, q.question_id) as rn_popular,
+    rank() over (partition by date_trunc('month', q.q_created) order by coalesce(q.q_score,0) desc) as r_month_score,
+    dense_rank() over (order by (
+      coalesce(q.q_score,0)*2 + coalesce(qv.upvotes,0) - coalesce(qv.downvotes,0) + coalesce(qa.answers_total,0)*2
+    ) desc) as dr_overall
+  from q
+  left join a_agg qa on qa.question_id = q.question_id
+  left join q_votes_pivot qv on qv.question_id = q.question_id
+  left join q_comments qc on qc.question_id = q.question_id
+  left join q_history qh on qh.question_id = q.question_id
+  left join q_links ql on ql.question_id = q.question_id
+  left join q_tag_stats qts on qts.question_id = q.question_id
+  left join q_owner qo on qo.question_id = q.question_id
+),
+-- filter out potential spammy or low-quality using complex predicates
+q_filtered as (
+  select *
+  from q_metrics m
+  where
+    -- exclude posts with extreme negative score unless they have high views
+    not (coalesce(m.q_score,0) <= -5 and coalesce(m.viewcount,0) < 500)
+    and (
+      -- include either accepted answer or decent engagement
+      coalesce(m.accepted_count,0) > 0
+      or m.engagement_index >= 10
+      or (m.bounty_amount_total > 0 and m.answers_total >= 1)
+    )
+    and (
+      -- avoid likely tag wikis leaking in
+      m.tag_count between 1 and 7
+    )
+),
+-- derive cohorts by tag popularity and owner reputation
+q_cohorts as (
+  select
+    m.*,
+    case
+      when m.max_tag_global_count is null then 'unknown'
+      when m.max_tag_global_count >= 500000 then 'mega'
+      when m.max_tag_global_count >= 100000 then 'large'
+      when m.max_tag_global_count >= 20000 then 'medium'
+      else 'niche'
+    end as tag_size_bucket,
+    case
+      when m.owner_rep is null then 'anon'
+      when m.owner_rep >= 100000 then 'legend'
+      when m.owner_rep >= 10000 then 'expert'
+      when m.owner_rep >= 1000 then 'regular'
+      else 'newbie'
+    end as owner_rep_bucket
+  from q_filtered m
+),
+-- compute per-cohort statistics using window frames
+q_cohort_metrics as (
+  select
+    c.question_id,
+    c.title,
+    c.q_created,
+    c.viewcount,
+    c.q_score,
+    c.favoritecount,
+    c.answercount,
+    c.answers_total,
+    c.accepted_count,
+    c.first_answer_time,
+    c.last_answer_time,
+    c.hours_to_first_answer,
+    c.hours_to_last_answer,
+    c.upvotes,
+    c.downvotes,
+    c.bounty_events,
+    c.bounty_amount_total,
+    c.comments_total,
+    c.max_comment_score,
+    c.close_events,
+    c.reopen_events,
+    c.protect_events,
+    c.last_moderation_event,
+    c.duplicate_links,
+    c.related_links,
+    c.tag_count,
+    c.max_tag_global_count,
+    c.avg_tag_global_count,
+    c.required_tag_hits,
+    c.owner_user_id,
+    c.owner_name,
+    c.owner_rep,
+    c.rep_decile,
+    c.rn_recent,
+    c.owner_location,
+    c.websiteurl_norm,
+    c.engagement_index,
+    c.rn_popular,
+    c.r_month_score,
+    c.dr_overall,
+    c.tag_size_bucket,
+    c.owner_rep_bucket,
+    c.avg_engagement_by_tag_size,
+    c.avg_engagement_by_owner_bucket,
+    c.p90_engagement_by_tag_size,
+    c.accepted_questions_in_owner_bucket,
+    avg(engagement_index) over (partition by tag_size_bucket) as avg_engagement_by_tag_size,
+    avg(engagement_index) over (partition by owner_rep_bucket) as avg_engagement_by_owner_bucket,
+    percentile_cont(0.9) within group (order by engagement_index) as p90_engagement_by_tag_size,
+    sum(case when accepted_count > 0 then 1 else 0 end) over (partition by owner_rep_bucket) as accepted_questions_in_owner_bucket
+  from q_cohorts c
+),
+-- correlated subquery example: compute first high-score comment text snippet if any
+q_first_hot_comment as (
+  select
+    m.question_id,
+    (
+      select substring(coalesce(c.text,''), 1, 120)
+      from comments c
+      where c.postid = m.question_id and coalesce(c.score,0) >= 5
+      order by c.score desc, c.creationdate asc
+      limit 1
+    ) as hot_comment_snippet
+  from q_cohort_metrics m
+),
+-- final ranking with tie-breakers and null-safe ordering
+final_ranked as (
+  select
+    m.*,
+    fhc.hot_comment_snippet,
+    row_number() over (
+      order by
+        m.engagement_index desc,
+        coalesce(m.upvotes,0) - coalesce(m.downvotes,0) desc,
+        coalesce(m.viewcount,0) desc,
+        m.question_id
+    ) as rn_final
+  from q_cohort_metrics m
+  left join q_first_hot_comment fhc on fhc.question_id = m.question_id
+)
+select
+  fr.question_id,
+  fr.title,
+  fr.q_created,
+  fr.owner_name,
+  fr.owner_rep,
+  fr.owner_rep_bucket,
+  fr.tag_size_bucket,
+  fr.viewcount,
+  fr.q_score,
+  fr.upvotes,
+  fr.downvotes,
+  fr.answers_total,
+  fr.accepted_count,
+  fr.hours_to_first_answer,
+  fr.bounty_amount_total,
+  fr.engagement_index,
+  fr.avg_engagement_by_tag_size,
+  fr.avg_engagement_by_owner_bucket,
+  fr.p90_engagement_by_tag_size,
+  fr.hot_comment_snippet,
+  fr.rn_final,
+  case
+    when fr.engagement_index >= greatest(fr.avg_engagement_by_tag_size, fr.avg_engagement_by_owner_bucket) * 1.5 then 'outlier'
+    when fr.engagement_index >= greatest(fr.avg_engagement_by_tag_size, fr.avg_engagement_by_owner_bucket) then 'above_avg'
+    when fr.engagement_index is null then 'unknown'
+    else 'normal'
+  end as engagement_label
+from final_ranked fr
+where fr.rn_final <= 500
+order by fr.rn_final;

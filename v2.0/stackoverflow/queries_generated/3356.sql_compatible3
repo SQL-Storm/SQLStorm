@@ -1,0 +1,128 @@
+WITH RECURSIVE TagHierarchy AS (
+    SELECT t.Id AS TagId,
+           CAST(t.TagName AS VARCHAR(255)) AS TagPath,
+           1 AS Depth
+    FROM Tags t
+    WHERE t.TagName IS NOT NULL
+    UNION ALL
+    SELECT p.Id AS TagId,
+           CAST(h.TagPath || ' > ' || p.TagName AS VARCHAR(255)) AS TagPath,
+           h.Depth + 1 AS Depth
+    FROM TagHierarchy h
+    JOIN Tags p ON p.Id <> h.TagId
+    WHERE h.Depth < 5
+),
+QuestionPosts AS (
+    SELECT p.Id,
+           p.Title,
+           p.CreationDate,
+           p.Score,
+           p.ViewCount,
+           p.AnswerCount,
+           p.FavoriteCount,
+           p.Tags,
+           COALESCE(u.Reputation, 0) AS OwnerReputation,
+           COALESCE(u.Id, -1) AS OwnerUserId,
+           ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS RowNumPerOwner
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1
+),
+TopAnswers AS (
+    SELECT a.ParentId AS QuestionId,
+           a.Id AS AnswerId,
+           a.Score,
+           a.CreationDate,
+           ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS RankInQuestion
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+),
+UserBadgeStats AS (
+    SELECT b.UserId,
+           COUNT(*) AS TotalBadges,
+           SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+           SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+           SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+           MAX(b.Date) AS LastBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+),
+VoteAggregates AS (
+    SELECT v.PostId,
+           SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS UpVotes,
+           SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS DownVotes,
+           SUM(CASE WHEN vt.Id = 5 THEN 1 ELSE 0 END) AS Favorites,
+           MAX(v.CreationDate) AS LastVoteDate
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY v.PostId
+),
+LinkedPosts AS (
+    SELECT pl.PostId,
+           pl.RelatedPostId,
+           lt.Name AS LinkTypeName,
+           pl.CreationDate AS LinkDate
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+),
+RecentCloseReasons AS (
+    SELECT ph.PostId,
+           ph.CreationDate AS ClosedOn,
+           CAST(ph.Comment AS INTEGER) AS CloseReasonId,
+           crt.Name AS CloseReasonName
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht ON pht.Id = ph.PostHistoryTypeId
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS INTEGER)
+    WHERE pht.Id = 10
+      AND ph.Comment ~ '^[0-9]+$'
+),
+TagStats AS (
+    SELECT th.TagId,
+           CAST(th.TagPath AS VARCHAR(255)) AS TagPath,
+           th.Depth,
+           COUNT(q.Id) AS QuestionCount,
+           AVG(q.Score) AS AvgQuestionScore,
+           PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY q.Score) AS MedianQuestionScore,
+           SUM(COALESCE(vu.UpVotes, 0)) AS TotalUpVotes,
+           SUM(COALESCE(vu.DownVotes, 0)) AS TotalDownVotes,
+           COUNT(DISTINCT ub.UserId) AS DistinctBadgeOwners,
+           MAX(q.CreationDate) AS MostRecentQuestion
+    FROM TagHierarchy th
+    LEFT JOIN LATERAL (
+        SELECT CAST(unnest(string_to_array(q.Tags, '><')) AS INTEGER) AS TagId
+        FROM QuestionPosts q
+        WHERE q.Tags IS NOT NULL
+    ) AS tagmap ON tagmap.TagId = th.TagId
+    LEFT JOIN QuestionPosts q ON q.Id = tagmap.TagId
+    LEFT JOIN VoteAggregates vu ON vu.PostId = q.Id
+    LEFT JOIN UserBadgeStats ub ON ub.UserId = q.OwnerUserId
+    GROUP BY th.TagId, th.TagPath, th.Depth
+)
+SELECT ts.TagPath,
+       ts.Depth,
+       ts.QuestionCount,
+       ts.AvgQuestionScore,
+       ts.MedianQuestionScore,
+       ts.TotalUpVotes,
+       ts.TotalDownVotes,
+       ts.DistinctBadgeOwners,
+       ts.MostRecentQuestion,
+       COALESCE(
+         (SELECT STRING_AGG(DISTINCT rc.CloseReasonName, ', ')
+          FROM RecentCloseReasons rc
+          JOIN QuestionPosts qp ON qp.Id = rc.PostId
+          WHERE qp.Tags LIKE '%' || REPLACE(ts.TagPath, '_', '\_') || '%'
+         ),
+         'No recent closures'
+       ) AS RecentCloseReasons,
+       CASE
+         WHEN ts.QuestionCount > 1000 THEN 'High Traffic'
+         WHEN ts.QuestionCount BETWEEN 100 AND 1000 THEN 'Medium Traffic'
+         ELSE 'Low Traffic'
+       END AS TrafficCategory,
+       ROW_NUMBER() OVER (ORDER BY ts.QuestionCount DESC) AS RankByQuestionCount
+FROM TagStats ts
+WHERE ts.QuestionCount > 0
+ORDER BY ts.QuestionCount DESC
+LIMIT 50
+OFFSET 0;

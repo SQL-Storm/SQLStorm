@@ -1,0 +1,217 @@
+SELECT 
+    p.Id AS PostId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.CreationDate,
+    p.OwnerUserId,
+    u.DisplayName AS OwnerName,
+    p.OwnerDisplayName,
+    CASE 
+        WHEN p.PostTypeId = 1 THEN 'Question'
+        WHEN p.PostTypeId = 2 THEN 'Answer'
+        WHEN p.PostTypeId = 3 THEN 'Wiki'
+        WHEN p.PostTypeId = 4 THEN 'TagWikiExcerpt'
+        WHEN p.PostTypeId = 5 THEN 'TagWiki'
+        WHEN p.PostTypeId = 6 THEN 'ModeratorNomination'
+        WHEN p.PostTypeId = 7 THEN 'WikiPlaceholder'
+        WHEN p.PostTypeId = 8 THEN 'PrivilegeWiki'
+        ELSE 'Unknown'
+    END AS PostTypeName,
+    COALESCE(
+        (SELECT STRING_AGG(t.TagName, ' ' ORDER BY t.TagName)
+         FROM (
+             SELECT TRIM(value) AS TagName
+             FROM (SELECT p.Tags) ptags,
+                  JSON_TABLE(
+                    CONCAT('["', REPLACE(SUBSTRING(ptags.value FROM 2 FOR CASE WHEN CHAR_LENGTH(ptags.value) > 2 THEN CHAR_LENGTH(ptags.value)-2 ELSE 0 END), '><', '","'), '"]'),
+                    '$[*]' COLUMNS(value VARCHAR(4000) PATH '$')
+                  ) jt
+             WHERE p.Tags IS NOT NULL AND p.Tags <> ''
+         ) t
+        ), 
+        ''
+    ) AS TagList,
+    COALESCE(
+        (SELECT COUNT(*) 
+         FROM Votes v 
+         WHERE v.PostId = p.Id AND v.VoteTypeId IN (2,3)
+        ), 
+        0
+    ) AS TotalVotes,
+    COALESCE(
+        (SELECT COUNT(*) 
+         FROM Votes v 
+         WHERE v.PostId = p.Id AND v.VoteTypeId = 2
+        ), 
+        0
+    ) AS UpVotes,
+    COALESCE(
+        (SELECT COUNT(*) 
+         FROM Votes v 
+         WHERE v.PostId = p.Id AND v.VoteTypeId = 3
+        ), 
+        0
+    ) AS DownVotes,
+    COALESCE(
+        (SELECT COUNT(*) 
+         FROM Comments c 
+         WHERE c.PostId = p.Id
+        ), 
+        0
+    ) AS CommentCountActual,
+    COALESCE(
+        (SELECT COUNT(*) 
+         FROM Badges b 
+         WHERE b.UserId = p.OwnerUserId AND b.Date >= p.CreationDate
+        ), 
+        0
+    ) AS BadgeCount,
+    CASE 
+        WHEN p.PostTypeId = 1 THEN (
+            SELECT COUNT(*) 
+            FROM Posts a 
+            WHERE a.ParentId = p.Id AND a.PostTypeId = 2
+        )
+        ELSE 0
+    END AS AnswerCountActual,
+    CASE 
+        WHEN p.PostTypeId = 1 THEN (
+            SELECT CASE WHEN COUNT(*) > 0 THEN 'Yes' ELSE 'No' END
+            FROM Posts a 
+            WHERE a.ParentId = p.Id AND a.PostTypeId = 2 AND a.Id = p.AcceptedAnswerId
+        )
+        ELSE 'N/A'
+    END AS HasAcceptedAnswer,
+    CASE 
+        WHEN p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN p.PostTypeId = 1 AND p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        WHEN p.PostTypeId = 2 AND p.ParentId IN (SELECT Id FROM Posts WHERE PostTypeId = 1 AND ClosedDate IS NOT NULL) THEN 'Answer to Closed Question'
+        WHEN p.PostTypeId = 1 THEN 'Open'
+        ELSE 'N/A'
+    END AS Status,
+    CAST(
+      (EXTRACT(EPOCH FROM COALESCE(p.LastActivityDate, p.CreationDate)) - EXTRACT(EPOCH FROM p.CreationDate)) / 86400
+      AS INTEGER
+    ) AS DaysSinceLastActivity,
+    COALESCE(
+        (SELECT COUNT(*) 
+         FROM PostLinks pl 
+         WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3
+        ), 
+        0
+    ) AS DuplicateCount,
+    (
+        SELECT STRING_AGG(
+            (COALESCE(pt.Name, 'Unknown') || ': ' || COALESCE(ph.Comment, 'No comment')), 
+            '; ' ORDER BY phsub.CreationDate DESC
+        )
+        FROM (
+            SELECT ph_inner.PostHistoryTypeId, ph_inner.Comment, ph_inner.CreationDate
+            FROM PostHistory ph_inner
+            WHERE ph_inner.PostId = p.Id
+              AND ph_inner.CreationDate BETWEEN p.CreationDate AND COALESCE(p.LastActivityDate, TIMESTAMP '2024-10-01 12:34:56')
+            ORDER BY ph_inner.CreationDate DESC
+            FETCH FIRST 5 ROWS WITH TIES
+        ) phsub
+        LEFT JOIN PostHistoryTypes pt ON phsub.PostHistoryTypeId = pt.Id
+        LEFT JOIN PostHistory ph ON ph.Id IS NOT NULL -- placeholder join to allow ph alias in STRING_AGG ORDER BY; phsub.CreationDate used instead
+    ) AS RecentHistory,
+    CASE 
+        WHEN p.ViewCount > (
+            SELECT AVG(CAST(ViewCount AS NUMERIC)) 
+            FROM Posts p2 
+            WHERE p2.PostTypeId = 1 AND p2.ViewCount IS NOT NULL
+        ) THEN 'Above Average'
+        WHEN p.ViewCount < (
+            SELECT AVG(CAST(ViewCount AS NUMERIC)) 
+            FROM Posts p2 
+            WHERE p2.PostTypeId = 1 AND p2.ViewCount IS NOT NULL
+        ) THEN 'Below Average'
+        ELSE 'Average'
+    END AS ViewPerformance,
+    COALESCE(
+        (SELECT COUNT(*) 
+         FROM PostHistory ph 
+         WHERE ph.PostId = p.Id 
+         AND ph.PostHistoryTypeId IN (2,5,8)
+        ), 
+        0
+    ) AS BodyEditCount,
+    PERCENT_RANK() OVER (ORDER BY p.Score DESC) AS ScorePercentile,
+    ROW_NUMBER() OVER (ORDER BY p.Score DESC) AS ScoreRank,
+    LAG(p.Score, 1, 0) OVER (ORDER BY p.Score DESC) AS PreviousScore,
+    LEAD(p.Score, 1, 0) OVER (ORDER BY p.Score DESC) AS NextScore,
+    AVG(p.Score) OVER (PARTITION BY p.Id ORDER BY p.CreationDate ROWS BETWEEN 10 PRECEDING AND CURRENT ROW) AS MovingAverageScore,
+    ('Post-' || p.Id || ' by ' || COALESCE(u.DisplayName, p.OwnerDisplayName, 'Anonymous') || ' (Score: ' || p.Score || ', Views: ' || p.ViewCount || ')') AS PostSummary,
+    CASE 
+        WHEN p.Score > 100 THEN 'Hot'
+        WHEN p.Score > 50 THEN 'Popular'
+        WHEN p.Score > 0 THEN 'Moderate'
+        ELSE 'Low'
+    END AS PopularityLevel,
+    COALESCE(
+        (SELECT COUNT(*) 
+         FROM Users u2 
+         WHERE u2.Reputation > p.Score
+        ), 
+        0
+    ) AS UsersWithHigherReputation,
+    (SELECT COUNT(*) FROM Posts p3 WHERE p3.PostTypeId = 1 AND p3.Score > p.Score) AS QuestionsWithHigherScore,
+    COALESCE(
+        (SELECT STRING_AGG(b.Name, ', ' ORDER BY b.Name)
+         FROM Badges b 
+         WHERE b.UserId = p.OwnerUserId 
+           AND b.Date BETWEEN p.CreationDate AND TIMESTAMP '2024-10-01 12:34:56'
+           AND b.Class = 1
+        ), 
+        ''
+    ) AS GoldBadges
+FROM Posts p
+LEFT JOIN Users u ON p.OwnerUserId = u.Id
+WHERE (
+    p.PostTypeId IN (1, 2) 
+    AND p.ViewCount > 100
+    AND p.CreationDate >= DATE '2020-01-01'
+    AND (p.ClosedDate IS NULL OR p.ClosedDate >= DATE '2020-01-01')
+)
+AND (
+    EXISTS (
+        SELECT 1 
+        FROM Comments c 
+        WHERE c.PostId = p.Id 
+          AND c.CreationDate >= DATE '2022-01-01'
+    )
+    OR 
+    EXISTS (
+        SELECT 1 
+        FROM Votes v 
+        WHERE v.PostId = p.Id 
+          AND v.CreationDate >= DATE '2022-01-01'
+          AND v.VoteTypeId IN (2, 3)
+    )
+)
+AND (
+    CASE 
+        WHEN p.PostTypeId = 1 THEN 
+            (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = p.Id AND a.PostTypeId = 2 AND a.Score > 0) > 0
+        ELSE TRUE
+    END
+)
+AND NOT (
+    p.Score = 0 
+    AND p.AnswerCount = 0 
+    AND p.CommentCount = 0
+    AND CAST(
+      (EXTRACT(EPOCH FROM COALESCE(p.LastActivityDate, TIMESTAMP '2024-10-01 12:34:56')) - EXTRACT(EPOCH FROM p.CreationDate)) / 86400
+      AS INTEGER
+    ) > 30
+)
+ORDER BY 
+    p.Score DESC,
+    p.ViewCount DESC,
+    p.CreationDate DESC
+FETCH FIRST 10000 ROWS ONLY;

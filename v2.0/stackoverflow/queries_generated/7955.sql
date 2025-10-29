@@ -1,0 +1,230 @@
+-- {"query": "7955.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2143} 
+WITH PostStats AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.Body,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as UserPostRank,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) as TotalUserPosts,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as AvgUserScore,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PrevScore,
+        CASE 
+            WHEN p.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'High'
+            WHEN p.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) * 0.5 THEN 'Medium'
+            ELSE 'Low'
+        END as ScoreCategory,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND LENGTH(p.Tags) > 0 THEN 
+                (SELECT COUNT(*) FROM UNNEST(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) as tag)
+            ELSE 0
+        END as TagCount
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserActivity AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT ps.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN ps.PostTypeId = 1 THEN ps.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN ps.PostTypeId = 2 THEN ps.Id END) as Answers,
+        AVG(ps.Score) as AvgScore,
+        MAX(ps.CreationDate) as LastActivity,
+        CASE 
+            WHEN COUNT(DISTINCT ps.Id) > 100 THEN 'Veteran'
+            WHEN COUNT(DISTINCT ps.Id) > 50 THEN 'Experienced'
+            WHEN COUNT(DISTINCT ps.Id) > 10 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as ActivityLevel,
+        STRING_AGG(DISTINCT ps.Tags, ', ') as AllTags
+    FROM Users u
+    LEFT JOIN PostStats ps ON u.Id = ps.OwnerUserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > (SELECT AVG(Count) FROM Tags) THEN 'Popular'
+            WHEN t.Count > (SELECT AVG(Count) FROM Tags) * 0.5 THEN 'Moderate'
+            ELSE 'Niche'
+        END as PopularityLevel,
+        (SELECT COUNT(*) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%') as PostsWithTag
+    FROM Tags t
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        ps.Id as PostId,
+        ps.Title,
+        ps.Score,
+        ps.OwnerUserId,
+        ps.CreationDate,
+        ps.ViewCount,
+        ps.AnswerCount,
+        ps.CommentCount,
+        ps.FavoriteCount,
+        ps.TagCount,
+        CASE 
+            WHEN ps.AnswerCount > 0 AND ps.Score > 0 THEN ps.Score::FLOAT / ps.AnswerCount
+            WHEN ps.AnswerCount > 0 THEN -1
+            ELSE ps.Score
+        END as ScorePerAnswer,
+        CASE 
+            WHEN ps.CommentCount > 0 AND ps.ViewCount > 0 THEN (ps.CommentCount::FLOAT * 100) / ps.ViewCount
+            ELSE 0
+        END as CommentDensityPercentage,
+        ps.ScoreCategory,
+        ps.UserPostRank,
+        ps.TotalUserPosts,
+        ps.AvgUserScore,
+        ps.PrevScore,
+        (ps.Score - COALESCE(ps.PrevScore, 0)) as ScoreChange,
+        CASE 
+            WHEN ps.TotalUserPosts > 1 THEN (ps.Score - ps.AvgUserScore) / ps.AvgUserScore
+            ELSE 0
+        END as RelativeScoreToUserAverage,
+        CASE 
+            WHEN ps.OwnerUserId IS NOT NULL THEN 
+                (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = ps.OwnerUserId AND p2.PostTypeId = 1 AND p2.CreationDate < ps.CreationDate)
+            ELSE 0
+        END as PrecedingQuestions
+    FROM PostStats ps
+    WHERE ps.Score IS NOT NULL
+),
+FinalAnalysis AS (
+    SELECT 
+        cpa.PostId,
+        cpa.Title,
+        cpa.Score,
+        cpa.OwnerUserId,
+        cpa.CreationDate,
+        cpa.ViewCount,
+        cpa.AnswerCount,
+        cpa.CommentCount,
+        cpa.FavoriteCount,
+        cpa.TagCount,
+        cpa.ScorePerAnswer,
+        cpa.CommentDensityPercentage,
+        cpa.ScoreCategory,
+        cpa.UserPostRank,
+        cpa.TotalUserPosts,
+        cpa.AvgUserScore,
+        cpa.PrevScore,
+        cpa.ScoreChange,
+        cpa.RelativeScoreToUserAverage,
+        cpa.PrecedingQuestions,
+        ua.DisplayName as OwnerDisplayName,
+        ua.ActivityLevel,
+        CASE 
+            WHEN cpa.ScoreChange > 0 THEN 'Improving'
+            WHEN cpa.ScoreChange < 0 THEN 'Declining'
+            ELSE 'Stable'
+        END as PerformanceTrend,
+        CASE 
+            WHEN cpa.ViewCount > 1000 THEN 'High Visibility'
+            WHEN cpa.ViewCount > 500 THEN 'Medium Visibility'
+            ELSE 'Low Visibility'
+        END as VisibilityLevel,
+        CASE 
+            WHEN cpa.CommentDensityPercentage >= 5 THEN 'High Engagement'
+            WHEN cpa.CommentDensityPercentage >= 2 THEN 'Medium Engagement'
+            ELSE 'Low Engagement'
+        END as EngagementLevel,
+        ta.PopularityLevel,
+        ta.PostsWithTag,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = cpa.PostId AND v.VoteTypeId = 2) as UpvoteCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = cpa.PostId AND v.VoteTypeId = 3) as DownvoteCount,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = cpa.PostId) as CommentCountActual,
+        CASE 
+            WHEN cpa.Score > 10 AND cpa.ViewCount > 500 AND cpa.AnswerCount > 0 THEN 'High Impact'
+            WHEN cpa.Score > 5 AND cpa.ViewCount > 100 THEN 'Medium Impact'
+            ELSE 'Low Impact'
+        END as ImpactScore
+    FROM ComplexPostAnalysis cpa
+    LEFT JOIN UserActivity ua ON cpa.OwnerUserId = ua.UserId
+    LEFT JOIN TagAnalysis ta ON ta.TagName = (
+        SELECT tag FROM UNNEST(string_to_array(substring(cpa.Tags, 2, length(cpa.Tags)-2), '><')) as tag 
+        WHERE tag IS NOT NULL AND tag != ''
+        LIMIT 1
+    )
+    WHERE ua.ActivityLevel IS NOT NULL
+)
+SELECT 
+    fa.PostId,
+    fa.Title,
+    fa.OwnerUserId,
+    fa.OwnerDisplayName,
+    fa.Score,
+    fa.ViewCount,
+    fa.AnswerCount,
+    fa.CommentCountActual as CommentCount,
+    fa.FavoriteCount,
+    fa.TagCount,
+    fa.ScorePerAnswer,
+    fa.CommentDensityPercentage,
+    fa.ScoreCategory,
+    fa.UserPostRank,
+    fa.TotalUserPosts,
+    fa.AvgUserScore,
+    fa.ScoreChange,
+    fa.RelativeScoreToUserAverage,
+    fa.PrecedingQuestions,
+    fa.ActivityLevel,
+    fa.PerformanceTrend,
+    fa.VisibilityLevel,
+    fa.EngagementLevel,
+    fa.PopularityLevel,
+    fa.PostsWithTag,
+    fa.UpvoteCount,
+    fa.DownvoteCount,
+    fa.ImpactScore,
+    CASE 
+        WHEN (fa.ViewCount > 0 AND fa.AnswerCount > 0) THEN 
+            (fa.Score * 100.0) / (fa.ViewCount * fa.AnswerCount)
+        ELSE 0
+    END as EfficiencyScore,
+    CASE 
+        WHEN fa.FavoriteCount > 0 AND fa.ViewCount > 0 THEN 
+            ROUND((fa.FavoriteCount * 100.0) / fa.ViewCount, 2)
+        ELSE 0
+    END as FavoriteRate,
+    ((fa.Score * 1000) + (fa.ViewCount * 10) + (fa.CommentCountActual * 5) + (fa.FavoriteCount * 20)) as WeightedScore,
+    ROW_NUMBER() OVER (ORDER BY ((fa.Score * 1000) + (fa.ViewCount * 10) + (fa.CommentCountActual * 5) + (fa.FavoriteCount * 20)) DESC) as RankByWeightedScore,
+    CONCAT(
+        'Post #', 
+        fa.PostId, 
+        ' by ', 
+        COALESCE(fa.OwnerDisplayName, 'Anonymous'),
+        ' - ', 
+        CASE 
+            WHEN fa.Score > 0 THEN CONCAT('Score: ', fa.Score)
+            ELSE 'No Score'
+        END
+    ) as PostSummary,
+    CASE 
+        WHEN fa.ScoreChange > 0 AND fa.RelativeScoreToUserAverage > 0.5 THEN 'Outperforming'
+        WHEN fa.ScoreChange < 0 AND fa.RelativeScoreToUserAverage < -0.5 THEN 'Underperforming'
+        ELSE 'In line'
+    END as PerformanceStatus
+FROM FinalAnalysis fa
+WHERE (fa.Score > 5 OR fa.ViewCount > 100 OR fa.CommentCountActual > 2)
+  AND fa.VisibilityLevel IN ('High Visibility', 'Medium Visibility')
+  AND fa.OwnerUserId IS NOT NULL
+ORDER BY fa.WeightedScore DESC, fa.CreationDate DESC
+LIMIT 2000;

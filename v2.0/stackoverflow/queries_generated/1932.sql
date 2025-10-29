@@ -1,0 +1,265 @@
+-- {"query": "1932.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3737} 
+
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS UserTotalUpVotesGiven,
+        U.DownVotes AS UserTotalDownVotesGiven,
+        COALESCE(SUM(CASE WHEN P_Owned.PostTypeId = 1 THEN 1 ELSE 0 END), 0) AS TotalQuestionsOwned,
+        COALESCE(SUM(CASE WHEN P_Owned.PostTypeId = 2 THEN 1 ELSE 0 END), 0) AS TotalAnswersOwned,
+        COALESCE(SUM(P_Owned.Score), 0) AS TotalPostScoreReceived,
+        COUNT(DISTINCT P_Edited.Id) AS TotalPostsEdited,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        COALESCE(SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS TotalUpvotesGiven, -- UpMod
+        COALESCE(SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS TotalDownvotesGiven, -- DownMod
+        COALESCE(SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END), 0) AS GoldBadges,
+        COALESCE(SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END), 0) AS SilverBadges,
+        COALESCE(SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END), 0) AS BronzeBadges,
+        MAX(U.LastAccessDate) AS UserLastAccessDate
+    FROM Users U
+    LEFT JOIN Posts P_Owned ON U.Id = P_Owned.OwnerUserId
+    LEFT JOIN Posts P_Edited ON U.Id = P_Edited.LastEditorUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Votes V ON U.Id = V.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.Views, U.UpVotes, U.DownVotes, U.LastAccessDate
+),
+PostDetailedMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.CreationDate AS PostCreationDate,
+        P.OwnerUserId,
+        P.Score AS PostCurrentScore,
+        P.ViewCount AS PostViewCount,
+        P.AnswerCount,
+        P.CommentCount AS PostCommentCount,
+        P.FavoriteCount AS PostFavoriteCount,
+        P.ClosedDate,
+        P.AcceptedAnswerId,
+        Q_AcceptedAnswer.OwnerUserId AS AcceptedAnswerOwnerUserId,
+        (SELECT COUNT(PH.Id) FROM PostHistory PH WHERE PH.PostId = P.Id AND PH.PostHistoryTypeId IN (4, 5, 6)) AS EditCount, -- Edit Title, Body, Tags
+        MAX(CASE WHEN PH_Close.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS IsClosed,
+        MAX(PH_Close.CreationDate) AS LastClosedDate,
+        STRING_AGG(DISTINCT T.TagName, ' | ') FILTER (WHERE T.TagName IS NOT NULL) AS AssociatedTags,
+        (SELECT COUNT(V_Up.Id) FROM Votes V_Up WHERE V_Up.PostId = P.Id AND V_Up.VoteTypeId = 2) AS UpVoteCount,
+        (SELECT COUNT(V_Down.Id) FROM Votes V_Down WHERE V_Down.PostId = P.Id AND V_Down.VoteTypeId = 3) AS DownVoteCount,
+        COALESCE(SUM(CASE WHEN PL.LinkTypeId = 3 THEN 1 ELSE 0 END), 0) AS DuplicateLinkCount, -- LinkType 3 = Duplicate
+        COALESCE(SUM(CASE WHEN PL.LinkTypeId = 1 THEN 1 ELSE 0 END), 0) AS LinkedPostCount -- LinkType 1 = Linked
+    FROM Posts P
+    JOIN PostTypes PT ON P.PostTypeId = PT.Id
+    LEFT JOIN PostHistory PH_Close ON P.Id = PH_Close.PostId AND PH_Close.PostHistoryTypeId = 10 -- Post Closed
+    LEFT JOIN PostLinks PL ON P.Id = PL.PostId
+    LEFT JOIN LATERAL (
+        SELECT UNNEST(string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><')) AS TagName
+    ) AS ParsedTags ON P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2
+    LEFT JOIN Tags T ON ParsedTags.TagName = T.TagName
+    LEFT JOIN Posts Q_AcceptedAnswer ON P.AcceptedAnswerId = Q_AcceptedAnswer.Id AND P.PostTypeId = 1 -- Get owner of accepted answer for questions
+    GROUP BY
+        P.Id, P.PostTypeId, PT.Name, P.CreationDate, P.OwnerUserId, P.Score, P.ViewCount,
+        P.AnswerCount, P.CommentCount, P.FavoriteCount, P.ClosedDate, P.AcceptedAnswerId, Q_AcceptedAnswer.OwnerUserId
+),
+UserPostImpact AS (
+    SELECT
+        PDM.PostId,
+        PDM.PostTypeId,
+        PDM.PostTypeName,
+        PDM.OwnerUserId,
+        PDM.PostCreationDate,
+        PDM.PostCurrentScore,
+        PDM.PostViewCount,
+        PDM.PostCommentCount,
+        PDM.PostFavoriteCount,
+        PDM.EditCount,
+        PDM.IsClosed,
+        PDM.LastClosedDate,
+        PDM.AssociatedTags,
+        PDM.UpVoteCount,
+        PDM.DownVoteCount,
+        PDM.DuplicateLinkCount,
+        PDM.LinkedPostCount,
+        (PDM.UpVoteCount - PDM.DownVoteCount) AS NetVotes,
+        CASE
+            WHEN PDM.PostTypeId = 1 THEN PDM.AnswerCount
+            ELSE 0
+        END AS QuestionAnswerCount,
+        COALESCE(PDM.PostCurrentScore * 0.7 + PDM.PostViewCount * 0.05 + PDM.PostFavoriteCount * 0.1 + PDM.PostCommentCount * 0.15, 0) AS CalculatedPostImpactScore,
+        ROW_NUMBER() OVER (PARTITION BY PDM.OwnerUserId ORDER BY PDM.PostCurrentScore DESC, PDM.PostViewCount DESC, PDM.PostCreationDate DESC) AS UserPostRankByScore,
+        LAG(PDM.PostCreationDate, 1, PDM.PostCreationDate) OVER (PARTITION BY PDM.OwnerUserId ORDER BY PDM.PostCreationDate) AS PreviousPostDate,
+        PDM.AcceptedAnswerId,
+        PDM.AcceptedAnswerOwnerUserId
+    FROM PostDetailedMetrics PDM
+    WHERE PDM.OwnerUserId IS NOT NULL
+),
+PostsWithCommentAnalysis AS (
+    SELECT
+        UPI.PostId,
+        UPI.PostTypeId,
+        UPI.PostTypeName,
+        UPI.OwnerUserId,
+        UPI.PostCreationDate,
+        UPI.PostCurrentScore,
+        UPI.PostViewCount,
+        UPI.PostCommentCount,
+        UPI.CalculatedPostImpactScore,
+        COALESCE(SUM(C.Score), 0) AS TotalCommentScore,
+        COALESCE(AVG(LENGTH(C.Text)), 0) AS AverageCommentLength,
+        COUNT(DISTINCT C.UserId) AS UniqueCommenters,
+        SUM(CASE WHEN C.UserId IS NULL THEN 1 ELSE 0 END) AS AnonymousCommentCount,
+        AVG(C.Score) OVER (PARTITION BY UPI.PostId ORDER BY C.CreationDate) AS RollingAvgCommentScore
+    FROM UserPostImpact UPI
+    LEFT JOIN Comments C ON UPI.PostId = C.PostId
+    GROUP BY
+        UPI.PostId, UPI.PostTypeId, UPI.PostTypeName, UPI.OwnerUserId, UPI.PostCreationDate, UPI.PostCurrentScore,
+        UPI.PostViewCount, UPI.PostCommentCount, UPI.CalculatedPostImpactScore
+),
+QuestionAnswerMetrics AS (
+    SELECT
+        Q.Id AS QuestionId,
+        Q.OwnerUserId AS QuestionOwnerId,
+        Q.CreationDate AS QuestionCreationDate,
+        Q.ViewCount AS QuestionViewCount,
+        Q.Score AS QuestionScore,
+        Q.FavoriteCount AS QuestionFavoriteCount,
+        A.Id AS AnswerId,
+        A.OwnerUserId AS AnswerOwnerId,
+        A.CreationDate AS AnswerCreationDate,
+        A.Score AS AnswerScore,
+        (EXTRACT(EPOCH FROM (A.CreationDate - Q.CreationDate)) / 3600.0) AS TimeToFirstAnswerHours,
+        CASE WHEN Q.AcceptedAnswerId = A.Id THEN TRUE ELSE FALSE END AS IsAcceptedAnswer,
+        ROW_NUMBER() OVER (PARTITION BY Q.Id ORDER BY A.CreationDate) AS AnswerSequenceNum,
+        RANK() OVER (PARTITION BY Q.Id ORDER BY A.Score DESC, A.CreationDate ASC) AS AnswerScoreRank
+    FROM Posts Q
+    JOIN Posts A ON Q.Id = A.ParentId AND A.PostTypeId = 2
+    WHERE Q.PostTypeId = 1
+),
+QuestionAnswerPerformance AS (
+    SELECT
+        QAM.QuestionId,
+        QAM.QuestionOwnerId,
+        QAM.QuestionCreationDate,
+        QAM.QuestionScore,
+        QAM.QuestionViewCount,
+        QAM.QuestionFavoriteCount,
+        QAM.AnswerId,
+        QAM.AnswerOwnerId,
+        QAM.AnswerCreationDate,
+        QAM.AnswerScore,
+        QAM.TimeToFirstAnswerHours,
+        QAM.IsAcceptedAnswer,
+        AVG(QAM.TimeToFirstAnswerHours) OVER (PARTITION BY QAM.QuestionOwnerId ORDER BY QAM.QuestionCreationDate
+            ROWS BETWEEN 5 PRECEDING AND CURRENT ROW) AS RollingAvgTimeToAnswer
+    FROM QuestionAnswerMetrics QAM
+    WHERE QAM.IsAcceptedAnswer = TRUE AND QAM.TimeToFirstAnswerHours IS NOT NULL
+),
+TopUsersAndTheirPosts AS (
+    SELECT
+        UAS.UserId,
+        UAS.DisplayName,
+        UAS.Reputation,
+        UAS.UserProfileViews,
+        UAS.TotalQuestionsOwned,
+        UAS.TotalAnswersOwned,
+        UAS.TotalPostScoreReceived,
+        UAS.GoldBadges,
+        UAS.SilverBadges,
+        UAS.BronzeBadges,
+        UAS.UserLastAccessDate,
+        UAS.TotalPostsEdited,
+        UAS.TotalCommentsMade,
+        UAS.TotalUpvotesGiven,
+        UAS.TotalDownvotesGiven,
+        (UAS.Reputation * 0.6 + UAS.TotalPostScoreReceived * 0.2 + UAS.GoldBadges * 10 + UAS.SilverBadges * 5 + UAS.TotalQuestionsOwned * 2 + UAS.TotalAnswersOwned * 1) AS OverallUserInfluenceScore,
+        EXISTS (
+            SELECT 1 FROM Posts P_Recent WHERE P_Recent.OwnerUserId = UAS.UserId
+            AND P_Recent.CreationDate >= (CURRENT_TIMESTAMP - INTERVAL '1 year')
+        ) AND UAS.GoldBadges > 0 AS IsActiveGoldTierUser,
+        (SELECT MAX(UPI.CalculatedPostImpactScore) FROM UserPostImpact UPI WHERE UPI.OwnerUserId = UAS.UserId) AS MaxPostImpactScore,
+        (SELECT PostId FROM UserPostImpact UPI WHERE UPI.OwnerUserId = UAS.UserId ORDER BY UPI.CalculatedPostImpactScore DESC LIMIT 1) AS TopImpactPostId,
+        (SELECT PostTypeName FROM UserPostImpact UPI WHERE UPI.OwnerUserId = UAS.UserId ORDER BY UPI.CalculatedPostImpactScore DESC LIMIT 1) AS TopImpactPostType,
+        (UAS.TotalQuestionsOwned > 0 AND NOT EXISTS (
+            SELECT 1 FROM Posts Q_Accepted
+            WHERE Q_Accepted.OwnerUserId = UAS.UserId
+            AND Q_Accepted.PostTypeId = 1
+            AND Q_Accepted.AcceptedAnswerId IS NOT NULL
+        )) AS HasUnacceptedQuestionsOnly -- Users who asked questions but none of their *own* questions have an accepted answer.
+    FROM UserActivitySummary UAS
+    WHERE UAS.Reputation > 1000 AND UAS.TotalPostsOwned > 5
+),
+HighlyEngagedQuestionOwners AS (
+    SELECT
+        TUP.UserId,
+        TUP.DisplayName,
+        TUP.Reputation,
+        QAP.QuestionId,
+        QAP.QuestionCreationDate,
+        QAP.QuestionScore,
+        QAP.QuestionViewCount,
+        QAP.AnswerId,
+        QAP.AnswerOwnerId,
+        QAP.AnswerCreationDate,
+        QAP.AnswerScore,
+        QAP.TimeToFirstAnswerHours,
+        QAP.RollingAvgTimeToAnswer,
+        CASE
+            WHEN QAP.QuestionViewCount > (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = 1)
+                AND QAP.TimeToFirstAnswerHours < (SELECT AVG(TimeToFirstAnswerHours) FROM QuestionAnswerPerformance)
+                THEN 'HighEngagementQuickAnswer'
+            WHEN QAP.QuestionViewCount > (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = 1) THEN 'HighEngagementSlowAnswer'
+            WHEN QAP.QuestionViewCount <= (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = 1)
+                AND QAP.TimeToFirstAnswerHours < (SELECT AVG(TimeToFirstAnswerHours) FROM QuestionAnswerPerformance)
+                THEN 'ModerateEngagementQuickAnswer'
+            ELSE 'ModerateEngagement'
+        END AS EngagementCategory
+    FROM TopUsersAndTheirPosts TUP
+    INNER JOIN QuestionAnswerPerformance QAP ON TUP.UserId = QAP.QuestionOwnerId
+    WHERE QAP.TimeToFirstAnswerHours IS NOT NULL
+)
+SELECT
+    HEQ.UserId,
+    HEQ.DisplayName,
+    HEQ.Reputation,
+    HEQ.QuestionId,
+    HEQ.QuestionCreationDate,
+    HEQ.QuestionScore,
+    HEQ.QuestionViewCount,
+    HEQ.EngagementCategory,
+    HEQ.AnswerId,
+    HEQ.AnswerOwnerId,
+    HEQ.AnswerCreationDate,
+    HEQ.AnswerScore,
+    HEQ.TimeToFirstAnswerHours,
+    HEQ.RollingAvgTimeToAnswer,
+    TUP.OverallUserInfluenceScore,
+    TUP.IsActiveGoldTierUser,
+    TUP.MaxPostImpactScore,
+    TUP.TopImpactPostId,
+    TUP.TopImpactPostType,
+    PCA.TotalCommentScore AS TopQuestionTotalCommentScore,
+    PCA.AverageCommentLength AS TopQuestionAvgCommentLength,
+    PCA.UniqueCommenters AS TopQuestionUniqueCommenters,
+    COALESCE(UPI.AssociatedTags, 'NoTagsAvailable') AS QuestionTags,
+    'https://stackoverflow.com/questions/' || HEQ.QuestionId || '/' || REPLACE(SPLIT_PART(UPI.PostTypeName, ' ', 1), ' ', '-') AS QuestionURL,
+    CASE
+        WHEN UPI.EditCount = 0 AND TUP.HasUnacceptedQuestionsOnly = FALSE THEN 'NoEdits_Accepted'
+        WHEN UPI.EditCount > 0 AND TUP.HasUnacceptedQuestionsOnly = FALSE THEN 'Edited_Accepted'
+        WHEN UPI.EditCount = 0 AND TUP.HasUnacceptedQuestionsOnly = TRUE THEN 'NoEdits_Unaccepted'
+        ELSE 'Edited_Unaccepted'
+    END AS QuestionEditAcceptanceStatus
+FROM HighlyEngagedQuestionOwners HEQ
+JOIN TopUsersAndTheirPosts TUP ON HEQ.UserId = TUP.UserId
+LEFT JOIN PostsWithCommentAnalysis PCA ON HEQ.QuestionId = PCA.PostId
+LEFT JOIN UserPostImpact UPI ON HEQ.QuestionId = UPI.PostId
+WHERE
+    HEQ.QuestionScore > 0
+    AND HEQ.AnswerScore IS NOT NULL
+    AND HEQ.TimeToFirstAnswerHours BETWEEN 0.01 AND (24 * 7) -- Answered within a week, but not instantly (e.g. self-answer)
+ORDER BY
+    TUP.OverallUserInfluenceScore DESC, HEQ.Reputation DESC, HEQ.QuestionCreationDate DESC
+LIMIT 100;

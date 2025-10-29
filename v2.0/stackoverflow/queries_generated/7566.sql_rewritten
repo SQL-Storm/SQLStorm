@@ -1,0 +1,207 @@
+-- {"query": "7566.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1752} 
+WITH PostStats AS (
+    SELECT 
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.LastActivityDate,
+        p.ParentId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostTypeDesc,
+        COALESCE(p.Title, 'No Title') AS CleanTitle,
+        COALESCE(p.Tags, '') AS CleanTags,
+        CASE 
+            WHEN p.Score > 100 THEN 'Highly Voted'
+            WHEN p.Score > 10 THEN 'Moderately Voted'
+            ELSE 'Low Voted'
+        END AS VoteCategory,
+        DATEDIFF(day, p.CreationDate, cast('2024-10-01 12:34:56' as timestamp)) AS DaysSinceCreation,
+        CASE 
+            WHEN p.LastActivityDate IS NULL THEN 0
+            ELSE DATEDIFF(day, p.LastActivityDate, cast('2024-10-01 12:34:56' as timestamp))
+        END AS DaysSinceLastActivity,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserPostRank,
+        RANK() OVER (ORDER BY p.Score DESC) AS OverallScoreRank
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.AccountId,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(p.Score) AS TotalScore,
+        AVG(p.Score) AS AvgScore,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        COALESCE(u.AboutMe, '') AS AboutMe,
+        CASE 
+            WHEN u.Reputation >= 100000 THEN 'Expert'
+            WHEN u.Reputation >= 10000 THEN 'Advanced'
+            WHEN u.Reputation >= 1000 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END AS ReputationLevel
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.AccountId, u.AboutMe
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Very Popular'
+            WHEN t.Count > 100 THEN 'Popular'
+            WHEN t.Count > 10 THEN 'Moderately Popular'
+            ELSE 'Less Popular'
+        END AS PopularityLevel,
+        STRING_AGG(p.Title, ', ') WITHIN GROUP (ORDER BY p.CreationDate DESC) AS TopQuestions,
+        COUNT(DISTINCT p.Id) AS QuestionCount
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE '%' + t.TagName + '%'
+    WHERE p.PostTypeId = 1
+    GROUP BY t.TagName, t.Count, t.IsModeratorOnly, t.IsRequired
+),
+ComplexPosts AS (
+    SELECT 
+        ps.PostId,
+        ps.PostTypeId,
+        ps.Score,
+        ps.ViewCount,
+        ps.CreationDate,
+        ps.OwnerUserId,
+        ps.Title,
+        ps.Tags,
+        ps.AnswerCount,
+        ps.CommentCount,
+        ps.FavoriteCount,
+        ps.LastActivityDate,
+        ps.ParentId,
+        ps.PostTypeDesc,
+        ps.CleanTitle,
+        ps.CleanTags,
+        ps.VoteCategory,
+        ps.DaysSinceCreation,
+        ps.DaysSinceLastActivity,
+        ps.UserPostRank,
+        ps.OverallScoreRank,
+        CASE 
+            WHEN ps.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'Above Average'
+            ELSE 'Below Average'
+        END AS ScoreComparison,
+        CASE 
+            WHEN ps.ViewCount > (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = 1) THEN 'High View Count'
+            ELSE 'Normal View Count'
+        END AS ViewCountCategory
+    FROM PostStats ps
+    WHERE ps.PostTypeId = 1
+),
+UserPostSummary AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.AccountId,
+        u.TotalPosts,
+        u.TotalScore,
+        u.AvgScore,
+        u.QuestionCount,
+        u.AnswerCount,
+        u.LastPostDate,
+        u.ReputationLevel,
+        ROW_NUMBER() OVER (ORDER BY u.TotalPosts DESC) AS PostRank,
+        ROW_NUMBER() OVER (ORDER BY u.TotalScore DESC) AS ScoreRank,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM UserActivity u
+    WHERE u.TotalPosts > 0
+)
+SELECT 
+    cp.PostId,
+    cp.PostTypeId,
+    cp.Score,
+    cp.ViewCount,
+    cp.CreationDate,
+    cp.OwnerUserId,
+    cp.Title,
+    cp.Tags,
+    cp.AnswerCount,
+    cp.CommentCount,
+    cp.FavoriteCount,
+    cp.LastActivityDate,
+    cp.ParentId,
+    cp.PostTypeDesc,
+    cp.CleanTitle,
+    cp.CleanTags,
+    cp.VoteCategory,
+    cp.DaysSinceCreation,
+    cp.DaysSinceLastActivity,
+    cp.UserPostRank,
+    cp.OverallScoreRank,
+    cp.ScoreComparison,
+    cp.ViewCountCategory,
+    ups.UserPostRank AS UserTotalPostRank,
+    ups.TotalPosts,
+    ups.TotalScore,
+    ups.AvgScore,
+    ups.QuestionCount,
+    ups.AnswerCount,
+    ups.ReputationLevel,
+    ta.TagName,
+    ta.Count AS TagCount,
+    ta.PopularityLevel,
+    ta.TopQuestions,
+    CASE 
+        WHEN cp.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) 
+             AND cp.ViewCount > (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = 1) 
+             AND ups.TotalPosts > 10 THEN 'High Performance'
+        WHEN cp.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) OR 
+             cp.ViewCount > (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = 1) THEN 'Above Average Performance'
+        ELSE 'Standard Performance'
+    END AS PerformanceCategory,
+    NULLIF(ups.AvgScore, 0) AS NormalizedScore,
+    CASE 
+        WHEN ups.TotalScore > 1000 THEN 'High Performing'
+        WHEN ups.TotalScore > 100 THEN 'Moderately Performing'
+        ELSE 'Low Performing'
+    END AS UserPerformanceLevel,
+    CONCAT('User:', ups.DisplayName, ' - Tags:', COALESCE(ta.TagName, 'None')) AS UserTagSummary,
+    (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = cp.OwnerUserId AND p2.PostTypeId = 1 AND p2.CreationDate > cp.CreationDate) AS PostsAfterThisOne,
+    (SELECT AVG(Score) FROM Posts p3 WHERE p3.OwnerUserId = cp.OwnerUserId AND p3.PostTypeId = 1) AS UserAvgScore,
+    DATEDIFF(day, cp.CreationDate, ups.LastPostDate) AS DaysSinceUserLastPost
+FROM ComplexPosts cp
+LEFT JOIN UserPostSummary ups ON cp.OwnerUserId = ups.UserId
+LEFT JOIN TagAnalysis ta ON cp.CleanTags LIKE '%' + ta.TagName + '%'
+WHERE 
+    cp.Score IS NOT NULL 
+    AND cp.DaysSinceCreation < 365
+    AND ups.TotalPosts > 0
+    AND (ta.Count > 5 OR ta.Count IS NULL)
+ORDER BY 
+    cp.Score DESC,
+    cp.ViewCount DESC,
+    cp.CreationDate DESC
+OFFSET 0 ROWS
+FETCH NEXT 1000 ROWS ONLY;

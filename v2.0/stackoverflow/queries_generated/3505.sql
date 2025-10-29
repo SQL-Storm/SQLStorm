@@ -1,0 +1,124 @@
+-- {"query": "3505.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2391} 
+
+WITH
+    usr AS (
+        SELECT u.Id,
+               u.DisplayName,
+               u.Reputation,
+               u.CreationDate,
+               u.LastAccessDate,
+               u.Views,
+               u.UpVotes,
+               u.DownVotes,
+               COALESCE(u.Location, 'Unknown') AS Location,
+               ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS rep_rank
+        FROM Users u
+    ),
+    badge_counts AS (
+        SELECT b.UserId,
+               COUNT(*) FILTER (WHERE b.Class = 1) AS gold_cnt,
+               COUNT(*) FILTER (WHERE b.Class = 2) AS silver_cnt,
+               COUNT(*) FILTER (WHERE b.Class = 3) AS bronze_cnt,
+               COUNT(*) AS total_cnt
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+    recent_votes AS (
+        SELECT v.UserId,
+               MAX(v.CreationDate) AS last_vote_dt,
+               (SELECT vt.Name FROM VoteTypes vt WHERE vt.Id = v.VoteTypeId) AS last_vote_type
+        FROM Votes v
+        GROUP BY v.UserId
+    ),
+    top_tags AS (
+        SELECT t.TagName,
+               t.Count,
+               ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS tag_rank
+        FROM Tags t
+        WHERE t.IsModeratorOnly = 0
+    ),
+    user_posts AS (
+        SELECT p.OwnerUserId AS UserId,
+               COUNT(*) FILTER (WHERE p.PostTypeId = 1) AS question_cnt,
+               COUNT(*) FILTER (WHERE p.PostTypeId = 2) AS answer_cnt,
+               COALESCE(AVG(p.Score) FILTER (WHERE p.PostTypeId = 1),0) AS avg_question_score,
+               COALESCE(SUM(p.ViewCount) FILTER (WHERE p.PostTypeId = 1),0) AS total_question_views,
+               MAX(p.CreationDate) AS latest_post_dt
+        FROM Posts p
+        WHERE p.OwnerUserId IS NOT NULL
+        GROUP BY p.OwnerUserId
+    ),
+    linked_questions AS (
+        SELECT pl.PostId AS QId,
+               COUNT(*) FILTER (WHERE pl.LinkTypeId = 1) AS linked_cnt,
+               COUNT(*) FILTER (WHERE pl.LinkTypeId = 3) AS duplicate_cnt
+        FROM PostLinks pl
+        JOIN Posts p ON pl.PostId = p.Id
+        WHERE p.PostTypeId = 1
+        GROUP BY pl.PostId
+    )
+SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.rep_rank,
+    COALESCE(bc.gold_cnt,0)      AS gold_badges,
+    COALESCE(bc.silver_cnt,0)    AS silver_badges,
+    COALESCE(bc.bronze_cnt,0)    AS bronze_badges,
+    COALESCE(rv.last_vote_dt, '1970-01-01'::timestamp) AS last_vote_date,
+    COALESCE(rv.last_vote_type, 'None')               AS last_vote_type,
+    up.question_cnt,
+    up.answer_cnt,
+    ROUND(up.avg_question_score::numeric,2)           AS avg_q_score,
+    up.total_question_views,
+    up.latest_post_dt,
+    COALESCE(lq.linked_cnt,0)     AS linked_questions,
+    COALESCE(lq.duplicate_cnt,0)  AS duplicate_questions,
+    CASE
+        WHEN u.Reputation > 20000 THEN 'Legendary'
+        WHEN u.Reputation > 10000 THEN 'Expert'
+        WHEN u.Reputation > 5000  THEN 'Advanced'
+        ELSE 'Novice'
+    END                           AS reputation_tier,
+    CONCAT(u.DisplayName, ' (', u.Id, ')')           AS user_key,
+    tt.TagName,
+    tt.Count                                            AS tag_use_count
+FROM usr u
+LEFT JOIN badge_counts bc   ON bc.UserId = u.Id
+LEFT JOIN recent_votes rv   ON rv.UserId = u.Id
+LEFT JOIN user_posts up     ON up.UserId = u.Id
+LEFT JOIN linked_questions lq ON lq.QId = up.UserId   -- outer‑join example with mismatched key
+LEFT JOIN LATERAL (
+    SELECT t.TagName, t.Count
+    FROM Tags t
+    WHERE t.TagName ILIKE '%' || u.DisplayName || '%'
+    ORDER BY t.Count DESC
+    LIMIT 1
+) tt ON TRUE
+WHERE u.rep_rank <= 100
+
+UNION ALL
+
+SELECT
+    NULL AS Id,
+    'Aggregates' AS DisplayName,
+    NULL,
+    NULL,
+    SUM(COALESCE(bc.gold_cnt,0)),
+    SUM(COALESCE(bc.silver_cnt,0)),
+    SUM(COALESCE(bc.bronze_cnt,0)),
+    NULL,
+    NULL,
+    SUM(COALESCE(up.question_cnt,0)),
+    SUM(COALESCE(up.answer_cnt,0)),
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL
+FROM badge_counts bc
+FULL JOIN user_posts up ON up.UserId = bc.UserId;

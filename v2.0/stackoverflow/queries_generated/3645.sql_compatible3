@@ -1,0 +1,122 @@
+WITH
+    recent_posts AS (
+        SELECT
+            p.Id,
+            p.OwnerUserId,
+            p.PostTypeId,
+            p.CreationDate,
+            p.Score,
+            p.Tags
+        FROM Posts p
+        WHERE p.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '30 days'
+          AND p.OwnerUserId IS NOT NULL
+    ),
+    user_post_stats AS (
+        SELECT
+            u.Id                              AS user_id,
+            u.DisplayName,
+            u.Reputation,
+            COUNT(CASE WHEN rp.PostTypeId = 1 THEN 1 END)                AS question_cnt,
+            COUNT(CASE WHEN rp.PostTypeId = 2 THEN 1 END)                AS answer_cnt,
+            COALESCE(SUM(rp.Score),0)                                    AS total_score,
+            COALESCE(AVG(rp.Score),0)                                    AS avg_score,
+            COUNT(DISTINCT t.tag)                                        AS distinct_tag_cnt
+        FROM Users u
+        LEFT JOIN recent_posts rp ON rp.OwnerUserId = u.Id
+        LEFT JOIN LATERAL (
+            SELECT regexp_split_to_table(rp.Tags,'[><]') AS tag
+            WHERE rp.Tags IS NOT NULL
+        ) t ON TRUE
+        GROUP BY u.Id, u.DisplayName, u.Reputation
+    ),
+    user_badge_stats AS (
+        SELECT
+            b.UserId                                     AS user_id,
+            SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_cnt,
+            SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_cnt,
+            SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_cnt,
+            COUNT(*)                                     AS total_badges
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+    recent_votes AS (
+        SELECT
+            v.PostId,
+            v.VoteTypeId,
+            COUNT(*) AS vote_cnt
+        FROM Votes v
+        WHERE v.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '90 days'
+        GROUP BY v.PostId, v.VoteTypeId
+    ),
+    user_vote_agg AS (
+        SELECT
+            u.Id                                            AS user_id,
+            SUM(CASE WHEN rv.VoteTypeId = 2 THEN rv.vote_cnt ELSE 0 END) AS up_votes,
+            SUM(CASE WHEN rv.VoteTypeId = 3 THEN rv.vote_cnt ELSE 0 END) AS down_votes
+        FROM Users u
+        LEFT JOIN Posts p      ON p.OwnerUserId = u.Id
+        LEFT JOIN recent_votes rv ON rv.PostId = p.Id
+        GROUP BY u.Id
+    ),
+    high_impact_users AS (
+        SELECT ups.user_id
+        FROM user_post_stats ups
+        LEFT JOIN user_badge_stats ubs ON ubs.user_id = ups.user_id
+        WHERE ups.Reputation > 50000
+           OR COALESCE(ubs.total_badges,0) >= 10
+           OR ups.distinct_tag_cnt > 5
+           OR ups.answer_cnt > 100
+    )
+
+SELECT
+    ups.user_id,
+    ups.DisplayName,
+    ups.Reputation,
+    ups.question_cnt,
+    ups.answer_cnt,
+    ups.total_score,
+    ROUND(ups.avg_score,2)                               AS avg_score,
+    ups.distinct_tag_cnt,
+    COALESCE(ubs.gold_cnt,0)                             AS gold_badges,
+    COALESCE(ubs.silver_cnt,0)                           AS silver_badges,
+    COALESCE(ubs.bronze_cnt,0)                           AS bronze_badges,
+    COALESCE(ubs.total_badges,0)                         AS total_badges,
+    COALESCE(uva.up_votes,0)                             AS recent_up_votes,
+    COALESCE(uva.down_votes,0)                           AS recent_down_votes,
+    CASE
+        WHEN ups.Reputation > LAG(ups.Reputation) OVER (ORDER BY ups.Reputation DESC) THEN '↑'
+        WHEN ups.Reputation < LAG(ups.Reputation) OVER (ORDER BY ups.Reputation DESC) THEN '↓'
+        ELSE '='
+    END                                                   AS rep_trend,
+    ('Tags:' || COALESCE(CAST(ups.distinct_tag_cnt AS varchar),'0')) AS tag_info,
+    CASE
+        WHEN ups.answer_cnt = 0 THEN NULL
+        ELSE ROUND(CAST(ups.total_score AS numeric) / NULLIF(ups.answer_cnt,0),2)
+    END                                                   AS score_per_answer
+FROM user_post_stats      ups
+LEFT JOIN user_badge_stats   ubs ON ubs.user_id = ups.user_id
+LEFT JOIN user_vote_agg      uva ON uva.user_id = ups.user_id
+WHERE ups.user_id IN (SELECT user_id FROM high_impact_users)
+GROUP BY
+    ups.user_id,
+    ups.DisplayName,
+    ups.Reputation,
+    ups.question_cnt,
+    ups.answer_cnt,
+    ups.total_score,
+    ups.avg_score,
+    ups.distinct_tag_cnt,
+    ubs.gold_cnt,
+    ubs.silver_cnt,
+    ubs.bronze_cnt,
+    ubs.total_badges,
+    uva.up_votes,
+    uva.down_votes
+ORDER BY ups.Reputation DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL
+WHERE NOT EXISTS (SELECT 1 FROM high_impact_users);

@@ -1,0 +1,135 @@
+WITH
+RecentActivePosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.OwnerUserId,
+    p.ViewCount,
+    p.Score,
+    p.Tags,
+    p.AcceptedAnswerId,
+    p.ParentId,
+    p.CommentCount,
+    p.AnswerCount
+  FROM Posts p
+  WHERE p.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days'
+),
+UserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.AccountId,
+    u.LastAccessDate,
+    u.CreationDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.Location,
+    u.WebsiteUrl,
+    (COALESCE(u.Views,0) * 1.0 + COALESCE(u.UpVotes,0) * 2.0 - COALESCE(u.DownVotes,0) * 3.0) AS EngagementScore
+  FROM Users u
+),
+TopTags AS (
+  SELECT
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId,
+    t.WikiPostId,
+    ROW_NUMBER() OVER (ORDER BY t.Count DESC, t.TagName) AS rn
+  FROM Tags t
+  WHERE COALESCE(t.IsModeratorOnly, FALSE) = FALSE
+),
+PostTagScores AS (
+  SELECT
+    p2.PostId,
+    t.TagName,
+    (p2.Score * 1.5) + (p2.ViewCount * 0.75) + (COALESCE(t.Count,0) * 0.25) AS CompositeScore
+  FROM RecentActivePosts p2
+  LEFT JOIN Tags t ON t.ExcerptPostId = p2.PostId OR t.WikiPostId = p2.PostId
+),
+Links AS (
+  SELECT
+    pl.PostId,
+    pl.RelatedPostId,
+    lt.Name AS LinkTypeName
+  FROM PostLinks pl
+  LEFT JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+  WHERE lt.Name IN ('Linked','Duplicate')
+),
+RecentVotes AS (
+  SELECT
+    v.PostId,
+    v.VoteTypeId,
+    v.UserId,
+    v.CreationDate,
+    v.BountyAmount,
+    vt.Name AS VoteTypeName
+  FROM Votes v
+  JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+  WHERE v.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '60 days'
+),
+UserBadges AS (
+  SELECT
+    b.UserId,
+    b.Name,
+    b.Date,
+    b.Class,
+    b.TagBased
+  FROM Badges b
+  WHERE b.Date > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180 days'
+)
+SELECT
+  rp.PostId,
+  rp.TagName,
+  rp.CompositeScore,
+  u.Id AS AuthorId,
+  u.DisplayName AS AuthorDisplayName,
+  u.Reputation AS AuthorReputation,
+  ua.EngagementScore,
+  p.CreationDate AS PostCreationDate,
+  p.LastActivityDate AS PostLastActivityDate,
+  p.Title,
+  p.Tags,
+  p.ViewCount,
+  p.Score AS PostScore,
+  p.CommentCount,
+  p.AnswerCount,
+  STRING_AGG(DISTINCT COALESCE(rv.VoteTypeName, vt.Name), ',') AS RecentVoteTypes,
+  ARRAY_AGG(DISTINCT ub.Name) FILTER (WHERE ub.Name IS NOT NULL) AS RecentBadges,
+  (SELECT COUNT(*) FROM PostLinks pl2 WHERE pl2.PostId = rp.PostId) AS LinkedPostsCount
+FROM
+  RecentActivePosts p
+  LEFT JOIN UserActivity ua ON p.OwnerUserId = ua.UserId
+  LEFT JOIN TopTags tt ON tt.TagName ILIKE ANY (STRING_TO_ARRAY(REPLACE(COALESCE(p.Tags,''), '><','|'), '|')) OR tt.TagName ILIKE p.Title
+  LEFT JOIN PostTagScores rp ON rp.PostId = p.PostId
+  LEFT JOIN Votes v ON v.PostId = p.PostId
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN RecentVotes rv ON rv.PostId = p.PostId
+  LEFT JOIN UserBadges ub ON ub.UserId = u.Id
+  LEFT JOIN (SELECT * FROM Badges WHERE 1=0) lb ON 1=0
+  LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+GROUP BY
+  rp.PostId,
+  rp.TagName,
+  rp.CompositeScore,
+  u.Id,
+  u.DisplayName,
+  u.Reputation,
+  ua.EngagementScore,
+  p.PostId,
+  p.CreationDate,
+  p.LastActivityDate,
+  p.Title,
+  p.Tags,
+  p.ViewCount,
+  p.Score,
+  p.CommentCount,
+  p.AnswerCount,
+  vt.Name
+ORDER BY
+  rp.CompositeScore DESC
+LIMIT 100;

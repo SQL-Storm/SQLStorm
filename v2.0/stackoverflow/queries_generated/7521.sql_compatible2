@@ -1,0 +1,278 @@
+WITH RECURSIVE PostHierarchy AS (
+    SELECT 
+        p.Id AS PostId,
+        p.ParentId,
+        p.PostTypeId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        0 AS Level,
+        CAST(p.Id AS VARCHAR(1000)) AS Path
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.ParentId IS NULL
+
+    UNION ALL
+
+    SELECT 
+        p.Id AS PostId,
+        p.ParentId,
+        p.PostTypeId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        ph.Level + 1 AS Level,
+        (ph.Path || '->' || CAST(p.Id AS VARCHAR(1000)))::text AS Path
+    FROM Posts p
+    INNER JOIN PostHierarchy ph ON p.ParentId = ph.PostId
+    WHERE ph.Level < 3
+),
+UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.CreationDate,
+        u.Views,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS TotalQuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS TotalAnswerScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        AVG(p.Score) AS AveragePostScore,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR (LENGTH(p.Tags)-2)), ', ') AS AllTags
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.CreationDate, u.Views
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.CommentCount,
+        p.AnswerCount,
+        COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+        CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN 1 ELSE 0 END AS IsCommunityOwned,
+        CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS HasAcceptedAnswer,
+        CAST(DATE_PART('day', COALESCE(p.ClosedDate, p.LastActivityDate) - p.CreationDate) AS INTEGER) AS DaysSinceCreation,
+        CAST(DATE_PART('day', p.LastEditDate - p.CreationDate) AS INTEGER) AS DaysSinceLastEdit,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2 THEN 
+                (LENGTH(p.Tags) - 2 - LENGTH(REPLACE(p.Tags, '><', '')) ) + 1
+            ELSE 0 
+        END AS TagCount,
+        LENGTH(p.Body) AS BodyLength,
+        CASE 
+            WHEN p.Score > 100 THEN 'High'
+            WHEN p.Score > 50 THEN 'Medium'
+            WHEN p.Score > 0 THEN 'Low'
+            ELSE 'Zero'
+        END AS ScoreCategory,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS ScoreRank,
+        RANK() OVER (ORDER BY p.Score DESC) AS OverallScoreRank,
+        PERCENT_RANK() OVER (ORDER BY p.Score) AS ScorePercentile,
+        NTILE(10) OVER (ORDER BY p.Score) AS ScoreDecile
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) AND p.Score IS NOT NULL
+),
+CommentAnalysis AS (
+    SELECT 
+        c.PostId,
+        COUNT(*) AS CommentCount,
+        SUM(c.Score) AS TotalCommentScore,
+        AVG(c.Score) AS AverageCommentScore,
+        MAX(c.CreationDate) AS LatestCommentDate,
+        STRING_AGG(SUBSTRING(c.Text FROM 1 FOR 50), ' | ') AS CommentSnippets
+    FROM Comments c
+    GROUP BY c.PostId
+),
+ComplexMetrics AS (
+    SELECT 
+        pa.PostId,
+        pa.Title,
+        pa.Score,
+        pa.ViewCount,
+        pa.OwnerUserId,
+        pa.CreationDate,
+        pa.IsClosed,
+        pa.HasAcceptedAnswer,
+        pa.DaysSinceCreation,
+        pa.TagCount,
+        pa.BodyLength,
+        pa.ScoreCategory,
+        pa.ScoreRank,
+        pa.OverallScoreRank,
+        pa.ScorePercentile,
+        pa.ScoreDecile,
+        COALESCE(ca.CommentCount, 0) AS CommentCount,
+        COALESCE(ca.TotalCommentScore, 0) AS TotalCommentScore,
+        COALESCE(ca.AverageCommentScore, 0) AS AverageCommentScore,
+        CASE 
+            WHEN pa.Score > 0 AND COALESCE(ca.TotalCommentScore,0) > 0 THEN 
+                (pa.Score * 1.0 / NULLIF(ca.TotalCommentScore, 0))
+            ELSE 0 
+        END AS ScoreToCommentRatio,
+        CASE 
+            WHEN pa.ViewCount > 0 AND pa.Score > 0 THEN 
+                (pa.ViewCount * 1.0 / NULLIF(pa.Score, 0))
+            ELSE 0 
+        END AS ViewsPerScore,
+        CASE 
+            WHEN pa.CommentCount > 0 AND pa.Score > 0 THEN 
+                (pa.CommentCount * 1.0 / NULLIF(pa.Score, 0))
+            ELSE 0 
+        END AS CommentsPerScore,
+        CASE 
+            WHEN pa.DaysSinceCreation > 0 AND pa.Score > 0 THEN 
+                (pa.Score * 1.0 / NULLIF(pa.DaysSinceCreation, 0))
+            ELSE 0 
+        END AS ScorePerDay,
+        CASE 
+            WHEN pa.ViewCount > 0 AND pa.DaysSinceCreation > 0 THEN 
+                (pa.ViewCount * 1.0 / NULLIF(pa.DaysSinceCreation, 0))
+            ELSE 0 
+        END AS ViewsPerDay,
+        CASE 
+            WHEN pa.TagCount > 0 AND pa.Score > 0 THEN 
+                (pa.TagCount * 1.0 / NULLIF(pa.Score, 0))
+            ELSE 0 
+        END AS TagsPerScore,
+        NULLIF(pa.Score / NULLIF(pa.ViewCount, 0), 0) AS ScoreRatio,
+        CASE 
+            WHEN pa.TagCount > 0 AND pa.CommentCount > 0 THEN 
+                (pa.TagCount * 1.0 / NULLIF(pa.CommentCount, 0))
+            ELSE 0 
+        END AS TagsPerComment
+    FROM PostAnalysis pa
+    LEFT JOIN CommentAnalysis ca ON pa.PostId = ca.PostId
+)
+SELECT 
+    cm.PostId,
+    cm.Title,
+    cm.Score,
+    cm.ViewCount,
+    cm.OwnerUserId,
+    cm.CreationDate,
+    cm.IsClosed,
+    cm.HasAcceptedAnswer,
+    cm.DaysSinceCreation,
+    cm.TagCount,
+    cm.BodyLength,
+    cm.ScoreCategory,
+    cm.ScoreRank,
+    cm.OverallScoreRank,
+    cm.ScorePercentile,
+    cm.ScoreDecile,
+    cm.CommentCount,
+    cm.TotalCommentScore,
+    cm.AverageCommentScore,
+    cm.ScoreToCommentRatio,
+    cm.ViewsPerScore,
+    cm.CommentsPerScore,
+    cm.ScorePerDay,
+    cm.ViewsPerDay,
+    cm.TagsPerScore,
+    cm.ScoreRatio,
+    cm.TagsPerComment,
+    us.Reputation,
+    us.DisplayName AS OwnerDisplayName,
+    us.PostCount,
+    us.QuestionCount,
+    us.AnswerCount,
+    us.TotalQuestionScore,
+    us.TotalAnswerScore,
+    us.AveragePostScore,
+    us.BadgeCount,
+    CASE 
+        WHEN cm.Score > 200 THEN 'Elite'
+        WHEN cm.Score > 100 THEN 'High'
+        WHEN cm.Score > 50 THEN 'Medium'
+        WHEN cm.Score > 0 THEN 'Low'
+        ELSE 'Zero'
+    END AS PerformanceTier,
+    CASE 
+        WHEN cm.CommentCount > 10 AND cm.Score > 100 THEN 'Engaged'
+        WHEN cm.CommentCount > 0 AND cm.Score > 50 THEN 'Active'
+        WHEN cm.Score > 0 THEN 'Minimal'
+        ELSE 'Inactive'
+    END AS EngagementLevel,
+    CASE 
+        WHEN cm.DaysSinceCreation BETWEEN 0 AND 30 THEN 'New'
+        WHEN cm.DaysSinceCreation BETWEEN 31 AND 365 THEN 'Established'
+        WHEN cm.DaysSinceCreation > 365 THEN 'Veteran'
+        ELSE 'Unknown'
+    END AS AgeCategory,
+    LAG(cm.Score, 1) OVER (ORDER BY cm.Score DESC) AS PreviousScore,
+    LEAD(cm.Score, 1) OVER (ORDER BY cm.Score DESC) AS NextScore,
+    AVG(cm.Score) OVER (ORDER BY cm.Score DESC ROWS BETWEEN 5 PRECEDING AND 5 FOLLOWING) AS ScoreMovingAverage,
+    COUNT(*) OVER () AS TotalPosts,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY cm.Score) AS MedianScore,
+    COUNT(*) OVER (PARTITION BY cm.ScoreCategory) AS PostsInCategory,
+    MAX(cm.TagCount) OVER (PARTITION BY cm.PostId) AS MaxTagsInPost,
+    ROW_NUMBER() OVER (ORDER BY cm.Score DESC, cm.CommentCount DESC) AS RankByScoreAndComments,
+    DENSE_RANK() OVER (ORDER BY cm.Score DESC) AS DenseScoreRank,
+    RANK() OVER (ORDER BY cm.Score DESC, cm.ViewCount DESC) AS CompositeRank,
+    CASE 
+        WHEN cm.ScorePercentile >= 0.95 THEN 'Top 5%'
+        WHEN cm.ScorePercentile >= 0.75 THEN 'Top 25%'
+        WHEN cm.ScorePercentile >= 0.5 THEN 'Top 50%'
+        WHEN cm.ScorePercentile >= 0.25 THEN 'Bottom 75%'
+        ELSE 'Bottom 25%'
+    END AS PercentileGroup,
+    CASE 
+        WHEN cm.ScoreCategory IN ('High', 'Medium') AND cm.CommentsPerScore > 0.1 THEN 
+            'Well Discussable'
+        WHEN cm.ScoreCategory = 'High' AND cm.CommentsPerScore <= 0.1 THEN 
+            'High Score, Low Engagement'
+        WHEN cm.ScoreCategory = 'Low' AND cm.CommentsPerScore > 0.05 THEN 
+            'Low Score, High Engagement'
+        ELSE 
+            'Average'
+    END AS ContentImpact,
+    CASE 
+        WHEN cm.Score > 10 AND cm.TagCount > 0 AND cm.TagCount <= 5 THEN 
+            'Optimal Tagging'
+        WHEN cm.TagCount > 5 THEN 
+            'Over Tagged'
+        WHEN cm.TagCount = 0 THEN 
+            'Untagged'
+        ELSE 
+            'Normal'
+    END AS TaggingEfficiency,
+    CASE 
+        WHEN cm.ScorePerDay > 0.1 AND cm.ViewsPerDay > 0.5 THEN 'High Velocity'
+        WHEN cm.ScorePerDay > 0.05 AND cm.ViewsPerDay > 0.25 THEN 'Moderate Velocity'
+        WHEN cm.ScorePerDay > 0 THEN 'Low Velocity'
+        ELSE 'No Velocity'
+    END AS PerformanceVelocity
+FROM ComplexMetrics cm
+LEFT JOIN UserStats us ON cm.OwnerUserId = us.UserId
+WHERE cm.Score > 0 
+    AND cm.TagCount BETWEEN 1 AND 10
+    AND cm.DaysSinceCreation > 0
+    AND cm.BodyLength > 50
+    AND cm.CommentCount >= 0
+    AND (us.PostCount > 0 OR us.PostCount IS NULL)
+    AND cm.Title IS NOT NULL
+    AND cm.Title <> ''
+    AND cm.Title LIKE '%'
+ORDER BY 
+    cm.Score DESC,
+    cm.CommentCount DESC,
+    cm.ViewCount DESC
+LIMIT 100000 OFFSET 0;

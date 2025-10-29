@@ -1,0 +1,143 @@
+WITH
+  UserPostStats AS (
+    SELECT
+      p.OwnerUserId,
+      COUNT(p.Id) AS PostCount,
+      SUM(p.Score) AS TotalScore,
+      AVG(p.Score) AS AvgScore,
+      MAX(p.CreationDate) AS LastPostDate
+    FROM Posts p
+    WHERE
+      p.OwnerUserId IS NOT NULL
+    GROUP BY
+      p.OwnerUserId
+  ),
+  UserCommentStats AS (
+    SELECT
+      c.UserId,
+      COUNT(c.Id) AS CommentCount,
+      SUM(c.Score) AS TotalCommentScore,
+      AVG(c.Score) AS AvgCommentScore
+    FROM Comments c
+    WHERE
+      c.UserId IS NOT NULL
+    GROUP BY
+      c.UserId
+  ),
+  UserBadgeSummary AS (
+    SELECT
+      b.UserId,
+      COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadgeCount,
+      COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadgeCount,
+      COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadgeCount
+    FROM Badges b
+    GROUP BY
+      b.UserId
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate AS UserCreationDate,
+      u.LastAccessDate,
+      COALESCE(ups.PostCount, 0) AS TotalPosts,
+      COALESCE(ups.TotalScore, 0) AS TotalPostScore,
+      COALESCE(ups.AvgScore, 0) AS AvgPostScore,
+      COALESCE(ucs.CommentCount, 0) AS TotalComments,
+      COALESCE(ucs.TotalCommentScore, 0) AS TotalCommentScore,
+      COALESCE(ucs.AvgCommentScore, 0) AS AvgCommentScore,
+      COALESCE(ubs.GoldBadgeCount, 0) AS GoldBadges,
+      COALESCE(ubs.SilverBadgeCount, 0) AS SilverBadges,
+      COALESCE(ubs.BronzeBadgeCount, 0) AS BronzeBadges,
+      CASE WHEN ups.LastPostDate > u.LastAccessDate THEN 'Active Post Contributor' ELSE 'Less Active Post Contributor' END AS PostActivityStatus,
+      CASE WHEN u.WebsiteUrl IS NULL OR u.WebsiteUrl = '' THEN 'No Website' ELSE 'Has Website' END AS WebsiteStatus,
+      DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+      u.LastAccessDate -- include for grouping usage downstream
+    FROM Users u
+    LEFT JOIN UserPostStats ups
+      ON u.Id = ups.OwnerUserId
+    LEFT JOIN UserCommentStats ucs
+      ON u.Id = ucs.UserId
+    LEFT JOIN UserBadgeSummary ubs
+      ON u.Id = ubs.UserId
+  )
+SELECT
+  ua.DisplayName,
+  ua.Reputation,
+  ua.ReputationRank,
+  ua.TotalPosts,
+  ua.TotalPostScore,
+  ua.AvgPostScore,
+  ua.TotalComments,
+  ua.TotalCommentScore,
+  ua.AvgCommentScore,
+  ua.GoldBadges,
+  ua.SilverBadges,
+  ua.BronzeBadges,
+  ua.PostActivityStatus,
+  ua.WebsiteStatus,
+  (
+    SELECT
+      COUNT(*)
+    FROM PostHistory ph
+    WHERE
+      ph.UserId = ua.UserId
+      AND ph.PostHistoryTypeId IN (4, 5, 6)
+  ) AS EditCount,
+  CASE
+    WHEN EXISTS (
+      SELECT 1 FROM Badges b WHERE b.UserId = ua.UserId AND b.Name = 'Editor'
+    )
+    THEN 'Has Editor Badge'
+    ELSE 'No Editor Badge'
+  END AS EditorBadgeStatus,
+  CASE
+    WHEN ua.UserCreationDate < DATE '2010-01-01' AND ua.Reputation > 10000 THEN 'Early High Rep User'
+    WHEN ua.UserCreationDate >= DATE '2010-01-01' AND ua.Reputation > 50000 THEN 'Later High Rep User'
+    ELSE 'Standard User'
+  END AS UserTier,
+  CASE
+    WHEN LAG(ua.Reputation, 1, 0) OVER (ORDER BY ua.Reputation DESC) > ua.Reputation * 1.2 THEN 'Significant Gap'
+    ELSE 'Close Following'
+  END AS ReputationGap,
+  SUM(ua.TotalPosts) OVER () AS GrandTotalPosts,
+  AVG(ua.AvgPostScore) OVER () AS OverallAvgPostScore
+FROM UserActivity ua
+WHERE
+  ua.Reputation > 100
+  AND ua.TotalPosts > 10
+  AND ua.LastAccessDate > ua.UserCreationDate + INTERVAL '30 days'
+UNION
+SELECT
+  'Community User' AS DisplayName,
+  -1 AS Reputation,
+  0 AS ReputationRank,
+  COUNT(p.Id) AS TotalPosts,
+  SUM(p.Score) AS TotalPostScore,
+  AVG(p.Score) AS AvgPostScore,
+  COUNT(c.Id) AS TotalComments,
+  SUM(c.Score) AS TotalCommentScore,
+  AVG(c.Score) AS AvgCommentScore,
+  0 AS GoldBadges,
+  0 AS SilverBadges,
+  0 AS BronzeBadges,
+  'Active Post Contributor' AS PostActivityStatus,
+  'No Website' AS WebsiteStatus,
+  COUNT(ph.Id) AS EditCount,
+  'No Editor Badge' AS EditorBadgeStatus,
+  'Standard User' AS UserTier,
+  'Close Following' AS ReputationGap,
+  SUM(COUNT(p.Id)) OVER () AS GrandTotalPosts,
+  AVG(AVG(p.Score)) OVER () AS OverallAvgPostScore
+FROM Posts p
+LEFT JOIN Comments c
+  ON c.UserId = p.OwnerUserId
+LEFT JOIN PostHistory ph
+  ON ph.UserId = p.OwnerUserId AND ph.PostHistoryTypeId IN (4, 5, 6)
+WHERE
+  p.OwnerUserId = -1
+GROUP BY
+  p.OwnerUserId
+HAVING
+  COUNT(p.Id) > 500;

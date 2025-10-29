@@ -1,0 +1,111 @@
+WITH RankedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.AnswerCount,
+        p.FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT p.Id) AS QuestionCount,
+        SUM(CASE WHEN p.Score > 0 THEN 1 ELSE 0 END) AS PositiveScoreQuestionCount,
+        AVG(CASE WHEN p.AnswerCount IS NOT NULL THEN p.AnswerCount ELSE 0 END) AS AvgAnswersPerQuestion,
+        MAX(COALESCE(b.Date, DATE '1900-01-01')) AS LastBadgeDate,
+        (
+            SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 2
+        ) AS TotalUpvotesCast,
+        (
+            SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 3
+        ) AS TotalDownvotesCast
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+CommentAnalysis AS (
+    SELECT
+        c.PostId,
+        COUNT(c.Id) AS CommentCountOnPost,
+        SUM(CASE WHEN c.Score > 0 THEN 1 ELSE 0 END) AS PositiveScoreComments,
+        AVG(c.Score) AS AvgCommentScore,
+        MAX(c.CreationDate) AS LatestCommentDate
+    FROM Comments c
+    GROUP BY c.PostId
+)
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.UserCreationDate,
+    ua.QuestionCount,
+    ua.PositiveScoreQuestionCount,
+    ua.AvgAnswersPerQuestion,
+    rp.Title AS LatestQuestionTitle,
+    rp.Tags AS LatestQuestionTags,
+    rp.Score AS LatestQuestionScore,
+    rp.FavoriteCount AS LatestQuestionFavoriteCount,
+    ca.CommentCountOnPost,
+    ca.PositiveScoreComments,
+    ca.AvgCommentScore,
+    ua.TotalUpvotesCast,
+    ua.TotalDownvotesCast,
+    CASE
+        WHEN EXTRACT(YEAR FROM ua.UserCreationDate) < EXTRACT(YEAR FROM (DATE '2024-10-01' - INTERVAL '1 year')) THEN 'Established'
+        ELSE 'Newer'
+    END AS UserAgeCategory,
+    CASE
+        WHEN ua.Reputation > 100000 THEN 'High'
+        WHEN ua.Reputation > 10000 THEN 'Medium'
+        ELSE 'Low'
+    END AS ReputationTier,
+    CASE
+        WHEN ca.LatestCommentDate > (DATE '2024-10-01' - INTERVAL '7 days') THEN 'Recent Activity'
+        ELSE 'Dormant'
+    END AS RecentCommentActivity,
+    COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersOwned,
+    SUM(p.ViewCount) AS TotalViewsOnPosts,
+    SUM(p.CommentCount) AS TotalCommentsOnPosts,
+    AVG(p.Score) AS AveragePostScore,
+    MAX(p.LastActivityDate) AS UserLastActivityDate,
+    (SELECT COUNT(*) FROM Badges WHERE UserId = ua.UserId AND Class = 1) AS GoldBadges,
+    (SELECT COUNT(*) FROM Badges WHERE UserId = ua.UserId AND Class = 2) AS SilverBadges,
+    (SELECT COUNT(*) FROM Badges WHERE UserId = ua.UserId AND Class = 3) AS BronzeBadges,
+    CASE
+        WHEN ua.LastBadgeDate IS NULL OR ua.LastBadgeDate < (DATE '2024-10-01' - INTERVAL '365 days') THEN 'No Recent Badges'
+        ELSE 'Has Recent Badges'
+    END AS BadgeStatus
+FROM UserActivity ua
+LEFT JOIN RankedPosts rp ON ua.UserId = rp.OwnerUserId AND rp.rn = 1
+LEFT JOIN Posts p ON ua.UserId = p.OwnerUserId
+LEFT JOIN CommentAnalysis ca ON p.Id = ca.PostId
+GROUP BY
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.UserCreationDate,
+    ua.QuestionCount,
+    ua.PositiveScoreQuestionCount,
+    ua.AvgAnswersPerQuestion,
+    rp.Title,
+    rp.Tags,
+    rp.Score,
+    rp.FavoriteCount,
+    ca.CommentCountOnPost,
+    ca.PositiveScoreComments,
+    ca.AvgCommentScore,
+    ua.TotalUpvotesCast,
+    ua.TotalDownvotesCast,
+    ua.LastBadgeDate
+HAVING COUNT(DISTINCT p.Id) > 5
+ORDER BY ua.Reputation DESC, ua.QuestionCount DESC;

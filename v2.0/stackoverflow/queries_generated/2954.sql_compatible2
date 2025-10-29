@@ -1,0 +1,178 @@
+with RecursiveTagHierarchy as (
+    select 
+        t.Id,
+        t.TagName,
+        0 as Level,
+        cast(t.TagName as varchar(1000)) as TagPath
+    from Tags t
+    where t.IsModeratorOnly = false
+
+    union all
+
+    select
+        t.Id,
+        t.TagName,
+        r.Level + 1,
+        r.TagPath || ' > ' || t.TagName
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id = r.Id + 1 and r.Level < 3
+),
+UserBadgeStats as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct b.Id) as TotalBadges,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        min(b.Date) as FirstBadgeDate,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    group by u.Id, u.DisplayName
+),
+QuestionAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.OwnerUserId,
+        q.Title,
+        q.CreationDate as QuestionCreationDate,
+        count(distinct a.Id) as AnswerCount,
+        coalesce(sum(a.Score), 0) as TotalAnswerScore,
+        max(a.Score) as MaxAnswerScore,
+        (select count(1) 
+         from Votes v 
+         where v.PostId = q.Id and v.VoteTypeId = 2) as QuestionUpVotes,
+        (select count(1) 
+         from Votes v 
+         where v.PostId = q.Id and v.VoteTypeId = 3) as QuestionDownVotes,
+        coalesce((select count(1) 
+         from Comments c 
+         where c.PostId = q.Id),0) as QuestionCommentCount
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+    group by q.Id, q.OwnerUserId, q.Title, q.CreationDate
+),
+TopAnswerers as (
+    select
+        a.OwnerUserId,
+        u.DisplayName,
+        count(a.Id) as NumberOfAnswers,
+        avg(a.Score) as AvgAnswerScore,
+        sum(case when a.Score > 10 then 1 else 0 end) as HighScoreAnswers
+    from Posts a
+    join Users u on a.OwnerUserId = u.Id
+    where a.PostTypeId = 2
+    group by a.OwnerUserId, u.DisplayName
+    having count(a.Id) > 50
+),
+RankedPosts as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.CreationDate asc) as RankByScore
+    from Posts p
+    where p.PostTypeId in (1, 2)
+),
+LinkTypeCounts as (
+    select
+        l.PostId,
+        lt.Name as LinkTypeName,
+        count(*) as LinkCount
+    from PostLinks l
+    join LinkTypes lt on l.LinkTypeId = lt.Id
+    group by l.PostId, lt.Name
+),
+ComplexPostAnalysis as (
+    select 
+        rp.Id as PostId,
+        rp.PostTypeId,
+        rp.OwnerUserId,
+        rp.Title,
+        rp.CreationDate,
+        rp.Score,
+        rp.ViewCount,
+        ub.TotalBadges,
+        ut.NumberOfAnswers,
+        ut.AvgAnswerScore,
+        max(case when ltc.LinkTypeName = 'Duplicate' then ltc.LinkCount else 0 end) as DuplicateLinks,
+        max(case when ltc.LinkTypeName = 'Linked' then ltc.LinkCount else 0 end) as LinkedPosts,
+        case 
+            when rp.ViewCount > 10000 then 'HighViews'
+            when rp.ViewCount between 1000 and 9999 then 'MediumViews'
+            else 'LowViews'
+        end as ViewCategory,
+        case 
+            when rp.Score < 0 then 0
+            else rp.Score
+        end as PositiveScore,
+        coalesce((select max(ph.CreationDate) from PostHistory ph where ph.PostId = rp.Id), rp.CreationDate) as LastModifiedDate,
+        rp.RankByScore
+    from RankedPosts rp
+    left join UserBadgeStats ub on rp.OwnerUserId = ub.UserId
+    left join TopAnswerers ut on rp.OwnerUserId = ut.OwnerUserId
+    left join LinkTypeCounts ltc on rp.Id = ltc.PostId
+    group by
+        rp.Id,
+        rp.PostTypeId,
+        rp.OwnerUserId,
+        rp.Title,
+        rp.CreationDate,
+        rp.Score,
+        rp.ViewCount,
+        ub.TotalBadges,
+        ut.NumberOfAnswers,
+        ut.AvgAnswerScore,
+        rp.RankByScore,
+        rp.ViewCount
+)
+select 
+    cpa.PostId,
+    cpa.PostTypeId,
+    u.DisplayName as OwnerName,
+    cpa.Title,
+    cpa.CreationDate,
+    cpa.LastModifiedDate,
+    cpa.Score,
+    cpa.PositiveScore,
+    cpa.ViewCount,
+    cpa.ViewCategory,
+    cpa.TotalBadges,
+    cpa.NumberOfAnswers,
+    coalesce(cpa.AvgAnswerScore, 0) as AvgAnswerScore,
+    coalesce(cpa.DuplicateLinks, 0) as DuplicateLinks,
+    coalesce(cpa.LinkedPosts, 0) as LinkedPosts,
+    row_number() over (partition by cpa.ViewCategory order by cpa.Score desc) as RankWithinViewCategory,
+    (select string_agg(distinct pt.Name, ', ')
+     from Posts p2
+     join PostLinks pl on p2.Id = pl.RelatedPostId
+     join PostTypes pt on p2.PostTypeId = pt.Id
+     where pl.PostId = cpa.PostId and p2.PostTypeId <> cpa.PostTypeId
+    ) as RelatedPostTypes,
+    case 
+        when coalesce(ub.GoldBadges,0) > 0 then 'Experienced'
+        when coalesce(ub.SilverBadges,0) > 5 then 'Advanced'
+        when coalesce(ub.BronzeBadges,0) > 10 then 'Intermediate'
+        else 'Newbie'
+    end as BadgeLevelCategory,
+    (select count(1) from Comments cmt where cmt.PostId = cpa.PostId) as CommentCountOnPost,
+    (select count(1) from Votes v2 where v2.PostId = cpa.PostId and v2.VoteTypeId = 2) as UpVotesCount,
+    (select count(1) from Votes v2 where v2.PostId = cpa.PostId and v2.VoteTypeId = 3) as DownVotesCount,
+    case when cpa.PostTypeId = 1 then
+        (select string_agg(distinct substring(t.TagName from 1 for 15), ', ')
+         from Tags t
+         join Posts p3 on p3.Tags like '%' || t.TagName || '%'
+         where p3.Id = cpa.PostId
+        )
+    else null end as ShortTagsSnippet
+from ComplexPostAnalysis cpa
+left join Users u on cpa.OwnerUserId = u.Id
+left join UserBadgeStats ub on cpa.OwnerUserId = ub.UserId
+where cpa.RankByScore <= 100
+order by cpa.ViewCategory, cpa.Score desc, cpa.CreationDate asc;

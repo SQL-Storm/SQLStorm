@@ -1,0 +1,157 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        0 AS Level,
+        ARRAY[t.TagName] AS Path
+    FROM Tags t
+    WHERE t.IsRequired = 1
+
+    UNION ALL
+
+    SELECT
+        t.Id,
+        t.TagName,
+        r.Level + 1,
+        r.Path || t.TagName
+    FROM Tags t
+    JOIN RecursiveTagHierarchy r ON t.Id <> r.Id AND NOT t.TagName = ANY(r.Path)
+    WHERE t.IsModeratorOnly = 0 AND r.Level < 3
+),
+RecentUserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        MAX(CASE WHEN p.PostTypeId = 1 THEN p.LastActivityDate END) AS LastQuestionActivity,
+        MAX(CASE WHEN p.PostTypeId = 2 THEN p.LastActivityDate END) AS LastAnswerActivity,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotes
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    WHERE u.CreationDate > CAST('2024-10-01' AS DATE) - INTERVAL '2 years'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+QuestionWithAcceptedAndCloseInfo AS (
+    SELECT 
+        q.Id,
+        q.Title,
+        q.Tags,
+        q.OwnerUserId,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.AcceptedAnswerId,
+        ca.Score AS AcceptedAnswerScore,
+        crt.Name AS CloseReason,
+        ph.ClosedDate
+    FROM Posts q
+    LEFT JOIN Posts ca ON ca.Id = q.AcceptedAnswerId
+    LEFT JOIN PostHistory ph ON ph.PostId = q.Id AND ph.PostHistoryTypeId = 10 AND ph.CreationDate = (
+        SELECT MAX(ph2.CreationDate) FROM PostHistory ph2 WHERE ph2.PostId = q.Id AND ph2.PostHistoryTypeId = 10
+    )
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS INTEGER)
+    WHERE q.PostTypeId = 1
+),
+RankingVotesPerPost AS (
+    SELECT
+        p.Id AS PostId,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVoteCount,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVoteCount,
+        COUNT(v.Id) AS TotalVotes,
+        ROUND(
+            COALESCE(
+                SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) * 1.0 / NULLIF(COUNT(v.Id), 0),
+                0
+            ), 4
+        ) AS UpVoteRatio
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    GROUP BY p.Id
+)
+SELECT
+    q.Id AS QuestionId,
+    q.Title,
+    q.Tags,
+    q.Score,
+    q.ViewCount,
+    CAST(q.CreationDate AS DATE) AS QuestionDate,
+    q.CloseReason,
+    CAST(q.ClosedDate AS DATE) AS ClosedDate,
+    q.AcceptedAnswerId,
+    q.AcceptedAnswerScore,
+    r.UserId,
+    r.DisplayName AS QuestionOwner,
+    r.Reputation AS OwnerReputation,
+    r.QuestionCount,
+    r.AnswerCount,
+    rv.UpVoteCount,
+    rv.DownVoteCount,
+    rv.TotalVotes,
+    rv.UpVoteRatio,
+    ROW_NUMBER() OVER (PARTITION BY r.UserId ORDER BY q.Score DESC, q.ViewCount DESC) AS UserQuestionRank,
+    DENSE_RANK() OVER (ORDER BY q.Score DESC, q.ViewCount DESC) AS GlobalQuestionRank,
+    COALESCE(phc.Comment, 'No recent close comments') AS LatestCloseComment,
+    COALESCE((
+        SELECT STRING_AGG(b.Name || ' (class ' || b.Class || ')', ', ' ORDER BY b.Date DESC)
+        FROM Badges b 
+        WHERE b.UserId = r.UserId
+          AND b.Date > CAST('2024-10-01' AS DATE) - INTERVAL '1 year'
+    ), 'No recent badges') AS RecentBadges
+FROM QuestionWithAcceptedAndCloseInfo q
+INNER JOIN RecentUserActivity r ON r.UserId = q.OwnerUserId
+LEFT JOIN RankingVotesPerPost rv ON rv.PostId = q.Id
+LEFT JOIN LATERAL (
+    SELECT ph3.Comment, ph3.CreationDate
+    FROM PostHistory ph3
+    WHERE ph3.PostId = q.Id AND ph3.PostHistoryTypeId = 10 AND ph3.CreationDate > CAST('2024-10-01' AS DATE) - INTERVAL '1 month'
+    ORDER BY ph3.CreationDate DESC
+    LIMIT 1
+) phc ON TRUE
+WHERE
+    (q.CloseReason IS NULL OR q.CloseReason NOT IN ('Duplicate', 'Exact Duplicate'))
+    AND (array_length(string_to_array(q.Tags, '><'), 1) BETWEEN 1 AND 5)
+    AND r.Reputation > 1000
+    AND (q.Score > 5 OR q.ViewCount > 1000)
+ORDER BY r.UserId
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    a.Id AS QuestionId,
+    'Answer to: ' || COALESCE(q.Title, '[unknown question]') AS Title,
+    q.Tags,
+    a.Score,
+    NULL AS ViewCount,
+    CAST(a.CreationDate AS DATE) AS QuestionDate,
+    NULL AS CloseReason,
+    NULL AS ClosedDate,
+    NULL AS AcceptedAnswerId,
+    NULL AS AcceptedAnswerScore,
+    r.UserId,
+    r.DisplayName AS QuestionOwner,
+    r.Reputation AS OwnerReputation,
+    r.QuestionCount,
+    r.AnswerCount,
+    rv.UpVoteCount,
+    rv.DownVoteCount,
+    rv.TotalVotes,
+    rv.UpVoteRatio,
+    NULL AS UserQuestionRank,
+    NULL AS GlobalQuestionRank,
+    NULL AS LatestCloseComment,
+    NULL AS RecentBadges
+FROM Posts a
+LEFT JOIN Posts q ON q.Id = a.ParentId AND q.PostTypeId = 1
+INNER JOIN RecentUserActivity r ON r.UserId = a.OwnerUserId
+LEFT JOIN RankingVotesPerPost rv ON rv.PostId = a.Id
+WHERE a.PostTypeId = 2
+  AND a.CreationDate > CAST('2024-10-01' AS DATE) - INTERVAL '6 months'
+  AND r.Reputation > 500
+ORDER BY a.CreationDate DESC
+LIMIT 50;

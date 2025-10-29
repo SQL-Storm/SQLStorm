@@ -1,0 +1,115 @@
+with RecursiveTagCounts as (
+    select p.Id as PostId, 
+           u.Id as UserId, 
+           unnest(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')) as Tag
+    from Posts p
+    join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId = 1 and p.Tags is not null
+), TagUserAggregates as (
+    select Tag,
+           count(distinct UserId) as UserCount,
+           count(PostId) as PostCount
+    from RecursiveTagCounts
+    group by Tag
+), RankedPosts as (
+    select p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount,
+           p.OwnerUserId, u.DisplayName, p.Tags,
+           row_number() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc) as RankScoreView,
+           dense_rank() over (order by p.Score desc) as DenseRankScore,
+           lag(p.Score) over (order by p.CreationDate) as PrevScore,
+           lead(p.Score) over (order by p.CreationDate) as NextScore
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId = 1
+), RecentActivity as (
+    select ph.PostId, ph.PostHistoryTypeId, pht.Name as HistoryTypeName,
+           ph.CreationDate, ph.UserId, u.DisplayName,
+           length(ph.Comment) as CommentLength,
+           case when ph.PostHistoryTypeId in (10, 11) and ph.Comment is not null then cast(ph.Comment as integer) else null end as CloseReasonId
+    from PostHistory ph
+    join PostHistoryTypes pht on ph.PostHistoryTypeId = pht.Id
+    left join Users u on ph.UserId = u.Id
+    where ph.CreationDate > (cast('2024-10-01' as date) - interval '30 days')
+), UserBadgeRanks as (
+    select b.UserId,
+           b.Name,
+           b.Class,
+           b.Date,
+           row_number() over (partition by b.UserId order by b.Class, b.Date desc) as BadgeRank
+    from Badges b
+    where b.Date > (cast('2024-10-01' as date) - interval '1 year')
+), PostLinkStats as (
+    select pl.PostId,
+           sum(case when lt.Name = 'Duplicate' then 1 else 0 end) as DuplicateLinks,
+           sum(case when lt.Name = 'Linked' then 1 else 0 end) as LinkedPosts,
+           count(*) as TotalLinks
+    from PostLinks pl
+    join LinkTypes lt on pl.LinkTypeId = lt.Id
+    group by pl.PostId
+), UserVoteSummary as (
+    select v.UserId,
+           sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+           sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes,
+           sum(case when vt.Name = 'Favorite' then 1 else 0 end) as Favorites
+    from Votes v
+    join VoteTypes vt on v.VoteTypeId = vt.Id
+    where v.CreationDate > (cast('2024-10-01' as date) - interval '180 days')
+    group by v.UserId
+), TopScoringAnswers as (
+    select p.Id, p.ParentId, p.Score,
+           row_number() over (partition by p.ParentId order by p.Score desc) as AnswerRank
+    from Posts p
+    where p.PostTypeId = 2 and p.Score > 0
+)
+select 
+    rp.Id as QuestionId,
+    rp.Title,
+    rp.CreationDate,
+    rp.Score as QuestionScore,
+    rp.ViewCount,
+    coalesce(pls.DuplicateLinks, 0) as NumDuplicateLinks,
+    coalesce(pls.LinkedPosts, 0) as NumLinkedPosts,
+    rp.DisplayName as QuestionOwner,
+    ts.AnswerId,
+    ts.AnswerScore,
+    ts.AnswerOwner,
+    ua.UpVotes as UserUpVotes,
+    ua.DownVotes as UserDownVotes,
+    ua.Favorites as UserFavorites,
+    ua2.UpVotes as AnswerOwnerUpVotes,
+    ua2.DownVotes as AnswerOwnerDownVotes,
+    COUNT(DISTINCT ph.PostHistoryTypeId) FILTER (WHERE ph.PostHistoryTypeId IN (10,11)) as CloseReopenEventsLast30d,
+    string_agg(DISTINCT cut.DisplayName, ', ') as RecentEditors,
+    tga.UserCount as TagUserCount,
+    tga.PostCount as TagPostCount,
+    string_agg(DISTINCT (ub.Name || ' (' || ub.Class || ')'), ', ') as RecentBadges,
+    case 
+        when rp.Score > avg(rp.Score) over () then 'Above Avg Score'
+        else 'Below Avg Score'
+    end as ScoreCategory
+from RankedPosts rp
+left join PostLinkStats pls on rp.Id = pls.PostId
+left join (
+    select p.ParentId, p.Id as AnswerId, p.Score as AnswerScore, p.OwnerUserId as AnswerOwnerUserId, u.DisplayName as AnswerOwner
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId = 2
+) ts on ts.ParentId = rp.Id and ts.AnswerScore = (
+    select max(p2.Score) from Posts p2 where p2.ParentId = rp.Id and p2.PostTypeId = 2
+)
+left join UserVoteSummary ua on ua.UserId = rp.OwnerUserId
+left join UserVoteSummary ua2 on ua2.UserId = ts.AnswerOwnerUserId
+left join RecentActivity ph on ph.PostId = rp.Id
+left join Users cut on cut.Id = ph.UserId
+left join TagUserAggregates tga on tga.Tag = (
+    select (string_to_array(substring(rp.Tags, 2, length(rp.Tags) - 2), '><'))[1]
+)
+left join UserBadgeRanks ub on ub.UserId = rp.OwnerUserId and ub.BadgeRank <= 3
+where rp.RankScoreView <= 5
+group by rp.Id, rp.Title, rp.CreationDate, rp.Score, rp.ViewCount, rp.DisplayName, rp.Tags, pls.DuplicateLinks, pls.LinkedPosts,
+         ts.AnswerId, ts.AnswerScore, ts.AnswerOwner, ts.AnswerOwnerUserId,
+         ua.UpVotes, ua.DownVotes, ua.Favorites,
+         ua2.UpVotes, ua2.DownVotes,
+         tga.UserCount, tga.PostCount, rp.RankScoreView, rp.Score, rp.OwnerUserId
+order by rp.Score desc, rp.ViewCount desc
+limit 50;

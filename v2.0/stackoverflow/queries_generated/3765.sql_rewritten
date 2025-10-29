@@ -1,0 +1,133 @@
+-- {"query": "3765.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2838} 
+WITH top_tags AS (
+    SELECT t.TagName
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0
+    ORDER BY t.Count DESC
+    LIMIT 10
+),
+user_posts AS (
+    SELECT 
+        u.Id AS UserId,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        SUM(p.Score) FILTER (WHERE p.PostTypeId = 2) AS AnswerScoreSum,
+        MAX(p.CreationDate) AS LastPostDate,
+        MIN(p.CreationDate) AS FirstPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id
+),
+user_badges AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        STRING_AGG(DISTINCT b.Name, ', ') FILTER (WHERE b.Class = 1) AS GoldBadgeNames
+    FROM Badges b
+    GROUP BY b.UserId
+),
+user_votes AS (
+    SELECT 
+        v.PostId,
+        SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        MAX(v.CreationDate) AS LastVoteDate
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY v.PostId
+),
+answer_acceptance AS (
+    SELECT 
+        a.OwnerUserId AS UserId,
+        COUNT(*) AS AcceptedAnswerCount
+    FROM Posts a
+    JOIN Posts q ON q.AcceptedAnswerId = a.Id
+    WHERE a.PostTypeId = 2
+    GROUP BY a.OwnerUserId
+),
+user_recent_activity AS (
+    SELECT 
+        u.Id AS UserId,
+        COUNT(DISTINCT ph.Id) FILTER (WHERE ph.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days') AS RecentHistoryEvents,
+        COUNT(DISTINCT c.Id) FILTER (WHERE c.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days') AS RecentComments,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days') AS RecentVotes
+    FROM Users u
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    GROUP BY u.Id
+),
+user_tag_answer_stats AS (
+    SELECT 
+        a.OwnerUserId AS UserId,
+        t.TagName,
+        COUNT(*) AS AnswersInTag,
+        AVG(a.Score) AS AvgScoreInTag,
+        ROW_NUMBER() OVER (PARTITION BY a.OwnerUserId ORDER BY COUNT(*) DESC) AS TagRank
+    FROM Posts a
+    JOIN Posts q ON q.Id = a.ParentId
+    CROSS JOIN LATERAL (
+        SELECT unnest(string_to_array(substring(q.Tags, 2, length(q.Tags)-2), '><')) AS TagName
+    ) t
+    WHERE a.PostTypeId = 2
+      AND t.TagName = ANY (SELECT TagName FROM top_tags)
+    GROUP BY a.OwnerUserId, t.TagName
+)
+SELECT 
+    u.Id,
+    COALESCE(u.DisplayName, 'Anonymous') AS DisplayName,
+    u.Reputation,
+    up.QuestionCount,
+    up.AnswerCount,
+    up.AnswerScoreSum,
+    ROUND(CASE WHEN up.AnswerCount = 0 THEN 0 ELSE up.AnswerScoreSum::numeric / up.AnswerCount END, 2) AS AvgAnswerScore,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ub.GoldBadgeNames,
+    aa.AcceptedAnswerCount,
+    ur.RecentHistoryEvents,
+    ur.RecentComments,
+    ur.RecentVotes,
+    ta.TagName AS TopTag,
+    ta.AnswersInTag,
+    ROUND(ta.AvgScoreInTag::numeric, 2) AS AvgScoreInTopTag,
+    GREATEST(
+        COALESCE(DATE_PART('day', cast('2024-10-01 12:34:56' as timestamp) - up.LastPostDate), 0),
+        COALESCE(DATE_PART('day', cast('2024-10-01 12:34:56' as timestamp) - up.FirstPostDate), 0)
+    ) AS DaysSinceLastOrFirstPost,
+    CASE 
+        WHEN up.AnswerCount IS NULL THEN 'No Activity'
+        WHEN up.AnswerCount > 0 AND ub.GoldBadges > 0 THEN 'Power Contributor'
+        ELSE 'Active User'
+    END AS UserCategory
+FROM Users u
+LEFT JOIN user_posts up ON up.UserId = u.Id
+LEFT JOIN user_badges ub ON ub.UserId = u.Id
+LEFT JOIN answer_acceptance aa ON aa.UserId = u.Id
+LEFT JOIN user_recent_activity ur ON ur.UserId = u.Id
+LEFT JOIN (
+    SELECT *
+    FROM user_tag_answer_stats
+    WHERE TagRank = 1
+) ta ON ta.UserId = u.Id
+WHERE u.Reputation > 0
+   AND (up.AnswerCount IS NOT NULL OR ub.GoldBadges IS NOT NULL)
+ORDER BY u.Reputation DESC NULLS LAST
+LIMIT 100
+UNION ALL
+SELECT 
+    u.Id,
+    COALESCE(u.DisplayName, 'Anonymous') AS DisplayName,
+    u.Reputation,
+    0,0,0,0,
+    0,0,0,NULL,
+    0,0,0,0,NULL,0,NULL,
+    NULL,NULL,NULL,'Inactive'
+FROM Users u
+WHERE NOT EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id)
+  AND u.Reputation > 0
+ORDER BY Reputation DESC
+LIMIT 50;

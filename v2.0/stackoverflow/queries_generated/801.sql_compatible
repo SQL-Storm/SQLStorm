@@ -1,0 +1,435 @@
+with
+active_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.lastaccessdate,
+    coalesce(nullif(trim(u.location), ''), 'Unknown') as location_norm,
+    u.upvotes,
+    u.downvotes,
+    u.views,
+    (u.upvotes - u.downvotes) as net_votes,
+    row_number() over (order by u.reputation desc, u.id) as rn_rep
+  from users u
+  where u.reputation > 0
+    and u.creationdate <= cast('2024-10-01 12:34:56' as timestamp)
+    and u.lastaccessdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '730 days'
+),
+recent_questions as (
+  select
+    p.id as post_id,
+    p.owneruserid as owner_user_id,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.favoritecount,
+    p.answercount,
+    p.commentcount,
+    p.acceptedanswerid,
+    p.closeddate,
+    p.title,
+    length(coalesce(p.title, '')) as title_len,
+    case
+      when p.tags is null then array[]::varchar[]
+      when length(p.tags) < 2 then array[]::varchar[]
+      else string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')
+    end as tag_arr
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+),
+answers as (
+  select
+    a.id as answer_id,
+    a.parentid as question_id,
+    a.owneruserid as answerer_id,
+    a.creationdate as answer_date,
+    a.score as answer_score
+  from posts a
+  where a.posttypeid = 2
+),
+first_answer as (
+  select distinct on (a.question_id)
+    a.question_id,
+    a.answer_id,
+    a.answerer_id,
+    a.answer_date
+  from answers a
+  order by a.question_id, a.answer_date
+),
+post_votes as (
+  select
+    v.postid,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as up_count,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as down_count,
+    sum(case when v.votetypeid = 5 then 1 else 0 end) as fav_count,
+    count(*) as total_votes,
+    max(v.creationdate) as last_vote_at
+  from votes v
+  group by v.postid
+),
+post_comments as (
+  select
+    c.postid,
+    count(*) as comment_count,
+    max(c.creationdate) as last_comment_at,
+    sum(case when c.score > 0 then 1 else 0 end) as pos_comments,
+    sum(case when c.score < 0 then 1 else 0 end) as neg_comments
+  from comments c
+  group by c.postid
+),
+post_history_flags as (
+  select
+    ph.postid,
+    bool_or(ph.posthistorytypeid in (10,35)) as was_closed_or_migrated,
+    bool_or(ph.posthistorytypeid = 19) as was_protected,
+    min(case when ph.posthistorytypeid in (10,35) then ph.creationdate end) as first_closed_at,
+    min(case when ph.posthistorytypeid = 19 then ph.creationdate end) as first_protected_at,
+    count(*) filter (where ph.posthistorytypeid in (4,5,6)) as edit_events
+  from posthistory ph
+  group by ph.postid
+),
+post_links_agg as (
+  select
+    pl.postid,
+    sum(case when pl.linktypeid = 3 then 1 else 0 end) as dup_links,
+    sum(case when pl.linktypeid = 1 then 1 else 0 end) as related_links,
+    count(*) as all_links
+  from postlinks pl
+  group by pl.postid
+),
+tag_dim as (
+  select t.tagname, t.count as tag_count
+  from tags t
+),
+question_tags as (
+  select
+    rq.post_id,
+    lower(trim(t)) as tagname
+  from recent_questions rq,
+  lateral unnest(rq.tag_arr) as t
+),
+question_tag_stats as (
+  select
+    qt.post_id,
+    count(*) as tag_cnt,
+    coalesce(max(td.tag_count), 0) as max_tag_popularity,
+    coalesce(cast(avg(td.tag_count) as bigint), 0) as avg_tag_popularity
+  from question_tags qt
+  left join tag_dim td on td.tagname = qt.tagname
+  group by qt.post_id
+),
+user_badges as (
+  select
+    b.userid,
+    sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+    sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+    sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+    sum(case when b.tagbased = true then 1 else 0 end) as tag_badges,
+    count(*) as total_badges,
+    max(b.date) as last_badge_at
+  from badges b
+  group by b.userid
+),
+question_metrics as (
+  select
+    rq.post_id,
+    rq.owner_user_id,
+    rq.creationdate as q_created,
+    rq.score as q_score,
+    rq.viewcount as q_views,
+    rq.favoritecount as q_favs,
+    rq.answercount as q_answers,
+    rq.commentcount as q_comments,
+    rq.acceptedanswerid,
+    rq.closeddate,
+    rq.title,
+    rq.title_len,
+    qts.tag_cnt,
+    qts.max_tag_popularity,
+    qts.avg_tag_popularity,
+    pv.up_count as v_up,
+    pv.down_count as v_down,
+    pv.fav_count as v_fav,
+    pv.total_votes as v_total,
+    pv.last_vote_at,
+    pc.comment_count as c_total,
+    pc.last_comment_at,
+    pc.pos_comments,
+    pc.neg_comments,
+    ph.was_closed_or_migrated,
+    ph.was_protected,
+    ph.first_closed_at,
+    ph.first_protected_at,
+    ph.edit_events,
+    pla.dup_links,
+    pla.related_links,
+    pla.all_links
+  from recent_questions rq
+  left join question_tag_stats qts on qts.post_id = rq.post_id
+  left join post_votes pv on pv.postid = rq.post_id
+  left join post_comments pc on pc.postid = rq.post_id
+  left join post_history_flags ph on ph.postid = rq.post_id
+  left join post_links_agg pla on pla.postid = rq.post_id
+),
+answer_latency as (
+  select
+    qm.post_id,
+    fa.answer_id as first_answer_id,
+    fa.answerer_id,
+    fa.answer_date,
+    cast(extract(epoch from (fa.answer_date - qm.q_created)) as bigint) as secs_to_first_answer,
+    case when qm.acceptedanswerid is not null then 1 else 0 end as has_accepted,
+    case when qm.acceptedanswerid = fa.answer_id then 1 else 0 end as accepted_was_first
+  from question_metrics qm
+  left join first_answer fa on fa.question_id = qm.post_id
+),
+owner_enriched as (
+  select
+    au.user_id,
+    au.displayname,
+    au.location_norm,
+    au.reputation,
+    au.net_votes,
+    ub.gold_badges,
+    ub.silver_badges,
+    ub.bronze_badges,
+    ub.tag_badges,
+    ub.total_badges,
+    ub.last_badge_at,
+    au.rn_rep
+  from active_users au
+  left join user_badges ub on ub.userid = au.user_id
+),
+ranked_questions as (
+  select
+    qm.post_id,
+    qm.owner_user_id,
+    qm.q_created,
+    qm.q_score,
+    qm.q_views,
+    qm.q_favs,
+    qm.q_answers,
+    qm.q_comments,
+    qm.acceptedanswerid,
+    qm.closeddate,
+    qm.title,
+    qm.title_len,
+    qm.tag_cnt,
+    qm.max_tag_popularity,
+    qm.avg_tag_popularity,
+    qm.v_up,
+    qm.v_down,
+    qm.v_fav,
+    qm.v_total,
+    qm.last_vote_at,
+    qm.c_total,
+    qm.last_comment_at,
+    qm.pos_comments,
+    qm.neg_comments,
+    qm.was_closed_or_migrated,
+    qm.was_protected,
+    qm.first_closed_at,
+    qm.first_protected_at,
+    qm.edit_events,
+    qm.dup_links,
+    qm.related_links,
+    qm.all_links,
+    al.first_answer_id,
+    al.answerer_id,
+    al.answer_date,
+    al.secs_to_first_answer,
+    al.has_accepted,
+    al.accepted_was_first,
+    oe.displayname as owner_name,
+    oe.location_norm as owner_location,
+    oe.reputation as owner_rep,
+    oe.net_votes as owner_net_votes,
+    oe.gold_badges,
+    oe.silver_badges,
+    oe.bronze_badges,
+    oe.total_badges,
+    oe.rn_rep,
+    row_number() over (partition by coalesce(oe.location_norm, 'Unknown') order by qm.q_views desc nulls last) as rn_by_location_views,
+    rank() over (order by coalesce(qm.q_views,0) desc, coalesce(qm.q_score, -9999) desc) as r_global_views,
+    dense_rank() over (order by coalesce(qm.v_total,0) desc) as dr_by_votes,
+    percentile_cont(0.5) within group (order by coalesce(al.secs_to_first_answer, 1e18)) over () as p50_answer_secs,
+    avg(coalesce(al.secs_to_first_answer, 1e18)) over () as avg_answer_secs_all
+  from question_metrics qm
+  left join answer_latency al on al.post_id = qm.post_id
+  left join owner_enriched oe on oe.user_id = qm.owner_user_id
+),
+scored_questions as (
+  select
+    rq.post_id,
+    rq.owner_user_id,
+    rq.q_created,
+    rq.q_score,
+    rq.q_views,
+    rq.q_favs,
+    rq.q_answers,
+    rq.q_comments,
+    rq.acceptedanswerid,
+    rq.closeddate,
+    rq.title,
+    rq.title_len,
+    rq.tag_cnt,
+    rq.max_tag_popularity,
+    rq.avg_tag_popularity,
+    rq.v_up,
+    rq.v_down,
+    rq.v_fav,
+    rq.v_total,
+    rq.last_vote_at,
+    rq.c_total,
+    rq.last_comment_at,
+    rq.pos_comments,
+    rq.neg_comments,
+    rq.was_closed_or_migrated,
+    rq.was_protected,
+    rq.first_closed_at,
+    rq.first_protected_at,
+    rq.edit_events,
+    rq.dup_links,
+    rq.related_links,
+    rq.all_links,
+    rq.first_answer_id,
+    rq.answerer_id,
+    rq.answer_date,
+    rq.secs_to_first_answer,
+    rq.has_accepted,
+    rq.accepted_was_first,
+    rq.owner_name,
+    rq.owner_location,
+    rq.owner_rep,
+    rq.owner_net_votes,
+    rq.gold_badges,
+    rq.silver_badges,
+    rq.bronze_badges,
+    rq.total_badges,
+    rq.rn_rep,
+    rq.rn_by_location_views,
+    rq.r_global_views,
+    rq.dr_by_votes,
+    rq.p50_answer_secs,
+    rq.avg_answer_secs_all,
+    (coalesce(rq.q_views,0) / nullif((select max(q_views) from ranked_questions),0)::numeric) as x_views,
+    (coalesce(rq.q_score,0) / nullif((select max(q_score) from ranked_questions),0)::numeric) as x_score,
+    (coalesce(rq.v_total,0) / nullif((select max(v_total) from ranked_questions),0)::numeric) as x_votes,
+    (coalesce(rq.tag_cnt,0) / nullif((select max(tag_cnt) from ranked_questions),0)::numeric) as x_tagn,
+    (case when rq.secs_to_first_answer is null then 0
+          else 1 - least(1.0, (rq.secs_to_first_answer::numeric) / nullif((select max(secs_to_first_answer) from ranked_questions where secs_to_first_answer is not null),0)::numeric) end) as x_fast_answer,
+    (
+      0.35 * coalesce(coalesce(rq.q_views,0),0) / nullif((select avg(q_views) from ranked_questions),0) +
+      0.25 * coalesce(coalesce(rq.q_score,0),0) / nullif((select avg(q_score) from ranked_questions),0) +
+      0.20 * coalesce(coalesce(rq.v_total,0),0) / nullif((select avg(v_total) from ranked_questions),0) +
+      0.10 * coalesce(coalesce(rq.tag_cnt,0),0) / nullif((select avg(tag_cnt) from ranked_questions),0) +
+      0.10 * coalesce((case when rq.secs_to_first_answer is null then null else 1.0 / nullif(rq.secs_to_first_answer,0) end), 0)
+    ) as composite_score,
+    (case when rq.q_views >= 10000 and rq.q_score >= 5 and coalesce(rq.has_accepted,0) = 1 then true else false end) as is_high_quality,
+    (case when rq.was_closed_or_migrated = true and rq.q_score <= 0 then true else false end) as is_problematic,
+    (case when rq.dup_links is not null and rq.dup_links > 0 then true else false end) as is_marked_duplicate
+  from ranked_questions rq
+),
+sample_set as (
+  (
+    select post_id from scored_questions where is_high_quality
+    intersect
+    select post_id from scored_questions where dr_by_votes <= 100
+  )
+  union
+  (
+    select post_id from scored_questions where is_problematic
+    except
+    select post_id from scored_questions where is_marked_duplicate
+  )
+),
+text_features as (
+  select
+    p.id as post_id,
+    length(coalesce(p.body,'')) as body_len,
+    (regexp_count(coalesce(p.body,''), '<code>') + regexp_count(coalesce(p.body,''), '`')) as code_markers,
+    regexp_count(coalesce(lower(p.title),''), '\bhow to\b') as title_howto,
+    regexp_count(coalesce(lower(p.title),''), '\bwhy\b') as title_why,
+    (position('?' in coalesce(p.title,'')) > 0) as title_has_qmark
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+)
+select
+  sq.post_id,
+  sq.title,
+  sq.owner_name,
+  coalesce(sq.owner_location, 'Unknown') as owner_location,
+  sq.owner_rep,
+  sq.gold_badges,
+  sq.silver_badges,
+  sq.bronze_badges,
+  sq.q_created,
+  sq.q_views,
+  sq.q_score,
+  sq.v_up,
+  sq.v_down,
+  sq.v_fav,
+  sq.v_total,
+  sq.tag_cnt,
+  sq.max_tag_popularity,
+  sq.avg_tag_popularity,
+  sq.c_total,
+  sq.pos_comments,
+  sq.neg_comments,
+  sq.edit_events,
+  sq.dup_links,
+  sq.related_links,
+  sq.has_accepted,
+  sq.accepted_was_first,
+  sq.secs_to_first_answer,
+  sq.r_global_views,
+  sq.dr_by_votes,
+  sq.rn_by_location_views,
+  sq.p50_answer_secs,
+  sq.avg_answer_secs_all,
+  round(sq.composite_score, 4) as composite_score,
+  sq.is_high_quality,
+  sq.is_problematic,
+  sq.is_marked_duplicate,
+  tf.body_len,
+  tf.code_markers,
+  tf.title_howto,
+  tf.title_why,
+  tf.title_has_qmark,
+  (
+    select count(*) from answers a
+    where a.question_id = sq.post_id
+      and a.answer_score > 0
+  ) as positive_answers,
+  (
+    select coalesce(sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end),0)
+    from votes v
+    where v.postid = sq.post_id
+  ) as vote_balance,
+  coalesce(nullif(trim(sq.title), ''), concat('[untitled #', sq.post_id, ']')) as safe_title,
+  case
+    when sq.closeddate is not null then 'Closed/Migrated'
+    when sq.was_protected then 'Protected'
+    else 'Open'
+  end as moderation_state,
+  case when sq.post_id in (select post_id from sample_set) then 1 else 0 end as in_sample
+from scored_questions sq
+left join text_features tf on tf.post_id = sq.post_id
+where
+  coalesce(sq.q_views,0) >= 100
+  and (sq.tag_cnt is null or sq.tag_cnt between 1 and 10)
+  and not (sq.was_closed_or_migrated = true and sq.q_score > 10)
+  and (
+    tf.code_markers is null
+    or tf.code_markers >= 0
+  )
+order by
+  coalesce(sq.is_high_quality, false) desc,
+  sq.composite_score desc nulls last,
+  sq.r_global_views asc,
+  sq.post_id
+limit 500;

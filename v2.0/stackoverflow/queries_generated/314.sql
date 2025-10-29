@@ -1,0 +1,389 @@
+-- {"query": "314.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3671} 
+with
+-- parameterizable ranges
+date_bounds as (
+  select
+    coalesce(min(p.CreationDate), timestamp '2000-01-01') as min_dt,
+    coalesce(max(p.CreationDate), now()) as max_dt
+  from Posts p
+),
+-- pick a moving 180-day window ending 30 days before max to avoid very fresh data
+active_window as (
+  select
+    (max_dt - interval '210 days') as win_start,
+    (max_dt - interval '30 days')  as win_end
+  from date_bounds
+),
+-- expand Tags column into rows for questions in window
+question_tags as (
+  select
+    p.Id as QuestionId,
+    lower(trim(tg)) as TagName
+  from Posts p
+  join active_window w
+    on p.PostTypeId = 1
+   and p.CreationDate >= w.win_start
+   and p.CreationDate <  w.win_end
+  cross join lateral unnest(
+    case
+      when p.Tags is null then array[]::varchar[]
+      else string_to_array(substring(p.Tags, 2, greatest(length(p.Tags)-2,0)), '><')
+    end
+  ) as tg
+),
+-- summarize tag popularity and volatility
+tag_stats as (
+  select
+    qt.TagName,
+    count(*) as question_count,
+    count(distinct qt.QuestionId) as unique_questions,
+    stddev_samp(p.Score) filter (where p.Score is not null) as score_stddev,
+    avg(p.ViewCount)::numeric(20,2) as avg_views
+  from question_tags qt
+  join Posts p on p.Id = qt.QuestionId
+  group by qt.TagName
+),
+-- windowed rank of tags by different metrics
+ranked_tags as (
+  select
+    ts.*,
+    dense_rank() over (order by ts.question_count desc) as r_by_count,
+    dense_rank() over (order by ts.avg_views desc nulls last) as r_by_views,
+    dense_rank() over (order by coalesce(ts.score_stddev,0) desc) as r_by_volatility
+  from tag_stats ts
+),
+-- pick a diverse top N tags
+picked_tags as (
+  select TagName
+  from ranked_tags
+  where r_by_count <= 25
+     or r_by_views <= 25
+     or r_by_volatility <= 25
+),
+-- answers in window, capture acceptance and age
+answers as (
+  select
+    a.Id,
+    a.ParentId as QuestionId,
+    a.OwnerUserId,
+    a.Score,
+    a.CreationDate,
+    (a.CreationDate::date) as AnswerDate,
+    (q.AcceptedAnswerId = a.Id) as IsAccepted,
+    extract(epoch from (a.CreationDate - q.CreationDate))/3600.0 as HoursAfterQuestion
+  from Posts a
+  join Posts q on q.Id = a.ParentId and a.PostTypeId = 2 and q.PostTypeId = 1
+  join active_window w on q.CreationDate >= w.win_start and q.CreationDate < w.win_end
+),
+-- join answers to question tags and picked tags
+answers_by_tag as (
+  select
+    qt.TagName,
+    a.*
+  from answers a
+  join question_tags qt on qt.QuestionId = a.QuestionId
+  join picked_tags pt on pt.TagName = qt.TagName
+),
+-- derive per-user engagement deltas
+user_vote_delta as (
+  select
+    u.Id as UserId,
+    coalesce(u.UpVotes,0) - coalesce(u.DownVotes,0) as VoteDelta,
+    u.Reputation,
+    date_trunc('day', u.CreationDate) as UserCreateDay
+  from Users u
+),
+-- comment activity around the question and answer
+comment_activity as (
+  select
+    c.PostId,
+    count(*) filter (where c.Score > 0) as pos_comments,
+    count(*) filter (where c.Score <= 0 or c.Score is null) as nonpos_comments,
+    min(c.CreationDate) as first_comment_at,
+    max(c.CreationDate) as last_comment_at
+  from Comments c
+  group by c.PostId
+),
+-- votes aggregation for answers
+answer_votes as (
+  select
+    v.PostId as AnswerId,
+    count(*) filter (where v.VoteTypeId = 2) as upvotes,
+    count(*) filter (where v.VoteTypeId = 3) as downvotes,
+    count(*) filter (where v.VoteTypeId = 1) as accepted_by_originator,
+    max(v.CreationDate) filter (where v.VoteTypeId in (2,3)) as last_vote_at
+  from Votes v
+  group by v.PostId
+),
+-- post history signals for questions: closures, protections, migrations
+question_events as (
+  select
+    ph.PostId,
+    count(*) filter (where ph.PostHistoryTypeId = 10) as closes,
+    count(*) filter (where ph.PostHistoryTypeId = 11) as reopens,
+    count(*) filter (where ph.PostHistoryTypeId = 19) as protects,
+    count(*) filter (where ph.PostHistoryTypeId = 20) as unprotects,
+    count(*) filter (where ph.PostHistoryTypeId in (35,36)) as migrations,
+    max(ph.CreationDate) as last_event_at,
+    max(ph.Comment) filter (where ph.PostHistoryTypeId = 10 and ph.Comment ~ '^[0-9]+$') as last_close_reason_id
+  from PostHistory ph
+  group by ph.PostId
+),
+-- link duplication info
+dup_links as (
+  select
+    pl.PostId,
+    count(*) filter (where pl.LinkTypeId = 3) as duplicates_marked,
+    count(*) filter (where pl.LinkTypeId = 1) as linked_count,
+    max(pl.CreationDate) as last_link_at
+  from PostLinks pl
+  group by pl.PostId
+),
+-- enrich questions with tags and signals
+question_enriched as (
+  select
+    q.Id as QuestionId,
+    q.Title,
+    lower(coalesce(q.OwnerDisplayName, u.DisplayName, 'anonymous')) as QuestionOwnerName,
+    u.Id as QuestionOwnerId,
+    u.Reputation as QuestionOwnerRep,
+    q.Score as QuestionScore,
+    q.ViewCount,
+    q.AnswerCount,
+    q.CreationDate as QuestionCreated,
+    qt.TagName,
+    qe.closes, qe.reopens, qe.protects, qe.unprotects, qe.migrations, qe.last_event_at, qe.last_close_reason_id,
+    dl.duplicates_marked, dl.linked_count, dl.last_link_at,
+    ca.pos_comments as q_pos_comments,
+    ca.nonpos_comments as q_nonpos_comments
+  from Posts q
+  join active_window w on q.PostTypeId = 1 and q.CreationDate >= w.win_start and q.CreationDate < w.win_end
+  join question_tags qt on qt.QuestionId = q.Id
+  left join Users u on u.Id = q.OwnerUserId
+  left join question_events qe on qe.PostId = q.Id
+  left join dup_links dl on dl.PostId = q.Id
+  left join comment_activity ca on ca.PostId = q.Id
+  where exists (select 1 from picked_tags pt where pt.TagName = qt.TagName)
+),
+-- compute per tag rolling metrics using window frames
+tag_time_metrics as (
+  select
+    qe.TagName,
+    date_trunc('day', qe.QuestionCreated) as day,
+    count(*) as questions_day,
+    avg(qe.QuestionScore) as avg_q_score_day,
+    sum(qe.ViewCount) as views_day,
+    sum(qe.duplicates_marked) as dups_day
+  from question_enriched qe
+  group by qe.TagName, date_trunc('day', qe.QuestionCreated)
+),
+tag_rollups as (
+  select
+    ttm.*,
+    sum(questions_day) over (partition by TagName order by day rows between 6 preceding and current row) as q_7d,
+    sum(views_day) over (partition by TagName order by day rows between 6 preceding and current row) as views_7d,
+    avg(avg_q_score_day) over (partition by TagName order by day rows between 6 preceding and current row) as avg_score_7d,
+    sum(dups_day) over (partition by TagName order by day rows between 29 preceding and current row) as dups_30d
+  from tag_time_metrics ttm
+),
+-- answers enriched with user and comment/vote context
+answer_enriched as (
+  select
+    abt.TagName,
+    abt.Id as AnswerId,
+    abt.QuestionId,
+    abt.OwnerUserId,
+    abt.Score as AnswerScore,
+    abt.IsAccepted,
+    abt.HoursAfterQuestion,
+    abt.CreationDate as AnswerCreated,
+    u.DisplayName as AnswerOwnerName,
+    u.Reputation as AnswerOwnerRep,
+    uvd.VoteDelta as AnswerOwnerVoteDelta,
+    av.upvotes, av.downvotes, av.accepted_by_originator, av.last_vote_at,
+    coalesce(ca.pos_comments,0) as a_pos_comments,
+    coalesce(ca.nonpos_comments,0) as a_nonpos_comments
+  from answers_by_tag abt
+  left join Users u on u.Id = abt.OwnerUserId
+  left join user_vote_delta uvd on uvd.UserId = abt.OwnerUserId
+  left join answer_votes av on av.AnswerId = abt.Id
+  left join comment_activity ca on ca.PostId = abt.Id
+),
+-- select a representative per-question best answer per tag using complex ordering
+best_answer_per_q as (
+  select
+    ae.*,
+    row_number() over (
+      partition by ae.TagName, ae.QuestionId
+      order by
+        ae.IsAccepted desc,
+        coalesce(ae.AnswerScore,0) desc,
+        coalesce(ae.upvotes,0) - coalesce(ae.downvotes,0) desc,
+        ae.HoursAfterQuestion asc,
+        ae.AnswerId asc
+    ) as rn
+  from answer_enriched ae
+),
+-- compute question-level aggregates from answers
+question_answer_agg as (
+  select
+    ba.TagName,
+    ba.QuestionId,
+    max(ba.IsAccepted::int) as has_accepted,
+    max(ba.AnswerScore) as top_answer_score,
+    avg(coalesce(ba.AnswerScore,0)) as avg_answer_score,
+    count(*) as answers_considered
+  from best_answer_per_q ba
+  group by ba.TagName, ba.QuestionId
+),
+-- normalize display names and nullable fields to stress null logic and string ops
+normalized_questions as (
+  select
+    qe.*,
+    nullif(regexp_replace(qe.Title, '\s+', ' ', 'g'), '') as norm_title,
+    nullif(regexp_replace(qe.QuestionOwnerName, '[^a-z0-9_]+', '_', 'gi'), '') as norm_owner_name
+  from question_enriched qe
+),
+-- stitch together final per tag-question metrics combining windows, subqueries, and null handling
+assembled as (
+  select
+    nq.TagName,
+    nq.QuestionId,
+    nq.norm_title as QuestionTitle,
+    nq.QuestionOwnerId,
+    nq.norm_owner_name as QuestionOwnerName,
+    nq.QuestionOwnerRep,
+    nq.QuestionScore,
+    nq.ViewCount,
+    nq.AnswerCount,
+    nq.closes, nq.reopens, nq.protects, nq.unprotects, nq.migrations, nq.duplicates_marked,
+    qa.has_accepted,
+    qa.top_answer_score,
+    qa.avg_answer_score,
+    tra.q_7d, tra.views_7d, tra.avg_score_7d, tra.dups_30d,
+    -- complex predicate-derived score
+    (
+      coalesce(nq.QuestionScore,0)*1.0
+      + ln(greatest(nq.ViewCount,1))::numeric
+      + case when qa.has_accepted = 1 then 2.5 else 0 end
+      + greatest(coalesce(qa.top_answer_score,0),0)*0.5
+      - least(coalesce(nq.closes,0),2)*1.0
+      - least(coalesce(nq.duplicates_marked,0),2)*0.7
+      + case when coalesce(tra.q_7d,0) > 10 then 0.3 else -0.2 end
+    )::numeric(20,3) as composite_signal,
+    nq.QuestionCreated
+  from normalized_questions nq
+  left join question_answer_agg qa
+    on qa.TagName = nq.TagName and qa.QuestionId = nq.QuestionId
+  left join tag_rollups tra
+    on tra.TagName = nq.TagName
+   and tra.day = date_trunc('day', nq.QuestionCreated)
+),
+-- pick top questions per tag using composite signal with tiebreakers
+tag_leaders as (
+  select
+    a.*,
+    row_number() over (
+      partition by a.TagName
+      order by a.composite_signal desc nulls last,
+               a.ViewCount desc nulls last,
+               a.QuestionCreated desc,
+               a.QuestionId desc
+    ) as rn
+  from assembled a
+),
+-- enrich with a correlated subquery to get a concise snippet of the body
+question_snippets as (
+  select
+    tl.TagName,
+    tl.QuestionId,
+    substring(
+      coalesce((
+        select ph.Text
+        from PostHistory ph
+        where ph.PostId = tl.QuestionId
+          and ph.PostHistoryTypeId in (2,5,8) -- body variants
+        order by ph.CreationDate asc
+        limit 1
+      ), '') from 1 for 160
+    ) as body_snippet
+  from tag_leaders tl
+  where tl.rn <= 5
+),
+-- map close reason id to name with safe cast and null logic
+close_reason_lookup as (
+  select
+    crt.Id::varchar as IdStr,
+    crt.Name
+  from CloseReasonTypes crt
+),
+final as (
+  select
+    tl.TagName,
+    tl.QuestionId,
+    tl.QuestionTitle,
+    tl.QuestionOwnerId,
+    tl.QuestionOwnerName,
+    tl.QuestionOwnerRep,
+    tl.QuestionScore,
+    tl.ViewCount,
+    tl.AnswerCount,
+    tl.has_accepted,
+    tl.top_answer_score,
+    tl.avg_answer_score,
+    tl.q_7d, tl.views_7d, tl.avg_score_7d, tl.dups_30d,
+    tl.closes, tl.reopens, tl.protects, tl.unprotects, tl.migrations, tl.duplicates_marked,
+    tl.composite_signal,
+    tl.QuestionCreated,
+    qsn.body_snippet,
+    coalesce(crt.Name, 'Unknown') as LastCloseReasonName
+  from tag_leaders tl
+  left join question_snippets qsn
+    on qsn.TagName = tl.TagName and qsn.QuestionId = tl.QuestionId
+  left join (
+    select
+      qe.PostId,
+      max(qe.last_close_reason_id) as last_close_reason_id
+    from question_events qe
+    group by qe.PostId
+  ) lr on lr.PostId = tl.QuestionId
+  left join close_reason_lookup crt
+    on crt.IdStr = nullif(lr.last_close_reason_id, '')
+)
+-- final output with set operations to union in a synthetic "no-tag" bucket for questions without any picked tag
+select *
+from final
+union all
+select
+  '(no-picked-tag)' as TagName,
+  q.Id as QuestionId,
+  q.Title as QuestionTitle,
+  q.OwnerUserId as QuestionOwnerId,
+  lower(coalesce(q.OwnerDisplayName, u.DisplayName, 'anonymous')) as QuestionOwnerName,
+  coalesce(u.Reputation,0) as QuestionOwnerRep,
+  q.Score as QuestionScore,
+  q.ViewCount,
+  q.AnswerCount,
+  0 as has_accepted,
+  null::int as top_answer_score,
+  null::numeric as avg_answer_score,
+  null::bigint as q_7d,
+  null::bigint as views_7d,
+  null::numeric as avg_score_7d,
+  null::bigint as dups_30d,
+  0 as closes, 0 as reopens, 0 as protects, 0 as unprotects, 0 as migrations, 0 as duplicates_marked,
+  (q.Score + ln(greatest(q.ViewCount,1)))::numeric(20,3) as composite_signal,
+  q.CreationDate as QuestionCreated,
+  null::text as body_snippet,
+  'Unknown' as LastCloseReasonName
+from Posts q
+left join Users u on u.Id = q.OwnerUserId
+where q.PostTypeId = 1
+  and not exists (
+    select 1
+    from question_tags qt
+    join picked_tags pt on pt.TagName = qt.TagName
+    where qt.QuestionId = q.Id
+  )
+order by TagName, composite_signal desc nulls last, QuestionCreated desc, QuestionId desc
+limit 500;

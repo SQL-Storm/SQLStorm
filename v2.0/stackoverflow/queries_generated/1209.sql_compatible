@@ -1,0 +1,231 @@
+WITH UserActivity AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Reputation,
+        U.Views AS UserViews,
+        U.UpVotes AS UserUpVotes,
+        U.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS AnswerCount,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        AVG(P.Score) FILTER (WHERE P.PostTypeId IN (1, 2)) AS AvgPostScore,
+        MAX(P.CreationDate) AS LastPostDate,
+        MAX(C.CreationDate) AS LastCommentDate,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        RANK() OVER (ORDER BY U.Reputation DESC, U.Id ASC) AS ReputationRank,
+        EXISTS (SELECT 1 FROM Badges B_sub WHERE B_sub.UserId = U.Id AND B_sub.Name IN ('Enthusiast', 'Fanatic')) AS HasEngagementBadges
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    LEFT JOIN Badges AS B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.CreationDate, U.LastAccessDate, U.Reputation, U.Views, U.UpVotes, U.DownVotes
+),
+PostDetails AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.OwnerUserId,
+        P.Title,
+        P.CreationDate AS PostCreationDate,
+        P.LastActivityDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount AS OriginalAnswerCount,
+        P.CommentCount AS OriginalCommentCount,
+        P.FavoriteCount,
+        P.ClosedDate,
+        P.ParentId,
+        P.AcceptedAnswerId,
+        P.CommunityOwnedDate,
+        COALESCE(SUBSTRING(P.Tags FROM 2 FOR NULLIF(POSITION('><' IN (P.Tags || '><')) - 2, -1)), 'untagged') AS PrimaryTag,
+        (P.Score * 5 + COALESCE(P.ViewCount, 0) / 10 + COALESCE(P.CommentCount, 0) * 2 + COALESCE(P.FavoriteCount, 0) * 10) AS PostActivityScore,
+        (SELECT COUNT(DISTINCT V.UserId) FROM Votes AS V WHERE V.PostId = P.Id AND V.VoteTypeId = 2 AND V.CreationDate >= P.CreationDate - INTERVAL '1 year') AS RecentUpVotersCount,
+        AVG(P.Score) OVER (PARTITION BY P.PostTypeId, DATE_TRUNC('month', P.CreationDate)) AS AvgPostTypeScoreInMonth,
+        EXTRACT(EPOCH FROM (P.CreationDate - LAG(P.CreationDate, 1, P.CreationDate) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate))) / 86400 AS DaysSincePreviousPost
+    FROM Posts AS P
+    JOIN PostTypes AS PT ON P.PostTypeId = PT.Id
+    WHERE P.CreationDate >= DATE '2020-01-01'
+),
+ModerationOverview AS (
+    SELECT
+        PH.PostId,
+        PH.CreationDate AS HistoryDate,
+        PHT.Name AS HistoryTypeName,
+        CR.Name AS CloseReasonName,
+        PH.UserId AS ModifierUserId,
+        PH.Comment,
+        COALESCE(
+            NULLIF(
+                SUBSTRING(
+                    PH.Text
+                    FROM (POSITION('"OriginalQuestionIds":[' IN PH.Text) + CHAR_LENGTH('"OriginalQuestionIds":['))
+                    FOR (POSITION(']' IN PH.Text) - (POSITION('"OriginalQuestionIds":[' IN PH.Text) + CHAR_LENGTH('"OriginalQuestionIds":[')))
+                , ''
+                )
+            , NULL
+        ) AS OriginalQuestionIdsText,
+        CASE
+            WHEN PH.PostHistoryTypeId IN (10, 101) THEN 'Closed'
+            WHEN PH.PostHistoryTypeId IN (11, 102) THEN 'Reopened'
+            WHEN PH.PostHistoryTypeId = 12 THEN 'Deleted'
+            WHEN PH.PostHistoryTypeId = 13 THEN 'Undeleted'
+            WHEN PH.PostHistoryTypeId = 14 THEN 'Locked'
+            WHEN PH.PostHistoryTypeId = 35 THEN 'Migrated Away'
+            ELSE 'OtherModeration'
+        END AS ModerationEventType,
+        ROW_NUMBER() OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate DESC) AS rn_latest_moderation
+    FROM PostHistory AS PH
+    JOIN PostHistoryTypes AS PHT ON PH.PostHistoryTypeId = PHT.Id
+    LEFT JOIN CloseReasonTypes AS CR ON PH.PostHistoryTypeId IN (10, 101) AND PH.Comment IS NOT NULL AND CR.Id = CAST(PH.Comment AS SMALLINT)
+    WHERE PH.PostHistoryTypeId IN (10, 11, 12, 13, 14, 35, 101, 102)
+),
+PostCommentScores AS (
+    SELECT
+        C.PostId,
+        COUNT(C.Id) AS TotalCommentsOnPost,
+        AVG(C.Score) AS AverageCommentScore,
+        SUM(CASE WHEN C.Score > 0 THEN 1 ELSE 0 END) AS PositiveCommentsCount,
+        EXISTS (SELECT 1 FROM Comments AS C2 WHERE C2.PostId = C.PostId AND (LOWER(C2.Text) LIKE '%thank you%' OR LOWER(C2.Text) LIKE '%thanks%')) AS HasGratitudeComment,
+        (SELECT STRING_AGG(C3.Text, ' || ') FROM Comments AS C3 WHERE C3.PostId = C.PostId ORDER BY C3.Score DESC LIMIT 3) AS TopCommentsPreview
+    FROM Comments AS C
+    GROUP BY C.PostId
+),
+TagMetrics AS (
+    SELECT
+        TagName,
+        COUNT(DISTINCT P.Id) AS PostsWithTag,
+        AVG(P.Score) AS AvgScoreForTag,
+        SUM(P.ViewCount) AS TotalViewsForTag,
+        COUNT(DISTINCT P.OwnerUserId) AS UniqueOwnersForTag
+    FROM Posts AS P
+    CROSS JOIN LATERAL (
+        SELECT UNNEST(string_to_array(SUBSTRING(P.Tags FROM 2 FOR (CHAR_LENGTH(P.Tags) - 2)), '><')) AS TagName
+    ) t
+    WHERE P.Tags IS NOT NULL AND CHAR_LENGTH(P.Tags) > 2
+    GROUP BY TagName
+)
+SELECT
+    'ActiveUserPostInsight' AS InsightType,
+    UA.UserId,
+    COALESCE(UA.DisplayName, 'Unknown User') AS UserName,
+    UA.Reputation,
+    UA.TotalPosts,
+    UA.QuestionCount,
+    UA.AnswerCount,
+    UA.AvgPostScore,
+    UA.GoldBadges,
+    UA.SilverBadges,
+    UA.ReputationRank,
+    PD.PostId,
+    PD.PostTypeName,
+    PD.Title,
+    PD.PostScore,
+    PD.ViewCount,
+    PD.PostActivityScore,
+    PD.RecentUpVotersCount,
+    PD.AvgPostTypeScoreInMonth,
+    PD.DaysSincePreviousPost,
+    COALESCE(PCS.TotalCommentsOnPost, 0) AS PostCommentCount,
+    COALESCE(PCS.AverageCommentScore, 0.0) AS PostAvgCommentScore,
+    PCS.HasGratitudeComment,
+    MO.HistoryTypeName AS LastModerationAction,
+    MO.CloseReasonName,
+    MO.OriginalQuestionIdsText,
+    PCS.TopCommentsPreview,
+    TM.PostsWithTag AS PrimaryTagPostsCount,
+    TM.AvgScoreForTag AS PrimaryTagAvgScore,
+    TM.UniqueOwnersForTag AS PrimaryTagUniqueOwners,
+    CASE
+        WHEN PD.ClosedDate IS NULL THEN 'Open'
+        WHEN PD.CommunityOwnedDate IS NOT NULL THEN 'Community Owned & Closed'
+        ELSE 'Closed'
+    END AS PostStatus,
+    CASE
+        WHEN EXISTS (SELECT 1 FROM PostLinks PL WHERE PL.PostId = PD.PostId AND PL.LinkTypeId = 3) THEN 'Duplicate Source'
+        WHEN EXISTS (SELECT 1 FROM PostLinks PL WHERE PL.RelatedPostId = PD.PostId AND PL.LinkTypeId = 3) THEN 'Duplicate Target'
+        WHEN EXISTS (SELECT 1 FROM PostLinks PL WHERE PL.PostId = PD.PostId AND PL.LinkTypeId = 1) THEN 'Linked'
+        ELSE 'Not Linked/Duplicate'
+    END AS LinkStatus,
+    (CAST(UA.Reputation AS NUMERIC) / 100.0 + (UA.TotalPosts * 5) + (UA.TotalComments * 2) + (UA.UserUpVotes - UA.UserDownVotes)) AS UserEngagementScore,
+    UA.HasEngagementBadges AS UserHasEngagementBadges
+FROM UserActivity AS UA
+LEFT JOIN PostDetails AS PD ON UA.UserId = PD.OwnerUserId
+LEFT JOIN PostCommentScores AS PCS ON PD.PostId = PCS.PostId
+LEFT JOIN ModerationOverview AS MO ON PD.PostId = MO.PostId AND MO.rn_latest_moderation = 1
+LEFT JOIN TagMetrics AS TM ON PD.PrimaryTag = TM.TagName
+WHERE
+    UA.Reputation > 1000
+    AND PD.PostActivityScore > 50
+    AND (
+        (PD.PostTypeName = 'Question' AND PD.OriginalAnswerCount >= 1)
+        OR
+        (PD.PostTypeName = 'Answer' AND PD.PostScore > 0)
+    )
+    AND (PD.ClosedDate IS NULL OR PD.ClosedDate > PD.CreationDate + INTERVAL '1 month')
+    AND NOT (PD.PostTypeName = 'Answer' AND PD.ParentId IS NULL)
+
+UNION ALL
+
+SELECT
+    'HiddenGemOrOverlooked' AS InsightType,
+    UA.UserId,
+    COALESCE(UA.DisplayName, 'Unknown User') AS UserName,
+    UA.Reputation,
+    UA.TotalPosts,
+    UA.QuestionCount,
+    UA.AnswerCount,
+    UA.AvgPostScore,
+    UA.GoldBadges,
+    UA.SilverBadges,
+    UA.ReputationRank,
+    PD.PostId,
+    PD.PostTypeName,
+    PD.Title,
+    PD.PostScore,
+    PD.ViewCount,
+    PD.PostActivityScore,
+    PD.RecentUpVotersCount,
+    PD.AvgPostTypeScoreInMonth,
+    PD.DaysSincePreviousPost,
+    COALESCE(PCS.TotalCommentsOnPost, 0) AS PostCommentCount,
+    COALESCE(PCS.AverageCommentScore, 0.0) AS PostAvgCommentScore,
+    PCS.HasGratitudeComment,
+    NULL AS LastModerationAction,
+    NULL AS CloseReasonName,
+    NULL AS OriginalQuestionIdsText,
+    PCS.TopCommentsPreview,
+    TM.PostsWithTag AS PrimaryTagPostsCount,
+    TM.AvgScoreForTag AS PrimaryTagAvgScore,
+    TM.UniqueOwnersForTag AS PrimaryTagUniqueOwners,
+    CASE
+        WHEN PD.ClosedDate IS NULL THEN 'Open'
+        WHEN PD.CommunityOwnedDate IS NOT NULL THEN 'Community Owned & Closed'
+        ELSE 'Closed'
+    END AS PostStatus,
+    'N/A' AS LinkStatus,
+    (CAST(UA.Reputation AS NUMERIC) / 100.0 + (UA.TotalPosts * 5) + (UA.TotalComments * 2) + (UA.UserUpVotes - UA.UserDownVotes)) AS UserEngagementScore,
+    UA.HasEngagementBadges AS UserHasEngagementBadges
+FROM UserActivity AS UA
+INNER JOIN PostDetails AS PD ON UA.UserId = PD.OwnerUserId
+LEFT JOIN PostCommentScores AS PCS ON PD.PostId = PCS.PostId
+LEFT JOIN TagMetrics AS TM ON PD.PrimaryTag = TM.TagName
+WHERE
+    UA.Reputation > 500
+    AND (
+        (PD.PostScore >= 5 AND PD.ViewCount < 500)
+        OR
+        (PD.PostScore < 0 AND PD.ViewCount > 2000)
+    )
+    AND PD.PostCreationDate >= DATE '2021-01-01'
+ORDER BY
+    ReputationRank ASC,
+    PostActivityScore DESC,
+    PostCreationDate DESC
+LIMIT 2000;

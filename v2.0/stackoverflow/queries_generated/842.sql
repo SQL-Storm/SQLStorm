@@ -1,0 +1,368 @@
+-- {"query": "842.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3258} 
+with params as (
+    select 
+        date_trunc('month', now()) - interval '24 months' as since_date,
+        500 as min_views,
+        50 as min_reputation,
+        0.10::float as heavy_editor_top_frac
+),
+active_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.location,
+        u.creationdate,
+        u.upvotes,
+        u.downvotes,
+        coalesce(nullif(u.websiteurl, ''), 'n/a') as websiteurl,
+        count(*) filter (where v.votetypeid = 2) as upvote_events,
+        count(*) filter (where v.votetypeid = 3) as downvote_events,
+        count(distinct p.id) as total_posts
+    from users u
+    left join posts p on p.owneruserid = u.id
+    left join votes v on v.userid = u.id
+    group by u.id, u.displayname, u.reputation, u.location, u.creationdate, u.upvotes, u.downvotes, u.websiteurl
+),
+q as (
+    select
+        p.id,
+        p.owneruserid,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        p.title,
+        p.tags,
+        p.answercount,
+        p.favoritecount,
+        p.closeddate,
+        p.communityowneddate
+    from posts p
+    join posttypes pt on pt.id = p.posttypeid and pt.name = 'Question'
+    where p.creationdate >= (select since_date from params)
+      and coalesce(p.viewcount, 0) >= (select min_views from params)
+),
+a as (
+    select
+        pa.id,
+        pa.parentid,
+        pa.owneruserid,
+        pa.creationdate,
+        pa.score
+    from posts pa
+    join posttypes pt on pt.id = pa.posttypeid and pt.name = 'Answer'
+),
+qa_metrics as (
+    select
+        q.id as question_id,
+        q.owneruserid as asker_id,
+        q.creationdate as question_date,
+        q.score as question_score,
+        q.viewcount,
+        q.title,
+        q.tags,
+        q.answercount,
+        q.favoritecount,
+        q.closeddate,
+        count(a.id) as answers_total,
+        sum(case when a.score > 0 then 1 else 0 end) as answers_positive,
+        max(a.score) as max_answer_score,
+        avg(a.score::float) as avg_answer_score,
+        min(a.creationdate) filter (where a.parentid is not null) as first_answer_date,
+        max(a.creationdate) filter (where a.parentid is not null) as last_answer_date
+    from q
+    left join a on a.parentid = q.id
+    group by q.id, q.owneruserid, q.creationdate, q.score, q.viewcount, q.title, q.tags, q.answercount, q.favoritecount, q.closeddate
+),
+tag_expansion as (
+    select
+        question_id,
+        unnest(string_to_array(substring(tags, 2, length(tags) - 2), '><')) as tag
+    from qa_metrics
+),
+per_tag as (
+    select
+        te.tag,
+        count(*) as q_count,
+        sum(case when qm.question_score >= 0 then 1 else 0 end) as nonneg_score_q,
+        sum(coalesce(qm.viewcount,0)) as total_views,
+        avg(qm.viewcount::float) as avg_views,
+        percentile_cont(0.9) within group (order by qm.viewcount) as p90_views,
+        sum(coalesce(qm.answers_total,0)) as total_answers
+    from tag_expansion te
+    join qa_metrics qm on qm.question_id = te.question_id
+    group by te.tag
+),
+heavy_edit_events as (
+    select
+        ph.postid,
+        ph.userid,
+        count(*) filter (where ph.posthistorytypeid in (4,5,6,7,8,9,24)) as edit_events,
+        count(*) filter (where ph.posthistorytypeid in (10,11,12,13,14,15,19,20,35)) as mod_state_events,
+        min(ph.creationdate) as first_event,
+        max(ph.creationdate) as last_event
+    from posthistory ph
+    where ph.creationdate >= (select since_date from params)
+    group by ph.postid, ph.userid
+),
+heavy_editors_ranked as (
+    select
+        he.userid,
+        sum(he.edit_events) as total_edits,
+        sum(he.mod_state_events) as total_mod_events,
+        min(he.first_event) as first_event,
+        max(he.last_event) as last_event,
+        row_number() over (order by sum(he.edit_events) desc nulls last, sum(he.mod_state_events) desc nulls last, min(he.first_event)) as rn,
+        count(*) over () as cnt
+    from heavy_edit_events he
+    where he.userid is not null
+    group by he.userid
+),
+heavy_editor_cut as (
+    select
+        userid
+    from heavy_editors_ranked
+    where rn <= greatest(1, floor(cnt * (select heavy_editor_top_frac from params)))
+),
+post_closure_info as (
+    select
+        ph.postid,
+        min(ph.creationdate) filter (where ph.posthistorytypeid = 10) as first_closed_at,
+        max(ph.creationdate) filter (where ph.posthistorytypeid = 11) as last_reopened_at,
+        max(case when ph.posthistorytypeid = 10 then ph.comment end) as close_reason_raw
+    from posthistory ph
+    where ph.posthistorytypeid in (10,11)
+    group by ph.postid
+),
+hotness as (
+    select
+        qm.question_id,
+        qm.question_date,
+        qm.viewcount,
+        qm.answers_total,
+        qm.favoritecount,
+        qm.question_score,
+        extract(epoch from (now() - qm.question_date)) as age_seconds,
+        /* a synthetic "hotness" metric combining activity and recency */
+        (
+            coalesce(qm.viewcount,0) * 0.002
+            + coalesce(qm.answers_total,0) * 1.5
+            + coalesce(qm.favoritecount,0) * 0.8
+            + greatest(qm.question_score, 0) * 0.5
+        ) / nullif(1 + ln(1 + extract(epoch from (now() - qm.question_date))::float / 3600.0), 0) as hot_score
+    from qa_metrics qm
+),
+dup_links as (
+    select
+        pl.postid as dup_post_id,
+        pl.relatedpostid as original_post_id,
+        min(pl.creationdate) as first_dup_link_at
+    from postlinks pl
+    join linktypes lt on lt.id = pl.linktypeid and lt.name = 'Duplicate'
+    group by pl.postid, pl.relatedpostid
+),
+question_votes as (
+    select
+        p.id as post_id,
+        count(*) filter (where v.votetypeid = 2) as upvotes,
+        count(*) filter (where v.votetypeid = 3) as downvotes,
+        count(*) filter (where v.votetypeid = 5) as favorites
+    from posts p
+    left join votes v on v.postid = p.id
+    where p.id in (select question_id from qa_metrics)
+    group by p.id
+),
+asker_badges as (
+    select
+        b.userid,
+        count(*) filter (where b.class = 1) as gold_badges,
+        count(*) filter (where b.class = 2) as silver_badges,
+        count(*) filter (where b.class = 3) as bronze_badges,
+        count(*) filter (where b.tagbased = 1) as tag_badges
+    from badges b
+    group by b.userid
+),
+question_ranked as (
+    select
+        qm.*,
+        hv.hot_score,
+        row_number() over (order by hv.hot_score desc nulls last) as hot_rank,
+        dense_rank() over (order by coalesce(qm.viewcount,0) desc) as view_rank,
+        dense_rank() over (order by coalesce(qm.answers_total,0) desc) as answer_rank
+    from qa_metrics qm
+    left join hotness hv on hv.question_id = qm.question_id
+),
+normalized as (
+    select
+        qr.question_id,
+        qr.asker_id,
+        qr.title,
+        qr.tags,
+        qr.question_date,
+        qr.viewcount,
+        qr.answers_total,
+        qr.favoritecount,
+        qr.question_score,
+        qr.closeddate,
+        qr.hot_score,
+        qr.hot_rank,
+        qr.view_rank,
+        qr.answer_rank,
+        qv.upvotes,
+        qv.downvotes,
+        qv.favorites as vote_favorites,
+        pci.first_closed_at,
+        pci.last_reopened_at,
+        case 
+            when pci.close_reason_raw ~ '^[0-9]+$' then pci.close_reason_raw
+            else null
+        end::int as close_reason_id_guess,
+        dl.original_post_id as duplicate_of,
+        dl.first_dup_link_at,
+        au.displayname as asker_name,
+        au.reputation as asker_reputation,
+        au.location as asker_location,
+        au.upvotes as asker_profile_upvotes,
+        au.downvotes as asker_profile_downvotes,
+        ab.gold_badges,
+        ab.silver_badges,
+        ab.bronze_badges,
+        ab.tag_badges,
+        case 
+            when qr.closeddate is not null and pci.last_reopened_at is null then 'Closed'
+            when qr.closeddate is not null and pci.last_reopened_at is not null then 'ClosedThenReopened'
+            else 'Open'
+        end as closure_state
+    from question_ranked qr
+    left join question_votes qv on qv.post_id = qr.question_id
+    left join post_closure_info pci on pci.postid = qr.question_id
+    left join dup_links dl on dl.dup_post_id = qr.question_id
+    left join active_users au on au.user_id = qr.asker_id
+    left join asker_badges ab on ab.userid = qr.asker_id
+),
+close_reason_lookup as (
+    select crt.id as close_reason_id, crt.name as close_reason_name
+    from closereasontypes crt
+),
+final_scored as (
+    select
+        n.*,
+        coalesce(crt.close_reason_name, 'Unknown') as close_reason_name,
+        case 
+            when n.duplicate_of is not null then 1
+            when n.close_reason_id_guess = 101 then 1
+            else 0
+        end as is_duplicate_flag,
+        case 
+            when n.asker_reputation >= (select min_reputation from params) then 1 else 0
+        end as is_established_user,
+        /* combined complexity score with null-safe arithmetic */
+        (
+            coalesce(n.hot_score, 0)
+            + coalesce(n.upvotes, 0) * 0.6
+            - coalesce(n.downvotes, 0) * 0.8
+            + case when n.is_duplicate_flag = 1 then -3 else 0 end
+            + case when n.is_established_user = 1 then 1.5 else 0 end
+        ) as complexity_score
+    from normalized n
+    left join close_reason_lookup crt on crt.close_reason_id = n.close_reason_id_guess
+),
+heavy_editor_influence as (
+    select
+        he.postid as question_id,
+        count(distinct he.userid) as editors_count,
+        count(*) as edit_events,
+        sum(case when he.userid in (select userid from heavy_editor_cut) then 1 else 0 end) as heavy_edit_events,
+        count(distinct case when he.userid in (select userid from heavy_editor_cut) then he.userid end) as heavy_editor_count,
+        min(he.first_event) as first_edit_at,
+        max(he.last_event) as last_edit_at
+    from heavy_edit_events he
+    join qa_metrics qm on qm.question_id = he.postid
+    group by he.postid
+),
+rank_buckets as (
+    select
+        fs.*,
+        hei.editors_count,
+        hei.edit_events,
+        hei.heavy_edit_events,
+        hei.heavy_editor_count,
+        hei.first_edit_at,
+        hei.last_edit_at,
+        width_bucket(fs.hot_score, 0, greatest(1.0, (select max(hot_score) from final_scored)), 10) as hot_bucket,
+        width_bucket(coalesce(fs.viewcount,0)::float, 0, greatest(1.0, (select max(viewcount) from final_scored)), 10) as view_bucket
+    from final_scored fs
+    left join heavy_editor_influence hei on hei.question_id = fs.question_id
+),
+aggregate_summary as (
+    select
+        rb.hot_bucket,
+        rb.view_bucket,
+        count(*) as bucket_questions,
+        avg(rb.complexity_score) as avg_complexity,
+        avg(coalesce(rb.answers_total,0)::float) as avg_answers,
+        avg(coalesce(rb.viewcount,0)::float) as avg_views,
+        sum(case when rb.is_duplicate_flag = 1 then 1 else 0 end) as dup_count,
+        sum(coalesce(rb.heavy_edit_events,0)) as total_heavy_edits
+    from rank_buckets rb
+    group by rb.hot_bucket, rb.view_bucket
+),
+topk as (
+    (
+        select 
+            rb.*,
+            'by_hot' as criteria,
+            row_number() over (order by rb.hot_score desc nulls last, rb.viewcount desc) as rn
+        from rank_buckets rb
+    )
+    union all
+    (
+        select
+            rb.*,
+            'by_complexity' as criteria,
+            row_number() over (order by rb.complexity_score desc nulls last, rb.hot_score desc nulls last) as rn
+        from rank_buckets rb
+    )
+),
+filtered_topk as (
+    select * from topk
+    where rn <= 50
+)
+select
+    ft.criteria,
+    ft.rn as rank_within_criteria,
+    ft.question_id,
+    coalesce(ft.title, '[no title]') as title,
+    ft.tags,
+    ft.question_date,
+    ft.viewcount,
+    ft.answers_total,
+    ft.question_score,
+    ft.hot_score,
+    ft.complexity_score,
+    ft.hot_rank,
+    ft.view_rank,
+    ft.answer_rank,
+    ft.upvotes,
+    ft.downvotes,
+    ft.vote_favorites,
+    ft.duplicate_of,
+    ft.first_dup_link_at,
+    ft.closure_state,
+    ft.close_reason_name,
+    ft.asker_id,
+    ft.asker_name,
+    ft.asker_reputation,
+    ft.asker_location,
+    coalesce(ft.gold_badges,0) as gold_badges,
+    coalesce(ft.silver_badges,0) as silver_badges,
+    coalesce(ft.bronze_badges,0) as bronze_badges,
+    coalesce(ft.tag_badges,0) as tag_badges,
+    ft.editors_count,
+    ft.edit_events,
+    ft.heavy_edit_events,
+    ft.heavy_editor_count,
+    ft.first_edit_at,
+    ft.last_edit_at
+from filtered_topk ft
+order by ft.criteria, ft.rn;

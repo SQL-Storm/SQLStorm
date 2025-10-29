@@ -1,0 +1,48 @@
+-- {"query": "6869.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-micro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 475} 
+
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    MAX(u.CreationDate) AS LatestAccountActivity,
+    MAX(p.LastActivityDate) AS LatestPostActivity,
+    AVG(p.Score) AS AvgPostScore,
+    MAX(ph.CreationDate) AS LastEdit,
+    COALESCE(SUM(v.BountyAmount), 0) AS TotalBounty,
+    COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN pl.RelatedPostId ELSE NULL END) AS TotalDuplicates,
+    (
+        SELECT STRING_AGG(t.TagName, ', ')
+        FROM Tags t
+        WHERE t.Id IN (
+            SELECT tg.TagId
+            FROM PostTags pt
+            JOIN Tags t ON pt.TagId = t.Id
+            WHERE pt.PostId = p.Id
+        )
+    ) AS MostFrequentTags
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId = 2
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId AND v.VoteTypeId = 8
+LEFT JOIN 
+    PostLinks pl ON p.Id = pl.PostId
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    PostTags pt ON p.Id = pt.PostId
+WHERE 
+    u.Reputation > 1000
+    AND p.CreationDate >= DATEADD(year, -1, GETDATE())
+GROUP BY 
+    u.DisplayName, u.Reputation
+HAVING 
+    COUNT(DISTINCT p.Id) > 50
+ORDER BY 
+    u.Reputation DESC, 
+    TotalPosts DESC;

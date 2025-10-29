@@ -1,0 +1,140 @@
+-- {"query": "4076.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2292} 
+
+WITH PostEngagement AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ViewCount AS PostViewCount,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVoteCount,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownVoteCount,
+        COUNT(DISTINCT c.Id) AS CommentCountDistinct,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as UserPostSequence
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (2, 3)
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    WHERE p.PostTypeId IN (1, 2) -- Questions and Answers
+    GROUP BY p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.CommentCount, p.FavoriteCount, p.ViewCount
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName AS UserDisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.Views AS UserViews,
+        u.UpVotes AS UserTotalUpVotes,
+        u.DownVotes AS UserTotalDownVotes,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadgeCount,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadgeCount,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadgeCount,
+        MAX(pe.PostCreationDate) AS LastPostCreationDate,
+        AVG(pe.PostScore) AS AvgPostScore,
+        SUM(pe.UpVoteCount) AS TotalUpVotesOnPosts,
+        SUM(pe.DownVoteCount) AS TotalDownVotesOnPosts,
+        COUNT(DISTINCT CASE WHEN pe.PostTypeId = 1 THEN pe.PostId ELSE NULL END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN pe.PostTypeId = 2 THEN pe.PostId ELSE NULL END) AS AnswerCount,
+        SUM(pe.PostViewCount) AS TotalPostViewCount
+    FROM Users u
+    LEFT JOIN PostEngagement pe ON u.Id = pe.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Views, u.UpVotes, u.DownVotes
+),
+PostHistorySummaries AS (
+    SELECT
+        ph.PostId,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 2 THEN ph.Id ELSE NULL END) AS BodyEditCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 4 THEN ph.Id ELSE NULL END) AS TitleEditCount,
+        MAX(ph.CreationDate) AS LastEditDate
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (2, 4)
+    GROUP BY ph.PostId
+)
+SELECT
+    ua.UserId,
+    ua.UserDisplayName,
+    ua.Reputation,
+    ua.UserCreationDate,
+    ua.UserViews,
+    ua.UserTotalUpVotes,
+    ua.UserTotalDownVotes,
+    ua.BadgeCount,
+    ua.GoldBadgeCount,
+    ua.SilverBadgeCount,
+    ua.BronzeBadgeCount,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.AvgPostScore,
+    ua.TotalUpVotesOnPosts,
+    ua.TotalDownVotesOnPosts,
+    ua.TotalPostViewCount,
+    (ua.Reputation * 1.0 / NULLIF(ua.UserViews, 0)) AS ReputationPerView,
+    CASE WHEN ua.UserCreationDate < NOW() - INTERVAL '1 year' THEN 'Old' ELSE 'New' END AS UserAgeCategory,
+    phs.BodyEditCount,
+    phs.TitleEditCount,
+    CASE WHEN phs.LastEditDate IS NULL THEN 'Never Edited' ELSE 'Edited' END AS EditStatus,
+    CASE WHEN phs.LastEditDate > ua.LastPostCreationDate THEN 'PostEditedAfterCreation' ELSE 'PostEditedBeforeOrAtCreation' END AS EditTiming,
+    COALESCE(p.PostScore, 0) AS PostScoreForNthPost,
+    COALESCE(p.CommentCount, 0) AS CommentCountForNthPost,
+    COALESCE(p.FavoriteCount, 0) AS FavoriteCountForNthPost,
+    COALESCE(p.UpVoteCount, 0) AS UpVoteCountForNthPost,
+    COALESCE(p.DownVoteCount, 0) AS DownVoteCountForNthPost,
+    CASE WHEN p.PostTypeId = 1 THEN 'Question' ELSE 'Answer' END AS PostTypeDescription,
+    (p.PostScoreForNthPost + p.UpVoteCountForNthPost - p.DownVoteCountForNthPost) AS NetScoreForNthPost,
+    TRIM(SUBSTRING(p.PostId::text FROM '^([0-9]+)')) AS PostIdString,
+    CASE WHEN p.UserPostSequence BETWEEN 1 AND 10 THEN 'Top 10' WHEN p.UserPostSequence BETWEEN 11 AND 50 THEN '11-50' ELSE 'Beyond 50' END AS UserPostRankCategory,
+    CASE WHEN p.PostCreationDate IS NULL THEN 'UnknownDate' ELSE TO_CHAR(p.PostCreationDate, 'YYYY-MM') END AS PostCreationYearMonth
+FROM UserActivity ua
+LEFT JOIN PostEngagement p ON ua.UserId = p.OwnerUserId AND p.UserPostSequence = 1 -- Correlated subquery equivalent via outer join and filtering
+LEFT JOIN PostHistorySummaries phs ON p.PostId = phs.PostId
+WHERE ua.Reputation > 1000
+UNION ALL
+SELECT
+    ua.UserId,
+    ua.UserDisplayName,
+    ua.Reputation,
+    ua.UserCreationDate,
+    ua.UserViews,
+    ua.UserTotalUpVotes,
+    ua.UserTotalDownVotes,
+    ua.BadgeCount,
+    ua.GoldBadgeCount,
+    ua.SilverBadgeCount,
+    ua.BronzeBadgeCount,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.AvgPostScore,
+    ua.TotalUpVotesOnPosts,
+    ua.TotalDownVotesOnPosts,
+    ua.TotalPostViewCount,
+    (ua.Reputation * 1.0 / NULLIF(ua.UserViews, 0)) AS ReputationPerView,
+    CASE WHEN ua.UserCreationDate < NOW() - INTERVAL '1 year' THEN 'Old' ELSE 'New' END AS UserAgeCategory,
+    phs.BodyEditCount,
+    phs.TitleEditCount,
+    CASE WHEN phs.LastEditDate IS NULL THEN 'Never Edited' ELSE 'Edited' END AS EditStatus,
+    CASE WHEN phs.LastEditDate > ua.LastPostCreationDate THEN 'PostEditedAfterCreation' ELSE 'PostEditedBeforeOrAtCreation' END AS EditTiming,
+    COALESCE(p.PostScore, 0) AS PostScoreForNthPost,
+    COALESCE(p.CommentCount, 0) AS CommentCountForNthPost,
+    COALESCE(p.FavoriteCount, 0) AS FavoriteCountForNthPost,
+    COALESCE(p.UpVoteCount, 0) AS UpVoteCountForNthPost,
+    COALESCE(p.DownVoteCount, 0) AS DownVoteCountForNthPost,
+    CASE WHEN p.PostTypeId = 1 THEN 'Question' ELSE 'Answer' END AS PostTypeDescription,
+    (p.PostScoreForNthPost + p.UpVoteCountForNthPost - p.DownVoteCountForNthPost) AS NetScoreForNthPost,
+    TRIM(SUBSTRING(p.PostId::text FROM '^([0-9]+)')) AS PostIdString,
+    CASE WHEN p.UserPostSequence BETWEEN 1 AND 10 THEN 'Top 10' WHEN p.UserPostSequence BETWEEN 11 AND 50 THEN '11-50' ELSE 'Beyond 50' END AS UserPostRankCategory,
+    CASE WHEN p.PostCreationDate IS NULL THEN 'UnknownDate' ELSE TO_CHAR(p.PostCreationDate, 'YYYY-MM') END AS PostCreationYearMonth
+FROM UserActivity ua
+RIGHT JOIN PostEngagement p ON ua.UserId = p.OwnerUserId AND p.UserPostSequence = 5 -- Another correlated subquery equivalent via outer join and filtering
+LEFT JOIN PostHistorySummaries phs ON p.PostId = phs.PostId
+WHERE ua.Reputation < 500
+GROUP BY
+    ua.UserId, ua.UserDisplayName, ua.Reputation, ua.UserCreationDate, ua.UserViews, ua.UserTotalUpVotes, ua.UserTotalDownVotes,
+    ua.BadgeCount, ua.GoldBadgeCount, ua.SilverBadgeCount, ua.BronzeBadgeCount, ua.QuestionCount, ua.AnswerCount, ua.AvgPostScore,
+    ua.TotalUpVotesOnPosts, ua.TotalDownVotesOnPosts, ua.TotalPostViewCount, ReputationPerView, UserAgeCategory, phs.BodyEditCount,
+    phs.TitleEditCount, EditStatus, EditTiming, p.PostScore, p.CommentCount, p.FavoriteCount, p.UpVoteCount, p.DownVoteCount,
+    PostTypeDescription, NetScoreForNthPost, PostIdString, UserPostRankCategory, PostCreationYearMonth;

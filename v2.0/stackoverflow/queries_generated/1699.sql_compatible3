@@ -1,0 +1,94 @@
+SELECT TF.PostCount FROM TagFrequency TF WHERE TF.TagName = LOWER(split_part(substr(PQ.Tags, 2, LENGTH(PQ.Tags)-2), '><', 1))) AS FirstTagPostCount,
+    COALESCE(PQ.ActualAnswerCount, 0) - COALESCE(PQ.QuestionCommentCount, 0) AS AnswerCommentDifference,
+    CASE
+        WHEN PQ.HasAcceptedAnswer = FALSE AND PQ.QuestionScore > 10 AND (TIMESTAMP '2024-10-01 12:34:56' - PQ.QuestionCreationDate) > INTERVAL '365 days' AND PQ.QuestionViewCount > 500 THEN 'High_Score_No_Accepted_Answer_Stale'
+        WHEN PQ.ActualAnswerCount = 0 AND PQ.QuestionScore < 0 AND (TIMESTAMP '2024-10-01 12:34:56' - PQ.QuestionCreationDate) < INTERVAL '183 days' THEN 'Low_Score_No_Answers_Recent'
+        ELSE 'Normal_Question'
+    END AS QuestionStatusCategory,
+    'Question-' || PQ.QuestionId AS PostIdentifier,
+    'Question' AS RecordType,
+    LEAD(PQ.QuestionScore, 1, 0) OVER (PARTITION BY UE.UserId ORDER BY PQ.QuestionCreationDate) - PQ.QuestionScore AS ScoreChangeToNextQuestion
+FROM UserEngagement UE
+JOIN PostQualityMetrics PQ ON UE.UserId = PQ.QuestionOwnerId
+LEFT JOIN LinkedPostAnalysis LPA ON PQ.QuestionId = LPA.PostId
+WHERE UE.Reputation > 1000
+  AND PQ.QuestionScore >= 5
+  AND PQ.QuestionViewCount > 50
+  AND (PQ.Tags LIKE '%<sql>%' OR PQ.Tags LIKE '%<database>%')
+  AND LENGTH(PQ.QuestionBody) > 100
+  AND PQ.QuestionCreationDate BETWEEN DATE '2020-01-01' AND DATE '2023-12-31'
+  AND (PQ.LastCloseReason IS NULL OR (PQ.LastCloseReason NOT ILIKE '%duplicate%' AND PQ.LastCloseReason NOT ILIKE '%off-topic%'))
+UNION ALL
+SELECT
+    UE.UserId,
+    UE.DisplayName,
+    UE.Reputation,
+    P.Id AS QuestionId,
+    P.Title AS QuestionTitle,
+    P.Score AS QuestionScore,
+    P.ViewCount AS QuestionViewCount,
+    U.DisplayName AS QuestionOwnerDisplayName,
+    NULL AS AnswerId,
+    NULL AS AnswerScore,
+    NULL AS AnswerOwnerDisplayName,
+    FALSE AS HasAcceptedAnswer,
+    (P.CommunityOwnedDate IS NOT NULL) AS IsCommunityWiki,
+    (SELECT
+        CASE
+            WHEN PH_Close.Comment IS NOT NULL AND LENGTH(TRIM(PH_Close.Comment)) > 0 THEN
+                COALESCE(CR.Name, 'Unknown (' || PH_Close.Comment || ')')
+            ELSE NULL
+        END
+     FROM PostHistory PH_Close
+     LEFT JOIN CloseReasonTypes CR ON
+         (CASE WHEN PH_Close.Comment ~ '^[0-9]+$' THEN CAST(PH_Close.Comment AS INTEGER) ELSE NULL END) = CR.Id
+     WHERE PH_Close.PostId = P.Id AND PH_Close.PostHistoryTypeId = 10
+     ORDER BY PH_Close.CreationDate DESC
+     LIMIT 1
+    ) AS LastCloseReason,
+    NULL AS NumberOfTags,
+    LPA.LinkedCount,
+    LPA.DuplicateCount,
+    LPA.AvgRelatedPostScore,
+    COALESCE(LPA.DuplicateTitles, 'No linked posts') AS DuplicateTitles,
+    UE.TotalPosts,
+    UE.QuestionsAsked,
+    UE.AnswersProvided,
+    UE.TotalComments,
+    UE.TotalBadges,
+    UE.GoldBadges,
+    UE.TotalEditsMade,
+    UE.AveragePostScore AS UserAvgPostScore,
+    (SELECT COUNT(B.Id) FROM Badges B WHERE B.UserId = UE.UserId AND LOWER(B.Name) LIKE LOWER('%editor%')) AS HasEditorBadge,
+    NULLIF((SELECT AVG(P_Other.Score)
+     FROM Posts P_Other
+     WHERE P_Other.OwnerUserId = U.Id
+       AND P_Other.Id != P.Id
+       AND P_Other.PostTypeId = 2
+       AND EXTRACT(MONTH FROM P_Other.CreationDate) = EXTRACT(MONTH FROM P.CreationDate)
+       AND EXTRACT(YEAR FROM P_Other.CreationDate) = EXTRACT(YEAR FROM P.CreationDate)
+    ), 0) AS AvgOtherAnswersScoreSameMonth,
+    RANK() OVER (PARTITION BY P.OwnerUserId ORDER BY P.Score DESC, P.CreationDate DESC) AS AnswerScoreRankByOwner,
+    (UE.Reputation * 0.05 + UE.AnswersProvided * 0.7 + UE.TotalComments * 0.3 + UE.GoldBadges * 5 + P.Score * 0.9 + COALESCE(P.FavoriteCount, 0) * 1.5) AS EngagementScore,
+    NULL AS FirstTag,
+    NULL AS FirstTagPostCount,
+    COALESCE(P.AnswerCount, 0) - COALESCE((SELECT COUNT(Id) FROM Comments WHERE PostId = P.Id), 0) AS AnswerCommentDifference,
+    CASE
+        WHEN P.Score > 50 AND (TIMESTAMP '2024-10-01 12:34:56' - P.CreationDate) < INTERVAL '92 days' AND P.ParentId IS NOT NULL THEN 'Highly_Scored_Recent_Answer'
+        WHEN P.Score < 0 AND (TIMESTAMP '2024-10-01 12:34:56' - P.CreationDate) > INTERVAL '365 days' AND P.ParentId IS NOT NULL THEN 'Low_Score_Old_Answer'
+        ELSE 'Normal_Answer'
+    END AS PostStatusCategory,
+    'Answer-' || P.Id AS PostIdentifier,
+    'Answer' AS RecordType,
+    LEAD(P.Score, 1, 0) OVER (PARTITION BY UE.UserId ORDER BY P.CreationDate) - P.Score AS ScoreChangeToNextAnswer
+FROM Posts P
+JOIN Users U ON P.OwnerUserId = U.Id
+JOIN UserEngagement UE ON U.Id = UE.UserId
+LEFT JOIN LinkedPostAnalysis LPA ON P.Id = LPA.PostId
+WHERE P.PostTypeId = 2
+  AND P.Score >= 1
+  AND LENGTH(P.Body) > 50
+  AND P.CreationDate BETWEEN DATE '2020-01-01' AND DATE '2023-12-31'
+  AND EXISTS (SELECT 1 FROM Posts Q WHERE Q.Id = P.ParentId AND Q.ViewCount > 1000 AND Q.AcceptedAnswerId IS NULL)
+ORDER BY EngagementScore DESC, Reputation DESC
+LIMIT 1000;

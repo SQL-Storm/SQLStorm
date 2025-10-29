@@ -1,0 +1,170 @@
+with RecursiveTagCounts as (
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        p.Id as PostId,
+        p.CreationDate,
+        u.Id as UserId,
+        u.DisplayName,
+        row_number() over (partition by t.Id order by p.CreationDate desc) as rn
+    from Tags t
+    left join Posts p on p.Tags like '%<' || t.TagName || '>%'
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId = 1
+), 
+TopTagPosts as (
+    select * from RecursiveTagCounts where rn <= 5
+),
+UserBadgeRanks as (
+    select 
+        b.UserId,
+        b.Name as BadgeName,
+        case b.Class 
+            when 1 then 'Gold'
+            when 2 then 'Silver'
+            when 3 then 'Bronze'
+            else 'Unknown'
+        end as BadgeClass,
+        dense_rank() over (partition by b.UserId order by b.Class) as RankClass
+    from Badges b
+    where b.Date > cast('2024-10-01' as date) - interval '365 days'
+),
+UserPostStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionCount,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswerCount,
+        coalesce(sum(p.Score), 0) as TotalScore,
+        max(p.CreationDate) as LatestPostDate,
+        coalesce(u.Reputation,0) as Reputation,
+        case 
+            when u.Location is null or length(trim(u.Location)) = 0 then 'Unknown'
+            else u.Location
+        end as UserLocation
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.Location
+),
+PostRelationStats as (
+    select
+        pl.PostId,
+        sum(case when lt.Name = 'Duplicate' then 1 else 0 end) as DuplicateCount,
+        sum(case when lt.Name = 'Linked' then 1 else 0 end) as LinkedCount,
+        count(*) as TotalLinks
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    group by pl.PostId
+),
+PostCloseCounts as (
+    select
+        ph.PostId,
+        count(case when ph.PostHistoryTypeId = 10 then 1 end) as CloseCount,
+        count(case when ph.PostHistoryTypeId = 11 then 1 end) as ReopenCount
+    from PostHistory ph
+    group by ph.PostId
+),
+ScoreWindows as (
+    select
+        p.Id as PostId,
+        p.OwnerUserId,
+        p.NormalizedScore,
+        rank() over (partition by p.OwnerUserId order by p.Score desc nulls last) as RankByScore,
+        avg(p.Score) over (partition by p.OwnerUserId) as AvgScorePerUser
+    from (
+        select 
+            Id,
+            OwnerUserId,
+            coalesce(Score,0) as Score,
+            case when Score is null then 0 else Score end as NormalizedScore
+        from Posts
+        where PostTypeId in (1,2)
+    ) p
+),
+UserTopScores as (
+    select 
+        OwnerUserId as UserId,
+        max(coalesce(Score,0)) as MaxPostScore,
+        min(coalesce(Score,0)) as MinPostScore,
+        avg(coalesce(Score,0)) as AvgPostScore,
+        count(*) as PostCount
+    from Posts
+    where PostTypeId in (1,2)
+    group by OwnerUserId
+),
+StringAnalysis as (
+    select
+        p.Id as PostId,
+        length(p.Title) as TitleLength,
+        length(p.Body) - length(replace(p.Body, 'SQL', '')) as SQLKeywordCount,
+        case 
+            when p.Tags is null then array[]::text[]
+            else string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><') 
+        end as TagArray,
+        array_length(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><'),1) as TagCount
+    from Posts p
+    where p.PostTypeId = 1
+),
+CorrelatedComments as (
+    select 
+        p.Id as PostId,
+        count(c.Id) as CommentCount,
+        max(c.Score) as MaxCommentScore,
+        bool_or(c.Text ilike '%bug%') as HasBugMention
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+    group by p.Id
+),
+CombinedStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        up.QuestionCount,
+        up.AnswerCount,
+        up.TotalScore,
+        up.LatestPostDate,
+        up.Reputation,
+        up.UserLocation,
+        coalesce(utb.MaxPostScore,0) as MaxPostScore,
+        coalesce(utb.MinPostScore,0) as MinPostScore,
+        coalesce(utb.AvgPostScore,0) as AvgPostScore,
+        utb.PostCount,
+        string_agg(distinct (ub.BadgeName || '(' || ub.BadgeClass || ')'), ', ') as RecentBadges
+    from Users u
+    left join UserPostStats up on up.UserId = u.Id
+    left join UserTopScores utb on utb.UserId = u.Id
+    left join UserBadgeRanks ub on ub.UserId = u.Id and ub.RankClass=1
+    group by u.Id, u.DisplayName, up.QuestionCount, up.AnswerCount, up.TotalScore, up.LatestPostDate, up.Reputation, up.UserLocation, utb.MaxPostScore, utb.MinPostScore, utb.AvgPostScore, utb.PostCount
+)
+select 
+    cs.UserId,
+    cs.DisplayName,
+    cs.UserLocation,
+    cs.Reputation,
+    cs.QuestionCount,
+    cs.AnswerCount,
+    cs.TotalScore,
+    cs.MaxPostScore,
+    cs.MinPostScore,
+    cs.AvgPostScore,
+    cs.PostCount,
+    cs.LatestPostDate,
+    coalesce(cs.RecentBadges, 'None') as RecentBadges,
+    string_agg(distinct t.TagName, ', ' ) as PopularTags,
+    sum(coalesce(prs.DuplicateCount,0)) as TotalDuplicates,
+    sum(coalesce(prs.LinkedCount,0)) as TotalLinked,
+    sum(coalesce(pcc.CloseCount,0)) as TotalCloseVotes,
+    sum(coalesce(pcc.ReopenCount,0)) as TotalReopenVotes,
+    sum(case when ca.HasBugMention then 1 else 0 end) as PostsMentioningBug
+from CombinedStats cs
+left join TopTagPosts t on t.UserId = cs.UserId
+left join Posts p on p.OwnerUserId = cs.UserId
+left join PostRelationStats prs on prs.PostId = p.Id
+left join PostCloseCounts pcc on pcc.PostId = p.Id
+left join CorrelatedComments ca on ca.PostId = p.Id
+where cs.Reputation > 1000
+group by cs.UserId, cs.DisplayName, cs.UserLocation, cs.Reputation, cs.QuestionCount, cs.AnswerCount, cs.TotalScore, cs.MaxPostScore, cs.MinPostScore, cs.AvgPostScore, cs.PostCount, cs.LatestPostDate, cs.RecentBadges
+having sum(coalesce(prs.DuplicateCount,0)) > 0 or sum(coalesce(prs.LinkedCount,0)) > 0
+order by cs.TotalScore desc, cs.Reputation desc
+limit 50;

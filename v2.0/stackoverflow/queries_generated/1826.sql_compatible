@@ -1,0 +1,171 @@
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS UserTotalUpVotes,
+        U.DownVotes AS UserTotalDownVotes,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - U.CreationDate)) / 86400 AS UserAgeDays,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswers,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        SUM(CASE WHEN V_Made.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalVotesMadeUp,
+        SUM(CASE WHEN V_Made.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalVotesMadeDown,
+        AVG(CASE WHEN P.PostTypeId IN (1, 2) THEN P.Score END) AS AvgUserPostScore,
+        MAX(P.CreationDate) AS LastPostDate,
+        MIN(P.CreationDate) AS FirstPostDate,
+        COALESCE(U.Location, 'Unspecified Location') AS UserLocation_Coalesced
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Votes V_Made ON U.Id = V_Made.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.Views, U.UpVotes, U.DownVotes, U.CreationDate, U.Location
+),
+PostQualityMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.FavoriteCount,
+        P.ClosedDate,
+        CHAR_LENGTH(P.Body) AS BodyLength,
+        CHAR_LENGTH(COALESCE(P.Title, 'No Title')) AS TitleLength,
+        (CASE WHEN P.Tags IS NOT NULL THEN CARDINALITY(string_to_array(TRIM(BOTH '<>' FROM P.Tags), '><')) ELSE 0 END) AS TagCount,
+        (
+            SELECT COUNT(DISTINCT PH.Id)
+            FROM PostHistory PH
+            WHERE PH.PostId = P.Id
+              AND PH.PostHistoryTypeId IN (4,5,6,7,8,9)
+        ) AS PostEditCount,
+        COALESCE(P.AcceptedAnswerId, -999) AS AcceptedAnswerPostId,
+        CASE
+            WHEN P.PostTypeId = 1 AND P.ViewCount > 0 THEN CAST(P.Score AS NUMERIC) / NULLIF(P.ViewCount,0)
+            ELSE 0.0
+        END AS ScorePerViewRatio,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.Score DESC, P.ViewCount DESC) AS UserPostScoreRank,
+        LAG(P.CreationDate, 1, P.CreationDate) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate) AS PreviousPostCreationDate
+    FROM Posts P
+    WHERE P.PostTypeId IN (1, 2)
+      AND P.CreationDate >= DATE '2020-01-01'
+),
+TagPerformance AS (
+    SELECT
+        lower(trim(tag)) AS TagName,
+        COUNT(DISTINCT P.Id) AS TaggedPostCount,
+        SUM(P.ViewCount) AS TagTotalViews,
+        AVG(P.Score) AS AvgTagPostScore
+    FROM Posts P
+    CROSS JOIN LATERAL (
+        SELECT regexp_split_to_table(TRIM(BOTH '<>' FROM P.Tags), '><') AS tag
+    ) t
+    WHERE P.Tags IS NOT NULL AND P.PostTypeId = 1
+    GROUP BY lower(trim(tag))
+    HAVING COUNT(DISTINCT P.Id) > 50
+),
+PostLinkSummary AS (
+    SELECT
+        PL.PostId,
+        COUNT(CASE WHEN PL.LinkTypeId = 1 THEN 1 END) AS LinkedPostsCount,
+        COUNT(CASE WHEN PL.LinkTypeId = 3 THEN 1 END) AS DuplicatePostsCount
+    FROM PostLinks PL
+    GROUP BY PL.PostId
+),
+LatestPostHistoryEvent AS (
+    SELECT
+        PH.PostId,
+        PH.PostHistoryTypeId,
+        PH.CreationDate AS LatestHistoryDate,
+        ROW_NUMBER() OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate DESC, PH.Id DESC) as rn
+    FROM PostHistory PH
+)
+SELECT
+    UE.UserId,
+    UE.DisplayName,
+    UE.Reputation,
+    UE.UserLocation_Coalesced,
+    UE.TotalQuestions,
+    UE.TotalAnswers,
+    UE.AvgUserPostScore,
+    UE.UserAgeDays,
+    PQM.PostId,
+    PQM.PostCreationDate,
+    PQM.PostScore,
+    PQM.ViewCount,
+    PQM.ScorePerViewRatio,
+    PQM.TagCount,
+    PQM.PostEditCount,
+    (PQM.PostCreationDate - PQM.PreviousPostCreationDate) AS TimeSincePreviousPost,
+    TP.TagName AS TopAssociatedTag,
+    TP.AvgTagPostScore,
+    COALESCE(PLS.LinkedPostsCount, 0) AS LinkedPostsCount,
+    COALESCE(PLS.DuplicatePostsCount, 0) AS DuplicatePostsCount,
+    LPH.LatestHistoryDate,
+    PHT.Name AS LatestHistoryTypeName,
+    CASE
+        WHEN UE.Reputation > 50000 AND PQM.ScorePerViewRatio > 0.5 AND PQM.PostEditCount > 2 THEN 'High-Impact Expert'
+        WHEN UE.Reputation > 10000 AND PQM.PostScore > 100 AND PQM.AcceptedAnswerPostId <> -999 THEN 'Community Leader'
+        WHEN UE.TotalQuestions > 50 AND PQM.TagCount > 3 THEN 'Prolific Contributor'
+        WHEN PQM.ClosedDate IS NOT NULL THEN 'Closed Post Contributor'
+        ELSE 'Active User'
+    END AS UserPostSegment,
+    (SELECT COUNT(DISTINCT B.Id) FROM Badges B WHERE B.UserId = UE.UserId AND B.Class = 1) AS GoldBadgesCount,
+    REPLACE(UPPER(SUBSTRING(UE.DisplayName FROM 1 FOR 3)), ' ', '_') AS DisplayNamePrefix_Upper
+FROM UserEngagement UE
+INNER JOIN PostQualityMetrics PQM ON UE.UserId = PQM.OwnerUserId
+LEFT JOIN PostLinkSummary PLS ON PQM.PostId = PLS.PostId
+LEFT JOIN LatestPostHistoryEvent LPH ON PQM.PostId = LPH.PostId AND LPH.rn = 1
+LEFT JOIN PostHistoryTypes PHT ON LPH.PostHistoryTypeId = PHT.Id
+LEFT JOIN (
+    SELECT
+        sq.PostId,
+        sq.TagName,
+        sq.AvgTagPostScore,
+        ROW_NUMBER() OVER (PARTITION BY sq.PostId ORDER BY sq.AvgTagPostScore DESC, sq.TaggedPostCount DESC) as rn
+    FROM (
+        SELECT
+            P_sub.Id AS PostId,
+            lower(trim(t.tag)) AS TagName,
+            TP_sub.AvgTagPostScore,
+            TP_sub.TaggedPostCount
+        FROM Posts P_sub
+        CROSS JOIN LATERAL (
+            SELECT regexp_split_to_table(TRIM(BOTH '<>' FROM P_sub.Tags), '><') AS tag
+        ) t
+        JOIN TagPerformance TP_sub ON lower(trim(t.tag)) = TP_sub.TagName
+        WHERE P_sub.Tags IS NOT NULL
+          AND P_sub.PostTypeId = 1
+    ) sq
+) TP ON PQM.PostId = TP.PostId AND TP.rn = 1
+WHERE UE.Reputation > 1000
+  AND PQM.PostScore > 5
+  AND PQM.UserPostScoreRank <= 5
+  AND PQM.BodyLength > 100
+  AND PQM.AcceptedAnswerPostId IS DISTINCT FROM -999
+  AND (UE.UserLocation_Coalesced LIKE '%US%' OR UE.UserLocation_Coalesced IS NULL)
+  AND NOT EXISTS (
+      SELECT 1
+      FROM PostHistory PH_closed
+      WHERE PH_closed.PostId = PQM.PostId
+        AND PH_closed.PostHistoryTypeId = 10
+        AND PH_closed.CreationDate > PQM.PostCreationDate + INTERVAL '1 year'
+  )
+GROUP BY
+    UE.UserId, UE.DisplayName, UE.Reputation, UE.UserLocation_Coalesced, UE.TotalQuestions, UE.TotalAnswers,
+    UE.AvgUserPostScore, UE.UserAgeDays, PQM.PostId, PQM.PostCreationDate, PQM.PostScore, PQM.ViewCount,
+    PQM.ScorePerViewRatio, PQM.TagCount, PQM.PostEditCount, PQM.PreviousPostCreationDate,
+    TP.TagName, TP.AvgTagPostScore, PLS.LinkedPostsCount, PLS.DuplicatePostsCount,
+    LPH.LatestHistoryDate, PHT.Name, PQM.ClosedDate, PQM.AcceptedAnswerPostId, UE.DisplayName
+HAVING
+    COUNT(DISTINCT PQM.PostId) > 1
+    AND MAX(PQM.ScorePerViewRatio) > 0.05
+ORDER BY
+    UE.Reputation DESC,
+    PQM.ScorePerViewRatio DESC,
+    UE.UserAgeDays DESC
+LIMIT 100;

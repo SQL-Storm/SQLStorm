@@ -1,0 +1,81 @@
+WITH top_users AS (
+  SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.AccountId,
+    COUNT(p.Id) AS post_count,
+    AVG(p.Score) AS avg_post_score,
+    MAX(p.LastActivityDate) AS last_activity
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY
+    u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate,
+    u.Location, u.Views, u.UpVotes, u.DownVotes, u.AccountId
+),
+recent_interactions AS (
+  SELECT
+    u.Id AS UserId,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes_cast,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes_cast,
+    COUNT(DISTINCT c.Id) AS comments_made,
+    COUNT(DISTINCT b.Id) AS badges_awarded
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.UserId = u.Id
+  LEFT JOIN Comments c ON c.UserId = u.Id
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  GROUP BY u.Id
+),
+tag_interest AS (
+  SELECT
+    p.OwnerUserId AS UserId,
+    TRIM(BOTH '<>' FROM tag) AS tag
+  FROM Posts p
+  CROSS JOIN LATERAL (
+    SELECT value AS tag
+    FROM UNNEST(string_to_array(p.Tags, '><')) AS t(value)
+  ) AS t
+  WHERE p.PostTypeId = 1
+),
+tag_trends AS (
+  SELECT
+    TRIM(BOTH '<>' FROM t.value) AS tag,
+    COUNT(*) AS tag_count,
+    AVG(p.Score) AS avg_score
+  FROM Posts p
+  CROSS JOIN LATERAL (
+    SELECT value
+    FROM UNNEST(string_to_array(p.Tags, '><')) AS u(value)
+  ) AS t
+  WHERE p.PostTypeId = 1
+  GROUP BY TRIM(BOTH '<>' FROM t.value)
+  ORDER BY COUNT(*) DESC
+  LIMIT 5
+)
+SELECT
+  tu.Id,
+  tu.DisplayName,
+  tu.Reputation,
+  tu.post_count,
+  tu.avg_post_score,
+  ri.upvotes_cast,
+  ri.downvotes_cast,
+  ri.comments_made,
+  ri.badges_awarded,
+  tu.last_activity,
+  tt.tag AS top_tag_considered,
+  tt.tag_count AS tag_frequency,
+  tt.avg_score AS tag_avg_post_score
+FROM top_users tu
+LEFT JOIN recent_interactions ri ON ri.UserId = tu.Id
+LEFT JOIN tag_interest ti ON ti.UserId = tu.Id
+LEFT JOIN tag_trends tt ON TRUE
+ORDER BY tu.Reputation DESC, tu.post_count DESC
+LIMIT 100;

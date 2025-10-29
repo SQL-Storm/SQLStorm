@@ -1,0 +1,157 @@
+-- {"query": "1949.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2317} 
+WITH UserEngagementSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName AS UserName,
+        u.Reputation,
+        u.Views AS UserProfileViews,
+        u.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostScoreReceived,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT b.Id) AS TotalBadgesAwarded,
+        MAX(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS HasGoldBadge,
+        -- Window function: Rank users by their reputation, handling ties by creation date
+        RANK() OVER (ORDER BY u.Reputation DESC, u.CreationDate ASC) AS ReputationRank,
+        -- Window function: Calculate the average score of posts by users in the same reputation tier (e.g., every 1000 reputation points)
+        AVG(COALESCE(p.Score, 0)) OVER (PARTITION BY FLOOR(u.Reputation / 1000) ORDER BY u.Reputation) AS AvgPostScoreInRepTier
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.CreationDate
+),
+PostHistoricalMetrics AS (
+    SELECT
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate AS HistoryTimestamp,
+        ph.UserId AS HistoryEditorUserId,
+        -- Correlated subquery to find the previous significant event timestamp for a post
+        (
+            SELECT MAX(ph_inner.CreationDate)
+            FROM PostHistory ph_inner
+            WHERE ph_inner.PostId = ph.PostId
+              AND ph_inner.CreationDate < ph.CreationDate
+              AND ph_inner.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 10, 11, 12, 13) -- Initial, Edit, Close, Reopen, Delete, Undelete
+        ) AS LastSignificantHistoryEvent,
+        -- Window function: Get the type of the immediately preceding history event for context
+        LAG(ph.PostHistoryTypeId) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS PrecedingHistoryType,
+        -- Window function: Get the type of the immediately succeeding history event
+        LEAD(ph.PostHistoryTypeId) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS SucceedingHistoryType
+    FROM PostHistory ph
+),
+QuestionDetails AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title AS QuestionTitle,
+        q.OwnerUserId,
+        q.CreationDate AS QuestionCreationDate,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.AnswerCount AS EffectiveAnswerCount,
+        q.CommentCount AS QuestionCommentCount,
+        COALESCE(q.FavoriteCount, 0) AS QuestionFavoriteCount,
+        q.Tags,
+        q.ClosedDate,
+        q.AcceptedAnswerId,
+        -- Correlated subquery: Count how many times this question was closed
+        (SELECT COUNT(DISTINCT phm.HistoryTimestamp) FROM PostHistoricalMetrics phm WHERE phm.PostId = q.Id AND phm.PostHistoryTypeId = 10) AS TimesClosed,
+        -- Correlated subquery: Count how many times this question was reopened
+        (SELECT COUNT(DISTINCT phm.HistoryTimestamp) FROM PostHistoricalMetrics phm WHERE phm.PostId = q.Id AND phm.PostHistoryTypeId = 11) AS TimesReopened,
+        -- Aggregate: Average score of all answers to this question
+        AVG(ans.Score) AS AvgAnswerScore,
+        -- Aggregate: Maximum edit date of this question
+        MAX(CASE WHEN ph_edit.PostHistoryTypeId IN (4, 5, 6) THEN ph_edit.HistoryTimestamp ELSE NULL END) AS LastQuestionEditDate,
+        -- Complex calculation: Engagement Score (favs + score + answer count + 0.1 * view count)
+        (COALESCE(q.FavoriteCount, 0) + COALESCE(q.Score, 0) + COALESCE(q.AnswerCount, 0) * 2 + (COALESCE(q.ViewCount, 0) * 0.1)) AS TotalEngagementScore,
+        -- String expression & NULL logic: Check for 'sql' tag and handle potential NULLs in tags
+        CASE
+            WHEN q.Tags IS NOT NULL AND LOWER(q.Tags) LIKE '%<sql>%' THEN 1
+            ELSE 0
+        END AS HasSQLTag,
+        -- NULL logic and CASE statement: Determine question status
+        CASE
+            WHEN q.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN q.AcceptedAnswerId IS NOT NULL THEN 'Accepted'
+            WHEN q.AnswerCount > 0 THEN 'HasAnswers'
+            ELSE 'NoAnswers'
+        END AS QuestionStatusCategory,
+        -- Complicated calculation: "Freshness Index" (decay based on age)
+        -- Age in days: (cast('2024-10-01 12:34:56' as timestamp) - q.CreationDate) / 1 day
+        -- Weight by (Score + Favorites) and decay exponentially
+        (COALESCE(q.Score, 0) + COALESCE(q.FavoriteCount, 0) * 2.0)
+        / (EXP(EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - q.CreationDate)) / (3600 * 24 * 30.0))) -- Decay by months
+        AS FreshnessIndex
+    FROM Posts q
+    LEFT JOIN Posts ans ON q.Id = ans.ParentId AND ans.PostTypeId = 2 -- Answers
+    LEFT JOIN PostHistoricalMetrics ph_edit ON q.Id = ph_edit.PostId
+    WHERE q.PostTypeId = 1 -- Only questions
+    GROUP BY q.Id, q.Title, q.OwnerUserId, q.CreationDate, q.Score, q.ViewCount, q.AnswerCount, q.CommentCount, q.FavoriteCount, q.Tags, q.ClosedDate, q.AcceptedAnswerId
+)
+SELECT
+    ues.UserId,
+    ues.UserName,
+    ues.Reputation,
+    ues.TotalQuestions,
+    ues.TotalAnswers,
+    qd.QuestionId,
+    qd.QuestionTitle,
+    qd.QuestionScore,
+    qd.ViewCount,
+    qd.EffectiveAnswerCount,
+    qd.QuestionStatusCategory,
+    qd.AvgAnswerScore,
+    qd.TimesClosed,
+    qd.TimesReopened,
+    qd.TotalEngagementScore,
+    qd.HasSQLTag,
+    qd.FreshnessIndex,
+    qd.LastQuestionEditDate,
+    -- Window function: Calculate rolling average of FreshnessIndex for questions from high-reputation users
+    AVG(qd.FreshnessIndex) OVER (PARTITION BY ues.ReputationRank / 100 ORDER BY qd.QuestionCreationDate RANGE BETWEEN INTERVAL '90 DAY' PRECEDING AND CURRENT ROW) AS RollingAvgFreshnessForRepTier,
+    -- String expression: Extract first 30 chars of title, or 'No Title' if NULL/empty
+    COALESCE(NULLIF(SUBSTRING(qd.QuestionTitle, 1, 30), ''), 'No Title') AS TruncatedTitlePreview,
+    -- Complicated predicate in SELECT, with NULL logic and arithmetic
+    (qd.QuestionScore * 0.7 + COALESCE(qd.AvgAnswerScore, 0) * 0.3) AS WeightedScore,
+    -- Check for linked questions (duplicates or related) and their types
+    COALESCE(lt.Name, 'NoLinkType') AS RelatedLinkTypeName,
+    pl.RelatedPostId,
+    -- Correlated subquery: Check if the owner user has any badges named 'Popular Question'
+    EXISTS (
+        SELECT 1
+        FROM Badges b_sub
+        WHERE b_sub.UserId = ues.UserId AND b_sub.Name = 'Popular Question'
+    ) AS HasPopularQuestionBadge
+FROM UserEngagementSummary ues
+INNER JOIN QuestionDetails qd ON ues.UserId = qd.OwnerUserId
+LEFT JOIN PostLinks pl ON qd.QuestionId = pl.PostId
+LEFT JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+WHERE
+    ues.Reputation > 1000 -- Filter for reasonably active/established users
+    AND ues.TotalQuestions >= 3 -- Users who asked at least 3 questions
+    AND qd.QuestionCreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '2 year') -- Questions within the last 2 years
+    AND qd.ViewCount > 500 -- Popular questions
+    AND (
+        (qd.HasSQLTag = 1 AND qd.FreshnessIndex > 10) -- SQL questions with good freshness
+        OR
+        (qd.TimesReopened > 0 AND ues.HasGoldBadge = 1) -- Reopened questions by Gold badge holders
+        OR
+        (qd.QuestionStatusCategory = 'Accepted' AND qd.EffectiveAnswerCount > 1 AND qd.TotalEngagementScore > 100) -- Accepted questions with multiple answers and high engagement
+    )
+    -- More complex NULL-aware condition
+    AND NOT EXISTS (
+        SELECT 1
+        FROM PostHistoricalMetrics phm_del
+        WHERE phm_del.PostId = qd.QuestionId
+          AND phm_del.PostHistoryTypeId = 12 -- Post Deleted event
+          AND phm_del.HistoryTimestamp > qd.QuestionCreationDate
+    )
+ORDER BY
+    ues.Reputation DESC,
+    qd.FreshnessIndex DESC,
+    qd.TotalEngagementScore DESC,
+    qd.QuestionId
+LIMIT 2000;

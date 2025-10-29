@@ -1,0 +1,255 @@
+-- {"query": "1734.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3507} 
+WITH UserEngagementStats AS (
+    -- CTE 1: Aggregates user-level activity, reputation, and badge metrics
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.UpVotes AS UserUpVotesGiven,
+        U.DownVotes AS UserDownVotesGiven,
+        COUNT(DISTINCT P_OWNED.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT CASE WHEN P_OWNED.PostTypeId = 1 THEN P_OWNED.Id END) AS TotalQuestionsAsked,
+        COUNT(DISTINCT CASE WHEN P_OWNED.PostTypeId = 2 THEN P_OWNED.Id END) AS TotalAnswersWritten,
+        -- Count answers by this user that were accepted by others
+        COUNT(DISTINCT P_OWNED.Id) FILTER (WHERE P_OWNED.PostTypeId = 2 AND EXISTS (SELECT 1 FROM Posts Q WHERE Q.PostTypeId = 1 AND Q.AcceptedAnswerId = P_OWNED.Id)) AS TotalAcceptedAnswersWritten,
+        COUNT(DISTINCT C_MADE.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        -- Calculate user's active days on the platform
+        EXTRACT(EPOCH FROM (U.LastAccessDate - U.CreationDate)) / (60 * 60 * 24) AS UserActiveDays
+    FROM
+        Users AS U
+    LEFT JOIN
+        Posts AS P_OWNED ON U.Id = P_OWNED.OwnerUserId
+    LEFT JOIN
+        Comments AS C_MADE ON U.Id = C_MADE.UserId
+    LEFT JOIN
+        Badges AS B ON U.Id = B.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.UpVotes, U.DownVotes
+),
+PostHistoricalMetrics AS (
+    -- CTE 2: Evaluates post quality, historical changes, and vote counts
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.LastActivityDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount AS DirectCommentCount, -- Number of comments directly on the post
+        P.FavoriteCount,
+        COUNT(DISTINCT PH_ALL.Id) AS TotalHistoryEvents,
+        SUM(CASE WHEN PH_ALL.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditCount, -- Title/Body/Tags edits
+        SUM(CASE WHEN PH_ALL.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseVoteCount, -- Close events
+        SUM(CASE WHEN PH_ALL.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenVoteCount, -- Reopen events
+        -- Use COUNT for vote types, COALESCE to ensure 0 instead of NULL
+        COALESCE(COUNT(V_UP.Id), 0) AS UpVoteCount,
+        COALESCE(COUNT(V_DOWN.Id), 0) AS DownVoteCount,
+        -- Correlated subquery to fetch the last editor's reputation
+        (SELECT MAX(U_LE.Reputation) FROM Users AS U_LE WHERE U_LE.Id = P.LastEditorUserId) AS LatestEditorReputation,
+        -- Window function to find the time difference between consecutive close/reopen events
+        MAX(CASE WHEN PH_CLOSE.PostHistoryTypeId = 10 THEN PH_CLOSE.CreationDate END) AS LastClosedDate,
+        LAG(PH_CLOSE.CreationDate, 1, PH_CLOSE.CreationDate) OVER (PARTITION BY P.Id ORDER BY PH_CLOSE.CreationDate) AS PreviousCloseEventDate
+    FROM
+        Posts AS P
+    LEFT JOIN
+        PostHistory AS PH_ALL ON P.Id = PH_ALL.PostId
+    LEFT JOIN
+        Votes AS V_UP ON P.Id = V_UP.PostId AND V_UP.VoteTypeId = 2 -- UpMod
+    LEFT JOIN
+        Votes AS V_DOWN ON P.Id = V_DOWN.PostId AND V_DOWN.VoteTypeId = 3 -- DownMod
+    LEFT JOIN
+        PostHistory AS PH_CLOSE ON P.Id = PH_CLOSE.PostId AND PH_CLOSE.PostHistoryTypeId IN (10, 11)
+    GROUP BY
+        P.Id, P.PostTypeId, P.OwnerUserId, P.CreationDate, P.LastActivityDate, P.Score, P.ViewCount, P.AnswerCount, P.CommentCount, P.FavoriteCount
+),
+TagPerformance AS (
+    -- CTE 3: Analyzes the average performance of tags
+    SELECT
+        Tag,
+        COUNT(DISTINCT P_TAG.Id) AS TagPostCount,
+        AVG(P_TAG.Score) AS AvgTagScore,
+        SUM(CASE WHEN P_TAG.PostTypeId = 1 THEN 1 ELSE 0 END) AS TagQuestionCount,
+        SUM(CASE WHEN P_TAG.PostTypeId = 2 THEN 1 ELSE 0 END) AS TagAnswerCount
+    FROM
+        Posts AS P_TAG,
+        -- String function to split tags from the Posts.Tags string
+        unnest(string_to_array(substring(P_TAG.Tags, 2, length(P_TAG.Tags)-2), '><')) AS Tag
+    WHERE
+        P_TAG.Tags IS NOT NULL AND P_TAG.Tags != '' AND P_TAG.PostTypeId = 1 -- Only questions have meaningful tags
+    GROUP BY
+        Tag
+    HAVING
+        COUNT(DISTINCT P_TAG.Id) > 50 -- Filter out less popular tags
+        AND AVG(P_TAG.Score) > 0 -- Only positive average score tags
+),
+UserOverallScore AS (
+    -- CTE 4: Combines user engagement with post historical metrics to create influence scores
+    SELECT
+        UES.UserId,
+        UES.DisplayName,
+        UES.Reputation,
+        UES.TotalQuestionsAsked,
+        UES.TotalAnswersWritten,
+        UES.GoldBadges,
+        UES.SilverBadges,
+        UES.BronzeBadges,
+        UES.UserActiveDays,
+        SUM(PQM.PostScore) AS TotalPostScoreOwned,
+        SUM(PQM.ViewCount) AS TotalViewCountOwned,
+        SUM(PQM.DirectCommentCount) AS TotalCommentsReceivedOnOwnedPosts,
+        SUM(PQM.EditCount) AS TotalEditsToOwnPosts,
+        AVG(PQM.UpVoteCount) AS AvgUpVotesPerOwnedPost,
+        -- Complex influence score calculation
+        (UES.Reputation * 0.4) + (UES.TotalQuestionsAsked * 0.1) + (UES.TotalAnswersWritten * 0.15) +
+        (UES.GoldBadges * 5) + (UES.SilverBadges * 2) + (UES.BronzeBadges * 1) +
+        (COALESCE(SUM(PQM.PostScore), 0) * 0.01) + (COALESCE(SUM(PQM.ViewCount), 0) * 0.001) AS InfluenceScore,
+        -- NTILE window function to categorize users into reputation quintiles
+        NTILE(5) OVER (ORDER BY UES.Reputation DESC, UES.GoldBadges DESC, COALESCE(SUM(PQM.PostScore), 0) DESC) AS ReputationQuintile
+    FROM
+        UserEngagementStats AS UES
+    LEFT JOIN
+        PostHistoricalMetrics AS PQM ON UES.UserId = PQM.OwnerUserId
+    GROUP BY
+        UES.UserId, UES.DisplayName, UES.Reputation, UES.TotalQuestionsAsked, UES.TotalAnswersWritten,
+        UES.GoldBadges, UES.SilverBadges, UES.BronzeBadges, UES.UserActiveDays
+),
+RankedUsers AS (
+    -- CTE 5: Ranks users based on various influence and activity metrics
+    SELECT
+        UserId,
+        DisplayName,
+        Reputation,
+        TotalQuestionsAsked,
+        TotalAnswersWritten,
+        InfluenceScore,
+        ReputationQuintile,
+        -- RANK window function for overall influence
+        RANK() OVER (ORDER BY InfluenceScore DESC) AS OverallInfluenceRank,
+        -- ROW_NUMBER window function for question and answer specific ranks
+        ROW_NUMBER() OVER (ORDER BY TotalQuestionsAsked DESC, Reputation DESC) AS QuestionProdigyRank,
+        ROW_NUMBER() OVER (ORDER BY TotalAnswersWritten DESC, Reputation DESC) AS AnswerGuruRank
+    FROM
+        UserOverallScore
+    WHERE
+        TotalQuestionsAsked > 0 OR TotalAnswersWritten > 0 -- Exclude users with no content
+)
+-- Main Query: Retrieves top influential users based on multiple criteria
+SELECT
+    'Top Influential User' AS MetricType,
+    RU.DisplayName,
+    RU.Reputation,
+    RU.TotalQuestionsAsked,
+    RU.TotalAnswersWritten,
+    RU.InfluenceScore,
+    RU.OverallInfluenceRank,
+    TU.TagName AS TopContributingTag,
+    COALESCE(TU.AvgTagScore, 0.0) AS TopTagAvgScore, -- NULL logic: COALESCE
+    COALESCE(TU.TagPostCount, 0) AS TopTagPostCount,
+    PHM.EditCount AS ExamplePostEditCount,
+    COALESCE(PHM.LatestEditorReputation, 0) AS ExamplePostLastEditorReputation,
+    -- String expressions and NULL logic for user location
+    UPPER(LEFT(COALESCE(U.Location, 'UNKNOWN LOCATION'), 20)) AS UserLocationPrefix,
+    NULLIF(U.WebsiteUrl, '') AS UserWebsite -- NULL logic: NULLIF
+FROM
+    RankedUsers AS RU
+JOIN
+    Users AS U ON RU.UserId = U.Id
+LEFT JOIN LATERAL ( -- LATERAL JOIN to find the top tag for each user
+    SELECT
+        Tag,
+        TP.AvgTagScore,
+        TP.TagPostCount,
+        COUNT(P_TAG.Id) AS UserTagPostCount
+    FROM
+        Posts AS P_TAG,
+        unnest(string_to_array(substring(P_TAG.Tags, 2, length(P_TAG.Tags)-2), '><')) AS Tag
+    JOIN TagPerformance AS TP ON Tag = TP.Tag
+    WHERE P_TAG.OwnerUserId = RU.UserId
+      AND P_TAG.PostTypeId = 1 -- Only questions contribute to tags
+      AND P_TAG.Tags IS NOT NULL AND P_TAG.Tags != ''
+    GROUP BY Tag, TP.AvgTagScore, TP.TagPostCount
+    ORDER BY UserTagPostCount DESC, TP.AvgTagScore DESC
+    LIMIT 1
+) AS TU ON TRUE
+LEFT JOIN PostHistoricalMetrics AS PHM ON PHM.PostId = (
+    -- Correlated subquery to get the most scored question by this user
+    SELECT P_TOP.Id
+    FROM Posts AS P_TOP
+    WHERE P_TOP.OwnerUserId = RU.UserId
+      AND P_TOP.PostTypeId = 1
+    ORDER BY P_TOP.Score DESC, P_TOP.ViewCount DESC
+    LIMIT 1
+)
+WHERE
+    RU.OverallInfluenceRank <= 50 -- Top 50 influential users
+    AND RU.ReputationQuintile = 5 -- Only users in the top 20% by base reputation metrics
+    AND U.DisplayName IS NOT NULL AND U.DisplayName <> ''
+    AND U.LastAccessDate >= cast('2024-10-01' as date) - INTERVAL '3 months' -- Recently active users
+    -- Complicated predicate combining string length and NULL checks
+    AND (U.AboutMe IS NOT NULL AND LENGTH(U.AboutMe) > 100 OR U.WebsiteUrl IS NOT NULL)
+    -- Correlated subquery in WHERE clause, combined with a simple check
+    AND (EXISTS (SELECT 1 FROM Badges B WHERE B.UserId = RU.UserId AND B.Class = 1 AND B.TagBased = TRUE) OR RU.GoldBadges > 2)
+
+UNION ALL -- Set operator to combine results with a different set of criteria
+
+-- Second part of the query: Identifies most active content contributors
+SELECT
+    'Most Active Content Contributor' AS MetricType,
+    RU.DisplayName,
+    RU.Reputation,
+    RU.TotalQuestionsAsked,
+    RU.TotalAnswersWritten,
+    RU.InfluenceScore,
+    RU.OverallInfluenceRank,
+    TU.TagName AS TopContributingTag,
+    COALESCE(TU.AvgTagScore, 0.0) AS TopTagAvgScore,
+    COALESCE(TU.TagPostCount, 0) AS TopTagPostCount,
+    PHM.EditCount AS ExamplePostEditCount,
+    COALESCE(PHM.LatestEditorReputation, 0) AS ExamplePostLastEditorReputation,
+    UPPER(LEFT(COALESCE(U.Location, 'UNKNOWN LOCATION'), 20)) AS UserLocationPrefix,
+    NULLIF(U.WebsiteUrl, '') AS UserWebsite
+FROM
+    RankedUsers AS RU
+JOIN
+    Users AS U ON RU.UserId = U.Id
+LEFT JOIN LATERAL (
+    SELECT
+        Tag,
+        TP.AvgTagScore,
+        TP.TagPostCount,
+        COUNT(P_TAG.Id) AS UserTagPostCount
+    FROM
+        Posts AS P_TAG,
+        unnest(string_to_array(substring(P_TAG.Tags, 2, length(P_TAG.Tags)-2), '><')) AS Tag
+    JOIN TagPerformance AS TP ON Tag = TP.Tag
+    WHERE P_TAG.OwnerUserId = RU.UserId
+      AND P_TAG.PostTypeId = 1
+      AND P_TAG.Tags IS NOT NULL AND P_TAG.Tags != ''
+    GROUP BY Tag, TP.AvgTagScore, TP.TagPostCount
+    ORDER BY UserTagPostCount DESC, TP.AvgTagScore DESC
+    LIMIT 1
+) AS TU ON TRUE
+LEFT JOIN PostHistoricalMetrics AS PHM ON PHM.PostId = (
+    -- Correlated subquery to get the most recent answer by this user
+    SELECT P_TOP.Id
+    FROM Posts AS P_TOP
+    WHERE P_TOP.OwnerUserId = RU.UserId
+      AND P_TOP.PostTypeId = 2 -- Focusing on answers for activity
+    ORDER BY P_TOP.CreationDate DESC, P_TOP.Score DESC
+    LIMIT 1
+)
+WHERE
+    RU.AnswerGuruRank <= 50 -- Top 50 users by answer count
+    AND U.LastAccessDate >= cast('2024-10-01' as date) - INTERVAL '1 year' -- Active within the last year
+    AND RU.TotalAnswersWritten > RU.TotalQuestionsAsked -- Contributes more answers than questions
+    AND RU.TotalEditsToOwnPosts > 5 -- Users who frequently edit their own posts
+    AND U.Location IS NOT NULL AND U.Location <> ''
+ORDER BY
+    MetricType, InfluenceScore DESC, Reputation DESC;

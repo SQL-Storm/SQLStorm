@@ -1,0 +1,278 @@
+WITH UserActivityMetrics AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.UpVotes AS UserUpVotesGiven,
+        u.DownVotes AS UserDownVotesGiven,
+        COUNT(DISTINCT p.Id) AS TotalPostsCreated,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsCreated,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersCreated,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END), 0) AS TotalQuestionViewCount,
+        COALESCE(SUM(COALESCE(p.Score,0)), 0) AS TotalPostScore,
+        COALESCE(AVG(CASE WHEN p.PostTypeId IN (1,2) THEN p.Score END), 0.0) AS AvgActivePostScore,
+        COALESCE(COUNT(DISTINCT c.Id), 0) AS TotalCommentsMade,
+        COALESCE(COUNT(DISTINCT b.Id), 0) AS TotalBadgesEarned,
+        MAX(p.CreationDate) AS LatestPostDate,
+        MIN(p.CreationDate) AS EarliestPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.UpVotes, u.DownVotes
+),
+PostDetailsWithTags AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.LastActivityDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.CommunityOwnedDate,
+        p.Title,
+        p.Tags,
+        p.Body,
+        CASE
+            WHEN p.Tags IS NULL OR p.Tags = '' THEN 0
+            ELSE array_length(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><'),1)
+        END AS NumberOfTags,
+        CASE
+            WHEN p.Tags IS NULL OR p.Tags = '' THEN CAST(ARRAY[] AS text[])
+            ELSE string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')
+        END AS TagArray,
+        (SELECT COUNT(DISTINCT pl_inner.RelatedPostId) FROM PostLinks pl_inner WHERE pl_inner.PostId = p.Id AND pl_inner.LinkTypeId = 1) AS OutgoingLinksCount,
+        (SELECT COUNT(DISTINCT pl_inner.PostId) FROM PostLinks pl_inner WHERE pl_inner.RelatedPostId = p.Id AND pl_inner.LinkTypeId = 1) AS IncomingLinksCount,
+        (SELECT COUNT(DISTINCT pl_inner.RelatedPostId) FROM PostLinks pl_inner WHERE pl_inner.PostId = p.Id AND pl_inner.LinkTypeId = 3) AS DuplicatesFoundCount
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+      AND p.CreationDate >= TIMESTAMP '2022-01-01'
+),
+PostModerationHistory AS (
+    SELECT
+        ph.PostId,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseEvents,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenEvents,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 12 THEN 1 ELSE 0 END) AS DeleteEvents,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 13 THEN 1 ELSE 0 END) AS UndeleteEvents,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) AS LastClosedDateRecord,
+        MIN(CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.CreationDate END) AS FirstReopenedDateRecord,
+        COUNT(DISTINCT ph.UserId) AS UniqueModeratorsInteracted,
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (10,11,12,13,14,15,19,20) THEN ph.CreationDate END) AS LastModerationActionDate
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (10,11,12,13,14,15,19,20)
+    GROUP BY ph.PostId
+),
+UserPostDateSequence AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        p.Id AS PostId,
+        p.CreationDate AS PostCreationDate,
+        LAG(p.CreationDate, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostDate
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL AND p.PostTypeId IN (1,2)
+),
+UserAvgTimeBetweenPosts AS (
+    SELECT
+        UserId,
+        AVG(EXTRACT(EPOCH FROM (PostCreationDate - PreviousPostDate))) AS AvgSecondsBetweenPosts
+    FROM UserPostDateSequence
+    WHERE PreviousPostDate IS NOT NULL
+    GROUP BY UserId
+),
+AggregatedUserStats AS (
+    SELECT
+        uam.UserId,
+        uam.DisplayName,
+        uam.Reputation,
+        uam.UserCreationDate,
+        uam.LastAccessDate,
+        uam.UserUpVotesGiven,
+        uam.UserDownVotesGiven,
+        uam.TotalPostsCreated,
+        uam.TotalQuestionsCreated,
+        uam.TotalAnswersCreated,
+        uam.TotalQuestionViewCount,
+        uam.TotalPostScore,
+        uam.AvgActivePostScore,
+        uam.TotalCommentsMade,
+        uam.TotalBadgesEarned,
+        uam.LatestPostDate,
+        uam.EarliestPostDate,
+        COALESCE(uap.AvgSecondsBetweenPosts, 0) AS AvgTimeBetweenPostsSeconds,
+        (SELECT MAX(ph_inner.CreationDate) FROM PostHistory ph_inner WHERE ph_inner.UserId = uam.UserId AND ph_inner.PostHistoryTypeId IN (10,11,12,13,14,15,19,20)) AS LastModerationActionByGivenUser,
+        CASE
+            WHEN uam.TotalQuestionsCreated > 0 AND uam.TotalAnswersCreated > 0 THEN 'Contributor & Helper'
+            WHEN uam.TotalQuestionsCreated > 0 THEN 'Questioner'
+            WHEN uam.TotalAnswersCreated > 0 THEN 'Answerer'
+            ELSE 'Passive User'
+        END AS UserRoleCategory,
+        EXTRACT(EPOCH FROM (uam.LastAccessDate - uam.UserCreationDate)) / (3600 * 24 * 365.25) AS YearsActive,
+        (
+            SELECT COALESCE(SUM(p_ans.Score), 0)
+            FROM Posts p_ans
+            WHERE p_ans.PostTypeId = 2
+              AND p_ans.OwnerUserId = uam.UserId
+              AND p_ans.Id IN (SELECT q.AcceptedAnswerId FROM Posts q WHERE q.PostTypeId = 1 AND q.AcceptedAnswerId IS NOT NULL)
+        ) AS ScoreFromAcceptedAnswers,
+        RANK() OVER (ORDER BY uam.Reputation DESC, uam.TotalPostsCreated DESC) AS GlobalReputationRank
+    FROM UserActivityMetrics uam
+    LEFT JOIN UserAvgTimeBetweenPosts uap ON uam.UserId = uap.UserId
+),
+AggregatedPostStats AS (
+    SELECT
+        pd.PostId,
+        pd.PostTypeId,
+        pd.OwnerUserId,
+        pd.PostCreationDate,
+        pd.LastActivityDate,
+        pd.Score,
+        pd.ViewCount,
+        pd.AnswerCount,
+        pd.CommentCount,
+        pd.FavoriteCount,
+        pd.ClosedDate,
+        pd.CommunityOwnedDate,
+        pd.Title,
+        pd.Tags,
+        pd.Body,
+        pd.NumberOfTags,
+        pd.TagArray,
+        pd.OutgoingLinksCount,
+        pd.IncomingLinksCount,
+        pd.DuplicatesFoundCount,
+        pmh.CloseEvents,
+        pmh.ReopenEvents,
+        pmh.DeleteEvents,
+        pmh.UndeleteEvents,
+        pmh.LastClosedDateRecord,
+        pmh.FirstReopenedDateRecord,
+        pmh.UniqueModeratorsInteracted,
+        pmh.LastModerationActionDate,
+        COALESCE(pd.Score * 1.0 / NULLIF(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - pd.PostCreationDate)) / (3600 * 24), 0), 0.0) AS ScorePerDay,
+        COALESCE(pd.ViewCount * 1.0 / NULLIF(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - pd.PostCreationDate)) / (3600 * 24), 0), 0.0) AS ViewsPerDay,
+        COALESCE(pd.AnswerCount * 1.0 / NULLIF(NULLIF(pd.ViewCount,0),0), 0.0) AS AnswerToViewRatio,
+        COALESCE(pd.CommentCount * 1.0 / NULLIF(NULLIF(pd.ViewCount,0),0), 0.0) AS CommentToViewRatio,
+        COALESCE(pd.FavoriteCount * 1.0 / NULLIF(NULLIF(pd.ViewCount,0),0), 0.0) AS FavoriteToViewRatio,
+        RANK() OVER (PARTITION BY pd.PostTypeId ORDER BY pd.Score DESC, pd.ViewCount DESC, pd.AnswerCount DESC) AS PostEngagementRankGlobal,
+        ROW_NUMBER() OVER (PARTITION BY pd.OwnerUserId, pd.PostTypeId ORDER BY pd.Score DESC) AS PostEngagementRankByUser,
+        CASE
+            WHEN pd.Tags IS NULL THEN 'Untagged'
+            WHEN lower(pd.Tags) LIKE '%<sql>%' OR lower(pd.Tags) LIKE '%<database>%' THEN 'SQL/DB Related'
+            WHEN lower(pd.Tags) LIKE '%<javascript>%' OR lower(pd.Tags) LIKE '%<frontend>%' THEN 'Frontend Related'
+            WHEN lower(pd.Tags) LIKE '%<java>%' OR lower(pd.Tags) LIKE '%<c#>%' OR lower(pd.Tags) LIKE '%<python>%' THEN 'Backend Language'
+            ELSE 'General/Other'
+        END AS TagCategory,
+        CASE WHEN pd.Body IS NULL THEN 0 ELSE (char_length(pd.Body) - char_length(replace(lower(pd.Body), '<code>', ''))) / NULLIF(char_length('<code>'),0) END AS CodeBlockCount,
+        (pd.ClosedDate IS NOT NULL AND COALESCE(pmh.ReopenEvents, 0) = 0) AS PermanentlyClosed,
+        (SELECT COUNT(c_inner.Id) FROM Comments c_inner WHERE c_inner.PostId = pd.PostId AND c_inner.UserId = pd.OwnerUserId) AS OwnerCommentsOnOwnPost,
+        pmh.LastModerationActionDate
+    FROM PostDetailsWithTags pd
+    LEFT JOIN PostModerationHistory pmh ON pd.PostId = pmh.PostId
+)
+SELECT
+    'HighPerformanceUserPosts' AS AnalysisType,
+    fus.UserId,
+    fus.DisplayName,
+    fus.Reputation,
+    fus.GlobalReputationRank,
+    fus.UserRoleCategory,
+    aps.PostId,
+    aps.PostTypeId,
+    aps.Title,
+    aps.PostCreationDate,
+    aps.Score,
+    aps.ViewCount,
+    aps.AnswerCount,
+    aps.FavoriteCount,
+    aps.ScorePerDay,
+    aps.ViewsPerDay,
+    aps.AnswerToViewRatio,
+    aps.TagCategory,
+    aps.NumberOfTags,
+    aps.OwnerCommentsOnOwnPost,
+    aps.CodeBlockCount,
+    aps.PostEngagementRankGlobal,
+    aps.PostEngagementRankByUser,
+    (aps.ClosedDate IS NOT NULL) AS IsClosed,
+    aps.PermanentlyClosed,
+    aps.LastClosedDateRecord,
+    aps.UniqueModeratorsInteracted,
+    COALESCE(fus.YearsActive, 0.0) AS UserYearsActive,
+    COALESCE(fus.AvgTimeBetweenPostsSeconds, 0) AS UserAvgTimeBetweenPosts,
+    fus.ScoreFromAcceptedAnswers,
+    (SELECT COUNT(DISTINCT ph2.PostId) FROM PostHistory ph2 WHERE ph2.UserId = fus.UserId AND ph2.PostHistoryTypeId = 10) AS UserCloseVotesCasted,
+    CAST(NULL AS numeric) AS ModerationEventRatio,
+    CAST(NULL AS numeric) AS CommunityImpactScore
+FROM AggregatedUserStats fus
+JOIN AggregatedPostStats aps ON fus.UserId = aps.OwnerUserId
+WHERE
+    fus.Reputation >= 10000
+    AND aps.Score >= 50
+    AND aps.PostEngagementRankGlobal <= 100
+    AND aps.NumberOfTags BETWEEN 2 AND 5
+    AND lower(aps.Title) LIKE '%query%'
+    AND aps.AnswerToViewRatio > 0.05
+    AND aps.TagCategory <> 'Untagged'
+    AND aps.Body LIKE '%<pre><code>%'
+    AND aps.AnswerCount > 0
+    AND aps.ClosedDate IS NULL
+    AND (SELECT COUNT(aps2.PostId) FROM AggregatedPostStats aps2 WHERE aps2.OwnerUserId = fus.UserId AND aps2.Score >= 50 AND aps2.PostEngagementRankGlobal <= 100) > 1
+UNION ALL
+SELECT
+    'ModeratedPostsInsights' AS AnalysisType,
+    fus.UserId,
+    fus.DisplayName,
+    fus.Reputation,
+    fus.GlobalReputationRank,
+    fus.UserRoleCategory,
+    aps.PostId,
+    aps.PostTypeId,
+    aps.Title,
+    aps.PostCreationDate,
+    aps.Score,
+    aps.ViewCount,
+    aps.AnswerCount,
+    aps.FavoriteCount,
+    aps.ScorePerDay,
+    aps.ViewsPerDay,
+    aps.AnswerToViewRatio,
+    aps.TagCategory,
+    aps.NumberOfTags,
+    aps.OwnerCommentsOnOwnPost,
+    aps.CodeBlockCount,
+    aps.PostEngagementRankGlobal,
+    aps.PostEngagementRankByUser,
+    (aps.ClosedDate IS NOT NULL) AS IsClosed,
+    aps.PermanentlyClosed,
+    aps.LastClosedDateRecord,
+    aps.UniqueModeratorsInteracted,
+    COALESCE(fus.YearsActive, 0.0) AS UserYearsActive,
+    COALESCE(fus.AvgTimeBetweenPostsSeconds, 0) AS UserAvgTimeBetweenPosts,
+    fus.ScoreFromAcceptedAnswers,
+    (SELECT COUNT(DISTINCT ph2.PostId) FROM PostHistory ph2 WHERE ph2.UserId = fus.UserId AND ph2.PostHistoryTypeId = 10) AS UserCloseVotesCasted,
+    COALESCE(aps.CloseEvents + aps.ReopenEvents + aps.DeleteEvents + aps.UndeleteEvents, 0) * 1.0 / NULLIF(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - aps.PostCreationDate)) / (3600 * 24), 0) AS ModerationEventRatio,
+    (aps.IncomingLinksCount * 0.5 + COALESCE(aps.FavoriteCount, 0) * 0.3 + COALESCE(aps.AnswerCount, 0) * 0.2) AS CommunityImpactScore
+FROM AggregatedUserStats fus
+JOIN AggregatedPostStats aps ON fus.UserId = aps.OwnerUserId
+WHERE
+    (COALESCE(aps.CloseEvents, 0) > 0 OR COALESCE(aps.DeleteEvents, 0) > 0 OR COALESCE(aps.ReopenEvents, 0) > 0)
+    AND aps.OwnerUserId IS NOT NULL
+    AND aps.PostCreationDate BETWEEN (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '3 years') AND TIMESTAMP '2024-10-01 12:34:56'
+    AND aps.Title IS NOT NULL
+    AND aps.Title NOT ILIKE '%[duplicate]%'
+    AND (aps.Body ILIKE '%bug%' OR aps.Body ILIKE '%error%')
+    AND aps.PermanentlyClosed IS TRUE
+    AND (COALESCE(aps.UniqueModeratorsInteracted,0) > 1 OR (COALESCE(aps.CloseEvents + aps.ReopenEvents + aps.DeleteEvents + aps.UndeleteEvents,0) * 1.0 / NULLIF(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - aps.PostCreationDate)) / (3600 * 24), 0)) > 0.1)
+ORDER BY
+    AnalysisType,
+    ModerationEventRatio DESC,
+    aps.LastModerationActionDate DESC
+LIMIT 100;

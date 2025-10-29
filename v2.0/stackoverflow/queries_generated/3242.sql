@@ -1,0 +1,164 @@
+-- {"query": "3242.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2785} 
+
+/*  Comprehensive benchmark query using CTEs, window functions, outer joins,
+    correlated sub‑queries, set operators, string handling and NULL logic   */
+WITH 
+/* ----------------------------------------------------------------------
+   Monthly statistics per tag (questions, answers, total score) and ranking
+   ---------------------------------------------------------------------- */
+TagMonthlyStats AS (
+    SELECT
+        t.TagName,
+        EXTRACT(YEAR FROM p.CreationDate)   AS yr,
+        EXTRACT(MONTH FROM p.CreationDate)  AS mo,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 1)                AS question_cnt,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 2)                AS answer_cnt,
+        SUM(p.Score)                                           AS total_score,
+        ROW_NUMBER() OVER (
+            PARTITION BY EXTRACT(YEAR FROM p.CreationDate),
+                         EXTRACT(MONTH FROM p.CreationDate)
+            ORDER BY SUM(p.Score) DESC
+        )                                                      AS rank_in_month
+    FROM Posts p
+    /* explode the Tags column (e.g. "<c#><sql>") */
+    JOIN LATERAL (
+        SELECT UNNEST(string_to_array(TRIM(BOTH '<>' FROM p.Tags), '><')) AS tag
+    ) AS tlist ON TRUE
+    JOIN Tags t ON t.TagName = tlist.tag
+    WHERE p.PostTypeId IN (1,2)               /* only Q&A */
+    GROUP BY t.TagName,
+             EXTRACT(YEAR FROM p.CreationDate),
+             EXTRACT(MONTH FROM p.CreationDate)
+),
+
+/* ---------------------------------------------------
+   Keep only the top‑5 tags per month by total_score
+   --------------------------------------------------- */
+TopTags AS (
+    SELECT *
+    FROM TagMonthlyStats
+    WHERE rank_in_month <= 5
+),
+
+/* ---------------------------------------------------
+   User activity aggregation (questions, answers, votes)
+   --------------------------------------------------- */
+UserActivity AS (
+    SELECT
+        u.Id                            AS user_id,
+        u.DisplayName,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS questions_asked,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS answers_given,
+        COALESCE(SUM(v.up_votes),0)                     AS total_upvotes,
+        MAX(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END)    AS has_gold_badge,
+        /* most recent closing date of any post the user owns,
+           or a sentinel value if never closed */
+        COALESCE( (
+            SELECT MAX(ph.CreationDate)
+            FROM PostHistory ph
+            WHERE ph.PostId = p.Id
+              AND ph.PostHistoryTypeId = 10            /* closed */
+        ), TIMESTAMP '1970‑01‑01' )                     AS last_closed_date
+    FROM Users u
+    LEFT JOIN Posts p            ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS up_votes
+        FROM Votes
+        WHERE VoteTypeId = 2                              /* upvote */
+        GROUP BY PostId
+    ) v ON v.PostId = p.Id
+    LEFT JOIN Badges b          ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+
+/* ---------------------------------------------------
+   Recent closed posts (last 30 days) with close reason
+   --------------------------------------------------- */
+RecentClosedPosts AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        ph.Comment                                      AS close_reason,
+        ROW_NUMBER() OVER (PARTITION BY ph.Comment
+                           ORDER BY p.CreationDate DESC) AS rn_per_reason
+    FROM Posts p
+    JOIN PostHistory ph
+          ON ph.PostId = p.Id
+         AND ph.PostHistoryTypeId = 10                 /* closed */
+    WHERE p.CreationDate >= CURRENT_DATE - INTERVAL '30 days'
+)
+
+SELECT
+    tt.TagName,
+    tt.yr,
+    tt.mo,
+    tt.question_cnt,
+    tt.answer_cnt,
+    tt.total_score,
+    ua.DisplayName,
+    ua.questions_asked,
+    ua.answers_given,
+    ua.total_upvotes,
+    CASE WHEN ua.has_gold_badge = 1 THEN 'Gold' ELSE 'NoGold' END AS gold_badge_status,
+    COALESCE(rcp.Title,          'N/A')               AS recent_closed_title,
+    COALESCE(rcp.close_reason,  'None')              AS recent_close_reason,
+    /* label like “Tag sql in 2023‑05” */
+    CONCAT('Tag ', tt.TagName, ' in ',
+           tt.yr, '-', LPAD(tt.mo::TEXT,2,'0'))      AS tag_period_label,
+    /* count of positively scored comments on that recent closed post */
+    (SELECT COUNT(*)
+     FROM Comments c
+     WHERE c.PostId = rcp.Id
+       AND c.Score > 0)                               AS positive_comment_cnt
+FROM TopTags tt
+/* ------------------------------------------------------------------
+   Join the most active user for the tag (correlated sub‑query)
+   ------------------------------------------------------------------ */
+LEFT JOIN UserActivity ua
+       ON ua.user_id = (
+            SELECT p2.OwnerUserId
+            FROM Posts p2
+            WHERE p2.Tags ILIKE '%'||tt.TagName||'%'
+              AND p2.OwnerUserId IS NOT NULL
+            ORDER BY p2.Score DESC
+            LIMIT 1
+       )
+LEFT JOIN RecentClosedPosts rcp
+       ON rcp.rn_per_reason = 1
+      AND rcp.close_reason = (
+            SELECT ph2.Comment
+            FROM PostHistory ph2
+            JOIN Posts p3 ON p3.Id = ph2.PostId
+            WHERE ph2.PostHistoryTypeId = 10
+              AND p3.Tags ILIKE '%'||tt.TagName||'%'
+            ORDER BY p3.CreationDate DESC
+            LIMIT 1
+      )
+
+UNION ALL
+
+/* -----------------------------------------------------------
+   Fallback set – raw per‑tag monthly aggregates for the last 90 days
+   ----------------------------------------------------------- */
+SELECT
+    t.TagName,
+    EXTRACT(YEAR FROM p.CreationDate)::INT   AS yr,
+    EXTRACT(MONTH FROM p.CreationDate)::INT  AS mo,
+    COUNT(*) FILTER (WHERE p.PostTypeId = 1)  AS question_cnt,
+    COUNT(*) FILTER (WHERE p.PostTypeId = 2)  AS answer_cnt,
+    SUM(p.Score)                              AS total_score,
+    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
+FROM Posts p
+JOIN LATERAL (
+    SELECT UNNEST(string_to_array(TRIM(BOTH '<>' FROM p.Tags), '><')) AS tag
+) AS tlist ON TRUE
+JOIN Tags t ON t.TagName = tlist.tag
+WHERE p.CreationDate >= CURRENT_DATE - INTERVAL '90 days'
+GROUP BY t.TagName,
+         EXTRACT(YEAR FROM p.CreationDate),
+         EXTRACT(MONTH FROM p.CreationDate)
+HAVING COUNT(*) > 100
+ORDER BY yr DESC, mo DESC, total_score DESC NULLS LAST
+LIMIT 100;

@@ -1,0 +1,145 @@
+-- {"query": "3093.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2680} 
+
+WITH
+/*-------------------------------------------------
+  Questions per user with tag extraction
+-------------------------------------------------*/
+user_questions AS (
+    SELECT
+        p.OwnerUserId                         AS user_id,
+        COUNT(*)                              AS question_cnt,
+        AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL) AS avg_question_score,
+        SUM(p.FavoriteCount)                  AS total_favorites,
+        ARRAY_AGG(DISTINCT UNNEST(
+            regexp_split_to_array(
+                trim(BOTH '<>' FROM p.Tags),
+                '><'
+            )
+        ))                                     AS tags_array
+    FROM Posts p
+    WHERE p.PostTypeId = 1                     -- questions
+    GROUP BY p.OwnerUserId
+),
+
+/*-------------------------------------------------
+  Answers per user
+-------------------------------------------------*/
+user_answers AS (
+    SELECT
+        p.OwnerUserId                         AS user_id,
+        COUNT(*)                              AS answer_cnt,
+        AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL) AS avg_answer_score
+    FROM Posts p
+    WHERE p.PostTypeId = 2                     -- answers
+    GROUP BY p.OwnerUserId
+),
+
+/*-------------------------------------------------
+  Basic user info + reputation ranking
+-------------------------------------------------*/
+base_users AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        COALESCE(u.Location, 'Unknown')       AS location,
+        CASE WHEN u.EmailHash IS NULL THEN 0 ELSE 1 END AS has_email,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS rep_rank
+    FROM Users u
+),
+
+/*-------------------------------------------------
+  Badge aggregation per user
+-------------------------------------------------*/
+user_badges AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_badges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_badges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_badges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+/*-------------------------------------------------
+  Most recent activity (posts & comments)
+-------------------------------------------------*/
+recent_activity AS (
+    SELECT
+        p.OwnerUserId                               AS user_id,
+        MAX(p.LastActivityDate)                     AS last_post_activity,
+        (SELECT MAX(c.CreationDate)
+         FROM Comments c
+         WHERE c.UserId = p.OwnerUserId)            AS last_comment_activity
+    FROM Posts p
+    GROUP BY p.OwnerUserId
+),
+
+/*-------------------------------------------------
+  Top tag per user (derived from extracted tags)
+-------------------------------------------------*/
+user_top_tag AS (
+    SELECT
+        uq.user_id,
+        tag,
+        cnt,
+        ROW_NUMBER() OVER (PARTITION BY uq.user_id ORDER BY cnt DESC) AS rn
+    FROM (
+        SELECT
+            q.user_id,
+            unnest(q.tags_array) AS tag,
+            COUNT(*) AS cnt
+        FROM user_questions q
+        GROUP BY q.user_id, unnest(q.tags_array)
+    ) uq
+),
+
+/*-------------------------------------------------
+  Net vote score per user (upvotes - downvotes)
+-------------------------------------------------*/
+user_vote_score AS (
+    SELECT
+        pu.OwnerUserId                AS user_id,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END),0) -
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END),0) AS net_vote_score
+    FROM Posts pu
+    LEFT JOIN Votes v ON v.PostId = pu.Id
+    GROUP BY pu.OwnerUserId
+)
+
+/*=================================================
+  Final result: enriched user profile for top 100
+=================================================*/
+SELECT
+    bu.Id                                 AS user_id,
+    bu.DisplayName,
+    bu.Reputation,
+    bu.rep_rank,
+    COALESCE(uq.question_cnt, 0)          AS question_count,
+    COALESCE(uq.avg_question_score, 0)    AS avg_question_score,
+    COALESCE(ua.answer_cnt, 0)            AS answer_count,
+    COALESCE(ua.avg_answer_score, 0)      AS avg_answer_score,
+    COALESCE(ub.gold_badges, 0)           AS gold_badges,
+    COALESCE(ub.silver_badges, 0)         AS silver_badges,
+    COALESCE(ub.bronze_badges, 0)         AS bronze_badges,
+    COALESCE(ra.last_post_activity, bu.CreationDate) AS last_post_activity,
+    CASE WHEN ra.last_comment_activity IS NULL THEN FALSE ELSE TRUE END AS has_commented,
+    CASE WHEN utt.rn = 1 THEN utt.tag ELSE NULL END          AS top_tag,
+    CASE WHEN EXISTS (SELECT 1
+                      FROM Posts p
+                      WHERE p.OwnerUserId = bu.Id
+                        AND p.OwnerUserId IS NULL) THEN 1 ELSE 0 END AS has_anonymous_posts,
+    COALESCE(vs.net_vote_score, 0)        AS net_vote_score,
+    bu.has_email,
+    bu.location
+FROM base_users bu
+LEFT JOIN user_questions uq   ON uq.user_id = bu.Id
+LEFT JOIN user_answers   ua   ON ua.user_id = bu.Id
+LEFT JOIN user_badges    ub   ON ub.UserId = bu.Id
+LEFT JOIN recent_activity ra ON ra.user_id = bu.Id
+LEFT JOIN user_top_tag   utt ON utt.user_id = bu.Id AND utt.rn = 1
+LEFT JOIN user_vote_score vs ON vs.user_id = bu.Id
+WHERE bu.rep_rank <= 100
+ORDER BY bu.rep_rank;

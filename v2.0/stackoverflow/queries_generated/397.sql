@@ -1,0 +1,316 @@
+-- {"query": "397.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3024} 
+with
+-- recent active users with derived metrics
+recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.location,
+        u.creationdate,
+        u.lastaccessdate,
+        coalesce(nullif(trim(u.websiteurl), ''), 'n/a') as websiteurl,
+        u.upvotes,
+        u.downvotes,
+        u.views,
+        (u.upvotes - u.downvotes) as net_votes,
+        width_bucket(u.reputation, 0, greatest(u.reputation, 1), 10) as rep_bucket, -- stable bucketing even for low rep
+        row_number() over (order by u.reputation desc, u.id) as rn_global
+    from users u
+    where u.creationdate >= (select date_trunc('year', max(creationdate)) - interval '3 years' from users)
+),
+-- classify posts in the last N years and compute engagement
+recent_posts as (
+    select
+        p.id,
+        p.posttypeid,
+        p.owneruserid,
+        p.creationdate,
+        p.lastactivitydate,
+        p.score,
+        p.viewcount,
+        p.answercount,
+        p.commentcount,
+        p.favoritecount,
+        p.closeddate,
+        p.title,
+        p.tags,
+        case when p.posttypeid = 1 then 'Question'
+             when p.posttypeid = 2 then 'Answer'
+             else 'Other' end as post_type,
+        (coalesce(p.viewcount,0) + 5*coalesce(p.answercount,0) + 2*coalesce(p.commentcount,0) + 10*coalesce(p.favoritecount,0))::bigint as engagement_score,
+        case when p.closeddate is not null then 1 else 0 end as is_closed
+    from posts p
+    where p.creationdate >= (select date_trunc('year', max(creationdate)) - interval '3 years' from posts)
+),
+-- comments summary per post
+comment_agg as (
+    select
+        c.postid,
+        count(*) as comment_cnt,
+        sum(coalesce(c.score,0)) as comment_score_sum,
+        max(c.creationdate) as last_comment_at
+    from comments c
+    group by c.postid
+),
+-- vote aggregates and latest vote time
+vote_agg as (
+    select
+        v.postid,
+        count(*) filter (where v.votetypeid = 2) as upvotes,
+        count(*) filter (where v.votetypeid = 3) as downvotes,
+        count(*) filter (where v.votetypeid = 5) as favorites,
+        max(v.creationdate) as last_vote_at
+    from votes v
+    group by v.postid
+),
+-- badge counts per user and first/last badge dates
+badge_agg as (
+    select
+        b.userid,
+        count(*) as badges_total,
+        count(*) filter (where b.class = 1) as gold_cnt,
+        count(*) filter (where b.class = 2) as silver_cnt,
+        count(*) filter (where b.class = 3) as bronze_cnt,
+        min(b.date) as first_badge_at,
+        max(b.date) as last_badge_at
+    from badges b
+    group by b.userid
+),
+-- closed reasons extracted from PostHistory JSON/comment field
+close_events as (
+    select
+        ph.postid,
+        ph.creationdate as closed_at,
+        ph.comment as close_reason_id_raw,
+        try_cast(nullif(ph.comment, '') as int) as close_reason_id
+    from posthistory ph
+    where ph.posthistorytypeid = 10
+),
+-- duplicate links and linked posts
+link_agg as (
+    select
+        pl.postid,
+        count(*) filter (where pl.linktypeid = 3) as dup_links,
+        count(*) filter (where pl.linktypeid = 1) as related_links,
+        max(pl.creationdate) as last_link_at
+    from postlinks pl
+    group by pl.postid
+),
+-- tag expansion for questions (Tags like <tag1><tag2>), provide one row per tag
+question_tags as (
+    select
+        p.id as post_id,
+        lower(trim(tg)) as tag
+    from recent_posts p
+    cross join lateral unnest(string_to_array(substring(coalesce(p.tags,''), 2, greatest(length(coalesce(p.tags,'')) - 2, 0)), '><')) as tg
+    where p.posttypeid = 1
+),
+-- tag popularity context
+tag_stats as (
+    select
+        qt.tag,
+        count(*) as q_count_recent,
+        count(*) filter (where rp.is_closed = 1) as q_closed_recent,
+        avg(rp.score)::numeric(12,4) as avg_q_score_recent
+    from question_tags qt
+    join recent_posts rp on rp.id = qt.post_id
+    group by qt.tag
+),
+-- windowed post rankings per user and globally
+post_rankings as (
+    select
+        rp.*,
+        coalesce(ca.comment_cnt,0) as comment_cnt,
+        coalesce(ca.comment_score_sum,0) as comment_score_sum,
+        coalesce(va.upvotes,0) as v_up,
+        coalesce(va.downvotes,0) as v_down,
+        coalesce(va.favorites,0) as v_fav,
+        coalesce(la.dup_links,0) as dup_links,
+        coalesce(la.related_links,0) as related_links,
+        greatest(rp.lastactivitydate, coalesce(ca.last_comment_at, rp.lastactivitydate), coalesce(va.last_vote_at, rp.lastactivitydate), coalesce(la.last_link_at, rp.lastactivitydate)) as last_touch_at,
+        row_number() over (partition by rp.owneruserid order by rp.score desc nulls last, rp.viewcount desc nulls last, rp.id) as rn_by_owner_score,
+        dense_rank() over (order by rp.engagement_score desc, rp.score desc nulls last, rp.id) as drnk_global_engagement,
+        sum(rp.score) over (partition by rp.owneruserid) as sum_score_by_owner,
+        avg(rp.score) over (partition by rp.owneruserid) as avg_score_by_owner,
+        sum(coalesce(va.upvotes,0) - coalesce(va.downvotes,0)) over (partition by rp.owneruserid) as net_votes_by_owner
+    from recent_posts rp
+    left join comment_agg ca on ca.postid = rp.id
+    left join vote_agg va on va.postid = rp.id
+    left join link_agg la on la.postid = rp.id
+),
+-- user level synthesis
+user_synthesis as (
+    select
+        ru.user_id,
+        ru.displayname,
+        ru.location,
+        ru.reputation,
+        ru.creationdate,
+        ru.lastaccessdate,
+        ru.websiteurl,
+        ru.net_votes as user_net_votes,
+        ru.views as profile_views,
+        ba.badges_total,
+        ba.gold_cnt,
+        ba.silver_cnt,
+        ba.bronze_cnt,
+        ba.first_badge_at,
+        ba.last_badge_at,
+        count(pr.id) as recent_posts_cnt,
+        count(*) filter (where pr.posttypeid = 1) as recent_questions_cnt,
+        count(*) filter (where pr.posttypeid = 2) as recent_answers_cnt,
+        sum(coalesce(pr.engagement_score,0)) as total_engagement_recent,
+        max(pr.last_touch_at) as last_touch_at,
+        max(pr.score) filter (where pr.posttypeid = 1) as max_q_score_recent,
+        max(pr.score) filter (where pr.posttypeid = 2) as max_a_score_recent
+    from recent_users ru
+    left join post_rankings pr on pr.owneruserid = ru.user_id
+    left join badge_agg ba on ba.userid = ru.user_id
+    group by ru.user_id, ru.displayname, ru.location, ru.reputation, ru.creationdate, ru.lastaccessdate, ru.websiteurl, ru.net_votes, ru.views, ba.badges_total, ba.gold_cnt, ba.silver_cnt, ba.bronze_cnt, ba.first_badge_at, ba.last_badge_at
+),
+-- correlate question quality with tag context
+question_quality as (
+    select
+        pr.id as post_id,
+        pr.owneruserid as user_id,
+        pr.title,
+        pr.score,
+        pr.viewcount,
+        pr.engagement_score,
+        coalesce(qt.tag, '(no-tag)') as tag,
+        ts.q_count_recent,
+        ts.q_closed_recent,
+        ts.avg_q_score_recent,
+        case
+            when ts.q_count_recent is null then null
+            when pr.score is null then null
+            else (pr.score - ts.avg_q_score_recent)
+        end as score_vs_tag_avg
+    from post_rankings pr
+    left join question_tags qt on qt.post_id = pr.id
+    left join tag_stats ts on ts.tag = qt.tag
+    where pr.posttypeid = 1
+),
+-- compute closed reason names for questions
+closed_with_reason as (
+    select
+        ce.postid,
+        min(ce.closed_at) as first_closed_at,
+        crt.name as close_reason_name
+    from close_events ce
+    left join closereasontypes crt on crt.id = ce.close_reason_id
+    group by ce.postid, crt.name
+),
+-- pick top-N per user across types for final join weight
+top_posts_per_user as (
+    select *
+    from (
+        select
+            pr.*,
+            row_number() over (partition by pr.owneruserid order by pr.engagement_score desc, pr.score desc nulls last, pr.id) as rn_by_owner_eng
+        from post_rankings pr
+    ) s
+    where s.rn_by_owner_eng <= 5
+),
+-- heavy predicate set combining strings, nulls, and ranges
+filtered_posts as (
+    select
+        pr.id,
+        pr.owneruserid,
+        pr.post_type,
+        pr.title,
+        pr.tags,
+        pr.score,
+        pr.viewcount,
+        pr.comment_cnt,
+        pr.v_up,
+        pr.v_down,
+        pr.v_fav,
+        pr.engagement_score,
+        pr.is_closed,
+        cw.close_reason_name,
+        pr.last_touch_at
+    from post_rankings pr
+    left join closed_with_reason cw on cw.postid = pr.id
+    where
+        (
+            -- interesting scoring windows
+            (pr.score >= 5 and pr.viewcount >= 1000)
+            or (pr.score between -2 and 2 and pr.comment_cnt >= 10)
+            or (pr.engagement_score >= 500 and pr.v_up - pr.v_down >= 3)
+        )
+        and (
+            pr.posttypeid in (1,2)
+            and (
+                pr.tags is null
+                or pr.tags ilike '%<sql>%'
+                or pr.tags ilike '%<performance>%'
+                or pr.title ilike any (array['%index%','%join%','%window%','%cte%'])
+            )
+        )
+)
+select
+    us.user_id,
+    us.displayname,
+    coalesce(nullif(us.location,''), 'Unknown') as location,
+    us.reputation,
+    us.user_net_votes,
+    us.badges_total,
+    us.gold_cnt,
+    us.silver_cnt,
+    us.bronze_cnt,
+    us.recent_posts_cnt,
+    us.recent_questions_cnt,
+    us.recent_answers_cnt,
+    us.total_engagement_recent,
+    to_char(us.creationdate, 'YYYY-MM-DD') as user_since,
+    to_char(us.lastaccessdate, 'YYYY-MM-DD') as last_seen,
+    -- aggregates from filtered posts
+    count(fp.id) as matched_posts,
+    count(*) filter (where fp.post_type = 'Question') as matched_questions,
+    count(*) filter (where fp.post_type = 'Answer') as matched_answers,
+    sum(fp.engagement_score) as matched_engagement_sum,
+    avg(fp.score)::numeric(12,4) as matched_avg_score,
+    max(fp.viewcount) as matched_max_views,
+    min(fp.last_touch_at) as first_touch_matched,
+    max(fp.last_touch_at) as last_touch_matched,
+    -- windowed rank across all users by matched engagement and by total engagement
+    rank() over (order by sum(fp.engagement_score) desc nulls last, us.user_id) as r_matched_engagement,
+    dense_rank() over (order by us.total_engagement_recent desc nulls last, us.user_id) as dr_total_engagement,
+    -- cross-check against top posts table using set logic
+    coalesce((
+        select count(*)
+        from top_posts_per_user tpu
+        where tpu.owneruserid = us.user_id
+          and exists (
+              select 1
+              from filtered_posts fpx
+              where fpx.id = tpu.id
+          )
+    ),0) as top_posts_in_matched,
+    -- string calc example
+    left(coalesce(us.websiteurl, 'n/a'), 50) as website_trunc,
+    -- subquery: average delta to tag average among user's matched questions
+    (
+        select avg(qq.score_vs_tag_avg)
+        from question_quality qq
+        where qq.user_id = us.user_id
+          and exists (select 1 from filtered_posts fpp where fpp.id = qq.post_id)
+    )::numeric(12,4) as avg_score_vs_tag
+from user_synthesis us
+left join filtered_posts fp on fp.owneruserid = us.user_id
+group by
+    us.user_id, us.displayname, us.location, us.reputation, us.user_net_votes, us.badges_total,
+    us.gold_cnt, us.silver_cnt, us.bronze_cnt, us.recent_posts_cnt, us.recent_questions_cnt,
+    us.recent_answers_cnt, us.total_engagement_recent, us.creationdate, us.lastaccessdate, us.websiteurl
+having
+    -- ensure active enough users
+    coalesce(count(fp.id),0) >= 3
+    or (us.total_engagement_recent >= 1000 and coalesce(count(fp.id),0) >= 1)
+order by
+    matched_engagement_sum desc nulls last,
+    matched_posts desc,
+    us.reputation desc,
+    us.user_id
+limit 250;

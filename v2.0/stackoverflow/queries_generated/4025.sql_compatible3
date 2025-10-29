@@ -1,0 +1,139 @@
+WITH
+  RankedPostEdits AS (
+    SELECT
+      ph.PostId,
+      ph.UserId,
+      ph.CreationDate,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6)
+  ),
+  UserEditCounts AS (
+    SELECT
+      rpe.UserId,
+      COUNT(DISTINCT rpe.PostId) AS NumPostsEdited,
+      SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS NumQuestionsEdited,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS NumAnswersEdited,
+      AVG((CAST(strftime('%s', rpe.CreationDate) AS DOUBLE) - CAST(strftime('%s', p.CreationDate) AS DOUBLE)) / 60.0) AS AvgTimeToFirstEdit
+    FROM RankedPostEdits rpe
+    JOIN Posts p
+      ON rpe.PostId = p.Id
+    WHERE rpe.rn = 1
+    GROUP BY rpe.UserId
+  ),
+  HighReputationUsers AS (
+    SELECT Id
+    FROM Users
+    WHERE Reputation > 10000
+  ),
+  FrequentVoters AS (
+    SELECT
+      UserId,
+      COUNT(*) AS VoteCount
+    FROM Votes
+    WHERE VoteTypeId IN (2, 3)
+    GROUP BY UserId
+    HAVING COUNT(*) > 500
+  ),
+  LatestEdits AS (
+    SELECT
+      PostId,
+      MAX(CreationDate) AS LatestEditDate
+    FROM PostHistory
+    WHERE PostHistoryTypeId IN (4, 5, 6)
+    GROUP BY PostId
+  ),
+  UserPostCounts AS (
+    SELECT
+      OwnerUserId,
+      COUNT(*) AS PostCount
+    FROM Posts
+    GROUP BY OwnerUserId
+  )
+SELECT
+  u.Id AS UserId,
+  u.DisplayName,
+  u.Reputation,
+  u.CreationDate,
+  COALESCE(uec.NumPostsEdited, 0) AS TotalPostsEdited,
+  COALESCE(uec.NumQuestionsEdited, 0) AS QuestionsEdited,
+  COALESCE(uec.NumAnswersEdited, 0) AS AnswersEdited,
+  COALESCE(uec.AvgTimeToFirstEdit, 0) AS AvgMinutesToFirstEdit,
+  (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+  (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id AND c.Score > 10) AS HighScoringComments,
+  CASE
+    WHEN EXISTS (SELECT 1 FROM FrequentVoters fv WHERE fv.UserId = u.Id) THEN 'Frequent Voter'
+    ELSE 'Standard Voter'
+  END AS VoterStatus,
+  COALESCE(pht.Name, 'No Specific Post History Type') AS LastPostHistoryAction,
+  CASE
+    WHEN ps.Score > 0 THEN 'Positive Score'
+    WHEN ps.Score < 0 THEN 'Negative Score'
+    ELSE 'Zero or Null Score'
+  END AS PostScoreCategory,
+  LOWER(SUBSTR(u.DisplayName, 1, 1)) AS FirstInitial,
+  CASE
+    WHEN u.WebsiteUrl IS NULL THEN 'No Website'
+    WHEN u.WebsiteUrl LIKE '%stackoverflow.com%' THEN 'Stack Overflow Site'
+    ELSE 'Other Website'
+  END AS WebsiteType,
+  COALESCE(up.PostCount, 0) AS UserPostCount,
+  CASE
+    WHEN u.AccountId IS NULL THEN 'No Associated Account'
+    WHEN EXISTS (SELECT 1 FROM HighReputationUsers hru WHERE hru.Id = u.Id) THEN 'High Reputation'
+    ELSE 'Standard Reputation'
+  END AS ReputationTier
+FROM Users u
+LEFT JOIN UserEditCounts uec
+  ON u.Id = uec.UserId
+LEFT JOIN LatestEdits le
+  ON EXISTS (
+    SELECT 1 FROM Posts p_sub WHERE p_sub.Id = le.PostId AND p_sub.OwnerUserId = u.Id
+  )
+LEFT JOIN PostHistoryTypes pht
+  ON pht.Id = (
+    SELECT ph2.PostHistoryTypeId
+    FROM PostHistory ph2
+    WHERE ph2.PostId = u.Id
+      AND ph2.CreationDate = (
+        SELECT MAX(ph3.CreationDate) FROM PostHistory ph3 WHERE ph3.PostId = u.Id
+      )
+    LIMIT 1
+  )
+LEFT JOIN Posts ps
+  ON ps.OwnerUserId = u.Id AND ps.PostTypeId = 1
+LEFT JOIN UserPostCounts up
+  ON u.Id = up.OwnerUserId
+WHERE
+  u.DisplayName IS NOT NULL AND u.DisplayName <> ''
+  AND u.Views > 0
+  AND u.Location IS NOT NULL
+  AND u.AboutMe IS NOT NULL AND LENGTH(u.AboutMe) > 50
+GROUP BY
+  u.Id,
+  u.DisplayName,
+  u.Reputation,
+  u.CreationDate,
+  uec.NumPostsEdited,
+  uec.NumQuestionsEdited,
+  uec.NumAnswersEdited,
+  uec.AvgTimeToFirstEdit,
+  pht.Name,
+  ps.Score,
+  LOWER(SUBSTR(u.DisplayName, 1, 1)),
+  CASE
+    WHEN u.WebsiteUrl IS NULL THEN 'No Website'
+    WHEN u.WebsiteUrl LIKE '%stackoverflow.com%' THEN 'Stack Overflow Site'
+    ELSE 'Other Website'
+  END,
+  up.PostCount,
+  u.AccountId
+HAVING
+  SUM(CASE WHEN ps.PostTypeId = 1 THEN COALESCE(ps.AnswerCount,0) ELSE 0 END) > 5
+  OR COUNT(*) FILTER (WHERE EXISTS (
+        SELECT 1 FROM PostHistory ph_check WHERE ph_check.PostId = ph_check.PostId AND ph_check.PostHistoryTypeId = 10
+      )) > 0
+ORDER BY
+  u.Reputation DESC,
+  u.CreationDate ASC
+LIMIT 100;

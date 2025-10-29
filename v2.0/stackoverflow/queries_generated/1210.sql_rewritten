@@ -1,0 +1,263 @@
+-- {"query": "1210.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3498} 
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+        COALESCE(AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL), 0.0) AS AvgPostScore,
+        MAX(p.LastActivityDate) AS LastPostActivityDate,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COALESCE(SUM(c.Score), 0) AS TotalCommentScore,
+        COUNT(v.Id) AS TotalVotesGivenByOwner,
+        SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS TotalUpVotesGiven,
+        SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS TotalDownVotesGiven,
+        (EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - u.LastAccessDate)) / 86400)::int AS DaysSinceLastAccess
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+    HAVING COUNT(DISTINCT p.Id) > 0 OR COUNT(DISTINCT c.Id) > 0
+),
+QuestionDetails AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Title,
+        p.Body,
+        p.Tags,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        (SELECT COUNT(ph.Id)
+         FROM PostHistory ph
+         WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4, 5, 6)) AS EditCount, -- Correlated subquery
+        (SELECT COUNT(ph.Id)
+         FROM PostHistory ph
+         WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (10, 11)) AS CloseReopenEvents, -- Correlated subquery
+        COALESCE(SUBSTRING(p.Tags FROM 2 FOR POSITION('><' IN p.Tags) - 2), '') AS PrimaryTag,
+        LENGTH(REPLACE(REPLACE(p.Body, '<pre><code>', ''), '</code></pre>', '')) AS BodyTextLength,
+        CASE
+            WHEN p.Body LIKE '%<pre><code>%' AND p.Body LIKE '%</code></pre>%' THEN TRUE
+            ELSE FALSE
+        END AS HasCodeSnippet,
+        p.LastActivityDate,
+        p.CommunityOwnedDate,
+        ph_closed.CreationDate AS ClosedTimestamp,
+        crt.Name AS CloseReason
+    FROM Posts p
+    LEFT JOIN (SELECT PostId, CreationDate, Comment
+               FROM PostHistory
+               WHERE PostHistoryTypeId = 10 AND Comment IS NOT NULL
+               -- Prioritize a specific close reason if multiple exist for the same post, e.g., latest one or lowest ID
+               QUALIFY ROW_NUMBER() OVER (PARTITION BY PostId ORDER BY CreationDate DESC) = 1
+              ) ph_closed
+        ON p.Id = ph_closed.PostId
+    LEFT JOIN CloseReasonTypes crt ON ph_closed.Comment = crt.Id::text
+    WHERE p.PostTypeId = 1 -- Only questions
+),
+AnswerQuality AS (
+    SELECT
+        p.ParentId AS QuestionId,
+        p.OwnerUserId AS AnswerOwnerUserId,
+        p.Id AS AnswerId,
+        p.Score AS AnswerScore,
+        p.CreationDate AS AnswerCreationDate,
+        COUNT(c.Id) AS AnswerCommentCount,
+        AVG(c.Score) FILTER (WHERE c.Score IS NOT NULL) AS AvgAnswerCommentScore,
+        ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate) AS RankByScoreForQuestion
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    WHERE p.PostTypeId = 2 -- Only answers
+    GROUP BY p.ParentId, p.OwnerUserId, p.Id, p.Score, p.CreationDate
+),
+BadgeMilestones AS (
+    SELECT
+        b.UserId,
+        b.Name AS BadgeName,
+        b.Class AS BadgeClass,
+        b.Date AS BadgeAwardDate,
+        u.Reputation AS UserReputationAtBadge,
+        DENSE_RANK() OVER (PARTITION BY b.UserId, b.Class ORDER BY b.Date) AS BadgeRankForClass,
+        LEAD(b.Date, 1) OVER (PARTITION BY b.UserId ORDER BY b.Date) AS NextBadgeAwardDate,
+        (EXTRACT(EPOCH FROM (LEAD(b.Date, 1) OVER (PARTITION BY b.UserId ORDER BY b.Date) - b.Date)) / 86400)::int AS DaysUntilNextBadge
+    FROM Badges b
+    JOIN Users u ON b.UserId = u.Id
+    WHERE b.Class IN (1, 2) -- Gold and Silver badges
+),
+PostLinkAnalysis AS (
+    SELECT
+        pl.PostId,
+        SUM(CASE WHEN lt.Name = 'Linked' THEN 1 ELSE 0 END) AS TotalLinkedPosts,
+        SUM(CASE WHEN lt.Name = 'Duplicate' THEN 1 ELSE 0 END) AS TotalDuplicateMarkers,
+        COUNT(DISTINCT pl.RelatedPostId) AS UniqueRelatedPosts
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    GROUP BY pl.PostId
+),
+QuestionStatsExtended AS (
+    SELECT
+        qd.PostId,
+        qd.OwnerUserId,
+        qd.Title,
+        qd.PrimaryTag,
+        qd.PostScore,
+        qd.ViewCount,
+        qd.FavoriteCount,
+        qd.AnswerCount,
+        qd.EditCount,
+        qd.CloseReopenEvents,
+        qd.HasCodeSnippet,
+        qd.ClosedTimestamp,
+        qd.CloseReason,
+        pla.TotalLinkedPosts,
+        pla.TotalDuplicateMarkers,
+        -- Aggregate answer quality per question
+        MAX(aq.RankByScoreForQuestion) FILTER (WHERE aq.RankByScoreForQuestion = 1) AS HasTopAnswer, -- Binary flag for having a top answer
+        AVG(aq.AnswerScore) OVER (PARTITION BY qd.PostId) AS AvgAnswerScoreForQuestion,
+        SUM(aq.AnswerScore) OVER (PARTITION BY qd.PostId) AS TotalAnswerScoreForQuestion,
+        COUNT(aq.AnswerId) OVER (PARTITION BY qd.PostId) AS ActualAnswerCount,
+        NTILE(5) OVER (PARTITION BY qd.PrimaryTag ORDER BY qd.ViewCount DESC) AS ViewCountQuintileByTag,
+        RANK() OVER (PARTITION BY qd.PrimaryTag ORDER BY qd.PostScore DESC, qd.FavoriteCount DESC) AS PostRankByTag,
+        qd.PostCreationDate -- Keep for LAG ordering
+    FROM QuestionDetails qd
+    LEFT JOIN AnswerQuality aq ON qd.PostId = aq.QuestionId
+    LEFT JOIN PostLinkAnalysis pla ON qd.PostId = pla.PostId
+)
+-- Main query path 1: Gold Badge holders with impactful questions
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.TotalPosts,
+    ua.TotalQuestions,
+    ua.TotalAnswers,
+    ua.AvgPostScore,
+    ua.DaysSinceLastAccess,
+    qse.PostId AS RelatedPostId,
+    qse.Title AS RelatedPostTitle,
+    qse.PrimaryTag,
+    qse.PostScore AS RelatedPostScore,
+    qse.ViewCount AS RelatedPostViewCount,
+    qse.FavoriteCount AS RelatedPostFavoriteCount,
+    qse.ActualAnswerCount,
+    qse.EditCount AS RelatedPostEditCount,
+    qse.CloseReopenEvents,
+    qse.HasCodeSnippet,
+    qse.ClosedTimestamp,
+    COALESCE(qse.CloseReason, 'N/A') AS FinalCloseReason,
+    qse.TotalLinkedPosts,
+    qse.TotalDuplicateMarkers,
+    COALESCE(qse.HasTopAnswer, 0) AS HasTopAnswerFlag,
+    COALESCE(qse.AvgAnswerScoreForQuestion, 0.0) AS AvgAnswerScoreForPost,
+    COALESCE(qse.TotalAnswerScoreForQuestion, 0) AS TotalAnswerScoreForPost,
+    qse.ViewCountQuintileByTag,
+    qse.PostRankByTag,
+    bm.BadgeName AS MajorBadgeName,
+    bm.BadgeClass AS MajorBadgeClass,
+    bm.BadgeAwardDate,
+    bm.DaysUntilNextBadge,
+    (ua.Reputation * (qse.RelatedPostScore + COALESCE(qse.TotalAnswerScoreForPost, 0.0)) / (ua.DaysSinceLastAccess + 1) *
+        CASE
+            WHEN qse.HasCodeSnippet THEN 1.25
+            WHEN qse.PrimaryTag ILIKE '%sql%' OR qse.PrimaryTag ILIKE '%database%' THEN 1.5
+            WHEN qse.TotalDuplicateMarkers > 0 THEN 0.8 -- Penalize duplicates
+            ELSE 1.0
+        END
+    )::NUMERIC(18, 4) AS EngagementMetric, -- Complex Calculation
+    LAG(ua.Reputation, 1, 0) OVER (PARTITION BY ua.UserId ORDER BY qse.PostCreationDate NULLS FIRST) AS PreviousActivityReputation,
+    RANK() OVER (ORDER BY ua.Reputation DESC, ua.TotalPosts DESC, EngagementMetric DESC) AS GlobalUserRank
+FROM UserActivity ua
+LEFT JOIN QuestionStatsExtended qse ON ua.UserId = qse.OwnerUserId
+LEFT JOIN BadgeMilestones bm ON ua.UserId = bm.UserId
+WHERE
+    ua.Reputation > 7500 -- High reputation users
+    AND qse.RelatedPostId IS NOT NULL -- Must have at least one question associated
+    AND (
+        (qse.HasCodeSnippet AND qse.RelatedPostScore > 100 AND qse.ViewCount > 50000)
+        OR (qse.PrimaryTag IN ('javascript', 'python', 'java', 'c#', 'c++', 'html', 'css') AND qse.ViewCount > 30000 AND qse.ActualAnswerCount > 7 AND qse.EditCount < 5)
+        OR (qse.ClosedTimestamp IS NOT NULL AND qse.CloseReason IN ('Needs details or clarity', 'Needs more focus') AND qse.PostRankByTag <= 10) -- Highly ranked but closed questions
+    )
+    AND ua.DaysSinceLastAccess < 120 -- Very active users
+    AND bm.BadgeClass = 1 -- Only gold badge holders for this part
+    AND (bm.DaysUntilNextBadge IS NULL OR bm.DaysUntilNextBadge > 90) -- Significant time between gold badges
+    AND NOT EXISTS (
+        SELECT 1
+        FROM PostHistory ph_del
+        WHERE ph_del.PostId = qse.RelatedPostId
+        AND ph_del.PostHistoryTypeId = 12 -- Question was deleted
+        AND ph_del.CreationDate > (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year') -- Recently deleted
+    )
+
+UNION ALL
+
+-- Main query path 2: Silver Badge holders with significant answer contributions
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.TotalPosts,
+    ua.TotalQuestions,
+    ua.TotalAnswers,
+    ua.AvgPostScore,
+    ua.DaysSinceLastAccess,
+    NULL AS RelatedPostId, -- No specific question focus for this part
+    'N/A' AS RelatedPostTitle,
+    'N/A' AS PrimaryTag,
+    NULL AS RelatedPostScore,
+    NULL AS RelatedPostViewCount,
+    NULL AS RelatedPostFavoriteCount,
+    NULL AS ActualAnswerCount,
+    NULL AS RelatedPostEditCount,
+    NULL AS CloseReopenEvents,
+    FALSE AS HasCodeSnippet,
+    NULL AS ClosedTimestamp,
+    'N/A' AS FinalCloseReason,
+    NULL AS TotalLinkedPosts,
+    NULL AS TotalDuplicateMarkers,
+    NULL AS HasTopAnswerFlag,
+    NULL AS AvgAnswerScoreForPost,
+    NULL AS TotalAnswerScoreForPost,
+    NULL AS ViewCountQuintileByTag,
+    NULL AS PostRankByTag,
+    bm.BadgeName AS MajorBadgeName,
+    bm.BadgeClass AS MajorBadgeClass,
+    bm.BadgeAwardDate,
+    bm.DaysUntilNextBadge,
+    (ua.Reputation * (ua.TotalAnswers * ua.AvgPostScore) / (ua.DaysSinceLastAccess + 1) *
+        CASE
+            WHEN ua.TotalAnswers > ua.TotalQuestions AND ua.AvgPostScore > 15 THEN 1.4
+            WHEN ua.TotalComments > 100 AND ua.TotalAnswers > 50 THEN 1.1
+            ELSE 1.0
+        END
+    )::NUMERIC(18, 4) AS EngagementMetric, -- Different complex calculation
+    LAG(ua.Reputation, 1, 0) OVER (PARTITION BY ua.UserId ORDER BY bm.BadgeAwardDate NULLS FIRST) AS PreviousActivityReputation,
+    RANK() OVER (ORDER BY ua.TotalAnswers DESC, ua.AvgPostScore DESC, EngagementMetric DESC) AS GlobalUserRank
+FROM UserActivity ua
+JOIN BadgeMilestones bm ON ua.UserId = bm.UserId
+WHERE
+    ua.Reputation > 2000
+    AND ua.TotalAnswers > (ua.TotalQuestions * 1.5) -- Users who clearly contribute more answers than questions
+    AND ua.AvgPostScore > 8 -- Answers are generally very well-received
+    AND ua.DaysSinceLastAccess < 60 -- Very recently active
+    AND bm.BadgeClass = 2 -- Only silver badge holders for this part
+    AND bm.BadgeAwardDate > (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '6 months') -- Awarded a silver badge recently
+    AND EXISTS (
+        SELECT 1
+        FROM Posts p_ans
+        WHERE p_ans.OwnerUserId = ua.UserId
+        AND p_ans.PostTypeId = 2
+        AND p_ans.Score > 50
+        AND p_ans.CreationDate > (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '3 months') -- Has a recent, very highly-scored answer
+    )
+ORDER BY GlobalUserRank ASC, EngagementMetric DESC
+LIMIT 5000;

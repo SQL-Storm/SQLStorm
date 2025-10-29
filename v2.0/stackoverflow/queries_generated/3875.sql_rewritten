@@ -1,0 +1,95 @@
+-- {"query": "3875.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2756} 
+WITH user_summary AS (
+    SELECT u.Id,
+           u.DisplayName,
+           u.Reputation,
+           COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+           COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+           SUM(COALESCE(p.Score,0)) AS TotalScore,
+           MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+badge_counts AS (
+    SELECT b.UserId,
+           COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+           COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+           COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+top_tags AS (
+    SELECT t.TagName,
+           t.Count,
+           ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS rn
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0
+),
+recent_votes AS (
+    SELECT v.PostId,
+           SUM(CASE WHEN vt.Id = 2 THEN 1
+                    WHEN vt.Id = 3 THEN -1
+                    ELSE 0 END) AS NetVote,
+           MAX(v.CreationDate) AS LastVoteDate
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE v.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+    GROUP BY v.PostId
+)
+SELECT us.Id,
+       us.DisplayName,
+       us.Reputation,
+       us.QuestionCount,
+       us.AnswerCount,
+       us.TotalScore,
+       COALESCE(bc.GoldBadges,0)   AS GoldBadges,
+       COALESCE(bc.SilverBadges,0) AS SilverBadges,
+       COALESCE(bc.BronzeBadges,0) AS BronzeBadges,
+       COALESCE(rv.NetVote,0)      AS RecentNetVote,
+       CASE WHEN us.LastPostDate IS NULL THEN NULL
+            ELSE to_char(us.LastPostDate,'YYYY-MM-DD')
+       END                         AS LastPost,
+       STRING_AGG(DISTINCT tt.TagName, ', ') FILTER (WHERE tt.rn <= 5) AS TopTags
+FROM user_summary us
+LEFT JOIN badge_counts bc ON bc.UserId = us.Id
+LEFT JOIN LATERAL (
+    SELECT p.Id
+    FROM Posts p
+    WHERE p.OwnerUserId = us.Id
+    ORDER BY p.CreationDate DESC
+    LIMIT 1
+) latest_post ON true
+LEFT JOIN recent_votes rv ON rv.PostId = latest_post.Id
+LEFT JOIN LATERAL (
+    SELECT trim(both '<>' FROM tag) AS TagName
+    FROM unnest(string_to_array(
+           (SELECT p.Tags FROM Posts p WHERE p.Id = latest_post.Id), '><'
+         )) AS tag
+) pt ON true
+LEFT JOIN top_tags tt ON tt.TagName = pt.TagName
+WHERE us.Reputation > 1000
+GROUP BY us.Id, us.DisplayName, us.Reputation,
+         us.QuestionCount, us.AnswerCount, us.TotalScore,
+         bc.GoldBadges, bc.SilverBadges, bc.BronzeBadges,
+         rv.NetVote, us.LastPostDate
+HAVING COUNT(tt.TagName) FILTER (WHERE tt.rn <= 5) > 0
+ORDER BY us.TotalScore DESC
+LIMIT 50
+
+UNION ALL
+
+SELECT NULL,
+       '--- Summary Separator ---',
+       NULL,
+       NULL,
+       NULL,
+       NULL,
+       NULL,
+       NULL,
+       NULL,
+       NULL,
+       NULL,
+       NULL
+ORDER BY 2 DESC
+LIMIT 51;

@@ -1,0 +1,130 @@
+-- {"query": "2466.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1101} 
+with RecursiveTagCounts as (
+    select
+        t.Id as TagId,
+        t.TagName,
+        t.Count,
+        1 as Depth,
+        p.Id as PostId,
+        p.Score,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Title
+    from Tags t
+    join Posts p on p.PostTypeId = 1 and p.Tags like concat('%<', t.TagName, '>%')
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+
+    union all
+
+    select
+        rt.TagId,
+        rt.TagName,
+        rt.Count,
+        rt.Depth + 1,
+        a.Id as PostId,
+        a.Score,
+        a.OwnerUserId,
+        a.CreationDate,
+        a.Title
+    from RecursiveTagCounts rt
+    join Posts a on a.PostTypeId = 2 and a.ParentId = rt.PostId and a.CreationDate > rt.CreationDate
+    where rt.Depth < 3
+),
+UserScoreWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        sum(coalesce(p.Score,0)) as TotalPostScore,
+        count(distinct p.Id) as PostCount,
+        avg(coalesce(p.Score,0)) as AvgPostScore,
+        dense_rank() over (order by sum(coalesce(p.Score,0)) desc) as UserScoreRank,
+        max(p.CreationDate) as LastPostDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName
+),
+TopTagsByScore as (
+    select
+        TagName,
+        sum(Score) as TotalTagScore,
+        count(distinct PostId) as PostsWithTag
+    from RecursiveTagCounts
+    group by TagName
+    having sum(Score) > 1000
+),
+ActiveBadges as (
+    select
+        b.UserId,
+        b.Name as BadgeName,
+        b.Class,
+        b.Date,
+        u.Reputation,
+        u.DisplayName as UserDisplayName,
+        row_number() over (partition by b.UserId order by b.Date desc) as rn
+    from Badges b
+    join Users u on u.Id = b.UserId
+    where b.Date > current_date - interval '1 year'
+),
+LatestComments as (
+    select
+        c.PostId,
+        c.Text as CommentText,
+        c.CreationDate,
+        c.UserId,
+        u.DisplayName as CommentUser
+    from Comments c
+    left join Users u on u.Id = c.UserId
+    where c.CreationDate > (select max(CreationDate) - interval '7 day' from Comments)
+),
+PostHistoryCloseVotes as (
+    select
+        ph.PostId,
+        ph.CreationDate,
+        crt.Name as CloseReason,
+        ph.UserId,
+        u.DisplayName as UserDisplayName
+    from PostHistory ph
+    join PostHistoryTypes pht on pht.Id = ph.PostHistoryTypeId and pht.Name = 'Post Closed'
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    left join Users u on u.Id = ph.UserId
+    where ph.CreationDate > current_date - interval '30 day'
+)
+select distinct
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    usw.TotalPostScore,
+    usw.AvgPostScore,
+    usw.UserScoreRank,
+    tb.TotalTagScore,
+    tb.PostsWithTag,
+    (select string_agg(distinct b.BadgeName || '(' || b.Class || ')', ', ') 
+        from ActiveBadges b where b.UserId = u.Id and b.rn <= 3) as RecentBadges,
+    lc.CommentText,
+    phcv.CloseReason,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    row_number() over (partition by u.Id order by p.Score desc nulls last, p.ViewCount desc nulls last) as UserPostRank,
+    count(pl.Id) over (partition by p.Id) as PostLinksCount,
+    case 
+        when p.ClosedDate is not null then 'Closed' 
+        when p.AcceptedAnswerId is not null then 'Accepted'
+        else 'Open'
+    end as PostStatus,
+    case
+        when strpos(coalesce(p.Tags, ''), '<sql>') > 0 then 'Has SQL Tag'
+        else 'No SQL Tag'
+    end as SqlTagPresence
+from Users u
+left join UserScoreWindow usw on usw.UserId = u.Id
+left join TopTagsByScore tb on true
+left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 1 and p.Score > 0
+left join PostLinks pl on pl.PostId = p.Id
+left join LatestComments lc on lc.PostId = p.Id
+left join PostHistoryCloseVotes phcv on phcv.PostId = p.Id
+where u.Reputation > 5000
+  and coalesce(p.CreationDate, current_date) > current_date - interval '365 day'
+order by usw.UserScoreRank, UserPostRank
+limit 100;

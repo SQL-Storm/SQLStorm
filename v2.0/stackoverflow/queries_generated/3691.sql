@@ -1,0 +1,123 @@
+-- {"query": "3691.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1725} 
+
+/*  Complex benchmark query over the StackOverflow schema  */
+WITH
+-- 1️⃣  User level aggregates
+user_agg AS (
+    SELECT
+        u.Id                                        AS user_id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.Location, '')                    AS location,
+        COALESCE(u.AboutMe, '')                     AS about_me,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS question_cnt,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS answer_cnt,
+        COUNT(DISTINCT b.Id)                        AS badge_cnt,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvote_received,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvote_received,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId IN (1,2))  AS avg_post_score,
+        /* correlated sub‑query: average score of the user’s *answers* */
+        (SELECT AVG(a.Score)
+         FROM Posts a
+         WHERE a.OwnerUserId = u.Id AND a.PostTypeId = 2) AS avg_answer_score
+    FROM Users u
+    LEFT JOIN Posts p      ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b    ON b.UserId      = u.Id
+    LEFT JOIN Votes v     ON v.PostId      = p.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location, u.AboutMe
+),
+
+-- 2️⃣  Latest activity per user (posts & comments)
+latest_activity AS (
+    SELECT
+        u.Id                                            AS user_id,
+        GREATEST(
+            MAX(p.LastActivityDate)                FILTER (WHERE p.LastActivityDate IS NOT NULL),
+            MAX(c.CreationDate)                     FILTER (WHERE c.CreationDate IS NOT NULL)
+        )                                               AS most_recent_dt
+    FROM Users u
+    LEFT JOIN Posts    p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId      = u.Id
+    GROUP BY u.Id
+),
+
+-- 3️⃣  Tag popularity that the user has ever used (string parsing & array handling)
+user_tag_pop AS (
+    SELECT
+        ua.user_id,
+        SUM(t.Count) FILTER (WHERE t.Count IS NOT NULL) AS total_tag_popularity,
+        STRING_AGG(DISTINCT t.TagName, ', ')          AS popular_tags
+    FROM user_agg ua
+    LEFT JOIN Posts p
+           ON p.OwnerUserId = ua.user_id
+          AND p.PostTypeId = 1                         -- only questions have Tags
+    LEFT JOIN LATERAL (
+        SELECT UNNEST(STRING_TO_ARRAY(
+                SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2),
+                '><')) AS tag
+    ) AS tags ON TRUE
+    LEFT JOIN Tags t ON t.TagName = tags.tag
+    GROUP BY ua.user_id
+),
+
+-- 4️⃣  Rank users by a composite score, using window functions
+ranked_users AS (
+    SELECT
+        ua.*,
+        la.most_recent_dt,
+        utp.total_tag_popularity,
+        utp.popular_tags,
+        ROW_NUMBER() OVER (ORDER BY
+            ua.Reputation DESC,
+            (ua.question_cnt + ua.answer_cnt) DESC,
+            ua.avg_post_score DESC NULLS LAST)                AS rank,
+        SUM(ua.question_cnt + ua.answer_cnt) OVER (ORDER BY
+            ua.Reputation DESC)                               AS cumulative_contributions
+    FROM user_agg ua
+    LEFT JOIN latest_activity la   ON la.user_id = ua.user_id
+    LEFT JOIN user_tag_pop utp    ON utp.user_id = ua.user_id
+    WHERE
+        (ua.Reputation > 1000 OR ua.upvote_received > ua.downvote_received)
+        AND (ua.location <> '' OR ua.about_me ILIKE '%SQL%')
+)
+
+-- 5️⃣  Final result set: top‑100 users + a dummy row (set operator)
+SELECT
+    r.rank,
+    r.user_id,
+    r.DisplayName,
+    r.Reputation,
+    r.question_cnt,
+    r.answer_cnt,
+    r.badge_cnt,
+    r.upvote_received,
+    r.downvote_received,
+    r.avg_post_score,
+    r.avg_answer_score,
+    COALESCE(r.most_recent_dt, TIMESTAMP '1970-01-01')      AS most_recent_activity,
+    r.total_tag_popularity,
+    r.popular_tags,
+    r.cumulative_contributions
+FROM ranked_users r
+WHERE r.rank <= 100
+
+UNION ALL
+
+SELECT
+    NULL AS rank,
+    NULL AS user_id,
+    NULL AS DisplayName,
+    NULL AS Reputation,
+    NULL AS question_cnt,
+    NULL AS answer_cnt,
+    NULL AS badge_cnt,
+    NULL AS upvote_received,
+    NULL AS downvote_received,
+    NULL AS avg_post_score,
+    NULL AS avg_answer_score,
+    NULL AS most_recent_activity,
+    NULL AS total_tag_popularity,
+    NULL AS popular_tags,
+    NULL AS cumulative_contributions
+FROM (SELECT 1) AS dummy
+ORDER BY rank;

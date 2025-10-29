@@ -1,0 +1,124 @@
+WITH
+    UserStats AS (
+        SELECT
+            u.Id,
+            u.DisplayName,
+            u.Reputation,
+            COUNT(p.Id) AS TotalPosts,
+            SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS Questions,
+            SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS Answers,
+            AVG(p.Score) AS AvgScore,
+            MAX(p.CreationDate) AS LastPostDate
+        FROM Users u
+        LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+        GROUP BY u.Id, u.DisplayName, u.Reputation
+    ),
+    BadgeStats AS (
+        SELECT
+            b.UserId,
+            STRING_AGG(DISTINCT CASE WHEN b.Class = 1 THEN b.Name END, ', ') AS GoldBadges,
+            STRING_AGG(DISTINCT CASE WHEN b.Class = 2 THEN b.Name END, ', ') AS SilverBadges,
+            COUNT(*) AS TotalBadges,
+            MAX(b.Date) AS LastBadgeDate
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+    TagUsage AS (
+        SELECT
+            u.Id AS UserId,
+            TRIM(t) AS TagName,
+            COUNT(*) AS TagCount,
+            ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY COUNT(*) DESC) AS rn
+        FROM Users u
+        JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+        CROSS JOIN LATERAL (
+            SELECT UNNEST(string_to_array(TRIM(BOTH '<>' FROM p.Tags), '><')) AS t
+        ) tags
+        GROUP BY u.Id, TRIM(t)
+    ),
+    TopTag AS (
+        SELECT UserId, TagName, TagCount
+        FROM TagUsage
+        WHERE rn = 1
+    ),
+    VoteAgg AS (
+        SELECT
+            p.OwnerUserId AS UserId,
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+            SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived,
+            COUNT(DISTINCT CASE WHEN v.VoteTypeId = 5 THEN v.UserId END) AS FavoritesReceived
+        FROM Posts p
+        LEFT JOIN Votes v ON v.PostId = p.Id
+        GROUP BY p.OwnerUserId
+    ),
+    RecentClosed AS (
+        SELECT
+            ph.UserId,
+            COUNT(*) AS ClosedQuestions
+        FROM PostHistory ph
+        WHERE ph.PostHistoryTypeId = 10
+          AND ph.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '30 days')
+        GROUP BY ph.UserId
+    ),
+    MainRows AS (
+        SELECT
+            us.Id,
+            us.DisplayName,
+            us.Reputation,
+            us.TotalPosts,
+            us.Questions,
+            us.Answers,
+            ROUND(CAST(us.AvgScore AS NUMERIC), 2) AS AvgScore,
+            COALESCE(bs.GoldBadges, '') AS GoldBadges,
+            COALESCE(bs.SilverBadges, '') AS SilverBadges,
+            bs.TotalBadges,
+            tt.TagName AS TopTag,
+            tt.TagCount AS TopTagUsage,
+            va.UpVotesReceived,
+            va.DownVotesReceived,
+            va.FavoritesReceived,
+            COALESCE(rc.ClosedQuestions, 0) AS ClosedLast30Days,
+            (SELECT p.Title
+               FROM Posts p
+              WHERE p.OwnerUserId = us.Id
+              ORDER BY p.CreationDate DESC
+              FETCH FIRST 1 ROW ONLY) AS LatestPostTitle,
+            ROW_NUMBER() OVER (ORDER BY us.Reputation DESC) AS RankByReputation
+        FROM UserStats us
+        LEFT JOIN BadgeStats bs   ON bs.UserId = us.Id
+        LEFT JOIN TopTag tt       ON tt.UserId = us.Id
+        LEFT JOIN VoteAgg va      ON va.UserId = us.Id
+        LEFT JOIN RecentClosed rc ON rc.UserId = us.Id
+        WHERE us.Reputation > 1000
+          AND (us.Questions > 0 OR us.Answers > 0)
+    )
+SELECT *
+FROM (
+    SELECT *
+    FROM MainRows
+    WHERE TRUE
+    ORDER BY Reputation DESC
+    LIMIT 100
+
+    UNION ALL
+
+    SELECT
+        CAST(NULL AS BIGINT) AS Id,
+        CAST(NULL AS TEXT) AS DisplayName,
+        CAST(NULL AS INTEGER) AS Reputation,
+        CAST(NULL AS INTEGER) AS TotalPosts,
+        CAST(NULL AS INTEGER) AS Questions,
+        CAST(NULL AS INTEGER) AS Answers,
+        CAST(NULL AS NUMERIC) AS AvgScore,
+        CAST(NULL AS TEXT) AS GoldBadges,
+        CAST(NULL AS TEXT) AS SilverBadges,
+        CAST(NULL AS INTEGER) AS TotalBadges,
+        CAST(NULL AS TEXT) AS TopTag,
+        CAST(NULL AS INTEGER) AS TopTagUsage,
+        CAST(NULL AS INTEGER) AS UpVotesReceived,
+        CAST(NULL AS INTEGER) AS DownVotesReceived,
+        CAST(NULL AS INTEGER) AS FavoritesReceived,
+        CAST(NULL AS INTEGER) AS ClosedLast30Days,
+        CAST(NULL AS TEXT) AS LatestPostTitle,
+        CAST(NULL AS BIGINT) AS RankByReputation
+) t;

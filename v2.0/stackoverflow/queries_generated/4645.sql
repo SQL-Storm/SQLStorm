@@ -1,0 +1,212 @@
+-- {"query": "4645.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1713} 
+
+WITH
+  RankedPostHistory AS (
+    SELECT
+      ph.PostId,
+      ph.PostHistoryTypeId,
+      ph.UserId,
+      ph.CreationDate,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) as rn
+    FROM PostHistory AS ph
+    WHERE
+      ph.PostHistoryTypeId IN (
+        5,
+        4,
+        6,
+        7
+      )
+  ),
+  LatestEdits AS (
+    SELECT
+      rph.PostId,
+      u.DisplayName AS EditorDisplayName,
+      rph.CreationDate AS LastEditDate,
+      CASE
+        WHEN rph.PostHistoryTypeId = 5 THEN 'Body'
+        WHEN rph.PostHistoryTypeId = 4 THEN 'Title'
+        WHEN rph.PostHistoryTypeId = 6 THEN 'Tags'
+        WHEN rph.PostHistoryTypeId = 7 THEN 'Rollback'
+        ELSE 'Unknown'
+      END AS EditType
+    FROM RankedPostHistory AS rph
+    LEFT JOIN Users AS u
+      ON rph.UserId = u.Id
+    WHERE
+      rph.rn = 1
+  ),
+  PostDetails AS (
+    SELECT
+      p.Id,
+      p.PostTypeId,
+      pt.Name AS PostTypeName,
+      p.OwnerUserId,
+      u_owner.DisplayName AS OwnerDisplayName,
+      p.Title,
+      p.Tags,
+      p.Score,
+      p.ViewCount,
+      p.CommentCount,
+      p.AnswerCount,
+      p.FavoriteCount,
+      p.CreationDate,
+      p.LastActivityDate,
+      p.ClosedDate,
+      CASE WHEN p.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS PostStatus,
+      le.EditorDisplayName,
+      le.LastEditDate,
+      le.EditType
+    FROM Posts AS p
+    JOIN PostTypes AS pt
+      ON p.PostTypeId = pt.Id
+    LEFT JOIN Users AS u_owner
+      ON p.OwnerUserId = u_owner.Id
+    LEFT JOIN LatestEdits AS le
+      ON p.Id = le.PostId
+    WHERE
+      p.PostTypeId IN (1, 2)
+  )
+SELECT
+  pd.Id AS PostId,
+  pd.PostTypeName,
+  pd.Title,
+  pd.OwnerDisplayName,
+  pd.Score,
+  pd.ViewCount,
+  pd.CommentCount,
+  pd.AnswerCount,
+  pd.FavoriteCount,
+  pd.CreationDate,
+  pd.LastActivityDate,
+  pd.PostStatus,
+  pd.EditorDisplayName,
+  pd.LastEditDate,
+  pd.EditType,
+  COALESCE(
+    (
+      SELECT
+        SUM(v.VoteTypeId = 2)
+      FROM Votes AS v
+      WHERE
+        v.PostId = pd.Id AND v.VoteTypeId = 2
+    ),
+    0
+  ) AS UpVoteCount,
+  COALESCE(
+    (
+      SELECT
+        SUM(v.VoteTypeId = 3)
+      FROM Votes AS v
+      WHERE
+        v.PostId = pd.Id AND v.VoteTypeId = 3
+    ),
+    0
+  ) AS DownVoteCount,
+  CASE
+    WHEN pd.Tags IS NOT NULL THEN LENGTH(REPLACE(pd.Tags, '><', '')) - LENGTH(pd.Tags) + 1
+    ELSE 0
+  END AS TagCount,
+  CASE
+    WHEN pd.PostStatus = 'Closed' AND pd.ClosedDate > DATE('now', '-30 day') THEN 'Recently Closed'
+    WHEN pd.PostStatus = 'Open' AND pd.LastActivityDate > DATE('now', '-7 day') THEN 'Recently Active'
+    ELSE 'Older'
+  END AS ActivityCategory,
+  (
+    SELECT
+      COUNT(c.Id)
+    FROM Comments AS c
+    WHERE
+      c.PostId = pd.Id AND c.Score < 0
+  ) AS NegativeScoreCommentCount,
+  UPPER(SUBSTRING(pd.Title, 1, 3)) AS TitlePrefix,
+  CASE
+    WHEN pd.OwnerUserId = -1 THEN 'Community'
+    ELSE COALESCE(pd.OwnerDisplayName, 'Unknown')
+  END AS FinalOwnerName,
+  CASE
+    WHEN pd.ClosedDate IS NOT NULL THEN CAST(strftime('%Y%m%d', pd.ClosedDate) AS INTEGER)
+    ELSE 0
+  END AS ClosedDateInt
+FROM PostDetails AS pd
+WHERE
+  pd.Score > 5
+  OR (
+    pd.PostTypeName = 'Question' AND pd.AnswerCount > 0
+  )
+  OR (
+    pd.PostTypeName = 'Answer' AND pd.Score > 10
+  )
+UNION ALL
+SELECT
+  pd.Id AS PostId,
+  pd.PostTypeName,
+  pd.Title,
+  pd.OwnerDisplayName,
+  pd.Score,
+  pd.ViewCount,
+  pd.CommentCount,
+  pd.AnswerCount,
+  pd.FavoriteCount,
+  pd.CreationDate,
+  pd.LastActivityDate,
+  pd.PostStatus,
+  pd.EditorDisplayName,
+  pd.LastEditDate,
+  pd.EditType,
+  COALESCE(
+    (
+      SELECT
+        SUM(v.VoteTypeId = 2)
+      FROM Votes AS v
+      WHERE
+        v.PostId = pd.Id AND v.VoteTypeId = 2
+    ),
+    0
+  ) AS UpVoteCount,
+  COALESCE(
+    (
+      SELECT
+        SUM(v.VoteTypeId = 3)
+      FROM Votes AS v
+      WHERE
+        v.PostId = pd.Id AND v.VoteTypeId = 3
+    ),
+    0
+  ) AS DownVoteCount,
+  CASE
+    WHEN pd.Tags IS NOT NULL THEN LENGTH(REPLACE(pd.Tags, '><', '')) - LENGTH(pd.Tags) + 1
+    ELSE 0
+  END AS TagCount,
+  CASE
+    WHEN pd.PostStatus = 'Closed' AND pd.ClosedDate > DATE('now', '-30 day') THEN 'Recently Closed'
+    WHEN pd.PostStatus = 'Open' AND pd.LastActivityDate > DATE('now', '-7 day') THEN 'Recently Active'
+    ELSE 'Older'
+  END AS ActivityCategory,
+  (
+    SELECT
+      COUNT(c.Id)
+    FROM Comments AS c
+    WHERE
+      c.PostId = pd.Id AND c.Score < 0
+  ) AS NegativeScoreCommentCount,
+  UPPER(SUBSTRING(pd.Title, 1, 3)) AS TitlePrefix,
+  CASE
+    WHEN pd.OwnerUserId = -1 THEN 'Community'
+    ELSE COALESCE(pd.OwnerDisplayName, 'Unknown')
+  END AS FinalOwnerName,
+  CASE
+    WHEN pd.ClosedDate IS NOT NULL THEN CAST(strftime('%Y%m%d', pd.ClosedDate) AS INTEGER)
+    ELSE 0
+  END AS ClosedDateInt
+FROM PostDetails AS pd
+WHERE
+  pd.PostTypeName = 'Question'
+  AND pd.ViewCount > 1000
+  AND pd.FavoriteCount > 50
+  AND EXISTS (
+    SELECT
+      1
+    FROM PostLinks AS pl
+    WHERE
+      pl.PostId = pd.Id AND pl.LinkTypeId = 3
+  );

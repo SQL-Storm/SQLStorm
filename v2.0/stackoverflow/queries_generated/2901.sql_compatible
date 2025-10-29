@@ -1,0 +1,206 @@
+with RecentTopPosts as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.Tags,
+        u.DisplayName as OwnerName,
+        u.Reputation as OwnerReputation,
+        row_number() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as rn,
+        p.OwnerUserId
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    where p.CreationDate >= (cast('2024-10-01' as date) - interval '90 days')
+      and p.Score is not null
+      and p.ViewCount > 100
+),
+BadgeSummary as (
+    select 
+        UserId,
+        sum(case when Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when Class = 3 then 1 else 0 end) as BronzeBadges,
+        count(*) as TotalBadges
+    from Badges
+    group by UserId
+),
+TopPostHistories as (
+    select 
+        ph.PostId,
+        max(ph.CreationDate) as LastEditDate,
+        max(case when ph.PostHistoryTypeId = 10 then 1 else 0 end) as WasClosed,
+        max(case when ph.PostHistoryTypeId = 11 then 1 else 0 end) as WasReopened,
+        count(*) as TotalEdits
+    from PostHistory ph
+    where ph.PostId in (select Id from RecentTopPosts where rn <= 20)
+    group by ph.PostId
+),
+PostCommentCounts as (
+    select 
+        PostId,
+        count(*) as CommentCount,
+        sum(case when Score > 0 then 1 else 0 end) as PositiveComments
+    from Comments
+    group by PostId
+),
+AnswerStats as (
+    select
+        p.ParentId as QuestionId,
+        count(p.Id) as AnswerCount,
+        sum(p.Score) as TotalAnswerScore,
+        avg(p.Score) as AvgAnswerScore,
+        max(p.Score) as MaxAnswerScore,
+        bool_or(p.Score > 10) as HasHighlyRatedAnswer
+    from Posts p
+    where p.PostTypeId = 2
+    group by p.ParentId
+),
+PostVotesSummary as (
+    select
+        v.PostId,
+        sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+        sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes,
+        sum(case when vt.Name = 'Favorite' then 1 else 0 end) as Favorites,
+        sum(case when vt.Name = 'Close' then 1 else 0 end) as CloseVotes
+    from Votes v
+    join VoteTypes vt on vt.Id = v.VoteTypeId
+    group by v.PostId
+),
+QuestionTagExplode as (
+    select 
+        p.Id as PostId,
+        unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')) as Tag
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+),
+TagActivity as (
+    select 
+        t.TagName,
+        count(distinct qe.PostId) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        avg(p.Score) filter (where p.PostTypeId = 1) as AvgQuestionScore,
+        avg(p.Score) filter (where p.PostTypeId = 2) as AvgAnswerScore
+    from Tags t
+    left join QuestionTagExplode qe on qe.Tag = t.TagName
+    left join Posts p on p.Id = qe.PostId or p.ParentId = qe.PostId
+    group by t.TagName
+    having count(distinct qe.PostId) > 100
+),
+UserRecentActivity as (
+    select 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        max(ph.CreationDate) as LastActivity,
+        count(distinct ph.PostId) as PostsEdited,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsPosted,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersPosted,
+        row_number() over (order by max(ph.CreationDate) desc) as rn_activity
+    from Users u
+    left join PostHistory ph on ph.UserId = u.Id
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+    having count(distinct ph.PostId) > 0
+)
+select 
+    rt.PostTypeId,
+    rt.Id as PostId,
+    rt.CreationDate,
+    rt.Score,
+    rt.ViewCount,
+    rt.AnswerCount,
+    rt.FavoriteCount,
+    coalesce(ph.LastEditDate, rt.CreationDate) as LastModified,
+    ph.WasClosed,
+    ph.WasReopened,
+    ph.TotalEdits,
+    coalesce(bc.GoldBadges, 0) as GoldBadges,
+    coalesce(bc.SilverBadges, 0) as SilverBadges,
+    coalesce(bc.BronzeBadges, 0) as BronzeBadges,
+    coalesce(pc.CommentCount,0) as Comments,
+    coalesce(pc.PositiveComments, 0) as PositiveComments,
+    coalesce(av.AnswerCount, 0) as NumAnswers,
+    av.AvgAnswerScore,
+    av.MaxAnswerScore,
+    coalesce(av.HasHighlyRatedAnswer, false) as HasHighlyRatedAnswer,
+    coalesce(pv.UpVotes, 0) as UpVotes,
+    coalesce(pv.DownVotes, 0) as DownVotes,
+    coalesce(pv.Favorites, 0) as Favorites,
+    coalesce(pv.CloseVotes, 0) as CloseVotes,
+    rt.OwnerName,
+    rt.OwnerReputation,
+    ua.DisplayName as LastEditor,
+    ua.Reputation as LastEditorReputation,
+    concat(
+      'Post #', rt.Id::text,
+      ' [Type: ', coalesce(pt.Name, 'Unknown'),
+      '] Tags: ', coalesce(rt.Tags, 'None'),
+      ' - Owner: ', coalesce(rt.OwnerName, 'Unknown'),
+      ' (Rep=', coalesce(cast(rt.OwnerReputation as text), '0'), ')'
+    ) as SummaryInfo,
+    rank() over (
+      partition by date_trunc('month', rt.CreationDate)
+      order by rt.Score desc, rt.ViewCount desc
+    ) as MonthlyRank,
+    (select count(*) from PostLinks pl where pl.PostId = rt.Id and pl.LinkTypeId = 1) as OutgoingLinks,
+    (select count(*) from PostLinks pl where pl.RelatedPostId = rt.Id and pl.LinkTypeId = 3) as DuplicateLinks
+from RecentTopPosts rt
+join PostTypes pt on pt.Id = rt.PostTypeId
+left join TopPostHistories ph on ph.PostId = rt.Id
+left join BadgeSummary bc on bc.UserId = rt.OwnerUserId
+left join PostCommentCounts pc on pc.PostId = rt.Id
+left join AnswerStats av on av.QuestionId = rt.Id and rt.PostTypeId = 1
+left join PostVotesSummary pv on pv.PostId = rt.Id
+left join Users ua on ua.Id = (
+    select ph2.UserId 
+    from PostHistory ph2 
+    where ph2.PostId = rt.Id and ph2.CreationDate = (
+        select max(CreationDate) from PostHistory ph3 where ph3.PostId = rt.Id
+    ) fetch first 1 row only
+)
+where rt.rn <= 50
+
+union
+
+select
+    1 as PostTypeId,
+    t.Id as PostId,
+    cast('2024-10-01' as date) as CreationDate,
+    0 as Score,
+    0 as ViewCount,
+    0 as AnswerCount,
+    0 as FavoriteCount,
+    cast('2024-10-01' as date) as LastModified,
+    0 as WasClosed,
+    0 as WasReopened,
+    0 as TotalEdits,
+    0 as GoldBadges,
+    0 as SilverBadges,
+    0 as BronzeBadges,
+    0 as Comments,
+    0 as PositiveComments,
+    0 as NumAnswers,
+    0 as AvgAnswerScore,
+    0 as MaxAnswerScore,
+    false as HasHighlyRatedAnswer,
+    0 as UpVotes,
+    0 as DownVotes,
+    0 as Favorites,
+    0 as CloseVotes,
+    'System' as OwnerName,
+    0 as OwnerReputation,
+    'System' as LastEditor,
+    0 as LastEditorReputation,
+    concat('Tag: ', t.TagName, ' with ', coalesce(cast(ta.QuestionCount as text), '0'), ' questions') as SummaryInfo,
+    0 as MonthlyRank,
+    0 as OutgoingLinks,
+    0 as DuplicateLinks
+from Tags t
+left join TagActivity ta on ta.TagName = t.TagName
+where ta.QuestionCount > 500
+order by PostTypeId desc, Score desc nulls last
+limit 100;

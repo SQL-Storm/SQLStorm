@@ -1,0 +1,146 @@
+WITH UserAgg AS (
+    SELECT 
+        u.Id                         AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id)                  AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        COALESCE((SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1),0) AS GoldBadges,
+        COALESCE((SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2),0) AS SilverBadges,
+        COALESCE((SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3),0) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+PostStats AS (
+    SELECT 
+        p.Id                              AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        COALESCE(p.AcceptedAnswerId,0)    AS AcceptedAnswerId,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpVotes,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS DownVotes,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id)                 AS CommentCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate) AS RankByScore,
+        CASE
+            WHEN p.Tags IS NULL THEN NULL
+            ELSE (
+                SELECT string_agg(t.TagName, '|')
+                FROM regexp_split_to_table(substring(p.Tags, 2, length(p.Tags)-2), '><') AS tag(tag)
+                JOIN Tags t ON t.TagName = tag.tag
+            )
+        END AS TagList
+    FROM Posts p
+    WHERE p.PostTypeId IN (1,2)
+),
+
+LatestComment AS (
+    SELECT 
+        c.PostId,
+        c.Id                                   AS CommentId,
+        c.Text,
+        c.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY c.PostId ORDER BY c.CreationDate DESC) AS rn
+    FROM Comments c
+),
+
+CloseInfo AS (
+    SELECT 
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        TRY_CAST(ph.Comment AS integer)                AS CloseReasonId,
+        ph.CreationDate                        AS CloseDate,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10
+),
+
+Combined AS (
+    SELECT 
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.TotalPosts,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.GoldBadges,
+        ua.SilverBadges,
+        ua.BronzeBadges,
+        ps.PostId,
+        ps.PostTypeId,
+        ps.Title,
+        ps.Score,
+        ps.ViewCount,
+        ps.UpVotes,
+        ps.DownVotes,
+        ps.CommentCount,
+        ps.RankByScore,
+        COALESCE(ci.CloseReasonId,0)            AS CloseReasonId,
+        ci.CloseDate,
+        lc.Text                                 AS LatestCommentText,
+        ps.TagList
+    FROM UserAgg ua
+    LEFT JOIN PostStats ps      ON ps.OwnerUserId = ua.UserId
+    LEFT JOIN CloseInfo ci      ON ci.PostId = ps.PostId AND ci.rn = 1
+    LEFT JOIN LatestComment lc  ON lc.PostId = ps.PostId AND lc.rn = 1
+    WHERE ua.Reputation > 10000
+      AND (ps.Score IS NOT NULL AND ps.Score >= 5)
+      AND (ps.RankByScore <= 3 OR ua.GoldBadges > 5)
+)
+
+SELECT *
+FROM (
+    SELECT *
+    FROM Combined
+    WHERE (TagList IS NOT NULL AND TagList ILIKE '%sql%')
+       OR (CloseReasonId = 101)
+    ORDER BY Reputation DESC, Score DESC
+    LIMIT 100
+
+    UNION ALL
+
+    SELECT 
+        NULL                                        AS UserId,
+        NULL                                        AS DisplayName,
+        NULL                                        AS Reputation,
+        NULL                                        AS TotalPosts,
+        NULL                                        AS QuestionCount,
+        NULL                                        AS AnswerCount,
+        NULL                                        AS GoldBadges,
+        NULL                                        AS SilverBadges,
+        NULL                                        AS BronzeBadges,
+        p.Id                                        AS PostId,
+        p.PostTypeId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpVotes,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS DownVotes,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id)                 AS CommentCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS RankByScore,
+        NULL                                        AS CloseReasonId,
+        NULL                                        AS CloseDate,
+        NULL                                        AS LatestCommentText,
+        NULL                                        AS TagList
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate > (CAST('2024-10-01' AS DATE) - INTERVAL '30' DAY)
+      AND p.Score BETWEEN -5 AND 5
+      AND p.Tags IS NOT NULL
+      AND NOT EXISTS (
+            SELECT 1 FROM Votes v
+            WHERE v.PostId = p.Id
+              AND v.VoteTypeId = 2
+              AND v.UserId = p.OwnerUserId
+        )
+    ORDER BY Score DESC
+    LIMIT 50
+) AS unioned
+ORDER BY Reputation DESC NULLS LAST, Score DESC NULLS LAST;

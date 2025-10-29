@@ -1,0 +1,223 @@
+WITH UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.Views AS ProfileViews,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPostsAuthored,
+        SUM(CASE WHEN p.PostTypeId = (SELECT Id FROM PostTypes WHERE Name = 'Question') THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = (SELECT Id FROM PostTypes WHERE Name = 'Answer') THEN 1 ELSE 0 END) AS AnswerCount,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostScoreReceived,
+        SUM(COALESCE(c.Score, 0)) AS TotalCommentScoreReceived,
+        COUNT(DISTINCT b.Id) AS TotalBadgesEarned,
+        MAX(u.LastAccessDate) AS LastActivityDate,
+        AVG(CASE WHEN LENGTH(TRIM(COALESCE(c.Text, ''))) > 0 THEN LENGTH(TRIM(c.Text)) ELSE NULL END) AS AvgCommentLength,
+        CASE WHEN EXISTS (
+            SELECT 1
+            FROM Posts sqp
+            WHERE sqp.OwnerUserId = u.Id
+              AND sqp.PostTypeId = (SELECT Id FROM PostTypes WHERE Name = 'Question')
+              AND (LOWER(sqp.Tags) LIKE '%<performance>%' OR LOWER(sqp.Title) LIKE '%performance%')
+        ) THEN TRUE ELSE FALSE END AS HasPerformanceRelatedQuestion,
+        CASE WHEN u.Reputation > COALESCE((
+            SELECT AVG(u2.Reputation)
+            FROM Users u2
+            WHERE EXTRACT(YEAR FROM u2.CreationDate) = EXTRACT(YEAR FROM u.CreationDate)
+        ), 0) THEN TRUE ELSE FALSE END AS AboveAvgReputationForCohort
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Views, u.UpVotes, u.DownVotes, u.LastAccessDate
+),
+PostQualityHistoryExtended AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.OwnerUserId,
+        p.CreationDate,
+        COALESCE(p.Score, 0) AS PostScore,
+        COALESCE(p.ViewCount, 0) AS PostViewCount,
+        COALESCE(p.AnswerCount, 0) AS PostAnswerCount,
+        COALESCE(p.CommentCount, 0) AS PostCommentCount,
+        COALESCE(p.FavoriteCount, 0) AS PostFavoriteCount,
+        p.Title,
+        p.Tags,
+        p.ClosedDate,
+        p.LastEditDate,
+        ph_closed.Comment AS CloseReasonComment,
+        (
+            COALESCE(p.Score, 0) * 0.35 +
+            COALESCE(p.ViewCount, 0) * 0.05 +
+            COALESCE(NULLIF(p.AnswerCount, 0), 0) * 0.25 +
+            COALESCE(p.FavoriteCount, 0) * 0.25 +
+            COALESCE(p.CommentCount, 0) * 0.10
+        ) AS PostQualityIndex,
+        (SELECT COUNT(ph.Id) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (SELECT Id FROM PostHistoryTypes WHERE Name LIKE 'Edit %')) AS TotalEditRevisions,
+        (SELECT COUNT(ph.Id) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId = (SELECT Id FROM PostHistoryTypes WHERE Name = 'Post Closed')) AS TotalCloseEvents,
+        (SELECT COUNT(ph.Id) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId = (SELECT Id FROM PostHistoryTypes WHERE Name = 'Post Reopened')) AS TotalReopenEvents,
+        AVG(COALESCE(p.Score, 0)) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS RunningAvgUserPostScore,
+        COALESCE(p.Score, 0) - LAG(COALESCE(p.Score, 0), 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS ScoreDeltaFromPreviousPost,
+        CASE
+            WHEN p.PostTypeId = (SELECT Id FROM PostTypes WHERE Name = 'Answer') AND
+                 p.Id = (SELECT pa.AcceptedAnswerId FROM Posts pa WHERE pa.Id = p.ParentId)
+            THEN 'Accepted Answer'
+            WHEN p.PostTypeId = (SELECT Id FROM PostTypes WHERE Name = 'Answer')
+            THEN 'Unaccepted Answer'
+            ELSE 'N/A'
+        END AS AnswerStatus,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC, p.Score DESC) AS PostTypeCreationRank
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN PostHistory ph_closed ON p.Id = ph_closed.PostId AND ph_closed.PostHistoryTypeId = (SELECT Id FROM PostHistoryTypes WHERE Name = 'Post Closed')
+    WHERE p.OwnerUserId IS NOT NULL
+      AND p.PostTypeId IN ((SELECT Id FROM PostTypes WHERE Name = 'Question'), (SELECT Id FROM PostTypes WHERE Name = 'Answer'))
+),
+AggregatedUserPostStats AS (
+    SELECT
+        pqhe.OwnerUserId AS UserId,
+        COUNT(pqhe.PostId) AS UserTotalPosts,
+        SUM(pqhe.PostQualityIndex) AS UserTotalQualityIndex,
+        AVG(pqhe.PostQualityIndex) AS UserAvgPostQualityIndex,
+        SUM(pqhe.TotalEditRevisions) AS TotalEditsMadeOnUserPosts,
+        SUM(pqhe.TotalCloseEvents) AS TotalCloseEventsOnUserPosts,
+        SUM(pqhe.TotalReopenEvents) AS TotalReopenEventsOnUserPosts,
+        AVG(CASE WHEN pqhe.PostTypeName = 'Question' THEN pqhe.PostQualityIndex ELSE NULL END) AS AvgQuestionQualityIndex,
+        AVG(CASE WHEN pqhe.PostTypeName = 'Answer' THEN pqhe.PostQualityIndex ELSE NULL END) AS AvgAnswerQualityIndex,
+        MAX(pqhe.PostScore) AS MaxSinglePostScore,
+        MAX(pqhe.PostViewCount) AS MaxSinglePostViewCount,
+        CASE WHEN EXISTS (
+            SELECT 1 FROM PostLinks pl
+            WHERE pl.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = pqhe.OwnerUserId)
+            AND pl.LinkTypeId IN ((SELECT Id FROM LinkTypes WHERE Name = 'Duplicate'), (SELECT Id FROM LinkTypes WHERE Name = 'Linked'))
+        ) THEN TRUE ELSE FALSE END AS HasAssociatedLinks,
+        CASE WHEN EXISTS (
+            SELECT 1 FROM PostHistory ph_reason
+            WHERE ph_reason.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = pqhe.OwnerUserId)
+            AND ph_reason.PostHistoryTypeId = (SELECT Id FROM PostHistoryTypes WHERE Name = 'Post Closed')
+            AND ph_reason.Comment = CAST((SELECT Id FROM CloseReasonTypes WHERE Name = 'Off-topic') AS VARCHAR)
+        ) THEN TRUE ELSE FALSE END AS HasOffTopicClosure
+    FROM PostQualityHistoryExtended pqhe
+    GROUP BY pqhe.OwnerUserId
+),
+ProblematicTagAnalysis AS (
+    SELECT
+        TRIM(tag) AS TagName,
+        EXTRACT(YEAR FROM p.CreationDate) AS TagYear,
+        COUNT(*) AS PostsWithTag,
+        AVG(COALESCE(p.Score, 0)) AS AvgScoreForTag,
+        AVG(COALESCE(p.ViewCount, 0)) AS AvgViewsForTag,
+        SUM(CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END) AS ClosedPostsWithTag,
+        COALESCE(SUM(CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END) * 1.0 / NULLIF(COUNT(*), 0), 0) AS ClosureRateForTag
+    FROM Posts p
+    JOIN (
+        WITH RECURSIVE tag_split(post_id, tags_remaining, tag) AS (
+            SELECT p0.Id,
+                   CASE WHEN p0.Tags IS NULL THEN '' ELSE p0.Tags END,
+                   NULL
+            FROM Posts p0
+            WHERE p0.PostTypeId = (SELECT Id FROM PostTypes WHERE Name = 'Question')
+              AND p0.Tags IS NOT NULL AND LENGTH(TRIM(p0.Tags)) > 2
+              AND p0.Id = p.Id
+            UNION ALL
+            SELECT post_id,
+                   CASE
+                     WHEN POSITION('>' IN tags_remaining) = 0 THEN ''
+                     ELSE SUBSTR(tags_remaining, POSITION('>' IN tags_remaining) + 1)
+                   END,
+                   CASE
+                     WHEN POSITION('>' IN tags_remaining) = 0 THEN TRIM(tags_remaining)
+                     ELSE TRIM(SUBSTR(tags_remaining, 2, POSITION('>' IN tags_remaining) - 2))
+                   END
+            FROM tag_split
+            WHERE tags_remaining <> ''
+        )
+        SELECT post_id, tag FROM tag_split WHERE tag IS NOT NULL AND tag <> ''
+    ) ts ON ts.post_id = p.Id
+    WHERE p.PostTypeId = (SELECT Id FROM PostTypes WHERE Name = 'Question')
+      AND p.Tags IS NOT NULL AND LENGTH(TRIM(p.Tags)) > 2
+    GROUP BY TRIM(tag), EXTRACT(YEAR FROM p.CreationDate)
+    HAVING COUNT(*) >= 50
+),
+TopProblematicTags AS (
+    SELECT
+        pta.TagName,
+        pta.TagYear,
+        pta.PostsWithTag,
+        pta.AvgScoreForTag,
+        pta.AvgViewsForTag,
+        pta.ClosureRateForTag,
+        'LowScoreHighClosure' AS ProblemType,
+        RANK() OVER (PARTITION BY pta.TagYear ORDER BY pta.AvgScoreForTag ASC, pta.ClosureRateForTag DESC) AS RankWithinYear
+    FROM ProblematicTagAnalysis pta
+    WHERE pta.AvgScoreForTag < 10 AND pta.ClosureRateForTag > 0.30
+    UNION ALL
+    SELECT
+        pta.TagName,
+        pta.TagYear,
+        pta.PostsWithTag,
+        pta.AvgScoreForTag,
+        pta.AvgViewsForTag,
+        pta.ClosureRateForTag,
+        'HighViewLowEngagement' AS ProblemType,
+        RANK() OVER (PARTITION BY pta.TagYear ORDER BY pta.AvgViewsForTag DESC, pta.AvgScoreForTag ASC) AS RankWithinYear
+    FROM ProblematicTagAnalysis pta
+    WHERE pta.AvgViewsForTag > 5000 AND pta.AvgScoreForTag < 5
+)
+SELECT
+    ue.UserId,
+    ue.DisplayName,
+    ue.Reputation,
+    ue.UserCreationDate,
+    ue.LastActivityDate,
+    ue.ProfileViews,
+    ue.TotalPostsAuthored,
+    ue.QuestionCount,
+    ue.AnswerCount,
+    ue.TotalCommentsMade,
+    ue.TotalBadgesEarned,
+    COALESCE(ue.AvgCommentLength, 0.0) AS UserAvgCommentLength,
+    ue.HasPerformanceRelatedQuestion,
+    ue.AboveAvgReputationForCohort,
+    aups.UserTotalQualityIndex,
+    aups.UserAvgPostQualityIndex,
+    aups.AvgQuestionQualityIndex,
+    aups.AvgAnswerQualityIndex,
+    aups.MaxSinglePostScore,
+    aups.MaxSinglePostViewCount,
+    aups.TotalEditsMadeOnUserPosts,
+    aups.TotalCloseEventsOnUserPosts,
+    aups.TotalReopenEventsOnUserPosts,
+    aups.HasAssociatedLinks,
+    aups.HasOffTopicClosure,
+    DENSE_RANK() OVER (ORDER BY ue.Reputation DESC, aups.UserTotalQualityIndex DESC) AS UserOverallRank,
+    NTILE(10) OVER (ORDER BY COALESCE(aups.AvgAnswerQualityIndex, 0) DESC) AS AnswerQualityDecile,
+    (ue.DisplayName || ' (Rep: ' || CAST(ue.Reputation AS VARCHAR) || ') - ' ||
+        CASE
+            WHEN ue.AboveAvgReputationForCohort AND aups.UserAvgPostQualityIndex > 100 THEN 'High-Impact Contributor'
+            WHEN aups.TotalCloseEventsOnUserPosts > aups.TotalReopenEventsOnUserPosts AND aups.HasOffTopicClosure THEN 'Content-Challenged User'
+            WHEN ue.QuestionCount > ue.AnswerCount AND ue.TotalPostsAuthored > 20 THEN 'Question-Focused Expert'
+            ELSE 'General Participant'
+        END ||
+        ' (Posts: ' || CAST(ue.TotalPostsAuthored AS VARCHAR) || ', Badges: ' || CAST(ue.TotalBadgesEarned AS VARCHAR) || ')'
+    ) AS UserSummaryDescription,
+    tpt.ProblemType AS TopProblematicTagType,
+    tpt.TagName AS TopProblematicTagName,
+    tpt.TagYear AS TopProblematicTagYear,
+    tpt.ClosureRateForTag AS TopProblematicTagClosureRate
+FROM UserEngagement ue
+LEFT JOIN AggregatedUserPostStats aups ON ue.UserId = aups.UserId
+LEFT JOIN TopProblematicTags tpt ON ue.HasPerformanceRelatedQuestion = TRUE AND tpt.TagName = 'performance' AND tpt.RankWithinYear = 1
+WHERE ue.Reputation >= 5000
+  AND COALESCE(aups.UserTotalQualityIndex, 0) > 0
+  AND (
+      aups.AvgQuestionQualityIndex > (SELECT AVG(AvgQuestionQualityIndex) FROM AggregatedUserPostStats)
+      OR aups.AvgAnswerQualityIndex > (SELECT AVG(AvgAnswerQualityIndex) FROM AggregatedUserPostStats)
+  )
+ORDER BY UserOverallRank ASC, ue.LastActivityDate DESC
+LIMIT 500;

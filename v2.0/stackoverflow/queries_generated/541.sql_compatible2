@@ -1,0 +1,326 @@
+with recent_questions as (
+    select
+        q.Id as QuestionId,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        coalesce(q.OwnerUserId, -1) as OwnerUserId,
+        q.Title,
+        q.Tags,
+        q.AcceptedAnswerId,
+        array_length(string_to_array(substring(q.Tags, 2, greatest(length(q.Tags)-2,0)), '><'), 1) as TagCount
+    from Posts q
+    where q.PostTypeId = 1
+      and q.CreationDate >= (select date_trunc('month', max(CreationDate)) - interval '12 months' from Posts where PostTypeId = 1)
+),
+user_activity as (
+    select
+        u.Id as UserId,
+        u.Reputation,
+        u.CreationDate as UserCreated,
+        u.Location,
+        u.UpVotes,
+        u.DownVotes,
+        u.Views as ProfileViews,
+        count(distinct p.Id) filter (where p.PostTypeId in (1,2)) as TotalPosts,
+        coalesce(sum(case when v.VoteTypeId = 2 then 1 when v.VoteTypeId = 3 then -1 else 0 end), 0) as NetVotes,
+        count(distinct b.Id) as BadgeCount,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Votes v on v.PostId = p.Id and v.VoteTypeId in (2,3)
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.Reputation, u.CreationDate, u.Location, u.UpVotes, u.DownVotes, u.Views
+),
+question_metrics as (
+    select
+        rq.QuestionId,
+        rq.OwnerUserId,
+        rq.CreationDate,
+        rq.Score,
+        rq.ViewCount,
+        rq.TagCount,
+        rq.Title,
+        rq.Tags,
+        case when rq.AcceptedAnswerId is not null then 1 else 0 end as HasAcceptedAnswer,
+        count(a.Id) as AnswerCount,
+        max(a.Score) as MaxAnswerScore,
+        sum(case when a.Score > 0 then 1 else 0 end) as PositiveAnswers,
+        avg(nullif(a.Score, 0)) as AvgNonZeroAnswerScore
+    from recent_questions rq
+    left join Posts a on a.ParentId = rq.QuestionId and a.PostTypeId = 2
+    group by rq.QuestionId, rq.OwnerUserId, rq.CreationDate, rq.Score, rq.ViewCount, rq.TagCount, rq.Title, rq.Tags, rq.AcceptedAnswerId
+),
+tag_expansion as (
+    select
+        qm.QuestionId,
+        unnest(string_to_array(substring(qm.Tags, 2, greatest(length(qm.Tags)-2,0)), '><')) as Tag
+    from question_metrics qm
+    where qm.Tags is not null and qm.Tags like '<%>'
+),
+tag_rank as (
+    select
+        te.Tag,
+        count(*) as TagUses,
+        dense_rank() over (order by count(*) desc, min(te.Tag)) as TagPopularityRank
+    from tag_expansion te
+    group by te.Tag
+),
+dup_links as (
+    select
+        pl.PostId as QuestionId,
+        count(*) as DuplicateRefs
+    from PostLinks pl
+    where pl.LinkTypeId = 3
+    group by pl.PostId
+),
+closings as (
+    select
+        ph.PostId as QuestionId,
+        min(ph.CreationDate) as FirstClosedAt,
+        max(ph.CreationDate) as LastClosedAt,
+        count(*) as CloseEvents,
+        count(*) filter (where ph.Comment ~ '^[0-9]+$') as CloseEventsWithReasonId,
+        max(case when ph.Comment ~ '^[0-9]+$' then ph.Comment else null end) as AnyCloseReasonText
+    from PostHistory ph
+    where ph.PostHistoryTypeId = 10
+    group by ph.PostId
+),
+reopens as (
+    select
+        ph.PostId as QuestionId,
+        count(*) as ReopenEvents,
+        min(ph.CreationDate) as FirstReopenAt
+    from PostHistory ph
+    where ph.PostHistoryTypeId = 11
+    group by ph.PostId
+),
+favorites as (
+    select
+        v.PostId as QuestionId,
+        count(*) as FavoriteCount,
+        count(distinct v.UserId) as DistinctFavoriters
+    from Votes v
+    where v.VoteTypeId = 5
+    group by v.PostId
+),
+comment_stats as (
+    select
+        c.PostId as QuestionId,
+        count(*) as CommentCount,
+        sum(c.Score) as CommentScoreSum,
+        max(c.Score) as MaxCommentScore,
+        avg(c.Score) as AvgCommentScore
+    from Comments c
+    group by c.PostId
+),
+question_enriched as (
+    select
+        qm.*,
+        coalesce(dl.DuplicateRefs, 0) as DuplicateRefs,
+        coalesce(cl.CloseEvents, 0) as CloseEvents,
+        cl.FirstClosedAt,
+        cl.LastClosedAt,
+        coalesce(ro.ReopenEvents, 0) as ReopenEvents,
+        ro.FirstReopenAt,
+        coalesce(fav.FavoriteCount, 0) as FavoriteCount,
+        coalesce(fav.DistinctFavoriters, 0) as DistinctFavoriters,
+        coalesce(cs.CommentCount, 0) as CommentCount,
+        coalesce(cs.CommentScoreSum, 0) as CommentScoreSum,
+        cs.MaxCommentScore,
+        cs.AvgCommentScore
+    from question_metrics qm
+    left join dup_links dl on dl.QuestionId = qm.QuestionId
+    left join closings cl on cl.QuestionId = qm.QuestionId
+    left join reopens ro on ro.QuestionId = qm.QuestionId
+    left join favorites fav on fav.QuestionId = qm.QuestionId
+    left join comment_stats cs on cs.QuestionId = qm.QuestionId
+),
+owner_join as (
+    select
+        qe.*,
+        ua.Reputation as OwnerReputation,
+        ua.TotalPosts as OwnerTotalPosts,
+        ua.NetVotes as OwnerNetVotes,
+        ua.BadgeCount as OwnerBadges,
+        ua.GoldBadges as OwnerGold,
+        ua.SilverBadges as OwnerSilver,
+        ua.BronzeBadges as OwnerBronze,
+        ua.Location as OwnerLocation,
+        ua.UserCreated as OwnerCreated,
+        ua.ProfileViews as OwnerProfileViews
+    from question_enriched qe
+    left join user_activity ua on ua.UserId = qe.OwnerUserId
+),
+scored as (
+    select
+        oj.*,
+        (
+            coalesce(oj.Score,0) * 2
+            + coalesce(oj.ViewCount,0) * 0.01
+            + coalesce(oj.FavoriteCount,0) * 1.5
+            + coalesce(oj.DistinctFavoriters,0) * 2
+            + coalesce(oj.CommentCount,0) * 0.5
+            + coalesce(oj.AnswerCount,0) * 3
+            + coalesce(oj.MaxAnswerScore,0) * 1
+            - coalesce(oj.DuplicateRefs,0) * 2
+            - case when oj.CloseEvents > 0 then 5 else 0 end
+            + coalesce(oj.ReopenEvents,0) * 2
+            + coalesce(oj.OwnerReputation,0) * 0.002
+        ) as EngagementScore,
+        extract(epoch from (oj.LastActivityDate - oj.CreationDate)) / 3600.0 as HoursToLastActivity,
+        extract(epoch from (oj.FirstClosedAt - oj.CreationDate)) / 3600.0 as HoursToFirstClose,
+        extract(epoch from (oj.FirstReopenAt - oj.CreationDate)) / 3600.0 as HoursToFirstReopen
+    from (
+        select
+            o.*,
+            p.LastActivityDate
+        from owner_join o
+        left join Posts p on p.Id = o.QuestionId
+    ) oj
+),
+tag_anchor as (
+    select
+        s.QuestionId,
+        lower(coalesce(tr.Tag, split_part(s.Title, ' ', 1))) as AnchorToken
+    from scored s
+    left join lateral (
+        select te.Tag
+        from tag_expansion te
+        where te.QuestionId = s.QuestionId
+        order by (select TagPopularityRank from tag_rank tr where tr.Tag = te.Tag) nulls last, te.Tag
+        limit 1
+    ) tr on true
+),
+string_analytics as (
+    select
+        s.QuestionId,
+        length(coalesce(s.Title,'')) as TitleLen,
+        length(regexp_replace(coalesce(s.Title,''), '\s+', '', 'g')) as TitleLenNoSpace,
+        strpos(lower(coalesce(s.Title,'')), 'how') as PosHow,
+        strpos(lower(coalesce(s.Title,'')), 'why') as PosWhy,
+        (length(coalesce(s.Title,'')) - length(replace(coalesce(s.Title,''), '?', ''))) as QuestionMarkCount,
+        case when regexp_match(coalesce(s.Title,''), '(^|\\s)\\[.*\\]') is not null then 1 else 0 end as HasBracketedPrefix
+    from scored s
+),
+ranked as (
+    select
+        s.*,
+        ta.AnchorToken,
+        sa.TitleLen,
+        sa.TitleLenNoSpace,
+        sa.PosHow,
+        sa.PosWhy,
+        sa.QuestionMarkCount,
+        sa.HasBracketedPrefix,
+        row_number() over (partition by coalesce(s.OwnerUserId, -1) order by s.EngagementScore desc nulls last, s.CreationDate desc) as rn_owner_score,
+        dense_rank() over (order by s.EngagementScore desc nulls last) as dr_global_score,
+        ntile(10) over (order by s.EngagementScore desc nulls last) as decile_score,
+        count(*) over () as total_rows_window
+    from scored s
+    left join tag_anchor ta on ta.QuestionId = s.QuestionId
+    left join string_analytics sa on sa.QuestionId = s.QuestionId
+),
+owner_cohort as (
+    select
+        r.*,
+        case
+            when coalesce(r.OwnerReputation,0) >= 100000 then 'Legend'
+            when coalesce(r.OwnerReputation,0) >= 20000 then 'Expert'
+            when coalesce(r.OwnerReputation,0) >= 5000 then 'Advanced'
+            when coalesce(r.OwnerReputation,0) >= 1000 then 'Intermediate'
+            when r.OwnerReputation is null then 'Unknown'
+            else 'Beginner'
+        end as RepCohort
+    from ranked r
+),
+finalized as (
+    select
+        oc.*,
+        sum(case when oc.HasAcceptedAnswer = 1 then 1 else 0 end) over () as total_with_accepted,
+        sum(case when oc.CloseEvents > 0 then 1 else 0 end) over () as total_closed,
+        sum(case when oc.ReopenEvents > 0 then 1 else 0 end) over () as total_reopened
+    from owner_cohort oc
+)
+select
+    f.QuestionId,
+    coalesce(u.DisplayName, '[unknown]') as OwnerName,
+    f.OwnerUserId,
+    f.OwnerReputation,
+    f.RepCohort,
+    f.OwnerBadges,
+    f.OwnerGold,
+    f.OwnerSilver,
+    f.OwnerBronze,
+    f.OwnerTotalPosts,
+    f.OwnerNetVotes,
+    f.OwnerLocation,
+    f.OwnerCreated,
+    f.OwnerProfileViews,
+    f.CreationDate,
+    f.Title,
+    f.Tags,
+    f.AnchorToken,
+    f.TitleLen,
+    f.TitleLenNoSpace,
+    f.QuestionMarkCount,
+    f.HasBracketedPrefix,
+    f.TagCount,
+    f.Score,
+    f.ViewCount,
+    f.AnswerCount,
+    f.PositiveAnswers,
+    f.MaxAnswerScore,
+    round(cast(f.AvgNonZeroAnswerScore as numeric), 3) as AvgNonZeroAnswerScore,
+    f.FavoriteCount,
+    f.DistinctFavoriters,
+    f.CommentCount,
+    f.CommentScoreSum,
+    f.MaxCommentScore,
+    round(cast(f.AvgCommentScore as numeric), 3) as AvgCommentScore,
+    f.DuplicateRefs,
+    f.CloseEvents,
+    f.ReopenEvents,
+    f.HasAcceptedAnswer,
+    round(cast(f.EngagementScore as numeric), 3) as EngagementScore,
+    round(cast(f.HoursToLastActivity as numeric), 3) as HoursToLastActivity,
+    round(cast(f.HoursToFirstClose as numeric), 3) as HoursToFirstClose,
+    round(cast(f.HoursToFirstReopen as numeric), 3) as HoursToFirstReopen,
+    f.rn_owner_score,
+    f.dr_global_score,
+    f.decile_score,
+    f.total_rows_window,
+    f.total_with_accepted,
+    f.total_closed,
+    f.total_reopened
+from finalized f
+left join Users u on u.Id = f.OwnerUserId
+where
+    (
+        (f.CloseEvents = 0 and f.DuplicateRefs = 0)
+        or
+        (f.ReopenEvents > 0 and f.CloseEvents > 0)
+    )
+    and coalesce(f.EngagementScore, -1e9) > (
+        select avg(x.EngagementScore) - stddev_pop(x.EngagementScore)
+        from scored x
+        where x.EngagementScore is not null
+    )
+    and not exists (
+        select 1
+        from PostLinks l
+        where l.PostId = f.QuestionId
+          and l.LinkTypeId = 1
+          and l.RelatedPostId = f.QuestionId
+    )
+    and (
+        f.OwnerReputation is null
+        or f.OwnerReputation >= coalesce((
+            select percentile_disc(0.25) within group (order by ua.Reputation)
+            from user_activity ua
+        ), 0)
+    )
+order by f.dr_global_score asc, f.rn_owner_score asc, f.QuestionId
+limit 500;

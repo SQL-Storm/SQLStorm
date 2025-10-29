@@ -1,0 +1,132 @@
+WITH
+UserStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END),0) AS GoldBadges,
+        COALESCE(SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END),0) AS SilverBadges,
+        COALESCE(SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END),0) AS BronzeBadges,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS UpVoteCount,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS DownVoteCount,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Badges b      ON b.UserId = u.Id
+    LEFT JOIN Posts  p      ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes  v      ON v.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopUsers AS (
+    SELECT *
+    FROM UserStats
+    WHERE Reputation > 10000
+    ORDER BY (GoldBadges*3 + SilverBadges*2 + BronzeBadges) DESC,
+             Reputation DESC
+    LIMIT 100
+),
+TagInfo AS (
+    SELECT
+        t.Id               AS TagId,
+        t.TagName,
+        t.Count            AS TagUseCount,
+        COALESCE(e.Title,'') AS ExcerptTitle,
+        COALESCE(w.Title,'') AS WikiTitle
+    FROM Tags t
+    LEFT JOIN Posts e ON e.Id = t.ExcerptPostId
+    LEFT JOIN Posts w ON w.Id = t.WikiPostId
+    WHERE t.IsModeratorOnly = FALSE
+),
+UserTagActivity AS (
+    SELECT
+        u.Id                AS UserId,
+        tg.TagName,
+        COUNT(*)            AS TaggedPosts,
+        SUM(p.Score)        AS TotalScore,
+        STRING_AGG(DISTINCT p.Title, '; ') AS SampleTitles,
+        ROW_NUMBER() OVER (PARTITION BY u.Id
+                           ORDER BY SUM(p.Score) DESC) AS rn
+    FROM Posts p
+    JOIN Users u ON u.Id = p.OwnerUserId
+    JOIN LATERAL (
+        SELECT unnest(string_to_array(
+                substring(p.Tags, 2, length(p.Tags)-2), '><')) AS tag
+    ) lt ON TRUE
+    JOIN TagInfo tg ON tg.TagName = lt.tag
+    WHERE p.PostTypeId = 1
+    GROUP BY u.Id, tg.TagName
+),
+RecentClosedDuplicates AS (
+    SELECT
+        ph.PostId,
+        ph.CreationDate                AS CloseDate,
+        ph.Comment                     AS CloseReasonId,
+        jsonb_extract_path_text(ph.Text, 'OriginalQuestionIds') AS DuplicateIds,
+        p.Title,
+        p.OwnerUserId,
+        u.DisplayName                  AS OwnerDisplayName
+    FROM PostHistory ph
+    JOIN Posts p      ON p.Id = ph.PostId
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE ph.PostHistoryTypeId = 10
+      AND ph.Comment = '101'
+    ORDER BY ph.CreationDate DESC
+    LIMIT 50
+)
+SELECT
+    tu.Id,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.GoldBadges,
+    tu.SilverBadges,
+    tu.BronzeBadges,
+    tu.QuestionCount,
+    tu.AnswerCount,
+    tu.UpVoteCount,
+    tu.DownVoteCount,
+    tu.LastPostDate,
+    COALESCE(uta.TagName,      'N/A')          AS FavoriteTag,
+    COALESCE(uta.TaggedPosts, 0)               AS TaggedPosts,
+    COALESCE(uta.TotalScore,  0)               AS TagScore,
+    uta.SampleTitles,
+    rc.Title            AS RecentlyClosedDuplicateTitle,
+    rc.CloseDate,
+    rc.DuplicateIds,
+    rc.OwnerDisplayName
+FROM TopUsers tu
+LEFT JOIN LATERAL (
+    SELECT *
+    FROM UserTagActivity uta
+    WHERE uta.UserId = tu.Id
+      AND uta.rn = 1
+) uta ON TRUE
+LEFT JOIN LATERAL (
+    SELECT *
+    FROM RecentClosedDuplicates rc
+    WHERE rc.OwnerUserId = tu.Id
+    ORDER BY rc.CloseDate DESC
+    LIMIT 1
+) rc ON TRUE
+GROUP BY
+    tu.Id,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.GoldBadges,
+    tu.SilverBadges,
+    tu.BronzeBadges,
+    tu.QuestionCount,
+    tu.AnswerCount,
+    tu.UpVoteCount,
+    tu.DownVoteCount,
+    tu.LastPostDate,
+    COALESCE(uta.TagName, 'N/A'),
+    COALESCE(uta.TaggedPosts, 0),
+    COALESCE(uta.TotalScore, 0),
+    uta.SampleTitles,
+    rc.Title,
+    rc.CloseDate,
+    rc.DuplicateIds,
+    rc.OwnerDisplayName
+ORDER BY (tu.GoldBadges*3 + tu.SilverBadges*2 + tu.BronzeBadges) DESC,
+         tu.Reputation DESC;

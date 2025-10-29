@@ -1,0 +1,194 @@
+-- {"query": "1710.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3221} 
+WITH UserMetrics AS (
+    -- Aggregates various metrics for each user, including post counts, badge info, and total scores.
+    SELECT
+        U.Id AS UserId,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS UserUpVotesGiven,
+        U.DownVotes AS UserDownVotesGiven,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        MAX(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS HasGoldBadge, -- Indicates if user has any gold badge
+        COUNT(DISTINCT P.Id) FILTER (WHERE P.PostTypeId = 1) AS TotalQuestionsAsked,
+        COUNT(DISTINCT P.Id) FILTER (WHERE P.PostTypeId = 2) AS TotalAnswersGiven,
+        SUM(P.Score) FILTER (WHERE P.PostTypeId = 1) AS TotalQuestionScore,
+        SUM(P.Score) FILTER (WHERE P.PostTypeId = 2) AS TotalAnswerScore,
+        -- Calculate the average post score for the user, handling division by zero with NULLIF
+        CAST(COALESCE(SUM(P.Score), 0) AS NUMERIC) / NULLIF(COUNT(DISTINCT P.Id), 0) AS AvgPostScore
+    FROM Users U
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    GROUP BY U.Id, U.Reputation, U.CreationDate, U.Views, U.UpVotes, U.DownVotes
+),
+PostHistoryAggregates AS (
+    -- Summarizes post history events for each post, counting major edits and close/delete actions.
+    SELECT
+        PH.PostId,
+        COUNT(PH.Id) AS TotalHistoryEvents,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS MajorEditCount, -- Edit Title, Body, Tags
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (10, 12) THEN 1 ELSE 0 END) AS CloseDeleteCount, -- Post Closed, Post Deleted
+        MAX(PH.CreationDate) AS LastHistoryActivityDate
+    FROM PostHistory PH
+    GROUP BY PH.PostId
+),
+PostLinkSummary AS (
+    -- Provides counts of linked and duplicate posts for each post.
+    SELECT
+        PL.PostId,
+        COUNT(DISTINCT PL.RelatedPostId) FILTER (WHERE PL.LinkTypeId = 1) AS LinkedPostCount,
+        COUNT(DISTINCT PL.RelatedPostId) FILTER (WHERE PL.LinkTypeId = 3) AS DuplicatePostCount
+    FROM PostLinks PL
+    GROUP BY PL.PostId
+),
+-- Branch 1: High Impact Questions Analysis
+HighImpactQuestions AS (
+    -- Focuses on questions with high scores, views, specific tags, and related user/history metrics.
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score,
+        P.ViewCount,
+        P.Title,
+        P.Tags,
+        P.AcceptedAnswerId,
+        UM.Reputation AS OwnerReputation,
+        UM.HasGoldBadge AS OwnerHasGoldBadge,
+        PHA.MajorEditCount,
+        PHA.CloseDeleteCount,
+        PLS.LinkedPostCount,
+        PLS.DuplicatePostCount,
+        COALESCE(P.FavoriteCount, 0) AS FavoriteCount, -- Coalesce NULL FavoriteCount to 0
+        CAST(P.Score AS NUMERIC) / NULLIF(P.ViewCount, 0) AS ScoreToViewRatio,
+        COALESCE(P.AnswerCount, 0) AS ActualAnswerCount,
+        -- Window function: Ranks questions by score within categories defined by specific tags.
+        RANK() OVER (PARTITION BY (CASE WHEN P.Tags LIKE '%<sql>%' THEN 'SQL' WHEN P.Tags LIKE '%<java>%' THEN 'Java' ELSE 'Other' END) ORDER BY P.Score DESC, P.ViewCount DESC) AS RankWithinTagCategory,
+        -- Correlated subquery: Counts comments from high-reputation users in the last 30 days of the post's life.
+        (SELECT COUNT(C.Id)
+         FROM Comments C
+         JOIN Users CU ON C.UserId = CU.Id
+         WHERE C.PostId = P.Id
+           AND CU.Reputation > 5000
+           AND C.CreationDate BETWEEN P.CreationDate AND (P.CreationDate + INTERVAL '30 days')
+        ) AS HighRepCommentCountInitialMonth,
+        -- String array operation: Calculates the number of tags on a question.
+        ARRAY_LENGTH(string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags)-2), '><'), 1) AS NumberOfTagsInQuestion,
+        'Question' AS RecordType,
+        NULL::INT AS ParentPostId, -- Placeholder for UNION ALL type compatibility
+        NULL::INT AS AcceptedAnswerScore -- Placeholder for UNION ALL type compatibility
+    FROM Posts P
+    JOIN UserMetrics UM ON P.OwnerUserId = UM.UserId
+    LEFT JOIN PostHistoryAggregates PHA ON P.Id = PHA.PostId
+    LEFT JOIN PostLinkSummary PLS ON P.Id = PLS.PostId
+    WHERE P.PostTypeId = 1 -- Only questions
+      AND P.Score > 10
+      AND P.ViewCount > 1000
+      AND P.CreationDate BETWEEN '2020-01-01' AND '2023-12-31'
+      AND (P.Tags LIKE '%<performance>%' OR P.Tags LIKE '%<optimization>%') -- Specific tag filtering
+      AND P.ClosedDate IS NULL -- Exclude closed questions
+),
+-- Branch 2: Elite Answerer Contributions
+EliteAnswerContributions AS (
+    -- Focuses on highly scored answers from high-reputation users, including checks for accepted answers.
+    SELECT
+        A.Id AS PostId,
+        A.PostTypeId,
+        A.OwnerUserId,
+        A.CreationDate AS PostCreationDate,
+        A.Score,
+        NULL::INT AS ViewCount, -- Answers do not have a direct ViewCount in Posts, use NULL for consistency
+        A.Title, -- Answers typically don't have titles in the Posts table
+        NULL::VARCHAR(4000) AS Tags, -- Answers do not have tags
+        NULL::INT AS AcceptedAnswerId, -- An answer itself cannot have an AcceptedAnswerId
+        UM.Reputation AS OwnerReputation,
+        UM.HasGoldBadge AS OwnerHasGoldBadge,
+        PHA.MajorEditCount,
+        PHA.CloseDeleteCount,
+        PLS.LinkedPostCount,
+        NULL::BIGINT AS DuplicatePostCount, -- Answers are not marked as duplicates in the same way questions are
+        COALESCE(A.FavoriteCount, 0) AS FavoriteCount, -- Coalesce NULL FavoriteCount to 0
+        NULL::NUMERIC AS ScoreToViewRatio, -- Not applicable for answers
+        NULL::INT AS ActualAnswerCount, -- Not applicable for answers
+        -- Window function: Divides elite answerers into 4 quartiles based on their reputation and answer score.
+        NTILE(4) OVER (ORDER BY UM.Reputation DESC, A.Score DESC) AS ReputationQuartileRank,
+        -- Correlated subquery: Retrieves the score of the parent question if this answer was accepted and the question had a high score.
+        (SELECT P.Score FROM Posts P WHERE P.Id = A.ParentId AND P.Score > 50 AND P.AcceptedAnswerId = A.Id) AS AcceptedAnswerForHighScoreQuestionScore,
+        NULL::INT AS NumberOfTagsInQuestion, -- Not applicable for answers
+        'Answer' AS RecordType,
+        A.ParentId AS ParentPostId,
+        A.Score AS AcceptedAnswerScore
+    FROM Posts A
+    JOIN UserMetrics UM ON A.OwnerUserId = UM.UserId
+    LEFT JOIN PostHistoryAggregates PHA ON A.Id = PHA.PostId
+    LEFT JOIN PostLinkSummary PLS ON A.Id = PLS.PostId
+    WHERE A.PostTypeId = 2 -- Only answers
+      AND A.Score > 50
+      AND UM.Reputation > 10000 -- From highly reputable users
+      AND A.CreationDate BETWEEN '2020-01-01' AND '2023-12-31'
+      AND A.OwnerUserId IS NOT NULL -- Exclude community-owned or deleted user answers
+)
+-- Final UNION ALL combining results from both branches for a comprehensive view.
+SELECT
+    CombinedResults.PostId,
+    CombinedResults.RecordType,
+    CombinedResults.OwnerUserId,
+    CombinedResults.OwnerReputation,
+    CombinedResults.PostCreationDate,
+    CombinedResults.Score,
+    CombinedResults.ViewCount,
+    CombinedResults.Title,
+    CombinedResults.Tags,
+    CombinedResults.MajorEditCount,
+    CombinedResults.CloseDeleteCount,
+    CombinedResults.LinkedPostCount,
+    CombinedResults.FavoriteCount,
+    CombinedResults.ScoreToViewRatio,
+    CombinedResults.ActualAnswerCount,
+    CombinedResults.NumberOfTagsInQuestion,
+    CombinedResults.OwnerHasGoldBadge,
+    CombinedResults.ParentPostId,
+    CombinedResults.AcceptedAnswerScore,
+    -- Window function: Retrieves the title of the owner's highest-scoring post among the combined results.
+    FIRST_VALUE(CombinedResults.Title) OVER (PARTITION BY CombinedResults.OwnerUserId ORDER BY CombinedResults.Score DESC, CombinedResults.PostCreationDate DESC) AS TopPostTitleByOwner,
+    -- Window function: Retrieves the creation date of the owner's earliest post among the combined results.
+    LAST_VALUE(CombinedResults.PostCreationDate) OVER (PARTITION BY CombinedResults.OwnerUserId ORDER BY CombinedResults.PostCreationDate ASC) AS OwnersFirstRelevantPostDate,
+    -- Complicated calculation: An 'Engagement Index' combining score, links, favorites, views, and edit history.
+    COALESCE(CombinedResults.Score, 0) * (1 + COALESCE(CombinedResults.LinkedPostCount, 0) + COALESCE(CombinedResults.FavoriteCount, 0))
+    / NULLIF(COALESCE(CombinedResults.ViewCount, 1) + COALESCE(CombinedResults.MajorEditCount, 0) + COALESCE(CombinedResults.CloseDeleteCount, 0) + 1, 0) AS EngagementIndex,
+    -- String expression with conditional logic to extract the primary tag for questions or mark answers.
+    CASE
+        WHEN CombinedResults.RecordType = 'Question' AND CombinedResults.Tags IS NOT NULL THEN
+            SUBSTRING(CombinedResults.Tags FROM POSITION('<' IN CombinedResults.Tags) + 1 FOR POSITION('>' IN CombinedResults.Tags) - POSITION('<' IN CombinedResults.Tags) - 1)
+        WHEN CombinedResults.RecordType = 'Answer' AND CombinedResults.ParentPostId IS NOT NULL THEN
+            'Answer_to_Q_' || CombinedResults.ParentPostId::text
+        ELSE 'N/A'
+    END AS PrimaryTagOrAnswerMarker,
+    -- Complicated predicate: Determines if the post is considered 'trending' based on recent activity relative to creation date.
+    (CombinedResults.PostCreationDate > (CURRENT_DATE - INTERVAL '6 months') AND CombinedResults.Score > 50)
+    OR
+    (CombinedResults.ViewCount IS NOT NULL AND CombinedResults.ViewCount > 5000 AND (CombinedResults.FavoriteCount > 10 OR CombinedResults.LinkedPostCount > 2)) AS IsTrending,
+    -- Correlated subquery (demonstration, could be optimized as a join): Checks if any other post by the same user has more linked posts.
+    (SELECT COUNT(P2.Id) FROM Posts P2 WHERE P2.OwnerUserId = CombinedResults.OwnerUserId AND COALESCE(PLS_sub.LinkedPostCount, 0) > COALESCE(CombinedResults.LinkedPostCount, 0)) AS MoreLinkedPostsBySameUser
+FROM (
+    SELECT
+        HIQ.PostId, HIQ.PostTypeId, HIQ.OwnerUserId, HIQ.PostCreationDate, HIQ.Score, HIQ.ViewCount, HIQ.Title, HIQ.Tags, HIQ.AcceptedAnswerId,
+        HIQ.OwnerReputation, HIQ.OwnerHasGoldBadge, HIQ.MajorEditCount, HIQ.CloseDeleteCount, HIQ.LinkedPostCount, HIQ.DuplicatePostCount, HIQ.FavoriteCount,
+        HIQ.ScoreToViewRatio, HIQ.ActualAnswerCount, HIQ.RankWithinTagCategory AS SpecificRank, HIQ.HighRepCommentCountInitialMonth AS SpecificMetric,
+        HIQ.NumberOfTagsInQuestion, HIQ.RecordType, HIQ.ParentPostId, HIQ.AcceptedAnswerScore
+    FROM HighImpactQuestions HIQ
+
+    UNION ALL
+
+    SELECT
+        EAC.PostId, EAC.PostTypeId, EAC.OwnerUserId, EAC.PostCreationDate, EAC.Score, EAC.ViewCount, EAC.Title, EAC.Tags, EAC.AcceptedAnswerId,
+        EAC.OwnerReputation, EAC.OwnerHasGoldBadge, EAC.MajorEditCount, EAC.CloseDeleteCount, EAC.LinkedPostCount, EAC.DuplicatePostCount, EAC.FavoriteCount,
+        EAC.ScoreToViewRatio, EAC.ActualAnswerCount, EAC.ReputationQuartileRank AS SpecificRank, EAC.AcceptedAnswerForHighScoreQuestionScore AS SpecificMetric,
+        EAC.NumberOfTagsInQuestion, EAC.RecordType, EAC.ParentPostId, EAC.AcceptedAnswerScore
+    FROM EliteAnswerContributions EAC
+) AS CombinedResults
+LEFT JOIN PostLinkSummary PLS_sub ON CombinedResults.PostId = PLS_sub.PostId -- Used in the "MoreLinkedPostsBySameUser" correlated subquery for clarity
+WHERE CombinedResults.EngagementIndex IS NOT NULL AND CombinedResults.EngagementIndex > 0 -- Filter out posts with no engagement or calculation issues
+ORDER BY CombinedResults.OwnerReputation DESC, CombinedResults.Score DESC, EngagementIndex DESC
+LIMIT 500;

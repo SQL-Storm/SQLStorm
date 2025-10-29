@@ -1,0 +1,177 @@
+WITH
+RecentActivePosts AS (
+  SELECT
+    p.Id,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.LastEditorUserId,
+    p.LastEditDate,
+    p.ContentLicense
+  FROM Posts p
+  WHERE p.LastActivityDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days'
+),
+TopUsers AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.UpVotes,
+    u.DownVotes,
+    u.Views,
+    u.Location,
+    u.WebsiteUrl,
+    u.AboutMe,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.UpVotes DESC, u.LastAccessDate DESC) AS rn
+  FROM Users u
+),
+TagInsights AS (
+  SELECT
+    t.TagName,
+    t.Count AS TagCount,
+    tl.TagPostId,
+    tl.TagName AS TagFromPost,
+    pr.Title AS PostTitle,
+    pr.Score AS PostScore,
+    pr.ViewCount AS PostViews,
+    pr.OwnerUserId AS PostOwner
+  FROM Tags t
+  LEFT JOIN Posts pr ON t.WikiPostId = pr.Id
+  LEFT JOIN LATERAL (
+    SELECT
+      TRIM(BOTH '><' FROM tag) AS TagName,
+      pr.Id AS TagPostId,
+      ord
+    FROM UNNEST(string_to_array(pr.Tags, '><')) WITH ORDINALITY AS u(tag, ord)
+  ) AS tl ON pr.Id IS NOT NULL
+  WHERE t.IsModeratorOnly = 0
+),
+Combined AS (
+  SELECT
+    rap.Id AS PostId,
+    rap.PostTypeId,
+    rap.OwnerUserId,
+    tu.UserId AS OwnerUserId2,
+    rap.Title,
+    rap.Tags,
+    rap.CreationDate,
+    rap.LastActivityDate,
+    rap.Score,
+    rap.ViewCount,
+    rap.CommentCount,
+    rap.AnswerCount,
+    rap.FavoriteCount,
+    rap.ParentId,
+    rap.AcceptedAnswerId,
+    rap.LastEditorUserId,
+    rap.LastEditDate,
+    rap.ContentLicense,
+    tu.DisplayName AS OwnerDisplayName,
+    br.Name AS BorderCase,
+    v.Badges,
+    p2.Id AS RelatedPostId,
+    ph.Comment AS PostHistoryComment,
+    b.Name AS BadgeName,
+    t.TagName AS MatchedTagName
+  FROM RecentActivePosts rap
+  LEFT JOIN TopUsers tu ON rap.OwnerUserId = tu.UserId
+  LEFT JOIN Votes v ON rap.Id = v.PostId
+  LEFT JOIN PostLinks pl ON rap.Id = pl.PostId
+  LEFT JOIN Posts p2 ON pl.RelatedPostId = p2.Id
+  LEFT JOIN PostHistory ph ON rap.Id = ph.PostId
+  LEFT JOIN Badges b ON rap.OwnerUserId = b.UserId
+  LEFT JOIN Tags t ON rap.Tags LIKE '%' || t.TagName || '%'
+  LEFT JOIN CloseReasonTypes br ON ph.Comment LIKE '%' || CAST(br.Id AS varchar) || '%'
+  WHERE rap.PostTypeId IN (1,2)
+),
+WindowAgg AS (
+  SELECT
+    c.PostId,
+    c.PostTypeId,
+    c.OwnerUserId,
+    c.Title,
+    c.Tags,
+    c.CreationDate,
+    c.LastActivityDate,
+    c.Score,
+    c.ViewCount,
+    c.CommentCount,
+    c.AnswerCount,
+    c.FavoriteCount,
+    c.ParentId,
+    c.AcceptedAnswerId,
+    c.LastEditorUserId,
+    c.LastEditDate,
+    c.ContentLicense,
+    c.OwnerDisplayName,
+    BR.Name AS CloseReason,
+    ph.Comment AS PH_Comment,
+    ph2.Comment AS PH2_Comment
+  FROM Combined c
+  LEFT JOIN PostHistory ph ON ph.PostId = c.PostId AND ph.PostHistoryTypeId = 10
+  LEFT JOIN PostHistory ph2 ON ph2.PostId = c.PostId AND ph2.PostHistoryTypeId = 11
+  LEFT JOIN CloseReasonTypes BR ON CAST(ph.Comment AS varchar) LIKE '%' || CAST(BR.Id AS varchar) || '%'
+),
+Final AS (
+  SELECT
+    w.PostId,
+    w.PostTypeId,
+    w.OwnerUserId,
+    w.OwnerDisplayName,
+    w.Title,
+    w.Tags,
+    w.CreationDate,
+    w.LastActivityDate,
+    w.Score,
+    w.ViewCount,
+    w.CommentCount,
+    w.AnswerCount,
+    w.FavoriteCount,
+    w.ParentId,
+    w.AcceptedAnswerId,
+    w.LastEditorUserId,
+    w.LastEditDate,
+    w.ContentLicense,
+    w.CloseReason,
+    SUM(CASE WHEN v.PostId IS NOT NULL THEN COALESCE(v.BountyAmount,0) ELSE 0 END) OVER (PARTITION BY w.PostId) AS TotalBounty
+  FROM WindowAgg w
+  LEFT JOIN Votes v ON w.PostId = v.PostId
+  WHERE w.PostTypeId IN (1,2)
+)
+SELECT
+  PostId,
+  PostTypeId,
+  OwnerUserId,
+  OwnerDisplayName,
+  Title,
+  Tags,
+  CreationDate,
+  LastActivityDate,
+  Score,
+  ViewCount,
+  CommentCount,
+  AnswerCount,
+  FavoriteCount,
+  ParentId,
+  AcceptedAnswerId,
+  LastEditorUserId,
+  LastEditDate,
+  ContentLicense,
+  CloseReason,
+  TotalBounty
+FROM Final
+WHERE TotalBounty > 0
+ORDER BY LastActivityDate DESC, Score DESC
+LIMIT 100;

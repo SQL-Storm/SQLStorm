@@ -1,0 +1,126 @@
+-- {"query": "2120.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1396} 
+with RecursiveUserActivity as (
+  select u.Id as UserId,
+         u.DisplayName,
+         u.Reputation,
+         u.CreationDate,
+         count(p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+         count(p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+         coalesce(sum(p.Score),0) as TotalPostScore,
+         row_number() over (partition by u.Id order by p.CreationDate desc nulls last) as LatestPostRank
+  from Users u
+  left join Posts p on p.OwnerUserId = u.Id
+  group by u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+LatestPosts as (
+  select p.Id,
+         p.PostTypeId,
+         p.AcceptedAnswerId,
+         p.ParentId,
+         p.CreationDate,
+         p.Score,
+         p.ViewCount,
+         p.Title,
+         p.Tags,
+         p.OwnerUserId,
+         p.LastActivityDate,
+         p.ClosedDate,
+         p.CommunityOwnedDate,
+         p.FavoriteCount,
+         p.AnswerCount,
+         p.CommentCount
+  from Posts p
+  inner join (
+    select OwnerUserId, max(CreationDate) as MaxCreationDate
+    from Posts
+    where OwnerUserId is not null
+    group by OwnerUserId
+  ) lp on p.OwnerUserId = lp.OwnerUserId and p.CreationDate = lp.MaxCreationDate
+  where p.PostTypeId in (1,2)
+),
+PostScoresWithWindow as (
+  select p.Id,
+         p.OwnerUserId,
+         p.Score,
+         p.ViewCount,
+         p.CreationDate,
+         p.PostTypeId,
+         p.AcceptedAnswerId,
+         row_number() over (partition by p.OwnerUserId order by p.Score desc nulls last) as ScoreRank,
+         avg(p.Score) over (partition by p.OwnerUserId) as AvgUserPostScore,
+         sum(p.ViewCount) over (partition by p.OwnerUserId) as TotalUserPostViews
+  from Posts p
+  where p.Score is not null
+),
+AnswersWithQuestionInfo as (
+  select a.Id as AnswerId,
+         a.ParentId as QuestionId,
+         q.Title as QuestionTitle,
+         a.OwnerUserId as AnswerOwner,
+         q.OwnerUserId as QuestionOwner,
+         a.Score as AnswerScore,
+         q.Score as QuestionScore,
+         a.CreationDate as AnswerCreationDate,
+         q.CreationDate as QuestionCreationDate,
+         case when a.Id = q.AcceptedAnswerId then 1 else 0 end as IsAccepted
+  from Posts a
+  left join Posts q on q.Id = a.ParentId and q.PostTypeId = 1
+  where a.PostTypeId = 2
+),
+UserBadgeSummary as (
+  select b.UserId,
+         count(*) as BadgeCount,
+         count(distinct case when b.Class = 1 then b.Id end) as GoldBadges,
+         count(distinct case when b.Class = 2 then b.Id end) as SilverBadges,
+         count(distinct case when b.Class = 3 then b.Id end) as BronzeBadges,
+         bool_or(b.TagBased) as HasTagBasedBadges
+  from Badges b
+  group by b.UserId
+),
+ClosedQuestionDetails as (
+  select p.Id as QuestionId,
+         p.Title,
+         p.OwnerUserId,
+         p.ClosedDate,
+         pht.Name as CloseReason,
+         count(distinct ph.Id) as CloseEvents
+  from Posts p
+  left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 10
+  left join CloseReasonTypes pht on try_cast(ph.Comment as int) = pht.Id
+  where p.PostTypeId = 1 and p.ClosedDate is not null
+  group by p.Id, p.Title, p.OwnerUserId, p.ClosedDate, pht.Name
+)
+select ua.UserId,
+       ua.DisplayName,
+       ua.Reputation,
+       ua.QuestionCount,
+       ua.AnswerCount,
+       ua.TotalPostScore,
+       upv.ScoreRank,
+       upv.AvgUserPostScore,
+       upv.TotalUserPostViews,
+       coalesce(ubs.BadgeCount,0) as BadgeCount,
+       coalesce(ubs.GoldBadges,0) as GoldBadges,
+       coalesce(ubs.SilverBadges,0) as SilverBadges,
+       coalesce(ubs.BronzeBadges,0) as BronzeBadges,
+       coalesce(ubs.HasTagBasedBadges, false) as HasTagBasedBadges,
+       coalesce(cqd.ClosedDate, timestamp '9999-12-31') as LatestClosedDate,
+       cqd.CloseReason,
+       count(distinct awqi.AnswerId) filter (where awqi.IsAccepted = 1) as AcceptedAnswersCount,
+       count(distinct awqi.AnswerId) as TotalAnswersCount,
+       avg(case when awqi.IsAccepted = 1 then awqi.AnswerScore else null end) as AvgAcceptedAnswerScore,
+       (select count(*) from Comments cm where cm.UserId = ua.UserId and cm.CreationDate >= cast('2024-10-01' as date) - interval '1 year') as RecentCommentsCount
+from RecursiveUserActivity ua
+left join PostScoresWithWindow upv on upv.OwnerUserId = ua.UserId and upv.ScoreRank = 1
+left join UserBadgeSummary ubs on ubs.UserId = ua.UserId
+left join AnswersWithQuestionInfo awqi on awqi.AnswerOwner = ua.UserId
+left join ClosedQuestionDetails cqd on cqd.QuestionId in (
+    select p.Id from Posts p where p.OwnerUserId = ua.UserId and p.PostTypeId = 1
+)
+group by ua.UserId, ua.DisplayName, ua.Reputation, ua.QuestionCount, ua.AnswerCount, ua.TotalPostScore,
+         upv.ScoreRank, upv.AvgUserPostScore, upv.TotalUserPostViews,
+         ubs.BadgeCount, ubs.GoldBadges, ubs.SilverBadges, ubs.BronzeBadges, ubs.HasTagBasedBadges,
+         cqd.ClosedDate, cqd.CloseReason
+having ua.Reputation > 1000 or count(distinct awqi.AnswerId) filter (where awqi.IsAccepted = 1) > 0
+order by ua.Reputation desc nulls last, count(distinct awqi.AnswerId) filter (where awqi.IsAccepted = 1) desc
+limit 50;

@@ -1,0 +1,380 @@
+with recent_q as (
+  select
+    p.Id as QuestionId,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    coalesce(p.AnswerCount, 0) as AnswerCount
+  from Posts p
+  where p.PostTypeId = 1
+    and p.CreationDate >= (select max(CreationDate) - interval '365 days' from Posts where PostTypeId = 1)
+),
+answers as (
+  select
+    a.Id as AnswerId,
+    a.ParentId as QuestionId,
+    a.OwnerUserId as AnswerUserId,
+    a.Score as AnswerScore,
+    a.CreationDate as AnswerCreationDate
+  from Posts a
+  where a.PostTypeId = 2
+),
+first_answer as (
+  select distinct on (QuestionId)
+    QuestionId,
+    AnswerId,
+    AnswerUserId,
+    AnswerScore,
+    AnswerCreationDate
+  from answers
+  order by QuestionId, AnswerCreationDate
+),
+votes_agg as (
+  select
+    v.PostId,
+    sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+    sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+    sum(case when v.VoteTypeId = 5 then 1 else 0 end) as Favorites,
+    sum(case when v.VoteTypeId in (8,9) then coalesce(v.BountyAmount,0) else 0 end) as BountyTotal,
+    count(*) as TotalVotes
+  from Votes v
+  group by v.PostId
+),
+user_badges as (
+  select
+    b.UserId,
+    count(*) filter (where b.Class = 1) as GoldBadges,
+    count(*) filter (where b.Class = 2) as SilverBadges,
+    count(*) filter (where b.Class = 3) as BronzeBadges,
+    count(*) as TotalBadges,
+    sum(case when b.TagBased = 1 then 1 else 0 end) as TagBadges,
+    max(b.Date) as LastBadgeDate
+  from Badges b
+  group by b.UserId
+),
+edits as (
+  select
+    ph.PostId,
+    count(*) filter (where ph.PostHistoryTypeId in (4,5,6,7,8,9)) as EditCount,
+    min(ph.CreationDate) filter (where ph.PostHistoryTypeId in (4,5,6)) as FirstEditDate,
+    max(ph.CreationDate) filter (where ph.PostHistoryTypeId in (4,5,6)) as LastEditDate,
+    count(*) filter (where ph.PostHistoryTypeId = 10) as CloseVotesInHistory,
+    max(case when ph.PostHistoryTypeId = 10 then
+        case when ph.Comment ~ '^[0-9]+$' then cast(ph.Comment as integer) else null end
+      end) as LastCloseReasonId
+  from PostHistory ph
+  group by ph.PostId
+),
+closures as (
+  select
+    p.Id as PostId,
+    p.ClosedDate,
+    crt.Name as CloseReasonName
+  from Posts p
+  left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 10
+  left join CloseReasonTypes crt on (case when ph.Comment ~ '^[0-9]+$' then cast(ph.Comment as integer) else null end) = crt.Id
+  where p.ClosedDate is not null
+),
+links as (
+  select
+    pl.PostId,
+    sum(case when pl.LinkTypeId = 1 then 1 else 0 end) as LinkedCount,
+    sum(case when pl.LinkTypeId = 3 then 1 else 0 end) as DuplicateCount,
+    count(*) as TotalLinks
+  from PostLinks pl
+  group by pl.PostId
+),
+tag_expansion as (
+  select
+    q.QuestionId,
+    unnest(string_to_array(substring(q.Tags, 2, greatest(length(q.Tags)-2,0)), '><')) as TagName
+  from recent_q q
+  where q.Tags is not null and q.Tags like '<%>'
+),
+tag_stats as (
+  select
+    te.QuestionId,
+    array_agg(te.TagName order by te.TagName) as TagArray,
+    count(*) as TagCount,
+    string_agg(te.TagName, ',' order by te.TagName) as TagCSV
+  from tag_expansion te
+  group by te.QuestionId
+),
+comment_agg as (
+  select
+    c.PostId,
+    count(*) as CommentCount,
+    sum(c.Score) as CommentScoreSum,
+    avg(c.Score) filter (where c.Score is not null) as CommentScoreAvg,
+    max(c.CreationDate) as LastCommentDate
+  from Comments c
+  group by c.PostId
+),
+user_stats as (
+  select
+    u.Id as UserId,
+    u.Reputation,
+    u.CreationDate as UserCreationDate,
+    u.LastAccessDate,
+    u.UpVotes as UserUpVotes,
+    u.DownVotes as UserDownVotes,
+    coalesce(ub.TotalBadges,0) as TotalBadges,
+    coalesce(ub.GoldBadges,0) as GoldBadges,
+    coalesce(ub.SilverBadges,0) as SilverBadges,
+    coalesce(ub.BronzeBadges,0) as BronzeBadges,
+    coalesce(ub.TagBadges,0) as TagBadges,
+    ub.LastBadgeDate
+  from Users u
+  left join user_badges ub on ub.UserId = u.Id
+),
+answerer_stats as (
+  select
+    fa.QuestionId,
+    us.UserId,
+    us.Reputation,
+    us.UserCreationDate,
+    us.LastAccessDate,
+    us.UserUpVotes,
+    us.UserDownVotes,
+    us.TotalBadges,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    us.TagBadges,
+    us.LastBadgeDate
+  from first_answer fa
+  left join user_stats us on us.UserId = fa.AnswerUserId
+),
+questioner_stats as (
+  select
+    q.QuestionId,
+    us.UserId,
+    us.Reputation,
+    us.UserCreationDate,
+    us.LastAccessDate,
+    us.UserUpVotes,
+    us.UserDownVotes,
+    us.TotalBadges,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    us.TagBadges,
+    us.LastBadgeDate
+  from recent_q q
+  left join user_stats us on us.UserId = q.OwnerUserId
+),
+question_activity as (
+  select
+    q.QuestionId,
+    q.Title,
+    q.CreationDate as QuestionCreationDate,
+    q.Score as QuestionScore,
+    q.ViewCount,
+    q.AnswerCount,
+    coalesce(v1.UpVotes,0) as UpVotes,
+    coalesce(v1.DownVotes,0) as DownVotes,
+    coalesce(v1.Favorites,0) as Favorites,
+    coalesce(v1.BountyTotal,0) as BountyTotal,
+    coalesce(v1.TotalVotes,0) as TotalVotes,
+    coalesce(e.EditCount,0) as EditCount,
+    e.FirstEditDate,
+    e.LastEditDate,
+    coalesce(l.LinkedCount,0) as LinkedCount,
+    coalesce(l.DuplicateCount,0) as DuplicateCount,
+    coalesce(l.TotalLinks,0) as TotalLinks,
+    coalesce(ca.CommentCount,0) as CommentCount,
+    coalesce(ca.CommentScoreSum,0) as CommentScoreSum,
+    ca.CommentScoreAvg,
+    ca.LastCommentDate,
+    cl.ClosedDate,
+    cl.CloseReasonName
+  from recent_q q
+  left join votes_agg v1 on v1.PostId = q.QuestionId
+  left join edits e on e.PostId = q.QuestionId
+  left join links l on l.PostId = q.QuestionId
+  left join comment_agg ca on ca.PostId = q.QuestionId
+  left join closures cl on cl.PostId = q.QuestionId
+),
+answer_activity as (
+  select
+    fa.QuestionId,
+    fa.AnswerId,
+    fa.AnswerScore,
+    fa.AnswerCreationDate,
+    coalesce(v2.UpVotes,0) as AnsUpVotes,
+    coalesce(v2.DownVotes,0) as AnsDownVotes,
+    coalesce(v2.TotalVotes,0) as AnsTotalVotes
+  from first_answer fa
+  left join votes_agg v2 on v2.PostId = fa.AnswerId
+),
+ranked_q as (
+  select
+    qa.QuestionId,
+    qa.Title,
+    qa.QuestionCreationDate,
+    qa.QuestionScore,
+    qa.ViewCount,
+    qa.AnswerCount,
+    qa.UpVotes,
+    qa.DownVotes,
+    qa.Favorites,
+    qa.BountyTotal,
+    qa.TotalVotes,
+    qa.EditCount,
+    qa.FirstEditDate,
+    qa.LastEditDate,
+    qa.LinkedCount,
+    qa.DuplicateCount,
+    qa.TotalLinks,
+    qa.CommentCount,
+    qa.CommentScoreSum,
+    qa.CommentScoreAvg,
+    qa.LastCommentDate,
+    qa.ClosedDate,
+    qa.CloseReasonName,
+    qa.rn_view_score,
+    qa.rn_discussion,
+    qa.rk_bounty,
+    qa.median_views,
+    qa.avg_views,
+    qa.stddev_views,
+    ts.TagArray,
+    ts.TagCount,
+    ts.TagCSV,
+    row_number() over (order by qa.ViewCount desc, qa.QuestionScore desc, qa.TotalVotes desc) as rn_view_score,
+    row_number() over (order by qa.CommentCount desc nulls last, qa.EditCount desc nulls last) as rn_discussion,
+    dense_rank() over (order by coalesce(qa.BountyTotal,0) desc) as rk_bounty,
+    percentile_disc(0.5) within group (order by qa.ViewCount) over () as median_views,
+    avg(qa.ViewCount) over () as avg_views,
+    stddev_pop(qa.ViewCount) over () as stddev_views
+  from question_activity qa
+  left join tag_stats ts on ts.QuestionId = qa.QuestionId
+  group by
+    qa.QuestionId,
+    qa.Title,
+    qa.QuestionCreationDate,
+    qa.QuestionScore,
+    qa.ViewCount,
+    qa.AnswerCount,
+    qa.UpVotes,
+    qa.DownVotes,
+    qa.Favorites,
+    qa.BountyTotal,
+    qa.TotalVotes,
+    qa.EditCount,
+    qa.FirstEditDate,
+    qa.LastEditDate,
+    qa.LinkedCount,
+    qa.DuplicateCount,
+    qa.TotalLinks,
+    qa.CommentCount,
+    qa.CommentScoreSum,
+    qa.CommentScoreAvg,
+    qa.LastCommentDate,
+    qa.ClosedDate,
+    qa.CloseReasonName,
+    ts.TagArray,
+    ts.TagCount,
+    ts.TagCSV
+),
+final as (
+  select
+    rq.QuestionId,
+    rq.Title,
+    rq.TagCSV,
+    rq.TagCount,
+    rq.QuestionCreationDate,
+    rq.QuestionScore,
+    rq.ViewCount,
+    rq.UpVotes,
+    rq.DownVotes,
+    rq.Favorites,
+    rq.BountyTotal,
+    rq.TotalVotes,
+    rq.EditCount,
+    rq.FirstEditDate,
+    rq.LastEditDate,
+    rq.LinkedCount,
+    rq.DuplicateCount,
+    rq.TotalLinks,
+    rq.CommentCount,
+    rq.CommentScoreSum,
+    rq.CommentScoreAvg,
+    rq.LastCommentDate,
+    rq.ClosedDate,
+    rq.CloseReasonName,
+    rq.rn_view_score,
+    rq.rn_discussion,
+    rq.rk_bounty,
+    rq.median_views,
+    rq.avg_views,
+    rq.stddev_views,
+    aa.AnswerId,
+    aa.AnswerScore,
+    aa.AnswerCreationDate,
+    aa.AnsUpVotes,
+    aa.AnsDownVotes,
+    aa.AnsTotalVotes,
+    qs.UserId as QuestionUserId,
+    qs.Reputation as QuestionUserReputation,
+    qs.TotalBadges as QuestionUserBadges,
+    qs.GoldBadges as QuestionUserGold,
+    qs.SilverBadges as QuestionUserSilver,
+    qs.BronzeBadges as QuestionUserBronze,
+    qs.TagBadges as QuestionUserTagBadges,
+    qs.LastBadgeDate as QuestionUserLastBadge,
+    as2.UserId as AnswerUserId,
+    as2.Reputation as AnswerUserReputation,
+    as2.TotalBadges as AnswerUserBadges,
+    as2.GoldBadges as AnswerUserGold,
+    as2.SilverBadges as AnswerUserSilver,
+    as2.BronzeBadges as AnswerUserBronze,
+    as2.TagBadges as AnswerUserTagBadges,
+    as2.LastBadgeDate as AnswerUserLastBadge,
+    case
+      when rq.ViewCount is null then null
+      when rq.stddev_views = 0 or rq.stddev_views is null then null
+      else (rq.ViewCount - rq.avg_views) / rq.stddev_views
+    end as viewcount_zscore,
+    case
+      when rq.CommentCount > 0 then (cast(rq.CommentScoreSum as numeric) / rq.CommentCount)
+      else null
+    end as comment_score_per_comment,
+    case
+      when rq.AnswerCount > 0 and aa.AnswerId is null then 'Unanswered'
+      when rq.AnswerCount = 0 then 'NoAnswersYet'
+      when aa.AnswerScore >= 0 then 'AnsweredNonNeg'
+      else 'AnsweredNeg'
+    end as answer_status_bucket,
+    case
+      when rq.TagCount is null then 0
+      when rq.TagCount = 0 then 0
+      else cardinality(array_remove(rq.TagArray, null))
+    end as normalized_tagcount
+  from ranked_q rq
+  left join answer_activity aa on aa.QuestionId = rq.QuestionId
+  left join questioner_stats qs on qs.QuestionId = rq.QuestionId
+  left join answerer_stats as2 on as2.QuestionId = rq.QuestionId
+)
+select *
+from final f
+where
+  (f.ViewCount > coalesce(f.median_views, 0))
+  and (f.AnswerUserReputation is null or f.AnswerUserReputation >= 1000)
+  and (
+    f.CloseReasonName is null
+    or lower(f.CloseReasonName) not like any (array['%duplicate%','%off-topic%'])
+  )
+  and (
+    f.TagCSV is null
+    or position('sql' in lower(f.TagCSV)) > 0
+    or f.TagCount >= 3
+  )
+order by
+  f.rn_view_score,
+  f.rn_discussion,
+  f.QuestionId
+limit 500;

@@ -1,0 +1,182 @@
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Views AS UserViews,
+        U.UpVotes AS UserUpVotes,
+        U.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswers,
+        COUNT(C.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalVotesCastUp,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalVotesCastDown,
+        COUNT(B.Id) AS TotalBadges,
+        MAX(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS HasGoldBadge,
+        AVG(CASE WHEN P.PostTypeId = 1 THEN P.Score END) AS AvgQuestionScore,
+        AVG(CASE WHEN P.PostTypeId = 2 THEN P.Score END) AS AvgAnswerScore,
+        COUNT(PH.Id) AS TotalUserHistoryEvents,
+        COALESCE((U.Reputation - 1) / NULLIF(EXTRACT(EPOCH FROM (U.LastAccessDate - U.CreationDate)) / 86400, 0), 0) AS RepGainPerActiveDay,
+        CASE WHEN U.Location ILIKE '%USA%' OR U.Location ILIKE '%Canada%' THEN TRUE ELSE FALSE END AS IsNorthAmericanUser,
+        U.Location
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Votes V ON U.Id = V.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN PostHistory PH ON U.Id = PH.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Views, U.UpVotes, U.DownVotes, U.Location
+),
+PostContentAnalysis AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount AS PostCommentCount,
+        P.FavoriteCount,
+        P.ClosedDate,
+        P.LastActivityDate,
+        P.LastEditDate,
+        P.Title,
+        P.Body,
+        P.Tags,
+        COALESCE((SELECT AVG(SC.Score) FROM Comments SC WHERE SC.PostId = P.Id), 0) AS AvgCommentScoreForPost,
+        SUM(CASE WHEN PV.VoteTypeId = 2 THEN 1 ELSE 0 END) AS PostTotalUpVotes,
+        SUM(CASE WHEN PV.VoteTypeId = 3 THEN 1 ELSE 0 END) AS PostTotalDownVotes,
+        CASE
+            WHEN P.Title ILIKE '%sql%' OR P.Body ILIKE '%sql%' OR P.Title ILIKE '%database%' OR P.Body ILIKE '%database%' THEN TRUE
+            ELSE FALSE
+        END AS ContainsDatabaseKeywords,
+        CASE
+            WHEN P.Title ILIKE '%performance%' OR P.Body ILIKE '%performance%' OR P.Title ILIKE '%optimization%' OR P.Body ILIKE '%optimization%' THEN TRUE
+            ELSE FALSE
+        END AS ContainsPerfOptKeywords,
+        EXTRACT(EPOCH FROM (P.LastActivityDate - P.CreationDate)) / 3600 AS HoursSinceCreationToLastActivity,
+        COALESCE((CHAR_LENGTH(REPLACE(P.Body, LOWER(P.Body), '')) * 1.0) / NULLIF(CHAR_LENGTH(P.Body), 0) * 100, 0) AS UppercaseBodyPercentage,
+        TRIM(BOTH '<>' FROM SUBSTRING(P.Tags FROM '(?<=<)[^>]+(?=>)')) AS FirstTag,
+        CHAR_LENGTH(P.Body) AS BodyLength
+    FROM Posts P
+    LEFT JOIN Votes PV ON P.Id = PV.PostId AND PV.VoteTypeId IN (2, 3)
+    WHERE P.PostTypeId IN (1, 2)
+    GROUP BY P.Id, P.PostTypeId, P.OwnerUserId, P.CreationDate, P.Score, P.ViewCount, P.AnswerCount, P.CommentCount, P.FavoriteCount, P.ClosedDate, P.LastActivityDate, P.LastEditDate, P.Title, P.Body, P.Tags
+),
+PostHistoryAggregates AS (
+    SELECT
+        PH.PostId,
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 END) AS CloseEvents,
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 END) AS ReopenEvents,
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 12 THEN 1 END) AS DeleteEvents,
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 13 THEN 1 END) AS UndeleteEvents,
+        COUNT(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 END) AS EditEvents,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.CreationDate END) AS LatestCloseDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 11 THEN PH.CreationDate END) AS LatestReopenDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 12 THEN PH.CreationDate END) AS LatestDeleteDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 13 THEN PH.CreationDate END) AS LatestUndeleteDate,
+        (
+            SELECT SH.Text
+            FROM PostHistory SH
+            WHERE SH.PostId = PH.PostId
+              AND SH.PostHistoryTypeId = 5
+            ORDER BY SH.CreationDate ASC
+            LIMIT 1
+        ) AS FirstBodyEditText,
+        COALESCE(
+            (SELECT LEAD(PH2.PostHistoryTypeId) OVER (ORDER BY PH2.CreationDate)
+             FROM PostHistory PH2
+             WHERE PH2.PostId = PH.PostId AND PH2.PostHistoryTypeId = 10
+             ORDER BY PH2.CreationDate
+             LIMIT 1),
+            -1
+        ) AS PostHistoryTypeAfterFirstClose
+    FROM PostHistory PH
+    GROUP BY PH.PostId
+)
+SELECT
+    UAS.DisplayName,
+    UAS.Reputation,
+    UAS.TotalPosts,
+    UAS.TotalQuestions,
+    UAS.TotalAnswers,
+    UAS.AvgQuestionScore,
+    UAS.AvgAnswerScore,
+    PCA.Title AS QuestionTitle,
+    PCA.PostScore AS QuestionScore,
+    PCA.ViewCount AS QuestionViewCount,
+    PCA.PostCommentCount AS QuestionCommentCount,
+    PCA.FavoriteCount AS QuestionFavoriteCount,
+    PCA.ContainsPerfOptKeywords,
+    PCA.ContainsDatabaseKeywords,
+    PHA.CloseEvents,
+    PHA.ReopenEvents,
+    PHA.EditEvents,
+    PHA.LatestCloseDate,
+    PHA.LatestReopenDate,
+    (
+        PCA.PostTotalDownVotes +
+        (PHA.CloseEvents * 2) +
+        (PHA.ReopenEvents * 1.5) +
+        (PCA.PostCommentCount * 0.5) +
+        ABS(COALESCE(PCA.PostTotalUpVotes,0) - COALESCE(PCA.PostTotalDownVotes,0))
+    ) AS PostControversyIndex,
+    RANK() OVER (ORDER BY UAS.Reputation DESC, UAS.TotalQuestions DESC) AS UserReputationRank,
+    NTILE(4) OVER (PARTITION BY UAS.UserId ORDER BY PCA.PostScore DESC) AS PostScoreQuartileForUser,
+    COALESCE(EXTRACT(DAY FROM (PHA.LatestReopenDate - PCA.PostCreationDate)), 0) AS DaysToReopen,
+    COALESCE(UPPER(SUBSTRING(UAS.Location FROM 1 FOR 3)), 'UNKNOWN') AS UserLocationPrefix,
+    CASE
+        WHEN PHA.FirstBodyEditText IS NOT NULL AND ABS(CHAR_LENGTH(PHA.FirstBodyEditText) - CHAR_LENGTH(PCA.Body)) > 50 THEN TRUE
+        ELSE FALSE
+    END AS BodyLengthChangedSignificantly,
+    (
+        SELECT SA.Body
+        FROM Posts SA
+        WHERE SA.ParentId = PCA.PostId
+          AND SA.OwnerUserId = UAS.UserId
+          AND SA.PostTypeId = 2
+        ORDER BY SA.CreationDate DESC
+        LIMIT 1
+    ) AS LatestSelfAnswerBodySnippet,
+    EXISTS (
+        SELECT 1
+        FROM PostHistory PH_CR
+        WHERE PH_CR.PostId = PCA.PostId
+          AND PH_CR.PostHistoryTypeId = 10
+          AND PH_CR.Comment = '102'
+    ) AS WasClosedOffTopic,
+    PCA.PostCreationDate,
+    PCA.OwnerUserId,
+    PCA.PostId,
+    PCA.BodyLength,
+    PCA.UppercaseBodyPercentage,
+    UAS.UserId
+FROM Users U
+JOIN UserActivitySummary UAS ON U.Id = UAS.UserId
+LEFT JOIN PostContentAnalysis PCA ON U.Id = PCA.OwnerUserId
+LEFT JOIN PostHistoryAggregates PHA ON PCA.PostId = PHA.PostId
+WHERE
+    PCA.PostTypeId = 1
+    AND PCA.ContainsPerfOptKeywords IS TRUE
+    AND COALESCE(PHA.CloseEvents, 0) > 0
+    AND COALESCE(PHA.ReopenEvents, 0) > 0
+    AND COALESCE(UAS.TotalAnswers, 0) > 5
+    AND UAS.Reputation > 5000
+    AND PCA.PostScore > 50
+    AND (UAS.Location IS NOT NULL AND TRIM(UAS.Location) <> '')
+    AND PCA.BodyLength > 150
+    AND UAS.IsNorthAmericanUser = TRUE
+    AND (
+        (SELECT 1 FROM Posts A WHERE A.ParentId = PCA.PostId AND A.OwnerUserId = UAS.UserId AND A.PostTypeId = 2 LIMIT 1) IS NOT NULL
+        OR COALESCE(PCA.FavoriteCount, 0) > 10
+    )
+    AND PCA.UppercaseBodyPercentage BETWEEN 0.5 AND 10
+ORDER BY
+    UAS.Reputation DESC,
+    PostControversyIndex DESC,
+    PCA.PostCreationDate DESC
+LIMIT 200;

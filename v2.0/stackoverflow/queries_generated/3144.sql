@@ -1,0 +1,119 @@
+-- {"query": "3144.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2212} 
+
+WITH UserAgg AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.UpVotes, 0) - COALESCE(u.DownVotes, 0)               AS NetVotes,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1)                         AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2)                         AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3)                         AS BronzeBadges,
+        MAX(u.LastAccessDate)                                          AS LastSeen,
+        ROW_NUMBER() OVER (PARTITION BY u.Location ORDER BY u.Reputation DESC) AS LocRank
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes, u.LastAccessDate
+),
+
+PostAgg AS (
+    SELECT
+        p.OwnerUserId                                      AS UserId,
+        COUNT(*)        FILTER (WHERE p.PostTypeId = 1)   AS QuestionCount,
+        COUNT(*)        FILTER (WHERE p.PostTypeId = 2)   AS AnswerCount,
+        SUM(p.Score)    FILTER (WHERE p.PostTypeId = 1)   AS QuestionScoreSum,
+        SUM(p.Score)    FILTER (WHERE p.PostTypeId = 2)   AS AnswerScoreSum,
+        MAX(p.CreationDate)                               AS MostRecentPost,
+        STRING_AGG(
+            DISTINCT TRIM(BOTH '<>' FROM UNNEST(string_to_array(p.Tags, '><'))),
+            ', '
+        )                                                  AS TagList
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+
+TagStats AS (
+    SELECT
+        t.TagName,
+        t.Count                                 AS TagUseCount,
+        COALESCE(e.ExcerptLength, 0) + COALESCE(w.WikiLength, 0) AS ContentSize,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC)               AS TagRank
+    FROM Tags t
+    LEFT JOIN LATERAL (
+        SELECT LENGTH(p.Body) AS ExcerptLength
+        FROM Posts p
+        WHERE p.Id = t.ExcerptPostId
+    ) e ON true
+    LEFT JOIN LATERAL (
+        SELECT LENGTH(p.Body) AS WikiLength
+        FROM Posts p
+        WHERE p.Id = t.WikiPostId
+    ) w ON true
+    WHERE t.IsModeratorOnly = 0
+),
+
+RecentVotes AS (
+    SELECT
+        v.PostId,
+        v.VoteTypeId,
+        v.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY v.PostId ORDER BY v.CreationDate DESC) AS VoteRank
+    FROM Votes v
+    WHERE v.VoteTypeId IN (2, 3)   -- up/down votes
+)
+
+SELECT
+    ua.Id                                 AS UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.NetVotes,
+    ua.GoldBadges,
+    ua.SilverBadges,
+    ua.BronzeBadges,
+    COALESCE(pa.QuestionCount, 0)         AS Questions,
+    COALESCE(pa.AnswerCount,   0)         AS Answers,
+    COALESCE(pa.QuestionScoreSum, 0)      AS QScore,
+    COALESCE(pa.AnswerScoreSum,   0)      AS AScore,
+    pa.MostRecentPost,
+    pa.TagList,
+    CASE
+        WHEN ua.LocRank = 1               THEN 'TopInLocation'
+        WHEN ua.Reputation > 50000        THEN 'HighRep'
+        ELSE                              'Regular'
+    END                                   AS UserSegment,
+    EXISTS (
+        SELECT 1
+        FROM Posts p
+        WHERE p.OwnerUserId = ua.Id
+          AND p.CreationDate > ua.LastSeen - INTERVAL '30 days'
+    )                                    AS RecentActivityFlag
+FROM UserAgg ua
+LEFT JOIN PostAgg pa ON pa.UserId = ua.Id
+WHERE ua.Reputation IS NOT NULL
+ORDER BY ua.Reputation DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    0                                   AS NetVotes,
+    0                                   AS GoldBadges,
+    0                                   AS SilverBadges,
+    0                                   AS BronzeBadges,
+    0                                   AS Questions,
+    0                                   AS Answers,
+    0                                   AS QScore,
+    0                                   AS AScore,
+    NULL                                AS MostRecentPost,
+    NULL                                AS TagList,
+    'NoPosts'                           AS UserSegment,
+    FALSE                               AS RecentActivityFlag
+FROM Users u
+WHERE NOT EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id)
+  AND u.Reputation IS NOT NULL
+ORDER BY u.Reputation DESC
+LIMIT 50;

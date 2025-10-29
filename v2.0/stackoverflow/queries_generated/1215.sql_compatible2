@@ -1,0 +1,236 @@
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswers,
+        SUM(P.Score) AS TotalPostScore,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        COUNT(DISTINCT PH_Edit.PostId) AS TotalPostEdits,
+        COUNT(DISTINCT PH_Close.PostId) AS TotalPostCloses,
+        MAX(P.LastActivityDate) AS LastPostActivity,
+        MIN(P.CreationDate) AS FirstPostActivity,
+        COALESCE(SUBSTRING(U.AboutMe FROM 1 FOR 100), 'No description provided') AS AboutMeSnippet,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN PostHistory PH_Edit ON U.Id = PH_Edit.UserId AND PH_Edit.PostHistoryTypeId IN (4, 5, 6, 8, 9, 24)
+    LEFT JOIN PostHistory PH_Close ON U.Id = PH_Close.UserId AND PH_Close.PostHistoryTypeId = 10
+    WHERE U.Reputation >= 100
+      AND U.LastAccessDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year')
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.AboutMe
+),
+PostTagAnalysis AS (
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        P.PostTypeId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.ClosedDate,
+        CASE
+            WHEN P.Tags IS NULL THEN NULL
+            ELSE SUBSTRING(P.Tags FROM 2 FOR (POSITION('>' IN P.Tags) - 2))
+        END AS PrimaryTag,
+        CASE
+            WHEN P.Tags LIKE '%<sql>%' OR P.Tags LIKE '%<database>%' THEN TRUE
+            ELSE FALSE
+        END AS IsDatabaseRelated,
+        (P.AcceptedAnswerId IS NOT NULL AND EXISTS (
+            SELECT 1
+            FROM Posts AS AcceptedA
+            WHERE AcceptedA.Id = P.AcceptedAnswerId AND AcceptedA.OwnerUserId = P.OwnerUserId
+        )) AS AcceptedBySelf,
+        (SELECT MAX(C.Score) FROM Comments C WHERE C.PostId = P.Id) AS MaxCommentScore,
+        (SELECT AVG(C.Score) FROM Comments C WHERE C.PostId = P.Id) AS AvgCommentScore,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate DESC) AS rn_latest_post_by_user
+    FROM Posts P
+    WHERE P.OwnerUserId IS NOT NULL
+      AND P.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '3 years')
+),
+PostHistoryDetails AS (
+    SELECT
+        PH.Id,
+        PH.UserId,
+        PH.PostId,
+        PH.PostHistoryTypeId,
+        PH.CreationDate,
+        LAG(PH.CreationDate, 1) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) AS PreviousHistoryDate
+    FROM PostHistory PH
+    WHERE PH.UserId IS NOT NULL
+      AND PH.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 19, 20)
+),
+UserPostHistoryAgg AS (
+    SELECT
+        PHD.UserId,
+        PHD.PostId,
+        MIN(PHD.CreationDate) AS FirstHistoryDate,
+        MAX(PHD.CreationDate) AS LastHistoryDate,
+        COUNT(PHD.Id) AS TotalHistoryEntries,
+        SUM(CASE WHEN PHD.PostHistoryTypeId IN (4,5,6) THEN 1 ELSE 0 END) AS MajorEdits,
+        SUM(CASE WHEN PHD.PostHistoryTypeId IN (10) THEN 1 ELSE 0 END) AS CloseEvents,
+        SUM(CASE WHEN PHD.PostHistoryTypeId IN (11) THEN 1 ELSE 0 END) AS ReopenEvents,
+        MAX(EXTRACT(EPOCH FROM (PHD.CreationDate - PHD.PreviousHistoryDate))) AS MaxIntervalBetweenEditsSeconds
+    FROM PostHistoryDetails PHD
+    GROUP BY PHD.UserId, PHD.PostId
+),
+PostVoteAnalysis AS (
+    SELECT
+        V.PostId,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+        SUM(CASE WHEN V.VoteTypeId = 8 THEN COALESCE(V.BountyAmount,0) ELSE 0 END) AS TotalBountyGiven,
+        SUM(CASE WHEN V.VoteTypeId = 9 THEN COALESCE(V.BountyAmount,0) ELSE 0 END) AS TotalBountyReceived
+    FROM Votes V
+    WHERE V.VoteTypeId IN (2, 3, 8, 9)
+    GROUP BY V.PostId
+),
+ActiveCommenters AS (
+    SELECT
+        C.UserId,
+        COUNT(C.Id) AS UserCommentCount,
+        MAX(C.CreationDate) AS LastCommentDate,
+        MIN(C.CreationDate) AS FirstCommentDate,
+        COUNT(CASE WHEN LOWER(C.Text) LIKE '%bug%' OR LOWER(C.Text) LIKE '%error%' THEN 1 ELSE NULL END) AS BugReportComments
+    FROM Comments C
+    WHERE C.UserId IS NOT NULL
+      AND C.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 years')
+    GROUP BY C.UserId
+    HAVING COUNT(C.Id) >= 5
+),
+PrimarySelection AS (
+    SELECT
+        UAS.UserId,
+        UAS.DisplayName,
+        UAS.Reputation,
+        UAS.TotalPosts,
+        UAS.TotalQuestions,
+        UAS.TotalAnswers,
+        UAS.TotalPostScore,
+        UAS.TotalComments,
+        UAS.TotalBadges,
+        UAS.GoldBadges,
+        UAS.SilverBadges,
+        UAS.BronzeBadges,
+        UAS.AboutMeSnippet,
+        COALESCE(UAS.TotalPostScore / NULLIF(UAS.TotalPosts, 0), 0) AS AvgScorePerPost,
+        COALESCE(CAST(UAS.TotalQuestions AS DECIMAL) / NULLIF(UAS.TotalPosts, 0), 0.0) AS QuestionPostRatio,
+        EXTRACT(DAY FROM (UAS.LastPostActivity - UAS.FirstPostActivity)) AS DaysActiveInPosts,
+        EXTRACT(HOUR FROM (TIMESTAMP '2024-10-01 12:34:56' - UAS.LastAccessDate)) AS HoursSinceLastAccess,
+        AC.UserCommentCount,
+        AC.BugReportComments,
+        (SELECT AVG(UPA.TotalHistoryEntries) FROM UserPostHistoryAgg UPA WHERE UPA.UserId = UAS.UserId) AS AvgHistoryEntriesPerPost,
+        SUM(CASE WHEN PTA.IsDatabaseRelated THEN 1 ELSE 0 END) AS DatabaseRelatedPosts,
+        SUM(CASE WHEN PTA.AcceptedBySelf THEN 1 ELSE 0 END) AS SelfAcceptedAnswers,
+        SUM(PTA.MaxCommentScore) AS TotalMaxCommentScores,
+        SUM(PV.UpVoteCount) AS TotalUserUpVotesReceived,
+        SUM(PV.DownVoteCount) AS TotalUserDownVotesReceived,
+        COALESCE(MAX(UPA.MaxIntervalBetweenEditsSeconds), 0) AS MaxTimeGapBetweenPostEdits,
+        CASE
+            WHEN SUM(PV.UpVoteCount) IS NULL AND SUM(PV.DownVoteCount) IS NULL THEN -1
+            WHEN COALESCE(SUM(PV.UpVoteCount), 0) = 0 AND SUM(PV.DownVoteCount) > 0 THEN -100
+            WHEN SUM(PV.DownVoteCount) > COALESCE(SUM(PV.UpVoteCount), 0) THEN COALESCE(SUM(PV.UpVoteCount), 0) - SUM(PV.DownVoteCount)
+            ELSE COALESCE(SUM(PV.UpVoteCount), 0) - SUM(PV.DownVoteCount)
+        END AS ControversialScoreMetric,
+        UAS.LastPostActivity,
+        UAS.FirstPostActivity,
+        UAS.LastAccessDate
+    FROM UserActivitySummary UAS
+    LEFT JOIN PostTagAnalysis PTA ON UAS.UserId = PTA.OwnerUserId AND PTA.rn_latest_post_by_user <= 5
+    LEFT JOIN PostVoteAnalysis PV ON PTA.PostId = PV.PostId
+    LEFT JOIN ActiveCommenters AC ON UAS.UserId = AC.UserId
+    LEFT JOIN UserPostHistoryAgg UPA ON UAS.UserId = UPA.UserId AND PTA.PostId = UPA.PostId
+    WHERE UAS.TotalPosts > 0
+      AND UAS.Reputation > 500
+      AND (PTA.IsDatabaseRelated = TRUE OR (UAS.TotalAnswers > UAS.TotalQuestions AND PTA.ClosedDate IS NULL))
+    GROUP BY
+        UAS.UserId,
+        UAS.DisplayName,
+        UAS.Reputation,
+        UAS.TotalPosts,
+        UAS.TotalQuestions,
+        UAS.TotalAnswers,
+        UAS.TotalPostScore,
+        UAS.TotalComments,
+        UAS.TotalBadges,
+        UAS.GoldBadges,
+        UAS.SilverBadges,
+        UAS.BronzeBadges,
+        UAS.AboutMeSnippet,
+        UAS.LastPostActivity,
+        UAS.FirstPostActivity,
+        UAS.LastAccessDate,
+        AC.UserCommentCount,
+        AC.BugReportComments
+    HAVING
+        SUM(CASE WHEN PTA.PostTypeId = 1 THEN PTA.PostScore ELSE 0 END) > 50
+        AND SUM(PV.UpVoteCount) > 10
+        AND EXISTS (
+            SELECT 1
+            FROM UserPostHistoryAgg UPH_inner
+            WHERE UPH_inner.UserId = UAS.UserId AND UPH_inner.ReopenEvents > 0
+        )
+)
+SELECT *
+FROM PrimarySelection
+ORDER BY Reputation DESC, ControversialScoreMetric ASC
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    P.OwnerUserId AS UserId,
+    U.DisplayName,
+    U.Reputation,
+    1 AS TotalPosts,
+    1 AS TotalQuestions,
+    0 AS TotalAnswers,
+    P.Score AS TotalPostScore,
+    0 AS TotalComments,
+    0 AS TotalBadges,
+    0 AS GoldBadges,
+    0 AS SilverBadges,
+    0 AS BronzeBadges,
+    COALESCE(SUBSTRING(U.AboutMe FROM 1 FOR 100), 'N/A') AS AboutMeSnippet,
+    P.Score AS AvgScorePerPost,
+    1.0 AS QuestionPostRatio,
+    EXTRACT(DAY FROM (P.LastActivityDate - P.CreationDate)) AS DaysActiveInPosts,
+    EXTRACT(HOUR FROM (TIMESTAMP '2024-10-01 12:34:56' - U.LastAccessDate)) AS HoursSinceLastAccess,
+    0 AS UserCommentCount,
+    0 AS BugReportComments,
+    (SELECT AVG(PH.TotalHistoryEntries) FROM UserPostHistoryAgg PH WHERE PH.UserId = P.OwnerUserId) AS AvgHistoryEntriesPerPost,
+    (CASE WHEN P.Tags LIKE '%<java>%' OR P.Tags LIKE '%<javascript>%' THEN 1 ELSE 0 END) AS DatabaseRelatedPosts,
+    0 AS SelfAcceptedAnswers,
+    0 AS TotalMaxCommentScores,
+    (SELECT SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) FROM Votes V WHERE V.PostId = P.Id) AS TotalUserUpVotesReceived,
+    (SELECT SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) FROM Votes V WHERE V.PostId = P.Id) AS TotalUserDownVotesReceived,
+    COALESCE((SELECT MAX(EXTRACT(EPOCH FROM (PHD_inner.CreationDate - PHD_inner.PreviousHistoryDate)))
+              FROM PostHistoryDetails PHD_inner WHERE PHD_inner.PostId = P.Id), 0) AS MaxTimeGapBetweenPostEdits,
+    0 AS ControversialScoreMetric
+FROM Posts P
+JOIN Users U ON P.OwnerUserId = U.Id
+WHERE P.PostTypeId = 1
+  AND P.ViewCount > 50000
+  AND P.Score < 100
+  AND P.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 years')
+  AND P.OwnerUserId IS NOT NULL
+  AND NOT EXISTS (
+      SELECT 1 FROM PostLinks PL WHERE PL.PostId = P.Id AND PL.LinkTypeId = 3
+  )
+  AND (P.ClosedDate IS NULL OR P.ClosedDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '3 months'))
+ORDER BY
+    Reputation DESC, TotalPostScore DESC
+LIMIT 50;

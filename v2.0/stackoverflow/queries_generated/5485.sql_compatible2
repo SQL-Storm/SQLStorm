@@ -1,0 +1,41 @@
+SELECT
+  u.Id AS UserId,
+  u.DisplayName,
+  u.Reputation,
+  COUNT(DISTINCT p.Id) AS PostsCount,
+  AVG(p.Score) AS AvgPostScore,
+  SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesReceived,
+  SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesReceived,
+  SUM(CASE WHEN b.Id IS NOT NULL THEN 1 ELSE 0 END) AS BadgesCount,
+  SUM(CASE WHEN c.Id IS NOT NULL THEN 1 ELSE 0 END) AS CommentsCount,
+  MIN(p.CreationDate) AS FirstPostDate,
+  MAX(p.LastActivityDate) AS LastActivityDate,
+  STRING_AGG(DISTINCT t.Name, ',') AS TagsTouched,
+  AVG(NULLIF(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - CAST(u.CreationDate AS timestamp)))/86400, 0)) AS AgeInDays
+FROM
+  Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id AND v.UserId = u.Id
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  LEFT JOIN Comments c ON c.PostId = p.Id
+  LEFT JOIN (
+    SELECT
+      ph.PostId,
+      ph.Text,
+      ph.CreationDate
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (1, 4, 5, 6, 10, 11, 16)
+  ) h ON h.PostId = p.Id
+  LEFT JOIN LATERAL (
+    SELECT t.Id, t.Name
+    FROM Tags t
+    WHERE p.Tags LIKE '%' || '<' || t.Name || '>' || '%'
+    LIMIT 1
+  ) t ON true
+GROUP BY
+  u.Id, u.DisplayName, u.Reputation
+HAVING
+  COUNT(DISTINCT p.Id) > 0
+ORDER BY
+  u.Reputation DESC, PostsCount DESC
+LIMIT 100;

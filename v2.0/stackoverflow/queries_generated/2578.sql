@@ -1,0 +1,120 @@
+-- {"query": "2578.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1534} 
+with RecursiveUserBadges as (
+    select u.Id as UserId, u.DisplayName, b.Name as BadgeName, b.Class,
+        row_number() over (partition by u.Id order by b.Date desc) as rn
+    from Users u
+    left join Badges b on u.Id = b.UserId and b.Class = 1
+    where b.Date is not null
+), UserTopBadges as (
+    select UserId, DisplayName, BadgeName, Class
+    from RecursiveUserBadges
+    where rn = 1
+
+    union all
+
+    select u.Id, u.DisplayName, null, null
+    from Users u
+    where not exists (
+        select 1 from RecursiveUserBadges b where b.UserId = u.Id
+    )
+), QuestionAnswerStats as (
+    select
+        p.OwnerUserId as UserId,
+        sum(case when pt.Name = 'Question' then 1 else 0 end) as QuestionCount,
+        sum(case when pt.Name = 'Answer' then 1 else 0 end) as AnswerCount,
+        coalesce(avg(case when pt.Name = 'Question' then p.Score end),0) as AvgQuestionScore,
+        coalesce(avg(case when pt.Name = 'Answer' then p.Score end),0) as AvgAnswerScore,
+        max(p.CreationDate) as LastPostDate
+    from Posts p
+    join PostTypes pt on pt.Id = p.PostTypeId
+    where p.OwnerUserId is not null
+    group by p.OwnerUserId
+), UserActivity as (
+    select u.Id as UserId, u.DisplayName,
+        count(distinct ph.PostId) as EditsMade,
+        max(ph.CreationDate) as LastEditDate,
+        count(distinct c.Id) as CommentCount,
+        count(distinct v.Id) as VotesCast
+    from Users u
+    left join PostHistory ph on ph.UserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName
+), TopTags as (
+    select t.TagName, t.Count,
+        rank() over (order by t.Count desc) as rnk
+    from Tags t
+    where t.Count > 1000
+), PostsWithTagCTE as (
+    select p.Id, p.OwnerUserId, p.PostTypeId, p.Score, p.ViewCount, p.Tags,
+        unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><')) as SingleTag
+    from Posts p
+    where p.Tags is not null and p.PostTypeId = 1
+), TopTagQuestions as (
+    select p.OwnerUserId, p.SingleTag, count(*) as QuestionCount, avg(p.Score) as AvgScore
+    from PostsWithTagCTE p
+    join TopTags tt on tt.TagName = p.SingleTag
+    group by p.OwnerUserId, p.SingleTag
+), DuplicateLinkedQuestions as (
+    select distinct pl.PostId, pl.RelatedPostId, p1.Title as PostTitle, p2.Title as RelatedPostTitle
+    from PostLinks pl
+    join Posts p1 on p1.Id = pl.PostId and p1.PostTypeId = 1
+    join Posts p2 on p2.Id = pl.RelatedPostId and p2.PostTypeId = 1
+    where pl.LinkTypeId = 3
+), CorrelatedVotes as (
+    select p.Id as PostId, count(v.Id) as UpVotes, 
+        (select count(*) from Votes v2 where v2.PostId = p.Id and v2.VoteTypeId = 3) as DownVotes,
+        (select count(*) from Votes v3 where v3.PostId = p.Id and v3.VoteTypeId = 16) as ApprovedEditSuggestions
+    from Posts p
+    left join Votes v on v.PostId = p.Id and v.VoteTypeId = 2
+    group by p.Id
+), UserScoreRanks as (
+    select u.Id, u.DisplayName, qs.QuestionCount, qs.AnswerCount,
+        rank() over (order by qs.QuestionCount desc nulls last) as QuestionRank,
+        rank() over (order by qs.AnswerCount desc nulls last) as AnswerRank
+    from Users u
+    left join QuestionAnswerStats qs on qs.UserId = u.Id
+), LastActivityPosts as (
+    select p.Id, p.OwnerUserId, p.PostTypeId, p.Title, p.CreationDate,
+        row_number() over (partition by p.OwnerUserId order by p.LastActivityDate desc nulls last) as rn
+    from Posts p
+    where p.OwnerUserId is not null
+)
+select 
+    u.Id as UserId,
+    u.DisplayName,
+    coalesce(utb.BadgeName, 'None') as TopGoldBadge,
+    coalesce(qas.QuestionCount,0) as QuestionCount,
+    coalesce(qas.AnswerCount,0) as AnswerCount,
+    round(coalesce(qas.AvgQuestionScore,0),2) as AvgQuestionScore,
+    round(coalesce(qas.AvgAnswerScore,0),2) as AvgAnswerScore,
+    ua.EditsMade,
+    ua.CommentCount,
+    ua.VotesCast,
+    string_agg(distinct tt.SingleTag, ', ') filter (where tt.SingleTag is not null) as TopTags,
+    dup.PostTitle as DuplicateQuestionTitle,
+    dup.RelatedPostTitle as DuplicateOfTitle,
+    coalesce(cv.UpVotes,0) as PostUpVotes,
+    coalesce(cv.DownVotes,0) as PostDownVotes,
+    coalesce(cv.ApprovedEditSuggestions,0) as ApprovedEditsOnPost,
+    usr.QuestionRank,
+    usr.AnswerRank,
+    lap.Title as LatestPostTitle,
+    lap.CreationDate as LatestPostCreationDate
+from Users u
+left join UserTopBadges utb on utb.UserId = u.Id
+left join QuestionAnswerStats qas on qas.UserId = u.Id
+left join UserActivity ua on ua.UserId = u.Id
+left join TopTagQuestions tt on tt.OwnerUserId = u.Id
+left join DuplicateLinkedQuestions dup on dup.PostId in (
+    select p.Id from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 1
+) limit 1
+left join CorrelatedVotes cv on cv.PostId = dup.PostId
+left join UserScoreRanks usr on usr.Id = u.Id
+left join LastActivityPosts lap on lap.OwnerUserId = u.Id and lap.rn = 1
+where u.Reputation > 1000
+group by u.Id, u.DisplayName, utb.BadgeName, qas.QuestionCount, qas.AnswerCount, qas.AvgQuestionScore, qas.AvgAnswerScore,
+         ua.EditsMade, ua.CommentCount, ua.VotesCast, dup.PostTitle, dup.RelatedPostTitle, cv.UpVotes, cv.DownVotes, cv.ApprovedEditSuggestions,
+         usr.QuestionRank, usr.AnswerRank, lap.Title, lap.CreationDate
+order by usr.QuestionRank asc nulls last, usr.AnswerRank asc nulls last
+limit 50;

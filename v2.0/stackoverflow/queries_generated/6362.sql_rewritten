@@ -1,0 +1,38 @@
+-- {"query": "6362.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-micro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 353} 
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    u.AboutMe,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    COUNT(DISTINCT p.Id) AS PostCount,
+    SUM(p.Score) AS TotalScore,
+    MAX(p.LastActivityDate) AS LastActivePost,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 1 THEN v.PostId END) AS AcceptedAnswerCount,
+    AVG(p.ViewCount) AS AvgViewCount,
+    MAX(ph.CreationDate) AS LastEdited,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Comment END) AS CloseReason,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 33 THEN ph.Comment END) AS PostNotice
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId AND v.VoteTypeId = 1
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+WHERE 
+    p.PostTypeId = 1 AND 
+    u.Reputation > 1000 AND 
+    p.LastActivityDate > DATE_SUB(cast('2024-10-01 12:34:56' as timestamp), INTERVAL 1 YEAR)
+GROUP BY 
+    u.Id
+HAVING 
+    AVG(p.Score) > 100 AND 
+    COUNT(DISTINCT p.Id) > 10
+ORDER BY 
+    TotalScore DESC, 
+    PostCount DESC
+LIMIT 100;

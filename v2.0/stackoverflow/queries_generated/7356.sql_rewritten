@@ -1,0 +1,292 @@
+-- {"query": "7356.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2791} 
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        COUNT(DISTINCT b.Id) AS Badges,
+        COUNT(DISTINCT c.Id) AS Comments,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId IN (2, 3) THEN v.Id END) AS Votes,
+        AVG(CAST(p.Score AS FLOAT)) AS AvgPostScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) AS MedianScore,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RankByReputation,
+        DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS RankByPostCount,
+        RANK() OVER (ORDER BY u.Views DESC) AS RankByViews,
+        CASE WHEN u.AccountId IS NOT NULL THEN 'AccountHolder' ELSE 'SoloUser' END AS UserCategory,
+        CASE WHEN u.Reputation > 10000 THEN 'Expert' ELSE 'Regular' END AS UserTier,
+        TRIM(CONCAT(u.WebsiteUrl, ' ', u.Location, ' ', u.AboutMe)) AS UserProfileSummary,
+        COALESCE(u.EmailHash, 'NoEmail') AS EmailHash,
+        CONCAT('User_', u.Id) AS UserAlias
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    WHERE u.CreationDate >= '2010-01-01 00:00:00'
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes, u.AccountId, u.WebsiteUrl, u.Location, u.AboutMe, u.EmailHash
+),
+TopTags AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        (SELECT COUNT(*) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%') AS PostsWithTag,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank,
+        CASE WHEN t.Count > 1000 THEN 'Popular' ELSE 'Moderate' END AS TagPopularity
+    FROM Tags t
+    WHERE t.Count > 50
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.ParentId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.Tags,
+        p.LastActivityDate,
+        p.AcceptedAnswerId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostTypeCategory,
+        CASE 
+            WHEN p.Score > 10 THEN 'HighlyRated'
+            WHEN p.Score > 0 THEN 'Positive'
+            ELSE 'NeutralOrNegative'
+        END AS RatingCategory,
+        CASE WHEN p.AnswerCount > 0 THEN 'HasAnswer' ELSE 'NoAnswer' END AS AnswerStatus,
+        DATEDIFF('DAY', p.CreationDate, cast('2024-10-01 12:34:56' as timestamp)) AS DaysSinceCreation,
+        LENGTH(p.Body) AS BodyLength,
+        CASE WHEN LENGTH(p.Tags) > 0 THEN 1 ELSE 0 END AS HasTags,
+        COALESCE(
+            (SELECT TOP 1 ph.Comment 
+             FROM PostHistory ph 
+             WHERE ph.PostId = p.Id 
+               AND ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20, 35) 
+               AND ph.Comment IS NOT NULL
+             ORDER BY ph.CreationDate DESC), 
+            'NoCloseComment'
+        ) AS RecentHistoryComment,
+        (SELECT COUNT(*) 
+         FROM PostHistory ph 
+         WHERE ph.PostId = p.Id 
+           AND ph.PostHistoryTypeId IN (5, 6, 24)) AS EditCount
+    FROM Posts p
+    WHERE p.CreationDate >= '2020-01-01 00:00:00'
+      AND p.PostTypeId IN (1, 2)
+),
+CombinedData AS (
+    SELECT 
+        us.UserId,
+        us.Reputation,
+        us.DisplayName,
+        us.Views,
+        us.UpVotes,
+        us.DownVotes,
+        us.TotalPosts,
+        us.Questions,
+        us.Answers,
+        us.Badges,
+        us.Comments,
+        us.Votes,
+        us.AvgPostScore,
+        us.LastPostDate,
+        us.MedianScore,
+        us.RankByReputation,
+        us.RankByPostCount,
+        us.RankByViews,
+        us.UserCategory,
+        us.UserTier,
+        us.UserProfileSummary,
+        us.EmailHash,
+        us.UserAlias,
+        ta.TagName,
+        ta.Count AS TagCount,
+        ta.PostsWithTag,
+        ta.TagRank,
+        ta.TagPopularity,
+        pa.PostId,
+        pa.Title,
+        pa.Body,
+        pa.Score AS PostScore,
+        pa.ViewCount,
+        pa.CreationDate AS PostCreationDate,
+        pa.PostTypeId,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.FavoriteCount,
+        pa.Tags,
+        pa.LastActivityDate,
+        pa.RatingCategory,
+        pa.AnswerStatus,
+        pa.DaysSinceCreation,
+        pa.BodyLength,
+        pa.HasTags,
+        pa.RecentHistoryComment,
+        pa.EditCount
+    FROM UserStats us
+    LEFT JOIN TopTags ta ON 1 = 1
+    LEFT JOIN PostAnalysis pa ON pa.OwnerUserId = us.UserId
+    WHERE us.TotalPosts > 0
+)
+SELECT 
+    cd.UserId,
+    cd.Reputation,
+    cd.DisplayName,
+    cd.Views,
+    cd.UpVotes,
+    cd.DownVotes,
+    cd.TotalPosts,
+    cd.Questions,
+    cd.Answers,
+    cd.Badges,
+    cd.Comments,
+    cd.Votes,
+    cd.AvgPostScore,
+    cd.LastPostDate,
+    cd.MedianScore,
+    cd.RankByReputation,
+    cd.RankByPostCount,
+    cd.RankByViews,
+    cd.UserCategory,
+    cd.UserTier,
+    cd.UserProfileSummary,
+    cd.EmailHash,
+    cd.UserAlias,
+    cd.TagName,
+    cd.TagCount,
+    cd.PostsWithTag,
+    cd.TagRank,
+    cd.TagPopularity,
+    cd.PostId,
+    cd.Title,
+    cd.Body,
+    cd.PostScore,
+    cd.ViewCount,
+    cd.PostCreationDate,
+    cd.PostTypeId,
+    cd.AnswerCount,
+    cd.CommentCount,
+    cd.FavoriteCount,
+    cd.Tags,
+    cd.LastActivityDate,
+    cd.RatingCategory,
+    cd.AnswerStatus,
+    cd.DaysSinceCreation,
+    cd.BodyLength,
+    cd.HasTags,
+    cd.RecentHistoryComment,
+    cd.EditCount,
+    CASE 
+        WHEN cd.Reputation > 10000 AND cd.TotalPosts > 100 THEN 'Elite Contributor'
+        WHEN cd.Reputation > 5000 AND cd.TotalPosts > 50 THEN 'Veteran Contributor'
+        WHEN cd.Reputation > 1000 AND cd.TotalPosts > 20 THEN 'Active Contributor'
+        ELSE 'Regular Contributor'
+    END AS ContributionLevel,
+    CASE 
+        WHEN cd.PostTypeId = 1 AND cd.Score > 10 THEN 'HighQualityQuestion'
+        WHEN cd.PostTypeId = 1 AND cd.Score <= 0 THEN 'LowQualityQuestion'
+        WHEN cd.PostTypeId = 2 AND cd.Score > 5 THEN 'HighQualityAnswer'
+        WHEN cd.PostTypeId = 2 AND cd.Score <= 0 THEN 'LowQualityAnswer'
+        ELSE 'NeutralPost'
+    END AS QualityCategory,
+    CASE 
+        WHEN cd.DaysSinceCreation < 30 THEN 'FreshPost'
+        WHEN cd.DaysSinceCreation < 90 THEN 'RecentPost'
+        WHEN cd.DaysSinceCreation < 365 THEN 'OldPost'
+        ELSE 'ArchivedPost'
+    END AS PostAgeCategory,
+    CONCAT('Score_', cd.PostScore) AS ScoreCategory,
+    CASE 
+        WHEN LOWER(cd.Title) LIKE '%sql%' OR LOWER(cd.Tags) LIKE '%sql%' THEN 'SQLRelated'
+        WHEN LOWER(cd.Title) LIKE '%python%' OR LOWER(cd.Tags) LIKE '%python%' THEN 'PythonRelated'
+        WHEN LOWER(cd.Title) LIKE '%java%' OR LOWER(cd.Tags) LIKE '%java%' THEN 'JavaRelated'
+        ELSE 'OtherTopic'
+    END AS TopicCategory,
+    CASE 
+        WHEN cd.FavoriteCount > 10 THEN 'PopularInFavorites'
+        WHEN cd.FavoriteCount > 5 THEN 'ModerateFavorites'
+        WHEN cd.FavoriteCount > 0 THEN 'FewFavorites'
+        ELSE 'NoFavorites'
+    END AS FavoriteStatus,
+    ABS(cd.EditCount) AS EffectiveEditCount,
+    TRIM(cd.Title) AS CleanTitle,
+    TRIM(cd.Tags) AS CleanTags,
+    CASE 
+        WHEN cd.TagPopularity = 'Popular' THEN 1 
+        WHEN cd.TagPopularity = 'Moderate' THEN 0 
+        ELSE -1 
+    END AS TagPopularityScore,
+    DATEDIFF('MONTH', cd.PostCreationDate, cast('2024-10-01 12:34:56' as timestamp)) AS MonthsSincePost,
+    CASE 
+        WHEN cd.MedianScore > 10 THEN 'HighMedianScore'
+        WHEN cd.MedianScore > 5 THEN 'ModerateMedianScore'
+        WHEN cd.MedianScore > 0 THEN 'LowMedianScore'
+        ELSE 'NoPostScore'
+    END AS MedianScoreCategory,
+    CASE 
+        WHEN cd.AvgPostScore > 10 THEN 'HighAverageScore'
+        WHEN cd.AvgPostScore > 5 THEN 'ModerateAverageScore'
+        WHEN cd.AvgPostScore > 0 THEN 'LowAverageScore'
+        ELSE 'NoScore'
+    END AS AverageScoreCategory,
+    CASE 
+        WHEN cd.HasTags = 1 THEN 'TaggedPost'
+        ELSE 'UntaggedPost'
+    END AS TaggingStatus,
+    CASE 
+        WHEN cd.UserTier = 'Expert' AND cd.UserCategory = 'AccountHolder' THEN 'ExpertAccount'
+        WHEN cd.UserTier = 'Expert' THEN 'ExpertSolo'
+        WHEN cd.UserCategory = 'AccountHolder' THEN 'RegularAccount'
+        ELSE 'RegularSolo'
+    END AS UserClassification,
+    CASE 
+        WHEN cd.UserRank = 1 THEN 'FirstPlace'
+        WHEN cd.UserRank = 2 THEN 'SecondPlace'
+        WHEN cd.UserRank = 3 THEN 'ThirdPlace'
+        ELSE 'OtherRank'
+    END AS UserPerformanceRank,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = cd.UserId AND p.PostTypeId = 2 AND p.Score > 10) AS HighScoreAnswers,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = cd.UserId AND p.PostTypeId = 1 AND p.Score > 10) AS HighScoreQuestions,
+    (SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = cd.UserId AND (p.PostTypeId = 2 OR p.PostTypeId = 1)) AS OverallScoreAverage,
+    CASE 
+        WHEN cd.ScoreCategory = 'Score_0' THEN 'ZeroScore'
+        WHEN cd.ScoreCategory = 'Score_-1' THEN 'NegativeScore'
+        ELSE 'PositiveScore'
+    END AS ScoreIndicator,
+    CASE 
+        WHEN cd.Reputation BETWEEN 1 AND 500 THEN 'Beginner'
+        WHEN cd.Reputation BETWEEN 501 AND 2000 THEN 'Intermediate'
+        WHEN cd.Reputation BETWEEN 2001 AND 5000 THEN 'Advanced'
+        WHEN cd.Reputation > 5000 THEN 'Expert'
+        ELSE 'Unknown'
+    END AS ReputationLevel,
+    CASE 
+        WHEN cd.Reputation >= 10000 AND cd.ViewCount >= 1000 THEN 'HighVisibilityUser'
+        WHEN cd.Reputation >= 5000 AND cd.ViewCount >= 500 THEN 'ModerateVisibilityUser'
+        WHEN cd.Reputation >= 1000 AND cd.ViewCount >= 100 THEN 'LowVisibilityUser'
+        ELSE 'MinimalVisibilityUser'
+    END AS VisibilityCategory
+FROM CombinedData cd
+WHERE cd.Reputation IS NOT NULL
+  AND cd.TotalPosts IS NOT NULL
+  AND (cd.TagCount > 0 OR cd.TagCount IS NULL)
+  AND (cd.PostScore >= 0 OR cd.PostScore IS NULL)
+  AND cd.PostTypeId IS NOT NULL;

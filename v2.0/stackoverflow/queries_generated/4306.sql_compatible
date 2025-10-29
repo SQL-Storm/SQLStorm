@@ -1,0 +1,222 @@
+WITH
+  UserEngagement AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      COUNT(DISTINCT p.Id) AS QuestionCount,
+      COUNT(DISTINCT a.Id) AS AnswerCount,
+      COUNT(DISTINCT c.Id) AS CommentCount,
+      COUNT(DISTINCT b.Id) AS BadgeCount,
+      SUM(CASE WHEN p.Id IS NOT NULL THEN p.Score ELSE 0 END) AS TotalQuestionScore,
+      SUM(CASE WHEN a.Id IS NOT NULL THEN a.Score ELSE 0 END) AS TotalAnswerScore,
+      u.Views AS UserProfileViews,
+      u.UpVotes AS UserUpVotes,
+      u.DownVotes AS UserDownVotes,
+      CASE
+        WHEN u.WebsiteUrl IS NULL THEN 'No Website'
+        WHEN u.WebsiteUrl LIKE '%stackoverflow.com%' THEN 'Stack Overflow Related'
+        ELSE 'External Website'
+      END AS WebsiteCategory,
+      CASE
+        WHEN DATE_PART('year', AGE(CAST('2024-10-01 12:34:56' AS timestamp), u.CreationDate)) > 5 THEN 'Very Old'
+        WHEN DATE_PART('year', AGE(CAST('2024-10-01 12:34:56' AS timestamp), u.CreationDate)) > 2 THEN 'Old'
+        ELSE 'New'
+      END AS UserAgeCategory
+    FROM
+      Users AS u
+    LEFT JOIN
+      Posts AS p
+      ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+    LEFT JOIN
+      Posts AS a
+      ON u.Id = a.OwnerUserId AND a.PostTypeId = 2
+    LEFT JOIN
+      Comments AS c
+      ON u.Id = c.UserId
+    LEFT JOIN
+      Badges AS b
+      ON u.Id = b.UserId
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.Views,
+      u.UpVotes,
+      u.DownVotes,
+      u.WebsiteUrl,
+      u.CreationDate
+  ),
+  PostActivity AS (
+    SELECT
+      ph.PostId,
+      COUNT(CASE WHEN ph.PostHistoryTypeId IN (1, 4, 7) THEN 1 END) AS TitleEdits,
+      COUNT(CASE WHEN ph.PostHistoryTypeId IN (2, 5, 8) THEN 1 END) AS BodyEdits,
+      COUNT(CASE WHEN ph.PostHistoryTypeId IN (3, 6, 9) THEN 1 END) AS TagEdits,
+      MAX(ph.CreationDate) AS LastPostHistoryDate,
+      CASE
+        WHEN COUNT(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 END) > 0 THEN 'Closed'
+        WHEN COUNT(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 END) > 0 THEN 'Reopened'
+        ELSE 'Open'
+      END AS PostStatus
+    FROM
+      PostHistory AS ph
+    GROUP BY
+      ph.PostId
+  ),
+  AggregatedPostData AS (
+    SELECT
+      p.Id AS PostId,
+      pt.Name AS PostType,
+      p.Title,
+      p.CreationDate AS PostCreationDate,
+      p.Score,
+      p.ViewCount,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      CASE
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        ELSE 'Active'
+      END AS PostLifecycleStage,
+      pa.TitleEdits,
+      pa.BodyEdits,
+      pa.TagEdits,
+      pa.PostStatus,
+      CASE
+        WHEN p.OwnerUserId IS NULL THEN 'Anonymous'
+        WHEN ue.Reputation < 1000 THEN 'Low Reputation'
+        WHEN ue.Reputation BETWEEN 1000 AND 10000 THEN 'Medium Reputation'
+        ELSE 'High Reputation'
+      END AS OwnerReputationLevel,
+      CASE
+        WHEN UPPER(p.Tags) LIKE '%<SQL>%' THEN TRUE
+        ELSE FALSE
+      END AS IsSqlRelated,
+      CASE
+        WHEN p.Title IS NOT NULL AND LENGTH(p.Title) > 50 THEN 'Long Title'
+        WHEN p.Title IS NOT NULL AND LENGTH(p.Title) < 15 THEN 'Short Title'
+        ELSE 'Medium Title'
+      END AS TitleLengthCategory,
+      ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) AS PostSequence,
+      p.OwnerUserId
+    FROM
+      Posts AS p
+    INNER JOIN
+      PostTypes AS pt
+      ON p.PostTypeId = pt.Id
+    LEFT JOIN
+      UserEngagement AS ue
+      ON p.OwnerUserId = ue.UserId
+    LEFT JOIN
+      PostActivity AS pa
+      ON p.Id = pa.PostId
+    WHERE
+      p.CreationDate > '2023-01-01'
+    GROUP BY
+      p.Id,
+      pt.Name,
+      p.Title,
+      p.CreationDate,
+      p.Score,
+      p.ViewCount,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      p.ClosedDate,
+      p.CommunityOwnedDate,
+      pa.TitleEdits,
+      pa.BodyEdits,
+      pa.TagEdits,
+      pa.PostStatus,
+      ue.Reputation,
+      p.Tags,
+      p.PostTypeId,
+      p.OwnerUserId
+  )
+SELECT
+  apd.PostId,
+  apd.PostType,
+  apd.Title,
+  apd.PostCreationDate,
+  apd.Score,
+  apd.ViewCount,
+  apd.AnswerCount,
+  apd.CommentCount,
+  apd.FavoriteCount,
+  apd.PostLifecycleStage,
+  apd.TitleEdits,
+  apd.BodyEdits,
+  apd.TagEdits,
+  apd.PostStatus,
+  apd.OwnerReputationLevel,
+  apd.IsSqlRelated,
+  apd.TitleLengthCategory,
+  CASE
+    WHEN apd.Score > 100 AND apd.FavoriteCount > 10 THEN 'Highly Valued'
+    WHEN apd.Score < 0 THEN 'Negatively Scored'
+    ELSE 'Standard'
+  END AS PostValueCategory,
+  CASE
+    WHEN apd.PostSequence <= 50 THEN 'Top 50'
+    WHEN apd.PostSequence <= 200 THEN 'Top 200'
+    ELSE 'Other'
+  END AS PostRankByCategory,
+  CASE
+    WHEN apd.PostLifecycleStage = 'Closed' AND apd.PostStatus = 'Closed' THEN 'Effectively Closed'
+    WHEN apd.PostLifecycleStage = 'Active' AND apd.PostStatus = 'Open' THEN 'Actively Open'
+    ELSE 'Other Status'
+  END AS DetailedStatus,
+  COALESCE(ue.Reputation, 0) AS OwnerReputation,
+  CASE
+    WHEN ue.DisplayName IS NULL THEN 'Null Display Name'
+    ELSE ue.DisplayName
+  END AS SanitizedDisplayName,
+  ue.WebsiteCategory,
+  ue.UserAgeCategory,
+  LAG(apd.Score, 1, 0) OVER (PARTITION BY apd.PostType ORDER BY apd.PostCreationDate) AS PreviousPostScore,
+  LEAD(apd.Score, 1, 0) OVER (PARTITION BY apd.PostType ORDER BY apd.PostCreationDate) AS NextPostScore,
+  SUM(apd.Score) OVER (PARTITION BY apd.PostType ORDER BY apd.PostCreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativeScoreByType,
+  AVG(apd.ViewCount) OVER (PARTITION BY apd.PostType) AS AverageViewCountByType
+FROM
+  AggregatedPostData AS apd
+LEFT JOIN
+  UserEngagement AS ue
+  ON apd.OwnerUserId = ue.UserId
+WHERE
+  apd.PostType IN ('Question', 'Answer') AND apd.IsSqlRelated = TRUE
+UNION ALL
+SELECT
+  NULL AS PostId,
+  'Summary' AS PostType,
+  'Average Metrics for SQL Related Posts' AS Title,
+  NULL AS PostCreationDate,
+  AVG(apd.Score) AS Score,
+  AVG(apd.ViewCount) AS ViewCount,
+  AVG(apd.AnswerCount) AS AnswerCount,
+  AVG(apd.CommentCount) AS CommentCount,
+  AVG(apd.FavoriteCount) AS FavoriteCount,
+  NULL AS PostLifecycleStage,
+  AVG(apd.TitleEdits) AS TitleEdits,
+  AVG(apd.BodyEdits) AS BodyEdits,
+  AVG(apd.TagEdits) AS TagEdits,
+  NULL AS PostStatus,
+  NULL AS OwnerReputationLevel,
+  NULL AS IsSqlRelated,
+  NULL AS TitleLengthCategory,
+  NULL AS PostValueCategory,
+  NULL AS PostRankByCategory,
+  NULL AS DetailedStatus,
+  NULL AS OwnerReputation,
+  'Aggregated' AS SanitizedDisplayName,
+  NULL AS WebsiteCategory,
+  NULL AS UserAgeCategory,
+  NULL AS PreviousPostScore,
+  NULL AS NextPostScore,
+  NULL AS CumulativeScoreByType,
+  NULL AS AverageViewCountByType
+FROM
+  AggregatedPostData AS apd
+WHERE
+  apd.PostType IN ('Question', 'Answer') AND apd.IsSqlRelated = TRUE;

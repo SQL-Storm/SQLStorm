@@ -1,0 +1,84 @@
+WITH TopTags AS (
+  SELECT
+    t.Id AS TagId,
+    t.TagName,
+    SUM(p.Score) AS TotalScore,
+    AVG(p.ViewCount) AS AvgViews,
+    COUNT(DISTINCT p.OwnerUserId) AS UniqueAuthors
+  FROM Posts p
+  JOIN Tags t ON p.Tags LIKE '%' || t.TagName || '%'
+  WHERE p.PostTypeId = 1
+    AND p.ClosedDate IS NULL
+  GROUP BY t.Id, t.TagName
+),
+TagBurndown AS (
+  SELECT
+    t.TagName,
+    SUM(CASE WHEN p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days' THEN p.Score ELSE 0 END) AS Last30DaysScore,
+    SUM(CASE WHEN p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days' THEN p.Score ELSE 0 END) AS Last90DaysScore,
+    COUNT(*) FILTER (WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days') AS QuestionsLast30
+  FROM Posts p
+  JOIN Tags t ON p.Tags LIKE '%' || t.TagName || '%'
+  WHERE p.PostTypeId = 1
+  GROUP BY t.TagName
+),
+RecentActiveUsers AS (
+  SELECT DISTINCT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate
+  FROM Posts p
+  JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180 days'
+),
+ComplexQuery AS (
+  SELECT
+    t.TagName,
+    t.TagId,
+    COALESCE(b.TotalScore, 0) AS TotalScore,
+    COALESCE(b.AvgViews, 0) AS AvgViews,
+    COALESCE(b.UniqueAuthors, 0) AS UniqueAuthors,
+    COALESCE(tb.Last30DaysScore, 0) AS Last30DaysScore,
+    COALESCE(tb.Last90DaysScore, 0) AS Last90DaysScore,
+    COALESCE(tb.QuestionsLast30, 0) AS QuestionsLast30,
+    ARRAY_AGG(DISTINCT ru.UserId) FILTER (WHERE ru.UserId IS NOT NULL) AS ActiveUserIds
+  FROM TopTags t
+  LEFT JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%' AND p.PostTypeId = 1
+  LEFT JOIN (
+    SELECT
+      t.Id AS TagId,
+      SUM(p.Score) AS TotalScore,
+      AVG(p.ViewCount) AS AvgViews,
+      COUNT(DISTINCT p.OwnerUserId) AS UniqueAuthors
+    FROM Posts p
+    JOIN Tags t ON p.Tags LIKE '%' || t.TagName || '%'
+    WHERE p.PostTypeId = 1
+    GROUP BY t.Id
+  ) b ON b.TagId = t.TagId
+  LEFT JOIN TagBurndown tb ON tb.TagName = t.TagName
+  LEFT JOIN (
+    SELECT
+      u.Id AS UserId
+    FROM RecentActiveUsers u
+  ) ru ON true
+  GROUP BY t.TagName, t.TagId, b.TotalScore, b.AvgViews, b.UniqueAuthors, tb.Last30DaysScore, tb.Last90DaysScore, tb.QuestionsLast30
+)
+SELECT
+  ct.TagName,
+  ct.TagId,
+  ct.TotalScore,
+  ct.AvgViews,
+  ct.UniqueAuthors,
+  ct.Last30DaysScore,
+  ct.Last90DaysScore,
+  ct.QuestionsLast30,
+  CASE
+    WHEN ct.Last30DaysScore > 1000 THEN 'Hot'
+    WHEN ct.QuestionsLast30 > 50 THEN 'Active'
+    ELSE 'Steady'
+  END AS Momentum,
+  CARDINALITY(ct.ActiveUserIds) AS ActiveUserCount
+FROM ComplexQuery ct
+ORDER BY ct.TotalScore DESC
+LIMIT 100;

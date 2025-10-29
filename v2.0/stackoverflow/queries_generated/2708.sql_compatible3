@@ -1,0 +1,173 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        p.Id AS ExcerptPostId,
+        p.Title AS ExcerptTitle,
+        p.Score AS ExcerptScore,
+        1 AS Level
+    FROM Tags t
+    LEFT JOIN Posts p ON t.ExcerptPostId = p.Id
+    WHERE (t.IsModeratorOnly = FALSE OR t.IsModeratorOnly = 0 OR t.IsModeratorOnly IS NULL) 
+      AND (t.IsRequired = FALSE OR t.IsRequired = 0 OR t.IsRequired IS NULL)
+
+    UNION ALL
+
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        p2.Id,
+        p2.Title,
+        p2.Score,
+        r.Level + 1
+    FROM Tags t2
+    JOIN Posts p2 ON t2.ExcerptPostId = p2.Id
+    JOIN RecursiveTagHierarchy r ON r.Id <> t2.Id
+    WHERE (t2.IsModeratorOnly = FALSE OR t2.IsModeratorOnly = 0 OR t2.IsModeratorOnly IS NULL)
+      AND (t2.IsRequired = FALSE OR t2.IsRequired = 0 OR t2.IsRequired IS NULL)
+      AND r.Level < 3
+),
+UserBadgesRanked AS (
+    SELECT 
+        b.UserId,
+        b.Name,
+        b.Class,
+        row_number() OVER (PARTITION BY b.UserId ORDER BY b.Class, b.Date DESC) AS rn
+    FROM Badges b
+    WHERE b.Class IN (1, 2, 3)
+),
+TopUsersByScore AS (
+    SELECT DISTINCT 
+        u.Id, 
+        u.DisplayName, 
+        u.Reputation,
+        COALESCE(u.Location, 'Unknown') AS Location,
+        u.CreationDate,
+        SUM(p.Score) OVER (PARTITION BY u.Id) AS TotalPostScore,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswerCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 2) AS UpVotesGiven,
+        (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 3) AS DownVotesGiven,
+        (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id) AS CommentsMade,
+        (SELECT string_agg(DISTINCT b.Name, ', ') FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+        (SELECT string_agg(DISTINCT b.Name, ', ') FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadges,
+        (SELECT string_agg(DISTINCT b.Name, ', ') FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, COALESCE(u.Location, 'Unknown'), u.CreationDate
+),
+TopQuestionsWithAnswers AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate AS QuestionDate,
+        q.Score AS QuestionScore,
+        q.ViewCount AS QuestionViews,
+        q.Tags,
+        a.Id AS AnswerId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerDate,
+        a.OwnerUserId AS AnswerOwner,
+        u.DisplayName AS AnswererName,
+        row_number() OVER (PARTITION BY q.Id ORDER BY a.Score DESC NULLS LAST, a.CreationDate ASC) AS AnswerRank
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    LEFT JOIN Users u ON a.OwnerUserId = u.Id
+    WHERE q.PostTypeId = 1 AND q.Score > 10
+),
+FinalResult AS (
+    SELECT 
+        tu.DisplayName,
+        tu.Reputation,
+        tu.Location,
+        tu.QuestionCount,
+        tu.AnswerCount,
+        tu.TotalPostScore,
+        tu.UpVotesGiven,
+        tu.DownVotesGiven,
+        tu.CommentsMade,
+        COALESCE(tu.GoldBadges, '') AS GoldBadges,
+        COALESCE(tu.SilverBadges, '') AS SilverBadges,
+        COALESCE(tu.BronzeBadges, '') AS BronzeBadges,
+        q.Title AS TopQuestionTitle,
+        q.QuestionScore,
+        q.QuestionViews,
+        q.Tags AS QuestionTags,
+        q.AnswerId,
+        q.AnswerScore,
+        q.AnswererName,
+        CASE 
+            WHEN q.AnswerScore IS NULL THEN 'No Answers'
+            WHEN q.AnswerScore > 5 THEN 'Highly Rated Answer'
+            ELSE 'Answer Present'
+        END AS AnswerQuality,
+        CASE 
+            WHEN POSITION('<sql>' IN COALESCE(q.Tags, '')) > 0 THEN 'Has SQL Tag'
+            ELSE 'No SQL Tag'
+        END AS HasSQLTag,
+        rh.Level AS TagExcerptLevel,
+        rh.TagName AS TagExcerptName,
+        rh.ExcerptTitle AS TagExcerptPostTitle,
+        rh.ExcerptScore AS TagExcerptScore
+    FROM TopUsersByScore tu
+    LEFT JOIN TopQuestionsWithAnswers q ON q.AnswerRank = 1 AND q.QuestionScore > 20 AND q.AnswerScore IS NOT NULL
+    LEFT JOIN RecursiveTagHierarchy rh ON rh.TagName = SUBSTRING(SPLIT_PART(SPLIT_PART(COALESCE(q.Tags, ''), '><', 1), '<', 2) FROM 1 FOR 35)
+    WHERE tu.AnswerCount > 10 AND tu.QuestionCount >= 5
+    GROUP BY
+        tu.DisplayName,
+        tu.Reputation,
+        tu.Location,
+        tu.QuestionCount,
+        tu.AnswerCount,
+        tu.TotalPostScore,
+        tu.UpVotesGiven,
+        tu.DownVotesGiven,
+        tu.CommentsMade,
+        COALESCE(tu.GoldBadges, ''),
+        COALESCE(tu.SilverBadges, ''),
+        COALESCE(tu.BronzeBadges, ''),
+        q.Title,
+        q.QuestionScore,
+        q.QuestionViews,
+        q.Tags,
+        q.AnswerId,
+        q.AnswerScore,
+        q.AnswererName,
+        rh.Level,
+        rh.TagName,
+        rh.ExcerptTitle,
+        rh.ExcerptScore
+    ORDER BY tu.TotalPostScore DESC, q.QuestionScore DESC
+    LIMIT 50
+)
+SELECT * FROM FinalResult
+UNION
+SELECT 
+    'System' AS DisplayName,
+    999999 AS Reputation,
+    'Unknown' AS Location,
+    0 AS QuestionCount,
+    0 AS AnswerCount,
+    0 AS TotalPostScore,
+    0 AS UpVotesGiven,
+    0 AS DownVotesGiven,
+    0 AS CommentsMade,
+    '' AS GoldBadges,
+    '' AS SilverBadges,
+    '' AS BronzeBadges,
+    'Dummy Question Title' AS TopQuestionTitle,
+    0 AS QuestionScore,
+    0 AS QuestionViews,
+    '' AS QuestionTags,
+    NULL::bigint AS AnswerId,
+    NULL::integer AS AnswerScore,
+    NULL AS AnswererName,
+    'No Answers' AS AnswerQuality,
+    'No SQL Tag' AS HasSQLTag,
+    0 AS TagExcerptLevel,
+    NULL AS TagExcerptName,
+    NULL AS TagExcerptPostTitle,
+    NULL::integer AS TagExcerptScore;

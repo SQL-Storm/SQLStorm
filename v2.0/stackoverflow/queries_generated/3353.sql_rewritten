@@ -1,0 +1,111 @@
+-- {"query": "3353.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1929} 
+WITH 
+-- Basic per‑user post statistics
+user_posts AS (
+    SELECT 
+        u.id                                 AS user_id,
+        u.displayname                        AS display_name,
+        u.reputation                         AS reputation,
+        COUNT(p.id) FILTER (WHERE p.posttypeid = 1) AS question_cnt,
+        COUNT(p.id) FILTER (WHERE p.posttypeid = 2) AS answer_cnt,
+        COALESCE(SUM(p.score),0)              AS total_score,
+        MAX(p.creationdate)                  AS last_post_date,
+        -- correlated sub‑query to count distinct tags used by the user
+        (SELECT COUNT(DISTINCT unnest_tags.tag)
+         FROM (
+               SELECT 
+                     regexp_split_to_table(trim(both '><' FROM p.tags), '><') AS tag
+               FROM posts p
+               WHERE p.owneruserid = u.id
+                 AND p.posttypeid = 1
+                 AND p.tags IS NOT NULL
+         ) AS unnest_tags)                  AS distinct_tag_cnt
+    FROM users u
+    LEFT JOIN posts p
+           ON p.owneruserid = u.id
+    GROUP BY u.id, u.displayname, u.reputation
+),
+
+-- Badge aggregates per user
+user_badges AS (
+    SELECT 
+        b.userid                               AS user_id,
+        COUNT(*)                               AS badge_cnt,
+        MAX(CASE WHEN b.class = 1 THEN 1 ELSE 0 END) AS has_gold,
+        STRING_AGG(CASE WHEN b.class = 3 THEN b.name END, ',') FILTER (WHERE b.class = 3) AS bronze_badges
+    FROM badges b
+    GROUP BY b.userid
+),
+
+-- Recent vote activity (up/down) per user
+user_votes AS (
+    SELECT 
+        v.userid                               AS user_id,
+        COUNT(*) FILTER (WHERE vt.name = 'UpMod')   AS up_votes_given,
+        COUNT(*) FILTER (WHERE vt.name = 'DownMod') AS down_votes_given,
+        MAX(v.creationdate)                    AS last_vote_date
+    FROM votes v
+    JOIN votetypes vt ON vt.id = v.votetypeid
+    GROUP BY v.userid
+),
+
+-- Combine everything, add window functions and complex predicates
+combined AS (
+    SELECT 
+        up.user_id,
+        up.display_name,
+        up.reputation,
+        up.question_cnt,
+        up.answer_cnt,
+        up.total_score,
+        up.last_post_date,
+        up.distinct_tag_cnt,
+        ub.badge_cnt,
+        ub.has_gold,
+        ub.bronze_badges,
+        uv.up_votes_given,
+        uv.down_votes_given,
+        uv.last_vote_date,
+        RANK() OVER (ORDER BY up.reputation DESC)                     AS rep_rank,
+        NTILE(4) OVER (ORDER BY up.total_score DESC)                 AS score_quartile,
+        -- a calculated column mixing string, numeric and NULL logic
+        CASE 
+            WHEN ub.bronze_badges IS NULL THEN NULL
+            WHEN POSITION('sql' IN LOWER(ub.bronze_badges)) > 0 THEN 'SQL Lover'
+            ELSE 'Other'
+        END                                                          AS badge_category
+    FROM user_posts up
+    LEFT JOIN user_badges ub ON ub.user_id = up.user_id
+    LEFT JOIN user_votes  uv ON uv.user_id = up.user_id
+    WHERE up.reputation > 1000
+)
+
+-- Final result set with UNION ALL to add a sentinel row when no data matches
+SELECT *
+FROM combined
+WHERE (score_quartile = 1 AND has_gold = 1)
+   OR (badge_category = 'SQL Lover')
+ORDER BY rep_rank
+LIMIT 100
+
+UNION ALL
+
+SELECT 
+    NULL::int         AS user_id,
+    NULL::varchar(40) AS display_name,
+    NULL::int         AS reputation,
+    NULL::int         AS question_cnt,
+    NULL::int         AS answer_cnt,
+    NULL::int         AS total_score,
+    NULL::timestamp   AS last_post_date,
+    NULL::int         AS distinct_tag_cnt,
+    NULL::int         AS badge_cnt,
+    NULL::int         AS has_gold,
+    NULL::varchar     AS bronze_badges,
+    NULL::int         AS up_votes_given,
+    NULL::int         AS down_votes_given,
+    NULL::timestamp   AS last_vote_date,
+    NULL::int         AS rep_rank,
+    NULL::int         AS score_quartile,
+    NULL::varchar     AS badge_category
+WHERE NOT EXISTS (SELECT 1 FROM combined);

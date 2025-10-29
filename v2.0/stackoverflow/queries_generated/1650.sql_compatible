@@ -1,0 +1,226 @@
+WITH TopActiveTags AS (
+    SELECT
+        t.TagName,
+        SUM(p.ViewCount) AS TotalTagViewCount,
+        COUNT(p.Id) AS TotalTagQuestionCount
+    FROM Tags t
+    JOIN Posts p ON p.PostTypeId = 1 AND p.Tags LIKE '%' || t.TagName || '%'
+    WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '5 year'
+      AND p.Tags IS NOT NULL
+      AND LENGTH(TRIM(REPLACE(REPLACE(p.Tags, '><', ' '), '<', ''), '>')) > 0
+    GROUP BY t.TagName
+    HAVING COUNT(p.Id) >= 50
+    ORDER BY TotalTagViewCount DESC, TotalTagQuestionCount DESC
+    LIMIT 20
+),
+RecentHighImpactQuestions AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.Body,
+        p.OwnerUserId,
+        p.OwnerDisplayName,
+        p.CreationDate AS QuestionCreationDate,
+        p.Score AS QuestionScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.LastActivityDate,
+        p.ClosedDate,
+        COALESCE(
+            SUBSTRING(p.Tags FROM POSITION('<' IN p.Tags) + 1 FOR POSITION('>' IN p.Tags) - POSITION('<' IN p.Tags) - 1),
+            'Untagged'
+        ) AS PrimaryTag,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 'AcceptedAnswered'
+            WHEN p.AnswerCount > 0 THEN 'Answered'
+            ELSE 'Open'
+        END AS QuestionStatus
+    FROM Posts p
+    JOIN TopActiveTags tat ON p.Tags LIKE '%' || tat.TagName || '%'
+    WHERE p.PostTypeId = 1
+      AND p.ViewCount > 500
+      AND p.Score > 5
+      AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 year'
+      AND p.OwnerUserId IS NOT NULL
+      AND p.Title IS NOT NULL
+),
+UserActivityBase AS (
+    SELECT u.Id AS UserId, u.DisplayName, u.Reputation, u.CreationDate, u.Views, u.UpVotes, u.DownVotes
+    FROM Users u
+    WHERE u.Id IN (SELECT DISTINCT OwnerUserId FROM RecentHighImpactQuestions WHERE OwnerUserId IS NOT NULL)
+       OR u.Reputation > 20000
+),
+DetailedPostEditHistory AS (
+    SELECT
+        ph.PostId,
+        ph.CreationDate AS EditDate,
+        ph.UserId AS EditorUserId,
+        ph.PostHistoryTypeId,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS EditSequence,
+        LAG(ph.CreationDate, 1, ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS PreviousEventDate
+    FROM PostHistory ph
+    WHERE ph.PostId IN (SELECT PostId FROM RecentHighImpactQuestions)
+      AND ph.PostHistoryTypeId IN (4, 5, 6)
+),
+PostAggregatedMetrics AS (
+    SELECT
+        rhq.PostId,
+        rhq.Title,
+        rhq.Body,
+        rhq.OwnerUserId,
+        rhq.QuestionCreationDate,
+        rhq.QuestionScore,
+        rhq.ViewCount,
+        rhq.AnswerCount,
+        rhq.FavoriteCount,
+        rhq.LastActivityDate,
+        rhq.ClosedDate,
+        rhq.PrimaryTag,
+        rhq.QuestionStatus,
+        (SELECT COUNT(DISTINCT deph.EditorUserId) FROM DetailedPostEditHistory deph WHERE deph.PostId = rhq.PostId) AS UniqueEditorsCount,
+        COALESCE(AVG(EXTRACT(EPOCH FROM (deph.EditDate - deph.PreviousEventDate))) FILTER (WHERE deph.EditSequence > 1), 0.0) AS AvgSecondsBetweenEdits,
+        COALESCE((SELECT AVG(c.Score) FROM Comments c WHERE c.PostId = rhq.PostId), 0.0) AS AvgCommentScore,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20) THEN 1 ELSE 0 END) AS ModeratorActionCount,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 16 THEN 1 ELSE 0 END) AS WasCommunityOwnedFlag,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 AND ph.Comment = '101' THEN 1 ELSE 0 END) AS ClosedAsDuplicateFlag,
+        MIN(deph.EditDate - rhq.QuestionCreationDate) AS TimeToFirstEditInterval
+    FROM RecentHighImpactQuestions rhq
+    LEFT JOIN PostHistory ph ON rhq.PostId = ph.PostId
+    LEFT JOIN DetailedPostEditHistory deph ON rhq.PostId = deph.PostId
+    GROUP BY
+        rhq.PostId, rhq.Title, rhq.Body, rhq.OwnerUserId, rhq.QuestionCreationDate, rhq.QuestionScore,
+        rhq.ViewCount, rhq.AnswerCount, rhq.FavoriteCount, rhq.LastActivityDate, rhq.ClosedDate,
+        rhq.PrimaryTag, rhq.QuestionStatus
+),
+CombinedUserTopPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Score,
+        p.CreationDate,
+        'Question' AS PostType
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Score > 50 AND p.OwnerUserId IN (SELECT UserId FROM UserActivityBase)
+    UNION ALL
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Score,
+        p.CreationDate,
+        'Answer' AS PostType
+    FROM Posts p
+    WHERE p.PostTypeId = 2 AND p.Score > 75 AND p.OwnerUserId IN (SELECT UserId FROM UserActivityBase)
+),
+UserOverallEngagement AS (
+    SELECT
+        uab.UserId,
+        uab.DisplayName,
+        uab.Reputation,
+        uab.CreationDate AS UserJoinDate,
+        uab.Views AS UserProfileViews,
+        uab.UpVotes AS UserUpVotesGiven,
+        uab.DownVotes AS UserDownVotesGiven,
+        COALESCE(SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END), 0) AS GoldBadges,
+        COALESCE(SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END), 0) AS SilverBadges,
+        COALESCE(SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END), 0) AS BronzeBadges,
+        MAX(CASE WHEN b.Name = 'Disciplined' THEN 1 ELSE 0 END) AS HasDisciplinedBadge,
+        COUNT(DISTINCT ctp.PostId) AS TotalHighScorePosts,
+        COALESCE(AVG(ctp.Score), 0.0) AS AvgHighScorePostScore,
+        COALESCE(AVG(p_all.Score) FILTER (WHERE p_all.PostTypeId = 1), 0.0) AS OverallAvgQuestionScore,
+        (SELECT CASE WHEN EXISTS (SELECT 1 FROM Posts p_kw WHERE p_kw.OwnerUserId = uab.UserId AND p_kw.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year' AND p_kw.Body ILIKE '%kubernetes%') THEN TRUE ELSE FALSE END) AS PostedAboutKubernetesRecently
+    FROM UserActivityBase uab
+    LEFT JOIN Badges b ON uab.UserId = b.UserId
+    LEFT JOIN CombinedUserTopPosts ctp ON uab.UserId = ctp.OwnerUserId
+    LEFT JOIN Posts p_all ON uab.UserId = p_all.OwnerUserId
+    GROUP BY uab.UserId, uab.DisplayName, uab.Reputation, uab.CreationDate, uab.Views, uab.UpVotes, uab.DownVotes
+),
+RankedUserPerformance AS (
+    SELECT
+        uoe.UserId,
+        uoe.DisplayName,
+        uoe.Reputation,
+        uoe.GoldBadges,
+        uoe.SilverBadges,
+        uoe.BronzeBadges,
+        uoe.HasDisciplinedBadge,
+        uoe.TotalHighScorePosts,
+        uoe.AvgHighScorePostScore,
+        uoe.OverallAvgQuestionScore,
+        uoe.PostedAboutKubernetesRecently,
+        RANK() OVER (ORDER BY uoe.Reputation DESC, uoe.TotalHighScorePosts DESC) AS UserOverallRank,
+        NTILE(4) OVER (ORDER BY uoe.Reputation DESC) AS ReputationQuartile,
+        AVG(uoe.UserProfileViews) OVER (PARTITION BY uoe.HasDisciplinedBadge) AS AvgViewsForDisciplineGroup,
+        CASE
+            WHEN uoe.GoldBadges >= 5 AND uoe.Reputation >= 100000 THEN 'Legendary Expert'
+            WHEN uoe.GoldBadges >= 1 OR uoe.Reputation >= 50000 THEN 'Senior Expert'
+            WHEN uoe.SilverBadges >= 5 OR uoe.Reputation >= 10000 THEN 'Mid-Level Contributor'
+            ELSE 'Junior Contributor'
+        END AS UserExpertiseLevel
+    FROM UserOverallEngagement uoe
+)
+SELECT
+    rup.DisplayName AS OwnerName,
+    rup.Reputation AS OwnerReputation,
+    rup.UserExpertiseLevel,
+    rup.UserOverallRank,
+    rup.ReputationQuartile,
+    rup.HasDisciplinedBadge,
+    rup.PostedAboutKubernetesRecently,
+    pam.PostId AS QuestionID,
+    pam.Title AS QuestionTitle,
+    pam.Body AS QuestionBody,
+    pam.QuestionCreationDate,
+    pam.QuestionStatus,
+    pam.PrimaryTag,
+    pam.ViewCount,
+    pam.QuestionScore,
+    pam.AnswerCount,
+    pam.FavoriteCount,
+    pam.UniqueEditorsCount,
+    pam.AvgCommentScore,
+    pam.ModeratorActionCount,
+    pam.WasCommunityOwnedFlag,
+    pam.ClosedAsDuplicateFlag,
+    pam.AvgSecondsBetweenEdits,
+    pam.TimeToFirstEditInterval,
+    CAST(pam.QuestionScore AS DECIMAL) / NULLIF(pam.ViewCount, 0) AS ScorePerViewRatio,
+    (pam.AnswerCount * 0.75 + pam.FavoriteCount * 1.5 + pam.UniqueEditorsCount * 0.5 + pam.AvgCommentScore * 0.25) AS WeightedEngagementIndex,
+    COALESCE(UPPER(SUBSTRING(pam.Title FROM 1 FOR 1)), '#') AS FirstCharOfTitle,
+    TRIM(BOTH '>' FROM TRIM(BOTH '<' FROM pam.PrimaryTag)) AS CleanPrimaryTag,
+    CASE
+        WHEN pam.Title ILIKE '%error%' OR pam.Body ILIKE '%bug%' THEN 'Issue/Bug Report'
+        WHEN pam.Title ILIKE '%how to%' OR pam.Title ILIKE '%guide%' THEN 'How-To/Guidance'
+        WHEN pam.PrimaryTag IN ('javascript', 'python', 'java') THEN 'Popular Language'
+        ELSE 'Other Technical'
+    END AS ContentTopicCategory,
+    (
+        SELECT COALESCE(STRING_AGG(c.Text, ' || '), 'No high-score comments recently')
+        FROM Comments c
+        WHERE c.PostId = pam.PostId
+          AND c.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '6 month'
+        ORDER BY c.Score DESC, c.CreationDate DESC
+        LIMIT 1
+    ) AS TopRecentCommentSnippet,
+    pl_linked.RelatedPostId AS LinkedToPostId,
+    pl_duplicate.RelatedPostId AS DuplicateOfPostId,
+    COALESCE(CAST(rup.OverallAvgQuestionScore AS DECIMAL) / NULLIF(pam.QuestionScore, 0), 0.0) AS OwnerAvgVsPostScoreRatio
+FROM PostAggregatedMetrics pam
+LEFT JOIN RankedUserPerformance rup ON pam.OwnerUserId = rup.UserId
+LEFT JOIN PostLinks pl_linked ON pam.PostId = pl_linked.PostId AND pl_linked.LinkTypeId = 1
+LEFT JOIN PostLinks pl_duplicate ON pam.PostId = pl_duplicate.PostId AND pl_duplicate.LinkTypeId = 3
+WHERE
+    pam.QuestionScore > 20
+    AND pam.ViewCount > 10000
+    AND pam.ModeratorActionCount > 0
+    AND pam.ClosedAsDuplicateFlag = 1
+    AND rup.ReputationQuartile = 1
+    AND (pam.AvgSecondsBetweenEdits IS NULL OR pam.AvgSecondsBetweenEdits > 7200)
+ORDER BY
+    rup.Reputation DESC,
+    pam.ViewCount DESC,
+    pam.QuestionScore DESC,
+    pam.LastActivityDate DESC
+LIMIT 750;

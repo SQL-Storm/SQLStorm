@@ -1,0 +1,223 @@
+-- {"query": "2847.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2325} 
+
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        array[t.TagName] as Ancestors
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+  union all
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Ancestors || t.TagName
+    from Tags t
+    join PostLinks pl on pl.PostId = t.WikiPostId and pl.LinkTypeId = 1
+    join RecursiveTagHierarchy r on r.Id = pl.RelatedPostId
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+),
+UserBadgeStats as (
+    select
+        b.UserId,
+        count(*) filter (where b.Class = 1) as GoldBadges,
+        count(*) filter (where b.Class = 2) as SilverBadges,
+        count(*) filter (where b.Class = 3) as BronzeBadges,
+        count(distinct b.Name) as DistinctBadgeNames,
+        max(b.Date) as LastBadgeDate
+    from Badges b
+    group by b.UserId
+),
+PostEngagement as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.AnswerCount,
+        p.FavoriteCount,
+        case when p.ClosedDate is null then 0 else 1 end as IsClosed,
+        -- Parse tags array from Tags string formatted like '<tag1><tag2><tag3>'
+        string_to_array(trim(both '<>' from p.Tags), '><') as TagArray
+    from Posts p
+    where p.PostTypeId = 1 or p.PostTypeId = 2
+),
+UserPostActivity as (
+    select 
+        u.Id as UserId,
+        u.Reputation,
+        u.CreationDate as UserCreated,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsPosted,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersPosted,
+        coalesce(sum(p.Score),0) as TotalPostScore,
+        avg(p.Score) filter (where p.PostTypeId in (1,2)) as AvgPostScore,
+        count(distinct c.Id) as CommentsMade,
+        count(distinct v.Id) filter (where v.VoteTypeId = 2) as UpVotesReceived,
+        count(distinct v.Id) filter (where v.VoteTypeId = 3) as DownVotesReceived,
+        max(p.CreationDate) as LastPostDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.PostId = p.Id
+    group by u.Id, u.Reputation, u.CreationDate
+),
+LatestPostHistory as (
+    select distinct on (ph.PostId)
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate as HistoryDate,
+        ph.UserId as EditorUserId,
+        ph.UserDisplayName,
+        ph.Comment
+    from PostHistory ph
+    order by ph.PostId, ph.CreationDate desc
+),
+ComplexUserPostScores as (
+    select
+        p.Id as PostId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Tags,
+        -- Calculate weighted score: Score * LOG(1 + ViewCount) * (1 + COALESCE(fav.FavoriteCount,0)),
+        (p.Score * ln(1 + greatest(p.ViewCount,0) + 1) * (1 + coalesce(p.FavoriteCount,0)) ) as WeightedScore,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as PostRankDesc,
+        case when p.ClosedDate is null then 0 else 1 end as IsClosed,
+        -- Check if accepted answer exists for questions
+        case when (p.PostTypeId = 1 and p.AcceptedAnswerId is not null) then 1 else 0 end as HasAcceptedAnswer,
+        -- Calculate delta time from creation to last activity in seconds
+        extract(epoch from coalesce(p.LastActivityDate, p.CreationDate) - p.CreationDate) as ActivityDurationSeconds
+    from Posts p
+    where p.PostTypeId in (1,2)
+),
+DuplicateQuestionCounts as (
+    select
+        pl.RelatedPostId as QuestionId,
+        count(*) filter (where lt.Name = 'Duplicate') as DuplicateCount
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    join Posts p on p.Id = pl.PostId
+    where p.PostTypeId = 1
+    group by pl.RelatedPostId
+),
+FinalUserStatistics as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Location,
+        upa.QuestionsPosted,
+        upa.AnswersPosted,
+        upa.TotalPostScore,
+        upa.CommentsMade,
+        upa.UpVotesReceived,
+        upa.DownVotesReceived,
+        coalesce(ubs.GoldBadges,0) as GoldBadges,
+        coalesce(ubs.SilverBadges,0) as SilverBadges,
+        coalesce(ubs.BronzeBadges,0) as BronzeBadges,
+        ubs.DistinctBadgeNames,
+        max(ph.HistoryDate) filter (where ph.PostHistoryTypeId in (10, 11)) as LastCloseOrReopen,
+        count(distinct p.Id) filter (where p.ClosedDate is not null) as ClosedPosts,
+        min(p.CreationDate) as FirstPostDate,
+        max(p.CreationDate) as LastPostDate,
+        -- Ratio of answers to questions
+        case when upa.QuestionsPosted = 0 then null else round(cast(upa.AnswersPosted as numeric) / upa.QuestionsPosted,2) end as AnswerQuestionRatio,
+        -- Average weighted score of posts
+        round(avg(cps.WeightedScore),2) as AvgWeightedPostScore,
+        -- Number of posts closed by user
+        count(distinct ph.PostId) filter (where ph.PostHistoryTypeId = 10 and ph.UserId = u.Id) as UserClosedPosts,
+        -- Number of posts re-opened by user
+        count(distinct ph.PostId) filter (where ph.PostHistoryTypeId = 11 and ph.UserId = u.Id) as UserReopenedPosts,
+        -- Number of posts edited by user excluding initial edits
+        count(distinct ph.PostId) filter (where ph.UserId = u.Id and ph.PostHistoryTypeId not in (1,2,3)) as EditedPostsCount
+    from Users u
+    left join UserBadgeStats ubs on ubs.UserId = u.Id
+    left join UserPostActivity upa on upa.UserId = u.Id
+    left join Posts p on p.OwnerUserId = u.Id
+    left join LatestPostHistory ph on ph.PostId = p.Id
+    left join ComplexUserPostScores cps on cps.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.Location, upa.QuestionsPosted, upa.AnswersPosted, upa.TotalPostScore, upa.CommentsMade,
+             upa.UpVotesReceived, upa.DownVotesReceived, ubs.GoldBadges, ubs.SilverBadges, ubs.BronzeBadges, ubs.DistinctBadgeNames
+),
+HighEngagementQuestions as (
+    select
+        p.Id,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        array_length(tagarr.TagArray,1) as TagCount,
+        duplicate.DuplicateCount,
+        case when p.ClosedDate is null then 0 else 1 end as IsClosed,
+        p.AcceptedAnswerId,
+        -- Calculate tag popularity rank using window function
+        rank() over (order by p.ViewCount desc, p.Score desc) as PopularityRank
+    from PostEngagement p
+    left join DuplicateQuestionCounts duplicate on duplicate.QuestionId = p.Id
+    cross join lateral (
+        select p.TagArray
+    ) tagarr
+    where p.PostTypeId = 1 and p.Score > 10 and p.ViewCount > 1000 and (duplicate.DuplicateCount is null or duplicate.DuplicateCount = 0)
+),
+TopContributors as (
+    select
+        fus.UserId,
+        fus.DisplayName,
+        fus.Reputation,
+        fus.QuestionsPosted,
+        fus.AnswersPosted,
+        fus.AvgWeightedPostScore,
+        fus.GoldBadges,
+        fus.SilverBadges,
+        fus.BronzeBadges,
+        fus.AnswerQuestionRatio,
+        dense_rank() over (order by fus.AvgWeightedPostScore desc nulls last, fus.Reputation desc) as ContributorRank
+    from FinalUserStatistics fus
+    where fus.AnswersPosted > 10 and fus.AvgWeightedPostScore is not null
+),
+PostAnswerPopularity as (
+    select
+        p.Id as AnswerId,
+        p.ParentId as QuestionId,
+        p.Score as AnswerScore,
+        rank() over (partition by p.ParentId order by p.Score desc, p.CreationDate asc) as AnswerScoreRank,
+        row_number() over (partition by p.ParentId order by p.CreationDate asc) as AnswerFirstRank,
+        case when p.Id = q.AcceptedAnswerId then 1 else 0 end as IsAcceptedAnswer
+    from Posts p
+    join Posts q on q.Id = p.ParentId and q.PostTypeId = 1
+    where p.PostTypeId = 2
+)
+select
+    tc.UserId,
+    tc.DisplayName,
+    tc.Reputation,
+    tc.QuestionsPosted,
+    tc.AnswersPosted,
+    tc.GoldBadges,
+    tc.SilverBadges,
+    tc.BronzeBadges,
+    tc.AnswerQuestionRatio,
+    heq.Id as PopularQuestionId,
+    heq.Score as QuestionScore,
+    heq.ViewCount,
+    heq.FavoriteCount,
+    heq.TagCount,
+    heq.PopularityRank,
+    pa.AnswerId,
+    pa.AnswerScore,
+    pa.IsAcceptedAnswer,
+    pa.AnswerScoreRank,
+    pa.AnswerFirstRank
+from TopContributors tc
+join HighEngagementQuestions heq on heq.OwnerUserId = tc.UserId
+left join PostAnswerPopularity pa on pa.QuestionId = heq.Id and pa.AnswerScoreRank = 1
+where heq.IsClosed = 0
+order by tc.ContributorRank, heq.PopularityRank, pa.AnswerScore desc
+limit 50;

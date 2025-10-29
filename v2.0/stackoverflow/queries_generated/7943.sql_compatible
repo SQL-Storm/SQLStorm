@@ -1,0 +1,271 @@
+WITH RECURSIVE PostHierarchy AS (
+    SELECT 
+        p.Id as PostId,
+        p.ParentId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        0 as Level,
+        CAST(p.Id AS VARCHAR(1000)) as Path
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.ParentId IS NULL
+
+    UNION ALL
+
+    SELECT 
+        p.Id as PostId,
+        p.ParentId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        ph.Level + 1,
+        ph.Path || '->' || CAST(p.Id AS VARCHAR(1000)) AS Path
+    FROM Posts p
+    INNER JOIN PostHierarchy ph ON p.ParentId = ph.PostId
+    WHERE ph.Level < 5
+),
+UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        AVG(p.Score) as AvgPostScore,
+        MAX(p.CreationDate) as LastPostDate,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+                -- Standard SQL: use DATE_PART on age differences where supported; fallback to JULIANDAY for SQLite is not portable.
+                -- Use EXTRACT epoch day difference for portability where available; here use standard SQL: (max - min) in days via (EXTRACT(EPOCH FROM ...) / 86400)
+                -- To keep compatibility across dialects, compute days as CAST(MAX - MIN AS INTEGER) where date subtraction yields interval; for many DBs DATEDIFF exists, but keep generic using DATE_PART for postgres-like and fallback handled by adapter.
+                CAST(EXTRACT(EPOCH FROM (MAX(p.CreationDate) - MIN(p.CreationDate))) / 86400 AS INTEGER)
+            ELSE 0 
+        END as DaysActive
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+QuestionTagAnalysis AS (
+    SELECT 
+        p.Id as QuestionId,
+        p.Title,
+        p.Tags,
+        -- split tags stored like '<tag1><tag2>' into array: use standard replace and string split where available
+        -- Here produce as an array where supported; otherwise keep original string
+        (CASE WHEN p.Tags IS NOT NULL THEN STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2), '><') ELSE NULL END) as TagArray,
+        COUNT(DISTINCT ph.Id) as AnswerCount,
+        MAX(v.CreationDate) as LastVoteDate,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId IN (2, 3) THEN 1 ELSE 0 END), 0) as VoteCount,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+            ELSE 'Unanswered'
+        END as QuestionStatus
+    FROM Posts p
+    LEFT JOIN Posts ph ON p.Id = ph.ParentId AND ph.PostTypeId = 2
+    LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (2, 3)
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Title, p.Tags, p.ClosedDate, p.CommunityOwnedDate, p.AcceptedAnswerId
+),
+TopPostsByTag AS (
+    SELECT 
+        qta.QuestionId,
+        qta.Title,
+        qta.TagArray,
+        qta.AnswerCount,
+        qta.VoteCount,
+        qta.QuestionStatus,
+        ROW_NUMBER() OVER (
+            PARTITION BY tag 
+            ORDER BY qta.VoteCount DESC, qta.AnswerCount DESC
+        ) as RankByTag,
+        DENSE_RANK() OVER (ORDER BY qta.VoteCount DESC, qta.AnswerCount DESC) as OverallRank
+    FROM QuestionTagAnalysis qta,
+    -- UNNEST/EXPLODE TagArray into rows in a dialect-agnostic way: use lateral unnest where supported.
+    LATERAL (
+        SELECT UNNEST(qta.TagArray) AS tag
+    ) t
+),
+PerformanceMetrics AS (
+    SELECT 
+        ph.PostId,
+        ph.ParentId,
+        ph.PostTypeId,
+        ph.OwnerUserId,
+        ph.Score,
+        ph.ViewCount,
+        ph.CreationDate,
+        ph.Title,
+        ph.Level,
+        ph.Path,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.PostCount,
+        uas.CommentCount,
+        uas.BadgeCount,
+        uas.AvgPostScore,
+        uas.LastPostDate,
+        uas.DaysActive,
+        CASE 
+            WHEN ph.Level = 0 THEN 'Question'
+            WHEN ph.Level = 1 THEN 'First Answer'
+            WHEN ph.Level = 2 THEN 'Second Answer'
+            ELSE 'Deep Answer'
+        END as PostLevelType,
+        CASE 
+            WHEN uas.Reputation >= 10000 THEN 'Expert'
+            WHEN uas.Reputation >= 1000 THEN 'Intermediate'
+            WHEN uas.Reputation >= 100 THEN 'Beginner'
+            ELSE 'Newbie'
+        END as UserExpertiseLevel,
+        CASE 
+            WHEN ph.Score > 100 THEN 'Highly Upvoted'
+            WHEN ph.Score > 50 THEN 'Moderately Upvoted'
+            WHEN ph.Score > 10 THEN 'Mildly Upvoted'
+            ELSE 'Low Upvoted'
+        END as UpvoteCategory,
+        COALESCE(
+            COUNT(DISTINCT CASE WHEN ph.PostTypeId = 1 THEN ph.PostId END) OVER (PARTITION BY ph.OwnerUserId),
+            0
+        ) as UserQuestionCount,
+        COALESCE(
+            COUNT(DISTINCT CASE WHEN ph.PostTypeId = 2 THEN ph.PostId END) OVER (PARTITION BY ph.OwnerUserId),
+            0
+        ) as UserAnswerCount,
+        PERCENT_RANK() OVER (ORDER BY ph.Score DESC) as ScorePercentile,
+        NTILE(10) OVER (ORDER BY ph.Score DESC) as ScoreDecile
+    FROM PostHierarchy ph
+    LEFT JOIN UserActivityStats uas ON ph.OwnerUserId = uas.UserId
+)
+SELECT 
+    pm.PostId,
+    pm.ParentId,
+    pm.PostTypeId,
+    pm.OwnerUserId,
+    pm.Title,
+    pm.Level,
+    pm.Path,
+    pm.DisplayName,
+    pm.Reputation,
+    pm.PostCount,
+    pm.CommentCount,
+    pm.BadgeCount,
+    pm.AvgPostScore,
+    pm.LastPostDate,
+    pm.DaysActive,
+    pm.PostLevelType,
+    pm.UserExpertiseLevel,
+    pm.UpvoteCategory,
+    pm.UserQuestionCount,
+    pm.UserAnswerCount,
+    pm.ScorePercentile,
+    pm.ScoreDecile,
+    ROW_NUMBER() OVER (ORDER BY pm.Score DESC) as Rank,
+    CASE 
+        WHEN pm.PostLevelType IN ('Question', 'First Answer') THEN 'High Quality'
+        WHEN pm.PostLevelType = 'Second Answer' AND pm.Score > 50 THEN 'Solid Quality'
+        WHEN pm.PostLevelType = 'Deep Answer' AND pm.Score > 25 THEN 'Good Quality'
+        ELSE 'Basic Quality'
+    END as ContentQuality,
+    CASE 
+        WHEN pm.Score > 0 AND pm.ViewCount > 0 THEN (CAST(pm.Score AS FLOAT) / CAST(pm.ViewCount AS FLOAT)) * 100
+        ELSE 0
+    END as ScoreToViewRatio,
+    COALESCE(
+        (SELECT COUNT(*) 
+         FROM TopPostsByTag tpt 
+         WHERE tpt.QuestionId = pm.PostId AND tpt.RankByTag <= 3),
+        0
+    ) as TopTagRanking,
+    CASE 
+        WHEN pm.PostLevelType = 'Question' THEN 
+            (SELECT COUNT(*) 
+             FROM Posts p2 
+             WHERE p2.ParentId = pm.PostId AND p2.PostTypeId = 2)
+        ELSE 0
+    END as ChildAnswerCount,
+    COALESCE(
+        (SELECT MAX(v.CreationDate) 
+         FROM Votes v 
+         WHERE v.PostId = pm.PostId AND v.VoteTypeId IN (2, 3)),
+        pm.CreationDate
+    ) as LastActivityDate,
+    EXTRACT(YEAR FROM pm.CreationDate) as CreationYear,
+    EXTRACT(MONTH FROM pm.CreationDate) as CreationMonth,
+    EXTRACT(DAY FROM pm.CreationDate) as CreationDay,
+    CASE 
+        WHEN EXISTS (
+            SELECT 1 
+            FROM Posts p3 
+            WHERE p3.ParentId = pm.PostId 
+            AND p3.PostTypeId = 2 
+            AND p3.Score > 100
+        ) THEN 'Has High Score Answer'
+        ELSE 'No High Score Answer'
+    END as HasHighScoreAnswer,
+    CASE 
+        WHEN pm.PostTypeId = 1 AND pm.Score > 100 AND 
+             (SELECT COUNT(*) FROM Posts p_a WHERE p_a.ParentId = pm.PostId AND p_a.PostTypeId = 2) >= 1 THEN 'Popular Question'
+        WHEN pm.PostTypeId = 2 AND pm.Score > 100 THEN 'High Quality Answer'
+        WHEN pm.PostTypeId = 1 THEN 'Question'
+        WHEN pm.PostTypeId = 2 THEN 'Answer'
+        ELSE 'Other'
+    END as PostCategory,
+    CAST(
+        CASE 
+            WHEN pm.Reputation >= 5000 AND 
+                 pm.PostCount >= 50 AND 
+                 pm.CommentCount >= 20 AND 
+                 pm.BadgeCount >= 5 THEN 1
+            WHEN pm.Reputation >= 1000 AND 
+                 pm.PostCount >= 20 AND 
+                 pm.CommentCount >= 10 AND 
+                 pm.BadgeCount >= 2 THEN 1
+            WHEN pm.Reputation >= 100 AND 
+                 pm.PostCount >= 5 AND 
+                 pm.BadgeCount >= 1 THEN 1
+            ELSE 0
+        END AS INTEGER
+    ) as HighEngagementUser,
+    CASE 
+        WHEN pm.DaysActive > 0 THEN 
+            CAST(pm.PostCount AS FLOAT) / CAST(pm.DaysActive AS FLOAT)
+        ELSE 0
+    END as DailyPostRate,
+    (SELECT AVG(pm2.Score) 
+     FROM PerformanceMetrics pm2 
+     WHERE pm2.OwnerUserId = pm.OwnerUserId 
+     AND pm2.PostTypeId = 1) as UserAverageQuestionScore,
+    CASE 
+        WHEN CHAR_LENGTH(pm.Title) > 80 THEN SUBSTRING(pm.Title FROM 1 FOR 77) || '...'
+        ELSE pm.Title
+    END as ShortenedTitle,
+    (SELECT COUNT(DISTINCT p4.Id) 
+     FROM Posts p4 
+     WHERE p4.OwnerUserId = pm.OwnerUserId 
+     AND p4.PostTypeId = 1 
+     AND p4.CreationDate > pm.CreationDate) as SubsequentQuestions
+FROM PerformanceMetrics pm
+WHERE pm.PostId IS NOT NULL 
+  AND (pm.Score IS NOT NULL OR pm.ViewCount IS NOT NULL)
+  AND EXISTS (
+    SELECT 1 
+    FROM Posts p5 
+    WHERE p5.Id = pm.PostId 
+      AND p5.PostTypeId IN (1, 2)
+)
+ORDER BY pm.Score DESC NULLS LAST, pm.CreationDate DESC
+LIMIT 1000;

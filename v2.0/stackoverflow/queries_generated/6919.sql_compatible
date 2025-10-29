@@ -1,0 +1,60 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.Title,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.OwnerUserId,
+        U.DisplayName,
+        U.Reputation,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.ViewCount DESC) AS rank
+    FROM 
+        Posts P
+    JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId IN (1, 2) AND P.Score > 0
+),
+BadgesSummary AS (
+    SELECT 
+        B.UserId,
+        COUNT(DISTINCT B.Id) AS totalBadges,
+        SUM(B.Class) AS badgeClassTotal,
+        MAX(B.Class) AS highestBadgeClass
+    FROM 
+        Badges B
+    GROUP BY 
+        B.UserId
+)
+SELECT 
+    RP.Id,
+    RP.Title,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.rank,
+    RP.DisplayName,
+    RP.Reputation,
+    BS.totalBadges,
+    BS.badgeClassTotal,
+    BS.highestBadgeClass,
+    CASE 
+        WHEN RP.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'High Scoring'
+        ELSE 'Average Scoring'
+    END AS score_category,
+    COUNT(DISTINCT V.UserId) AS totalVotes
+FROM 
+    RankedPosts RP
+LEFT JOIN 
+    BadgesSummary BS ON RP.OwnerUserId = BS.UserId
+LEFT JOIN 
+    Votes V ON RP.Id = V.PostId
+WHERE 
+    RP.rank <= 10
+GROUP BY 
+    RP.Id, RP.Title, RP.Score, RP.ViewCount, RP.CreationDate, RP.rank, RP.DisplayName, RP.Reputation, RP.OwnerUserId, BS.totalBadges, BS.badgeClassTotal, BS.highestBadgeClass
+HAVING 
+    COUNT(DISTINCT V.UserId) >= 5
+ORDER BY 
+    RP.Score DESC, RP.ViewCount DESC;

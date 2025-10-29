@@ -1,0 +1,388 @@
+-- {"query": "189.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3637} 
+with
+-- recent activity window
+recent_posts as (
+  select
+    p.id,
+    p.posttypeid,
+    p.creationdate,
+    p.lastactivitydate,
+    p.owneruserid,
+    coalesce(p.title, substring(p.body from 1 for 80)) as title_or_excerpt,
+    p.score,
+    p.viewcount,
+    p.tags,
+    p.acceptedanswerid,
+    p.parentid
+  from posts p
+  where p.creationdate >= (select max(creationdate) - interval '365 days' from posts)
+),
+-- normalize tags to rows
+tag_split as (
+  select
+    rp.id as post_id,
+    unnest(string_to_array(substring(rp.tags, 2, greatest(length(rp.tags)-2,0)), '><')) as tagname
+  from recent_posts rp
+  where rp.posttypeid = 1
+    and rp.tags is not null
+),
+-- compute user activity metrics
+user_activity as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate as user_created,
+    u.location,
+    coalesce(nullif(trim(u.websiteurl), ''), 'n/a') as websiteurl_norm,
+    sum(case when p.posttypeid = 1 then 1 else 0 end) as questions,
+    sum(case when p.posttypeid = 2 then 1 else 0 end) as answers,
+    count(*) as total_posts,
+    sum(p.score) as post_score,
+    sum(coalesce(p.viewcount,0)) as post_views,
+    count(distinct date_trunc('day', p.creationdate)) as active_days
+  from users u
+  left join recent_posts p
+    on p.owneruserid = u.id
+  group by u.id, u.displayname, u.reputation, u.creationdate, u.location, u.websiteurl
+),
+-- rolling engagement stats for posts
+post_engagement as (
+  select
+    p.id,
+    p.posttypeid,
+    p.owneruserid,
+    p.creationdate,
+    p.lastactivitydate,
+    p.score,
+    p.viewcount,
+    count(c.id) as comment_count,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+    max(case when v.votetypeid = 8 then v.bountyamount end) as bounty_start,
+    max(case when v.votetypeid = 9 then v.bountyamount end) as bounty_close
+  from recent_posts p
+  left join comments c on c.postid = p.id
+  left join votes v on v.postid = p.id
+  group by p.id, p.posttypeid, p.owneruserid, p.creationdate, p.lastactivitydate, p.score, p.viewcount
+),
+-- accepted answer latency per question
+answer_latency as (
+  select
+    q.id as question_id,
+    q.owneruserid as asker_id,
+    q.creationdate as question_created,
+    a.id as accepted_answer_id,
+    a.owneruserid as answerer_id,
+    a.creationdate as answer_created,
+    extract(epoch from (a.creationdate - q.creationdate))/3600.0 as hours_to_accept
+  from posts q
+  join posts a on a.id = q.acceptedanswerid
+  where q.posttypeid = 1
+    and q.creationdate >= (select max(creationdate) - interval '365 days' from posts)
+),
+-- duplicate/linked relationships
+link_graph as (
+  select
+    pl.postid,
+    pl.relatedpostid,
+    lt.name as link_type,
+    pl.creationdate
+  from postlinks pl
+  join linktypes lt on lt.id = pl.linktypeid
+),
+-- edits and closures summary
+post_events as (
+  select
+    ph.postid,
+    sum(case when ph.posthistorytypeid in (4,5,6,7,8,9,24) then 1 else 0 end) as edits,
+    max(case when ph.posthistorytypeid = 10 then ph.creationdate end) as closed_at,
+    max(case when ph.posthistorytypeid = 11 then ph.creationdate end) as reopened_at,
+    max(case when ph.posthistorytypeid = 50 then ph.creationdate end) as community_bump_at,
+    max(case when ph.posthistorytypeid in (35,36) then ph.creationdate end) as migrated_at,
+    max(case when ph.posthistorytypeid = 10 then try_cast(nullif(ph.comment,'') as int) end) as close_reason_id_raw
+  from posthistory ph
+  group by ph.postid
+),
+-- map close reasons to names with outer join and null logic
+close_reason_resolved as (
+  select
+    pe.postid,
+    coalesce(crt.name, 'Unknown/Legacy') as close_reason_name
+  from post_events pe
+  left join closerreasontypes crt on crt.id = pe.close_reason_id_raw
+),
+-- rank tags by growth
+tag_trends as (
+  select
+    ts.tagname,
+    count(*) as questions_in_period,
+    count(*) filter (where rp.creationdate >= (select max(creationdate) - interval '30 days' from posts)) as questions_last_30d,
+    row_number() over (order by count(*) desc, tagname) as rank_all_time_period,
+    row_number() over (order by count(*) filter (where rp.creationdate >= (select max(creationdate) - interval '30 days' from posts)) desc nulls last, tagname) as rank_30d
+  from tag_split ts
+  join recent_posts rp on rp.id = ts.post_id
+  group by ts.tagname
+),
+-- per-user rolling windows for engagement
+user_post_windows as (
+  select
+    pe.owneruserid as user_id,
+    pe.id as post_id,
+    pe.creationdate,
+    pe.score,
+    pe.viewcount,
+    sum(pe.score) over (partition by pe.owneruserid order by pe.creationdate rows between 10 preceding and current row) as score_last_11_posts,
+    avg(pe.viewcount) over (partition by pe.owneruserid order by pe.creationdate range between interval '30 days' preceding and current row) as avg_views_30d,
+    count(*) over (partition by pe.owneruserid order by pe.creationdate range between interval '7 days' preceding and current row) as posts_7d
+  from post_engagement pe
+),
+-- identify outlier posts per user by z-score over rolling window
+user_outliers as (
+  select
+    upw.user_id,
+    upw.post_id,
+    upw.creationdate,
+    upw.score,
+    upw.viewcount,
+    case
+      when stddev_samp(upw.score) over (partition by upw.user_id) = 0 then 0
+      else (upw.score - avg(upw.score) over (partition by upw.user_id)) / nullif(stddev_samp(upw.score) over (partition by upw.user_id),0)
+    end as score_z,
+    case
+      when stddev_samp(upw.viewcount) over (partition by upw.user_id) = 0 then 0
+      else (upw.viewcount - avg(upw.viewcount) over (partition by upw.user_id)) / nullif(stddev_samp(upw.viewcount) over (partition by upw.user_id),0)
+    end as views_z
+  from user_post_windows upw
+),
+-- synthetic dimension for vote mix
+vote_mix as (
+  select
+    pe.id as post_id,
+    case
+      when pe.upvotes + pe.downvotes = 0 then 'no-votes'
+      when pe.upvotes >= 5 and pe.downvotes = 0 then 'all-up'
+      when pe.downvotes >= 5 and pe.upvotes = 0 then 'all-down'
+      when pe.upvotes > pe.downvotes then 'mostly-up'
+      when pe.downvotes > pe.upvotes then 'mostly-down'
+      else 'mixed'
+    end as vote_bucket
+  from post_engagement pe
+),
+-- compile per post summary
+post_summary as (
+  select
+    rp.id,
+    rp.posttypeid,
+    rp.owneruserid,
+    rp.creationdate,
+    rp.lastactivitydate,
+    coalesce(rp.title_or_excerpt, '[no title/body]') as title_or_excerpt,
+    pe.score,
+    pe.viewcount,
+    pe.comment_count,
+    pe.upvotes,
+    pe.downvotes,
+    pe.favorites,
+    vm.vote_bucket,
+    coalesce(crr.close_reason_name, 'Open') as close_reason_name,
+    pe.bounty_start,
+    pe.bounty_close,
+    ul.score_z,
+    ul.views_z,
+    at.hours_to_accept
+  from recent_posts rp
+  left join post_engagement pe on pe.id = rp.id
+  left join vote_mix vm on vm.post_id = rp.id
+  left join close_reason_resolved crr on crr.postid = rp.id
+  left join user_outliers ul on ul.post_id = rp.id
+  left join answer_latency at on at.question_id = rp.id
+),
+-- per user aggregate including badges and controversial ratio
+user_badges as (
+  select
+    b.userid,
+    sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+    sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+    sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+    sum(1) as total_badges,
+    sum(case when b.tagbased = 1 then 1 else 0 end) as tag_badges
+  from badges b
+  group by b.userid
+),
+user_votes as (
+  select
+    p.owneruserid as user_id,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes_received,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes_received
+  from posts p
+  left join votes v on v.postid = p.id
+  group by p.owneruserid
+),
+user_profile as (
+  select
+    ua.user_id,
+    ua.displayname,
+    ua.reputation,
+    ua.user_created,
+    ua.location,
+    ua.websiteurl_norm,
+    ua.questions,
+    ua.answers,
+    ua.total_posts,
+    ua.post_score,
+    ua.post_views,
+    ua.active_days,
+    coalesce(ub.gold_badges,0) as gold_badges,
+    coalesce(ub.silver_badges,0) as silver_badges,
+    coalesce(ub.bronze_badges,0) as bronze_badges,
+    coalesce(ub.total_badges,0) as total_badges,
+    coalesce(ub.tag_badges,0) as tag_badges,
+    coalesce(uv.upvotes_received,0) as upvotes_received,
+    coalesce(uv.downvotes_received,0) as downvotes_received,
+    case
+      when coalesce(uv.upvotes_received,0) + coalesce(uv.downvotes_received,0) = 0 then null
+      else 1.0 * coalesce(uv.downvotes_received,0) / (coalesce(uv.upvotes_received,0) + coalesce(uv.downvotes_received,0))
+    end as controversial_ratio
+  from user_activity ua
+  left join user_badges ub on ub.userid = ua.user_id
+  left join user_votes uv on uv.user_id = ua.user_id
+),
+-- combine with tag trend for each question's top tag rank
+question_tag_rank as (
+  select
+    ts.post_id,
+    min(tt.rank_all_time_period) as best_rank_period,
+    min(tt.rank_30d) as best_rank_30d
+  from tag_split ts
+  join tag_trends tt on tt.tagname = ts.tagname
+  group by ts.post_id
+),
+-- correlated subquery for median comment score per post
+comment_stats as (
+  select
+    p.id as post_id,
+    avg(c.score) as avg_comment_score,
+    percentile_cont(0.5) within group (order by c.score) as median_comment_score,
+    count(*) as total_comments
+  from posts p
+  left join comments c on c.postid = p.id
+  group by p.id
+),
+-- heavy predicate evaluation set
+filtered_posts as (
+  select
+    ps.*,
+    qtr.best_rank_period,
+    qtr.best_rank_30d,
+    cs.avg_comment_score,
+    cs.median_comment_score,
+    cs.total_comments,
+    case
+      when ps.posttypeid = 1 and coalesce(ps.hours_to_accept, 99999) < 24 then 'fast-accept'
+      when ps.posttypeid = 1 and ps.hours_to_accept between 24 and 168 then 'normal-accept'
+      when ps.posttypeid = 1 and ps.hours_to_accept is null then 'no-accept'
+      else 'non-question'
+    end as accept_bucket
+  from post_summary ps
+  left join question_tag_rank qtr on qtr.post_id = ps.id
+  left join comment_stats cs on cs.post_id = ps.id
+  where
+    (
+      ps.posttypeid = 1
+      and (
+        (ps.score >= 5 and ps.viewcount >= 1000)
+        or (ps.vote_bucket in ('mostly-up','all-up') and coalesce(ps.comment_count,0) >= 3)
+        or (ps.close_reason_name <> 'Open' and ps.score <= 0)
+      )
+    )
+    or (
+      ps.posttypeid = 2
+      and (
+        (ps.score >= 3 and ps.upvotes >= ps.downvotes)
+        or (ps.views_z >= 1.5)
+      )
+    )
+)
+select
+  fp.id as post_id,
+  fp.posttypeid,
+  coalesce(u.displayname, '[deleted]') as owner_display,
+  up.reputation,
+  up.total_posts,
+  up.controversial_ratio,
+  up.gold_badges,
+  up.silver_badges,
+  up.bronze_badges,
+  fp.creationdate,
+  fp.lastactivitydate,
+  fp.title_or_excerpt,
+  fp.score,
+  fp.viewcount,
+  fp.comment_count,
+  fp.upvotes,
+  fp.downvotes,
+  fp.favorites,
+  fp.vote_bucket,
+  fp.close_reason_name,
+  fp.bounty_start,
+  fp.bounty_close,
+  fp.score_z,
+  fp.views_z,
+  fp.hours_to_accept,
+  fp.accept_bucket,
+  fp.best_rank_period,
+  fp.best_rank_30d,
+  fp.avg_comment_score,
+  fp.median_comment_score,
+  fp.total_comments,
+  -- string expression composite key
+  lower(regexp_replace(coalesce(u.location,'unknown'), '[^a-z0-9]+', '-', 'g')) || '::' ||
+  lpad(coalesce(cast(up.reputation as varchar), '0'), 6, '0') as loc_rep_bucket,
+  -- correlated subquery: count duplicates referencing this post
+  coalesce((
+    select count(*)
+    from postlinks pl
+    where pl.relatedpostid = fp.id
+      and pl.linktypeid = 3
+  ),0) as dup_inbound_count,
+  -- set operator style anti-join via not exists: migrated but not reopened later
+  case
+    when exists (
+      select 1
+      from posthistory ph
+      where ph.postid = fp.id
+        and ph.posthistorytypeid in (35,36)
+    ) and not exists (
+      select 1
+      from posthistory ph2
+      where ph2.postid = fp.id
+        and ph2.posthistorytypeid = 11
+        and ph2.creationdate > (select max(ph3.creationdate) from posthistory ph3 where ph3.postid = fp.id and ph3.posthistorytypeid in (35,36))
+    ) then 1 else 0
+  end as migrated_not_reopened_flag
+from filtered_posts fp
+left join users u on u.id = fp.owneruserid
+left join user_profile up on up.user_id = fp.owneruserid
+where
+  -- complicated predicate mixing nulls and pattern matching
+  (
+    up.reputation is null
+    or up.reputation >= 1000
+    or (u.websiteurl is not null and u.websiteurl ilike '%github%')
+  )
+  and (
+    fp.close_reason_name = 'Open'
+    or (fp.close_reason_name <> 'Open' and fp.score <= 10)
+  )
+  and (
+    fp.vote_bucket <> 'all-down'
+    or (fp.vote_bucket = 'all-down' and coalesce(fp.comment_count,0) >= 5)
+  )
+order by
+  coalesce(fp.views_z, 0) desc nulls last,
+  fp.score desc,
+  fp.viewcount desc,
+  fp.creationdate desc
+limit 500;

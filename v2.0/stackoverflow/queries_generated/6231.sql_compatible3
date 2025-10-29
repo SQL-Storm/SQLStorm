@@ -1,0 +1,93 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.Title,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.LastActivityDate,
+        U.DisplayName AS OwnerDisplayName,
+        U.Reputation,
+        P.OwnerUserId,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.ViewCount DESC) AS Rank,
+        P.Tags
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId = 1 AND P.Score > 0
+),
+BadgeCounts AS (
+    SELECT 
+        U.Id AS UserId,
+        COUNT(DISTINCT B.Id) AS BadgeCount
+    FROM 
+        Users U
+    LEFT JOIN 
+        Badges B ON U.Id = B.UserId
+    GROUP BY 
+        U.Id
+)
+SELECT 
+    RP.Id, 
+    RP.Title,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.LastActivityDate,
+    RP.OwnerDisplayName,
+    RP.Reputation,
+    BC.BadgeCount,
+    CASE 
+        WHEN RP.Rank <= 3 THEN 'Top'
+        WHEN RP.Rank <= 10 THEN 'Top 10'
+        ELSE 'Other'
+    END AS RankCategory,
+    (
+        SELECT 
+            STRING_AGG(T.TagName, ', ')
+        FROM (
+            SELECT
+                TRIM(BOTH '<' FROM elem) AS raw_tag
+            FROM (
+                SELECT regexp_split_to_array(RP.Tags, '><') AS arr
+            ) AS arr_wrap,
+            UNNEST(arr_wrap.arr) AS elem
+        ) AS split_tags
+        JOIN Tags T ON T.TagName = split_tags.raw_tag
+    ) AS Tags,
+    (
+        SELECT 
+            COUNT(*) 
+        FROM 
+            Votes V
+        WHERE 
+            V.PostId = RP.Id AND V.VoteTypeId IN (2, 15)
+    ) AS PositiveVotes
+FROM 
+    RankedPosts RP
+LEFT JOIN 
+    BadgeCounts BC ON RP.OwnerUserId = BC.UserId
+WHERE 
+    COALESCE(BC.BadgeCount, 0) > (
+        SELECT 
+            AVG(BadgeCount) 
+        FROM 
+            BadgeCounts
+    )
+GROUP BY
+    RP.Id,
+    RP.Title,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.LastActivityDate,
+    RP.OwnerDisplayName,
+    RP.Reputation,
+    RP.OwnerUserId,
+    RP.Rank,
+    BC.BadgeCount,
+    RP.Tags
+ORDER BY 
+    RP.Rank;

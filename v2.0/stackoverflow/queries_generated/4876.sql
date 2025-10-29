@@ -1,0 +1,106 @@
+-- {"query": "4876.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1244} 
+
+WITH RankedPostEdits AS (
+    SELECT
+        ph.PostId,
+        ph.UserId,
+        ph.CreationDate AS EditDate,
+        ph.PostHistoryTypeId,
+        ROW_NUMBER() OVER(PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate DESC) as rn
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+),
+UserContributionSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        AVG(p.Score) AS AveragePostScore,
+        MAX(p.ViewCount) AS MaxPostViewCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 5 THEN ph.PostId ELSE NULL END) AS BodyEditsMade,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 4 THEN ph.PostId ELSE NULL END) AS TitleEditsMade,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 6 THEN ph.PostId ELSE NULL END) AS TagEditsMade,
+        DATEDIFF(day, u.CreationDate, GETDATE()) AS DaysSinceCreation
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN RankedPostEdits ph ON u.Id = ph.UserId
+    WHERE u.Views > 1000 AND u.Reputation > 5000
+    GROUP BY u.Id, u.DisplayName, u.CreationDate, u.Views, u.Reputation
+),
+RecentQuestions AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.CreationDate AS QuestionDate,
+        p.OwnerUserId,
+        p.AnswerCount,
+        p.FavoriteCount,
+        u.DisplayName AS OwnerDisplayName,
+        ROW_NUMBER() OVER(ORDER BY p.CreationDate DESC) as qrn
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1 AND p.CreationDate >= DATEADD(month, -1, GETDATE())
+),
+TopAnswers AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.OwnerUserId,
+        a.Score AS AnswerScore,
+        ROW_NUMBER() OVER(PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) as arn
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+)
+SELECT
+    rcq.QuestionId,
+    rcq.Title,
+    rcq.QuestionDate,
+    rcq.OwnerDisplayName AS OriginalQuestioner,
+    ta.AnswerId AS BestAnswerId,
+    ta.AnswerScore,
+    ucs.DisplayName AS FrequentEditor,
+    ucs.BodyEditsMade,
+    ucs.TitleEditsMade,
+    ucs.TagEditsMade,
+    ucs.GoldBadges,
+    ucs.SilverBadges,
+    ucs.BronzeBadges,
+    CAST(rcq.FavoriteCount AS FLOAT) / (rcq.AnswerCount + 1) AS FavoriteToAnswerRatio,
+    CASE
+        WHEN ucs.DaysSinceCreation < 30 THEN 'New'
+        WHEN ucs.DaysSinceCreation BETWEEN 30 AND 365 THEN 'Established'
+        ELSE 'Veteran'
+    END AS UserTenure,
+    LOWER(SUBSTRING(rcq.Title, 1, 3)) AS FirstThreeCharsOfTitle
+FROM RecentQuestions rcq
+JOIN TopAnswers ta ON rcq.QuestionId = ta.QuestionId AND ta.arn = 1
+LEFT JOIN UserContributionSummary ucs ON rcq.OwnerUserId = ucs.UserId
+WHERE rcq.qrn <= 100 AND ta.AnswerScore > 10
+UNION ALL
+SELECT
+    NULL,
+    'Summary Metric',
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    'Overall Performance',
+    AVG(CAST(ucs.BodyEditsMade AS FLOAT)),
+    AVG(CAST(ucs.TitleEditsMade AS FLOAT)),
+    AVG(CAST(ucs.TagEditsMade AS FLOAT)),
+    SUM(ucs.GoldBadges),
+    SUM(ucs.SilverBadges),
+    SUM(ucs.BronzeBadges),
+    AVG(CAST(rcq.FavoriteCount AS FLOAT) / (rcq.AnswerCount + 1)),
+    NULL,
+    NULL
+FROM RecentQuestions rcq
+JOIN TopAnswers ta ON rcq.QuestionId = ta.QuestionId AND ta.arn = 1
+LEFT JOIN UserContributionSummary ucs ON rcq.OwnerUserId = ucs.UserId
+WHERE rcq.qrn <= 100 AND ta.AnswerScore > 10;

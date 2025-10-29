@@ -1,0 +1,146 @@
+-- {"query": "3122.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2304} 
+WITH 
+/* -------------------------------------------------
+   Aggregate post counts, scores and dates per user
+   ------------------------------------------------- */
+UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id)                FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(p.Id)                FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COALESCE(SUM(p.Score),0)                         AS TotalScore,
+        AVG(p.Score)              FILTER (WHERE p.Score IS NOT NULL) AS AvgScore,
+        MAX(p.CreationDate)                                AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p 
+           ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+/* -------------------------------------------------
+   Badge totals per user, plus a concatenated list
+   ------------------------------------------------- */
+BadgeAgg AS (
+    SELECT 
+        b.UserId,
+        COUNT(*)                                           AS BadgeTotal,
+        COUNT(*) FILTER (WHERE b.Class = 1)                AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2)                AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3)                AS BronzeBadges,
+        STRING_AGG(DISTINCT b.Name, ', ')                  AS BadgeNames
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+/* -------------------------------------------------
+   Top tag used by each user (derived from Questions)
+   ------------------------------------------------- */
+TopTagStats AS (
+    SELECT 
+        p.OwnerUserId                              AS UserId,
+        UNNEST(string_to_array(TRIM(BOTH '<>' FROM p.Tags), '><')) AS Tag,
+        COUNT(*)                                   AS TagUseCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId 
+                           ORDER BY COUNT(*) DESC) AS TagRank
+    FROM Posts p
+    WHERE p.PostTypeId = 1               -- only questions
+      AND p.Tags IS NOT NULL
+    GROUP BY p.OwnerUserId, Tag
+),
+
+/* -------------------------------------------------
+   Vote activity performed BY the user
+   ------------------------------------------------- */
+UserRecentVotes AS (
+    SELECT 
+        v.UserId,
+        COUNT(*) FILTER (WHERE vt.Id = 2) AS UpVotesGiven,
+        COUNT(*) FILTER (WHERE vt.Id = 3) AS DownVotesGiven,
+        MAX(v.CreationDate)               AS LastVoteDate
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE v.UserId IS NOT NULL
+    GROUP BY v.UserId
+)
+
+/* -------------------------------------------------
+   Final result set with many expressions, outer joins,
+   correlated sub‑queries, window functions, set operator,
+   and NULL logic.
+   ------------------------------------------------- */
+SELECT 
+    us.Id,
+    us.DisplayName,
+    us.Reputation,
+    us.QuestionCount,
+    us.AnswerCount,
+    us.TotalScore,
+    ROUND(us.AvgScore::numeric, 2)                     AS AvgScore,
+    COALESCE(b.BadgeTotal, 0)                         AS TotalBadges,
+    COALESCE(b.GoldBadges, 0)                         AS GoldBadges,
+    COALESCE(b.SilverBadges, 0)                       AS SilverBadges,
+    COALESCE(b.BronzeBadges, 0)                       AS BronzeBadges,
+    b.BadgeNames,
+    COALESCE(vr.UpVotesGiven, 0)                      AS UpVotesGiven,
+    COALESCE(vr.DownVotesGiven, 0)                    AS DownVotesGiven,
+    vr.LastVoteDate,
+    tt.Tag                                            AS TopTag,
+    tt.TagUseCount,
+    CASE
+        WHEN us.QuestionCount = 0 THEN NULL
+        WHEN us.AnswerCount / NULLIF(us.QuestionCount,0)::float > 5 THEN 'Answer heavy'
+        ELSE 'Balanced'
+    END                                               AS ActivityProfile,
+    CASE
+        WHEN us.Reputation > 20000 THEN 'Elite'
+        WHEN us.Reputation > 10000 THEN 'Pro'
+        WHEN us.Reputation > 1000  THEN 'Intermediate'
+        ELSE 'Newbie'
+    END                                               AS ReputationTier,
+    EXISTS (
+        SELECT 1
+        FROM Posts p2
+        WHERE p2.OwnerUserId = us.Id
+          AND p2.CreationDate > us.LastPostDate - INTERVAL '30 days'
+    )                                                 AS RecentActivityFlag
+FROM UserStats us
+LEFT JOIN BadgeAgg b        ON b.UserId   = us.Id
+LEFT JOIN UserRecentVotes vr ON vr.UserId = us.Id
+LEFT JOIN (
+    SELECT UserId, Tag, TagUseCount
+    FROM TopTagStats
+    WHERE TagRank = 1
+) tt                      ON tt.UserId = us.Id
+WHERE us.Reputation IS NOT NULL
+ORDER BY us.Reputation DESC
+LIMIT 100
+
+UNION ALL
+
+/* -------------------------------------------------
+   Dummy empty row to force a set operator usage
+   ------------------------------------------------- */
+SELECT 
+    NULL::int      AS Id,
+    NULL::varchar  AS DisplayName,
+    NULL::int      AS Reputation,
+    NULL::int      AS QuestionCount,
+    NULL::int      AS AnswerCount,
+    NULL::int      AS TotalScore,
+    NULL::numeric  AS AvgScore,
+    NULL::int      AS TotalBadges,
+    NULL::int      AS GoldBadges,
+    NULL::int      AS SilverBadges,
+    NULL::int      AS BronzeBadges,
+    NULL::varchar  AS BadgeNames,
+    NULL::int      AS UpVotesGiven,
+    NULL::int      AS DownVotesGiven,
+    NULL::timestamp AS LastVoteDate,
+    NULL::varchar  AS TopTag,
+    NULL::int      AS TagUseCount,
+    NULL::varchar  AS ActivityProfile,
+    NULL::varchar  AS ReputationTier,
+    NULL::bool     AS RecentActivityFlag
+WHERE FALSE;

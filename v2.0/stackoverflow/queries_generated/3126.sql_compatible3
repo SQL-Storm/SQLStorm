@@ -1,0 +1,211 @@
+WITH
+    RecentPosts AS (
+        SELECT
+            p.Id,
+            p.PostTypeId,
+            p.OwnerUserId,
+            p.CreationDate,
+            p.Score,
+            p.ViewCount,
+            p.Title,
+            p.Tags,
+            p.AnswerCount,
+            p.FavoriteCount,
+            p.ClosedDate,
+            CASE 
+                WHEN p.Tags IS NULL THEN 0
+                ELSE ((LENGTH(p.Tags) - LENGTH(REPLACE(p.Tags, '><', ''))) / 2) + 1
+            END AS TagCount,
+            CASE
+                WHEN p.PostTypeId = 1 THEN 'Question'
+                WHEN p.PostTypeId = 2 THEN 'Answer'
+                ELSE 'Other'
+            END AS PostCategory,
+            ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS RecentPostRank
+        FROM Posts p
+        WHERE p.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '180' DAY)
+    ),
+
+    BadgeSummary AS (
+        SELECT
+            b.UserId,
+            COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+            COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+            COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+            MAX(b.Date) AS LastBadgeDate
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+
+    UserActivity AS (
+        SELECT
+            u.Id          AS UserId,
+            u.Reputation,
+            u.CreationDate AS UserCreated,
+            (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS QuestionCount,
+            (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS AnswerCount,
+            (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id)               AS CommentCount,
+            (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id)                  AS VoteCount,
+            COALESCE(
+                (SELECT MAX(v.CreationDate) FROM Votes v WHERE v.UserId = u.Id),
+                u.LastAccessDate
+            ) AS LastActivity
+        FROM Users u
+        WHERE u.Reputation > 1000
+    ),
+
+    TagUsage AS (
+        parsed_tags AS (
+            SELECT
+                rp.OwnerUserId,
+                TRIM(SUBSTR(rp.Tags, 2, CASE WHEN LENGTH(rp.Tags) > 2 THEN LENGTH(rp.Tags) - 2 ELSE 0 END)) AS tags_str
+            FROM RecentPosts rp
+            WHERE rp.Tags IS NOT NULL
+        ),
+        split AS (
+            SELECT
+                OwnerUserId,
+                CASE
+                    WHEN tags_str = '' THEN NULL
+                    WHEN INSTR(tags_str, '><') = 0 THEN tags_str
+                    ELSE SUBSTR(tags_str, 1, INSTR(tags_str, '><') - 1)
+                END AS tag,
+                CASE
+                    WHEN INSTR(tags_str, '><') = 0 THEN NULL
+                    ELSE SUBSTR(tags_str, INSTR(tags_str, '><') + 2)
+                END AS rest
+            FROM parsed_tags
+            UNION ALL
+            SELECT
+                s.OwnerUserId,
+                CASE
+                    WHEN INSTR(s.rest, '><') = 0 THEN s.rest
+                    ELSE SUBSTR(s.rest, 1, INSTR(s.rest, '><') - 1)
+                END AS tag,
+                CASE
+                    WHEN INSTR(s.rest, '><') = 0 THEN NULL
+                    ELSE SUBSTR(s.rest, INSTR(s.rest, '><') + 2)
+                END AS rest
+            FROM split s
+            WHERE s.rest IS NOT NULL AND s.rest <> ''
+        )
+        SELECT
+            OwnerUserId AS OwnerUserId,
+            tag AS Tag,
+            COUNT(*) AS UsageCount
+        FROM split
+        WHERE tag IS NOT NULL AND tag <> ''
+        GROUP BY OwnerUserId, tag
+    ),
+
+    QuestionAnswerPosts AS (
+        SELECT
+            p.Id,
+            p.OwnerUserId,
+            p.CreationDate,
+            p.Score,
+            p.Title,
+            'Q' AS TypeFlag,
+            p.ViewCount,
+            p.FavoriteCount
+        FROM Posts p
+        WHERE p.PostTypeId = 1 AND p.Score IS NOT NULL
+
+        UNION ALL
+
+        SELECT
+            p.Id,
+            p.OwnerUserId,
+            p.CreationDate,
+            p.Score,
+            NULL AS Title,
+            'A' AS TypeFlag,
+            CAST(NULL AS INTEGER) AS ViewCount,
+            p.FavoriteCount
+        FROM Posts p
+        WHERE p.PostTypeId = 2 AND p.Score IS NOT NULL
+    ),
+
+    RecentScoreBand AS (
+        SELECT
+            rp.OwnerUserId,
+            SUM(rp.Score) AS TotalScore,
+            CASE
+                WHEN u.Reputation >= 20000 THEN 'Legendary'
+                WHEN u.Reputation >= 10000 THEN 'Expert'
+                WHEN u.Reputation >= 5000  THEN 'Seasoned'
+                WHEN u.Reputation >= 1000  THEN 'Intermediate'
+                ELSE 'Novice'
+            END AS RepBand,
+            ROW_NUMBER() OVER (
+                PARTITION BY
+                    CASE
+                        WHEN u.Reputation >= 20000 THEN 'Legendary'
+                        WHEN u.Reputation >= 10000 THEN 'Expert'
+                        WHEN u.Reputation >= 5000  THEN 'Seasoned'
+                        WHEN u.Reputation >= 1000  THEN 'Intermediate'
+                        ELSE 'Novice'
+                    END
+                ORDER BY SUM(rp.Score) DESC
+            ) AS RankInBand
+        FROM RecentPosts rp
+        JOIN Users u ON u.Id = rp.OwnerUserId
+        GROUP BY rp.OwnerUserId, u.Reputation
+    )
+
+SELECT
+    u.Id,
+    COALESCE(u.DisplayName, ('Anon_' || CAST(u.Id AS VARCHAR)))                AS DisplayName,
+    u.Reputation,
+    CASE
+        WHEN u.Reputation >= 20000 THEN 'Legendary'
+        WHEN u.Reputation >= 10000 THEN 'Expert'
+        WHEN u.Reputation >= 5000  THEN 'Seasoned'
+        WHEN u.Reputation >= 1000  THEN 'Intermediate'
+        ELSE 'Novice'
+    END                                                    AS ReputationBand,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.CommentCount,
+    ua.VoteCount,
+    bs.GoldBadges,
+    bs.SilverBadges,
+    bs.BronzeBadges,
+    bs.LastBadgeDate,
+    rp.RecentPostRank,
+    rp.PostCategory,
+    rp.TagCount,
+    COALESCE(
+        (SELECT LISTAGG(tu.Tag, ', ') WITHIN GROUP (ORDER BY tu.UsageCount DESC)
+         FROM TagUsage tu
+         WHERE tu.OwnerUserId = u.Id
+         FETCH FIRST 5 ROWS ONLY),
+        'NoTags'
+    )                                                    AS TopTags,
+    rss.TotalScore,
+    rss.RankInBand
+FROM Users u
+LEFT JOIN UserActivity ua      ON ua.UserId = u.Id
+LEFT JOIN BadgeSummary bs      ON bs.UserId = u.Id
+LEFT JOIN RecentPosts rp       ON rp.OwnerUserId = u.Id AND rp.RecentPostRank = 1
+LEFT JOIN RecentScoreBand rss  ON rss.OwnerUserId = u.Id
+WHERE u.Id IS NOT NULL
+GROUP BY
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.CommentCount,
+    ua.VoteCount,
+    bs.GoldBadges,
+    bs.SilverBadges,
+    bs.BronzeBadges,
+    bs.LastBadgeDate,
+    rp.RecentPostRank,
+    rp.PostCategory,
+    rp.TagCount,
+    rss.TotalScore,
+    rss.RankInBand
+ORDER BY u.Reputation DESC, ua.QuestionCount DESC
+FETCH FIRST 100 ROWS ONLY;

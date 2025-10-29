@@ -1,0 +1,143 @@
+WITH 
+UserPostStats AS (
+    SELECT 
+        u.Id                               AS UserId,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END)                     AS QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END)                     AS AnswerCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END)          AS QuestionScoreSum,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END)          AS AnswerScoreSum,
+        MAX(p.CreationDate)                                              AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id
+),
+UserBadgeStats AS (
+    SELECT 
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        MAX(b.Date)                             AS LastBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserTagCounts AS (
+    SELECT 
+        u.Id                                   AS UserId,
+        t.tag,
+        COUNT(*) OVER (PARTITION BY t.tag, u.Id)       AS cnt
+    FROM Users u
+    LEFT JOIN LATERAL (
+        SELECT 
+            UNNEST(STRING_TO_ARRAY(
+                SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2), '><'
+            )) AS tag
+        FROM Posts p
+        WHERE p.OwnerUserId = u.Id
+          AND p.PostTypeId = 1
+    ) AS t ON TRUE
+    WHERE t.tag IS NOT NULL
+),
+TopUserTag AS (
+    SELECT 
+        utc.UserId,
+        utc.tag,
+        utc.cnt,
+        ROW_NUMBER() OVER (PARTITION BY utc.UserId 
+                           ORDER BY utc.cnt DESC, utc.tag) AS rn
+    FROM UserTagCounts utc
+),
+RecentUserActivity AS (
+    SELECT 
+        u.Id                                            AS UserId,
+        (SELECT COUNT(*) 
+         FROM Votes v 
+         WHERE v.UserId = u.Id 
+           AND v.VoteTypeId = 2
+           AND v.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '7' DAY)
+        )                                                AS RecentUpVotesGiven,
+        (SELECT COUNT(*) 
+         FROM Comments c 
+         WHERE c.UserId = u.Id 
+           AND c.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '7' DAY)
+        )                                                AS RecentCommentsMade
+    FROM Users u
+)
+
+SELECT
+    u.Id,
+    COALESCE(u.DisplayName, 'Anonymous')                AS DisplayName,
+    u.Reputation,
+    COALESCE(ps.QuestionCount, 0)                       AS QuestionCount,
+    COALESCE(ps.AnswerCount, 0)                         AS AnswerCount,
+    CASE WHEN COALESCE(ps.QuestionCount,0) = 0 THEN NULL
+         ELSE COALESCE(ps.QuestionScoreSum,0) * 1.0 / COALESCE(ps.QuestionCount,0)
+    END                                                 AS AvgQuestionScore,
+    CASE WHEN COALESCE(ps.AnswerCount,0) = 0 THEN NULL
+         ELSE COALESCE(ps.AnswerScoreSum,0) * 1.0 / COALESCE(ps.AnswerCount,0)
+    END                                                 AS AvgAnswerScore,
+    COALESCE(bs.GoldBadges,   0)                        AS GoldBadges,
+    COALESCE(bs.SilverBadges, 0)                        AS SilverBadges,
+    COALESCE(bs.BronzeBadges, 0)                        AS BronzeBadges,
+    CASE
+        WHEN u.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1' YEAR) THEN 'Newbie'
+        WHEN u.Reputation >= 100000                        THEN 'Legend'
+        WHEN u.Reputation >= 20000                         THEN 'Expert'
+        ELSE                                                'Member'
+    END                                                AS UserTier,
+    t.tag                                              AS TopTag,
+    t.cnt                                              AS TopTagUsage,
+    CASE
+        WHEN ps.LastPostDate IS NULL                      THEN NULL
+        WHEN ps.LastPostDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30' DAY) THEN 'Active'
+        ELSE                                                'Dormant'
+    END                                                AS RecentActivity,
+    rua.RecentUpVotesGiven,
+    rua.RecentCommentsMade
+FROM Users u
+LEFT JOIN UserPostStats   ps  ON ps.UserId = u.Id
+LEFT JOIN UserBadgeStats  bs  ON bs.UserId = u.Id
+LEFT JOIN TopUserTag      t   ON t.UserId = u.Id AND t.rn = 1
+LEFT JOIN RecentUserActivity rua ON rua.UserId = u.Id
+WHERE u.Id NOT IN (
+      SELECT DISTINCT UserId 
+      FROM Badges 
+      WHERE Class = 1 AND LOWER(Name) LIKE LOWER('%moderator%')
+)
+ORDER BY u.Reputation DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    NULL                                              AS Id,
+    'TOTAL'                                           AS DisplayName,
+    SUM(u.Reputation)                                 AS Reputation,
+    SUM(COALESCE(ps.QuestionCount,0))                 AS QuestionCount,
+    SUM(COALESCE(ps.AnswerCount,0))                   AS AnswerCount,
+    CASE WHEN SUM(COALESCE(ps.QuestionCount,0)) = 0 THEN NULL
+         ELSE SUM(COALESCE(ps.QuestionScoreSum,0)) * 1.0 / SUM(COALESCE(ps.QuestionCount,0))
+    END                                                 AS AvgQuestionScore,
+    CASE WHEN SUM(COALESCE(ps.AnswerCount,0)) = 0 THEN NULL
+         ELSE SUM(COALESCE(ps.AnswerScoreSum,0)) * 1.0 / SUM(COALESCE(ps.AnswerCount,0))
+    END                                                 AS AvgAnswerScore,
+    SUM(COALESCE(bs.GoldBadges,0))   AS GoldBadges,
+    SUM(COALESCE(bs.SilverBadges,0)) AS SilverBadges,
+    SUM(COALESCE(bs.BronzeBadges,0)) AS BronzeBadges,
+    NULL AS UserTier,
+    NULL AS TopTag,
+    NULL AS TopTagUsage,
+    NULL AS RecentActivity,
+    NULL AS RecentUpVotesGiven,
+    NULL AS RecentCommentsMade
+FROM Users u
+LEFT JOIN UserPostStats  ps ON ps.UserId = u.Id
+LEFT JOIN UserBadgeStats bs ON bs.UserId = u.Id
+WHERE u.Id NOT IN (
+      SELECT DISTINCT UserId 
+      FROM Badges 
+      WHERE Class = 1 AND LOWER(Name) LIKE LOWER('%moderator%')
+)
+-- no non-aggregated columns remain; group by a constant to allow HAVING
+GROUP BY 1
+HAVING COUNT(u.Id) > 0;

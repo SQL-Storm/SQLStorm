@@ -1,0 +1,559 @@
+-- {"query": "7193.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 5465} 
+WITH UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        MAX(b.Date) AS LastBadgeDate,
+        MAX(v.CreationDate) AS LastVoteDate,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Elite'
+            WHEN u.Reputation >= 1000 THEN 'Expert'
+            WHEN u.Reputation >= 100 THEN 'Novice'
+            ELSE 'Beginner'
+        END AS UserTier,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRankDense,
+        NTILE(10) OVER (ORDER BY u.Reputation DESC) AS ReputationDecile,
+        LAG(u.Reputation, 1) OVER (ORDER BY u.Reputation DESC) AS PrevReputation,
+        LEAD(u.Reputation, 1) OVER (ORDER BY u.Reputation DESC) AS NextReputation,
+        AVG(u.Reputation) OVER (ORDER BY u.Reputation ROWS BETWEEN 5 PRECEDING AND 5 FOLLOWING) AS ReputationMovingAvg,
+        u.Reputation - LAG(u.Reputation, 1) OVER (ORDER BY u.Reputation DESC) AS RepChangeFromPrev,
+        (u.Reputation - LAG(u.Reputation, 1) OVER (ORDER BY u.Reputation DESC)) / NULLIF(LAG(u.Reputation, 1) OVER (ORDER BY u.Reputation DESC), 0) * 100 AS RepGrowthPercent,
+        CASE WHEN u.Reputation > (SELECT AVG(Reputation) FROM Users) THEN 1 ELSE 0 END AS AboveAvgReputation,
+        CASE WHEN u.Reputation < (SELECT AVG(Reputation) FROM Users) THEN 1 ELSE 0 END AS BelowAvgReputation
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    WHERE u.CreationDate >= '2010-01-01 00:00:00'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+UserStats AS (
+    SELECT
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.CreationDate,
+        ua.PostCount,
+        ua.CommentCount,
+        ua.BadgeCount,
+        ua.VoteCount,
+        ua.LastPostDate,
+        ua.LastCommentDate,
+        ua.LastBadgeDate,
+        ua.LastVoteDate,
+        ua.UserTier,
+        ua.ReputationRank,
+        ua.ReputationRankDense,
+        ua.ReputationDecile,
+        ua.RepChangeFromPrev,
+        ua.RepGrowthPercent,
+        ua.AboveAvgReputation,
+        ua.BelowAvgReputation,
+        -- Calculate activity scores
+        CASE 
+            WHEN ua.PostCount > 0 THEN ua.VoteCount * 1.0 / ua.PostCount 
+            ELSE 0 
+        END AS VotesPerPost,
+        CASE 
+            WHEN ua.CommentCount > 0 THEN ua.BadgeCount * 1.0 / ua.CommentCount 
+            ELSE 0 
+        END AS BadgesPerComment,
+        CASE 
+            WHEN ua.Reputation > 0 THEN (ua.PostCount + ua.CommentCount) * 1.0 / ua.Reputation 
+            ELSE 0 
+        END AS ActivityEfficiency,
+        -- Calculate time-based metrics
+        DATEDIFF(CURRENT_TIMESTAMP, ua.CreationDate) AS DaysSinceCreation,
+        DATEDIFF(CURRENT_TIMESTAMP, ua.LastPostDate) AS DaysSinceLastPost,
+        DATEDIFF(CURRENT_TIMESTAMP, ua.LastCommentDate) AS DaysSinceLastComment,
+        DATEDIFF(CURRENT_TIMESTAMP, ua.LastBadgeDate) AS DaysSinceLastBadge,
+        DATEDIFF(CURRENT_TIMESTAMP, ua.LastVoteDate) AS DaysSinceLastVote,
+        -- Activity score using multiple metrics
+        (ua.PostCount * 3 + ua.CommentCount * 2 + ua.BadgeCount + ua.VoteCount) AS ActivityScore,
+        -- Time-based factors
+        CASE 
+            WHEN DATEDIFF(CURRENT_TIMESTAMP, ua.LastPostDate) <= 30 THEN 1.5
+            WHEN DATEDIFF(CURRENT_TIMESTAMP, ua.LastPostDate) <= 90 THEN 1.2
+            WHEN DATEDIFF(CURRENT_TIMESTAMP, ua.LastPostDate) <= 180 THEN 1.0
+            ELSE 0.8
+        END AS PostActivityFactor,
+        CASE 
+            WHEN DATEDIFF(CURRENT_TIMESTAMP, ua.LastCommentDate) <= 30 THEN 1.5
+            WHEN DATEDIFF(CURRENT_TIMESTAMP, ua.LastCommentDate) <= 90 THEN 1.2
+            WHEN DATEDIFF(CURRENT_TIMESTAMP, ua.LastCommentDate) <= 180 THEN 1.0
+            ELSE 0.8
+        END AS CommentActivityFactor,
+        CASE 
+            WHEN DATEDIFF(CURRENT_TIMESTAMP, ua.LastBadgeDate) <= 30 THEN 1.5
+            WHEN DATEDIFF(CURRENT_TIMESTAMP, ua.LastBadgeDate) <= 90 THEN 1.2
+            WHEN DATEDIFF(CURRENT_TIMESTAMP, ua.LastBadgeDate) <= 180 THEN 1.0
+            ELSE 0.8
+        END AS BadgeActivityFactor,
+        -- Complex reputation growth indicator
+        CASE 
+            WHEN ua.RepGrowthPercent > 50 THEN 'Rapid Growth'
+            WHEN ua.RepGrowthPercent > 10 THEN 'Steady Growth'
+            WHEN ua.RepGrowthPercent >= -10 THEN 'Stable'
+            WHEN ua.RepGrowthPercent >= -50 THEN 'Minor Decline'
+            ELSE 'Significant Decline'
+        END AS RepGrowthTrend,
+        -- Determine user status based on activity
+        CASE 
+            WHEN (ua.PostCount + ua.CommentCount + ua.BadgeCount + ua.VoteCount) > 100 THEN 'Highly Active'
+            WHEN (ua.PostCount + ua.CommentCount + ua.BadgeCount + ua.VoteCount) > 50 THEN 'Active'
+            WHEN (ua.PostCount + ua.CommentCount + ua.BadgeCount + ua.VoteCount) > 10 THEN 'Moderate'
+            ELSE 'Inactive'
+        END AS UserStatus,
+        -- Rank-based indicators
+        CASE 
+            WHEN ua.ReputationRank <= 10 THEN 'Top 10'
+            WHEN ua.ReputationRank <= 100 THEN 'Top 100'
+            WHEN ua.ReputationRank <= 1000 THEN 'Top 1000'
+            ELSE 'Below Top 1000'
+        END AS ReputationPlacement,
+        -- Replication of user tier with conditional logic
+        CASE 
+            WHEN ua.Reputation >= 25000 AND ua.PostCount >= 200 THEN 'Elite Contributor'
+            WHEN ua.Reputation >= 15000 AND ua.PostCount >= 100 THEN 'Veteran Contributor'
+            WHEN ua.Reputation <= 1000 AND ua.PostCount <= 10 THEN 'New Contributor'
+            ELSE 'Regular Contributor'
+        END AS ContributorStatus,
+        -- Calculate time since last activity
+        GREATEST(
+            NULLIF(DATEDIFF(CURRENT_TIMESTAMP, ua.LastPostDate), -1),
+            NULLIF(DATEDIFF(CURRENT_TIMESTAMP, ua.LastCommentDate), -1),
+            NULLIF(DATEDIFF(CURRENT_TIMESTAMP, ua.LastBadgeDate), -1),
+            NULLIF(DATEDIFF(CURRENT_TIMESTAMP, ua.LastVoteDate), -1)
+        ) AS DaysSinceLastActivity
+    FROM UserActivity ua
+    WHERE ua.PostCount + ua.CommentCount + ua.BadgeCount + ua.VoteCount > 0
+),
+TagAnalysis AS (
+    SELECT 
+        t.Id AS TagId,
+        t.TagName,
+        t.Count AS TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        -- Complex condition using CASE and string functions
+        CASE 
+            WHEN t.TagName LIKE 'c++' OR t.TagName LIKE 'c#' OR t.TagName LIKE 'javascript' THEN 'Popular Language'
+            WHEN t.TagName LIKE '%-%' OR t.TagName LIKE '%.%' THEN 'Technical Concept'
+            WHEN t.TagName LIKE '%[sql]' OR t.TagName LIKE '%sql%' THEN 'Database Related'
+            ELSE 'General'
+        END AS TagCategory,
+        -- Calculated weight for tags
+        LOG(t.Count + 1) * CASE 
+            WHEN t.IsRequired = 1 THEN 2 
+            WHEN t.IsModeratorOnly = 1 THEN 1.5 
+            ELSE 1 
+        END AS TagWeight,
+        -- String manipulation in expression
+        CONCAT(UPPER(LEFT(t.TagName, 1)), LOWER(SUBSTRING(t.TagName, 2))) AS FormattedTagName,
+        -- Determine if tag is "featured"
+        CASE 
+            WHEN t.Count > (SELECT AVG(Count) FROM Tags) * 2 THEN 'Featured'
+            WHEN t.Count > (SELECT AVG(Count) FROM Tags) THEN 'Popular'
+            ELSE 'Standard'
+        END AS TagPopularity,
+        -- Calculate ratio to top tags
+        t.Count * 1.0 / (SELECT MAX(Count) FROM Tags) AS CountRatioToTop,
+        -- Tag activity score calculated in subquery
+        (SELECT COUNT(*) FROM Posts p INNER JOIN (
+            SELECT Id FROM Posts WHERE Tags LIKE '%' || t.TagName || '%'
+        ) AS filtered ON p.Id = filtered.Id) AS TagActivityScore
+    FROM Tags t
+    WHERE t.TagName IS NOT NULL AND t.TagName != ''
+),
+PostCategoryAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        -- Extracting tags and categorizing them
+        CASE 
+            WHEN CHARINDEX('c++', p.Tags) > 0 THEN 1 ELSE 0 END +
+        CASE 
+            WHEN CHARINDEX('python', p.Tags) > 0 THEN 1 ELSE 0 END +
+        CASE 
+            WHEN CHARINDEX('java', p.Tags) > 0 THEN 1 ELSE 0 END +
+        CASE 
+            WHEN CHARINDEX('javascript', p.Tags) > 0 THEN 1 ELSE 0 END +
+        CASE 
+            WHEN CHARINDEX('sql', p.Tags) > 0 THEN 1 ELSE 0 END AS LanguageTagCount,
+        -- Complex filtering using multiple conditions
+        CASE 
+            WHEN p.Score > 0 AND p.ViewCount > 1000 THEN 'High Engagement'
+            WHEN p.Score > 0 AND p.ViewCount > 500 THEN 'Medium Engagement'
+            WHEN p.Score <= 0 AND p.ViewCount > 1000 THEN 'High Views, Low Score'
+            ELSE 'Low Engagement'
+        END AS PostEngagementLevel,
+        -- Post age calculation in days
+        DATEDIFF(CURRENT_TIMESTAMP, p.CreationDate) AS PostAgeInDays,
+        -- Categorize by creation timestamp
+        CASE 
+            WHEN DATEPART(YEAR, p.CreationDate) >= 2020 THEN 'Recent'
+            WHEN DATEPART(YEAR, p.CreationDate) >= 2015 THEN 'Mid'
+            ELSE 'Old'
+        END AS PostAgeCategory,
+        -- Calculate engagement score (weighted)
+        (p.Score * 2 + p.ViewCount * 0.1 + COALESCE(p.CommentCount, 0) * 5) AS EngagementScore,
+        -- Normalize tag count
+        CASE 
+            WHEN LEN(p.Tags) > 5 THEN LEN(p.Tags) - 2 ELSE 0 END AS TagCountNormalized,
+        -- Extract primary language from tags if present
+        CASE 
+            WHEN p.Tags LIKE '%[c++]%' THEN 'c++'
+            WHEN p.Tags LIKE '%[python]%' THEN 'python'
+            WHEN p.Tags LIKE '%[java]%' THEN 'java'
+            WHEN p.Tags LIKE '%[javascript]%' THEN 'javascript'
+            WHEN p.Tags LIKE '%[sql]%' THEN 'sql'
+            ELSE NULL
+        END AS PrimaryLanguage,
+        -- Complex conditional on nested queries for post analysis
+        COALESCE(
+            (SELECT COUNT(*) 
+             FROM Comments c 
+             WHERE c.PostId = p.Id 
+               AND c.CreationDate > DATEADD(DAY, -7, p.CreationDate)
+            ), 
+            0
+        ) AS RecentCommentsInWeek
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)  -- Questions and Answers
+      AND p.CreationDate >= '2019-01-01 00:00:00'
+      AND (p.Score IS NULL OR p.Score >= -5) -- Filter for reasonable scores
+),
+CombinedResults AS (
+    SELECT 
+        'User Metrics' AS Section,
+        COUNT(*) AS RecordCount,
+        NULL AS UserId,
+        NULL AS DisplayName,
+        NULL AS Reputation,
+        NULL AS PostCount,
+        NULL AS CommentCount,
+        NULL AS BadgeCount,
+        NULL AS VoteCount,
+        NULL AS UserTier,
+        NULL AS ActivityScore,
+        NULL AS UserStatus,
+        NULL AS RepGrowthTrend,
+        NULL AS ContributorStatus
+    FROM UserStats
+    UNION ALL
+    SELECT 
+        'Tag Metrics' AS Section,
+        COUNT(*) AS RecordCount,
+        NULL AS UserId,
+        NULL AS DisplayName,
+        NULL AS Reputation,
+        NULL AS PostCount,
+        NULL AS CommentCount,
+        NULL AS BadgeCount,
+        NULL AS VoteCount,
+        NULL AS UserTier,
+        NULL AS ActivityScore,
+        NULL AS UserStatus,
+        NULL AS RepGrowthTrend,
+        NULL AS ContributorStatus
+    FROM TagAnalysis
+    UNION ALL
+    SELECT 
+        'Post Metrics' AS Section,
+        COUNT(*) AS RecordCount,
+        NULL AS UserId,
+        NULL AS DisplayName,
+        NULL AS Reputation,
+        NULL AS PostCount,
+        NULL AS CommentCount,
+        NULL AS BadgeCount,
+        NULL AS VoteCount,
+        NULL AS UserTier,
+        NULL AS ActivityScore,
+        NULL AS UserStatus,
+        NULL AS RepGrowthTrend,
+        NULL AS ContributorStatus
+    FROM PostCategoryAnalysis
+),
+PostWithTags AS (
+    SELECT 
+        pca.PostId,
+        pca.PostTypeId,
+        pca.OwnerUserId,
+        pca.CreationDate,
+        pca.Score,
+        pca.ViewCount,
+        pca.Title,
+        pca.Tags,
+        pca.LanguageTagCount,
+        pca.PostEngagementLevel,
+        pca.PostAgeInDays,
+        pca.PostAgeCategory,
+        pca.EngagementScore,
+        pca.TagCountNormalized,
+        pca.PrimaryLanguage,
+        pca.RecentCommentsInWeek
+    FROM PostCategoryAnalysis pca
+    WHERE pca.PostTypeId = 1 -- Only questions
+),
+ComplexUserSummary AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        CASE 
+            WHEN (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.CreationDate > DATEADD(YEAR, -1, CURRENT_TIMESTAMP)) > 100
+                 THEN 1 ELSE 0 END AS ActiveInLastYear,
+        -- Nested subquery analysis
+        (SELECT TOP 1 TagName FROM Tags t WHERE t.Count = (SELECT MAX(Count) FROM Tags)) AS MostPopularTag,
+        -- Aggregation with CASE
+        CASE 
+            WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 50 THEN 'Question Expert'
+            WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 10 THEN 'Question Contributor'
+            ELSE 'Novice Questioner'
+        END AS QuestioningStyle,
+        -- Using window functions in a complex way
+        AVG(CAST(p.Score AS FLOAT)) OVER (PARTITION BY p.OwnerUserId) AS AvgUserScore,
+        -- Time-based filtering with window functions
+        FIRST_VALUE(p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS FirstPostDate,
+        LAST_VALUE(p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS LatestPostDate,
+        -- Correlated subquery for ranking 
+        (
+            SELECT COUNT(*) 
+            FROM Users u2 
+            WHERE u2.Reputation > u.Reputation
+        ) + 1 AS RankAmongUsers,
+        -- Complex string manipulation
+        TRIM(CONCAT(u.DisplayName, ' (', 
+            CASE WHEN u.AverageScore > 100 THEN 'Active' ELSE 'Regular' END, 
+            ')')) AS UserDisplayNameWithStatus
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.CreationDate >= '2015-01-01 00:00:00'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+FinalAggregation AS (
+    -- Combine everything with set operators and complex joins
+    SELECT 
+        cs.UserId,
+        cs.DisplayName,
+        cs.Reputation,
+        cs.CreationDate,
+        cs.ActiveInLastYear,
+        cs.MostPopularTag,
+        cs.QuestioningStyle,
+        cs.AvgUserScore,
+        cs.FirstPostDate,
+        cs.LatestPostDate,
+        cs.RankAmongUsers,
+        cs.UserDisplayNameWithStatus,
+        ps.PostId,
+        ps.PostTypeId,
+        ps.CreationDate AS PostCreationDate,
+        ps.Score,
+        ps.ViewCount,
+        ps.Title,
+        ps.Tags,
+        ps.LanguageTagCount,
+        ps.PostEngagementLevel,
+        ps.PostAgeInDays,
+        ps.PostAgeCategory,
+        ps.EngagementScore,
+        ps.TagCountNormalized,
+        ps.PrimaryLanguage,
+        ps.RecentCommentsInWeek,
+        -- Calculated combined metrics
+        (cs.Reputation / NULLIF(cs.AvgUserScore, 0)) * ps.EngagementScore AS ReputationAdjustedEngagementScore,
+        -- String processing complex pattern matching
+        CASE 
+            WHEN ps.Title LIKE '%problem%' OR ps.Title LIKE '%issue%' OR ps.Title LIKE '%question%' THEN 'Problem Focused'
+            WHEN ps.Title LIKE '%solution%' OR ps.Title LIKE '%answer%' THEN 'Solution Focused'
+            ELSE 'Neutral Focus'
+        END AS TitleFocus,
+        -- Complex boolean logic in WHERE clause
+        CASE 
+            WHEN ps.PostTypeId = 1 AND ps.Score >= 10 AND ps.PostAgeInDays <= 30 THEN 1
+            WHEN ps.PostTypeId = 1 AND ps.ViewCount >= 500 THEN 1
+            ELSE 0
+        END AS HighValueQuestion,
+        -- Date-based business rules
+        CASE 
+            WHEN ps.CreationDate >= DATEADD(DAY, -30, CURRENT_TIMESTAMP) THEN 'Newly Published'
+            WHEN ps.CreationDate >= DATEADD(DAY, -90, CURRENT_TIMESTAMP) THEN 'Recently Updated'
+            WHEN ps.CreationDate >= DATEADD(DAY, -365, CURRENT_TIMESTAMP) THEN 'Active Content'
+            ELSE 'Historical Content'
+        END AS PostPublishStatus,
+        -- Multi-criteria calculation
+        CASE 
+            WHEN (ps.LanguageTagCount > 2 AND ps.Tags LIKE '%[c++]%') OR ps.Tags LIKE '%[python]%' THEN 'Multi-Language Code'
+            WHEN ps.Tags LIKE '%[sql]%' AND ps.Score > 0 THEN 'SQL Focused'
+            ELSE 'General Inquiry'
+        END AS PostCategoryClassification,
+        -- Aggregated count of similar posts by user
+        COUNT(*) OVER (PARTITION BY cs.UserId, ps.PrimaryLanguage) AS UserLanguagePostCount
+    FROM ComplexUserSummary cs
+    INNER JOIN Posts ps ON cs.UserId = ps.OwnerUserId
+    WHERE ps.PostTypeId = 1 
+      AND ps.CreationDate >= '2019-01-01 00:00:00'
+      AND ps.Title IS NOT NULL
+),
+CombinedData AS (
+    SELECT 
+        f.UserId,
+        f.DisplayName,
+        f.Reputation,
+        f.CreationDate,
+        f.ActiveInLastYear,
+        f.MostPopularTag,
+        f.QuestioningStyle,
+        f.AvgUserScore,
+        f.FirstPostDate,
+        f.LatestPostDate,
+        f.RankAmongUsers,
+        f.UserDisplayNameWithStatus,
+        f.PostId,
+        f.PostTypeId,
+        f.PostCreationDate,
+        f.Score,
+        f.ViewCount,
+        f.Title,
+        f.Tags,
+        f.LanguageTagCount,
+        f.PostEngagementLevel,
+        f.PostAgeInDays,
+        f.PostAgeCategory,
+        f.EngagementScore,
+        f.TagCountNormalized,
+        f.PrimaryLanguage,
+        f.RecentCommentsInWeek,
+        f.ReputationAdjustedEngagementScore,
+        f.TitleFocus,
+        f.HighValueQuestion,
+        f.PostPublishStatus,
+        f.PostCategoryClassification,
+        f.UserLanguagePostCount
+    FROM FinalAggregation f
+    WHERE f.Reputation > 1000
+      AND f.PostAgeInDays <= 365
+),
+AggregatedMetrics AS (
+    SELECT 
+        COUNT(*) AS TotalRecords,
+        MAX(Reputation) AS MaxReputation,
+        MIN(Reputation) AS MinReputation,
+        AVG(Reputation) AS AvgReputation,
+        SUM(Score) AS TotalScore,
+        MAX(CreationDate) AS LatestUserCreationDate,
+        MIN(LatestPostDate) AS EarliestLatestPost,
+        COUNT(DISTINCT UserId) AS UniqueUsers,
+        SUM(EngagementScore) AS TotalEngagementScore,
+        COUNT(DISTINCT PostId) AS UniqueQuestions
+    FROM CombinedData
+)
+SELECT 
+    'Performance Benchmark Query Output' AS QueryType,
+    (
+        SELECT TotalRecords FROM AggregatedMetrics
+    ) AS TotalRecords,
+    (
+        SELECT MaxReputation FROM AggregatedMetrics
+    ) AS MaxReputation,
+    (
+        SELECT MinReputation FROM AggregatedMetrics
+    ) AS MinReputation,
+    (
+        SELECT AvgReputation FROM AggregatedMetrics
+    ) AS AvgReputation,
+    (
+        SELECT TotalScore FROM AggregatedMetrics
+    ) AS TotalScore,
+    (
+        SELECT LatestUserCreationDate FROM AggregatedMetrics
+    ) AS LatestUserCreationDate,
+    (
+        SELECT EarliestLatestPost FROM AggregatedMetrics
+    ) AS EarliestLatestPost,
+    (
+        SELECT UniqueUsers FROM AggregatedMetrics
+    ) AS UniqueUsers,
+    (
+        SELECT TotalEngagementScore FROM AggregatedMetrics
+    ) AS TotalEngagementScore,
+    (
+        SELECT UniqueQuestions FROM AggregatedMetrics
+    ) AS UniqueQuestions,
+    -- Complex calculation from final aggregated results
+    (SELECT AVG(Reputation) FROM CombinedData WHERE Reputation > (SELECT AVG(Reputation) FROM CombinedData)) AS AboveAverageReputation,
+    -- Set operation result (UNION with complex subquery)
+    (SELECT COUNT(*) FROM (
+        SELECT UserId FROM CombinedData WHERE HighValueQuestion = 1
+        UNION 
+        SELECT UserId FROM CombinedData WHERE PostCategoryClassification = 'Multi-Language Code'
+        UNION 
+        SELECT UserId FROM CombinedData WHERE ActiveInLastYear = 1
+    ) AS MultiCriteriaResults) AS MultiCriteriaResultsCount,
+    -- Window function in scalar context
+    (
+        SELECT TOP 1 Reputation FROM CombinedData ORDER BY Reputation DESC
+    ) AS TopIndividualReputation,
+    -- String aggregation pattern
+    (
+        SELECT STRING_AGG(DISTINCT PostCategoryClassification, ', ') 
+        FROM CombinedData 
+        WHERE PostTypeId = 1
+    ) AS DistinctPostCategories,
+    -- Complex filter with EXISTS and correlated subqueries
+    CASE 
+        WHEN EXISTS (
+            SELECT 1 FROM CombinedData cd 
+            WHERE cd.Reputation > (SELECT AVG(Reputation) FROM Users) 
+            AND cd.HighValueQuestion = 1
+        ) THEN 'High Value Community Exists'
+        ELSE 'No High Value Community'
+    END AS CommunityQualityIndicator,
+    -- Subquery with JOIN and complex predicates
+    (
+        SELECT COUNT(*) FROM (
+            SELECT cd.UserId, COUNT(cd.PostId) AS PostCount
+            FROM CombinedData cd 
+            WHERE cd.PostAgeInDays <= 30
+            GROUP BY cd.UserId 
+            HAVING COUNT(cd.PostId) > 5
+        ) AS RecentActiveUsers
+    ) AS RecentHighlyActiveUsers
+FROM CombinedData
+WHERE 
+    EXISTS (
+        SELECT 1 FROM Posts p 
+        WHERE p.Id = CombinedData.PostId 
+        AND p.CreationDate >= '2019-01-01 00:00:00'
+    )
+    AND 
+    (CombinedData.Reputation > 500 OR CombinedData.Score > 20)
+    AND 
+    CombinedData.PostAgeInDays <= 365
+    AND 
+    CombinedData.PrimaryLanguage IS NOT NULL
+ORDER BY 
+    CombinedData.Reputation DESC,
+    CombinedData.EngagementScore DESC
+OFFSET 0 ROWS FETCH NEXT 1000 ROWS ONLY;

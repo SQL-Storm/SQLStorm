@@ -1,0 +1,141 @@
+-- {"query": "4279.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1652} 
+WITH RankedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS RowNumUser,
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousScore,
+        LEAD(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextScore,
+        SUM(CASE WHEN c.UserId IS NOT NULL THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id) AS CommenterCount,
+        AVG(CAST(p.Score AS FLOAT)) OVER (PARTITION BY p.PostTypeId) AS AvgScoreForPostType
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    WHERE p.OwnerUserId IS NOT NULL
+      AND p.PostTypeId IN (1, 2)
+    GROUP BY p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.ClosedDate
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT rp.PostId) AS TotalPosts,
+        SUM(rp.PostScore) AS TotalScoreReceived,
+        AVG(CAST(rp.PostScore AS FLOAT)) AS AvgScorePerPost,
+        MAX(rp.PostCreationDate) AS LastPostDate,
+        CASE
+            WHEN rp.CommenterCount > 5 THEN 'Engaged'
+            WHEN rp.CommenterCount BETWEEN 2 AND 5 THEN 'Active'
+            ELSE 'Less Active'
+        END AS EngagementLevel,
+        CASE
+            WHEN rp.ClosedDate IS NOT NULL THEN 'Closed'
+            ELSE 'Open'
+        END AS PostStatus,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+    JOIN RankedPosts rp ON u.Id = rp.OwnerUserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, rp.CommenterCount, rp.ClosedDate
+),
+PostLinkAnalysis AS (
+    SELECT
+        pl.PostId,
+        COUNT(pl.RelatedPostId) AS NumberOfLinks
+    FROM PostLinks pl
+    GROUP BY pl.PostId
+)
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.UserCreationDate,
+    ua.TotalPosts,
+    ua.TotalScoreReceived,
+    ua.AvgScorePerPost,
+    ua.LastPostDate,
+    ua.EngagementLevel,
+    ua.PostStatus,
+    ua.ReputationRank,
+    COALESCE(pla.NumberOfLinks, 0) AS TotalLinksPosted,
+    rp.PostId AS TopUserPostId,
+    rp.PostScore AS TopUserPostScore,
+    rp.AnswerCount AS TopUserAnswerCount,
+    rp.CommentCount AS TopUserCommentCount,
+    rp.FavoriteCount AS TopUserFavoriteCount,
+    rp.AvgScoreForPostType AS AvgScoreForPostType,
+    CASE
+        WHEN rp.PreviousScore > 0 AND rp.NextScore > 0 AND rp.PreviousScore < rp.PostScore AND rp.NextScore < rp.PostScore THEN 'Trending Up'
+        WHEN rp.PreviousScore > 0 AND rp.NextScore > 0 AND rp.PreviousScore > rp.PostScore AND rp.NextScore > rp.PostScore THEN 'Trending Down'
+        ELSE 'Stable'
+    END AS ScoreTrend,
+    CASE
+        WHEN LENGTH(TRIM(u.Location)) > 10 AND u.Location IS NOT NULL THEN 'Has Location'
+        ELSE 'No Specific Location'
+    END AS LocationDetail,
+    CASE
+        WHEN rp.PostScore > 1000 THEN 'High Score'
+        WHEN rp.PostScore BETWEEN 100 AND 1000 THEN 'Medium Score'
+        ELSE 'Low Score'
+    END AS ScoreCategory,
+    UPPER(SUBSTRING(COALESCE(u.AboutMe, ''), 1, 20)) AS PartialAboutMe,
+    (rp.PostScore * 1.0 / NULLIF(rp.CommentCount, 0)) AS ScoreToCommentRatio,
+    CASE
+        WHEN EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = u.Id AND b.Name LIKE '%Famous%') THEN 'Has Famous Badge'
+        ELSE 'No Famous Badge'
+    END AS FamousBadgeStatus
+FROM UserActivity ua
+LEFT JOIN RankedPosts rp ON ua.UserId = rp.OwnerUserId AND rp.RowNumUser = 1
+LEFT JOIN PostLinkAnalysis pla ON ua.UserId = pla.PostId
+LEFT JOIN Users u ON ua.UserId = u.Id
+WHERE ua.TotalPosts > 5
+  AND ua.AvgScorePerPost > 10
+  AND ua.LastPostDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '90 days'
+UNION
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.UserCreationDate,
+    ua.TotalPosts,
+    ua.TotalScoreReceived,
+    ua.AvgScorePerPost,
+    ua.LastPostDate,
+    ua.EngagementLevel,
+    ua.PostStatus,
+    ua.ReputationRank,
+    COALESCE(pla.NumberOfLinks, 0) AS TotalLinksPosted,
+    NULL AS TopUserPostId,
+    NULL AS TopUserPostScore,
+    NULL AS TopUserAnswerCount,
+    NULL AS TopUserCommentCount,
+    NULL AS TopUserFavoriteCount,
+    NULL AS AvgScoreForPostType,
+    NULL AS ScoreTrend,
+    CASE
+        WHEN LENGTH(TRIM(u.Location)) > 10 AND u.Location IS NOT NULL THEN 'Has Location'
+        ELSE 'No Specific Location'
+    END AS LocationDetail,
+    CASE
+        WHEN ua.Reputation > 50000 THEN 'High Reputation User'
+        ELSE 'Standard User'
+    END AS ScoreCategory,
+    UPPER(SUBSTRING(COALESCE(u.AboutMe, ''), 1, 20)) AS PartialAboutMe,
+    NULL AS ScoreToCommentRatio,
+    CASE
+        WHEN EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = u.Id AND b.Name LIKE '%Unsung%') THEN 'Has Unsung Badge'
+        ELSE 'No Unsung Badge'
+    END AS FamousBadgeStatus
+FROM UserActivity ua
+LEFT JOIN PostLinkAnalysis pla ON ua.UserId = pla.PostId
+LEFT JOIN Users u ON ua.UserId = u.Id
+WHERE ua.TotalPosts <= 5
+  AND ua.AvgScorePerPost <= 10
+  AND ua.LastPostDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '180 days';

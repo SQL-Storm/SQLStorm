@@ -1,0 +1,187 @@
+-- {"query": "7451.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2049} 
+SELECT 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) as TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.ViewCount > 1000 THEN p.Id END) as HighViewQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.Score > 10 THEN p.Id END) as HighScoreAnswers,
+    COUNT(DISTINCT b.Id) as Badges,
+    COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) as GoldBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) as SilverBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) as BronzeBadges,
+    COALESCE(SUM(CASE WHEN p.PostTypeId IN (1,2) THEN p.Score ELSE 0 END), 0) as TotalReputationScore,
+    COALESCE(SUM(p.ViewCount), 0) as TotalViews,
+    COALESCE(AVG(p.Score), 0) as AverageScore,
+    MAX(p.CreationDate) as LatestPostDate,
+    MIN(p.CreationDate) as FirstPostDate,
+    DATEDIFF(day, MIN(p.CreationDate), MAX(p.CreationDate)) as DaysActive,
+    CASE 
+        WHEN COUNT(DISTINCT b.Id) > 0 THEN 
+            COALESCE(COUNT(DISTINCT b.Id) * 100.0 / COUNT(DISTINCT u.Id), 0)
+        ELSE 0 
+    END as BadgeEfficiencyRate,
+    COALESCE(
+        (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id),
+        0
+    ) as TotalComments,
+    COALESCE(
+        (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId IN (2,3,8,9)),
+        0
+    ) as TotalVotes,
+    COALESCE(
+        (SELECT COUNT(*) FROM PostHistory ph WHERE ph.UserId = u.Id AND ph.PostHistoryTypeId IN (10,11,12,13)),
+        0
+    ) as PostHistoryChanges,
+    COALESCE(
+        (SELECT COUNT(*) FROM Posts p2 JOIN PostLinks pl ON p2.Id = pl.PostId AND pl.LinkTypeId = 3 WHERE p2.OwnerUserId = u.Id),
+        0
+    ) as DuplicateQuestions,
+    CASE 
+        WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+            ROUND(
+                CAST(COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) * 100.0 / COUNT(DISTINCT p.Id) AS FLOAT), 
+                2
+            )
+        ELSE 0 
+    END as QuestionPercentage,
+    CASE 
+        WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+            ROUND(
+                CAST(COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) * 100.0 / COUNT(DISTINCT p.Id) AS FLOAT), 
+                2
+            )
+        ELSE 0 
+    END as AnswerPercentage,
+    COALESCE(
+        (SELECT TOP 1 p3.Title 
+         FROM Posts p3 
+         WHERE p3.OwnerUserId = u.Id 
+         AND p3.PostTypeId = 1 
+         ORDER BY p3.CreationDate DESC),
+        'No Questions'
+    ) as LatestQuestionTitle,
+    COALESCE(
+        (SELECT TOP 1 p4.Body 
+         FROM Posts p4 
+         WHERE p4.OwnerUserId = u.Id 
+         AND p4.PostTypeId = 2 
+         ORDER BY p4.CreationDate DESC),
+        'No Answers'
+    ) as LatestAnswerBody,
+    COALESCE(
+        (SELECT STRING_AGG(t.TagName, ', ') 
+         FROM Posts p5 
+         JOIN (
+             SELECT p6.Id, STRING_AGG(TRIM(SUBSTRING(p6.Tags, 2, LEN(p6.Tags)-2), '>') as TagName
+             FROM Posts p6 
+             WHERE p6.OwnerUserId = u.Id 
+             AND p6.PostTypeId = 1
+             GROUP BY p6.Id
+         ) t ON p5.Id = t.Id),
+        'No Tags'
+    ) as UserTags,
+    CASE 
+        WHEN EXISTS(SELECT 1 FROM Users u2 WHERE u2.AccountId = u.AccountId AND u2.Id != u.Id) THEN 
+            'Shared Account'
+        ELSE 'Unique Account'
+    END as AccountStatus,
+    CASE 
+        WHEN u.Reputation >= 10000 THEN 'Elite'
+        WHEN u.Reputation >= 1000 THEN 'Master'
+        WHEN u.Reputation >= 100 THEN 'Beginner'
+        ELSE 'Novice'
+    END as ReputationTier,
+    PERCENT_RANK() OVER (ORDER BY u.Reputation) as ReputationPercentile,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) as ReputationRank,
+    NTILE(100) OVER (ORDER BY u.Reputation DESC) as ReputationQuartile,
+    LAG(u.Reputation, 1, 0) OVER (ORDER BY u.Reputation DESC) as PreviousReputation,
+    LEAD(u.Reputation, 1, 0) OVER (ORDER BY u.Reputation DESC) as NextReputation,
+    CASE 
+        WHEN u.Reputation > (
+            SELECT AVG(Reputation) FROM Users WHERE AccountId = u.AccountId
+        ) THEN 'Above Account Average'
+        WHEN u.Reputation < (
+            SELECT AVG(Reputation) FROM Users WHERE AccountId = u.AccountId
+        ) THEN 'Below Account Average'
+        ELSE 'Account Average'
+    END as AccountReputationComparison,
+    ROUND(
+        AVG(CASE 
+            WHEN p.PostTypeId = 1 THEN p.ViewCount 
+            ELSE NULL 
+        END) OVER (PARTITION BY u.Id), 
+        2
+    ) as AvgQuestionViews,
+    ROUND(
+        AVG(CASE 
+            WHEN p.PostTypeId = 2 THEN p.Score 
+            ELSE NULL 
+        END) OVER (PARTITION BY u.Id), 
+        2
+    ) as AvgAnswerScore,
+    CAST(
+        DATEDIFF(YEAR, u.CreationDate, GETDATE()) AS VARCHAR(10)
+    ) + ' years' as AccountAge,
+    COALESCE(
+        (SELECT COUNT(*) FROM Posts p7 
+         WHERE p7.OwnerUserId = u.Id 
+         AND p7.CreationDate >= DATEADD(MONTH, -3, GETDATE())),
+        0
+    ) as RecentPosts,
+    COALESCE(
+        (SELECT COUNT(*) FROM Posts p8 
+         WHERE p8.OwnerUserId = u.Id 
+         AND p8.CreationDate >= DATEADD(MONTH, -1, GETDATE())),
+        0
+    ) as RecentQuestions,
+    CASE 
+        WHEN u.LastAccessDate > DATEADD(DAY, -7, GETDATE()) THEN 'Active'
+        WHEN u.LastAccessDate > DATEADD(DAY, -30, GETDATE()) THEN 'Inactive (7-30 days)'
+        WHEN u.LastAccessDate > DATEADD(DAY, -90, GETDATE()) THEN 'Inactive (30-90 days)'
+        ELSE 'Very Inactive (>90 days)'
+    END as ActivityStatus,
+    STRING_AGG(
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Q' 
+            WHEN p.PostTypeId = 2 THEN 'A' 
+            ELSE 'O' 
+        END, 
+        ' | '
+    ) WITHIN GROUP (ORDER BY p.CreationDate) as PostTypeHistory,
+    CASE 
+        WHEN COUNT(DISTINCT p.Id) = 0 THEN 'No Posts'
+        WHEN COUNT(DISTINCT p.Id) BETWEEN 1 AND 10 THEN 'Few Posts'
+        WHEN COUNT(DISTINCT p.Id) BETWEEN 11 AND 100 THEN 'Moderate Posts'
+        WHEN COUNT(DISTINCT p.Id) BETWEEN 101 AND 1000 THEN 'Many Posts'
+        ELSE 'Very Many Posts'
+    END as PostVolume,
+    IIF(COUNT(DISTINCT p.Id) = 0, 0, COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) * 100.0 / COUNT(DISTINCT p.Id)) as QuestionRatio
+FROM 
+    Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+WHERE 
+    u.Id BETWEEN 1 AND 10000
+    AND u.Reputation >= 0
+    AND (p.Id IS NULL OR p.CreationDate >= '2008-01-01')
+GROUP BY 
+    u.Id, 
+    u.DisplayName, 
+    u.Reputation, 
+    u.CreationDate, 
+    u.LastAccessDate,
+    u.AccountId
+HAVING 
+    COUNT(DISTINCT p.Id) >= 0
+    AND (COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) >= 0 
+         OR COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) >= 0)
+ORDER BY 
+    u.Reputation DESC,
+    TotalPosts DESC,
+    LatestPostDate DESC
+OFFSET 0 ROWS
+FETCH FIRST 1000 ROWS ONLY
+OPTION (MAXDOP 8);

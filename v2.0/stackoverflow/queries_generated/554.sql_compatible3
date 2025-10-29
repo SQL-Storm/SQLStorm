@@ -1,0 +1,296 @@
+with recent_users as (
+  select u.id as user_id,
+         u.displayname,
+         u.reputation,
+         u.creationdate,
+         u.location,
+         coalesce(nullif(trim(split_part(coalesce(u.websiteurl,''), '/', 3)), ''), 'n/a') as website_domain,
+         row_number() over (order by u.creationdate desc, u.id desc) as rn
+  from users u
+  where u.creationdate >= (select date_trunc('year', max(creationdate)) - interval '2 years' from users)
+),
+user_activity as (
+  select
+    p.owneruserid as user_id,
+    count(case when p.posttypeid = 1 then 1 end) as q_count,
+    count(case when p.posttypeid = 2 then 1 end) as a_count,
+    sum(greatest(p.score,0)) as nonneg_post_score,
+    avg(nullif(p.viewcount,0)) as avg_views_when_positive,
+    max(p.lastactivitydate) as last_post_activity,
+    sum(case when p.closeddate is not null then 1 else 0 end) as closed_count,
+    count(distinct case when p.posttypeid = 1 then p.id end) as distinct_questions
+  from posts p
+  where p.owneruserid is not null
+  group by p.owneruserid
+),
+votes_agg as (
+  select v.userid as user_id,
+         count(case when v.votetypeid = 2 then 1 end) as upvotes_cast,
+         count(case when v.votetypeid = 3 then 1 end) as downvotes_cast,
+         count(case when v.votetypeid = 5 then 1 end) as favorites_cast,
+         count(case when v.votetypeid in (8,9) then 1 end) as bounty_events,
+         sum(coalesce(v.bountyamount,0)) as bounty_amount_total
+  from votes v
+  where v.userid is not null
+  group by v.userid
+),
+badges_agg as (
+  select b.userid as user_id,
+         count(case when b.class = 1 then 1 end) as golds,
+         count(case when b.class = 2 then 1 end) as silvers,
+         count(case when b.class = 3 then 1 end) as bronzes,
+         count(*) as badges_total,
+         min(b.date) as first_badge_date,
+         max(b.date) as last_badge_date,
+         count(case when b.tagbased = true then 1 end) as tag_badges
+  from badges b
+  group by b.userid
+),
+user_comment_stats as (
+  select c.userid as user_id,
+         count(*) as comments_made,
+         avg(c.score) as avg_comment_score,
+         max(c.creationdate) as last_comment_date,
+         sum(case when lower(c.text) like '%thanks%' then 1 else 0 end) as thanks_comments
+  from comments c
+  where c.userid is not null
+  group by c.userid
+),
+question_accepts as (
+  select q.owneruserid as asker_id,
+         count(case when q.acceptedanswerid is not null then 1 end) as accepted_questions,
+         count(*) as total_questions
+  from posts q
+  where q.posttypeid = 1 and q.owneruserid is not null
+  group by q.owneruserid
+),
+answer_accepts as (
+  select a.owneruserid as answerer_id,
+         count(*) as answers_posted,
+         count(case when exists (
+           select 1
+           from posts q
+           where q.id = a.parentid
+             and q.acceptedanswerid = a.id
+         ) then 1 end) as answers_accepted
+  from posts a
+  where a.posttypeid = 2 and a.owneruserid is not null
+  group by a.owneruserid
+),
+post_links_agg as (
+  select p.owneruserid as user_id,
+         count(case when pl.linktypeid = 1 and pl.postid = p.id then 1 end) as links_out,
+         count(case when pl.linktypeid = 1 and pl.relatedpostid = p.id then 1 end) as links_in,
+         count(case when pl.linktypeid = 3 and pl.postid = p.id then 1 end) as dup_of,
+         count(case when pl.linktypeid = 3 and pl.relatedpostid = p.id then 1 end) as dup_target
+  from posts p
+  left join postlinks pl
+    on pl.postid = p.id or pl.relatedpostid = p.id
+  where p.owneruserid is not null
+  group by p.owneruserid
+),
+recent_hot_bumps as (
+  select ph.postid,
+         max(ph.creationdate) as last_bump_date
+  from posthistory ph
+  where ph.posthistorytypeid in (50,52)
+  group by ph.postid
+),
+question_tag_counts as (
+  select p.owneruserid as user_id,
+         sum(cardinality(string_to_array(coalesce(substring(p.tags, 2, length(p.tags)-2), ''), '><'))) as tag_uses
+  from posts p
+  where p.posttypeid = 1 and p.owneruserid is not null and p.tags is not null
+  group by p.owneruserid
+),
+user_last_seen as (
+  select u.id as user_id,
+         u.lastaccessdate,
+         rank() over (order by u.lastaccessdate desc, u.id) as recency_rank
+  from users u
+),
+user_quality_scores as (
+  select
+    u.user_id,
+    cast(
+      (coalesce(ua.nonneg_post_score,0)
+     + coalesce(va.upvotes_cast,0)*0.5
+     - coalesce(va.downvotes_cast,0)*0.25
+     + coalesce(ba.golds,0)*10
+     + coalesce(ba.silvers,0)*3
+     + coalesce(ba.bronzes,0)*1
+     + coalesce(ac.answers_accepted,0)*5
+     + coalesce(qc.accepted_questions,0)*2
+     + least(coalesce(pl.links_in,0), 100)*0.2
+     - greatest(coalesce(ua.closed_count,0) - 5, 0)*1.5
+     + coalesce(qt.tag_uses,0)*0.01
+    ) as numeric(18,4)
+    ) as quality_score
+  from recent_users u
+  left join user_activity ua on ua.user_id = u.user_id
+  left join votes_agg va on va.user_id = u.user_id
+  left join badges_agg ba on ba.user_id = u.user_id
+  left join answer_accepts ac on ac.answerer_id = u.user_id
+  left join question_accepts qc on qc.asker_id = u.user_id
+  left join post_links_agg pl on pl.user_id = u.user_id
+  left join question_tag_counts qt on qt.user_id = u.user_id
+),
+activity_window as (
+  select
+    p.owneruserid as user_id,
+    p.id as post_id,
+    p.posttypeid,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    row_number() over (partition by p.owneruserid order by p.creationdate desc, p.id desc) as rn_recent_post,
+    sum(p.score) over (partition by p.owneruserid order by p.creationdate rows between unbounded preceding and current row) as cumulative_score
+  from posts p
+  where p.owneruserid is not null
+),
+user_null_edgecases as (
+  select u.id as user_id,
+         case when u.displayname is null or trim(u.displayname) = '' then 1 else 0 end as has_blank_name,
+         case when coalesce(u.location,'') ilike '%unknown%' then 1 else 0 end as location_unknown_flag,
+         nullif(coalesce(u.emailhash,''),'') as emailhash_nonblank
+  from users u
+),
+final_rank as (
+  select
+    ru.user_id,
+    ru.displayname,
+    ru.reputation,
+    ru.creationdate,
+    ru.location,
+    ru.website_domain,
+    ua.q_count,
+    ua.a_count,
+    ua.avg_views_when_positive,
+    ua.last_post_activity,
+    va.upvotes_cast,
+    va.downvotes_cast,
+    va.favorites_cast,
+    va.bounty_events,
+    va.bounty_amount_total,
+    ba.golds,
+    ba.silvers,
+    ba.bronzes,
+    ba.badges_total,
+    cs.comments_made,
+    cs.avg_comment_score,
+    cs.last_comment_date,
+    cs.thanks_comments,
+    ac.answers_posted,
+    ac.answers_accepted,
+    qc.accepted_questions,
+    qc.total_questions,
+    pl.links_out,
+    pl.links_in,
+    pl.dup_of,
+    pl.dup_target,
+    qt.tag_uses,
+    uls.lastaccessdate,
+    uls.recency_rank,
+    uqe.quality_score,
+    ne.has_blank_name,
+    ne.location_unknown_flag,
+    ne.emailhash_nonblank,
+    max(case when aw.rn_recent_post = 1 then aw.post_id end) as last_post_id,
+    max(case when aw.rn_recent_post = 1 then aw.score end) as last_post_score,
+    max(case when aw.rn_recent_post = 1 then aw.viewcount end) as last_post_views,
+    max(aw.cumulative_score) as cumulative_score_all_time,
+    count(*) over () as total_users_in_scope
+  from recent_users ru
+  left join user_activity ua on ua.user_id = ru.user_id
+  left join votes_agg va on va.user_id = ru.user_id
+  left join badges_agg ba on ba.user_id = ru.user_id
+  left join user_comment_stats cs on cs.user_id = ru.user_id
+  left join answer_accepts ac on ac.answerer_id = ru.user_id
+  left join question_accepts qc on qc.asker_id = ru.user_id
+  left join post_links_agg pl on pl.user_id = ru.user_id
+  left join question_tag_counts qt on qt.user_id = ru.user_id
+  left join user_last_seen uls on uls.user_id = ru.user_id
+  left join user_quality_scores uqe on uqe.user_id = ru.user_id
+  left join user_null_edgecases ne on ne.user_id = ru.user_id
+  left join activity_window aw on aw.user_id = ru.user_id
+  group by
+    ru.user_id, ru.displayname, ru.reputation, ru.creationdate, ru.location, ru.website_domain,
+    ua.q_count, ua.a_count, ua.avg_views_when_positive, ua.last_post_activity,
+    va.upvotes_cast, va.downvotes_cast, va.favorites_cast, va.bounty_events, va.bounty_amount_total,
+    ba.golds, ba.silvers, ba.bronzes, ba.badges_total,
+    cs.comments_made, cs.avg_comment_score, cs.last_comment_date, cs.thanks_comments,
+    ac.answers_posted, ac.answers_accepted,
+    qc.accepted_questions, qc.total_questions,
+    pl.links_out, pl.links_in, pl.dup_of, pl.dup_target,
+    qt.tag_uses,
+    uls.lastaccessdate, uls.recency_rank,
+    uqe.quality_score,
+    ne.has_blank_name, ne.location_unknown_flag, ne.emailhash_nonblank
+),
+top_and_bottom as (
+  select * from final_rank
+  where row_number() over (order by coalesce(quality_score, -1e9) desc) <= 50
+  union all
+  select * from final_rank
+  where row_number() over (order by coalesce(quality_score, 1e9) asc) <= 50
+),
+with_post_flags as (
+  select
+    t.*,
+    case
+      when coalesce(t.golds,0) > 0 and coalesce(t.a_count,0) = 0 then 'gold-no-answers'
+      when coalesce(t.answers_accepted,0) > coalesce(t.answers_posted,0)/2.0 then 'high-accept-rate'
+      when coalesce(t.downvotes_cast,0) > coalesce(t.upvotes_cast,0) then 'net-negative-voter'
+      when t.has_blank_name = 1 then 'blank-name'
+      when t.location_unknown_flag = 1 then 'unknown-location'
+      else 'normal'
+    end as persona_flag
+  from top_and_bottom t
+)
+select
+  w.user_id,
+  coalesce(nullif(w.displayname,''), ('user#' || cast(w.user_id as varchar))) as displayname,
+  w.reputation,
+  w.quality_score,
+  w.recency_rank,
+  w.q_count,
+  w.a_count,
+  w.accepted_questions,
+  w.answers_accepted,
+  w.badges_total,
+  w.golds,
+  w.silvers,
+  w.bronzes,
+  w.upvotes_cast,
+  w.downvotes_cast,
+  w.bounty_amount_total,
+  w.links_in,
+  w.links_out,
+  w.tag_uses,
+  w.last_post_id,
+  w.last_post_score,
+  w.last_post_views,
+  w.last_post_activity,
+  w.last_comment_date,
+  w.website_domain,
+  w.location,
+  w.persona_flag,
+  case when exists (
+    select 1
+    from posts p
+    left join recent_hot_bumps r on r.postid = p.id
+    where p.owneruserid = w.user_id
+      and (p.score >= 10 or r.last_bump_date >= (timestamp '2024-10-01 12:34:56') - interval '90 days')
+      and p.creationdate >= w.creationdate
+  ) then 1 else 0 end as has_hot_or_bumped_post_recently
+from with_post_flags w
+where (
+    coalesce(w.quality_score, -1e9) >= (
+      select percentile_disc(0.90) within group (order by coalesce(quality_score, -1e9)) from final_rank
+    )
+    or coalesce(w.quality_score, 1e9) <= (
+      select percentile_disc(0.10) within group (order by coalesce(quality_score, 1e9)) from final_rank
+    )
+  )
+order by w.quality_score desc nulls last, w.reputation desc, w.user_id
+limit 100;

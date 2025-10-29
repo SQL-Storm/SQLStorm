@@ -1,0 +1,68 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.Title,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.LastActivityDate,
+        P.OwnerUserId,
+        U.DisplayName AS OwnerDisplayName,
+        U.Reputation,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.ViewCount DESC) AS Rank
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId = 1 
+        AND P.LastActivityDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days')
+),
+TopUsers AS (
+    SELECT 
+        U.Id,
+        U.DisplayName,
+        U.Reputation,
+        COUNT(B.Id) AS BadgeCount,
+        MAX(CASE WHEN B.Class = 1 THEN B.Date ELSE NULL END) AS LastGoldBadgeDate,
+        MAX(CASE WHEN B.Class = 2 THEN B.Date ELSE NULL END) AS LastSilverBadgeDate,
+        MAX(CASE WHEN B.Class = 3 THEN B.Date ELSE NULL END) AS LastBronzeBadgeDate
+    FROM 
+        Users U
+    LEFT JOIN 
+        Badges B ON U.Id = B.UserId
+    WHERE 
+        U.Reputation > 1000
+    GROUP BY 
+        U.Id, U.DisplayName, U.Reputation
+    ORDER BY 
+        U.Reputation DESC, BadgeCount DESC
+    LIMIT 10
+)
+SELECT 
+    RP.Id, 
+    RP.Title, 
+    RP.Score, 
+    RP.ViewCount, 
+    RP.CreationDate, 
+    RP.LastActivityDate, 
+    RP.OwnerUserId,
+    RU.DisplayName AS OwnerDisplayName,
+    RU.Reputation,
+    RU.BadgeCount,
+    RU.LastGoldBadgeDate,
+    RU.LastSilverBadgeDate,
+    RU.LastBronzeBadgeDate,
+    CASE 
+        WHEN RP.Rank <= 3 THEN 'Top'
+        WHEN RP.Rank <= 10 THEN 'High'
+        ELSE 'Low'
+    END AS RankStatus
+FROM 
+    RankedPosts RP
+JOIN 
+    TopUsers RU ON RP.OwnerUserId = RU.Id
+WHERE 
+    RP.Rank <= 5
+ORDER BY 
+    RP.Score DESC, RP.ViewCount DESC;

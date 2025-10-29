@@ -1,0 +1,196 @@
+-- {"query": "2553.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1714} 
+
+WITH RecursiveBadges AS (
+    SELECT
+        b.UserId,
+        b.Name AS BadgeName,
+        b.Class,
+        b.Date,
+        u.Reputation,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Class, b.Date) AS BadgeRank
+    FROM Badges b
+    JOIN Users u ON b.UserId = u.Id
+    WHERE b.Class IN (1, 2, 3)
+), LatestPostHistoryByType AS (
+    SELECT
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId, ph.PostHistoryTypeId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+), LastEditOrCloseInfo AS (
+    SELECT
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        ph.UserId,
+        ph.Comment,
+        CASE
+            WHEN ph.PostHistoryTypeId = 10 THEN (SELECT Name FROM CloseReasonTypes crt WHERE crt.Id = TRY_CAST(ph.Comment AS SMALLINT))
+            ELSE NULL
+        END AS CloseReason,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4,5,6,10,11)
+), UserActivityWindow AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersCount,
+        COUNT(c.Id) AS CommentsCount,
+        SUM(COALESCE(vp.Count, 0)) AS TotalVotesReceived,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS UserRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN (
+        SELECT
+            p.OwnerUserId,
+            COUNT(v.Id) AS Count
+        FROM Posts p
+        JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId IN (2,3)
+        GROUP BY p.OwnerUserId
+    ) vp ON vp.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+), AskedButUnansweredQuestions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        u.DisplayName AS OwnerName,
+        u.Reputation AS OwnerRep
+    FROM Posts p
+    LEFT JOIN Posts a ON a.ParentId = p.Id AND a.PostTypeId = 2
+    JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1
+      AND a.Id IS NULL
+      AND p.Score > 0
+), TagStats AS (
+    SELECT
+        unnest(string_to_array(trim(both '<>' from p.Tags), '><')) AS Tag,
+        COUNT(p.Id) AS TotalQuestions,
+        AVG(p.Score) AS AvgScore,
+        SUM(p.ViewCount) AS TotalViews
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+    GROUP BY Tag
+), PopularTagsWithBadges AS (
+    SELECT
+        ts.Tag,
+        ts.TotalQuestions,
+        ts.AvgScore,
+        ts.TotalViews,
+        COUNT(DISTINCT rb.UserId) AS BadgeHolders
+    FROM TagStats ts
+    LEFT JOIN RecursiveBadges rb ON rb.BadgeName ILIKE '%' || ts.Tag || '%'
+    GROUP BY ts.Tag, ts.TotalQuestions, ts.AvgScore, ts.TotalViews
+), DuplicateLinkDetails AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        p1.Title AS PostTitle,
+        p2.Title AS RelatedPostTitle,
+        u.DisplayName AS PostOwner,
+        u2.DisplayName AS RelatedPostOwner,
+        pl.CreationDate
+    FROM PostLinks pl
+    JOIN Posts p1 ON p1.Id = pl.PostId
+    JOIN Posts p2 ON p2.Id = pl.RelatedPostId
+    LEFT JOIN Users u ON u.Id = p1.OwnerUserId
+    LEFT JOIN Users u2 ON u2.Id = p2.OwnerUserId
+    WHERE pl.LinkTypeId = 3 -- Duplicate
+), RecentEdits AS (
+    SELECT
+        ph.PostId,
+        ph.UserId,
+        u.DisplayName,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        ph.Comment,
+        ph.Text,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS EditRank
+    FROM PostHistory ph
+    LEFT JOIN Users u ON u.Id = ph.UserId
+    WHERE ph.PostHistoryTypeId IN (4,5)
+), WindowRankedQuestions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        RANK() OVER (ORDER BY p.Score DESC, p.ViewCount DESC) AS ScoreRank,
+        NTILE(5) OVER (ORDER BY p.CreationDate DESC) AS RecentQuintile
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+)
+SELECT
+    ua.Id AS UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.QuestionsCount,
+    ua.AnswersCount,
+    ua.CommentsCount,
+    ua.TotalVotesReceived,
+    ARRAY_AGG(DISTINCT rb.BadgeName) FILTER (WHERE rb.BadgeRank <= 3) AS TopBadges,
+    aq.Title AS UnansweredQuestionTitle,
+    aq.Score AS UnansweredQuestionScore,
+    aq.ViewCount AS UnansweredQuestionViews,
+    dt.Tag,
+    dt.TotalQuestions AS TagTotalQuestions,
+    dt.AvgScore AS TagAverageScore,
+    dt.TotalViews AS TagTotalViews,
+    dt.BadgeHolders AS TagBadgeHolders,
+    dl.PostTitle AS DuplicatePostTitle,
+    dl.RelatedPostTitle AS DuplicateRelatedPostTitle,
+    dl.PostOwner AS DuplicatePostOwner,
+    dl.RelatedPostOwner AS DuplicateRelatedPostOwner,
+    le.CreationDate AS LastEditDate,
+    le.DisplayName AS LastEditor,
+    le.Comment AS LastEditComment,
+    wr.ScoreRank,
+    wr.RecentQuintile
+FROM UserActivityWindow ua
+LEFT JOIN RecursiveBadges rb ON rb.UserId = ua.Id
+LEFT JOIN LATERAL (
+    SELECT * FROM AskedButUnansweredQuestions aq
+    WHERE aq.OwnerName = ua.DisplayName
+    ORDER BY aq.Score DESC, aq.ViewCount DESC
+    LIMIT 1
+) aq ON TRUE
+LEFT JOIN (
+    SELECT * FROM PopularTagsWithBadges dt
+    WHERE dt.BadgeHolders > 10
+    ORDER BY dt.TotalQuestions DESC
+    LIMIT 1
+) dt ON TRUE
+LEFT JOIN LATERAL (
+    SELECT * FROM DuplicateLinkDetails dl
+    WHERE dl.PostOwner = ua.DisplayName OR dl.RelatedPostOwner = ua.DisplayName
+    ORDER BY dl.CreationDate DESC
+    LIMIT 1
+) dl ON TRUE
+LEFT JOIN LATERAL (
+    SELECT
+        ph.CreationDate,
+        u.DisplayName,
+        ph.Comment
+    FROM LastEditOrCloseInfo ph
+    LEFT JOIN Users u ON u.Id = ph.UserId
+    WHERE ph.PostId IN (SELECT p.Id FROM Posts p WHERE p.OwnerUserId = ua.Id)
+    ORDER BY ph.CreationDate DESC
+    LIMIT 1
+) le ON TRUE
+LEFT JOIN WindowRankedQuestions wr ON wr.Id = (
+    SELECT p.Id FROM Posts p WHERE p.OwnerUserId = ua.Id AND p.PostTypeId = 1 ORDER BY p.Score DESC LIMIT 1
+)
+WHERE ua.Reputation > 1000
+AND ua.QuestionsCount > 5
+ORDER BY ua.Reputation DESC
+LIMIT 50;

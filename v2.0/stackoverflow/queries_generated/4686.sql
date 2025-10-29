@@ -1,0 +1,166 @@
+-- {"query": "4686.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1458} 
+
+WITH
+  RankedPosts AS (
+    SELECT
+      p.Id AS PostId,
+      p.OwnerUserId,
+      p.PostTypeId,
+      p.Title,
+      p.Score,
+      p.ViewCount,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS ScoreRank,
+      DENSE_RANK() OVER (ORDER BY p.ViewCount DESC) AS ViewRank,
+      ROW_NUMBER() OVER (ORDER BY p.FavoriteCount DESC) AS FavoriteRank,
+      COUNT(c.Id) OVER (PARTITION BY p.Id) AS CommentCountPerPost
+    FROM
+      Posts AS p
+    LEFT JOIN
+      Comments AS c
+      ON p.Id = c.PostId
+    WHERE
+      p.OwnerUserId IS NOT NULL
+      AND p.CreationDate >= DATE('now', '-365 day')
+    GROUP BY
+      p.Id,
+      p.OwnerUserId,
+      p.PostTypeId,
+      p.Title,
+      p.Score,
+      p.ViewCount,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount
+  ),
+  UserPostActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      COUNT(p.Id) AS TotalPosts,
+      SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+      AVG(p.Score) AS AverageScore,
+      MAX(p.CreationDate) AS LastPostDate,
+      COUNT(DISTINCT ph.Id) AS PostHistoryEntries
+    FROM
+      Users AS u
+    JOIN
+      Posts AS p
+      ON u.Id = p.OwnerUserId
+    LEFT JOIN
+      PostHistory AS ph
+      ON p.Id = ph.PostId
+    WHERE
+      u.CreationDate >= DATE('now', '-730 day')
+      AND p.Score > 5 -- Only consider posts with some positive engagement
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation
+    HAVING
+      COUNT(p.Id) > 10 -- Users with at least 10 posts
+  ),
+  PostWithCommentsAndVotes AS (
+    SELECT
+      p.Id AS PostId,
+      p.Title,
+      p.Score,
+      COUNT(DISTINCT c.Id) AS NumComments,
+      COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS Upvotes,
+      COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS Downvotes,
+      CASE
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        ELSE 'Active'
+      END AS PostStatus
+    FROM
+      Posts AS p
+    LEFT JOIN
+      Comments AS c
+      ON p.Id = c.PostId
+    LEFT JOIN
+      Votes AS v
+      ON p.Id = v.PostId
+    WHERE
+      p.CreationDate >= DATE('now', '-180 day')
+    GROUP BY
+      p.Id,
+      p.Title,
+      p.Score,
+      p.ClosedDate,
+      p.CommunityOwnedDate
+  )
+SELECT
+  rp.PostId,
+  rp.Title,
+  rp.Score,
+  rp.ViewCount,
+  rp.FavoriteRank,
+  upa.DisplayName AS OwnerDisplayName,
+  upa.Reputation,
+  upa.QuestionCount,
+  upa.AnswerCount,
+  upa.AverageScore,
+  pwcv.NumComments,
+  pwcv.Upvotes,
+  pwcv.Downvotes,
+  pwcv.PostStatus,
+  COALESCE(pht.Name, 'Unknown') AS LastPostHistoryAction,
+  CASE
+    WHEN rp.ScoreRank <= 10 AND rp.ViewRank <= 100 THEN 'Top Scorer & High Viewer'
+    WHEN rp.FavoriteRank <= 5 THEN 'Highly Favorited'
+    WHEN upa.TotalPosts > 1000 AND upa.AverageScore > 10 THEN 'Power User'
+    ELSE 'Standard User'
+  END AS UserEngagementLevel,
+  LENGTH(rp.Title) AS TitleLength,
+  CASE WHEN rp.Title LIKE '%?%' THEN 'HasQuestionMark' ELSE 'NoQuestionMark' END AS TitleHasQuestionMark,
+  (
+    SELECT
+      COUNT(*)
+    FROM
+      PostLinks AS pl
+    WHERE
+      pl.PostId = rp.PostId
+      AND pl.LinkTypeId = 3 -- Duplicate links
+  ) AS DuplicateLinkCount,
+  (
+    SELECT
+      COUNT(*)
+    FROM
+      PostHistory AS ph
+    WHERE
+      ph.PostId = rp.PostId
+      AND ph.PostHistoryTypeId IN (10, 11, 12, 13) -- Close/Reopen/Delete/Undelete
+  ) AS ModerationActions,
+  rp.CommentCountPerPost
+FROM
+  RankedPosts AS rp
+JOIN
+  UserPostActivity AS upa
+  ON rp.OwnerUserId = upa.UserId
+JOIN
+  PostWithCommentsAndVotes AS pwcv
+  ON rp.PostId = pwcv.PostId
+LEFT JOIN
+  PostHistory AS ph_last
+  ON rp.PostId = ph_last.PostId
+LEFT JOIN
+  PostHistoryTypes AS pht
+  ON ph_last.PostHistoryTypeId = pht.Id
+  AND ph_last.CreationDate = (
+    SELECT MAX(ph_inner.CreationDate)
+    FROM PostHistory AS ph_inner
+    WHERE ph_inner.PostId = rp.PostId
+  )
+WHERE
+  rp.ScoreRank <= 100 -- Top 100 posts by score within each type
+  AND rp.ViewRank <= 500 -- Top 500 posts by view count overall
+  AND upa.TotalPosts > 50 -- Only users with more than 50 posts
+ORDER BY
+  rp.Score DESC,
+  upa.Reputation DESC,
+  rp.FavoriteRank;

@@ -1,0 +1,130 @@
+with recursive RecursivePostHierarchy as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        0 as Level,
+        cast(p.Tags as varchar(4000)) as TagsPath
+    from Posts p
+    where p.ParentId is null and p.PostTypeId = 1
+
+    union all
+
+    select
+        c.Id,
+        c.PostTypeId,
+        c.ParentId,
+        c.OwnerUserId,
+        c.CreationDate,
+        c.Score,
+        c.ViewCount,
+        r.Level + 1 as Level,
+        cast(
+            case 
+                when r.TagsPath is null then c.Tags
+                when c.Tags is null then r.TagsPath
+                else r.TagsPath || ',' || c.Tags
+            end
+        as varchar(4000)) as TagsPath
+    from Posts c
+    inner join RecursivePostHierarchy r on c.ParentId = r.Id
+), UserBadgeRanks as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        sum(case when b.Class = 1 then 3 when b.Class = 2 then 2 when b.Class = 3 then 1 else 0 end) as BadgeRankPoints,
+        count(b.Id) as BadgeCount,
+        row_number() over (order by sum(case when b.Class = 1 then 3 when b.Class = 2 then 2 when b.Class = 3 then 1 else 0 end) desc, count(b.Id) desc) as BadgeRank
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+), PostActivityWindow as (
+    select
+        p.Id as PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Tags,
+        sum(case when ph.PostHistoryTypeId in (10,12) then 1 else 0 end) over (partition by p.Id) as CloseDeleteHistoryCount,
+        max(case when ph.PostHistoryTypeId in (10,11) then ph.CreationDate else null end) over (partition by p.Id) as LastCloseReopenDate,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) over (partition by p.Id) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) over (partition by p.Id) as DownVotes,
+        sum(case when c.Id is not null then 1 else 0 end) over (partition by p.Id) as CommentCount
+    from Posts p
+    left join PostHistory ph on ph.PostId = p.Id
+    left join Votes v on v.PostId = p.Id
+    left join Comments c on c.PostId = p.Id
+), TagsSplit as (
+    select
+        p.Id as PostId,
+        trim(tag) as Tag
+    from Posts p,
+    unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) as tag
+    where p.Tags is not null
+), TagTopUsers as (
+    select
+        ts.Tag,
+        u.Id as UserId,
+        u.DisplayName,
+        count(*) as TagPostCount,
+        rank() over (partition by ts.Tag order by count(*) desc) as UserTagRank
+    from TagsSplit ts
+    join Posts p on p.Id = ts.PostId and p.PostTypeId = 1
+    join Users u on u.Id = p.OwnerUserId
+    group by ts.Tag, u.Id, u.DisplayName
+), FinalStats as (
+    select
+        rph.Id as RootQuestionId,
+        rph.CreationDate as QuestionCreation,
+        rph.Score as QuestionScore,
+        rph.ViewCount as QuestionViews,
+        array_agg(tih.Name) filter (where tih.Name is not null) as LinkTypeNames,
+        rph.TagsPath,
+        count(a.Id) filter (where a.PostTypeId = 2) as AnswerCount,
+        count(a.Id) filter (where a.PostTypeId = 2 and a.Score > 0) as PositiveAnswerCount,
+        min(a.CreationDate) filter (where a.PostTypeId = 2) as FirstAnswerDate,
+        max(pa.LastCloseReopenDate) as LastClosureActivity,
+        max(pa.CloseDeleteHistoryCount) as TotalCloseDeleteHistory,
+        sum(pa.UpVotes) as TotalUpVotes,
+        sum(pa.DownVotes) as TotalDownVotes,
+        sum(pa.CommentCount) as TotalComments,
+        string_agg(u.DisplayName, ', ') as ParticipatingUsers,
+        count(pb.UserId) filter (where pb.BadgeRank <= 100) as TopBadgeUsersCount,
+        string_agg(pb.DisplayName, ', ') filter (where pb.BadgeRank <= 5) as Top5BadgeUsers
+    from RecursivePostHierarchy rph
+    left join Posts a on a.ParentId = rph.Id
+    left join PostLinks pl on pl.PostId = rph.Id
+    left join LinkTypes tih on tih.Id = pl.LinkTypeId
+    left join PostActivityWindow pa on pa.PostId = rph.Id or pa.PostId = a.Id
+    left join Users u on u.Id = pa.OwnerUserId
+    left join UserBadgeRanks pb on pb.UserId = u.Id
+    group by rph.Id, rph.CreationDate, rph.Score, rph.ViewCount, rph.TagsPath
+    having count(a.Id) > 5 and sum(pa.UpVotes) > 10 and max(pa.CloseDeleteHistoryCount) < 3
+)
+select
+    fs.RootQuestionId,
+    fs.QuestionCreation,
+    fs.QuestionScore,
+    fs.QuestionViews,
+    fs.LinkTypeNames,
+    fs.TagsPath,
+    fs.AnswerCount,
+    fs.PositiveAnswerCount,
+    fs.FirstAnswerDate,
+    fs.LastClosureActivity,
+    fs.TotalCloseDeleteHistory,
+    fs.TotalUpVotes,
+    fs.TotalDownVotes,
+    fs.TotalComments,
+    fs.ParticipatingUsers,
+    fs.TopBadgeUsersCount,
+    fs.Top5BadgeUsers
+from FinalStats fs
+order by fs.TotalUpVotes desc, fs.AnswerCount desc
+limit 50;

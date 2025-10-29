@@ -1,0 +1,120 @@
+-- {"query": "3029.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1506} 
+WITH recent_posts AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.Title,
+        p.Tags,
+        p.ViewCount,
+        p.FavoriteCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.ClosedDate,
+        p.CommunityOwnedDate
+    FROM Posts p
+    WHERE p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '90 days'
+),
+user_post_stats AS (
+    SELECT
+        u.Id                                           AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(*) FILTER (WHERE rp.PostTypeId = 1)       AS QuestionCount90d,
+        COUNT(*) FILTER (WHERE rp.PostTypeId = 2)       AS AnswerCount90d,
+        SUM(rp.Score) FILTER (WHERE rp.PostTypeId = 1) AS QuestionScoreSum90d,
+        SUM(rp.Score) FILTER (WHERE rp.PostTypeId = 2) AS AnswerScoreSum90d,
+        COUNT(DISTINCT rp.Tags)                        AS DistinctTagCount,
+        COALESCE(badge_cnt, 0)                          AS BadgeCount,
+        COALESCE(vote_up_cnt, 0)                        AS UpVoteCount,
+        COALESCE(vote_down_cnt, 0)                      AS DownVoteCount
+    FROM Users u
+    LEFT JOIN recent_posts rp
+        ON rp.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT UserId, COUNT(*) AS badge_cnt
+        FROM Badges
+        GROUP BY UserId
+    ) b ON b.UserId = u.Id
+    LEFT JOIN (
+        SELECT v.UserId,
+               COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS vote_up_cnt,
+               COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS vote_down_cnt
+        FROM Votes v
+        GROUP BY v.UserId
+    ) v ON v.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, badge_cnt, vote_up_cnt, vote_down_cnt
+),
+user_tag_agg AS (
+    SELECT
+        ups.UserId,
+        tag,
+        COUNT(*)                                     AS TagPostCount,
+        AVG(rp.Score)                                 AS AvgScorePerTag,
+        ROW_NUMBER() OVER (PARTITION BY ups.UserId ORDER BY COUNT(*) DESC) AS TagRank
+    FROM user_post_stats ups
+    JOIN recent_posts rp
+        ON rp.OwnerUserId = ups.UserId
+    CROSS JOIN LATERAL (
+        SELECT TRIM(t) AS tag
+        FROM regexp_split_to_table(rp.Tags, '><') AS t
+        WHERE rp.Tags IS NOT NULL
+    ) AS tags
+    GROUP BY ups.UserId, tag
+),
+top_users_by_activity AS (
+    SELECT
+        ups.*,
+        ROW_NUMBER() OVER (ORDER BY (ups.QuestionCount90d + ups.AnswerCount90d) DESC) AS ActivityRank
+    FROM user_post_stats ups
+    WHERE ups.Reputation > 1000
+),
+badge_veterans AS (
+    SELECT
+        UserId,
+        BadgeCount,
+        ROW_NUMBER() OVER (ORDER BY BadgeCount DESC) AS BadgeRank
+    FROM user_post_stats
+    WHERE BadgeCount >= 50
+),
+combined_ranks AS (
+    SELECT UserId, ActivityRank, NULL::int AS BadgeRank
+    FROM top_users_by_activity
+    UNION ALL
+    SELECT UserId, NULL::int AS ActivityRank, BadgeRank
+    FROM badge_veterans
+)
+SELECT
+    u.UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.QuestionCount90d,
+    u.AnswerCount90d,
+    u.QuestionScoreSum90d,
+    u.AnswerScoreSum90d,
+    u.DistinctTagCount,
+    u.BadgeCount,
+    u.UpVoteCount,
+    u.DownVoteCount,
+    cr.ActivityRank,
+    cr.BadgeRank,
+    COALESCE(tagg.Tag, '(no tag)')                      AS TopTag,
+    COALESCE(tagg.TagPostCount, 0)                      AS TopTagPostCount,
+    COALESCE(ROUND(tagg.AvgScorePerTag, 2), 0)          AS TopTagAvgScore
+FROM user_post_stats u
+LEFT JOIN combined_ranks cr
+    ON cr.UserId = u.UserId
+LEFT JOIN LATERAL (
+    SELECT tag, TagPostCount, AvgScorePerTag
+    FROM user_tag_agg uta
+    WHERE uta.UserId = u.UserId
+      AND uta.TagRank = 1
+) tagg ON true
+WHERE (cr.ActivityRank IS NOT NULL AND cr.ActivityRank <= 20)
+   OR (cr.BadgeRank IS NOT NULL AND cr.BadgeRank <= 20)
+ORDER BY
+    COALESCE(cr.ActivityRank, 9999),
+    COALESCE(cr.BadgeRank, 9999),
+    u.Reputation DESC;

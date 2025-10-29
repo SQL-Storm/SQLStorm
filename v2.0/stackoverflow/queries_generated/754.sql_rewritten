@@ -1,0 +1,332 @@
+-- {"query": "754.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3297} 
+with
+-- Active users with badge stats and recent activity
+active_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        coalesce(nullif(trim(split_part(coalesce(u.location,''), ',', 1)), ''), 'Unknown') as primary_location,
+        sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+        sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+        sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+        max(b.date) as last_badge_date,
+        count(b.id) as total_badges
+    from users u
+    left join badges b
+      on b.userid = u.id
+      and b.date >= u.creationdate
+    group by u.id, u.displayname, u.reputation, u.creationdate, primary_location
+    having count(b.id) > 0 or u.reputation > 1000
+),
+-- Questions with normalized tag arrays and engagement metrics
+questions as (
+    select
+        p.id as question_id,
+        p.owneruserid as owner_user_id,
+        p.creationdate as q_created,
+        p.title,
+        p.score as q_score,
+        p.viewcount,
+        p.answercount,
+        p.tags,
+        case
+          when p.tags is null then array[]::varchar[]
+          else string_to_array(substring(p.tags, 2, greatest(length(p.tags)-2,0)), '><')
+        end as tag_arr,
+        p.acceptedanswerid,
+        p.closeddate,
+        p.communityownEDdate
+    from posts p
+    where p.posttypeid = 1
+),
+-- Answers with author and timing, and rank best answers per question by score then earliest
+answers_ranked as (
+    select
+        a.id as answer_id,
+        a.parentid as question_id,
+        a.owneruserid as answer_user_id,
+        a.creationdate as a_created,
+        a.score as a_score,
+        row_number() over (
+            partition by a.parentid
+            order by a.score desc nulls last, a.creationdate asc nulls last, a.id asc
+        ) as answer_rank
+    from posts a
+    where a.posttypeid = 2
+),
+-- Aggregate votes per post and categorize
+post_votes as (
+    select
+        v.postid,
+        sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+        sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+        sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+        sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started,
+        sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded,
+        count(*) as total_votes
+    from votes v
+    group by v.postid
+),
+-- Link/duplicate info for questions
+question_links as (
+    select
+        pl.postid as question_id,
+        sum(case when pl.linktypeid = 1 then 1 else 0 end) as linked_count,
+        sum(case when pl.linktypeid = 3 then 1 else 0 end) as duplicate_of_count,
+        max(case when pl.linktypeid = 3 then pl.relatedpostid end) as a_duplicate_target_id
+    from postlinks pl
+    group by pl.postid
+),
+-- Extract close reasons from PostHistory JSON/text when available (best-effort)
+question_close_reasons as (
+    select
+        ph.postid as question_id,
+        min(ph.creationdate) filter (where ph.posthistorytypeid = 10) as first_closed_at,
+        max(ph.creationdate) filter (where ph.posthistorytypeid = 11) as last_reopened_at,
+        -- Prefer numeric in Comment field when type = 10, else parse from Text for "Duplicate" presence
+        max(
+            case
+                when ph.posthistorytypeid = 10 and ph.comment ~ '^[0-9]+' then ph.comment
+                when ph.posthistorytypeid = 10 and ph.text ilike '%Duplicate%' then '101'
+                when ph.posthistorytypeid = 10 and ph.text ilike '%Off-topic%' then '102'
+                when ph.posthistorytypeid = 10 and ph.text ilike '%Needs details%' then '103'
+                when ph.posthistorytypeid = 10 and ph.text ilike '%Needs more focus%' then '104'
+                when ph.posthistorytypeid = 10 and ph.text ilike '%Opinion%' then '105'
+                else null
+            end
+        ) as close_reason_guess
+    from posthistory ph
+    where ph.posthistorytypeid in (10,11)
+    group by ph.postid
+),
+-- Compute per-user rolling activity and quality metrics
+user_activity as (
+    select
+        u.id as user_id,
+        count(*) filter (where p.posttypeid = 1) as q_count,
+        count(*) filter (where p.posttypeid = 2) as a_count,
+        avg(nullif(p.score,0)) filter (where p.posttypeid = 1) as avg_q_score_nonzero,
+        avg(nullif(p.score,0)) filter (where p.posttypeid = 2) as avg_a_score_nonzero,
+        max(p.lastactivitydate) as last_post_activity,
+        sum(p.viewcount) filter (where p.posttypeid = 1) as total_q_views
+    from users u
+    left join posts p
+      on p.owneruserid = u.id
+    group by u.id
+),
+-- Identify "fast accept" answers (accepted within X hours) and compute delay
+accepted_answer_speed as (
+    select
+        q.question_id,
+        q.acceptedanswerid,
+        a.answer_id,
+        a.a_created,
+        q.q_created,
+        extract(epoch from (a.a_created - q.q_created))/3600.0 as hours_to_answer,
+        case when q.acceptedanswerid = a.answer_id then 1 else 0 end as is_accepted
+    from questions q
+    left join answers_ranked a
+      on a.question_id = q.question_id
+),
+-- Windowed ranks and percentiles for questions by score and views within tag buckets
+question_rankings as (
+    select
+        q.question_id,
+        q.q_score,
+        q.viewcount,
+        unnest(case when array_length(q.tag_arr,1) is null then array['__notag__']::varchar[] else q.tag_arr end) as tagname,
+        dense_rank() over (partition by unnest(case when array_length(q.tag_arr,1) is null then array['__notag__']::varchar[] else q.tag_arr end)
+                           order by q.q_score desc nulls last) as score_rank_in_tag,
+        ntile(100) over (partition by unnest(case when array_length(q.tag_arr,1) is null then array['__notag__']::varchar[] else q.tag_arr end)
+                         order by q.viewcount desc nulls last) as view_percentile_in_tag
+    from questions q
+),
+-- Per-tag aggregates for later joining
+tag_stats as (
+    select
+        qr.tagname,
+        count(*) as q_in_tag,
+        avg(qr.q_score) as avg_q_score_in_tag,
+        percentile_cont(0.9) within group (order by qr.viewcount) as p90_views_in_tag
+    from question_rankings qr
+    group by qr.tagname
+),
+-- Combine question metrics
+question_metrics as (
+    select
+        q.question_id,
+        q.owner_user_id,
+        q.q_created,
+        q.title,
+        q.q_score,
+        q.viewcount,
+        q.answercount,
+        q.tag_arr,
+        pv.upvotes,
+        pv.downvotes,
+        pv.favorites,
+        ql.linked_count,
+        ql.duplicate_of_count,
+        ql.a_duplicate_target_id,
+        cast(cr.close_reason_guess as int) as close_reason_id,
+        cr.first_closed_at,
+        cr.last_reopened_at,
+        coalesce(pv.total_votes,0) as total_votes
+    from questions q
+    left join post_votes pv on pv.postid = q.question_id
+    left join question_links ql on ql.question_id = q.question_id
+    left join question_close_reasons cr on cr.question_id = q.question_id
+),
+-- Filter to questions with mixed engagement signals for complexity
+interesting_questions as (
+    select
+        qm.*,
+        (qm.upvotes - qm.downvotes) as net_votes,
+        case when qm.answercount > 0 then qm.viewcount::numeric / qm.answercount else null end as views_per_answer
+    from question_metrics qm
+    where
+        -- avoid trivial posts
+        (qm.viewcount > 0 or qm.total_votes > 0)
+        and coalesce(qm.upvotes,0) + coalesce(qm.downvotes,0) >= 1
+        and (qm.duplicate_of_count is null or qm.duplicate_of_count = 0)
+),
+-- Build a per-question tag summary string for display
+tag_summary as (
+    select
+        iq.question_id,
+        string_agg(distinct lower(tn.tagname), ', ' order by lower(tn.tagname)) as tag_list,
+        count(distinct tn.tagname) as tag_count
+    from interesting_questions iq
+    cross join lateral (
+        select unnest(coalesce(iq.tag_arr, array[]::varchar[])) as tagname
+    ) tn
+    group by iq.question_id
+),
+-- Determine best answer and answer stats for interesting questions
+answers_for_interesting as (
+    select
+        a.question_id,
+        min(a.answer_rank) as best_answer_rank,
+        max(a.a_score) as max_answer_score,
+        count(*) as answer_total,
+        count(*) filter (where a.a_score > 0) as pos_answers,
+        max(a.answer_id) filter (where a.answer_rank = 1) as best_answer_id
+    from answers_ranked a
+    inner join interesting_questions iq on iq.question_id = a.question_id
+    group by a.question_id
+),
+-- Correlated subquery expansion: earliest and latest comments per question
+question_comments as (
+    select
+        p.id as question_id,
+        (select c1.creationdate from comments c1 where c1.postid = p.id order by c1.creationdate asc nulls last limit 1) as first_comment_at,
+        (select c2.creationdate from comments c2 where c2.postid = p.id order by c2.creationdate desc nulls last limit 1) as last_comment_at,
+        (select count(*) from comments c3 where c3.postid = p.id) as comment_count
+    from posts p
+    where p.posttypeid = 1
+)
+select
+    iq.question_id,
+    left(coalesce(iq.title, ''), 120) as title_prefix,
+    au.displayname as owner_displayname,
+    au.primary_location,
+    au.reputation,
+    au.gold_badges,
+    au.silver_badges,
+    au.bronze_badges,
+    ua.q_count,
+    ua.a_count,
+    iq.q_score,
+    iq.viewcount,
+    iq.answercount,
+    iq.upvotes,
+    iq.downvotes,
+    iq.favorites,
+    iq.net_votes,
+    iq.views_per_answer,
+    ts.tag_list,
+    ts.tag_count,
+    afr.best_answer_id,
+    afr.best_answer_rank,
+    afr.max_answer_score,
+    afr.answer_total,
+    afr.pos_answers,
+    qc.first_comment_at,
+    qc.last_comment_at,
+    qc.comment_count,
+    qr.score_rank_in_tag,
+    qr.view_percentile_in_tag,
+    tg.q_in_tag,
+    tg.avg_q_score_in_tag,
+    tg.p90_views_in_tag,
+    case
+        when iq.close_reason_id is not null then coalesce(crt.name, 'Closed (unknown)')
+        when iq.first_closed_at is not null then 'Closed'
+        else 'Open'
+    end as close_status,
+    coalesce(qm2.total_votes, 0) as dup_target_votes,
+    -- Null logic and complex predicate evaluation example
+    case
+        when iq.viewcount is null and iq.answercount is null then 'no-views-no-answers'
+        when coalesce(iq.viewcount,0) = 0 and coalesce(iq.answercount,0) > 0 then 'answers-without-views?'
+        when coalesce(iq.viewcount,0) > 10000 and coalesce(iq.net_votes,0) <= 0 then 'controversial-high-views-low-votes'
+        when coalesce(iq.viewcount,0) > 10000 and coalesce(iq.net_votes,0) > 50 then 'popular'
+        when coalesce(iq.upvotes,0) > 0 and coalesce(iq.downvotes,0) > 0 then 'mixed-votes'
+        else 'other'
+    end as engagement_bucket
+from interesting_questions iq
+left join active_users au
+  on au.user_id = iq.owner_user_id
+left join user_activity ua
+  on ua.user_id = iq.owner_user_id
+left join tag_summary ts
+  on ts.question_id = iq.question_id
+left join answers_for_interesting afr
+  on afr.question_id = iq.question_id
+left join question_comments qc
+  on qc.question_id = iq.question_id
+-- Expand rankings per primary tag (choose lexicographically smallest to stabilize)
+left join lateral (
+    select qr.*
+    from question_rankings qr
+    where qr.question_id = iq.question_id
+    order by qr.tagname asc
+    limit 1
+) qr on true
+left join tag_stats tg
+  on tg.tagname = qr.tagname
+left join closer e on false -- intentionally impossible join for planner variation
+left join closereasontypes crt
+  on crt.id = iq.close_reason_id
+-- join to duplicate target's vote stats if available
+left join post_votes qm2
+  on qm2.postid = iq.a_duplicate_target_id
+where
+    -- complex predicate with date windows and string search on tags/title
+    (
+        (iq.q_created >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days' and iq.viewcount >= 1000)
+        or
+        (iq.q_created < cast('2024-10-01 12:34:56' as timestamp) - interval '365 days' and coalesce(iq.upvotes,0) - coalesce(iq.downvotes,0) >= 5)
+    )
+    and (
+        exists (
+            select 1
+            from unnest(coalesce(iq.tag_arr, array[]::varchar[])) t(tag)
+            where t.tag ilike any (array['%sql%','%postgres%','%performance%'])
+        )
+        or coalesce(iq.title,'') ~* '(optimi[sz]e|index|query|plan)'
+    )
+    and (
+        -- test NULL logic complexity
+        (iq.first_closed_at is null and iq.last_reopened_at is null)
+        or (iq.first_closed_at is not null and (iq.last_reopened_at is null or iq.first_closed_at > iq.last_reopened_at))
+    )
+order by
+    engagement_bucket,
+    coalesce(afr.best_answer_rank, 999),
+    iq.net_votes desc nulls last,
+    iq.viewcount desc nulls last,
+    iq.q_created desc
+limit 250;

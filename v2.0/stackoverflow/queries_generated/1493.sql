@@ -1,0 +1,176 @@
+-- {"query": "1493.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2336} 
+
+WITH UserEngagement AS (
+    -- Aggregates various user-level statistics including post, comment, and moderation activity
+    SELECT
+        U.Id AS UserId,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        COALESCE(U.DisplayName, 'Anonymous') AS UserDisplayName,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(P.Score) AS TotalPostScore,
+        AVG(P.Score) AS AveragePostScore,
+        SUM(P.ViewCount) AS TotalPostViews,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        MAX(COALESCE(P.LastActivityDate, C.CreationDate, U.LastAccessDate)) AS LatestActivityDate,
+        COUNT(DISTINCT PH.PostId) FILTER (WHERE PH.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20)) AS ModerationHistoryCount,
+        SUM(CASE WHEN P.CommunityOwnedDate IS NOT NULL THEN 1 ELSE 0 END) AS CommunityOwnedPosts,
+        COUNT(DISTINCT B.Id) AS TotalBadges
+    FROM
+        Users AS U
+    LEFT JOIN
+        Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN
+        Comments AS C ON U.Id = C.UserId
+    LEFT JOIN
+        PostHistory AS PH ON U.Id = PH.UserId
+    LEFT JOIN
+        Badges AS B ON U.Id = B.UserId
+    GROUP BY
+        U.Id, U.Reputation, U.CreationDate, U.LastAccessDate, U.DisplayName
+),
+TagPerformance AS (
+    -- Analyzes performance of individual tags based on post scores and view counts
+    SELECT
+        TRIM(UNNEST(string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><'))) AS TagName,
+        SUM(P.Score) AS TagTotalScore,
+        AVG(P.Score) AS TagAverageScore,
+        COUNT(DISTINCT P.Id) AS TagPostCount,
+        SUM(P.ViewCount) AS TagTotalViewCount
+    FROM
+        Posts AS P
+    WHERE
+        P.PostTypeId = 1 -- Only questions have tags in this format
+        AND P.Tags IS NOT NULL
+        AND LENGTH(P.Tags) > 2 -- Ensure tags string is not empty
+    GROUP BY
+        TRIM(UNNEST(string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><')))
+),
+HotTagThreshold AS (
+    -- Identifies 'hot' tags that exceed a certain post count and average score threshold
+    SELECT
+        TP.TagName
+    FROM
+        TagPerformance AS TP
+    WHERE
+        TP.TagPostCount >= 100
+        AND TP.TagAverageScore >= (SELECT AVG(TagAverageScore) * 1.5 FROM TagPerformance WHERE TagPostCount >= 100)
+    ORDER BY
+        TP.TagTotalScore DESC
+    LIMIT 10
+),
+UserPostDetails AS (
+    -- Provides detailed post information for each user, including various window functions
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId AS UserId,
+        P.PostTypeId,
+        P.Score,
+        P.CreationDate AS PostCreationDate,
+        P.ViewCount,
+        COALESCE(P.Title, SUBSTRING(P.Body, 1, 50) || '...') AS PostTitleExcerpt,
+        P.ParentId,
+        P.AcceptedAnswerId,
+        COALESCE(P.Tags, 'No Tags') AS PostTags,
+        LAG(P.LastEditDate, 1, P.CreationDate) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate) AS PreviousEditDate,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate) AS PostSequenceNum,
+        RANK() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.ViewCount DESC) AS RankOverallScoreViews,
+        NTILE(10) OVER (ORDER BY P.CreationDate) AS CreationDateDecile
+    FROM
+        Posts AS P
+    WHERE
+        P.OwnerUserId IS NOT NULL
+),
+UserAggregatedWindowStats AS (
+    -- Computes user-level aggregated window statistics and hot tag contributions
+    SELECT
+        UPD.UserId,
+        AVG(UPD.Score) AS UserAvgPostScore,
+        MAX(SUM(UPD.Score) OVER (PARTITION BY UPD.UserId ORDER BY UPD.PostCreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)) AS MaxCumulativeUserScore,
+        COUNT(DISTINCT HT.TagName) AS HotTagContributions
+    FROM
+        UserPostDetails AS UPD
+    LEFT JOIN
+        HotTagThreshold AS HT ON UPD.PostTags ILIKE '%' || '<' || HT.TagName || '>' || '%'
+    GROUP BY
+        UPD.UserId
+)
+-- Main query to combine all CTEs and generate final user insights
+SELECT
+    UE.UserId,
+    UE.UserDisplayName,
+    UE.Reputation,
+    UE.TotalPosts,
+    UE.TotalQuestions,
+    UE.TotalAnswers,
+    UE.TotalComments,
+    UE.LatestActivityDate,
+    UE.ModerationHistoryCount,
+    UE.CommunityOwnedPosts,
+    UE.TotalBadges,
+    (UE.TotalQuestions * 1.0 / NULLIF(UE.TotalPosts, 0)) AS QuestionRatio,
+    (UE.TotalAnswers * 1.0 / NULLIF(UE.TotalPosts, 0)) AS AnswerRatio,
+    EXTRACT(EPOCH FROM (UE.LatestActivityDate - UE.UserCreationDate)) / 86400.0 AS DaysSinceCreationToLastActivity, -- Days in service
+    UAWS.UserAvgPostScore,
+    UAWS.MaxCumulativeUserScore,
+    UAWS.HotTagContributions,
+    -- Correlated subquery: Counts accepted answers by the user on questions with specific tags and sufficient comments
+    (
+        SELECT COUNT(DISTINCT A.Id)
+        FROM Posts AS Q
+        JOIN Posts AS A ON Q.AcceptedAnswerId = A.Id
+        LEFT JOIN Comments AS C_sub ON Q.Id = C_sub.PostId
+        WHERE Q.OwnerUserId = UE.UserId
+          AND A.OwnerUserId = UE.UserId
+          AND Q.AnswerCount > 0
+          AND (Q.Tags ILIKE '%<sql>%' OR Q.Tags ILIKE '%<database>%')
+        GROUP BY Q.Id
+        HAVING COUNT(C_sub.Id) >= 5
+    ) AS AcceptedAnswersWithManyCommentsOnSqlQuestions,
+    -- String expression and NULL logic: Formats location, handles empty website URL
+    COALESCE(UPPER(SUBSTRING(U.Location, 1, 1)) || SUBSTRING(U.Location, 2), 'Unknown Location') AS FormattedLocation,
+    NULLIF(U.WebsiteUrl, '') AS UserWebsite,
+    -- Correlated subquery: Counts recent favorite votes made by the user
+    (
+        SELECT COUNT(DISTINCT V.PostId)
+        FROM Votes AS V
+        WHERE V.UserId = UE.UserId AND V.VoteTypeId = 5 -- Favorite votes
+        AND V.CreationDate BETWEEN NOW() - INTERVAL '1 year' AND NOW()
+    ) AS RecentFavoriteCount,
+    -- Complicated CASE expression for user categorization
+    CASE
+        WHEN UE.Reputation >= 10000 AND UE.ModerationHistoryCount > 5 THEN 'Power User & Moderator'
+        WHEN UE.Reputation >= 5000 AND UE.TotalQuestions > 100 THEN 'Prolific Questioner'
+        WHEN UE.Reputation >= 2000 AND UE.TotalAnswers > 50 THEN 'Established Answerer'
+        WHEN UE.Reputation < 100 THEN 'New Contributor'
+        ELSE 'Active User'
+    END AS UserCategory,
+    -- Aggregates recent duplicate links associated with the user's posts
+    COUNT(DISTINCT PL.RelatedPostId) FILTER (WHERE PL.LinkTypeId = 3 AND PL.CreationDate >= UE.LastAccessDate - INTERVAL '6 months') AS RecentDuplicateLinks
+FROM
+    Users AS U
+INNER JOIN
+    UserEngagement AS UE ON U.Id = UE.UserId
+LEFT JOIN
+    UserAggregatedWindowStats AS UAWS ON UE.UserId = UAWS.UserId
+LEFT JOIN
+    -- Joins PostLinks by finding the owner of the linked post
+    PostLinks AS PL ON U.Id = (SELECT P.OwnerUserId FROM Posts P WHERE P.Id = PL.PostId LIMIT 1)
+WHERE
+    UE.TotalPosts > 5 -- Filter for users with a minimum number of posts
+    AND UE.Reputation > 100 -- Filter for users with significant reputation
+    AND (UE.LatestActivityDate BETWEEN NOW() - INTERVAL '2 years' AND NOW() OR UE.TotalQuestions > 10) -- Recent activity or substantial questions
+    AND U.AboutMe IS NOT NULL -- Users with an 'About Me' section
+    AND U.DisplayName IS NOT NULL -- Users with a DisplayName
+    AND UAWS.UserAvgPostScore IS NOT NULL -- Ensure user has posts to calculate average score
+GROUP BY
+    UE.UserId, UE.UserDisplayName, UE.Reputation, UE.TotalPosts, UE.TotalQuestions, UE.TotalAnswers,
+    UE.TotalComments, UE.LatestActivityDate, UE.ModerationHistoryCount, UE.CommunityOwnedPosts,
+    UE.TotalBadges, UE.UserCreationDate, UAWS.UserAvgPostScore, UAWS.MaxCumulativeUserScore,
+    UAWS.HotTagContributions, U.Location, U.WebsiteUrl -- All non-aggregated columns in SELECT must be in GROUP BY
+ORDER BY
+    UE.Reputation DESC, UAWS.HotTagContributions DESC, UE.LatestActivityDate DESC
+LIMIT 500;

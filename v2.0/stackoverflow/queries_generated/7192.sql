@@ -1,0 +1,256 @@
+-- {"query": "7192.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 3196} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COUNT(DISTINCT v.Id) as VoteCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        MAX(b.Date) as LastBadgeDate,
+        MAX(v.CreationDate) as LastVoteDate,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Expert'
+            WHEN u.Reputation > 1000 THEN 'Advanced'
+            WHEN u.Reputation > 100 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as ReputationLevel,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END), 0) as QuestionScore,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END), 0) as AnswerScore,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END), 0) as TotalViews,
+        DATEDIFF(DAY, u.CreationDate, GETDATE()) as DaysSinceRegistration,
+        ROUND(CAST(COUNT(DISTINCT p.Id) AS FLOAT) / NULLIF(DATEDIFF(DAY, u.CreationDate, GETDATE()), 0), 2) as PostsPerDay,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) as ReputationRank,
+        RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) as PostRank,
+        DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT b.Id) DESC) as BadgeRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate
+),
+TopUsers AS (
+    SELECT TOP 100 
+        UserId,
+        DisplayName,
+        Reputation,
+        PostCount,
+        CommentCount,
+        BadgeCount,
+        VoteCount,
+        ReputationLevel,
+        QuestionScore,
+        AnswerScore,
+        TotalViews,
+        DaysSinceRegistration,
+        PostsPerDay,
+        ReputationRank,
+        PostRank,
+        BadgeRank
+    FROM UserActivityStats
+    WHERE PostCount > 0
+),
+RecentActivity AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        u.DisplayName as OwnerDisplayName,
+        COALESCE(p.AnswerCount, 0) as AnswerCount,
+        COALESCE(p.CommentCount, 0) as CommentCount,
+        COALESCE(p.FavoriteCount, 0) as FavoriteCount,
+        DATEDIFF(HOUR, p.CreationDate, GETDATE()) as HoursOld,
+        CASE 
+            WHEN p.Score >= 100 THEN 'Hot'
+            WHEN p.Score >= 25 THEN 'Popular'
+            WHEN p.Score >= 1 THEN 'Normal'
+            ELSE 'Low'
+        END as PopularityLevel,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PreviousScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) as MovingAverageScore,
+        NTILE(4) OVER (ORDER BY p.Score DESC) as ScoreQuartile,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as RecentPostNumber,
+        LTRIM(RTRIM(LEFT(p.Tags, 300))) as ShortenedTags,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND LEN(p.Tags) > 0 THEN 
+                (SELECT COUNT(*) FROM STRING_SPLIT(SUBSTRING(p.Tags, 2, LEN(p.Tags)-2), '><'))
+            ELSE 0 
+        END as TagCount
+    FROM Posts p
+    INNER JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.CreationDate >= DATEADD(DAY, -7, GETDATE()) 
+      AND p.PostTypeId IN (1, 2)
+      AND p.Score IS NOT NULL
+),
+UserPostEngagement AS (
+    SELECT 
+        rp.PostId,
+        rp.Title,
+        rp.Score,
+        rp.OwnerUserId,
+        rp.OwnerDisplayName,
+        rp.PopularityLevel,
+        rp.HoursOld,
+        rp.AnswerCount,
+        rp.CommentCount,
+        rp.FavoriteCount,
+        rp.ScoreQuartile,
+        rp.TagCount,
+        rp.ShortenedTags,
+        CASE 
+            WHEN rp.ScoreQuartile = 1 AND rp.AnswerCount > 0 THEN 1
+            WHEN rp.ScoreQuartile = 1 THEN 0.5
+            WHEN rp.ScoreQuartile = 2 AND rp.AnswerCount > 0 THEN 0.75
+            WHEN rp.ScoreQuartile = 3 AND rp.AnswerCount > 0 THEN 0.5
+            ELSE 0.25 
+        END as EngagementScore,
+        DENSE_RANK() OVER (ORDER BY rp.Score DESC) as Ranking,
+        DENSE_RANK() OVER (PARTITION BY rp.OwnerUserId ORDER BY rp.Score DESC) as UserRanking,
+        ROW_NUMBER() OVER (PARTITION BY rp.OwnerUserId ORDER BY rp.CreationDate DESC) as PostSequence
+    FROM RecentActivity rp
+)
+SELECT 
+    tu.UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.PostCount,
+    tu.CommentCount,
+    tu.BadgeCount,
+    tu.VoteCount,
+    tu.ReputationLevel,
+    tu.QuestionScore,
+    tu.AnswerScore,
+    tu.TotalViews,
+    tu.DaysSinceRegistration,
+    tu.PostsPerDay,
+    tu.ReputationRank,
+    tu.PostRank,
+    tu.BadgeRank,
+    COALESCE(ue.Ranking, 0) as PostRanking,
+    COALESCE(ue.Title, 'No Recent Posts') as LatestPostTitle,
+    COALESCE(ue.Score, 0) as LatestPostScore,
+    COALESCE(ue.PopularityLevel, 'N/A') as LatestPopularity,
+    COALESCE(ue.HoursOld, 0) as HoursSincePost,
+    COALESCE(ue.AnswerCount, 0) as AnswerCount,
+    COALESCE(ue.CommentCount, 0) as CommentCount,
+    COALESCE(ue.FavoriteCount, 0) as FavoriteCount,
+    COALESCE(ue.TagCount, 0) as TagCount,
+    COALESCE(ue.ShortenedTags, 'No Tags') as Tags,
+    COALESCE(ue.EngagementScore, 0) as EngagementScore,
+    COALESCE(ue.UserRanking, 0) as UserRanking,
+    COALESCE(ue.PostSequence, 0) as PostSequence,
+    CASE 
+        WHEN tu.PostCount > 10 THEN 'High Engagement'
+        WHEN tu.PostCount > 5 THEN 'Medium Engagement'
+        WHEN tu.PostCount > 0 THEN 'Low Engagement'
+        ELSE 'No Activity'
+    END as EngagementCategory,
+    CASE 
+        WHEN (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = tu.UserId AND p.PostTypeId = 1) > 0 
+             AND (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = tu.UserId AND p.PostTypeId = 2) > 0 
+        THEN 'Both Question and Answer'
+        WHEN (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = tu.UserId AND p.PostTypeId = 1) > 0 
+        THEN 'Question Writer'
+        WHEN (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = tu.UserId AND p.PostTypeId = 2) > 0 
+        THEN 'Answerer'
+        ELSE 'Inactive'
+    END as ContributionType,
+    CASE 
+        WHEN tu.Reputation > 10000 AND tu.PostCount > 50 THEN 'Elite Contributor'
+        WHEN tu.Reputation > 1000 AND tu.PostCount > 25 THEN 'Active Contributor'
+        WHEN tu.PostCount > 10 THEN 'Regular Contributor'
+        WHEN tu.CommentCount > 100 THEN 'Commenter'
+        ELSE 'New User'
+    END as RoleCategory,
+    CAST(ROUND(tu.PostsPerDay, 2) AS VARCHAR(10)) + ' posts/day' as ActivityRate,
+    CASE 
+        WHEN tu.Reputation > 5000 THEN 'Power User'
+        WHEN tu.Reputation > 1000 THEN 'Member'
+        WHEN tu.Reputation > 100 THEN 'Contributor'
+        ELSE 'Newbie'
+    END as UserTier,
+    CASE 
+        WHEN tu.Reputation >= 10000 THEN 'Gold'
+        WHEN tu.Reputation >= 1000 THEN 'Silver'
+        WHEN tu.Reputation >= 100 THEN 'Bronze'
+        ELSE 'Copper'
+    END as ReputationTier,
+    STUFF((
+        SELECT ', ' + b.Name
+        FROM Badges b
+        WHERE b.UserId = tu.UserId
+        AND b.Date >= DATEADD(MONTH, -3, GETDATE())
+        FOR XML PATH(''), TYPE).value('.', 'NVARCHAR(MAX)'), 1, 2, '') as RecentBadges,
+    CONCAT('UserID:', tu.UserId, ' | Posts:', tu.PostCount, ' | Reputation:', tu.Reputation) as Metadata,
+    COALESCE((SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = tu.UserId AND p.Score > 0 AND p.PostTypeId = 1), 0) as PositiveQuestions,
+    COALESCE((SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = tu.UserId AND p.Score > 0 AND p.PostTypeId = 2), 0) as PositiveAnswers,
+    CASE 
+        WHEN (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = tu.UserId AND p.PostTypeId = 1 AND p.ViewCount > 100) > 0 
+        THEN 'Popular Questions'
+        WHEN (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = tu.UserId AND p.PostTypeId = 2 AND p.ViewCount > 100) > 0 
+        THEN 'Popular Answers'
+        ELSE 'No Popular Content'
+    END as ContentPopularity,
+    CASE 
+        WHEN tu.BadgeCount > 10 AND tu.VoteCount > 100 THEN 'Highly Active'
+        WHEN tu.BadgeCount > 5 AND tu.VoteCount > 50 THEN 'Moderately Active'
+        WHEN tu.BadgeCount > 0 OR tu.VoteCount > 10 THEN 'Basic Active'
+        ELSE 'Inactive'
+    END as ActivityStatus,
+    DATEDIFF(DAY, tu.CreationDate, GETDATE()) as AccountAgeDays,
+    CASE 
+        WHEN tu.PostCount > 0 
+        THEN CAST(((tu.QuestionScore + tu.AnswerScore) * 1.0 / NULLIF(tu.PostCount, 0)) AS DECIMAL(10,2))
+        ELSE 0 
+    END as AverageScorePerPost,
+    CASE 
+        WHEN tu.BadgeCount > 0 AND tu.Reputation > 100 THEN 'Achievement Seeker'
+        WHEN tu.PostCount > 20 AND tu.Reputation > 500 THEN 'Regular Participant'
+        WHEN tu.PostCount > 5 THEN 'Occasional Participant'
+        ELSE 'New Member'
+    END as CommunityRole,
+    COALESCE((SELECT TOP 1 Title FROM Posts WHERE OwnerUserId = tu.UserId AND PostTypeId = 1 ORDER BY CreationDate DESC), 'No Questions') as LatestQuestion,
+    COALESCE((SELECT TOP 1 Title FROM Posts WHERE OwnerUserId = tu.UserId AND PostTypeId = 2 ORDER BY CreationDate DESC), 'No Answers') as LatestAnswer,
+    COALESCE((SELECT TOP 1 Title FROM Posts WHERE OwnerUserId = tu.UserId ORDER BY CreationDate DESC), 'No Posts') as MostRecentPost,
+    CAST(tu.Reputation AS VARCHAR(20)) + ' rep' as ReputationDisplay,
+    CASE 
+        WHEN tu.Reputation >= 100 AND tu.Score >= 100 THEN 'Highly Rated User'
+        WHEN tu.Reputation >= 100 THEN 'Rated User'
+        WHEN tu.Score >= 100 THEN 'Scored User'
+        ELSE 'Basic User'
+    END as RatingLevel,
+    COALESCE((SELECT COUNT(*) FROM Comments c WHERE c.UserId = tu.UserId AND c.CreationDate >= DATEADD(DAY, -7, GETDATE())), 0) as RecentComments,
+    COALESCE((SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = tu.UserId AND p.CreationDate >= DATEADD(DAY, -7, GETDATE())), 0) as RecentPosts,
+    CASE 
+        WHEN EXISTS(SELECT 1 FROM Posts p WHERE p.OwnerUserId = tu.UserId AND p.PostTypeId = 1 AND p.Score > 50) 
+        THEN 'Question Expert'
+        WHEN EXISTS(SELECT 1 FROM Posts p WHERE p.OwnerUserId = tu.UserId AND p.PostTypeId = 2 AND p.Score > 50) 
+        THEN 'Answer Expert'
+        ELSE 'Generalist'
+    END as ExpertiseType,
+    COALESCE(ue.Ranking, 0) + COALESCE(tu.ReputationRank, 0) as CombinedRank,
+    CASE 
+        WHEN tu.BadgeCount > 0 THEN 'Badge Holder'
+        WHEN tu.VoteCount > 0 THEN 'Voter'
+        ELSE 'New User'
+    END as EngagementStatus,
+    COALESCE((SELECT COUNT(*) FROM Badges b WHERE b.UserId = tu.UserId AND b.Class = 1), 0) as GoldBadges,
+    COALESCE((SELECT COUNT(*) FROM Badges b WHERE b.UserId = tu.UserId AND b.Class = 2), 0) as SilverBadges,
+    COALESCE((SELECT COUNT(*) FROM Badges b WHERE b.UserId = tu.UserId AND b.Class = 3), 0) as BronzeBadges
+FROM TopUsers tu
+LEFT JOIN UserPostEngagement ue ON tu.UserId = ue.OwnerUserId
+WHERE (tu.PostCount > 0 OR tu.BadgeCount > 0 OR tu.VoteCount > 0)
+  AND (COALESCE(ue.Ranking, 0) > 0 OR (tu.UserId IN (SELECT DISTINCT OwnerUserId FROM Posts WHERE CreationDate >= DATEADD(DAY, -7, GETDATE()))))
+ORDER BY tu.Reputation DESC, tu.PostCount DESC, COALESCE(ue.Ranking, 0) DESC;

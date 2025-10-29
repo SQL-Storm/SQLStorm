@@ -1,0 +1,155 @@
+with recursive RecursiveTagPaths as (
+    select 
+        t.Id as TagId,
+        t.TagName,
+        array[t.TagName]::varchar[] as TagPath,
+        1 as Depth
+    from Tags t
+    where t.IsRequired = true
+
+    union all
+
+    select
+        t.Id,
+        t.TagName,
+        r.TagPath || t.TagName,
+        r.Depth + 1
+    from Tags t
+    join RecursiveTagPaths r on t.Id = r.TagId + 1
+    where r.Depth < 3
+),
+TopUsersCTE as (
+    select 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct b.Id) as BadgesCount,
+        avg(case when p.PostTypeId = 1 then coalesce(p.Score,0) end) as AvgQuestionScore,
+        row_number() over (order by u.Reputation desc, count(distinct b.Id) desc) as Rnk
+    from Users u
+    left join Badges b on b.UserId = u.Id and b.Class = 1
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+    having count(distinct b.Id) > 0
+),
+QuestionStatsCTE as (
+    select 
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.AnswerCount,
+        (select count(*) from Comments c where c.PostId = p.Id) as TotalComments,
+        dense_rank() over (partition by p.OwnerUserId order by p.CreationDate desc) as RecentRank
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId = 1
+),
+AnswersWithCorrelatedVotes as (
+    select 
+        a.Id,
+        a.ParentId as QuestionId,
+        a.CreationDate,
+        a.Score,
+        a.OwnerUserId,
+        (select count(*) from Votes v where v.PostId = a.Id and v.VoteTypeId = 2) as UpVotes,
+        (select count(*) from Votes v where v.PostId = a.Id and v.VoteTypeId = 3) as DownVotes,
+        u.DisplayName
+    from Posts a
+    left join Users u on u.Id = a.OwnerUserId
+    where a.PostTypeId = 2
+),
+FinalAggregatedData as (
+    select 
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionDate,
+        q.OwnerUserId,
+        q.DisplayName as QuestionOwner,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        q.AnswerCount,
+        q.TotalComments,
+        a.Id as AnswerId,
+        a.CreationDate as AnswerDate,
+        a.Score as AnswerScore,
+        a.UpVotes,
+        a.DownVotes,
+        a.OwnerUserId as AnswerOwnerUserId,
+        a.DisplayName as AnswerOwnerDisplayName,
+        tp.Rnk as QuestionOwnerRank,
+        row_number() over (partition by q.Id order by a.Score desc nulls last) as AnswerRank,
+        q.RecentRank
+    from QuestionStatsCTE q
+    left join AnswersWithCorrelatedVotes a on a.QuestionId = q.Id
+    left join TopUsersCTE tp on tp.Id = q.OwnerUserId
+    where tp.Rnk <= 50
+)
+select 
+    fad.QuestionId,
+    fad.Title,
+    fad.QuestionOwner,
+    fad.QuestionOwnerRank,
+    fad.QuestionScore,
+    fad.ViewCount,
+    regexp_replace(coalesce(fad.Tags, ''), '[<>]', ' ') as ParsedTags,
+    fad.AnswerCount,
+    fad.TotalComments,
+    fad.AnswerId,
+    fad.AnswerDate,
+    fad.AnswerScore,
+    fad.UpVotes,
+    fad.DownVotes,
+    fad.AnswerOwnerDisplayName,
+    case 
+        when fad.AnswerScore > 0 and fad.UpVotes is not null and fad.DownVotes is not null 
+        then round( (cast(fad.UpVotes as numeric) / greatest(fad.DownVotes,1)), 2)
+        else null
+    end as UpDownRatio,
+    string_agg(distinct pt.Name, ', ') over (partition by fad.QuestionId) as PostTypeNames,
+    coalesce(cht.Name, 'No Close Reason') as LastCloseReason,
+    count(distinct pl.Id) filter (where pl.LinkTypeId = 3) over (partition by fad.QuestionId) as DuplicateLinksCount,
+    count(distinct ch.Id) filter (where ch.PostHistoryTypeId in (10,11)) over (partition by fad.QuestionId) as CloseReopenEvents,
+    dense_rank() over (order by fad.AnswerScore desc nulls last) as OverallAnswerRank
+from FinalAggregatedData fad
+left join PostTypes pt on pt.Id = (case when fad.AnswerId is not null then 2 else 1 end)
+left join lateral (
+    select ph.PostHistoryTypeId, cr.Name
+    from PostHistory ph
+    left join CloseReasonTypes cr on cr.Id = cast(ph.Comment as integer)
+    where ph.PostId = fad.QuestionId and ph.PostHistoryTypeId = 10
+    order by ph.CreationDate desc
+    limit 1
+) cht on true
+left join PostLinks pl on pl.PostId = fad.QuestionId
+left join PostHistory ch on ch.PostId = fad.QuestionId
+where fad.RecentRank <= 5 and (fad.AnswerRank <= 3 or fad.AnswerRank is null)
+group by
+    fad.QuestionId,
+    fad.Title,
+    fad.QuestionOwner,
+    fad.QuestionOwnerRank,
+    fad.QuestionScore,
+    fad.ViewCount,
+    ParsedTags,
+    fad.AnswerCount,
+    fad.TotalComments,
+    fad.AnswerId,
+    fad.AnswerDate,
+    fad.AnswerScore,
+    fad.UpVotes,
+    fad.DownVotes,
+    fad.AnswerOwnerDisplayName,
+    UpDownRatio,
+    coalesce(cht.Name, 'No Close Reason'),
+    dense_rank() over (order by fad.AnswerScore desc nulls last),
+    pt.Name,
+    fad.QuestionDate,
+    fad.RecentRank
+order by fad.QuestionOwnerRank, fad.QuestionDate desc, fad.AnswerScore desc nulls last
+limit 100;

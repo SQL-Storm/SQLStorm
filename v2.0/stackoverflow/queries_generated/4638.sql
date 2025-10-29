@@ -1,0 +1,133 @@
+-- {"query": "4638.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1335} 
+
+WITH
+  RankedPosts AS (
+    SELECT
+      p.Id AS PostId,
+      p.OwnerUserId,
+      p.Title,
+      p.CreationDate,
+      p.Score,
+      p.AnswerCount,
+      p.ViewCount,
+      p.FavoriteCount,
+      p.PostTypeId,
+      ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS PostRank,
+      COUNT(c.Id) OVER (PARTITION BY p.Id) AS CommentCount,
+      SUM(v.VoteTypeId) OVER (PARTITION BY p.Id) AS TotalVoteScore
+    FROM Posts AS p
+    LEFT JOIN Comments AS c
+      ON p.Id = c.PostId
+    LEFT JOIN Votes AS v
+      ON p.Id = v.PostId
+    WHERE
+      p.PostTypeId = 1 -- Questions only
+    GROUP BY
+      p.Id,
+      p.OwnerUserId,
+      p.Title,
+      p.CreationDate,
+      p.Score,
+      p.AnswerCount,
+      p.ViewCount,
+      p.FavoriteCount,
+      p.PostTypeId
+  ),
+  UserEngagement AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate AS UserCreationDate,
+      COUNT(DISTINCT rp.PostId) AS QuestionsAsked,
+      SUM(rp.Score) AS TotalScoreOfQuestions,
+      AVG(rp.ViewCount) AS AvgQuestionViews,
+      MAX(rp.LastActivityDate) AS LastActivityOnQuestions,
+      CASE
+        WHEN rp.PostTypeId = 1 THEN COUNT(rp.PostId)
+        ELSE 0
+      END AS QuestionPostCount
+    FROM Users AS u
+    LEFT JOIN RankedPosts AS rp
+      ON u.Id = rp.OwnerUserId
+    WHERE
+      rp.PostRank <= 5 -- Top 5 questions by user
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate,
+      rp.PostTypeId,
+      rp.LastActivityDate
+  ),
+  PostHistorySummary AS (
+    SELECT
+      ph.PostId,
+      COUNT(CASE WHEN ph.PostHistoryTypeId IN (1, 4, 7) THEN 1 END) AS TitleEdits,
+      COUNT(CASE WHEN ph.PostHistoryTypeId IN (2, 5, 8) THEN 1 END) AS BodyEdits,
+      COUNT(CASE WHEN ph.PostHistoryTypeId IN (3, 6, 9) THEN 1 END) AS TagEdits,
+      MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Comment ELSE NULL END) AS CloseReasonComment,
+      COUNT(DISTINCT ph.UserId) AS DistinctEditors
+    FROM PostHistory AS ph
+    WHERE
+      ph.PostId IN (SELECT PostId FROM RankedPosts)
+    GROUP BY
+      ph.PostId
+  )
+SELECT
+  rp.PostId,
+  rp.Title,
+  rp.CreationDate AS QuestionCreationDate,
+  rp.Score AS QuestionScore,
+  rp.AnswerCount AS NumberOfAnswers,
+  rp.ViewCount AS QuestionViews,
+  rp.FavoriteCount AS Bookmarks,
+  ue.DisplayName AS OwnerDisplayName,
+  ue.Reputation AS OwnerReputation,
+  ue.UserCreationDate,
+  ue.QuestionsAsked AS UserTotalQuestions,
+  ue.TotalScoreOfQuestions AS UserTotalScoreOnQuestions,
+  ue.AvgQuestionViews AS UserAvgQuestionViews,
+  phs.TitleEdits,
+  phs.BodyEdits,
+  phs.TagEdits,
+  phs.DistinctEditors,
+  COALESCE(pht.Name, 'Unknown') AS CloseReason,
+  rp.CommentCount,
+  rp.TotalVoteScore,
+  CASE
+    WHEN rp.Score > 100 AND rp.AnswerCount > 10 THEN 'High Engagement'
+    WHEN rp.Score < 0 THEN 'Negative Score'
+    WHEN rp.ViewCount > 10000 THEN 'High Views'
+    ELSE 'Standard'
+  END AS PerformanceCategory,
+  CASE
+    WHEN rp.Title LIKE '%[duplicate]%' OR rp.Title LIKE '%duplicate of%' THEN 'Potential Duplicate'
+    WHEN INSTR(rp.Tags, 'sql') > 0 THEN 'SQL Related'
+    WHEN INSTR(rp.Tags, 'performance') > 0 THEN 'Performance Tuning'
+    ELSE 'General'
+  END AS TopicCategory,
+  CASE
+    WHEN ue.LastActivityOnQuestions IS NOT NULL AND ue.LastActivityOnQuestions < DATE('now', '-365 day') THEN 'Inactive User'
+    WHEN ue.Reputation < 1000 THEN 'Low Reputation'
+    ELSE 'Active User'
+  END AS UserActivityStatus,
+  rp.Score + (rp.AnswerCount * 5) - (rp.ViewCount / 1000) AS CalculatedMetric
+FROM RankedPosts AS rp
+JOIN UserEngagement AS ue
+  ON rp.OwnerUserId = ue.UserId
+LEFT JOIN PostHistorySummary AS phs
+  ON rp.PostId = phs.PostId
+LEFT JOIN PostHistory AS ph_close
+  ON rp.PostId = ph_close.PostId
+  AND ph_close.PostHistoryTypeId = 10
+LEFT JOIN CloseReasonTypes AS pht
+  ON CAST(ph_close.Comment AS INT) = pht.Id
+WHERE
+  rp.PostRank <= 10 -- Consider top 10 questions for each user
+  AND ue.Reputation > 50 -- Filter out users with very low reputation
+  AND rp.CreationDate > DATE('now', '-730 day') -- Recent questions
+ORDER BY
+  rp.Score DESC,
+  rp.ViewCount DESC
+LIMIT 100;

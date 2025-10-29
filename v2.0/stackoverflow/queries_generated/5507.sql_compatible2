@@ -1,0 +1,104 @@
+WITH top_users AS (
+  SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.AccountId,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.LastAccessDate DESC) AS rn
+  FROM Users u
+  WHERE u.Reputation > 1000
+),
+recent_activities AS (
+  SELECT
+    p.Id AS PostId,
+    p.OwnerUserId,
+    p.Title,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    COALESCE(vt.Name, 'Unknown') AS VoteTypeName,
+    v.CreationDate AS VoteDate,
+    v.BountyAmount
+  FROM Posts p
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  LEFT JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+  WHERE p.CreationDate >= CAST(CAST('2024-10-01 12:34:56' AS TIMESTAMP) AS TIMESTAMP) - INTERVAL '30' DAY
+),
+tagged_activity AS (
+  SELECT
+    ra.PostId,
+    ra.Title,
+    -- split tags like '<tag1><tag2>' into rows in a dialect-neutral way when possible
+    -- use SQL standard functions where available; fallback to assume string format and simple parsing function
+    -- here we use regexp to extract tags between angle brackets one per row using a numbers table approach if supported.
+    -- For portability, use a generic regexp_matches approach returning one row per match where supported.
+    match.tag AS tag,
+    ra.CreationDate,
+    ra.Score,
+    ra.ViewCount
+  FROM recent_activities ra
+  CROSS JOIN LATERAL (
+    SELECT m[1] AS tag
+    FROM regexp_matches(ra.Tags, '<([^>]+)>', 'g') AS m
+  ) AS match
+  WHERE ra.Tags IS NOT NULL AND ra.Tags <> ''
+),
+complex_calc AS (
+  SELECT
+    ta.PostId,
+    ta.Title,
+    ta.tag,
+    ta.CreationDate,
+    ta.Score,
+    ta.ViewCount,
+    -- ensure numeric addition by converting VoteType name to a numeric-safe representation;
+    -- use 0 when VoteType name is not numeric
+    (ta.Score * 2 + CAST(COALESCE(NULLIF(regexp_replace(COALESCE(vt2.Name, ''), '[^0-9.+-]', '', 'g'), ''), '0') AS NUMERIC)) AS score_factor,
+    CASE
+      WHEN ta.ViewCount > 1000 THEN 'high-views'
+      WHEN ta.ViewCount BETWEEN 100 AND 1000 THEN 'mid-views'
+      ELSE 'low-views'
+    END AS view_bucket,
+    ROW_NUMBER() OVER (PARTITION BY ta.tag ORDER BY ta.Score DESC, ta.CreationDate DESC) AS tag_rank
+  FROM tagged_activity ta
+  LEFT JOIN Votes v ON v.PostId = ta.PostId
+  LEFT JOIN VoteTypes vt2 ON vt2.Id = v.VoteTypeId
+)
+SELECT
+  hu.Id AS user_id,
+  hu.DisplayName AS user_name,
+  hu.Reputation,
+  hu.AccountId,
+  hu.rn AS user_rank,
+  ca.PostId,
+  ca.Title AS post_title,
+  ca.tag AS post_tag,
+  ca.CreationDate AS post_creation,
+  ca.Score AS post_score,
+  ca.ViewCount AS post_views,
+  ca.score_factor,
+  ca.view_bucket,
+  ca.tag_rank
+FROM top_users hu
+JOIN recent_activities ra ON ra.OwnerUserId = hu.Id
+JOIN complex_calc ca ON ca.PostId = ra.PostId
+WHERE hu.rn <= 100
+GROUP BY
+  hu.Id,
+  hu.DisplayName,
+  hu.Reputation,
+  hu.AccountId,
+  hu.rn,
+  ca.PostId,
+  ca.Title,
+  ca.tag,
+  ca.CreationDate,
+  ca.Score,
+  ca.ViewCount,
+  ca.score_factor,
+  ca.view_bucket,
+  ca.tag_rank
+ORDER BY hu.Reputation DESC, ca.Score DESC, ca.ViewCount DESC
+LIMIT 100;

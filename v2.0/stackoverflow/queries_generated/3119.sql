@@ -1,0 +1,195 @@
+-- {"query": "3119.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2813} 
+
+/*  Complex performance‑benchmarking query for the StackOverflow replica  */
+WITH
+/* ------------------------------------------------------------------
+   1️⃣  User‑level aggregates (questions, answers, scores, votes, badges)
+   ------------------------------------------------------------------ */
+UserStats AS (
+    SELECT
+        u.Id                                   AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1)   AS QuestionCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2)   AS AnswerCount,
+        COALESCE(SUM(p.Score) FILTER (WHERE p.PostTypeId = 1),0) AS QuestionScore,
+        COALESCE(SUM(p.Score) FILTER (WHERE p.PostTypeId = 2),0) AS AnswerScore,
+        COALESCE(SUM(v_up.UpVotes),0)                     AS UpVoteTotal,
+        COALESCE(SUM(v_dn.DownVotes),0)                   AS DownVoteTotal,
+        COUNT(b.Id)                                      AS BadgeCount
+    FROM Users u
+    LEFT JOIN Posts p
+           ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT
+            v.PostId,
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes v
+        GROUP BY v.PostId
+    ) v_up ON v_up.PostId = p.Id
+    LEFT JOIN (
+        SELECT
+            v.PostId,
+            SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes v
+        GROUP BY v.PostId
+    ) v_dn ON v_dn.PostId = p.Id
+    LEFT JOIN Badges b
+           ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+/* ------------------------------------------------------------------
+   2️⃣  Top 10 tags by overall usage (for later cross‑join)
+   ------------------------------------------------------------------ */
+TopTags AS (
+    SELECT
+        t.TagName,
+        COUNT(p.Id)                                   AS TagUsage,
+        ROW_NUMBER() OVER (ORDER BY COUNT(p.Id) DESC) AS rn
+    FROM Tags t
+    JOIN Posts p
+      ON p.Tags ILIKE '%' || t.TagName || '%'
+     AND p.PostTypeId = 1                /* only questions */
+    GROUP BY t.TagName
+),
+
+/* ------------------------------------------------------------------
+   3️⃣  Per‑user tag ranking (how many times each user used the top tags)
+   ------------------------------------------------------------------ */
+UserTagRank AS (
+    SELECT
+        us.UserId,
+        tt.TagName,
+        COUNT(*)                                     AS TagCount,
+        ROW_NUMBER() OVER (PARTITION BY us.UserId
+                           ORDER BY COUNT(*) DESC) AS TagRank
+    FROM UserStats us
+    CROSS JOIN LATERAL (
+        SELECT TagName FROM TopTags WHERE rn <= 5
+    ) tt
+    JOIN Posts p
+      ON p.OwnerUserId = us.UserId
+     AND p.Tags ILIKE '%' || tt.TagName || '%'
+    GROUP BY us.UserId, tt.TagName
+),
+
+/* ------------------------------------------------------------------
+   4️⃣  Recent closed questions (last 30 days) – uses a correlated sub‑query
+   ------------------------------------------------------------------ */
+RecentClosedQuestions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        ph.CreationDate                              AS ClosedDate,
+        ph.Comment                                    AS CloseReason,
+        COALESCE(u.DisplayName, 'Community')          AS OwnerName
+    FROM Posts p
+    JOIN PostHistory ph
+      ON ph.PostId = p.Id
+     AND ph.PostHistoryTypeId = 10                   /* Close */
+    LEFT JOIN Users u
+           ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1                           /* question */
+      AND ph.CreationDate > CURRENT_DATE - INTERVAL '30 days'
+),
+
+/* ------------------------------------------------------------------
+   5️⃣  Predict next badge class based on reputation & current badge count
+   ------------------------------------------------------------------ */
+BadgeAwardPrediction AS (
+    SELECT
+        us.UserId,
+        CASE
+            WHEN us.Reputation > 20000 AND us.BadgeCount < 5 THEN 'Gold'
+            WHEN us.Reputation > 10000 AND us.BadgeCount < 10 THEN 'Silver'
+            ELSE 'Bronze'
+        END                                          AS PredictedBadgeClass,
+        ROW_NUMBER() OVER (ORDER BY us.Reputation DESC) AS RepRank
+    FROM (
+        SELECT
+            u.Id                                 AS UserId,
+            u.Reputation,
+            COUNT(b.Id)                          AS BadgeCount
+        FROM Users u
+        LEFT JOIN Badges b ON b.UserId = u.Id
+        GROUP BY u.Id, u.Reputation
+    ) us
+),
+
+/* ------------------------------------------------------------------
+   6️⃣  Combine everything, aggregate top‑5 tags per user as an array,
+       and provide a UNION‑ALL summary row.
+   ------------------------------------------------------------------ */
+CombinedUserMetrics AS (
+    SELECT
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.QuestionCount,
+        us.AnswerCount,
+        us.QuestionScore,
+        us.AnswerScore,
+        us.UpVoteTotal,
+        us.DownVoteTotal,
+        us.BadgeCount,
+        bap.PredictedBadgeClass,
+        bap.RepRank,
+        ARRAY_AGG(utr.TagName || ':' || utr.TagCount
+                  ORDER BY utr.TagRank)[:5]         AS Top5Tags
+    FROM UserStats us
+    LEFT JOIN BadgeAwardPrediction bap
+           ON bap.UserId = us.UserId
+    LEFT JOIN UserTagRank utr
+           ON utr.UserId = us.UserId
+    GROUP BY
+        us.UserId, us.DisplayName, us.Reputation,
+        us.QuestionCount, us.AnswerCount,
+        us.QuestionScore, us.AnswerScore,
+        us.UpVoteTotal, us.DownVoteTotal,
+        us.BadgeCount, bap.PredictedBadgeClass, bap.RepRank
+)
+
+SELECT
+    cu.UserId,
+    cu.DisplayName,
+    cu.Reputation,
+    cu.QuestionCount,
+    cu.AnswerCount,
+    cu.QuestionScore,
+    cu.AnswerScore,
+    cu.UpVoteTotal,
+    cu.DownVoteTotal,
+    cu.BadgeCount,
+    cu.PredictedBadgeClass,
+    cu.RepRank,
+    cu.Top5Tags
+FROM CombinedUserMetrics cu
+WHERE cu.Reputation IS NOT NULL
+
+UNION ALL
+
+/* ------------------------------------------------------------------
+   Summary row – aggregates over the whole dataset (uses NULL placeholders)
+   ------------------------------------------------------------------ */
+SELECT
+    NULL                                      AS UserId,
+    'Summary'                                 AS DisplayName,
+    NULL                                      AS Reputation,
+    SUM(QuestionCount)                        AS QuestionCount,
+    SUM(AnswerCount)                          AS AnswerCount,
+    SUM(QuestionScore)                        AS QuestionScore,
+    SUM(AnswerScore)                          AS AnswerScore,
+    SUM(UpVoteTotal)                          AS UpVoteTotal,
+    SUM(DownVoteTotal)                        AS DownVoteTotal,
+    COUNT(DISTINCT UserId)                    AS BadgeCount,
+    NULL                                      AS PredictedBadgeClass,
+    NULL                                      AS RepRank,
+    NULL                                      AS Top5Tags
+FROM CombinedUserMetrics
+
+ORDER BY
+    Reputation DESC NULLS LAST
+OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY;

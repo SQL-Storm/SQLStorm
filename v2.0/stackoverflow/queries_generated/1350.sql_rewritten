@@ -1,0 +1,226 @@
+-- {"query": "1350.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3745} 
+WITH UserReputationTiers AS (
+    -- Gathers basic user information, calculates account age, categorizes users into reputation tiers,
+    -- and standardizes location data.
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - u.CreationDate)) / (60*60*24*365.25) AS AccountAgeYears,
+        COALESCE(u.Location, 'Unknown') AS UserLocation,
+        CASE
+            WHEN u.Reputation >= 200000 THEN 'Elite'
+            WHEN u.Reputation >= 50000 THEN 'Veteran'
+            WHEN u.Reputation >= 10000 THEN 'Expert'
+            WHEN u.Reputation >= 2000 THEN 'Active Contributor'
+            ELSE 'Novice'
+        END AS ReputationTier
+    FROM Users u
+    WHERE u.Id IS NOT NULL
+),
+UserPostAggregates AS (
+    -- Aggregates various statistics related to posts authored by each user,
+    -- including total posts, scores, view counts, and number of questions with accepted answers.
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(DISTINCT p.Id) AS TotalPostsAuthored,
+        SUM(p.Score) AS TotalScoreOnPostsAuthored,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsAuthored,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersAuthored,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END) AS TotalQuestionViewCount,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 1) AS AvgQuestionScore,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 2) AS AvgAnswerScore,
+        COUNT(DISTINCT q.AcceptedAnswerId) AS QuestionsWithAcceptedAnswers, -- Number of questions *by this user* that have an accepted answer.
+        MAX(p.LastActivityDate) AS LastPostActivityDate
+    FROM Posts p
+    LEFT JOIN Posts q ON p.Id = q.AcceptedAnswerId AND p.PostTypeId = 2 AND q.PostTypeId = 1
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+UserAcceptedAnswerPerformance AS (
+    -- Focuses on answers authored by users that were subsequently accepted by a question owner,
+    -- providing metrics like count, total score, and average score for these specific answers.
+    SELECT
+        ans.OwnerUserId AS UserId,
+        COUNT(ans.Id) AS AcceptedAnswersGiven,
+        SUM(ans.Score) AS TotalScoreOnAcceptedAnswersGiven,
+        AVG(ans.Score) AS AvgScoreOnAcceptedAnswersGiven,
+        SUM(ans.CommentCount) AS TotalCommentsOnAcceptedAnswers,
+        SUM(ans.FavoriteCount) AS TotalFavoritesOnAcceptedAnswers
+    FROM Posts ans
+    JOIN Posts q ON ans.Id = q.AcceptedAnswerId
+    WHERE ans.PostTypeId = 2 AND q.PostTypeId = 1 AND ans.OwnerUserId IS NOT NULL
+    GROUP BY ans.OwnerUserId
+),
+UserEditAndModerationActivity AS (
+    -- Summarizes user involvement in editing posts and specific moderation actions such as
+    -- voting to close or reopen posts, derived from the PostHistory table.
+    SELECT
+        ph.UserId,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.Id END) AS TotalEditsMade, -- Edit Title, Body, Tags
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.PostId END) AS PostsVotedToClose,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.PostId END) AS PostsVotedToReopen,
+        MAX(ph.CreationDate) AS LastHistoryEventDate
+    FROM PostHistory ph
+    WHERE ph.UserId IS NOT NULL
+    GROUP BY ph.UserId
+),
+UserBadgeAndCommentSummary AS (
+    -- Provides an overview of badges earned by users and their commenting activity,
+    -- including total comments, average comment score, and last comment date.
+    SELECT
+        u.Id AS UserId,
+        COUNT(DISTINCT b.Id) AS TotalBadgesEarned,
+        COUNT(CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(c.Id) AS TotalCommentsMade,
+        AVG(c.Score) AS AvgCommentScore,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id
+),
+OverallAverages AS (
+    -- Calculates non-correlated overall average scores and view counts for questions and answers
+    -- to serve as a benchmark for individual user performance.
+    SELECT
+        AVG(Score) FILTER (WHERE PostTypeId = 1) AS OverallAvgQuestionScore,
+        AVG(Score) FILTER (WHERE PostTypeId = 2) AS OverallAvgAnswerScore,
+        AVG(ViewCount) FILTER (WHERE PostTypeId = 1) AS OverallAvgQuestionViews
+    FROM Posts
+),
+TopTagsAggregated AS (
+    -- Identifies and aggregates the top 3 most frequently used tags for questions authored by each user,
+    -- creating a summarized string for easier consumption.
+    SELECT
+        UserId,
+        STRING_AGG(TagName || ' (' || TagCount || ')', '; ' ORDER BY TagRank ASC) AS Top3TagsSummary
+    FROM (
+        SELECT
+            p.OwnerUserId AS UserId,
+            TRIM(unnest(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags)-2), '><'))) AS TagName,
+            COUNT(*) AS TagCount,
+            ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY COUNT(*) DESC, TRIM(unnest(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags)-2), '><'))) ASC) AS TagRank
+        FROM Posts p
+        WHERE p.PostTypeId = 1 AND p.OwnerUserId IS NOT NULL AND p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2
+        GROUP BY p.OwnerUserId, TRIM(unnest(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags)-2), '><')))
+    ) AS ranked_tags
+    WHERE TagRank <= 3
+    GROUP BY UserId
+),
+InfluentialUsers AS (
+    -- Identifies a set of users who are either highly successful in providing accepted answers
+    -- or significantly involved in moderation activities.
+    SELECT UserId FROM UserAcceptedAnswerPerformance
+    WHERE AcceptedAnswersGiven >= 10 OR TotalScoreOnAcceptedAnswersGiven >= 200
+    UNION
+    SELECT UserId FROM UserEditAndModerationActivity
+    WHERE PostsVotedToClose >= 15 OR PostsVotedToReopen >= 8
+),
+LessEngagedUsers AS (
+    -- Identifies a set of users who have very limited editing activity and a low overall score
+    -- on their authored posts, potentially indicating lower engagement or less impactful contributions.
+    SELECT u.UserId
+    FROM UserReputationTiers u
+    LEFT JOIN UserPostAggregates upa ON u.UserId = upa.UserId
+    LEFT JOIN UserEditAndModerationActivity ueama ON u.UserId = ueama.UserId
+    WHERE COALESCE(ueama.TotalEditsMade, 0) < 5
+      AND COALESCE(upa.TotalScoreOnPostsAuthored, 0) < 100
+      AND u.Reputation < 2000
+),
+FinalCandidateUsers AS (
+    -- Uses a set operator (EXCEPT) to filter the InfluentialUsers, removing those
+    -- also identified as LessEngagedUsers, resulting in a refined list of active, impactful users.
+    SELECT UserId FROM InfluentialUsers
+    EXCEPT
+    SELECT UserId FROM LessEngagedUsers
+)
+-- The main query combines all the pre-processed data from the CTEs.
+SELECT
+    urt.UserId,
+    urt.DisplayName,
+    urt.Reputation,
+    urt.ReputationTier,
+    urt.AccountAgeYears,
+    urt.UserLocation,
+    COALESCE(upa.TotalPostsAuthored, 0) AS TotalPostsAuthored,
+    COALESCE(upa.QuestionsAuthored, 0) AS QuestionsAuthored,
+    COALESCE(upa.AnswersAuthored, 0) AS AnswersAuthored,
+    COALESCE(uaap.AcceptedAnswersGiven, 0) AS AcceptedAnswersGiven,
+    COALESCE(uaap.AvgScoreOnAcceptedAnswersGiven, 0.0) AS AvgScoreOnAcceptedAnswersGiven,
+    COALESCE(ueama.TotalEditsMade, 0) AS TotalEditsMade,
+    COALESCE(ueama.PostsVotedToClose, 0) AS PostsVotedToClose,
+    COALESCE(ueama.PostsVotedToReopen, 0) AS PostsVotedToReopen,
+    COALESCE(ubcs.TotalBadgesEarned, 0) AS TotalBadgesEarned,
+    COALESCE(ubcs.GoldBadges, 0) AS GoldBadgesEarned,
+    COALESCE(ubcs.TotalCommentsMade, 0) AS TotalCommentsMade,
+    COALESCE(upa.TotalQuestionViewCount, 0) AS TotalQuestionViewCount,
+    -- Correlated subquery: Retrieves the raw body text of the earliest initial body history entry
+    -- for any accepted answer authored by the current user.
+    (
+        SELECT ph.Text
+        FROM PostHistory ph
+        JOIN Posts p_ans ON ph.PostId = p_ans.Id
+        WHERE p_ans.OwnerUserId = urt.UserId
+          AND p_ans.PostTypeId = 2
+          AND p_ans.Id IN (SELECT q_sub.AcceptedAnswerId FROM Posts q_sub WHERE q_sub.PostTypeId = 1 AND q_sub.AcceptedAnswerId = p_ans.Id)
+          AND ph.PostHistoryTypeId = 2 -- Initial Body
+        ORDER BY ph.CreationDate ASC
+        LIMIT 1
+    ) AS EarliestAcceptedAnswerBodyExcerpt,
+    -- Window functions: Calculates a normalized score metric, ranks users by content contribution,
+    -- ranks by moderation activity, and retrieves the reputation of the user just above in rank.
+    ROUND(CAST(COALESCE(upa.TotalScoreOnPostsAuthored, 0) AS NUMERIC) / GREATEST(1, urt.AccountAgeYears), 2) AS AvgScorePerYear,
+    RANK() OVER (ORDER BY COALESCE(upa.TotalScoreOnPostsAuthored, 0) DESC, COALESCE(uaap.AcceptedAnswersGiven, 0) DESC) AS OverallContentContributionRank,
+    DENSE_RANK() OVER (ORDER BY COALESCE(ueama.PostsVotedToClose, 0) + COALESCE(ueama.PostsVotedToReopen, 0) DESC) AS ModerationActivityRank,
+    LAG(urt.Reputation, 1, 0) OVER (ORDER BY urt.Reputation DESC) AS PrevHigherRepUserReputation,
+    -- Complex calculations: Differences in average scores compared to overall site averages.
+    COALESCE(upa.AvgQuestionScore, 0.0) - oa.OverallAvgQuestionScore AS QuestionScoreDeltaVsOverallAvg,
+    COALESCE(upa.AvgAnswerScore, 0.0) - oa.OverallAvgAnswerScore AS AnswerScoreDeltaVsOverallAvg,
+    -- Complicated string expressions: Constructs a detailed user profile summary and
+    -- classifies users into detailed roles based on various performance metrics and thresholds.
+    'User "' || COALESCE(urt.DisplayName, 'N/A') || '" (' || urt.ReputationTier || ') from ' || urt.UserLocation || ' joined on ' || TO_CHAR(urt.CreationDate, 'YYYY-MM-DD HH24:MI:SS') || '.' AS UserProfileBlurb,
+    CASE
+        WHEN COALESCE(uaap.AcceptedAnswersGiven, 0) >= 5 AND COALESCE(uaap.AvgScoreOnAcceptedAnswersGiven, 0) > oa.OverallAvgAnswerScore THEN 'High-Impact Answerer'
+        WHEN COALESCE(upa.QuestionsAuthored, 0) > 10 AND COALESCE(upa.TotalQuestionViewCount, 0) > (oa.OverallAvgQuestionViews * 2) THEN 'Popular Questioner'
+        WHEN COALESCE(ueama.PostsVotedToClose, 0) + COALESCE(ueama.PostsVotedToReopen, 0) >= 10 AND COALESCE(ubcs.GoldBadges, 0) >= 1 THEN 'Community Steward'
+        WHEN urt.AccountAgeYears > 5 AND COALESCE(upa.TotalPostsAuthored, 0) > 50 THEN 'Seasoned Contributor'
+        ELSE 'Emerging Participant'
+    END AS DetailedRoleClassification,
+    -- Aggregated top tags from the TopTagsAggregated CTE.
+    COALESCE(tta.Top3TagsSummary, 'No significant tags') AS TopQuestionTagsSummary,
+    -- Calculates the difference in account age compared to the average account age across all users.
+    (urt.AccountAgeYears - (SELECT AVG(AccountAgeYears) FROM UserReputationTiers)) AS AccountAgeVsAvg,
+    -- Dynamic status based on complex NULL logic and date calculations, categorizing users as
+    -- 'Potentially Inactive' if their last activity (across multiple types) exceeds 90 days.
+    CASE
+        WHEN GREATEST(
+            EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - COALESCE(urt.LastAccessDate, '1970-01-01'::timestamp))) / (60*60*24),
+            EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - COALESCE(upa.LastPostActivityDate, '1970-01-01'::timestamp))) / (60*60*24),
+            EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - COALESCE(ueama.LastHistoryEventDate, '1970-01-01'::timestamp))) / (60*60*24),
+            EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - COALESCE(ubcs.LastCommentDate, '1970-01-01'::timestamp))) / (60*60*24)
+        ) > 90 THEN 'Potentially Inactive'
+        ELSE 'Currently Active'
+    END AS ActivityStatus
+FROM UserReputationTiers urt
+LEFT JOIN UserPostAggregates upa ON urt.UserId = upa.UserId
+LEFT JOIN UserAcceptedAnswerPerformance uaap ON urt.UserId = uaap.UserId
+LEFT JOIN UserEditAndModerationActivity ueama ON urt.UserId = ueama.UserId
+LEFT JOIN UserBadgeAndCommentSummary ubcs ON urt.UserId = ubcs.UserId
+CROSS JOIN OverallAverages oa
+LEFT JOIN TopTagsAggregated tta ON urt.UserId = tta.UserId
+WHERE urt.UserId IN (SELECT UserId FROM FinalCandidateUsers) -- Filters results to include only users from the final refined set.
+  AND (COALESCE(upa.TotalPostsAuthored, 0) > 0 OR COALESCE(ubcs.TotalCommentsMade, 0) > 0 OR COALESCE(ueama.TotalEditsMade, 0) > 0)
+  AND urt.Reputation >= 1000
+  -- Complex predicate with NULL logic: Users must meet at least one of several criteria
+  -- for accepted answer performance, badge acquisition, or moderation activity.
+  AND (
+        COALESCE(uaap.AvgScoreOnAcceptedAnswersGiven, 0) >= 15
+        OR COALESCE(ubcs.GoldBadges, 0) >= 1
+        OR COALESCE(ueama.PostsVotedToClose, 0) + COALESCE(ueama.PostsVotedToReopen, 0) >= 5
+      )
+ORDER BY OverallContentContributionRank ASC, ModerationActivityRank ASC, AvgScorePerYear DESC
+LIMIT 200;

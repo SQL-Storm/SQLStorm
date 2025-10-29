@@ -1,0 +1,142 @@
+WITH UserBadgePoints AS (
+    SELECT u.Id AS UserId,
+           SUM(CASE b.Class
+                   WHEN 1 THEN 100
+                   WHEN 2 THEN 50
+                   WHEN 3 THEN 10
+                   ELSE 0
+               END) AS BadgePoints,
+           COUNT(*) FILTER (WHERE b.TagBased = TRUE) AS TagBadgeCount
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id
+),
+UserTagStats AS (
+    SELECT u.Id AS UserId,
+           t.TagName,
+           COUNT(p.Id) AS QuestionsAsked,
+           SUM(p.Score) AS TotalQuestionScore,
+           AVG(p.ViewCount) AS AvgViews,
+           ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY SUM(p.Score) DESC) AS TagRank
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id
+                AND p.PostTypeId = 1
+    CROSS JOIN LATERAL (
+        SELECT regexp_replace(tag, '[<>]', '', 'g') AS tag
+        FROM regexp_split_to_table(p.Tags, '><') AS tag
+    ) AS t(TagName)
+    GROUP BY u.Id, t.TagName
+),
+LatestComment AS (
+    SELECT c.PostId,
+           c.Id AS CommentId,
+           c.CreationDate,
+           LENGTH(c.Text) AS CommentLength,
+           ROW_NUMBER() OVER (PARTITION BY c.PostId ORDER BY c.CreationDate DESC) AS rn
+    FROM Comments c
+),
+PostScoreStats AS (
+    SELECT p.Id AS PostId,
+           p.Title,
+           p.Score,
+           p.ViewCount,
+           COALESCE(p.FavoriteCount, 0) AS FavCount,
+           CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+           EXISTS (
+               SELECT 1
+               FROM Votes v
+               WHERE v.PostId = p.Id
+                 AND v.VoteTypeId = 2
+                 AND v.UserId = p.OwnerUserId
+           ) AS OwnerUpvotedOwnPost,
+           (
+               SELECT MAX(l.CreationDate)
+               FROM PostLinks l
+               WHERE l.PostId = p.Id
+           ) AS LastLinkDate,
+           p.OwnerUserId
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+Combined AS (
+    SELECT u.Id AS UserId,
+           u.DisplayName,
+           ub.BadgePoints,
+           ub.TagBadgeCount,
+           uts.TagName,
+           uts.QuestionsAsked,
+           uts.TotalQuestionScore,
+           uts.AvgViews,
+           uts.TagRank,
+           pss.Title,
+           pss.Score,
+           pss.ViewCount,
+           pss.FavCount,
+           pss.IsClosed,
+           COALESCE(lc.CommentLength, 0) AS LatestCommentLength,
+           pss.OwnerUpvotedOwnPost,
+           pss.LastLinkDate,
+           pss.PostId,
+           u.Reputation,
+           pss.OwnerUserId
+    FROM Users u
+    LEFT JOIN UserBadgePoints ub ON ub.UserId = u.Id
+    LEFT JOIN UserTagStats uts ON uts.UserId = u.Id AND uts.TagRank = 1
+    LEFT JOIN PostScoreStats pss ON pss.OwnerUserId = u.Id
+    LEFT JOIN LatestComment lc ON lc.PostId = pss.PostId AND lc.rn = 1
+    WHERE (u.Reputation > 10000 OR ub.BadgePoints > 200)
+      AND (pss.Score IS NULL OR pss.Score > 5)
+    GROUP BY u.Id, u.DisplayName, ub.BadgePoints, ub.TagBadgeCount, uts.TagName, uts.QuestionsAsked, uts.TotalQuestionScore, uts.AvgViews, uts.TagRank, pss.Title, pss.Score, pss.ViewCount, pss.FavCount, pss.IsClosed, lc.CommentLength, pss.OwnerUpvotedOwnPost, pss.LastLinkDate, pss.PostId, u.Reputation, pss.OwnerUserId
+)
+SELECT c.UserId,
+       c.DisplayName,
+       c.BadgePoints,
+       c.TagBadgeCount,
+       c.TagName,
+       c.QuestionsAsked,
+       c.TotalQuestionScore,
+       c.AvgViews,
+       c.TagRank,
+       c.Title,
+       c.Score,
+       c.ViewCount,
+       c.FavCount,
+       c.IsClosed,
+       c.LatestCommentLength,
+       c.OwnerUpvotedOwnPost,
+       c.LastLinkDate,
+       c.PostId,
+       c.Reputation,
+       c.OwnerUserId
+FROM Combined c
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM Votes v
+    WHERE v.PostId = c.PostId
+      AND v.VoteTypeId = 12
+)
+UNION ALL
+SELECT u.Id AS UserId,
+       u.DisplayName,
+       COALESCE(ub.BadgePoints, 0) AS BadgePoints,
+       COALESCE(ub.TagBadgeCount, 0) AS TagBadgeCount,
+       NULL AS TagName,
+       0 AS QuestionsAsked,
+       0 AS TotalQuestionScore,
+       0.0 AS AvgViews,
+       NULL AS TagRank,
+       NULL AS Title,
+       NULL AS Score,
+       NULL AS ViewCount,
+       NULL AS FavCount,
+       NULL AS IsClosed,
+       NULL AS LatestCommentLength,
+       NULL AS OwnerUpvotedOwnPost,
+       NULL AS LastLinkDate,
+       NULL AS PostId,
+       u.Reputation,
+       NULL AS OwnerUserId
+FROM Users u
+LEFT JOIN UserBadgePoints ub ON ub.UserId = u.Id
+WHERE COALESCE(ub.BadgePoints, 0) = 0
+ORDER BY UserId, TagRank NULLS LAST;

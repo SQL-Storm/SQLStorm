@@ -1,0 +1,187 @@
+-- {"query": "3923.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1996} 
+WITH
+    -- Basic user metrics
+    user_stats AS (
+        SELECT
+            u.Id,
+            u.DisplayName,
+            u.Reputation,
+            u.CreationDate,
+            u.LastAccessDate,
+            u.Views,
+            u.UpVotes,
+            u.DownVotes,
+            COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+            COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+            COUNT(b.Id) AS BadgeCount,
+            SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadgeCount,
+            SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadgeCount,
+            SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadgeCount,
+            COALESCE(SUM(v.Score), 0) AS TotalPostScore
+        FROM Users u
+        LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+        LEFT JOIN Badges b ON b.UserId = u.Id
+        LEFT JOIN (
+            SELECT
+                p.OwnerUserId,
+                SUM(p.Score) AS Score
+            FROM Posts p
+            WHERE p.PostTypeId IN (1,2)   -- questions & answers
+            GROUP BY p.OwnerUserId
+        ) v ON v.OwnerUserId = u.Id
+        GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate,
+                 u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes
+    ),
+    -- Recent activity (last 30 days)
+    recent_activity AS (
+        SELECT
+            u.Id,
+            MAX(p.CreationDate) FILTER (WHERE p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '30 days') AS LastQuestionDate,
+            MAX(a.CreationDate) FILTER (WHERE a.CreationDate >= cast('2024-10-01' as date) - INTERVAL '30 days') AS LastAnswerDate,
+            MAX(c.CreationDate) FILTER (WHERE c.CreationDate >= cast('2024-10-01' as date) - INTERVAL '30 days') AS LastCommentDate
+        FROM Users u
+        LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+        LEFT JOIN Posts a ON a.OwnerUserId = u.Id AND a.PostTypeId = 2
+        LEFT JOIN Comments c ON c.UserId = u.Id
+        GROUP BY u.Id
+    ),
+    -- Correlated subquery: avg score of this user's answers compared to site avg
+    answer_score_cmp AS (
+        SELECT
+            u.Id,
+            AVG(a.Score) AS AvgAnswerScore,
+            (SELECT AVG(p2.Score) FROM Posts p2 WHERE p2.PostTypeId = 2) AS SiteAvgAnswerScore,
+            CASE
+                WHEN AVG(a.Score) > (SELECT AVG(p2.Score) FROM Posts p2 WHERE p2.PostTypeId = 2) THEN 'Above'
+                WHEN AVG(a.Score) < (SELECT AVG(p2.Score) FROM Posts p2 WHERE p2.PostTypeId = 2) THEN 'Below'
+                ELSE 'Equal'
+            END AS ScoreRelativeToSite
+        FROM Users u
+        LEFT JOIN Posts a ON a.OwnerUserId = u.Id AND a.PostTypeId = 2
+        WHERE a.Id IS NOT NULL
+        GROUP BY u.Id
+    ),
+    -- Tag participation (top 3 tags per user)
+    user_tags AS (
+        SELECT
+            p.OwnerUserId AS UserId,
+            UNNEST(string_to_array(REPLACE(REPLACE(p.Tags, '<', ''), '>', ''), ' ')) AS Tag,
+            ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY COUNT(*) DESC) AS rn,
+            COUNT(*) AS TagUsage
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+          AND p.Tags IS NOT NULL
+        GROUP BY p.OwnerUserId, Tag
+    ),
+    top_user_tags AS (
+        SELECT
+            ut.UserId,
+            STRING_AGG(ut.Tag, ', ') FILTER (WHERE ut.rn <= 3) AS TopTags
+        FROM user_tags ut
+        GROUP BY ut.UserId
+    ),
+    -- Users with no posts but badges
+    badge_only_users AS (
+        SELECT
+            u.Id,
+            u.DisplayName,
+            u.Reputation,
+            0 AS QuestionCount,
+            0 AS AnswerCount,
+            COUNT(b.Id) AS BadgeCount
+        FROM Users u
+        LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+        JOIN Badges b ON b.UserId = u.Id
+        WHERE p.Id IS NULL
+        GROUP BY u.Id, u.DisplayName, u.Reputation
+    ),
+    -- Combine all user records (including badge‑only)
+    combined_users AS (
+        SELECT
+            us.Id,
+            us.DisplayName,
+            us.Reputation,
+            us.CreationDate,
+            us.LastAccessDate,
+            us.Views,
+            us.UpVotes,
+            us.DownVotes,
+            us.QuestionCount,
+            us.AnswerCount,
+            us.BadgeCount,
+            us.GoldBadgeCount,
+            us.SilverBadgeCount,
+            us.BronzeBadgeCount,
+            us.TotalPostScore,
+            ra.LastQuestionDate,
+            ra.LastAnswerDate,
+            ra.LastCommentDate,
+            asc.AvgAnswerScore,
+            asc.SiteAvgAnswerScore,
+            asc.ScoreRelativeToSite,
+            tu.TopTags
+        FROM user_stats us
+        LEFT JOIN recent_activity ra ON ra.Id = us.Id
+        LEFT JOIN answer_score_cmp asc ON asc.Id = us.Id
+        LEFT JOIN top_user_tags tu ON tu.UserId = us.Id
+
+        UNION ALL
+
+        SELECT
+            bou.Id,
+            bou.DisplayName,
+            bou.Reputation,
+            NULL AS CreationDate,
+            NULL AS LastAccessDate,
+            NULL AS Views,
+            NULL AS UpVotes,
+            NULL AS DownVotes,
+            bou.QuestionCount,
+            bou.AnswerCount,
+            bou.BadgeCount,
+            0 AS GoldBadgeCount,
+            0 AS SilverBadgeCount,
+            0 AS BronzeBadgeCount,
+            0 AS TotalPostScore,
+            NULL AS LastQuestionDate,
+            NULL AS LastAnswerDate,
+            NULL AS LastCommentDate,
+            NULL AS AvgAnswerScore,
+            NULL AS SiteAvgAnswerScore,
+            NULL AS ScoreRelativeToSite,
+            NULL AS TopTags
+        FROM badge_only_users bou
+    )
+SELECT
+    cu.Id,
+    COALESCE(cu.DisplayName, '(deleted)') AS DisplayName,
+    cu.Reputation,
+    cu.QuestionCount,
+    cu.AnswerCount,
+    cu.BadgeCount,
+    cu.GoldBadgeCount,
+    cu.SilverBadgeCount,
+    cu.BronzeBadgeCount,
+    cu.TotalPostScore,
+    COALESCE(cu.LastQuestionDate, cu.LastAnswerDate, cu.LastCommentDate) AS LastActivityDate,
+    ROUND(COALESCE(cu.AvgAnswerScore,0),2) AS AvgAnswerScore,
+    ROUND(COALESCE(cu.SiteAvgAnswerScore,0),2) AS SiteAvgAnswerScore,
+    cu.ScoreRelativeToSite,
+    cu.TopTags,
+    CASE
+        WHEN cu.Reputation >= 20000 THEN 'Legendary'
+        WHEN cu.Reputation >= 10000 THEN 'Elite'
+        WHEN cu.Reputation >= 5000  THEN 'Pro'
+        WHEN cu.Reputation >= 1000  THEN 'Experienced'
+        ELSE 'Newbie'
+    END AS ReputationTier,
+    CASE
+        WHEN cu.QuestionCount + cu.AnswerCount = 0 THEN NULL
+        ELSE ROUND(100.0 * cu.AnswerCount / NULLIF(cu.QuestionCount + cu.AnswerCount,0),2)
+    END AS AnswerContributionPct,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = cu.Id AND p.PostTypeId = 1 AND p.CreationDate > cast('2024-10-01' as date) - INTERVAL '7 days') AS WeeklyQuestions,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = cu.Id AND p.PostTypeId = 2 AND p.CreationDate > cast('2024-10-01' as date) - INTERVAL '7 days') AS WeeklyAnswers
+FROM combined_users cu
+WHERE cu.Reputation IS NOT NULL
+ORDER BY cu.Reputation DESC
+LIMIT 100;

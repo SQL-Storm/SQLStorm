@@ -1,0 +1,205 @@
+-- {"query": "1118.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3004} 
+WITH AcceptedAnswersByUser AS (
+    -- CTE 1: Calculates the total number of accepted answers for each user.
+    -- This requires joining questions (q) with answers (a) and checking if the answer was accepted.
+    SELECT
+        a.OwnerUserId AS UserId,
+        COUNT(a.Id) AS TotalAnswersAccepted
+    FROM Posts q
+    JOIN Posts a ON q.AcceptedAnswerId = a.Id
+    WHERE a.PostTypeId = 2 -- Ensure 'a' is indeed an answer post type
+    GROUP BY a.OwnerUserId
+),
+UserContributionSummary AS (
+    -- CTE 2: Consolidates various direct contributions by users (posts, comments, edits, votes).
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.UpVotes AS UserUpVotesGiven, -- Upvotes cast by this user
+        u.DownVotes AS UserDownVotesGiven, -- Downvotes cast by this user
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS QuestionsWithAcceptedAnswer,
+        COALESCE(aab.TotalAnswersAccepted, 0) AS AnswersAccepted, -- From AcceptedAnswersByUser CTE
+        SUM(p.Score) AS TotalPostScore,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END) AS TotalQuestionViews,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        SUM(c.Score) AS TotalCommentScore,
+        COUNT(DISTINCT ph.Id) AS TotalHistoryEntries,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN 1 ELSE 0 END) AS TotalEditsMade, -- Edit Title, Body, Tags
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS TotalPostsClosed, -- Post Closed history type
+        SUM(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS TotalPostsReopened, -- Post Reopened history type
+        COUNT(DISTINCT v.Id) AS TotalVotesCast, -- Total unique votes (up/down/etc.) cast by this user
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesCast,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesCast
+    FROM
+        Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN AcceptedAnswersByUser aab ON u.Id = aab.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.UpVotes, u.DownVotes, aab.TotalAnswersAccepted
+),
+PostTagAnalysis AS (
+    -- CTE 3: Extracts individual tags from question posts and provides post-level metrics, including sequence for LAG.
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount AS PostViewCount,
+        p.AnswerCount AS PostAnswerCount,
+        p.LastActivityDate AS PostLastActivityDate,
+        p.LastEditDate AS PostLastEditDate,
+        p.ClosedDate AS PostClosedDate,
+        COALESCE(p.FavoriteCount, 0) AS PostFavoriteCount,
+        t.TagName AS PrimaryTag, -- Unnested tag name
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserPostSeqNum,
+        LAG(p.CreationDate, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevPostDate
+    FROM
+        Posts p
+    LEFT JOIN LATERAL UNNEST(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS t(TagName) ON TRUE
+    WHERE
+        p.PostTypeId = 1 -- Only questions are relevant for tags in this context
+),
+TagPerformanceMetrics AS (
+    -- CTE 4: Aggregates performance metrics for each tag based on questions.
+    SELECT
+        pta.PrimaryTag,
+        COUNT(DISTINCT pta.PostId) AS QuestionsInTag,
+        AVG(pta.PostScore) AS AvgTagPostScore,
+        AVG(pta.PostViewCount) AS AvgTagPostViewCount,
+        SUM(CASE WHEN pta.PostClosedDate IS NOT NULL THEN 1 ELSE 0 END) AS TagClosedQuestions,
+        NTILE(100) OVER (ORDER BY AVG(pta.PostScore) DESC, COUNT(DISTINCT pta.PostId) DESC) AS TagScorePercentile
+    FROM
+        PostTagAnalysis pta
+    GROUP BY
+        pta.PrimaryTag
+),
+UserPostTagActivity AS (
+    -- CTE 5: Combines user contribution summaries with insights from their tagged posts and tag performance.
+    SELECT
+        ucs.UserId,
+        ucs.DisplayName,
+        ucs.Reputation,
+        ucs.UserCreationDate,
+        ucs.TotalPosts,
+        ucs.TotalQuestions,
+        ucs.TotalAnswers,
+        ucs.AnswersAccepted,
+        ucs.TotalPostScore,
+        ucs.TotalQuestionViews,
+        ucs.TotalComments,
+        ucs.TotalEditsMade,
+        ucs.TotalPostsClosed,
+        ucs.TotalPostsReopened,
+        ucs.TotalUpVotesCast,
+        ucs.TotalDownVotesCast,
+        COUNT(DISTINCT pta.PrimaryTag) AS DistinctTagsContributed,
+        SUM(CASE WHEN tpm.TagScorePercentile <= 10 THEN 1 ELSE 0 END) AS ContributionsToTop10PercentileTags, -- Posts by user in high-scoring tags
+        AVG(pta.PostScore) AS AvgPostScoreByUser,
+        MAX(EXTRACT(EPOCH FROM (pta.PostLastActivityDate - pta.PostCreationDate)) / 3600 / 24) AS MaxPostLifeDays, -- Max days a user's question was active
+        MIN(EXTRACT(EPOCH FROM (pta.PostCreationDate - pta.PrevPostDate)) / 3600 / 24) AS MinDaysBetweenPosts -- Quickest consecutive posting frequency
+    FROM
+        UserContributionSummary ucs
+    LEFT JOIN PostTagAnalysis pta ON ucs.UserId = pta.OwnerUserId
+    LEFT JOIN TagPerformanceMetrics tpm ON pta.PrimaryTag = tpm.PrimaryTag
+    GROUP BY
+        ucs.UserId, ucs.DisplayName, ucs.Reputation, ucs.UserCreationDate, ucs.TotalPosts, ucs.TotalQuestions,
+        ucs.TotalAnswers, ucs.AnswersAccepted, ucs.TotalPostScore, ucs.TotalQuestionViews, ucs.TotalComments,
+        ucs.TotalEditsMade, ucs.TotalPostsClosed, ucs.TotalPostsReopened, ucs.TotalUpVotesCast, ucs.TotalDownVotesCast
+),
+DetailedUserMetrics AS (
+    -- CTE 6: Applies further complex calculations, window functions, and a correlated subquery.
+    SELECT
+        upta.*,
+        (CAST(upta.AnswersAccepted AS NUMERIC) / NULLIF(upta.TotalAnswers, 0)) AS AnswerAcceptanceRate,
+        (CAST(upta.TotalQuestions AS NUMERIC) / NULLIF(upta.TotalPosts, 0)) AS QuestionPostRatio,
+        AGE(cast('2024-10-01 12:34:56' as timestamp), upta.UserCreationDate) AS UserAge, -- Calculate user account age
+        -- A composite score for user influence based on weighted metrics
+        (
+            (upta.Reputation * 0.1) +
+            (COALESCE(upta.TotalPostScore, 0) * 0.05) +
+            (COALESCE(upta.TotalQuestionViews, 0) * 0.001) +
+            (COALESCE(upta.TotalEditsMade, 0) * 0.5) +
+            (COALESCE(upta.ContributionsToTop10PercentileTags, 0) * 1) +
+            (COALESCE(upta.AnswersAccepted, 0) * 2)
+        ) AS UserInfluenceScore,
+        RANK() OVER (ORDER BY upta.Reputation DESC, upta.TotalPostScore DESC) AS ReputationRank,
+        DENSE_RANK() OVER (ORDER BY upta.TotalQuestions DESC) AS QuestionerRank,
+        NTILE(5) OVER (ORDER BY upta.TotalAnswers DESC) AS AnswererQuintile,
+        AVG(upta.AvgPostScoreByUser) OVER (PARTITION BY DATE_TRUNC('month', upta.UserCreationDate)) AS AvgMonthlyCohortPostScore,
+        -- Correlated subquery to check if the user has a Gold badge (Class = 1)
+        EXISTS (
+            SELECT 1 FROM Badges b WHERE b.UserId = upta.UserId AND b.Class = 1
+        ) AS HasGoldBadge,
+        NULLIF(upta.TotalPostsClosed, 0) AS PostsClosedByMeOrNull -- Demonstrates NULLIF
+    FROM
+        UserPostTagActivity upta
+    WHERE
+        -- Filter out very inactive users from the detailed analysis
+        upta.TotalPosts > 0 OR upta.TotalComments > 0 OR upta.TotalEditsMade > 0
+)
+-- Final SELECT statement: Joins detailed user metrics with post links, applies filters, and orders results.
+SELECT
+    dum.UserId,
+    dum.DisplayName,
+    dum.Reputation,
+    dum.UserCreationDate,
+    dum.UserAge,
+    dum.TotalPosts,
+    dum.TotalQuestions,
+    dum.TotalAnswers,
+    dum.AnswersAccepted,
+    dum.AnswerAcceptanceRate,
+    dum.QuestionPostRatio,
+    dum.TotalPostScore,
+    dum.TotalQuestionViews,
+    dum.TotalComments,
+    dum.TotalEditsMade,
+    dum.TotalPostsClosed,
+    dum.TotalPostsReopened,
+    dum.TotalUpVotesCast,
+    dum.TotalDownVotesCast,
+    dum.DistinctTagsContributed,
+    dum.ContributionsToTop10PercentileTags,
+    dum.AvgPostScoreByUser,
+    dum.MaxPostLifeDays,
+    dum.MinDaysBetweenPosts,
+    dum.UserInfluenceScore,
+    dum.ReputationRank,
+    dum.QuestionerRank,
+    dum.AnswererQuintile,
+    dum.AvgMonthlyCohortPostScore,
+    dum.HasGoldBadge,
+    dum.PostsClosedByMeOrNull,
+    -- String aggregation to list linked posts associated with the user's own posts
+    COALESCE(STRING_AGG(pl.LinkTypeId::varchar || ':' || pl.RelatedPostId::varchar ||
+                        ' (Post ID: ' || user_posts.Id::varchar || ')',
+                        '; ' ORDER BY pl.CreationDate DESC), 'No Related Posts') AS LinkedPostInfo
+FROM
+    DetailedUserMetrics dum
+LEFT JOIN Posts user_posts ON dum.UserId = user_posts.OwnerUserId
+LEFT JOIN PostLinks pl ON user_posts.Id = pl.PostId
+WHERE
+    dum.Reputation > 1000 -- Filter for higher reputation users
+    AND dum.TotalQuestions > 5 -- Users who have asked a reasonable number of questions
+    -- Correlated subquery in WHERE clause: UserInfluenceScore must be above average for users with more than 10 posts
+    AND dum.UserInfluenceScore > (SELECT AVG(UserInfluenceScore) FROM DetailedUserMetrics WHERE TotalPosts > 10)
+    AND dum.DisplayName IS NOT NULL -- Exclude users with no display name
+GROUP BY
+    dum.UserId, dum.DisplayName, dum.Reputation, dum.UserCreationDate, dum.UserAge, dum.TotalPosts,
+    dum.TotalQuestions, dum.TotalAnswers, dum.AnswersAccepted, dum.AnswerAcceptanceRate, dum.QuestionPostRatio,
+    dum.TotalPostScore, dum.TotalQuestionViews, dum.TotalComments, dum.TotalEditsMade, dum.TotalPostsClosed,
+    dum.TotalPostsReopened, dum.TotalUpVotesCast, dum.TotalDownVotesCast, dum.DistinctTagsContributed,
+    dum.ContributionsToTop10PercentileTags, dum.AvgPostScoreByUser, dum.MaxPostLifeDays, dum.MinDaysBetweenPosts,
+    dum.UserInfluenceScore, dum.ReputationRank, dum.QuestionerRank, dum.AnswererQuintile, dum.AvgMonthlyCohortPostScore,
+    dum.HasGoldBadge, dum.PostsClosedByMeOrNull
+ORDER BY
+    dum.UserInfluenceScore DESC, dum.Reputation DESC
+LIMIT 100;

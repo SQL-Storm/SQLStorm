@@ -1,0 +1,88 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.Title,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.LastActivityDate,
+        P.OwnerUserId,
+        U.DisplayName,
+        U.Reputation,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.ViewCount DESC) AS Rank,
+        P.Tags
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId IN (1, 2) AND P.Score > 0
+),
+BadgeCounts AS (
+    SELECT 
+        U.Id AS UserId,
+        COUNT(DISTINCT B.Id) AS BadgeCount
+    FROM 
+        Users U
+    LEFT JOIN 
+        Badges B ON U.Id = B.UserId
+    GROUP BY 
+        U.Id
+),
+PostTags AS (
+    SELECT
+        RP.Id AS PostId,
+        T.Id AS TagId,
+        T.TagName
+    FROM RankedPosts RP
+    JOIN Tags T
+      ON RP.Tags IS NOT NULL
+     AND (
+          RP.Tags = CAST(T.Id AS VARCHAR)
+          OR RP.Tags LIKE CAST(T.Id AS VARCHAR) || ',%'
+          OR RP.Tags LIKE '%,' || CAST(T.Id AS VARCHAR) || ',%'
+          OR RP.Tags LIKE '%,' || CAST(T.Id AS VARCHAR)
+     )
+),
+TagCounts AS (
+    SELECT
+        PT.PostId,
+        PT.TagName,
+        COUNT(*) AS TagCount
+    FROM PostTags PT
+    GROUP BY PT.PostId, PT.TagName
+)
+SELECT 
+    RP.Id,
+    RP.Title,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.LastActivityDate,
+    RP.Rank,
+    RP.OwnerUserId,
+    U.DisplayName,
+    U.Reputation,
+    COALESCE(BC.BadgeCount, 0) AS BadgeCount,
+    CASE 
+        WHEN RP.Rank <= 3 THEN 'Top'
+        WHEN RP.Rank <= 10 THEN 'High'
+        ELSE 'Low'
+    END AS RankStatus,
+    STRING_AGG(TC.TagName, ', ' ORDER BY TC.TagCount DESC, TC.TagName) AS TopTags
+FROM 
+    RankedPosts RP
+LEFT JOIN 
+    Users U ON RP.OwnerUserId = U.Id
+LEFT JOIN 
+    PostHistory PH ON RP.Id = PH.PostId AND PH.PostHistoryTypeId = 10
+LEFT JOIN 
+    BadgeCounts BC ON RP.OwnerUserId = BC.UserId
+LEFT JOIN 
+    TagCounts TC ON RP.Id = TC.PostId
+WHERE 
+    RP.Rank <= 10 AND PH.RevisionGUID IS NOT NULL
+GROUP BY 
+    RP.Id, RP.Title, RP.Score, RP.ViewCount, RP.CreationDate, RP.LastActivityDate, RP.Rank, RP.OwnerUserId, U.DisplayName, U.Reputation, BC.BadgeCount, RP.Tags
+ORDER BY 
+    RP.Rank ASC;

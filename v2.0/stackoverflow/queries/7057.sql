@@ -1,0 +1,265 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        AVG(p.Score) as AvgScore,
+        MAX(p.CreationDate) as LatestPostDate,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        STRING_AGG(DISTINCT b.Name, ', ') as BadgeNames,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) * 100.0 / NULLIF(COUNT(DISTINCT p.Id), 0) as QuestionPercentage
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes
+),
+TopQuestions AS (
+    SELECT 
+        p.Id as QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        STRING_AGG(t.TagName, ', ') as Tags,
+        ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.ViewCount DESC) as RankByScore,
+        DENSE_RANK() OVER (ORDER BY p.CreationDate DESC) as RecentRank,
+        PERCENT_RANK() OVER (ORDER BY p.Score) as ScorePercentile
+    FROM Posts p
+    INNER JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT Id, UNNEST(STRING_TO_ARRAY(Tags, '<')) as TagName
+        FROM Posts
+        WHERE PostTypeId = 1 AND Tags IS NOT NULL
+    ) t ON p.Id = t.Id
+    WHERE p.PostTypeId = 1 AND p.Score > 50
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.CreationDate, p.OwnerUserId, u.DisplayName
+),
+RecentActivity AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.PostTypeId,
+        p.Score,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.OwnerUserId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as PostTypeDesc,
+        EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate)) / 86400.0 as DaysSinceCreation,
+        CASE 
+            WHEN EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate)) / 86400.0 > 30 THEN 'Old'
+            WHEN EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate)) / 86400.0 > 7 THEN 'Medium'
+            ELSE 'Recent'
+        END as ActivityLevel,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate DESC) as RecentActivityRank
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserPerformance AS (
+    SELECT 
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.QuestionCount,
+        us.AnswerCount,
+        us.PostCount,
+        us.AvgScore,
+        us.QuestionPercentage,
+        us.BadgeCount,
+        CASE 
+            WHEN us.QuestionCount > 100 THEN 'Expert'
+            WHEN us.QuestionCount > 50 THEN 'Advanced'
+            WHEN us.QuestionCount > 10 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as ExperienceLevel,
+        CASE 
+            WHEN us.Reputation > 100000 THEN 'Master'
+            WHEN us.Reputation > 10000 THEN 'Expert'
+            WHEN us.Reputation > 1000 THEN 'Advanced'
+            ELSE 'Novice'
+        END as ReputationLevel,
+        RANK() OVER (ORDER BY us.Reputation DESC) as ReputationRank,
+        DENSE_RANK() OVER (ORDER BY us.QuestionCount DESC) as QuestionRank,
+        LAG(us.Reputation, 1) OVER (ORDER BY us.Reputation DESC) as PreviousReputation,
+        LEAD(us.Reputation, 1) OVER (ORDER BY us.Reputation DESC) as NextReputation
+    FROM UserStats us
+),
+ComplexAnalytics AS (
+    SELECT 
+        up.UserId,
+        up.DisplayName,
+        up.Reputation,
+        up.QuestionCount,
+        up.AnswerCount,
+        up.PostCount,
+        up.AvgScore,
+        up.QuestionPercentage,
+        up.BadgeCount,
+        up.ExperienceLevel,
+        up.ReputationLevel,
+        up.ReputationRank,
+        up.QuestionRank,
+        up.PreviousReputation,
+        up.NextReputation,
+        (CASE WHEN up.QuestionCount > 0 THEN up.Reputation / up.QuestionCount ELSE 0 END) as ReputationPerQuestion,
+        (CASE WHEN up.AnswerCount > 0 THEN up.Reputation / up.AnswerCount ELSE 0 END) as ReputationPerAnswer,
+        COALESCE(
+            (SELECT AVG(p.Score) 
+             FROM Posts p 
+             WHERE p.OwnerUserId = up.UserId AND p.PostTypeId = 1), 0
+        ) as UserAvgQuestionScore,
+        COALESCE(
+            (SELECT AVG(p.Score) 
+             FROM Posts p 
+             WHERE p.OwnerUserId = up.UserId AND p.PostTypeId = 2), 0
+        ) as UserAvgAnswerScore,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionsWithAnswers,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswersWithVotes
+    FROM UserPerformance up
+    LEFT JOIN Posts p ON up.UserId = p.OwnerUserId
+    WHERE up.Reputation > 1000
+    GROUP BY 
+        up.UserId, up.DisplayName, up.Reputation, up.QuestionCount, up.AnswerCount, 
+        up.PostCount, up.AvgScore, up.QuestionPercentage, up.BadgeCount, 
+        up.ExperienceLevel, up.ReputationLevel, up.ReputationRank, up.QuestionRank, 
+        up.PreviousReputation, up.NextReputation
+)
+SELECT 
+    ca.UserId,
+    ca.DisplayName,
+    ca.Reputation,
+    ca.QuestionCount,
+    ca.AnswerCount,
+    ca.PostCount,
+    ca.AvgScore,
+    ca.QuestionPercentage,
+    ca.BadgeCount,
+    ca.ExperienceLevel,
+    ca.ReputationLevel,
+    ca.ReputationRank,
+    ca.QuestionRank,
+    ca.ReputationPerQuestion,
+    ca.ReputationPerAnswer,
+    ca.UserAvgQuestionScore,
+    ca.UserAvgAnswerScore,
+    CASE 
+        WHEN ca.QuestionCount > 0 AND ca.AnswerCount > 0 THEN 
+            (ca.QuestionCount * 100.0 / NULLIF(ca.QuestionCount + ca.AnswerCount, 0))
+        ELSE 0 
+    END as QuestionAnswerRatio,
+    CASE 
+        WHEN ca.Reputation > 10000 THEN 
+            (SELECT COUNT(*) FROM ComplexAnalytics WHERE Reputation > ca.Reputation)
+        ELSE NULL 
+    END as ReputationRankAbove,
+    CASE 
+        WHEN ca.Reputation > 10000 AND ca.QuestionCount > 5 THEN 
+            (SELECT MAX(Reputation) FROM ComplexAnalytics WHERE QuestionCount > ca.QuestionCount)
+        ELSE NULL 
+    END as HighestReputationSameQuestionCount,
+    CASE 
+        WHEN ca.QuestionCount > 5 AND ca.Reputation > 1000 THEN 
+            (SELECT MAX(Reputation) FROM ComplexAnalytics WHERE QuestionCount <= ca.QuestionCount AND Reputation > ca.Reputation)
+        ELSE NULL 
+    END as ReputationIncreasePotential,
+    COALESCE(
+        (SELECT STRING_AGG(DISTINCT t.TagName, ', ')
+         FROM Posts p
+         JOIN (
+             SELECT Id, UNNEST(STRING_TO_ARRAY(Tags, '<')) as TagName
+             FROM Posts
+             WHERE PostTypeId = 1 AND Tags IS NOT NULL
+         ) t ON p.Id = t.Id
+         WHERE p.OwnerUserId = ca.UserId AND p.Score > 10
+        ), 'No popular tags'
+    ) as PopularTagList,
+    CASE 
+        WHEN ca.PostCount > 100 AND ca.Reputation > 50000 THEN 'High Volume'
+        WHEN ca.PostCount > 50 AND ca.Reputation > 25000 THEN 'Medium Volume'
+        ELSE 'Low Volume'
+    END as ActivityVolume,
+    CASE 
+        WHEN tq.ScorePercentile IS NOT NULL AND tq.ScorePercentile > 0.9 THEN 'Top 10%'
+        WHEN tq.ScorePercentile IS NOT NULL AND tq.ScorePercentile > 0.75 THEN 'Top 25%'
+        WHEN tq.ScorePercentile IS NOT NULL AND tq.ScorePercentile > 0.5 THEN 'Top 50%'
+        ELSE 'Below Median'
+    END as PerformanceBucket,
+    CASE 
+        WHEN ca.BadgeCount > 0 AND (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = ca.UserId AND p.Score > 50) > 0 THEN
+            (SELECT COUNT(DISTINCT b.Name) FROM Badges b WHERE b.UserId = ca.UserId AND b.Name IN ('Great Answer', 'Great Question'))
+        ELSE 0
+    END as FeaturedBadges,
+    COUNT(*) OVER() as TotalUsers,
+    ROW_NUMBER() OVER (ORDER BY ca.Reputation DESC, ca.QuestionCount DESC) as OverallRank,
+    CONCAT(
+        'User ', ca.UserId, ' (', ca.DisplayName, ') - Rep: ', ca.Reputation, 
+        ', Q:', ca.QuestionCount, ', A:', ca.AnswerCount, ' (' , ca.ExperienceLevel, '/', ca.ReputationLevel, ')'
+    ) as UserSummary,
+    CASE 
+        WHEN ca.ReputationRank <= 10 THEN 'Top 10 Users'
+        WHEN ca.ReputationRank <= 50 THEN 'Top 50 Users'
+        WHEN ca.ReputationRank <= 100 THEN 'Top 100 Users'
+        ELSE 'Regular Users'
+    END as UserTier,
+    CASE 
+        WHEN ca.Reputation > 100000 THEN 'Elite'
+        WHEN ca.Reputation > 50000 THEN 'Veteran'
+        WHEN ca.Reputation > 10000 THEN 'Experienced'
+        ELSE 'Regular'
+    END as ReputationTier,
+    (ca.Reputation - COALESCE(ca.PreviousReputation, 0)) as ReputationChange,
+    (SELECT COUNT(*) FROM RecentActivity ra WHERE ra.OwnerUserId = ca.UserId AND ra.RecentActivityRank <= 5) as RecentActivityCount,
+    (ca.QuestionCount + ca.AnswerCount) * 100.0 / NULLIF(
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = ca.UserId AND p.PostTypeId IN (1,2)), 0
+    ) as ActivityPercentage,
+    CASE 
+        WHEN ca.QuestionCount > 0 AND ca.AnswerCount > 0 AND ca.AvgScore > 30 THEN 'Highly Engaged'
+        WHEN ca.QuestionCount > 0 AND ca.AnswerCount > 0 THEN 'Moderately Engaged'
+        ELSE 'Low Engagement'
+    END as EngagementLevel,
+    NULLIF(
+        (ca.QuestionCount + ca.AnswerCount) / NULLIF((ca.Reputation / 1000.0) * 0.5, 0), 
+        0
+    ) as PostEfficiencyRatio,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = ca.UserId AND p.Score > 100) as HighScorePosts
+FROM ComplexAnalytics ca
+INNER JOIN (
+    SELECT UserId, COUNT(*) as CommentCount
+    FROM Comments
+    WHERE CreationDate > DATE '2020-01-01'
+    GROUP BY UserId
+    HAVING COUNT(*) > 10
+) cm ON cm.UserId = ca.UserId
+LEFT JOIN LATERAL (
+    SELECT MAX(tq.ScorePercentile) as ScorePercentile
+    FROM TopQuestions tq
+    WHERE tq.OwnerUserId = ca.UserId
+) tq ON TRUE
+WHERE ca.Reputation > 5000
+  AND (ca.QuestionCount > 5 OR ca.AnswerCount > 10)
+  AND ca.ReputationRank <= 100
+  AND EXISTS (
+    SELECT 1 FROM Posts p 
+    WHERE p.OwnerUserId = ca.UserId 
+    AND p.LastActivityDate > DATE '2022-01-01'
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM Users u 
+    WHERE u.Id = ca.UserId AND u.DisplayName IS NULL
+  )
+ORDER BY ca.Reputation DESC, ca.QuestionCount DESC
+LIMIT 50;

@@ -1,0 +1,131 @@
+-- {"query": "3129.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1451} 
+
+/*  Performance‑intensive benchmark query on the StackOverflow schema  */
+WITH
+/* 1️⃣  Users with their aggregate post statistics */
+user_post_stats AS (
+    SELECT
+        u.Id                                   AS user_id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id)                             AS total_posts,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END)   AS total_answers,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END)   AS total_questions,
+        SUM(COALESCE(p.Score,0))                AS sum_score,
+        COALESCE(SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 END),0) AS close_votes_received
+    FROM Users u
+    LEFT JOIN Posts p      ON p.OwnerUserId = u.Id
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+/* 2️⃣  Badge aggregates per user, distinguishing tag‑based badges */
+user_badge_stats AS (
+    SELECT
+        b.UserId                                    AS user_id,
+        COUNT(*)                                    AS total_badges,
+        COUNT(CASE WHEN b.TagBased = 1 THEN 1 END)  AS tag_badges,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END)     AS gold_badges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END)     AS silver_badges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END)     AS bronze_badges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+/* 3️⃣  Most frequent tags in a user's questions (top 3) */
+user_top_tags AS (
+    SELECT
+        q.OwnerUserId                                 AS user_id,
+        tag,
+        ROW_NUMBER() OVER (PARTITION BY q.OwnerUserId ORDER BY tag_cnt DESC) AS rn
+    FROM (
+        SELECT
+            p.OwnerUserId,
+            UNNEST(string_to_array(TRIM(both '<>' FROM p.Tags), '><')) AS tag,
+            COUNT(*) AS tag_cnt
+        FROM Posts p
+        WHERE p.PostTypeId = 1                         -- only questions
+        GROUP BY p.OwnerUserId, tag
+    ) q
+),
+
+/* 4️⃣  Latest activity per user (most recent post or comment) */
+user_latest_activity AS (
+    SELECT
+        uid,
+        MAX(activity_dt) AS last_activity
+    FROM (
+        SELECT
+            p.OwnerUserId AS uid,
+            p.LastActivityDate AS activity_dt
+        FROM Posts p
+        WHERE p.OwnerUserId IS NOT NULL
+
+        UNION ALL
+
+        SELECT
+            c.UserId AS uid,
+            c.CreationDate AS activity_dt
+        FROM Comments c
+        WHERE c.UserId IS NOT NULL
+    ) a
+    GROUP BY uid
+),
+
+/* 5️⃣  Users with zero posts (to force outer‑join processing) */
+users_without_posts AS (
+    SELECT u.Id AS user_id
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    WHERE p.Id IS NULL
+)
+
+-- Final result set combining all the pieces
+SELECT
+    up.user_id,
+    up.DisplayName,
+    up.Reputation,
+    up.total_posts,
+    up.total_answers,
+    up.total_questions,
+    up.sum_score,
+    up.close_votes_received,
+    COALESCE(ub.total_badges,0)          AS total_badges,
+    COALESCE(ub.tag_badges,0)            AS tag_badges,
+    COALESCE(ub.gold_badges,0)           AS gold_badges,
+    COALESCE(ub.silver_badges,0)         AS silver_badges,
+    COALESCE(ub.bronze_badges,0)         AS bronze_badges,
+    /* concatenate top‑3 tags, handling NULLs */
+    COALESCE(
+        STRING_AGG(ut.tag, ', ') FILTER (WHERE ut.rn <= 3),
+        'N/A'
+    )                                    AS top_3_tags,
+    ula.last_activity,
+    CASE
+        WHEN up.total_posts = 0 THEN 'Never posted'
+        ELSE 'Active'
+    END                                 AS posting_status,
+    /* derived metric: acceptance ratio, safe‑guard against division by zero */
+    CASE
+        WHEN up.total_answers = 0 THEN NULL
+        ELSE ROUND(
+            (SELECT COUNT(*)::numeric
+             FROM Posts a
+             WHERE a.PostTypeId = 2
+               AND a.OwnerUserId = up.user_id
+               AND a.Id IN (SELECT AcceptedAnswerId FROM Posts q WHERE q.AcceptedAnswerId = a.Id)
+            ) / up.total_answers, 3)
+    END                                 AS answer_acceptance_ratio
+FROM user_post_stats up
+LEFT JOIN user_badge_stats ub      ON ub.user_id = up.user_id
+LEFT JOIN user_top_tags ut        ON ut.user_id = up.user_id
+LEFT JOIN user_latest_activity ula ON ula.uid = up.user_id
+WHERE up.user_id NOT IN (SELECT user_id FROM users_without_posts)   -- exclude zero‑post users
+GROUP BY
+    up.user_id, up.DisplayName, up.Reputation, up.total_posts,
+    up.total_answers, up.total_questions, up.sum_score,
+    up.close_votes_received, ub.total_badges, ub.tag_badges,
+    ub.gold_badges, ub.silver_badges, ub.bronze_badges,
+    ula.last_activity, up.total_answers
+ORDER BY up.Reputation DESC
+LIMIT 100;

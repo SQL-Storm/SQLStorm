@@ -1,0 +1,147 @@
+-- {"query": "2886.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1244} 
+with RecursiveTagPosts as (
+    select 
+        t.Id as TagId,
+        t.TagName,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags
+    from Tags t
+    join Posts p on p.Tags like '%'||t.TagName||'%'
+    where p.PostTypeId = 1
+    union all
+    select
+        r.TagId,
+        r.TagName,
+        a.Id as PostId,
+        a.PostTypeId,
+        a.Score,
+        a.ViewCount,
+        a.CreationDate,
+        a.OwnerUserId,
+        a.Title,
+        a.Tags
+    from RecursiveTagPosts r
+    join Posts a on a.ParentId = r.PostId and a.PostTypeId = 2
+),
+UserBadgeCounts as (
+    select
+        u.Id as UserId,
+        count(distinct b.Id) as BadgeCount,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id
+),
+LatestEdits as (
+    select distinct on (ph.PostId)
+        ph.PostId,
+        ph.CreationDate as EditDate,
+        ph.UserId as EditorUserId,
+        ph.UserDisplayName as EditorName,
+        ph.Comment as EditComment,
+        ph.PostHistoryTypeId
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (4,5,6,10,11) -- edits of title, body, tags, closure open/close
+    order by ph.PostId, ph.CreationDate desc
+),
+ActiveUsersRanked as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.Location,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Views,
+        ub.BadgeCount,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        row_number() over (order by u.Reputation desc nulls last, ub.GoldBadges desc nulls last) as RankByRep,
+        dense_rank() over (partition by u.Location order by u.Reputation desc) as LocationRepRank
+    from Users u
+    left join UserBadgeCounts ub on ub.UserId = u.Id
+    where u.Reputation > 1000 and u.LastAccessDate > now() - interval '90 days'
+),
+TopScoredPosts as (
+    select
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        coalesce(u.DisplayName, p.OwnerDisplayName, 'unknown') as OwnerName,
+        p.CreationDate,
+        array_to_string(array(
+            select unnest(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')) order by 1
+        ), ', ') as ParsedTags,
+        case 
+            when p.ClosedDate is not null then 'Closed'
+            when p.AcceptedAnswerId is not null then 'Accepted'
+            else 'Open'
+        end as PostStatus
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId = 1 and p.Score > 50
+),
+CloseReasonsCount as (
+    select 
+        crt.Name as CloseReason,
+        count(*) as TimesClosed
+    from PostHistory ph
+    left join CloseReasonTypes crt on cast(ph.Comment as int) = crt.Id
+    where ph.PostHistoryTypeId = 10
+    group by crt.Name
+),
+DuplicatesWithAnswers as (
+    select
+        pl.PostId as DuplicateId,
+        pl.RelatedPostId as OriginalId,
+        po.Title as OriginalTitle,
+        count(a.Id) filter (where a.PostTypeId = 2) as OriginalAnswerCount,
+        avg(a.Score) filter (where a.PostTypeId = 2) as OriginalAvgAnswerScore
+    from PostLinks pl
+    join Posts po on po.Id = pl.RelatedPostId and po.PostTypeId = 1
+    left join Posts a on a.ParentId = po.Id and a.PostTypeId = 2
+    where pl.LinkTypeId = 3
+    group by pl.PostId, pl.RelatedPostId, po.Title
+)
+select 
+    ts.Id as QuestionId,
+    ts.Title,
+    ts.Score,
+    ts.ViewCount,
+    ts.OwnerUserId,
+    ts.OwnerName,
+    ts.CreationDate,
+    ts.ParsedTags,
+    ts.PostStatus,
+    cu.RankByRep as OwnerReputationRank,
+    cu.GoldBadges,
+    cu.SilverBadges,
+    cu.BronzeBadges,
+    le.EditDate as LastEditDate,
+    le.EditorName as LastEditor,
+    cr.TimesClosed,
+    dup.OriginalTitle as DuplicateOf,
+    dup.OriginalAnswerCount,
+    dup.OriginalAvgAnswerScore
+from TopScoredPosts ts
+left join ActiveUsersRanked cu on cu.Id = ts.OwnerUserId
+left join LatestEdits le on le.PostId = ts.Id
+left join CloseReasonsCount cr on true
+left join DuplicatesWithAnswers dup on dup.DuplicateId = ts.Id
+where exists (
+    select 1 from RecursiveTagPosts rtp 
+    where rtp.PostId = ts.Id and rtp.Score > 10 and rtp.TagName in ('sql', 'performance', 'query')
+)
+order by ts.Score desc nulls last, ts.ViewCount desc nulls last
+limit 100;

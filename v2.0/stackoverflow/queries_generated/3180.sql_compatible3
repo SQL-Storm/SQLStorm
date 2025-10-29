@@ -1,0 +1,157 @@
+WITH
+    user_stats AS (
+        SELECT
+            u.Id                                 AS user_id,
+            u.DisplayName,
+            u.Reputation,
+            COALESCE(SUM(CASE
+                WHEN v.VoteTypeId = 2 THEN 1
+                WHEN v.VoteTypeId = 3 THEN -1
+                ELSE 0
+            END), 0)                              AS net_vote_score,
+            COUNT(DISTINCT b.Id)                  AS badge_count,
+            MAX(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS has_gold_badge,
+            ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS reputation_rank
+        FROM Users u
+        LEFT JOIN Votes v   ON v.UserId   = u.Id
+        LEFT JOIN Badges b  ON b.UserId   = u.Id
+        GROUP BY u.Id, u.DisplayName, u.Reputation
+    ),
+
+    question_details AS (
+        SELECT
+            p.Id                                 AS question_id,
+            p.Title,
+            p.CreationDate,
+            p.Score,
+            p.ViewCount,
+            p.OwnerUserId,
+            p.Tags,
+            (SELECT COUNT(*) FROM Posts a
+                WHERE a.ParentId = p.Id AND a.PostTypeId = 2) AS answer_count,
+            (SELECT COUNT(*) FROM Comments c
+                WHERE c.PostId = p.Id)               AS comment_count,
+            ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId
+                               ORDER BY p.Score DESC) AS owner_question_rank,
+            ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.ViewCount DESC) AS global_question_rank
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+        GROUP BY p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.OwnerUserId, p.Tags
+    ),
+
+    tag_stats AS (
+        SELECT
+            t.TagName,
+            COUNT(p.Id)                                        AS question_using_tag,
+            SUM(p.Score)                                       AS total_score,
+            -- approximate median using array aggregation then picking middle index in a SQL-standard way:
+            (
+              (
+               ( -- aggregate into an array-like ordered set using STRING_AGG as a fallback and then pick middle value by splitting;
+                 -- this is a portable approximation when ARRAY_AGG with ordering isn't available
+                 SELECT CAST(SPLIT_PART(ordered_scores, ',', (CEIL(CAST((ARRAY_LENGTH(scores_arr) AS DOUBLE PRECISION)) / 2.0))::INT) AS NUMERIC)
+                 FROM (
+                   SELECT
+                     STRING_AGG(CAST(s AS VARCHAR), ',' ORDER BY CAST(s AS NUMERIC)) AS ordered_scores,
+                     STRING_TO_ARRAY(STRING_AGG(CAST(s AS VARCHAR), ',' ORDER BY CAST(s AS NUMERIC)), ',') AS scores_arr
+                   FROM (
+                     SELECT p.Score AS s
+                     FROM Posts p2
+                     WHERE p2.PostTypeId = 1
+                       AND p2.Tags LIKE '%' || t.TagName || '%'
+                   ) sub1
+                 ) sub2
+               )
+              )
+            ) AS median_score,
+            ROW_NUMBER() OVER (ORDER BY COUNT(p.Id) DESC)      AS tag_popularity_rank
+        FROM Tags t
+        JOIN Posts p
+          ON p.Tags LIKE '%' || t.TagName || '%'
+         AND p.PostTypeId = 1
+        GROUP BY t.TagName
+    ),
+
+    top_tag_per_question AS (
+        SELECT
+            q.question_id,
+            tt.tagname
+        FROM question_details q
+        LEFT JOIN LATERAL (
+            SELECT
+                t.TagName AS tagname,
+                ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS rn
+            FROM (
+                -- split tags into rows in a dialect-agnostic way using a recursive CTE
+                SELECT TRIM(value) AS tag
+                FROM (
+                  SELECT q.Tags AS tags_string
+                ) qs,
+                UNNEST(STRING_TO_ARRAY(REPLACE(REPLACE(REPLACE(qs.tags_string, '<', ''), '>', ','), '><', ','), ',')) AS value
+            ) split
+            JOIN Tags t ON t.TagName = split.tag
+            ORDER BY t.Count DESC
+            LIMIT 1
+        ) tt ON true
+    )
+
+SELECT
+    q.question_id,
+    q.Title,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    q.answer_count,
+    q.comment_count,
+    u.DisplayName,
+    u.Reputation,
+    u.net_vote_score,
+    u.badge_count,
+    u.has_gold_badge,
+    t.tagname                           AS top_tag,
+    ts.question_using_tag,
+    ts.total_score,
+    ts.median_score,
+    CASE
+        WHEN q.Score IS NULL       THEN 'NoScore'
+        WHEN q.Score < 0           THEN 'Negative'
+        ELSE 'Positive'
+    END                                 AS score_sign,
+    COALESCE(NULLIF(q.answer_count,0), -1) AS answer_count_or_minus_one,
+    q.global_question_rank
+FROM question_details q
+LEFT JOIN user_stats u        ON u.user_id = q.OwnerUserId
+LEFT JOIN top_tag_per_question t ON t.question_id = q.question_id
+LEFT JOIN tag_stats ts        ON ts.TagName = t.tagname
+WHERE q.owner_question_rank <= 3
+
+UNION ALL
+
+SELECT
+    p.Id                                 AS question_id,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    NULL                                 AS answer_count,
+    NULL                                 AS comment_count,
+    NULL                                 AS DisplayName,
+    NULL                                 AS Reputation,
+    NULL                                 AS net_vote_score,
+    NULL                                 AS badge_count,
+    NULL                                 AS has_gold_badge,
+    NULL                                 AS top_tag,
+    NULL                                 AS question_using_tag,
+    NULL                                 AS total_score,
+    NULL                                 AS median_score,
+    'Unanswered'                         AS score_sign,
+    NULL                                 AS answer_count_or_minus_one,
+    ROW_NUMBER() OVER (ORDER BY p.ViewCount DESC) AS global_question_rank
+FROM Posts p
+WHERE p.PostTypeId = 1
+  AND NOT EXISTS (SELECT 1 FROM Posts a WHERE a.ParentId = p.Id AND a.PostTypeId = 2)
+  AND p.Score > 0
+  AND p.CreationDate > (CAST('2024-10-01' AS DATE) - INTERVAL '30' DAY)
+
+ORDER BY global_question_rank
+LIMIT 100;

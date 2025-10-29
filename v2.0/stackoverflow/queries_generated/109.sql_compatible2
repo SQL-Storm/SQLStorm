@@ -1,0 +1,318 @@
+with recent_users as (
+    select u.id as user_id,
+           u.displayname,
+           u.reputation,
+           u.creationdate,
+           u.location,
+           date_trunc('month', u.creationdate) as cohort_month,
+           row_number() over (order by u.reputation desc, u.id) as rn_global
+    from users u
+    where u.creationdate >= (select coalesce(max(creationdate), cast('1900-01-01' as timestamp)) - interval '365 days' from users)
+),
+posts_enriched as (
+    select p.id,
+           p.posttypeid,
+           p.owneruserid,
+           p.parentid,
+           p.acceptedanswerid,
+           p.creationdate,
+           p.score,
+           p.viewcount,
+           p.answercount,
+           p.commentcount,
+           p.favoritecount,
+           p.closeddate,
+           p.title,
+           p.tags,
+           coalesce(nullif(trim(p.ownerdisplayname), ''), u.displayname, '[unknown]') as owner_name,
+           case when p.closeddate is not null then 1 else 0 end as is_closed,
+           case when p.posttypeid = 1 then 1 when p.posttypeid = 2 then 0 else null end as is_question
+    from posts p
+    left join users u on u.id = p.owneruserid
+    where p.creationdate >= (select coalesce(max(creationdate), cast('1900-01-01' as timestamp)) - interval '365 days' from posts)
+),
+question_metrics as (
+    select q.id as question_id,
+           q.owneruserid as asker_id,
+           q.creationdate as question_date,
+           q.score as question_score,
+           q.viewcount,
+           q.tags,
+           q.title,
+           q.acceptedanswerid,
+           q.is_closed,
+           q.owner_name as asker_name,
+           (select min(a.creationdate) - q.creationdate
+            from posts a
+            where a.parentid = q.id
+              and a.posttypeid = 2) as time_to_first_answer,
+           (select count(*) from posts a where a.parentid = q.id and a.posttypeid = 2) as answers_count,
+           (select count(distinct c.userid) from comments c where c.postid = q.id) as distinct_commenters,
+           (select count(*) from votes v where v.postid = q.id and v.votetypeid in (5)) as legacy_favorites,
+           exists (
+             select 1
+             from posthistory ph
+             where ph.postid = q.id
+               and ph.posthistorytypeid in (2,5,8)
+               and ph.text like '%<code>%'
+           ) as has_code_blocks
+    from posts_enriched q
+    where q.posttypeid = 1
+),
+answer_metrics as (
+    select a.id as answer_id,
+           a.parentid as question_id,
+           a.owneruserid as answerer_id,
+           a.creationdate as answer_date,
+           a.score as answer_score,
+           a.owner_name as answerer_name,
+           case when a.id = q.acceptedanswerid then 1 else 0 end as is_accepted,
+           u.reputation as answerer_reputation,
+           (select count(*) from comments c where c.postid = a.id) as answer_comment_count
+    from posts_enriched a
+    join posts_enriched q on q.id = a.parentid and q.posttypeid = 1
+    left join users u on u.id = a.owneruserid
+    where a.posttypeid = 2
+),
+tag_exploded as (
+    select q.question_id,
+           unnest(string_to_array(substring(q.tags, 2, greatest(length(q.tags)-2,0)), '><')) as tag
+    from question_metrics q
+    where q.tags is not null and q.tags like '<%>'
+),
+user_activity as (
+    select u.id as user_id,
+           count(*) filter (where p.posttypeid = 1) as questions_last_year,
+           count(*) filter (where p.posttypeid = 2) as answers_last_year,
+           sum(greatest(p.score,0)) as nonneg_post_score,
+           sum(coalesce(badge_weight,0)) as badge_score,
+           count(distinct date_trunc('day', p.creationdate)) as active_days
+    from users u
+    left join posts p on p.owneruserid = u.id
+                      and p.creationdate >= (select coalesce(max(creationdate), cast('1900-01-01' as timestamp)) - interval '365 days' from posts)
+    left join (
+        select b.userid, case b.class when 1 then 5 when 2 then 2 when 3 then 1 else 0 end as badge_weight
+        from badges b
+        where b.date >= (select coalesce(max(date), cast('1900-01-01' as timestamp)) - interval '365 days' from badges)
+    ) bw on bw.userid = u.id
+    group by u.id
+),
+duplicates_detail as (
+    select pl.postid as dup_id,
+           pl.relatedpostid as original_id,
+           pl.creationdate as link_date,
+           lt.name as link_type_name
+    from postlinks pl
+    join linktypes lt on lt.id = pl.linktypeid
+    where pl.linktypeid = 3
+),
+close_events as (
+    select ph.postid,
+           ph.creationdate as closed_at,
+           cast(nullif(regexp_replace(ph.comment, '[^0-9]', '', 'g'), '') as integer) as close_reason_id,
+           cr.name as close_reason_name
+    from posthistory ph
+    left join closereasontypes cr on cr.id = cast(nullif(regexp_replace(ph.comment, '[^0-9]', '', 'g'), '') as integer)
+    where ph.posthistorytypeid = 10
+),
+votes_agg as (
+    select v.postid,
+           sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end) as vote_delta,
+           count(*) filter (where v.votetypeid = 8) as bounties_started,
+           sum(coalesce(v.bountyamount,0)) filter (where v.votetypeid in (8,9)) as bounty_amount
+    from votes v
+    group by v.postid
+),
+cohorts as (
+    select ru.user_id,
+           ru.cohort_month,
+           count(p.id) filter (where p.posttypeid = 1) as cohort_questions,
+           count(p.id) filter (where p.posttypeid = 2) as cohort_answers,
+           avg(nullif(p.score,0)) as avg_nonzero_score,
+           percentile_cont(0.5) within group (order by p.score) as median_score
+    from recent_users ru
+    left join posts p on p.owneruserid = ru.user_id
+    group by ru.user_id, ru.cohort_month
+),
+question_rankings as (
+    select q.question_id,
+           q.asker_id,
+           q.question_score + coalesce(v.vote_delta,0) + coalesce(am.accepted_bonus,0) as composite_score,
+           rank() over (partition by date_trunc('month', q.question_date) order by (q.question_score + coalesce(v.vote_delta,0) + coalesce(am.accepted_bonus,0)) desc, q.viewcount desc, q.question_id) as rank_in_month,
+           dense_rank() over (order by q.viewcount desc) as global_view_rank
+    from question_metrics q
+    left join votes_agg v on v.postid = q.question_id
+    left join (
+        select question_id, max(case when is_accepted = 1 then 15 else 0 end) as accepted_bonus
+        from answer_metrics
+        group by question_id
+    ) am on am.question_id = q.question_id
+),
+user_rollups as (
+    select q.asker_id as user_id,
+           count(*) as questions_count,
+           avg(extract(epoch from coalesce(q.time_to_first_answer, interval '0'))/3600.0) as avg_hours_to_first_answer,
+           sum(case when q.is_closed = 1 then 1 else 0 end) as closed_questions,
+           sum(q.question_score) as total_question_score,
+           sum(coalesce(v.vote_delta,0)) as total_vote_delta,
+           sum(case when q.acceptedanswerid is not null then 1 else 0 end) as accepted_count,
+           sum(case when q.has_code_blocks then 1 else 0 end) as with_code_blocks
+    from question_metrics q
+    left join votes_agg v on v.postid = q.question_id
+    group by q.asker_id
+),
+stringy as (
+    select q.question_id,
+           lower(coalesce(q.title,'')) as title_lower,
+           -- replace overlay(coalesce(q.title,'') placing '[REDACTED]' from 1 for 0)
+           -- with concatenation that inserts '[REDACTED]' at position 1 (before the original string)
+           '[REDACTED]' || coalesce(q.title,'') as title_overlay,
+           regexp_replace(coalesce(q.title,''), '\s+', ' ', 'g') as title_normalized,
+           md5(coalesce(q.title,'')) as title_hash
+    from question_metrics q
+),
+accepted_stats as (
+    select a.answerer_id as user_id,
+           count(*) filter (where a.is_accepted = 1) as accepted_answers,
+           avg(a.answer_score) as avg_answer_score,
+           max(a.answer_score) as max_answer_score
+    from answer_metrics a
+    group by a.answerer_id
+),
+final_users as (
+    select u.id as user_id,
+           u.displayname,
+           u.reputation,
+           coalesce(ua.questions_last_year,0) as questions_last_year,
+           coalesce(ua.answers_last_year,0) as answers_last_year,
+           coalesce(ua.badge_score,0) as badge_score,
+           coalesce(ua.nonneg_post_score,0) as nonneg_post_score,
+           coalesce(ua.active_days,0) as active_days,
+           coalesce(us.questions_count,0) as questions_total,
+           coalesce(us.total_question_score,0) as question_score_total,
+           coalesce(us.total_vote_delta,0) as vote_delta_total,
+           coalesce(us.closed_questions,0) as closed_questions_total,
+           coalesce(us.accepted_count,0) as questions_with_accepted_answer,
+           coalesce(acs.accepted_answers,0) as accepted_answers_given,
+           coalesce(acs.avg_answer_score,0) as avg_answer_score_given,
+           coalesce(acs.max_answer_score,0) as max_answer_score_given
+    from users u
+    left join user_activity ua on ua.user_id = u.id
+    left join user_rollups us on us.user_id = u.id
+    left join accepted_stats acs on acs.user_id = u.id
+),
+month_calendar as (
+    select generate_series(
+        date_trunc('month', (select min(creationdate) from posts)),
+        date_trunc('month', (select max(creationdate) from posts)),
+        interval '1 month'
+    ) as gen_ts,
+    cast(generate_series(
+        date_trunc('month', (select min(creationdate) from posts)),
+        date_trunc('month', (select max(creationdate) from posts)),
+        interval '1 month'
+    ) as date) as month_start
+),
+monthly_posting as (
+    select cast(date_trunc('month', p.creationdate) as date) as month_start,
+           sum(case when p.posttypeid = 1 then 1 else 0 end) as questions,
+           sum(case when p.posttypeid = 2 then 1 else 0 end) as answers,
+           sum(case when p.posttypeid = 1 and p.closeddate is not null then 1 else 0 end) as closed_questions
+    from posts p
+    group by cast(date_trunc('month', p.creationdate) as date)
+),
+calendar_join as (
+    select mc.month_start,
+           coalesce(mp.questions,0) as questions,
+           coalesce(mp.answers,0) as answers,
+           coalesce(mp.closed_questions,0) as closed_questions,
+           sum(coalesce(mp.questions,0)) over (order by mc.month_start rows between unbounded preceding and current row) as cum_questions,
+           sum(coalesce(mp.answers,0)) over (order by mc.month_start rows between unbounded preceding and current row) as cum_answers
+    from month_calendar mc
+    left join monthly_posting mp on mp.month_start = mc.month_start
+),
+complex_predicate_questions as (
+    select q.question_id
+    from question_metrics q
+    left join question_rankings qr on qr.question_id = q.question_id
+    left join close_events ce on ce.postid = q.question_id
+    where
+        (q.viewcount > 1000 or (q.question_score >= 5 and q.answers_count >= 2))
+        and not (q.is_closed = 1 and coalesce(ce.close_reason_name,'') ilike '%duplicate%')
+        and (q.time_to_first_answer is null or extract(epoch from q.time_to_first_answer) <= 72*3600)
+        and (
+            q.tags is null
+            or exists (
+                select 1
+                from tag_exploded te
+                where te.question_id = q.question_id
+                  and te.tag not ilike '%fun%'
+                  and char_length(te.tag) between 2 and 30
+            )
+        )
+        and coalesce(qr.rank_in_month, 999999) <= 1000
+)
+select
+    fu.user_id,
+    fu.displayname,
+    fu.reputation,
+    fu.questions_last_year,
+    fu.answers_last_year,
+    fu.badge_score,
+    fu.nonneg_post_score,
+    fu.active_days,
+    fu.questions_total,
+    fu.question_score_total,
+    fu.vote_delta_total,
+    fu.closed_questions_total,
+    fu.questions_with_accepted_answer,
+    fu.accepted_answers_given,
+    fu.avg_answer_score_given,
+    fu.max_answer_score_given,
+    coalesce(c.cohort_month, date_trunc('month', u.creationdate))::date as cohort_month,
+    coalesce(c.cohort_questions,0) as cohort_questions,
+    coalesce(c.cohort_answers,0) as cohort_answers,
+    coalesce(c.avg_nonzero_score,0) as cohort_avg_nonzero_score,
+    coalesce(c.median_score,0) as cohort_median_score,
+    cq.count as featured_questions_matching_complex_predicate,
+    cq.first_question_id,
+    cq.any_title_hash,
+    cal.month_start as sample_month,
+    cal.questions as month_questions,
+    cal.answers as month_answers,
+    cal.closed_questions as month_closed_questions,
+    cal.cum_questions,
+    cal.cum_answers
+from final_users fu
+left join users u on u.id = fu.user_id
+left join cohorts c on c.user_id = fu.user_id and c.cohort_month = date_trunc('month', u.creationdate)
+left join lateral (
+    select count(*) as count,
+           min(qm.question_id) as first_question_id,
+           max(s.title_hash) as any_title_hash
+    from question_metrics qm
+    left join stringy s on s.question_id = qm.question_id
+    where qm.asker_id = fu.user_id
+      and qm.question_id in (select question_id from complex_predicate_questions)
+) cq on true
+left join lateral (
+    select cal.month_start,
+           cal.questions,
+           cal.answers,
+           cal.closed_questions,
+           cal.cum_questions,
+           cal.cum_answers
+    from calendar_join cal
+    where cal.month_start >= date_trunc('month', u.creationdate)
+    order by cal.month_start
+    limit 1
+) cal on true
+where
+    (fu.questions_last_year + fu.answers_last_year) > 0
+    or fu.badge_score > 0
+order by
+    fu.reputation desc,
+    fu.questions_last_year desc,
+    fu.answers_last_year desc,
+    fu.user_id
+limit 500;

@@ -1,0 +1,201 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Elite'
+            WHEN u.Reputation >= 1000 THEN 'Expert'
+            WHEN u.Reputation >= 100 THEN 'Novice'
+            ELSE 'Beginner'
+        END AS ReputationLevel,
+        COALESCE(SUM(p.Score), 0) AS TotalScore,
+        COALESCE(SUM(p.ViewCount), 0) AS TotalViews,
+        ROUND( CAST(SUM(p.Score) AS NUMERIC) / NULLIF(COUNT(p.Id), 0), 2) AS AvgPostScore,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2), ', ') AS AllTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        p.PostTypeId,
+        p.AnswerCount,
+        p.CommentCount,
+        u.DisplayName AS OwnerName,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS ScoreRank,
+        DENSE_RANK() OVER (ORDER BY p.ViewCount DESC) AS ViewRank,
+        NTILE(4) OVER (ORDER BY p.Score DESC) AS ScoreQuartile,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Accepted'
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NULL THEN 'Unanswered'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostStatus
+    FROM Posts p
+    INNER JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.Score IS NOT NULL AND p.CreationDate >= TIMESTAMP '2020-01-01'
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            WHEN t.Count > 10 THEN 'Niche'
+            ELSE 'Rare'
+        END AS TagPopularity,
+        t.IsRequired,
+        t.IsModeratorOnly,
+        (SELECT COUNT(*) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%') AS RelatedPostCount
+    FROM Tags t
+    WHERE t.TagName IS NOT NULL
+),
+PerformanceMetrics AS (
+    SELECT 
+        'Overall' AS MetricType,
+        COUNT(*) AS TotalUsers,
+        COUNT(DISTINCT u.Id) AS DistinctUsers,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT p.OwnerUserId) AS ActivePosterCount,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        ROUND(AVG(u.Reputation)::numeric, 2) AS AvgReputation,
+        ROUND(AVG(p.Score)::numeric, 2) AS AvgPostScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    UNION ALL
+    SELECT 
+        'HighScoreUsers' AS MetricType,
+        COUNT(*) AS TotalUsers,
+        COUNT(DISTINCT u.Id) AS DistinctUsers,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT p.OwnerUserId) AS ActivePosterCount,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        ROUND(AVG(u.Reputation)::numeric, 2) AS AvgReputation,
+        ROUND(AVG(p.Score)::numeric, 2) AS AvgPostScore
+    FROM Users u
+    INNER JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    WHERE u.Reputation >= 10000
+),
+UserTags AS (
+    -- normalize AllTags into one tag per row to avoid non-inner join on subquery in some engines
+    SELECT us.UserId, TRIM(tag) AS TagName
+    FROM UserStats us,
+         UNNEST(STRING_TO_ARRAY(us.AllTags, ', ')) AS t(tag)
+    WHERE us.AllTags IS NOT NULL
+)
+SELECT 
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.ReputationLevel,
+    us.PostCount,
+    us.CommentCount,
+    us.BadgeCount,
+    us.TotalScore,
+    us.TotalViews,
+    us.AvgPostScore,
+    us.LastPostDate,
+    tp.ScoreRank,
+    tp.ViewRank,
+    tp.ScoreQuartile,
+    tp.PostStatus,
+    tp.Title AS TopPostTitle,
+    tp.Score AS TopPostScore,
+    tp.ViewCount AS TopPostViews,
+    ta.TagName,
+    ta.TagCount,
+    ta.TagPopularity,
+    pm.MetricType,
+    pm.TotalUsers,
+    pm.DistinctUsers,
+    pm.TotalPosts,
+    pm.ActivePosterCount,
+    pm.TotalComments,
+    pm.AvgReputation,
+    pm.AvgPostScore,
+    CASE 
+        WHEN us.PostCount > 0 AND us.Reputation > 0 THEN 
+            ROUND( CAST(us.PostCount AS NUMERIC) * 100.0 / NULLIF(CAST(us.Reputation AS NUMERIC), 0), 2)
+        ELSE 0 
+    END AS PostsPerReputation,
+    COALESCE(SUBSTRING(us.AllTags FROM 1 FOR 100), 'No tags') AS SampleTags,
+    CASE 
+        WHEN us.PostCount > 10 AND us.BadgeCount > 5 THEN 'Active Contributor'
+        WHEN us.PostCount > 5 AND us.BadgeCount > 2 THEN 'Regular Contributor'
+        WHEN us.PostCount > 0 THEN 'Occasional Poster'
+        ELSE 'Inactive'
+    END AS ContributionLevel,
+    RANK() OVER (ORDER BY us.TotalScore DESC) AS OverallScoreRank,
+    DENSE_RANK() OVER (ORDER BY us.Reputation DESC) AS ReputationRank,
+    FLOOR(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - us.LastPostDate)) / 86400) AS DaysSinceLastPost,
+    CASE 
+        WHEN FLOOR(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - us.LastPostDate)) / 86400) > 365 THEN 'Inactive for over a year'
+        WHEN FLOOR(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - us.LastPostDate)) / 86400) > 180 THEN 'Inactive for 6+ months'
+        WHEN FLOOR(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - us.LastPostDate)) / 86400) > 90 THEN 'Inactive for 3+ months'
+        WHEN FLOOR(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - us.LastPostDate)) / 86400) > 30 THEN 'Inactive for month'
+        ELSE 'Active'
+    END AS ActivityStatus
+FROM UserStats us
+LEFT JOIN TopPosts tp ON us.UserId = tp.OwnerUserId AND tp.ScoreRank <= 5
+LEFT JOIN UserTags ut ON ut.UserId = us.UserId
+LEFT JOIN TagAnalysis ta ON ta.TagName = ut.TagName
+JOIN PerformanceMetrics pm ON pm.MetricType = 'Overall'
+WHERE us.UserId IS NOT NULL
+    AND (tp.PostId IS NOT NULL OR ta.TagName IS NOT NULL OR pm.MetricType IS NOT NULL)
+    AND (us.Reputation >= 100 OR us.PostCount >= 1 OR us.CommentCount >= 1)
+GROUP BY
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.ReputationLevel,
+    us.PostCount,
+    us.CommentCount,
+    us.BadgeCount,
+    us.TotalScore,
+    us.TotalViews,
+    us.AvgPostScore,
+    us.LastPostDate,
+    tp.ScoreRank,
+    tp.ViewRank,
+    tp.ScoreQuartile,
+    tp.PostStatus,
+    tp.Title,
+    tp.Score,
+    tp.ViewCount,
+    ta.TagName,
+    ta.TagCount,
+    ta.TagPopularity,
+    pm.MetricType,
+    pm.TotalUsers,
+    pm.DistinctUsers,
+    pm.TotalPosts,
+    pm.ActivePosterCount,
+    pm.TotalComments,
+    pm.AvgReputation,
+    pm.AvgPostScore,
+    us.AllTags
+ORDER BY us.TotalScore DESC, us.Reputation DESC
+LIMIT 10000;

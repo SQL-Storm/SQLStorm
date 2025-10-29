@@ -1,0 +1,214 @@
+-- {"query": "1585.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3030} 
+WITH UserEngagementSummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS UserUpVotesGiven,
+        U.DownVotes AS UserDownVotesGiven,
+        U.Location,
+        U.AboutMe,
+        -- Calculate user's activity duration in days
+        EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - U.CreationDate)) / (60 * 60 * 24) AS UserLifetimeDays,
+        -- Correlated subquery to check if user has any closed questions in the last 180 days
+        EXISTS (
+            SELECT 1
+            FROM Posts P_sub
+            WHERE P_sub.OwnerUserId = U.Id
+              AND P_sub.PostTypeId = 1
+              AND P_sub.ClosedDate IS NOT NULL
+              AND P_sub.ClosedDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '180 days'
+        ) AS HasRecentClosedQuestion,
+        -- Calculate a reputation growth rate per day, avoiding division by zero
+        NULLIF(U.Reputation, 0) / NULLIF(EXTRACT(DAY FROM (cast('2024-10-01 12:34:56' as timestamp) - U.CreationDate)) + 1, 0) AS RepPerDay
+    FROM Users U
+    WHERE U.Reputation > 750 AND U.LastAccessDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '2 years'
+),
+PostComprehensiveStats AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.Title,
+        P.Body,
+        P.Tags,
+        P.CreationDate AS PostCreationDate,
+        P.LastEditDate,
+        P.LastActivityDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount AS PostCommentCount,
+        P.FavoriteCount,
+        P.AcceptedAnswerId,
+        P.ParentId AS AnsweredQuestionId, -- For answers (PostTypeId = 2)
+        P.ClosedDate,
+        P.CommunityOwnedDate,
+        COUNT(DISTINCT PH.Id) AS TotalRevisions,
+        MAX(PH.CreationDate) AS LatestRevisionDate,
+        -- Determine if the post body has ever been edited
+        BOOL_OR(PH.PostHistoryTypeId IN (5, 8, 24)) AS HasBodyEditHistory,
+        -- Window function: Calculate the average score of the user's posts in the last 30 days
+        AVG(P.Score) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate ROWS BETWEEN 30 PRECEDING AND CURRENT ROW) AS RollingAvgUserPostScore,
+        -- Window function: Find the score of the previous post by the same user, for trend analysis
+        LAG(P.Score, 1, 0) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate) AS PreviousPostScoreByAuthor
+    FROM Posts P
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+                             AND PH.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 19, 20, 24)
+    WHERE P.PostTypeId IN (1, 2) -- Only Questions (1) and Answers (2)
+      AND P.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '3 years' -- Focus on recent posts
+    GROUP BY
+        P.Id, P.PostTypeId, P.OwnerUserId, P.Title, P.Body, P.Tags, P.CreationDate,
+        P.LastEditDate, P.LastActivityDate, P.Score, P.ViewCount, P.AnswerCount,
+        P.CommentCount, P.FavoriteCount, P.AcceptedAnswerId, P.ParentId, P.ClosedDate,
+        P.CommunityOwnedDate
+),
+TagAnalysis AS (
+    SELECT
+        P.PostId,
+        TRIM(unnest(string_to_array(substring(P.Tags, 2, length(P.Tags)-2), '><'))) AS TagName,
+        P.PostScore,
+        P.OwnerUserId
+    FROM PostComprehensiveStats P
+    WHERE P.Tags IS NOT NULL
+),
+HighlyEngagedTags AS (
+    SELECT
+        TagName,
+        COUNT(PostId) AS TaggedPostCount,
+        AVG(PostScore) AS AvgTagScore
+    FROM TagAnalysis
+    GROUP BY TagName
+    HAVING COUNT(PostId) > 5000 AND AVG(PostScore) > 5
+),
+UserTagContributions AS (
+    SELECT
+        TA.OwnerUserId AS UserId,
+        TA.TagName,
+        COUNT(DISTINCT TA.PostId) AS UserPostsInTag,
+        AVG(TA.PostScore) AS UserAvgScoreInTag,
+        RANK() OVER (PARTITION BY TA.OwnerUserId ORDER BY AVG(TA.PostScore) DESC) AS TagRankForUser
+    FROM TagAnalysis TA
+    JOIN HighlyEngagedTags HET ON TA.TagName = HET.TagName
+    GROUP BY TA.OwnerUserId, TA.TagName
+),
+BadgeAggregates AS (
+    SELECT
+        B.UserId,
+        COUNT(B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        STRING_AGG(DISTINCT B.Name, '; ') AS AllBadgeNamesString
+    FROM Badges B
+    GROUP BY B.UserId
+),
+GlobalAverages AS (
+    SELECT
+        AVG(PostScore) AS GlobalAvgPostScore,
+        AVG(ViewCount) AS GlobalAvgViewCount,
+        AVG(TotalRevisions) AS GlobalAvgTotalRevisions
+    FROM PostComprehensiveStats
+)
+-- Main Query - Part 1: High-Impact Questions & Their Authors
+SELECT
+    UES.UserId,
+    COALESCE(UES.DisplayName, 'Anonymous') AS DisplayName,
+    'High-Impact Questioner' AS RoleCategory,
+    UES.Reputation,
+    UES.UserCreationDate,
+    PCS.PostId AS EntityId,
+    PCS.Title AS EntityTitle,
+    PCS.PostScore AS EntityScore,
+    PCS.ViewCount AS EntityViews,
+    PCS.CommentCount AS EntityCommentCount,
+    PCS.FavoriteCount AS EntityFavoriteCount,
+    PCS.TotalRevisions AS EntityRevisions,
+    PCS.LastEditDate AS EntityLastEditDate,
+    -- Custom calculation for Question Impact Score
+    (PCS.PostScore * 0.4 + PCS.ViewCount * 0.0005 + COALESCE(PCS.AnswerCount, 0) * 0.15 + PCS.CommentCount * 0.05 + PCS.FavoriteCount * 0.1 + PCS.TotalRevisions * 0.02 +
+     (CASE WHEN PCS.AcceptedAnswerId IS NOT NULL THEN 0.2 ELSE 0 END) * PCS.PostScore
+    ) AS CombinedQualityScore,
+    -- Window function: Rank the user's questions by their PostScore
+    RANK() OVER (PARTITION BY UES.UserId ORDER BY PCS.PostScore DESC, PCS.ViewCount DESC) AS UserEntityRank,
+    (PCS.PostScore > GA.GlobalAvgPostScore) AS IsAboveGlobalAvgScore,
+    (PCS.ViewCount > GA.GlobalAvgViewCount) AS IsAboveGlobalAvgViews,
+    (PCS.TotalRevisions > GA.GlobalAvgTotalRevisions) AS IsAboveGlobalAvgRevisions,
+    BA.GoldBadges,
+    BA.SilverBadges,
+    BA.BronzeBadges,
+    UES.HasRecentClosedQuestion,
+    (UES.AboutMe LIKE '%developer%' OR UES.AboutMe LIKE '%engineer%' OR UES.AboutMe LIKE '%programmer%') AS IsTechProfessional,
+    -- String aggregation of top 3 tags by user's average score within that tag
+    (SELECT STRING_AGG(UTC.TagName || ' (' || ROUND(UTC.UserAvgScoreInTag, 1) || ')', '; ') FROM UserTagContributions UTC WHERE UTC.UserId = UES.UserId AND UTC.TagRankForUser <= 3) AS TopTagContributionsSummary,
+    -- NULL Logic: Display 'N/A' if Post Tags are NULL
+    COALESCE(PCS.Tags, 'N/A') AS PostTags
+FROM UserEngagementSummary UES
+JOIN PostComprehensiveStats PCS ON UES.UserId = PCS.OwnerUserId
+LEFT JOIN BadgeAggregates BA ON UES.UserId = BA.UserId
+CROSS JOIN GlobalAverages GA
+WHERE PCS.PostTypeId = 1 -- Only questions
+  AND PCS.PostScore > 20 -- High score questions
+  AND PCS.ViewCount > 1000 -- Highly viewed questions
+  AND PCS.AcceptedAnswerId IS NOT NULL -- Questions with accepted answers
+  AND PCS.ClosedDate IS NULL -- Exclude closed questions
+  AND EXISTS ( -- Correlated subquery: Question is linked to another post of type 'Linked'
+        SELECT 1 FROM PostLinks PL WHERE PL.PostId = PCS.PostId AND PL.LinkTypeId = 1
+    )
+  AND PCS.HasBodyEditHistory -- Ensure body has been edited
+  AND PCS.RollingAvgUserPostScore > 10 -- User consistently posts good scores
+UNION ALL
+-- Main Query - Part 2: Top Answer Providers & Their Contributions
+SELECT
+    UES.UserId,
+    COALESCE(UES.DisplayName, 'Anonymous') AS DisplayName,
+    'Top Answer Provider' AS RoleCategory,
+    UES.Reputation,
+    UES.UserCreationDate,
+    PCS.PostId AS EntityId,
+    NULL AS EntityTitle, -- Answers don't have titles
+    PCS.PostScore AS EntityScore,
+    NULL AS EntityViews, -- Views are primarily for questions
+    PCS.CommentCount AS EntityCommentCount,
+    PCS.FavoriteCount AS EntityFavoriteCount,
+    PCS.TotalRevisions AS EntityRevisions,
+    PCS.LastEditDate AS EntityLastEditDate,
+    -- Custom calculation for Answer Impact Score
+    (PCS.PostScore * 0.5 + PCS.CommentCount * 0.1 + PCS.FavoriteCount * 0.15 + PCS.TotalRevisions * 0.03 +
+     (CASE WHEN ParentQ.AcceptedAnswerId = PCS.PostId THEN 0.2 ELSE 0 END) * PCS.PostScore + -- Bonus for being accepted
+     (PCS.PostScore - PCS.PreviousPostScoreByAuthor) * 0.01 -- Consider score improvement
+    ) AS CombinedQualityScore,
+    -- Window function: NTILE to categorize answers into 4 performance groups based on score
+    NTILE(4) OVER (PARTITION BY UES.UserId ORDER BY PCS.PostScore DESC, PCS.LastEditDate DESC) AS UserEntityRank,
+    (PCS.PostScore > GA.GlobalAvgPostScore) AS IsAboveGlobalAvgScore,
+    FALSE AS IsAboveGlobalAvgViews, -- Always false for answers' views
+    (PCS.TotalRevisions > GA.GlobalAvgTotalRevisions) AS IsAboveGlobalAvgRevisions,
+    BA.GoldBadges,
+    BA.SilverBadges,
+    BA.BronzeBadges,
+    UES.HasRecentClosedQuestion,
+    (UES.AboutMe LIKE '%mentor%' OR UES.AboutMe LIKE '%expert%' OR UES.AboutMe LIKE '%specialist%') AS IsTechProfessional,
+    (SELECT STRING_AGG(UTC.TagName || ' (' || ROUND(UTC.UserAvgScoreInTag, 1) || ')', '; ') FROM UserTagContributions UTC WHERE UTC.UserId = UES.UserId AND UTC.TagRankForUser <= 3) AS TopTagContributionsSummary,
+    COALESCE(PCS.Tags, 'N/A') AS PostTags
+FROM UserEngagementSummary UES
+JOIN PostComprehensiveStats PCS ON UES.UserId = PCS.OwnerUserId
+LEFT JOIN PostComprehensiveStats ParentQ ON PCS.AnsweredQuestionId = ParentQ.PostId -- Join to get parent question details
+LEFT JOIN BadgeAggregates BA ON UES.UserId = BA.UserId
+CROSS JOIN GlobalAverages GA
+WHERE PCS.PostTypeId = 2 -- Only answers
+  AND PCS.PostScore > 15 -- High score answers
+  AND PCS.CommentCount > 2 -- Answers that generated significant discussion
+  AND PCS.LastEditDate IS NOT NULL -- Edited at least once
+  AND (ParentQ.AcceptedAnswerId = PCS.PostId OR PCS.FavoriteCount > 0) -- Either accepted or favorited
+  AND PCS.CommunityOwnedDate IS NULL -- Not community owned
+  AND NOT EXISTS ( -- Correlated subquery: Ensure the answer has not been deleted (PostHistoryTypeId = 12)
+        SELECT 1 FROM PostHistory PH WHERE PH.PostId = PCS.PostId AND PH.PostHistoryTypeId = 12
+    )
+ORDER BY
+    RoleCategory,
+    CombinedQualityScore DESC,
+    Reputation DESC
+LIMIT 750;

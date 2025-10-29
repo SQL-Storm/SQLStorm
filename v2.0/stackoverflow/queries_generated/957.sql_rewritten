@@ -1,0 +1,269 @@
+-- {"query": "957.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2882} 
+with recent_users as (
+    select u.id as user_id,
+           u.displayname,
+           u.reputation,
+           u.creationdate,
+           u.location,
+           coalesce(nullif(trim(split_part(coalesce(u.websiteurl,''), '/', 3)), ''), 'unknown.host') as host,
+           row_number() over (order by u.creationdate desc, u.id) as rn
+    from users u
+    where u.creationdate >= (select date_trunc('year', max(creationdate)) from users) - interval '2 years'
+),
+user_activity as (
+    select
+        u.user_id,
+        count(distinct p.id) filter (where p.posttypeid in (1,2)) as total_posts,
+        count(*) filter (where c.id is not null) as total_comments,
+        sum(greatest(p.score,0)) as nonneg_post_score,
+        sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end) as net_votes_on_posts,
+        max(p.lastactivitydate) as last_post_activity,
+        max(c.creationdate) as last_comment_activity
+    from recent_users u
+    left join posts p on p.owneruserid = u.user_id
+    left join comments c on c.userid = u.user_id
+    left join votes v on v.postid = p.id and v.votetypeid in (2,3)
+    group by u.user_id
+),
+question_metrics as (
+    select
+        q.owneruserid as user_id,
+        count(*) as questions,
+        avg(nullif(q.viewcount,0)) as avg_views,
+        avg(q.score) as avg_q_score,
+        count(*) filter (where q.acceptedanswerid is not null) as accepted_count,
+        count(*) filter (where q.closeddate is not null) as closed_count,
+        percentile_cont(0.5) within group (order by coalesce(q.answercount,0)) as median_answers
+    from posts q
+    where q.posttypeid = 1
+    group by q.owneruserid
+),
+answer_metrics as (
+    select
+        a.owneruserid as user_id,
+        count(*) as answers,
+        avg(a.score) as avg_a_score,
+        count(distinct a.parentid) as distinct_questions_answered,
+        sum(case when a.id = q.acceptedanswerid then 1 else 0 end) as accepted_answers
+    from posts a
+    join posts q on q.id = a.parentid and q.posttypeid = 1
+    where a.posttypeid = 2
+    group by a.owneruserid
+),
+edits_and_history as (
+    select
+        ph.userid as user_id,
+        count(*) filter (where ph.posthistorytypeid in (4,5,6,7,8,9,24)) as edits_count,
+        count(*) filter (where ph.posthistorytypeid in (10,11,12,13,14,15,19,20,35)) as moderation_events,
+        count(distinct ph.postid) as touched_posts
+    from posthistory ph
+    group by ph.userid
+),
+badges_rollup as (
+    select
+        b.userid as user_id,
+        count(*) as total_badges,
+        sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+        sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+        sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+        count(*) filter (where b.tagbased = 1) as tag_badges
+    from badges b
+    group by b.userid
+),
+tag_inference as (
+    select
+        p.owneruserid as user_id,
+        lower(trim(both '<>' from unnest(string_to_array(coalesce(p.tags,''), '><')))) as tagname,
+        count(*) as uses
+    from posts p
+    where p.posttypeid = 1
+      and p.tags is not null
+    group by p.owneruserid, lower(trim(both '<>' from unnest(string_to_array(coalesce(p.tags,''), '><'))))
+),
+top_tags as (
+    select t.user_id,
+           string_agg(t.tagname || ':' || t.uses::text, ', ' order by t.uses desc, t.tagname) as tag_usage,
+           array_agg(t.tagname order by t.uses desc, t.tagname)[1:3] as top3_tags
+    from (
+        select user_id, tagname, uses,
+               row_number() over (partition by user_id order by uses desc, tagname) as rk
+        from tag_inference
+    ) t
+    where t.rk <= 10
+    group by t.user_id
+),
+duplicate_links as (
+    select pl.postid,
+           count(*) filter (where pl.linktypeid = 3) as dup_links
+    from postlinks pl
+    group by pl.postid
+),
+question_quality as (
+    select q.owneruserid as user_id,
+           avg((coalesce(q.score,0) * 1.0) / nullif(1 + coalesce(dl.dup_links,0),0)) as score_per_dup_link_adj,
+           avg(coalesce(q.favoritecount,0)) as avg_fav,
+           avg(coalesce(q.commentcount,0)) as avg_comments
+    from posts q
+    left join duplicate_links dl on dl.postid = q.id
+    where q.posttypeid = 1
+    group by q.owneruserid
+),
+activity_windows as (
+    select
+        p.owneruserid as user_id,
+        count(*) filter (where p.posttypeid in (1,2) and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '90 days') as posts_90d,
+        count(*) filter (where p.posttypeid in (1,2) and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days') as posts_30d,
+        max(p.creationdate) as last_post_created
+    from posts p
+    group by p.owneruserid
+),
+user_scored as (
+    select
+        ru.user_id,
+        ru.displayname,
+        ru.reputation,
+        ru.creationdate,
+        ru.location,
+        ru.host,
+        ua.total_posts,
+        ua.total_comments,
+        ua.nonneg_post_score,
+        ua.net_votes_on_posts,
+        coalesce(qm.questions,0) as questions,
+        coalesce(am.answers,0) as answers,
+        coalesce(qm.avg_views,0) as avg_q_views,
+        coalesce(qm.avg_q_score,0) as avg_q_score,
+        coalesce(qm.accepted_count,0) as accepted_q_count,
+        coalesce(qm.closed_count,0) as closed_q_count,
+        coalesce(qm.median_answers,0) as median_answers_per_q,
+        coalesce(am.avg_a_score,0) as avg_a_score,
+        coalesce(am.distinct_questions_answered,0) as distinct_q_answered,
+        coalesce(am.accepted_answers,0) as accepted_answers,
+        coalesce(eh.edits_count,0) as edits_count,
+        coalesce(eh.moderation_events,0) as moderation_events,
+        coalesce(eh.touched_posts,0) as touched_posts,
+        coalesce(br.total_badges,0) as total_badges,
+        coalesce(br.gold_badges,0) as gold_badges,
+        coalesce(br.silver_badges,0) as silver_badges,
+        coalesce(br.bronze_badges,0) as bronze_badges,
+        coalesce(br.tag_badges,0) as tag_badges,
+        coalesce(tt.tag_usage,'') as tag_usage,
+        coalesce(qq.score_per_dup_link_adj,0) as score_per_dup_link_adj,
+        coalesce(qq.avg_fav,0) as avg_q_fav,
+        coalesce(qq.avg_comments,0) as avg_q_comments,
+        coalesce(aw.posts_90d,0) as posts_90d,
+        coalesce(aw.posts_30d,0) as posts_30d,
+        aw.last_post_created,
+        ua.last_post_activity,
+        ua.last_comment_activity,
+        -- Composite scoring with mixed weights and NULL handling
+        (
+            0.25 * ln(1 + greatest(ru.reputation,0)) +
+            0.20 * ln(1 + coalesce(ua.nonneg_post_score,0)) +
+            0.15 * ln(1 + coalesce(am.answers,0)) +
+            0.10 * ln(1 + coalesce(qm.questions,0)) +
+            0.10 * coalesce(am.avg_a_score,0) +
+            0.08 * coalesce(qm.avg_q_score,0) +
+            0.05 * ln(1 + coalesce(br.total_badges,0)) +
+            0.04 * coalesce(aw.posts_90d,0) / nullif(greatest(extract(day from cast('2024-10-01 12:34:56' as timestamp) - ru.creationdate),1),0) * 365 +
+            0.03 * coalesce(qq.avg_fav,0)
+        ) as activity_score
+    from recent_users ru
+    left join user_activity ua on ua.user_id = ru.user_id
+    left join question_metrics qm on qm.user_id = ru.user_id
+    left join answer_metrics am on am.user_id = ru.user_id
+    left join edits_and_history eh on eh.user_id = ru.user_id
+    left join badges_rollup br on br.user_id = ru.user_id
+    left join top_tags tt on tt.user_id = ru.user_id
+    left join question_quality qq on qq.user_id = ru.user_id
+    left join activity_windows aw on aw.user_id = ru.user_id
+),
+ranked as (
+    select us.*,
+           row_number() over (order by us.activity_score desc nulls last, us.reputation desc, us.user_id) as global_rank,
+           rank() over (partition by coalesce(us.location,'Unknown') order by us.activity_score desc nulls last, us.reputation desc) as rank_by_location,
+           dense_rank() over (partition by case when us.gold_badges > 0 then 'gold' when us.silver_badges > 0 then 'silver' when us.bronze_badges > 0 then 'bronze' else 'none' end
+                              order by us.activity_score desc nulls last) as rank_by_badge
+    from user_scored us
+),
+summary_by_host as (
+    select
+        host,
+        count(*) as users_on_host,
+        avg(activity_score) as avg_activity_score,
+        max(activity_score) as max_activity_score,
+        percentile_cont(0.9) within group (order by activity_score) as p90_activity_score
+    from user_scored
+    group by host
+),
+recent_hot_questions as (
+    select
+        ph.postid,
+        max(ph.creationdate) as last_hot
+    from posthistory ph
+    where ph.posthistorytypeid in (52,53)
+    group by ph.postid
+),
+quality_flags as (
+    select
+        p.id as post_id,
+        p.owneruserid as user_id,
+        case
+            when p.posttypeid = 1 and p.answercount = 0 and cast('2024-10-01 12:34:56' as timestamp) - p.creationdate > interval '180 days'
+                then 1 else 0 end as stale_unanswered_q,
+        case
+            when p.score <= -2 and coalesce(p.viewcount,0) >= 100 then 1 else 0 end as controversial_low_score
+    from posts p
+)
+select
+    r.global_rank,
+    r.rank_by_location,
+    r.rank_by_badge,
+    r.user_id,
+    r.displayname,
+    r.reputation,
+    r.location,
+    r.host,
+    r.activity_score,
+    r.total_posts,
+    r.total_comments,
+    r.questions,
+    r.answers,
+    r.avg_q_views,
+    r.avg_q_score,
+    r.avg_a_score,
+    r.accepted_q_count,
+    r.accepted_answers,
+    r.edits_count,
+    r.moderation_events,
+    r.total_badges,
+    r.gold_badges,
+    r.silver_badges,
+    r.bronze_badges,
+    r.tag_badges,
+    r.tag_usage,
+    r.posts_90d,
+    r.posts_30d,
+    r.last_post_created,
+    r.last_post_activity,
+    r.last_comment_activity,
+    coalesce(sb.avg_activity_score,0) as host_avg_activity,
+    coalesce(sb.p90_activity_score,0) as host_p90_activity,
+    coalesce(hq.last_hot, timestamp 'epoch') as last_hot_question_event,
+    sum(qf.stale_unanswered_q) filter (where qf.user_id = r.user_id) over (partition by r.user_id) as stale_unanswered_q_count,
+    sum(qf.controversial_low_score) filter (where qf.user_id = r.user_id) over (partition by r.user_id) as controversial_low_score_count
+from ranked r
+left join summary_by_host sb on sb.host = r.host
+left join posts p on p.owneruserid = r.user_id and p.posttypeid = 1
+left join recent_hot_questions hq on hq.postid = p.id
+left join quality_flags qf on qf.post_id = p.id
+where (
+    r.activity_score > 0
+    and (
+        r.posts_30d > 0
+        or r.total_comments > 10
+        or r.total_badges >= 5
+    )
+)
+order by r.global_rank
+limit 200;

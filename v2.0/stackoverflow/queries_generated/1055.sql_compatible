@@ -1,0 +1,188 @@
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS TotalUpvotesReceived,
+        U.DownVotes AS TotalDownvotesReceived,
+        COALESCE(COUNT(DISTINCT P.Id), 0) AS UserTotalPosts,
+        COALESCE(SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END), 0) AS UserTotalQuestions,
+        COALESCE(SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END), 0) AS UserTotalAnswers,
+        COALESCE(COUNT(DISTINCT C.Id), 0) AS UserTotalCommentsPosted,
+        COALESCE(SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS TotalUpvotesGiven,
+        COALESCE(SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS TotalDownvotesGiven,
+        COALESCE(COUNT(DISTINCT B.Id), 0) AS TotalBadgesAwarded,
+        MAX(CASE WHEN B.Class = 1 THEN 1 WHEN B.Class = 2 THEN 2 WHEN B.Class = 3 THEN 3 ELSE 4 END) AS LowestBadgeClass,
+        COUNT(DISTINCT CASE WHEN B.TagBased = TRUE THEN B.Name ELSE NULL END) AS UniqueTagBadgesCount
+    FROM
+        Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Votes V ON U.Id = V.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    WHERE
+        U.Reputation >= 5000
+        AND U.LastAccessDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2' YEAR)
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Views, U.UpVotes, U.DownVotes
+),
+PostHistoryAggregates AS (
+    SELECT
+        PH.PostId,
+        COUNT(DISTINCT PH.UserId) AS DistinctHistoryUsers,
+        MAX(PH.CreationDate) AS LatestHistoryEventDate,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9) THEN 1 ELSE 0 END) AS TotalEditRollbackCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (10, 11) THEN 1 ELSE 0 END) AS CloseReopenVoteCount,
+        STRING_AGG(DISTINCT
+            CASE
+                WHEN PH.PostHistoryTypeId = 10 AND PH.Comment IS NOT NULL THEN
+                    (SELECT CRT.Name FROM CloseReasonTypes CRT WHERE CRT.Id = CAST(PH.Comment AS INTEGER))
+                ELSE NULL
+            END, '; ') FILTER (WHERE PH.Comment IS NOT NULL AND PH.PostHistoryTypeId = 10) AS AllCloseReasonsCombined,
+        COUNT(DISTINCT L.RelatedPostId) FILTER (WHERE L.LinkTypeId = 3) AS DuplicateLinkedPostCount
+    FROM
+        PostHistory PH
+    LEFT JOIN PostLinks L ON PH.PostId = L.PostId
+    GROUP BY
+        PH.PostId
+),
+PostDetailedAnalysis AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.OwnerUserId,
+        COALESCE(P.OwnerDisplayName, 'Deleted User ' || CAST(P.OwnerUserId AS TEXT)) AS OwnerDisplayName,
+        P.CreationDate AS PostCreationDate,
+        COALESCE(P.LastEditDate, P.CreationDate) AS ActualLastActivityDate,
+        P.Score AS PostScore,
+        P.ViewCount AS PostViewCount,
+        P.AnswerCount,
+        P.CommentCount AS PostCommentCountDirect,
+        P.FavoriteCount AS PostFavoriteCount,
+        COALESCE(P.Title, SUBSTRING(P.Body FROM 1 FOR 150) || '...') AS PostTitleOrBodySnippet,
+        P.Tags,
+        P.AcceptedAnswerId,
+        (SELECT COUNT(C.Id) FROM Comments C WHERE C.PostId = P.Id) AS TotalCommentsOnPost,
+        COALESCE(PHA.DistinctHistoryUsers, 0) AS DistinctHistoryUsers,
+        COALESCE(PHA.TotalEditRollbackCount, 0) AS TotalEditRollbackCount,
+        COALESCE(PHA.CloseReopenVoteCount, 0) AS CloseReopenVoteCount,
+        PHA.AllCloseReasonsCombined,
+        PHA.DuplicateLinkedPostCount,
+        CASE
+            WHEN P.PostTypeId = 1 AND P.AcceptedAnswerId IS NOT NULL THEN 'Accepted Answer'
+            WHEN P.PostTypeId = 1 AND P.AcceptedAnswerId IS NULL AND P.AnswerCount > 0 THEN 'Unaccepted Answer(s)'
+            WHEN P.PostTypeId = 1 AND P.AnswerCount = 0 THEN 'No Answers'
+            WHEN P.PostTypeId = 2 THEN 'Is Answer'
+            ELSE 'Other Post Type'
+        END AS QuestionAnswerStatus,
+        ABS(EXTRACT(EPOCH FROM (COALESCE(P.LastEditDate, P.CreationDate) - P.CreationDate))) / 3600.0 AS PostLifespanHours,
+        (SELECT MAX(V.CreationDate) FROM Votes V WHERE V.PostId = P.Id AND V.VoteTypeId IN (2, 3)) AS LatestVoteDate,
+        COALESCE(NULLIF(P.LastEditorUserId, P.OwnerUserId), -999) AS LastEditorIfDifferentFromOwner
+    FROM
+        Posts P
+    JOIN PostTypes PT ON P.PostTypeId = PT.Id
+    LEFT JOIN PostHistoryAggregates PHA ON P.Id = PHA.PostId
+    WHERE
+        P.Score >= 5
+        AND P.ViewCount >= 500
+        AND P.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '5' YEAR)
+        AND LENGTH(P.Body) > 100
+)
+SELECT
+    UE.UserId,
+    UE.DisplayName,
+    UE.Reputation,
+    UE.UserCreationDate,
+    UE.LastAccessDate,
+    UE.UserTotalPosts,
+    UE.UserTotalQuestions,
+    UE.UserTotalAnswers,
+    UE.TotalUpvotesGiven,
+    UE.TotalDownvotesGiven,
+    UE.TotalBadgesAwarded,
+    UE.LowestBadgeClass,
+    PDA.PostId,
+    PDA.PostTypeName,
+    PDA.PostCreationDate,
+    PDA.ActualLastActivityDate,
+    PDA.PostScore,
+    PDA.PostViewCount,
+    PDA.TotalCommentsOnPost,
+    PDA.PostFavoriteCount,
+    PDA.PostTitleOrBodySnippet,
+    PDA.Tags AS PostTags,
+    PDA.DistinctHistoryUsers,
+    PDA.TotalEditRollbackCount,
+    PDA.CloseReopenVoteCount,
+    PDA.AllCloseReasonsCombined,
+    PDA.DuplicateLinkedPostCount,
+    PDA.QuestionAnswerStatus,
+    PDA.PostLifespanHours,
+    PDA.LatestVoteDate,
+    AVG(PDA.PostScore) OVER (PARTITION BY UE.UserId) AS UserAvgPostScore,
+    RANK() OVER (PARTITION BY UE.UserId ORDER BY PDA.PostScore DESC, PDA.PostViewCount DESC) AS RankOfPostForUser,
+    NTILE(10) OVER (ORDER BY UE.Reputation DESC, UE.UserTotalPosts DESC, UE.TotalUpvotesGiven DESC, UE.UserProfileViews DESC) AS UserEngagementDecile,
+    LAG(PDA.PostCreationDate, 1, UE.UserCreationDate) OVER (PARTITION BY UE.UserId ORDER BY PDA.PostCreationDate) AS PreviousPostCreationDate,
+    (
+        SELECT SUM(V_bounty.BountyAmount)
+        FROM Votes V_bounty
+        WHERE V_bounty.PostId = PDA.PostId
+          AND V_bounty.VoteTypeId = 9
+    ) AS TotalBountyAmountClosed,
+    (
+        SELECT COUNT(DISTINCT PH_edit.UserId)
+        FROM PostHistory PH_edit
+        WHERE PH_edit.PostId = PDA.PostId
+          AND PH_edit.UserId != PDA.OwnerUserId
+          AND PH_edit.PostHistoryTypeId IN (4, 5, 6)
+    ) AS EditsByOtherUsers,
+    (
+        SELECT STRING_AGG(T.TagName, ', ')
+        FROM (
+            SELECT UNNEST(string_to_array(SUBSTRING(PDA.Tags FROM 2 FOR CHAR_LENGTH(PDA.Tags) - 2), '><')) AS tag_elem
+        ) te
+        JOIN Tags T ON T.TagName = te.tag_elem
+        WHERE T.IsModeratorOnly = TRUE OR T.IsRequired = TRUE
+    ) AS SpecialTagsPresent,
+    CASE
+        WHEN PDA.PostLifespanHours > 720 AND PDA.TotalEditRollbackCount > 5 AND PDA.DistinctHistoryUsers > 1 THEN 'Long-term Highly Curated'
+        WHEN PDA.PostLifespanHours <= 24 AND PDA.PostScore > 50 AND PDA.PostViewCount > 5000 THEN 'Very Hot Content'
+        WHEN PDA.PostLifespanHours BETWEEN 24 AND 720 AND PDA.TotalEditRollbackCount > 2 AND PDA.DistinctHistoryUsers > 0 THEN 'Actively Managed'
+        ELSE 'Regular Content'
+    END AS ContentCuratingCategory,
+    PDA.PostLifespanHours / NULLIF((SELECT COUNT(V_all.Id) FROM Votes V_all WHERE V_all.PostId = PDA.PostId), 0) AS HoursPerVoteRatio
+FROM
+    UserEngagement UE
+INNER JOIN
+    PostDetailedAnalysis PDA ON UE.UserId = PDA.OwnerUserId
+WHERE
+    PDA.PostTypeId IN (1, 2)
+    AND PDA.PostLifespanHours > 24
+    AND PDA.PostScore > (
+        SELECT AVG(P_avg_score.Score)
+        FROM Posts P_avg_score
+        WHERE P_avg_score.OwnerUserId = UE.UserId
+          AND P_avg_score.PostTypeId = PDA.PostTypeId
+          AND P_avg_score.Score > 0
+    )
+    AND (PDA.Tags LIKE '%<sql>%' OR PDA.Tags LIKE '%<database>%' OR PDA.Tags LIKE '%<performance>%')
+    AND PDA.QuestionAnswerStatus != 'No Answers'
+    AND EXISTS (
+        SELECT 1 FROM Votes V_upmod WHERE V_upmod.UserId = UE.UserId AND V_upmod.VoteTypeId = 2
+    )
+    AND EXISTS (
+        SELECT 1 FROM Votes V_fav WHERE V_fav.UserId = UE.UserId AND V_fav.VoteTypeId = 5
+    )
+    AND EXISTS (
+        SELECT 1 FROM Badges B2 WHERE B2.UserId = UE.UserId AND B2.Class = 1
+    )
+ORDER BY
+    UE.Reputation DESC,
+    UserEngagementDecile ASC,
+    PDA.PostScore DESC,
+    PDA.PostCreationDate DESC
+LIMIT 2000;

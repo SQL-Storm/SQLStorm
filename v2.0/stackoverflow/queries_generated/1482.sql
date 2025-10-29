@@ -1,0 +1,233 @@
+-- {"query": "1482.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3898} 
+
+WITH QuestionMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId AS QuestionOwnerUserId,
+        p.Score AS QuestionScore,
+        p.ViewCount AS QuestionViewCount,
+        p.AnswerCount AS QuestionAnswerCount,
+        p.FavoriteCount AS QuestionFavoriteCount,
+        p.CreationDate AS QuestionCreationDate,
+        -- Extract tags and clean them for easier processing, then normalize
+        LOWER(TRIM(REPLACE(REPLACE(REPLACE(p.Tags, '><', ' '), '<', ''), '>', ' '))) AS NormalizedTags,
+        -- Simple check if it was closed or community-owned using NULL logic
+        COALESCE(CASE WHEN p.ClosedDate IS NOT NULL OR p.CommunityOwnedDate IS NOT NULL THEN 1 ELSE 0 END, 0) AS WasClosedOrCommunityOwned,
+        -- Calculate question body length, handling potential NULL body
+        COALESCE(LENGTH(p.Body), 0) AS BodyLength
+    FROM
+        Posts p
+    WHERE
+        p.PostTypeId = 1 -- Only questions
+        AND p.CreationDate >= '2022-01-01 00:00:00' -- Specific timeframe for analysis
+        AND p.CreationDate < '2023-01-01 00:00:00'
+        AND p.Score >= 5 -- Minimum score for relevant questions
+        AND p.ViewCount >= 100 -- Minimum views for relevant questions
+        AND p.OwnerUserId IS NOT NULL -- Exclude community user posts for ownership analysis
+        AND p.Body IS NOT NULL -- Ensure body exists for length calculation
+),
+UserPostAggregates AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.UpVotes AS TotalUpVotesGivenByMe,
+        u.DownVotes AS TotalDownVotesGivenByMe,
+        COUNT(DISTINCT qm.PostId) AS TotalQuestionsPosted,
+        SUM(qm.QuestionScore) AS TotalQuestionScoreReceived,
+        SUM(qm.QuestionViewCount) AS TotalQuestionViewsReceived,
+        SUM(qm.QuestionAnswerCount) AS TotalAnswersOnMyQuestions,
+        SUM(qm.QuestionFavoriteCount) AS TotalQuestionFavoritesReceived,
+        SUM(qm.BodyLength) AS TotalQuestionBodyLength,
+        -- Calculate average score for their questions, handling division by zero
+        COALESCE(AVG(CAST(qm.QuestionScore AS NUMERIC)), 0.0) AS AvgQuestionScore,
+        -- Correlated subquery: count how many of their questions were later closed/community-owned
+        SUM(CASE WHEN qm.WasClosedOrCommunityOwned = 1 THEN 1 ELSE 0 END) AS QuestionsClosedOrCommunityOwned,
+        -- Check if user has questions containing specific popular tags
+        MAX(CASE WHEN qm.NormalizedTags LIKE '%sql%' OR qm.NormalizedTags LIKE '%python%' OR qm.NormalizedTags LIKE '%javascript%' THEN 1 ELSE 0 END) AS HasPopularTechTags,
+        -- Count distinct answers provided by other users to *this* user's questions
+        (SELECT COUNT(DISTINCT ans.Id) FROM Posts ans WHERE ans.ParentId IN (SELECT qm_inner.PostId FROM QuestionMetrics qm_inner WHERE qm_inner.QuestionOwnerUserId = u.Id) AND ans.PostTypeId = 2 AND ans.OwnerUserId IS NOT NULL) AS AnswersReceivedFromOthers
+    FROM
+        Users u
+    LEFT JOIN
+        QuestionMetrics qm ON u.Id = qm.QuestionOwnerUserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes
+),
+UserCommentAggregates AS (
+    SELECT
+        c.UserId,
+        COUNT(c.Id) AS TotalCommentsMade,
+        COALESCE(AVG(CAST(c.Score AS NUMERIC)), 0.0) AS AvgCommentScore,
+        -- Advanced sentiment analysis using string functions and CASE statements
+        SUM(CASE
+                WHEN LOWER(c.Text) LIKE '%great%' OR LOWER(c.Text) LIKE '%excellent%' OR LOWER(c.Text) LIKE '%thank you%' THEN 2 -- Strong positive
+                WHEN LOWER(c.Text) LIKE '%good%' OR LOWER(c.Text) LIKE '%helpful%' OR LOWER(c.Text) LIKE '%fix%' THEN 1 -- Mild positive
+                WHEN LOWER(c.Text) LIKE '%bug%' OR LOWER(c.Text) LIKE '%error%' OR LOWER(c.Text) LIKE '%issue%' THEN -1 -- Mild negative
+                WHEN LOWER(c.Text) LIKE '%wrong%' OR LOWER(c.Text) LIKE '%incorrect%' OR LOWER(c.Text) LIKE '%broken%' THEN -2 -- Strong negative
+                ELSE 0
+            END) AS CommentSentimentScore
+    FROM
+        Comments c
+    WHERE
+        c.UserId IS NOT NULL
+        AND c.CreationDate >= '2022-01-01 00:00:00'
+        AND c.CreationDate < '2023-01-01 00:00:00'
+    GROUP BY
+        c.UserId
+),
+UserBadgeAggregates AS (
+    SELECT
+        b.UserId,
+        COUNT(b.Id) AS TotalBadgesEarned,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        SUM(CASE WHEN b.TagBased = TRUE THEN 1 ELSE 0 END) AS TagBasedBadges
+    FROM
+        Badges b
+    WHERE
+        b.Date >= '2022-01-01 00:00:00'
+        AND b.Date < '2023-01-01 00:00:00'
+    GROUP BY
+        b.UserId
+),
+PostLinkImpact AS (
+    SELECT
+        qm.QuestionOwnerUserId AS UserId,
+        -- Count how many times this user's question is linked to by others
+        SUM(CASE WHEN pl.LinkTypeId = 1 AND pl.RelatedPostId = qm.PostId THEN 1 ELSE 0 END) AS TimesLinkedToByOthers,
+        -- Count how many times this user's question is marked as a duplicate target
+        SUM(CASE WHEN pl.LinkTypeId = 3 AND pl.RelatedPostId = qm.PostId THEN 1 ELSE 0 END) AS TimesMarkedDuplicateTarget,
+        -- Count how many times this user's question links to other posts
+        SUM(CASE WHEN pl.LinkTypeId = 1 AND pl.PostId = qm.PostId THEN 1 ELSE 0 END) AS TimesThisQuestionLinksToOthers,
+        -- Count how many times this user's question is the source of a duplicate link
+        SUM(CASE WHEN pl.LinkTypeId = 3 AND pl.PostId = qm.PostId THEN 1 ELSE 0 END) AS TimesThisQuestionIsDuplicateSource
+    FROM
+        QuestionMetrics qm
+    JOIN
+        PostLinks pl ON qm.PostId = pl.PostId OR qm.PostId = pl.RelatedPostId
+    GROUP BY
+        qm.QuestionOwnerUserId
+),
+UserVoteActivity AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        v.PostId,
+        v.VoteTypeId,
+        p.Score AS PostScore,
+        p.CreationDate AS PostCreationDate,
+        u.Location,
+        u.Reputation,
+        -- Window function: Average score of posts by this user within each month
+        AVG(CAST(p.Score AS NUMERIC)) OVER (PARTITION BY p.OwnerUserId, EXTRACT(YEAR FROM p.CreationDate), EXTRACT(MONTH FROM p.CreationDate)) AS AvgMonthlyPostScore,
+        -- Window function: Rank of user by reputation within their location
+        DENSE_RANK() OVER (PARTITION BY u.Location ORDER BY u.Reputation DESC, u.CreationDate ASC) AS RankByReputationInLocation
+    FROM
+        Votes v
+    JOIN
+        Posts p ON v.PostId = p.Id
+    LEFT JOIN
+        Users u ON p.OwnerUserId = u.Id
+    WHERE
+        p.OwnerUserId IS NOT NULL
+        AND v.CreationDate >= '2022-01-01 00:00:00'
+        AND v.CreationDate < '2023-01-01 00:00:00'
+),
+UserVoteAggregates AS (
+    SELECT
+        UserId,
+        COUNT(DISTINCT PostId) AS TotalPostsReceivedVotes,
+        SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceivedOnMyPosts,
+        SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceivedOnMyPosts,
+        COALESCE(AVG(PostScore), 0.0) AS OverallAvgPostScoreReceived,
+        COALESCE(AVG(AvgMonthlyPostScore), 0.0) AS AvgOfMonthlyAvgPostScore, -- Average of monthly averages
+        -- Max/Min/Avg for window functions can serve as aggregate representations
+        COALESCE(MAX(RankByReputationInLocation), 999999) AS MaxReputationRankInLocation, -- Max, because lower number is better rank
+        COALESCE(MIN(RankByReputationInLocation), 999999) AS MinReputationRankInLocation
+    FROM
+        UserVoteActivity
+    GROUP BY
+        UserId
+)
+SELECT
+    COALESCE(upa.DisplayName, u.DisplayName, 'Deleted User') AS UserDisplayName,
+    u.Id AS UserId,
+    u.Reputation,
+    COALESCE(upa.TotalQuestionsPosted, 0) AS QuestionsPosted,
+    COALESCE(upa.TotalQuestionScoreReceived, 0) AS TotalQuestionScore,
+    COALESCE(upa.TotalQuestionViewsReceived, 0) AS TotalQuestionViews,
+    COALESCE(upa.TotalAnswersOnMyQuestions, 0) AS TotalAnswersToMyQuestions,
+    COALESCE(uca.TotalCommentsMade, 0) AS CommentsMade,
+    COALESCE(uca.AvgCommentScore, 0.0) AS AvgCommentScore,
+    COALESCE(uca.CommentSentimentScore, 0) AS TotalCommentSentiment,
+    COALESCE(uba.GoldBadges, 0) AS GoldBadges,
+    COALESCE(uba.SilverBadges, 0) AS SilverBadges,
+    COALESCE(uba.BronzeBadges, 0) AS BronzeBadges,
+    COALESCE(pia.TimesLinkedToByOthers, 0) AS LinkedToCount,
+    COALESCE(pia.TimesMarkedDuplicateTarget, 0) AS MarkedDuplicateTargetCount,
+    COALESCE(uva.UpVotesReceivedOnMyPosts, 0) AS TotalUpVotesOnMyPosts,
+    COALESCE(uva.DownVotesReceivedOnMyPosts, 0) AS TotalDownVotesOnMyPosts,
+    COALESCE(upa.AnswersReceivedFromOthers, 0) AS AnswersToMyQuestionsFromOthers,
+    COALESCE(upa.QuestionsClosedOrCommunityOwned, 0) AS MyQuestionsFlagged,
+    COALESCE(upa.HasPopularTechTags, 0) AS HasQuestionsWithPopularTechTags,
+    COALESCE(uva.AvgOfMonthlyAvgPostScore, 0.0) AS OverallAvgOfMonthlyAvgPostScore,
+    -- Complex Weighted Impact Score (elaborate calculation using multiple metrics with different weights)
+    (
+        (COALESCE(upa.TotalQuestionScoreReceived, 0) * 0.7) +
+        (COALESCE(upa.TotalQuestionViewsReceived, 0) * 0.005) +
+        (COALESCE(upa.TotalAnswersOnMyQuestions, 0) * 2.5) +
+        (COALESCE(uca.CommentSentimentScore, 0) * 0.15) +
+        (COALESCE(uba.GoldBadges, 0) * 120) +
+        (COALESCE(uba.SilverBadges, 0) * 60) +
+        (COALESCE(uba.BronzeBadges, 0) * 15) +
+        (COALESCE(pia.TimesLinkedToByOthers, 0) * 7.0) -
+        (COALESCE(pia.TimesMarkedDuplicateTarget, 0) * 25.0) -
+        (COALESCE(upa.MyQuestionsFlagged, 0) * 18.0) +
+        (COALESCE(uva.UpVotesReceivedOnMyPosts, 0) * 0.3) -
+        (COALESCE(uva.DownVotesReceivedOnMyPosts, 0) * 0.6) +
+        (COALESCE(upa.AnswersReceivedFromOthers, 0) * 3.0) +
+        (COALESCE(upa.HasPopularTechTags, 0) * 50.0) +
+        (u.Reputation * 0.01) -
+        (COALESCE(uva.MinReputationRankInLocation, 999999) * 0.001) -- Penalize higher rank numbers
+    ) AS WeightedImpactScore,
+    -- Window function: Global rank based on the calculated WeightedImpactScore
+    ROW_NUMBER() OVER (ORDER BY
+        (
+            (COALESCE(upa.TotalQuestionScoreReceived, 0) * 0.7) +
+            (COALESCE(upa.TotalQuestionViewsReceived, 0) * 0.005) +
+            (COALESCE(upa.TotalAnswersOnMyQuestions, 0) * 2.5) +
+            (COALESCE(uca.CommentSentimentScore, 0) * 0.15) +
+            (COALESCE(uba.GoldBadges, 0) * 120) +
+            (COALESCE(uba.SilverBadges, 0) * 60) +
+            (COALESCE(uba.BronzeBadges, 0) * 15) +
+            (COALESCE(pia.TimesLinkedToByOthers, 0) * 7.0) -
+            (COALESCE(pia.TimesMarkedDuplicateTarget, 0) * 25.0) -
+            (COALESCE(upa.MyQuestionsFlagged, 0) * 18.0) +
+            (COALESCE(uva.UpVotesReceivedOnMyPosts, 0) * 0.3) -
+            (COALESCE(uva.DownVotesReceivedOnMyPosts, 0) * 0.6) +
+            (COALESCE(upa.AnswersReceivedFromOthers, 0) * 3.0) +
+            (COALESCE(upa.HasPopularTechTags, 0) * 50.0) +
+            (u.Reputation * 0.01) -
+            (COALESCE(uva.MinReputationRankInLocation, 999999) * 0.001)
+        ) DESC, u.CreationDate ASC -- Tie-breaker
+    ) AS GlobalImpactRank,
+    -- Window function: Average reputation of users in the same country/region
+    COALESCE(AVG(u.Reputation) OVER (PARTITION BY SUBSTRING(u.Location FROM '.*(?:United States|Canada|UK|Germany|France).*')), 0) AS AvgReputationInUserRegion
+FROM
+    Users u
+LEFT JOIN UserPostAggregates upa ON u.Id = upa.UserId
+LEFT JOIN UserCommentAggregates uca ON u.Id = uca.UserId
+LEFT JOIN UserBadgeAggregates uba ON u.Id = uba.UserId
+LEFT JOIN PostLinkImpact pia ON u.Id = pia.UserId
+LEFT JOIN UserVoteAggregates uva ON u.Id = uva.UserId
+WHERE
+    u.CreationDate < '2023-01-01 00:00:00' -- Filter users created before the analysis period ends
+    -- Only include users who have some form of activity or notable reputation
+    AND (upa.UserId IS NOT NULL OR uca.UserId IS NOT NULL OR uba.UserId IS NOT NULL OR uva.UserId IS NOT NULL OR u.Reputation > 500)
+    AND u.AboutMe IS NOT NULL -- Example filter on a TEXT column
+    AND (u.Location IS NULL OR u.Location NOT LIKE '%Mars%' AND u.Location NOT LIKE '%Moon%') -- Exclude unrealistic locations
+    AND u.Views > 0 -- Ensure user profile has been viewed
+ORDER BY
+    WeightedImpactScore DESC, u.Reputation DESC, u.Id ASC
+LIMIT 250; -- Limit to the top 250 most impactful users

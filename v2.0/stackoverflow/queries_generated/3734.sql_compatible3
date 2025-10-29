@@ -1,0 +1,129 @@
+WITH
+    q AS (
+        SELECT
+            p.Id                      AS QuestionId,
+            p.OwnerUserId,
+            p.CreationDate,
+            p.Score                   AS QuestionScore,
+            p.ViewCount,
+            p.Tags,
+            COALESCE(p.FavoriteCount,0) AS Favorites,
+            p.AnswerCount,
+            p.AcceptedAnswerId,
+            p.Title
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+    ),
+    a AS (
+        SELECT
+            p.Id                      AS AnswerId,
+            p.ParentId                AS QuestionId,
+            p.OwnerUserId,
+            p.CreationDate,
+            p.Score                   AS AnswerScore,
+            p.CommentCount,
+            p.LastEditDate
+        FROM Posts p
+        WHERE p.PostTypeId = 2
+    ),
+    user_votes AS (
+        SELECT
+            v.UserId,
+            SUM(CASE v.VoteTypeId WHEN 2 THEN 1 WHEN 3 THEN -1 ELSE 0 END)                AS NetVotes,
+            COUNT(CASE WHEN v.VoteTypeId = 5 THEN 1 END)                                   AS FavoritesGiven,
+            COUNT(CASE WHEN v.VoteTypeId = 8 THEN 1 END)                                   AS BountiesStarted
+        FROM Votes v
+        GROUP BY v.UserId
+    ),
+    badge_points AS (
+        SELECT
+            b.UserId,
+            SUM(CASE b.Class WHEN 1 THEN 100 WHEN 2 THEN 50 ELSE 10 END)                 AS BadgeScore
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+    tag_usage_exploded AS (
+        SELECT
+            q.QuestionId,
+            u.Id AS UserId,
+            TRIM(BOTH '><' FROM q.Tags) AS trimmed_tags
+        FROM Users u
+        LEFT JOIN q ON q.OwnerUserId = u.Id
+        WHERE q.QuestionId IS NOT NULL
+    ),
+    tag_usage_tokens AS (
+        SELECT
+            teu.UserId,
+            token
+        FROM tag_usage_exploded teu,
+        LATERAL (
+            SELECT value AS token
+            FROM (
+                SELECT regexp_split_to_table(teu.trimmed_tags, '><') AS value
+            ) t
+        ) s
+        WHERE token IS NOT NULL AND token <> ''
+    ),
+    tag_usage AS (
+        SELECT
+            tu.UserId,
+            COUNT(DISTINCT tu.token) AS DistinctTagCount
+        FROM tag_usage_tokens tu
+        GROUP BY tu.UserId
+    ),
+    user_stats AS (
+        SELECT
+            u.Id,
+            u.DisplayName,
+            u.Reputation,
+            COALESCE(uv.NetVotes,0)         AS NetVotes,
+            COALESCE(bp.BadgeScore,0)       AS BadgeScore,
+            COALESCE(tu.DistinctTagCount,0) AS DistinctTagCount,
+            ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, COALESCE(uv.NetVotes,0) DESC) AS ReputationRank,
+            u.WebsiteUrl
+        FROM Users u
+        LEFT JOIN user_votes uv   ON uv.UserId = u.Id
+        LEFT JOIN badge_points bp ON bp.UserId = u.Id
+        LEFT JOIN tag_usage tu    ON tu.UserId = u.Id
+    ),
+    top_answered_questions AS (
+        SELECT
+            q.QuestionId,
+            q.Title,
+            q.OwnerUserId,
+            q.AnswerCount,
+            q.QuestionScore,
+            ROW_NUMBER() OVER (PARTITION BY q.OwnerUserId ORDER BY q.AnswerCount DESC, q.QuestionScore DESC) AS rn
+        FROM q
+        WHERE q.AnswerCount > 0
+    )
+SELECT
+    us.Id,
+    us.DisplayName,
+    us.Reputation,
+    us.NetVotes,
+    us.BadgeScore,
+    us.DistinctTagCount,
+    us.ReputationRank,
+    COALESCE(taq.Title,'<no answered question>')   AS TopAnsweredQuestionTitle,
+    COALESCE(taq.AnswerCount,0)                    AS TopAnswerCount,
+    COALESCE(taq.QuestionScore,0)                  AS TopQuestionScore,
+    CASE
+        WHEN us.Reputation >= 20000 THEN 'Legendary'
+        WHEN us.Reputation >= 10000 THEN 'Expert'
+        WHEN us.Reputation >= 5000  THEN 'Experienced'
+        ELSE 'Novice'
+    END                                            AS ReputationTier,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = us.Id AND p.PostTypeId = 1 AND p.CreationDate > (CAST('2024-10-01' AS date) - INTERVAL '30' DAY)) AS RecentQuestions,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = us.Id AND p.PostTypeId = 2 AND p.CreationDate > (CAST('2024-10-01' AS date) - INTERVAL '30' DAY)) AS RecentAnswers,
+    (SELECT AVG(a.AnswerScore)
+       FROM a
+       WHERE a.QuestionId IN (SELECT q2.QuestionId FROM q q2 WHERE q2.OwnerUserId = us.Id)
+    )                                            AS AvgScoreOfAnswersToOwnQuestions
+FROM user_stats us
+LEFT JOIN top_answered_questions taq
+     ON taq.OwnerUserId = us.Id AND taq.rn = 1
+WHERE (us.Reputation > 1000 OR us.BadgeScore > 0)
+  AND (us.WebsiteUrl IS NOT NULL)
+ORDER BY us.ReputationRank
+LIMIT 100;

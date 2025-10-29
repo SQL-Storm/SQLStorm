@@ -1,0 +1,158 @@
+-- {"query": "4377.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1476} 
+
+WITH
+  LatestPostHistory AS (
+    SELECT
+      PostId,
+      MAX(CreationDate) AS MaxCreationDate
+    FROM
+      PostHistory
+    GROUP BY
+      PostId
+  ),
+  PostWithLatestHistory AS (
+    SELECT
+      p.Id AS PostId,
+      p.PostTypeId,
+      p.OwnerUserId,
+      p.CreationDate AS PostCreationDate,
+      p.Score AS PostScore,
+      p.Title AS PostTitle,
+      p.AnswerCount,
+      p.FavoriteCount,
+      ph.CreationDate AS LatestHistoryDate,
+      ph.UserId AS HistorianUserId,
+      ph.PostHistoryTypeId,
+      ph.Comment AS HistoryComment,
+      ph.Text AS HistoryText,
+      ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY ph.CreationDate DESC) AS rn
+    FROM
+      Posts AS p
+      LEFT OUTER JOIN PostHistory AS ph
+        ON p.Id = ph.PostId
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate AS UserCreationDate,
+      COUNT(DISTINCT p.Id) AS PostsCount,
+      COUNT(DISTINCT c.Id) AS CommentsCount,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesGiven,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesGiven,
+      MAX(u.LastAccessDate) AS LastAccessDate
+    FROM
+      Users AS u
+      LEFT OUTER JOIN Posts AS p
+        ON u.Id = p.OwnerUserId
+      LEFT OUTER JOIN Comments AS c
+        ON u.Id = c.UserId
+      LEFT OUTER JOIN Votes AS v
+        ON u.Id = v.UserId
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate
+  ),
+  QuestionStats AS (
+    SELECT
+      p.Id AS QuestionId,
+      p.Title AS QuestionTitle,
+      p.Score AS QuestionScore,
+      p.AnswerCount,
+      p.FavoriteCount,
+      p.CreationDate AS QuestionCreationDate,
+      COUNT(a.Id) AS AcceptedAnswerCount,
+      AVG(a.Score) AS AvgAnswerScore,
+      DATEDIFF(day, p.CreationDate, p.ClosedDate) AS DaysToClose,
+      ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.FavoriteCount DESC) AS QuestionRank
+    FROM
+      Posts AS p
+      LEFT OUTER JOIN Posts AS a
+        ON p.Id = a.ParentId
+      LEFT OUTER JOIN PostTypes AS pt
+        ON p.PostTypeId = pt.Id
+    WHERE
+      pt.Name = 'Question'
+      AND p.ClosedDate IS NOT NULL
+    GROUP BY
+      p.Id,
+      p.Title,
+      p.Score,
+      p.AnswerCount,
+      p.FavoriteCount,
+      p.CreationDate,
+      p.ClosedDate
+  ),
+  TagParticipation AS (
+    SELECT
+      t.TagName,
+      COUNT(DISTINCT ph.PostId) AS TagSpecificHistoryCount,
+      COUNT(DISTINCT p.Id) AS TagSpecificPostsCount,
+      SUM(CASE WHEN ph.PostHistoryTypeId = 6 THEN 1 ELSE 0 END) AS TagEdits
+    FROM
+      Tags AS t
+      LEFT OUTER JOIN Posts AS p
+        ON Posts.Tags LIKE '%' || t.TagName || '%'
+      LEFT OUTER JOIN PostHistory AS ph
+        ON p.Id = ph.PostId
+        AND ph.PostHistoryTypeId IN (3, 6, 9) -- Initial Tags, Edit Tags, Rollback Tags
+    WHERE
+      t.TagName IS NOT NULL
+    GROUP BY
+      t.TagName
+    HAVING
+      COUNT(DISTINCT p.Id) > 100
+  )
+SELECT
+  pwh.PostId,
+  pt.Name AS PostType,
+  COALESCE(pwh.PostTitle, 'No Title') AS ProcessedTitle,
+  ua.DisplayName AS OwnerDisplayName,
+  ua.Reputation AS OwnerReputation,
+  pwh.PostScore,
+  pwh.LatestHistoryDate,
+  pht.Name AS LastHistoryEventType,
+  pwh.HistoryComment,
+  qs.QuestionRank,
+  qs.DaysToClose,
+  tp.TagName,
+  tp.TagSpecificPostsCount,
+  CASE
+    WHEN ua.UserCreationDate < DATE('now', '-5 years') THEN 'Old'
+    WHEN ua.UserCreationDate < DATE('now', '-1 year') THEN 'Established'
+    ELSE 'New'
+  END AS UserAgeCategory,
+  CASE
+    WHEN pwh.PostCreationDate < DATE('now', '-1 year') THEN 'Old Post'
+    ELSE 'Recent Post'
+  END AS PostAgeCategory,
+  SUBSTRING(pwh.HistoryText FROM 1 FOR 100) AS SnippetOfHistoryText,
+  IIF(pwh.OwnerUserId = -1, 'Community Owned', 'User Owned') AS OwnershipStatus,
+  CAST(
+    (
+      JULIANDAY(pwh.LatestHistoryDate) - JULIANDAY(pwh.PostCreationDate)
+    ) AS INTEGER
+  ) AS DaysSinceLastActivity,
+  UPPER(COALESCE(pwh.OwnerDisplayName, 'Anonymous')) AS NormalizedOwnerDisplayName
+FROM
+  PostWithLatestHistory AS pwh
+  INNER JOIN PostTypes AS pt
+    ON pwh.PostTypeId = pt.Id
+  LEFT OUTER JOIN UserActivity AS ua
+    ON pwh.OwnerUserId = ua.UserId
+  LEFT OUTER JOIN PostHistoryTypes AS pht
+    ON pwh.PostHistoryTypeId = pht.Id
+  LEFT OUTER JOIN QuestionStats AS qs
+    ON pwh.PostId = qs.QuestionId
+  LEFT OUTER JOIN TagParticipation AS tp
+    ON SUBSTRING(pwh.PostTitle FROM 1 FOR LENGTH(tp.TagName)) = tp.TagName
+WHERE
+  pwh.rn = 1
+  AND pwh.PostTypeId IN (1, 2) -- Questions and Answers
+  AND COALESCE(pwh.PostScore, 0) > 10
+  AND ua.PostsCount > 50
+  AND qs.QuestionRank < 1000
+  OR tp.TagEdits > 10;

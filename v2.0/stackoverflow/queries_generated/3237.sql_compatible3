@@ -1,0 +1,144 @@
+WITH UserBadgeStats AS (
+    SELECT u.Id                                 AS UserId,
+           u.DisplayName,
+           u.Reputation,
+           COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+           COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+           COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+           SUM(CASE WHEN b.TagBased = 1 THEN 1 ELSE 0 END) AS TagBadges
+    FROM   Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+RecentQuestionPosts AS (
+    SELECT p.Id,
+           p.Title,
+           p.CreationDate,
+           p.Score,
+           p.OwnerUserId,
+           p.Tags,
+           p.ViewCount,
+           p.FavoriteCount,
+           p.AnswerCount,
+           ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+    FROM   Posts p
+    WHERE  p.PostTypeId = 1
+      AND  p.CreationDate >= (DATE '2024-10-01' - INTERVAL '30' DAY)
+),
+
+TagPopularity AS (
+    SELECT
+        tag AS Tag,
+        COUNT(*)                                          AS QuestionCount,
+        AVG(p.Score)                                      AS AvgScore,
+        SUM(p.ViewCount)                                  AS TotalViews
+    FROM (
+        SELECT p.Id, p.Score, p.ViewCount,
+               UNNEST(string_to_array(TRIM(BOTH '<>' FROM p.Tags), '><')) AS tag
+        FROM RecentQuestionPosts p
+    ) p
+    GROUP  BY tag
+),
+
+LatestCommentPerPost AS (
+    SELECT c.PostId,
+           c.Id      AS CommentId,
+           c.Text,
+           c.CreationDate,
+           ROW_NUMBER() OVER (PARTITION BY c.PostId ORDER BY c.CreationDate DESC) AS rn
+    FROM   Comments c
+),
+
+PostVoteAggregates AS (
+    SELECT v.PostId,
+           SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+           SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+           MAX(v.CreationDate)                              AS LastVoteDate
+    FROM   Votes v
+    GROUP BY v.PostId
+),
+
+PrimaryQuery AS (
+SELECT
+    ubs.UserId,
+    ubs.DisplayName,
+    ubs.Reputation,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    ubs.TagBadges,
+    rq.Id                                 AS QuestionId,
+    rq.Title,
+    rq.CreationDate,
+    rq.Score,
+    rq.ViewCount,
+    rq.FavoriteCount,
+    rq.AnswerCount,
+    COALESCE(lc.CommentId, -1)           AS LatestCommentId,
+    COALESCE(lc.Text, '(no comment)')    AS LatestCommentText,
+    COALESCE(vu.UpVotes, 0)              AS UpVotes,
+    COALESCE(vu.DownVotes, 0)            AS DownVotes,
+    CASE
+        WHEN rq.Score >= 10 AND tp.QuestionCount >= 5 THEN 'Hot'
+        WHEN rq.Score < 0                                 THEN 'Neg'
+        ELSE                                              'Normal'
+    END                                   AS QuestionStatus,
+    tp.Tag,
+    tp.QuestionCount,
+    tp.AvgScore,
+    tp.TotalViews
+FROM   UserBadgeStats ubs
+JOIN   RecentQuestionPosts rq
+       ON rq.OwnerUserId = ubs.UserId AND rq.rn = 1
+LEFT   JOIN LatestCommentPerPost lc
+       ON lc.PostId = rq.Id AND lc.rn = 1
+LEFT   JOIN PostVoteAggregates vu
+       ON vu.PostId = rq.Id
+LEFT   JOIN LATERAL (
+           SELECT UNNEST(string_to_array(TRIM(BOTH '<>' FROM rq.Tags), '><')) AS Tag
+       ) AS tlist ON TRUE
+LEFT   JOIN TagPopularity tp
+       ON tp.Tag = tlist.Tag
+WHERE  (ubs.Reputation > 10000 OR ubs.GoldBadges > 0)
+  AND  (rq.Score IS NOT NULL AND rq.Score <> 0)
+  AND  (rq.ClosedDate IS NULL OR rq.ClosedDate > (DATE '2024-10-01' - INTERVAL '1' DAY'))
+)
+
+SELECT *
+FROM PrimaryQuery
+ORDER BY Reputation DESC, Score DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    CAST(NULL AS BIGINT)   AS UserId,
+    CAST(NULL AS VARCHAR)  AS DisplayName,
+    CAST(NULL AS INTEGER)  AS Reputation,
+    CAST(NULL AS INTEGER)  AS GoldBadges,
+    CAST(NULL AS INTEGER)  AS SilverBadges,
+    CAST(NULL AS INTEGER)  AS BronzeBadges,
+    CAST(NULL AS INTEGER)  AS TagBadges,
+    p.Id                             AS QuestionId,
+    CAST(NULL AS VARCHAR)            AS Title,
+    CAST(NULL AS TIMESTAMP)          AS CreationDate,
+    CAST(NULL AS INTEGER)            AS Score,
+    CAST(NULL AS INTEGER)            AS ViewCount,
+    CAST(NULL AS INTEGER)            AS FavoriteCount,
+    CAST(NULL AS INTEGER)            AS AnswerCount,
+    CAST(NULL AS BIGINT)             AS LatestCommentId,
+    CAST(NULL AS VARCHAR)            AS LatestCommentText,
+    CAST(NULL AS INTEGER)            AS UpVotes,
+    CAST(NULL AS INTEGER)            AS DownVotes,
+    CAST(NULL AS VARCHAR)            AS QuestionStatus,
+    CAST(NULL AS VARCHAR)            AS Tag,
+    CAST(NULL AS INTEGER)            AS QuestionCount,
+    CAST(NULL AS NUMERIC)            AS AvgScore,
+    CAST(NULL AS BIGINT)             AS TotalViews
+FROM   Posts p
+WHERE  p.PostTypeId = 2
+  AND  NOT EXISTS (SELECT 1 FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2)
+  AND  p.CreationDate < (DATE '2024-10-01' - INTERVAL '365' DAY)
+ORDER BY p.CreationDate DESC
+LIMIT 50;

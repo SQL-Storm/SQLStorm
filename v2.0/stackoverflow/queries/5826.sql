@@ -1,0 +1,158 @@
+WITH recent_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180 days'
+),
+tag_rows AS (
+  -- split tags into rows using a recursive CTE in a dialect-neutral way
+  SELECT sr.id, sr.tag
+  FROM (
+    SELECT
+      p.Id,
+      TRIM(BOTH '<' FROM TRIM(BOTH '>' FROM p.Tags)) AS tags_inner
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+  ) p
+  JOIN LATERAL (
+    WITH RECURSIVE split(id, tags_remaining, tag, nxt_pos) AS (
+      SELECT
+        p.Id,
+        p.tags_inner,
+        CASE
+          WHEN p.tags_inner = '' THEN NULL
+          WHEN POSITION('><' IN p.tags_inner) = 0 THEN p.tags_inner
+          ELSE SUBSTRING(p.tags_inner FROM 1 FOR POSITION('><' IN p.tags_inner) - 1)
+        END AS tag,
+        POSITION('><' IN p.tags_inner)
+      UNION ALL
+      SELECT
+        id,
+        CASE WHEN nxt_pos = 0 THEN '' ELSE SUBSTRING(tags_remaining FROM nxt_pos + 2) END,
+        CASE
+          WHEN nxt_pos = 0 THEN NULL
+          WHEN POSITION('><' IN SUBSTRING(tags_remaining FROM nxt_pos + 2)) = 0 THEN SUBSTRING(tags_remaining FROM nxt_pos + 2)
+          ELSE SUBSTRING(SUBSTRING(tags_remaining FROM nxt_pos + 2) FROM 1 FOR POSITION('><' IN SUBSTRING(tags_remaining FROM nxt_pos + 2)) - 1)
+        END,
+        CASE
+          WHEN nxt_pos = 0 THEN 0
+          ELSE POSITION('><' IN SUBSTRING(tags_remaining FROM nxt_pos + 2))
+        END
+      FROM split
+      WHERE tags_remaining IS NOT NULL AND tags_remaining <> '' AND nxt_pos <> 0
+    )
+    SELECT id, tag FROM split WHERE tag IS NOT NULL
+  ) sr ON TRUE
+),
+tag_stats AS (
+  SELECT
+    tr.tag,
+    COUNT(*) AS total_posts,
+    AVG(p.Score) AS avg_score,
+    SUM(p.ViewCount) AS total_views
+  FROM tag_rows tr
+  JOIN Posts p ON p.Id = tr.id
+  WHERE p.PostTypeId = 1
+  GROUP BY tr.tag
+),
+top_authors AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(r.PostId) AS recent_questions
+  FROM Users u
+  JOIN recent_questions r ON r.OwnerUserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+  HAVING COUNT(r.PostId) > 5
+),
+complex_posts AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.Tags,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.ViewCount,
+    p.Score,
+    EXISTS (
+      SELECT 1
+      FROM Votes v
+      WHERE v.PostId = p.Id
+        AND v.VoteTypeId = 2
+        AND v.CreationDate > p.CreationDate
+    ) AS had_upmod_after_creation,
+    EXISTS (
+      SELECT 1
+      FROM PostLinks pl
+      WHERE pl.PostId = p.Id
+        AND pl.RelatedPostId = p.Id
+    ) AS has_self_link
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.LastActivityDate > p.CreationDate
+),
+outer_join_demo AS (
+  SELECT
+    a.UserId,
+    a.DisplayName,
+    b.total_posts AS user_total_questions,
+    c.total_views AS user_total_views
+  FROM top_authors a
+  LEFT JOIN (
+    SELECT OwnerUserId, COUNT(*) AS total_posts
+    FROM Posts
+    WHERE PostTypeId = 1
+    GROUP BY OwnerUserId
+  ) b ON a.UserId = b.OwnerUserId
+  LEFT JOIN (
+    SELECT OwnerUserId, SUM(ViewCount) AS total_views
+    FROM Posts
+    WHERE PostTypeId = 1
+    GROUP BY OwnerUserId
+  ) c ON a.UserId = c.OwnerUserId
+)
+SELECT
+  ra.UserId,
+  ra.DisplayName,
+  ta.Reputation,
+  ra.user_total_questions,
+  ra.user_total_views,
+  tt.tag,
+  tt.total_posts AS tag_post_count,
+  tt.avg_score AS tag_avg_score,
+  tt.total_views AS tag_total_views,
+  COALESCE(c.complex_count, 0) AS complex_post_count
+FROM outer_join_demo ra
+JOIN top_authors ta ON ra.UserId = ta.UserId
+LEFT JOIN tag_stats tt ON TRUE
+LEFT JOIN (
+  SELECT
+    p.OwnerUserId,
+    COUNT(*) AS complex_count
+  FROM complex_posts p
+  GROUP BY p.OwnerUserId
+) c ON ra.UserId = c.OwnerUserId
+GROUP BY
+  ra.UserId,
+  ra.DisplayName,
+  ta.Reputation,
+  ra.user_total_questions,
+  ra.user_total_views,
+  tt.tag,
+  tt.total_posts,
+  tt.avg_score,
+  tt.total_views,
+  c.complex_count
+ORDER BY ta.Reputation DESC NULLS LAST, ra.user_total_questions DESC NULLS LAST
+LIMIT 100;

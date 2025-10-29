@@ -1,0 +1,280 @@
+WITH PostStats AS (
+  SELECT 
+    p.Id,
+    p.PostTypeId,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.Title,
+    p.Tags,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.LastActivityDate,
+    p.LastEditDate,
+    p.LastEditorUserId,
+    p.LastEditorDisplayName,
+    p.OwnerDisplayName,
+    p.Body,
+    CASE 
+      WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Question with Accepted Answer'
+      WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NULL THEN 'Question without Accepted Answer'
+      WHEN p.PostTypeId = 2 THEN 'Answer'
+      ELSE 'Other'
+    END AS PostTypeCategory,
+    CASE 
+      WHEN p.Score > 100 THEN 'HighlyVoted'
+      WHEN p.Score > 50 THEN 'ModeratelyVoted'
+      WHEN p.Score > 0 THEN 'LowVoted'
+      ELSE 'NoVotes'
+    END AS VoteCategory,
+    DENSE_RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) as ScoreRank,
+    NTILE(4) OVER (ORDER BY p.Score) as ScoreQuartile,
+    COALESCE(p.OwnerUserId, -1) as EffectiveOwnerId,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ASC) as UserPostSequence
+  FROM Posts p
+),
+UserActivity AS (
+  SELECT 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.LastAccessDate,
+    COUNT(DISTINCT ps.Id) as TotalPosts,
+    COUNT(DISTINCT CASE WHEN ps.PostTypeId = 1 THEN ps.Id END) as QuestionCount,
+    COUNT(DISTINCT CASE WHEN ps.PostTypeId = 2 THEN ps.Id END) as AnswerCount,
+    SUM(ps.Score) as TotalScore,
+    AVG(ps.Score) as AverageScore,
+    MAX(ps.CreationDate) as LastPostDate,
+    STRING_AGG(DISTINCT ps.Title, ' | ') as AllPostTitles,
+    STRING_AGG(DISTINCT ps.Tags, ' | ') as AllTags,
+    COALESCE(MAX(ps.CreationDate), u.CreationDate) as ActivityDate
+  FROM Users u
+  LEFT JOIN PostStats ps ON u.Id = ps.OwnerUserId
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.LastAccessDate, u.CreationDate
+),
+TagAnalysis AS (
+  SELECT 
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId,
+    t.WikiPostId,
+    t.IsModeratorOnly,
+    t.IsRequired,
+    CASE 
+      WHEN t.Count > 1000 THEN 'Popular'
+      WHEN t.Count > 100 THEN 'Moderate'
+      WHEN t.Count > 10 THEN 'Niche'
+      ELSE 'Rare'
+    END as PopularityLevel
+  FROM Tags t
+),
+PostTagAnalysis AS (
+  SELECT 
+    ps.Id,
+    ps.Title,
+    ps.Tags,
+    ps.OwnerUserId,
+    ps.Score,
+    ps.ViewCount,
+    ps.CreationDate,
+    ps.PostTypeId,
+    CASE 
+      WHEN ps.Tags IS NOT NULL AND CHAR_LENGTH(ps.Tags) > 2 THEN 
+        (SELECT COUNT(*) FROM (
+           SELECT unnest(string_to_array(SUBSTRING(ps.Tags FROM 2 FOR CHAR_LENGTH(ps.Tags)-2), '><')) AS tag
+         ) s)
+      ELSE 0
+    END as TagCount,
+    COALESCE(
+      (SELECT COUNT(*) FROM Comments c WHERE c.PostId = ps.Id AND c.Score > 0),
+      0
+    ) as PositiveComments,
+    COALESCE(
+      (SELECT COUNT(*) FROM Votes v WHERE v.PostId = ps.Id AND v.VoteTypeId IN (2,3)),
+      0
+    ) as VoteCount,
+    CASE 
+      WHEN ps.PostTypeId = 1 THEN 'Question'
+      WHEN ps.PostTypeId = 2 THEN 'Answer'
+      ELSE 'Other'
+    END as PostCategory,
+    COALESCE(
+      (SELECT AVG(v.Score) FROM Votes v WHERE v.PostId = ps.Id AND v.VoteTypeId IN (2,3)),
+      0
+    ) as AvgVoteScore
+  FROM PostStats ps
+  WHERE ps.PostTypeId IN (1,2)
+),
+ComplexPostAnalysis AS (
+  SELECT 
+    pta.Id,
+    pta.Title,
+    pta.Tags,
+    pta.OwnerUserId,
+    pta.Score,
+    pta.ViewCount,
+    pta.CreationDate,
+    pta.PostTypeId,
+    pta.TagCount,
+    pta.PositiveComments,
+    pta.VoteCount,
+    pta.PostCategory,
+    pta.AvgVoteScore,
+    CASE 
+      WHEN pta.Score > (SELECT AVG(pt2.Score) FROM PostTagAnalysis pt2 WHERE pt2.PostTypeId = 1) THEN 'AboveAverageQuestion'
+      WHEN pta.Score < (SELECT AVG(pt2.Score) FROM PostTagAnalysis pt2 WHERE pt2.PostTypeId = 1) THEN 'BelowAverageQuestion'
+      ELSE 'AverageQuestion'
+    END as QuestionPerformance,
+    CASE 
+      WHEN pta.ViewCount > (SELECT AVG(pt2.ViewCount) FROM PostTagAnalysis pt2 WHERE pt2.PostTypeId = 1) THEN 'PopularQuestion'
+      WHEN pta.ViewCount < (SELECT AVG(pt2.ViewCount) FROM PostTagAnalysis pt2 WHERE pt2.PostTypeId = 1) THEN 'LessPopularQuestion'
+      ELSE 'AverageQuestionViews'
+    END as QuestionPopularity,
+    CASE 
+      WHEN pta.Score > (SELECT AVG(pt2.Score) FROM PostTagAnalysis pt2 WHERE pt2.PostTypeId = 2) THEN 'AboveAverageAnswer'
+      WHEN pta.Score < (SELECT AVG(pt2.Score) FROM PostTagAnalysis pt2 WHERE pt2.PostTypeId = 2) THEN 'BelowAverageAnswer'
+      ELSE 'AverageAnswer'
+    END as AnswerQuality,
+    pta.Score - LAG(pta.Score) OVER (ORDER BY pta.CreationDate) as ScoreChange,
+    pta.Score - FIRST_VALUE(pta.Score) OVER (PARTITION BY pta.OwnerUserId ORDER BY pta.CreationDate) as ScoreDifferenceFromUserStart
+  FROM PostTagAnalysis pta
+),
+AggregatedResults AS (
+  SELECT 
+    cpa.Id,
+    cpa.Title,
+    cpa.Tags,
+    cpa.OwnerUserId,
+    cpa.Score,
+    cpa.ViewCount,
+    cpa.CreationDate,
+    cpa.PostTypeId,
+    cpa.TagCount,
+    cpa.PositiveComments,
+    cpa.VoteCount,
+    cpa.PostCategory,
+    cpa.AvgVoteScore,
+    cpa.QuestionPerformance,
+    cpa.QuestionPopularity,
+    cpa.AnswerQuality,
+    cpa.ScoreChange,
+    cpa.ScoreDifferenceFromUserStart,
+    ua.DisplayName as OwnerDisplayName,
+    ua.Reputation as OwnerReputation,
+    ua.TotalPosts as OwnerTotalPosts,
+    ua.QuestionCount as OwnerQuestionCount,
+    ua.AnswerCount as OwnerAnswerCount,
+    ua.TotalScore as OwnerTotalScore,
+    ua.AverageScore as OwnerAverageScore,
+    ta.TagName,
+    ta.Count as TagCount,
+    ta.PopularityLevel,
+    COALESCE(cpa.PositiveComments, 0) + COALESCE(cpa.VoteCount, 0) as EngagementScore,
+    CASE 
+      WHEN cpa.TagCount > 0 THEN 
+        (cpa.Score * cpa.ViewCount) / NULLIF(cpa.TagCount, 0)
+      ELSE NULL
+    END as TagEfficiency,
+    CASE 
+      WHEN cpa.Score > 100 AND cpa.ViewCount > 1000 THEN 'HighImpact'
+      WHEN cpa.Score > 50 AND cpa.ViewCount > 500 THEN 'MediumImpact'
+      WHEN cpa.Score > 0 AND cpa.ViewCount > 100 THEN 'LowImpact'
+      ELSE 'NoImpact'
+    END as ImpactLevel,
+    ROW_NUMBER() OVER (ORDER BY cpa.Score DESC) as GlobalRank,
+    DENSE_RANK() OVER (PARTITION BY cpa.OwnerUserId ORDER BY cpa.Score DESC) as UserRank,
+    PERCENT_RANK() OVER (ORDER BY cpa.Score) as ScorePercentile,
+    NTILE(10) OVER (ORDER BY cpa.Score DESC) as ScoreDecile,
+    CASE 
+      WHEN cpa.ScoreChange IS NOT NULL THEN 
+        (cpa.ScoreChange * 100.0) / NULLIF(LAG(cpa.Score) OVER (ORDER BY cpa.CreationDate), 0)
+      ELSE NULL
+    END as PercentChangeFromPrevious
+  FROM ComplexPostAnalysis cpa
+  LEFT JOIN UserActivity ua ON cpa.OwnerUserId = ua.UserId
+  LEFT JOIN TagAnalysis ta ON EXISTS (
+    SELECT 1 FROM (
+      SELECT unnest(string_to_array(SUBSTRING(cpa.Tags FROM 2 FOR CHAR_LENGTH(cpa.Tags)-2), '><')) AS tag
+    ) s WHERE s.tag = ta.TagName
+  )
+),
+FinalResults AS (
+  SELECT 
+    ar.*,
+    CASE 
+      WHEN ar.OwnerReputation > 10000 AND ar.OwnerTotalPosts > 100 THEN 'Veteran'
+      WHEN ar.OwnerReputation > 1000 AND ar.OwnerTotalPosts > 50 THEN 'Experienced'
+      WHEN ar.OwnerReputation > 100 AND ar.OwnerTotalPosts > 10 THEN 'Intermediate'
+      ELSE 'Beginner'
+    END as UserLevel,
+    CASE 
+      WHEN ar.Score > 50 AND ar.ViewCount > 500 THEN 'Engaging'
+      WHEN ar.Score > 0 AND ar.ViewCount > 100 THEN 'Basic'
+      WHEN ar.Score < 0 THEN 'Unpopular'
+      ELSE 'Neutral'
+    END as EngagementLevel,
+    CASE 
+      WHEN ar.OwnerAverageScore > 10 THEN 'HighScoring'
+      WHEN ar.OwnerAverageScore > 5 THEN 'ModerateScoring'
+      WHEN ar.OwnerAverageScore > 0 THEN 'LowScoring'
+      ELSE 'NoScoring'
+    END as OwnerPerformance,
+    CASE 
+      WHEN ar.GlobalRank <= 10 THEN 'Top10'
+      WHEN ar.GlobalRank <= 100 THEN 'Top100'
+      WHEN ar.GlobalRank <= 1000 THEN 'Top1000'
+      ELSE 'BelowTop1000'
+    END as GlobalPerformance,
+    CONCAT(ar.Title, ' - ', ar.TagCount, ' tags, ', ar.Score, ' points') as TitleWithDetails,
+    CASE 
+      WHEN ar.OwnerDisplayName IS NOT NULL THEN 
+        CONCAT(ar.OwnerDisplayName, ' (', ar.OwnerReputation, ' rep)')
+      ELSE 'Unknown User'
+    END as UserIdentifier,
+    CAST(ar.CreationDate as DATE) as CreationDateOnly,
+    EXTRACT(YEAR FROM ar.CreationDate) as CreationYear,
+    EXTRACT(MONTH FROM ar.CreationDate) as CreationMonth,
+    EXTRACT(DAY FROM ar.CreationDate) as CreationDay,
+    CASE 
+      WHEN ar.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '1 year' THEN TRUE
+      ELSE FALSE
+    END as RecentPost,
+    CASE 
+      WHEN ar.TagEfficiency IS NOT NULL AND ar.Tags IS NOT NULL THEN
+        CASE 
+          WHEN ar.TagEfficiency > 100 THEN 'HighlyEfficient'
+          WHEN ar.TagEfficiency > 50 THEN 'ModerateEfficiency'
+          WHEN ar.TagEfficiency > 10 THEN 'LowEfficiency'
+          ELSE 'PoorEfficiency'
+        END
+      ELSE 'UnknownEfficiency'
+    END as EfficiencyCategory,
+    MOD(ar.Score, 10) as ScoreMod10,
+    MOD(ar.ViewCount, 100) as ViewCountMod100
+  FROM AggregatedResults ar
+)
+SELECT 
+  fr.*,
+  NULLIF(fr.EnjoymentScore, 0) as EnjoymentScoreOrNull,
+  CASE 
+    WHEN fr.EnjoymentScore < 0 THEN 'Negative'
+    WHEN fr.EnjoymentScore = 0 THEN 'Neutral'
+    ELSE 'Positive'
+  END as EnjoymentCategory
+FROM FinalResults fr
+WHERE fr.OwnerDisplayName IS NOT NULL 
+  AND fr.Title IS NOT NULL
+  AND fr.Score IS NOT NULL
+  AND fr.ViewCount IS NOT NULL
+  AND fr.OwnerReputation > 0
+  AND (fr.PostTypeId = 1 OR fr.PostTypeId = 2)
+  AND fr.EnjoymentScore IS NOT NULL
+ORDER BY fr.Score DESC, fr.ViewCount DESC, fr.CreationDate DESC
+LIMIT 5000;

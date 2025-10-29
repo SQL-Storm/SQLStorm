@@ -1,0 +1,326 @@
+-- {"query": "902.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2951} 
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.location,
+        u.creationdate,
+        coalesce(nullif(trim(split_part(coalesce(u.websiteurl, ''), '/', 3)), ''), 'unknown.host') as host,
+        row_number() over (order by u.creationdate desc, u.id desc) as rn
+    from users u
+    where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+q_and_a as (
+    select
+        p.id,
+        p.posttypeid,
+        p.owneruserid,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        p.title,
+        p.tags,
+        p.parentid,
+        p.acceptedanswerid
+    from posts p
+    where p.posttypeid in (1,2)
+),
+user_posts as (
+    select
+        ru.user_id,
+        count(*) filter (where qa.posttypeid = 1) as question_count,
+        count(*) filter (where qa.posttypeid = 2) as answer_count,
+        sum(case when qa.posttypeid = 1 then coalesce(qa.score,0) else 0 end) as q_score,
+        sum(case when qa.posttypeid = 2 then coalesce(qa.score,0) else 0 end) as a_score,
+        max(qa.creationdate) as last_post_date
+    from recent_users ru
+    left join q_and_a qa
+      on qa.owneruserid = ru.user_id
+    group by ru.user_id
+),
+votes_agg as (
+    select
+        p.owneruserid as user_id,
+        count(*) filter (where v.votetypeid = 2) as upvotes_rcvd,
+        count(*) filter (where v.votetypeid = 3) as downvotes_rcvd,
+        count(*) filter (where v.votetypeid = 1) as accepts_rcvd,
+        sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_flow
+    from posts p
+    join votes v on v.postid = p.id
+    where p.owneruserid is not null
+    group by p.owneruserid
+),
+comments_agg as (
+    select
+        coalesce(c.userid, -1) as user_id,
+        count(*) as comment_count,
+        sum(case when c.score > 0 then 1 else 0 end) as pos_comment_count,
+        max(c.creationdate) as last_comment_date
+    from comments c
+    group by coalesce(c.userid, -1)
+),
+badges_agg as (
+    select
+        b.userid as user_id,
+        count(*) filter (where b.class = 1) as gold,
+        count(*) filter (where b.class = 2) as silver,
+        count(*) filter (where b.class = 3) as bronze,
+        count(*) filter (where b.tagbased = 1) as tag_badges,
+        min(b.date) as first_badge_date,
+        max(b.date) as last_badge_date
+    from badges b
+    group by b.userid
+),
+question_tag_stats as (
+    select
+        p.owneruserid as user_id,
+        count(*) as questions_with_tags,
+        sum(cardinality(string_to_array(substring(p.tags, 2, greatest(length(p.tags)-2,0)), '><'))) as total_tag_count,
+        max(p.viewcount) as max_q_views
+    from posts p
+    where p.posttypeid = 1
+      and p.tags is not null
+    group by p.owneruserid
+),
+dup_links as (
+    select
+        pl.postid,
+        count(*) filter (where pl.linktypeid = 3) as duplicate_marks,
+        count(*) filter (where pl.linktypeid = 1) as linked_refs
+    from postlinks pl
+    group by pl.postid
+),
+closure_events as (
+    select
+        ph.postid,
+        count(*) filter (where ph.posthistorytypeid = 10) as closes,
+        count(*) filter (where ph.posthistorytypeid = 11) as reopens,
+        max(case when ph.posthistorytypeid = 10 then ph.creationdate end) as last_close_at,
+        max(case when ph.posthistorytypeid = 11 then ph.creationdate end) as last_reopen_at,
+        max(case when ph.posthistorytypeid = 10 then try_cast(ph.comment as int) end) as last_close_reason_id
+    from posthistory ph
+    where ph.posthistorytypeid in (10,11)
+    group by ph.postid
+),
+user_quality as (
+    select
+        ru.user_id,
+        (up.q_score + up.a_score) as total_score,
+        coalesce(va.upvotes_rcvd,0) - coalesce(va.downvotes_rcvd,0) as net_votes_rcvd,
+        case
+            when coalesce(up.answer_count,0) = 0 then null
+            else round((coalesce(va.accepts_rcvd,0)::numeric / nullif(up.answer_count,0)) * 100, 2)
+        end as accept_rate_pct,
+        coalesce(qts.max_q_views,0) as max_q_views
+    from recent_users ru
+    left join user_posts up on up.user_id = ru.user_id
+    left join votes_agg va on va.user_id = ru.user_id
+    left join question_tag_stats qts on qts.user_id = ru.user_id
+),
+hot_questions as (
+    select
+        p.id as post_id,
+        p.owneruserid as user_id,
+        p.score,
+        p.viewcount,
+        p.title,
+        row_number() over (partition by p.owneruserid order by p.viewcount desc, p.score desc, p.id) as rn
+    from posts p
+    where p.posttypeid = 1
+),
+answers_to_hot as (
+    select
+        a.owneruserid as user_id,
+        count(*) as answers_to_hot_q
+    from posts a
+    join hot_questions hq
+      on hq.post_id = a.parentid
+     and hq.rn = 1
+    where a.posttypeid = 2
+    group by a.owneruserid
+),
+user_activity_rank as (
+    select
+        ru.user_id,
+        dense_rank() over (order by coalesce(up.answer_count,0) desc, coalesce(up.question_count,0) desc, ru.reputation desc, ru.user_id) as activity_rank
+    from recent_users ru
+    left join user_posts up on up.user_id = ru.user_id
+),
+post_mix as (
+    select
+        ru.user_id,
+        coalesce(up.question_count,0) as q_cnt,
+        coalesce(up.answer_count,0) as a_cnt,
+        case
+            when coalesce(up.question_count,0) + coalesce(up.answer_count,0) = 0 then 'none'
+            when coalesce(up.answer_count,0) = 0 then 'questioner'
+            when coalesce(up.question_count,0) = 0 then 'answerer'
+            when coalesce(up.answer_count,0) >= 4 * greatest(coalesce(up.question_count,0),1) then 'mostly answerer'
+            when coalesce(up.question_count,0) >= 4 * greatest(coalesce(up.answer_count,0),1) then 'mostly questioner'
+            else 'balanced'
+        end as mix_bucket
+    from recent_users ru
+    left join user_posts up on up.user_id = ru.user_id
+),
+null_safety as (
+    select
+        ru.user_id,
+        coalesce(va.upvotes_rcvd,0) as upvotes_rcvd,
+        coalesce(va.downvotes_rcvd,0) as downvotes_rcvd,
+        coalesce(va.accepts_rcvd,0) as accepts_rcvd,
+        coalesce(va.bounty_flow,0) as bounty_flow
+    from recent_users ru
+    left join votes_agg va on va.user_id = ru.user_id
+),
+bench_source as (
+    select
+        ru.user_id,
+        ru.displayname,
+        ru.reputation,
+        ru.location,
+        ru.creationdate as user_created_at,
+        ru.host,
+        up.question_count,
+        up.answer_count,
+        up.q_score,
+        up.a_score,
+        up.last_post_date,
+        ca.comment_count,
+        ca.pos_comment_count,
+        ca.last_comment_date,
+        ba.gold,
+        ba.silver,
+        ba.bronze,
+        ba.tag_badges,
+        ba.first_badge_date,
+        ba.last_badge_date,
+        na.upvotes_rcvd,
+        na.downvotes_rcvd,
+        na.accepts_rcvd,
+        na.bounty_flow,
+        qts.questions_with_tags,
+        qts.total_tag_count,
+        uq.total_score,
+        uq.net_votes_rcvd,
+        uq.accept_rate_pct,
+        uq.max_q_views,
+        coalesce(ah.answers_to_hot_q,0) as answers_to_hot_q,
+        uar.activity_rank,
+        pm.mix_bucket
+    from recent_users ru
+    left join user_posts up on up.user_id = ru.user_id
+    left join comments_agg ca on ca.user_id = ru.user_id
+    left join badges_agg ba on ba.user_id = ru.user_id
+    left join null_safety na on na.user_id = ru.user_id
+    left join question_tag_stats qts on qts.user_id = ru.user_id
+    left join user_quality uq on uq.user_id = ru.user_id
+    left join answers_to_hot ah on ah.user_id = ru.user_id
+    left join user_activity_rank uar on uar.user_id = ru.user_id
+    left join post_mix pm on pm.user_id = ru.user_id
+),
+ranked as (
+    select
+        b.*,
+        row_number() over (
+            partition by b.mix_bucket
+            order by coalesce(b.total_score,0) desc, coalesce(b.net_votes_rcvd,0) desc, b.reputation desc, b.user_id
+        ) as bucket_rank,
+        percentile_cont(0.9) within group (order by coalesce(b.total_score,0)) over () as p90_total_score
+    from bench_source b
+),
+bucket_summary as (
+    select
+        mix_bucket,
+        count(*) as bucket_users,
+        avg(coalesce(total_score,0)) as avg_total_score,
+        stddev_pop(coalesce(total_score,0)) as std_total_score,
+        sum(coalesce(upvotes_rcvd,0)) as sum_up_rcvd,
+        sum(coalesce(downvotes_rcvd,0)) as sum_down_rcvd,
+        min(user_created_at) as earliest_user,
+        max(last_post_date) as last_post_any
+    from bench_source
+    group by mix_bucket
+),
+tag_heavy_users as (
+    select
+        b.user_id,
+        case when coalesce(b.questions_with_tags,0) > 0
+             then round((coalesce(b.total_tag_count,0)::numeric / nullif(b.questions_with_tags,0)), 2)
+             else null
+        end as avg_tags_per_question
+    from bench_source b
+    where coalesce(b.questions_with_tags,0) > 0
+),
+final_union as (
+    select
+        r.user_id,
+        r.displayname,
+        r.reputation,
+        r.location,
+        r.host,
+        r.mix_bucket,
+        r.bucket_rank,
+        r.activity_rank,
+        r.question_count,
+        r.answer_count,
+        r.total_score,
+        r.net_votes_rcvd,
+        r.accept_rate_pct,
+        r.max_q_views,
+        r.upvotes_rcvd,
+        r.downvotes_rcvd,
+        r.accepts_rcvd,
+        r.bounty_flow,
+        r.gold, r.silver, r.bronze, r.tag_badges,
+        r.last_badge_date,
+        coalesce(thu.avg_tags_per_question, 0) as avg_tags_per_question,
+        r.p90_total_score,
+        'USER_ROW' as row_kind
+    from ranked r
+    left join tag_heavy_users thu on thu.user_id = r.user_id
+
+    union all
+
+    select
+        null::int as user_id,
+        concat('BUCKET=', bs.mix_bucket) as displayname,
+        null::int as reputation,
+        null::varchar(100) as location,
+        null::varchar(200) as host,
+        bs.mix_bucket,
+        null::bigint as bucket_rank,
+        null::bigint as activity_rank,
+        null::bigint as question_count,
+        null::bigint as answer_count,
+        bs.avg_total_score::numeric as total_score,
+        bs.sum_up_rcvd::bigint - bs.sum_down_rcvd::bigint as net_votes_rcvd,
+        null::numeric as accept_rate_pct,
+        null::int as max_q_views,
+        bs.sum_up_rcvd::bigint as upvotes_rcvd,
+        bs.sum_down_rcvd::bigint as downvotes_rcvd,
+        null::bigint as accepts_rcvd,
+        null::bigint as bounty_flow,
+        null::bigint as gold, null::bigint as silver, null::bigint as bronze, null::bigint as tag_badges,
+        bs.last_post_any as last_badge_date,
+        null::numeric as avg_tags_per_question,
+        null::numeric as p90_total_score,
+        'BUCKET_SUMMARY' as row_kind
+    from bucket_summary bs
+)
+select *
+from final_union
+where
+    (
+        row_kind = 'USER_ROW'
+        and (
+            bucket_rank <= 50
+            or (total_score is not null and total_score >= coalesce(p90_total_score, 0))
+        )
+    )
+    or row_kind = 'BUCKET_SUMMARY'
+order by
+    case when row_kind = 'BUCKET_SUMMARY' then 1 else 0 end,
+    mix_bucket,
+    coalesce(bucket_rank, 0),
+    displayname;

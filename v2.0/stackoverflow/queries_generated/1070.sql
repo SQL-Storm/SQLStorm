@@ -1,0 +1,266 @@
+-- {"query": "1070.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3492} 
+WITH UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COALESCE(AVG(p.Score), 0) AS AvgPostScore,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        MAX(b.Class) AS MaxBadgeClass, -- 1=Gold, 2=Silver, 3=Bronze (min value is better)
+        -- Correlated subquery example: Get the latest badge date for the user
+        (SELECT MAX(b_sub.Date) FROM Badges b_sub WHERE b_sub.UserId = u.Id) AS LatestBadgeDate,
+        -- Conditional reputation tier
+        CASE
+            WHEN u.Reputation >= 100000 THEN 'Legend'
+            WHEN u.Reputation >= 25000 THEN 'Guru'
+            WHEN u.Reputation >= 5000 THEN 'Expert'
+            WHEN u.Reputation >= 1000 THEN 'Pro'
+            ELSE 'Novice'
+        END AS ReputationTier
+    FROM
+        Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+PostDetails AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.Body,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        COALESCE(p.LastEditDate, p.CreationDate) AS EffectiveLastEditDate,
+        p.LastActivityDate,
+        p.ClosedDate,
+        -- String expression and NULL logic: Extract first paragraph if it exists
+        NULLIF(TRIM(SUBSTRING(p.Body, POSITION('<p>', p.Body) + 3, POSITION('</p>', p.Body) - (POSITION('<p>', p.Body) + 3))), '') AS FirstParagraphSummary,
+        -- Window function: Rank posts by score within each PostType
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.CreationDate DESC) AS RankInPostType,
+        -- Window function: Lag to find the previous post by the same owner
+        LAG(p.Id, 1, -1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostIdByOwner,
+        -- Complicated calculation: engagement score based on votes, views, comments, favorites
+        (p.Score * 5 + COALESCE(p.ViewCount, 0) / 100 + COALESCE(p.CommentCount, 0) * 2 + COALESCE(p.FavoriteCount, 0) * 10) *
+        (CASE WHEN p.ClosedDate IS NOT NULL THEN 0.5 ELSE 1.0 END) AS CalculatedEngagementScore,
+        -- Tags as array (assuming PostgreSQL `string_to_array` for example)
+        CASE
+            WHEN p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2 THEN
+                string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><')
+            ELSE ARRAY[]::varchar(50)[]
+        END AS TagArray
+    FROM
+        Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE
+        p.OwnerUserId IS NOT NULL -- Exclude community-owned or deleted user posts
+        AND p.CreationDate >= '2020-01-01' -- Filter for recent data
+),
+PostEditorActivity AS (
+    SELECT
+        ph.PostId,
+        COUNT(DISTINCT ph.UserId) AS UniqueEditors,
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.CreationDate ELSE NULL END) AS LastContentEditDate,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 4 THEN 1 ELSE NULL END) AS TitleEditCount,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 5 THEN 1 ELSE NULL END) AS BodyEditCount,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 6 THEN 1 ELSE NULL END) AS TagEditCount
+    FROM
+        PostHistory ph
+    WHERE
+        ph.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9) -- Edits and rollbacks
+    GROUP BY
+        ph.PostId
+),
+PostLinkAnalysis AS (
+    SELECT
+        pl.PostId,
+        COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 1 THEN pl.RelatedPostId ELSE NULL END) AS LinkedPostsCount,
+        COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN pl.RelatedPostId ELSE NULL END) AS DuplicateOfPostsCount,
+        -- Non-correlated subquery for average score of linked posts
+        (SELECT COALESCE(AVG(p_sub.Score), 0) FROM Posts p_sub WHERE p_sub.Id IN (SELECT pl_sub.RelatedPostId FROM PostLinks pl_sub WHERE pl_sub.PostId = pl.PostId AND pl_sub.LinkTypeId = 1)) AS AvgLinkedPostScore
+    FROM
+        PostLinks pl
+    GROUP BY
+        pl.PostId
+),
+TagMetrics AS (
+    SELECT
+        UNNEST(pd.TagArray) AS TagName, -- Explode TagArray into rows
+        pd.PostId,
+        pd.PostScore,
+        pd.CalculatedEngagementScore,
+        pd.PostCreationDate
+    FROM
+        PostDetails pd
+    WHERE
+        pd.PostTypeId = 1 -- Only analyze tags for questions
+        AND array_length(pd.TagArray, 1) > 0
+),
+AggregatedTagMetrics AS (
+    SELECT
+        tm.TagName,
+        COUNT(DISTINCT tm.PostId) AS QuestionsWithTag,
+        COALESCE(AVG(tm.PostScore), 0) AS AvgTagQuestionScore,
+        COALESCE(AVG(tm.CalculatedEngagementScore), 0) AS AvgTagEngagementScore,
+        -- Window function: Percentage of questions created within the last year for this tag
+        100.0 * SUM(CASE WHEN tm.PostCreationDate >= (CURRENT_DATE - INTERVAL '1 year') THEN 1 ELSE 0 END) OVER (PARTITION BY tm.TagName) /
+            NULLIF(COUNT(tm.PostId) OVER (PARTITION BY tm.TagName), 0) AS RecentActivityRatio
+    FROM
+        TagMetrics tm
+    GROUP BY
+        tm.TagName
+),
+VoteAnalysis AS (
+    SELECT
+        v.PostId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS Downvotes,
+        SUM(CASE WHEN v.VoteTypeId = 1 THEN 1 ELSE 0 END) AS AcceptedAnswers,
+        SUM(CASE WHEN v.VoteTypeId = 8 THEN v.BountyAmount ELSE 0 END) AS TotalBountyGiven,
+        SUM(CASE WHEN v.VoteTypeId = 9 THEN v.BountyAmount ELSE 0 END) AS TotalBountyReceived,
+        -- Complex ratio, handling division by zero with NULLIF
+        CAST(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS numeric) /
+        NULLIF(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS UpvoteDownvoteRatio
+    FROM
+        Votes v
+    GROUP BY
+        v.PostId
+)
+SELECT * FROM (
+    -- Main query combining all CTEs for highly engaged open questions
+    SELECT
+        'High-Engagement Open Question' AS ReportCategory,
+        ue.UserId,
+        ue.DisplayName,
+        ue.Reputation,
+        ue.ReputationTier,
+        pd.PostId,
+        pd.PostTypeName,
+        pd.Title,
+        pd.PostCreationDate,
+        pd.PostScore,
+        pd.ViewCount,
+        pd.FavoriteCount,
+        pd.CalculatedEngagementScore,
+        pd.FirstParagraphSummary,
+        pd.RankInPostType,
+        pd.PreviousPostIdByOwner,
+        pea.UniqueEditors,
+        pea.LastContentEditDate,
+        pla.LinkedPostsCount,
+        pla.DuplicateOfPostsCount,
+        pla.AvgLinkedPostScore,
+        atm.TagName AS TopTagForPost,
+        atm.AvgTagQuestionScore,
+        va.Upvotes,
+        va.Downvotes,
+        va.UpvoteDownvoteRatio,
+        COALESCE(ue.TotalQuestions * 1.0 / NULLIF(ue.TotalPosts, 0), 0) AS QuestionPostRatio,
+        (EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - pd.PostCreationDate)) / 3600)::bigint AS AgeInHours,
+        (pd.CalculatedEngagementScore * COALESCE(va.UpvoteDownvoteRatio, 1.0)) AS AdjustedEngagementScore,
+        -- Correlated subquery for a final check (e.g., if user has any gold badges)
+        EXISTS (SELECT 1 FROM Badges b_final WHERE b_final.UserId = ue.UserId AND b_final.Class = 1) AS HasGoldBadge
+    FROM
+        UserEngagement ue
+    INNER JOIN PostDetails pd ON ue.UserId = pd.OwnerUserId
+    LEFT JOIN PostEditorActivity pea ON pd.PostId = pea.PostId
+    LEFT JOIN PostLinkAnalysis pla ON pd.PostId = pla.PostId
+    LEFT JOIN VoteAnalysis va ON pd.PostId = va.PostId
+    -- Lateral join to get tag metrics for the first tag in the array
+    LEFT JOIN LATERAL (SELECT atm_sub.TagName, atm_sub.AvgTagQuestionScore
+                       FROM AggregatedTagMetrics atm_sub
+                       WHERE atm_sub.TagName = pd.TagArray[1] AND array_length(pd.TagArray, 1) > 0
+                       LIMIT 1) atm ON TRUE
+    WHERE
+        ue.ReputationTier IN ('Guru', 'Legend')
+        AND pd.PostTypeId = 1 -- Focus on questions
+        AND pd.PostScore > 10
+        AND pd.ViewCount > 1000
+        AND pd.FavoriteCount IS NOT NULL
+        AND (pea.UniqueEditors IS NULL OR pea.UniqueEditors >= 2) -- Posts edited by at least 2 distinct users or not edited at all
+        AND pd.FirstParagraphSummary LIKE '%benchmark%' -- String matching
+        AND ABS(EXTRACT(DOW FROM pd.PostCreationDate) - 0) > 0 -- Not created on Sunday (0)
+        AND pd.ClosedDate IS NULL -- Must be an open question
+        AND va.UpvoteDownvoteRatio IS DISTINCT FROM 0 -- Avoid posts with only downvotes if ratio is 0 (NULLIF produces NULL)
+        -- Correlated NOT EXISTS subquery for comment content
+        AND (NOT EXISTS (SELECT 1 FROM Comments c_sub WHERE c_sub.PostId = pd.PostId AND c_sub.Text ILIKE '%spam%'))
+    ORDER BY
+        AdjustedEngagementScore DESC, ue.Reputation DESC
+    LIMIT 50
+) AS OpenQuestions
+
+UNION ALL
+
+SELECT * FROM (
+    -- Second part of UNION ALL for questions with similar criteria but are closed
+    SELECT
+        'High-Engagement Closed Question' AS ReportCategory,
+        ue.UserId,
+        ue.DisplayName,
+        ue.Reputation,
+        ue.ReputationTier,
+        pd.PostId,
+        pd.PostTypeName,
+        pd.Title,
+        pd.PostCreationDate,
+        pd.PostScore,
+        pd.ViewCount,
+        pd.FavoriteCount,
+        pd.CalculatedEngagementScore,
+        pd.FirstParagraphSummary,
+        pd.RankInPostType,
+        pd.PreviousPostIdByOwner,
+        pea.UniqueEditors,
+        pea.LastContentEditDate,
+        pla.LinkedPostsCount,
+        pla.DuplicateOfPostsCount,
+        pla.AvgLinkedPostScore,
+        atm.TagName AS TopTagForPost,
+        atm.AvgTagQuestionScore,
+        va.Upvotes,
+        va.Downvotes,
+        va.UpvoteDownvoteRatio,
+        COALESCE(ue.TotalQuestions * 1.0 / NULLIF(ue.TotalPosts, 0), 0) AS QuestionPostRatio,
+        (EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - pd.PostCreationDate)) / 3600)::bigint AS AgeInHours,
+        (pd.CalculatedEngagementScore * COALESCE(va.UpvoteDownvoteRatio, 1.0)) AS AdjustedEngagementScore,
+        EXISTS (SELECT 1 FROM Badges b_final WHERE b_final.UserId = ue.UserId AND b_final.Class = 1) AS HasGoldBadge
+    FROM
+        UserEngagement ue
+    INNER JOIN PostDetails pd ON ue.UserId = pd.OwnerUserId
+    LEFT JOIN PostEditorActivity pea ON pd.PostId = pea.PostId
+    LEFT JOIN PostLinkAnalysis pla ON pd.PostId = pla.PostId
+    LEFT JOIN VoteAnalysis va ON pd.PostId = va.PostId
+    LEFT JOIN LATERAL (SELECT atm_sub.TagName, atm_sub.AvgTagQuestionScore
+                       FROM AggregatedTagMetrics atm_sub
+                       WHERE atm_sub.TagName = pd.TagArray[1] AND array_length(pd.TagArray, 1) > 0
+                       LIMIT 1) atm ON TRUE
+    WHERE
+        ue.ReputationTier IN ('Guru', 'Legend')
+        AND pd.PostTypeId = 1
+        AND pd.PostScore > 10
+        AND pd.ViewCount > 1000
+        AND pd.FavoriteCount IS NOT NULL
+        AND (pea.UniqueEditors IS NULL OR pea.UniqueEditors >= 2)
+        AND pd.FirstParagraphSummary LIKE '%benchmark%'
+        AND ABS(EXTRACT(DOW FROM pd.PostCreationDate) - 0) > 0
+        AND pd.ClosedDate IS NOT NULL -- Must be a closed question
+        AND va.UpvoteDownvoteRatio IS DISTINCT FROM 0
+        AND (NOT EXISTS (SELECT 1 FROM Comments c_sub WHERE c_sub.PostId = pd.PostId AND c_sub.Text ILIKE '%spam%'))
+    ORDER BY
+        AdjustedEngagementScore DESC, ue.Reputation DESC
+    LIMIT 50
+) AS ClosedQuestions;

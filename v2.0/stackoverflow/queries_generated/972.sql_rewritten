@@ -1,0 +1,406 @@
+-- {"query": "972.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 4041} 
+with
+-- recent active users with reputation tiers
+active_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.lastaccessdate,
+    u.location,
+    case
+      when u.reputation >= 100000 then 'legend'
+      when u.reputation >= 25000 then 'elite'
+      when u.reputation >= 5000 then 'pro'
+      when u.reputation >= 1000 then 'intermediate'
+      else 'newbie'
+    end as rep_tier
+  from users u
+  where u.lastaccessdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+),
+-- questions in the last N years with parsed tags and quality heuristics
+recent_questions as (
+  select
+    p.id as question_id,
+    p.creationdate,
+    p.owneruserid,
+    p.score,
+    p.viewcount,
+    p.answercount,
+    p.favoritecount,
+    p.closeddate,
+    p.title,
+    p.tags,
+    string_to_array(substring(p.tags, 2, greatest(length(p.tags)-2,0)), '><') as tag_array,
+    (p.score * coalesce(p.viewcount,0))::bigint as score_view_mass,
+    case when p.closeddate is not null then 1 else 0 end as is_closed
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+),
+-- per-question vote breakdown
+vote_agg as (
+  select
+    v.postid,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started,
+    sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded,
+    count(*) as total_votes,
+    min(v.creationdate) as first_vote_at,
+    max(v.creationdate) as last_vote_at
+  from votes v
+  join posts p on p.id = v.postid and p.posttypeid = 1
+  group by v.postid
+),
+-- post history signals (closures, reopen, protections, migrations)
+history_flags as (
+  select
+    ph.postid,
+    max(case when ph.posthistorytypeid = 10 then 1 else 0 end) as was_closed,
+    max(case when ph.posthistorytypeid = 11 then 1 else 0 end) as was_reopened,
+    max(case when ph.posthistorytypeid = 19 then 1 else 0 end) as was_protected,
+    max(case when ph.posthistorytypeid in (35,36) then 1 else 0 end) as was_migrated,
+    max(case when ph.posthistorytypeid in (52) then 1 else 0 end) as was_hot,
+    max(case when ph.posthistorytypeid in (53) then 1 else 0 end) as removed_hot,
+    count(*) filter (where ph.posthistorytypeid in (4,5,6,7,8,9,24)) as edit_events
+  from posthistory ph
+  join posts p on p.id = ph.postid and p.posttypeid = 1
+  group by ph.postid
+),
+-- answers joined to questions and their owners
+answers as (
+  select
+    a.id as answer_id,
+    a.parentid as question_id,
+    a.owneruserid as answerer_id,
+    a.score as answer_score,
+    a.creationdate as answer_created
+  from posts a
+  where a.posttypeid = 2
+),
+-- per-question answer stats and acceptance
+answer_agg as (
+  select
+    q.question_id,
+    count(a.answer_id) as answers_total,
+    max(a.answer_score) as best_answer_score,
+    avg(a.answer_score::numeric) as avg_answer_score,
+    min(a.answer_created) as first_answer_at,
+    max(a.answer_created) as last_answer_at,
+    max(case when q.question_id = q2.id and q2.acceptedanswerid = a.answer_id then 1 else 0 end) as has_accepted
+  from recent_questions q
+  left join answers a on a.question_id = q.question_id
+  left join posts q2 on q2.id = q.question_id
+  group by q.question_id
+),
+-- comments density around first 48h
+comment_window as (
+  select
+    c.postid as question_id,
+    count(*) filter (where c.creationdate <= p.creationdate + interval '48 hours') as comments_48h,
+    count(*) as comments_total,
+    sum(c.score) as comment_score_sum
+  from comments c
+  join posts p on p.id = c.postid and p.posttypeid = 1
+  group by c.postid
+),
+-- tag popularity and moderation flags
+tag_metrics as (
+  select
+    t.tagname,
+    t.count as tag_usage_count,
+    coalesce(t.ismoderatoronly, 0) as is_mod_only,
+    coalesce(t.isrequired, 0) as is_required
+  from tags t
+),
+-- explode tags per question
+question_tags as (
+  select
+    q.question_id,
+    lower(trim(t)) as tag
+  from recent_questions q
+  cross join lateral unnest(q.tag_array) as t
+),
+-- aggregate tag-level metrics per question
+question_tag_agg as (
+  select
+    qt.question_id,
+    count(*) as tag_count,
+    sum(tm.tag_usage_count) as tag_usage_sum,
+    max(tm.tag_usage_count) as tag_usage_max,
+    sum(case when tm.is_mod_only = 1 then 1 else 0 end) as mod_only_tag_cnt,
+    sum(case when tm.is_required = 1 then 1 else 0 end) as required_tag_cnt
+  from question_tags qt
+  left join tag_metrics tm on tm.tagname = qt.tag
+  group by qt.question_id
+),
+-- duplicate and linked relationships
+link_agg as (
+  select
+    pl.postid as question_id,
+    sum(case when pl.linktypeid = 3 then 1 else 0 end) as duplicate_links,
+    sum(case when pl.linktypeid = 1 then 1 else 0 end) as related_links,
+    count(*) as total_links
+  from postlinks pl
+  join posts p on p.id = pl.postid and p.posttypeid = 1
+  group by pl.postid
+),
+-- user badges quality signals in the last 5y
+user_badges as (
+  select
+    b.userid,
+    count(*) filter (where b.class = 1) as gold_badges,
+    count(*) filter (where b.class = 2) as silver_badges,
+    count(*) filter (where b.class = 3) as bronze_badges,
+    count(*) filter (where b.tagbased = 1) as tag_badges_recent
+  from badges b
+  where b.date >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+  group by b.userid
+),
+-- normalized owner info
+owner_info as (
+  select
+    u.id as user_id,
+    u.displayname,
+    au.rep_tier,
+    u.reputation,
+    coalesce(ub.gold_badges,0) as gold_badges,
+    coalesce(ub.silver_badges,0) as silver_badges,
+    coalesce(ub.bronze_badges,0) as bronze_badges,
+    coalesce(ub.tag_badges_recent,0) as tag_badges_recent
+  from users u
+  left join active_users au on au.user_id = u.id
+  left join user_badges ub on ub.userid = u.id
+),
+-- rolling activity per user over 30d windows for recent years
+user_activity as (
+  select
+    p.owneruserid as user_id,
+    date_trunc('month', p.creationdate) as month,
+    count(*) filter (where p.posttypeid = 1) as questions_made,
+    count(*) filter (where p.posttypeid = 2) as answers_made,
+    sum(greatest(p.score,0)) as positive_post_score
+  from posts p
+  where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+    and p.owneruserid is not null
+  group by p.owneruserid, date_trunc('month', p.creationdate)
+),
+user_activity_roll as (
+  select
+    ua.user_id,
+    ua.month,
+    sum(ua.questions_made) over (partition by ua.user_id order by ua.month rows between 2 preceding and current row) as q_3m_sum,
+    sum(ua.answers_made) over (partition by ua.user_id order by ua.month rows between 2 preceding and current row) as a_3m_sum,
+    avg(ua.positive_post_score::numeric) over (partition by ua.user_id order by ua.month rows between 5 preceding and current row) as avg_pos_score_6m
+  from user_activity ua
+),
+-- final denormalized fact with various window metrics
+question_facts as (
+  select
+    q.question_id,
+    q.creationdate,
+    q.owneruserid,
+    q.score,
+    q.viewcount,
+    q.answercount,
+    q.favoritecount,
+    q.closeddate,
+    q.title,
+    q.tags,
+    qa.answers_total,
+    qa.best_answer_score,
+    qa.avg_answer_score,
+    qa.first_answer_at,
+    qa.last_answer_at,
+    qa.has_accepted,
+    va.upvotes,
+    va.downvotes,
+    va.total_votes,
+    va.first_vote_at,
+    va.last_vote_at,
+    hf.was_closed,
+    hf.was_reopened,
+    hf.was_protected,
+    hf.was_migrated,
+    hf.was_hot,
+    hf.removed_hot,
+    hf.edit_events,
+    coalesce(cw.comments_48h,0) as comments_48h,
+    coalesce(cw.comments_total,0) as comments_total,
+    coalesce(cw.comment_score_sum,0) as comment_score_sum,
+    coalesce(qta.tag_count,0) as tag_count,
+    coalesce(qta.tag_usage_sum,0) as tag_usage_sum,
+    coalesce(qta.tag_usage_max,0) as tag_usage_max,
+    coalesce(qta.mod_only_tag_cnt,0) as mod_only_tag_cnt,
+    coalesce(qta.required_tag_cnt,0) as required_tag_cnt,
+    coalesce(la.duplicate_links,0) as duplicate_links,
+    coalesce(la.related_links,0) as related_links,
+    coalesce(la.total_links,0) as total_links
+  from recent_questions q
+  left join answer_agg qa on qa.question_id = q.question_id
+  left join vote_agg va on va.postid = q.question_id
+  left join history_flags hf on hf.postid = q.question_id
+  left join comment_window cw on cw.question_id = q.question_id
+  left join question_tag_agg qta on qta.question_id = q.question_id
+  left join link_agg la on la.question_id = q.question_id
+),
+-- compute per-question windows vs cohort
+cohort_windows as (
+  select
+    qf.*,
+    percentile_cont(0.5) within group (order by qf.viewcount) over (partition by date_trunc('quarter', qf.creationdate)) as q_views_p50_quarter,
+    avg(qf.score) over (partition by date_trunc('quarter', qf.creationdate)) as q_score_avg_quarter,
+    row_number() over (partition by date_trunc('month', qf.creationdate) order by qf.viewcount desc nulls last) as rank_views_month,
+    dense_rank() over (partition by date_trunc('month', qf.creationdate) order by qf.score desc nulls last) as rank_score_month
+  from question_facts qf
+),
+-- enrich with owner signals and recent rolling activity (last available month before question)
+owner_enriched as (
+  select
+    cw.*,
+    oi.displayname as owner_displayname,
+    oi.rep_tier,
+    oi.reputation as owner_reputation,
+    oi.gold_badges,
+    oi.silver_badges,
+    oi.bronze_badges,
+    oi.tag_badges_recent,
+    uar.q_3m_sum as owner_q_3m_sum,
+    uar.a_3m_sum as owner_a_3m_sum,
+    uar.avg_pos_score_6m as owner_avg_pos_score_6m
+  from cohort_windows cw
+  left join owner_info oi on oi.user_id = cw.owneruserid
+  left join lateral (
+    select uar.*
+    from user_activity_roll uar
+    where uar.user_id = cw.owneruserid
+      and uar.month <= date_trunc('month', cw.creationdate)
+    order by uar.month desc
+    limit 1
+  ) uar on true
+),
+-- correlated subquery examples: best related post by score and first duplicate target
+related_peers as (
+  select
+    oe.question_id,
+    (
+      select p2.id
+      from postlinks pl2
+      join posts p2 on p2.id = pl2.relatedpostid
+      where pl2.postid = oe.question_id and pl2.linktypeid = 1
+      order by p2.score desc nulls last, p2.viewcount desc nulls last
+      limit 1
+    ) as top_related_post_id,
+    (
+      select p3.id
+      from postlinks pl3
+      join posts p3 on p3.id = pl3.relatedpostid
+      where pl3.postid = oe.question_id and pl3.linktypeid = 3
+      order by p3.creationdate asc
+      limit 1
+    ) as first_duplicate_target_id
+  from owner_enriched oe
+),
+-- complexity: synthetic quality score with null-safe math and string ops
+quality_scores as (
+  select
+    oe.question_id,
+    oe.creationdate,
+    oe.title,
+    oe.tags,
+    oe.score,
+    oe.viewcount,
+    oe.answercount,
+    oe.favoritecount,
+    oe.closeddate,
+    oe.has_accepted,
+    oe.upvotes,
+    oe.downvotes,
+    oe.total_votes,
+    oe.comments_48h,
+    oe.tag_count,
+    oe.tag_usage_sum,
+    oe.mod_only_tag_cnt,
+    oe.duplicate_links,
+    oe.rank_views_month,
+    oe.rank_score_month,
+    oe.rep_tier,
+    oe.owner_reputation,
+    coalesce(oe.owner_a_3m_sum,0) as owner_a_3m_sum,
+    coalesce(oe.owner_q_3m_sum,0) as owner_q_3m_sum,
+    coalesce(oe.owner_avg_pos_score_6m,0) as owner_avg_pos_score_6m,
+    case
+      when oe.closeddate is not null then -100
+      else greatest(0, oe.score) * 3
+           + least(coalesce(oe.viewcount,0), 100000) / 250
+           + coalesce(oe.favoritecount,0) * 2
+           + coalesce(oe.comments_48h,0)
+           + coalesce(oe.has_accepted,0) * 25
+           + coalesce(oe.upvotes,0) - coalesce(oe.downvotes,0) * 2
+           + ln(1 + greatest(coalesce(oe.tag_usage_sum,0), 1))
+           + case when oe.mod_only_tag_cnt > 0 then -10 else 0 end
+           + case when oe.duplicate_links > 0 then -25 else 0 end
+           + case when oe.rep_tier in ('legend','elite') then 10 when oe.rep_tier = 'pro' then 5 else 0 end
+           + least(coalesce(oe.owner_a_3m_sum,0), 50)
+    end as quality_score,
+    length(coalesce(oe.title,'')) as title_len,
+    position('how' in lower(coalesce(oe.title,''))) > 0 as title_contains_how,
+    regexp_replace(lower(coalesce(oe.title,'')), '\s+', ' ', 'g') as title_norm,
+    regexp_replace(coalesce(oe.tags,''), '[^a-zA-Z0-9<>-]', '', 'g') as tags_sanitized
+  from owner_enriched oe
+),
+-- pick top N per month by quality score
+ranked as (
+  select
+    qs.*,
+    row_number() over (partition by date_trunc('month', qs.creationdate) order by qs.quality_score desc nulls last, qs.viewcount desc nulls last) as rn_month,
+    ntile(10) over (partition by date_trunc('year', qs.creationdate) order by qs.quality_score desc nulls last) as decile_year
+  from quality_scores qs
+)
+select
+  r.creationdate::date as question_date,
+  r.question_id,
+  coalesce(u.displayname, r.title_norm) as owner_or_title,
+  r.title,
+  r.tags_sanitized as tags_clean,
+  r.score,
+  r.viewcount,
+  r.answercount,
+  r.favoritecount,
+  r.upvotes,
+  r.downvotes,
+  r.total_votes,
+  r.has_accepted,
+  r.rep_tier,
+  r.owner_reputation,
+  r.owner_a_3m_sum,
+  r.owner_q_3m_sum,
+  r.owner_avg_pos_score_6m,
+  r.quality_score,
+  r.rank_views_month,
+  r.rank_score_month,
+  r.rn_month,
+  r.decile_year,
+  case when r.title_contains_how then 'how?' else 'other' end as title_theme,
+  -- complicated predicate example output
+  case
+    when r.quality_score >= 150 and r.has_accepted = 1 and r.viewcount >= 10000 then 'excellent'
+    when r.quality_score >= 90 and r.has_accepted = 1 then 'great'
+    when r.closeddate is not null or r.duplicate_links > 0 then 'problematic'
+    when r.quality_score between 40 and 89 then 'good'
+    else 'average'
+  end as quality_bucket
+from ranked r
+left join users u on u.id = (
+  select owneruserid from posts p where p.id = r.question_id
+)
+where r.rn_month <= 50
+  and (
+    -- complicated boolean with null logic
+    (r.title_contains_how is true and r.tag_count >= 3)
+    or (r.title_len between 20 and 120 and coalesce(r.mod_only_tag_cnt,0) = 0)
+    or (r.decile_year <= 3 and r.has_accepted = 1)
+  )
+order by r.creationdate desc, r.quality_score desc, r.question_id desc;

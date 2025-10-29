@@ -1,0 +1,233 @@
+-- {"query": "1090.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3357} 
+
+WITH UserActivitySummary AS (
+    -- Aggregates core activity metrics for each user
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.CreationDate AS UserCreationDate,
+        u.Reputation,
+        u.UpVotes AS UserUpVotes,
+        u.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestionsOwned,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswersOwned,
+        SUM(p.Score) AS TotalPostScoreReceived,
+        SUM(p.ViewCount) AS TotalPostViewsReceived,
+        MAX(p.LastActivityDate) AS LatestPostActivity,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) AS AvgAnswerScore,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMadeByOrOnUserPosts,
+        COUNT(DISTINCT b.Id) AS TotalBadgesReceived,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges
+    FROM
+        Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId OR p.Id = c.PostId -- Comments by user OR comments on user's posts
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.CreationDate, u.Reputation, u.UpVotes, u.DownVotes
+),
+PostHistoryEngagement AS (
+    -- Summarizes post history events for each post
+    SELECT
+        ph.PostId,
+        COUNT(DISTINCT ph.Id) AS TotalHistoryEvents,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditCount, -- Title, Body, Tags edits
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (10, 12) THEN 1 ELSE 0 END) AS CloseDeleteCount, -- Post Closed, Post Deleted
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (11, 13) THEN 1 ELSE 0 END) AS ReopenUndeleteCount, -- Post Reopened, Post Undeleted
+        MAX(ph.CreationDate) AS LastHistoryEventDate,
+        ARRAY_AGG(DISTINCT ph.PostHistoryTypeId) AS AllHistoryTypes -- Collect all distinct history types
+    FROM
+        PostHistory ph
+    GROUP BY
+        ph.PostId
+),
+QuestionDetails AS (
+    -- Provides detailed information for each question, including linked/duplicate relationships
+    SELECT
+        q.Id AS QuestionId,
+        q.OwnerUserId,
+        q.CreationDate AS QuestionCreationDate,
+        q.Score AS QuestionScore,
+        q.ViewCount AS QuestionViewCount,
+        q.AnswerCount AS QuestionAnswerCount,
+        q.FavoriteCount AS QuestionFavoriteCount,
+        q.ClosedDate AS QuestionClosedDate,
+        COALESCE(q.Title, 'Untitled Question') AS QuestionTitle,
+        q.Tags AS QuestionTagsRaw,
+        (SELECT COUNT(DISTINCT a.Id) FROM Posts a WHERE a.ParentId = q.Id AND a.PostTypeId = 2) AS ActualAnswerCount, -- Correlated subquery for actual answer count
+        (SELECT SUM(v.BountyAmount) FROM Votes v WHERE v.PostId = q.Id AND v.VoteTypeId = 8) AS TotalBountyAmount, -- Correlated subquery for total bounty
+        phe.TotalHistoryEvents,
+        phe.EditCount,
+        phe.CloseDeleteCount,
+        phe.ReopenUndeleteCount,
+        phe.LastHistoryEventDate,
+        phe.AllHistoryTypes,
+        la.RelatedPostId AS LinkedRelatedPostId, -- For duplicate/linked questions
+        lt.Name AS LinkTypeName,
+        CASE
+            WHEN q.AcceptedAnswerId IS NOT NULL THEN TRUE
+            ELSE FALSE
+        END AS HasAcceptedAnswer
+    FROM
+        Posts q
+    LEFT JOIN PostHistoryEngagement phe ON q.Id = phe.PostId
+    LEFT JOIN PostLinks la ON q.Id = la.PostId AND la.LinkTypeId IN (1, 3) -- Linked (1) or Duplicate (3)
+    LEFT JOIN LinkTypes lt ON la.LinkTypeId = lt.Id
+    WHERE
+        q.PostTypeId = 1 -- Only questions
+),
+TagPerformance AS (
+    -- Expands tags into individual rows for analysis
+    SELECT
+        unnest(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><')) AS TagName, -- String manipulation and unnesting
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Score,
+        p.CreationDate
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2
+),
+UserTagStats AS (
+    -- Aggregates tag performance for each user
+    SELECT
+        tp.OwnerUserId AS UserId,
+        tp.TagName,
+        COUNT(tp.PostId) AS QuestionsWithTag,
+        AVG(tp.Score) AS AvgScoreWithTag,
+        MAX(tp.CreationDate) AS LatestPostWithTag,
+        ROW_NUMBER() OVER (PARTITION BY tp.OwnerUserId ORDER BY COUNT(tp.PostId) DESC, AVG(tp.Score) DESC) AS TagRank -- Window function for ranking tags
+    FROM TagPerformance tp
+    GROUP BY tp.OwnerUserId, tp.TagName
+),
+UserRecentActivityRank AS (
+    -- Ranks users based on various engagement metrics using window functions
+    SELECT
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.UserCreationDate,
+        EXTRACT(EPOCH FROM (NOW() - uas.UserCreationDate)) / (3600 * 24 * 365.25) AS UserAgeYears, -- Complex date calculation
+        uas.TotalPostsOwned,
+        uas.TotalQuestionsOwned,
+        uas.TotalAnswersOwned,
+        uas.TotalPostScoreReceived,
+        uas.TotalPostViewsReceived,
+        uas.LatestPostActivity,
+        uas.AvgQuestionScore,
+        uas.AvgAnswerScore,
+        uas.TotalCommentsMadeByOrOnUserPosts,
+        uas.TotalBadgesReceived,
+        uas.GoldBadges,
+        uas.SilverBadges,
+        uas.BronzeBadges,
+        RANK() OVER (ORDER BY uas.Reputation DESC, uas.UserUpVotes DESC) AS GlobalReputationRank, -- Global ranking
+        NTILE(10) OVER (ORDER BY uas.TotalQuestionsOwned DESC) AS QuestionerDecile, -- Decile ranking
+        LAG(uas.TotalPostScoreReceived, 1, 0) OVER (ORDER BY uas.LatestPostActivity) AS PreviousUserPostScoreSum, -- Lag window function
+        SUM(uas.TotalPostsOwned) OVER (ORDER BY uas.UserCreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativePostsByJoiningUsers, -- Cumulative sum
+        COALESCE(uas.UserUpVotes, 0) - COALESCE(uas.UserDownVotes, 0) AS NetVotesGivenReceived, -- NULL-aware arithmetic
+        EXISTS ( -- Correlated subquery: check for accepted answers by user from others' questions
+            SELECT 1
+            FROM Posts ans
+            WHERE ans.OwnerUserId = uas.UserId
+              AND ans.PostTypeId = 2
+              AND ans.Id IN (SELECT q.AcceptedAnswerId FROM Posts q WHERE q.PostTypeId = 1 AND q.AcceptedAnswerId IS NOT NULL)
+        ) AS HasAcceptedAnswersFromOthers
+    FROM
+        UserActivitySummary uas
+    WHERE
+        uas.TotalPostsOwned > 0
+),
+ModerationFlags AS (
+    -- Summarizes moderation-related actions performed by users
+    SELECT
+        ph.UserId,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (10, 12, 14, 19) THEN 1 END) AS UserModActionsCount, -- Closed, Deleted, Locked, Protected
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (11, 13, 15, 20) THEN 1 END) AS UserReversalActionsCount, -- Reopened, Undeleted, Unlocked, Unprotected
+        MAX(ph.CreationDate) AS LatestModActionDate
+    FROM PostHistory ph
+    WHERE ph.UserId IS NOT NULL
+      AND ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20, 35, 36) -- Common moderator/community actions including migration
+    GROUP BY ph.UserId
+)
+SELECT
+    urar.UserId,
+    urar.DisplayName,
+    COALESCE(urar.DisplayName, 'Unknown User') AS DisplayNameCoalesced, -- NULL logic
+    urar.Reputation,
+    urar.UserAgeYears,
+    urar.GlobalReputationRank,
+    urar.QuestionerDecile,
+    urar.TotalPostsOwned,
+    urar.TotalQuestionsOwned,
+    urar.TotalAnswersOwned,
+    urar.TotalCommentsMadeByOrOnUserPosts,
+    urar.TotalBadgesReceived,
+    urar.GoldBadges,
+    urar.SilverBadges,
+    urar.BronzeBadges,
+    urar.NetVotesGivenReceived,
+    urar.HasAcceptedAnswersFromOthers,
+    MODF.UserModActionsCount,
+    MODF.UserReversalActionsCount,
+    MODF.LatestModActionDate,
+    SUM(qd.QuestionScore) AS TotalQuestionScoreOfOwnedQuestions,
+    SUM(qd.QuestionViewCount) AS TotalQuestionViewsOfOwnedQuestions,
+    AVG(qd.QuestionAnswerCount) AS AvgAnswersPerOwnedQuestion,
+    COUNT(DISTINCT qd.QuestionId) AS DistinctQuestionsOwned,
+    SUM(CASE WHEN qd.HasAcceptedAnswer THEN 1 ELSE 0 END) AS QuestionsWithAcceptedAnswer,
+    SUM(CASE WHEN qd.QuestionClosedDate IS NOT NULL THEN 1 ELSE 0 END) AS ClosedQuestionsOwned,
+    AVG(qd.EditCount) AS AvgEditsPerOwnedQuestion,
+    MAX(qd.LastHistoryEventDate) AS LatestHistoryEventOnOwnedQuestion,
+    (
+        SELECT AVG(p_linked.Score) -- Correlated subquery for average score of linked/duplicate questions
+        FROM Posts p_linked
+        WHERE p_linked.Id IN (SELECT pl_inner.RelatedPostId FROM PostLinks pl_inner WHERE pl_inner.PostId = qd.QuestionId AND pl_inner.LinkTypeId = 3) -- Duplicate link type
+          AND p_linked.PostTypeId = 1
+    ) AS AvgDuplicateQuestionScore,
+    (
+        SELECT STRING_AGG(uts.TagName, ', ') -- Correlated subquery with string aggregation and ordering
+        FROM UserTagStats uts
+        WHERE uts.UserId = urar.UserId AND uts.TagRank <= 3
+        ORDER BY uts.TagRank
+    ) AS Top3TagsByPerformance,
+    CAST(urar.TotalPostsOwned AS NUMERIC) / NULLIF(urar.TotalCommentsMadeByOrOnUserPosts + urar.TotalBadgesReceived, 0) AS PostToEngagementRatio, -- Complex ratio with NULLIF
+    (
+        SELECT
+            SUM(sub_q.Score) -- Subquery with set operator (UNION ALL)
+        FROM
+            (
+                SELECT p.Score FROM Posts p WHERE p.OwnerUserId = urar.UserId AND p.PostTypeId = 1 AND p.CreationDate >= NOW() - INTERVAL '1 year'
+                UNION ALL
+                SELECT p.Score FROM Posts p WHERE p.OwnerUserId = urar.UserId AND p.PostTypeId = 2 AND p.CreationDate >= NOW() - INTERVAL '1 year'
+            ) AS sub_q
+    ) AS TotalScoreLastYear,
+    CASE -- Complex conditional classification based on multiple criteria
+        WHEN urar.Reputation >= 10000 AND urar.GoldBadges >= 5 AND urar.UserAgeYears >= 5 THEN 'Legendary Contributor'
+        WHEN urar.Reputation >= 5000 AND urar.SilverBadges >= 10 AND urar.TotalQuestionsOwned + urar.TotalAnswersOwned >= 100 THEN 'Veteran Member'
+        WHEN urar.Reputation >= 1000 AND urar.TotalPostsOwned >= 50 AND urar.TotalCommentsMadeByOrOnUserPosts >= 20 THEN 'Active Community Member'
+        ELSE 'Aspiring Contributor'
+    END AS UserTierClassification,
+    EXISTS ( -- NULL logic: check if any owned post has specific history types using array containment
+        SELECT 1
+        FROM QuestionDetails qd_inner
+        WHERE qd_inner.OwnerUserId = urar.UserId
+          AND (qd_inner.AllHistoryTypes @> ARRAY[10::smallint] OR qd_inner.AllHistoryTypes @> ARRAY[12::smallint]) -- Contains Post Closed (10) or Post Deleted (12)
+    ) AS HasModeratedPosts
+FROM
+    UserRecentActivityRank urar
+LEFT JOIN QuestionDetails qd ON urar.UserId = qd.OwnerUserId
+LEFT JOIN ModerationFlags MODF ON urar.UserId = MODF.UserId
+GROUP BY
+    urar.UserId, urar.DisplayName, urar.Reputation, urar.UserAgeYears, urar.GlobalReputationRank, urar.QuestionerDecile,
+    urar.TotalPostsOwned, urar.TotalQuestionsOwned, urar.TotalAnswersOwned, urar.TotalCommentsMadeByOrOnUserPosts,
+    urar.TotalBadgesReceived, urar.GoldBadges, urar.SilverBadges, urar.BronzeBadges, urar.NetVotesGivenReceived,
+    urar.HasAcceptedAnswersFromOthers, MODF.UserModActionsCount, MODF.UserReversalActionsCount, MODF.LatestModActionDate
+HAVING
+    urar.TotalQuestionsOwned > 0 OR urar.TotalAnswersOwned > 0 -- Filter for users with actual content contributions
+ORDER BY
+    urar.Reputation DESC, TotalQuestionScoreOfOwnedQuestions DESC, MODF.UserModActionsCount DESC
+LIMIT 100;

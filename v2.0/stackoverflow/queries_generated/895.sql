@@ -1,0 +1,434 @@
+-- {"query": "895.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3764} 
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        date_trunc('month', u.creationdate) as cohort_month,
+        coalesce(nullif(trim(split_part(coalesce(u.location, ''), ',', 1)), ''), 'Unknown') as region_hint
+    from users u
+    where u.creationdate >= now() - interval '5 years'
+),
+user_posts as (
+    select
+        p.owneruserid as user_id,
+        p.id as post_id,
+        p.posttypeid,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        p.answercount,
+        p.commentcount,
+        p.favoritecount,
+        p.closeddate,
+        p.tags,
+        p.title
+    from posts p
+    where p.owneruserid is not null
+      and p.owneruserid <> -1
+      and p.creationdate >= now() - interval '5 years'
+),
+question_core as (
+    select
+        up.*,
+        (up.posttypeid = 1) as is_question,
+        (up.posttypeid = 2) as is_answer
+    from user_posts up
+    where up.posttypeid in (1, 2)
+),
+q_with_answers as (
+    select
+        q.user_id as asker_id,
+        q.post_id as question_id,
+        q.creationdate as question_date,
+        q.score as question_score,
+        q.viewcount as question_views,
+        q.title,
+        q.tags,
+        q.closeddate,
+        q.answercount,
+        q.favoritecount,
+        a.user_id as answerer_id,
+        a.post_id as answer_id,
+        a.creationdate as answer_date,
+        a.score as answer_score
+    from question_core q
+    left join question_core a
+      on a.is_answer
+     and q.is_question
+     and a.parentid = q.post_id
+),
+first_answer as (
+    select distinct on (question_id)
+        question_id,
+        asker_id,
+        question_date,
+        question_score,
+        question_views,
+        title,
+        tags,
+        closeddate,
+        answercount,
+        favoritecount,
+        answer_id,
+        answerer_id,
+        answer_date,
+        answer_score,
+        extract(epoch from (answer_date - question_date)) as seconds_to_first_answer
+    from q_with_answers
+    where answer_id is not null
+    order by question_id, answer_date asc
+),
+votes_agg as (
+    select
+        v.postid,
+        sum(case when vt.name = 'UpMod' then 1 else 0 end) as upvotes,
+        sum(case when vt.name = 'DownMod' then 1 else 0 end) as downvotes,
+        sum(case when vt.name = 'Favorite' then 1 else 0 end) as favorites,
+        sum(case when vt.name = 'BountyStart' then coalesce(v.bountyamount,0) else 0 end) as bounty_started,
+        sum(case when vt.name = 'BountyClose' then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded,
+        count(*) as total_votes
+    from votes v
+    join votetypes vt on vt.id = v.votetypeid
+    where v.creationdate >= now() - interval '5 years'
+    group by v.postid
+),
+postlinks_agg as (
+    select
+        pl.postid,
+        sum(case when lt.name = 'Duplicate' then 1 else 0 end) as dup_links,
+        sum(case when lt.name = 'Linked' then 1 else 0 end) as related_links,
+        count(*) as total_links,
+        max(pl.creationdate) as last_link_date
+    from postlinks pl
+    join linktypes lt on lt.id = pl.linktypeid
+    group by pl.postid
+),
+close_events as (
+    select
+        ph.postid,
+        min(case when ph.posthistorytypeid = 10 then ph.creationdate end) filter (where ph.posthistorytypeid = 10) as first_close_date,
+        max(case when ph.posthistorytypeid = 11 then ph.creationdate end) filter (where ph.posthistorytypeid = 11) as last_reopen_date,
+        count(*) filter (where ph.posthistorytypeid = 10) as close_votes_events,
+        count(*) filter (where ph.posthistorytypeid = 11) as reopen_events,
+        count(*) filter (where ph.posthistorytypeid in (12,13)) as delete_undelete_events
+    from posthistory ph
+    where ph.creationdate >= now() - interval '5 years'
+    group by ph.postid
+),
+tag_expansion as (
+    select
+        q.post_id as question_id,
+        unnest(string_to_array(substring(q.tags, 2, length(q.tags)-2), '><')) as tagname
+    from question_core q
+    where q.is_question
+      and q.tags is not null
+),
+tag_rank as (
+    select
+        te.question_id,
+        te.tagname,
+        t.count as global_tag_count,
+        row_number() over (partition by te.question_id order by coalesce(t.count, 0) desc, te.tagname) as tag_rank_by_popularity
+    from tag_expansion te
+    left join tags t on lower(t.tagname) = lower(te.tagname)
+),
+user_badges as (
+    select
+        b.userid,
+        count(*) as total_badges,
+        sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+        sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+        sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+        max(b.date) as last_badge_date
+    from badges b
+    where b.date >= now() - interval '10 years'
+    group by b.userid
+),
+user_activity as (
+    select
+        u.id as user_id,
+        count(*) filter (where p.posttypeid = 1) as q_count,
+        count(*) filter (where p.posttypeid = 2) as a_count,
+        sum(coalesce(p.score,0)) as total_post_score,
+        sum(coalesce(p.viewcount,0)) filter (where p.posttypeid = 1) as total_question_views,
+        max(p.creationdate) as last_post_date
+    from users u
+    left join posts p on p.owneruserid = u.id
+                      and p.creationdate >= now() - interval '5 years'
+    group by u.id
+),
+first_answerer_stats as (
+    select
+        fa.answerer_id as user_id,
+        count(*) as fa_count,
+        avg(fa.seconds_to_first_answer) as avg_secs_to_fa,
+        percentile_cont(0.5) within group (order by fa.seconds_to_first_answer) as p50_secs_to_fa,
+        percentile_cont(0.9) within group (order by fa.seconds_to_first_answer) as p90_secs_to_fa
+    from first_answer fa
+    group by fa.answerer_id
+),
+question_windows as (
+    select
+        q.post_id as question_id,
+        q.user_id as asker_id,
+        q.creationdate as question_date,
+        q.score as question_score,
+        q.viewcount as question_views,
+        q.answercount,
+        coalesce(va.upvotes,0) as upvotes,
+        coalesce(va.downvotes,0) as downvotes,
+        coalesce(va.favorites,0) as favorites,
+        coalesce(va.bounty_started,0) as bounty_started,
+        coalesce(va.bounty_awarded,0) as bounty_awarded,
+        coalesce(pla.dup_links,0) as dup_links,
+        coalesce(pla.related_links,0) as related_links,
+        ce.first_close_date,
+        ce.last_reopen_date,
+        sum(q.score) over (partition by q.user_id order by q.creationdate rows between unbounded preceding and current row) as running_user_score,
+        avg(q.score) over (partition by q.user_id rows between 10 preceding and current row) as moving_avg_score_last_10,
+        row_number() over (partition by q.user_id order by q.creationdate) as q_seq_for_user
+    from question_core q
+    left join votes_agg va on va.postid = q.post_id
+    left join postlinks_agg pla on pla.postid = q.post_id
+    left join close_events ce on ce.postid = q.post_id
+    where q.is_question
+),
+quality_bucket as (
+    select
+        qw.*,
+        case
+            when qw.question_score >= 10 or qw.upvotes - qw.downvotes >= 15 then 'excellent'
+            when qw.question_score >= 3 or qw.upvotes - qw.downvotes between 5 and 14 then 'good'
+            when qw.question_score <= -3 or qw.downvotes > qw.upvotes then 'poor'
+            else 'average'
+        end as quality_band,
+        case when qw.first_close_date is not null and qw.last_reopen_date is null then 1 else 0 end as closed_and_not_reopened,
+        case when qw.first_close_date is not null and qw.last_reopen_date is not null and qw.last_reopen_date > qw.first_close_date then 1 else 0 end as closed_then_reopened
+    from question_windows qw
+),
+answers_enriched as (
+    select
+        a.post_id as answer_id,
+        a.parentid as question_id,
+        a.user_id as answerer_id,
+        a.creationdate as answer_date,
+        a.score as answer_score,
+        coalesce(va.upvotes,0) as upvotes,
+        coalesce(va.downvotes,0) as downvotes,
+        coalesce(va.favorites,0) as favorites
+    from question_core a
+    left join votes_agg va on va.postid = a.post_id
+    where a.is_answer
+),
+answerer_quality as (
+    select
+        ae.answerer_id,
+        count(*) as answers_count,
+        avg(ae.answer_score) as avg_answer_score,
+        sum(case when ae.answer_score > 0 then 1 else 0 end)::float / nullif(count(*),0) as pct_positive_answers,
+        sum(case when ae.upvotes > ae.downvotes then 1 else 0 end) as net_positive_answers
+    from answers_enriched ae
+    group by ae.answerer_id
+),
+best_tag_per_question as (
+    select
+        tr.question_id,
+        tr.tagname as top_tag,
+        tr.global_tag_count
+    from tag_rank tr
+    where tr.tag_rank_by_popularity = 1
+),
+user_dim as (
+    select
+        ru.user_id,
+        ru.displayname,
+        ru.reputation,
+        ru.cohort_month,
+        ru.region_hint,
+        ua.q_count,
+        ua.a_count,
+        ua.total_post_score,
+        ua.total_question_views,
+        ua.last_post_date,
+        ub.total_badges,
+        ub.gold_badges,
+        ub.silver_badges,
+        ub.bronze_badges,
+        ub.last_badge_date,
+        fas.fa_count,
+        fas.avg_secs_to_fa,
+        fas.p50_secs_to_fa,
+        fas.p90_secs_to_fa
+    from recent_users ru
+    left join user_activity ua on ua.user_id = ru.user_id
+    left join user_badges ub on ub.userid = ru.user_id
+    left join first_answerer_stats fas on fas.user_id = ru.user_id
+),
+question_final as (
+    select
+        qb.question_id,
+        qb.asker_id,
+        qb.question_date,
+        qb.question_score,
+        qb.question_views,
+        qb.answercount,
+        qb.upvotes,
+        qb.downvotes,
+        qb.favorites,
+        qb.bounty_started,
+        qb.bounty_awarded,
+        qb.dup_links,
+        qb.related_links,
+        qb.quality_band,
+        qb.closed_and_not_reopened,
+        qb.closed_then_reopened,
+        coalesce(fa.seconds_to_first_answer, null) as seconds_to_first_answer,
+        coalesce(fa.answerer_id, null) as first_answerer_id,
+        bt.top_tag,
+        bt.global_tag_count,
+        row_number() over (partition by qb.asker_id order by qb.question_date desc) as recency_rank_for_asker
+    from quality_bucket qb
+    left join first_answer fa on fa.question_id = qb.question_id
+    left join best_tag_per_question bt on bt.question_id = qb.question_id
+),
+recent_top_questions as (
+    select
+        qf.*
+    from qf
+),
+-- Guard CTE to allow referencing recent_top_questions alias correctly
+qf as (
+    select * from question_final
+),
+answer_join as (
+    select
+        qf.question_id,
+        qf.asker_id,
+        qf.first_answerer_id,
+        qf.seconds_to_first_answer,
+        aq.answers_count as first_answerer_total_answers,
+        aq.avg_answer_score as first_answerer_avg_answer_score,
+        ud.displayname as first_answerer_name,
+        ud.reputation as first_answerer_rep
+    from qf
+    left join answerer_quality aq on aq.answerer_id = qf.first_answerer_id
+    left join user_dim ud on ud.user_id = qf.first_answerer_id
+),
+asker_join as (
+    select
+        qf.question_id,
+        ud.user_id as asker_id,
+        ud.displayname as asker_name,
+        ud.reputation as asker_rep,
+        ud.cohort_month as asker_cohort,
+        ud.region_hint as asker_region,
+        ud.q_count as asker_q_count,
+        ud.a_count as asker_a_count,
+        ud.total_badges as asker_badges
+    from qf
+    left join user_dim ud on ud.user_id = qf.asker_id
+),
+bench_base as (
+    select
+        qf.question_id,
+        qf.asker_id,
+        aj.asker_name,
+        aj.asker_rep,
+        aj.asker_cohort,
+        aj.asker_region,
+        aj.asker_q_count,
+        aj.asker_a_count,
+        aj.asker_badges,
+        qf.question_date,
+        qf.question_score,
+        qf.question_views,
+        qf.answercount,
+        qf.upvotes,
+        qf.downvotes,
+        qf.favorites,
+        qf.bounty_started,
+        qf.bounty_awarded,
+        qf.dup_links,
+        qf.related_links,
+        qf.quality_band,
+        qf.closed_and_not_reopened,
+        qf.closed_then_reopened,
+        qf.seconds_to_first_answer,
+        aj2.first_answerer_id,
+        aj2.first_answerer_name,
+        aj2.first_answerer_rep,
+        aj2.first_answerer_total_answers,
+        aj2.first_answerer_avg_answer_score,
+        qf.top_tag,
+        qf.global_tag_count,
+        qf.recency_rank_for_asker
+    from qf
+    left join asker_join aj on aj.question_id = qf.question_id
+    left join answer_join aj2 on aj2.question_id = qf.question_id
+),
+ranked as (
+    select
+        bb.*,
+        dense_rank() over (order by coalesce(bb.question_views,0) desc, coalesce(bb.upvotes,0)-coalesce(bb.downvotes,0) desc) as popularity_rank,
+        ntile(10) over (order by coalesce(bb.question_score,0) desc) as score_decile,
+        case when coalesce(bb.first_answerer_rep,0) > coalesce(bb.asker_rep,0) then 1 else 0 end as answerer_more_rep_flag
+    from bench_base bb
+),
+null_logic_demo as (
+    select
+        r.*,
+        coalesce(nullif(r.top_tag, ''), case when r.global_tag_count is null then 'untagged' else 'other' end) as normalized_top_tag,
+        case when r.seconds_to_first_answer is null then -1 else r.seconds_to_first_answer end as secs_to_first_answer_or_neg1,
+        case when r.first_answerer_id is null then r.asker_id else r.first_answerer_id end as responder_or_asker_id
+    from ranked r
+),
+final_set as (
+    select * from null_logic_demo where score_decile <= 5
+    union all
+    select * from null_logic_demo where popularity_rank <= 100
+),
+dedup as (
+    select
+        fs.*,
+        row_number() over (partition by fs.question_id order by fs.popularity_rank, fs.score_decile) as rn
+    from final_set fs
+)
+select
+    d.question_id,
+    d.asker_id,
+    d.asker_name,
+    d.asker_rep,
+    d.asker_region,
+    d.top_tag,
+    d.normalized_top_tag,
+    d.question_date,
+    d.question_score,
+    d.question_views,
+    d.upvotes,
+    d.downvotes,
+    d.favorites,
+    d.bounty_started,
+    d.bounty_awarded,
+    d.dup_links,
+    d.related_links,
+    d.quality_band,
+    d.closed_and_not_reopened,
+    d.closed_then_reopened,
+    d.seconds_to_first_answer,
+    d.secs_to_first_answer_or_neg1,
+    d.first_answerer_id,
+    d.first_answerer_name,
+    d.first_answerer_rep,
+    d.first_answerer_total_answers,
+    d.first_answerer_avg_answer_score,
+    d.answerer_more_rep_flag,
+    d.popularity_rank,
+    d.score_decile,
+    d.recency_rank_for_asker,
+    d.global_tag_count
+from dedup d
+where d.rn = 1
+order by d.popularity_rank nulls last, d.score_decile, d.question_date desc
+limit 500;

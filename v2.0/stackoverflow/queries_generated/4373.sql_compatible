@@ -1,0 +1,116 @@
+WITH RankedPosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.CreationDate AS PostCreationDate,
+    p.Score AS PostScore,
+    p.ViewCount AS PostViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    pt.Name AS PostTypeName,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation AS OwnerReputation,
+    ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) AS rn_by_type_date,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id) AS UpVoteCount,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id) AS DownVoteCount,
+    COUNT(c.Id) OVER (PARTITION BY p.Id) AS CommentCountForPost,
+    LAG(p.Score, 1, 0) OVER (ORDER BY p.CreationDate) AS PreviousPostScore
+  FROM Posts AS p
+  JOIN PostTypes AS pt
+    ON p.PostTypeId = pt.Id
+  LEFT JOIN Users AS u
+    ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes AS v
+    ON p.Id = v.PostId
+  LEFT JOIN Comments AS c
+    ON p.Id = c.PostId
+  WHERE
+    p.PostTypeId IN (1, 2) -- Questions and Answers
+    AND p.OwnerUserId IS NOT NULL
+    AND u.Views > 1000
+), TaggedPosts AS (
+  SELECT
+    p.Id AS PostId,
+    TRIM(BOTH '<>' FROM p.Tags) AS PrimaryTag
+  FROM Posts AS p
+  WHERE
+    p.Tags IS NOT NULL
+    AND POSITION('>' IN p.Tags) > 0
+)
+SELECT
+  rp.PostId,
+  rp.PostTypeName,
+  rp.OwnerDisplayName,
+  rp.OwnerReputation,
+  rp.PostCreationDate,
+  rp.PostScore,
+  rp.PostViewCount,
+  rp.AnswerCount,
+  rp.CommentCount,
+  rp.FavoriteCount,
+  rp.UpVoteCount,
+  rp.DownVoteCount,
+  rp.CommentCountForPost,
+  rp.PreviousPostScore,
+  tp.PrimaryTag,
+  CASE
+    WHEN rp.PostScore > 100 AND rp.AnswerCount > 5 AND rp.FavoriteCount > 10 THEN 'Popular High-Scoring'
+    WHEN rp.PostScore < 0 AND rp.CommentCountForPost > 3 THEN 'Controversial'
+    WHEN rp.PostViewCount > 5000 AND rp.PostScore > 50 THEN 'Frequently Viewed'
+    ELSE 'Standard'
+  END AS PostCategorization,
+  CASE
+    WHEN rp.OwnerReputation >= 100000 THEN 'High Reputation'
+    WHEN rp.OwnerReputation BETWEEN 50000 AND 99999 THEN 'Medium Reputation'
+    ELSE 'Standard Reputation'
+  END AS OwnerReputationLevel,
+  COALESCE(rp.PostViewCount, 0) + COALESCE(rp.AnswerCount, 0) * 10 + COALESCE(rp.CommentCount, 0) * 2 AS EngagementScore,
+  (rp.PostScore - rp.PreviousPostScore) AS ScoreChange,
+  UPPER(SUBSTRING(rp.OwnerDisplayName FROM 1 FOR 1)) AS OwnerInitial,
+  CASE
+    WHEN rp.PostTypeId = 1 THEN 'IsQuestion'
+    ELSE 'IsAnswer'
+  END AS PostTypeIndicator,
+  TO_CHAR(rp.PostCreationDate, 'YYYY-MM') AS PostYearMonth,
+  CASE
+    WHEN rp.PostScore > 0 AND rp.AnswerCount > 0 THEN CAST(rp.PostScore AS NUMERIC) / rp.AnswerCount
+    ELSE 0
+  END AS ScorePerAnswerRatio,
+  CASE
+    WHEN rp.OwnerReputation IS NULL THEN 'Unknown'
+    WHEN rp.OwnerReputation > 50000 THEN 'Expert'
+    ELSE 'Regular'
+  END AS UserExperience,
+  ROW_NUMBER() OVER (PARTITION BY tp.PrimaryTag ORDER BY rp.PostScore DESC, rp.PostCreationDate DESC) AS RankInTag
+FROM RankedPosts AS rp
+LEFT JOIN TaggedPosts AS tp
+  ON rp.PostId = tp.PostId
+WHERE
+  rp.rn_by_type_date <= 1000 -- Limit to top 1000 recent posts per type for benchmarking
+  AND rp.PostTypeName IN ('Question', 'Answer')
+  AND rp.PostScore IS NOT NULL
+  AND rp.PostViewCount IS NOT NULL
+GROUP BY
+  rp.PostId,
+  rp.PostTypeId,
+  rp.OwnerUserId,
+  rp.PostCreationDate,
+  rp.PostScore,
+  rp.PostViewCount,
+  rp.AnswerCount,
+  rp.CommentCount,
+  rp.FavoriteCount,
+  rp.PostTypeName,
+  rp.OwnerDisplayName,
+  rp.OwnerReputation,
+  rp.rn_by_type_date,
+  rp.UpVoteCount,
+  rp.DownVoteCount,
+  rp.CommentCountForPost,
+  rp.PreviousPostScore,
+  tp.PrimaryTag
+ORDER BY
+  rp.PostCreationDate DESC
+LIMIT 5000;

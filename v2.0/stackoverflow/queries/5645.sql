@@ -1,0 +1,116 @@
+WITH
+recent_posts AS (
+  SELECT
+    p.Id,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.ParentId,
+    p.AcceptedAnswerId
+  FROM Posts p
+  WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days'
+),
+tag_activity AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS tag_posts,
+    SUM(CASE WHEN p.Score > 0 THEN 1 ELSE 0 END) AS positive_score_posts,
+    SUM(p.ViewCount) AS total_views
+  FROM Tags t
+  JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+  WHERE p.PostTypeId = 1
+  GROUP BY t.TagName
+),
+user_activity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    COUNT(p.Id) AS posts_last_30_days,
+    SUM(p.ViewCount) AS views_last_30_days,
+    SUM(p.Score) AS score_last_30_days,
+    MAX(p.LastActivityDate) AS last_activity
+  FROM Users u
+  LEFT JOIN Posts p
+    ON p.OwnerUserId = u.Id
+   AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days'
+  GROUP BY u.Id, u.DisplayName
+),
+hot_candidates AS (
+  SELECT
+    p.Id,
+    p.PostTypeId,
+    p.Title,
+    p.ViewCount,
+    p.Score,
+    p.CommentCount,
+    p.Tags,
+    ROW_NUMBER() OVER (
+      PARTITION BY p.PostTypeId
+      ORDER BY
+        (CASE WHEN p.PostTypeId = 1 THEN p.ViewCount * 2 ELSE p.ViewCount END)
+        + p.Score
+        + COALESCE(lk.Cnt, 0)
+        DESC
+    ) AS rn
+  FROM Posts p
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS Cnt
+    FROM PostLinks
+    GROUP BY PostId
+  ) lk ON lk.PostId = p.Id
+  WHERE p.PostTypeId IN (1,2)
+    AND p.ClosedDate IS NULL
+)
+SELECT
+  rp.Id AS PostId,
+  rp.PostTypeId,
+  rp.Title,
+  rp.Tags,
+  rp.CreationDate,
+  rp.LastActivityDate,
+  rp.Score,
+  rp.ViewCount,
+  rp.CommentCount,
+  rp.AcceptedAnswerId,
+  ua.UserId,
+  ua.DisplayName AS OwnerDisplayName,
+  ua.posts_last_30_days,
+  ua.views_last_30_days,
+  ua.score_last_30_days,
+  ua.last_activity,
+  ta.TagName,
+  ta.tag_posts,
+  ta.positive_score_posts,
+  ta.total_views,
+  hc.Id AS HotCandidatePostId,
+  hc.Title AS HotCandidateTitle,
+  hc.ViewCount AS HotCandidateViews,
+  hc.Score AS HotCandidateScore,
+  hc.CommentCount AS HotCandidateComments,
+  hc.Tags AS HotCandidateTags
+FROM recent_posts rp
+LEFT JOIN user_activity ua
+  ON rp.OwnerUserId = ua.UserId
+LEFT JOIN (
+  SELECT
+    t.TagName,
+    t.TagName AS TagAlias
+  FROM Tags t
+  GROUP BY t.TagName
+) t0 ON rp.Tags LIKE '%' || t0.TagName || '%'
+LEFT JOIN tag_activity ta
+  ON ta.TagName LIKE '%' || split_part(rp.Tags, '><', 1) || '%'
+LEFT JOIN hot_candidates hc
+  ON rp.Id = hc.Id
+WHERE rp.ViewCount >= 100
+  OR rp.Score >= 5
+ORDER BY rp.LastActivityDate DESC
+LIMIT 100;

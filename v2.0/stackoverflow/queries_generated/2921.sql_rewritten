@@ -1,0 +1,128 @@
+-- {"query": "2921.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1165} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        array[t.TagName] as TagPath,
+        1 as Depth
+    from Tags t
+    where t.IsModeratorOnly = 0
+    union all
+    select
+        t.Id,
+        t.TagName,
+        r.TagPath || t.TagName,
+        r.Depth + 1
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id = r.Id + 1
+    where r.Depth < 3
+),
+UserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        count(distinct c.Id) as CommentCount,
+        count(distinct b.Id) as BadgeCount,
+        coalesce(sum(vb.VoteScore),0) as VoteScoreSum,
+        rank() over (order by coalesce(sum(vb.VoteScore),0) desc nulls last) as VoteScoreRank
+    from
+        Users u
+        left join Posts p on p.OwnerUserId = u.Id
+        left join Comments c on c.UserId = u.Id
+        left join Badges b on b.UserId = u.Id
+        left join (
+            select
+                v.PostId,
+                p.OwnerUserId as OwnerUserId,
+                case
+                    when vt.Name = 'UpMod' then 1
+                    when vt.Name = 'DownMod' then -1
+                    else 0
+                end as VoteScore
+            from Votes v
+            join VoteTypes vt on v.VoteTypeId = vt.Id
+            join Posts p on v.PostId = p.Id
+            where vt.Name in ('UpMod','DownMod')
+        ) vb on vb.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName
+),
+HotQuestions as (
+    select
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        count(v.Id) filter (where vt.Name = 'UpMod') as UpVotes,
+        count(v.Id) filter (where vt.Name = 'DownMod') as DownVotes,
+        (count(v.Id) filter (where vt.Name = 'UpMod') - count(v.Id) filter (where vt.Name = 'DownMod')) as VoteDiff,
+        row_number() over (order by p.Score desc, p.ViewCount desc) as ScoreRank
+    from Posts p
+    left join Votes v on v.PostId = p.Id
+    left join VoteTypes vt on v.VoteTypeId = vt.Id
+    where p.PostTypeId = 1 and p.CreationDate > cast('2024-10-01' as date) - interval '30 day'
+    group by p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount
+),
+ClosedQuestionsWithReasons AS (
+    select
+        ph.PostId,
+        p.Title,
+        p.CreationDate,
+        crt.Name as CloseReason,
+        ph.CreationDate as CloseDate,
+        row_number() over (partition by ph.PostId order by ph.CreationDate desc) as CloseEventRank
+    from PostHistory ph
+    join CloseReasonTypes crt on ph.Comment::int = crt.Id and ph.PostHistoryTypeId = 10
+    join Posts p on p.Id = ph.PostId
+    where p.PostTypeId = 1 and ph.Comment is not null
+)
+select
+    ua.UserId,
+    ua.DisplayName,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.CommentCount,
+    ua.BadgeCount,
+    ua.VoteScoreSum,
+    ua.VoteScoreRank,
+    hq.Id as HotQuestionId,
+    hq.Title as HotQuestionTitle,
+    hq.Score as HotQuestionScore,
+    hq.UpVotes,
+    hq.DownVotes,
+    hq.VoteDiff,
+    cqwr.CloseReason,
+    cqwr.CloseDate,
+    cqwr.Title as ClosedQuestionTitle,
+    case
+        when strpos(coalesce(p.Body, ''), 'sql') > 0 then 'Contains SQL'
+        else 'No SQL'
+    end as BodyContainsSQL,
+    rth.TagName,
+    rth.TagPath,
+    rth.Depth
+from UserActivity ua
+left join LATERAL (
+    select *
+    from HotQuestions hq
+    where hq.Id in (
+        select p.Id from Posts p where p.OwnerUserId = ua.UserId and p.PostTypeId = 1
+    )
+    order by hq.ScoreRank
+    limit 1
+) hq on true
+left join LATERAL (
+    select *
+    from ClosedQuestionsWithReasons cqwr
+    where cqwr.PostId in (
+        select p.Id from Posts p where p.OwnerUserId = ua.UserId and p.PostTypeId = 1
+    )
+    and cqwr.CloseEventRank = 1
+    order by cqwr.CloseDate desc
+    limit 1
+) cqwr on true
+left join Posts p on p.OwnerUserId = ua.UserId and p.PostTypeId = 1
+left join RecursiveTagHierarchy rth on rth.TagName = ANY(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><'))
+where ua.VoteScoreRank <= 100
+order by ua.VoteScoreRank, hq.ScoreRank nulls last, cqwr.CloseDate nulls last;

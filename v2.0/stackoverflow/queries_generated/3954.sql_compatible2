@@ -1,0 +1,123 @@
+WITH 
+UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1)                AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2)                AS AnswerCount,
+        SUM(COALESCE(p.Score,0))                                   AS TotalPostScore,
+        SUM(v.UpVotes)                                             AS TotalUpVotes,
+        SUM(v.DownVotes)                                           AS TotalDownVotes,
+        MAX(p.CreationDate)                                        AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p 
+        ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT 
+            PostId,
+            SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes
+        GROUP BY PostId
+    ) v 
+        ON v.PostId = p.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+TopTags AS (
+    SELECT 
+        t.TagName,
+        COUNT(*)                                        AS TagUsage,
+        ROW_NUMBER() OVER (ORDER BY COUNT(*) DESC)     AS rn
+    FROM Posts p
+    CROSS JOIN LATERAL (
+        SELECT UNNEST(string_to_array(TRIM(BOTH '><' FROM p.Tags), '><')) AS tag
+    ) AS tags
+    JOIN Tags t ON t.TagName = tags.tag
+    WHERE p.PostTypeId = 1
+    GROUP BY t.TagName
+    HAVING COUNT(*) > 100
+),
+
+UserBadgeAgg AS (
+    SELECT 
+        b.UserId,
+        JSON_AGG(JSON_BUILD_OBJECT('Name', b.Name, 'Class', b.Class)) AS BadgesJson,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldCount,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverCount,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeCount
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+RecentActivity AS (
+    SELECT 
+        u.Id                                                       AS UserId,
+        GREATEST(
+            COALESCE(MAX(p.LastActivityDate), TIMESTAMP '1970-01-01'),
+            COALESCE(MAX(c.CreationDate),      TIMESTAMP '1970-01-01'),
+            COALESCE(MAX(ph.CreationDate),     TIMESTAMP '1970-01-01')
+        )                                                          AS LastActivity
+    FROM Users u
+    LEFT JOIN Posts p        ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c     ON c.UserId      = u.Id
+    LEFT JOIN PostHistory ph ON ph.UserId     = u.Id
+    GROUP BY u.Id
+),
+
+MainResults AS (
+    SELECT 
+        us.Id,
+        us.DisplayName,
+        us.Reputation,
+        us.QuestionCount,
+        us.AnswerCount,
+        us.TotalPostScore,
+        us.TotalUpVotes - us.TotalDownVotes                           AS NetVotes,
+        ub.GoldCount,
+        ub.SilverCount,
+        ub.BronzeCount,
+        ub.BadgesJson,
+        ra.LastActivity,
+        tt.TagName,
+        tt.TagUsage,
+        CASE 
+            WHEN us.Reputation > 200000 THEN 'Veteran'
+            WHEN us.Reputation >  50000 THEN 'Experienced'
+            ELSE                               'Rising'
+        END                                                          AS ReputationTier,
+        COALESCE(NULLIF(us.LastPostDate, TIMESTAMP '1970-01-01'), ra.LastActivity) AS MostRecentContribution
+    FROM UserStats us
+    LEFT JOIN UserBadgeAgg ub      ON ub.UserId = us.Id
+    LEFT JOIN RecentActivity ra    ON ra.UserId = us.Id
+    LEFT JOIN (SELECT TagName, TagUsage FROM TopTags WHERE rn <= 5) tt ON TRUE
+    WHERE (us.Reputation IS NOT NULL AND us.QuestionCount > 0)
+       OR (ub.GoldCount > 0 AND ra.LastActivity > (CAST('2024-10-01' AS DATE) - INTERVAL '30 days'))
+)
+
+SELECT *
+FROM MainResults
+ORDER BY Reputation DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT 
+    NULL AS Id,
+    '---' AS DisplayName,
+    NULL AS Reputation,
+    NULL AS QuestionCount,
+    NULL AS AnswerCount,
+    NULL AS TotalPostScore,
+    NULL AS NetVotes,
+    NULL AS GoldCount,
+    NULL AS SilverCount,
+    NULL AS BronzeCount,
+    NULL AS BadgesJson,
+    NULL AS LastActivity,
+    NULL AS TagName,
+    NULL AS TagUsage,
+    NULL AS ReputationTier,
+    NULL AS MostRecentContribution
+WHERE FALSE;

@@ -1,0 +1,98 @@
+-- {"query": "3189.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2234} 
+
+WITH RecentQuestions AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1                                    -- only questions
+      AND p.CreationDate >= CURRENT_DATE - INTERVAL '30 days'
+),
+UserBadgeStats AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS gold_badges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS silver_badges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS bronze_badges,
+        MAX(b.Date) AS last_badge_date
+    FROM Badges b
+    GROUP BY b.UserId
+),
+PostVoteAggregates AS (
+    SELECT 
+        v.PostId,
+        SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS up_votes,
+        SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS down_votes,
+        MAX(v.CreationDate) AS last_vote_date
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY v.PostId
+),
+TagAggregation AS (
+    SELECT 
+        p.Id AS PostId,
+        STRING_AGG(t.TagName, '|') AS tag_pipe
+    FROM Posts p
+    JOIN LATERAL regexp_split_to_table(p.Tags, '<|>') AS tg(tag) ON tg.tag <> ''
+    JOIN Tags t ON t.TagName = tg.tag
+    GROUP BY p.Id
+)
+SELECT 
+    rq.Id                                           AS PostId,
+    rq.Title,
+    COALESCE(u.DisplayName, '[deleted]')           AS OwnerDisplayName,
+    COALESCE(ubs.gold_badges, 0)                    AS GoldBadges,
+    COALESCE(ubs.silver_badges, 0)                  AS SilverBadges,
+    COALESCE(ubs.bronze_badges, 0)                  AS BronzeBadges,
+    pva.up_votes,
+    pva.down_votes,
+    (pva.up_votes - pva.down_votes)                AS ScoreDiff,
+    ta.tag_pipe,
+    CASE 
+        WHEN pva.last_vote_date IS NULL                THEN 'NoVotes'
+        WHEN pva.last_vote_date > rq.CreationDate       THEN 'VotedAfterPost'
+        ELSE 'VotedBeforePost'
+    END                                            AS VoteTiming,
+    CASE 
+        WHEN p.ClosedDate IS NOT NULL                THEN 'Closed'
+        WHEN p.CommunityOwnedDate IS NOT NULL         THEN 'CommunityOwned'
+        ELSE 'Open'
+    END                                            AS Status
+FROM RecentQuestions rq
+LEFT JOIN Users u               ON u.Id = rq.OwnerUserId
+LEFT JOIN UserBadgeStats ubs    ON ubs.UserId = u.Id
+LEFT JOIN PostVoteAggregates pva ON pva.PostId = rq.Id
+LEFT JOIN TagAggregation ta     ON ta.PostId = rq.Id
+LEFT JOIN Posts p               ON p.Id = rq.Id               -- to expose ClosedDate etc.
+WHERE rq.rn <= 5                                            -- top‑5 recent per user
+  AND (u.Reputation IS NULL OR u.Reputation > 1000)        -- filter low‑rep owners
+  AND (pva.up_votes IS NULL OR pva.up_votes >= 10)       -- require some up‑votes
+  AND (COALESCE(p.ClosedDate, p.CommunityOwnedDate) IS NULL 
+       OR p.CreationDate > DATE '2008-01-01')             -- ignore very old closed/owned posts
+UNION ALL
+SELECT 
+    a.Id,
+    q.Title,
+    COALESCE(ua.DisplayName, '[deleted]')          AS OwnerDisplayName,
+    COALESCE(ubs2.gold_badges, 0)                  AS GoldBadges,
+    COALESCE(ubs2.silver_badges, 0)                AS SilverBadges,
+    COALESCE(ubs2.bronze_badges, 0)                AS BronzeBadges,
+    pva2.up_votes,
+    pva2.down_votes,
+    (pva2.up_votes - pva2.down_votes)             AS ScoreDiff,
+    ta2.tag_pipe,
+    'Answer'                                      AS VoteTiming,
+    'Answer'                                      AS Status
+FROM Posts a
+JOIN Posts q ON q.Id = a.ParentId AND q.PostTypeId = 1               -- parent question
+LEFT JOIN Users ua            ON ua.Id = a.OwnerUserId
+LEFT JOIN UserBadgeStats ubs2 ON ubs2.UserId = ua.Id
+LEFT JOIN PostVoteAggregates pva2 ON pva2.PostId = a.Id
+LEFT JOIN TagAggregation ta2      ON ta2.PostId = q.Id
+WHERE a.PostTypeId = 2                                             -- only answers
+  AND a.CreationDate >= CURRENT_DATE - INTERVAL '30 days'
+  AND pva2.up_votes >= 5
+ORDER BY PostId DESC, ScoreDiff DESC;

@@ -1,0 +1,277 @@
+-- {"query": "1385.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3516} 
+WITH UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.Views AS UserViews,
+        u.UpVotes AS UserUpVotesGiven,
+        u.DownVotes AS UserDownVotesGiven,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswers,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        SUM(COALESCE(p.Score, 0)) AS SumPostScore,
+        SUM(COALESCE(p.FavoriteCount, 0)) AS SumFavoriteCountOnPosts,
+        MAX(GREATEST(COALESCE(p.LastActivityDate, '1900-01-01'), COALESCE(c.CreationDate, '1900-01-01'), COALESCE(b.Date, '1900-01-01'))) AS LastKnownUserActivityDate,
+        AVG(CASE WHEN p.Score IS NOT NULL THEN p.Score ELSE 0 END) AS AvgPostScorePerUser
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes
+),
+PostDetailsAndTags AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.Body,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount AS PostCommentCount,
+        p.FavoriteCount AS PostFavoriteCount,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.AcceptedAnswerId,
+        p.ClosedDate,
+        LENGTH(COALESCE(p.Body, '')) AS BodyCharLength,
+        LENGTH(COALESCE(p.Title, '')) AS TitleCharLength,
+        ARRAY_LENGTH(string_to_array(SUBSTRING(COALESCE(p.Tags, ''), 2, LENGTH(COALESCE(p.Tags, '')) - 2), '><'), 1) AS TagCount,
+        COALESCE(p.Score, 0) + COALESCE(p.FavoriteCount, 0) * 5 + COALESCE(p.ViewCount, 0) / 100.0 AS WeightedPostEngagement,
+        (SELECT COUNT(v.Id) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpVoteCountOnPost, -- Correlated subquery for actual upvotes
+        (SELECT COUNT(v.Id) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS DownVoteCountOnPost -- Correlated subquery for actual downvotes
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+),
+PostHistoryAggregates AS (
+    SELECT
+        ph.PostId,
+        COUNT(ph.Id) AS TotalHistoryEvents,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 END) AS TotalEditEvents,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) AS LastCloseDate,
+        (SELECT crt.Name FROM CloseReasonTypes crt WHERE crt.Id = CAST(MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Comment END) AS SMALLINT) LIMIT 1) AS CloseReasonName
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6, 10, 11) -- Edit, Close, Reopen events
+    GROUP BY ph.PostId
+),
+TagPerformance AS (
+    SELECT
+        t.TagName,
+        COUNT(DISTINCT p.Id) AS QuestionsUsingTag,
+        AVG(p.Score) AS AvgScoreForTag,
+        SUM(p.ViewCount) AS TotalViewsForTag,
+        NTILE(5) OVER (ORDER BY COUNT(DISTINCT p.Id) DESC, AVG(p.Score) DESC) AS TagPopularityQuintile
+    FROM Tags t
+    JOIN Posts p ON p.Tags LIKE CONCAT('%<', t.TagName, '>%') AND p.PostTypeId = 1
+    GROUP BY t.TagName
+),
+RankedUserPosts AS (
+    SELECT
+        pda.PostId,
+        pda.OwnerUserId,
+        pda.PostScore,
+        pda.WeightedPostEngagement,
+        ROW_NUMBER() OVER (PARTITION BY pda.OwnerUserId ORDER BY pda.WeightedPostEngagement DESC, pda.PostScore DESC, pda.CreationDate DESC) AS UserPostRank,
+        RANK() OVER (PARTITION BY pda.OwnerUserId, pda.PostTypeId ORDER BY pda.PostScore DESC) AS RankWithinPostTypeByScore
+    FROM PostDetailsAndTags pda
+),
+BaseQueryResult AS (
+    SELECT
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.TotalPosts,
+        uas.TotalQuestions,
+        uas.TotalAnswers,
+        uas.TotalComments,
+        uas.TotalBadges,
+        pda.PostId,
+        pda.PostTypeName,
+        pda.Title,
+        pda.PostScore,
+        pda.ViewCount,
+        pda.AnswerCount,
+        pda.PostCommentCount,
+        pda.PostFavoriteCount,
+        pda.BodyCharLength,
+        pda.TitleCharLength,
+        pda.TagCount,
+        pda.WeightedPostEngagement,
+        pda.UpVoteCountOnPost,
+        pda.DownVoteCountOnPost,
+        rpec.TotalEditEvents,
+        rpec.LastCloseDate,
+        rpec.CloseReasonName,
+        tp.TagName AS TopContributingTag,
+        tp.AvgScoreForTag AS TopTagAvgScore,
+        tp.TagPopularityQuintile,
+        pda.PostCreationDate,
+        uas.UserCreationDate,
+        EXTRACT(DAY FROM (cast('2024-10-01 12:34:56' as timestamp) - uas.UserCreationDate)) AS UserAgeInDays,
+        EXTRACT(HOUR FROM (cast('2024-10-01 12:34:56' as timestamp) - pda.PostCreationDate)) AS PostAgeInHours,
+        (uas.SumPostScore * 1.0 / NULLIF(uas.TotalPosts, 0)) AS CalculatedAvgUserPostScore,
+        COALESCE(pda.Tags, 'No Tags') AS PostTagsString,
+        CASE
+            WHEN pda.AcceptedAnswerId IS NOT NULL AND pda.PostTypeId = 1 THEN TRUE
+            ELSE FALSE
+        END AS HasAcceptedAnswer,
+        CASE
+            WHEN pda.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN pda.PostScore < 0 THEN 'Low_Score'
+            WHEN pda.PostCommentCount = 0 AND pda.AnswerCount = 0 THEN 'No_Engagement'
+            ELSE 'Active'
+        END AS PostStatusCategory,
+        ROW_NUMBER() OVER (ORDER BY uas.Reputation DESC, uas.TotalPosts DESC, uas.LastKnownUserActivityDate DESC) AS GlobalUserRank,
+        RANK() OVER (PARTITION BY pda.PostTypeId ORDER BY pda.WeightedPostEngagement DESC, pda.PostScore DESC) AS PostTypeEngagementRank,
+        LAG(pda.PostCreationDate, 1, '1900-01-01') OVER (PARTITION BY uas.UserId ORDER BY pda.PostCreationDate) AS PreviousPostDateByUser,
+        LEAD(pda.PostCreationDate, 1, '2999-01-01') OVER (PARTITION BY uas.UserId ORDER BY pda.PostCreationDate) AS NextPostDateByUser,
+        (SELECT AVG(s.PostScore) FROM PostDetailsAndTags s WHERE s.OwnerUserId = uas.UserId AND s.PostTypeId = 2) AS AvgAnswerScoreByUser, -- Correlated subquery
+        (SELECT MAX(s.WeightedPostEngagement) FROM PostDetailsAndTags s WHERE s.OwnerUserId = uas.UserId AND s.PostTypeId = 1 AND s.WeightedPostEngagement IS NOT NULL) AS MaxQuestionEngagementByUser -- Correlated subquery
+    FROM UserActivitySummary uas
+    INNER JOIN RankedUserPosts rup ON uas.UserId = rup.OwnerUserId
+    INNER JOIN PostDetailsAndTags pda ON rup.PostId = pda.PostId
+    LEFT JOIN PostHistoryAggregates rpec ON pda.PostId = rpec.PostId
+    LEFT JOIN TagPerformance tp ON pda.Tags LIKE CONCAT('%<', tp.TagName, '>%') AND tp.TagPopularityQuintile = 1
+)
+-- High-Impact Posts/Users
+SELECT
+    'High-Impact' AS ImpactCategory,
+    bqr.UserId,
+    bqr.DisplayName,
+    bqr.Reputation,
+    bqr.TotalPosts,
+    bqr.TotalQuestions,
+    bqr.TotalAnswers,
+    bqr.TotalComments,
+    bqr.TotalBadges,
+    bqr.PostId,
+    bqr.PostTypeName,
+    bqr.Title,
+    bqr.PostScore,
+    bqr.ViewCount,
+    bqr.AnswerCount,
+    bqr.PostCommentCount,
+    bqr.PostFavoriteCount,
+    bqr.BodyCharLength,
+    bqr.TitleCharLength,
+    bqr.TagCount,
+    bqr.WeightedPostEngagement,
+    bqr.UpVoteCountOnPost,
+    bqr.DownVoteCountOnPost,
+    bqr.TotalEditEvents,
+    bqr.LastCloseDate,
+    bqr.CloseReasonName,
+    bqr.TopContributingTag,
+    bqr.TopTagAvgScore,
+    bqr.TagPopularityQuintile,
+    bqr.PostCreationDate,
+    bqr.UserCreationDate,
+    bqr.UserAgeInDays,
+    bqr.PostAgeInHours,
+    bqr.CalculatedAvgUserPostScore,
+    bqr.PostTagsString,
+    bqr.HasAcceptedAnswer,
+    bqr.PostStatusCategory,
+    bqr.GlobalUserRank,
+    bqr.PostTypeEngagementRank,
+    bqr.PreviousPostDateByUser,
+    bqr.NextPostDateByUser,
+    bqr.AvgAnswerScoreByUser,
+    bqr.MaxQuestionEngagementByUser
+FROM BaseQueryResult bqr
+WHERE
+    bqr.Reputation > 1000
+    AND bqr.TotalPosts > 5
+    AND bqr.PostScore IS NOT NULL
+    AND bqr.PostTypeId IN (1, 2)
+    AND bqr.WeightedPostEngagement > 10
+    AND (bqr.PostTagsString LIKE '%<sql>%' OR bqr.PostTagsString LIKE '%<database>%')
+    AND bqr.UserPostRank <= 5
+    AND (
+        (bqr.PostTypeName = 'Question' AND bqr.ViewCount > 500 AND bqr.AnswerCount >= 1)
+        OR
+        (bqr.PostTypeName = 'Answer' AND bqr.PostScore >= 5 AND bqr.BodyCharLength > 100)
+    )
+    AND NOT (bqr.Title ILIKE '%what is%' AND bqr.PostCommentCount < 2)
+    AND (bqr.ClosedDate IS NULL OR bqr.PostScore > 0)
+ORDER BY
+    bqr.Reputation DESC,
+    bqr.WeightedPostEngagement DESC,
+    bqr.PostCreationDate DESC
+LIMIT 500
+UNION ALL
+-- Low-Impact Posts/Users for comparison/analysis
+SELECT
+    'Low-Impact' AS ImpactCategory,
+    bqr.UserId,
+    bqr.DisplayName,
+    bqr.Reputation,
+    bqr.TotalPosts,
+    bqr.TotalQuestions,
+    bqr.TotalAnswers,
+    bqr.TotalComments,
+    bqr.TotalBadges,
+    bqr.PostId,
+    bqr.PostTypeName,
+    bqr.Title,
+    bqr.PostScore,
+    bqr.ViewCount,
+    bqr.AnswerCount,
+    bqr.PostCommentCount,
+    bqr.PostFavoriteCount,
+    bqr.BodyCharLength,
+    bqr.TitleCharLength,
+    bqr.TagCount,
+    bqr.WeightedPostEngagement,
+    bqr.UpVoteCountOnPost,
+    bqr.DownVoteCountOnPost,
+    bqr.TotalEditEvents,
+    bqr.LastCloseDate,
+    bqr.CloseReasonName,
+    bqr.TopContributingTag,
+    bqr.AvgScoreForTag,
+    bqr.TagPopularityQuintile,
+    bqr.PostCreationDate,
+    bqr.UserCreationDate,
+    bqr.UserAgeInDays,
+    bqr.PostAgeInHours,
+    bqr.CalculatedAvgUserPostScore,
+    bqr.PostTagsString,
+    bqr.HasAcceptedAnswer,
+    bqr.PostStatusCategory,
+    bqr.GlobalUserRank,
+    bqr.PostTypeEngagementRank,
+    bqr.PreviousPostDateByUser,
+    bqr.NextPostDateByUser,
+    bqr.AvgAnswerScoreByUser,
+    bqr.MaxQuestionEngagementByUser
+FROM BaseQueryResult bqr
+WHERE
+    bqr.Reputation <= 500
+    AND bqr.TotalPosts < 5
+    AND bqr.PostScore <= 0
+    AND bqr.PostTypeId IN (1, 2)
+    AND (bqr.WeightedPostEngagement IS NULL OR bqr.WeightedPostEngagement < 5)
+    AND (bqr.PostTagsString LIKE '%<newbie>%' OR bqr.PostTagsString LIKE '%<beginner>%') -- Hypothetical common "low-impact" tags
+    AND bqr.UserPostRank = 1
+    AND (
+        (bqr.PostTypeName = 'Question' AND bqr.ViewCount < 100 AND bqr.AnswerCount = 0)
+        OR
+        (bqr.PostTypeName = 'Answer' AND bqr.PostScore < 0 AND bqr.BodyCharLength < 50)
+    )
+    AND (bqr.Title ILIKE '%how to basic%' OR bqr.PostCommentCount = 0)
+    AND bqr.ClosedDate IS NOT NULL
+ORDER BY
+    bqr.Reputation ASC,
+    bqr.WeightedPostEngagement ASC,
+    bqr.PostCreationDate ASC
+LIMIT 500;

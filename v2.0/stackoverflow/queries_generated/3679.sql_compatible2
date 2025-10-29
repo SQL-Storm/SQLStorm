@@ -1,0 +1,132 @@
+WITH
+    UserReputation AS (
+        SELECT
+            u.Id                                   AS UserId,
+            u.DisplayName,
+            u.Reputation,
+            COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+            COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+            COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+            COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END),0) -
+            COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END),0) AS NetUpVotes
+        FROM Users u
+        LEFT JOIN Badges b ON b.UserId = u.Id
+        LEFT JOIN Votes v  ON v.UserId = u.Id AND v.VoteTypeId IN (2,3)
+        GROUP BY u.Id, u.DisplayName, u.Reputation
+    ),
+
+    RecentActivePosts AS (
+        SELECT
+            p.Id,
+            p.Title,
+            p.PostTypeId,
+            p.OwnerUserId,
+            p.Score,
+            p.CreationDate,
+            p.Tags,
+            ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) AS rn
+        FROM Posts p
+        WHERE p.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '30 days')
+    ),
+
+    PostCommentsAgg AS (
+        SELECT
+            c.PostId,
+            COUNT(*)                                   AS CommentCount,
+            STRING_AGG(DISTINCT LEFT(c.Text,30), '; ') AS SampleComments
+        FROM Comments c
+        WHERE c.Score IS NOT NULL
+        GROUP BY c.PostId
+    ),
+
+    TagFrequency AS (
+        SELECT
+            tag AS Tag,
+            COUNT(*)                                                   AS TagUseCount
+        FROM (
+            SELECT
+                TRIM(tgt) AS tag
+            FROM Posts p,
+                 UNNEST(STRING_TO_ARRAY(TRIM(BOTH '<>' FROM p.Tags), '><')) AS t(tgt)
+            WHERE p.PostTypeId = 1
+              AND p.Tags IS NOT NULL
+        ) sub
+        GROUP BY tag
+    ),
+
+    TopTags AS (
+        SELECT
+            Tag,
+            TagUseCount,
+            ROW_NUMBER() OVER (ORDER BY TagUseCount DESC) AS TagRank
+        FROM TagFrequency
+        WHERE Tag IS NOT NULL
+        ORDER BY TagUseCount DESC
+        LIMIT 10
+    )
+SELECT
+    ur.UserId,
+    ur.DisplayName,
+    ur.Reputation,
+    ur.GoldBadges,
+    ur.SilverBadges,
+    ur.BronzeBadges,
+    ur.NetUpVotes,
+    rp.Id                               AS PostId,
+    rp.Title,
+    rp.Score,
+    COALESCE(pc.CommentCount,0)         AS CommentCount,
+    COALESCE(pc.SampleComments,'')      AS SampleComments,
+    CASE
+        WHEN rp.Tags IS NULL THEN NULL
+        ELSE (
+            SELECT STRING_AGG(tt.Tag, ',' ORDER BY tt.TagRank)
+            FROM (
+                SELECT DISTINCT TRIM(tgt) AS tag
+                FROM UNNEST(STRING_TO_ARRAY(TRIM(BOTH '<>' FROM rp.Tags), '><')) AS t(tgt)
+            ) AS tags
+            JOIN TopTags tt ON tt.Tag = tags.tag
+            LIMIT 3
+        )
+    END                                 AS TopMatchingTags
+FROM UserReputation ur
+JOIN RecentActivePosts rp
+     ON rp.OwnerUserId = ur.UserId AND rp.rn <= 5
+LEFT JOIN PostCommentsAgg pc ON pc.PostId = rp.Id
+WHERE ur.Reputation > 5000
+  AND (rp.Score >= 10 OR ur.NetUpVotes > 100)
+
+UNION ALL
+
+SELECT
+    NULL                                 AS UserId,
+    'Community'                          AS DisplayName,
+    NULL                                 AS Reputation,
+    0                                    AS GoldBadges,
+    0                                    AS SilverBadges,
+    0                                    AS BronzeBadges,
+    0                                    AS NetUpVotes,
+    p.Id                                 AS PostId,
+    p.Title,
+    p.Score,
+    COALESCE(pc.CommentCount,0)          AS CommentCount,
+    COALESCE(pc.SampleComments,'')       AS SampleComments,
+    NULL                                 AS TopMatchingTags
+FROM Posts p
+LEFT JOIN PostCommentsAgg pc ON pc.PostId = p.Id
+WHERE p.PostTypeId = 1
+  AND p.Score = (
+        SELECT MAX(p2.Score)
+        FROM Posts p2
+        WHERE p2.PostTypeId = 1
+          AND p2.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '7 days')
+          AND p2.Tags IS NOT NULL
+          AND EXISTS (
+                SELECT 1
+                FROM TopTags tt
+                WHERE tt.Tag = ANY (STRING_TO_ARRAY(TRIM(BOTH '<>' FROM p2.Tags), '><'))
+          )
+    )
+  AND p.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '7 days')
+ORDER BY Score DESC NULLS LAST
+LIMIT 20;

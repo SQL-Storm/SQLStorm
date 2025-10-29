@@ -1,0 +1,77 @@
+-- {"query": "5680.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 775} 
+SELECT
+  p.Id AS PostId,
+  p.Title,
+  p.PostTypeId,
+  p.CreationDate,
+  p.Score,
+  p.ViewCount,
+  p.OwnerUserId,
+  u.DisplayName AS OwnerDisplayName,
+  u.Reputation,
+  COALESCE(p.FavoriteCount, 0) AS Favorites,
+  pc.CountCommentCount,
+  COALESCE(vvotes.SummingUp, 0) AS UpVotesDuringWindow,
+  COALESCE(vvotes.SummingDown, 0) AS DownVotesDuringWindow,
+  nt.LastActivityWindow,
+  COALESCE(bg.GoldCount, 0) AS GoldBadgesOwned,
+  COALESCE(bg.SilverCount, 0) AS SilverBadgesOwned,
+  COALESCE(bg.BronzeCount, 0) AS BronzeBadgesOwned,
+  wl.LastEditedBy AS LastEditorDisplayName,
+  wl.LastEditDate AS LastEditDate,
+  cl.CloseReasonCurrent,
+  CASE
+    WHEN p.PostTypeId = 1 THEN (SELECT COUNT(*) FROM Posts AS a WHERE a.ParentId = p.Id)
+    ELSE NULL
+  END AS ChildAnswersCount,
+  CASE
+    WHEN p.Tags IS NOT NULL THEN
+      ARRAY_LENGTH(string_to_array(REGEXP_REPLACE(p.Tags, '^\\(|\\)$', '', 'g'), '><')
+    ELSE 0
+  END AS TagCount
+FROM
+  Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS CountCommentCount
+    FROM Comments
+    GROUP BY PostId
+  ) pc ON p.Id = pc.PostId
+  LEFT JOIN (
+    SELECT PostId, SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS SummingUp,
+           SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS SummingDown
+    FROM Votes
+    GROUP BY PostId
+  ) vvotes ON p.Id = vvotes.PostId
+  LEFT JOIN (
+    SELECT Id, Max(LastEditDate) AS LastEditDate, LastEditorUserId, LastEditorDisplayName
+    FROM Posts
+    GROUP BY Id, LastEditorUserId, LastEditorDisplayName
+  ) wl ON p.Id = wl.Id
+  LEFT JOIN (
+    SELECT OwnerUserId,
+           SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldCount,
+           SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverCount,
+           SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeCount
+    FROM Badges
+    GROUP BY OwnerUserId
+  ) bg ON p.OwnerUserId = bg.OwnerUserId
+  LEFT JOIN (
+    SELECT PostHistory.PostId,
+           MAX(PostHistory.CreationDate) AS CloseDate,
+           MAX(CASE WHEN PostHistory.PostHistoryTypeId IN (10, 11) THEN PostHistory.Comment ELSE NULL END) AS CloseReasonCurrent
+    FROM PostHistory
+    GROUP BY PostHistory.PostId
+  ) ph ON p.Id = ph.PostId
+  LEFT JOIN (
+    SELECT PostId, MAX(LastActivityDate) AS LastActivityWindow
+    FROM Posts
+    GROUP BY PostId
+  ) nt ON p.Id = nt.PostId
+WHERE
+  p.PostTypeId IN (1, 2)
+  AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+  AND (p.Tags IS NULL OR LENGTH(p.Tags) > 0)
+ORDER BY
+  p.CreationDate DESC
+LIMIT 100;

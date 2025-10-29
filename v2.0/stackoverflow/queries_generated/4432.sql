@@ -1,0 +1,111 @@
+-- {"query": "4432.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1127} 
+
+WITH
+  RankedAnswers AS (
+    SELECT
+      p.Id AS PostId,
+      p.ParentId AS QuestionId,
+      p.OwnerUserId,
+      p.Score,
+      p.CreationDate,
+      ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS rn
+    FROM Posts AS p
+    WHERE
+      p.PostTypeId = 2
+      AND p.ParentId IS NOT NULL
+  ),
+  QuestionDetails AS (
+    SELECT
+      q.Id AS QuestionId,
+      q.OwnerUserId AS QuestionOwnerUserId,
+      q.Title AS QuestionTitle,
+      q.Tags AS QuestionTags,
+      q.AcceptedAnswerId,
+      q.ViewCount AS QuestionViewCount,
+      q.FavoriteCount AS QuestionFavoriteCount,
+      q.AnswerCount,
+      q.CreationDate AS QuestionCreationDate,
+      q.LastActivityDate AS QuestionLastActivityDate,
+      q.ClosedDate,
+      (
+        SELECT
+          COUNT(ph.Id)
+        FROM PostHistory AS ph
+        WHERE
+          ph.PostId = q.Id AND ph.PostHistoryTypeId IN (10, 11, 12, 13)
+      ) AS PostHistoryEventCount,
+      u.DisplayName AS QuestionOwnerDisplayName,
+      u.Reputation AS QuestionOwnerReputation
+    FROM Posts AS q
+    LEFT JOIN Users AS u
+      ON q.OwnerUserId = u.Id
+    WHERE
+      q.PostTypeId = 1
+  ),
+  UserEngagement AS (
+    SELECT
+      v.UserId,
+      COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE NULL END) AS UpVotesCount,
+      COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE NULL END) AS DownVotesCount,
+      COUNT(DISTINCT c.PostId) AS CommentedOnPostCount,
+      COUNT(DISTINCT b.Id) AS BadgesEarnedCount,
+      MAX(b.Date) AS LastBadgeDate
+    FROM Votes AS v
+    LEFT JOIN Comments AS c
+      ON v.UserId = c.UserId AND v.PostId = c.PostId
+    LEFT JOIN Badges AS b
+      ON v.UserId = b.UserId
+    WHERE
+      v.UserId IS NOT NULL
+    GROUP BY
+      v.UserId
+  )
+SELECT
+  qd.QuestionId,
+  qd.QuestionTitle,
+  qd.QuestionOwnerDisplayName,
+  qd.QuestionOwnerReputation,
+  qd.QuestionTags,
+  qd.QuestionViewCount,
+  qd.QuestionFavoriteCount,
+  qd.AnswerCount,
+  qd.QuestionCreationDate,
+  qd.QuestionLastActivityDate,
+  qd.PostHistoryEventCount,
+  qd.ClosedDate,
+  COALESCE(ra_top.Score, 0) AS TopAnswerScore,
+  ra_top.OwnerUserId AS TopAnswerOwnerUserId,
+  COALESCE(ue.UpVotesCount, 0) AS UserUpVotes,
+  COALESCE(ue.DownVotesCount, 0) AS UserDownVotes,
+  COALESCE(ue.CommentedOnPostCount, 0) AS UserCommentedPosts,
+  COALESCE(ue.BadgesEarnedCount, 0) AS UserTotalBadges,
+  CASE
+    WHEN qd.AcceptedAnswerId IS NOT NULL AND ra_top.PostId = qd.AcceptedAnswerId THEN 'Accepted Top Answer'
+    WHEN qd.AcceptedAnswerId IS NOT NULL THEN 'Accepted Not Top Answer'
+    ELSE 'No Accepted Answer'
+  END AS AcceptanceStatus,
+  CASE
+    WHEN qd.QuestionOwnerDisplayName LIKE '%[^a-zA-Z0-9]%' THEN 'Contains Special Chars'
+    ELSE 'Clean Name'
+  END AS OwnerNameFormat,
+  DATEDIFF(day, qd.QuestionCreationDate, qd.QuestionLastActivityDate) AS DaysSinceLastActivity,
+  CASE
+    WHEN UPPER(qd.QuestionTags) LIKE '%<performance>% OR UPPER(qd.QuestionTags) LIKE '%<sql>%'' THEN 'Performance/SQL Related'
+    ELSE 'Other'
+  END AS TagCategory
+FROM QuestionDetails AS qd
+LEFT JOIN RankedAnswers AS ra_top
+  ON qd.QuestionId = ra_top.QuestionId AND ra_top.rn = 1
+LEFT JOIN UserEngagement AS ue
+  ON qd.QuestionOwnerUserId = ue.UserId
+WHERE
+  qd.QuestionViewCount > 1000
+  AND qd.AnswerCount BETWEEN 5 AND 50
+  AND qd.QuestionCreationDate < DATEADD(year, -1, GETDATE())
+  AND qd.ClosedDate IS NULL
+  AND (
+    qd.QuestionOwnerReputation > 5000 OR qd.QuestionOwnerUserId IS NULL
+  )
+ORDER BY
+  qd.QuestionFavoriteCount DESC,
+  qd.QuestionViewCount DESC;

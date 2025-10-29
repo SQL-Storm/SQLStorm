@@ -1,0 +1,119 @@
+WITH
+user_stats AS (
+    SELECT
+        u.Id                                   AS user_id,
+        u.DisplayName                          AS display_name,
+        u.Reputation,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS question_cnt,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS answer_cnt,
+        COALESCE(SUM(p.Score),0)               AS total_score,
+        MAX(p.CreationDate)                    AS last_post_dt
+    FROM Users u
+    LEFT JOIN Posts p
+        ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+badge_agg AS (
+    SELECT
+        b.UserId,
+        STRING_AGG(b.Name, ', ')               AS badge_list,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_cnt,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_cnt,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_cnt
+    FROM Badges b
+    GROUP BY b.UserId
+),
+question_tags AS (
+    SELECT
+        p.OwnerUserId                         AS user_id,
+        UNNEST(string_to_array(TRIM(BOTH '<>' FROM p.Tags), '><')) AS tag,
+        ROW_NUMBER() OVER (
+            PARTITION BY p.OwnerUserId
+            ORDER BY p.Score DESC, p.CreationDate DESC
+        )                                     AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.Tags IS NOT NULL
+),
+user_top_tags AS (
+    SELECT
+        user_id,
+        STRING_AGG(tag, ', ') FILTER (WHERE rn <= 3) AS top_3_tags
+    FROM question_tags
+    GROUP BY user_id
+),
+recent_votes AS (
+    SELECT
+        v.PostId,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS up_votes,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS down_votes,
+        MAX(v.CreationDate)                       AS last_vote_dt
+    FROM Votes v
+    WHERE v.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '30 days')
+    GROUP BY v.PostId
+),
+user_votes AS (
+    SELECT
+        p.OwnerUserId                               AS user_id,
+        SUM(rv.up_votes)                            AS recent_up_votes,
+        SUM(rv.down_votes)                          AS recent_down_votes,
+        MAX(rv.last_vote_dt)                        AS most_recent_vote_dt
+    FROM recent_votes rv
+    JOIN Posts p
+        ON p.Id = rv.PostId
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+)
+
+SELECT
+    us.user_id,
+    us.display_name,
+    us.Reputation,
+    us.question_cnt,
+    us.answer_cnt,
+    us.total_score,
+    COALESCE(ba.badge_list, '')                     AS badge_list,
+    COALESCE(ba.gold_cnt,0)                         AS gold_badges,
+    COALESCE(ba.silver_cnt,0)                       AS silver_badges,
+    COALESCE(ba.bronze_cnt,0)                       AS bronze_badges,
+    COALESCE(ut.top_3_tags, '')                     AS top_3_tags,
+    COALESCE(uv.recent_up_votes,0)                  AS recent_up_votes,
+    COALESCE(uv.recent_down_votes,0)                AS recent_down_votes,
+    uv.most_recent_vote_dt,
+    CASE
+        WHEN us.Reputation > 20000 THEN 'Elite'
+        WHEN us.Reputation BETWEEN 10000 AND 20000 THEN 'Veteran'
+        WHEN us.Reputation BETWEEN 1000 AND 9999 THEN 'Active'
+        ELSE 'Newbie'
+    END                                            AS reputation_tier
+FROM user_stats us
+LEFT JOIN badge_agg ba
+    ON ba.UserId = us.user_id
+LEFT JOIN user_top_tags ut
+    ON ut.user_id = us.user_id
+LEFT JOIN user_votes uv
+    ON uv.user_id = us.user_id
+WHERE us.Reputation IS NOT NULL
+  AND (us.question_cnt + us.answer_cnt) > 0
+
+UNION ALL
+
+SELECT
+    NULL AS user_id,
+    '---' AS display_name,
+    NULL AS Reputation,
+    NULL AS question_cnt,
+    NULL AS answer_cnt,
+    NULL AS total_score,
+    NULL AS badge_list,
+    NULL AS gold_badges,
+    NULL AS silver_badges,
+    NULL AS bronze_badges,
+    NULL AS top_3_tags,
+    NULL AS recent_up_votes,
+    NULL AS recent_down_votes,
+    NULL AS most_recent_vote_dt,
+    NULL AS reputation_tier
+
+ORDER BY Reputation DESC
+OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY;

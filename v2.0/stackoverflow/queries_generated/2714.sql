@@ -1,0 +1,158 @@
+-- {"query": "2714.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1576} 
+with RecursiveUserBadges as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        row_number() over (partition by u.Id order by b.Date desc) as rn
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    where b.TagBased = 0 and b.Class = 1
+),
+TopUsersWithBadges as (
+    select 
+        UserId, DisplayName, BadgeName
+    from RecursiveUserBadges
+    where rn <= 3
+),
+QuestionStats as (
+    select
+        p.Id as QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.ViewCount,
+        p.Score,
+        p.AnswerCount,
+        p.Tags,
+        coalesce(p.FavoriteCount, 0) as FavoriteCount,
+        max(case when v.VoteTypeId = 2 then 1 else 0 end) as HasUpvotes,
+        min(case when v.VoteTypeId = 3 then 1 else 0 end) as HasDownvotes,
+        (select count(*) from Comments c where c.PostId = p.Id and c.CreationDate > p.CreationDate) as CommentsAfterCreation,
+        (
+            select count(distinct ph.PostHistoryTypeId)
+            from PostHistory ph 
+            where ph.PostId = p.Id and ph.PostHistoryTypeId in (4,5,6)
+        ) as EditCount
+    from Posts p
+    left join Votes v on p.Id = v.PostId
+    where p.PostTypeId = 1
+    group by p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.ViewCount, p.Score, p.AnswerCount, p.Tags, p.FavoriteCount
+),
+AnswerDetails as (
+    select
+        p.ParentId as QuestionId,
+        count(*) as TotalAnswers,
+        avg(p.Score) as AvgAnswerScore,
+        sum(case when p.Score > 5 then 1 else 0 end) as HighlyRatedAnswers,
+        max(p.CreationDate) as LastAnswerDate
+    from Posts p
+    where p.PostTypeId = 2
+    group by p.ParentId
+),
+QuestionWithAnswers as (
+    select 
+        qs.*,
+        ad.TotalAnswers,
+        ad.AvgAnswerScore,
+        ad.HighlyRatedAnswers,
+        ad.LastAnswerDate
+    from QuestionStats qs
+    left join AnswerDetails ad on qs.QuestionId = ad.QuestionId
+),
+UserActivityRanked as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        count(distinct bh.Id) as TotalBadges,
+        rank() over (order by u.Reputation desc, count(distinct bh.Id) desc) as ActivityRank
+    from Users u
+    left join Badges bh on u.Id = bh.UserId
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes
+),
+ClosingInfo as (
+    select
+        ph.PostId,
+        max(case when ph.PostHistoryTypeId = 10 then ph.Comment else null end) as CloseReasonId,
+        max(case when ph.PostHistoryTypeId = 11 then ph.CreationDate else null end) as LastReopenDate
+    from PostHistory ph
+    group by ph.PostId
+),
+QuestionFinalData as (
+    select
+        qa.*,
+        ci.CloseReasonId,
+        ci.LastReopenDate,
+        string_agg(distinct lt.Name, ', ') filter (where lt.Name is not null) as CloseReasonNames
+    from QuestionWithAnswers qa
+    left join ClosingInfo ci on qa.QuestionId = ci.PostId
+    left join CloseReasonTypes lt on lt.Id::text = ci.CloseReasonId
+    group by qa.QuestionId, qa.Title, qa.OwnerUserId, qa.CreationDate, qa.ViewCount, qa.Score, qa.AnswerCount, qa.Tags, qa.FavoriteCount, qa.HasUpvotes, qa.HasDownvotes, qa.CommentsAfterCreation, qa.EditCount, qa.TotalAnswers, qa.AvgAnswerScore, qa.HighlyRatedAnswers, qa.LastAnswerDate, ci.CloseReasonId, ci.LastReopenDate
+),
+FinalResult as (
+    select
+        qfd.QuestionId,
+        qfd.Title,
+        case when uar.ActivityRank <= 100 then uar.DisplayName else 'Other User' end as OwnerNameOrOther,
+        uar.Reputation,
+        qfd.ViewCount,
+        qfd.Score,
+        qfd.AnswerCount,
+        qfd.FavoriteCount,
+        qfd.CommentsAfterCreation,
+        qfd.EditCount,
+        qfd.TotalAnswers,
+        qfd.AvgAnswerScore,
+        qfd.HighlyRatedAnswers,
+        qfd.LastAnswerDate,
+        coalesce(qfd.CloseReasonNames, 'Open') as QuestionStatus,
+        array_to_string(array_agg(distinct substr(tb.BadgeName, 1, 3) order by tb.BadgeName), ', ') as TopBadges,
+        case 
+            when qfd.Tags is null then 'No tags'
+            else 
+                (select string_agg(tag, '|') from unnest(string_to_array(regexp_replace(qfd.Tags, '[<>]', '', 'g'), '><')) as tag)
+        end as ParsedTags
+    from QuestionFinalData qfd
+    left join UserActivityRanked uar on uar.Id = qfd.OwnerUserId
+    left join TopUsersWithBadges tb on tb.UserId = qfd.OwnerUserId
+    group by qfd.QuestionId, qfd.Title, uar.ActivityRank, uar.DisplayName, uar.Reputation, qfd.ViewCount, qfd.Score, qfd.AnswerCount, qfd.FavoriteCount, qfd.CommentsAfterCreation, qfd.EditCount, qfd.TotalAnswers, qfd.AvgAnswerScore, qfd.HighlyRatedAnswers, qfd.LastAnswerDate, qfd.CloseReasonNames
+    having qfd.Score > 5 or qfd.FavoriteCount > 10 or qfd.AnswerCount > 3
+)
+select 
+    fr.QuestionId,
+    fr.Title,
+    fr.OwnerNameOrOther,
+    fr.Reputation,
+    fr.ViewCount,
+    fr.Score,
+    fr.AnswerCount,
+    fr.FavoriteCount,
+    fr.CommentsAfterCreation,
+    fr.EditCount,
+    fr.TotalAnswers,
+    round(fr.AvgAnswerScore::numeric,2) as AvgAnswerScore,
+    fr.HighlyRatedAnswers,
+    fr.LastAnswerDate,
+    fr.QuestionStatus,
+    fr.TopBadges,
+    fr.ParsedTags,
+    length(fr.Title) - length(replace(lower(fr.Title), 'sql', '')) as SqlKeywordOccurrences,
+    case 
+        when fr.Score > 50 then 'High'
+        when fr.Score between 20 and 50 then 'Medium'
+        else 'Low'
+    end as ScoreCategory,
+    case 
+        when fr.LastAnswerDate is null then 'No Answers'
+        when fr.LastAnswerDate > current_timestamp - interval '30 days' then 'Recent Activity'
+        else 'Stale'
+    end as ActivityStatus
+from FinalResult fr
+order by fr.Score desc, fr.ViewCount desc, fr.AnswerCount desc
+limit 100;

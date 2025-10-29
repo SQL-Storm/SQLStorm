@@ -1,0 +1,146 @@
+-- {"query": "2415.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1481} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        array[t.TagName] as Ancestry,
+        1 as Depth
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+    union all
+    select
+        t2.Id,
+        t2.TagName,
+        r.Ancestry || t2.TagName,
+        r.Depth + 1
+    from Tags t2
+    join RecursiveTagHierarchy r on array_contains(r.Ancestry, substring(t2.TagName from 1 for length(t2.TagName)-1))
+    where r.Depth < 3
+),
+UserPostStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        avg(p.Score) filter (where p.PostTypeId in (1,2)) as AvgPostScore,
+        max(p.ViewCount) filter (where p.PostTypeId = 1) as MaxQuestionViewCount,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as TotalUpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as TotalDownVotes,
+        case when u.Reputation > 0 then u.Reputation else null end as Reputation,
+        (select array_agg(distinct b.Name order by b.Name)
+         from Badges b
+         where b.UserId = u.Id and b.Class = 1 limit 5) as GoldBadgesSample
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+),
+PostCloseInfo as (
+    select ph.PostId,
+        max(case when ph.PostHistoryTypeId = 10 then ph.CreationDate else null end) as CloseDate,
+        max(case when ph.PostHistoryTypeId = 10 then ph.Comment else null end) as CloseReasonId
+    from PostHistory ph
+    where ph.PostHistoryTypeId = 10
+    group by ph.PostId
+),
+TopScoringAnswers as (
+    select
+        p.Id as AnswerId,
+        p.ParentId as QuestionId,
+        p.Score,
+        row_number() over (partition by p.ParentId order by p.Score desc, p.CreationDate asc) as Rank
+    from Posts p
+    where p.PostTypeId = 2
+),
+QuestionAnswerSummary as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionCreationDate,
+        q.OwnerUserId as QuestionOwnerId,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViewCount,
+        a.AnswerId,
+        a.Score as AnswerScore,
+        a.Rank,
+        us.DisplayName as QuestionOwnerName,
+        us.Reputation as QuestionOwnerReputation,
+        pci.CloseDate,
+        pci.CloseReasonId
+    from Posts q
+    left join TopScoringAnswers a on a.QuestionId = q.Id and a.Rank = 1
+    left join UserPostStats us on us.UserId = q.OwnerUserId
+    left join PostCloseInfo pci on pci.PostId = q.Id
+    where q.PostTypeId = 1
+      and (pci.CloseDate is null or pci.CloseDate > now() - interval '1 year')
+),
+AnswerVotesWindow as (
+    select
+        v.PostId,
+        v.VoteTypeId,
+        count(*) over (partition by v.PostId, v.VoteTypeId) as VoteCountPerType,
+        row_number() over (partition by v.PostId order by v.CreationDate desc) as RecentVoteRank
+    from Votes v
+    where v.VoteTypeId in (2,3)
+),
+AnswerVoteSummary as (
+    select
+        avw.PostId,
+        max(case when avw.VoteTypeId = 2 then avw.VoteCountPerType else 0 end) as UpVotes,
+        max(case when avw.VoteTypeId = 3 then avw.VoteCountPerType else 0 end) as DownVotes
+    from AnswerVotesWindow avw
+    where avw.RecentVoteRank <= 10
+    group by avw.PostId
+),
+QualifiedQuestions as (
+    select
+        qas.*,
+        coalesce(av.UpVotes,0) as TopAnswerUpVotes,
+        coalesce(av.DownVotes,0) as TopAnswerDownVotes,
+        us.GoldBadgesSample
+    from QuestionAnswerSummary qas
+    left join AnswerVoteSummary av on av.PostId = qas.AnswerId
+    left join UserPostStats us on us.UserId = qas.QuestionOwnerId
+    where (qas.QuestionScore > 5 or (coalesce(av.UpVotes,0) - coalesce(av.DownVotes,0)) > 5)
+      and (qas.CloseDate is null or qas.CloseDate > now() - interval '6 months')
+)
+select
+    q.UserId,
+    q.DisplayName,
+    q.QuestionCount,
+    q.AnswerCount,
+    q.AvgPostScore,
+    q.MaxQuestionViewCount,
+    q.TotalUpVotes,
+    q.TotalDownVotes,
+    q.Reputation,
+    string_agg(distinct coalesce(b.Name,'') || ':' || coalesce(b.Class::text,'') , ', ') as GoldBadges,
+    s.QuestionId,
+    s.Title,
+    s.QuestionCreationDate,
+    s.QuestionScore,
+    s.QuestionViewCount,
+    s.AnswerId,
+    s.AnswerScore,
+    s.TopAnswerUpVotes,
+    s.TopAnswerDownVotes,
+    s.CloseDate,
+    (select lt.Name 
+     from PostLinks pl 
+     join LinkTypes lt on lt.Id = pl.LinkTypeId 
+     where pl.PostId = s.QuestionId limit 1) as LinkTypeName,
+    case 
+        when s.CloseReasonId is not null then (select crt.Name from CloseReasonTypes crt where crt.Id::text = s.CloseReasonId) 
+        else 'Open'
+    end as CloseReasonName,
+    length(s.Title) - length(replace(s.Title, ' ', '')) + 1 as TitleWordCount,
+    (select count(*) from Comments c where c.PostId = s.QuestionId and c.UserId = q.UserId) as UserCommentsOnQuestion,
+    rank() over (partition by q.UserId order by s.QuestionScore desc) as QuestionRankByScore
+from 
+    UserPostStats q
+left join Badges b on b.UserId = q.UserId and b.Class = 1
+left join QualifiedQuestions s on s.QuestionOwnerId = q.UserId
+where q.QuestionCount > 10
+order by q.Reputation desc nulls last, s.QuestionScore desc nulls last
+limit 100;

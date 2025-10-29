@@ -1,0 +1,245 @@
+-- {"query": "7908.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2216} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT c.Id) as Comments,
+        COUNT(DISTINCT b.Id) as Badges,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN DATEDIFF(CURRENT_TIMESTAMP, MAX(p.CreationDate))
+            ELSE NULL 
+        END as DaysSinceLastPost
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostComplexity AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND LENGTH(p.Tags) > 0 THEN 
+                (LENGTH(p.Tags) - LENGTH(REPLACE(p.Tags, '>', '')) + 1)
+            ELSE 0 
+        END as TagCount,
+        CASE 
+            WHEN p.AnswerCount > 0 THEN 
+                ROUND(p.Score * 1.0 / p.AnswerCount, 2)
+            ELSE NULL 
+        END as ScorePerAnswer,
+        CASE 
+            WHEN p.ViewCount > 0 THEN 
+                ROUND(p.Score * 100.0 / p.ViewCount, 2)
+            ELSE 0 
+        END as ScorePerView,
+        CASE 
+            WHEN p.Score > 0 THEN 
+                LOG10(p.Score + 1)
+            ELSE 0 
+        END as LogScore,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PrevScore,
+        LAG(p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PrevCreationDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PostSequence,
+        RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) as ScoreRank,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) as GlobalScoreRank
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserPostPatterns AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        AVG(p.Score) as AvgScore,
+        stddev(p.Score) as ScoreStdDev,
+        MAX(p.Score) as MaxScore,
+        MIN(p.Score) as MinScore,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        SUM(p.Score) as TotalScore,
+        AVG(p.ViewCount) as AvgViews,
+        AVG(CASE WHEN p.AnswerCount IS NOT NULL THEN p.AnswerCount ELSE 0 END) as AvgAnswers,
+        AVG(p.CommentCount) as AvgComments,
+        DATEDIFF(CURRENT_TIMESTAMP, MAX(p.CreationDate)) as DaysSinceLastPost,
+        ROW_NUMBER() OVER (ORDER BY SUM(p.Score) DESC) as ScoreRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE p.CreationDate >= DATEADD(YEAR, -2, CURRENT_TIMESTAMP)
+    GROUP BY u.Id, u.DisplayName
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'High'
+            WHEN t.Count > 100 THEN 'Medium'
+            WHEN t.Count > 10 THEN 'Low'
+            ELSE 'Very Low'
+        END as PopularityLevel,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as PopularityRank,
+        AVG(CASE WHEN p.Score > 0 THEN p.Score ELSE 0 END) as AvgTagScore,
+        MAX(CASE WHEN p.Score > 0 THEN p.Score ELSE 0 END) as MaxTagScore,
+        MIN(CASE WHEN p.Score > 0 THEN p.Score ELSE 0 END) as MinTagScore
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    GROUP BY t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId
+),
+AnswerQualityStats AS (
+    SELECT 
+        a.Id as AnswerId,
+        a.ParentId,
+        a.OwnerUserId,
+        a.Score,
+        a.CreationDate,
+        a.LastEditDate,
+        a.Body,
+        CASE 
+            WHEN (LENGTH(a.Body) - LENGTH(REPLACE(a.Body, 'code', ''))) > 0 THEN 1
+            ELSE 0 
+        END as HasCodeBlock,
+        CASE 
+            WHEN LENGTH(a.Body) > 500 THEN 'Long'
+            WHEN LENGTH(a.Body) > 200 THEN 'Medium'
+            ELSE 'Short'
+        END as BodyLengthCategory,
+        (SELECT COUNT(*) 
+         FROM Comments c 
+         WHERE c.PostId = a.Id) as CommentCount,
+        DATEDIFF(CURRENT_TIMESTAMP, a.CreationDate) as AgeInDays
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+)
+SELECT 
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.Views,
+    uas.UpVotes,
+    uas.DownVotes,
+    uas.TotalPosts,
+    uas.Questions,
+    uas.Answers,
+    uas.Comments,
+    uas.Badges,
+    uas.LastPostDate,
+    uas.LastCommentDate,
+    uas.DaysSinceLastPost,
+    ups.TotalPosts as UserTotalPosts,
+    ups.AvgScore,
+    ups.ScoreStdDev,
+    ups.MaxScore,
+    ups.MinScore,
+    ups.Questions as UserQuestions,
+    ups.Answers as UserAnswers,
+    ups.TotalScore,
+    ups.AvgViews,
+    ups.AvgAnswers,
+    ups.AvgComments,
+    ups.DaysSinceLastPost as UserDaysSinceLastPost,
+    ups.ScoreRank,
+    pa.PostId,
+    pa.Title,
+    pa.Score as PostScore,
+    pa.ViewCount,
+    pa.AnswerCount,
+    pa.CommentCount,
+    pa.FavoriteCount,
+    pa.CreationDate as PostCreationDate,
+    pa.Tags,
+    pa.TagCount,
+    pa.ScorePerAnswer,
+    pa.ScorePerView,
+    pa.LogScore,
+    pa.PrevScore,
+    pa.PostSequence,
+    pa.ScoreRank as PostScoreRank,
+    pa.GlobalScoreRank,
+    ta.TagName,
+    ta.Count as TagCount,
+    ta.PopularityLevel,
+    ta.PopularityRank,
+    ta.AvgTagScore,
+    ta.MaxTagScore,
+    ta.MinTagScore,
+    aqs.AnswerId,
+    aqs.HasCodeBlock,
+    aqs.BodyLengthCategory,
+    aqs.CommentCount as AnswerCommentCount,
+    aqs.AgeInDays,
+    CASE 
+        WHEN uas.Reputation >= 10000 AND uas.TotalPosts >= 100 THEN 'Elite'
+        WHEN uas.Reputation >= 5000 AND uas.TotalPosts >= 50 THEN 'Veteran'
+        WHEN uas.Reputation >= 1000 AND uas.TotalPosts >= 10 THEN 'Active'
+        ELSE 'Regular'
+    END as UserTier,
+    CASE 
+        WHEN pa.Score >= 100 THEN 'Highly Upvoted'
+        WHEN pa.Score >= 50 THEN 'Good'
+        WHEN pa.Score >= 10 THEN 'Average'
+        ELSE 'Low'
+    END as PostQuality,
+    DENSE_RANK() OVER (ORDER BY uas.Reputation DESC) as ReputationRank,
+    RANK() OVER (ORDER BY uas.TotalPosts DESC) as PostCountRank,
+    ROW_NUMBER() OVER (ORDER BY pa.Score DESC) as HighestScorePostRank,
+    COALESCE(pa.ScorePerAnswer, 0) + COALESCE(pa.ScorePerView, 0) as CombinedMetric,
+    CASE 
+        WHEN pa.TagCount > 0 THEN 
+            CASE 
+                WHEN pa.ScorePerView >= 10 THEN 'Viral'
+                WHEN pa.ScorePerView >= 5 THEN 'Engaging'
+                ELSE 'Moderate'
+            END
+        ELSE 'No Tags'
+    END as EngagementLevel,
+    NULLIF(ups.TotalScore, 0) * 1.0 / NULLIF(ups.AvgViews, 0) as ScoreEfficiency,
+    CASE 
+        WHEN ups.AvgScore > 0 AND ups.ScoreStdDev > 0 
+        THEN (ups.AvgScore - ups.MinScore) / ups.ScoreStdDev
+        ELSE 0 
+    END as ScoreDeviationRatio
+FROM UserActivityStats uas
+INNER JOIN UserPostPatterns ups ON uas.UserId = ups.UserId
+LEFT JOIN PostComplexity pa ON uas.UserId = pa.OwnerUserId
+LEFT JOIN TagAnalysis ta ON (pa.Tags IS NOT NULL AND 
+    (pa.Tags LIKE '%<' || ta.TagName || '>%'))
+LEFT JOIN AnswerQualityStats aqs ON uas.UserId = aqs.OwnerUserId
+WHERE 
+    (pa.PostId IS NOT NULL OR ups.UserId IS NOT NULL)
+    AND (
+        uas.Reputation >= 100 OR 
+        ups.TotalScore >= 10 OR 
+        pa.Score >= 10 OR
+        ta.Count >= 10
+    )
+    AND (
+        uas.TotalPosts > 0 OR 
+        ups.TotalPosts > 0
+    )
+    AND uas.UserId IS NOT NULL
+ORDER BY 
+    uas.Reputation DESC,
+    uas.TotalPosts DESC,
+    pa.Score DESC
+LIMIT 1000 OFFSET 0;

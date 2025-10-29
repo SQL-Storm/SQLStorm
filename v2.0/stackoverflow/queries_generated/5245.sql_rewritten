@@ -1,0 +1,158 @@
+-- {"query": "5245.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1321} 
+WITH
+-- Per-user aggregated signals: activity, reputation, badges, and post stats
+UserSignals AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    u.LastAccessDate,
+    -- compute a volatile "activity score" from recent activity (posts, comments, votes)
+    COALESCE(p.RecentPostActivity, 0) * 4 +
+    COALESCE(c.RecentCommentActivity, 0) * 2 +
+    COALESCE(v.RecentVoteActivity, 0) AS ActivityScore,
+    -- window: time since last activity
+    DATEDIFF(second, u.LastAccessDate, cast('2024-10-01 12:34:56' as timestamp)) AS SecondsSinceLastAccess
+  FROM Users u
+  LEFT JOIN (
+    -- recent posts by user
+    SELECT OwnerUserId AS UserId, COUNT(*) AS RecentPostActivity
+    FROM Posts
+    WHERE CreationDate >= DATEADD(day, -7, cast('2024-10-01 12:34:56' as timestamp))
+    GROUP BY OwnerUserId
+  ) p ON p.UserId = u.Id
+  LEFT JOIN (
+    -- recent comments by user
+    SELECT UserId, COUNT(*) AS RecentCommentActivity
+    FROM Comments
+    WHERE CreationDate >= DATEADD(day, -7, cast('2024-10-01 12:34:56' as timestamp))
+    GROUP BY UserId
+  ) c ON c.UserId = u.Id
+  LEFT JOIN (
+    -- recent votes by user
+    SELECT UserId, COUNT(*) AS RecentVoteActivity
+    FROM Votes
+    WHERE CreationDate >= DATEADD(day, -7, cast('2024-10-01 12:34:56' as timestamp))
+    GROUP BY UserId
+  ) v ON v.UserId = u.Id
+),
+-- Complex post-based signals: nested CTEs to derive correlations and NULL-handling
+PostSignals AS (
+  SELECT
+    p.Id AS PostId,
+    p.OwnerUserId,
+    p.PostTypeId,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.AcceptedAnswerId,
+    -- correlated subquery: number of linked posts of type Duplicate
+    (SELECT COUNT(*) FROM PostLinks pl
+     WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3) AS DuplicateLinks,
+    -- window function example: rank posts by Score within same day
+    ROW_NUMBER() OVER (PARTITION BY CONVERT(date, p.CreationDate)
+                       ORDER BY p.Score DESC, p.ViewCount DESC) AS DailyRank
+  FROM Posts p
+),
+-- Tag-based aggregation with potential NULLs and string expressions
+TagStats AS (
+  SELECT
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId,
+    t.WikiPostId,
+    -- derived tag popularity score with NULL-safe math
+    COALESCE(t.Count, 0) * 1.5 +
+    COALESCE((SELECT AVG(Score) FROM Posts WHERE Tags LIKE '%<' + t.TagName + '>%'), 0) AS PopularityScore,
+    -- existence flag for moderator-only tags
+    CASE WHEN t.IsModeratorOnly = 1 THEN 1 ELSE 0 END AS IsModeratorOnlyFlag
+  FROM Tags t
+),
+-- Advanced set operation: union of top posts by score across two post types
+TopPosts AS (
+  SELECT Id
+  FROM Posts
+  WHERE PostTypeId IN (1, 2) -- Questions and Answers
+  ORDER BY Score DESC
+  OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY
+),
+TopPosts_Other AS (
+  SELECT Id
+  FROM Posts
+  WHERE PostTypeId = 5 -- TagWiki
+  ORDER BY CreationDate DESC
+  OFFSET 0 ROWS FETCH NEXT 50 ROWS ONLY
+)
+SELECT
+  -- select a rich mix of metrics
+  u.UserId,
+  u.DisplayName AS UserDisplayName,
+  us.Reputation,
+  us.UserCreationDate,
+  us.LastAccessDate,
+  us.ActivityScore,
+  ps.PostId,
+  ps.PostTypeId,
+  ps.Title,
+  ps.Tags,
+  ps.Score,
+  ps.ViewCount,
+  ps.CommentCount,
+  ps.DailyRank,
+  ds.DuplicateLinks,
+  ts.TagName,
+  ts.PopularityScore,
+  t.IsModeratorOnly AS TagIsModeratorOnly,
+  -- compute a NULL-inclusive calculated field
+  CASE WHEN ps.AcceptedAnswerId IS NULL THEN NULL ELSE ps.AcceptedAnswerId END AS AcceptedAnswer,
+  -- a complex predicate expression with NULL handling and string operations
+  CASE
+    WHEN ps.PostTypeId = 1 AND ps.Title IS NOT NULL THEN
+      (UPPER(SUBSTRING(ps.Title, 1, 60)) || '...') -- pseudo-concatenation style; ensure DB supports
+    ELSE NULL
+  END AS TruncatedTitle
+FROM UserSignals us
+JOIN TopPosts tp ON 1=1
+JOIN Posts ps ON ps.Id = tp.Id
+LEFT JOIN PostLinks ds ON ds.PostId = ps.Id
+LEFT JOIN TagStats ts ON ts.TagName LIKE '%' || ps.Tags || '%'
+LEFT JOIN Tags t ON t.IsModeratorOnly = 0
+WHERE
+  -- elaborate filtering with complex predicates and NULLs
+  (ps.ViewCount > 0 OR ps.Score IS NOT NULL)
+  AND (ps.CreationDate >= DATEADD(year, -2, cast('2024-10-01 12:34:56' as timestamp)) OR ps.CreationDate IS NULL)
+  AND (u.Id IS NOT NULL)
+UNION ALL
+SELECT
+  u.UserId,
+  u.DisplayName,
+  us.Reputation,
+  us.UserCreationDate,
+  us.LastAccessDate,
+  us.ActivityScore,
+  p.Id,
+  p.PostTypeId,
+  p.Title,
+  p.Tags,
+  p.Score,
+  p.ViewCount,
+  p.CommentCount,
+  NULL AS DailyRank,
+  NULL AS DuplicateLinks,
+  NULL AS TagName,
+  NULL AS PopularityScore,
+  NULL AS TagIsModeratorOnly,
+  NULL AS AcceptedAnswer,
+  NULL AS TruncatedTitle
+FROM UserSignals us
+JOIN TopPosts_Other tp ON 1=1
+JOIN Posts p ON p.Id = tp.Id
+LEFT JOIN PostLinks l ON l.PostId = p.Id
+ORDER BY UserId, PostId
+LIMIT 200;

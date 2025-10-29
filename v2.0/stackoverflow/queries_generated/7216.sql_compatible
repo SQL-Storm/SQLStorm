@@ -1,0 +1,196 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT b.Id) as Badges,
+        COUNT(DISTINCT c.Id) as Comments,
+        COUNT(DISTINCT ph.Id) as HistoryEntries,
+        MAX(p.CreationDate) as LatestPostDate,
+        MAX(u.CreationDate) as AccountCreatedDate,
+        CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - u.CreationDate)) / 86400 AS INTEGER) as AccountAgeDays,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Elite'
+            WHEN u.Reputation > 5000 THEN 'Veteran'
+            WHEN u.Reputation > 1000 THEN 'Regular'
+            ELSE 'Newbie'
+        END as ReputationTier,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END), 0) as TotalQuestionScore,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END), 0) as TotalAnswerScore,
+        COALESCE(AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END), 0) as AvgQuestionScore,
+        COALESCE(AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END), 0) as AvgAnswerScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate
+),
+UserPostStats AS (
+    SELECT 
+        u.Id as UserId,
+        COUNT(DISTINCT p.ParentId) as AnsweredQuestions,
+        COUNT(DISTINCT p.Id) as TotalAnswerCount,
+        COUNT(DISTINCT CASE WHEN p.Score > 0 THEN p.Id END) as PositiveScoreAnswers,
+        COUNT(DISTINCT CASE WHEN p.Score < 0 THEN p.Id END) as NegativeScoreAnswers,
+        SUM(p.Score) as NetAnswerScore,
+        MAX(p.CreationDate) as LastAnswerDate,
+        AVG(p.Score) as AvgAnswerScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 2
+    GROUP BY u.Id
+),
+PostTagAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags != '' THEN 
+                regexp_split_to_table(trim(both '<>' from p.Tags), '><')
+            ELSE NULL 
+        END as TagList,
+        COALESCE(p.ViewCount, 0) + COALESCE(p.AnswerCount, 0) + COALESCE(p.CommentCount, 0) as EngagementScore,
+        CASE WHEN COALESCE(p.AnswerCount, 0) = 0 THEN NULL ELSE COALESCE(p.ViewCount, 0)::numeric / COALESCE(p.AnswerCount, 0)::numeric END as ViewsPerAnswerRatio,
+        CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate)) / 86400 AS INTEGER) as AgeInDays
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+TopTaggers AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        COUNT(DISTINCT t.Id) as TotalTagsUsed,
+        SUM(CASE WHEN t.Count > 100 THEN 1 ELSE 0 END) as HighReputationTags,
+        STRING_AGG(t.TagName, ', ' ORDER BY t.Count DESC) as TopTags
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId AND b.TagBased = 1
+    LEFT JOIN Tags t ON POSITION('<' || t.TagName || '>' IN COALESCE(b.Name, '')) > 0
+    GROUP BY u.Id, u.DisplayName
+    HAVING COUNT(DISTINCT t.Id) > 0
+),
+ComplexQueryResult AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.ReputationTier,
+        uas.TotalPosts,
+        uas.Questions,
+        uas.Answers,
+        uas.Badges,
+        uas.Comments,
+        uas.HistoryEntries,
+        uas.TotalQuestionScore,
+        uas.TotalAnswerScore,
+        uas.AvgQuestionScore,
+        uas.AvgAnswerScore,
+        ups.AnsweredQuestions,
+        ups.TotalAnswerCount,
+        ups.PositiveScoreAnswers,
+        ups.NegativeScoreAnswers,
+        ups.NetAnswerScore,
+        ups.AvgAnswerScore as AnswerAvgScore,
+        uas.LatestPostDate,
+        uas.AccountAgeDays,
+        tta.TotalTagsUsed,
+        tta.HighReputationTags,
+        tta.TopTags,
+        STRING_AGG(CAST(poa.TagList AS text), ', ' ORDER BY poa.CreationDate DESC) as RecentTagUsage,
+        AVG(poa.Score) as AvgPostScore,
+        MAX(poa.Score) as MaxPostScore,
+        MIN(poa.Score) as MinPostScore,
+        CASE 
+            WHEN uas.Reputation > 10000 AND uas.Badges > 50 THEN 'Legendary Contributor'
+            WHEN uas.Reputation > 5000 AND uas.Badges > 25 THEN 'Veteran Contributor'
+            WHEN uas.Answers > 100 THEN 'Active Answerer'
+            ELSE 'Regular Member'
+        END as ContributionLevel,
+        CASE 
+            WHEN uas.Questions > 0 AND uas.Answers > 0 THEN 
+                ROUND((CAST(uas.Answers AS numeric) / NULLIF(uas.Questions, 0)) * 100::numeric, 2)
+            ELSE 0 
+        END as AnswerToQuestionRatio
+    FROM UserActivityStats uas
+    LEFT JOIN UserPostStats ups ON uas.UserId = ups.UserId
+    LEFT JOIN TopTaggers tta ON uas.UserId = tta.UserId
+    LEFT JOIN PostTagAnalysis poa ON uas.UserId = poa.OwnerUserId
+    WHERE uas.Reputation > 100
+    GROUP BY 
+        uas.UserId, uas.DisplayName, uas.Reputation, uas.ReputationTier, 
+        uas.TotalPosts, uas.Questions, uas.Answers, uas.Badges, uas.Comments, 
+        uas.HistoryEntries, uas.TotalQuestionScore, uas.TotalAnswerScore, 
+        uas.AvgQuestionScore, uas.AvgAnswerScore, uas.LatestPostDate, 
+        uas.AccountAgeDays, ups.AnsweredQuestions, ups.TotalAnswerCount, 
+        ups.PositiveScoreAnswers, ups.NegativeScoreAnswers, ups.NetAnswerScore,
+        ups.AvgAnswerScore, tta.TotalTagsUsed, tta.HighReputationTags, tta.TopTags
+)
+SELECT 
+    UserId,
+    DisplayName,
+    Reputation,
+    ReputationTier,
+    TotalPosts,
+    Questions,
+    Answers,
+    Badges,
+    Comments,
+    HistoryEntries,
+    TotalQuestionScore,
+    TotalAnswerScore,
+    AvgQuestionScore,
+    AvgAnswerScore,
+    AnsweredQuestions,
+    TotalAnswerCount,
+    PositiveScoreAnswers,
+    NegativeScoreAnswers,
+    NetAnswerScore,
+    AnswerAvgScore,
+    LatestPostDate,
+    AccountAgeDays,
+    TotalTagsUsed,
+    HighReputationTags,
+    TopTags,
+    RecentTagUsage,
+    AvgPostScore,
+    MaxPostScore,
+    MinPostScore,
+    ContributionLevel,
+    AnswerToQuestionRatio,
+    CASE 
+        WHEN ContributionLevel IN ('Legendary Contributor', 'Veteran Contributor') 
+             AND AccountAgeDays > 365 
+             AND TotalPosts > 500 THEN 'Highly Engaged'
+        WHEN ContributionLevel = 'Active Answerer' AND AccountAgeDays > 180 THEN 'Moderately Engaged'
+        ELSE 'Standard Engagement'
+    END as EngagementStatus
+FROM ComplexQueryResult
+WHERE 
+    (TotalPosts > 10 OR Badges > 5 OR TotalQuestionScore > 100)
+    AND (AnswerToQuestionRatio >= 10 OR TotalAnswerCount >= 20)
+    AND AccountAgeDays > 30
+ORDER BY 
+    CASE 
+        WHEN ContributionLevel = 'Legendary Contributor' THEN 1
+        WHEN ContributionLevel = 'Veteran Contributor' THEN 2
+        WHEN ContributionLevel = 'Active Answerer' THEN 3
+        ELSE 4
+    END,
+    Reputation DESC,
+    TotalPosts DESC,
+    NetAnswerScore DESC
+OFFSET 20
+LIMIT 50;

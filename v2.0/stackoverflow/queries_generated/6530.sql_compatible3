@@ -1,0 +1,41 @@
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    MAX(u.CreationDate) AS LatestAccountActivity,
+    MAX(p.LastActivityDate) AS LatestPostActivity,
+    MAX(ph.CreationDate) AS LatestPostHistory,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 1 THEN v.PostId ELSE NULL END) AS AcceptedAnswers,
+    COUNT(DISTINCT CASE WHEN b.TagBased = FALSE THEN b.TagName ELSE NULL END) AS NamedBadges,
+    COUNT(DISTINCT CASE WHEN b.TagBased = TRUE THEN b.TagName ELSE NULL END) AS TagBadges,
+    STRING_AGG(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN p.Title ELSE NULL END, ', ') AS DuplicatePosts,
+    STRING_AGG(DISTINCT CASE WHEN t.IsRequired = 1 THEN t.TagName ELSE NULL END, ', ') AS RequiredTags
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+LEFT JOIN 
+    PostLinks pl ON p.Id = pl.PostId
+LEFT JOIN 
+    Tags t ON p.Id = t.ExcerptPostId
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+WHERE 
+    u.Reputation > 1000
+    AND (p.LastActivityDate IS NULL OR p.LastActivityDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '12' MONTH))
+    AND (b.Id IS NULL OR b.Date > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '24' MONTH))
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation, u.Location, u.CreationDate
+HAVING 
+    COUNT(DISTINCT p.Id) > 50
+ORDER BY 
+    u.Reputation DESC, 
+    TotalPosts DESC
+OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY;

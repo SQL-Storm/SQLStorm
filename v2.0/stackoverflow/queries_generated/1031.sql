@@ -1,0 +1,264 @@
+-- {"query": "1031.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3652} 
+
+WITH PostEventSummary AS (
+    -- Aggregates various post history events, focusing on edits and moderation actions.
+    SELECT
+        ph.PostId,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE NULL END) AS TotalEditEvents, -- Edit Title, Body, Tags
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE NULL END) AS CloseEvents,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE NULL END) AS ReopenEvents,
+        MAX(ph.CreationDate) AS LatestHistoryChangeDate,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (10, 12, 14, 19, 35) THEN 1 ELSE 0 END) AS NegativeModerationCount, -- Closed, Deleted, Locked, Protected, Migrated Away
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (11, 13, 15, 20, 36) THEN 1 ELSE 0 END) AS PositiveModerationCount, -- Reopened, Undeleted, Unlocked, Unprotected, Migrated Here
+        MAX(CASE WHEN ph.PostHistoryTypeId = 36 THEN ph.CreationDate ELSE NULL END) AS LastMigrationHereDate,
+        -- Correlated subquery to find the name of the user who performed the most recent 'close' event
+        (SELECT u.DisplayName FROM Users u WHERE u.Id = ph.UserId AND ph.PostHistoryTypeId = 10 ORDER BY ph.CreationDate DESC LIMIT 1) AS LastCloserDisplayName
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+),
+UserEngagementMetrics AS (
+    -- Calculates aggregated metrics for users, combining post, comment, and badge activity.
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views AS UserProfileViews,
+        u.UpVotes AS UserUpVotesGiven,
+        u.DownVotes AS UserDownVotesGiven,
+        COUNT(DISTINCT p.Id) AS TotalOwnedPosts,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostsScore,
+        COUNT(DISTINCT c.Id) AS TotalOwnedComments,
+        SUM(COALESCE(c.Score, 0)) AS TotalCommentsScore,
+        COUNT(DISTINCT b.Id) AS TotalBadgesAwarded,
+        MAX(u.LastAccessDate) AS LastUserActivityDate,
+        -- Complex calculation for user influence
+        (u.Reputation * 0.5 + COUNT(DISTINCT p.Id) * 0.1 + SUM(COALESCE(p.Score, 0)) * 0.15 + COUNT(DISTINCT b.Id) * 0.1 + u.UpVotes * 0.05) AS OverallInfluenceScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes
+),
+PostTagAnalysis AS (
+    -- Extracts tags from questions and prepares them for aggregation.
+    SELECT
+        p.Id AS QuestionId,
+        STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><') AS TagArray,
+        p.Score AS QuestionScore,
+        p.CreationDate AS QuestionCreationDate,
+        p.ViewCount AS QuestionViewCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2
+),
+OverallTagPerformance AS (
+    -- Aggregates performance metrics for each unique tag.
+    SELECT
+        unnest_tag.TagName,
+        COUNT(PTA.QuestionId) AS TaggedQuestionCount,
+        SUM(PTA.QuestionScore) AS TotalTagScore,
+        AVG(PTA.QuestionScore) AS AvgTagScore,
+        AVG(PTA.QuestionViewCount) AS AvgTagViewCount,
+        -- Calculates the average age of questions associated with this tag in days.
+        AVG(EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - PTA.QuestionCreationDate)) / (60 * 60 * 24)) AS AvgTagAgeDays
+    FROM PostTagAnalysis PTA,
+    LATERAL UNNEST(PTA.TagArray) AS unnest_tag(TagName)
+    GROUP BY unnest_tag.TagName
+),
+RankedAnswers AS (
+    -- Ranks answers for each question based on score, owner's reputation, and creation date.
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.CreationDate AS AnswerCreationDate,
+        a.Score AS AnswerScore,
+        a.OwnerUserId AS AnswerOwnerUserId,
+        ua.Reputation AS AnswerOwnerReputation,
+        a.CommentCount AS AnswerCommentCount,
+        a.LastEditDate AS AnswerLastEditDate,
+        -- Ranks answers for a given question. Uses DENSE_RANK for potential ties.
+        DENSE_RANK() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, ua.Reputation DESC, a.CreationDate ASC) AS AnswerRank,
+        -- Identifies if this answer is the accepted one for its parent question.
+        (CASE WHEN a.Id = q_parent.AcceptedAnswerId THEN TRUE ELSE FALSE END) AS IsAcceptedAnswer
+    FROM Posts a
+    JOIN Posts q_parent ON a.ParentId = q_parent.Id
+    JOIN UserEngagementMetrics ua ON a.OwnerUserId = ua.UserId
+    WHERE a.PostTypeId = 2
+),
+FilteredQuestions AS (
+    -- Selects and filters questions based on a complex set of criteria and enriches with various metrics.
+    SELECT
+        q.Id AS QuestionId,
+        q.Title AS QuestionTitle,
+        q.CreationDate AS QuestionCreationDate,
+        q.Score AS QuestionScore,
+        q.ViewCount AS QuestionViewCount,
+        q.AnswerCount AS QuestionAnswerCount,
+        q.CommentCount AS QuestionCommentCount,
+        q.FavoriteCount AS QuestionFavoriteCount,
+        q.OwnerUserId AS QuestionOwnerUserId,
+        ue_owner.DisplayName AS QuestionOwnerDisplayName,
+        ue_owner.Reputation AS QuestionOwnerReputation,
+        ue_owner.OverallInfluenceScore AS QuestionOwnerInfluence,
+        pes.TotalEditEvents,
+        pes.CloseEvents,
+        pes.ReopenEvents,
+        pes.NegativeModerationCount,
+        pes.PositiveModerationCount,
+        pes.LatestHistoryChangeDate,
+        pes.LastMigrationHereDate,
+        pes.LastCloserDisplayName,
+        ATP.TagName AS PrimaryTag, -- Takes the first tag as the primary tag.
+        OTP.TaggedQuestionCount AS PrimaryTagQuestionCount,
+        OTP.TotalTagScore AS PrimaryTagTotalScore,
+        OTP.AvgTagScore AS PrimaryTagAvgScore,
+        OTP.AvgTagAgeDays AS PrimaryTagAvgAgeDays,
+        COALESCE(q.AcceptedAnswerId, -1) AS AcceptedAnswerId,
+        -- Non-correlated subquery to count unique users who favorited this question.
+        (SELECT COUNT(DISTINCT v.UserId) FROM Votes v WHERE v.PostId = q.Id AND v.VoteTypeId = 5) AS TotalFavoritedByUsers,
+        -- Correlated subquery to get the reputation of the last editor. Handles NULL LastEditorUserId.
+        (SELECT COALESCE(u_editor.Reputation, -1) FROM Users u_editor WHERE u_editor.Id = q.LastEditorUserId) AS LastEditorReputation,
+        -- NULL logic with CASE statement.
+        CASE
+            WHEN q.ClosedDate IS NOT NULL AND q.ClosedDate > q.CreationDate THEN TRUE
+            ELSE FALSE
+        END AS WasClosed,
+        CASE
+            WHEN q.CommunityOwnedDate IS NOT NULL THEN TRUE
+            ELSE FALSE
+        END AS IsCommunityOwned,
+        -- Window function: Ranks questions globally by view count then score.
+        DENSE_RANK() OVER (ORDER BY q.ViewCount DESC, q.Score DESC, q.CreationDate DESC) AS GlobalViewScoreRank,
+        -- Window function: Gets the score of the owner's previous question. Default to 0 if no previous question.
+        LAG(q.Score, 1, 0) OVER (PARTITION BY q.OwnerUserId ORDER BY q.CreationDate) AS PrevQuestionScoreByOwner,
+        -- Correlated subquery to find the average score of all previous questions by the same owner.
+        (SELECT AVG(s.Score) FROM Posts s WHERE s.OwnerUserId = q.OwnerUserId AND s.PostTypeId = 1 AND s.CreationDate < q.CreationDate AND s.Id != q.Id) AS AvgOwnerPrevQuestionScore,
+        -- An Nth_VALUE example: Get the reputation of the user who made the 2nd edit to this post, if any.
+        COALESCE((
+            SELECT
+                u.Reputation
+            FROM PostHistory ph_nth
+            JOIN Users u ON ph_nth.UserId = u.Id
+            WHERE ph_nth.PostId = q.Id AND ph_nth.PostHistoryTypeId IN (4, 5, 6)
+            ORDER BY ph_nth.CreationDate
+            OFFSET 1 LIMIT 1 -- Get the 2nd event
+        ), -1) AS SecondEditorReputation
+    FROM Posts q
+    JOIN UserEngagementMetrics ue_owner ON q.OwnerUserId = ue_owner.UserId
+    LEFT JOIN PostEventSummary pes ON q.Id = pes.PostId
+    LEFT JOIN PostTagAnalysis PTA ON q.Id = PTA.QuestionId
+    LEFT JOIN LATERAL UNNEST(PTA.TagArray) WITH ORDINALITY AS ATP(TagName, rn) ON ATP.rn = 1 -- Selects the first tag
+    LEFT JOIN OverallTagPerformance OTP ON ATP.TagName = OTP.TagName
+    WHERE q.PostTypeId = 1
+      AND q.CreationDate >= CURRENT_DATE - INTERVAL '5 year' -- Posts from the last 5 years.
+      AND q.ViewCount > 5000 -- High view count.
+      AND q.Score >= 100 -- High score.
+      AND q.AnswerCount IS NOT NULL AND q.AnswerCount > 0 -- Must be a question with answers.
+      AND (pes.TotalEditEvents > 5 OR ue_owner.Reputation > 10000) -- Frequently edited or owner is high rep.
+      -- Complex string predicates combining LIKE and ILIKE (case-insensitive LIKE for PostgreSQL).
+      AND (q.Title ILIKE '%performance tuning%' OR q.Tags LIKE '%<sql>%' OR q.Tags LIKE '%<optimization>%')
+      AND COALESCE(q.FavoriteCount, 0) >= 10 -- Has been favorited at least 10 times.
+      AND (pes.CloseEvents = 0 OR pes.ReopenEvents > 0) -- Not closed OR was reopened.
+),
+FinalQuestions AS (
+    -- Prepares the final selection of high-impact questions.
+    SELECT
+        fq.QuestionId,
+        fq.QuestionTitle,
+        fq.QuestionCreationDate,
+        fq.QuestionScore,
+        fq.QuestionViewCount,
+        fq.QuestionAnswerCount,
+        fq.QuestionOwnerDisplayName,
+        fq.QuestionOwnerReputation,
+        fq.QuestionOwnerInfluence,
+        fq.TotalEditEvents,
+        fq.CloseEvents,
+        fq.ReopenEvents,
+        fq.LastCloserDisplayName,
+        fq.AcceptedAnswerId,
+        fq.TotalFavoritedByUsers,
+        fq.LastMigrationHereDate,
+        fq.LastEditorReputation,
+        fq.SecondEditorReputation,
+        fq.WasClosed,
+        fq.IsCommunityOwned,
+        fq.PrimaryTag,
+        fq.PrimaryTagQuestionCount,
+        fq.PrimaryTagAvgScore,
+        fq.GlobalViewScoreRank,
+        fq.PrevQuestionScoreByOwner,
+        fq.AvgOwnerPrevQuestionScore,
+        'Question_Details' AS RecordType,
+        NULL::INT AS RelatedPostId,
+        NULL::VARCHAR(300) AS RelatedPostExcerpt,
+        NULL::INT AS RelatedPostScore,
+        NULL::TIMESTAMP AS RelatedPostCreationDate,
+        NULL::INT AS RelatedPostOwnerReputation,
+        NULL::BOOLEAN AS RelatedPostIsAccepted,
+        -- Complex calculation for a composite score for questions.
+        COALESCE(
+            (fq.QuestionScore * 0.4) +
+            (fq.QuestionViewCount * 0.0001) +
+            (fq.TotalFavoritedByUsers * 0.3) +
+            (fq.TotalEditEvents * 0.05) +
+            (fq.QuestionOwnerInfluence * 0.001) +
+            (CASE WHEN fq.AcceptedAnswerId != -1 THEN 100 ELSE 0 END),
+        0) AS FinalCompositeScore
+    FROM FilteredQuestions fq
+    WHERE fq.QuestionId IN (SELECT QuestionId FROM RankedAnswers WHERE AnswerRank = 1) -- Ensure questions have at least one top answer
+),
+FinalAnswers AS (
+    -- Prepares the final selection of top-ranked answers for the high-impact questions.
+    SELECT
+        fq.QuestionId,
+        fq.QuestionTitle,
+        fq.QuestionCreationDate,
+        fq.QuestionScore,
+        fq.QuestionViewCount,
+        fq.QuestionAnswerCount,
+        fq.QuestionOwnerDisplayName,
+        fq.QuestionOwnerReputation,
+        fq.QuestionOwnerInfluence,
+        fq.TotalEditEvents,
+        fq.CloseEvents,
+        fq.ReopenEvents,
+        fq.LastCloserDisplayName,
+        fq.AcceptedAnswerId,
+        fq.TotalFavoritedByUsers,
+        fq.LastMigrationHereDate,
+        fq.LastEditorReputation,
+        fq.SecondEditorReputation,
+        fq.WasClosed,
+        fq.IsCommunityOwned,
+        fq.PrimaryTag,
+        fq.PrimaryTagQuestionCount,
+        fq.PrimaryTagAvgScore,
+        fq.GlobalViewScoreRank,
+        fq.PrevQuestionScoreByOwner,
+        fq.AvgOwnerPrevQuestionScore,
+        'Top_Answer_Details' AS RecordType,
+        ra.AnswerId AS RelatedPostId,
+        -- String expression: Extracts a cleaned excerpt from the answer body. Handles NULL Body.
+        COALESCE(SUBSTRING(REPLACE(REPLACE(REPLACE(ra_post.Body, '<p>', ''), '</p>', ''), '<code>', ''), 1, 250) || '...', '[No Answer Body Excerpt]') AS RelatedPostExcerpt,
+        ra.AnswerScore AS RelatedPostScore,
+        ra.AnswerCreationDate AS RelatedPostCreationDate,
+        ra.AnswerOwnerReputation AS RelatedPostOwnerReputation,
+        ra.IsAcceptedAnswer AS RelatedPostIsAccepted,
+        -- Complex calculation for a composite score for answers.
+        COALESCE(
+            (ra.AnswerScore * 0.6) +
+            (ra.AnswerOwnerReputation * 0.002) +
+            (ra.AnswerCommentCount * 0.1) +
+            (CASE WHEN ra.IsAcceptedAnswer THEN 150 ELSE 0 END),
+        0) AS FinalCompositeScore
+    FROM FilteredQuestions fq
+    JOIN RankedAnswers ra ON fq.QuestionId = ra.QuestionId AND ra.AnswerRank = 1
+    JOIN Posts ra_post ON ra.AnswerId = ra_post.Id -- Join to get the actual answer body.
+    WHERE ra.AnswerOwnerUserId IS NOT NULL -- Ensure the answer has an owner.
+)
+-- Combines the final question and top answer details using UNION ALL.
+SELECT * FROM FinalQuestions
+UNION ALL
+SELECT * FROM FinalAnswers
+ORDER BY QuestionId, FinalCompositeScore DESC, RecordType DESC
+LIMIT 500; -- Limit the final output for practicality in benchmarking context.

@@ -1,0 +1,155 @@
+WITH
+usr_agg AS (
+    SELECT
+        u.Id                                   AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        SUM(p.Score) FILTER (WHERE p.PostTypeId = 2) AS TotalAnswerScore,
+        MAX(p.CreationDate)                     AS LastPostDate,
+        COALESCE(u.UpVotes - u.DownVotes, 0)    AS NetVotes,
+        u.UpVotes,
+        u.DownVotes
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes
+),
+
+gold_badge_users AS (
+    SELECT DISTINCT b.UserId
+    FROM Badges b
+    WHERE b.Class = 1
+),
+
+-- Split tags into rows in a dialect-neutral way using a recursive CTE
+user_tags AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        NULL::VARCHAR  AS Tag,
+        0              AS pos,
+        trim(both '<>' FROM p.Tags) AS tags_remaining
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.Tags IS NOT NULL
+
+    UNION ALL
+
+    SELECT
+        ut.UserId,
+        CASE
+            WHEN position('><' IN ut.tags_remaining) > 0
+            THEN substring(ut.tags_remaining FROM 1 FOR position('><' IN ut.tags_remaining)-1)
+            ELSE ut.tags_remaining
+        END AS Tag,
+        ut.pos + 1 AS pos,
+        CASE
+            WHEN position('><' IN ut.tags_remaining) > 0
+            THEN substring(ut.tags_remaining FROM position('><' IN ut.tags_remaining)+2)
+            ELSE ''
+        END AS tags_remaining
+    FROM user_tags ut
+    WHERE ut.tags_remaining <> ''
+),
+
+user_tags_agg AS (
+    SELECT
+        UserId,
+        Tag,
+        COUNT(*) AS TagUsage
+    FROM user_tags
+    WHERE Tag IS NOT NULL AND Tag <> ''
+    GROUP BY UserId, Tag
+),
+
+top_tags AS (
+    SELECT t.TagName, t.Count
+    FROM Tags t
+    ORDER BY t.Count DESC
+    LIMIT 10
+),
+
+recent_activity AS (
+    SELECT
+        p.OwnerUserId   AS UserId,
+        p.CreationDate  AS ActivityDate,
+        'Post'          AS ActivityType,
+        p.Title         AS Detail
+    FROM Posts p
+    WHERE p.CreationDate > (DATE '2024-10-01' - INTERVAL '30 days')
+
+    UNION ALL
+
+    SELECT
+        c.UserId        AS UserId,
+        c.CreationDate  AS ActivityDate,
+        'Comment'       AS ActivityType,
+        LEFT(c.Text, 100) AS Detail
+    FROM Comments c
+    WHERE c.CreationDate > (DATE '2024-10-01' - INTERVAL '30 days')
+),
+
+ranked_activity AS (
+    SELECT
+        ra.UserId,
+        ra.ActivityDate,
+        ra.ActivityType,
+        ra.Detail,
+        ROW_NUMBER() OVER (PARTITION BY ra.UserId ORDER BY ra.ActivityDate DESC) AS rn
+    FROM recent_activity ra
+),
+
+vote_summary AS (
+    SELECT
+        p.Id                                 AS PostId,
+        p.PostTypeId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        COUNT(v.Id)                         AS TotalVotes
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    GROUP BY p.Id, p.PostTypeId
+)
+
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.TotalAnswerScore,
+    ua.NetVotes,
+    CASE WHEN gb.UserId IS NOT NULL THEN 1 ELSE 0 END          AS HasGoldBadge,
+    COALESCE(ut.Tag, 'None')                                   AS TopTag,
+    ut.TagUsage,
+    ra.ActivityDate,
+    ra.ActivityType,
+    ra.Detail,
+    vs.UpVotes,
+    vs.DownVotes,
+    vs.TotalVotes,
+    COALESCE(tt.Count, 0)                                      AS TagGlobalCount
+FROM usr_agg ua
+LEFT JOIN gold_badge_users gb ON gb.UserId = ua.UserId
+LEFT JOIN (
+    SELECT
+        UserId,
+        Tag,
+        TagUsage,
+        ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY TagUsage DESC, Tag) AS rn
+    FROM user_tags_agg
+) ut ON ut.UserId = ua.UserId AND ut.rn = 1
+LEFT JOIN ranked_activity ra ON ra.UserId = ua.UserId AND ra.rn = 1
+LEFT JOIN vote_summary vs ON vs.PostId = (
+    SELECT p2.Id
+    FROM Posts p2
+    WHERE p2.OwnerUserId = ua.UserId
+      AND p2.PostTypeId = 2
+    ORDER BY p2.Score DESC NULLS LAST
+    LIMIT 1
+)
+LEFT JOIN top_tags tt ON tt.TagName = ut.Tag
+WHERE ua.Reputation > 10000
+  AND (ua.LastPostDate IS NULL OR ua.LastPostDate < (DATE '2024-10-01' - INTERVAL '365 days'))
+ORDER BY ua.Reputation DESC, ua.AnswerCount DESC
+LIMIT 50;

@@ -1,0 +1,157 @@
+with RecursiveUserBadges as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class as BadgeClass,
+        b.TagBased,
+        row_number() over (partition by u.Id order by b.Date desc, b.Class, b.Name) as BadgeRank
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    where b.Date is not null
+), 
+TopUsersByBadgeCount as (
+    select 
+        UserId,
+        DisplayName,
+        count(*) as TotalBadges,
+        sum(case when BadgeClass = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when BadgeClass = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when BadgeClass = 3 then 1 else 0 end) as BronzeBadges
+    from RecursiveUserBadges
+    group by UserId, DisplayName
+    having count(*) > 5
+),
+LatestPostsCTE as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.OwnerUserId,
+        p.Tags,
+        p.AcceptedAnswerId,
+        dense_rank() over (partition by p.OwnerUserId order by p.CreationDate desc) as RecentPostRank
+    from Posts p
+    where p.PostTypeId in (1,2)
+),
+UserQuestionAnswerStats as (
+    select 
+        u.Id as UserId,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionCount,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswerCount,
+        avg(case when p.PostTypeId = 1 then p.Score else null end) as AvgQuestionScore,
+        avg(case when p.PostTypeId = 2 then p.Score else null end) as AvgAnswerScore,
+        sum(case when p.PostTypeId = 1 and p.AcceptedAnswerId is not null then 1 else 0 end) as QuestionsWithAcceptedAnswer
+    from Users u
+    left join Posts p on u.Id = p.OwnerUserId
+    group by u.Id
+),
+UserVoteActivity as (
+    select
+        v.UserId,
+        count(*) as TotalVotesCast,
+        count(case when vt.Name = 'UpMod' then 1 end) as UpVotesCast,
+        count(case when vt.Name = 'DownMod' then 1 end) as DownVotesCast,
+        max(v.CreationDate) as LastVoteDate
+    from Votes v
+    inner join VoteTypes vt on v.VoteTypeId = vt.Id
+    where v.UserId is not null
+    group by v.UserId
+),
+DuplicatedQuestions as (
+    select distinct pl.PostId as DuplicateQuestionId, pl.RelatedPostId as OriginalQuestionId
+    from PostLinks pl
+    inner join LinkTypes lt on pl.LinkTypeId = lt.Id
+    where lt.Name = 'Duplicate'
+),
+QuestionClosureStats as (
+    select 
+        ph.PostId,
+        count(case when pht.Name = 'Post Closed' then 1 end) as CloseVotesCount,
+        max(ph.CreationDate) as LastClosedDate,
+        max(case when pht.Name = 'Post Closed' then crt.Name end) as LastCloseReason
+    from PostHistory ph
+    inner join PostHistoryTypes pht on ph.PostHistoryTypeId = pht.Id
+    left join CloseReasonTypes crt on cast(ph.Comment as integer) = crt.Id
+    group by ph.PostId
+),
+TagUsageFrequency as (
+    select 
+        tagname,
+        sum(count) as TotalCount
+    from (
+        select unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><')) as tagname, p.Id as PostId
+        from Posts p
+        where p.PostTypeId = 1 and p.Tags is not null
+    ) tagExtract
+    inner join Tags t on lower(t.TagName) = lower(tagExtract.tagname)
+    group by tagname
+    order by TotalCount desc
+    limit 10
+)
+select 
+    u.Id as UserId,
+    u.DisplayName,
+    coalesce(us.QuestionCount,0) as QuestionCount,
+    coalesce(us.AnswerCount,0) as AnswerCount,
+    coalesce(us.AvgQuestionScore,0) as AvgQuestionScore,
+    coalesce(us.AvgAnswerScore,0) as AvgAnswerScore,
+    coalesce(us.QuestionsWithAcceptedAnswer,0) as QuestionsWithAcceptedAnswer,
+    coalesce(vote.TotalVotesCast,0) as VotesCast,
+    coalesce(vote.UpVotesCast,0) as UpVotesCast,
+    coalesce(vote.DownVotesCast,0) as DownVotesCast,
+    tb.TotalBadges,
+    tb.GoldBadges,
+    tb.SilverBadges,
+    tb.BronzeBadges,
+    dup.DuplicateQuestionId,
+    dup.OriginalQuestionId,
+    qc.CloseVotesCount,
+    qc.LastClosedDate,
+    qc.LastCloseReason,
+    case 
+        when u.Location is null then 'Unknown'
+        when u.Location like '%USA%' or u.Location like '%United States%' then 'USA'
+        else u.Location 
+    end as NormalizedLocation,
+    rank() over (order by u.Reputation desc) as ReputationRank,
+    (select count(distinct c.PostId) from Comments c where c.UserId = u.Id and exists (select 1 from Posts p2 where p2.Id = c.PostId and p2.OwnerUserId = u.Id)) as SelfCommentedPostCount
+from Users u
+left join UserQuestionAnswerStats us on us.UserId = u.Id
+left join UserVoteActivity vote on vote.UserId = u.Id
+left join TopUsersByBadgeCount tb on tb.UserId = u.Id
+left join DuplicatedQuestions dup on dup.DuplicateQuestionId = (
+    select min(p.Id) from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 1
+)
+left join QuestionClosureStats qc on qc.PostId = (
+    select min(p.Id) from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 1
+)
+where u.Reputation > 1000 and u.LastAccessDate > cast('2024-10-01 12:34:56' as timestamp) - interval '180 days'
+group by
+    u.Id,
+    u.DisplayName,
+    us.QuestionCount,
+    us.AnswerCount,
+    us.AvgQuestionScore,
+    us.AvgAnswerScore,
+    us.QuestionsWithAcceptedAnswer,
+    vote.TotalVotesCast,
+    vote.UpVotesCast,
+    vote.DownVotesCast,
+    tb.TotalBadges,
+    tb.GoldBadges,
+    tb.SilverBadges,
+    tb.BronzeBadges,
+    dup.DuplicateQuestionId,
+    dup.OriginalQuestionId,
+    qc.CloseVotesCount,
+    qc.LastClosedDate,
+    qc.LastCloseReason,
+    u.Location,
+    u.Reputation,
+    u.LastAccessDate
+order by ReputationRank
+limit 100;

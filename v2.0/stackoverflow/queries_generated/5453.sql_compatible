@@ -1,0 +1,155 @@
+WITH top_users AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.AccountId,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.ViewCount DESC NULLS LAST) AS rn
+  FROM Users u
+  WHERE u.Reputation > 1000
+),
+tag_pop AS (
+  SELECT
+    tg.TagName,
+    COUNT(*) AS TagCount,
+    AVG(p.Score) AS AvgPostScore
+  FROM Tags tg
+  JOIN Posts p ON p.Id = tg.ExcerptPostId
+  JOIN (VALUES ('python'), ('sql'), ('c#'), ('java'), ('javascript')) AS v(TagName) ON v.TagName = tg.TagName
+  GROUP BY tg.TagName
+),
+recent_activities AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    ARRAY_AGG(DISTINCT v.VoteTypeId) AS VoteTypes
+  FROM Posts p
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  WHERE p.LastActivityDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days'
+  GROUP BY p.Id, p.Title, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.LastActivityDate, p.Score
+),
+complex_calc AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    CASE
+      WHEN p.Tags LIKE '%<python>%' THEN 1
+      WHEN p.Tags LIKE '%<sql>%' THEN 2
+      ELSE 0
+    END AS TagAffinity,
+    p.LastActivityDate,
+    (COALESCE(p.Score,0) * 1.15) + COALESCE(p.ViewCount,0) AS ScoreWeight
+  FROM Posts p
+  WHERE p.PostTypeId IN (1,2)
+    AND p.LastActivityDate IS NOT NULL
+)
+SELECT
+  t.UserId,
+  t.DisplayName AS UserDisplayName,
+  t.Reputation,
+  t.CreationDate AS UserCreationDate,
+  t.LastAccessDate,
+  t.Location,
+  t.Views,
+  t.UpVotes,
+  t.DownVotes,
+  t.AccountId,
+  -- top posts by user with weighting: construct array of top 5 posts per user
+  (
+    SELECT jsonb_agg(x)
+    FROM (
+      SELECT
+        jsonb_build_object(
+          'PostId', r2.PostId,
+          'Title', COALESCE(r2.Title, ''),
+          'PostTypeId', r2.PostTypeId,
+          'CreationDate', r2.CreationDate,
+          'LastActivityDate', r2.LastActivityDate,
+          'Score', r2.ScoreWeight
+        ) AS x
+      FROM (
+        SELECT
+          p.OwnerUserId,
+          p.Id AS PostId,
+          p.Title,
+          p.PostTypeId,
+          p.CreationDate,
+          p.LastActivityDate,
+          p.Score,
+          p.ViewCount,
+          p.Tags,
+          (COALESCE(p.Score,0) * 1.15) + COALESCE(p.ViewCount,0) AS ScoreWeight
+        FROM Posts p
+        WHERE p.OwnerUserId = t.UserId
+          AND p.OwnerUserId IS NOT NULL
+      ) r2
+      ORDER BY r2.ScoreWeight DESC
+      LIMIT 5
+    ) q
+  ) AS TopPosts,
+  -- tag popularity insight
+  (SELECT jsonb_object_agg(s.TagName, s.TagCount) FROM (
+     SELECT t2.TagName, t2.TagCount
+     FROM tag_pop t2
+     ORDER BY t2.TagCount DESC
+     LIMIT 5
+  ) s) AS TopTags,
+  -- recent activities per post
+  (
+    SELECT jsonb_agg(jsonb_build_object(
+      'PostId', ra.PostId,
+      'Title', ra.Title,
+      'PostTypeId', ra.PostTypeId,
+      'CreationDate', ra.CreationDate,
+      'LastActivityDate', ra.LastActivityDate,
+      'Score', ra.Score
+    ))
+    FROM recent_activities ra
+    WHERE ra.OwnerUserId = t.UserId
+      AND ra.Score IS NOT NULL
+  ) AS RecentActivity
+FROM top_users t
+LEFT JOIN (
+  SELECT
+    p.OwnerUserId,
+    p.Id AS PostId,
+    p.Title,
+    p.PostTypeId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    (COALESCE(p.Score,0) * 1.15) + COALESCE(p.ViewCount,0) AS ScoreWeight
+  FROM Posts p
+  WHERE p.OwnerUserId IS NOT NULL
+) r ON r.OwnerUserId = t.UserId
+GROUP BY
+  t.UserId,
+  t.DisplayName,
+  t.Reputation,
+  t.CreationDate,
+  t.LastAccessDate,
+  t.Location,
+  t.Views,
+  t.UpVotes,
+  t.DownVotes,
+  t.AccountId
+ORDER BY t.Reputation DESC
+LIMIT 100;

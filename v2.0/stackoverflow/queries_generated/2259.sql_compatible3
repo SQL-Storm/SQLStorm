@@ -1,0 +1,157 @@
+WITH RECURSIVE RecursiveTagCTE AS (
+    SELECT 
+        t.Id AS TagId,
+        t.TagName,
+        t.Count,
+        p.Id AS PostId,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        array_length(string_to_array(substring(p.Tags FROM 2 FOR length(p.Tags)-2), '><'),1) AS TagCount,
+        rank() OVER (PARTITION BY p.Id ORDER BY p.Score DESC) AS PostRank
+    FROM Tags t
+    JOIN Posts p 
+      ON p.PostTypeId = 1 
+      AND p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    WHERE t.IsModeratorOnly = false AND t.IsRequired = false
+
+    UNION ALL
+
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        array_length(string_to_array(substring(p.Tags FROM 2 FOR length(p.Tags)-2), '><'),1),
+        rank() OVER (PARTITION BY p.Id ORDER BY p.Score DESC)
+    FROM Tags t
+    JOIN Posts p ON p.ParentId IN (
+        -- Avoid referencing RecursiveTagCTE inside a subquery by joining instead
+        SELECT r.PostId FROM RecursiveTagCTE r JOIN Tags tt ON tt.Id = r.TagId WHERE tt.Id = t.Id
+    )
+    WHERE p.PostTypeId = 2
+),
+UserEngagement AS (
+    SELECT 
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      coalesce(sum(case when b.Class = 1 then 1 else 0 end),0) AS GoldBadges,
+      coalesce(sum(case when b.Class = 2 then 1 else 0 end),0) AS SilverBadges,
+      coalesce(sum(case when b.Class = 3 then 1 else 0 end),0) AS BronzeBadges,
+      coalesce(max(ph.CreationDate), u.CreationDate) AS LastEditDate,
+      count(distinct c.Id) AS CommentCount,
+      count(distinct v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotesReceived,
+      count(distinct v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVotesReceived
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+LatestPostActivity AS (
+    SELECT
+      p.Id AS PostId,
+      p.Title,
+      p.OwnerUserId,
+      p.CreationDate,
+      p.LastActivityDate,
+      dense_rank() OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate DESC) AS ActivityRank,
+      coalesce(pl.PostId,0) AS LinkedPostId,
+      coalesce(pl.RelatedPostId,0) AS RelatedPostId,
+      pl.LinkTypeId
+    FROM Posts p
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+    WHERE p.PostTypeId IN (1,2)
+),
+PostScoresWithWindow AS (
+    SELECT 
+      p.Id,
+      p.Title,
+      p.OwnerUserId,
+      p.Score,
+      avg(p.Score) OVER (PARTITION BY p.OwnerUserId) AS AvgUserPostScore,
+      count(*) OVER (PARTITION BY p.OwnerUserId) AS UserPostCount,
+      row_number() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS UserPostRank
+    FROM Posts p
+    WHERE p.PostTypeId IN (1,2)
+),
+FilteredPosts AS (
+    SELECT 
+      p.Id,
+      p.Title,
+      p.OwnerUserId,
+      p.Score,
+      p.ViewCount,
+      u.Reputation,
+      ue.GoldBadges,
+      ue.SilverBadges,
+      ue.BronzeBadges,
+      ue.CommentCount,
+      ue.UpVotesReceived,
+      ue.DownVotesReceived,
+      psw.AvgUserPostScore,
+      psw.UserPostCount,
+      psw.UserPostRank,
+      CASE 
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+        ELSE 'Open'
+      END AS PostStatus,
+      CASE 
+        WHEN p.Tags IS NULL THEN ''
+        ELSE array_to_string(string_to_array(substring(p.Tags FROM 2 FOR length(p.Tags)-2), '><'), ',')
+      END AS TagList,
+      length(p.Body) AS BodyLength,
+      (p.LastEditorUserId IS NOT NULL AND p.LastEditorUserId <> -1) AS HasEditor
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    LEFT JOIN UserEngagement ue ON ue.UserId = p.OwnerUserId
+    LEFT JOIN PostScoresWithWindow psw ON psw.Id = p.Id
+    WHERE p.PostTypeId = 1 AND p.Score >= 0 AND p.ViewCount > 100
+)
+SELECT 
+  fp.Id AS QuestionId,
+  fp.Title,
+  fp.OwnerUserId,
+  fp.Reputation,
+  fp.GoldBadges,
+  fp.SilverBadges,
+  fp.BronzeBadges,
+  fp.CommentCount,
+  fp.UpVotesReceived,
+  fp.DownVotesReceived,
+  fp.Score,
+  fp.ViewCount,
+  fp.AvgUserPostScore,
+  fp.UserPostCount,
+  fp.UserPostRank,
+  fp.PostStatus,
+  fp.TagList,
+  fp.BodyLength,
+  fp.HasEditor,
+  coalesce(
+    (SELECT count(*) FROM Posts a WHERE a.ParentId = fp.Id AND a.Score > fp.Score * 0.75),
+    0
+  ) AS HighScoringAnswers,
+  coalesce(
+    (SELECT avg(v.Score) FROM Votes v JOIN Posts po ON v.PostId = po.Id WHERE po.OwnerUserId = fp.OwnerUserId AND v.VoteTypeId = 2),
+    0
+  ) AS AvgUpvoteScoreOnUserPosts,
+  CASE 
+    WHEN fp.BodyLength > 500 THEN 'LongBody'
+    WHEN fp.BodyLength BETWEEN 200 AND 500 THEN 'MediumBody'
+    ELSE 'ShortBody'
+  END AS BodyLengthType
+FROM FilteredPosts fp
+WHERE (fp.GoldBadges + fp.SilverBadges + fp.BronzeBadges) >= 5
+  AND fp.UpVotesReceived > fp.DownVotesReceived
+  AND EXISTS (
+      SELECT 1 FROM PostLinks pl2 WHERE pl2.PostId = fp.Id AND pl2.LinkTypeId = 3
+  )
+ORDER BY fp.Score DESC, fp.ViewCount DESC
+LIMIT 100;

@@ -1,0 +1,47 @@
+-- {"query": "6709.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-micro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 499} 
+
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id ELSE NULL END) AS TotalQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id ELSE NULL END) AS TotalAnswers,
+    COUNT(DISTINCT CASE WHEN pv.VoteTypeId = 1 THEN p.Id ELSE NULL END) AS TotalAcceptedAnswers,
+    COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN p.Id ELSE NULL END) AS TotalDuplicatePosts,
+    MAX(p.Score) AS HighestScoredPost,
+    MIN(p.Score) AS LowestScoredPost,
+    AVG(p.Score) AS AverageScore,
+    SUM(p.ViewCount) AS TotalViews,
+    SUM(p.FavoriteCount) AS TotalFavorites,
+    STRING_AGG(DISTINCT t.TagName, ', ') AS TagList,
+    MAX(u.LastAccessDate) AS LastAccessDate,
+    ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.LastActivityDate DESC) AS MostRecentActivity,
+    COALESCE(SUM(b.Class), 0) AS TotalBadges
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Votes pv ON p.Id = pv.PostId AND pv.VoteTypeId = 1
+LEFT JOIN 
+    PostLinks pl ON p.Id = pl.PostId
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    (SELECT 
+         Id, 
+         STRING_AGG(TagName, ', ') WITHIN GROUP (ORDER BY TagName) AS TagName
+     FROM 
+         Tags
+     GROUP BY 
+         Id) t ON p.Id = t.Id
+WHERE 
+    u.Reputation > 1000
+    AND p.CreationDate >= DATEADD(year, -2, CURRENT_TIMESTAMP)
+GROUP BY 
+    u.DisplayName, u.Reputation
+HAVING 
+    AVG(p.Score) > 10
+ORDER BY 
+    TotalViews DESC, 
+    TotalPosts DESC;

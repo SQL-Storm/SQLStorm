@@ -1,0 +1,87 @@
+-- {"query": "4923.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 987} 
+
+WITH RankedPostHistory AS (
+    SELECT
+        ph.PostId,
+        ph.UserId,
+        ph.CreationDate,
+        pht.Name AS HistoryTypeName,
+        ROW_NUMBER() OVER(PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) as rn
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    WHERE ph.UserId IS NOT NULL
+),
+UserPostActivity AS (
+    SELECT
+        p.OwnerUserId,
+        COUNT(p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        AVG(p.Score) AS AverageScore,
+        MAX(p.CreationDate) AS LatestPostDate
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+PostInteractionSummary AS (
+    SELECT
+        p.Id AS PostId,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+        SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicateLinkCount
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (2, 3)
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId AND pl.LinkTypeId = 3
+    GROUP BY p.Id
+)
+SELECT
+    u.DisplayName,
+    u.Reputation,
+    ua.TotalPosts,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.AverageScore,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    pis.CommentCount,
+    pis.UpVoteCount,
+    pis.DownVoteCount,
+    pis.DuplicateLinkCount,
+    ph_latest.HistoryTypeName AS LatestHistoryAction,
+    CASE
+        WHEN u.LastAccessDate < ua.LatestPostDate THEN 'Inactive'
+        WHEN u.Reputation < 1000 THEN 'Newcomer'
+        WHEN u.Views > 10000 THEN 'High Traffic User'
+        ELSE 'Standard User'
+    END AS UserStatus,
+    LOWER(REPLACE(COALESCE(u.Location, 'Unknown'), ' ', '_')) AS NormalizedLocation,
+    CASE
+        WHEN SUBSTRING(CAST(u.CreationDate AS VARCHAR), 1, 4) = SUBSTRING(CAST(u.LastAccessDate AS VARCHAR), 1, 4) THEN 'Same Year'
+        ELSE 'Different Years'
+    END AS AccountAgeIndicator,
+    CASE
+        WHEN ua.LatestPostDate IS NULL THEN 0
+        ELSE DATE_PART('day', NOW() - ua.LatestPostDate)
+    END AS DaysSinceLastPost
+FROM Users u
+LEFT JOIN UserPostActivity ua ON u.Id = ua.OwnerUserId
+LEFT JOIN UserBadgeCounts ub ON u.Id = ub.UserId
+LEFT JOIN PostInteractionSummary pis ON u.Id = (SELECT OwnerUserId FROM Posts WHERE Id = pis.PostId) -- Correlated subquery to get OwnerUserId for each post's summary
+LEFT JOIN RankedPostHistory ph_latest ON u.Id = ph_latest.UserId AND ph_latest.rn = 1
+WHERE u.DisplayName IS NOT NULL
+  AND u.DisplayName NOT LIKE '%deleted%'
+  AND u.AccountId IS NOT NULL
+ORDER BY u.Reputation DESC, ua.TotalPosts DESC
+LIMIT 1000;

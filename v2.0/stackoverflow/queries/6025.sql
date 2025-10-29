@@ -1,0 +1,42 @@
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id ELSE NULL END) AS TotalQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id ELSE NULL END) AS TotalAnswers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 3 THEN p.Id ELSE NULL END) AS TotalWikis,
+    COUNT(DISTINCT p.AcceptedAnswerId) AS TotalAcceptedAnswers,
+    COUNT(DISTINCT pl.RelatedPostId) AS TotalLinkedPosts,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Id ELSE NULL END) AS TotalClosedPosts,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.Id ELSE NULL END) AS TotalReopenedPosts,
+    AVG(p.Score) AS AvgScore,
+    SUM(p.ViewCount) AS TotalViewCount,
+    SUM(p.AnswerCount) AS TotalAnswerCount,
+    SUM(v.BountyAmount) AS TotalBountyAmount,
+    MAX(u.CreationDate) AS LatestAccountCreation,
+    MIN(u.LastAccessDate) AS EarliestLastAccess,
+    STRING_AGG(DISTINCT t.TagName, ', ') AS MostCommonTags
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    PostLinks pl ON p.Id = pl.PostId
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId AND v.VoteTypeId = 8
+LEFT JOIN 
+    Tags t ON p.Id = t.ExcerptPostId
+WHERE 
+    p.PostTypeId IN (1, 2, 3)
+    AND u.Reputation > 1000
+    AND p.CreationDate BETWEEN (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '5' YEAR) AND TIMESTAMP '2024-10-01 12:34:56'
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation, u.Location
+HAVING 
+    COUNT(DISTINCT p.Id) > 50
+ORDER BY 
+    TotalViewCount DESC, 
+    AvgScore DESC;

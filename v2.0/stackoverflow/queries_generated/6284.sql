@@ -1,0 +1,36 @@
+-- {"query": "6284.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-micro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 480} 
+
+SELECT 
+    u.DisplayName, 
+    COUNT(DISTINCT p.Id) AS TotalPosts, 
+    MAX(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END) AS HighestScoredQuestion,
+    MIN(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE NULL END) AS LowestScoredAnswer,
+    SUM(v.BountyAmount) AS TotalBountyPoints,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Comment END) AS ClosedPosts,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 33 THEN ph.Comment END) AS PostNoticesAdded,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 34 THEN ph.Comment END) AS PostNoticesRemoved,
+    COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN pl.RelatedPostId ELSE NULL END) AS DuplicatePosts,
+    COUNT(DISTINCT CASE WHEN t.IsRequired = 1 THEN t.TagName ELSE NULL END) AS RequiredTags,
+    ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.Score DESC) AS RankedByScore
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId AND v.VoteTypeId = 8
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN 
+    PostLinks pl ON p.Id = pl.PostId
+LEFT JOIN 
+    Tags t ON p.Id = t.ExcerptPostId
+WHERE 
+    u.Reputation > 1000
+    AND p.CreationDate >= DATEADD(year, -2, CURRENT_TIMESTAMP)
+    AND (ph.PostHistoryTypeId IN (10, 33, 34) OR pl.LinkTypeId = 3)
+GROUP BY 
+    u.DisplayName, u.Id
+HAVING 
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id ELSE NULL END) > 5
+ORDER BY 
+    TotalPosts DESC, HighestScoredQuestion DESC;

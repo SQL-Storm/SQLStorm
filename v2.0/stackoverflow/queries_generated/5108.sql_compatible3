@@ -1,0 +1,138 @@
+WITH recent_posts AS (
+  SELECT
+    p.Id,
+    p.OwnerUserId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.CommentCount,
+    p.AnswerCount,
+    p.PostTypeId,
+    p.FavoriteCount,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.LastEditDate
+  FROM Posts p
+  WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days'
+),
+tag_stats AS (
+  SELECT
+    tag,
+    COUNT(*) AS post_count,
+    AVG(p.Score) AS avg_score,
+    SUM(p.ViewCount) AS total_views
+  FROM (
+    SELECT
+      p.*,
+      unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '> <')) AS tag
+    FROM recent_posts p
+    WHERE p.Tags IS NOT NULL
+  ) p
+  GROUP BY tag
+),
+author_activity AS (
+  SELECT
+    u.Id AS user_id,
+    u.DisplayName,
+    COUNT(DISTINCT p.Id) AS posts_in_30d,
+    SUM(p.ViewCount) AS views_in_30d,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS questions_30d,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS answers_30d,
+    MAX(p.CreationDate) AS last_post_date
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  WHERE u.Id IN (SELECT DISTINCT OwnerUserId FROM recent_posts)
+  GROUP BY u.Id, u.DisplayName
+),
+complex_metrics AS (
+  SELECT
+    rp.Id AS post_id,
+    rp.Title,
+    rp.OwnerUserId,
+    ua.posts_in_30d,
+    ua.views_in_30d,
+    vt.Name AS vote_type,
+    v.CreationDate AS vote_date,
+    v.BountyAmount,
+    CASE
+      WHEN rp.PostTypeId = 1 THEN 'Question'
+      WHEN rp.PostTypeId = 2 THEN 'Answer'
+      ELSE 'Other'
+    END AS post_kind,
+    CASE
+      WHEN rp.AcceptedAnswerId IS NOT NULL THEN 1
+      ELSE 0
+    END AS was_accepted,
+    CASE
+      WHEN rp.LastEditDate IS NOT NULL THEN rp.LastEditDate
+      WHEN rp.LastActivityDate IS NOT NULL THEN rp.LastActivityDate
+      ELSE rp.CreationDate
+    END AS activity_timestamp
+  FROM recent_posts rp
+  LEFT JOIN author_activity ua ON rp.OwnerUserId = ua.user_id
+  LEFT JOIN Votes v ON v.PostId = rp.Id
+  LEFT JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+  WHERE rp.OwnerUserId IS NOT NULL
+),
+windowed AS (
+  SELECT
+    cm.post_id,
+    cm.Title,
+    cm.OwnerUserId,
+    cm.posts_in_30d,
+    cm.views_in_30d,
+    cm.vote_type,
+    cm.vote_date,
+    cm.BountyAmount,
+    cm.post_kind,
+    cm.was_accepted,
+    cm.activity_timestamp,
+    ROW_NUMBER() OVER (
+      PARTITION BY cm.OwnerUserId
+      ORDER BY cm.activity_timestamp DESC
+    ) AS rn
+  FROM complex_metrics cm
+),
+final AS (
+  SELECT
+    w.post_id,
+    w.Title,
+    w.OwnerUserId,
+    w.posts_in_30d,
+    w.views_in_30d,
+    w.vote_type,
+    w.vote_date,
+    w.BountyAmount,
+    w.post_kind,
+    w.was_accepted,
+    w.activity_timestamp,
+    w.rn,
+    ts.post_count AS related_tag_posts,
+    ts.avg_score AS related_tag_avg_score,
+    ts.total_views AS related_tag_total_views
+  FROM windowed w
+  LEFT JOIN tag_stats ts ON TRUE
+  WHERE w.rn = 1
+)
+SELECT
+  f.post_id,
+  f.Title,
+  u.DisplayName AS OwnerDisplayName,
+  f.post_kind,
+  f.was_accepted,
+  f.activity_timestamp,
+  f.posts_in_30d,
+  f.views_in_30d,
+  f.vote_type,
+  f.vote_date,
+  f.BountyAmount,
+  f.related_tag_posts,
+  f.related_tag_avg_score,
+  f.related_tag_total_views
+FROM final f
+LEFT JOIN Users u ON u.Id = f.OwnerUserId
+ORDER BY f.activity_timestamp DESC
+LIMIT 200;

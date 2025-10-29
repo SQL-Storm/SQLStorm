@@ -1,0 +1,310 @@
+-- {"query": "1205.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 4348} 
+WITH UserEngagement AS (
+    -- CTE 1: Aggregates user activity, including post counts, scores, and a correlated subquery for gold badges.
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COALESCE(SUM(P.Score), 0) AS TotalPostScore,
+        COALESCE(MAX(P.Score), 0) AS MaxPostScore,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        MAX(P.LastActivityDate) AS LastPostActivity,
+        MIN(P.CreationDate) AS FirstPostDate,
+        -- Correlated subquery: Count Gold Badges for the user
+        (SELECT COUNT(B.Id) FROM Badges B WHERE B.UserId = U.Id AND B.Class = 1) AS GoldBadgeCount
+    FROM
+        Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate
+),
+PostVersionHistory AS (
+    -- CTE 2: Tracks various historical events and edits for posts, using min/max dates and string aggregation.
+    SELECT
+        PH.PostId,
+        MIN(CASE WHEN PH.PostHistoryTypeId = 2 THEN PH.CreationDate END) AS OriginalBodyDate, -- First body creation
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (5, 8) THEN PH.CreationDate END) AS LastBodyEditDate, -- Last body edit/rollback
+        MIN(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.CreationDate END) AS FirstClosedDate, -- First time post was closed
+        MAX(CASE WHEN PH.PostHistoryTypeId = 11 THEN PH.CreationDate END) AS LastReopenedDate, -- Last time post was reopened
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (12, 35) THEN PH.CreationDate END) AS LastDeletedOrMigratedDate, -- Last deletion or migration
+        COUNT(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 END) AS TotalEdits,
+        -- String expression: Aggregates comments from recent edits, truncating and joining
+        STRING_AGG(DISTINCT SUBSTRING(PH.Comment, 1, 50), '; ') FILTER (WHERE PH.Comment IS NOT NULL AND PH.Comment != '') AS RecentEditComments
+    FROM
+        PostHistory PH
+    GROUP BY
+        PH.PostId
+),
+QuestionAnswerEngagement AS (
+    -- CTE 3: Joins questions with their answers and their respective version histories.
+    SELECT
+        Q.Id AS QuestionId,
+        Q.Title AS QuestionTitle,
+        Q.OwnerUserId AS QuestionOwnerId,
+        Q.CreationDate AS QuestionCreationDate,
+        Q.Score AS QuestionScore,
+        Q.ViewCount,
+        Q.FavoriteCount,
+        Q.Tags,
+        A.Id AS AnswerId,
+        A.OwnerUserId AS AnswerOwnerId,
+        A.CreationDate AS AnswerCreationDate,
+        A.Score AS AnswerScore,
+        PVH_Q.TotalEdits AS QuestionEditCount,
+        PVH_A.TotalEdits AS AnswerEditCount,
+        COALESCE(Q.AcceptedAnswerId = A.Id, FALSE) AS IsAcceptedAnswer, -- NULL logic on boolean comparison
+        -- Window function: Ranks answers for each question by score (desc) then creation date (asc)
+        ROW_NUMBER() OVER (PARTITION BY Q.Id ORDER BY A.Score DESC, A.CreationDate ASC) AS Rn_BestAnswer,
+        -- Window function: Gets the creation date of the previous answer for the same question
+        LAG(A.CreationDate) OVER (PARTITION BY Q.Id ORDER BY A.CreationDate ASC) AS PreviousAnswerDate
+    FROM
+        Posts Q
+    LEFT JOIN Posts A ON Q.Id = A.ParentId AND A.PostTypeId = 2
+    LEFT JOIN PostVersionHistory PVH_Q ON Q.Id = PVH_Q.PostId
+    LEFT JOIN PostVersionHistory PVH_A ON A.Id = PVH_A.PostId
+    WHERE
+        Q.PostTypeId = 1
+),
+DetailedPostMetrics AS (
+    -- CTE 4: Enriches questions and answers with user engagement data, vote counts, and more window functions.
+    SELECT
+        QAE.QuestionId,
+        QAE.QuestionTitle,
+        QAE.QuestionOwnerId,
+        QAE.QuestionCreationDate,
+        QAE.QuestionScore,
+        QAE.ViewCount,
+        QAE.FavoriteCount,
+        QAE.Tags,
+        QAE.AnswerId,
+        QAE.AnswerOwnerId,
+        QAE.AnswerCreationDate,
+        QAE.AnswerScore,
+        QAE.IsAcceptedAnswer,
+        QAE.Rn_BestAnswer,
+        QAE.PreviousAnswerDate,
+        UE_Q.DisplayName AS QuestionOwnerDisplayName,
+        UE_Q.Reputation AS QuestionOwnerReputation,
+        UE_Q.UserCreationDate AS QOwnerUserCreationDate, -- Needed for correlated subquery later
+        UE_A.DisplayName AS AnswerOwnerDisplayName,
+        UE_A.Reputation AS AnswerOwnerReputation,
+        PVH.FirstClosedDate,
+        PVH.LastReopenedDate,
+        -- Non-correlated subquery: Count Question UpVotes
+        (SELECT COUNT(V.Id) FROM Votes V WHERE V.PostId = QAE.QuestionId AND V.VoteTypeId = 2) AS QuestionUpVotes,
+        -- Non-correlated subquery: Count Question DownVotes
+        (SELECT COUNT(V.Id) FROM Votes V WHERE V.PostId = QAE.QuestionId AND V.VoteTypeId = 3) AS QuestionDownVotes,
+        -- Window function: Average answer score by question owner
+        AVG(QAE.AnswerScore) OVER (PARTITION BY QAE.QuestionOwnerId) AS AvgAnswerScoreByQuestionOwner,
+        -- Window function: Cumulative sum of answer scores by question owner over time
+        SUM(QAE.AnswerScore) OVER (PARTITION BY QAE.QuestionOwnerId ORDER BY QAE.AnswerCreationDate) AS CumulativeAnswerScoreByQuestionOwner
+    FROM
+        QuestionAnswerEngagement QAE
+    LEFT JOIN UserEngagement UE_Q ON QAE.QuestionOwnerId = UE_Q.UserId
+    LEFT JOIN UserEngagement UE_A ON QAE.AnswerOwnerId = UE_A.UserId
+    LEFT JOIN PostVersionHistory PVH ON QAE.QuestionId = PVH.PostId
+    WHERE QAE.Rn_BestAnswer = 1 OR QAE.AnswerId IS NULL -- Focus on the best answer or questions with no answers
+),
+TagAnalysis AS (
+    -- CTE 5: Parses individual tags from posts, handling string manipulation.
+    SELECT
+        P.Id AS PostId,
+        -- String expressions: Extracts and cleans individual tags from the 'Tags' string
+        REPLACE(TRIM(unnest(string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><'))), '&amp;', '&') AS TagName
+    FROM
+        Posts P
+    WHERE
+        P.PostTypeId = 1 AND P.Tags IS NOT NULL
+),
+TopQuestionTags AS (
+    -- CTE 6: Identifies top-ranked tags based on usage and score.
+    SELECT
+        TA.TagName,
+        COUNT(DISTINCT TA.PostId) AS TaggedQuestionCount,
+        SUM(P.ViewCount) AS TotalTagViewCount,
+        SUM(P.Score) AS TotalTagScore,
+        -- Window function: Ranks tags by tagged question count, then total score
+        RANK() OVER (ORDER BY COUNT(DISTINCT TA.PostId) DESC, SUM(P.Score) DESC) AS TagRank
+    FROM
+        TagAnalysis TA
+    JOIN Posts P ON TA.PostId = P.Id
+    GROUP BY
+        TA.TagName
+    HAVING
+        COUNT(DISTINCT TA.PostId) > 10 -- Complicated predicate: filter out infrequent tags
+),
+UserPostLinkSummary AS (
+    -- CTE 7: Summarizes post link activities for users, identifying linked and duplicate posts.
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        COUNT(DISTINCT PL.PostId) AS LinkedPostsAsSource,
+        COUNT(DISTINCT PL.RelatedPostId) AS LinkedPostsAsTarget,
+        SUM(CASE WHEN LT.Name = 'Duplicate' THEN 1 ELSE 0 END) AS DuplicateLinksAsSource,
+        SUM(CASE WHEN LT.Name = 'Duplicate' THEN 1 ELSE 0 END) AS DuplicateLinksAsTarget
+    FROM
+        Users U
+    LEFT JOIN Posts P_Source ON U.Id = P_Source.OwnerUserId
+    LEFT JOIN PostLinks PL ON P_Source.Id = PL.PostId
+    LEFT JOIN LinkTypes LT ON PL.LinkTypeId = LT.Id
+    GROUP BY
+        U.Id, U.DisplayName
+)
+-- Main query: Combines all CTEs, applies complex filtering, calculations, and NULL logic.
+SELECT
+    DPM.QuestionId,
+    DPM.QuestionTitle,
+    DPM.QuestionOwnerDisplayName,
+    DPM.QuestionOwnerReputation,
+    UE_Q.TotalPosts AS QOwnerTotalPosts,
+    UE_Q.TotalQuestions AS QOwnerTotalQuestions,
+    UE_Q.TotalAnswers AS QOwnerTotalAnswers,
+    UE_Q.GoldBadgeCount AS QOwnerGoldBadges,
+    COALESCE(DPM.AnswerId, -1) AS BestAnswerId, -- NULL logic: replaces NULL answer ID with -1
+    COALESCE(DPM.AnswerOwnerDisplayName, 'No Answer User') AS BestAnswerOwnerDisplayName, -- NULL logic: replaces NULL display name with string
+    DPM.AnswerScore AS BestAnswerScore,
+    DPM.IsAcceptedAnswer,
+    DPM.QuestionCreationDate,
+    DPM.FirstClosedDate,
+    DPM.LastReopenedDate,
+    DPM.ViewCount,
+    DPM.FavoriteCount,
+    DPM.QuestionUpVotes,
+    DPM.QuestionDownVotes,
+    TQT.TagName AS TopTagForQuestion,
+    TQT.TaggedQuestionCount AS TopTagQuestionCount,
+    (DPM.QuestionUpVotes - DPM.QuestionDownVotes) AS NetQuestionVotes, -- Complicated calculation
+    -- Complicated calculation: Calculates months since creation, using date functions and arithmetic
+    CEIL(EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - DPM.QuestionCreationDate)) / (3600 * 24 * 30.5)) AS MonthsSinceCreation,
+    -- Complicated expression: Categorizes question status based on closed/reopened dates
+    CASE
+        WHEN DPM.FirstClosedDate IS NOT NULL AND DPM.LastReopenedDate IS NULL THEN 'Closed_Permanent'
+        WHEN DPM.FirstClosedDate IS NOT NULL AND DPM.LastReopenedDate IS NOT NULL AND DPM.LastReopenedDate > DPM.FirstClosedDate THEN 'Reopened'
+        WHEN DPM.FirstClosedDate IS NOT NULL THEN 'Closed_Temporary'
+        ELSE 'Open'
+    END AS QuestionStatus,
+    -- Complicated expression: Categorizes question based on score, views, and age
+    CASE
+        WHEN DPM.QuestionScore > 100 AND DPM.ViewCount > 10000 THEN 'Viral'
+        WHEN DPM.QuestionScore > 50 AND DPM.ViewCount > 5000 THEN 'Popular'
+        WHEN DPM.AnswerId IS NULL AND DPM.QuestionCreationDate < (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year') THEN 'Stale_Unanswered'
+        ELSE 'Normal'
+    END AS QuestionCategory,
+    -- NULL logic and arithmetic: Difference in reputation between question owner and best answerer
+    UE_Q.Reputation - COALESCE(UE_A.Reputation, 0) AS QOwnerReputationDifferenceToBestAnswerer,
+    -- Correlated subquery: Counts close votes by the question owner before this specific question's creation
+    (
+        SELECT COUNT(DISTINCT PH.PostId)
+        FROM PostHistory PH
+        WHERE PH.UserId = DPM.QuestionOwnerId -- Correlated part
+          AND PH.PostHistoryTypeId = 10 -- Post Closed event
+          AND PH.CreationDate BETWEEN DPM.QOwnerUserCreationDate AND DPM.QuestionCreationDate
+    ) AS QOwnerCloseVoteCountBeforeThisQuestion,
+    DPM.AvgAnswerScoreByQuestionOwner,
+    DPM.CumulativeAnswerScoreByQuestionOwner,
+    UPLS.LinkedPostsAsSource,
+    UPLS.DuplicateLinksAsSource,
+    -- Window function: Gets the creation date of the previous question by the same owner, with a default value for the first question
+    LAG(DPM.QuestionCreationDate, 1, '1900-01-01'::timestamp) OVER (PARTITION BY DPM.QuestionOwnerId ORDER BY DPM.QuestionCreationDate) AS PrevQuestionByOwnerDate
+FROM
+    DetailedPostMetrics DPM
+LEFT JOIN UserEngagement UE_Q ON DPM.QuestionOwnerId = UE_Q.UserId
+LEFT JOIN UserEngagement UE_A ON DPM.AnswerOwnerId = UE_A.UserId
+LEFT JOIN (
+    -- Subquery for filtering the top-ranked tag for each question
+    SELECT
+        TA.PostId,
+        TA.TagName
+    FROM
+        TagAnalysis TA
+    INNER JOIN TopQuestionTags TQT ON TA.TagName = TQT.TagName
+    WHERE
+        TQT.TagRank = 1
+) TQT ON DPM.QuestionId = TQT.PostId
+LEFT JOIN UserPostLinkSummary UPLS ON DPM.QuestionOwnerId = UPLS.UserId
+WHERE
+    -- Non-correlated subquery: Filters questions with scores above the recent average
+    DPM.QuestionScore >= (SELECT AVG(P.Score) FROM Posts P WHERE P.PostTypeId = 1 AND P.CreationDate > (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '3 months'))
+    AND DPM.ViewCount >= 100
+    -- Complex predicate with NULL logic
+    AND (
+        DPM.FavoriteCount IS NULL
+        OR DPM.FavoriteCount > 5
+        OR DPM.QuestionOwnerReputation > 5000
+    )
+    -- Correlated subquery (EXISTS): Ensures the question owner has at least one gold badge issued after their user creation
+    AND EXISTS (
+        SELECT 1 FROM Badges B
+        WHERE B.UserId = DPM.QuestionOwnerId
+          AND B.Class = 1 -- Gold Badge
+          AND B.Date >= DPM.QOwnerUserCreationDate
+    )
+
+UNION ALL -- Set operator: Combines results with another elaborate query for specific duplicate questions
+
+-- Branch for duplicate questions without an accepted answer that were closed
+SELECT
+    P_Dup.Id AS QuestionId,
+    P_Dup.Title AS QuestionTitle,
+    UE_Dup.DisplayName AS QuestionOwnerDisplayName,
+    UE_Dup.Reputation AS QuestionOwnerReputation,
+    UE_Dup.TotalPosts AS QOwnerTotalPosts,
+    UE_Dup.TotalQuestions AS QOwnerTotalQuestions,
+    UE_Dup.TotalAnswers AS QOwnerTotalAnswers,
+    UE_Dup.GoldBadgeCount AS QOwnerGoldBadges,
+    -1 AS BestAnswerId,
+    'N/A - Duplicate' AS BestAnswerOwnerDisplayName,
+    0 AS BestAnswerScore,
+    FALSE AS IsAcceptedAnswer,
+    P_Dup.CreationDate AS QuestionCreationDate,
+    PVH_Dup.FirstClosedDate,
+    PVH_Dup.LastReopenedDate,
+    P_Dup.ViewCount,
+    P_Dup.FavoriteCount,
+    -- Non-correlated subqueries for votes
+    (SELECT COUNT(V.Id) FROM Votes V WHERE V.PostId = P_Dup.Id AND V.VoteTypeId = 2) AS QuestionUpVotes,
+    (SELECT COUNT(V.Id) FROM Votes V WHERE V.PostId = P_Dup.Id AND V.VoteTypeId = 3) AS QuestionDownVotes,
+    NULL AS TopTagForQuestion,
+    NULL AS TopTagQuestionCount,
+    (SELECT COUNT(V.Id) FROM Votes V WHERE V.PostId = P_Dup.Id AND V.VoteTypeId = 2) - (SELECT COUNT(V.Id) FROM Votes V WHERE V.PostId = P_Dup.Id AND V.VoteTypeId = 3) AS NetQuestionVotes,
+    CEIL(EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - P_Dup.CreationDate)) / (3600 * 24 * 30.5)) AS MonthsSinceCreation,
+    'Duplicate_Question' AS QuestionStatus,
+    'Needs_Review' AS QuestionCategory,
+    NULL AS QOwnerReputationDifferenceToBestAnswerer,
+    -- Correlated subquery for close vote history for this branch
+    (
+        SELECT COUNT(DISTINCT PH_sub.PostId)
+        FROM PostHistory PH_sub
+        WHERE PH_sub.UserId = UE_Dup.UserId
+          AND PH_sub.PostHistoryTypeId = 10
+          AND PH_sub.CreationDate BETWEEN UE_Dup.FirstPostDate AND P_Dup.CreationDate
+    ) AS QOwnerCloseVoteCountBeforeThisQuestion,
+    NULL AS AvgAnswerScoreByQuestionOwner,
+    NULL AS CumulativeAnswerScoreByQuestionOwner,
+    UPLS_Dup.LinkedPostsAsSource,
+    UPLS_Dup.DuplicateLinksAsSource,
+    -- Window function for previous question by owner in this branch
+    LAG(P_Dup.CreationDate, 1, '1900-01-01'::timestamp) OVER (PARTITION BY P_Dup.OwnerUserId ORDER BY P_Dup.CreationDate) AS PrevQuestionByOwnerDate
+FROM
+    Posts P_Dup
+LEFT JOIN UserEngagement UE_Dup ON P_Dup.OwnerUserId = UE_Dup.UserId
+LEFT JOIN PostVersionHistory PVH_Dup ON P_Dup.Id = PVH_Dup.PostId
+LEFT JOIN UserPostLinkSummary UPLS_Dup ON P_Dup.OwnerUserId = UPLS_Dup.UserId
+WHERE
+    P_Dup.PostTypeId = 1
+    AND P_Dup.AcceptedAnswerId IS NULL
+    AND P_Dup.ClosedDate IS NOT NULL
+    -- EXISTS clause with non-correlated subquery to find duplicate link type ID
+    AND EXISTS (
+        SELECT 1 FROM PostLinks PL_Dup
+        WHERE PL_Dup.PostId = P_Dup.Id
+          AND PL_Dup.LinkTypeId = (SELECT Id FROM LinkTypes WHERE Name = 'Duplicate')
+    )
+    AND P_Dup.CreationDate > (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '2 years') -- Filter for recent duplicates
+ORDER BY
+    QuestionCreationDate DESC, NetQuestionVotes DESC;

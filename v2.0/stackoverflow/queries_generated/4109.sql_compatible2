@@ -1,0 +1,201 @@
+WITH
+  RankedPostEdits AS (
+    SELECT
+      ph.PostId,
+      ph.UserId,
+      ph.CreationDate,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn,
+      p.Title,
+      p.Tags,
+      p.PostTypeId,
+      p.OwnerUserId,
+      p.CommunityOwnedDate,
+      CASE WHEN ph.PostHistoryTypeId = 4 THEN 'Title Edit' WHEN ph.PostHistoryTypeId = 5 THEN 'Body Edit' WHEN ph.PostHistoryTypeId = 6 THEN 'Tags Edit' ELSE 'Other' END AS EditType
+    FROM
+      PostHistory ph
+      JOIN Posts p
+        ON ph.PostId = p.Id
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6)
+  ),
+  PostEditDifferences AS (
+    SELECT
+      re.PostId,
+      re.Title,
+      re.Tags,
+      re.PostTypeId,
+      re.OwnerUserId,
+      re.CommunityOwnedDate,
+      re.CreationDate,
+      LAG(re.CreationDate) OVER (PARTITION BY re.PostId ORDER BY re.CreationDate) AS PrevCreationDate
+    FROM
+      RankedPostEdits re
+  ),
+  PostEditStats AS (
+    SELECT
+      ped.PostId,
+      ped.Title,
+      ped.Tags,
+      ped.PostTypeId,
+      ped.OwnerUserId,
+      ped.CommunityOwnedDate,
+      COUNT(*) AS NumberOfEdits,
+      MAX(ped.CreationDate) AS LastEditDate,
+      AVG(EXTRACT(EPOCH FROM (ped.CreationDate - ped.PrevCreationDate))) AS AvgTimeBetweenEditsSeconds
+    FROM
+      PostEditDifferences ped
+    GROUP BY
+      ped.PostId,
+      ped.Title,
+      ped.Tags,
+      ped.PostTypeId,
+      ped.OwnerUserId,
+      ped.CommunityOwnedDate
+  ),
+  UserPostActivity AS (
+    SELECT
+      p.OwnerUserId,
+      COUNT(p.Id) AS TotalPostsOwned,
+      SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount
+    FROM
+      Posts p
+    WHERE
+      p.OwnerUserId IS NOT NULL
+      AND p.OwnerUserId > 0
+    GROUP BY
+      p.OwnerUserId
+  ),
+  QuestionVoteCounts AS (
+    SELECT
+      p.Id AS QuestionId,
+      COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVotes,
+      COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVotes
+    FROM
+      Posts p
+      JOIN Votes v
+        ON p.Id = v.PostId
+    WHERE
+      p.PostTypeId = 1
+    GROUP BY
+      p.Id
+  ),
+  MostActiveUsers AS (
+    SELECT
+      UserId,
+      COUNT(*) AS VoteCount,
+      ROW_NUMBER() OVER (ORDER BY COUNT(*) DESC) AS UserRank
+    FROM
+      Votes
+    WHERE
+      VoteTypeId IN (2, 3)
+    GROUP BY
+      UserId
+    HAVING
+      COUNT(*) > 50
+  ),
+  ModerationDifferences AS (
+    SELECT
+      ph.PostId,
+      ph.CreationDate,
+      LAG(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS PrevCreationDate,
+      ph.Id AS PhId
+    FROM
+      PostHistory ph
+    WHERE
+      ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20, 35, 36)
+  ),
+  ModerationStats AS (
+    SELECT
+      md.PostId,
+      COUNT(md.PhId) AS ModerationCount,
+      MAX(md.CreationDate) AS LastModerationDate,
+      AVG(EXTRACT(EPOCH FROM (md.CreationDate - md.PrevCreationDate))) AS AvgTimeBetweenModerationsSeconds
+    FROM
+      ModerationDifferences md
+    GROUP BY
+      md.PostId
+    HAVING
+      COUNT(md.PhId) > 10
+  )
+SELECT
+  pes.PostId,
+  pes.Title,
+  pes.Tags,
+  pes.PostTypeId,
+  pes.OwnerUserId,
+  u.DisplayName AS OwnerDisplayName,
+  pes.CommunityOwnedDate,
+  pes.NumberOfEdits,
+  pes.LastEditDate,
+  pes.AvgTimeBetweenEditsSeconds,
+  upa.TotalPostsOwned,
+  upa.QuestionCount,
+  upa.AnswerCount,
+  qvc.UpVotes AS QuestionUpVotes,
+  qvc.DownVotes AS QuestionDownVotes,
+  COALESCE(u.Reputation, 0) AS UserReputation,
+  CASE WHEN u.CreationDate < DATE '2010-01-01' THEN 'OldAccount' ELSE 'NewAccount' END AS AccountAgeCategory,
+  CASE WHEN pes.Title IS NULL THEN 'NoTitle' ELSE SUBSTRING(pes.Title FROM 1 FOR 30) END AS TruncatedTitle,
+  CASE WHEN pes.Tags LIKE '%<sql>%' THEN 'HasSQLTag' ELSE 'NoSQLTag' END AS SQLTagPresence,
+  CASE WHEN pes.CommunityOwnedDate IS NOT NULL THEN 'CommunityOwned' ELSE 'UserOwned' END AS OwnershipType,
+  mau.UserRank AS MostActiveUserRank,
+  NULL AS ModerationPostId,
+  NULL AS ModerationCount,
+  NULL AS LastModerationDate,
+  NULL AS AvgTimeBetweenModerationsSeconds
+FROM
+  PostEditStats pes
+LEFT JOIN
+  Users u
+  ON pes.OwnerUserId = u.Id
+LEFT JOIN
+  UserPostActivity upa
+  ON pes.OwnerUserId = upa.OwnerUserId
+LEFT JOIN
+  QuestionVoteCounts qvc
+  ON pes.PostId = qvc.QuestionId
+LEFT JOIN
+  MostActiveUsers mau
+  ON pes.OwnerUserId = mau.UserId
+WHERE
+  pes.NumberOfEdits > 2
+  AND (
+    pes.AvgTimeBetweenEditsSeconds IS NULL
+    OR pes.AvgTimeBetweenEditsSeconds < 86400
+  )
+  AND COALESCE(u.Location, 'Unknown') <> 'Unknown'
+  AND pes.PostTypeId IN (1, 2)
+
+UNION ALL
+
+SELECT
+  NULL AS PostId,
+  NULL AS Title,
+  NULL AS Tags,
+  NULL AS PostTypeId,
+  NULL AS OwnerUserId,
+  NULL AS OwnerDisplayName,
+  NULL AS CommunityOwnedDate,
+  NULL AS NumberOfEdits,
+  NULL AS LastEditDate,
+  NULL AS AvgTimeBetweenEditsSeconds,
+  NULL AS TotalPostsOwned,
+  NULL AS QuestionCount,
+  NULL AS AnswerCount,
+  NULL AS QuestionUpVotes,
+  NULL AS QuestionDownVotes,
+  NULL AS UserReputation,
+  NULL AS AccountAgeCategory,
+  NULL AS TruncatedTitle,
+  NULL AS SQLTagPresence,
+  NULL AS OwnershipType,
+  NULL AS MostActiveUserRank,
+  ms.PostId AS ModerationPostId,
+  ms.ModerationCount,
+  ms.LastModerationDate,
+  ms.AvgTimeBetweenModerationsSeconds
+FROM
+  ModerationStats ms
+ORDER BY
+  COALESCE(pes.LastEditDate, ms.LastModerationDate) DESC;

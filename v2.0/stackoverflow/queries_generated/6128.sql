@@ -1,0 +1,37 @@
+-- {"query": "6128.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-micro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 365} 
+
+SELECT 
+    u.DisplayName, 
+    p.Title, 
+    COUNT(DISTINCT v.Id) AS TotalVotes,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) AS LastClosedDate,
+    b.Name AS LatestBadge,
+    SUBSTRING_INDEX(GROUP_CONCAT(DISTINCT t.TagName ORDER BY t.TagName ASC SEPARATOR ','), ',', 10) AS TopTags
+FROM 
+    Users u
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN 
+    Tags t ON p.Id = t.ExcerptPostId
+WHERE 
+    u.Reputation > 1000
+    AND p.PostTypeId = 1
+    AND p.ViewCount > 100
+    AND p.Score > 0
+    AND p.LastActivityDate > DATE_SUB(NOW(), INTERVAL 1 YEAR)
+GROUP BY 
+    u.DisplayName, p.Title
+HAVING 
+    COUNT(DISTINCT v.Id) > 50
+ORDER BY 
+    TotalVotes DESC, 
+    u.Reputation DESC
+LIMIT 100;

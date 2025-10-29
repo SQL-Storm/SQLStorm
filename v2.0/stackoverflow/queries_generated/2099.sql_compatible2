@@ -1,0 +1,129 @@
+with recursive UserBadgeCounts as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    count(b.Id) filter (where b.Class = 1) as GoldBadges,
+    count(b.Id) filter (where b.Class = 2) as SilverBadges,
+    count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+    row_number() over (order by count(b.Id) desc, u.Reputation desc) as BadgeRank
+  from Users u
+  left join Badges b on u.Id = b.UserId
+  group by u.Id, u.DisplayName, u.Reputation
+), RecursiveBadgeRank as (
+  select UserId, DisplayName, GoldBadges, SilverBadges, BronzeBadges, BadgeRank
+  from UserBadgeCounts
+  where BadgeRank = 1
+  union all
+  select ubc.UserId, ubc.DisplayName, ubc.GoldBadges, ubc.SilverBadges, ubc.BronzeBadges, ubc.BadgeRank
+  from UserBadgeCounts ubc
+  join RecursiveBadgeRank rbr on ubc.BadgeRank = rbr.BadgeRank + 1
+  where ubc.BadgeRank <= 10
+), PostScoresWithRanks as (
+  select
+    p.Id,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    dense_rank() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as ScoreRank
+  from Posts p
+  where p.PostTypeId in (1,2) and p.Score is not null
+), TopPosts as (
+  select pswr.*
+  from PostScoresWithRanks pswr
+  where pswr.ScoreRank <= 50
+), PostCommentsAgg as (
+  select
+    c.PostId,
+    count(c.Id) as TotalComments,
+    max(c.CreationDate) as LastCommentDate,
+    -- use array_agg + array_to_string to emulate distinct-then-order-safe aggregation
+    array_to_string(array_agg(distinct coalesce(c.UserDisplayName, 'Anonymous') order by coalesce(c.UserDisplayName, 'Anonymous')), ',') as CommenterNames
+  from Comments c
+  group by c.PostId
+), AcceptedAnswerScores as (
+  select
+    p.Id as QuestionId,
+    a.Id as AcceptedAnswerId,
+    a.Score as AcceptedAnswerScore,
+    a.ViewCount as AcceptedAnswerViews
+  from Posts p
+  left join Posts a on p.AcceptedAnswerId = a.Id
+  where p.PostTypeId = 1
+), TagUsage as (
+  select
+    unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags) - 2), '><')) as TagName,
+    count(*) as TagCount,
+    max(p.CreationDate) as LastUsedAt
+  from Posts p
+  where p.PostTypeId = 1 and p.Tags is not null
+  group by unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags) - 2), '><'))
+), DuplicatePostPairs as (
+  select
+    pl.PostId,
+    pl.RelatedPostId,
+    pt1.Name as PostType,
+    pt2.Name as RelatedPostType
+  from PostLinks pl
+  join LinkTypes lt on pl.LinkTypeId = lt.Id and lt.Name = 'Duplicate'
+  join Posts p1 on pl.PostId = p1.Id
+  join Posts p2 on pl.RelatedPostId = p2.Id
+  join PostTypes pt1 on p1.PostTypeId = pt1.Id
+  join PostTypes pt2 on p2.PostTypeId = pt2.Id
+)
+select
+  rbr.BadgeRank,
+  rbr.DisplayName as UserName,
+  rbr.GoldBadges,
+  rbr.SilverBadges,
+  rbr.BronzeBadges,
+  tp.Id as PostId,
+  tp.PostTypeId,
+  tp.Score,
+  tp.ViewCount,
+  tp.CreationDate as PostCreatedAt,
+  pca.TotalComments,
+  pca.LastCommentDate,
+  pca.CommenterNames,
+  coalesce(aas.AcceptedAnswerScore, -1) as AcceptedAnswerScore,
+  coalesce(aas.AcceptedAnswerViews, -1) as AcceptedAnswerViews,
+  tu.TagName,
+  tu.TagCount,
+  tu.LastUsedAt,
+  dp.RelatedPostId as DuplicateOfPostId,
+  dp.PostType as DuplicatePostType,
+  dp.RelatedPostType as DuplicateRelatedPostType
+from RecursiveBadgeRank rbr
+left join Posts tp on tp.OwnerUserId = rbr.UserId and tp.PostTypeId in (1,2)
+left join PostCommentsAgg pca on tp.Id = pca.PostId
+left join AcceptedAnswerScores aas on tp.Id = aas.QuestionId
+left join TagUsage tu on tu.TagName = any(
+  select unnest(string_to_array(substring(tp.Tags from 2 for length(tp.Tags) - 2), '><'))
+)
+left join DuplicatePostPairs dp on dp.PostId = tp.Id
+where tp.Id is not null
+group by
+  rbr.BadgeRank,
+  rbr.DisplayName,
+  rbr.GoldBadges,
+  rbr.SilverBadges,
+  rbr.BronzeBadges,
+  tp.Id,
+  tp.PostTypeId,
+  tp.Score,
+  tp.ViewCount,
+  tp.CreationDate,
+  pca.TotalComments,
+  pca.LastCommentDate,
+  pca.CommenterNames,
+  aas.AcceptedAnswerScore,
+  aas.AcceptedAnswerViews,
+  tu.TagName,
+  tu.TagCount,
+  tu.LastUsedAt,
+  dp.RelatedPostId,
+  dp.PostType,
+  dp.RelatedPostType
+order by rbr.BadgeRank, tp.Score desc, tp.ViewCount desc
+limit 100;

@@ -1,0 +1,149 @@
+WITH UserPostAgg AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END)                                     AS QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END)                                     AS AnswerCount,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END)                                 AS AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END)                                 AS AvgAnswerScore,
+        SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END)                   AS AcceptedAnswerCount
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+UserBadgeAgg AS (
+    SELECT
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END)                                         AS GoldBadgeCount,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END)                                         AS SilverBadgeCount,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END)                                         AS BronzeBadgeCount,
+        STRING_AGG(DISTINCT b.Name, ', ') FILTER (WHERE b.Class = 1)                     AS GoldBadgeNames
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserTagAgg AS (
+    -- split tags like '<tag1><tag2>' into rows using a recursive CTE
+    SELECT
+        ut.UserId,
+        ut.Tag,
+        COUNT(*) AS TagUseCount
+    FROM (
+        SELECT
+            p.OwnerUserId AS UserId,
+            TRIM(BOTH '<>' FROM p.Tags) AS TagsInner
+        FROM Posts p
+        WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+    ) p
+    CROSS JOIN LATERAL (
+        WITH RECURSIVE split(str, rest) AS (
+            SELECT
+                NULL::text AS str,
+                p.TagsInner || '><' AS rest
+            UNION ALL
+            SELECT
+                SUBSTRING(rest FROM 1 FOR (CASE WHEN POSITION('><' IN rest) > 0 THEN POSITION('><' IN rest)-1 ELSE CHAR_LENGTH(rest) END)) AS str,
+                CASE WHEN POSITION('><' IN rest) > 0 THEN SUBSTRING(rest FROM POSITION('><' IN rest)+2) ELSE '' END AS rest
+            FROM split
+            WHERE rest <> ''
+        )
+        SELECT str AS Tag FROM split WHERE str IS NOT NULL AND str <> ''
+    ) ut(Tag)
+    GROUP BY ut.UserId, ut.Tag
+),
+UserTopTag AS (
+    SELECT
+        t.UserId,
+        t.Tag,
+        t.TagUseCount,
+        ROW_NUMBER() OVER (PARTITION BY t.UserId ORDER BY t.TagUseCount DESC, t.Tag)      AS rn
+    FROM UserTagAgg t
+),
+UserDupInfo AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(DISTINCT pl.RelatedPostId)                                            AS DuplicateLinkCount
+    FROM Posts p
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id AND pl.LinkTypeId = 3
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+Combined AS (
+    SELECT
+        u.Id,
+        COALESCE(u.DisplayName, 'Anonymous')                                         AS DisplayName,
+        u.Reputation,
+        COALESCE(up.QuestionCount, 0)                                                AS QuestionCount,
+        COALESCE(up.AnswerCount, 0)                                                  AS AnswerCount,
+        COALESCE(up.AvgQuestionScore, 0)                                             AS AvgQuestionScore,
+        COALESCE(up.AvgAnswerScore, 0)                                               AS AvgAnswerScore,
+        COALESCE(up.AcceptedAnswerCount, 0)                                          AS AcceptedAnswerCount,
+        COALESCE(ub.GoldBadgeCount, 0)                                               AS GoldBadgeCount,
+        COALESCE(ub.SilverBadgeCount, 0)                                             AS SilverBadgeCount,
+        COALESCE(ub.BronzeBadgeCount, 0)                                             AS BronzeBadgeCount,
+        ub.GoldBadgeNames,
+        COALESCE(ud.DuplicateLinkCount, 0)                                           AS DuplicateLinkCount,
+        tt.Tag                                                                       AS TopTag,
+        tt.TagUseCount                                                               AS TopTagUseCount,
+        CASE
+            WHEN u.Location IS NULL AND u.WebsiteUrl IS NOT NULL THEN 'HasWebsiteOnly'
+            WHEN u.Location IS NOT NULL AND u.WebsiteUrl IS NULL THEN 'HasLocationOnly'
+            WHEN u.Location IS NULL AND u.WebsiteUrl IS NULL THEN 'NoGeoInfo'
+            ELSE 'FullInfo'
+        END                                                                          AS GeoInfoFlag,
+        ('User_' || u.Id::text)                                                       AS UserKey,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.Id)                         AS ReputationRank
+    FROM Users u
+    LEFT JOIN UserPostAgg up ON up.UserId = u.Id
+    LEFT JOIN UserBadgeAgg ub ON ub.UserId = u.Id
+    LEFT JOIN UserDupInfo ud ON ud.UserId = u.Id
+    LEFT JOIN UserTopTag tt ON tt.UserId = u.Id AND tt.rn = 1
+    GROUP BY
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        up.QuestionCount,
+        up.AnswerCount,
+        up.AvgQuestionScore,
+        up.AvgAnswerScore,
+        up.AcceptedAnswerCount,
+        ub.GoldBadgeCount,
+        ub.SilverBadgeCount,
+        ub.BronzeBadgeCount,
+        ub.GoldBadgeNames,
+        ud.DuplicateLinkCount,
+        tt.Tag,
+        tt.TagUseCount,
+        u.Location,
+        u.WebsiteUrl
+)
+SELECT *
+FROM Combined
+WHERE ReputationRank <= 20
+  AND (QuestionCount + AnswerCount) > 10
+  AND GoldBadgeCount >= 1
+
+UNION ALL
+
+SELECT
+    NULL                                   AS Id,
+    'NoPosts'                              AS DisplayName,
+    NULL                                   AS Reputation,
+    0                                      AS QuestionCount,
+    0                                      AS AnswerCount,
+    0                                      AS AvgQuestionScore,
+    0                                      AS AvgAnswerScore,
+    0                                      AS AcceptedAnswerCount,
+    COALESCE(b.GoldBadgeCount, 0)          AS GoldBadgeCount,
+    COALESCE(b.SilverBadgeCount, 0)        AS SilverBadgeCount,
+    COALESCE(b.BronzeBadgeCount, 0)        AS BronzeBadgeCount,
+    b.GoldBadgeNames,
+    0                                      AS DuplicateLinkCount,
+    NULL                                   AS TopTag,
+    NULL                                   AS TopTagUseCount,
+    'BadgeOnly'                            AS GeoInfoFlag,
+    ('BadgeUser_' || COALESCE(b.UserId,0)::text) AS UserKey,
+    NULL                                   AS ReputationRank
+FROM UserBadgeAgg b
+WHERE NOT EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = b.UserId)
+  AND b.GoldBadgeCount > 0
+
+ORDER BY ReputationRank NULLS LAST, GoldBadgeCount DESC;

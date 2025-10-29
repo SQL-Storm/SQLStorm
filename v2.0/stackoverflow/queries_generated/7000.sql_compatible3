@@ -1,0 +1,114 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.Title,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        U.DisplayName,
+        U.Reputation,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.ViewCount DESC) AS rank
+    FROM 
+        Posts P
+    JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId IN (1, 2) AND P.Score > 0
+),
+BadgeCounts AS (
+    SELECT 
+        U.Id AS UserId, 
+        U.DisplayName, 
+        COUNT(B.Id) AS BadgeCount
+    FROM 
+        Users U
+    JOIN 
+        Badges B ON U.Id = B.UserId
+    GROUP BY 
+        U.Id, U.DisplayName
+),
+CommentStats AS (
+    SELECT 
+        PC.Id AS PostId,
+        COUNT(C.Id) AS CommentCount,
+        SUM(C.Score) AS TotalCommentScore
+    FROM 
+        Posts PC
+    LEFT JOIN 
+        Comments C ON PC.Id = C.PostId
+    GROUP BY 
+        PC.Id
+),
+TagRows AS (
+    SELECT
+        P.Id AS PostId,
+        TRIM(tag) AS TagName
+    FROM Posts P,
+    LATERAL (
+        SELECT
+            CASE
+                WHEN elem = '' THEN NULL
+                WHEN LEFT(elem,1) = '<' AND RIGHT(elem,1) = '>' THEN SUBSTR(elem,2,LENGTH(elem)-2)
+                WHEN LEFT(elem,1) = '<' THEN SUBSTR(elem,2)
+                WHEN RIGHT(elem,1) = '>' THEN SUBSTR(elem,1,LENGTH(elem)-1)
+                ELSE elem
+            END AS tag
+        FROM (
+            WITH RECURSIVE split(idx, rest, piece) AS (
+                SELECT 1 AS idx,
+                       CAST(P.Tags AS VARCHAR(4000)) AS rest,
+                       NULL AS piece
+                UNION ALL
+                SELECT idx + 1,
+                       CASE
+                         WHEN POSITION('><' IN rest) > 0 THEN SUBSTR(rest, POSITION('><' IN rest) + 2)
+                         ELSE ''
+                       END,
+                       CASE
+                         WHEN POSITION('><' IN rest) > 0 THEN SUBSTR(rest, 1, POSITION('><' IN rest) - 1)
+                         ELSE rest
+                       END
+                FROM split
+                WHERE rest <> '' AND rest IS NOT NULL AND POSITION('><' IN rest) > 0
+            )
+            SELECT piece AS elem FROM split WHERE piece IS NOT NULL
+            UNION ALL
+            SELECT CASE WHEN P.Tags = '' THEN NULL ELSE P.Tags END
+        ) s
+    ) x
+    WHERE tag IS NOT NULL AND tag <> ''
+)
+SELECT 
+    RP.Id AS PostId,
+    RP.Title,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.rank,
+    RP.DisplayName,
+    RP.Reputation,
+    CS.CommentCount,
+    CS.TotalCommentScore,
+    BC.BadgeCount,
+    CASE
+        WHEN RP.Score > 100 THEN 'High'
+        WHEN RP.Score BETWEEN 50 AND 100 THEN 'Medium'
+        ELSE 'Low'
+    END AS ScoreTier,
+    STRING_AGG(DISTINCT TR.TagName, ', ' ORDER BY TR.TagName) AS Tags
+FROM 
+    RankedPosts RP
+LEFT JOIN 
+    CommentStats CS ON RP.Id = CS.PostId
+LEFT JOIN 
+    BadgeCounts BC ON RP.DisplayName = BC.DisplayName
+LEFT JOIN 
+    Posts P ON RP.Id = P.Id
+LEFT JOIN 
+    Tags T ON P.Id = T.ExcerptPostId
+LEFT JOIN 
+    TagRows TR ON RP.Id = TR.PostId
+GROUP BY 
+    RP.Id, RP.Title, RP.Score, RP.ViewCount, RP.CreationDate, RP.rank, RP.DisplayName, RP.Reputation, CS.CommentCount, CS.TotalCommentScore, BC.BadgeCount
+ORDER BY 
+    RP.rank, RP.Score DESC;

@@ -1,0 +1,159 @@
+-- {"query": "1623.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2800} 
+WITH UserActivityStats AS (
+    -- Aggregates user post and comment activity, including first/last interaction dates and counts of answers accepted for the user's questions
+    SELECT
+        U.Id AS UserId,
+        COUNT(P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COUNT(C.Id) AS TotalComments,
+        SUM(P.Score) AS TotalPostScore,
+        AVG(P.Score) AS AvgPostScore,
+        MIN(P.CreationDate) AS FirstPostDate,
+        MAX(P.LastActivityDate) AS LastPostActivityDate,
+        -- Count of answers (authored by others) that were accepted for this user's questions
+        COUNT(DISTINCT P_Accept.Id) AS AnswersAcceptedForUserQuestions
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Posts P_Accept ON P_Accept.Id = P.AcceptedAnswerId AND P.PostTypeId = 1
+    GROUP BY U.Id
+),
+PostEditActivity AS (
+    -- Tracks editing activity for posts, identifies comments made after edits, and ranks posts by score for each user
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        COUNT(PH.Id) AS TotalPostHistoryEvents,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4,5,6) THEN 1 ELSE 0 END) AS EditCount, -- Title, Body, Tags edits
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (10,12) THEN 1 ELSE 0 END) AS CloseDeleteCount, -- Post Closed or Post Deleted
+        MAX(PH.CreationDate) AS LastEditDate,
+        -- Correlated subquery: Count new comments made on this post *after* its last known edit date
+        (SELECT COUNT(C_sub.Id)
+         FROM Comments C_sub
+         WHERE C_sub.PostId = P.Id
+           AND C_sub.CreationDate > P.LastEditDate) AS NewCommentsAfterLastEdit,
+        -- Window function: Rank each user's posts by their score (descending) and creation date (descending)
+        RANK() OVER (PARTITION BY P.OwnerUserId ORDER BY P.Score DESC, P.CreationDate DESC) AS UserPostRankByScore
+    FROM Posts P
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    GROUP BY P.Id, P.OwnerUserId, P.Score, P.CreationDate, P.LastEditDate
+),
+UserBadgeSummary AS (
+    -- Summarizes badge counts by class and calculates average time (in seconds) since a gold badge was awarded
+    SELECT
+        U.Id AS UserId,
+        COUNT(B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(B.Date) AS LatestBadgeDate,
+        -- Calculation: Average time (in seconds) since a gold badge was awarded, handling division by zero with NULLIF
+        COALESCE(SUM(CASE WHEN B.Class = 1 THEN EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - B.Date)) ELSE NULL END) / NULLIF(SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END), 0), 0) AS AvgTimeSinceGoldBadgeSeconds
+    FROM Users U
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id
+),
+ProblematicPostIds AS (
+    -- Set operator (UNION ALL) to identify posts that were closed then later reopened OR deleted then later undeleted
+    SELECT PH.PostId
+    FROM PostHistory PH
+    WHERE PH.PostHistoryTypeId = 10 -- Post Closed
+      AND EXISTS (SELECT 1 FROM PostHistory PH2 WHERE PH2.PostId = PH.PostId AND PH2.PostHistoryTypeId = 11 AND PH2.CreationDate > PH.CreationDate)
+    UNION ALL
+    SELECT PH.PostId
+    FROM PostHistory PH
+    WHERE PH.PostHistoryTypeId = 12 -- Post Deleted
+      AND EXISTS (SELECT 1 FROM PostHistory PH3 WHERE PH3.PostId = PH.PostId AND PH3.PostHistoryTypeId = 13 AND PH3.CreationDate > PH.CreationDate)
+)
+SELECT
+    U.Id AS UserIdentifier,
+    COALESCE(U.DisplayName, 'Anonymous User') AS UserDisplayName,
+    U.Reputation,
+    U.Views AS UserProfileViews,
+    UAS.TotalPosts,
+    UAS.TotalQuestions,
+    UAS.TotalAnswers,
+    UAS.TotalComments,
+    COALESCE(UAS.AvgPostScore, 0.0) AS UserAvgPostScore,
+    UBS.GoldBadges,
+    UBS.SilverBadges,
+    UBS.BronzeBadges,
+    UBS.AvgTimeSinceGoldBadgeSeconds,
+    P.Id AS PostId,
+    COALESCE(P.Title, 'No Title Provided') AS PostTitle,
+    PT.Name AS PostTypeName,
+    P.Score AS PostScore,
+    P.ViewCount AS PostViewCount,
+    P.CommentCount AS PostCommentCount,
+    P.FavoriteCount AS PostFavoriteCount,
+    -- Complicated CASE expression for determining detailed post status
+    CASE
+        WHEN P.AcceptedAnswerId IS NOT NULL THEN 'HasAcceptedAnswer'
+        WHEN P.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN P.CommunityOwnedDate IS NOT NULL THEN 'CommunityWiki'
+        WHEN P.CreationDate > (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '7 days') AND P.CommentCount = 0 THEN 'RecentNoEngagement'
+        ELSE 'Open'
+    END AS PostStatusDetail,
+    P.CreationDate AS PostCreationDate,
+    P.LastActivityDate AS PostLastActivityDate,
+    PEA.TotalPostHistoryEvents,
+    PEA.EditCount,
+    PEA.CloseDeleteCount,
+    PEA.NewCommentsAfterLastEdit AS CommentsAfterLastEdit,
+    COALESCE(U.Location, 'Unspecified Location') AS UserLocation,
+    SUBSTRING(COALESCE(U.AboutMe, 'No "About Me" provided.'), 1, 150) AS AboutMeSnippet,
+    -- Window function: Rank users by reputation within their reported location
+    ROW_NUMBER() OVER (PARTITION BY U.Location ORDER BY U.Reputation DESC, U.CreationDate) AS UserRankInSpecificLocation,
+    -- Window function: Get the creation date of the previous post by the same user
+    LAG(P.CreationDate) OVER (PARTITION BY U.Id ORDER BY P.CreationDate) AS PreviousPostCreationDateForUser,
+    -- Correlated Subquery: Average score of comments made by the post owner on this specific post within 1 month after its last edit
+    (SELECT AVG(C_sub.Score)
+     FROM Comments C_sub
+     WHERE C_sub.PostId = P.Id
+       AND C_sub.UserId = P.OwnerUserId -- User who owns the post
+       AND C_sub.CreationDate BETWEEN PEA.LastEditDate AND (PEA.LastEditDate + INTERVAL '1 month')) AS AvgOwnerCommentScoreAfterEdit,
+    -- String operations and NULL logic
+    UPPER(LEFT(COALESCE(U.DisplayName, 'UNKNOWN_DISPLAY_NAME'), 5)) AS DisplayNamePrefixFiveChars,
+    TRIM(REPLACE(REPLACE(P.Tags, '>', ' '), '<', '')) AS SpaceSeparatedTags, -- Cleans tags from '<' and '>'
+    CASE WHEN PPI.PostId IS NOT NULL THEN 'TRUE' ELSE 'FALSE' END AS IsProblematicPostFlag, -- Flags posts from the ProblematicPostIds CTE
+    DATE_PART('day', cast('2024-10-01 12:34:56' as timestamp) - U.CreationDate) AS UserAgeInDays, -- User's age in days
+    DATE_PART('hour', P.LastActivityDate - P.CreationDate) AS PostActivityDurationHours, -- Duration from post creation to last activity
+    COALESCE(PL.LinkTypeId, -1) AS RelatedLinkType -- Example of including a link type if present
+FROM Users U
+LEFT JOIN UserActivityStats UAS ON U.Id = UAS.UserId
+LEFT JOIN UserBadgeSummary UBS ON U.Id = UBS.UserId
+LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+LEFT JOIN PostTypes PT ON P.PostTypeId = PT.Id
+LEFT JOIN PostEditActivity PEA ON P.Id = PEA.PostId
+LEFT JOIN ProblematicPostIds PPI ON P.Id = PPI.PostId
+LEFT JOIN PostLinks PL ON P.Id = PL.PostId -- Example of an additional join for variety
+WHERE U.Reputation > 7500
+  AND U.LastAccessDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '6 months') -- Users active in the last 6 months
+  AND (UBS.GoldBadges >= 3 OR UBS.SilverBadges >= 7) -- Users with significant badge achievements (NULL logic here too for users without badges)
+  AND P.PostTypeId IN (1, 2) -- Only questions and answers
+  AND P.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '2 years') -- Posts created in the last 2 years
+  AND P.Score > 5
+  AND P.ViewCount > 500
+  AND (P.Tags LIKE '%<performance>%' OR P.Tags LIKE '%<optimization>%' OR P.Tags LIKE '%<benchmark>%') -- Posts tagged with performance-related tags
+  AND U.AboutMe IS NOT NULL AND LENGTH(U.AboutMe) > 100 -- Users with substantial "About Me" sections
+  AND P.Body LIKE '%resource allocation%' -- Specific phrase in post body to filter relevant content
+  AND PEA.EditCount > 1 -- Post edited more than once
+  AND PEA.UserPostRankByScore <= 3 -- Only consider top 3 posts by score for each user to focus on significant contributions
+  AND (P.ClosedDate IS NULL OR P.ClosedDate > (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year')) -- Exclude very old closed posts
+  AND NOT EXISTS (SELECT 1 FROM Comments C_ex WHERE C_ex.PostId = P.Id AND C_ex.Text LIKE '%spam%') -- Exclude posts with comments containing 'spam'
+GROUP BY
+    U.Id, U.DisplayName, U.Reputation, U.Views, UAS.TotalPosts, UAS.TotalQuestions, UAS.TotalAnswers,
+    UAS.TotalComments, UAS.AvgPostScore, UBS.GoldBadges, UBS.SilverBadges, UBS.BronzeBadges,
+    UBS.AvgTimeSinceGoldBadgeSeconds, P.Id, P.Title, PT.Name, P.Score, P.ViewCount, P.CommentCount, P.FavoriteCount,
+    P.AcceptedAnswerId, P.ClosedDate, P.CommunityOwnedDate, P.CreationDate, P.LastActivityDate,
+    PEA.TotalPostHistoryEvents, PEA.EditCount, PEA.CloseDeleteCount, PEA.NewCommentsAfterLastEdit,
+    U.Location, U.AboutMe, P.Tags, PEA.LastEditDate, PPI.PostId, P.OwnerUserId, PL.LinkTypeId
+HAVING
+    SUM(PEA.NewCommentsAfterLastEdit) >= 1 -- At least one comment after the last edit for any of their posts
+    AND AVG(P.Score) > 15 -- Average score of filtered posts for the user must be > 15
+    AND COUNT(P.Id) >= 3 -- At least 3 posts matching criteria per user for a user to be considered
+    AND SUM(CASE WHEN P.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) >= 1 -- At least one accepted answer among the posts, demonstrating problem-solving
+ORDER BY
+    U.Reputation DESC, UBS.GoldBadges DESC, UserAvgPostScore DESC, PostScore DESC
+LIMIT 500;

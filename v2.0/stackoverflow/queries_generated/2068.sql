@@ -1,0 +1,167 @@
+-- {"query": "2068.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1508} 
+
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        COALESCE(pt.ParentId, 0) as ParentTagId
+    FROM Tags t
+    LEFT JOIN Posts pt ON pt.Id = t.ExcerptPostId
+    WHERE t.IsModeratorOnly = 0
+
+    UNION ALL
+
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        rh.ParentTagId
+    FROM Tags t
+    JOIN RecursiveTagHierarchy rh ON rh.ParentTagId = t.Id
+), UserBadgeAggregates AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COALESCE(MAX(b.Date), u.CreationDate) AS LastBadgeDate
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.CreationDate
+), PostVotes AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        ROW_NUMBER() OVER(PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS RecentPostRank
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    WHERE p.PostTypeId IN (1, 2) -- Questions or Answers only
+    GROUP BY p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Tags
+), UserRecentPosts AS (
+    SELECT
+        pv.OwnerUserId,
+        COUNT(*) AS RecentPostsCount,
+        SUM(pv.UpVotes) AS RecentPostUpVotes,
+        SUM(pv.DownVotes) AS RecentPostDownVotes,
+        AVG(pv.ViewCount) AS AvgViewCount,
+        STRING_AGG(DISTINCT COALESCE(NULLIF(pv.Tags, ''), '<no-tags>'), ',' ORDER BY pv.CreationDate DESC) AS RecentTags
+    FROM PostVotes pv
+    WHERE pv.RecentPostRank <= 5
+    GROUP BY pv.OwnerUserId
+), CloseReasonCount AS (
+    SELECT
+        ph.UserId,
+        ph.Comment AS CloseReasonId,
+        COUNT(*) AS CloseCount
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10 -- Post Closed
+      AND ph.UserId IS NOT NULL
+    GROUP BY ph.UserId, ph.Comment
+), DuplicatePostCounts AS (
+    SELECT
+        pl.PostId,
+        COUNT(*) FILTER (WHERE lt.Name = 'Duplicate') AS DuplicateCount
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    GROUP BY pl.PostId
+), RankedAnswers AS (
+    SELECT
+        p.Id,
+        p.ParentId,
+        p.Score,
+        p.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS AnswerRank
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+), UserAnswerStats AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(a.Id) AS TotalAnswers,
+        AVG(a.Score) AS AvgAnswerScore,
+        SUM(CASE WHEN a.Rank = 1 THEN 1 ELSE 0 END) AS TopRankedAnswers
+    FROM Users u
+    LEFT JOIN (
+        SELECT
+            a.Id,
+            a.OwnerUserId,
+            a.Score,
+            a.CreationDate,
+            ra.AnswerRank AS Rank
+        FROM Posts a
+        JOIN RankedAnswers ra ON ra.Id = a.Id
+        WHERE a.PostTypeId = 2
+    ) a ON a.OwnerUserId = u.Id
+    GROUP BY u.Id
+)
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    uba.GoldBadges,
+    uba.SilverBadges,
+    uba.BronzeBadges,
+    COALESCE(urb.RecentPostsCount, 0) AS RecentPosts,
+    COALESCE(urb.RecentPostUpVotes, 0) AS RecentPostUpVotes,
+    COALESCE(urb.RecentPostDownVotes, 0) AS RecentPostDownVotes,
+    COALESCE(urb.AvgViewCount, 0) AS AvgViewCount,
+    COALESCE(urb.RecentTags, '') AS RecentPostTags,
+    uas.TotalAnswers,
+    ROUND(COALESCE(uas.AvgAnswerScore, 0), 2) AS AvgAnswerScore,
+    COALESCE(uas.TopRankedAnswers, 0) AS TopRankedAnswers,
+    cr.CloseReasonId,
+    cr.CloseCount,
+    CASE 
+        WHEN u.WebsiteUrl IS NOT NULL AND u.WebsiteUrl LIKE '%stackexchange%' THEN 'SE Network'
+        WHEN u.WebsiteUrl IS NOT NULL THEN 'Other Website'
+        ELSE 'No Website'
+    END AS WebsiteCategory,
+    CASE 
+        WHEN LENGTH(u.AboutMe) > 0 THEN LEFT(u.AboutMe, 200)
+        ELSE 'No AboutMe'
+    END AS AboutMeSnippet,
+    COALESCE(dup.DuplicateCount, 0) AS TotalDuplicatesLinked
+FROM Users u
+LEFT JOIN UserBadgeAggregates uba ON uba.UserId = u.Id
+LEFT JOIN UserRecentPosts urb ON urb.OwnerUserId = u.Id
+LEFT JOIN UserAnswerStats uas ON uas.UserId = u.Id
+LEFT JOIN CloseReasonCount cr ON cr.UserId = u.Id
+LEFT JOIN (
+    SELECT 
+        pl.PostId,
+        COUNT(*) FILTER (WHERE lt.Name = 'Duplicate') AS DuplicateCount
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    GROUP BY pl.PostId
+) dup ON dup.PostId = (
+    SELECT p.Id
+    FROM Posts p
+    WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1
+    ORDER BY p.CreationDate DESC
+    LIMIT 1
+)
+WHERE u.Reputation > 100
+AND (
+    EXISTS (
+        SELECT 1
+        FROM Posts p2
+        WHERE p2.OwnerUserId = u.Id AND p2.ViewCount > 1000
+    )
+    OR u.Id IN (
+        SELECT ph.UserId
+        FROM PostHistory ph
+        WHERE ph.PostHistoryTypeId = 10
+        AND ph.UserId = u.Id
+        LIMIT 1
+    )
+)
+ORDER BY u.Reputation DESC, uba.GoldBadges DESC, RecentPosts DESC
+LIMIT 100;

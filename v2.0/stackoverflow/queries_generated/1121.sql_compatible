@@ -1,0 +1,155 @@
+WITH RecentUserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(DISTINCT p.Id) AS PostsCount,
+        COUNT(DISTINCT c.Id) AS CommentsCount,
+        COUNT(DISTINCT ph.Id) AS EditsCount,
+        MAX(GREATEST(
+            COALESCE(p.LastActivityDate, CAST('1900-01-01' AS TIMESTAMP)),
+            COALESCE(c.CreationDate, CAST('1900-01-01' AS TIMESTAMP)),
+            COALESCE(ph.CreationDate, CAST('1900-01-01' AS TIMESTAMP))
+        )) AS LastActivityDate_UserContent
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year')
+    LEFT JOIN Comments c ON u.Id = c.UserId AND c.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year')
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId AND ph.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year')
+    GROUP BY u.Id
+    HAVING COUNT(DISTINCT p.Id) + COUNT(DISTINCT c.Id) + COUNT(DISTINCT ph.Id) > 0
+),
+ClosedDuplicateQuestions AS (
+    SELECT DISTINCT
+        p.OwnerUserId AS QuestionOwnerId,
+        ph.PostId AS ClosedQuestionId,
+        ph.CreationDate AS ClosureDate
+    FROM Posts p
+    JOIN PostHistory ph ON p.Id = ph.PostId
+    WHERE ph.PostHistoryTypeId = 10
+      AND (ph.Comment = '101' OR ph.Comment = '1')
+      AND p.PostTypeId = 1
+      AND ph.Text IS NOT NULL
+      AND ph.Text LIKE '%OriginalQuestionIds%'
+),
+UserAnswerStats AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(p.Id) AS TotalAnswers,
+        AVG(p.Score) AS AverageAnswerScore,
+        SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS AcceptedAnswersCount
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+      AND p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+UserBadgeSummary AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserQuestionTagAnalysis AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(DISTINCT tag_value) AS DistinctTagsUsedInQuestions,
+        STRING_AGG(DISTINCT tag_value, ', ' ORDER BY tag_value) AS TopTagsString
+    FROM Posts p
+    CROSS JOIN LATERAL (
+        SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags)-2), '><')) AS tag_value
+    ) t
+    WHERE p.PostTypeId = 1
+      AND p.OwnerUserId IS NOT NULL
+      AND p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2
+    GROUP BY p.OwnerUserId
+),
+GlobalPostStats AS (
+    SELECT
+        AVG(p.Score) AS AvgGlobalPostScore,
+        AVG(p.ViewCount) AS AvgGlobalPostViewCount,
+        AVG(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - p.CreationDate)) / (60*60*24)) AS AvgPostAgeDays
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+)
+SELECT
+    u.Id AS UserId,
+    COALESCE(u.DisplayName, 'Anonymous User') AS UserName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    COALESCE(SUBSTRING(u.Location FROM 1 FOR 50), 'Unknown Location') AS UserLocation,
+    COALESCE(u.WebsiteUrl, 'N/A') AS UserWebsite,
+    SUBSTRING(COALESCE(u.AboutMe, ''), 1, 100) AS UserAboutMeSnippet,
+    ua.PostsCount AS RecentPostsCount,
+    ua.CommentsCount AS RecentCommentsCount,
+    ua.EditsCount AS RecentEditsCount,
+    EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - u.LastAccessDate)) AS DaysSinceLastAccess,
+    COALESCE(uas.TotalAnswers, 0) AS UserTotalAnswers,
+    COALESCE(uas.AverageAnswerScore, 0.0) AS UserAverageAnswerScore,
+    COALESCE(uas.AcceptedAnswersCount, 0) AS UserAcceptedAnswersCount,
+    COALESCE(ubs.GoldBadges, 0) AS UserGoldBadges,
+    COALESCE(ubs.SilverBadges, 0) AS UserSilverBadges,
+    COALESCE(ubs.BronzeBadges, 0) AS UserBronzeBadges,
+    COALESCE(uqta.DistinctTagsUsedInQuestions, 0) AS UserDistinctQuestionTags,
+    uqta.TopTagsString AS UserTopQuestionTagsSummary,
+    COUNT(DISTINCT cdq.ClosedQuestionId) AS QuestionsClosedAsDuplicateCount,
+    (
+        SELECT COUNT(p_sub.Id)
+        FROM Posts p_sub
+        WHERE p_sub.OwnerUserId = u.Id
+          AND p_sub.PostTypeId = 1
+          AND p_sub.ViewCount > gps.AvgGlobalPostViewCount
+          AND p_sub.Score > (
+                SELECT COALESCE(AVG(p_score_sub.Score), 0)
+                FROM Posts p_score_sub
+                WHERE p_score_sub.OwnerUserId = u.Id AND p_score_sub.PostTypeId = 1
+            )
+    ) AS HighPerformingQuestionsCount,
+    (
+        SELECT COALESCE(AVG(p_sub.Score), 0.0)
+        FROM Posts p_sub
+        WHERE p_sub.OwnerUserId = u.Id
+          AND p_sub.PostTypeId = 2
+          AND p_sub.CreationDate BETWEEN (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6 months') AND CAST('2024-10-01 12:34:56' AS TIMESTAMP)
+    ) AS AverageAnswerScoreLast6Months,
+    gps.AvgGlobalPostScore,
+    gps.AvgGlobalPostViewCount,
+    gps.AvgPostAgeDays,
+    CASE
+        WHEN u.Location IS NULL OR TRIM(u.Location) = '' THEN 'No Location'
+        WHEN LOWER(u.Location) LIKE '%london%' OR LOWER(u.Location) LIKE '%uk%' OR LOWER(u.Location) LIKE '%england%' THEN 'UK Based'
+        WHEN LOWER(u.Location) LIKE '%usa%' OR LOWER(u.Location) LIKE '%united states%' OR LOWER(u.Location) LIKE '%america%' THEN 'US Based'
+        ELSE 'Other International'
+    END AS UserRegionCategory,
+    COALESCE(NULLIF(LENGTH(TRIM(u.AboutMe)), 0), 0) AS AboutMeTextLength,
+    (u.UpVotes - u.DownVotes) AS NetVotes,
+    (u.Views * 1.0 / GREATEST(1.0, COALESCE(uas.TotalAnswers, 0.0) + COALESCE(ua.PostsCount, 0.0))) AS ViewToContributionRatio,
+    RANK() OVER (
+        ORDER BY
+            u.Reputation DESC,
+            COALESCE(uas.AverageAnswerScore, 0.0) DESC,
+            COUNT(DISTINCT cdq.ClosedQuestionId) DESC,
+            COALESCE(ubs.GoldBadges, 0) DESC
+    ) AS UserOverallRank
+FROM Users u
+INNER JOIN RecentUserActivity ua ON u.Id = ua.UserId
+LEFT JOIN UserAnswerStats uas ON u.Id = uas.UserId
+LEFT JOIN UserBadgeSummary ubs ON u.Id = ubs.UserId
+LEFT JOIN UserQuestionTagAnalysis uqta ON u.Id = uqta.UserId
+LEFT JOIN ClosedDuplicateQuestions cdq ON u.Id = cdq.QuestionOwnerId
+CROSS JOIN GlobalPostStats gps
+WHERE u.Reputation >= 5000
+  AND u.LastAccessDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '3 months')
+  AND u.DisplayName IS NOT NULL AND TRIM(u.DisplayName) != ''
+  AND EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1)
+GROUP BY
+    u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Location, u.WebsiteUrl, u.AboutMe,
+    ua.PostsCount, ua.CommentsCount, ua.EditsCount,
+    uas.TotalAnswers, uas.AverageAnswerScore, uas.AcceptedAnswersCount,
+    ubs.GoldBadges, ubs.SilverBadges, ubs.BronzeBadges,
+    uqta.DistinctTagsUsedInQuestions, uqta.TopTagsString,
+    gps.AvgGlobalPostScore, gps.AvgGlobalPostViewCount, gps.AvgPostAgeDays,
+    u.UpVotes, u.DownVotes, u.Views
+HAVING COUNT(DISTINCT cdq.ClosedQuestionId) > 0
+ORDER BY UserOverallRank ASC, QuestionsClosedAsDuplicateCount DESC
+LIMIT 100;

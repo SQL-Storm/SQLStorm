@@ -1,0 +1,148 @@
+-- {"query": "5026.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1131} 
+WITH
+-- Recent activity per post with various joins to enrich data
+RecentActivity AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.PostTypeId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    u.DisplayName AS OwnerDisplayName,
+    p.Tags,
+    p.AcceptedAnswerId,
+    -- computed metrics
+    COUNT(CASE WHEN v.VoteTypeId IN (2) THEN 1 END) AS UpVotes,
+    COUNT(CASE WHEN v.VoteTypeId IN (3) THEN 1 END) AS DownVotes,
+    MAX(CASE WHEN v.VoteTypeId IN (2,3) THEN v.CreationDate END) AS LastVoteDate
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON p.Id = v.PostId
+  WHERE p.PostTypeId IN (1,2) -- questions and answers
+  GROUP BY
+    p.Id, p.Title, p.PostTypeId, p.CreationDate, p.LastActivityDate,
+    p.Score, p.ViewCount, p.OwnerUserId, u.DisplayName, p.Tags, p.AcceptedAnswerId
+),
+-- Subquery to fetch top tags by count across posts, with string processing
+TopTags AS (
+  SELECT
+    t.TagName,
+    t.Count,
+    ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS rn
+  FROM Tags t
+  WHERE t.IsModeratorOnly = 0
+),
+-- Windowed ranking by activity date per post
+ActiveRank AS (
+  SELECT
+    ra.PostId,
+    ra.Title,
+    ra.PostTypeId,
+    ra.CreationDate,
+    ra.LastActivityDate,
+    ra.Score,
+    ra.ViewCount,
+    ra.OwnerDisplayName,
+    ra.OwnerUserId,
+    ra.Tags,
+    ra.AcceptedAnswerId,
+    ROW_NUMBER() OVER (
+      PARTITION BY ra.PostTypeId
+      ORDER BY ra.LastActivityDate DESC, ra.Score DESC, ra.ViewCount DESC
+    ) AS TypeRank
+  FROM RecentActivity ra
+),
+-- Correlated subquery: posts whose last activity predates a specific cutoff and have large view counts
+StalePopular AS (
+  SELECT
+    a.PostId,
+    a.Title,
+    a.LastActivityDate,
+    a.ViewCount
+  FROM ActiveRank a
+  WHERE a.LastActivityDate < (SELECT DATEADD(DAY, -7, cast('2024-10-01 12:34:56' as timestamp)))
+    AND a.ViewCount > 1000
+),
+-- Complex predicate with NULL handling and string expressions
+ComplexPosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Body IS NOT NULL AS HasBody,
+    CASE
+      WHEN p.Tags IS NULL OR LENGTH(p.Tags) = 0 THEN 'untagged'
+      ELSE 'tagged'
+    END AS TagStatus,
+    CASE
+      WHEN p.OwnerUserId IS NULL THEN 'anonymous'
+      WHEN u.Location IS NULL THEN 'location-unknown'
+      ELSE u.Location
+    END AS UserLocation,
+    CONCAT('[', COALESCE(p.Tags, ''), ']') AS TagArrayVisual,
+    LENGTH(p.Title) AS TitleLength
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId IN (1,2)
+    AND (p.LastEditDate IS NULL OR p.LastEditDate >= p.CreationDate)
+),
+-- Outer join to connect posts with their latest history entry (if any), plus a set operation
+LatestHistory AS (
+  SELECT
+    p.Id AS PostId,
+    ph.Id AS HistoryId,
+    ph.PostHistoryTypeId,
+    ph.CreationDate AS HistoryDate,
+    ph.UserDisplayName AS HistoryUser,
+    ph.Comment
+  FROM Posts p
+  LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+  WHERE ph.Id IS NULL OR ph.CreationDate = (
+    SELECT MAX(ph2.CreationDate)
+    FROM PostHistory ph2
+    WHERE ph2.PostId = p.Id
+  )
+),
+-- Final aggregate combining various signals
+FinalBundle AS (
+  SELECT
+    ar.PostId,
+    ar.Title,
+    ar.PostTypeId,
+    ar.LastActivityDate,
+    ar.Score,
+    ar.ViewCount,
+    ar.OwnerDisplayName,
+    ar.Tags,
+    ar.AcceptedAnswerId,
+    lr.HistoryId,
+    lr.HistoryDate,
+    lr.Comment
+  FROM ActiveRank ar
+  LEFT JOIN LatestHistory lr ON lr.PostId = ar.PostId
+  LEFT JOIN StalePopular sp ON sp.PostId = ar.PostId
+  LEFT JOIN ComplexPosts cp ON cp.PostId = ar.PostId
+)
+SELECT
+  fb.PostId,
+  fb.Title,
+  fb.PostTypeId,
+  fb.LastActivityDate,
+  fb.Score,
+  fb.ViewCount,
+  fb.OwnerDisplayName,
+  fb.Tags,
+  fb.AcceptedAnswerId,
+  fb.HistoryDate,
+  fb.Comment,
+  fb.TagArrayVisual,
+  fb.TitleLength,
+  fb.UserLocation,
+  fb.HasBody,
+  fb.TagStatus,
+  (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = fb.PostId) AS DummyOwnerPostCount
+FROM FinalBundle fb
+ORDER BY fb.LastActivityDate DESC
+LIMIT 100;

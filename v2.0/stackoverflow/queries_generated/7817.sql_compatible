@@ -1,0 +1,183 @@
+WITH UserStats AS (
+  SELECT 
+    u.Id as UserId,
+    u.Reputation,
+    u.DisplayName,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    COUNT(DISTINCT p.Id) as PostCount,
+    COUNT(DISTINCT c.Id) as CommentCount,
+    COUNT(DISTINCT b.Id) as BadgeCount,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+    MAX(p.CreationDate) as LastPostDate,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) as ReputationRank,
+    DENSE_RANK() OVER (ORDER BY u.Views DESC) as ViewRank,
+    NTILE(100) OVER (ORDER BY u.Reputation) as ReputationPercentile,
+    CASE WHEN u.WebsiteUrl IS NOT NULL AND u.WebsiteUrl != '' THEN 1 ELSE 0 END as HasWebsite,
+    CASE WHEN u.AboutMe IS NOT NULL AND LENGTH(u.AboutMe) > 100 THEN 1 ELSE 0 END as HasDetailedBio,
+    EXTRACT(YEAR FROM (CAST('2024-10-01 12:34:56' AS timestamp) - u.CreationDate)) as AccountAgeYears
+  FROM Users u
+  LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+  LEFT JOIN Comments c ON u.Id = c.UserId
+  LEFT JOIN Badges b ON u.Id = b.UserId
+  WHERE u.Id > 0
+  GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes, u.WebsiteUrl, u.AboutMe, u.CreationDate
+),
+TagAnalysis AS (
+  SELECT 
+    t.TagName,
+    t.Count as TagCount,
+    t.ExcerptPostId,
+    t.WikiPostId,
+    COUNT(DISTINCT p.Id) as QuestionCountUsingTag,
+    AVG(p.Score) as AvgScoreOfTaggedQuestions,
+    MAX(p.ViewCount) as MaxViewsOfTaggedQuestion,
+    STRING_AGG(DISTINCT u.DisplayName, ', ' ORDER BY u.DisplayName) as UsersWhoTagged,
+    ROW_NUMBER() OVER (ORDER BY t.Count DESC) as TagPopularityRank
+  FROM Tags t
+  LEFT JOIN Posts p ON (p.Tags LIKE '%' || t.TagName || '%')
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND p.Tags != ''
+  GROUP BY t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId
+),
+PostActivity AS (
+  SELECT 
+    p.Id as PostId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.OwnerUserId,
+    p.ParentId,
+    p.PostTypeId,
+    CASE 
+      WHEN p.PostTypeId = 1 THEN 'Question'
+      WHEN p.PostTypeId = 2 THEN 'Answer'
+      WHEN p.PostTypeId = 3 THEN 'Wiki'
+      ELSE 'Other'
+    END as PostType,
+    CASE 
+      WHEN p.Score >= 10 THEN 'HighlyVoted'
+      WHEN p.Score >= 5 THEN 'ModeratelyVoted'
+      WHEN p.Score >= 1 THEN 'LowVoted'
+      ELSE 'Unvoted'
+    END as VoteCategory,
+    CAST((p.LastActivityDate - p.CreationDate) AS INTERVAL) as _tmp_interval,
+    EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate))/86400 as DaysSinceLastActivity,
+    CASE 
+      WHEN p.LastActivityDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '7 days' THEN 'Active'
+      WHEN p.LastActivityDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days' THEN 'RecentlyActive'
+      ELSE 'Inactive'
+    END as ActivityStatus,
+    LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PreviousPostScore,
+    LAG(p.CreationDate, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PreviousPostDate,
+    (p.Score - LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate)) as ScoreChange
+  FROM Posts p
+  WHERE p.PostTypeId IN (1, 2) AND p.CreationDate IS NOT NULL
+)
+SELECT 
+  us.UserId,
+  us.DisplayName,
+  us.Reputation,
+  us.PostCount,
+  us.QuestionCount,
+  us.AnswerCount,
+  us.CommentCount,
+  us.BadgeCount,
+  us.ReputationRank,
+  us.ViewRank,
+  us.ReputationPercentile,
+  us.HasWebsite,
+  us.HasDetailedBio,
+  us.AccountAgeYears,
+  ta.TagName,
+  ta.TagCount,
+  ta.QuestionCountUsingTag,
+  ta.AvgScoreOfTaggedQuestions,
+  ta.MaxViewsOfTaggedQuestion,
+  pa.PostId,
+  pa.Title,
+  pa.Score,
+  pa.ViewCount,
+  pa.AnswerCount,
+  pa.CommentCount,
+  pa.FavoriteCount,
+  pa.CreationDate,
+  pa.LastActivityDate,
+  pa.PostType,
+  pa.VoteCategory,
+  pa.DaysSinceLastActivity,
+  pa.ActivityStatus,
+  pa.ScoreChange,
+  CASE 
+    WHEN pa.Score > 0 AND pa.Score < 10 THEN NULL
+    ELSE (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = us.UserId AND p2.Score > pa.Score)
+  END as HigherScoreCount,
+  CASE 
+    WHEN pa.ScoreChange IS NOT NULL AND pa.PreviousPostScore IS NOT NULL THEN
+      CASE 
+        WHEN pa.ScoreChange > 0 THEN 'Improvement'
+        WHEN pa.ScoreChange < 0 THEN 'Decline'
+        ELSE 'Stable'
+      END
+    ELSE NULL
+  END as PerformanceTrend,
+  CASE 
+    WHEN us.Reputation > 10000 AND us.PostCount > 50 THEN 'Expert'
+    WHEN us.Reputation > 5000 AND us.PostCount > 25 THEN 'Experienced'
+    WHEN us.Reputation > 1000 AND us.PostCount > 10 THEN 'Intermediate'
+    ELSE 'Beginner'
+  END as UserLevel,
+  COALESCE(pa.Title, SUBSTRING(ta.TagName, 1, 50) || ' Tag Questions') as ContentIdentifier,
+  (CASE WHEN pa.LastActivityDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 day' THEN 1 ELSE 0 END) as TodayActivity,
+  (CASE WHEN pa.ViewCount IS NULL THEN 0 ELSE pa.ViewCount END) as ViewCountZeroed,
+  (CASE WHEN pa.Score IS NULL THEN 0 ELSE pa.Score END) as ScoreZeroed,
+  CASE 
+    WHEN pa.PostType = 'Answer' AND pa.ParentId IS NOT NULL THEN 
+      (SELECT p3.Title FROM Posts p3 WHERE p3.Id = pa.ParentId LIMIT 1)
+    ELSE NULL
+  END as ParentQuestionTitle,
+  (SELECT COUNT(*) FROM Votes v WHERE v.PostId = pa.PostId AND v.VoteTypeId = 2) as UpvotesForPost,
+  (SELECT COUNT(*) FROM Votes v WHERE v.PostId = pa.PostId AND v.VoteTypeId = 3) as DownvotesForPost,
+  ((SELECT COUNT(*) FROM Votes v WHERE v.PostId = pa.PostId AND v.VoteTypeId = 2) - 
+   (SELECT COUNT(*) FROM Votes v WHERE v.PostId = pa.PostId AND v.VoteTypeId = 3)) as NetVotesForPost
+FROM UserStats us
+LEFT JOIN TagAnalysis ta ON ta.QuestionCountUsingTag > 0
+LEFT JOIN PostActivity pa ON pa.OwnerUserId = us.UserId
+WHERE (
+  (us.Reputation > 1000 AND us.PostCount > 5) OR 
+  (ta.TagCount > 20 AND ta.QuestionCountUsingTag > 10) OR
+  (pa.Score > 50 AND pa.ViewCount > 1000)
+) 
+AND (
+  (us.ReputationRank BETWEEN 1 AND 500) OR 
+  (ta.TagPopularityRank BETWEEN 1 AND 100) OR
+  (pa.ScoreChange IS NOT NULL)
+)
+AND (
+  pa.PostId IS NOT NULL OR 
+  ta.TagName IS NOT NULL OR
+  us.UserId IS NOT NULL
+)
+AND 
+  (COALESCE(pa.ViewCount,0) > 0 OR ta.QuestionCountUsingTag > 0 OR us.PostCount > 0)
+  AND (
+    NOT EXISTS (
+      SELECT 1 FROM Posts p WHERE p.OwnerUserId = us.UserId AND p.CreationDate < DATE '2010-01-01'
+    ) OR 
+    EXISTS (
+      SELECT 1 FROM Posts p WHERE p.OwnerUserId = us.UserId AND p.CreationDate > DATE '2020-01-01'
+    )
+  )
+ORDER BY 
+  CASE WHEN pa.Score > 100 THEN pa.Score ELSE 0 END DESC,
+  us.Reputation DESC,
+  ta.TagCount DESC,
+  pa.LastActivityDate DESC
+LIMIT 1000;

@@ -1,0 +1,285 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT v.Id) as VoteCount,
+        MAX(p.CreationDate) as LastPostDate,
+        RANK() OVER (ORDER BY u.Reputation DESC) as ReputationRank,
+        DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) as PostActivityRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        PostCount,
+        QuestionCount,
+        AnswerCount,
+        BadgeCount,
+        CommentCount,
+        VoteCount,
+        LastPostDate,
+        ReputationRank,
+        PostActivityRank,
+        CASE 
+            WHEN PostCount > 100 AND Reputation > 50000 THEN 'Elite'
+            WHEN PostCount > 50 AND Reputation > 10000 THEN 'Active'
+            WHEN PostCount > 10 AND Reputation > 1000 THEN 'Regular'
+            ELSE 'Casual'
+        END as UserCategory,
+        ROUND(
+          (CASE WHEN NULLIF(QuestionCount,0) IS NULL THEN 0.0 ELSE (CAST(AnswerCount AS numeric) / NULLIF(QuestionCount,0)) END) 
+          * CAST(100 AS numeric)
+        , 2) as AnswerToQuestionRatio
+    FROM UserStats
+    WHERE ReputationRank <= 1000
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END as HasAcceptedAnswer,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END as IsClosed,
+        CAST(
+          (EXTRACT(EPOCH FROM (COALESCE(p.ClosedDate, TIMESTAMP '2024-10-01 12:34:56') - p.CreationDate)) / 86400)
+          AS INTEGER
+        ) as DaysOpen,
+        COALESCE(p.Tags, '') as Tags,
+        LENGTH(COALESCE(p.Body, '')) as BodyLength,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as UserPostRank,
+        RANK() OVER (ORDER BY p.Score DESC) as ScoreRank,
+        PERCENT_RANK() OVER (ORDER BY p.Score) as ScorePercentile,
+        LAG(p.Score, 1) OVER (ORDER BY p.CreationDate) as PreviousScore,
+        LEAD(p.Score, 1) OVER (ORDER BY p.CreationDate) as NextScore,
+        AVG(p.Score) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate ROWS BETWEEN 10 PRECEDING AND CURRENT ROW) as MovingAvgScore,
+        NTH_VALUE(p.Score, 3) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) as ThirdHighestScore,
+        CASE 
+            WHEN p.Score > 100 THEN 'High'
+            WHEN p.Score > 10 THEN 'Medium'
+            WHEN p.Score > 0 THEN 'Low'
+            ELSE 'Negative'
+        END as ScoreCategory,
+        CASE 
+            WHEN p.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = p.PostTypeId) THEN 'AboveAverage'
+            ELSE 'BelowAverage'
+        END as ScoreVsAverage
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) AND p.Score IS NOT NULL
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsRequired,
+        t.IsModeratorOnly,
+        COALESCE(STRING_AGG(pa.Title, '; ' ORDER BY pa.Score DESC), 'No Posts') as TopQuestions,
+        COUNT(pa.PostId) as QuestionCount,
+        AVG(pa.Score) as AvgScore,
+        MAX(pa.Score) as MaxScore,
+        MIN(pa.Score) as MinScore,
+        STRING_AGG(CAST(pa.Score as varchar), ', ') as AllScores,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            WHEN t.Count > 10 THEN 'Niche'
+            ELSE 'Rare'
+        END as PopularityCategory,
+        DENSE_RANK() OVER (ORDER BY t.Count DESC) as PopularityRank
+    FROM Tags t
+    LEFT JOIN PostAnalysis pa ON pa.Tags LIKE '%' || t.TagName || '%'
+    WHERE t.Count > 0
+    GROUP BY t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId, t.IsRequired, t.IsModeratorOnly
+),
+DetailedVotes AS (
+    SELECT 
+        v.Id as VoteId,
+        v.PostId,
+        v.UserId,
+        v.VoteTypeId,
+        v.CreationDate,
+        v.BountyAmount,
+        vt.Name as VoteTypeName,
+        p.OwnerUserId as PostOwner,
+        u.DisplayName as VoterName,
+        CASE 
+            WHEN v.VoteTypeId = 1 THEN 'Accepted Answer'
+            WHEN v.VoteTypeId = 2 THEN 'Upvote'
+            WHEN v.VoteTypeId = 3 THEN 'Downvote'
+            WHEN v.VoteTypeId = 4 THEN 'Offensive'
+            WHEN v.VoteTypeId = 5 THEN 'Favorite'
+            ELSE 'Other'
+        END as VoteTypeDescription,
+        CASE 
+            WHEN v.VoteTypeId IN (1, 2, 3) THEN 'Moderation'
+            WHEN v.VoteTypeId IN (4, 5, 6) THEN 'Community'
+            ELSE 'Other'
+        END as VoteCategory,
+        COALESCE(v.BountyAmount, 0) as BountyAmountWithDefault
+    FROM Votes v
+    LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    LEFT JOIN Posts p ON v.PostId = p.Id
+    LEFT JOIN Users u ON v.UserId = u.Id
+    WHERE v.CreationDate >= TIMESTAMP '2020-01-01'
+),
+CombinedAnalysis AS (
+    SELECT 
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.PostCount,
+        tu.QuestionCount,
+        tu.AnswerCount,
+        tu.BadgeCount,
+        tu.CommentCount,
+        tu.VoteCount,
+        tu.ReputationRank,
+        tu.PostActivityRank,
+        tu.UserCategory,
+        tu.AnswerToQuestionRatio,
+        pa.PostId,
+        pa.Title,
+        pa.Score,
+        pa.ViewCount,
+        pa.AnswerCount as PostAnswerCount,
+        pa.CommentCount as PostCommentCount,
+        pa.FavoriteCount,
+        pa.CreationDate as PostCreationDate,
+        pa.PostTypeId,
+        pa.HasAcceptedAnswer,
+        pa.IsClosed,
+        pa.DaysOpen,
+        pa.Tags,
+        pa.BodyLength,
+        pa.UserPostRank,
+        pa.ScoreRank,
+        pa.ScorePercentile,
+        pa.ScoreVsAverage,
+        ta.TagName,
+        ta.Count as TagCount,
+        CASE 
+            WHEN pa.Score > 50 AND ta.Count > 100 THEN 'HighImpact'
+            WHEN pa.Score > 10 AND ta.Count > 10 THEN 'ModerateImpact'
+            ELSE 'LowImpact'
+        END as ImpactLevel,
+        dv.VoteId,
+        dv.VoteTypeId,
+        dv.VoteTypeName,
+        dv.VoteTypeDescription,
+        dv.VoteCategory,
+        dv.BountyAmountWithDefault,
+        CASE 
+            WHEN dv.BountyAmountWithDefault > 0 THEN 'BountyVote'
+            ELSE 'RegularVote'
+        END as VoteType,
+        ROW_NUMBER() OVER (PARTITION BY tu.UserId ORDER BY pa.CreationDate DESC) as UserPostOrder,
+        RANK() OVER (ORDER BY pa.CreationDate DESC) as RecentPostRank,
+        NTILE(4) OVER (ORDER BY tu.Reputation DESC) as ReputationQuartile
+    FROM TopUsers tu
+    LEFT JOIN PostAnalysis pa ON tu.UserId = pa.OwnerUserId
+    LEFT JOIN TagAnalysis ta ON pa.Tags LIKE '%' || ta.TagName || '%'
+    LEFT JOIN DetailedVotes dv ON pa.PostId = dv.PostId
+    WHERE pa.PostId IS NOT NULL OR ta.TagName IS NOT NULL
+)
+SELECT 
+    COUNT(*) as TotalRecords,
+    COUNT(DISTINCT UserId) as DistinctUsers,
+    COUNT(DISTINCT PostId) as DistinctPosts,
+    COUNT(DISTINCT TagName) as DistinctTags,
+    COUNT(DISTINCT VoteId) as DistinctVotes,
+    AVG(Reputation) as AvgReputation,
+    MAX(Reputation) as MaxReputation,
+    MIN(Reputation) as MinReputation,
+    AVG(PostCount) as AvgUserPosts,
+    AVG(QuestionCount) as AvgQuestions,
+    AVG(AnswerCount) as AvgAnswers,
+    AVG(BadgeCount) as AvgBadges,
+    AVG(CommentCount) as AvgComments,
+    AVG(VoteCount) as AvgVotes,
+    AVG(Score) as AvgPostScore,
+    MAX(Score) as MaxPostScore,
+    MIN(Score) as MinPostScore,
+    AVG(ViewCount) as AvgViews,
+    AVG(PostAnswerCount) as AvgAnswerCount,
+    AVG(FavoriteCount) as AvgFavorites,
+    COUNT(CASE WHEN HasAcceptedAnswer = 1 THEN 1 END) as PostsWithAcceptedAnswers,
+    COUNT(CASE WHEN IsClosed = 1 THEN 1 END) as ClosedPosts,
+    AVG(DaysOpen) as AvgDaysOpen,
+    COUNT(CASE WHEN ScoreRank <= 10 THEN 1 END) as Top10ScoredPosts,
+    COUNT(CASE WHEN ScoreRank <= 5 THEN 1 END) as Top5ScoredPosts,
+    COUNT(CASE WHEN ReputationQuartile = 1 THEN 1 END) as TopQuartileUsers,
+    COUNT(CASE WHEN ReputationQuartile = 4 THEN 1 END) as BottomQuartileUsers,
+    COUNT(CASE WHEN UserCategory = 'Elite' THEN 1 END) as EliteUsers,
+    COUNT(CASE WHEN UserCategory = 'Active' THEN 1 END) as ActiveUsers,
+    COUNT(CASE WHEN UserCategory = 'Regular' THEN 1 END) as RegularUsers,
+    COUNT(CASE WHEN UserCategory = 'Casual' THEN 1 END) as CasualUsers,
+    COUNT(CASE WHEN ScoreVsAverage = 'AboveAverage' THEN 1 END) as AboveAveragePosts,
+    COUNT(CASE WHEN ScoreVsAverage = 'BelowAverage' THEN 1 END) as BelowAveragePosts,
+    COUNT(CASE WHEN VoteCategory = 'Moderation' THEN 1 END) as ModerationVotes,
+    COUNT(CASE WHEN VoteCategory = 'Community' THEN 1 END) as CommunityVotes,
+    SUM(BountyAmountWithDefault) as TotalBounties,
+    AVG(BountyAmountWithDefault) as AvgBountyAmount,
+    COUNT(CASE WHEN VoteType = 'BountyVote' THEN 1 END) as BountyVotes,
+    COUNT(CASE WHEN VoteType = 'RegularVote' THEN 1 END) as RegularVotes,
+    STRING_AGG(DISTINCT TagName, ', ' ORDER BY TagName) as AllTags,
+    STRING_AGG(DISTINCT DisplayName, ', ' ORDER BY MAX(Reputation) DESC) as TopUsersList,
+    STRING_AGG(DISTINCT VoteTypeName, ', ' ORDER BY VoteTypeName) as VoteTypesList,
+    STRING_AGG(DISTINCT UserCategory, ', ' ORDER BY UserCategory) as UserCategories,
+    RANK() OVER (ORDER BY SUM(Score) DESC) as TotalScoreRank,
+    DENSE_RANK() OVER (ORDER BY AVG(Reputation) DESC) as AvgReputationRank,
+    PERCENT_RANK() OVER (ORDER BY COUNT(DISTINCT PostId) DESC) as PostActivityPercentile,
+    CASE 
+        WHEN COUNT(DISTINCT PostId) > 500 THEN 'UltraActive'
+        WHEN COUNT(DISTINCT PostId) > 100 THEN 'VeryActive'
+        WHEN COUNT(DISTINCT PostId) > 50 THEN 'Active'
+        WHEN COUNT(DISTINCT PostId) > 10 THEN 'Moderate'
+        ELSE 'Inactive'
+    END as OverallActivityLevel
+FROM CombinedAnalysis
+GROUP BY 
+    UserId, 
+    DisplayName, 
+    Reputation, 
+    PostCount, 
+    QuestionCount, 
+    AnswerCount, 
+    BadgeCount, 
+    CommentCount, 
+    VoteCount, 
+    ReputationRank, 
+    PostActivityRank, 
+    UserCategory, 
+    AnswerToQuestionRatio
+HAVING 
+    COUNT(DISTINCT PostId) > 0 
+    AND COUNT(DISTINCT TagName) > 0
+ORDER BY 
+    TotalScoreRank,
+    AvgReputationRank,
+    PostActivityPercentile DESC
+LIMIT 1000;

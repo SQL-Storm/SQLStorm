@@ -1,0 +1,191 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserPostRank,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) AS ScoreRank,
+        LAG(p.Score) OVER (ORDER BY p.CreationDate) AS PrevScore,
+        LEAD(p.Score) OVER (ORDER BY p.CreationDate) AS NextScore,
+        AVG(p.Score) OVER (PARTITION BY p.PostTypeId) AS AvgScoreByType,
+        CASE 
+            WHEN p.Score > (SELECT AVG(Posts.Score) FROM Posts WHERE Posts.PostTypeId = p.PostTypeId) THEN 'AboveAvg'
+            WHEN p.Score < (SELECT AVG(Posts.Score) FROM Posts WHERE Posts.PostTypeId = p.PostTypeId) THEN 'BelowAvg'
+            ELSE 'Avg'
+        END AS ScoreCategory,
+        COALESCE(p.Title, '') || ' - ' || COALESCE(p.Tags, '') AS TitleTagConcat
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) 
+      AND p.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years')
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 100 THEN 'High'
+            WHEN COUNT(DISTINCT p.Id) > 50 THEN 'Medium'
+            ELSE 'Low'
+        END AS ActivityLevel
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '5 years')
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > (SELECT AVG(T2.Count) FROM Tags T2) THEN 'Popular'
+            WHEN t.Count < (SELECT AVG(T2.Count) FROM Tags T2) THEN 'Rare'
+            ELSE 'Average'
+        END AS PopularityLevel,
+        DENSE_RANK() OVER (ORDER BY t.Count DESC) AS PopularityRank
+    FROM Tags t
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        rp.Id,
+        rp.TitleTagConcat,
+        rp.Score,
+        rp.ViewCount,
+        rp.AnswerCount,
+        rp.CommentCount,
+        rp.FavoriteCount,
+        rp.UserPostRank,
+        rp.ScoreRank,
+        rp.ScoreCategory,
+        rp.AvgScoreByType,
+        CASE 
+            WHEN rp.Score > rp.AvgScoreByType AND rp.Score > 50 THEN 'HighPerforming'
+            WHEN rp.Score < rp.AvgScoreByType AND rp.Score < 10 THEN 'LowPerforming'
+            WHEN rp.Score BETWEEN rp.AvgScoreByType - 10 AND rp.AvgScoreByType + 10 THEN 'Moderate'
+            ELSE 'Unusual'
+        END AS PerformanceLevel,
+        CASE 
+            WHEN rp.AnswerCount > 0 AND rp.CommentCount > 0 THEN 'Active'
+            WHEN rp.AnswerCount = 0 AND rp.CommentCount > 0 THEN 'Commented'
+            WHEN rp.AnswerCount > 0 AND rp.CommentCount = 0 THEN 'Answered'
+            ELSE 'Inactive'
+        END AS EngagementStatus,
+        rp.PrevScore,
+        rp.NextScore,
+        COALESCE(rp.PrevScore, 0) - COALESCE(rp.NextScore, 0) AS ScoreChangeFromPrevNext,
+        'Tag-' || rp.Tags AS TagPrefix,
+        RIGHT(rp.Tags, 20) AS TagSuffix,
+        CHAR_LENGTH(rp.TitleTagConcat) AS TitleTagLength,
+        CASE 
+            WHEN rp.Tags LIKE '%<%' THEN 'HasTags'
+            ELSE 'NoTags'
+        END AS TagStatus,
+        ROW_NUMBER() OVER (ORDER BY rp.Score DESC, rp.ViewCount DESC) AS OverallRanking,
+        DENSE_RANK() OVER (PARTITION BY rp.PostTypeId ORDER BY rp.Score DESC) AS TypeSpecificRank,
+        rp.PostTypeId,
+        rp.Tags
+    FROM RankedPosts rp
+),
+FinalCombined AS (
+    SELECT 
+        cpa.Id,
+        cpa.TitleTagConcat,
+        cpa.Score,
+        cpa.ViewCount,
+        cpa.AnswerCount,
+        cpa.CommentCount,
+        cpa.FavoriteCount,
+        cpa.UserPostRank,
+        cpa.ScoreRank,
+        cpa.PerformanceLevel,
+        cpa.EngagementStatus,
+        cpa.TagPrefix,
+        cpa.TagSuffix,
+        cpa.TitleTagLength,
+        CASE 
+            WHEN cpa.ScoreChangeFromPrevNext > 10 THEN 'Rising'
+            WHEN cpa.ScoreChangeFromPrevNext < -10 THEN 'Falling'
+            ELSE 'Stable'
+        END AS Trend,
+        COALESCE(ua.DisplayName, 'Unknown') AS AuthorName,
+        COALESCE(ua.Reputation, 0) AS AuthorReputation,
+        COALESCE(ua.PostCount, 0) AS AuthorPostCount,
+        COALESCE(ta.TagName, 'NoTag') AS AssociatedTag,
+        COALESCE(ta.PopularityLevel, 'Unknown') AS TagPopularity,
+        CASE 
+            WHEN COALESCE(ua.PostCount, 0) > 100 AND COALESCE(ua.Reputation, 0) > 1000 THEN 'Elite'
+            WHEN COALESCE(ua.PostCount, 0) > 50 AND COALESCE(ua.Reputation, 0) > 500 THEN 'Experienced'
+            WHEN COALESCE(ua.PostCount, 0) > 0 AND COALESCE(ua.Reputation, 0) > 0 THEN 'Active'
+            ELSE 'New'
+        END AS AuthorMaturity,
+        CASE 
+            WHEN cpa.Score > 0 AND cpa.ViewCount > 0 THEN CAST(cpa.Score AS DOUBLE PRECISION) / CAST(cpa.ViewCount AS DOUBLE PRECISION)
+            ELSE 0.0
+        END AS ScoreToViewRatio,
+        cpa.Tags,
+        cpa.PostTypeId
+    FROM ComplexPostAnalysis cpa
+    LEFT JOIN UserActivity ua ON cpa.Id IN (SELECT Posts.Id FROM Posts WHERE Posts.OwnerUserId = ua.UserId)
+    LEFT JOIN Tags ta ON cpa.TagSuffix LIKE '%' || ta.TagName || '%'
+)
+SELECT 
+    fc.Id,
+    fc.TitleTagConcat,
+    fc.Score,
+    fc.ViewCount,
+    fc.AnswerCount,
+    fc.CommentCount,
+    fc.FavoriteCount,
+    fc.UserPostRank,
+    fc.ScoreRank,
+    fc.PerformanceLevel,
+    fc.EngagementStatus,
+    fc.TagPrefix,
+    fc.TagSuffix,
+    fc.TitleTagLength,
+    fc.Trend,
+    fc.AuthorName,
+    fc.AuthorReputation,
+    fc.AuthorPostCount,
+    fc.AssociatedTag,
+    fc.TagPopularity,
+    fc.AuthorMaturity,
+    fc.ScoreToViewRatio,
+    CASE 
+        WHEN fc.ScoreToViewRatio > 0.1 THEN 'HighlyEngaged'
+        WHEN fc.ScoreToViewRatio > 0.05 THEN 'ModeratelyEngaged'
+        WHEN fc.ScoreToViewRatio > 0 THEN 'LowEngagement'
+        ELSE 'NoEngagement'
+    END AS EngagementLevel,
+    CASE 
+        WHEN fc.Score > (SELECT AVG(Posts.Score) FROM Posts) * 1.5 THEN 'Extreme'
+        WHEN fc.Score >= (SELECT AVG(Posts.Score) FROM Posts) * 1.2 THEN 'High'
+        WHEN fc.Score >= (SELECT AVG(Posts.Score) FROM Posts) THEN 'Standard'
+        WHEN fc.Score >= (SELECT AVG(Posts.Score) FROM Posts) * 0.8 THEN 'Low'
+        ELSE 'VeryLow'
+    END AS ScoreTier,
+    DENSE_RANK() OVER (ORDER BY fc.ScoreToViewRatio DESC) AS EngagementRank,
+    PERCENT_RANK() OVER (ORDER BY fc.Score) AS ScorePercentile,
+    NTILE(10) OVER (ORDER BY fc.Score) AS ScoreDecile
+FROM FinalCombined fc
+WHERE fc.Id IS NOT NULL
+ORDER BY fc.Score DESC, fc.ViewCount DESC;

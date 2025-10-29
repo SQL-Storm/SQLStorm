@@ -1,0 +1,30 @@
+-- {"query": "5139.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 389} 
+SELECT
+  u.Id AS UserId,
+  u.DisplayName AS UserName,
+  u.Reputation,
+  COUNT(DISTINCT p.Id) AS PostCount,
+  AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END) AS AvgQuestionScore,
+  AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE NULL END) AS AvgAnswerScore,
+  SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+  SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived,
+  MAX(p.LastActivityDate) AS LastActivity,
+  STRING_AGG(DISTINCT t.Name, ',') FILTER (WHERE t.Name IS NOT NULL) AS FavoriteTagSet,
+  COUNT(DISTINCT b.Id) AS BadgesEarned,
+  MAX(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS HasGoldBadge
+FROM
+  Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id AND v.UserId = u.Id
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  LEFT JOIN Tags t ON t.Id = ANY(string_to_array(replace(replace(p.Tags, '<', ''), '>', ','), ',')::int[])
+WHERE
+  u.CreationDate < NOW() - INTERVAL '30 days'
+  AND (u.LastAccessDate > NOW() - INTERVAL '180 days' OR u.LastAccessDate IS NULL)
+GROUP BY
+  u.Id, u.DisplayName, u.Reputation
+HAVING
+  COUNT(DISTINCT p.Id) > 0
+ORDER BY
+  Reputation DESC, PostCount DESC
+LIMIT 100;

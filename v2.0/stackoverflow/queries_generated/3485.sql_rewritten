@@ -1,0 +1,139 @@
+-- {"query": "3485.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2288} 
+WITH
+/* --------------------------------------------------------------
+   Per‑user aggregated statistics
+   -------------------------------------------------------------- */
+UserStats AS (
+    SELECT
+        u.Id,
+        u.Reputation,
+        COALESCE(u.DisplayName, 'Anonymous')                AS DisplayName,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadges,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS QuestionCount,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS AnswerCount,
+        /* total up‑votes received on all of the user’s posts */
+        (SELECT COUNT(*) 
+         FROM Votes v
+         JOIN Posts p ON v.PostId = p.Id
+         WHERE p.OwnerUserId = u.Id AND v.VoteTypeId = 2)                          AS UpVoteCount
+    FROM Users u
+),
+
+/* --------------------------------------------------------------
+   Tag‑level metrics, including optional excerpt/wiki posts
+   -------------------------------------------------------------- */
+TagMetrics AS (
+    SELECT
+        t.TagName,
+        t.Count                                            AS TagUseCount,
+        COALESCE(e.Title, '')                              AS ExcerptTitle,
+        COALESCE(w.Title, '')                              AS WikiTitle,
+        (SELECT COUNT(*)
+         FROM PostLinks pl
+         WHERE pl.PostId = t.ExcerptPostId
+           AND pl.LinkTypeId = 1)                         AS ExcerptLinkCount
+    FROM Tags t
+    LEFT JOIN Posts e ON t.ExcerptPostId = e.Id               -- outer join – excerpt may be missing
+    LEFT JOIN Posts w ON t.WikiPostId    = w.Id               -- outer join – wiki may be missing
+),
+
+/* --------------------------------------------------------------
+   Top active users (by total post count) with row numbers
+   -------------------------------------------------------------- */
+TopActiveUsers AS (
+    SELECT
+        us.Id,
+        us.DisplayName,
+        us.Reputation,
+        (us.QuestionCount + us.AnswerCount)                AS TotalPosts,
+        ROW_NUMBER() OVER (ORDER BY (us.QuestionCount + us.AnswerCount) DESC) AS rn
+    FROM UserStats us
+    WHERE us.Reputation > 1000
+),
+
+/* --------------------------------------------------------------
+   Recent closed questions with tag aggregation and close reason
+   -------------------------------------------------------------- */
+RecentClosedQuestions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        ph.CreationDate                         AS ClosedDate,
+        COALESCE(NULLIF(ph.Comment, ''), 'No reason supplied') AS CloseReason,
+        STRING_AGG(DISTINCT t.TagName, '|')    AS TagList
+    FROM Posts p
+    JOIN PostHistory ph
+          ON ph.PostId = p.Id
+         AND ph.PostHistoryTypeId = 10                     -- close event
+    LEFT JOIN LATERAL (
+        SELECT regexp_split_to_table(p.Tags, '\\><') AS Tag
+    ) AS split_tags ON TRUE
+    LEFT JOIN Tags t
+           ON t.TagName = split_tags.Tag
+    WHERE p.PostTypeId = 1                                 -- only questions
+      AND p.ClosedDate IS NOT NULL
+    GROUP BY p.Id, p.Title, p.CreationDate, ph.CreationDate, ph.Comment
+),
+
+/* --------------------------------------------------------------
+   Union of all result “categories” for a single final scan
+   -------------------------------------------------------------- */
+Combined AS (
+    SELECT
+        'UserStats'   AS Category,
+        us.Id::text   AS KeyId,
+        us.DisplayName,
+        us.Reputation::text                              AS Metric,
+        us.GoldBadges || '/' || us.SilverBadges || '/' || us.BronzeBadges AS Badges,
+        NULL::text                                       AS ExtraInfo,
+        NULL::int                                        AS rn
+    FROM UserStats us
+
+    UNION ALL
+
+    SELECT
+        'TagMetrics' AS Category,
+        t.TagName    AS KeyId,
+        t.TagName    AS DisplayName,
+        t.TagUseCount::text                              AS Metric,
+        t.ExcerptTitle || ' | ' || t.WikiTitle           AS Badges,
+        t.ExcerptLinkCount::text                         AS ExtraInfo,
+        NULL::int                                        AS rn
+    FROM TagMetrics t
+
+    UNION ALL
+
+    SELECT
+        'TopActive' AS Category,
+        ta.Id::text AS KeyId,
+        ta.DisplayName,
+        ta.TotalPosts::text                               AS Metric,
+        NULL::text                                        AS Badges,
+        ta.rn::text                                       AS ExtraInfo,
+        ta.rn
+    FROM TopActiveUsers ta
+
+    UNION ALL
+
+    SELECT
+        'ClosedQ'   AS Category,
+        rcq.Id::text AS KeyId,
+        rcq.Title   AS DisplayName,
+        rcq.CreationDate::text                           AS Metric,
+        rcq.CloseReason                                   AS Badges,
+        rcq.TagList                                       AS ExtraInfo,
+        NULL::int                                         AS rn
+    FROM RecentClosedQuestions rcq
+)
+
+SELECT *
+FROM Combined
+WHERE Category = 'UserStats'
+   OR (Category = 'TopActive' AND rn <= 10)          -- show only top‑10 active users
+ORDER BY Category,
+         CASE WHEN Category = 'UserStats'   THEN Metric::bigint END DESC,
+         CASE WHEN Category = 'TopActive'  THEN rn END ASC
+OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY;

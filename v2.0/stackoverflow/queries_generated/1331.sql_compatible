@@ -1,0 +1,173 @@
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT P.Id) AS TotalPostsAuthored,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        SUM(COALESCE(P.Score, 0)) AS TotalAuthoredPostScore,
+        COUNT(DISTINCT B.Id) AS TotalBadgesReceived,
+        MAX(U.LastAccessDate) AS LatestUserActivity,
+        AVG(CASE WHEN P.PostTypeId = 1 THEN P.Score ELSE NULL END) AS AvgQuestionScoreAuthored,
+        (
+            SELECT TRIM(TagSplit.value)
+            FROM PostHistory PH_Tags,
+                 LATERAL (SELECT value FROM UNNEST(string_to_array(substr(PH_Tags.Text, 2, length(PH_Tags.Text) - 2), '><')) AS value) AS TagSplit
+            WHERE PH_Tags.PostId IN (SELECT P_Inner.Id FROM Posts P_Inner WHERE P_Inner.OwnerUserId = U.Id)
+              AND PH_Tags.PostHistoryTypeId = 3
+              AND PH_Tags.Text IS NOT NULL AND length(PH_Tags.Text) > 2
+            GROUP BY TRIM(TagSplit.value)
+            ORDER BY COUNT(*) DESC, TRIM(TagSplit.value) ASC
+            LIMIT 1
+        ) AS MostFrequentInitialTagByAuthor
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate
+),
+PostHistoricalMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.CreationDate AS PostCreationDate,
+        P.LastActivityDate,
+        P.ViewCount,
+        P.Score AS PostScore,
+        P.OwnerUserId,
+        P.Title,
+        P.Tags,
+        P.AnswerCount AS ReportedAnswerCount,
+        P.FavoriteCount,
+        P.ClosedDate,
+        CR.Name AS CloseReason,
+        COUNT(DISTINCT PH_EditBody.Id) AS BodyEditCount,
+        COUNT(DISTINCT PH_EditTags.Id) AS TagEditCount,
+        MAX(CASE WHEN PH_Closed.PostHistoryTypeId = 10 THEN PH_Closed.CreationDate ELSE NULL END) AS LastClosedDate,
+        MAX(CASE WHEN PH_Reopened.PostHistoryTypeId = 11 THEN PH_Reopened.CreationDate ELSE NULL END) AS LastReopenedDate,
+        MAX(PH_MigrationAway.CreationDate) AS LastMigratedAwayDate
+    FROM Posts P
+    LEFT JOIN PostHistory PH_Closed ON P.Id = PH_Closed.PostId AND PH_Closed.PostHistoryTypeId = 10
+    LEFT JOIN CloseReasonTypes CR ON (PH_Closed.Comment ~ '^\d+$' AND CAST(PH_Closed.Comment AS INTEGER)) = CR.Id
+    LEFT JOIN PostHistory PH_Reopened ON P.Id = PH_Reopened.PostId AND PH_Reopened.PostHistoryTypeId = 11
+    LEFT JOIN PostHistory PH_EditBody ON P.Id = PH_EditBody.PostId AND PH_EditBody.PostHistoryTypeId = 5
+    LEFT JOIN PostHistory PH_EditTags ON P.Id = PH_EditTags.PostId AND PH_EditTags.PostHistoryTypeId = 6
+    LEFT JOIN PostHistory PH_MigrationAway ON P.Id = PH_MigrationAway.PostId AND PH_MigrationAway.PostHistoryTypeId = 35
+    WHERE P.PostTypeId = 1
+    GROUP BY P.Id, P.PostTypeId, P.CreationDate, P.LastActivityDate, P.ViewCount, P.Score, P.OwnerUserId, P.Title, P.Tags, P.AnswerCount, P.FavoriteCount, P.ClosedDate, CR.Name
+),
+AnswerAndCommentAggregates AS (
+    SELECT
+        Q.Id AS QuestionId,
+        COUNT(DISTINCT A.Id) AS ActualAnswerCount,
+        AVG(COALESCE(A.Score, 0)) AS AvgAnswerScore,
+        SUM(COALESCE(A.CommentCount, 0)) AS TotalCommentsOnAnswers,
+        AVG(COALESCE(C.Score, 0)) AS AvgCommentScoreOnQuestion,
+        COUNT(DISTINCT C.Id) AS TotalCommentsOnQuestion,
+        MAX(A.CreationDate) AS LatestAnswerDate,
+        MAX(C.CreationDate) AS LatestCommentDate
+    FROM Posts Q
+    LEFT JOIN Posts A ON Q.Id = A.ParentId AND A.PostTypeId = 2
+    LEFT JOIN Comments C ON Q.Id = C.PostId
+    WHERE Q.PostTypeId = 1
+    GROUP BY Q.Id
+),
+PostLinkSummary AS (
+    SELECT
+        P.Id AS PostId,
+        COUNT(DISTINCT PL_Linked.RelatedPostId) AS NumberOfLinkedPosts,
+        COUNT(DISTINCT PL_Duplicate.RelatedPostId) AS NumberOfDuplicatePosts,
+        MAX(PL_Linked.CreationDate) AS LatestLinkedPostDate,
+        MAX(PL_Duplicate.CreationDate) AS LatestDuplicatePostDate
+    FROM Posts P
+    LEFT JOIN PostLinks PL_Linked ON P.Id = PL_Linked.PostId AND PL_Linked.LinkTypeId = 1
+    LEFT JOIN PostLinks PL_Duplicate ON P.Id = PL_Duplicate.PostId AND PL_Duplicate.LinkTypeId = 3
+    WHERE P.PostTypeId = 1
+    GROUP BY P.Id
+),
+PrimaryPostTags AS (
+    SELECT
+        P.Id AS PostId,
+        TRIM(t.value) AS PrimaryTag,
+        ROW_NUMBER() OVER (PARTITION BY P.Id ORDER BY length(TRIM(t.value)) DESC, TRIM(t.value) ASC) AS rn
+    FROM Posts P,
+         LATERAL (SELECT value FROM UNNEST(string_to_array(substr(P.Tags, 2, length(P.Tags) - 2), '><')) AS value) AS t
+    WHERE P.Tags IS NOT NULL AND length(P.Tags) > 2 AND P.PostTypeId = 1
+),
+RankedPopularTags AS (
+    SELECT
+        TRIM(t.value) AS TagName,
+        COUNT(P.Id) AS TaggedPostCount,
+        ROW_NUMBER() OVER (ORDER BY COUNT(P.Id) DESC, TRIM(t.value) ASC) AS GlobalTagRank
+    FROM Posts P,
+         LATERAL (SELECT value FROM UNNEST(string_to_array(substr(P.Tags, 2, length(P.Tags) - 2), '><')) AS value) AS t
+    WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL AND length(P.Tags) > 2
+    GROUP BY TRIM(t.value)
+)
+SELECT
+    UE.UserId,
+    UE.DisplayName,
+    UE.Reputation,
+    PHM.PostId,
+    PHM.Title AS QuestionTitle,
+    PHM.PostCreationDate,
+    (EXTRACT(EPOCH FROM (PHM.LastActivityDate - PHM.PostCreationDate)) / 86400)::bigint AS DaysSinceCreationActivity,
+    COALESCE(PHM.ViewCount, 0) AS ViewCount,
+    PHM.PostScore,
+    COALESCE(PHM.FavoriteCount, 0) AS FavoriteCount,
+    PHM.ReportedAnswerCount AS InitialReportedAnswerCount,
+    COALESCE(ACA.ActualAnswerCount, 0) AS CurrentActualAnswerCount,
+    ACA.AvgAnswerScore,
+    COALESCE(ACA.TotalCommentsOnQuestion, 0) AS TotalCommentsOnQuestion,
+    ACA.AvgCommentScoreOnQuestion,
+    COALESCE(PLS.NumberOfLinkedPosts, 0) AS NumberOfLinkedQuestions,
+    COALESCE(PLS.NumberOfDuplicatePosts, 0) AS NumberOfDuplicateQuestions,
+    PHM.BodyEditCount,
+    PHM.TagEditCount,
+    PHM.CloseReason,
+    CASE
+        WHEN PHM.LastMigratedAwayDate IS NOT NULL THEN 'Migrated Away'
+        WHEN PHM.ClosedDate IS NOT NULL OR PHM.LastClosedDate IS NOT NULL THEN
+            CASE
+                WHEN PHM.LastReopenedDate IS NOT NULL AND PHM.LastReopenedDate > COALESCE(PHM.ClosedDate, PHM.LastClosedDate) THEN 'Reopened'
+                ELSE 'Closed'
+            END
+        ELSE 'Open'
+    END AS PostLifecycleStatus,
+    LAG(PHM.PostScore, 1, 0) OVER (PARTITION BY UE.UserId ORDER BY PHM.PostCreationDate) AS PreviousPostScoreByAuthor,
+    RANK() OVER (PARTITION BY UE.UserId ORDER BY PHM.PostScore DESC, PHM.PostCreationDate ASC) AS UserQuestionScoreRank,
+    COALESCE(UE.MostFrequentInitialTagByAuthor, '(No Primary Tag Data)') AS UserPreferredTagCategory,
+    RPT.GlobalTagRank AS QuestionPrimaryTagGlobalRank,
+    (
+        SELECT COUNT(DISTINCT V.Id)
+        FROM Votes V
+        WHERE V.PostId = PHM.PostId AND V.VoteTypeId = 2
+    ) AS UpVoteCountForQuestion,
+    NULLIF(CAST(PHM.ViewCount AS NUMERIC(10,2)), 0) / NULLIF(CAST(PHM.PostScore AS NUMERIC(10,2)), 0) AS ViewScoreRatio,
+    CASE WHEN PHM.LastClosedDate IS NOT NULL AND EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - PHM.LastClosedDate)) < 86400 THEN 'Recently Closed' ELSE 'Not Recently Closed' END AS RecentClosureFlag
+FROM UserEngagement UE
+INNER JOIN PostHistoricalMetrics PHM ON UE.UserId = PHM.OwnerUserId
+LEFT JOIN AnswerAndCommentAggregates ACA ON PHM.PostId = ACA.QuestionId
+LEFT JOIN PostLinkSummary PLS ON PHM.PostId = PLS.PostId
+LEFT JOIN PrimaryPostTags PPT ON PHM.PostId = PPT.PostId AND PPT.rn = 1
+LEFT JOIN RankedPopularTags RPT ON PPT.PrimaryTag = RPT.TagName
+WHERE
+    UE.Reputation > 5000
+    AND PHM.ViewCount > 1000
+    AND PHM.PostScore > 50
+    AND PHM.PostCreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '18 months')
+    AND (
+        PHM.Title ILIKE '%performance%' OR
+        PHM.Title ILIKE '%benchmark%' OR
+        PHM.Tags ILIKE '%performance%' OR
+        PHM.Tags ILIKE '%<sql-server>%' OR
+        PHM.Tags ILIKE '%<optimization>%' OR
+        PHM.Tags ILIKE '%<database-design>%'
+    )
+ORDER BY
+    UE.Reputation DESC,
+    PHM.PostScore DESC,
+    DaysSinceCreationActivity ASC,
+    PHM.LastActivityDate DESC
+OFFSET 0 ROWS FETCH NEXT 2000 ROWS ONLY;

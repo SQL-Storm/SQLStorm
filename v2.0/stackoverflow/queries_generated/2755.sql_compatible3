@@ -1,0 +1,190 @@
+WITH RECURSIVE RecursiveBadges AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        b.Name AS BadgeName,
+        b.Class,
+        b.Date,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY b.Date DESC, b.Class) AS BadgeRank
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Reputation > 5000
+),
+RecentPostsWithScores AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS RecentPostRank,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) AS TotalPostsByUser
+    FROM Posts p
+    WHERE p.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year' AND p.Score IS NOT NULL
+),
+QuestionsWithAcceptedAnswerDetails AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.OwnerUserId,
+        q.AcceptedAnswerId,
+        a.Score AS AcceptedAnswerScore,
+        a.OwnerUserId AS AcceptedAnswerOwnerUserId,
+        a.CreationDate AS AcceptedAnswerCreationDate,
+        a.Body AS AcceptedAnswerBody,
+        CASE 
+            WHEN q.ClosedDate IS NOT NULL THEN 'Closed'
+            ELSE 'Open'
+        END AS QuestionStatus
+    FROM Posts q
+    LEFT JOIN Posts a ON q.AcceptedAnswerId = a.Id
+    WHERE q.PostTypeId = 1
+),
+CloseReasonCounts AS (
+    SELECT
+        cht.Name AS CloseReasonName,
+        COUNT(ph.Id) AS CloseCount
+    FROM PostHistory ph
+    INNER JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    INNER JOIN CloseReasonTypes cht ON CAST(ph.Comment AS integer) = cht.Id
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY cht.Name
+),
+UserActivitySummary AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersCount,
+        COUNT(DISTINCT c.Id) AS CommentsCount,
+        COALESCE(SUM(v.VoteCount), 0) AS TotalVotesReceived,
+        COALESCE(SUM(v.VoteCount), 0) - COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.PostId END) * 2 AS WeightedVoteScore,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN (
+        SELECT PostId, VoteTypeId, COUNT(Id) AS VoteCount
+        FROM Votes
+        WHERE VoteTypeId IN (2,3)
+        GROUP BY PostId, VoteTypeId
+    ) v ON v.PostId = p.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+RecursiveUserComments AS (
+    SELECT c.Id, c.PostId, c.UserId, c.CreationDate, c.Text,
+        1 AS Depth
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+
+    UNION ALL
+
+    SELECT c2.Id, c2.PostId, c2.UserId, c2.CreationDate, c2.Text, rc.Depth + 1
+    FROM Comments c2
+    INNER JOIN RecursiveUserComments rc ON c2.UserId = rc.UserId AND c2.CreationDate > rc.CreationDate
+    WHERE rc.Depth < 3
+),
+UserBadgesRanked AS (
+    SELECT 
+        UserId, 
+        BadgeName, 
+        Class, 
+        Date,
+        DENSE_RANK() OVER (PARTITION BY UserId ORDER BY Class, Date DESC) AS DenseBadgeRank
+    FROM Badges
+    WHERE TagBased = 0
+),
+CombinedQuestionsAndAnswers AS (
+    SELECT p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score,
+           t.TagName,
+           ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate DESC) AS UserPostRank
+    FROM Posts p
+    LEFT JOIN LATERAL (
+        SELECT UNNEST (
+            CASE 
+                WHEN p.Tags IS NOT NULL THEN string_to_array(
+                    substring(p.Tags from 2 for char_length(p.Tags) - 2), '><'
+                )
+                ELSE string_to_array('', '') -- results in empty set in UNNEST-safe manner
+            END
+        ) AS TagName
+    ) t ON true
+    WHERE p.PostTypeId IN (1,2)
+),
+UnionExample AS (
+    SELECT Id, OwnerUserId, Score AS Value, 'Question' AS PostCategory
+    FROM Posts
+    WHERE PostTypeId = 1 AND Score > 5
+
+    UNION
+
+    SELECT Id, OwnerUserId, Score AS Value, 'Answer' AS PostCategory
+    FROM Posts
+    WHERE PostTypeId = 2 AND Score > 3
+),
+CorrelationExample AS (
+    SELECT p.Id, p.Title, p.CreationDate, p.Score,
+        (
+            SELECT AVG(p2.Score) 
+            FROM Posts p2 
+            WHERE p2.OwnerUserId = p.OwnerUserId AND p2.PostTypeId = 2
+        ) AS AverageAnswerScoreByOwner
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+)
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    uas.QuestionsCount,
+    uas.AnswersCount,
+    uas.CommentsCount,
+    uas.TotalVotesReceived,
+    uas.WeightedVoteScore,
+    rbt.BadgeName AS MostRecentBadge,
+    rbt.Class AS BadgeClass,
+    rpws.Id AS RecentPostId,
+    rpws.PostTypeId AS RecentPostType,
+    rpws.Score AS RecentPostScore,
+    rpws.ViewCount AS RecentPostViews,
+    qa.QuestionId,
+    qa.Title,
+    qa.AcceptedAnswerScore,
+    qa.QuestionStatus,
+    crc.CloseReasonName,
+    crc.CloseCount,
+    uq.UserPostRank,
+    ue.AverageAnswerScoreByOwner,
+    ue.Score AS QuestionScore,
+    ue.Title AS QuestionTitle,
+    ue.CreationDate AS QuestionCreated,
+    subq.Value AS UnionValue,
+    subq.PostCategory,
+    CASE
+        WHEN ua.DisplayName IS NOT NULL THEN CONCAT('User: ', ua.DisplayName)
+        ELSE 'Anonymous or Deleted User'
+    END AS UserDisplayString,
+    CASE 
+        WHEN ua.Id IS NULL THEN 0
+        ELSE 1
+    END AS HasUser,
+    CASE 
+        WHEN qa.QuestionStatus = 'Closed' THEN CONCAT('Closed question titled "', qa.Title, '" by user ', u.DisplayName)
+        WHEN qa.AcceptedAnswerScore IS NULL THEN CONCAT('Open question titled "', qa.Title, '" without accepted answer')
+        ELSE CONCAT('Open question titled "', qa.Title, '" with accepted answer score ', qa.AcceptedAnswerScore)
+    END AS QuestionSummary
+FROM Users u
+INNER JOIN UserActivitySummary uas ON uas.Id = u.Id
+LEFT JOIN RecursiveBadges rbt ON rbt.UserId = u.Id AND rbt.BadgeRank = 1
+LEFT JOIN RecentPostsWithScores rpws ON rpws.OwnerUserId = u.Id AND rpws.RecentPostRank = 1
+LEFT JOIN QuestionsWithAcceptedAnswerDetails qa ON qa.OwnerUserId = u.Id
+LEFT JOIN CloseReasonCounts crc ON TRUE
+LEFT JOIN CombinedQuestionsAndAnswers uq ON uq.OwnerUserId = u.Id AND uq.UserPostRank = 1
+LEFT JOIN CorrelationExample ue ON ue.Id = uq.Id
+LEFT JOIN UnionExample subq ON subq.OwnerUserId = u.Id
+LEFT JOIN Users ua ON ua.Id = u.Id
+WHERE u.Reputation > 10000
+ORDER BY uas.TotalVotesReceived DESC NULLS LAST, uas.WeightedVoteScore DESC NULLS LAST
+LIMIT 100;

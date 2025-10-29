@@ -1,0 +1,121 @@
+-- {"query": "4495.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1226} 
+
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS PostsCreated,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesReceived,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesReceived,
+        ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC, u.Reputation DESC) AS PostRank,
+        RANK() OVER (PARTITION BY DATE_PART('year', u.CreationDate) ORDER BY SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) DESC) AS TopUpvoterRankInYear
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    WHERE u.DisplayName IS NOT NULL AND u.DisplayName NOT LIKE '%[deleted]%'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+PostEngagement AS (
+    SELECT
+        p.Id AS PostId,
+        pt.Name AS PostType,
+        p.Title,
+        p.Score,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+            ELSE 'Active'
+        END AS PostStatus,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id AND c.Score > 5) AS HighScoreComments,
+        COALESCE(p.ViewCount, 0) AS Views,
+        ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.CreationDate DESC) AS ScoreRank,
+        LAG(p.Score, 1, 0) OVER (ORDER BY p.CreationDate) AS PreviousPostScore
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.OwnerUserId IS NOT NULL AND p.OwnerUserId != -1 AND pt.Name IN ('Question', 'Answer')
+),
+UserPostSummary AS (
+    SELECT
+        ua.UserId,
+        ua.DisplayName,
+        ua.PostsCreated,
+        ua.CommentsMade,
+        ua.UpvotesReceived,
+        ua.DownvotesReceived,
+        pe.PostId,
+        pe.PostType,
+        pe.Title,
+        pe.Score,
+        pe.AnswerCount,
+        pe.CommentCount,
+        pe.FavoriteCount,
+        pe.PostStatus,
+        pe.HighScoreComments,
+        pe.Views,
+        pe.ScoreRank,
+        pe.PreviousPostScore,
+        ROW_NUMBER() OVER (PARTITION BY ua.UserId ORDER BY pe.Score DESC) AS UserTopPostScoreRank
+    FROM UserActivity ua
+    JOIN PostEngagement pe ON ua.UserId = pe.OwnerUserId
+    WHERE ua.PostsCreated > 10 AND ua.UpvotesReceived > 50
+)
+SELECT
+    ups.DisplayName,
+    ups.UserId,
+    ups.PostsCreated,
+    ups.CommentsMade,
+    ups.UpvotesReceived,
+    ups.DownvotesReceived,
+    ups.PostId,
+    ups.PostType,
+    ups.Title,
+    ups.Score,
+    ups.AnswerCount,
+    ups.CommentCount,
+    ups.FavoriteCount,
+    ups.PostStatus,
+    ups.HighScoreComments,
+    ups.Views,
+    ups.ScoreRank,
+    ups.PreviousPostScore,
+    ups.UserTopPostScoreRank,
+    CASE
+        WHEN ups.Score > 1000 AND ups.AnswerCount > 10 THEN 'Highly Engaged Question'
+        WHEN ups.Score > 50 AND ups.CommentCount > 5 THEN 'Frequently Discussed Post'
+        ELSE 'Standard Post'
+    END AS PostEngagementLevel,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = ups.PostId AND pl.LinkTypeId = 3) AS DuplicateLinks
+FROM UserPostSummary ups
+WHERE ups.UserTopPostScoreRank <= 5 -- Top 5 posts by score for each highly active user
+UNION ALL
+SELECT
+    ua.DisplayName,
+    ua.UserId,
+    ua.PostsCreated,
+    ua.CommentsMade,
+    ua.UpvotesReceived,
+    ua.DownvotesReceived,
+    NULL AS PostId,
+    NULL AS PostType,
+    'Overall Summary' AS Title,
+    NULL AS Score,
+    NULL AS AnswerCount,
+    NULL AS CommentCount,
+    NULL AS FavoriteCount,
+    NULL AS PostStatus,
+    NULL AS HighScoreComments,
+    ua.PostRank AS Views, -- Reusing Views column for PostRank
+    NULL AS ScoreRank,
+    NULL AS PreviousPostScore,
+    ua.TopUpvoterRankInYear,
+    'User Aggregate' AS PostEngagementLevel,
+    NULL AS DuplicateLinks
+FROM UserActivity ua
+WHERE ua.PostRank <= 100 -- Top 100 most active users overall
+ORDER BY DisplayName, PostId NULLS FIRST;

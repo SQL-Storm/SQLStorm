@@ -1,0 +1,122 @@
+-- {"query": "4479.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1495} 
+WITH RECURSIVE PostHierarchy AS (
+    -- Base case: Select top-level questions
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.AnswerCount,
+        1 AS Level,
+        CAST(p.Id AS VARCHAR(MAX)) AS Path,
+        p.Id AS RootPostId,
+        CAST(NULL AS INT) AS ParentPostId
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.ParentId IS NULL
+
+    UNION ALL
+
+    -- Recursive step: Select answers related to questions
+    SELECT
+        a.Id AS PostId,
+        a.Title, -- Answers don't typically have titles, but we select it for consistency
+        a.OwnerUserId,
+        a.CreationDate,
+        a.Score,
+        a.AnswerCount, -- AnswerCount is not relevant for answers, but included for structure
+        ph.Level + 1 AS Level,
+        ph.Path + '/' + CAST(a.Id AS VARCHAR(MAX)),
+        ph.RootPostId,
+        ph.PostId AS ParentPostId
+    FROM Posts a
+    JOIN PostHierarchy ph ON a.ParentId = ph.PostId
+    WHERE a.PostTypeId = 2
+),
+AnswerQuality AS (
+    SELECT
+        p.Id AS PostId,
+        AVG(CAST(c.Score AS FLOAT)) AS AverageCommentScore,
+        COUNT(DISTINCT c.Id) AS NumberOfComments,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS Downvotes,
+        MAX(CASE WHEN p.AcceptedAnswerId = p.Id THEN 1 ELSE 0 END) AS IsAcceptedAnswer
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (2, 3)
+    WHERE p.PostTypeId = 2 -- Only consider answers
+    GROUP BY p.Id
+),
+UserContribution AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT ph.PostId) AS TotalPostsOwned,
+        SUM(CASE WHEN ph.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsOwned,
+        SUM(CASE WHEN ph.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersOwned,
+        AVG(ph.Score) AS AveragePostScore,
+        MAX(u.CreationDate) AS LatestUserCreationDate
+    FROM Users u
+    LEFT JOIN Posts ph ON u.Id = ph.OwnerUserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+PostInteraction AS (
+    SELECT
+        p.Id AS PostId,
+        COUNT(DISTINCT ph.Id) AS PostHistoryEvents,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT pv.Id) AS TotalVotes,
+        SUM(CASE WHEN pht.Name IN ('Post Closed', 'Post Merged') THEN 1 ELSE 0 END) AS ClosureOrMergeEvents,
+        STRING_AGG(DISTINCT pt.Name, ', ') AS PostTagNames
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    LEFT JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes pv ON p.Id = pv.PostId
+    LEFT JOIN (SELECT PostId, STRING_AGG(TagName, ',') AS TagNames FROM Posts CROSS APPLY STRING_SPLIT(REPLACE(REPLACE(Tags, '<', ''), '>', ''), ',') WHERE PostTypeId = 1 GROUP BY PostId) AS TagsAgg ON p.Id = TagsAgg.PostId
+    LEFT JOIN Tags pt ON TagsAgg.TagNames LIKE '%' + pt.TagName + '%'
+    WHERE p.PostTypeId = 1 -- Focus on questions for interaction metrics
+    GROUP BY p.Id
+)
+SELECT
+    ph.PostId,
+    ph.Title AS QuestionTitle,
+    u.DisplayName AS QuestionOwnerDisplayName,
+    ph.CreationDate AS QuestionCreationDate,
+    ph.Score AS QuestionScore,
+    ph.AnswerCount AS QuestionAnswerCount,
+    aq.AverageCommentScore,
+    aq.NumberOfComments,
+    aq.Upvotes AS AnswerUpvotes,
+    aq.Downvotes AS AnswerDownvotes,
+    aq.IsAcceptedAnswer,
+    uc.Reputation AS QuestionOwnerReputation,
+    uc.TotalPostsOwned AS QuestionOwnerTotalPosts,
+    uc.QuestionsOwned AS QuestionOwnerQuestions,
+    uc.AnswersOwned AS QuestionOwnerAnswers,
+    uc.AveragePostScore AS QuestionOwnerAverageScore,
+    pi.PostHistoryEvents,
+    pi.TotalComments AS QuestionTotalComments,
+    pi.TotalVotes AS QuestionTotalVotes,
+    pi.ClosureOrMergeEvents,
+    pi.PostTagNames,
+    COALESCE(u.DisplayName, 'Deleted User') AS SafeOwnerDisplayName,
+    CASE
+        WHEN ph.Score > 1000 AND ph.AnswerCount > 50 THEN 'High Engagement'
+        WHEN ph.Score <= 0 AND ph.AnswerCount = 0 THEN 'Low Engagement'
+        ELSE 'Moderate Engagement'
+    END AS EngagementLevel,
+    ROW_NUMBER() OVER (PARTITION BY ph.RootPostId ORDER BY aq.IsAcceptedAnswer DESC, aq.AverageCommentScore DESC, aq.NumberOfComments DESC) AS AnswerRankForQuestion
+FROM PostHierarchy ph
+LEFT JOIN Posts p ON ph.PostId = p.Id -- Join to get PostTypeId and other details
+LEFT JOIN Users u ON ph.OwnerUserId = u.Id
+LEFT JOIN AnswerQuality aq ON ph.PostId = aq.PostId -- This join is incorrect for questions; need to join answers to questions
+LEFT JOIN UserContribution uc ON ph.OwnerUserId = uc.UserId
+LEFT JOIN PostInteraction pi ON ph.PostId = pi.PostId
+WHERE ph.Level = 1 -- Only consider top-level questions
+  AND (p.ClosedDate IS NULL OR p.ClosedDate > DATEADD(year, -1, cast('2024-10-01 12:34:56' as timestamp))) -- Exclude questions closed more than a year ago
+  AND pi.PostTagNames IS NOT NULL
+  AND uc.Reputation BETWEEN 100 AND 10000
+ORDER BY ph.CreationDate DESC
+LIMIT 100;

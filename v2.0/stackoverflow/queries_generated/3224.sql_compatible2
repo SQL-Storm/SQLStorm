@@ -1,0 +1,98 @@
+WITH UserReputation AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COALESCE(u.Location, 'Unknown') AS Location,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location
+), PostStats AS (
+    SELECT 
+        p.OwnerUserId AS UserId,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        SUM(p.Score) FILTER (WHERE p.PostTypeId = 1) AS QuestionScoreSum,
+        SUM(p.Score) FILTER (WHERE p.PostTypeId = 2) AS AnswerScoreSum,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+), VoteAggregates AS (
+    SELECT 
+        v.PostId,
+        SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS DownVotes
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY v.PostId
+), TopTags AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0
+), MainRows AS (
+    SELECT 
+        ur.Id,
+        ur.DisplayName,
+        ur.Reputation,
+        ur.Location,
+        ur.GoldBadges,
+        ur.SilverBadges,
+        ur.BronzeBadges,
+        COALESCE(ps.QuestionCount, 0) AS QuestionCount,
+        COALESCE(ps.AnswerCount, 0) AS AnswerCount,
+        COALESCE(ps.QuestionScoreSum, 0) - COALESCE(ps.AnswerScoreSum, 0) AS NetScore,
+        ps.LastPostDate,
+        (SELECT AVG(vu.UpVotes) 
+         FROM Posts p2
+         JOIN VoteAggregates vu ON vu.PostId = p2.Id
+         WHERE p2.OwnerUserId = ur.Id AND p2.PostTypeId = 1) AS AvgUpVotesPerQuestion,
+        (SELECT STRING_AGG(t.TagName, ', ') 
+         FROM (SELECT TagName FROM TopTags WHERE TagRank <= 3) t) AS TopThreeTags,
+        CASE 
+            WHEN COALESCE(ps.AnswerCount,0) = 0 AND ur.GoldBadges > 5 THEN 1
+            ELSE 0
+        END AS SuspiciousGoldOnlyUser
+    FROM UserReputation ur
+    LEFT JOIN PostStats ps ON ps.UserId = ur.Id
+    WHERE ur.Reputation > 10000
+      AND (ur.GoldBadges + ur.SilverBadges + ur.BronzeBadges) > 10
+)
+SELECT *
+FROM MainRows
+ORDER BY Reputation DESC
+FETCH FIRST 100 ROWS ONLY
+
+UNION ALL
+
+SELECT 
+    CAST(NULL AS bigint) AS Id,
+    'Aggregated Totals' AS DisplayName,
+    SUM(ur.Reputation) AS Reputation,
+    CAST(NULL AS text) AS Location,
+    SUM(ur.GoldBadges) AS GoldBadges,
+    SUM(ur.SilverBadges) AS SilverBadges,
+    SUM(ur.BronzeBadges) AS BronzeBadges,
+    SUM(COALESCE(ps.QuestionCount,0)) AS QuestionCount,
+    SUM(COALESCE(ps.AnswerCount,0)) AS AnswerCount,
+    SUM(COALESCE(ps.QuestionScoreSum,0)) - SUM(COALESCE(ps.AnswerScoreSum,0)) AS NetScore,
+    MAX(ps.LastPostDate) AS LastPostDate,
+    AVG(
+      (SELECT AVG(vu.UpVotes) 
+       FROM Posts p2
+       JOIN VoteAggregates vu ON vu.PostId = p2.Id
+       WHERE p2.OwnerUserId = ur.Id AND p2.PostTypeId = 1)
+    ) AS AvgUpVotesPerQuestion,
+    CAST(NULL AS text) AS TopThreeTags,
+    CAST(NULL AS integer) AS SuspiciousGoldOnlyUser
+FROM UserReputation ur
+LEFT JOIN PostStats ps ON ps.UserId = ur.Id
+WHERE ur.Reputation > 10000
+  AND (ur.GoldBadges + ur.SilverBadges + ur.BronzeBadges) > 10;

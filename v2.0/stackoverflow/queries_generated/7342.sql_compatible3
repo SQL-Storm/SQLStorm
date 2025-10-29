@@ -1,0 +1,218 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LatestPostDate,
+        MAX(c.CreationDate) AS LatestCommentDate,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Elite'
+            WHEN u.Reputation > 5000 THEN 'Veteran'
+            WHEN u.Reputation > 1000 THEN 'Active'
+            ELSE 'Newbie'
+        END AS ReputationTier,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RankByReputation,
+        DENSE_RANK() OVER (ORDER BY u.Views DESC) AS RankByViews
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        Views,
+        PostCount,
+        CommentCount,
+        BadgeCount,
+        LatestPostDate,
+        LatestCommentDate,
+        ReputationTier,
+        RankByReputation,
+        RankByViews,
+        CASE 
+            WHEN PostCount > 100 AND CommentCount > 500 THEN 'Highly Engaged'
+            WHEN PostCount > 50 AND CommentCount > 200 THEN 'Engaged'
+            WHEN PostCount > 10 AND CommentCount > 50 THEN 'Moderately Engaged'
+            ELSE 'Casual'
+        END AS EngagementLevel
+    FROM UserActivityStats
+    WHERE RankByReputation <= 1000
+),
+PostComplexity AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.ParentId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END AS PostType,
+        CASE 
+            WHEN p.ViewCount > 10000 THEN 'Viral'
+            WHEN p.ViewCount > 1000 THEN 'Popular'
+            WHEN p.ViewCount > 100 THEN 'Moderate'
+            ELSE 'Low'
+        END AS Popularity,
+        CASE 
+            WHEN p.Score > 100 THEN 'Highly Rated'
+            WHEN p.Score > 50 THEN 'Well Rated'
+            WHEN p.Score > 10 THEN 'Average Rated'
+            ELSE 'Low Rated'
+        END AS Rating,
+        CASE 
+            WHEN p.AnswerCount > 50 THEN 'Highly Answered'
+            WHEN p.AnswerCount > 10 THEN 'Moderately Answered'
+            WHEN p.AnswerCount > 0 THEN 'Slightly Answered'
+            ELSE 'Unanswered'
+        END AS AnswerStatus,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCountFromComments,
+        CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS HasAcceptedAnswer,
+        COALESCE(p.Tags, '') AS TagsList,
+        CHAR_LENGTH(COALESCE(p.Tags, '')) AS TagsLength,
+        TRIM(REPLACE(REPLACE(REPLACE(COALESCE(p.Tags, ''), '<', ''), '>', ''), ' ', '')) AS CleanTags,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpVotesCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS DownVotesCount,
+        (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (1, 4, 5, 6)) AS EditCount
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) AND p.Score IS NOT NULL
+),
+CombinedAnalysis AS (
+    SELECT 
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.Views,
+        tu.PostCount,
+        tu.CommentCount,
+        tu.BadgeCount,
+        tu.ReputationTier,
+        tu.RankByReputation,
+        tu.RankByViews,
+        tu.EngagementLevel,
+        pc.PostId,
+        pc.Title,
+        pc.Score,
+        pc.ViewCount,
+        pc.AnswerCount,
+        pc.CommentCount AS PostCommentCount,
+        pc.FavoriteCount,
+        pc.CreationDate AS PostCreationDate,
+        pc.PostType,
+        pc.Popularity,
+        pc.Rating,
+        pc.AnswerStatus,
+        pc.CommentCountFromComments,
+        pc.HasAcceptedAnswer,
+        pc.TagsList,
+        pc.TagsLength,
+        pc.CleanTags,
+        pc.UpVotesCount,
+        pc.DownVotesCount,
+        pc.EditCount,
+        (CAST(EXTRACT(EPOCH FROM TIMESTAMP '2024-10-01 12:34:56') AS BIGINT)) - (CAST(EXTRACT(EPOCH FROM tu.LatestPostDate) AS BIGINT)) AS SecondsSinceLatestPost,
+        (CAST(EXTRACT(EPOCH FROM TIMESTAMP '2024-10-01 12:34:56') AS BIGINT)) - (CAST(EXTRACT(EPOCH FROM tu.LatestCommentDate) AS BIGINT)) AS SecondsSinceLatestComment,
+        (COALESCE(tu.PostCount,0) + COALESCE(tu.CommentCount,0) + COALESCE(tu.BadgeCount,0)) AS TotalActivityPoints,
+        CASE 
+            WHEN tu.PostCount > 0 AND (CAST(pc.Score AS DOUBLE PRECISION) / CAST(tu.PostCount AS DOUBLE PRECISION)) > 5 THEN 'High Value Contributor'
+            WHEN tu.PostCount > 0 AND (CAST(pc.Score AS DOUBLE PRECISION) / CAST(tu.PostCount AS DOUBLE PRECISION)) > 2 THEN 'Value Contributor'
+            WHEN tu.PostCount > 0 AND (CAST(pc.Score AS DOUBLE PRECISION) / CAST(tu.PostCount AS DOUBLE PRECISION)) >= 0 THEN 'Standard Contributor'
+            ELSE 'Inactive'
+        END AS ContributionValue,
+        DATE '2024-10-01' AS ReferenceDate
+    FROM TopUsers tu
+    INNER JOIN PostComplexity pc ON tu.UserId = pc.OwnerUserId
+    WHERE (pc.ViewCount > 1000 OR pc.Score > 50 OR pc.AnswerCount > 10 OR (pc.CommentCountFromComments > 10 AND tu.RankByReputation <= 500))
+      AND pc.CreationDate >= (DATE '2024-10-01' - INTERVAL '12 months')
+),
+FinalResults AS (
+    SELECT 
+        ca.UserId,
+        ca.DisplayName,
+        ca.Reputation,
+        ca.Views,
+        ca.PostCount,
+        ca.CommentCount,
+        ca.BadgeCount,
+        ca.ReputationTier,
+        ca.RankByReputation,
+        ca.RankByViews,
+        ca.EngagementLevel,
+        ca.PostId,
+        ca.Title,
+        ca.Score,
+        ca.ViewCount,
+        ca.AnswerCount,
+        ca.PostCommentCount,
+        ca.FavoriteCount,
+        ca.PostCreationDate,
+        ca.PostType,
+        ca.Popularity,
+        ca.Rating,
+        ca.AnswerStatus,
+        ca.CommentCountFromComments,
+        ca.HasAcceptedAnswer,
+        ca.TagsList,
+        ca.TagsLength,
+        ca.CleanTags,
+        ca.UpVotesCount,
+        ca.DownVotesCount,
+        ca.EditCount,
+        (CAST(ca.SecondsSinceLatestPost AS DOUBLE PRECISION) / 86400.0) AS DaysSinceLatestPost,
+        (CAST(ca.SecondsSinceLatestComment AS DOUBLE PRECISION) / 86400.0) AS DaysSinceLatestComment,
+        ca.TotalActivityPoints,
+        ca.ContributionValue,
+        CAST(ca.Score AS DOUBLE PRECISION) / NULLIF(ca.PostCount, 0) AS AvgScorePerPost,
+        CAST(ca.CommentCountFromComments AS DOUBLE PRECISION) / NULLIF(ca.ViewCount, 0) AS CommentToViewRatio,
+        CAST(ca.AnswerCount AS DOUBLE PRECISION) / NULLIF(ca.PostCount, 0) AS AnswerToPostRatio,
+        CASE WHEN ca.DownVotesCount = 0 THEN NULL ELSE CAST(ca.UpVotesCount AS DOUBLE PRECISION) / CAST(ca.DownVotesCount AS DOUBLE PRECISION) END AS UpToDownRatio,
+        CASE 
+            WHEN (ca.CleanTags LIKE '%sql%' OR ca.CleanTags LIKE '%database%' OR ca.CleanTags LIKE '%query%') THEN 'SQL Related'
+            WHEN (ca.CleanTags LIKE '%c%' OR ca.CleanTags LIKE '%c++%' OR ca.CleanTags LIKE '%programming%') THEN 'Programming Related'
+            WHEN (ca.CleanTags LIKE '%python%' OR ca.CleanTags LIKE '%data%' OR ca.CleanTags LIKE '%analysis%') THEN 'Data Related'
+            ELSE 'Other'
+        END AS TopicCategory,
+        CASE 
+            WHEN (ca.PostType = 'Question' AND ca.AnswerCount >= 5 AND ca.Score >= 20) OR 
+                 (ca.PostType = 'Answer' AND ca.Score >= 10 AND ca.CommentCountFromComments >= 3) THEN 'High Quality'
+            WHEN (ca.PostType = 'Question' AND ca.AnswerCount >= 2 AND ca.Score >= 10) OR 
+                 (ca.PostType = 'Answer' AND ca.Score >= 5 AND ca.CommentCountFromComments >= 1) THEN 'Moderate Quality'
+            ELSE 'Low Quality'
+        END AS QualityLevel,
+        ROW_NUMBER() OVER (PARTITION BY ca.ReputationTier ORDER BY ca.Score DESC) AS ScoreRankInTier,
+        RANK() OVER (ORDER BY ca.TotalActivityPoints DESC) AS ActivityRank,
+        (SELECT ca2.PostId FROM CombinedAnalysis ca2 WHERE ca2.UserId = ca.UserId AND ca2.Score > 100 ORDER BY ca2.Score DESC LIMIT 1) AS TopScoringPostId
+    FROM CombinedAnalysis ca
+    WHERE 
+        ca.ViewCount > 500 
+        AND (ca.Score > 10 OR ca.AnswerCount > 2 OR ca.CommentCountFromComments > 5)
+        AND ca.ContributionValue IN ('High Value Contributor', 'Value Contributor', 'Standard Contributor')
+        AND (ca.RankByReputation <= 200 OR ca.RankByViews <= 200)
+        AND (ca.PostType = 'Question' OR (ca.PostType = 'Answer' AND ca.HasAcceptedAnswer = 1))
+)
+SELECT *
+FROM FinalResults
+ORDER BY 
+    Reputation DESC,
+    Score DESC,
+    ViewCount DESC
+LIMIT 2000 OFFSET 0;

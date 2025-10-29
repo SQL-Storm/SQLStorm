@@ -1,0 +1,111 @@
+-- {"query": "3722.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2398} 
+
+WITH UserStats AS (
+    SELECT u.Id,
+           u.DisplayName,
+           u.Reputation,
+           COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1)                AS QuestionCount,
+           COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2)                AS AnswerCount,
+           SUM(COALESCE(p.Score, 0))                                 AS TotalScore,
+           MAX(p.CreationDate)                                       AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+BadgeStats AS (
+    SELECT b.UserId,
+           COUNT(*) FILTER (WHERE b.Class = 1)                      AS GoldBadges,
+           COUNT(*) FILTER (WHERE b.Class = 2)                      AS SilverBadges,
+           COUNT(*) FILTER (WHERE b.Class = 3)                      AS BronzeBadges,
+           MAX(b.Date)                                              AS LatestBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+),
+TopTags AS (
+    SELECT t.TagName,
+           t.Count,
+           ROW_NUMBER() OVER (ORDER BY t.Count DESC)               AS TagRank
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0
+),
+RecentVotes AS (
+    SELECT v.PostId,
+           SUM(CASE WHEN vt.Name = 'UpMod'   THEN 1
+                    WHEN vt.Name = 'DownMod' THEN -1
+                    ELSE 0 END)                                    AS NetVote,
+           MAX(v.CreationDate)                                      AS LastVoteDate
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE v.CreationDate >= CURRENT_DATE - INTERVAL '30 days'
+    GROUP BY v.PostId
+),
+ClosedDuplicates AS (
+    SELECT ph.PostId,
+           ph.CreationDate                                          AS ClosedDate,
+           CAST(ph.Comment AS int)                                  AS DuplicateOfId
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10                               -- Post Closed
+      AND ph.Comment ~ '^\d+$'                                     -- only numeric comments
+)
+SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    COALESCE(us.QuestionCount, 0)                                 AS Questions,
+    COALESCE(us.AnswerCount, 0)                                   AS Answers,
+    COALESCE(us.TotalScore, 0)                                    AS ScoreSum,
+    COALESCE(bs.GoldBadges, 0)                                    AS Gold,
+    COALESCE(bs.SilverBadges, 0)                                  AS Silver,
+    COALESCE(bs.BronzeBadges, 0)                                  AS Bronze,
+    CASE
+        WHEN u.Reputation > 20000 THEN 'Elite'
+        WHEN u.Reputation > 10000 THEN 'Pro'
+        WHEN u.Reputation > 1000  THEN 'Active'
+        ELSE 'Newbie'
+    END                                                          AS ReputationTier,
+    STRING_AGG(DISTINCT t.TagName, ', ') FILTER (WHERE t.TagRank <= 5)
+                                                               AS TopTags,
+    MAX(rv.NetVote) OVER (PARTITION BY u.Id)                     AS MaxRecentNetVote,
+    COUNT(DISTINCT cd.DuplicateOfId) FILTER (WHERE cd.DuplicateOfId IS NOT NULL)
+                                                               AS DuplicatesClosed
+FROM Users u
+LEFT JOIN UserStats us          ON us.Id = u.Id
+LEFT JOIN BadgeStats bs         ON bs.UserId = u.Id
+LEFT JOIN Posts p               ON p.OwnerUserId = u.Id
+LEFT JOIN Tags t ON t.TagName = ANY(
+        STRING_TO_ARRAY(
+            REPLACE(REPLACE(p.Tags, '<', ''), '>', ''), ','
+        )
+    )
+LEFT JOIN RecentVotes rv        ON rv.PostId = p.Id
+LEFT JOIN ClosedDuplicates cd   ON cd.PostId = p.Id
+WHERE (u.CreationDate < CURRENT_DATE - INTERVAL '1 year' OR u.Reputation IS NOT NULL)
+GROUP BY u.Id, u.DisplayName, u.Reputation,
+         us.QuestionCount, us.AnswerCount, us.TotalScore,
+         bs.GoldBadges, bs.SilverBadges, bs.BronzeBadges,
+         ReputationTier
+HAVING COUNT(p.Id) > 0
+
+UNION ALL
+
+SELECT
+    NULL                                 AS Id,
+    'Aggregate'                          AS DisplayName,
+    NULL                                 AS Reputation,
+    SUM(COALESCE(us.QuestionCount, 0))   AS Questions,
+    SUM(COALESCE(us.AnswerCount, 0))     AS Answers,
+    SUM(COALESCE(us.TotalScore, 0))      AS ScoreSum,
+    SUM(COALESCE(bs.GoldBadges, 0))      AS Gold,
+    SUM(COALESCE(bs.SilverBadges, 0))    AS Silver,
+    SUM(COALESCE(bs.BronzeBadges, 0))    AS Bronze,
+    NULL                                 AS ReputationTier,
+    NULL                                 AS TopTags,
+    MAX(rv.NetVote)                     AS MaxRecentNetVote,
+    NULL                                 AS DuplicatesClosed
+FROM UserStats us
+LEFT JOIN BadgeStats bs ON bs.UserId = us.Id
+LEFT JOIN Posts p      ON p.OwnerUserId = us.Id
+LEFT JOIN RecentVotes rv ON rv.PostId = p.Id
+WHERE us.Reputation > 5000
+ORDER BY ReputationTier DESC NULLS LAST, Questions DESC
+LIMIT 100;

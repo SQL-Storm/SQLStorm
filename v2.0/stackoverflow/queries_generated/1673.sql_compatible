@@ -1,0 +1,171 @@
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.UpVotes AS TotalUpvotesGiven,
+        U.DownVotes AS TotalDownvotesGiven,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT B.Id) AS UniqueBadges,
+        COALESCE(SUM(P.Score), 0) AS SumOfPostScores,
+        COALESCE(AVG(P.Score), 0.0) AS AvgPostScore,
+        MAX(P.LastEditDate) AS LatestPostEditDate,
+        EXTRACT(EPOCH FROM (U.LastAccessDate - U.CreationDate)) / (60 * 60 * 24) AS DaysActive,
+        COALESCE(AVG(CASE WHEN C.Score IS NOT NULL THEN C.Score ELSE 0 END), 0.0) AS AvgCommentScore
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.UpVotes, U.DownVotes
+),
+PostHistoricalEvents AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.ParentId,
+        P.AcceptedAnswerId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount AS PostCommentCount,
+        P.FavoriteCount,
+        P.ClosedDate,
+        P.LastEditDate,
+        P.Title AS PostTitle,
+        P.Body AS PostBody,
+        P.Tags AS PostTagsRaw,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.Id END) AS EditEventsCount,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.Id END) AS CloseEventsCount,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId = 11 THEN PH.Id END) AS ReopenEventsCount,
+        COUNT(DISTINCT PL.RelatedPostId) AS LinkedPostsCount,
+        SUM(CASE WHEN PL.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicateLinkCount,
+        MAX(PH.CreationDate) AS LastHistoryEventDate
+    FROM Posts P
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    LEFT JOIN PostLinks PL ON P.Id = PL.PostId
+    GROUP BY P.Id, P.PostTypeId, P.ParentId, P.AcceptedAnswerId, P.OwnerUserId, P.CreationDate, P.Score, P.ViewCount,
+             P.AnswerCount, P.CommentCount, P.FavoriteCount, P.ClosedDate, P.LastEditDate, P.Title, P.Body, P.Tags
+),
+TagPerformance AS (
+    SELECT
+        TagName,
+        COUNT(DISTINCT P.Id) AS TotalPostsInTag,
+        COALESCE(AVG(P.Score), 0.0) AS AvgScoreInTag,
+        COALESCE(SUM(P.ViewCount), 0) AS TotalViewsInTag,
+        COALESCE(SUM(P.AnswerCount), 0) AS TotalAnswersInTag
+    FROM Posts P,
+         LATERAL (
+             SELECT unnest(string_to_array(substring(P.Tags, 2, length(P.Tags) - 2), '><')) AS TagName
+         ) t
+    WHERE P.Tags IS NOT NULL AND P.Tags <> '' AND P.OwnerUserId IS NOT NULL
+    GROUP BY TagName
+),
+UserPostRankings AS (
+    SELECT
+        PHE.PostId,
+        PHE.OwnerUserId AS UserId,
+        PHE.PostCreationDate,
+        PHE.PostScore,
+        PHE.PostTitle,
+        PHE.PostTagsRaw,
+        ROW_NUMBER() OVER (PARTITION BY PHE.OwnerUserId ORDER BY PHE.PostCreationDate DESC) AS rn_user_latest_post,
+        AVG(PHE.PostScore) OVER (PARTITION BY PHE.OwnerUserId ORDER BY PHE.PostCreationDate ASC ROWS BETWEEN 5 PRECEDING AND CURRENT ROW) AS UserMovingAvgScore,
+        RANK() OVER (PARTITION BY PHE.PostTypeId ORDER BY PHE.PostScore DESC, PHE.PostCreationDate DESC) AS PostTypeScoreRank
+    FROM PostHistoricalEvents PHE
+    WHERE PHE.OwnerUserId IS NOT NULL
+)
+SELECT
+    UA.UserId,
+    COALESCE(UA.DisplayName, 'Deleted User') AS UserDisplayName,
+    UA.Reputation,
+    UA.TotalPosts,
+    UA.TotalQuestions,
+    UA.TotalAnswers,
+    UA.UniqueBadges,
+    UA.SumOfPostScores,
+    UA.AvgPostScore,
+    UA.AvgCommentScore,
+    UA.DaysActive,
+    RANK() OVER (ORDER BY UA.Reputation DESC, UA.TotalPosts DESC) AS GlobalReputationRank,
+    NTILE(5) OVER (ORDER BY UA.TotalPosts DESC) AS UserActivityTier,
+    UPR.PostId AS LatestPostId,
+    UPR.PostTitle AS LatestPostTitle,
+    UPR.PostScore AS LatestPostScore,
+    UPR.PostCreationDate AS LatestPostDate,
+    PHE.ViewCount AS LatestPostViewCount,
+    PHE.EditEventsCount AS LatestPostEditCount,
+    PHE.CloseEventsCount AS LatestPostCloseCount,
+    PHE.ReopenEventsCount AS LatestPostReopenCount,
+    PHE.LinkedPostsCount AS LatestPostLinkedCount,
+    UPR.UserMovingAvgScore AS Latest5PostsMovingAvgScore,
+    (
+        SELECT TP.TagName
+        FROM Posts P_inner,
+             LATERAL (
+                 SELECT unnest(string_to_array(substring(P_inner.Tags, 2, length(P_inner.Tags) - 2), '><')) AS TagName_inner
+             ) t_inner
+        JOIN TagPerformance TP ON t_inner.TagName_inner = TP.TagName
+        WHERE P_inner.OwnerUserId = UA.UserId AND P_inner.Tags IS NOT NULL AND P_inner.Tags <> ''
+        GROUP BY t_inner.TagName_inner, TP.TagName, TP.AvgScoreInTag
+        ORDER BY AVG(P_inner.Score) DESC, TP.AvgScoreInTag DESC
+        LIMIT 1
+    ) AS TopContributingTag,
+    EXISTS (
+        SELECT 1
+        FROM Posts Ans
+        JOIN Posts Qus ON Ans.ParentId = Qus.Id
+        WHERE Ans.OwnerUserId = UA.UserId
+          AND Ans.PostTypeId = 2
+          AND Qus.AcceptedAnswerId = Ans.Id
+          AND Ans.OwnerUserId IS DISTINCT FROM Qus.OwnerUserId
+          AND Ans.Score > 50
+          AND Qus.CreationDate > UA.UserCreationDate
+          AND Qus.FavoriteCount > 5
+    ) AS HasImpactfulAcceptedAnswer,
+    (CAST(UA.Reputation AS NUMERIC) / 1000) + (UA.TotalPosts / 10.0) + (UA.SumOfPostScores / 50.0) + (UA.UniqueBadges * 2.5) AS InfluenceScore,
+    COALESCE(U.Location, 'Earth') AS UserLocation,
+    CASE WHEN UA.LastAccessDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '6 months' THEN 'Active Recently' ELSE 'Inactive' END AS RecentActivityStatus,
+    LEFT(COALESCE(TRIM(REGEXP_REPLACE(PHE.PostBody, '<[^>]+>', '', 'g')), PHE.PostTitle), 100) AS LatestPostSnippet,
+    PHE.PostTypeId AS LatestPostType,
+    PHE.PostCommentCount AS LatestPostTotalComments,
+    PHE.FavoriteCount AS LatestPostTotalFavorites,
+    CASE
+        WHEN PHE.ClosedDate IS NOT NULL AND PHE.PostScore > (SELECT COALESCE(AVG(P_sub.Score), 0) FROM Posts P_sub WHERE P_sub.PostTypeId = PHE.PostTypeId)
+        THEN 'Closed & Popular'
+        WHEN PHE.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN PHE.FavoriteCount > 10 THEN 'Popular'
+        ELSE 'Normal'
+    END AS LatestPostStatusDetail,
+    CASE WHEN PHE.EditEventsCount > 5 AND PHE.CloseEventsCount > 0 AND PHE.ReopenEventsCount > 0
+         THEN 'Controversial & Iterated'
+         ELSE 'Standard Post'
+    END AS PostControversyStatus,
+    U.DisplayName AS UserDisplayNameForGroup,
+    U.CreationDate AS UserCreationDateForGroup,
+    U.LastAccessDate AS UserLastAccessDateForGroup
+FROM UserActivitySummary UA
+JOIN Users U ON UA.UserId = U.Id
+LEFT JOIN UserPostRankings UPR ON UA.UserId = UPR.UserId AND UPR.rn_user_latest_post = 1
+LEFT JOIN PostHistoricalEvents PHE ON UPR.PostId = PHE.PostId
+WHERE UA.Reputation > 1000
+  AND UA.TotalPosts > 10
+  AND (UA.TotalQuestions > 0 OR UA.TotalAnswers > 0)
+  AND UA.DaysActive > 30
+  AND (PHE.PostId IS NULL OR (
+            PHE.PostScore > 5
+            AND PHE.LastEditDate IS NOT NULL
+            AND (PHE.ClosedDate IS NULL OR PHE.ReopenEventsCount > PHE.CloseEventsCount / 2)
+            AND (PHE.PostTagsRaw LIKE '%<sql>%' OR PHE.PostTagsRaw LIKE '%<database>%')
+        )
+      )
+  AND U.Location IS NOT NULL
+  AND U.Location NOT LIKE '%Internet%'
+ORDER BY InfluenceScore DESC, UA.Reputation DESC, UA.LastAccessDate DESC
+LIMIT 100;

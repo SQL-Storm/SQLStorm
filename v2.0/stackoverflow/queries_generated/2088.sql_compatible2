@@ -1,0 +1,167 @@
+with recursive RecursiveTagTree as (
+    select 
+        t.Id, 
+        t.TagName, 
+        t.Count, 
+        1 as Level,
+        array[t.Id] as Path
+    from Tags t
+    where t.IsRequired = true
+
+    union all
+
+    select 
+        child.Id, 
+        child.TagName, 
+        child.Count,
+        parent.Level + 1,
+        parent.Path || child.Id
+    from Tags child
+    join RecursiveTagTree parent on 
+        child.IsRequired = true
+        and child.Id <> all(parent.Path)
+        and child.Count < parent.Count
+), 
+
+UserQuestionAnswerStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct q.Id) as QuestionsAsked,
+        count(distinct a.Id) as AnswersGiven,
+        coalesce(sum(a.Score),0) as TotalAnswerScore,
+        max(coalesce(q.Score,0)) as MaxQuestionScore,
+        avg(coalesce(a.Score,0)) as AvgAnswerScore,
+        count(distinct b.Id) as BadgeCount,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges
+    from Users u
+    left join Posts q on q.OwnerUserId = u.Id and q.PostTypeId = 1 and q.DeletionDate is null
+    left join Posts a on a.OwnerUserId = u.Id and a.PostTypeId = 2 and a.DeletionDate is null
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+
+TopQuestionsWithComplexPredicates as (
+    select 
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.Tags,
+        p.AnswerCount,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        qstats.QuestionsAsked,
+        qstats.AnswersGiven,
+        qstats.TotalAnswerScore,
+        row_number() over(partition by p.OwnerUserId order by p.Score desc) as rn,
+        case 
+            when p.Tags is null then null
+            else array_to_string(
+                array(
+                    select unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><'))
+                    intersect 
+                    select rt.TagName from RecursiveTagTree rt
+                ), ', '
+            )
+        end as OverlappingTags
+    from Posts p
+    inner join UserQuestionAnswerStats qstats on qstats.UserId = p.OwnerUserId
+    where p.PostTypeId = 1
+      and p.Score > 5
+      and p.ViewCount > 100
+      and p.AnswerCount > 0
+      and (p.ClosedDate is null or p.ClosedDate > cast('2024-10-01 12:34:56' as timestamp) - interval '30 days')
+),
+
+AnswerWithUserAndVotes as (
+    select 
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId,
+        a.Score as AnswerScore,
+        v.VoteTypeId,
+        v.CreationDate as VoteDate,
+        u.Reputation,
+        u.CreationDate as UserCreationDate,
+        row_number() over(partition by a.ParentId order by a.Score desc) as AnswerRank
+    from Posts a
+    left join Votes v on v.PostId = a.Id and v.VoteTypeId in (2,3)
+    left join Users u on u.Id = a.OwnerUserId
+    where a.PostTypeId = 2
+),
+
+AnswerAggregates as (
+    select 
+        QuestionId,
+        count(*) as TotalAnswers,
+        sum(case when VoteTypeId = 2 then 1 else 0 end) as TotalUpVotes,
+        sum(case when VoteTypeId = 3 then 1 else 0 end) as TotalDownVotes,
+        avg(AnswerScore) as AvgAnswerScore,
+        max(AnswerScore) as MaxAnswerScore,
+        min(AnswerScore) as MinAnswerScore
+    from AnswerWithUserAndVotes
+    group by QuestionId
+),
+
+FinalComplexQuery as (
+    select 
+        tq.Id as QuestionId,
+        tq.Title,
+        tq.OwnerUserId,
+        u.DisplayName,
+        tq.Score as QuestionScore,
+        tq.ViewCount,
+        tq.AnswerCount,
+        aagg.TotalAnswers,
+        aagg.TotalUpVotes,
+        aagg.TotalDownVotes,
+        aagg.AvgAnswerScore,
+        aagg.MaxAnswerScore,
+        aagg.MinAnswerScore,
+        tq.OverlappingTags,
+        row_number() over (order by tq.Score desc, tq.ViewCount desc) as GlobalRank,
+        case 
+            when tq.Score > 50 and (aagg.TotalUpVotes - aagg.TotalDownVotes) > 100 then 'High Impact'
+            when tq.Score between 10 and 50 then 'Moderate Impact'
+            else 'Low Impact'
+        end as ImpactCategory,
+        exists (
+            select 1 from PostLinks pl 
+            where pl.PostId = tq.Id 
+              and pl.LinkTypeId = 3
+              and exists (
+                select 1 from Posts related where related.Id = pl.RelatedPostId and related.Score > tq.Score
+              )
+        ) as IsDuplicatedByHigherScore,
+        (select count(*) from Comments c where c.PostId = tq.Id and c.CreationDate > cast('2024-10-01' as date) - interval '30 days') as RecentCommentCount
+    from TopQuestionsWithComplexPredicates tq
+    left join Users u on u.Id = tq.OwnerUserId
+    left join AnswerAggregates aagg on aagg.QuestionId = tq.Id
+    where coalesce(tq.AnswerCount,0) = coalesce(aagg.TotalAnswers,0)
+)
+
+select 
+    fq.GlobalRank,
+    fq.QuestionId,
+    fq.Title,
+    fq.DisplayName as QuestionOwner,
+    fq.QuestionScore,
+    fq.ViewCount,
+    fq.AnswerCount,
+    fq.TotalAnswers,
+    fq.TotalUpVotes,
+    fq.TotalDownVotes,
+    cast(fq.AvgAnswerScore as numeric(10,2)) as AvgAnswerScore,
+    fq.MaxAnswerScore,
+    fq.MinAnswerScore,
+    fq.OverlappingTags,
+    fq.ImpactCategory,
+    fq.IsDuplicatedByHigherScore,
+    fq.RecentCommentCount
+from FinalComplexQuery fq
+where fq.ImpactCategory in ('High Impact', 'Moderate Impact')
+order by fq.GlobalRank
+limit 50;

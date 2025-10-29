@@ -1,0 +1,65 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.Title,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.ViewCount DESC) AS rank
+    FROM 
+        Posts P
+    JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId IN (1, 2) AND P.Score > 0
+),
+BadgeCounts AS (
+    SELECT 
+        U.Id,
+        U.DisplayName,
+        COUNT(B.Id) AS badge_count
+    FROM 
+        Users U
+    JOIN 
+        Badges B ON U.Id = B.UserId
+    GROUP BY 
+        U.Id,
+        U.DisplayName
+),
+VoteSummary AS (
+    SELECT 
+        V.PostId,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes
+    FROM 
+        Votes V
+    GROUP BY 
+        V.PostId
+)
+SELECT 
+    RP.Id,
+    RP.Title,
+    RP.Score,
+    RP.ViewCount,
+    RP.rank,
+    RP.DisplayName,
+    RP.Reputation,
+    COALESCE(VC.upvotes, 0) AS upvotes,
+    COALESCE(VC.downvotes, 0) AS downvotes,
+    COALESCE(BC.badge_count, 0) AS badge_count,
+    CASE 
+        WHEN RP.rank <= 3 THEN 'Top'
+        WHEN RP.rank <= 10 THEN 'High'
+        ELSE 'Low'
+    END AS rank_category
+FROM 
+    RankedPosts RP
+LEFT JOIN 
+    VoteSummary VC ON RP.Id = VC.PostId
+LEFT JOIN 
+    BadgeCounts BC ON RP.UserId = BC.Id
+ORDER BY 
+    RP.rank;

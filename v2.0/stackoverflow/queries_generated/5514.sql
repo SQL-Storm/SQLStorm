@@ -1,0 +1,113 @@
+-- {"query": "5514.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 931} 
+WITH recent_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.ViewCount,
+    p.Score,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.FavoriteCount,
+    p.AnswerCount,
+    p.CommentCount
+  FROM Posts p
+  WHERE p.PostTypeId = (SELECT Id FROM PostTypes WHERE Name = 'Question') 
+    AND p.CreationDate >= NOW() - INTERVAL '90 days'
+),
+top_tags AS (
+  SELECT
+    unnest(string_to_array(substr(t.Tags, 2, length(t.Tags)-2), '><')) AS TagName,
+    COUNT(*) AS TagPostCount,
+    SUM(p.Score) AS ScoreSum,
+    AVG(p.ViewCount) AS AvgViews
+  FROM Posts p
+  JOIN LATERAL unnest(string_to_array(substr(p.Tags, 2, length(p.Tags)-2), '><')) AS t(TagName) ON true
+  WHERE p.PostTypeId = (SELECT Id FROM PostTypes WHERE Name = 'Question')
+  GROUP BY TagName
+),
+tag_rank AS (
+  SELECT
+    TagName,
+    TagPostCount,
+    ScoreSum,
+    AvgViews,
+    ROW_NUMBER() OVER (ORDER BY ScoreSum DESC, AvgViews DESC, TagName) AS rn
+  FROM top_tags
+  WHERE TagName IS NOT NULL
+),
+popular_questions AS (
+  SELECT
+    q.Id AS QuestionId,
+    q.Title,
+    q.CreationDate,
+    q.ViewCount,
+    q.Score,
+    q.OwnerUserId,
+    q.AnswerCount,
+    q.CommentCount,
+    jsonb_agg(DISTINCT jsonb_build_object(
+      'tag', t.TagName,
+      'count', t.TagPostCount
+    )) FILTER (WHERE t.TagPostCount IS NOT NULL) AS TagMetrics
+  FROM recent_questions q
+  LEFT JOIN LATERAL (
+    SELECT TagName, TagPostCount
+    FROM tag_rank tr
+    WHERE tr.rn <= 5
+  ) t ON true
+  GROUP BY q.Id, q.Title, q.CreationDate, q.ViewCount, q.Score, q.OwnerUserId, q.AnswerCount, q.CommentCount
+  ORDER BY q.ViewCount DESC, q.Score DESC
+  LIMIT 100
+),
+complex_derived AS (
+  SELECT
+    pq.QuestionId,
+    pq.Title,
+    pq.CreationDate,
+    pq.ViewCount,
+    pq.Score,
+    pq.OwnerUserId,
+    pq.AnswerCount,
+    pq.CommentCount,
+    (pq.ViewCount * 1.0) / NULLIF(pq.AnswerCount, 0) AS views_per_answer,
+    (SELECT COALESCE(AVG(v.BountyAmount), 0) FROM Votes v WHERE v.PostId = pq.QuestionId AND v.VoteTypeId = 8) AS avg_bounty,
+    CASE
+      WHEN pq.ViewCount > 1000 THEN 'Hot'
+      WHEN pq.ViewCount > 500 THEN 'Warm'
+      ELSE 'New'
+    END AS popularity_band
+  FROM popular_questions pq
+)
+SELECT
+  c.QuestionId,
+  c.Title,
+  c.CreationDate,
+  c.ViewCount,
+  c.Score,
+  c.OwnerUserId,
+  c.AnswerCount,
+  c.CommentCount,
+  c.views_per_answer,
+  c.avg_bounty,
+  c.popularity_band,
+  c.TagMetrics
+FROM complex_derived c
+LEFT JOIN LATERAL (
+  SELECT
+    tp.TagName,
+    tp.TagPostCount
+  FROM unnest(string_to_array(substr((SELECT Tags FROM Posts WHERE Id = c.QuestionId), 2, length((SELECT Tags FROM Posts WHERE Id = c.QuestionId))-2), '><')) AS TagName
+  LEFT JOIN (
+    SELECT TagName, COUNT(*) AS TagPostCount
+    FROM Posts p
+    CROSS JOIN LATERAL unnest(string_to_array(substr(p.Tags, 2, length(p.Tags)-2), '><')) AS t(TagName)
+    WHERE p.PostTypeId = (SELECT Id FROM PostTypes WHERE Name = 'Question')
+    GROUP BY TagName
+  ) t2 ON t2.TagName = TagName
+  ORDER BY TagPostCount DESC
+  LIMIT 3
+) t ON true
+ORDER BY c.popularity_band DESC, c.ViewCount DESC, c.Score DESC
+LIMIT 50;

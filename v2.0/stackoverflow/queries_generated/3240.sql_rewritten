@@ -1,0 +1,178 @@
+-- {"query": "3240.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2819} 
+WITH 
+-- Aggregate per user
+UserPostStats AS (
+    SELECT 
+        u.Id                       AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COALESCE(SUM(p.Score),0)   AS TotalScore,
+        MAX(p.CreationDate)        AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+-- Rank users by reputation
+TopUsers AS (
+    SELECT 
+        *, 
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC) AS RepRank
+    FROM UserPostStats
+    WHERE Reputation > 1000
+),
+
+-- Badge totals per user
+UserBadgeCounts AS (
+    SELECT 
+        b.UserId,
+        COUNT(*)                                   AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+-- Latest post per user (correlated)
+LatestPostPerUser AS (
+    SELECT 
+        p.OwnerUserId,
+        p.Id               AS PostId,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+),
+
+-- Aggregate votes per post
+PostVotesAgg AS (
+    SELECT 
+        v.PostId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        COUNT(*) FILTER (WHERE v.VoteTypeId IN (4,12))    AS NegativeFlags
+    FROM Votes v
+    GROUP BY v.PostId
+),
+
+-- Tag statistics
+TagStats AS (
+    SELECT 
+        t.TagName,
+        t.Count               AS TagUseCount,
+        COALESCE(e.AnswerCount,0) AS ExcerptAnswerCount,
+        COALESCE(w.FavoriteCount,0) AS WikiFavorites
+    FROM Tags t
+    LEFT JOIN Posts e ON e.Id = t.ExcerptPostId
+    LEFT JOIN Posts w ON w.Id = t.WikiPostId
+),
+
+-- Combine everything
+Combined AS (
+    SELECT 
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.RepRank,
+        tu.QuestionCount,
+        tu.AnswerCount,
+        tu.TotalScore,
+        ub.BadgeCount,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        lp.Title                     AS LatestPostTitle,
+        lp.CreationDate              AS LatestPostDate,
+        CASE 
+            WHEN lp.Title ILIKE '%sql%'         THEN 'SQL'
+            WHEN lp.Title ILIKE '%performance%' THEN 'Performance'
+            ELSE 'Other'
+        END                           AS LatestPostCategory,
+        COALESCE(pv.UpVotes,0) - COALESCE(pv.DownVotes,0) AS NetVotesOnLatest,
+        CASE WHEN pv.NegativeFlags > 0 THEN 'Flagged' ELSE 'Clean' END AS LatestPostFlagStatus,
+        ts.TagName,
+        ts.TagUseCount,
+        ts.ExcerptAnswerCount,
+        ts.WikiFavorites
+    FROM TopUsers tu
+    LEFT JOIN UserBadgeCounts ub ON ub.UserId = tu.UserId
+    LEFT JOIN LatestPostPerUser lp ON lp.OwnerUserId = tu.UserId AND lp.rn = 1
+    LEFT JOIN PostVotesAgg pv      ON pv.PostId = lp.PostId
+    LEFT JOIN LATERAL (
+        SELECT TRIM(BOTH '<>' FROM unnest(string_to_array(lp.Tags, '><'))) AS tag_raw
+    ) AS tags_raw ON TRUE
+    LEFT JOIN TagStats ts ON ts.TagName = tags_raw.tag_raw
+    WHERE tu.RepRank <= 50
+),
+
+-- Final windowed result set
+FinalResult AS (
+    SELECT 
+        *,
+        ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY NetVotesOnLatest DESC NULLS LAST) AS PostVoteRank,
+        PERCENT_RANK() OVER (ORDER BY Reputation DESC) AS RepPercentile
+    FROM Combined
+)
+
+SELECT 
+    UserId,
+    DisplayName,
+    Reputation,
+    RepRank,
+    RepPercentile,
+    QuestionCount,
+    AnswerCount,
+    TotalScore,
+    BadgeCount,
+    GoldBadges,
+    SilverBadges,
+    BronzeBadges,
+    LatestPostTitle,
+    LatestPostDate,
+    LatestPostCategory,
+    NetVotesOnLatest,
+    LatestPostFlagStatus,
+    TagName,
+    TagUseCount,
+    ExcerptAnswerCount,
+    WikiFavorites,
+    PostVoteRank
+FROM FinalResult
+WHERE (TagUseCount IS NOT NULL AND TagUseCount > 1000)
+   OR (NetVotesOnLatest IS NOT NULL AND NetVotesOnLatest > 10)
+ORDER BY RepRank, NetVotesOnLatest DESC
+LIMIT 200
+
+UNION ALL
+
+SELECT 
+    NULL AS UserId,
+    'Aggregate Summary' AS DisplayName,
+    NULL AS Reputation,
+    NULL AS RepRank,
+    NULL AS RepPercentile,
+    SUM(QuestionCount)  OVER () AS QuestionCount,
+    SUM(AnswerCount)    OVER () AS AnswerCount,
+    SUM(TotalScore)     OVER () AS TotalScore,
+    SUM(BadgeCount)     OVER () AS BadgeCount,
+    SUM(GoldBadges)     OVER () AS GoldBadges,
+    SUM(SilverBadges)   OVER () AS SilverBadges,
+    SUM(BronzeBadges)   OVER () AS BronzeBadges,
+    NULL AS LatestPostTitle,
+    NULL AS LatestPostDate,
+    NULL AS LatestPostCategory,
+    SUM(NetVotesOnLatest) OVER () AS NetVotesOnLatest,
+    NULL AS LatestPostFlagStatus,
+    NULL AS TagName,
+    SUM(TagUseCount)    OVER () AS TagUseCount,
+    NULL AS ExcerptAnswerCount,
+    NULL AS WikiFavorites,
+    NULL AS PostVoteRank
+FROM FinalResult
+WHERE RepRank = 1
+LIMIT 1;

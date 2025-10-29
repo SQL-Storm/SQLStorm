@@ -1,0 +1,60 @@
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    MAX(u.CreationDate) AS LatestAccountActivity,
+    MAX(p.LastActivityDate) AS LatestPostActivity,
+    b.Class,
+    t.TagName,
+    ph.RevisionGUID,
+    ph.Comment,
+    CASE 
+        WHEN ph.PostHistoryTypeId = 10 THEN cr.Name
+        WHEN ph.PostHistoryTypeId = 11 THEN 'Reopened'
+        WHEN ph.PostHistoryTypeId = 12 THEN 'Deleted'
+        WHEN ph.PostHistoryTypeId = 13 THEN 'Undeleted'
+        ELSE NULL
+    END AS HistoryAction,
+    v.VoteTypeId,
+    v.BountyAmount,
+    ROW_NUMBER() OVER(PARTITION BY p.Id ORDER BY ph.CreationDate DESC) AS RevisionOrder
+FROM 
+    Users u
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN 
+    CloseReasonTypes cr ON ph.Comment = CAST(cr.Id AS varchar(10))
+LEFT JOIN 
+    Tags t ON t.ExcerptPostId = p.Id
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+WHERE 
+    (u.Reputation > 10000 OR u.Reputation IS NULL)
+    AND (p.ViewCount > 100 OR p.ViewCount IS NULL)
+    AND (v.BountyAmount > 0 OR v.BountyAmount IS NULL)
+    AND (ph.CreationDate BETWEEN CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30' DAY AND CAST('2024-10-01 12:34:56' AS timestamp))
+GROUP BY 
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    p.LastActivityDate,
+    b.Class,
+    t.TagName,
+    ph.RevisionGUID,
+    ph.Comment,
+    ph.PostHistoryTypeId,
+    cr.Name,
+    v.VoteTypeId,
+    v.BountyAmount,
+    p.Id
+HAVING 
+    COUNT(DISTINCT p.Id) > 10
+ORDER BY 
+    u.Reputation DESC, 
+    TotalPosts DESC;

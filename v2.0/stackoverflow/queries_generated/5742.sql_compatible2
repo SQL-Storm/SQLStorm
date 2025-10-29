@@ -1,0 +1,71 @@
+SELECT
+  u.Id AS UserId,
+  u.DisplayName AS UserName,
+  u.Reputation,
+  COALESCE(u.Location, 'Unknown') AS Location,
+  u.CreationDate AS UserCreationDate,
+  u.LastAccessDate AS UserLastAccessDate,
+  u.Views,
+  u.UpVotes,
+  u.DownVotes,
+  u.ProfileImageUrl,
+  u.EmailHash AS EmailHash,
+  u.AccountId,
+  COALESCE(bg.GoldCount, 0) AS GoldBadges,
+  COALESCE(bs.SilverCount, 0) AS SilverBadges,
+  COALESCE(br.BronzeCount, 0) AS BronzeBadges,
+  COALESCE(vt.TotalVotes, 0) AS TotalPostVotes,
+  COALESCE(vt.UpVotes, 0) AS UpVotesOnPosts,
+  COALESCE(vt.DownVotes, 0) AS DownVotesOnPosts,
+  ph.LastPostActivityDate,
+  ph.LastPostStatus
+FROM
+  Users u
+  LEFT JOIN (
+    SELECT
+      UserId,
+      COUNT(*) AS GoldCount
+    FROM Badges
+    WHERE Class = 1
+    GROUP BY UserId
+  ) bg ON bg.UserId = u.Id
+  LEFT JOIN (
+    SELECT
+      UserId,
+      COUNT(*) AS SilverCount
+    FROM Badges
+    WHERE Class = 2
+    GROUP BY UserId
+  ) bs ON bs.UserId = u.Id
+  LEFT JOIN (
+    SELECT
+      UserId,
+      COUNT(*) AS BronzeCount
+    FROM Badges
+    WHERE Class = 3
+    GROUP BY UserId
+  ) br ON br.UserId = u.Id
+  LEFT JOIN (
+    SELECT
+      p.OwnerUserId AS UserId,
+      SUM(CASE WHEN vt.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+      SUM(CASE WHEN vt.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+      SUM(CASE WHEN vt.VoteTypeId IN (2,3) THEN 1 ELSE 0 END) AS TotalVotes
+    FROM Posts p
+    LEFT JOIN Votes vt ON vt.PostId = p.Id
+    GROUP BY p.OwnerUserId
+  ) vt ON vt.UserId = u.Id
+  LEFT JOIN (
+    SELECT
+      p.OwnerUserId AS UserId,
+      MAX(p.LastActivityDate) AS LastPostActivityDate,
+      MAX(CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END) AS LastPostStatus
+    FROM Posts p
+    GROUP BY p.OwnerUserId
+  ) ph ON ph.UserId = u.Id
+WHERE
+  u.Id > 0
+ORDER BY
+  COALESCE(vt.TotalVotes, 0) DESC,
+  u.Reputation DESC
+FETCH FIRST 100 ROWS ONLY;

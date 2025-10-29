@@ -1,0 +1,170 @@
+-- {"query": "1633.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2580} 
+WITH UserEngagement AS (
+    -- CTE 1: Aggregate user engagement metrics, including post, comment, and vote summaries.
+    -- This helps identify active users with varied interactions across the platform.
+    SELECT
+        U.Id AS UserId,
+        U.Reputation,
+        U.UpVotes,
+        U.DownVotes,
+        U.Views AS UserProfileViews,
+        U.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        MAX(P.LastActivityDate) AS LastPostActivity,
+        MAX(C.CreationDate) AS LastCommentActivity,
+        SUM(CASE WHEN P.AcceptedAnswerId IS NOT NULL AND P.PostTypeId = 1 THEN 1 ELSE 0 END) AS AcceptedAnswerQuestionCount,
+        SUM(CASE WHEN P.PostTypeId = 2 AND EXISTS (SELECT 1 FROM Posts PARENT_POST WHERE PARENT_POST.Id = P.ParentId AND PARENT_POST.AcceptedAnswerId = P.Id) THEN 1 ELSE 0 END) AS AnswersAcceptedByOthersCount
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    GROUP BY U.Id, U.Reputation, U.UpVotes, U.DownVotes, U.Views, U.CreationDate
+),
+PostAnalytics AS (
+    -- CTE 2: Analyze individual posts for their core metrics, edit history, and tag information.
+    -- This includes extracting the first tag and counting historical edits.
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        P.PostTypeId,
+        P.AcceptedAnswerId,
+        P.ParentId,
+        P.CreationDate AS PostCreationDate,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.ClosedDate,
+        P.LastActivityDate,
+        P.LastEditDate,
+        COALESCE(P.Title, 'Untitled Post') AS PostTitle,
+        LENGTH(P.Body) AS BodyLength,
+        CASE
+            WHEN P.Tags IS NOT NULL THEN (SELECT MIN(s.value) FROM string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags)-2), '><') AS s(value) WHERE s.value != '')
+            ELSE NULL
+        END AS PrimaryTag,
+        (SELECT COUNT(DISTINCT PH.Id) FROM PostHistory PH WHERE PH.PostId = P.Id AND PH.PostHistoryTypeId IN (4, 5, 6)) AS EditRevisionCount,
+        (SELECT MAX(PH.CreationDate) FROM PostHistory PH WHERE PH.PostId = P.Id AND PH.PostHistoryTypeId IN (4, 5, 6)) AS LastEditHistoryTimestamp
+    FROM Posts P
+    WHERE P.PostTypeId IN (1, 2) -- Focus on Questions (1) and Answers (2)
+),
+BadgeSummary AS (
+    -- CTE 3: Summarize badge counts per user, categorizing by gold, silver, and bronze.
+    -- This gives an indication of a user's recognition and expertise.
+    SELECT
+        B.UserId,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges B
+    GROUP BY B.UserId
+),
+PostLinkAnalysis AS (
+    -- CTE 4: Analyze post links, specifically counting linked and duplicate posts.
+    -- Useful for understanding how posts relate to others (e.g., canonical questions).
+    SELECT
+        PL.PostId,
+        COUNT(CASE WHEN PL.LinkTypeId = 1 THEN 1 ELSE NULL END) AS LinkedPostsCount,
+        COUNT(CASE WHEN PL.LinkTypeId = 3 THEN 1 ELSE NULL END) AS DuplicateOfCount
+    FROM PostLinks PL
+    GROUP BY PL.PostId
+),
+VoteTypeCounts AS (
+    -- CTE 5: Count specific vote types for each post, e.g., UpMod and DownMod.
+    -- This is a more granular view of post popularity and controversiality.
+    SELECT
+        V.PostId,
+        COUNT(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE NULL END) AS UpVoteCount,
+        COUNT(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE NULL END) AS DownVoteCount,
+        COUNT(CASE WHEN V.VoteTypeId = 4 THEN 1 ELSE NULL END) AS OffensiveVoteCount
+    FROM Votes V
+    GROUP BY V.PostId
+)
+-- Main Query: Integrates all CTEs to generate a comprehensive report on high-impact users and their significant posts.
+-- It applies complex filters, window functions for ranking and rolling averages, and various data transformations.
+SELECT
+    UE.UserId,
+    U.DisplayName,
+    UE.Reputation,
+    UE.UpVotes AS UserTotalUpVotesGiven,
+    UE.DownVotes AS UserTotalDownVotesGiven,
+    UE.UserProfileViews,
+    UE.TotalPostsOwned,
+    UE.QuestionCount,
+    UE.AnswerCount,
+    COALESCE(BS.GoldBadges, 0) AS UserGoldBadges,
+    COALESCE(BS.SilverBadges, 0) AS UserSilverBadges,
+    COALESCE(BS.BronzeBadges, 0) AS UserBronzeBadges,
+    PA.PostId,
+    PT.Name AS PostTypeName,
+    PA.PostTitle,
+    PA.Score AS PostCurrentScore,
+    PA.ViewCount AS PostTotalViewCount,
+    PA.FavoriteCount AS PostBookmarkCount,
+    PA.AnswerCount AS PostTotalAnswerCount,
+    PA.CommentCount AS PostTotalCommentCount,
+    VT.UpVoteCount AS PostUpVotesReceived,
+    VT.DownVoteCount AS PostDownVotesReceived,
+    VT.OffensiveVoteCount AS PostOffensiveVotesReceived,
+    PA.PrimaryTag,
+    PA.BodyLength AS PostBodyCharacterLength,
+    PLA.LinkedPostsCount,
+    PLA.DuplicateOfCount,
+    PA.EditRevisionCount,
+    EXTRACT(EPOCH FROM (PA.LastActivityDate - PA.PostCreationDate)) / 3600 AS HoursActiveSinceCreation, -- Time in hours from creation to last activity
+    COALESCE(CLT.Name, 'N/A') AS CloseReasonName,
+    CASE
+        WHEN PA.PostTypeId = 1 AND PA.AcceptedAnswerId IS NOT NULL THEN 'Accepted_Answered'
+        WHEN PA.PostTypeId = 1 AND PA.ClosedDate IS NOT NULL THEN 'Closed_Question'
+        WHEN PA.PostTypeId = 2 AND EXISTS (SELECT 1 FROM Posts P_PARENT WHERE P_PARENT.Id = PA.ParentId AND P_PARENT.AcceptedAnswerId = PA.PostId) THEN 'Accepted_Answer'
+        ELSE 'Open_Active'
+    END AS DetailedPostStatus,
+    -- Window functions for ranking posts and users
+    RANK() OVER (PARTITION BY UE.UserId ORDER BY PA.Score DESC, PA.ViewCount DESC) AS RankOfPostByUserActivity,
+    NTILE(5) OVER (ORDER BY UE.Reputation DESC, UE.UpVotes DESC, UE.TotalPostsOwned DESC) AS UserEngagementTier,
+    AVG(PA.Score) OVER (PARTITION BY PA.PostTypeId ORDER BY PA.PostCreationDate ROWS BETWEEN 20 PRECEDING AND CURRENT ROW) AS RollingAvgPostScoreForType,
+    LAG(PA.LastEditHistoryTimestamp, 1, PA.PostCreationDate) OVER (PARTITION BY UE.UserId, PA.PostId ORDER BY PA.LastEditHistoryTimestamp) AS PreviousEditTimestamp,
+    -- Complex calculations and NULL logic
+    NULLIF(PA.ViewCount, 0) / NULLIF(PA.Score, 0)::numeric AS ViewScoreRatio, -- Prevent division by zero
+    UE.AcceptedAnswerQuestionCount,
+    UE.AnswersAcceptedByOthersCount,
+    (UE.UpVotes + UE.DownVotes) AS UserTotalVotesCast,
+    -- Correlated subquery to check for recent post activity for the user
+    (SELECT
+        CASE
+            WHEN COUNT(P_RECENT.Id) > 0 THEN TRUE
+            ELSE FALSE
+        END
+    FROM Posts P_RECENT
+    WHERE P_RECENT.OwnerUserId = U.Id
+        AND P_RECENT.CreationDate > (cast('2024-10-01' as date) - INTERVAL '60 days')
+        AND P_RECENT.PostTypeId IN (1, 2)
+    ) AS HasRecentSignificantPosts,
+    -- Correlated subquery to find if any associated comments are highly scored
+    (SELECT
+        COALESCE(MAX(C_SCORE.Score), 0)
+    FROM Comments C_SCORE
+    WHERE C_SCORE.PostId = PA.PostId AND C_SCORE.Score >= 5
+    ) AS MaxHighScoreCommentOnPost,
+    -- String aggregation for related popular tags based on the primary tag
+    (SELECT STRING_AGG(T.TagName, '; ') FROM Tags T WHERE T.TagName LIKE '%' || PA.PrimaryTag || '%' AND T.Count > 500 AND T.Id != (SELECT Id FROM Tags WHERE TagName = PA.PrimaryTag)) AS RelatedPopularTagsString
+FROM Users U
+INNER JOIN UserEngagement UE ON U.Id = UE.UserId
+LEFT JOIN PostAnalytics PA ON U.Id = PA.OwnerUserId
+LEFT JOIN PostTypes PT ON PA.PostTypeId = PT.Id
+LEFT JOIN BadgeSummary BS ON U.Id = BS.UserId
+LEFT JOIN PostLinkAnalysis PLA ON PA.PostId = PLA.PostId
+LEFT JOIN VoteTypeCounts VT ON PA.PostId = VT.PostId
+-- Join to PostHistory and CloseReasonTypes to get the close reason if the post is closed
+LEFT JOIN (SELECT DISTINCT ON (PostId) PostId, Comment FROM PostHistory WHERE PostHistoryTypeId = 10 AND Comment IS NOT NULL ORDER BY PostId, CreationDate DESC) PH_CLOSE ON PA.PostId = PH_CLOSE.PostId
+LEFT JOIN CloseReasonTypes CLT ON PH_CLOSE.Comment::smallint = CLT.Id
+WHERE U.Reputation > 10000 -- Filter for high-reputation users
+AND U.LastAccessDate >= (cast('2024-10-01' as date) - INTERVAL '180 days') -- Users must have been active recently
+AND (PA.PostId IS NULL OR (PA.Score > 10 AND PA.CommentCount >= 3 AND PA.BodyLength > 150)) -- Posts must be significant, or user might not have posts matching criteria
+AND (UE.TotalPostsOwned > 0 OR UE.TotalCommentsMade > 5) -- User must have some contribution
+AND UE.UserCreationDate < (cast('2024-10-01' as date) - INTERVAL '1 year') -- Exclude very new users
+ORDER BY UE.Reputation DESC, UserGoldBadges DESC, PostCurrentScore DESC, PA.PostCreationDate DESC
+LIMIT 500;

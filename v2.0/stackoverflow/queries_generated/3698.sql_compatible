@@ -1,0 +1,147 @@
+WITH RECURSIVE
+    user_stats AS (
+        SELECT
+            u.id                               AS user_id,
+            u.displayname                      AS display_name,
+            u.reputation,
+            COALESCE(u.location, 'Unknown')    AS location,
+            COUNT(DISTINCT b.id)               FILTER (WHERE b.class = 1) AS gold_badges,
+            COUNT(DISTINCT b.id)               FILTER (WHERE b.class = 2) AS silver_badges,
+            COUNT(DISTINCT b.id)               FILTER (WHERE b.class = 3) AS bronze_badges,
+            SUM(CASE v.votetypeid
+                    WHEN 2 THEN  1
+                    WHEN 3 THEN -1
+                    ELSE 0 END)               AS net_vote_score,
+            AVG(p.score) FILTER (WHERE p.posttypeid = 1)    AS avg_question_score,
+            MAX(p.creationdate)                AS last_post_date
+        FROM users u
+        LEFT JOIN badges b   ON b.userid   = u.id
+        LEFT JOIN votes  v   ON v.userid   = u.id
+        LEFT JOIN posts  p   ON p.owneruserid = u.id
+        GROUP BY u.id, u.displayname, u.reputation, u.location
+    ),
+
+    ranked_users AS (
+        SELECT
+            *,
+            RANK() OVER (ORDER BY reputation DESC, net_vote_score DESC) AS rep_rank
+        FROM user_stats
+        WHERE reputation > 10000
+    ),
+
+    tag_activity AS (
+        SELECT
+            t.tagname,
+            COUNT(p.id)                                     AS question_cnt,
+            AVG(p.score)                                    AS avg_score,
+            SUM(CASE WHEN ph.posthistorytypeid = 5 THEN 1 ELSE 0 END) AS edit_cnt
+        FROM tags t
+        JOIN posts p
+          ON p.tags IS NOT NULL
+         AND POSITION('<' || t.tagname || '>' IN p.tags) > 0
+         AND p.posttypeid = 1
+        LEFT JOIN posthistory ph
+          ON ph.postid = p.id
+         AND ph.posthistorytypeid = 5
+        GROUP BY t.tagname
+        HAVING COUNT(p.id) > 100
+    ),
+
+    recent_closures AS (
+        SELECT
+            p.id                               AS post_id,
+            p.title,
+            ph.creationdate                    AS close_date,
+            CAST(ph.comment AS INTEGER)        AS close_reason_id,
+            COALESCE(crt.name, 'Other')        AS close_reason,
+            ROW_NUMBER() OVER (PARTITION BY p.id ORDER BY ph.creationdate DESC) AS rn
+        FROM posts p
+        JOIN posthistory ph
+          ON ph.postid = p.id
+         AND ph.posthistorytypeid = 10
+        LEFT JOIN closereasontypes crt
+          ON crt.id = CAST(ph.comment AS INTEGER)
+        WHERE p.posttypeid = 1
+    ),
+
+    user_enriched AS (
+        SELECT
+            ru.user_id,
+            ru.display_name,
+            ru.reputation,
+            ru.gold_badges,
+            ru.silver_badges,
+            ru.bronze_badges,
+            ru.net_vote_score,
+            ru.avg_question_score,
+            ru.last_post_date,
+            ru.rep_rank,
+            lt.tagname,
+            lt.question_cnt,
+            lt.avg_score,
+            rc.title               AS latest_closed_title,
+            rc.close_reason        AS latest_close_reason,
+            rc.close_date
+        FROM ranked_users ru
+        LEFT JOIN LATERAL (
+            SELECT
+                t.tagname,
+                ta.question_cnt,
+                ta.avg_score,
+                ROW_NUMBER() OVER (ORDER BY ta.question_cnt DESC) AS tag_rn
+            FROM posts p
+            JOIN tags t
+              ON p.tags IS NOT NULL
+             AND POSITION('<' || t.tagname || '>' IN p.tags) > 0
+            JOIN tag_activity ta
+              ON ta.tagname = t.tagname
+            WHERE p.owneruserid = ru.user_id
+              AND p.posttypeid = 1
+            GROUP BY t.tagname, ta.question_cnt, ta.avg_score
+        ) lt ON lt.tag_rn = 1
+        LEFT JOIN LATERAL (
+            SELECT
+                rc.title,
+                rc.close_reason,
+                rc.close_date
+            FROM recent_closures rc
+            WHERE rc.post_id IN (
+                SELECT p.id
+                FROM posts p
+                WHERE p.owneruserid = ru.user_id
+                  AND p.posttypeid = 1
+            )
+              AND rc.rn = 1
+            ORDER BY rc.close_date DESC
+            LIMIT 1
+        ) rc ON TRUE
+        WHERE ru.rep_rank <= 50
+    )
+
+SELECT
+    ue.user_id,
+    ue.display_name,
+    ue.reputation,
+    ue.rep_rank,
+    ue.gold_badges,
+    ue.silver_badges,
+    ue.bronze_badges,
+    ue.net_vote_score,
+    ue.avg_question_score,
+    COALESCE(ue.last_post_date, TIMESTAMP '1970-01-01') AS last_post_date,
+    ue.tagname                                   AS top_tag,
+    ue.question_cnt                              AS top_tag_question_cnt,
+    ROUND(CAST(ue.avg_score AS NUMERIC), 2)      AS top_tag_avg_score,
+    COALESCE(ue.latest_closed_title, 'No recent closure') AS recent_closed_title,
+    ue.latest_close_reason,
+    ue.close_date
+FROM user_enriched ue
+
+UNION ALL
+SELECT
+    NULL::INTEGER, 'Placeholder', NULL::INTEGER, NULL::INTEGER, NULL::INTEGER, NULL::INTEGER, NULL::INTEGER, NULL::INTEGER,
+    TIMESTAMP '1970-01-01', NULL::VARCHAR, NULL::INTEGER, NULL, NULL, NULL
+WHERE NOT EXISTS (SELECT 1 FROM user_enriched)
+
+ORDER BY reputation DESC, net_vote_score DESC
+LIMIT 100;

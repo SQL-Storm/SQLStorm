@@ -1,0 +1,179 @@
+with RecursiveTagCounts as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        p.Id as PostId,
+        p.PostTypeId,
+        u.Id as OwnerUserId,
+        u.DisplayName,
+        row_number() over (partition by t.Id order by p.Score desc, p.CreationDate desc) as TagPostRank
+    from Tags t
+    join Posts p on ('<' || t.TagName || '>') = any(string_to_array(coalesce(p.Tags, ''), '><'))
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId = 1
+),
+RankedAnswers as (
+    select
+        a.Id,
+        a.ParentId,
+        a.CreationDate,
+        a.Score,
+        a.OwnerUserId,
+        rank() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts a
+    where a.PostTypeId = 2
+),
+TopAnswers as (
+    select ra.*
+    from RankedAnswers ra
+    where ra.AnswerRank <= 3
+),
+UserBadgeCounts as (
+    select b.UserId,
+        count(case when b.Class = 1 then 1 end) as GoldBadges,
+        count(case when b.Class = 2 then 1 end) as SilverBadges,
+        count(case when b.Class = 3 then 1 end) as BronzeBadges
+    from Badges b
+    group by b.UserId
+),
+PostCloseReasons as (
+    select ph.PostId,
+        crt.Name as CloseReasonName,
+        count(*) as CloseCount
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(coalesce(ph.Comment, '0') as int)
+    where ph.PostHistoryTypeId = 10
+        and ph.Comment is not null
+        and ph.Comment <> ''
+    group by ph.PostId, crt.Name
+),
+UserActivity as (
+    select
+        u.Id,
+        u.DisplayName,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as AskedQuestions,
+        count(distinct a.Id) as AnsweredQuestions,
+        max(p.CreationDate) as LastPostDate,
+        max(c.CreationDate) as LastCommentDate,
+        max(ph.CreationDate) as LastPostHistoryEdit
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Posts a on a.OwnerUserId = u.Id and a.PostTypeId = 2
+    left join Comments c on c.UserId = u.Id
+    left join PostHistory ph on ph.UserId = u.Id
+    group by u.Id, u.DisplayName
+)
+select
+    rtc.TagName,
+    rtc.PostId,
+    rtc.DisplayName as QuestionOwner,
+    p.Title,
+    p.Score as QuestionScore,
+    p.ViewCount,
+    coalesce(pc.CloseReasonName, 'Open') as CloseReason,
+    coalesce(pc.CloseCount, 0) as CloseVotes,
+    -- construct aggregated top answers summary without ORDER BY inside aggregate with DISTINCT (some dialects require ordering inside aggregate argument)
+    array_agg(distinct concat_ws(' | ',
+        'AnswerId:', cast(ta.Id as text),
+        'Score:', cast(ta.Score as text),
+        'AgeDays:', cast(cast('2024-10-01' as date) - cast(ta.CreationDate as date) as text),
+        'User:', coalesce(u.DisplayName, 'Unknown')
+        )) as TopAnswersSummary,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ua.AskedQuestions,
+    ua.AnsweredQuestions,
+    ua.LastPostDate,
+    ua.LastCommentDate,
+    ua.LastPostHistoryEdit,
+    length(p.Body) as BodyLength,
+    nullif(position('sql' in lower(coalesce(p.Tags, ''))), 0) is not null as ContainsSQLTag,
+    case when p.AcceptedAnswerId is not null then 1 else 0 end as HasAcceptedAnswer,
+    max(rtc.TagPostRank) over (partition by rtc.TagName) as MaxPostRankForTag
+from RecursiveTagCounts rtc
+join Posts p on rtc.PostId = p.Id
+left join PostCloseReasons pc on pc.PostId = p.Id
+left join TopAnswers ta on ta.ParentId = p.Id
+left join Users u on ta.OwnerUserId = u.Id
+left join UserBadgeCounts ub on ub.UserId = rtc.OwnerUserId
+left join UserActivity ua on ua.Id = rtc.OwnerUserId
+where rtc.TagPostRank <= 10
+group by
+    rtc.TagName,
+    rtc.PostId,
+    rtc.DisplayName,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    pc.CloseReasonName,
+    pc.CloseCount,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ua.AskedQuestions,
+    ua.AnsweredQuestions,
+    ua.LastPostDate,
+    ua.LastCommentDate,
+    ua.LastPostHistoryEdit,
+    p.Body,
+    p.Tags,
+    p.AcceptedAnswerId,
+    rtc.TagPostRank
+union
+select
+    'Special_AllTimeTop' as TagName,
+    p.Id as PostId,
+    u.DisplayName as QuestionOwner,
+    p.Title,
+    p.Score as QuestionScore,
+    p.ViewCount,
+    'Open' as CloseReason,
+    0 as CloseVotes,
+    array_agg(distinct concat_ws(' | ',
+        'AnswerId:', cast(a.Id as text),
+        'Score:', cast(a.Score as text),
+        'AgeDays:', cast(cast('2024-10-01' as date) - cast(a.CreationDate as date) as text),
+        'User:', coalesce(ua.DisplayName, 'Unknown')
+        )) as TopAnswersSummary,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ua.AskedQuestions,
+    ua.AnsweredQuestions,
+    ua.LastPostDate,
+    ua.LastCommentDate,
+    ua.LastPostHistoryEdit,
+    length(p.Body) as BodyLength,
+    false as ContainsSQLTag,
+    case when p.AcceptedAnswerId is not null then 1 else 0 end as HasAcceptedAnswer,
+    0 as MaxPostRankForTag
+from Posts p
+left join Users u on p.OwnerUserId = u.Id
+left join Posts a on a.ParentId = p.Id and a.PostTypeId = 2
+left join Users ua on a.OwnerUserId = ua.Id
+left join UserBadgeCounts ub on ub.UserId = u.Id
+left join UserActivity ua2 on ua2.Id = u.Id
+where p.PostTypeId = 1
+and p.Score >= (
+    select percentile_cont(0.99) within group (order by score) from Posts where PostTypeId = 1
+)
+group by
+    p.Id,
+    u.DisplayName,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ua.AskedQuestions,
+    ua.AnsweredQuestions,
+    ua.LastPostDate,
+    ua.LastCommentDate,
+    ua.LastPostHistoryEdit,
+    p.Body,
+    p.AcceptedAnswerId
+order by TagName, QuestionScore desc, PostId
+limit 100;

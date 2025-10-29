@@ -1,0 +1,202 @@
+WITH RankedUsers AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.CreationDate,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        ROW_NUMBER() OVER (PARTITION BY u.AccountId ORDER BY u.CreationDate) as UserRank,
+        LAG(u.Reputation) OVER (PARTITION BY u.AccountId ORDER BY u.CreationDate) as PrevReputation,
+        AVG(u.Reputation) OVER (PARTITION BY u.AccountId) as AvgReputation,
+        COUNT(*) OVER (PARTITION BY u.AccountId) as UserCountInAccount
+    FROM Users u
+    WHERE u.Reputation > 1000
+),
+QuestionStats AS (
+    SELECT 
+        p.Id as QuestionId,
+        p.OwnerUserId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.Tags,
+        COALESCE(p.AnswerCount, 0) as FinalAnswerCount,
+        CASE WHEN p.AnswerCount IS NULL THEN 0 ELSE p.AnswerCount END as AnswerCountNullSafe,
+        CASE WHEN p.Score > 10 THEN 'High' 
+             WHEN p.Score > 5 THEN 'Medium' 
+             ELSE 'Low' END as ScoreCategory,
+        (SELECT COUNT(*) FROM Posts p2 WHERE p2.ParentId = p.Id AND p2.PostTypeId = 2 AND p2.Score > 0) as PositiveAnswers,
+        (SELECT STRING_AGG(p3.Title, ', ') FROM Posts p3 WHERE p3.ParentId = p.Id AND p3.PostTypeId = 2) as AnswerTitles
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+AnswerStats AS (
+    SELECT 
+        a.Id as AnswerId,
+        a.ParentId,
+        a.OwnerUserId,
+        a.Score,
+        a.CreationDate,
+        a.LastEditDate,
+        a.Body,
+        LENGTH(a.Body) as BodyLength,
+        CASE WHEN a.Score > 5 THEN 'High' ELSE 'Low' END as AnswerScoreCategory,
+        RANK() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC) as AnswerRank,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.CreationDate) as AnswerNumber
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+),
+UserActivity AS (
+    SELECT 
+        u.Id as UserId,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        MAX(b.Date) as LastBadgeDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE WHEN t.Count > 1000 THEN 'Popular' 
+             WHEN t.Count > 500 THEN 'Moderate' 
+             ELSE 'Niche' END as TagPopularity,
+        EXISTS (SELECT 1 FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%') as HasPosts,
+        (
+            SELECT AVG(CAST(p.Score AS FLOAT)) 
+            FROM Posts p 
+            WHERE p.Tags LIKE '%' || t.TagName || '%' AND p.PostTypeId = 1
+        ) as AvgQuestionScore
+    FROM Tags t
+),
+ComplexQuery AS (
+    SELECT 
+        ru.UserId,
+        ru.DisplayName,
+        ru.Reputation,
+        ru.Views,
+        rs.QuestionId,
+        rs.Title as QuestionTitle,
+        rs.Score as QuestionScore,
+        rs.AnswerCount as QuestionAnswerCount,
+        rs.ViewCount as QuestionViewCount,
+        rs.PositiveAnswers,
+        rs.AnswerTitles,
+        ast.AnswerId,
+        ast.Score as AnswerScore,
+        ast.BodyLength,
+        ast.AnswerScoreCategory,
+        ua.PostCount,
+        ua.CommentCount,
+        ua.BadgeCount,
+        ta.TagName,
+        ta.TagCount,
+        ta.TagPopularity,
+        ta.AvgQuestionScore,
+        CASE 
+            WHEN ru.Reputation > (SELECT AVG(Reputation) FROM Users) 
+            AND rs.Score > 5 THEN 'High Value User - Quality Content'
+            WHEN ru.Reputation < (SELECT AVG(Reputation) FROM Users) 
+            AND rs.Score < 5 THEN 'Low Value User - Low Activity'
+            ELSE 'Moderate User'
+        END as UserSegment,
+        CASE 
+            WHEN ru.UserRank > 1 AND ru.PrevReputation > 0 
+            AND (ru.Reputation - ru.PrevReputation) > 100 THEN 'Rising Star'
+            WHEN ru.Reputation > 10000 AND ru.UserCountInAccount > 5 THEN 'Established User'
+            ELSE 'Regular User'
+        END as UserStatus,
+        COALESCE(rs.QuestionId, ast.AnswerId) as RelatedPostId,
+        COALESCE(rs.QuestionId, ast.AnswerId, 0) as PostOrAnswerId
+    FROM RankedUsers ru
+    INNER JOIN UserActivity ua ON ru.UserId = ua.UserId
+    LEFT JOIN QuestionStats rs ON ru.UserId = rs.OwnerUserId
+    LEFT JOIN AnswerStats ast ON ru.UserId = ast.OwnerUserId
+    LEFT JOIN TagAnalysis ta ON rs.Tags LIKE '%' || ta.TagName || '%'
+    LEFT JOIN (
+        SELECT OwnerUserId, MAX(Id) AS LastPostId
+        FROM Posts
+        GROUP BY OwnerUserId
+    ) ra ON ra.OwnerUserId = ru.UserId
+    WHERE (rs.QuestionId IS NOT NULL OR ast.AnswerId IS NOT NULL)
+    AND ru.Reputation > (SELECT AVG(Reputation) FROM Users)
+    AND (COALESCE(rs.Score, -999999) >= 0 OR COALESCE(ast.Score, -999999) >= 0)
+    AND (
+        rs.AnswerCount IS NULL 
+        OR rs.AnswerCount > 0
+        OR ast.AnswerId IS NOT NULL
+    )
+    AND (
+        COALESCE(rs.ViewCount, 0) > 1000
+        OR COALESCE(rs.AnswerCount, 0) > 5
+        OR COALESCE(ast.BodyLength, 0) > 100
+        OR ua.BadgeCount > 10
+    )
+)
+SELECT 
+    UserId,
+    DisplayName,
+    Reputation,
+    Views,
+    QuestionId,
+    QuestionTitle,
+    QuestionScore,
+    QuestionAnswerCount,
+    QuestionViewCount,
+    PositiveAnswers,
+    AnswerTitles,
+    AnswerId,
+    AnswerScore,
+    BodyLength,
+    AnswerScoreCategory,
+    PostCount,
+    CommentCount,
+    BadgeCount,
+    TagName,
+    TagCount,
+    TagPopularity,
+    AvgQuestionScore,
+    UserSegment,
+    UserStatus,
+    RelatedPostId,
+    PostOrAnswerId,
+    COUNT(*) OVER () as TotalResults
+FROM ComplexQuery c
+WHERE (
+    (QuestionId IS NOT NULL OR AnswerId IS NOT NULL)
+    AND (PostCount > 1 OR CommentCount > 1 OR BadgeCount > 1)
+    AND Reputation > (
+        SELECT AVG(Reputation) + COALESCE(STDDEV_POP(Reputation), 0) 
+        FROM Users
+    )
+)
+GROUP BY 
+    UserId, DisplayName, Reputation, Views, QuestionId, QuestionTitle, 
+    QuestionScore, QuestionAnswerCount, QuestionViewCount, PositiveAnswers, 
+    AnswerTitles, AnswerId, AnswerScore, BodyLength, AnswerScoreCategory,
+    PostCount, CommentCount, BadgeCount, TagName, TagCount, TagPopularity,
+    AvgQuestionScore, UserSegment, UserStatus, RelatedPostId, PostOrAnswerId
+HAVING 
+    COUNT(*) > 1
+    OR COUNT(DISTINCT TagName) > 2
+    OR MAX(PostOrAnswerId) IS NOT NULL
+ORDER BY 
+    Reputation DESC,
+    QuestionScore DESC,
+    AnswerScore DESC
+LIMIT 1000;

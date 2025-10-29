@@ -1,0 +1,84 @@
+WITH TopUsers AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.AccountId,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.UpVotes DESC, u.LastAccessDate DESC) AS rn
+  FROM Users u
+  WHERE u.Reputation > 1000
+),
+TagActivity AS (
+  SELECT
+    ta.TagName,
+    COUNT(*) AS TagPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionPosts,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerPosts
+  FROM Tags ta
+  JOIN Posts p ON POSITION(ta.TagName IN p.Tags) > 0
+  GROUP BY
+    ta.TagName
+),
+RecentBadges AS (
+  SELECT
+    b.Id AS BadgeId,
+    b.UserId,
+    b.Name,
+    b.Date,
+    b.Class,
+    b.TagBased,
+    ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC) AS rn
+  FROM Badges b
+)
+SELECT
+  tu.UserId,
+  tu.DisplayName,
+  tu.Reputation,
+  tu.CreationDate AS UserCreation,
+  tu.LastAccessDate AS UserLastAccess,
+  tu.Views,
+  tu.UpVotes,
+  tu.DownVotes,
+  tu.AccountId,
+  COUNT(CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+  COUNT(CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+  AVG(p.Score) AS AvgPostScore,
+  MAX(p.LastActivityDate) AS LastActivity,
+  JSON_AGG(DISTINCT c.Text) FILTER (WHERE c.PostId IS NOT NULL) AS RecentCommentsTexts,
+  JSON_AGG(
+    JSON_BUILD_OBJECT(
+      'badge_id', b.Id,
+      'name', b.Name,
+      'date', b.Date,
+      'class', b.Class,
+      'tag_based', b.TagBased
+    )
+  ) AS Badges
+FROM TopUsers tu
+LEFT JOIN Posts p ON p.OwnerUserId = tu.UserId
+LEFT JOIN Comments c ON c.PostId = p.Id
+LEFT JOIN RecentBadges rb ON rb.UserId = tu.UserId AND rb.rn = 1
+LEFT JOIN Badges b ON b.UserId = tu.UserId
+GROUP BY
+  tu.UserId,
+  tu.DisplayName,
+  tu.Reputation,
+  tu.CreationDate,
+  tu.LastAccessDate,
+  tu.Views,
+  tu.UpVotes,
+  tu.DownVotes,
+  tu.AccountId,
+  b.Id,
+  b.Name,
+  b.Date,
+  b.Class,
+  b.TagBased
+HAVING COUNT(p.Id) > 0
+ORDER BY tu.Reputation DESC
+LIMIT 100;

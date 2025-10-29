@@ -1,0 +1,293 @@
+WITH UserActivityMetrics AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswers,
+        COALESCE(AVG(CASE WHEN p.PostTypeId IN (1,2) THEN p.Score END), 0) AS AvgPostScore,
+        COALESCE(AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END), 0) AS AvgQuestionScore,
+        COALESCE(AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END), 0) AS AvgAnswerScore,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END), 0) AS TotalViewsOnQuestions,
+        COUNT(DISTINCT c_made.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT c_received.Id) AS TotalCommentsReceived,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+        MAX(CASE WHEN b.TagBased = TRUE THEN 1 ELSE 0 END) AS HasTagBasedBadge,
+        MIN(b.Date) AS FirstBadgeDate,
+        MAX(b.Date) AS MostRecentBadgeDate,
+        MIN(p.CreationDate) AS FirstPostDate,
+        MAX(p.CreationDate) AS LastPostDate,
+        COUNT(DISTINCT p.PostTypeId) AS DistinctPostTypesContributed,
+        (u.Reputation * 1.0) / NULLIF(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - u.CreationDate)) / (3600.0 * 24 * 365.25), 0) AS ReputationGrowthRatePerYear,
+        MAX(ph_edit.CreationDate) AS MostRecentPostEditDateBySelf,
+        (SELECT 1 FROM PostHistory ph_migrated WHERE ph_migrated.UserId = u.Id AND ph_migrated.PostHistoryTypeId IN (17, 35, 36) LIMIT 1) IS NOT NULL AS HasMigrationInvolvement
+    FROM
+        Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c_made ON u.Id = c_made.UserId
+    LEFT JOIN Comments c_received ON p.Id = c_received.PostId AND u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN PostHistory ph_edit ON p.Id = ph_edit.PostId AND u.Id = ph_edit.UserId AND ph_edit.PostHistoryTypeId IN (4, 5, 6)
+    GROUP BY
+        u.Id, u.Reputation, u.CreationDate, u.UpVotes, u.DownVotes
+),
+PostComplexMetrics AS (
+    /* compute per-post metrics; avoid aggregates that include window functions by precomputing close->reopen markers in a subquery */
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AcceptedAnswerId,
+        p.Tags,
+        p.Body,
+        p.ClosedDate,
+        p.AnswerCount,
+        p.Title,
+        p.LastActivityDate,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.Id END) AS EditCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT pl.Id) AS LinkedPostCount,
+        MAX(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS IsDuplicateSource,
+        MAX(CASE WHEN pl_related.LinkTypeId = 3 THEN 1 ELSE 0 END) AS IsDuplicateDestination,
+        COALESCE(cr.CloseReopenCycleCount, 0) AS CloseReopenCycleCount,
+        CASE
+            WHEN p.Body ILIKE '%sql%' OR p.Body ILIKE '%database%' OR p.Body ILIKE '%query%' OR p.Body ILIKE '%performance%' THEN 1
+            ELSE 0
+        END AS ContainsDBKeywords,
+        (p.Score * 2) + COALESCE(p.ViewCount / 10.0, 0) + (COUNT(DISTINCT c.Id) * 3) + COALESCE(p.AnswerCount * 5, 0) AS EngagementScore,
+        AVG(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN EXTRACT(EPOCH FROM (p.LastActivityDate - ph.CreationDate)) END) / 3600.0 AS AvgHoursBetweenEditAndActivity,
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.CreationDate DESC) AS PostTypeScoreRank,
+        p.Score - LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS ScoreDeltaFromPreviousPost,
+        TRIM(SUBSTRING(p.Tags FROM 2 FOR POSITION('><' IN p.Tags) - 2)) AS FirstTag,
+        COALESCE(p.Title, 'Untitled Post') AS DisplayTitle
+    FROM
+        Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+    LEFT JOIN PostLinks pl_related ON p.Id = pl_related.RelatedPostId
+    LEFT JOIN (
+        /* precompute close->reopen counts per post without mixing window inside aggregate */
+        SELECT ph1.PostId,
+               SUM(CASE WHEN ph1.PostHistoryTypeId = 10 AND ph2.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS CloseReopenCycleCount
+        FROM PostHistory ph1
+        LEFT JOIN LATERAL (
+            SELECT ph_next.PostHistoryTypeId
+            FROM PostHistory ph_next
+            WHERE ph_next.PostId = ph1.PostId
+              AND ph_next.CreationDate = (
+                  SELECT MIN(ph3.CreationDate) FROM PostHistory ph3
+                  WHERE ph3.PostId = ph1.PostId AND ph3.CreationDate > ph1.CreationDate
+              )
+            LIMIT 1
+        ) ph2 ON true
+        GROUP BY ph1.PostId
+    ) cr ON p.Id = cr.PostId
+    GROUP BY
+        p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.AcceptedAnswerId, p.Tags, p.Body, p.ClosedDate, p.AnswerCount, p.Title, p.LastActivityDate, cr.CloseReopenCycleCount
+),
+TagPerformanceInsights AS (
+    SELECT
+        u.Id AS UserId,
+        t.TagName,
+        COUNT(DISTINCT p.Id) AS PostsInTag,
+        COALESCE(SUM(p.Score), 0) AS TotalScoreInTag,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY SUM(p.Score) DESC, COUNT(DISTINCT p.Id) DESC) AS TagRank,
+        ROW_NUMBER() OVER (PARTITION BY t.TagName ORDER BY SUM(p.Score) DESC, COUNT(DISTINCT p.Id) DESC) AS UserRankForTag
+    FROM
+        Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+    JOIN (
+        SELECT Id, UNNEST(string_to_array(SUBSTRING(Tags FROM 2 FOR CHAR_LENGTH(Tags) - 2), '><')) AS TagName
+        FROM Posts
+        WHERE Tags IS NOT NULL AND CHAR_LENGTH(Tags) > 2
+    ) AS PostTags ON p.Id = PostTags.Id
+    JOIN Tags t ON PostTags.TagName = t.TagName
+    WHERE
+        p.PostTypeId IN (1, 2)
+    GROUP BY
+        u.Id, t.TagName
+)
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.Views AS UserProfileViews,
+    uam.TotalPosts,
+    uam.TotalQuestions,
+    uam.TotalAnswers,
+    uam.AvgPostScore,
+    uam.GoldBadges,
+    uam.SilverBadges,
+    uam.BronzeBadges,
+    uam.ReputationGrowthRatePerYear,
+    uam.HasTagBasedBadge,
+    uam.TotalCommentsMade,
+    uam.TotalCommentsReceived,
+    uam.MostRecentPostEditDateBySelf,
+    COALESCE(uam.FirstBadgeDate, CAST('1900-01-01' AS timestamp)) AS EarliestBadgeDate,
+    COALESCE(uam.MostRecentBadgeDate, CAST('1900-01-01' AS timestamp)) AS LatestBadgeDate,
+    COALESCE(uam.FirstPostDate, CAST('1900-01-01' AS timestamp)) AS EarliestPostDate,
+    COALESCE(uam.LastPostDate, CAST('1900-01-01' AS timestamp)) AS LatestPostDate,
+    COALESCE(uam.ReputationGrowthRatePerYear, 0.0) AS NormalizedRepGrowth,
+    p.Id AS PostId,
+    p.PostTypeId,
+    pt.Name AS PostTypeName,
+    pcm.DisplayTitle AS PostTitle,
+    p.CreationDate AS PostCreationDate,
+    p.Score AS PostScore,
+    p.ViewCount AS PostViewCount,
+    pcm.EditCount AS PostEditCount,
+    pcm.CommentCount AS PostCommentCount,
+    pcm.LinkedPostCount,
+    pcm.IsDuplicateSource,
+    pcm.IsDuplicateDestination,
+    pcm.ContainsDBKeywords,
+    pcm.EngagementScore AS PostEngagementScore,
+    pcm.PostTypeScoreRank,
+    pcm.ScoreDeltaFromPreviousPost,
+    pcm.FirstTag,
+    pcm.AvgHoursBetweenEditAndActivity,
+    CASE
+        WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Has Accepted Answer'
+        WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 AND p.AcceptedAnswerId IS NULL THEN 'No Accepted Answer Yet, Has Answers'
+        WHEN p.PostTypeId = 1 AND p.AnswerCount = 0 THEN 'No Answers Yet'
+        ELSE 'N/A'
+    END AS AnswerStatus,
+    LAG(p.CreationDate, 1) OVER (PARTITION BY u.Id ORDER BY p.CreationDate) AS PreviousPostDate,
+    LEAD(p.CreationDate, 1) OVER (PARTITION BY u.Id ORDER BY p.CreationDate) AS NextPostDate,
+    NTILE(4) OVER (ORDER BY u.Reputation DESC) AS UserReputationQuartile,
+    SUM(p.Score) OVER (PARTITION BY u.Location ORDER BY u.Reputation DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS RunningTotalScoreByLocation,
+    (SELECT COUNT(DISTINCT c_corr.UserId)
+     FROM Comments c_corr
+     WHERE c_corr.PostId = p.Id AND c_corr.CreationDate > p.CreationDate - INTERVAL '1 month') AS RecentCommentersCount,
+    (SELECT ph_corr.Text
+     FROM PostHistory ph_corr
+     WHERE ph_corr.PostId = p.Id AND ph_corr.PostHistoryTypeId = 10
+     ORDER BY ph_corr.CreationDate
+     LIMIT 1) AS FirstCloseReasonText,
+    (SELECT STRING_AGG(tpi.TagName || ' (' || CAST(tpi.TotalScoreInTag AS varchar) || ')', '; ')
+     FROM TagPerformanceInsights tpi
+     WHERE tpi.UserId = u.Id AND tpi.TagRank <= 3) AS Top3TagsByScore,
+    CASE
+        WHEN u.Reputation >= 25000 AND uam.GoldBadges >= 5 AND uam.TotalQuestions >= 100 AND uam.AvgQuestionScore > 15 THEN 'Legendary Contributor'
+        WHEN u.Reputation >= 10000 AND uam.TotalPosts > 200 AND uam.ReputationGrowthRatePerYear > 5000 AND uam.HasTagBasedBadge > 0 THEN 'High-Growth Expert'
+        WHEN u.Reputation < 1000 AND uam.TotalPosts BETWEEN 5 AND 50 AND uam.FirstBadgeDate IS NOT NULL AND uam.FirstPostDate > CAST('2020-01-01' AS timestamp) THEN 'Promising Newcomer'
+        WHEN p.ClosedDate IS NOT NULL AND pcm.CloseReopenCycleCount > 0 THEN 'Contentious Post'
+        ELSE 'Regular Activity'
+    END AS UserEngagementSegment,
+    (u.UpVotes * 1.0) / NULLIF(u.DownVotes + u.UpVotes, 0) AS UpvoteRatio
+FROM
+    Users u
+LEFT JOIN UserActivityMetrics uam ON u.Id = uam.UserId
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+LEFT JOIN PostComplexMetrics pcm ON p.Id = pcm.PostId
+WHERE
+    u.CreationDate >= CAST('2018-01-01' AS date)
+    AND COALESCE(u.Location, '') <> ''
+    AND (COALESCE(uam.TotalPosts, 0) > 10 OR COALESCE(uam.TotalCommentsMade, 0) > 20 OR COALESCE(uam.GoldBadges, 0) > 0)
+    AND (p.PostTypeId IN (1, 2) OR p.PostTypeId IS NULL)
+    AND (COALESCE(pcm.EngagementScore, 0) > 20 OR COALESCE(p.Score, 0) > 5 OR COALESCE(p.ViewCount, 0) > 1000 OR p.Id IS NULL)
+    AND (u.DisplayName IS NOT NULL AND CHAR_LENGTH(u.DisplayName) >= 3 AND u.DisplayName NOT ILIKE '%test%')
+    AND (NOT EXISTS (
+        SELECT 1 FROM PostHistory ph_del WHERE ph_del.UserId = u.Id AND ph_del.PostHistoryTypeId = 12 GROUP BY ph_del.UserId HAVING COUNT(ph_del.Id) > 3
+    ))
+
+UNION ALL
+
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.Views AS UserProfileViews,
+    uam.TotalPosts,
+    uam.TotalQuestions,
+    uam.TotalAnswers,
+    uam.AvgPostScore,
+    uam.GoldBadges,
+    uam.SilverBadges,
+    uam.BronzeBadges,
+    uam.ReputationGrowthRatePerYear,
+    uam.HasTagBasedBadge,
+    uam.TotalCommentsMade,
+    uam.TotalCommentsReceived,
+    uam.MostRecentPostEditDateBySelf,
+    COALESCE(uam.FirstBadgeDate, CAST('1900-01-01' AS timestamp)) AS EarliestBadgeDate,
+    COALESCE(uam.MostRecentBadgeDate, CAST('1900-01-01' AS timestamp)) AS LatestBadgeDate,
+    COALESCE(uam.FirstPostDate, CAST('1900-01-01' AS timestamp)) AS EarliestPostDate,
+    COALESCE(uam.LastPostDate, CAST('1900-01-01' AS timestamp)) AS LatestPostDate,
+    COALESCE(uam.ReputationGrowthRatePerYear, 0.0) AS NormalizedRepGrowth,
+    p.Id AS PostId,
+    p.PostTypeId,
+    pt.Name AS PostTypeName,
+    pcm.DisplayTitle AS PostTitle,
+    p.CreationDate AS PostCreationDate,
+    p.Score AS PostScore,
+    p.ViewCount AS PostViewCount,
+    pcm.EditCount AS PostEditCount,
+    pcm.CommentCount AS PostCommentCount,
+    pcm.LinkedPostCount,
+    pcm.IsDuplicateSource,
+    pcm.IsDuplicateDestination,
+    pcm.ContainsDBKeywords,
+    pcm.EngagementScore AS PostEngagementScore,
+    pcm.PostTypeScoreRank,
+    pcm.ScoreDeltaFromPreviousPost,
+    pcm.FirstTag,
+    pcm.AvgHoursBetweenEditAndActivity,
+    CASE
+        WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Has Accepted Answer'
+        WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 AND p.AcceptedAnswerId IS NULL THEN 'No Accepted Answer Yet, Has Answers'
+        WHEN p.PostTypeId = 1 AND p.AnswerCount = 0 THEN 'No Answers Yet'
+        ELSE 'N/A'
+    END AS AnswerStatus,
+    LAG(p.CreationDate, 1) OVER (PARTITION BY u.Id ORDER BY p.CreationDate) AS PreviousPostDate,
+    LEAD(p.CreationDate, 1) OVER (PARTITION BY u.Id ORDER BY p.CreationDate) AS NextPostDate,
+    NTILE(4) OVER (ORDER BY u.Reputation DESC) AS UserReputationQuartile,
+    SUM(p.Score) OVER (PARTITION BY u.Location ORDER BY u.Reputation DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS RunningTotalScoreByLocation,
+    (SELECT COUNT(DISTINCT c_corr.UserId)
+     FROM Comments c_corr
+     WHERE c_corr.PostId = p.Id AND c_corr.CreationDate > p.CreationDate - INTERVAL '1 month') AS RecentCommentersCount,
+    (SELECT ph_corr.Text
+     FROM PostHistory ph_corr
+     WHERE ph_corr.PostId = p.Id AND ph_corr.PostHistoryTypeId = 10
+     ORDER BY ph_corr.CreationDate
+     LIMIT 1) AS FirstCloseReasonText,
+    (SELECT STRING_AGG(tpi.TagName || ' (' || CAST(tpi.TotalScoreInTag AS varchar) || ')', '; ')
+     FROM TagPerformanceInsights tpi
+     WHERE tpi.UserId = u.Id AND tpi.TagRank <= 3) AS Top3TagsByScore,
+    'Moderator Potential Candidate' AS UserEngagementSegment,
+    (u.UpVotes * 1.0) / NULLIF(u.DownVotes + u.UpVotes, 0) AS UpvoteRatio
+FROM
+    Users u
+LEFT JOIN UserActivityMetrics uam ON u.Id = uam.UserId
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+LEFT JOIN PostComplexMetrics pcm ON p.Id = pcm.PostId
+WHERE
+    u.Reputation >= 15000
+    AND COALESCE(uam.GoldBadges, 0) >= 2
+    AND COALESCE(uam.TotalAnswers, 0) >= 50
+    AND p.PostTypeId = 2
+    AND COALESCE(pcm.EngagementScore, 0) > 75
+    AND COALESCE(pcm.ContainsDBKeywords, 0) = 1
+    AND NOT EXISTS (
+        SELECT 1 FROM PostHistory ph_del WHERE ph_del.UserId = u.Id AND ph_del.PostHistoryTypeId = 12 GROUP BY ph_del.UserId HAVING COUNT(ph_del.Id) > 1
+    )
+ORDER BY
+    Reputation DESC, UserCreationDate ASC, PostCreationDate DESC;

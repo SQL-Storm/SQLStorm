@@ -1,0 +1,203 @@
+-- {"query": "1112.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3266} 
+WITH UserEngagement AS (
+    -- CTE 1: Aggregates user activity and post metrics
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate,
+        U.LastAccessDate,
+        COUNT(DISTINCT Q.Id) AS TotalQuestions,
+        COUNT(DISTINCT A.Id) AS TotalAnswers,
+        SUM(CASE WHEN Q.PostTypeId = 1 THEN Q.Score ELSE 0 END) AS TotalQuestionScore,
+        SUM(CASE WHEN A.PostTypeId = 2 THEN A.Score ELSE 0 END) AS TotalAnswerScore,
+        SUM(CASE WHEN Q.PostTypeId = 1 THEN Q.ViewCount ELSE 0 END) AS TotalQuestionViews,
+        SUM(CASE WHEN PA.AcceptedAnswerId = A.Id THEN 1 ELSE 0 END) AS AcceptedAnswersProvided,
+        -- Find the last content edit date by the user on any of their posts
+        MAX(PH.CreationDate) FILTER (WHERE PH.PostHistoryTypeId IN (4, 5, 6) AND PH.UserId = U.Id) AS LastContentEditDate,
+        -- Correlated subquery to calculate average comment score
+        (SELECT COALESCE(AVG(C.Score), 0) FROM Comments C WHERE C.UserId = U.Id) AS AvgCommentScore,
+        -- Correlated subquery to check if user has any posts with 'Offensive' votes
+        EXISTS (
+            SELECT 1
+            FROM Votes V
+            JOIN Posts P ON V.PostId = P.Id
+            WHERE P.OwnerUserId = U.Id AND V.VoteTypeId = 4 -- Offensive vote
+        ) AS HasOffensiveVoteOnTheirPosts
+    FROM Users U
+    LEFT JOIN Posts Q ON Q.OwnerUserId = U.Id AND Q.PostTypeId = 1 -- Questions owned by user
+    LEFT JOIN Posts A ON A.OwnerUserId = U.Id AND A.PostTypeId = 2 -- Answers owned by user
+    LEFT JOIN Posts PA ON PA.AcceptedAnswerId = A.Id -- Posts for which A is the accepted answer
+    LEFT JOIN PostHistory PH ON PH.PostId IN (Q.Id, A.Id) -- Post history for their questions/answers
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate
+),
+UserBadgesAndTagDiversity AS (
+    -- CTE 2: User badge summary and tag diversity from their questions
+    SELECT
+        U.Id AS UserId,
+        COUNT(B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        -- Using STRING_TO_ARRAY and LATERAL UNNEST for tag parsing (PostgreSQL specific)
+        COUNT(DISTINCT Tag.value) AS DistinctTagsContributedTo,
+        MAX(B.Date) AS LatestBadgeAwardDate
+    FROM Users U
+    LEFT JOIN Badges B ON B.UserId = U.Id
+    LEFT JOIN Posts Q ON Q.OwnerUserId = U.Id AND Q.PostTypeId = 1 AND Q.Tags IS NOT NULL
+    LEFT JOIN LATERAL UNNEST(STRING_TO_ARRAY(SUBSTRING(Q.Tags FROM 2 FOR LENGTH(Q.Tags)-2), '><')) AS Tag(value) ON TRUE
+    GROUP BY U.Id
+),
+PostLinkAnalysis AS (
+    -- CTE 3: Analyze post linking activity (e.g., creating links or identifying duplicates)
+    SELECT
+        U.Id AS UserId,
+        COUNT(DISTINCT PL_Linked.Id) AS LinksCreated,
+        COUNT(DISTINCT PL_Dup.Id) AS DuplicatesIdentified
+    FROM Users U
+    LEFT JOIN Posts P ON P.OwnerUserId = U.Id
+    LEFT JOIN PostLinks PL_Linked ON PL_Linked.PostId = P.Id AND PL_Linked.LinkTypeId = 1 -- Linked posts
+    LEFT JOIN PostLinks PL_Dup ON PL_Dup.PostId = P.Id AND PL_Dup.LinkTypeId = 3 -- Duplicate posts
+    GROUP BY U.Id
+),
+VoteActivitySummary AS (
+    -- CTE 4: Summarize voting behavior for users
+    SELECT
+        U.Id AS UserId,
+        COUNT(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE NULL END) AS UpVotesCast,
+        COUNT(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE NULL END) AS DownVotesCast,
+        COUNT(CASE WHEN V.VoteTypeId IN (6, 7) THEN 1 ELSE NULL END) AS CloseReopenVotes,
+        COALESCE(SUM(CASE WHEN V.VoteTypeId = 8 THEN V.BountyAmount ELSE 0 END), 0) AS TotalBountyGiven
+    FROM Users U
+    LEFT JOIN Votes V ON V.UserId = U.Id
+    GROUP BY U.Id
+),
+UserFirstEditAggregates AS (
+    -- CTE 5: Calculate average time to first edit for all posts owned by a user
+    SELECT
+        P.OwnerUserId AS UserId,
+        AVG(EXTRACT(EPOCH FROM (PH.FirstEditDate - P.CreationDate))) AS AvgTimeToFirstEditSeconds -- Time in seconds
+    FROM Posts P
+    JOIN (
+        SELECT
+            PH_Inner.PostId,
+            MIN(PH_Inner.CreationDate) AS FirstEditDate
+        FROM PostHistory PH_Inner
+        WHERE PH_Inner.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+        GROUP BY PH_Inner.PostId
+    ) PH ON P.Id = PH.PostId
+    WHERE P.OwnerUserId IS NOT NULL AND P.CreationDate < PH.FirstEditDate -- Ensure edit is after creation
+    GROUP BY P.OwnerUserId
+),
+PostClosureAnalysis AS (
+    -- CTE 6: Count specific close reasons initiated by a user
+    SELECT
+        PH.UserId,
+        COUNT(DISTINCT PH.PostId) AS DuplicateCloseVotesByThem
+    FROM PostHistory PH
+    WHERE PH.PostHistoryTypeId = 10 -- Post Closed
+      AND PH.Comment IS NOT NULL
+      AND PH.Comment ~ '^[0-9]+$' -- Check if comment is numeric (PostgreSQL regex)
+      -- Non-correlated subquery to get the ID for 'Duplicate' close reason
+      AND CAST(PH.Comment AS SMALLINT) = (SELECT CRT.Id FROM CloseReasonTypes CRT WHERE CRT.Name = 'Duplicate')
+    GROUP BY PH.UserId
+),
+HighAchieverIdentifiers AS (
+    -- CTE 7: Using UNION ALL to identify high achievers based on different criteria
+    SELECT
+        U.Id AS UserId,
+        'GoldBadger' AS AchievementType,
+        B.Date AS AchievementDate
+    FROM Users U
+    JOIN Badges B ON U.Id = B.UserId
+    WHERE B.Class = 1 -- Gold Badges
+    UNION ALL
+    SELECT
+        U.Id AS UserId,
+        'HighRepVoter' AS AchievementType,
+        V.CreationDate AS AchievementDate
+    FROM Users U
+    JOIN Votes V ON U.Id = V.UserId
+    WHERE V.VoteTypeId = 2 AND U.UpVotes > 10000 AND V.CreationDate IS NOT NULL -- Users with over 10000 upvotes cast
+)
+-- Final SELECT statement combining all derived metrics with complex calculations and window functions
+SELECT
+    U.Id AS UserId,
+    U.DisplayName,
+    U.Reputation,
+    UE.TotalQuestions,
+    UE.TotalAnswers,
+    COALESCE(UB.GoldBadges, 0) AS GoldBadges,
+    COALESCE(UB.SilverBadges, 0) AS SilverBadges,
+    COALESCE(UB.BronzeBadges, 0) AS BronzeBadges,
+    UE.AcceptedAnswersProvided,
+    UE.TotalQuestionViews,
+    COALESCE(UB.DistinctTagsContributedTo, 0) AS DistinctTagsContributedTo,
+    COALESCE(PLA.LinksCreated, 0) AS LinksCreated,
+    COALESCE(PLA.DuplicatesIdentified, 0) AS DuplicatesIdentified,
+    COALESCE(VAS.UpVotesCast, 0) AS UpVotesCast,
+    COALESCE(VAS.DownVotesCast, 0) AS DownVotesCast,
+    COALESCE(VAS.TotalBountyGiven, 0) AS TotalBountyGiven,
+    UE.AvgCommentScore,
+    UE.HasOffensiveVoteOnTheirPosts,
+    COALESCE(PCA.DuplicateCloseVotesByThem, 0) AS DuplicateCloseVotesByThem,
+    COALESCE(UFEA.AvgTimeToFirstEditSeconds, 0) AS AvgTimeToFirstEditSeconds,
+    -- Check achievement status using EXISTS on the UNION ALL CTE
+    CASE WHEN EXISTS (SELECT 1 FROM HighAchieverIdentifiers HAI WHERE HAI.UserId = U.Id AND HAI.AchievementType = 'GoldBadger') THEN TRUE ELSE FALSE END AS IsGoldBadgerAchiever,
+    CASE WHEN EXISTS (SELECT 1 FROM HighAchieverIdentifiers HAI WHERE HAI.UserId = U.Id AND HAI.AchievementType = 'HighRepVoter') THEN TRUE ELSE FALSE END AS IsHighRepVoterAchiever,
+
+    -- Complex User Influence Score calculation
+    (
+        U.Reputation * 0.1
+        + COALESCE(UE.TotalQuestionScore, 0) * 0.05
+        + COALESCE(UE.TotalAnswerScore, 0) * 0.07
+        + COALESCE(UE.AcceptedAnswersProvided, 0) * 5
+        + COALESCE(UE.TotalQuestionViews, 0) * 0.001
+        + COALESCE(UB.GoldBadges, 0) * 10
+        + COALESCE(UB.SilverBadges, 0) * 5
+        + COALESCE(UB.BronzeBadges, 0) * 1
+        + COALESCE(PLA.LinksCreated, 0) * 0.5
+        + COALESCE(PLA.DuplicatesIdentified, 0) * 2
+        + COALESCE(VAS.UpVotesCast, 0) * 0.02
+        - COALESCE(VAS.DownVotesCast, 0) * 0.05 -- Penalty for downvotes
+        + COALESCE(VAS.TotalBountyGiven, 0) * 0.1
+        + COALESCE(UE.AvgCommentScore, 0) * 0.5
+        - CASE WHEN UE.HasOffensiveVoteOnTheirPosts THEN 100 ELSE 0 END -- Significant penalty for offensive content
+        + COALESCE(UB.DistinctTagsContributedTo, 0) * 0.5
+        + (CASE WHEN COALESCE(UFEA.AvgTimeToFirstEditSeconds, 0) > 0 THEN 1000.0 / (COALESCE(UFEA.AvgTimeToFirstEditSeconds, 1)) ELSE 0 END) * 0.1 -- Quicker edits implies more active
+        + (CASE WHEN EXISTS (SELECT 1 FROM HighAchieverIdentifiers HAI WHERE HAI.UserId = U.Id AND HAI.AchievementType = 'GoldBadger') THEN 50 ELSE 0 END) -- Bonus for Gold Badgers
+    ) AS UserInfluenceScore,
+
+    -- Window functions for ranking and aggregation over partitions
+    RANK() OVER (ORDER BY U.Reputation DESC, UE.AcceptedAnswersProvided DESC, UE.TotalAnswerScore DESC) AS ReputationAndAnswerRank,
+    NTILE(10) OVER (ORDER BY (U.UpVotes - U.DownVotes) DESC) AS NetVoteDifferenceDecile,
+    LAG(U.Reputation, 1, 0) OVER (PARTITION BY (EXTRACT(YEAR FROM U.CreationDate)) ORDER BY U.Reputation DESC) AS PreviousUserRepInCreationYear,
+    AVG(U.Reputation) OVER (PARTITION BY (EXTRACT(MONTH FROM U.CreationDate))) AS AvgReputationForCreationMonth,
+
+    -- String expressions and complicated predicates based on Users table directly
+    CASE
+        WHEN U.AboutMe IS NULL THEN 'No Bio'
+        WHEN LENGTH(U.AboutMe) > 1000 THEN 'Extremely Detailed Bio'
+        WHEN LENGTH(U.AboutMe) > 300 THEN 'Very Detailed Bio'
+        WHEN LENGTH(U.AboutMe) > 50 THEN 'Moderately Detailed Bio'
+        ELSE 'Brief Bio'
+    END AS AboutMeDetailLevel,
+    COALESCE(NULLIF(TRIM(U.Location), ''), 'Undefined Location') AS ProcessedLocation, -- NULLIF and COALESCE for NULL handling, TRIM for string cleaning
+    UPPER(LEFT(COALESCE(U.DisplayName, 'ANONYMOUS'), 3)) AS DisplayNamePrefix, -- String manipulation
+    REPLACE(U.WebsiteUrl, 'http://', 'https://') AS HTTPSWebsiteUrl, -- String transformation
+    (EXTRACT(DAY FROM U.LastAccessDate - U.CreationDate)) AS DaysSinceCreationToLastAccess -- Date calculation
+FROM Users U
+LEFT JOIN UserEngagement UE ON U.Id = UE.UserId
+LEFT JOIN UserBadgesAndTagDiversity UB ON U.Id = UB.UserId
+LEFT JOIN PostLinkAnalysis PLA ON U.Id = PLA.UserId
+LEFT JOIN VoteActivitySummary VAS ON U.Id = VAS.UserId
+LEFT JOIN UserFirstEditAggregates UFEA ON U.Id = UFEA.UserId
+LEFT JOIN PostClosureAnalysis PCA ON U.Id = PCA.UserId
+WHERE
+    U.Reputation > 500 -- Filter for more engaged users
+    AND (U.AboutMe LIKE '%SQL%' OR U.AboutMe LIKE '%database%' OR U.WebsiteUrl IS NOT NULL) -- Complicated predicate using OR and LIKE, and NULL logic
+    AND U.LastAccessDate > (NOW() - INTERVAL '6 months') -- Active within the last 6 months (PostgreSQL interval syntax)
+    AND (U.UpVotes > U.DownVotes * 2 OR U.UpVotes > 100) -- Another complex predicate
+    AND U.DisplayName IS NOT NULL
+ORDER BY UserInfluenceScore DESC, ReputationAndAnswerRank ASC
+LIMIT 500;

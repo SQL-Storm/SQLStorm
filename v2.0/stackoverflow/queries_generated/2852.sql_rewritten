@@ -1,0 +1,200 @@
+-- {"query": "2852.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1785} 
+with RecursiveUserActivity as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p2.Id) filter (where p2.PostTypeId = 2) as AnswerCount,
+        coalesce(sum(vt2_counts.UpVotes),0) as TotalUpVotesReceived,
+        coalesce(sum(vt3_counts.DownVotes),0) as TotalDownVotesReceived,
+        count(distinct b.Id) as BadgeCount,
+        max(b.Class) as HighestBadgeClass,
+        row_number() over (partition by u.Id order by b.Date desc nulls last) as LatestBadgeRowNum
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 1
+    left join Posts p2 on p2.OwnerUserId = u.Id and p2.PostTypeId = 2
+    left join Badges b on b.UserId = u.Id
+    left join (
+        select p.OwnerUserId, count(v.Id) as UpVotes
+        from Votes v
+        join VoteTypes vt on vt.Id = v.VoteTypeId and vt.Name = 'UpMod'
+        join Posts p on p.Id = v.PostId
+        group by p.OwnerUserId
+    ) vt2_counts on vt2_counts.OwnerUserId = u.Id
+    left join (
+        select p.OwnerUserId, count(v.Id) as DownVotes
+        from Votes v
+        join VoteTypes vt on vt.Id = v.VoteTypeId and vt.Name = 'DownMod'
+        join Posts p on p.Id = v.PostId
+        group by p.OwnerUserId
+    ) vt3_counts on vt3_counts.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+UserTopTags as (
+    select 
+        ph.PostId,
+        unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) as Tag,
+        ph.UserId,
+        count(*) as EditsOnTag
+    from PostHistory ph
+    join Posts p on p.Id = ph.PostId and p.Tags is not null
+    where ph.UserId is not null and ph.PostHistoryTypeId in (4,5,6) -- edits on title, body, or tags
+    group by ph.PostId, Tag, ph.UserId
+),
+MostEditedTagsByUser as (
+    select 
+        UserId,
+        Tag,
+        sum(EditsOnTag) as TotalEdits
+    from UserTopTags
+    group by UserId, Tag
+),
+UserRecentActivity as (
+    select
+        u.Id as UserId,
+        max(ph.CreationDate) as LastEditDate,
+        max(c.CreationDate) as LastCommentDate,
+        max(v.CreationDate) as LastVoteDate
+    from Users u
+    left join PostHistory ph on ph.UserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id
+),
+UserActivitySummary as (
+    select
+        a.UserId,
+        a.DisplayName,
+        a.Reputation,
+        a.CreationDate,
+        a.LastAccessDate,
+        a.QuestionCount,
+        a.AnswerCount,
+        a.TotalUpVotesReceived,
+        a.TotalDownVotesReceived,
+        a.BadgeCount,
+        a.HighestBadgeClass,
+        r.LastEditDate,
+        r.LastCommentDate,
+        r.LastVoteDate,
+        mt.Tag as MostEditedTag,
+        mt.TotalEdits
+    from RecursiveUserActivity a
+    left join UserRecentActivity r on r.UserId = a.UserId
+    left join lateral (
+        select Tag, TotalEdits 
+        from MostEditedTagsByUser m 
+        where m.UserId = a.UserId 
+        order by TotalEdits desc 
+        limit 1
+    ) mt on true
+),
+QuestionAnswerDetails as (
+    select 
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.CreationDate as QuestionCreationDate,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViewCount,
+        coalesce(q.AnswerCount,0) as QuestionAnswerCount,
+        a.Id as AnswerId,
+        a.CreationDate as AnswerCreationDate,
+        a.Score as AnswerScore,
+        u.DisplayName as AnswerOwnerName,
+        row_number() over (partition by q.Id order by a.Score desc nulls last, a.CreationDate asc) as AnswerRank,
+        coalesce(cl.Reason, 'No Close Reason') as CloseReason
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Users u on u.Id = a.OwnerUserId
+    left join (
+        select ph.PostId, crt.Name as Reason
+        from PostHistory ph
+        join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+        where ph.PostHistoryTypeId = 10
+    ) cl on cl.PostId = q.Id
+    where q.PostTypeId = 1
+),
+AggregatedPostLinks as (
+    select 
+        pl.PostId,
+        count(distinct pl.RelatedPostId) as TotalLinkedPosts,
+        count(distinct case when lt.Name = 'Duplicate' then pl.RelatedPostId end) as TotalDuplicates,
+        count(distinct case when lt.Name = 'Linked' then pl.RelatedPostId end) as TotalOtherLinks
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    group by pl.PostId
+),
+ComplexPostStats as (
+    select 
+        p.Id as PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        al.TotalLinkedPosts,
+        al.TotalDuplicates,
+        al.TotalOtherLinks,
+        case 
+            when p.Score is null then null
+            else p.Score * log(1 + p.ViewCount) / nullif(p.AnswerCount + 1,0)
+        end as WeightedScore,
+        length(coalesce(p.Body, '')) as BodyLength,
+        -- complexity score with string manipulation and NULL logic
+        coalesce(
+            nullif(position('?' in coalesce(p.Title, '') ),0),
+            9999
+        ) as QuestionMarkPositionInTitle
+    from Posts p
+    left join AggregatedPostLinks al on al.PostId = p.Id
+)
+select 
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.MostEditedTag,
+    uas.TotalEdits,
+    uas.QuestionCount,
+    uas.AnswerCount,
+    uas.TotalUpVotesReceived,
+    uas.TotalDownVotesReceived,
+    uas.BadgeCount,
+    uas.HighestBadgeClass,
+    uas.LastEditDate,
+    uas.LastCommentDate,
+    uas.LastVoteDate,
+    qad.QuestionId,
+    qad.Title,
+    qad.QuestionScore,
+    qad.QuestionViewCount,
+    qad.QuestionAnswerCount,
+    qad.AnswerId,
+    qad.AnswerScore,
+    qad.AnswerOwnerName,
+    qad.CloseReason,
+    cps.PostId as RelatedPostId,
+    cps.PostTypeId,
+    cps.Score as RelatedPostScore,
+    cps.ViewCount as RelatedPostViewCount,
+    cps.AnswerCount as RelatedPostAnswerCount,
+    cps.FavoriteCount as RelatedPostFavoriteCount,
+    cps.TotalLinkedPosts,
+    cps.TotalDuplicates,
+    cps.TotalOtherLinks,
+    cps.WeightedScore,
+    cps.BodyLength,
+    cps.QuestionMarkPositionInTitle
+from UserActivitySummary uas
+left join Posts p on p.OwnerUserId = uas.UserId and p.PostTypeId = 1
+left join QuestionAnswerDetails qad on qad.QuestionId = p.Id
+left join ComplexPostStats cps on cps.PostId = qad.AnswerId
+where uas.Reputation > 1000
+and (cps.WeightedScore > 10 or cps.WeightedScore is null)
+and (uas.LastAccessDate > cast('2024-10-01 12:34:56' as timestamp) - interval '90 days')
+order by uas.Reputation desc, uas.TotalEdits desc, qad.QuestionScore desc
+limit 100;

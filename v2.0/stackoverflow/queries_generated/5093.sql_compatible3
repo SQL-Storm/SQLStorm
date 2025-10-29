@@ -1,0 +1,65 @@
+SELECT
+  u.Id AS UserId,
+  u.DisplayName AS UserName,
+  du.TotalDelv AS DeliveredViews,
+  ru.TotalUpvotes AS UpvotesReceived,
+  COALESCE(bg.BadgeGoldCount, 0) AS GoldBadges,
+  COALESCE(bs.BadgeSilverCount, 0) AS SilverBadges,
+  COALESCE(br.BadgeBronzeCount, 0) AS BronzeBadges,
+  COUNT(CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+  AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS AvgQuestionScore,
+  LISTAGG(t.TagName, ',') WITHIN GROUP (ORDER BY t.TagName) AS TopTags,
+  MAX(p.LastActivityDate) AS LastActive,
+  SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesGiven,
+  SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesGiven
+FROM Users u
+LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+LEFT JOIN Votes v ON v.PostId = p.Id
+LEFT JOIN (
+  SELECT pp.OwnerUserId AS OwnerUserId, COUNT(*) AS TotalDelv
+  FROM Posts pp
+  WHERE pp.ViewCount > 0
+  GROUP BY pp.OwnerUserId
+) du ON du.OwnerUserId = u.Id
+LEFT JOIN (
+  SELECT p3.OwnerUserId AS OwnerUserId, SUM(CASE WHEN v2.VoteTypeId = 1 THEN 1 ELSE 0 END) AS TotalUpvotes
+  FROM Posts p3
+  JOIN Votes v2 ON v2.PostId = p3.Id
+  GROUP BY p3.OwnerUserId
+) ru ON ru.OwnerUserId = u.Id
+LEFT JOIN (
+  SELECT UserId,
+         SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS BadgeGoldCount
+  FROM Badges
+  GROUP BY UserId
+) bg ON bg.UserId = u.Id
+LEFT JOIN (
+  SELECT UserId,
+         SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS BadgeSilverCount
+  FROM Badges
+  GROUP BY UserId
+) bs ON bs.UserId = u.Id
+LEFT JOIN (
+  SELECT UserId,
+         SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BadgeBronzeCount
+  FROM Badges
+  GROUP BY UserId
+) br ON br.UserId = u.Id
+LEFT JOIN (
+  SELECT p2.OwnerUserId AS OwnerUserId, t.Name AS TagName
+  FROM Tags t
+  JOIN Posts p2 ON t.WikiPostId = p2.Id
+  GROUP BY p2.OwnerUserId, t.Name
+) t ON t.OwnerUserId = u.Id
+GROUP BY
+  u.Id,
+  u.DisplayName,
+  du.TotalDelv,
+  ru.TotalUpvotes,
+  bg.BadgeGoldCount,
+  bs.BadgeSilverCount,
+  br.BadgeBronzeCount,
+  p.LastActivityDate
+ORDER BY
+  MAX(p.LastActivityDate) DESC
+FETCH FIRST 100 ROWS ONLY;

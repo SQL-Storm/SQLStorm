@@ -1,0 +1,319 @@
+with recent_active_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.location,
+        u.creationdate,
+        u.lastaccessdate,
+        coalesce(nullif(trim(u.websiteurl), ''), 'n/a') as websiteurl,
+        sum(coalesce(vu.upvotes, 0)) over (partition by u.id) as total_upvotes_window,
+        sum(coalesce(vu.downvotes, 0)) over (partition by u.id) as total_downvotes_window
+    from users u
+    left join lateral (
+        select
+            count(*) filter (where vt.name = 'UpMod') as upvotes,
+            count(*) filter (where vt.name = 'DownMod') as downvotes
+        from votes v
+        join votetypes vt on vt.id = v.votetypeid
+        where v.userid = u.id
+          and v.creationdate >= u.lastaccessdate - interval '365 days'
+    ) vu on true
+    where u.lastaccessdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '730 days'
+),
+question_activity as (
+    select
+        p.id as question_id,
+        p.owneruserid,
+        p.creationdate as q_created,
+        p.score as q_score,
+        p.viewcount,
+        p.answercount,
+        p.title,
+        p.tags,
+        bool_or(ph.posthistorytypeid = 10) as ever_closed_flag,
+        max(ph.creationdate) filter (where ph.posthistorytypeid = 10) as last_closed_date,
+        max(ph.creationdate) filter (where ph.posthistorytypeid = 11) as last_reopened_date,
+        sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end) as net_votes,
+        count(distinct case when v.votetypeid = 5 then v.userid end) as favorites,
+        count(distinct a.id) as answers_total
+    from posts p
+    left join posthistory ph on ph.postid = p.id and ph.posthistorytypeid in (10, 11)
+    left join votes v on v.postid = p.id
+    left join posts a on a.parentid = p.id and a.posttypeid = 2
+    where p.posttypeid = 1
+      and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '1460 days'
+    group by p.id, p.owneruserid, p.creationdate, p.score, p.viewcount, p.answercount, p.title, p.tags
+),
+answers_detail as (
+    select
+        a.parentid as question_id,
+        a.id as answer_id,
+        a.owneruserid as answer_owner_id,
+        a.creationdate as a_created,
+        a.score as a_score,
+        row_number() over (partition by a.parentid order by a.score desc nulls last, a.creationdate asc) as rn_by_score,
+        row_number() over (partition by a.parentid order by a.creationdate asc) as rn_by_time,
+        avg(a.score) over (partition by a.parentid) as avg_answer_score_per_q
+    from posts a
+    where a.posttypeid = 2
+),
+tag_expansion as (
+    select
+        qa.question_id,
+        unnest(string_to_array(substring(coalesce(qa.tags, ''), 2, greatest(length(coalesce(qa.tags, '')) - 2, 0)), '><')) as tag
+    from question_activity qa
+),
+question_metrics as (
+    select
+        qa.question_id,
+        qa.owneruserid as asker_id,
+        qa.q_created,
+        qa.q_score,
+        qa.net_votes,
+        qa.viewcount,
+        qa.answercount,
+        qa.title,
+        qa.tags,
+        qa.ever_closed_flag,
+        qa.last_closed_date,
+        qa.last_reopened_date,
+        ad.answer_id as top_answer_id,
+        ad.a_score as top_answer_score,
+        ad.avg_answer_score_per_q,
+        min(ad.a_created) filter (where ad.rn_by_time = 1) as first_answer_time,
+        max(ad.a_created) filter (where ad.rn_by_score = 1) as top_answer_time,
+        count(*) filter (where ad.rn_by_time = 1) as has_first_answer,
+        count(*) filter (where ad.rn_by_score = 1) as has_top_answer
+    from question_activity qa
+    left join answers_detail ad on ad.question_id = qa.question_id
+    group by qa.question_id, qa.owneruserid, qa.q_created, qa.q_score, qa.net_votes, qa.viewcount, qa.answercount, qa.title, qa.tags, qa.ever_closed_flag, qa.last_closed_date, qa.last_reopened_date, ad.answer_id, ad.a_score, ad.avg_answer_score_per_q
+),
+dedup_links as (
+    select distinct
+        pl.postid as src_id,
+        pl.relatedpostid as dst_id,
+        lt.name as link_type,
+        pl.creationdate
+    from postlinks pl
+    join linktypes lt on lt.id = pl.linktypeid
+    where pl.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '1825 days'
+),
+duplicate_graph as (
+    select
+        dl.src_id as question_id,
+        count(*) filter (where dl.link_type = 'Duplicate') as duplicate_edges,
+        count(*) filter (where dl.link_type <> 'Duplicate') as other_edges,
+        max(dl.creationdate) as last_link_date
+    from dedup_links dl
+    group by dl.src_id
+),
+owner_stats as (
+    select
+        u.id as user_id,
+        count(*) filter (where p.posttypeid = 1) as q_count,
+        count(*) filter (where p.posttypeid = 2) as a_count,
+        sum(coalesce(p.score, 0)) as total_post_score,
+        percentile_cont(0.5) within group (order by coalesce(p.score, 0)) as median_post_score,
+        coalesce(sum(case when p.posttypeid = 1 then p.viewcount end), 0) as total_views_questions
+    from users u
+    left join posts p on p.owneruserid = u.id
+    group by u.id
+),
+badge_mix as (
+    select
+        b.userid,
+        sum(case when b.class = 1 then 1 else 0 end) as gold,
+        sum(case when b.class = 2 then 1 else 0 end) as silver,
+        sum(case when b.class = 3 then 1 else 0 end) as bronze,
+        sum(case when b.tagbased = 1 then 1 else 0 end) as tag_badges,
+        min(b.date) as first_badge_date,
+        max(b.date) as last_badge_date
+    from badges b
+    group by b.userid
+),
+comment_snippets as (
+    select
+        c.postid,
+        string_agg(left(coalesce(c.text, ''), 50), ' | ' order by c.creationdate asc) as earliest_comments_concat,
+        sum(case when c.score > 0 then 1 else 0 end) as positive_comments,
+        count(*) as total_comments
+    from comments c
+    where c.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '1095 days'
+    group by c.postid
+),
+recent_hot as (
+    select
+        qa.question_id,
+        case
+            when qa.viewcount >= 10000 or qa.net_votes >= 50 then 1
+            when qa.answercount >= 10 and qa.viewcount >= 5000 then 1
+            else 0
+        end as is_hot
+    from question_activity qa
+),
+normalized_titles as (
+    select
+        qm.question_id,
+        regexp_replace(lower(coalesce(qm.title, '')), '\s+', ' ', 'g') as norm_title,
+        length(coalesce(qm.title, '')) as title_len
+    from question_metrics qm
+),
+title_similarity as (
+    select
+        nt1.question_id as qid1,
+        nt2.question_id as qid2,
+        case
+            when nt1.question_id = nt2.question_id then cast(1.0 as numeric(6,3))
+            else cast(1.0 - (abs(nt1.title_len - nt2.title_len) / greatest(nullif(least(nt1.title_len, nt2.title_len), 0), 1)) as numeric(6,3))
+        end as crude_len_similarity
+    from normalized_titles nt1
+    join normalized_titles nt2 on nt1.question_id <= nt2.question_id
+    where nt1.title_len > 0 and nt2.title_len > 0
+),
+best_similar as (
+    select
+        qid1 as question_id,
+        max(crude_len_similarity) filter (where qid1 <> qid2) as best_similarity
+    from title_similarity
+    group by qid1
+),
+final_ranked as (
+    select
+        qm.question_id,
+        qm.asker_id,
+        u.displayname as asker_name,
+        u.location as asker_location,
+        os.q_count,
+        os.a_count,
+        os.total_post_score,
+        os.median_post_score,
+        os.total_views_questions,
+        coalesce(bm.gold,0) as gold_badges,
+        coalesce(bm.silver,0) as silver_badges,
+        coalesce(bm.bronze,0) as bronze_badges,
+        coalesce(bm.tag_badges,0) as tag_badges,
+        qa.q_created,
+        qm.q_score,
+        qa.net_votes,
+        qa.viewcount,
+        qa.answercount,
+        coalesce(qm.ever_closed_flag, false) as was_closed,
+        qa.last_closed_date,
+        qa.last_reopened_date,
+        coalesce(dg.duplicate_edges, 0) as duplicate_edges,
+        coalesce(dg.other_edges, 0) as other_edges,
+        dg.last_link_date,
+        rd.is_hot,
+        cs.earliest_comments_concat,
+        cs.positive_comments,
+        cs.total_comments,
+        qm.top_answer_id,
+        qm.top_answer_score,
+        qm.avg_answer_score_per_q,
+        case
+            when qa.answercount > 0 and qm.first_answer_time is not null then extract(epoch from (qm.first_answer_time - qa.q_created))/3600.0
+            else null
+        end as hours_to_first_answer,
+        case
+            when qm.top_answer_time is not null then extract(epoch from (qm.top_answer_time - qa.q_created))/3600.0
+            else null
+        end as hours_to_top_answer,
+        nt.norm_title,
+        bs.best_similarity,
+        rank() over (
+            order by
+                coalesce(rd.is_hot, 0) desc,
+                coalesce(qa.net_votes, 0) desc,
+                coalesce(qa.viewcount, 0) desc,
+                coalesce(qm.top_answer_score, -9999) desc nulls last,
+                coalesce(qm.avg_answer_score_per_q, -9999) desc nulls last,
+                coalesce(os.total_post_score, -9999) desc nulls last
+        ) as popularity_rank,
+        dense_rank() over (
+            order by
+                coalesce(dg.duplicate_edges, 0) desc,
+                coalesce(best_similarity, 0) desc
+        ) as dupiness_rank,
+        row_number() over (
+            partition by u.id
+            order by coalesce(qa.net_votes, 0) desc, qa.viewcount desc
+        ) as top_q_for_user
+    from question_metrics qm
+    join question_activity qa on qa.question_id = qm.question_id
+    left join users u on u.id = qm.asker_id
+    left join owner_stats os on os.user_id = qm.asker_id
+    left join badge_mix bm on bm.userid = qm.asker_id
+    left join duplicate_graph dg on dg.question_id = qm.question_id
+    left join recent_hot rd on rd.question_id = qm.question_id
+    left join comment_snippets cs on cs.postid = qm.question_id
+    left join normalized_titles nt on nt.question_id = qm.question_id
+    left join best_similar bs on bs.question_id = qm.question_id
+),
+saver as (
+    select *
+    from final_ranked
+    where
+        coalesce(asker_location, '') ilike any (array['%usa%','%united states%','%canada%','%uk%','%germany%','%india%'])
+        or coalesce(asker_location, '') = ''
+),
+null_logic_check as (
+    select
+        fr.question_id,
+        case when fr.asker_name is null then 1 else 0 end as asker_name_is_null,
+        case when fr.top_answer_id is null then 1 else 0 end as no_top_answer,
+        case when fr.hours_to_first_answer is null then 1 else 0 end as no_first_answer_time
+    from final_ranked fr
+)
+select
+    fr.question_id,
+    coalesce(fr.norm_title, '(no title)') as title_norm,
+    fr.asker_id,
+    coalesce(fr.asker_name, concat('user#', cast(fr.asker_id as text))) as asker_name_or_fallback,
+    nullif(fr.asker_location, '') as asker_location,
+    fr.q_score,
+    fr.net_votes,
+    fr.viewcount,
+    fr.answercount,
+    fr.was_closed,
+    fr.duplicate_edges,
+    fr.other_edges,
+    fr.is_hot,
+    fr.popularity_rank,
+    fr.dupiness_rank,
+    fr.top_q_for_user,
+    fr.top_answer_id,
+    fr.top_answer_score,
+    fr.avg_answer_score_per_q,
+    fr.hours_to_first_answer,
+    fr.hours_to_top_answer,
+    fr.gold_badges,
+    fr.silver_badges,
+    fr.bronze_badges,
+    fr.tag_badges,
+    fr.total_post_score,
+    fr.median_post_score,
+    fr.total_views_questions,
+    left(coalesce(fr.earliest_comments_concat, ''), 400) as earliest_comments_sample,
+    bs.asker_name_is_null,
+    bs.no_top_answer,
+    bs.no_first_answer_time,
+    case when fr.top_q_for_user = 1 then 'YES' else 'NO' end as is_users_top_question,
+    case when fr.viewcount > 0 then round( (cast(fr.net_votes as numeric) / greatest(cast(fr.viewcount as numeric), 1)) * 1000, 3) else null end as votes_per_1000_views,
+    case when fr.answercount > 0 then round(cast(fr.net_votes as numeric) / cast(fr.answercount as numeric), 3) else null end as votes_per_answer,
+    case when fr.answercount > 0 then round(cast(fr.viewcount as numeric) / cast(fr.answercount as numeric), 3) else null end as views_per_answer
+from final_ranked fr
+join saver s on s.question_id = fr.question_id
+left join null_logic_check bs on bs.question_id = fr.question_id
+where
+    coalesce(fr.q_score, 0) >= 0
+    and (fr.last_closed_date is null or fr.last_reopened_date >= fr.last_closed_date)
+    and (
+        fr.best_similarity is null
+        or fr.best_similarity < 0.98
+    )
+order by
+    fr.popularity_rank asc,
+    fr.dupiness_rank asc,
+    fr.question_id asc
+limit 500;

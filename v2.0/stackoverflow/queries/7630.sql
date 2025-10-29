@@ -1,0 +1,268 @@
+WITH PostStats AS (
+    SELECT 
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.ParentId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END AS PostTypeDesc,
+        COALESCE(p.Title, 'No Title') AS CleanTitle,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags <> '' THEN 
+                CARDINALITY(string_to_array(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2), '><'))
+            ELSE 0 
+        END AS TagCount,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) AS ScoreRank,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS UserPostSequence
+    FROM Posts p
+    WHERE p.Score > 0
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT ps.PostId) AS TotalPosts,
+        SUM(CASE WHEN ps.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN ps.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        AVG(ps.Score) AS AvgScore,
+        MAX(ps.Score) AS MaxScore
+    FROM Users u
+    LEFT JOIN PostStats ps ON u.Id = ps.OwnerUserId
+    WHERE u.Reputation > 100
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            WHEN t.Count > 10 THEN 'Niche'
+            ELSE 'Tiny'
+        END AS TagPopularity,
+        CASE 
+            WHEN t.IsRequired = TRUE THEN 'Required'
+            WHEN t.IsModeratorOnly = TRUE THEN 'Moderator Only'
+            ELSE 'Community'
+        END AS TagType
+    FROM Tags t
+    WHERE t.Count > 0
+),
+AdvancedPostAnalysis AS (
+    SELECT 
+        ps.PostId,
+        ps.OwnerUserId,
+        ps.Score,
+        ps.ViewCount,
+        ps.AnswerCount,
+        ps.CommentCount,
+        ps.FavoriteCount,
+        ps.CreationDate,
+        ps.Title,
+        ps.Tags,
+        ps.PostTypeDesc,
+        ps.TagCount,
+        ps.ScoreRank,
+        ps.UserPostSequence,
+        CASE 
+            WHEN ps.Score >= 100 THEN 'High Impact'
+            WHEN ps.Score >= 50 THEN 'Medium Impact'
+            WHEN ps.Score >= 10 THEN 'Low Impact'
+            ELSE 'Minimal Impact'
+        END AS ImpactLevel,
+        CAST(date_part('day', (TIMESTAMP '2024-10-01 12:34:56' - ps.CreationDate)) AS INTEGER) AS DaysSinceCreation,
+        LAG(ps.Score, 1) OVER (ORDER BY ps.CreationDate) AS PreviousScore,
+        LAG(ps.ViewCount, 1) OVER (ORDER BY ps.CreationDate) AS PreviousViewCount,
+        LAG(ps.AnswerCount, 1) OVER (ORDER BY ps.CreationDate) AS PreviousAnswerCount,
+        AVG(ps.Score) OVER (ORDER BY ps.CreationDate ROWS BETWEEN 10 PRECEDING AND CURRENT ROW) AS MovingAverageScore,
+        PERCENT_RANK() OVER (ORDER BY ps.Score) AS ScorePercentile,
+        NTILE(4) OVER (ORDER BY ps.ViewCount) AS ViewQuartile,
+        ROW_NUMBER() OVER (ORDER BY ps.Score DESC, ps.ViewCount DESC) AS OverallRank,
+        RANK() OVER (PARTITION BY ps.OwnerUserId ORDER BY ps.Score DESC) AS UserRank,
+        ROW_NUMBER() OVER (PARTITION BY ps.PostTypeId ORDER BY ps.Score DESC) AS TypeRank
+    FROM PostStats ps
+),
+CombinedAnalysis AS (
+    SELECT 
+        apa.PostId,
+        apa.OwnerUserId,
+        apa.Score,
+        apa.ViewCount,
+        apa.AnswerCount,
+        apa.CommentCount,
+        apa.FavoriteCount,
+        apa.CreationDate,
+        apa.Title,
+        apa.Tags,
+        apa.PostTypeDesc,
+        apa.TagCount,
+        apa.ScoreRank,
+        apa.UserPostSequence,
+        apa.ImpactLevel,
+        apa.DaysSinceCreation,
+        apa.MovingAverageScore,
+        apa.ScorePercentile,
+        apa.ViewQuartile,
+        apa.OverallRank,
+        apa.UserRank,
+        apa.TypeRank,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.TotalPosts,
+        ua.QuestionCount,
+        ua.AnswerCount AS UserAnswerCount,
+        ua.AvgScore,
+        ua.MaxScore,
+        ta.TagName,
+        ta.TagCount AS TagUsageCount,
+        ta.TagPopularity,
+        ta.TagType,
+        CASE 
+            WHEN apa.Score > (SELECT AVG(a2.Score) FROM AdvancedPostAnalysis a2 WHERE a2.PostId = apa.PostId) THEN 'Above Average'
+            WHEN apa.Score < (SELECT AVG(a2.Score) FROM AdvancedPostAnalysis a2 WHERE a2.PostId = apa.PostId) THEN 'Below Average'
+            ELSE 'Average'
+        END AS ScoreComparison,
+        CASE 
+            WHEN apa.ViewCount > (SELECT AVG(a3.ViewCount) FROM AdvancedPostAnalysis a3 WHERE a3.PostId = apa.PostId) THEN 'Above Average Views'
+            ELSE 'Below Average Views'
+        END AS ViewComparison,
+        ('Post ID: ' || apa.PostId || 
+            ' | Score: ' || apa.Score || 
+            ' | Views: ' || apa.ViewCount || 
+            ' | Author: ' || COALESCE(ua.DisplayName, '') ||
+            ' | Type: ' || apa.PostTypeDesc ||
+            ' | Tag Count: ' || apa.TagCount ||
+            ' | Impact: ' || apa.ImpactLevel ||
+            ' | Reputation: ' || COALESCE(CAST(ua.Reputation AS TEXT), '') ||
+            ' | Tags: ' || COALESCE(apa.Tags, 'None')
+        ) AS PostSummary,
+        CASE 
+            WHEN apa.TypeRank = 1 THEN 'Top Ranked Post in Type'
+            WHEN apa.UserRank = 1 THEN 'Top Ranked Post by User'
+            ELSE 'Regular Post'
+        END AS RankingStatus,
+        CASE WHEN apa.DaysSinceCreation > 365 THEN 'Archived' ELSE 'Active' END AS PostStatus,
+        COALESCE(apa.Title, 'Untitled') AS CleanTitle,
+        CASE 
+            WHEN apa.Score > 50 AND apa.ViewCount > 100 THEN 'High Engagement'
+            WHEN apa.Score > 25 AND apa.ViewCount > 50 THEN 'Moderate Engagement'
+            WHEN apa.Score > 10 AND apa.ViewCount > 25 THEN 'Low Engagement'
+            ELSE 'Minimal Engagement'
+        END AS EngagementLevel
+    FROM AdvancedPostAnalysis apa
+    LEFT JOIN UserActivity ua ON apa.OwnerUserId = ua.UserId
+    LEFT JOIN TagAnalysis ta ON EXISTS (
+        SELECT 1
+        FROM UNNEST(string_to_array(SUBSTRING(apa.Tags FROM 2 FOR CHAR_LENGTH(apa.Tags)-2), '><')) AS t(tagname)
+        WHERE t.tagname = ta.TagName
+    )
+    WHERE apa.Score > 0
+),
+FinalSelection AS (
+    SELECT 
+        ca.PostId,
+        ca.OwnerUserId,
+        ca.Score,
+        ca.ViewCount,
+        ca.AnswerCount,
+        ca.CommentCount,
+        ca.FavoriteCount,
+        ca.CreationDate,
+        ca.Title,
+        ca.Tags,
+        ca.PostTypeDesc,
+        ca.TagCount,
+        ca.ScoreRank,
+        ca.UserPostSequence,
+        ca.ImpactLevel,
+        ca.DaysSinceCreation,
+        ca.MovingAverageScore,
+        ca.ScorePercentile,
+        ca.ViewQuartile,
+        ca.OverallRank,
+        ca.UserRank,
+        ca.TypeRank,
+        ca.DisplayName,
+        ca.Reputation,
+        ca.TotalPosts,
+        ca.QuestionCount,
+        ca.UserAnswerCount,
+        ca.AvgScore,
+        ca.MaxScore,
+        ca.TagName,
+        ca.TagUsageCount,
+        ca.TagPopularity,
+        ca.TagType,
+        ca.ScoreComparison,
+        ca.ViewComparison,
+        ca.PostSummary,
+        ca.RankingStatus,
+        ca.PostStatus,
+        ca.CleanTitle,
+        ca.EngagementLevel,
+        CASE 
+            WHEN ca.Reputation > 10000 AND ca.AvgScore > 50 THEN 'Elite Contributor'
+            WHEN ca.Reputation > 5000 AND ca.AvgScore > 25 THEN 'Veteran Contributor'
+            WHEN ca.Reputation > 1000 AND ca.AvgScore > 10 THEN 'Regular Contributor'
+            ELSE 'New Contributor'
+        END AS ContributorTier,
+        CASE 
+            WHEN ca.Score > 50 AND ca.ViewCount > 100 AND ca.CommentCount > 5 THEN 'High Value Post'
+            WHEN ca.Score > 25 AND ca.ViewCount > 50 AND ca.CommentCount > 2 THEN 'Medium Value Post'
+            WHEN ca.Score > 10 AND ca.ViewCount > 25 AND ca.CommentCount > 1 THEN 'Low Value Post'
+            ELSE 'Minimal Value Post'
+        END AS PostValueCategory,
+        CAST(date_part('day', (TIMESTAMP '2024-10-01 12:34:56' - ca.CreationDate)) AS INTEGER) AS AgeInDays,
+        ROUND((ca.ViewCount * 1.0 / NULLIF(ca.Score, 0)), 2) AS ViewsPerScore,
+        ROUND((ca.AnswerCount * 1.0 / NULLIF(ca.CommentCount + 1, 0)), 2) AS AnswersPerComment,
+        CASE 
+            WHEN ca.EngagementLevel = 'High Engagement' AND ca.TagPopularity = 'Popular' THEN 'Trending Topic'
+            WHEN ca.EngagementLevel = 'Moderate Engagement' AND ca.TagPopularity = 'Popular' THEN 'Popular Discussion'
+            WHEN ca.EngagementLevel = 'Low Engagement' AND ca.TagPopularity = 'Popular' THEN 'Popular But Underutilized'
+            ELSE 'Standard Topic'
+        END AS TopicClassification,
+        CASE 
+            WHEN ca.TagCount > 5 AND ca.Score > 100 THEN 'Multi-Tag High Impact'
+            WHEN ca.TagCount > 3 AND ca.Score > 50 THEN 'Multi-Tag Moderate Impact'
+            WHEN ca.TagCount = 1 AND ca.Score > 100 THEN 'Single Tag High Impact'
+            ELSE 'Standard Tagging'
+        END AS TaggingStrategy,
+        ROW_NUMBER() OVER (ORDER BY ca.Score DESC, ca.ViewCount DESC, ca.CommentCount DESC) AS GlobalRanking,
+        RANK() OVER (PARTITION BY ca.PostTypeDesc ORDER BY ca.Score DESC) AS TypeSpecificRanking,
+        DENSE_RANK() OVER (ORDER BY ca.Reputation DESC) AS ReputationRank,
+        NTILE(10) OVER (ORDER BY ca.Score) AS ScoreDecile
+    FROM CombinedAnalysis ca
+    WHERE ca.Score > 0
+    AND (
+        ca.PostStatus = 'Active' OR 
+        (ca.PostStatus = 'Archived' AND ca.Score > 100)
+    )
+    AND (
+        ca.EngagementLevel IN ('High Engagement', 'Moderate Engagement') OR
+        ca.TagPopularity IN ('Popular', 'Moderate')
+    )
+    AND ca.TagCount > 0
+)
+SELECT *
+FROM FinalSelection
+ORDER BY Score DESC, ViewCount DESC, CreationDate DESC
+LIMIT 1000;

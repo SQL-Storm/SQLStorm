@@ -1,0 +1,248 @@
+-- {"query": "1119.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3771} 
+
+WITH UserEngagement AS (
+    -- Calculate aggregated user metrics for overall engagement and activity.
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views AS UserViews,
+        u.UpVotes AS UserUpVotes,
+        u.DownVotes AS UserDownVotes,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate AS UserLastAccessDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostScore,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN COALESCE(p.ViewCount, 0) ELSE 0 END) AS TotalQuestionViews,
+        SUM(COALESCE(p.FavoriteCount, 0)) AS TotalFavoriteCount,
+        MAX(p.CreationDate) AS LastPostCreationDate,
+        AVG(CAST(p.Score AS numeric)) FILTER (WHERE p.PostTypeId = 1) AS AvgQuestionScore,
+        AVG(CAST(p.Score AS numeric)) FILTER (WHERE p.PostTypeId = 2) AS AvgAnswerScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate, u.LastAccessDate
+),
+PostRevisionSummary AS (
+    -- Summarize post revision activity, including distinct editors and counts of specific history types.
+    SELECT
+        ph.PostId,
+        COUNT(ph.Id) AS TotalRevisions,
+        COUNT(DISTINCT ph.UserId) AS DistinctEditors,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (5, 8) THEN 1 ELSE 0 END) AS BodyRevisions, -- Edit Body / Rollback Body
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 7) THEN 1 ELSE 0 END) AS TitleRevisions, -- Edit Title / Rollback Title
+        MAX(ph.CreationDate) AS LastRevisionDate,
+        MIN(ph.CreationDate) AS FirstRevisionDate,
+        -- Flag if post was ever community owned (PostHistoryTypeId = 16)
+        MAX(CASE WHEN ph.PostHistoryTypeId = 16 THEN 1 ELSE 0 END) AS WasCommunityOwnedFlag
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+),
+PostLinkAnalysis AS (
+    -- Analyze linked and duplicate posts using PostLinks table.
+    SELECT
+        pl.PostId,
+        COUNT(CASE WHEN pl.LinkTypeId = 1 THEN 1 ELSE NULL END) AS LinkedPostsCount,
+        COUNT(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE NULL END) AS DuplicatePostsCount,
+        MAX(pl.CreationDate) AS LastLinkDate
+    FROM PostLinks pl
+    GROUP BY pl.PostId
+),
+UserBadgeTimeline AS (
+    -- Determine user's first and last badge dates, and count of specific badge classes.
+    SELECT
+        b.UserId,
+        MIN(b.Date) AS FirstBadgeDate,
+        MAX(b.Date) AS LastBadgeDate,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+CommentSentimentApprox AS (
+    -- A very basic "sentiment" analysis based on comment text length and score (proxy for quality/reaction).
+    SELECT
+        c.PostId,
+        AVG(CAST(c.Score AS NUMERIC)) AS AvgCommentScore,
+        SUM(CASE WHEN LENGTH(c.Text) > 100 AND POSITION('great' IN LOWER(c.Text)) > 0 THEN 1 ELSE 0 END) AS PositiveKeywordComments,
+        COUNT(c.Id) AS TotalComments
+    FROM Comments c
+    GROUP BY c.PostId
+),
+ComplexPosts AS (
+    -- Combines "high-value" questions and answers using UNION ALL, with specific filtering criteria.
+    -- Branch 1: High-score questions with an accepted answer.
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.ClosedDate,
+        p.AcceptedAnswerId,
+        COALESCE(p.Title, SUBSTRING(p.Body, 1, 50) || '...') AS PostTitleExcerpt,
+        REPLACE(REPLACE(REPLACE(p.Tags, '>', ','), '<', ''), ',,', ',') AS CleanTags, -- String manipulation
+        (SELECT COUNT(DISTINCT UserId) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpVoterCount, -- Correlated subquery for upvotes
+        (SELECT COUNT(DISTINCT UserId) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS DownVoterCount, -- Correlated subquery for downvotes
+        LAG(p.CreationDate, 1, '1900-01-01'::timestamp) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostDate, -- Window function: previous post by same user
+        NTILE(100) OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS ScoreViewPercentile -- Window function: percentile by score and views
+    FROM Posts p
+    WHERE p.PostTypeId = 1 -- Only questions
+    AND p.CreationDate >= '2020-01-01'
+    AND p.Score > 50
+    AND p.ViewCount IS NOT NULL
+    AND p.AcceptedAnswerId IS NOT NULL -- Question has an accepted answer
+    UNION ALL
+    -- Branch 2: High-impact answers with significant score.
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount, -- Answers don't have ViewCount directly; use 0 or handle NULL.
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.ClosedDate,
+        p.AcceptedAnswerId,
+        COALESCE(p.Title, SUBSTRING(p.Body, 1, 50) || '...') AS PostTitleExcerpt,
+        REPLACE(REPLACE(REPLACE(p.Tags, '>', ','), '<', ''), ',,', ',') AS CleanTags,
+        (SELECT COUNT(DISTINCT UserId) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpVoterCount,
+        (SELECT COUNT(DISTINCT UserId) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS DownVoterCount,
+        LAG(p.CreationDate, 1, '1900-01-01'::timestamp) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostDate,
+        NTILE(100) OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.FavoriteCount DESC) AS ScoreViewPercentile
+    FROM Posts p
+    WHERE p.PostTypeId = 2 -- Only answers
+    AND p.CreationDate >= '2020-01-01'
+    AND p.Score > 30
+    AND p.ParentId IS NOT NULL -- Must be an answer to a question
+),
+PostAggregatedContext AS (
+    -- Combine post-level CTEs for a richer post context, calculating derived metrics.
+    SELECT
+        cp.PostId,
+        cp.OwnerUserId,
+        cp.PostTypeId,
+        cp.Score,
+        cp.ViewCount,
+        cp.CommentCount,
+        cp.FavoriteCount,
+        cp.CreationDate,
+        cp.LastActivityDate,
+        cp.ClosedDate,
+        cp.PostTitleExcerpt,
+        cp.CleanTags,
+        cp.UpVoterCount,
+        cp.DownVoterCount,
+        cp.PreviousPostDate,
+        cp.ScoreViewPercentile,
+        prs.TotalRevisions,
+        prs.DistinctEditors,
+        prs.BodyRevisions,
+        prs.TitleRevisions,
+        prs.LastRevisionDate,
+        prs.WasCommunityOwnedFlag,
+        pla.LinkedPostsCount,
+        pla.DuplicatePostsCount,
+        pla.LastLinkDate,
+        csa.AvgCommentScore,
+        csa.PositiveKeywordComments,
+        csa.TotalComments,
+        CASE
+            WHEN cp.PostTypeId = 1 AND EXISTS (SELECT 1 FROM Posts acc WHERE acc.Id = cp.AcceptedAnswerId) THEN TRUE -- Question has an existing accepted answer
+            WHEN cp.PostTypeId = 2 AND EXISTS (SELECT 1 FROM Votes v WHERE v.PostId = cp.Id AND v.VoteTypeId = 1) THEN TRUE -- Answer was accepted by originator
+            ELSE FALSE
+        END AS IsAcceptedOrHasAcceptedAnswer,
+        -- Calculate time since creation to last activity and last revision.
+        EXTRACT(EPOCH FROM (cp.LastActivityDate - cp.CreationDate)) / 3600 AS HoursToLastActivity,
+        EXTRACT(EPOCH FROM (COALESCE(prs.LastRevisionDate, cp.LastActivityDate) - cp.CreationDate)) / 86400.0 AS DaysToLastEditOrActivity
+    FROM ComplexPosts cp
+    LEFT JOIN PostRevisionSummary prs ON cp.PostId = prs.PostId
+    LEFT JOIN PostLinkAnalysis pla ON cp.PostId = pla.PostId
+    LEFT JOIN CommentSentimentApprox csa ON cp.PostId = csa.PostId
+)
+-- Final selection, aggregation, and ranking of users based on their contributions and influence.
+SELECT
+    ue.UserId,
+    ue.DisplayName,
+    ue.Reputation,
+    ue.UserViews,
+    ue.UserUpVotes,
+    ue.UserDownVotes,
+    ue.TotalPosts,
+    ue.QuestionCount,
+    ue.AnswerCount,
+    ue.TotalPostScore,
+    ue.TotalQuestionViews,
+    ue.TotalFavoriteCount,
+    ue.LastPostCreationDate,
+    ue.AvgQuestionScore,
+    ue.AvgAnswerScore,
+    ubt.FirstBadgeDate,
+    ubt.LastBadgeDate,
+    ubt.GoldBadges,
+    ubt.SilverBadges,
+    ubt.BronzeBadges,
+    SUM(pac.Score) AS TotalAggregatedPostScore,
+    SUM(pac.ViewCount) AS TotalAggregatedPostViews,
+    COUNT(pac.PostId) AS ContributedPostsCount,
+    AVG(CAST(pac.UpVoterCount AS NUMERIC)) AS AvgPostUpVoterCount,
+    AVG(CAST(pac.DownVoterCount AS NUMERIC)) AS AvgPostDownVoterCount,
+    MAX(pac.DaysToLastEditOrActivity) AS MaxDaysToPostEvolution,
+    SUM(COALESCE(pac.LinkedPostsCount, 0)) AS TotalLinkedFromPosts,
+    SUM(COALESCE(pac.DuplicatePostsCount, 0)) AS TotalDuplicateFromPosts,
+    -- Window function: Rank users by a combination of reputation and aggregated post metrics.
+    RANK() OVER (ORDER BY ue.Reputation DESC, SUM(pac.Score) DESC, ue.TotalQuestionViews DESC) AS OverallImpactRank,
+    -- Complicated calculation for a derived user impact score.
+    (ue.Reputation * 0.7
+     + SUM(pac.Score) * 0.3
+     + ue.TotalQuestionViews * 0.1
+     - ue.UserDownVotes * 0.05
+     + SUM(COALESCE(pac.TotalRevisions, 0)) * 0.15
+     + SUM(CASE WHEN pac.IsAcceptedOrHasAcceptedAnswer THEN 1 ELSE 0 END) * 0.2
+     + SUM(COALESCE(pac.PositiveKeywordComments, 0)) * 0.08
+     - (EXTRACT(EPOCH FROM (NOW() - ue.UserCreationDate)) / 86400.0) * 0.01 -- Penalize older accounts slightly
+    ) AS CalculatedUserImpactScore,
+    -- NULL logic and CASE WHEN for an effective last activity date and user categorization.
+    COALESCE(ubt.LastBadgeDate, ue.LastPostCreationDate, ue.UserLastAccessDate, ue.UserCreationDate) AS EffectiveLastActivityDate,
+    CASE
+        WHEN ue.Reputation > 10000 AND COALESCE(ubt.GoldBadges, 0) > 0 AND SUM(pac.Score) > 5000 AND SUM(COALESCE(pac.PositiveKeywordComments, 0)) > 10 THEN 'Elite Contributor'
+        WHEN ue.Reputation > 2000 AND ue.QuestionCount > 10 AND ue.AnswerCount > 20 THEN 'Prolific Engager'
+        WHEN COALESCE(ubt.GoldBadges, 0) = 0 AND COALESCE(ubt.SilverBadges, 0) = 0 AND COALESCE(ubt.BronzeBadges, 0) = 0 THEN 'No Badges User' -- Explicitly check for zero badges
+        WHEN ubt.GoldBadges IS NULL AND ubt.SilverBadges IS NULL AND ubt.BronzeBadges IS NULL THEN 'No Badge Data User' -- For users not found in UserBadgeTimeline
+        ELSE 'Regular Contributor'
+    END AS UserCategory,
+    -- Another correlated subquery to check for specific tag involvement (highly popular tags).
+    (SELECT COUNT(DISTINCT t.Id)
+     FROM Tags t
+     WHERE POSITION('<' || t.TagName || '>' IN pac.CleanTags) > 0
+     AND t.Count > 10000) AS HighlyPopularTagInvolvementCount
+FROM UserEngagement ue
+LEFT JOIN UserBadgeTimeline ubt ON ue.UserId = ubt.UserId
+LEFT JOIN PostAggregatedContext pac ON ue.UserId = pac.OwnerUserId
+WHERE
+    ue.TotalPosts > 0 -- Ensure user has at least one post.
+    AND (pac.CreationDate BETWEEN '2021-01-01' AND '2023-12-31' OR pac.PostId IS NULL) -- Filter for recent complex posts or include users without such posts.
+    AND ue.Reputation > 500 -- Filter for users with a minimum reputation.
+    AND (
+        LOWER(ue.DisplayName) LIKE '%dev%' OR LOWER(ue.DisplayName) LIKE '%coder%' OR ue.DisplayName IS NULL -- String pattern matching and NULL logic for DisplayName.
+        OR ue.UserId IN (SELECT p.OwnerUserId FROM Posts p WHERE p.Tags LIKE '%<sql>%' AND p.PostTypeId = 1 ORDER BY p.Score DESC LIMIT 10) -- Non-correlated subquery for top SQL questioners.
+    )
+GROUP BY
+    ue.UserId, ue.DisplayName, ue.Reputation, ue.UserViews, ue.UserUpVotes, ue.UserDownVotes,
+    ue.TotalPosts, ue.QuestionCount, ue.AnswerCount, ue.TotalPostScore, ue.TotalQuestionViews,
+    ue.TotalFavoriteCount, ue.LastPostCreationDate, ue.AvgQuestionScore, ue.AvgAnswerScore,
+    ubt.FirstBadgeDate, ubt.LastBadgeDate, ubt.GoldBadges, ubt.SilverBadges, ubt.BronzeBadges,
+    ue.UserCreationDate, ue.UserLastAccessDate
+HAVING
+    COUNT(pac.PostId) > 0 -- Ensure at least one complex post contributes to the aggregation.
+    OR ue.TotalPosts > 5 -- Or users with general activity.
+ORDER BY OverallImpactRank ASC, CalculatedUserImpactScore DESC
+LIMIT 100;

@@ -1,0 +1,131 @@
+WITH
+TopQuestions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.CommentCount,
+    p.AnswerCount
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+RecentActivity AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    COALESCE(v.BountyAmount, 0) AS BountyAmount
+  FROM Posts p
+  LEFT JOIN Votes v
+    ON p.Id = v.PostId AND v.VoteTypeId = 8
+  WHERE p.PostTypeId = 1
+),
+TagPopularity AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS TagCount
+  FROM Tags t
+  GROUP BY t.TagName
+),
+UserStats AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.Location,
+    u.WebsiteUrl,
+    u.ProfileImageUrl,
+    u.AccountId,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.Id) AS rn
+  FROM Users u
+)
+SELECT
+  rq.PostId,
+  rq.Title,
+  rq.OwnerUserId,
+  rq.CreationDate AS QuestionCreationDate,
+  rq.LastActivityDate,
+  rq.Score AS QuestionScore,
+  rq.ViewCount,
+  rq.AnswerCount,
+  ra.BountyAmount,
+  ui.DisplayName AS OwnerDisplayName,
+  ui.Reputation AS OwnerReputation,
+  COALESCE(
+    JSON_ARRAYAGG(
+      -- construct JSON text and cast using standard SQL functions where possible
+      CAST(
+        '{'
+        || '"Tag":' || '"' || REPLACE(t.TagName, '"', '\"') || '"'
+        || ',"Count":' || COALESCE(CAST(tp.TagCount AS VARCHAR), '0')
+        || '}'
+      AS JSON)
+    ) FILTER (WHERE t.TagName IS NOT NULL),
+    CAST('[]' AS JSON)
+  ) AS TagStats,
+  CAST(
+    '{'
+    || '"MostActiveUser":' ||
+       COALESCE(
+         '"' || (SELECT u2.DisplayName FROM Users u2 WHERE u2.Id = rq.OwnerUserId FETCH FIRST 1 ROW ONLY) || '"',
+         'null'
+       )
+    || ',"RecentActivity":' ||
+       COALESCE(
+         '"' || TO_CHAR((SELECT MAX(la.LastActivityDate) FROM RecentActivity la WHERE la.PostId = rq.PostId), 'YYYY-MM-DD"T"HH24:MI:SS') || '"',
+         'null'
+       )
+    || '}'
+  AS JSON) AS Meta
+FROM TopQuestions rq
+LEFT JOIN RecentActivity ra
+  ON rq.PostId = ra.PostId
+LEFT JOIN UserStats ui
+  ON rq.OwnerUserId = ui.UserId
+LEFT JOIN Tags t
+  ON t.TagName IN (
+       SELECT TRIM(value)
+       FROM (
+         -- split tags like '<tag1><tag2>' or comma-separated fallback
+         SELECT UNNEST(
+           CASE
+             WHEN POSITION('>' IN rq.Tags) > 0 THEN
+               -- convert '<a><b>' to 'a,b' then split
+               string_to_array(REPLACE(REPLACE(rq.Tags, '<', ''), '>', ','), ',')
+             ELSE
+               string_to_array(rq.Tags, ',')
+           END
+         ) AS value
+       ) AS sub
+  )
+LEFT JOIN TagPopularity tp
+  ON tp.TagName = t.TagName
+WHERE rq.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days')
+GROUP BY
+  rq.PostId,
+  rq.Title,
+  rq.OwnerUserId,
+  rq.CreationDate,
+  rq.LastActivityDate,
+  rq.Score,
+  rq.ViewCount,
+  rq.AnswerCount,
+  ra.BountyAmount,
+  ui.DisplayName,
+  ui.Reputation
+ORDER BY rq.Score DESC, rq.ViewCount DESC
+FETCH FIRST 100 ROWS ONLY;

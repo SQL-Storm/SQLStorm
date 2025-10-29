@@ -1,0 +1,119 @@
+WITH
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      COUNT(DISTINCT ph.PostId) AS PostsEdited,
+      SUM(CASE WHEN ph.PostHistoryTypeId IN (2, 5) THEN 1 ELSE 0 END) AS BodyEdits,
+      MAX(ph.CreationDate) AS LastActivityDate
+    FROM Users u
+    JOIN PostHistory ph
+      ON u.Id = ph.UserId
+    WHERE
+      ph.PostHistoryTypeId IN (2, 4, 5, 6)
+    GROUP BY
+      u.Id,
+      u.DisplayName
+  ),
+  PostDetails AS (
+    SELECT
+      p.Id AS PostId,
+      pt.Name AS PostType,
+      p.Title,
+      p.CreationDate,
+      p.Score,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      u.DisplayName AS OwnerDisplayName,
+      CASE
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+        ELSE 'Open'
+      END AS PostStatus,
+      CASE
+        WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        ELSE 'User Owned'
+      END AS OwnershipStatus,
+      LAG(p.Score, 1, 0) OVER (ORDER BY p.CreationDate) AS PreviousPostScore
+    FROM Posts p
+    JOIN PostTypes pt
+      ON p.PostTypeId = pt.Id
+    LEFT JOIN Users u
+      ON p.OwnerUserId = u.Id
+    WHERE
+      p.PostTypeId IN (1, 2)
+  ),
+  UserPostCounts AS (
+    SELECT
+      OwnerUserId,
+      COUNT(*) AS TotalPosts,
+      SUM(CASE WHEN PostTypeId = 1 THEN 1 ELSE 0 END) AS Questions,
+      SUM(CASE WHEN PostTypeId = 2 THEN 1 ELSE 0 END) AS Answers
+    FROM Posts
+    WHERE
+      OwnerUserId IS NOT NULL
+      AND OwnerUserId > 0
+    GROUP BY
+      OwnerUserId
+  ),
+  TopContributors AS (
+    SELECT
+      upc.OwnerUserId,
+      u.DisplayName,
+      upc.TotalPosts,
+      ROW_NUMBER() OVER (ORDER BY upc.TotalPosts DESC) AS ContributionRank
+    FROM UserPostCounts upc
+    JOIN Users u
+      ON upc.OwnerUserId = u.Id
+    WHERE
+      upc.TotalPosts > 100
+  ),
+  HighEngagementPosts AS (
+    SELECT
+      pd.PostId,
+      pd.Title,
+      pd.OwnerDisplayName,
+      pd.Score,
+      pd.AnswerCount,
+      pd.CommentCount,
+      pd.FavoriteCount,
+      (pd.AnswerCount + pd.CommentCount + COALESCE(pd.FavoriteCount, 0)) AS EngagementScore,
+      CASE
+        WHEN pd.PostStatus = 'Closed' THEN 'High Risk'
+        WHEN (pd.AnswerCount + pd.CommentCount + COALESCE(pd.FavoriteCount, 0)) > 50 THEN 'High Engagement'
+        ELSE 'Standard'
+      END AS EngagementCategory
+    FROM PostDetails pd
+    WHERE
+      pd.Score > 10
+  )
+SELECT
+  ua.DisplayName AS EditorName,
+  ua.PostsEdited,
+  ua.BodyEdits,
+  tc.DisplayName AS TopContributorName,
+  tc.ContributionRank,
+  hep.Title AS HighEngagementPostTitle,
+  hep.EngagementCategory,
+  hep.Score AS PostScore,
+  COALESCE(hep.FavoriteCount, 0) AS SafeFavoriteCount,
+  DENSE_RANK() OVER (ORDER BY ua.LastActivityDate DESC) AS EditorActivityRank
+FROM UserActivity ua
+LEFT JOIN TopContributors tc
+  ON ua.UserId = tc.OwnerUserId
+LEFT JOIN HighEngagementPosts hep
+  ON ua.UserId = (
+    SELECT
+      p2.OwnerUserId
+    FROM Posts p2
+    WHERE
+      p2.Id = hep.PostId
+  )
+WHERE
+  ua.PostsEdited > 50
+  AND tc.ContributionRank <= 10
+  AND hep.EngagementCategory <> 'Standard'
+  AND ua.DisplayName NOT LIKE '%moderator%'
+ORDER BY
+  EditorActivityRank,
+  tc.ContributionRank;

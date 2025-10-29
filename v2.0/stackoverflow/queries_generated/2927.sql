@@ -1,0 +1,153 @@
+-- {"query": "2927.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1401} 
+with RecursiveTagHierarchy as (
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 as Level,
+        null::int as ParentTagId
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+    union all
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Level + 1,
+        r.Id
+    from Tags t
+    join RecursiveTagHierarchy r on substring(t.TagName from 1 for 1) = 'p' and r.TagName like '%' || substring(t.TagName from 1 for 1) || '%' and t.Id != r.Id
+    where r.Level < 3
+),
+UserActivity as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as Questions,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as Answers,
+        count(distinct c.Id) as CommentsCount,
+        coalesce(sum(vt.Name = 'UpMod'::text)::int, 0) over (partition by u.Id) as TotalUpVotes,
+        coalesce(sum(vt.Name = 'DownMod'::text)::int, 0) over (partition by u.Id) as TotalDownVotes,
+        max(b.Class) as HighestBadgeClass
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.CreationDate > u.CreationDate
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    left join VoteTypes vt on vt.Id = v.VoteTypeId
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostStats as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        (select count(*) from Comments c where c.PostId = p.Id) as CommentCount,
+        (select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 2) as UpVotes,
+        (select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 3) as DownVotes,
+        dense_rank() over (partition by p.PostTypeId order by p.Score desc) as ScoreRank,
+        row_number() over (partition by p.PostTypeId order by p.ViewCount desc) as ViewRank
+    from Posts p
+    where p.CreationDate between '2022-01-01'::timestamp and '2024-01-01'::timestamp
+),
+TopQuestionsWithAnswers as (
+    select 
+        psq.Id as QuestionId,
+        psq.Tags,
+        psq.Score as QuestionScore,
+        psa.Id as AnswerId,
+        psa.Score as AnswerScore,
+        psa.OwnerUserId as AnswerOwnerUserId,
+        u.DisplayName as AnswerOwnerName,
+        row_number() over (partition by psq.Id order by psa.Score desc, psa.CreationDate asc) as AnswerRank
+    from PostStats psq
+    left join Posts psa on psa.ParentId = psq.Id and psa.PostTypeId = 2
+    left join Users u on u.Id = psa.OwnerUserId
+    where psq.PostTypeId = 1 and psq.Score >= 10
+),
+CloseVotesSummary as (
+    select 
+        ph.PostId,
+        sum(case when ph.PostHistoryTypeId = 10 then 1 else 0 end) as CloseVotes,
+        max(case when ph.PostHistoryTypeId = 10 then cast(ph.Comment as integer) else null end) as CloseReasonId
+    from PostHistory ph
+    where ph.PostHistoryTypeId = 10
+    group by ph.PostId
+),
+PostsWithCloseInfo as (
+    select 
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        coalesce(cv.CloseVotes, 0) as CloseVotes,
+        cv.CloseReasonId
+    from Posts p
+    left join CloseVotesSummary cv on cv.PostId = p.Id
+    where p.PostTypeId = 1
+)
+select 
+    u.UserId,
+    u.DisplayName,
+    u.Questions,
+    u.Answers,
+    u.CommentsCount,
+    u.TotalUpVotes,
+    u.TotalDownVotes,
+    case u.HighestBadgeClass 
+        when 1 then 'Gold'
+        when 2 then 'Silver'
+        when 3 then 'Bronze' 
+        else 'None' end as BestBadge,
+    q.QuestionId,
+    q.Tags as QuestionTags,
+    q.QuestionScore,
+    q.AnswerId,
+    q.AnswerScore,
+    q.AnswerOwnerName,
+    p.Title as PostTitle,
+    p.CloseVotes,
+    cr.Name as CloseReason,
+    case when strpos(coalesce(p.Tags, ''), '<sql>') > 0 then 'Contains SQL Tag'
+         else 'No SQL Tag' end as SQLTagPresence,
+    row_number() over (partition by u.UserId order by q.QuestionScore desc) as UserQuestionRank
+from UserActivity u
+left join TopQuestionsWithAnswers q on q.AnswerOwnerUserId = u.UserId and q.AnswerRank = 1
+left join PostsWithCloseInfo p on p.Id = q.QuestionId
+left join CloseReasonTypes cr on cr.Id = p.CloseReasonId
+where u.Questions > 0 and u.TotalUpVotes > u.TotalDownVotes
+union
+select 
+    u.UserId,
+    u.DisplayName,
+    u.Questions,
+    u.Answers,
+    u.CommentsCount,
+    u.TotalUpVotes,
+    u.TotalDownVotes,
+    case u.HighestBadgeClass 
+        when 1 then 'Gold'
+        when 2 then 'Silver'
+        when 3 then 'Bronze' 
+        else 'None' end as BestBadge,
+    null as QuestionId,
+    null as QuestionTags,
+    null as QuestionScore,
+    null as AnswerId,
+    null as AnswerScore,
+    null as AnswerOwnerName,
+    null as PostTitle,
+    null as CloseVotes,
+    null as CloseReason,
+    null as SQLTagPresence,
+    null as UserQuestionRank
+from Users u
+left join UserActivity ua on ua.UserId = u.Id
+where ua.UserId is null
+order by UserId, UserQuestionRank nulls last;

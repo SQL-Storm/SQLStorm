@@ -1,0 +1,151 @@
+-- {"query": "4047.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1995} 
+WITH PostInteraction AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ViewCount AS PostViewCount,
+        CASE
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 5 THEN 'TagWiki'
+            ELSE 'Other'
+        END AS PostType,
+        u.DisplayName AS OwnerDisplayName,
+        u.Reputation AS OwnerReputation,
+        COUNT(DISTINCT c.Id) AS CommentCountOnPost,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY ph.CreationDate DESC) AS LatestRevisionRank
+    FROM Posts AS p
+    LEFT JOIN Users AS u ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments AS c ON p.Id = c.PostId
+    LEFT JOIN Votes AS v ON p.Id = v.PostId
+    LEFT JOIN PostHistory AS ph ON p.Id = ph.PostId
+    WHERE p.PostTypeId IN (1, 2, 5)
+    GROUP BY
+        p.Id,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ViewCount,
+        u.DisplayName,
+        u.Reputation,
+        ph.CreationDate
+),
+UserActivitySummary AS (
+    SELECT
+        pi.OwnerUserId,
+        COUNT(DISTINCT pi.PostId) AS TotalPostsOwned,
+        AVG(pi.PostScore) AS AveragePostScore,
+        SUM(pi.PostViewCount) AS TotalViewsOnPosts,
+        MAX(pi.OwnerReputation) AS MaxOwnerReputation,
+        AVG(pi.OwnerReputation) AS AverageOwnerReputation,
+        COUNT(DISTINCT CASE WHEN pi.PostTypeId = 1 THEN pi.PostId END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN pi.PostTypeId = 2 THEN pi.PostId END) AS AnswerCount,
+        COUNT(DISTINCT CASE WHEN pi.PostTypeId = 5 THEN pi.PostId END) AS TagWikiCount,
+        SUM(pi.UpVoteCount) AS TotalUpVotesReceived,
+        SUM(pi.DownVoteCount) AS TotalDownVotesReceived,
+        CAST(AVG(CAST(pi.PostScore AS REAL)) AS DECIMAL(10, 2)) AS AvgScoreWithPrecision
+    FROM PostInteraction AS pi
+    WHERE pi.OwnerUserId IS NOT NULL
+    GROUP BY pi.OwnerUserId
+),
+RankedPostInteractions AS (
+    SELECT
+        pi.*,
+        RANK() OVER (ORDER BY pi.PostScore DESC, pi.PostCreationDate ASC) AS ScoreRank,
+        LAG(pi.PostScore, 1, 0) OVER (PARTITION BY pi.OwnerUserId ORDER BY pi.PostCreationDate) AS PreviousPostScore
+    FROM PostInteraction AS pi
+    WHERE pi.LatestRevisionRank = 1 -- Only consider the most recent revision for each post
+),
+TagWikiCounts AS (
+    SELECT
+        t.TagName,
+        COUNT(DISTINCT p.Id) AS NumberOfTagWikis
+    FROM Tags AS t
+    JOIN Posts AS p ON t.WikiPostId = p.Id AND p.PostTypeId = 5
+    GROUP BY t.TagName
+),
+UserTagPreference AS (
+    SELECT
+        u.Id AS UserId,
+        t.TagName,
+        COUNT(*) AS TagUsageCount
+    FROM Users AS u
+    JOIN Posts AS p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1 -- Questions
+    JOIN (
+        SELECT
+            Id,
+            TRIM(unnest(string_to_array(substring(Tags, 2, length(Tags) - 2), '><'))) AS TagName
+        FROM Posts
+        WHERE PostTypeId = 1 AND Tags IS NOT NULL
+    ) AS PostTags ON p.Id = PostTags.Id
+    JOIN Tags AS t ON PostTags.TagName = t.TagName
+    WHERE u.DisplayName IS NOT NULL AND u.DisplayName <> ''
+    GROUP BY u.Id, t.TagName
+),
+UserPreferredTag AS (
+    SELECT
+        UserId,
+        TagName,
+        ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY TagUsageCount DESC, TagName ASC) AS TagRank
+    FROM UserTagPreference
+)
+SELECT
+    rpi.PostId,
+    rpi.PostType,
+    rpi.PostCreationDate,
+    rpi.PostScore,
+    rpi.PostViewCount,
+    rpi.CommentCountOnPost,
+    rpi.UpVoteCount,
+    rpi.DownVoteCount,
+    COALESCE(uas.TotalPostsOwned, 0) AS UserTotalPostsOwned,
+    COALESCE(uas.AveragePostScore, 0.0) AS UserAveragePostScore,
+    COALESCE(uas.TotalViewsOnPosts, 0) AS UserTotalViewsOnPosts,
+    COALESCE(uas.AverageOwnerReputation, 0.0) AS UserAverageOwnerReputation,
+    uas.TotalUpVotesReceived AS UserTotalUpVotesReceived,
+    uas.TotalDownVotesReceived AS UserTotalDownVotesReceived,
+    rpi.ScoreRank,
+    rpi.PreviousPostScore,
+    twc.NumberOfTagWikis AS RelevantTagWikiCount,
+    upt.TagName AS MostFrequentTag,
+    CASE
+        WHEN rpi.PostScore > uas.AveragePostScore * 1.5 THEN 'Above Average Score'
+        WHEN rpi.PostScore < uas.AveragePostScore * 0.5 THEN 'Below Average Score'
+        ELSE 'Average Score'
+    END AS ScorePerformanceCategory,
+    CASE
+        WHEN rpi.PostViewCount > (SELECT AVG(PostViewCount) FROM PostInteraction WHERE PostTypeId = rpi.PostTypeId) THEN 'High View Count'
+        ELSE 'Normal View Count'
+    END AS ViewCountCategory,
+    CAST(rpi.PostScore AS VARCHAR) || '-' || CAST(rpi.PostViewCount AS VARCHAR) AS ScoreViewComposite,
+    (rpi.UpVoteCount + rpi.DownVoteCount) AS TotalVotesCast,
+    CASE
+        WHEN rpi.OwnerUserId IS NULL THEN 'Community'
+        ELSE COALESCE(rpi.OwnerDisplayName, 'Unknown User')
+    END AS EffectiveOwnerName,
+    COALESCE(rpi.OwnerReputation, 0) AS EffectiveOwnerReputation,
+    IIF(rpi.PostScore > 100 AND rpi.AnswerCount > 5 AND rpi.CommentCountOnPost > 10, 'High Engagement Post', 'Standard Post') AS EngagementLevel,
+    IIF(rpi.PostCreationDate < cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year', 'Old', 'New') AS AgeCategory,
+    IIF(rpi.PostScore > 0 AND rpi.PostViewCount > 0, CAST(rpi.PostScore AS REAL) / rpi.PostViewCount, 0) AS ScoreToViewRatio,
+    IIF(rpi.PostScore IS NULL OR rpi.PostScore = 0, TRUE, FALSE) AS IsZeroOrNullScore,
+    IIF(rpi.PostCreationDate BETWEEN CAST(cast('2024-10-01 12:34:56' as timestamp) AS DATE) - INTERVAL '7 day' AND CAST(cast('2024-10-01 12:34:56' as timestamp) AS DATE), 'Last Week', 'Older') AS RecentActivityFlag,
+    IIF(rpi.PostViewCount > 10000 AND rpi.PostScore > 50, 'Popular High-Scoring', 'Other') AS PopularityMetric
+FROM RankedPostInteractions AS rpi
+LEFT JOIN UserActivitySummary AS uas ON rpi.OwnerUserId = uas.OwnerUserId
+LEFT JOIN TagWikiCounts AS twc ON rpi.PostId IN (SELECT WikiPostId FROM Tags WHERE TagWikiCounts.TagName = Tags.TagName) -- This join logic might need adjustment based on exact requirements
+LEFT JOIN UserPreferredTag AS upt ON rpi.OwnerUserId = upt.UserId AND upt.TagRank = 1
+WHERE rpi.PostTypeId IN (1, 2) AND rpi.OwnerUserId IS NOT NULL -- Filter for questions and answers owned by users
+ORDER BY rpi.PostScore DESC, rpi.PostCreationDate ASC
+LIMIT 100;

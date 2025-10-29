@@ -1,0 +1,204 @@
+-- {"query": "1416.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2939} 
+
+WITH UserActivitySummary AS (
+    -- CTE 1: Gathers foundational user metrics, including their overall post engagement,
+    -- and identifies users who have highly-rated answers.
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate AS UserLastAccessDate,
+        U.Reputation,
+        U.UpVotes,
+        U.DownVotes,
+        U.Views AS UserProfileViews,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        MAX(P.Score) AS MaxPostScore,
+        AVG(CASE WHEN P.PostTypeId = 2 THEN P.Score ELSE NULL END) AS AvgAnswerScore,
+        COUNT(B.Id) AS BadgeCount,
+        -- Binary flag for users with at least one answer scoring above 50 (considered highly upvoted)
+        MAX(CASE WHEN P.PostTypeId = 2 AND P.Score > 50 THEN 1 ELSE 0 END) AS HasHighScoreAnswer,
+        -- Calculates the approximate account age in days
+        EXTRACT(EPOCH FROM (U.LastAccessDate - U.CreationDate)) / (60 * 60 * 24) AS UserAccountAgeDays,
+        -- Calculates the average view count for their questions
+        AVG(CASE WHEN P.PostTypeId = 1 THEN P.ViewCount ELSE NULL END) AS AvgQuestionViewCount
+    FROM
+        Users AS U
+    LEFT JOIN
+        Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN
+        Badges AS B ON U.Id = B.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.CreationDate, U.LastAccessDate, U.Reputation, U.UpVotes, U.DownVotes, U.Views
+    HAVING
+        COUNT(P.Id) > 0 AND U.Reputation > 200 -- Focus on more established users with some activity
+),
+ClosedDuplicateQuestions AS (
+    -- CTE 2: Identifies questions that were closed specifically as duplicates,
+    -- and counts how many other posts explicitly link to them as duplicates.
+    SELECT
+        P.Id AS QuestionId,
+        P.OwnerUserId,
+        P.CreationDate AS QuestionCreationDate,
+        P.Title AS QuestionTitle,
+        P.Tags AS QuestionTags,
+        P.ClosedDate AS ActualClosedDate, -- Use Posts.ClosedDate for definitive closure date
+        PH.CreationDate AS HistoryCloseEntryDate, -- Date when the close event was recorded in history
+        COALESCE(CR.Name, 'Unknown Close Reason') AS CloseReasonTypeName,
+        -- Counts distinct posts that are linked as duplicates to this question
+        (SELECT COUNT(DISTINCT PL_inner.RelatedPostId)
+         FROM PostLinks AS PL_inner
+         WHERE PL_inner.PostId = P.Id AND PL_inner.LinkTypeId = 3) AS OutgoingDuplicateLinkCount, -- Question links *to* duplicates
+        (SELECT COUNT(DISTINCT PL_inner.PostId)
+         FROM PostLinks AS PL_inner
+         WHERE PL_inner.RelatedPostId = P.Id AND PL_inner.LinkTypeId = 3) AS IncomingDuplicateLinkCount -- Question *is* a duplicate of
+    FROM
+        Posts AS P
+    INNER JOIN
+        PostHistory AS PH ON P.Id = PH.PostId
+    LEFT JOIN
+        CloseReasonTypes AS CR ON PH.Comment = CR.Id::text -- Assuming Comment stores CloseReasonId for type 10
+    WHERE
+        P.PostTypeId = 1 -- Only questions
+        AND PH.PostHistoryTypeId = 10 -- Post Closed event
+        AND (PH.Comment = '1' OR PH.Comment = '101' OR PH.Comment LIKE '1__') -- CloseReasonType 1 (Exact Duplicate) or 101 (Duplicate)
+        AND P.ClosedDate IS NOT NULL -- Ensure it was actually closed
+),
+PostCommentSentiment AS (
+    -- CTE 3: Analyzes comments for posts, calculating average score, standard deviation,
+    -- and identifies top/bottom comments using window functions to gauge "controversy".
+    SELECT
+        C.PostId,
+        AVG(C.Score) AS AvgCommentScore,
+        -- Standard deviation of comment scores as a proxy for comment controversy
+        STDDEV_POP(C.Score) AS StdDevCommentScore,
+        COUNT(C.Id) AS CommentCount,
+        -- Ranks comments within each post by score to identify extreme opinions
+        ROW_NUMBER() OVER(PARTITION BY C.PostId ORDER BY C.Score DESC) AS RankTopComment,
+        ROW_NUMBER() OVER(PARTITION BY C.PostId ORDER BY C.Score ASC) AS RankBottomComment,
+        -- Identifies posts where the text of a comment contains common "flame" keywords
+        MAX(CASE WHEN C.Text ILIKE '%stupid%' OR C.Text ILIKE '%wrong%' OR C.Text ILIKE '%idiot%' THEN 1 ELSE 0 END) AS HasControversialKeywordComment
+    FROM
+        Comments AS C
+    GROUP BY
+        C.PostId
+    HAVING
+        COUNT(C.Id) > 3 AND AVG(C.Score) IS NOT NULL -- Posts with a few comments and calculable average score
+),
+PostEditHistorySummary AS (
+    -- CTE 4: Summarizes post editing activity, particularly focusing on edits by users other than the owner.
+    SELECT
+        PH.PostId,
+        COUNT(PH.Id) AS TotalEdits,
+        SUM(CASE WHEN PH.UserId != P.OwnerUserId THEN 1 ELSE 0 END) AS EditsByOthers,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 5 AND LENGTH(PH.Text) > LENGTH(P.Body) THEN 1 ELSE 0 END) AS BodyGrowthEdits,
+        -- Lag function to find the time difference between consecutive edits
+        EXTRACT(EPOCH FROM (PH.CreationDate - LAG(PH.CreationDate, 1, PH.CreationDate) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate))) / (60*60) AS TimeSinceLastEditHours
+    FROM
+        PostHistory AS PH
+    INNER JOIN
+        Posts AS P ON PH.PostId = P.Id
+    WHERE
+        PH.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+        AND P.OwnerUserId IS NOT NULL
+    GROUP BY
+        PH.PostId, P.OwnerUserId, P.Body -- Include P.Body for length comparison
+)
+-- Main Query: Combines the insights from all CTEs to identify users who are prolific answerers
+-- but also have had questions closed as duplicates, and analyzes the characteristics of these posts.
+SELECT
+    UAS.UserId,
+    UAS.DisplayName,
+    UAS.Reputation,
+    UAS.TotalQuestions,
+    UAS.TotalAnswers,
+    UAS.AvgAnswerScore,
+    UAS.BadgeCount,
+    UAS.UserAccountAgeDays,
+    UAS.AvgQuestionViewCount,
+    CDQ.QuestionId AS ClosedDuplicateQuestionId,
+    CDQ.QuestionTitle AS ClosedDuplicateQuestionTitle,
+    CDQ.QuestionTags AS ClosedQuestionTags,
+    CDQ.ActualClosedDate,
+    CDQ.CloseReasonTypeName,
+    CDQ.OutgoingDuplicateLinkCount,
+    CDQ.IncomingDuplicateLinkCount,
+    -- Correlated subquery: Checks if the user has posted anything around the time their question was closed.
+    (SELECT COUNT(P_related.Id)
+     FROM Posts AS P_related
+     WHERE P_related.OwnerUserId = UAS.UserId
+       AND P_related.CreationDate BETWEEN CDQ.HistoryCloseEntryDate - INTERVAL '14 days' AND CDQ.HistoryCloseEntryDate + INTERVAL '14 days'
+       AND P_related.Id != CDQ.QuestionId
+    ) AS RelatedPostsAroundCloseEventCount,
+    PC.AvgCommentScore AS ClosedQuestionAvgCommentScore,
+    PC.StdDevCommentScore AS ClosedQuestionStdDevCommentScore,
+    PC.CommentCount AS ClosedQuestionCommentCount,
+    PC.HasControversialKeywordComment,
+    -- Subquery in SELECT: Calculates the average score of answers that this user has accepted for their own questions.
+    (SELECT AVG(AcceptedAnswer.Score)
+     FROM Posts AS QuestionWithAcceptedAnswer
+     INNER JOIN Posts AS AcceptedAnswer ON QuestionWithAcceptedAnswer.AcceptedAnswerId = AcceptedAnswer.Id
+     WHERE QuestionWithAcceptedAnswer.OwnerUserId = UAS.UserId
+       AND AcceptedAnswer.PostTypeId = 2
+    ) AS AvgScoreOfAcceptedAnswersByThisUser,
+    -- Categorizes user reputation into tiers using CASE statement
+    CASE
+        WHEN UAS.Reputation >= 100000 THEN 'Mega-Star'
+        WHEN UAS.Reputation >= 20000 THEN 'Legendary'
+        WHEN UAS.Reputation >= 5000 THEN 'Veteran'
+        WHEN UAS.Reputation >= 1000 THEN 'Experienced'
+        WHEN UAS.Reputation >= 500 THEN 'Apprentice'
+        ELSE 'Novice'
+    END AS ReputationTier,
+    -- String manipulation: Extracts the first 200 characters of the user's AboutMe, handling NULLs.
+    SUBSTRING(TRIM(COALESCE(U_main.AboutMe, 'No "About Me" provided.')), 1, 200) AS UserAboutMeSnippet,
+    -- Window function: Ranks users within their reputation tier by their average answer score.
+    RANK() OVER (PARTITION BY
+        CASE
+            WHEN UAS.Reputation >= 100000 THEN 'Mega-Star'
+            WHEN UAS.Reputation >= 20000 THEN 'Legendary'
+            WHEN UAS.Reputation >= 5000 THEN 'Veteran'
+            WHEN UAS.Reputation >= 1000 THEN 'Experienced'
+            WHEN UAS.Reputation >= 500 THEN 'Apprentice'
+            ELSE 'Novice'
+        END
+        ORDER BY UAS.AvgAnswerScore DESC NULLS LAST) AS RankByAvgAnswerScoreInTier,
+    -- Percentage of posts that are answers, using NULLIF for division by zero safety
+    (CAST(UAS.TotalAnswers AS NUMERIC) / NULLIF(UAS.TotalPosts, 0)) * 100 AS AnswerPostRatioPercentage,
+    -- Boolean check for existence of 'Gold' badges
+    (SELECT EXISTS (SELECT 1 FROM Badges B WHERE B.UserId = UAS.UserId AND B.Class = 1)) AS HasGoldBadge,
+    PEHS.TotalEdits AS ClosedQuestionTotalEdits,
+    PEHS.EditsByOthers AS ClosedQuestionEditsByOthers,
+    PEHS.BodyGrowthEdits AS ClosedQuestionBodyGrowthEdits,
+    PEHS.TimeSinceLastEditHours AS TimeToLastEditHours, -- This LAG result is aggregated in CTE, so it's the last recorded value for the post
+    -- Complex predicate combining NULL logic, subquery, and conditional checks for "highly controversial" closed questions
+    CASE
+        WHEN PC.StdDevCommentScore IS NOT NULL
+             AND PC.StdDevCommentScore > (SELECT AVG(StdDevCommentScore) FROM PostCommentSentiment WHERE StdDevCommentScore IS NOT NULL) * 1.8 -- 80% higher than global average stddev
+             AND CDQ.IncomingDuplicateLinkCount > 0 -- It was marked as duplicate of something
+             AND CDQ.OutgoingDuplicateLinkCount > 0 -- It linked to duplicates
+             AND PC.HasControversialKeywordComment = 1
+             AND UAS.Reputation > 1000
+            THEN TRUE
+        ELSE FALSE
+    END AS IsHighlyControversialClosedQuestion
+FROM
+    UserActivitySummary AS UAS
+INNER JOIN
+    ClosedDuplicateQuestions AS CDQ ON UAS.UserId = CDQ.OwnerUserId
+LEFT JOIN
+    PostCommentSentiment AS PC ON CDQ.QuestionId = PC.PostId
+LEFT JOIN
+    PostEditHistorySummary AS PEHS ON CDQ.QuestionId = PEHS.PostId
+INNER JOIN
+    Users AS U_main ON UAS.UserId = U_main.Id -- Join back to Users table to fetch AboutMe
+WHERE
+    UAS.HasHighScoreAnswer = 1 -- Only users who have at least one highly upvoted answer
+    AND UAS.TotalQuestions >= 1 -- Ensure they have at least one question (which is the closed duplicate)
+    AND UAS.AvgAnswerScore IS NOT NULL -- User must have answers to calculate this average
+    AND UAS.UserAccountAgeDays > 30 -- Filter out very new users
+ORDER BY
+    UAS.Reputation DESC, UAS.AvgAnswerScore DESC, CDQ.ActualClosedDate DESC
+LIMIT 1000;

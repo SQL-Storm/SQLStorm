@@ -1,0 +1,298 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        MAX(b.Date) as LastBadgeDate,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Elite'
+            WHEN u.Reputation > 5000 THEN 'Advanced'
+            WHEN u.Reputation > 1000 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as ReputationTier,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        COALESCE(SUM(p.ViewCount), 0) as TotalViews,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+                CAST(CAST(SUM(p.Score) AS FLOAT) / CAST(COUNT(DISTINCT p.Id) AS FLOAT) AS DECIMAL(10,2))
+            ELSE 0 
+        END as AvgScorePerPost,
+        CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - u.CreationDate)) / 86400 AS INTEGER) as AccountAgeDays,
+        CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - u.LastAccessDate)) / 86400 AS INTEGER) as DaysSinceLastAccess
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate, u.LastAccessDate
+),
+RankedUsers AS (
+    SELECT 
+        uas.*,
+        ROW_NUMBER() OVER (ORDER BY TotalScore DESC) as RankByScore,
+        RANK() OVER (ORDER BY Reputation DESC) as RankByReputation,
+        DENSE_RANK() OVER (ORDER BY PostCount DESC) as RankByPostCount,
+        PERCENT_RANK() OVER (ORDER BY TotalScore DESC) as PercentileScore,
+        NTILE(10) OVER (ORDER BY TotalScore DESC) as ScoreDecile,
+        AVG(TotalScore) OVER () as AvgTotalScore,
+        STDDEV(TotalScore) OVER () as StdDevScore,
+        LAG(TotalScore, 1) OVER (ORDER BY TotalScore DESC) as PreviousScore,
+        LEAD(TotalScore, 1) OVER (ORDER BY TotalScore DESC) as NextScore,
+        FIRST_VALUE(TotalScore) OVER (ORDER BY TotalScore DESC) as TopScore,
+        LAST_VALUE(TotalScore) OVER (ORDER BY TotalScore DESC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) as BottomScore
+    FROM UserActivityStats uas
+),
+PostPerformanceStats AS (
+    SELECT 
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.ParentId,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Question with Accepted Answer'
+            WHEN p.PostTypeId = 1 THEN 'Question without Accepted Answer'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as PostTypeDescription,
+        CASE 
+            WHEN p.Score >= 100 THEN 'Highly Upvoted'
+            WHEN p.Score >= 10 THEN 'Mid Upvoted'
+            WHEN p.Score >= 0 THEN 'Neutral'
+            WHEN p.Score < 0 THEN 'Downvoted'
+            ELSE 'Unknown'
+        END as ScoreCategory,
+        CASE 
+            WHEN p.ViewCount >= 1000 THEN 'Popular'
+            WHEN p.ViewCount >= 100 THEN 'Moderately Popular'
+            WHEN p.ViewCount >= 10 THEN 'Less Popular'
+            ELSE 'Rarely Viewed'
+        END as PopularityTier,
+        CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate)) / 86400 AS INTEGER) as AgeInDays,
+        CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - p.LastActivityDate)) / 86400 AS INTEGER) as DaysSinceLastActivity,
+        CAST(EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate)) / 86400 AS INTEGER) as ActivityDurationDays
+    FROM Posts p
+    WHERE p.Id IS NOT NULL
+),
+CombinedPostStats AS (
+    SELECT 
+        ppss.PostId,
+        ppss.PostTypeId,
+        ppss.Title,
+        ppss.Score,
+        ppss.ViewCount,
+        ppss.AnswerCount,
+        ppss.CommentCount,
+        ppss.FavoriteCount,
+        ppss.CreationDate,
+        ppss.OwnerUserId,
+        ppss.PostTypeDescription,
+        ppss.ScoreCategory,
+        ppss.PopularityTier,
+        ppss.AgeInDays,
+        ppss.DaysSinceLastActivity,
+        ppss.ActivityDurationDays,
+        CASE 
+            WHEN ppss.ViewCount > 0 THEN CAST(ppss.Score AS FLOAT) / CAST(ppss.ViewCount AS FLOAT)
+            ELSE 0 
+        END as ScoreToViewRatio,
+        CASE 
+            WHEN ppss.AnswerCount > 0 THEN CAST(ppss.Score AS FLOAT) / CAST(ppss.AnswerCount AS FLOAT)
+            ELSE 0 
+        END as ScoreToAnswerRatio,
+        CASE 
+            WHEN ppss.CommentCount > 0 THEN CAST(ppss.Score AS FLOAT) / CAST(ppss.CommentCount AS FLOAT)
+            ELSE 0 
+        END as ScoreToCommentRatio,
+        CASE 
+            WHEN ppss.FavoriteCount > 0 THEN CAST(ppss.Score AS FLOAT) / CAST(ppss.FavoriteCount AS FLOAT)
+            ELSE 0 
+        END as ScoreToFavoriteRatio,
+        ROW_NUMBER() OVER (PARTITION BY ppss.OwnerUserId ORDER BY ppss.Score DESC) as UserPostRank,
+        COUNT(*) OVER (PARTITION BY ppss.OwnerUserId) as UserTotalPosts,
+        AVG(ppss.Score) OVER (PARTITION BY ppss.OwnerUserId) as UserAvgScore,
+        AVG(ppss.ViewCount) OVER (PARTITION BY ppss.OwnerUserId) as UserAvgViews,
+        MAX(ppss.Score) OVER (PARTITION BY ppss.OwnerUserId) as UserBestScore,
+        MIN(ppss.Score) OVER (PARTITION BY ppss.OwnerUserId) as UserWorstScore,
+        LAG(ppss.Score, 1, 0) OVER (PARTITION BY ppss.OwnerUserId ORDER BY ppss.CreationDate) as PreviousPostScore,
+        LEAD(ppss.Score, 1, 0) OVER (PARTITION BY ppss.OwnerUserId ORDER BY ppss.CreationDate) as NextPostScore
+    FROM PostPerformanceStats ppss
+),
+UserPostAnalysis AS (
+    SELECT 
+        ru.UserId,
+        ru.DisplayName,
+        ru.Reputation,
+        ru.ReputationTier,
+        ru.PostCount,
+        ru.CommentCount,
+        ru.BadgeCount,
+        ru.TotalScore,
+        ru.TotalViews,
+        ru.AvgScorePerPost,
+        ru.AccountAgeDays,
+        ru.DaysSinceLastAccess,
+        ru.RankByScore,
+        ru.RankByReputation,
+        ru.RankByPostCount,
+        ru.PercentileScore,
+        ru.ScoreDecile,
+        ru.AvgTotalScore,
+        ru.StdDevScore,
+        ru.PreviousScore,
+        ru.NextScore,
+        ru.TopScore,
+        ru.BottomScore,
+        cps.PostId,
+        cps.PostTypeId,
+        cps.Title,
+        cps.Score,
+        cps.ViewCount,
+        cps.AnswerCount,
+        cps.CommentCount,
+        cps.FavoriteCount,
+        cps.CreationDate as PostCreationDate,
+        cps.PostTypeDescription,
+        cps.ScoreCategory,
+        cps.PopularityTier,
+        cps.AgeInDays,
+        cps.DaysSinceLastActivity,
+        cps.ActivityDurationDays,
+        cps.ScoreToViewRatio,
+        cps.ScoreToAnswerRatio,
+        cps.ScoreToCommentRatio,
+        cps.ScoreToFavoriteRatio,
+        cps.UserPostRank,
+        cps.UserTotalPosts,
+        cps.UserAvgScore,
+        cps.UserAvgViews,
+        cps.UserBestScore,
+        cps.UserWorstScore,
+        cps.PreviousPostScore,
+        cps.NextPostScore,
+        CASE 
+            WHEN cps.PreviousPostScore > 0 THEN 
+                CAST((cps.Score - cps.PreviousPostScore) AS FLOAT) / CAST(cps.PreviousPostScore AS FLOAT) * 100
+            ELSE 0 
+        END as ScoreChangePercentage,
+        CASE 
+            WHEN cps.NextPostScore > 0 THEN 
+                CAST((cps.NextPostScore - cps.Score) AS FLOAT) / NULLIF(CAST(cps.Score AS FLOAT),0) * 100
+            ELSE 0 
+        END as NextPostScoreChangePercentage
+    FROM RankedUsers ru
+    INNER JOIN CombinedPostStats cps ON ru.UserId = cps.OwnerUserId
+    WHERE ru.UserId IS NOT NULL AND cps.PostId IS NOT NULL
+),
+PerformanceMetrics AS (
+    SELECT 
+        upa.*,
+        (COALESCE(AvgScorePerPost,0) + 1) * (COALESCE(TotalViews,0) + 1) * (COALESCE(PostCount,0) + 1) * (COALESCE(BadgeCount,0) + 1) as CompositePerformanceScore,
+        CASE 
+            WHEN ScoreToViewRatio > 0.5 THEN 'High Signal to Noise'
+            WHEN ScoreToViewRatio > 0.1 THEN 'Moderate Signal to Noise'
+            WHEN ScoreToViewRatio > 0 THEN 'Low Signal to Noise'
+            ELSE 'No Views'
+        END as SignalToNoiseCategory,
+        CASE 
+            WHEN DaysSinceLastActivity <= 1 THEN 'Active Today'
+            WHEN DaysSinceLastActivity <= 7 THEN 'Active Weekly'
+            WHEN DaysSinceLastActivity <= 30 THEN 'Active Monthly'
+            ELSE 'Inactive'
+        END as ActivityStatus
+    FROM UserPostAnalysis upa
+)
+SELECT 
+    pm.UserId,
+    pm.DisplayName,
+    pm.Reputation,
+    pm.ReputationTier,
+    pm.PostCount,
+    pm.CommentCount,
+    pm.BadgeCount,
+    pm.TotalScore,
+    pm.TotalViews,
+    pm.AvgScorePerPost,
+    pm.AccountAgeDays,
+    pm.DaysSinceLastAccess,
+    pm.RankByScore,
+    pm.RankByReputation,
+    pm.RankByPostCount,
+    pm.PercentileScore,
+    pm.ScoreDecile,
+    pm.AvgTotalScore,
+    pm.StdDevScore,
+    pm.PreviousScore,
+    pm.NextScore,
+    pm.TopScore,
+    pm.BottomScore,
+    pm.PostId,
+    pm.PostTypeId,
+    pm.Title,
+    pm.Score,
+    pm.ViewCount,
+    pm.AnswerCount,
+    pm.CommentCount,
+    pm.FavoriteCount,
+    pm.PostCreationDate,
+    pm.PostTypeDescription,
+    pm.ScoreCategory,
+    pm.PopularityTier,
+    pm.AgeInDays,
+    pm.DaysSinceLastActivity,
+    pm.ActivityDurationDays,
+    pm.ScoreToViewRatio,
+    pm.ScoreToAnswerRatio,
+    pm.ScoreToCommentRatio,
+    pm.ScoreToFavoriteRatio,
+    pm.UserPostRank,
+    pm.UserTotalPosts,
+    pm.UserAvgScore,
+    pm.UserAvgViews,
+    pm.UserBestScore,
+    pm.UserWorstScore,
+    pm.PreviousPostScore,
+    pm.NextPostScore,
+    pm.ScoreChangePercentage,
+    pm.NextPostScoreChangePercentage,
+    pm.CompositePerformanceScore,
+    pm.SignalToNoiseCategory,
+    pm.ActivityStatus,
+    ROW_NUMBER() OVER (ORDER BY pm.CompositePerformanceScore DESC) as CompositeRank,
+    RANK() OVER (ORDER BY pm.TotalScore DESC) as ScoreRank,
+    DENSE_RANK() OVER (ORDER BY pm.PostCount DESC) as PostRank,
+    PERCENT_RANK() OVER (ORDER BY pm.CompositePerformanceScore DESC) as CompositePercentile,
+    NTILE(5) OVER (ORDER BY pm.CompositePerformanceScore DESC) as PerformanceQuintile
+FROM PerformanceMetrics pm
+WHERE pm.UserId IS NOT NULL 
+    AND pm.PostId IS NOT NULL 
+    AND pm.Score >= 0 
+    AND pm.ViewCount >= 0
+    AND pm.AnswerCount >= 0
+    AND pm.CommentCount >= 0
+    AND pm.FavoriteCount >= 0
+    AND pm.AccountAgeDays >= 0
+    AND pm.DaysSinceLastAccess >= 0
+    AND pm.AgeInDays >= 0
+    AND pm.DaysSinceLastActivity >= 0
+    AND pm.ActivityDurationDays >= 0
+    AND (pm.ScoreToViewRatio BETWEEN 0 AND 100) 
+    AND (pm.ScoreChangePercentage BETWEEN -100 AND 100)
+    AND pm.CompositePerformanceScore >= 0
+    AND pm.CompositePerformanceScore <= 1000000000
+ORDER BY pm.CompositePerformanceScore DESC
+LIMIT 2500;

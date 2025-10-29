@@ -1,0 +1,295 @@
+-- {"query": "7428.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 3085} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Elite'
+            WHEN u.Reputation > 5000 THEN 'Expert'
+            WHEN u.Reputation > 1000 THEN 'Advanced'
+            WHEN u.Reputation > 100 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as ReputationTier,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END), 0) as QuestionCount,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END), 0) as AnswerCount,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END), 0) as TotalQuestionScore,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END), 0) as TotalAnswerScore,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) as ReputationRank,
+        NTILE(100) OVER (ORDER BY u.Reputation) as ReputationPercentile,
+        AVG(COALESCE(p.Score, 0)) as AvgPostScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostPerformanceMetrics AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.OwnerUserId,
+        DATEDIFF(day, p.CreationDate, p.LastActivityDate) as AgeInDays,
+        CASE 
+            WHEN p.ViewCount > 1000 THEN 'High Traffic'
+            WHEN p.ViewCount > 100 THEN 'Medium Traffic'
+            WHEN p.ViewCount > 10 THEN 'Low Traffic'
+            ELSE 'Very Low Traffic'
+        END as TrafficLevel,
+        CASE 
+            WHEN p.Score > 100 THEN 'Highly Rated'
+            WHEN p.Score > 50 THEN 'Well Rated'
+            WHEN p.Score > 10 THEN 'Moderately Rated'
+            ELSE 'Low Rated'
+        END as RatingLevel,
+        CASE 
+            WHEN p.AnswerCount > 10 THEN 'Highly Answered'
+            WHEN p.AnswerCount > 5 THEN 'Moderately Answered'
+            WHEN p.AnswerCount > 0 THEN 'Slightly Answered'
+            ELSE 'Unanswered'
+        END as AnswerLevel,
+        AVG(p.Score) OVER (PARTITION BY p.PostTypeId) as AvgScoreByType,
+        ROW_NUMBER() OVER (ORDER BY p.Score DESC) as ScoreRank,
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) as TypeScoreRank
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) AND p.OwnerUserId IS NOT NULL
+),
+UserPostAnalysis AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.PostCount,
+        uas.QuestionCount,
+        uas.AnswerCount,
+        uas.TotalQuestionScore,
+        uas.TotalAnswerScore,
+        uas.ReputationTier,
+        uas.ReputationRank,
+        uas.AvgPostScore,
+        CASE 
+            WHEN uas.PostCount > 0 THEN uas.TotalQuestionScore * 1.0 / uas.PostCount
+            ELSE 0
+        END as AvgQuestionScore,
+        CASE 
+            WHEN uas.AnswerCount > 0 THEN uas.TotalAnswerScore * 1.0 / uas.AnswerCount
+            ELSE 0
+        END as AvgAnswerScore,
+        CASE 
+            WHEN uas.QuestionCount > 0 THEN uas.AnswerCount * 1.0 / uas.QuestionCount
+            ELSE 0
+        END as AnswerRate,
+        LAG(uas.Reputation, 1) OVER (ORDER BY uas.Reputation DESC) - uas.Reputation as ReputationChangeFromPrevious
+    FROM UserActivityStats uas
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.OwnerUserId,
+        p.Tags,
+        p.PostTypeId,
+        ppm.AgeInDays,
+        ppm.TrafficLevel,
+        ppm.RatingLevel,
+        ppm.AnswerLevel,
+        ppm.TypeScoreRank,
+        CASE 
+            WHEN LENGTH(p.Title) > 50 THEN 'Long Title'
+            WHEN LENGTH(p.Title) > 25 THEN 'Medium Title'
+            ELSE 'Short Title'
+        END as TitleLengthCategory,
+        CASE 
+            WHEN LENGTH(p.Body) > 1000 THEN 'Long Body'
+            WHEN LENGTH(p.Body) > 500 THEN 'Medium Body'
+            ELSE 'Short Body'
+        END as BodyLengthCategory,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND LENGTH(p.Tags) > 0 THEN 
+                CASE WHEN p.Tags LIKE '%<%' THEN 'Has Tags' ELSE 'No Tags' END
+            ELSE 'No Tags'
+        END as TagStatus,
+        COALESCE(p.AnswerCount, 0) * COALESCE(p.Score, 0) as AnswerScoreProduct,
+        DATEDIFF(day, p.CreationDate, cast('2024-10-01' as date)) as DaysSinceCreation,
+        RANK() OVER (ORDER BY p.ViewCount DESC) as ViewRank,
+        ROW_NUMBER() OVER (ORDER BY (COALESCE(p.Score, 0) + COALESCE(p.ViewCount, 0) + COALESCE(p.AnswerCount, 0)) DESC) as CombinedRank,
+        PERCENT_RANK() OVER (ORDER BY p.Score) as ScorePercentile,
+        CUME_DIST() OVER (ORDER BY p.ViewCount) as ViewDistribution,
+        CASE WHEN p.CreationDate > cast('2024-10-01' as date) - INTERVAL 30 DAY THEN 1 ELSE 0 END as RecentPostIndicator
+    FROM Posts p
+    JOIN PostPerformanceMetrics ppm ON p.Id = ppm.PostId
+    WHERE p.PostTypeId IN (1, 2)
+),
+RankedUserPosts AS (
+    SELECT 
+        upa.UserId,
+        upa.DisplayName,
+        upa.Reputation,
+        upa.PostCount,
+        upa.QuestionCount,
+        upa.AnswerCount,
+        upa.ReputationTier,
+        upa.ReputationRank,
+        upa.AvgPostScore,
+        upa.AvgQuestionScore,
+        upa.AvgAnswerScore,
+        upa.AnswerRate,
+        CASE 
+            WHEN upa.Reputation > 10000 THEN 
+                (SELECT COUNT(*) FROM ComplexPostAnalysis cpa WHERE cpa.OwnerUserId = upa.UserId AND cpa.TypeScoreRank <= 5)
+            ELSE 0
+        END as Top5RankedPosts,
+        CASE 
+            WHEN upa.QuestionCount > 0 THEN 
+                (SELECT AVG(cpa.Score) FROM ComplexPostAnalysis cpa WHERE cpa.OwnerUserId = upa.UserId AND cpa.PostTypeId = 1)
+            ELSE 0
+        END as AvgQuestionScoreInGroup,
+        CASE 
+            WHEN upa.AnswerCount > 0 THEN 
+                (SELECT AVG(cpa.Score) FROM ComplexPostAnalysis cpa WHERE cpa.OwnerUserId = upa.UserId AND cpa.PostTypeId = 2)
+            ELSE 0
+        END as AvgAnswerScoreInGroup,
+        ROW_NUMBER() OVER (ORDER BY upa.Reputation DESC, upa.PostCount DESC) as OverallUserRank
+    FROM UserPostAnalysis upa
+),
+FinalAggregatedView AS (
+    SELECT 
+        'User Performance Summary' as Category,
+        COUNT(*) as CountOfUsers,
+        AVG(Reputation) as AvgReputation,
+        MAX(Reputation) as MaxReputation,
+        MIN(Reputation) as MinReputation,
+        SUM(PostCount) as TotalPosts,
+        SUM(QuestionCount) as TotalQuestions,
+        SUM(AnswerCount) as TotalAnswers,
+        AVG(AvgQuestionScore) as AvgQuestionScore,
+        AVG(AvgAnswerScore) as AvgAnswerScore,
+        AVG(AnswerRate) as AvgAnswerRate,
+        COUNT(DISTINCT CASE WHEN ReputationTier = 'Elite' THEN UserId END) as EliteUsers,
+        COUNT(DISTINCT CASE WHEN ReputationTier = 'Expert' THEN UserId END) as ExpertUsers,
+        COUNT(DISTINCT CASE WHEN ReputationTier = 'Advanced' THEN UserId END) as AdvancedUsers
+    FROM RankedUserPosts
+    UNION ALL
+    SELECT 
+        'Post Performance Summary' as Category,
+        COUNT(*) as CountOfPosts,
+        AVG(Score) as AvgScore,
+        MAX(Score) as MaxScore,
+        MIN(Score) as MinScore,
+        AVG(ViewCount) as AvgViews,
+        AVG(AnswerCount) as AvgAnswers,
+        AVG(CommentCount) as AvgComments,
+        AVG(DaysSinceCreation) as AvgAgeInDays,
+        COUNT(DISTINCT CASE WHEN TrafficLevel = 'High Traffic' THEN PostId END) as HighTrafficPosts,
+        COUNT(DISTINCT CASE WHEN RatingLevel = 'Highly Rated' THEN PostId END) as HighlyRatedPosts,
+        COUNT(DISTINCT CASE WHEN AnswerLevel = 'Highly Answered' THEN PostId END) as HighlyAnsweredPosts
+    FROM ComplexPostAnalysis
+    UNION ALL
+    SELECT 
+        'Combined User-Post Analysis' as Category,
+        COUNT(DISTINCT UserId) as CountOfUsers,
+        AVG(Reputation) as AvgReputation,
+        MAX(Reputation) as MaxReputation,
+        MIN(Reputation) as MinReputation,
+        SUM(PostCount) as TotalPosts,
+        SUM(QuestionCount) as TotalQuestions,
+        SUM(AnswerCount) as TotalAnswers,
+        AVG(AvgQuestionScore) as AvgQuestionScore,
+        AVG(AvgAnswerScore) as AvgAnswerScore,
+        AVG(AnswerRate) as AvgAnswerRate,
+        COUNT(DISTINCT CASE WHEN ReputationTier = 'Elite' THEN UserId END) as EliteUsers,
+        COUNT(DISTINCT CASE WHEN ReputationTier = 'Expert' THEN UserId END) as ExpertUsers,
+        COUNT(DISTINCT CASE WHEN ReputationTier = 'Advanced' THEN UserId END) as AdvancedUsers
+    FROM RankedUserPosts
+    WHERE Reputation > 1000 AND PostCount > 10
+),
+StatisticalSummary AS (
+    SELECT 
+        'Overall' as AnalysisType,
+        COUNT(*) as TotalRecords,
+        COUNT(DISTINCT UserId) as DistinctUsers,
+        COUNT(DISTINCT PostId) as DistinctPosts,
+        AVG(Reputation) as AvgUserReputation,
+        AVG(Score) as AvgPostScore,
+        MAX(ViewCount) as MaxPostViews,
+        MIN(CreationDate) as EarliestPostDate,
+        MAX(CreationDate) as LatestPostDate,
+        COUNT(DISTINCT CASE WHEN TagStatus = 'Has Tags' THEN PostId END) as TaggedPosts,
+        COUNT(DISTINCT CASE WHEN TrafficLevel = 'High Traffic' THEN PostId END) as HighTrafficPosts,
+        COUNT(DISTINCT CASE WHEN RatingLevel = 'Highly Rated' THEN PostId END) as HighlyRatedPosts
+    FROM (
+        SELECT 1 as dummy, UserId, PostId, Score, ViewCount, CreationDate, TagStatus, TrafficLevel, RatingLevel
+        FROM RankedUserPosts
+        CROSS JOIN ComplexPostAnalysis
+        WHERE RankedUserPosts.UserId = ComplexPostAnalysis.OwnerUserId
+    ) combined_data
+)
+SELECT 
+    s.AnalysisType,
+    s.TotalRecords,
+    s.DistinctUsers,
+    s.DistinctPosts,
+    s.AvgUserReputation,
+    s.AvgPostScore,
+    s.MaxPostViews,
+    s.EarliestPostDate,
+    s.LatestPostDate,
+    s.TaggedPosts,
+    s.HighTrafficPosts,
+    s.HighlyRatedPosts,
+    -- Complex calculations and string manipulations
+    CASE 
+        WHEN s.TotalRecords > 10000 THEN 'Large Scale Analysis'
+        WHEN s.TotalRecords > 1000 THEN 'Medium Scale Analysis'
+        ELSE 'Small Scale Analysis'
+    END as AnalysisScale,
+    CONCAT('Analysis conducted on ', DATE_FORMAT(s.LatestPostDate, '%Y-%m-%d'), ' with ', s.TotalRecords, ' records') as SummaryText,
+    CASE 
+        WHEN s.AvgPostScore > 50 THEN 'Highly Active Community'
+        WHEN s.AvgPostScore > 20 THEN 'Moderately Active Community'
+        ELSE 'Low Activity Community'
+    END as CommunityEngagementLevel,
+    NULLIF(s.TaggedPosts, 0) * 100.0 / NULLIF(s.DistinctPosts, 0) as TaggingPercentage,
+    CASE 
+        WHEN s.AvgUserReputation > 1000 THEN 'Experienced User Base'
+        WHEN s.AvgUserReputation > 100 THEN 'Intermediate User Base'
+        ELSE 'Beginner User Base'
+    END as UserExperienceLevel,
+    ABS(s.MaxPostViews - s.AvgPostScore) as ViewScoreVariance,
+    ROUND(COUNT(*) OVER (ORDER BY s.AvgUserReputation) * 100.0 / COUNT(*) OVER (), 2) as CumulativeReputationPercentile
+FROM StatisticalSummary s
+WHERE s.TotalRecords > 0
+HAVING 
+    COUNT(*) >= 1
+    AND s.DistinctUsers >= 1
+    AND s.DistinctPosts >= 1
+ORDER BY 
+    CASE s.AnalysisType
+        WHEN 'Overall' THEN 1
+        WHEN 'User Performance Summary' THEN 2
+        WHEN 'Post Performance Summary' THEN 3
+        WHEN 'Combined User-Post Analysis' THEN 4
+    END
+LIMIT 1000;

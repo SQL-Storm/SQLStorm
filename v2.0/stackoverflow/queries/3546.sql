@@ -1,0 +1,91 @@
+WITH
+    user_votes AS (
+        SELECT u.Id AS UserId,
+               SUM(CASE 
+                       WHEN v.VoteTypeId = 2 THEN 1
+                       WHEN v.VoteTypeId = 3 THEN -1
+                       ELSE 0
+                   END) AS NetVoteScore,
+               COUNT(*) FILTER (WHERE v.VoteTypeId = 5) AS FavoriteCount
+        FROM Users u
+        LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+        LEFT JOIN Votes v ON v.PostId = p.Id
+        GROUP BY u.Id
+    ),
+    user_badges AS (
+        SELECT b.UserId,
+               SUM(CASE b.Class
+                       WHEN 1 THEN 1000
+                       WHEN 2 THEN 500
+                       WHEN 3 THEN 250
+                       ELSE 0
+                   END) AS BadgePoints,
+               COUNT(*) FILTER (WHERE b.TagBased = TRUE) AS TagBadgeCount
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+    recent_activity AS (
+        SELECT p.OwnerUserId AS UserId,
+               COUNT(*) FILTER (WHERE p.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days')) AS RecentPosts,
+               MAX(p.CreationDate) AS LastPostDate,
+               MAX(p.Title) FILTER (WHERE p.Title IS NOT NULL) AS LastPostTitle
+        FROM Posts p
+        GROUP BY p.OwnerUserId
+    ),
+    tag_usage AS (
+        SELECT p.OwnerUserId AS UserId,
+               SUM(array_length(string_to_array(trim(both '<>' FROM p.Tags), '><'), 1)) AS TotalTagCount
+        FROM Posts p
+        WHERE p.Tags IS NOT NULL
+        GROUP BY p.OwnerUserId
+    ),
+    combined AS (
+        SELECT u.Id,
+               u.DisplayName,
+               COALESCE(uv.NetVoteScore, 0)      AS NetVoteScore,
+               COALESCE(uv.FavoriteCount, 0)     AS FavoriteCount,
+               COALESCE(ub.BadgePoints, 0)       AS BadgePoints,
+               COALESCE(ub.TagBadgeCount, 0)     AS TagBadgeCount,
+               COALESCE(ra.RecentPosts, 0)       AS RecentPosts,
+               ra.LastPostDate,
+               ra.LastPostTitle,
+               COALESCE(tu.TotalTagCount, 0)     AS TotalTagCount,
+               u.Reputation,
+               ROW_NUMBER() OVER (ORDER BY
+                     (CAST(u.Reputation AS numeric) * 1.0) +
+                     COALESCE(uv.NetVoteScore, 0) * 2 +
+                     COALESCE(ub.BadgePoints, 0) +
+                     COALESCE(ra.RecentPosts, 0) * 5 DESC) AS ActivityRank
+        FROM Users u
+        LEFT JOIN user_votes uv ON uv.UserId = u.Id
+        LEFT JOIN user_badges ub ON ub.UserId = u.Id
+        LEFT JOIN recent_activity ra ON ra.UserId = u.Id
+        LEFT JOIN tag_usage tu ON tu.UserId = u.Id
+        GROUP BY u.Id, u.DisplayName, uv.NetVoteScore, uv.FavoriteCount, ub.BadgePoints, ub.TagBadgeCount, ra.RecentPosts, ra.LastPostDate, ra.LastPostTitle, tu.TotalTagCount, u.Reputation
+    ),
+    inactive AS (
+        SELECT u.Id,
+               u.DisplayName,
+               CAST(NULL AS integer)    AS NetVoteScore,
+               CAST(NULL AS integer)    AS FavoriteCount,
+               CAST(NULL AS integer)    AS BadgePoints,
+               CAST(NULL AS integer)    AS TagBadgeCount,
+               0                         AS RecentPosts,
+               CAST(NULL AS timestamp)   AS LastPostDate,
+               CAST(NULL AS varchar)     AS LastPostTitle,
+               0                         AS TotalTagCount,
+               u.Reputation,
+               CAST(NULL AS integer)     AS ActivityRank
+        FROM Users u
+        WHERE NOT EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id)
+    )
+SELECT *
+FROM (
+    SELECT * FROM combined
+    UNION ALL
+    SELECT * FROM inactive
+) AS final
+WHERE (ActivityRank IS NOT NULL AND ActivityRank <= 10)
+   OR (ActivityRank IS NULL AND Reputation > 20000)
+ORDER BY ActivityRank NULLS LAST, Reputation DESC
+LIMIT 50;

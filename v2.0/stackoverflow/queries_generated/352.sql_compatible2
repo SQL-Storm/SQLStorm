@@ -1,0 +1,283 @@
+with
+q as (
+  select p.Id as QuestionId,
+         p.OwnerUserId,
+         p.CreationDate,
+         p.Score,
+         p.ViewCount,
+         p.Title,
+         p.Tags,
+         p.AcceptedAnswerId,
+         p.ClosedDate,
+         p.AnswerCount
+  from Posts p
+  where p.PostTypeId = 1
+),
+a as (
+  select a.ParentId as QuestionId,
+         a.Id as AnswerId,
+         a.OwnerUserId as AnswerOwnerId,
+         a.CreationDate as AnswerCreationDate,
+         a.Score as AnswerScore
+  from Posts a
+  where a.PostTypeId = 2
+),
+answers_ranked as (
+  select
+    a.QuestionId,
+    a.AnswerId,
+    a.AnswerOwnerId,
+    a.AnswerCreationDate,
+    a.AnswerScore,
+    row_number() over (partition by a.QuestionId order by a.AnswerScore desc, a.AnswerCreationDate asc) as rn_best,
+    row_number() over (partition by a.QuestionId order by a.AnswerCreationDate asc) as rn_first
+  from a
+),
+q_activity as (
+  select
+    q.QuestionId,
+    q.OwnerUserId,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    q.Title,
+    q.Tags,
+    q.AcceptedAnswerId,
+    q.ClosedDate,
+    q.AnswerCount,
+    count(distinct c.Id) as CommentCount,
+    coalesce(sum(case when v.VoteTypeId = 2 then 1 when v.VoteTypeId = 3 then -1 else 0 end), 0) as VoteDelta,
+    min(c.CreationDate) as FirstCommentAt,
+    max(c.CreationDate) as LastCommentAt
+  from q
+  left join Comments c on c.PostId = q.QuestionId
+  left join Votes v on v.PostId = q.QuestionId and v.VoteTypeId in (2,3)
+  group by q.QuestionId, q.OwnerUserId, q.CreationDate, q.Score, q.ViewCount, q.Title, q.Tags, q.AcceptedAnswerId, q.ClosedDate, q.AnswerCount
+),
+best_answer as (
+  select ar.QuestionId, ar.AnswerId as BestAnswerId, ar.AnswerOwnerId as BestAnswerOwnerId, ar.AnswerScore as BestAnswerScore
+  from answers_ranked ar
+  where ar.rn_best = 1
+),
+first_answer as (
+  select ar.QuestionId, ar.AnswerId as FirstAnswerId, ar.AnswerOwnerId as FirstAnswerOwnerId, ar.AnswerCreationDate as FirstAnswerAt
+  from answers_ranked ar
+  where ar.rn_first = 1
+),
+accepted_answer as (
+  select q.QuestionId, p.Id as AcceptedAnswerId, p.OwnerUserId as AcceptedOwnerId, p.Score as AcceptedScore, p.CreationDate as AcceptedAt
+  from q
+  join Posts p on p.Id = q.AcceptedAnswerId
+),
+user_stats as (
+  select
+    u.Id as UserId,
+    u.Reputation,
+    u.CreationDate as UserCreated,
+    u.Views as ProfileViews,
+    u.UpVotes,
+    u.DownVotes,
+    sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+    sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+    sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+    count(b.Id) as TotalBadges
+  from Users u
+  left join Badges b on b.UserId = u.Id
+  group by u.Id, u.Reputation, u.CreationDate, u.Views, u.UpVotes, u.DownVotes
+),
+tag_expanded as (
+  select
+    q.QuestionId,
+    -- replace PostgreSQL-specific functions with more portable equivalents where possible
+    -- assume tags formatted like '<tag1><tag2>' -> strip leading '<' and trailing '>' then split on '><'
+    -- Use substring and replace to emulate substring(...) ... in many dialects
+    regexp_substr( q.Tags, '[^><]+', 1, 1 ) as tagname  -- placeholder to allow later join; expanded via a set-returning function may be dialect-specific
+  from q
+  where q.Tags is not null and q.Tags like '<%>'
+),
+tag_quality as (
+  select te.QuestionId,
+         avg(t.Count) as AvgTagCount,
+         sum(case when t.IsModeratorOnly then 1 else 0 end) as ModOnlyTags,
+         sum(case when t.IsRequired then 1 else 0 end) as RequiredTags
+  from tag_expanded te
+  left join Tags t on lower(t.TagName) = lower(te.tagname)
+  group by te.QuestionId
+),
+dup_info as (
+  select pl.PostId as QuestionId,
+         count(case when pl.LinkTypeId = 3 then 1 end) as DuplicateLinks,
+         min(case when pl.LinkTypeId = 3 then pl.CreationDate end) as FirstDupLinkAt
+  from PostLinks pl
+  group by pl.PostId
+),
+closure_info as (
+  select ph.PostId as QuestionId,
+         min(case when ph.PostHistoryTypeId = 10 then ph.CreationDate end) as FirstClosedAt,
+         max(case when ph.PostHistoryTypeId = 11 then ph.CreationDate end) as LastReopenedAt,
+         max(case when ph.PostHistoryTypeId in (10,11) then ph.CreationDate end) as LastCloseReopenEventAt,
+         sum(case when ph.PostHistoryTypeId = 10 then 1 else 0 end) as CloseEvents,
+         sum(case when ph.PostHistoryTypeId = 11 then 1 else 0 end) as ReopenEvents,
+         sum(case when ph.PostHistoryTypeId = 10 and ph.Comment regexp '^[0-9]+$' then 1 else 0 end) as CloseWithReasonCount
+  from PostHistory ph
+  where ph.PostHistoryTypeId in (10,11)
+  group by ph.PostId
+),
+question_windows as (
+  select
+    qa.QuestionId,
+    qa.OwnerUserId,
+    qa.CreationDate,
+    qa.Score,
+    qa.ViewCount,
+    qa.Title,
+    qa.Tags,
+    qa.AcceptedAnswerId,
+    qa.ClosedDate,
+    qa.AnswerCount,
+    qa.CommentCount,
+    qa.VoteDelta,
+    qa.FirstCommentAt,
+    qa.LastCommentAt,
+    avg(qa.Score) over (order by qa.CreationDate rows between 100 preceding and current row) as MovingAvgScore,
+    count(*) over (order by qa.CreationDate rows between unbounded preceding and current row) as RunningCount,
+    ntile(10) over (order by coalesce(qa.ViewCount,0) desc) as ViewDecile
+  from q_activity qa
+),
+user_engagement as (
+  select
+    q.QuestionId,
+    count(distinct c.UserId) as DistinctCommenters,
+    sum(c.Score) as CommentScoreSum,
+    max(c.Score) as MaxCommentScore,
+    min(c.Score) as MinCommentScore
+  from q
+  left join Comments c on c.PostId = q.QuestionId
+  group by q.QuestionId
+),
+vote_summaries as (
+  select
+    v.PostId as QuestionId,
+    sum(case when v.VoteTypeId = 2 then 1 else 0 end) as Upvotes,
+    sum(case when v.VoteTypeId = 3 then 1 else 0 end) as Downvotes,
+    sum(case when v.VoteTypeId = 5 then 1 else 0 end) as Favorites
+  from Votes v
+  group by v.PostId
+),
+owner_answer_gap as (
+  select
+    q.QuestionId,
+    min(case when a.AnswerOwnerId = q.OwnerUserId then a.AnswerCreationDate end) as FirstSelfAnswerAt,
+    min(a.AnswerCreationDate) as FirstAnyAnswerAt
+  from q
+  left join a on a.QuestionId = q.QuestionId
+  group by q.QuestionId
+),
+question_flags as (
+  select
+    qw.QuestionId,
+    case when qw.AnswerCount is null or qw.AnswerCount = 0 then 1 else 0 end as IsUnanswered,
+    case when qw.AcceptedAnswerId is not null then 1 else 0 end as HasAccepted,
+    case when qw.ClosedDate is not null then 1 else 0 end as IsClosed,
+    case when lower(coalesce(qw.Title,'')) regexp '(?<![a-z])how to(?![a-z])' then 1 else 0 end as IsHowToTitle
+  from question_windows qw
+)
+select
+  qw.QuestionId,
+  coalesce(u.DisplayName, 'unknown') as OwnerDisplayName,
+  us.Reputation,
+  us.TotalBadges,
+  us.GoldBadges,
+  us.SilverBadges,
+  us.BronzeBadges,
+  qw.CreationDate,
+  qw.Score,
+  qw.ViewCount,
+  qs.Upvotes,
+  qs.Downvotes,
+  qs.Favorites,
+  qw.CommentCount,
+  qw.VoteDelta,
+  qw.MovingAvgScore,
+  qw.RunningCount,
+  qw.ViewDecile,
+  tq.AvgTagCount,
+  tq.ModOnlyTags,
+  tq.RequiredTags,
+  di.DuplicateLinks,
+  ci.FirstClosedAt,
+  ci.LastReopenedAt,
+  ci.LastCloseReopenEventAt,
+  ci.CloseEvents,
+  ci.ReopenEvents,
+  ci.CloseWithReasonCount,
+  fa.FirstAnswerId,
+  ba.BestAnswerId,
+  aa.AcceptedAnswerId,
+  aa.AcceptedScore,
+  aa.AcceptedAt,
+  ue.DistinctCommenters,
+  ue.CommentScoreSum,
+  ue.MaxCommentScore,
+  ue.MinCommentScore,
+  oag.FirstSelfAnswerAt,
+  oag.FirstAnyAnswerAt,
+  qf.IsUnanswered,
+  qf.HasAccepted,
+  qf.IsClosed,
+  qf.IsHowToTitle,
+  case
+    when aa.AcceptedAnswerId is not null then 'accepted'
+    when ba.BestAnswerId is not null then 'best-only'
+    when fa.FirstAnswerId is not null then 'has-answers'
+    else 'no-answers'
+  end as AnswerStatus,
+  case
+    when coalesce(qs.Upvotes,0) + coalesce(qs.Downvotes,0) = 0 then null
+    else round(100.0 * cast(coalesce(qs.Upvotes,0) as numeric) / nullif(coalesce(qs.Upvotes,0) + coalesce(qs.Downvotes,0),0), 2)
+  end as UpvoteRatioPct,
+  case
+    when qw.ViewCount is null or qw.ViewCount = 0 then null
+    else round(cast(qw.Score as numeric) / nullif(qw.ViewCount,0), 6)
+  end as ScorePerView,
+  case
+    when aa.AcceptedAt is not null then cast(extract(epoch from (aa.AcceptedAt - qw.CreationDate)) as bigint)
+    else null
+  end as SecondsToAccept,
+  case
+    when oag.FirstAnyAnswerAt is not null then cast(extract(epoch from (oag.FirstAnyAnswerAt - qw.CreationDate)) as bigint)
+    else null
+  end as SecondsToFirstAnswer,
+  coalesce(nullif(trim(regexp_replace(lower(coalesce(qw.Title,'')), '\s+', ' ', 'g')), ''), '(no title)') as NormalizedTitle,
+  coalesce(array_length(string_to_array(coalesce(substring(qw.Tags, 2, greatest(length(qw.Tags)-2,0)), ''), '><'), 1), 0) as TagCount,
+  case
+    when qw.Score >= 100 then 'very-high'
+    when qw.Score >= 10 then 'high'
+    when qw.Score >= 0 then 'neutral'
+    else 'negative'
+  end as ScoreBucket
+from question_windows qw
+left join Users u on u.Id = qw.OwnerUserId
+left join user_stats us on us.UserId = qw.OwnerUserId
+left join tag_quality tq on tq.QuestionId = qw.QuestionId
+left join dup_info di on di.QuestionId = qw.QuestionId
+left join closure_info ci on ci.QuestionId = qw.QuestionId
+left join first_answer fa on fa.QuestionId = qw.QuestionId
+left join best_answer ba on ba.QuestionId = qw.QuestionId
+left join accepted_answer aa on aa.QuestionId = qw.QuestionId
+left join user_engagement ue on ue.QuestionId = qw.QuestionId
+left join vote_summaries qs on qs.QuestionId = qw.QuestionId
+left join owner_answer_gap oag on oag.QuestionId = qw.QuestionId
+left join question_flags qf on qf.QuestionId = qw.QuestionId
+where
+  coalesce(qw.ViewCount,0) > 0
+  and (qs.Upvotes is not null or qs.Downvotes is not null or qs.Favorites is not null)
+  and (ci.CloseEvents is null or ci.CloseEvents <= coalesce(ci.ReopenEvents,0) + 5)
+  and (tq.AvgTagCount is null or tq.AvgTagCount > 0)
+  and (qw.CreationDate >= (select max(CreationDate) - interval '5' year from Posts where PostTypeId = 1))
+order by
+  ScorePerView desc,
+  UpvoteRatioPct desc,
+  SecondsToAccept asc,
+  qw.ViewCount desc
+limit 500;

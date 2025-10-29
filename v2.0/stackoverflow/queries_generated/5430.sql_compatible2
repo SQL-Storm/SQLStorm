@@ -1,0 +1,80 @@
+SELECT
+  u.DisplayName AS UserName,
+  u.Reputation,
+  p.Id AS PostId,
+  p.Title,
+  p.PostTypeId,
+  p.CreationDate,
+  p.Score,
+  p.ViewCount,
+  p.CommentCount,
+  p.AnswerCount,
+  p.Tags,
+  COALESCE(p.LastActivityDate, p.CreationDate) AS LastActivity,
+  pv.TotalUpVotes,
+  pv.TotalDownVotes,
+  CASE
+    WHEN vh.Id IS NOT NULL THEN vh.Name
+    ELSE 'Unknown'
+  END AS HistoryEventType,
+  COALESCE(b.TotalGoldBadges, 0) AS GoldBadgesCount,
+  COALESCE(b.TotalSilverBadges, 0) AS SilverBadgesCount,
+  COALESCE(b.TotalBronzeBadges, 0) AS BronzeBadgesCount
+FROM
+  Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN (
+    SELECT
+      v.PostId,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotes,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotes
+    FROM Votes v
+    GROUP BY v.PostId
+  ) pv ON p.Id = pv.PostId
+  LEFT JOIN (
+    SELECT ph.PostId, ph.Id, ph.Name
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (1, 2, 16, 50, 66)
+  ) vh ON vh.PostId = p.Id
+  LEFT JOIN (
+    SELECT
+      p2.Id AS PostId,
+      SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS TotalGoldBadges,
+      SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS TotalSilverBadges,
+      SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS TotalBronzeBadges
+    FROM Posts p2
+      LEFT JOIN Badges b ON b.UserId = p2.OwnerUserId
+    GROUP BY p2.Id
+  ) b ON p.Id = b.PostId
+WHERE
+  p.PostTypeId IN (1, 2)
+  AND p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2' YEAR)
+  AND (
+    p.Tags LIKE '%<sql>%'
+    OR p.Tags LIKE '%<performance>%'
+    OR p.Tags LIKE '%<benchmark>%'
+  )
+GROUP BY
+  u.DisplayName,
+  u.Reputation,
+  p.Id,
+  p.Title,
+  p.PostTypeId,
+  p.CreationDate,
+  p.Score,
+  p.ViewCount,
+  p.CommentCount,
+  p.AnswerCount,
+  p.Tags,
+  COALESCE(p.LastActivityDate, p.CreationDate),
+  pv.TotalUpVotes,
+  pv.TotalDownVotes,
+  vh.Id,
+  vh.Name,
+  b.TotalGoldBadges,
+  b.TotalSilverBadges,
+  b.TotalBronzeBadges
+ORDER BY
+  LastActivity DESC,
+  p.Score DESC
+OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY;

@@ -1,0 +1,196 @@
+WITH UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        COALESCE(u.DisplayName, 'Anonymous User') AS DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.UpVotes AS UserUpVotesGiven,
+        u.DownVotes AS UserDownVotesGiven,
+        u.Views AS UserProfileViews,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS TotalQuestionsPosted,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS TotalAnswersPosted,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        COALESCE(SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END), 0) AS GoldBadges,
+        COALESCE(SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END), 0) AS SilverBadges,
+        COALESCE(SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END), 0) AS BronzeBadges,
+        MAX(v_rcvd.CreationDate) FILTER (WHERE v_rcvd.VoteTypeId = 2) AS LastUpVoteReceived,
+        MIN(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId IN (4, 5, 6)) AS FirstPostEditDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v_rcvd ON p.Id = v_rcvd.PostId AND u.Id = p.OwnerUserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId AND ph.PostHistoryTypeId IN (4, 5, 6)
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate,
+        u.UpVotes, u.DownVotes, u.Views
+),
+PostDetailsExtended AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        COALESCE(p.Title, SUBSTRING(p.Body FROM 1 FOR 100) || '...') AS PostTitleOrBodyPreview,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount AS PostCommentCount,
+        p.FavoriteCount,
+        p.LastActivityDate,
+        p.ClosedDate,
+        (SELECT COUNT(ph2.Id) FROM PostHistory ph2 WHERE ph2.PostId = p.Id AND ph2.PostHistoryTypeId IN (4,5,6)) AS PostEditCount,
+        (SELECT MAX(c2.CreationDate) FROM Comments c2 WHERE c2.PostId = p.Id AND c2.UserId IS NOT NULL) AS LatestCommentFromRegisteredUserDate,
+        CASE
+            WHEN p.Tags IS NOT NULL AND LENGTH(TRIM(p.Tags)) > 2 THEN
+                (string_to_array(SUBSTRING(p.Tags FROM 2 FOR (LENGTH(p.Tags) - 2)), '><'))[1]
+            ELSE NULL
+        END AS PrimaryTag,
+        p.ParentId,
+        p.AcceptedAnswerId,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Wiki'
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+            ELSE 'Open'
+        END AS PostStatusCategory,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId, p.PostTypeId ORDER BY p.Score DESC, p.CreationDate DESC) AS PostRankByUserType,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId, DATE_TRUNC('day', p.CreationDate)) AS DailyAvgPostScoreByUser
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+      AND p.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '3 years')
+),
+TagPerformanceMetrics AS (
+    SELECT
+        pde.PrimaryTag,
+        COUNT(DISTINCT pde.PostId) AS TagPostCount,
+        SUM(pde.PostScore) AS TagTotalScore,
+        AVG(pde.ViewCount) AS TagAvgViewCount,
+        SUM(pde.PostEditCount) AS TagTotalEdits,
+        RANK() OVER (ORDER BY SUM(pde.PostScore) DESC, COUNT(DISTINCT pde.PostId) DESC) AS TagScoreRank,
+        NTILE(5) OVER (ORDER BY SUM(pde.PostScore) DESC) AS TagScoreQuintile
+    FROM PostDetailsExtended pde
+    WHERE pde.PrimaryTag IS NOT NULL
+    GROUP BY pde.PrimaryTag
+    HAVING COUNT(DISTINCT pde.PostId) > 50
+)
+
+SELECT
+    uas.DisplayName AS ContributorName,
+    uas.UserId,
+    'Top Questioner' AS ContributorCategory,
+    pde.PostId,
+    pde.PostTitleOrBodyPreview AS AssociatedPostTitle,
+    pde.PostScore,
+    pde.ViewCount,
+    NULLIF(pde.AnswerCount, 0) AS ValidAnswerCountForQuestion,
+    pde.PrimaryTag,
+    tpm.TagAvgViewCount,
+    uas.Reputation,
+    uas.TotalQuestionsPosted,
+    uas.TotalAnswersPosted,
+    uas.GoldBadges,
+    pde.PostStatusCategory,
+    pde.PostEditCount,
+    pde.LatestCommentFromRegisteredUserDate,
+    (uas.UserUpVotesGiven - uas.UserDownVotesGiven) AS NetUserVotesGiven,
+    (uas.Reputation * 0.05 + uas.TotalQuestionsPosted * 0.1 + pde.PostScore * 0.2 + pde.DailyAvgPostScoreByUser * 0.05) AS OverallQuestionerImpactScore,
+    NULL::numeric(5,2) AS AnswerAcceptanceRate,
+    (SELECT COUNT(DISTINCT l.RelatedPostId) FROM PostLinks l WHERE l.PostId = pde.PostId AND l.LinkTypeId = 3) AS DuplicateLinkedPostCount
+FROM UserActivitySummary uas
+INNER JOIN PostDetailsExtended pde ON uas.UserId = pde.OwnerUserId
+INNER JOIN TagPerformanceMetrics tpm ON pde.PrimaryTag = tpm.PrimaryTag
+WHERE
+    pde.PostTypeId = 1
+    AND pde.PostRankByUserType <= 5
+    AND uas.Reputation > 75000
+    AND uas.TotalQuestionsPosted >= 25
+    AND pde.PostScore >= 75
+    AND pde.PostCreationDate BETWEEN (CAST('2024-10-01' AS date) - INTERVAL '2 years') AND CAST('2024-10-01' AS date)
+    AND tpm.TagScoreRank <= 15
+    AND pde.PostStatusCategory IN ('Open', 'Answered')
+    AND EXISTS (
+        SELECT 1
+        FROM Comments c_exist
+        WHERE c_exist.PostId = pde.PostId
+          AND c_exist.UserId = uas.UserId
+          AND c_exist.CreationDate > (CAST('2024-10-01' AS date) - INTERVAL '1 year')
+    )
+    AND (pde.PostTitleOrBodyPreview LIKE '%query%' OR pde.PostTitleOrBodyPreview LIKE '%database%')
+
+UNION ALL
+
+SELECT
+    uas.DisplayName AS ContributorName,
+    uas.UserId,
+    'Top Answerer' AS ContributorCategory,
+    pde.PostId,
+    pde.PostTitleOrBodyPreview AS AssociatedPostTitle,
+    pde.PostScore,
+    pde.ViewCount,
+    NULL AS ValidAnswerCountForQuestion,
+    pde.PrimaryTag,
+    tpm.TagAvgViewCount,
+    uas.Reputation,
+    uas.TotalQuestionsPosted,
+    uas.TotalAnswersPosted,
+    uas.GoldBadges,
+    pde.PostStatusCategory,
+    pde.PostEditCount,
+    pde.LatestCommentFromRegisteredUserDate,
+    (uas.UserUpVotesGiven - uas.UserDownVotesGiven) AS NetUserVotesGiven,
+    (uas.Reputation * 0.07 + uas.TotalAnswersPosted * 0.15 + pde.PostScore * 0.25 + pde.DailyAvgPostScoreByUser * 0.07) AS OverallAnswererImpactScore,
+    COALESCE(
+      (SUM(CASE WHEN q_parent.AcceptedAnswerId = pde.PostId THEN 1 ELSE 0 END) * 100.0) / NULLIF(COUNT(pde.PostId),0)
+    , 0.00) AS AnswerAcceptanceRate,
+    (SELECT COUNT(ph_cl.PostId) FROM PostHistory ph_cl WHERE ph_cl.PostId = pde.ParentId AND ph_cl.PostHistoryTypeId = 10) AS ParentQuestionClosedCount
+FROM UserActivitySummary uas
+INNER JOIN PostDetailsExtended pde ON uas.UserId = pde.OwnerUserId
+INNER JOIN TagPerformanceMetrics tpm ON pde.PrimaryTag = tpm.PrimaryTag
+LEFT JOIN Posts q_parent ON pde.ParentId = q_parent.Id
+WHERE
+    pde.PostTypeId = 2
+    AND pde.PostRankByUserType <= 3
+    AND uas.Reputation > 40000
+    AND uas.TotalAnswersPosted >= 50
+    AND pde.PostScore >= 40
+    AND pde.PostCreationDate BETWEEN (CAST('2024-10-01' AS date) - INTERVAL '18 months') AND CAST('2024-10-01' AS date)
+    AND tpm.TagScoreQuintile = 1
+    AND q_parent.AcceptedAnswerId IS NOT NULL
+    AND NOT EXISTS (
+        SELECT 1
+        FROM Votes v_exist
+        WHERE v_exist.PostId = pde.PostId
+          AND v_exist.VoteTypeId = 12
+    )
+    AND ( (pde.PostTitleOrBodyPreview LIKE '%example code%') OR (pde.PostTitleOrBodyPreview LIKE '%best practice%') )
+    AND pde.PostTitleOrBodyPreview NOT LIKE '%deprecated%'
+GROUP BY
+    uas.DisplayName,
+    uas.UserId,
+    pde.PostId,
+    pde.PostTitleOrBodyPreview,
+    pde.PostScore,
+    pde.ViewCount,
+    pde.PrimaryTag,
+    tpm.TagAvgViewCount,
+    uas.Reputation,
+    uas.TotalQuestionsPosted,
+    uas.TotalAnswersPosted,
+    uas.GoldBadges,
+    pde.PostStatusCategory,
+    pde.PostEditCount,
+    pde.LatestCommentFromRegisteredUserDate,
+    uas.UserUpVotesGiven,
+    uas.UserDownVotesGiven,
+    pde.DailyAvgPostScoreByUser,
+    pde.ParentId,
+    q_parent.AcceptedAnswerId
+
+ORDER BY
+    ContributorCategory DESC,
+    OverallQuestionerImpactScore DESC NULLS LAST,
+    OverallAnswererImpactScore DESC NULLS LAST,
+    Reputation DESC,
+    PostId;

@@ -1,0 +1,152 @@
+-- {"query": "5495.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1200} 
+WITH
+RecentActive AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.ContentLicense,
+    p.Body,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    u.Reputation,
+    u.DisplayName AS OwnerDisplayName,
+    u.Location,
+    u.CreationDate AS UserCreationDate,
+    u.LastAccessDate AS UserLastAccess
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.LastActivityDate > NOW() - interval '30 days'
+),
+TagTagScore AS (
+  SELECT
+    t.TagName,
+    t.Count AS TagCount,
+    t.ExcerptPostId,
+    t.WikiPostId,
+    p.Id AS PostId,
+    p.Title,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.Score AS PostScore,
+    ROW_NUMBER() OVER (PARTITION BY t.TagName ORDER BY p.Score DESC, p.LastActivityDate DESC) AS rn
+  FROM Tags t
+  JOIN Posts p ON p.Id = t.WikiPostId OR p.Id = t.ExcerptPostId
+  WHERE t.Count > 0
+),
+CorrelatedHistory AS (
+  SELECT
+    ph.Id AS HistoryId,
+    ph.PostId,
+    ph.PostHistoryTypeId,
+    ph.CreationDate AS HistoryDate,
+    ph.UserId,
+    ph.Comment,
+    ph.Text,
+    ph.ContentLicense,
+    ph.RevisionGUID,
+    ph.UserDisplayName
+  FROM PostHistory ph
+  WHERE ph.PostHistoryTypeId IN (10, 16, 50) -- closed, community owned, and community bump events
+),
+Composite AS (
+  SELECT
+    r.PostId,
+    r.PostTypeId,
+    r.OwnerUserId,
+    r.Title,
+    r.Tags,
+    r.CreationDate,
+    r.LastActivityDate,
+    r.Score,
+    r.ViewCount,
+    r.CommentCount,
+    r.AnswerCount,
+    r.FavoriteCount,
+    r.ContentLicense,
+    r.Body,
+    r.ParentId,
+    r.AcceptedAnswerId,
+    r.Reputation,
+    r.OwnerDisplayName,
+    r.UserCreationDate,
+    r.UserLastAccess,
+    t.TagName,
+    t.TagCount,
+    t.ExcerptPostId,
+    t.WikiPostId,
+    t.PostId AS LinkedPostId,
+    t.PostId AS LinkedPostId2,
+    c.HistoryId,
+    c.PostHistoryTypeId,
+    c.HistoryDate,
+    c.UserId,
+    c.Comment AS HistoryComment,
+    c.Text AS HistoryText,
+    c.RevisionGUID,
+    c.UserDisplayName
+  FROM RecentActive r
+  LEFT JOIN TagTagScore t ON t.PostId = r.Id
+  LEFT JOIN CorrelatedHistory c ON c.PostId = r.Id
+)
+SELECT
+  -- Output a rich set of metrics for benchmarking
+  p.Id AS PostId,
+  p.PostTypeId,
+  p.OwnerUserId,
+  COALESCE(o.DisplayName, p.OwnerDisplayName, 'Unknown') AS OwnerName,
+  p.Title,
+  p.Tags,
+  p.CreationDate,
+  p.LastActivityDate,
+  p.Score,
+  p.ViewCount,
+  p.CommentCount,
+  p.AnswerCount,
+  p.FavoriteCount,
+  p.ContentLicense,
+  p.Body,
+  p.ParentId,
+  p.AcceptedAnswerId,
+  u.Reputation AS OwnerReputation,
+  u.Location AS OwnerLocation,
+  COALESCE(b.Name, '') AS BadgeName,
+  b.Date AS BadgeDate,
+  b.Class AS BadgeClass,
+  b.TagBased AS BadgeTagBased,
+  v.VoteTypeId,
+  v.CreationDate AS VoteDate,
+  v.BountyAmount,
+  -- Complex calculated expressions
+  (p.ViewCount * 1.0) / NULLIF(p.Score, 0) AS ViewsPerScore,
+  CASE
+    WHEN p.LastActivityDate IS NULL THEN 0
+    ELSE EXTRACT(epoch FROM (CURRENT_TIMESTAMP - p.LastActivityDate)) / 3600.0
+  END AS HoursSinceLastActivity,
+  ARRAY_AGG(DISTINCT tl.Name) FILTER (WHERE tl.Name IS NOT NULL) AS LinkedLinkTypes,
+  (SELECT COUNT(*) FROM Posts pr WHERE pr.ParentId = p.Id) AS ChildAnswerCount
+FROM Posts p
+LEFT JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN Badges b ON b.UserId = u.Id
+LEFT JOIN PostLinks l ON l.PostId = p.Id
+LEFT JOIN Votes v ON v.PostId = p.Id
+LEFT JOIN Tags t ON t.Id = p.Tags::int -- simplistic join for benchmarking
+LEFT JOIN LinkTypes tl ON l.LinkTypeId = tl.Id
+LEFT JOIN Users o ON p.OwnerUserId = o.Id
+GROUP BY
+  p.Id, p.PostTypeId, p.OwnerUserId, o.DisplayName, p.Title, p.Tags, p.CreationDate,
+  p.LastActivityDate, p.Score, p.ViewCount, p.CommentCount, p.AnswerCount,
+  p.FavoriteCount, p.ContentLicense, p.Body, p.ParentId, p.AcceptedAnswerId,
+  u.Reputation, u.Location, b.Name, b.Date, b.Class, b.TagBased, v.VoteTypeId,
+  v.CreationDate, v.BountyAmount, p.Id, u.Id
+ORDER BY p.LastActivityDate DESC
+LIMIT 100;

@@ -1,0 +1,182 @@
+-- {"query": "4505.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2237} 
+
+WITH PostEngagement AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate AS PostCreationDate,
+        pt.Name AS PostTypeName,
+        COUNT(c.Id) AS CommentCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoriteCount,
+        ROW_NUMBER() OVER(PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as UserPostRank,
+        LAG(p.CreationDate, 1, p.CreationDate) OVER(PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PreviousPostDate
+    FROM Posts p
+    LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE p.PostTypeId IN (1, 2) -- Questions and Answers
+    GROUP BY
+        p.Id,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate,
+        pt.Name
+),
+UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(CASE WHEN b.Class = 1 THEN b.Name ELSE NULL END) AS GoldBadge,
+        MAX(CASE WHEN b.Class = 2 THEN b.Name ELSE NULL END) AS SilverBadge,
+        MAX(CASE WHEN b.Class = 3 THEN b.Name ELSE NULL END) AS BronzeBadge,
+        COALESCE(SUM(ph.Id), 0) AS PostHistoryEntries,
+        AVG(CASE WHEN pe.PostTypeName = 'Question' THEN pe.UpVoteCount ELSE NULL END) AS AvgQuestionUpvotes,
+        COUNT(CASE WHEN pe.UserPostRank <= 5 THEN pe.PostId ELSE NULL END) AS Top5PostsCount,
+        DATEDIFF(day, u.CreationDate, GETDATE()) AS AccountAgeDays
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    LEFT JOIN PostEngagement pe ON u.Id = pe.OwnerUserId
+    GROUP BY
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate
+)
+SELECT
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.UserCreationDate,
+    uas.AccountAgeDays,
+    uas.BadgeCount,
+    COALESCE(uas.GoldBadge, 'None') AS HighestBadge,
+    COALESCE(uas.SilverBadge, 'None') AS SecondHighestBadge,
+    COALESCE(uas.BronzeBadge, 'None') AS ThirdHighestBadge,
+    uas.PostHistoryEntries,
+    CASE
+        WHEN uas.AvgQuestionUpvotes IS NULL THEN 0
+        ELSE CAST(uas.AvgQuestionUpvotes AS INT)
+    END AS AverageQuestionUpvotes,
+    uas.Top5PostsCount,
+    MAX(pe.PostCreationDate) AS LastPostDate,
+    SUM(pe.CommentCount) AS TotalCommentsOnPosts,
+    SUM(pe.UpVoteCount) AS TotalUpvotesReceived,
+    SUM(pe.DownVoteCount) AS TotalDownvotesReceived,
+    SUM(pe.FavoriteCount) AS TotalFavoritesReceived,
+    (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = uas.UserId AND PostTypeId = 1) AS QuestionCount,
+    (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = uas.UserId AND PostTypeId = 2) AS AnswerCount,
+    (SELECT COUNT(*) FROM Comments WHERE UserId = uas.UserId) AS UserCommentCount,
+    (SELECT COUNT(*) FROM Votes WHERE UserId = uas.UserId AND VoteTypeId = 2) AS UserUpvoteCount,
+    (SELECT COUNT(*) FROM Votes WHERE UserId = uas.UserId AND VoteTypeId = 3) AS UserDownvoteCount,
+    CAST(
+        SUM(
+            CASE
+                WHEN pe.PostTypeName = 'Question' THEN
+                    DATEDIFF(minute, pe.PreviousPostDate, pe.PostCreationDate)
+                ELSE NULL
+            END
+        ) AS DECIMAL(10, 2)
+    ) / NULLIF(COUNT(CASE WHEN pe.PostTypeName = 'Question' THEN pe.PostId ELSE NULL END), 0) AS AvgTimeBetweenQuestionsMinutes,
+    SUM(
+        CASE
+            WHEN pe.PostTypeName = 'Answer' AND pe.UpVoteCount > 5 THEN 1
+            ELSE 0
+        END
+    ) AS HighScoringAnswerCount,
+    CASE
+        WHEN uas.DisplayName LIKE '%[^a-zA-Z0-9 ]%' THEN 'Contains Special Chars'
+        ELSE 'Standard Chars Only'
+    END AS DisplayNameCharType,
+    COALESCE(MAX(pe.PostTypeName), 'No Posts') AS MostRecentPostType,
+    CASE WHEN uas.AccountAgeDays > 365 THEN 'Experienced' ELSE 'Newer' END AS UserExperienceLevel,
+    CASE WHEN uas.Reputation > 10000 THEN 'High Reputation' WHEN uas.Reputation > 1000 THEN 'Medium Reputation' ELSE 'Low Reputation' END AS ReputationTier
+FROM UserActivitySummary uas
+LEFT JOIN PostEngagement pe ON uas.UserId = pe.OwnerUserId
+WHERE uas.Reputation BETWEEN 100 AND 10000
+GROUP BY
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.UserCreationDate,
+    uas.AccountAgeDays,
+    uas.BadgeCount,
+    uas.GoldBadge,
+    uas.SilverBadge,
+    uas.BronzeBadge,
+    uas.PostHistoryEntries,
+    uas.AvgQuestionUpvotes,
+    uas.Top5PostsCount
+HAVING COUNT(pe.PostId) > 5
+UNION ALL
+SELECT
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.UserCreationDate,
+    uas.AccountAgeDays,
+    uas.BadgeCount,
+    COALESCE(uas.GoldBadge, 'None') AS HighestBadge,
+    COALESCE(uas.SilverBadge, 'None') AS SecondHighestBadge,
+    COALESCE(uas.BronzeBadge, 'None') AS ThirdHighestBadge,
+    uas.PostHistoryEntries,
+    CASE
+        WHEN uas.AvgQuestionUpvotes IS NULL THEN 0
+        ELSE CAST(uas.AvgQuestionUpvotes AS INT)
+    END AS AverageQuestionUpvotes,
+    uas.Top5PostsCount,
+    MAX(pe.PostCreationDate) AS LastPostDate,
+    SUM(pe.CommentCount) AS TotalCommentsOnPosts,
+    SUM(pe.UpVoteCount) AS TotalUpvotesReceived,
+    SUM(pe.DownVoteCount) AS TotalDownvotesReceived,
+    SUM(pe.FavoriteCount) AS TotalFavoritesReceived,
+    (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = uas.UserId AND PostTypeId = 1) AS QuestionCount,
+    (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = uas.UserId AND PostTypeId = 2) AS AnswerCount,
+    (SELECT COUNT(*) FROM Comments WHERE UserId = uas.UserId) AS UserCommentCount,
+    (SELECT COUNT(*) FROM Votes WHERE UserId = uas.UserId AND VoteTypeId = 2) AS UserUpvoteCount,
+    (SELECT COUNT(*) FROM Votes WHERE UserId = uas.UserId AND VoteTypeId = 3) AS UserDownvoteCount,
+    CAST(
+        SUM(
+            CASE
+                WHEN pe.PostTypeName = 'Question' THEN
+                    DATEDIFF(minute, pe.PreviousPostDate, pe.PostCreationDate)
+                ELSE NULL
+            END
+        ) AS DECIMAL(10, 2)
+    ) / NULLIF(COUNT(CASE WHEN pe.PostTypeName = 'Question' THEN pe.PostId ELSE NULL END), 0) AS AvgTimeBetweenQuestionsMinutes,
+    SUM(
+        CASE
+            WHEN pe.PostTypeName = 'Answer' AND pe.UpVoteCount > 5 THEN 1
+            ELSE 0
+        END
+    ) AS HighScoringAnswerCount,
+    CASE
+        WHEN uas.DisplayName LIKE '%[^a-zA-Z0-9 ]%' THEN 'Contains Special Chars'
+        ELSE 'Standard Chars Only'
+    END AS DisplayNameCharType,
+    COALESCE(MAX(pe.PostTypeName), 'No Posts') AS MostRecentPostType,
+    CASE WHEN uas.AccountAgeDays > 365 THEN 'Experienced' ELSE 'Newer' END AS UserExperienceLevel,
+    CASE WHEN uas.Reputation > 10000 THEN 'High Reputation' WHEN uas.Reputation > 1000 THEN 'Medium Reputation' ELSE 'Low Reputation' END AS ReputationTier
+FROM UserActivitySummary uas
+LEFT JOIN PostEngagement pe ON uas.UserId = pe.OwnerUserId
+WHERE uas.Reputation > 10000
+GROUP BY
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.UserCreationDate,
+    uas.AccountAgeDays,
+    uas.BadgeCount,
+    uas.GoldBadge,
+    uas.SilverBadge,
+    uas.BronzeBadge,
+    uas.PostHistoryEntries,
+    uas.AvgQuestionUpvotes,
+    uas.Top5PostsCount
+HAVING COUNT(pe.PostId) > 10;

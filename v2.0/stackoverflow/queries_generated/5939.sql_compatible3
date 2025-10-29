@@ -1,0 +1,193 @@
+WITH ranked_posts AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.OwnerDisplayName,
+    p.AcceptedAnswerId,
+    p.ParentId,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.Body,
+    p.LastEditDate,
+    p.LastEditorUserId,
+    p.LastEditorDisplayName,
+    p.CommunityOwnedDate,
+    p.ContentLicense,
+    COALESCE(p.AnswerCount, 0) AS AnswerCount,
+    COALESCE(vu.ViewSum, 0) AS TotalUserVotes,
+    ROW_NUMBER() OVER (
+      PARTITION BY p.OwnerUserId
+      ORDER BY p.CreationDate DESC
+    ) AS rn_owner
+  FROM Posts p
+  LEFT JOIN (
+    SELECT PostId, SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS ViewSum
+    FROM Votes
+    GROUP BY PostId
+  ) vu ON vu.PostId = p.Id
+  WHERE p.PostTypeId IN (1, 2)
+),
+expanded AS (
+  SELECT
+    rp.PostId,
+    rp.PostTypeId,
+    rp.Title,
+    rp.Tags,
+    rp.CreationDate,
+    rp.LastActivityDate,
+    rp.Score,
+    rp.ViewCount,
+    rp.OwnerUserId,
+    rp.OwnerDisplayName,
+    rp.AcceptedAnswerId,
+    rp.ParentId,
+    rp.CommentCount,
+    rp.FavoriteCount,
+    rp.Body,
+    rp.LastEditDate,
+    rp.LastEditorUserId,
+    rp.LastEditorDisplayName,
+    rp.CommunityOwnedDate,
+    rp.ContentLicense,
+    rp.AnswerCount,
+    rp.TotalUserVotes,
+    rp.rn_owner,
+    ct.Count AS CommentCountTotal,
+    b.Name AS BadgeName,
+    b.Class AS BadgeClass,
+    b.Date AS BadgeDate
+  FROM ranked_posts rp
+  LEFT JOIN Comments ct ON ct.PostId = rp.PostId
+  LEFT JOIN Badges b ON b.UserId = rp.OwnerUserId
+  WHERE rp.rn_owner = 1
+),
+correlated AS (
+  SELECT
+    e.PostId,
+    e.PostTypeId,
+    e.Title,
+    e.Tags,
+    e.CreationDate,
+    e.LastActivityDate,
+    e.Score,
+    e.ViewCount,
+    e.OwnerUserId,
+    u.DisplayName AS OwnerDisplayNameAlias,
+    e.AcceptedAnswerId,
+    e.ParentId,
+    e.CommentCount,
+    e.FavoriteCount,
+    e.Body,
+    e.LastEditDate,
+    e.LastEditorUserId,
+    e.LastEditorDisplayName,
+    e.CommunityOwnedDate,
+    e.ContentLicense,
+    e.AnswerCount,
+    e.TotalUserVotes,
+    e.CommentCountTotal,
+    e.BadgeName,
+    e.BadgeClass,
+    e.BadgeDate,
+    e.rn_owner,
+    ROW_NUMBER() OVER (
+      PARTITION BY e.OwnerUserId
+      ORDER BY e.ViewCount DESC, e.Score DESC
+    ) AS rn_owner_top
+  FROM expanded e
+  LEFT JOIN Users u ON u.Id = e.OwnerUserId
+  LEFT JOIN PostLinks pl ON pl.PostId = e.PostId
+  LEFT JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+  LEFT JOIN Posts pnext ON pnext.Id = pl.RelatedPostId
+  LEFT JOIN Votes v ON v.PostId = e.PostId
+  WHERE (e.ViewCount > 0 OR e.Score IS NOT NULL)
+)
+SELECT
+  c.PostId,
+  c.PostTypeId,
+  c.Title,
+  c.Tags,
+  c.CreationDate,
+  c.LastActivityDate,
+  c.Score,
+  c.ViewCount,
+  c.OwnerUserId,
+  c.OwnerDisplayNameAlias AS OwnerDisplayName,
+  c.AcceptedAnswerId,
+  c.ParentId,
+  c.CommentCount,
+  c.FavoriteCount,
+  c.Body,
+  c.LastEditDate,
+  c.LastEditorUserId,
+  c.LastEditorDisplayName,
+  c.CommunityOwnedDate,
+  c.ContentLicense,
+  c.AnswerCount,
+  c.TotalUserVotes,
+  c.CommentCountTotal,
+  c.BadgeName,
+  c.BadgeClass,
+  c.BadgeDate,
+  vp.TotalVotesForPost AS TotalVotes,
+  CASE
+    WHEN c.PostTypeId = 1 THEN 'Question'
+    WHEN c.PostTypeId = 2 THEN 'Answer'
+    ELSE 'Other'
+  END AS PostCategory,
+  EXISTS (
+    SELECT 1
+    FROM Votes v2
+    WHERE v2.PostId = c.PostId AND v2.VoteTypeId = 2
+  ) AS HasUpvote,
+  EXISTS (
+    SELECT 1
+    FROM Votes v2
+    WHERE v2.PostId = c.PostId AND v2.VoteTypeId = 4
+  ) AS HasDownvote,
+  (c.TotalUserVotes - COALESCE((SELECT SUM(BountyAmount) FROM Votes WHERE PostId = c.PostId AND BountyAmount > 0), 0)) AS NetVotes
+FROM correlated c
+LEFT JOIN (
+  SELECT PostId, SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalVotesForPost
+  FROM Votes
+  GROUP BY PostId
+) vp ON vp.PostId = c.PostId
+WHERE c.rn_owner_top = 1
+GROUP BY
+  c.PostId,
+  c.PostTypeId,
+  c.Title,
+  c.Tags,
+  c.CreationDate,
+  c.LastActivityDate,
+  c.Score,
+  c.ViewCount,
+  c.OwnerUserId,
+  c.OwnerDisplayNameAlias,
+  c.AcceptedAnswerId,
+  c.ParentId,
+  c.CommentCount,
+  c.FavoriteCount,
+  c.Body,
+  c.LastEditDate,
+  c.LastEditorUserId,
+  c.LastEditorDisplayName,
+  c.CommunityOwnedDate,
+  c.ContentLicense,
+  c.AnswerCount,
+  c.TotalUserVotes,
+  c.CommentCountTotal,
+  c.BadgeName,
+  c.BadgeClass,
+  c.BadgeDate,
+  vp.TotalVotesForPost,
+  c.rn_owner_top
+ORDER BY c.CreationDate DESC
+LIMIT 100;

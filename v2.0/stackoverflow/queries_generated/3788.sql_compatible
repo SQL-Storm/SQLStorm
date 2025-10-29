@@ -1,0 +1,129 @@
+WITH
+recent_q AS (
+    SELECT
+        p.Id                            AS QuestionId,
+        p.OwnerUserId                   AS OwnerUserId,
+        p.CreationDate                  AS QCreated,
+        p.Score                         AS QScore,
+        COALESCE(
+            NULLIF(
+                SUBSTRING(
+                    TRIM(BOTH '><' FROM p.Tags)
+                    FROM 1 FOR (CASE
+                        WHEN POSITION('><' IN TRIM(BOTH '><' FROM p.Tags)) > 0
+                        THEN POSITION('><' IN TRIM(BOTH '><' FROM p.Tags)) - 1
+                        ELSE CHAR_LENGTH(TRIM(BOTH '><' FROM p.Tags))
+                    END)
+                ),
+                ''
+            ),
+            NULL
+        )                               AS FirstTag,
+        CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS HasAccepted
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '365 days')
+),
+
+user_stats AS (
+    SELECT
+        u.Id                                 AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id)                 AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.Id = ph.PostId
+                             AND ph.PostHistoryTypeId = 1 THEN p.Id END) AS AnsweredQuestions,
+        AVG(COALESCE(p.Score,0))             AS AvgPostScore,
+        SUM(CASE WHEN b.Class = 1 THEN 5
+                 WHEN b.Class = 2 THEN 3
+                 WHEN b.Class = 3 THEN 1
+                 ELSE 0 END)                AS BadgeScore,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        MAX(p.CreationDate)                 AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p
+        ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b
+        ON b.UserId = u.Id
+    LEFT JOIN PostHistory ph
+        ON ph.PostId = p.Id
+       AND ph.PostHistoryTypeId = 1
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+tag_stats AS (
+    SELECT
+        q.FirstTag                         AS TagName,
+        COUNT(*)                           AS RecentQuestionCount,
+        SUM(q.QScore)                      AS TotalScore,
+        AVG(q.QScore)                      AS AvgScore,
+        SUM(q.HasAccepted)                 AS QuestionsWithAccepted
+    FROM recent_q q
+    WHERE q.FirstTag IS NOT NULL
+    GROUP BY q.FirstTag
+),
+
+ranked_users AS (
+    SELECT
+        us.*,
+        (0.5 * us.Reputation
+         + 0.3 * us.TotalPosts
+         + 0.2 * COALESCE(us.BadgeScore,0))            AS CompositeScore,
+        RANK() OVER (ORDER BY
+            (0.5 * us.Reputation
+             + 0.3 * us.TotalPosts
+             + 0.2 * COALESCE(us.BadgeScore,0)) DESC) AS RankOverall
+    FROM user_stats us
+),
+
+high_rep_or_gold AS (
+    SELECT UserId FROM ranked_users WHERE Reputation > 200000
+    UNION ALL
+    SELECT UserId FROM ranked_users WHERE GoldBadges >= 1
+),
+
+user_recent_tag AS (
+    SELECT
+        ru.UserId,
+        (SELECT q.FirstTag
+         FROM recent_q q
+         WHERE q.OwnerUserId = ru.UserId
+         ORDER BY q.QCreated DESC
+         LIMIT 1)                         AS MostRecentTag
+    FROM ranked_users ru
+)
+
+SELECT
+    ru.UserId,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.TotalPosts,
+    ru.GoldBadges,
+    ru.SilverBadges,
+    ru.BronzeBadges,
+    ru.BadgeScore,
+    ru.CompositeScore,
+    ru.RankOverall,
+    urt.MostRecentTag,
+    COALESCE(ts.RecentQuestionCount,0)      AS RecentQCountForTag,
+    COALESCE(ts.TotalScore,0)               AS RecentTagScore,
+    CASE
+        WHEN ru.Reputation > 500000 THEN 'Legendary'
+        WHEN ru.GoldBadges >= 5      THEN 'Gold Guru'
+        WHEN ru.CompositeScore > 100000 THEN 'High Performer'
+        ELSE 'Active User'
+    END                                    AS UserTier,
+    CASE WHEN urt.MostRecentTag IS NULL
+         THEN 'No recent questions'
+         ELSE 'Active in tag: ' || urt.MostRecentTag
+    END                                    AS RecentActivityFlag
+FROM ranked_users ru
+LEFT JOIN user_recent_tag urt
+    ON ru.UserId = urt.UserId
+LEFT JOIN tag_stats ts
+    ON ts.TagName = urt.MostRecentTag
+WHERE ru.RankOverall <= 1000
+   OR ru.UserId IN (SELECT UserId FROM high_rep_or_gold)
+ORDER BY ru.RankOverall;

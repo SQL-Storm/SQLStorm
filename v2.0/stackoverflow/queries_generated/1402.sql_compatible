@@ -1,0 +1,218 @@
+WITH UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.UpVotes AS UserUpVotesGiven,
+        u.DownVotes AS UserDownVotesGiven,
+        COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsOwned,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersOwned,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostScoreOwned,
+        SUM(COALESCE(p.ViewCount, 0)) AS TotalViewsOnPostsOwned,
+        SUM(COALESCE(p.FavoriteCount, 0)) AS TotalFavoritesOnPostsOwned,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT b.Id) AS TotalBadgesReceived,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.UpVotes, u.DownVotes
+),
+PostDetailsAggregated AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END) AS AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE NULL END) AS AvgAnswerScore,
+        COUNT(CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN p.Id ELSE NULL END) AS QuestionsWithAcceptedAnswers,
+        AVG(
+            EXTRACT(EPOCH FROM (pa.CreationDate - p.CreationDate))
+        ) FILTER (WHERE p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL) AS AvgTimeToAcceptedAnswerSeconds,
+        COUNT(CASE WHEN p.PostTypeId = 2 AND p.Id = pa.AcceptedAnswerId THEN p.Id ELSE NULL END) AS AcceptedAnswersProvided,
+        SUM(CASE WHEN p.LastEditorUserId = p.OwnerUserId AND p.LastEditDate IS NOT NULL THEN 1 ELSE 0 END) AS SelfEditedPostsCount,
+        CASE
+            WHEN NULLIF(COUNT(CASE WHEN p.PostTypeId = 2 THEN p.Id ELSE NULL END), 0) IS NULL THEN NULL
+            ELSE CAST(COUNT(CASE WHEN p.PostTypeId = 2 AND p.Id = pa.AcceptedAnswerId THEN p.Id ELSE NULL END) AS DECIMAL) /
+                 NULLIF(COUNT(CASE WHEN p.PostTypeId = 2 THEN p.Id ELSE NULL END), 0)
+        END AS AcceptanceRatioOnAnswers,
+        COUNT(DISTINCT CASE WHEN ph_closed.PostId IS NOT NULL AND ph_reopened.PostId IS NOT NULL THEN p.Id ELSE NULL END) AS ClosedReopenedQuestionsCount,
+        MAX(CASE WHEN p.PostTypeId = 1 AND EXISTS (SELECT 1 FROM PostHistory ph_ot WHERE ph_ot.PostId = p.Id AND ph_ot.PostHistoryTypeId = 10 AND ph_ot.Comment = '102') THEN 1 ELSE 0 END) AS HasOffTopicQuestion
+    FROM Posts p
+    LEFT JOIN Posts pa ON p.AcceptedAnswerId = pa.Id AND pa.PostTypeId = 2
+    LEFT JOIN PostHistory ph_closed ON p.Id = ph_closed.PostId AND ph_closed.PostHistoryTypeId = 10
+    LEFT JOIN PostHistory ph_reopened ON p.Id = ph_reopened.PostId AND ph_reopened.PostHistoryTypeId = 11
+        AND ph_reopened.CreationDate > ph_closed.CreationDate
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+UserTagPerformance AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        LOWER(TRIM(t.tag)) AS TagName,
+        COUNT(p.Id) AS PostsInTag,
+        AVG(p.Score) AS AvgScoreInTag,
+        SUM(COALESCE(p.AnswerCount, 0)) AS TotalAnswersInTagQuestions,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY COUNT(p.Id) DESC, AVG(p.Score) DESC) AS TagActivityRank
+    FROM Posts p,
+         LATERAL (
+             SELECT unnest(string_to_array(SUBSTRING(p.Tags FROM 2 FOR (char_length(p.Tags) - 2)), '><')) AS tag
+         ) t
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND char_length(TRIM(p.Tags)) > 2
+    GROUP BY p.OwnerUserId, LOWER(TRIM(t.tag))
+    HAVING COUNT(p.Id) >= 3
+),
+UserOverallScores AS (
+    SELECT
+        ue.UserId,
+        ue.DisplayName,
+        ue.Reputation,
+        ue.UserCreationDate,
+        ue.LastAccessDate,
+        ue.TotalPostsOwned,
+        ue.TotalQuestionsOwned,
+        ue.TotalAnswersOwned,
+        ue.TotalPostScoreOwned,
+        ue.TotalViewsOnPostsOwned,
+        ue.TotalCommentsMade,
+        ue.TotalBadgesReceived,
+        ue.GoldBadges,
+        ue.SilverBadges,
+        ue.BronzeBadges,
+        pda.AvgQuestionScore,
+        pda.AvgAnswerScore,
+        pda.QuestionsWithAcceptedAnswers,
+        pda.AvgTimeToAcceptedAnswerSeconds,
+        pda.AcceptedAnswersProvided,
+        pda.SelfEditedPostsCount,
+        COALESCE(pda.AcceptanceRatioOnAnswers, 0) AS AcceptanceRatioOnAnswers,
+        pda.ClosedReopenedQuestionsCount,
+        pda.HasOffTopicQuestion,
+        (
+            (ue.Reputation / 500.0) +
+            (COALESCE(ue.TotalPostScoreOwned, 0) / 20.0) +
+            (COALESCE(ue.TotalViewsOnPostsOwned, 0) / 2000.0) +
+            (COALESCE(ue.TotalCommentsMade, 0) * 0.75) +
+            (COALESCE(ue.TotalBadgesReceived, 0) * 2.5) +
+            (COALESCE(ue.GoldBadges, 0) * 15.0) +
+            (COALESCE(ue.SilverBadges, 0) * 7.5) +
+            (COALESCE(pda.AvgQuestionScore, 0) * 4.0) +
+            (COALESCE(pda.AvgAnswerScore, 0) * 5.0) +
+            (COALESCE(pda.QuestionsWithAcceptedAnswers, 0) * 3.0) +
+            (COALESCE(pda.AcceptedAnswersProvided, 0) * 4.0) +
+            (COALESCE(pda.SelfEditedPostsCount, 0) * 1.0) +
+            (COALESCE(pda.AcceptanceRatioOnAnswers, 0) * 75.0) +
+            (COALESCE(pda.ClosedReopenedQuestionsCount, 0) * 12.0) +
+            (CASE WHEN ue.LastAccessDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '6 months') THEN 25 ELSE 0 END) -
+            (COALESCE(ue.UserDownVotesGiven, 0) * 0.3) -
+            (CASE WHEN pda.HasOffTopicQuestion = 1 THEN 50 ELSE 0 END)
+        ) AS InfluenceScore,
+        STRING_AGG(utp.TagName, ', ' ORDER BY utp.TagActivityRank) FILTER (WHERE utp.TagActivityRank <= 3) AS Top3Tags
+    FROM UserEngagement ue
+    LEFT JOIN PostDetailsAggregated pda ON ue.UserId = pda.UserId
+    LEFT JOIN UserTagPerformance utp ON ue.UserId = utp.UserId
+    GROUP BY
+        ue.UserId, ue.DisplayName, ue.Reputation, ue.UserCreationDate, ue.LastAccessDate,
+        ue.TotalPostsOwned, ue.TotalQuestionsOwned, ue.TotalAnswersOwned, ue.TotalPostScoreOwned,
+        ue.TotalViewsOnPostsOwned, ue.TotalCommentsMade, ue.TotalBadgesReceived, ue.GoldBadges, ue.SilverBadges, ue.BronzeBadges,
+        pda.AvgQuestionScore, pda.AvgAnswerScore, pda.QuestionsWithAcceptedAnswers, pda.AvgTimeToAcceptedAnswerSeconds,
+        pda.AcceptedAnswersProvided, pda.SelfEditedPostsCount, pda.AcceptanceRatioOnAnswers, pda.ClosedReopenedQuestionsCount, pda.HasOffTopicQuestion
+    HAVING ue.Reputation >= 1000
+),
+TopInfluencers AS (
+    SELECT
+        UserId,
+        DisplayName,
+        Reputation,
+        InfluenceScore,
+        TotalPostsOwned,
+        TotalQuestionsOwned,
+        TotalAnswersOwned,
+        TotalCommentsMade,
+        TotalBadgesReceived,
+        GoldBadges,
+        SilverBadges,
+        Top3Tags,
+        DENSE_RANK() OVER (ORDER BY InfluenceScore DESC, Reputation DESC) AS InfluenceRank
+    FROM UserOverallScores
+    WHERE InfluenceScore IS NOT NULL
+),
+HighlyActiveCommenters AS (
+    SELECT
+        c.UserId
+    FROM Comments c
+    WHERE c.CreationDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')
+    GROUP BY c.UserId
+    HAVING COUNT(c.Id) > 75
+)
+SELECT
+    ti.UserId,
+    ti.DisplayName,
+    ti.Reputation,
+    ti.InfluenceScore,
+    ti.InfluenceRank,
+    ti.TotalPostsOwned,
+    ti.TotalQuestionsOwned,
+    ti.TotalAnswersOwned,
+    ti.TotalCommentsMade,
+    ti.TotalBadgesReceived,
+    ti.GoldBadges,
+    ti.Top3Tags,
+    'Top Influencer' AS UserCategory,
+    CASE WHEN EXISTS (
+        SELECT 1
+        FROM Posts p
+        WHERE p.OwnerUserId = ti.UserId
+          AND p.CreationDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 months')
+          AND p.Score >= 50
+    ) THEN TRUE ELSE FALSE END AS HasRecentHighScorePost
+FROM TopInfluencers ti
+WHERE ti.InfluenceRank <= 100
+  AND ti.Reputation > 7500
+  AND ti.InfluenceScore > (SELECT AVG(InfluenceScore) FROM TopInfluencers WHERE InfluenceScore IS NOT NULL)
+  AND ti.GoldBadges > 0
+  AND NOT EXISTS (
+      SELECT 1 FROM PostHistory ph_closed_only
+      WHERE ph_closed_only.PostHistoryTypeId = 10
+        AND ph_closed_only.UserId = ti.UserId
+        AND NOT EXISTS (
+            SELECT 1 FROM PostHistory ph_reopened_check
+            WHERE ph_reopened_check.PostId = ph_closed_only.PostId
+              AND ph_reopened_check.PostHistoryTypeId = 11
+              AND ph_reopened_check.CreationDate > ph_closed_only.CreationDate
+        )
+      GROUP BY ph_closed_only.PostId HAVING COUNT(ph_closed_only.Id) > 5
+  )
+
+UNION ALL
+
+SELECT
+    ue.UserId,
+    ue.DisplayName,
+    ue.Reputation,
+    uos.InfluenceScore,
+    NULL AS InfluenceRank,
+    ue.TotalPostsOwned,
+    ue.TotalQuestionsOwned,
+    ue.TotalAnswersOwned,
+    ue.TotalCommentsMade,
+    ue.TotalBadgesReceived,
+    ue.GoldBadges,
+    uos.Top3Tags,
+    'Active Commenter (Not Top Influencer)' AS UserCategory,
+    FALSE AS HasRecentHighScorePost
+FROM UserEngagement ue
+INNER JOIN HighlyActiveCommenters hac ON ue.UserId = hac.UserId
+LEFT JOIN UserOverallScores uos ON ue.UserId = uos.UserId
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM TopInfluencers ti
+    WHERE ti.UserId = ue.UserId
+)
+  AND ue.Reputation > 500
+ORDER BY InfluenceScore DESC NULLS LAST, Reputation DESC
+LIMIT 150;

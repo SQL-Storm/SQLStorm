@@ -1,0 +1,327 @@
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        date_trunc('month', u.creationdate) as cohort_month,
+        coalesce(nullif(trim(split_part(coalesce(u.location, 'Unknown,ZZ'), ',', 1)), ''), 'Unknown') as country_guess,
+        row_number() over (partition by date_trunc('month', u.creationdate) order by u.reputation desc, u.id) as rn_in_cohort
+    from users u
+    where u.creationdate >= (select coalesce(max(creationdate), CAST('2024-10-01 12:34:56' AS timestamp) - interval '10 years') - interval '24 months' from users)
+),
+user_badge_rollup as (
+    select
+        b.userid,
+        count(*) filter (where b.class = 1) as gold_cnt,
+        count(*) filter (where b.class = 2) as silver_cnt,
+        count(*) filter (where b.class = 3) as bronze_cnt,
+        min(b.date) as first_badge_date,
+        max(b.date) as last_badge_date
+    from badges b
+    group by b.userid
+),
+question_base as (
+    select
+        p.id as question_id,
+        p.owneruserid,
+        p.score,
+        coalesce(p.viewcount, 0) as viewcount,
+        p.creationdate as q_created,
+        p.acceptedanswerid,
+        p.tags,
+        p.title,
+        p.closeddate,
+        p.communityowneddate,
+        p.answercount,
+        coalesce(nullif(p.ownerdisplayname, ''), 'anon') as ownerdisplayname
+    from posts p
+    where p.posttypeid = 1
+),
+answer_base as (
+    select
+        a.id as answer_id,
+        a.parentid as question_id,
+        a.owneruserid as answer_userid,
+        a.score as answer_score,
+        a.creationdate as a_created
+    from posts a
+    where a.posttypeid = 2
+),
+q_activity as (
+    select
+        q.question_id,
+        q.owneruserid,
+        q.score,
+        q.viewcount,
+        q.q_created,
+        q.acceptedanswerid,
+        q.tags,
+        q.title,
+        q.closeddate,
+        q.communityowneddate,
+        q.answercount,
+        count(distinct c.id) as comment_cnt,
+        count(distinct pl_related.id) filter (where pl_related.linktypeid = 1) as linked_cnt,
+        count(distinct pl_dup.id) filter (where pl_dup.linktypeid = 3) as dup_cnt,
+        sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end) as net_votes
+    from question_base q
+    left join comments c on c.postid = q.question_id
+    left join postlinks pl_related on pl_related.postid = q.question_id and pl_related.linktypeid = 1
+    left join postlinks pl_dup on pl_dup.postid = q.question_id and pl_dup.linktypeid = 3
+    left join votes v on v.postid = q.question_id and v.votetypeid in (2,3)
+    group by q.question_id, q.owneruserid, q.score, q.viewcount, q.q_created, q.acceptedanswerid, q.tags, q.title, q.closeddate, q.communityowneddate, q.answercount
+),
+accepted_answer_latency as (
+    select
+        q.question_id,
+        min(a.a_created) filter (where q.acceptedanswerid is null) as first_answer_time_if_no_accept,
+        min(case when a.answer_id = q.acceptedanswerid then a.a_created end) as accepted_time,
+        min(a.a_created) as first_answer_time,
+        count(*) as total_answers,
+        sum(case when a.answer_score > 0 then 1 else 0 end) as positive_answers
+    from q_activity q
+    left join answer_base a on a.question_id = q.question_id
+    group by q.question_id
+),
+tag_expansion as (
+    select
+        q.question_id,
+        unnest(string_to_array(substring(q.tags from 2 for length(q.tags)-2), '><')) as tag
+    from q_activity q
+    where q.tags is not null and length(q.tags) > 2
+),
+tag_stats as (
+    select
+        te.tag,
+        count(*) as tag_q_count,
+        sum(qa.viewcount) as tag_total_views,
+        avg(CAST(qa.score AS numeric)) as tag_avg_score
+    from tag_expansion te
+    join q_activity qa on qa.question_id = te.question_id
+    group by te.tag
+),
+user_q_agg as (
+    select
+        qa.owneruserid as user_id,
+        count(*) as q_count,
+        sum(case when qa.closeddate is not null then 1 else 0 end) as closed_q_count,
+        sum(qa.viewcount) as sum_views,
+        avg(CAST(qa.viewcount AS numeric)) as avg_views,
+        avg(CAST(qa.score AS numeric)) as avg_q_score,
+        max(qa.q_created) as last_q_date
+    from q_activity qa
+    group by qa.owneruserid
+),
+leaderboard as (
+    select
+        ru.user_id,
+        ru.displayname,
+        ru.reputation,
+        ru.cohort_month,
+        ub.gold_cnt,
+        ub.silver_cnt,
+        ub.bronze_cnt,
+        uq.q_count,
+        uq.closed_q_count,
+        uq.sum_views,
+        uq.avg_views,
+        uq.avg_q_score,
+        uq.last_q_date,
+        coalesce(ub.first_badge_date, uq.last_q_date) as first_notable_date
+    from recent_users ru
+    left join user_badge_rollup ub on ub.userid = ru.user_id
+    left join user_q_agg uq on uq.user_id = ru.user_id
+),
+per_question_scoring as (
+    select
+        qa.question_id,
+        qa.owneruserid as user_id,
+        qa.score,
+        qa.viewcount,
+        qa.net_votes,
+        qa.comment_cnt,
+        qa.linked_cnt,
+        qa.dup_cnt,
+        aal.total_answers,
+        aal.positive_answers,
+        extract(epoch from coalesce(aal.accepted_time, aal.first_answer_time) - qa.q_created) as sec_to_first_resolution,
+        case
+            when qa.acceptedanswerid is not null then 1
+            when aal.total_answers > 0 then 0
+            else null
+        end as accepted_flag
+    from q_activity qa
+    left join accepted_answer_latency aal on aal.question_id = qa.question_id
+),
+user_windowed as (
+    select
+        pqs.user_id,
+        pqs.question_id,
+        pqs.score,
+        pqs.viewcount,
+        pqs.net_votes,
+        pqs.comment_cnt,
+        pqs.linked_cnt,
+        pqs.dup_cnt,
+        pqs.total_answers,
+        pqs.positive_answers,
+        pqs.sec_to_first_resolution,
+        pqs.accepted_flag,
+        avg(pqs.viewcount) over (partition by pqs.user_id) as user_avg_views,
+        avg(pqs.score) over (partition by pqs.user_id) as user_avg_score,
+        percent_rank() over (partition by pqs.user_id order by pqs.viewcount desc) as view_percentile_in_user,
+        row_number() over (partition by pqs.user_id order by pqs.score desc, pqs.viewcount desc, pqs.question_id) as rn_user_top_q
+    from per_question_scoring pqs
+),
+agg_by_country as (
+    select
+        l.country_guess,
+        count(distinct u.id) as users_in_country,
+        avg(CAST(u.reputation AS numeric)) as avg_rep_country
+    from users u
+    left join lateral (
+        select coalesce(nullif(trim(split_part(coalesce(u.location, 'Unknown,ZZ'), ',', 1)), ''), 'Unknown') as country_guess
+    ) l on true
+    group by l.country_guess
+),
+hot_tags as (
+    select
+        ts.tag,
+        ts.tag_q_count,
+        ts.tag_total_views,
+        dense_rank() over (order by ts.tag_total_views desc, ts.tag_q_count desc) as dr
+    from tag_stats ts
+),
+cross_user_interest as (
+    select
+        uw1.user_id as user_a,
+        uw2.user_id as user_b,
+        count(*) as shared_qs
+    from user_windowed uw1
+    join user_windowed uw2
+      on uw1.question_id = uw2.question_id
+     and uw1.user_id <> uw2.user_id
+    group by uw1.user_id, uw2.user_id
+    having count(*) >= 3
+),
+final_scores as (
+    select
+        lb.user_id,
+        lb.displayname,
+        lb.reputation,
+        lb.cohort_month,
+        coalesce(lb.gold_cnt,0) as gold_cnt,
+        coalesce(lb.silver_cnt,0) as silver_cnt,
+        coalesce(lb.bronze_cnt,0) as bronze_cnt,
+        coalesce(lb.q_count,0) as q_count,
+        coalesce(lb.closed_q_count,0) as closed_q_count,
+        coalesce(lb.sum_views,0) as sum_views,
+        lb.avg_views,
+        lb.avg_q_score,
+        lb.last_q_date,
+        ru.country_guess,
+        ac.users_in_country,
+        ac.avg_rep_country,
+        sum(case when uw.accepted_flag = 1 then 1 else 0 end) as accepted_qs,
+        avg(uw.sec_to_first_resolution) as avg_sec_to_resolution,
+        avg(CAST(uw.viewcount AS numeric)) as avg_q_views_calc,
+        avg(CAST(uw.score AS numeric)) as avg_q_score_calc,
+        stddev_pop(CAST(uw.viewcount AS numeric)) as std_views,
+        percentile_cont(0.9) within group (order by uw.viewcount) as p90_views,
+        max(case when uw.rn_user_top_q = 1 then uw.question_id end) as top_question_id,
+        sum(greatest(0, uw.net_votes)) as sum_net_upvotes
+    from leaderboard lb
+    left join recent_users ru on ru.user_id = lb.user_id
+    left join agg_by_country ac on ac.country_guess = ru.country_guess
+    left join user_windowed uw on uw.user_id = lb.user_id
+    group by
+        lb.user_id, lb.displayname, lb.reputation, lb.cohort_month,
+        lb.gold_cnt, lb.silver_cnt, lb.bronze_cnt, lb.q_count, lb.closed_q_count,
+        lb.sum_views, lb.avg_views, lb.avg_q_score, lb.last_q_date,
+        ru.country_guess, ac.users_in_country, ac.avg_rep_country
+),
+ranked as (
+    select
+        fs.*,
+        coalesce(nullif(fs.displayname, ''), concat('user#', CAST(fs.user_id AS varchar))) as display_or_fallback,
+        (
+            coalesce(fs.gold_cnt,0)*5 +
+            coalesce(fs.silver_cnt,0)*2 +
+            coalesce(fs.bronze_cnt,0)*1 +
+            coalesce(fs.sum_views,0)/1000.0 +
+            coalesce(fs.accepted_qs,0)*3 +
+            coalesce(fs.sum_net_upvotes,0)*1
+        ) as score_index,
+        row_number() over (order by
+            (
+                coalesce(fs.gold_cnt,0)*5 +
+                coalesce(fs.silver_cnt,0)*2 +
+                coalesce(fs.bronze_cnt,0)*1 +
+                coalesce(fs.sum_views,0)/1000.0 +
+                coalesce(fs.accepted_qs,0)*3 +
+                coalesce(fs.sum_net_upvotes,0)*1
+            ) desc,
+            fs.reputation desc,
+            fs.user_id
+        ) as overall_rank
+    from final_scores fs
+)
+select
+    r.overall_rank,
+    r.user_id,
+    r.display_or_fallback as displayname,
+    r.reputation,
+    to_char(r.cohort_month::timestamp, 'YYYY-MM') as cohort_month,
+    r.gold_cnt || '/' || r.silver_cnt || '/' || r.bronze_cnt as badge_mix,
+    r.q_count,
+    r.closed_q_count,
+    r.accepted_qs,
+    coalesce(round(CAST(r.avg_q_score_calc AS numeric), 2), r.avg_q_score) as avg_q_score,
+    coalesce(round(CAST(r.avg_q_views_calc AS numeric), 2), r.avg_views) as avg_q_views,
+    round(CAST(r.p90_views AS numeric), 0) as p90_views,
+    round(CAST(r.std_views AS numeric), 2) as std_views,
+    r.sum_views,
+    r.sum_net_upvotes,
+    r.top_question_id,
+    coalesce(r.country_guess, 'Unknown') as country_guess,
+    r.users_in_country,
+    round(CAST(r.avg_rep_country AS numeric), 1) as avg_rep_country,
+    round(CAST(r.score_index AS numeric), 2) as score_index,
+    ht.tag as hottest_tag_by_views,
+    ts.tag_q_count as hottest_tag_qs
+from ranked r
+left join lateral (
+    select ht.tag
+    from hot_tags ht
+    where ht.dr = 1
+    order by ht.tag
+    limit 1
+) ht on true
+left join tag_stats ts on ts.tag = ht.tag
+where r.overall_rank <= 100
+union all
+select
+    0 as overall_rank,
+    CAST(NULL AS int) as user_id,
+    'TOTALS' as displayname,
+    CAST(NULL AS int) as reputation,
+    CAST(NULL AS varchar) as cohort_month,
+    CAST(NULL AS varchar) as badge_mix,
+    sum(r.q_count) as q_count,
+    sum(r.closed_q_count) as closed_q_count,
+    sum(r.accepted_qs) as accepted_qs,
+    CAST(avg(r.avg_q_score_calc) AS numeric(18,2)) as avg_q_score,
+    CAST(avg(r.avg_q_views_calc) AS numeric(18,2)) as avg_q_views,
+    CAST(avg(r.p90_views) AS numeric(18,0)) as p90_views,
+    CAST(avg(r.std_views) AS numeric(18,2)) as std_views,
+    sum(r.sum_views) as sum_views,
+    sum(r.sum_net_upvotes) as sum_net_upvotes,
+    CAST(NULL AS int) as top_question_id,
+    CAST(NULL AS varchar) as country_guess,
+    CAST(NULL AS bigint) as users_in_country,
+    CAST(NULL AS numeric) as avg_rep_country,
+    CAST(avg(r.score_index) AS numeric(18,2)) as score_index,
+    CAST(NULL AS varchar) as hottest_tag_by_views,
+    CAST(NULL AS bigint) as hottest_tag_qs
+from ranked r
+order by overall_rank, user_id nulls last;

@@ -1,0 +1,126 @@
+-- {"query": "4611.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1155} 
+
+WITH
+  RankedAnswers AS (
+    SELECT
+      p.Id AS PostId,
+      p.ParentId AS QuestionId,
+      p.OwnerUserId,
+      p.CreationDate AS AnswerCreationDate,
+      ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS rn_score,
+      ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.CreationDate ASC) AS rn_creation,
+      COUNT(c.Id) AS CommentCount,
+      AVG(c.Score) OVER (PARTITION BY p.ParentId) AS AvgCommentScore
+    FROM Posts AS p
+    LEFT JOIN Comments AS c
+      ON p.Id = c.PostId
+    WHERE
+      p.PostTypeId = 2
+    GROUP BY
+      p.Id,
+      p.ParentId,
+      p.OwnerUserId,
+      p.CreationDate,
+      p.Score
+  ),
+  QuestionDetails AS (
+    SELECT
+      q.Id AS QuestionId,
+      q.OwnerUserId AS QuestionOwnerUserId,
+      q.CreationDate AS QuestionCreationDate,
+      q.ViewCount AS QuestionViewCount,
+      q.AnswerCount AS QuestionAnswerCount,
+      COALESCE(pt.Name, 'Unknown') AS QuestionPostType,
+      CASE
+        WHEN q.ClosedDate IS NOT NULL THEN 'Closed'
+        ELSE 'Open'
+      END AS QuestionStatus,
+      (
+        SELECT
+          COUNT(*)
+        FROM PostLinks AS pl
+        WHERE
+          pl.PostId = q.Id AND pl.LinkTypeId = 3
+      ) AS DuplicateLinkCount,
+      (
+        SELECT
+          COUNT(*)
+        FROM Votes AS v
+        WHERE
+          v.PostId = q.Id AND v.VoteTypeId = 2
+      ) AS UpVoteCount,
+      (
+        SELECT
+          STRING_AGG(t.TagName, ',')
+        FROM (
+          SELECT
+            SUBSTRING(value, 2, LEN(value) - 2) AS TagName
+          FROM STRING_SPLIT(q.Tags, '><')
+        ) AS t
+      ) AS FormattedTags
+    FROM Posts AS q
+    JOIN PostTypes AS pt
+      ON q.PostTypeId = pt.Id
+    WHERE
+      q.PostTypeId = 1
+  )
+SELECT
+  qd.QuestionId,
+  qd.QuestionOwnerUserId,
+  qd.QuestionCreationDate,
+  qd.QuestionViewCount,
+  qd.QuestionAnswerCount,
+  qd.QuestionPostType,
+  qd.QuestionStatus,
+  qd.FormattedTags,
+  ra_best.OwnerUserId AS BestAnswerOwnerUserId,
+  ra_best.AnswerCreationDate AS BestAnswerCreationDate,
+  ra_best.CommentCount AS BestAnswerCommentCount,
+  ra_best.AvgCommentScore AS BestAnswerAvgCommentScore,
+  ra_first.OwnerUserId AS FirstAnswerOwnerUserId,
+  ra_first.AnswerCreationDate AS FirstAnswerCreationDate,
+  ra_first.CommentCount AS FirstAnswerCommentCount,
+  ra_first.AvgCommentScore AS FirstAnswerAvgCommentScore,
+  qd.DuplicateLinkCount,
+  qd.UpVoteCount,
+  u.DisplayName AS QuestionOwnerDisplayName,
+  u.Reputation AS QuestionOwnerReputation,
+  COALESCE(u.Location, 'N/A') AS QuestionOwnerLocation,
+  CASE
+    WHEN u.WebsiteUrl IS NULL OR u.WebsiteUrl = '' THEN 'No Website'
+    ELSE 'Has Website'
+  END AS QuestionOwnerWebsiteStatus,
+  (
+    SELECT
+      COUNT(ph.Id)
+    FROM PostHistory AS ph
+    WHERE
+      ph.PostId = qd.QuestionId AND ph.PostHistoryTypeId IN (4, 5, 6)
+  ) AS EditHistoryCount,
+  CASE
+    WHEN EXISTS (
+      SELECT
+        1
+      FROM Posts AS p_related
+      WHERE
+        p_related.ParentId = qd.QuestionId AND p_related.OwnerUserId = qd.QuestionOwnerUserId
+    ) THEN 'Answered by Owner'
+    ELSE 'Not Answered by Owner'
+  END AS OwnerAnswerStatus
+FROM QuestionDetails AS qd
+LEFT JOIN RankedAnswers AS ra_best
+  ON qd.QuestionId = ra_best.QuestionId AND ra_best.rn_score = 1
+LEFT JOIN RankedAnswers AS ra_first
+  ON qd.QuestionId = ra_first.QuestionId AND ra_first.rn_creation = 1
+LEFT JOIN Users AS u
+  ON qd.QuestionOwnerUserId = u.Id
+WHERE
+  qd.QuestionViewCount > 1000
+  AND qd.QuestionAnswerCount BETWEEN 5 AND 50
+  AND qd.QuestionCreationDate < DATEADD(year, -1, GETDATE())
+  AND qd.DuplicateLinkCount < 3
+  AND qd.UpVoteCount > 10
+ORDER BY
+  qd.QuestionViewCount DESC,
+  qd.QuestionAnswerCount DESC
+LIMIT 100;

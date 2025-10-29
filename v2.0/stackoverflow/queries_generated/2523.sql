@@ -1,0 +1,102 @@
+-- {"query": "2523.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1156} 
+with RecursivePosts as (
+    select p.Id, p.PostTypeId, p.ParentId, p.CreationDate, p.Score, p.ViewCount,
+           p.OwnerUserId, p.AcceptedAnswerId,
+           cast(1 as int) as Level
+    from Posts p
+    where p.PostTypeId = 1 and p.CreationDate >= '2023-01-01'
+    
+    union all
+    
+    select p2.Id, p2.PostTypeId, p2.ParentId, p2.CreationDate, p2.Score, p2.ViewCount,
+           p2.OwnerUserId, p2.AcceptedAnswerId,
+           rp.Level + 1
+    from Posts p2
+    inner join RecursivePosts rp on p2.ParentId = rp.Id
+    where p2.PostTypeId = 2
+),
+UserActivityRank as (
+    select u.Id as UserId,
+           u.DisplayName,
+           count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsAsked,
+           count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersGiven,
+           count(distinct b.Id) as BadgesCount,
+           count(distinct c.Id) as CommentsCount,
+           row_number() over (order by u.Reputation desc nulls last) as RepRank,
+           rank() over (partition by u.Location order by u.Reputation desc nulls last) as LocationRepRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    where u.Reputation > 0
+    group by u.Id, u.DisplayName, u.Location, u.Reputation
+),
+TopPostsWithVotes as (
+    select p.Id, p.Title, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount,
+           coalesce(sum(case when v.VoteTypeId = 2 then 1 else 0 end), 0) as UpVotes,
+           coalesce(sum(case when v.VoteTypeId = 3 then 1 else 0 end), 0) as DownVotes,
+           u.DisplayName as OwnerName,
+           case 
+               when p.AcceptedAnswerId is not null then
+                   (select count(*) from Posts where ParentId = p.Id and Score >= p.Score)
+               else null
+           end as BetterAnswersCount
+    from Posts p
+    left join Votes v on v.PostId = p.Id
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId in (1,2)
+    group by p.Id, p.Title, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.AcceptedAnswerId, u.DisplayName
+    having (sum(case when v.VoteTypeId = 2 then 1 else 0 end) - sum(case when v.VoteTypeId = 3 then 1 else 0 end)) > 10
+),
+FilteredComments as (
+    select c.Id, c.PostId, c.UserId, c.CreationDate, c.Score, c.Text,
+           row_number() over (partition by c.PostId order by c.Score desc nulls last, c.CreationDate asc) as CommentRank
+    from Comments c
+    where c.Text is not null and length(c.Text) > 10
+),
+CloseReasonsCount as (
+    select ph.PostId,
+           max(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Comment END) as CloseReasonId,
+           count(*) filter (where ph.PostHistoryTypeId = 10) as CloseVotesCount,
+           max(cr.Name) as CloseReasonName
+    from PostHistory ph
+    left join CloseReasonTypes cr on cr.Id::text = ph.Comment
+    group by ph.PostId
+)
+
+select 
+    tp.Id as PostId,
+    tp.Title,
+    tp.PostTypeId,
+    tp.CreationDate,
+    tp.Score,
+    tp.ViewCount,
+    tp.UpVotes,
+    tp.DownVotes,
+    tp.OwnerName,
+    coalesce(bc.CloseVotesCount, 0) as CloseVotes,
+    bc.CloseReasonName,
+    fa.BetterAnswersCount,
+    ua.QuestionsAsked,
+    ua.AnswersGiven,
+    ua.BadgesCount,
+    ua.CommentsCount,
+    ua.RepRank,
+    ua.LocationRepRank,
+    fc.CommentRank,
+    fc.Text as TopComment,
+    concat_ws(' - ', left(tp.Title, 50), coalesce(tp.OwnerName, 'Unknown')) as TitleSummary,
+    case
+        when tp.ViewCount is null then 'No Views'
+        when tp.ViewCount > 10000 then 'Popular'
+        else 'Regular'
+    end as PopularityCategory
+from TopPostsWithVotes tp
+left join CloseReasonsCount bc on bc.PostId = tp.Id
+left join FilteredComments fc on fc.PostId = tp.Id and fc.CommentRank = 1
+left join UserActivityRank ua on ua.UserId = tp.OwnerUserId
+left join FilteredComments fco on fco.UserId = ua.UserId and fco.CommentRank = 1
+left join RecursivePosts rp on rp.Id = tp.Id and rp.Level = 1
+where tp.CreationDate >= '2023-01-01' and tp.Score > 0 
+order by tp.UpVotes desc, tp.ViewCount desc
+limit 100;

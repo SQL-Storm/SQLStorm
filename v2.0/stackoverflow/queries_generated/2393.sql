@@ -1,0 +1,168 @@
+-- {"query": "2393.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1666} 
+
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        ARRAY[t.TagName] AS TagPath,
+        1 AS Depth
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0
+    UNION ALL
+    SELECT
+        c.Id,
+        c.TagName,
+        th.TagPath || c.TagName,
+        th.Depth + 1
+    FROM Tags c
+    JOIN PostLinks pl ON pl.PostId = c.ExcerptPostId AND pl.LinkTypeId = 1
+    JOIN RecursiveTagHierarchy th ON pl.RelatedPostId = th.ExcerptPostId
+    WHERE c.IsModeratorOnly = 0 AND th.Depth < 3
+),
+UserBadgeSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+        SUM(COALESCE(p.Score,0)) AS TotalPostScore,
+        AVG(COALESCE(p.Score,0)) FILTER (WHERE p.PostTypeId = 1) AS AvgQuestionScore,
+        AVG(COALESCE(p.Score,0)) FILTER (WHERE p.PostTypeId = 2) AS AvgAnswerScore,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+TopActivePosts AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.Tags,
+        u.DisplayName AS OwnerDisplayName,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS RankByScoreView,
+        AVG(COALESCE(c.Score,0)) OVER (PARTITION BY p.Id) AS AvgCommentScore,
+        COUNT(c.Id) OVER (PARTITION BY p.Id) AS CommentCount
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    WHERE p.CreationDate > NOW() - INTERVAL '1 year'
+),
+QuestionsWithAnswerStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.Tags,
+        q.OwnerUserId,
+        q.Score AS QuestionScore,
+        COUNT(a.Id) AS AnswerCount,
+        AVG(a.Score) AS AvgAnswerScore,
+        MAX(a.Score) AS MaxAnswerScore,
+        SUM(COALESCE(vu.CountUp,0)) AS TotalUpVotesOnAnswers,
+        SUM(COALESCE(vd.CountDown,0)) AS TotalDownVotesOnAnswers
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS CountUp
+        FROM Votes
+        WHERE VoteTypeId = 2
+        GROUP BY PostId
+    ) vu ON vu.PostId = a.Id
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS CountDown
+        FROM Votes
+        WHERE VoteTypeId = 3
+        GROUP BY PostId
+    ) vd ON vd.PostId = a.Id
+    WHERE q.PostTypeId = 1 AND q.CreationDate > NOW() - INTERVAL '2 years'
+    GROUP BY q.Id, q.Title, q.Tags, q.OwnerUserId, q.Score
+),
+QuestionsWithDuplicateCounts AS (
+    SELECT
+        q.Id AS QuestionId,
+        COUNT(pl.Id) FILTER (WHERE lt.Name = 'Duplicate') AS DuplicateCount,
+        COUNT(pl.Id) FILTER (WHERE lt.Name = 'Linked') AS LinkedCount
+    FROM Posts q
+    LEFT JOIN PostLinks pl ON pl.PostId = q.Id
+    LEFT JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id
+),
+PostHistoryCloseAnalysis AS (
+    SELECT
+        ph.PostId,
+        COUNT(*) AS CloseVotesCount,
+        COUNT(DISTINCT ph.UserId) AS DistinctVoters,
+        MIN(ph.CreationDate) AS FirstCloseVoteDate,
+        MAX(ph.CreationDate) AS LastCloseVoteDate,
+        STRING_AGG(DISTINCT crt.Name, ', ' ORDER BY crt.Name) AS CloseReasons
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS smallint)
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.PostId
+),
+FinalResult AS (
+    SELECT
+        q.Q.QuestionId,
+        q.Q.Title,
+        q.Q.Tags,
+        u.DisplayName AS QuestionOwner,
+        u.Reputation AS OwnerReputation,
+        q.Q.QuestionScore,
+        q.Q.AnswerCount,
+        q.Q.AvgAnswerScore,
+        q.Q.MaxAnswerScore,
+        q.Q.TotalUpVotesOnAnswers,
+        q.Q.TotalDownVotesOnAnswers,
+        qd.DuplicateCount,
+        qd.LinkedCount,
+        phca.CloseVotesCount,
+        phca.DistinctVoters,
+        phca.FirstCloseVoteDate,
+        phca.LastCloseVoteDate,
+        phca.CloseReasons,
+        COALESCE(usb.GoldBadges,0) AS OwnerGoldBadges,
+        COALESCE(usb.SilverBadges,0) AS OwnerSilverBadges,
+        COALESCE(usb.BronzeBadges,0) AS OwnerBronzeBadges,
+        usb.TotalPostScore AS OwnerTotalPostScore,
+        usb.AvgQuestionScore AS OwnerAvgQuestionScore,
+        usb.AvgAnswerScore AS OwnerAvgAnswerScore,
+        usb.LastBadgeDate,
+        -- Complex string manipulation for tags
+        CASE 
+            WHEN q.Q.Tags IS NOT NULL THEN
+                array_to_string(
+                    ARRAY(
+                        SELECT unnest(string_to_array(substr(q.Q.Tags, 2, length(q.Q.Tags) - 2), '><'))
+                        ORDER BY length(unnest)
+                    ),
+                    '|'
+                )
+            ELSE 'No Tags'
+        END AS SortedTagList,
+        -- Window function example for rank of question score with ties broken by answer count
+        RANK() OVER (ORDER BY q.Q.QuestionScore DESC, q.Q.AnswerCount DESC) AS RankByScoreAnswerCount,
+        -- Correlated subquery: last comment text for the question
+        (SELECT c.Text FROM Comments c WHERE c.PostId = q.Q.QuestionId ORDER BY c.CreationDate DESC LIMIT 1) AS LastCommentText,
+        -- NULL logic and expression: Determine if owner is "Experienced"
+        CASE 
+            WHEN u.Reputation > 10000 AND usb.GoldBadges >= 3 THEN 'Experienced'
+            WHEN u.Reputation > 1000 AND usb.SilverBadges >= 5 THEN 'Intermediate'
+            WHEN u.Reputation IS NULL THEN 'Unknown'
+            ELSE 'Beginner'
+        END AS OwnerExperienceLevel
+    FROM QuestionsWithAnswerStats q(Q)
+    LEFT JOIN Users u ON u.Id = q.Q.OwnerUserId
+    LEFT JOIN QuestionsWithDuplicateCounts qd ON qd.QuestionId = q.Q.QuestionId
+    LEFT JOIN PostHistoryCloseAnalysis phca ON phca.PostId = q.Q.QuestionId
+    LEFT JOIN UserBadgeSummary usb ON usb.UserId = q.Q.OwnerUserId
+    WHERE q.Q.AnswerCount > 0 AND q.Q.QuestionScore > 0
+)
+SELECT * FROM FinalResult
+WHERE RankByScoreAnswerCount <= 50
+ORDER BY RankByScoreAnswerCount, DuplicateCount DESC, CloseVotesCount DESC;

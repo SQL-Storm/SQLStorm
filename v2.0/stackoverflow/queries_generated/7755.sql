@@ -1,0 +1,382 @@
+-- {"query": "7755.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 4171} 
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        MAX(p.CreationDate) as LatestPostDate,
+        MIN(p.CreationDate) as FirstPostDate,
+        AVG(p.Score) as AvgScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.ParentId,
+        p.PostTypeId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.Tags,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as PostType,
+        CASE 
+            WHEN p.Score > 100 THEN 'HighlyVoted'
+            WHEN p.Score > 50 THEN 'ModeratelyVoted'
+            WHEN p.Score > 0 THEN 'LowVoted'
+            WHEN p.Score <= 0 THEN 'NonVoted'
+        END as VoteCategory,
+        CASE 
+            WHEN p.CommentCount > 10 THEN 'HighlyDiscussed'
+            WHEN p.CommentCount > 5 THEN 'ModeratelyDiscussed'
+            WHEN p.CommentCount > 0 THEN 'LowDiscussed'
+            ELSE 'NotDiscussed'
+        END as DiscussionLevel,
+        CASE 
+            WHEN p.FavoriteCount > 5 THEN 'HighlyFavorited'
+            WHEN p.FavoriteCount > 2 THEN 'ModeratelyFavorited'
+            WHEN p.FavoriteCount > 0 THEN 'LowFavorited'
+            ELSE 'NotFavorited'
+        END as FavoritingLevel,
+        COALESCE(LEN(p.Tags), 0) as TagLength,
+        IIF(p.Tags IS NOT NULL AND p.Tags != '', 1, 0) as HasTags,
+        COALESCE(
+            (SELECT COUNT(*) FROM Posts WHERE ParentId = p.Id AND PostTypeId = 2 AND Score > 0),
+            0
+        ) as PositiveAnswers,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as UserPostRank,
+        NTILE(4) OVER (ORDER BY p.Score DESC) as ScoreQuartile,
+        PERCENT_RANK() OVER (ORDER BY p.ViewCount) as ViewPercentile,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PreviousScore,
+        LEAD(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as NextScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as UserAvgScore,
+        SUM(p.ViewCount) OVER (PARTITION BY p.OwnerUserId) as UserTotalViews,
+        DATEDIFF(day, p.CreationDate, GETDATE()) as DaysSinceCreation,
+        CASE 
+            WHEN p.CreationDate > DATEADD(day, -7, GETDATE()) THEN 'Recent'
+            WHEN p.CreationDate > DATEADD(day, -30, GETDATE()) THEN 'LastMonth'
+            WHEN p.CreationDate > DATEADD(day, -90, GETDATE()) THEN 'LastQuarter'
+            ELSE 'Older'
+        END as PostAgeCategory
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserEngagement AS (
+    SELECT 
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.Views,
+        us.UpVotes,
+        us.DownVotes,
+        us.PostCount,
+        us.CommentCount,
+        us.BadgeCount,
+        us.QuestionCount,
+        us.AnswerCount,
+        us.TotalScore,
+        us.LatestPostDate,
+        us.FirstPostDate,
+        us.AvgScore,
+        AVG(pa.Score) as AvgPostScore,
+        MAX(pa.Score) as MaxPostScore,
+        MIN(pa.Score) as MinPostScore,
+        COUNT(pa.PostId) FILTER (WHERE pa.PostType = 'Question') as UserQuestions,
+        COUNT(pa.PostId) FILTER (WHERE pa.PostType = 'Answer') as UserAnswers,
+        SUM(pa.ViewCount) as TotalViews,
+        AVG(pa.ViewCount) as AvgViews,
+        MAX(pa.ViewCount) as MaxViews,
+        SUM(pa.Score) as TotalPostScore,
+        COUNT(pa.PostId) FILTER (WHERE pa.VoteCategory = 'HighlyVoted') as HighlyVotedPosts,
+        COUNT(pa.PostId) FILTER (WHERE pa.DiscussionLevel = 'HighlyDiscussed') as HighlyDiscussedPosts,
+        COUNT(pa.PostId) FILTER (WHERE pa.FavoritingLevel = 'HighlyFavorited') as HighlyFavoritedPosts,
+        (us.PostCount * 1.0 / NULLIF(DATEDIFF(day, us.FirstPostDate, us.LatestPostDate), 0)) as PostsPerDay,
+        (us.TotalScore * 1.0 / NULLIF(us.PostCount, 0)) as ScorePerPost,
+        NULLIF(DATEDIFF(day, us.FirstPostDate, us.LatestPostDate), 0) as ActiveDays,
+        100.0 * COALESCE(us.BadgeCount, 0) / NULLIF(us.PostCount, 0) as BadgeRatio,
+        (COALESCE(us.UpVotes, 0) * 1.0 / NULLIF(us.DownVotes, 0)) as UpDownRatio
+    FROM UserStats us
+    LEFT JOIN PostAnalysis pa ON us.UserId = pa.OwnerUserId
+    GROUP BY 
+        us.UserId, us.DisplayName, us.Reputation, us.Views, us.UpVotes, us.DownVotes,
+        us.PostCount, us.CommentCount, us.BadgeCount, us.QuestionCount, us.AnswerCount,
+        us.TotalScore, us.LatestPostDate, us.FirstPostDate, us.AvgScore
+),
+PostTrends AS (
+    SELECT 
+        pa.PostId,
+        pa.Title,
+        pa.Score,
+        pa.ViewCount,
+        pa.CreationDate,
+        pa.OwnerUserId,
+        pa.ParentId,
+        pa.PostType,
+        pa.VoteCategory,
+        pa.DiscussionLevel,
+        pa.FavoritingLevel,
+        pa.TagLength,
+        pa.HasTags,
+        pa.PositiveAnswers,
+        pa.UserPostRank,
+        pa.ScoreQuartile,
+        pa.ViewPercentile,
+        pa.PreviousScore,
+        pa.NextScore,
+        pa.UserAvgScore,
+        pa.UserTotalViews,
+        pa.DaysSinceCreation,
+        pa.PostAgeCategory,
+        DENSE_RANK() OVER (ORDER BY pa.Score DESC) as OverallRank,
+        RANK() OVER (ORDER BY pa.ViewCount DESC) as ViewRank,
+        ROW_NUMBER() OVER (ORDER BY pa.CreationDate DESC) as NewestPostRank,
+        COUNT(*) OVER () as TotalPosts,
+        AVG(pa.Score) OVER () as AvgScoreAllPosts,
+        MAX(pa.ViewCount) OVER () as MaxViewCount,
+        MIN(pa.ViewCount) OVER () as MinViewCount,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY pa.Score) OVER () as MedianScore,
+        COALESCE(
+            (SELECT TOP 1 Title FROM Posts WHERE PostTypeId = 1 AND OwnerUserId = pa.OwnerUserId ORDER BY Score DESC),
+            'No Top Question'
+        ) as UserTopQuestion,
+        CASE 
+            WHEN pa.Score > (
+                SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1 AND ABS(DATEDIFF(day, CreationDate, GETDATE())) <= 30
+            ) THEN 'AboveAverage'
+            WHEN pa.Score < (
+                SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1 AND ABS(DATEDIFF(day, CreationDate, GETDATE())) <= 30
+            ) THEN 'BelowAverage'
+            ELSE 'Average'
+        END as ScoringTrend,
+        LAG(pa.Score, 1) OVER (ORDER BY pa.PostId) as PrevPostScore,
+        LEAD(pa.Score, 1) OVER (ORDER BY pa.PostId) as NextPostScore,
+        IIF(
+            pa.Score > ISNULL(LAG(pa.Score, 1) OVER (ORDER BY pa.PostId), 0) 
+            AND pa.Score > ISNULL(LEAD(pa.Score, 1) OVER (ORDER BY pa.PostId), 0),
+            'Peak',
+            IIF(
+                pa.Score < ISNULL(LAG(pa.Score, 1) OVER (ORDER BY pa.PostId), 999999) 
+                AND pa.Score < ISNULL(LEAD(pa.Score, 1) OVER (ORDER BY pa.PostId), 999999),
+                'Valley',
+                'Normal'
+            )
+        ) as TrendType
+    FROM PostAnalysis pa
+),
+AggregatedData AS (
+    SELECT 
+        'Overall' as Category,
+        COUNT(*) as Count,
+        AVG(pa.Score) as AvgScore,
+        MAX(pa.Score) as MaxScore,
+        MIN(pa.Score) as MinScore,
+        SUM(pa.ViewCount) as TotalViews,
+        AVG(pa.ViewCount) as AvgViews,
+        COUNT(DISTINCT pa.OwnerUserId) as ActiveUsers,
+        COUNT(DISTINCT pa.ParentId) as AnsweredQuestions
+    FROM PostAnalysis pa
+    UNION ALL
+    SELECT 
+        pa.PostAgeCategory as Category,
+        COUNT(*) as Count,
+        AVG(pa.Score) as AvgScore,
+        MAX(pa.Score) as MaxScore,
+        MIN(pa.Score) as MinScore,
+        SUM(pa.ViewCount) as TotalViews,
+        AVG(pa.ViewCount) as AvgViews,
+        COUNT(DISTINCT pa.OwnerUserId) as ActiveUsers,
+        COUNT(DISTINCT pa.ParentId) as AnsweredQuestions
+    FROM PostAnalysis pa
+    GROUP BY pa.PostAgeCategory
+)
+SELECT 
+    ue.UserId,
+    ue.DisplayName,
+    ue.Reputation,
+    ue.Views,
+    ue.UpVotes,
+    ue.DownVotes,
+    NULLIF(ue.PostCount, 0) as PostCount,
+    NULLIF(ue.CommentCount, 0) as CommentCount,
+    NULLIF(ue.BadgeCount, 0) as BadgeCount,
+    NULLIF(ue.QuestionCount, 0) as QuestionCount,
+    NULLIF(ue.AnswerCount, 0) as AnswerCount,
+    CASE 
+        WHEN ue.PostCount > 0 THEN (ue.TotalScore * 1.0 / ue.PostCount)
+        ELSE 0 
+    END as AverageScorePerPost,
+    CASE 
+        WHEN ue.BadgeCount > 0 THEN (ue.BadgeCount * 1.0 / ue.PostCount)
+        ELSE 0 
+    END as BadgesPerPost,
+    CASE 
+        WHEN (ue.UpVotes + ue.DownVotes) > 0 THEN (ue.UpVotes * 1.0 / (ue.UpVotes + ue.DownVotes))
+        ELSE 0 
+    END as UpVotePercentage,
+    CASE 
+        WHEN ue.ActiveDays > 0 THEN (ue.PostCount * 1.0 / ue.ActiveDays)
+        ELSE 0 
+    END as PostsPerActiveDay,
+    CASE 
+        WHEN ue.TotalViews > 0 THEN (ue.TotalViews * 1.0 / ue.PostCount)
+        ELSE 0 
+    END as AverageViewsPerPost,
+    CASE 
+        WHEN UE.AvgScore > (
+            SELECT AVG(AvgScore) FROM UserEngagement
+        ) THEN 'AboveAverage'
+        WHEN UE.AvgScore < (
+            SELECT AVG(AvgScore) FROM UserEngagement
+        ) THEN 'BelowAverage'
+        ELSE 'Average'
+    END as EngagementLevel,
+    'Top User' as UserStatus,
+    (SELECT TOP 1 pt.Title FROM PostTrends pt WHERE pt.OwnerUserId = ue.UserId AND pt.PostType = 'Question' ORDER BY pt.Score DESC) as TopQuestion,
+    (SELECT TOP 1 pt.Title FROM PostTrends pt WHERE pt.OwnerUserId = ue.UserId AND pt.PostType = 'Answer' ORDER BY pt.Score DESC) as TopAnswer,
+    (SELECT COUNT(*) FROM PostTrends pt WHERE pt.OwnerUserId = ue.UserId AND pt.PostAgeCategory = 'Recent') as RecentPosts,
+    (SELECT COUNT(*) FROM PostTrends pt WHERE pt.OwnerUserId = ue.UserId AND pt.PostAgeCategory = 'LastMonth') as RecentMonthPosts,
+    (SELECT COUNT(*) FROM PostTrends pt WHERE pt.OwnerUserId = ue.UserId AND pt.DiscussionLevel = 'HighlyDiscussed') as HighlyDiscussedPosts,
+    (SELECT COUNT(*) FROM PostTrends pt WHERE pt.OwnerUserId = ue.UserId AND pt.FavoritingLevel = 'HighlyFavorited') as HighlyFavoritedPosts,
+    (SELECT COUNT(*) FROM PostTrends pt WHERE pt.OwnerUserId = ue.UserId AND pt.ScoreQuartile = 1) as TopQuartilePosts,
+    (SELECT COUNT(*) FROM PostTrends pt WHERE pt.OwnerUserId = ue.UserId AND pt.VoteCategory = 'HighlyVoted') as HighlyVotedPosts,
+    (
+        SELECT STRING_AGG(
+            CASE 
+                WHEN pt.VoteCategory = 'HighlyVoted' THEN 'HighlyVoted'
+                WHEN pt.VoteCategory = 'ModeratelyVoted' THEN 'ModeratelyVoted'
+                WHEN pt.VoteCategory = 'LowVoted' THEN 'LowVoted'
+                WHEN pt.VoteCategory = 'NonVoted' THEN 'NonVoted'
+                ELSE 'Unknown'
+            END + ':' + CAST(pt.Score AS VARCHAR(10)), ', '
+        ) FROM PostTrends pt WHERE pt.OwnerUserId = ue.UserId
+    ) as VoteDistribution,
+    (
+        SELECT STRING_AGG(
+            CASE 
+                WHEN pt.DiscussionLevel = 'HighlyDiscussed' THEN 'HighlyDiscussed'
+                WHEN pt.DiscussionLevel = 'ModeratelyDiscussed' THEN 'ModeratelyDiscussed'
+                WHEN pt.DiscussionLevel = 'LowDiscussed' THEN 'LowDiscussed'
+                WHEN pt.DiscussionLevel = 'NotDiscussed' THEN 'NotDiscussed'
+                ELSE 'Unknown'
+            END + ':' + CAST(pt.CommentCount AS VARCHAR(10)), ', '
+        ) FROM PostTrends pt WHERE pt.OwnerUserId = ue.UserId
+    ) as DiscussionDistribution,
+    (
+        SELECT STRING_AGG(
+            CASE 
+                WHEN pt.FavoritingLevel = 'HighlyFavorited' THEN 'HighlyFavorited'
+                WHEN pt.FavoritingLevel = 'ModeratelyFavorited' THEN 'ModeratelyFavorited'
+                WHEN pt.FavoritingLevel = 'LowFavorited' THEN 'LowFavorited'
+                WHEN pt.FavoritingLevel = 'NotFavorited' THEN 'NotFavorited'
+                ELSE 'Unknown'
+            END + ':' + CAST(pt.FavoriteCount AS VARCHAR(10)), ', '
+        ) FROM PostTrends pt WHERE pt.OwnerUserId = ue.UserId
+    ) as FavoriteDistribution,
+    (SELECT COUNT(*) FROM Posts ps WHERE ps.OwnerUserId = ue.UserId AND ps.PostTypeId = 1 AND ps.Score >= 100) as HighScoreQuestions,
+    (SELECT COUNT(*) FROM Posts ps WHERE ps.OwnerUserId = ue.UserId AND ps.PostTypeId = 2 AND ps.Score >= 100) as HighScoreAnswers,
+    (SELECT COUNT(*) FROM Posts ps WHERE ps.OwnerUserId = ue.UserId AND ps.PostTypeId = 1 AND ps.Score <= 0) as ZeroScoreQuestions,
+    (SELECT COUNT(*) FROM Posts ps WHERE ps.OwnerUserId = ue.UserId AND ps.PostTypeId = 2 AND ps.Score <= 0) as ZeroScoreAnswers,
+    (
+        SELECT COUNT(*) 
+        FROM Posts ps 
+        INNER JOIN Votes v ON ps.Id = v.PostId 
+        WHERE ps.OwnerUserId = ue.UserId 
+        AND v.VoteTypeId IN (2, 3) 
+        AND ps.PostTypeId = 1
+    ) as QuestionVotes,
+    (
+        SELECT COUNT(*) 
+        FROM Posts ps 
+        INNER JOIN Votes v ON ps.Id = v.PostId 
+        WHERE ps.OwnerUserId = ue.UserId 
+        AND v.VoteTypeId IN (2, 3) 
+        AND ps.PostTypeId = 2
+    ) as AnswerVotes,
+    (SELECT MAX(pa.Score) FROM PostTrends pa WHERE pa.OwnerUserId = ue.UserId) as MaxPostScore,
+    (SELECT MIN(pa.Score) FROM PostTrends pa WHERE pa.OwnerUserId = ue.UserId) as MinPostScore,
+    (SELECT AVG(pa.Score) FROM PostTrends pa WHERE pa.OwnerUserId = ue.UserId) as AvgUserPostScore,
+    (SELECT COUNT(pa.PostId) FROM PostTrends pa WHERE pa.OwnerUserId = ue.UserId AND pa.ViewCount >= 1000) as HighViewCountPosts,
+    (
+        SELECT TOP 1 pt.Title 
+        FROM PostTrends pt 
+        INNER JOIN (
+            SELECT TOP 1 OwnerUserId 
+            FROM PostTrends 
+            WHERE OwnerUserId = ue.UserId 
+            ORDER BY ViewCount DESC
+        ) temp ON temp.OwnerUserId = pt.OwnerUserId 
+        ORDER BY pt.ViewCount DESC
+    ) as HighestViewedPost
+FROM UserEngagement ue
+WHERE ue.PostCount > 0
+    AND (ue.QuestionCount > 0 OR ue.AnswerCount > 0)
+    AND ue.Reputation > 100
+ORDER BY ue.Reputation DESC, ue.TotalScore DESC
+OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY
+UNION
+SELECT 
+    -1 as UserId,
+    'Aggregated Statistics' as DisplayName,
+    0 as Reputation,
+    0 as Views,
+    0 as UpVotes,
+    0 as DownVotes,
+    SUM(ad.Count) as PostCount,
+    0 as CommentCount,
+    0 as BadgeCount,
+    0 as QuestionCount,
+    0 as AnswerCount,
+    AVG(ad.AvgScore) as AverageScorePerPost,
+    0 as BadgesPerPost,
+    0 as UpVotePercentage,
+    0 as PostsPerActiveDay,
+    AVG(ad.TotalViews) as AverageViewsPerPost,
+    'Overall' as EngagementLevel,
+    'Summary' as UserStatus,
+    NULL as TopQuestion,
+    NULL as TopAnswer,
+    NULL as RecentPosts,
+    NULL as RecentMonthPosts,
+    NULL as HighlyDiscussedPosts,
+    NULL as HighlyFavoritedPosts,
+    NULL as TopQuartilePosts,
+    NULL as HighlyVotedPosts,
+    NULL as VoteDistribution,
+    NULL as DiscussionDistribution,
+    NULL as FavoriteDistribution,
+    NULL as HighScoreQuestions,
+    NULL as HighScoreAnswers,
+    NULL as ZeroScoreQuestions,
+    NULL as ZeroScoreAnswers,
+    NULL as QuestionVotes,
+    NULL as AnswerVotes,
+    NULL as MaxPostScore,
+    NULL as MinPostScore,
+    NULL as AvgUserPostScore,
+    NULL as HighViewCountPosts,
+    NULL as HighestViewedPost
+FROM AggregatedData ad
+GROUP BY ad.Category
+HAVING COUNT(*) > 0
+ORDER BY 1;

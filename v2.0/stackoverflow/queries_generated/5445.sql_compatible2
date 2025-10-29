@@ -1,0 +1,132 @@
+WITH TopQuestions AS (
+  SELECT
+    p.Id AS QuestionId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    pt.Name AS PostTypeName,
+    COALESCE(u.Reputation, 0) AS OwnerReputation,
+    STRING_AGG(CASE WHEN v.VoteTypeId = 2 THEN 'Up' WHEN v.VoteTypeId = 3 THEN 'Down' END, ',') AS UpDownVotes,
+    MAX(CASE WHEN v.VoteTypeId = 2 THEN v.CreationDate END) AS LastUpvoteDate
+  FROM Posts p
+  LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  WHERE p.PostTypeId = 1
+    AND p.ClosedDate IS NULL
+  GROUP BY
+    p.Id, p.Title, p.Tags, p.CreationDate, p.Score, p.ViewCount,
+    p.OwnerUserId, p.LastActivityDate, p.CommentCount, p.AnswerCount,
+    p.FavoriteCount, pt.Name, u.Reputation
+),
+HighlyActive AS (
+  SELECT
+    tq.QuestionId,
+    tq.Title,
+    tq.Tags,
+    tq.CreationDate,
+    tq.Score,
+    tq.ViewCount,
+    tq.OwnerUserId,
+    tq.LastActivityDate,
+    tq.CommentCount,
+    tq.AnswerCount,
+    tq.FavoriteCount,
+    tq.PostTypeName,
+    tq.OwnerReputation,
+    tq.UpDownVotes,
+    tq.LastUpvoteDate,
+    ROW_NUMBER() OVER (
+      PARTITION BY tq.OwnerUserId
+      ORDER BY tq.LastActivityDate DESC, tq.ViewCount DESC, tq.Score DESC
+    ) AS rn_by_owner
+  FROM TopQuestions tq
+),
+Filtered AS (
+  SELECT *
+  FROM HighlyActive
+  WHERE rn_by_owner = 1
+),
+CrossStats AS (
+  SELECT
+    f.QuestionId,
+    f.Title,
+    f.Tags,
+    f.CreationDate,
+    f.Score,
+    f.ViewCount,
+    f.OwnerUserId,
+    f.LastActivityDate,
+    f.CommentCount,
+    f.AnswerCount,
+    f.FavoriteCount,
+    f.PostTypeName,
+    f.OwnerReputation,
+    f.UpDownVotes,
+    f.LastUpvoteDate,
+    COUNT(*) OVER () AS GlobalQuestionCount,
+    MAX(p2.LastActivityDate) OVER () AS GlobalLatestActivity
+  FROM Filtered f
+  LEFT JOIN Posts p2 ON p2.Id = f.QuestionId
+),
+Joined AS (
+  SELECT
+    cs.QuestionId,
+    cs.Title,
+    cs.Tags,
+    cs.CreationDate,
+    cs.Score,
+    cs.ViewCount,
+    cs.OwnerUserId,
+    cs.LastActivityDate,
+    cs.CommentCount,
+    cs.AnswerCount,
+    cs.FavoriteCount,
+    cs.PostTypeName,
+    cs.OwnerReputation,
+    cs.UpDownVotes,
+    cs.LastUpvoteDate,
+    cs.GlobalQuestionCount,
+    cs.GlobalLatestActivity
+  FROM CrossStats cs
+)
+SELECT
+  j.QuestionId,
+  j.Title,
+  j.Tags,
+  j.CreationDate,
+  j.Score,
+  j.ViewCount,
+  j.OwnerUserId,
+  j.LastActivityDate,
+  j.CommentCount,
+  j.AnswerCount,
+  j.FavoriteCount,
+  j.PostTypeName,
+  j.OwnerReputation,
+  j.UpDownVotes,
+  j.LastUpvoteDate,
+  j.GlobalQuestionCount,
+  j.GlobalLatestActivity,
+  TW.ExcerptPostId,
+  TW.Title AS TagWikiTitle,
+  TW.Id AS WikiPostId,
+  TAGW.Count AS TagCount
+FROM Joined j
+LEFT JOIN Tags TAGS_ALIAS ON TAGS_ALIAS.TagName = ANY(string_to_array(replace(replace(j.Tags, '<', ''), '>', ''), '><'))
+LEFT JOIN Posts TW ON TAGS_ALIAS.WikiPostId = TW.Id
+LEFT JOIN LATERAL (
+  SELECT t.Id, t.TagName, t.Count
+  FROM Tags t
+  WHERE t.TagName = ANY(string_to_array(replace(replace(j.Tags, '<', ''), '>', ''), '><'))
+  LIMIT 1
+) AS TAGW ON TRUE
+ORDER BY j.LastActivityDate DESC
+LIMIT 100;

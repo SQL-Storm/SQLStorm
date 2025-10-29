@@ -1,0 +1,189 @@
+-- {"query": "7620.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1903} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT c.Id) as Comments,
+        COUNT(DISTINCT b.Id) as Badges,
+        MAX(p.CreationDate) as LastPostDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, COUNT(DISTINCT p.Id) DESC) as ReputationRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostStats AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        COALESCE(p.AcceptedAnswerId, 0) as AcceptedAnswerId,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 AND EXISTS(
+                SELECT 1 FROM Posts a 
+                WHERE a.ParentId = p.Id AND a.Id = p.AcceptedAnswerId
+            ) THEN 'Has Accepted Answer'
+            WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN 'No Accepted Answer'
+            ELSE 'Not a Question'
+        END as AnswerStatus,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.ViewCount > 1000 THEN 'High Traffic'
+            WHEN p.PostTypeId = 1 AND p.ViewCount > 100 THEN 'Medium Traffic'
+            ELSE 'Low Traffic'
+        END as TrafficLevel,
+        DATEDIFF('day', p.CreationDate, cast('2024-10-01 12:34:56' as timestamp)) as AgeInDays
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) AND p.CreationDate >= '2020-01-01'
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            ELSE 'Rare'
+        END as PopularityLevel,
+        COALESCE(
+            (SELECT COUNT(*) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%'),
+            0
+        ) as AssociatedPosts
+    FROM Tags t
+    WHERE t.TagName IS NOT NULL
+),
+ComplexVotes AS (
+    SELECT 
+        v.PostId,
+        v.VoteTypeId,
+        v.UserId,
+        v.CreationDate,
+        v.BountyAmount,
+        CASE 
+            WHEN v.VoteTypeId = 2 THEN 'Upvote'
+            WHEN v.VoteTypeId = 3 THEN 'Downvote'
+            WHEN v.VoteTypeId = 8 THEN 'Bounty Start'
+            WHEN v.VoteTypeId = 9 THEN 'Bounty Close'
+            ELSE 'Other'
+        END as VoteTypeDescription,
+        ROW_NUMBER() OVER (PARTITION BY v.PostId ORDER BY v.CreationDate DESC) as VoteSequence,
+        LAG(v.CreationDate, 1) OVER (PARTITION BY v.PostId ORDER BY v.CreationDate) as PreviousVoteDate,
+        DATEDIFF('second', LAG(v.CreationDate, 1) OVER (PARTITION BY v.PostId ORDER BY v.CreationDate), v.CreationDate) as TimeBetweenVotes
+    FROM Votes v
+    WHERE v.VoteTypeId IN (2, 3, 8, 9) AND v.CreationDate >= '2020-01-01'
+),
+UserBadgeSummary AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        COUNT(DISTINCT b.Id) as TotalBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) as GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) as SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) as BronzeBadges,
+        STRING_AGG(CASE WHEN b.Class = 1 THEN b.Name END, ', ') as GoldBadgeNames,
+        STRING_AGG(CASE WHEN b.Class = 2 THEN b.Name END, ', ') as SilverBadgeNames,
+        STRING_AGG(CASE WHEN b.Class = 3 THEN b.Name END, ', ') as BronzeBadgeNames,
+        MAX(b.Date) as LastBadgeDate
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.DisplayName
+)
+SELECT 
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.Views,
+    uas.UpVotes,
+    uas.DownVotes,
+    uas.TotalPosts,
+    uas.Questions,
+    uas.Answers,
+    uas.Comments,
+    uas.Badges,
+    uas.LastPostDate,
+    uas.ReputationRank,
+    ps.PostId,
+    ps.Title,
+    ps.Score as PostScore,
+    ps.ViewCount,
+    ps.AnswerCount,
+    ps.CommentCount,
+    ps.FavoriteCount,
+    ps.CreationDate as PostCreationDate,
+    ps.PostTypeId,
+    ps.Tags,
+    ps.AcceptedAnswerId,
+    ps.AnswerStatus,
+    ps.TrafficLevel,
+    ps.AgeInDays,
+    ta.TagName,
+    ta.TagCount,
+    ta.PopularityLevel,
+    ta.AssociatedPosts,
+    cv.VoteTypeId,
+    cv.VoteTypeDescription,
+    cv.VoteSequence,
+    cv.TimeBetweenVotes,
+    ubs.TotalBadges,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    ubs.GoldBadgeNames,
+    ubs.SilverBadgeNames,
+    ubs.BronzeBadgeNames,
+    CASE 
+        WHEN uas.Reputation > 10000 AND uas.TotalPosts > 100 THEN 'Active Elite'
+        WHEN uas.Reputation > 5000 AND uas.TotalPosts > 50 THEN 'Active Contributor'
+        WHEN uas.Reputation > 1000 AND uas.TotalPosts > 10 THEN 'Regular Participant'
+        ELSE 'Casual User'
+    END as UserCategory,
+    CASE 
+        WHEN ps.Score > 100 AND ps.ViewCount > 1000 AND ps.PostTypeId = 1 THEN 'High Impact Question'
+        WHEN ps.Score > 10 AND ps.PostTypeId = 2 THEN 'Quality Answer'
+        WHEN ps.Score < -10 AND ps.PostTypeId = 1 THEN 'Low Quality Question'
+        ELSE 'Normal Post'
+    END as PostClassification,
+    DATEDIFF('day', ps.CreationDate, cv.CreationDate) as DaysSincePost,
+    ROW_NUMBER() OVER (PARTITION BY uas.UserId ORDER BY ps.CreationDate DESC) as PostSequence,
+    RANK() OVER (ORDER BY uas.Reputation DESC, ps.Score DESC) as OverallRank,
+    DENSE_RANK() OVER (ORDER BY uas.Reputation DESC) as ReputationDensityRank
+FROM UserActivityStats uas
+LEFT JOIN PostStats ps ON uas.UserId = ps.OwnerUserId
+LEFT JOIN TagAnalysis ta ON ps.Tags IS NOT NULL AND ps.Tags LIKE '%' || ta.TagName || '%'
+LEFT JOIN ComplexVotes cv ON ps.PostId = cv.PostId
+LEFT JOIN UserBadgeSummary ubs ON uas.UserId = ubs.UserId
+WHERE 
+    (ps.PostId IS NULL OR ps.Score > 0)
+    AND (cv.VoteTypeId IS NULL OR cv.VoteTypeId IN (2, 3))
+    AND (ta.TagName IS NULL OR ta.TagCount > 50)
+    AND (uas.Reputation > 500 OR uas.Badges > 0)
+    AND (
+        ps.CreationDate >= '2021-01-01' 
+        OR cv.CreationDate >= '2021-01-01'
+        OR ta.TagCount > 100
+    )
+    AND (
+        uas.TotalPosts > 0 
+        OR uas.Answers > 0 
+        OR uas.Questions > 0
+    )
+ORDER BY uas.Reputation DESC, ps.Score DESC, cv.CreationDate DESC;

@@ -1,0 +1,141 @@
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        coalesce(t.IsModeratorOnly, false) as IsModeratorOnly,
+        coalesce(t.IsRequired, false) as IsRequired,
+        0 as Level
+    from Tags t
+    where t.IsRequired = true
+
+    union all
+
+    select
+        child.Id,
+        child.TagName,
+        child.Count,
+        coalesce(child.IsModeratorOnly, false),
+        coalesce(child.IsRequired, false),
+        parent.Level + 1
+    from Tags child
+    inner join Posts p on p.Id = child.ExcerptPostId
+    inner join PostLinks pl on pl.PostId = p.Id
+    inner join Posts linkedPost on linkedPost.Id = pl.RelatedPostId
+    inner join Tags parent on parent.ExcerptPostId = linkedPost.Id
+    join RecursiveTagHierarchy parent_h on parent.Id = parent_h.Id
+    where child.IsRequired = false
+), UserScores as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        coalesce(sum(
+            case when v.VoteTypeId = 2 then 1
+                 when v.VoteTypeId = 3 then -1
+                 else 0
+            end), 0) as VoteScore,
+        coalesce(count(distinct b.Id), 0) as BadgeCount,
+        row_number() over (order by coalesce(sum(
+            case when v.VoteTypeId = 2 then 1
+                 when v.VoteTypeId = 3 then -1
+                 else 0
+            end), 0) desc, u.Reputation desc) as UserRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Votes v on v.PostId = p.Id
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+), PostTagExplode as (
+    select
+        p.Id as PostId,
+        unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><')) as Tag
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null and p.Tags <> ''
+), AnswerStats as (
+    select
+        a.ParentId as QuestionId,
+        count(*) filter (where a.Score >= 5) as HighScoreAnswers,
+        avg(a.Score) as AvgAnswerScore,
+        max(a.CreationDate) as LastAnswerDate
+    from Posts a
+    where a.PostTypeId = 2
+    group by a.ParentId
+), CloseReasonUsage as (
+    select
+        ph.Comment as CloseReasonId,
+        count(*) as CloseCount
+    from PostHistory ph
+    where ph.PostHistoryTypeId = 10 and ph.Comment is not null
+    group by ph.Comment
+), UserActivityWindows as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        count(*) over (partition by u.Id order by p.CreationDate range between interval '7 days' preceding and current row) as PostsLast7Days,
+        count(*) over (partition by u.Id order by p.CreationDate range between interval '30 days' preceding and current row) as PostsLast30Days,
+        lag(p.Score) over (partition by u.Id order by p.CreationDate) as PrevPostScore,
+        lead(p.Score) over (partition by u.Id order by p.CreationDate) as NextPostScore
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    where p.CreationDate is not null
+), RecentHighlyVotedQuestions as (
+    select
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        u.DisplayName as OwnerName,
+        array_agg(distinct pt.Tag) as Tags
+    from Posts p
+    join Users u on u.Id = p.OwnerUserId
+    join PostTagExplode pt on pt.PostId = p.Id
+    where p.PostTypeId = 1 and p.Score > 10 and p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '180 days'
+    group by p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, u.DisplayName
+)
+select 
+    qs.UserRank,
+    qs.DisplayName,
+    qs.VoteScore,
+    qs.BadgeCount,
+    us.PostsLast7Days,
+    us.PostsLast30Days,
+    coalesce(asw.HighScoreAnswers, 0) as HighScoreAnswers,
+    coalesce(asw.AvgAnswerScore, 0)::numeric(10,2) as AvgAnswerScore,
+    to_char(coalesce(asw.LastAnswerDate, timestamp '1970-01-01'), 'YYYY-MM-DD') as LastAnswerDate,
+    coalesce(cr.CloseCount,0) as CloseVotesCast,
+    array_to_string(array_agg(distinct rht.TagName), ', ') as AssociatedTags,
+    rht.Level as TagHierarchyLevel,
+    concat_ws(' | ', 
+        case when us.PrevPostScore is null then 'N/A' else us.PrevPostScore::text end,
+        case when p.Score is null then 'N/A' else p.Score::text end,
+        case when us.NextPostScore is null then 'N/A' else us.NextPostScore::text end
+    ) as NeighborPostScores,
+    rhq.Title as SampleHighlyVotedQuestionTitle,
+    rhq.Score as SampleQuestionScore,
+    array_to_string(rhq.Tags, ', ') as SampleQuestionTags
+from UserScores qs
+left join UserActivityWindows us on us.UserId = qs.UserId
+left join AnswerStats asw on asw.QuestionId = us.PostId
+left join CloseReasonUsage cr on cr.CloseReasonId = (
+    select CloseReasonId from PostHistory 
+    where UserId = qs.UserId and PostHistoryTypeId = 10
+    order by CreationDate desc
+    limit 1
+)
+left join RecursiveTagHierarchy rht on rht.TagName in (
+    select distinct pt.Tag from PostTagExplode pt join Posts p on p.Id = pt.PostId where p.OwnerUserId = qs.UserId
+)
+left join Posts p on p.Id = us.PostId
+left join RecentHighlyVotedQuestions rhq on rhq.OwnerName = qs.DisplayName
+where qs.UserRank <= 50
+group by 
+    qs.UserRank, qs.DisplayName, qs.VoteScore, qs.BadgeCount, us.PostsLast7Days, us.PostsLast30Days,
+    asw.HighScoreAnswers, asw.AvgAnswerScore, asw.LastAnswerDate, cr.CloseCount, rht.Level,
+    us.PrevPostScore, p.Score, us.NextPostScore,
+    rhq.Title, rhq.Score, rhq.Tags
+order by qs.UserRank;

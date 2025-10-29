@@ -1,0 +1,191 @@
+-- {"query": "2489.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1752} 
+with recursive TagHierarchy as (
+    select 
+        t.Id, 
+        t.TagName, 
+        array[t.TagName] as Ancestry,
+        1 as Depth
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+
+    union all
+
+    select 
+        t.Id, 
+        t.TagName, 
+        th.Ancestry || t.TagName,
+        th.Depth + 1
+    from Tags t
+    join TagHierarchy th on t.Id = th.Id + 1 -- simulate hierarchy with adjacent Ids
+    where th.Depth < 3
+),
+UserBadgeStats as (
+    select 
+        u.Id as UserId, u.DisplayName,
+        count(distinct b.Id) as TotalBadges,
+        count(distinct case when b.Class = 1 then b.Id end) as GoldBadges,
+        count(distinct case when b.Class = 2 then b.Id end) as SilverBadges,
+        count(distinct case when b.Class = 3 then b.Id end) as BronzeBadges,
+        max(b.Date) as LastBadgeDate,
+        coalesce(string_agg(distinct b.Name, ', '), '') as BadgeNames
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+TopPostsResponseTime as (
+    select
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.AcceptedAnswerId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.Tags,
+        u.DisplayName as Owner,
+        extract(epoch from coalesce(
+            (select min(a.CreationDate) from Posts a where a.ParentId = p.Id and a.PostTypeId = 2), 
+            p.CreationDate
+        ) - p.CreationDate) as SecondsToFirstAnswer
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId = 1
+      and p.AnswerCount > 0
+      and p.CreationDate > (cast('2024-10-01 12:34:56' as timestamp) - interval '180 day')
+),
+RankedAnswers as (
+    select 
+        a.Id,
+        a.ParentId as QuestionId,
+        a.Score,
+        a.CreationDate,
+        a.OwnerUserId,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as RankByScore,
+        rank() over (partition by a.ParentId order by a.CreationDate asc) as RankByDate
+    from Posts a
+    where a.PostTypeId = 2
+      and a.Score >= 0
+),
+AnswerScoresByUser as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        sum(a.Score) as TotalAnswerScore,
+        count(a.Id) as AnswerCount,
+        avg(a.Score) as AvgAnswerScore
+    from Users u
+    left join Posts a on a.OwnerUserId = u.Id and a.PostTypeId = 2
+    group by u.Id, u.DisplayName
+),
+DuplicateLinkCounts as (
+    select 
+        pl.PostId,
+        count(*) filter (where lt.Name = 'Duplicate') as DuplicateLinkCount
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    group by pl.PostId
+),
+QuestionCloseStats as (
+    select 
+        ph.PostId,
+        count(distinct ph.Id) as CloseVotesCount,
+        max(case when ph.PostHistoryTypeId = 10 then ph.Comment else null end) as CloseReasonJson,
+        max(ph.CreationDate) as LastCloseDate
+    from PostHistory ph
+    where ph.PostHistoryTypeId = 10
+    group by ph.PostId
+),
+QuestionsWithStats as (
+    select 
+        tp.Id as QuestionId,
+        tp.Title,
+        tp.CreationDate,
+        tp.Score,
+        tp.ViewCount,
+        tp.AnswerCount,
+        tp.SecondsToFirstAnswer,
+        tp.Tags,
+        tp.Owner,
+        ubs.TotalBadges,
+        ubs.GoldBadges,
+        ubs.SilverBadges,
+        ubs.BronzeBadges,
+        asc.TotalAnswerScore,
+        asc.AnswerCount as UserAnswerCount,
+        asc.AvgAnswerScore,
+        dlc.DuplicateLinkCount,
+        qcs.CloseVotesCount,
+        qcs.CloseReasonJson,
+        qcs.LastCloseDate
+    from TopPostsResponseTime tp
+    left join Users u on u.DisplayName = tp.Owner
+    left join UserBadgeStats ubs on ubs.UserId = u.Id
+    left join AnswerScoresByUser asc on asc.UserId = u.Id
+    left join DuplicateLinkCounts dlc on dlc.PostId = tp.Id
+    left join QuestionCloseStats qcs on qcs.PostId = tp.Id
+),
+FinalResults as (
+    select 
+        qws.QuestionId,
+        qws.Title,
+        qws.CreationDate,
+        qws.Score,
+        qws.ViewCount,
+        qws.AnswerCount,
+        qws.SecondsToFirstAnswer,
+        qws.Tags,
+        coalesce(qws.Owner, '(unknown)') as OwnerDisplayName,
+        coalesce(qws.TotalBadges, 0) as TotalBadges,
+        coalesce(qws.GoldBadges, 0) as GoldBadges,
+        coalesce(qws.SilverBadges, 0) as SilverBadges,
+        coalesce(qws.BronzeBadges, 0) as BronzeBadges,
+        coalesce(qws.TotalAnswerScore, 0) as UserTotalAnswerScore,
+        coalesce(qws.UserAnswerCount, 0) as UserAnswerCount,
+        round(coalesce(qws.AvgAnswerScore, 0)::numeric, 2) as UserAvgAnswerScore,
+        coalesce(qws.DuplicateLinkCount, 0) as NumberOfDuplicatesLinked,
+        coalesce(qws.CloseVotesCount, 0) as NumberOfCloseVotes,
+        qws.CloseReasonJson,
+        lead(qws.Score) over (order by qws.Score desc) as NextHigherScore,
+        lag(qws.Score) over (order by qws.Score desc) as PreviousLowerScore,
+        case 
+            when qws.Score >= 100 then 'Excellent'
+            when qws.Score >= 50 then 'Good'
+            when qws.Score >= 10 then 'Average'
+            else 'Low'
+        end as ScoreCategory
+    from QuestionsWithStats qws
+)
+select 
+    fr.QuestionId,
+    fr.Title,
+    fr.OwnerDisplayName,
+    fr.CreationDate,
+    fr.Score,
+    fr.ScoreCategory,
+    fr.ViewCount,
+    fr.AnswerCount,
+    fr.SecondsToFirstAnswer,
+    string_agg(distinct th.TagName, ', ') filter (where th.TagName is not null) as TagsExtracted,
+    fr.TotalBadges,
+    fr.GoldBadges,
+    fr.SilverBadges,
+    fr.BronzeBadges,
+    fr.UserTotalAnswerScore,
+    fr.UserAnswerCount,
+    fr.UserAvgAnswerScore,
+    fr.NumberOfDuplicatesLinked,
+    fr.NumberOfCloseVotes,
+    fr.CloseReasonJson,
+    coalesce(fr.NextHigherScore, 0) as NextHigherScore,
+    coalesce(fr.PreviousLowerScore, 0) as PreviousLowerScore
+from FinalResults fr
+left join LATERAL (
+    select unnest(string_to_array(replace(replace(fr.Tags, '><', ','), '<',''),',')) as TagName
+) th on true
+where fr.CreationDate >= cast('2024-10-01' as date) - interval '90 day'
+group by 
+    fr.QuestionId, fr.Title, fr.OwnerDisplayName, fr.CreationDate, fr.Score, fr.ScoreCategory, fr.ViewCount, fr.AnswerCount, fr.SecondsToFirstAnswer,
+    fr.TotalBadges, fr.GoldBadges, fr.SilverBadges, fr.BronzeBadges, fr.UserTotalAnswerScore, fr.UserAnswerCount, fr.UserAvgAnswerScore,
+    fr.NumberOfDuplicatesLinked, fr.NumberOfCloseVotes, fr.CloseReasonJson, fr.NextHigherScore, fr.PreviousLowerScore
+order by fr.Score desc, fr.ViewCount desc
+limit 50;

@@ -1,0 +1,231 @@
+WITH UserBaseMetrics AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.UpVotes,
+        U.DownVotes,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        SUM(P.Score) AS TotalPostScore,
+        SUM(C.Score) AS TotalCommentScore
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.UpVotes, U.DownVotes
+),
+PostRevisionHistory AS (
+    SELECT
+        PH.PostId,
+        PH.UserId AS EditorUserId,
+        PH.CreationDate AS RevisionDate,
+        PH.PostHistoryTypeId,
+        LAG(PH.CreationDate, 1, PH.CreationDate) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) AS PreviousRevisionDate,
+        (EXTRACT(EPOCH FROM (PH.CreationDate - LAG(PH.CreationDate, 1, PH.CreationDate) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate))) / 3600) AS TimeSincePrevEditHours,
+        ROW_NUMBER() OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate DESC) AS rn_latest_edit,
+        ROW_NUMBER() OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate ASC) AS rn_first_edit
+    FROM PostHistory PH
+    WHERE PH.PostHistoryTypeId IN (4, 5, 6)
+),
+AggregatedPostData AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.Tags,
+        P.ClosedDate,
+        COUNT(DISTINCT C.Id) AS ActualCommentCount,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvoteCount,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvoteCount,
+        MAX(PRH.TimeSincePrevEditHours) AS MaxEditIntervalHours,
+        COUNT(PRH.PostHistoryTypeId) AS TotalEdits,
+        AVG(PRH.TimeSincePrevEditHours) AS AvgEditIntervalHours,
+        (SELECT COUNT(DISTINCT PL.RelatedPostId) FROM PostLinks PL WHERE PL.PostId = P.Id AND PL.LinkTypeId = 1) AS LinkedPostCount,
+        (SELECT COUNT(DISTINCT PL.PostId) FROM PostLinks PL WHERE PL.RelatedPostId = P.Id AND PL.LinkTypeId = 3) AS DuplicateOfCount,
+        (SELECT MAX(PHX.CreationDate) FROM PostHistory PHX WHERE PHX.PostId = P.Id AND PHX.PostHistoryTypeId IN (10, 11, 12, 13)) AS LastModerationActionDate
+    FROM Posts P
+    LEFT JOIN Comments C ON P.Id = C.PostId
+    LEFT JOIN Votes V ON P.Id = V.PostId
+    LEFT JOIN PostRevisionHistory PRH ON P.Id = PRH.PostId
+    GROUP BY
+        P.Id, P.PostTypeId, P.OwnerUserId, P.CreationDate, P.Score, P.ViewCount, P.AnswerCount,
+        P.CommentCount, P.FavoriteCount, P.Tags, P.ClosedDate
+),
+TagAnalysis AS (
+    SELECT
+        UPPER(TRIM(SUBSTRING(t.tag FROM 1 FOR 50))) AS TagName,
+        COUNT(DISTINCT P.Id) AS PostsPerTag,
+        AVG(P.Score) AS AvgScorePerTag,
+        SUM(P.ViewCount) AS TotalViewsPerTag,
+        MAX(P.CreationDate) AS LastTagActivity
+    FROM Posts P,
+         LATERAL (
+           SELECT unnest(string_to_array(SUBSTRING(P.Tags FROM 2 FOR (char_length(P.Tags)-2)), '><')) AS tag
+         ) t
+    WHERE P.Tags IS NOT NULL AND char_length(P.Tags) > 2
+    GROUP BY UPPER(TRIM(SUBSTRING(t.tag FROM 1 FOR 50)))
+),
+UserEngagementSummary AS (
+    SELECT
+        UBM.UserId,
+        UBM.DisplayName,
+        UBM.Reputation,
+        UBM.UserCreationDate,
+        UBM.LastAccessDate,
+        UBM.UpVotes,
+        UBM.DownVotes,
+        UBM.TotalPosts,
+        UBM.QuestionCount,
+        UBM.AnswerCount,
+        UBM.TotalComments,
+        UBM.TotalPostScore,
+        UBM.TotalCommentScore,
+        (UBM.UpVotes + UBM.DownVotes) AS TotalUserVotes,
+        (UBM.TotalPosts * 0.5 + UBM.TotalComments * 0.2 + COALESCE(UBM.TotalPostScore, 0) * 0.8 + COALESCE(UBM.TotalCommentScore, 0) * 0.1) AS ActivityWeight,
+        RANK() OVER (ORDER BY (COALESCE(UBM.TotalPostScore, 0) * 0.7 + COALESCE(UBM.TotalComments, 0) * 0.3 + UBM.Reputation * 0.5) DESC) AS UserEngagementRank
+    FROM UserBaseMetrics UBM
+),
+PostQualityRank AS (
+    SELECT
+        APD.PostId,
+        APD.PostTypeId,
+        APD.OwnerUserId,
+        APD.PostCreationDate,
+        APD.PostScore,
+        APD.ViewCount,
+        APD.AnswerCount,
+        APD.CommentCount,
+        APD.FavoriteCount,
+        APD.Tags,
+        APD.ClosedDate,
+        APD.UpvoteCount,
+        APD.DownvoteCount,
+        APD.MaxEditIntervalHours,
+        APD.TotalEdits,
+        APD.AvgEditIntervalHours,
+        APD.LinkedPostCount,
+        APD.DuplicateOfCount,
+        APD.LastModerationActionDate,
+        COALESCE(APD.PostScore, 0) * 1.5 + COALESCE(APD.FavoriteCount, 0) * 2 + COALESCE(APD.AnswerCount, 0) * 1.2 + COALESCE(APD.CommentCount, 0) * 0.8 AS PostQualityScore,
+        DENSE_RANK() OVER (ORDER BY (COALESCE(APD.PostScore, 0) * 1.5 + COALESCE(APD.FavoriteCount, 0) * 2 + COALESCE(APD.AnswerCount, 0) * 1.2 + COALESCE(APD.CommentCount, 0) * 0.8) DESC, APD.PostId ASC) AS PostGlobalQualityRank,
+        LAG(APD.PostScore, 1, 0) OVER (PARTITION BY APD.OwnerUserId ORDER BY APD.PostCreationDate) AS PrevPostScoreByOwner,
+        (SELECT COUNT(DISTINCT B.Id) FROM Badges B WHERE B.UserId = APD.OwnerUserId AND B.Date BETWEEN APD.PostCreationDate - INTERVAL '30 days' AND APD.PostCreationDate) AS BadgesEarnedAroundPostCreation,
+        PH_LatestEdit.EditorUserId AS LastEditorUserId,
+        U_EDITOR.DisplayName AS LastEditorDisplayName,
+        U_EDITOR.Reputation AS LastEditorReputation
+    FROM AggregatedPostData APD
+    LEFT JOIN PostRevisionHistory PH_LatestEdit ON APD.PostId = PH_LatestEdit.PostId AND PH_LatestEdit.rn_latest_edit = 1
+    LEFT JOIN Users U_EDITOR ON PH_LatestEdit.EditorUserId = U_EDITOR.Id
+),
+HighlyActiveUsers AS (
+    SELECT
+        UES.UserId,
+        UES.DisplayName,
+        UES.Reputation,
+        UES.TotalPosts,
+        UES.TotalComments,
+        (UES.TotalPosts + UES.TotalComments) AS TotalContributionsInPeriod,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM UserEngagementSummary UES
+    LEFT JOIN Badges B ON UES.UserId = B.UserId
+    WHERE UES.LastAccessDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+      AND UES.Reputation > 5000
+      AND UES.TotalPosts > 10
+    GROUP BY UES.UserId, UES.DisplayName, UES.Reputation, UES.TotalPosts, UES.TotalComments
+),
+ModerationFocusPosts AS (
+    SELECT
+        PQR.PostId,
+        PQR.OwnerUserId,
+        PQR.PostCreationDate,
+        PQR.PostScore,
+        PQR.TotalEdits,
+        PQR.ClosedDate,
+        (CASE WHEN PQR.ClosedDate IS NOT NULL AND COALESCE(PQR.PostScore, 0) < 0 THEN 'Closed & Negative Score'
+              WHEN PQR.TotalEdits > 5 AND COALESCE(PQR.AvgEditIntervalHours, 0) < 24 AND PQR.PostTypeId = 1 THEN 'Rapidly Edited Question'
+              WHEN PQR.LastModerationActionDate IS NOT NULL AND PQR.LastModerationActionDate > PQR.PostCreationDate + INTERVAL '1 year' THEN 'Old Post Moderated'
+              ELSE 'Other Focus' END) AS FocusReason,
+        PQR.PostQualityScore,
+        PQR.AvgEditIntervalHours,
+        PQR.PostTypeId
+    FROM PostQualityRank PQR
+    WHERE PQR.ClosedDate IS NOT NULL
+       OR (PQR.TotalEdits > 5 AND PQR.AvgEditIntervalHours < 24 AND COALESCE(PQR.PostScore, 0) < 5 AND PQR.PostTypeId = 1)
+       OR (PQR.LastModerationActionDate IS NOT NULL AND PQR.LastModerationActionDate > PQR.PostCreationDate + INTERVAL '1 year')
+),
+UserPostTags AS (
+    SELECT DISTINCT
+        P.OwnerUserId AS UserId,
+        UPPER(TRIM(SUBSTRING(t.tag FROM 1 FOR 50))) AS TagName
+    FROM Posts P,
+         LATERAL (
+           SELECT unnest(string_to_array(SUBSTRING(P.Tags FROM 2 FOR (char_length(P.Tags)-2)), '><')) AS tag
+         ) t
+    WHERE P.OwnerUserId IS NOT NULL AND P.Tags IS NOT NULL AND char_length(P.Tags) > 2
+)
+SELECT
+    COALESCE(UES.UserId, HA.UserId) AS UnifiedUserId,
+    COALESCE(UES.DisplayName, HA.DisplayName) AS UserName,
+    COALESCE(UES.Reputation, HA.Reputation) AS CurrentReputation,
+    UES.UserEngagementRank,
+    COALESCE(HA.TotalContributionsInPeriod, 0) AS RecentContributions,
+    COALESCE(HA.GoldBadges, 0) AS UserGoldBadges,
+    COALESCE(HA.SilverBadges, 0) AS UserSilverBadges,
+    COALESCE(HA.BronzeBadges, 0) AS UserBronzeBadges,
+    COUNT(DISTINCT PQR.PostId) AS TotalPostsByThisUser,
+    SUM(CASE WHEN PQR.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsByThisUser,
+    SUM(CASE WHEN PQR.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersByThisUser,
+    AVG(PQR.PostQualityScore) AS AvgPostQualityByUser,
+    MAX(PQR.PostQualityScore) AS MaxPostQualityByUser,
+    (
+        SELECT AVG(TA.AvgScorePerTag)
+        FROM TagAnalysis TA
+        JOIN UserPostTags UPT ON TA.TagName = UPT.TagName
+        WHERE UPT.UserId = COALESCE(UES.UserId, HA.UserId)
+    ) AS AvgTagPerformanceForUserPosts,
+    COUNT(DISTINCT MFP.PostId) FILTER (WHERE MFP.FocusReason = 'Closed & Negative Score') AS ClosedNegativePostsCount,
+    COUNT(DISTINCT MFP.PostId) FILTER (WHERE MFP.FocusReason = 'Rapidly Edited Question') AS RapidlyEditedQuestionsCount,
+    (SELECT COUNT(DISTINCT B.Id) FROM Badges B WHERE B.UserId = COALESCE(UES.UserId, HA.UserId) AND B.Class = 1 AND B.TagBased = TRUE) AS TagBasedGoldBadges,
+    (SELECT MAX(U.LastAccessDate) FROM Users U WHERE U.Id = COALESCE(UES.UserId, HA.UserId)) AS LastActivityDateFromUsersTable,
+    SUM(PQR.PostScore) FILTER (WHERE PQR.PostCreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year') AS RecentPostScore,
+    AVG(PQR.AvgEditIntervalHours) FILTER (WHERE PQR.TotalEdits > 1) AS AvgEditIntervalForOwnedPosts,
+    COALESCE(UES.UpVotes, 0) - COALESCE(UES.DownVotes, 0) AS NetUserVotes,
+    SUM(CASE WHEN PQR.LastEditorUserId IS NOT NULL AND PQR.LastEditorUserId != COALESCE(UES.UserId, HA.UserId) THEN 1 ELSE 0 END) AS EditedByOthersCount
+FROM UserEngagementSummary UES
+FULL OUTER JOIN HighlyActiveUsers HA ON UES.UserId = HA.UserId
+LEFT JOIN PostQualityRank PQR ON COALESCE(UES.UserId, HA.UserId) = PQR.OwnerUserId
+LEFT JOIN ModerationFocusPosts MFP ON PQR.PostId = MFP.PostId
+WHERE COALESCE(UES.Reputation, HA.Reputation) IS NOT NULL
+  AND (PQR.PostCreationDate IS NULL OR PQR.PostCreationDate >= DATE '2019-01-01')
+GROUP BY
+    COALESCE(UES.UserId, HA.UserId),
+    COALESCE(UES.DisplayName, HA.DisplayName),
+    COALESCE(UES.Reputation, HA.Reputation),
+    UES.UserEngagementRank,
+    HA.TotalContributionsInPeriod,
+    HA.GoldBadges,
+    HA.SilverBadges,
+    HA.BronzeBadges,
+    UES.UserId,
+    HA.UserId,
+    UES.DisplayName,
+    HA.DisplayName,
+    UES.Reputation,
+    HA.Reputation
+HAVING
+    COUNT(DISTINCT PQR.PostId) > 0 OR COALESCE(HA.TotalContributionsInPeriod, 0) > 0
+ORDER BY
+    CurrentReputation DESC, UserEngagementRank ASC
+LIMIT 1000;

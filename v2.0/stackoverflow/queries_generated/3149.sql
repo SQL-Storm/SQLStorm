@@ -1,0 +1,130 @@
+-- {"query": "3149.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2227} 
+
+WITH UserStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(b.Id)                                             AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END)           AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END)           AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END)           AS BronzeBadges,
+        AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL)       AS AvgPostScore,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1)            AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2)            AS AnswerCount,
+        MAX(p.LastActivityDate)                                AS LastPostActivity,
+        MAX(v.CreationDate)                                    AS LastVoteDate,
+        MAX(c.CreationDate)                                    AS LastCommentDate
+    FROM Users u
+    LEFT JOIN Badges b      ON b.UserId = u.Id
+    LEFT JOIN Posts p       ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v       ON v.UserId = u.Id
+    LEFT JOIN Comments c    ON c.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopUsers AS (
+    SELECT
+        *,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, TotalBadges DESC) AS rn
+    FROM UserStats
+    WHERE Reputation > 10000
+),
+TagInfo AS (
+    SELECT
+        t.TagName,
+        t.Count                                          AS TagUsage,
+        COALESCE(e.Title, w.Title)                       AS TagTitle,
+        COALESCE(LENGTH(e.Body), LENGTH(w.Body))          AS TagBodyLength,
+        CASE WHEN t.IsModeratorOnly = 1 THEN 'ModOnly' ELSE 'Public' END AS Visibility
+    FROM Tags t
+    LEFT JOIN Posts e ON e.Id = t.ExcerptPostId
+    LEFT JOIN Posts w ON w.Id = t.WikiPostId
+    WHERE t.Count > 5000
+),
+RecentClosedPosts AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        ph.CreationDate                                 AS ClosedDate,
+        ph.Comment                                      AS CloseReasonId,
+        ROW_NUMBER() OVER (PARTITION BY ph.Comment ORDER BY ph.CreationDate DESC) AS rn_reason
+    FROM Posts p
+    JOIN PostHistory ph ON ph.PostId = p.Id
+    WHERE ph.PostHistoryTypeId = 10                      -- Post Closed
+      AND ph.CreationDate > CURRENT_DATE - INTERVAL '30 days'
+),
+AggregatedCloseReasons AS (
+    SELECT
+        CloseReasonId,
+        COUNT(*)                                          AS ClosedCount,
+        STRING_AGG(DISTINCT p.Tags, ',')                  AS SampleTags
+    FROM RecentClosedPosts rcp
+    JOIN Posts p ON p.Id = rcp.Id
+    GROUP BY CloseReasonId
+)
+SELECT
+    tu.Id,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.TotalBadges,
+    tu.GoldBadges,
+    tu.SilverBadges,
+    tu.BronzeBadges,
+    ROUND(tu.AvgPostScore, 2)                           AS AvgScore,
+    tu.QuestionCount,
+    tu.AnswerCount,
+    tu.LastPostActivity,
+    tu.LastVoteDate,
+    tu.LastCommentDate,
+    ti.TagName,
+    ti.TagUsage,
+    ti.Visibility,
+    acr.CloseReasonId,
+    acr.ClosedCount,
+    acr.SampleTags
+FROM TopUsers tu
+LEFT JOIN LATERAL (
+    SELECT
+        t.TagName,
+        t.TagUsage,
+        t.Visibility
+    FROM TagInfo t
+    WHERE t.TagUsage > (SELECT AVG(TagUsage) FROM TagInfo)
+    ORDER BY t.TagUsage DESC
+    LIMIT 1
+) ti ON TRUE
+LEFT JOIN AggregatedCloseReasons acr
+    ON acr.CloseReasonId = (
+        SELECT CAST(rp.CloseReasonId AS VARCHAR)
+        FROM RecentClosedPosts rp
+        WHERE rp.rn_reason = 1
+        ORDER BY rp.ClosedDate DESC
+        LIMIT 1
+    )
+WHERE tu.rn <= 50
+ORDER BY tu.Reputation DESC, tu.TotalBadges DESC
+
+UNION ALL
+
+SELECT
+    NULL                      AS Id,
+    'Summary'                 AS DisplayName,
+    NULL                      AS Reputation,
+    SUM(TotalBadges)           AS TotalBadges,
+    SUM(GoldBadges)            AS GoldBadges,
+    SUM(SilverBadges)          AS SilverBadges,
+    SUM(BronzeBadges)          AS BronzeBadges,
+    NULL                       AS AvgScore,
+    NULL                       AS QuestionCount,
+    NULL                       AS AnswerCount,
+    MAX(LastPostActivity)     AS LastPostActivity,
+    MAX(LastVoteDate)         AS LastVoteDate,
+    MAX(LastCommentDate)      AS LastCommentDate,
+    NULL                       AS TagName,
+    NULL                       AS TagUsage,
+    NULL                       AS Visibility,
+    NULL                       AS CloseReasonId,
+    NULL                       AS ClosedCount,
+    NULL                       AS SampleTags
+FROM TopUsers;

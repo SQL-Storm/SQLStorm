@@ -1,0 +1,287 @@
+WITH RecentHighRepUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(p.Score) AS TotalPostScore,
+        COUNT(DISTINCT b.Id) AS TotalBadges
+    FROM Users u
+    INNER JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE
+        u.Reputation >= 5000
+        AND u.LastAccessDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6 months'
+        AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.UpVotes, u.DownVotes
+    HAVING
+        COUNT(DISTINCT p.Id) >= 50
+),
+QuestionBase AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title AS QuestionTitle,
+        q.CreationDate AS QuestionCreationDate,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        q.FavoriteCount,
+        q.LastActivityDate,
+        q.OwnerUserId AS QuestionOwnerId,
+        COALESCE(u_owner.DisplayName, q.OwnerDisplayName, 'Community') AS QuestionOwnerDisplayName,
+        q.LastEditorUserId,
+        u_editor.DisplayName AS LastEditorDisplayName,
+        u_editor.Reputation AS LastEditorReputation,
+        q.LastEditDate,
+        q.Tags,
+        q.ClosedDate,
+        q.CommunityOwnedDate,
+        q.Body AS QuestionBody,
+        q.AcceptedAnswerId
+    FROM Posts q
+    INNER JOIN PostTypes pt ON q.PostTypeId = pt.Id AND pt.Id = 1
+    LEFT JOIN Users u_owner ON q.OwnerUserId = u_owner.Id
+    LEFT JOIN Users u_editor ON q.LastEditorUserId = u_editor.Id
+    WHERE
+        q.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '3 years'
+),
+QuestionClosureInfo AS (
+    SELECT
+        qb.QuestionId,
+        qb.QuestionCreationDate,
+        qb.ClosedDate,
+        qb.LastEditDate,
+        ph_closed.CreationDate AS ClosureHistoryDate,
+        COALESCE(
+            crt.Name,
+            CASE
+                WHEN ph_closed.Comment IN ('1','2','3','4','7','10','20') THEN
+                    CASE ph_closed.Comment
+                        WHEN '1' THEN 'Exact Duplicate (Old)'
+                        WHEN '2' THEN 'Off-topic (Old)'
+                        WHEN '3' THEN 'Subjective and argumentative (Old)'
+                        WHEN '4' THEN 'Not a real question (Old)'
+                        WHEN '7' THEN 'Too localized (Old)'
+                        WHEN '10' THEN 'General reference (Old)'
+                        WHEN '20' THEN 'Noise or pointless (Old)'
+                        ELSE 'Unknown Old Reason'
+                    END
+                WHEN ph_closed.Comment IS NOT NULL AND LENGTH(ph_closed.Comment) > 0 THEN 'Custom/Other Close Reason'
+                ELSE NULL
+            END
+        ) AS CloseReasonTypeName,
+        ph_closed.Comment AS CloseReasonCommentRaw,
+        (CASE
+            WHEN ph_closed.PostHistoryTypeId = 10 AND ph_closed.Text LIKE '%"OriginalQuestionIds":[%' THEN
+                SUBSTRING(
+                    ph_closed.Text,
+                    POSITION('"OriginalQuestionIds":[' IN ph_closed.Text) + CHAR_LENGTH('"OriginalQuestionIds":['),
+                    POSITION(']' IN ph_closed.Text) - (POSITION('"OriginalQuestionIds":[' IN ph_closed.Text) + CHAR_LENGTH('"OriginalQuestionIds":['))
+            ELSE NULL
+        END) AS DuplicateOriginalQuestionIds,
+        CASE WHEN EXISTS (SELECT 1 FROM PostHistory phr WHERE phr.PostId = qb.QuestionId AND phr.PostHistoryTypeId = 11) THEN 1 ELSE 0 END AS WasReopened
+    FROM QuestionBase qb
+    LEFT JOIN PostHistory ph_closed ON qb.QuestionId = ph_closed.PostId
+        AND ph_closed.PostHistoryTypeId = 10
+        AND ph_closed.CreationDate = (
+            SELECT MAX(ph_sub.CreationDate)
+            FROM PostHistory ph_sub
+            WHERE ph_sub.PostId = qb.QuestionId AND ph_sub.PostHistoryTypeId = 10
+        )
+    LEFT JOIN CloseReasonTypes crt ON
+        (CASE WHEN ph_closed.Comment ~ '^[0-9]+$' THEN CAST(ph_closed.Comment AS SMALLINT) ELSE NULL END) = crt.Id
+),
+AnswerAggregates AS (
+    SELECT
+        a.ParentId AS QuestionId,
+        COUNT(a.Id) AS TotalAnswers,
+        SUM(a.Score) AS TotalAnswerScore,
+        AVG(a.Score) AS AverageAnswerScore,
+        MAX(a.CreationDate) AS LatestAnswerDate,
+        SUM(CASE WHEN a.Id = qb.AcceptedAnswerId THEN 1 ELSE 0 END) AS AcceptedAnswersCount,
+        MAX(CASE WHEN a.Id = qb.AcceptedAnswerId AND a.OwnerUserId = qb.QuestionOwnerId THEN 1 ELSE 0 END) AS HasSelfAcceptedAnswer
+    FROM Posts a
+    INNER JOIN QuestionBase qb ON a.ParentId = qb.QuestionId
+    WHERE a.PostTypeId = 2
+    GROUP BY a.ParentId
+),
+PostVoteAggregates AS (
+    SELECT
+        v.PostId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesCount,
+        SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoriteCountFromVotes,
+        SUM(COALESCE(v.BountyAmount, 0)) AS TotalBountyAmount,
+        COUNT(DISTINCT v.UserId) AS UniqueVoters
+    FROM Votes v
+    WHERE v.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '3 years'
+    GROUP BY v.PostId
+),
+UserActivityRank AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        (u.UpVotes + u.DownVotes) AS TotalVoteActivity,
+        NTILE(10) OVER (ORDER BY (u.UpVotes + u.DownVotes) DESC) AS VoteActivityDecile
+    FROM Users u
+    WHERE u.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '5 years'
+),
+BadgeSummary AS (
+    SELECT
+        b.UserId,
+        COUNT(b.Id) AS UserBadgeCount,
+        SUM(CASE b.Class WHEN 1 THEN 3 WHEN 2 THEN 2 WHEN 3 THEN 1 ELSE 0 END) AS BadgeClassScore,
+        STRING_AGG(DISTINCT b.Name, '; ' ORDER BY b.Name) AS AllBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+TopQuestionTags AS (
+    SELECT
+        t.TagName
+    FROM Tags t
+    ORDER BY t.Count DESC
+    LIMIT 100
+)
+SELECT
+    qb.QuestionId,
+    qb.QuestionTitle,
+    qb.QuestionOwnerDisplayName,
+    rhu.Reputation AS QuestionOwnerReputation,
+    qb.QuestionCreationDate,
+    qb.QuestionScore,
+    qb.ViewCount,
+    qb.AnswerCount,
+    aa.TotalAnswers,
+    aa.AverageAnswerScore,
+    CASE WHEN aa.HasSelfAcceptedAnswer = 1 THEN TRUE ELSE FALSE END AS HasSelfAcceptedAnswer,
+    pva_q.UpVotesCount AS QuestionUpVotes,
+    pva_q.DownVotesCount AS QuestionDownVotes,
+    pva_q.TotalBountyAmount AS QuestionBountyAmount,
+    pva_q.FavoriteCountFromVotes,
+    qb.LastEditorDisplayName,
+    qb.LastEditorReputation,
+    qb.LastEditDate,
+    qci.ClosedDate,
+    qci.CloseReasonTypeName,
+    CASE WHEN qci.WasReopened = 1 THEN TRUE ELSE FALSE END AS WasReopened,
+    SUBSTRING(
+        COALESCE(
+            REPLACE(REPLACE(REPLACE(qb.QuestionBody, '<p>', ''), '</p>', ''), '<code>', ''),
+            'No Body Text'
+        ), 1, 200
+    ) AS QuestionBodyCleanExcerpt,
+    RANK() OVER (
+        PARTITION BY EXTRACT(YEAR FROM qb.QuestionCreationDate)
+        ORDER BY qb.QuestionScore * (1 + EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - qb.QuestionCreationDate)) / (3600 * 24 * 30)) DESC
+    ) AS QuestionActivityRank,
+    (qb.QuestionScore * 1.0 / GREATEST(1, qb.ViewCount)) * (1 + (aa.TotalAnswers * 0.1)) * (CASE WHEN qb.LastActivityDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '3 months' THEN 1.2 ELSE 1 END) AS CalculatedImpactScore,
+    (
+        SELECT STRING_AGG(tag, ', ')
+        FROM (
+            SELECT UNNEST_TAG AS tag
+            FROM (SELECT regexp_split_to_table(SUBSTRING(qb.Tags FROM 2 FOR CHAR_LENGTH(qb.Tags) - 2), '><') AS UNNEST_TAG) t
+            WHERE t.UNNEST_TAG IN (SELECT TagName FROM TopQuestionTags)
+        ) tag_list
+    ) AS RelevantTopTags,
+    (
+        SELECT COUNT(b2.Id)
+        FROM Badges b2
+        JOIN (SELECT regexp_split_to_table(SUBSTRING(qb.Tags FROM 2 FOR CHAR_LENGTH(qb.Tags) - 2), '><') AS Q_TAG) qt ON b2.Name = qt.Q_TAG
+        WHERE b2.UserId = qb.QuestionOwnerId AND b2.Class = 1 AND b2.TagBased = TRUE
+    ) AS OwnerTagBasedSpecificBadges,
+    ua.VoteActivityDecile AS QuestionOwnerVoteDecile,
+    bs.BadgeClassScore AS QuestionOwnerBadgeScore,
+    'Active/High-Impact' AS QueryCategory
+FROM QuestionBase qb
+INNER JOIN AnswerAggregates aa ON qb.QuestionId = aa.QuestionId
+LEFT JOIN PostVoteAggregates pva_q ON qb.QuestionId = pva_q.PostId
+LEFT JOIN RecentHighRepUsers rhu ON qb.QuestionOwnerId = rhu.UserId
+LEFT JOIN QuestionClosureInfo qci ON qb.QuestionId = qci.QuestionId
+LEFT JOIN UserActivityRank ua ON qb.QuestionOwnerId = ua.UserId
+LEFT JOIN BadgeSummary bs ON qb.QuestionOwnerId = bs.UserId
+WHERE
+    qb.QuestionScore >= 10
+    AND qb.ViewCount >= 500
+    AND qb.ClosedDate IS NULL
+    AND qb.LastActivityDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6 months'
+    AND (qb.Tags ILIKE '%<sql>%' OR qb.Tags ILIKE '%<database>%')
+    AND aa.TotalAnswers >= 2
+    AND aa.AverageAnswerScore >= 5
+
+UNION ALL
+
+SELECT
+    qb.QuestionId,
+    qb.QuestionTitle,
+    qb.QuestionOwnerDisplayName,
+    rhu.Reputation AS QuestionOwnerReputation,
+    qb.QuestionCreationDate,
+    qb.QuestionScore,
+    qb.ViewCount,
+    qb.AnswerCount,
+    aa.TotalAnswers,
+    aa.AverageAnswerScore,
+    CASE WHEN aa.HasSelfAcceptedAnswer = 1 THEN TRUE ELSE FALSE END AS HasSelfAcceptedAnswer,
+    pva_q.UpVotesCount AS QuestionUpVotes,
+    pva_q.DownVotesCount AS QuestionDownVotes,
+    pva_q.TotalBountyAmount AS QuestionBountyAmount,
+    pva_q.FavoriteCountFromVotes,
+    qb.LastEditorDisplayName,
+    qb.LastEditorReputation,
+    qb.LastEditDate,
+    qci.ClosedDate,
+    qci.CloseReasonTypeName,
+    CASE WHEN qci.WasReopened = 1 THEN TRUE ELSE FALSE END AS WasReopened,
+    SUBSTRING(
+        COALESCE(
+            REPLACE(REPLACE(REPLACE(qb.QuestionBody, '<p>', ''), '</p>', ''), '<code>', ''),
+            'No Body Text (Closed)'
+        ), 1, 200
+    ) AS QuestionBodyCleanExcerpt,
+    RANK() OVER (
+        PARTITION BY EXTRACT(YEAR FROM qb.ClosedDate)
+        ORDER BY qb.LastEditDate DESC, aa.TotalAnswers DESC
+    ) AS QuestionActivityRank,
+    (qb.QuestionScore * 1.0 / GREATEST(1, aa.TotalAnswers)) * (CASE WHEN qb.ClosedDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year' THEN 1.5 ELSE 1 END) * (COALESCE(qb.LastEditorReputation, 0) / 1000.0) AS CalculatedImpactScore,
+    (
+        SELECT STRING_AGG(tag, ', ')
+        FROM (
+            SELECT UNNEST_TAG AS tag
+            FROM (SELECT regexp_split_to_table(SUBSTRING(qb.Tags FROM 2 FOR CHAR_LENGTH(qb.Tags) - 2), '><') AS UNNEST_TAG) t
+            WHERE LOWER(t.UNNEST_TAG) LIKE '%security%' OR LOWER(t.UNNEST_TAG) LIKE '%api%'
+        ) tag_list
+    ) AS RelevantTopTags,
+    (
+        SELECT COUNT(b3.Id)
+        FROM Badges b3
+        WHERE b3.UserId = qb.QuestionOwnerId AND b3.Class = 2
+    ) AS OwnerTagBasedSpecificBadges,
+    ua.VoteActivityDecile AS QuestionOwnerVoteDecile,
+    bs.BadgeClassScore AS QuestionOwnerBadgeScore,
+    'Closed/Engaged' AS QueryCategory
+FROM QuestionBase qb
+INNER JOIN AnswerAggregates aa ON qb.QuestionId = aa.QuestionId
+LEFT JOIN PostVoteAggregates pva_q ON qb.QuestionId = pva_q.PostId
+LEFT JOIN RecentHighRepUsers rhu ON qb.QuestionOwnerId = rhu.UserId
+LEFT JOIN QuestionClosureInfo qci ON qb.QuestionId = qci.QuestionId
+LEFT JOIN UserActivityRank ua ON qb.QuestionOwnerId = ua.UserId
+LEFT JOIN BadgeSummary bs ON qb.QuestionOwnerId = bs.UserId
+WHERE
+    qb.ClosedDate IS NOT NULL
+    AND qb.ClosedDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 years'
+    AND qb.LastActivityDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+    AND aa.TotalAnswers >= 1
+    AND (
+        (qb.QuestionScore >= 20 AND qb.FavoriteCount >= 5)
+        OR (qci.WasReopened = 1)
+    )
+ORDER BY
+    CalculatedImpactScore DESC,
+    QuestionCreationDate DESC
+LIMIT 1000;

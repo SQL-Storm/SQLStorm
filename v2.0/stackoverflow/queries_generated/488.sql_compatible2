@@ -1,0 +1,381 @@
+with params as (
+  select
+    cast(10 as int) as top_n,
+    cast('365 days' as interval) as recent_window
+),
+recent_activity as (
+  select
+    p.Id,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Title,
+    p.Tags,
+    coalesce(nullif(trim(p.OwnerDisplayName), ''), 'anon') as OwnerDisplayNameNorm
+  from Posts p
+  where p.CreationDate >= cast(cast('2024-10-01 12:34:56' as timestamp) - (select recent_window from params) as timestamp)
+),
+user_enrichment as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    u.UpVotes,
+    u.DownVotes,
+    u.Views as ProfileViews,
+    cast(date_part('year', age(cast('2024-10-01 12:34:56' as timestamp), u.CreationDate)) as int) as AccountAgeYears,
+    case
+      when lower(u.WebsiteUrl) like 'http://%' or lower(u.WebsiteUrl) like 'https://%' then u.WebsiteUrl
+      when nullif(u.WebsiteUrl, '') is not null then 'http://' || u.WebsiteUrl
+      else null
+    end as NormalizedWebsite
+  from Users u
+),
+post_votes as (
+  select
+    v.PostId,
+    sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+    sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+    sum(case when v.VoteTypeId = 5 then 1 else 0 end) as Favorites,
+    sum(case when v.VoteTypeId = 8 then coalesce(v.BountyAmount, 0) else 0 end) as BountyStarted,
+    sum(case when v.VoteTypeId = 9 then coalesce(v.BountyAmount, 0) else 0 end) as BountyAwarded,
+    count(*) as TotalVotes,
+    max(v.CreationDate) as LastVoteAt
+  from Votes v
+  group by v.PostId
+),
+comment_stats as (
+  select
+    c.PostId,
+    count(*) as CommentCount,
+    sum(case when c.Score > 0 then 1 else 0 end) as PosComments,
+    sum(case when c.Score < 0 then 1 else 0 end) as NegComments,
+    max(c.CreationDate) as LastCommentAt
+  from Comments c
+  group by c.PostId
+),
+history_events as (
+  select
+    ph.PostId,
+    count(*) filter (where ph.PostHistoryTypeId in (4,5,6)) as EditCount,
+    count(*) filter (where ph.PostHistoryTypeId in (10)) as CloseCount,
+    count(*) filter (where ph.PostHistoryTypeId in (11)) as ReopenCount,
+    count(*) filter (where ph.PostHistoryTypeId in (12)) as DeleteCount,
+    count(*) filter (where ph.PostHistoryTypeId in (13)) as UndeleteCount,
+    min(ph.CreationDate) as FirstEventAt,
+    max(ph.CreationDate) as LastEventAt,
+    max(case when ph.PostHistoryTypeId = 10 then ph.Comment end) as LastCloseReasonIdRaw,
+    max(case when ph.PostHistoryTypeId = 10 then ph.Text end) as LastCloseVotePayload
+  from PostHistory ph
+  group by ph.PostId
+),
+close_reason as (
+  select
+    he.PostId,
+    crt.Name as LastCloseReasonName
+  from history_events he
+  left join CloseReasonTypes crt
+    on cast(crt.Id as varchar) = nullif(he.LastCloseReasonIdRaw, '')
+),
+post_links_agg as (
+  select
+    pl.PostId,
+    count(*) filter (where pl.LinkTypeId = 1) as LinkedCount,
+    count(*) filter (where pl.LinkTypeId = 3) as DuplicateCount,
+    count(distinct case when pl.LinkTypeId = 3 then pl.RelatedPostId end) as DistinctDuplicateTargets
+  from PostLinks pl
+  group by pl.PostId
+),
+tag_expansion as (
+  select
+    p.Id as PostId,
+    unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><')) as TagName
+  from Posts p
+  where p.PostTypeId = 1
+    and p.Tags is not null
+    and p.Tags like '<%>'
+),
+tag_join as (
+  select
+    te.PostId,
+    te.TagName,
+    t.Count as TagGlobalCount,
+    t.IsModeratorOnly,
+    t.IsRequired
+  from tag_expansion te
+  left join Tags t on t.TagName = te.TagName
+),
+tag_stats as (
+  select
+    tj.PostId,
+    count(*) as TagCount,
+    avg(cast(tj.TagGlobalCount as numeric)) as AvgTagPopularity,
+    sum(case when tj.IsModeratorOnly then 1 else 0 end) as ModOnlyTags,
+    sum(case when tj.IsRequired then 1 else 0 end) as RequiredTags,
+    string_agg(tj.TagName, ',' order by tj.TagName) as TagListCSV
+  from tag_join tj
+  group by tj.PostId
+),
+accepted_answer_age as (
+  select
+    q.Id as QuestionId,
+    q.AcceptedAnswerId,
+    a.CreationDate as AcceptedAnswerCreated,
+    extract(epoch from (a.CreationDate - q.CreationDate))/3600.0 as HoursToAccepted
+  from Posts q
+  left join Posts a on a.Id = q.AcceptedAnswerId
+  where q.PostTypeId = 1
+),
+answerers as (
+  select
+    a.ParentId as QuestionId,
+    a.Id as AnswerId,
+    a.OwnerUserId as AnswererId,
+    a.Score as AnswerScore,
+    row_number() over (partition by a.ParentId order by a.Score desc nulls last, a.Id) as rn_by_score,
+    dense_rank() over (partition by a.ParentId order by coalesce(a.OwnerUserId, -1)) as distinct_answerer_rank
+  from Posts a
+  where a.PostTypeId = 2
+),
+question_quality as (
+  select
+    q.Id as QuestionId,
+    q.Score as QScore,
+    q.ViewCount,
+    q.AnswerCount,
+    pv.UpVotes as UpVotesOnQ,
+    pv.DownVotes as DownVotesOnQ,
+    coalesce(pv.TotalVotes, 0) as TotalVotesOnQ,
+    cs.CommentCount as CommentsOnQ,
+    hl.EditCount as EditsOnQ,
+    coalesce(pl.DuplicateCount, 0) as DupLinksOnQ,
+    coalesce(pl.LinkedCount, 0) as LinkedOnQ,
+    coalesce(ts.AvgTagPopularity, 0) as AvgTagPopularity,
+    coalesce(ts.TagCount, 0) as TagCount
+  from Posts q
+  left join post_votes pv on pv.PostId = q.Id
+  left join comment_stats cs on cs.PostId = q.Id
+  left join history_events hl on hl.PostId = q.Id
+  left join post_links_agg pl on pl.PostId = q.Id
+  left join tag_stats ts on ts.PostId = q.Id
+  where q.PostTypeId = 1
+),
+scored_posts as (
+  select
+    ra.Id as PostId,
+    ra.PostTypeId,
+    ra.Title,
+    ra.Tags,
+    ra.OwnerUserId,
+    ue.DisplayName as OwnerName,
+    ue.Reputation,
+    ue.AccountAgeYears,
+    ue.Location,
+    ue.UpVotes as UserUpVotes,
+    ue.DownVotes as UserDownVotes,
+    ra.Score as PostScore,
+    ra.ViewCount as PostViews,
+    ra.AnswerCount,
+    pv.UpVotes as PostUpVotes,
+    pv.DownVotes as PostDownVotes,
+    pv.Favorites as PostFavorites,
+    pv.BountyAwarded - pv.BountyStarted as NetBounty,
+    cs.CommentCount,
+    he.EditCount,
+    he.CloseCount,
+    he.ReopenCount,
+    he.DeleteCount,
+    he.UndeleteCount,
+    he.LastEventAt,
+    cr.LastCloseReasonName,
+    pla.LinkedCount,
+    pla.DuplicateCount,
+    coalesce(ts2.TagCount, 0) as TagCountIfQuestion,
+    coalesce(ts2.AvgTagPopularity, 0) as AvgTagPopularityIfQuestion,
+    aa.HoursToAccepted,
+    qq.QScore,
+    qq.ViewCount as QViewCount,
+    qq.AnswerCount as QAnswerCount,
+    qq.UpVotesOnQ,
+    qq.DownVotesOnQ,
+    qq.DupLinksOnQ,
+    qq.AvgTagPopularity as QAvgTagPopularity,
+    extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - ra.CreationDate))/86400.0 as AgeDays,
+    (
+      coalesce(ra.Score,0)*2
+      + coalesce(pv.UpVotes,0)*1.5
+      - coalesce(pv.DownVotes,0)*2
+      + greatest(least(coalesce(pv.Favorites,0), 50), 0)*0.5
+      + cast(ln(1 + greatest(coalesce(ra.ViewCount,0),0)) as numeric)
+      - case when he.CloseCount > 0 then 5 else 0 end
+      + case when ra.PostTypeId = 1 then coalesce(qq.AvgTagPopularity,0)*0.01 else 0 end
+      + case when ra.PostTypeId = 1 and aa.HoursToAccepted is not null then greatest(0, 24 - aa.HoursToAccepted)*0.1 else 0 end
+      - coalesce(pla.DuplicateCount,0)*3
+      + case when ue.Reputation >= 10000 then 2 else 0 end
+    ) as CompositeScore
+  from recent_activity ra
+  left join user_enrichment ue on ue.UserId = ra.OwnerUserId
+  left join post_votes pv on pv.PostId = ra.Id
+  left join comment_stats cs on cs.PostId = ra.Id
+  left join history_events he on he.PostId = ra.Id
+  left join close_reason cr on cr.PostId = ra.Id
+  left join post_links_agg pla on pla.PostId = ra.Id
+  left join tag_stats ts2 on ts2.PostId = ra.Id
+  left join accepted_answer_age aa on aa.QuestionId = ra.Id
+  left join question_quality qq on qq.QuestionId = ra.Id
+),
+ranked as (
+  select
+    sp.PostId,
+    sp.PostTypeId,
+    sp.Title,
+    sp.Tags,
+    sp.OwnerUserId,
+    sp.OwnerName,
+    sp.Reputation,
+    sp.AccountAgeYears,
+    sp.Location,
+    sp.UserUpVotes,
+    sp.UserDownVotes,
+    sp.PostScore,
+    sp.PostViews,
+    sp.AnswerCount,
+    sp.PostUpVotes,
+    sp.PostDownVotes,
+    sp.PostFavorites,
+    sp.NetBounty,
+    sp.CommentCount,
+    sp.EditCount,
+    sp.CloseCount,
+    sp.ReopenCount,
+    sp.DeleteCount,
+    sp.UndeleteCount,
+    sp.LastEventAt,
+    sp.LastCloseReasonName,
+    sp.LinkedCount,
+    sp.DuplicateCount,
+    sp.TagCountIfQuestion,
+    sp.AvgTagPopularityIfQuestion,
+    sp.HoursToAccepted,
+    sp.QScore,
+    sp.QViewCount,
+    sp.QAnswerCount,
+    sp.UpVotesOnQ,
+    sp.DownVotesOnQ,
+    sp.DupLinksOnQ,
+    sp.QAvgTagPopularity,
+    sp.AgeDays,
+    sp.CompositeScore,
+    row_number() over (order by sp.CompositeScore desc nulls last, sp.PostId desc) as rn,
+    rank() over (order by sp.CompositeScore desc nulls last) as rnk,
+    dense_rank() over (order by sp.PostTypeId, case when sp.CloseCount > 0 then 1 else 0 end) as type_close_bucket,
+    percent_rank() over (order by sp.CompositeScore desc nulls last) as pct_rank,
+    ntile(10) over (order by sp.CompositeScore desc nulls last) as decile
+  from scored_posts sp
+),
+top_posts as (
+  select *
+  from ranked
+  where rn <= (select top_n from params)
+),
+dupe_graph as (
+  select
+    pl.PostId,
+    count(*) as DupeRefsOut,
+    count(distinct pl.RelatedPostId) as DupeTargets,
+    sum(case when p2.Score > 0 then 1 else 0 end) as TargetPosScoreCount
+  from PostLinks pl
+  left join Posts p2 on p2.Id = pl.RelatedPostId
+  where pl.LinkTypeId = 3
+  group by pl.PostId
+),
+outer_mix as (
+  select
+    tp.PostId,
+    coalesce(dg.DupeRefsOut, 0) as DupeRefsOut,
+    coalesce(dg.DupeTargets, 0) as DupeTargets,
+    coalesce(dg.TargetPosScoreCount, 0) as TargetPosScoreCount,
+    coalesce(phh.EditCount, 0) as TotalEditsAllTime
+  from top_posts tp
+  left join dupe_graph dg on dg.PostId = tp.PostId
+  left join (
+    select ph.PostId, count(*) filter (where ph.PostHistoryTypeId in (4,5,6,7,8,9)) as EditCount
+    from PostHistory ph
+    group by ph.PostId
+  ) phh on phh.PostId = tp.PostId
+),
+string_munge as (
+  select
+    tp.PostId,
+    tp.PostTypeId,
+    coalesce(nullif(tp.Title, ''), '[no-title]') as TitleSafe,
+    case
+      when tp.Tags is null then '[no-tags]'
+      else replace(replace(tp.Tags, '<', '['), '>', ']')
+    end as TagsBracketed,
+    tp.OwnerName,
+    tp.Location,
+    regexp_replace(coalesce(tp.OwnerName, 'anon') || '|' || coalesce(tp.Location, 'n/a'), '\s+', ' ', 'g') as OwnerLocationKey
+  from top_posts tp
+)
+select
+  tp.PostId,
+  tp.PostTypeId,
+  tp.Title,
+  sm.TagsBracketed as TagsFormatted,
+  tp.OwnerUserId,
+  tp.OwnerName,
+  tp.Reputation,
+  tp.AccountAgeYears,
+  tp.Location,
+  tp.UserUpVotes,
+  tp.UserDownVotes,
+  tp.PostScore,
+  tp.PostViews,
+  tp.AnswerCount,
+  tp.PostUpVotes,
+  tp.PostDownVotes,
+  tp.PostFavorites,
+  tp.NetBounty,
+  tp.CommentCount,
+  tp.EditCount,
+  tp.CloseCount,
+  tp.ReopenCount,
+  tp.DeleteCount,
+  tp.UndeleteCount,
+  tp.LastEventAt,
+  tp.LastCloseReasonName,
+  tp.LinkedCount,
+  tp.DuplicateCount,
+  tp.TagCountIfQuestion,
+  tp.AvgTagPopularityIfQuestion,
+  tp.HoursToAccepted,
+  tp.QScore,
+  tp.QViewCount,
+  tp.QAnswerCount,
+  tp.UpVotesOnQ,
+  tp.DownVotesOnQ,
+  tp.DupLinksOnQ,
+  tp.QAvgTagPopularity,
+  tp.AgeDays,
+  tp.CompositeScore,
+  tp.rn as RowNumber,
+  tp.rnk as Rank,
+  tp.type_close_bucket as TypeCloseBucket,
+  tp.pct_rank as PercentRank,
+  tp.decile as Decile,
+  om.DupeRefsOut,
+  om.DupeTargets,
+  om.TargetPosScoreCount,
+  om.TotalEditsAllTime,
+  sm.TitleSafe,
+  sm.OwnerLocationKey
+from top_posts tp
+left join outer_mix om on om.PostId = tp.PostId
+left join string_munge sm on sm.PostId = tp.PostId
+order by tp.CompositeScore desc nulls last, tp.PostId desc;

@@ -1,0 +1,123 @@
+WITH UserStats AS (
+    SELECT
+        u.Id                              AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        SUM(COALESCE(p.Score, 0))         AS TotalScore,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+BadgeInfo AS (
+    SELECT
+        b.UserId,
+        MAX(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END)    AS HasGold,
+        MAX(CASE WHEN b.TagBased = 1 THEN 1 ELSE 0 END) AS HasTagBadge,
+        COUNT(*)                                        AS BadgeCount
+    FROM Badges b
+    GROUP BY b.UserId
+),
+TopTags AS (
+    SELECT
+        t.TagName,
+        t.Count                AS TagUseCount,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank
+    FROM Tags t
+    WHERE COALESCE(t.IsModeratorOnly, 0) = 0
+),
+PostDetails AS (
+    SELECT
+        p.Id                                    AS PostId,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.Tags,
+        p.OwnerUserId,
+        COALESCE(p.AcceptedAnswerId, -1)        AS AcceptedAnswerId,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpVoteCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS DownVoteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC NULLS LAST) AS UserPostRank
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+Combined AS (
+    SELECT
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.RepRank,
+        COALESCE(bi.HasGold, 0)                AS HasGold,
+        COALESCE(bi.HasTagBadge, 0)            AS HasTagBadge,
+        COALESCE(bi.BadgeCount, 0)             AS BadgeCount,
+        pd.PostId,
+        pd.Title,
+        pd.Score,
+        pd.UpVoteCount,
+        pd.DownVoteCount,
+        pd.UserPostRank,
+        COALESCE(pd.Tags, '')                  AS RawTags,
+        CASE WHEN pd.AcceptedAnswerId = -1 THEN NULL ELSE pd.AcceptedAnswerId END AS AcceptedAnswerId,
+        ptags.TagName,
+        tt.TagUseCount,
+        tt.TagRank
+    FROM UserStats us
+    LEFT JOIN BadgeInfo bi   ON bi.UserId = us.UserId
+    LEFT JOIN PostDetails pd ON pd.OwnerUserId = us.UserId
+    LEFT JOIN LATERAL (
+        SELECT unnest(string_to_array(trim(both '<>' FROM COALESCE(pd.Tags, '')), '><')) AS TagName
+    ) ptags ON TRUE
+    LEFT JOIN TopTags tt ON tt.TagName = ptags.TagName
+    WHERE (us.Reputation > 50000 OR COALESCE(bi.HasGold, 0) = 1)
+      AND (pd.Score IS NULL OR pd.Score >= 0)
+)
+SELECT
+    (Combined.DisplayName || ' (Rep: ' || COALESCE(CAST(Combined.Reputation AS VARCHAR), '0') || ')') AS UserLabel,
+    Combined.RepRank,
+    Combined.BadgeCount,
+    CASE WHEN Combined.HasGold = 1 THEN 'Gold' ELSE 'NoGold' END AS GoldStatus,
+    Combined.PostId,
+    COALESCE(Combined.Title, '<no title>')          AS QuestionTitle,
+    Combined.Score,
+    Combined.UpVoteCount,
+    Combined.DownVoteCount,
+    Combined.UserPostRank,
+    Combined.TagName,
+    Combined.TagUseCount,
+    Combined.TagRank,
+    CASE
+        WHEN EXISTS (
+            SELECT 1 FROM Votes v
+            WHERE v.PostId = Combined.PostId
+              AND v.VoteTypeId = 2
+              AND v.CreationDate > (DATE '2024-10-01' - INTERVAL '30' DAY)
+        ) THEN 'Trending'
+        ELSE 'Stale'
+    END                                            AS ActivityStatus
+FROM Combined
+WHERE (Combined.UserPostRank <= 3)
+   OR (Combined.TagRank IS NOT NULL AND Combined.TagRank <= 5)
+ORDER BY Combined.RepRank ASC
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    '---'               AS UserLabel,
+    NULL::INTEGER AS RepRank,
+    NULL::INTEGER AS BadgeCount,
+    NULL::VARCHAR AS GoldStatus,
+    NULL::INTEGER AS PostId,
+    NULL::VARCHAR AS QuestionTitle,
+    NULL::INTEGER AS Score,
+    NULL::INTEGER AS UpVoteCount,
+    NULL::INTEGER AS DownVoteCount,
+    NULL::INTEGER AS UserPostRank,
+    NULL::VARCHAR AS TagName,
+    NULL::INTEGER AS TagUseCount,
+    NULL::INTEGER AS TagRank,
+    NULL::VARCHAR AS ActivityStatus
+WHERE NOT EXISTS (SELECT 1 FROM Combined);

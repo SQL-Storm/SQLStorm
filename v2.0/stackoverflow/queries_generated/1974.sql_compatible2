@@ -1,0 +1,145 @@
+WITH UserActivityMetrics AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        MAX(p.LastActivityDate) AS LastPostActivity,
+        MAX(c.CreationDate) AS LastCommentActivity,
+        NTILE(4) OVER (ORDER BY u.Reputation DESC) AS ReputationQuartile,
+        AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL) AS AvgOverallPostScore,
+        COALESCE(u.Location, 'Unknown Location') AS UserLocation,
+        CASE WHEN MAX(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) = 1 THEN TRUE ELSE FALSE END AS HasGoldBadge
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.UpVotes, u.DownVotes, u.Location
+),
+PostTagAnalysis AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.AcceptedAnswerId,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.ClosedDate,
+        p.Tags,
+        p.FavoriteCount,
+        CARDINALITY(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2), '><')) AS TagCount,
+        STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2), '><') AS TagArray,
+        (LOWER(p.Title) LIKE '%performance%' OR LOWER(p.Body) LIKE '%benchmark%') AS IsPerformanceBenchmarkPost
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.Tags IS NOT NULL
+      AND p.Title IS NOT NULL
+      AND p.Score >= 0
+),
+LatestPostEdit AS (
+    SELECT
+        ph.PostId,
+        ph.CreationDate AS LastEditDate,
+        ph.UserId AS LastEditorUserId,
+        ph.UserDisplayName AS LastEditorDisplayName,
+        ph.PostHistoryTypeId,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC, ph.Id DESC) AS rn
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6)
+),
+PostCloseReasonDetails AS (
+    SELECT
+        ph.PostId,
+        ph.CreationDate AS CloseDate,
+        crt.Name AS CloseReasonName,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn_close
+    FROM PostHistory ph
+    JOIN CloseReasonTypes crt ON CAST(ph.Comment AS integer) = crt.Id
+    WHERE ph.PostHistoryTypeId = 10
+),
+HighScoringUserContent AS (
+    SELECT OwnerUserId AS UserId, Id AS ContentId, 'Post' AS ContentType, Score
+    FROM Posts WHERE Score > 20 AND OwnerUserId IS NOT NULL
+    UNION ALL
+    SELECT UserId, Id AS ContentId, 'Comment' AS ContentType, Score
+    FROM Comments WHERE Score > 10 AND UserId IS NOT NULL
+)
+SELECT
+    pta.PostId,
+    pta.Title,
+    pta.Score AS QuestionScore,
+    pta.ViewCount AS QuestionViewCount,
+    pta.CreationDate AS QuestionCreationDate,
+    uam.DisplayName AS QuestionOwnerDisplayName,
+    uam.Reputation AS QuestionOwnerReputation,
+    uam.ReputationQuartile,
+    uam.HasGoldBadge,
+    lpe.LastEditDate AS QuestionLastEditDate,
+    COALESCE(lpe.LastEditorDisplayName, 'No Editor') AS LastEditorName,
+    pcr.CloseReasonName,
+    pta.TagCount,
+    pta.IsPerformanceBenchmarkPost,
+    CASE
+        WHEN pta.ClosedDate IS NOT NULL AND pcr.CloseReasonName IS NULL THEN 'Closed (Reason Unknown)'
+        WHEN pta.ClosedDate IS NOT NULL THEN 'Closed (' || pcr.CloseReasonName || ')'
+        ELSE 'Open'
+    END AS PostStatusDetail,
+    AVG(CASE WHEN ans.Score > 0 THEN ans.Score END) AS AvgPositiveAnswerScore,
+    COUNT(DISTINCT ans.Id) AS TotalAnswersReceived,
+    SUM(CASE WHEN ans.AcceptedAnswerId = pta.PostId THEN 1 ELSE 0 END) AS AcceptedAnswersCount,
+    SUM(CASE WHEN ans.CreationDate > pta.CreationDate + INTERVAL '1 month' THEN 1 ELSE 0 END) AS LateAnswersCount,
+    (
+        SELECT COALESCE(MAX(c.Score), 0)
+        FROM Comments c
+        WHERE c.PostId = pta.PostId
+    ) AS MaxQuestionCommentScore,
+    (
+        SELECT CASE WHEN COUNT(*) > 0 THEN TRUE ELSE FALSE END
+        FROM PostHistory ph2 WHERE ph2.PostId = pta.PostId AND ph2.PostHistoryTypeId = 15
+    ) AS HadModeratorReview,
+    NULLIF(EXTRACT(EPOCH FROM (lpe.LastEditDate - pta.CreationDate)) / 3600, 0) AS HoursToFirstEdit,
+    COUNT(hsc.ContentId) FILTER (WHERE hsc.ContentType = 'Post') AS OwnerHighScorePosts,
+    COUNT(hsc.ContentId) FILTER (WHERE hsc.ContentType = 'Comment') AS OwnerHighScoreComments,
+    RANK() OVER (PARTITION BY uam.ReputationQuartile ORDER BY pta.Score DESC, pta.ViewCount DESC) AS RankWithinReputationQuartile,
+    LAG(pta.Score, 1, 0) OVER (PARTITION BY uam.UserId ORDER BY pta.CreationDate) AS PreviousPostScoreByOwner,
+    COALESCE(plt.Name, 'No Link') AS RelatedPostLinkType,
+    CASE WHEN plt.Id = 3 THEN 'Duplicate' ELSE 'Not Duplicate' END AS IsDuplicateLink,
+    (
+        SELECT COUNT(DISTINCT tags.TagName)
+        FROM UNNEST(pta.TagArray) AS tags(TagName)
+        WHERE tags.TagName LIKE 'sql%' OR tags.TagName LIKE 'database%'
+    ) AS DatabaseRelatedTagsCount
+FROM PostTagAnalysis pta
+JOIN UserActivityMetrics uam ON pta.OwnerUserId = uam.UserId
+LEFT JOIN LatestPostEdit lpe ON pta.PostId = lpe.PostId AND lpe.rn = 1
+LEFT JOIN PostCloseReasonDetails pcr ON pta.PostId = pcr.PostId AND pcr.rn_close = 1
+LEFT JOIN Posts ans ON pta.PostId = ans.ParentId AND ans.PostTypeId = 2
+LEFT JOIN PostLinks pl ON pta.PostId = pl.PostId
+LEFT JOIN LinkTypes plt ON pl.LinkTypeId = plt.Id
+LEFT JOIN HighScoringUserContent hsc ON uam.UserId = hsc.UserId
+WHERE uam.Reputation > 500
+  AND pta.CreationDate >= DATE '2021-01-01'
+  AND pta.IsPerformanceBenchmarkPost IS TRUE
+  AND EXISTS (
+      SELECT 1 FROM Comments c_exist WHERE c_exist.PostId = pta.PostId AND c_exist.CreationDate BETWEEN pta.CreationDate AND pta.CreationDate + INTERVAL '2 day'
+  )
+  AND uam.UserLocation IS NOT NULL
+GROUP BY
+    pta.PostId, pta.Title, pta.Score, pta.ViewCount, pta.CreationDate,
+    uam.DisplayName, uam.Reputation, uam.ReputationQuartile, uam.HasGoldBadge,
+    lpe.LastEditDate, lpe.LastEditorDisplayName, pcr.CloseReasonName,
+    pta.TagCount, pta.IsPerformanceBenchmarkPost, pta.ClosedDate, uam.UserId,
+    plt.Name, plt.Id, pta.TagArray, pta.AcceptedAnswerId, pta.LastEditDate, pta.LastActivityDate, pta.Tags, pta.FavoriteCount
+ORDER BY
+    uam.Reputation DESC, pta.Score DESC, pta.CreationDate DESC
+LIMIT 500;

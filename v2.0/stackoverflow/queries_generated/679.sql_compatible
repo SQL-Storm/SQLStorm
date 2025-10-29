@@ -1,0 +1,311 @@
+with params as (
+    select
+        cast(50 as int) as min_rep,
+        cast(10 as int) as min_answers,
+        cast('2 years' as interval) as recent_window
+),
+recent_questions as (
+    select
+        q.Id,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.OwnerUserId,
+        q.AcceptedAnswerId,
+        q.Title,
+        q.Tags,
+        coalesce(q.AnswerCount, 0) as AnswerCount
+    from Posts q
+    join PostTypes pt on pt.Id = q.PostTypeId and pt.Name = 'Question'
+    where q.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - (select recent_window from params)
+),
+answers as (
+    select
+        a.Id,
+        a.ParentId as QuestionId,
+        a.OwnerUserId,
+        a.Score,
+        a.CreationDate
+    from Posts a
+    join PostTypes pt on pt.Id = a.PostTypeId and pt.Name = 'Answer'
+),
+answer_stats as (
+    select
+        rq.Id as QuestionId,
+        count(a.Id) filter (where a.Id is not null) as total_answers,
+        sum(case when a.Score > 0 then 1 else 0 end) as positive_answers,
+        sum(case when a.Score < 0 then 1 else 0 end) as negative_answers,
+        max(a.Score) as max_answer_score,
+        min(a.Score) as min_answer_score,
+        avg(cast(a.Score as numeric)) as avg_answer_score,
+        max(a.CreationDate) as last_answer_date
+    from recent_questions rq
+    left join answers a on a.QuestionId = rq.Id
+    group by rq.Id
+),
+accepted_answerers as (
+    select
+        rq.Id as QuestionId,
+        u.Id as AcceptedUserId,
+        u.DisplayName as AcceptedDisplayName,
+        u.Reputation as AcceptedReputation
+    from recent_questions rq
+    left join Posts aa on aa.Id = rq.AcceptedAnswerId
+    left join Users u on u.Id = aa.OwnerUserId
+),
+tag_expanded as (
+    select
+        rq.Id as QuestionId,
+        lower(trim(both ' ' from t)) as tag
+    from recent_questions rq
+    cross join lateral unnest(string_to_array(substring(coalesce(rq.Tags,''), 2, greatest(length(coalesce(rq.Tags,'')) - 2, 0)), '><')) as t
+),
+tag_rank as (
+    select
+        te.QuestionId,
+        te.tag,
+        row_number() over (partition by te.QuestionId order by coalesce(greatest(length(te.tag),1),1) desc, te.tag) as tag_len_rank
+    from tag_expanded te
+),
+top_tag as (
+    select
+        tr.QuestionId,
+        tr.tag as TopTag
+    from tag_rank tr
+    where tr.tag_len_rank = 1
+),
+votes_agg as (
+    select
+        v.PostId,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as upvotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as downvotes,
+        sum(case when v.VoteTypeId = 5 then 1 else 0 end) as favorites
+    from Votes v
+    group by v.PostId
+),
+comment_density as (
+    select
+        c.PostId,
+        count(*) as comment_count,
+        max(c.CreationDate) as last_comment_date,
+        avg(nullif(length(coalesce(c.Text,'')),0)) as avg_comment_len
+    from Comments c
+    group by c.PostId
+),
+link_dupes as (
+    select
+        pl.PostId,
+        sum(case when lt.Name = 'Duplicate' then 1 else 0 end) as dup_links,
+        sum(case when lt.Name = 'Linked' then 1 else 0 end) as related_links
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    group by pl.PostId
+),
+close_events as (
+    select
+        ph.PostId,
+        count(*) filter (where ph.PostHistoryTypeId = 10) as close_votes_events,
+        max(ph.CreationDate) filter (where ph.PostHistoryTypeId = 10) as last_close_event,
+        max(case when ph.PostHistoryTypeId = 10 then cast(ph.Comment as int) end) as last_close_reason_id
+    from PostHistory ph
+    group by ph.PostId
+),
+user_activity as (
+    select
+        u.Id as UserId,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.UpVotes,
+        u.DownVotes,
+        u.Views,
+        coalesce(nullif(trim(coalesce(u.Location,'')),''),'Unknown') as LocationNorm
+    from Users u
+),
+user_badge_rollup as (
+    select
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as gold_badges,
+        sum(case when b.Class = 2 then 1 else 0 end) as silver_badges,
+        sum(case when b.Class = 3 then 1 else 0 end) as bronze_badges,
+        count(*) filter (where b.TagBased = 1) as tag_badges
+    from Badges b
+    group by b.UserId
+),
+question_owner as (
+    select
+        rq.Id as QuestionId,
+        u.Id as OwnerId,
+        u.DisplayName as OwnerDisplayName,
+        ua.Reputation as OwnerReputation,
+        ua.LocationNorm as OwnerLocation,
+        coalesce(ubr.gold_badges,0) as OwnerGold,
+        coalesce(ubr.silver_badges,0) as OwnerSilver,
+        coalesce(ubr.bronze_badges,0) as OwnerBronze
+    from recent_questions rq
+    left join Users u on u.Id = rq.OwnerUserId
+    left join user_activity ua on ua.UserId = u.Id
+    left join user_badge_rollup ubr on ubr.UserId = u.Id
+),
+question_quality as (
+    select
+        rq.Id as QuestionId,
+        rq.Title,
+        rq.CreationDate,
+        rq.Score,
+        rq.ViewCount,
+        rq.AnswerCount,
+        coalesce(va.upvotes,0) as upvotes,
+        coalesce(va.downvotes,0) as downvotes,
+        coalesce(va.favorites,0) as favorites,
+        coalesce(cd.comment_count,0) as comment_count,
+        cd.avg_comment_len,
+        le.dup_links,
+        le.related_links,
+        ce.close_votes_events,
+        ce.last_close_event,
+        ce.last_close_reason_id,
+        tt.TopTag
+    from recent_questions rq
+    left join votes_agg va on va.PostId = rq.Id
+    left join comment_density cd on cd.PostId = rq.Id
+    left join link_dupes le on le.PostId = rq.Id
+    left join close_events ce on ce.PostId = rq.Id
+    left join top_tag tt on tt.QuestionId = rq.Id
+),
+scored as (
+    select
+        qq.*,
+        qa.total_answers,
+        qa.positive_answers,
+        qa.negative_answers,
+        qa.max_answer_score,
+        qa.min_answer_score,
+        qa.avg_answer_score,
+        qa.last_answer_date,
+        qa.total_answers + coalesce(qq.AnswerCount,0) as answers_consistency_check,
+        (
+            coalesce(qq.Score,0) * 1.0
+            + coalesce(qq.upvotes,0) * 0.8
+            - coalesce(qq.downvotes,0) * 1.2
+            + coalesce(qq.favorites,0) * 0.5
+            + coalesce(qa.positive_answers,0) * 0.7
+            - coalesce(qa.negative_answers,0) * 0.9
+            + least(coalesce(qq.ViewCount,0) / nullif(1 + extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - qq.CreationDate)) / 86400,0), 5000) * 0.05
+            + case when ce.last_close_event is not null then -5 else 0 end
+            + case when qq.TopTag ilike '%sql%' then 3 else 0 end
+        ) as composite_score_raw
+    from question_quality qq
+    left join answer_stats qa on qa.QuestionId = qq.Id
+    left join close_events ce on ce.PostId = qq.Id
+),
+ranked as (
+    select
+        s.*,
+        dense_rank() over (order by s.composite_score_raw desc, s.ViewCount desc, s.CreationDate desc) as comp_rank,
+        ntile(10) over (order by s.composite_score_raw desc) as decile,
+        row_number() over (partition by coalesce(s.TopTag,'__no_tag__') order by s.composite_score_raw desc) as tag_rownum
+    from scored s
+),
+owner_enriched as (
+    select
+        r.*,
+        qo.OwnerId,
+        qo.OwnerDisplayName,
+        qo.OwnerReputation,
+        qo.OwnerLocation,
+        qo.OwnerGold,
+        qo.OwnerSilver,
+        qo.OwnerBronze
+    from ranked r
+    left join question_owner qo on qo.QuestionId = r.Id
+),
+filtered as (
+    select
+        oe.*
+    from owner_enriched oe
+    where
+        (
+            coalesce(oe.total_answers,0) >= (select min_answers from params)
+            or coalesce(oe.Score,0) >= 10
+            or coalesce(oe.upvotes,0) >= 20
+        )
+        and (
+            oe.OwnerId is null
+            or coalesce(oe.OwnerReputation,0) >= (select min_rep from params)
+        )
+        and not (
+            coalesce(oe.dup_links,0) >= 3
+            and coalesce(oe.Score,0) < 0
+        )
+),
+similarity as (
+    select
+        f1.Id as q1,
+        f2.Id as q2,
+        (
+            (case when f1.TopTag is not null and f1.TopTag = f2.TopTag then 0.25 else 0 end)
+            + (case when position(lower(split_part(coalesce(f1.Title,''),' ',1)) in lower(coalesce(f2.Title,''))) > 0 then 0.15 else 0 end)
+            + (case when abs(coalesce(f1.avg_answer_score,0) - coalesce(f2.avg_answer_score,0)) <= 1 then 0.1 else 0 end)
+            + (case when abs(coalesce(f1.total_answers,0) - coalesce(f2.total_answers,0)) <= 2 then 0.1 else 0 end)
+        ) as sim_score
+    from filtered f1
+    join filtered f2 on f1.Id < f2.Id
+),
+sim_best as (
+    select
+        q1,
+        q2,
+        sim_score,
+        row_number() over (partition by q1 order by sim_score desc, q2) as rn
+    from similarity
+),
+final_selection as (
+    select
+        f.*,
+        sb.q2 as most_similar_question_id,
+        sb.sim_score as most_similar_score
+    from filtered f
+    left join sim_best sb on sb.q1 = f.Id and sb.rn = 1
+)
+select
+    fs.Id as QuestionId,
+    coalesce(fs.Title, '(no title)') as Title,
+    coalesce(fs.TopTag, '(no tag)') as TopTag,
+    fs.CreationDate,
+    fs.Score,
+    fs.ViewCount,
+    fs.AnswerCount,
+    fs.total_answers as AnswersJoined,
+    fs.upvotes,
+    fs.downvotes,
+    fs.favorites,
+    fs.comment_count,
+    round(coalesce(fs.avg_comment_len,0),2) as AvgCommentLen,
+    coalesce(fs.dup_links,0) as DuplicateLinks,
+    coalesce(fs.related_links,0) as RelatedLinks,
+    fs.close_votes_events,
+    fs.last_close_event,
+    fs.last_close_reason_id,
+    round(coalesce(fs.composite_score_raw,0),3) as CompositeScore,
+    fs.comp_rank,
+    fs.decile,
+    fs.tag_rownum,
+    fs.OwnerId,
+    coalesce(fs.OwnerDisplayName, '(unknown)') as OwnerDisplayName,
+    fs.OwnerReputation,
+    fs.OwnerLocation,
+    fs.OwnerGold,
+    fs.OwnerSilver,
+    fs.OwnerBronze,
+    fs.most_similar_question_id,
+    round(coalesce(fs.most_similar_score,0),3) as most_similar_score
+from final_selection fs
+where
+    (fs.decile <= 3 or fs.tag_rownum <= 5)
+order by
+    fs.comp_rank,
+    fs.TopTag nulls last,
+    fs.tag_rownum,
+    fs.Id
+limit 500;

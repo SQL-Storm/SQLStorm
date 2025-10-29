@@ -1,0 +1,306 @@
+with
+-- Active users with activity bands
+active_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.lastaccessdate,
+    coalesce(nullif(trim(u.location), ''), 'Unknown') as location_norm,
+    width_bucket(u.reputation, 0, 100000, 10) as rep_bucket,
+    cast(extract(year from age(coalesce(u.lastaccessdate, cast('2024-10-01 12:34:56' as timestamp)), u.creationdate)) as int) as years_active
+  from users u
+  where u.creationdate < coalesce(u.lastaccessdate, cast('2024-10-01 12:34:56' as timestamp))
+),
+-- Questions and answers with tag arrays and normalized titles
+posts_norm as (
+  select
+    p.id,
+    p.posttypeid,
+    p.acceptedanswerid,
+    p.parentid,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.owneruserid,
+    lower(coalesce(p.title, '')) as title_lc,
+    string_to_array(substring(p.tags, 2, greatest(length(p.tags)-2,0)), '><') as tag_arr
+  from posts p
+),
+-- Per-question engagement metrics
+q_metrics as (
+  select
+    q.id as question_id,
+    q.owneruserid as owner_id,
+    q.creationdate as question_date,
+    q.score as q_score,
+    q.viewcount as q_views,
+    count(a.id) filter (where a.posttypeid = 2) as answers_total,
+    count(a.id) filter (where a.id = q.acceptedanswerid) as accepted_present,
+    sum(greatest(a.score,0)) filter (where a.posttypeid = 2) as answers_upscore,
+    min(a.creationdate) filter (where a.posttypeid = 2) as first_answer_at,
+    max(a.creationdate) filter (where a.posttypeid = 2) as last_answer_at,
+    array_agg(distinct t) filter (where t is not null) as tags
+  from posts_norm q
+  left join posts_norm a on a.parentid = q.id and a.posttypeid = 2
+  left join lateral unnest(q.tag_arr) as t on true
+  where q.posttypeid = 1
+  group by q.id, q.owneruserid, q.creationdate, q.score, q.viewcount
+),
+-- Votes summarized per post
+post_votes as (
+  select
+    v.postid,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+    sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started,
+    sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded
+  from votes v
+  group by v.postid
+),
+-- Per-user activity derived from posts and comments
+user_activity as (
+  select
+    u.user_id,
+    count(distinct p.id) filter (where p.posttypeid = 1) as q_count,
+    count(distinct p.id) filter (where p.posttypeid = 2) as a_count,
+    count(distinct c.id) as c_count,
+    sum(coalesce(p.score,0)) as post_score_sum,
+    max(p.creationdate) as last_post_at
+  from active_users u
+  left join posts p on p.owneruserid = u.user_id
+  left join comments c on c.userid = u.user_id
+  group by u.user_id
+),
+-- Badge tallies per user and time-based recency
+user_badges as (
+  select
+    b.userid as user_id,
+    sum(case when b.class = 1 then 1 else 0 end) as gold,
+    sum(case when b.class = 2 then 1 else 0 end) as silver,
+    sum(case when b.class = 3 then 1 else 0 end) as bronze,
+    max(b.date) as last_badge_at
+  from badges b
+  group by b.userid
+),
+-- Link graph edges for duplicates and related
+q_links as (
+  select
+    pl.postid as src_id,
+    pl.relatedpostid as dst_id,
+    pl.linktypeid
+  from postlinks pl
+),
+-- Detect duplicate clusters via symmetric closure within a window (limited for perf)
+dup_pairs as (
+  select distinct
+    least(src_id, dst_id) as a,
+    greatest(src_id, dst_id) as b
+  from q_links
+  where linktypeid = 3
+),
+-- Per-question quality composite metric
+q_quality as (
+  select
+    qm.question_id,
+    coalesce(pv.upvotes,0) as up,
+    coalesce(pv.downvotes,0) as down,
+    coalesce(pv.favorites,0) as fav,
+    qm.q_score,
+    qm.q_views,
+    qm.answers_total,
+    qm.accepted_present,
+    cast((coalesce(pv.upvotes,0) - 0.8 * coalesce(pv.downvotes,0)) as numeric) as vote_balance,
+    cast((ln(1 + coalesce(qm.q_views,0)) + 2*coalesce(qm.answers_total,0) + 5*coalesce(qm.accepted_present,0)) as numeric) as engagement_score,
+    (case when qm.first_answer_at is not null then extract(epoch from (qm.first_answer_at - qm.question_date))/3600.0 end) as hours_to_first_answer
+  from q_metrics qm
+  left join post_votes pv on pv.postid = qm.question_id
+),
+-- Windowed ranks by tag and by month
+q_tagged as (
+  select
+    q.question_id,
+    t.tag as tagname,
+    date_trunc('month', m.creationdate) as month_bucket,
+    m.creationdate,
+    q.vote_balance,
+    q.engagement_score,
+    q.hours_to_first_answer
+  from q_quality q
+  join posts m on m.id = q.question_id
+  -- expand tags using unnest from q_metrics.tags array column (q_metrics defined tags)
+  left join lateral (
+    select unnest(qm_tags) as tag
+    from (select q.tags as qm_tags) sub
+  ) t on true
+),
+q_tag_ranks as (
+  select
+    qt.question_id,
+    qt.tagname,
+    qt.month_bucket,
+    qt.creationdate,
+    qt.vote_balance,
+    qt.engagement_score,
+    qt.hours_to_first_answer,
+    row_number() over (partition by qt.tagname, qt.month_bucket order by qt.engagement_score desc nulls last, qt.vote_balance desc, qt.question_id) as rank_in_tag_month,
+    percent_rank() over (partition by qt.tagname order by qt.vote_balance) as vote_balance_pct_in_tag,
+    avg(qt.hours_to_first_answer) over (partition by qt.tagname, qt.month_bucket) as avg_h2a_tag_month
+  from q_tagged qt
+),
+-- Null-robust text search flags
+q_text_flags as (
+  select
+    q.question_id,
+    max(case when pn.title_lc like any (array['%performance%','%optimiz%','%index%']) then 1 else 0 end) as is_perf_related,
+    max(case when pn.title_lc ~* '\b(why|how|what)\b' then 1 else 0 end) as is_interrogative
+  from posts_norm pn
+  join q_quality q on q.question_id = pn.id
+  group by q.question_id
+),
+-- Correlated subquery: most engaged commenter per question
+q_top_commenter as (
+  select
+    q.question_id,
+    (
+      select c.userid
+      from comments c
+      where c.postid = q.question_id and c.userid is not null
+      group by c.userid
+      order by sum(coalesce(c.score,0)) desc nulls last, count(*) desc, min(c.creationdate) asc
+      limit 1
+    ) as top_commenter_id
+  from q_quality q
+),
+-- Close/Protect/PostHistory derived signals
+q_moderation as (
+  select
+    ph.postid as question_id,
+    sum(case when ph.posthistorytypeid = 10 then 1 else 0 end) as close_events,
+    max(case when ph.posthistorytypeid = 19 then 1 else 0 end) as was_protected,
+    max(case when ph.posthistorytypeid in (11,13) then 1 else 0 end) as reopened_or_undeleted,
+    max(case when ph.posthistorytypeid = 10 and ph.comment ~ '^\d+$' and cast(ph.comment as int) in (101,102,103,104,105) then 1 else 0 end) as has_close_reason_new
+  from posthistory ph
+  group by ph.postid
+),
+-- Aggregate per-user quality
+user_q_agg as (
+  select
+    q.owner_id as user_id,
+    count(*) as q_total,
+    avg(q.vote_balance) as avg_vote_balance,
+    avg(q.engagement_score) as avg_engagement,
+    avg(q.hours_to_first_answer) as avg_h2a,
+    sum(case when tf.is_perf_related = 1 then 1 else 0 end) as perf_q_count
+  from q_metrics qm
+  join q_quality q on q.question_id = qm.question_id
+  left join q_text_flags tf on tf.question_id = q.question_id
+  group by q.owner_id
+),
+-- Combine all per-user features
+user_features as (
+  select
+    au.user_id,
+    au.displayname,
+    au.location_norm,
+    au.rep_bucket,
+    au.years_active,
+    ua.q_count,
+    ua.a_count,
+    ua.c_count,
+    ua.post_score_sum,
+    coalesce(ub.gold,0) as gold,
+    coalesce(ub.silver,0) as silver,
+    coalesce(ub.bronze,0) as bronze,
+    ub.last_badge_at,
+    uqa.q_total,
+    uqa.avg_vote_balance,
+    uqa.avg_engagement,
+    uqa.avg_h2a,
+    uqa.perf_q_count,
+    (coalesce(ua.a_count,0) - coalesce(ua.q_count,0)) as ans_minus_ques,
+    (case when ub.last_badge_at is not null then (cast('2024-10-01 12:34:56' as timestamp) - ub.last_badge_at) end) as time_since_badge
+  from active_users au
+  left join user_activity ua on ua.user_id = au.user_id
+  left join user_badges ub on ub.user_id = au.user_id
+  left join user_q_agg uqa on uqa.user_id = au.user_id
+),
+-- Set operator example: users active but never posted vs ever posted
+user_sets as (
+  select user_id, cast('no_posts' as text) as set_flag from active_users au
+  where not exists (select 1 from posts p where p.owneruserid = au.user_id)
+  union all
+  select distinct p.owneruserid as user_id, cast('has_posts' as text) from posts p where p.owneruserid is not null
+),
+-- Final composite scoring with null logic and conditions
+final_scores as (
+  select
+    uf.*,
+    us.set_flag,
+    cast(greatest(0.0,
+      coalesce(uf.avg_engagement,0)
+      + 0.5*coalesce(uf.avg_vote_balance,0)
+      + 0.2*coalesce(uf.gold,0)
+      + 0.1*coalesce(uf.silver,0)
+      + 0.05*coalesce(uf.bronze,0)
+      + case when uf.perf_q_count > 0 then 1.0 else 0.0 end
+      + case when uf.rep_bucket >= 8 then 2.0 when uf.rep_bucket >= 5 then 1.0 else 0.0 end
+      - case when coalesce(uf.avg_h2a,0) > 72 then 1.0 else 0.0 end
+    ) as numeric(18,4)) as quality_score
+  from user_features uf
+  left join user_sets us on us.user_id = uf.user_id
+),
+-- Rank duplicates clusters by aggregate score of members
+duplicate_cluster_scores as (
+  select
+    dp.a,
+    dp.b,
+    coalesce(fs_a.quality_score,0) + coalesce(fs_b.quality_score,0) as pair_quality
+  from dup_pairs dp
+  left join posts qa on qa.id = dp.a
+  left join posts qb on qb.id = dp.b
+  left join final_scores fs_a on fs_a.user_id = qa.owneruserid
+  left join final_scores fs_b on fs_b.user_id = qb.owneruserid
+)
+select
+  fs.user_id,
+  fs.displayname,
+  fs.location_norm,
+  fs.rep_bucket,
+  fs.years_active,
+  fs.q_count,
+  fs.a_count,
+  fs.c_count,
+  fs.gold,
+  fs.silver,
+  fs.bronze,
+  fs.quality_score,
+  coalesce(us.set_flag,'unknown') as user_set,
+  percentile_disc(0.5) within group (order by fs.quality_score) over () as global_median_quality,
+  rank() over (order by fs.quality_score desc, fs.gold desc, fs.silver desc, fs.bronze desc, fs.user_id) as global_rank,
+  (
+    select max(dcs.pair_quality)
+    from duplicate_cluster_scores dcs
+    join posts p on p.id in (dcs.a, dcs.b)
+    where p.owneruserid = fs.user_id
+  ) as max_dup_pair_quality,
+  case
+    when (fs.quality_score > 5 and (fs.gold + fs.silver) >= 2)
+      or (fs.q_count + fs.a_count >= 50 and fs.avg_engagement > 3)
+      or (fs.time_since_badge is not null and fs.time_since_badge < interval '30 days')
+    then 'highlight'
+    else 'normal'
+  end as highlight_flag
+from final_scores fs
+left join user_sets us on us.user_id = fs.user_id
+where
+  coalesce(length(trim(fs.displayname)),0) >= 2
+  and (
+    fs.user_id % 2 = 0
+    or fs.rep_bucket between 3 and 9
+    or fs.quality_score > 10
+  )
+order by fs.quality_score desc nulls last, fs.gold desc, fs.silver desc, fs.bronze desc, fs.user_id
+limit 200;

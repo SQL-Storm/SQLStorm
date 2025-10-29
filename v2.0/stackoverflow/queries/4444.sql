@@ -1,0 +1,143 @@
+WITH RecentQuestions AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title AS QuestionTitle,
+        p.OwnerUserId,
+        p.CreationDate AS QuestionCreationDate,
+        p.Score AS QuestionScore,
+        p.AnswerCount,
+        u.DisplayName AS OwnerDisplayName,
+        u.Reputation AS OwnerReputation,
+        ROW_NUMBER() OVER (ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '30' DAY)
+),
+TopAnswers AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.OwnerUserId,
+        a.CreationDate AS AnswerCreationDate,
+        a.Score AS AnswerScore,
+        u.DisplayName AS AnswererDisplayName,
+        u.Reputation AS AnswererReputation,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS answer_rn
+    FROM Posts a
+    JOIN Users u ON a.OwnerUserId = u.Id
+    WHERE a.PostTypeId = 2
+),
+AnswerStats AS (
+    SELECT
+        ta.QuestionId,
+        COUNT(ta.AnswerId) AS TotalAnswers,
+        SUM(CASE WHEN ta.answer_rn = 1 THEN 1 ELSE 0 END) AS BestAnswerCount,
+        AVG(ta.AnswerScore) AS AvgAnswerScore
+    FROM TopAnswers ta
+    GROUP BY ta.QuestionId
+),
+QuestionComments AS (
+    SELECT
+        c.PostId,
+        COUNT(c.Id) AS CommentCount,
+        SUM(CASE WHEN c.Score > 0 THEN 1 ELSE 0 END) AS PositiveCommentCount,
+        MAX(c.CreationDate) AS LatestCommentDate
+    FROM Comments c
+    WHERE c.PostId IN (SELECT QuestionId FROM RecentQuestions)
+    GROUP BY c.PostId
+),
+QuestionTags AS (
+    SELECT
+        p.Id AS QuestionId,
+        TRIM(tag) AS TagName
+    FROM Posts p,
+    LATERAL (
+        SELECT unnest(string_to_array(substring(p.Tags FROM 2 FOR (char_length(p.Tags) - 2)), '><')) AS tag
+    ) t
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+),
+TagPopularity AS (
+    SELECT
+        qt.TagName,
+        COUNT(DISTINCT qt.QuestionId) AS TagUsageCount
+    FROM QuestionTags qt
+    WHERE qt.TagName IN (
+        SELECT TagName FROM QuestionTags WHERE QuestionId IN (SELECT QuestionId FROM RecentQuestions)
+    )
+    GROUP BY qt.TagName
+),
+QuestionLinkCount AS (
+    SELECT
+        pl.PostId,
+        COUNT(pl.Id) AS LinkCount
+    FROM PostLinks pl
+    WHERE pl.PostId IN (SELECT QuestionId FROM RecentQuestions)
+    GROUP BY pl.PostId
+)
+SELECT
+    rq.QuestionId,
+    rq.QuestionTitle,
+    rq.OwnerDisplayName,
+    rq.OwnerReputation,
+    rq.QuestionScore,
+    rq.AnswerCount AS DirectAnswerCount,
+    COALESCE(ans_stats.TotalAnswers, 0) AS TotalAnswersOnQuestion,
+    COALESCE(ans_stats.BestAnswerCount, 0) AS NumBestAnswers,
+    ans_stats.AvgAnswerScore,
+    COALESCE(qc.CommentCount, 0) AS QuestionCommentCount,
+    qc.PositiveCommentCount,
+    COALESCE(qlc.LinkCount, 0) AS OutgoingLinkCount,
+    CONCAT(
+        CASE
+            WHEN rq.QuestionCreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '1' DAY) THEN 'Today'
+            WHEN rq.QuestionCreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '7' DAY) THEN 'ThisWeek'
+            ELSE 'Older'
+        END,
+        '-',
+        CASE
+            WHEN rq.QuestionScore > 100 THEN 'HighScore'
+            WHEN rq.QuestionScore > 10 THEN 'MidScore'
+            ELSE 'LowScore'
+        END
+    ) AS TemporalAndScoreCategory,
+    CASE
+        WHEN EXISTS (
+            SELECT 1
+            FROM PostHistory ph
+            WHERE ph.PostId = rq.QuestionId
+              AND ph.PostHistoryTypeId = 10
+              AND ph.Comment IS NOT NULL
+              AND ph.Comment IN ('101', '102', '103', '104', '105')
+        ) THEN 'Closed'
+        ELSE 'Open'
+    END AS QuestionStatus,
+    COALESCE(
+        (SELECT STRING_AGG(qt_inner.TagName, ', ' ORDER BY tp_inner.TagUsageCount DESC, qt_inner.TagName ASC)
+         FROM QuestionTags qt_inner
+         LEFT JOIN TagPopularity tp_inner ON tp_inner.TagName = qt_inner.TagName
+         WHERE qt_inner.QuestionId = rq.QuestionId
+         FETCH FIRST 5 ROWS ONLY),
+        'No Tags'
+    ) AS TopQuestionTags
+FROM RecentQuestions rq
+LEFT JOIN AnswerStats ans_stats ON rq.QuestionId = ans_stats.QuestionId
+LEFT JOIN QuestionComments qc ON rq.QuestionId = qc.PostId
+LEFT JOIN QuestionLinkCount qlc ON rq.QuestionId = qlc.PostId
+WHERE rq.rn <= 100
+GROUP BY
+    rq.QuestionId,
+    rq.QuestionTitle,
+    rq.OwnerDisplayName,
+    rq.OwnerReputation,
+    rq.QuestionScore,
+    rq.AnswerCount,
+    ans_stats.TotalAnswers,
+    ans_stats.BestAnswerCount,
+    ans_stats.AvgAnswerScore,
+    qc.CommentCount,
+    qc.PositiveCommentCount,
+    qlc.LinkCount,
+    rq.QuestionCreationDate,
+    rq.rn
+ORDER BY rq.QuestionCreationDate DESC;

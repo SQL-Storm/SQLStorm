@@ -1,0 +1,98 @@
+WITH RankedPosts AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.CreationDate,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.LastActivityDate,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.LastEditorUserId,
+    p.LastEditDate,
+    p.ContentLicense,
+    u.Reputation,
+    u.DisplayName,
+    u.Location,
+    u.AccountId,
+    CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate)) / 3600.0 AS DECIMAL(10,2)) AS hours_since_creation,
+    AVG(p.Score) OVER (PARTITION BY CAST(p.CreationDate AS DATE) ORDER BY p.CreationDate ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS rolling_score_7d,
+    p.LastActivityDate
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.LastActivityDate IS NOT NULL
+),
+TagInsights AS (
+  SELECT
+    rp.Id,
+    rp.Title,
+    rp.Tags,
+    CASE
+      WHEN rp.Tags LIKE '%<java>%' OR LOWER(rp.Title) LIKE '%java%' THEN 'Java-related'
+      WHEN rp.Tags LIKE '%<sql>%'  OR LOWER(rp.Title) LIKE '%sql%'  THEN 'SQL-related'
+      ELSE 'Other'
+    END AS topic_category,
+    ROW_NUMBER() OVER (
+      PARTITION BY CASE
+        WHEN rp.Tags LIKE '%<java>%' OR LOWER(rp.Title) LIKE '%java%' THEN 'Java-related'
+        WHEN rp.Tags LIKE '%<sql>%'  OR LOWER(rp.Title) LIKE '%sql%'  THEN 'SQL-related'
+        ELSE 'Other'
+      END
+      ORDER BY rp.LastActivityDate DESC
+    ) AS rn_by_topic,
+    rp.hours_since_creation,
+    rp.rolling_score_7d,
+    rp.LastActivityDate
+  FROM RankedPosts rp
+),
+Filtered AS (
+  SELECT
+    ti.Id,
+    ti.Title,
+    ti.topic_category AS Topic_Category,
+    ti.Tags,
+    ti.hours_since_creation,
+    ti.rolling_score_7d,
+    ti.LastActivityDate
+  FROM TagInsights ti
+  CROSS JOIN (SELECT 1) AS dummy -- replace lateral priority computation with simple mapping later
+  WHERE ti.rolling_score_7d > 0
+),
+Aggregates AS (
+  SELECT
+    f.Id,
+    f.Title,
+    f.Topic_Category,
+    f.Tags,
+    f.hours_since_creation,
+    f.rolling_score_7d,
+    f.LastActivityDate,
+    COALESCE(NULLIF(REGEXP_REPLACE(f.Title, '(^\\s+)|(\\s+$)', ''), ''), 'Untitled') AS safe_title,
+    CASE
+      WHEN f.hours_since_creation < 24 THEN 'Fresh'
+      WHEN f.hours_since_creation < 168 THEN 'Active'
+      ELSE 'Stale'
+    END AS freshness_bucket,
+    (f.rolling_score_7d * 1.0) + (CASE WHEN REGEXP_MATCHES(f.Tags, '(?i)\\b(sql)\\b') THEN 5 ELSE 0 END) AS composite_score
+  FROM Filtered f
+)
+SELECT
+  a.Id,
+  a.Title,
+  a.Topic_Category,
+  a.Tags,
+  a.hours_since_creation,
+  a.rolling_score_7d,
+  a.LastActivityDate,
+  a.safe_title,
+  a.freshness_bucket,
+  a.composite_score
+FROM Aggregates a
+ORDER BY a.composite_score DESC, a.LastActivityDate DESC
+LIMIT 100;

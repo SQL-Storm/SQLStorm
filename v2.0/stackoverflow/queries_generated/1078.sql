@@ -1,0 +1,245 @@
+-- {"query": "1078.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3344} 
+
+WITH UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostScore,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        SUM(COALESCE(c.Score, 0)) AS TotalCommentScore,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        MAX(b.CreationDate) AS LatestBadgeDate,
+        DATE_PART('day', NOW() - u.CreationDate) AS UserTenureDays
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes
+),
+PostEditHistory AS (
+    SELECT
+        ph.PostId,
+        ph.UserId AS EditorUserId,
+        ph.CreationDate AS EditDate,
+        ph.PostHistoryTypeId,
+        LAG(ph.CreationDate, 1, ph.CreationDate) OVER (PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate) AS PreviousEditDate
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9) -- Edit Title, Body, Tags or Rollback
+),
+EditorActivitySummary AS (
+    SELECT
+        peh.EditorUserId AS UserId,
+        COUNT(peh.PostId) AS TotalEdits,
+        SUM(CASE WHEN p.OwnerUserId = peh.EditorUserId THEN 1 ELSE 0 END) AS SelfEdits,
+        SUM(CASE WHEN p.OwnerUserId IS DISTINCT FROM peh.EditorUserId THEN 1 ELSE 0 END) AS OtherUserEdits,
+        AVG(EXTRACT(EPOCH FROM (peh.EditDate - peh.PreviousEditDate))) AS AvgEditIntervalSeconds
+    FROM PostEditHistory peh
+    LEFT JOIN Posts p ON peh.PostId = p.Id
+    GROUP BY peh.EditorUserId
+),
+TagPerformance AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        TRIM(tag_value) AS TagName
+    FROM Posts p
+    CROSS JOIN LATERAL UNNEST(string_to_array(TRIM(BOTH '<>' FROM COALESCE(p.Tags, '')), '><')) AS tag_value
+    WHERE p.Tags IS NOT NULL AND p.Tags != '' AND p.PostTypeId = 1 -- Only for questions
+),
+TagAverageScores AS (
+    SELECT
+        tp.TagName,
+        AVG(tp.Score) AS AvgScorePerTag,
+        AVG(tp.ViewCount) AS AvgViewsPerTag,
+        COUNT(DISTINCT tp.PostId) AS TotalQuestionsInTag
+    FROM TagPerformance tp
+    GROUP BY tp.TagName
+),
+UserTagPreference AS (
+    SELECT
+        tp.OwnerUserId AS UserId,
+        tp.TagName,
+        COUNT(tp.PostId) AS PostsInTag,
+        AVG(tp.Score) AS UserAvgScoreInTag,
+        AVG(tp.ViewCount) AS UserAvgViewsInTag,
+        RANK() OVER (PARTITION BY tp.OwnerUserId ORDER BY COUNT(tp.PostId) DESC, AVG(tp.Score) DESC) AS TagRankByUser
+    FROM TagPerformance tp
+    GROUP BY tp.OwnerUserId, tp.TagName
+),
+AcceptedAnswerRatio AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(DISTINCT p.Id) AS TotalAnswersPosted,
+        SUM(CASE WHEN p.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END) AS AcceptedAnswersCount
+    FROM Posts p
+    JOIN Posts q ON p.ParentId = q.Id AND q.PostTypeId = 1 -- Ensure q is a question
+    WHERE p.PostTypeId = 2 -- Answers
+    GROUP BY p.OwnerUserId
+    HAVING COUNT(DISTINCT p.Id) > 0
+),
+PostsUnderModeratorReview AS (
+    SELECT
+        p.OwnerUserId AS AffectedUserId,
+        COUNT(DISTINCT v.PostId) AS ReviewedPostCount
+    FROM Votes v
+    JOIN Posts p ON v.PostId = p.Id
+    WHERE v.VoteTypeId = 15 -- ModeratorReview
+    AND p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+    HAVING COUNT(DISTINCT v.PostId) > 5
+),
+FinalUserMetrics AS (
+SELECT
+    ue.UserId,
+    ue.DisplayName,
+    ue.Reputation,
+    ue.UserTenureDays,
+    ue.TotalPosts,
+    ue.TotalQuestions,
+    ue.TotalAnswers,
+    ue.TotalBadges,
+    eas.TotalEdits,
+    eas.SelfEdits,
+    eas.OtherUserEdits,
+    COALESCE(eas.AvgEditIntervalSeconds, 0) AS AvgEditIntervalSeconds,
+    aar.TotalAnswersPosted,
+    aar.AcceptedAnswersCount,
+    CAST(COALESCE(aar.AcceptedAnswersCount, 0) AS NUMERIC) / NULLIF(aar.TotalAnswersPosted, 0) AS AcceptedAnswerRatio,
+    utp.TagName AS TopPreferredTag,
+    utp.PostsInTag AS TopTagPosts,
+    utp.UserAvgScoreInTag AS TopTagUserAvgScore,
+    tas.AvgScorePerTag AS TopTagGlobalAvgScore,
+    -- Correlated Subquery 1: Latest comment date by this user on any of their posts
+    (SELECT MAX(c.CreationDate)
+     FROM Comments c
+     WHERE c.UserId = ue.UserId AND c.PostId IN (SELECT p.Id FROM Posts p WHERE p.OwnerUserId = ue.UserId)
+    ) AS LatestSelfCommentDate,
+    -- Correlated Subquery 2: FavoriteCount of their highest scoring question
+    (SELECT COALESCE(MAX(p.FavoriteCount), 0)
+     FROM Posts p
+     WHERE p.OwnerUserId = ue.UserId
+       AND p.PostTypeId = 1
+       AND p.Score = (SELECT COALESCE(MAX(sub_p.Score), 0) FROM Posts sub_p WHERE sub_p.OwnerUserId = ue.UserId AND sub_p.PostTypeId = 1)
+    ) AS HighestQuestionFavoriteCount,
+    -- String Expression: Location analysis
+    CASE
+        WHEN u.DisplayName LIKE '%stack%' OR u.DisplayName LIKE '%overflow%' THEN 'Stack-related Name'
+        WHEN u.Location IS NULL THEN 'Location Unknown'
+        WHEN LOWER(u.Location) LIKE '%remote%' OR LOWER(u.Location) LIKE '%online%' THEN 'Remote/Virtual Location'
+        ELSE 'Specific Location'
+    END AS UserLocationCategory,
+    -- NULL logic and complex calculations
+    COALESCE(ue.TotalPostScore, 0) + (COALESCE(ue.TotalCommentScore, 0) * 0.5) + (COALESCE(ue.UpVotes, 0) - COALESCE(ue.DownVotes, 0)) * 2 AS WeightedUserScore,
+    (ue.Reputation * 0.7) + (COALESCE(eas.TotalEdits, 0) * 0.1) + (COALESCE(aar.AcceptedAnswersCount, 0) * 0.2) AS InfluenceScore
+FROM UserEngagement ue
+LEFT JOIN EditorActivitySummary eas ON ue.UserId = eas.UserId
+LEFT JOIN AcceptedAnswerRatio aar ON ue.UserId = aar.UserId
+LEFT JOIN UserTagPreference utp ON ue.UserId = utp.UserId AND utp.TagRankByUser = 1 -- Get top preferred tag
+LEFT JOIN TagAverageScores tas ON utp.TagName = tas.TagName
+JOIN Users u ON ue.UserId = u.Id -- Needed for u.Location for UserLocationCategory
+WHERE ue.TotalPosts > 0
+AND ue.Reputation >= 100
+AND ue.UserTenureDays > 30
+AND (utp.UserAvgScoreInTag > COALESCE(tas.AvgScorePerTag, 0) OR utp.TagName IS NULL) -- Users doing better than avg in their top tag or no top tag
+AND ue.UserId NOT IN (SELECT AffectedUserId FROM PostsUnderModeratorReview)
+GROUP BY
+    ue.UserId, ue.DisplayName, ue.Reputation, ue.UserTenureDays, ue.TotalPosts, ue.TotalQuestions, ue.TotalAnswers,
+    ue.TotalBadges, eas.TotalEdits, eas.SelfEdits, eas.OtherUserEdits, eas.AvgEditIntervalSeconds,
+    aar.TotalAnswersPosted, aar.AcceptedAnswersCount, utp.TagName, utp.PostsInTag, utp.UserAvgScoreInTag,
+    tas.AvgScorePerTag, u.Location, ue.TotalPostScore, ue.TotalCommentScore, ue.UpVotes, ue.DownVotes
+HAVING COALESCE(eas.TotalEdits, 0) > 5 OR COALESCE(aar.AcceptedAnswersCount, 0) > 2
+)
+SELECT
+    f.UserId,
+    f.DisplayName,
+    f.Reputation,
+    f.UserTenureDays,
+    f.TotalPosts,
+    f.TotalQuestions,
+    f.TotalAnswers,
+    f.TotalBadges,
+    f.TotalEdits,
+    f.SelfEdits,
+    f.OtherUserEdits,
+    f.AvgEditIntervalSeconds,
+    f.TotalAnswersPosted,
+    f.AcceptedAnswersCount,
+    f.AcceptedAnswerRatio,
+    f.TopPreferredTag,
+    f.TopTagPosts,
+    f.TopTagUserAvgScore,
+    f.TopTagGlobalAvgScore,
+    f.LatestSelfCommentDate,
+    f.HighestQuestionFavoriteCount,
+    f.UserLocationCategory,
+    f.WeightedUserScore,
+    f.InfluenceScore,
+    DENSE_RANK() OVER (ORDER BY f.InfluenceScore DESC) AS InfluenceRank,
+    NTILE(5) OVER (ORDER BY f.TotalPosts DESC, f.TotalComments DESC, f.TotalBadges DESC) AS ActivityTier
+FROM FinalUserMetrics f
+
+UNION ALL
+
+SELECT -- This branch identifies users who are high-reputation/badge contributors but less active in recent posting/editing.
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    DATE_PART('day', NOW() - u.CreationDate) AS UserTenureDays,
+    NULL AS TotalPosts,
+    NULL AS TotalQuestions,
+    NULL AS TotalAnswers,
+    COUNT(b.Id) AS TotalBadges,
+    NULL AS TotalEdits,
+    NULL AS SelfEdits,
+    NULL AS OtherUserEdits,
+    NULL AS AvgEditIntervalSeconds,
+    NULL AS TotalAnswersPosted,
+    NULL AS AcceptedAnswersCount,
+    NULL AS AcceptedAnswerRatio,
+    NULL AS TopPreferredTag,
+    NULL AS TopTagPosts,
+    NULL AS TopTagUserAvgScore,
+    NULL AS TopTagGlobalAvgScore,
+    -- Correlated Subquery 1 (repurposed): Latest activity regarding close/reopen votes by this user
+    (SELECT MAX(ph.CreationDate)
+     FROM PostHistory ph
+     WHERE ph.UserId = u.Id AND ph.PostHistoryTypeId IN (10, 11, 12, 13) -- Post Closed, Post Reopened, Post Deleted, Post Undeleted
+    ) AS LatestSelfCommentDate,
+    -- Correlated Subquery 2 (repurposed): Number of unique posts this user has voted to close or reopen
+    (SELECT COUNT(DISTINCT ph.PostId)
+     FROM PostHistory ph
+     WHERE ph.UserId = u.Id AND ph.PostHistoryTypeId IN (10, 11)
+    ) AS HighestQuestionFavoriteCount,
+    -- String Expression (repurposed): AboutMe analysis and complexity
+    CASE
+        WHEN u.AboutMe IS NULL OR LENGTH(TRIM(u.AboutMe)) < 50 THEN 'Minimal Bio'
+        WHEN LOWER(u.AboutMe) LIKE '%sql%' OR LOWER(u.AboutMe) LIKE '%database%' THEN 'Database Specialist'
+        WHEN LOWER(u.AboutMe) LIKE '%cloud%' OR LOWER(u.AboutMe) LIKE '%azure%' OR LOWER(u.AboutMe) LIKE '%aws%' THEN 'Cloud Enthusiast'
+        WHEN LOWER(u.AboutMe) LIKE '%developer%' OR LOWER(u.AboutMe) LIKE '%engineer%' THEN 'Software Professional'
+        ELSE 'Detailed Bio'
+    END AS UserLocationCategory,
+    COALESCE(u.UpVotes, 0) + COALESCE(u.DownVotes, 0) * 0.1 AS WeightedUserScore, -- Simple score for this group
+    (u.Reputation * 0.5) + (COUNT(b.Id) * 0.3) + (SELECT COUNT(DISTINCT ph.PostId) FROM PostHistory ph WHERE ph.UserId = u.Id AND ph.PostHistoryTypeId IN (10, 11)) AS InfluenceScore,
+    DENSE_RANK() OVER (ORDER BY (u.Reputation * 0.5) + (COUNT(b.Id) * 0.3) DESC) AS InfluenceRank,
+    NTILE(5) OVER (ORDER BY COUNT(b.Id) DESC, u.Reputation DESC) AS ActivityTier
+FROM Users u
+JOIN Badges b ON u.Id = b.UserId
+WHERE u.Reputation >= 500
+AND NOT EXISTS (
+    SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id AND p.CreationDate > (NOW() - INTERVAL '1 year')
+) -- Users who haven't posted in the last year
+GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.UpVotes, u.DownVotes, u.AboutMe
+HAVING COUNT(b.Id) >= 10 -- Users with at least 10 badges
+ORDER BY InfluenceRank DESC, UserId ASC;

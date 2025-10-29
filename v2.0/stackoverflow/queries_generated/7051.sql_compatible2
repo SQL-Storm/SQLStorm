@@ -1,0 +1,198 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        STRING_AGG(DISTINCT p.Title, ' | ') AS PostTitles,
+        STRING_AGG(DISTINCT t.TagName, ', ') AS Tags,
+        AVG(p.Score) AS AvgScore,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN COALESCE(p.ViewCount,0) ELSE 0 END) AS TotalQuestionViews,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN COALESCE(p.ViewCount,0) ELSE 0 END) AS TotalAnswerViews
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Posts pt ON p.Id = pt.ParentId
+    LEFT JOIN Tags t ON p.Tags LIKE '%' || t.TagName || '%'
+    WHERE u.AccountId IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        PostCount,
+        QuestionCount,
+        AnswerCount,
+        BadgeCount,
+        LastPostDate,
+        PostTitles,
+        Tags,
+        AvgScore,
+        TotalQuestionViews,
+        TotalAnswerViews,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, PostCount DESC) AS RankByReputation,
+        ROW_NUMBER() OVER (ORDER BY PostCount DESC, Reputation DESC) AS RankByPostCount
+    FROM UserStats
+),
+QuestionAnalysis AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS HasAcceptedAnswer,
+        STRING_AGG(DISTINCT t.TagName, ', ') AS Tags,
+        COUNT(DISTINCT c.Id) AS CommentCountActual,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        NULL AS AvgVoteScore,
+        MAX(ph.CreationDate) AS LastActivityDate,
+        EXTRACT(EPOCH FROM (MAX(ph.CreationDate) - p.CreationDate)) / 86400.0 AS DaysSinceCreation,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS Status
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN Tags t ON p.Tags LIKE '%' || t.TagName || '%'
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.CreationDate, p.OwnerUserId, u.DisplayName, p.AcceptedAnswerId, p.ClosedDate
+),
+AnswerAnalysis AS (
+    SELECT 
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.Score,
+        a.CreationDate,
+        a.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        a.LastEditDate,
+        CASE WHEN a.OwnerUserId IS NULL THEN 1 ELSE 0 END AS IsCommunityAnswer,
+        CASE WHEN a.OwnerUserId = (SELECT OwnerUserId FROM Posts WHERE Id = a.ParentId) THEN 1 ELSE 0 END AS IsAnswerToOwnQuestion,
+        EXTRACT(EPOCH FROM (a.CreationDate - (SELECT CreationDate FROM Posts WHERE Id = a.ParentId))) / 86400.0 AS DaysToAnswer,
+        (SELECT COUNT(*) FROM Votes WHERE PostId = a.Id AND VoteTypeId = 2) AS UpVotes,
+        (SELECT COUNT(*) FROM Votes WHERE PostId = a.Id AND VoteTypeId = 3) AS DownVotes
+    FROM Posts a
+    LEFT JOIN Users u ON a.OwnerUserId = u.Id
+    WHERE a.PostTypeId = 2
+),
+CombinedAnalysis AS (
+    SELECT 
+        q.QuestionId,
+        q.Title,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.CommentCountActual,
+        q.VoteCount,
+        q.AvgVoteScore,
+        q.LastActivityDate,
+        q.DaysSinceCreation,
+        q.Status,
+        q.OwnerDisplayName,
+        COALESCE(q.Tags, 'No Tags') AS Tags,
+        COALESCE(a.AnswerId, 0) AS AnswerId,
+        a.Score AS AnswerScore,
+        a.OwnerDisplayName AS AnswerOwnerDisplayName,
+        a.DaysToAnswer,
+        a.IsCommunityAnswer,
+        CASE WHEN q.HasAcceptedAnswer = 1 THEN 'Yes' ELSE 'No' END AS HasAcceptedAnswer,
+        CASE WHEN a.IsAnswerToOwnQuestion = 1 THEN 'Yes' ELSE 'No' END AS IsAnswerToOwnQuestion,
+        ROW_NUMBER() OVER (PARTITION BY q.QuestionId ORDER BY a.Score DESC NULLS LAST, a.CreationDate DESC) AS AnswerRank,
+        AVG(q.Score) OVER (PARTITION BY q.OwnerUserId) AS OwnerAvgQuestionScore,
+        RANK() OVER (ORDER BY q.Score DESC) AS QuestionRank,
+        DENSE_RANK() OVER (ORDER BY q.ViewCount DESC) AS ViewRank,
+        NTILE(4) OVER (ORDER BY q.ViewCount DESC) AS ViewQuartile,
+        LAG(q.Title, 1) OVER (ORDER BY q.CreationDate) AS PrevQuestionTitle,
+        LEAD(q.Title, 1) OVER (ORDER BY q.CreationDate) AS NextQuestionTitle,
+        COUNT(*) OVER (PARTITION BY q.OwnerUserId) AS OwnerQuestionCount,
+        AVG(q.ViewCount) OVER (PARTITION BY q.OwnerUserId) AS OwnerAvgViewCount,
+        q.CreationDate,
+        q.OwnerUserId
+    FROM QuestionAnalysis q
+    LEFT JOIN AnswerAnalysis a ON q.QuestionId = a.QuestionId
+    WHERE q.DaysSinceCreation <= 365
+)
+SELECT 
+    'Question Analysis Summary' AS ReportType,
+    COUNT(*) AS Col1,
+    COUNT(DISTINCT OwnerUserId) AS Col2,
+    AVG(Score) AS Col3,
+    AVG(ViewCount) AS Col4,
+    AVG(AnswerCount) AS Col5,
+    AVG(CommentCountActual) AS Col6,
+    SUM(CASE WHEN Status = 'Closed' THEN 1 ELSE 0 END) AS Col7,
+    SUM(CASE WHEN Status = 'Open' THEN 1 ELSE 0 END) AS Col8,
+    MIN(CreationDate) AS Col9,
+    MAX(CreationDate) AS Col10,
+    STRING_AGG(DISTINCT Tags, '; ') AS Col11,
+    STRING_AGG(DISTINCT OwnerDisplayName, '; ') AS Col12
+FROM CombinedAnalysis
+
+UNION ALL
+
+SELECT 
+    'Top Performing Users' AS ReportType,
+    COUNT(*) AS Col1,
+    COUNT(DISTINCT UserId) AS Col2,
+    AVG(Reputation) AS Col3,
+    AVG(PostCount) AS Col4,
+    AVG(QuestionCount) AS Col5,
+    AVG(AnswerCount) AS Col6,
+    AVG(BadgeCount) AS Col7,
+    MIN(LastPostDate) AS Col8,
+    MAX(LastPostDate) AS Col9,
+    STRING_AGG(DISTINCT Tags, '; ') AS Col11,
+    STRING_AGG(DISTINCT DisplayName, '; ') AS Col12
+FROM TopUsers
+WHERE RankByReputation <= 100
+
+UNION ALL
+
+SELECT 
+    'Answer Quality Analysis' AS ReportType,
+    COUNT(*) AS Col1,
+    COUNT(DISTINCT QuestionId) AS Col2,
+    AVG(Score) AS Col3,
+    MAX(Score) AS Col4,
+    MIN(Score) AS Col5,
+    AVG(DaysToAnswer) AS Col6,
+    AVG(UpVotes) AS Col7,
+    AVG(DownVotes) AS Col8,
+    COUNT(CASE WHEN IsCommunityAnswer = 1 THEN 1 END) AS Col9,
+    COUNT(CASE WHEN IsAnswerToOwnQuestion = 1 THEN 1 END) AS Col10,
+    MIN(CreationDate) AS Col11,
+    MAX(CreationDate) AS Col12,
+    STRING_AGG(DISTINCT OwnerDisplayName, '; ') AS Col13,
+    STRING_AGG(DISTINCT DisplayName, '; ') AS Col14
+FROM (
+      SELECT 
+        a.QuestionId,
+        a.AnswerId,
+        a.Score,
+        a.CreationDate,
+        a.OwnerDisplayName,
+        a.DaysToAnswer,
+        a.UpVotes,
+        a.DownVotes,
+        a.IsCommunityAnswer,
+        a.IsAnswerToOwnQuestion,
+        u.DisplayName
+      FROM AnswerAnalysis a
+      LEFT JOIN Users u ON a.QuestionId = u.Id
+      WHERE a.DaysToAnswer <= 15
+    ) AS AnswerQualityCheck;

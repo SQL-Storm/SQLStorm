@@ -1,0 +1,107 @@
+-- {"query": "4553.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1464} 
+
+WITH RankedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount AS PostViewCount,
+        p.FavoriteCount AS PostFavoriteCount,
+        p.AnswerCount,
+        p.CommentCount,
+        pt.Name AS PostTypeName,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS ScoreRank,
+        AVG(CAST(p.Score AS FLOAT)) OVER (PARTITION BY p.PostTypeId) AS AvgScoreForType,
+        LAG(p.CreationDate, 1, p.CreationDate) OVER (ORDER BY p.CreationDate) AS PreviousPostCreationDate,
+        LEAD(p.CreationDate, 1, p.CreationDate) OVER (ORDER BY p.CreationDate) AS NextPostCreationDate,
+        COUNT(c.Id) OVER (PARTITION BY p.Id) AS CommentCountForPost,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id) AS UpVoteCountForPost,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id) AS DownVoteCountForPost
+    FROM Posts AS p
+    JOIN PostTypes AS pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Comments AS c ON p.Id = c.PostId
+    LEFT JOIN Votes AS v ON p.Id = v.PostId
+    WHERE p.PostTypeId IN (1, 2) -- Focus on Questions and Answers
+    GROUP BY
+        p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.FavoriteCount, p.AnswerCount, p.CommentCount, pt.Name
+),
+UserPostActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT CASE WHEN rp.PostTypeId = 1 THEN rp.PostId END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN rp.PostTypeId = 2 THEN rp.PostId END) AS AnswerCount,
+        SUM(CASE WHEN rp.PostTypeId = 1 THEN rp.PostScore ELSE 0 END) AS TotalQuestionScore,
+        SUM(CASE WHEN rp.PostTypeId = 2 THEN rp.PostScore ELSE 0 END) AS TotalAnswerScore,
+        AVG(rp.PostScore) AS AvgPostScoreForUser,
+        MAX(rp.PostCreationDate) AS LastPostDateForUser,
+        COUNT(DISTINCT rp.PostId) AS TotalPosts,
+        CASE WHEN u.Views > 0 THEN CAST(u.UpVotes AS FLOAT) / u.Views ELSE 0 END AS UpvoteRatio,
+        CASE WHEN u.Views > 0 THEN CAST(u.DownVotes AS FLOAT) / u.Views ELSE 0 END AS DownvoteRatio
+    FROM Users AS u
+    JOIN RankedPosts AS rp ON u.Id = rp.OwnerUserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Views, u.UpVotes, u.DownVotes
+)
+SELECT
+    rp.PostId,
+    rp.PostTypeName,
+    rp.PostCreationDate,
+    rp.PostScore,
+    rp.PostViewCount,
+    rp.PostFavoriteCount,
+    rp.CommentCountForPost,
+    rp.UpVoteCountForPost,
+    rp.DownVoteCountForPost,
+    upa.UserId,
+    upa.DisplayName AS OwnerDisplayName,
+    upa.Reputation AS OwnerReputation,
+    upa.UserCreationDate AS OwnerCreationDate,
+    upa.QuestionCount,
+    upa.AnswerCount,
+    upa.TotalQuestionScore,
+    upa.TotalAnswerScore,
+    upa.AvgPostScoreForUser,
+    upa.LastPostDateForUser,
+    upa.TotalPosts,
+    upa.UpvoteRatio,
+    upa.DownvoteRatio,
+    rp.AvgScoreForType,
+    rp.ScoreRank,
+    CASE
+        WHEN rp.PostScore > rp.AvgScoreForType * 1.5 THEN 'Above Average Performer'
+        WHEN rp.PostScore < rp.AvgScoreForType * 0.5 THEN 'Below Average Performer'
+        ELSE 'Average Performer'
+    END AS PerformanceCategory,
+    CASE
+        WHEN rp.PostCreationDate < DATE('now', '-1 year') AND rp.PostScore > 0 THEN 'Old High Score Post'
+        WHEN rp.PostCreationDate >= DATE('now', '-1 year') THEN 'Recent Post'
+        ELSE 'Established Post'
+    END AS AgeCategory,
+    COALESCE(upa.DisplayName, 'Anonymous') AS DisplayNameOrAnonymous,
+    rp.PostCreationDate BETWEEN rp.PreviousPostCreationDate AND rp.NextPostCreationDate AS IsChronologicallyContained,
+    STRPOS(rp.PostTypeName, 'Q') > 0 AS IsQuestionType, -- Simple string check
+    CASE
+        WHEN rp.PostFavoriteCount IS NULL THEN 0
+        WHEN rp.PostFavoriteCount > 100 THEN 'Highly Favorited'
+        WHEN rp.PostFavoriteCount > 10 THEN 'Moderately Favorited'
+        ELSE 'Less Favorited'
+    END AS FavoriteStatus,
+    (rp.PostScore + rp.CommentCountForPost) AS CombinedScore,
+    UPPER(LEFT(upa.DisplayName, 1)) AS FirstInitial
+FROM RankedPosts AS rp
+LEFT JOIN UserPostActivity AS upa ON rp.OwnerUserId = upa.UserId
+WHERE rp.PostScore > 0 OR rp.CommentCountForPost > 0
+UNION ALL
+SELECT
+    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+    NULL, NULL, NULL, NULL
+WHERE EXISTS (SELECT 1 FROM PostLinks WHERE LinkTypeId = 3);

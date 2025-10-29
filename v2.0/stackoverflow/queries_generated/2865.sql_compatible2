@@ -1,0 +1,157 @@
+with RecursiveTagStats as (
+  select 
+    t.Id,
+    t.TagName,
+    count(p.Id) as QuestionCount,
+    sum(coalesce(p.ViewCount,0)) as TotalViews,
+    row_number() over (order by count(p.Id) desc, sum(coalesce(p.ViewCount,0)) desc) as RankPos
+  from Tags t
+  left join Posts p on p.PostTypeId = 1 and p.Tags like concat('%<',t.TagName,'>%')
+  group by t.Id, t.TagName
+),
+UserBadgeRank as (
+  select 
+    u.Id as UserId,
+    u.DisplayName,
+    b.Class,
+    count(b.Id) as BadgeCount,
+    rank() over (partition by b.Class order by count(b.Id) desc) as BadgeRank
+  from Users u
+  left join Badges b on b.UserId = u.Id
+  group by u.Id, u.DisplayName, b.Class
+),
+PostAnswerInfo as (
+  select 
+    q.Id as QuestionId,
+    q.Title,
+    q.CreationDate as QuestionCreation,
+    a.Id as AnswerId,
+    a.CreationDate as AnswerCreation,
+    a.Score as AnswerScore,
+    a.OwnerUserId as AnswerOwnerId,
+    u.DisplayName as AnswerOwner,
+    case when a.Id = q.AcceptedAnswerId then 1 else 0 end as IsAccepted,
+    sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+    sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+    row_number() over (partition by q.Id order by a.Score desc, a.CreationDate asc) as AnswerRank
+  from Posts q
+  left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+  left join Users u on u.Id = a.OwnerUserId
+  left join Votes v on v.PostId = a.Id
+  where q.PostTypeId = 1
+  group by q.Id, q.Title, q.CreationDate, a.Id, a.CreationDate, a.Score, a.OwnerUserId, u.DisplayName, q.AcceptedAnswerId
+),
+PostCloseHistory as (
+  select
+    ph.PostId,
+    max(case when ph.PostHistoryTypeId = 10 then ph.CreationDate else null end) as LastClosedDate,
+    max(case when ph.PostHistoryTypeId = 11 then ph.CreationDate else null end) as LastReopenedDate,
+    max(case when ph.PostHistoryTypeId = 10 then cast(ph.Comment as int) else null end) as CloseReasonId
+  from PostHistory ph
+  where ph.PostHistoryTypeId in (10,11)
+  group by ph.PostId
+),
+CombinedPostsInfo as (
+  select 
+    pai.QuestionId,
+    pai.Title,
+    pai.QuestionCreation,
+    pai.AnswerId,
+    pai.AnswerCreation,
+    pai.AnswerScore,
+    pai.AnswerOwnerId,
+    pai.AnswerOwner,
+    pai.IsAccepted,
+    pai.UpVotes,
+    pai.DownVotes,
+    pc.LastClosedDate,
+    pc.LastReopenedDate,
+    pc.CloseReasonId,
+    rts.TagName as TopTag,
+    rts.RankPos as TopTagRank,
+    ubr.DisplayName as AnswerTopBadgeUser,
+    ubr.BadgeCount as BadgeCount,
+    ubr.Class as BadgeClass
+  from PostAnswerInfo pai
+  left join PostCloseHistory pc on pc.PostId = pai.QuestionId
+  left join RecursiveTagStats rts on rts.TagName = (
+    select subtag.TagName
+    from Tags subtag
+    join Posts pq on pq.PostTypeId=1 and pq.Id = pai.QuestionId and pq.Tags like concat('%<',subtag.TagName,'>%')
+    order by subtag.Count desc limit 1
+  )
+  left join UserBadgeRank ubr on ubr.UserId = pai.AnswerOwnerId and ubr.BadgeRank = 1
+  where pai.AnswerRank <= 3
+),
+PrimaryResult as (
+select 
+  cpi.QuestionId,
+  cpi.Title,
+  cpi.QuestionCreation,
+  coalesce(to_char(cpi.LastClosedDate, 'YYYY-MM-DD HH24:MI:SS'), 'Open') as PostStatus,
+  cpi.CloseReasonId,
+  cpi.AnswerId,
+  cpi.AnswerCreation,
+  cpi.AnswerScore,
+  cpi.AnswerOwner,
+  cpi.IsAccepted,
+  cpi.UpVotes,
+  cpi.DownVotes,
+  cpi.TopTag,
+  cpi.TopTagRank,
+  cpi.AnswerTopBadgeUser,
+  cpi.BadgeCount,
+  case cpi.BadgeClass 
+    when 1 then 'Gold'
+    when 2 then 'Silver'
+    when 3 then 'Bronze'
+    else 'None' end as BadgeClass,
+  length(coalesce(cpi.Title,'')) as TitleLength,
+  length(coalesce(cpi.AnswerOwner,'')) as AnswerOwnerNameLength,
+  (length(coalesce(cpi.Title,'')) + length(coalesce(cpi.AnswerOwner,''))) as CombinedNameLength,
+  substring(cpi.Title,1,15) || '...' as TitlePreview
+from CombinedPostsInfo cpi
+where cpi.QuestionCreation >= cast('2024-10-01' as date) - interval '180 day'
+  and (cpi.IsAccepted = 1 or cpi.BadgeClass = 1)
+),
+SecondaryResult as (
+select 
+  p.Id as QuestionId,
+  p.Title,
+  p.CreationDate as QuestionCreation,
+  cast(null as text) as PostStatus,
+  cast(null as int) as CloseReasonId,
+  cast(null as int) as AnswerId,
+  cast(null as timestamp) as AnswerCreation,
+  cast(null as int) as AnswerScore,
+  cast(null as text) as AnswerOwner,
+  cast(null as int) as IsAccepted,
+  cast(null as int) as UpVotes,
+  cast(null as int) as DownVotes,
+  cast(null as text) as TopTag,
+  cast(null as int) as TopTagRank,
+  cast(null as text) as AnswerTopBadgeUser,
+  cast(null as int) as BadgeCount,
+  cast(null as int) as BadgeClass,
+  cast(null as int) as TitleLength,
+  cast(null as int) as AnswerOwnerNameLength,
+  cast(null as int) as CombinedNameLength,
+  cast(null as text) as TitlePreview
+from Posts p
+where p.PostTypeId = 1
+  and p.CreationDate < cast('2024-10-01' as date) - interval '180 day'
+  and not exists (
+    select 1 from Posts a where a.ParentId = p.Id and a.PostTypeId = 2
+  )
+)
+select * from (
+  select * from PrimaryResult
+  order by QuestionCreation desc, AnswerScore desc
+  limit 100
+) as pr
+union all
+select * from (
+  select * from SecondaryResult
+  order by QuestionCreation desc
+  limit 20
+) as sr;

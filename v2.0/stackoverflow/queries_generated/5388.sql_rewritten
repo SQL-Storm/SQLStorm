@@ -1,0 +1,116 @@
+-- {"query": "5388.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 888} 
+WITH recent_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.PostTypeId,
+    u.Reputation,
+    u.DisplayName,
+    u.Location,
+    u.AccountId
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId = 1 -- questions
+    AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+),
+tag_summary AS (
+  SELECT
+    t.TagName,
+    COALESCE(t.Count, 0) AS TagCount,
+    ARRAY_AGG(DISTINCT q.PostId) AS QuestionIds
+  FROM Tags t
+  LEFT JOIN Posts q ON q.Id = t.ExcerptPostId
+  WHERE t.IsModeratorOnly = 0
+  GROUP BY t.TagName, t.Count
+),
+active_users AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.UpVotes,
+    u.DownVotes,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.AccountId
+  FROM Users u
+  WHERE u.Reputation > 1000
+),
+complex_metrics AS (
+  SELECT
+    rq.PostId,
+    rq.Title,
+    rq.Tags,
+    rq.CreationDate,
+    rq.Score,
+    rq.ViewCount,
+    rq.AnswerCount,
+    rq.CommentCount,
+    rq.FavoriteCount,
+    rq.LastActivityDate,
+    -- window function: rank questions by last activity within 30 days
+    ROW_NUMBER() OVER (PARTITION BY rq.OwnerUserId ORDER BY rq.LastActivityDate DESC) AS rn_by_user,
+    -- correlated subquery: count of comments by the question's author
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = rq.PostId AND c.UserId = rq.OwnerUserId) AS AuthorCommentCount
+  FROM recent_questions rq
+  LEFT JOIN active_users au ON rq.OwnerUserId = au.UserId
+  WHERE rq.OwnerUserId IS NOT NULL
+)
+SELECT
+  cm.PostId,
+  cm.Title,
+  cm.Tags,
+  cm.CreationDate,
+  cm.Score,
+  cm.ViewCount,
+  cm.LastActivityDate,
+  cm.AnswerCount,
+  cm.CommentCount,
+  cm.FavoriteCount,
+  cm.Reputation AS OwnerReputation,
+  cm.DisplayName AS OwnerDisplayName,
+  cm.Location AS OwnerLocation,
+  cm.AuthorCommentCount,
+  STRING_AGG(DISTINCT t.TagName, ',') AS AllTags,
+  (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = cm.PostId AND pl.LinkTypeId = 1) AS LinkedCount,
+  (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = cm.PostId) AS TotalLinks,
+  (SELECT COUNT(*) FROM Votes v WHERE v.PostId = cm.PostId AND v.VoteTypeId = 2) AS UpModCount,
+  (SELECT MAX(v.BountyAmount) FROM Votes v WHERE v.PostId = cm.PostId AND v.VoteTypeId = 8) AS MaxBounty
+FROM complex_metrics cm
+LEFT JOIN (
+  SELECT DISTINCT PostId, UnnestTagName AS TagName
+  FROM Posts p
+  CROSS JOIN LATERAL (
+    SELECT UNNEST(string_to_array(substr(p.Tags, 2, length(p.Tags)-2), '><')) AS UnnestTagName
+  ) t
+) tt ON cm.PostId = tt.PostId
+LEFT JOIN (
+  SELECT TagName FROM Tags
+) t ON t.TagName = tt.TagName
+GROUP BY
+  cm.PostId,
+  cm.Title,
+  cm.Tags,
+  cm.CreationDate,
+  cm.Score,
+  cm.ViewCount,
+  cm.LastActivityDate,
+  cm.AnswerCount,
+  cm.CommentCount,
+  cm.FavoriteCount,
+  cm.Reputation,
+  cm.DisplayName,
+  cm.Location,
+  cm.AuthorCommentCount
+ORDER BY cm.LastActivityDate DESC
+LIMIT 100;

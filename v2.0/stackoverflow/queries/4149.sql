@@ -1,0 +1,128 @@
+WITH RankedQuestions AS (
+  SELECT
+    p.Id AS QuestionId,
+    p.Title AS QuestionTitle,
+    p.OwnerUserId,
+    u.DisplayName AS OwnerDisplayName,
+    p.CreationDate AS QuestionCreationDate,
+    p.Score AS QuestionScore,
+    p.ViewCount AS QuestionViewCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.Tags,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserQuestionRank,
+    CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosedQuestion
+  FROM Posts AS p
+  JOIN Users AS u
+    ON p.OwnerUserId = u.Id
+  WHERE
+    p.PostTypeId = 1
+), RecentAnswers AS (
+  SELECT
+    ans.ParentId AS QuestionId,
+    COUNT(ans.Id) AS RecentAnswerCount,
+    SUM(CASE WHEN ans.Score > 0 THEN 1 ELSE 0 END) AS PositiveScoreAnswerCount,
+    AVG(ans.Score) AS AverageAnswerScore,
+    MAX(ans.CreationDate) AS LatestAnswerDate
+  FROM Posts AS ans
+  WHERE
+    ans.PostTypeId = 2
+    AND ans.CreationDate > (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 day')
+  GROUP BY
+    ans.ParentId
+), UserEngagement AS (
+  SELECT
+    ph.UserId,
+    COUNT(DISTINCT ph.PostId) AS PostsEngagedWith,
+    SUM(CASE WHEN ph.PostHistoryTypeId IN (2, 5) THEN 1 ELSE 0 END) AS BodyEdits,
+    SUM(CASE WHEN ph.PostHistoryTypeId IN (1, 4) THEN 1 ELSE 0 END) AS TitleEdits,
+    SUM(CASE WHEN ph.PostHistoryTypeId IN (3, 6) THEN 1 ELSE 0 END) AS TagEdits,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.PostId ELSE NULL END) AS UpvotesCast,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.PostId ELSE NULL END) AS DownvotesCast
+  FROM PostHistory AS ph
+  LEFT JOIN Votes AS v
+    ON ph.UserId = v.UserId
+    AND ph.PostId = v.PostId
+    AND v.VoteTypeId IN (2, 3)
+  WHERE
+    ph.UserId IS NOT NULL
+  GROUP BY
+    ph.UserId
+)
+SELECT
+  rq.QuestionId,
+  rq.QuestionTitle,
+  rq.OwnerDisplayName,
+  rq.QuestionCreationDate,
+  rq.QuestionScore,
+  rq.QuestionViewCount,
+  rq.AnswerCount,
+  rq.FavoriteCount,
+  rq.Tags,
+  COALESCE(ra.RecentAnswerCount, 0) AS TotalRecentAnswers,
+  COALESCE(ra.PositiveScoreAnswerCount, 0) AS RecentPositiveScoreAnswers,
+  ra.AverageAnswerScore,
+  COALESCE(ue.PostsEngagedWith, 0) AS UserTotalPostsEngaged,
+  COALESCE(ue.BodyEdits, 0) AS UserBodyEditCount,
+  COALESCE(ue.TitleEdits, 0) AS UserTitleEditCount,
+  COALESCE(ue.TagEdits, 0) AS UserTagEditCount,
+  COALESCE(ue.UpvotesCast, 0) AS UserUpvotesCast,
+  COALESCE(ue.DownvotesCast, 0) AS UserDownvotesCast,
+  (
+    SELECT COUNT(*)
+    FROM Comments AS c
+    WHERE c.PostId = rq.QuestionId
+      AND c.CreationDate > (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year')
+  ) AS RecentCommentCount,
+  CASE
+    WHEN rq.UserQuestionRank <= 5 THEN 'Top 5 Recent Questions'
+    WHEN rq.UserQuestionRank <= 20 THEN 'Top 20 Recent Questions'
+    ELSE 'Other'
+  END AS UserQuestionPlacement,
+  CASE
+    WHEN (EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - rq.QuestionCreationDate)) / 86400) > 365 THEN 'Older Than A Year'
+    WHEN (EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - rq.QuestionCreationDate)) / 86400) > 90 THEN 'Between 3 Months and A Year'
+    ELSE 'Within Last 3 Months'
+  END AS QuestionAgeCategory,
+  CASE
+    WHEN rq.FavoriteCount > 100 AND rq.QuestionScore > 500 THEN 'Highly Favorited and Scored'
+    WHEN rq.FavoriteCount > 50 OR rq.QuestionScore > 200 THEN 'Moderately Popular'
+    ELSE 'Standard Popularity'
+  END AS PopularityTier,
+  CASE WHEN rq.IsClosedQuestion = 1 THEN 'Closed' ELSE 'Open' END AS QuestionStatus,
+  CHAR_LENGTH(rq.QuestionTitle) AS TitleLength,
+  REPLACE(rq.Tags, '><', ' ') AS TagList
+FROM RankedQuestions AS rq
+LEFT JOIN RecentAnswers AS ra
+  ON rq.QuestionId = ra.QuestionId
+LEFT JOIN UserEngagement AS ue
+  ON rq.OwnerUserId = ue.UserId
+WHERE
+  rq.QuestionScore > 0
+  AND rq.OwnerUserId IS NOT NULL
+  AND rq.OwnerUserId <> -1
+GROUP BY
+  rq.QuestionId,
+  rq.QuestionTitle,
+  rq.OwnerDisplayName,
+  rq.QuestionCreationDate,
+  rq.QuestionScore,
+  rq.QuestionViewCount,
+  rq.AnswerCount,
+  rq.FavoriteCount,
+  rq.Tags,
+  ra.RecentAnswerCount,
+  ra.PositiveScoreAnswerCount,
+  ra.AverageAnswerScore,
+  ue.PostsEngagedWith,
+  ue.BodyEdits,
+  ue.TitleEdits,
+  ue.TagEdits,
+  ue.UpvotesCast,
+  ue.DownvotesCast,
+  rq.UserQuestionRank,
+  rq.IsClosedQuestion
+ORDER BY
+  rq.QuestionScore DESC,
+  rq.QuestionViewCount DESC
+LIMIT 100;

@@ -1,0 +1,220 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        AVG(p.Score) AS AvgPostScore,
+        STRING_AGG(DISTINCT p.Tags, ', ') AS AllTags,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 100 THEN 'High Activity'
+            WHEN COUNT(DISTINCT p.Id) > 50 THEN 'Medium Activity'
+            ELSE 'Low Activity'
+        END AS ActivityLevel
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId OR u.Id = p.LastEditorUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        u.DisplayName AS OwnerName,
+        p.Tags,
+        p.Body,
+        CASE 
+            WHEN p.Score > 10 THEN 'High Score'
+            WHEN p.Score > 5 THEN 'Medium Score'
+            ELSE 'Low Score'
+        END AS ScoreCategory,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) AS ScoreRank,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) AS RecentPostNumber,
+        LAG(p.Score) OVER (ORDER BY p.CreationDate) AS PreviousScore,
+        LAG(p.CreationDate) OVER (ORDER BY p.CreationDate) AS PreviousPostDate,
+        COALESCE(p.AcceptedAnswerId, 0) AS HasAcceptedAnswer,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+            ELSE 'Open'
+        END AS PostStatus,
+        COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        CASE 
+            WHEN p.AnswerCount > 0 AND p.AcceptedAnswerId IS NOT NULL THEN 'Answered with Accepted'
+            WHEN p.AnswerCount > 0 THEN 'Answered'
+            ELSE 'Unanswered'
+        END AS AnswerStatus
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.Id IS NOT NULL
+      AND p.PostTypeId IN (1, 2)
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 500 THEN 'Popular Tag'
+            WHEN t.Count > 100 THEN 'Moderate Tag'
+            ELSE 'Rare Tag'
+        END AS TagPopularity,
+        DENSE_RANK() OVER (ORDER BY t.Count DESC) AS PopularityRank
+    FROM Tags t
+    WHERE t.TagName IS NOT NULL
+),
+ComplexQuery AS (
+    SELECT 
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.PostCount,
+        us.CommentCount,
+        us.BadgeCount,
+        us.ActivityLevel,
+        pa.PostId,
+        pa.Title,
+        pa.Score,
+        pa.ViewCount,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.ScoreCategory,
+        pa.ScoreRank,
+        pa.PostStatus,
+        pa.AnswerStatus,
+        pa.CreationDate,
+        pa.PostTypeId,
+        pa.OwnerUserId,
+        ta.TagName,
+        ta.TagCount,
+        ta.TagPopularity,
+        CASE 
+            WHEN (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = pa.PostId AND ph.PostHistoryTypeId = 10) > 0 
+            THEN 'Previously Closed'
+            ELSE 'Never Closed'
+        END AS ClosureHistory,
+        CASE 
+            WHEN pa.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) 
+            THEN 'Above Average Question'
+            ELSE 'Below Average Question'
+        END AS QuestionPerformance,
+        CASE 
+            WHEN pa.PostTypeId = 1 AND pa.AnswerCount > 0 THEN 
+                (SELECT COUNT(*) FROM Posts p2 WHERE p2.ParentId = pa.PostId AND p2.PostTypeId = 2 AND p2.Score > 0) 
+            ELSE 0 
+        END AS PositiveAnswers,
+        CASE 
+            WHEN pa.Score > 0 
+            THEN (pa.Score * 1.0 / (1.0 + pa.ViewCount))
+            ELSE 0 
+        END AS ScorePerView,
+        ROW_NUMBER() OVER (PARTITION BY us.UserId ORDER BY pa.Score DESC) AS TopPostByUser,
+        RANK() OVER (ORDER BY pa.Score DESC) AS GlobalScoreRank,
+        NTILE(4) OVER (ORDER BY pa.Score DESC) AS ScoreQuartile,
+        (SELECT MAX(Score) FROM Posts WHERE OwnerUserId = us.UserId AND PostTypeId = 1) AS MaxScoreByUser
+    FROM UserStats us
+    INNER JOIN PostAnalysis pa ON us.UserId = pa.OwnerUserId
+    LEFT JOIN TagAnalysis ta ON (pa.Tags LIKE '%' || ta.TagName || '%')
+    WHERE us.PostCount > 0
+)
+SELECT 
+    cq.UserId,
+    cq.DisplayName,
+    cq.Reputation,
+    cq.PostCount,
+    cq.CommentCount,
+    cq.BadgeCount,
+    cq.ActivityLevel,
+    cq.PostId,
+    cq.Title,
+    cq.Score,
+    cq.ViewCount,
+    cq.AnswerCount,
+    cq.CommentCount,
+    cq.ScoreCategory,
+    cq.ScoreRank,
+    cq.PostStatus,
+    cq.AnswerStatus,
+    cq.CreationDate,
+    cq.TagName,
+    cq.TagCount,
+    cq.TagPopularity,
+    cq.ClosureHistory,
+    cq.QuestionPerformance,
+    cq.PositiveAnswers,
+    cq.ScorePerView,
+    cq.TopPostByUser,
+    cq.GlobalScoreRank,
+    cq.ScoreQuartile,
+    cq.MaxScoreByUser,
+    CASE 
+        WHEN cq.ScoreRank <= 10 THEN 'Top 10 Score'
+        WHEN cq.ScoreRank <= 50 THEN 'Top 50 Score'
+        WHEN cq.ScoreRank <= 100 THEN 'Top 100 Score'
+        ELSE 'Other'
+    END AS TopScoreCategory,
+    ABS(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - cq.CreationDate)) / 86400) AS DaysSincePost,
+    CASE 
+        WHEN ABS(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - cq.CreationDate)) / 86400) > 365 THEN 'Legacy Post'
+        WHEN ABS(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - cq.CreationDate)) / 86400) > 180 THEN 'Recent Post'
+        ELSE 'Very Recent Post'
+    END AS PostAgeCategory,
+    CAST((cq.Score * 1.0 / NULLIF(cq.ViewCount, 0)) AS DECIMAL(10,4)) AS ScoreToViewRatio,
+    CASE 
+        WHEN cq.PostStatus = 'Closed' AND cq.Score < 0 THEN 'Negative Score Closed Post'
+        WHEN cq.PostStatus = 'Closed' AND cq.Score >= 0 THEN 'Positive Score Closed Post'
+        WHEN cq.PostStatus = 'Open' AND cq.Score < 0 THEN 'Negative Score Open Post'
+        WHEN cq.PostStatus = 'Open' AND cq.Score >= 0 THEN 'Positive Score Open Post'
+        ELSE 'Unknown'
+    END AS PerformanceCategory,
+    CASE 
+        WHEN cq.BadgeCount >= 10 THEN 'Badge Master'
+        WHEN cq.BadgeCount >= 5 THEN 'Badge Enthusiast'
+        WHEN cq.BadgeCount >= 1 THEN 'Badge Beginner'
+        ELSE 'No Badges'
+    END AS BadgeStatus,
+    LAG(cq.Score) OVER (ORDER BY cq.UserId, cq.CreationDate) AS PreviousUserScore,
+    LAG(cq.Reputation) OVER (ORDER BY cq.UserId) AS PreviousUserReputation,
+    COALESCE(
+        (SELECT COUNT(*) FROM Comments c WHERE c.UserId = cq.UserId AND c.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30' DAY)),
+        0
+    ) AS RecentCommentsCount,
+    COALESCE(
+        (SELECT COUNT(*) FROM Votes v WHERE v.UserId = cq.UserId AND v.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30' DAY)),
+        0
+    ) AS RecentVotesCount,
+    (cq.Score * cq.ViewCount) / NULLIF((cq.ViewCount + cq.AnswerCount + cq.CommentCount), 0) AS EngagementScore,
+    CASE 
+        WHEN (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = cq.PostId AND ph.PostHistoryTypeId = 1) > 0 THEN 'Has Initial Title'
+        ELSE 'No Initial Title'
+    END AS TitleHistoryFlag
+FROM ComplexQuery cq
+WHERE cq.PostStatus IN ('Open', 'Closed')
+    AND cq.ScoreCategory IN ('High Score', 'Medium Score')
+    AND cq.ActivityLevel IN ('High Activity', 'Medium Activity')
+    AND cq.TagCount > 0
+    AND cq.Score > 0
+    AND cq.ViewCount > 0
+    AND cq.AnswerCount >= 0
+ORDER BY cq.Score DESC, cq.Reputation DESC
+LIMIT 1000 OFFSET 0;

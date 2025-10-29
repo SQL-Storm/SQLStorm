@@ -1,0 +1,132 @@
+WITH
+post_agg AS (
+    SELECT
+        p.OwnerUserId AS user_id,
+        COUNT(*) AS total_posts,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS total_answers,
+        MAX(p.CreationDate) AS latest_post_date
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+comment_agg AS (
+    SELECT
+        c.UserId AS user_id,
+        COUNT(*) AS total_comments
+    FROM Comments c
+    GROUP BY c.UserId
+),
+badge_agg AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_badges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_badges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_badges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+vote_agg AS (
+    SELECT
+        v.PostId,
+        SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS up_votes,
+        SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS down_votes
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY v.PostId
+),
+tag_agg AS (
+    SELECT
+        p.OwnerUserId AS user_id,
+        COUNT(DISTINCT tag) AS distinct_tags
+    FROM Posts p
+    CROSS JOIN LATERAL (
+        SELECT trim(both '<>' FROM p.Tags) AS tags_trimmed
+    ) t1
+    CROSS JOIN LATERAL (
+        SELECT unnest(string_to_array(t1.tags_trimmed, '><')) AS tag
+    ) t2
+    WHERE p.Tags IS NOT NULL AND p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+user_stats AS (
+    SELECT
+        u.Id AS user_id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(pa.total_posts, 0) AS post_count,
+        COALESCE(pa.total_answers, 0) AS answer_count,
+        COALESCE(ca.total_comments, 0) AS comment_count,
+        COALESCE(ba.gold_badges, 0) AS gold_badges,
+        COALESCE(ba.silver_badges, 0) AS silver_badges,
+        COALESCE(ba.bronze_badges, 0) AS bronze_badges,
+        COALESCE(ta.distinct_tags, 0) AS tag_variety,
+        COALESCE(
+            (SELECT SUM(vu.up_votes - vu.down_votes)
+             FROM vote_agg vu
+             WHERE vu.PostId = (
+                 SELECT MIN(p2.Id)
+                 FROM Posts p2
+                 WHERE p2.OwnerUserId = u.Id
+             )
+            ), 0) AS net_vote_score,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, COALESCE(pa.total_posts,0) DESC) AS rep_rank,
+        CASE
+            WHEN u.Reputation >= 20000 THEN 'Legendary'
+            WHEN u.Reputation >= 10000 THEN 'Expert'
+            WHEN u.Reputation >= 5000 THEN 'Contributor'
+            ELSE 'Novice'
+        END AS reputation_tier,
+        pa.latest_post_date
+    FROM Users u
+    LEFT JOIN post_agg pa ON pa.user_id = u.Id
+    LEFT JOIN comment_agg ca ON ca.user_id = u.Id
+    LEFT JOIN badge_agg ba ON ba.UserId = u.Id
+    LEFT JOIN tag_agg ta ON ta.user_id = u.Id
+)
+
+SELECT *
+FROM (
+    SELECT
+        us.user_id,
+        us.DisplayName,
+        us.Reputation,
+        us.post_count,
+        us.answer_count,
+        us.comment_count,
+        us.gold_badges,
+        us.silver_badges,
+        us.bronze_badges,
+        us.tag_variety,
+        us.net_vote_score,
+        us.rep_rank,
+        us.reputation_tier,
+        us.latest_post_date,
+        (SELECT COUNT(*)
+         FROM PostHistory ph
+         WHERE ph.UserId = us.user_id
+           AND ph.PostHistoryTypeId = 10) AS close_votes_cast
+    FROM user_stats us
+    WHERE us.rep_rank <= 100
+    ORDER BY us.rep_rank
+    OFFSET 0 ROWS FETCH NEXT 50 ROWS ONLY
+
+    UNION ALL
+
+    SELECT
+        CAST(NULL AS BIGINT) AS user_id,
+        CAST('--- SUMMARY ---' AS TEXT) AS DisplayName,
+        CAST(NULL AS INTEGER) AS Reputation,
+        CAST(NULL AS INTEGER) AS post_count,
+        CAST(NULL AS INTEGER) AS answer_count,
+        CAST(NULL AS INTEGER) AS comment_count,
+        CAST(NULL AS INTEGER) AS gold_badges,
+        CAST(NULL AS INTEGER) AS silver_badges,
+        CAST(NULL AS INTEGER) AS bronze_badges,
+        CAST(NULL AS INTEGER) AS tag_variety,
+        CAST(NULL AS INTEGER) AS net_vote_score,
+        CAST(NULL AS INTEGER) AS rep_rank,
+        CAST(NULL AS TEXT) AS reputation_tier,
+        CAST(NULL AS TIMESTAMP) AS latest_post_date,
+        CAST(NULL AS INTEGER) AS close_votes_cast
+) t
+LIMIT 1;

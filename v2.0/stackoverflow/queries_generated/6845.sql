@@ -1,0 +1,44 @@
+-- {"query": "6845.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-micro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 461} 
+
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    MAX(u.CreationDate) AS LatestAccountActivity,
+    MAX(p.LastActivityDate) AS LatestPostActivity,
+    AVG(p.Score) AS AvgPostScore,
+    MAX(ph.CreationDate) AS LastEdit,
+    SUBSTRING_INDEX(GROUP_CONCAT(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN p2.Title ELSE NULL END SEPARATOR ', '), ',', 10) AS TopTenDuplicateQuestions,
+    (
+        SELECT COUNT(*) 
+        FROM Badges b 
+        WHERE b.UserId = u.Id AND b.Class = 1
+    ) AS GoldBadgeCount,
+    (
+        SELECT COUNT(DISTINCT p3.Id) 
+        FROM Posts p3 
+        INNER JOIN Votes v ON v.PostId = p3.Id AND v.VoteTypeId = 2 
+        WHERE p3.OwnerUserId = u.Id AND v.CreationDate >= DATE_SUB(NOW(), INTERVAL 1 YEAR)
+    ) AS UpvotesReceivedLastYear
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON p.OwnerUserId = u.Id
+LEFT JOIN 
+    PostLinks pl ON pl.PostId = p.Id AND pl.LinkTypeId = 3
+LEFT JOIN 
+    Posts p2 ON pl.RelatedPostId = p2.Id AND p2.PostTypeId = 1
+LEFT JOIN 
+    PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 5
+WHERE 
+    u.Reputation > 10000
+GROUP BY 
+    u.Id
+HAVING 
+    AVG(p.Score) > 10
+ORDER BY 
+    u.Reputation DESC, 
+    TotalPosts DESC
+LIMIT 100;

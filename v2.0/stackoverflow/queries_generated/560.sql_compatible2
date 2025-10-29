@@ -1,0 +1,378 @@
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        coalesce(nullif(trim(u.location), ''), 'Unknown') as norm_location,
+        u.reputation,
+        u.creationdate,
+        u.lastaccessdate,
+        cast(date_part('year', age(cast('2024-10-01 12:34:56' as timestamp), u.creationdate)) as int) as acct_age_years,
+        row_number() over (order by u.creationdate desc, u.id desc) as rn_newest
+    from users u
+),
+user_badge_mix as (
+    select
+        b.userid,
+        count(*) filter (where b.class = 1) as golds,
+        count(*) filter (where b.class = 2) as silvers,
+        count(*) filter (where b.class = 3) as bronzes,
+        count(*) filter (where b.tagbased = true) as tag_badges,
+        count(*) as total_badges,
+        min(b.date) as first_badge_date,
+        max(b.date) as last_badge_date
+    from badges b
+    group by b.userid
+),
+question_core as (
+    select
+        p.id as qid,
+        p.owneruserid as asker_id,
+        p.creationdate as q_created,
+        p.score as q_score,
+        p.viewcount as q_views,
+        p.answercount,
+        p.title,
+        p.tags,
+        p.acceptedanswerid,
+        p.closeddate,
+        coalesce(p.favoritecount, 0) as favs
+    from posts p
+    where p.posttypeid = 1
+),
+answer_core as (
+    select
+        a.id as aid,
+        a.parentid as qid,
+        a.owneruserid as answerer_id,
+        a.creationdate as a_created,
+        a.score as a_score
+    from posts a
+    where a.posttypeid = 2
+),
+q_accepted as (
+    select
+        qc.qid,
+        case when qc.acceptedanswerid is not null then 1 else 0 end as has_accepted,
+        ac.a_created as accepted_created,
+        extract(epoch from (ac.a_created - qc.q_created)) as seconds_to_accept
+    from question_core qc
+    left join answer_core ac
+      on ac.aid = qc.acceptedanswerid
+),
+q_vote_summ as (
+    select
+        v.postid as qid,
+        count(*) filter (where v.votetypeid = 2) as upvotes,
+        count(*) filter (where v.votetypeid = 3) as downvotes,
+        count(*) filter (where v.votetypeid = 5) as favorites,
+        count(*) filter (where v.votetypeid = 8) as bounties_started,
+        sum(v.bountyamount) filter (where v.votetypeid in (8,9)) as bounty_total
+    from votes v
+    group by v.postid
+),
+q_comment_summ as (
+    select
+        c.postid as qid,
+        count(*) as comments,
+        max(c.creationdate) as last_comment_at,
+        sum(greatest(c.score, 0)) as nonneg_comment_score
+    from comments c
+    group by c.postid
+),
+q_link_dupes as (
+    select
+        pl.postid as qid,
+        count(*) filter (where pl.linktypeid = 3) as duplicate_links,
+        count(*) filter (where pl.linktypeid = 1) as linked_links,
+        max(pl.creationdate) as last_link_at
+    from postlinks pl
+    group by pl.postid
+),
+q_history_flags as (
+    select
+        ph.postid as qid,
+        max(case when ph.posthistorytypeid = 10 then 1 else 0 end) as was_closed,
+        max(case when ph.posthistorytypeid = 11 then 1 else 0 end) as was_reopened,
+        max(case when ph.posthistorytypeid in (12,10) then 1 else 0 end) as had_mod_action,
+        min(ph.creationdate) filter (where ph.posthistorytypeid in (10,11,12,13,14,15,19,20)) as first_mgmt_event_at
+    from posthistory ph
+    group by ph.postid
+),
+tag_expansion as (
+    select
+        qc.qid,
+        unnest(string_to_array(substring(qc.tags from 2 for length(qc.tags)-2), '><')) as tagname
+    from question_core qc
+    where qc.tags is not null and qc.tags like '<%>'
+),
+tag_rank as (
+    select
+        te.qid,
+        te.tagname,
+        t.count as tag_global_count,
+        row_number() over (partition by te.qid order by t.count desc nulls last, te.tagname) as tag_rank_by_pop
+    from tag_expansion te
+    left join tags t
+      on lower(t.tagname) = lower(te.tagname)
+),
+top3_tags as (
+    select
+        qid,
+        string_agg(tagname, ' | ' order by tag_rank_by_pop) as top_tags
+    from tag_rank
+    where tag_rank_by_pop <= 3
+    group by qid
+),
+first_answer as (
+    select distinct on (ac.qid)
+        ac.qid,
+        ac.aid as first_aid,
+        ac.answerer_id as first_answerer_id,
+        ac.a_created as first_answer_created,
+        extract(epoch from (ac.a_created - qc.q_created)) as seconds_to_first_answer
+    from answer_core ac
+    join question_core qc on qc.qid = ac.qid
+    order by ac.qid, ac.a_created, ac.aid
+),
+answer_stats as (
+    select
+        ac.qid,
+        count(*) as answers_total,
+        cast(avg(ac.a_score) as numeric(12,4)) as avg_answer_score,
+        max(ac.a_score) as max_answer_score,
+        sum(case when ac.a_score > 0 then 1 else 0 end) as pos_answer_count
+    from answer_core ac
+    group by ac.qid
+),
+asker_profile as (
+    select
+        qc.qid,
+        ru.user_id as asker_id,
+        ru.displayname as asker_name,
+        ru.norm_location as asker_location,
+        ru.reputation as asker_rep,
+        ub.total_badges,
+        ub.golds,
+        ub.silvers,
+        ub.bronzes,
+        ub.tag_badges,
+        ub.first_badge_date,
+        ub.last_badge_date
+    from question_core qc
+    left join recent_users ru on ru.user_id = qc.asker_id
+    left join user_badge_mix ub on ub.userid = qc.asker_id
+),
+question_activity as (
+    select
+        qc.qid,
+        qc.q_created,
+        qc.q_score,
+        qc.q_views,
+        qc.answercount,
+        qc.title,
+        coalesce(tt.top_tags, '(no tags)') as top_tags,
+        qc.acceptedanswerid,
+        qc.closeddate,
+        qc.favs,
+        qh.was_closed,
+        qh.was_reopened,
+        qh.had_mod_action,
+        qh.first_mgmt_event_at,
+        qvd.upvotes,
+        qvd.downvotes,
+        coalesce(qvd.favorites, 0) as vote_favorites,
+        coalesce(qvd.bounties_started, 0) as bounties_started,
+        coalesce(qvd.bounty_total, 0) as bounty_total,
+        cast(qc.q_views as numeric) / nullif(extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - qc.q_created)) / 86400.0, 0) as views_per_day,
+        cast(qc.q_score as numeric) / nullif(extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - qc.q_created)) / 86400.0, 0) as score_per_day
+    from question_core qc
+    left join q_history_flags qh on qh.qid = qc.qid
+    left join q_vote_summ qvd on qvd.qid = qc.qid
+    left join top3_tags tt on tt.qid = qc.qid
+),
+penalties as (
+    select
+        qa.qid,
+        case
+            when qa.was_closed = 1 then 0.5
+            when qa.had_mod_action = 1 then 0.8
+            else 1.0
+        end as moderation_multiplier,
+        case
+            when qa.downvotes is null then 1.0
+            when qa.downvotes >= coalesce(qa.upvotes,0) then 0.6
+            when qa.downvotes >= coalesce(qa.upvotes,0) / 2.0 then 0.8
+            else 1.0
+        end as vote_balance_multiplier
+    from question_activity qa
+),
+engagement_score as (
+    select
+        qa.qid,
+        qa.q_created,
+        qa.title,
+        qa.top_tags,
+        qa.q_views,
+        qa.q_score,
+        qa.upvotes,
+        qa.downvotes,
+        qa.vote_favorites,
+        qa.bounties_started,
+        qa.bounty_total,
+        qa.views_per_day,
+        qa.score_per_day,
+        qa.answercount,
+        coalesce(fa.seconds_to_first_answer, null) as seconds_to_first_answer,
+        coalesce(qa.was_closed, 0) as was_closed,
+        coalesce(qacc.has_accepted, 0) as has_accepted,
+        qacc.seconds_to_accept,
+        qa.closeddate,
+        qa.first_mgmt_event_at,
+        p.moderation_multiplier,
+        p.vote_balance_multiplier,
+        greatest(
+            0,
+            (
+                coalesce(qa.upvotes,0)*3
+              + coalesce(qa.vote_favorites,0)*5
+              + coalesce(qa.bounties_started,0)*8
+              + least(coalesce(qa.bounty_total,0), 500) / 25.0
+              + coalesce(qa.q_score,0)*2
+              + coalesce(qa.answercount,0)*1.5
+              + case when coalesce(qacc.has_accepted,0) = 1 then 10 else 0 end
+              + case when qa.was_closed = 1 then -15 else 0 end
+              - coalesce(qa.downvotes,0)*2
+            )
+            * p.moderation_multiplier
+            * p.vote_balance_multiplier
+        ) as raw_engagement,
+        case
+            when fa.seconds_to_first_answer is null then null
+            when fa.seconds_to_first_answer <= 600 then 1.2
+            when fa.seconds_to_first_answer <= 3600 then 1.1
+            when fa.seconds_to_first_answer <= 86400 then 1.0
+            else 0.9
+        end as speed_multiplier
+    from question_activity qa
+    left join first_answer fa on fa.qid = qa.qid
+    left join q_accepted qacc on qacc.qid = qa.qid
+    left join penalties p on p.qid = qa.qid
+),
+ranked as (
+    select
+        e.qid,
+        e.q_created,
+        e.title,
+        e.top_tags,
+        e.q_views,
+        e.q_score,
+        e.upvotes,
+        e.downvotes,
+        e.vote_favorites,
+        e.bounties_started,
+        e.bounty_total,
+        e.answercount,
+        e.seconds_to_first_answer,
+        e.has_accepted,
+        e.was_closed,
+        e.closeddate,
+        e.first_mgmt_event_at,
+        e.raw_engagement,
+        e.speed_multiplier,
+        round(coalesce(e.raw_engagement * coalesce(e.speed_multiplier, 1.0), e.raw_engagement), 2) as final_engagement,
+        row_number() over (
+            order by coalesce(e.raw_engagement * coalesce(e.speed_multiplier, 1.0), e.raw_engagement) desc,
+                     e.q_created desc,
+                     e.qid desc
+        ) as rn_overall,
+        ntile(10) over (
+            order by coalesce(e.raw_engagement * coalesce(e.speed_multiplier, 1.0), e.raw_engagement) desc
+        ) as decile
+    from engagement_score e
+),
+asker_rollup as (
+    select
+        ap.asker_id,
+        count(*) as questions_count,
+        cast(avg(coalesce(r.final_engagement,0)) as numeric(12,4)) as avg_engagement,
+        cast(stddev_pop(coalesce(r.final_engagement,0)) as numeric(12,4)) as std_engagement,
+        max(r.final_engagement) as max_engagement,
+        min(r.final_engagement) as min_engagement
+    from asker_profile ap
+    join ranked r on r.qid = ap.qid
+    group by ap.asker_id
+),
+dupe_web as (
+    select
+        qc.qid,
+        count(*) filter (where pl.linktypeid = 3) as dupes_outgoing,
+        count(*) filter (where pl.linktypeid = 3 and pl.postid <> pl.relatedpostid) as dupes_outgoing_distinct,
+        count(*) filter (where pl.linktypeid = 3 and pl.relatedpostid = qc.qid) as dupes_incoming
+    from question_core qc
+    left join postlinks pl on pl.postid = qc.qid or pl.relatedpostid = qc.qid
+    group by qc.qid
+),
+final as (
+    select
+        r.qid,
+        r.q_created,
+        to_char(r.q_created AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS') as q_created_iso,
+        r.title,
+        r.top_tags,
+        r.q_views,
+        r.q_score,
+        r.upvotes,
+        r.downvotes,
+        r.vote_favorites,
+        r.bounties_started,
+        r.bounty_total,
+        r.answercount,
+        r.seconds_to_first_answer,
+        r.has_accepted,
+        r.was_closed,
+        r.closeddate,
+        r.first_mgmt_event_at,
+        r.raw_engagement,
+        r.speed_multiplier,
+        r.final_engagement,
+        r.decile,
+        ap.asker_id,
+        ap.asker_name,
+        ap.asker_location,
+        ap.asker_rep,
+        ap.total_badges,
+        ap.golds,
+        ap.silvers,
+        ap.bronzes,
+        ap.tag_badges,
+        ar.questions_count as asker_questions_count,
+        ar.avg_engagement as asker_avg_engagement,
+        ar.std_engagement as asker_std_engagement,
+        dw.dupes_outgoing,
+        dw.dupes_outgoing_distinct,
+        dw.dupes_incoming
+    from ranked r
+    left join asker_profile ap on ap.qid = r.qid
+    left join asker_rollup ar on ar.asker_id = ap.asker_id
+    left join dupe_web dw on dw.qid = r.qid
+)
+select *
+from final
+where
+    (
+        (final.final_engagement > 0 and final.decile <= 7)
+        or (final.has_accepted = 1 and coalesce(final.seconds_to_first_answer, 1e12) < 86400)
+        or (final.bounties_started > 0 and coalesce(final.bounty_total,0) >= 50)
+    )
+    and not (
+        final.was_closed = 1
+        and final.upvotes < coalesce(final.downvotes,0) + 3
+        and final.dupes_incoming > final.dupes_outgoing
+    )
+    and (
+        position('how' in lower(coalesce(final.title,''))) = 1
+        or final.vote_favorites >= 1
+        or final.q_views >= 100
+    )
+order by final.final_engagement desc nulls last, final.q_created desc
+limit 200;

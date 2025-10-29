@@ -1,0 +1,130 @@
+WITH
+  RankedPosts AS (
+    SELECT
+      p.Id AS PostId,
+      p.OwnerUserId,
+      p.Title,
+      p.CreationDate,
+      p.Score,
+      p.AnswerCount,
+      p.ViewCount,
+      p.FavoriteCount,
+      p.PostTypeId,
+      ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS PostRank,
+      COUNT(c.Id) OVER (PARTITION BY p.Id) AS CommentCount,
+      SUM(v.VoteTypeId) OVER (PARTITION BY p.Id) AS TotalVoteScore
+    FROM Posts p
+    LEFT JOIN Comments c
+      ON p.Id = c.PostId
+    LEFT JOIN Votes v
+      ON p.Id = v.PostId
+    WHERE
+      p.PostTypeId = 1
+    GROUP BY
+      p.Id,
+      p.OwnerUserId,
+      p.Title,
+      p.CreationDate,
+      p.Score,
+      p.AnswerCount,
+      p.ViewCount,
+      p.FavoriteCount,
+      p.PostTypeId
+  ),
+  UserEngagement AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate AS UserCreationDate,
+      COUNT(DISTINCT rp.PostId) AS QuestionsAsked,
+      SUM(rp.Score) AS TotalScoreOfQuestions,
+      AVG(rp.ViewCount) AS AvgQuestionViews,
+      MAX(rp.CreationDate) AS LastActivityOnQuestions,
+      COUNT(rp.PostId) FILTER (WHERE rp.PostTypeId = 1) AS QuestionPostCount
+    FROM Users u
+    LEFT JOIN RankedPosts rp
+      ON u.Id = rp.OwnerUserId
+      AND rp.PostRank <= 5
+    WHERE
+      u.Id IS NOT NULL
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate
+  ),
+  PostHistorySummary AS (
+    SELECT
+      ph.PostId,
+      COUNT(CASE WHEN ph.PostHistoryTypeId IN (1, 4, 7) THEN 1 END) AS TitleEdits,
+      COUNT(CASE WHEN ph.PostHistoryTypeId IN (2, 5, 8) THEN 1 END) AS BodyEdits,
+      COUNT(CASE WHEN ph.PostHistoryTypeId IN (3, 6, 9) THEN 1 END) AS TagEdits,
+      MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Comment END) AS CloseReasonComment,
+      COUNT(DISTINCT ph.UserId) AS DistinctEditors
+    FROM PostHistory ph
+    WHERE
+      ph.PostId IN (SELECT PostId FROM RankedPosts)
+    GROUP BY
+      ph.PostId
+  )
+SELECT
+  rp.PostId,
+  rp.Title,
+  rp.CreationDate AS QuestionCreationDate,
+  rp.Score AS QuestionScore,
+  rp.AnswerCount AS NumberOfAnswers,
+  rp.ViewCount AS QuestionViews,
+  rp.FavoriteCount AS Bookmarks,
+  ue.DisplayName AS OwnerDisplayName,
+  ue.Reputation AS OwnerReputation,
+  ue.UserCreationDate,
+  ue.QuestionsAsked AS UserTotalQuestions,
+  ue.TotalScoreOfQuestions AS UserTotalScoreOnQuestions,
+  ue.AvgQuestionViews AS UserAvgQuestionViews,
+  phs.TitleEdits,
+  phs.BodyEdits,
+  phs.TagEdits,
+  phs.DistinctEditors,
+  COALESCE(pht.Name, 'Unknown') AS CloseReason,
+  rp.CommentCount,
+  rp.TotalVoteScore,
+  CASE
+    WHEN rp.Score > 100 AND rp.AnswerCount > 10 THEN 'High Engagement'
+    WHEN rp.Score < 0 THEN 'Negative Score'
+    WHEN rp.ViewCount > 10000 THEN 'High Views'
+    ELSE 'Standard'
+  END AS PerformanceCategory,
+  CASE
+    WHEN rp.Title LIKE '%[duplicate]%' OR rp.Title LIKE '%duplicate of%' THEN 'Potential Duplicate'
+    WHEN POSITION('sql' IN COALESCE(NULLIF(rp.Title, ''), '')) > 0 THEN 'SQL Related'
+    WHEN POSITION('performance' IN COALESCE(NULLIF(rp.Title, ''), '')) > 0 THEN 'Performance Tuning'
+    ELSE 'General'
+  END AS TopicCategory,
+  CASE
+    WHEN ue.LastActivityOnQuestions IS NOT NULL AND ue.LastActivityOnQuestions < (DATE '2024-10-01' - INTERVAL '365' DAY) THEN 'Inactive User'
+    WHEN ue.Reputation < 1000 THEN 'Low Reputation'
+    ELSE 'Active User'
+  END AS UserActivityStatus,
+  rp.Score + (rp.AnswerCount * 5) - (rp.ViewCount / 1000.0) AS CalculatedMetric
+FROM RankedPosts rp
+JOIN UserEngagement ue
+  ON rp.OwnerUserId = ue.UserId
+LEFT JOIN PostHistorySummary phs
+  ON rp.PostId = phs.PostId
+LEFT JOIN PostHistory ph_close
+  ON rp.PostId = ph_close.PostId
+  AND ph_close.PostHistoryTypeId = 10
+LEFT JOIN CloseReasonTypes pht
+  ON (CASE
+       WHEN ph_close.Comment ~ '^\s*[0-9]+\s*$' THEN CAST(TRIM(ph_close.Comment) AS INTEGER)
+       ELSE NULL
+     END) = pht.Id
+WHERE
+  rp.PostRank <= 10
+  AND ue.Reputation > 50
+  AND rp.CreationDate > (DATE '2024-10-01' - INTERVAL '730' DAY)
+ORDER BY
+  rp.Score DESC,
+  rp.ViewCount DESC
+LIMIT 100;

@@ -1,0 +1,213 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        COALESCE(SUM(p.ViewCount), 0) as TotalViews,
+        COUNT(DISTINCT c.Id) as CommentsMade,
+        COUNT(DISTINCT b.Id) as BadgesEarned,
+        MAX(p.CreationDate) as LastPostDate,
+        CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - u.CreationDate)) / 86400 AS INTEGER) as AccountAgeDays,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) = 0 THEN 'No Posts'
+            WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 0 AND COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) = 0 THEN 'Question Only'
+            WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) = 0 AND COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) > 0 THEN 'Answer Only'
+            ELSE 'Both Questions and Answers'
+        END as PostTypeCategory,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) OVER (PARTITION BY u.Id) as MedianScore,
+        LAG(u.Reputation, 1) OVER (ORDER BY u.Reputation DESC) as NextHigherReputation,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) as ReputationRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+RankedUsers AS (
+    SELECT 
+        *,
+        CASE 
+            WHEN TotalPosts = 0 THEN 0
+            ELSE CAST(TotalScore AS DOUBLE PRECISION) / NULLIF(CAST(TotalPosts AS DOUBLE PRECISION), 0)
+        END as AvgScorePerPost,
+        CASE 
+            WHEN TotalViews = 0 THEN 0
+            ELSE CAST(TotalScore AS DOUBLE PRECISION) / NULLIF(CAST(TotalViews AS DOUBLE PRECISION), 0)
+        END as ScorePerView,
+        CASE 
+            WHEN AccountAgeDays = 0 THEN 0
+            ELSE CAST(TotalPosts AS DOUBLE PRECISION) / NULLIF(CAST(AccountAgeDays AS DOUBLE PRECISION), 0)
+        END as PostsPerDay,
+        CASE 
+            WHEN TotalPosts > 0 THEN CAST(CommentsMade AS DOUBLE PRECISION) / NULLIF(CAST(TotalPosts AS DOUBLE PRECISION), 0)
+            ELSE 0
+        END as CommentsPerPost,
+        CASE WHEN Reputation > 1000 AND TotalPosts > 0 THEN 'Active' ELSE 'Inactive' END as ActivityStatus,
+        CASE 
+            WHEN TotalPosts = 0 THEN 'No Activity'
+            WHEN TotalPosts >= 1000 THEN 'Legendary'
+            WHEN TotalPosts >= 500 THEN 'Master'
+            WHEN TotalPosts >= 100 THEN 'Expert'
+            WHEN TotalPosts >= 10 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as PostLevel,
+        DENSE_RANK() OVER (ORDER BY TotalScore DESC) as ScoreRank
+    FROM UserActivityStats
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        LENGTH(p.Body) as BodyLength,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags != '' THEN 
+                CARDINALITY(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2), '><'))
+            ELSE 0 
+        END as TagCount,
+        CASE 
+            WHEN p.Score > 100 THEN 'High'
+            WHEN p.Score > 50 THEN 'Medium'
+            WHEN p.Score > 10 THEN 'Low'
+            ELSE 'Very Low'
+        END as ScoreCategory,
+        CASE 
+            WHEN p.ViewCount > 1000 THEN 'Popular'
+            WHEN p.ViewCount > 100 THEN 'Moderate'
+            WHEN p.ViewCount > 10 THEN 'Low'
+            ELSE 'Very Low'
+        END as PopularityCategory,
+        NTILE(5) OVER (ORDER BY p.Score DESC) as ScoreQuintile,
+        PERCENT_RANK() OVER (ORDER BY p.ViewCount) as ViewPercentile,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as UserPostSequence,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PrevScore,
+        COALESCE(p.Score - LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate), 0) as ScoreChange,
+        EXTRACT(YEAR FROM p.CreationDate) as PostYear,
+        EXTRACT(MONTH FROM p.CreationDate) as PostMonth
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) AND p.OwnerUserId IS NOT NULL
+),
+UserPostStats AS (
+    SELECT 
+        r.UserId,
+        r.DisplayName,
+        r.Reputation,
+        r.TotalPosts,
+        r.Questions,
+        r.Answers,
+        r.TotalScore,
+        r.TotalViews,
+        r.CommentsMade,
+        r.BadgesEarned,
+        r.PostTypeCategory,
+        r.AvgScorePerPost,
+        r.ScorePerView,
+        r.PostsPerDay,
+        r.CommentsPerPost,
+        r.ActivityStatus,
+        r.PostLevel,
+        r.ScoreRank,
+        SUM(pa.Score) as UserTotalScore,
+        AVG(pa.Score) as UserAvgScore,
+        MAX(pa.Score) as UserMaxScore,
+        MIN(pa.Score) as UserMinScore,
+        COUNT(pa.Id) as UserTotalPosts,
+        AVG(pa.ViewCount) as UserAvgViews,
+        SUM(pa.ViewCount) as UserTotalViews,
+        STRING_AGG(DISTINCT pa.Title, ', ') as UserPostTitles,
+        STRING_AGG(DISTINCT pa.Tags, ', ') as UserPostTags,
+        MIN(pa.CreationDate) as FirstPostDate,
+        MAX(pa.CreationDate) as LatestPostDate,
+        CAST(EXTRACT(EPOCH FROM (MAX(pa.CreationDate) - MIN(pa.CreationDate))) / 86400 AS INTEGER) as ActivePeriodDays,
+        COUNT(CASE WHEN pa.PostTypeId = 1 THEN 1 END) as UserQuestions,
+        COUNT(CASE WHEN pa.PostTypeId = 2 THEN 1 END) as UserAnswers
+    FROM RankedUsers r
+    INNER JOIN PostAnalysis pa ON r.UserId = pa.OwnerUserId
+    WHERE r.UserId IS NOT NULL
+    GROUP BY 
+        r.UserId, r.DisplayName, r.Reputation, r.TotalPosts, r.Questions, r.Answers, 
+        r.TotalScore, r.TotalViews, r.CommentsMade, r.BadgesEarned, 
+        r.PostTypeCategory, r.AvgScorePerPost, r.ScorePerView, r.PostsPerDay,
+        r.CommentsPerPost, r.ActivityStatus, r.PostLevel, r.ScoreRank
+),
+TemporalAnalysis AS (
+    SELECT 
+        PostYear,
+        PostMonth,
+        COUNT(*) as TotalPosts,
+        AVG(Score) as AvgScore,
+        AVG(ViewCount) as AvgViews,
+        SUM(Score) as TotalScore,
+        SUM(ViewCount) as TotalViews,
+        COUNT(DISTINCT OwnerUserId) as UniqueAuthors,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY Score) as MedianScore,
+        CUME_DIST() OVER (ORDER BY AVG(Score)) as ScoreDistribution,
+        LAG(AVG(Score), 1) OVER (ORDER BY PostYear, PostMonth) as PrevMonthAvgScore,
+        (AVG(Score) - LAG(AVG(Score), 1) OVER (ORDER BY PostYear, PostMonth)) / NULLIF(LAG(AVG(Score), 1) OVER (ORDER BY PostYear, PostMonth), 0) * 100 as ScoreGrowthPercent,
+        ROW_NUMBER() OVER (ORDER BY PostYear, PostMonth) as MonthSequence
+    FROM PostAnalysis
+    GROUP BY PostYear, PostMonth
+)
+SELECT 
+    'Performance Benchmark Report' as ReportTitle,
+    COUNT(*) as TotalUsers,
+    COUNT(CASE WHEN ru.ActivityStatus = 'Active' THEN 1 END) as ActiveUsers,
+    AVG(ru.Reputation) as AvgReputation,
+    MAX(ru.Reputation) as MaxReputation,
+    AVG(ru.TotalPosts) as AvgPostsPerUser,
+    AVG(ru.TotalScore) as AvgScorePerUser,
+    COUNT(CASE WHEN ru.PostLevel = 'Legendary' THEN 1 END) as LegendaryUsers,
+    COUNT(CASE WHEN ru.PostLevel = 'Master' THEN 1 END) as MasterUsers,
+    COUNT(CASE WHEN ru.PostLevel = 'Expert' THEN 1 END) as ExpertUsers,
+    COUNT(CASE WHEN ru.PostLevel = 'Intermediate' THEN 1 END) as IntermediateUsers,
+    COUNT(CASE WHEN ru.PostLevel = 'Beginner' THEN 1 END) as BeginnerUsers,
+    COUNT(CASE WHEN ru.PostLevel = 'No Activity' THEN 1 END) as NoActivityUsers,
+    STRING_AGG(DISTINCT ups.PostTypeCategory, ', ') as PostTypeCategories,
+    COUNT(DISTINCT pa.PostTypeId) as PostTypeCount,
+    COUNT(DISTINCT pa.TagCount) as TagCounts,
+    AVG(ups.CommentsPerPost) as AvgCommentsPerPost,
+    AVG(ups.AvgScorePerPost) as AvgScorePerPost,
+    AVG(ups.ScorePerView) as AvgScorePerView,
+    AVG(ups.PostsPerDay) as AvgPostsPerDay,
+    COUNT(DISTINCT pa.OwnerUserId) as UniquePostOwners,
+    COUNT(pa.Id) as TotalPostsAnalysed,
+    AVG(pa.ViewPercentile) as AvgViewPercentile,
+    MAX(pa.ScoreQuintile) as MaxScoreQuintile,
+    AVG(pa.ScoreChange) as AvgScoreChange,
+    COUNT(DISTINCT pa.PostYear) as YearsAnalyzed,
+    COUNT(DISTINCT pa.PostMonth) as MonthsAnalyzed,
+    AVG(ta.TotalScore) as AvgScorePerMonth,
+    AVG(ta.TotalViews) as AvgViewsPerMonth,
+    AVG(ta.UniqueAuthors) as AvgUniqueAuthorsPerMonth,
+    AVG(ta.ScoreDistribution) as AvgScoreDistribution,
+    AVG(ta.ScoreGrowthPercent) as AvgScoreGrowthPercent,
+    '--- Complex Query Complete ---' as FinalNote,
+    CASE 
+        WHEN COUNT(DISTINCT ups.UserId) > 0 THEN 'Users'
+        WHEN COUNT(DISTINCT pa.Id) > 0 THEN 'Posts'
+        WHEN COUNT(DISTINCT ta.PostYear) > 0 THEN 'Temporal'
+        ELSE 'Mixed'
+    END as ReportCategory
+FROM UserPostStats ups
+FULL JOIN PostAnalysis pa ON ups.UserId = pa.OwnerUserId OR ups.UserId IS NULL
+FULL JOIN TemporalAnalysis ta ON pa.PostYear IS NOT NULL OR ta.PostYear IS NULL
+FULL JOIN RankedUsers ru ON ups.UserId = ru.UserId
+WHERE ups.UserId IS NOT NULL OR pa.Id IS NOT NULL OR ta.PostYear IS NOT NULL
+GROUP BY 
+    CASE 
+        WHEN COUNT(DISTINCT ups.UserId) > 0 THEN 'Users'
+        WHEN COUNT(DISTINCT pa.Id) > 0 THEN 'Posts'
+        WHEN COUNT(DISTINCT ta.PostYear) > 0 THEN 'Temporal'
+        ELSE 'Mixed'
+    END;

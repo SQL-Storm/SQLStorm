@@ -1,0 +1,259 @@
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.UpVotes,
+        U.DownVotes,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        MAX(COALESCE(P.LastActivityDate, C.CreationDate, U.LastAccessDate)) AS LastActivityDate_User,
+        AVG(CASE WHEN P.PostTypeId = 1 THEN P.Score END) AS AvgQuestionScore,
+        AVG(CASE WHEN P.PostTypeId = 2 THEN P.Score END) AS AvgAnswerScore,
+        COUNT(DISTINCT V.PostId) AS TotalVotedPosts
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN Votes V ON U.Id = V.UserId AND V.VoteTypeId IN (2, 3, 5)
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.UpVotes, U.DownVotes
+),
+PostDetails AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.CreationDate AS PostCreationDate,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.FavoriteCount,
+        P.CommentCount,
+        P.OwnerUserId,
+        P.Title,
+        LENGTH(P.Body) AS BodyLength,
+        (
+         SELECT COUNT(DISTINCT tag)
+         FROM (
+             SELECT UNNEST(string_to_array(SUBSTRING(P.Tags FROM 2 FOR (CHAR_LENGTH(P.Tags) - 2)), '><')) AS tag
+         ) AS tags_arr
+        ) AS TagCount,
+        CASE WHEN P.AcceptedAnswerId IS NOT NULL THEN TRUE ELSE FALSE END AS IsAccepted,
+        P.ClosedDate,
+        EXTRACT(EPOCH FROM (COALESCE(MIN_PH.MinEditDate, P.CreationDate) - P.CreationDate)) / 3600 AS TimeToFirstEditHours,
+        (SELECT COUNT(*) FROM PostHistory PH WHERE PH.PostId = P.Id AND PH.PostHistoryTypeId IN (4, 5, 6)) AS PostEditCount,
+        (SELECT COUNT(*) FROM Comments C_inner WHERE C_inner.PostId = P.Id AND C_inner.CreationDate > P.CreationDate AND C_inner.UserId IS NOT NULL) AS UserCommentCount,
+        PH_Close.FirstCloseDate,
+        PH_Close.LastCloseDate,
+        PH_Migrated.MigrationCount,
+        PH_Migrated.LastMigrationDate
+    FROM Posts P
+    JOIN PostTypes PT ON P.PostTypeId = PT.Id
+    LEFT JOIN (
+        SELECT
+            PH.PostId,
+            MIN(PH.CreationDate) AS FirstCloseDate,
+            MAX(PH.CreationDate) AS LastCloseDate
+        FROM PostHistory PH
+        WHERE PH.PostHistoryTypeId = 10
+        GROUP BY PH.PostId
+    ) AS PH_Close ON P.Id = PH_Close.PostId
+    LEFT JOIN (
+        SELECT
+            PH.PostId,
+            MIN(PH.CreationDate) AS MinEditDate
+        FROM PostHistory PH
+        WHERE PH.PostHistoryTypeId IN (4, 5, 6)
+        GROUP BY PH.PostId
+    ) AS MIN_PH ON P.Id = MIN_PH.PostId
+    LEFT JOIN (
+        SELECT
+            PH.PostId,
+            COUNT(CASE WHEN PH.PostHistoryTypeId IN (17, 35, 36) THEN 1 END) AS MigrationCount,
+            MAX(CASE WHEN PH.PostHistoryTypeId IN (17, 35, 36) THEN PH.CreationDate END) AS LastMigrationDate
+        FROM PostHistory PH
+        WHERE PH.PostHistoryTypeId IN (17, 35, 36)
+        GROUP BY PH.PostId
+    ) AS PH_Migrated ON P.Id = PH_Migrated.PostId
+    WHERE P.PostTypeId IN (1, 2)
+),
+UserPostPerformance AS (
+    SELECT
+        PD.PostId,
+        PD.PostTypeId,
+        PD.PostTypeName,
+        PD.OwnerUserId,
+        PD.PostCreationDate,
+        PD.Score,
+        PD.ViewCount,
+        PD.AnswerCount,
+        PD.FavoriteCount,
+        PD.CommentCount,
+        PD.Title,
+        PD.BodyLength,
+        PD.TagCount,
+        PD.IsAccepted,
+        PD.ClosedDate,
+        PD.TimeToFirstEditHours,
+        PD.PostEditCount,
+        PD.UserCommentCount,
+        PD.MigrationCount,
+        PD.LastMigrationDate,
+        UA.Reputation AS OwnerReputation,
+        UA.QuestionCount AS OwnerQuestionCount,
+        UA.AnswerCount AS OwnerAnswerCount,
+        UA.GoldBadges AS OwnerGoldBadges,
+        UA.LastActivityDate_User,
+        RANK() OVER (PARTITION BY PD.PostTypeId ORDER BY PD.Score DESC, PD.ViewCount DESC) AS RankByScoreAndViews,
+        NTILE(10) OVER (PARTITION BY PD.PostTypeId ORDER BY PD.PostCreationDate) AS CreationDateDecile,
+        AVG(PD.Score) OVER (PARTITION BY PD.OwnerUserId ORDER BY PD.PostCreationDate ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) AS OwnerRollingAvgScore,
+        LAG(PD.Score, 1, 0) OVER (PARTITION BY PD.OwnerUserId ORDER BY PD.PostCreationDate) AS PreviousPostScore,
+        COUNT(PD.PostId) OVER (PARTITION BY PD.OwnerUserId ORDER BY PD.PostCreationDate) AS OwnerPostCumulativeCount
+    FROM PostDetails PD
+    JOIN UserActivitySummary UA ON PD.OwnerUserId = UA.UserId
+    WHERE PD.OwnerUserId IS NOT NULL
+),
+QuestionAnswerInteractions AS (
+    SELECT
+        P_Q.Id AS QuestionId,
+        P_Q.Title AS QuestionTitle,
+        P_Q.OwnerUserId AS QuestionOwnerId,
+        P_Q.AcceptedAnswerId,
+        P_A.Id AS AnswerId,
+        P_A.OwnerUserId AS AnswerOwnerId,
+        COUNT(DISTINCT C_Q.Id) AS QuestionCommentCount,
+        COUNT(DISTINCT C_A.Id) AS AnswerCommentCount,
+        SUM(CASE WHEN P_A.Id = P_Q.AcceptedAnswerId THEN 1 ELSE 0 END) AS IsAcceptedAnswer
+    FROM Posts P_Q
+    LEFT JOIN Posts P_A ON P_Q.Id = P_A.ParentId AND P_A.PostTypeId = 2
+    LEFT JOIN Comments C_Q ON P_Q.Id = C_Q.PostId
+    LEFT JOIN Comments C_A ON P_A.Id = C_A.PostId
+    WHERE P_Q.PostTypeId = 1
+    GROUP BY
+        P_Q.Id, P_Q.Title, P_Q.OwnerUserId, P_Q.AcceptedAnswerId,
+        P_A.Id, P_A.OwnerUserId
+),
+DailyTrendsWithRank AS (
+    SELECT
+        DATE_TRUNC('day', CreationDate) AS ActivityDay,
+        COUNT(DISTINCT Id) AS DailyPosts,
+        SUM(Score) AS DailyScoreSum,
+        AVG(Score) AS DailyAvgScore,
+        (
+          SELECT
+            percentile_cont(0.5) WITHIN GROUP (ORDER BY p2.Score)
+          FROM Posts p2
+          WHERE p2.PostTypeId IN (1,2)
+            AND DATE_TRUNC('day', p2.CreationDate) BETWEEN DATE_TRUNC('day', Posts.CreationDate) - INTERVAL '7 day' AND DATE_TRUNC('day', Posts.CreationDate)
+        ) AS MedianScore7DayRolling,
+        LAG(COUNT(DISTINCT Id), 1, 0) OVER (ORDER BY DATE_TRUNC('day', CreationDate)) AS PreviousDayPosts,
+        (COUNT(DISTINCT Id) - LAG(COUNT(DISTINCT Id), 1, 0) OVER (ORDER BY DATE_TRUNC('day', CreationDate))) 
+            / NULLIF(LAG(COUNT(DISTINCT Id), 1, 0) OVER (ORDER BY DATE_TRUNC('day', CreationDate)), 0) * 100 AS DailyPostGrowthRatePercent
+    FROM Posts
+    WHERE PostTypeId IN (1, 2)
+    GROUP BY DATE_TRUNC('day', CreationDate)
+),
+PostPercentiles AS (
+    SELECT
+        0.75 AS pct,
+        percentile_cont(0.75) WITHIN GROUP (ORDER BY FavoriteCount) AS pct75_fav_count
+    FROM Posts
+    WHERE PostTypeId = 1
+)
+SELECT
+    UPP.PostId,
+    UPP.PostTypeName,
+    UPP.Title,
+    UPP.PostCreationDate,
+    UPP.Score,
+    UPP.ViewCount,
+    UPP.CommentCount,
+    UPP.FavoriteCount,
+    UPP.IsAccepted,
+    UPP.ClosedDate,
+    UPP.TagCount,
+    UPP.PostEditCount,
+    UPP.UserCommentCount,
+    UPP.OwnerUserId,
+    UPP.OwnerReputation,
+    UPP.OwnerGoldBadges,
+    UPP.RankByScoreAndViews,
+    UPP.CreationDateDecile,
+    UPP.OwnerRollingAvgScore,
+    UPP.PreviousPostScore,
+    UPP.OwnerPostCumulativeCount,
+    UA.TotalPosts AS OwnerTotalPosts,
+    UA.TotalComments AS OwnerTotalComments,
+    DT.DailyPosts,
+    DT.DailyAvgScore,
+    DT.MedianScore7DayRolling,
+    DT.DailyPostGrowthRatePercent,
+    COALESCE(QA.QuestionCommentAggCount, 0) AS RelatedQuestionComments,
+    COALESCE(QA.AnswerCommentAggCount, 0) AS RelatedAnswerComments,
+    UPP.MigrationCount,
+    UPP.LastMigrationDate,
+    (CAST(UPP.Score AS DECIMAL) / NULLIF(UPP.ViewCount, 0)) * (1 + UPP.OwnerReputation / 100000.0) * (1 + UPP.PostEditCount / 10.0) * (1 + UPP.UserCommentCount / 5.0) AS WeightedEngagementRatio,
+    SUBSTRING(UPP.Title FROM 1 FOR 50) || '...' ||
+        CASE
+            WHEN UPP.ClosedDate IS NOT NULL THEN ' [CLOSED]'
+            WHEN COALESCE(UPP.MigrationCount, 0) > 0 THEN ' [MIGRATED]'
+            ELSE ''
+        END AS DisplayTitleSummary,
+    CASE
+        WHEN UPP.PostTypeId = 1 AND UPP.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1 AND CreationDate >= DATE '2020-01-01')
+             AND UPP.IsAccepted
+             AND UPP.PostEditCount > 2
+             AND UPP.OwnerGoldBadges > 0
+             AND UPP.FavoriteCount > (SELECT pct75_fav_count FROM PostPercentiles)
+        THEN 'HighImpactQuestion'
+        WHEN UPP.PostTypeId = 2 AND UPP.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 2 AND CreationDate >= DATE '2020-01-01')
+             AND UPP.OwnerReputation > 50000
+             AND UPP.UserCommentCount >= 3
+        THEN 'ExpertAnswer'
+        WHEN UPP.ClosedDate IS NOT NULL AND UPP.Score < 0 AND COALESCE(UPP.MigrationCount, 0) = 0 THEN 'ProblematicPost'
+        ELSE 'Standard'
+    END AS PostImpactCategory,
+    (UPP.Title LIKE '%SQL%' OR UPP.Title LIKE '%performance%') AS IsRelevantToBenchmarking
+FROM UserPostPerformance UPP
+LEFT JOIN UserActivitySummary UA ON UPP.OwnerUserId = UA.UserId
+LEFT JOIN DailyTrendsWithRank DT ON DATE_TRUNC('day', UPP.PostCreationDate) = DT.ActivityDay
+LEFT JOIN (
+    SELECT
+        RelevantPostId,
+        SUM(QuestionCommentAggCount) AS QuestionCommentAggCount,
+        SUM(AnswerCommentAggCount) AS AnswerCommentAggCount
+    FROM (
+        SELECT
+            QuestionId AS RelevantPostId,
+            SUM(QuestionCommentCount) AS QuestionCommentAggCount,
+            SUM(AnswerCommentCount) AS AnswerCommentAggCount
+        FROM QuestionAnswerInteractions
+        GROUP BY QuestionId
+        UNION ALL
+        SELECT
+            AnswerId AS RelevantPostId,
+            SUM(QuestionCommentCount) AS QuestionCommentAggCount,
+            SUM(AnswerCommentCount) AS AnswerCommentAggCount
+        FROM QuestionAnswerInteractions
+        WHERE AnswerId IS NOT NULL
+        GROUP BY AnswerId
+    ) t
+    GROUP BY RelevantPostId
+) QA ON UPP.PostId = QA.RelevantPostId
+WHERE
+    UPP.OwnerReputation > 1000
+    AND UPP.PostCreationDate >= DATE '2020-01-01'
+    AND UPP.BodyLength > 100
+    AND (UPP.Title LIKE '%SQL%' OR UPP.Title LIKE '%performance%' OR UPP.Title LIKE '%optimization%' OR UPP.PostTypeName = 'Answer')
+    AND NOT EXISTS (
+        SELECT 1 FROM PostHistory PH WHERE PH.PostId = UPP.PostId AND PH.PostHistoryTypeId = 12 AND PH.CreationDate >= UPP.PostCreationDate
+    )
+ORDER BY
+    WeightedEngagementRatio DESC, UPP.PostCreationDate DESC, UPP.Score DESC
+LIMIT 1000;

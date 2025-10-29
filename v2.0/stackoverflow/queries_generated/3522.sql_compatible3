@@ -1,0 +1,123 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(p.PostCnt,0)            AS PostCount,
+        COALESCE(a.AnsCnt,0)            AS AnswerCount,
+        COALESCE(a.QuesCnt,0)           AS QuestionCount,
+        COALESCE(b.BadgeScore,0)        AS BadgeScore,
+        COALESCE(v.UpVotes,0)-COALESCE(v.DownVotes,0) AS VoteBalance,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS rk
+    FROM Users u
+    LEFT JOIN (
+        SELECT OwnerUserId, COUNT(*) AS PostCnt
+        FROM Posts
+        WHERE OwnerUserId IS NOT NULL
+        GROUP BY OwnerUserId
+    ) p ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT OwnerUserId,
+               SUM(CASE WHEN PostTypeId = 2 THEN 1 ELSE 0 END) AS AnsCnt,
+               SUM(CASE WHEN PostTypeId = 1 THEN 1 ELSE 0 END) AS QuesCnt
+        FROM Posts
+        WHERE OwnerUserId IS NOT NULL
+        GROUP BY OwnerUserId
+    ) a ON a.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT UserId,
+               SUM(CASE WHEN Class = 1 THEN 100 WHEN Class = 2 THEN 50 ELSE 10 END) AS BadgeScore
+        FROM Badges
+        GROUP BY UserId
+    ) b ON b.UserId = u.Id
+    LEFT JOIN (
+        SELECT v.UserId,
+               SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS UpVotes,
+               SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes v
+        JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+        GROUP BY v.UserId
+    ) v ON v.UserId = u.Id
+), 
+TopUsers AS (
+    SELECT *
+    FROM UserStats
+    WHERE rk <= 100
+), 
+TagMetrics AS (
+    SELECT 
+        t.TagName,
+        t.Count                                         AS TagUseCount,
+        COALESCE(CHAR_LENGTH(p_ex.Body),0)              AS ExcerptLength,
+        COALESCE(CHAR_LENGTH(p_wk.Body),0)              AS WikiLength
+    FROM Tags t
+    LEFT JOIN Posts p_ex ON p_ex.Id = t.ExcerptPostId
+    LEFT JOIN Posts p_wk ON p_wk.Id = t.WikiPostId
+), 
+UserTagActivity AS (
+    SELECT 
+        u.Id                                   AS UserId,
+        tg.TagName,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionPosts,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerPosts,
+        MAX(p.CreationDate)                    AS LastActivity
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.Tags IS NOT NULL
+    LEFT JOIN LATERAL (
+        SELECT unnest(string_to_array(substring(p.Tags,2,char_length(p.Tags)-2),'><')) AS Tag
+    ) lt ON 1=1
+    LEFT JOIN Tags tg ON tg.TagName = lt.Tag
+    GROUP BY u.Id, tg.TagName
+), 
+Combined AS (
+    SELECT 
+        tu.Id,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.PostCount,
+        tu.AnswerCount,
+        tu.QuestionCount,
+        tu.BadgeScore,
+        tu.VoteBalance,
+        COALESCE(uta.QuestionPosts,0)          AS QPostsOnTags,
+        COALESCE(uta.AnswerPosts,0)            AS APostsOnTags,
+        uta.LastActivity,
+        tm.TagUseCount,
+        (tm.ExcerptLength + tm.WikiLength)    AS TagContentSize,
+        CASE 
+            WHEN tu.Reputation > 20000 THEN 'HighRep'
+            WHEN tu.Reputation BETWEEN 10000 AND 20000 THEN 'MidRep'
+            ELSE 'LowRep'
+        END                                   AS RepTier
+    FROM TopUsers tu
+    LEFT JOIN UserTagActivity uta ON uta.UserId = tu.Id
+    LEFT JOIN TagMetrics tm ON tm.TagName = uta.TagName
+)
+SELECT *
+FROM (
+    SELECT *
+    FROM Combined
+    WHERE (QPostsOnTags + APostsOnTags) > 0
+       OR TagUseCount IS NOT NULL
+    LIMIT 200
+
+    UNION ALL
+
+    SELECT 
+        NULL AS Id,
+        'Aggregated Totals' AS DisplayName,
+        SUM(Reputation)     AS Reputation,
+        SUM(PostCount)      AS PostCount,
+        SUM(AnswerCount)    AS AnswerCount,
+        SUM(QuestionCount)  AS QuestionCount,
+        SUM(BadgeScore)     AS BadgeScore,
+        SUM(VoteBalance)    AS VoteBalance,
+        SUM(QPostsOnTags)   AS QPostsOnTags,
+        SUM(APostsOnTags)   AS APostsOnTags,
+        MAX(LastActivity)   AS LastActivity,
+        NULL                AS TagUseCount,
+        NULL                AS TagContentSize,
+        'Total'             AS RepTier
+    FROM Combined
+) t
+ORDER BY Reputation DESC, BadgeScore DESC;

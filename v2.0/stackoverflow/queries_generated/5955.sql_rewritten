@@ -1,0 +1,119 @@
+-- {"query": "5955.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 798} 
+WITH RecentActivePosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.PostTypeId,
+    p.Tags
+  FROM Posts p
+  WHERE p.PostTypeId IN (1,2) -- Questions and Answers for rich activity
+),
+EscalatedQueries AS (
+  SELECT
+    r.PostId,
+    r.Title,
+    r.OwnerUserId,
+    r.CreationDate,
+    r.LastActivityDate,
+    r.Score,
+    r.ViewCount,
+    r.Tags,
+    v1.VoteCountUp AS UpVotes,
+    v2.VoteCountDown AS DownVotes,
+    a.DisplayName AS OwnerDisplayName,
+    u.Reputation,
+    ROW_NUMBER() OVER (
+      PARTITION BY r.OwnerUserId
+      ORDER BY r.LastActivityDate DESC, r.Score DESC
+    ) AS rn_owner
+  FROM RecentActivePosts r
+  LEFT JOIN Votes v1
+    ON v1.PostId = r.PostId AND v1.VoteTypeId = 2
+  LEFT JOIN Votes v2
+    ON v2.PostId = r.PostId AND v2.VoteTypeId = 3
+  LEFT JOIN Users a
+    ON a.Id = r.OwnerUserId
+  LEFT JOIN Users u
+    ON u.Id = r.OwnerUserId
+  WHERE r.LastActivityDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+),
+CrossLinkStats AS (
+  SELECT
+    e.PostId,
+    e.Title,
+    e.OwnerUserId,
+    e.OwnerDisplayName,
+    e.CreationDate,
+    e.LastActivityDate,
+    e.Score,
+    e.ViewCount,
+    e.Tags,
+    e.UpVotes,
+    e.DownVotes,
+    u2.DisplayName AS LastEditorDisplayName,
+    le.Name AS LastEditorRole,
+    P.count_comments,
+    P.comment_experience
+  FROM EscalatedQueries e
+  LEFT JOIN Posts P
+    ON P.Id = e.PostId
+  LEFT JOIN Users u2
+    ON u2.Id = (SELECT LastEditorUserId FROM Posts WHERE Id = e.PostId)
+  LEFT JOIN (
+    SELECT Id,
+           CASE
+             WHEN OwnerUserId IS NULL THEN 'Community'
+             WHEN OwnerUserId = -1 THEN 'Community'
+             ELSE 'Author'
+           END AS LastEditorRole,
+           (SELECT COUNT(*) FROM Comments c WHERE c.PostId = Id) AS count_comments,
+           (SELECT AVG(CASE WHEN CommentCount IS NULL THEN 0 ELSE CommentCount END)
+            FROM (SELECT 1 AS CommentCount) t) AS comment_experience
+    FROM Posts
+  ) AS P
+    ON P.Id = e.PostId
+),
+FinalOutput AS (
+  SELECT
+    c.PostId,
+    c.Title,
+    c.OwnerUserId,
+    c.OwnerDisplayName,
+    c.CreationDate,
+    c.LastActivityDate,
+    c.Score,
+    c.ViewCount,
+    c.Tags,
+    c.UpVotes,
+    c.DownVotes,
+    c.LastEditorDisplayName,
+    c.LastEditorRole,
+    c.count_comments,
+    c.comment_experience
+  FROM CrossLinkStats c
+  WHERE c.rn_owner = 1
+)
+SELECT
+  fo.PostId,
+  fo.Title,
+  fo.OwnerUserId,
+  fo.OwnerDisplayName,
+  fo.CreationDate,
+  fo.LastActivityDate,
+  fo.Score,
+  fo.ViewCount,
+  fo.Tags,
+  fo.UpVotes,
+  fo.DownVotes,
+  fo.LastEditorDisplayName,
+  fo.LastEditorRole,
+  fo.count_comments,
+  fo.comment_experience
+FROM FinalOutput fo
+ORDER BY fo.LastActivityDate DESC, fo.Score DESC
+LIMIT 100;

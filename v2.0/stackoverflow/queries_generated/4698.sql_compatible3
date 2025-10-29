@@ -1,0 +1,111 @@
+WITH RankedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount AS PostViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        pt.Name AS PostTypeName,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) AS rn_by_type,
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate) AS previous_post_score,
+        SUM(c.Score) OVER (PARTITION BY p.Id) AS total_comment_score,
+        COUNT(ph.Id) OVER (PARTITION BY p.Id) AS post_history_count,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS is_closed_flag
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    WHERE p.OwnerUserId IS NOT NULL AND p.OwnerUserId > 0
+),
+UserPostStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(rp.PostId) AS total_posts_by_user,
+        SUM(rp.PostScore) AS total_score_of_user_posts,
+        AVG(rp.PostViewCount) AS avg_view_count_of_user_posts,
+        SUM(CASE WHEN rp.is_closed_flag = 1 THEN 1 ELSE 0 END) AS closed_posts_count,
+        MAX(rp.PostCreationDate) AS last_post_creation_date
+    FROM Users u
+    JOIN RankedPosts rp ON u.Id = rp.OwnerUserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+TagPerformance AS (
+    SELECT
+        t.TagName,
+        t.Count AS tag_post_count,
+        AVG(rp.PostScore) AS avg_score_for_tag,
+        SUM(CASE WHEN rp.PostTypeId = 1 THEN 1 ELSE 0 END) AS question_count_for_tag,
+        SUM(CASE WHEN rp.PostTypeId = 2 THEN 1 ELSE 0 END) AS answer_count_for_tag
+    FROM Tags t
+    JOIN Posts p ON POSITION(t.TagName IN REPLACE(REPLACE(p.Tags, '<', ''), '>', '')) > 0
+    JOIN RankedPosts rp ON p.Id = rp.PostId AND rp.PostTypeId = 1
+    GROUP BY t.TagName, t.Count
+),
+UnionLatestEdits AS (
+    SELECT
+        ph.PostId,
+        ph.CreationDate AS EditDate,
+        ph.UserId AS EditorUserId,
+        ph.PostHistoryTypeId,
+        ROW_NUMBER() OVER(PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) as rn_edit
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6)
+)
+SELECT
+    rp.PostId,
+    rp.PostTypeName,
+    rp.PostCreationDate,
+    rp.PostScore,
+    rp.PostViewCount,
+    rp.total_comment_score,
+    rp.post_history_count,
+    rp.is_closed_flag,
+    CASE
+        WHEN rp.AnswerCount > 0 THEN CAST(rp.PostScore * 1.0 / rp.AnswerCount AS DECIMAL(10, 2))
+        ELSE CAST(0.00 AS DECIMAL(10,2))
+    END AS score_per_answer,
+    (COALESCE(ups.DisplayName, 'Anonymous')
+        || ' (Rep: ' || CAST(ups.Reputation AS TEXT) || ')'
+        || ' - Posts: ' || CAST(ups.total_posts_by_user AS TEXT)) AS author_info,
+    ups.avg_view_count_of_user_posts,
+    ups.closed_posts_count,
+    tp.TagName,
+    tp.avg_score_for_tag,
+    tp.question_count_for_tag,
+    tp.answer_count_for_tag,
+    ue.EditDate AS latest_edit_date,
+    ue.EditorUserId AS latest_editor_id,
+    CASE WHEN rp.PostCreationDate < ups.UserCreationDate THEN TRUE ELSE FALSE END AS was_created_before_user,
+    rp.rn_by_type,
+    rp.previous_post_score,
+    CASE WHEN rp.PostScore > rp.previous_post_score THEN 'Increased' WHEN rp.PostScore < rp.previous_post_score THEN 'Decreased' ELSE 'Same' END AS score_change_vs_previous,
+    CASE WHEN pht.Name = 'Post Closed' THEN 'Yes' ELSE 'No' END AS is_post_closed_history,
+    CASE WHEN pl.LinkTypeId = 3 THEN 'Duplicate Link' ELSE 'Other Link' END AS post_link_type
+FROM RankedPosts rp
+JOIN Users ups ON rp.OwnerUserId = ups.Id
+LEFT JOIN (
+    SELECT
+        rp_inner.PostId,
+        STRING_AGG(tp_inner.TagName, ', ') AS TagName,
+        SUM(tp_inner.avg_score_for_tag) AS avg_score_for_tag,
+        SUM(tp_inner.question_count_for_tag) AS question_count_for_tag,
+        SUM(tp_inner.answer_count_for_tag) AS answer_count_for_tag
+    FROM TagPerformance tp_inner
+    JOIN Posts p_inner ON POSITION(tp_inner.TagName IN REPLACE(REPLACE(p_inner.Tags, '<', ''), '>', '')) > 0
+    JOIN RankedPosts rp_inner ON p_inner.Id = rp_inner.PostId
+    GROUP BY rp_inner.PostId
+) tp ON tp.PostId = rp.PostId
+LEFT JOIN UnionLatestEdits ue ON rp.PostId = ue.PostId AND ue.rn_edit = 1
+LEFT JOIN PostHistoryTypes pht ON pht.Id = 10
+LEFT JOIN PostLinks pl ON rp.PostId = pl.PostId AND pl.LinkTypeId = 3
+WHERE rp.rn_by_type <= 1000
+ORDER BY rp.PostCreationDate DESC
+LIMIT 500;

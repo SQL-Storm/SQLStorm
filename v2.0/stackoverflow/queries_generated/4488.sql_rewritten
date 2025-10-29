@@ -1,0 +1,183 @@
+-- {"query": "4488.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1928} 
+WITH
+  RankedPostEdits AS (
+    SELECT
+      ph.PostId,
+      ph.UserId,
+      ph.CreationDate,
+      ph.PostHistoryTypeId,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM
+      PostHistory AS ph
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6) -- Edits to Title, Body, or Tags
+  ),
+  RecentPostInfo AS (
+    SELECT
+      p.Id AS PostId,
+      p.OwnerUserId,
+      p.CreationDate AS PostCreationDate,
+      p.Score AS PostScore,
+      p.ViewCount AS PostViewCount,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      p.ClosedDate,
+      pt.Name AS PostTypeName,
+      COALESCE(u.DisplayName, p.OwnerDisplayName) AS OwnerDisplayName,
+      rpe.UserId AS LastEditorId,
+      rpe.CreationDate AS LastEditDate,
+      rpe.PostHistoryTypeId AS LastEditTypeId,
+      CASE
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        ELSE 'Open'
+      END AS PostStatus,
+      -- Calculate days since last edit, handling NULL LastEditDate
+      CASE
+        WHEN rpe.CreationDate IS NOT NULL THEN JULIANDAY(p.LastActivityDate) - JULIANDAY(rpe.CreationDate)
+        ELSE JULIANDAY(p.LastActivityDate) - JULIANDAY(p.CreationDate)
+      END AS DaysSinceLastActivityOrEdit,
+      -- Simulate a complex string concatenation and calculation
+      'Post: ' || CAST(p.Id AS TEXT) || ' | Type: ' || pt.Name || ' | Score: ' || CAST(p.Score AS TEXT) || ' | Views: ' || CAST(p.ViewCount AS TEXT) AS PostSummary,
+      -- NULL-aware calculation for total edits across all types
+      (
+        SELECT
+          COUNT(*)
+        FROM
+          PostHistory AS ph_inner
+        WHERE
+          ph_inner.PostId = p.Id
+          AND ph_inner.PostHistoryTypeId BETWEEN 1 AND 9 -- All initial and edit types
+      ) AS TotalHistoryEntries,
+      -- Correlated subquery to count comments by users with more than 1000 reputation
+      (
+        SELECT
+          COUNT(c.Id)
+        FROM
+          Comments AS c
+        LEFT JOIN
+          Users AS u_comment ON c.UserId = u_comment.Id
+        WHERE
+          c.PostId = p.Id
+          AND u_comment.Reputation > 1000
+      ) AS HighReputationCommentCount,
+      -- Check for the presence of specific tags using a complex string operation
+      CASE
+        WHEN p.Tags LIKE '%<sql>%' THEN 1
+        WHEN p.Tags LIKE '%<performance>%' THEN 1
+        WHEN p.Tags LIKE '%<optimization>%' THEN 1
+        ELSE 0
+      END AS HasPerformanceTag
+    FROM
+      Posts AS p
+      JOIN PostTypes AS pt ON p.PostTypeId = pt.Id
+      LEFT JOIN Users AS u ON p.OwnerUserId = u.Id
+      LEFT JOIN RankedPostEdits AS rpe ON p.Id = rpe.PostId AND rpe.rn = 1
+    WHERE
+      p.CreationDate >= '2023-01-01' -- Filter for recent posts
+      AND p.PostTypeId = 1 -- Only Questions
+      AND p.Score > 10 -- High scoring questions
+  ),
+  PostTagCounts AS (
+    SELECT
+      pt.TagName,
+      SUM(p.AnswerCount) AS TotalAnswersForTag,
+      AVG(p.Score) AS AverageScoreForTag,
+      COUNT(p.Id) AS NumberOfQuestionsWithTag
+    FROM
+      Posts AS p
+      JOIN Tags AS pt ON p.Tags LIKE '%' || pt.TagName || '%' -- Inefficient tag matching for demonstration
+    WHERE
+      p.PostTypeId = 1
+      AND p.CreationDate >= '2023-01-01'
+    GROUP BY
+      pt.TagName
+    HAVING
+      COUNT(p.Id) > 100 -- Tags with at least 100 questions
+  ),
+  UserActivitySummary AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      COUNT(DISTINCT p.Id) AS TotalQuestionsPosted,
+      SUM(p.Score) AS TotalScoreOnQuestions,
+      COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+      COUNT(DISTINCT ph.Id) AS TotalHistoryEntries
+    FROM
+      Users AS u
+      LEFT JOIN Posts AS p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+      LEFT JOIN Comments AS c ON u.Id = c.UserId
+      LEFT JOIN PostHistory AS ph ON u.Id = ph.UserId
+    WHERE
+      u.Reputation > 5000 -- Active users
+    GROUP BY
+      u.Id,
+      u.DisplayName
+  )
+SELECT
+  rpi.PostId,
+  rpi.PostTypeName,
+  rpi.OwnerDisplayName,
+  rpi.PostScore,
+  rpi.PostViewCount,
+  rpi.AnswerCount,
+  rpi.CommentCount,
+  rpi.FavoriteCount,
+  rpi.PostStatus,
+  rpi.DaysSinceLastActivityOrEdit,
+  rpi.PostSummary,
+  rpi.TotalHistoryEntries,
+  rpi.HighReputationCommentCount,
+  rpi.HasPerformanceTag,
+  ptc.TagName,
+  ptc.TotalAnswersForTag,
+  ptc.AverageScoreForTag,
+  uas.TotalQuestionsPosted,
+  uas.TotalScoreOnQuestions,
+  uas.TotalCommentsMade,
+  uas.TotalHistoryEntries AS UserTotalHistoryEntries,
+  -- Set operator: UNION to combine high-activity users and high-scoring questions
+  CASE WHEN rpi.PostScore > 50 THEN 'High Scoring Question' ELSE 'Normal Question' END AS QuestionCategory,
+  CASE WHEN uas.TotalScoreOnQuestions > 10000 THEN 'High Achiever' ELSE 'Standard User' END AS UserCategory
+FROM
+  RecentPostInfo AS rpi
+LEFT JOIN
+  PostTagCounts AS ptc ON rpi.PostId IN (SELECT p.Id FROM Posts p WHERE p.Tags LIKE '%' || ptc.TagName || '%') -- Inefficient join for demonstration
+LEFT JOIN
+  UserActivitySummary AS uas ON rpi.OwnerUserId = uas.UserId
+WHERE
+  rpi.PostViewCount > 1000 -- High traffic questions
+  AND rpi.HasPerformanceTag = 1
+UNION
+SELECT
+  NULL, -- Placeholder for PostId as it's not directly from UserActivitySummary
+  NULL, -- Placeholder for PostTypeName
+  uas.DisplayName,
+  NULL, -- Placeholder for PostScore
+  NULL, -- Placeholder for PostViewCount
+  NULL, -- Placeholder for AnswerCount
+  NULL, -- Placeholder for CommentCount
+  NULL, -- Placeholder for FavoriteCount
+  'User Summary', -- Indicating this row is about user summary
+  NULL, -- Placeholder for DaysSinceLastActivityOrEdit
+  'User: ' || uas.DisplayName || ' | Qs: ' || CAST(uas.TotalQuestionsPosted AS TEXT) || ' | Score: ' || CAST(uas.TotalScoreOnQuestions AS TEXT) || ' | Cmts: ' || CAST(uas.TotalCommentsMade AS TEXT),
+  NULL, -- Placeholder for TotalHistoryEntries
+  NULL, -- Placeholder for HighReputationCommentCount
+  NULL, -- Placeholder for HasPerformanceTag
+  NULL, -- Placeholder for TagName
+  NULL, -- Placeholder for TotalAnswersForTag
+  NULL, -- Placeholder for AverageScoreForTag
+  uas.TotalQuestionsPosted,
+  uas.TotalScoreOnQuestions,
+  uas.TotalCommentsMade,
+  uas.UserTotalHistoryEntries,
+  NULL, -- Placeholder for QuestionCategory
+  uas.UserCategory
+FROM
+  UserActivitySummary AS uas
+WHERE
+  uas.TotalQuestionsPosted > 500 -- Highly active users
+ORDER BY
+  uas.TotalScoreOnQuestions DESC NULLS LAST, -- Order by user score if available, otherwise by question score
+  rpi.PostScore DESC NULLS LAST;

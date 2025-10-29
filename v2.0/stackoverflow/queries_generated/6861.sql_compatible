@@ -1,0 +1,41 @@
+SELECT 
+    u.DisplayName,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.PostId ELSE NULL END) AS TotalUpVotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.PostId ELSE NULL END) AS TotalDownVotes,
+    MAX(u.Reputation) AS MaxReputation,
+    MIN(u.CreationDate) AS EarliestUser,
+    MAX(u.LastAccessDate) AS LatestAccess,
+    b.Class AS BadgeClass,
+    ROW_NUMBER() OVER (PARTITION BY b.TagBased ORDER BY b.Date DESC) AS RecentBadge,
+    COALESCE(SUM(CASE WHEN ph.PostHistoryTypeId = 1 THEN 1 ELSE 0 END), 0) AS InitialTitleEdits,
+    COALESCE(SUM(CASE WHEN ph.PostHistoryTypeId = 5 THEN 1 ELSE 0 END), 0) AS BodyEdits
+FROM 
+    Users u
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    (SELECT 
+         ph.UserId, 
+         ph.PostId, 
+         ph.PostHistoryTypeId
+     FROM 
+         PostHistory ph
+     WHERE 
+         ph.PostHistoryTypeId IN (1, 5)) ph ON u.Id = ph.UserId
+LEFT JOIN 
+    Votes v ON u.Id = v.UserId
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+WHERE 
+    (u.Reputation > 10000 OR u.Reputation IS NULL)
+    AND (p.LastActivityDate >= CAST(DATETIME('2024-10-01 12:34:56') AS TIMESTAMP) - INTERVAL '6' MONTH
+         OR p.LastActivityDate IS NULL)
+GROUP BY 
+    u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, b.Class, b.TagBased, b.Date
+HAVING 
+    COUNT(DISTINCT p.Id) > 50
+ORDER BY 
+    TotalUpVotes DESC, 
+    TotalPosts DESC;

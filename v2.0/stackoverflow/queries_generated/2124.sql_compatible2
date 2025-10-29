@@ -1,0 +1,149 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id, 
+        t.TagName, 
+        1 AS Level,
+        ARRAY[t.Id] AS Path
+    FROM Tags t
+    WHERE t.IsModeratorOnly = false AND t.IsRequired = false
+    UNION ALL
+    SELECT 
+        child.Id,
+        child.TagName,
+        r.Level + 1,
+        r.Path || child.Id
+    FROM Tags child
+    JOIN RecursiveTagHierarchy r ON child.ExcerptPostId = r.Id
+    WHERE NOT child.Id = ANY(r.Path) AND r.Level < 3
+),
+PostRankedScores AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        p.Score,
+        p.CreationDate,
+        p.ViewCount,
+        u.Reputation,
+        dense_rank() OVER (
+            PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC, p.CreationDate ASC
+        ) AS ScoreRank
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1,2) AND p.Score IS NOT NULL
+),
+BadgeRankings AS (
+    SELECT 
+        b.UserId,
+        b.Name AS BadgeName,
+        b.Class,
+        COUNT(*) OVER (PARTITION BY b.UserId) AS BadgeCount,
+        row_number() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC) AS RecentBadgeRank
+    FROM Badges b
+    WHERE b.Class IN (1, 2, 3)
+),
+UserAggregates AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        coalesce(sum(vtUp.CountUpVotes), 0) AS TotalUpVotesReceived,
+        coalesce(sum(vtDown.CountDownVotes), 0) AS TotalDownVotesReceived,
+        count(distinct b.Id) AS TotalBadges,
+        max(b.Date) AS LastBadgeDate,
+        count(distinct ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (10, 11)) AS CloseReopenEvents
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN (
+        SELECT p.OwnerUserId, count(v.Id) AS CountUpVotes
+        FROM Votes v
+        JOIN Posts p ON p.Id = v.PostId AND p.OwnerUserId IS NOT NULL
+        WHERE v.VoteTypeId = 2
+        GROUP BY p.OwnerUserId
+    ) vtUp ON vtUp.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT p.OwnerUserId, count(v.Id) AS CountDownVotes
+        FROM Votes v
+        JOIN Posts p ON p.Id = v.PostId AND p.OwnerUserId IS NOT NULL
+        WHERE v.VoteTypeId = 3
+        GROUP BY p.OwnerUserId
+    ) vtDown ON vtDown.OwnerUserId = u.Id
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, vtUp.CountUpVotes, vtDown.CountDownVotes
+),
+PostsWithDuplicateCount AS (
+    SELECT 
+        p.Id, p.PostTypeId, p.Title, p.OwnerUserId, p.Score, p.ViewCount, p.CreationDate,
+        coalesce(CountLinks.DuplicateCount, 0) AS DuplicateLinksCount
+    FROM Posts p
+    LEFT JOIN (
+        SELECT PostId, count(*) AS DuplicateCount
+        FROM PostLinks
+        WHERE LinkTypeId = 3
+        GROUP BY PostId
+    ) CountLinks ON p.Id = CountLinks.PostId
+    WHERE p.PostTypeId = 1
+),
+RankedAnswers AS (
+    SELECT
+        a.Id,
+        a.ParentId,
+        a.Score,
+        row_number() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerScoreRank
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+),
+AcceptedAnswersWithScoreDiff AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.Score AS QuestionScore,
+        aa.Id AS AcceptedAnswerId,
+        aa.Score AS AcceptedAnswerScore,
+        aa.Score - q.Score AS ScoreDifference
+    FROM Posts q
+    LEFT JOIN Posts aa ON q.AcceptedAnswerId = aa.Id
+    WHERE q.PostTypeId = 1
+)
+SELECT
+    u.UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.TotalUpVotesReceived,
+    u.TotalDownVotesReceived,
+    u.TotalBadges,
+    u.LastBadgeDate,
+    u.CloseReopenEvents,
+    p.Title AS TopQuestionTitle,
+    p.Score AS QuestionScore,
+    p.ViewCount AS QuestionViews,
+    p.DuplicateLinksCount,
+    aa.AcceptedAnswerId,
+    aa.AcceptedAnswerScore,
+    aa.ScoreDifference,
+    string_agg(DISTINCT rt.TagName, ', ' ORDER BY rt.Level) AS RecursiveTags,
+    string_agg(DISTINCT br.BadgeName, ', ' ORDER BY br.Class, br.Date DESC) AS RecentBadges
+FROM UserAggregates u
+LEFT JOIN PostsWithDuplicateCount p ON p.OwnerUserId = u.UserId
+    AND p.Score = (
+        SELECT max(Score) FROM PostsWithDuplicateCount p2 WHERE p2.OwnerUserId = u.UserId AND p2.PostTypeId = 1
+    )
+LEFT JOIN AcceptedAnswersWithScoreDiff aa ON aa.QuestionId = p.Id
+LEFT JOIN RecursiveTagHierarchy rt ON p.Tags LIKE '%' || rt.TagName || '%'
+LEFT JOIN (
+    SELECT b.UserId, b.Name AS BadgeName, b.Class, b.Date
+    FROM Badges b
+    WHERE b.Class IN (1, 2, 3)
+) br ON br.UserId = u.UserId
+GROUP BY 
+    u.UserId, u.DisplayName, u.Reputation, u.TotalUpVotesReceived, u.TotalDownVotesReceived, u.TotalBadges, u.LastBadgeDate, u.CloseReopenEvents,
+    p.Title, p.Score, p.ViewCount, p.DuplicateLinksCount,
+    aa.AcceptedAnswerId, aa.AcceptedAnswerScore, aa.ScoreDifference,
+    rt.TagName, rt.Level, br.BadgeName, br.Class, br.Date
+HAVING 
+    (u.TotalUpVotesReceived + u.TotalDownVotesReceived) > 1000
+ORDER BY u.Reputation DESC, u.TotalBadges DESC, p.Score DESC
+LIMIT 100;

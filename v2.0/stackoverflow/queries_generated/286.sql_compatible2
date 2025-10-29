@@ -1,0 +1,374 @@
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        u.location,
+        coalesce(nullif(trim(split_part(coalesce(u.websiteurl,''),'/',3)),''), 'unknown.host') as website_host,
+        row_number() over (order by u.creationdate desc, u.id desc) as rn
+    from users u
+    where u.creationdate >= (
+        select max(creationdate) - interval '365 days' from users
+    )
+),
+user_badge_agg as (
+    select
+        b.userid,
+        count(*) as total_badges,
+        sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+        sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+        sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+        max(b.date) as last_badge_date
+    from badges b
+    group by b.userid
+),
+question_core as (
+    select
+        p.id as qid,
+        p.owneruserid as owner_id,
+        p.creationdate as q_created,
+        p.score as q_score,
+        p.viewcount as q_views,
+        p.title,
+        p.tags,
+        p.answercount,
+        p.favoritecount,
+        p.closeddate,
+        p.acceptedanswerid,
+        case when p.closeddate is not null then 1 else 0 end as is_closed
+    from posts p
+    where p.posttypeid = 1
+      and p.creationdate >= (select max(creationdate) - interval '365 days' from posts where posttypeid = 1)
+),
+question_quality as (
+    select
+        qc.qid,
+        qc.owner_id,
+        qc.q_created,
+        qc.q_score,
+        qc.q_views,
+        qc.title,
+        qc.tags,
+        qc.answercount,
+        qc.favoritecount,
+        qc.closeddate,
+        qc.acceptedanswerid,
+        qc.is_closed,
+        -- extract tag array length safely (avoid dialect-specific array literal)
+        coalesce(array_length(string_to_array(substring(coalesce(qc.tags, ''), 2, greatest(length(coalesce(qc.tags,'')) - 2, 0)), '><'),1),0) as tag_count,
+        -- normalized engagement score (avoid ::cast)
+        (coalesce(qc.q_score,0) * 2 + coalesce(qc.answercount,0) * 1.5 + coalesce(qc.favoritecount,0) * 0.5 + least(coalesce(qc.q_views,0)/100.0, 100)) as engagement_score
+    from question_core qc
+),
+answers_agg as (
+    select
+        a.parentid as qid,
+        count(*) as answers_total,
+        sum(case when a.score > 0 then 1 else 0 end) as answers_positive,
+        max(a.creationdate) as last_answer_date,
+        max(a.score) as max_answer_score
+    from posts a
+    where a.posttypeid = 2
+    group by a.parentid
+),
+votes_agg as (
+    select
+        v.postid as qid,
+        sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+        sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+        sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+        sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_total,
+        max(case when v.votetypeid in (8,9) then v.creationdate else null end) as last_bounty_activity
+    from votes v
+    group by v.postid
+),
+closures as (
+    select
+        ph.postid as qid,
+        min(case when ph.posthistorytypeid = 10 then ph.creationdate end) as first_close_date,
+        max(case when ph.posthistorytypeid = 11 then ph.creationdate end) as last_reopen_date,
+        max(
+            case
+                when ph.posthistorytypeid = 10 and ph.comment ~ '^[0-9]+$' then cast((regexp_match(ph.comment, '([0-9]+)'))[1] as integer)
+                else null
+            end
+        ) as last_close_reason_id
+    from posthistory ph
+    where ph.posthistorytypeid in (10,11)
+    group by ph.postid
+),
+dup_links as (
+    select
+        pl.postid as qid,
+        sum(case when pl.linktypeid = 3 then 1 else 0 end) as duplicate_marks,
+        sum(case when pl.linktypeid = 1 then 1 else 0 end) as linked_refs,
+        min(pl.creationdate) as first_link_date
+    from postlinks pl
+    group by pl.postid
+),
+tag_expansion as (
+    select
+        qq.qid,
+        unnest(string_to_array(substring(qq.tags, 2, greatest(length(qq.tags) - 2, 0)), '><')) as tag
+    from question_quality qq
+    where qq.tags is not null and qq.tags <> ''
+),
+tag_stats as (
+    select
+        te.qid,
+        count(*) as tag_count_nonnull,
+        sum(t.count) as tag_popularity_sum,
+        avg(cast(t.count as numeric)) as tag_popularity_avg,
+        max(t.count) as tag_popularity_max,
+        sum(case when t.ismoderaToronly then 1 else 0 end) as moderator_only_tags,
+        sum(case when t.isrequired then 1 else 0 end) as required_tags
+    from tag_expansion te
+    left join tags t on lower(t.tagname) = lower(te.tag)
+    group by te.qid
+),
+user_activity as (
+    select
+        u.id as user_id,
+        count(distinct case when p.posttypeid = 1 then p.id end) as q_posts,
+        count(distinct case when p.posttypeid = 2 then p.id end) as a_posts,
+        count(distinct c.id) as comments_total,
+        max(coalesce(p.lastactivitydate, c.creationdate)) as last_activity
+    from users u
+    left join posts p on p.owneruserid = u.id
+    left join comments c on c.userid = u.id
+    group by u.id
+),
+ranked_questions as (
+    select
+        qq.qid,
+        qq.owner_id,
+        qq.q_created,
+        qq.q_score,
+        qq.q_views,
+        qq.title,
+        qq.tags,
+        qq.answercount,
+        qq.favoritecount,
+        qq.closeddate,
+        qq.acceptedanswerid,
+        qq.is_closed,
+        qq.tag_count,
+        qq.engagement_score,
+        aa.answers_total,
+        aa.answers_positive,
+        aa.last_answer_date,
+        aa.max_answer_score,
+        va.upvotes,
+        va.downvotes,
+        va.favorites,
+        va.bounty_total,
+        va.last_bounty_activity,
+        cl.first_close_date,
+        cl.last_reopen_date,
+        cl.last_close_reason_id,
+        dl.duplicate_marks,
+        dl.linked_refs,
+        dl.first_link_date,
+        ts.tag_count_nonnull,
+        ts.tag_popularity_sum,
+        ts.tag_popularity_avg,
+        ts.tag_popularity_max,
+        ts.moderator_only_tags,
+        ts.required_tags,
+        -- comprehensive ranking score with null handling
+        (
+            coalesce(qq.engagement_score,0)
+            + coalesce(aa.answers_total,0) * 0.7
+            + coalesce(aa.answers_positive,0) * 1.2
+            + coalesce(va.upvotes,0) * 1.5
+            - coalesce(va.downvotes,0) * 1.0
+            + least(coalesce(va.bounty_total,0) / 50.0, 50)
+            - coalesce(dl.duplicate_marks,0) * 5
+            - case when qq.is_closed = 1 then 10 else 0 end
+            + least(coalesce(ts.tag_popularity_avg,0) / 1000.0, 20)
+            + case when qq.acceptedanswerid is not null then 3 else 0 end
+        ) as rank_score,
+        row_number() over (
+            partition by (case when qq.acceptedanswerid is not null then 1 else 0 end)
+            order by
+                (coalesce(qq.engagement_score,0)
+                + coalesce(va.upvotes,0) * 1.5
+                - coalesce(va.downvotes,0)
+                + coalesce(aa.answers_total,0) * 0.5) desc,
+                qq.q_created desc,
+                qq.qid desc
+        ) as rn_partition,
+        dense_rank() over (
+            order by
+                (coalesce(qq.engagement_score,0)
+                + coalesce(va.upvotes,0) * 1.5
+                - coalesce(va.downvotes,0)
+                + coalesce(aa.answers_total,0) * 0.5) desc
+        ) as global_dense_rank
+    from question_quality qq
+    left join answers_agg aa on aa.qid = qq.qid
+    left join votes_agg va on va.qid = qq.qid
+    left join closures cl on cl.qid = qq.qid
+    left join dup_links dl on dl.qid = qq.qid
+    left join tag_stats ts on ts.qid = qq.qid
+),
+top_questions as (
+    select *
+    from ranked_questions
+    where rn_partition <= 50
+       or global_dense_rank <= 100
+),
+owner_enriched as (
+    select
+        tq.*,
+        ru.user_id,
+        ru.displayname,
+        ru.reputation,
+        ru.creationdate as user_created,
+        ru.location,
+        ru.website_host,
+        uba.total_badges,
+        uba.gold_badges,
+        uba.silver_badges,
+        uba.bronze_badges,
+        uba.last_badge_date,
+        ua.q_posts as user_q_posts,
+        ua.a_posts as user_a_posts,
+        ua.comments_total as user_comments_total,
+        ua.last_activity as user_last_activity
+    from top_questions tq
+    left join recent_users ru on ru.user_id = tq.owner_id
+    left join user_badge_agg uba on uba.userid = tq.owner_id
+    left join user_activity ua on ua.user_id = tq.owner_id
+),
+comment_sentiment as (
+    select
+        c.postid as qid,
+        count(*) as comments_count,
+        sum(case when c.score > 0 then 1 else 0 end) as comments_positive,
+        sum(case when c.score < 0 then 1 else 0 end) as comments_negative,
+        avg(c.score) as comments_avg_score,
+        max(c.creationdate) as last_comment_date
+    from comments c
+    group by c.postid
+),
+final_scored as (
+    select
+        oe.*,
+        cs.comments_count,
+        cs.comments_positive,
+        cs.comments_negative,
+        cs.comments_avg_score,
+        cs.last_comment_date,
+        -- adjusted final score blending user and comment signals
+        (
+            oe.rank_score
+            + coalesce(cs.comments_positive,0) * 0.3
+            - coalesce(cs.comments_negative,0) * 0.2
+            + least(coalesce(oe.reputation,0) / 500.0, 40)
+            + least(coalesce(oe.total_badges,0) / 10.0, 20)
+        ) as final_score
+    from owner_enriched oe
+    left join comment_sentiment cs on cs.qid = oe.qid
+),
+percentiles AS (
+    select
+        fs.qid,
+        fs.final_score,
+        percent_rank() over (order by fs.final_score) as pr
+    from final_scored fs
+),
+bucketed as (
+    select
+        fs.*,
+        case
+            when p.pr >= 0.95 then 'P95+'
+            when p.pr >= 0.90 then 'P90-P95'
+            when p.pr >= 0.75 then 'P75-P90'
+            when p.pr >= 0.50 then 'P50-P75'
+            else 'P0-P50'
+        end as score_bucket
+    from final_scored fs
+    join percentiles p on p.qid = fs.qid
+),
+null_probe as (
+    select
+        b.*,
+        case when b.closeddate is null and b.last_reopen_date is not null then 1 else 0 end as reopened_flag,
+        coalesce(nullif(trim(b.title), ''), '(untitled)') as safe_title,
+        coalesce(b.tag_count_nonnull, 0) + case when b.tags is null then 0 else 0 end as tag_count_safe
+    from bucketed b
+)
+select
+    np.qid,
+    np.safe_title as title,
+    np.owner_id,
+    coalesce(np.displayname, '(unknown)') as owner_displayname,
+    np.reputation,
+    np.user_created,
+    np.location,
+    np.website_host,
+    np.q_created,
+    np.q_score,
+    np.q_views,
+    np.answercount,
+    np.acceptedanswerid,
+    np.upvotes,
+    np.downvotes,
+    np.favorites,
+    np.bounty_total,
+    np.last_bounty_activity,
+    np.duplicate_marks,
+    np.linked_refs,
+    np.tag_count_safe as tag_count,
+    np.tag_popularity_sum,
+    np.tag_popularity_avg,
+    np.is_closed,
+    np.first_close_date,
+    np.last_reopen_date,
+    np.last_close_reason_id,
+    np.answers_total,
+    np.answers_positive,
+    np.max_answer_score,
+    np.last_answer_date,
+    np.comments_count,
+    np.comments_positive,
+    np.comments_negative,
+    np.comments_avg_score,
+    np.last_comment_date,
+    np.total_badges,
+    np.gold_badges,
+    np.silver_badges,
+    np.bronze_badges,
+    np.user_q_posts,
+    np.user_a_posts,
+    np.user_comments_total,
+    np.user_last_activity,
+    np.rank_score,
+    np.final_score,
+    np.score_bucket,
+    np.rn_partition,
+    np.global_dense_rank,
+    (
+        select min(dt) from (
+            values (np.q_created), (np.first_link_date), (np.first_close_date), (np.last_answer_date), (np.last_comment_date)
+        ) as v(dt)
+    ) as earliest_activity,
+    case when lower(coalesce(np.tags,'')) like '%<sql>%' then 1 else 0 end as has_sql_tag,
+    extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - np.q_created)) / 86400.0 as days_since_creation
+from null_probe np
+where (
+        (coalesce(np.upvotes,0) - coalesce(np.downvotes,0) >= 0)
+        or (np.acceptedanswerid is not null and coalesce(np.answers_total,0) >= 1)
+    )
+  and (
+        np.score_bucket in ('P95+','P90-P95','P75-P90')
+        or (np.reopened_flag = 1 and coalesce(np.duplicate_marks,0) = 0)
+    )
+  and (
+        coalesce(np.tag_popularity_avg,0) > 0
+        or (np.website_host is not null and np.website_host not like '%.invalid')
+    )
+order by np.final_score desc, np.q_created desc
+limit 500;

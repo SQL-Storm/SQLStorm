@@ -1,0 +1,162 @@
+with RecursiveTagCounts as (
+    select 
+        t.Id as TagId,
+        t.TagName,
+        p.Id as PostId,
+        p.CreationDate,
+        pn.ExcerptPostId,
+        ROW_NUMBER() over (partition by t.Id order by p.CreationDate desc) as rn
+    from 
+        Tags t
+    left join 
+        Posts p on p.Tags like concat('%<', t.TagName, '>%')
+    left join 
+        Posts pn on pn.Id = t.ExcerptPostId
+    where 
+        p.PostTypeId = 1 or p.Id is null
+),
+UserBadgeAgg as (
+    select 
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount,
+        max(b.Date) as LastBadgeDate,
+        sum(case when b.TagBased = 1 then 1 else 0 end) as TagBasedCount
+    from 
+        Badges b
+    group by 
+        b.UserId, b.Class
+),
+PostAnswerVotes as (
+    select 
+        p.Id as QuestionId,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        v.VoteTypeId,
+        count(case when v.VoteTypeId = 2 then v.Id end) as AnswerUpVotes,
+        count(case when v.VoteTypeId = 3 then v.Id end) as AnswerDownVotes
+    from 
+        Posts p
+    left join Posts a on a.ParentId = p.Id and a.PostTypeId = 2
+    left join Votes v on v.PostId = a.Id
+    where 
+        p.PostTypeId = 1
+    group by 
+        p.Id, a.Id, a.Score, v.VoteTypeId
+),
+UserActivityWindow as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        count(distinct p.Id) over (partition by u.Id order by p.CreationDate rows between unbounded preceding and current row) as CumulativePosts,
+        sum(case when p.PostTypeId = 1 then 1 else 0 end) over (partition by u.Id order by p.CreationDate rows between unbounded preceding and current row) as CumulativeQuestions,
+        sum(case when p.PostTypeId = 2 then 1 else 0 end) over (partition by u.Id order by p.CreationDate rows between unbounded preceding and current row) as CumulativeAnswers
+    from 
+        Users u
+    left join Posts p on p.OwnerUserId = u.Id
+),
+ClosedQuestionsWithReason as (
+    select 
+        ph.PostId,
+        ph.Comment as CloseReasonId,
+        crt.Name as CloseReasonName,
+        max(ph.CreationDate) as CloseDate
+    from 
+        PostHistory ph
+    join CloseReasonTypes crt on crt.Id = CAST(ph.Comment AS integer)
+    where 
+        ph.PostHistoryTypeId = 10
+    group by 
+        ph.PostId, ph.Comment, crt.Name
+),
+DuplicateLinks as (
+    select 
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name as LinkTypeName
+    from 
+        PostLinks pl
+    join LinkTypes lt on pl.LinkTypeId = lt.Id
+    where 
+        pl.LinkTypeId = 3
+),
+QuestionWithDuplicatesAndClose as (
+    select 
+        p.Id as QuestionId,
+        p.Title,
+        p.ViewCount,
+        p.Score,
+        p.Tags,
+        dq.RelatedPostId as DuplicateOf,
+        ccwr.CloseReasonId,
+        ccwr.CloseReasonName,
+        ccwr.CloseDate,
+        u.DisplayName as OwnerDisplayName,
+        u.Reputation as OwnerReputation,
+        uba.BadgeCount as UserBadgeCount,
+        uba.LastBadgeDate,
+        uba.TagBasedCount
+    from 
+        Posts p
+    left join DuplicateLinks dq on dq.PostId = p.Id
+    left join ClosedQuestionsWithReason ccwr on ccwr.PostId = p.Id
+    left join Users u on p.OwnerUserId = u.Id
+    left join UserBadgeAgg uba on uba.UserId = u.Id and uba.Class = 1
+    where 
+        p.PostTypeId = 1
+),
+RankedQuestions as (
+    select 
+        q.QuestionId,
+        q.Title,
+        q.ViewCount,
+        q.Score,
+        q.Tags,
+        q.DuplicateOf,
+        q.CloseReasonId,
+        q.CloseReasonName,
+        q.CloseDate,
+        q.OwnerDisplayName,
+        q.OwnerReputation,
+        q.UserBadgeCount,
+        q.LastBadgeDate,
+        q.TagBasedCount,
+        dense_rank() over (partition by q.CloseReasonName order by q.ViewCount desc, q.Score desc) as RankWithinCloseReason,
+        ntile(5) over (order by coalesce(q.OwnerReputation, 0) desc) as ReputationQuintile
+    from 
+        QuestionWithDuplicatesAndClose q
+)
+select 
+    rq.QuestionId,
+    rq.Title,
+    rq.ViewCount,
+    rq.Score,
+    rq.Tags,
+    rq.DuplicateOf,
+    rq.CloseReasonName,
+    rq.CloseDate,
+    rq.OwnerDisplayName,
+    rq.OwnerReputation,
+    rq.UserBadgeCount,
+    rq.LastBadgeDate,
+    rq.TagBasedCount,
+    rq.RankWithinCloseReason,
+    rq.ReputationQuintile,
+    (select count(*) from Comments c 
+     where c.PostId = rq.QuestionId 
+       and (length(c.Text) > 50 or c.Text is null)) as LongCommentCount,
+    coalesce(split_part(trim(both '<>' from rq.Tags), '><', 1), 'NoTag') as FirstTag,
+    avg(rq.Score) over (partition by rq.ReputationQuintile) as AvgScoreByRepQuintile,
+    coalesce(rq.UserBadgeCount, 0) * coalesce(rq.ViewCount, 0) / nullif(rq.Score + 10, 0) as BadgeViewScoreRatio
+from 
+    RankedQuestions rq
+where 
+    (rq.CloseReasonName is null or rq.CloseReasonName not like '%off-topic%')
+    and (rq.OwnerReputation > 100 or rq.OwnerReputation is null)
+    and rq.RankWithinCloseReason <= 10
+order by 
+    rq.ReputationQuintile, rq.RankWithinCloseReason
+limit 100;

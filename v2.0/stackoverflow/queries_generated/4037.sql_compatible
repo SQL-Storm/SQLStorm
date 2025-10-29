@@ -1,0 +1,162 @@
+WITH
+  UserPostActivity AS (
+    SELECT
+      p.OwnerUserId,
+      COUNT(p.Id) AS PostCount,
+      SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+      MAX(p.CreationDate) AS LastPostDate,
+      AVG(p.Score) AS AvgPostScore,
+      SUM(p.FavoriteCount) AS TotalFavorites
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+  ),
+  UserCommentActivity AS (
+    SELECT
+      c.UserId,
+      COUNT(c.Id) AS CommentCount,
+      AVG(c.Score) AS AvgCommentScore,
+      MAX(c.CreationDate) AS LastCommentDate
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+    GROUP BY c.UserId
+  ),
+  UserVoteActivity AS (
+    SELECT
+      v.UserId,
+      COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE NULL END) AS UpVoteCount,
+      COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE NULL END) AS DownVoteCount,
+      COUNT(CASE WHEN v.VoteTypeId = 8 THEN 1 ELSE NULL END) AS BountyStartCount
+    FROM Votes v
+    WHERE v.UserId IS NOT NULL
+    GROUP BY v.UserId
+  ),
+  UserBadgeDistribution AS (
+    SELECT
+      b.UserId,
+      COUNT(CASE WHEN b.Class = 1 THEN 1 ELSE NULL END) AS GoldBadgeCount,
+      COUNT(CASE WHEN b.Class = 2 THEN 1 ELSE NULL END) AS SilverBadgeCount,
+      COUNT(CASE WHEN b.Class = 3 THEN 1 ELSE NULL END) AS BronzeBadgeCount
+    FROM Badges b
+    GROUP BY b.UserId
+  ),
+  RankedPosts AS (
+    SELECT
+      p.Id AS PostId,
+      p.OwnerUserId,
+      p.Title,
+      p.Score,
+      p.ViewCount,
+      p.CreationDate,
+      ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS ScoreRank,
+      ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.ViewCount DESC) AS ViewRank,
+      LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousScore,
+      LEAD(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextScore
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.OwnerUserId IS NOT NULL
+  )
+SELECT
+  u.Id AS UserId,
+  u.DisplayName,
+  u.Reputation,
+  u.CreationDate AS UserCreationDate,
+  u.LastAccessDate AS UserLastAccessDate,
+  COALESCE(upa.PostCount, 0) AS TotalPosts,
+  COALESCE(upa.QuestionCount, 0) AS TotalQuestions,
+  COALESCE(upa.AnswerCount, 0) AS TotalAnswers,
+  COALESCE(u.UpVotes, 0) AS UserUpVotesGiven,
+  COALESCE(u.DownVotes, 0) AS UserDownVotesGiven,
+  COALESCE(uva.UpVoteCount, 0) AS VotesUpReceived,
+  COALESCE(uva.DownVoteCount, 0) AS VotesDownReceived,
+  COALESCE(uca.CommentCount, 0) AS TotalCommentsMade,
+  COALESCE(uca.AvgCommentScore, 0.0) AS AvgCommentScore,
+  COALESCE(ubd.GoldBadgeCount, 0) AS GoldBadges,
+  COALESCE(ubd.SilverBadgeCount, 0) AS SilverBadges,
+  COALESCE(ubd.BronzeBadgeCount, 0) AS BronzeBadges,
+  CASE
+    WHEN COALESCE(upa.PostCount,0) > 0 THEN CAST(upa.TotalFavorites AS DOUBLE PRECISION) / upa.PostCount
+    ELSE 0.0
+  END AS AvgFavoritesPerPost,
+  COALESCE(upa.AvgPostScore, 0.0) AS AvgPostScore,
+  CASE
+    WHEN rp.ScoreRank <= 3 THEN rp.Title
+    ELSE 'No Top 3 Posts'
+  END AS TopPostTitle,
+  CASE
+    WHEN rp.ScoreRank <= 3 THEN rp.Score
+    ELSE 0
+  END AS TopPostScore,
+  CASE
+    WHEN rp.ScoreRank <= 3 THEN rp.ViewRank
+    ELSE 0
+  END AS TopPostViewRank,
+  CASE
+    WHEN COALESCE(rp.PreviousScore,0) > 0 AND COALESCE(rp.NextScore,0) > 0 THEN (rp.NextScore - rp.PreviousScore)
+    ELSE 0
+  END AS ScoreChangeBetweenAdjacentPosts,
+  LOWER(SUBSTRING(u.Location FROM 1 FOR 3)) AS LocationPrefix,
+  LENGTH(COALESCE(u.AboutMe, '')) AS AboutMeLength,
+  CASE
+    WHEN u.WebsiteUrl LIKE '%stackexchange.com%' THEN 'StackExchange Network'
+    WHEN u.WebsiteUrl LIKE '%stackoverflow.com%' THEN 'Stack Overflow Specific'
+    WHEN u.WebsiteUrl IS NOT NULL THEN 'Other'
+    ELSE 'No Website'
+  END AS WebsiteCategory,
+  COALESCE(CAST(upa.LastPostDate AS VARCHAR), 'Never') AS LastPostActivity,
+  COALESCE(CAST(uca.LastCommentDate AS VARCHAR), 'Never') AS LastCommentActivity,
+  CASE
+    WHEN u.LastAccessDate > (cast('2024-10-01' as date) - INTERVAL '90 days') THEN 'Active Recently'
+    WHEN u.LastAccessDate > (cast('2024-10-01' as date) - INTERVAL '365 days') THEN 'Moderately Active'
+    ELSE 'Inactive'
+  END AS UserActivityStatus
+FROM Users u
+LEFT JOIN UserPostActivity upa
+  ON u.Id = upa.OwnerUserId
+LEFT JOIN UserCommentActivity uca
+  ON u.Id = uca.UserId
+LEFT JOIN UserVoteActivity uva
+  ON u.Id = uva.UserId
+LEFT JOIN UserBadgeDistribution ubd
+  ON u.Id = ubd.UserId
+LEFT JOIN RankedPosts rp
+  ON u.Id = rp.OwnerUserId AND rp.ScoreRank <= 3
+WHERE
+  u.DisplayName IS NOT NULL
+  AND u.Reputation > 1000
+GROUP BY
+  u.Id,
+  u.DisplayName,
+  u.Reputation,
+  u.CreationDate,
+  u.LastAccessDate,
+  u.UpVotes,
+  u.DownVotes,
+  upa.PostCount,
+  upa.QuestionCount,
+  upa.AnswerCount,
+  upa.TotalFavorites,
+  upa.AvgPostScore,
+  upa.LastPostDate,
+  uca.CommentCount,
+  uca.AvgCommentScore,
+  uca.LastCommentDate,
+  uva.UpVoteCount,
+  uva.DownVoteCount,
+  ubd.GoldBadgeCount,
+  ubd.SilverBadgeCount,
+  ubd.BronzeBadgeCount,
+  rp.ScoreRank,
+  rp.Title,
+  rp.Score,
+  rp.ViewRank,
+  rp.PreviousScore,
+  rp.NextScore,
+  u.Location,
+  u.AboutMe,
+  u.WebsiteUrl
+ORDER BY
+  u.Reputation DESC,
+  UserActivityStatus,
+  upa.PostCount DESC
+LIMIT 100;

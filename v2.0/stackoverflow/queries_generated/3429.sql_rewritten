@@ -1,0 +1,121 @@
+-- {"query": "3429.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2552} 
+WITH TaggedQuestions AS (
+    SELECT 
+        p.Id               AS QId,
+        p.Title,
+        p.CreationDate,
+        p.Score            AS QScore,
+        p.Tags,
+        p.OwnerUserId      AS QOwnerId
+    FROM Posts p
+    WHERE p.PostTypeId = 1               -- only questions
+      AND p.Tags IS NOT NULL
+      AND p.CreationDate >= DATEADD(year, -1, cast('2024-10-01 12:34:56' as timestamp))
+),
+ParsedTags AS (
+    SELECT 
+        tq.QId,
+        TRIM(value) AS Tag
+    FROM TaggedQuestions tq
+    CROSS APPLY STRING_SPLIT(
+        SUBSTRING(tq.Tags, 2, LEN(tq.Tags) - 2),   -- strip leading/trailing '<' '>'
+        '><'
+    ) AS s
+),
+AnswersAgg AS (
+    SELECT 
+        a.ParentId                         AS QId,
+        COUNT(*)                           AS AnswerCount,
+        MAX(CASE WHEN a.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END) AS HasAccepted,
+        AVG(CAST(a.Score AS FLOAT))        AS AvgAnswerScore
+    FROM Posts a
+    JOIN Posts q ON q.Id = a.ParentId AND q.PostTypeId = 1
+    WHERE a.PostTypeId = 2               -- only answers
+    GROUP BY a.ParentId
+),
+UserStats AS (
+    SELECT 
+        u.Id                     AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        COUNT(DISTINCT b.Id)     AS BadgeCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesGiven,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesGiven
+    FROM Users u
+    LEFT JOIN Badges b   ON b.UserId = u.Id
+    LEFT JOIN Votes  v   ON v.UserId = u.Id
+    GROUP BY u.Id, u.Reputation, u.DisplayName
+),
+TopUsers AS (
+    SELECT 
+        us.*,
+        RANK() OVER (ORDER BY us.Reputation DESC, us.BadgeCount DESC) AS RepRank
+    FROM UserStats us
+    WHERE us.Reputation > 1000
+)
+SELECT TOP (10)
+    tu.UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.BadgeCount,
+    tu.UpVotesGiven,
+    tu.DownVotesGiven,
+    tu.RepRank,
+    q.QId,
+    q.Title,
+    q.QScore,
+    COALESCE(a.AnswerCount, 0)            AS AnswerCount,
+    COALESCE(a.HasAccepted, 0)            AS HasAccepted,
+    COALESCE(a.AvgAnswerScore, 0.0)       AS AvgAnswerScore,
+    STRING_AGG(pt.Tag, ',')               AS TagList,
+    /* Correlated sub‑query – distinct commenters per question */
+    (SELECT COUNT(DISTINCT c.UserId)
+     FROM Comments c
+     WHERE c.PostId = q.QId)              AS DistinctCommenters,
+    /* Total up‑votes on all answers for the question */
+    COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END),0) AS AnswerUpVotes,
+    /* NULL logic – show NULL when no tags match the filter */
+    CASE 
+        WHEN EXISTS (SELECT 1 FROM ParsedTags pt2 WHERE pt2.QId = q.QId AND pt2.Tag IN ('sql','performance'))
+        THEN 'Match'
+        ELSE NULL
+    END                                 AS TagMatchFlag
+FROM TopUsers tu
+JOIN Posts q               ON q.OwnerUserId = tu.UserId AND q.PostTypeId = 1
+LEFT JOIN AnswersAgg a    ON a.QId = q.QId
+LEFT JOIN ParsedTags pt   ON pt.QId = q.QId
+LEFT JOIN Posts ans       ON ans.PostTypeId = 2 AND ans.ParentId = q.QId
+LEFT JOIN Votes v         ON v.PostId = ans.Id
+WHERE (q.Tags LIKE '%<sql>%'
+       OR q.Tags LIKE '%<performance>%')
+GROUP BY 
+    tu.UserId, tu.DisplayName, tu.Reputation, tu.BadgeCount,
+    tu.UpVotesGiven, tu.DownVotesGiven, tu.RepRank,
+    q.QId, q.Title, q.QScore, a.AnswerCount, a.HasAccepted, a.AvgAnswerScore
+UNION ALL
+/*  Second branch – questions without answers but with specific tags  */
+SELECT
+    NULL        AS UserId,
+    NULL        AS DisplayName,
+    NULL        AS Reputation,
+    NULL        AS BadgeCount,
+    NULL        AS UpVotesGiven,
+    NULL        AS DownVotesGiven,
+    NULL        AS RepRank,
+    tq.QId,
+    tq.Title,
+    tq.QScore,
+    0          AS AnswerCount,
+    0          AS HasAccepted,
+    0.0        AS AvgAnswerScore,
+    STRING_AGG(pt.Tag, ',') AS TagList,
+    0          AS DistinctCommenters,
+    0          AS AnswerUpVotes,
+    'NoAnswer' AS TagMatchFlag
+FROM TaggedQuestions tq
+LEFT JOIN ParsedTags pt ON pt.QId = tq.QId
+WHERE NOT EXISTS (SELECT 1 FROM AnswersAgg aa WHERE aa.QId = tq.QId)
+  AND (tq.Tags LIKE '%<c>%'
+       OR tq.Tags LIKE '%<java>%')
+GROUP BY 
+    tq.QId, tq.Title, tq.QScore;

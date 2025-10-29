@@ -1,0 +1,189 @@
+WITH UserInfluence AS (
+    SELECT
+        U.Id AS UserId,
+        U.Reputation,
+        U.Views AS UserViews,
+        U.UpVotes AS UserUpVotes,
+        U.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT P.Id) AS TotalPostsAuthored,
+        COUNT(DISTINCT C.Id) AS TotalCommentsAuthored,
+        SUM(CASE WHEN V.VoteTypeId IN (2, 5, 8) THEN 1 ELSE 0 END) AS TotalBeneficialVotesReceived,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalHarmfulVotesReceived
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Votes V ON P.Id = V.PostId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    GROUP BY U.Id, U.Reputation, U.Views, U.UpVotes, U.DownVotes
+    HAVING U.Reputation > 5000 AND COUNT(DISTINCT P.Id) > 10
+),
+PostHistorySummary AS (
+    SELECT
+        PH.PostId,
+        COUNT(DISTINCT PH.UserId) AS UniqueEditors,
+        MAX(PH.CreationDate) AS LastHistoryEventDate,
+        MIN(PH.CreationDate) AS FirstHistoryEventDate,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS MajorEditCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (10, 12, 14) THEN 1 ELSE 0 END) AS NegativeHistoryCount,
+        LAG(PH.CreationDate, 1, TIMESTAMP '1970-01-01 00:00:00') OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) AS PreviousHistoryEventDate
+    FROM PostHistory PH
+    WHERE PH.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 10, 11, 12, 13, 14, 15, 16, 17)
+    GROUP BY PH.PostId
+    HAVING COUNT(PH.Id) >= 3
+),
+TagUsageAggregate AS (
+    SELECT
+        SPLIT_PART.Tag AS TagName,
+        COUNT(DISTINCT P.Id) AS PostCountWithTag,
+        AVG(P.Score) AS AvgScoreWithTag,
+        SUM(P.ViewCount) AS TotalViewsWithTag,
+        NTILE(5) OVER (ORDER BY AVG(P.Score) DESC, COUNT(DISTINCT P.Id) DESC) AS TagEngagementPercentile
+    FROM Posts P
+    CROSS JOIN LATERAL (SELECT unnest(string_to_array(trim(P.Tags, '<>'), '><')) AS Tag) AS SPLIT_PART
+    WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL AND TRIM(P.Tags) <> ''
+    GROUP BY SPLIT_PART.Tag
+    HAVING COUNT(DISTINCT P.Id) > 20
+),
+RecentCommentsWithSentiment AS (
+    SELECT
+        C.PostId,
+        SUM(CASE WHEN C.Text ILIKE '%solved%' OR C.Text ILIKE '%thanks%' OR C.Text ILIKE '%working%' THEN 1 ELSE 0 END) AS PositiveSentimentComments,
+        SUM(CASE WHEN C.Text ILIKE '%bug%' OR C.Text ILIKE '%issue%' OR C.Text ILIKE '%error%' OR C.Text ILIKE '%not working%' THEN 1 ELSE 0 END) AS NegativeSentimentComments,
+        AVG(C.Score) AS AvgCommentScore,
+        MAX(C.CreationDate) AS LatestCommentDate,
+        COUNT(C.Id) AS TotalCommentsOnPost,
+        ROW_NUMBER() OVER (PARTITION BY C.PostId ORDER BY C.CreationDate DESC, C.Score DESC) AS rn_latest_comment
+    FROM Comments C
+    WHERE C.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year') AND LENGTH(C.Text) > 10
+    GROUP BY C.PostId
+    HAVING COUNT(C.Id) >= 1
+),
+LinkedDuplicateAnalysis AS (
+    SELECT
+        PL.PostId,
+        COUNT(CASE WHEN PL.LinkTypeId = 3 THEN 1 ELSE NULL END) AS DuplicatesCount,
+        COUNT(CASE WHEN PL.LinkTypeId = 1 THEN 1 ELSE NULL END) AS LinkedPostsCount,
+        SUM(COALESCE(P_rel.Score, 0)) AS SumRelatedPostScores,
+        AVG(COALESCE(P_rel.ViewCount, 0)) AS AvgRelatedPostViews
+    FROM PostLinks PL
+    LEFT JOIN Posts P_rel ON PL.RelatedPostId = P_rel.Id
+    GROUP BY PL.PostId
+),
+DiversePostSet AS (
+    SELECT
+        P.Id AS PostId,
+        'HighQuality_Resolved' AS SourceCategory,
+        P.CreationDate,
+        P.Score,
+        P.ViewCount
+    FROM Posts P
+    INNER JOIN UserInfluence UI ON P.OwnerUserId = UI.UserId
+    WHERE P.PostTypeId = 1
+      AND P.AcceptedAnswerId IS NOT NULL
+      AND P.FavoriteCount > 15
+      AND P.Score > 75
+    UNION ALL
+    SELECT
+        P.Id AS PostId,
+        'Linked_or_DuplicateInterest' AS SourceCategory,
+        P.CreationDate,
+        P.Score,
+        P.ViewCount
+    FROM Posts P
+    INNER JOIN LinkedDuplicateAnalysis LDA ON P.Id = LDA.PostId
+    WHERE P.PostTypeId = 1
+      AND (LDA.DuplicatesCount > 0 OR LDA.LinkedPostsCount > 2)
+      AND LDA.SumRelatedPostScores > 100
+      AND P.CreationDate BETWEEN (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '3 years') AND (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year')
+)
+SELECT
+    P.Id AS QuestionId,
+    P.Title AS QuestionTitle,
+    U.DisplayName AS OwnerDisplayName,
+    UI.Reputation AS OwnerReputation,
+    P.Score AS QuestionScore,
+    P.ViewCount,
+    P.AnswerCount,
+    P.FavoriteCount,
+    P.CreationDate AS QuestionCreationDate,
+    P.LastActivityDate,
+    PHS.LastHistoryEventDate,
+    PHS.MajorEditCount,
+    COALESCE(DPS.SourceCategory, 'General_Interest') AS PostCategoryFromDiverseSet,
+    CASE
+        WHEN P.Title ILIKE '%javascript%' OR P.Body ILIKE '%javascript%' THEN 'JS_Related'
+        WHEN P.Tags ILIKE '%<python>%' OR P.Tags ILIKE '%<django>%' THEN 'Python_Related'
+        WHEN P.Title ILIKE '%database%' OR P.Tags ILIKE '%<sql>%' THEN 'Database_SQL_Related'
+        ELSE 'Other_Tech'
+    END AS DetectedContentType,
+    (P.Score * 2.5 + P.AnswerCount * 1.8 + P.CommentCount * 0.9 + P.FavoriteCount * 3.0 + (P.ViewCount / 100.0)) *
+    (1 + (UI.TotalBeneficialVotesReceived - UI.TotalHarmfulVotesReceived) / (NULLIF(UI.TotalBeneficialVotesReceived + UI.TotalHarmfulVotesReceived, 0) + 100.0)) AS InfluenceScore,
+    EXISTS (
+        SELECT 1
+        FROM Badges B
+        WHERE B.UserId = P.OwnerUserId
+          AND B.Name = 'Nice Answer'
+          AND B.Class = 2
+          AND B.Date BETWEEN P.CreationDate AND (P.LastActivityDate + INTERVAL '1 month')
+    ) AS HasRelevantSilverBadge,
+    (SELECT AVG(P_linked.Score) FROM PostLinks PL_sub JOIN Posts P_linked ON PL_sub.RelatedPostId = P_linked.Id WHERE PL_sub.PostId = P.Id AND PL_sub.LinkTypeId = 1) AS AvgLinkedPostScore,
+    RANK() OVER (PARTITION BY
+        CASE
+            WHEN P.Title ILIKE '%javascript%' OR P.Body ILIKE '%javascript%' THEN 'JS_Related'
+            WHEN P.Tags ILIKE '%<python>%' OR P.Tags ILIKE '%<django>%' THEN 'Python_Related'
+            WHEN P.Title ILIKE '%database%' OR P.Tags ILIKE '%<sql>%' THEN 'Database_SQL_Related'
+            ELSE 'Other_Tech'
+        END
+    ORDER BY (
+        (P.Score * 2.5 + P.AnswerCount * 1.8 + P.CommentCount * 0.9 + P.FavoriteCount * 3.0 + (P.ViewCount / 100.0)) *
+        (1 + (UI.TotalBeneficialVotesReceived - UI.TotalHarmfulVotesReceived) / (NULLIF(UI.TotalBeneficialVotesReceived + UI.TotalHarmfulVotesReceived, 0) + 100.0))
+    ) DESC) AS RankWithinContentType,
+    (CAST(P.ViewCount AS NUMERIC) / NULLIF(SUM(P.ViewCount) OVER (PARTITION BY EXTRACT(YEAR FROM P.CreationDate), EXTRACT(MONTH FROM P.CreationDate)), 0)) * 100 AS MonthlyViewSharePercentage,
+    COALESCE(RCS.PositiveSentimentComments, 0) AS PositiveCommentsLastYear,
+    COALESCE(RCS.NegativeSentimentComments, 0) AS NegativeCommentsLastYear,
+    TUA.AvgScoreWithTag AS AvgScoreOfTopTag,
+    TUA.TagEngagementPercentile AS TopTagPercentile,
+    PHS.PreviousHistoryEventDate AS LastHistoryPrevDate,
+    CASE
+        WHEN P.ClosedDate IS NOT NULL AND PHS.NegativeHistoryCount > 0 THEN
+             (SELECT CRS.Name FROM CloseReasonTypes CRS JOIN PostHistory PH_close ON CRS.Id = CAST(PH_close.Comment AS INTEGER) WHERE PH_close.PostId = P.Id AND PH_close.PostHistoryTypeId = 10 ORDER BY PH_close.CreationDate DESC LIMIT 1)
+        WHEN P.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        WHEN P.AcceptedAnswerId IS NOT NULL THEN 'Answered & Accepted'
+        ELSE 'Open & Active'
+    END AS DetailedStatusDescription,
+    SUBSTRING(U.AboutMe FROM POSITION('<p>' IN U.AboutMe) + 3 FOR (POSITION('</p>' IN U.AboutMe) - POSITION('<p>' IN U.AboutMe) - 3)) AS OwnerAboutMeSnippet
+FROM Posts P
+INNER JOIN Users U ON P.OwnerUserId = U.Id
+INNER JOIN UserInfluence UI ON U.Id = UI.UserId
+LEFT JOIN PostHistorySummary PHS ON P.Id = PHS.PostId
+LEFT JOIN RecentCommentsWithSentiment RCS ON P.Id = RCS.PostId AND RCS.rn_latest_comment = 1
+LEFT JOIN LinkedDuplicateAnalysis LDA ON P.Id = LDA.PostId
+LEFT JOIN DiversePostSet DPS ON P.Id = DPS.PostId
+LEFT JOIN (
+    SELECT DISTINCT ON (SPLIT_TAGS.PostId)
+           SPLIT_TAGS.PostId,
+           SPLIT_TAGS.Tag AS TagName,
+           TUA_inner.AvgScoreWithTag,
+           TUA_inner.TagEngagementPercentile
+    FROM (
+        SELECT P_inner.Id AS PostId, unnest(string_to_array(trim(P_inner.Tags, '<>'), '><')) AS Tag
+        FROM Posts P_inner
+        WHERE P_inner.PostTypeId = 1 AND P_inner.Tags IS NOT NULL AND TRIM(P_inner.Tags) <> ''
+    ) AS SPLIT_TAGS
+    INNER JOIN TagUsageAggregate TUA_inner ON SPLIT_TAGS.Tag = TUA_inner.TagName
+    ORDER BY SPLIT_TAGS.PostId, TUA_inner.AvgScoreWithTag DESC, TUA_inner.PostCountWithTag DESC
+) AS TUA ON P.Id = TUA.PostId
+WHERE
+    P.PostTypeId = 1
+    AND P.OwnerUserId IS NOT NULL
+    AND P.Score >= 100
+    AND P.ViewCount > 5000
+    AND P.AnswerCount >= 2
+    AND P.LastActivityDate IS NOT NULL
+    AND P.LastActivityDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 years')
+    AND PHS.MajorEditCount >= 3
+    AND (RCS.TotalCommentsOnPost IS NULL OR (RCS.TotalCommentsOnPost >= 3 AND RCS.NegativeSentimentComments < RCS.PositiveSentimentComments))
+    AND P.Id NOT IN (SELECT PH_del.PostId FROM PostHistory PH_del WHERE PH_del.PostHistoryTypeId = 12)
+    AND P.Title IS NOT NULL
+    AND P.Body IS NOT NULL
+ORDER BY InfluenceScore DESC, P.CreationDate DESC
+LIMIT 500;

@@ -1,0 +1,183 @@
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate,
+        U.LastAccessDate,
+        U.Views AS UserViews,
+        U.UpVotes AS UserUpVotesGiven,
+        U.DownVotes AS UserDownVotesGiven,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsAsked,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersProvided,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT B.Id) AS TotalBadgesEarned,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COALESCE(SUM(P.Score), 0) AS TotalPostScoreReceived,
+        COALESCE(SUM(P.ViewCount), 0) AS TotalPostViewCount,
+        EXTRACT(EPOCH FROM (U.LastAccessDate - U.CreationDate)) / (60 * 60 * 24 * 365.25) AS YearsActive,
+        COUNT(DISTINCT V.PostId) AS TotalPostsVotedOnByUser,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesCast,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesCast
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN Votes V ON U.Id = V.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Views, U.UpVotes, U.DownVotes
+),
+PostEditActivity AS (
+    SELECT
+        PH.PostId,
+        COUNT(PH.Id) AS TotalRevisions,
+        MAX(PH.CreationDate) AS LastRevisionDate,
+        MIN(PH.CreationDate) AS FirstRevisionDate,
+        COUNT(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 END) AS MajorEditCount,
+        COUNT(CASE WHEN PH.PostHistoryTypeId IN (10, 11, 12, 13) THEN 1 END) AS StatusChangeCount
+    FROM PostHistory PH
+    GROUP BY PH.PostId
+),
+QuestionAnswerPerformance AS (
+    SELECT
+        Q.Id AS QuestionId,
+        Q.OwnerUserId AS QuestionOwnerUserId,
+        Q.Title AS QuestionTitle,
+        Q.CreationDate AS QuestionCreationDate,
+        Q.Score AS QuestionScore,
+        Q.ViewCount AS QuestionViewCount,
+        COALESCE(Q.AnswerCount, 0) AS ActualAnswerCount,
+        A.Id AS AcceptedAnswerId,
+        A.OwnerUserId AS AcceptedAnswerOwnerUserId,
+        A.Score AS AcceptedAnswerScore,
+        COALESCE(EXTRACT(EPOCH FROM (A.CreationDate - Q.CreationDate)) / (60 * 60), 0) AS TimeToAcceptedAnswerHours,
+        (SELECT COUNT(DISTINCT Comments.Id) FROM Comments WHERE Comments.PostId = Q.Id) AS QuestionCommentCount,
+        REPLACE(REPLACE(REPLACE(COALESCE(Q.Tags, ''), '><', ','), '<', ''), '>', '') AS TagListString
+    FROM Posts Q
+    LEFT JOIN Posts A ON Q.AcceptedAnswerId = A.Id
+    WHERE Q.PostTypeId = 1
+),
+UserOverallMetrics AS (
+    SELECT
+        UAS.UserId,
+        UAS.DisplayName,
+        UAS.Reputation,
+        UAS.CreationDate,
+        UAS.LastAccessDate,
+        UAS.YearsActive,
+        UAS.TotalPostsOwned,
+        UAS.TotalQuestionsAsked,
+        UAS.TotalAnswersProvided,
+        UAS.TotalCommentsMade,
+        UAS.TotalBadgesEarned,
+        UAS.GoldBadges,
+        UAS.SilverBadges,
+        UAS.BronzeBadges,
+        UAS.TotalPostScoreReceived,
+        UAS.TotalPostViewCount,
+        UAS.UserUpVotesGiven,
+        UAS.UserDownVotesGiven,
+        UAS.TotalUpVotesCast,
+        UAS.TotalDownVotesCast,
+        COALESCE(SUM(QAP.QuestionScore), 0) AS TotalQuestionsScore,
+        COALESCE(SUM(QAP.QuestionViewCount), 0) AS TotalQuestionsViewCount,
+        COALESCE(SUM(QAP.ActualAnswerCount), 0) AS TotalActualAnswers,
+        COALESCE(AVG(QAP.TimeToAcceptedAnswerHours), 0) AS AvgTimeToAcceptedAnswerHours,
+        COALESCE(MAX(PEA.TotalRevisions), 0) AS MaxRevisionsOnAnyPost,
+        COALESCE(AVG(PEA.TotalRevisions), 0) AS AvgRevisionsPerPost,
+        (UAS.TotalPostScoreReceived + UAS.GoldBadges * 100.0) / NULLIF((UAS.YearsActive * 10.0 + 1), 0) AS UserEngagementRatio,
+        (
+            SELECT PHNT.Name
+            FROM PostHistory PH_corr
+            JOIN PostHistoryTypes PHNT ON PH_corr.PostHistoryTypeId = PHNT.Id
+            WHERE PH_corr.UserId = UAS.UserId
+              AND PH_corr.PostHistoryTypeId IN (SELECT Id FROM PostHistoryTypes WHERE Name LIKE '%Edit%')
+            GROUP BY PHNT.Name
+            ORDER BY COUNT(PH_corr.Id) DESC, PHNT.Name
+            LIMIT 1
+        ) AS MostFrequentEditType
+    FROM UserActivitySummary UAS
+    LEFT JOIN QuestionAnswerPerformance QAP ON UAS.UserId = QAP.QuestionOwnerUserId
+    LEFT JOIN Posts P_base ON UAS.UserId = P_base.OwnerUserId
+    LEFT JOIN PostEditActivity PEA ON P_base.Id = PEA.PostId
+    GROUP BY UAS.UserId, UAS.DisplayName, UAS.Reputation, UAS.CreationDate, UAS.LastAccessDate, UAS.YearsActive, UAS.TotalPostsOwned,
+             UAS.TotalQuestionsAsked, UAS.TotalAnswersProvided, UAS.TotalCommentsMade, UAS.TotalBadgesEarned, UAS.GoldBadges,
+             UAS.SilverBadges, UAS.BronzeBadges, UAS.TotalPostScoreReceived, UAS.TotalPostViewCount, UAS.UserUpVotesGiven,
+             UAS.UserDownVotesGiven, UAS.TotalUpVotesCast, UAS.TotalDownVotesCast
+)
+SELECT
+    UOM.UserId,
+    UOM.DisplayName,
+    UOM.Reputation,
+    UOM.TotalPostsOwned,
+    UOM.TotalQuestionsAsked,
+    UOM.TotalAnswersProvided,
+    UOM.TotalBadgesEarned,
+    UOM.GoldBadges,
+    UOM.TotalPostScoreReceived,
+    UOM.UserEngagementRatio,
+    UOM.MostFrequentEditType,
+    RANK() OVER (ORDER BY UOM.Reputation DESC, UOM.TotalPostScoreReceived DESC) AS GlobalReputationRank,
+    DENSE_RANK() OVER (ORDER BY UOM.UserEngagementRatio DESC, UOM.TotalPostsOwned DESC) AS EngagementRank,
+    NTILE(10) OVER (ORDER BY UOM.Reputation DESC) AS ReputationTier,
+    AVG(UOM.AvgTimeToAcceptedAnswerHours) OVER (PARTITION BY (CASE WHEN UOM.TotalQuestionsAsked > 0 THEN 1 ELSE 0 END) ORDER BY UOM.Reputation DESC) AS AvgTimeToAcceptedAnswerHoursPerGroup,
+    LAG(UOM.CreationDate, 1, UOM.CreationDate) OVER (ORDER BY UOM.CreationDate) AS PreviousUserCreationDate,
+    (UOM.TotalUpVotesCast - UOM.TotalDownVotesCast) AS NetVotesCast,
+    COALESCE(UOM.TotalQuestionsAsked, 0) + COALESCE(UOM.TotalAnswersProvided, 0) AS CombinedPostCount,
+    CASE
+        WHEN UOM.GoldBadges > 0 AND UOM.TotalQuestionsAsked > 0 AND UOM.AvgTimeToAcceptedAnswerHours > 0 AND UOM.AvgTimeToAcceptedAnswerHours < 24 THEN 'Top Contributor & Fast Answerer'
+        WHEN UOM.Reputation > 5000 AND UOM.TotalPostsOwned > 100 THEN 'Veteran Power User'
+        WHEN UOM.TotalAnswersProvided > UOM.TotalQuestionsAsked * 2 THEN 'Answer Specialist'
+        WHEN UOM.TotalQuestionsAsked > 10 AND UOM.TotalAnswersProvided = 0 AND UOM.TotalPostScoreReceived < 50 THEN 'Questioner with Low Engagement'
+        ELSE 'Active Participant'
+    END AS UserCategoryClassification,
+    UOM.TotalCommentsMade,
+    UOM.TotalBadgesEarned,
+    UOM.YearsActive,
+    UOM.TotalUpVotesCast,
+    UOM.TotalDownVotesCast,
+    UOM.AvgTimeToAcceptedAnswerHours,
+    UOM.MaxRevisionsOnAnyPost
+FROM UserOverallMetrics UOM
+WHERE (UOM.TotalPostsOwned > 0 OR UOM.TotalCommentsMade > 0)
+ORDER BY EngagementRank ASC, GlobalReputationRank ASC
+LIMIT 500
+
+UNION ALL
+
+SELECT
+    UOM_B.UserId,
+    UOM_B.DisplayName,
+    UOM_B.Reputation,
+    UOM_B.TotalPostsOwned,
+    UOM_B.TotalQuestionsAsked,
+    UOM_B.TotalAnswersProvided,
+    UOM_B.TotalBadgesEarned,
+    UOM_B.GoldBadges,
+    UOM_B.TotalPostScoreReceived,
+    UOM_B.UserEngagementRatio,
+    UOM_B.MostFrequentEditType,
+    RANK() OVER (ORDER BY UOM_B.Reputation DESC, UOM_B.TotalPostScoreReceived DESC) AS GlobalReputationRank,
+    DENSE_RANK() OVER (ORDER BY UOM_B.UserEngagementRatio DESC, UOM_B.TotalPostsOwned DESC) AS EngagementRank,
+    NTILE(10) OVER (ORDER BY UOM_B.Reputation DESC) AS ReputationTier,
+    AVG(UOM_B.AvgTimeToAcceptedAnswerHours) OVER (PARTITION BY (CASE WHEN UOM_B.TotalQuestionsAsked > 0 THEN 1 ELSE 0 END) ORDER BY UOM_B.Reputation DESC) AS AvgTimeToAcceptedAnswerHoursPerGroup,
+    LAG(UOM_B.CreationDate, 1, UOM_B.CreationDate) OVER (ORDER BY UOM_B.CreationDate) AS PreviousUserCreationDate,
+    (UOM_B.TotalUpVotesCast - UOM_B.TotalDownVotesCast) AS NetVotesCast,
+    COALESCE(UOM_B.TotalQuestionsAsked, 0) + COALESCE(UOM_B.TotalAnswersProvided, 0) AS CombinedPostCount,
+    'Early Adopter & Prolific Editor' AS UserCategoryClassification,
+    UOM_B.TotalCommentsMade,
+    UOM_B.TotalBadgesEarned,
+    UOM_B.YearsActive,
+    UOM_B.TotalUpVotesCast,
+    UOM_B.TotalDownVotesCast,
+    UOM_B.AvgTimeToAcceptedAnswerHours,
+    UOM_B.MaxRevisionsOnAnyPost
+FROM UserOverallMetrics UOM_B
+WHERE UOM_B.YearsActive < 1
+  AND UOM_B.MaxRevisionsOnAnyPost > 5
+  AND UOM_B.TotalPostsOwned > 3
+  AND UOM_B.TotalBadgesEarned >= 1
+ORDER BY UOM_B.Reputation DESC
+LIMIT 100;

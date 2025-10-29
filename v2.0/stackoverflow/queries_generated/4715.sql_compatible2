@@ -1,0 +1,126 @@
+WITH
+  UserPostStats AS (
+    SELECT
+      p.OwnerUserId,
+      COUNT(p.Id) AS TotalPosts,
+      SUM(p.Score) AS TotalScore,
+      AVG(p.ViewCount) AS AvgViewCount,
+      MAX(p.CreationDate) AS LastPostDate
+    FROM Posts AS p
+    WHERE
+      p.OwnerUserId IS NOT NULL
+    GROUP BY
+      p.OwnerUserId
+  ),
+  UserCommentStats AS (
+    SELECT
+      c.UserId,
+      COUNT(c.Id) AS TotalComments,
+      SUM(c.Score) AS TotalCommentScore
+    FROM Comments AS c
+    WHERE
+      c.UserId IS NOT NULL
+    GROUP BY
+      c.UserId
+  ),
+  UserVoteStats AS (
+    SELECT
+      v.UserId,
+      COUNT(CASE WHEN vt.Name = 'UpMod' THEN v.Id END) AS UpvotesGiven,
+      COUNT(CASE WHEN vt.Name = 'DownMod' THEN v.Id END) AS DownvotesGiven,
+      COUNT(CASE WHEN vt.Name = 'Favorite' THEN v.Id END) AS FavoritesGiven
+    FROM Votes AS v
+    JOIN VoteTypes AS vt
+      ON v.VoteTypeId = vt.Id
+    WHERE
+      v.UserId IS NOT NULL
+    GROUP BY
+      v.UserId
+  ),
+  HighReputationUsers AS (
+    SELECT
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      COALESCE(ups.TotalPosts, 0) AS TotalPosts,
+      COALESCE(ucs.TotalComments, 0) AS TotalComments,
+      COALESCE(uvs.UpvotesGiven, 0) AS UpvotesGiven,
+      COALESCE(uvs.DownvotesGiven, 0) AS DownvotesGiven,
+      COALESCE(uvs.FavoritesGiven, 0) AS FavoritesGiven,
+      -- compute difference in days using DATE and standard EXTRACT(EPOCH ...)
+      CAST(EXTRACT(EPOCH FROM (CAST(u.LastAccessDate AS TIMESTAMP) - CAST(u.CreationDate AS TIMESTAMP))) / 86400 AS INTEGER) AS AccountAgeDays,
+      CASE
+        WHEN ups.LastPostDate IS NOT NULL THEN CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - CAST(ups.LastPostDate AS TIMESTAMP))) / 86400 AS INTEGER)
+        ELSE NULL
+      END AS DaysSinceLastPost
+    FROM Users AS u
+    LEFT JOIN UserPostStats AS ups
+      ON u.Id = ups.OwnerUserId
+    LEFT JOIN UserCommentStats AS ucs
+      ON u.Id = ucs.UserId
+    LEFT JOIN UserVoteStats AS uvs
+      ON u.Id = uvs.UserId
+    WHERE
+      u.Reputation > 10000
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      ups.TotalPosts,
+      ucs.TotalComments,
+      uvs.UpvotesGiven,
+      uvs.DownvotesGiven,
+      uvs.FavoritesGiven,
+      u.LastAccessDate,
+      u.CreationDate,
+      ups.LastPostDate
+  )
+SELECT
+  hr.DisplayName,
+  hr.Reputation,
+  hr.TotalPosts,
+  hr.TotalComments,
+  hr.UpvotesGiven,
+  hr.DownvotesGiven,
+  hr.FavoritesGiven,
+  hr.AccountAgeDays,
+  hr.DaysSinceLastPost,
+  (
+    SELECT
+      COUNT(*)
+    FROM Badges AS b
+    WHERE
+      b.UserId = hr.Id
+      AND b.Class = 1
+  ) AS GoldBadges,
+  (
+    SELECT
+      COUNT(*)
+    FROM Badges AS b
+    WHERE
+      b.UserId = hr.Id
+      AND b.Class = 2
+  ) AS SilverBadges,
+  (
+    SELECT
+      COUNT(*)
+    FROM Badges AS b
+    WHERE
+      b.UserId = hr.Id
+      AND b.Class = 3
+  ) AS BronzeBadges,
+  CASE
+    WHEN hr.DaysSinceLastPost IS NOT NULL AND hr.DaysSinceLastPost < 30 THEN 'Active'
+    WHEN hr.DaysSinceLastPost IS NOT NULL AND hr.DaysSinceLastPost < 365 THEN 'Moderately Active'
+    ELSE 'Inactive'
+  END AS ActivityStatus,
+  ROW_NUMBER() OVER (ORDER BY hr.Reputation DESC, hr.TotalPosts DESC) AS RankByReputation,
+  LAG(hr.Reputation, 1, 0) OVER (ORDER BY hr.Reputation DESC) AS PreviousReputation,
+  hr.Id
+FROM HighReputationUsers AS hr
+WHERE
+  hr.DisplayName IS NOT NULL
+  AND hr.AccountAgeDays > 180
+  AND hr.TotalPosts > 50
+ORDER BY
+  RankByReputation;

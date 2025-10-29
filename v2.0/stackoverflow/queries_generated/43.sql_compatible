@@ -1,0 +1,386 @@
+with recent_users as (
+  select u.id,
+         u.displayname,
+         u.reputation,
+         u.creationdate,
+         coalesce(nullif(trim(u.location), ''), 'Unknown') as norm_location,
+         date_trunc('month', u.creationdate) as cohort_month,
+         row_number() over (order by u.creationdate desc, u.id desc) as recency_rank
+  from users u
+),
+question_posts as (
+  select p.id,
+         p.owneruserid,
+         p.creationdate,
+         p.score,
+         p.viewcount,
+         p.title,
+         p.tags,
+         p.acceptedanswerid,
+         p.closeddate,
+         p.answercount
+  from posts p
+  where p.posttypeid = 1
+),
+answer_posts as (
+  select p.id,
+         p.parentid as questionid,
+         p.owneruserid,
+         p.creationdate,
+         p.score
+  from posts p
+  where p.posttypeid = 2
+),
+user_activity as (
+  select u.id as userid,
+         count(distinct q.id) as q_count,
+         count(distinct a.id) filter (where a.id is not null) as a_count,
+         sum(greatest(q.score,0)) as q_score_nonneg,
+         sum(greatest(a.score,0)) as a_score_nonneg,
+         sum(coalesce(q.viewcount,0)) as q_views
+  from recent_users u
+  left join question_posts q on q.owneruserid = u.id
+  left join answer_posts a on a.owneruserid = u.id
+  group by u.id
+),
+post_votes as (
+  select v.postid,
+         sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end) as net_votes,
+         sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+         sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+         count(*) as vote_events
+  from votes v
+  group by v.postid
+),
+q_enriched as (
+  select q.*,
+         pv.net_votes,
+         pv.upvotes,
+         pv.downvotes,
+         pv.vote_events,
+         case when q.acceptedanswerid is not null then 1 else 0 end as has_accepted,
+         extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - coalesce(q.creationdate, cast('2024-10-01 12:34:56' as timestamp)))) / 86400.0 as age_days,
+         (regexp_split_to_table(coalesce(q.tags,''), '><')) as tag_token_tmp
+  from question_posts q
+  left join post_votes pv on pv.postid = q.id
+),
+q_tags_norm as (
+  select id,
+         owneruserid,
+         creationdate,
+         score,
+         viewcount,
+         title,
+         tags,
+         acceptedanswerid,
+         closeddate,
+         answercount,
+         net_votes,
+         upvotes,
+         downvotes,
+         vote_events,
+         has_accepted,
+         age_days,
+         lower(replace(replace(replace(trim(both '<>' from tag_token_tmp), ' ', ''), '"',''), '''','')) as tag_token
+  from q_enriched
+),
+dup_links as (
+  select pl.postid as dup_postid,
+         pl.relatedpostid as target_postid,
+         min(pl.creationdate) as first_dup_link_dt,
+         count(*) as dup_link_count
+  from postlinks pl
+  where pl.linktypeid = 3
+  group by pl.postid, pl.relatedpostid
+),
+close_events as (
+  select ph.postid,
+         min(ph.creationdate) as first_close_dt,
+         max(ph.creationdate) as last_close_dt,
+         count(*) filter (where ph.posthistorytypeid = 10) as close_events_cnt,
+         count(*) filter (where ph.posthistorytypeid = 11) as reopen_events_cnt,
+         max(case when ph.posthistorytypeid = 10 then nullif(ph.comment, '') end) as any_close_reason_raw
+  from posthistory ph
+  where ph.posthistorytypeid in (10,11)
+  group by ph.postid
+),
+accepted_answerers as (
+  select a.questionid,
+         a.owneruserid as accepted_userid
+  from answer_posts a
+  join question_posts q on q.acceptedanswerid = a.id
+),
+tag_stats as (
+  select qt.tag_token,
+         count(*) as tag_q_count,
+         sum(case when qt.has_accepted = 1 then 1 else 0 end) as tag_q_with_accept,
+         avg(nullif(qt.viewcount,0)) as avg_views,
+         percentile_cont(0.5) within group (order by coalesce(qt.score,0)) as median_score,
+         max(qt.score) as max_score
+  from q_tags_norm qt
+  where qt.tag_token is not null and qt.tag_token <> ''
+  group by qt.tag_token
+),
+user_badges as (
+  select b.userid,
+         sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+         sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+         sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+         count(*) as total_badges,
+         min(b.date) as first_badge_dt
+  from badges b
+  group by b.userid
+),
+commenter_stats as (
+  select c.userid,
+         count(*) as comments_made,
+         sum(greatest(c.score,0)) as comment_score_nonneg,
+         max(c.creationdate) as last_comment_dt
+  from comments c
+  where c.userid is not null
+  group by c.userid
+),
+q_quality as (
+  select qt.id as questionid,
+         qt.owneruserid as ownerid,
+         qt.title,
+         qt.tag_token,
+         qt.viewcount,
+         qt.score,
+         qt.upvotes,
+         qt.downvotes,
+         qt.has_accepted,
+         qt.age_days,
+         coalesce(cs.close_events_cnt,0) as close_cnt,
+         coalesce(cs.reopen_events_cnt,0) as reopen_cnt,
+         case when cs.first_close_dt is not null then 1 else 0 end as ever_closed,
+         case
+           when qt.viewcount is null or qt.viewcount = 0 then null
+           else round((coalesce(qt.upvotes,0) - coalesce(qt.downvotes,0)) / nullif(cast(qt.viewcount as numeric),0), 6)
+         end as vote_view_ratio,
+         case when qt.score is null then 0 else qt.score end +
+         coalesce(least(greatest(qt.upvotes - coalesce(qt.downvotes,0), -10), 50),0) +
+         case when qt.has_accepted = 1 then 5 else 0 end -
+         case when cs.first_close_dt is not null then 3 else 0 end as quality_points
+  from q_tags_norm qt
+  left join close_events cs on cs.postid = qt.id
+),
+user_rollup as (
+  select u.id as userid,
+         u.displayname,
+         u.reputation,
+         u.norm_location,
+         u.cohort_month,
+         ua.q_count,
+         ua.a_count,
+         ua.q_score_nonneg + ua.a_score_nonneg as total_nonneg_score,
+         ua.q_views,
+         ub.gold_badges,
+         ub.silver_badges,
+         ub.bronze_badges,
+         ub.total_badges,
+         ub.first_badge_dt,
+         cs.comments_made,
+         cs.comment_score_nonneg,
+         cs.last_comment_dt
+  from recent_users u
+  left join user_activity ua on ua.userid = u.id
+  left join user_badges ub on ub.userid = u.id
+  left join commenter_stats cs on cs.userid = u.id
+),
+user_q_agg as (
+  select qq.ownerid as userid,
+         count(*) as qs,
+         sum(qq.quality_points) as q_quality_points,
+         avg(qq.vote_view_ratio) as avg_vote_view_ratio,
+         sum(case when qq.ever_closed = 1 then 1 else 0 end) as closed_qs,
+         sum(case when qq.has_accepted = 1 then 1 else 0 end) as accepted_qs
+  from q_quality qq
+  group by qq.ownerid
+),
+dup_clusters as (
+  select d.dup_postid,
+         count(distinct d.target_postid) as distinct_dup_targets,
+         min(d.first_dup_link_dt) as first_dup_seen
+  from dup_links d
+  group by d.dup_postid
+),
+location_norm as (
+  select norm_location,
+         case
+           when norm_location ~* '(usa|united states|new york|san francisco|seattle|boston|austin|chicago|los angeles|ca|ny|wa|tx|il)' then 'US'
+           when norm_location ~* '(uk|united kingdom|london|england|scotland|wales)' then 'UK'
+           when norm_location ~* '(india|bangalore|mumbai|delhi|hyderabad|pune|chennai)' then 'IN'
+           when norm_location ~* '(germany|deutschland|berlin|munich|münchen|hamburg)' then 'DE'
+           when norm_location ~* '(canada|toronto|vancouver|montreal|ottawa)' then 'CA'
+           when norm_location ~* '(australia|sydney|melbourne|brisbane)' then 'AU'
+           when norm_location ~* '(france|paris|lyon|marseille)' then 'FR'
+           else 'OTHER'
+         end as country_bucket
+  from (select distinct norm_location from recent_users) x
+),
+user_final as (
+  select ur.userid,
+         ur.displayname,
+         ur.reputation,
+         ln.country_bucket,
+         ur.cohort_month,
+         coalesce(ur.q_count,0) as q_count,
+         coalesce(ur.a_count,0) as a_count,
+         coalesce(ur.total_nonneg_score,0) as total_nonneg_score,
+         coalesce(ur.q_views,0) as q_views,
+         coalesce(ur.gold_badges,0) as gold_badges,
+         coalesce(ur.silver_badges,0) as silver_badges,
+         coalesce(ur.bronze_badges,0) as bronze_badges,
+         coalesce(ur.total_badges,0) as total_badges,
+         ur.first_badge_dt,
+         coalesce(ur.comments_made,0) as comments_made,
+         coalesce(ur.comment_score_nonneg,0) as comment_score_nonneg,
+         ur.last_comment_dt,
+         coalesce(uqa.qs,0) as qs,
+         coalesce(uqa.q_quality_points,0) as q_quality_points,
+         coalesce(uqa.avg_vote_view_ratio,0) as avg_vote_view_ratio,
+         coalesce(uqa.closed_qs,0) as closed_qs,
+         coalesce(uqa.accepted_qs,0) as accepted_qs
+  from user_rollup ur
+  left join location_norm ln on ln.norm_location = ur.norm_location
+  left join user_q_agg uqa on uqa.userid = ur.userid
+),
+ranked_users as (
+  select uf.*,
+         row_number() over (partition by country_bucket order by reputation desc, total_badges desc, userid asc) as rank_in_country,
+         dense_rank() over (order by reputation desc) as global_rep_rank,
+         ntile(10) over (order by coalesce(q_quality_points,0) desc) as quality_decile,
+         case
+           when coalesce(a_count,0) + coalesce(q_count,0) = 0 then null
+           else round(cast(coalesce(a_count,0) as numeric) / nullif(cast((coalesce(a_count,0) + coalesce(q_count,0)) as numeric),0), 4)
+         end as answer_mix_ratio
+  from user_final uf
+),
+top_tags_per_user as (
+  select qq.ownerid as userid,
+         qq.tag_token,
+         count(*) as tag_usage,
+         row_number() over (partition by qq.ownerid order by count(*) desc, min(qq.questionid) asc) as rn
+  from q_quality qq
+  where qq.tag_token is not null and qq.tag_token <> ''
+  group by qq.ownerid, qq.tag_token
+),
+accepted_collab as (
+  select aa.accepted_userid as userid,
+         count(distinct aa.questionid) as accepted_answers_authored
+  from accepted_answerers aa
+  group by aa.accepted_userid
+),
+final_scores as (
+  select ru.userid,
+         ru.displayname,
+         ru.country_bucket,
+         ru.cohort_month,
+         ru.reputation,
+         ru.global_rep_rank,
+         ru.rank_in_country,
+         ru.quality_decile,
+         coalesce(ru.q_count,0) as q_count,
+         coalesce(ru.a_count,0) as a_count,
+         coalesce(ru.qs,0) as qs,
+         coalesce(ru.q_quality_points,0) as q_quality_points,
+         coalesce(ru.avg_vote_view_ratio,0) as avg_vote_view_ratio,
+         coalesce(ru.closed_qs,0) as closed_qs,
+         coalesce(ru.accepted_qs,0) as accepted_qs,
+         coalesce(ru.comments_made,0) as comments_made,
+         coalesce(ru.total_badges,0) as total_badges,
+         coalesce(ru.gold_badges,0) as gold_badges,
+         coalesce(ru.silver_badges,0) as silver_badges,
+         coalesce(ru.bronze_badges,0) as bronze_badges,
+         coalesce(ru.answer_mix_ratio,0) as answer_mix_ratio,
+         coalesce(ac.accepted_answers_authored,0) as accepted_answers_authored,
+         max(case when tt.rn = 1 then tt.tag_token end) as top_tag1,
+         max(case when tt.rn = 2 then tt.tag_token end) as top_tag2,
+         max(case when tt.rn = 3 then tt.tag_token end) as top_tag3
+  from ranked_users ru
+  left join top_tags_per_user tt on tt.userid = ru.userid and tt.rn <= 3
+  left join accepted_collab ac on ac.userid = ru.userid
+  group by ru.userid, ru.displayname, ru.country_bucket, ru.cohort_month, ru.reputation, ru.global_rep_rank, ru.rank_in_country, ru.quality_decile,
+           ru.q_count, ru.a_count, ru.qs, ru.q_quality_points, ru.avg_vote_view_ratio, ru.closed_qs, ru.accepted_qs, ru.comments_made,
+           ru.total_badges, ru.gold_badges, ru.silver_badges, ru.bronze_badges, ru.answer_mix_ratio, ac.accepted_answers_authored
+),
+post_outliers as (
+  select q.questionid,
+         q.ownerid,
+         q.title,
+         q.viewcount,
+         q.score,
+         q.upvotes,
+         q.downvotes,
+         q.has_accepted,
+         q.age_days,
+         q.quality_points,
+         dense_rank() over (order by coalesce(q.quality_points, cast(-1e9 as numeric)) desc) as quality_rank,
+         dense_rank() over (order by coalesce(q.viewcount, -1) desc) as views_rank
+  from q_quality q
+),
+best_and_worst as (
+  select po.ownerid as userid,
+         max(case when po.quality_rank <= 5 then po.title end) as top_quality_title_sample,
+         max(case when po.views_rank <= 5 then po.title end) as top_view_title_sample,
+         min(case when po.quality_rank <= 5 then po.questionid end) as top_quality_qid,
+         min(case when po.views_rank <= 5 then po.questionid end) as top_views_qid
+  from post_outliers po
+  group by po.ownerid
+)
+select fs.userid,
+       fs.displayname,
+       fs.country_bucket,
+       fs.cohort_month,
+       fs.reputation,
+       fs.global_rep_rank,
+       fs.rank_in_country,
+       fs.quality_decile,
+       fs.q_count,
+       fs.a_count,
+       fs.qs,
+       fs.q_quality_points,
+       round(cast(fs.avg_vote_view_ratio as numeric), 6) as avg_vote_view_ratio,
+       fs.closed_qs,
+       fs.accepted_qs,
+       fs.comments_made,
+       fs.total_badges,
+       fs.gold_badges,
+       fs.silver_badges,
+       fs.bronze_badges,
+       round(cast(fs.answer_mix_ratio as numeric), 4) as answer_mix_ratio,
+       fs.accepted_answers_authored,
+       fs.top_tag1,
+       fs.top_tag2,
+       fs.top_tag3,
+       baw.top_quality_qid,
+       baw.top_views_qid,
+       baw.top_quality_title_sample,
+       baw.top_view_title_sample,
+       case
+         when fs.reputation >= 100000 then 'Legend'
+         when fs.reputation >= 50000 then 'Elite'
+         when fs.reputation >= 20000 then 'Veteran'
+         when fs.reputation >= 5000 then 'Seasoned'
+         when fs.reputation >= 1000 then 'Rising'
+         else 'Newcomer'
+       end as rep_tier,
+       case when fs.country_bucket = 'OTHER' then 0 else 1 end as geo_known_flag
+from final_scores fs
+left join best_and_worst baw on baw.userid = fs.userid
+where
+  (
+    fs.reputation >= 1000
+    or fs.total_badges >= 10
+    or (fs.accepted_answers_authored >= 3 and fs.a_count >= 20)
+  )
+  and (
+    fs.country_bucket in ('US','IN','UK','DE','CA','AU','FR')
+    or fs.q_quality_points >= (
+        select percentile_cont(0.9) within group (order by coalesce(q_quality_points,0))
+        from final_scores
+      )
+  )
+order by fs.global_rep_rank asc nulls last, fs.userid
+limit 500;

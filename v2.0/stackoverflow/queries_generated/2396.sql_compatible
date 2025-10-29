@@ -1,0 +1,163 @@
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p_ans.Id) as AnswerCount,
+        count(distinct c.Id) as CommentCount,
+        sum(coalesce(vs.UpVotes,0)) as TotalUpVotes,
+        sum(coalesce(vs.DownVotes,0)) as TotalDownVotes
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 1
+    left join Posts p_ans on p_ans.OwnerUserId = u.Id and p_ans.PostTypeId = 2
+    left join Comments c on c.UserId = u.Id
+    left join (
+        select 
+            p.OwnerUserId,
+            sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+            sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes
+        from Votes v
+        join Posts p on p.Id = v.PostId
+        join VoteTypes vt on vt.Id = v.VoteTypeId
+        group by p.OwnerUserId
+    ) vs on vs.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate
+), UserTopTags AS (
+    -- expand tags using standard string functions: split on '><' after trimming '<' and '>'
+    select
+        u.UserId,
+        tag as Tag,
+        count(*) as TagCount
+    from RecursiveUserActivity u
+    join Posts p on p.OwnerUserId = u.UserId and p.PostTypeId = 1 and p.Tags is not null
+    cross join lateral (
+        select trim(t) as tag
+        from (
+            select regexp_split_to_table(
+                case
+                    when left(trim(both ' ' from p.Tags),1) = '<' and right(trim(both ' ' from p.Tags),1) = '>' 
+                    then substring(p.Tags from 2 for char_length(p.Tags)-2)
+                    else p.Tags
+                end,
+                '><'
+            ) as t
+        ) s
+    ) tags
+    group by u.UserId, tag
+), TagRanks AS (
+    select
+        UserId,
+        Tag,
+        TagCount,
+        rank() over (partition by UserId order by TagCount desc) as TagRank
+    from UserTopTags
+), UserBestTags AS (
+    select 
+        UserId,
+        string_agg(Tag, ', ' order by Tag) as TopTags
+    from TagRanks 
+    where TagRank <= 3
+    group by UserId
+), QuestionAnswerStats AS (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.Score as QuestionScore,
+        count(a.Id) as AnswerCount,
+        max(a.Score) as MaxAnswerScore,
+        count(distinct l.Id) filter (where lt.Name = 'Duplicate') as DuplicateCount,
+        max(ph.CreationDate) filter (where ph.PostHistoryTypeId = 10) as ClosedDate,
+        (
+            select ph2.UserDisplayName
+            from PostHistory ph2
+            where ph2.PostId = q.Id and ph2.UserDisplayName is not null
+            order by ph2.CreationDate desc
+            limit 1
+        ) as LastEditorName
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join PostLinks l on l.PostId = q.Id
+    left join LinkTypes lt on lt.Id = l.LinkTypeId
+    left join PostHistory ph on ph.PostId = q.Id
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.OwnerUserId, q.Score
+), CombinedUserSummary AS (
+    select
+        u.UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        coalesce(u.QuestionCount,0) as QuestionCount,
+        coalesce(u.AnswerCount,0) as AnswerCount,
+        coalesce(u.CommentCount,0) as CommentCount,
+        coalesce(u.TotalUpVotes,0) as UpVotes,
+        coalesce(u.TotalDownVotes,0) as DownVotes,
+        coalesce(t.TopTags, '') as FavoriteTags,
+        qs.QuestionId,
+        qs.Title as RecentQuestionTitle,
+        qs.AnswerCount as QuestionAnswerCount,
+        qs.MaxAnswerScore,
+        qs.DuplicateCount,
+        qs.ClosedDate,
+        case when qs.ClosedDate is null then 'Open' else 'Closed' end as QuestionStatus,
+        qs.LastEditorName
+    from RecursiveUserActivity u
+    left join UserBestTags t on t.UserId = u.UserId
+    left join lateral (
+        select *
+        from QuestionAnswerStats qs2
+        where qs2.OwnerUserId = u.UserId
+        order by qs2.QuestionId desc
+        limit 1
+    ) qs on true
+    where u.Reputation > 1000
+)
+select
+    c.UserId,
+    c.DisplayName,
+    c.Reputation,
+    c.CreationDate,
+    c.QuestionCount,
+    c.AnswerCount,
+    c.CommentCount,
+    c.UpVotes,
+    c.DownVotes,
+    c.FavoriteTags,
+    c.RecentQuestionTitle,
+    c.QuestionAnswerCount,
+    c.MaxAnswerScore,
+    c.DuplicateCount,
+    c.QuestionStatus,
+    c.LastEditorName,
+    dense_rank() over (order by c.Reputation desc, c.QuestionCount desc) as ReputationRank,
+    lag(c.UpVotes) over (order by c.Reputation desc, c.QuestionCount desc) as PreviousUserUpVotes,
+    lead(c.DownVotes) over (order by c.Reputation desc, c.QuestionCount desc) as NextUserDownVotes,
+    case
+        when c.UpVotes + c.DownVotes = 0 then null
+        else round(c.UpVotes::double precision / nullif(c.UpVotes + c.DownVotes,0), 3)
+    end as UpVoteRatio,
+    md5(lower(coalesce(c.DisplayName, ''))) as DisplayNameHash
+from CombinedUserSummary c
+where c.AnswerCount > 10
+group by
+    c.UserId,
+    c.DisplayName,
+    c.Reputation,
+    c.CreationDate,
+    c.QuestionCount,
+    c.AnswerCount,
+    c.CommentCount,
+    c.UpVotes,
+    c.DownVotes,
+    c.FavoriteTags,
+    c.RecentQuestionTitle,
+    c.QuestionAnswerCount,
+    c.MaxAnswerScore,
+    c.DuplicateCount,
+    c.QuestionStatus,
+    c.LastEditorName
+order by c.Reputation desc, c.QuestionCount desc
+limit 50;

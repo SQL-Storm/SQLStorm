@@ -1,0 +1,145 @@
+-- {"query": "4571.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1305} 
+
+WITH
+  RankedPosts AS (
+    SELECT
+      p.Id AS PostId,
+      p.OwnerUserId,
+      p.Title,
+      p.PostTypeId,
+      p.CreationDate AS PostCreationDate,
+      p.Score AS PostScore,
+      p.ViewCount AS PostViewCount,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      p.ClosedDate,
+      pt.Name AS PostTypeName,
+      ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) AS rn_by_creation,
+      DENSE_RANK() OVER (ORDER BY p.Score DESC) AS dr_by_score
+    FROM
+      Posts AS p
+      JOIN PostTypes AS pt
+        ON p.PostTypeId = pt.Id
+    WHERE
+      p.OwnerUserId IS NOT NULL
+      AND p.PostTypeId IN (1, 2) -- Questions and Answers
+  ),
+  UserPostActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName AS UserDisplayName,
+      u.Reputation,
+      u.CreationDate AS UserCreationDate,
+      COUNT(rp.PostId) AS TotalPosts,
+      SUM(CASE WHEN rp.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+      SUM(CASE WHEN rp.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+      AVG(rp.PostScore) AS AvgPostScore,
+      SUM(rp.PostViewCount) AS TotalPostViews,
+      MAX(rp.PostCreationDate) AS LastPostDate
+    FROM
+      Users AS u
+      LEFT JOIN RankedPosts AS rp
+        ON u.Id = rp.OwnerUserId
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate
+  ),
+  CommentAnalysis AS (
+    SELECT
+      c.PostId,
+      COUNT(c.Id) AS CommentCount,
+      AVG(c.Score) AS AvgCommentScore,
+      MAX(c.CreationDate) AS LastCommentDate,
+      SUM(CASE WHEN c.UserDisplayName IS NULL THEN 1 ELSE 0 END) AS AnonymousCommentCount
+    FROM
+      Comments AS c
+    GROUP BY
+      c.PostId
+  ),
+  PostAggregates AS (
+    SELECT
+      rp.PostId,
+      rp.PostTypeName,
+      rp.Title,
+      rp.PostCreationDate,
+      rp.PostScore,
+      rp.PostViewCount,
+      rp.AnswerCount,
+      COALESCE(ca.CommentCount, 0) AS TotalComments,
+      COALESCE(ca.AvgCommentScore, 0) AS AvgCommentsScore,
+      CASE WHEN rp.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS PostStatus,
+      CASE WHEN rp.Title LIKE '%[%]%' THEN 'Contains Brackets' ELSE 'No Brackets' END AS TitleBracketStatus,
+      rp.dr_by_score
+    FROM
+      RankedPosts AS rp
+      LEFT JOIN CommentAnalysis AS ca
+        ON rp.PostId = ca.PostId
+    WHERE
+      rp.rn_by_creation <= 1000
+  )
+SELECT
+  pa.PostId,
+  pa.PostTypeName,
+  pa.Title,
+  pa.PostCreationDate,
+  pa.PostScore,
+  pa.PostViewCount,
+  pa.AnswerCount,
+  pa.TotalComments,
+  pa.AvgCommentsScore,
+  pa.PostStatus,
+  pa.TitleBracketStatus,
+  upa.UserDisplayName,
+  upa.Reputation,
+  upa.UserCreationDate,
+  upa.QuestionCount,
+  upa.AnswerCount AS UserAnswerCount,
+  upa.AvgPostScore AS UserAvgPostScore,
+  upa.TotalPostViews AS UserTotalPostViews,
+  DATEDIFF(DAY, upa.LastPostDate, GETDATE()) AS DaysSinceLastPost,
+  pa.dr_by_score
+FROM
+  PostAggregates AS pa
+  JOIN UserPostActivity AS upa
+    ON pa.OwnerUserId = upa.UserId
+WHERE
+  pa.PostScore > 50
+  AND pa.TotalComments < 100
+  AND upa.Reputation > 10000
+  AND pa.PostTypeName <> 'TagWikiExcerpt'
+UNION
+SELECT
+  rp.Id AS PostId,
+  pt.Name AS PostTypeName,
+  rp.Title,
+  rp.CreationDate AS PostCreationDate,
+  rp.Score AS PostScore,
+  rp.ViewCount AS PostViewCount,
+  rp.AnswerCount,
+  NULL AS TotalComments,
+  NULL AS AvgCommentsScore,
+  CASE WHEN rp.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS PostStatus,
+  CASE WHEN rp.Title LIKE '%[%]%' THEN 'Contains Brackets' ELSE 'No Brackets' END AS TitleBracketStatus,
+  NULL AS UserDisplayName,
+  NULL AS Reputation,
+  NULL AS UserCreationDate,
+  NULL AS QuestionCount,
+  NULL AS UserAnswerCount,
+  NULL AS UserAvgPostScore,
+  NULL AS UserTotalPostViews,
+  NULL AS DaysSinceLastPost,
+  rp.dr_by_score
+FROM
+  RankedPosts AS rp
+  JOIN PostTypes AS pt
+    ON rp.PostTypeId = pt.Id
+WHERE
+  rp.OwnerUserId IS NULL
+  AND rp.PostTypeId = 1 -- Questions only for this union branch
+  AND rp.Score > 100
+  AND rp.PostTypeName = 'Question'
+ORDER BY
+  dr_by_score;

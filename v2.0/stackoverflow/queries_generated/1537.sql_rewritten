@@ -1,0 +1,239 @@
+-- {"query": "1537.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3895} 
+WITH UserActivitySummary AS (
+    -- Summarizes user post, comment, and vote activity, and tracks first/last activity dates.
+    SELECT
+        U.Id AS UserId,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesGiven,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesGiven,
+        MAX(P.CreationDate) AS LastPostDate,
+        MIN(P.CreationDate) AS FirstPostDate
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId AND P.CreationDate >= U.CreationDate -- Ensure posts are not from before user creation
+    LEFT JOIN Comments C ON U.Id = C.UserId AND C.CreationDate >= U.CreationDate -- Ensure comments are not from before user creation
+    LEFT JOIN Votes V ON U.Id = V.UserId AND V.CreationDate >= U.CreationDate -- Ensure votes are not from before user creation
+    GROUP BY U.Id
+),
+UserBadgeStats AS (
+    -- Calculates various badge counts and first/last badge dates for each user.
+    SELECT
+        UserId,
+        COUNT(Id) AS TotalBadges,
+        SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(Date) AS LastBadgeDate,
+        MIN(Date) AS FirstBadgeDate
+    FROM Badges
+    GROUP BY UserId
+),
+HighlyVotedQuestions AS (
+    -- Identifies top-performing questions based on score, view count, and answer count,
+    -- ranking them per user using ROW_NUMBER.
+    SELECT
+        P.OwnerUserId AS UserId,
+        P.Id AS QuestionId,
+        P.Title AS QuestionTitle,
+        P.ViewCount,
+        P.Score AS QuestionScore,
+        P.AnswerCount,
+        P.Tags,
+        P.CreationDate AS QuestionCreationDate,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.Score DESC, P.ViewCount DESC, P.CreationDate DESC) as UserQuestionRank
+    FROM Posts P
+    WHERE P.PostTypeId = 1 -- Questions only
+      AND P.Score >= 50
+      AND P.ViewCount >= 10000
+      AND P.AnswerCount >= 5
+),
+PostEditActivity AS (
+    -- Aggregates post edit details, distinguishing edits by the owner vs. others.
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        COUNT(DISTINCT PH.Id) AS TotalEdits,
+        COUNT(DISTINCT CASE WHEN PH.UserId <> P.OwnerUserId THEN PH.Id ELSE NULL END) AS EditsByOthers,
+        MAX(PH.CreationDate) AS LastEditByAnyoneDate,
+        MIN(CASE WHEN PH.UserId <> P.OwnerUserId THEN PH.CreationDate ELSE NULL END) AS FirstEditByOtherDate,
+        ARRAY_AGG(DISTINCT PH.PostHistoryTypeId) AS HistoryTypesArray -- PostgreSQL specific
+    FROM Posts P
+    JOIN PostHistory PH ON P.Id = PH.PostId
+    WHERE PH.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9) -- Edit/Rollback Title, Body, Tags
+    GROUP BY P.Id, P.OwnerUserId
+),
+PostMigrationDetails AS (
+    -- Extracts the latest migration information for posts, including source/destination URLs.
+    SELECT
+        PH.PostId,
+        PH.UserId AS MigratorUserId,
+        PH.CreationDate AS MigrationDate,
+        PH.PostHistoryTypeId,
+        SUBSTRING(PH.Text FROM 'to (.+)') AS MigratedToUrl, -- PostgreSQL specific regex extraction
+        SUBSTRING(PH.Text FROM 'from (.+)') AS MigratedFromUrl, -- PostgreSQL specific regex extraction
+        ROW_NUMBER() OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate DESC) AS rn
+    FROM PostHistory PH
+    WHERE PH.PostHistoryTypeId IN (35, 36) -- Post Migrated Away, Post Migrated Here
+)
+-- Main Query Branch 1: Focus on highly reputable users with top-tier questions and significant badge collections
+SELECT
+    U.Id AS UserIdentifier,
+    U.DisplayName,
+    U.Reputation,
+    U.CreationDate AS UserCreationDate,
+    U.Location,
+    U.Views AS ProfileViews,
+    U.UpVotes AS TotalUpVotesReceived,
+    U.DownVotes AS TotalDownVotesReceived,
+    COALESCE(UAS.TotalPosts, 0) AS TotalUserPosts,
+    COALESCE(UAS.TotalComments, 0) AS TotalUserComments,
+    COALESCE(UAS.TotalUpVotesGiven, 0) AS TotalVotesGivenByThisUser,
+    COALESCE(UBS.GoldBadges, 0) AS GoldBadgesCount,
+    COALESCE(UBS.SilverBadges, 0) AS SilverBadgesCount,
+    COALESCE(UBS.BronzeBadges, 0) AS BronzeBadgesCount,
+    HQ.QuestionId AS TopQuestionId,
+    HQ.QuestionTitle AS TopQuestionTitle,
+    HQ.QuestionScore AS TopQuestionScore,
+    HQ.ViewCount AS TopQuestionViewCount,
+    HQ.AnswerCount AS TopQuestionAnswerCount,
+    COALESCE(PMD.MigrationDate, '1900-01-01'::timestamp) AS LatestMigrationDate, -- Default old date if no migration
+    COALESCE(PMD.MigratedToUrl, PMD.MigratedFromUrl, 'N/A') AS MigrationDestinationSource,
+    LAG(U.Reputation, 1, 0) OVER (ORDER BY U.Reputation DESC, U.CreationDate ASC) AS PreviousRankedUserReputation,
+    LEAD(U.Reputation, 1, 0) OVER (ORDER BY U.Reputation DESC, U.CreationDate ASC) AS NextRankedUserReputation,
+    NTILE(5) OVER (ORDER BY U.Reputation DESC, COALESCE(UBS.GoldBadges, 0) DESC, COALESCE(HQ.QuestionScore, 0) DESC) AS TopUserQuintile,
+    (U.UpVotes + U.DownVotes + COALESCE(UAS.TotalUpVotesGiven,0) + COALESCE(UAS.TotalDownVotesGiven,0) + COALESCE(UAS.TotalComments,0) * 0.5) AS EngagementScore,
+    CASE
+        WHEN U.Reputation > 75000 AND COALESCE(UBS.GoldBadges, 0) >= 15 THEN 'Legendary'
+        WHEN U.Reputation > 25000 AND COALESCE(UBS.GoldBadges, 0) >= 5 THEN 'Distinguished'
+        WHEN U.Reputation > 5000 THEN 'ProLific'
+        ELSE 'Contributor'
+    END AS UserExpertiseLevel,
+    NULLIF(TRIM(REPLACE(REPLACE(REPLACE(U.AboutMe, E'\n', ' '), E'\r', ' '), '  ', ' ')), '') AS AboutMeCleaned, -- PostgreSQL specific E'' syntax
+    LENGTH(U.AboutMe) AS AboutMeRawLength,
+    (
+        -- Correlated subquery: Average score of comments made by the user after 6 months from their first badge
+        SELECT AVG(C.Score)
+        FROM Comments C
+        WHERE C.UserId = U.Id
+          AND C.CreationDate >= COALESCE(UBS.FirstBadgeDate, U.CreationDate) + INTERVAL '6 months'
+          AND C.Score > 0
+    ) AS AvgPositiveCommentScoreAfterBadges,
+    (
+        -- Correlated subquery: Count of questions owned by the user that were marked as duplicates
+        SELECT COUNT(DISTINCT PL.RelatedPostId)
+        FROM PostLinks PL
+        INNER JOIN Posts P_OWNED ON PL.PostId = P_OWNED.Id
+        WHERE P_OWNED.OwnerUserId = U.Id
+          AND PL.LinkTypeId = 3 -- Duplicate link type
+          AND P_OWNED.PostTypeId = 1
+    ) AS OwnedQuestionsMarkedAsDuplicateCount,
+    (
+        -- Correlated subquery: Top three tags used by the user in their questions, aggregated as a string
+        SELECT STRING_AGG(DISTINCT T.TagName, ', ')
+        FROM Tags T
+        INNER JOIN Posts P_TAGGED ON P_TAGGED.OwnerUserId = U.Id
+        WHERE P_TAGGED.Tags LIKE '%<' || T.TagName || '>%' -- PostgreSQL specific string concatenation
+          AND P_TAGGED.PostTypeId = 1
+        GROUP BY P_TAGGED.OwnerUserId
+        ORDER BY COUNT(P_TAGGED.Id) DESC, MAX(P_TAGGED.CreationDate) DESC
+        LIMIT 3
+    ) AS TopThreeTagsByUsage,
+    COALESCE(PEA.EditsByOthers, 0) AS PostsEditedByOtherUsersCount,
+    COALESCE(PEA.TotalEdits, 0) AS TotalPostEditsCount,
+    (
+        -- Correlated subquery: Count of accepted answers for questions owned by the user
+        SELECT SUM(CASE WHEN P_INNER.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END)
+        FROM Posts P_INNER
+        WHERE P_INNER.OwnerUserId = U.Id AND P_INNER.PostTypeId = 1
+    ) AS AcceptedAnswersForUsersQuestions,
+    DATE_PART('year', AGE(cast('2024-10-01 12:34:56' as timestamp), U.CreationDate)) AS YearsOnPlatform,
+    RANK() OVER (ORDER BY U.Reputation DESC, U.UpVotes DESC) AS OverallUserRank,
+    'HighReputation' AS UserCategory
+FROM Users U
+LEFT JOIN UserActivitySummary UAS ON U.Id = UAS.UserId
+LEFT JOIN UserBadgeStats UBS ON U.Id = UBS.UserId
+LEFT JOIN HighlyVotedQuestions HQ ON U.Id = HQ.UserId AND HQ.UserQuestionRank = 1
+LEFT JOIN PostEditActivity PEA ON HQ.QuestionId = PEA.PostId
+LEFT JOIN PostMigrationDetails PMD ON HQ.QuestionId = PMD.PostId AND PMD.rn = 1
+WHERE
+    U.Reputation >= 5000
+    AND U.CreationDate BETWEEN '2010-01-01' AND '2022-12-31'
+    AND (U.AboutMe IS NOT NULL AND (U.AboutMe ILIKE '%programmer%' OR U.AboutMe ILIKE '%developer%')) -- ILIKE for case-insensitivity
+    AND COALESCE(UBS.GoldBadges, 0) >= 1
+    AND COALESCE(UAS.TotalPosts, 0) > 40
+    AND COALESCE(UAS.LastPostDate, U.CreationDate) > (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year')
+    AND HQ.QuestionId IS NOT NULL
+    AND EXISTS (
+        -- Correlated subquery: Check if the user's top question has any linked posts created after the question itself
+        SELECT 1
+        FROM PostLinks PL_EXISTS
+        WHERE PL_EXISTS.PostId = HQ.QuestionId
+          AND PL_EXISTS.LinkTypeId = 1 -- Linked post type
+          AND PL_EXISTS.CreationDate > HQ.QuestionCreationDate
+    )
+    AND U.AccountId IS NOT NULL
+GROUP BY
+    U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.Location, U.Views, U.UpVotes, U.DownVotes,
+    UAS.TotalPosts, UAS.TotalComments, UAS.TotalUpVotesGiven, UAS.TotalDownVotesGiven,
+    UBS.GoldBadges, UBS.SilverBadges, UBS.BronzeBadges, UBS.FirstBadgeDate,
+    HQ.QuestionId, HQ.QuestionTitle, HQ.QuestionScore, HQ.ViewCount, HQ.AnswerCount, HQ.QuestionCreationDate,
+    PMD.MigrationDate, PMD.MigratedToUrl, PMD.MigratedFromUrl,
+    PEA.EditsByOthers, PEA.TotalEdits, U.AboutMe
+HAVING
+    COALESCE(PEA.EditsByOthers, 0) >= 1 -- At least one post edited by someone else
+    OR COALESCE(PMD.MigrationDate, '1900-01-01'::timestamp) <> '1900-01-01'::timestamp -- Or their top question was migrated
+
+UNION ALL
+
+-- Main Query Branch 2: Focus on highly engaged users (many answers/comments) with moderate reputation
+SELECT
+    U.Id AS UserIdentifier,
+    U.DisplayName,
+    U.Reputation,
+    U.CreationDate AS UserCreationDate,
+    U.Location,
+    U.Views AS ProfileViews,
+    U.UpVotes AS TotalUpVotesReceived,
+    U.DownVotes AS TotalDownVotesReceived,
+    COALESCE(UAS.TotalPosts, 0) AS TotalUserPosts,
+    COALESCE(UAS.TotalComments, 0) AS TotalUserComments,
+    COALESCE(UAS.TotalUpVotesGiven, 0) AS TotalVotesGivenByThisUser,
+    COALESCE(UBS.GoldBadges, 0) AS GoldBadgesCount,
+    COALESCE(UBS.SilverBadges, 0) AS SilverBadgesCount,
+    COALESCE(UBS.BronzeBadges, 0) AS BronzeBadgesCount,
+    P_ANS.Id AS TopAnsweredQuestionId, -- This will be the ID of a question for which user has a top answer
+    P_ANS.Title AS TopAnsweredQuestionTitle,
+    P_ANS.Score AS TopAnswerScore,
+    P_ANS.ViewCount AS TopAnswerQuestionViewCount,
+    P_ANS.AnswerCount AS TopAnswerQuestionAnswerCount,
+    COALESCE(PMD_ANS.MigrationDate, '1900-01-01'::timestamp) AS LatestMigrationDate,
+    COALESCE(PMD_ANS.MigratedToUrl, PMD_ANS.MigratedFromUrl, 'N/A') AS MigrationDestinationSource,
+    LAG(U.Reputation, 1, 0) OVER (ORDER BY U.Reputation DESC, U.CreationDate ASC) AS PreviousRankedUserReputation,
+    LEAD(U.Reputation, 1, 0) OVER (ORDER BY U.Reputation DESC, U.CreationDate ASC) AS NextRankedUserReputation,
+    NTILE(5) OVER (ORDER BY U.Reputation DESC, COALESCE(UAS.TotalComments, 0) DESC, COALESCE(P_ANS.Score, 0) DESC) AS TopUserQuintile,
+    (U.UpVotes + U.DownVotes + COALESCE(UAS.TotalUpVotesGiven,0) + COALESCE(UAS.TotalDownVotesGiven,0) + COALESCE(UAS.TotalComments,0) * 0.7) AS EngagementScore, -- Slightly different weight for comments
+    CASE
+        WHEN U.Reputation > 75000 AND COALESCE(UBS.GoldBadges, 0) >= 15 THEN 'Legendary'
+        WHEN U.Reputation > 25000 AND COALESCE(UBS.GoldBadges, 0) >= 5 THEN 'Distinguished'
+        WHEN U.Reputation > 5000 THEN 'ProLific'
+        ELSE 'Contributor'
+    END AS UserExpertiseLevel,
+    NULLIF(TRIM(REPLACE(REPLACE(REPLACE(U.AboutMe, E'\n', ' '), E'\r', ' '), '  ', ' ')), '') AS AboutMeCleaned,
+    LENGTH(U.AboutMe) AS AboutMeRawLength,
+    (
+        -- Correlated subquery: Average score of comments made by the user after 6 months from their first badge
+        SELECT AVG(C.Score)
+        FROM Comments C
+        WHERE C.UserId = U.Id
+          AND C.CreationDate >= COALESCE(UBS.FirstBadgeDate, U.CreationDate) + INTERVAL '6 months'
+          AND C.Score > 0
+    ) AS AvgPositiveCommentScoreAfterBadges,
+    (
+        -- Correlated subquery: Count of questions owned by the user that were marked as duplicates
+        SELECT COUNT(DISTINCT PL.RelatedPostId)
+        FROM PostLinks PL
+        INNER JOIN Posts P_OWNED ON PL.PostId = P_OWNED.Id
+        WHERE P_OWNED.OwnerUserId = U.Id
+          AND PL.LinkTypeId = 3
+          AND P_OWNED.PostTypeId = 1
+    ) AS OwnedQuestionsMarkedAsDuplicate

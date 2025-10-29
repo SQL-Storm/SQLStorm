@@ -1,0 +1,98 @@
+-- {"query": "5910.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 729} 
+WITH recent_activity AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.PostTypeId,
+    COALESCE(a.TotalUp, 0) AS UpVotes,
+    COALESCE(a.TotalDown, 0) AS DownVotes,
+    ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.LastActivityDate DESC) AS rn
+  FROM Posts p
+  LEFT JOIN (
+    SELECT
+      PostId,
+      SUM(CASE WHEN Vt.Id = 2 THEN 1 ELSE 0 END) AS TotalUp,
+      SUM(CASE WHEN Vt.Id = 3 THEN 1 ELSE 0 END) AS TotalDown
+    FROM Votes V
+    JOIN VoteTypes Vt ON V.VoteTypeId = Vt.Id
+    GROUP BY PostId
+  ) a ON p.Id = a.PostId
+  WHERE p.PostTypeId IN (1,2) -- Questions and Answers
+),
+top_posts AS (
+  SELECT
+    ra.PostId,
+    ra.Title,
+    ra.CreationDate,
+    ra.LastActivityDate,
+    ra.OwnerUserId,
+    ra.Score,
+    ra.ViewCount,
+    ra.Tags,
+    ra.PostTypeId,
+    ra.UpVotes,
+    ra.DownVotes
+  FROM recent_activity ra
+  WHERE ra.rn <= 50
+),
+tag_summary AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS BotPosts,
+    AVG(ra.Score) AS AvgScore,
+    SUM(ra.UpVotes - ra.DownVotes) AS NetScore
+  FROM top_posts tp
+  JOIN Posts p ON tp.PostId = p.Id
+  CROSS APPLY (SELECT * FROM string_split(REPLACE(p.Tags, '<', ''), '>') ) AS s(TagName)
+  WHERE p.Tags IS NOT NULL
+  GROUP BY t.TagName
+),
+complex_filter AS (
+  SELECT
+    tp.PostId,
+    tp.Title,
+    tp.LastActivityDate,
+    tp.OwnerUserId,
+    tp.Score,
+    tp.ViewCount,
+    tp.UpVotes,
+    tp.DownVotes,
+    tp.Tags,
+    CASE
+      WHEN tp.Score > 5 AND tp.UpVotes >= 10 THEN 'HighQuality'
+      WHEN tp.ViewCount > 1000 OR tp.LastActivityDate > NOW() - INTERVAL '7 days' THEN 'Hot'
+      ELSE 'Normal'
+    END AS Category,
+    ROW_NUMBER() OVER (ORDER BY tp.LastActivityDate DESC, tp.Score DESC) AS Seq
+  FROM top_posts tp
+  LEFT JOIN LATERAL (
+    SELECT 1
+  ) AS dummy ON TRUE
+)
+SELECT
+  cf.PostId,
+  cf.Title,
+  cf.LastActivityDate,
+  cu.DisplayName AS OwnerName,
+  cf.Score,
+  cf.ViewCount,
+  cf.UpVotes,
+  cf.DownVotes,
+  cf.Tags,
+  cf.Category,
+  ct.TagName AS TagExploded
+FROM complex_filter cf
+LEFT JOIN Users cu ON cf.OwnerUserId = cu.Id
+LEFT JOIN (
+  SELECT DISTINCT TagName
+  FROM Tags t
+  CROSS APPLY (SELECT * FROM string_split(REPLACE(t.TagName, '<', ''), '>')) AS s(TagName)
+) AS ct ON 1=1
+WHERE cf.Seq <= 200
+ORDER BY cf.Category, cf.LastActivityDate DESC, cf.Score DESC;

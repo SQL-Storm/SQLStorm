@@ -1,0 +1,273 @@
+-- {"query": "7866.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2238} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        COUNT(DISTINCT c.Id) AS Comments,
+        COUNT(DISTINCT b.Id) AS Badges,
+        MAX(p.CreationDate) AS LastPostDate,
+        ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS ActivityRank,
+        AVG(p.Score) AS AvgPostScore,
+        STRING_AGG(DISTINCT CASE 
+            WHEN p.PostTypeId = 1 THEN p.Title 
+            WHEN p.PostTypeId = 2 THEN CONCAT('Answer to: ', (SELECT TOP 1 Title FROM Posts WHERE Id = p.ParentId))
+        END, ' | ') AS PostTitles
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        TotalPosts,
+        Questions,
+        Answers,
+        Comments,
+        Badges,
+        LastPostDate,
+        ActivityRank,
+        AvgPostScore,
+        PostTitles,
+        CASE 
+            WHEN TotalPosts >= 1000 THEN 'Elite'
+            WHEN TotalPosts >= 500 THEN 'Veteran'
+            WHEN TotalPosts >= 100 THEN 'Experienced'
+            WHEN TotalPosts >= 10 THEN 'Beginner'
+            ELSE 'Newbie'
+        END AS UserLevel,
+        COALESCE(
+            (SELECT TOP 1 p.Title 
+             FROM Posts p 
+             WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1 
+             ORDER BY p.Score DESC),
+            'No Questions'
+        ) AS HighestScoringQuestion
+    FROM UserActivityStats u
+    WHERE ActivityRank <= 100
+),
+PostComplexityAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.Tags,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+            WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN 'HasAnswers'
+            WHEN p.PostTypeId = 1 THEN 'Unanswered'
+            ELSE 'Other'
+        END AS QuestionStatus,
+        CASE 
+            WHEN p.ViewCount > 1000 AND p.Score > 10 THEN 'HighVisibility'
+            WHEN p.ViewCount > 500 THEN 'MediumVisibility'
+            WHEN p.ViewCount > 100 THEN 'LowVisibility'
+            ELSE 'VeryLowVisibility'
+        END AS VisibilityLevel,
+        STRING_TO_ARRAY(p.Tags, '><') AS TagArray,
+        (SELECT COUNT(*) FROM Posts WHERE ParentId = p.Id AND PostTypeId = 2) AS AnswerCountRecursive,
+        (SELECT COUNT(*) FROM Votes WHERE PostId = p.Id AND VoteTypeId IN (2,3)) AS VoteCount,
+        (SELECT AVG(v.Score) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId IN (2,3)) AS AvgVoteScore,
+        ISNULL(
+            (SELECT TOP 1 ph.Text 
+             FROM PostHistory ph 
+             WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId = 5 
+             ORDER BY ph.CreationDate DESC),
+            ''
+        ) AS MostRecentBodyChange,
+        DATEDIFF(day, p.CreationDate, GETDATE()) AS AgeInDays,
+        CASE 
+            WHEN p.CreationDate >= DATEADD(month, -3, GETDATE()) THEN 'New'
+            WHEN p.CreationDate >= DATEADD(month, -12, GETDATE()) THEN 'Recent'
+            WHEN p.CreationDate >= DATEADD(year, -2, GETDATE()) THEN 'Old'
+            ELSE 'VeryOld'
+        END AS PostAgeCategory
+    FROM Posts p
+    WHERE p.PostTypeId IN (1,2)
+),
+AggregatedComplexity AS (
+    SELECT 
+        PostId,
+        Title,
+        Score,
+        ViewCount,
+        CreationDate,
+        OwnerUserId,
+        PostTypeId,
+        AnswerCount,
+        CommentCount,
+        Tags,
+        QuestionStatus,
+        VisibilityLevel,
+        TagArray,
+        AnswerCountRecursive,
+        VoteCount,
+        AvgVoteScore,
+        MostRecentBodyChange,
+        AgeInDays,
+        PostAgeCategory,
+        COUNT(*) OVER() AS TotalAnalyzablePosts,
+        RANK() OVER (ORDER BY Score DESC) AS ScoreRank,
+        DENSE_RANK() OVER (ORDER BY ViewCount DESC) AS ViewRank,
+        ROW_NUMBER() OVER (PARTITION BY PostTypeId ORDER BY Score DESC) AS TypeRank,
+        LAG(Score, 1) OVER (ORDER BY Score DESC) - Score AS ScoreDifference,
+        PERCENT_RANK() OVER (ORDER BY Score) AS ScorePercentile
+    FROM PostComplexityAnalysis
+)
+SELECT 
+    au.UserId,
+    au.DisplayName,
+    au.Reputation,
+    au.TotalPosts,
+    au.Questions,
+    au.Answers,
+    au.Comments,
+    au.Badges,
+    au.LastPostDate,
+    au.ActivityRank,
+    au.AvgPostScore,
+    au.PostTitles,
+    au.UserLevel,
+    au.HighestScoringQuestion,
+    
+    ac.PostId,
+    ac.Title,
+    ac.Score,
+    ac.ViewCount,
+    ac.CreationDate,
+    ac.OwnerUserId,
+    ac.PostTypeId,
+    ac.AnswerCount,
+    ac.CommentCount,
+    ac.Tags,
+    ac.QuestionStatus,
+    ac.VisibilityLevel,
+    ac.TagArray,
+    ac.AnswerCountRecursive,
+    ac.VoteCount,
+    ac.AvgVoteScore,
+    ac.MostRecentBodyChange,
+    ac.AgeInDays,
+    ac.PostAgeCategory,
+    ac.TotalAnalyzablePosts,
+    ac.ScoreRank,
+    ac.ViewRank,
+    CASE 
+        WHEN ac.ScoreDifference < 0 THEN 'Gaining'
+        WHEN ac.ScoreDifference > 0 THEN 'Losing'
+        ELSE 'Stable'
+    END AS ScoreTrend,
+    ac.ScorePercentile,
+    
+    -- Complex expression using multiple functions and operations
+    CASE 
+        WHEN ac.VisibilityLevel = 'HighVisibility' AND ac.Score > 100 AND ac.AgeInDays < 365 THEN 
+            CONCAT('HighPriority-', ac.PostAgeCategory, '-', ac.QuestionStatus)
+        WHEN ac.VisibilityLevel = 'MediumVisibility' AND ac.Score > 50 AND ac.AgeInDays < 180 THEN 
+            CONCAT('MediumPriority-', ac.PostAgeCategory, '-', ac.QuestionStatus)
+        WHEN ac.VisibilityLevel = 'LowVisibility' OR ac.Score < 10 THEN 
+            CONCAT('LowPriority-', ac.QuestionStatus)
+        ELSE 
+            CONCAT('Regular-', ac.PostAgeCategory)
+    END AS PostPriorityCategory,
+    
+    -- Calculated fields with NULL handling
+    COALESCE(
+        (SELECT TOP 1 u.DisplayName 
+         FROM Users u 
+         WHERE u.Id = ac.OwnerUserId),
+        'Anonymous'
+    ) AS OwnerName,
+    
+    -- Set operations within a complex context
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = ac.PostId AND ph.PostHistoryTypeId IN (5,6)) AS EditCounts,
+    
+    -- Window function with complex frame specification
+    AVG(ac.Score) OVER (PARTITION BY ac.OwnerUserId ORDER BY ac.CreationDate ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS MovingAvgScore,
+    
+    -- Correlated subquery with multiple conditions
+    CASE 
+        WHEN EXISTS (
+            SELECT 1 
+            FROM Badges b 
+            WHERE b.UserId = au.UserId 
+            AND b.Date >= DATEADD(month, -6, GETDATE())
+        ) THEN 'ActiveBadgeHolder'
+        WHEN EXISTS (
+            SELECT 1 
+            FROM Votes v 
+            WHERE v.UserId = au.UserId 
+            AND v.CreationDate >= DATEADD(month, -3, GETDATE())
+            AND v.VoteTypeId IN (2,3)
+        ) THEN 'ActiveVoter'
+        ELSE 'Inactive'
+    END AS EngagementStatus,
+    
+    -- String manipulation with case conversion and formatting
+    UPPER(CONCAT(
+        'POST_ID:', ac.PostId, 
+        '-SCORE:', ac.Score, 
+        '-VIEWS:', ac.ViewCount,
+        '-CATEGORY:', ac.VisibilityLevel
+    )) AS FormattedPostInfo,
+    
+    -- Mathematical calculations and conditional expressions
+    ROUND(
+        CASE 
+            WHEN ac.Score > 0 AND ac.ViewCount > 0 THEN 
+                (ac.Score * 1.0 / ac.ViewCount) * 100
+            ELSE 0
+        END, 2
+    ) AS ScoreToViewRatio,
+    
+    -- Complex predicate combining multiple conditions
+    CASE 
+        WHEN ac.PostAgeCategory IN ('New', 'Recent') 
+        AND ac.Score > 10 
+        AND ac.VisibilityLevel IN ('HighVisibility', 'MediumVisibility')
+        AND (ac.CommentCount IS NOT NULL AND ac.CommentCount > 0)
+        THEN 'HotTopic'
+        WHEN ac.PostAgeCategory = 'Old' 
+        AND ac.VisibilityLevel = 'LowVisibility'
+        AND ac.Score < 5
+        THEN 'Legacy'
+        ELSE 'Normal'
+    END AS TopicClassification
+    
+FROM TopUsers au
+LEFT JOIN AggregatedComplexity ac ON au.UserId = ac.OwnerUserId
+WHERE 
+    -- Complex compound predicate
+    (au.TotalPosts > 50 OR au.Reputation > 1000 OR au.Badges > 10)
+    AND (
+        ac.PostAgeCategory IN ('New', 'Recent')
+        OR ac.Score > 50 
+        OR ac.ViewCount > 1000
+    )
+    AND (
+        (au.UserLevel IN ('Elite', 'Veteran') AND ac.Score > 20)
+        OR 
+        (au.UserLevel IN ('Experienced', 'Beginner') AND ac.ViewCount > 500) 
+        OR 
+        au.UserLevel = 'Newbie'
+    )
+    AND COALESCE(ac.Tags, '') != ''
+    
+ORDER BY 
+    au.ActivityRank,
+    ac.Score DESC,
+    ac.ViewCount DESC;

@@ -1,0 +1,180 @@
+-- {"query": "1682.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2479} 
+
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Views AS UserViews,
+        U.UpVotes AS UserUpVotes,
+        U.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT P.Id) AS TotalPostsCreated,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id ELSE NULL END) AS TotalQuestionsCreated,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadgesCount,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadgesCount,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadgesCount,
+        MAX(P.LastActivityDate) AS LastPostActivityByUser,
+        AVG(CASE WHEN P.PostTypeId = 1 THEN P.Score ELSE NULL END) AS AvgQuestionScore
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    LEFT JOIN Badges AS B ON U.Id = B.UserId
+    WHERE U.Reputation > 1000 -- Filter for somewhat active users
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate,
+        U.Views, U.UpVotes, U.DownVotes
+),
+PostHistoricalMetrics AS (
+    SELECT
+        PH.PostId,
+        COUNT(DISTINCT PH.UserId) AS UniqueEditorsCount,
+        MAX(PH.CreationDate) AS LastEditDateHistory,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4,5,6) THEN 1 ELSE 0 END) AS EditCount,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 AND PH.Comment LIKE '101' THEN 1 ELSE 0 END) AS WasClosedAsDuplicate, -- 101 for "Duplicate"
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (10, 11) THEN PH.UserId ELSE NULL END) AS DistinctCloserReopeners
+    FROM PostHistory AS PH
+    WHERE PH.CreationDate >= (CURRENT_DATE - INTERVAL '1 year')
+    GROUP BY PH.PostId
+),
+RelatedPostsSummary AS (
+    SELECT
+        PL.PostId,
+        STRING_AGG(DISTINCT P2.Title, '; ') AS LinkedPostTitles,
+        COUNT(DISTINCT CASE WHEN PL.LinkTypeId = 1 THEN PL.RelatedPostId ELSE NULL END) AS LinkedPostsCount,
+        COUNT(DISTINCT CASE WHEN PL.LinkTypeId = 3 THEN PL.RelatedPostId ELSE NULL END) AS DuplicatePostsCount,
+        MAX(CASE WHEN PL.LinkTypeId = 3 THEN P2.CreationDate ELSE NULL END) AS LatestDuplicateCreationDate
+    FROM PostLinks AS PL
+    JOIN Posts AS P1 ON PL.PostId = P1.Id
+    JOIN Posts AS P2 ON PL.RelatedPostId = P2.Id
+    WHERE PL.LinkTypeId IN (1, 3) -- Linked or Duplicate
+    GROUP BY PL.PostId
+),
+PostCurrentState AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.Title,
+        P.Tags,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate AS PostCreationDate,
+        P.LastActivityDate,
+        P.OwnerUserId,
+        P.AcceptedAnswerId,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.ClosedDate,
+        P.Body, -- Include Body for BodyExcerpt calculation
+        PV.UpVoteCount,
+        PV.DownVoteCount,
+        PV.OffensiveVoteCount,
+        PV.FavoriteVoteCount -- Votes.VoteType 5 is for Favorite, not the FavoriteCount from Posts
+    FROM Posts AS P
+    LEFT JOIN (
+        SELECT
+            V.PostId,
+            SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+            SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+            SUM(CASE WHEN V.VoteTypeId = 4 THEN 1 ELSE 0 END) AS OffensiveVoteCount,
+            SUM(CASE WHEN V.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoriteVoteCount
+        FROM Votes AS V
+        WHERE V.VoteTypeId IN (2, 3, 4, 5)
+        GROUP BY V.PostId
+    ) AS PV ON P.Id = PV.PostId
+    WHERE P.PostTypeId = 1 -- Only questions
+      AND P.AcceptedAnswerId IS NULL -- Unanswered questions
+      AND P.AnswerCount = 0 -- Explicitly no answers
+      AND P.Score > 0
+      AND P.ViewCount > 50
+)
+SELECT
+    PCS.PostId,
+    PCS.Title,
+    PCS.Tags,
+    UE.DisplayName AS OwnerDisplayName,
+    UE.Reputation AS OwnerReputation,
+    PCS.PostCreationDate,
+    PCS.LastActivityDate,
+    PCS.Score,
+    PCS.ViewCount,
+    PCS.AnswerCount,
+    PCS.CommentCount,
+    PCS.FavoriteCount,
+    COALESCE(PCS.UpVoteCount, 0) AS TotalUpVotes,
+    COALESCE(PCS.DownVoteCount, 0) AS TotalDownVotes,
+    COALESCE(PCS.FavoriteVoteCount, 0) AS TotalFavoriteVotesFromUsers,
+    UE.TotalPostsCreated,
+    UE.TotalQuestionsCreated,
+    UE.TotalCommentsMade,
+    UE.GoldBadgesCount,
+    UE.SilverBadgesCount,
+    UE.BronzeBadgesCount,
+    PHM.UniqueEditorsCount AS PostEditorsLastYear,
+    PHM.EditCount AS PostEditHistoryCount,
+    PHM.WasClosedAsDuplicate,
+    RPS.LinkedPostsCount,
+    RPS.DuplicatePostsCount,
+    RPS.LinkedPostTitles,
+    (PCS.Score * 0.5 + PCS.ViewCount * 0.01 + COALESCE(PCS.UpVoteCount, 0) * 0.8 - COALESCE(PCS.DownVoteCount, 0) * 0.4) AS CalculatedEngagementScore,
+    CASE
+        WHEN UE.Reputation > 50000 AND UE.GoldBadgesCount > 5 THEN 'Legendary Contributor'
+        WHEN UE.Reputation > 10000 AND UE.GoldBadgesCount > 0 THEN 'Veteran Author'
+        WHEN UE.Reputation > 2000 THEN 'Active Contributor'
+        ELSE 'Emerging Author'
+    END AS AuthorTier,
+    DENSE_RANK() OVER (ORDER BY (PCS.Score * UE.Reputation) DESC, PCS.ViewCount DESC, PCS.PostCreationDate ASC) AS GlobalImpactRank,
+    AVG(PCS.Score) OVER (PARTITION BY EXTRACT(YEAR FROM PCS.PostCreationDate)) AS AvgScoreForYear,
+    SUM(PCS.ViewCount) OVER (ORDER BY PCS.PostCreationDate ROWS BETWEEN 30 PRECEDING AND CURRENT ROW) AS Rolling30DayViews,
+    (SELECT COUNT(DISTINCT V.UserId)
+     FROM Votes AS V
+     WHERE V.PostId = PCS.PostId AND V.VoteTypeId = 5
+     AND V.CreationDate >= (CURRENT_DATE - INTERVAL '6 months')) AS RecentBookmarkUsers,
+    (SELECT EXISTS (
+        SELECT 1
+        FROM PostHistory AS PH_INNER
+        JOIN PostHistoryTypes AS PHT ON PH_INNER.PostHistoryTypeId = PHT.Id
+        WHERE PH_INNER.PostId = PCS.PostId
+        AND PHT.Name = 'Post Locked'
+        AND PH_INNER.CreationDate > (CURRENT_DATE - INTERVAL '1 year')
+    )) AS WasLockedRecently,
+    COALESCE(
+        NULLIF(SUBSTRING(PCS.Body,
+                         POSITION('<p>' IN PCS.Body) + 3,
+                         CASE
+                             WHEN POSITION('<p>' IN PCS.Body) > 0 AND POSITION('</p>' IN PCS.Body) > POSITION('<p>' IN PCS.Body) + 3
+                             THEN POSITION('</p>' IN PCS.Body) - (POSITION('<p>' IN PCS.Body) + 3)
+                             ELSE 0
+                         END), ''),
+        SUBSTRING(PCS.Body, 1, LEAST(LENGTH(PCS.Body), 200)) -- Fallback to first 200 chars if no paragraph or too short
+    ) AS BodyExcerpt,
+    NULLIF(UE.UserUpVotes, 0) / NULLIF(UE.UserDownVotes, 0)::NUMERIC AS OwnerUpvoteDownvoteRatio,
+    UPPER(LEFT(PCS.Title, 1)) || LOWER(SUBSTRING(PCS.Title, 2, LENGTH(PCS.Title) - 1)) AS StandardizedTitleCase,
+    (SELECT COUNT(DISTINCT T.Id)
+     FROM Tags AS T
+     WHERE PCS.Tags IS NOT NULL AND POSITION('<' || T.TagName || '>' IN PCS.Tags) > 0) AS TotalReferencedTagsInPost
+FROM PostCurrentState AS PCS
+LEFT JOIN UserEngagement AS UE ON PCS.OwnerUserId = UE.UserId
+LEFT JOIN PostHistoricalMetrics AS PHM ON PCS.PostId = PHM.PostId
+LEFT JOIN RelatedPostsSummary AS RPS ON PCS.PostId = RPS.PostId
+WHERE
+    UE.GoldBadgesCount > 0 AND UE.Reputation > 5000
+    AND PCS.PostCreationDate BETWEEN (CURRENT_DATE - INTERVAL '5 years') AND (CURRENT_DATE - INTERVAL '1 year')
+    AND PCS.ClosedDate IS NULL
+    AND (
+        (PCS.Tags LIKE '%<sql>%' OR PCS.Tags LIKE '%<database>%')
+        OR
+        (PCS.Title ILIKE '%performance%' AND LENGTH(PCS.Body) > 500)
+    )
+    AND NOT EXISTS ( -- Correlated subquery to exclude posts that were closed as 'Off-topic'
+        SELECT 1
+        FROM PostHistory AS PH_Close
+        WHERE PH_Close.PostId = PCS.PostId
+          AND PH_Close.PostHistoryTypeId = 10 -- Post Closed
+          AND PH_Close.Comment IN ('2', '102') -- Old (Off-topic) or New (Off-topic) close reasons
+    )
+ORDER BY GlobalImpactRank ASC, CalculatedEngagementScore DESC
+LIMIT 1000;

@@ -1,0 +1,327 @@
+with
+popular_tags as (
+  select
+    t.id,
+    t.tagname,
+    t.count,
+    dense_rank() over (order by t.count desc, t.tagname) as tag_rank
+  from tags t
+),
+question_tags as (
+  select
+    p.id as question_id,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.owneruserid,
+    lower(trim(tag)) as tagname
+  from posts p
+  cross join lateral unnest(
+    case
+      when p.posttypeid = 1 and p.tags is not null and length(p.tags) >= 2
+        then string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')
+      else array[]::varchar
+    end
+  ) as tag
+  where p.posttypeid = 1
+),
+qt as (
+  select
+    qt.question_id,
+    qt.creationdate,
+    qt.score,
+    qt.viewcount,
+    qt.owneruserid,
+    t.id as tag_id,
+    t.tagname,
+    t.count as tag_usage
+  from question_tags qt
+  left join tags t
+    on lower(t.tagname) = qt.tagname
+),
+active_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.location,
+    u.upvotes,
+    u.downvotes,
+    u.views,
+    width_bucket(u.reputation, 0, greatest(u.reputation, 1), 5) as rep_bucket_dynamic,
+    case
+      when u.reputation >= 100000 then 'Legend'
+      when u.reputation >= 10000 then 'Expert'
+      when u.reputation >= 1000 then 'Intermediate'
+      when u.reputation >= 100 then 'Beginner'
+      else 'Newbie'
+    end as rep_band
+  from users u
+),
+accepted as (
+  select
+    q.id as question_id,
+    q.creationdate as question_created,
+    a.id as answer_id,
+    a.creationdate as answer_created,
+    cast(extract(epoch from (a.creationdate - q.creationdate)) as bigint) as seconds_to_answer
+  from posts q
+  join posts a
+    on a.id = q.acceptedanswerid
+  where q.posttypeid = 1
+),
+vote_agg as (
+  select
+    v.postid,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+    count(*) as total_votes,
+    percentile_disc(0.5) within group (order by coalesce(v.bountyamount,0)) as p50_bounty,
+    avg(coalesce(v.bountyamount,0)) as avg_bounty
+  from votes v
+  group by v.postid
+),
+close_reasons as (
+  select
+    ph.postid as question_id,
+    max(case when ph.posthistorytypeid = 10 then ph.comment end) filter (where ph.posthistorytypeid = 10) as last_close_reason_id,
+    bool_or(ph.posthistorytypeid = 11) as was_reopened,
+    min(ph.creationdate) filter (where ph.posthistorytypeid = 10) as first_closed_at
+  from posthistory ph
+  join posts p on p.id = ph.postid and p.posttypeid = 1
+  group by ph.postid
+),
+dupe_links as (
+  select
+    pl.postid as duplicate_id,
+    pl.relatedpostid as original_id,
+    min(pl.creationdate) as first_linked_at
+  from postlinks pl
+  where pl.linktypeid = 3
+  group by pl.postid, pl.relatedpostid
+),
+question_metrics as (
+  select
+    q.id as question_id,
+    q.title,
+    q.creationdate,
+    q.owneruserid,
+    q.score,
+    q.viewcount,
+    q.answercount,
+    q.commentcount,
+    qa.upvotes,
+    qa.downvotes,
+    qa.favorites,
+    qa.total_votes,
+    qa.avg_bounty,
+    qa.p50_bounty,
+    coalesce(a.seconds_to_answer, null) as seconds_to_accept,
+    cr.last_close_reason_id,
+    cr.was_reopened,
+    cr.first_closed_at,
+    case when dl.original_id is not null then 1 else 0 end as is_marked_duplicate,
+    dl.original_id as duplicate_of_id
+  from posts q
+  left join vote_agg qa on qa.postid = q.id
+  left join accepted a on a.question_id = q.id
+  left join close_reasons cr on cr.question_id = q.id
+  left join dupe_links dl on dl.duplicate_id = q.id
+  where q.posttypeid = 1
+),
+tag_user_stats as (
+  select
+    qt.tag_id,
+    qt.tagname,
+    qt.question_id,
+    qm.score,
+    qm.viewcount,
+    qm.answercount,
+    qm.upvotes,
+    qm.downvotes,
+    qm.total_votes,
+    qm.seconds_to_accept,
+    au.user_id,
+    au.displayname,
+    au.reputation,
+    au.rep_band,
+    row_number() over (partition by qt.tag_id order by qm.viewcount desc nulls last) as rn_view_in_tag,
+    row_number() over (partition by qt.tag_id order by qm.score desc nulls last) as rn_score_in_tag,
+    avg(qm.viewcount) over (partition by qt.tag_id) as avg_views_in_tag,
+    stddev_pop(qm.viewcount) over (partition by qt.tag_id) as std_views_in_tag,
+    count(*) over (partition by qt.tag_id) as cnt_questions_in_tag,
+    sum(qm.upvotes) over (partition by qt.tag_id) as sum_up_in_tag,
+    sum(qm.downvotes) over (partition by qt.tag_id) as sum_down_in_tag
+  from qt
+  join question_metrics qm on qm.question_id = qt.question_id
+  left join active_users au on au.user_id = qm.owneruserid
+),
+tag_scores as (
+  select
+    tag_id,
+    tagname,
+    count(distinct question_id) as questions,
+    sum(coalesce(viewcount,0)) as sum_views,
+    sum(coalesce(score,0)) as sum_score,
+    sum(coalesce(total_votes,0)) as sum_votes,
+    avg(nullif(seconds_to_accept,0)) as avg_sec_to_accept,
+    sum(case when seconds_to_accept is null then 1 else 0 end) as unanswered_or_unaccepted,
+    1.0 * sum(coalesce(score,0)) / greatest(count(distinct question_id),1) as avg_score_per_q,
+    1.0 * sum(coalesce(viewcount,0)) / greatest(count(distinct question_id),1) as avg_views_per_q
+  from tag_user_stats
+  group by tag_id, tagname
+),
+tag_final as (
+  select
+    pt.id as tag_id,
+    pt.tagname,
+    pt.count as total_tag_usage,
+    ts.questions,
+    ts.sum_views,
+    ts.sum_score,
+    ts.sum_votes,
+    ts.avg_sec_to_accept,
+    ts.unanswered_or_unaccepted,
+    ts.avg_score_per_q,
+    ts.avg_views_per_q,
+    coalesce(ts.sum_score,0) * 0.4
+      + coalesce(ts.sum_votes,0) * 0.3
+      + coalesce(ts.sum_views,0) * 0.2
+      - coalesce(ts.unanswered_or_unaccepted,0) * 0.1 as engagement_score,
+    pt.tag_rank
+  from popular_tags pt
+  left join tag_scores ts on ts.tag_id = pt.id
+),
+tag_outliers as (
+  select
+    tus.tag_id,
+    tus.tagname,
+    tus.question_id,
+    tus.viewcount,
+    tus.score,
+    tus.total_votes,
+    tus.seconds_to_accept,
+    case
+      when tus.std_views_in_tag is not null and tus.std_views_in_tag > 0
+        then (tus.viewcount - tus.avg_views_in_tag) / nullif(tus.std_views_in_tag,0)
+      else null
+    end as view_z
+  from (
+    select
+      tag_id, tagname, question_id, viewcount, score, total_votes, seconds_to_accept,
+      avg_views_in_tag, std_views_in_tag
+    from tag_user_stats
+  ) tus
+  where tus.viewcount is not null
+),
+top_comment as (
+  select c.postid as question_id,
+         (select c2.text
+          from comments c2
+          where c2.postid = c.postid
+          order by c2.score desc nulls last, c2.creationdate asc
+          limit 1) as top_comment_text,
+         (select c3.userid from comments c3 where c3.postid = c.postid order by c3.score desc nulls last, c3.creationdate asc limit 1) as top_comment_userid
+  from comments c
+  group by c.postid
+),
+user_badges as (
+  select
+    b.userid,
+    sum(case when b.class = 1 then 1 else 0 end) as gold,
+    sum(case when b.class = 2 then 1 else 0 end) as silver,
+    sum(case when b.class = 3 then 1 else 0 end) as bronze,
+    sum(case when b.tagbased then 1 else 0 end) as tag_badges
+  from badges b
+  group by b.userid
+),
+user_profile as (
+  select
+    au.user_id,
+    coalesce(au.displayname, 'User#' || cast(au.user_id as varchar)) as display_name,
+    au.reputation,
+    au.rep_band,
+    coalesce(ub.gold,0) as gold,
+    coalesce(ub.silver,0) as silver,
+    coalesce(ub.bronze,0) as bronze,
+    concat_ws(' | ',
+      'Rep: ' || cast(au.reputation as varchar),
+      'Badges G/S/B: ' || cast(coalesce(ub.gold,0) as varchar) || '/' || cast(coalesce(ub.silver,0) as varchar) || '/' || cast(coalesce(ub.bronze,0) as varchar)
+    ) as summary
+  from active_users au
+  left join user_badges ub on ub.userid = au.user_id
+),
+question_strings as (
+  select
+    qm.question_id,
+    concat_ws(' | ',
+      'Title: ' || coalesce(left(q.title, 80), '[no title]'),
+      'Score: ' || cast(coalesce(qm.score,0) as varchar),
+      'Views: ' || cast(coalesce(qm.viewcount,0) as varchar),
+      'Votes: ' || cast(coalesce(qm.total_votes,0) as varchar),
+      'Accepted in: ' || coalesce(
+         case
+           when qm.seconds_to_accept is not null then
+             -- format seconds as HH24:MI:SS in standard SQL without to_char on interval
+             lpad(cast((qm.seconds_to_accept / 3600) as varchar),2,'0') || ':' ||
+             lpad(cast(((qm.seconds_to_accept % 3600) / 60) as varchar),2,'0') || ':' ||
+             lpad(cast((qm.seconds_to_accept % 60) as varchar),2,'0')
+           else 'N/A'
+         end
+      )
+    ) as question_summary
+  from question_metrics qm
+  join posts q on q.id = qm.question_id
+),
+top_tags as (
+  select tag_id
+  from tag_final
+  where tag_rank <= 50
+)
+select
+  tf.tagname,
+  tf.total_tag_usage,
+  tf.tag_rank,
+  round(cast(tf.engagement_score as numeric), 2) as engagement_score,
+  ts.questions as question_count,
+  ts.avg_views_per_q,
+  ts.avg_score_per_q,
+  count(*) filter (where abs("to".view_z) >= 2) as outlier_questions_2sigma,
+  count(*) filter (where qm.viewcount >= (select avg(viewcount) from question_metrics) and qm.score >= (select avg(score) from question_metrics)) as hv_hs_count,
+  q.id as sample_question_id,
+  qs.question_summary as sample_question_summary,
+  up.display_name as owner_display,
+  up.summary as owner_summary,
+  coalesce(tc.top_comment_text, '[no comments]') as top_comment_text,
+  case when qm.last_close_reason_id ~ '^[0-9]+$'
+       then (select crt.name from closereasontypes crt where cast(crt.id as varchar) = qm.last_close_reason_id limit 1)
+       else null end as last_close_reason_name,
+  case when qm.was_reopened then 'Yes' else 'No' end as was_reopened,
+  coalesce(to_char(qm.first_closed_at, 'YYYY-MM-DD'), 'Never') as first_closed_date,
+  case when qm.is_marked_duplicate = 1 then 'Duplicate of ' || cast(qm.duplicate_of_id as varchar) else 'Original' end as duplicate_status
+from tag_final tf
+join top_tags tt on tt.tag_id = tf.tag_id
+left join tag_scores ts on ts.tag_id = tf.tag_id
+left join lateral (
+  select
+    tus.question_id
+  from tag_user_stats tus
+  where tus.tag_id = tf.tag_id
+  order by coalesce(tus.viewcount,0) desc nulls last, coalesce(tus.score, -2147483648) desc nulls last
+  limit 1
+) pick on true
+left join question_metrics qm on qm.question_id = pick.question_id
+left join posts q on q.id = qm.question_id
+left join question_strings qs on qs.question_id = qm.question_id
+left join user_profile up on up.user_id = q.owneruserid
+left join top_comment tc on tc.question_id = q.id
+left join tag_outliers "to" on "to".question_id = q.id and "to".tag_id = tf.tag_id
+group by
+  tf.tagname, tf.total_tag_usage, tf.tag_rank, tf.engagement_score,
+  ts.questions, ts.avg_views_per_q, ts.avg_score_per_q,
+  q.id, qs.question_summary, up.display_name, up.summary,
+  tc.top_comment_text, qm.last_close_reason_id, qm.was_reopened, qm.first_closed_at, qm.is_marked_duplicate, qm.duplicate_of_id
+order by tf.engagement_score desc nulls last, tf.tag_rank asc
+limit 100;

@@ -1,0 +1,207 @@
+-- {"query": "1169.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3087} 
+WITH UserEngagement AS (
+    -- Aggregates user-specific data, badge counts, and calculates account activity duration.
+    -- Includes COALESCE for DisplayName and WebsiteUrl, and initial filtering on reputation.
+    SELECT
+        u.Id AS UserId,
+        COALESCE(u.DisplayName, 'Anonymous User') AS DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.Location,
+        u.WebsiteUrl,
+        u.AboutMe,
+        COUNT(DISTINCT b.Name) AS UniqueBadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        EXTRACT(EPOCH FROM (u.LastAccessDate - u.CreationDate)) / (60 * 60 * 24) AS AccountActiveDays,
+        COALESCE(u.WebsiteUrl, 'http://example.com/default') AS CoalescedWebsiteUrl
+    FROM Users AS u
+    LEFT JOIN Badges AS b ON u.Id = b.UserId
+    WHERE u.Reputation > 500 -- Filter for users with some reputation
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate,
+        u.Views, u.UpVotes, u.DownVotes, u.Location, u.WebsiteUrl, u.AboutMe
+),
+PostAggregates AS (
+    -- Summarizes post activity for each user, including post counts, scores, and view counts.
+    -- Uses COALESCE for post scores/view counts to handle potential NULLs gracefully in SUM.
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsAsked,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersProvided,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostScore,
+        SUM(COALESCE(p.ViewCount, 0)) AS TotalPostViews,
+        AVG(CAST(p.Score AS NUMERIC)) FILTER (WHERE p.PostTypeId IN (1,2)) AS AvgRelevantPostScorePerPost,
+        MAX(p.CreationDate) AS LatestPostDate,
+        SUM(CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END) AS ClosedPostsCount
+    FROM Posts AS p
+    WHERE p.OwnerUserId IS NOT NULL
+      AND p.CreationDate >= '2020-01-01' -- Focus on more recent post activity
+    GROUP BY p.OwnerUserId
+),
+AnswerAcceptance AS (
+    -- Identifies which answer posts have been accepted for questions.
+    SELECT
+        p.AcceptedAnswerId AS AnswerId, -- This is the ID of an answer post
+        COUNT(DISTINCT p.Id) AS QuestionsAcceptedThisAnswerFor
+    FROM Posts AS p
+    WHERE p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL
+    GROUP BY p.AcceptedAnswerId
+),
+UserPostTagFrequencies AS (
+    -- Breaks down tags from question posts and counts their occurrences per user.
+    -- Uses string_to_array and UNNEST for string manipulation and normalization with LOWER().
+    SELECT
+        p.OwnerUserId AS UserId,
+        LOWER(UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><'))) AS TagName,
+        COUNT(*) AS TagCount
+    FROM Posts AS p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND LENGTH(TRIM(p.Tags)) > 2
+    GROUP BY p.OwnerUserId, LOWER(UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><')))
+),
+RankedUserTags AS (
+    -- Ranks tags by frequency for each user to find their top contributing tag.
+    -- Uses ROW_NUMBER() window function.
+    SELECT
+        UserId,
+        TagName,
+        TagCount,
+        ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY TagCount DESC, TagName ASC) AS rn
+    FROM UserPostTagFrequencies
+),
+PostHistoryEditAnalysis AS (
+    -- Analyzes post history for edit events and estimates content changes.
+    -- Uses SUM(CASE WHEN ...) for counting specific event types and AVG(LENGTH()) for content changes.
+    SELECT
+        ph.PostId,
+        ph.UserId AS EditorUserId, -- The user who performed the history event
+        COUNT(ph.Id) AS TotalHistoryEvents,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditEvents, -- Title, Body, Tags edits
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15) THEN 1 ELSE 0 END) AS StatusChangeEvents, -- Closed, Reopened, Deleted, Undeleted, Locked, Unlocked
+        MAX(ph.CreationDate) AS LastHistoryDate,
+        -- Calculates average length of content changes for body edits/initials/rollbacks.
+        AVG(LENGTH(ph.Text)) FILTER (WHERE ph.PostHistoryTypeId IN (2, 5, 8) AND ph.Text IS NOT NULL) AS AvgBodyContentLengthChange
+    FROM PostHistory AS ph
+    WHERE ph.PostHistoryTypeId NOT IN (1, 3) -- Exclude initial title/tags, focus on changes and other events
+    GROUP BY ph.PostId, ph.UserId
+),
+OverallAverages AS (
+    -- Calculates global averages for reputation, views, post score, and comment length for benchmarking.
+    SELECT
+        AVG(u.Reputation) AS AvgReputation,
+        AVG(u.Views) AS AvgViews,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId IN (1,2)) AS AvgPostScoreOverall,
+        AVG(LENGTH(c.Text)) AS AvgCommentLengthOverall
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON p.Id = c.PostId
+)
+SELECT
+    ue.UserId,
+    ue.DisplayName,
+    ue.Reputation,
+    ue.AccountActiveDays,
+    ue.UniqueBadgeCount,
+    ue.GoldBadges,
+    pa.TotalPosts,
+    pa.QuestionsAsked,
+    pa.AnswersProvided,
+    pa.TotalPostScore,
+    pa.TotalPostViews,
+    pa.AvgRelevantPostScorePerPost,
+    -- Joins with a derived table to count how many of *this user's* answers have been accepted.
+    COALESCE(accepted_ans_owner.TotalAcceptedAnswersContributed, 0) AS AcceptedAnswersContributedByThisUser,
+    -- Aggregated edit activity for the user.
+    COALESCE(ph_user_summary.TotalUserEditEvents, 0) AS TotalUserEditEvents,
+    ph_user_summary.AvgEditContentLength,
+    -- Aggregated comment activity for the user.
+    COALESCE(comm_agg.TotalUserComments, 0) AS TotalUserComments,
+    comm_agg.AvgCommentScore,
+    -- Top tag for the user, derived from RankedUserTags CTE.
+    tgs.TagName AS TopContributingTag,
+    tgs.TagCount AS TopContributingTagCount,
+    -- Correlated subquery: Calculates the average score for answers specifically by this user.
+    (SELECT AVG(sub_p.Score) FROM Posts sub_p WHERE sub_p.OwnerUserId = ue.UserId AND sub_p.PostTypeId = 2 AND sub_p.Score IS NOT NULL) AS AverageAnswerScoreByUser,
+    -- Overall averages from CROSS JOIN for comparison.
+    oa.AvgReputation AS OverallAvgReputation,
+    oa.AvgPostScoreOverall AS OverallAvgPostScore,
+    oa.AvgCommentLengthOverall AS OverallAvgCommentLength,
+    -- Window functions for ranking and percentile grouping.
+    RANK() OVER (ORDER BY ue.Reputation DESC, pa.TotalPostScore DESC) AS GlobalUserRankByActivity,
+    NTILE(10) OVER (ORDER BY (ue.UpVotes - ue.DownVotes) DESC) AS NetVotePowerDecile, -- NTILE for grouping users into deciles
+    LAG(ue.Reputation, 1, 0) OVER (ORDER BY ue.CreationDate) AS PreviousUserReputationByCreationOrder, -- Demonstrates LAG for sequence analysis
+    -- Uncorrelated subquery: Counts posts upvoted by this user.
+    (SELECT COUNT(DISTINCT vp.PostId) FROM Votes vp WHERE vp.UserId = ue.UserId AND vp.VoteTypeId = 2) AS UpvotedPostsCountByUser,
+    -- Complicated predicate/expression: Categorizes users based on multiple criteria.
+    CASE
+        WHEN ue.Reputation >= 20000 AND ue.GoldBadges >= 5 AND pa.QuestionsAsked > 20 AND pa.AnswersProvided > 50 THEN 'Super_Guru_Contributor'
+        WHEN ue.Reputation >= 10000 AND ue.GoldBadges >= 3 AND pa.AnswersProvided > 20 THEN 'HighRep_Experienced_Responder'
+        WHEN ue.Reputation >= 5000 AND pa.QuestionsAsked > 10 THEN 'MidRep_Active_Questioner'
+        WHEN ue.Reputation < 2000 AND ue.UniqueBadgeCount > 5 THEN 'Niche_Contributor'
+        ELSE 'General_User'
+    END AS UserContributionCategory,
+    -- NULL logic and string expression for display location.
+    COALESCE(ue.Location, 'Unspecified Location') AS DisplayLocation,
+    -- Calculation with NULLIF to prevent division by zero.
+    NULLIF(ue.UpVotes, 0)::NUMERIC / NULLIF(ue.UpVotes + ue.DownVotes, 0)::NUMERIC AS NetVoteRatio,
+    -- String expressions: Substring for AboutMe, LOWER and REPLACE for DisplayName slug.
+    SUBSTRING(ue.AboutMe FROM 1 FOR 100) AS AboutMeExcerpt,
+    LOWER(REPLACE(ue.DisplayName, ' ', '-')) AS DisplayNameSlug,
+    -- EXISTS clause with complex conditions demonstrating nested filtering.
+    EXISTS (
+        SELECT 1 FROM Posts p_inner
+        WHERE p_inner.OwnerUserId = ue.UserId
+          AND p_inner.PostTypeId = 1
+          AND p_inner.Tags LIKE '%<sql>%'
+          AND p_inner.ViewCount > 5000
+          AND p_inner.CreationDate > (cast('2024-10-01' as date) - INTERVAL '1 year')
+    ) AS HasRecentHighViewSQLQuestions
+FROM UserEngagement AS ue
+LEFT JOIN PostAggregates AS pa ON ue.UserId = pa.UserId
+-- Join to link accepted answers to their owners
+LEFT JOIN (
+    SELECT
+        p_ans.OwnerUserId AS AnswerOwnerUserId,
+        SUM(aa.QuestionsAcceptedThisAnswerFor) AS TotalAcceptedAnswersContributed
+    FROM AnswerAcceptance aa
+    JOIN Posts p_ans ON aa.AnswerId = p_ans.Id
+    WHERE p_ans.OwnerUserId IS NOT NULL
+    GROUP BY p_ans.OwnerUserId
+) AS accepted_ans_owner ON ue.UserId = accepted_ans_owner.AnswerOwnerUserId
+LEFT JOIN RankedUserTags AS tgs ON ue.UserId = tgs.UserId AND tgs.rn = 1
+-- Derived table to sum up edit events and average content length changes per user
+LEFT JOIN (
+    SELECT
+        phe.EditorUserId AS UserId,
+        SUM(phe.EditEvents) AS TotalUserEditEvents,
+        AVG(phe.AvgBodyContentLengthChange) AS AvgEditContentLength
+    FROM PostHistoryEditAnalysis phe
+    GROUP BY phe.EditorUserId
+) AS ph_user_summary ON ue.UserId = ph_user_summary.UserId
+-- Derived table for user comment aggregates
+LEFT JOIN (
+    SELECT
+        c.UserId,
+        COUNT(c.Id) AS TotalUserComments,
+        AVG(CAST(c.Score AS NUMERIC)) AS AvgCommentScore
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+    GROUP BY c.UserId
+) AS comm_agg ON ue.UserId = comm_agg.UserId
+CROSS JOIN OverallAverages AS oa -- Cross join to bring in overall averages for comparison
+WHERE
+    ue.AccountActiveDays > 90 -- Users active for at least 3 months
+    -- Complex predicate with NULL logic and multiple string pattern matches
+    AND (ue.Location IS NOT NULL AND (ue.Location ILIKE '%Europe%' OR ue.Location ILIKE '%America%' OR ue.Location ILIKE '%Asia%'))
+    -- NULL logic: User must have either provided answers OR have a significant number of gold badges
+    AND (pa.AnswersProvided IS NOT NULL AND pa.AnswersProvided > 0 OR ue.GoldBadges > 2)
+    AND ue.Reputation >= 1500 -- More stringent reputation filter for final results
+ORDER BY
+    GlobalUserRankByActivity ASC, ue.Reputation DESC, AcceptedAnswersContributedByThisUser DESC
+LIMIT 5000;

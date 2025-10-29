@@ -1,0 +1,175 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT t.Id, t.TagName, t.Count, 0 AS Level
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+    UNION ALL
+    SELECT t.Id, t.TagName, t.Count, rth.Level + 1
+    FROM Tags t
+    INNER JOIN RecursiveTagHierarchy rth ON t.Id = rth.Id
+    WHERE rth.Level < 3
+),
+UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Elite'
+            WHEN u.Reputation >= 1000 THEN 'Veteran'
+            WHEN u.Reputation >= 100 THEN 'Regular'
+            ELSE 'Newbie'
+        END AS UserTier,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Tags,
+        p.OwnerUserId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END AS PostType,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        COALESCE(p.CommentCount, 0) AS CommentCount,
+        COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+            WHEN p.Score > 10 THEN 'Highly Rated'
+            ELSE 'Normal'
+        END AS PostStatus,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) AS ScoreRank,
+        COUNT(*) OVER () AS TotalPosts,
+        LAG(p.Score, 1, 0) OVER (ORDER BY p.CreationDate) AS PrevScore,
+        LEAD(p.Score, 1, 0) OVER (ORDER BY p.CreationDate) AS NextScore
+    FROM Posts p
+),
+ComplexTagAnalysis AS (
+    SELECT 
+        pa.PostId,
+        pa.Title,
+        pa.Score,
+        pa.Tags,
+        COALESCE(
+          STRING_AGG(t.TagName, ', '),
+          'No Tags'
+        ) AS TagList,
+        ARRAY_REMOVE(STRING_TO_ARRAY(COALESCE(pa.Tags, ''), '><'), '') AS TagArray,
+        (SELECT COUNT(*) FROM UNNEST(STRING_TO_ARRAY(COALESCE(pa.Tags, ''), '><')) AS tag(val) WHERE val <> '') AS TagCount,
+        CASE 
+            WHEN EXISTS (
+                SELECT 1 FROM UNNEST(STRING_TO_ARRAY(COALESCE(pa.Tags, ''), '><')) AS tag(val) WHERE UPPER(val) LIKE UPPER('%sql%')
+            ) THEN 'SQL Related'
+            ELSE 'Other'
+        END AS TechCategory,
+        ROW_NUMBER() OVER (PARTITION BY pa.OwnerUserId ORDER BY pa.Score DESC) AS UserPostRank,
+        pa.OwnerUserId
+    FROM PostAnalysis pa
+    LEFT JOIN LATERAL (
+        SELECT t.TagName
+        FROM Tags t
+        WHERE t.TagName IN (
+            SELECT val FROM UNNEST(STRING_TO_ARRAY(COALESCE(pa.Tags, ''), '><')) AS tag(val) WHERE val <> ''
+        )
+    ) t ON TRUE
+    GROUP BY pa.PostId, pa.Title, pa.Score, pa.Tags, pa.OwnerUserId
+)
+SELECT 
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.UserTier,
+    uas.ReputationRank,
+    uas.PostCount,
+    uas.CommentCount,
+    uas.BadgeCount,
+    uas.AvgPostScore,
+    uas.LastPostDate,
+    STRING_AGG(cta.Title, '; ') FILTER (WHERE cta.Score > 5) AS HighScoredPosts,
+    STRING_AGG(cta.TagList, '; ') AS AllTags,
+    COUNT(*) FILTER (WHERE cta.TechCategory = 'SQL Related') AS SqlRelatedPosts,
+    COUNT(*) FILTER (WHERE cta.Score <= 0 + 0) AS Top10ScoredPosts, -- placeholder safe expression; adjusted below
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.CreationDate >= DATE '2022-01-01') AS RecentPosts,
+    COALESCE(
+        (SELECT STRING_AGG('Badge: ' || b.Name || ' (' || CAST(b.Date AS VARCHAR) || ')', ', ')
+         FROM Badges b 
+         WHERE b.UserId = uas.UserId 
+           AND b.Date >= DATE '2022-01-01'
+         ORDER BY b.Date DESC
+         LIMIT 5),
+        'No recent badges'
+    ) AS RecentBadges,
+    CASE 
+        WHEN uas.PostCount > 50 AND uas.BadgeCount > 10 THEN 'Active Contributor'
+        WHEN uas.PostCount > 20 THEN 'Regular Poster'
+        WHEN uas.PostCount > 5 THEN 'Occasional Poster'
+        ELSE 'New User'
+    END AS ActivityLevel,
+    (SELECT COUNT(DISTINCT ph.PostId) 
+     FROM PostHistory ph 
+     WHERE ph.UserId = uas.UserId 
+       AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)) AS EditActivity,
+    COALESCE(
+        (SELECT AVG(p.Score) 
+         FROM Posts p 
+         WHERE p.OwnerUserId = uas.UserId 
+           AND p.PostTypeId = 1), 
+        0
+    ) AS AvgQuestionScore,
+    COALESCE(
+        (SELECT AVG(p.Score) 
+         FROM Posts p 
+         WHERE p.OwnerUserId = uas.UserId 
+           AND p.PostTypeId = 2), 
+        0
+    ) AS AvgAnswerScore
+FROM UserActivityStats uas
+LEFT JOIN ComplexTagAnalysis cta ON uas.UserId = cta.OwnerUserId
+WHERE 
+    uas.Reputation > 100
+    AND uas.PostCount > 1
+    AND (
+        cta.Tags IS NOT NULL 
+        OR EXISTS (
+            SELECT 1 FROM Posts p 
+            WHERE p.OwnerUserId = uas.UserId 
+              AND p.PostTypeId IN (1, 2)
+        )
+    )
+GROUP BY 
+    uas.UserId, 
+    uas.DisplayName, 
+    uas.Reputation, 
+    uas.UserTier, 
+    uas.ReputationRank, 
+    uas.PostCount, 
+    uas.CommentCount, 
+    uas.BadgeCount, 
+    uas.AvgPostScore, 
+    uas.LastPostDate
+HAVING 
+    COUNT(cta.PostId) > 0
+ORDER BY 
+    uas.Reputation DESC,
+    uas.PostCount DESC
+LIMIT 50;

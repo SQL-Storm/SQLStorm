@@ -1,0 +1,191 @@
+WITH UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.UpVotes AS TotalUpVotesGiven,
+        u.DownVotes AS TotalDownVotesGiven,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(p.CreationDate) AS LatestPostDate,
+        MAX(c.CreationDate) AS LatestCommentDate,
+        (u.UpVotes * 1.0 / NULLIF(u.UpVotes + u.DownVotes, 0)) AS UserVoteRatio,
+        ROW_NUMBER() OVER (PARTITION BY EXTRACT(MONTH FROM u.CreationDate) ORDER BY u.Reputation DESC, u.LastAccessDate DESC) AS MonthlyReputationRank
+    FROM
+        Users AS u
+    LEFT JOIN
+        Posts AS p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Comments AS c ON u.Id = c.UserId
+    WHERE
+        u.Reputation > 1000
+        AND u.LastAccessDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')
+        AND (u.DisplayName IS NOT NULL AND LENGTH(TRIM(u.DisplayName)) > 0)
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.UpVotes, u.DownVotes
+),
+QuestionPerformance AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.OwnerUserId,
+        q.Title,
+        q.CreationDate AS QuestionCreationDate,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        q.FavoriteCount,
+        q.ClosedDate,
+        COALESCE(SUM(a.Score), 0) AS TotalAnswerScore,
+        COUNT(a.Id) AS ActualAnswerCount,
+        AVG(LENGTH(a.Body)) AS AvgAnswerBodyLength,
+        MAX(a.CreationDate) AS LatestAnswerDate,
+        ARRAY_AGG(DISTINCT t.TagName) FILTER (WHERE t.TagName IS NOT NULL) AS QuestionTagsArray,
+        CASE
+            WHEN q.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN q.AcceptedAnswerId IS NOT NULL THEN 'Answered & Accepted'
+            WHEN q.AnswerCount > 0 THEN 'Answered'
+            ELSE 'Open'
+        END AS QuestionStatus,
+        DENSE_RANK() OVER (ORDER BY q.ViewCount DESC, q.Score DESC) AS ViewScoreRank
+    FROM
+        Posts AS q
+    LEFT JOIN
+        Posts AS a ON q.Id = a.ParentId AND a.PostTypeId = 2
+    LEFT JOIN
+        (SELECT
+            p_tags.Id AS PostId,
+            UNNEST(string_to_array(SUBSTRING(p_tags.Tags FROM 2 FOR LENGTH(p_tags.Tags) - 2), '><')) AS TagName
+         FROM Posts AS p_tags
+         WHERE p_tags.PostTypeId = 1 AND p_tags.Tags IS NOT NULL
+        ) AS post_tag_unnest ON q.Id = post_tag_unnest.PostId
+    LEFT JOIN
+        Tags AS t ON post_tag_unnest.TagName = t.TagName
+    WHERE
+        q.PostTypeId = 1
+        AND q.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years')
+    GROUP BY
+        q.Id, q.OwnerUserId, q.Title, q.CreationDate, q.Score, q.ViewCount, q.AnswerCount, q.FavoriteCount, q.ClosedDate, q.AcceptedAnswerId
+    HAVING
+        q.Score > 5 OR q.ViewCount > 100
+),
+UserPostAndBadgeHistory AS (
+    SELECT
+        ph.UserId,
+        ph.PostId,
+        ph.CreationDate AS EventDate,
+        ph.PostHistoryTypeId,
+        pht.Name AS EventTypeName,
+        CR.Name AS CloseReasonName,
+        (SELECT COUNT(DISTINCT pl.RelatedPostId) FROM PostLinks AS pl WHERE pl.PostId = ph.PostId AND pl.LinkTypeId = 3) AS DuplicateLinkCount,
+        NULL AS BadgeName,
+        NULL AS BadgeClass,
+        'PostHistoryEvent' AS RecordSource
+    FROM
+        PostHistory AS ph
+    LEFT JOIN
+        PostHistoryTypes AS pht ON ph.PostHistoryTypeId = pht.Id
+    LEFT JOIN
+        CloseReasonTypes AS CR ON
+            ph.PostHistoryTypeId = 10 AND
+            CR.Id = CAST(SUBSTRING(ph.Comment FROM '^\d+') AS smallint)
+    WHERE
+        ph.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')
+    UNION ALL
+    SELECT
+        b.UserId,
+        NULL AS PostId,
+        b.Date AS EventDate,
+        NULL AS PostHistoryTypeId,
+        'Badge Awarded' AS EventTypeName,
+        NULL AS CloseReasonName,
+        NULL AS DuplicateLinkCount,
+        b.Name AS BadgeName,
+        b.Class AS BadgeClass,
+        'BadgeAwardEvent' AS RecordSource
+    FROM
+        Badges AS b
+    WHERE
+        b.Class IN (1, 2)
+)
+SELECT
+    ue.UserId,
+    ue.DisplayName,
+    ue.Reputation,
+    qp.QuestionId,
+    qp.Title AS QuestionTitle,
+    qp.QuestionCreationDate,
+    qp.QuestionScore,
+    qp.ViewCount,
+    qp.QuestionStatus,
+    qp.TotalAnswerScore,
+    qp.ActualAnswerCount,
+    COALESCE(qp.AvgAnswerBodyLength, 0) AS AverageAnswerBodyLength,
+    ue.TotalPosts,
+    ue.TotalQuestions,
+    ue.TotalAnswers,
+    ue.TotalComments,
+    ue.UserVoteRatio,
+    ue.MonthlyReputationRank,
+    SUM(CASE WHEN upbh.BadgeClass = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+    SUM(CASE WHEN upbh.BadgeClass = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+    COUNT(DISTINCT CASE WHEN upbh.EventTypeName = 'Post Closed' AND upbh.PostId = qp.QuestionId THEN upbh.PostId END) AS QuestionsClosedByOrAboutUser,
+    MAX(upbh.EventDate) AS LastHistoryEvent,
+    AVG(CASE WHEN upbh.CloseReasonName IS NOT NULL AND upbh.PostId = qp.QuestionId THEN 1.0 ELSE 0.0 END) FILTER (WHERE upbh.UserId IS NOT NULL) OVER (PARTITION BY ue.UserId) AS UserClosedQuestionRatio,
+    (SELECT
+        COUNT(DISTINCT c.Id)
+     FROM Comments AS c
+     WHERE c.PostId = qp.QuestionId
+       AND c.CreationDate > (qp.QuestionCreationDate + INTERVAL '1 day')
+       AND c.UserId = ue.UserId
+       AND c.Text LIKE '%bug%'
+    ) AS UserBugCommentsOnQuestion,
+    (SELECT
+        COUNT(DISTINCT p_inner.Id)
+     FROM Posts AS p_inner
+     WHERE p_inner.ParentId = qp.QuestionId
+       AND p_inner.OwnerUserId IS NOT NULL
+       AND p_inner.OwnerUserId != ue.UserId
+       AND p_inner.Score > qp.QuestionScore * 0.5
+    ) AS HighScoringAnswersByOthers,
+    CASE
+        WHEN ue.Reputation > 50000 AND ue.TotalQuestions > 100 AND ue.UserVoteRatio > 0.8 THEN 'High-Impact Expert'
+        WHEN ue.Reputation > 10000 AND ue.TotalAnswers > 50 AND qp.QuestionScore > 10 THEN 'Valuable Contributor'
+        WHEN qp.QuestionStatus = 'Closed' AND ue.TotalComments > 50 THEN 'Engaged but Troubled'
+        ELSE 'General Participant'
+    END AS UserQuestionSegment,
+    NTILE(5) OVER (ORDER BY qp.ViewCount DESC, qp.QuestionScore DESC) AS ViewScoreQuintile
+FROM
+    UserEngagement AS ue
+INNER JOIN
+    QuestionPerformance AS qp ON ue.UserId = qp.OwnerUserId
+LEFT JOIN
+    UserPostAndBadgeHistory AS upbh ON ue.UserId = upbh.UserId AND (qp.QuestionId = upbh.PostId OR upbh.PostId IS NULL)
+WHERE
+    (qp.QuestionTagsArray IS NOT NULL AND ('javascript' = ANY(qp.QuestionTagsArray) OR 'python' = ANY(qp.QuestionTagsArray)))
+    AND ue.TotalPosts > 5
+    AND ue.UserVoteRatio IS NOT NULL AND ue.UserVoteRatio > 0.5
+    AND qp.QuestionCreationDate < ue.LastAccessDate
+    AND qp.ClosedDate IS NULL
+    AND NOT EXISTS (
+        SELECT 1
+        FROM PostHistory AS ph_ne
+        WHERE ph_ne.PostId = qp.QuestionId
+          AND ph_ne.PostHistoryTypeId IN (12, 18)
+          AND ph_ne.CreationDate > qp.QuestionCreationDate
+    )
+GROUP BY
+    ue.UserId, ue.DisplayName, ue.Reputation, qp.QuestionId, qp.Title, qp.QuestionCreationDate,
+    qp.QuestionScore, qp.ViewCount, qp.QuestionStatus, qp.TotalAnswerScore, qp.ActualAnswerCount,
+    qp.AvgAnswerBodyLength, ue.TotalPosts, ue.TotalQuestions, ue.TotalAnswers, ue.TotalComments,
+    ue.UserVoteRatio, ue.MonthlyReputationRank, ue.LastAccessDate, ue.LastAccessDate, qp.TotalAnswerScore
+HAVING
+    SUM(CASE WHEN upbh.BadgeClass = 1 THEN 1 ELSE 0 END) >= 1
+    OR SUM(qp.TotalAnswerScore) > 100
+ORDER BY
+    ue.Reputation DESC, qp.ViewCount DESC, ue.LastAccessDate DESC
+LIMIT 500;

@@ -1,0 +1,110 @@
+-- {"query": "3475.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1927} 
+
+/*  Benchmark query – combines CTEs, window functions, outer joins, 
+    correlated subqueries, set operators, string handling and NULL logic   */
+WITH recent_questions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId
+                           ORDER BY p.CreationDate DESC) AS rn_user_q
+    FROM Posts p
+    WHERE p.PostTypeId = 1                -- only questions
+      AND p.CreationDate > CURRENT_DATE - INTERVAL '180 days'
+),
+user_stats AS (
+    SELECT
+        u.Id               AS user_id,
+        COALESCE(u.DisplayName,'Anonymous') AS display_name,
+        COALESCE(u.Reputation,0)           AS reputation,
+        SUM(CASE WHEN vt.VoteTypeId = 2 THEN 1      -- upvote
+                 WHEN vt.VoteTypeId = 3 THEN -1     -- downvote
+                 ELSE 0 END)                     AS net_votes,
+        COUNT(b.Id)                         AS badge_count
+    FROM Users u
+    LEFT JOIN Votes vt
+           ON vt.UserId = u.Id
+    LEFT JOIN Badges b
+           ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+question_tags AS (
+    SELECT
+        p.Id                AS qid,
+        string_agg(t.TagName, ', ' ORDER BY t.TagName) AS tags_csv,
+        COUNT(*)            AS tagcnt
+    FROM Posts p
+    CROSS JOIN LATERAL (
+        SELECT trim(both '<>' FROM unnest(string_to_array(p.Tags,'><'))) AS tag
+    ) AS tag_raw
+    JOIN Tags t
+      ON t.TagName = tag_raw.tag
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id
+),
+last_title_edits AS (
+    SELECT DISTINCT ON (ph.PostId)
+        ph.PostId,
+        ph.Text               AS last_title_edit,
+        ph.CreationDate       AS edit_date
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 4      -- Edit Title
+    ORDER BY ph.PostId, ph.CreationDate DESC
+),
+positive_comment_counts AS (
+    SELECT
+        c.PostId,
+        COUNT(*) FILTER (WHERE c.Score > 0) AS pos_comments
+    FROM Comments c
+    GROUP BY c.PostId
+)
+SELECT
+    rq.Id                               AS question_id,
+    rq.Title,
+    rq.CreationDate,
+    rq.Score,
+    rq.ViewCount,
+    us.display_name                     AS owner_name,
+    us.reputation,
+    us.net_votes,
+    us.badge_count,
+    CASE WHEN rq.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END   AS has_accepted_answer,
+    COALESCE(qt.tags_csv,'')            AS tags,
+    qt.tagcnt                           AS distinct_tag_count,
+    COALESCE(pce.pos_comments,0)        AS positive_comment_count,
+    lte.last_title_edit,
+    ROW_NUMBER() OVER (ORDER BY rq.Score DESC, rq.ViewCount DESC) AS rank_by_score
+FROM recent_questions rq
+LEFT JOIN user_stats us
+       ON us.user_id = rq.OwnerUserId
+LEFT JOIN question_tags qt
+       ON qt.qid = rq.Id
+LEFT JOIN positive_comment_counts pce
+       ON pce.PostId = rq.Id
+LEFT JOIN last_title_edits lte
+       ON lte.PostId = rq.Id
+WHERE rq.rn_user_q <= 5                                   -- top‑5 recent per user
+  AND (rq.ViewCount IS NULL OR rq.ViewCount > 100)       -- filter on views
+  AND (us.reputation IS NULL OR us.reputation >= 1000)   -- filter on reputation
+  AND EXISTS (SELECT 1
+                FROM PostLinks pl
+               WHERE pl.PostId = rq.Id
+                 AND pl.LinkTypeId = 1)                  -- has a linked post
+  AND NOT EXISTS (SELECT 1
+                    FROM Votes v
+                   WHERE v.PostId = rq.Id
+                     AND v.VoteTypeId = 10)               -- not deleted
+UNION ALL
+/* Dummy row to force a set‑operator branch and add overhead */
+SELECT
+    NULL, NULL, NULL, NULL, NULL,
+    NULL, NULL, NULL, NULL,
+    NULL, NULL, NULL, NULL, NULL,
+    NULL
+LIMIT 0
+ORDER BY rank_by_score;

@@ -1,0 +1,149 @@
+-- {"query": "3826.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2360} 
+
+WITH
+-- Aggregate badge counts per user
+badge_agg AS (
+    SELECT
+        UserId,
+        SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS gold_cnt,
+        SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS silver_cnt,
+        SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS bronze_cnt
+    FROM Badges
+    GROUP BY UserId
+),
+
+-- Core user statistics
+user_stats AS (
+    SELECT
+        u.Id                       AS user_id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(b.gold_cnt,   0)   AS gold_badges,
+        COALESCE(b.silver_cnt, 0)   AS silver_badges,
+        COALESCE(b.bronze_cnt, 0)   AS bronze_badges,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS question_cnt,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS answer_cnt,
+        (SELECT MAX(CreationDate) FROM Posts p WHERE p.OwnerUserId = u.Id) AS last_post_dt
+    FROM Users u
+    LEFT JOIN badge_agg b ON b.UserId = u.Id
+),
+
+-- Top users based on reputation and gold badges
+top_users AS (
+    SELECT
+        *,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, gold_badges DESC) AS rn
+    FROM user_stats
+    WHERE Reputation > 10000
+),
+
+-- Recent activity per user (votes, comments, post‑history)
+recent_activity AS (
+    SELECT
+        u.Id                              AS user_id,
+        MAX(v.CreationDate)               AS last_vote_dt,
+        MAX(c.CreationDate)               AS last_comment_dt,
+        MAX(ph.CreationDate)              AS last_history_dt
+    FROM Users u
+    LEFT JOIN Votes v      ON v.UserId = u.Id
+    LEFT JOIN Comments c   ON c.UserId = u.Id
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+    GROUP BY u.Id
+),
+
+-- Best answer per user (ranked by score then recency)
+answer_perf AS (
+    SELECT
+        a.OwnerUserId                AS user_id,
+        a.Id                         AS answer_id,
+        a.ParentId                   AS question_id,
+        a.Score,
+        a.CreationDate,
+        q.Title,
+        q.Tags,
+        ROW_NUMBER() OVER (PARTITION BY a.OwnerUserId ORDER BY a.Score DESC, a.CreationDate DESC) AS ans_rank,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = a.Id AND v.VoteTypeId = 2) AS up_votes,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = a.Id AND v.VoteTypeId = 3) AS down_votes,
+        CASE WHEN a.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS is_accepted
+    FROM Posts a
+    JOIN Posts q ON q.Id = a.ParentId AND q.PostTypeId = 1
+    WHERE a.PostTypeId = 2
+),
+
+-- Tag‑level aggregates (used for string expression demo)
+tag_stats AS (
+    SELECT
+        t.TagName,
+        COUNT(p.Id)                             AS post_cnt,
+        AVG(p.Score)                            AS avg_score,
+        STRING_AGG(DISTINCT u.DisplayName, ', ') FILTER (WHERE u.Reputation > 50000) AS high_rep_users
+    FROM Tags t
+    JOIN Posts p ON p.Tags LIKE concat('%<', t.TagName, '>%')
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    GROUP BY t.TagName
+    HAVING COUNT(p.Id) > 100
+),
+
+-- Combine everything
+combined AS (
+    SELECT
+        tu.user_id,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.gold_badges,
+        tu.silver_badges,
+        tu.bronze_badges,
+        tu.question_cnt,
+        tu.answer_cnt,
+        tu.last_post_dt,
+        ra.last_vote_dt,
+        ra.last_comment_dt,
+        ra.last_history_dt,
+        ap.answer_id,
+        ap.question_id,
+        ap.Score               AS answer_score,
+        ap.Title               AS question_title,
+        ap.Tags                AS question_tags,
+        ap.ans_rank,
+        ap.up_votes,
+        ap.down_votes,
+        ap.is_accepted
+    FROM top_users tu
+    LEFT JOIN recent_activity ra ON ra.user_id = tu.user_id
+    LEFT JOIN answer_perf ap     ON ap.user_id = tu.user_id AND ap.ans_rank = 1
+)
+
+SELECT *
+FROM combined
+WHERE
+      (Reputation > 20000 OR gold_badges > 5)
+  AND (last_vote_dt IS NOT NULL OR last_comment_dt IS NOT NULL)
+  AND (answer_score IS NOT NULL AND answer_score >= 10)
+ORDER BY Reputation DESC, answer_score DESC
+
+UNION ALL
+
+-- Ensure a row is always returned even if the above yields nothing
+SELECT
+    NULL::int AS user_id,
+    NULL::varchar AS DisplayName,
+    NULL::int AS Reputation,
+    NULL::int AS gold_badges,
+    NULL::int AS silver_badges,
+    NULL::int AS bronze_badges,
+    NULL::int AS question_cnt,
+    NULL::int AS answer_cnt,
+    NULL::timestamp AS last_post_dt,
+    NULL::timestamp AS last_vote_dt,
+    NULL::timestamp AS last_comment_dt,
+    NULL::timestamp AS last_history_dt,
+    NULL::int AS answer_id,
+    NULL::int AS question_id,
+    NULL::int AS answer_score,
+    NULL::varchar AS question_title,
+    NULL::varchar AS question_tags,
+    NULL::int AS ans_rank,
+    NULL::int AS up_votes,
+    NULL::int AS down_votes,
+    NULL::int AS is_accepted
+WHERE NOT EXISTS (SELECT 1 FROM combined);

@@ -1,0 +1,64 @@
+SELECT 
+    u.DisplayName, 
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    MAX(p.Score) AS HighestScoredPost,
+    MIN(p.CreationDate) AS FirstPostDate,
+    MAX(p.LastActivityDate) AS LastActivityDate,
+    b.Name AS LatestBadge,
+    v.VotedName AS MostVotedType,
+    t.TagName AS MostUsedTag
+FROM 
+    Users u
+LEFT JOIN LATERAL
+    (SELECT Name, Date
+     FROM Badges
+     WHERE UserId = u.Id
+     ORDER BY Date DESC
+     LIMIT 1) b ON TRUE
+LEFT JOIN 
+    (SELECT 
+        UserId, 
+        MAX(CASE WHEN VoteTypeId = 1 THEN CAST(Name AS VARCHAR) END) AS VotedName,
+        MAX(CASE WHEN VoteTypeId = 1 THEN CreationDate END) AS VotedDate
+     FROM 
+        Votes
+     GROUP BY 
+        UserId) v ON v.UserId = u.Id
+LEFT JOIN 
+    (SELECT 
+        OwnerUserId, 
+        STRING_AGG(Tags, ', ') AS Tags
+     FROM 
+        Posts
+     WHERE 
+        PostTypeId = 1
+     GROUP BY 
+        OwnerUserId) ptags ON ptags.OwnerUserId = u.Id
+LEFT JOIN 
+    Posts p ON p.OwnerUserId = u.Id
+LEFT JOIN LATERAL
+    (SELECT 
+        TagName, 
+        COUNT(*) AS Count
+     FROM 
+        Tags
+     WHERE TagName IN (
+         SELECT TRIM(value) FROM UNNEST(string_to_array(COALESCE(ptags.Tags, ''), ', ')) AS value
+     )
+     GROUP BY 
+        TagName
+     ORDER BY 
+        Count DESC 
+     LIMIT 1) t ON ptags.Tags IS NOT NULL AND ptags.Tags <> ''
+WHERE 
+    u.Reputation > 1000
+    AND p.CreationDate >= DATE_TRUNC('month', CAST('2024-10-01' AS DATE)) - INTERVAL '1 year'
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation, b.Name, v.VotedName, t.TagName
+HAVING 
+    COUNT(DISTINCT p.Id) > 10
+ORDER BY 
+    u.Reputation DESC;

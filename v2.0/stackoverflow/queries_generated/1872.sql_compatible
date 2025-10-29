@@ -1,0 +1,194 @@
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate,
+        U.UpVotes,
+        U.DownVotes,
+        COALESCE(COUNT(DISTINCT B.Id), 0) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.TagBased = TRUE THEN 1 ELSE 0 END) AS TagBadges,
+        COALESCE(AVG(CASE WHEN P.PostTypeId = 1 THEN P.Score END), 0) AS AvgQuestionScore,
+        COALESCE(SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END), 0) AS TotalQuestions,
+        COALESCE(COUNT(C.Id), 0) AS TotalComments,
+        (U.UpVotes - U.DownVotes) AS NetVotes,
+        CASE
+            WHEN U.Reputation >= 15000 AND SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) >= 10 THEN 'Legend'
+            WHEN U.Reputation >= 7500 AND COUNT(DISTINCT B.Id) >= 20 THEN 'Guru'
+            WHEN U.Reputation >= 2000 AND COALESCE(SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END), 0) >= 10 THEN 'Contributor'
+            ELSE 'Apprentice'
+        END AS UserTier,
+        U.Location,
+        U.WebsiteUrl
+    FROM Users U
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.UpVotes, U.DownVotes, U.Location, U.WebsiteUrl
+),
+PostMetrics AS (
+    SELECT
+        PQ.Id AS QuestionId,
+        PQ.OwnerUserId AS QuestionOwnerId,
+        PQ.CreationDate AS QuestionCreationDate,
+        PQ.Score AS QuestionScore,
+        PQ.ViewCount,
+        PQ.AnswerCount AS DeclaredAnswerCount,
+        PQ.FavoriteCount,
+        PQ.Title,
+        PQ.Tags,
+        COALESCE(SUM(CASE WHEN PA.Id IS NOT NULL THEN PA.Score ELSE 0 END), 0) AS TotalAnswersScore,
+        COALESCE(SUM(CASE WHEN PA.Id IS NOT NULL THEN 1 ELSE 0 END), 0) AS ActualAnswerCount,
+        MIN(PA.CreationDate) FILTER (WHERE PA.Id IS NOT NULL) AS FirstAnswerDate,
+        MAX(PA.CreationDate) FILTER (WHERE PA.Id IS NOT NULL) AS LatestAnswerDate,
+        COALESCE(SUM(CASE WHEN PA.Id IS NOT NULL AND PA.Id = PQ.AcceptedAnswerId THEN PA.Score ELSE 0 END), 0) AS AcceptedAnswerScore,
+        (SELECT COUNT(DISTINCT PH.UserId)
+         FROM PostHistory PH
+         WHERE PH.PostId = PQ.Id
+           AND PH.PostHistoryTypeId IN (4, 5, 6, 8, 9)
+           AND PH.CreationDate > PQ.CreationDate) AS EditorCount,
+        (SELECT MIN(PH.CreationDate)
+         FROM PostHistory PH
+         WHERE PH.PostId = PQ.Id
+           AND PH.PostHistoryTypeId = 10
+        ) AS FirstClosedDate,
+        (SELECT MIN(PH_Min.CreationDate) FROM PostHistory PH_Min WHERE PH_Min.PostId = PQ.Id) AS FirstHistoryEventDate,
+        (SELECT MAX(PH_Max.CreationDate) FROM PostHistory PH_Max WHERE PH_Max.PostId = PQ.Id) AS LastHistoryEventDate,
+        ROW_NUMBER() OVER (PARTITION BY PQ.OwnerUserId ORDER BY PQ.CreationDate DESC) AS UserQuestionRankDesc,
+        DENSE_RANK() OVER (ORDER BY PQ.ViewCount DESC, PQ.Score DESC) AS GlobalViewRank,
+        RANK() OVER (PARTITION BY PQ.OwnerUserId ORDER BY PQ.Score DESC) AS UserScoreRank,
+        PQ.AcceptedAnswerId
+    FROM Posts PQ
+    LEFT JOIN Posts PA ON PQ.Id = PA.ParentId AND PA.PostTypeId = 2
+    WHERE PQ.PostTypeId = 1
+    GROUP BY PQ.Id, PQ.OwnerUserId, PQ.CreationDate, PQ.Score, PQ.ViewCount, PQ.AnswerCount, PQ.FavoriteCount, PQ.Title, PQ.Tags, PQ.AcceptedAnswerId
+),
+PostInteractionTimeline AS (
+    SELECT
+        PH.PostId,
+        PH.PostHistoryTypeId,
+        PHT.Name AS HistoryTypeName,
+        PH.CreationDate AS EventDate,
+        PH.UserId AS EventUserId,
+        LAG(PH.CreationDate) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) AS PreviousEventDate,
+        EXTRACT(EPOCH FROM (PH.CreationDate - LAG(PH.CreationDate) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate))) / 3600.0 AS HoursSincePreviousEvent,
+        ROW_NUMBER() OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate DESC) AS LastEventForPostRank,
+        ROW_NUMBER() OVER (PARTITION BY PH.PostId, PH.PostHistoryTypeId ORDER BY PH.CreationDate DESC) AS LatestEventTypeRank,
+        (SELECT Name FROM CloseReasonTypes CRT WHERE CRT.Id = CAST(PH.Comment AS INTEGER) AND PH.PostHistoryTypeId = 10) AS CloseReasonName
+    FROM PostHistory PH
+    JOIN PostHistoryTypes PHT ON PH.PostHistoryTypeId = PHT.Id
+    WHERE PH.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 10, 11, 12, 13, 16, 35, 36)
+),
+QuestionTagAnalysis AS (
+    SELECT
+        PM.QuestionId,
+        ARRAY_AGG(T.TagName) FILTER (WHERE T.Count > 5000) AS PopularTagsOnQuestion,
+        COUNT(T.Id) AS TotalTagsOnQuestion,
+        SUM(T.Count) AS SumOfTagCounts,
+        SUM(CASE WHEN T.IsRequired = TRUE THEN 1 ELSE 0 END) AS RequiredTagCount
+    FROM PostMetrics PM
+    JOIN Tags T ON T.TagName = ANY(string_to_array(SUBSTRING(PM.Tags FROM 2 FOR (CHAR_LENGTH(PM.Tags)-2)), '><'))
+    GROUP BY PM.QuestionId
+)
+SELECT
+    UE.UserId,
+    UE.DisplayName,
+    UE.Reputation,
+    UE.UserTier,
+    PM.QuestionId,
+    PM.QuestionCreationDate,
+    PM.Title,
+    PM.QuestionScore,
+    PM.ViewCount,
+    PM.ActualAnswerCount AS RealAnswerCount,
+    PM.TotalAnswersScore,
+    PM.AcceptedAnswerScore,
+    PM.EditorCount,
+    PM.GlobalViewRank,
+    PM.UserQuestionRankDesc,
+    PM.UserScoreRank,
+    COALESCE(PL.DuplicateCount, 0) AS NumberOfDuplicates,
+    COALESCE(PIT_Closed.CloseReasonName, 'N/A') AS QuestionCloseReason,
+    COALESCE(EXTRACT(EPOCH FROM (PM.FirstAnswerDate - PM.QuestionCreationDate)) / 3600.0, 0.0) AS TimeToFirstAnswerHours,
+    CASE WHEN UE.DownVotes = 0 THEN NULL ELSE CAST(UE.UpVotes AS NUMERIC) / UE.DownVotes END AS UpDownVoteRatio,
+    UPPER(SUBSTRING(COALESCE(UE.Location, 'Unknown') FROM 1 FOR 15)) AS UserLocationPrefix,
+    LOWER(REPLACE(TRIM(PM.Title), ' ', '-')) AS SlugifiedTitle,
+    CARDINALITY(string_to_array(SUBSTRING(PM.Tags FROM 2 FOR (CHAR_LENGTH(PM.Tags)-2)), '><')) AS TagCount,
+    QTA.PopularTagsOnQuestion,
+    QTA.TotalTagsOnQuestion AS PostTagVariety,
+    COALESCE(QTA.RequiredTagCount, 0) AS CriticalTagsPresent,
+    CASE WHEN UE.WebsiteUrl IS NOT NULL AND UE.WebsiteUrl LIKE 'http%' THEN TRUE ELSE FALSE END AS HasWebsite,
+    (
+        SELECT COUNT(V.Id)
+        FROM Votes V
+        WHERE V.PostId = PM.QuestionId
+          AND V.VoteTypeId = 2
+          AND V.CreationDate >= PM.QuestionCreationDate
+          AND V.CreationDate < (PM.FirstAnswerDate - INTERVAL '1 hour')
+    ) AS UpvotesBeforeFirstAnswer,
+    (
+        SELECT MAX(PIT_Edit.EventDate)
+        FROM PostInteractionTimeline PIT_Edit
+        WHERE PIT_Edit.PostId = PM.QuestionId
+          AND PIT_Edit.PostHistoryTypeId IN (4, 5, 6)
+          AND PIT_Edit.LatestEventTypeRank = 1
+    ) AS LatestEditDate,
+    COALESCE(PIT_LatestEvent.HoursSincePreviousEvent, 0.0) AS HoursSincePenultimateEvent,
+    EXTRACT(DAY FROM (PM.LastHistoryEventDate - PM.FirstHistoryEventDate)) AS DaysSpanOfHistory,
+    (
+        SELECT STRING_AGG(B.Name, '; ')
+        FROM Badges B
+        WHERE (B.UserId = PM.QuestionOwnerId
+           OR (PM.AcceptedAnswerId IS NOT NULL AND B.UserId = (SELECT A.OwnerUserId FROM Posts A WHERE A.Id = PM.AcceptedAnswerId)))
+           AND B.Class = 1
+    ) AS GoldBadgesFromQuestionContributors,
+    (
+        SELECT SUM(C.Score)
+        FROM Comments C
+        JOIN Users CU ON C.UserId = CU.Id
+        WHERE C.PostId = PM.QuestionId AND CU.Reputation > 5000
+    ) AS HighRepUserCommentScore,
+    CASE
+        WHEN PM.AcceptedAnswerScore > 0 AND PM.TotalAnswersScore > 0 THEN
+            (PM.AcceptedAnswerScore * 1.0 / PM.TotalAnswersScore) * PM.QuestionScore + (PM.ViewCount / 100.0)
+        WHEN PM.TotalAnswersScore > 0 THEN
+            (PM.TotalAnswersScore * 0.5 + PM.QuestionScore) / NULLIF(PM.ViewCount, 0)
+        ELSE
+            PM.QuestionScore * 0.1 + PM.ViewCount * 0.01
+    END AS CalculatedEngagementMetric
+FROM UserEngagement UE
+JOIN PostMetrics PM ON UE.UserId = PM.QuestionOwnerId
+LEFT JOIN (
+    SELECT PostId, COUNT(DISTINCT RelatedPostId) AS DuplicateCount
+    FROM PostLinks
+    WHERE LinkTypeId = 3
+    GROUP BY PostId
+) PL ON PM.QuestionId = PL.PostId
+LEFT JOIN (
+    SELECT PostId, CloseReasonName
+    FROM PostInteractionTimeline
+    WHERE LatestEventTypeRank = 1 AND PostHistoryTypeId = 10
+) PIT_Closed ON PM.QuestionId = PIT_Closed.PostId
+LEFT JOIN (
+    SELECT PostId, HoursSincePreviousEvent
+    FROM PostInteractionTimeline
+    WHERE LastEventForPostRank = 2
+) PIT_LatestEvent ON PM.QuestionId = PIT_LatestEvent.PostId
+LEFT JOIN QuestionTagAnalysis QTA ON PM.QuestionId = QTA.QuestionId
+WHERE
+    UE.Reputation > 750
+    AND PM.QuestionScore > 10
+    AND PM.ViewCount > 500
+    AND PM.ActualAnswerCount > 0
+    AND PM.UserQuestionRankDesc <= 3
+    AND PM.UserScoreRank <= 5
+    AND PM.QuestionCreationDate >= DATE '2021-01-01'
+    AND PM.Title IS NOT NULL
+    AND PM.Tags LIKE '%<sql>%'
+    AND UE.UserTier = 'Guru'
+    AND COALESCE(UE.Location, '') <> 'London'
+    AND (PM.FavoriteCount IS NULL OR PM.FavoriteCount >= 2)
+ORDER BY
+    UE.Reputation DESC, PM.GlobalViewRank ASC, PM.QuestionCreationDate DESC, CalculatedEngagementMetric DESC
+LIMIT 2000;

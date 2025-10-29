@@ -1,0 +1,212 @@
+-- {"query": "2757.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1808} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        p.OwnerUserId,
+        p.Id as PostId,
+        p.Score,
+        p.CreationDate,
+        1 as Level
+    from Tags t
+    join Posts p on p.Tags like concat('%<', t.TagName, '>%')
+    where t.IsRequired = 1
+
+    union all
+
+    select
+        t2.Id,
+        t2.TagName,
+        rth.OwnerUserId,
+        rth.PostId,
+        rth.Score,
+        rth.CreationDate,
+        rth.Level + 1
+    from Tags t2
+    join Posts p2 on p2.Tags like concat('%<', t2.TagName, '>%')
+    join RecursiveTagHierarchy rth on p2.OwnerUserId = rth.OwnerUserId and rth.Level < 3
+    where t2.Id <> rth.Id
+),
+UserPostActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        coalesce(sum(p.Score),0) as TotalScore,
+        max(p.CreationDate) as LastPostDate,
+        avg(p.Score) filter (where p.PostTypeId in (1,2)) as AvgPostScore,
+        percentile_cont(0.5) within group (order by p.Score) filter (where p.PostTypeId in (1,2)) as MedianPostScore
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName
+),
+TopPostsWithComments as (
+    select
+        p.Id,
+        p.Title,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        count(distinct c.Id) as CommentCount,
+        string_agg(distinct substring(c.Text from 1 for 30), ' | ' order by c.CreationDate desc) as RecentCommentPreviews
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+    where p.PostTypeId in (1,2)
+    group by p.Id, p.Title, p.PostTypeId, p.Score, p.ViewCount, p.OwnerUserId
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        sum(case when b.Class=1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class=2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class=3 then 1 else 0 end) as BronzeBadges,
+        sum(case when b.TagBased = 1 then 1 else 0 end) as TagBasedBadges,
+        count(*) as TotalBadges
+    from Badges b
+    group by b.UserId
+),
+UserRecentVotes as (
+    select
+        v.UserId,
+        count(*) filter (where v.VoteTypeId = 2 and v.CreationDate > now() - interval '30 day') as RecentUpVotes,
+        count(*) filter (where v.VoteTypeId = 3 and v.CreationDate > now() - interval '30 day') as RecentDownVotes
+    from Votes v
+    where v.UserId is not null
+    group by v.UserId
+),
+UserActivitySummary as (
+    select
+        u.Id as UserId,
+        u.Reputation,
+        u.DisplayName,
+        upa.QuestionCount,
+        upa.AnswerCount,
+        upa.TotalScore,
+        upa.LastPostDate,
+        upa.AvgPostScore,
+        upa.MedianPostScore,
+        ubc.GoldBadges,
+        ubc.SilverBadges,
+        ubc.BronzeBadges,
+        ubc.TagBasedBadges,
+        ubc.TotalBadges,
+        urv.RecentUpVotes,
+        urv.RecentDownVotes,
+        case
+            when u.Views > 0 and upa.TotalScore > 0 then round(cast(upa.TotalScore as numeric) / u.Views, 4)
+            else null
+        end as ScorePerView,
+        row_number() over (order by u.Reputation desc, upa.TotalScore desc) as RankByReputation
+    from Users u
+    left join UserPostActivity upa on upa.UserId = u.Id
+    left join UserBadgeCounts ubc on ubc.UserId = u.Id
+    left join UserRecentVotes urv on urv.UserId = u.Id
+),
+QuestionAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionCreation,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViews,
+        q.OwnerUserId as QuestionOwner,
+        count(a.Id) as AnswerCount,
+        max(a.Score) as HighestAnswerScore,
+        -- Correlated Subquery: find Answer with max score meeting criteria per Question
+        (select a2.Id from Posts a2 where a2.ParentId = q.Id order by a2.Score desc limit 1) as TopAnswerId
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount, q.OwnerUserId
+),
+DuplicateLinkCount as (
+    select
+        pl.PostId,
+        count(*) filter (where pl.LinkTypeId = 3) as DuplicateLinkCount
+    from PostLinks pl
+    group by pl.PostId
+),
+ClosedQuestions as (
+    select
+        ph.PostId,
+        ph.CreationDate as ClosedDate,
+        crt.Name as CloseReason
+    from PostHistory ph
+    left join CloseReasonTypes crt on cast(ph.Comment as int) = crt.Id
+    where ph.PostHistoryTypeId = 10
+),
+FinalUserQuestionAnswerAnalysis as (
+    select
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.QuestionCount,
+        uas.AnswerCount,
+        uas.TotalScore,
+        uas.LastPostDate,
+        uas.AvgPostScore,
+        uas.MedianPostScore,
+        uas.GoldBadges,
+        uas.SilverBadges,
+        uas.BronzeBadges,
+        uas.TagBasedBadges,
+        uas.TotalBadges,
+        uas.RecentUpVotes,
+        uas.RecentDownVotes,
+        uas.ScorePerView,
+        qas.QuestionId,
+        qas.Title,
+        qas.QuestionScore,
+        qas.QuestionViews,
+        qas.AnswerCount as AnswersOnQuestion,
+        qas.HighestAnswerScore,
+        dup.DuplicateLinkCount,
+        cq.ClosedDate,
+        cq.CloseReason,
+        fpc.CommentText
+    from UserActivitySummary uas
+    join QuestionAnswerStats qas on qas.QuestionOwner = uas.UserId
+    left join DuplicateLinkCount dup on dup.PostId = qas.QuestionId
+    left join ClosedQuestions cq on cq.PostId = qas.QuestionId
+    left join lateral (
+        select substring(c.Text from 1 for 60) as CommentText
+        from Comments c
+        where c.PostId = qas.QuestionId
+        order by c.CreationDate desc
+        limit 1
+    ) fpc on true
+    where uas.QuestionCount > 5 and uas.Reputation > 1000
+)
+select
+    UserId,
+    DisplayName,
+    Reputation,
+    QuestionCount,
+    AnswerCount,
+    TotalScore,
+    round(ScorePerView::numeric, 5) as ScorePerView,
+    GoldBadges,
+    SilverBadges,
+    BronzeBadges,
+    TagBasedBadges,
+    TotalBadges,
+    RecentUpVotes,
+    RecentDownVotes,
+    RankByReputation,
+    QuestionId,
+    Title,
+    QuestionScore,
+    QuestionViews,
+    AnswersOnQuestion,
+    HighestAnswerScore,
+    coalesce(DuplicateLinkCount, 0) as DuplicateLinks,
+    ClosedDate,
+    CloseReason,
+    CommentText,
+    row_number() over (partition by UserId order by QuestionScore desc, QuestionViews desc) as QuestionRank
+from FinalUserQuestionAnswerAnalysis
+where (CloseReason is null or CloseReason not ilike '%duplicate%')
+order by RankByReputation, QuestionScore desc, QuestionViews desc
+limit 100;

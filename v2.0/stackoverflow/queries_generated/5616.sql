@@ -1,0 +1,79 @@
+-- {"query": "5616.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 565} 
+WITH
+TopTags AS (
+  SELECT
+    t.TagName,
+    t.Count AS TagCount,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesOnTag,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesOnTag,
+    AVG(p.Score) AS AvgPostScore,
+    COUNT(DISTINCT p.Id) AS PostCount
+  FROM Tags t
+  JOIN Posts p ON t.Id = p.Tags /* assume Tag membership encoded in Tags on Posts for benchmarking */
+  LEFT JOIN Votes v ON p.Id = v.PostId
+  WHERE t.IsModeratorOnly = 0 AND p.PostTypeId IN (1,2)
+  GROUP BY t.TagName, t.Count
+),
+ActivityWindow AS (
+  SELECT
+    p.Id AS PostId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.Title,
+    p.Tags,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate DESC) AS rn_by_owner,
+    LAG(p.LastActivityDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate) AS prev_activity
+  FROM Posts p
+  WHERE p.CreationDate >= NOW() - INTERVAL '180 days'
+),
+Combined AS (
+  SELECT
+    a.PostId,
+    a.CreationDate,
+    a.LastActivityDate,
+    a.Score,
+    a.ViewCount,
+    a.OwnerUserId,
+    a.Title,
+    a.Tags,
+    t.TagName,
+    t.TagCount,
+    t.UpVotesOnTag,
+    t.DownVotesOnTag,
+    t.AvgPostScore,
+    t.PostCount,
+    CASE WHEN a.prev_activity IS NULL THEN 1
+         WHEN a.LastActivityDate > a.prev_activity + INTERVAL '7 days' THEN 2
+         ELSE 3 END AS ActivityTier
+  FROM ActivityWindow a
+  LEFT JOIN TopTags t
+    ON POSITION(t.TagName IN a.Tags) > 0
+),
+Filtered AS (
+  SELECT *
+  FROM Combined
+  WHERE TagName IS NOT NULL
+     OR ActivityTier = 1
+)
+SELECT
+  PostId,
+  OwnerUserId,
+  Title,
+  Tags,
+  CreationDate,
+  LastActivityDate,
+  Score,
+  ViewCount,
+  TagName,
+  TagCount,
+  UpVotesOnTag,
+  DownVotesOnTag,
+  AvgPostScore,
+  PostCount,
+  ActivityTier
+FROM Filtered
+ORDER BY LastActivityDate DESC, Score DESC
+LIMIT 100;

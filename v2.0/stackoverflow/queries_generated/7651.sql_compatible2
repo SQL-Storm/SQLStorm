@@ -1,0 +1,213 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        AVG(p.Score) AS AvgPostScore,
+        STRING_AGG(DISTINCT SUBSTRING(p.Title FROM 1 FOR 50), ', ') AS PostTitles,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+                (COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) * 100.0 / COUNT(DISTINCT p.Id))
+            ELSE 0 
+        END AS QuestionPercentage,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+                (COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) * 100.0 / COUNT(DISTINCT p.Id))
+            ELSE 0 
+        END AS AnswerPercentage
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= TIMESTAMP '2010-01-01'
+    GROUP BY u.Id, u.Reputation, u.DisplayName
+),
+RankedUsers AS (
+    SELECT 
+        uas.*,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, PostCount DESC) AS RankByReputation,
+        DENSE_RANK() OVER (ORDER BY AvgPostScore DESC) AS RankByAvgScore,
+        NTILE(10) OVER (ORDER BY Reputation DESC) AS Quintile
+    FROM UserActivityStats uas
+),
+TopUsersWithBadges AS (
+    SELECT 
+        ru.UserId,
+        ru.DisplayName,
+        ru.Reputation,
+        ru.PostCount,
+        ru.BadgeCount,
+        ru.QuestionPercentage,
+        ru.AnswerPercentage,
+        ru.RankByReputation,
+        (SELECT COUNT(*) 
+         FROM Posts p 
+         WHERE p.OwnerUserId = ru.UserId 
+           AND p.PostTypeId = 1 
+           AND p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year')) AS RecentQuestions,
+        (SELECT COUNT(*) 
+         FROM Posts p 
+         WHERE p.OwnerUserId = ru.UserId 
+           AND p.PostTypeId = 2 
+           AND p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year')) AS RecentAnswers,
+        (SELECT STRING_AGG(b.Name, ', ')
+         FROM Badges b 
+         WHERE b.UserId = ru.UserId 
+           AND b.Date >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 years')) AS RecentBadges
+    FROM RankedUsers ru
+    WHERE ru.RankByReputation <= 50
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        COALESCE(p.AcceptedAnswerId, 0) AS HasAcceptedAnswer,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostType,
+        CASE 
+            WHEN p.ViewCount > 1000 THEN 'High'
+            WHEN p.ViewCount > 500 THEN 'Medium'
+            ELSE 'Low'
+        END AS ViewCategory,
+        LENGTH(p.Body) AS BodyLength,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND LENGTH(p.Tags) > 0 THEN 
+                (LENGTH(p.Tags) - LENGTH(REPLACE(p.Tags, '>', '')) + 1)
+            ELSE 0
+        END AS TagCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserPostRank,
+        ROW_NUMBER() OVER (ORDER BY p.Score DESC) AS ScoreRank,
+        LAG(p.Score, 1) OVER (ORDER BY p.CreationDate) AS PreviousScore,
+        LEAD(p.Score, 1) OVER (ORDER BY p.CreationDate) AS NextScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING) AS MovingAvgScore,
+        MIN(p.CreationDate) OVER (PARTITION BY p.OwnerUserId) AS UserFirstPostDate,
+        MAX(p.CreationDate) OVER (PARTITION BY p.OwnerUserId) AS UserLastPostDate,
+        (EXTRACT(EPOCH FROM (MAX(p.CreationDate) OVER (PARTITION BY p.OwnerUserId) - MIN(p.CreationDate) OVER (PARTITION BY p.OwnerUserId))) / 86400) + 1 AS UserActivityDays,
+        COALESCE(
+            (SELECT COUNT(*) 
+             FROM Comments c 
+             WHERE c.PostId = p.Id 
+               AND c.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30 days')), 
+            0) AS RecentComments
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+      AND p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '3 years')
+      AND p.Score >= 0
+),
+ComplexInteractions AS (
+    SELECT 
+        pa.PostId,
+        pa.Title,
+        pa.Score,
+        pa.ViewCount,
+        pa.OwnerUserId,
+        pa.PostType,
+        pa.TagCount,
+        pa.RecentComments,
+        pa.BodyLength,
+        pa.ViewCategory,
+        pa.ScoreRank,
+        pa.UserPostRank,
+        pa.MovingAvgScore,
+        pa.UserFirstPostDate,
+        pa.UserLastPostDate,
+        pa.UserActivityDays,
+        CASE 
+            WHEN pa.Score > 50 AND pa.TagCount >= 3 THEN 'High Impact'
+            WHEN pa.Score BETWEEN 10 AND 50 AND pa.TagCount >= 2 THEN 'Medium Impact'
+            ELSE 'Low Impact'
+        END AS ImpactLevel,
+        CASE 
+            WHEN pa.BodyLength > 2000 AND pa.Score > 10 THEN 'Extensive Content'
+            WHEN pa.BodyLength BETWEEN 500 AND 2000 THEN 'Standard Content'
+            ELSE 'Brief Content'
+        END AS ContentLength,
+        CASE 
+            WHEN pa.ViewCategory = 'High' AND pa.RecentComments > 0 THEN 'Popular with Engagement'
+            WHEN pa.ViewCategory = 'High' AND pa.RecentComments = 0 THEN 'Popular but Quiet'
+            WHEN pa.ViewCategory = 'Low' AND pa.RecentComments > 5 THEN 'Low Views but Active'
+            ELSE 'Other'
+        END AS EngagementPattern
+    FROM PostAnalysis pa
+    WHERE pa.UserActivityDays >= 30
+)
+SELECT 
+    'Users With Top Posts' AS AnalysisType,
+    COUNT(*) AS RecordCount,
+    (SELECT COUNT(DISTINCT UserId) FROM TopUsersWithBadges) AS UniqueUserCount,
+    (SELECT AVG(Reputation) FROM TopUsersWithBadges) AS AvgReputation,
+    (SELECT MAX(PostCount) FROM TopUsersWithBadges) AS MaxPostCount,
+    STRING_AGG(
+        (DisplayName || ': ' || CAST(PostCount AS VARCHAR) || ' posts, ' || CAST(BadgeCount AS VARCHAR) || ' badges, ' || CAST(QuestionPercentage AS VARCHAR) || '% questions, ' || CAST(AnswerPercentage AS VARCHAR) || '% answers'), 
+        '; '
+    ) AS SummaryStats,
+    (SELECT STRING_AGG(
+        (RecentBadges || ' (' || DisplayName || ')'), 
+        ' | '
+    ) FROM TopUsersWithBadges WHERE RecentBadges IS NOT NULL) AS RecentBadgesByUser,
+    (SELECT COUNT(*) 
+     FROM ComplexInteractions 
+     WHERE ImpactLevel IN ('High Impact', 'Medium Impact')) AS ImpactfulPosts,
+    (SELECT AVG(ViewCount) 
+     FROM ComplexInteractions 
+     WHERE EngagementPattern = 'Popular with Engagement') AS AvgPopularWithEngagementViews
+FROM TopUsersWithBadges
+UNION ALL
+SELECT 
+    'Post Analysis Summary' AS AnalysisType,
+    COUNT(*) AS RecordCount,
+    COUNT(DISTINCT OwnerUserId) AS UniqueUserCount,
+    AVG(Score) AS AvgScore,
+    MAX(Score) AS MaxScore,
+    -- Build per-PostType summary by aggregating strings at the grouped level without nesting aggregates
+    STRING_AGG(SummaryPerType, '; ') AS SummaryStats,
+    NULL AS RecentBadgesByUser,
+    SUM(ImpactfulCount) AS ImpactfulPosts,
+    AVG(AvgViews) AS AvgPopularWithEngagementViews
+FROM (
+    SELECT
+        PostType,
+        COUNT(*) AS TypeCount,
+        AVG(Score) AS AvgScorePerType,
+        AVG(ViewCount) AS AvgViews,
+        CASE WHEN SUM(CASE WHEN ImpactLevel IN ('High Impact','Medium Impact') THEN 1 ELSE 0 END) IS NOT NULL THEN SUM(CASE WHEN ImpactLevel IN ('High Impact','Medium Impact') THEN 1 ELSE 0 END) ELSE 0 END AS ImpactfulCount,
+        (PostType || ': ' || CAST(COUNT(*) AS VARCHAR) || ' posts, ' || CAST(ROUND(AVG(Score)::numeric,2) AS VARCHAR) || ' AVG Score, ' || CAST(ROUND(AVG(ViewCount)::numeric,2) AS VARCHAR) || ' AVG Views') AS SummaryPerType
+    FROM ComplexInteractions
+    GROUP BY PostType
+) t
+GROUP BY PostType, SummaryPerType
+UNION ALL
+SELECT 
+    'Engagement Patterns' AS AnalysisType,
+    COUNT(*) AS RecordCount,
+    COUNT(DISTINCT OwnerUserId) AS UniqueUserCount,
+    AVG(Score) AS AvgScore,
+    MAX(Score) AS MaxScore,
+    STRING_AGG(
+        (EngagementPattern || ': ' || CAST(COUNT(*) AS VARCHAR) || ' posts'), 
+        '; '
+    ) AS SummaryStats,
+    NULL AS RecentBadgesByUser,
+    COUNT(*) AS ImpactfulPosts,
+    AVG(ViewCount) AS AvgPopularWithEngagementViews
+FROM ComplexInteractions
+GROUP BY EngagementPattern
+HAVING COUNT(*) > 0
+ORDER BY AnalysisType;

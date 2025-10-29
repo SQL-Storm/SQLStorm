@@ -1,0 +1,147 @@
+-- {"query": "3565.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1569} 
+WITH q_base AS (
+    SELECT
+        p.Id                                 AS QuestionId,
+        p.Title,
+        p.CreationDate,
+        p.Score                              AS QScore,
+        COALESCE(p.ViewCount,0)              AS Views,
+        COALESCE(p.FavoriteCount,0)          AS Favorites,
+        COALESCE(p.AnswerCount,0)            AS AnswerCnt,
+        COALESCE(p.CommentCount,0)           AS CommentCnt,
+        /* extract tags as array */
+        CASE WHEN p.Tags IS NOT NULL
+             THEN regexp_split_to_array(trim(both '<>' from p.Tags), '><')
+             ELSE ARRAY[]::text[]
+        END                                  AS TagArray,
+        /* compute age in days */
+        DATE_PART('day', cast('2024-10-01 12:34:56' as timestamp) - p.CreationDate) AS AgeDays
+    FROM Posts p
+    WHERE p.PostTypeId = 1                         -- only questions
+),
+
+q_badges AS (
+    SELECT
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+q_votes AS (
+    SELECT
+        v.PostId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1
+                 WHEN v.VoteTypeId = 3 THEN -1
+                 ELSE 0 END)               AS VoteScore,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 5) AS FavoriteVotes,
+        MAX(v.CreationDate)                  AS LastVoteDate
+    FROM Votes v
+    WHERE v.VoteTypeId IN (2,3,5)               -- up, down, favorite
+    GROUP BY v.PostId
+),
+
+q_latest_comments AS (
+    SELECT
+        c.PostId,
+        STRING_AGG(
+            LEFT(c.Text, 50) || CASE WHEN LENGTH(c.Text) > 50 THEN '…' ELSE '' END,
+            '; '
+            ORDER BY c.CreationDate DESC
+        ) AS RecentComments
+    FROM Comments c
+    WHERE c.Score > 0
+    GROUP BY c.PostId
+),
+
+q_top_tags AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0
+),
+
+q_combined AS (
+    SELECT
+        qb.QuestionId,
+        qb.Title,
+        qb.QScore,
+        qb.Views,
+        qb.Favorites,
+        qb.AnswerCnt,
+        qb.CommentCnt,
+        qb.AgeDays,
+        COALESCE(v.VoteScore,0)               AS NetVoteScore,
+        COALESCE(v.FavoriteVotes,0)           AS FavVotesFromVotes,
+        COALESCE(c.RecentComments,'')         AS RecentComments,
+        COALESCE(u.Reputation,0)              AS OwnerReputation,
+        COALESCE(b.GoldBadges,0)               AS GoldBadges,
+        COALESCE(b.SilverBadges,0)             AS SilverBadges,
+        COALESCE(b.BronzeBadges,0)             AS BronzeBadges,
+        /* calculate a composite benchmarking score */
+        (qb.QScore * 1.5 + qb.Views * 0.1 + qb.Favorites * 2
+         + COALESCE(v.VoteScore,0) * 1.2 + COALESCE(b.GoldBadges,0) * 5
+         + COALESCE(b.SilverBadges,0) * 3 + COALESCE(b.BronzeBadges,0) * 1
+         - qb.AgeDays * 0.05)                AS BenchmarkScore
+    FROM q_base qb
+    LEFT JOIN q_votes v
+           ON v.PostId = qb.QuestionId
+    LEFT JOIN q_latest_comments c
+           ON c.PostId = qb.QuestionId
+    LEFT JOIN Users u
+           ON u.Id = (SELECT OwnerUserId FROM Posts WHERE Id = qb.QuestionId)
+    LEFT JOIN q_badges b
+           ON b.UserId = u.Id
+),
+
+q_ranked AS (
+    SELECT
+        *,
+        ROW_NUMBER() OVER (ORDER BY BenchmarkScore DESC) AS RankOverall,
+        RANK() OVER (PARTITION BY (CASE WHEN AnswerCnt = 0 THEN 'Unanswered' ELSE 'Answered' END)
+                     ORDER BY BenchmarkScore DESC) AS RankByAnswerStatus
+    FROM q_combined
+)
+
+-- Final result set: top 20 questions plus a UNION with top 10 tag names
+SELECT
+    r.RankOverall,
+    r.QuestionId,
+    r.Title,
+    r.BenchmarkScore,
+    r.NetVoteScore,
+    r.FavVotesFromVotes,
+    r.RecentComments,
+    r.OwnerReputation,
+    r.GoldBadges,
+    r.SilverBadges,
+    r.BronzeBadges,
+    ARRAY_TO_STRING(r.TagArray, ', ') AS Tags,
+    CASE WHEN r.AnswerCnt = 0 THEN 'Unanswered' ELSE 'Answered' END AS AnswerStatus
+FROM q_ranked r
+WHERE r.RankOverall <= 20
+
+UNION ALL
+
+SELECT
+    NULL AS RankOverall,
+    NULL AS QuestionId,
+    tt.TagName AS Title,
+    tt.Count::numeric * 10 AS BenchmarkScore,
+    NULL AS NetVoteScore,
+    NULL AS FavVotesFromVotes,
+    NULL AS RecentComments,
+    NULL AS OwnerReputation,
+    NULL AS GoldBadges,
+    NULL AS SilverBadges,
+    NULL AS BronzeBadges,
+    tt.TagName AS Tags,
+    'Tag' AS AnswerStatus
+FROM q_top_tags tt
+WHERE tt.TagRank <= 10
+
+ORDER BY BenchmarkScore DESC, RankOverall NULLS LAST;

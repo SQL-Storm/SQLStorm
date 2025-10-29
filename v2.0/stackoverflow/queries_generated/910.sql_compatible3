@@ -1,0 +1,365 @@
+WITH
+recent_users AS (
+  SELECT
+    u.id AS user_id,
+    u.displayname,
+    COALESCE(NULLIF(TRIM(u.location), ''), 'Unknown') AS location_norm,
+    u.reputation,
+    u.creationdate,
+    u.lastaccessdate,
+    u.upvotes,
+    u.downvotes,
+    ROW_NUMBER() OVER (ORDER BY GREATEST(u.lastaccessdate, u.creationdate) DESC, u.reputation DESC, u.id) AS rn_recent
+  FROM users u
+  WHERE u.creationdate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '10 years'
+),
+recent_questions AS (
+  SELECT
+    p.id AS question_id,
+    p.owneruserid,
+    p.creationdate AS q_created,
+    p.lastactivitydate AS q_lastact,
+    p.score AS q_score,
+    p.viewcount,
+    p.answercount,
+    p.favoritecount,
+    p.closeddate,
+    p.acceptedanswerid,
+    p.title,
+    p.tags,
+    CASE
+      WHEN p.tags IS NOT NULL AND LENGTH(p.tags) >= 2 THEN string_to_array(SUBSTRING(p.tags, 2, LENGTH(p.tags)-2), '><')
+      ELSE ARRAY[]::text[]
+    END AS tag_arr
+  FROM posts p
+  WHERE p.posttypeid = 1
+    AND p.creationdate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '8 years'
+),
+answers AS (
+  SELECT
+    a.id AS answer_id,
+    a.parentid AS question_id,
+    a.owneruserid AS answerer_id,
+    a.score AS a_score,
+    a.creationdate AS a_created
+  FROM posts a
+  WHERE a.posttypeid = 2
+),
+vote_agg AS (
+  SELECT
+    v.postid,
+    SUM(CASE WHEN v.votetypeid = 2 THEN 1 ELSE 0 END) AS upvotes,
+    SUM(CASE WHEN v.votetypeid = 3 THEN 1 ELSE 0 END) AS downvotes,
+    SUM(CASE WHEN v.votetypeid = 5 THEN 1 ELSE 0 END) AS favorites,
+    SUM(CASE WHEN v.votetypeid = 8 THEN COALESCE(v.bountyamount, 0) ELSE 0 END) AS bounty_started,
+    SUM(CASE WHEN v.votetypeid = 9 THEN COALESCE(v.bountyamount, 0) ELSE 0 END) AS bounty_awarded,
+    MIN(v.creationdate) AS first_vote_at,
+    MAX(v.creationdate) AS last_vote_at,
+    COUNT(*) AS total_votes
+  FROM votes v
+  GROUP BY v.postid
+),
+link_agg AS (
+  SELECT
+    pl.postid,
+    SUM(CASE WHEN pl.linktypeid = 3 THEN 1 ELSE 0 END) AS dup_links,
+    SUM(CASE WHEN pl.linktypeid = 1 THEN 1 ELSE 0 END) AS ref_links,
+    COUNT(*) AS total_links
+  FROM postlinks pl
+  GROUP BY pl.postid
+),
+ph_signals AS (
+  SELECT
+    ph.postid,
+    SUM(CASE WHEN ph.posthistorytypeid = 10 THEN 1 ELSE 0 END) AS closed_events,
+    SUM(CASE WHEN ph.posthistorytypeid = 11 THEN 1 ELSE 0 END) AS reopened_events,
+    SUM(CASE WHEN ph.posthistorytypeid IN (4,5,6,24) THEN 1 ELSE 0 END) AS edit_events,
+    SUM(CASE WHEN ph.posthistorytypeid IN (35,36) THEN 1 ELSE 0 END) AS migration_events,
+    MAX(ph.creationdate) AS last_history_at,
+    COUNT(*) AS history_events
+  FROM posthistory ph
+  GROUP BY ph.postid
+),
+badge_agg AS (
+  SELECT
+    b.userid,
+    SUM(CASE WHEN b.class = 1 THEN 1 ELSE 0 END) AS gold_cnt,
+    SUM(CASE WHEN b.class = 2 THEN 1 ELSE 0 END) AS silver_cnt,
+    SUM(CASE WHEN b.class = 3 THEN 1 ELSE 0 END) AS bronze_cnt,
+    SUM(CASE WHEN COALESCE(b.tagbased, 0) = 1 THEN 1 ELSE 0 END) AS tag_badges,
+    COUNT(*) AS total_badges,
+    MAX(b.date) AS last_badge_at
+  FROM badges b
+  GROUP BY b.userid
+),
+comment_agg AS (
+  SELECT
+    c.postid,
+    COUNT(*) AS comment_count,
+    SUM(GREATEST(c.score, 0)) AS nonneg_comment_score,
+    MAX(c.creationdate) AS last_comment_at
+  FROM comments c
+  GROUP BY c.postid
+),
+tag_pop AS (
+  SELECT
+    t.tagname,
+    t.count AS total_tag_count,
+    t.ismodertoronly,
+    t.isrequired
+  FROM tags t
+),
+question_tags AS (
+  SELECT
+    q.question_id,
+    LOWER(TRIM(tag)) AS tag
+  FROM recent_questions q
+  LEFT JOIN LATERAL UNNEST(q.tag_arr) AS tag ON TRUE
+),
+question_tag_stats AS (
+  SELECT
+    qt.question_id,
+    COUNT(*) AS tag_cnt,
+    SUM(CASE WHEN tp.total_tag_count > 0 THEN 1 ELSE 0 END) AS known_tag_cnt,
+    MAX(tp.total_tag_count) AS max_tag_popularity,
+    MIN(tp.total_tag_count) AS min_tag_popularity,
+    AVG(COALESCE(tp.total_tag_count, 0)) AS avg_tag_popularity
+  FROM question_tags qt
+  LEFT JOIN tag_pop tp ON tp.tagname = qt.tag
+  GROUP BY qt.question_id
+),
+accepted_answer_metrics AS (
+  SELECT
+    q.question_id,
+    q.acceptedanswerid,
+    (SELECT a.score FROM posts a WHERE a.id = q.acceptedanswerid) AS accepted_answer_score,
+    (SELECT a.owneruserid FROM posts a WHERE a.id = q.acceptedanswerid) AS accepted_answerer_id,
+    (SELECT EXTRACT(EPOCH FROM (a.creationdate - q.q_created)) FROM posts a WHERE a.id = q.acceptedanswerid) AS seconds_to_accept
+  FROM recent_questions q
+),
+answer_competition AS (
+  SELECT
+    a.question_id,
+    MIN(a.a_created) AS first_answer_at,
+    MAX(a.a_score) AS best_answer_score,
+    COUNT(*) AS answer_cnt
+  FROM answers a
+  JOIN recent_questions q ON q.question_id = a.question_id
+  GROUP BY a.question_id
+),
+user_engagement AS (
+  SELECT
+    u.user_id,
+    COALESCE(b.total_badges, 0) AS total_badges,
+    COALESCE(b.gold_cnt, 0) AS gold_badges,
+    COALESCE(b.silver_cnt, 0) AS silver_badges,
+    COALESCE(b.bronze_cnt, 0) AS bronze_badges,
+    COALESCE(b.tag_badges, 0) AS tag_badges,
+    u.upvotes,
+    u.downvotes,
+    u.reputation,
+    u.lastaccessdate,
+    CAST(
+      0.6 * LN(1 + GREATEST(COALESCE(u.upvotes,0) - COALESCE(u.downvotes,0), 0)) +
+      0.3 * LN(1 + COALESCE(b.total_badges, 0)) +
+      0.1 * LN(1 + GREATEST(COALESCE(u.reputation,0), 0))
+    AS numeric(18,6)) AS engagement_score
+  FROM recent_users u
+  LEFT JOIN badge_agg b ON b.userid = u.user_id
+),
+question_activity_windows AS (
+  SELECT
+    q.question_id,
+    q.q_created,
+    q.q_lastact,
+    q.q_score,
+    q.viewcount,
+    SUM(q.viewcount) OVER (ORDER BY q.q_created ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cum_views_by_time,
+    AVG(q.q_score) OVER (ORDER BY q.q_created ROWS BETWEEN 100 PRECEDING AND CURRENT ROW) AS moving_avg_score_100,
+    RANK() OVER (ORDER BY q.viewcount DESC, q.q_score DESC) AS rank_views
+  FROM recent_questions q
+),
+duplicate_candidates AS (
+  SELECT
+    q.question_id,
+    la.dup_links,
+    CASE
+      WHEN q.title IS NULL THEN 0
+      WHEN POSITION('duplicate' IN LOWER(q.title)) > 0 THEN 1
+      ELSE 0
+    END AS title_mentions_duplicate
+  FROM recent_questions q
+  LEFT JOIN link_agg la ON la.postid = q.question_id
+),
+wide AS (
+  SELECT
+    q.question_id,
+    q.owneruserid AS asker_id,
+    ru.displayname AS asker_name,
+    ru.location_norm AS asker_location,
+    ue.engagement_score AS asker_engagement,
+    q.q_created,
+    q.q_lastact,
+    q.q_score,
+    q.viewcount,
+    q.answercount,
+    q.favoritecount,
+    ph.closed_events,
+    ph.reopened_events,
+    ph.edit_events,
+    ph.migration_events,
+    ph.last_history_at,
+    ph.history_events,
+    va.upvotes AS q_upvotes,
+    va.downvotes AS q_downvotes,
+    va.favorites AS q_favorites,
+    va.total_votes AS q_total_votes,
+    ca.comment_count,
+    ca.nonneg_comment_score,
+    ca.last_comment_at,
+    qts.tag_cnt,
+    qts.known_tag_cnt,
+    qts.max_tag_popularity,
+    qts.min_tag_popularity,
+    qts.avg_tag_popularity,
+    ac.first_answer_at,
+    ac.best_answer_score,
+    ac.answer_cnt,
+    aam.acceptedanswerid,
+    aam.accepted_answer_score,
+    aam.accepted_answerer_id,
+    aam.seconds_to_accept,
+    dc.dup_links,
+    dc.title_mentions_duplicate,
+    q.tags,
+    qa.cum_views_by_time,
+    qa.moving_avg_score_100,
+    qa.rank_views
+  FROM recent_questions q
+  LEFT JOIN recent_users ru ON ru.user_id = q.owneruserid
+  LEFT JOIN user_engagement ue ON ue.user_id = q.owneruserid
+  LEFT JOIN ph_signals ph ON ph.postid = q.question_id
+  LEFT JOIN vote_agg va ON va.postid = q.question_id
+  LEFT JOIN comment_agg ca ON ca.postid = q.question_id
+  LEFT JOIN question_tag_stats qts ON qts.question_id = q.question_id
+  LEFT JOIN answer_competition ac ON ac.question_id = q.question_id
+  LEFT JOIN accepted_answer_metrics aam ON aam.question_id = q.question_id
+  LEFT JOIN duplicate_candidates dc ON dc.question_id = q.question_id
+  LEFT JOIN question_activity_windows qa ON qa.question_id = q.question_id
+),
+scored AS (
+  SELECT
+    w.*,
+    CAST(
+      1.5 * COALESCE(w.q_score, 0) +
+      0.8 * LN(1 + COALESCE(w.viewcount, 0)) +
+      0.6 * COALESCE(COALESCE(w.q_upvotes,0) - COALESCE(w.q_downvotes,0), 0) +
+      0.5 * COALESCE(w.best_answer_score, 0) +
+      1.0 * CASE WHEN w.acceptedanswerid IS NOT NULL THEN 1 ELSE 0 END +
+      0.2 * COALESCE(w.comment_count, 0) -
+      1.2 * CASE WHEN COALESCE(w.closed_events,0) > 0 THEN 1 ELSE 0 END -
+      0.7 * COALESCE(w.dup_links, 0) +
+      0.3 * COALESCE(w.asker_engagement, 0)
+    AS numeric(18,6)) AS composite_score,
+    CASE
+      WHEN COALESCE(w.closed_events,0) > 0 OR COALESCE(w.title_mentions_duplicate,0) = 1 THEN 'closed_or_dup'
+      WHEN COALESCE(w.answercount,0) = 0 AND CAST('2024-10-01 12:34:56' AS timestamp) - w.q_created > INTERVAL '30 days' THEN 'stale_no_answers'
+      WHEN COALESCE(w.viewcount,0) > 10000 AND COALESCE(w.q_score,0) >= 5 THEN 'popular'
+      WHEN COALESCE(w.viewcount,0) < 100 AND COALESCE(w.q_score,0) <= 0 THEN 'low_impact'
+      ELSE 'normal'
+    END AS bucket
+  FROM wide w
+),
+ranked AS (
+  SELECT
+    s.*,
+    PERCENT_RANK() OVER (ORDER BY s.composite_score) AS pr_all,
+    CUME_DIST() OVER (ORDER BY s.composite_score DESC) AS cd_all,
+    NTILE(20) OVER (ORDER BY s.composite_score DESC) AS ntile20
+  FROM scored s
+),
+high_interest_ids AS (
+  (
+    SELECT question_id FROM ranked WHERE bucket = 'popular'
+  )
+  UNION
+  (
+    SELECT question_id FROM ranked WHERE pr_all >= 0.95
+  )
+  EXCEPT
+  (
+    SELECT question_id FROM ranked WHERE bucket IN ('closed_or_dup','low_impact')
+  )
+),
+edge_cases AS (
+  SELECT
+    w.question_id,
+    CASE WHEN COALESCE(w.q_total_votes,0) = 0 THEN 1 ELSE 0 END AS no_votes,
+    CASE WHEN COALESCE(w.comment_count,0) > 0 OR COALESCE(w.answer_cnt,0) > 0 THEN 1 ELSE 0 END AS has_discussion
+  FROM wide w
+),
+time_metrics AS (
+  SELECT
+    w.question_id,
+    EXTRACT(EPOCH FROM (COALESCE(w.first_answer_at, w.last_comment_at, w.q_lastact) - w.q_created)) AS secs_to_first_activity,
+    EXTRACT(EPOCH FROM (w.q_lastact - w.q_created)) AS secs_age,
+    EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - w.q_created)) AS secs_age_now
+  FROM wide w
+)
+SELECT
+  r.question_id,
+  r.asker_id,
+  r.asker_name,
+  r.asker_location,
+  r.q_created,
+  r.q_lastact,
+  r.q_score,
+  r.viewcount,
+  r.answercount,
+  r.favoritecount,
+  r.q_upvotes,
+  r.q_downvotes,
+  r.q_total_votes,
+  r.comment_count,
+  r.best_answer_score,
+  r.acceptedanswerid,
+  r.accepted_answer_score,
+  r.seconds_to_accept,
+  r.tag_cnt,
+  r.avg_tag_popularity,
+  r.dup_links,
+  r.title_mentions_duplicate,
+  r.bucket,
+  r.composite_score,
+  r.rank_views,
+  r.moving_avg_score_100,
+  tm.secs_to_first_activity,
+  tm.secs_age,
+  tm.secs_age_now,
+  CASE WHEN hi.question_id IS NOT NULL THEN 1 ELSE 0 END AS is_high_interest,
+  ec.no_votes,
+  ec.has_discussion
+FROM ranked r
+LEFT JOIN time_metrics tm ON tm.question_id = r.question_id
+LEFT JOIN high_interest_ids hi ON hi.question_id = r.question_id
+LEFT JOIN edge_cases ec ON ec.question_id = r.question_id
+WHERE
+  (
+    r.bucket IN ('popular','normal')
+    AND r.composite_score > 0
+    AND COALESCE(r.q_upvotes,0) >= COALESCE(r.q_downvotes,0)
+    AND (
+      COALESCE(r.tag_cnt,0) >= 1
+      OR (COALESCE(r.comment_count,0) > 0 AND COALESCE(r.answercount,0) > 0)
+    )
+  )
+  OR (
+    r.bucket = 'stale_no_answers'
+    AND COALESCE(r.viewcount,0) BETWEEN 100 AND 10000
+    AND (r.moving_avg_score_100 IS NULL OR r.moving_avg_score_100 <= 1.5)
+  )
+ORDER BY
+  is_high_interest DESC,
+  r.composite_score DESC,
+  r.q_created DESC
+LIMIT 500;

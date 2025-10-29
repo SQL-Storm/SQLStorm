@@ -1,0 +1,125 @@
+-- {"query": "3125.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2280} 
+WITH
+    -- Gather all answers together with their parent questions
+    answer_posts AS (
+        SELECT
+            a.id            AS answer_id,
+            a.owneruserid   AS owner_user_id,
+            a.score         AS answer_score,
+            q.id            AS question_id,
+            q.tags          AS question_tags,
+            q.creationdate  AS question_created,
+            a.creationdate  AS answer_created
+        FROM posts a
+        JOIN posts q ON q.id = a.parentid
+        WHERE a.posttypeid = 2          -- answer
+          AND q.posttypeid = 1          -- question
+    ),
+
+    -- Split the tag list into one row per tag (removing the surrounding '<' and '>')
+    exploded_tags AS (
+        SELECT
+            ap.*,
+            trim(t.tag) AS tag
+        FROM answer_posts ap,
+             LATERAL regexp_split_to_table(
+                 regexp_replace(ap.question_tags, '^<|>$', '', 'g'),   -- strip outer <>
+                 '><'
+             ) AS t(tag)
+    ),
+
+    -- Aggregate per (user, tag)
+    user_tag_agg AS (
+        SELECT
+            owner_user_id,
+            tag,
+            COUNT(*)                            AS answers_cnt,
+            SUM(answer_score)                  AS total_score,
+            AVG(answer_score)::numeric(10,2)   AS avg_score,
+            MAX(answer_created)                AS last_answer_ts,
+            MIN(question_created)              AS first_question_ts
+        FROM exploded_tags
+        GROUP BY owner_user_id, tag
+    ),
+
+    -- Rank tags per user by total_score then answers_cnt
+    ranked_tags AS (
+        SELECT
+            uta.*,
+            ROW_NUMBER() OVER (PARTITION BY owner_user_id
+                               ORDER BY total_score DESC, answers_cnt DESC) AS tag_rank
+        FROM user_tag_agg uta
+    ),
+
+    -- Keep only the top‑ranked tag per user (if any)
+    best_tag_per_user AS (
+        SELECT
+            u.id                     AS user_id,
+            u.displayname,
+            u.reputation,
+            COALESCE(rt.tag, '(none)') AS top_tag,
+            rt.total_score,
+            rt.answers_cnt,
+            rt.tag_rank
+        FROM users u
+        LEFT JOIN ranked_tags rt
+          ON rt.owner_user_id = u.id
+         AND rt.tag_rank = 1
+    ),
+
+    -- Badge counts per user; use UNION ALL to also return users with zero badges
+    badge_counts AS (
+        SELECT
+            b.userid,
+            COUNT(*) FILTER (WHERE b.class = 1) AS gold,
+            COUNT(*) FILTER (WHERE b.class = 2) AS silver,
+            COUNT(*) FILTER (WHERE b.class = 3) AS bronze,
+            COUNT(*)                            AS total
+        FROM badges b
+        GROUP BY b.userid
+        UNION ALL
+        SELECT
+            u.id,
+            0,0,0,0
+        FROM users u
+        WHERE NOT EXISTS (SELECT 1 FROM badges b WHERE b.userid = u.id)
+    ),
+
+    -- Latest vote activity per user (correlated aggregation)
+    latest_vote AS (
+        SELECT
+            v.userid,
+            MAX(v.creationdate)                         AS last_vote_ts,
+            COUNT(*) FILTER (WHERE vt.id = 2)           AS upvotes_given,
+            COUNT(*) FILTER (WHERE vt.id = 3)           AS downvotes_given
+        FROM votes v
+        JOIN votetypes vt ON vt.id = v.votetypeid
+        GROUP BY v.userid
+    )
+
+SELECT
+    btu.user_id,
+    btu.displayname,
+    btu.reputation,
+    btu.top_tag,
+    btu.total_score,
+    btu.answers_cnt,
+    COALESCE(bc.gold,0)   AS gold_badges,
+    COALESCE(bc.silver,0) AS silver_badges,
+    COALESCE(bc.bronze,0) AS bronze_badges,
+    COALESCE(lv.last_vote_ts, TIMESTAMP '1970-01-01') AS last_vote_ts,
+    COALESCE(lv.upvotes_given,0)   AS upvotes_given,
+    COALESCE(lv.downvotes_given,0) AS downvotes_given,
+    CASE
+        WHEN btu.reputation > 20000 THEN 'Legendary'
+        WHEN btu.reputation > 10000 THEN 'Guru'
+        WHEN btu.reputation > 2000  THEN 'Experienced'
+        WHEN btu.reputation > 500   THEN 'Novice'
+        ELSE 'Newbie'
+    END AS reputation_tier
+FROM best_tag_per_user btu
+LEFT JOIN badge_counts bc   ON bc.userid = btu.user_id
+LEFT JOIN latest_vote lv    ON lv.userid = btu.user_id
+WHERE btu.reputation IS NOT NULL
+ORDER BY btu.reputation DESC, btu.total_score DESC
+LIMIT 100;

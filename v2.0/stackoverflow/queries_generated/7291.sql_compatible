@@ -1,0 +1,309 @@
+WITH PostStats AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Title,
+        p.Tags,
+        p.Body,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        COALESCE(p.CommentCount, 0) AS CommentCount,
+        COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+        CAST((CAST(p.LastActivityDate AS DATE) - CAST(p.CreationDate AS DATE)) AS INTEGER) AS DaysActive,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.Score > 10 THEN 'Highly_Question'
+            WHEN p.PostTypeId = 2 AND p.Score > 5 THEN 'Highly_Answer'
+            ELSE 'Regular'
+        END AS PostCategory,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS UserPostRank,
+        RANK() OVER (ORDER BY p.Score DESC) AS GlobalScoreRank,
+        PERCENT_RANK() OVER (ORDER BY p.Score) AS ScorePercentile
+    FROM Posts p
+    WHERE p.CreationDate >= '2020-01-01'
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT ps.Id) AS TotalPosts,
+        SUM(ps.Score) AS TotalScore,
+        AVG(ps.Score) AS AvgScore,
+        MAX(ps.CreationDate) AS LastPostDate,
+        SUM(ps.ViewCount) AS TotalViews,
+        SUM(ps.AnswerCount) AS TotalAnswers,
+        SUM(ps.CommentCount) AS TotalComments,
+        SUM(ps.FavoriteCount) AS TotalFavorites,
+        CASE 
+            WHEN COUNT(DISTINCT ps.Id) > 100 THEN 'Elite'
+            WHEN COUNT(DISTINCT ps.Id) > 50 THEN 'Veteran'
+            WHEN COUNT(DISTINCT ps.Id) > 10 THEN 'Active'
+            ELSE 'Regular'
+        END AS UserLevel,
+        COALESCE(SUM(ps.Score) + 100, 0) AS AdjustedReputation
+    FROM Users u
+    LEFT JOIN PostStats ps ON u.Id = ps.OwnerUserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TagAnalysis AS (
+    SELECT 
+        t.Id AS TagId,
+        t.TagName,
+        t.Count AS TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        COALESCE(t.Count, 0) AS TagFrequency,
+        CASE 
+            WHEN EXISTS(SELECT 1 FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%') THEN 'Used'
+            ELSE 'Unused'
+        END AS TagUsage,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank,
+        LAG(t.Count, 1, 0) OVER (ORDER BY t.Count DESC) - t.Count AS TagPopularityChange
+    FROM Tags t
+    WHERE t.Count > 100
+),
+QuestionAnalysis AS (
+    SELECT 
+        ps.Id AS QuestionId,
+        ps.OwnerUserId,
+        ps.Title,
+        ps.Score,
+        ps.ViewCount,
+        ps.AnswerCount,
+        ps.CommentCount,
+        ps.CreationDate,
+        ps.LastActivityDate,
+        ps.FavoriteCount,
+        ps.PostCategory,
+        ps.UserPostRank,
+        ps.GlobalScoreRank,
+        ps.ScorePercentile,
+        ps.DaysActive,
+        CASE 
+            WHEN ps.AnswerCount > 0 THEN 'Answered'
+            ELSE 'Unanswered'
+        END AS QuestionStatus,
+        CASE
+            WHEN ps.Score > (SELECT AVG(Score) FROM PostStats WHERE PostTypeId = 1) THEN 'Above_Average'
+            ELSE 'Below_Average'
+        END AS ScoringTier,
+        CAST(LENGTH(ps.Title) AS FLOAT) / NULLIF(LENGTH(ps.Body), 0) AS TitleBodyRatio
+    FROM PostStats ps
+    WHERE ps.PostTypeId = 1
+),
+AnswerAnalysis AS (
+    SELECT 
+        ps.Id AS AnswerId,
+        ps.ParentId,
+        ps.OwnerUserId,
+        ps.Score,
+        ps.ViewCount,
+        ps.CreationDate,
+        ps.LastActivityDate,
+        ps.PostCategory,
+        ps.UserPostRank,
+        ps.GlobalScoreRank,
+        ps.ScorePercentile,
+        ps.DaysActive,
+        CASE 
+            WHEN ps.Score > (SELECT AVG(Score) FROM PostStats WHERE PostTypeId = 2) THEN 'Above_Average'
+            ELSE 'Below_Average'
+        END AS ScoringTier,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = ps.Id) AS CommentCount,
+        CASE 
+            WHEN ps.Score > (SELECT AVG(Score) FROM PostStats WHERE PostTypeId = 2) THEN 1
+            ELSE 0
+        END AS AboveAvgIndicator
+    FROM PostStats ps
+    WHERE ps.PostTypeId = 2
+),
+ActivityTimeline AS (
+    SELECT 
+        'Question' AS PostType,
+        qa.QuestionId AS Id,
+        qa.OwnerUserId,
+        qa.CreationDate,
+        qa.Score,
+        qa.AnswerCount,
+        qa.CommentCount,
+        qa.ViewCount,
+        qa.FavoriteCount,
+        qa.Title,
+        qa.QuestionStatus,
+        'Question' AS PostCategory
+    FROM QuestionAnalysis qa
+    WHERE qa.CreationDate >= '2020-01-01'
+    
+    UNION ALL
+    
+    SELECT 
+        'Answer' AS PostType,
+        aa.AnswerId AS Id,
+        aa.OwnerUserId,
+        aa.CreationDate,
+        aa.Score,
+        NULL AS AnswerCount,
+        aa.CommentCount,
+        aa.ViewCount,
+        aa.FavoriteCount,
+        NULL AS Title,
+        NULL AS QuestionStatus,
+        'Answer' AS PostCategory
+    FROM AnswerAnalysis aa
+    WHERE aa.CreationDate >= '2020-01-01'
+)
+SELECT 
+    at.PostType,
+    at.Id,
+    at.OwnerUserId,
+    at.CreationDate,
+    at.Score,
+    at.AnswerCount,
+    at.CommentCount,
+    at.ViewCount,
+    at.FavoriteCount,
+    at.Title,
+    at.QuestionStatus,
+    at.PostCategory,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.TotalPosts,
+    ua.TotalScore,
+    ua.AvgScore,
+    ua.UserLevel,
+    ta.TagName,
+    ta.TagCount,
+    ta.TagFrequency,
+    ta.TagUsage,
+    (SELECT COUNT(*) FROM ActivityTimeline at2 WHERE at2.OwnerUserId = at.OwnerUserId AND at2.CreationDate >= '2020-01-01') AS UserActivityCount,
+    CASE 
+        WHEN at.PostType = 'Question' THEN 
+            CASE 
+                WHEN at.AnswerCount > 0 THEN (
+                    SELECT COUNT(*) FROM AnswerAnalysis aa WHERE aa.ParentId = at.Id AND aa.Score > 10
+                )
+                ELSE 0 
+            END
+        ELSE NULL
+    END AS HighValueAnswers,
+    ROUND(
+        (CASE 
+            WHEN at.PostType = 'Question' THEN at.Score * 0.3 + COALESCE(at.AnswerCount,0) * 0.2 + COALESCE(at.CommentCount,0) * 0.1 + COALESCE(at.ViewCount,0) * 0.01
+            ELSE at.Score * 0.5 + COALESCE(at.ViewCount,0) * 0.02 + COALESCE(at.CommentCount,0) * 0.1
+        END),
+        2
+    ) AS ActivityScore,
+    (SELECT COUNT(DISTINCT c.PostId) FROM Comments c WHERE c.PostId = at.Id) AS TotalCommentsOnPost,
+    (SELECT CAST(COUNT(*) AS FLOAT) FROM Votes v WHERE v.PostId = at.Id AND v.VoteTypeId = 2) AS UpvoteCount,
+    (SELECT CAST(COUNT(*) AS FLOAT) FROM Votes v WHERE v.PostId = at.Id AND v.VoteTypeId = 3) AS DownvoteCount,
+    CASE 
+        WHEN at.Score > 0 AND (SELECT CAST(COUNT(*) AS FLOAT) FROM Votes v WHERE v.PostId = at.Id AND v.VoteTypeId = 2) > 0 
+        THEN (SELECT CAST(COUNT(*) AS FLOAT) FROM Votes v WHERE v.PostId = at.Id AND v.VoteTypeId = 2) / at.Score 
+        ELSE 0 
+    END AS UpvoteRatio,
+    CASE 
+        WHEN at.Score < 0 AND (SELECT CAST(COUNT(*) AS FLOAT) FROM Votes v WHERE v.PostId = at.Id AND v.VoteTypeId = 3) > 0 
+        THEN (SELECT CAST(COUNT(*) AS FLOAT) FROM Votes v WHERE v.PostId = at.Id AND v.VoteTypeId = 3) / ABS(at.Score) 
+        ELSE 0 
+    END AS DownvoteRatio,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = at.Id AND ph.PostHistoryTypeId = 10) AS CloseCount,
+    (SELECT COUNT(DISTINCT ph.UserId) FROM PostHistory ph WHERE ph.PostId = at.Id AND ph.PostHistoryTypeId = 10) AS CloseUserCount,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = at.Id AND ph.PostHistoryTypeId IN (12, 13)) AS DeleteHistoryCount,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = at.OwnerUserId AND b.Date >= '2020-01-01') AS RecentBadgesCount,
+    ROW_NUMBER() OVER (PARTITION BY at.OwnerUserId ORDER BY at.CreationDate ASC) AS PostSequenceNumber,
+    LAG(at.Score, 1, 0) OVER (PARTITION BY at.OwnerUserId ORDER BY at.CreationDate ASC) AS PreviousScore,
+    (at.Score - LAG(at.Score, 1, 0) OVER (PARTITION BY at.OwnerUserId ORDER BY at.CreationDate ASC)) AS ScoreChange,
+    CASE 
+        WHEN at.PostType = 'Question' AND at.AnswerCount > 0 THEN 
+            (SELECT AVG(aa.Score) FROM AnswerAnalysis aa WHERE aa.ParentId = at.Id) 
+        ELSE NULL 
+    END AS AvgAnswerScore,
+    CASE 
+        WHEN at.PostType = 'Answer' THEN 
+            (SELECT q.Title FROM QuestionAnalysis q WHERE q.QuestionId = at.ParentId) 
+        ELSE NULL 
+    END AS RelatedQuestionTitle,
+    CASE 
+        WHEN at.PostType = 'Question' THEN (
+            SELECT COUNT(*) FROM PostLinks pl 
+            WHERE pl.PostId = at.Id AND pl.LinkTypeId = 3
+        ) 
+        ELSE 0 
+    END AS DuplicateLinkCount,
+    CASE 
+        WHEN at.PostType = 'Question' THEN 
+            (SELECT COUNT(*) FROM Votes v WHERE v.PostId = at.Id AND v.VoteTypeId IN (8, 9)) 
+        ELSE 0 
+    END AS BountyCount,
+    CASE 
+        WHEN at.PostType = 'Question' THEN 
+            (SELECT COUNT(*) FROM Votes v WHERE v.PostId = at.Id AND v.VoteTypeId = 5) 
+        ELSE 0 
+    END AS FavoriteCount,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = at.Id) AS HistoryCount,
+    CASE 
+        WHEN at.PostType = 'Question' THEN 
+            (SELECT COUNT(*) FROM Comments c JOIN Posts p ON c.PostId = p.Id WHERE p.Id = at.Id AND c.CreationDate >= '2020-01-01')
+        ELSE 0 
+    END AS RecentCommentCount,
+    (SELECT STRING_AGG(ta2.TagName, ', ') FROM Tags ta2 WHERE ta2.TagName IN (
+        SELECT unnest(string_to_array(COALESCE(at.Title,''), ' '))
+    )) AS TaggedWordsInTitle,
+    'Performance_Benchmark_Query_Verification' AS VerificationTag,
+    ROUND(POWER(at.Score, 2) + COALESCE(at.ViewCount,0) + COALESCE(at.CommentCount,0) * 10, 2) AS ComplexScoreMetric,
+    (CASE 
+        WHEN at.OwnerUserId IS NOT NULL THEN 
+            COALESCE(ua.Reputation, 0) + COALESCE(ua.TotalScore, 0) + COALESCE(ua.TotalViews, 0)
+        ELSE 0 
+    END) AS UserContributionMetric,
+    NULL AS PlaceholderNULLColumn,
+    CASE 
+        WHEN at.Score > 0 THEN 'Positive'
+        WHEN at.Score < 0 THEN 'Negative'
+        ELSE 'Neutral'
+    END AS ScoreDirection
+FROM ActivityTimeline at
+LEFT JOIN UserActivity ua ON at.OwnerUserId = ua.UserId
+LEFT JOIN TagAnalysis ta ON ta.TagCount = (
+    SELECT MAX(tac.Count) FROM TagAnalysis tac 
+    WHERE tac.TagName IN (SELECT unnest(string_to_array(COALESCE(at.Title,''), ' ')))
+)
+WHERE at.CreationDate >= '2020-01-01'
+  AND (at.Score IS NOT NULL OR at.AnswerCount IS NOT NULL OR at.CommentCount IS NOT NULL)
+GROUP BY
+    at.PostType,
+    at.Id,
+    at.OwnerUserId,
+    at.CreationDate,
+    at.Score,
+    at.AnswerCount,
+    at.CommentCount,
+    at.ViewCount,
+    at.FavoriteCount,
+    at.Title,
+    at.QuestionStatus,
+    at.PostCategory,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.TotalPosts,
+    ua.TotalScore,
+    ua.AvgScore,
+    ua.UserLevel,
+    ta.TagName,
+    ta.TagCount,
+    ta.TagFrequency,
+    ta.TagUsage,
+    ua.TotalViews,
+    ua.UserId
+ORDER BY at.CreationDate DESC, at.Score DESC, at.OwnerUserId ASC
+LIMIT 10000;

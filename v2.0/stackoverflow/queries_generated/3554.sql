@@ -1,0 +1,146 @@
+-- {"query": "3554.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 3540} 
+WITH RecentQuestions AS (
+    SELECT Id, Title, CreationDate, Score, OwnerUserId, Tags
+    FROM Posts
+    WHERE PostTypeId = 1
+      AND CreationDate >= CURRENT_DATE - INTERVAL '180 day'
+),
+QuestionStats AS (
+    SELECT q.Id,
+           q.Score,
+           CASE WHEN q.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS HasAccepted,
+           COALESCE(a.AnsCnt,0) AS AnswerCount,
+           COALESCE(a.MaxScore,0) AS TopAnswerScore
+    FROM RecentQuestions q
+    LEFT JOIN (
+        SELECT ParentId,
+               COUNT(*) AS AnsCnt,
+               MAX(Score) AS MaxScore
+        FROM Posts
+        WHERE PostTypeId = 2
+        GROUP BY ParentId
+    ) a ON a.ParentId = q.Id
+),
+UserActivity AS (
+    SELECT u.Id AS UserId,
+           u.DisplayName,
+           u.Reputation,
+           COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END),0) -
+           COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END),0) AS NetVoteScore,
+           COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersPosted,
+           COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsPosted
+    FROM Users u
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+BadgeAgg AS (
+    SELECT b.UserId,
+           COUNT(*) FILTER (WHERE b.Class = 1) AS Gold,
+           COUNT(*) FILTER (WHERE b.Class = 2) AS Silver,
+           COUNT(*) FILTER (WHERE b.Class = 3) AS Bronze,
+           MAX(b.Date) AS LastBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+),
+TagSummary AS (
+    SELECT unnest(string_to_array(trim(both '<>' from Tags), '><')) AS Tag,
+           COUNT(*) AS UseCount
+    FROM Posts
+    WHERE PostTypeId = 1
+    GROUP BY 1
+),
+UserTagAffinity AS (
+    SELECT p.OwnerUserId AS UserId,
+           AVG(tf.UseCount)::numeric(10,2) AS AvgTagPopularity
+    FROM Posts p
+    JOIN TagSummary tf ON tf.Tag = ANY (string_to_array(trim(both '<>' from p.Tags), '><'))
+    WHERE p.PostTypeId = 1
+    GROUP BY p.OwnerUserId
+),
+Combined AS (
+    SELECT ua.UserId,
+           ua.DisplayName,
+           ua.Reputation,
+           ua.NetVoteScore,
+           ua.AnswersPosted,
+           ua.QuestionsPosted,
+           COALESCE(b.Gold,0) AS GoldBadges,
+           COALESCE(b.Silver,0) AS SilverBadges,
+           COALESCE(b.Bronze,0) AS BronzeBadges,
+           COALESCE(uta.AvgTagPopularity,0) AS AvgTagPopularity,
+           CASE
+               WHEN COALESCE(b.Gold,0) >= 5 THEN 'Legend'
+               WHEN COALESCE(b.Silver,0) >= 10 THEN 'Veteran'
+               ELSE 'Contributor'
+           END AS RankTier
+    FROM UserActivity ua
+    LEFT JOIN BadgeAgg b ON b.UserId = ua.UserId
+    LEFT JOIN UserTagAffinity uta ON uta.UserId = ua.UserId
+    WHERE ua.Reputation > 20000
+),
+TopUsers AS (
+    SELECT *
+    FROM Combined
+    ORDER BY Reputation DESC, GoldBadges DESC, NetVoteScore DESC
+    LIMIT 50
+),
+QuestionWindow AS (
+    SELECT qs.Id,
+           qs.Score,
+           qs.HasAccepted,
+           qs.AnswerCount,
+           qs.TopAnswerScore,
+           ROW_NUMBER() OVER (ORDER BY qs.Score DESC) AS rn,
+           COUNT(*) OVER () AS total_q
+    FROM QuestionStats qs
+    WHERE qs.Score > 0
+)
+SELECT t.RankTier,
+       t.DisplayName,
+       t.Reputation,
+       t.GoldBadges,
+       t.SilverBadges,
+       t.BronzeBadges,
+       t.AnswersPosted,
+       t.QuestionsPosted,
+       t.NetVoteScore,
+       t.AvgTagPopularity,
+       q.Id AS TopQuestionId,
+       q.Title AS TopQuestionTitle,
+       q.Score AS QuestionScore,
+       q.AnswerCount,
+       q.HasAccepted
+FROM TopUsers t
+LEFT JOIN LATERAL (
+    SELECT p.Id, p.Title, p.Score, 
+           (SELECT COUNT(*) FROM Posts a WHERE a.PostTypeId = 2 AND a.ParentId = p.Id) AS AnswerCount,
+           CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS HasAccepted
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.OwnerUserId = t.UserId
+    ORDER BY p.Score DESC NULLS LAST
+    LIMIT 1
+) q ON true
+WHERE t.RankTier = 'Legend'
+ORDER BY t.Reputation DESC
+
+EXCEPT
+SELECT *
+FROM (
+    SELECT NULL::text     AS RankTier,
+           NULL::varchar  AS DisplayName,
+           NULL::int      AS Reputation,
+           NULL::int      AS GoldBadges,
+           NULL::int      AS SilverBadges,
+           NULL::int      AS BronzeBadges,
+           NULL::int      AS AnswersPosted,
+           NULL::int      AS QuestionsPosted,
+           NULL::int      AS NetVoteScore,
+           NULL::numeric  AS AvgTagPopularity,
+           NULL::int      AS TopQuestionId,
+           NULL::varchar  AS TopQuestionTitle,
+           NULL::int      AS QuestionScore,
+           NULL::int      AS AnswerCount,
+           NULL::int      AS HasAccepted
+) dummy;

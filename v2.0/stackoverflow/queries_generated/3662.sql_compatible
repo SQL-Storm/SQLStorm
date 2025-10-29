@@ -1,0 +1,138 @@
+WITH TagStats AS (
+    SELECT
+        t.TagName,
+        COUNT(p.Id)                                            AS QuestionCount,
+        AVG(p.Score)                                           AS AvgScore,
+        SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) * 100.0
+            / NULLIF(COUNT(p.Id), 0)                           AS AcceptRatePct,
+        MAX(p.CreationDate)                                    AS LatestQuestionDate
+    FROM Tags t
+    JOIN Posts p
+        ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+       AND p.PostTypeId = 1          -- only questions
+    GROUP BY t.TagName
+    HAVING COUNT(p.Id) > 10
+),
+
+UserActivity AS (
+    SELECT
+        u.Id                                            AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsAsked,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersPosted,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVotesGiven,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownVotesGiven,
+        MAX(p.LastActivityDate)                        AS LastActivity
+    FROM Users u
+    LEFT JOIN Posts p   ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v   ON v.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+TopUsers AS (
+    SELECT *
+    FROM UserActivity
+    ORDER BY Reputation DESC, QuestionsAsked DESC
+    FETCH FIRST 50 ROWS ONLY
+),
+
+RecentEdits AS (
+    SELECT
+        ph.PostId,
+        MAX(ph.CreationDate)                                            AS LastEditDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN ph.Comment END) AS LastEditComment
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4,5,6)        -- edits
+    GROUP BY ph.PostId
+),
+
+QuestionAnswerStats AS (
+    SELECT
+        q.Id                                          AS QuestionId,
+        q.Title,
+        q.Score                                       AS QuestionScore,
+        q.ViewCount,
+        q.FavoriteCount,
+        COALESCE(a.AnsCnt, 0)                         AS AnswerCount,
+        COALESCE(a.AcceptedScore, 0)                  AS AcceptedAnswerScore,
+        ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY a.Score DESC) AS AnswerRank,
+        CASE WHEN q.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS HasAcceptedAnswer
+    FROM Posts q
+    LEFT JOIN (
+        SELECT
+            p.ParentId                                     AS QuestionId,
+            COUNT(*)                                       AS AnsCnt,
+            MAX(CASE WHEN p.Id = q.Id THEN p.Score END) AS AcceptedScore,
+            p.Score,
+            p.Id
+        FROM Posts p
+        JOIN Posts q ON q.Id = p.ParentId
+        WHERE p.PostTypeId = 2                               -- answers
+        GROUP BY p.ParentId, p.Id, p.Score, q.Id
+    ) a ON a.QuestionId = q.Id
+    WHERE q.PostTypeId = 1                                 -- questions
+),
+
+Combined AS (
+    SELECT
+        ts.TagName,
+        ts.QuestionCount,
+        ts.AvgScore,
+        ts.AcceptRatePct,
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        qa.QuestionId,
+        qa.Title,
+        qa.QuestionScore,
+        qa.ViewCount,
+        qa.FavoriteCount,
+        qa.AnswerCount,
+        qa.AcceptedAnswerScore,
+        qa.HasAcceptedAnswer,
+        re.LastEditDate,
+        re.LastEditComment,
+        ROW_NUMBER() OVER (PARTITION BY ts.TagName ORDER BY qa.QuestionScore DESC) AS RankByScore
+    FROM TagStats ts
+    JOIN Posts p
+        ON p.Tags LIKE '%' || '<' || ts.TagName || '>' || '%'
+       AND p.PostTypeId = 1
+    LEFT JOIN QuestionAnswerStats qa ON qa.QuestionId = p.Id
+    LEFT JOIN TopUsers tu           ON tu.UserId = p.OwnerUserId
+    LEFT JOIN RecentEdits re        ON re.PostId = p.Id
+    WHERE (qa.HasAcceptedAnswer = 1 OR qa.AnswerCount >= 3)
+)
+
+SELECT
+    TagName,
+    QuestionCount,
+    ROUND(AvgScore, 2)                     AS AvgScore,
+    ROUND(AcceptRatePct, 2)                AS AcceptRatePct,
+    UserId,
+    DisplayName,
+    Reputation,
+    QuestionId,
+    Title,
+    QuestionScore,
+    ViewCount,
+    FavoriteCount,
+    AnswerCount,
+    COALESCE(AcceptedAnswerScore, 0)       AS AcceptedAnswerScore,
+    CASE WHEN LastEditDate IS NULL THEN 'Never edited'
+         ELSE TO_CHAR(CAST(LastEditDate AS DATE), 'YYYY-MM-DD')
+    END                                    AS LastEditDate,
+    COALESCE(LastEditComment, '(none)')    AS LastEditComment,
+    RankByScore
+FROM Combined
+WHERE RankByScore <= 5
+
+UNION ALL
+
+SELECT
+    'Overall'        AS TagName,
+    NULL::integer, NULL::numeric, NULL::numeric,
+    NULL::integer, NULL::text, NULL::integer,
+    NULL::integer, NULL::text, NULL::integer, NULL::integer, NULL::integer, NULL::integer, NULL::text,
+    NULL::date, NULL::text, NULL::integer
+ORDER BY TagName, RankByScore NULLS LAST;

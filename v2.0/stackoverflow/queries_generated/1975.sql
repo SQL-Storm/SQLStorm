@@ -1,0 +1,243 @@
+-- {"query": "1975.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3877} 
+
+WITH UserEngagement AS (
+    -- CTE 1: Summarizes user activity, including derived metrics and filters for active users.
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.Views AS UserProfileViews,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsAsked,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersGiven,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostScore,
+        SUM(COALESCE(p.ViewCount, 0)) AS TotalPostViews,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        -- Calculate user age in days, including NULL logic for users without a creation date (though unlikely)
+        COALESCE(EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - u.CreationDate)) / (3600 * 24), 0) AS DaysOnPlatform,
+        -- Average time in hours between post creation and last edit, using a filter for only edited posts
+        AVG(EXTRACT(EPOCH FROM (p.LastEditDate - p.CreationDate)) / 3600.0) FILTER (WHERE p.LastEditDate IS NOT NULL AND p.LastEditDate > p.CreationDate) AS AvgPostEditTimeHours
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    WHERE u.CreationDate >= '2020-01-01' -- Focus on more recent users
+      AND u.LastAccessDate >= '2023-01-01' -- Recently active
+      AND u.Reputation > 500 -- Filter for somewhat established users
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes
+),
+PostMetrics AS (
+    -- CTE 2: Calculates various metrics for posts, including specific category, traffic level, and engagement scores.
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.LastActivityDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.Title,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.Body, -- Include body for string operations
+        (SELECT COUNT(DISTINCT v.Id) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpvoteCount, -- Non-correlated subquery
+        (SELECT COUNT(DISTINCT v.Id) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS DownvoteCount, -- Non-correlated subquery
+        -- Complicated calculation for post engagement score
+        COALESCE(p.Score, 0) * 1.5 + COALESCE(p.FavoriteCount, 0) * 3 + COALESCE(p.AnswerCount, 0) * 2 AS PostEngagementScore,
+        -- CASE expression for post categorization
+        CASE
+            WHEN LOWER(p.Body) LIKE '%performance%' OR LOWER(p.Title) LIKE '%optimize%' THEN 'PerformanceRelated'
+            WHEN p.Tags LIKE '%<sql>%' OR p.Tags LIKE '%<database>%' THEN 'DatabaseRelated'
+            WHEN p.PostTypeId = 1 AND COALESCE(p.AnswerCount, 0) = 0 AND p.ClosedDate IS NULL THEN 'UnansweredOpenQuestion'
+            ELSE 'Other'
+        END AS PostCategory,
+        -- CASE expression for traffic level
+        CASE
+            WHEN p.ViewCount > 50000 AND p.Score > 100 THEN 'Viral'
+            WHEN p.ViewCount > 10000 AND p.Score > 50 THEN 'HighTraffic'
+            ELSE 'Normal'
+        END AS TrafficLevel,
+        -- String expression: Convert tags string into an array (PostgreSQL specific)
+        STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><') AS TagArray,
+        -- Complex calculation with NULL logic for division by zero
+        ROUND(CAST(COALESCE(p.Score, 0) AS NUMERIC) / NULLIF(p.ViewCount, 0) * 100, 2) AS ScorePerViewPercentage
+    FROM Posts p
+    WHERE p.CreationDate >= '2022-01-01' -- Focus on more recent posts
+      AND p.PostTypeId IN (1, 2) -- Questions and Answers
+      AND p.OwnerUserId IS NOT NULL
+      AND p.CommunityOwnedDate IS NULL -- Exclude community-owned posts
+      AND (p.Score > 5 OR p.ViewCount > 100) -- Only somewhat notable posts
+),
+BadgeSummary AS (
+    -- CTE 3: Aggregates badge information per user, including a correlated subquery for a specific badge.
+    SELECT
+        b.UserId,
+        COUNT(b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(b.Date) AS LastBadgeDate,
+        -- Correlated subquery: Check if user has a specific "Great Answer" badge recently
+        EXISTS (SELECT 1 FROM Badges b2 WHERE b2.UserId = b.UserId AND b2.Name = 'Great Answer' AND b2.Date > '2023-01-01') AS HasRecentGreatAnswerBadge
+    FROM Badges b
+    GROUP BY b.UserId
+),
+PostHistoryAgg AS (
+    -- CTE 4: Aggregates post history events, including a complex correlated subquery for the most common close reason.
+    SELECT
+        ph.PostId,
+        COUNT(ph.Id) AS TotalHistoryEvents,
+        MAX(ph.CreationDate) AS LatestHistoryEventDate,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditCount, -- Title, Body, Tags edits
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseEventCount, -- Post Closed events
+        -- Correlated subquery: Get the most common close reason type for a post if it was closed (PostgreSQL-specific cast)
+        (
+            SELECT crt.Name
+            FROM PostHistory ph_inner
+            JOIN CloseReasonTypes crt ON ph_inner.Comment::smallint = crt.Id
+            WHERE ph_inner.PostId = ph.PostId
+              AND ph_inner.PostHistoryTypeId = 10
+            GROUP BY crt.Name
+            ORDER BY COUNT(*) DESC
+            LIMIT 1
+        ) AS MostCommonCloseReason
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6, 10, 11, 12, 13) -- Editing, closing, deleting, reopening events
+    GROUP BY ph.PostId
+)
+-- Main query: Combines all CTEs, applies window functions, complex filters, and set operations.
+SELECT
+    'HighReputationUsers' AS UserSegment,
+    ue.UserId,
+    ue.DisplayName,
+    ue.Reputation,
+    ue.UserCreationDate,
+    ue.DaysOnPlatform,
+    ue.TotalPosts,
+    ue.QuestionsAsked,
+    ue.AnswersGiven,
+    ue.TotalComments,
+    pm.PostId,
+    pm.Title AS PostTitle,
+    pm.PostCategory,
+    pm.TrafficLevel,
+    pm.PostEngagementScore,
+    pm.UpvoteCount AS PostUpvoteCount,
+    pm.DownvoteCount AS PostDownvoteCount,
+    COALESCE(bs.TotalBadges, 0) AS UserTotalBadges,
+    COALESCE(bs.GoldBadges, 0) AS UserGoldBadges,
+    bs.HasRecentGreatAnswerBadge,
+    COALESCE(pha.TotalHistoryEvents, 0) AS PostTotalHistoryEvents,
+    COALESCE(pha.EditCount, 0) AS PostEditCount,
+    pha.MostCommonCloseReason,
+    COALESCE(qa_link.LinkedPostCount, 0) AS LinkedPostsCount,
+    COALESCE(qa_link.DuplicatePostCount, 0) AS DuplicatePostsCount,
+    -- Correlated subquery in SELECT list for direct outgoing link count
+    (SELECT COUNT(DISTINCT pl.RelatedPostId) FROM PostLinks pl WHERE pl.PostId = pm.PostId AND pl.LinkTypeId = 1) AS DirectOutgoingLinks,
+    -- Window function: Rank users by reputation within their assigned traffic level segments
+    RANK() OVER (PARTITION BY pm.TrafficLevel ORDER BY ue.Reputation DESC, pm.PostEngagementScore DESC) AS RankInTrafficSegment,
+    pm.ScorePerViewPercentage,
+    -- String expression: Lowercase first 5 characters of display name
+    LOWER(SUBSTRING(ue.DisplayName, 1, 5)) AS DisplayNamePrefix,
+    -- NULL logic: Provide a placeholder for AcceptedAnswerId
+    COALESCE(pm.AcceptedAnswerId, -1) AS AcceptedAnswerID_or_Placeholder,
+    -- Conditional expression using array containment (PostgreSQL-specific)
+    CASE WHEN 'sql' = ANY(pm.TagArray) THEN 'HasSQLTag' ELSE 'NoSQLTag' END AS HasSQLTagIndicator
+FROM UserEngagement ue
+INNER JOIN PostMetrics pm ON ue.UserId = pm.OwnerUserId
+LEFT JOIN BadgeSummary bs ON ue.UserId = bs.UserId
+LEFT JOIN PostHistoryAgg pha ON pm.PostId = pha.PostId
+LEFT JOIN ( -- Subquery for linked/duplicate posts aggregation
+    SELECT
+        pl.PostId,
+        SUM(CASE WHEN pl.LinkTypeId = 1 THEN 1 ELSE 0 END) AS LinkedPostCount,
+        SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicatePostCount
+    FROM PostLinks pl
+    GROUP BY pl.PostId
+) AS qa_link ON pm.PostId = qa_link.PostId
+WHERE ue.QuestionsAsked > 0 -- Users who asked at least one question
+  AND ue.Reputation > 1000 -- Additional reputation filter
+  AND pm.PostCategory = 'DatabaseRelated' -- Focus on database-related posts
+  AND pm.ScorePerViewPercentage > 0.05 -- Filter for posts with a decent score-to-view ratio
+  AND ue.AvgPostEditTimeHours IS NOT NULL -- Exclude users with no edits
+  AND ue.DaysOnPlatform BETWEEN 365 AND 1825 -- User active for 1-5 years
+  AND (NOT bs.HasRecentGreatAnswerBadge OR COALESCE(bs.TotalBadges, 0) > 10) -- Users without recent 'Great Answer' badge, OR users with many badges
+  AND pm.TagArray @> ARRAY['sql'] -- Array containment check (PostgreSQL specific)
+  AND (pha.MostCommonCloseReason IS NULL OR pha.MostCommonCloseReason != 'Duplicate') -- NULL logic and string comparison
+  AND LENGTH(pm.Title) BETWEEN 20 AND 150 -- String length filter
+  AND LOWER(pm.Title) LIKE '%sql%' -- Case-insensitive match for 'SQL' in title
+  AND SUBSTRING(ue.DisplayName, 1, 1) NOT IN ('!', '@', '#', '$') -- Filter out unusual display names
+  -- Non-correlated subquery: Exclude posts last edited by community user recently
+  AND pm.PostId NOT IN (SELECT p_inner.Id FROM Posts p_inner WHERE p_inner.LastEditorUserId = -1 AND p_inner.LastEditDate > '2024-01-01')
+  AND COALESCE(pha.TotalHistoryEvents, 0) > 1 -- Ensure posts with at least 2 history events
+  AND ue.UpVotes > ue.DownVotes * 5 -- Users with significantly more upvotes than downvotes
+  AND ue.UserProfileViews > 1000 -- Users with notable profile views
+
+UNION ALL -- Set operator: Combine with highly rated answers from users with specific tag interests
+
+SELECT
+    'HighlyRatedAnswers' AS UserSegment,
+    ue.UserId,
+    ue.DisplayName,
+    ue.Reputation,
+    ue.UserCreationDate,
+    ue.DaysOnPlatform,
+    ue.TotalPosts,
+    ue.QuestionsAsked,
+    ue.AnswersGiven,
+    ue.TotalComments,
+    pm.PostId,
+    pm.Title AS PostTitle,
+    pm.PostCategory,
+    pm.TrafficLevel,
+    pm.PostEngagementScore,
+    pm.UpvoteCount AS PostUpvoteCount,
+    pm.DownvoteCount AS PostDownvoteCount,
+    COALESCE(bs.TotalBadges, 0) AS UserTotalBadges,
+    COALESCE(bs.GoldBadges, 0) AS UserGoldBadges,
+    bs.HasRecentGreatAnswerBadge,
+    COALESCE(pha.TotalHistoryEvents, 0) AS PostTotalHistoryEvents,
+    COALESCE(pha.EditCount, 0) AS PostEditCount,
+    pha.MostCommonCloseReason,
+    COALESCE(qa_link.LinkedPostCount, 0) AS LinkedPostsCount,
+    COALESCE(qa_link.DuplicatePostCount, 0) AS DuplicatePostsCount,
+    (SELECT COUNT(DISTINCT pl.RelatedPostId) FROM PostLinks pl WHERE pl.PostId = pm.PostId AND pl.LinkTypeId = 1) AS DirectOutgoingLinks,
+    RANK() OVER (PARTITION BY pm.TrafficLevel ORDER BY ue.Reputation DESC, pm.PostEngagementScore DESC) AS RankInTrafficSegment,
+    pm.ScorePerViewPercentage,
+    LOWER(SUBSTRING(ue.DisplayName, 1, 5)) AS DisplayNamePrefix,
+    COALESCE(pm.AcceptedAnswerId, -1) AS AcceptedAnswerID_or_Placeholder,
+    CASE WHEN 'java' = ANY(pm.TagArray) THEN 'HasJavaTag' ELSE 'NoJavaTag' END AS HasJavaTagIndicator -- Different tag check for UNION ALL
+FROM UserEngagement ue
+INNER JOIN PostMetrics pm ON ue.UserId = pm.OwnerUserId
+LEFT JOIN BadgeSummary bs ON ue.UserId = bs.UserId
+LEFT JOIN PostHistoryAgg pha ON pm.PostId = pha.PostId
+LEFT JOIN (
+    SELECT
+        pl.PostId,
+        SUM(CASE WHEN pl.LinkTypeId = 1 THEN 1 ELSE 0 END) AS LinkedPostCount,
+        SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicatePostCount
+    FROM PostLinks pl
+    GROUP BY pl.PostId
+) AS qa_link ON pm.PostId = qa_link.PostId
+WHERE pm.PostTypeId = 2 -- Only answers
+  AND pm.Score > 50 -- Highly rated answers
+  AND pm.LastActivityDate >= '2023-01-01' -- Recently active answers
+  AND ue.AnswersGiven > 10 -- Users who gave many answers
+  -- Correlated NOT EXISTS subquery: No recent anonymous comments on the post
+  AND NOT EXISTS (SELECT 1 FROM Comments c WHERE c.PostId = pm.PostId AND c.UserId IS NULL AND c.CreationDate > '2023-06-01')
+  AND pm.TagArray @> ARRAY['java'] -- Array containment check for 'java' tag
+  AND REPLACE(LOWER(pm.Body), '<code>', '') LIKE '%exception%' -- String manipulation and LIKE operator
+  AND COALESCE(pm.AnswerCount, 0) = 0 -- Ensures it's an answer post, not a question (though redundant with PostTypeId = 2)
+  AND pm.PostEngagementScore > 200 -- Higher engagement score filter
+  AND COALESCE(pha.EditCount, 0) < 5 -- Answers with fewer than 5 edits
+  AND ue.DaysOnPlatform > 730 -- User active for more than 2 years
+  AND (pha.MostCommonCloseReason IS NULL OR pha.MostCommonCloseReason != 'Off-topic')
+ORDER BY
+    UserSegment, Reputation DESC, PostEngagementScore DESC
+LIMIT 1000;

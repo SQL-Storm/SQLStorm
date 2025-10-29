@@ -1,0 +1,333 @@
+-- {"query": "713.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3224} 
+with
+q_posts as (
+  select p.Id as QuestionId,
+         p.Title,
+         p.OwnerUserId,
+         p.CreationDate,
+         p.Score,
+         p.ViewCount,
+         p.AnswerCount,
+         p.Tags,
+         p.AcceptedAnswerId
+  from Posts p
+  where p.PostTypeId = 1
+),
+a_posts as (
+  select a.Id as AnswerId,
+         a.ParentId as QuestionId,
+         a.OwnerUserId as AnswerOwnerId,
+         a.Score as AnswerScore,
+         a.CreationDate as AnswerCreationDate
+  from Posts a
+  where a.PostTypeId = 2
+),
+tag_expanded as (
+  select q.QuestionId,
+         trim(t) as Tag
+  from q_posts q
+  cross join lateral unnest(string_to_array(substring(coalesce(q.Tags, ''), 2, greatest(length(coalesce(q.Tags, ''))-2, 0)), '><')) as t
+),
+top_tags as (
+  select Tag,
+         count(*) as TagQCount
+  from tag_expanded
+  group by Tag
+  having count(*) >= 10
+),
+user_activity as (
+  select u.Id as UserId,
+         u.DisplayName,
+         u.Reputation,
+         u.CreationDate as UserCreationDate,
+         coalesce(u.Location, 'Unknown') as Location,
+         u.UpVotes,
+         u.DownVotes,
+         u.Views,
+         sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+         sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+         sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+         count(b.Id) as TotalBadges
+  from Users u
+  left join Badges b on b.UserId = u.Id
+  group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location, u.UpVotes, u.DownVotes, u.Views
+),
+answers_ranked as (
+  select a.*,
+         row_number() over (partition by a.QuestionId order by a.AnswerScore desc nulls last, a.AnswerCreationDate asc) as rn_score,
+         dense_rank() over (partition by a.AnswerOwnerId order by a.AnswerScore desc nulls last) as owner_best_rank
+  from a_posts a
+),
+q_metrics as (
+  select q.QuestionId,
+         q.Title,
+         q.OwnerUserId,
+         q.Score as QScore,
+         q.ViewCount,
+         q.AnswerCount,
+         q.CreationDate as QCreationDate,
+         q.AcceptedAnswerId,
+         count(distinct c.Id) as CommentersOnQ,
+         sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotesOnQ,
+         sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotesOnQ,
+         sum(case when v.VoteTypeId in (8,9) then coalesce(v.BountyAmount,0) else 0 end) as BountyTotalOnQ,
+         max(ph.CreationDate) filter (where ph.PostHistoryTypeId in (4,5,6,24)) as LastEditOnQ,
+         bool_or(ph.PostHistoryTypeId = 50) as WasCommunityBumped,
+         count(distinct pl.Id) filter (where pl.LinkTypeId = 3) as DuplicateLinks
+  from q_posts q
+  left join Comments c on c.PostId = q.QuestionId
+  left join Votes v on v.PostId = q.QuestionId
+  left join PostHistory ph on ph.PostId = q.QuestionId
+  left join PostLinks pl on pl.PostId = q.QuestionId
+  group by q.QuestionId, q.Title, q.OwnerUserId, q.Score, q.ViewCount, q.AnswerCount, q.CreationDate, q.AcceptedAnswerId
+),
+q_tagged as (
+  select q.QuestionId,
+         q.Title,
+         q.OwnerUserId,
+         q.QScore,
+         q.ViewCount,
+         q.AnswerCount,
+         q.QCreationDate,
+         q.AcceptedAnswerId,
+         q.CommentersOnQ,
+         q.UpVotesOnQ,
+         q.DownVotesOnQ,
+         q.BountyTotalOnQ,
+         q.LastEditOnQ,
+         q.WasCommunityBumped,
+         q.DuplicateLinks,
+         string_agg(distinct te.Tag, '|' order by te.Tag) as TagsList,
+         count(distinct te.Tag) as TagCount
+  from q_metrics q
+  left join tag_expanded te on te.QuestionId = q.QuestionId
+  group by q.QuestionId, q.Title, q.OwnerUserId, q.QScore, q.ViewCount, q.AnswerCount, q.QCreationDate, q.AcceptedAnswerId, q.CommentersOnQ, q.UpVotesOnQ, q.DownVotesOnQ, q.BountyTotalOnQ, q.LastEditOnQ, q.WasCommunityBumped, q.DuplicateLinks
+),
+accepted_answer as (
+  select q.QuestionId,
+         aa.AnswerId as AcceptedId,
+         aa.AnswerOwnerId as AcceptedOwnerId,
+         aa.AnswerScore as AcceptedScore,
+         aa.AnswerCreationDate as AcceptedCreationDate
+  from q_posts q
+  left join a_posts aa on aa.AnswerId = q.AcceptedAnswerId
+),
+best_other_answer as (
+  select ar.QuestionId,
+         ar.AnswerId as BestNonAcceptedId,
+         ar.AnswerOwnerId as BestNonAcceptedOwnerId,
+         ar.AnswerScore as BestNonAcceptedScore,
+         ar.AnswerCreationDate as BestNonAcceptedCreationDate
+  from answers_ranked ar
+  where ar.rn_score = 1
+),
+q_vote_windows as (
+  select
+    v.PostId,
+    count(*) filter (where v.VoteTypeId = 2) as UpCount,
+    count(*) filter (where v.VoteTypeId = 3) as DownCount,
+    max(v.CreationDate) as LastVoteDate,
+    min(v.CreationDate) as FirstVoteDate,
+    count(*) as TotalVotes,
+    (count(*) filter (where v.VoteTypeId = 2) - count(*) filter (where v.VoteTypeId = 3))::int as NetVotes
+  from Votes v
+  group by v.PostId
+),
+dupe_graph as (
+  select pl.RelatedPostId as CanonicalId,
+         count(*) as DupeCount,
+         count(distinct pl.PostId) as DistinctDupes
+  from PostLinks pl
+  where pl.LinkTypeId = 3
+  group by pl.RelatedPostId
+),
+user_recent_activity as (
+  select
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.Location,
+    ua.TotalBadges,
+    coalesce(avg(extract(epoch from age(cast('2024-10-01 12:34:56' as timestamp), p.CreationDate))/86400.0), 0) as AvgPostAgeDays,
+    coalesce(sum(case when p.PostTypeId = 1 then 1 else 0 end), 0) as QCount,
+    coalesce(sum(case when p.PostTypeId = 2 then 1 else 0 end), 0) as ACount,
+    coalesce(sum(case when p.Score > 0 then 1 else 0 end), 0) as PositivePosts
+  from user_activity ua
+  left join Posts p on p.OwnerUserId = ua.UserId
+    and p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+  group by ua.UserId, ua.DisplayName, ua.Reputation, ua.Location, ua.TotalBadges
+),
+flag_hot_candidates as (
+  select
+    qt.QuestionId,
+    case
+      when qt.ViewCount >= 10000 and qt.QScore >= 10 then 'VeryHot'
+      when qt.ViewCount >= 3000 and qt.QScore >= 5 then 'Hot'
+      when qt.ViewCount >= 1000 and qt.QScore >= 2 then 'Warm'
+      else 'Cold'
+    end as Heat
+  from q_tagged qt
+),
+quality_score as (
+  select
+    qt.QuestionId,
+    (
+      coalesce(qvw.NetVotes, 0) * 1.5
+      + coalesce(qt.AnswerCount, 0) * 0.75
+      + case when aa.AcceptedId is not null then 5 else 0 end
+      + least(coalesce(qt.ViewCount,0)/1000.0, 20)
+      - coalesce(qt.DownVotesOnQ, 0) * 0.5
+      + coalesce(dg.DupeCount, 0) * -2
+      + case when qt.WasCommunityBumped then -1 else 0 end
+    ) as QualityScore
+  from q_tagged qt
+  left join q_vote_windows qvw on qvw.PostId = qt.QuestionId
+  left join accepted_answer aa on aa.QuestionId = qt.QuestionId
+  left join dupe_graph dg on dg.CanonicalId = qt.QuestionId
+),
+comment_polarity as (
+  select
+    c.PostId,
+    avg(case
+          when c.Score is null then 0
+          when c.Score >= 5 then 2
+          when c.Score >= 1 then 1
+          when c.Score <= -1 then -1
+          else 0
+        end) as AvgCommentPolarity,
+    sum(case when c.Score >= 5 then 1 else 0 end) as HighScoreCommentCount
+  from Comments c
+  group by c.PostId
+),
+title_features as (
+  select
+    qt.QuestionId,
+    length(coalesce(qt.Title,'')) as TitleLen,
+    length(regexp_replace(coalesce(qt.Title,''), '[^A-Za-z]+', '', 'g')) as AlphaChars,
+    length(regexp_replace(coalesce(qt.Title,''), '[^0-9]+', '', 'g')) as DigitChars,
+    regexp_count(coalesce(qt.Title,''), '\?') as QuestionMarks,
+    regexp_count(coalesce(qt.Title,''), '!') as Exclamations,
+    case when qt.Title ~* '\bhow|why|what|when|where|can|should|is|are\b' then 1 else 0 end as WhWordPresent
+  from q_tagged qt
+),
+question_age as (
+  select
+    qt.QuestionId,
+    extract(epoch from age(cast('2024-10-01 12:34:56' as timestamp), qt.QCreationDate))/86400.0 as AgeDays
+  from q_tagged qt
+),
+owner_stats as (
+  select
+    qt.QuestionId,
+    ura.UserId as OwnerId,
+    ura.DisplayName as OwnerName,
+    ura.Reputation as OwnerReputation,
+    ura.Location as OwnerLocation,
+    ura.TotalBadges as OwnerTotalBadges,
+    ura.QCount as OwnerQCountY1,
+    ura.ACount as OwnerACountY1
+  from q_tagged qt
+  left join user_recent_activity ura on ura.UserId = qt.OwnerUserId
+),
+ranked_quality as (
+  select
+    qs.QuestionId,
+    qs.QualityScore,
+    ntile(10) over (order by qs.QualityScore desc nulls last) as QualityDecile
+  from quality_score qs
+),
+final_agg as (
+  select
+    qt.QuestionId,
+    qt.Title,
+    qt.TagsList,
+    qt.TagCount,
+    qt.QScore,
+    qt.ViewCount,
+    qt.AnswerCount,
+    qt.UpVotesOnQ,
+    qt.DownVotesOnQ,
+    qt.BountyTotalOnQ,
+    qt.CommentersOnQ,
+    qt.LastEditOnQ,
+    qt.WasCommunityBumped,
+    qt.DuplicateLinks,
+    aa.AcceptedId,
+    aa.AcceptedOwnerId,
+    aa.AcceptedScore,
+    bo.BestNonAcceptedId,
+    bo.BestNonAcceptedOwnerId,
+    bo.BestNonAcceptedScore,
+    qvw.TotalVotes,
+    qvw.NetVotes,
+    qvw.LastVoteDate,
+    fp.Heat,
+    qs.QualityScore,
+    rq.QualityDecile,
+    cp.AvgCommentPolarity,
+    cp.HighScoreCommentCount,
+    tf.TitleLen,
+    tf.AlphaChars,
+    tf.DigitChars,
+    tf.QuestionMarks,
+    tf.Exclamations,
+    tf.WhWordPresent,
+    qa.AgeDays,
+    os.OwnerId,
+    os.OwnerName,
+    os.OwnerReputation,
+    os.OwnerLocation,
+    os.OwnerTotalBadges,
+    os.OwnerQCountY1,
+    os.OwnerACountY1
+  from q_tagged qt
+  left join accepted_answer aa on aa.QuestionId = qt.QuestionId
+  left join best_other_answer bo on bo.QuestionId = qt.QuestionId
+  left join q_vote_windows qvw on qvw.PostId = qt.QuestionId
+  left join flag_hot_candidates fp on fp.QuestionId = qt.QuestionId
+  left join quality_score qs on qs.QuestionId = qt.QuestionId
+  left join ranked_quality rq on rq.QuestionId = qt.QuestionId
+  left join comment_polarity cp on cp.PostId = qt.QuestionId
+  left join title_features tf on tf.QuestionId = qt.QuestionId
+  left join question_age qa on qa.QuestionId = qt.QuestionId
+  left join owner_stats os on os.QuestionId = qt.QuestionId
+),
+subset as (
+  select fa.*
+  from final_agg fa
+  where
+    fa.TagCount between 1 and 5
+    and coalesce(fa.ViewCount,0) >= 100
+    and (fa.AcceptedId is not null or fa.AnswerCount >= 2)
+    and not exists (
+      select 1
+      from PostHistory ph
+      where ph.PostId = fa.QuestionId
+        and ph.PostHistoryTypeId in (12,10) -- deleted or closed
+        and ph.CreationDate > fa.QCreationDate
+    )
+)
+select *
+from (
+  select
+    s.*,
+    case
+      when s.QualityDecile <= 2 and s.Heat in ('VeryHot','Hot') then 'Anomaly: Hot but low quality'
+      when s.QualityDecile >= 9 and s.Heat in ('Cold') then 'Anomaly: Cold but high quality'
+      when s.AcceptedId is null and coalesce(s.BestNonAcceptedScore, -999) >= coalesce(s.AcceptedScore, -999) then 'Potential mis-accepted'
+      else null
+    end as DiagnosticFlag,
+    rank() over (
+      partition by coalesce(split_part(s.OwnerLocation, ',', 1), 'Unknown')
+      order by s.QualityScore desc nulls last, s.ViewCount desc nulls last
+    ) as RankWithinLocation
+  from subset s
+) z
+where
+  (z.DiagnosticFlag is not null or z.QualityDecile in (1,10))
+  and coalesce(z.OwnerReputation,0) >= 50
+order by
+  z.QualityDecile asc,
+  z.QualityScore desc nulls last,
+  z.ViewCount desc nulls last
+limit 500;

@@ -1,0 +1,200 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS prev_score,
+        COALESCE(p.Score, 0) - COALESCE(LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate), 0) AS score_change,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.Score > 10 THEN 'HighlyRankedQuestion'
+            WHEN p.PostTypeId = 2 AND p.Score > 5 THEN 'HighlyRankedAnswer'
+            ELSE 'Other'
+        END AS post_category
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) AND p.CreationDate >= TIMESTAMP '2022-01-01'
+),
+UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS total_posts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS question_count,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS answer_count,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS total_question_score,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS total_answer_score,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END) AS avg_question_score,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE NULL END) AS avg_answer_score,
+        MAX(p.CreationDate) AS last_post_date,
+        STRING_AGG(DISTINCT p.Tags, '; ') AS all_tags,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS gold_badges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS silver_badges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS bronze_badges
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.CreationDate >= TIMESTAMP '2022-01-01'
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        rp.Id AS PostId,
+        rp.Title,
+        rp.Tags,
+        rp.Score,
+        rp.ViewCount,
+        rp.Score - COALESCE(rp.prev_score, 0) AS score_difference,
+        rp.post_category,
+        rp.rn,
+        CASE 
+            WHEN rp.Score > 100 THEN 'Viral'
+            WHEN rp.Score > 50 THEN 'Popular'
+            WHEN rp.Score > 10 THEN 'Moderate'
+            ELSE 'Low'
+        END AS popularity_level,
+        CASE 
+            WHEN rp.score_change > 10 THEN 'Spike'
+            WHEN rp.score_change < -10 THEN 'Decline'
+            WHEN ABS(rp.score_change) <= 5 THEN 'Stable'
+            ELSE 'Fluctuating'
+        END AS trend_analysis,
+        'Post_' || rp.Id || '_' || rp.post_category AS post_identifier,
+        COALESCE(rp.AnswerCount, 0) AS answer_count,
+        COALESCE(rp.CommentCount, 0) AS comment_count,
+        COALESCE(rp.FavoriteCount, 0) AS favorite_count,
+        CASE 
+            WHEN rp.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN rp.PostTypeId = 1 AND rp.AnswerCount > 0 THEN 'Answered'
+            WHEN rp.PostTypeId = 1 AND rp.AnswerCount = 0 THEN 'Unanswered'
+            ELSE 'Other'
+        END AS question_status,
+        rp.OwnerUserId AS UserId
+    FROM RankedPosts rp
+    WHERE rp.rn <= 10
+),
+FinalAnalysis AS (
+    SELECT 
+        pa.PostId,
+        pa.Title,
+        pa.Tags,
+        pa.Score,
+        pa.ViewCount,
+        pa.score_difference,
+        pa.popularity_level,
+        pa.trend_analysis,
+        pa.post_identifier,
+        pa.answer_count,
+        pa.comment_count,
+        pa.favorite_count,
+        pa.question_status,
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.Views,
+        us.total_posts,
+        us.question_count,
+        us.answer_count AS user_answer_count,
+        us.total_question_score,
+        us.total_answer_score,
+        us.avg_question_score,
+        us.avg_answer_score,
+        us.gold_badges,
+        us.silver_badges,
+        us.bronze_badges,
+        CASE 
+            WHEN us.Reputation > 10000 THEN 'Expert'
+            WHEN us.Reputation > 1000 THEN 'Advanced'
+            WHEN us.Reputation > 100 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END AS user_level,
+        CASE 
+            WHEN us.question_count > 100 THEN 'Veteran'
+            WHEN us.question_count > 50 THEN 'Experienced'
+            WHEN us.question_count > 10 THEN 'Active'
+            ELSE 'New'
+        END AS activity_level,
+        CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - us.last_post_date)) / 86400 AS INTEGER) AS days_since_last_post
+    FROM ComplexPostAnalysis pa
+    INNER JOIN UserStats us ON pa.UserId = us.UserId
+    WHERE 
+        (pa.Score > 25 OR pa.ViewCount > 1000)
+        AND (us.Reputation > 100 OR us.total_posts > 5)
+        AND (pa.popularity_level IN ('Viral', 'Popular') OR pa.trend_analysis IN ('Spike', 'Stable'))
+)
+SELECT 
+    fa.PostId,
+    fa.Title,
+    fa.Tags,
+    fa.Score,
+    fa.ViewCount,
+    fa.score_difference,
+    fa.popularity_level,
+    fa.trend_analysis,
+    fa.post_identifier,
+    fa.answer_count,
+    fa.comment_count,
+    fa.favorite_count,
+    fa.question_status,
+    fa.UserId,
+    fa.DisplayName,
+    fa.Reputation,
+    fa.Views,
+    fa.total_posts,
+    fa.question_count,
+    fa.user_answer_count AS answer_count,
+    fa.total_question_score,
+    fa.total_answer_score,
+    fa.avg_question_score,
+    fa.avg_answer_score,
+    fa.gold_badges,
+    fa.silver_badges,
+    fa.bronze_badges,
+    fa.user_level,
+    fa.activity_level,
+    fa.days_since_last_post,
+    RANK() OVER (ORDER BY fa.Score DESC, fa.ViewCount DESC) AS global_rank,
+    DENSE_RANK() OVER (PARTITION BY fa.user_level ORDER BY fa.Score DESC) AS user_level_rank,
+    NTILE(4) OVER (ORDER BY fa.Score) AS score_quartile,
+    LAG(fa.Score, 1) OVER (ORDER BY fa.Score DESC) AS previous_score,
+    LAG(fa.ViewCount, 1) OVER (ORDER BY fa.Score DESC) AS previous_views,
+    CASE 
+        WHEN fa.days_since_last_post > 30 THEN 'Inactive'
+        WHEN fa.days_since_last_post > 7 THEN 'Moderate'
+        WHEN fa.days_since_last_post > 1 THEN 'Active'
+        ELSE 'Very Active'
+    END AS user_activity_level,
+    ROUND(
+        (fa.Score * 0.3 + 
+         fa.ViewCount * 0.2 + 
+         fa.answer_count * 1.5 + 
+         fa.comment_count * 2.0 + 
+         fa.favorite_count * 3.0 +
+         (CASE WHEN fa.question_status = 'Answered' THEN 1 ELSE 0 END) * 2.5 +
+         (CASE WHEN fa.popularity_level = 'Viral' THEN 10 ELSE 0 END) +
+         (CASE WHEN fa.trend_analysis = 'Spike' THEN 5 ELSE 0 END)
+        ) / 10.0, 2) AS engagement_score
+FROM FinalAnalysis fa
+WHERE 
+    (fa.score_difference > 5 OR fa.score_difference < -5)
+    AND fa.Reputation >= 500
+    AND fa.total_posts >= 3
+    AND (fa.user_level IN ('Expert', 'Advanced') OR fa.activity_level IN ('Veteran', 'Experienced'))
+    AND fa.days_since_last_post BETWEEN 0 AND 90
+    AND fa.question_status IN ('Answered', 'Closed')
+ORDER BY 
+    fa.Score DESC,
+    fa.ViewCount DESC,
+    fa.engagement_score DESC
+LIMIT 500;

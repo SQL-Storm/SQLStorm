@@ -1,0 +1,101 @@
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN p.Id END) AS QuestionsWithAcceptedAnswer,
+    COUNT(DISTINCT b.Id) AS BadgesReceived,
+    COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+    COALESCE(SUM(p.Score), 0) AS TotalScore,
+    COALESCE(AVG(p.Score), 0) AS AverageScore,
+    MAX(p.CreationDate) AS LastPostDate,
+    MIN(p.CreationDate) AS FirstPostDate,
+    EXTRACT(day FROM MAX(p.CreationDate) - MIN(p.CreationDate)) AS DaysActive,
+    ROW_NUMBER() OVER (PARTITION BY EXTRACT(year FROM u.CreationDate) ORDER BY u.Reputation DESC) AS RepRankInYear,
+    (
+      SELECT t.TagName
+      FROM Tags t
+      JOIN Posts p2 ON p2.Tags LIKE '%' || t.TagName || '%'
+      WHERE p2.OwnerUserId = u.Id
+      GROUP BY t.TagName
+      ORDER BY COUNT(*) DESC
+      FETCH FIRST 1 ROWS ONLY
+    ) AS MostActiveTag,
+    CASE 
+        WHEN u.Reputation >= 100000 THEN 'Elite'
+        WHEN u.Reputation >= 10000 THEN 'Master'
+        WHEN u.Reputation >= 1000 THEN 'Expert'
+        WHEN u.Reputation >= 100 THEN 'Novice'
+        ELSE 'Beginner'
+    END AS UserTier,
+    (
+      SELECT COUNT(*) FROM Users u2 
+      WHERE u2.Reputation > 10000 
+        AND NOT EXISTS (SELECT 1 FROM Posts p3 WHERE p3.OwnerUserId = u2.Id)
+    ) AS HighRepNoPosts,
+    COALESCE(SUBSTRING(u.WebsiteUrl FROM 1 FOR 20), 'No Website') AS WebsiteShort,
+    COALESCE(u.Location, 'Unknown Location') AS LocationNormalized,
+    (
+      SELECT STRING_AGG(CAST(PostsCount AS VARCHAR), ', ')
+      FROM (
+        SELECT 
+          EXTRACT(year FROM p.CreationDate) AS Year,
+          EXTRACT(month FROM p.CreationDate) AS Month,
+          COUNT(*) AS PostsCount,
+          SUM(p.Score) AS TotalScorePerMonth
+        FROM Posts p
+        WHERE p.OwnerUserId = u.Id 
+          AND p.CreationDate >= (CAST('2024-10-01' AS DATE)) - INTERVAL '1' YEAR
+        GROUP BY EXTRACT(year FROM p.CreationDate), EXTRACT(month FROM p.CreationDate)
+      ) AS MonthlyStats
+    ) AS MonthlyPostCounts,
+    COALESCE((
+      SELECT COUNT(*) FROM Posts p4 
+      JOIN PostHistory ph2 ON p4.Id = ph2.PostId
+      WHERE p4.OwnerUserId = u.Id 
+        AND ph2.PostHistoryTypeId IN (1, 2, 3)
+    ), 0) AS EditCount,
+    CASE WHEN u.Views IS NOT NULL THEN (u.Views - COALESCE(u.UpVotes, 0) - COALESCE(u.DownVotes, 0)) ELSE 0 END AS NetViews,
+    CASE WHEN COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) > 0 
+         AND COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) = 0 
+         AND COUNT(DISTINCT CASE WHEN v.VoteTypeId = 5 THEN v.Id END) > 50 
+         THEN 'Active Supporter'
+         WHEN COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) = 0 
+         AND COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) > 50 
+         AND COUNT(DISTINCT CASE WHEN v.VoteTypeId = 5 THEN v.Id END) > 0 
+         THEN 'Critically Engaged'
+         ELSE 'Regular User'
+    END AS UserEngagementType,
+    (
+      SELECT COUNT(DISTINCT SUBSTRING(t.TagName FROM 1 FOR (POSITION(' ' IN (t.TagName || ' ')) - 1)))
+      FROM Tags t
+      JOIN Posts p5 ON p5.Tags LIKE '%' || t.TagName || '%'
+      WHERE p5.OwnerUserId = u.Id
+        AND t.TagName LIKE '%-%'
+    ) AS HyphenatedTagCount
+FROM Users u
+LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+LEFT JOIN Badges b ON b.UserId = u.Id
+LEFT JOIN Votes v ON v.UserId = u.Id
+LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+WHERE u.Reputation >= 100 
+  AND u.CreationDate >= (CAST('2024-10-01' AS DATE)) - INTERVAL '5' YEAR
+  AND (p.PostTypeId = 1 OR p.PostTypeId = 2 OR p.PostTypeId IS NULL)
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation, u.WebsiteUrl, u.Location, u.Views, u.UpVotes, u.DownVotes, u.CreationDate
+HAVING 
+    COUNT(DISTINCT p.Id) >= 1
+    AND COUNT(DISTINCT b.Id) >= 0
+    AND (
+        MAX(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) > 10
+        OR MAX(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) > 5
+        OR COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 5
+    )
+ORDER BY 
+    u.Reputation DESC,
+    COUNT(DISTINCT p.Id) DESC,
+    COALESCE(SUM(p.Score), 0) DESC;

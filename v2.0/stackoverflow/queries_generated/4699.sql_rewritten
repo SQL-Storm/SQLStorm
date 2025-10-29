@@ -1,0 +1,111 @@
+-- {"query": "4699.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1296} 
+WITH UserPostActivity AS (
+    SELECT
+        p.OwnerUserId,
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.CommentCount,
+        p.FavoriteCount,
+        pt.Name AS PostTypeName,
+        ROW_NUMBER() OVER(PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.OwnerUserId IS NOT NULL
+),
+UserEngagement AS (
+    SELECT
+        c.UserId,
+        COUNT(c.Id) AS CommentCount,
+        SUM(c.Score) AS CommentScoreSum,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+    GROUP BY c.UserId
+),
+UserVoteSummary AS (
+    SELECT
+        v.UserId,
+        COUNT(CASE WHEN vt.Name = 'UpMod' THEN v.Id END) AS UpVoteCount,
+        COUNT(CASE WHEN vt.Name = 'DownMod' THEN v.Id END) AS DownVoteCount,
+        COUNT(CASE WHEN vt.Name = 'Favorite' THEN v.Id END) AS FavoriteVoteCount
+    FROM Votes v
+    JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    WHERE v.UserId IS NOT NULL
+    GROUP BY v.UserId
+),
+RankedUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.Views AS UserViews,
+        u.UpVotes AS UserTotalUpVotes,
+        u.DownVotes AS UserTotalDownVotes,
+        COALESCE(ue.CommentCount, 0) AS TotalCommentsMade,
+        COALESCE(ue.CommentScoreSum, 0) AS TotalCommentScore,
+        COALESCE(uvs.UpVoteCount, 0) AS TotalUpVotesReceived,
+        COALESCE(uvs.DownVoteCount, 0) AS TotalDownVotesReceived,
+        COALESCE(uvs.FavoriteVoteCount, 0) AS TotalFavoritesGiven,
+        CASE
+            WHEN u.LastAccessDate < DATE_SUB(cast('2024-10-01 12:34:56' as timestamp), INTERVAL 365 DAY) THEN 'Inactive'
+            WHEN u.LastAccessDate < DATE_SUB(cast('2024-10-01 12:34:56' as timestamp), INTERVAL 90 DAY) THEN 'Less Active'
+            ELSE 'Active'
+        END AS UserActivityStatus,
+        ROW_NUMBER() OVER(ORDER BY u.Reputation DESC) as UserReputationRank
+    FROM Users u
+    LEFT JOIN UserEngagement ue ON u.Id = ue.UserId
+    LEFT JOIN UserVoteSummary uvs ON u.Id = uvs.UserId
+)
+SELECT
+    ru.UserId,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.UserCreationDate,
+    ru.UserActivityStatus,
+    ru.UserReputationRank,
+    ru.TotalCommentsMade,
+    ru.TotalCommentScore,
+    ru.TotalUpVotesReceived,
+    ru.TotalDownVotesReceived,
+    ru.TotalFavoritesGiven,
+    COALESCE(upa_q.rn, 0) AS MostRecentQuestionRank,
+    COALESCE(upa_q.PostTypeName, 'N/A') AS MostRecentPostType,
+    COALESCE(upa_q.PostScore, 0) AS MostRecentPostScore,
+    COALESCE(upa_q.CommentCount, 0) AS MostRecentPostComments,
+    COALESCE(upa_q.FavoriteCount, 0) AS MostRecentPostFavorites,
+    SUM(CASE WHEN ph.PostHistoryTypeId = 2 THEN 1 ELSE 0 END) AS BodyEditCount,
+    SUM(CASE WHEN ph.PostHistoryTypeId = 4 THEN 1 ELSE 0 END) AS TitleEditCount,
+    COUNT(DISTINCT pl.RelatedPostId) AS LinkedPostsCount,
+    AVG(upa_a.PostScore) OVER (PARTITION BY ru.UserId) AS AvgAnswerScoreForUser,
+    CASE
+        WHEN EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = ru.UserId AND b.Name LIKE '%Teacher%') THEN 'Has Teacher Badge'
+        ELSE 'No Teacher Badge'
+    END AS TeacherBadgeStatus
+FROM RankedUsers ru
+LEFT JOIN UserPostActivity upa_q ON ru.UserId = upa_q.OwnerUserId AND upa_q.rn = 1
+LEFT JOIN Posts p_a ON ru.UserId = p_a.OwnerUserId AND p_a.PostTypeId = 2
+LEFT JOIN UserPostActivity upa_a ON ru.UserId = upa_a.OwnerUserId AND upa_a.PostTypeId = 2
+LEFT JOIN PostHistory ph ON ru.UserId = ph.UserId
+LEFT JOIN PostLinks pl ON ru.UserId = pl.PostId OR ru.UserId = pl.RelatedPostId
+GROUP BY
+    ru.UserId,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.UserCreationDate,
+    ru.UserActivityStatus,
+    ru.UserReputationRank,
+    ru.TotalCommentsMade,
+    ru.TotalCommentScore,
+    ru.TotalUpVotesReceived,
+    ru.TotalDownVotesReceived,
+    ru.TotalFavoritesGiven,
+    upa_q.rn,
+    upa_q.PostTypeName,
+    upa_q.PostScore,
+    upa_q.CommentCount,
+    upa_q.FavoriteCount
+HAVING ru.Reputation > 1000 AND ru.UserReputationRank <= 5000
+ORDER BY ru.UserReputationRank;

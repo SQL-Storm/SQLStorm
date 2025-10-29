@@ -1,0 +1,341 @@
+-- {"query": "7860.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 3315} 
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        MAX(p.CreationDate) as LastPostDate,
+        DATEDIFF(day, MIN(p.CreationDate), MAX(p.CreationDate)) as ActiveDays,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), ', ') as AllTags,
+        AVG(p.Score) as AvgPostScore,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) as AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) as AvgAnswerScore,
+        PERCENT_RANK() OVER (ORDER BY u.Reputation) as ReputationPercentile,
+        ROW_NUMBER() OVER (PARTITION BY u.AccountId ORDER BY u.CreationDate) as UserAccountSequence
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.AccountId
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        PostCount,
+        CommentCount,
+        BadgeCount,
+        QuestionCount,
+        AnswerCount,
+        LastPostDate,
+        ActiveDays,
+        AllTags,
+        AvgPostScore,
+        AvgQuestionScore,
+        AvgAnswerScore,
+        ReputationPercentile,
+        UserAccountSequence,
+        RANK() OVER (ORDER BY Reputation DESC) as ReputationRank,
+        DENSE_RANK() OVER (ORDER BY PostCount DESC) as PostRank,
+        DENSE_RANK() OVER (ORDER BY CommentCount DESC) as CommentRank,
+        DENSE_RANK() OVER (ORDER BY BadgeCount DESC) as BadgeRank,
+        CASE 
+            WHEN Reputation > 100000 THEN 'Elite'
+            WHEN Reputation > 10000 THEN 'Master'
+            WHEN Reputation > 1000 THEN 'Expert'
+            ELSE 'Regular'
+        END as UserTier,
+        CASE 
+            WHEN PostCount > 1000 THEN 'Veteran'
+            WHEN PostCount > 100 THEN 'Experienced'
+            WHEN PostCount > 10 THEN 'Beginner'
+            ELSE 'Newbie'
+        END as PostLevel
+    FROM UserStats
+),
+QuestionAnalysis AS (
+    SELECT 
+        p.Id as QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        DATEDIFF(day, p.CreationDate, p.LastActivityDate) as DaysActive,
+        EXISTS (SELECT 1 FROM Posts a WHERE a.ParentId = p.Id AND a.Score > 0) as HasHighScoreAnswer,
+        (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = p.Id AND a.CreationDate >= p.CreationDate) as TotalAnswers,
+        (SELECT AVG(a.Score) FROM Posts a WHERE a.ParentId = p.Id) as AvgAnswerScore,
+        (SELECT MAX(a.Score) FROM Posts a WHERE a.ParentId = p.Id) as BestAnswerScore,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) as Upvotes,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) as Downvotes,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) as CommentCount,
+        CASE 
+            WHEN p.ViewCount > 1000 THEN 'Viral'
+            WHEN p.ViewCount > 100 THEN 'Popular'
+            WHEN p.ViewCount > 10 THEN 'Noticeable'
+            ELSE 'Obscure'
+        END as PopularityLevel,
+        CASE 
+            WHEN p.AnswerCount > 10 THEN 'WellAnswered'
+            WHEN p.AnswerCount > 1 THEN 'Answered'
+            ELSE 'Unanswered'
+        END as AnswerStatus,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) as ScoreRank,
+        NTILE(5) OVER (ORDER BY p.ViewCount DESC) as ViewQuartile,
+        PERCENT_RANK() OVER (ORDER BY p.AnswerCount DESC) as AnswerPercentile
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.CreationDate > '2020-01-01'
+),
+AnswerAnalysis AS (
+    SELECT 
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId,
+        a.Score,
+        a.CreationDate,
+        a.LastActivityDate,
+        a.Body,
+        LENGTH(a.Body) as BodyLength,
+        DATEDIFF(day, a.CreationDate, a.LastActivityDate) as DaysActive,
+        DATEDIFF(day, (SELECT MIN(q.CreationDate) FROM Posts q WHERE q.Id = a.ParentId), a.CreationDate) as DaysSinceQuestion,
+        (SELECT q.Score FROM Posts q WHERE q.Id = a.ParentId) as QuestionScore,
+        (SELECT COUNT(*) FROM Posts q WHERE q.ParentId = a.ParentId) as TotalAnswersToQuestion,
+        DENSE_RANK() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC) as AnswerRankInQuestion,
+        CASE 
+            WHEN a.Score > 50 THEN 'Excellent'
+            WHEN a.Score > 10 THEN 'Good'
+            WHEN a.Score > 0 THEN 'Average'
+            ELSE 'Poor'
+        END as QualityRating,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.CreationDate ASC) as AnswerSequence,
+        RANK() OVER (ORDER BY a.Score DESC) as ScoreRankOverall
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+),
+CombinedAnalysis AS (
+    SELECT 
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.PostCount,
+        tu.QuestionCount,
+        tu.AnswerCount,
+        tu.Comments,
+        tu.BadgeCount,
+        tu.ReputationPercentile,
+        tu.UserTier,
+        tu.PostLevel,
+        tu.ReputationRank,
+        q.QuestionId,
+        q.Title,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.AnswerCount as QuestionAnswerCount,
+        q.CommentCount as QuestionCommentCount,
+        q.DaysActive as QuestionDaysActive,
+        q.HasHighScoreAnswer,
+        q.AvgAnswerScore,
+        q.BestAnswerScore,
+        q.Upvotes,
+        q.Downvotes,
+        q.PopularityLevel,
+        q.AnswerStatus,
+        q.ScoreRank as QuestionScoreRank,
+        q.ViewQuartile,
+        q.AnswerPercentile,
+        a.AnswerId,
+        a.Score as AnswerScore,
+        a.DaysActive as AnswerDaysActive,
+        a.BodyLength,
+        a.DaysSinceQuestion,
+        a.QuestionScore as AnswerQuestionScore,
+        a.AnswerRankInQuestion,
+        a.QualityRating,
+        a.AnswerSequence,
+        a.ScoreRankOverall,
+        CASE 
+            WHEN q.Score > 0 AND a.Score > 0 THEN (q.Score + a.Score) / (q.Score + 1)
+            ELSE 0
+        END as ScoreEfficiency,
+        CASE 
+            WHEN ISNULL(q.Tags, '') = '' THEN 'No Tags'
+            WHEN LEN(q.Tags) > 200 THEN 'Many Tags'
+            ELSE 'Normal Tags'
+        END as TagComplexity,
+        CASE 
+            WHEN q.AnswerCount > 5 AND q.AnswerCount * 1.0 / (q.ViewCount + 1) > 0.05 THEN 'Active Questions'
+            WHEN q.AnswerCount = 0 THEN 'Unanswered Questions'
+            ELSE 'Inactive Questions'
+        END as QuestionActivity,
+        ROW_NUMBER() OVER (PARTITION BY tu.UserId ORDER BY a.Score DESC) as TopAnswersPerUser,
+        DENSE_RANK() OVER (ORDER BY (q.Score + a.Score) DESC) as CombinedScoreRank
+    FROM TopUsers tu
+    LEFT JOIN QuestionAnalysis q ON tu.UserId = q.OwnerUserId
+    LEFT JOIN AnswerAnalysis a ON tu.UserId = a.OwnerUserId
+    WHERE (q.QuestionId IS NOT NULL OR a.AnswerId IS NOT NULL)
+),
+FinalAnalysis AS (
+    SELECT 
+        *,
+        CASE 
+            WHEN Reputation > 50000 AND QuestionCount > 50 THEN 'HighlyActive'
+            WHEN Reputation > 10000 AND QuestionCount > 20 THEN 'Active'
+            WHEN Reputation > 5000 THEN 'Moderate'
+            ELSE 'Inactive'
+        END as UserActivityLevel,
+        CASE 
+            WHEN QuestionScore > 100 AND ViewCount > 1000 THEN 'HighImpact'
+            WHEN QuestionScore > 50 THEN 'MediumImpact'
+            WHEN QuestionScore > 10 THEN 'LowImpact'
+            ELSE 'MinimalImpact'
+        END as QuestionImpact,
+        NULLIF(AnswerScore, 0) as SafeAnswerScore,
+        COALESCE(ScoreEfficiency, 0) as FinalScoreEfficiency,
+        COALESCE(AnswerQuestionScore, 0) as RelatedQuestionScore,
+        CASE 
+            WHEN ReputationPercentile > 0.9 THEN 'TopTier'
+            WHEN ReputationPercentile > 0.75 THEN 'HighTier'
+            WHEN ReputationPercentile > 0.5 THEN 'MediumTier'
+            ELSE 'LowTier'
+        END as ReputationTier,
+        CASE 
+            WHEN QuestionAnswerCount > 10 THEN 'HighlyAnswered'
+            WHEN QuestionAnswerCount > 5 THEN 'ModeratelyAnswered'
+            WHEN QuestionAnswerCount > 1 THEN 'SlightlyAnswered'
+            ELSE 'Unanswered'
+        END as QuestionAnswerStatus,
+        CASE 
+            WHEN ViewQuartile = 1 THEN 'TopViewed'
+            WHEN ViewQuartile = 2 THEN 'HighViewed'
+            WHEN ViewQuartile = 3 THEN 'MediumViewed'
+            WHEN ViewQuartile = 4 THEN 'LowViewed'
+            ELSE 'VeryLowViewed'
+        END as ViewingQuartile,
+        CASE 
+            WHEN UserAccountSequence > 1 THEN 'UserDuplicate'
+            WHEN UserAccountSequence = 1 THEN 'PrimaryAccount'
+            ELSE 'UnknownAccount'
+        END as AccountType,
+        IIF(AnswerRankInQuestion <= 1, 1, 0) as IsBestAnswer,
+        CASE 
+            WHEN AVG(QuestionScore) OVER (PARTITION BY UserId) > 50 THEN 'AboveAverage'
+            ELSE 'BelowAverage'
+        END as QuestionPerformance,
+        IIF(Reputation > 10000 AND QuestionCount > 10 AND BadgeCount > 5, 1, 0) as EliteContributor,
+        COALESCE(ScoreRankOverall, 0) as OverallAnswerRank,
+        COALESCE(AnswerSequence, 0) as AnswerOrder,
+        CASE 
+            WHEN Tags IS NOT NULL AND Tags <> '' THEN LEN(Tags) - LEN(REPLACE(Tags, '>', '')) + 1
+            ELSE 0
+        END as TagCount,
+        CASE 
+            WHEN DATEDIFF(day, LastPostDate, GETDATE()) < 30 THEN 'ActiveLast30Days'
+            WHEN DATEDIFF(day, LastPostDate, GETDATE()) < 90 THEN 'ActiveLast90Days'
+            WHEN DATEDIFF(day, LastPostDate, GETDATE()) < 365 THEN 'ActiveLastYear'
+            ELSE 'InactiveLongTerm'
+        END as ActivityStatus,
+        DATEDIFF(day, LastPostDate, MAX(LastPostDate) OVER ()) as DaysSinceLastActivity,
+        CAST(ScoreEfficiency * 100 AS DECIMAL(5,2)) as ScoreEfficiencyPercentage,
+        IIF(AnswerRankInQuestion = 1 AND AnswerScore > 0, 1, 0) as Rank1Answer,
+        CASE 
+            WHEN AVG(AnswerScore) OVER (PARTITION BY QuestionId) > 10 THEN 'HighAvgAnswerScore'
+            ELSE 'AverageAnswerScore'
+        END as AverageAnswerQuality,
+        IIF(PostCount > 100 AND AVG(QuestionScore) OVER (PARTITION BY UserId) > 10, 1, 0) as HighVolume,
+        COALESCE(ReputationRank, 0) as ReputationRanking,
+        COALESCE(PostRank, 0) as PostRanking,
+        COALESCE(CommentRank, 0) as CommentRanking,
+        COALESCE(BadgeRank, 0) as BadgeRanking,
+        IIF(ReputationRank < 100 OR PostRank < 100, 1, 0) as TopRankings,
+        IIF(Reputation > 50000 AND Badges > 50, 1, 0) as ReputableUser,
+        COALESCE(AvgQuestionScore, 0) as OverallAvgQuestionScore,
+        COALESCE(AvgAnswerScore, 0) as OverallAvgAnswerScore,
+        IIF(AnswerCount > QuestionCount AND AnswerCount > 10, 1, 0) as MoreAnswersThanQuestions
+    FROM CombinedAnalysis
+)
+SELECT 
+    UserId,
+    DisplayName,
+    Reputation,
+    PostCount,
+    QuestionCount,
+    AnswerCount,
+    CommentCount,
+    BadgeCount,
+    ReputationPercentile,
+    UserTier,
+    PostLevel,
+    UserActivityLevel,
+    QuestionImpact,
+    QuestionScore,
+    ViewCount,
+    AnswerCount as QuestionAnswerCount,
+    QuestionCommentCount,
+    DaysActive as QuestionDaysActive,
+    HasHighScoreAnswer,
+    AvgAnswerScore,
+    BestAnswerScore,
+    Upvotes,
+    Downvotes,
+    QuestionScoreRank,
+    QuestionScore as Score1,
+    ViewQuartile,
+    AnswerPercentile,
+    ScoreEfficiency,
+    FinalScoreEfficiency,
+    AnswerScore,
+    AnswerId,
+    BodyLength,
+    AnswerDaysActive,
+    DaysSinceQuestion,
+    AnswerQuestionScore,
+    AnswerRankInQuestion,
+    QualityRating,
+    AnswerSequence,
+    ScoreRankOverall,
+    SafeAnswerScore,
+    RelatedQuestionScore,
+    ReputationTier,
+    QuestionAnswerStatus,
+    ViewingQuartile,
+    AccountType,
+    IsBestAnswer,
+    QuestionPerformance,
+    EliteContributor,
+    OverallAnswerRank,
+    AnswerOrder,
+    TagCount,
+    ActivityStatus,
+    DaysSinceLastActivity,
+    ScoreEfficiencyPercentage,
+    Rank1Answer,
+    AverageAnswerQuality,
+    HighVolume,
+    ReputationRanking,
+    PostRanking,
+    CommentRanking,
+    BadgeRanking,
+    TopRankings,
+    ReputableUser,
+    OverallAvgQuestionScore,
+    OverallAvgAnswerScore,
+    MoreAnswersThanQuestions
+FROM FinalAnalysis
+WHERE Reputation > 1000
+    AND (QuestionCount > 10 OR AnswerCount > 10)
+    AND ActiveDays > 30
+ORDER BY Reputation DESC, PostCount DESC, ScoreEfficiency DESC
+OPTION (MAXDOP 1, RECOMPILE)

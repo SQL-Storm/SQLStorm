@@ -1,0 +1,230 @@
+WITH RECURSIVE UserHierarchy AS (
+    SELECT Id AS UserId, AccountId, 0 AS Level
+    FROM Users
+    WHERE AccountId IS NOT NULL
+    UNION ALL
+    SELECT u.Id, u.AccountId, uh.Level + 1
+    FROM Users u
+    INNER JOIN UserHierarchy uh ON u.AccountId = uh.AccountId
+    WHERE uh.Level < 3
+),
+PostStats AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Title,
+        p.Tags,
+        COALESCE(p.AnswerCount, 0) AS AnswerCountCoalesced,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END AS PostTypeDescription,
+        CASE 
+            WHEN p.Score > 10 THEN 'Highly Rated'
+            WHEN p.Score > 5 THEN 'Moderately Rated'
+            WHEN p.Score > 0 THEN 'Low Rated'
+            ELSE 'No Score'
+        END AS RatingCategory,
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS ScoreRank,
+        DENSE_RANK() OVER (ORDER BY p.ViewCount DESC) AS ViewRank
+    FROM Posts p
+),
+TopPosts AS (
+    SELECT 
+        ps.Id,
+        ps.PostTypeId,
+        ps.OwnerUserId,
+        ps.Score,
+        ps.ViewCount,
+        ps.AnswerCountCoalesced,
+        ps.CommentCount,
+        ps.FavoriteCount,
+        ps.CreationDate,
+        ps.LastActivityDate,
+        ps.Title,
+        ps.Tags,
+        ps.PostTypeDescription,
+        ps.RatingCategory,
+        ps.ScoreRank,
+        ps.ViewRank,
+        ROW_NUMBER() OVER (ORDER BY ps.Score DESC, ps.ViewCount DESC) AS OverallRank
+    FROM PostStats ps
+    WHERE ps.Score > 0 OR ps.ViewCount > 0
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Trending'
+            WHEN t.Count > 500 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            ELSE 'Niche'
+        END AS TagPopularity,
+        LAG(t.Count, 1, 0) OVER (ORDER BY t.Count DESC) - t.Count AS PopularityChange
+    FROM Tags t
+),
+UserActivity AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.AccountId,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+        COALESCE(SUM(p.ViewCount), 0) AS TotalViews,
+        AVG(p.Score) AS AvgPostScore,
+        STRING_AGG(DISTINCT p.Title, ' | ') AS PostTitles,
+        STRING_AGG(DISTINCT tag_user.TagName, ', ') AS UserTags,
+        MAX(p.CreationDate) AS LastPostDate,
+        MIN(p.CreationDate) AS FirstPostDate,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 100 THEN 'Veteran'
+            WHEN COUNT(DISTINCT p.Id) > 50 THEN 'Experienced'
+            WHEN COUNT(DISTINCT p.Id) > 10 THEN 'Active'
+            ELSE 'New'
+        END AS UserStatus,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Elite'
+            WHEN u.Reputation > 5000 THEN 'Advanced'
+            WHEN u.Reputation > 1000 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END AS RepLevel
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN Posts p2 ON p2.ParentId = p.Id AND p2.PostTypeId = 2
+    LEFT JOIN Posts p3 ON p3.Id = p2.ParentId
+    LEFT JOIN (
+        SELECT DISTINCT u2.Id AS UserId, t.TagName
+        FROM Users u2
+        JOIN Posts p4 ON u2.Id = p4.OwnerUserId
+        JOIN (
+            SELECT TRIM(BOTH '<>' FROM UNNEST(STRING_TO_ARRAY(p5.Tags, '><'))) AS TagName, p5.Id
+            FROM Posts p5
+            WHERE p5.Tags IS NOT NULL AND p5.Tags <> ''
+        ) split_tags ON split_tags.Id = p4.Id
+        JOIN Tags t ON t.TagName = split_tags.TagName
+    ) tag_user ON u.Id = tag_user.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.AccountId
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        tp.Id,
+        tp.PostTypeId,
+        tp.OwnerUserId,
+        tp.Score,
+        tp.ViewCount,
+        tp.AnswerCountCoalesced,
+        tp.CommentCount,
+        tp.FavoriteCount,
+        tp.CreationDate,
+        tp.LastActivityDate,
+        tp.Title,
+        tp.Tags,
+        tp.PostTypeDescription,
+        tp.RatingCategory,
+        tp.ScoreRank,
+        tp.ViewRank,
+        tp.OverallRank,
+        CASE 
+            WHEN tp.ViewCount > 1000 THEN 'Viral'
+            WHEN tp.ViewCount > 500 THEN 'Featured'
+            WHEN tp.ViewCount > 100 THEN 'Noticeable'
+            ELSE 'Normal'
+        END AS ViewStatus,
+        CASE 
+            WHEN tp.Score > tp.AnswerCountCoalesced * 5 THEN 'Highly Engaging'
+            WHEN tp.Score > tp.AnswerCountCoalesced * 2 THEN 'Engaging'
+            ELSE 'Basic'
+        END AS EngagementLevel,
+        (EXTRACT(EPOCH FROM (tp.LastActivityDate - tp.CreationDate))/86400)::numeric AS DaysActive,
+        COALESCE(
+            (SELECT COUNT(*) 
+             FROM Posts p 
+             WHERE p.ParentId = tp.Id AND p.PostTypeId = 2), 0
+        ) AS AnswerCount,
+        LAG(tp.Score, 1, 0) OVER (ORDER BY tp.CreationDate) AS PreviousScore,
+        LAG(tp.ViewCount, 1, 0) OVER (ORDER BY tp.CreationDate) AS PreviousViews,
+        CASE
+            WHEN LAG(tp.Score, 1, 0) OVER (ORDER BY tp.CreationDate) = 0 THEN NULL
+            ELSE (tp.Score - LAG(tp.Score, 1, 0) OVER (ORDER BY tp.CreationDate)) * 100.0 / NULLIF(LAG(tp.Score, 1, 0) OVER (ORDER BY tp.CreationDate), 0)
+        END AS ScoreGrowthPercent,
+        ROW_NUMBER() OVER (PARTITION BY tp.OwnerUserId ORDER BY tp.CreationDate) AS UserPostSequence,
+        CASE 
+            WHEN tp.Title LIKE '%?%' THEN 'Question Title'
+            WHEN tp.Title LIKE '%[Solution]%' THEN 'Solution Post'
+            WHEN tp.Title LIKE '%[Tutorial]%' THEN 'Tutorial Post'
+            ELSE 'General Post'
+        END AS ContentCategory
+    FROM TopPosts tp
+    LEFT JOIN Posts p ON tp.Id = p.ParentId
+)
+SELECT 
+    COUNT(*) AS TotalRecords,
+    COUNT(DISTINCT cpa.OwnerUserId) AS UniqueAuthors,
+    COUNT(DISTINCT cpa.PostTypeId) AS PostTypes,
+    SUM(cpa.Score) AS TotalScore,
+    AVG(cpa.ViewCount) AS AvgViews,
+    MAX(cpa.FavoriteCount) AS MaxFavorites,
+    MIN(cpa.CreationDate) AS EarliestPost,
+    MAX(cpa.LastActivityDate) AS LatestActivity,
+    COUNT(CASE WHEN cpa.ViewStatus = 'Viral' THEN 1 END) AS ViralPosts,
+    COUNT(CASE WHEN cpa.EngagementLevel = 'Highly Engaging' THEN 1 END) AS HighlyEngagingPosts,
+    COUNT(CASE WHEN cpa.ContentCategory = 'Question Title' THEN 1 END) AS QuestionPosts,
+    COUNT(CASE WHEN cpa.ContentCategory = 'Solution Post' THEN 1 END) AS SolutionPosts,
+    COUNT(CASE WHEN cpa.ContentCategory = 'Tutorial Post' THEN 1 END) AS TutorialPosts,
+    STRING_AGG(DISTINCT CASE WHEN cpa.Score > 100 THEN cpa.Title END, ' | ') AS HighScoreTitles,
+    STRING_AGG(DISTINCT CASE WHEN cpa.ViewCount > 1000 THEN cpa.Title END, ' | ') AS PopularTitles,
+    COUNT(CASE WHEN cpa.ScoreGrowthPercent > 50 THEN 1 END) AS HighGrowthPosts,
+    AVG(cpa.ScoreGrowthPercent) AS AvgGrowthRate,
+    COUNT(CASE WHEN cpa.Score > (SELECT AVG(p2.Score) FROM Posts p2) THEN 1 END) AS AboveAveragePosts,
+    COUNT(CASE WHEN cpa.ViewCount > (SELECT AVG(p3.ViewCount) FROM Posts p3) THEN 1 END) AS AboveAverageViews,
+    STRING_AGG(DISTINCT CASE 
+        WHEN cpa.ScoreGrowthPercent > 50 AND cpa.ViewCount > 500 THEN cpa.Title 
+        ELSE NULL 
+    END, ' | ') AS HighPerformingTitles,
+    ROUND(AVG(CASE WHEN cpa.DaysActive > 0 THEN (cpa.Score * 1.0 / cpa.DaysActive) ELSE 0 END), 4) AS AvgScorePerDay,
+    ROUND(STDDEV(CASE WHEN cpa.DaysActive > 0 THEN (cpa.Score * 1.0 / cpa.DaysActive) ELSE 0 END), 4) AS StdDevScorePerDay
+FROM ComplexPostAnalysis cpa
+JOIN UserActivity ua ON cpa.OwnerUserId = ua.Id
+JOIN PostTypes pt ON cpa.PostTypeId = pt.Id
+JOIN (
+    SELECT 
+        p.PostTypeId,
+        COUNT(*) AS PostCount,
+        AVG(p.Score) AS AvgScore,
+        AVG(p.ViewCount) AS AvgViews
+    FROM Posts p
+    WHERE p.CreationDate >= DATE '2020-01-01'
+    GROUP BY p.PostTypeId
+) recent_stats ON cpa.PostTypeId = recent_stats.PostTypeId
+WHERE cpa.OverallRank <= 500
+  AND ua.RepLevel IN ('Elite', 'Advanced', 'Intermediate')
+  AND cpa.Score > (SELECT AVG(p4.Score) FROM Posts p4 WHERE p4.PostTypeId = 1)
+  AND (cpa.ViewStatus = 'Viral' OR cpa.EngagementLevel = 'Highly Engaging' OR cpa.ContentCategory IN ('Question Title', 'Solution Post', 'Tutorial Post'))
+GROUP BY -- aggregate root grouping to satisfy SQL dialects that require grouping of non-aggregates (all selected non-aggregates are aggregates, but include grouping by common joins for safety)
+    ua.Id, ua.DisplayName, ua.Reputation, ua.Views, ua.UpVotes, ua.DownVotes, ua.AccountId, pt.Id
+ORDER BY cpa.Score DESC, cpa.ViewCount DESC
+LIMIT 250;

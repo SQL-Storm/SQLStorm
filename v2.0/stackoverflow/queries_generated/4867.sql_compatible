@@ -1,0 +1,99 @@
+WITH RankedPostEdits AS (
+    SELECT
+        ph.PostId,
+        ph.UserId,
+        ph.CreationDate AS EditDate,
+        ph.PostHistoryTypeId,
+        ROW_NUMBER() OVER(PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6)
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        MAX(u.Reputation) AS MaxReputation,
+        AVG(u.Views) AS AvgUserViews,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS TotalUpvotesReceived,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS TotalDownvotesReceived,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName
+),
+PostDetails AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        pt.Name AS PostType,
+        u.DisplayName AS OwnerDisplayName,
+        p.CreationDate,
+        p.LastActivityDate,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+            ELSE 'Active'
+        END AS PostStatus,
+        COALESCE(p.ViewCount, 0) AS PostViewCount,
+        -- Standard SQL: format year-month from timestamp
+        TO_CHAR(p.CreationDate, 'YYYY-MM') AS PostYearMonth,
+        CASE
+            WHEN p.Tags IS NULL THEN 'NoTags'
+            WHEN p.Tags LIKE '%<sql>%' THEN 'SQLRelated'
+            ELSE 'Other'
+        END AS TagCategory
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1, 2)
+)
+SELECT
+    pd.PostId,
+    pd.Title,
+    pd.PostType,
+    pd.PostStatus,
+    pd.PostYearMonth,
+    pd.TagCategory,
+    pd.Score,
+    pd.AnswerCount,
+    pd.CommentCount,
+    pd.FavoriteCount,
+    pd.PostViewCount,
+    pd.OwnerDisplayName,
+    ua.DisplayName AS EditorDisplayName,
+    ua.MaxReputation AS EditorReputation,
+    ua.GoldBadges,
+    ua.SilverBadges,
+    ua.BronzeBadges,
+    pdr.EditDate AS LastEditBySpecificUser,
+    CASE
+        WHEN pd.Score > 100 THEN 'HighScore'
+        WHEN pd.Score BETWEEN 10 AND 100 THEN 'MediumScore'
+        ELSE 'LowScore'
+    END AS ScoreBand,
+    CAST(pd.AnswerCount AS DOUBLE PRECISION) / NULLIF(pd.CommentCount, 0) AS AnswerToCommentRatio,
+    cast('2024-10-01' as date) - CAST(pd.CreationDate AS DATE) AS DaysSinceCreation,
+    CASE
+        WHEN UPPER(pd.Title) LIKE '%SQL%' OR UPPER(pd.Title) LIKE '%DATABASE%' THEN 'Technical'
+        ELSE 'General'
+    END AS TitleSubjectivity,
+    COALESCE(pdr.PostHistoryTypeId, 0) AS LastEditType,
+    COALESCE(ua.AvgUserViews, 0) AS AvgUserViewsForEditor,
+    CASE WHEN ua.TotalUpvotesReceived > ua.TotalDownvotesReceived THEN 'PositiveNet' ELSE 'NeutralOrNegativeNet' END AS UserVoteNet,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = pd.PostId AND c.Score < 0) AS NegativeScoreComments
+FROM PostDetails pd
+LEFT JOIN RankedPostEdits pdr ON pd.PostId = pdr.PostId AND pdr.rn = 1
+LEFT JOIN UserActivity ua ON pdr.UserId = ua.UserId
+WHERE pd.PostYearMonth BETWEEN '2023-01' AND '2023-12'
+ORDER BY pd.PostYearMonth, pd.Score DESC
+LIMIT 1000;

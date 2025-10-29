@@ -1,0 +1,81 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.Title,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.LastActivityDate,
+        U.DisplayName AS OwnerDisplayName,
+        U.Reputation,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.ViewCount DESC) AS Rank
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId = 1 AND P.Score > 0 AND P.ViewCount > 100
+),
+BadgeCounts AS (
+    SELECT 
+        U.Id AS UserId,
+        U.DisplayName,
+        COUNT(DISTINCT B.Id) AS BadgeCount
+    FROM 
+        Users U
+    JOIN 
+        Badges B ON U.Id = B.UserId
+    WHERE 
+        B.Class = 1 AND B.TagBased = FALSE
+    GROUP BY 
+        U.Id, U.DisplayName
+),
+CommentMetrics AS (
+    SELECT 
+        P.Id AS PostId,
+        COUNT(C.Id) AS CommentCount,
+        MAX(C.Score) AS MaxCommentScore
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Comments C ON P.Id = C.PostId
+    GROUP BY 
+        P.Id
+),
+TopBadges AS (
+    SELECT 
+        UserId, 
+        MAX(CASE WHEN Class = 1 THEN Name ELSE NULL END) AS Name
+    FROM 
+        Badges
+    GROUP BY 
+        UserId
+)
+SELECT 
+    RP.Id AS PostId,
+    RP.Title,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.LastActivityDate,
+    RP.Rank,
+    BC.BadgeCount,
+    CM.CommentCount,
+    COALESCE(CM.MaxCommentScore, 0) AS MaxCommentScore,
+    U.Reputation,
+    U.DisplayName AS OwnerDisplayName,
+    COALESCE(B.Name, 'No Badge') AS TopBadge
+FROM 
+    RankedPosts RP
+LEFT JOIN 
+    BadgeCounts BC ON RP.OwnerDisplayName = BC.DisplayName
+LEFT JOIN 
+    CommentMetrics CM ON RP.Id = CM.PostId
+LEFT JOIN 
+    Users U ON RP.OwnerDisplayName = U.DisplayName
+LEFT JOIN 
+    TopBadges B ON U.Id = B.UserId
+WHERE 
+    RP.Rank <= 10
+ORDER BY 
+    RP.Score DESC, RP.ViewCount DESC;

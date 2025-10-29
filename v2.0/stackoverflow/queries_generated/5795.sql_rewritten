@@ -1,0 +1,177 @@
+-- {"query": "5795.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1377} 
+WITH
+-- CTE to identify top users by reputation and activity score
+TopUsers AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    -- compute a synthetic activity score: reputation * log(1 + post activity) + recent activity
+    (u.Reputation * NULLIF(LOG(1 + COALESCE(p.PostCount,0)), 0)) +
+      COALESCE(p.RecentActivity, 0) AS ActivityScore
+  FROM Users u
+  LEFT JOIN (
+    -- correlated subquery: count posts per user and recent activity window
+    SELECT
+      OwnerUserId,
+      COUNT(*) AS PostCount,
+      SUM(CASE WHEN CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '90 days' THEN 1 ELSE 0 END) AS RecentActivity
+    FROM Posts
+    GROUP BY OwnerUserId
+  ) p ON p.OwnerUserId = u.Id
+),
+-- Subset of posts with complex predicates and window functions
+PostAnalysis AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.Tags,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.LastActivityDate,
+    p.AcceptedAnswerId,
+    p.ParentId,
+    -- window function: rank posts per day by score
+    RANK() OVER (PARTITION BY DATE(p.CreationDate) ORDER BY p.Score DESC, p.ViewCount DESC) AS DailyRank,
+    -- count of comments per post using a correlated subquery
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCount,
+    -- correlate to last editor
+    p.LastEditorUserId,
+    p.LastEditorDisplayName,
+    -- string expression: create a canonical tag string from Tags
+    CASE
+      WHEN p.Tags IS NULL THEN ''
+      ELSE LOWER(TRIM(p.Tags))
+    END AS CanonicalTags
+  FROM Posts p
+  -- Only consider questions or high-signal posts
+  WHERE p.PostTypeId IN (1, 2)
+),
+-- Join to link-related posts to exercise outer joins and set operations
+LinkedPosts AS (
+  SELECT
+    pa.PostId,
+    pa.PostTypeId,
+    pa.Title,
+    pa.Tags,
+    pa.OwnerUserId,
+    pa.CreationDate,
+    pa.Score,
+    pa.ViewCount,
+    pa.LastActivityDate,
+    pa.AcceptedAnswerId,
+    pa.ParentId,
+    pa.DailyRank,
+    pa.CommentCount,
+    pa.LastEditorUserId,
+    pa.LastEditorDisplayName,
+    pa.CanonicalTags,
+    lt.Id AS LinkId,
+    lt.Name AS LinkTypeName,
+    pl.RelatedPostId
+  FROM PostAnalysis pa
+  LEFT JOIN PostLinks pl ON pl.PostId = pa.PostId
+  LEFT JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+  WHERE pa.DailyRank <= 100
+),
+-- Include badge data with potential NULLs to stress NULL-handling paths
+UserBadges AS (
+  SELECT
+    u.Id AS UserId,
+    b.Name AS BadgeName,
+    b.Date AS AwardDate,
+    b.Class,
+    b.TagBased
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+),
+-- Aggregate a synthetic histogram over votes to exercise set-operations
+VoteHistogram AS (
+  SELECT
+    v.PostId,
+    vt.Name AS VoteType,
+    COUNT(*) AS NumVotes
+  FROM Votes v
+  JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+  GROUP BY v.PostId, vt.Name
+),
+-- Final selection combining all components with complex predicates and set operators
+FinalOutput AS (
+  SELECT
+    Up.UserId,
+    Up.DisplayName AS UserDisplayName,
+    Up.Reputation,
+    Up.ActivityScore,
+    bp.BadgeName,
+    bh.AwardDate,
+    b.Class AS BadgeClass,
+    b.TagBased,
+    lp.PostId,
+    lp.Title,
+    lp.CanonicalTags,
+    lp.DailyRank,
+    lp.CommentCount,
+    lp.LinkTypeName,
+    vh.VoteType,
+    vh.NumVotes,
+    -- complex calculation using NULL-aware arithmetic
+    CASE
+      WHEN lp.Score IS NULL THEN 0
+      ELSE lp.Score * (CASE WHEN lp.ViewCount > 0 THEN 1.0 ELSE 0 END)
+    END AS WeightedScore,
+    CASE
+      WHEN lp.LastEditorUserId IS NULL THEN 'Unknown'
+      ELSE lp.LastEditorDisplayName
+    END AS LastEditorName,
+    -- nested subquery correlation
+    (SELECT AVG(CASE WHEN c.Score IS NULL THEN 0 ELSE c.Score END)
+     FROM Comments c
+     WHERE c.PostId = lp.PostId) AS AvgCommentScore
+  FROM TopUsers Up
+  LEFT JOIN UserBadges bp ON bp.UserId = Up.UserId
+  LEFT JOIN Posts p ON p.OwnerUserId = Up.UserId
+  LEFT JOIN LinkedPosts lp ON lp.OwnerUserId = Up.UserId OR lp.PostId = p.Id
+  LEFT JOIN VoteHistogram vh ON vh.PostId = lp.PostId
+  LEFT JOIN Badges b ON b.UserId = Up.UserId
+  LEFT JOIN Votes v ON v.PostId = lp.PostId
+  WHERE (Up.Reputation > 1000 OR Up.ActivityScore > 0)
+    AND (bp.BadgeName IS NULL OR bp.TagBased = 0)
+  GROUP BY
+    Up.UserId, Up.DisplayName, Up.Reputation, Up.ActivityScore,
+    bp.BadgeName, bh.AwardDate, b.Class, b.TagBased,
+    lp.PostId, lp.Title, lp.CanonicalTags, lp.DailyRank, lp.CommentCount,
+    lp.LinkTypeName, vh.VoteType, vh.NumVotes, lp.Score, lp.ViewCount,
+    lp.LastEditorUserId, lp.LastEditorDisplayName, AvgCommentScore
+)
+SELECT
+  UserId,
+  UserDisplayName,
+  Reputation,
+  ActivityScore,
+  BadgeName,
+  AwardDate,
+  BadgeClass,
+  TagBased,
+  PostId,
+  Title,
+  CanonicalTags,
+  DailyRank,
+  CommentCount,
+  LinkTypeName,
+  VoteType,
+  NumVotes,
+  WeightedScore,
+  LastEditorName,
+  AvgCommentScore
+FROM FinalOutput
+ORDER BY ActivityScore DESC NULLS LAST
+LIMIT 200;

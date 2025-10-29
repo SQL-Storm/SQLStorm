@@ -1,0 +1,151 @@
+WITH UserStats AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COUNT(C.Id) AS TotalComments,
+        SUM(COALESCE(P.Score, 0)) AS TotalPostScore,
+        SUM(CASE WHEN V.VoteTypeId IN (2, 8, 9, 15) THEN 1 ELSE 0 END) AS UpVotesGiven,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesGiven,
+        MAX(GREATEST(COALESCE(P.LastActivityDate, TIMESTAMP '1900-01-01'), COALESCE(C.CreationDate, TIMESTAMP '1900-01-01'), U.LastAccessDate)) AS LastUserActivity,
+        AVG(CASE WHEN P.PostTypeId IN (1, 2) THEN P.Score END) AS AvgPostScore,
+        COUNT(B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        U.AboutMe
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Votes V ON U.Id = V.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.AboutMe
+),
+PostDetailedMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.Title,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.FavoriteCount,
+        P.OwnerUserId,
+        P.LastActivityDate,
+        P.ClosedDate,
+        CASE
+            WHEN P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2 THEN
+                SPLIT_PART(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags)-2), '><', 1)
+            ELSE NULL
+        END AS FirstTag,
+        COUNT(DISTINCT Ans.Id) AS ActualAnswerCount,
+        SUM(COALESCE(Ans.Score, 0)) AS TotalAnswerScore,
+        AVG(Ans.Score) FILTER (WHERE Ans.Score IS NOT NULL) AS AvgAnswerScore,
+        MAX(PH_Close.CreationDate) AS LastCloseDate,
+        (SELECT COUNT(DISTINCT PL_Linked.RelatedPostId) FROM PostLinks PL_Linked WHERE PL_Linked.PostId = P.Id AND PL_Linked.LinkTypeId = 1) AS LinkedPostsCount,
+        (SELECT COUNT(DISTINCT PL_Duplicate.RelatedPostId) FROM PostLinks PL_Duplicate WHERE PL_Duplicate.PostId = P.Id AND PL_Duplicate.LinkTypeId = 3) AS DuplicatePostsCount,
+        RANK() OVER (PARTITION BY P.OwnerUserId ORDER BY P.ViewCount DESC, P.Id DESC) AS RankByViewsForUser,
+        NTILE(100) OVER (ORDER BY P.Score DESC, P.Id DESC) AS ScorePercentile,
+        P.Tags
+    FROM Posts P
+    LEFT JOIN Posts Ans ON P.Id = Ans.ParentId AND Ans.PostTypeId = 2
+    LEFT JOIN PostHistory PH_Close ON P.Id = PH_Close.PostId AND PH_Close.PostHistoryTypeId = 10
+    WHERE P.PostTypeId = 1
+    GROUP BY
+        P.Id, P.Title, P.CreationDate, P.Score, P.ViewCount, P.AnswerCount,
+        P.FavoriteCount, P.OwnerUserId, P.LastActivityDate, P.ClosedDate, P.Tags
+),
+RecentPostHistory AS (
+    SELECT
+        PH.PostId,
+        PH.PostHistoryTypeId,
+        PH.CreationDate AS HistoryDate,
+        PH.Comment,
+        PH.Text AS HistoryText,
+        ROW_NUMBER() OVER (PARTITION BY PH.PostId, PH.PostHistoryTypeId ORDER BY PH.CreationDate DESC, PH.Id DESC) AS rn
+    FROM PostHistory PH
+    WHERE PH.PostHistoryTypeId IN (4, 5, 6, 10, 11, 12, 13, 19, 20, 35)
+)
+SELECT
+    US.UserId,
+    US.DisplayName,
+    US.Reputation,
+    US.UserCreationDate,
+    US.LastAccessDate,
+    US.TotalPosts,
+    US.TotalQuestions,
+    US.TotalAnswers,
+    US.TotalComments,
+    US.TotalPostScore,
+    US.UpVotesGiven,
+    US.DownVotesGiven,
+    US.LastUserActivity,
+    COALESCE(US.AvgPostScore, 0.0) AS AvgPostScore,
+    US.TotalBadges,
+    US.GoldBadges,
+    SUM(PDM.PostScore) AS TotalQuestionScore,
+    AVG(PDM.ViewCount) AS AvgQuestionViews,
+    COUNT(PDM.PostId) AS NumberOfQuestions,
+    SUM(CASE WHEN PDM.ClosedDate IS NOT NULL THEN 1 ELSE 0 END) AS ClosedQuestionsCount,
+    MAX(PDM.LastCloseDate) AS UserLatestQuestionCloseDate,
+    SUM(PDM.DuplicatePostsCount) AS TotalDuplicatesCreated,
+    AVG(PDM.ActualAnswerCount) AS AvgActualAnswersPerQuestion,
+    MAX(CASE WHEN PDM.ScorePercentile <= 10 THEN 1 ELSE 0 END) AS HasTop10PercentileQuestion,
+    STRING_AGG(DISTINCT PDM.FirstTag, ', ') FILTER (WHERE PDM.FirstTag IS NOT NULL AND PDM.FirstTag != '') AS UserTopTags,
+    (
+        SELECT RPH_Body.HistoryText
+        FROM RecentPostHistory RPH_Body
+        WHERE RPH_Body.PostId = (
+            SELECT PDM_MaxView.PostId
+            FROM PostDetailedMetrics PDM_MaxView
+            WHERE PDM_MaxView.OwnerUserId = US.UserId AND PDM_MaxView.RankByViewsForUser = 1
+            ORDER BY PDM_MaxView.PostId DESC
+            LIMIT 1
+        )
+        AND RPH_Body.PostHistoryTypeId = 5
+        AND RPH_Body.rn = 1
+    ) AS LatestBodyEditOfHighestViewedQuestion,
+    (
+        SELECT CR.Name
+        FROM RecentPostHistory RPH_CloseReason
+        LEFT JOIN CloseReasonTypes CR ON TRY_CAST(RPH_CloseReason.Comment AS SMALLINT) = CR.Id
+        WHERE RPH_CloseReason.PostId = (
+            SELECT PDM_MaxClose.PostId
+            FROM PostDetailedMetrics PDM_MaxClose
+            WHERE PDM_MaxClose.OwnerUserId = US.UserId AND PDM_MaxClose.ClosedDate IS NOT NULL
+            ORDER BY PDM_MaxClose.ClosedDate DESC, PDM_MaxClose.PostId DESC
+            LIMIT 1
+        )
+        AND RPH_CloseReason.PostHistoryTypeId = 10
+        AND RPH_CloseReason.rn = 1
+    ) AS LatestCloseReasonName,
+    (CAST(US.Reputation AS NUMERIC) / 100.0) + (US.TotalPosts * 0.5) + (US.TotalComments * 0.1) + (US.GoldBadges * 10) + (US.UpVotesGiven * 0.05) - (US.DownVotesGiven * 0.1) AS UserEngagementScore,
+    CASE
+        WHEN US.TotalQuestions > 0 AND COALESCE(US.AboutMe, '') LIKE '%<p>developer</p>%' THEN 'Active HTML Developer'
+        WHEN US.TotalQuestions > 0 AND US.AboutMe IS NOT NULL AND LENGTH(US.AboutMe) > 500 THEN 'Verbose Contributor'
+        WHEN US.TotalQuestions > 0 AND US.AboutMe IS NOT NULL THEN 'Active Contributor'
+        WHEN US.TotalPosts > 0 THEN 'General Contributor'
+        ELSE 'Passive User'
+    END AS UserCategory,
+    (
+        SELECT COUNT(DISTINCT EditedAndClosed.PostId)
+        FROM (
+            SELECT RPH_Edit.PostId FROM RecentPostHistory RPH_Edit WHERE RPH_Edit.PostHistoryTypeId IN (4,5,6) AND RPH_Edit.rn = 1
+            INTERSECT
+            SELECT RPH_Close.PostId FROM RecentPostHistory RPH_Close WHERE RPH_Close.PostHistoryTypeId = 10 AND RPH_Close.rn = 1
+        ) AS EditedAndClosed
+        WHERE EditedAndClosed.PostId IN (SELECT PDM_Filtered.PostId FROM PostDetailedMetrics PDM_Filtered WHERE PDM_Filtered.OwnerUserId = US.UserId)
+    ) AS EditedAndClosedQuestionsCount,
+    AVG(LENGTH(PDM.Tags)) FILTER (WHERE PDM.Tags LIKE '<%>%<>%') AS AvgMultiTagLength
+FROM UserStats US
+LEFT JOIN PostDetailedMetrics PDM ON US.UserId = PDM.OwnerUserId
+GROUP BY
+    US.UserId, US.DisplayName, US.Reputation, US.UserCreationDate, US.LastAccessDate,
+    US.TotalPosts, US.TotalQuestions, US.TotalAnswers, US.TotalComments, US.TotalPostScore,
+    US.UpVotesGiven, US.DownVotesGiven, US.LastUserActivity, US.AvgPostScore, US.TotalBadges,
+    US.GoldBadges, US.AboutMe
+ORDER BY UserEngagementScore DESC, US.Reputation DESC
+LIMIT 1000;

@@ -1,0 +1,134 @@
+-- {"query": "3523.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2507} 
+
+WITH UserPostStats AS (
+    SELECT 
+        u.Id                           AS UserId,
+        COUNT(p.Id)                    AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS QuestionScoreSum,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS AnswerScoreSum,
+        MAX(p.CreationDate)            AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p 
+        ON p.OwnerUserId = u.Id
+    GROUP BY u.Id
+),
+UserBadgeAgg AS (
+    SELECT 
+        b.UserId,
+        COUNT(*)                                         AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END)     AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END)     AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END)     AS BronzeBadges,
+        STRING_AGG(b.Name, '; ')                         AS BadgeNames
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserTagStats AS (
+    SELECT 
+        p.OwnerUserId                               AS UserId,
+        UNNEST(string_to_array(trim(both '><' FROM p.Tags), '><')) AS Tag,
+        COUNT(*)                                    AS TagUseCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.Tags IS NOT NULL
+    GROUP BY p.OwnerUserId, Tag
+),
+TopTags AS (
+    SELECT 
+        Tag,
+        SUM(TagUseCount)                AS TotalUses,
+        RANK() OVER (ORDER BY SUM(TagUseCount) DESC) AS TagRank
+    FROM UserTagStats
+    GROUP BY Tag
+    HAVING SUM(TagUseCount) > 1000
+),
+UserRankings AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(ups.BadgeCount, 0)          AS BadgeCount,
+        COALESCE(ups.TotalPosts, 0)          AS TotalPosts,
+        COALESCE(ups.QuestionScoreSum, 0)    AS QScore,
+        COALESCE(ups.AnswerScoreSum, 0)      AS AScore,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, COALESCE(ups.TotalPosts,0) DESC) AS ReputationRank,
+        CASE 
+            WHEN u.Reputation >= 20000 THEN 'Legendary'
+            WHEN u.Reputation >= 10000 THEN 'Expert'
+            WHEN u.Reputation >= 5000  THEN 'Veteran'
+            ELSE 'Rising'
+        END                                 AS ReputationTier
+    FROM Users u
+    LEFT JOIN UserPostStats ups 
+        ON ups.UserId = u.Id
+    LEFT JOIN UserBadgeAgg ba 
+        ON ba.UserId = u.Id
+)
+SELECT
+    ur.Id,
+    ur.DisplayName,
+    ur.Reputation,
+    ur.ReputationTier,
+    ur.ReputationRank,
+    ur.BadgeCount,
+    ur.TotalPosts,
+    ur.QScore,
+    ur.AScore,
+    COALESCE(ba.GoldBadges, 0)    AS GoldBadges,
+    COALESCE(ba.SilverBadges, 0)  AS SilverBadges,
+    COALESCE(ba.BronzeBadges, 0)  AS BronzeBadges,
+    CASE 
+        WHEN EXISTS (
+            SELECT 1 
+            FROM Posts p 
+            WHERE p.OwnerUserId = ur.Id 
+              AND p.CreationDate > CURRENT_DATE - INTERVAL '30 days'
+        ) THEN 'Active' 
+        ELSE 'Dormant' 
+    END                         AS RecentActivity,
+    COALESCE(ba.BadgeNames, 'None') AS BadgesList,
+    tt.Tag                       AS TopTag,
+    tt.TotalUses                 AS TagUsage,
+    tt.TagRank                   AS TagRank
+FROM UserRankings ur
+LEFT JOIN UserBadgeAgg ba 
+    ON ba.UserId = ur.Id
+LEFT JOIN (
+    SELECT 
+        uts.UserId,
+        t.Tag,
+        t.TotalUses,
+        t.TagRank,
+        ROW_NUMBER() OVER (PARTITION BY uts.UserId ORDER BY t.TotalUses DESC) AS rn
+    FROM UserTagStats uts
+    JOIN TopTags t 
+        ON t.Tag = uts.Tag
+) tt 
+    ON tt.UserId = ur.Id AND tt.rn = 1
+WHERE ur.ReputationRank <= 1000
+   OR (ur.ReputationRank > 1000 AND ur.Reputation >= 5000 AND ur.BadgeCount = 0)
+
+UNION ALL
+
+SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    'Newbie'                AS ReputationTier,
+    NULL                    AS ReputationRank,
+    0                       AS BadgeCount,
+    0                       AS TotalPosts,
+    0                       AS QScore,
+    0                       AS AScore,
+    0                       AS GoldBadges,
+    0                       AS SilverBadges,
+    0                       AS BronzeBadges,
+    'Never'                 AS RecentActivity,
+    'None'                  AS BadgesList,
+    NULL                    AS TopTag,
+    NULL                    AS TagUsage,
+    NULL                    AS TagRank
+FROM Users u
+WHERE u.Reputation < 100
+  AND NOT EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id)
+  AND NOT EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = u.Id);

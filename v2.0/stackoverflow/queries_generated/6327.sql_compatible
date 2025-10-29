@@ -1,0 +1,25 @@
+SELECT 
+    u.DisplayName,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    MAX(u.Reputation) AS MaxReputation,
+    MIN(u.CreationDate) AS EarliestUserCreationDate,
+    STRING_AGG(DISTINCT b.Name, ', ' ORDER BY b.Date DESC) AS RecentBadges
+FROM 
+    Users u
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+WHERE 
+    u.Reputation > 1000
+    AND p.LastActivityDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation, u.CreationDate
+HAVING 
+    COUNT(DISTINCT p.Id) > 50
+ORDER BY 
+    MaxReputation DESC, 
+    EarliestUserCreationDate ASC
+LIMIT 100;

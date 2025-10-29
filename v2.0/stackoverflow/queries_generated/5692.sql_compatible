@@ -1,0 +1,137 @@
+WITH
+RecentActivity AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.Title,
+    p.Tags,
+    COALESCE(p.AnswerCount, 0) AS AnswerCount,
+    COALESCE(p.CommentCount, 0) AS CommentCount,
+    COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    u.DisplayName,
+    u.Location,
+    v.VoteTypeId,
+    v.UserId AS VoterUserId,
+    v.CreationDate AS VoteDate,
+    bt.Name AS BadgeName,
+    bt.Class AS BadgeClass
+  FROM
+    Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN Badges bt ON bt.UserId = u.Id
+  WHERE
+    p.LastActivityDate >= (CAST('2024-10-01' AS date) - INTERVAL '180 days')
+),
+PostMetrics AS (
+  SELECT
+    PostId,
+    PostTypeId,
+    OwnerUserId,
+    CreationDate,
+    LastActivityDate,
+    Title,
+    Tags,
+    Score,
+    ViewCount,
+    AnswerCount,
+    CommentCount,
+    FavoriteCount,
+    Reputation,
+    UserCreationDate,
+    DisplayName,
+    Location,
+    -- emulate distinct count of VoteTypeId per PostId using aggregation in a subquery, then join back;
+    -- build a derived table of distinct vote types per post
+    vm.DistinctVoteTypes,
+    MAX(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY PostId) AS HasUpvote,
+    MAX(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) OVER (PARTITION BY PostId) AS HasDownvote,
+    MAX(CASE WHEN BadgeClass = 1 THEN 1 ELSE 0 END) OVER (PARTITION BY PostId) AS HasGoldBadge,
+    MAX(CASE WHEN BadgeClass = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY PostId) AS HasSilverBadge,
+    MAX(CASE WHEN BadgeClass = 3 THEN 1 ELSE 0 END) OVER (PARTITION BY PostId) AS HasBronzeBadge
+  FROM
+    RecentActivity ra
+    LEFT JOIN (
+      SELECT
+        PostId,
+        COUNT(DISTINCT VoteTypeId) AS DistinctVoteTypes
+      FROM
+        RecentActivity
+      WHERE VoteTypeId IS NOT NULL
+      GROUP BY PostId
+    ) vm ON vm.PostId = ra.PostId
+),
+RelatedTop AS (
+  SELECT
+    rp.Id AS RelatedPostId,
+    rp.Title AS RelatedTitle,
+    rp.Tags AS RelatedTags,
+    rp.CreationDate AS RelatedCreationDate,
+    rp.ViewCount AS RelatedViews,
+    rp.Score AS RelatedScore,
+    ROW_NUMBER() OVER (PARTITION BY rp.Tags ORDER BY rp.Score DESC, rp.CreationDate DESC) AS rn
+  FROM
+    Posts rp
+  WHERE
+    NOT EXISTS (SELECT 1 FROM RecentActivity ra WHERE ra.PostId = rp.Id)
+    AND rp.LastActivityDate >= (CAST('2024-10-01' AS date) - INTERVAL '90 days')
+),
+Final AS (
+  SELECT
+    pm.PostId,
+    pm.PostTypeId,
+    pm.OwnerUserId,
+    pm.CreationDate,
+    pm.LastActivityDate,
+    pm.Title,
+    pm.Tags,
+    pm.Score,
+    pm.ViewCount,
+    pm.AnswerCount,
+    pm.CommentCount,
+    pm.FavoriteCount,
+    pm.Reputation,
+    pm.UserCreationDate,
+    pm.DisplayName,
+    pm.Location,
+    pm.DistinctVoteTypes,
+    pm.HasUpvote,
+    pm.HasDownvote,
+    pm.HasGoldBadge,
+    pm.HasSilverBadge,
+    pm.HasBronzeBadge,
+    LOWER(REGEXP_REPLACE(pm.Tags, '[<>]', '', 'g')) AS NormalizedTags,
+    RANK() OVER (PARTITION BY pm.OwnerUserId ORDER BY pm.LastActivityDate DESC) AS OwnerRecentRank,
+    (SELECT COUNT(*) FROM RelatedTop r WHERE r.RelatedTags = pm.Tags AND r.rn <= 10) AS TopRelatedCount,
+    (pm.PostId) AS SyntheticKey
+  FROM
+    PostMetrics pm
+    LEFT JOIN RelatedTop rt ON rt.rn = 1
+  WHERE
+    pm.LastActivityDate >= (CAST('2024-10-01' AS date) - INTERVAL '365 days')
+)
+SELECT DISTINCT
+  f.PostId,
+  f.Title,
+  f.Tags,
+  f.ViewCount,
+  f.Score,
+  f.DistinctVoteTypes,
+  f.HasUpvote,
+  f.HasBronzeBadge,
+  f.NormalizedTags,
+  f.OwnerRecentRank,
+  f.TopRelatedCount
+FROM
+  Final f
+ORDER BY
+  f.OwnerRecentRank ASC,
+  f.Score DESC
+LIMIT 100;

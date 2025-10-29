@@ -1,0 +1,122 @@
+-- {"query": "4472.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1448} 
+WITH RankedPostEdits AS (
+    SELECT
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.UserId,
+        ph.CreationDate,
+        p.OwnerUserId AS OriginalOwnerUserId,
+        p.Title AS OriginalTitle,
+        ROW_NUMBER() OVER(PARTITION BY ph.PostId, ph.PostHistoryTypeId ORDER BY ph.CreationDate DESC) as rn
+    FROM PostHistory ph
+    JOIN Posts p ON ph.PostId = p.Id
+    WHERE ph.PostHistoryTypeId IN (4, 7) -- Edit Title and Rollback Title
+),
+PostEditSummary AS (
+    SELECT
+        rp.PostId,
+        MAX(CASE WHEN rp.rn = 1 AND rp.PostHistoryTypeId = 4 THEN rp.UserId ELSE NULL END) AS LastEditorUserId,
+        MAX(CASE WHEN rp.rn = 1 AND rp.PostHistoryTypeId = 4 THEN rp.CreationDate ELSE NULL END) AS LastEditDate,
+        MAX(CASE WHEN rp.rn = 1 AND rp.PostHistoryTypeId = 7 THEN rp.UserId ELSE NULL END) AS LastRollbackEditorUserId,
+        MAX(CASE WHEN rp.rn = 1 AND rp.PostHistoryTypeId = 7 THEN rp.CreationDate ELSE NULL END) AS LastRollbackDate,
+        COUNT(DISTINCT CASE WHEN rp.PostHistoryTypeId = 4 THEN rp.UserId END) AS DistinctEditors,
+        COUNT(DISTINCT CASE WHEN rp.PostHistoryTypeId = 7 THEN rp.UserId END) AS DistinctRollbackers
+    FROM RankedPostEdits rp
+    GROUP BY rp.PostId
+),
+UserPostEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsOwned,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersOwned,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT v.Id) AS TotalVotesCast
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    WHERE u.CreationDate < DATE('now', '-1 year')
+    GROUP BY u.Id, u.DisplayName
+    HAVING COUNT(DISTINCT p.Id) > 10 OR COUNT(DISTINCT c.Id) > 50 OR COUNT(DISTINCT v.Id) > 100
+),
+PostWithEditDetails AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.FavoriteCount,
+        pes.LastEditorUserId,
+        pes.LastEditDate,
+        pes.LastRollbackEditorUserId,
+        pes.LastRollbackDate,
+        CASE
+            WHEN pes.LastEditDate IS NOT NULL AND (pes.LastRollbackDate IS NULL OR pes.LastEditDate > pes.LastRollbackDate) THEN 'Edited'
+            WHEN pes.LastRollbackDate IS NOT NULL THEN 'Rolled Back'
+            ELSE 'No Title Edit/Rollback'
+        END AS TitleEditStatus
+    FROM Posts p
+    LEFT JOIN PostEditSummary pes ON p.Id = pes.PostId
+    WHERE p.PostTypeId = 1 -- Questions only
+)
+SELECT
+    pwed.PostId,
+    pwed.Title,
+    pwed.CreationDate,
+    pwed.Score,
+    pwed.FavoriteCount,
+    pwed.TitleEditStatus,
+    CASE
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        ELSE 'Active'
+    END AS PostStatus,
+    COALESCE(u.DisplayName, 'Unknown User') AS OwnerDisplayName,
+    CASE
+        WHEN pwed.LastEditDate IS NOT NULL THEN STRFTIME('%Y-%m-%d %H:%M:%S', pwed.LastEditDate)
+        ELSE 'N/A'
+    END AS FormattedLastEditDate,
+    COALESCE(pes.DistinctEditors, 0) AS NumberOfDistinctTitleEditors,
+    COALESCE(pes.DistinctRollbackers, 0) AS NumberOfDistinctTitleRollbackers,
+    UPPER(SUBSTRING(p.Tags, 2, INSTR(p.Tags, '>') - 2)) AS PrimaryTag,
+    CASE
+        WHEN upe.TotalPostsOwned IS NULL THEN 0
+        ELSE upe.TotalPostsOwned
+    END AS OwnerTotalPosts,
+    CASE
+        WHEN upe.QuestionsOwned IS NULL THEN 0
+        ELSE upe.QuestionsOwned
+    END AS OwnerQuestions,
+    CASE
+        WHEN upe.AnswersOwned IS NULL THEN 0
+        ELSE upe.AnswersOwned
+    END AS OwnerAnswers,
+    CASE
+        WHEN upe.TotalCommentsMade IS NULL THEN 0
+        ELSE upe.TotalCommentsMade
+    END AS OwnerComments,
+    CASE
+        WHEN upe.TotalVotesCast IS NULL THEN 0
+        ELSE upe.TotalVotesCast
+    END AS OwnerVotes,
+    CASE
+        WHEN EXISTS (SELECT 1 FROM PostLinks pl WHERE pl.PostId = pwed.PostId AND pl.LinkTypeId = 3) THEN 'Has Duplicate Link'
+        ELSE 'No Duplicate Link'
+    END AS HasDuplicateLink
+FROM PostWithEditDetails pwed
+JOIN Posts p ON pwed.PostId = p.Id
+LEFT JOIN Users u ON pwed.OwnerUserId = u.Id
+LEFT JOIN PostEditSummary pes ON pwed.PostId = pes.PostId
+LEFT JOIN UserPostEngagement upe ON pwed.OwnerUserId = upe.UserId
+WHERE pwed.Score > 5
+  AND pwed.FavoriteCount < 50
+  AND STRFTIME('%Y', pwed.CreationDate) = '2023'
+  AND pwed.Title LIKE '%SQL%'
+  AND pwed.OwnerUserId IS NOT NULL
+  AND u.Reputation > 1000
+ORDER BY pwed.Score DESC, pwed.FavoriteCount ASC
+LIMIT 100;

@@ -1,0 +1,115 @@
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 3 THEN p.Id END) AS Wikis,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS TotalQuestionScore,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS TotalAnswerScore,
+    AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END) AS AvgQuestionScore,
+    AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE NULL END) AS AvgAnswerScore,
+    MAX(p.CreationDate) AS LatestPostDate,
+    MIN(p.CreationDate) AS EarliestPostDate,
+    COUNT(DISTINCT b.Id) AS BadgesCount,
+    STRING_AGG(DISTINCT b.Name, ', ') AS BadgeNames,
+    COUNT(DISTINCT COALESCE(p.OwnerUserId, p.LastEditorUserId)) AS PostEditCount,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN p.Id END) AS QuestionsWithAcceptedAnswers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL THEN p.Id END) AS ClosedQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN p.Id END) AS QuestionsWithAnswers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.ParentId IS NOT NULL THEN p.Id END) AS AnsweredPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.Tags IS NOT NULL AND p.Tags <> '' THEN p.Id END) AS TaggedQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.ViewCount > 1000 THEN p.Id END) AS HighlyViewedQuestions,
+    CASE 
+        WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+            ROUND((COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) * 100.0 / COUNT(DISTINCT p.Id)), 2)
+        ELSE 0 
+    END AS QuestionPercentage,
+    CASE 
+        WHEN MAX(p.CreationDate) IS NOT NULL AND MIN(p.CreationDate) IS NOT NULL THEN 
+            CAST((EXTRACT(EPOCH FROM MAX(p.CreationDate)) - EXTRACT(EPOCH FROM MIN(p.CreationDate))) / 86400 AS INTEGER)
+        ELSE 0 
+    END AS ActiveDays,
+    ROW_NUMBER() OVER (ORDER BY SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) DESC) AS QuestionScoreRank,
+    RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS PostCountRank,
+    DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+    CASE 
+        WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 100 THEN 'Elite'
+        WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 50 THEN 'Veteran'
+        WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 10 THEN 'Regular'
+        ELSE 'Newbie'
+    END AS UserTier,
+    (SELECT COUNT(*) 
+     FROM Posts p2 
+     WHERE p2.OwnerUserId = u.Id 
+       AND p2.PostTypeId = 1 
+       AND p2.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1' YEAR)) AS RecentQuestions,
+    (SELECT COUNT(*) 
+     FROM Posts p3 
+     WHERE p3.OwnerUserId = u.Id 
+       AND p3.PostTypeId = 2 
+       AND p3.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1' YEAR)) AS RecentAnswers,
+    CASE 
+        WHEN u.Reputation < 1000 THEN 'Beginner'
+        WHEN u.Reputation BETWEEN 1000 AND 5000 THEN 'Intermediate'
+        WHEN u.Reputation BETWEEN 5001 AND 10000 THEN 'Advanced'
+        WHEN u.Reputation > 10000 THEN 'Expert'
+        ELSE 'Novice'
+    END AS ReputationTier,
+    COALESCE(
+        (SELECT STRING_AGG(TagName, ', ')
+         FROM (
+             SELECT TRIM(tag) AS TagName
+             FROM Posts p4
+             CROSS JOIN LATERAL (
+                 SELECT regexp_split_to_table(p4.Tags, '><') AS tag_with_brackets
+             ) s
+             CROSS JOIN LATERAL (
+                 SELECT
+                     (CASE 
+                         WHEN tag_with_brackets LIKE '<%' THEN TRIM(BOTH '<>' FROM tag_with_brackets)
+                         ELSE tag_with_brackets
+                      END) AS tag
+             ) t2
+             WHERE p4.OwnerUserId = u.Id 
+               AND p4.PostTypeId = 1
+               AND COALESCE(LENGTH(p4.Tags),0) > 2
+         ) tt
+        , 'No Tags')
+    ) AS FavoredTags,
+    ROUND(
+        (COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) * 100.0 / 
+         NULLIF((SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1), 0)),
+        4
+    ) AS PercentageOfTotalQuestions,
+    CASE 
+        WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 0 
+             AND COUNT(DISTINCT b.Id) > 0 
+        THEN CAST(COUNT(DISTINCT b.Id) AS DOUBLE PRECISION) / NULLIF(CAST(COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS DOUBLE PRECISION), 0)
+        ELSE 0 
+    END AS BadgesPerQuestion,
+    (SELECT p5.Title 
+     FROM Posts p5 
+     WHERE p5.OwnerUserId = u.Id 
+       AND p5.PostTypeId = 1 
+     ORDER BY p5.CreationDate DESC
+     LIMIT 1) AS LatestQuestionTitle,
+    (SELECT p6.Body 
+     FROM Posts p6 
+     WHERE p6.OwnerUserId = u.Id 
+       AND p6.PostTypeId = 1 
+     ORDER BY p6.CreationDate DESC
+     LIMIT 1) AS LatestQuestionBody
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId OR u.Id = p.LastEditorUserId
+LEFT JOIN Badges b ON u.Id = b.UserId
+WHERE u.Id > 0 
+  AND u.Reputation > 0
+  AND (p.PostTypeId = 1 OR p.PostTypeId = 2 OR p.PostTypeId = 3 OR p.PostTypeId IS NULL)
+GROUP BY u.Id, u.DisplayName, u.Reputation, MAX(p.CreationDate), MIN(p.CreationDate)
+HAVING COUNT(DISTINCT p.Id) > 0
+   OR COUNT(DISTINCT b.Id) > 0
+   OR COUNT(DISTINCT p.OwnerUserId) > 0
+ORDER BY u.Reputation DESC, COUNT(DISTINCT p.Id) DESC
+LIMIT 1000 OFFSET 0;

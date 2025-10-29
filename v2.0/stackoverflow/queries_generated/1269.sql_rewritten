@@ -1,0 +1,184 @@
+-- {"query": "1269.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2458} 
+WITH PostActivityMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        COUNT(DISTINCT c.Id) AS TotalCommentsFromTable,
+        COUNT(DISTINCT ph_edit.Id) FILTER (WHERE ph_edit.PostHistoryTypeId IN (4, 5, 6, 8, 9)) AS TotalEdits,
+        MAX(ph_edit.CreationDate) AS LastHistoryActivityDate,
+        COALESCE(SUM(CASE WHEN vt.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVoteCountAgg,
+        COALESCE(SUM(CASE WHEN vt.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownVoteCountAgg
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN PostHistory ph_edit ON p.Id = ph_edit.PostId
+    LEFT JOIN Votes vt ON p.Id = vt.PostId
+    GROUP BY p.Id
+),
+UserEngagementSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        COUNT(DISTINCT q.Id) AS QuestionsPosted,
+        COUNT(DISTINCT a.Id) AS AnswersPosted,
+        COALESCE(AVG(a.Score) FILTER (WHERE a.Score IS NOT NULL), 0) AS AvgAnswerScore,
+        MAX(p_any.LastActivityDate) AS LastContentActivity,
+        CASE
+            WHEN u.Reputation >= 10000 THEN 'Legendary'
+            WHEN u.Reputation >= 5000 THEN 'Veteran'
+            WHEN u.Reputation >= 1000 THEN 'Expert'
+            WHEN u.Reputation >= 100 THEN 'Apprentice'
+            ELSE 'Novice'
+        END AS ReputationTier,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        MAX(b.Date) AS LastBadgeAwardDate,
+        SUM(u.UpVotes) AS TotalUserUpVotes,
+        SUM(u.DownVotes) AS TotalUserDownVotes
+    FROM Users u
+    LEFT JOIN Posts q ON u.Id = q.OwnerUserId AND q.PostTypeId = 1
+    LEFT JOIN Posts a ON u.Id = a.OwnerUserId AND a.PostTypeId = 2
+    LEFT JOIN Posts p_any ON u.Id = p_any.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views
+),
+TopActiveTags AS (
+    SELECT
+        t.TagName
+    FROM Tags t
+    WHERE t.Count > 5000
+    ORDER BY t.Count DESC
+    LIMIT 20
+),
+MainQueryData AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate AS QuestionCreationDate,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        COALESCE(q.FavoriteCount, 0) AS FavoriteCount,
+        q.CommunityOwnedDate,
+        ues.DisplayName AS OwnerDisplayName,
+        ues.Reputation AS OwnerReputation,
+        ues.ReputationTier,
+        pam.TotalCommentsFromTable AS ActualCommentCount,
+        pam.TotalEdits AS PostEditCount,
+        pam.LastHistoryActivityDate,
+        pam.UpVoteCountAgg AS QuestionUpVotes,
+        pam.DownVoteCountAgg AS QuestionDownVotes,
+        a.Id AS AcceptedAnswerId,
+        a.Score AS AcceptedAnswerScore,
+        COALESCE(a.CreationDate, '1900-01-01') AS AcceptedAnswerCreationDate,
+        pl_linked.RelatedPostId AS LinkedToPostId,
+        related_p.Title AS LinkedPostTitle,
+        STRING_AGG(DISTINCT UNNEST(string_to_array(SUBSTRING(q.Tags, 2, LENGTH(q.Tags)-2), '><')), ', ') AS FormattedTags,
+        (SELECT COUNT(b.Id)
+         FROM Badges b
+         WHERE b.UserId = q.OwnerUserId
+           AND b.Class = 1
+           AND b.Date > q.CreationDate) AS GoldBadgesAfterPost,
+        COALESCE(ph_close.Comment, '0')::smallint AS CloseReasonId_IfClosed,
+        crt.Name AS CloseReasonName,
+        (q.Score * q.ViewCount * COALESCE(q.AnswerCount, 0) / (EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - q.CreationDate)) / 3600.0 + 1) *
+         (CASE WHEN q.AcceptedAnswerId IS NOT NULL THEN 1.5 ELSE 1 END))::numeric(18, 2) AS DerivedEngagementMetric,
+        RANK() OVER (PARTITION BY ues.ReputationTier ORDER BY q.Score DESC, q.ViewCount DESC) AS RankWithinRepTier,
+        LAG(q.CreationDate, 1, '1970-01-01') OVER (PARTITION BY q.OwnerUserId ORDER BY q.CreationDate) AS PrevQuestionCreationDate,
+        AVG(q.Score) OVER (PARTITION BY ues.ReputationTier) AS AvgScoreInTier,
+        NULLIF(q.LastEditorUserId, q.OwnerUserId) IS NOT NULL AS EditedByOtherUser,
+        (SELECT AVG(c.Score) FROM Comments c WHERE c.PostId = q.Id AND c.CreationDate > q.CreationDate - INTERVAL '30 days') AS AvgRecentCommentScore
+    FROM Posts q
+    INNER JOIN UserEngagementSummary ues ON q.OwnerUserId = ues.UserId
+    LEFT JOIN PostActivityMetrics pam ON q.Id = pam.PostId
+    LEFT JOIN Posts a ON q.AcceptedAnswerId = a.Id AND a.PostTypeId = 2
+    LEFT JOIN PostLinks pl_linked ON q.Id = pl_linked.PostId AND pl_linked.LinkTypeId = 1
+    LEFT JOIN Posts related_p ON pl_linked.RelatedPostId = related_p.Id
+    LEFT JOIN PostHistory ph_close ON q.Id = ph_close.PostId AND ph_close.PostHistoryTypeId = 10
+    LEFT JOIN CloseReasonTypes crt ON COALESCE(ph_close.Comment, '0')::smallint = crt.Id
+    WHERE q.PostTypeId = 1
+      AND q.CreationDate BETWEEN '2020-01-01' AND '2023-01-01'
+      AND q.ViewCount > 500
+      AND q.Score > 5
+      AND EXISTS (
+            SELECT 1
+            FROM TopActiveTags tat
+            WHERE q.Tags LIKE '%' || tat.TagName || '%'
+      )
+      AND ues.ReputationTier IN ('Expert', 'Veteran', 'Legendary')
+      AND (q.ClosedDate IS NULL OR q.CommunityOwnedDate IS NOT NULL)
+      AND pam.TotalEdits >= 2
+)
+SELECT
+    mqd.QuestionId,
+    mqd.Title,
+    mqd.QuestionCreationDate,
+    mqd.QuestionScore,
+    mqd.ViewCount,
+    mqd.AnswerCount,
+    mqd.FavoriteCount,
+    mqd.OwnerDisplayName,
+    mqd.OwnerReputation,
+    mqd.ReputationTier,
+    mqd.ActualCommentCount,
+    mqd.PostEditCount,
+    mqd.QuestionUpVotes,
+    mqd.QuestionDownVotes,
+    mqd.AcceptedAnswerId,
+    mqd.AcceptedAnswerScore,
+    mqd.FormattedTags,
+    mqd.GoldBadgesAfterPost,
+    mqd.CloseReasonName,
+    mqd.DerivedEngagementMetric,
+    mqd.RankWithinRepTier,
+    mqd.AvgScoreInTier,
+    mqd.EditedByOtherUser,
+    mqd.AvgRecentCommentScore,
+    (SELECT COUNT(DISTINCT pl_dup.RelatedPostId) FROM PostLinks pl_dup WHERE pl_dup.PostId = mqd.QuestionId AND pl_dup.LinkTypeId = 3) AS DuplicateCount,
+    CASE
+        WHEN mqd.DerivedEngagementMetric > 100000 THEN 'Very High Engagement'
+        WHEN mqd.DerivedEngagementMetric > 10000 THEN 'High Engagement'
+        WHEN mqd.DerivedEngagementMetric > 1000 THEN 'Medium Engagement'
+        ELSE 'Low Engagement'
+    END AS EngagementLevel
+FROM MainQueryData mqd
+
+UNION ALL
+
+SELECT
+    ph_mig.PostId AS QuestionId,
+    p_orig.Title,
+    p_orig.CreationDate AS QuestionCreationDate,
+    p_orig.Score AS QuestionScore,
+    p_orig.ViewCount,
+    p_orig.AnswerCount,
+    COALESCE(p_orig.FavoriteCount, 0) AS FavoriteCount,
+    COALESCE(u.DisplayName, p_orig.OwnerDisplayName) AS OwnerDisplayName,
+    u.Reputation AS OwnerReputation,
+    'Migrated' AS ReputationTier,
+    NULL AS ActualCommentCount,
+    COUNT(ph_mig.Id) AS PostEditCount,
+    NULL AS QuestionUpVotes,
+    NULL AS QuestionDownVotes,
+    NULL AS AcceptedAnswerId,
+    NULL AS AcceptedAnswerScore,
+    p_orig.Tags AS FormattedTags,
+    NULL AS GoldBadgesAfterPost,
+    'Migrated' AS CloseReasonName,
+    0.0 AS DerivedEngagementMetric,
+    0 AS RankWithinRepTier,
+    0.0 AS AvgScoreInTier,
+    FALSE AS EditedByOtherUser,
+    NULL AS AvgRecentCommentScore,
+    0 AS DuplicateCount,
+    'Migrated Post' AS EngagementLevel
+FROM PostHistory ph_mig
+JOIN Posts p_orig ON ph_mig.PostId = p_orig.Id
+LEFT JOIN Users u ON p_orig.OwnerUserId = u.Id
+WHERE ph_mig.PostHistoryTypeId IN (35, 36)
+  AND p_orig.CreationDate BETWEEN '2020-01-01' AND '2023-01-01'
+GROUP BY
+    ph_mig.PostId, p_orig.Title, p_orig.CreationDate, p_orig.Score, p_orig.ViewCount, p_orig.AnswerCount,
+    p_orig.FavoriteCount, u.DisplayName, p_orig.OwnerDisplayName, u.Reputation, p_orig.Tags
+HAVING COUNT(ph_mig.Id) > 0
+ORDER BY QuestionCreationDate DESC, QuestionScore DESC
+LIMIT 5000;

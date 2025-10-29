@@ -1,0 +1,149 @@
+-- {"query": "7595.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1739} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT c.Id) as Comments,
+        COUNT(DISTINCT b.Id) as Badges,
+        MAX(p.CreationDate) as LastPostDate,
+        COALESCE(MAX(p.LastActivityDate), u.LastAccessDate) as LastActivityDate,
+        DATEDIFF(day, u.CreationDate, GETDATE()) as AccountAgeDays,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        COALESCE(SUM(p.ViewCount), 0) as TotalViews,
+        COALESCE(AVG(CAST(p.Score AS FLOAT)), 0) as AvgPostScore,
+        STRING_AGG(DISTINCT COALESCE(p.Tags, ''), ', ') WITHIN GROUP (ORDER BY p.Tags) as AllTags,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 100 THEN 'Veteran'
+            WHEN COUNT(DISTINCT p.Id) > 50 THEN 'Experienced'
+            WHEN COUNT(DISTINCT p.Id) > 10 THEN 'Regular'
+            ELSE 'Newbie'
+        END as UserCategory
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.CreationDate, u.LastAccessDate
+),
+RankedUsers AS (
+    SELECT *,
+        ROW_NUMBER() OVER (ORDER BY TotalPosts DESC, Reputation DESC) as PostRank,
+        RANK() OVER (ORDER BY TotalScore DESC) as ScoreRank,
+        DENSE_RANK() OVER (ORDER BY AvgPostScore DESC) as AvgScoreRank
+    FROM UserActivityStats
+),
+TopUsers AS (
+    SELECT *
+    FROM RankedUsers
+    WHERE PostRank <= 500
+),
+QuestionStats AS (
+    SELECT 
+        p.Id as QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        u.DisplayName as OwnerName,
+        p.CreationDate,
+        p.LastActivityDate,
+        DATEDIFF(day, p.CreationDate, p.LastActivityDate) as ActiveDays,
+        COALESCE(p.Tags, '') as Tags,
+        STRING_AGG(DISTINCT c.Text, ' | ') WITHIN GROUP (ORDER BY c.CreationDate) as CommentTexts,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId IN (2, 3) THEN v.Id END) as VoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) as UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) as DownVotes,
+        AVG(CAST(p.Score AS FLOAT)) OVER (PARTITION BY SUBSTRING(p.Tags, 1, 5)) as AvgScoreByTagPrefix
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE p.PostTypeId = 1 
+    AND p.CreationDate >= DATEADD(YEAR, -2, GETDATE())
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, 
+             p.FavoriteCount, u.DisplayName, p.CreationDate, p.LastActivityDate, p.Tags
+),
+UserTagAnalysis AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags, 2, LEN(p.Tags) - 2), ', ') WITHIN GROUP (ORDER BY p.Tags) as UserTagList,
+        COUNT(DISTINCT p.Id) as TaggedQuestions,
+        COUNT(DISTINCT CASE WHEN p.Score > 0 THEN p.Id END) as PositiveScoreQuestions
+    FROM Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1 
+    AND p.Tags IS NOT NULL
+    GROUP BY u.Id, u.DisplayName
+)
+SELECT 
+    tu.UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.TotalPosts,
+    tu.Questions,
+    tu.Answers,
+    tu.Comments,
+    tu.Badges,
+    tu.UserCategory,
+    tu.PostRank,
+    tu.ScoreRank,
+    tu.AvgScoreRank,
+    (tu.TotalViews * 100.0 / NULLIF(tu.Reputation, 0)) as ViewPerReputation,
+    CASE 
+        WHEN tu.TotalScore > 1000 THEN 'High Achiever'
+        WHEN tu.TotalScore > 500 THEN 'Mid Tier'
+        ELSE 'Beginner'
+    END as AchievementTier,
+    (SELECT AVG(TotalPosts) FROM TopUsers) as AvgTopUserPosts,
+    (SELECT MAX(LastActivityDate) FROM TopUsers) as MaxLastActivity,
+    (SELECT COUNT(*) FROM QuestionStats qs WHERE qs.OwnerName = tu.DisplayName) as UserQuestionCount,
+    (SELECT STRING_AGG(Title, ' | ') WITHIN GROUP (ORDER BY LastActivityDate DESC) 
+     FROM QuestionStats qs 
+     WHERE qs.OwnerName = tu.DisplayName 
+     AND qs.LastActivityDate >= DATEADD(MONTH, -6, GETDATE())) as RecentQuestionTitles,
+    (SELECT COUNT(*) FROM Posts p2 
+     WHERE p2.OwnerUserId = tu.UserId 
+     AND p2.PostTypeId = 2 
+     AND p2.CreationDate >= DATEADD(YEAR, -1, GETDATE())) as RecentAnswers,
+    (SELECT COUNT(DISTINCT b.Name) FROM Badges b 
+     WHERE b.UserId = tu.UserId 
+     AND b.Date >= DATEADD(YEAR, -2, GETDATE())) as RecentBadges,
+    (SELECT COUNT(*) FROM Votes v 
+     INNER JOIN Posts p3 ON v.PostId = p3.Id 
+     WHERE v.UserId = tu.UserId 
+     AND v.VoteTypeId = 2 
+     AND p3.CreationDate >= DATEADD(MONTH, -3, GETDATE())) as RecentUpvotes,
+    (SELECT STUFF((SELECT ', ' + t.TagName 
+                  FROM Tags t 
+                  JOIN Posts p4 ON t.TagName = SUBSTRING(p4.Tags, 2, LEN(p4.Tags) - 2) 
+                  WHERE p4.OwnerUserId = tu.UserId 
+                  GROUP BY t.TagName 
+                  HAVING COUNT(*) > 1 
+                  ORDER BY COUNT(*) DESC 
+                  FOR XML PATH('')), 1, 2, '')) as HighFrequencyTags,
+    COALESCE(uTA.UserTagList, '') as UserTags,
+    COALESCE(uTA.TaggedQuestions, 0) as TaggedQCount,
+    COALESCE(uTA.PositiveScoreQuestions, 0) as PositiveScoreQCount,
+    (CASE WHEN tu.TotalPosts > (SELECT AVG(TotalPosts) FROM TopUsers) THEN 'Above Average' ELSE 'Below Average' END) as PostPerformance,
+    (CASE WHEN tu.Reputation > 10000 THEN 'Expert' 
+          WHEN tu.Reputation > 5000 THEN 'Advanced' 
+          WHEN tu.Reputation > 1000 THEN 'Intermediate' 
+          ELSE 'Beginner' END) as ReputationTier,
+    NULL as NullFieldPlaceholder
+FROM TopUsers tu
+LEFT JOIN UserTagAnalysis uTA ON tu.UserId = uTA.UserId
+WHERE tu.Reputation > 500 
+AND (tu.TotalPosts > 10 OR tu.Badges > 2)
+AND tu.AccountAgeDays > 30
+AND tu.DisplayName IS NOT NULL
+ORDER BY tu.TotalPosts DESC, tu.Reputation DESC
+OFFSET 100 ROWS 
+FETCH NEXT 200 ROWS ONLY;

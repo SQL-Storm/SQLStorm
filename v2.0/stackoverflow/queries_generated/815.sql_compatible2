@@ -1,0 +1,388 @@
+with
+-- recent activity window over posts with various flags
+recent_posts as (
+  select
+    p.id as post_id,
+    p.posttypeid,
+    p.owneruserid,
+    p.creationdate,
+    p.lastactivitydate,
+    p.score,
+    p.viewcount,
+    p.answercount,
+    p.favoritecount,
+    p.closeddate,
+    p.communityowneddate,
+    p.title,
+    p.tags,
+    coalesce(nullif(trim(p.ownerdisplayname), ''), u.displayname, '(anonymous)') as owner_name,
+    u.reputation,
+    u.creationdate as user_created,
+    u.location,
+    row_number() over (partition by p.owneruserid order by p.creationdate desc) as rn_owner_recent,
+    ntile(4) over (order by coalesce(p.viewcount,0) desc) as view_quartile,
+    dense_rank() over (order by coalesce(p.score,0) desc) as score_rank_global
+  from posts p
+  left join users u on u.id = p.owneruserid
+  where p.creationdate >= (select max(creationdate) - interval '365 days' from posts)
+),
+-- summarize votes per post, including windowed deltas
+vote_summary as (
+  select
+    v.postid,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+    sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_total,
+    max(v.creationdate) as last_vote_at,
+    count(*) as total_votes,
+    sum(case when v.votetypeid in (10,12) then 1 else 0 end) as harsh_votes,
+    avg(extract(epoch from v.creationdate)) as avg_vote_ts,
+    stddev_pop(extract(epoch from v.creationdate)) as std_vote_ts
+  from votes v
+  where v.creationdate >= (select max(creationdate) - interval '365 days' from votes)
+  group by v.postid
+),
+-- comments activity with text metrics
+comment_metrics as (
+  select
+    c.postid,
+    count(*) as comment_count,
+    sum(case when c.score > 0 then 1 else 0 end) as positive_comments,
+    max(c.creationdate) as last_comment_at,
+    avg(length(coalesce(c.text,''))) as avg_comment_len,
+    max(length(coalesce(c.text,''))) as max_comment_len
+  from comments c
+  where c.creationdate >= (select max(creationdate) - interval '365 days' from comments)
+  group by c.postid
+),
+-- post history events: closures, edits, migrations, etc.
+history_flags as (
+  select
+    ph.postid,
+    count(*) filter (where ph.posthistorytypeid in (4,5,6,7,8,9,24)) as edit_events,
+    count(*) filter (where ph.posthistorytypeid in (10)) as close_events,
+    count(*) filter (where ph.posthistorytypeid in (11)) as reopen_events,
+    count(*) filter (where ph.posthistorytypeid in (35,36,17)) as migrate_events,
+    bool_or(ph.posthistorytypeid = 19) as was_protected,
+    min(ph.creationdate) filter (where ph.posthistorytypeid in (10)) as first_close_at,
+    min(ph.creationdate) filter (where ph.posthistorytypeid in (11)) as first_reopen_at
+  from posthistory ph
+  where ph.creationdate >= (select max(creationdate) - interval '365 days' from posthistory)
+  group by ph.postid
+),
+-- duplicates and linked posts via PostLinks
+link_graph as (
+  select
+    pl.postid,
+    count(*) filter (where pl.linktypeid = 1) as linked_out,
+    count(*) filter (where pl.linktypeid = 3) as dup_of_count,
+    count(distinct case when pl.linktypeid = 3 then pl.relatedpostid end) as distinct_dups,
+    max(pl.creationdate) as last_link_at
+  from postlinks pl
+  where pl.creationdate >= (select max(creationdate) - interval '365 days' from postlinks)
+  group by pl.postid
+),
+-- tag expansion and tag popularity join
+tags_expanded as (
+  select
+    p.id as post_id,
+    lower(trim(t)) as tag
+  from posts p,
+  lateral (
+    select unnest(
+      case
+        when p.tags is null then array[]::text[]
+        else string_to_array(substring(p.tags, 2, char_length(p.tags)-2), '><')
+      end
+    ) as t
+  ) te
+),
+tag_stats as (
+  select te.post_id, te.tag, coalesce(tags.count,0) as tag_count_global,
+         coalesce(tags.ismoderatoronly, false) as tag_mod_only,
+         coalesce(tags.isrequired, false) as tag_required
+  from tags_expanded te
+  left join tags on lower(tags.tagname) = te.tag
+),
+-- aggregate per post tag features
+post_tag_agg as (
+  select
+    post_id,
+    count(*) as tag_count,
+    max(tag_count_global) as max_tag_popularity,
+    avg(cast(tag_count_global as numeric)) as avg_tag_popularity,
+    sum(case when tag_mod_only then 1 else 0 end) as mod_only_tags,
+    sum(case when tag_required then 1 else 0 end) as required_tags,
+    string_agg(tag, ',' ORDER BY tag) as tag_list_norm
+  from tag_stats
+  group by post_id
+),
+-- user-level aggregates
+user_activity as (
+  select
+    u.id as user_id,
+    u.reputation,
+    u.creationdate,
+    u.views,
+    u.upvotes,
+    u.downvotes,
+    coalesce(u.location, '') as location,
+    count(distinct p.id) filter (where p.posttypeid = 1) as q_count,
+    count(distinct p.id) filter (where p.posttypeid = 2) as a_count,
+    count(*) filter (where p.score > 0) as positive_posts,
+    avg(coalesce(p.score,0)) as avg_post_score,
+    max(p.creationdate) as last_post_at
+  from users u
+  left join posts p on p.owneruserid = u.id
+  group by u.id, u.reputation, u.creationdate, u.views, u.upvotes, u.downvotes, u.location
+),
+-- badge aggregates by class, with window of latest badge
+badge_agg as (
+  select
+    b.userid,
+    count(*) as badge_total,
+    count(*) filter (where b.class = 1) as golds,
+    count(*) filter (where b.class = 2) as silvers,
+    count(*) filter (where b.class = 3) as bronzes,
+    max(b.date) as last_badge_at
+  from badges b
+  group by b.userid
+),
+-- compile per-post metrics by joining many aggregates
+post_metrics as (
+  select
+    rp.post_id,
+    rp.posttypeid,
+    rp.owneruserid,
+    rp.owner_name,
+    rp.creationdate,
+    rp.lastactivitydate,
+    rp.score,
+    rp.viewcount,
+    rp.answercount,
+    rp.favoritecount,
+    rp.closeddate,
+    rp.communityowneddate,
+    coalesce(rp.title, '') as title,
+    coalesce(rp.tags, '') as tags_raw,
+    rp.view_quartile,
+    rp.score_rank_global,
+    vs.upvotes,
+    vs.downvotes,
+    vs.favorites as vote_favorites,
+    vs.bounty_total,
+    vs.total_votes,
+    vs.harsh_votes,
+    vs.last_vote_at,
+    cm.comment_count,
+    cm.positive_comments,
+    cm.last_comment_at,
+    cm.avg_comment_len,
+    cm.max_comment_len,
+    hf.edit_events,
+    hf.close_events,
+    hf.reopen_events,
+    hf.migrate_events,
+    hf.was_protected,
+    hf.first_close_at,
+    hf.first_reopen_at,
+    lg.linked_out,
+    lg.dup_of_count,
+    lg.distinct_dups,
+    lg.last_link_at,
+    pta.tag_count,
+    pta.max_tag_popularity,
+    pta.avg_tag_popularity,
+    pta.mod_only_tags,
+    pta.required_tags,
+    pta.tag_list_norm
+  from recent_posts rp
+  left join vote_summary vs on vs.postid = rp.post_id
+  left join comment_metrics cm on cm.postid = rp.post_id
+  left join history_flags hf on hf.postid = rp.post_id
+  left join link_graph lg on lg.postid = rp.post_id
+  left join post_tag_agg pta on pta.post_id = rp.post_id
+),
+-- rank posts per various dimensions
+ranked as (
+  select
+    pm.*,
+    coalesce(pm.upvotes,0) - coalesce(pm.downvotes,0) as net_votes,
+    case
+      when pm.closeddate is not null then 1
+      when coalesce(pm.close_events,0) > 0 then 1
+      else 0
+    end as was_closed_flag,
+    row_number() over (order by coalesce(pm.viewcount,0) desc, coalesce(pm.score,0) desc) as rn_views,
+    row_number() over (order by (coalesce(pm.upvotes,0) - coalesce(pm.downvotes,0)) desc) as rn_netvotes,
+    row_number() over (order by coalesce(pm.answercount,0) desc) as rn_answers,
+    percentile_cont(0.5) within group (order by coalesce(pm.viewcount,0)) over () as median_views_all
+  from post_metrics pm
+),
+-- combine with user aggregates
+user_enriched as (
+  select
+    r.*,
+    ua.reputation as user_reputation,
+    ua.q_count,
+    ua.a_count,
+    ua.avg_post_score as user_avg_post_score,
+    ua.last_post_at as user_last_post_at,
+    ba.badge_total,
+    ba.golds,
+    ba.silvers,
+    ba.bronzes,
+    ba.last_badge_at
+  from ranked r
+  left join user_activity ua on ua.user_id = r.owneruserid
+  left join badge_agg ba on ba.userid = r.owneruserid
+),
+-- complex filter and classification
+classified as (
+  select
+    ue.*,
+    case
+      when ue.posttypeid = 1 and coalesce(ue.answercount,0) = 0 and coalesce(ue.viewcount,0) > coalesce(ue.median_views_all,0) then 'unanswered_hot'
+      when ue.posttypeid = 1 and coalesce(ue.dup_of_count,0) > 0 then 'duplicate_question'
+      when ue.posttypeid = 2 and coalesce(ue.score,0) >= 10 then 'high_score_answer'
+      when ue.was_closed_flag = 1 then 'closed_post'
+      else 'other'
+    end as post_class,
+    case
+      when ue.tag_count is null or ue.tag_count = 0 then null
+      when position('sql' in coalesce(ue.tag_list_norm,'')) > 0 then 'sql'
+      when position('python' in coalesce(ue.tag_list_norm,'')) > 0 then 'python'
+      when position('javascript' in coalesce(ue.tag_list_norm,'')) > 0 then 'javascript'
+      else 'misc'
+    end as dominant_topic,
+    coalesce(ue.viewcount,0) / nullif((extract(epoch from (timestamp '2024-10-01 12:34:56' - ue.creationdate)) / 3600.0), 0) as views_per_hour,
+    case when ue.comment_count is not null and ue.comment_count > 0
+         then (coalesce(ue.positive_comments,0) * 1.0 / ue.comment_count)
+         else null end as positive_comment_ratio
+  from user_enriched ue
+),
+-- anomaly detection via z-scores
+zcalc as (
+  select
+    c.*,
+    avg(coalesce(c.viewcount,0)) over () as avg_views,
+    stddev_pop(coalesce(c.viewcount,0)) over () as sd_views,
+    avg(coalesce(c.net_votes,0)) over () as avg_netvotes,
+    stddev_pop(coalesce(c.net_votes,0)) over () as sd_netvotes,
+    avg(coalesce(c.comment_count,0)) over () as avg_comments,
+    stddev_pop(coalesce(c.comment_count,0)) over () as sd_comments
+  from classified c
+),
+scored as (
+  select
+    z.*,
+    case when sd_views > 0 then (coalesce(viewcount,0) - avg_views) / sd_views else 0 end as z_views,
+    case when sd_netvotes > 0 then (coalesce(net_votes,0) - avg_netvotes) / sd_netvotes else 0 end as z_netvotes,
+    case when sd_comments > 0 then (coalesce(comment_count,0) - avg_comments) / sd_comments else 0 end as z_comments,
+    -- composite score with weights and null handling
+    (case when sd_views > 0 then (coalesce(viewcount,0) - avg_views) / sd_views else 0 end * 0.5) +
+    (case when sd_netvotes > 0 then (coalesce(net_votes,0) - avg_netvotes) / sd_netvotes else 0 end * 0.3) +
+    (case when sd_comments > 0 then (coalesce(comment_count,0) - avg_comments) / sd_comments else 0 end * 0.2) as composite_z
+  from zcalc z
+),
+-- pick a challenging subset: combine set operators to contrast extremes
+top_extremes as (
+  (
+    select post_id from scored
+    where composite_z is not null
+    order by composite_z desc
+    limit 200
+  )
+  union
+  (
+    select post_id from scored
+    where composite_z is not null
+    order by composite_z asc
+    limit 200
+  )
+),
+-- final join to label if a post is in extremes
+final_set as (
+  select s.*, case when exists (select 1 from top_extremes te where te.post_id = s.post_id) then true else false end as is_extreme
+  from scored s
+)
+select
+  fs.post_id,
+  fs.posttypeid,
+  fs.owneruserid,
+  fs.owner_name,
+  fs.title,
+  fs.tags_raw,
+  fs.tag_list_norm,
+  fs.dominant_topic,
+  fs.post_class,
+  fs.viewcount,
+  fs.score,
+  fs.net_votes,
+  fs.answercount,
+  fs.comment_count,
+  fs.upvotes,
+  fs.downvotes,
+  fs.vote_favorites,
+  fs.bounty_total,
+  fs.harsh_votes,
+  fs.last_vote_at,
+  fs.last_comment_at,
+  fs.edit_events,
+  fs.close_events,
+  fs.reopen_events,
+  fs.migrate_events,
+  fs.was_protected,
+  fs.first_close_at,
+  fs.linked_out,
+  fs.dup_of_count,
+  fs.distinct_dups,
+  fs.views_per_hour,
+  fs.positive_comment_ratio,
+  fs.user_reputation,
+  fs.q_count,
+  fs.a_count,
+  fs.user_avg_post_score,
+  fs.badge_total,
+  fs.golds,
+  fs.silvers,
+  fs.bronzes,
+  fs.view_quartile,
+  fs.score_rank_global,
+  fs.rn_views,
+  fs.rn_netvotes,
+  fs.rn_answers,
+  fs.z_views,
+  fs.z_netvotes,
+  fs.z_comments,
+  fs.composite_z,
+  fs.is_extreme
+from final_set fs
+where
+  -- complex predicate blending multiple metrics
+  (
+    (fs.posttypeid = 1 and coalesce(fs.answercount,0) = 0 and fs.viewcount > coalesce(fs.median_views_all,0))
+    or
+    (fs.posttypeid = 2 and fs.net_votes >= 5 and coalesce(fs.comment_count,0) >= 1)
+    or
+    (fs.was_closed_flag = 1 and coalesce(fs.dup_of_count,0) >= 1)
+  )
+  and (
+    fs.dominant_topic is null
+    or fs.dominant_topic in ('sql','python','javascript')
+  )
+  and (
+    fs.owneruserid is not null
+    or fs.owner_name <> '(anonymous)'
+  )
+  and (
+    fs.views_per_hour is null
+    or fs.views_per_hour > 0
+  )
+order by
+  fs.is_extreme desc,
+  fs.composite_z desc,
+  fs.viewcount desc,
+  fs.score desc
+limit 500;

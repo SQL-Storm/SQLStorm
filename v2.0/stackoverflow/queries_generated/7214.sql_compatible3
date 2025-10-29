@@ -1,0 +1,248 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+        SUM(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ROWS UNBOUNDED PRECEDING) as running_total_score,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN 'QuestionWithAnswers'
+            WHEN p.PostTypeId = 1 AND p.AnswerCount = 0 THEN 'QuestionNoAnswers'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as post_category,
+        COALESCE(p.Title, 'No Title') as title_or_default,
+        CASE 
+            WHEN LENGTH(COALESCE(p.Tags, '')) > 0 AND p.Tags LIKE '%<%>' THEN 
+                REGEXP_REPLACE(p.Tags, '[<>]', '', 'g')
+            ELSE 'No Tags'
+        END as cleaned_tags,
+        CAST(
+            (EXTRACT(EPOCH FROM TIMESTAMP '2024-10-01 12:34:56') - EXTRACT(EPOCH FROM p.CreationDate))
+            / 86400
+        AS INTEGER) as days_since_creation
+    FROM Posts p
+    WHERE p.Score >= 0 AND p.CreationDate >= TIMESTAMP '2020-01-01'
+),
+UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.CreationDate as user_creation_date,
+        COUNT(DISTINCT p.Id) as total_posts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as answers,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) as question_score,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) as answer_score,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END) as avg_question_score,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE NULL END) as avg_answer_score,
+        MAX(p.CreationDate) as last_post_date
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate
+),
+PostsWithVotes AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        pv.vote_count,
+        pv.upvotes,
+        pv.downvotes,
+        pv.favorites,
+        CASE 
+            WHEN COALESCE(pv.vote_count,0) = 0 THEN 'No Votes'
+            WHEN pv.vote_count > 100 THEN 'Highly Voted'
+            WHEN pv.vote_count > 50 THEN 'Moderately Voted'
+            ELSE 'Low Votes'
+        END as vote_category,
+        pv.avg_vote_score,
+        CASE 
+            WHEN COALESCE(pv.avg_vote_score,0) > 10 THEN 'Highly Rated'
+            WHEN COALESCE(pv.avg_vote_score,0) > 5 THEN 'Moderately Rated'
+            ELSE 'Low Rated'
+        END as rating_category
+    FROM Posts p
+    LEFT JOIN (
+        SELECT 
+            v.PostId,
+            COUNT(*) as vote_count,
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) as upvotes,
+            SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) as downvotes,
+            SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) as favorites,
+            AVG(v.VoteTypeId) as avg_vote_score
+        FROM Votes v
+        GROUP BY v.PostId
+    ) pv ON p.Id = pv.PostId
+    WHERE p.PostTypeId IN (1,2)
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            WHEN t.Count > 10 THEN 'Low'
+            ELSE 'Very Low'
+        END as popularity_level,
+        CASE 
+            WHEN COALESCE(t.IsRequired, FALSE) = TRUE THEN 'Required Tag'
+            WHEN COALESCE(t.IsModeratorOnly, FALSE) = TRUE THEN 'Moderator Only'
+            ELSE 'General Tag'
+        END as tag_type,
+        CAST(FLOOR((t.ExcerptPostId * 1.0 / 1000000000)) AS INTEGER) as year_derived
+    FROM Tags t
+    WHERE t.Count > 0 AND LENGTH(COALESCE(t.TagName, '')) > 2
+)
+SELECT 
+    rs.Id,
+    rs.PostTypeId,
+    rs.ParentId,
+    rs.OwnerUserId,
+    rs.Score,
+    rs.ViewCount,
+    rs.CreationDate,
+    rs.Title,
+    rs.AnswerCount,
+    rs.CommentCount,
+    rs.FavoriteCount,
+    rs.post_category,
+    rs.cleaned_tags,
+    rs.days_since_creation,
+    rs.prev_score,
+    rs.running_total_score,
+    us.DisplayName,
+    us.Reputation,
+    us.total_posts,
+    us.questions,
+    us.answers,
+    us.avg_question_score,
+    us.avg_answer_score,
+    ps.vote_category,
+    ps.rating_category,
+    ta.popularity_level,
+    ta.tag_type,
+    CASE 
+        WHEN rs.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'Above Average'
+        WHEN rs.Score > (SELECT AVG(Score) * 0.8 FROM Posts WHERE PostTypeId = 1) THEN 'Near Average'
+        ELSE 'Below Average'
+    END as score_performance,
+    CASE 
+        WHEN rs.days_since_creation < 30 THEN 'Recent'
+        WHEN rs.days_since_creation < 180 THEN 'Mid-aged'
+        ELSE 'Old'
+    END as age_category,
+    CASE 
+        WHEN rs.Score >= 0 AND rs.ViewCount > 1000 THEN 'High Engagement'
+        WHEN rs.Score >= 0 AND rs.ViewCount > 100 THEN 'Medium Engagement'
+        ELSE 'Low Engagement'
+    END as engagement_level,
+    DENSE_RANK() OVER (ORDER BY rs.Score DESC) as rank_by_score,
+    PERCENT_RANK() OVER (ORDER BY rs.Score) as percent_rank_by_score,
+    STRING_AGG(
+        CASE 
+            WHEN rs.PostTypeId = 1 THEN rs.Title
+            WHEN rs.PostTypeId = 2 THEN 'Answer to: ' || (SELECT p2.Title FROM Posts p2 WHERE p2.Id = rs.ParentId LIMIT 1)
+            ELSE NULL
+        END, 
+        ' | ' 
+        ORDER BY rs.CreationDate
+    ) as post_chain,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p2 
+        WHERE p2.OwnerUserId = rs.OwnerUserId 
+        AND p2.CreationDate >= rs.CreationDate - INTERVAL '1 year'
+    ) as posts_last_year,
+    (
+        SELECT AVG(p3.Score) 
+        FROM Posts p3 
+        WHERE p3.OwnerUserId = rs.OwnerUserId 
+        AND p3.PostTypeId = rs.PostTypeId
+    ) as avg_score_by_type,
+    COALESCE(
+        (
+            SELECT t.TagName 
+            FROM Tags t 
+            WHERE t.TagName IN (
+                SELECT UNNEST(string_to_array(rs.cleaned_tags, ','))
+            )
+            LIMIT 1
+        ), 
+        'No Matching Tags'
+    ) as sample_tag
+FROM RankedPosts rs
+LEFT JOIN UserStats us ON rs.OwnerUserId = us.UserId
+LEFT JOIN PostsWithVotes ps ON rs.Id = ps.Id
+LEFT JOIN TagAnalysis ta ON (rs.cleaned_tags LIKE '%' || ta.TagName || '%')
+WHERE 
+    (rs.post_category IN ('QuestionWithAnswers', 'QuestionNoAnswers', 'Answer') OR rs.PostTypeId IN (1,2))
+    AND rs.days_since_creation <= 365
+    AND (us.Reputation > 1000 OR us.total_posts IS NULL)
+    AND (
+        rs.days_since_creation < 7 OR 
+        rs.days_since_creation > 365 OR 
+        rs.Score IS NULL OR 
+        rs.ViewCount IS NULL
+    )
+GROUP BY 
+    rs.Id,
+    rs.PostTypeId,
+    rs.ParentId,
+    rs.OwnerUserId,
+    rs.Score,
+    rs.ViewCount,
+    rs.CreationDate,
+    rs.Title,
+    rs.AnswerCount,
+    rs.CommentCount,
+    rs.FavoriteCount,
+    rs.post_category,
+    rs.cleaned_tags,
+    rs.days_since_creation,
+    rs.prev_score,
+    rs.running_total_score,
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.total_posts,
+    us.questions,
+    us.answers,
+    us.avg_question_score,
+    us.avg_answer_score,
+    ps.Id,
+    ps.vote_category,
+    ps.rating_category,
+    ta.TagName,
+    ta.popularity_level,
+    ta.tag_type
+HAVING 
+    COUNT(*) > 0
+    AND (COUNT(rs.Id) > 1 OR rs.Id IS NOT NULL)
+    AND (COUNT(us.UserId) = 1 OR us.UserId IS NULL)
+    AND (
+        AVG(rs.Score) > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1)
+        OR AVG(rs.Score) IS NULL
+    )
+ORDER BY 
+    rs.Score DESC,
+    rs.CreationDate DESC,
+    rs.ViewCount DESC,
+    us.Reputation DESC
+LIMIT 1000;

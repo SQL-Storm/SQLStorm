@@ -1,0 +1,54 @@
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id ELSE NULL END) AS TotalQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id ELSE NULL END) AS TotalAnswers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 3 THEN p.Id ELSE NULL END) AS TotalWikis,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.PostId ELSE NULL END) AS TotalUpVotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.PostId ELSE NULL END) AS TotalDownVotes,
+    MAX(p.Score) AS HighestScoredPost,
+    MIN(p.Score) AS LowestScoredPost,
+    STRING_AGG(DISTINCT t.TagName, ', ') AS MostCommonTags,
+    AVG(p.ViewCount) AS AvgViewCount,
+    SUM(p.AnswerCount) AS TotalAnswersCount,
+    MAX(ph.CreationDate) AS LastPostEdit,
+    COALESCE(SUM(b.Class), 0) AS TotalBadges,
+    AVG(CASE WHEN p.PostTypeId = 1 THEN p.AnswerCount ELSE 0 END) AS AvgAnswersPerQuestion
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN LATERAL (
+    SELECT t2.TagName
+    FROM Tags t2
+    WHERE t2.Id = ANY(
+        -- convert tag string like '<1><2>' into array of ints in dialect-agnostic way
+        -- split on '><' after trimming surrounding angle brackets
+        -- here we emulate by replacing leading '<' and trailing '>' and splitting; adjust for your SQL dialect
+        string_to_array(
+            trim(both '<' FROM p.Tags),
+            '><'
+        )
+    )::int[]
+) t ON true
+WHERE 
+    u.Reputation > 1000
+    AND p.CreationDate >= (DATE_TRUNC('month', CAST('2024-10-01' AS date)) - INTERVAL '1 year')
+GROUP BY 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.Location
+HAVING 
+    COUNT(DISTINCT p.Id) > 10
+ORDER BY 
+    u.Reputation DESC
+LIMIT 100;

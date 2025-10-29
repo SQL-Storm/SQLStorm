@@ -1,0 +1,177 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        AVG(p.Score) as AvgPostScore,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags)-2)), ', ') as AllTags,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 100 THEN 'Highly Active'
+            WHEN COUNT(DISTINCT p.Id) > 50 THEN 'Active'
+            WHEN COUNT(DISTINCT p.Id) > 10 THEN 'Regular'
+            ELSE 'Occasional'
+        END as ActivityLevel,
+        ROW_NUMBER() OVER (PARTITION BY u.Reputation ORDER BY COUNT(DISTINCT p.Id) DESC) as ReputationRank,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= TIMESTAMP '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Question with Accepted Answer'
+            WHEN p.PostTypeId = 1 THEN 'Question without Accepted Answer'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as PostTypeDescription,
+        EXISTS (
+            SELECT 1 FROM PostLinks pl 
+            WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3
+        ) as IsDuplicate,
+        COALESCE(
+            (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2),
+            0
+        ) as UpVoteCount,
+        COALESCE(
+            (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3),
+            0
+        ) as DownVoteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) as UserPostRank,
+        CASE 
+            WHEN p.Score >= 100 THEN 'Highly Upvoted'
+            WHEN p.Score >= 50 THEN 'Upvoted'
+            WHEN p.Score >= 10 THEN 'Moderately Upvoted'
+            ELSE 'Low Upvoted'
+        END as UpvoteCategory,
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PreviousPostScore,
+        (p.Score - LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate)) as ScoreChange,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) as GlobalScoreRank,
+        NTILE(100) OVER (ORDER BY p.Score DESC) as ScorePercentile
+    FROM Posts p
+    WHERE p.CreationDate >= TIMESTAMP '2015-01-01'
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            WHEN t.Count > 10 THEN 'Niche'
+            ELSE 'Rare'
+        END as PopularityLevel,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags)-2)), ', ') as QuestionTags
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    WHERE t.TagName IS NOT NULL
+    GROUP BY t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId, t.IsModeratorOnly, t.IsRequired
+),
+CombinedAnalysis AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.PostCount,
+        uas.CommentCount,
+        uas.BadgeCount,
+        uas.ActivityLevel,
+        uas.ReputationRank,
+        uas.QuestionCount,
+        uas.AnswerCount,
+        pa.PostId,
+        pa.Title,
+        pa.Score,
+        pa.ViewCount,
+        pa.AnswerCount as PostAnswerCount,
+        pa.CommentCount as PostCommentCount,
+        pa.CreationDate as PostCreationDate,
+        pa.PostTypeDescription,
+        pa.IsDuplicate,
+        pa.UpVoteCount,
+        pa.DownVoteCount,
+        pa.UserPostRank,
+        pa.UpvoteCategory,
+        pa.PreviousPostScore,
+        pa.ScoreChange,
+        pa.GlobalScoreRank,
+        pa.ScorePercentile,
+        ta.TagName,
+        ta.TagCount,
+        ta.PopularityLevel,
+        ta.IsModeratorOnly,
+        ta.IsRequired,
+        (pa.Score * 0.7 + pa.UpVoteCount * 0.3) as WeightedScore,
+        ABS(pa.ScoreChange) as AbsoluteScoreChange,
+        CASE 
+            WHEN pa.PreviousPostScore > 0 AND pa.Score > pa.PreviousPostScore THEN 'Improvement'
+            WHEN pa.PreviousPostScore > 0 AND pa.Score < pa.PreviousPostScore THEN 'Decline'
+            ELSE 'No Previous'
+        END as PerformanceTrend,
+        (pa.Score - LAG(pa.Score, 1) OVER (ORDER BY pa.CreationDate)) as DailyChange,
+        RANK() OVER (ORDER BY (pa.Score * 0.7 + pa.UpVoteCount * 0.3) DESC) as CombinedRank
+    FROM UserActivityStats uas
+    INNER JOIN PostAnalysis pa ON uas.UserId = pa.OwnerUserId
+    LEFT JOIN TagAnalysis ta ON pa.Tags LIKE '%' || ta.TagName || '%'
+    WHERE pa.Score > 0 AND uas.Reputation > 1000
+)
+SELECT 
+    COUNT(*) as TotalRecords,
+    COUNT(DISTINCT UserId) as DistinctUsers,
+    COUNT(DISTINCT PostId) as DistinctPosts,
+    COUNT(DISTINCT TagName) as DistinctTags,
+    AVG(Reputation) as AvgReputation,
+    AVG(PostCount) as AvgPostsPerUser,
+    AVG(Score) as AvgPostScore,
+    AVG(UpVoteCount) as AvgUpVotes,
+    AVG(DownVoteCount) as AvgDownVotes,
+    STRING_AGG(DISTINCT ActivityLevel, ', ') as ActivityLevels,
+    STRING_AGG(DISTINCT PopularityLevel, ', ') as TagPopularityLevels,
+    STRING_AGG(DISTINCT UpvoteCategory, ', ') as UpvoteCategories,
+    CONCAT('Users with more than 500 posts: ', 
+           COUNT(DISTINCT CASE WHEN PostCount > 500 THEN UserId END)) as HighActivityUsers,
+    CONCAT('Posts with score > 100: ', 
+           COUNT(DISTINCT CASE WHEN Score > 100 THEN PostId END)) as HighScorePosts,
+    CONCAT('Average reputation of top 1000 users: ', 
+           AVG(CASE WHEN ReputationRank <= 1000 THEN Reputation END)) as TopReputation,
+    COUNT(DISTINCT CASE WHEN IsDuplicate = TRUE THEN PostId END) as DuplicatePosts,
+    COUNT(DISTINCT CASE WHEN ScoreChange > 0 THEN PostId END) as PostsImproved,
+    COUNT(DISTINCT CASE WHEN ScoreChange < 0 THEN PostId END) as PostsDeclined,
+    COUNT(DISTINCT CASE WHEN PerformanceTrend = 'Improvement' THEN PostId END) as TrendingPosts,
+    COUNT(DISTINCT CASE WHEN CombinedRank <= 100 AND Score > 50 THEN PostId END) as TopPerformerPosts,
+    STRING_AGG(DISTINCT DisplayName, ', ') as UserNames,
+    STRING_AGG(DISTINCT Title, ', ') as PostTitles,
+    STRING_AGG(DISTINCT TagName, ', ') as AllTags
+FROM CombinedAnalysis
+WHERE 
+    Reputation > 1000 
+    AND PostCount > 0
+    AND Score >= 0
+    AND CombinedRank <= 10000
+    AND NOT (Reputation = 0 AND PostCount = 0);

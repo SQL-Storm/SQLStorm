@@ -1,0 +1,176 @@
+WITH UserEngagementSummary AS (
+    SELECT
+        u.Id AS UserId,
+        COALESCE(u.DisplayName, 'Unknown User') AS DisplayName,
+        u.CreationDate AS UserCreationDate,
+        u.Reputation,
+        u.UpVotes,
+        u.DownVotes,
+        MAX(GREATEST(u.LastAccessDate, COALESCE(p.LastActivityDate, TIMESTAMP '1900-01-01'), COALESCE(c.CreationDate, TIMESTAMP '1900-01-01'), COALESCE(b.Date, TIMESTAMP '1900-01-01'))) AS LastKnownActivity,
+        COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsOwned,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersOwned,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+        COALESCE(SUM(p.ViewCount), 0) AS TotalPostViews,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT b.Id) AS TotalBadgesEarned,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END) AS AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE NULL END) AS AvgAnswerScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.CreationDate, u.Reputation, u.UpVotes, u.DownVotes
+),
+PostHistoryTimeline AS (
+    SELECT
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate AS HistoryDate,
+        ph.UserId AS EditorUserId,
+        ph.Comment,
+        ph.Text,
+        LAG(ph.CreationDate, 1, ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS PreviousHistoryDate,
+        (ph.CreationDate - LAG(ph.CreationDate, 1, ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate)) AS TimeSincePreviousEvent
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6, 10, 11, 12, 13)
+),
+QuestionTagAnalysis AS (
+    SELECT
+        p.Id AS PostId,
+        unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS TagName,
+        p.Score AS PostScore,
+        p.ViewCount AS PostViewCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2
+),
+ComplexPostCategorization AS (
+    SELECT
+        p.Id AS PostId,
+        'Closed Duplicate Question' AS PostCategory,
+        p.CreationDate,
+        p.Score
+    FROM Posts p
+    WHERE
+        p.PostTypeId = 1
+        AND p.ClosedDate IS NOT NULL
+        AND EXISTS (
+            SELECT 1
+            FROM PostLinks pl
+            WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3
+        )
+    UNION ALL
+    SELECT
+        p.Id AS PostId,
+        'Low Quality Unnoticed Answer' AS PostCategory,
+        p.CreationDate,
+        p.Score
+    FROM Posts p
+    WHERE
+        p.PostTypeId = 2
+        AND p.Score <= 0
+        AND p.CommentCount = 0
+        AND NOT EXISTS (
+            SELECT 1 FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2
+        )
+)
+SELECT
+    ues.UserId,
+    ues.DisplayName AS UserDisplayName,
+    ues.Reputation,
+    ues.TotalPostsOwned,
+    ues.TotalQuestionsOwned,
+    ues.TotalAnswersOwned,
+    ues.TotalCommentsMade,
+    ues.TotalBadgesEarned,
+    ROUND(CAST(ues.UpVotes AS NUMERIC) / NULLIF(ues.DownVotes + ues.UpVotes, 0), 2) AS UpDownVoteRatio,
+    CASE
+        WHEN ues.Reputation >= 100000 THEN 'Legendary'
+        WHEN ues.Reputation >= 20000 THEN 'Veteran'
+        WHEN ues.Reputation >= 5000 THEN 'Experienced'
+        WHEN ues.Reputation >= 1000 THEN 'Active'
+        ELSE 'Novice'
+    END AS UserReputationTier,
+    AVG(p_q.Score) OVER (PARTITION BY ues.UserId) AS AvgQuestionScoreByThisUser,
+    (
+        SELECT COALESCE(AVG(ans.Score), 0)
+        FROM Posts ans
+        WHERE
+            ans.OwnerUserId = ues.UserId
+            AND ans.PostTypeId = 2
+            AND ans.CreationDate > (ues.UserCreationDate + INTERVAL '1 year')
+            AND ans.Score IS NOT NULL
+    ) AS AvgAnswerScoreAfterFirstYear,
+    RANK() OVER (PARTITION BY EXTRACT(YEAR FROM ues.UserCreationDate) ORDER BY ues.Reputation DESC) AS RankInCreationYear,
+    NTILE(5) OVER (ORDER BY ues.TotalPostsOwned + ues.TotalCommentsMade + ues.TotalBadgesEarned DESC) AS ActivityQuintile,
+    p_q.Id AS QuestionId,
+    p_q.Title AS QuestionTitle,
+    p_q.Score AS QuestionScore,
+    p_q.ViewCount AS QuestionViewCount,
+    p_q.AnswerCount AS QuestionAnswerCount,
+    COALESCE(p_q.FavoriteCount, 0) AS QuestionFavoriteCount,
+    p_q.CreationDate AS QuestionCreationDate,
+    p_q.LastEditDate AS QuestionLastEditDate,
+    p_q.LastActivityDate AS QuestionLastActivityDate,
+    CASE
+        WHEN p_q.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN p_q.AcceptedAnswerId IS NOT NULL THEN 'Answered & Accepted'
+        WHEN p_q.AnswerCount > 0 THEN 'Answered'
+        ELSE 'Open'
+    END AS QuestionStatus,
+    ARRAY_LENGTH(string_to_array(substring(p_q.Tags, 2, length(p_q.Tags)-2), '><'), 1) AS NumberOfTags,
+    (p_q.Tags LIKE '%<sql>%' OR p_q.Tags LIKE '%<database>%') AS ContainsSQLOrDatabaseTag,
+    (p_q.Score * p_q.ViewCount) / NULLIF(p_q.AnswerCount + COALESCE(p_q.CommentCount, 0) + 1, 0) AS QuestionImpactScore,
+    CASE
+        WHEN p_q.AcceptedAnswerId IS NOT NULL THEN 'YES'
+        ELSE 'NO'
+    END AS HasAcceptedAnswer,
+    pa.Score AS AcceptedAnswerScore,
+    pa.CreationDate AS AcceptedAnswerCreationDate,
+    MAX(CASE WHEN pht.PostHistoryTypeId IN (4, 5, 6) THEN EXTRACT(EPOCH FROM pht.TimeSincePreviousEvent) / 3600 ELSE NULL END) AS MaxHoursBetweenEdits,
+    MAX(CASE WHEN pht.PostHistoryTypeId = 10 THEN pht.HistoryDate ELSE NULL END) AS ClosureDateFromHistory,
+    cpc.PostCategory AS CategorizedAsProblematic,
+    (
+        SELECT qta_inner.TagName
+        FROM QuestionTagAnalysis qta_inner
+        WHERE qta_inner.PostId = p_q.Id
+        GROUP BY qta_inner.TagName
+        ORDER BY AVG(qta_inner.PostScore) DESC, COUNT(qta_inner.TagName) DESC
+        LIMIT 1
+    ) AS MostPopularQuestionTag,
+    COALESCE(
+        (SELECT AVG(c.Score) FROM Comments c WHERE c.PostId = p_q.Id AND c.Score IS NOT NULL),
+        0
+    ) AS AvgCommentScoreForQuestion,
+    COALESCE(
+        (SELECT AVG(c_global.Score) FROM Comments c_global WHERE c_global.Score IS NOT NULL),
+        0
+    ) AS GlobalAvgCommentScore
+FROM Users u
+LEFT JOIN UserEngagementSummary ues ON u.Id = ues.UserId
+LEFT JOIN Posts p_q ON u.Id = p_q.OwnerUserId AND p_q.PostTypeId = 1
+LEFT JOIN Posts pa ON p_q.AcceptedAnswerId = pa.Id
+LEFT JOIN PostHistoryTimeline pht ON p_q.Id = pht.PostId
+LEFT JOIN ComplexPostCategorization cpc ON p_q.Id = cpc.PostId
+WHERE
+    u.CreationDate >= DATE '2015-01-01'
+    AND u.Reputation > 500
+    AND (u.Location IS NOT NULL AND TRIM(u.Location) <> '')
+    AND (LENGTH(COALESCE(u.AboutMe, '')) > 50 OR u.AboutMe IS NULL)
+    AND p_q.ViewCount > 500
+GROUP BY
+    ues.UserId, ues.DisplayName, ues.Reputation, ues.TotalPostsOwned, ues.TotalQuestionsOwned,
+    ues.TotalAnswersOwned, ues.TotalCommentsMade, ues.TotalBadgesEarned, ues.UpVotes, ues.DownVotes,
+    ues.UserCreationDate,
+    p_q.Id, p_q.Title, p_q.Score, p_q.ViewCount, p_q.AnswerCount,
+    p_q.FavoriteCount, p_q.CreationDate, p_q.LastEditDate, p_q.LastActivityDate,
+    p_q.ClosedDate, p_q.AcceptedAnswerId, p_q.Tags, pa.Score, pa.CreationDate, cpc.PostCategory,
+    u.CreationDate, u.Location, u.Reputation, u.AboutMe
+HAVING
+    COUNT(DISTINCT pht.PostId) > 0
+    AND AVG(p_q.Score) > 5
+ORDER BY
+    UserReputationTier DESC,
+    AvgQuestionScoreByThisUser DESC,
+    QuestionImpactScore DESC
+LIMIT 1000;

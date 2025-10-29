@@ -1,0 +1,186 @@
+with RecursiveTagCounts as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        ROW_NUMBER() over (partition by t.Id order by p.Score desc, p.ViewCount desc) as rn
+    from Tags t
+    left join Posts p on lower(p.Tags) like lower(concat('%<', t.TagName, '>%'))
+    where p.PostTypeId = 1
+),
+TopTagPosts as (
+    select * from RecursiveTagCounts where rn <= 5
+),
+UserBadgeFrequency as (
+    select
+        b.UserId,
+        b.Name as BadgeName,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Name
+),
+UserActivity AS (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        coalesce(sum(case when v.VoteTypeId = 2 then 1 else 0 end),0) as UpVotesReceived,
+        coalesce(sum(case when v.VoteTypeId = 3 then 1 else 0 end),0) as DownVotesReceived,
+        max(p.CreationDate) as LastPostDate,
+        count(distinct p.Id) as PostCount,
+        (select count(*) from Comments c where c.UserId = u.Id and c.CreationDate > u.CreationDate) as CommentsMadeSinceCreation
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Votes v on v.PostId = p.Id
+    group by u.Id, u.DisplayName, u.Reputation
+),
+QuestionAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.OwnerUserId as QuestionOwner,
+        q.Title,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViews,
+        a.Id as AnswerId,
+        a.OwnerUserId as AnswerOwner,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreationDate,
+        a.ParentId as ParentQuestionId,
+        row_number() over (partition by q.Id order by a.Score desc nulls last, a.CreationDate) as AnswerRank
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+),
+HighlyVotedAcceptedAnswers as (
+    select
+        q.QuestionId,
+        q.Title,
+        q.QuestionScore,
+        q.QuestionViews,
+        q.AnswerId,
+        q.AnswerOwner,
+        q.AnswerScore,
+        ua.DisplayName as AnswerUserName,
+        ua.Reputation as AnswerUserReputation,
+        ua.PostCount as AnswerUserPosts,
+        ua.UpVotesReceived as UserUpVotes,
+        ua.DownVotesReceived as UserDownVotes,
+        (
+           select count(distinct pl.RelatedPostId)
+           from PostLinks pl
+           where pl.PostId = q.AnswerId and pl.LinkTypeId = 1
+        ) as LinkedPostsCount,
+        (
+           select count(distinct ph.Id)
+           from PostHistory ph
+           where ph.PostId = q.AnswerId and ph.PostHistoryTypeId in (4,5,6)
+        ) as EditsCount,
+        row_number() over (partition by q.QuestionId order by q.AnswerScore desc nulls last) as AnswerOrder
+    from QuestionAnswerStats q
+    left join UserActivity ua on ua.Id = q.AnswerOwner
+    where q.AnswerId is not null
+      and q.AnswerRank <= 3
+)
+select
+    t.Id as TagId,
+    t.TagName,
+    t.Count as TagTotalQuestions,
+    p.Id as PostId,
+    p.Title as QuestionTitle,
+    p.Score as QuestionScore,
+    p.ViewCount as QuestionViews,
+    p.CreationDate as QuestionCreationDate,
+    coalesce(hva.AnswerId, -1) as TopAnswerId,
+    hva.AnswerScore as TopAnswerScore,
+    hva.AnswerUserName,
+    hva.AnswerUserReputation,
+    hva.UserUpVotes,
+    hva.UserDownVotes,
+    hva.LinkedPostsCount,
+    hva.EditsCount,
+    ubf.BadgeName,
+    ubf.BadgeCount,
+    ua.DisplayName as QuestionOwnerName,
+    ua.Reputation as QuestionOwnerReputation,
+    ua.PostCount as QuestionOwnerPostCount,
+    ua.UpVotesReceived as QuestionOwnerUpVotes,
+    ua.DownVotesReceived as QuestionOwnerDownVotes,
+    ua.CommentsMadeSinceCreation,
+    sum(case when ph.PostHistoryTypeId = 10 then 1 else 0 end) over (partition by p.Id) as CloseVotesCount,
+    case when closeph.Id is not null then TRUE else FALSE end as IsCurrentlyClosed,
+    dense_rank() over (partition by t.TagName order by p.ViewCount desc) as ViewRankInTag,
+    case
+      when p.ViewCount > 10000 then 'Very High'
+      when p.ViewCount > 1000 then 'High'
+      when p.ViewCount > 100 then 'Medium'
+      else 'Low'
+    end as ViewCategory,
+    concat(
+        substr(coalesce(p.Title, ''), 1, 50),
+        ' (Score: ', coalesce(CAST(p.Score AS varchar), '0'), ', Views: ', coalesce(CAST(p.ViewCount AS varchar), '0'), ')'
+    ) as CompactTitle,
+    case when p.Tags like '%<sql>%'
+        then 'Has SQL tag'
+        else 'No SQL tag'
+    end as SQLTagPresence
+from TopTagPosts t
+inner join Posts p on p.Id = t.PostId
+left join HighlyVotedAcceptedAnswers hva on hva.QuestionId = p.Id
+left join Users ua on ua.Id = p.OwnerUserId
+left join UserBadgeFrequency ubf on ubf.UserId = p.OwnerUserId
+left join PostHistory ph on ph.PostId = p.Id
+left join PostHistory closeph on closeph.PostId = p.Id and closeph.PostHistoryTypeId = 10 and closeph.CreationDate = (
+    select max(ph2.CreationDate) from PostHistory ph2 where ph2.PostId = p.Id and ph2.PostHistoryTypeId = 10
+)
+where t.rn <= 5
+  and (p.CreationDate between (CAST('2024-10-01' AS date) - INTERVAL '180' day) and CAST('2024-10-01' AS date))
+union
+select
+    -1 as TagId,
+    'Uncategorized' as TagName,
+    0 as Count,
+    p.Id as PostId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    null as TopAnswerId,
+    null as TopAnswerScore,
+    null as AnswerUserName,
+    null as AnswerUserReputation,
+    null as UserUpVotes,
+    null as UserDownVotes,
+    null as LinkedPostsCount,
+    null as EditsCount,
+    null as BadgeName,
+    null as BadgeCount,
+    ua.DisplayName as QuestionOwnerName,
+    ua.Reputation as QuestionOwnerReputation,
+    ua.PostCount as QuestionOwnerPostCount,
+    ua.UpVotesReceived as QuestionOwnerUpVotes,
+    ua.DownVotesReceived as QuestionOwnerDownVotes,
+    ua.CommentsMadeSinceCreation,
+    0 as CloseVotesCount,
+    false as IsCurrentlyClosed,
+    0 as ViewRankInTag,
+    'Low' as ViewCategory,
+    concat(
+        substr(coalesce(p.Title, ''), 1, 50),
+        ' (Score: ', coalesce(CAST(p.Score AS varchar), '0'), ', Views: ', coalesce(CAST(p.ViewCount AS varchar), '0'), ')'
+    ) as CompactTitle,
+    case when p.Tags like '%<sql>%'
+        then 'Has SQL tag'
+        else 'No SQL tag'
+    end as SQLTagPresence
+from Posts p
+left join Users ua on ua.Id = p.OwnerUserId
+where p.PostTypeId = 1
+  and (p.Tags is null or p.Tags = '')
+  and p.CreationDate > CAST('2024-10-01' AS date) - INTERVAL '180' day
+order by TagName, QuestionScore desc, QuestionViews desc
+limit 100;

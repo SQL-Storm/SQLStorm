@@ -1,0 +1,209 @@
+-- {"query": "1155.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2853} 
+
+WITH UserStats AS (
+    SELECT
+        U.Id AS UserId,
+        COALESCE(U.DisplayName, 'Anonymous') AS DisplayName,
+        U.Reputation,
+        U.CreationDate,
+        U.LastAccessDate,
+        U.Views AS ProfileViews,
+        U.UpVotes AS UserUpVotesGiven, -- Votes given by this user
+        U.DownVotes AS UserDownVotesGiven, -- Votes given by this user
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        ARRAY_AGG(DISTINCT B.Name) FILTER (WHERE B.Id IS NOT NULL) AS UserBadgeNames
+    FROM Users U
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Views, U.UpVotes, U.DownVotes
+),
+PostDetailMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.FavoriteCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.LastActivityDate,
+        P.ClosedDate,
+        P.AcceptedAnswerId,
+        COALESCE(P.Title, LEFT(P.Body, 100) || '...') AS PostTitleExcerpt, -- NULL logic, string expression
+        string_to_array(TRIM(BOTH '<>' FROM P.Tags), '><') AS ParsedTags, -- String parsing
+        COUNT(DISTINCT PH.Id) AS TotalHistoryEntries,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditCount, -- Edit Title, Body, Tags
+        SUM(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseEvents,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenEvents,
+        (
+            SELECT SUM(CASE
+                           WHEN V.VoteTypeId IN (2, 8) THEN 1 -- UpMod, BountyStart
+                           WHEN V.VoteTypeId IN (3, 4, 10, 12) THEN -1 -- DownMod, Offensive, Deletion, Spam
+                           ELSE 0
+                       END)
+            FROM Votes V
+            WHERE V.PostId = P.Id
+        ) AS NetPostInteractionScore -- Correlated subquery for a complex calculation
+    FROM Posts P
+    INNER JOIN PostTypes PT ON P.PostTypeId = PT.Id
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    GROUP BY
+        P.Id, P.PostTypeId, PT.Name, P.OwnerUserId, P.CreationDate, P.Score, P.ViewCount,
+        P.FavoriteCount, P.AnswerCount, P.CommentCount, P.LastActivityDate, P.ClosedDate,
+        P.AcceptedAnswerId, P.Title, P.Body, P.Tags
+),
+LinkAggregations AS (
+    SELECT
+        PostId,
+        SUM(CASE WHEN LinkTypeId = 1 THEN 1 ELSE 0 END) AS LinkedFromCount,
+        MAX(CASE WHEN LinkTypeId = 1 THEN CreationDate ELSE NULL END) AS LatestLinkedRefDate,
+        SUM(CASE WHEN LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicateSourceCount,
+        ARRAY_AGG(CASE WHEN LinkTypeId = 3 THEN RelatedPostId ELSE NULL END) FILTER (WHERE LinkTypeId = 3) AS DuplicateTargets
+    FROM PostLinks
+    GROUP BY PostId
+),
+DuplicateTargetsAgg AS (
+    SELECT
+        RelatedPostId AS PostId,
+        TRUE AS IsDuplicateTarget,
+        ARRAY_AGG(PostId) AS DuplicateSources
+    FROM PostLinks
+    WHERE LinkTypeId = 3
+    GROUP BY RelatedPostId
+),
+CombinedLinkMetrics AS (
+    SELECT
+        COALESCE(LA.PostId, DTA.PostId) AS PostId,
+        COALESCE(LA.LinkedFromCount, 0) AS LinkedFromCount,
+        COALESCE(LA.LatestLinkedRefDate, '1900-01-01'::timestamp) AS LatestLinkedRefDate, -- NULL logic
+        COALESCE(LA.DuplicateSourceCount, 0) AS DuplicateSourceCount,
+        COALESCE(LA.DuplicateTargets, ARRAY[]::int[]) AS DuplicateTargets,
+        COALESCE(DTA.IsDuplicateTarget, FALSE) AS IsDuplicateTarget,
+        COALESCE(DTA.DuplicateSources, ARRAY[]::int[]) AS ReferencedByDuplicates
+    FROM LinkAggregations LA
+    FULL OUTER JOIN DuplicateTargetsAgg DTA ON LA.PostId = DTA.PostId
+),
+RankedUserPostData AS (
+    SELECT
+        US.UserId,
+        US.DisplayName,
+        US.Reputation,
+        US.CreationDate AS UserCreationDate,
+        US.LastAccessDate AS UserLastAccessDate,
+        US.ProfileViews,
+        US.UserUpVotesGiven,
+        US.UserDownVotesGiven,
+        US.TotalBadges,
+        US.GoldBadges,
+        US.SilverBadges,
+        US.BronzeBadges,
+        US.TotalCommentsMade,
+        PDM.PostId,
+        PDM.PostTypeName,
+        PDM.PostCreationDate,
+        PDM.LastActivityDate AS PostLastActivityDate,
+        PDM.PostScore,
+        PDM.ViewCount,
+        PDM.FavoriteCount,
+        PDM.AnswerCount,
+        PDM.CommentCount,
+        PDM.TotalHistoryEntries,
+        PDM.EditCount,
+        PDM.CloseEvents,
+        PDM.ReopenEvents,
+        PDM.NetPostInteractionScore,
+        PDM.PostTitleExcerpt,
+        PDM.ParsedTags,
+        CLM.LinkedFromCount,
+        CLM.DuplicateSourceCount,
+        CLM.IsDuplicateTarget,
+        CLM.ReferencedByDuplicates,
+        CLM.LatestLinkedRefDate,
+        ROW_NUMBER() OVER (PARTITION BY US.UserId ORDER BY PDM.PostScore DESC, PDM.ViewCount DESC) AS UserPostRank,
+        RANK() OVER (ORDER BY US.Reputation DESC, US.LastAccessDate DESC, US.ProfileViews DESC) AS GlobalUserReputationRank,
+        NTILE(100) OVER (PARTITION BY PDM.PostTypeName ORDER BY PDM.ViewCount DESC, PDM.PostScore DESC) AS PostEngagementPercentile,
+        LAG(PDM.PostCreationDate, 1, US.CreationDate) OVER (PARTITION BY US.UserId ORDER BY PDM.PostCreationDate) AS PreviousPostDate,
+        EXTRACT(DAY FROM (PDM.PostCreationDate - LAG(PDM.PostCreationDate, 1, US.CreationDate) OVER (PARTITION BY US.UserId ORDER BY PDM.PostCreationDate))) AS DaysBetweenPosts,
+        COALESCE(PDM.FavoriteCount, 0) * 1.0 / NULLIF(PDM.ViewCount, 0) AS PostPopularityRatio -- Complex calculation with NULLIF
+    FROM UserStats US
+    LEFT JOIN PostDetailMetrics PDM ON US.UserId = PDM.OwnerUserId
+    LEFT JOIN CombinedLinkMetrics CLM ON PDM.PostId = CLM.PostId
+)
+SELECT
+    RUPD.UserId,
+    RUPD.DisplayName,
+    RUPD.Reputation,
+    RUPD.GlobalUserReputationRank,
+    RUPD.PostId,
+    RUPD.PostTypeName,
+    RUPD.PostCreationDate,
+    RUPD.PostLastActivityDate,
+    RUPD.PostScore,
+    RUPD.ViewCount,
+    RUPD.FavoriteCount,
+    RUPD.AnswerCount,
+    RUPD.CommentCount,
+    RUPD.TotalHistoryEntries,
+    RUPD.EditCount,
+    RUPD.CloseEvents,
+    RUPD.ReopenEvents,
+    RUPD.NetPostInteractionScore,
+    RUPD.PostPopularityRatio,
+    RUPD.PostTitleExcerpt,
+    RUPD.ParsedTags,
+    RUPD.LinkedFromCount,
+    RUPD.DuplicateSourceCount,
+    RUPD.IsDuplicateTarget,
+    RUPD.ReferencedByDuplicates,
+    RUPD.PostEngagementPercentile,
+    RUPD.DaysBetweenPosts,
+    -- Complicated CASE statement for categorization
+    CASE
+        WHEN RUPD.PostTypeName = 'Question' AND RUPD.FavoriteCount > 100 AND RUPD.AnswerCount > 5 AND RUPD.PostScore >= 200 THEN 'Highly Engaged Question'
+        WHEN RUPD.PostTypeName = 'Answer' AND RUPD.PostScore >= 100 AND RUPD.EditCount > 3 AND RUPD.PostPopularityRatio > 0.1 THEN 'Expert Answer'
+        WHEN RUPD.IsDuplicateTarget AND ARRAY_LENGTH(RUPD.ReferencedByDuplicates, 1) > 2 THEN 'Frequent Duplicate Target'
+        WHEN RUPD.TotalHistoryEntries > 10 AND RUPD.CloseEvents > 0 AND RUPD.ReopenEvents > 0 THEN 'Controversial Post'
+        WHEN RUPD.PostId IS NULL AND RUPD.Reputation > 50000 AND RUPD.GoldBadges >= 5 THEN 'Elite Silent Contributor' -- NULL logic
+        ELSE 'General Contribution'
+    END AS ContributionCategory,
+    -- String expression and NULL logic for a formatted output
+    UPPER(LEFT(RUPD.DisplayName, 2)) || '-' || LPAD(RUPD.UserId::VARCHAR, 8, '0') AS FormattedUserCode,
+    COALESCE(ARRAY_TO_STRING(RUPD.ParsedTags, ', '), 'No Tags') AS TagListString,
+    -- Nested correlated subquery to find average reputation of users who commented on this post
+    (
+        SELECT AVG(U2.Reputation)
+        FROM Comments C
+        JOIN Users U2 ON C.UserId = U2.Id
+        WHERE C.PostId = RUPD.PostId
+          AND C.CreationDate BETWEEN RUPD.PostCreationDate AND RUPD.PostLastActivityDate
+    ) AS AvgCommenterReputation,
+    -- Non-correlated subquery demonstrating set operator (INTERSECT) for counting specific tags
+    (
+        SELECT COUNT(DISTINCT T.TagName)
+        FROM Tags T
+        WHERE T.TagName ILIKE '%sql%'
+        INTERSECT
+        SELECT UNNEST(RUPD.ParsedTags) -- UNNEST to treat array elements as rows for INTERSECT
+    ) AS SqlTagCountInPostTags
+FROM RankedUserPostData RUPD
+WHERE
+    (RUPD.PostTypeName = 'Question' AND RUPD.PostScore >= 50 AND RUPD.ViewCount > 5000 AND RUPD.PostEngagementPercentile <= 20)
+    OR
+    (RUPD.PostTypeName = 'Answer' AND RUPD.PostScore >= 20 AND RUPD.EditCount > 1 AND RUPD.PostPopularityRatio > 0.05 AND RUPD.DaysBetweenPosts IS NOT NULL AND RUPD.DaysBetweenPosts < 30)
+    OR
+    (RUPD.PostId IS NULL AND RUPD.Reputation >= 10000 AND RUPD.TotalCommentsMade >= 100 AND RUPD.UserUpVotesGiven > RUPD.UserDownVotesGiven) -- High-rep users without posts matching above criteria, but with many comments and positive voting activity
+    OR
+    (RUPD.IsDuplicateTarget AND RUPD.LinkedFromCount > 5 AND RUPD.PostCreationDate > (NOW() - INTERVAL '1 year')) -- Recently active duplicate targets
+ORDER BY
+    RUPD.GlobalUserReputationRank ASC,
+    RUPD.PostLastActivityDate DESC NULLS LAST,
+    RUPD.PostEngagementPercentile ASC,
+    RUPD.NetPostInteractionScore DESC
+LIMIT 10000;

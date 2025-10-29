@@ -1,0 +1,162 @@
+-- {"query": "4817.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1429} 
+WITH
+  RankedPostEdits AS (
+    SELECT
+      ph.PostId,
+      ph.UserId,
+      ph.CreationDate,
+      ph.PostHistoryTypeId,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate DESC) as rn
+    FROM PostHistory AS ph
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6) /* Edit Title, Edit Body, Edit Tags */
+  ),
+  UserEditCounts AS (
+    SELECT
+      rpe.UserId,
+      COUNT(DISTINCT rpe.PostId) AS NumberOfEditedPosts,
+      AVG(DATEDIFF(minute, u.CreationDate, rpe.CreationDate)) AS AvgTimeFromUserCreationToFirstEdit
+    FROM RankedPostEdits AS rpe
+    JOIN Users AS u
+      ON rpe.UserId = u.Id
+    WHERE
+      rpe.rn = 1
+    GROUP BY
+      rpe.UserId
+  ),
+  PostEditVelocity AS (
+    SELECT
+      p.Id AS PostId,
+      COUNT(ph.Id) AS EditCount,
+      MAX(ph.CreationDate) AS LastEditDate
+    FROM Posts AS p
+    JOIN PostHistory AS ph
+      ON p.Id = ph.PostId
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6)
+    GROUP BY
+      p.Id
+    HAVING
+      COUNT(ph.Id) > 5
+  ),
+  AnswerQuality AS (
+    SELECT
+      a.Id AS AnswerId,
+      a.ParentId AS QuestionId,
+      a.Score AS AnswerScore,
+      a.CreationDate AS AnswerCreationDate,
+      CASE
+        WHEN LAG(a.Score, 1, -1) OVER (PARTITION BY a.ParentId ORDER BY a.CreationDate) > a.Score THEN 'Lower'
+        WHEN LEAD(a.Score, 1, -1) OVER (PARTITION BY a.ParentId ORDER BY a.CreationDate) > a.Score THEN 'Higher'
+        ELSE 'Same'
+      END AS RelativeScoreToNeighbors
+    FROM Posts AS a
+    WHERE
+      a.PostTypeId = 2 /* Answer */
+  )
+SELECT
+  p.Id AS QuestionId,
+  p.Title AS QuestionTitle,
+  p.CreationDate AS QuestionCreationDate,
+  u.DisplayName AS QuestionOwnerDisplayName,
+  p.Score AS QuestionScore,
+  p.AnswerCount,
+  p.FavoriteCount,
+  pe.EditCount AS QuestionEditCount,
+  pe.LastEditDate AS QuestionLastEditDate,
+  COUNT(DISTINCT CASE WHEN pqn.RelativeScoreToNeighbors = 'Higher' THEN pqn.AnswerId ELSE NULL END) AS AnswersWithHigherScore,
+  COUNT(DISTINCT CASE WHEN pqn.RelativeScoreToNeighbors = 'Lower' THEN pqn.AnswerId ELSE NULL END) AS AnswersWithLowerScore,
+  AVG(ans.Score) AS AverageAnswerScore,
+  MAX(ans.Score) AS MaxAnswerScore,
+  p.ViewCount,
+  CASE
+    WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+    ELSE 'Open'
+  END AS PostStatus,
+  c.Name AS CloseReason,
+  COALESCE(u_editor.DisplayName, p.LastEditorDisplayName) AS LastEditorDisplayName,
+  p.LastEditDate AS LastPostEditDate,
+  CASE
+    WHEN uec.NumberOfEditedPosts IS NOT NULL AND uec.AvgTimeFromUserCreationToFirstEdit IS NOT NULL
+    THEN CONCAT(uec.NumberOfEditedPosts, ' edits, avg ', ROUND(uec.AvgTimeFromUserCreationToFirstEdit, 2), ' mins from user creation')
+    ELSE 'Insufficient edit data'
+  END AS UserEditProfile,
+  p.CommunityOwnedDate,
+  pt.Name AS PostTypeName
+FROM Posts AS p
+JOIN PostTypes AS pt
+  ON p.PostTypeId = pt.Id
+LEFT JOIN Users AS u
+  ON p.OwnerUserId = u.Id
+LEFT JOIN PostEditVelocity AS pe
+  ON p.Id = pe.PostId
+LEFT JOIN Comments AS c
+  ON p.Id = c.PostId AND c.Comment LIKE '%close%' /* Simple proxy for close reason */
+LEFT JOIN Posts AS ans
+  ON p.Id = ans.ParentId AND ans.PostTypeId = 2 /* Answers */
+LEFT JOIN AnswerQuality AS pqn
+  ON ans.Id = pqn.AnswerId
+LEFT JOIN UserEditCounts AS uec
+  ON p.OwnerUserId = uec.UserId
+LEFT JOIN Users AS u_editor
+  ON p.LastEditorUserId = u_editor.Id
+WHERE
+  p.PostTypeId = 1 /* Questions */
+  AND p.Score > 10
+  AND p.CreationDate BETWEEN '2023-01-01' AND '2023-12-31'
+  AND EXISTS (
+    SELECT
+      1
+    FROM PostLinks AS pl
+    WHERE
+      pl.PostId = p.Id AND pl.LinkTypeId = 3 /* Duplicate */
+  )
+GROUP BY
+  p.Id,
+  p.Title,
+  p.CreationDate,
+  u.DisplayName,
+  p.Score,
+  p.AnswerCount,
+  p.FavoriteCount,
+  pe.EditCount,
+  pe.LastEditDate,
+  p.ViewCount,
+  p.ClosedDate,
+  c.Name,
+  u_editor.DisplayName,
+  p.LastEditorDisplayName,
+  p.LastEditDate,
+  uec.NumberOfEditedPosts,
+  uec.AvgTimeFromUserCreationToFirstEdit,
+  p.CommunityOwnedDate,
+  pt.Name
+HAVING
+  COUNT(DISTINCT ans.Id) > 3
+UNION
+SELECT
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL
+FROM Users
+WHERE
+  1 = 0;

@@ -1,0 +1,225 @@
+-- {"query": "1052.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3078} 
+
+WITH UserActivitySummary AS (
+    -- Summarizes user post and comment activity, calculates engagement metrics
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswers,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        SUM(p.Score) AS TotalPostScore,
+        AVG(CASE WHEN p.Score IS NOT NULL THEN p.Score END) AS AvgPostScore,
+        COUNT(DISTINCT b.Name) AS UniqueBadgeCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        MIN(p.CreationDate) AS FirstPostDate,
+        -- Calculate the difference in days between user creation and their first post
+        EXTRACT(EPOCH FROM (MIN(p.CreationDate) - u.CreationDate)) / 86400.0 AS DaysToFirstPost,
+        -- Calculate the average time between consecutive posts by the same user, using NULLIF to prevent division by zero for users with one post
+        NULLIF(AVG(
+            EXTRACT(EPOCH FROM (p.CreationDate - LAG(p.CreationDate, 1, p.CreationDate) OVER (PARTITION BY u.Id ORDER BY p.CreationDate)))
+        ) FILTER (WHERE LAG(p.CreationDate) OVER (PARTITION BY u.Id ORDER BY p.CreationDate) IS NOT NULL), 0) AS AvgTimeBetweenPostsSec
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.UpVotes, u.DownVotes
+),
+PostDetailsExtended AS (
+    -- Gathers extensive details for each post, including tag parsing and subquery for first comment
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.Title,
+        p.Body,
+        p.Tags,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        ph.EditCount, -- Calculated below
+        COALESCE(p.LastEditDate, p.CreationDate) AS EffectiveLastEditDate,
+        COALESCE(p.LastActivityDate, p.CreationDate) AS EffectiveLastActivityDate,
+        -- Correlated subquery to find the creation date of the very first comment for this post
+        (
+            SELECT MIN(c_inner.CreationDate)
+            FROM Comments c_inner
+            WHERE c_inner.PostId = p.Id
+        ) AS FirstCommentDate,
+        -- Calculate time difference between post creation and first comment (if any)
+        EXTRACT(EPOCH FROM ((SELECT MIN(c_inner.CreationDate) FROM Comments c_inner WHERE c_inner.PostId = p.Id) - p.CreationDate)) / 60.0 AS TimeToFirstCommentMinutes,
+        -- String expression: check if body contains common code block tags
+        (CASE WHEN p.Body LIKE '%<pre><code>%' AND p.Body LIKE '%</code></pre>%' THEN 'Yes' ELSE 'No' END) AS HasCodeBlock,
+        -- Window function: Rank posts by score within their PostType
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS RankByScoreInPostType,
+        -- Window function: Calculate average score for posts by the same owner, using NULLIF to prevent division by zero for users with no posts
+        NULLIF(AVG(p.Score) OVER (PARTITION BY p.OwnerUserId), 0) AS AvgScoreByOwner
+    FROM Posts p
+    LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN (
+        -- Subquery to count total edits for each post
+        SELECT PostId, COUNT(Id) AS EditCount
+        FROM PostHistory
+        WHERE PostHistoryTypeId IN (4, 5, 6, 7, 8, 9, 11, 13, 15, 20) -- Edit, Rollback, Reopen, Undelete, Unlock, Unprotect types
+        GROUP BY PostId
+    ) ph ON p.Id = ph.PostId
+),
+PostTagAggregates AS (
+    -- Explodes tags and aggregates tag-specific metrics
+    SELECT
+        pd.PostId,
+        pd.PostTypeId,
+        LOWER(TRIM(UNNEST(string_to_array(SUBSTRING(pd.Tags, 2, LENGTH(pd.Tags) - 2), '><')))) AS TagName,
+        pd.Score AS PostScore,
+        pd.ViewCount AS PostViewCount,
+        t.Id AS TagId,
+        t.Count AS GlobalTagCount
+    FROM PostDetailsExtended pd
+    WHERE pd.Tags IS NOT NULL AND LENGTH(pd.Tags) > 2 -- Ensure tags exist and are not empty '><'
+    LEFT JOIN Tags t ON LOWER(TRIM(UNNEST(string_to_array(SUBSTRING(pd.Tags, 2, LENGTH(pd.Tags) - 2), '><')))) = t.TagName
+),
+TopQuestionTags AS (
+    -- CTE for tags used in questions, demonstrating UNION ALL and filtering
+    -- Part 1: Tags with high number of questions
+    SELECT TagName, COUNT(DISTINCT PostId) AS TaggedQuestionCount, 'HighQuestionCount' AS Reason
+    FROM PostTagAggregates
+    WHERE PostTypeId = 1
+    GROUP BY TagName
+    HAVING COUNT(DISTINCT PostId) > 100 -- Arbitrary threshold for "top"
+    UNION ALL
+    -- Part 2: Tags with high view counts on their questions, but fewer questions overall
+    SELECT TagName, COUNT(DISTINCT PostId) AS TaggedQuestionCount, 'HighViewCountLowQuestionCount' AS Reason
+    FROM PostTagAggregates
+    WHERE PostTypeId = 1 AND PostViewCount > 5000
+    GROUP BY TagName
+    HAVING COUNT(DISTINCT PostId) <= 100 AND COUNT(DISTINCT PostId) > 10
+),
+RankedPostTags AS (
+    -- Selects a 'primary' tag for each question post from the TopQuestionTags based on a ranking
+    SELECT
+        pta.PostId,
+        pta.TagName,
+        ROW_NUMBER() OVER (PARTITION BY pta.PostId ORDER BY tqt.TaggedQuestionCount DESC, tqt.Reason DESC) as rn
+    FROM PostTagAggregates pta
+    INNER JOIN TopQuestionTags tqt ON pta.TagName = tqt.TagName
+    WHERE pta.PostTypeId = 1
+),
+RelatedPostsInfo AS (
+    -- Analyze linked and duplicate posts
+    SELECT
+        pl.PostId,
+        COUNT(DISTINCT pl.RelatedPostId) AS TotalRelatedPosts,
+        COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 1 THEN pl.RelatedPostId END) AS LinkedPostsCount,
+        COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN pl.RelatedPostId END) AS DuplicatePostsCount,
+        NULLIF(AVG(CASE WHEN p_rel.Score IS NOT NULL THEN p_rel.Score END), 0) AS AvgRelatedPostScore,
+        MAX(p_rel.CreationDate) AS LatestRelatedPostDate
+    FROM PostLinks pl
+    JOIN Posts p_rel ON pl.RelatedPostId = p_rel.Id
+    GROUP BY pl.PostId
+)
+-- Final SELECT statement combining all CTEs with complex logic
+SELECT
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.TotalPosts,
+    uas.TotalQuestions,
+    uas.TotalAnswers,
+    uas.TotalComments,
+    uas.AvgPostScore,
+    uas.UniqueBadgeCount,
+    uas.DaysToFirstPost,
+    uas.AvgTimeBetweenPostsSec,
+    pde.PostId,
+    pde.PostTypeName,
+    pde.Title,
+    SUBSTRING(pde.Body, 1, 100) AS BodySnippet, -- String function for snippet
+    pde.Tags,
+    pde.PostCreationDate,
+    pde.Score,
+    pde.ViewCount,
+    pde.AnswerCount,
+    pde.CommentCount,
+    pde.FavoriteCount,
+    pde.EditCount,
+    pde.EffectiveLastEditDate,
+    pde.EffectiveLastActivityDate,
+    pde.FirstCommentDate,
+    pde.TimeToFirstCommentMinutes,
+    pde.HasCodeBlock,
+    pde.RankByScoreInPostType,
+    pde.AvgScoreByOwner,
+    rpt.TagName AS PrimaryQuestionTag, -- One of the top tags for questions
+    rpi.TotalRelatedPosts,
+    rpi.LinkedPostsCount,
+    rpi.DuplicatePostsCount,
+    rpi.AvgRelatedPostScore,
+    -- Complicated predicate/expression/calculation: User Engagement Score
+    (uas.TotalPosts * 0.5 + uas.TotalComments * 0.2 + uas.TotalQuestions * 0.3 + COALESCE(uas.AvgPostScore, 0)) AS UserEngagementScore,
+    -- Complicated predicate/expression/calculation: Post Category
+    (CASE
+        WHEN pde.Score >= 100 AND pde.ViewCount >= 10000 AND pde.AnswerCount >= 5 THEN 'Viral Post'
+        WHEN pde.Score >= 20 AND pde.ViewCount >= 1000 THEN 'Popular Post'
+        WHEN pde.ViewCount >= 100 AND pde.CommentCount >= 3 THEN 'Engaging Post'
+        WHEN pde.PostTypeId = 1 AND pde.AcceptedAnswerId IS NOT NULL THEN 'Resolved Question'
+        ELSE 'Standard Post'
+    END) AS PostCategory,
+    -- NULL logic: Display 'N/A' if Title is NULL, otherwise truncate
+    COALESCE(
+        CASE WHEN LENGTH(pde.Title) > 75 THEN SUBSTRING(pde.Title, 1, 72) || '...' ELSE pde.Title END,
+        'N/A - No Title'
+    ) AS FormattedTitle,
+    -- Correlated EXISTS subquery: Check if user has a specific 'Gold' badge
+    EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = uas.UserId AND b.Class = 1 AND b.TagBased = FALSE) AS HasGoldNamedBadge,
+    -- Correlated subquery to find the name of the CloseReason if the post was closed
+    (
+        SELECT crt.Name
+        FROM PostHistory ph_close
+        LEFT JOIN CloseReasonTypes crt ON ph_close.Comment = crt.Id::VARCHAR -- CloseReasonId is in 'Comment' for PostHistoryTypeId 10
+        WHERE ph_close.PostId = pde.PostId
+        AND ph_close.PostHistoryTypeId = 10 -- Post Closed event
+        ORDER BY ph_close.CreationDate DESC
+        LIMIT 1
+    ) AS CloseReasonName
+FROM UserActivitySummary uas
+INNER JOIN PostDetailsExtended pde ON uas.UserId = pde.OwnerUserId
+LEFT JOIN RankedPostTags rpt ON pde.PostId = rpt.PostId AND rpt.rn = 1 -- Join for primary tag
+LEFT JOIN RelatedPostsInfo rpi ON pde.PostId = rpi.PostId
+WHERE
+    uas.Reputation >= 5000 -- Filter for reputable users
+    AND pde.PostTypeId IN (1, 2) -- Only questions and answers
+    AND pde.Score > 0 -- Only scored posts
+    AND pde.ViewCount IS NOT NULL -- Ensure view count is recorded
+    AND pde.HasCodeBlock = 'Yes' -- Only posts with code blocks
+    AND (pde.EffectiveLastActivityDate > NOW() - INTERVAL '1 year') -- Posts active in the last year
+    AND (
+        pde.TimeToFirstCommentMinutes IS NULL OR pde.TimeToFirstCommentMinutes > 5 -- No comments or first comment took more than 5 minutes
+    )
+    AND pde.EditCount > 0 -- Has been edited at least once
+    AND pde.Title IS NOT NULL
+    AND LENGTH(TRIM(pde.Title)) > 10 -- Ensure meaningful title
+    AND NOT EXISTS (
+        -- Correlated NOT EXISTS subquery: ensure user has not downvoted any of their own posts
+        SELECT 1
+        FROM Votes v
+        WHERE v.PostId = pde.PostId
+        AND v.UserId = uas.UserId
+        AND v.VoteTypeId = 3 -- DownMod
+    )
+ORDER BY
+    UserEngagementScore DESC,
+    pde.Score DESC,
+    pde.ViewCount DESC
+LIMIT 100;

@@ -1,0 +1,38 @@
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        (EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - U.CreationDate)) / (60 * 60 * 24 * 365.25)) AS AccountAgeYears,
+        COALESCE(SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END), 0) AS TotalQuestions,
+        COALESCE(SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END), 0) AS TotalAnswers,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COALESCE(SUM(P.Score), 0) AS TotalPostScoreReceived,
+        COALESCE(SUM(P.ViewCount), 0) AS TotalPostViewsReceived,
+        COALESCE(SUM(P.FavoriteCount), 0) AS TotalPostFavoritesReceived,
+        COUNT(DISTINCT CASE WHEN B.Class = 1 THEN B.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN B.Class = 2 THEN B.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN B.Class = 3 THEN B.Id END) AS BronzeBadges,
+        MAX(P.CreationDate) AS LastPostCreationDate,
+        MIN(P.CreationDate) AS FirstPostCreationDate,
+        (SELECT COUNT(DISTINCT V.PostId) FROM Votes V WHERE V.UserId = U.Id AND V.VoteTypeId = 5) AS TotalBookmarksMade,
+        (SELECT COUNT(DISTINCT V.PostId) FROM Votes V WHERE V.UserId = U.Id AND V.VoteTypeId = 2) AS TotalUpvotesMade,
+        (SELECT COUNT(DISTINCT V.PostId) FROM Votes V WHERE V.UserId = U.Id AND V.VoteTypeId = 3) AS TotalDownvotesMade,
+        CASE WHEN U.AboutMe IS NOT NULL AND CHAR_LENGTH(U.AboutMe) > 50 THEN TRUE ELSE FALSE END AS HasDetailedAboutMe
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY
+        U.Id,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate,
+        U.LastAccessDate,
+        U.AboutMe
+)
+SELECT *
+FROM UserActivitySummary;

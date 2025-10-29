@@ -1,0 +1,169 @@
+WITH UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersCount,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScoreOwned,
+        COALESCE(AVG(p.Score), 0.0) AS AvgPostScoreOwned,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        COALESCE(SUM(c.Score), 0) AS TotalCommentScoreMade,
+        COUNT(DISTINCT b.Id) AS TotalBadgesEarned,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadgesCount,
+        SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS TotalUpvotesGiven,
+        SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS TotalDownvotesGiven,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 5 THEN v.PostId END) AS UniquePostsFavorited,
+        MAX(p.LastActivityDate) AS LastPostActivityDate,
+        MIN(p.CreationDate) AS FirstPostCreationDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+PostDetailsExtended AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.Title,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.ClosedDate,
+        COALESCE(LENGTH(p.Body), 0) AS BodyLength,
+        COALESCE(LENGTH(p.Title), 0) AS TitleLength,
+        COUNT(DISTINCT ph.Id) AS TotalHistoryEvents,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseHistoryCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenHistoryCount,
+        NULL AS AvgTimeBetweenEditsSec,
+        COUNT(DISTINCT v.UserId) FILTER (WHERE v.VoteTypeId = 2) AS UniqueUpvoters,
+        COUNT(DISTINCT v.UserId) FILTER (WHERE v.VoteTypeId = 3) AS UniqueDownvoters,
+        COALESCE(SUM(comm.Score), 0) AS TotalCommentsScoreOnPost,
+        COALESCE(AVG(comm.Score), 0.0) AS AvgCommentScoreOnPost,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC, p.ViewCount DESC, p.CreationDate DESC) AS GlobalPostRankByScoreViews,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC, p.CreationDate DESC) AS UserPostRankByScoreViews
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    LEFT JOIN Comments comm ON p.Id = comm.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (2, 3)
+    GROUP BY p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.Title, p.Tags, p.AcceptedAnswerId, p.ParentId, p.ClosedDate, p.Body
+),
+PostEditLag AS (
+    SELECT
+        ph.PostId,
+        AVG(EXTRACT(EPOCH FROM (ph.CreationDate - prev.CreationDate))) AS AvgTimeBetweenEditsSec
+    FROM (
+        SELECT
+            ph.*,
+            LAG(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS prev_creation
+        FROM PostHistory ph
+        WHERE ph.PostHistoryTypeId IN (5,6)
+    ) ph
+    JOIN PostHistory prev ON ph.PostId = prev.PostId AND prev.CreationDate = ph.prev_creation
+    GROUP BY ph.PostId
+),
+TopTagsByScore AS (
+    SELECT
+        pde.OwnerUserId AS UserId,
+        unnest_tags.TagName,
+        SUM(pde.PostScore) AS TagAccumulatedScore,
+        COUNT(pde.PostId) AS TaggedPostsCount,
+        ROW_NUMBER() OVER (PARTITION BY pde.OwnerUserId ORDER BY SUM(pde.PostScore) DESC, COUNT(pde.PostId) DESC) AS RankByTagScore
+    FROM PostDetailsExtended pde,
+    LATERAL (
+        SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(pde.Tags FROM 2 FOR LENGTH(pde.Tags) - 2), '><')) AS TagName
+    ) unnest_tags
+    WHERE pde.PostTypeId = 1 AND pde.Tags IS NOT NULL
+    GROUP BY pde.OwnerUserId, unnest_tags.TagName
+)
+SELECT
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.UserCreationDate,
+    uas.TotalPostsOwned,
+    uas.QuestionsCount,
+    uas.AnswersCount,
+    uas.TotalPostScoreOwned,
+    uas.AvgPostScoreOwned,
+    uas.TotalBadgesEarned,
+    uas.GoldBadgesCount,
+    uas.TotalUpvotesGiven,
+    uas.TotalDownvotesGiven,
+    uas.UniquePostsFavorited,
+    (uas.TotalUpvotesGiven - uas.TotalDownvotesGiven) AS NetVotesGiven,
+    EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS timestamp) - uas.UserCreationDate)) AS DaysActive,
+    ROUND(uas.Reputation / NULLIF(EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS timestamp) - uas.UserCreationDate)), 0)::numeric, 2) AS RepPerDay,
+    CASE
+        WHEN uas.QuestionsCount > 0 AND uas.AnswersCount > 0 THEN 'Active Contributor'
+        WHEN uas.QuestionsCount > 0 THEN 'Question Dominant'
+        WHEN uas.AnswersCount > 0 THEN 'Answer Dominant'
+        ELSE 'Passive User'
+    END AS UserEngagementProfile,
+    pde_top_q.PostId AS TopQuestionId,
+    pde_top_q.Title AS TopQuestionTitle,
+    pde_top_q.PostScore AS TopQuestionScore,
+    pde_top_q.ViewCount AS TopQuestionViewCount,
+    pde_top_q.EditCount AS TopQuestionEditCount,
+    COALESCE(pel.AvgTimeBetweenEditsSec, pde_top_q.AvgTimeBetweenEditsSec) AS TopQuestionAvgEditLag,
+    pde_top_q.ClosedDate IS NOT NULL AS IsTopQuestionClosed,
+    COALESCE(cr.Name, 'N/A') AS TopQuestionCloseReason,
+    pde_top_a.PostId AS TopAnswerId,
+    pde_top_a.PostScore AS TopAnswerScore,
+    pde_top_a.ParentId AS TopAnswerParentQuestionId,
+    pde_top_a.EditCount AS TopAnswerEditCount,
+    pde_top_a.AvgCommentScoreOnPost AS TopAnswerAvgCommentScore,
+    tto.TagName AS TopContributingTagName,
+    tto.TagAccumulatedScore AS TopTagTotalScore,
+    (
+        SELECT COUNT(DISTINCT p_link.RelatedPostId)
+        FROM PostLinks p_link
+        WHERE p_link.PostId = pde_top_q.PostId
+          AND p_link.LinkTypeId = 1
+    ) AS TopQuestionLinkedPostsCount,
+    (
+        SELECT CASE WHEN COUNT(*) > 0 THEN TRUE ELSE FALSE END
+        FROM Posts p_self_answer
+        WHERE p_self_answer.ParentId = pde_top_q.PostId
+          AND p_self_answer.OwnerUserId = uas.UserId
+          AND p_self_answer.PostTypeId = 2
+    ) AS HasSelfAnsweredTopQuestion,
+    MAX(CASE WHEN pde_all.PostTypeId = 1 THEN pde_all.PostCreationDate END) AS LatestQuestionDate,
+    MAX(CASE WHEN pde_all.PostTypeId = 2 THEN pde_all.PostCreationDate END) AS LatestAnswerDate,
+    AVG(CASE WHEN pde_all.PostTypeId = 1 THEN pde_all.PostScore END) AS AvgQuestionScoreAll,
+    AVG(CASE WHEN pde_all.PostTypeId = 2 THEN pde_all.PostScore END) AS AvgAnswerScoreAll,
+    COALESCE(SUM(CASE WHEN pde_all.AcceptedAnswerId = pde_all.PostId AND pde_all.PostTypeId = 2 THEN 1 ELSE 0 END), 0) AS AcceptedAnswersCount,
+    RANK() OVER (ORDER BY uas.Reputation DESC, uas.TotalPostScoreOwned DESC, (uas.QuestionsCount + uas.AnswersCount) DESC) AS GlobalUserRank
+FROM UserActivitySummary uas
+LEFT JOIN PostDetailsExtended pde_top_q ON uas.UserId = pde_top_q.OwnerUserId AND pde_top_q.PostTypeId = 1 AND pde_top_q.UserPostRankByScoreViews = 1
+LEFT JOIN PostDetailsExtended pde_top_a ON uas.UserId = pde_top_a.OwnerUserId AND pde_top_a.PostTypeId = 2 AND pde_top_a.UserPostRankByScoreViews = 1
+LEFT JOIN TopTagsByScore tto ON uas.UserId = tto.UserId AND tto.RankByTagScore = 1
+LEFT JOIN PostHistory ph_close_reason ON pde_top_q.PostId = ph_close_reason.PostId AND ph_close_reason.PostHistoryTypeId = 10 AND ph_close_reason.CreationDate = pde_top_q.ClosedDate
+LEFT JOIN CloseReasonTypes cr ON ph_close_reason.Comment ~ '^[0-9]+$' AND CAST(ph_close_reason.Comment AS smallint) = cr.Id
+LEFT JOIN PostDetailsExtended pde_all ON uas.UserId = pde_all.OwnerUserId
+LEFT JOIN PostEditLag pel ON pde_top_q.PostId = pel.PostId
+WHERE uas.Reputation > 500
+  AND uas.TotalPostsOwned >= 5
+  AND (pde_top_q.PostId IS NOT NULL OR pde_top_a.PostId IS NOT NULL)
+GROUP BY
+    uas.UserId, uas.DisplayName, uas.Reputation, uas.UserCreationDate, uas.TotalPostsOwned, uas.QuestionsCount, uas.AnswersCount,
+    uas.TotalPostScoreOwned, uas.AvgPostScoreOwned, uas.TotalBadgesEarned, uas.GoldBadgesCount, uas.TotalUpvotesGiven, uas.TotalDownvotesGiven,
+    uas.UniquePostsFavorited, pde_top_q.PostId, pde_top_q.Title, pde_top_q.PostScore, pde_top_q.ViewCount, pde_top_q.EditCount,
+    COALESCE(pel.AvgTimeBetweenEditsSec, pde_top_q.AvgTimeBetweenEditsSec), pde_top_q.ClosedDate, cr.Name, pde_top_a.PostId, pde_top_a.PostScore, pde_top_a.ParentId,
+    pde_top_a.EditCount, pde_top_a.AvgCommentScoreOnPost, tto.TagName, tto.TagAccumulatedScore
+HAVING COUNT(DISTINCT pde_all.PostId) > 0
+ORDER BY GlobalUserRank ASC, NetVotesGiven DESC
+LIMIT 5000;

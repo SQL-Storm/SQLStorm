@@ -1,0 +1,323 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT c.Id) as Comments,
+        COUNT(DISTINCT b.Id) as Badges,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        MAX(b.Date) as LastBadgeDate,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        COALESCE(SUM(p.ViewCount), 0) as TotalViews,
+        COALESCE(SUM(p.AnswerCount), 0) as TotalAnswers,
+        COALESCE(SUM(p.CommentCount), 0) as TotalComments,
+        RANK() OVER (ORDER BY COALESCE(SUM(p.Score), 0) DESC) as ScoreRank,
+        RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) as PostRank,
+        ROW_NUMBER() OVER (ORDER BY u.CreationDate ASC) as Seniority
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.ParentId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END as HasAcceptedAnswer,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END as IsClosed,
+        CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN 1 ELSE 0 END as IsCommunityOwned,
+        p.Tags,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags <> '' THEN array_length(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags)-2), '><'), 1)
+            ELSE 0 
+        END as TagCount,
+        COALESCE(
+            (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)),
+            0
+        ) as EditHistoryCount,
+        COALESCE(
+            (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId IN (2, 3)),
+            0
+        ) as VoteCount,
+        COALESCE(
+            (SELECT AVG(v.BountyAmount) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 8),
+            0
+        ) as AvgBounty,
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) as ScoreRankByType,
+        CASE 
+            WHEN p.Score > 10 THEN 'High'
+            WHEN p.Score > 5 THEN 'Medium'
+            WHEN p.Score > 0 THEN 'Low'
+            ELSE 'Negative'
+        END as ScoreCategory,
+        COALESCE(
+            (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3),
+            0
+        ) as DuplicateCount,
+        COALESCE(
+            (SELECT COUNT(*) FROM PostLinks pl WHERE pl.RelatedPostId = p.Id AND pl.LinkTypeId = 3),
+            0
+        ) as IsDuplicateCount,
+        COALESCE(
+            (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId = 10),
+            0
+        ) as CloseHistoryCount
+    FROM Posts p
+    WHERE p.Id IS NOT NULL
+),
+UserPostRelations AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.ScoreRank,
+        uas.PostRank,
+        pa.PostId,
+        pa.Title,
+        pa.Score,
+        pa.ViewCount,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.CreationDate,
+        pa.ScoreCategory,
+        pa.TagCount,
+        pa.IsClosed,
+        pa.HasAcceptedAnswer,
+        pa.DuplicateCount,
+        pa.CloseHistoryCount,
+        ROW_NUMBER() OVER (PARTITION BY uas.UserId ORDER BY pa.CreationDate DESC) as RecentPostSeq,
+        CASE 
+            WHEN uas.UserId = pa.OwnerUserId THEN 'Owner'
+            WHEN pa.OwnerUserId IS NULL THEN 'NoOwner'
+            ELSE 'Other'
+        END as OwnershipType,
+        CAST((EXTRACT(EPOCH FROM (pa.CreationDate - uas.LastPostDate)) / 86400) AS integer) as DaysSinceLastPost,
+        CAST((EXTRACT(EPOCH FROM (pa.CreationDate - uas.LastCommentDate)) / 86400) AS integer) as DaysSinceLastComment,
+        CAST((EXTRACT(EPOCH FROM (pa.CreationDate - uas.LastBadgeDate)) / 86400) AS integer) as DaysSinceLastBadge,
+        pa.OwnerUserId
+    FROM UserActivityStats uas
+    LEFT JOIN PostAnalysis pa ON uas.UserId = pa.OwnerUserId
+    WHERE pa.PostId IS NOT NULL
+),
+ComplexMetrics AS (
+    SELECT 
+        upr.UserId,
+        upr.DisplayName,
+        upr.Reputation,
+        upr.ScoreRank,
+        upr.PostRank,
+        upr.PostId,
+        upr.Title,
+        upr.Score,
+        upr.ViewCount,
+        upr.AnswerCount,
+        upr.CommentCount,
+        upr.CreationDate,
+        upr.ScoreCategory,
+        upr.TagCount,
+        upr.IsClosed,
+        upr.HasAcceptedAnswer,
+        upr.DuplicateCount,
+        upr.CloseHistoryCount,
+        upr.RecentPostSeq,
+        upr.OwnershipType,
+        upr.DaysSinceLastPost,
+        upr.DaysSinceLastComment,
+        upr.DaysSinceLastBadge,
+        CASE 
+            WHEN upr.IsClosed = 1 AND upr.CloseHistoryCount > 1 THEN 'RepeatedClose'
+            WHEN upr.IsClosed = 1 THEN 'SingleClose'
+            ELSE 'Open'
+        END as ClosureStatus,
+        CASE 
+            WHEN upr.HasAcceptedAnswer = 1 AND upr.AnswerCount > 0 THEN 'Answered'
+            WHEN upr.AnswerCount > 0 THEN 'HasAnswers'
+            ELSE 'NoAnswers'
+        END as AnswerStatus,
+        CASE 
+            WHEN upr.Score >= 100 THEN 'Elite'
+            WHEN upr.Score >= 50 THEN 'WellRespected'
+            WHEN upr.Score >= 10 THEN 'Respected'
+            WHEN upr.Score >= 5 THEN 'Contributor'
+            ELSE 'Newbie'
+        END as ReputationStatus,
+        CASE 
+            WHEN upr.TagCount >= 5 THEN 'TagHeavy'
+            WHEN upr.TagCount >= 3 THEN 'TagModerate'
+            ELSE 'TagLight'
+        END as TagIntensity,
+        CASE 
+            WHEN upr.DaysSinceLastPost < 7 THEN 'Active'
+            WHEN upr.DaysSinceLastPost < 30 THEN 'ModeratelyActive'
+            ELSE 'Inactive'
+        END as ActivityLevel,
+        ABS(upr.ViewCount - (SELECT AVG(ViewCount) FROM PostAnalysis)) as ViewCountDeviation,
+        ABS(upr.Score - (SELECT AVG(Score) FROM PostAnalysis)) as ScoreDeviation,
+        LAG(upr.CreationDate) OVER (PARTITION BY upr.UserId ORDER BY upr.CreationDate) as PreviousPostDate,
+        CASE 
+            WHEN LAG(upr.CreationDate) OVER (PARTITION BY upr.UserId ORDER BY upr.CreationDate) IS NULL THEN 0
+            ELSE CAST((EXTRACT(EPOCH FROM (upr.CreationDate - LAG(upr.CreationDate) OVER (PARTITION BY upr.UserId ORDER BY upr.CreationDate))) / 86400) AS integer)
+        END as DaysBetweenPosts,
+        ROW_NUMBER() OVER (ORDER BY upr.Score DESC) as GlobalScoreRank,
+        RANK() OVER (ORDER BY upr.Reputation DESC) as GlobalReputationRank,
+        CASE 
+            WHEN upr.Title IS NOT NULL AND char_length(upr.Title) > 100 THEN 'LongTitle'
+            WHEN upr.Title IS NOT NULL AND char_length(upr.Title) > 50 THEN 'MediumTitle'
+            ELSE 'ShortTitle'
+        END as TitleLengthStatus,
+        (CASE WHEN upr.Score >= 0 THEN 'Positive' ELSE 'Negative' END) || '-' ||
+            (CASE WHEN upr.ViewCount >= 100 THEN 'HighView' ELSE 'LowView' END) || '-' ||
+            (CASE WHEN upr.AnswerCount >= 5 THEN 'ManyAnswers' ELSE 'FewAnswers' END)
+            as PostStatusSummary
+    FROM UserPostRelations upr
+    WHERE upr.PostId IS NOT NULL
+)
+SELECT 
+    cm.UserId,
+    cm.DisplayName,
+    cm.Reputation,
+    cm.ScoreRank,
+    cm.PostRank,
+    cm.PostId,
+    cm.Title,
+    cm.Score,
+    cm.ViewCount,
+    cm.AnswerCount,
+    cm.CommentCount,
+    cm.CreationDate,
+    cm.ScoreCategory,
+    cm.TagCount,
+    cm.IsClosed,
+    cm.HasAcceptedAnswer,
+    cm.DuplicateCount,
+    cm.CloseHistoryCount,
+    cm.RecentPostSeq,
+    cm.OwnershipType,
+    cm.DaysSinceLastPost,
+    cm.DaysSinceLastComment,
+    cm.DaysSinceLastBadge,
+    cm.ClosureStatus,
+    cm.AnswerStatus,
+    cm.ReputationStatus,
+    cm.TagIntensity,
+    cm.ActivityLevel,
+    cm.ViewCountDeviation,
+    cm.ScoreDeviation,
+    cm.PreviousPostDate,
+    cm.DaysBetweenPosts,
+    cm.GlobalScoreRank,
+    cm.GlobalReputationRank,
+    cm.TitleLengthStatus,
+    cm.PostStatusSummary,
+    upper(substring(cm.Title FROM 1 FOR 1)) || lower(substring(cm.Title FROM 2)) as TitleFormatted,
+    CASE 
+        WHEN cm.Title IS NOT NULL THEN char_length(cm.Title) 
+        ELSE 0 
+    END as TitleLength,
+    CASE 
+        WHEN cm.TagCount IS NOT NULL AND cm.TagCount > 0 THEN 
+            (SELECT
+                CASE 
+                    WHEN pa.Tags IS NOT NULL THEN
+                        regexp_replace(
+                            regexp_replace(
+                                regexp_replace(pa.Tags, '<', '', 'g'),
+                                '>', '', 'g'),
+                            '\s+', ' ', 'g')
+                    ELSE NULL
+                END
+             FROM PostAnalysis pa
+             WHERE pa.PostId = cm.PostId
+             LIMIT 1)
+        ELSE NULL 
+    END as CleanedTags,
+    CASE 
+        WHEN cm.ViewCount > 0 THEN (CAST(cm.Score AS double precision) / CAST(cm.ViewCount AS double precision)) * 100
+        ELSE 0 
+    END as ScoreToViewRatio,
+    CASE 
+        WHEN cm.AnswerCount > 0 THEN CAST(cm.Score AS double precision) / CAST(cm.AnswerCount AS double precision)
+        ELSE 0 
+    END as ScorePerAnswer,
+    CASE 
+        WHEN cm.CommentCount > 0 THEN CAST(cm.Score AS double precision) / CAST(cm.CommentCount AS double precision)
+        ELSE 0 
+    END as ScorePerComment,
+    CASE 
+        WHEN COALESCE(cm.DuplicateCount, 0) > 0 AND cm.IsClosed = 1 THEN 'HighlyDuplicateAndClosed'
+        WHEN COALESCE(cm.DuplicateCount, 0) > 0 THEN 'HighlyDuplicate'
+        WHEN COALESCE(cm.DuplicateCount, 0) = 0 AND cm.IsClosed = 1 THEN 'ClosedNoDuplicates'
+        ELSE 'Normal'
+    END as PostCharacteristics,
+    CASE 
+        WHEN cm.Reputation > (SELECT AVG(u2.Reputation) FROM Users u2) THEN 'AboveAverageRep'
+        WHEN cm.Reputation = (SELECT AVG(u2.Reputation) FROM Users u2) THEN 'AverageRep'
+        ELSE 'BelowAverageRep' 
+    END as ReputationComparison,
+    CASE 
+        WHEN cm.Score >= (
+            SELECT percentile_cont(0.75) WITHIN GROUP (ORDER BY Score) 
+            FROM PostAnalysis
+        ) THEN 'TopQuarterScore'
+        WHEN cm.Score >= (
+            SELECT percentile_cont(0.50) WITHIN GROUP (ORDER BY Score) 
+            FROM PostAnalysis
+        ) THEN 'MedianScore'
+        ELSE 'BelowMedianScore'
+    END as ScorePercentile,
+    COUNT(*) OVER (PARTITION BY cm.UserId) as UserPostCount,
+    AVG(cm.Score) OVER (PARTITION BY cm.UserId) as AvgUserScore,
+    MAX(cm.ViewCount) OVER (PARTITION BY cm.UserId) as MaxUserViewCount,
+    LAG(cm.Score) OVER (ORDER BY cm.CreationDate) as PreviousScore,
+    LAG(cm.ViewCount) OVER (ORDER BY cm.CreationDate) as PreviousViewCount,
+    CASE 
+        WHEN cm.Title IS NULL OR cm.Title = '' THEN 'NoTitle'
+        ELSE 'HasTitle'
+    END as TitleStatus,
+    COALESCE(cm.Score, 0) + COALESCE(cm.ViewCount, 0) as ScoreViewSum,
+    CASE 
+        WHEN cm.Score IS NULL THEN 'ScoreMissing'
+        WHEN cm.Score < -10 THEN 'VeryNegative'
+        WHEN cm.Score < 0 THEN 'Negative'
+        WHEN cm.Score < 5 THEN 'Low'
+        WHEN cm.Score < 50 THEN 'Medium'
+        WHEN cm.Score < 100 THEN 'High'
+        ELSE 'VeryHigh'
+    END as ScoreClassification
+FROM ComplexMetrics cm
+WHERE 
+    cm.Reputation > 0 
+    AND cm.Score IS NOT NULL
+    AND cm.CreationDate BETWEEN TIMESTAMP '2010-01-01' AND TIMESTAMP '2025-12-31'
+    AND (
+        cm.Score >= 10 
+        OR cm.ViewCount >= 50 
+        OR cm.AnswerCount >= 1
+    )
+    AND cm.ReputationStatus IN ('Elite', 'WellRespected')
+    AND cm.ActivityLevel IN ('Active', 'ModeratelyActive')
+    AND (
+        cm.Title IS NOT NULL 
+        AND char_length(cm.Title) > 10
+    )
+ORDER BY cm.Score DESC, cm.ViewCount DESC
+LIMIT 1000000000;

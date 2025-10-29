@@ -1,0 +1,179 @@
+with UserBadgeCounts as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct b.Id) as TotalBadges,
+        count(distinct case when b.Class = 1 then b.Id end) as GoldBadges,
+        count(distinct case when b.Class = 2 then b.Id end) as SilverBadges,
+        count(distinct case when b.Class = 3 then b.Id end) as BronzeBadges,
+        max(b.Date) over (partition by u.Id) as LastBadgeDate
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    group by u.Id, u.DisplayName, b.Date
+), RecentActiveUsers as (
+    select
+        UserId,
+        DisplayName,
+        TotalBadges, GoldBadges, SilverBadges, BronzeBadges,
+        LastBadgeDate
+    from UserBadgeCounts
+    where LastBadgeDate > (date '2024-10-01' - interval '180 days')
+), PostAnswerStats as (
+    select
+        p.OwnerUserId,
+        count(case when p.PostTypeId = 1 then p.Id end) as QuestionsCount,
+        count(case when p.PostTypeId = 2 then p.Id end) as AnswersCount,
+        sum(case when p.PostTypeId in (1,2) then p.Score else 0 end) as TotalScore
+    from Posts p
+    where p.OwnerUserId is not null
+    group by p.OwnerUserId
+), UserEngagement as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        coalesce(ps.QuestionsCount,0) as QuestionsCount,
+        coalesce(ps.AnswersCount,0) as AnswersCount,
+        coalesce(ps.TotalScore,0) as TotalScore,
+        coalesce(u.Reputation,0) as Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Location,
+        u.WebsiteUrl,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes
+    from Users u
+    left join PostAnswerStats ps on u.Id = ps.OwnerUserId
+), TaggedQuestions as (
+  select 
+    p.Id,
+    p.OwnerUserId,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    regexp_split_to_table(
+      substring(p.Tags from 2 for length(p.Tags) - 2),
+      '><'
+    ) as TagName
+  from Posts p
+  where p.PostTypeId = 1 and p.Tags is not null
+), PopularTags as (
+  select 
+    t.TagName, 
+    count(distinct tq.Id) as QuestionsWithTag,
+    sum(tq.ViewCount) as TotalViews,
+    avg(tq.Score) as AvgScore,
+    max(tq.CreationDate) as LastUsed
+  from TaggedQuestions tq
+  join Tags t on t.TagName = tq.TagName
+  group by t.TagName
+  having count(distinct tq.Id) > 100
+), UserTagExpertise as (
+  select 
+    te.UserId,
+    te.TagName,
+    count(*) as PostsCount,
+    avg(te.Score) as AvgScore,
+    max(te.CreationDate) as LastPostDate
+  from (
+    select 
+      p.OwnerUserId as UserId,
+      regexp_split_to_table(
+        substring(p.Tags from 2 for length(p.Tags) - 2),
+        '><'
+      ) as TagName,
+      p.Score,
+      p.CreationDate
+    from Posts p
+    where p.PostTypeId in (1,2) and p.OwnerUserId is not null and p.Tags is not null
+  ) te
+  group by te.UserId, te.TagName
+), TopExpertUsers as (
+  select 
+    u.Id as UserId,
+    u.DisplayName,
+    ute.TagName,
+    ute.PostsCount,
+    ute.AvgScore,
+    ute.LastPostDate,
+    ue.Reputation,
+    ue.QuestionsCount,
+    ue.AnswersCount,
+    ue.TotalScore,
+    RANK() OVER (partition by ute.TagName ORDER BY ute.AvgScore DESC, ute.PostsCount DESC) as ExpertRank
+  from UserTagExpertise ute
+  join Users u on u.Id = ute.UserId
+  join UserEngagement ue on ue.UserId = u.Id
+  where ute.PostsCount >= 5 and u.Reputation > 1000
+), FinalSelect as (
+    select
+        te.UserId,
+        te.DisplayName,
+        te.TagName,
+        te.PostsCount,
+        te.AvgScore,
+        te.LastPostDate,
+        te.Reputation,
+        te.QuestionsCount,
+        te.AnswersCount,
+        te.TotalScore,
+        pt.QuestionsWithTag,
+        pt.TotalViews,
+        pt.AvgScore as TagAvgScore,
+        pt.LastUsed as TagLastUsed
+    from TopExpertUsers te
+    join PopularTags pt on pt.TagName = te.TagName
+    where te.ExpertRank <= 5
+)
+select 
+    fs.UserId,
+    fs.DisplayName,
+    fs.TagName,
+    fs.PostsCount,
+    round(cast(fs.AvgScore as numeric),2) as AvgScore,
+    fs.LastPostDate,
+    fs.Reputation,
+    fs.QuestionsCount,
+    fs.AnswersCount,
+    fs.TotalScore,
+    fs.QuestionsWithTag,
+    fs.TotalViews,
+    round(cast(fs.TagAvgScore as numeric),2) as TagAvgScore,
+    fs.TagLastUsed,
+    case 
+        when fs.AnswersCount > fs.QuestionsCount then 'Answerer'
+        when fs.AnswersCount < fs.QuestionsCount then 'Asker'
+        else 'Balanced'
+    end as UserType,
+    concat(
+        'Rank: ', (row_number() over (partition by fs.TagName order by fs.AvgScore desc, fs.PostsCount desc)),
+        ', LastActive: ', to_char(fs.LastPostDate, 'YYYY-MM-DD')
+    ) as ExtraInfo,
+    exists (
+        select 1 from Votes v 
+        where v.PostId in (
+            select p.Id from Posts p where p.OwnerUserId = fs.UserId and p.PostTypeId = 1
+        ) and v.VoteTypeId = 2
+        and v.CreationDate > (date '2024-10-01' - interval '30 days')
+        limit 1
+    ) as HasRecentUpvotesOnQuestions,
+    (select count(*) from Comments c where c.UserId = fs.UserId and c.CreationDate > (date '2024-10-01' - interval '90 days')) as RecentCommentsCount
+from FinalSelect fs
+group by
+    fs.UserId,
+    fs.DisplayName,
+    fs.TagName,
+    fs.PostsCount,
+    fs.AvgScore,
+    fs.LastPostDate,
+    fs.Reputation,
+    fs.QuestionsCount,
+    fs.AnswersCount,
+    fs.TotalScore,
+    fs.QuestionsWithTag,
+    fs.TotalViews,
+    fs.TagAvgScore,
+    fs.TagLastUsed
+order by fs.TagName, AvgScore desc, PostsCount desc
+limit 100;

@@ -1,0 +1,136 @@
+WITH
+    top_users AS (
+        SELECT u.Id,
+               u.DisplayName,
+               u.Reputation,
+               u.CreationDate,
+               COALESCE(u.Location,'Unknown') AS Location,
+               ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.CreationDate) AS rn
+        FROM   Users u
+        WHERE  u.Reputation > 1000
+          AND  u.CreationDate < CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+    ),
+    badge_counts AS (
+        SELECT b.UserId,
+               SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold,
+               SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver,
+               SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze,
+               COUNT(*)                                        AS total_badges
+        FROM   Badges b
+        GROUP  BY b.UserId
+    ),
+    recent_posts AS (
+        SELECT p.OwnerUserId,
+               MAX(p.CreationDate)                                   AS last_post_date,
+               STRING_AGG(
+                   CASE
+                       WHEN p.Title IS NOT NULL THEN LEFT(p.Title,30)
+                       ELSE '[no title]'
+                   END,
+                   '; '
+               ) FILTER (WHERE p.PostTypeId = 1)                     AS recent_question_titles,
+               STRING_AGG(
+                   CASE WHEN p.PostTypeId = 2 THEN CAST(p.Id AS text) END,
+                   ', '
+               ) FILTER (WHERE p.PostTypeId = 2)                     AS recent_answer_ids
+        FROM   Posts p
+        WHERE  p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '6 months'
+        GROUP  BY p.OwnerUserId
+    ),
+    user_votes AS (
+        SELECT v.PostId,
+               SUM(CASE WHEN v.VoteTypeId = 2 THEN 1
+                        WHEN v.VoteTypeId = 3 THEN -1
+                        ELSE 0 END)                                   AS net_score,
+               COUNT(*) FILTER (WHERE v.VoteTypeId = 5)            AS favorite_cnt
+        FROM   Votes v
+        GROUP  BY v.PostId
+    ),
+    question_stats AS (
+        SELECT p.OwnerUserId,
+               COUNT(*)                                          AS q_count,
+               AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL)   AS avg_score,
+               MAX(p.ViewCount)                                   AS max_views,
+               SUM(CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END) AS closed_q
+        FROM   Posts p
+        WHERE  p.PostTypeId = 1
+        GROUP  BY p.OwnerUserId
+    ),
+    answer_stats AS (
+        SELECT p.OwnerUserId,
+               COUNT(*)                                          AS a_count,
+               AVG(p.Score)                                      AS avg_answer_score,
+               SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS accepted_answers
+        FROM   Posts p
+        WHERE  p.PostTypeId = 2
+        GROUP  BY p.OwnerUserId
+    )
+SELECT
+    tu.Id                                          AS UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.Location,
+    tu.rn                                          AS ReputationRank,
+    COALESCE(bc.gold,0)                             AS GoldBadges,
+    COALESCE(bc.silver,0)                           AS SilverBadges,
+    COALESCE(bc.bronze,0)                           AS BronzeBadges,
+    COALESCE(bc.total_badges,0)                     AS TotalBadges,
+    COALESCE(rp.last_post_date, CAST('1970-01-01' AS timestamp)) AS LastPostDate,
+    rp.recent_question_titles,
+    rp.recent_answer_ids,
+    qs.q_count,
+    qs.avg_score,
+    qs.max_views,
+    qs.closed_q,
+    as_.a_count,
+    as_.avg_answer_score,
+    as_.accepted_answers,
+    (SELECT p.Id
+     FROM   Posts p
+            LEFT JOIN user_votes uv ON uv.PostId = p.Id
+     WHERE  p.OwnerUserId = tu.Id
+       AND  p.PostTypeId = 1
+     ORDER  BY COALESCE(uv.net_score,0) DESC,
+               p.CreationDate DESC
+     LIMIT  1)                                      AS TopQuestionId,
+    (SELECT STRING_AGG(tag, ', ')
+     FROM   (
+               SELECT UNNEST(string_to_array(p.Tags,'><')) AS tag
+               FROM   Posts p
+               WHERE  p.OwnerUserId = tu.Id
+                 AND  p.PostTypeId IN (1,2)
+               UNION
+               SELECT t.TagName
+               FROM   Tags t
+                      JOIN PostLinks pl ON pl.RelatedPostId = t.WikiPostId
+               WHERE  pl.PostId = (SELECT MIN(Id)
+                                   FROM   Posts
+                                   WHERE  OwnerUserId = tu.Id)
+           ) sub)                                      AS CombinedTagList
+FROM   top_users      tu
+LEFT   JOIN badge_counts   bc ON bc.UserId = tu.Id
+LEFT   JOIN recent_posts   rp ON rp.OwnerUserId = tu.Id
+LEFT   JOIN question_stats qs ON qs.OwnerUserId = tu.Id
+LEFT   JOIN answer_stats   as_ ON as_.OwnerUserId = tu.Id
+WHERE  tu.rn <= 100
+GROUP BY
+    tu.Id,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.Location,
+    tu.rn,
+    bc.gold,
+    bc.silver,
+    bc.bronze,
+    bc.total_badges,
+    rp.last_post_date,
+    rp.recent_question_titles,
+    rp.recent_answer_ids,
+    qs.q_count,
+    qs.avg_score,
+    qs.max_views,
+    qs.closed_q,
+    as_.a_count,
+    as_.avg_answer_score,
+    as_.accepted_answers
+ORDER  BY tu.Reputation DESC;

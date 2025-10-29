@@ -1,0 +1,114 @@
+-- {"query": "5129.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1058} 
+WITH
+RecentTopPosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.ViewCount,
+    p.Score,
+    p.AnswerCount,
+    p.Tags,
+    ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC, p.CreationDate DESC) AS rn
+  FROM Posts p
+  WHERE p.PostTypeId = 1 -- Questions
+    AND p.CreationDate >= NOW() - INTERVAL '30 days'
+),
+UserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    COUNT(DISTINCT c.Id) AS CommentCountLast30,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesGivenLast30,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesGivenLast30
+  FROM Users u
+  LEFT JOIN Comments c ON c.UserId = u.Id AND c.CreationDate >= NOW() - INTERVAL '30 days'
+  LEFT JOIN Votes v ON v.UserId = u.Id AND v.CreationDate >= NOW() - INTERVAL '30 days'
+  GROUP BY u.Id
+),
+PostLinksAgg AS (
+  SELECT
+    pl.PostId,
+    COUNT(*) FILTER (WHERE lt.Name ILIKE '%duplicate%') AS DuplicateLinks,
+    COUNT(*) AS TotalLinks
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+  GROUP BY pl.PostId
+),
+TagStats AS (
+  SELECT
+    t.TagName,
+    t.Count,
+    COALESCE(p.ViewCount, 0) AS PlaceholderViewCount
+  FROM Tags t
+  LEFT JOIN Posts p ON p.Id = t.WikiPostId
+),
+ExpandedRecent AS (
+  SELECT
+    rtp.PostId,
+    rtp.Title,
+    rtp.OwnerUserId,
+    rtp.CreationDate,
+    rtp.ViewCount,
+    rtp.Score,
+    rtp.AnswerCount,
+    rtp.Tags,
+    COALESCE(ups.UpvotesLast30, 0) AS UpvotesLast30
+  FROM RecentTopPosts rtp
+  LEFT JOIN (
+    SELECT
+      p.OwnerUserId,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesLast30
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id AND v.CreationDate >= NOW() - INTERVAL '30 days'
+    GROUP BY p.OwnerUserId
+  ) ups ON ups.OwnerUserId = rtp.OwnerUserId
+  WHERE rtp.rn <= 5
+)
+SELECT
+  er.PostId,
+  er.Title,
+  er.OwnerUserId,
+  er.CreationDate,
+  er.ViewCount,
+  er.Score,
+  er.AnswerCount,
+  er.Tags,
+  u.DisplayName AS OwnerDisplayName,
+  u.Reputation,
+  utc.CommentCountLast30,
+  utc.UpvotesGivenLast30,
+  utc.DownvotesGivenLast30,
+  COALESCE(pla.DuplicateLinks, 0) AS DuplicateLinks,
+  COALESCE(pla.TotalLinks, 0) AS TotalLinks,
+  ts.TagName,
+  ts.Count AS TagCount,
+  CASE
+    WHEN er.Score > 0 THEN 'Positive'
+    WHEN er.Score = 0 THEN 'Neutral'
+    ELSE 'Negative'
+  END AS ScoreTrend,
+  ARRAY_AGG(DISTINCT v2.VoteTypeId) AS VoteTypesOnPost
+FROM ExpandedRecent er
+JOIN Users u ON u.Id = er.OwnerUserId
+LEFT JOIN PostLinksAgg pla ON pla.PostId = er.PostId
+LEFT JOIN Votes v2 ON v2.PostId = er.PostId
+LEFT JOIN Tags t ON t.TagName = ANY(string_to_array(replace(replace(er.Tags, '<', ''), '>', ''), '><'))
+LEFT JOIN TagStats ts ON ts.TagName = t.TagName
+LEFT JOIN (
+  SELECT
+    p.Id,
+    COUNT(*) AS CommentCountLast30
+  FROM Posts p
+  LEFT JOIN Comments c ON c.PostId = p.Id AND c.CreationDate >= NOW() - INTERVAL '30 days'
+  GROUP BY p.Id
+) c30 ON c30.Id = er.PostId
+GROUP BY
+  er.PostId, er.Title, er.OwnerUserId, er.CreationDate, er.ViewCount, er.Score, er.AnswerCount,
+  er.Tags, u.DisplayName, u.Reputation, utc.CommentCountLast30, utc.UpvotesGivenLast30,
+  utc.DownvotesGivenLast30, pla.DuplicateLinks, pla.TotalLinks, ts.TagName, ts.Count, ScoreTrend
+ORDER BY er.Score DESC NULLS LAST, er.ViewCount DESC
+LIMIT 20;

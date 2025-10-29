@@ -1,0 +1,151 @@
+-- {"query": "7615.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1386} 
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) as avg_score_3posts,
+        CASE 
+            WHEN p.Score > 100 THEN 'High'
+            WHEN p.Score > 50 THEN 'Medium'
+            WHEN p.Score > 0 THEN 'Low'
+            ELSE 'Zero'
+        END as score_category,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND LENGTH(p.Tags) > 50 THEN 'Tagged'
+            ELSE 'Untagged'
+        END as tag_status
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) -- Questions and Answers only
+),
+UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as total_posts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as answers,
+        COALESCE(SUM(p.Score), 0) as total_score,
+        COALESCE(AVG(p.Score), 0) as avg_score,
+        MAX(p.CreationDate) as last_post_date,
+        DATEDIFF(day, MIN(p.CreationDate), MAX(p.CreationDate)) as active_days,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 100 THEN 'Veteran'
+            WHEN COUNT(DISTINCT p.Id) > 50 THEN 'Regular'
+            WHEN COUNT(DISTINCT p.Id) > 10 THEN 'Casual'
+            ELSE 'Newbie'
+        END as user_category
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TagStatistics AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 500 THEN 'Moderate'
+            WHEN t.Count > 100 THEN 'Common'
+            ELSE 'Rare'
+        END as popularity_level
+    FROM Tags t
+),
+QuestionAnalysis AS (
+    SELECT 
+        q.Id as QuestionId,
+        q.Title,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.CommentCount,
+        q.FavoriteCount,
+        q.CreationDate,
+        u.DisplayName as OwnerName,
+        CASE 
+            WHEN q.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN q.AnswerCount > 0 THEN 'Answered'
+            ELSE 'Unanswered'
+        END as status,
+        DATEDIFF(day, q.CreationDate, COALESCE(q.ClosedDate, CURRENT_TIMESTAMP)) as days_open,
+        p.Score as AnswerScore,
+        CASE 
+            WHEN q.AcceptedAnswerId IS NOT NULL THEN 'HasAccepted'
+            ELSE 'NoAccepted'
+        END as accepted_status,
+        COALESCE(
+            (SELECT COUNT(*) FROM Comments c WHERE c.PostId = q.Id),
+            0
+        ) as comment_count,
+        CASE 
+            WHEN EXISTS (
+                SELECT 1 FROM PostHistory ph 
+                WHERE ph.PostId = q.Id AND ph.PostHistoryTypeId IN (10, 11, 12, 13)
+            ) THEN 'HasHistory'
+            ELSE 'NoHistory'
+        END as history_status
+    FROM Posts q
+    JOIN Users u ON q.OwnerUserId = u.Id
+    LEFT JOIN Posts p ON q.AcceptedAnswerId = p.Id
+    WHERE q.PostTypeId = 1
+    AND q.CreationDate >= '2020-01-01'
+)
+SELECT 
+    'Performance Benchmark Query Results' as query_info,
+    COUNT(*) as total_records,
+    COUNT(DISTINCT ra.UserId) as active_users,
+    COUNT(DISTINCT CASE WHEN ra.score_category = 'High' THEN ra.Id END) as high_score_posts,
+    COUNT(DISTINCT CASE WHEN ra.tag_status = 'Tagged' THEN ra.Id END) as tagged_posts,
+    AVG(uas.total_score) as average_user_score,
+    SUM(CASE WHEN qa.status = 'Answered' THEN 1 ELSE 0 END) as answered_questions,
+    SUM(CASE WHEN qa.status = 'Closed' THEN 1 ELSE 0 END) as closed_questions,
+    AVG(qa.days_open) as avg_days_open,
+    MAX(uas.active_days) as max_active_days,
+    COUNT(DISTINCT ta.TagName) as total_tags,
+    STRING_AGG(
+        CASE 
+            WHEN ta.popularity_level = 'Popular' THEN ta.TagName 
+            ELSE NULL 
+        END, 
+        ', '
+    ) as popular_tags,
+    COALESCE(
+        (SELECT AVG(Score) FROM Posts p WHERE p.OwnerUserId IN (SELECT Id FROM Users WHERE Reputation > 10000) AND p.PostTypeId = 1),
+        0
+    ) as high_reputation_avg_score,
+    COUNT(*) OVER() as total_rows_processed,
+    CASE 
+        WHEN COUNT(*) > 1000 THEN 'LargeBatch'
+        WHEN COUNT(*) > 500 THEN 'MediumBatch'
+        ELSE 'SmallBatch'
+    END as batch_size_category
+FROM RankedPosts ra
+FULL OUTER JOIN UserActivityStats uas ON ra.OwnerUserId = uas.UserId
+FULL OUTER JOIN QuestionAnalysis qa ON ra.Id = qa.QuestionId
+FULL OUTER JOIN TagStatistics ta ON ta.TagName IS NOT NULL
+WHERE ra.rn <= 100
+    OR uas.total_posts > 50
+    OR qa.QuestionId IS NOT NULL
+    OR ta.TagName IS NOT NULL
+GROUP BY 
+    CASE 
+        WHEN COUNT(*) > 1000 THEN 'LargeBatch'
+        WHEN COUNT(*) > 500 THEN 'MediumBatch'
+        ELSE 'SmallBatch'
+    END;

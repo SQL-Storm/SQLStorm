@@ -1,0 +1,203 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.ViewCount,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        STRING_AGG(DISTINCT CAST(p.PostTypeId AS VARCHAR), ', ') AS PostTypes,
+        MAX(p.CreationDate) AS LastPostDate,
+        AVG(p.Score) AS AvgPostScore,
+        SUM(p.ViewCount) AS TotalViews,
+        SUM(p.Score) AS TotalScore,
+        RANK() OVER (ORDER BY SUM(p.Score) DESC) AS ScoreRank,
+        DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS PostRank,
+        CASE WHEN COUNT(DISTINCT b.Id) > 0 THEN 'Yes' ELSE 'No' END AS HasBadges,
+        CASE WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 0 THEN 'Question Author' ELSE 'Non-Question Author' END AS AuthorType
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.ViewCount, u.UpVotes, u.DownVotes
+),
+TopPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        u.Reputation AS OwnerReputation,
+        u.DisplayName AS OwnerDisplayName,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) AS ScoreRank,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS TypeRank,
+        NTILE(4) OVER (ORDER BY p.Score) AS Quartile,
+        LAG(p.Title, 1) OVER (ORDER BY p.Score DESC) AS PrevTopTitle,
+        LEAD(p.Title, 1) OVER (ORDER BY p.Score DESC) AS NextTopTitle,
+        COALESCE(p.Tags, '') AS CleanTags,
+        CASE WHEN p.Tags IS NULL OR p.Tags = '' THEN 'No Tags' ELSE 'Has Tags' END AS TagStatus,
+        ROW_NUMBER() OVER (ORDER BY p.CreationDate DESC) AS RecentRank
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1, 2) 
+        AND p.Score IS NOT NULL 
+        AND p.Score > 0 
+        AND p.CreationDate > DATE '2020-01-01'
+        AND p.ParentId IS NULL
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE WHEN t.Count > 1000 THEN 'Popular Tag' 
+             WHEN t.Count > 100 THEN 'Moderate Tag' 
+             ELSE 'Niche Tag' END AS TagCategory,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS RankByPopularity,
+        AVG(t.Count) OVER () AS AvgTagCount,
+        STDDEV_SAMP(t.Count) OVER () AS StdDevTagCount
+    FROM Tags t
+    WHERE t.Count > 0
+),
+RecentActivity AS (
+    SELECT 
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.UserId,
+        ph.CreationDate,
+        ph.Text,
+        ph.Comment,
+        u.DisplayName AS EditorName,
+        p.Title AS PostTitle,
+        p.Score AS PostScore,
+        p.OwnerUserId AS PostOwner,
+        CASE WHEN ph.PostHistoryTypeId = 1 THEN 'Initial Title' 
+             WHEN ph.PostHistoryTypeId = 2 THEN 'Initial Body' 
+             WHEN ph.PostHistoryTypeId = 3 THEN 'Initial Tags' 
+             WHEN ph.PostHistoryTypeId = 4 THEN 'Edit Title' 
+             ELSE 'Other Edit' END AS EditType,
+        CASE WHEN ph.UserId IS NULL THEN 'System Edit' ELSE 'User Edit' END AS EditSource,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS LatestEdit,
+        CAST(EXTRACT(EPOCH FROM (ph.CreationDate - LAG(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate))) AS BIGINT) AS TimeDiffFromPrevEdit,
+        LAG(ph.Text) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS PrevText
+    FROM PostHistory ph
+    JOIN Users u ON ph.UserId = u.Id
+    JOIN Posts p ON ph.PostId = p.Id
+    WHERE ph.CreationDate > DATE '2022-01-01'
+        AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)
+        AND p.Score > 0
+),
+CombinedResult AS (
+    SELECT 
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.PostCount,
+        us.CommentCount,
+        us.BadgeCount,
+        us.PostTypes,
+        us.ScoreRank,
+        us.PostRank,
+        us.HasBadges,
+        us.AuthorType,
+        tp.PostId,
+        tp.Title,
+        tp.Score AS PostScore,
+        tp.ViewCount,
+        tp.CreationDate AS PostCreationDate,
+        tp.OwnerReputation,
+        tp.OwnerDisplayName,
+        tp.ScoreRank AS PostScoreRank,
+        tp.TypeRank,
+        tp.Quartile,
+        ta.TagName,
+        ta.Count AS TagCount,
+        ta.TagCategory,
+        ra.EditType,
+        ra.EditSource,
+        ra.CreationDate AS EditDate,
+        ra.TimeDiffFromPrevEdit,
+        CASE WHEN ra.TimeDiffFromPrevEdit > 3600 THEN 'Long Edit Gap' 
+             WHEN ra.TimeDiffFromPrevEdit < 60 THEN 'Quick Edit' 
+             ELSE 'Normal Edit' END AS EditTiming,
+        CASE WHEN tp.Score > 100 THEN 1 ELSE 0 END AS HighScore,
+        CASE WHEN tp.Score > 500 THEN 1 ELSE 0 END AS VeryHighScore,
+        CASE WHEN ta.Count > 1000 THEN 1 ELSE 0 END AS PopularTag,
+        CASE WHEN us.Reputation > 10000 THEN 1 ELSE 0 END AS HighReputation,
+        CASE WHEN us.BadgeCount > 10 THEN 1 ELSE 0 END AS ManyBadges,
+        1.0 * tp.Score / NULLIF(us.TotalScore, 0) AS ScoreProportion
+    FROM UserStats us
+    JOIN TopPosts tp ON us.UserId = tp.OwnerUserId
+    LEFT JOIN TagAnalysis ta ON tp.Tags LIKE '%' || ta.TagName || '%'
+    LEFT JOIN RecentActivity ra ON tp.PostId = ra.PostId AND ra.LatestEdit = 1
+    WHERE tp.ScoreRank <= 50
+        AND us.PostCount > 20
+        AND us.BadgeCount > 0
+        AND ta.TagCategory IS NOT NULL
+)
+SELECT 
+    UserId,
+    DisplayName,
+    Reputation,
+    PostCount,
+    CommentCount,
+    BadgeCount,
+    PostTypes,
+    ScoreRank,
+    PostRank,
+    HasBadges,
+    AuthorType,
+    PostId,
+    Title,
+    PostScore,
+    ViewCount,
+    PostCreationDate,
+    OwnerReputation,
+    OwnerDisplayName,
+    PostScoreRank,
+    TypeRank,
+    Quartile,
+    TagName,
+    TagCount,
+    TagCategory,
+    EditType,
+    EditSource,
+    EditDate,
+    TimeDiffFromPrevEdit,
+    EditTiming,
+    HighScore,
+    VeryHighScore,
+    PopularTag,
+    HighReputation,
+    ManyBadges,
+    ScoreProportion,
+    CASE 
+        WHEN ScoreProportion > 0.05 THEN 'Major Contributor'
+        WHEN ScoreProportion > 0.02 THEN 'Significant Contributor'
+        WHEN ScoreProportion > 0.005 THEN 'Minor Contributor'
+        ELSE 'Regular Contributor'
+    END AS ContributionLevel,
+    ROW_NUMBER() OVER (ORDER BY ScoreProportion DESC) AS ContributionRank,
+    COUNT(*) OVER () AS TotalRecords
+FROM CombinedResult
+WHERE 
+    (PostScoreRank <= 25 OR TagCount > 500) 
+    AND (HighReputation = 1 OR ManyBadges = 1)
+    AND TimeDiffFromPrevEdit IS NOT NULL
+    AND EditTiming IN ('Long Edit Gap', 'Quick Edit', 'Normal Edit')
+    AND ScoreProportion > 0.001
+ORDER BY 
+    ScoreProportion DESC,
+    PostScore DESC,
+    TagCount DESC,
+    TimeDiffFromPrevEdit ASC
+LIMIT 10000;

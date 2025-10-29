@@ -1,0 +1,129 @@
+-- {"query": "3283.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2355} 
+
+WITH q_posts AS (
+   SELECT p.Id,
+          p.Title,
+          COALESCE(p.Tags,'')                     AS Tags,
+          p.CreationDate,
+          p.Score,
+          p.ViewCount,
+          p.OwnerUserId,
+          p.AcceptedAnswerId,
+          p.ParentId,
+          ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId
+                             ORDER BY p.CreationDate DESC) AS rn_user
+   FROM Posts p
+   WHERE p.PostTypeId = 1                                   -- only questions
+     AND p.CreationDate >= CURRENT_DATE - INTERVAL '180 days'
+),
+tag_exploded AS (
+   SELECT qp.Id                              AS PostId,
+          TRIM(BOTH '<>' FROM regexp_split_to_table(qp.Tags, '><')) AS Tag,
+          qp.Score,
+          qp.ViewCount,
+          qp.CreationDate,
+          qp.OwnerUserId
+   FROM q_posts qp
+   WHERE qp.Tags <> ''
+),
+tag_stats AS (
+   SELECT te.Tag,
+          COUNT(*)                                            AS TagPostCount,
+          AVG(te.Score)                                       AS AvgScore,
+          SUM(te.ViewCount)                                   AS TotalViews,
+          MAX(te.CreationDate)                                AS LatestPostDate,
+          STRING_AGG(DISTINCT te.OwnerUserId::text, ',' 
+                     ORDER BY te.OwnerUserId)                 AS OwnerIds
+   FROM tag_exploded te
+   GROUP BY te.Tag
+),
+user_badges AS (
+   SELECT b.UserId,
+          COUNT(*) FILTER (WHERE b.Class = 1)                AS GoldBadges,
+          COUNT(*) FILTER (WHERE b.Class = 2)                AS SilverBadges,
+          COUNT(*) FILTER (WHERE b.Class = 3)                AS BronzeBadges,
+          STRING_AGG(DISTINCT b.Name, ';' 
+                     ORDER BY b.Name)                        AS BadgeList
+   FROM Badges b
+   GROUP BY b.UserId
+),
+user_activity AS (
+   SELECT u.Id                                     AS UserId,
+          u.DisplayName,
+          u.Reputation,
+          u.CreationDate                           AS UserSince,
+          COALESCE(ub.GoldBadges,0)                AS GoldBadges,
+          COALESCE(ub.SilverBadges,0)              AS SilverBadges,
+          COALESCE(ub.BronzeBadges,0)              AS BronzeBadges,
+          ub.BadgeList,
+          (SELECT COUNT(*) FROM Posts p 
+            WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS QuestionCount,
+          (SELECT COUNT(*) FROM Posts p 
+            WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS AnswerCount,
+          (SELECT COUNT(*) FROM Comments c 
+            WHERE c.UserId = u.Id)                AS CommentCount,
+          (SELECT COUNT(*) FROM Votes v 
+            WHERE v.UserId = u.Id AND v.VoteTypeId = 2) AS UpVoteGiven
+   FROM Users u
+   LEFT JOIN user_badges ub ON ub.UserId = u.Id
+),
+post_votes AS (
+   SELECT v.PostId,
+          SUM(CASE WHEN v.VoteTypeId = 2 THEN 1
+                   WHEN v.VoteTypeId = 3 THEN -1
+                   ELSE 0 END)                     AS NetScore,
+          MAX(v.CreationDate)                       AS LastVoteDate
+   FROM Votes v
+   GROUP BY v.PostId
+)
+SELECT ua.UserId,
+       ua.DisplayName,
+       ua.Reputation,
+       ua.QuestionCount,
+       ua.AnswerCount,
+       ua.CommentCount,
+       ua.GoldBadges,
+       ua.SilverBadges,
+       ua.BronzeBadges,
+       ua.BadgeList,
+       COALESCE(ts.TagPostCount,0)                  AS TagPostCount,
+       COALESCE(ts.AvgScore,0)                      AS TagAvgScore,
+       COALESCE(ts.TotalViews,0)                    AS TagTotalViews,
+       ts.LatestPostDate,
+       pv.NetScore,
+       pv.LastVoteDate,
+       CASE
+         WHEN ua.Reputation > 20000 THEN 'Legendary'
+         WHEN ua.Reputation > 10000 THEN 'Expert'
+         WHEN ua.Reputation > 2000  THEN 'Intermediate'
+         ELSE 'Novice'
+       END                                          AS ReputationTier,
+       COALESCE(NULLIF(ts.OwnerIds,''), 'None')    AS TagOwnerIds
+FROM user_activity ua
+LEFT JOIN tag_stats ts
+  ON ts.Tag = ANY (
+        SELECT TRIM(BOTH '<>' FROM regexp_split_to_table(p.Tags, '><'))
+        FROM Posts p
+        WHERE p.OwnerUserId = ua.UserId
+          AND p.PostTypeId = 1
+        LIMIT 1
+     )
+LEFT JOIN post_votes pv
+  ON pv.PostId = (
+        SELECT p2.Id
+        FROM Posts p2
+        WHERE p2.OwnerUserId = ua.UserId
+          AND p2.PostTypeId = 1
+        ORDER BY p2.CreationDate DESC
+        LIMIT 1
+     )
+WHERE ua.Reputation IS NOT NULL
+
+UNION ALL
+
+SELECT NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,
+       NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL
+WHERE FALSE
+
+ORDER BY ReputationTier DESC, ua.Reputation DESC
+LIMIT 100;

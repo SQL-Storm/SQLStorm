@@ -1,0 +1,226 @@
+-- {"query": "1817.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2963} 
+
+WITH UserActivitySummary AS (
+    -- CTE 1: Aggregates user-specific activity, including post counts, comment counts, vote types, and badge statistics.
+    -- Includes NULL handling for user-related joins and conditional aggregations.
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END), 0) AS QuestionCount,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END), 0) AS AnswerCount,
+        COALESCE(COUNT(DISTINCT c.Id), 0) AS TotalCommentsWritten,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS TotalUpvotesGiven,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS TotalDownvotesGiven,
+        COALESCE(SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END), 0) AS GoldBadges,
+        COALESCE(SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END), 0) AS SilverBadges,
+        COALESCE(SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END), 0) AS BronzeBadges,
+        MAX(p.CreationDate) AS LatestPostDate,
+        MAX(c.CreationDate) AS LatestCommentDate
+    FROM
+        Users AS u
+    LEFT JOIN
+        Posts AS p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Comments AS c ON u.Id = c.UserId
+    LEFT JOIN
+        Votes AS v ON u.Id = v.UserId
+    LEFT JOIN
+        Badges AS b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+    HAVING
+        -- Filter for moderately active or influential users
+        COALESCE(COUNT(DISTINCT p.Id), 0) > 5 OR COALESCE(COUNT(DISTINCT c.Id), 0) > 10 OR COALESCE(SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END), 0) > 0
+),
+PostEditHistoryAndLinks AS (
+    -- CTE 2: Gathers post history (edits) and linked post information.
+    -- Uses window functions and string aggregation.
+    SELECT
+        ph.PostId,
+        COUNT(ph.Id) AS TotalHistoryEntries,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.Id END) AS EditCount, -- Count of title/body/tag edits
+        MIN(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId IN (4, 5, 6)) AS FirstEditDate,
+        MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId IN (4, 5, 6)) AS LastEditDate,
+        STRING_AGG(DISTINCT pl.LinkTypeId::varchar, ',') AS AllLinkTypes,
+        COUNT(DISTINCT pl.RelatedPostId) AS RelatedPostCount
+    FROM
+        PostHistory AS ph
+    LEFT JOIN
+        PostLinks AS pl ON ph.PostId = pl.PostId
+    GROUP BY
+        ph.PostId
+    HAVING
+        COUNT(ph.Id) > 1 -- Only posts with at least some history
+),
+PostCommentSummary AS (
+    -- CTE 3: Summarizes comment activity for each post.
+    SELECT
+        PostId,
+        COUNT(Id) AS CommentCount,
+        MIN(CreationDate) AS FirstCommentDate,
+        MAX(CreationDate) AS LastCommentDate,
+        AVG(Score) AS AverageCommentScore
+    FROM
+        Comments
+    GROUP BY
+        PostId
+),
+QuestionAnswerAcceptedInfo AS (
+    -- CTE 4: Extracts specific details for questions, especially regarding accepted answers.
+    SELECT
+        q.Id AS QuestionId,
+        q.AcceptedAnswerId,
+        q.AnswerCount,
+        q.FavoriteCount,
+        q.ClosedDate,
+        a.Score AS AcceptedAnswerScore,
+        a.CreationDate AS AcceptedAnswerCreationDate,
+        u_ans.DisplayName AS AcceptedAnswerOwnerDisplayName,
+        (q.AcceptedAnswerId IS NOT NULL AND u_ans.Reputation > 5000) AS IsHighRepAccepted
+    FROM
+        Posts AS q
+    LEFT JOIN
+        Posts AS a ON q.AcceptedAnswerId = a.Id
+    LEFT JOIN
+        Users AS u_ans ON a.OwnerUserId = u_ans.Id
+    WHERE
+        q.PostTypeId = 1
+),
+TopTagsByPostCount AS (
+    -- CTE 5: Identifies the most popular tags based on question count, using LATERAL UNNEST for tag parsing and window functions.
+    SELECT
+        LOWER(TRIM(unnested_tag)) AS TagName,
+        COUNT(p.Id) AS PostCount,
+        RANK() OVER (ORDER BY COUNT(p.Id) DESC) AS TagRank
+    FROM
+        Posts AS p,
+        LATERAL UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><')) AS unnested_tag
+    WHERE
+        p.Tags IS NOT NULL AND p.PostTypeId = 1 -- Only consider tags from questions
+    GROUP BY
+        LOWER(TRIM(unnested_tag))
+    HAVING
+        COUNT(p.Id) > 100 -- Focus on substantially popular tags
+),
+AggregatedPostPerformance AS (
+    -- CTE 6: Combines post details with metrics from other CTEs, calculates performance indicators, and uses window functions.
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.LastActivityDate,
+        p.Title,
+        p.PostTypeId,
+        COALESCE(pes.EditCount, 0) AS TotalEdits,
+        pes.FirstEditDate,
+        pes.LastEditDate,
+        EXTRACT(EPOCH FROM (pes.FirstEditDate - p.CreationDate)) / 3600.0 AS TimeToFirstEditHours, -- Time in hours, with floating point
+        COALESCE(pcs.CommentCount, 0) AS TotalComments,
+        pcs.AverageCommentScore,
+        qaai.AcceptedAnswerId,
+        qaai.AcceptedAnswerScore,
+        qaai.AnswerCount,
+        qaai.FavoriteCount,
+        qaai.ClosedDate,
+        qaai.IsHighRepAccepted,
+        DENSE_RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS RankByOwnerScore,
+        -- Correlated subqueries for distinct counts
+        (SELECT COUNT(DISTINCT UserId) FROM Comments WHERE PostId = p.Id AND UserId IS NOT NULL) AS DistinctCommenters,
+        (SELECT COUNT(DISTINCT UserId) FROM Votes WHERE PostId = p.Id AND VoteTypeId IN (2,3) AND UserId IS NOT NULL) AS DistinctVoters,
+        CASE
+            WHEN p.FavoriteCount > 100 AND p.Score > 500 THEN 'Highly Viral'
+            WHEN p.FavoriteCount > 50 AND p.Score > 200 THEN 'Very Popular'
+            WHEN p.ViewCount > 100000 AND p.Score > 100 THEN 'High Traffic'
+            ELSE 'Standard'
+        END AS PostImpactCategory,
+        NULLIF(TRIM(SUBSTRING(p.Body, POSITION('<p>' IN p.Body) + 3, POSITION('</p>' IN p.Body) - POSITION('<p>' IN p.Body) - 3)), '') AS FirstParagraphSummary,
+        COALESCE(pes.AllLinkTypes, 'No Links') AS PostLinkCategories
+    FROM
+        Posts AS p
+    LEFT JOIN
+        PostEditHistoryAndLinks AS pes ON p.Id = pes.PostId
+    LEFT JOIN
+        PostCommentSummary AS pcs ON p.Id = pcs.PostId
+    LEFT JOIN
+        QuestionAnswerAcceptedInfo AS qaai ON p.Id = qaai.QuestionId
+    WHERE
+        p.OwnerUserId IS NOT NULL
+        AND p.CreationDate >= '2020-01-01' -- Filter for recent posts
+        AND (p.PostTypeId IN (1, 2) OR (p.PostTypeId = 4 AND p.Score > 0)) -- Questions, Answers, or TagWikiExcerpts with score
+)
+SELECT
+    uas.UserId,
+    uas.DisplayName AS UserDisplayName,
+    uas.Reputation,
+    uas.LastAccessDate,
+    uas.QuestionCount,
+    uas.AnswerCount,
+    uas.TotalCommentsWritten,
+    app.PostId,
+    app.PostCreationDate,
+    app.Title AS PostTitle,
+    app.Score AS PostScore,
+    app.ViewCount AS PostViewCount,
+    app.TotalEdits,
+    app.TimeToFirstEditHours,
+    app.TotalComments AS PostCommentCount,
+    app.AverageCommentScore,
+    app.AcceptedAnswerId,
+    app.AcceptedAnswerScore,
+    app.AnswerCount AS QuestionAnswerCount,
+    app.FavoriteCount,
+    app.ClosedDate,
+    app.IsHighRepAccepted,
+    app.RankByOwnerScore,
+    app.DistinctCommenters,
+    app.DistinctVoters,
+    app.PostImpactCategory,
+    app.FirstParagraphSummary,
+    tt.TagName AS TopAssociatedTag,
+    tt.PostCount AS TopTagPostCount,
+    EXTRACT(DAY FROM (NOW() - uas.LastAccessDate)) AS DaysSinceLastAccess,
+    COALESCE(app.PostLinkCategories, 'N/A') AS LinkSummary,
+    -- Correlated subquery: Check for posts with high engagement from this user after their first year
+    (SELECT COUNT(p_sub.Id)
+     FROM Posts AS p_sub
+     WHERE p_sub.OwnerUserId = uas.UserId
+       AND p_sub.Score > 50
+       AND p_sub.CommentCount > 10
+       AND p_sub.CreationDate > uas.UserCreationDate + INTERVAL '1 year'
+    ) AS PostsWithHighEngagementCount,
+    -- String expression and NULL logic for a masked user initial
+    NULLIF(UPPER(SUBSTRING(COALESCE(uas.DisplayName, 'UNKNOWN'), 1, 1)) || LPAD('*', LENGTH(COALESCE(uas.DisplayName, 'UNKNOWN')) - 1, '*'), '*') AS MaskedUserInitial
+FROM
+    UserActivitySummary AS uas
+INNER JOIN
+    AggregatedPostPerformance AS app ON uas.UserId = app.OwnerUserId
+LEFT JOIN
+    Posts p_main ON app.PostId = p_main.Id -- Re-join to access Tags column for specific post
+LEFT JOIN
+    (SELECT TagName, PostCount FROM TopTagsByPostCount WHERE TagRank = 1) AS tt ON
+    -- Complex join condition for matching a post's tags to a top-ranked tag
+    app.PostTypeId = 1 AND EXISTS (SELECT 1 FROM LATERAL UNNEST(STRING_TO_ARRAY(SUBSTRING(p_main.Tags, 2, LENGTH(p_main.Tags)-2), '><')) AS post_tag WHERE LOWER(TRIM(post_tag)) = tt.TagName)
+WHERE
+    uas.Reputation > 1000 -- High reputation users
+    AND app.Score >= 10 -- Posts with a minimum score
+    AND app.RankByOwnerScore <= 3 -- Only top 3 performing posts per user
+    AND app.PostImpactCategory <> 'Standard' -- Filter out less impactful posts
+    AND app.FirstParagraphSummary IS NOT NULL -- Posts with a detectable first paragraph
+    AND app.FirstParagraphSummary LIKE 'The %' -- String expression: first paragraph starts with 'The '
+    AND (app.ClosedDate IS NULL OR app.ClosedDate > NOW() - INTERVAL '1 year') -- NULL logic and date arithmetic for closed posts
+    AND uas.LastAccessDate > NOW() - INTERVAL '6 months' -- Users active in the last 6 months
+    AND NOT EXISTS (
+        -- Correlated subquery: Exclude posts with excessively long titles
+        SELECT 1
+        FROM Posts AS p_title_check
+        WHERE p_title_check.Id = app.PostId
+          AND LENGTH(COALESCE(p_title_check.Title, '')) > 150
+    )
+ORDER BY
+    uas.Reputation DESC, app.PostScore DESC, app.PostViewCount DESC
+LIMIT 1000;

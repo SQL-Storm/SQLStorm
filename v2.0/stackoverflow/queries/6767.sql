@@ -1,0 +1,90 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.Title,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        U.DisplayName,
+        P.OwnerUserId,
+        U.Reputation,
+        RANK() OVER (ORDER BY P.Score DESC, P.ViewCount DESC) AS Rank,
+        CASE 
+            WHEN P.PostTypeId = 1 THEN 'Question'
+            WHEN P.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostType
+    FROM 
+        Posts P
+    JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId IN (1, 2)
+        AND P.Score > 0
+        AND P.ViewCount > 100
+),
+BadgeCounts AS (
+    SELECT 
+        U.Id AS UserId,
+        U.DisplayName,
+        COUNT(DISTINCT B.Id) AS BadgeCount
+    FROM 
+        Users U
+    JOIN 
+        Badges B ON U.Id = B.UserId
+    WHERE 
+        B.Class = 1
+        AND B.TagBased = FALSE
+    GROUP BY 
+        U.Id, U.DisplayName
+),
+CommentMetrics AS (
+    SELECT 
+        PC.Id AS PostId,
+        COUNT(C.Id) AS CommentCount,
+        COUNT(DISTINCT CASE WHEN C.Score > 0 THEN C.UserId END) AS PositiveCommenterCount
+    FROM 
+        Posts PC
+    LEFT JOIN 
+        Comments C ON PC.Id = C.PostId
+    GROUP BY 
+        PC.Id
+)
+SELECT 
+    RP.Id AS PostId,
+    RP.Title,
+    RP.Score,
+    RP.ViewCount,
+    CAST(RP.CreationDate AS DATE) AS CreationDate,
+    RP.DisplayName,
+    RP.Reputation,
+    RP.Rank,
+    RP.PostType,
+    COALESCE(BC.BadgeCount, 0) AS BadgeCount,
+    COALESCE(CM.CommentCount, 0) AS CommentCount,
+    COALESCE(CM.PositiveCommenterCount, 0) AS PositiveCommenterCount,
+    CASE
+        WHEN RP.Score > 100 THEN 'High Scoring'
+        ELSE 'Low Scoring'
+    END AS ScoreCategory
+FROM 
+    RankedPosts RP
+LEFT JOIN 
+    BadgeCounts BC ON RP.OwnerUserId = BC.UserId
+LEFT JOIN 
+    CommentMetrics CM ON RP.Id = CM.PostId
+GROUP BY
+    RP.Id,
+    RP.Title,
+    RP.Score,
+    RP.ViewCount,
+    CAST(RP.CreationDate AS DATE),
+    RP.DisplayName,
+    RP.Reputation,
+    RP.Rank,
+    RP.PostType,
+    BC.BadgeCount,
+    CM.CommentCount,
+    CM.PositiveCommenterCount
+ORDER BY 
+    RP.Rank;

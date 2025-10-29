@@ -1,0 +1,128 @@
+WITH MostActiveUsers AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(p.Id) AS PostCount,
+    SUM(p.Score) AS TotalPostScore,
+    MAX(p.CreationDate) AS LastPostDate
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopTags AS (
+  SELECT
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId,
+    t.WikiPostId,
+    ROW_NUMBER() OVER (ORDER BY t.Count DESC, t.TagName ASC) AS rn
+  FROM Tags t
+  WHERE t.IsModeratorOnly = FALSE
+),
+RecentClosed AS (
+  SELECT
+    ph.PostId,
+    ph.PostHistoryTypeId,
+    ph.CreationDate,
+    ph.Comment,
+    rc.Name AS CloseReasonName
+  FROM PostHistory ph
+  LEFT JOIN CloseReasonTypes rc ON CAST(ph.Comment AS varchar) LIKE '%' || CAST(rc.Id AS varchar) || '%'
+  WHERE ph.PostHistoryTypeId = 10
+    AND ph.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days'
+),
+MixedSample AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName AS UserName,
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.LastActivityDate,
+    v.VoteCount
+  FROM MostActiveUsers u
+  CROSS JOIN LATERAL (
+    SELECT *
+    FROM Posts p
+    WHERE p.OwnerUserId = u.UserId
+    ORDER BY p.CreationDate DESC
+    LIMIT 1
+  ) p
+  LEFT JOIN LATERAL (
+    SELECT COUNT(*) AS VoteCount
+    FROM Votes vs
+    WHERE vs.PostId = p.Id
+      AND vs.VoteTypeId IN (2, 6, 7, 8, 9, 10, 11, 12)
+  ) v ON TRUE
+  WHERE p.PostTypeId IN (1, 2)
+),
+WindowedStats AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.LastActivityDate,
+    ROW_NUMBER() OVER (
+      ORDER BY p.Score DESC NULLS LAST,
+               p.ViewCount DESC NULLS LAST,
+               p.CreationDate ASC
+    ) AS rn_desc,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) OVER (
+      PARTITION BY p.Id
+    ) AS UpvotesOnPost
+  FROM Posts p
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  GROUP BY p.Id, p.Title, p.Tags, p.Score, p.ViewCount, p.CreationDate, p.LastActivityDate, v.VoteTypeId
+),
+Filtered AS (
+  SELECT
+    ws.PostId,
+    ws.Title,
+    ws.Tags,
+    ws.Score,
+    ws.ViewCount,
+    ws.CreationDate,
+    ws.LastActivityDate,
+    ws.rn_desc,
+    ws.UpvotesOnPost
+  FROM WindowedStats ws
+  WHERE ws.rn_desc <= 5
+),
+Annotated AS (
+  SELECT
+    f.PostId,
+    f.Title,
+    f.Tags,
+    f.Score,
+    f.ViewCount,
+    f.CreationDate,
+    f.LastActivityDate,
+    f.UpvotesOnPost,
+    tt.rn,
+    tt.TagName
+  FROM Filtered f
+  LEFT JOIN TopTags tt ON LOWER(f.Title) LIKE '%' || LOWER(tt.TagName) || '%'
+)
+SELECT
+  a.PostId,
+  a.Title,
+  a.Tags,
+  a.Score,
+  a.ViewCount,
+  a.CreationDate,
+  a.LastActivityDate,
+  a.UpvotesOnPost,
+  a.TagName AS RelatedTag,
+  a.rn
+FROM Annotated a
+LEFT JOIN RecentClosed rc ON rc.PostId = a.PostId
+WHERE a.UpvotesOnPost IS NOT NULL
+ORDER BY a.Score DESC NULLS LAST, a.ViewCount DESC NULLS LAST
+LIMIT 200;

@@ -1,0 +1,169 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Body,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS prev_score,
+        AVG(p.Score) OVER (PARTITION BY p.PostTypeId) AS avg_score_by_type,
+        CASE 
+            WHEN p.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = p.PostTypeId) 
+            THEN 'Above Average'
+            ELSE 'Below Average'
+        END AS score_category,
+        COALESCE(p.Tags, '') AS tags_with_default
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserStats AS (
+    SELECT 
+        u.Id,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS total_posts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS question_count,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS answer_count,
+        AVG(p.Score) AS avg_score,
+        MAX(p.CreationDate) AS last_post_date,
+        STRING_AGG(DISTINCT COALESCE(p.Tags, ''), '; ') AS all_tags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > (SELECT AVG(Count) FROM Tags) THEN 'High Popularity'
+            ELSE 'Normal Popularity'
+        END AS popularity_level,
+        RANK() OVER (ORDER BY t.Count DESC) AS popularity_rank
+    FROM Tags t
+    WHERE t.Count > 10
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        rp.Id,
+        rp.Title,
+        rp.Score,
+        rp.ViewCount,
+        rp.Tags,
+        rp.score_category,
+        rp.avg_score_by_type,
+        CASE 
+            WHEN rp.prev_score IS NOT NULL AND rp.prev_score <> 0 
+            THEN ROUND((rp.Score - rp.prev_score) * 100.0 / rp.prev_score, 2)
+            ELSE 0
+        END AS score_change_percent,
+        COALESCE((SELECT COUNT(*) FROM Comments c WHERE c.PostId = rp.Id), 0) AS comment_count,
+        COALESCE((SELECT COUNT(*) FROM Votes v WHERE v.PostId = rp.Id AND v.VoteTypeId = 2), 0) AS upvotes,
+        COALESCE((SELECT COUNT(*) FROM Votes v WHERE v.PostId = rp.Id AND v.VoteTypeId = 3), 0) AS downvotes,
+        CASE 
+            WHEN rp.Tags IS NOT NULL AND LENGTH(rp.Tags) > 0 
+            THEN (COALESCE(NULLIF(array_length(string_to_array(rp.Tags, '><'), 1), 0), 0) - 1)
+            ELSE 0
+        END AS tag_count,
+        ('Post_' || CAST(rp.Id AS VARCHAR) || '_Analysis') AS analysis_label
+    FROM RankedPosts rp
+    WHERE rp.rn = 1
+      AND rp.Score > 50
+)
+SELECT 
+    ups.Id AS user_id,
+    ups.DisplayName,
+    ups.Reputation,
+    ups.total_posts,
+    ups.question_count,
+    ups.answer_count,
+    ups.avg_score,
+    ups.last_post_date,
+    ups.all_tags,
+    CASE 
+        WHEN ups.total_posts > 100 THEN 'Veteran'
+        WHEN ups.total_posts > 50 THEN 'Experienced'
+        WHEN ups.total_posts > 10 THEN 'Active'
+        ELSE 'New'
+    END AS user_status,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = ups.Id AND b.Class = 1) AS gold_badge_count,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = ups.Id AND b.Class = 2) AS silver_badge_count,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = ups.Id AND b.Class = 3) AS bronze_badge_count,
+    (SELECT STRING_AGG(b.Name, ', ') FROM Badges b WHERE b.UserId = ups.Id AND b.Class = 1) AS gold_badges,
+    (SELECT STRING_AGG(b.Name, ', ') FROM Badges b WHERE b.UserId = ups.Id AND b.Class = 2) AS silver_badges,
+    (SELECT STRING_AGG(DISTINCT cpa.analysis_label, ', ') 
+     FROM ComplexPostAnalysis cpa 
+     JOIN Posts p ON p.Id = cpa.Id
+     WHERE p.OwnerUserId = ups.Id AND p.PostTypeId = 1
+    ) AS analysis_labels,
+    (SELECT STRING_AGG(ta.TagName, ', ') FROM TagAnalysis ta WHERE ta.popularity_rank <= 5) AS popular_tags_5,
+    (SELECT COUNT(*) 
+     FROM Posts p1 
+     WHERE p1.OwnerUserId = ups.Id 
+       AND p1.Score > (
+           SELECT AVG(p2.Score) FROM Posts p2 WHERE p2.OwnerUserId = ups.Id
+       )
+    ) AS score_above_avg,
+    (SELECT COUNT(*) FROM Posts p1 WHERE p1.OwnerUserId = ups.Id) 
+      - (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = ups.Id AND p2.Score > 100) AS posts_below_100,
+    ('User ID: ' || CAST(ups.Id AS VARCHAR) || ' | Reputation: ' || CAST(ups.Reputation AS VARCHAR) || ' | Posts: ' || CAST(ups.total_posts AS VARCHAR) ||
+     ' | Questions: ' || CAST(ups.question_count AS VARCHAR) || ' | Answers: ' || CAST(ups.answer_count AS VARCHAR)) AS user_summary_text,
+    CASE 
+        WHEN ups.all_tags IS NULL THEN 'No Tags Present'
+        WHEN ups.all_tags = '' THEN 'Empty Tags'
+        ELSE 'Has Tags'
+    END AS tag_status,
+    ROW_NUMBER() OVER (ORDER BY ups.Reputation DESC) AS reputation_rank,
+    (SELECT MAX(c.Score) 
+     FROM Comments c 
+     WHERE c.UserId = ups.Id 
+       AND c.Score IN (
+           SELECT c2.Score 
+           FROM Comments c2 
+           WHERE c2.PostId IN (
+               SELECT p.Id FROM Posts p WHERE p.OwnerUserId = ups.Id
+           )
+       )
+    ) AS max_comment_score
+FROM UserStats ups
+LEFT JOIN (
+    SELECT DISTINCT cpa.Id, cpa.analysis_label
+    FROM ComplexPostAnalysis cpa
+) cpa ON EXISTS (
+    SELECT 1 FROM Posts p WHERE p.Id = cpa.Id AND p.OwnerUserId = ups.Id AND p.PostTypeId = 1
+)
+WHERE ups.total_posts > 0
+  AND ups.Id IN (
+      (SELECT UserId FROM Badges WHERE Class = 1)
+      INTERSECT
+      (SELECT OwnerUserId FROM Posts WHERE PostTypeId = 1)
+      UNION
+      (SELECT UserId FROM Comments)
+  )
+GROUP BY
+    ups.Id,
+    ups.DisplayName,
+    ups.Reputation,
+    ups.total_posts,
+    ups.question_count,
+    ups.answer_count,
+    ups.avg_score,
+    ups.last_post_date,
+    ups.all_tags,
+    ups.Views,
+    ups.UpVotes,
+    ups.DownVotes,
+    ups.Reputation -- included again to ensure deterministic grouping across dialects
+ORDER BY ups.Reputation DESC
+LIMIT 1000;

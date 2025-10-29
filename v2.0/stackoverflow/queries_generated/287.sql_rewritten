@@ -1,0 +1,390 @@
+-- {"query": "287.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3706} 
+with
+-- Active users with derived metrics
+active_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.lastaccessdate,
+    coalesce(nullif(trim(lower(u.location)), ''), 'unknown') as norm_location,
+    extract(year from age(cast('2024-10-01 12:34:56' as timestamp), u.creationdate))::int as account_age_years,
+    case when u.websiteurl ~* '^(https?://)?(www\.)?github\.com/' then 1 else 0 end as has_github
+  from users u
+  where u.reputation > 0
+),
+-- Posts enriched with tag array and quality score
+post_core as (
+  select
+    p.id as post_id,
+    p.posttypeid,
+    p.owneruserid as user_id,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.answercount,
+    p.favoritecount,
+    p.commentcount,
+    p.acceptedanswerid,
+    p.parentid,
+    p.title,
+    p.closeddate,
+    p.lastactivitydate,
+    coalesce(string_to_array(substring(p.tags, 2, greatest(length(p.tags)-2,0)), '><'), array[]::varchar[]) as tag_arr,
+    (
+      coalesce(p.score,0)*2
+      + coalesce(p.viewcount,0)/100
+      + coalesce(p.favoritecount,0)*3
+      + coalesce(p.commentcount,0)
+      + case when p.acceptedanswerid is not null then 15 else 0 end
+      - case when p.closeddate is not null then 25 else 0 end
+    )::int as quality_score
+  from posts p
+  where p.posttypeid in (1,2)
+),
+-- Votes summary per post
+vote_agg as (
+  select
+    v.postid as post_id,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started,
+    sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded,
+    max(v.creationdate) as last_vote_at
+  from votes v
+  group by v.postid
+),
+-- Comments summary per post
+comment_agg as (
+  select
+    c.postid as post_id,
+    count(*) as comment_cnt,
+    max(c.creationdate) as last_comment_at,
+    sum(c.score) as comment_score_sum,
+    max(length(c.text)) as max_comment_len
+  from comments c
+  group by c.postid
+),
+-- Post history signals (closures, reopenings, edits)
+history_flags as (
+  select
+    ph.postid as post_id,
+    sum(case when ph.posthistorytypeid = 10 then 1 else 0 end) as close_events,
+    sum(case when ph.posthistorytypeid = 11 then 1 else 0 end) as reopen_events,
+    sum(case when ph.posthistorytypeid in (4,5,6,24) then 1 else 0 end) as edit_events,
+    min(case when ph.posthistorytypeid = 10 then ph.creationdate end) as first_closed_at,
+    max(case when ph.posthistorytypeid = 11 then ph.creationdate end) as last_reopened_at
+  from posthistory ph
+  group by ph.postid
+),
+-- Duplicate link relationships
+dupe_links as (
+  select
+    pl.postid as post_id,
+    count(*) filter (where pl.linktypeid = 3) as dupes_marked,
+    count(*) filter (where pl.linktypeid = 1) as linked_refs
+  from postlinks pl
+  group by pl.postid
+),
+-- Tag popularity snapshot for tags referenced by posts
+tag_popularity as (
+  select
+    t.tagname,
+    t.count as tag_count
+  from tags t
+),
+-- Expand post tags and join tag popularity
+post_tag_expanded as (
+  select
+    pc.post_id,
+    unnest(pc.tag_arr) as tagname
+  from post_core pc
+  where pc.posttypeid = 1 and array_length(pc.tag_arr,1) is not null
+),
+post_tag_stats as (
+  select
+    pte.post_id,
+    count(*) as tag_cnt,
+    min(tp.tag_count) as min_tag_pop,
+    max(tp.tag_count) as max_tag_pop,
+    avg(tp.tag_count)::bigint as avg_tag_pop
+  from post_tag_expanded pte
+  left join tag_popularity tp on lower(tp.tagname) = lower(pte.tagname)
+  group by pte.post_id
+),
+-- Users' badge mix and density
+badge_agg as (
+  select
+    b.userid as user_id,
+    count(*) as badges_total,
+    sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+    sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+    sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+    sum(case when b.tagbased = 1 then 1 else 0 end) as tag_badges,
+    min(b.date) as first_badge_at,
+    max(b.date) as last_badge_at
+  from badges b
+  group by b.userid
+),
+-- Windowed activity per user: recent streak and rank by quality
+user_post_activity as (
+  select
+    pc.user_id,
+    pc.post_id,
+    pc.posttypeid,
+    pc.creationdate,
+    pc.quality_score,
+    row_number() over (partition by pc.user_id order by pc.creationdate desc) as rn_recent,
+    avg(pc.quality_score) over (partition by pc.user_id) as avg_quality_user,
+    rank() over (partition by pc.user_id order by pc.quality_score desc, pc.creationdate desc) as rank_quality_within_user
+  from post_core pc
+),
+-- Correlated subquery: best answer per question by score then earliest
+best_answer as (
+  select a.parentid as question_id,
+         a.id as answer_id,
+         a.score as answer_score
+  from posts a
+  where a.posttypeid = 2
+    and a.id = (
+      select a2.id
+      from posts a2
+      where a2.posttypeid = 2 and a2.parentid = a.parentid
+      order by a2.score desc nulls last, a2.creationdate asc
+      limit 1
+    )
+),
+-- Compute engagement bands
+engagement as (
+  select
+    pc.post_id,
+    case
+      when coalesce(va.upvotes,0) + coalesce(va.downvotes,0) >= 100 then 'very_high'
+      when coalesce(va.upvotes,0) + coalesce(va.downvotes,0) >= 25 then 'high'
+      when coalesce(va.upvotes,0) + coalesce(va.downvotes,0) >= 5 then 'medium'
+      when coalesce(va.upvotes,0) + coalesce(va.downvotes,0) >= 1 then 'low'
+      else 'none'
+    end as vote_engagement_band,
+    case
+      when coalesce(ca.comment_cnt,0) >= 50 then 'chattery'
+      when coalesce(ca.comment_cnt,0) >= 10 then 'discussed'
+      when coalesce(ca.comment_cnt,0) >= 1 then 'noted'
+      else 'silent'
+    end as comment_engagement_band
+  from post_core pc
+  left join vote_agg va on va.post_id = pc.post_id
+  left join comment_agg ca on ca.post_id = pc.post_id
+),
+-- Outlier detection using window statistics across all posts
+post_outliers as (
+  select
+    pc.post_id,
+    pc.quality_score,
+    pc.viewcount,
+    pc.score,
+    pc.favoritecount,
+    case
+      when pc.quality_score >
+        avg(pc.quality_score) over () + 3 * stddev_pop(pc.quality_score) over () then 1
+      else 0
+    end as quality_outlier,
+    case
+      when pc.viewcount >
+        avg(pc.viewcount) over () + 3 * stddev_pop(pc.viewcount) over () then 1
+      else 0
+    end as view_outlier
+  from post_core pc
+),
+-- Combine everything into a rich post/user fact
+post_user_fact as (
+  select
+    pc.post_id,
+    pc.posttypeid,
+    pc.creationdate as post_created,
+    pc.lastactivitydate,
+    pc.title,
+    au.user_id,
+    au.displayname,
+    au.reputation,
+    au.norm_location,
+    au.account_age_years,
+    au.has_github,
+    coalesce(va.upvotes,0) as upvotes,
+    coalesce(va.downvotes,0) as downvotes,
+    coalesce(va.bounty_started,0) as bounty_started,
+    coalesce(va.bounty_awarded,0) as bounty_awarded,
+    va.last_vote_at,
+    coalesce(ca.comment_cnt,0) as comment_cnt,
+    ca.last_comment_at,
+    coalesce(ca.comment_score_sum,0) as comment_score_sum,
+    coalesce(ca.max_comment_len,0) as max_comment_len,
+    coalesce(hf.close_events,0) as close_events,
+    coalesce(hf.reopen_events,0) as reopen_events,
+    coalesce(hf.edit_events,0) as edit_events,
+    hf.first_closed_at,
+    hf.last_reopened_at,
+    coalesce(dl.dupes_marked,0) as dupes_marked,
+    coalesce(dl.linked_refs,0) as linked_refs,
+    coalesce(pts.tag_cnt,0) as tag_cnt,
+    coalesce(pts.min_tag_pop,0) as min_tag_pop,
+    coalesce(pts.max_tag_pop,0) as max_tag_pop,
+    coalesce(pts.avg_tag_pop,0) as avg_tag_pop,
+    pc.quality_score,
+    po.quality_outlier,
+    po.view_outlier,
+    e.vote_engagement_band,
+    e.comment_engagement_band,
+    ba.badges_total,
+    ba.gold_badges,
+    ba.silver_badges,
+    ba.bronze_badges,
+    ba.tag_badges,
+    ba.first_badge_at,
+    ba.last_badge_at,
+    ua.avg_quality_user,
+    ua.rank_quality_within_user,
+    ua.rn_recent,
+    case when pc.posttypeid = 1 then ba2.answer_id end as best_answer_id,
+    case when pc.posttypeid = 1 then ba2.answer_score end as best_answer_score
+  from post_core pc
+  left join active_users au on au.user_id = pc.user_id
+  left join vote_agg va on va.post_id = pc.post_id
+  left join comment_agg ca on ca.post_id = pc.post_id
+  left join history_flags hf on hf.post_id = pc.post_id
+  left join dupe_links dl on dl.post_id = pc.post_id
+  left join post_tag_stats pts on pts.post_id = pc.post_id
+  left join badge_agg ba on ba.user_id = pc.user_id
+  left join user_post_activity ua on ua.post_id = pc.post_id
+  left join post_outliers po on po.post_id = pc.post_id
+  left join engagement e on e.post_id = pc.post_id
+  left join best_answer ba2 on ba2.question_id = pc.post_id
+),
+-- Build tiers for users using set operators across different criteria
+user_tiers as (
+  select user_id, 'high_rep' as tier from active_users where reputation >= 10000
+  union
+  select user_id, 'editor' from (
+    select ph.userid as user_id
+    from posthistory ph
+    where ph.posthistorytypeid in (4,5,6,24)
+    group by ph.userid
+    having count(*) >= 50
+  ) s
+  union
+  select user_id, 'badged' from badge_agg where badges_total >= 25
+),
+user_tier_pivot as (
+  select
+    au.user_id,
+    max(case when ut.tier = 'high_rep' then 1 else 0 end) as is_high_rep,
+    max(case when ut.tier = 'editor' then 1 else 0 end) as is_editor,
+    max(case when ut.tier = 'badged' then 1 else 0 end) as is_badged
+  from active_users au
+  left join user_tiers ut on ut.user_id = au.user_id
+  group by au.user_id
+),
+-- Final ranking with complex predicates and null handling
+scored as (
+  select
+    puf.*,
+    utp.is_high_rep,
+    utp.is_editor,
+    utp.is_badged,
+    -- composite score mixes multiple signals
+    (
+      coalesce(puf.quality_score,0)
+      + greatest(coalesce(puf.upvotes,0) - coalesce(puf.downvotes,0), 0)
+      + case when puf.best_answer_id is not null then 10 else 0 end
+      + case when puf.close_events > puf.reopen_events then -15 else 0 end
+      + case when puf.vote_engagement_band in ('very_high','high') then 10 when puf.vote_engagement_band = 'medium' then 4 else 0 end
+      + case when utp.is_high_rep = 1 then 8 else 0 end
+      + case when utp.is_editor = 1 then 5 else 0 end
+      + case when puf.view_outlier = 1 then 6 else 0 end
+    ) as composite_score
+  from post_user_fact puf
+  left join user_tier_pivot utp on utp.user_id = puf.user_id
+)
+select
+  s.post_id,
+  s.posttypeid,
+  s.post_created,
+  s.lastactivitydate,
+  coalesce(nullif(s.title,''), '[no title]') as title,
+  s.user_id,
+  coalesce(nullif(s.displayname,''), '[unknown]') as displayname,
+  s.reputation,
+  s.norm_location,
+  s.account_age_years,
+  s.has_github,
+  s.upvotes,
+  s.downvotes,
+  s.bounty_started,
+  s.bounty_awarded,
+  s.comment_cnt,
+  s.close_events,
+  s.reopen_events,
+  s.edit_events,
+  s.dupes_marked,
+  s.linked_refs,
+  s.tag_cnt,
+  s.min_tag_pop,
+  s.max_tag_pop,
+  s.avg_tag_pop,
+  s.quality_score,
+  s.quality_outlier,
+  s.view_outlier,
+  s.vote_engagement_band,
+  s.comment_engagement_band,
+  s.badges_total,
+  s.gold_badges,
+  s.silver_badges,
+  s.bronze_badges,
+  s.tag_badges,
+  s.avg_quality_user,
+  s.rank_quality_within_user,
+  s.rn_recent,
+  s.best_answer_id,
+  s.best_answer_score,
+  s.is_high_rep,
+  s.is_editor,
+  s.is_badged,
+  s.composite_score,
+  -- string expressions and null logic
+  concat_ws(' | ',
+    case when s.posttypeid = 1 then 'Q' when s.posttypeid = 2 then 'A' else 'P' end,
+    s.vote_engagement_band,
+    s.comment_engagement_band,
+    case when s.quality_outlier = 1 then 'Q-OUT' end,
+    case when s.view_outlier = 1 then 'V-OUT' end
+  ) as flags,
+  -- correlated subquery to get number of answers for the same question thread (if answer)
+  case
+    when s.posttypeid = 2 then (
+      select count(*) from posts pa where pa.posttypeid = 2 and pa.parentid = (select parentid from posts px where px.id = s.post_id)
+    )
+  end as sibling_answer_count
+from scored s
+where
+  (
+    -- complicated predicate combining multiple dimensions
+    (s.posttypeid = 1 and s.quality_score >= 20 and coalesce(s.tag_cnt,0) >= 1)
+    or
+    (s.posttypeid = 2 and (s.upvotes - s.downvotes) >= 5 and coalesce(s.best_answer_id,0) <> s.post_id)
+    or
+    (s.vote_engagement_band in ('very_high','high') and s.comment_engagement_band <> 'silent')
+  )
+  and (
+    s.first_badge_at is null -- users without badges
+    or s.is_high_rep = 1
+    or (s.edit_events >= 3 and s.is_editor = 1)
+  )
+  and (
+    s.lastactivitydate is null
+    or s.lastactivitydate >= s.post_created
+  )
+order by
+  s.composite_score desc nulls last,
+  s.upvotes desc nulls last,
+  s.post_created desc
+limit 500;

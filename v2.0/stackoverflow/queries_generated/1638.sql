@@ -1,0 +1,185 @@
+-- {"query": "1638.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3005} 
+
+WITH UserActivityMetrics AS (
+    -- CTE 1: Summarize user activity, reputation, and badge information.
+    -- Includes aggregation, outer joins (to Badges, Posts, Comments), date filtering, and NULL handling for badge class sum.
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.Views AS TotalProfileViews,
+        U.UpVotes AS TotalUpVotesGiven,
+        U.DownVotes AS TotalDownVotesGiven,
+        COUNT(DISTINCT P.Id) AS PostsCreated,
+        COUNT(DISTINCT C.Id) AS CommentsMade,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsAsked,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersProvided,
+        MAX(P.CreationDate) AS LatestPostDate,
+        AVG(NULLIF(P.Score, 0)) AS AvgPostScore, -- NULLIF handles posts with 0 score
+        COALESCE(SUM(B.Class), 0) AS TotalBadgeClassValue -- Sum of badge classes (1=Gold, 2=Silver, 3=Bronze), COALESCE handles users with no badges
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    WHERE U.CreationDate >= '2020-01-01' -- Filter for more recent user accounts
+      AND U.LastAccessDate < '2023-01-01' -- Filter for users whose last access was not too recent
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.Views, U.UpVotes, U.DownVotes
+    HAVING COUNT(DISTINCT P.Id) > 5 AND U.Reputation > 1000 -- Filter for active users with significant reputation
+),
+PostHistoricalInsights AS (
+    -- CTE 2: Analyze post history for edits, closures, and deletions.
+    -- Includes aggregation and conditional summing for specific history types, and date filtering.
+    SELECT
+        PH.PostId,
+        COUNT(DISTINCT PH.Id) AS TotalHistoryEntries,
+        MAX(PH.CreationDate) AS LastHistoryUpdate,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.Id END) AS EditCount, -- Count of title, body, or tag edits
+        SUM(CASE
+            WHEN PH.PostHistoryTypeId = 10 AND PH.Comment IS NOT NULL AND PH.Comment::int IN (101, 102) THEN 1 -- Duplicate or Off-topic close
+            WHEN PH.PostHistoryTypeId = 12 THEN 1 -- Post Deleted
+            ELSE 0
+        END) AS CloseDeleteVotes, -- Count of close or delete votes
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.CreationDate ELSE NULL END) AS LastClosedDate -- Date of most recent closure
+    FROM PostHistory PH
+    WHERE PH.CreationDate BETWEEN '2021-01-01' AND '2023-12-31'
+    GROUP BY PH.PostId
+    HAVING COUNT(DISTINCT PH.Id) > 2 -- Filter for posts with multiple history entries
+),
+TagPerformance AS (
+    -- CTE 3: Calculate performance metrics per tag based on posts.
+    -- Uses CROSS JOIN LATERAL with STRING_TO_ARRAY for tag parsing, aggregation, and filtering.
+    SELECT
+        TagName,
+        SUM(P.Score) AS TotalTagScore,
+        COUNT(P.Id) AS TotalPostsWithTag,
+        AVG(P.ViewCount) AS AvgTagViewCount
+    FROM Posts P
+    -- Use string_to_array to extract individual tags from the 'Tags' string column
+    CROSS JOIN LATERAL UNNEST(STRING_TO_ARRAY(SUBSTRING(P.Tags, 2, LENGTH(P.Tags)-2), '><')) AS TagName
+    WHERE P.PostTypeId IN (1, 4, 5) -- Only questions and tag wikis for tag performance
+    GROUP BY TagName
+    HAVING COUNT(P.Id) > 100 -- Only consider tags with a significant number of posts
+),
+AggregatedPostPerformance AS (
+    -- CTE 4: Combine post data with user activity, historical insights, and tag performance.
+    -- Includes multiple joins, correlated subqueries, and initial score calculations.
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.AcceptedAnswerId,
+        P.ParentId,
+        P.CreationDate,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.ClosedDate,
+        P.CommunityOwnedDate,
+        P.Title,
+        P.Tags,
+        P.Body, -- Include Body for string operations in final select
+        UAM.DisplayName AS OwnerDisplayName,
+        UAM.Reputation AS OwnerReputation,
+        UAM.TotalProfileViews AS OwnerTotalViews,
+        PHI.TotalHistoryEntries,
+        PHI.EditCount,
+        PHI.CloseDeleteVotes,
+        PHI.LastClosedDate,
+        COALESCE(TP.TotalTagScore, 0) AS TotalTagScore, -- COALESCE for tags that might not exist in TagPerformance
+        COALESCE(TP.TotalPostsWithTag, 0) AS TotalPostsWithTag,
+        COALESCE(TP.AvgTagViewCount, 0.0) AS AvgTagViewCount,
+        COALESCE(P.Score, 0) * COALESCE(P.ViewCount, 1) AS RawEngagementScore,
+        -- Correlated subquery 1: Total up and down votes for the specific post
+        (SELECT COUNT(DISTINCT V.Id) FROM Votes V WHERE V.PostId = P.Id AND V.VoteTypeId IN (2, 3)) AS TotalUpAndDownVotes,
+        -- Correlated subquery 2: Last comment date by the post owner on this post
+        (SELECT MAX(C.CreationDate) FROM Comments C WHERE C.PostId = P.Id AND C.UserId = P.OwnerUserId) AS OwnerLastCommentDate,
+        CASE
+            WHEN P.AcceptedAnswerId IS NOT NULL THEN 'HasAcceptedAnswer'
+            WHEN P.CommunityOwnedDate IS NOT NULL THEN 'CommunityOwned'
+            WHEN P.ClosedDate IS NOT NULL THEN 'Closed'
+            ELSE 'Open'
+        END AS PostStatus
+    FROM Posts P
+    JOIN UserActivityMetrics UAM ON P.OwnerUserId = UAM.UserId
+    LEFT JOIN PostHistoricalInsights PHI ON P.Id = PHI.PostId
+    -- Join to tag performance via individual tags extracted from the post's Tags column
+    LEFT JOIN LATERAL UNNEST(STRING_TO_ARRAY(SUBSTRING(P.Tags, 2, LENGTH(P.Tags)-2), '><')) AS PostTag
+    LEFT JOIN TagPerformance TP ON PostTag = TP.TagName
+    WHERE P.CreationDate BETWEEN '2021-01-01' AND '2023-06-30'
+      AND P.PostTypeId IN (1, 2) -- Only Questions and Answers
+      AND P.Score > 0 -- Only posts with positive scores
+)
+-- Main Query: Final selection, elaborate calculations, window functions, and complex filtering.
+SELECT
+    APP.PostId,
+    APP.PostTypeId,
+    APP.Title,
+    APP.OwnerDisplayName,
+    APP.OwnerReputation,
+    APP.Score,
+    APP.ViewCount,
+    APP.AnswerCount,
+    APP.CommentCount,
+    APP.FavoriteCount,
+    APP.TotalUpAndDownVotes,
+    APP.PostStatus,
+    APP.OwnerLastCommentDate,
+    APP.TotalHistoryEntries,
+    APP.EditCount,
+    APP.CloseDeleteVotes,
+    APP.TotalTagScore,
+    APP.AvgTagViewCount,
+    -- Complicated Post Impact Score calculation combining various metrics, NULL logic, and conditional bonuses
+    (
+        CAST(COALESCE(APP.Score, 0) AS NUMERIC)
+        + (COALESCE(APP.ViewCount, 0) / 100.0)
+        + (COALESCE(APP.AnswerCount, 0) * 2.5)
+        + (COALESCE(APP.CommentCount, 0) * 0.75)
+        + (COALESCE(APP.FavoriteCount, 0) * 5.0)
+        - (COALESCE(APP.CloseDeleteVotes, 0) * 10.0) -- Penalize for close/delete votes
+        + (CASE WHEN APP.AcceptedAnswerId IS NOT NULL THEN 100 ELSE 0 END) -- Bonus for accepted answer
+        + (COALESCE(APP.TotalTagScore, 0) / GREATEST(1, COALESCE(APP.TotalPostsWithTag, 1))) -- Average score of associated tag
+        + (CASE WHEN APP.PostTypeId = 1 AND APP.Tags ILIKE '%<sql>%' THEN 20 ELSE 0 END) -- Bonus for SQL questions
+        + (CASE WHEN APP.PostTypeId = 2 AND APP.Body LIKE '%<code>%</code>%' THEN 15 ELSE 0 END) -- Bonus for answers with code blocks
+    ) AS PostImpactScore,
+    -- Window function 1: Rank posts by their impact score within their post type
+    RANK() OVER (PARTITION BY APP.PostTypeId ORDER BY (
+        CAST(COALESCE(APP.Score, 0) AS NUMERIC)
+        + (COALESCE(APP.ViewCount, 0) / 100.0)
+        + (COALESCE(APP.AnswerCount, 0) * 2.5)
+        + (COALESCE(APP.CommentCount, 0) * 0.75)
+        + (COALESCE(APP.FavoriteCount, 0) * 5.0)
+        - (COALESCE(APP.CloseDeleteVotes, 0) * 10.0)
+        + (CASE WHEN APP.AcceptedAnswerId IS NOT NULL THEN 100 ELSE 0 END)
+        + (COALESCE(APP.TotalTagScore, 0) / GREATEST(1, COALESCE(APP.TotalPostsWithTag, 1)))
+        + (CASE WHEN APP.PostTypeId = 1 AND APP.Tags ILIKE '%<sql>%' THEN 20 ELSE 0 END)
+        + (CASE WHEN APP.PostTypeId = 2 AND APP.Body LIKE '%<code>%</code>%' THEN 15 ELSE 0 END)
+    ) DESC) AS PostTypeImpactRank,
+    -- Window function 2: Cumulative sum of RawEngagementScore for a user's posts, ordered by creation date
+    SUM(APP.RawEngagementScore) OVER (PARTITION BY APP.OwnerUserId ORDER BY APP.CreationDate) AS OwnerCumulativeEngagement,
+    -- String expressions and NULL logic
+    COALESCE(SUBSTRING(APP.Title, 1, 50), 'No Title Provided') AS ShortTitle, -- Shortened title or default string
+    NULLIF(LENGTH(APP.Body), 0) AS BodyLength, -- Body length, NULL if 0
+    -- Correlated subquery 3: Get the latest gold badge date for the post's owner (if any)
+    (
+        SELECT MAX(B.Date)
+        FROM Badges B
+        WHERE B.UserId = APP.OwnerUserId AND B.Class = 1 -- Class 1 is Gold
+        GROUP BY B.UserId
+    ) AS LatestGoldBadgeDate
+FROM AggregatedPostPerformance APP
+LEFT JOIN Posts ParentPost ON APP.ParentId = ParentPost.Id -- Outer join to parent post (for answers)
+LEFT JOIN Posts AcceptedAnswer ON APP.AcceptedAnswerId = AcceptedAnswer.Id -- Outer join to accepted answer (for questions)
+WHERE APP.OwnerReputation > 5000 -- Filter for highly reputed owners
+  AND (APP.PostImpactScore > 100 OR APP.OwnerTotalViews > 50000) -- Complex filtering: significant impact or high profile owner
+  AND (APP.LastClosedDate IS NULL OR APP.LastClosedDate > '2023-01-01') -- Not closed or recently reopened/closed
+  AND ( -- Complex OR condition for different post types
+        (APP.PostTypeId = 1 AND APP.AnswerCount > 2 AND APP.FavoriteCount > 5 AND APP.Tags ILIKE '%<optimization>%') -- Questions about 'optimization' with many answers/favorites
+        OR
+        (APP.PostTypeId = 2 AND APP.Score > 10 AND APP.ParentId IS NOT NULL AND APP.Body LIKE '%database%') -- High-scoring answers mentioning 'database'
+      )
+  AND APP.Title NOT ILIKE '%[duplicate]%' -- Exclude titles explicitly marked as duplicates
+ORDER BY PostImpactScore DESC, PostId
+LIMIT 500; -- Limit the final result set

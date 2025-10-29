@@ -1,0 +1,223 @@
+-- {"query": "2549.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2194} 
+with RecursiveTagHierarchy as (
+    select 
+        t.Id, 
+        t.TagName, 
+        t.Count, 
+        t.ExcerptPostId, 
+        t.WikiPostId,
+        1 as Level,
+        cast(t.TagName as varchar(1000)) as Path
+    from Tags t
+    where t.IsRequired = 1
+    union all
+    select 
+        child.Id,
+        child.TagName,
+        child.Count,
+        child.ExcerptPostId,
+        child.WikiPostId,
+        r.Level + 1,
+        r.Path || ' > ' || child.TagName
+    from Tags child
+    join RecursiveTagHierarchy r on child.WikiPostId = r.ExcerptPostId
+    where r.Level < 3
+),
+PostsWithScoreStats as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.AcceptedAnswerId,
+        u.Reputation as OwnerReputation,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc nulls last, p.CreationDate) as UserPostRank,
+        avg(p.Score) over (partition by p.OwnerUserId) as AvgUserScore,
+        count(*) over (partition by p.OwnerUserId) as TotalUserPosts
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId in (1, 2)
+),
+PostAnswerPairs as (
+    select 
+        q.Id as QuestionId, q.Title, q.Tags as QuestionTags, q.Score as QuestionScore,
+        a.Id as AnswerId, a.Score as AnswerScore, a.OwnerUserId as AnswerOwner,
+        a.CreationDate as AnswerCreationDate,
+        EXISTS (
+            select 1 
+            from Votes v 
+            where v.PostId = a.Id and v.VoteTypeId = 2 and v.CreationDate > a.CreationDate
+            and v.CreationDate < a.CreationDate + interval '7 days'
+            limit 1
+        ) as AnswerHasPostAnswerUpvotesWithinWeek
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+),
+BadgeRanks as (
+    select 
+        b.UserId,
+        b.Name,
+        b.Class,
+        b.Date,
+        dense_rank() over (partition by b.UserId order by b.Date) as BadgeSequence,
+        count(*) over (partition by b.UserId, b.Class) as BadgeClassCount
+    from Badges b
+),
+UserBadgeSummary as (
+    select 
+        UserId,
+        sum(case when Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when Class = 3 then 1 else 0 end) as BronzeBadges,
+        max(BadgeDate) as LastBadgeDate
+    from (
+        select UserId, Class, Date as BadgeDate from Badges
+    ) b
+    group by UserId
+),
+CloseReasonSummary as (
+    select 
+        p.Id as PostId,
+        cht.Name as HistoryTypeName,
+        cr.Name as CloseReasonName,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    join PostHistoryTypes cht on ph.PostHistoryTypeId = cht.Id
+    left join CloseReasonTypes cr on ph.Comment::int = cr.Id
+    join Posts p on ph.PostId = p.Id
+    where ph.PostHistoryTypeId = 10
+),
+UserActivityRanking as (
+    select 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct p.Id) as TotalPosts,
+        count(distinct c.Id) as TotalComments,
+        count(distinct b.Id) as TotalBadges,
+        row_number() over (order by u.Reputation desc, count(distinct p.Id) desc) as RankByReputation
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+),
+TopQuestionsWithAcceptedAnswers AS (
+    select 
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score as QuestionScore,
+        acc.Id as AcceptedAnswerId,
+        acc.Score as AcceptedAnswerScore,
+        acc.OwnerUserId as AcceptedAnswerOwner,
+        first_value(acc.CreationDate) over (partition by q.Id order by acc.CreationDate) as FirstAcceptedAnswerDate
+    from Posts q
+    left join Posts acc on q.AcceptedAnswerId = acc.Id
+    where q.PostTypeId = 1 and q.AcceptedAnswerId is not null
+),
+QuestionsWithoutAcceptedAnswersWithAnswers AS (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.Score as QuestionScore,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.OwnerUserId as AnswerOwner,
+        a.CreationDate as AnswerCreationDate
+    from Posts q
+    join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1 and q.AcceptedAnswerId is null
+),
+CombinedQuestionsAndAnswers AS (
+    select 
+        tq.QuestionId, 
+        tq.Title, 
+        tq.QuestionScore, 
+        tq.AcceptedAnswerId as AnswerId, 
+        tq.AcceptedAnswerScore as AnswerScore, 
+        tq.AcceptedAnswerOwner as AnswerOwner,
+        tq.FirstAcceptedAnswerDate as AnswerCreationDate,
+        'AcceptedAnswer' as AnswerType
+    from TopQuestionsWithAcceptedAnswers tq
+    union all
+    select 
+        qwa.QuestionId, qwa.Title, qwa.QuestionScore, qwa.AnswerId, qwa.AnswerScore, qwa.AnswerOwner, qwa.AnswerCreationDate,
+        'NonAcceptedAnswer' as AnswerType
+    from QuestionsWithoutAcceptedAnswersWithAnswers qwa
+),
+AnswerRanks AS (
+    select 
+        cqa.*,
+        row_number() over (partition by cqa.QuestionId order by cqa.AnswerScore desc nulls last, cqa.AnswerCreationDate) as AnswerRank
+    from CombinedQuestionsAndAnswers cqa
+),
+UserQuestionStats AS (
+    select 
+        p.OwnerUserId as UserId,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as TotalQuestions,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as TotalAnswers,
+        avg(p.Score) filter (where p.PostTypeId = 1) as AvgQuestionScore,
+        avg(p.Score) filter (where p.PostTypeId = 2) as AvgAnswerScore,
+        max(p.Score) filter (where p.PostTypeId = 1) as MaxQuestionScore,
+        max(p.Score) filter (where p.PostTypeId = 2) as MaxAnswerScore
+    from Posts p
+    group by p.OwnerUserId
+)
+select 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    u.Views,
+    coalesce(ubs.GoldBadges,0) as GoldBadges,
+    coalesce(ubs.SilverBadges,0) as SilverBadges,
+    coalesce(ubs.BronzeBadges,0) as BronzeBadges,
+    us.TotalQuestions,
+    us.TotalAnswers,
+    round(us.AvgQuestionScore::numeric,2) as AvgQuestionScore,
+    round(us.AvgAnswerScore::numeric,2) as AvgAnswerScore,
+    us.MaxQuestionScore,
+    us.MaxAnswerScore,
+    count(distinct ph.Id) filter (where ph.PostHistoryTypeId in (10,11)) as CloseReopenEvents,
+    count(distinct c.Id) as CommentCount,
+    max(ph.CreationDate) as LastPostHistoryChange,
+    sum(case when v.VoteTypeId = 2 then 1 else 0 end) as TotalUpVotes,
+    sum(case when v.VoteTypeId = 3 then 1 else 0 end) as TotalDownVotes,
+    max(p.CreationDate) as LastPostCreatedDate,
+    median_score,
+    avg_post_score,
+    max_post_score,
+    min_post_score,
+    string_agg(distinct rth.Path, ' | ') as RequiredTagPaths,
+    rank_by_reputation
+from Users u
+left join UserBadgeSummary ubs on u.Id = ubs.UserId
+left join UserQuestionStats us on u.Id = us.UserId
+left join PostHistory ph on ph.UserId = u.Id
+left join Comments c on c.UserId = u.Id
+left join Votes v on v.UserId = u.Id
+left join Posts p on p.OwnerUserId = u.Id
+left join RecursiveTagHierarchy rth on position('<' || rth.TagName || '>' in coalesce(p.Tags, '')) > 0
+left join (
+    select 
+        OwnerUserId,
+        percentile_cont(0.5) within group (order by Score) as median_score,
+        avg(Score) as avg_post_score,
+        max(Score) as max_post_score,
+        min(Score) as min_post_score
+    from Posts
+    where OwnerUserId is not null and PostTypeId in (1,2)
+    group by OwnerUserId
+) ps on ps.OwnerUserId = u.Id
+left join UserActivityRanking uar on u.Id = uar.Id
+group by u.Id, u.DisplayName, u.Reputation, u.Location, u.Views, ubs.GoldBadges, ubs.SilverBadges, ubs.BronzeBadges, 
+         us.TotalQuestions, us.TotalAnswers, us.AvgQuestionScore, us.AvgAnswerScore, us.MaxQuestionScore, us.MaxAnswerScore,
+         median_score, avg_post_score, max_post_score, min_post_score, rank_by_reputation
+having count(distinct ph.Id) >= 1
+order by u.Reputation desc nulls last, GoldBadges desc, us.TotalAnswers desc
+limit 100;

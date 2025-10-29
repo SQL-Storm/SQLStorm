@@ -1,0 +1,178 @@
+WITH top_users AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(bc.Gold, 0)   AS GoldBadges,
+        COALESCE(bc.Silver, 0) AS SilverBadges,
+        COALESCE(bc.Bronze, 0) AS BronzeBadges,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS QuestionCount,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS AnswerCount
+    FROM Users u
+    LEFT JOIN (
+        SELECT
+            UserId,
+            SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS Gold,
+            SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS Silver,
+            SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS Bronze
+        FROM Badges
+        GROUP BY UserId
+    ) bc ON bc.UserId = u.Id
+    WHERE u.Reputation > 10000
+),
+
+question_stats AS (
+    SELECT
+        q.Id,
+        q.OwnerUserId,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.FavoriteCount,
+        q.AnswerCount,
+        q.Tags,
+        COALESCE(vu.UpVotes, 0)   AS UpVoteCount,
+        COALESCE(vd.DownVotes, 0) AS DownVoteCount,
+        CASE WHEN q.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+        ROW_NUMBER() OVER (PARTITION BY q.OwnerUserId ORDER BY q.Score DESC) AS RankInOwner
+    FROM Posts q
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS UpVotes
+        FROM Votes
+        WHERE VoteTypeId = 2
+        GROUP BY PostId
+    ) vu ON vu.PostId = q.Id
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS DownVotes
+        FROM Votes
+        WHERE VoteTypeId = 3
+        GROUP BY PostId
+    ) vd ON vd.PostId = q.Id
+    WHERE q.PostTypeId = 1
+),
+
+tag_explode AS (
+    SELECT
+        qs.Id AS QuestionId,
+        TRIM(x.tag) AS Tag
+    FROM question_stats qs,
+    LATERAL (
+      SELECT UNNEST(string_to_array(TRIM(BOTH '<>' FROM qs.Tags), '><')) AS tag
+    ) x
+),
+
+tag_stats AS (
+    SELECT
+        te.Tag,
+        COUNT(DISTINCT te.QuestionId)               AS QuestionsWithTag,
+        SUM(qs.Score)                               AS TotalScore,
+        CAST(ROUND(AVG(CAST(qs.ViewCount AS DECIMAL)),2) AS DECIMAL(10,2)) AS AvgViews,
+        MAX(qs.FavoriteCount)                       AS MaxFavorites
+    FROM tag_explode te
+    JOIN question_stats qs ON qs.Id = te.QuestionId
+    GROUP BY te.Tag
+    HAVING COUNT(*) > 100
+),
+
+closed_reason_counts AS (
+    SELECT
+        CAST(ph.Comment AS INTEGER) AS CloseReasonId,
+        COUNT(*)        AS ClosedCount
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10
+      AND ph.Comment LIKE '[0-9]%' = FALSE -- fallback to include only numeric comments is dialect-specific; keep filter below
+      AND ph.Comment ~ '^\d+$' -- if regex not supported, consider replacing with appropriate function per dialect
+    GROUP BY CAST(ph.Comment AS INTEGER)
+),
+
+final AS (
+    SELECT
+        tu.Id,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.GoldBadges,
+        tu.SilverBadges,
+        tu.BronzeBadges,
+        tu.QuestionCount,
+        tu.AnswerCount,
+        q.Title,
+        q.Score,
+        q.ViewCount,
+        q.FavoriteCount,
+        q.AnswerCount               AS QAnswerCount,
+        q.Tags,
+        q.UpVoteCount,
+        q.DownVoteCount,
+        q.IsClosed,
+        crc.ClosedCount,
+        ts.TotalScore               AS TagTotalScore,
+        ts.AvgViews                 AS TagAvgViews,
+        ts.MaxFavorites             AS TagMaxFav
+    FROM top_users tu
+    LEFT JOIN LATERAL (
+        SELECT qs.*
+        FROM question_stats qs
+        WHERE qs.OwnerUserId = tu.Id
+        ORDER BY qs.Score DESC
+        LIMIT 1
+    ) q ON TRUE
+    LEFT JOIN LATERAL (
+        SELECT crc.ClosedCount
+        FROM closed_reason_counts crc
+        WHERE crc.CloseReasonId = (
+                SELECT COALESCE((
+                    SELECT CAST(split_part(t, '_', 2) AS INTEGER)
+                    FROM (
+                      SELECT UNNEST(string_to_array(q.Tags, '><')) AS t
+                    ) sub
+                    WHERE sub.t LIKE 'close\_%' ESCAPE '\'
+                    LIMIT 1
+                ), 0)
+              )
+        LIMIT 1
+    ) crc ON TRUE
+    LEFT JOIN LATERAL (
+        SELECT ts.*
+        FROM tag_stats ts
+        WHERE ts.Tag = ANY (string_to_array(TRIM(BOTH '<>' FROM q.Tags), '><'))
+        ORDER BY ts.TotalScore DESC
+        LIMIT 1
+    ) ts ON TRUE
+    WHERE tu.Reputation > 20000
+      AND (q.Score IS NULL OR q.Score > 0 OR q.IsClosed = 0)
+      AND (tu.GoldBadges + tu.SilverBadges + tu.BronzeBadges) > 5
+      AND COALESCE(q.UpVoteCount,0) - COALESCE(q.DownVoteCount,0) > 10
+)
+
+SELECT *
+FROM final
+
+UNION ALL
+
+SELECT
+    NULL AS Id,
+    NULL AS DisplayName,
+    NULL AS Reputation,
+    NULL AS GoldBadges,
+    NULL AS SilverBadges,
+    NULL AS BronzeBadges,
+    NULL AS QuestionCount,
+    NULL AS AnswerCount,
+    'Aggregated Tag Summary' AS Title,
+    NULL AS Score,
+    NULL AS ViewCount,
+    NULL AS FavoriteCount,
+    NULL AS QAnswerCount,
+    NULL AS Tags,
+    NULL AS UpVoteCount,
+    NULL AS DownVoteCount,
+    NULL AS IsClosed,
+    NULL AS ClosedCount,
+    SUM(TagTotalScore) OVER () AS TagTotalScore,
+    AVG(TagAvgViews)   OVER () AS TagAvgViews,
+    MAX(TagMaxFav)     OVER () AS TagMaxFav
+FROM final
+
+ORDER BY Reputation DESC NULLS LAST
+LIMIT 100;

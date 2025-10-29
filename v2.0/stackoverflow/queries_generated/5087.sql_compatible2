@@ -1,0 +1,127 @@
+WITH RecentActivePosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.ViewCount,
+    p.Score,
+    p.OwnerUserId,
+    p.Tags,
+    p.LastActivityDate,
+    p.AcceptedAnswerId
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '90 days'
+),
+TopTags AS (
+  SELECT
+    TRIM(tag) AS TagName,
+    COUNT(*) AS TagCount
+  FROM Posts p
+  JOIN RecentActivePosts rap ON rap.PostId = p.Id
+  WHERE p.Tags IS NOT NULL
+  CROSS JOIN LATERAL (
+    SELECT split_tag
+    FROM (
+      -- split tags like '<tag1><tag2>' into rows: remove leading/trailing <> then split on '><'
+      SELECT regexp_split_to_table(substr(p.Tags, 2, length(p.Tags) - 2), '><') AS split_tag
+    ) s
+  ) st
+  GROUP BY TRIM(st.split_tag)
+),
+TagWeights AS (
+  SELECT
+    TagName,
+    TagCount,
+    (LN(1 + TagCount) * 2.0) + CASE WHEN TagName IN ('sql','performance','database','optimization') THEN 5 ELSE 0 END AS Weight
+  FROM TopTags
+),
+AnswerStats AS (
+  SELECT
+    ph.PostId,
+    COUNT(CASE WHEN ph.PostHistoryTypeId = 3 THEN 1 END) AS InitialBodyEdits,
+    MAX(ph.CreationDate) AS LastEditDate
+  FROM PostHistory ph
+  GROUP BY ph.PostId
+),
+Likes AS (
+  SELECT
+    v.PostId,
+    SUM(CASE WHEN v.VoteTypeId IN (2,14,16) THEN 1 ELSE 0 END) AS Upvotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS Downvotes,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN COALESCE(v.BountyAmount, 0) ELSE 0 END) AS UpModBonus
+  FROM Votes v
+  GROUP BY v.PostId
+),
+CorrelatedQueries AS (
+  SELECT
+    rap.PostId,
+    rap.Title,
+    rap.CreationDate,
+    rap.ViewCount,
+    rap.Score,
+    rap.OwnerUserId,
+    rap.Tags,
+    rap.LastActivityDate,
+    COALESCE(a.InitialBodyEdits, 0) AS InitEdits,
+    COALESCE(l.Upvotes, 0) AS Upvotes,
+    COALESCE(l.Downvotes, 0) AS Downvotes,
+    COALESCE(a.LastEditDate, rap.CreationDate) AS LastEditDate
+  FROM RecentActivePosts rap
+  LEFT JOIN AnswerStats a ON a.PostId = rap.PostId
+  LEFT JOIN Likes l ON l.PostId = rap.PostId
+)
+SELECT
+  cr.PostId,
+  cr.Title,
+  cr.CreationDate,
+  cr.ViewCount,
+  cr.Score,
+  cr.OwnerUserId,
+  cr.LastActivityDate,
+  cr.InitEdits,
+  cr.Upvotes,
+  cr.Downvotes,
+  cr.LastEditDate,
+  (
+    SELECT STRING_AGG(t.TagName, ',')
+    FROM (
+      SELECT TRIM(st.split_tag) AS TagName
+      FROM Posts p
+      CROSS JOIN LATERAL (
+        SELECT regexp_split_to_table(substr(p.Tags, 2, length(p.Tags) - 2), '><') AS split_tag
+      ) st
+      WHERE p.Id = cr.PostId AND p.Tags IS NOT NULL
+    ) t
+    JOIN TopTags tt ON tt.TagName = t.TagName
+    WHERE tt.TagCount > 0
+  ) AS TagSnapshot,
+  (
+    SELECT tw.Weight
+    FROM (
+      SELECT TRIM(st.split_tag) AS TagName
+      FROM Posts p
+      CROSS JOIN LATERAL (
+        SELECT regexp_split_to_table(substr(p.Tags, 2, length(p.Tags) - 2), '><') AS split_tag
+      ) st
+      WHERE p.Id = cr.PostId AND p.Tags IS NOT NULL
+    ) t
+    JOIN TagWeights tw ON tw.TagName = t.TagName
+    LIMIT 1
+  ) AS SampleTagWeight
+FROM CorrelatedQueries cr
+GROUP BY
+  cr.PostId,
+  cr.Title,
+  cr.CreationDate,
+  cr.ViewCount,
+  cr.Score,
+  cr.OwnerUserId,
+  cr.Tags,
+  cr.LastActivityDate,
+  cr.InitEdits,
+  cr.Upvotes,
+  cr.Downvotes,
+  cr.LastEditDate
+ORDER BY Score DESC, ViewCount DESC
+LIMIT 100;

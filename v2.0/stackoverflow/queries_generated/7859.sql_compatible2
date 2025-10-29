@@ -1,0 +1,335 @@
+WITH UserActivity AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) as TotalQuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) as TotalAnswerScore,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        MAX(b.Date) as LastBadgeDate,
+        AVG(CAST(p.Score AS DOUBLE PRECISION)) as AvgPostScore,
+        STRING_AGG(DISTINCT p.Tags, ', ') as AllTags,
+        STRING_AGG(DISTINCT (COALESCE(u.Location, '') || ' - ' || COALESCE(u.WebsiteUrl, '')), ' | ') as UserInfo
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000 
+        AND (p.CreationDate IS NULL OR p.CreationDate > DATE '2020-01-01')
+        AND u.CreationDate > DATE '2019-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.Location, u.WebsiteUrl
+),
+RankedUsers AS (
+    SELECT 
+        ua.*,
+        ROW_NUMBER() OVER (ORDER BY ua.Reputation DESC, ua.PostCount DESC) as UserRank,
+        DENSE_RANK() OVER (ORDER BY ua.TotalQuestionScore DESC) as QScoreRank,
+        RANK() OVER (ORDER BY ua.BadgeCount DESC) as BadgeRank,
+        NTILE(10) OVER (ORDER BY ua.Views DESC) as ViewDecile,
+        CASE 
+            WHEN SUM(ua.PostCount) OVER (ORDER BY ua.Reputation DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) > 1000000 THEN 'Elite'
+            WHEN SUM(ua.PostCount) OVER (ORDER BY ua.Reputation DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) > 500000 THEN 'Veteran'
+            WHEN SUM(ua.PostCount) OVER (ORDER BY ua.Reputation DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) > 100000 THEN 'Regular'
+            ELSE 'Newbie'
+        END as UserCategory,
+        AVG(ua.Reputation) OVER (PARTITION BY SUBSTRING(ua.DisplayName FROM 1 FOR 1)) as AvgReputationByInitial
+    FROM UserActivity ua
+),
+CommunityPosts AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.OwnerDisplayName,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        ps.Name as PostTypeName,
+        COALESCE(
+            (SELECT COUNT(*) 
+             FROM Votes v 
+             WHERE v.PostId = p.Id 
+               AND v.VoteTypeId IN (1, 2, 3)
+            ), 0) as VoteCount,
+        COALESCE(
+            (SELECT COUNT(*) 
+             FROM Comments c 
+             WHERE c.PostId = p.Id
+            ), 0) as CommentCount2,
+        (SELECT COUNT(*) 
+         FROM PostLinks pl 
+         WHERE pl.PostId = p.Id 
+           AND pl.LinkTypeId = 3
+        ) as DuplicateCount,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community'
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as PostStatus,
+        (SELECT STRING_AGG(b.Name, ', ')
+         FROM Badges b
+         WHERE b.UserId = p.OwnerUserId
+           AND b.Date > p.CreationDate
+           AND b.Date < p.LastActivityDate
+        ) as RecentBadges,
+        (SELECT COUNT(*) 
+         FROM Posts p2 
+         WHERE p2.ParentId = p.Id
+           AND p2.PostTypeId = 2
+           AND p2.CreationDate > p.CreationDate
+        ) as NewerAnswersCount
+    FROM Posts p
+    LEFT JOIN PostTypes ps ON p.PostTypeId = ps.Id
+    WHERE p.PostTypeId IN (1, 2)
+      AND p.CreationDate > DATE '2021-01-01'
+      AND p.Score >= 0
+      AND p.ViewCount >= 100
+),
+ComplexAnalytics AS (
+    SELECT 
+        cu.UserId,
+        cu.DisplayName,
+        cu.Reputation,
+        cu.PostCount,
+        cu.QuestionCount,
+        cu.AnswerCount,
+        cu.TotalQuestionScore,
+        cu.TotalAnswerScore,
+        cu.ViewDecile,
+        cu.UserCategory,
+        cu.AvgReputationByInitial,
+        CASE 
+            WHEN cu.PostCount > 500 AND cu.TotalQuestionScore > 10000 THEN 'Highly Active'
+            WHEN cu.PostCount > 100 AND cu.TotalQuestionScore > 5000 THEN 'Active'
+            WHEN cu.PostCount > 20 AND cu.TotalQuestionScore > 1000 THEN 'Moderate'
+            ELSE 'Low Activity'
+        END as ActivityLevel,
+        COUNT(DISTINCT CASE 
+            WHEN cp.PostStatus IN ('Closed','Community') THEN cp.PostId 
+            ELSE NULL 
+        END) as SpecialPostCount,
+        SUM(CASE 
+            WHEN cp.PostStatus IN ('Closed','Community') THEN 1 
+            ELSE 0 
+        END) as CommunityOrClosedCount,
+        AVG(CASE 
+            WHEN cp.PostStatus = 'Question' AND cp.Score > 10 THEN cp.Score 
+            ELSE NULL 
+        END) as HighScoreQuestionAvg,
+        MAX(CASE 
+            WHEN cp.PostStatus = 'Answer' AND cp.Score > 50 THEN cp.Score 
+            ELSE 0 
+        END) as MaxAnswerScore,
+        COUNT(DISTINCT CASE 
+            WHEN cp.NewerAnswersCount > 5 THEN cp.PostId 
+            ELSE NULL 
+        END) as PostsWithManyAnswers,
+        STRING_AGG(DISTINCT cp.Tags, ', ') as AllTagsInPosts,
+        STRING_AGG(DISTINCT 
+            CASE 
+                WHEN cp.PostStatus = 'Question' AND cp.Score > 10 THEN cp.Title 
+                ELSE NULL 
+            END, ' | ') as HighScoreQuestions,
+        CASE 
+            WHEN COUNT(DISTINCT CASE WHEN cp.PostStatus = 'Question' THEN cp.PostId END) > 0 
+                 AND AVG(CASE WHEN cp.PostStatus = 'Question' THEN cp.Score ELSE NULL END) > 20 
+            THEN 'Expert Level'
+            WHEN COUNT(DISTINCT CASE WHEN cp.PostStatus = 'Question' THEN cp.PostId END) > 0 
+                 AND AVG(CASE WHEN cp.PostStatus = 'Question' THEN cp.Score ELSE NULL END) > 5 
+            THEN 'Intermediate Level'
+            ELSE 'Beginner Level'
+        END as ExpertiseLevel,
+        (SELECT COUNT(*) 
+         FROM Posts p3 
+         WHERE p3.OwnerUserId = cu.UserId
+           AND p3.PostTypeId = 1
+           AND p3.CreationDate > DATE '2021-01-01'
+           AND p3.Score > 50
+        ) as HighScoreQuestionsCount,
+        (SELECT COUNT(*) 
+         FROM Posts p4 
+         WHERE p4.OwnerUserId = cu.UserId
+           AND p4.PostTypeId = 2
+           AND p4.Score > 20
+           AND p4.CreationDate > DATE '2021-01-01'
+        ) as HighScoreAnswersCount,
+        MAX(cu.LastPostDate) as MaxLastPostDate,
+        MIN(cu.LastCommentDate) as MinLastCommentDate,
+        COUNT(DISTINCT cu.LastBadgeDate) as DistinctLastBadgeDates,
+        (SELECT STRING_AGG(DISTINCT b.Name, ', ')
+         FROM Badges b 
+         WHERE b.UserId = cu.UserId
+           AND b.Class = 1
+        ) as GoldBadgesList,
+        (SELECT COUNT(*) 
+         FROM Badges b 
+         WHERE b.UserId = cu.UserId 
+           AND b.Class = 1
+        ) as TotalGoldBadges
+    FROM RankedUsers cu
+    LEFT JOIN CommunityPosts cp ON cu.UserId = cp.OwnerUserId
+    WHERE cu.UserRank <= 1000
+    GROUP BY cu.UserId, cu.DisplayName, cu.Reputation, cu.PostCount, cu.QuestionCount, 
+             cu.AnswerCount, cu.TotalQuestionScore, cu.TotalAnswerScore, cu.ViewDecile,
+             cu.UserCategory, cu.AvgReputationByInitial, cu.LastPostDate, cu.LastCommentDate, cu.LastBadgeDate
+),
+FinalAnalytics AS (
+    SELECT 
+        ca.*,
+        ROW_NUMBER() OVER (ORDER BY ca.TotalGoldBadges DESC, ca.TotalQuestionScore DESC) as FinalRank,
+        (ca.Reputation - AVG(ca.Reputation) OVER()) / NULLIF(STDDEV_POP(ca.Reputation) OVER(), 0) as ReputationZScore,
+        (ca.PostCount - AVG(ca.PostCount) OVER()) / NULLIF(STDDEV_POP(ca.PostCount) OVER(), 0) as PostCountZScore,
+        (ca.TotalQuestionScore - AVG(ca.TotalQuestionScore) OVER()) / NULLIF(STDDEV_POP(ca.TotalQuestionScore) OVER(), 0) as QScoreZScore,
+        CASE 
+            WHEN (ca.TotalGoldBadges + ca.BadgeCount) > 100 THEN 'Elite Contributor'
+            WHEN (ca.TotalGoldBadges + ca.BadgeCount) > 50 THEN 'Veteran Contributor'
+            WHEN (ca.TotalGoldBadges + ca.BadgeCount) > 10 THEN 'Regular Contributor'
+            ELSE 'New Contributor'
+        END as ContributorStatus,
+        (SELECT COUNT(*) 
+         FROM UserActivity ua 
+         WHERE ua.Reputation > ca.Reputation
+        ) as ReputationRank,
+        CAST( 
+            (ca.PostCount::DOUBLE PRECISION / NULLIF(
+                EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - TIMESTAMP '2019-01-01')), 
+                0
+             ) * 365 * 24 * 60 * 60) 
+        AS DOUBLE PRECISION) as ActivityRatePerYear,
+        CASE 
+            WHEN ca.AvgPostScore > 10 THEN 'High Scoring'
+            WHEN ca.AvgPostScore > 5 THEN 'Medium Scoring'
+            WHEN ca.AvgPostScore > 1 THEN 'Low Scoring'
+            ELSE 'Very Low Scoring'
+        END as ScoringLevel,
+        (SELECT AVG(f.TotalQuestionScore) 
+         FROM ComplexAnalytics f
+         WHERE f.ActivityLevel = 'Highly Active'
+        ) - ca.TotalQuestionScore as QuestionScoreDeviationFromActiveAvg,
+        CASE 
+            WHEN (ca.PostCount > 0 AND ca.TotalAnswerScore > 0) 
+                 AND ((ca.TotalAnswerScore * 1.0 / NULLIF(ca.PostCount, 0)) > 2) 
+            THEN 'Answer Heavy'
+            WHEN (ca.PostCount > 0 AND ca.TotalQuestionScore > 0) 
+                 AND ((ca.TotalQuestionScore * 1.0 / NULLIF(ca.PostCount, 0)) > 10) 
+            THEN 'Question Heavy'
+            ELSE 'Balanced'
+        END as ContributionFocus,
+        (SELECT STRING_AGG(TagName, ', ') 
+         FROM Tags 
+         WHERE TagName IN (
+             SELECT UNNEST(STRING_TO_ARRAY(ca.AllTagsInPosts, ', '))
+         )
+         FETCH FIRST 5 ROWS ONLY
+        ) as TopTags,
+        (SELECT COUNT(*) 
+         FROM (
+            SELECT 1 
+            FROM Tags t 
+            WHERE t.TagName IN (
+                SELECT UNNEST(STRING_TO_ARRAY(ca.AllTagsInPosts, ', '))
+            )
+            GROUP BY t.TagName
+            HAVING COUNT(*) > 1
+         ) subq
+        ) as OverlappingTagCount
+    FROM ComplexAnalytics ca
+),
+AggregatedResults AS (
+    SELECT 
+        'User Stats' as MetricGroup,
+        COUNT(*) as TotalUsers,
+        AVG(Reputation) as AvgReputation,
+        AVG(PostCount) as AvgPostCount,
+        AVG(TotalQuestionScore) as AvgQuestionScore,
+        MAX(Reputation) as MaxReputation,
+        MIN(Reputation) as MinReputation,
+        SUM(PostCount) as TotalPosts,
+        STRING_AGG(DISTINCT UserCategory, ', ') as UserCategories,
+        STRING_AGG(DISTINCT ExpertiseLevel, ', ') as ExpertiseLevels,
+        STRING_AGG(DISTINCT ActivityLevel, ', ') as ActivityLevels
+    FROM FinalAnalytics
+    UNION ALL
+    SELECT 
+        'Post Analysis' as MetricGroup,
+        NULL as TotalUsers,
+        NULL as AvgReputation,
+        NULL as AvgPostCount,
+        NULL as AvgQuestionScore,
+        NULL as MaxReputation,
+        NULL as MinReputation,
+        SUM(PostCount) as TotalPosts,
+        NULL as UserCategories,
+        NULL as ExpertiseLevels,
+        NULL as ActivityLevels
+    FROM FinalAnalytics
+    UNION ALL
+    SELECT 
+        'Community Health' as MetricGroup,
+        NULL as TotalUsers,
+        AVG(Reputation) as AvgReputation,
+        NULL as AvgPostCount,
+        AVG(TotalQuestionScore) as AvgQuestionScore,
+        MAX(Reputation) as MaxReputation,
+        MIN(Reputation) as MinReputation,
+        NULL as TotalPosts,
+        STRING_AGG(DISTINCT ContributorStatus, ', ') as UserCategories,
+        NULL as ExpertiseLevels,
+        NULL as ActivityLevels
+    FROM FinalAnalytics
+)
+SELECT 
+    MetricGroup,
+    TotalUsers,
+    AvgReputation,
+    AvgPostCount,
+    AvgQuestionScore,
+    MaxReputation,
+    MinReputation,
+    TotalPosts,
+    UserCategories,
+    ExpertiseLevels,
+    ActivityLevels,
+    (SELECT COUNT(*) FROM FinalAnalytics WHERE FinalRank <= 50) as Top50Count,
+    (SELECT AVG(Reputation) FROM FinalAnalytics WHERE FinalRank <= 50) as Top50AvgReputation,
+    (SELECT COUNT(*) FROM FinalAnalytics WHERE AvgPostScore > 10) as HighScoringUsers,
+    CASE 
+        WHEN AVG(CAST(TotalPosts AS DOUBLE PRECISION)) > 1000 THEN 'High Engagement'
+        WHEN AVG(CAST(TotalPosts AS DOUBLE PRECISION)) > 500 THEN 'Medium Engagement'
+        ELSE 'Low Engagement'
+    END as EngagementLevel,
+    (SELECT COUNT(*) FROM FinalAnalytics WHERE PostCount > 1000) as HighPostCountUsers,
+    (SELECT COUNT(*) FROM FinalAnalytics WHERE Reputation > 100000) as EliteUsers,
+    (SELECT AVG(Reputation) FROM FinalAnalytics WHERE UserCategory = 'Elite') as EliteAvgReputation,
+    (SELECT COUNT(*) FROM FinalAnalytics WHERE ActivityLevel = 'Highly Active') as HighlyActiveUsers,
+    (SELECT COUNT(*) FROM FinalAnalytics WHERE ExpertiseLevel IN ('Expert Level', 'Intermediate Level')) as ExperiencedUsers,
+    (SELECT STRING_AGG(DISTINCT UserCategory, ', ') FROM FinalAnalytics WHERE UserCategory LIKE '%Veteran%') as VeteranUserCategories,
+    (SELECT STRING_AGG(DISTINCT UserCategory, ', ') FROM FinalAnalytics WHERE UserCategory LIKE '%Regular%') as RegularUserCategories
+FROM AggregatedResults
+GROUP BY MetricGroup, TotalUsers, AvgReputation, AvgPostCount, AvgQuestionScore, MaxReputation, MinReputation, TotalPosts, UserCategories, ExpertiseLevels, ActivityLevels
+HAVING COUNT(*) > 0
+ORDER BY 
+    CASE MetricGroup 
+        WHEN 'User Stats' THEN 1
+        WHEN 'Post Analysis' THEN 2
+        WHEN 'Community Health' THEN 3
+        ELSE 4
+    END,
+    TotalPosts DESC NULLS LAST
+LIMIT 1000;

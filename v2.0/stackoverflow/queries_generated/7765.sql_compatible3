@@ -1,0 +1,257 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        MAX(p.CreationDate) as LastPostDate,
+        ROW_NUMBER() OVER (ORDER BY COALESCE(SUM(p.Score), 0) DESC) as RankByScore,
+        RANK() OVER (ORDER BY u.Reputation DESC) as RankByReputation
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.Reputation, u.DisplayName
+),
+TopTags AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        STRING_AGG(DISTINCT u.DisplayName, ', ') as TopUsers,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as TagRank
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE t.Count > 1000 AND t.TagName IS NOT NULL
+    GROUP BY t.TagName, t.Count
+),
+QuestionStats AS (
+    SELECT 
+        p.Id as QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        CAST('2024-10-01 12:34:56' AS timestamp) - p.CreationDate AS AgeInterval,
+        EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS timestamp) - p.CreationDate)) 
+            + EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - p.CreationDate))/86400 - 
+              FLOOR(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - p.CreationDate))/86400) AS AgeFraction, 
+        FLOOR(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - p.CreationDate))/86400) AS AgeInDays,
+        CASE 
+            WHEN p.AnswerCount = 0 THEN 'No Answers'
+            WHEN p.AnswerCount = 1 THEN 'One Answer'
+            WHEN p.AnswerCount > 1 AND p.AnswerCount <= 5 THEN 'Few Answers'
+            ELSE 'Many Answers'
+        END as AnswerCategory,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        p.LastActivityDate,
+        COALESCE(p.AcceptedAnswerId, 0) as HasAcceptedAnswer,
+        FLOOR(EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate))/86400) as DaysToLastActivity,
+        CASE 
+            WHEN p.ViewCount > 1000 THEN 'High Traffic'
+            WHEN p.ViewCount > 100 THEN 'Medium Traffic'
+            WHEN p.ViewCount > 0 THEN 'Low Traffic'
+            ELSE 'No Views'
+        END as TrafficLevel
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+),
+UserPostHistory AS (
+    SELECT 
+        ph.UserId,
+        COUNT(*) as TotalEdits,
+        COUNT(DISTINCT ph.PostId) as PostsEdited,
+        STRING_AGG(DISTINCT CAST(ph.PostHistoryTypeId AS VARCHAR), ', ') as EditTypes,
+        MAX(ph.CreationDate) as LastEditDate,
+        MIN(ph.CreationDate) as FirstEditDate,
+        ROUND(CAST(AVG(
+            FLOOR(EXTRACT(EPOCH FROM (ph.CreationDate - ph.CreationDate))/86400)
+        ) AS numeric), 2) as AvgEditInterval
+    FROM PostHistory ph
+    WHERE ph.UserId IS NOT NULL
+    GROUP BY ph.UserId
+),
+UserPostHistory_fixed AS (
+    SELECT
+        uph.UserId,
+        uph.TotalEdits,
+        uph.PostsEdited,
+        uph.EditTypes,
+        uph.LastEditDate,
+        uph.FirstEditDate,
+        ROUND(CAST( uph.AvgEditInterval AS numeric ), 2) AS AvgEditInterval
+    FROM (
+        SELECT 
+            ph.UserId,
+            COUNT(*) as TotalEdits,
+            COUNT(DISTINCT ph.PostId) as PostsEdited,
+            STRING_AGG(DISTINCT CAST(ph.PostHistoryTypeId AS VARCHAR), ', ') as EditTypes,
+            MAX(ph.CreationDate) as LastEditDate,
+            MIN(ph.CreationDate) as FirstEditDate,
+            AVG(
+                FLOOR(EXTRACT(EPOCH FROM (ph.CreationDate - ph.CreationDate))/86400)
+            ) as AvgEditInterval
+        FROM PostHistory ph
+        WHERE ph.UserId IS NOT NULL
+        GROUP BY ph.UserId
+    ) uph
+),
+ComplexQuestionAnalysis AS (
+    SELECT 
+        qs.QuestionId,
+        qs.Title,
+        qs.Score,
+        qs.ViewCount,
+        qs.AnswerCount,
+        qs.CommentCount,
+        qs.OwnerName,
+        qs.DaysToLastActivity,
+        qs.TrafficLevel,
+        CASE 
+            WHEN qs.Score > 50 AND qs.AnswerCount >= 3 THEN 'High Engagement'
+            WHEN qs.Score > 20 AND qs.AnswerCount >= 1 THEN 'Moderate Engagement'
+            WHEN qs.ViewCount > 1000 AND qs.Score > 0 THEN 'Popular'
+            ELSE 'Standard'
+        END as EngagementLevel,
+        CASE 
+            WHEN qs.AnswerCount = 0 AND qs.Score < 10 THEN 'Unanswered Low Score'
+            WHEN qs.AnswerCount = 0 AND qs.Score >= 10 THEN 'Unanswered High Score'
+            WHEN qs.AnswerCount >= 1 AND qs.Score < 0 THEN 'Answered Negative Score'
+            ELSE 'Normal'
+        END as QuestionStatus,
+        COALESCE(ROUND( CAST(qs.Score AS numeric) / NULLIF(qs.AnswerCount + 1, 0), 2), 0) as ScorePerAnswer,
+        ROW_NUMBER() OVER (ORDER BY qs.Score DESC) as ScoreRank,
+        ROW_NUMBER() OVER (ORDER BY qs.ViewCount DESC) as ViewRank,
+        ROW_NUMBER() OVER (ORDER BY qs.AnswerCount DESC) as AnswerRank
+    FROM QuestionStats qs
+),
+CombinedAnalysis AS (
+    SELECT 
+        uas.UserId,
+        uas.Reputation,
+        uas.DisplayName,
+        uas.TotalPosts,
+        uas.QuestionCount,
+        uas.AnswerCount,
+        uas.TotalScore,
+        uas.LastPostDate,
+        uas.RankByScore,
+        uas.RankByReputation,
+        COALESCE(uph.TotalEdits, 0) as TotalEdits,
+        COALESCE(uph.PostsEdited, 0) as PostsEdited,
+        COALESCE(uph.LastEditDate, TIMESTAMP '1900-01-01') as LastEditDate,
+        CASE 
+            WHEN uas.TotalPosts > 100 THEN 'Heavy Poster'
+            WHEN uas.TotalPosts > 50 THEN 'Medium Poster'
+            WHEN uas.TotalPosts > 10 THEN 'Light Poster'
+            ELSE 'New Poster'
+        END as PostingActivityLevel,
+        CASE 
+            WHEN uas.TotalScore > 10000 THEN 'Veteran'
+            WHEN uas.TotalScore > 1000 THEN 'Experienced'
+            WHEN uas.TotalScore > 100 THEN 'Beginner'
+            ELSE 'Newbie'
+        END as ExperienceLevel,
+        CASE 
+            WHEN uas.Reputation > 10000 THEN 'High Rep User'
+            WHEN uas.Reputation > 1000 THEN 'Medium Rep User'
+            WHEN uas.Reputation > 100 THEN 'Low Rep User'
+            ELSE 'New User'
+        END as ReputationLevel
+    FROM UserActivityStats uas
+    LEFT JOIN UserPostHistory_fixed uph ON uas.UserId = uph.UserId
+)
+SELECT 
+    ca.UserId,
+    ca.Reputation,
+    ca.DisplayName,
+    ca.TotalPosts,
+    ca.QuestionCount,
+    ca.AnswerCount,
+    ca.TotalScore,
+    ca.LastPostDate,
+    ca.RankByScore,
+    ca.RankByReputation,
+    ca.TotalEdits,
+    ca.PostsEdited,
+    ca.LastEditDate,
+    ca.PostingActivityLevel,
+    ca.ExperienceLevel,
+    ca.ReputationLevel,
+    CASE 
+        WHEN ca.TotalEdits > 0 THEN ROUND( CAST(ca.TotalEdits AS numeric) / NULLIF(ca.TotalPosts, 0), 2)
+        ELSE 0
+    END as EditsPerPost,
+    CASE 
+        WHEN ca.QuestionCount > 0 THEN ROUND( CAST(ca.QuestionCount AS numeric) / NULLIF(ca.TotalPosts, 0), 2)
+        ELSE 0
+    END as QuestionsPercentage,
+    CASE 
+        WHEN ca.AnswerCount > 0 THEN ROUND( CAST(ca.AnswerCount AS numeric) / NULLIF(ca.QuestionCount, 0), 2)
+        ELSE 0
+    END as AnswersPerQuestion,
+    (
+        SELECT STRING_AGG(t.TagName, ', ')
+        FROM Tags t
+        JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+        WHERE p.OwnerUserId = ca.UserId
+        GROUP BY ca.UserId
+        HAVING COUNT(*) > 0
+        ORDER BY COUNT(*) DESC
+        LIMIT 5
+    ) as TopTagInterests,
+    (
+        SELECT COUNT(*)
+        FROM Posts p
+        WHERE p.OwnerUserId = ca.UserId AND p.PostTypeId = 1 AND p.Score > 100
+    ) as HighScoreQuestions,
+    (
+        SELECT COUNT(*)
+        FROM Posts p
+        WHERE p.OwnerUserId = ca.UserId AND p.PostTypeId = 2 AND p.Score > 50
+    ) as HighScoreAnswers,
+    (
+        SELECT STRING_AGG(DISTINCT ph.EditTypes, ', ')
+        FROM UserPostHistory_fixed ph
+        WHERE ph.UserId = ca.UserId AND ph.EditTypes IS NOT NULL
+        ORDER BY ph.LastEditDate DESC
+        LIMIT 1
+    ) as RecentEditTypes,
+    COALESCE(
+        (SELECT COUNT(DISTINCT p.Id)
+         FROM Posts p
+         INNER JOIN PostLinks pl ON p.Id = pl.PostId
+         WHERE p.OwnerUserId = ca.UserId AND pl.LinkTypeId = 3),
+        0
+    ) as DuplicatePosts,
+    NULLIF(
+        (SELECT AVG(FLOOR(EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate))/86400))
+         FROM Posts p
+         WHERE p.OwnerUserId = ca.UserId),
+        0
+    ) as AvgDaysToActivity,
+    CASE WHEN ca.TotalScore > 5000 THEN 'Top Contributor' ELSE 'Regular Contributor' END as ContributionLevel,
+    CASE WHEN ca.TotalEdits > 10 THEN 'Active Editor' ELSE 'Passive Editor' END as EditingStatus,
+    ROUND(COALESCE( CAST(ca.TotalScore AS numeric) / NULLIF(ca.TotalPosts, 0), 0), 2) as AvgScorePerPost,
+    COALESCE(
+        (SELECT COUNT(DISTINCT v.PostId)
+         FROM Votes v
+         WHERE v.UserId = ca.UserId AND v.VoteTypeId IN (2, 3)),
+        0
+    ) as VoteCount,
+    COALESCE(
+        (SELECT COUNT(DISTINCT b.Id)
+         FROM Badges b
+         WHERE b.UserId = ca.UserId),
+        0
+    ) as BadgeCount
+FROM CombinedAnalysis ca
+WHERE ca.Reputation > 100
+ORDER BY ca.TotalScore DESC, ca.Reputation DESC
+LIMIT 1000;

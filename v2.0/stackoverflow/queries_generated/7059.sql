@@ -1,0 +1,322 @@
+-- {"query": "7059.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2995} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) = 0 THEN 'No Posts'
+            WHEN COUNT(DISTINCT p.Id) > 100 THEN 'Active User'
+            WHEN COUNT(DISTINCT p.Id) > 50 THEN 'Regular User'
+            WHEN COUNT(DISTINCT p.Id) > 10 THEN 'Occasional User'
+            ELSE 'New User'
+        END as UserActivityLevel,
+        AVG(CAST(p.Score AS FLOAT)) as AvgPostScore,
+        SUM(p.ViewCount) as TotalViews,
+        SUM(p.AnswerCount) as TotalAnswers,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), ', ') as AllTags,
+        COALESCE(SUM(p.Score), 0) + COALESCE(SUM(p.ViewCount), 0) + COALESCE(SUM(p.AnswerCount), 0) as CompositeScore,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        RANK() OVER (ORDER BY (COALESCE(SUM(p.Score), 0) + COALESCE(SUM(p.ViewCount), 0) + COALESCE(SUM(p.AnswerCount), 0)) DESC) as UserRank,
+        PERCENT_RANK() OVER (ORDER BY (COALESCE(SUM(p.Score), 0) + COALESCE(SUM(p.ViewCount), 0) + COALESCE(SUM(p.AnswerCount), 0))) as UserPercentile,
+        ROW_NUMBER() OVER (PARTITION BY u.AccountId ORDER BY u.CreationDate) as AccountUserSequence
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.AccountId
+),
+TopPosts AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        p.ParentId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as PostType,
+        LEAD(p.CreationDate, 1) OVER (ORDER BY p.CreationDate) as NextPostDate,
+        LAG(p.CreationDate, 1) OVER (ORDER BY p.CreationDate) as PreviousPostDate,
+        DATEDIFF('SECOND', LAG(p.CreationDate, 1) OVER (ORDER BY p.CreationDate), p.CreationDate) as PostIntervalSeconds,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as UserPostSequence,
+        CASE 
+            WHEN p.Score > 100 THEN 'Highly Upvoted'
+            WHEN p.Score > 50 THEN 'Moderately Upvoted'
+            WHEN p.Score > 10 THEN 'Low Upvoted'
+            ELSE 'Not Popular'
+        END as ScoreCategory
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+PostAnalysis AS (
+    SELECT 
+        tp.PostId,
+        tp.Title,
+        tp.Score,
+        tp.ViewCount,
+        tp.AnswerCount,
+        tp.CommentCount,
+        tp.CreationDate,
+        tp.OwnerUserId,
+        tp.PostType,
+        tp.ScoreCategory,
+        tp.PostIntervalSeconds,
+        ua.UserActivityLevel,
+        ua.Reputation,
+        ua.DisplayName,
+        ABS(tp.Score - AVG(tp.Score) OVER()) as ScoreDeviation,
+        NTILE(4) OVER (ORDER BY tp.Score) as Quartile,
+        CASE 
+            WHEN tp.AnswerCount > 0 THEN 'Has Answers'
+            ELSE 'No Answers'
+        END as AnswerStatus,
+        CASE 
+            WHEN tp.CommentCount > 0 THEN 'Has Comments'
+            ELSE 'No Comments'
+        END as CommentStatus,
+        CAST(SUBSTRING(tp.Tags, 2, LENGTH(tp.Tags)-2) AS VARCHAR(4000)) as CleanTags,
+        LENGTH(SUBSTRING(tp.Tags, 2, LENGTH(tp.Tags)-2)) as TagLength,
+        COALESCE(tp.AnswerCount, 0) + COALESCE(tp.CommentCount, 0) as InteractionCount,
+        CASE 
+            WHEN tp.PostIntervalSeconds IS NOT NULL AND tp.PostIntervalSeconds < 3600 THEN 'Frequent Poster'
+            WHEN tp.PostIntervalSeconds IS NOT NULL AND tp.PostIntervalSeconds < 86400 THEN 'Daily Poster'
+            ELSE 'Infrequent Poster'
+        END as PostingFrequency,
+        ROW_NUMBER() OVER (ORDER BY tp.Score DESC) as GlobalRank,
+        DENSE_RANK() OVER (PARTITION BY tp.OwnerUserId ORDER BY tp.Score DESC) as OwnerScoreRank
+    FROM TopPosts tp
+    JOIN UserActivityStats ua ON tp.OwnerUserId = ua.UserId
+    WHERE tp.Title IS NOT NULL
+),
+ComplexAggregations AS (
+    SELECT 
+        pa.PostId,
+        pa.Title,
+        pa.Score,
+        pa.ViewCount,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.CreationDate,
+        pa.OwnerUserId,
+        pa.PostType,
+        pa.ScoreCategory,
+        pa.UserActivityLevel,
+        pa.Reputation,
+        pa.DisplayName,
+        pa.ScoreDeviation,
+        pa.Quartile,
+        pa.AnswerStatus,
+        pa.CommentStatus,
+        pa.CleanTags,
+        pa.TagLength,
+        pa.InteractionCount,
+        pa.PostingFrequency,
+        pa.GlobalRank,
+        pa.OwnerScoreRank,
+        LAG(pa.Score, 1) OVER (PARTITION BY pa.OwnerUserId ORDER BY pa.CreationDate) as PreviousScore,
+        LEAD(pa.Score, 1) OVER (PARTITION BY pa.OwnerUserId ORDER BY pa.CreationDate) as NextScore,
+        COALESCE(
+            LAG(pa.Score, 1) OVER (PARTITION BY pa.OwnerUserId ORDER BY pa.CreationDate),
+            0
+        ) + COALESCE(
+            LEAD(pa.Score, 1) OVER (PARTITION BY pa.OwnerUserId ORDER BY pa.CreationDate),
+            0
+        ) as AdjacentScores,
+        CASE 
+            WHEN pa.Score > (
+                SELECT AVG(Score) 
+                FROM Posts p2 
+                WHERE p2.PostTypeId = 1 
+                AND p2.OwnerUserId = pa.OwnerUserId
+            ) 
+            THEN 'Above Average'
+            ELSE 'Below Average'
+        END as ScoreComparison,
+        CASE 
+            WHEN pa.PostIntervalSeconds IS NOT NULL 
+            AND pa.PostIntervalSeconds > (
+                SELECT AVG(p3.PostIntervalSeconds) 
+                FROM TopPosts p3 
+                WHERE p3.OwnerUserId = pa.OwnerUserId
+            ) 
+            THEN 'Slower Than Average'
+            ELSE 'Faster Than Average'
+        END as PostingSpeed,
+        CASE 
+            WHEN pa.CleanTags LIKE '%sql%' OR pa.CleanTags LIKE '%database%' OR pa.CleanTags LIKE '%postgresql%' 
+            THEN 'Technical'
+            WHEN pa.CleanTags LIKE '%python%' OR pa.CleanTags LIKE '%java%' OR pa.CleanTags LIKE '%javascript%' 
+            THEN 'Programming'
+            ELSE 'General'
+        END as TopicCategory
+    FROM PostAnalysis pa
+),
+FinalAnalysis AS (
+    SELECT 
+        ca.PostId,
+        ca.Title,
+        ca.Score,
+        ca.ViewCount,
+        ca.AnswerCount,
+        ca.CommentCount,
+        ca.CreationDate,
+        ca.OwnerUserId,
+        ca.PostType,
+        ca.ScoreCategory,
+        ca.UserActivityLevel,
+        ca.Reputation,
+        ca.DisplayName,
+        ca.ScoreDeviation,
+        ca.Quartile,
+        ca.AnswerStatus,
+        ca.CommentStatus,
+        ca.CleanTags,
+        ca.TagLength,
+        ca.InteractionCount,
+        ca.PostingFrequency,
+        ca.GlobalRank,
+        ca.OwnerScoreRank,
+        ca.PreviousScore,
+        ca.NextScore,
+        ca.AdjacentScores,
+        ca.ScoreComparison,
+        ca.PostingSpeed,
+        ca.TopicCategory,
+        DENSE_RANK() OVER (ORDER BY ca.ViewCount DESC) as ViewRank,
+        PERCENT_RANK() OVER (ORDER BY ca.Score DESC) as ScorePercentile,
+        NTH_VALUE(ca.Score, 1) OVER (ORDER BY ca.Score DESC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) as MaxScore,
+        NTH_VALUE(ca.Score, 1) OVER (ORDER BY ca.Score ASC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) as MinScore,
+        AVG(ca.Score) OVER (ORDER BY ca.CreationDate ROWS BETWEEN 10 PRECEDING AND CURRENT ROW) as MovingAvgScore,
+        CASE 
+            WHEN ca.OwnerUserId = (
+                SELECT TOP 1 Id 
+                FROM Users 
+                WHERE AccountId = (SELECT AccountId FROM Users WHERE Id = ca.OwnerUserId)
+                ORDER BY CreationDate
+            ) THEN 'Primary Account User'
+            ELSE 'Secondary Account User'
+        END as AccountType,
+        COALESCE(
+            (SELECT COUNT(*) FROM Posts p4 WHERE p4.OwnerUserId = ca.OwnerUserId AND p4.PostTypeId = 1),
+            0
+        ) as QuestionCountByUser,
+        COALESCE(
+            (SELECT COUNT(*) FROM Posts p5 WHERE p5.OwnerUserId = ca.OwnerUserId AND p5.PostTypeId = 2),
+            0
+        ) as AnswerCountByUser,
+        CONCAT(
+            'User_', ca.OwnerUserId, '_Post_', ca.PostId, '_', 
+            CASE WHEN ca.Score > 50 THEN 'HighScore' ELSE 'LowScore' END
+        ) as PostIdentifier,
+        DATEPART(YEAR, ca.CreationDate) as PostYear,
+        DATEPART(MONTH, ca.CreationDate) as PostMonth,
+        CASE 
+            WHEN DAYOFWEEK(ca.CreationDate) IN (1, 7) THEN 'Weekend'
+            ELSE 'Weekday'
+        END as PostDayType,
+        CASE 
+            WHEN ca.CreationDate BETWEEN 
+                (SELECT DATEADD(MONTH, -3, MAX(CreationDate)) FROM Posts) 
+                AND MAX(CreationDate) OVER() 
+            THEN 'Recent'
+            ELSE 'Historical'
+        END as TimePeriod,
+        NULLIF(ca.AnswerCount, 0) / NULLIF(ca.ViewCount, 0) as AnswerToViewRatio,
+        NULLIF(CAST(ca.CommentCount AS FLOAT), 0) / NULLIF(CAST(ca.AnswerCount AS FLOAT), 0) as CommentToAnswerRatio,
+        CASE 
+            WHEN ca.Reputation > 10000 THEN 'Elite'
+            WHEN ca.Reputation > 5000 THEN 'Advanced'
+            WHEN ca.Reputation > 1000 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as ReputationLevel,
+        CASE 
+            WHEN ca.TagLength > 100 THEN 'Long Tags'
+            WHEN ca.TagLength > 50 THEN 'Medium Tags'
+            ELSE 'Short Tags'
+        END as TagLengthCategory
+    FROM ComplexAggregations ca
+)
+SELECT 
+    fa.PostId,
+    fa.Title,
+    fa.Score,
+    fa.ViewCount,
+    fa.AnswerCount,
+    fa.CommentCount,
+    fa.CreationDate,
+    fa.OwnerUserId,
+    fa.PostType,
+    fa.ScoreCategory,
+    fa.UserActivityLevel,
+    fa.Reputation,
+    fa.DisplayName,
+    fa.ScoreDeviation,
+    fa.Quartile,
+    fa.AnswerStatus,
+    fa.CommentStatus,
+    fa.CleanTags,
+    fa.TagLength,
+    fa.InteractionCount,
+    fa.PostingFrequency,
+    fa.GlobalRank,
+    fa.OwnerScoreRank,
+    fa.PreviousScore,
+    fa.NextScore,
+    fa.AdjacentScores,
+    fa.ScoreComparison,
+    fa.PostingSpeed,
+    fa.TopicCategory,
+    fa.ViewRank,
+    fa.ScorePercentile,
+    fa.MaxScore,
+    fa.MinScore,
+    fa.MovingAvgScore,
+    fa.AccountType,
+    fa.QuestionCountByUser,
+    fa.AnswerCountByUser,
+    fa.PostIdentifier,
+    fa.PostYear,
+    fa.PostMonth,
+    fa.PostDayType,
+    fa.TimePeriod,
+    fa.AnswerToViewRatio,
+    fa.CommentToAnswerRatio,
+    fa.ReputationLevel,
+    fa.TagLengthCategory,
+    CASE 
+        WHEN fa.ViewRank <= 50 AND fa.GlobalRank <= 50 THEN 'Top Performer'
+        WHEN fa.ViewRank <= 100 OR fa.GlobalRank <= 100 THEN 'High Performer'
+        WHEN fa.Score >= 50 THEN 'Good Performer'
+        ELSE 'Standard Performer'
+    END as PerformanceTier
+FROM FinalAnalysis fa
+WHERE fa.PostId IS NOT NULL
+  AND fa.Title IS NOT NULL
+  AND (fa.Score > 0 OR fa.ViewCount > 0 OR fa.AnswerCount > 0)
+  AND fa.ScoreCategory IS NOT NULL
+  AND fa.UserActivityLevel IS NOT NULL
+  AND fa.TopicCategory IS NOT NULL
+  AND (fa.Posts.CreationDate >= DATEADD(YEAR, -1, GETDATE()) OR fa.Posts.CreationDate IS NULL)
+  AND EXISTS (
+    SELECT 1 
+    FROM Users u 
+    WHERE u.Id = fa.OwnerUserId 
+    AND u.Reputation > 0
+  )
+ORDER BY fa.GlobalRank ASC, fa.Score DESC, fa.ViewCount DESC
+LIMIT 1000 SKIP 0;

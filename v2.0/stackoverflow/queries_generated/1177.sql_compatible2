@@ -1,0 +1,112 @@
+WITH UserPostStats AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(COALESCE(P.Score, 0)) AS TotalPostScore,
+        AVG(CASE WHEN P.PostTypeId IN (1, 2) AND P.Body IS NOT NULL THEN LENGTH(P.Body) END) AS AvgPostBodyLength,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        MAX(P.CreationDate) AS LatestPostCreationDate,
+        MIN(P.CreationDate) AS EarliestPostCreationDate,
+        MAX(P.LastActivityDate) AS LatestPostActivityDate,
+        MAX(C.CreationDate) AS LatestCommentDate
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate
+    HAVING COUNT(DISTINCT P.Id) > 5 AND U.Reputation > 500
+),
+PostHistoryMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.ClosedDate,
+        P.CommunityOwnedDate,
+        P.OwnerUserId,
+        COUNT(PH.Id) AS TotalHistoryEntries,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditCount,
+        COUNT(DISTINCT PH.UserId) AS UniqueEditors,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (10, 101) THEN PH.CreationDate END) AS LastClosedDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 11 THEN PH.CreationDate END) AS LastReopenedDate,
+        COALESCE(
+            (SELECT CR.Name FROM CloseReasonTypes CR WHERE CR.Id = CAST(PH.Comment AS INTEGER) LIMIT 1),
+            'Not Closed'
+        ) AS CurrentCloseReasonName,
+        (SELECT COUNT(DISTINCT V.UserId) FROM Votes V WHERE V.PostId = P.Id AND V.VoteTypeId = 5 AND V.UserId IS NOT NULL) AS DistinctFavoritorsCount,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (17, 35, 36) THEN 1 ELSE 0 END) AS IsMigratedPost,
+        MAX(PH.CreationDate) AS LatestHistoryDate,
+        MIN(PH.CreationDate) AS EarliestHistoryDate,
+        EXTRACT(EPOCH FROM (MAX(PH.CreationDate) - P.CreationDate)) AS SecondsSinceLastHistory
+    FROM Posts P
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    GROUP BY
+        P.Id, P.PostTypeId, P.CreationDate, P.Score, P.ViewCount, P.AnswerCount,
+        P.CommentCount, P.FavoriteCount, P.ClosedDate, P.CommunityOwnedDate, P.OwnerUserId, PH.Comment
+),
+UserPostAggregates AS (
+    SELECT
+        UPS.UserId,
+        UPS.DisplayName,
+        UPS.Reputation,
+        UPS.UserCreationDate,
+        UPS.LastAccessDate,
+        UPS.TotalPosts,
+        UPS.TotalQuestions,
+        UPS.TotalAnswers,
+        UPS.TotalPostScore,
+        UPS.AvgPostBodyLength,
+        UPS.TotalCommentsMade,
+        UPS.LatestPostCreationDate,
+        UPS.EarliestPostCreationDate,
+        UPS.LatestPostActivityDate,
+        UPS.LatestCommentDate,
+        COUNT(PHM.PostId) AS PostsConsidered,
+        SUM(COALESCE(PHM.EditCount, 0)) AS SumEditCount,
+        SUM(COALESCE(PHM.UniqueEditors, 0)) AS SumUniqueEditors,
+        SUM(COALESCE(PHM.DistinctFavoritorsCount, 0)) AS SumDistinctFavoritors,
+        SUM(CASE WHEN PHM.IsMigratedPost = 1 THEN 1 ELSE 0 END) AS MigratedPostCount,
+        AVG(COALESCE(PHM.SecondsSinceLastHistory, 0)) AS AvgSecondsSinceLastHistory
+    FROM UserPostStats UPS
+    LEFT JOIN Posts P ON UPS.UserId = P.OwnerUserId
+    LEFT JOIN PostHistoryMetrics PHM ON P.Id = PHM.PostId
+    GROUP BY
+        UPS.UserId, UPS.DisplayName, UPS.Reputation, UPS.UserCreationDate, UPS.LastAccessDate,
+        UPS.TotalPosts, UPS.TotalQuestions, UPS.TotalAnswers, UPS.TotalPostScore, UPS.AvgPostBodyLength,
+        UPS.TotalCommentsMade, UPS.LatestPostCreationDate, UPS.EarliestPostCreationDate,
+        UPS.LatestPostActivityDate, UPS.LatestCommentDate
+)
+SELECT
+    UPA.UserId,
+    UPA.DisplayName,
+    UPA.Reputation,
+    UPA.UserCreationDate,
+    UPA.LastAccessDate,
+    UPA.TotalPosts,
+    UPA.TotalQuestions,
+    UPA.TotalAnswers,
+    UPA.TotalPostScore,
+    UPA.AvgPostBodyLength,
+    UPA.TotalCommentsMade,
+    UPA.LatestPostCreationDate,
+    UPA.EarliestPostCreationDate,
+    UPA.LatestPostActivityDate,
+    UPA.LatestCommentDate,
+    UPA.PostsConsidered,
+    UPA.SumEditCount,
+    UPA.SumUniqueEditors,
+    UPA.SumDistinctFavoritors,
+    UPA.MigratedPostCount,
+    UPA.AvgSecondsSinceLastHistory
+FROM UserPostAggregates UPA
+ORDER BY UPA.SumDistinctFavoritors DESC, UPA.SumEditCount DESC;

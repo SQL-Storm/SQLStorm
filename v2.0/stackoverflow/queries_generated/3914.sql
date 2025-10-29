@@ -1,0 +1,117 @@
+-- {"query": "3914.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2460} 
+
+WITH TopUsers AS (
+    SELECT u.Id,
+           u.DisplayName,
+           SUM(COALESCE(p.Score,0))                              AS TotalScore,
+           COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1)  AS QuestionsAsked,
+           COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2)  AS AnswersGiven,
+           COUNT(b.Id) FILTER (WHERE b.Class = 1)                AS GoldBadges,
+           ROW_NUMBER() OVER (ORDER BY SUM(COALESCE(p.Score,0)) DESC) AS RankByScore
+    FROM Users u
+    LEFT JOIN Posts p   ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b  ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+    HAVING SUM(COALESCE(p.Score,0)) > 1000
+),
+RecentActiveTags AS (
+    SELECT t.Id,
+           t.TagName,
+           COUNT(p.Id)                                          AS RecentPostCount,
+           AVG(p.Score)                                         AS AvgScore,
+           STRING_AGG(DISTINCT LOWER(p.Title), ', ') 
+               FILTER (WHERE p.Title IS NOT NULL)               AS SampleTitles
+    FROM Tags t
+    JOIN Posts p ON p.Tags LIKE ('%<'||t.TagName||'>%')
+    WHERE p.CreationDate >= CURRENT_DATE - INTERVAL '30 days'
+      AND p.PostTypeId = 1
+    GROUP BY t.Id, t.TagName
+),
+QuestionAnswerStats AS (
+    SELECT q.Id                                    AS QuestionId,
+           q.Title,
+           q.Score                                 AS QuestionScore,
+           COALESCE(a.AnswerCount,0)               AS AnswerCount,
+           COALESCE(v.UpVotes,0) - COALESCE(v.DownVotes,0) AS VoteBalance,
+           CASE
+               WHEN q.ClosedDate IS NOT NULL      THEN 'Closed'
+               WHEN q.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+               ELSE                               'Open'
+           END                                     AS Status,
+           ROW_NUMBER() OVER (PARTITION BY q.OwnerUserId ORDER BY q.Score DESC) AS UserQuestionRank
+    FROM Posts q
+    LEFT JOIN (
+        SELECT ParentId, COUNT(*) AS AnswerCount
+        FROM Posts
+        WHERE PostTypeId = 2
+        GROUP BY ParentId
+    ) a ON a.ParentId = q.Id
+    LEFT JOIN (
+        SELECT p.Id,
+               SUM(CASE WHEN vt.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+               SUM(CASE WHEN vt.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Posts p
+        LEFT JOIN Votes vt ON vt.PostId = p.Id
+        GROUP BY p.Id
+    ) v ON v.Id = q.Id
+    WHERE q.PostTypeId = 1
+),
+DuplicateLinks AS (
+    SELECT pl.PostId,
+           pl.RelatedPostId,
+           lt.Name                                          AS LinkType,
+           ph.Comment::int                                 AS CloseReasonId,
+           cr.Name                                          AS CloseReasonName
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    LEFT JOIN PostHistory ph 
+           ON ph.PostId = pl.PostId
+          AND ph.PostHistoryTypeId = 10
+    LEFT JOIN CloseReasonTypes cr 
+           ON cr.Id = ph.Comment::int
+    WHERE lt.Id = 3      -- Duplicate links
+)
+SELECT tu.Id                                   AS UserId,
+       tu.DisplayName,
+       tu.TotalScore,
+       tu.RankByScore,
+       qa.Status,
+       qa.QuestionId,
+       qa.Title,
+       qa.QuestionScore,
+       qa.AnswerCount,
+       qa.VoteBalance,
+       COALESCE(dl.LinkType, 'None')           AS DuplicateLinkType,
+       COALESCE(dl.CloseReasonName, 'N/A')     AS CloseReason,
+       STRING_AGG(DISTINCT rat.TagName, '; ')  AS ActiveTags,
+       STRING_AGG(DISTINCT rat.SampleTitles, '; ') AS TagSampleTitles
+FROM TopUsers tu
+LEFT JOIN LATERAL (
+    SELECT *
+    FROM QuestionAnswerStats qa
+    WHERE qa.UserQuestionRank = 1
+      AND qa.QuestionId = (
+          SELECT q.Id
+          FROM Posts q
+          WHERE q.OwnerUserId = tu.Id
+            AND q.PostTypeId = 1
+          ORDER BY q.Score DESC NULLS LAST
+          LIMIT 1
+      )
+) qa ON TRUE
+LEFT JOIN DuplicateLinks dl 
+       ON dl.PostId = qa.QuestionId
+LEFT JOIN LATERAL (
+    SELECT t.TagName, rat.SampleTitles
+    FROM Tags t
+    JOIN RecentActiveTags rat ON rat.Id = t.Id
+    WHERE qa.Title ILIKE '%'||t.TagName||'%'
+    LIMIT 3
+) rat ON TRUE
+GROUP BY tu.Id, tu.DisplayName, tu.TotalScore, tu.RankByScore,
+         qa.Status, qa.QuestionId, qa.Title, qa.QuestionScore,
+         qa.AnswerCount, qa.VoteBalance, dl.LinkType, dl.CloseReasonName
+ORDER BY tu.RankByScore ASC
+LIMIT 20
+UNION ALL
+SELECT NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL;

@@ -1,0 +1,117 @@
+WITH RankedAnswers AS (
+    SELECT
+        ROW_NUMBER() OVER (PARTITION BY ParentId ORDER BY Score DESC, CreationDate ASC) AS rn,
+        Id,
+        ParentId,
+        OwnerUserId,
+        Score,
+        CreationDate
+    FROM Posts
+    WHERE PostTypeId = 2
+),
+TopQuestions AS (
+    SELECT
+        Id,
+        OwnerUserId,
+        Title,
+        CreationDate,
+        Score,
+        AnswerCount,
+        FavoriteCount,
+        ROW_NUMBER() OVER (ORDER BY FavoriteCount DESC, Score DESC, AnswerCount DESC) AS q_rn
+    FROM Posts
+    WHERE PostTypeId = 1
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COALESCE(u.Reputation, 0) AS Reputation
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.DisplayName, COALESCE(u.Reputation, 0)
+),
+QuestionAnswerStats AS (
+    SELECT
+        tq.Id AS QuestionId,
+        tq.Title,
+        tq.OwnerUserId AS QuestionOwnerUserId,
+        tq.Score AS QuestionScore,
+        tq.AnswerCount AS TotalAnswers,
+        ra.rn AS RankOfBestAnswer,
+        ra.Id AS BestAnswerId,
+        ra.OwnerUserId AS BestAnswerOwnerUserId,
+        ra.Score AS BestAnswerScore,
+        ra.CreationDate AS BestAnswerCreationDate,
+        COALESCE(ua.DisplayName, 'Unknown User') AS QuestionOwnerDisplayName,
+        ua.Reputation AS QuestionOwnerReputation,
+        ua.GoldBadges AS QuestionOwnerGoldBadges,
+        ua.SilverBadges AS QuestionOwnerSilverBadges,
+        ua.BronzeBadges AS QuestionOwnerBronzeBadges,
+        LAG(tq.Score, 1, 0) OVER (ORDER BY tq.CreationDate) AS PreviousQuestionScore
+    FROM TopQuestions tq
+    LEFT JOIN RankedAnswers ra ON tq.Id = ra.ParentId AND ra.rn = 1
+    LEFT JOIN UserActivity ua ON tq.OwnerUserId = ua.UserId
+    WHERE tq.q_rn BETWEEN 1 AND 100
+)
+SELECT
+    qas.QuestionId,
+    qas.Title,
+    qas.QuestionOwnerDisplayName,
+    qas.QuestionOwnerReputation,
+    qas.QuestionScore,
+    qas.TotalAnswers,
+    qas.RankOfBestAnswer,
+    CASE
+        WHEN qas.BestAnswerId IS NULL THEN 'No accepted answer'
+        WHEN qas.BestAnswerScore > qas.QuestionScore THEN 'Answer outscored question'
+        WHEN qas.BestAnswerScore <= 0 THEN 'Low score answer'
+        ELSE 'Standard answer'
+    END AS AnswerQualityCategory,
+    qas.BestAnswerScore,
+    qas.BestAnswerCreationDate,
+    CASE
+        WHEN qas.QuestionOwnerGoldBadges > 5 THEN 'Elite Contributor'
+        WHEN qas.QuestionOwnerSilverBadges > 10 THEN 'Active Member'
+        ELSE 'Regular User'
+    END AS UserTier,
+    (qas.QuestionScore * 1.0 / NULLIF(qas.TotalAnswers, 0)) AS ScorePerAnswerRatio,
+    qas.PreviousQuestionScore,
+    UPPER(SUBSTRING(qas.Title FROM 1 FOR 3)) || '-' || LOWER(REPLACE(qas.Title, ' ', '_')) AS ProcessedTitle,
+    CASE WHEN qas.QuestionOwnerReputation > 10000 THEN TRUE ELSE FALSE END AS IsHighReputationOwner,
+    'QueryExecutionTime:' || CAST(EXTRACT(EPOCH FROM CAST('2024-10-01 12:34:56' AS TIMESTAMP)) AS VARCHAR) AS BenchmarkMarker
+FROM QuestionAnswerStats qas
+WHERE qas.QuestionOwnerReputation > 500
+  AND qas.BestAnswerScore IS NOT NULL
+  AND qas.TotalAnswers > 0
+UNION ALL
+SELECT
+    NULL::bigint AS QuestionId,
+    'Summary Row' AS Title,
+    NULL::varchar AS QuestionOwnerDisplayName,
+    AVG(CAST(QuestionOwnerReputation AS DECIMAL)) AS QuestionOwnerReputation,
+    AVG(CAST(QuestionScore AS DECIMAL)) AS QuestionScore,
+    AVG(CAST(TotalAnswers AS DECIMAL)) AS TotalAnswers,
+    AVG(CAST(RankOfBestAnswer AS DECIMAL)) AS RankOfBestAnswer,
+    NULL::varchar AS AnswerQualityCategory,
+    AVG(CAST(BestAnswerScore AS DECIMAL)) AS BestAnswerScore,
+    NULL::timestamp AS BestAnswerCreationDate,
+    NULL::varchar AS UserTier,
+    AVG((qas.QuestionScore * 1.0 / NULLIF(qas.TotalAnswers, 0))) AS ScorePerAnswerRatio,
+    AVG(CAST(PreviousQuestionScore AS DECIMAL)) AS PreviousQuestionScore,
+    NULL::varchar AS ProcessedTitle,
+    NULL::boolean AS IsHighReputationOwner,
+    'QueryExecutionTime:' || CAST(EXTRACT(EPOCH FROM CAST('2024-10-01 12:34:56' AS TIMESTAMP)) AS VARCHAR) AS BenchmarkMarker
+FROM QuestionAnswerStats qas
+WHERE qas.QuestionOwnerReputation > 500
+  AND qas.BestAnswerScore IS NOT NULL
+  AND qas.TotalAnswers > 0;

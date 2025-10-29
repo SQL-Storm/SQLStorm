@@ -1,0 +1,90 @@
+-- {"query": "2573.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1177} 
+with RecentHighScorePosts as (
+    select p.Id, p.Title, p.Score, p.OwnerUserId, p.CreationDate,
+      row_number() over (partition by p.OwnerUserId order by p.Score desc, p.CreationDate desc) as rn
+    from Posts p
+    where p.PostTypeId = 1 /* questions */
+      and p.CreationDate > current_date - interval '1 year'
+      and p.Score >= 10
+),
+UserBadgeCounts as (
+    select b.UserId,
+      count(*) filter (where b.Class = 1) as GoldBadges,
+      count(*) filter (where b.Class = 2) as SilverBadges,
+      count(*) filter (where b.Class = 3) as BronzeBadges,
+      count(*) as TotalBadges
+    from Badges b
+    group by b.UserId
+),
+UserTopQuestions as (
+    select rhp.Id as PostId, rhp.Title, rhp.Score, rhp.OwnerUserId,
+      u.DisplayName, u.Reputation, u.CreationDate as UserCreationDate,
+      bc.GoldBadges, bc.SilverBadges, bc.BronzeBadges, bc.TotalBadges,
+      count(c.Id) as CommentsCount,
+      max(ph.CreationDate) as LastEditDate
+    from RecentHighScorePosts rhp
+    join Users u on u.Id = rhp.OwnerUserId
+    left join Badges bc on bc.UserId = u.Id
+    left join Comments c on c.PostId = rhp.Id
+    left join PostHistory ph on ph.PostId = rhp.Id and ph.PostHistoryTypeId in (4,5,6) /* edits */
+    where rhp.rn = 1
+    group by rhp.Id, rhp.Title, rhp.Score, rhp.OwnerUserId, u.DisplayName, u.Reputation, u.CreationDate,
+      bc.GoldBadges, bc.SilverBadges, bc.BronzeBadges, bc.TotalBadges
+),
+PostDuplicateInfo as (
+    select pl.PostId, count(distinct pl.RelatedPostId) as DuplicateCount
+    from PostLinks pl
+    where pl.LinkTypeId = 3 /* duplicates */
+    group by pl.PostId
+),
+AcceptedAnswerVotes as (
+    select a.Id as AnswerId, a.ParentId as QuestionId, 
+      count(v.Id) filter (where v.VoteTypeId = 2) as AnswerUpVotes,
+      count(v.Id) filter (where v.VoteTypeId = 3) as AnswerDownVotes
+    from Posts a
+    left join Votes v on v.PostId = a.Id
+    where a.PostTypeId = 2 /* answers */
+    group by a.Id, a.ParentId
+),
+UserActivePeriod as (
+    select u.Id, u.DisplayName, 
+      extract(epoch from (u.LastAccessDate - u.CreationDate))/86400 as DaysActive,
+      case when u.LastAccessDate is null or u.CreationDate is null then null else (u.LastAccessDate - u.CreationDate) end as ActiveInterval,
+      u.Reputation
+    from Users u
+),
+ComplexSearch as (
+    select p.Id, p.Title, p.Score,
+      (char_length(coalesce(p.Body, '')) - char_length(replace(coalesce(p.Body, ''), 'SQL', ''))) / 3 as SQLKeywordCount,
+      array_length(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><'),1) as TagCount,
+      p.ViewCount, p.FavoriteCount,
+      case when p.ClosedDate is null then false else true end as IsClosed,
+      case when p.AcceptedAnswerId is not null then true else false end as HasAcceptedAnswer
+    from Posts p
+    where p.PostTypeId = 1
+      and p.Score > 0
+      and p.FavoriteCount > 0
+      and (p.Tags like '%<sql>%'
+           or p.Tags like '%<performance>%'
+           or (p.Title ilike '%performance%' and p.Body ilike '%join%'))
+),
+FinalResults as (
+    select c.Id as QuestionId, c.Title, c.Score, c.SQLKeywordCount, c.TagCount, c.ViewCount, c.FavoriteCount,
+      c.IsClosed, c.HasAcceptedAnswer, a.AnswerUpVotes, a.AnswerDownVotes, d.DuplicateCount,
+      u.DisplayName as OwnerDisplayName, u.Reputation as OwnerReputation,
+      b.GoldBadges, b.SilverBadges, b.BronzeBadges, b.TotalBadges,
+      c.Score * 1.0 / nullif(c.TagCount,0) as ScorePerTag,
+      case when c.IsClosed then 'Closed' else 'Open' end as Status,
+      row_number() over (partition by u.Id order by c.Score desc, c.ViewCount desc) as UserPostRank
+    from ComplexSearch c
+    left join Posts p on p.Id = c.Id
+    left join AcceptedAnswerVotes a on a.QuestionId = c.Id
+    left join PostDuplicateInfo d on d.PostId = c.Id
+    left join Users u on u.Id = p.OwnerUserId
+    left join UserBadgeCounts b on b.UserId = u.Id
+)
+select * from FinalResults
+where UserPostRank <= 3
+  and (ScorePerTag > 5 or FavoriteCount > 10)
+order by OwnerReputation desc nulls last, Score desc, ViewCount desc
+limit 100;

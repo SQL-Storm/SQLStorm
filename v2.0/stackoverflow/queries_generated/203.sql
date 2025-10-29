@@ -1,0 +1,337 @@
+-- {"query": "203.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2817} 
+with
+recent_users as (
+  select u.id as user_id,
+         u.displayname,
+         u.reputation,
+         u.creationdate,
+         u.location,
+         coalesce(nullif(trim(u.websiteurl), ''), 'N/A') as websiteurl_norm
+  from users u
+  where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+posts_norm as (
+  select p.id,
+         p.posttypeid,
+         p.owneruserid,
+         p.parentid,
+         p.acceptedanswerid,
+         p.creationdate,
+         p.score,
+         p.viewcount,
+         coalesce(p.title, '') as title,
+         p.tags,
+         case when p.tags is null then array[]::varchar[]
+              else string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')
+         end as tag_arr
+  from posts p
+),
+question_core as (
+  select q.id as question_id,
+         q.owneruserid as asker_id,
+         q.creationdate as q_created,
+         q.score as q_score,
+         q.viewcount as q_views,
+         q.title,
+         q.tag_arr,
+         q.acceptedanswerid
+  from posts_norm q
+  where q.posttypeid = 1
+),
+answer_core as (
+  select a.id as answer_id,
+         a.parentid as question_id,
+         a.owneruserid as answerer_id,
+         a.creationdate as a_created,
+         a.score as a_score
+  from posts_norm a
+  where a.posttypeid = 2
+),
+user_badge_rollup as (
+  select b.userid,
+         count(*) as badges_total,
+         count(*) filter (where b.class = 1) as gold_count,
+         count(*) filter (where b.class = 2) as silver_count,
+         count(*) filter (where b.class = 3) as bronze_count,
+         min(b.date) as first_badge_at,
+         max(b.date) as last_badge_at
+  from badges b
+  group by b.userid
+),
+vote_agg as (
+  select v.postid,
+         count(*) filter (where v.votetypeid = 2) as upvotes,
+         count(*) filter (where v.votetypeid = 3) as downvotes,
+         count(*) filter (where v.votetypeid = 5) as favorites,
+         count(*) filter (where v.votetypeid in (8,9)) as bounty_events,
+         sum(v.bountyamount) filter (where v.votetypeid in (8,9)) as bounty_sum
+  from votes v
+  group by v.postid
+),
+comment_stats as (
+  select c.postid,
+         count(*) as comment_count,
+         max(c.score) as max_comment_score,
+         avg(c.score) as avg_comment_score,
+         max(c.creationdate) as last_comment_at
+  from comments c
+  group by c.postid
+),
+post_history_flags as (
+  select ph.postid,
+         bool_or(ph.posthistorytypeid in (10,35)) as was_closed_or_migrated,
+         bool_or(ph.posthistorytypeid in (11)) as was_reopened,
+         bool_or(ph.posthistorytypeid in (19)) as was_protected,
+         min(ph.creationdate) filter (where ph.posthistorytypeid in (10,35)) as first_closed_at,
+         max(ph.creationdate) filter (where ph.posthistorytypeid in (11)) as last_reopened_at
+  from posthistory ph
+  group by ph.postid
+),
+dupe_links as (
+  select pl.postid as dup_post_id,
+         count(*) filter (where pl.linktypeid = 3) as duplicate_links,
+         count(*) filter (where pl.linktypeid = 1) as related_links
+  from postlinks pl
+  group by pl.postid
+),
+tag_explosion as (
+  select qc.question_id,
+         unnest(qc.tag_arr) as tagname
+  from question_core qc
+),
+tag_rank as (
+  select t.tagname,
+         count(*) as q_count
+  from tag_explosion t
+  group by t.tagname
+),
+ranked_answers as (
+  select ac.question_id,
+         ac.answer_id,
+         ac.answerer_id,
+         ac.a_created,
+         ac.a_score,
+         row_number() over (partition by ac.question_id order by ac.a_score desc nulls last, ac.a_created asc) as rn_score,
+         row_number() over (partition by ac.question_id order by ac.a_created asc) as rn_time
+  from answer_core ac
+),
+first_and_top_answers as (
+  select ra.question_id,
+         max(case when ra.rn_time = 1 then ra.answer_id end) as first_answer_id,
+         max(case when ra.rn_time = 1 then ra.answerer_id end) as first_answerer_id,
+         max(case when ra.rn_time = 1 then ra.a_score end) as first_answer_score,
+         max(case when ra.rn_score = 1 then ra.answer_id end) as top_answer_id,
+         max(case when ra.rn_score = 1 then ra.answerer_id end) as top_answerer_id,
+         max(case when ra.rn_score = 1 then ra.a_score end) as top_answer_score
+  from ranked_answers ra
+  group by ra.question_id
+),
+accept_eval as (
+  select qc.question_id,
+         qc.acceptedanswerid,
+         fa.top_answer_id,
+         fa.first_answer_id,
+         case
+           when qc.acceptedanswerid is null then 'none'
+           when qc.acceptedanswerid = fa.top_answer_id then 'accepted_is_top'
+           when qc.acceptedanswerid = fa.first_answer_id then 'accepted_is_first'
+           else 'accepted_other'
+         end as accept_category
+  from question_core qc
+  left join first_and_top_answers fa on fa.question_id = qc.question_id
+),
+asker_activity as (
+  select qc.question_id,
+         u.user_id as asker_id,
+         u.reputation as asker_rep,
+         ub.badges_total as asker_badges,
+         ub.gold_count as asker_gold,
+         ub.silver_count as asker_silver,
+         ub.bronze_count as asker_bronze,
+         u.location as asker_location,
+         u.websiteurl_norm as asker_website
+  from question_core qc
+  left join recent_users u on u.user_id = qc.asker_id
+  left join user_badge_rollup ub on ub.userid = qc.asker_id
+),
+answerer_activity as (
+  select ra.question_id,
+         count(distinct ra.answerer_id) as unique_answerers,
+         count(*) as total_answers,
+         avg(ra.a_score) as avg_answer_score,
+         max(ra.a_score) as max_answer_score
+  from answer_core ra
+  group by ra.question_id
+),
+temporal_bins as (
+  select qc.question_id,
+         qc.q_created,
+         date_trunc('month', qc.q_created) as month_bucket,
+         extract(dow from qc.q_created) as dow,
+         extract(hour from qc.q_created) as hod
+  from question_core qc
+),
+engagement as (
+  select qc.question_id,
+         coalesce(v.upvotes, 0) as q_upvotes,
+         coalesce(v.downvotes, 0) as q_downvotes,
+         coalesce(v.favorites, 0) as q_favorites,
+         coalesce(v.bounty_events, 0) as q_bounty_events,
+         coalesce(v.bounty_sum, 0) as q_bounty_sum,
+         coalesce(c.comment_count, 0) as q_comments,
+         c.last_comment_at
+  from question_core qc
+  left join vote_agg v on v.postid = qc.question_id
+  left join comment_stats c on c.postid = qc.question_id
+),
+score_norm as (
+  select qc.question_id,
+         qc.q_score,
+         qc.q_views,
+         case when qc.q_views > 0 then round(qc.q_score::numeric / qc.q_views, 6) else null end as score_per_view,
+         percentile_disc(0.9) within group (order by qc.q_score) over () as p90_score
+  from question_core qc
+),
+final_set as (
+  select
+    qc.question_id,
+    qc.title,
+    qc.tag_arr,
+    te.month_bucket,
+    te.dow,
+    te.hod,
+    ae.accept_category,
+    ea.q_upvotes,
+    ea.q_downvotes,
+    ea.q_favorites,
+    ea.q_bounty_events,
+    ea.q_bounty_sum,
+    ea.q_comments,
+    sn.q_score,
+    sn.q_views,
+    sn.score_per_view,
+    sn.p90_score,
+    aa.total_answers,
+    aa.unique_answerers,
+    aa.avg_answer_score,
+    aa.max_answer_score,
+    af.was_closed_or_migrated,
+    af.was_reopened,
+    af.was_protected,
+    af.first_closed_at,
+    af.last_reopened_at,
+    dl.duplicate_links,
+    dl.related_links,
+    ak.asker_id,
+    ak.asker_rep,
+    ak.asker_badges,
+    ak.asker_gold,
+    ak.asker_silver,
+    ak.asker_bronze,
+    ak.asker_location,
+    ak.asker_website
+  from question_core qc
+  left join temporal_bins te on te.question_id = qc.question_id
+  left join accept_eval ae on ae.question_id = qc.question_id
+  left join engagement ea on ea.question_id = qc.question_id
+  left join score_norm sn on sn.question_id = qc.question_id
+  left join answerer_activity aa on aa.question_id = qc.question_id
+  left join post_history_flags af on af.postid = qc.question_id
+  left join dupe_links dl on dl.dup_post_id = qc.question_id
+  left join asker_activity ak on ak.question_id = qc.question_id
+),
+tag_filter as (
+  select fs.*,
+         (exists (
+            select 1
+            from unnest(fs.tag_arr) t(tagname)
+            where lower(t.tagname) in ('sql','postgresql','tsql','mysql')
+         )) as is_sql_tagged
+  from final_set fs
+),
+ranked as (
+  select
+    tf.*,
+    dense_rank() over (
+      partition by coalesce(tf.is_sql_tagged, false), tf.month_bucket
+      order by
+        coalesce(tf.q_bounty_sum, 0) desc,
+        coalesce(tf.q_favorites, 0) desc,
+        coalesce(tf.q_upvotes - tf.q_downvotes, 0) desc,
+        coalesce(tf.total_answers, 0) desc,
+        tf.q_views desc nulls last,
+        tf.q_score desc nulls last
+    ) as perf_rank
+  from tag_filter tf
+),
+multi_source as (
+  select question_id, title, month_bucket, perf_rank, 'A:high_engagement' as bucket
+  from ranked
+  where perf_rank <= 50
+  union all
+  select question_id, title, month_bucket, perf_rank, 'B:recently_closed' as bucket
+  from ranked r
+  where r.was_closed_or_migrated = true
+    and coalesce(r.first_closed_at, now()) >= (select max(creationdate) - interval '30 days' from posts)
+  union
+  select question_id, title, month_bucket, perf_rank, 'C:sql_tagged_top' as bucket
+  from ranked
+  where is_sql_tagged
+    and perf_rank <= 200
+),
+dedup as (
+  select ms.*,
+         row_number() over (partition by question_id order by
+           case when bucket = 'A:high_engagement' then 1
+                when bucket = 'C:sql_tagged_top' then 2
+                else 3 end,
+           perf_rank asc
+         ) as pref
+  from multi_source ms
+)
+select
+  r.question_id,
+  r.title,
+  r.month_bucket,
+  r.perf_rank,
+  r.q_views,
+  r.q_score,
+  r.score_per_view,
+  r.q_upvotes,
+  r.q_downvotes,
+  r.q_favorites,
+  r.q_bounty_events,
+  r.q_bounty_sum,
+  r.q_comments,
+  r.accept_category,
+  r.total_answers,
+  r.unique_answerers,
+  r.avg_answer_score,
+  r.max_answer_score,
+  r.was_closed_or_migrated,
+  r.was_reopened,
+  r.was_protected,
+  r.duplicate_links,
+  r.related_links,
+  r.asker_id,
+  r.asker_rep,
+  r.asker_badges,
+  r.asker_gold,
+  r.asker_silver,
+  r.asker_bronze,
+  r.asker_location,
+  r.asker_website,
+  r.is_sql_tagged,
+  d.bucket as selected_bucket
+from ranked r
+join dedup d on d.question_id = r.question_id and d.pref = 1
+where
+  (
+    r.score_per_view is not null
+    and r.score_per_view >= coalesce(r.p90_score::numeric / nullif(r.q_views,0), 0)
+  )
+  and (
+    r.total_answers is null or r.total_answers >= 1
+  )
+order by r.month_bucket desc nulls last, r.perf_rank asc
+limit 500;

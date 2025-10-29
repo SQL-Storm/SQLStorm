@@ -1,0 +1,131 @@
+-- {"query": "5942.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 957} 
+WITH
+RecentUsers AS (
+  SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.AccountId,
+    ROW_NUMBER() OVER (ORDER BY u.LastAccessDate DESC) AS rn
+  FROM Users u
+),
+TopTags AS (
+  SELECT
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId,
+    ROW_NUMBER() OVER (PARTITION BY t.TagName ORDER BY t.Count DESC) AS rn_tag
+  FROM Tags t
+  WHERE t.IsModeratorOnly = 0
+),
+SamplePosts AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.PostTypeId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.Tags,
+    p.FavoriteCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.ContentLicense
+  FROM Posts p
+  WHERE p.CreationDate >= DATEADD(year, -2, GETDATE())
+),
+CorrelatedHistory AS (
+  SELECT
+    ph.Id AS HistoryId,
+    ph.PostId,
+    ph.PostHistoryTypeId,
+    ph.UserId,
+    ph.CreationDate AS HistoryDate,
+    ph.Text,
+    ph.Comment
+  FROM PostHistory ph
+  WHERE ph.PostHistoryTypeId IN (10, 16, 1, 25) -- close, community owned, initial title, post tweet
+),
+ActivityWindow AS (
+  SELECT
+    p.Id AS PostId,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    V.VoteTypeId,
+    V.CreationDate AS VoteDate,
+    V.BountyAmount,
+    L.LinkTypeId
+  FROM Posts p
+  LEFT JOIN Votes V ON V.PostId = p.Id
+  LEFT JOIN PostLinks L ON L.PostId = p.Id
+  WHERE p.LastActivityDate >= DATEADD(month, -6, GETDATE())
+),
+Joined AS (
+  SELECT
+    sp.Id AS PostId,
+    sp.Title,
+    sp.PostTypeId,
+    sp.CreationDate,
+    sp.LastActivityDate,
+    sp.Score,
+    sp.ViewCount,
+    sp.OwnerUserId,
+    sp.Tags,
+    sp.FavoriteCount,
+    sp.AnswerCount,
+    sp.CommentCount,
+    cu.DisplayName AS OwnerDisplayName,
+    u.Reputation,
+    (SELECT TOP 1 Name FROM PostHistory ph JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id WHERE ph.PostId = sp.Id ORDER BY ph.CreationDate DESC) AS LastEditType,
+    (SELECT MAX(CreationDate) FROM Votes v2 WHERE v2.PostId = sp.Id) AS LastVoteDate,
+    ac.VoteDate AS LastVoteDateAlt
+  FROM SamplePosts sp
+  LEFT JOIN Users cu ON cu.Id = sp.OwnerUserId
+  LEFT JOIN Users u ON u.Id = sp.OwnerUserId
+  LEFT JOIN CorrelatedHistory ch ON ch.PostId = sp.Id
+  LEFT JOIN ActivityWindow ac ON ac.PostId = sp.Id
+)
+SELECT
+  Joined.PostId,
+  Joined.Title,
+  Joined.PostTypeId,
+  Joined.CreationDate,
+  Joined.LastActivityDate,
+  Joined.Score,
+  Joined.ViewCount,
+  Joined.OwnerUserId,
+  Joined.OwnerDisplayName,
+  Joined.Reputation,
+  Joined.Tags,
+  Joined.FavoriteCount,
+  Joined.AnswerCount,
+  Joined.CommentCount,
+  Joined.LastEditType,
+  Joined.LastVoteDate,
+  CASE
+    WHEN Joined.PostTypeId = 1 THEN 'Question'
+    WHEN Joined.PostTypeId = 2 THEN 'Answer'
+    ELSE 'Other'
+  END AS PostKind,
+  ROW_NUMBER() OVER (PARTITION BY (CASE
+    WHEN Joined.PostTypeId = 1 THEN 'Q'
+    WHEN Joined.PostTypeId = 2 THEN 'A'
+    ELSE 'O'
+  END) ORDER BY Joined.LastActivityDate DESC) AS RankWithinType,
+  (SELECT STRING_AGG(t.TagName, ',') WITHIN GROUP (ORDER BY t.TagName)
+   FROM (\n
+       SELECT value AS TagName
+       FROM STRING_SPLIT(Joined.Tags, '><')
+   ) AS t) AS TagList
+FROM Joined
+ORDER BY Joined.LastActivityDate DESC, Joined.Score DESC
+OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY;

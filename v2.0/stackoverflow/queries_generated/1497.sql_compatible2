@@ -1,0 +1,184 @@
+WITH UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Views AS UserProfileViews,
+        COALESCE(COUNT(DISTINCT p.Id), 0) AS TotalPostsOwned,
+        COALESCE(COUNT(DISTINCT c.Id), 0) AS TotalCommentsMade,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 AND v.UserId = u.Id THEN 1 ELSE 0 END), 0) AS TotalUpVotesGiven,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 AND v.UserId = u.Id THEN 1 ELSE 0 END), 0) AS TotalDownVotesGiven,
+        COALESCE(SUM(CASE WHEN pa.AcceptedAnswerId = p.Id THEN 1 ELSE 0 END), 0) AS TotalAcceptedAnswers,
+        AVG(u_other.Reputation) AS AvgReputationInCreationMonth
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN Posts pa ON pa.AcceptedAnswerId = p.Id
+    LEFT JOIN Users u_other
+        ON DATE_TRUNC('month', u_other.CreationDate) = DATE_TRUNC('month', u.CreationDate)
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views
+),
+PostEngagementMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate AS PostCreationDate,
+        p.LastActivityDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount AS PostCommentCount,
+        p.FavoriteCount,
+        p.Tags,
+        p.Body,
+        CASE WHEN CAST(p.ClosedDate AS TEXT) = 'infinity' THEN NULL ELSE p.ClosedDate END AS ClosedDateAdjusted,
+        COALESCE(array_length(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><'), 1), 0) AS TagCount,
+        SUM(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS OwnerRunningPostScore,
+        AVG(p.Score) OVER (
+            PARTITION BY p.PostTypeId
+            ORDER BY p.CreationDate
+            ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+        ) AS AvgPostScoreTypeWindow,
+        (POSITION('<pre>' IN LOWER(p.Body)) > 0 OR POSITION('<code>' IN LOWER(p.Body)) > 0 OR POSITION('<a href=' IN LOWER(p.Body)) > 0) AS HasCodeOrExternalLink,
+        EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate)) / 3600 AS HoursUntilLastActivity,
+        COALESCE(SUBSTRING(p.Body, 1, 50), '(Empty Body)') AS BodyExcerpt,
+        p.PostTypeId AS PostTypeId_for_grouping,
+        p.CreationDate AS CreationDate_for_grouping,
+        p.OwnerUserId AS OwnerUserId_for_grouping,
+        p.Score AS Score_for_grouping
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    -- no GROUP BY here because window functions used; include any ungrouped columns in outer queries as needed
+),
+PostHistoryEvents AS (
+    SELECT
+        ph.PostId,
+        ph.CreationDate AS HistoryEventDate,
+        ph.PostHistoryTypeId,
+        pht.Name AS HistoryTypeName,
+        ph.UserId AS HistoryEditorUserId,
+        ph.Comment AS HistoryComment,
+        u.DisplayName AS EditorDisplayName,
+        EXTRACT(EPOCH FROM (ph.CreationDate - LAG(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate))) / 60 AS MinsSincePrevHistoryEvent,
+        (SELECT OwnerUserId FROM Posts WHERE Id = ph.PostId) = ph.UserId AS IsOwnerEditing
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    LEFT JOIN Users u ON u.Id = ph.UserId
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6, 10, 11, 12, 13, 16)
+),
+UserBadgeSummary AS (
+    SELECT
+        b.UserId,
+        COUNT(b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(b.Date) AS LastBadgeDate,
+        ROUND(CAST(SUM(CASE WHEN b.TagBased = TRUE THEN 1 ELSE 0 END) AS NUMERIC) / NULLIF(COUNT(b.Id), 0) * 100, 2) AS PercentTagBasedBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+TagUsageAggregates AS (
+    SELECT
+        TRIM(tag) AS TagName,
+        COUNT(DISTINCT p.Id) AS PostsWithThisTag,
+        AVG(p.Score) AS AverageScoreForTag,
+        MAX(p.ViewCount) AS MaxViewCountForTag
+    FROM Posts p,
+    UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><')) AS tag
+    WHERE p.Tags IS NOT NULL AND p.Tags != '' AND LENGTH(p.Tags) > 2
+    GROUP BY TRIM(tag)
+),
+PostLinkRelationships AS (
+    SELECT
+        pl.PostId,
+        COUNT(DISTINCT pl.RelatedPostId) AS TotalRelatedPosts,
+        SUM(CASE WHEN pl.LinkTypeId = 1 THEN 1 ELSE 0 END) AS LinkedFromOtherPosts,
+        SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicatesOfOtherPosts,
+        SUM(CASE WHEN (SELECT PostTypeId FROM Posts WHERE Id = pl.RelatedPostId) = 1 THEN 1 ELSE 0 END) AS LinkedToQuestionsCount,
+        (SELECT AVG(Score) FROM Posts WHERE Id IN (SELECT RelatedPostId FROM PostLinks WHERE PostId = pl.PostId)) AS AvgRelatedPostScore
+    FROM PostLinks pl
+    GROUP BY pl.PostId
+)
+SELECT
+    COALESCE(uas.UserId, pem.OwnerUserId, -1) AS FinalUserId,
+    COALESCE(uas.DisplayName, 'Community User') AS FinalDisplayName,
+    uas.Reputation,
+    uas.CreationDate,
+    uas.LastAccessDate,
+    uas.UserProfileViews,
+    uas.TotalPostsOwned,
+    uas.TotalCommentsMade,
+    uas.TotalUpVotesGiven,
+    uas.TotalDownVotesGiven,
+    uas.TotalAcceptedAnswers,
+    uas.AvgReputationInCreationMonth,
+    ubs.TotalBadges,
+    ubs.GoldBadges,
+    ubs.PercentTagBasedBadges,
+    pem.PostId,
+    pem.PostTypeName,
+    pem.Title,
+    pem.PostCreationDate,
+    pem.LastActivityDate,
+    pem.PostScore,
+    pem.ViewCount,
+    pem.AnswerCount,
+    pem.PostCommentCount,
+    pem.FavoriteCount,
+    pem.TagCount AS PostTagCount,
+    pem.OwnerRunningPostScore,
+    pem.AvgPostScoreTypeWindow,
+    pem.HasCodeOrExternalLink,
+    pem.HoursUntilLastActivity,
+    pem.BodyExcerpt,
+    ph.HistoryEventDate AS LastHistoryEventDate,
+    ph.HistoryTypeName AS LastHistoryEventType,
+    ph.MinsSincePrevHistoryEvent,
+    ph.IsOwnerEditing,
+    plr.TotalRelatedPosts,
+    plr.LinkedFromOtherPosts,
+    plr.DuplicatesOfOtherPosts,
+    plr.LinkedToQuestionsCount,
+    plr.AvgRelatedPostScore,
+    tga.PostsWithThisTag AS MostDominantTagPostsCount,
+    tga.AverageScoreForTag AS MostDominantTagAvgScore,
+    CASE
+        WHEN COALESCE(uas.Reputation, 0) >= 10000 AND COALESCE(uas.TotalPostsOwned, 0) >= 100 THEN 'LegendaryContributor'
+        WHEN COALESCE(uas.Reputation, 0) >= 5000 AND COALESCE(uas.TotalPostsOwned, 0) >= 50 THEN 'HighlyActiveExpert'
+        WHEN COALESCE(uas.Reputation, 0) >= 1000 AND COALESCE(uas.TotalPostsOwned, 0) >= 10 THEN 'EstablishedParticipant'
+        WHEN COALESCE(uas.Reputation, 0) < 1000 AND COALESCE(uas.TotalPostsOwned, 0) = 0 AND COALESCE(uas.TotalCommentsMade, 0) = 0 THEN 'LurkerOrNewbie'
+        ELSE 'RegularUser'
+    END AS UserEngagementTier,
+    NTILE(10) OVER (ORDER BY COALESCE(uas.Reputation, 0) DESC, COALESCE(uas.TotalPostsOwned, 0) DESC) AS GlobalReputationPostTile,
+    RANK() OVER (PARTITION BY pem.PostTypeId ORDER BY COALESCE(pem.PostScore, 0) DESC, COALESCE(pem.ViewCount, 0) DESC) AS RankWithinPostType,
+    (pem.ClosedDateAdjusted IS NOT NULL AND pem.HoursUntilLastActivity IS NOT NULL AND pem.HoursUntilLastActivity < 24 * 7) AS ClosedQuicklyAfterLastActivity,
+    UPPER(COALESCE(SUBSTRING(pem.Title, 1, 1), '')) || LOWER(COALESCE(SUBSTRING(pem.Title, 2, 20), '')) AS FormattedTitleStart,
+    (COALESCE(uas.Reputation, 0) > 0 AND COALESCE(pem.PostScore, 0) > 0 AND uas.Reputation / NULLIF(pem.PostScore, 0) > 100) AS HighRepLowPostScoreRatio,
+    EXISTS (
+        SELECT 1
+        FROM Comments sc
+        WHERE sc.PostId = pem.PostId
+          AND sc.Text ILIKE '%[duplicate]%'
+          AND sc.UserId IS NOT NULL
+          AND sc.UserId != pem.OwnerUserId
+    ) AS HasDuplicateWarningComment,
+    (COALESCE(uas.TotalPostsOwned, 0) > 5 AND ubs.TotalBadges IS NULL) AS BadgeLessHighPoster
+FROM UserActivitySummary uas
+FULL OUTER JOIN PostEngagementMetrics pem ON uas.UserId = pem.OwnerUserId
+LEFT JOIN PostHistoryEvents ph ON pem.PostId = ph.PostId
+LEFT JOIN PostLinkRelationships plr ON pem.PostId = plr.PostId
+LEFT JOIN TagUsageAggregates tga ON tga.TagName = (
+    SELECT TRIM(tag)
+    FROM Posts p
+    CROSS JOIN LATERAL UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><')) AS tag
+    WHERE p.Id = pem.PostId
+    LIMIT 1
+)
+LEFT JOIN UserBadgeSummary ubs ON ubs.UserId = uas.UserId;

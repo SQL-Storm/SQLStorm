@@ -1,0 +1,118 @@
+-- {"query": "5283.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 920} 
+WITH
+RecentActivePosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.OwnerUserId,
+    p.PostTypeId,
+    p.Score,
+    p.ViewCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.AnswerCount
+  FROM Posts p
+  WHERE p.CreationDate > NOW() - INTERVAL '90 days'
+),
+TopTags AS (
+  SELECT
+    tag.TagName,
+    COUNT(*) AS PostCount,
+    AVG(p.Score) AS AvgScore,
+    MAX(p.ViewCount) AS MaxViews
+  FROM Tags t
+  JOIN Posts p ON p.Id = t.ExcerptPostId
+  CROSS APPLY (SELECT unnest(string_to_array(substr(t.TagName, 2, length(t.TagName)-2), '><')) AS TagNameItem) AS x
+  RIGHT JOIN (SELECT unnest(string_to_array(p.Tags, '><')) AS TagNameItem2 FROM Posts p) AS y ON x.TagNameItem = y.TagNameItem2
+  WHERE t.IsModeratorOnly = 0
+  GROUP BY tag.TagName
+  ORDER BY PostCount DESC
+  LIMIT 5
+),
+CorrelatedCommentStats AS (
+  SELECT
+    rp.PostId,
+    COUNT(c.Id) AS CommentCountLast90
+  FROM RecentActivePosts rp
+  LEFT JOIN Comments c ON c.PostId = rp.PostId
+  AND c.CreationDate > NOW() - INTERVAL '90 days'
+  GROUP BY rp.PostId
+),
+VoteIntensity AS (
+  SELECT
+    vp.PostId,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS Downvotes,
+    SUM(CASE WHEN v.VoteTypeId = 10 THEN 1 ELSE 0 END) AS Deletions,
+    SUM(CASE WHEN v.VoteTypeId = 8 THEN 1 ELSE 0 END) AS BountyStarts,
+    SUM(CASE WHEN v.VoteTypeId = 9 THEN 1 ELSE 0 END) AS BountyCloses
+  FROM Votes v
+  JOIN Posts vp ON vp.Id = v.PostId
+  WHERE v.CreationDate > NOW() - INTERVAL '180 days'
+  GROUP BY vp.PostId
+),
+FlaggedPosts AS (
+  SELECT
+    p.Id AS PostId,
+    COUNT(v.Id) AS FlagCount
+  FROM Posts p
+  LEFT JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId = 16
+  WHERE p.PostTypeId = 1
+  GROUP BY p.Id
+),
+AllData AS (
+  SELECT
+    r.PostId,
+    r.Title,
+    r.Tags,
+    r.CreationDate,
+    r.LastActivityDate,
+    r.OwnerUserId,
+    r.PostTypeId,
+    r.Score,
+    r.ViewCount,
+    r.CommentCount,
+    r.FavoriteCount,
+    r.AnswerCount,
+    ct.CommentCountLast90,
+    vi.Upvotes,
+    vi.Downvotes,
+    vi.Deletions,
+    vi.BountyStarts,
+    vi.BountyCloses,
+    fp.FlagCount,
+    ta.TagName AS TopTag
+  FROM RecentActivePosts r
+  LEFT JOIN CorrelatedCommentStats ct ON ct.PostId = r.PostId
+ LEFT JOIN VoteIntensity vi ON vi.PostId = r.PostId
+  LEFT JOIN FlaggedPosts fp ON fp.PostId = r.PostId
+  LEFT JOIN TopTags tt ON true
+  WHERE r.PostTypeId IN (1,2)
+)
+SELECT
+  ad.PostId,
+  ad.Title,
+  ad.Tags,
+  ad.CreationDate,
+  ad.LastActivityDate,
+  ad.OwnerUserId,
+  ad.PostTypeId,
+  ad.Score,
+  ad.ViewCount,
+  ad.CommentCount,
+  ad.FavoriteCount,
+  ad.AnswerCount,
+  ad.CommentCountLast90,
+  ad.Upvotes,
+  ad.Downvotes,
+  ad.Deletions,
+  ad.BountyStarts,
+  ad.BountyCloses,
+  ad.FlagCount,
+  ad.TopTag
+FROM AllData ad
+ORDER BY ad.LastActivityDate DESC, ad.Score DESC
+LIMIT 100;

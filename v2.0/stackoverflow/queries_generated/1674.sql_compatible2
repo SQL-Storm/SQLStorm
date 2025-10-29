@@ -1,0 +1,208 @@
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestionsAsked,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswersProvided,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        COALESCE(SUM(CASE WHEN P.Score > 0 THEN P.Score ELSE 0 END), 0) AS TotalPostUpvotesReceived,
+        COALESCE(SUM(CASE WHEN P.Score < 0 THEN P.Score ELSE 0 END), 0) AS TotalPostDownvotesReceived,
+        COALESCE(SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS TotalUpVotesGiven,
+        COALESCE(SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS TotalDownVotesGiven,
+        MAX(P.LastActivityDate) AS LastPostActivityDate,
+        MAX(C.CreationDate) AS LastCommentActivityDate,
+        DENSE_RANK() OVER (ORDER BY U.Reputation DESC, U.LastAccessDate DESC) AS ReputationRank
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Votes V ON U.Id = V.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate
+),
+QuestionDetailedMetrics AS (
+    SELECT
+        Q.Id AS QuestionId,
+        Q.Title AS QuestionTitle,
+        Q.OwnerUserId,
+        Q.CreationDate AS QuestionCreationDate,
+        Q.Score AS QuestionScore,
+        Q.ViewCount,
+        Q.AnswerCount AS DeclaredAnswerCount,
+        Q.FavoriteCount,
+        Q.ClosedDate,
+        Q.LastActivityDate AS QuestionLastActivityDate,
+        -- parse tags like "<a><b>" into array ['a','b']
+        (SELECT array_agg(elem) FROM (
+            SELECT elem FROM unnest(string_to_array(substring(Q.Tags FROM 2 FOR char_length(Q.Tags)-2), '><')) AS elem WHERE elem <> ''
+        ) t) AS ParsedTags,
+        COALESCE(SUM(A.Score), 0) AS TotalAnswerScore,
+        COUNT(DISTINCT A.Id) AS ActualAnswerCount,
+        MAX(A.CreationDate) AS LatestAnswerDate,
+        CASE WHEN COUNT(A.Id) = 0 THEN NULL ELSE AVG(A.Score) END AS AverageAnswerScore,
+        COUNT(DISTINCT PH.Id) AS TotalPostRevisions,
+        COUNT(DISTINCT PH.UserId) AS TotalDistinctEditors,
+        MIN(CASE WHEN PH.PostHistoryTypeId IN (1,2,3) THEN PH.CreationDate ELSE NULL END) AS InitialPostHistoryDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (4,5,6) THEN PH.CreationDate ELSE NULL END) AS LastEditHistoryDate,
+        EXTRACT(EPOCH FROM (MAX(CASE WHEN PH.PostHistoryTypeId IN (4,5,6) THEN PH.CreationDate ELSE NULL END) - MIN(CASE WHEN PH.PostHistoryTypeId IN (1,2,3) THEN PH.CreationDate ELSE NULL END))) / 3600.0 AS HoursBetweenFirstAndLastEdit,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4,5,6) THEN 1 ELSE 0 END) AS ExplicitEditCount,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.CreationDate ELSE NULL END) AS LatestClosureHistoryDate,
+        COUNT(DISTINCT CASE WHEN PL.LinkTypeId = 1 THEN PL.RelatedPostId END) AS LinkedPostsCount,
+        COUNT(DISTINCT CASE WHEN PL.LinkTypeId = 3 THEN PL.RelatedPostId END) AS DuplicatePostsCount
+    FROM Posts Q
+    LEFT JOIN Posts A ON Q.Id = A.ParentId AND A.PostTypeId = 2
+    LEFT JOIN PostHistory PH ON Q.Id = PH.PostId
+    LEFT JOIN PostLinks PL ON Q.Id = PL.PostId
+    WHERE Q.PostTypeId = 1
+    GROUP BY Q.Id, Q.Title, Q.OwnerUserId, Q.CreationDate, Q.Score, Q.ViewCount, Q.AnswerCount, Q.FavoriteCount, Q.ClosedDate, Q.LastActivityDate, Q.Tags
+),
+UserBadgeSummary AS (
+    SELECT
+        B.UserId,
+        COUNT(B.Id) AS TotalBadges,
+        COUNT(CASE WHEN B.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN B.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN B.Class = 3 THEN 1 END) AS BronzeBadges,
+        STRING_AGG(DISTINCT B.Name, '; ') AS AllBadgeNamesConcatenated,
+        (MAX(CASE WHEN B.Name LIKE '%Constituent%' AND B.Class = 1 THEN B.Date ELSE NULL END) IS NOT NULL) AS HasSpecificGoldBadge
+    FROM Badges B
+    GROUP BY B.UserId
+),
+TopGlobalQuestionTags AS (
+    SELECT
+        T_unnested.TagName,
+        COUNT(DISTINCT QDM.QuestionId) AS QuestionsWithTag,
+        SUM(QDM.QuestionScore) AS TotalTagScoreSum,
+        RANK() OVER (ORDER BY COUNT(DISTINCT QDM.QuestionId) DESC, SUM(QDM.QuestionScore) DESC) AS GlobalTagPopularityRank
+    FROM QuestionDetailedMetrics QDM,
+         unnest(QDM.ParsedTags) AS T_unnested(TagName)
+    GROUP BY T_unnested.TagName
+),
+RecentPostUserActivity AS (
+    SELECT
+        U.Id AS UserId,
+        MAX(P.LastActivityDate) AS MaxPostActivity,
+        MAX(C.CreationDate) AS MaxCommentActivity,
+        COUNT(DISTINCT P.Id) AS RecentActivePostsCount,
+        COUNT(DISTINCT C.Id) AS RecentActiveCommentsCount
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    WHERE (P.LastActivityDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days') OR (C.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days')
+    GROUP BY U.Id
+)
+SELECT
+    UE.UserId,
+    UE.DisplayName AS UserDisplayName,
+    UE.Reputation,
+    UE.ReputationRank,
+    UE.TotalQuestionsAsked,
+    UE.TotalAnswersProvided,
+    UE.TotalCommentsMade,
+    UE.TotalPostUpvotesReceived,
+    UE.TotalUpVotesGiven,
+    QDM.QuestionId,
+    QDM.QuestionTitle,
+    QDM.QuestionScore,
+    QDM.ViewCount AS QuestionViewCount,
+    QDM.FavoriteCount AS QuestionFavoriteCount,
+    QDM.TotalAnswerScore,
+    QDM.ActualAnswerCount,
+    QDM.AverageAnswerScore,
+    (QDM.ClosedDate IS NOT NULL) AS IsQuestionClosed,
+    COALESCE(QDM.HoursBetweenFirstAndLastEdit, 0) AS QuestionEditDurationHours,
+    QDM.TotalPostRevisions,
+    QDM.TotalDistinctEditors,
+    UBS.TotalBadges,
+    UBS.GoldBadges,
+    UBS.HasSpecificGoldBadge,
+    TGT.TagName AS TopGlobalAssociatedTag,
+    TGT.GlobalTagPopularityRank,
+    (SELECT COUNT(DISTINCT PL_sub.RelatedPostId) FROM PostLinks PL_sub WHERE PL_sub.PostId = QDM.QuestionId AND PL_sub.LinkTypeId = 3) AS CorrelatedDuplicateLinksCount,
+    SUM(CASE WHEN RPA.UserId IS NOT NULL THEN 1 ELSE 0 END) OVER (PARTITION BY UE.UserId) AS UserRecentActivityScore,
+    AVG(QDM.QuestionScore) OVER (ORDER BY UE.Reputation DESC ROWS BETWEEN 50 PRECEDING AND CURRENT ROW) AS RollingAvgQuestionScoreByReputation,
+    COALESCE(NULLIF(QDM.QuestionScore, 0) * QDM.TotalAnswerScore / (NULLIF(QDM.ActualAnswerCount, 0) + 1), 0) AS WeightedQuestionEngagementScore,
+    CASE
+        WHEN QDM.QuestionScore > 150 AND QDM.FavoriteCount > 20 AND QDM.ActualAnswerCount > 10 AND QDM.ClosedDate IS NULL THEN 'Highly Viral & Open'
+        WHEN QDM.QuestionScore BETWEEN 50 AND 150 AND COALESCE(QDM.AverageAnswerScore,0) > 2 AND QDM.TotalPostRevisions > 3 THEN 'Popular, Well-Answered & Maintained'
+        WHEN QDM.QuestionScore < 10 AND QDM.TotalPostRevisions > 5 AND QDM.QuestionCreationDate < CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years' THEN 'Aging Low-Score, High-Revision'
+        WHEN QDM.QuestionLastActivityDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '6 months' AND QDM.QuestionScore > 0 AND (SELECT MAX(C_sub.CreationDate) FROM Comments C_sub WHERE C_sub.PostId = QDM.QuestionId) IS NOT NULL THEN 'Recently Active Discussion Post'
+        ELSE 'Other Question Category'
+    END AS QuestionStatusCategory,
+    'Main_Highly_Engaged_Users_And_Questions' AS QuerySourceSegment
+FROM UserEngagement UE
+INNER JOIN QuestionDetailedMetrics QDM ON UE.UserId = QDM.OwnerUserId
+LEFT JOIN UserBadgeSummary UBS ON UE.UserId = UBS.UserId
+LEFT JOIN TopGlobalQuestionTags TGT ON TGT.TagName = (
+    SELECT T_inner.TagName
+    FROM unnest(QDM.ParsedTags) AS T_inner(TagName)
+    LEFT JOIN TopGlobalQuestionTags TGT_inner ON T_inner.TagName = TGT_inner.TagName
+    ORDER BY TGT_inner.GlobalTagPopularityRank ASC NULLS LAST
+    LIMIT 1
+)
+LEFT JOIN RecentPostUserActivity RPA ON UE.UserId = RPA.UserId
+WHERE
+    UE.Reputation > 10000
+    AND UE.TotalQuestionsAsked > 25
+    AND QDM.QuestionScore > 10
+    AND QDM.ActualAnswerCount >= 3
+    AND QDM.QuestionCreationDate BETWEEN CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '7 years' AND CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+    AND (
+        QDM.FavoriteCount >= 10
+        OR (COALESCE(QDM.AverageAnswerScore,0) > 1.5 AND QDM.TotalPostRevisions >= 5)
+        OR (QDM.ViewCount > 5000 AND QDM.QuestionScore > 50)
+    )
+    AND (UBS.GoldBadges > 0 OR UBS.HasSpecificGoldBadge)
+    AND (QDM.ClosedDate IS NULL OR QDM.ClosedDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')
+    AND QDM.QuestionTitle IS NOT NULL
+
+UNION ALL
+
+SELECT
+    UE.UserId,
+    UE.DisplayName AS UserDisplayName,
+    UE.Reputation,
+    UE.ReputationRank,
+    UE.TotalQuestionsAsked,
+    UE.TotalAnswersProvided,
+    UE.TotalCommentsMade,
+    UE.TotalPostUpvotesReceived,
+    UE.TotalUpVotesGiven,
+    NULL AS QuestionId,
+    NULL AS QuestionTitle,
+    NULL AS QuestionScore,
+    NULL AS QuestionViewCount,
+    NULL AS QuestionFavoriteCount,
+    NULL AS TotalAnswerScore,
+    NULL AS ActualAnswerCount,
+    NULL AS AverageAnswerScore,
+    NULL AS IsQuestionClosed,
+    NULL AS QuestionEditDurationHours,
+    NULL AS TotalPostRevisions,
+    NULL AS TotalDistinctEditors,
+    UBS.TotalBadges,
+    UBS.GoldBadges,
+    UBS.HasSpecificGoldBadge,
+    NULL AS TopGlobalAssociatedTag,
+    NULL AS GlobalTagPopularityRank,
+    (SELECT COUNT(DISTINCT PL_sub.PostId) FROM PostLinks PL_sub WHERE PL_sub.RelatedPostId IN (SELECT Id FROM Posts WHERE OwnerUserId = UE.UserId)) AS TotalPostsLinkedToUserContent,
+    SUM(CASE WHEN RPA.UserId IS NOT NULL THEN 1 ELSE 0 END) OVER (PARTITION BY UE.UserId) AS UserRecentActivityScore,
+    NULL AS RollingAvgQuestionScoreByReputation,
+    COALESCE(NULLIF(UE.TotalCommentsMade, 0) * UE.TotalAnswersProvided / (NULLIF(UE.TotalQuestionsAsked, 0) + 1), 0) AS WeightedEngagementContributionScore,
+    'Highly_Active_Contributor_Non_Question_Focus' AS QuestionStatusCategory,
+    'Union_Branch_Active_Contributors' AS QuerySourceSegment
+FROM UserEngagement UE
+LEFT JOIN UserBadgeSummary UBS ON UE.UserId = UBS.UserId
+LEFT JOIN RecentPostUserActivity RPA ON UE.UserId = RPA.UserId
+WHERE
+    UE.Reputation > 2500
+    AND (UE.TotalCommentsMade > 100 OR UE.TotalUpVotesGiven > 750)
+    AND UE.LastAccessDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '4 months'
+    AND UE.TotalQuestionsAsked < 15
+    AND NOT EXISTS (SELECT 1 FROM Posts P_inner WHERE P_inner.OwnerUserId = UE.UserId AND P_inner.Score > 200)
+GROUP BY
+    UE.UserId, UE.DisplayName, UE.Reputation, UE.ReputationRank, UE.TotalQuestionsAsked, UE.TotalAnswersProvided, UE.TotalCommentsMade,
+    UE.TotalPostUpvotesReceived, UE.TotalUpVotesGiven, UBS.TotalBadges, UBS.GoldBadges, UBS.HasSpecificGoldBadge,
+    UE.LastAccessDate;

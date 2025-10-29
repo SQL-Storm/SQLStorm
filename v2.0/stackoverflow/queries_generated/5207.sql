@@ -1,0 +1,120 @@
+-- {"query": "5207.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 878} 
+WITH
+RecentActivePosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.PostTypeId
+  FROM Posts p
+  WHERE p.PostTypeId = 1 -- Questions
+    AND p.CreationDate >= CURRENT_DATE - INTERVAL '365 days'
+),
+TagHotness AS (
+  SELECT
+    t.TagName,
+    COUNT(p.PostId) AS QuestionCount,
+    AVG(p.Score) AS AvgScore,
+    SUM(p.ViewCount) AS TotalViews
+  FROM RecentActivePosts rap
+  CROSS APPLY (
+    SELECT unnest(string_to_array(substring(rap.Tags, 2, length(rap.Tags)-2), '><')) AS TagName
+  ) AS t
+  GROUP BY t.TagName
+),
+TopTags AS (
+  SELECT
+    t.TagName,
+    t.QuestionCount,
+    t.AvgScore,
+    t.TotalViews,
+    ROW_NUMBER() OVER (ORDER BY t.TotalViews DESC, t.AvgScore DESC) AS rn
+  FROM TagHotness t
+  ORDER BY TotalViews DESC
+  LIMIT 20
+),
+Engagement AS (
+  SELECT
+    p.Id AS PostId,
+    p.OwnerUserId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.LastActivityDate,
+    c.Id AS CommentId,
+    c.Score AS CommentScore,
+    c.CreationDate AS CommentDate,
+    v.VoteTypeId,
+    v.CreationDate AS VoteDate,
+    u.Reputation
+  FROM Posts p
+  LEFT JOIN Comments c ON c.PostId = p.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  LEFT JOIN Users u ON u.Id = p.OwnerUserId
+  WHERE p.PostTypeId = 1 -- Questions
+    AND p.LastActivityDate IS NOT NULL
+),
+CorrelatedStats AS (
+  SELECT
+    e.PostId,
+    e.OwnerUserId,
+    e.Title,
+    e.Score,
+    e.ViewCount,
+    e.LastActivityDate,
+    COUNT(DISTINCT e.CommentId) AS NumComments,
+    SUM(CASE WHEN e.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesOnPost,
+    SUM(CASE WHEN e.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesOnPost,
+    AVG(e.Reputation) AS AvgAuthorReputation,
+    MIN(e.CommentDate) AS FirstCommentDate
+  FROM Engagement e
+  GROUP BY e.PostId, e.OwnerUserId, e.Title, e.Score, e.ViewCount, e.LastActivityDate
+),
+Combined AS (
+  SELECT
+    cs.PostId,
+    cs.Title,
+    cs.Score,
+    cs.ViewCount,
+    cs.LastActivityDate,
+    cs.NumComments,
+    cs.UpvotesOnPost,
+    cs.DownvotesOnPost,
+    cs.AvgAuthorReputation,
+    cs.FirstCommentDate,
+    EXISTS (
+      SELECT 1
+      FROM PostLinks pl
+      WHERE pl.PostId = cs.PostId
+        AND pl.RelatedPostId IS NOT NULL
+        AND pl.LinkTypeId = 1
+    ) AS HasLinkedPost
+  FROM CorrelatedStats cs
+)
+SELECT
+  t.TagName AS tag,
+  t.QuestionCount,
+  t.AvgScore,
+  t.TotalViews,
+  c.PostId,
+  c.Title,
+  c.Score AS PostScore,
+  c.ViewCount AS PostViews,
+  c.LastActivityDate,
+  c.NumComments,
+  c.UpvotesOnPost,
+  c.DownvotesOnPost,
+  c.AvgAuthorReputation,
+  c.FirstCommentDate,
+  CASE
+    WHEN c.HasLinkedPost THEN 'Yes' ELSE 'No' END AS HasLinkedPostFlag,
+  (SELECT COUNT(*) FROM Votes v2 WHERE v2.PostId = c.PostId AND v2.VoteTypeId = 2) AS TotalUpvotes
+FROM TopTags t
+LEFT JOIN Combined c ON TRUE
+ORDER BY t.TotalViews DESC, c.LastActivityDate DESC
+LIMIT 100;

@@ -1,0 +1,188 @@
+-- {"query": "1417.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2716} 
+
+WITH UserBaseStats AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate,
+        U.LastAccessDate,
+        DATE_PART('day', U.LastAccessDate - U.CreationDate) AS DaysRegistered,
+        COALESCE(U.Location, 'Unspecified') AS UserLocationFull,
+        CASE
+            WHEN U.AboutMe IS NULL OR LENGTH(U.AboutMe) < 10 THEN 'NoBio'
+            ELSE 'HasBio'
+        END AS HasAboutMe,
+        COUNT(DISTINCT P.Id) AS TotalPostsCreatedByUser,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMadeByUser,
+        COUNT(DISTINCT B.Id) AS TotalBadgesReceivedByUser,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesGivenByUser,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesGivenByUser,
+        COUNT(DISTINCT PL_Source.RelatedPostId) FILTER (WHERE PL_Source.LinkTypeId = 3) AS QuestionsDuplicatedByOthersCount,
+        COUNT(DISTINCT PL_Target.RelatedPostId) FILTER (WHERE PL_Target.LinkTypeId = 1) AS QuestionsLinkingToOthersCount,
+        MAX(CASE WHEN P.PostTypeId = 1 THEN P.ViewCount ELSE 0 END) AS MaxQuestionViews,
+        MAX(P.Score) AS MaxPostScore
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN Votes V ON U.Id = V.UserId
+    LEFT JOIN PostLinks PL_Source ON P.Id = PL_Source.PostId
+    LEFT JOIN PostLinks PL_Target ON P.Id = PL_Target.PostId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Location, U.AboutMe
+),
+PostDetailedMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.LastEditDate,
+        P.ClosedDate,
+        P.Score AS PostScore,
+        P.ViewCount AS PostViewCount,
+        P.FavoriteCount,
+        P.ParentId,
+        STRING_TO_ARRAY(SUBSTRING(P.Tags, 2, LENGTH(P.Tags)-2), '><') AS TagArray,
+        COUNT(DISTINCT PH_Edit.Id) FILTER (WHERE PH_Edit.PostHistoryTypeId IN (4,5,6)) AS EditCount,
+        COUNT(DISTINCT PH_Close.Id) FILTER (WHERE PH_Close.PostHistoryTypeId = 10) AS CloseVoteEventCount,
+        COUNT(DISTINCT PH_Delete.Id) FILTER (WHERE PH_Delete.PostHistoryTypeId = 12) AS DeleteVoteEventCount,
+        DATE_PART('hour', (SELECT MIN(PH_MinEdit.CreationDate) FROM PostHistory PH_MinEdit WHERE PH_MinEdit.PostId = P.Id AND PH_MinEdit.PostHistoryTypeId IN (4,5,6)) - P.CreationDate) AS TimeToFirstEditHours,
+        (SELECT COUNT(P_Ans.Id) FROM Posts P_Ans WHERE P_Ans.ParentId = P.Id AND P_Ans.PostTypeId = 2) AS AnswerCountOnQuestion,
+        (
+            SELECT A.CreationDate
+            FROM Posts A
+            WHERE A.Id = P.AcceptedAnswerId AND P.PostTypeId = 1
+        ) AS AcceptedAnswerCreationDate,
+        SUM(CASE WHEN V_Rec.VoteTypeId = 2 THEN 1 ELSE 0 END) AS PostUpVotesReceived,
+        SUM(CASE WHEN V_Rec.VoteTypeId = 3 THEN 1 ELSE 0 END) AS PostDownVotesReceived
+    FROM Posts P
+    LEFT JOIN PostHistory PH_Edit ON P.Id = PH_Edit.PostId AND PH_Edit.PostHistoryTypeId IN (4,5,6)
+    LEFT JOIN PostHistory PH_Close ON P.Id = PH_Close.PostId AND PH_Close.PostHistoryTypeId = 10
+    LEFT JOIN PostHistory PH_Delete ON P.Id = PH_Delete.PostId AND PH_Delete.PostHistoryTypeId = 12
+    LEFT JOIN Votes V_Rec ON P.Id = V_Rec.PostId AND V_Rec.VoteTypeId IN (2,3)
+    GROUP BY
+        P.Id, P.PostTypeId, P.OwnerUserId, P.CreationDate, P.LastEditDate, P.ClosedDate,
+        P.Score, P.ViewCount, P.FavoriteCount, P.ParentId, P.Tags, P.AcceptedAnswerId
+),
+UserAggregatedPostMetrics AS (
+    SELECT
+        PDM.OwnerUserId AS UserId,
+        COUNT(PDM.PostId) FILTER (WHERE PDM.PostTypeId = 1) AS QuestionsPosted,
+        COUNT(PDM.PostId) FILTER (WHERE PDM.PostTypeId = 2) AS AnswersPosted,
+        SUM(PDM.PostScore) AS TotalPostScoreReceived,
+        AVG(PDM.PostScore) FILTER (WHERE PDM.PostTypeId = 1) AS AvgQuestionScore,
+        AVG(PDM.PostScore) FILTER (WHERE PDM.PostTypeId = 2) AS AvgAnswerScore,
+        SUM(PDM.EditCount) AS TotalPostEdits,
+        SUM(PDM.CloseVoteEventCount) AS TotalCloseVoteEventsReceived,
+        SUM(PDM.DeleteVoteEventCount) AS TotalDeleteVoteEventsReceived,
+        AVG(PDM.TimeToFirstEditHours) AS AvgTimeToFirstEditHours,
+        COUNT(PDM.PostId) FILTER (WHERE PDM.AcceptedAnswerCreationDate IS NOT NULL) AS QuestionsWithAcceptedAnswer,
+        AVG(DATE_PART('hour', PDM.AcceptedAnswerCreationDate - PDM.PostCreationDate)) AS AvgTimeToAcceptAnswerHours,
+        SUM(PDM.FavoriteCount) AS TotalFavoriteCounts,
+        NTILE(4) OVER (ORDER BY SUM(PDM.PostScore) DESC) AS PostScoreQuartile,
+        SUM(PDM.PostUpVotesReceived) AS TotalUpVotesReceivedOnUserPosts,
+        SUM(PDM.PostDownVotesReceived) AS TotalDownVotesReceivedOnUserPosts
+    FROM PostDetailedMetrics PDM
+    GROUP BY PDM.OwnerUserId
+),
+TagEngagementSummary AS (
+    SELECT
+        PDM.OwnerUserId AS UserId,
+        UNNEST(PDM.TagArray) AS TagName,
+        COUNT(PDM.PostId) AS PostsInTag,
+        SUM(PDM.PostScore) AS ScoreInTag,
+        AVG(PDM.PostScore) AS AvgScoreInTag
+    FROM PostDetailedMetrics PDM
+    WHERE PDM.PostTypeId = 1 AND PDM.TagArray IS NOT NULL
+    GROUP BY PDM.OwnerUserId, UNNEST(PDM.TagArray)
+),
+UserTopTag AS (
+    SELECT
+        TES.UserId,
+        TES.TagName AS TopTagName,
+        TES.PostsInTag,
+        TES.ScoreInTag,
+        ROW_NUMBER() OVER (PARTITION BY TES.UserId ORDER BY TES.PostsInTag DESC, TES.ScoreInTag DESC) AS rn
+    FROM TagEngagementSummary TES
+)
+SELECT
+    UBS.UserId,
+    UBS.DisplayName,
+    UBS.Reputation,
+    UBS.DaysRegistered,
+    UBS.UserLocationFull AS UserLocation,
+    UBS.HasAboutMe,
+    UBS.TotalPostsCreatedByUser,
+    UBS.TotalCommentsMadeByUser,
+    UBS.TotalBadgesReceivedByUser,
+    UBS.TotalUpVotesGivenByUser,
+    UBS.TotalDownVotesGivenByUser,
+    UBS.QuestionsDuplicatedByOthersCount,
+    UBS.QuestionsLinkingToOthersCount,
+    UAPS.QuestionsPosted,
+    UAPS.AnswersPosted,
+    UAPS.TotalPostScoreReceived,
+    UAPS.AvgQuestionScore,
+    UAPS.AvgAnswerScore,
+    UAPS.TotalPostEdits,
+    UAPS.TotalCloseVoteEventsReceived,
+    UAPS.TotalDeleteVoteEventsReceived,
+    UAPS.QuestionsWithAcceptedAnswer,
+    COALESCE(UAPS.AvgTimeToAcceptAnswerHours, 0.0) AS AvgTimeToAcceptAnswerHours,
+    UAPS.TotalFavoriteCounts,
+    UAPS.PostScoreQuartile,
+    UAPS.TotalUpVotesReceivedOnUserPosts,
+    UAPS.TotalDownVotesReceivedOnUserPosts,
+    UTT.TopTagName,
+    UTT.PostsInTag AS TopTagPosts,
+    UTT.ScoreInTag AS TopTagScore,
+    (UAPS.TotalCloseVoteEventsReceived + UAPS.TotalDeleteVoteEventsReceived + (UAPS.TotalPostEdits / 2.0)) AS UserControversyIndex,
+    (
+        SELECT
+            MAX(PH.CreationDate)
+        FROM PostHistory PH
+        WHERE PH.UserId = UBS.UserId AND PH.PostHistoryTypeId IN (10, 12)
+    ) AS LastControversialActivityDate,
+    UPPER(SUBSTRING(UBS.DisplayName, 1, 1)) || LPAD(SUBSTRING(UBS.DisplayName, 2), LENGTH(UBS.DisplayName) - 1, '*') AS MaskedDisplayName,
+    CASE
+        WHEN UBS.MaxPostScore > 50 AND UAPS.AvgQuestionScore > 10 THEN 'High Impact Contributor'
+        WHEN UAPS.QuestionsPosted >= 10 AND UAPS.QuestionsWithAcceptedAnswer >= 5 THEN 'Helpful Questioner'
+        WHEN UAPS.AnswersPosted >= 20 AND UAPS.TotalPostScoreReceived > 100 THEN 'Prolific Answerer'
+        ELSE 'General Contributor'
+    END AS UserContributionProfile,
+    T.Count AS TopTagGlobalPostCount,
+    T.WikiPostId IS NOT NULL AS TopTagHasWiki,
+    (
+        SELECT COUNT(DISTINCT C.Id)
+        FROM Comments C
+        JOIN Posts P ON C.PostId = P.Id
+        WHERE P.OwnerUserId = UBS.UserId AND C.CreationDate > (CURRENT_TIMESTAMP - INTERVAL '30 days')
+    ) AS RecentCommentsOnUserPosts,
+    AVG(UBS.Reputation) OVER (PARTITION BY UTT.TopTagName) AS AvgReputationInTopTag,
+    RANK() OVER (ORDER BY (UAPS.TotalUpVotesReceivedOnUserPosts - UAPS.TotalDownVotesReceivedOnUserPosts) DESC) AS NetPostVotesRank
+FROM UserBaseStats UBS
+LEFT JOIN UserAggregatedPostMetrics UAPS ON UBS.UserId = UAPS.UserId
+LEFT JOIN UserTopTag UTT ON UBS.UserId = UTT.UserId AND UTT.rn = 1
+LEFT JOIN Tags T ON UTT.TopTagName = T.TagName
+WHERE
+    UBS.Reputation >= 1000
+    AND UBS.DaysRegistered >= 365
+    AND UBS.TotalPostsCreatedByUser >= 10
+    AND (
+        (UAPS.QuestionsPosted > 0 AND UAPS.QuestionsWithAcceptedAnswer > 0) OR (UAPS.AnswersPosted > 0 AND UAPS.AvgAnswerScore > 5)
+    )
+    AND (
+        UBS.UserLocationFull NOT LIKE '%Mars%' AND UBS.UserLocationFull NOT LIKE '%Moon%'
+    )
+    AND EXISTS (
+        SELECT 1
+        FROM Badges B
+        WHERE B.UserId = UBS.UserId AND B.Class = 1
+    )
+    AND (UAPS.TotalPostEdits > 0 OR UAPS.TotalFavoriteCounts > 0)
+ORDER BY
+    UserControversyIndex DESC,
+    NetPostVotesRank ASC,
+    UBS.Reputation DESC
+LIMIT 500;

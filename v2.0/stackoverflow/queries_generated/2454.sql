@@ -1,0 +1,246 @@
+-- {"query": "2454.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1985} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        array[t.Id] as TagPath
+    from Tags t
+    where t.IsRequired = 1
+
+    union all
+
+    select
+        c.Id,
+        c.TagName,
+        c.Count,
+        c.ExcerptPostId,
+        c.WikiPostId,
+        c.IsModeratorOnly,
+        c.IsRequired,
+        r.TagPath || c.Id
+    from Tags c
+    join RecursiveTagHierarchy r on c.IsRequired = 1 and c.Id != all(r.TagPath)
+    where cardinality(r.TagPath) < 3
+),
+PostScoresByUser as (
+    select
+        p.OwnerUserId,
+        p.PostTypeId,
+        count(*) as PostCount,
+        sum(coalesce(p.Score,0)) as TotalScore,
+        avg(coalesce(p.Score,0)) as AvgScore,
+        max(p.Score) as MaxScore,
+        min(p.Score) as MinScore
+    from Posts p
+    where p.OwnerUserId is not null
+    group by p.OwnerUserId, p.PostTypeId
+),
+UserBadgeRanks as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserAggregates as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Location,
+        coalesce(pb.PostCount,0) as QuestionCount,
+        coalesce(pb.TotalScore,0) as QuestionScore,
+        coalesce(ab.BadgeCount,0) filter (where ab.Class = 1) as GoldBadges,
+        coalesce(ab.BadgeCount,0) filter (where ab.Class = 2) as SilverBadges,
+        coalesce(ab.BadgeCount,0) filter (where ab.Class = 3) as BronzeBadges,
+        row_number() over (order by u.Reputation desc) as ReputationRank,
+        lead(u.Reputation) over (order by u.Reputation desc) as NextHighestReputation,
+        lag(u.Reputation) over (order by u.Reputation desc) as PrevHighestReputation
+    from Users u
+    left join (
+        select OwnerUserId, PostCount, TotalScore from PostScoresByUser
+        where PostTypeId = 1
+    ) pb on u.Id = pb.OwnerUserId
+    left join UserBadgeRanks ab on u.Id = ab.UserId
+),
+PostsWithLatestCloseReason as (
+    select
+        p.Id,
+        p.Title,
+        p.Body,
+        p.Tags,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        ph.Comment as CloseReasonId,
+        crt.Name as CloseReasonName
+    from Posts p
+    left join lateral (
+        select phinner.Comment
+        from PostHistory phinner
+        where phinner.PostId = p.Id and phinner.PostHistoryTypeId = 10 -- Post Closed
+        order by phinner.CreationDate desc
+        limit 1
+    ) ph on true
+    left join CloseReasonTypes crt on crt.Id::varchar = ph.Comment
+),
+UserRecentActivity as (
+    select
+        ph.UserId,
+        ph.PostId,
+        max(ph.CreationDate) as LastEditDate
+    from PostHistory ph
+    group by ph.UserId, ph.PostId
+),
+UserNetwork as (
+    select distinct
+        p.OwnerUserId as UserA,
+        pl.RelatedPostId,
+        p2.OwnerUserId as UserB
+    from PostLinks pl
+    join Posts p on pl.PostId = p.Id
+    join Posts p2 on pl.RelatedPostId = p2.Id
+    where p.OwnerUserId is not null and p2.OwnerUserId is not null and p.OwnerUserId != p2.OwnerUserId
+),
+MutualUserConnections as (
+    select
+        un1.UserA,
+        un1.UserB
+    from UserNetwork un1
+    join UserNetwork un2 on un1.UserA = un2.UserB and un1.UserB = un2.UserA
+),
+UserStatsWithConnections as (
+    select
+        ua.Id,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.QuestionCount,
+        ua.GoldBadges,
+        ua.SilverBadges,
+        ua.BronzeBadges,
+        count(muc.UserB) as MutualConnectionCount
+    from UserAggregates ua
+    left join MutualUserConnections muc on ua.Id = muc.UserA
+    group by ua.Id, ua.DisplayName, ua.Reputation, ua.QuestionCount, ua.GoldBadges, ua.SilverBadges, ua.BronzeBadges
+),
+AnswerScores as (
+    select
+        a.Id,
+        a.ParentId,
+        a.Score,
+        u.Reputation as OwnerReputation,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts a
+    left join Users u on a.OwnerUserId = u.Id
+    where a.PostTypeId = 2
+),
+QuestionWithTopAnswer as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score as QuestionScore,
+        a.Id as TopAnswerId,
+        a.Score as TopAnswerScore,
+        a.OwnerReputation as TopAnswerOwnerReputation
+    from Posts q
+    left join AnswerScores a on q.Id = a.ParentId and a.AnswerRank = 1
+    where q.PostTypeId = 1
+),
+FilteredComments as (
+    select 
+        c.PostId,
+        count(*) filter (where c.Score > 2) as HighScoreComments,
+        count(*) filter (where c.Text ~* '\bperformance\b') as CommentsMentioningPerformance
+    from Comments c
+    group by c.PostId
+),
+CombinedPostData as (
+    select
+        q.Id,
+        q.Title,
+        q.Tags,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        coalesce(fc.HighScoreComments, 0) as HighScoreComments,
+        coalesce(fc.CommentsMentioningPerformance,0) as CommentsMentioningPerformance,
+        pwta.TopAnswerId,
+        pwta.TopAnswerScore,
+        pwta.TopAnswerOwnerReputation,
+        p.CloseReasonName
+    from Posts q
+    left join FilteredComments fc on q.Id = fc.PostId
+    left join QuestionWithTopAnswer pwta on q.Id = pwta.QuestionId
+    left join PostsWithLatestCloseReason p on q.Id = p.Id
+    where q.PostTypeId = 1
+),
+UnionsExample as (
+    select Id, Title, 'Question' as PostCategory, Score from Posts where PostTypeId = 1 and Score > 10
+    union all
+    select Id, Title, 'Wiki' as PostCategory, Score from Posts where PostTypeId in (3,5) and Score > 10
+),
+FinalResults as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.QuestionCount,
+        u.GoldBadges,
+        u.SilverBadges,
+        u.BronzeBadges,
+        u.MutualConnectionCount,
+        cpd.Title,
+        cpd.Score as QuestionScore,
+        cpd.ViewCount,
+        cpd.HighScoreComments,
+        cpd.CommentsMentioningPerformance,
+        cpd.TopAnswerId,
+        cpd.TopAnswerScore,
+        cpd.TopAnswerOwnerReputation,
+        cpd.CloseReasonName,
+        row_number() over (partition by u.Id order by cpd.Score desc nulls last) as QuestionRank
+    from UserStatsWithConnections u
+    join CombinedPostData cpd on cpd.OwnerUserId = u.Id
+    where u.Reputation > 1000
+),
+AggregatedUserStats as (
+    select
+        UserId,
+        DisplayName,
+        sum(QuestionCount) as TotalQuestions,
+        sum(HighScoreComments) as TotalHighScoreComments,
+        avg(CommentsMentioningPerformance) as AvgCommentsMentioningPerformance,
+        max(TopAnswerScore) as MaxTopAnswerScore,
+        count(distinct TopAnswerId) as AnsweredQuestionsCount,
+        max(MutualConnectionCount) as MaxMutualConnections
+    from FinalResults
+    group by UserId, DisplayName
+)
+select 
+    aus.UserId,
+    aus.DisplayName,
+    aus.TotalQuestions,
+    aus.TotalHighScoreComments,
+    round(aus.AvgCommentsMentioningPerformance, 2) as AvgCommentsMentioningPerformance,
+    aus.MaxTopAnswerScore,
+    aus.AnsweredQuestionsCount,
+    aus.MaxMutualConnections,
+    case 
+        when aus.MaxMutualConnections > 5 and aus.TotalHighScoreComments > 10 then 'Highly Engaged & Connected'
+        when aus.MaxMutualConnections > 5 then 'Highly Connected'
+        when aus.TotalHighScoreComments > 10 then 'Highly Engaged'
+        else 'Normal'
+    end as UserEngagementCategory
+from AggregatedUserStats aus
+order by aus.TotalQuestions desc, aus.TotalHighScoreComments desc
+limit 50;

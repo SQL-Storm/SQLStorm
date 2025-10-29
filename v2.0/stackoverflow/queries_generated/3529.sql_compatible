@@ -1,0 +1,96 @@
+WITH user_stats AS (
+    SELECT u.id                                      AS user_id,
+           u.displayname,
+           u.reputation,
+           COALESCE(u.upvotes, 0) - COALESCE(u.downvotes, 0) AS net_votes,
+           COUNT(b.id)                               AS badge_cnt,
+           SUM(CASE b.class
+                   WHEN 1 THEN 100
+                   WHEN 2 THEN 50
+                   ELSE 10
+               END)                                 AS badge_score
+    FROM   users u
+    LEFT JOIN badges b
+           ON b.userid = u.id
+    GROUP BY u.id, u.displayname, u.reputation,
+             u.upvotes, u.downvotes
+),
+
+tag_activity AS (
+    SELECT tag.tagname,
+           p.owneruserid,
+           COUNT(*)                                 AS posts_in_tag,
+           SUM(CASE WHEN p.posttypeid = 1 THEN p.score ELSE 0 END) AS question_score,
+           SUM(CASE WHEN p.posttypeid = 2 THEN p.score ELSE 0 END) AS answer_score
+    FROM   posts p
+    LEFT JOIN LATERAL
+           unnest(string_to_array(trim(both '<>' FROM p.tags), '><')) AS tagval(tag) ON true
+    LEFT JOIN tags tag
+           ON tag.tagname = tagval.tag
+    WHERE  p.owneruserid IS NOT NULL
+    GROUP BY tag.tagname, p.owneruserid
+),
+
+ranked_tag_users AS (
+    SELECT ta.tagname,
+           ta.owneruserid,
+           ta.posts_in_tag,
+           ta.question_score,
+           ta.answer_score,
+           ROW_NUMBER() OVER (PARTITION BY ta.tagname
+                              ORDER BY (ta.question_score + ta.answer_score) DESC) AS tag_rank
+    FROM   tag_activity ta
+),
+
+latest_post AS (
+    SELECT p.owneruserid,
+           MAX(p.creationdate)                                 AS latest_date,
+           -- Standard SQL: use KEEP/DENSE_RANK or a correlated subquery to get title; here use MAX on title filtered by latest_date via subquery
+           (SELECT p2.title
+            FROM posts p2
+            WHERE p2.owneruserid = p.owneruserid
+              AND p2.creationdate = (SELECT MAX(p3.creationdate) FROM posts p3 WHERE p3.owneruserid = p.owneruserid)
+            LIMIT 1) AS latest_title
+    FROM   posts p
+    GROUP  BY p.owneruserid
+)
+
+SELECT us.user_id,
+       us.displayname,
+       us.reputation,
+       us.net_votes,
+       us.badge_cnt,
+       us.badge_score,
+       COALESCE(rt.tagname, '<no tag>')                         AS top_tag,
+       rt.posts_in_tag,
+       rt.question_score,
+       rt.answer_score,
+       rt.tag_rank,
+       lp.latest_title
+FROM   user_stats us
+LEFT   JOIN ranked_tag_users rt
+          ON rt.owneruserid = us.user_id
+         AND rt.tag_rank = 1
+LEFT   JOIN latest_post lp
+          ON lp.owneruserid = us.user_id
+WHERE  (us.reputation > 1000 OR us.badge_score > 200)
+  AND (rt.tagname IS NOT NULL OR us.badge_cnt = 0)
+
+UNION ALL
+
+SELECT u.id,
+       u.displayname,
+       u.reputation,
+       COALESCE(u.upvotes, 0) - COALESCE(u.downvotes, 0)        AS net_votes,
+       0                                                     AS badge_cnt,
+       0                                                     AS badge_score,
+       NULL                                                  AS top_tag,
+       NULL                                                  AS posts_in_tag,
+       NULL                                                  AS question_score,
+       NULL                                                  AS answer_score,
+       NULL                                                  AS tag_rank,
+       NULL                                                  AS latest_title
+FROM   users u
+WHERE  NOT EXISTS (SELECT 1 FROM posts p WHERE p.owneruserid = u.id)
+
+ORDER BY 1;

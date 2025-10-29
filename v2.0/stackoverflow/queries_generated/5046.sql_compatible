@@ -1,0 +1,97 @@
+WITH
+RecentActivePosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.OwnerUserId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.PostTypeId,
+    p.ParentId,
+    p.AcceptedAnswerId
+  FROM Posts p
+  WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '90' DAY
+),
+TopTags AS (
+  SELECT
+    t.TagName,
+    t.Count AS TagCount
+  FROM Tags t
+  WHERE COALESCE(t.IsModeratorOnly, FALSE) = FALSE
+),
+UserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.AccountId,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesGiven,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesGiven,
+    MAX(v.CreationDate) AS LastVoteDate
+  FROM Users u
+  LEFT JOIN Votes v ON v.UserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.AccountId
+),
+TagFollowerJoin AS (
+  SELECT
+    u.Id AS UserId,
+    b.Name AS TagName
+  FROM Users u
+  JOIN Badges b ON b.UserId = u.Id AND b.Name = 'TagFollower'
+  JOIN Tags t ON t.TagName = b.Name
+),
+ConcurrentEngagement AS (
+  SELECT
+    p.PostId,
+    p.OwnerUserId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.LastActivityDate,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate DESC) AS rn
+  FROM RecentActivePosts p
+  WHERE p.LastActivityDate IS NOT NULL
+)
+SELECT
+  rp.PostId,
+  rp.Title AS PostTitle,
+  rp.Tags,
+  rp.Score AS PostScore,
+  rp.ViewCount,
+  rp.AnswerCount,
+  rp.CommentCount,
+  ru.UserId,
+  ru.DisplayName AS OwnerDisplayName,
+  ru.Reputation,
+  ru.LastVoteDate,
+  t.TagName AS HighlightTag,
+  ta.TagCount,
+  rp.LastActivityDate
+FROM ConcurrentEngagement rp
+LEFT JOIN UserActivity ru ON ru.UserId = rp.OwnerUserId
+LEFT JOIN TopTags ta ON ta.TagName = ANY(string_to_array(SUBSTRING(rp.Tags FROM 2 FOR LENGTH(rp.Tags)-2), '><'))
+LEFT JOIN (
+  SELECT DISTINCT ON (pl.PostId) pl.PostId, pl.RelatedPostId
+  FROM PostLinks pl
+  WHERE pl.LinkTypeId = 1
+  ORDER BY pl.PostId, pl.CreationDate DESC
+) pl ON pl.PostId = rp.PostId
+LEFT JOIN PostLinks pl2 ON pl2.PostId = rp.PostId AND pl2.RelatedPostId IS NOT NULL
+LEFT JOIN Tags t ON t.Id = (
+  SELECT t2.Id
+  FROM Tags t2
+  WHERE t2.TagName = ANY(string_to_array(SUBSTRING(rp.Tags FROM 2 FOR LENGTH(rp.Tags)-2), '><'))
+  LIMIT 1
+)
+WHERE rp.rn = 1
+  AND rp.OwnerUserId IS NOT NULL
+ORDER BY rp.LastActivityDate DESC
+LIMIT 100;

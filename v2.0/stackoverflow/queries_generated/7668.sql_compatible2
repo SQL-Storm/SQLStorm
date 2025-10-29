@@ -1,0 +1,144 @@
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END), 0) AS TotalQuestionScore,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END), 0) AS TotalAnswerScore,
+    COUNT(DISTINCT b.Id) AS Badges,
+    COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+    COALESCE(AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END), 0) AS AvgQuestionScore,
+    COALESCE(AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END), 0) AS AvgAnswerScore,
+    COUNT(DISTINCT c.Id) AS TotalComments,
+    COUNT(DISTINCT ph.Id) AS TotalEdits,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN ph.Id END) AS ModerationActions,
+    COALESCE(MAX(p.CreationDate), DATE '1900-01-01') AS LastPostDate,
+    COALESCE(MAX(ph.CreationDate), DATE '1900-01-01') AS LastEditDate,
+    COALESCE(MAX(c.CreationDate), DATE '1900-01-01') AS LastCommentDate,
+    COALESCE(MAX(u.LastAccessDate), DATE '1900-01-01') AS LastAccess,
+    CASE 
+        WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+            ROUND(
+                (COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) * 100.0 / COUNT(DISTINCT p.Id)), 
+                2
+            )
+        ELSE 0 
+    END AS QuestionPercentage,
+    CASE 
+        WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+            ROUND(
+                (COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) * 100.0 / COUNT(DISTINCT p.Id)), 
+                2
+            )
+        ELSE 0 
+    END AS AnswerPercentage,
+    RANK() OVER (ORDER BY SUM(p.Score) DESC) AS RankingByScore,
+    DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS RankingByPostCount,
+    ROW_NUMBER() OVER (ORDER BY u.CreationDate ASC) AS NewbieRank,
+    LAG(u.DisplayName) OVER (ORDER BY u.Reputation DESC) AS PreviousTopReputationUser,
+    LEAD(u.DisplayName) OVER (ORDER BY u.Reputation DESC) AS NextTopReputationUser,
+    CASE 
+        WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 0 
+         AND COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) > 0 
+        THEN 'Active' 
+        ELSE 'Inactive' 
+    END AS ActivityStatus,
+    CASE 
+        WHEN COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) > 0 
+          OR COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) > 0 
+          OR COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) > 0
+        THEN 'BadgeHolder'
+        ELSE 'NoBadge'
+    END AS BadgeStatus,
+    (
+        SELECT 
+            ('Question: ' || COALESCE(p2.Title, '') || ' (Score: ' || COALESCE(CAST(p2.Score AS VARCHAR), '0') || ')')
+        FROM Posts p2
+        WHERE p2.PostTypeId = 1 
+          AND p2.OwnerUserId = u.Id
+          AND p2.Score = (
+            SELECT MAX(p3.Score) 
+            FROM Posts p3 
+            WHERE p3.PostTypeId = 1 AND p3.OwnerUserId = u.Id
+          )
+        ORDER BY p2.Score DESC, p2.Id ASC
+        LIMIT 1
+    ) AS TopScoringQuestion,
+    (
+        SELECT 
+            ('Answer: ' || COALESCE(p2.Title, '') || ' (Score: ' || COALESCE(CAST(p2.Score AS VARCHAR), '0') || ')')
+        FROM Posts p2
+        WHERE p2.PostTypeId = 2 
+          AND p2.OwnerUserId = u.Id
+          AND p2.Score = (
+            SELECT MAX(p3.Score) 
+            FROM Posts p3 
+            WHERE p3.PostTypeId = 2 AND p3.OwnerUserId = u.Id
+          )
+        ORDER BY p2.Score DESC, p2.Id ASC
+        LIMIT 1
+    ) AS TopScoringAnswer,
+    STRING_AGG(DISTINCT COALESCE(p.Tags, ''), ', ') AS AllTags,
+    STRING_AGG(DISTINCT p.Title, ' | ') AS AllTitles,
+    COALESCE(
+        (
+            SELECT COUNT(*) 
+            FROM Posts p3 
+            JOIN PostLinks pl ON p3.Id = pl.PostId 
+            WHERE p3.OwnerUserId = u.Id 
+              AND pl.LinkTypeId = 3
+        ), 
+        0
+    ) AS DuplicateLinksCount,
+    CASE 
+        WHEN (TIMESTAMP '2024-10-01 12:34:56' - u.CreationDate) > INTERVAL '365 days'
+        THEN 'Veteran' 
+        WHEN (TIMESTAMP '2024-10-01 12:34:56' - u.CreationDate) > INTERVAL '180 days'
+        THEN 'SemiVeteran' 
+        ELSE 'Newbie' 
+    END AS AccountAgeCategory
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN Comments c ON u.Id = c.UserId
+LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+WHERE (u.CreationDate >= DATE '2010-01-01' OR u.CreationDate IS NULL)
+  AND u.Id IN (
+    SELECT DISTINCT UserId 
+    FROM Badges 
+    WHERE Date >= DATE '2020-01-01'
+    UNION 
+    SELECT DISTINCT OwnerUserId AS UserId
+    FROM Posts 
+    WHERE CreationDate >= DATE '2020-01-01'
+    UNION
+    SELECT DISTINCT UserId 
+    FROM Comments 
+    WHERE CreationDate >= DATE '2020-01-01'
+  )
+  AND u.Reputation > 0
+GROUP BY 
+    u.Id, 
+    u.DisplayName, 
+    u.Reputation, 
+    u.CreationDate,
+    u.LastAccessDate
+HAVING 
+    (
+      COUNT(DISTINCT p.Id) >= 5
+      AND (
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) >= 1 
+        OR COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) >= 1
+      )
+    )
+    OR COUNT(DISTINCT b.Id) >= 3
+ORDER BY 
+    SUM(p.Score) DESC,
+    COUNT(DISTINCT p.Id) DESC,
+    u.Reputation DESC
+OFFSET 0 ROWS
+FETCH NEXT 1000 ROWS ONLY;

@@ -1,0 +1,109 @@
+-- {"query": "3585.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2193} 
+WITH QuestionStats AS (
+    SELECT
+        OwnerUserId               AS UserId,
+        COUNT(*)                  AS QCount,
+        SUM(COALESCE(Score,0))    AS QScoreSum,
+        MAX(CreationDate)         AS LastQuestionDate,
+        AVG(AnswerCount)          AS AvgAnswersPerQuestion,
+        SUM(COALESCE(FavoriteCount,0)) AS QFavSum,
+        STRING_AGG(DISTINCT TRIM(BOTH '<>' FROM UNNEST(string_to_array(Tags, '><'))), ',') AS AllTags
+    FROM Posts
+    WHERE PostTypeId = 1
+    GROUP BY OwnerUserId
+),
+AnswerStats AS (
+    SELECT
+        OwnerUserId                           AS UserId,
+        COUNT(*)                              AS ACount,
+        SUM(COALESCE(Score,0))                AS AScoreSum,
+        MAX(CreationDate)                     AS LastAnswerDate,
+        SUM(CASE WHEN Id = COALESCE(p.AcceptedAnswerId,0) THEN 1 ELSE 0 END) AS AcceptedAnswers
+    FROM Posts p
+    WHERE PostTypeId = 2
+    GROUP BY OwnerUserId
+),
+BadgeStats AS (
+    SELECT
+        UserId,
+        COUNT(*) FILTER (WHERE Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE Class = 3) AS BronzeBadges,
+        COUNT(*)                         AS TotalBadges
+    FROM Badges
+    GROUP BY UserId
+),
+VoteStats AS (
+    SELECT
+        PostId,
+        SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+    FROM Votes
+    GROUP BY PostId
+),
+UserActivity AS (
+    SELECT
+        u.Id                                     AS Id,
+        COALESCE(q.QCount,0)                     AS QCount,
+        COALESCE(a.ACount,0)                     AS ACount,
+        COALESCE(b.TotalBadges,0)                AS BadgeCount,
+        GREATEST(
+            COALESCE(q.LastQuestionDate,'1970-01-01'::timestamp),
+            COALESCE(a.LastAnswerDate,'1970-01-01'::timestamp),
+            u.LastAccessDate
+        )                                        AS LastActivity
+    FROM Users u
+    LEFT JOIN QuestionStats q ON q.UserId = u.Id
+    LEFT JOIN AnswerStats   a ON a.UserId = u.Id
+    LEFT JOIN BadgeStats    b ON b.UserId = u.Id
+)
+SELECT
+    ua.Id,
+    ua.DisplayName,
+    u.Reputation,
+    ua.QCount,
+    ua.ACount,
+    ua.BadgeCount,
+    ua.LastActivity,
+    COALESCE(q.QScoreSum,0) + COALESCE(a.AScoreSum,0)               AS TotalScore,
+    RANK() OVER (ORDER BY (u.Reputation + COALESCE(q.QScoreSum,0) + COALESCE(a.AScoreSum,0)) DESC) AS ReputationScoreRank,
+    CASE
+        WHEN ua.QCount = 0 AND ua.ACount = 0 THEN 'Inactive'
+        WHEN ua.QCount > ua.ACount                THEN 'Questioner'
+        ELSE                                      'Answerer'
+    END                                                            AS PrimaryRole,
+    COALESCE(q.AllTags,'')                                         AS TagsUsed,
+    COALESCE(v.UpVotes,0) - COALESCE(v.DownVotes,0)                 AS NetPostVotes
+FROM UserActivity ua
+JOIN Users u ON u.Id = ua.Id
+LEFT JOIN QuestionStats q ON q.UserId = ua.Id
+LEFT JOIN AnswerStats   a ON a.UserId = ua.Id
+LEFT JOIN VoteStats v ON v.PostId = (
+    SELECT Id
+    FROM Posts
+    WHERE OwnerUserId = ua.Id
+    ORDER BY CreationDate DESC
+    LIMIT 1
+)
+WHERE ua.LastActivity > cast('2024-10-01' as date) - INTERVAL '1 year'
+
+UNION ALL
+
+SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    0                               AS QCount,
+    0                               AS ACount,
+    0                               AS BadgeCount,
+    u.LastAccessDate                AS LastActivity,
+    0                               AS TotalScore,
+    NULL                            AS ReputationScoreRank,
+    'New'                           AS PrimaryRole,
+    ''                              AS TagsUsed,
+    0                               AS NetPostVotes
+FROM Users u
+WHERE NOT EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id)
+  AND u.CreationDate > cast('2024-10-01' as date) - INTERVAL '6 months'
+
+ORDER BY ReputationScoreRank NULLS LAST, TotalScore DESC;

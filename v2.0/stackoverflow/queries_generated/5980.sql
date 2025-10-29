@@ -1,0 +1,116 @@
+-- {"query": "5980.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 895} 
+WITH RankedPosts AS (
+  SELECT
+    p.Id,
+    p.PostTypeId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.CloseReasonId,
+    ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC, p.CreationDate DESC) AS rn_type
+  FROM Posts p
+  LEFT JOIN LATERAL (
+    SELECT 1
+  ) AS _ ON true
+),
+TopQuestions AS (
+  SELECT
+    rp.Id,
+    rp.Title,
+    rp.Tags,
+    rp.CreationDate,
+    rp.Score,
+    rp.ViewCount,
+    rp.OwnerUserId,
+    rp.LastActivityDate,
+    COALESCE(u.Reputation, 0) AS OwnerReputation,
+    COALESCE(a.DisplayName, rp.OwnerDisplayName) AS OwnerName,
+    ROW_NUMBER() OVER (ORDER BY rp.Score DESC, rp.ViewCount DESC, rp.CreationDate DESC) AS rn
+  FROM RankedPosts rp
+  LEFT JOIN Users u ON rp.OwnerUserId = u.Id
+  LEFT JOIN Users a ON rp.OwnerUserId = a.Id
+  WHERE rp.PostTypeId = 1
+    AND rp.rn_type = 1
+),
+TopTagWikis AS (
+  SELECT
+    t.Id,
+    t.TagName,
+    t.Count,
+    t.IsModeratorOnly,
+    t.IsRequired,
+    p.Id AS PostId,
+    p.Title AS PostTitle,
+    p.OwnerUserId,
+    p.CreationDate AS PostDate
+  FROM Tags t
+  LEFT JOIN Posts p ON t.WikiPostId = p.Id
+  WHERE t.IsModeratorOnly = 0 OR t.IsModeratorOnly IS NULL
+),
+RecentActivity AS (
+  SELECT
+    v.PostId,
+    MAX(v.CreationDate) AS LastVoteDate
+  FROM Votes v
+  GROUP BY v.PostId
+),
+EngagedPosts AS (
+  SELECT
+    q.Id,
+    q.Title,
+    q.Score,
+    q.ViewCount,
+    q.OwnerUserId,
+    q.OwnerName,
+    q.OwnerReputation,
+    q.LastActivityDate,
+    COALESCE(ra.LastVoteDate, q.LastActivityDate) AS ActivityDate,
+    CASE
+      WHEN ra.LastVoteDate IS NULL THEN 0
+      ELSE DATEDIFF(day, ra.LastVoteDate, GETDATE())
+    END AS DaysSinceActivity
+  FROM TopQuestions q
+  LEFT JOIN RecentActivity ra ON q.Id = ra.PostId
+  WHERE q.Title IS NOT NULL
+),
+ComplexPredicate AS (
+  SELECT
+    e.*,
+    CASE
+      WHEN e.ActivityDate > e.PostDate THEN 1
+      ELSE 0
+    END AS ActiveFlag,
+    (e.OwnerReputation * 0.75) + (CASE WHEN e.OwnerName IS NOT NULL THEN 100 ELSE 0 END) AS ScoreWeight
+  FROM EngagedPosts e
+)
+SELECT
+  cp.Id AS PostId,
+  cp.Title,
+  cp.PostDate,
+  cp.LastActivityDate,
+  cp.ActivityDate,
+  cp.DaysSinceActivity,
+  cp.Score,
+  cp.ViewCount,
+  cp.OwnerName,
+  cp.OwnerReputation,
+  cp.ActiveFlag,
+  cp.ScoreWeight,
+  -- join with a few related structures to exercise outer joins and aggregates
+  (SELECT COUNT(*) FROM Comments c WHERE c.PostId = cp.Id) AS CommentCount,
+  (SELECT STRING_AGG(tv.Name, ', ') FROM Votes v
+     JOIN VoteTypes tv ON v.VoteTypeId = tv.Id
+     WHERE v.PostId = cp.Id) AS VoteTypesApplied,
+  (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = cp.Id) AS RelatedLinks
+FROM ComplexPredicate cp
+LEFT JOIN Posts p ON cp.Id = p.Id
+LEFT JOIN PostLinks pl ON pl.PostId = cp.Id AND pl.LinkTypeId = 1
+LEFT JOIN Tags t ON t.Id IN (SELECT CAST(value AS int) FROM STRING_SPLIT(cp.Tags, '>'))
+ORDER BY cp.ScoreWeight DESC, cp.ActivityDate DESC
+LIMIT 100;

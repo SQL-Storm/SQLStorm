@@ -1,0 +1,179 @@
+WITH UserPostCounts AS (
+    SELECT
+        OwnerUserId,
+        COUNT(Id) AS PostCount
+    FROM Posts
+    WHERE OwnerUserId IS NOT NULL
+    GROUP BY OwnerUserId
+),
+RankedUserPosts AS (
+    SELECT
+        p.OwnerUserId,
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.FavoriteCount,
+        p.CreationDate AS PostCreationDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn,
+        CASE
+            WHEN pt.Name = 'Question' THEN 'Q'
+            WHEN pt.Name = 'Answer' THEN 'A'
+            ELSE 'O'
+        END AS PostTypeShort
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.OwnerUserId IS NOT NULL
+),
+RecentUserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        MAX(p.CreationDate) AS LastPostDate,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id ELSE NULL END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id ELSE NULL END) AS AnswerCount,
+        SUM(p.Score) AS TotalScore,
+        SUM(p.ViewCount) AS TotalViewCount,
+        SUM(p.FavoriteCount) AS TotalFavoriteCount,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadges
+    FROM Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Id <= 10000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+UserEngagement AS (
+    SELECT
+        ru.UserId,
+        ru.DisplayName,
+        ru.Reputation,
+        ru.UserCreationDate,
+        ru.LastPostDate,
+        ru.QuestionCount,
+        ru.AnswerCount,
+        ru.TotalScore,
+        ru.TotalViewCount,
+        ru.TotalFavoriteCount,
+        ru.GoldBadges,
+        ru.SilverBadges,
+        ru.BronzeBadges,
+        /* Compute average post score per user using aggregate since window caused grouping issue */
+        CASE WHEN COUNT(p.Id) > 0 THEN SUM(p.Score) * 1.0 / COUNT(p.Id) ELSE NULL END AS AvgPostScore,
+        COUNT(c.Id) AS CommentCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount
+    FROM RecentUserActivity ru
+    LEFT JOIN Comments c ON ru.UserId = c.UserId
+    LEFT JOIN Votes v ON ru.UserId = v.UserId AND v.VoteTypeId IN (2, 3)
+    LEFT JOIN Posts p ON ru.UserId = p.OwnerUserId
+    GROUP BY ru.UserId, ru.DisplayName, ru.Reputation, ru.UserCreationDate, ru.LastPostDate, ru.QuestionCount, ru.AnswerCount, ru.TotalScore, ru.TotalViewCount, ru.TotalFavoriteCount, ru.GoldBadges, ru.SilverBadges, ru.BronzeBadges
+),
+PostMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.Score,
+        p.ViewCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate AS PostCreationDate,
+        p.ClosedDate,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+        LENGTH(COALESCE(p.Title, '')) AS TitleLength,
+        LENGTH(COALESCE(p.Tags, '')) AS TagsLength,
+        p.AnswerCount,
+        (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3) AS DuplicateLinkCount,
+        (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId = 5) AS EditBodyCount
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.OwnerUserId IS NOT NULL AND p.PostTypeId IN (1, 2)
+),
+ComplexMetrics AS (
+    SELECT
+        pm.PostId,
+        pm.OwnerUserId,
+        pm.PostTypeName,
+        pm.Score,
+        pm.ViewCount,
+        pm.CommentCount,
+        pm.FavoriteCount,
+        pm.PostCreationDate,
+        pm.IsClosed,
+        pm.TitleLength,
+        pm.TagsLength,
+        pm.AnswerCount,
+        pm.DuplicateLinkCount,
+        pm.EditBodyCount,
+        ue.Reputation AS OwnerReputation,
+        ue.GoldBadges AS OwnerGoldBadges,
+        ue.SilverBadges AS OwnerSilverBadges,
+        ue.BronzeBadges AS OwnerBronzeBadges,
+        ue.QuestionCount AS OwnerQuestionCount,
+        ue.AnswerCount AS OwnerAnswerCount,
+        ue.UpVoteCount AS OwnerUpVoteCount,
+        ue.DownVoteCount AS OwnerDownVoteCount,
+        CASE
+            WHEN pm.Score > 0 AND pm.ViewCount > 0 THEN CAST(pm.Score AS NUMERIC) / NULLIF(pm.ViewCount, 0)
+            ELSE 0
+        END AS ScoreToViewRatio,
+        CASE
+            WHEN pm.PostTypeName = 'Question' AND pm.AnswerCount > 0 THEN CAST(pm.Score AS NUMERIC) / NULLIF(pm.AnswerCount, 0)
+            WHEN pm.PostTypeName = 'Question' AND pm.AnswerCount = 0 THEN pm.Score
+            ELSE 0
+        END AS ScorePerAnswer,
+        CAST((julianday('2024-10-01 12:34:56') - julianday(pm.PostCreationDate)) AS INTEGER) AS DaysSinceCreation,
+        ROW_NUMBER() OVER (ORDER BY pm.Score DESC, pm.ViewCount DESC) AS GlobalRank,
+        SUM(pm.Score) OVER (ORDER BY pm.PostCreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS RunningTotalScore,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = pm.PostId AND c.Score > 0) AS PositiveCommentCount,
+        UPPER(SUBSTR(pm.PostTypeName, 1, 1)) || LOWER(SUBSTR(pm.PostTypeName, 2, LENGTH(pm.PostTypeName))) AS FormattedPostTypeName
+    FROM PostMetrics pm
+    JOIN UserEngagement ue ON pm.OwnerUserId = ue.UserId
+    WHERE ue.Reputation > 1000
+)
+SELECT
+    cm.PostId,
+    cm.PostTypeName,
+    cm.Score,
+    cm.ViewCount,
+    cm.CommentCount,
+    cm.FavoriteCount,
+    cm.IsClosed,
+    cm.TitleLength,
+    cm.TagsLength,
+    cm.AnswerCount,
+    cm.DuplicateLinkCount,
+    cm.EditBodyCount,
+    cm.OwnerReputation,
+    cm.OwnerGoldBadges,
+    cm.OwnerSilverBadges,
+    cm.OwnerBronzeBadges,
+    cm.OwnerQuestionCount,
+    cm.OwnerAnswerCount,
+    cm.OwnerUpVoteCount,
+    cm.OwnerDownVoteCount,
+    cm.ScoreToViewRatio,
+    cm.ScorePerAnswer,
+    cm.DaysSinceCreation,
+    cm.GlobalRank,
+    cm.RunningTotalScore,
+    cm.PositiveCommentCount,
+    cm.FormattedPostTypeName,
+    (SELECT COUNT(Id) FROM Posts WHERE OwnerUserId = cm.OwnerUserId AND PostTypeId = 1 AND Score > 50) AS OwnerHighScoringQuestions,
+    COALESCE(ue.LastPostDate, DATE '1900-01-01') AS LastActivityNonNull,
+    CASE WHEN cm.PostTypeName = 'Question' THEN 'This is a question' WHEN cm.PostTypeName = 'Answer' THEN 'This is an answer' ELSE 'Other' END AS PostTypeDescription,
+    CASE WHEN cm.OwnerReputation >= 10000 THEN 'High' WHEN cm.OwnerReputation >= 1000 THEN 'Medium' ELSE 'Low' END AS ReputationTier,
+    CASE
+        WHEN cm.PostCreationDate BETWEEN datetime('2024-10-01 12:34:56', '-7 days') AND datetime('2024-10-01 12:34:56') THEN 'Recent'
+        WHEN cm.PostCreationDate BETWEEN datetime('2024-10-01 12:34:56', '-30 days') AND datetime('2024-10-01 12:34:56', '-7 days') THEN 'PastMonth'
+        ELSE 'Older'
+    END AS PostAgeCategory,
+    ue.DisplayName AS OwnerDisplayName
+FROM ComplexMetrics cm
+LEFT JOIN UserEngagement ue ON cm.OwnerUserId = ue.UserId
+WHERE cm.Score > 0 OR cm.ViewCount > 100
+ORDER BY cm.GlobalRank;

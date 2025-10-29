@@ -1,0 +1,123 @@
+-- {"query": "3657.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2118} 
+
+WITH 
+-- Aggregate basic user activity
+UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(SUM(p.Score),0)               AS TotalPostScore,
+        COUNT(p.Id)                            AS PostCount,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswerCount,
+        MAX(p.CreationDate)                   AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+-- Badge breakdown per user
+BadgeStats AS (
+    SELECT 
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(*)                                   AS TotalBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+-- Tag usage per user (explodes Tags column)
+TagUsage AS (
+    SELECT 
+        u.Id                               AS UserId,
+        UNNEST(string_to_array(p.Tags, '><')) AS Tag,
+        COUNT(*)                           AS TagPosts
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id
+    WHERE p.Tags IS NOT NULL
+    GROUP BY u.Id, Tag
+),
+
+-- Top 5 tags per user, concatenated
+TopTags AS (
+    SELECT 
+        UserId,
+        STRING_AGG(Tag, ', ') FILTER (WHERE rn <= 5) AS Top5Tags
+    FROM (
+        SELECT 
+            UserId,
+            Tag,
+            ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY TagPosts DESC) AS rn
+        FROM TagUsage
+    ) t
+    GROUP BY UserId
+),
+
+-- Vote aggregates for the last 30 days
+RecentVotes AS (
+    SELECT 
+        v.PostId,
+        SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        MAX(v.CreationDate)                         AS LastVoteDate
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE v.CreationDate >= NOW() - INTERVAL '30 days'
+    GROUP BY v.PostId
+),
+
+-- Summarise recent votes per user
+UserRecentVotes AS (
+    SELECT 
+        p.OwnerUserId                              AS UserId,
+        SUM(rv.UpVotes)                            AS UpVotes,
+        SUM(rv.DownVotes)                          AS DownVotes,
+        MAX(rv.LastVoteDate)                       AS LastVoteDate
+    FROM RecentVotes rv
+    JOIN Posts p ON p.Id = rv.PostId
+    GROUP BY p.OwnerUserId
+)
+
+SELECT 
+    us.Id,
+    us.DisplayName,
+    us.Reputation,
+    us.TotalPostScore,
+    us.PostCount,
+    us.QuestionCount,
+    us.AnswerCount,
+    us.LastPostDate,
+    COALESCE(bs.GoldBadges,0)   AS GoldBadges,
+    COALESCE(bs.SilverBadges,0) AS SilverBadges,
+    COALESCE(bs.BronzeBadges,0) AS BronzeBadges,
+    COALESCE(bs.TotalBadges,0)  AS TotalBadges,
+    tt.Top5Tags,
+    urv.UpVotes,
+    urv.DownVotes,
+    urv.LastVoteDate,
+    /* Correlated sub‑query for comment count */
+    (SELECT COUNT(*) FROM Comments c WHERE c.UserId = us.Id) AS CommentCount,
+    /* Reputation ranking */
+    RANK() OVER (ORDER BY us.Reputation DESC) AS ReputationRank,
+    CASE
+        WHEN us.Reputation > 20000 THEN 'Elite'
+        WHEN us.Reputation > 5000  THEN 'Pro'
+        WHEN us.Reputation > 1000  THEN 'Experienced'
+        ELSE 'Newbie'
+    END AS ReputationTier
+FROM UserStats us
+LEFT JOIN BadgeStats bs      ON bs.UserId = us.Id
+LEFT JOIN TopTags tt        ON tt.UserId = us.Id
+LEFT JOIN UserRecentVotes urv ON urv.UserId = us.Id
+WHERE us.Reputation >= 1000
+
+UNION ALL
+
+/* Simple footer row for benchmarking tools */
+SELECT 
+    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+    NULL, NULL, '--- End of Report ---';

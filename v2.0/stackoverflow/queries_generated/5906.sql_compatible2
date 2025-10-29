@@ -1,0 +1,138 @@
+WITH
+ActiveUsers AS (
+  SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.ProfileImageUrl
+  FROM Users u
+  WHERE 1=1
+),
+TagHotness AS (
+  SELECT
+    t.TagName,
+    t.Count AS TagCount,
+    AVG(p.Score) AS AvgPostScore,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount
+  FROM Tags t
+  LEFT JOIN Posts p ON (p.Tags IS NOT NULL AND (POSITION(t.TagName IN p.Tags) > 0 OR p.Tags LIKE '%' || t.TagName || '%'))
+  GROUP BY t.TagName, t.Count
+),
+ComplexPostStats AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.PostTypeId,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.OwnerUserId,
+    p.OwnerDisplayName,
+    p.AnswerCount,
+    p.CommentCount,
+    p.Tags,
+    p.FavoriteCount,
+    (SELECT COUNT(*) FROM Comments c
+     WHERE c.PostId = p.Id
+       AND c.UserId = p.OwnerUserId
+       AND CAST(c.CreationDate AS DATE) = CAST(p.CreationDate AS DATE)
+    ) AS OwnerCommentsSameDay,
+    ROW_NUMBER() OVER (PARTITION BY CAST(p.CreationDate AS DATE) ORDER BY p.Score DESC NULLS LAST, p.ViewCount DESC NULLS LAST) AS DayRank
+  FROM Posts p
+  WHERE p.PostTypeId IN (1,2)
+),
+FilteredPosts AS (
+  SELECT
+    c.Id,
+    c.Title,
+    c.PostTypeId,
+    c.Score,
+    c.ViewCount,
+    c.CreationDate,
+    c.LastActivityDate,
+    c.OwnerUserId,
+    c.OwnerDisplayName,
+    c.AnswerCount,
+    c.CommentCount,
+    c.Tags,
+    c.FavoriteCount,
+    c.OwnerCommentsSameDay,
+    c.DayRank
+  FROM ComplexPostStats c
+  LEFT JOIN PostLinks pl ON pl.PostId = c.Id
+  WHERE c.Score IS NOT NULL
+    AND c.Tags IS NOT NULL
+    AND POSITION('sql' IN LOWER(c.Tags)) > 0
+),
+AggregatedVotes AS (
+  SELECT
+    v.PostId,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+    SUM(CASE WHEN v.VoteTypeId = 8 THEN 1 ELSE 0 END) AS BountyStarts,
+    SUM(CASE WHEN v.VoteTypeId = 9 THEN 1 ELSE 0 END) AS BountyCloses
+  FROM Votes v
+  GROUP BY v.PostId
+),
+Final AS (
+  SELECT
+    fp.Id,
+    fp.Title,
+    fp.PostTypeId,
+    fp.Score,
+    fp.ViewCount,
+    fp.CreationDate,
+    fp.LastActivityDate,
+    fp.OwnerUserId,
+    fp.OwnerDisplayName,
+    fp.AnswerCount,
+    fp.CommentCount,
+    fp.Tags,
+    fp.FavoriteCount,
+    fp.OwnerCommentsSameDay,
+    fp.DayRank,
+    av.UpVotes,
+    av.DownVotes,
+    av.BountyStarts,
+    av.BountyCloses,
+    tt.AvgPostScore,
+    tt.QuestionCount,
+    tt.AnswerCount AS TagRelatedAnswers
+  FROM FilteredPosts fp
+  LEFT JOIN AggregatedVotes av ON av.PostId = fp.Id
+  LEFT JOIN TagHotness tt ON 1=1
+)
+SELECT
+  f.Id AS PostId,
+  f.Title,
+  f.PostTypeId,
+  f.Score,
+  f.ViewCount,
+  f.CreationDate,
+  f.LastActivityDate,
+  f.OwnerUserId,
+  f.OwnerDisplayName,
+  f.AnswerCount,
+  f.CommentCount,
+  f.Tags,
+  f.FavoriteCount,
+  f.OwnerCommentsSameDay,
+  f.DayRank,
+  COALESCE(f.UpVotes,0) AS UpVotes,
+  COALESCE(f.DownVotes,0) AS DownVotes,
+  COALESCE(f.BountyStarts,0) AS BountyStarts,
+  COALESCE(f.BountyCloses,0) AS BountyCloses,
+  f.AvgPostScore,
+  f.QuestionCount,
+  f.TagRelatedAnswers
+FROM Final f
+WHERE f.DayRank <= 100
+ORDER BY f.DayRank, f.CreationDate;

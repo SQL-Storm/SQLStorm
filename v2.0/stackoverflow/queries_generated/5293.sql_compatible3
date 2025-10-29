@@ -1,0 +1,198 @@
+WITH
+RecentActivePosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Body,
+    p.Tags,
+    p.CreationDate,
+    p.ViewCount,
+    p.Score,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.CommentCount,
+    p.AnswerCount,
+    p.PostTypeId
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '180 days'
+),
+TopCommenters AS (
+  SELECT
+    c.PostId,
+    c.UserId AS CommentUserId,
+    c.Score AS CommentScore,
+    ROW_NUMBER() OVER (PARTITION BY c.PostId ORDER BY c.Score DESC, c.CreationDate ASC) AS rn
+  FROM Comments c
+  WHERE c.UserId IS NOT NULL
+),
+QuestionTags AS (
+  SELECT
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId,
+    t.WikiPostId
+  FROM Tags t
+  WHERE t.TagName IS NOT NULL
+),
+UserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.UpVotes,
+    u.DownVotes,
+    u.Views,
+    u.Location,
+    u.ProfileImageUrl
+  FROM Users u
+),
+Composite AS (
+  SELECT
+    RAP.PostId,
+    RAP.Title,
+    RAP.Body,
+    RAP.Tags,
+    RAP.CreationDate,
+    RAP.ViewCount,
+    RAP.Score,
+    RAP.OwnerUserId,
+    RAP.LastActivityDate,
+    RAP.CommentCount,
+    RAP.AnswerCount,
+    RAP.PostTypeId,
+    MAX(CASE WHEN TC.rn = 1 THEN TC.CommentScore ELSE NULL END) AS TopCommentScore,
+    MAX(CASE WHEN TC.rn = 1 THEN TC.CommentUserId ELSE NULL END) AS TopCommentUserId,
+    MAX(qt.TagName) AS PrimaryTag
+  FROM RecentActivePosts RAP
+  LEFT JOIN TopCommenters TC
+    ON RAP.PostId = TC.PostId
+  LEFT JOIN (
+    SELECT
+      ExcerptPostId AS PostId,
+      TagName
+    FROM QuestionTags
+    WHERE ExcerptPostId IS NOT NULL
+  ) qt
+    ON RAP.PostId = qt.PostId
+  GROUP BY
+    RAP.PostId, RAP.Title, RAP.Body, RAP.Tags, RAP.CreationDate, RAP.ViewCount, RAP.Score,
+    RAP.OwnerUserId, RAP.LastActivityDate, RAP.CommentCount, RAP.AnswerCount, RAP.PostTypeId
+),
+Enhanced AS (
+  SELECT
+    C.PostId,
+    C.Title,
+    C.Body,
+    C.Tags,
+    C.CreationDate,
+    C.ViewCount,
+    C.Score,
+    C.OwnerUserId,
+    C.LastActivityDate,
+    C.CommentCount,
+    C.AnswerCount,
+    C.PostTypeId,
+    C.TopCommentScore,
+    C.TopCommentUserId,
+    C.PrimaryTag,
+    UA.DisplayName AS OwnerDisplayName,
+    UA.Reputation,
+    UA.Location,
+    UA.ProfileImageUrl,
+    VA.LastAccessDate
+  FROM Composite C
+  LEFT JOIN UserActivity UA
+    ON C.OwnerUserId = UA.UserId
+  LEFT JOIN (
+    SELECT Id AS UserId, MAX(LastAccessDate) AS LastAccessDate FROM Users GROUP BY Id
+  ) VA
+    ON C.OwnerUserId = VA.UserId
+),
+Windowed AS (
+  SELECT
+    E.PostId,
+    E.Title,
+    E.Body,
+    E.Tags,
+    E.CreationDate,
+    E.ViewCount,
+    E.Score,
+    E.OwnerUserId,
+    E.LastActivityDate,
+    E.CommentCount,
+    E.AnswerCount,
+    E.PostTypeId,
+    E.TopCommentScore,
+    E.TopCommentUserId,
+    E.PrimaryTag,
+    E.OwnerDisplayName,
+    E.Reputation,
+    E.Location,
+    E.ProfileImageUrl,
+    E.LastAccessDate,
+    ROW_NUMBER() OVER (
+      ORDER BY E.Score DESC,
+               E.LastActivityDate DESC,
+               COALESCE(E.TopCommentScore, 0) DESC,
+               COALESCE(E.Reputation, 0) DESC
+    ) AS rn
+  FROM Enhanced E
+),
+Final AS (
+  SELECT
+    w.PostId,
+    w.Title,
+    w.Body,
+    w.Tags,
+    w.CreationDate,
+    w.ViewCount,
+    w.Score,
+    w.OwnerUserId,
+    w.LastActivityDate,
+    w.CommentCount,
+    w.AnswerCount,
+    w.PostTypeId,
+    w.TopCommentScore,
+    w.TopCommentUserId,
+    w.PrimaryTag,
+    w.OwnerDisplayName,
+    w.Reputation,
+    w.Location,
+    w.ProfileImageUrl,
+    w.LastAccessDate
+  FROM Windowed w
+  WHERE w.rn <= 50
+)
+SELECT
+  -- Construct JSON using standard SQL: build object via JSON_OBJECT (if available) or standard JSON functions.
+  JSON_BUILD_OBJECT(
+    'top_posts', JSON_AGG(
+      JSON_BUILD_OBJECT(
+        'post_id', PostId,
+        'title', Title,
+        'tags', Tags,
+        'creation_date', TO_CHAR(CreationDate, 'YYYY-MM-DD"T"HH24:MI:SS'),
+        'score', Score,
+        'view_count', ViewCount,
+        'owner', JSON_BUILD_OBJECT(
+          'user_id', OwnerUserId,
+          'display_name', OwnerDisplayName,
+          'reputation', Reputation,
+          'location', Location
+        ),
+        'last_activity', TO_CHAR(LastActivityDate, 'YYYY-MM-DD"T"HH24:MI:SS'),
+        'comment_count', CommentCount,
+        'answer_count', AnswerCount,
+        'primary_tag', PrimaryTag,
+        'top_comment', COALESCE(TopCommentScore, 0)
+      ) ORDER BY Score DESC, LastActivityDate DESC NULLS LAST
+    )
+  ) AS benchmark_result
+FROM Final
+GROUP BY
+  -- group by all selected non-aggregated expressions; JSON_BUILD_OBJECT produces one row per GROUP BY key.
+  -- Using a constant grouping key to produce a single JSON result.
+  (SELECT 1);

@@ -1,0 +1,300 @@
+with
+q_posts as (
+    select
+        p.Id as QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AcceptedAnswerId,
+        p.Tags,
+        coalesce(nullif(trim(p.OwnerDisplayName), ''), u.DisplayName, '[unknown]') as OwnerName,
+        extract(year from p.CreationDate) as q_year
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId = 1
+),
+answers as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId as AnswerUserId,
+        a.CreationDate as AnswerCreationDate,
+        a.Score as AnswerScore
+    from Posts a
+    where a.PostTypeId = 2
+),
+first_answer as (
+    select distinct on (QuestionId)
+        QuestionId,
+        AnswerId,
+        AnswerUserId,
+        AnswerCreationDate,
+        AnswerScore,
+        rank() over (partition by QuestionId order by AnswerScore desc, AnswerCreationDate asc, AnswerId asc) as top_rank
+    from answers
+    order by QuestionId, AnswerCreationDate asc
+),
+vote_aggs as (
+    select
+        v.PostId,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as upvotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as downvotes,
+        sum(case when v.VoteTypeId = 5 then 1 else 0 end) as favorites,
+        sum(case when v.VoteTypeId = 8 then coalesce(v.BountyAmount,0) else 0 end) as bounty_start,
+        sum(case when v.VoteTypeId = 9 then coalesce(v.BountyAmount,0) else 0 end) as bounty_close,
+        min(case when v.VoteTypeId in (2,3,5) then v.CreationDate end) as first_vote_at,
+        max(case when v.VoteTypeId in (2,3,5) then v.CreationDate end) as last_vote_at
+    from Votes v
+    group by v.PostId
+),
+comment_stats as (
+    select
+        c.PostId,
+        count(*) as comment_count,
+        avg(c.Score) as avg_comment_score,
+        max(char_length(c.Text)) as longest_comment_len,
+        sum(case when c.UserId is null then 1 else 0 end) as anon_comments
+    from Comments c
+    group by c.PostId
+),
+tag_expanded as (
+    select
+        qp.QuestionId,
+        unnest(string_to_array(substring(qp.Tags, 2, greatest(length(qp.Tags)-2,0)), '><')) as tag
+    from q_posts qp
+    where qp.Tags is not null and qp.Tags like '<%>'
+),
+tag_quality as (
+    select
+        te.QuestionId,
+        count(*) as tag_count,
+        sum(case when lower(te.tag) similar to '(how|why|what|urgent|help|please|beginner)%' then 1 else 0 end) as low_signal_tags
+    from tag_expanded te
+    group by te.QuestionId
+),
+postlinks_dupes as (
+    select
+        pl.PostId as QuestionId,
+        sum(case when pl.LinkTypeId = 3 then 1 else 0 end) as duplicate_links,
+        sum(case when pl.LinkTypeId = 1 then 1 else 0 end) as related_links
+    from PostLinks pl
+    group by pl.PostId
+),
+history_flags as (
+    select
+        ph.PostId as QuestionId,
+        max(case when ph.PostHistoryTypeId = 10 then 1 else 0 end) as was_closed,
+        max(case when ph.PostHistoryTypeId = 11 then 1 else 0 end) as was_reopened,
+        max(case when ph.PostHistoryTypeId = 19 then 1 else 0 end) as was_protected,
+        max(case when ph.PostHistoryTypeId = 50 then 1 else 0 end) as community_bump,
+        min(case when ph.PostHistoryTypeId = 10 then ph.CreationDate end) as first_closed_at,
+        max(case when ph.PostHistoryTypeId = 11 then ph.CreationDate end) as last_reopened_at
+    from PostHistory ph
+    group by ph.PostId
+),
+owner_stats as (
+    select
+        u.Id as UserId,
+        u.Reputation,
+        u.UpVotes,
+        u.DownVotes,
+        u.Views as ProfileViews,
+        coalesce(nullif(trim(u.Location), ''), 'Unknown') as LocationNorm,
+        dense_rank() over (order by u.Reputation desc nulls last, u.Id) as rep_rank
+    from Users u
+),
+badge_aggs as (
+    select
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as golds,
+        sum(case when b.Class = 2 then 1 else 0 end) as silvers,
+        sum(case when b.Class = 3 then 1 else 0 end) as bronzes,
+        max(b.Date) as last_badge_at
+    from Badges b
+    group by b.UserId
+),
+accept_info as (
+    select
+        qp.QuestionId,
+        case when qp.AcceptedAnswerId is not null then 1 else 0 end as has_accept,
+        fa.AnswerId as accepted_or_top_answer_id,
+        fa.AnswerUserId as answerer_id,
+        fa.AnswerCreationDate as answer_date,
+        fa.AnswerScore as answer_score
+    from q_posts qp
+    left join lateral (
+        select
+            a.Id as AnswerId,
+            a.OwnerUserId as AnswerUserId,
+            a.CreationDate as AnswerCreationDate,
+            a.Score as AnswerScore
+        from Posts a
+        where a.PostTypeId = 2
+          and a.ParentId = qp.QuestionId
+          and (qp.AcceptedAnswerId is null or a.Id = qp.AcceptedAnswerId)
+        order by case when a.Id = qp.AcceptedAnswerId then 0 else 1 end, a.Score desc, a.CreationDate asc
+        limit 1
+    ) fa on true
+),
+question_activity as (
+    select
+        qp.QuestionId,
+        qp.Title,
+        qp.OwnerUserId,
+        qp.OwnerName,
+        qp.CreationDate,
+        qp.Score,
+        qp.ViewCount,
+        qp.q_year,
+        coalesce(v.upvotes,0) as upvotes,
+        coalesce(v.downvotes,0) as downvotes,
+        coalesce(v.favorites,0) as favorites,
+        coalesce(v.bounty_start,0) as bounty_start,
+        coalesce(v.bounty_close,0) as bounty_close,
+        cs.comment_count,
+        cs.avg_comment_score,
+        cs.longest_comment_len,
+        cs.anon_comments,
+        tq.tag_count,
+        tq.low_signal_tags,
+        pl.duplicate_links,
+        pl.related_links,
+        hf.was_closed,
+        hf.was_reopened,
+        hf.was_protected,
+        hf.community_bump,
+        hf.first_closed_at,
+        hf.last_reopened_at,
+        ai.has_accept,
+        ai.accepted_or_top_answer_id,
+        ai.answerer_id,
+        ai.answer_date,
+        ai.answer_score
+    from q_posts qp
+    left join vote_aggs v on v.PostId = qp.QuestionId
+    left join comment_stats cs on cs.PostId = qp.QuestionId
+    left join tag_quality tq on tq.QuestionId = qp.QuestionId
+    left join postlinks_dupes pl on pl.QuestionId = qp.QuestionId
+    left join history_flags hf on hf.QuestionId = qp.QuestionId
+    left join accept_info ai on ai.QuestionId = qp.QuestionId
+),
+quality_score as (
+    select
+        qa.*,
+        (
+            coalesce(qa.Score,0)*2
+            + coalesce(qa.upvotes,0)*1.5
+            - coalesce(qa.downvotes,0)*2
+            + least(coalesce(qa.favorites,0), 50)*0.5
+            + case when qa.has_accept = 1 then 5 else 0 end
+            + case when coalesce(qa.tag_count,0) > 0 then 2 else -1 end
+            - coalesce(qa.low_signal_tags,0)*1
+            - case when coalesce(qa.was_closed,0) = 1 then 8 else 0 end
+            + coalesce(qa.related_links,0)*0.2
+            - coalesce(qa.duplicate_links,0)*3
+            + least(greatest(coalesce(qa.ViewCount,0)/100.0, 0), 100)
+        ) as quality_score_raw,
+        exp(-extract(epoch from coalesce(qa.last_reopened_at, qa.answer_date, qa.CreationDate) - coalesce(qa.CreationDate, qa.answer_date, qa.last_reopened_at))/86400.0/365.0) as recency_weight
+    from question_activity qa
+),
+scored as (
+    select
+        q.*,
+        cast((q.quality_score_raw * coalesce(nullif(q.recency_weight,0), 1)) as numeric(18,6)) as weighted_quality,
+        row_number() over (
+            partition by q.q_year
+            order by (q.quality_score_raw * coalesce(nullif(q.recency_weight,0), 1)) desc nulls last, q.QuestionId
+        ) as year_rank,
+        percent_rank() over (order by (q.quality_score_raw * coalesce(nullif(q.recency_weight,0), 1)) desc nulls last) as global_percentile
+    from quality_score q
+),
+owner_enriched as (
+    select
+        s.*,
+        os.Reputation,
+        os.UpVotes as owner_upvotes,
+        os.DownVotes as owner_downvotes,
+        os.ProfileViews,
+        os.LocationNorm,
+        os.rep_rank,
+        coalesce(b.golds,0) as gold_badges,
+        coalesce(b.silvers,0) as silver_badges,
+        coalesce(b.bronzes,0) as bronze_badges,
+        b.last_badge_at
+    from scored s
+    left join owner_stats os on os.UserId = s.OwnerUserId
+    left join badge_aggs b on b.UserId = s.OwnerUserId
+),
+dup_clusters as (
+    select
+        least(pl.PostId, pl.RelatedPostId) as q_low,
+        greatest(pl.PostId, pl.RelatedPostId) as q_high
+    from PostLinks pl
+    where pl.LinkTypeId = 3
+),
+cluster_pairs as (
+    select distinct q_low as q1, q_high as q2 from dup_clusters
+),
+clustered as (
+    select
+        oe.*,
+        case when exists (
+            select 1
+            from cluster_pairs cp
+            where cp.q1 = oe.QuestionId or cp.q2 = oe.QuestionId
+        ) then 1 else 0 end as in_dup_cluster
+    from owner_enriched oe
+),
+finalized as (
+    select
+        c.*,
+        substring(coalesce(c.Title, '[no title]') from 1 for 80)
+        || ' - ' ||
+        coalesce(c.OwnerName, '[anon]')
+        || ' (rep ' || cast(coalesce(c.Reputation, 0) as text) || ')' as title_signature,
+        coalesce(c.first_closed_at, c.last_reopened_at, c.answer_date, c.CreationDate) as notable_event_at,
+        case
+            when c.was_closed = 1 and c.was_reopened = 1 then 'closed->reopened'
+            when c.was_closed = 1 then 'closed'
+            when c.was_protected = 1 then 'protected'
+            else 'normal'
+        end as mod_state
+    from clustered c
+)
+select
+    f.QuestionId,
+    f.title_signature,
+    f.q_year,
+    f.mod_state,
+    f.in_dup_cluster,
+    f.has_accept,
+    f.upvotes, f.downvotes, f.favorites,
+    f.tag_count, f.low_signal_tags,
+    f.comment_count, round(coalesce(f.avg_comment_score,0),3) as avg_comment_score,
+    f.longest_comment_len,
+    f.ViewCount,
+    f.duplicate_links, f.related_links,
+    f.Reputation, f.owner_upvotes, f.owner_downvotes, f.ProfileViews,
+    f.gold_badges, f.silver_badges, f.bronze_badges,
+    to_char(f.notable_event_at, 'YYYY-MM-DD"T"HH24:MI:SS') as notable_event_at,
+    round(coalesce(f.quality_score_raw,0),3) as quality_score_raw,
+    round(coalesce(f.weighted_quality,0),3) as weighted_quality,
+    f.year_rank,
+    round(coalesce(f.global_percentile,0) * 100, 2) as global_percentile_pct
+from finalized f
+where
+    coalesce(f.weighted_quality, -1e9) > (
+        select percentile_cont(0.75) within group (order by coalesce(weighted_quality, -1e9))
+        from scored
+    )
+    and coalesce(f.tag_count,0) >= 1
+    and coalesce(f.comment_count,0) >= 0
+    and (f.was_closed is distinct from 1 or f.was_reopened = 1)
+    and (f.duplicate_links is null or f.duplicate_links < 5)
+order by
+    f.weighted_quality desc nulls last,
+    f.ViewCount desc nulls last,
+    f.QuestionId
+limit 250;

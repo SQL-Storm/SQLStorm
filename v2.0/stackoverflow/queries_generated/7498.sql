@@ -1,0 +1,251 @@
+-- {"query": "7498.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2762} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        MAX(b.Date) as LastBadgeDate,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Elite'
+            WHEN u.Reputation >= 1000 THEN 'Expert'
+            WHEN u.Reputation >= 100 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as ReputationTier,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) as ReputationRank,
+        AVG(p.Score) as AvgPostScore,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2) FILTER (WHERE p.Tags IS NOT NULL), ', ') as UniqueTags,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 3 THEN p.Id END) as WikiCount,
+        STRING_AGG(DISTINCT p.Title FILTER (WHERE p.PostTypeId = 1), ' | ') as QuestionTitles
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= '2010-01-01 00:00:00'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+    HAVING COUNT(DISTINCT p.Id) > 0 OR COUNT(DISTINCT c.Id) > 0 OR COUNT(DISTINCT b.Id) > 0
+),
+PostPerformanceAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.LastEditDate,
+        p.Tags,
+        p.ContentLicense,
+        p.AcceptedAnswerId,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN 1.0 * p.AnswerCount / NULLIF(p.AnswerCount + p.CommentCount, 0)
+            WHEN p.PostTypeId = 2 THEN 1.0
+            ELSE 0.0
+        END as EngagementRate,
+        DATEDIFF('day', p.CreationDate, COALESCE(p.LastActivityDate, p.CreationDate)) as DaysActive,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) as ScoreRank,
+        PERCENT_RANK() OVER (ORDER BY p.Score) as ScorePercentile,
+        SUM(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as CumulativeScore,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PreviousScore,
+        LEAD(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as NextScore,
+        LAG(p.CreationDate, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PrevPostDate,
+        DATEDIFF('day', LAG(p.CreationDate, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate), p.CreationDate) as DaysSinceLastPost,
+        CASE 
+            WHEN p.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = p.PostTypeId) THEN 1
+            ELSE 0
+        END as AboveAverage
+    FROM Posts p
+    WHERE p.CreationDate >= '2015-01-01 00:00:00'
+),
+UserPostMetrics AS (
+    SELECT 
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.PostCount,
+        ua.CommentCount,
+        ua.BadgeCount,
+        ua.ReputationTier,
+        ua.ReputationRank,
+        ua.AvgPostScore,
+        ua.UniqueTags,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.WikiCount,
+        ua.QuestionTitles,
+        (SELECT COUNT(*) FROM Users u2 WHERE u2.Reputation > ua.Reputation) as UsersAboveThisReputation,
+        (SELECT AVG(Reputation) FROM Users) as AvgReputation,
+        (SELECT AVG(Reputation) FROM Users WHERE Reputation > 100) as AvgHighReputation,
+        DENSE_RANK() OVER (ORDER BY ua.PostCount DESC) as PostCountRank,
+        DENSE_RANK() OVER (ORDER BY ua.CommentCount DESC) as CommentCountRank,
+        CASE 
+            WHEN ua.PostCount > 100 AND ua.Reputation > 5000 THEN 'Highly Active'
+            WHEN ua.PostCount > 50 AND ua.Reputation > 2000 THEN 'Moderately Active'
+            WHEN ua.PostCount > 10 AND ua.Reputation > 1000 THEN 'Engaged'
+            ELSE 'Casual'
+        END as ActivityLevel,
+        STRING_AGG(
+            CONCAT('Q', p.PostId, ':', p.Title, '[Score:', p.Score, ']'), 
+            '; '
+        ) FILTER (WHERE p.PostTypeId = 1) OVER (PARTITION BY ua.UserId) as UserQuestionSummary,
+        STRING_AGG(
+            CONCAT('A', p.PostId, ':', p.Title, '[Score:', p.Score, ']'), 
+            '; '
+        ) FILTER (WHERE p.PostTypeId = 2) OVER (PARTITION BY ua.UserId) as UserAnswerSummary
+    FROM UserActivityStats ua
+    LEFT JOIN Posts p ON ua.UserId = p.OwnerUserId
+),
+ComplexUserAnalysis AS (
+    SELECT 
+        upm.UserId,
+        upm.DisplayName,
+        upm.Reputation,
+        upm.PostCount,
+        upm.CommentCount,
+        upm.BadgeCount,
+        upm.ReputationTier,
+        upm.ReputationRank,
+        upm.AvgPostScore,
+        upm.UniqueTags,
+        upm.QuestionCount,
+        upm.AnswerCount,
+        upm.WikiCount,
+        upm.QuestionTitles,
+        upm.UsersAboveThisReputation,
+        upm.AvgReputation,
+        upm.AvgHighReputation,
+        upm.PostCountRank,
+        upm.CommentCountRank,
+        upm.ActivityLevel,
+        upm.UserQuestionSummary,
+        upm.UserAnswerSummary,
+        CASE 
+            WHEN upm.Reputation > (SELECT AVG(Reputation) FROM Users) 
+                 AND upm.PostCount > 30 
+                 AND upm.QuestionCount > 5 
+                 AND upm.BadgeCount > 10 THEN 'Elite Contributor'
+            WHEN upm.Reputation > (SELECT AVG(Reputation) FROM Users) 
+                 AND upm.PostCount > 15 
+                 AND upm.CommentCount > 20 THEN 'Active Contributor'
+            WHEN upm.Reputation > (SELECT AVG(Reputation) FROM Users) 
+                 AND upm.PostCount > 5 THEN 'Regular Contributor'
+            ELSE 'Contributor'
+        END as ContributorTier,
+        ROUND(
+            (upm.AvgPostScore * upm.QuestionCount + 
+             0.5 * upm.AnswerCount + 
+             1.5 * upm.CommentCount +
+             0.1 * upm.BadgeCount) / 
+            NULLIF(upm.Reputation, 0), 2
+        ) as ContributionIndex,
+        (SELECT COUNT(*) 
+         FROM Badges b 
+         WHERE b.UserId = upm.UserId 
+           AND b.Class = 1 
+           AND b.Date >= '2020-01-01') as GoldBadges2020Plus,
+        (SELECT COUNT(*) 
+         FROM Badges b 
+         WHERE b.UserId = upm.UserId 
+           AND b.Class = 2 
+           AND b.Date >= '2020-01-01') as SilverBadges2020Plus,
+        (SELECT COUNT(*) 
+         FROM Badges b 
+         WHERE b.UserId = upm.UserId 
+           AND b.Class = 3 
+           AND b.Date >= '2020-01-01') as BronzeBadges2020Plus,
+        COUNT(DISTINCT CASE 
+            WHEN p.PostTypeId = 1 AND p.ViewCount > 1000 THEN p.Id 
+        END) as HighViewQuestionCount,
+        (SELECT STRING_AGG(DISTINCT SUBSTRING(p2.Tags, 2, LENGTH(p2.Tags)-2), ', ')
+         FROM Posts p2 
+         WHERE p2.OwnerUserId = upm.UserId 
+           AND p2.Tags IS NOT NULL 
+           AND p2.PostTypeId = 1
+           AND p2.ViewCount > 1000) as HighViewTags
+    FROM UserPostMetrics upm
+)
+SELECT 
+    CASE 
+        WHEN cua.ContributorTier = 'Elite Contributor' AND cua.ContributionIndex > 3.0 THEN 'Top Performer'
+        WHEN cua.ContributorTier = 'Active Contributor' AND cua.ContributionIndex > 2.0 THEN 'High Performer'
+        ELSE 'Regular Performer'
+    END as PerformanceCategory,
+    cua.UserId,
+    cua.DisplayName,
+    cua.Reputation,
+    cua.PostCount,
+    cua.CommentCount,
+    cua.BadgeCount,
+    cua.ReputationTier,
+    cua.ReputationRank,
+    cua.AvgPostScore,
+    cua.UniqueTags,
+    cua.QuestionCount,
+    cua.AnswerCount,
+    cua.WikiCount,
+    cua.QuestionTitles,
+    cua.UsersAboveThisReputation,
+    cua.AvgReputation,
+    cua.AvgHighReputation,
+    cua.PostCountRank,
+    cua.CommentCountRank,
+    cua.ActivityLevel,
+    cua.ContributorTier,
+    cua.ContributionIndex,
+    cua.GoldBadges2020Plus,
+    cua.SilverBadges2020Plus,
+    cua.BronzeBadges2020Plus,
+    cua.HighViewQuestionCount,
+    cua.HighViewTags,
+    CASE 
+        WHEN cua.ReputationTier = 'Elite' AND cua.QuestionsCount > 100 THEN 'Elite Questioner'
+        WHEN cua.ReputationTier = 'Expert' AND cua.QuestionsCount > 50 THEN 'Expert Questioner'
+        ELSE 'Regular Questioner'
+    END as QuestioningCategory,
+    CASE 
+        WHEN cua.BadgeCount > 50 THEN 'Badge Collector'
+        WHEN cua.BadgeCount > 25 THEN 'Moderate Collector'
+        WHEN cua.BadgeCount > 10 THEN 'Small Collector'
+        ELSE 'Minimal Collector'
+    END as BadgeCollectionCategory,
+    ROUND(cua.ContributionIndex * 100, 2) as NormalizedContribution,
+    DENSE_RANK() OVER (ORDER BY cua.ContributionIndex DESC) as ContributionRank,
+    PERCENT_RANK() OVER (ORDER BY cua.ContributionIndex ASC) as ContributionPercentile,
+    (cua.PostCount + cua.CommentCount + cua.BadgeCount) as TotalEngagement,
+    cua.UserQuestionSummary,
+    cua.UserAnswerSummary,
+    CASE 
+        WHEN cua.PostCount > 100 THEN 'High Volume'
+        WHEN cua.PostCount > 50 THEN 'Medium Volume'
+        WHEN cua.PostCount > 10 THEN 'Low Volume'
+        ELSE 'Very Low Volume'
+    END as PostVolumeCategory,
+    (SELECT COUNT(*) 
+     FROM Posts p 
+     WHERE p.OwnerUserId = cua.UserId 
+       AND p.Score > 100) as HighScorePostCount,
+    (SELECT COUNT(*) 
+     FROM Posts p 
+     WHERE p.OwnerUserId = cua.UserId 
+       AND p.PostTypeId = 1 
+       AND p.Score > 10) as HighScoreQuestionCount
+FROM ComplexUserAnalysis cua
+WHERE (cua.ContributionIndex > 1.0 OR cua.GoldBadges2020Plus > 0)
+  AND cua.Reputation > 500
+  AND (cua.QuestionCount > 1 OR cua.AnswerCount > 1 OR cua.CommentCount > 1)
+ORDER BY cua.ContributionIndex DESC, cua.Reputation DESC
+LIMIT 1000;

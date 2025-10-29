@@ -1,0 +1,209 @@
+WITH UserContributionSummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswers,
+        SUM(COALESCE(P.Score, 0)) AS TotalPostScore,
+        AVG(COALESCE(P.Score, 0)) FILTER (WHERE P.PostTypeId IN (1, 2)) AS AvgPostScore,
+        MAX(P.LastActivityDate) AS LastPostActivityDate,
+        DENSE_RANK() OVER (ORDER BY U.Reputation DESC, U.CreationDate ASC) AS ReputationRank
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    WHERE U.Reputation > 1000
+      AND U.CreationDate >= TIMESTAMP '2010-01-01'
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate
+),
+PostDetailsAndActivity AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.ParentId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.Title,
+        P.Tags,
+        P.AnswerCount,
+        P.CommentCount AS InitialCommentCount,
+        P.LastEditDate,
+        P.LastActivityDate,
+        P.ClosedDate,
+        COALESCE(P.AcceptedAnswerId, -1) AS AcceptedAnswerId,
+        (SELECT COUNT(PH.Id) FROM PostHistory PH WHERE PH.PostId = P.Id AND PH.PostHistoryTypeId IN (4, 5, 6)) AS EditCount,
+        (SELECT MAX(PH.CreationDate) FROM PostHistory PH WHERE PH.PostId = P.Id AND PH.PostHistoryTypeId IN (4, 5, 6)) AS LastSignificantEditDate,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId, P.PostTypeId ORDER BY P.Score DESC, P.CreationDate DESC) AS PostRankByUserType,
+        P.CreationDate AS _WindowCreationDate
+    FROM Posts P
+    WHERE P.PostTypeId IN (1, 2)
+      AND P.CreationDate >= TIMESTAMP '2015-01-01'
+),
+CommentEngagement AS (
+    SELECT
+        C.PostId,
+        COUNT(C.Id) AS TotalComments,
+        SUM(COALESCE(C.Score, 0)) AS TotalCommentScore,
+        MAX(C.CreationDate) AS LastCommentDate,
+        MAX(CASE WHEN C.UserId IS NULL THEN 1 ELSE 0 END) AS HasAnonymousComments,
+        STRING_AGG(SUBSTRING(REPLACE(C.Text, '''', ''), 1, 50), ' | ' ORDER BY C.CreationDate DESC) AS RecentCommentSnippets
+    FROM Comments C
+    GROUP BY C.PostId
+),
+BadgeAchievement AS (
+    SELECT
+        B.UserId,
+        COUNT(B.Id) AS TotalBadges,
+        COUNT(CASE WHEN B.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN B.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN B.Class = 3 THEN 1 END) AS BronzeBadges,
+        MAX(CASE WHEN B.Class = 1 AND B.Date >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year') THEN 1 ELSE 0 END) AS HasRecentGoldBadge
+    FROM Badges B
+    GROUP BY B.UserId
+),
+InterestingPosts AS (
+    SELECT
+        PD.PostId,
+        PD.OwnerUserId,
+        PD.PostTypeId,
+        PD.PostCreationDate AS CreationDate,
+        PD.Title AS MainTitle,
+        PD.PostScore,
+        PD.ViewCount,
+        PD.Tags,
+        PD.AnswerCount,
+        CE.TotalComments,
+        PD.LastActivityDate,
+        PD.ClosedDate,
+        PD.AcceptedAnswerId,
+        NULL AS ParentPostId,
+        NULL AS ParentPostTitle,
+        PD.EditCount,
+        PD.LastEditDate,
+        CASE
+            WHEN PD.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN PD.AnswerCount > 0 AND PD.AcceptedAnswerId <> -1 THEN 'Accepted'
+            WHEN PD.AnswerCount = 0 THEN 'NoAnswer'
+            ELSE 'Open'
+        END AS PostStatus,
+        LAG(PD.PostCreationDate, 1, PD.PostCreationDate) OVER (PARTITION BY PD.OwnerUserId ORDER BY PD.PostCreationDate) AS PreviousPostCreationDate,
+        'HighScoringQuestion' AS PostCategory,
+        PD.PostCreationDate AS UnionCreationDate
+    FROM PostDetailsAndActivity PD
+    LEFT JOIN CommentEngagement CE ON PD.PostId = CE.PostId
+    WHERE PD.PostTypeId = 1
+      AND PD.PostScore >= 50
+      AND PD.PostRankByUserType <= 5
+
+    UNION ALL
+
+    SELECT
+        PD.PostId,
+        PD.OwnerUserId,
+        PD.PostTypeId,
+        PD.PostCreationDate AS CreationDate,
+        PD.Title AS MainTitle,
+        PD.PostScore,
+        NULL AS ViewCount,
+        NULL AS Tags,
+        NULL AS AnswerCount,
+        CE.TotalComments,
+        PD.LastActivityDate,
+        NULL AS ClosedDate,
+        NULL AS AcceptedAnswerId,
+        PD.ParentId AS ParentPostId,
+        P_Parent.Title AS ParentPostTitle,
+        PD.EditCount,
+        PD.LastEditDate,
+        'Answer' AS PostStatus,
+        LAG(PD.PostCreationDate, 1, PD.PostCreationDate) OVER (PARTITION BY PD.OwnerUserId ORDER BY PD.PostCreationDate) AS PreviousPostCreationDate,
+        'HighlyEditedAnswer' AS PostCategory,
+        PD.PostCreationDate AS UnionCreationDate
+    FROM PostDetailsAndActivity PD
+    LEFT JOIN CommentEngagement CE ON PD.PostId = CE.PostId
+    INNER JOIN Posts P_Parent ON PD.ParentId = P_Parent.Id
+    WHERE PD.PostTypeId = 2
+      AND PD.EditCount >= 3
+      AND PD.PostScore >= 20
+)
+SELECT
+    UCS.UserId,
+    UCS.DisplayName,
+    UCS.Reputation,
+    UCS.TotalPosts,
+    UCS.TotalQuestions,
+    UCS.TotalAnswers,
+    UCS.AvgPostScore,
+    UCS.ReputationRank,
+    BA.TotalBadges,
+    BA.GoldBadges,
+    BA.SilverBadges,
+    BA.BronzeBadges,
+    COALESCE(BA.HasRecentGoldBadge, 0) AS HasRecentGoldBadge,
+    IP.PostId,
+    IP.PostCategory,
+    IP.PostTypeId,
+    IP.MainTitle,
+    IP.PostScore,
+    IP.ViewCount,
+    IP.Tags,
+    IP.AnswerCount,
+    IP.TotalComments AS PostCommentCount,
+    IP.LastActivityDate AS PostLastActivity,
+    IP.PostStatus,
+    IP.ParentPostId,
+    IP.ParentPostTitle,
+    IP.EditCount AS PostEditCount,
+    IP.LastEditDate AS PostLastEditDate,
+    EXTRACT(EPOCH FROM (IP.CreationDate - IP.PreviousPostCreationDate)) / 3600.0 AS TimeSincePreviousPostHours,
+    (
+        SELECT SUBSTRING(C.Text, 1, 100)
+        FROM Comments C
+        WHERE C.PostId = IP.PostId
+          AND C.UserId = UCS.UserId
+        ORDER BY C.CreationDate DESC
+        LIMIT 1
+    ) AS OwnersMostRecentCommentSnippet,
+    (
+        SELECT CASE WHEN COUNT(*) > 0 THEN TRUE ELSE FALSE END
+        FROM PostLinks PL
+        JOIN LinkTypes LT ON PL.LinkTypeId = LT.Id
+        WHERE PL.PostId = IP.PostId
+          AND LT.Name IN ('Linked', 'Duplicate')
+    ) AS IsLinkedOrDuplicate,
+    COALESCE(
+        (CASE WHEN COALESCE(BA.HasRecentGoldBadge, 0) = 1 THEN 'Has Recent Gold Badge' END),
+        (CASE WHEN COALESCE(BA.SilverBadges, 0) > 0 OR COALESCE(BA.BronzeBadges, 0) > 0 THEN 'Has Silver or Bronze Badge' END),
+        'No Significant Badges'
+    ) AS BadgeCategorization,
+    CASE
+        WHEN UCS.TotalQuestions > 0 AND UCS.TotalAnswers = 0 THEN 'Questioner Only'
+        WHEN UCS.TotalAnswers > 0 AND UCS.TotalQuestions = 0 THEN 'Answerer Only'
+        WHEN UCS.TotalQuestions > 0 AND UCS.TotalAnswers > 0 THEN 'Contributor'
+        ELSE 'Passive'
+    END AS UserRoleType,
+    CASE
+        WHEN IP.PostTypeId = 1 AND IP.Tags IS NOT NULL THEN
+            UPPER(SUBSTRING(IP.MainTitle FROM 1 FOR 1)) || LPAD(REPLACE(SUBSTRING(IP.Tags FROM 2 FOR CHAR_LENGTH(IP.Tags) - 2), '><', ','), 50, '_')
+        ELSE
+            UPPER(SUBSTRING(IP.MainTitle FROM 1 FOR 1)) || LPAD('N_A', 50, '_')
+    END AS ProcessedTagsAndTitleInitial,
+    CASE
+        WHEN IP.PostTypeId = 1 AND IP.ClosedDate IS NOT NULL AND IP.AcceptedAnswerId <> -1 THEN 'Closed with Accepted'
+        WHEN IP.PostTypeId = 1 AND IP.ClosedDate IS NOT NULL AND IP.AcceptedAnswerId = -1 THEN 'Closed No Accepted'
+        WHEN IP.PostTypeId = 1 AND IP.ClosedDate IS NULL AND IP.AcceptedAnswerId <> -1 THEN 'Open with Accepted'
+        WHEN IP.PostTypeId = 1 AND IP.ClosedDate IS NULL AND IP.AcceptedAnswerId = -1 AND COALESCE(IP.AnswerCount, 0) > 0 THEN 'Open No Accepted but Answered'
+        WHEN IP.PostTypeId = 1 AND IP.ClosedDate IS NULL AND IP.AcceptedAnswerId = -1 AND COALESCE(IP.AnswerCount, 0) = 0 THEN 'Open Unanswered'
+        WHEN IP.PostTypeId = 2 AND IP.PostScore >= 100 THEN 'Highly Voted Answer'
+        WHEN IP.PostTypeId = 2 AND IP.EditCount >= 5 THEN 'Heavily Edited Answer'
+        ELSE 'Other'
+    END AS DetailedPostCategory
+FROM UserContributionSummary UCS
+LEFT JOIN BadgeAchievement BA ON UCS.UserId = BA.UserId
+INNER JOIN InterestingPosts IP ON UCS.UserId = IP.OwnerUserId
+WHERE UCS.ReputationRank <= 5000
+ORDER BY UCS.Reputation DESC, IP.PostScore DESC, IP.LastActivityDate DESC
+LIMIT 10000;

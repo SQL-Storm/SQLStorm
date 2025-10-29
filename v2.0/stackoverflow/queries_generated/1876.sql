@@ -1,0 +1,196 @@
+-- {"query": "1876.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2665} 
+
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS UserUpVotesGiven,
+        U.DownVotes AS UserDownVotesGiven,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(CASE WHEN P.AcceptedAnswerId IS NOT NULL AND P.OwnerUserId = U.Id THEN 1 ELSE 0 END) AS AcceptedAnswersCount,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(P.LastActivityDate) AS LastPostActivity,
+        MAX(C.CreationDate) AS LastCommentActivity,
+        DATE_PART('day', U.LastAccessDate - U.CreationDate) AS UserTenureDays
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate,
+        U.Views, U.UpVotes, U.DownVotes
+),
+PostHistoricalAnalysis AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount AS PostViewCount,
+        P.AnswerCount,
+        P.CommentCount AS PostCommentCount,
+        P.OwnerUserId,
+        P.LastEditDate,
+        P.ClosedDate,
+        P.Title,
+        P.Tags,
+        P.Body,
+        COUNT(DISTINCT PH.Id) AS TotalHistoryEntries,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseVoteCount,
+        MAX(PH.CreationDate) AS LastHistoryDate,
+        COUNT(DISTINCT CASE WHEN PH.UserId IS NOT NULL AND PH.UserId <> P.OwnerUserId THEN PH.UserId END) AS UniqueCoEditors,
+        SUM(CASE WHEN PL.LinkTypeId = 1 THEN 1 ELSE 0 END) AS LinkedPostsCount,
+        SUM(CASE WHEN PL.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicatePostsCount,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.CreationDate DESC) AS RankByScoreForType,
+        P.Score - LAG(P.Score, 1, 0) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate) AS ScoreChangeFromPreviousPost
+    FROM Posts P
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    LEFT JOIN PostLinks PL ON P.Id = PL.PostId
+    GROUP BY
+        P.Id, P.PostTypeId, P.CreationDate, P.Score, P.ViewCount, P.AnswerCount,
+        P.CommentCount, P.OwnerUserId, P.LastEditDate, P.ClosedDate, P.Title, P.Tags, P.Body
+),
+PostTagsExpanded AS (
+    SELECT
+        PHA.PostId,
+        TRIM(UNNEST(string_to_array(SUBSTRING(PHA.Tags FROM 2 FOR LENGTH(PHA.Tags)-2), '><'))) AS TagName
+    FROM PostHistoricalAnalysis PHA
+    WHERE PHA.Tags IS NOT NULL AND LENGTH(PHA.Tags) > 2 AND PHA.PostTypeId IN (1, 4, 5)
+),
+TagUsageAnalysis AS (
+    SELECT
+        PTE.TagName,
+        COUNT(DISTINCT PTE.PostId) AS PostsWithTag,
+        SUM(PHA.PostScore) AS TotalTagScore,
+        AVG(PHA.PostViewCount) AS AvgTagViewCount,
+        SUM(PHA.PostCommentCount) AS TotalTagComments
+    FROM PostTagsExpanded PTE
+    JOIN PostHistoricalAnalysis PHA ON PTE.PostId = PHA.PostId
+    GROUP BY PTE.TagName
+),
+QuestionAnswerChainMetrics AS (
+    SELECT
+        Q.Id AS QuestionId,
+        Q.OwnerUserId AS QuestionOwnerId,
+        A.Id AS AnswerId,
+        A.OwnerUserId AS AnswerOwnerId,
+        A.Score AS AnswerScore,
+        A.CreationDate AS AnswerCreationDate,
+        Q.CreationDate AS QuestionCreationDate,
+        (
+            SELECT COALESCE(MAX(C.Score), 0)
+            FROM Comments C
+            WHERE C.PostId = A.Id
+              AND C.UserId = A.OwnerUserId
+        ) AS AcceptedAnswerOwnerLatestCommentScore,
+        EXTRACT(EPOCH FROM (A.CreationDate - Q.CreationDate)) / 3600.0 AS TimeToAnswerHours,
+        CASE
+            WHEN U_Ans.Reputation >= 20000 THEN 'Legend'
+            WHEN U_Ans.Reputation >= 5000 THEN 'Expert'
+            WHEN U_Ans.Reputation >= 1000 THEN 'Contributor'
+            ELSE 'Novice'
+        END AS AnswerOwnerReputationTier
+    FROM Posts Q
+    JOIN Posts A ON Q.AcceptedAnswerId = A.Id AND Q.Id = A.ParentId
+    JOIN Users U_Ans ON A.OwnerUserId = U_Ans.Id
+    WHERE Q.PostTypeId = 1 AND A.PostTypeId = 2
+),
+ActiveEngagedUsers AS (
+    SELECT UserId, DisplayName, Reputation FROM UserEngagement WHERE Reputation > 10000
+    UNION ALL
+    SELECT UserId, DisplayName, Reputation FROM UserEngagement WHERE TotalPosts > 500
+    EXCEPT
+    SELECT UserId, DisplayName, Reputation FROM UserEngagement WHERE TotalBadges = 0 OR TotalBadges IS NULL
+)
+SELECT
+    UE.UserId,
+    UE.DisplayName,
+    UE.Reputation,
+    UE.UserCreationDate,
+    UE.UserTenureDays,
+    UE.TotalPosts,
+    UE.TotalQuestions,
+    UE.TotalAnswers,
+    UE.AcceptedAnswersCount,
+    UE.TotalBadges,
+    UE.GoldBadges,
+    UE.SilverBadges,
+    UE.BronzeBadges,
+    PHA.PostId,
+    PHA.PostTypeId,
+    PHA.PostCreationDate,
+    PHA.PostScore,
+    PHA.PostViewCount,
+    PHA.PostCommentCount,
+    PHA.Title,
+    PHA.EditCount,
+    PHA.CloseVoteCount,
+    PHA.UniqueCoEditors,
+    PHA.RankByScoreForType,
+    PHA.ScoreChangeFromPreviousPost,
+    QUA.QuestionId AS QA_QuestionId,
+    QUA.AnswerId AS QA_AnswerId,
+    QUA.AcceptedAnswerOwnerLatestCommentScore,
+    QUA.TimeToAnswerHours,
+    QUA.AnswerOwnerReputationTier,
+    TUA.TagName,
+    TUA.PostsWithTag,
+    TUA.TotalTagScore,
+    UPPER(COALESCE(SUBSTRING(UE.DisplayName FROM 1 FOR 2), '??')) AS DisplayNamePrefix,
+    (COALESCE(UE.Reputation / 1000.0, 0) * 0.5 +
+     COALESCE(UE.TotalPosts, 0) * 0.2 +
+     COALESCE(UE.TotalComments, 0) * 0.1 +
+     COALESCE(UE.GoldBadges, 0) * 10 +
+     COALESCE(UE.SilverBadges, 0) * 5 +
+     COALESCE(UE.BronzeBadges, 0) * 1) AS WeightedUserActivityScore,
+    COALESCE(PHA.PostScore, 0) * 0.7 +
+    COALESCE(PHA.PostViewCount / 100.0, 0) * 0.1 +
+    COALESCE(PHA.PostCommentCount, 0) * 0.15 +
+    COALESCE(PHA.AnswerCount, 0) * 0.05 +
+    CASE WHEN PHA.ClosedDate IS NOT NULL THEN -50 ELSE 0 END AS PostQualityIndex,
+    (
+        SELECT COUNT(P_Prev.Id)
+        FROM Posts P_Prev
+        WHERE P_Prev.OwnerUserId = UE.UserId
+          AND P_Prev.CreationDate < PHA.PostCreationDate
+          AND P_Prev.Score > 10
+    ) AS PriorHighScorePostsByOwner,
+    AVG(PHA.PostScore) OVER (PARTITION BY UE.UserId ORDER BY PHA.PostCreationDate) AS UserRollingAvgPostScore,
+    COALESCE(PHA.Title, 'N/A') AS PostTitleNonNull,
+    CASE
+        WHEN PHA.Body ILIKE '%<pre><code>SELECT%' THEN 'SQL Snippet'
+        WHEN PHA.Body ILIKE '%<pre><code>JAVA%' THEN 'Java Snippet'
+        WHEN PHA.Body ILIKE '%<pre><code>PYTHON%' THEN 'Python Snippet'
+        WHEN PHA.Body ILIKE '%<pre><code>C#%' THEN 'CSharp Snippet'
+        ELSE 'No Specific Code Snippet'
+    END AS CodeSnippetType,
+    NULLIF(UE.TotalQuestions, UE.TotalAnswers) AS QuestionsNotEqualToAnswersCount,
+    CASE
+        WHEN UE.TotalAnswers > 0 THEN CAST(UE.AcceptedAnswersCount AS NUMERIC) / UE.TotalAnswers
+        ELSE 0.0
+    END AS AcceptedAnswerRatio,
+    RANK() OVER (ORDER BY (COALESCE(UE.Reputation / 1000.0, 0) * 0.5 + COALESCE(UE.TotalPosts, 0) * 0.2 + COALESCE(UE.TotalComments, 0) * 0.1 + COALESCE(UE.GoldBadges, 0) * 10 + COALESCE(UE.SilverBadges, 0) * 5 + COALESCE(UE.BronzeBadges, 0) * 1) DESC) AS GlobalUserActivityRank
+FROM ActiveEngagedUsers AE
+JOIN UserEngagement UE ON AE.UserId = UE.UserId
+LEFT JOIN PostHistoricalAnalysis PHA ON UE.UserId = PHA.OwnerUserId
+LEFT JOIN PostTagsExpanded PTE ON PHA.PostId = PTE.PostId
+LEFT JOIN TagUsageAnalysis TUA ON PTE.TagName = TUA.TagName
+LEFT JOIN QuestionAnswerChainMetrics QUA ON PHA.PostId = QUA.QuestionId AND PHA.PostTypeId = 1
+WHERE
+    (UE.Reputation > 5000 AND PHA.PostId IS NOT NULL)
+    OR (PHA.PostScore > 50 AND PHA.PostTypeId = 1)
+ORDER BY
+    WeightedUserActivityScore DESC,
+    PHA.PostCreationDate DESC
+LIMIT 1000;

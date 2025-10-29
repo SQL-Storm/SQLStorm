@@ -1,0 +1,225 @@
+-- {"query": "7725.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1936} 
+WITH PostStats AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        COALESCE(p.AnswerCount, 0) + COALESCE(p.CommentCount, 0) AS engagement_score,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NULL AND p.AnswerCount > 0 THEN 'Unanswered with Answers'
+            WHEN p.PostTypeId = 1 AND p.AnswerCount = 0 THEN 'Unanswered'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS post_status,
+        COALESCE(
+            (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId IN (2,3)),
+            0
+        ) AS total_votes,
+        COALESCE(
+            (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2),
+            0
+        ) AS upvotes,
+        COALESCE(
+            (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3),
+            0
+        ) AS downvotes,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS user_post_rank,
+        RANK() OVER (ORDER BY p.Score DESC, p.ViewCount DESC) AS global_rank
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.CreationDate,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COALESCE(SUM(ps.Score), 0) AS total_score,
+        COALESCE(COUNT(ps.Id), 0) AS post_count,
+        COALESCE(AVG(ps.Score), 0) AS avg_post_score,
+        COALESCE(MAX(ps.CreationDate), u.CreationDate) AS last_activity,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Elite'
+            WHEN u.Reputation >= 1000 THEN 'Veteran'
+            WHEN u.Reputation >= 100 THEN 'Regular'
+            ELSE 'Newbie'
+        END AS reputation_level
+    FROM Users u
+    LEFT JOIN PostStats ps ON ps.OwnerUserId = u.Id
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.CreationDate, u.Views, u.UpVotes, u.DownVotes
+),
+TagAnalytics AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.IsRequired,
+        t.IsModeratorOnly,
+        COALESCE(
+            (SELECT AVG(ps.Score) 
+             FROM Posts ps 
+             WHERE ps.PostTypeId = 1 
+             AND ps.Tags LIKE '%' || t.TagName || '%'),
+            0
+        ) AS avg_question_score,
+        COALESCE(
+            (SELECT COUNT(*) 
+             FROM Posts ps 
+             WHERE ps.PostTypeId = 1 
+             AND ps.Tags LIKE '%' || t.TagName || '%'),
+            0
+        ) AS question_count,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Trending'
+            WHEN t.Count > 100 THEN 'Popular'
+            WHEN t.Count > 10 THEN 'Moderate'
+            ELSE 'Niche'
+        END AS popularity_category
+    FROM Tags t
+    WHERE t.TagName IS NOT NULL
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        ps.Id AS PostId,
+        ps.OwnerUserId,
+        ps.PostTypeId,
+        ps.Score,
+        ps.ViewCount,
+        ps.CommentCount,
+        ps.FavoriteCount,
+        ps.engagement_score,
+        ps.post_status,
+        ps.total_votes,
+        ps.upvotes,
+        ps.downvotes,
+        ps.user_post_rank,
+        ps.global_rank,
+        ps.Title,
+        ps.Tags,
+        ps.AnswerCount,
+        ps.CreationDate,
+        ps.LastActivityDate,
+        CASE 
+            WHEN ps.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'Highly Rated'
+            WHEN ps.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) * 0.5 THEN 'Moderately Rated'
+            ELSE 'Low Rated'
+        END AS quality_rating,
+        DATEDIFF('day', ps.CreationDate, ps.LastActivityDate) AS days_since_last_activity,
+        COALESCE(
+            (SELECT COUNT(*) FROM Comments c WHERE c.PostId = ps.Id),
+            0
+        ) AS comment_count,
+        COALESCE(
+            (SELECT COUNT(DISTINCT v.UserId) FROM Votes v WHERE v.PostId = ps.Id),
+            0
+        ) AS unique_voters,
+        COALESCE(
+            (SELECT COUNT(*) FROM PostHistory ph 
+             WHERE ph.PostId = ps.Id 
+             AND ph.PostHistoryTypeId IN (2,5,6)), 
+            0
+        ) AS edit_count,
+        CASE 
+            WHEN ps.AnswerCount > 0 THEN 
+                CAST(ps.Score AS FLOAT) / NULLIF(ps.AnswerCount, 0)
+            ELSE NULL 
+        END AS score_per_answer,
+        CASE 
+            WHEN ps.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 day' THEN 'Recent'
+            WHEN ps.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '90 day' THEN 'Mid-term'
+            ELSE 'Old'
+        END AS time_category,
+        COALESCE(
+            (SELECT COUNT(*) FROM Badges b 
+             WHERE b.UserId = ps.OwnerUserId 
+             AND b.Date >= ps.CreationDate),
+            0
+        ) AS badges_since_post
+    FROM PostStats ps
+)
+SELECT 
+    caa.PostId,
+    caa.OwnerUserId,
+    caa.PostTypeId,
+    caa.Score,
+    caa.ViewCount,
+    caa.CommentCount,
+    caa.FavoriteCount,
+    caa.engagement_score,
+    caa.post_status,
+    caa.total_votes,
+    caa.upvotes,
+    caa.downvotes,
+    caa.user_post_rank,
+    caa.global_rank,
+    caa.Title,
+    caa.Tags,
+    caa.AnswerCount,
+    caa.CreationDate,
+    caa.LastActivityDate,
+    caa.quality_rating,
+    caa.days_since_last_activity,
+    caa.comment_count,
+    caa.unique_voters,
+    caa.edit_count,
+    caa.score_per_answer,
+    caa.time_category,
+    caa.badges_since_post,
+    ua.DisplayName AS OwnerDisplayName,
+    ua.Reputation AS OwnerReputation,
+    ua.total_score AS owner_total_score,
+    ua.post_count AS owner_post_count,
+    ua.avg_post_score AS owner_avg_score,
+    ua.last_activity AS owner_last_activity,
+    ua.reputation_level,
+    ta.TagName,
+    ta.Count AS tag_count,
+    ta.avg_question_score,
+    ta.question_count,
+    ta.popularity_category,
+    CASE 
+        WHEN caa.score_per_answer > 10 THEN 'Highly Valued'
+        WHEN caa.score_per_answer > 5 THEN 'Moderately Valued'
+        WHEN caa.score_per_answer > 0 THEN 'Low Valued'
+        ELSE 'No Answers'
+    END AS value_category,
+    CASE 
+        WHEN caa.engagement_score > (SELECT AVG(engagement_score) FROM ComplexPostAnalysis) + 50 THEN 'High Engagement'
+        WHEN caa.engagement_score > (SELECT AVG(engagement_score) FROM ComplexPostAnalysis) THEN 'Average Engagement'
+        ELSE 'Low Engagement'
+    END AS engagement_level,
+    COALESCE(
+        (SELECT STRING_AGG(ta2.TagName, ', ') 
+         FROM (
+             SELECT TRIM(split_part(ps2.Tags, '><', generate_series(1, array_length(string_to_array(ps2.Tags, '><'), 1)))) AS TagName
+             FROM Posts ps2 
+             WHERE ps2.Id = caa.PostId AND ps2.Tags IS NOT NULL
+         ) ta2
+         WHERE ta2.TagName IS NOT NULL AND ta2.TagName != ''),
+        'None'
+    ) AS extracted_tags
+FROM ComplexPostAnalysis caa
+JOIN UserActivity ua ON caa.OwnerUserId = ua.UserId
+LEFT JOIN TagAnalytics ta ON caa.Tags LIKE '%' || ta.TagName || '%'
+WHERE caa.score_per_answer IS NOT NULL
+  AND caa.days_since_last_activity <= 365
+  AND caa.quality_rating IN ('Highly Rated', 'Moderately Rated')
+  AND ua.reputation_level IN ('Elite', 'Veteran')
+  AND ta.popularity_category IN ('Trending', 'Popular')
+  AND caa.edit_count >= 2
+  AND caa.unique_voters > 5
+ORDER BY caa.global_rank, caa.engagement_score DESC
+LIMIT 1000

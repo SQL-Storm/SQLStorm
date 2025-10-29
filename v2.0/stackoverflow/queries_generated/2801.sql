@@ -1,0 +1,148 @@
+-- {"query": "2801.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1480} 
+
+with RecursivePostSummary as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        u.DisplayName as OwnerName,
+        -- Calculate a complex weighted score with NULL handling and string parsing of tags
+        coalesce(p.Score,0) * 2
+        + coalesce(p.ViewCount,0) / nullif(nullif(length(p.Tags),0),0)
+        + (select count(*) from Comments c where c.PostId = p.Id) * 1.5
+        + (select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 2) * 3
+        as WeightedScore,
+        p.Tags,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as OwnerPostRank
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId in (1,2) -- questions and answers
+),
+AcceptedAnswerScores as (
+    select
+        q.Id as QuestionId,
+        a.Id as AnswerId,
+        a.Score as AnswerScore
+    from Posts q
+    left join Posts a on a.Id = q.AcceptedAnswerId and a.PostTypeId = 2
+    where q.PostTypeId = 1
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        count(*) as TotalBadges
+    from Badges b
+    group by b.UserId
+),
+TopUsersByActivity as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct p.Id) as TotalPosts,
+        sum(case when p.PostTypeId = 1 then 1 else 0 end) as Questions,
+        sum(case when p.PostTypeId = 2 then 1 else 0 end) as Answers,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        -- Calculate average accepted answer score per user using correlated subquery
+        (
+            select avg(a.Score)
+            from Posts a
+            inner join Posts q on q.AcceptedAnswerId = a.Id and q.PostTypeId = 1
+            where a.OwnerUserId = u.Id and a.PostTypeId = 2
+        ) as AvgAcceptedAnswerScore
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId in (1,2)
+    left join UserBadgeCounts ub on ub.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges
+    having count(distinct p.Id) > 10
+),
+PostsWithCloseInfo as (
+    select 
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        ch.Name as CloseReason,
+        ph.CreationDate as CloseDate,
+        ph.UserId as ClosedByUserId,
+        u.DisplayName as ClosedByUserName
+    from Posts p
+    left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 10 -- Post Closed
+    left join CloseReasonTypes ch on ch.Id = cast(ph.Comment as int)
+    left join Users u on u.Id = ph.UserId
+    where p.PostTypeId = 1
+),
+TagUsage as (
+    select
+        unnest(string_to_array(trim(both '<>' from t.Tags), '><')) as Tag,
+        count(*) as TagCount
+    from Posts t
+    where t.PostTypeId = 1 and t.Tags is not null
+    group by Tag
+),
+HighScorePosts as (
+    select * from Posts where Score > 1000
+),
+HighScoreComments as (
+    select c.*
+    from Comments c
+    inner join HighScorePosts p on p.Id = c.PostId
+),
+CombinedPostsComments as (
+    select p.Id, p.CreationDate, p.Score as ItemScore, 'Post' as ItemType, p.OwnerUserId as UserId
+    from Posts p
+    union all
+    select c.Id, c.CreationDate, c.Score, 'Comment', c.UserId
+    from Comments c
+),
+RankedActivity as (
+    select
+        UserId,
+        ItemType,
+        Id,
+        CreationDate,
+        ItemScore,
+        row_number() over (partition by UserId, ItemType order by CreationDate desc) as ActivityRank
+    from CombinedPostsComments
+    where ItemScore is not null
+)
+select 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    ua.TotalPosts,
+    ua.Questions,
+    ua.Answers,
+    ua.GoldBadges,
+    ua.SilverBadges,
+    ua.BronzeBadges,
+    coalesce(ua.AvgAcceptedAnswerScore,0)::numeric(10,2) as AvgAcceptedAnswerScore,
+    rpa_r.ItemType as LatestHighScoreActivityType,
+    rpa_r.CreationDate as LatestHighScoreActivityDate,
+    rpa_r.ItemScore as LatestHighScoreActivityScore,
+    count(distinct q.Id) as QuestionsClosedCount,
+    max(case when q.CloseReason = 'Duplicate' then 1 else 0 end) as HasDuplicateClosures,
+    array_agg(distinct tu.Tag order by tu.TagCount desc limit 5) as TopTagsUsed,
+    (select count(*) from Posts p2 where p2.OwnerUserId = u.Id and p2.PostTypeId = 2 and p2.Score > 10) as HighScoreAnswersCount
+from Users u
+inner join TopUsersByActivity ua on ua.Id = u.Id
+left join RankedActivity rpa_r on rpa_r.UserId = u.Id and rpa_r.ActivityRank = 1
+left join PostsWithCloseInfo q on q.ClosedByUserId = u.Id
+left join TagUsage tu on tu.Tag in (
+    select unnest(string_to_array(trim(both '<>' from p.Tags), '><'))
+    from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 1
+)
+group by 
+    u.Id, u.DisplayName, u.Reputation, 
+    ua.TotalPosts, ua.Questions, ua.Answers, ua.GoldBadges, ua.SilverBadges, ua.BronzeBadges, ua.AvgAcceptedAnswerScore,
+    rpa_r.ItemType, rpa_r.CreationDate, rpa_r.ItemScore
+order by ua.Reputation desc, ua.TotalPosts desc
+limit 100;

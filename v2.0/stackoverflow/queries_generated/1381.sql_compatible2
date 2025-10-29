@@ -1,0 +1,240 @@
+WITH UserContributionSummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.Views AS UserProfileViews,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswers,
+        SUM(COALESCE(P.Score, 0)) AS TotalPostScore,
+        AVG(COALESCE(P.Score, 0.0)) AS AveragePostScore,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        MIN(P.CreationDate) AS FirstPostDate,
+        MAX(P.CreationDate) AS LastPostDate,
+        DATE_PART('day', AGE(MAX(P.CreationDate), MIN(P.CreationDate))) AS DaysActiveInPosting,
+        COUNT(DISTINCT PH.PostId) AS TotalPostsWithHistoryChanges,
+        MAX(U.LastAccessDate) AS UserLastAccessDate
+    FROM
+        Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN PostHistory PH ON U.Id = PH.UserId AND PH.PostHistoryTypeId IN (4, 5, 6, 10, 11, 12, 13)
+    WHERE
+        U.CreationDate >= DATE '2020-01-01'
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.Views, U.LastAccessDate
+),
+PostVolatilityMetrics AS (
+    SELECT
+        PH.PostId,
+        COUNT(PH.Id) AS RevisionCount,
+        COUNT(DISTINCT PH.UserId) AS DistinctEditorCount,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (10, 101, 102, 103, 104, 105) THEN 1 ELSE 0 END) AS WasClosed,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (11) THEN 1 ELSE 0 END) AS WasReopened,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (12) THEN 1 ELSE 0 END) AS WasDeleted,
+        MAX(PH.CreationDate) AS LastRevisionDate,
+        MIN(PH.CreationDate) AS FirstRevisionDate,
+        (
+            SELECT CR.Name
+            FROM PostHistory PH_INNER
+            JOIN CloseReasonTypes CR ON CR.Id = CAST(PH_INNER.Comment AS SMALLINT)
+            WHERE PH_INNER.PostId = PH.PostId
+              AND PH_INNER.PostHistoryTypeId IN (10, 101, 102, 103, 104, 105)
+            ORDER BY PH_INNER.CreationDate DESC
+            LIMIT 1
+        ) AS LatestCloseReasonName
+    FROM
+        PostHistory PH
+    GROUP BY
+        PH.PostId
+    HAVING COUNT(PH.Id) > 1
+),
+TagPerformanceOverview AS (
+    SELECT
+        P.Id AS PostId,
+        P.Title,
+        P.OwnerUserId,
+        P.Score,
+        P.ViewCount,
+        tag_names.TagNameClean,
+        T.Id AS TagId,
+        T.Count AS TagGlobalCount,
+        NTILE(5) OVER (PARTITION BY tag_names.TagNameClean ORDER BY P.Score DESC) AS TagScoreNtile,
+        AVG(P.Score) OVER (PARTITION BY tag_names.TagNameClean) AS AvgTagQuestionScore,
+        COUNT(P.Id) OVER (PARTITION BY tag_names.TagNameClean) AS TotalTagQuestions
+    FROM
+        Posts P
+    JOIN LATERAL (
+        SELECT TRIM(tn) AS TagNameClean
+        FROM (
+            SELECT UNNEST(string_to_array(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags) - 2), '><')) AS tn
+        ) s
+    ) tag_names ON TRUE
+    LEFT JOIN Tags T ON T.TagName = tag_names.TagNameClean
+    WHERE
+        P.PostTypeId = 1
+        AND P.Tags IS NOT NULL
+        AND LENGTH(P.Tags) > 2
+),
+HighImpactAnswerers AS (
+    SELECT
+        A.OwnerUserId AS UserId,
+        COUNT(DISTINCT A.Id) AS TotalAnswers,
+        SUM(CASE WHEN A.Id = Q.AcceptedAnswerId THEN 1 ELSE 0 END) AS AcceptedAnswersCount,
+        SUM(A.Score) AS TotalAnswerScore,
+        RANK() OVER (ORDER BY SUM(CASE WHEN A.Id = Q.AcceptedAnswerId THEN 1 ELSE 0 END) DESC, SUM(A.Score) DESC) AS AnswererRank
+    FROM
+        Posts A
+    JOIN Posts Q ON A.ParentId = Q.Id
+    WHERE
+        A.PostTypeId = 2
+        AND A.Score >= 5
+    GROUP BY
+        A.OwnerUserId
+    HAVING SUM(CASE WHEN A.Id = Q.AcceptedAnswerId THEN 1 ELSE 0 END) >= 1
+),
+UserBadgeAchievements AS (
+    SELECT
+        B.UserId,
+        COUNT(B.Id) AS TotalBadges,
+        COUNT(CASE WHEN B.Class = 1 THEN B.Id END) AS GoldBadges,
+        COUNT(CASE WHEN B.Class = 2 THEN B.Id END) AS SilverBadges,
+        COUNT(CASE WHEN B.Class = 3 THEN B.Id END) AS BronzeBadges,
+        MAX(B.Date) AS LastBadgeAwardDate
+    FROM
+        Badges B
+    GROUP BY
+        B.UserId
+),
+TopQuestionContributors AS (
+    SELECT
+        UCS.UserId,
+        UCS.DisplayName,
+        UCS.Reputation,
+        'Question_Focus' AS AnalysisType,
+        UCS.TotalQuestions,
+        UCS.AveragePostScore,
+        COALESCE(PV.LatestCloseReasonName, 'Open') AS QuestionCloseStatus,
+        PV.RevisionCount,
+        TPO.TagNameClean AS PrimaryQuestionTag,
+        TPO.AvgTagQuestionScore,
+        (
+            SELECT MAX(V.BountyAmount)
+            FROM Votes V
+            WHERE V.PostId IN (SELECT P_Q.Id FROM Posts P_Q WHERE P_Q.OwnerUserId = UCS.UserId AND P_Q.PostTypeId = 1)
+              AND V.VoteTypeId = 8
+              AND V.BountyAmount IS NOT NULL
+        ) AS MaxBountyOfferedByQuestioner,
+        RANK() OVER (ORDER BY UCS.TotalQuestions DESC, UCS.Reputation DESC) AS ContributorRank,
+        LAG(UCS.DisplayName, 1, 'N/A') OVER (ORDER BY UCS.TotalQuestions DESC) AS PrevRankedContributor
+    FROM
+        UserContributionSummary UCS
+    LEFT JOIN LATERAL (
+        SELECT PV_INNER.*
+        FROM Posts P_REP
+        JOIN PostVolatilityMetrics PV_INNER ON P_REP.Id = PV_INNER.PostId
+        WHERE P_REP.OwnerUserId = UCS.UserId AND P_REP.PostTypeId = 1
+        ORDER BY P_REP.Score DESC, P_REP.ViewCount DESC
+        LIMIT 1
+    ) PV ON TRUE
+    LEFT JOIN LATERAL (
+        SELECT TPO_INNER.*
+        FROM TagPerformanceOverview TPO_INNER
+        WHERE TPO_INNER.OwnerUserId = UCS.UserId AND TPO_INNER.PostId = PV.PostId
+        ORDER BY TPO_INNER.Score DESC NULLS LAST
+        LIMIT 1
+    ) TPO ON TRUE
+    WHERE
+        UCS.TotalQuestions > 10
+        AND UCS.Reputation > 5000
+        AND UCS.DisplayName IS NOT NULL AND UCS.DisplayName != ''
+),
+TopAnswerersAndBadgeHolders AS (
+    SELECT
+        UCS.UserId,
+        UCS.DisplayName,
+        UCS.Reputation,
+        'Answer_Badge_Focus' AS AnalysisType,
+        HIA.TotalAnswers,
+        HIA.AcceptedAnswersCount,
+        UBA.GoldBadges,
+        UBA.SilverBadges,
+        UBA.BronzeBadges,
+        (HIA.AcceptedAnswersCount * 1.0 / NULLIF(HIA.TotalAnswers, 0)) AS AcceptedAnswerRatio,
+        (
+            SELECT P_ACC_ANS.Title
+            FROM Posts P_ANS
+            JOIN Posts P_ACC_ANS ON P_ANS.ParentId = P_ACC_ANS.Id
+            WHERE P_ANS.OwnerUserId = UCS.UserId
+              AND P_ANS.PostTypeId = 2
+              AND P_ANS.Id = P_ACC_ANS.AcceptedAnswerId
+            ORDER BY P_ANS.Score DESC
+            LIMIT 1
+        ) AS TopAcceptedAnswerQuestionTitle,
+        NTILE(4) OVER (ORDER BY HIA.AcceptedAnswersCount DESC, UBA.GoldBadges DESC) AS AnswererBadgeNtile,
+        LEAD(UCS.DisplayName, 1, 'N/A') OVER (ORDER BY HIA.AcceptedAnswersCount DESC, UBA.GoldBadges DESC) AS NextRankedAnswerer
+    FROM
+        UserContributionSummary UCS
+    JOIN HighImpactAnswerers HIA ON UCS.UserId = HIA.UserId
+    LEFT JOIN UserBadgeAchievements UBA ON UCS.UserId = UBA.UserId
+    WHERE
+        HIA.AcceptedAnswersCount >= 5
+        AND UCS.Reputation > 7500
+        AND COALESCE(UBA.GoldBadges, 0) >= 1
+        AND UCS.DisplayName IS NOT NULL AND UCS.DisplayName != ''
+)
+SELECT
+    UserId,
+    DisplayName,
+    Reputation,
+    AnalysisType,
+    TotalQuestions,
+    TotalAnswers,
+    AveragePostScore,
+    CAST(NULL AS INTEGER) AS AcceptedAnswersCount,
+    CAST(NULL AS NUMERIC) AS AcceptedAnswerRatio,
+    QuestionCloseStatus,
+    CAST(RevisionCount AS BIGINT) AS RevisionCount,
+    PrimaryQuestionTag,
+    AvgTagQuestionScore,
+    MaxBountyOfferedByQuestioner,
+    ContributorRank AS CombinedRank,
+    PrevRankedContributor AS PeerContributor,
+    CAST(NULL AS INTEGER) AS GoldBadges,
+    CAST(NULL AS INTEGER) AS SilverBadges,
+    CAST(NULL AS INTEGER) AS BronzeBadges,
+    CAST(NULL AS VARCHAR(300)) AS TopAcceptedAnswerQuestionTitle,
+    NULLIF(DisplayName, 'Community') AS ActualDisplayNameIfNoCommunity
+FROM TopQuestionContributors
+WHERE ContributorRank <= 50
+
+UNION ALL
+
+SELECT
+    UserId,
+    DisplayName,
+    Reputation,
+    AnalysisType,
+    CAST(NULL AS INTEGER) AS TotalQuestions,
+    TotalAnswers,
+    CAST(NULL AS NUMERIC) AS AveragePostScore,
+    AcceptedAnswersCount,
+    AcceptedAnswerRatio,
+    CAST(NULL AS VARCHAR(50)) AS QuestionCloseStatus,
+    CAST(NULL AS BIGINT) AS RevisionCount,
+    CAST(NULL AS VARCHAR(255)) AS PrimaryQuestionTag,
+    CAST(NULL AS NUMERIC) AS AvgTagQuestionScore,
+    CAST(NULL AS INTEGER) AS MaxBountyOfferedByQuestioner,
+    AnswererBadgeNtile AS CombinedRank,
+    NextRankedAnswerer AS PeerContributor,
+    GoldBadges,
+    SilverBadges,
+    BronzeBadges,
+    TopAcceptedAnswerQuestionTitle,
+    NULLIF(DisplayName, 'Community') AS ActualDisplayNameIfNoCommunity
+FROM TopAnswerersAndBadgeHolders
+WHERE AnswererBadgeNtile <= 2
+
+ORDER BY Reputation DESC, CombinedRank ASC
+LIMIT 100;

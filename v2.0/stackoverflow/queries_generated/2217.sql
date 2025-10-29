@@ -1,0 +1,139 @@
+-- {"query": "2217.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1274} 
+
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t1.Id,
+        t1.TagName,
+        ARRAY[t1.TagName] AS TagPath,
+        1 AS Level
+    FROM Tags t1
+    WHERE t1.IsModeratorOnly = 0 AND t1.IsRequired = 0
+  UNION ALL
+    SELECT
+        t2.Id,
+        t2.TagName,
+        r.TagPath || t2.TagName,
+        r.Level + 1
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r ON t2.Id > r.Id
+    WHERE t2.IsModeratorOnly = 0
+      AND t2.IsRequired = 0
+      AND NOT t2.TagName = ANY(r.TagPath)
+), LatestUserActivity AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.Location,
+        u.CreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(b.Class) AS HighestBadgeClass,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY u.LastAccessDate DESC) AS rn
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Reputation > 1000 OR u.Location IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location, u.CreationDate, u.LastAccessDate
+), QuestionAnswerStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.OwnerUserId,
+        q.Title,
+        q.Tags,
+        q.CreationDate AS QuestionCreated,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        COALESCE(a.AnswersCnt, 0) AS TotalAnswers,
+        COALESCE(a.MaxAnswerScore, 0) AS MaxAnswerScore,
+        COALESCE(a.AvgAnswerScore, 0) AS AvgAnswerScore,
+        CASE WHEN q.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS HasAcceptedAnswer,
+        (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = q.Id AND ph.PostHistoryTypeId IN (10, 11) AND ph.CreationDate >= q.CreationDate) AS CloseReopenEvents
+    FROM Posts q
+    LEFT JOIN (
+        SELECT
+            ParentId,
+            COUNT(*) AS AnswersCnt,
+            MAX(Score) AS MaxAnswerScore,
+            AVG(Score::numeric) AS AvgAnswerScore
+        FROM Posts
+        WHERE PostTypeId = 2 -- answers
+        GROUP BY ParentId
+    ) a ON a.ParentId = q.Id
+    WHERE q.PostTypeId = 1 -- questions
+      AND q.Score >= 0
+), UserVoteAgg AS (
+    SELECT
+        v.UserId,
+        COUNT(*) FILTER (WHERE vt.Name = 'UpMod') AS UpVotes,
+        COUNT(*) FILTER (WHERE vt.Name = 'DownMod') AS DownVotes,
+        COUNT(*) FILTER (WHERE vt.Name = 'Favorite') AS Favorites,
+        COUNT(*) FILTER (WHERE vt.Name = 'Close') AS CloseVotes,
+        COUNT(*) FILTER (WHERE vt.Name = 'Reopen') AS ReopenVotes
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY v.UserId
+), ComplexPosts AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.PostTypeId,
+        p.AcceptedAnswerId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        to_tsvector('english', coalesce(p.Title || ' ' || p.Body, '')) AS DocumentVector
+    FROM Posts p
+    WHERE p.PostTypeId IN (1,2) -- questions and answers
+), FilteredComments AS (
+    SELECT
+        c.PostId,
+        STRING_AGG(c.Text, ' | ' ORDER BY c.CreationDate DESC) AS AllCommentsText,
+        MAX(c.Score) AS MaxCommentScore,
+        COUNT(*) AS CommentCount
+    FROM Comments c
+    WHERE POSITION('bug' IN lower(c.Text)) > 0
+    GROUP BY c.PostId
+)
+SELECT
+    qs.QuestionId,
+    LEFT(qs.Title, 100) AS ShortTitle,
+    qs.Tags,
+    qs.ViewCount,
+    qs.AnswerCount,
+    qs.TotalAnswers,
+    qs.MaxAnswerScore,
+    ROUND(qs.AvgAnswerScore,2) AS AvgAnswerScore,
+    qs.HasAcceptedAnswer,
+    qs.CloseReopenEvents,
+    lu.DisplayName AS QuestionOwner,
+    lu.Reputation AS OwnerReputation,
+    COALESCE(uv.UpVotes,0) AS OwnerUpVotes,
+    COALESCE(uv.DownVotes,0) AS OwnerDownVotes,
+    COALESCE(fc.AllCommentsText, '') AS CommentsContainingBug,
+    fc.MaxCommentScore,
+    fc.CommentCount,
+    rh.Level AS TagDepth,
+    rh.TagPath,
+    ROW_NUMBER() OVER (PARTITION BY qs.QuestionId ORDER BY qs.Score DESC, qs.ViewCount DESC) AS RankByPopularity
+FROM QuestionAnswerStats qs
+INNER JOIN LatestUserActivity lu ON lu.Id = qs.OwnerUserId AND lu.rn = 1
+LEFT JOIN UserVoteAgg uv ON uv.UserId = qs.OwnerUserId
+LEFT JOIN FilteredComments fc ON fc.PostId = qs.QuestionId
+LEFT JOIN LATERAL (
+    SELECT *
+    FROM RecursiveTagHierarchy rth
+    WHERE rth.TagName = ANY(string_to_array(substring(qs.Tags FROM 2 FOR length(qs.Tags)-2), '><'))
+    ORDER BY rth.Level DESC
+    LIMIT 1
+) rh ON TRUE
+WHERE qs.ViewCount > 1000
+  AND (qs.AnswerCount > 0 OR qs.CloseReopenEvents > 0)
+  AND (fc.CommentCount IS NOT NULL OR qs.Score > 10)
+ORDER BY RankByPopularity
+LIMIT 50;

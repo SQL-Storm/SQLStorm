@@ -1,0 +1,234 @@
+-- {"query": "7891.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2500} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT c.Id) as Comments,
+        COUNT(DISTINCT b.Id) as Badges,
+        MAX(p.CreationDate) as LastPostDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) as ReputationRank,
+        RANK() OVER (PARTITION BY SUBSTRING(u.Location, 1, 2) ORDER BY u.Reputation DESC) as LocationReputationRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.Location
+),
+UserPostPerformance AS (
+    SELECT 
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Question with Accepted Answer'
+            WHEN p.PostTypeId = 1 THEN 'Question without Accepted Answer'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as PostCategory,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId, p.PostTypeId ORDER BY p.CreationDate DESC) as PostSequence,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId, p.PostTypeId) as TotalTypePosts,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId, p.PostTypeId) as AvgScorePerType,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PrevPostScore,
+        (p.Score - LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate)) as ScoreChange,
+        DATEDIFF(day, LAG(p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate), p.CreationDate) as DaysSinceLastPost,
+        CASE 
+            WHEN p.Score > 100 THEN 'Highly Upvoted'
+            WHEN p.Score > 50 THEN 'Upvoted'
+            WHEN p.Score > 0 THEN 'Neutral'
+            WHEN p.Score < 0 THEN 'Downvoted'
+            ELSE 'No Votes'
+        END as ScoreCategory
+    FROM Posts p
+    WHERE p.CreationDate >= '2015-01-01' 
+    AND p.OwnerUserId IS NOT NULL
+),
+UserStatsWithRankings AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.Views,
+        uas.UpVotes,
+        uas.DownVotes,
+        uas.TotalPosts,
+        uas.Questions,
+        uas.Answers,
+        uas.Comments,
+        uas.Badges,
+        uas.LastPostDate,
+        uas.ReputationRank,
+        uas.LocationReputationRank,
+        CASE WHEN uas.Reputation > 10000 THEN 'Elite' 
+             WHEN uas.Reputation > 5000 THEN 'Veteran'
+             WHEN uas.Reputation > 1000 THEN 'Active'
+             ELSE 'Newbie' END as UserTier,
+        DENSE_RANK() OVER (ORDER BY uas.TotalPosts DESC) as PostCountRank,
+        DENSE_RANK() OVER (ORDER BY (uas.Questions + uas.Answers) DESC) as QuestionAnswerRank,
+        DENSE_RANK() OVER (ORDER BY uas.Comments DESC) as CommentRank,
+        DENSE_RANK() OVER (ORDER BY uas.Badges DESC) as BadgeRank,
+        AVG(uas.Reputation) OVER (ORDER BY uas.ReputationRank ROWS BETWEEN 10 PRECEDING AND CURRENT ROW) as ReputationMovingAvg,
+        MIN(uas.Reputation) OVER (ORDER BY uas.ReputationRank ROWS BETWEEN 5 PRECEDING AND 5 FOLLOWING) as ReputationRangeMin,
+        MAX(uas.Reputation) OVER (ORDER BY uas.ReputationRank ROWS BETWEEN 5 PRECEDING AND 5 FOLLOWING) as ReputationRangeMax
+    FROM UserActivityStats uas
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderately Popular'
+            WHEN t.Count > 10 THEN 'Niche'
+            ELSE 'Rare'
+        END as TagPopularity,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as TagPopularityRank,
+        RANK() OVER (PARTITION BY t.IsModeratorOnly ORDER BY t.Count DESC) as ModOnlyTagRank,
+        AVG(t.Count) OVER (ORDER BY TagPopularityRank ROWS BETWEEN 10 PRECEDING AND CURRENT ROW) as PopularityMovingAvg,
+        LAG(t.Count) OVER (ORDER BY t.Count DESC) as PrevTagCount
+    FROM Tags t
+    WHERE t.Count > 0
+),
+ComplexMetrics AS (
+    SELECT 
+        ups.OwnerUserId,
+        ups.PostTypeId,
+        ups.Score,
+        ups.ViewCount,
+        ups.AnswerCount,
+        ups.CommentCount,
+        ups.FavoriteCount,
+        ups.CreationDate,
+        ups.Title,
+        ups.Tags,
+        ups.PostCategory,
+        ups.PostSequence,
+        ups.TotalTypePosts,
+        ups.AvgScorePerType,
+        ups.PrevPostScore,
+        ups.ScoreChange,
+        ups.DaysSinceLastPost,
+        ups.ScoreCategory,
+        CASE 
+            WHEN ups.Score > 0 AND ups.ViewCount > 1000 THEN 'High Engagement'
+            WHEN ups.Score > 0 AND ups.ViewCount > 500 THEN 'Moderate Engagement'
+            WHEN ups.Score > 0 THEN 'Low Engagement'
+            WHEN ups.Score <= 0 AND ups.ViewCount > 1000 THEN 'Content Engagement'
+            ELSE 'No Engagement'
+        END as EngagementLevel,
+        CASE 
+            WHEN ups.ScoreChange > 10 THEN 'Rapid Improvement'
+            WHEN ups.ScoreChange > 0 THEN 'Slow Improvement'
+            WHEN ups.ScoreChange < -10 THEN 'Rapid Decline'
+            WHEN ups.ScoreChange < 0 THEN 'Slow Decline'
+            ELSE 'Stable'
+        END as PerformanceChange,
+        CASE 
+            WHEN ups.DaysSinceLastPost < 30 THEN 'Active Contributor'
+            WHEN ups.DaysSinceLastPost < 90 THEN 'Occasional Contributor'
+            WHEN ups.DaysSinceLastPost < 365 THEN 'Seasonal Contributor'
+            ELSE 'Inactive'
+        END as ContributionFrequency,
+        (COALESCE(ups.VoteCount, 0) + COALESCE(ups.CommentCount, 0) + COALESCE(ups.AnswerCount, 0)) as TotalCommunityInteraction,
+        ABS(ups.Score - ups.AvgScorePerType) / NULLIF(ups.AvgScorePerType, 0) * 100 as ScoreDeviationPercentage,
+        IIF(ups.Tags IS NOT NULL AND ups.Tags != '', 
+            IIF(ups.Tags LIKE '%<%' AND ups.Tags LIKE '%>%' AND LENGTH(ups.Tags) > 2,
+                (LENGTH(ups.Tags) - LENGTH(REPLACE(ups.Tags, '>', ''))) / 2, 0), 0) as TagCountEstimate
+    FROM (
+        SELECT 
+            p.OwnerUserId,
+            p.PostTypeId,
+            p.Score,
+            p.ViewCount,
+            p.AnswerCount,
+            p.CommentCount,
+            p.FavoriteCount,
+            p.CreationDate,
+            p.Title,
+            p.Tags,
+            p.AcceptedAnswerId,
+            DENSE_RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as PostRank,
+            ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId, p.PostTypeId ORDER BY p.CreationDate DESC) as TypePostRank
+        FROM Posts p
+        WHERE p.OwnerUserId IS NOT NULL 
+        AND p.OwnerUserId <> -1
+        AND p.CreationDate >= '2015-01-01'
+    ) ups
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) as VoteCount 
+        FROM Votes 
+        GROUP BY PostId
+    ) v ON v.PostId = ups.id
+)
+SELECT 
+    'User Performance Summary' as ReportType,
+    uswr.UserId as UserId,
+    uswr.DisplayName,
+    uswr.Reputation,
+    uswr.Views,
+    uswr.UpVotes,
+    uswr.DownVotes,
+    uswr.TotalPosts,
+    uswr.Questions,
+    uswr.Answers,
+    uswr.Comments,
+    uswr.Badges,
+    uswr.LastPostDate,
+    uswr.ReputationRank,
+    uswr.LocationReputationRank,
+    uswr.UserTier,
+    uswr.PostCountRank,
+    uswr.QuestionAnswerRank,
+    uswr.CommentRank,
+    uswr.BadgeRank,
+    uswr.ReputationMovingAvg,
+    uswr.ReputationRangeMin,
+    uswr.ReputationRangeMax,
+    CASE 
+        WHEN uswr.Reputation > 10000 AND uswr.TotalPosts > 500 THEN 'Elite Contributor'
+        WHEN uswr.Reputation > 5000 AND uswr.TotalPosts > 100 THEN 'Veteran Contributor'
+        WHEN uswr.Reputation > 1000 AND uswr.TotalPosts > 50 THEN 'Active Contributor'
+        ELSE 'Regular Contributor'
+    END as ContributorLevel,
+    COALESCE(
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = uswr.UserId AND p.PostTypeId = 1 AND p.Score > 0),
+        0
+    ) as HighScoringQuestions,
+    COALESCE(
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = uswr.UserId AND p.PostTypeId = 2 AND p.Score > 0),
+        0
+    ) as HighScoringAnswers,
+    (CASE WHEN uswr.ReputationRank <= 10 THEN 1 ELSE 0 END) as Top10Reputation,
+    (CASE WHEN uswr.PostCountRank <= 10 THEN 1 ELSE 0 END) as Top10PostCount,
+    (SELECT STRING_AGG(DISTINCT t.TagName, ', ') 
+     FROM Posts p 
+     JOIN Tags t ON p.Tags LIKE '%' || t.TagName || '%' 
+     WHERE p.OwnerUserId = uswr.UserId AND p.Tags IS NOT NULL AND p.Tags != ''
+     LIMIT 5) as SampleTags,
+    (SELECT COUNT(*) 
+     FROM Badges b 
+     JOIN Users u ON b.UserId = u.Id 
+     WHERE b.UserId = uswr.UserId AND b.Date >= DATEADD(year, -1, GETDATE())) as RecentBadgesCount
+FROM UserStatsWithRankings uswr
+WHERE uswr.Reputation > 100
+HAVING COUNT(*) >= 1
+ORDER BY uswr.Reputation DESC, uswr.TotalPosts DESC
+OPTION (MAXDOP 4)

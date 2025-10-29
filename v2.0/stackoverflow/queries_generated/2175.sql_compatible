@@ -1,0 +1,166 @@
+with recursive RecursiveTagPosts as (
+    select p.Id, p.Tags, 1 as depth
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+    union all
+    select p2.Id, p2.Tags, rt.depth + 1
+    from Posts p2
+    join RecursiveTagPosts rt on p2.ParentId = rt.Id
+    where p2.PostTypeId = 2
+),
+UserPostStats as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) as TotalPosts,
+        sum(case when p.PostTypeId = 1 then 1 else 0 end) as QuestionsAsked,
+        sum(case when p.PostTypeId = 2 then 1 else 0 end) as AnswersGiven,
+        avg(coalesce(p.Score,0)) as AvgPostScore,
+        max(coalesce(p.Score,0)) as MaxPostScore,
+        sum(coalesce(p.ViewCount,0)) as TotalViews,
+        sum(coalesce(p.FavoriteCount,0)) as TotalFavorites,
+        sum(case when coalesce(b.Class,0) = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when coalesce(b.Class,0) = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when coalesce(b.Class,0) = 3 then 1 else 0 end) as BronzeBadges,
+        min(u.CreationDate) as MemberSince
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostWithAcceptedAndAnswers as (
+    select 
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionCreated,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViews,
+        q.AcceptedAnswerId,
+        a.Id as AcceptedAnswerIdReal,
+        a.OwnerUserId as AcceptedByUser,
+        count(ans.Id) as AnswerCount,
+        avg(ans.Score) as AvgAnswerScore,
+        max(ans.Score) as MaxAnswerScore
+    from Posts q
+    left join Posts a on a.Id = q.AcceptedAnswerId
+    left join Posts ans on ans.ParentId = q.Id and ans.PostTypeId = 2
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount, q.AcceptedAnswerId, a.Id, a.OwnerUserId
+),
+RankedComments as (
+    select 
+        c.PostId, 
+        c.Id as CommentId,
+        c.UserId,
+        c.UserDisplayName,
+        c.CreationDate,
+        c.Score,
+        row_number() over (partition by c.PostId order by c.Score desc NULLS LAST, c.CreationDate asc) as CommentRank
+    from Comments c
+),
+DuplicateQuestionChains as (
+    select 
+        pl.PostId as DuplicateQuestionId,
+        pl.RelatedPostId as OriginalQuestionId,
+        pl.CreationDate
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId and lt.Name = 'Duplicate'
+    where exists (
+        select 1 from Posts p where p.Id = pl.PostId and p.PostTypeId = 1
+    ) and exists (
+        select 1 from Posts p2 where p2.Id = pl.RelatedPostId and p2.PostTypeId = 1
+    )
+),
+TopUsersByAvgAnswerScore as (
+    select 
+        p.OwnerUserId,
+        avg(p.Score) as AvgAnswerScore
+    from Posts p
+    where p.PostTypeId = 2
+    group by p.OwnerUserId
+),
+UserCloseVoteCounts as (
+    select 
+        ph.UserId,
+        count(case when ph.PostHistoryTypeId = 10 then 1 end) as CloseVotes,
+        count(case when ph.PostHistoryTypeId = 11 then 1 end) as ReopenVotes
+    from PostHistory ph
+    group by ph.UserId
+)
+select 
+    ups.UserId,
+    ups.DisplayName,
+    ups.TotalPosts,
+    ups.QuestionsAsked,
+    ups.AnswersGiven,
+    ups.AvgPostScore,
+    ups.MaxPostScore,
+    ups.TotalViews,
+    ups.TotalFavorites,
+    ups.GoldBadges,
+    ups.SilverBadges,
+    ups.BronzeBadges,
+    ups.MemberSince,
+    coalesce(ucvc.CloseVotes,0) as UserCloseVotes,
+    coalesce(ucvc.ReopenVotes,0) as UserReopenVotes,
+    coalesce(tustab.AvgAnswerScore, 0) as UserAvgAnswerScore,
+    coalesce(dq.OriginalQuestionId, null) as DuplicatedQuestionOriginalId,
+    string_agg(distinct substring(rt.Tags from '<([^<>]+)>'), ',' order by substring(rt.Tags from '<([^<>]+)>') ) filter (where rt.Tags is not null) as UserTagSet,
+    (select string_agg(distinct pt.Name, ',' order by pt.Name)
+     from PostTypes pt
+     where pt.Id in (
+         select distinct p.PostTypeId from Posts p where p.OwnerUserId = ups.UserId limit 5
+     )) as PostTypesUsed,
+    (select count(*) from RecursiveTagPosts rtp_inner where rtp_inner.Id in (
+        select p.Id from Posts p where p.OwnerUserId = ups.UserId
+    ) and rtp_inner.depth > 1) as RecursiveTaggedPostsCount,
+    (select count(*) from Comments cmt where cmt.UserId = ups.UserId and cmt.Score > 5) as HighlyRatedComments,
+    (select avg(p.Score) from Posts p where p.OwnerUserId = ups.UserId and p.PostTypeId = 2) as AvgAnswerScoreDirect,
+    (select count(distinct c2.Id) 
+      from Comments c2 
+      join Posts p2 on p2.Id = c2.PostId 
+      where p2.OwnerUserId = ups.UserId and c2.CreationDate > ups.MemberSince + interval '1 year') as CommentsInSecondYear,
+    (case when ups.TotalPosts > 50 and ups.GoldBadges >= 1 and ups.AvgPostScore > 2 then 'Expert' else 'Contributor' end) as UserCategory
+from UserPostStats ups
+left join UserCloseVoteCounts ucvc on ucvc.UserId = ups.UserId
+left join TopUsersByAvgAnswerScore tustab on tustab.OwnerUserId = ups.UserId
+left join DuplicateQuestionChains dq on dq.DuplicateQuestionId = (
+    select p.Id from Posts p where p.OwnerUserId = ups.UserId and p.PostTypeId = 1 order by p.CreationDate desc limit 1
+)
+left join RecursiveTagPosts rt on rt.Id in (
+    select p.Id from Posts p where p.OwnerUserId = ups.UserId
+)
+where ups.TotalPosts > 10
+group by
+    ups.UserId,
+    ups.DisplayName,
+    ups.TotalPosts,
+    ups.QuestionsAsked,
+    ups.AnswersGiven,
+    ups.AvgPostScore,
+    ups.MaxPostScore,
+    ups.TotalViews,
+    ups.TotalFavorites,
+    ups.GoldBadges,
+    ups.SilverBadges,
+    ups.BronzeBadges,
+    ups.MemberSince,
+    ucvc.CloseVotes,
+    ucvc.ReopenVotes,
+    tustab.AvgAnswerScore,
+    dq.OriginalQuestionId,
+    ups.UserId,
+    ups.DisplayName,
+    ups.TotalPosts,
+    ups.QuestionsAsked,
+    ups.AnswersGiven,
+    ups.AvgPostScore,
+    ups.MaxPostScore,
+    ups.TotalViews,
+    ups.TotalFavorites,
+    ups.GoldBadges,
+    ups.SilverBadges,
+    ups.BronzeBadges,
+    ups.MemberSince
+order by ups.TotalPosts desc, ups.AvgPostScore desc
+limit 100;

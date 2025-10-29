@@ -1,0 +1,167 @@
+-- {"query": "3557.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2024} 
+
+/*  Benchmark query mixing CTEs, window functions, outer joins, correlated subqueries,
+    set operators, string manipulation and NULL logic on the StackOverflow schema   */
+WITH 
+/* 1. Tag statistics for questions */
+TagStats AS (
+    SELECT 
+        t.Id               AS TagId,
+        t.TagName,
+        COUNT(p.Id)        AS QuestionCount,
+        COALESCE(SUM(p.Score),0) AS TotalScore,
+        COALESCE(AVG(p.ViewCount),0) AS AvgViews,
+        -- extract first word of the tag description (if any)
+        NULLIF(TRIM(SPLIT_PART(p.Body, ' ', 1)),'') AS SampleWord
+    FROM Tags t
+    LEFT JOIN Posts p
+        ON p.PostTypeId = 1                                   -- only questions
+       AND p.Tags LIKE ('%<'||t.TagName||'>%')
+    GROUP BY t.Id, t.TagName
+),
+
+/* 2. User activity snapshot */
+UserActivity AS (
+    SELECT 
+        u.Id                                   AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END),0)  AS UpVotesGiven,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END),0)  AS DownVotesGiven,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END)      AS QuestionsAsked,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END)      AS AnswersGiven,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY u.CreationDate) AS RowNumByCreation
+    FROM Users u
+    LEFT JOIN Votes v       ON v.UserId = u.Id
+    LEFT JOIN Posts p       ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+
+/* 3. Recent closed questions with reason extracted from PostHistory.Comment field */
+RecentClosedQuestions AS (
+    SELECT 
+        p.Id                     AS QuestionId,
+        p.Title,
+        p.CreationDate,
+        ph.CreationDate          AS ClosedDate,
+        NULLIF(TRIM(ph.Comment),'') AS CloseReasonRaw,
+        -- map old numeric reasons to textual equivalents (example mapping)
+        CASE 
+            WHEN ph.Comment = '1'  THEN 'Exact Duplicate'
+            WHEN ph.Comment = '2'  THEN 'Off-topic'
+            WHEN ph.Comment = '3'  THEN 'Subjective'
+            WHEN ph.Comment = '4'  THEN 'Not a real question'
+            WHEN ph.Comment LIKE '10%' THEN 'General reference'
+            ELSE 'Other'
+        END                     AS CloseReason
+    FROM Posts p
+    JOIN PostHistory ph
+        ON ph.PostId = p.Id
+       AND ph.PostHistoryTypeId = 10            -- Post Closed
+    WHERE p.PostTypeId = 1                     -- Question
+      AND ph.CreationDate >= CURRENT_DATE - INTERVAL '30 days'
+),
+
+/* 4. Top answer per question (correlated subquery in the CTE) */
+TopAnswers AS (
+    SELECT 
+        a.ParentId               AS QuestionId,
+        a.Id                     AS AnswerId,
+        a.Score,
+        a.OwnerUserId,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate) AS RankInQuestion
+    FROM Posts a
+    WHERE a.PostTypeId = 2                        -- Answer
+),
+
+/* 5. Users who have earned at least one gold badge (derived via EXISTS) */
+GoldBadgeUsers AS (
+    SELECT DISTINCT b.UserId
+    FROM Badges b
+    WHERE b.Class = 1                               -- Gold
+),
+
+/* 6. Posts that have been linked or marked as duplicates (set operator) */
+LinkedOrDuplicatePosts AS (
+    SELECT 
+        pl.PostId      AS SourcePostId,
+        pl.RelatedPostId,
+        lt.Name        AS LinkType,
+        pl.CreationDate
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    WHERE lt.Name IN ('Linked','Duplicate')
+    UNION ALL
+    SELECT 
+        pl.RelatedPostId,
+        pl.PostId,
+        lt.Name,
+        pl.CreationDate
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    WHERE lt.Name = 'Duplicate'
+),
+
+/* 7. Score distribution per tag using window framing */
+TagScoreDistribution AS (
+    SELECT 
+        ts.TagId,
+        ts.TagName,
+        ts.QuestionCount,
+        ts.TotalScore,
+        PERCENT_RANK() OVER (PARTITION BY ts.TagId ORDER BY ts.TotalScore) AS ScorePercentile,
+        NTILE(5) OVER (PARTITION BY ts.TagId ORDER BY ts.TotalScore) AS Quintile
+    FROM TagStats ts
+)
+
+SELECT 
+    ts.TagName,
+    ts.QuestionCount,
+    ts.TotalScore,
+    ts.AvgViews,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.UpVotesGiven,
+    ua.DownVotesGiven,
+    rcq.Title                             AS RecentlyClosedTitle,
+    rcq.CloseReason,
+    ta.AnswerId                           AS TopAnswerId,
+    ta.Score                              AS TopAnswerScore,
+    gbu.UserId                            AS GoldBadgeUserId,
+    ldp.SourcePostId,
+    ldp.RelatedPostId,
+    ldp.LinkType,
+    ldp.CreationDate                     AS LinkCreatedOn,
+    tsd.ScorePercentile,
+    tsd.Quintile
+FROM TagStats ts
+LEFT OUTER JOIN UserActivity ua        ON ua.RowNumByCreation = 1                     -- most senior user per tag (example logic)
+LEFT OUTER JOIN RecentClosedQuestions rcq 
+        ON rcq.QuestionId = (
+               SELECT MIN(p.Id)
+               FROM Posts p
+               WHERE p.Tags LIKE ('%<'||ts.TagName||'>%')
+                 AND p.PostTypeId = 1
+           )
+LEFT OUTER JOIN TopAnswers ta
+        ON ta.QuestionId = (
+               SELECT MIN(p.Id)
+               FROM Posts p
+               WHERE p.Tags LIKE ('%<'||ts.TagName||'>%')
+                 AND p.PostTypeId = 1
+           )
+           AND ta.RankInQuestion = 1
+LEFT OUTER JOIN GoldBadgeUsers gbu
+        ON gbu.UserId = ua.UserId
+LEFT OUTER JOIN LinkedOrDuplicatePosts ldp
+        ON ldp.SourcePostId = (
+               SELECT MIN(p.Id)
+               FROM Posts p
+               WHERE p.Tags LIKE ('%<'||ts.TagName||'>%')
+                 AND p.PostTypeId = 1
+           )
+LEFT OUTER JOIN TagScoreDistribution tsd
+        ON tsd.TagId = ts.TagId
+WHERE ts.QuestionCount > 0
+ORDER BY ts.TotalScore DESC
+OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY;

@@ -1,0 +1,335 @@
+-- {"query": "188.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3397} 
+with
+q_posts as (
+  select
+    p.Id as QuestionId,
+    p.CreationDate as QuestionCreationDate,
+    p.Score as QuestionScore,
+    p.ViewCount,
+    p.OwnerUserId as QuestionOwnerId,
+    p.AcceptedAnswerId,
+    p.Title,
+    p.Tags,
+    coalesce(p.AnswerCount, 0) as AnswerCount
+  from Posts p
+  where p.PostTypeId = 1
+    and p.CreationDate >= (select date_trunc('year', min(CreationDate)) from Posts where PostTypeId = 1)
+),
+a_posts as (
+  select
+    a.Id as AnswerId,
+    a.ParentId as QuestionId,
+    a.OwnerUserId as AnswerOwnerId,
+    a.Score as AnswerScore,
+    a.CreationDate as AnswerCreationDate
+  from Posts a
+  where a.PostTypeId = 2
+),
+user_stats as (
+  select
+    u.Id as UserId,
+    u.Reputation,
+    u.UpVotes,
+    u.DownVotes,
+    u.Views as ProfileViews,
+    u.CreationDate as UserCreationDate,
+    (u.UpVotes - coalesce(u.DownVotes,0)) as NetVotes,
+    case when u.WebsiteUrl is null or trim(u.WebsiteUrl) = '' then 0 else 1 end as HasWebsite
+  from Users u
+),
+comment_agg as (
+  select
+    c.PostId,
+    count(*) as CommentCount,
+    sum(case when c.Score > 0 then 1 else 0 end) as PosCommentCount,
+    sum(case when c.Score < 0 then 1 else 0 end) as NegCommentCount,
+    max(c.CreationDate) as LastCommentDate
+  from Comments c
+  group by c.PostId
+),
+vote_agg as (
+  select
+    v.PostId,
+    sum(case when v.VoteTypeId = 2 then 1 else 0 end) as Upvotes,
+    sum(case when v.VoteTypeId = 3 then 1 else 0 end) as Downvotes,
+    sum(case when v.VoteTypeId = 8 then coalesce(v.BountyAmount,0) else 0 end) as BountyStarted,
+    sum(case when v.VoteTypeId = 9 then coalesce(v.BountyAmount,0) else 0 end) as BountyAwarded,
+    count(*) as VoteEvents
+  from Votes v
+  group by v.PostId
+),
+ph_close as (
+  select
+    ph.PostId,
+    count(*) filter (where ph.PostHistoryTypeId = 10) as CloseEvents,
+    min(ph.CreationDate) filter (where ph.PostHistoryTypeId = 10) as FirstCloseDate,
+    max(ph.CreationDate) filter (where ph.PostHistoryTypeId = 11) as LastReopenDate,
+    max(case when ph.PostHistoryTypeId = 10 then nullif(ph.Comment, '') end) as LastCloseReasonRaw
+  from PostHistory ph
+  where ph.PostHistoryTypeId in (10,11)
+  group by ph.PostId
+),
+dup_links as (
+  select
+    pl.PostId,
+    count(*) filter (where pl.LinkTypeId = 3) as DuplicateLinks,
+    count(*) filter (where pl.LinkTypeId = 1) as RelatedLinks,
+    min(pl.CreationDate) as FirstLinkDate
+  from PostLinks pl
+  group by pl.PostId
+),
+tag_expansion as (
+  select
+    q.QuestionId,
+    unnest(string_to_array(substring(coalesce(q.Tags,''), 2, greatest(length(coalesce(q.Tags,'')) - 2, 0)), '><')) as TagName
+  from q_posts q
+),
+tag_rank as (
+  select
+    te.QuestionId,
+    te.TagName,
+    t.Count as TagGlobalCount,
+    row_number() over (partition by te.QuestionId order by coalesce(t.Count,0) desc, te.TagName) as TagRankByGlobalCount
+  from tag_expansion te
+  left join Tags t on lower(t.TagName) = lower(te.TagName)
+),
+best_answer as (
+  select
+    a.QuestionId,
+    a.AnswerId,
+    a.AnswerOwnerId,
+    a.AnswerScore,
+    a.AnswerCreationDate,
+    row_number() over (partition by a.QuestionId order by a.AnswerScore desc, a.AnswerCreationDate asc, a.AnswerId asc) as rn_score,
+    row_number() over (partition by a.QuestionId order by a.AnswerCreationDate asc, a.AnswerId asc) as rn_fastest
+  from a_posts a
+),
+user_badge_agg as (
+  select
+    b.UserId,
+    count(*) as TotalBadges,
+    sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+    sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+    sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+    max(b.Date) as LastBadgeDate
+  from Badges b
+  group by b.UserId
+),
+q_quality as (
+  select
+    q.QuestionId,
+    q.QuestionScore,
+    q.ViewCount,
+    q.AnswerCount,
+    v.Upvotes,
+    v.Downvotes,
+    coalesce(v.Upvotes,0) - coalesce(v.Downvotes,0) as NetVotes,
+    coalesce(v.BountyAwarded,0) as BountyAwarded,
+    coalesce(c.CommentCount,0) as CommentCount,
+    case
+      when q.ViewCount is null or q.ViewCount = 0 then null
+      else round((q.QuestionScore::numeric + coalesce(v.Upvotes,0) - coalesce(v.Downvotes,0)) / nullif(q.ViewCount,0), 6)
+    end as EngagementScore
+  from q_posts q
+  left join vote_agg v on v.PostId = q.QuestionId
+  left join comment_agg c on c.PostId = q.QuestionId
+),
+owner_enriched as (
+  select
+    q.QuestionId,
+    q.Title,
+    q.Tags,
+    uo.UserId as OwnerUserId,
+    uo.Reputation as OwnerReputation,
+    uo.NetVotes as OwnerNetVotes,
+    ub.TotalBadges as OwnerTotalBadges,
+    coalesce(ub.GoldBadges,0) as OwnerGoldBadges,
+    coalesce(ub.SilverBadges,0) as OwnerSilverBadges,
+    coalesce(ub.BronzeBadges,0) as OwnerBronzeBadges
+  from q_posts q
+  left join user_stats uo on uo.UserId = q.QuestionOwnerId
+  left join user_badge_agg ub on ub.UserId = q.QuestionOwnerId
+),
+accepted_vs_best as (
+  select
+    q.QuestionId,
+    q.AcceptedAnswerId,
+    ba.AnswerId as TopScoredAnswerId,
+    ba.AnswerOwnerId as TopScoredOwnerId,
+    ba.AnswerScore as TopScoredAnswerScore,
+    ba2.AnswerId as FastestAnswerId,
+    case when q.AcceptedAnswerId is not null and q.AcceptedAnswerId = ba.AnswerId then 1 else 0 end as AcceptedIsTopScored,
+    case when q.AcceptedAnswerId is not null and q.AcceptedAnswerId = ba2.AnswerId then 1 else 0 end as AcceptedIsFastest
+  from q_posts q
+  left join best_answer ba on ba.QuestionId = q.QuestionId and ba.rn_score = 1
+  left join best_answer ba2 on ba2.QuestionId = q.QuestionId and ba2.rn_fastest = 1
+),
+owner_vs_answerer as (
+  select
+    e.QuestionId,
+    e.OwnerUserId,
+    case
+      when e.OwnerUserId is null then null
+      when e.OwnerUserId = avb.TopScoredOwnerId then 'Owner=TopScorer'
+      else 'Owner!=TopScorer'
+    end as OwnerTopScoreRelation
+  from owner_enriched e
+  left join accepted_vs_best avb on avb.QuestionId = e.QuestionId
+),
+closed_reason_norm as (
+  select
+    ph.PostId as QuestionId,
+    case
+      when ph.LastCloseReasonRaw ~ '^[0-9]+$' then
+        case cast(ph.LastCloseReasonRaw as int)
+          when 1 then 'Exact Duplicate'
+          when 2 then 'Off-topic'
+          when 3 then 'Subjective'
+          when 4 then 'Not real question'
+          when 7 then 'Too localized'
+          when 10 then 'General reference'
+          when 20 then 'Noise/pointless'
+          when 101 then 'Duplicate'
+          when 102 then 'Off-topic'
+          when 103 then 'Needs details'
+          when 104 then 'Needs focus'
+          when 105 then 'Opinion-based'
+          else 'OtherCode'
+        end
+      else
+        case
+          when ph.LastCloseReasonRaw ilike '%duplicate%' then 'Duplicate(text)'
+          when ph.LastCloseReasonRaw ilike '%off-topic%' then 'Off-topic(text)'
+          when ph.LastCloseReasonRaw is null then null
+          else 'Other(text)'
+        end
+    end as NormalizedCloseReason
+  from ph_close ph
+),
+tag_top3 as (
+  select
+    tr.QuestionId,
+    string_agg(tr.TagName, ',', order by tr.TagRankByGlobalCount) as Top3Tags
+  from tag_rank tr
+  where tr.TagRankByGlobalCount <= 3
+  group by tr.QuestionId
+),
+q_activity as (
+  select
+    q.QuestionId,
+    q.QuestionCreationDate,
+    least(
+      coalesce(ph.FirstCloseDate, 'infinity'::timestamp),
+      coalesce(ca.LastCommentDate, 'infinity'::timestamp),
+      coalesce(pl.FirstLinkDate, 'infinity'::timestamp),
+      q.QuestionCreationDate + interval '365 days'
+    ) as FirstSignificantEvent,
+    ph.CloseEvents,
+    pl.DuplicateLinks,
+    pl.RelatedLinks
+  from q_posts q
+  left join ph_close ph on ph.PostId = q.QuestionId
+  left join comment_agg ca on ca.PostId = q.QuestionId
+  left join dup_links pl on pl.PostId = q.QuestionId
+),
+ranked_questions as (
+  select
+    e.QuestionId,
+    dense_rank() over (order by qq.EngagementScore desc nulls last, qa.CloseEvents desc nulls last, e.OwnerReputation desc nulls last, e.OwnerGoldBadges desc nulls last, e.OwnerSilverBadges desc nulls last, e.OwnerBronzeBadges desc nulls last, e.Title) as GlobalRank,
+    row_number() over (partition by date_trunc('month', qa.QuestionCreationDate) order by qq.EngagementScore desc nulls last, e.OwnerReputation desc nulls last, e.Title) as RankWithinMonth
+  from owner_enriched e
+  left join q_quality qq on qq.QuestionId = e.QuestionId
+  left join q_activity qa on qa.QuestionId = e.QuestionId
+)
+select
+  e.QuestionId,
+  coalesce(e.Title, '[no title]') as Title,
+  coalesce(tt.Top3Tags, '') as Top3TagsByPopularity,
+  qq.QuestionScore,
+  qq.ViewCount,
+  qq.AnswerCount,
+  qq.Upvotes,
+  qq.Downvotes,
+  qq.NetVotes as NetQuestionVotes,
+  qq.BountyAwarded,
+  qq.EngagementScore,
+  oa.OwnerTopScoreRelation,
+  avb.AcceptedIsTopScored,
+  avb.AcceptedIsFastest,
+  crn.NormalizedCloseReason,
+  qa.CloseEvents,
+  qa.DuplicateLinks,
+  qa.RelatedLinks,
+  qa.QuestionCreationDate,
+  qa.FirstSignificantEvent,
+  e.OwnerUserId,
+  coalesce(e.OwnerReputation, 0) as OwnerReputation,
+  e.OwnerNetVotes as OwnerNetVotes,
+  e.OwnerTotalBadges,
+  e.OwnerGoldBadges,
+  e.OwnerSilverBadges,
+  e.OwnerBronzeBadges,
+  rq.GlobalRank,
+  rq.RankWithinMonth,
+  -- complicated predicate showcase as a derived flag
+  case
+    when coalesce(qq.ViewCount,0) >= 1000
+     and coalesce(qq.AnswerCount,0) >= 2
+     and (coalesce(qq.Upvotes,0) - coalesce(qq.Downvotes,0)) >= 5
+     and (crn.NormalizedCloseReason is null)
+     and (avb.AcceptedIsTopScored = 1 or avb.AcceptedIsFastest = 1)
+    then 1 else 0
+  end as HeuristicGoodQuestionFlag,
+  -- string expressions and null logic
+  trim(both ' ' from regexp_replace(coalesce(e.Title, ''), '\s+', ' ', 'g')) || case when avb.AcceptedIsTopScored = 1 then ' ✔' else '' end as NormalizedTitleWithMark,
+  -- correlated subquery: time to first answer
+  (
+    select min(a2.AnswerCreationDate) - q.QuestionCreationDate
+    from a_posts a2
+    where a2.QuestionId = e.QuestionId
+  ) as TimeToFirstAnswer,
+  -- set operator demo via counts: number of unique users who either commented or answered
+  (
+    select count(distinct user_id_union) from (
+      select c.UserId as user_id_union
+      from Comments c
+      where c.PostId = e.QuestionId and c.UserId is not null
+      union
+      select a.AnswerOwnerId as user_id_union
+      from a_posts a
+      where a.QuestionId = e.QuestionId and a.AnswerOwnerId is not null
+    ) z
+  ) as DistinctParticipants
+from owner_enriched e
+left join q_quality qq on qq.QuestionId = e.QuestionId
+left join accepted_vs_best avb on avb.QuestionId = e.QuestionId
+left join owner_vs_answerer oa on oa.QuestionId = e.QuestionId
+left join closed_reason_norm crn on crn.QuestionId = e.QuestionId
+left join tag_top3 tt on tt.QuestionId = e.QuestionId
+left join q_activity qa on qa.QuestionId = e.QuestionId
+left join ranked_questions rq on rq.QuestionId = e.QuestionId
+where
+  (
+    -- complicated predicates combining text, score, tags, and null-safe comparisons
+    (qq.EngagementScore is not null and qq.EngagementScore > 0.0005)
+    or (coalesce(qq.Upvotes,0) >= 10 and coalesce(qq.Downvotes,0) <= 2)
+    or (coalesce(e.OwnerReputation,0) >= 10000 and (e.Title ilike '%performance%' or e.Title ilike '%optimization%'))
+  )
+  and (
+    -- string to array usage on tags; include questions with specific tech tags or with at least 3 tags
+    exists (
+      select 1
+      from unnest(string_to_array(substring(coalesce(e.Tags,''), 2, greatest(length(coalesce(e.Tags,'')) - 2, 0)), '><')) t(tag)
+      where lower(t.tag) in ('sql','postgresql','performance','tuning')
+    ) or (
+      select count(*)
+      from unnest(string_to_array(substring(coalesce(e.Tags,''), 2, greatest(length(coalesce(e.Tags,'')) - 2, 0)), '><')) t2(tag)
+    ) >= 3
+  )
+order by
+  rq.GlobalRank nulls last,
+  qq.EngagementScore desc nulls last,
+  qa.CloseEvents desc nulls last,
+  e.OwnerReputation desc nulls last,
+  e.Title
+limit 250;

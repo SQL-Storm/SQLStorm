@@ -1,0 +1,82 @@
+-- {"query": "4738.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1010} 
+WITH RankedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        pt.Name AS PostTypeName,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) AS rn_creation,
+        COUNT(c.Id) OVER (PARTITION BY p.Id) AS CommentCountForPost,
+        AVG(p.Score) OVER (PARTITION BY p.PostTypeId) AS AvgScoreForPostType,
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate) AS PreviousPostScore,
+        LEAD(p.Score, 1, 0) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate) AS NextPostScore,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    WHERE p.OwnerUserId IS NOT NULL
+      AND p.Score > -5
+      AND p.CreationDate >= DATE('now', '-3 years')
+),
+UserPostStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN p.Id ELSE NULL END) AS QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN p.Id ELSE NULL END) AS AnswerCount,
+        SUM(CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS QuestionsWithAcceptedAnswer,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        SUM(CASE WHEN p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END) AS ClosedQuestionCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 100
+    GROUP BY u.Id, u.DisplayName
+    HAVING COUNT(p.Id) > 5
+)
+SELECT
+    rp.PostId,
+    rp.PostTypeName,
+    rp.CreationDate,
+    rp.Score,
+    rp.ViewCount,
+    rp.CommentCountForPost,
+    rp.AvgScoreForPostType,
+    rp.IsClosed,
+    rp.rn_creation,
+    CASE
+        WHEN rp.Score > rp.AvgScoreForPostType THEN 'Above Average'
+        WHEN rp.Score < rp.AvgScoreForPostType THEN 'Below Average'
+        ELSE 'Average'
+    END AS ScoreCategory,
+    CASE
+        WHEN rp.PreviousPostScore > 0 AND rp.NextPostScore > 0 THEN 'Between High Scores'
+        WHEN rp.PreviousPostScore < 0 AND rp.NextPostScore < 0 THEN 'Between Low Scores'
+        ELSE 'Standard'
+    END AS ScoreTrend,
+    ups.DisplayName AS OwnerDisplayName,
+    ups.QuestionCount,
+    ups.AnswerCount,
+    ups.BadgeCount,
+    ups.ClosedQuestionCount,
+    CASE WHEN ups.AvgPostScore > 50 THEN 'High Performer' ELSE 'Standard' END AS UserPerformance,
+    (rp.ViewCount * (rp.Score + 1) * (rp.CommentCountForPost + 1)) AS EngagementScore
+FROM RankedPosts rp
+JOIN UserPostStats ups ON rp.OwnerUserId = ups.UserId
+LEFT JOIN PostLinks pl ON rp.PostId = pl.PostId AND pl.LinkTypeId = 3 -- Duplicate links
+WHERE rp.rn_creation <= 50
+  AND rp.Score IS NOT NULL
+  AND ups.DisplayName IS NOT NULL
+  AND ups.DisplayName NOT LIKE '%moderator%'
+  AND (rp.ClosedDate IS NULL OR rp.ClosedDate > DATE('now', '-1 year'))
+ORDER BY rp.Score DESC, rp.ViewCount DESC
+LIMIT 100;

@@ -1,0 +1,142 @@
+-- {"query": "3579.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1651} 
+WITH
+/* 1️⃣ Base user activity aggregation */
+user_agg AS (
+    SELECT
+        u.Id                               AS user_id,
+        u.DisplayName,
+        COALESCE(u.Reputation, 0)          AS reputation,
+        COUNT(p.Id)                        AS total_posts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS questions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS answers,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.PostId END) AS upvoted_posts,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.PostId END) AS downvoted_posts,
+        COUNT(b.Id)                        AS badges_earned,
+        MAX(u.CreationDate)               AS first_seen,
+        MAX(p.CreationDate)               AS last_post_date
+    FROM Users u
+    LEFT JOIN Posts p   ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v   ON v.UserId = u.Id
+    LEFT JOIN Badges b  ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+/* 2️⃣ Tag‑level statistics (including string parsing) */
+tag_stats AS (
+    SELECT
+        t.Id           AS tag_id,
+        t.TagName,
+        t.Count        AS tag_question_count,
+        COALESCE(e.PostId, 0)   AS excerpt_post_id,
+        COALESCE(w.PostId, 0)   AS wiki_post_id,
+        /*  average score of questions using this tag  */
+        AVG(CASE WHEN p.Score IS NOT NULL THEN p.Score END) FILTER (WHERE p.PostTypeId = 1) AS avg_question_score,
+        /*  most recent question date for the tag  */
+        MAX(CASE WHEN p.CreationDate IS NOT NULL THEN p.CreationDate END) FILTER (WHERE p.PostTypeId = 1) AS latest_question_date
+    FROM Tags t
+    LEFT JOIN Posts e ON e.Id = t.ExcerptPostId
+    LEFT JOIN Posts w ON w.Id = t.WikiPostId
+    LEFT JOIN PostTags pt ON pt.TagId = t.Id               -- assuming a junction table PostTags(TagId, PostId)
+    LEFT JOIN Posts p ON p.Id = pt.PostId
+    GROUP BY t.Id, t.TagName, t.Count, e.PostId, w.PostId
+),
+
+/* 3️⃣ Top‑scoring posts per user with window function */
+top_posts AS (
+    SELECT
+        p.OwnerUserId               AS user_id,
+        p.Id                        AS post_id,
+        p.Title,
+        p.Score,
+        p.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId IN (1,2)          -- questions and answers only
+),
+
+/* 4️⃣ Correlated subquery to fetch the latest badge per user */
+latest_badge AS (
+    SELECT
+        b.UserId      AS user_id,
+        b.Name        AS badge_name,
+        b.Date        AS awarded_on
+    FROM Badges b
+    WHERE b.Date = (
+        SELECT MAX(b2.Date)
+        FROM Badges b2
+        WHERE b2.UserId = b.UserId
+    )
+),
+
+/* 5️⃣ Union of users with high reputation vs. users with many tags (set operator) */
+high_rep_vs_tagged AS (
+    SELECT user_id FROM user_agg WHERE reputation >= 20000
+    UNION
+    SELECT ub.user_id
+    FROM (
+        SELECT
+            p.OwnerUserId AS user_id,
+            COUNT(DISTINCT unnest(string_to_array(p.Tags, '><'))) AS distinct_tags
+        FROM Posts p
+        WHERE p.Tags IS NOT NULL
+        GROUP BY p.OwnerUserId
+        HAVING COUNT(DISTINCT unnest(string_to_array(p.Tags, '><'))) >= 15
+    ) ub
+),
+
+/* 6️⃣ Final join of all pieces */
+final_set AS (
+    SELECT
+        ua.user_id,
+        ua.DisplayName,
+        ua.reputation,
+        ua.total_posts,
+        ua.questions,
+        ua.answers,
+        ua.upvoted_posts,
+        ua.downvoted_posts,
+        ua.badges_earned,
+        ua.first_seen,
+        ua.last_post_date,
+        lb.badge_name,
+        lb.awarded_on,
+        tp.post_id,
+        tp.Title,
+        tp.Score    AS post_score,
+        tp.CreationDate AS post_date,
+        CASE
+            WHEN ua.reputation IS NULL THEN 'No Rep'
+            WHEN ua.reputation < 1000 THEN 'Newbie'
+            WHEN ua.reputation BETWEEN 1000 AND 5000 THEN 'Intermediate'
+            ELSE 'Expert'
+        END AS reputation_tier,
+        COALESCE(NULLIF(ua.total_posts,0),0) 
+            + COALESCE(NULLIF(ua.badges_earned,0),0) 
+            + COALESCE(NULLIF(ua.upvoted_posts,0),0) 
+            - COALESCE(NULLIF(ua.downvoted_posts,0),0) AS activity_score
+    FROM user_agg ua
+    LEFT JOIN latest_badge lb          ON lb.user_id = ua.user_id
+    LEFT JOIN top_posts tp            ON tp.user_id = ua.user_id AND tp.rn = 1
+    WHERE ua.user_id IN (SELECT user_id FROM high_rep_vs_tagged)
+)
+
+SELECT
+    fs.*,
+    RANK() OVER (ORDER BY fs.activity_score DESC) AS activity_rank,
+    PERCENT_RANK() OVER (ORDER BY fs.activity_score) AS activity_percentile,
+    /*  Append a dynamic tag list (first three tags) via a correlated subquery */
+    (SELECT STRING_AGG(t.TagName, ', ') 
+     FROM (
+         SELECT unnest(string_to_array(p.Tags, '><')) AS tag_name
+         FROM Posts p
+         WHERE p.OwnerUserId = fs.user_id AND p.Tags IS NOT NULL
+         LIMIT 3
+     ) t) AS sample_tags,
+    /*  Null‑logic test: show if user ever posted after their creation date */
+    CASE 
+        WHEN fs.last_post_date IS NOT NULL AND fs.last_post_date > fs.first_seen THEN 'Active Post'
+        ELSE COALESCE(NULLIF('No Post', ''), 'Never Posted')
+    END AS post_activity_flag
+FROM final_set fs
+ORDER BY fs.activity_score DESC
+LIMIT 100;

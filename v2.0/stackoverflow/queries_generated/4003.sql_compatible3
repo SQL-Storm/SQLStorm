@@ -1,0 +1,193 @@
+WITH
+  RecentPosts AS (
+    SELECT
+      p.Id AS PostId,
+      p.PostTypeId,
+      p.OwnerUserId,
+      p.CreationDate AS PostCreationDate,
+      p.Title,
+      p.Score AS PostScore,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      pt.Name AS PostTypeName,
+      u.DisplayName AS OwnerDisplayName,
+      u.Reputation AS OwnerReputation,
+      u.Views AS OwnerViews,
+      u.UpVotes AS OwnerUpVotes,
+      u.DownVotes AS OwnerDownVotes,
+      u.CreationDate AS OwnerCreationDate,
+      CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+      CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN 1 ELSE 0 END AS IsCommunityOwned
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '90' DAY)
+  ),
+  PostVotes AS (
+    SELECT
+      v.PostId,
+      COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVoteCount,
+      COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVoteCount,
+      COUNT(CASE WHEN v.VoteTypeId = 5 THEN 1 END) AS FavoriteCount
+    FROM Votes v
+    WHERE v.VoteTypeId IN (2, 3, 5)
+    GROUP BY v.PostId
+  ),
+  PostComments AS (
+    SELECT
+      c.PostId,
+      COUNT(c.Id) AS CommentCount
+    FROM Comments c
+    WHERE c.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '90' DAY)
+    GROUP BY c.PostId
+  ),
+  PostHistoryInfo AS (
+    SELECT
+      ph.PostId,
+      MAX(CASE WHEN ph.PostHistoryTypeId = 4 THEN ph.CreationDate END) AS LastTitleEditDate,
+      MAX(CASE WHEN ph.PostHistoryTypeId IN (5, 8) THEN ph.CreationDate END) AS LastBodyEditDate,
+      MAX(CASE WHEN ph.PostHistoryTypeId IN (6, 9) THEN ph.CreationDate END) AS LastTagsEditDate,
+      COUNT(CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20) THEN 1 END) AS ModerationActionCount
+    FROM PostHistory ph
+    WHERE ph.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '90' DAY)
+    GROUP BY ph.PostId
+  ),
+  UserBadges AS (
+    SELECT
+      b.UserId,
+      COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadgeCount,
+      COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadgeCount,
+      COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadgeCount
+    FROM Badges b
+    WHERE b.Date >= (CAST('2024-10-01' AS date) - INTERVAL '90' DAY)
+    GROUP BY b.UserId
+  ),
+  AnswerDetails AS (
+    SELECT
+      p.Id AS AnswerId,
+      p.ParentId AS QuestionId,
+      p.OwnerUserId AS AnswererUserId,
+      p.CreationDate AS AnswerCreationDate,
+      p.Score AS AnswerScore,
+      ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS Rank
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+      AND p.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '90' DAY)
+  ),
+  QuestionAggregates AS (
+    SELECT
+      rp.PostId AS QuestionId,
+      rp.Title,
+      rp.PostScore AS QuestionScore,
+      rp.AnswerCount AS QuestionAnswerCount,
+      rp.CommentCount AS QuestionCommentCount,
+      rp.FavoriteCount AS QuestionFavoriteCount,
+      rp.OwnerDisplayName AS QuestionOwnerName,
+      rp.OwnerReputation AS QuestionOwnerReputation,
+      rp.OwnerViews AS QuestionOwnerViews,
+      rp.OwnerCreationDate AS QuestionOwnerCreationDate,
+      rp.IsClosed AS IsQuestionClosed,
+      rp.IsCommunityOwned AS IsQuestionCommunityOwned,
+      pv.UpVoteCount AS QuestionUpVotes,
+      pv.DownVoteCount AS QuestionDownVotes,
+      pc.CommentCount AS QuestionCommentCountDistinct,
+      ph.LastTitleEditDate,
+      ph.LastBodyEditDate,
+      ph.LastTagsEditDate,
+      ph.ModerationActionCount,
+      MAX(CASE WHEN ad.AnswererUserId = rp.OwnerUserId THEN 1 ELSE 0 END) AS OwnerAnsweredOwnQuestion,
+      AVG(ad.AnswerScore) AS AvgAnswerScore,
+      COUNT(ad.AnswerId) AS TotalAnswers,
+      SUM(CASE WHEN ad.Rank = 1 THEN 1 ELSE 0 END) AS HasAcceptedAnswer,
+      rp.OwnerUserId AS QuestionOwnerUserId
+    FROM RecentPosts rp
+    LEFT JOIN PostVotes pv ON rp.PostId = pv.PostId
+    LEFT JOIN PostComments pc ON rp.PostId = pc.PostId
+    LEFT JOIN PostHistoryInfo ph ON rp.PostId = ph.PostId
+    LEFT JOIN AnswerDetails ad ON rp.PostId = ad.QuestionId
+    WHERE rp.PostTypeId = 1
+    GROUP BY
+      rp.PostId,
+      rp.Title,
+      rp.PostScore,
+      rp.AnswerCount,
+      rp.CommentCount,
+      rp.FavoriteCount,
+      rp.OwnerDisplayName,
+      rp.OwnerReputation,
+      rp.OwnerViews,
+      rp.OwnerCreationDate,
+      rp.IsClosed,
+      rp.IsCommunityOwned,
+      pv.UpVoteCount,
+      pv.DownVoteCount,
+      pc.CommentCount,
+      ph.LastTitleEditDate,
+      ph.LastBodyEditDate,
+      ph.LastTagsEditDate,
+      ph.ModerationActionCount,
+      rp.OwnerUserId
+  )
+SELECT
+  qa.QuestionId,
+  qa.Title,
+  qa.QuestionScore,
+  qa.QuestionOwnerName,
+  qa.QuestionOwnerReputation,
+  qa.QuestionOwnerCreationDate,
+  qa.QuestionOwnerViews,
+  qa.IsQuestionClosed,
+  qa.IsQuestionCommunityOwned,
+  qa.QuestionUpVotes,
+  qa.QuestionDownVotes,
+  qa.QuestionCommentCountDistinct,
+  qa.QuestionFavoriteCount,
+  qa.AvgAnswerScore,
+  qa.TotalAnswers,
+  qa.HasAcceptedAnswer,
+  qa.OwnerAnsweredOwnQuestion,
+  qa.LastTitleEditDate,
+  qa.LastBodyEditDate,
+  qa.LastTagsEditDate,
+  qa.ModerationActionCount,
+  CASE
+    WHEN qa.QuestionScore > 100 AND qa.TotalAnswers > 10 THEN 'High Engagement'
+    WHEN qa.QuestionScore < 0 AND qa.TotalAnswers < 2 THEN 'Low Engagement'
+    ELSE 'Medium Engagement'
+  END AS EngagementCategory,
+  CASE
+    WHEN qa.QuestionOwnerReputation > 100000 AND qa.QuestionOwnerCreationDate < (CAST('2024-10-01' AS date) - INTERVAL '365' DAY) THEN 'Highly Reputable Early Adopter'
+    WHEN qa.QuestionOwnerReputation < 1000 AND qa.QuestionOwnerCreationDate > (CAST('2024-10-01' AS date) - INTERVAL '90' DAY) THEN 'Newer User, Low Reputation'
+    ELSE 'Standard User'
+  END AS UserProfileCategory,
+  CAST(SUM(qa.QuestionScore) OVER (ORDER BY qa.QuestionOwnerCreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS REAL) / COUNT(*) OVER () AS CumulativeAvgScore,
+  ub.GoldBadgeCount,
+  ub.SilverBadgeCount,
+  ub.BronzeBadgeCount,
+  COALESCE(qa.QuestionOwnerReputation, 0) * COALESCE(ub.GoldBadgeCount, 0)
+    + COALESCE(qa.QuestionOwnerReputation, 0) * COALESCE(ub.SilverBadgeCount, 0) * 0.5
+    + COALESCE(qa.QuestionOwnerReputation, 0) * COALESCE(ub.BronzeBadgeCount, 0) * 0.1 AS WeightedUserScore,
+  CASE
+    WHEN qa.TotalAnswers > 0 AND qa.QuestionAnswerCount > 0 THEN CAST(qa.QuestionScore AS REAL) / qa.TotalAnswers
+    ELSE NULL
+  END AS ScorePerAnswerRatio,
+  CASE
+    WHEN qa.QuestionFavoriteCount > 50 THEN 'Very Popular'
+    WHEN qa.QuestionFavoriteCount < 5 THEN 'Rarely Favorited'
+    ELSE 'Moderately Popular'
+  END AS PopularityLevel,
+  TO_CHAR(DATE_TRUNC('week', qa.QuestionOwnerCreationDate)::date, 'IYYY-IW') AS OwnerCreationYearWeek,
+  SUBSTRING(qa.Title FROM 1 FOR 50) AS TruncatedTitle,
+  CASE
+    WHEN qa.QuestionOwnerReputation IS NULL THEN 'Unknown Owner'
+    WHEN qa.QuestionOwnerReputation BETWEEN 0 AND 1000 THEN 'Low Reputation'
+    WHEN qa.QuestionOwnerReputation BETWEEN 1001 AND 10000 THEN 'Medium Reputation'
+    ELSE 'High Reputation'
+  END AS OwnerReputationBand,
+  COALESCE(qa.QuestionOwnerViews, 0) + COALESCE(qa.QuestionOwnerReputation, 0) AS CombinedUserMetric
+FROM QuestionAggregates qa
+LEFT JOIN UserBadges ub ON qa.QuestionOwnerUserId = ub.UserId
+WHERE qa.QuestionScore > -10
+ORDER BY qa.QuestionScore DESC, qa.TotalAnswers DESC
+LIMIT 100;

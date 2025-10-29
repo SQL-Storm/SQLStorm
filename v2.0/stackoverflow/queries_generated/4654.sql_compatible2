@@ -1,0 +1,134 @@
+WITH RankedPostEdits AS (
+    SELECT
+        ph.PostId,
+        ph.UserId,
+        u.DisplayName AS EditorDisplayName,
+        ph.PostHistoryTypeId,
+        pht.Name AS HistoryTypeName,
+        ph.CreationDate AS EditDate,
+        ROW_NUMBER() OVER(PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate DESC) as rn
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    JOIN Users u ON ph.UserId = u.Id
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6) AND ph.UserId IS NOT NULL
+),
+PostEditSummary AS (
+    SELECT
+        rpe1.PostId,
+        rpe1.UserId AS FirstEditorUserId,
+        rpe1.EditorDisplayName AS FirstEditorDisplayName,
+        rpe1.EditDate AS FirstEditDate,
+        rpe2.UserId AS SecondEditorUserId,
+        rpe2.EditorDisplayName AS SecondEditorDisplayName,
+        rpe2.EditDate AS SecondEditDate,
+        rpe1.HistoryTypeName AS FirstEditType,
+        rpe2.HistoryTypeName AS SecondEditType,
+        CAST(rpe2.EditDate AS DATE) - CAST(rpe1.EditDate AS DATE) AS DaysBetweenEdits
+    FROM RankedPostEdits rpe1
+    LEFT JOIN RankedPostEdits rpe2 ON rpe1.PostId = rpe2.PostId AND rpe1.UserId = rpe2.UserId AND rpe1.rn = rpe2.rn + 1
+    WHERE rpe1.rn = 1
+    GROUP BY
+        rpe1.PostId,
+        rpe1.UserId,
+        rpe1.EditorDisplayName,
+        rpe1.EditDate,
+        rpe2.UserId,
+        rpe2.EditorDisplayName,
+        rpe2.EditDate,
+        rpe1.HistoryTypeName,
+        rpe2.HistoryTypeName
+),
+PostEngagement AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        p.CreationDate AS PostCreationDate,
+        p.LastActivityDate AS PostLastActivityDate,
+        p.Score,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        COUNT(DISTINCT c.Id) AS CommentCountTotal,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS UpVoteCount,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS DownVoteCount,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE p.PostTypeId = 1 AND p.OwnerUserId IS NOT NULL
+    GROUP BY
+        p.Id, p.Title, p.OwnerUserId, u.DisplayName, p.CreationDate, p.LastActivityDate, p.Score, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.ClosedDate
+)
+SELECT
+    pe.PostId,
+    pe.Title,
+    pe.OwnerDisplayName,
+    pe.PostCreationDate,
+    pe.PostLastActivityDate,
+    pe.Score,
+    pe.AnswerCount,
+    pe.CommentCount,
+    pe.FavoriteCount,
+    pe.UpVoteCount,
+    pe.DownVoteCount,
+    pe.IsClosed,
+    pes.FirstEditorDisplayName,
+    pes.FirstEditDate,
+    pes.SecondEditorDisplayName,
+    pes.SecondEditDate,
+    pes.DaysBetweenEdits,
+    CASE
+        WHEN pes.DaysBetweenEdits IS NULL THEN 'No Subsequent Edit by Same User'
+        WHEN pes.DaysBetweenEdits = 0 THEN 'Same Day Edit'
+        WHEN pes.DaysBetweenEdits BETWEEN 1 AND 7 THEN 'Within a Week'
+        ELSE 'More Than a Week'
+    END AS EditFrequencyCategory,
+    COALESCE(ue.Reputation, 0) AS OwnerReputation,
+    CASE
+        WHEN ue.UpVotes IS NULL OR ue.DownVotes IS NULL THEN -1
+        WHEN ue.DownVotes = 0 THEN 1000000
+        ELSE CAST(ue.UpVotes AS DOUBLE PRECISION) / NULLIF(ue.DownVotes, 0)
+    END AS UpDownVoteRatio,
+    CASE
+        WHEN pt.Name LIKE '%Question%' THEN 'Question Type'
+        WHEN pt.Name LIKE '%Answer%' THEN 'Answer Type'
+        ELSE 'Other Type'
+    END AS PostCategory,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = pe.PostId AND c.UserId = pe.OwnerUserId) AS OwnerCommentsOnOwnPost,
+    CASE
+        WHEN pes.FirstEditorUserId = pe.OwnerUserId THEN 'Owner Edited'
+        ELSE 'Another User Edited'
+    END AS EditorIsOwner
+FROM PostEngagement pe
+LEFT JOIN PostEditSummary pes ON pe.PostId = pes.PostId
+LEFT JOIN Users ue ON pe.OwnerUserId = ue.Id
+LEFT JOIN Posts p_alias ON pe.PostId = p_alias.Id
+LEFT JOIN PostTypes pt ON p_alias.PostTypeId = pt.Id
+WHERE pe.Score > 5 AND pe.UpVoteCount > pe.DownVoteCount
+GROUP BY
+    pe.PostId,
+    pe.Title,
+    pe.OwnerDisplayName,
+    pe.PostCreationDate,
+    pe.PostLastActivityDate,
+    pe.Score,
+    pe.AnswerCount,
+    pe.CommentCount,
+    pe.FavoriteCount,
+    pe.UpVoteCount,
+    pe.DownVoteCount,
+    pe.IsClosed,
+    pes.FirstEditorDisplayName,
+    pes.FirstEditDate,
+    pes.SecondEditorDisplayName,
+    pes.SecondEditDate,
+    pes.DaysBetweenEdits,
+    ue.Reputation,
+    ue.UpVotes,
+    ue.DownVotes,
+    pt.Name,
+    pe.OwnerUserId
+ORDER BY pe.Score DESC, pe.PostLastActivityDate ASC;

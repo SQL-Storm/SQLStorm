@@ -1,0 +1,373 @@
+-- {"query": "577.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3802} 
+with
+-- Identify active users with recent activity and compute engagement metrics
+active_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.location,
+    coalesce(nullif(trim(lower(u.websiteurl)), ''), 'n/a') as website_norm,
+    date_trunc('month', u.creationdate) as user_cohort_month,
+    count(*) filter (where p.posttypeid in (1,2)) as total_posts,
+    count(*) filter (where p.posttypeid = 1) as question_count,
+    count(*) filter (where p.posttypeid = 2) as answer_count,
+    sum(greatest(p.score, 0)) as nonneg_post_score,
+    sum(p.viewcount) filter (where p.posttypeid = 1) as question_views,
+    sum(v.score) as comment_score_sum,
+    sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+    sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+    sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+    max(p.lastactivitydate) as last_post_activity,
+    max(c.creationdate) as last_comment_activity
+  from users u
+  left join posts p on p.owneruserid = u.id
+  left join comments v on v.userid = u.id
+  left join badges b on b.userid = u.id
+  group by u.id, u.displayname, u.reputation, u.creationdate, u.location, u.websiteurl
+),
+-- Compute per-post metrics including acceptance, duplicate linkage, and closure reasons
+post_enriched as (
+  select
+    p.id as post_id,
+    p.posttypeid,
+    p.creationdate,
+    p.owneruserid,
+    p.parentid,
+    p.acceptedanswerid,
+    p.score,
+    p.viewcount,
+    p.title,
+    p.tags,
+    p.answercount,
+    p.closeddate,
+    p.communityowneddate,
+    -- parse tags into array and compute tag count
+    nullif(p.tags, '') as tags_raw,
+    cardinality(case when p.tags is not null and length(p.tags) >= 2 then string_to_array(substring(p.tags, 2, length(p.tags)-2), '><') else array[]::varchar[] end) as tag_count,
+    exists (
+      select 1
+      from votes v
+      where v.postid = p.id and v.votetypeid = 1
+    ) as has_accept_vote,
+    exists (
+      select 1
+      from postlinks pl
+      where pl.postid = p.id and pl.linktypeid = 3
+    ) as is_marked_duplicate,
+    -- derive last close reason if any from posthistory
+    (
+      select crt.name
+      from posthistory ph
+      left join closereasontypes crt
+        on crt.id::varchar = nullif(ph.comment, '')
+      where ph.postid = p.id
+        and ph.posthistorytypeid = 10
+      order by ph.creationdate desc
+      limit 1
+    ) as last_close_reason,
+    -- windowed rank of posts by score within month
+    rank() over (partition by date_trunc('month', p.creationdate), p.posttypeid order by p.score desc nulls last, p.viewcount desc nulls last, p.id) as monthly_score_rank,
+    -- moving average of score for user's posts
+    avg(p.score) over (partition by p.owneruserid order by p.creationdate rows between 10 preceding and current row) as user_score_ma11,
+    -- dense rank of viewcount in tagless vs tagged buckets
+    dense_rank() over (partition by case when p.tags is null then 'no' else 'yes' end order by coalesce(p.viewcount, -1) desc, p.id) as tag_bucket_view_dr
+  from posts p
+  where p.posttypeid in (1,2)
+),
+-- Aggregate votes per post with window distributions
+vote_agg as (
+  select
+    v.postid,
+    count(*) filter (where v.votetypeid = 2) as upvotes,
+    count(*) filter (where v.votetypeid = 3) as downvotes,
+    count(*) filter (where v.votetypeid = 5) as favorites,
+    count(*) filter (where v.votetypeid in (8,9)) as bounty_events,
+    sum(v.bountyamount) filter (where v.votetypeid in (8,9)) as bounty_amount_total,
+    max(v.creationdate) as last_vote_at,
+    percent_rank() over (partition by v.votetypeid order by v.creationdate) as vote_time_percentile
+  from votes v
+  group by v.postid, v.votetypeid
+),
+-- Collapse vote_agg to a single row per post
+vote_rollup as (
+  select
+    postid,
+    sum(upvotes) as upvotes,
+    sum(downvotes) as downvotes,
+    sum(favorites) as favorites,
+    sum(bounty_events) as bounty_events,
+    sum(bounty_amount_total) as bounty_amount_total,
+    max(last_vote_at) as last_vote_at,
+    max(vote_time_percentile) as max_vote_time_percentile
+  from vote_agg
+  group by postid
+),
+-- Extract duplicate clusters by linking posts with linktype=3
+duplicate_graph as (
+  select
+    pl.postid,
+    pl.relatedpostid,
+    pl.creationdate,
+    pl.linktypeid
+  from postlinks pl
+  where pl.linktypeid = 3
+),
+-- Build per-question answer stats with correlated subqueries for accepted/first answer times
+answer_stats as (
+  select
+    q.id as question_id,
+    q.owneruserid as asker_id,
+    q.creationdate as question_created,
+    q.acceptedanswerid,
+    count(a.id) as answer_count_total,
+    sum(case when a.score > 0 then 1 else 0 end) as positive_answers,
+    max(a.score) as max_answer_score,
+    min(a.creationdate) as first_answer_time,
+    (
+      select min(a2.creationdate)
+      from posts a2
+      where a2.parentid = q.id and a2.id = q.acceptedanswerid
+    ) as accepted_answer_time
+  from posts q
+  left join posts a on a.parentid = q.id and a.posttypeid = 2
+  where q.posttypeid = 1
+  group by q.id, q.owneruserid, q.creationdate, q.acceptedanswerid
+),
+-- CTE for tag popularity and metadata
+tag_info as (
+  select
+    t.tagname,
+    t.count as tag_total_count,
+    t.ismoderatoronly,
+    t.isrequired,
+    t.excerptpostid,
+    t.wikipostid
+  from tags t
+),
+-- Expand questions to one row per tag (including null tag bucket)
+question_tags as (
+  select
+    q.id as question_id,
+    unnest(
+      case when q.tags is not null and length(q.tags) >= 2
+           then string_to_array(substring(q.tags, 2, length(q.tags)-2), '><')
+           else array['(no-tag)']::varchar[]
+      end
+    ) as tagname
+  from posts q
+  where q.posttypeid = 1
+),
+-- Compute tag-based performance of questions
+tag_performance as (
+  select
+    qt.tagname,
+    count(*) as questions_with_tag,
+    avg(coalesce(q.score, 0)) as avg_question_score,
+    avg(coalesce(q.viewcount, 0)) as avg_question_views,
+    sum(case when q.acceptedanswerid is not null then 1 else 0 end) as accepted_questions,
+    sum(q.answercount) as sum_answercount
+  from posts q
+  join question_tags qt on qt.question_id = q.id
+  group by qt.tagname
+),
+-- Determine user tenure buckets
+user_tenure as (
+  select
+    au.user_id,
+    case
+      when age(cast('2024-10-01 12:34:56' as timestamp), au.creationdate) < interval '90 days' then 'new'
+      when age(cast('2024-10-01 12:34:56' as timestamp), au.creationdate) < interval '365 days' then 'regular'
+      else 'veteran'
+    end as tenure_bucket
+  from active_users au
+),
+-- Compute rolling activity per user per month using window frames
+user_monthly as (
+  select
+    p.owneruserid as user_id,
+    date_trunc('month', p.creationdate) as month,
+    count(*) as posts_in_month,
+    sum(p.score) as score_in_month,
+    sum(coalesce(vr.upvotes,0) - coalesce(vr.downvotes,0)) as net_votes_in_month,
+    sum(case when p.posttypeid = 1 then 1 else 0 end) as questions_in_month,
+    sum(case when p.posttypeid = 2 then 1 else 0 end) as answers_in_month,
+    sum(case when p.acceptedanswerid is not null then 1 else 0 end) as questions_with_accept_in_month
+  from posts p
+  left join vote_rollup vr on vr.postid = p.id
+  where p.owneruserid is not null
+  group by p.owneruserid, date_trunc('month', p.creationdate)
+),
+user_monthly_windowed as (
+  select
+    um.*,
+    sum(posts_in_month) over (partition by user_id order by month rows between 2 preceding and current row) as posts_last_3m,
+    avg(score_in_month) over (partition by user_id order by month rows between 5 preceding and current row) as avg_score_last_6m
+  from user_monthly um
+),
+-- Build a filtered cohort of interesting posts and users for benchmarking
+interesting_posts as (
+  select
+    pe.*,
+    coalesce(vr.upvotes,0) as upvotes,
+    coalesce(vr.downvotes,0) as downvotes,
+    coalesce(vr.favorites,0) as favorites,
+    coalesce(vr.bounty_events,0) as bounty_events,
+    coalesce(vr.bounty_amount_total,0) as bounty_amount_total,
+    vr.last_vote_at,
+    ag.asker_id,
+    ag.answer_count_total,
+    ag.positive_answers,
+    ag.max_answer_score,
+    ag.first_answer_time,
+    ag.accepted_answer_time
+  from post_enriched pe
+  left join vote_rollup vr on vr.postid = pe.post_id
+  left join answer_stats ag on ag.question_id = pe.post_id
+  where
+    -- a mix of popular or controversial posts, with varied states
+    (
+      coalesce(vr.upvotes,0) - coalesce(vr.downvotes,0) >= 5
+      or (coalesce(vr.downvotes,0) >= 3 and pe.score <= 0)
+      or pe.is_marked_duplicate = true
+      or pe.closeddate is not null
+    )
+),
+-- Build per-user composite engagement score combining multiple signals
+user_engagement as (
+  select
+    au.user_id,
+    au.displayname,
+    au.reputation,
+    ut.tenure_bucket,
+    coalesce(umw.posts_last_3m, 0) as posts_last_3m,
+    coalesce(umw.avg_score_last_6m, 0) as avg_score_last_6m,
+    au.total_posts,
+    au.answer_count,
+    au.question_count,
+    au.nonneg_post_score,
+    au.question_views,
+    au.gold_badges,
+    au.silver_badges,
+    au.bronze_badges,
+    greatest(coalesce(extract(epoch from cast('2024-10-01 12:34:56' as timestamp) - au.last_post_activity), extract(epoch from interval '100 years')), 0) as seconds_since_last_post_activity,
+    greatest(coalesce(extract(epoch from cast('2024-10-01 12:34:56' as timestamp) - au.last_comment_activity), extract(epoch from interval '100 years')), 0) as seconds_since_last_comment_activity,
+    -- composite score
+    (
+      coalesce(umw.posts_last_3m,0) * 1.0
+      + coalesce(umw.avg_score_last_6m,0) * 0.5
+      + coalesce(au.answer_count,0) * 0.25
+      + coalesce(au.question_count,0) * 0.1
+      + coalesce(au.gold_badges,0) * 5
+      + coalesce(au.silver_badges,0) * 2
+      + coalesce(au.bronze_badges,0) * 1
+      - least(coalesce(extract(epoch from cast('2024-10-01 12:34:56' as timestamp) - au.last_post_activity)/86400.0, 9999999), 3650) * 0.01
+    ) as engagement_score
+  from active_users au
+  left join user_tenure ut on ut.user_id = au.user_id
+  left join user_monthly_windowed umw on umw.user_id = au.user_id
+),
+-- Identify "power users" by percentile rank of engagement within tenure bucket
+power_users as (
+  select
+    ue.*,
+    percent_rank() over (partition by ue.tenure_bucket order by ue.engagement_score) as engagement_percentile
+  from user_engagement ue
+),
+-- Diverse sample combining users and posts via set operators for stress
+wide_union as (
+  select
+    'POST'::varchar as entity_type,
+    ip.post_id::bigint as entity_id,
+    ip.owneruserid as user_id,
+    ip.posttypeid::int as subtype,
+    ip.creationdate as created_at,
+    ip.score::bigint as metric_primary,
+    (coalesce(ip.upvotes,0) - coalesce(ip.downvotes,0))::bigint as metric_secondary,
+    coalesce(ip.viewcount,0)::bigint as metric_tertiary,
+    nullif(ip.last_close_reason,'') as category_text,
+    ip.tags_raw as aux_text,
+    ip.is_marked_duplicate as flag_a,
+    (ip.acceptedanswerid is not null) as flag_b
+  from interesting_posts ip
+  union all
+  select
+    'USER'::varchar,
+    pu.user_id::bigint,
+    pu.user_id,
+    case pu.tenure_bucket when 'new' then 1 when 'regular' then 2 else 3 end as subtype,
+    cast('2024-10-01 12:34:56' as timestamp) - make_interval(days => (pu.engagement_percentile * 365)::int),
+    pu.reputation::bigint,
+    (pu.total_posts)::bigint,
+    (pu.gold_badges + pu.silver_badges + pu.bronze_badges)::bigint,
+    pu.tenure_bucket,
+    pu.displayname,
+    (pu.engagement_percentile >= 0.9) as flag_a,
+    (pu.reputation >= 10000) as flag_b
+  from power_users pu
+),
+-- Final ranking and window stats across the unioned set
+final_ranked as (
+  select
+    wu.*,
+    row_number() over (order by metric_primary desc nulls last, metric_secondary desc nulls last, created_at desc nulls last, entity_id) as rn_global,
+    row_number() over (partition by entity_type order by metric_primary desc nulls last, metric_secondary desc nulls last, created_at desc nulls last, entity_id) as rn_by_type,
+    sum(metric_primary) over (partition by entity_type) as sum_metric_primary_by_type,
+    avg(metric_secondary) over (partition by entity_type) as avg_metric_secondary_by_type,
+    min(created_at) over (partition by entity_type) as min_created_at_by_type,
+    max(created_at) over (partition by entity_type) as max_created_at_by_type
+  from wide_union wu
+)
+select
+  fr.entity_type,
+  fr.entity_id,
+  fr.user_id,
+  fr.subtype,
+  fr.created_at,
+  fr.metric_primary,
+  fr.metric_secondary,
+  fr.metric_tertiary,
+  fr.category_text,
+  fr.aux_text,
+  fr.flag_a,
+  fr.flag_b,
+  fr.rn_global,
+  fr.rn_by_type,
+  fr.sum_metric_primary_by_type,
+  fr.avg_metric_secondary_by_type,
+  fr.min_created_at_by_type,
+  fr.max_created_at_by_type,
+  -- companion correlated metrics:
+  (
+    select count(*) from comments c
+    where fr.entity_type = 'POST' and c.postid = fr.entity_id
+  ) as comment_count_if_post,
+  (
+    select count(*) from posts p
+    where fr.entity_type = 'USER' and p.owneruserid = fr.user_id
+  ) as post_count_if_user,
+  -- complicated predicate for flagging notable items
+  (
+    case
+      when fr.entity_type = 'POST' and fr.metric_primary >= 10 and (fr.flag_b or fr.flag_a) then 'hot-post'
+      when fr.entity_type = 'USER' and fr.metric_primary >= 2000 and fr.flag_a and fr.flag_b then 'elite-user'
+      when fr.entity_type = 'POST' and fr.metric_secondary < 0 and coalesce(fr.category_text,'') <> '' then 'controversial-closed'
+      when fr.entity_type = 'USER' and fr.metric_secondary >= 100 and fr.metric_tertiary >= 5 then 'decorated-user'
+      else 'normal'
+    end
+  ) as notable_bucket
+from final_ranked fr
+where
+  -- complex filter to keep a balanced sample
+  (
+    (fr.entity_type = 'POST' and (fr.metric_primary >= 0 or fr.flag_a or fr.flag_b))
+    or
+    (fr.entity_type = 'USER' and (fr.metric_primary >= 100 or fr.flag_a))
+  )
+  and (
+    fr.created_at >= cast('2024-10-01 12:34:56' as timestamp) - interval '15 years'
+    or fr.created_at is null
+  )
+order by fr.rn_global
+limit 500;

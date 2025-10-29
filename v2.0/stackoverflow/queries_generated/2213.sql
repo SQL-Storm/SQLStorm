@@ -1,0 +1,201 @@
+-- {"query": "2213.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1731} 
+
+WITH RecursivePostHierarchy AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        1 AS Depth
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+
+    UNION ALL
+
+    SELECT
+        c.Id,
+        c.PostTypeId,
+        c.ParentId,
+        c.CreationDate,
+        c.Score,
+        c.ViewCount,
+        c.OwnerUserId,
+        c.Title,
+        c.Tags,
+        r.Depth + 1
+    FROM Posts c
+    INNER JOIN RecursivePostHierarchy r ON c.ParentId = r.Id
+    WHERE c.PostTypeId = 2
+),
+BadgesPerUser AS (
+    SELECT
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COUNT(DISTINCT b.Name) AS DistinctBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserActivityWindows AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Location,
+        u.UpVotes,
+        u.DownVotes,
+        u.Views,
+        b.GoldBadges,
+        b.SilverBadges,
+        b.BronzeBadges,
+        b.DistinctBadges,
+        ROW_NUMBER() OVER (PARTITION BY (CASE WHEN u.Location IS NULL THEN 'Unknown' ELSE u.Location END) ORDER BY u.Reputation DESC) AS LocationRank,
+        RANK() OVER (ORDER BY u.Reputation DESC NULLS LAST) AS GlobalReputationRank,
+        COUNT(*) OVER (PARTITION BY EXTRACT(YEAR FROM u.CreationDate)) AS UsersCreatedThatYear
+    FROM Users u
+    LEFT JOIN BadgesPerUser b ON u.Id = b.UserId
+),
+QuestionCommentStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.OwnerUserId,
+        q.Title,
+        q.Tags,
+        q.Score AS QuestionScore,
+        q.ViewCount AS QuestionViews,
+        COUNT(c.Id) AS CommentCount,
+        STRING_AGG(DISTINCT coalesce(c.UserDisplayName, 'Anonymous'), ', ') AS Commenters,
+        AVG(COALESCE(c.Score,0)) AS AvgCommentScore,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotes,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVotes,
+        (SELECT STRING_AGG(Name, ';') FROM PostHistoryTypes pht WHERE pht.Id IN (SELECT DISTINCT PostHistoryTypeId FROM PostHistory ph WHERE ph.PostId = q.Id))
+            AS PostHistoryTypesInvolved,
+        CASE WHEN q.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS PostStatus
+    FROM Posts q
+    LEFT JOIN Comments c ON c.PostId = q.Id
+    LEFT JOIN Votes v ON v.PostId = q.Id
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.OwnerUserId, q.Title, q.Tags, q.Score, q.ViewCount, q.ClosedDate
+),
+LinkTypeCounts AS (
+    SELECT
+        pl.PostId,
+        COUNT(CASE WHEN pl.LinkTypeId = 1 THEN 1 END) AS LinkedCount,
+        COUNT(CASE WHEN pl.LinkTypeId = 3 THEN 1 END) AS DuplicateCount,
+        COUNT(DISTINCT pl.RelatedPostId) AS DistinctRelatedPosts
+    FROM PostLinks pl
+    GROUP BY pl.PostId
+),
+FinalSelection AS (
+    SELECT
+        qcs.QuestionId,
+        qcs.Title,
+        qcs.Tags,
+        qcs.QuestionScore,
+        qcs.QuestionViews,
+        qcs.CommentCount,
+        qcs.AvgCommentScore,
+        qcs.Commenters,
+        qcs.UpVotes,
+        qcs.DownVotes,
+        qcs.PostStatus,
+        ltc.LinkedCount,
+        ltc.DuplicateCount,
+        ltc.DistinctRelatedPosts,
+        ua.DisplayName AS OwnerName,
+        ua.Reputation AS OwnerReputation,
+        ua.Location,
+        ua.GoldBadges,
+        ua.SilverBadges,
+        ua.BronzeBadges,
+        ua.DistinctBadges,
+        ua.LocationRank,
+        ua.GlobalReputationRank,
+        ua.UsersCreatedThatYear,
+        EXISTS(
+            SELECT 1
+            FROM PostHistory ph
+            WHERE ph.PostId = qcs.QuestionId
+              AND ph.PostHistoryTypeId IN (10, 11) -- Closed or Reopened
+              AND ph.CreationDate > qcs.QuestionScore * interval '1 hour'
+        ) AS HasCloseReopenActivity,
+        CASE
+            WHEN qcs.QuestionScore < 0 THEN 'NegativeScore'
+            WHEN qcs.UpVotes > qcs.DownVotes THEN 'PositiveVotes'
+            ELSE 'NeutralVotes'
+        END AS VoteSentiment,
+        (SELECT MAX(COALESCE(ph.CreationDate, q.CreationDate)) FROM PostHistory ph WHERE ph.PostId = qcs.QuestionId) AS LastHistoryEdit
+    FROM QuestionCommentStats qcs
+    LEFT JOIN LinkTypeCounts ltc ON ltc.PostId = qcs.QuestionId
+    LEFT JOIN Users ua ON ua.Id = qcs.OwnerUserId
+    LEFT JOIN Posts q ON q.Id = qcs.QuestionId
+),
+UserBadgeSentiment AS (
+    SELECT
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.Location,
+        ua.GoldBadges,
+        ua.SilverBadges,
+        ua.BronzeBadges,
+        CASE
+            WHEN ua.GoldBadges > ua.SilverBadges THEN 'Gold Dominated'
+            WHEN ua.SilverBadges > ua.BronzeBadges THEN 'Silver Encouraged'
+            WHEN ua.BronzeBadges > 10 THEN 'Bronze Enthusiast'
+            ELSE 'Balanced'
+        END AS BadgeDistribution,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsPosted,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersPosted,
+        COUNT(DISTINCT c.Id) AS CommentsMade
+    FROM UserActivityWindows ua
+    LEFT JOIN Posts p ON p.OwnerUserId = ua.UserId
+    LEFT JOIN Comments c ON c.UserId = ua.UserId
+    GROUP BY ua.UserId, ua.DisplayName, ua.Reputation, ua.Location, ua.GoldBadges, ua.SilverBadges, ua.BronzeBadges
+)
+SELECT
+    f.QuestionId,
+    f.Title,
+    f.Tags,
+    f.QuestionScore,
+    f.QuestionViews,
+    f.CommentCount,
+    f.AvgCommentScore,
+    f.Commenters,
+    f.UpVotes,
+    f.DownVotes,
+    f.PostStatus,
+    f.LinkedCount,
+    f.DuplicateCount,
+    f.DistinctRelatedPosts,
+    f.OwnerName,
+    f.OwnerReputation,
+    f.Location,
+    f.GoldBadges,
+    f.SilverBadges,
+    f.BronzeBadges,
+    f.DistinctBadges,
+    f.LocationRank,
+    f.GlobalReputationRank,
+    f.UsersCreatedThatYear,
+    f.HasCloseReopenActivity,
+    f.VoteSentiment,
+    f.LastHistoryEdit,
+    ubs.BadgeDistribution,
+    ubs.QuestionsPosted,
+    ubs.AnswersPosted,
+    ubs.CommentsMade
+FROM FinalSelection f
+LEFT JOIN UserBadgeSentiment ubs ON ubs.UserId = f.OwnerUserId
+WHERE f.QuestionViews > 5000
+  AND (f.PostStatus = 'Open' OR (f.PostStatus = 'Closed' AND f.HasCloseReopenActivity = TRUE))
+ORDER BY f.QuestionScore DESC NULLS LAST, f.CommentCount DESC NULLS LAST
+FETCH FIRST 100 ROWS ONLY;

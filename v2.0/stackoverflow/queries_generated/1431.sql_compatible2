@@ -1,0 +1,220 @@
+WITH UserEngagementSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.CreationDate AS UserCreationDate,
+        u.Reputation,
+        u.Views AS UserProfileViews,
+        u.UpVotes AS UserUpVotes,
+        u.DownVotes AS UserDownVotes,
+        u.Location,
+        u.AboutMe,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COALESCE(AVG(p.Score), 0) AS AveragePostScore,
+        COALESCE(SUM(p.ViewCount), 0) AS TotalPostViewCount,
+        MAX(p.CreationDate) AS LatestPostDate,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        MAX(c.CreationDate) AS LatestCommentDate,
+        u.Reputation / NULLIF(EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS timestamp) - u.CreationDate)) + 1, 0) AS ReputationPerDay,
+        (SELECT MAX(s.Score) FROM Posts s WHERE s.OwnerUserId = u.Id AND s.PostTypeId = 1) AS MaxQuestionScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    GROUP BY u.Id, u.CreationDate, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.Location, u.AboutMe
+),
+PostHistoryDetails AS (
+    SELECT
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate AS HistoryDate,
+        ph.UserId AS HistoryEditorUserId,
+        crt.Name AS CloseReasonName,
+        LAG(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS PreviousHistoryDate,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn_latest_history_event,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId, ph.PostHistoryTypeId ORDER BY ph.CreationDate DESC) AS rn_latest_history_type
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON ph.PostHistoryTypeId = 10 AND ph.Comment = CAST(crt.Id AS varchar)
+    GROUP BY ph.PostId, ph.PostHistoryTypeId, ph.CreationDate, ph.UserId, crt.Name
+),
+PostEditAndCloseMetrics_Agg AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        MAX(phd.HistoryDate) AS LastEditOrHistoryDate,
+        COUNT(CASE WHEN phd.PostHistoryTypeId IN (4, 5, 6) THEN phd.PostId END) AS EditCount,
+        SUM(CASE WHEN phd.PostHistoryTypeId = 10 AND phd.CloseReasonName = 'Duplicate' THEN 1 ELSE 0 END) AS DuplicateCloseCount,
+        AVG(EXTRACT(EPOCH FROM (phd.HistoryDate - phd.PreviousHistoryDate))) FILTER (WHERE phd.PreviousHistoryDate IS NOT NULL) AS AvgTimeBetweenHistorySeconds,
+        NULL AS QuestionRankByScoreInYear,
+        (SELECT CloseReasonName FROM PostHistoryDetails WHERE PostId = p.Id AND PostHistoryTypeId = 10 AND rn_latest_history_type = 1 ORDER BY HistoryDate DESC LIMIT 1) AS LatestCloseReasonForPost
+    FROM Posts p
+    LEFT JOIN PostHistoryDetails phd ON p.Id = phd.PostId
+    GROUP BY p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Title, p.Tags, p.Score, p.ViewCount
+),
+PostEditAndCloseMetrics_WithRank AS (
+    SELECT
+        pae.*,
+        pr.RankInYear
+    FROM PostEditAndCloseMetrics_Agg pae
+    LEFT JOIN (
+        SELECT php.PostId, php.rnk AS RankInYear
+        FROM (
+            SELECT Id AS PostId, PostTypeId, EXTRACT(YEAR FROM CreationDate) AS CreationYear, Score, ViewCount,
+                RANK() OVER (PARTITION BY PostTypeId, EXTRACT(YEAR FROM CreationDate) ORDER BY Score DESC, ViewCount DESC) AS rnk
+            FROM Posts
+            WHERE PostTypeId = 1
+        ) php
+    ) pr ON pr.PostId = pae.PostId
+),
+TagInsight AS (
+    SELECT
+        tag.TagName,
+        COUNT(p.Id) AS TagPostCount,
+        COALESCE(AVG(p.Score), 0) AS AvgTagScore,
+        COUNT(DISTINCT p.OwnerUserId) AS UniqueTagUsers,
+        MAX(p.CreationDate) AS LatestTagPostDate
+    FROM Posts p
+    CROSS JOIN LATERAL (
+        SELECT TRIM(t) AS TagName
+        FROM (
+            SELECT regexp_split_to_table(SUBSTRING(p.Tags FROM 2 FOR (char_length(p.Tags)-2)), '><') AS t
+        ) sub
+    ) tag
+    WHERE p.Tags IS NOT NULL AND p.Tags != '' AND p.PostTypeId = 1
+    GROUP BY tag.TagName
+),
+QuestionAnswerDetails AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.OwnerUserId AS QuestionOwnerId,
+        q.CreationDate AS QuestionCreationDate,
+        q.Score AS QuestionScore,
+        q.AcceptedAnswerId,
+        a.CreationDate AS AcceptedAnswerCreationDate,
+        a.Score AS AcceptedAnswerScore,
+        a.OwnerUserId AS AcceptedAnswerOwnerId,
+        EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate)) / 3600.0 AS TimeToAcceptAnswerHours,
+        (a.Score - q.Score) AS ScoreDifference
+    FROM Posts q
+    JOIN Posts a ON q.AcceptedAnswerId = a.Id
+    WHERE q.PostTypeId = 1 AND q.AcceptedAnswerId IS NOT NULL
+)
+SELECT
+    ues.UserId,
+    u.DisplayName,
+    ues.Reputation,
+    ues.ReputationPerDay,
+    ues.TotalPosts,
+    ues.TotalQuestions,
+    ues.TotalAnswers,
+    ues.AveragePostScore,
+    ues.MaxQuestionScore,
+    COALESCE(ues.Location, 'Unknown') AS UserLocation,
+    SUBSTRING(COALESCE(ues.AboutMe, ''), 1, 100) AS AboutMeSnippet,
+    COUNT(b.Id) AS TotalBadges,
+    SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+    SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+    SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+    MAX(pec_agg.EditCount) FILTER (WHERE pec_agg.PostTypeId = 1) AS MaxQuestionEditsByUser,
+    AVG(pec_agg.AvgTimeBetweenHistorySeconds) FILTER (WHERE pec_agg.PostTypeId = 1) AS AvgTimeBetweenQuestionHistoryByUser,
+    COALESCE(AVG(qad.TimeToAcceptAnswerHours) FILTER (WHERE qad.AcceptedAnswerOwnerId = ues.UserId), 0) AS AvgTimeToAcceptForUserAnswers,
+    COALESCE(AVG(qad.ScoreDifference) FILTER (WHERE qad.AcceptedAnswerOwnerId = ues.UserId), 0) AS AvgScoreDiffForUserAnswers,
+    (
+        SELECT ti.TagName || ' (Global Avg Score: ' || CAST(ti.AvgTagScore AS varchar) || ', Posts: ' || CAST(ti.TagPostCount AS varchar) || ')'
+        FROM TagInsight ti
+        JOIN (
+            SELECT tag.TagName, COUNT(p.Id) AS UserTagPostCount
+            FROM Posts p
+            CROSS JOIN LATERAL (
+                SELECT regexp_split_to_table(SUBSTRING(p.Tags FROM 2 FOR (char_length(p.Tags)-2)), '><') AS TagName
+            ) tag
+            WHERE p.OwnerUserId = ues.UserId AND p.Tags IS NOT NULL AND p.Tags != '' AND p.PostTypeId = 1
+            GROUP BY tag.TagName
+            ORDER BY UserTagPostCount DESC, tag.TagName
+            LIMIT 1
+        ) AS UserTopTag ON ti.TagName = UserTopTag.TagName
+    ) AS TopUsedTagWithStats,
+    (
+        SELECT SUM(rp.Score)
+        FROM Posts p_q
+        JOIN PostLinks pl ON p_q.Id = pl.PostId
+        JOIN Posts rp ON pl.RelatedPostId = rp.Id
+        WHERE p_q.OwnerUserId = ues.UserId AND p_q.PostTypeId = 1 AND pl.LinkTypeId = 1 AND rp.Score > 0
+    ) AS SumOfLinkedPostScores,
+    NTILE(10) OVER (ORDER BY ues.Reputation DESC, ues.TotalPosts DESC, ues.AveragePostScore DESC) AS ReputationDecile,
+    CASE
+        WHEN ues.TotalQuestions > 0 AND ues.TotalAnswers > 0 AND ues.Reputation > 1000 AND u.LastAccessDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days' THEN 'Proactive Contributor'
+        WHEN ues.TotalQuestions > 0 AND ues.TotalAnswers > 0 THEN 'General Contributor'
+        WHEN ues.TotalQuestions > 0 THEN 'Questioner'
+        WHEN ues.TotalAnswers > 0 THEN 'Answerer'
+        WHEN u.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days' THEN 'New User'
+        ELSE 'Lurker / Inactive'
+    END AS UserRoleClassification,
+    COALESCE(NULLIF(TRIM(ues.AboutMe), ''), 'No "About Me" provided') AS AboutMeContentIndicator,
+    u.LastAccessDate,
+    MAX(pec_agg.DuplicateCloseCount) FILTER (WHERE pec_agg.PostTypeId = 1) AS UserQuestionDuplicateCloseCount,
+    (
+        SELECT pec_agg_sub.LatestCloseReasonForPost
+        FROM PostEditAndCloseMetrics_Agg pec_agg_sub
+        WHERE pec_agg_sub.OwnerUserId = u.Id AND pec_agg_sub.LatestCloseReasonForPost IS NOT NULL
+        ORDER BY pec_agg_sub.LastEditOrHistoryDate DESC
+        LIMIT 1
+    ) AS LatestCloseReasonForUserPosts
+FROM Users u
+JOIN UserEngagementSummary ues ON u.Id = ues.UserId
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN PostEditAndCloseMetrics_WithRank pec_agg ON u.Id = pec_agg.OwnerUserId
+LEFT JOIN QuestionAnswerDetails qad ON u.Id = qad.QuestionOwnerId OR u.Id = qad.AcceptedAnswerOwnerId
+WHERE u.Reputation > 100 OR ues.TotalPosts > 0 OR ues.TotalComments > 0
+GROUP BY ues.UserId, u.DisplayName, ues.Reputation, ues.ReputationPerDay, ues.TotalPosts, ues.TotalQuestions, ues.TotalAnswers, ues.AveragePostScore, ues.MaxQuestionScore, ues.Location, ues.AboutMe, u.LastAccessDate, u.Id
+
+UNION ALL
+
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.Reputation / NULLIF(EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS timestamp) - u.CreationDate)) + 1, 0) AS ReputationPerDay,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    COALESCE(AVG(p.Score), 0) AS AveragePostScore,
+    (SELECT MAX(s.Score) FROM Posts s WHERE s.OwnerUserId = u.Id AND s.PostTypeId = 1) AS MaxQuestionScore,
+    COALESCE(u.Location, 'Unknown') AS UserLocation,
+    SUBSTRING(COALESCE(u.AboutMe, ''), 1, 100) AS AboutMeSnippet,
+    COUNT(b.Id) AS TotalBadges,
+    SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+    SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+    SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+    0 AS MaxQuestionEditsByUser,
+    NULL AS AvgTimeBetweenQuestionHistoryByUser,
+    0 AS AvgTimeToAcceptForUserAnswers,
+    0 AS AvgScoreDiffForUserAnswers,
+    NULL AS TopUsedTagWithStats,
+    NULL AS SumOfLinkedPostScores,
+    NULL AS ReputationDecile,
+    'High-Rep Influencer' AS UserRoleClassification,
+    COALESCE(NULLIF(TRIM(u.AboutMe), ''), 'No "About Me" provided') AS AboutMeContentIndicator,
+    u.LastAccessDate,
+    0 AS UserQuestionDuplicateCloseCount,
+    (
+        SELECT phd.CloseReasonName
+        FROM PostHistoryDetails phd
+        WHERE phd.HistoryEditorUserId = u.Id AND phd.PostHistoryTypeId = 10
+        ORDER BY phd.HistoryDate DESC
+        LIMIT 1
+    ) AS LatestCloseReasonForUserPosts
+FROM Users u
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+WHERE u.Reputation >= 10000 AND EXISTS (SELECT 1 FROM Badges b_sub WHERE b_sub.UserId = u.Id AND b_sub.Class = 1)
+GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location, u.AboutMe, u.LastAccessDate
+HAVING SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) > 0 OR u.Reputation >= 50000
+ORDER BY Reputation DESC, LastAccessDate DESC
+LIMIT 1000;

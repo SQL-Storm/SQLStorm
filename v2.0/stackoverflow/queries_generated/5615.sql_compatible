@@ -1,0 +1,127 @@
+WITH
+ActiveUsers AS (
+  SELECT u.Id,
+         u.DisplayName,
+         u.Reputation,
+         u.CreationDate,
+         u.LastAccessDate,
+         u.Location,
+         u.Views,
+         u.UpVotes,
+         u.DownVotes
+  FROM Users u
+),
+TopTags AS (
+  SELECT t.TagName,
+         t.Count,
+         t.ExcerptPostId,
+         t.WikiPostId
+  FROM Tags t
+  WHERE t.IsModeratorOnly = FALSE
+),
+RecentActivity AS (
+  SELECT p.Id AS PostId,
+         p.PostTypeId,
+         p.OwnerUserId,
+         p.Title,
+         p.CreationDate,
+         p.LastActivityDate,
+         p.Score,
+         p.ViewCount,
+         p.Tags,
+         ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate DESC, p.CreationDate DESC) AS rn
+  FROM Posts p
+  WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '180 days'
+),
+CrossJoinStats AS (
+  SELECT
+    a.Id AS UserId,
+    a.DisplayName,
+    COUNT(DISTINCT c.Id) AS CommentCountLast180,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesGiven,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesGiven,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN COALESCE(v.BountyAmount,0) ELSE 0 END) AS UpvoteBounty
+  FROM ActiveUsers a
+  LEFT JOIN Posts p ON p.OwnerUserId = a.Id
+  LEFT JOIN Comments c ON c.PostId = p.Id AND c.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '180 days'
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  GROUP BY a.Id, a.DisplayName
+),
+TagActivity AS (
+  SELECT
+    t.TagName,
+    COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS UpvotesOnTag,
+    COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS DownvotesOnTag,
+    SUM(CASE WHEN v.VoteTypeId = 4 THEN 1 ELSE 0 END) AS OffensiveVotes
+  FROM Tags t
+  LEFT JOIN Posts p ON p.Id = t.WikiPostId OR p.Id = t.ExcerptPostId
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  GROUP BY t.TagName
+),
+WindowedActivity AS (
+  SELECT
+    ra.PostId,
+    ra.PostTypeId,
+    ra.OwnerUserId,
+    ra.Title,
+    ra.CreationDate,
+    ra.LastActivityDate,
+    ra.Score,
+    ra.ViewCount,
+    ra.Tags,
+    SUM(CASE WHEN ra.rn = 1 THEN 1 ELSE 0 END) OVER (PARTITION BY ra.OwnerUserId) AS LatestPostByUser
+  FROM RecentActivity ra
+)
+SELECT
+  au.Id AS UserId,
+  au.DisplayName,
+  au.Reputation,
+  au.CreationDate AS UserCreationDate,
+  au.LastAccessDate,
+  cu.CommentCountLast180,
+  cu.UpvotesGiven,
+  cu.DownvotesGiven,
+  cu.UpvoteBounty,
+  ta.TagName,
+  ta.UpvotesOnTag,
+  ta.DownvotesOnTag,
+  ta.OffensiveVotes,
+  wa.PostId,
+  wa.PostTypeId,
+  wa.Title AS PostTitle,
+  wa.CreationDate AS PostCreationDate,
+  wa.LastActivityDate AS PostLastActivityDate,
+  wa.Score AS PostScore,
+  wa.ViewCount AS PostViewCount,
+  wa.Tags AS PostTags
+FROM CrossJoinStats cu
+JOIN ActiveUsers au ON au.Id = cu.UserId
+LEFT JOIN WindowedActivity wa ON wa.OwnerUserId = au.Id
+LEFT JOIN TagActivity ta ON 1 = 1
+WHERE
+  au.Reputation > 1000
+  OR wa.PostId IS NOT NULL
+GROUP BY
+  au.Id,
+  au.DisplayName,
+  au.Reputation,
+  au.CreationDate,
+  au.LastAccessDate,
+  cu.CommentCountLast180,
+  cu.UpvotesGiven,
+  cu.DownvotesGiven,
+  cu.UpvoteBounty,
+  ta.TagName,
+  ta.UpvotesOnTag,
+  ta.DownvotesOnTag,
+  ta.OffensiveVotes,
+  wa.PostId,
+  wa.PostTypeId,
+  wa.Title,
+  wa.CreationDate,
+  wa.LastActivityDate,
+  wa.Score,
+  wa.ViewCount,
+  wa.Tags
+ORDER BY au.Reputation DESC, wa.LastActivityDate DESC NULLS LAST
+LIMIT 100;

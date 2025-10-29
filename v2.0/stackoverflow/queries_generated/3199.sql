@@ -1,0 +1,108 @@
+-- {"query": "3199.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 4307} 
+
+WITH
+    rep_rank AS (
+        SELECT u.Id,
+               u.DisplayName,
+               u.Reputation,
+               ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS rn
+        FROM Users u
+    ),
+    badge_totals AS (
+        SELECT b.UserId,
+               COUNT(*) FILTER (WHERE b.Class = 1) AS gold,
+               COUNT(*) FILTER (WHERE b.Class = 2) AS silver,
+               COUNT(*) FILTER (WHERE b.Class = 3) AS bronze
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+    q_stats AS (
+        SELECT p.OwnerUserId,
+               COUNT(*)                                   AS q_cnt,
+               AVG(p.Score)                               AS avg_score,
+               MAX(p.ViewCount)                           AS max_views,
+               STRING_AGG(p.Title, ' | ') FILTER (WHERE p.Score >= 10) AS hot_titles
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+        GROUP BY p.OwnerUserId
+    ),
+    closed_posts AS (
+        SELECT ph.PostId,
+               MIN(ph.CreationDate) AS first_closed,
+               MAX(ph.CreationDate) AS last_closed,
+               COUNT(*)              AS close_cnt,
+               STRING_AGG(DISTINCT crt.Name, ', ') AS reasons
+        FROM PostHistory ph
+        JOIN PostHistoryTypes pht ON pht.Id = ph.PostHistoryTypeId AND pht.Id = 10
+        LEFT JOIN CloseReasonTypes crt ON crt.Id = (ph.Comment)::int
+        GROUP BY ph.PostId
+    ),
+    tag_words AS (
+        SELECT t.TagName,
+               t.Count AS tag_use,
+               COALESCE(e.wc,0) + COALESCE(w.wc,0) AS total_wc
+        FROM Tags t
+        LEFT JOIN LATERAL (
+            SELECT array_length(regexp_split_to_array(p.Body, '\s+'),1) AS wc
+            FROM Posts p
+            WHERE p.Id = t.ExcerptPostId
+        ) e ON true
+        LEFT JOIN LATERAL (
+            SELECT array_length(regexp_split_to_array(p.Body, '\s+'),1) AS wc
+            FROM Posts p
+            WHERE p.Id = t.WikiPostId
+        ) w ON true
+    )
+SELECT
+    rr.Id,
+    rr.DisplayName,
+    rr.Reputation,
+    rr.rn,
+    bt.gold,
+    bt.silver,
+    bt.bronze,
+    qs.q_cnt,
+    qs.avg_score,
+    qs.max_views,
+    qs.hot_titles,
+    cp.first_closed,
+    cp.last_closed,
+    cp.close_cnt,
+    cp.reasons,
+    tw.TagName,
+    tw.tag_use,
+    tw.total_wc,
+    CASE
+        WHEN rr.rn <= 10 THEN 'Top10'
+        WHEN rr.rn <= 100 THEN 'Top100'
+        ELSE 'Other'
+    END AS rank_group,
+    COALESCE(u.Location,'Unknown') AS location,
+    (SELECT COUNT(*) FROM Comments c WHERE c.UserId = rr.Id AND c.Score > 0) AS pos_comments,
+    (SELECT COUNT(*) FROM Votes v WHERE v.UserId = rr.Id AND v.VoteTypeId = 2) -
+    (SELECT COUNT(*) FROM Votes v WHERE v.UserId = rr.Id AND v.VoteTypeId = 3) AS net_votes_given
+FROM rep_rank rr
+LEFT JOIN badge_totals bt      ON bt.UserId = rr.Id
+LEFT JOIN q_stats qs          ON qs.OwnerUserId = rr.Id
+LEFT JOIN closed_posts cp     ON cp.PostId IN (
+                                   SELECT p.Id
+                                   FROM Posts p
+                                   WHERE p.OwnerUserId = rr.Id AND p.PostTypeId = 1
+                               )
+LEFT JOIN tag_words tw        ON tw.TagName = ANY (
+                                   SELECT unnest(string_to_array(p.Tags, '><'))
+                                   FROM Posts p
+                                   WHERE p.OwnerUserId = rr.Id AND p.PostTypeId = 1
+                               )
+LEFT JOIN Users u             ON u.Id = rr.Id
+WHERE (bt.gold IS NOT NULL OR qs.q_cnt >= 5)
+  AND (tw.tag_use IS NULL OR tw.tag_use > 200)
+  AND NOT EXISTS (SELECT 1 FROM Users du WHERE du.Id = rr.Id AND du.EmailHash IS NULL)
+ORDER BY rr.rn
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL
+WHERE FALSE;

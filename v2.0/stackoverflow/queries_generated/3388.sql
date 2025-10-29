@@ -1,0 +1,164 @@
+-- {"query": "3388.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2508} 
+
+WITH
+-- Aggregate user statistics
+UserStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.Views,0)                           AS TotalViews,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id)                     AS PostCount,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS QuestionCount,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS AnswerCount,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1)          AS GoldBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2)          AS SilverBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3)          AS BronzeBadges
+    FROM Users u
+),
+
+-- Top users by reputation & badge count
+TopUsers AS (
+    SELECT *
+    FROM UserStats
+    ORDER BY Reputation DESC, GoldBadges DESC, SilverBadges DESC
+    FETCH FIRST 20 ROWS ONLY
+),
+
+-- Tag activity derived from questions containing the tag
+TagActivity AS (
+    SELECT
+        t.TagName,
+        COUNT(p.Id)                                     AS TaggedPostCount,
+        SUM(p.Score)                                    AS TotalScore,
+        AVG(p.ViewCount)                                AS AvgViews,
+        STRING_AGG(DISTINCT u.DisplayName, ', ') FILTER (WHERE u.Id IS NOT NULL) AS ActiveUsers
+    FROM Tags t
+    JOIN Posts p ON p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    GROUP BY t.TagName
+    HAVING COUNT(p.Id) > 0
+),
+
+-- Votes in the last 90 days per post
+RecentVotes AS (
+    SELECT
+        v.PostId,
+        SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END)   AS UpVotes,
+        SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END)   AS DownVotes,
+        MAX(v.CreationDate)                          AS LastVoteDate
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE v.CreationDate >= CURRENT_DATE - INTERVAL '90 days'
+    GROUP BY v.PostId
+),
+
+-- Detailed per‑question analytics
+QuestionStats AS (
+    SELECT
+        p.Id                                          AS QuestionId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        COALESCE(rv.UpVotes,0) - COALESCE(rv.DownVotes,0) AS NetVotes,
+        COALESCE(rv.UpVotes,0)                        AS RecentUpVotes,
+        COALESCE(rv.DownVotes,0)                      AS RecentDownVotes,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS RowNumByUser,
+        COUNT(a.Id) FILTER (WHERE a.CreationDate <= p.CreationDate + INTERVAL '7 days')
+                                                    AS AnswersInFirstWeek,
+        AVG(CASE WHEN a.Score IS NOT NULL THEN a.Score END)
+                                                    OVER (PARTITION BY p.Id)               AS AvgAnswerScore
+    FROM Posts p
+    LEFT JOIN RecentVotes rv ON rv.PostId = p.Id
+    LEFT JOIN Posts a ON a.ParentId = p.Id AND a.PostTypeId = 2
+    WHERE p.PostTypeId = 1
+),
+
+-- Highest‑scoring recent questions (30‑day window)
+HighScoringRecent AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Score,
+        p.CreationDate
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= CURRENT_DATE - INTERVAL '30 days'
+      AND p.Score > (
+          SELECT PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY Score)
+          FROM Posts
+          WHERE PostTypeId = 1
+      )
+)
+
+SELECT
+    tu.Id,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.GoldBadges,
+    tu.SilverBadges,
+    tu.BronzeBadges,
+    qs.QuestionId,
+    qs.Title,
+    qs.CreationDate,
+    qs.Score,
+    qs.NetVotes,
+    qs.RecentUpVotes,
+    qs.RecentDownVotes,
+    qs.AnswersInFirstWeek,
+    qs.AvgAnswerScore,
+    ta.TagName,
+    ta.TaggedPostCount,
+    ta.TotalScore          AS TagTotalScore,
+    ta.AvgViews            AS TagAvgViews,
+    ta.ActiveUsers
+FROM TopUsers tu
+LEFT JOIN QuestionStats qs
+       ON qs.RowNumByUser = 1
+      AND qs.QuestionId = (
+          SELECT p.Id
+          FROM Posts p
+          WHERE p.OwnerUserId = tu.Id
+            AND p.PostTypeId = 1
+          ORDER BY p.Score DESC
+          FETCH FIRST 1 ROW ONLY
+      )
+LEFT JOIN LATERAL (
+    SELECT
+        t.TagName,
+        t.TaggedPostCount,
+        t.TotalScore,
+        t.AvgViews,
+        t.ActiveUsers
+    FROM TagActivity t
+    WHERE qs.Title ILIKE CONCAT('%', t.TagName, '%')
+    ORDER BY t.TaggedPostCount DESC
+    FETCH FIRST 1 ROW ONLY
+) ta ON TRUE
+WHERE tu.Reputation > 10000
+
+UNION ALL
+
+SELECT
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    hr.Id,
+    hr.Title,
+    hr.CreationDate,
+    hr.Score,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL
+FROM HighScoringRecent hr
+ORDER BY Reputation DESC NULLS LAST, GoldBadges DESC NULLS LAST
+LIMIT 100 OFFSET 0;

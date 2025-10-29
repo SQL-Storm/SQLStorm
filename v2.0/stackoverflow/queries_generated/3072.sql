@@ -1,0 +1,163 @@
+-- {"query": "3072.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1813} 
+
+/*  Complex benchmark query on the StackOverflow schema  */
+WITH RECURSIVE user_hierarchy AS (
+    /*   Users with their immediate "referral" (dummy example using AccountId)   */
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        0 AS depth,
+        CAST(u.Id AS VARCHAR) AS path
+    FROM Users u
+    WHERE u.AccountId IS NULL
+
+    UNION ALL
+
+    SELECT 
+        child.Id,
+        child.DisplayName,
+        child.Reputation,
+        child.CreationDate,
+        parent.depth + 1,
+        parent.path || '->' || child.Id
+    FROM Users child
+    JOIN Users parent ON child.AccountId = parent.Id
+    WHERE parent.depth < 5               -- limit recursion depth for safety
+),
+user_stats AS (
+    SELECT 
+        u.Id                                    AS user_id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT b.Id)                    AS badge_count,
+        SUM(CASE WHEN b.Class = 1 THEN 3
+                 WHEN b.Class = 2 THEN 2
+                 ELSE 1 END)                  AS badge_score,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS question_count,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS answer_count,
+        COALESCE(SUM(p.Score),0)                AS total_post_score,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 1) AS avg_question_score,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 2) AS avg_answer_score,
+        MAX(p.CreationDate)                    AS last_post_date,
+        MAX(v.CreationDate) FILTER (WHERE v.VoteTypeId = 2) AS last_upvote_date,
+        COUNT(DISTINCT t.Id)                   AS distinct_tag_count
+    FROM Users u
+    LEFT JOIN Badges b          ON b.UserId = u.Id
+    LEFT JOIN Posts p           ON p.OwnerUserId = u.Id
+    LEFT JOIN PostHistory ph    ON ph.PostId = p.Id
+    LEFT JOIN Votes v           ON v.PostId = p.Id
+    LEFT JOIN (
+        SELECT DISTINCT 
+            UNNEST(string_to_array(trim(both '<>' FROM Tags), '><'))::VARCHAR AS tag
+        FROM Posts
+        WHERE PostTypeId = 1
+    ) pt                     ON pt.tag = ANY(string_to_array(trim(both '<>' FROM p.Tags), '><'))
+    LEFT JOIN Tags t          ON t.TagName = pt.tag
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+recent_activity AS (
+    SELECT 
+        ua.user_id,
+        GREATEST(
+            COALESCE(ua.last_post_date, '1970-01-01'::timestamp),
+            COALESCE(ua.last_upvote_date, '1970-01-01'::timestamp),
+            COALESCE(p.LastActivityDate, '1970-01-01'::timestamp)
+        ) AS most_recent_ts,
+        ROW_NUMBER() OVER (PARTITION BY ua.user_id ORDER BY GREATEST(
+            COALESCE(ua.last_post_date, '1970-01-01'::timestamp),
+            COALESCE(ua.last_upvote_date, '1970-01-01'::timestamp),
+            COALESCE(p.LastActivityDate, '1970-01-01'::timestamp)
+        ) DESC) AS rn
+    FROM user_stats ua
+    LEFT JOIN Posts p ON p.OwnerUserId = ua.user_id
+),
+tag_popularity AS (
+    SELECT 
+        t.TagName,
+        t.Count                                   AS tag_total_posts,
+        COUNT(DISTINCT pl.PostId)                 AS linked_questions,
+        COUNT(DISTINCT pl.RelatedPostId)          AS linked_answers,
+        STRING_AGG(DISTINCT u.DisplayName, ', ') FILTER (WHERE u.Reputation > 10000) AS top_user_names
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Id = t.ExcerptPostId OR p.Id = t.WikiPostId
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    GROUP BY t.TagName, t.Count
+),
+combined AS (
+    /*  Users with high reputation and recent activity  */
+    SELECT 
+        us.user_id,
+        us.DisplayName,
+        us.Reputation,
+        us.badge_count,
+        us.badge_score,
+        us.question_count,
+        us.answer_count,
+        us.total_post_score,
+        us.avg_question_score,
+        us.avg_answer_score,
+        us.distinct_tag_count,
+        ra.most_recent_ts,
+        DENSE_RANK() OVER (ORDER BY us.Reputation DESC, us.total_post_score DESC) AS reputation_rank,
+        CASE 
+            WHEN us.Reputation >= 20000 THEN 'Legendary'
+            WHEN us.Reputation >= 10000 THEN 'Expert'
+            WHEN us.Reputation >= 5000  THEN 'Proficient'
+            ELSE 'Novice'
+        END AS reputation_tier,
+        COALESCE(us.avg_question_score,0) - COALESCE(us.avg_answer_score,0) AS qa_score_delta
+    FROM user_stats us
+    JOIN recent_activity ra ON ra.user_id = us.user_id AND ra.rn = 1
+    WHERE us.Reputation > 1000
+      AND ra.most_recent_ts > CURRENT_DATE - INTERVAL '180 days'
+),
+tagged_users AS (
+    /*  Users who have authored posts containing popular tags  */
+    SELECT DISTINCT
+        p.OwnerUserId      AS user_id,
+        t.TagName,
+        tp.tag_total_posts,
+        tp.linked_questions,
+        tp.linked_answers,
+        tp.top_user_names
+    FROM Posts p
+    JOIN LATERAL (
+        SELECT UNNEST(string_to_array(trim(both '<>' FROM p.Tags), '><'))::VARCHAR AS tag
+    ) pt ON TRUE
+    JOIN Tags t ON t.TagName = pt.tag
+    JOIN tag_popularity tp ON tp.TagName = t.TagName
+    WHERE p.PostTypeId = 1               -- only questions
+      AND p.OwnerUserId IS NOT NULL
+      AND tp.tag_total_posts > 5000
+)
+SELECT 
+    c.user_id,
+    c.DisplayName,
+    c.Reputation,
+    c.reputation_tier,
+    c.reputation_rank,
+    c.badge_count,
+    c.badge_score,
+    c.question_count,
+    c.answer_count,
+    ROUND(c.qa_score_delta,2) AS qa_score_delta,
+    TO_CHAR(c.most_recent_ts, 'YYYY-MM-DD') AS last_activity,
+    COALESCE(tu.TagName, 'N/A')                           AS top_tag,
+    COALESCE(tu.tag_total_posts,0)                        AS tag_total_posts,
+    COALESCE(tu.linked_questions,0)                       AS linked_questions,
+    COALESCE(tu.linked_answers,0)                         AS linked_answers,
+    COALESCE(tu.top_user_names,'-')                       AS other_top_users
+FROM combined c
+LEFT JOIN LATERAL (
+    SELECT *
+    FROM tagged_users tu
+    WHERE tu.user_id = c.user_id
+    ORDER BY tu.tag_total_posts DESC
+    LIMIT 1
+) tu ON TRUE
+WHERE c.reputation_rank <= 250
+ORDER BY c.reputation_rank
+LIMIT 200;

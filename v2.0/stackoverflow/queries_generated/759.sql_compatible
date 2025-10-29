@@ -1,0 +1,360 @@
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        u.location,
+        coalesce(nullif(trim(split_part(u.websiteurl, '/', 3)), ''), 'no-domain') as domain,
+        date_trunc('month', u.creationdate) as cohort_month
+    from users u
+    where u.creationdate >= (select date_trunc('year', max(creationdate)) - interval '2 years' from users)
+),
+user_activity as (
+    select
+        p.owneruserid as user_id,
+        count(*) filter (where p.posttypeid = 1) as q_cnt,
+        count(*) filter (where p.posttypeid = 2) as a_cnt,
+        sum(coalesce(p.score, 0)) as post_score,
+        sum(coalesce(p.viewcount, 0)) as views,
+        max(p.lastactivitydate) as last_post_activity,
+        count(*) filter (where p.closeddate is not null) as closed_cnt
+    from posts p
+    where p.owneruserid is not null
+    group by p.owneruserid
+),
+comment_activity as (
+    select
+        c.userid as user_id,
+        count(*) as c_cnt,
+        sum(coalesce(c.score, 0)) as c_score,
+        min(c.creationdate) as first_comment_date,
+        max(c.creationdate) as last_comment_date
+    from comments c
+    where c.userid is not null
+    group by c.userid
+),
+badge_activity as (
+    select
+        b.userid as user_id,
+        count(*) filter (where b.class = 1) as gold_cnt,
+        count(*) filter (where b.class = 2) as silver_cnt,
+        count(*) filter (where b.class = 3) as bronze_cnt,
+        count(*) filter (where b.tagbased = true) as tag_badges,
+        max(b.date) as last_badge_date
+    from badges b
+    group by b.userid
+),
+vote_summary as (
+    select
+        v.userid as user_id,
+        count(*) filter (where v.votetypeid = 2) as upvotes_cast,
+        count(*) filter (where v.votetypeid = 3) as downvotes_cast,
+        count(*) filter (where v.votetypeid = 5) as favorites_cast,
+        sum(coalesce(v.bountyamount,0)) filter (where v.votetypeid in (8,9)) as bounty_total,
+        max(v.creationdate) as last_vote_date
+    from votes v
+    where v.userid is not null
+    group by v.userid
+),
+post_scores as (
+    select
+        p.owneruserid as user_id,
+        p.id as post_id,
+        p.posttypeid,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        p.favoritecount,
+        p.answercount,
+        p.commentcount,
+        p.closeddate,
+        p.title,
+        p.tags
+    from posts p
+    where p.owneruserid is not null
+),
+answer_accepts as (
+    select
+        a.owneruserid as user_id,
+        count(*) as answers_accepted
+    from posts q
+    join posts a on a.id = q.acceptedanswerid
+    where q.posttypeid = 1
+    group by a.owneruserid
+),
+dup_links as (
+    select
+        pl.postid,
+        count(*) filter (where pl.linktypeid = 3) as dup_count
+    from postlinks pl
+    group by pl.postid
+),
+post_quality as (
+    select
+        ps.user_id,
+        percentile_cont(0.5) within group (order by coalesce(ps.score,0)) as score_p50,
+        percentile_cont(0.9) within group (order by coalesce(ps.score,0)) as score_p90,
+        avg(ps.score) as avg_score,
+        avg(ps.viewcount) as avg_views,
+        stddev_pop(coalesce(ps.score,0)) as score_stddev,
+        count(*) as post_cnt,
+        sum(case when ps.closeddate is not null then 1 else 0 end) as closed_posts,
+        sum(case when dl.dup_count > 0 then 1 else 0 end) as dup_marked_posts
+    from post_scores ps
+    left join dup_links dl on dl.postid = ps.post_id
+    group by ps.user_id
+),
+user_recent_q as (
+    select
+        p.owneruserid as user_id,
+        count(*) filter (where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '90 days' and p.posttypeid = 1) as q_90d,
+        count(*) filter (where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '90 days' and p.posttypeid = 2) as a_90d
+    from posts p
+    where p.owneruserid is not null
+    group by p.owneruserid
+),
+title_signal as (
+    select
+        ps.user_id,
+        avg(case when ps.title ilike any (array['%how to%','%best way%','%why%','%error%','%exception%']) then 1.0 else 0.0 end) as title_phrase_rate,
+        avg(case when ps.title ~* '\b(help|urgent|please)\b' then 1.0 else 0.0 end) as weak_title_rate
+    from post_scores ps
+    where ps.posttypeid = 1
+    group by ps.user_id
+),
+tag_usage as (
+    select
+        ps.user_id,
+        avg(array_length(string_to_array(coalesce(nullif(ps.tags,''),'<>'), '><'), 1)) as avg_tag_count,
+        count(*) filter (where ps.tags ilike '%<java>%') as java_posts,
+        count(*) filter (where ps.tags ilike '%<javascript>%') as js_posts,
+        count(*) filter (where ps.tags ilike '%<python>%') as py_posts
+    from post_scores ps
+    where ps.posttypeid = 1
+    group by ps.user_id
+),
+edits as (
+    select
+        ph.postid,
+        count(*) filter (where ph.posthistorytypeid in (4,5,6)) as edit_events,
+        min(ph.creationdate) filter (where ph.posthistorytypeid in (4,5,6)) as first_edit_date,
+        max(ph.creationdate) filter (where ph.posthistorytypeid in (4,5,6)) as last_edit_date
+    from posthistory ph
+    group by ph.postid
+),
+user_editing as (
+    select
+        p.owneruserid as user_id,
+        sum(coalesce(e.edit_events,0)) as total_edits,
+        count(*) filter (where e.edit_events > 0) as posts_ever_edited,
+        max(e.last_edit_date) as last_edit_date
+    from posts p
+    left join edits e on e.postid = p.id
+    where p.owneruserid is not null
+    group by p.owneruserid
+),
+post_age as (
+    select
+        ps.user_id,
+        avg(extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - ps.creationdate)) / 86400.0) as avg_post_age_days,
+        min(ps.creationdate) as first_post_date,
+        max(ps.creationdate) as last_post_date
+    from post_scores ps
+    group by ps.user_id
+),
+activity_rank as (
+    select
+        ru.user_id,
+        ru.displayname,
+        ru.reputation,
+        ru.domain,
+        ru.cohort_month,
+        coalesce(qa.q_cnt,0) as q_cnt,
+        coalesce(qa.a_cnt,0) as a_cnt,
+        coalesce(qa.post_score,0) as post_score,
+        coalesce(qa.views,0) as views,
+        coalesce(qa.closed_cnt,0) as closed_cnt,
+        coalesce(ca.c_cnt,0) as c_cnt,
+        coalesce(ca.c_score,0) as c_score,
+        coalesce(ba.gold_cnt,0) as gold_cnt,
+        coalesce(ba.silver_cnt,0) as silver_cnt,
+        coalesce(ba.bronze_cnt,0) as bronze_cnt,
+        coalesce(ba.tag_badges,0) as tag_badges,
+        coalesce(vs.upvotes_cast,0) as upvotes_cast,
+        coalesce(vs.downvotes_cast,0) as downvotes_cast,
+        coalesce(vs.favorites_cast,0) as favorites_cast,
+        coalesce(vs.bounty_total,0) as bounty_total,
+        coalesce(pa.post_cnt,0) as post_cnt,
+        coalesce(pa.avg_score,0) as avg_score,
+        coalesce(pa.avg_views,0) as avg_views,
+        coalesce(pa.score_p50,0) as score_p50,
+        coalesce(pa.score_p90,0) as score_p90,
+        coalesce(pa.score_stddev,0) as score_stddev,
+        coalesce(pa.closed_posts,0) as closed_posts,
+        coalesce(pa.dup_marked_posts,0) as dup_marked_posts,
+        coalesce(ua.q_90d,0) as q_90d,
+        coalesce(ua.a_90d,0) as a_90d,
+        coalesce(ts.title_phrase_rate,0) as title_phrase_rate,
+        coalesce(ts.weak_title_rate,0) as weak_title_rate,
+        coalesce(tu.avg_tag_count,0) as avg_tag_count,
+        coalesce(tu.java_posts,0) as java_posts,
+        coalesce(tu.js_posts,0) as js_posts,
+        coalesce(tu.py_posts,0) as py_posts,
+        coalesce(ue.total_edits,0) as total_edits,
+        coalesce(ue.posts_ever_edited,0) as posts_ever_edited,
+        coalesce(pa2.avg_post_age_days,0) as avg_post_age_days,
+        ru.creationdate as user_creation_date,
+        greatest(coalesce(qa.last_post_activity, ru.creationdate), coalesce(ca.last_comment_date, ru.creationdate), coalesce(vs.last_vote_date, ru.creationdate)) as last_activity_any,
+        ru.location
+    from recent_users ru
+    left join user_activity qa on qa.user_id = ru.user_id
+    left join comment_activity ca on ca.user_id = ru.user_id
+    left join badge_activity ba on ba.user_id = ru.user_id
+    left join vote_summary vs on vs.user_id = ru.user_id
+    left join post_quality pa on pa.user_id = ru.user_id
+    left join user_recent_q ua on ua.user_id = ru.user_id
+    left join title_signal ts on ts.user_id = ru.user_id
+    left join tag_usage tu on tu.user_id = ru.user_id
+    left join user_editing ue on ue.user_id = ru.user_id
+    left join post_age pa2 on pa2.user_id = ru.user_id
+),
+normalized as (
+    select
+        ar.*,
+        nullif(ar.post_cnt,0) as post_cnt_nz,
+        nullif(ar.a_cnt + ar.q_cnt,0) as contrib_cnt_nz,
+        nullif(ar.c_cnt,0) as comments_nz
+    from activity_rank ar
+),
+scores as (
+    select
+        n.*,
+        coalesce((ar.post_score / nullif(ar.post_cnt,0)), 0) as score_per_post,
+        coalesce((ar.views / nullif(ar.post_cnt,0)), 0) as views_per_post,
+        coalesce((ar.c_score / nullif(ar.c_cnt,0)), 0) as score_per_comment,
+        coalesce((ar.gold_cnt*5 + ar.silver_cnt*2 + ar.bronze_cnt), 0) as badge_weight,
+        case
+            when ar.downvotes_cast > ar.upvotes_cast then 0.5
+            else 1.0
+        end as vote_balance_factor,
+        case
+            when ar.dup_marked_posts > 0 then least(0.95, 1.0 - (ar.dup_marked_posts / greatest(ar.post_cnt,1)))
+            else 1.0
+        end as dup_penalty,
+        case
+            when ar.closed_posts > 0 then least(0.9, 1.0 - (ar.closed_posts / greatest(ar.post_cnt,1)))
+            else 1.0
+        end as closed_penalty,
+        case
+            when ar.weak_title_rate > 0.3 then 0.8
+            when ar.weak_title_rate > 0.1 then 0.9
+            else 1.0
+        end as title_penalty,
+        coalesce((ar.answers_casted), 0) as answers_casted_placeholder
+    from activity_rank ar
+    join normalized n on n.user_id = ar.user_id
+),
+ranked as (
+    select
+        s.*,
+        (
+            0.30 * coalesce(s.score_per_post,0) +
+            0.15 * coalesce(s.views_per_post,0) +
+            0.10 * coalesce(s.score_p90,0) +
+            0.10 * coalesce(s.answers_casted_placeholder,0) +
+            0.10 * coalesce(s.badge_weight,0) +
+            0.05 * greatest(0, 1 - s.weak_title_rate) +
+            0.05 * coalesce(s.q_90d + s.a_90d,0) +
+            0.05 * coalesce(s.total_edits,0) +
+            0.10 * greatest(0, 1 - (s.closed_posts / greatest(s.post_cnt,1)))
+        )
+        * s.vote_balance_factor * s.dup_penalty * s.closed_penalty * s.title_penalty
+        as activity_score,
+        row_number() over (order by
+            (
+                0.30 * coalesce(s.score_per_post,0) +
+                0.15 * coalesce(s.views_per_post,0) +
+                0.10 * coalesce(s.score_p90,0) +
+                0.10 * coalesce(s.answers_casted_placeholder,0) +
+                0.10 * coalesce(s.badge_weight,0) +
+                0.05 * greatest(0, 1 - s.weak_title_rate) +
+                0.05 * coalesce(s.q_90d + s.a_90d,0) +
+                0.05 * coalesce(s.total_edits,0) +
+                0.10 * greatest(0, 1 - (s.closed_posts / greatest(s.post_cnt,1)))
+            )
+            * s.vote_balance_factor * s.dup_penalty * s.closed_penalty * s.title_penalty desc,
+            s.user_id
+        ) as rn,
+        rank() over (order by coalesce(s.reputation,0) desc) as rep_rank,
+        ntile(10) over (order by coalesce(s.avg_score,0) desc) as score_decile,
+        dense_rank() over (partition by s.cohort_month order by coalesce(s.activity_score,0) desc nulls last) as cohort_rank
+    from scores s
+),
+top_vs_random as (
+    select
+        cast('top' as varchar) as bucket, r.* from ranked r where r.rn <= 200
+    union all
+    select
+        cast('random' as varchar) as bucket, r.* from ranked r
+    where r.rn % 97 = 0
+),
+finalized as (
+    select
+        tvr.bucket,
+        tvr.user_id,
+        tvr.displayname,
+        tvr.domain,
+        tvr.cohort_month,
+        tvr.reputation,
+        tvr.rep_rank,
+        tvr.score_decile,
+        tvr.cohort_rank,
+        tvr.activity_score,
+        tvr.q_cnt, tvr.a_cnt, tvr.post_cnt,
+        tvr.avg_score, tvr.avg_views, tvr.score_p90,
+        tvr.upvotes_cast, tvr.downvotes_cast, tvr.favorites_cast,
+        tvr.badge_weight, tvr.gold_cnt, tvr.silver_cnt, tvr.bronze_cnt,
+        tvr.q_90d, tvr.a_90d,
+        tvr.closed_posts, tvr.dup_marked_posts,
+        tvr.title_phrase_rate, tvr.weak_title_rate,
+        tvr.avg_tag_count, tvr.java_posts, tvr.js_posts, tvr.py_posts,
+        tvr.total_edits, tvr.posts_ever_edited,
+        tvr.avg_post_age_days,
+        tvr.last_activity_any,
+        case when tvr.location is null or length(trim(tvr.location)) = 0 then 'unknown' else tvr.location end as location_filled
+    from ranked tvr
+    where tvr.user_id in (select user_id from top_vs_random)
+)
+select
+    f.bucket,
+    f.user_id,
+    f.displayname,
+    f.domain,
+    f.location_filled as location,
+    f.cohort_month,
+    f.reputation,
+    f.rep_rank,
+    f.cohort_rank,
+    f.score_decile,
+    round(f.activity_score, 4) as activity_score,
+    f.q_cnt, f.a_cnt, f.post_cnt,
+    round(f.avg_score, 3) as avg_score,
+    round(f.avg_views, 3) as avg_views,
+    round(f.score_p90, 3) as score_p90,
+    f.upvotes_cast, f.downvotes_cast, f.favorites_cast,
+    cast(f.badge_weight as integer) as badge_weight,
+    f.gold_cnt, f.silver_cnt, f.bronze_cnt,
+    f.q_90d, f.a_90d,
+    f.closed_posts, f.dup_marked_posts,
+    round(100 * f.weak_title_rate, 2) as weak_title_pct,
+    round(f.avg_tag_count, 2) as avg_tag_count,
+    f.java_posts, f.js_posts, f.py_posts,
+    f.total_edits, f.posts_ever_edited,
+    round(f.avg_post_age_days, 2) as avg_post_age_days,
+    f.last_activity_any
+from finalized f
+where
+    coalesce(f.post_cnt,0) >= 5
+    and (f.score_decile <= 3 or f.bucket = 'random')
+order by f.bucket, f.activity_score desc nulls last, f.user_id;

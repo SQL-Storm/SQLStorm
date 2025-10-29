@@ -1,0 +1,56 @@
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    MAX(u.CreationDate) AS LatestAccountActivity,
+    MAX(p.LastActivityDate) AS LatestPostActivity,
+    b.Class AS BadgeClass,
+    t.TagName,
+    COALESCE(vl.TotalVotes, 0) AS TotalVotes,
+    MAX(ph.CreationDate) AS LatestPostHistoryChange,
+    ph.Comment AS LastPostHistoryComment
+FROM 
+    Users u
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    (SELECT 
+        UserId, 
+        COUNT(Id) AS TotalVotes
+     FROM 
+        Votes 
+     GROUP BY 
+        UserId) vl ON u.Id = vl.UserId
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    (SELECT 
+        TagName, 
+        Id, 
+        COUNT(Id) AS TagCount
+     FROM 
+        Tags 
+     GROUP BY 
+        TagName, Id) t ON p.Tags LIKE '%' || t.TagName || '%'
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId = 10
+WHERE 
+    u.Reputation > 10000
+    AND p.Score > 100
+    AND p.LastActivityDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1' YEAR)
+GROUP BY 
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    b.Class,
+    t.TagName,
+    ph.Comment,
+    ph.CreationDate,
+    vl.TotalVotes
+HAVING 
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id ELSE NULL END) > 10
+ORDER BY 
+    TotalPosts DESC, 
+    TotalVotes DESC;

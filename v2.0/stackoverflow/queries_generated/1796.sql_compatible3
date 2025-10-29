@@ -1,0 +1,161 @@
+WITH UserEngagementSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.Views AS UserViews,
+        u.UpVotes AS UserUpVotes,
+        u.DownVotes AS UserDownVotes,
+        u.Location,
+        u.AboutMe,
+        COALESCE(u.WebsiteUrl, 'NO_WEBSITE_PROVIDED') AS CoalescedWebsiteUrl,
+        COUNT(DISTINCT p_q.Id) AS TotalQuestionsOwned,
+        COUNT(DISTINCT p_a.Id) AS TotalAnswersOwned,
+        COUNT(DISTINCT c.Id) AS TotalCommentsWritten,
+        AVG(CASE WHEN p_all.PostTypeId IN (1, 2) THEN p_all.Score END) AS AverageOverallPostScore,
+        SUM(c.Score) AS TotalCommentScoreSum,
+        MIN(CASE WHEN b.Class = 1 THEN b.Date END) AS FirstGoldBadgeDate,
+        MAX(CASE WHEN b.Class = 1 THEN b.Date END) AS LastGoldBadgeDate,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 AND b.Date >= TIMESTAMP '2022-01-01' THEN b.Id END) AS RecentGoldBadgesCount,
+        EXTRACT(EPOCH FROM (u.LastAccessDate - u.CreationDate)) / 86400 AS DaysSinceUserCreation,
+        (SELECT COUNT(DISTINCT pl.RelatedPostId)
+         FROM Posts p_owned
+         JOIN PostLinks pl ON p_owned.Id = pl.PostId
+         WHERE p_owned.OwnerUserId = u.Id AND pl.LinkTypeId = 3) AS TotalDuplicateLinkedPostsByOwner,
+        EXISTS (SELECT 1 FROM Badges b_corr WHERE b_corr.UserId = u.Id AND b_corr.Name = 'Strunk & White' AND b_corr.Date < u.LastAccessDate) AS HasStrunkWhiteBeforeLastAccess,
+        NTILE(10) OVER (ORDER BY u.Reputation DESC, u.UpVotes DESC) AS ReputationDecile,
+        NULLIF(u.Views, 0) AS NonZeroUserViews
+    FROM Users u
+    LEFT JOIN Posts p_all ON u.Id = p_all.OwnerUserId
+    LEFT JOIN Posts p_q ON u.Id = p_q.OwnerUserId AND p_q.PostTypeId = 1
+    LEFT JOIN Posts p_a ON u.Id = p_a.OwnerUserId AND p_a.PostTypeId = 2
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes, u.Location, u.AboutMe, u.WebsiteUrl
+),
+PostContentAndHistoryAnalysis AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount AS PostDirectCommentCount,
+        p.FavoriteCount,
+        p.Title,
+        p.Tags,
+        COALESCE(p.ClosedDate, TIMESTAMP '9999-12-31') AS CoalescedClosedDate,
+        COUNT(DISTINCT ph_edit.Id) AS TotalEditHistoryEntries,
+        COUNT(DISTINCT ph_reopen.Id) AS ReopenEventsCount,
+        MAX(CASE WHEN ph_community.PostHistoryTypeId = 16 THEN 1 ELSE 0 END) AS WasCommunityOwnedEver,
+        SUM(CASE WHEN ph_text_change.Text LIKE '%<pre><code>%' THEN 1 ELSE 0 END) AS BodyCodeBlockEditCount,
+        AVG(sub_comments.AvgCommentScoreForPost) AS PostCommentsAverageScore,
+        STRING_AGG(DISTINCT t.TagName, ';') AS AssociatedTagNames,
+        (SELECT COUNT(DISTINCT v.UserId) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 5) AS TotalFavoriteUsers,
+        SUBSTRING(sub_tags.tag_list FROM 1 FOR POSITION('><' IN sub_tags.tag_list || '><') - 1) AS FirstTag,
+        CASE WHEN p.Body LIKE '%<a href="http%' THEN TRUE ELSE FALSE END AS ContainsExternalLinkInBody,
+        NULLIF(p.ViewCount, 0) AS NonZeroPostViewCount,
+        CASE
+            WHEN p.Title LIKE '%performance%' OR p.Title LIKE '%optimize%' THEN 'PerformanceRelated'
+            WHEN p.Title LIKE '%error%' OR p.Title LIKE '%bug%' THEN 'IssueRelated'
+            ELSE 'General'
+        END AS TitleCategory,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS RowNumByOwnerForRecency,
+        LEAD(p.CreationDate, 1, p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextPostCreationDate,
+        LAG(p.CreationDate, 1, p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevPostCreationDate
+    FROM Posts p
+    LEFT JOIN PostHistory ph_edit ON p.Id = ph_edit.PostId AND ph_edit.PostHistoryTypeId IN (4, 5, 6)
+    LEFT JOIN PostHistory ph_reopen ON p.Id = ph_reopen.PostId AND ph_reopen.PostHistoryTypeId = 11
+    LEFT JOIN PostHistory ph_community ON p.Id = ph_community.PostId AND ph_community.PostHistoryTypeId = 16
+    LEFT JOIN PostHistory ph_text_change ON p.Id = ph_text_change.PostId AND ph_text_change.PostHistoryTypeId IN (2,5,8)
+    LEFT JOIN (
+        SELECT c_sub.PostId, AVG(c_sub.Score) AS AvgCommentScoreForPost
+        FROM Comments c_sub
+        GROUP BY c_sub.PostId
+    ) sub_comments ON p.Id = sub_comments.PostId
+    LEFT JOIN (
+        SELECT p_inner.Id AS pid, SUBSTRING(p_inner.Tags FROM 2 FOR (CHAR_LENGTH(p_inner.Tags) - 2)) AS tag_list
+        FROM Posts p_inner
+    ) sub_tags ON sub_tags.pid = p.Id
+    LEFT JOIN Tags t ON t.TagName IN (SELECT UNNEST(string_to_array(sub_tags.tag_list, '><'))) 
+    WHERE p.PostTypeId IN (1, 2)
+    GROUP BY
+        p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.LastEditDate, p.LastActivityDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.Title, p.Tags, p.ClosedDate, p.Body, sub_tags.tag_list
+),
+TopInfluentialPosters AS (
+    SELECT
+        ues.UserId,
+        ues.DisplayName,
+        ues.Reputation,
+        SUM(pda.PostScore) AS TotalQuestionsScore,
+        COUNT(pda.PostId) AS TotalQuestionsContributed,
+        AVG(EXTRACT(EPOCH FROM (pda.LastActivityDate - pda.PostCreationDate))) AS AvgPostActivityDurationSeconds,
+        RANK() OVER (ORDER BY SUM(pda.PostScore) DESC, COUNT(pda.PostId) DESC) AS ScoreRank,
+        NTH_VALUE(ues.DisplayName, 3) OVER (ORDER BY ues.Reputation DESC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS ThirdHighestRepDisplayName
+    FROM UserEngagementSummary ues
+    JOIN PostContentAndHistoryAnalysis pda ON ues.UserId = pda.OwnerUserId
+    WHERE pda.PostTypeId = 1
+    GROUP BY ues.UserId, ues.DisplayName, ues.Reputation
+    HAVING SUM(pda.PostScore) > 100
+)
+SELECT
+    ues.UserId,
+    ues.DisplayName,
+    ues.Reputation,
+    ues.TotalQuestionsOwned,
+    ues.TotalAnswersOwned,
+    ues.AverageOverallPostScore,
+    pda.PostId,
+    pda.Title AS PostTitle,
+    pda.FirstTag,
+    pda.TotalEditHistoryEntries,
+    pda.ReopenEventsCount,
+    pda.WasCommunityOwnedEver,
+    pda.PostCommentsAverageScore,
+    pda.AssociatedTagNames,
+    tip.TotalQuestionsScore AS InfluencerTotalQuestionsScore,
+    tip.ScoreRank AS InfluencerScoreRank,
+    ues.ReputationDecile,
+    pda.TitleCategory,
+    EXTRACT(DAY FROM (pda.NextPostCreationDate - pda.PrevPostCreationDate)) AS DaysBetweenUserPosts,
+    CASE
+        WHEN ues.TotalQuestionsOwned > 50 AND ues.TotalAnswersOwned > 100 AND ues.Reputation > 50000 THEN 'PowerUser'
+        WHEN ues.TotalQuestionsOwned = 0 AND ues.TotalAnswersOwned > 50 AND ues.Reputation > 10000 THEN 'DedicatedAnswerer'
+        WHEN ues.RecentGoldBadgesCount > 0 AND ues.AverageOverallPostScore > 10 AND ues.HasStrunkWhiteBeforeLastAccess THEN 'CuratorPlus'
+        ELSE 'Contributor'
+    END AS UserRoleCategory,
+    (ues.UserUpVotes - ues.UserDownVotes) * (ues.AverageOverallPostScore + COALESCE(pda.PostCommentsAverageScore, 0)) AS CustomEngagementMetric,
+    COALESCE(ues.Location, 'Unknown') || ' - ' || UPPER(SUBSTRING(ues.CoalescedWebsiteUrl FROM POSITION('//' IN ues.CoalescedWebsiteUrl) + 2 FOR 5)) AS CombinedLocationInfo,
+    NULLIF(pda.NonZeroPostViewCount, 0) AS PostEffectiveViewCount,
+    ues.DaysSinceUserCreation / NULLIF(ues.TotalQuestionsOwned + ues.TotalAnswersOwned, 0) AS AvgDaysPerPost,
+    pda.PostScore * (1 + pda.ReopenEventsCount * 0.5) * (CASE WHEN pda.WasCommunityOwnedEver = 1 THEN 0.8 ELSE 1 END) AS AdjustedPostScore
+FROM UserEngagementSummary ues
+INNER JOIN PostContentAndHistoryAnalysis pda ON ues.UserId = pda.OwnerUserId
+LEFT JOIN TopInfluentialPosters tip ON ues.UserId = tip.UserId
+WHERE
+    ues.Reputation > 10000
+    AND ues.DaysSinceUserCreation > 365 * 2
+    AND ues.TotalQuestionsOwned >= 5
+    AND ues.TotalAnswersOwned >= 10
+    AND pda.PostTypeId = 1
+    AND pda.PostScore >= 5
+    AND pda.ViewCount >= 1000
+    AND pda.TotalEditHistoryEntries >= 2
+    AND (LOWER(ues.Location) LIKE '%london%' OR ues.Location IS NULL)
+    AND NOT pda.ContainsExternalLinkInBody
+    AND ues.HasStrunkWhiteBeforeLastAccess
+    AND pda.CoalescedClosedDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year')
+    AND pda.RowNumByOwnerForRecency <= 5
+    AND ues.DisplayName IS NOT NULL
+ORDER BY
+    AdjustedPostScore DESC,
+    CustomEngagementMetric DESC,
+    ues.Reputation DESC
+LIMIT 1000;

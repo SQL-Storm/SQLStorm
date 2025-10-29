@@ -1,0 +1,73 @@
+SELECT
+  u.DisplayName AS UserName,
+  u.Reputation,
+  p.Id AS PostId,
+  p.Title,
+  p.Tags,
+  p.PostTypeId,
+  p.CreationDate,
+  p.LastActivityDate,
+  pv.CurrentScore,
+  pv.VoteTypeName,
+  c.CommentCountOnPost,
+  COALESCE(b.BadgeCount, 0) AS GoldBadgesOnUser,
+  b2.TagBadgeCount,
+  gd.LastEditorDisplayName,
+  gd.LastEditDate,
+  wl.LastLikeDate,
+  CASE
+    WHEN p.ViewCount IS NULL THEN 0
+    ELSE p.ViewCount
+  END AS ViewCount,
+  CASE
+    WHEN p.ParentId IS NULL THEN 'Root'
+    ELSE 'HasParent'
+  END AS PostHierarchy,
+  replace(replace(trim(both '>' FROM replace(p.Tags, '><', '>><')), '><', ','), '><', ',') AS TagList,
+  CASE
+    WHEN p.AcceptedAnswerId IS NOT NULL THEN p.AcceptedAnswerId
+    ELSE NULL
+  END AS AcceptedAnswerId
+FROM Posts p
+LEFT JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN (
+  SELECT PostId, SUM(COALESCE(V.Score,0)) AS CurrentScore, MAX(V.VoteTypeId) AS VoteTypeName
+  FROM Votes V
+  GROUP BY PostId
+) pv ON pv.PostId = p.Id
+LEFT JOIN (
+  SELECT PostId, COUNT(*) AS CommentCountOnPost
+  FROM Comments
+  GROUP BY PostId
+) c ON c.PostId = p.Id
+LEFT JOIN (
+  SELECT OwnerUserId, COUNT(*) AS BadgeCount
+  FROM Badges
+  WHERE Class = 1
+  GROUP BY OwnerUserId
+) b ON b.OwnerUserId = u.Id
+LEFT JOIN (
+  SELECT OwnerUserId, COUNT(*) AS TagBadgeCount
+  FROM Badges
+  WHERE COALESCE(TagBased, FALSE) = TRUE
+  GROUP BY OwnerUserId
+) b2 ON b2.OwnerUserId = u.Id
+LEFT JOIN (
+  SELECT Id, UserId, UserDisplayName AS LastEditorDisplayName, LastEditDate
+  FROM Posts
+  WHERE Id IS NOT NULL
+) gd ON gd.UserId = u.Id
+LEFT JOIN (
+  SELECT PostId, MAX(CreationDate) AS LastLikeDate
+  FROM Votes
+  WHERE VoteTypeId = 6
+  GROUP BY PostId
+) wl ON wl.PostId = p.Id
+WHERE
+  p.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '365' DAY)
+  AND (p.PostTypeId = 1 OR p.PostTypeId = 2)
+  AND (p.Tags LIKE '%<sql>%'
+       OR LOWER(p.Title) LIKE LOWER('%benchmark%'))
+ORDER BY
+  p.CreationDate DESC
+LIMIT 100;

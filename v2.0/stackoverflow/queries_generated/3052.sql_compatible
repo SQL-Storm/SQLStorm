@@ -1,0 +1,129 @@
+WITH
+    UserStats AS (
+        SELECT
+            u.Id,
+            u.DisplayName,
+            u.Reputation,
+            COALESCE(u.UpVotes, 0) - COALESCE(u.DownVotes, 0) AS NetVotes,
+            COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+            COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+            MAX(CASE WHEN p.PostTypeId = 1 THEN p.CreationDate END) AS LastQuestionDate,
+            MAX(CASE WHEN p.PostTypeId = 2 THEN p.CreationDate END) AS LastAnswerDate
+        FROM Users u
+        LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+        GROUP BY u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes
+    ),
+    BadgeAgg AS (
+        SELECT
+            b.UserId,
+            SUM(
+                CASE b.Class
+                    WHEN 1 THEN 3
+                    WHEN 2 THEN 2
+                    ELSE 1
+                END
+            ) AS BadgeScore,
+            STRING_AGG(DISTINCT b.Name, ', ') FILTER (WHERE b.Class = 1) AS GoldBadges,
+            STRING_AGG(DISTINCT b.Name, ', ') FILTER (WHERE b.Class = 2) AS SilverBadges,
+            STRING_AGG(DISTINCT b.Name, ', ') FILTER (WHERE b.Class = 3) AS BronzeBadges
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+    TopTags AS (
+        SELECT
+            p.OwnerUserId AS UserId,
+            UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2), '><')) AS Tag,
+            COUNT(*) AS TagUsage
+        FROM Posts p
+        WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+        GROUP BY p.OwnerUserId, Tag
+    ),
+    UserTopTag AS (
+        SELECT
+            t.UserId,
+            t.Tag,
+            t.TagUsage,
+            ROW_NUMBER() OVER (PARTITION BY t.UserId ORDER BY t.TagUsage DESC, t.Tag) AS rn
+        FROM TopTags t
+    ),
+    RecentVotes AS (
+        SELECT
+            v.PostId,
+            v.VoteTypeId,
+            v.CreationDate,
+            ROW_NUMBER() OVER (PARTITION BY v.PostId ORDER BY v.CreationDate DESC) AS rn
+        FROM Votes v
+        WHERE v.VoteTypeId IN (2, 3)
+    ),
+    RecentVoteAgg AS (
+        SELECT
+            p.OwnerUserId AS OwnerUserId,
+            SUM(CASE WHEN rv.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN rv.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Posts p
+        JOIN RecentVotes rv ON rv.PostId = p.Id AND rv.rn <= 5
+        GROUP BY p.OwnerUserId
+    ),
+    DuplicateStats AS (
+        SELECT
+            pl.PostId AS SourcePostId,
+            COUNT(*) FILTER (WHERE lt.Id = 3) AS DuplicateLinkCount,
+            COUNT(*) FILTER (WHERE lt.Id <> 3) AS DuplicateRelatedCount
+        FROM PostLinks pl
+        JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+        GROUP BY pl.PostId
+    ),
+    MainResults AS (
+        SELECT
+            us.Id,
+            us.DisplayName,
+            us.Reputation,
+            us.NetVotes,
+            us.QuestionCount,
+            us.AnswerCount,
+            us.LastQuestionDate,
+            us.LastAnswerDate,
+            COALESCE(ba.BadgeScore, 0) AS BadgeScore,
+            ba.GoldBadges,
+            ba.SilverBadges,
+            ba.BronzeBadges,
+            CASE WHEN utt.rn = 1 THEN utt.Tag END AS TopTag,
+            CASE WHEN utt.rn = 1 THEN utt.TagUsage END AS TopTagUsage,
+            COALESCE(rva.UpVotes, 0) AS RecentUpVotes,
+            COALESCE(rva.DownVotes, 0) AS RecentDownVotes,
+            COALESCE(ds.DuplicateLinkCount, 0) AS DuplicateLinkCount,
+            COALESCE(ds.DuplicateRelatedCount, 0) AS DuplicateRelatedCount
+        FROM UserStats us
+        LEFT JOIN BadgeAgg ba       ON ba.UserId = us.Id
+        LEFT JOIN UserTopTag utt    ON utt.UserId = us.Id AND utt.rn = 1
+        LEFT JOIN RecentVoteAgg rva ON rva.OwnerUserId = us.Id
+        LEFT JOIN DuplicateStats ds ON ds.SourcePostId = us.Id
+        WHERE us.Reputation > 1000
+    )
+SELECT *
+FROM MainResults
+ORDER BY Reputation DESC, BadgeScore DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    NULL AS Id,
+    NULL AS DisplayName,
+    NULL AS Reputation,
+    NULL AS NetVotes,
+    NULL AS QuestionCount,
+    NULL AS AnswerCount,
+    NULL AS LastQuestionDate,
+    NULL AS LastAnswerDate,
+    NULL AS BadgeScore,
+    NULL AS GoldBadges,
+    NULL AS SilverBadges,
+    NULL AS BronzeBadges,
+    NULL AS TopTag,
+    NULL AS TopTagUsage,
+    NULL AS RecentUpVotes,
+    NULL AS RecentDownVotes,
+    NULL AS DuplicateLinkCount,
+    NULL AS DuplicateRelatedCount
+ORDER BY Id NULLS LAST;

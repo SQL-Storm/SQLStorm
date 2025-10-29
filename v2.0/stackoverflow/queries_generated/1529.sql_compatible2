@@ -1,0 +1,148 @@
+WITH UserEngagementSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT p_q.Id) AS QuestionsPosted,
+        COUNT(DISTINCT p_a.Id) AS AnswersPosted,
+        SUM(COALESCE(p_q.Score, 0) + COALESCE(p_a.Score, 0)) AS TotalPostScoreReceived,
+        COUNT(DISTINCT c.Id) AS CommentsWritten,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesCast,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesCast,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        MAX(b.Date) AS LastBadgeDate,
+        LAG(u.LastAccessDate, 1, u.CreationDate) OVER (PARTITION BY u.Id ORDER BY u.LastAccessDate) AS PreviousAccessDate
+    FROM Users AS u
+    LEFT JOIN Posts AS p_q ON u.Id = p_q.OwnerUserId AND p_q.PostTypeId = 1
+    LEFT JOIN Posts AS p_a ON u.Id = p_a.OwnerUserId AND p_a.PostTypeId = 2
+    LEFT JOIN Comments AS c ON u.Id = c.UserId
+    LEFT JOIN Votes AS v ON u.Id = v.UserId
+    LEFT JOIN Badges AS b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.CreationDate, u.LastAccessDate
+),
+PostPerformanceStats AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId IN (2, 3)) AS TotalVotesReceived,
+        COUNT(DISTINCT comm.Id) AS TotalCommentsReceived,
+        COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+        EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate)) / 86400 AS PostAgeDays,
+        NTILE(10) OVER (ORDER BY p.ViewCount DESC) AS ViewCountDecile,
+        LAG(p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostCreationDate
+    FROM Posts AS p
+    LEFT JOIN Votes AS v ON p.Id = v.PostId
+    LEFT JOIN Comments AS comm ON p.Id = comm.PostId
+    GROUP BY p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.FavoriteCount
+),
+ComplexTagAnalysis AS (
+    SELECT
+        t.TagName,
+        COUNT(DISTINCT p.Id) AS QuestionsCount,
+        SUM(p.Score) AS TotalTagScore,
+        AVG(p.ViewCount) AS AvgTagViewCount,
+        COUNT(DISTINCT p.OwnerUserId) AS UniqueContributors,
+        RANK() OVER (ORDER BY SUM(p.Score) DESC, COUNT(DISTINCT p.Id) DESC) AS TagPopularityRank
+    FROM Posts AS p
+    CROSS JOIN LATERAL (
+        SELECT tag AS tag_name
+        FROM (
+            SELECT
+                -- remove leading and trailing <> then split by '><'
+                regexp_split_to_table(substring(p.Tags FROM 2 FOR (char_length(p.Tags) - 2)), '><') AS tag
+        ) s
+    ) AS tag_names
+    JOIN Tags AS t ON LOWER(t.TagName) = LOWER(tag_names.tag_name)
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND p.Tags <> ''
+    GROUP BY t.TagName
+    HAVING COUNT(DISTINCT p.Id) > 100
+),
+HistoryEventCounts AS (
+    SELECT
+        ph.PostId,
+        ph.UserId,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 12 THEN 1 ELSE 0 END) AS DeleteCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenCount,
+        COUNT(DISTINCT ph.PostHistoryTypeId) AS DistinctHistoryEvents
+    FROM PostHistory AS ph
+    WHERE ph.UserId IS NOT NULL
+    GROUP BY ph.PostId, ph.UserId
+)
+SELECT
+    ues.UserId,
+    ues.DisplayName,
+    ues.UserCreationDate,
+    ues.LastAccessDate,
+    ues.QuestionsPosted,
+    ues.AnswersPosted,
+    ues.TotalPostScoreReceived,
+    ues.CommentsWritten,
+    ues.UpVotesCast,
+    ues.DownVotesCast,
+    ues.TotalBadges,
+    ues.LastBadgeDate,
+    EXTRACT(DAY FROM (ues.LastAccessDate - ues.PreviousAccessDate)) AS DaysSinceLastAccess,
+    SUM(pps.PostScore) AS TotalPostsScoreAggregated,
+    AVG(pps.PostAgeDays) AS AveragePostAge,
+    MAX(pps.ViewCountDecile) AS MaxPostViewDecile,
+    COUNT(DISTINCT pps.PostId) AS TotalPostsWithPerformance,
+    STRING_AGG(DISTINCT cta.TagName, ', ') FILTER (WHERE cta.TagPopularityRank <= 50) AS Top50TagsContributed,
+    SUM(COALESCE(hec.EditCount, 0)) AS TotalEditsMadeByUsers,
+    SUM(COALESCE(hec.CloseCount, 0)) AS TotalCloseVotesMadeByUsers,
+    SUM(COALESCE(hec.DeleteCount, 0)) AS TotalDeleteVotesMadeByUsers,
+    SUM(COALESCE(hec.ReopenCount, 0)) AS TotalReopenVotesMadeByUsers,
+    RANK() OVER (ORDER BY
+        (ues.TotalPostScoreReceived * 0.5) +
+        (ues.QuestionsPosted * 0.2) +
+        (ues.AnswersPosted * 0.2) +
+        (ues.CommentsWritten * 0.1)
+        DESC
+    ) AS UserInfluenceRank,
+    (SELECT AVG(pps_sub.PostScore)
+     FROM PostPerformanceStats pps_sub
+     WHERE pps_sub.OwnerUserId = ues.UserId
+       AND pps_sub.PostTypeId = 2
+       AND pps_sub.PostCreationDate > ues.UserCreationDate + INTERVAL '1 year'
+    ) AS AvgAnswerScoreAfterFirstYear,
+    COALESCE(NULLIF(CAST(ues.UpVotesCast AS NUMERIC), 0) / NULLIF(CAST(ues.DownVotesCast AS NUMERIC), 0), 0) AS UpDownVoteRatio,
+    CASE
+        WHEN ues.QuestionsPosted > 100 AND ues.TotalPostScoreReceived > 1000 THEN 'Prodigious'
+        WHEN ues.QuestionsPosted > 50 AND ues.TotalPostScoreReceived > 500 THEN 'Active Contributor'
+        WHEN ues.TotalBadges > 10 AND ues.CommentsWritten > 50 THEN 'Engaged Member'
+        ELSE 'Casual User'
+    END AS UserCategory,
+    'User contributions processed on ' || TO_CHAR(TIMESTAMP '2024-10-01 12:34:56', 'YYYY-MM-DD HH24:MI:SS') AS QueryExecutionTimestamp
+FROM UserEngagementSummary AS ues
+LEFT JOIN PostPerformanceStats AS pps ON ues.UserId = pps.OwnerUserId
+LEFT JOIN Posts AS p_q_for_tags ON ues.UserId = p_q_for_tags.OwnerUserId AND p_q_for_tags.PostTypeId = 1
+LEFT JOIN ComplexTagAnalysis AS cta ON
+    cta.TagName = ANY(string_to_array(substring(p_q_for_tags.Tags, 2, char_length(p_q_for_tags.Tags)-2), '><'))
+LEFT JOIN HistoryEventCounts AS hec ON ues.UserId = hec.UserId AND pps.PostId = hec.PostId
+WHERE
+    ues.LastAccessDate >= ues.UserCreationDate + INTERVAL '6 months'
+    AND ues.DisplayName IS NOT NULL
+    AND ues.QuestionsPosted + ues.AnswersPosted > 0
+    AND NOT EXISTS (
+        SELECT 1
+        FROM Badges b_sub
+        WHERE b_sub.UserId = ues.UserId
+          AND b_sub.Class = 1
+          AND LOWER(b_sub.Name) LIKE LOWER('%suffrage%')
+    )
+GROUP BY
+    ues.UserId, ues.DisplayName, ues.UserCreationDate, ues.LastAccessDate, ues.QuestionsPosted,
+    ues.AnswersPosted, ues.TotalPostScoreReceived, ues.CommentsWritten, ues.UpVotesCast,
+    ues.DownVotesCast, ues.TotalBadges, ues.LastBadgeDate, ues.PreviousAccessDate
+HAVING
+    COUNT(DISTINCT p_q_for_tags.Id) > 0
+    AND SUM(COALESCE(hec.EditCount, 0)) >= 5
+    AND SUM(pps.TotalVotesReceived) > 10
+ORDER BY UserInfluenceRank ASC, TotalPostsScoreAggregated DESC
+LIMIT 100;

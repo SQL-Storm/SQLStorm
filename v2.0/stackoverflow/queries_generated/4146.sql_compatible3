@@ -1,0 +1,146 @@
+WITH RankedPostEdits AS (
+    SELECT
+        ph.PostId,
+        ph.UserId,
+        u.DisplayName AS EditorDisplayName,
+        ph.CreationDate AS EditDate,
+        ph.Comment AS EditComment,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    JOIN Users u ON ph.UserId = u.Id
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6)
+),
+PostEditStats AS (
+    SELECT
+        pe.PostId,
+        COUNT(DISTINCT pe.UserId) AS DistinctEditors,
+        AVG(EXTRACT(EPOCH FROM (pe.EditDate - LAG(pe.EditDate) OVER (PARTITION BY pe.PostId ORDER BY pe.EditDate))) / 60.0) AS AvgTimeBetweenEditsMinutes,
+        MAX(pe.EditDate) AS LastEditDate
+    FROM RankedPostEdits pe
+    GROUP BY pe.PostId
+),
+UserPostContribution AS (
+    SELECT
+        p.OwnerUserId,
+        COUNT(DISTINCT p.Id) AS PostsOwned,
+        SUM(p.Score) AS TotalScoreFromPosts,
+        SUM(p.ViewCount) AS TotalViewsOnPosts
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL AND p.OwnerUserId <> -1
+    GROUP BY p.OwnerUserId
+),
+UserCommentContribution AS (
+    SELECT
+        c.UserId,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        SUM(c.Score) AS TotalScoreFromComments
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+    GROUP BY c.UserId
+),
+UserVoteContribution AS (
+    SELECT
+        v.UserId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesGiven,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesGiven,
+        SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoritesGiven
+    FROM Votes v
+    WHERE v.UserId IS NOT NULL
+    GROUP BY v.UserId
+),
+FinalPostDetails AS (
+    SELECT
+        p.Id AS PostId,
+        pt.Name AS PostType,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        u.DisplayName AS OwnerDisplayName,
+        p.OwnerUserId,
+        COALESCE(pes.DistinctEditors, 0) AS NumberOfDistinctEditors,
+        COALESCE(pes.AvgTimeBetweenEditsMinutes, 0) AS AvgMinutesBetweenEdits,
+        COALESCE(upc.PostsOwned, 0) AS UserTotalPostsOwned,
+        COALESCE(upc.TotalScoreFromPosts, 0) AS UserTotalScoreFromPosts,
+        COALESCE(ucc.CommentsMade, 0) AS UserTotalCommentsMade,
+        COALESCE(uvc.UpVotesGiven, 0) AS UserTotalUpVotesGiven,
+        COALESCE(uvc.DownVotesGiven, 0) AS UserTotalDownVotesGiven,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS PostStatus,
+        CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned' ELSE 'User Owned' END AS OwnershipStatus,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        COALESCE(p.CommentCount, 0) AS CommentCount,
+        COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+        (
+            CASE
+                WHEN p.Tags IS NULL OR p.Tags = '' THEN ''
+                ELSE
+                    CASE
+                        WHEN POSITION('><' IN p.Tags) = 0 THEN TRIM(BOTH '<>' FROM p.Tags)
+                        ELSE
+                            -- find first delimiter
+                            (
+                                TRIM(BOTH '<>' FROM SUBSTRING(p.Tags FROM 2 FOR (POSITION('><' IN p.Tags) - 2)))
+                                ||
+                                CASE
+                                    WHEN POSITION('><' IN SUBSTRING(p.Tags FROM POSITION('><' IN p.Tags) + 2)) > 0 THEN
+                                        ', ' || TRIM(BOTH '<>' FROM SUBSTRING(
+                                            p.Tags
+                                            FROM POSITION('><' IN p.Tags) + 2 + POSITION('><' IN SUBSTRING(p.Tags FROM POSITION('><' IN p.Tags) + 2))
+                                            - (POSITION('><' IN SUBSTRING(p.Tags FROM POSITION('><' IN p.Tags) + 2)) - 1)
+                                            FOR POSITION('><' IN SUBSTRING(p.Tags FROM POSITION('><' IN p.Tags) + 2)) - 1
+                                        ))
+                                    WHEN POSITION('><' IN p.Tags) > 0 AND LENGTH(p.Tags) > POSITION('><' IN p.Tags) + 1 THEN
+                                        ', ' || TRIM(BOTH '<>' FROM SUBSTRING(p.Tags FROM POSITION('><' IN p.Tags) + 2 FOR (LENGTH(p.Tags) - (POSITION('><' IN p.Tags) + 1))))
+                                    ELSE
+                                        ''
+                                END
+                            )
+                    END
+            END
+        ) AS PrimaryTags
+    FROM Posts p
+    LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN PostEditStats pes ON p.Id = pes.PostId
+    LEFT JOIN UserPostContribution upc ON p.OwnerUserId = upc.OwnerUserId
+    LEFT JOIN UserCommentContribution ucc ON p.OwnerUserId = ucc.UserId
+    LEFT JOIN UserVoteContribution uvc ON p.OwnerUserId = uvc.UserId
+)
+SELECT
+    fpd.PostId,
+    fpd.PostType,
+    fpd.Title,
+    fpd.CreationDate,
+    fpd.Score,
+    fpd.ViewCount,
+    fpd.OwnerDisplayName,
+    fpd.OwnerUserId,
+    fpd.NumberOfDistinctEditors,
+    fpd.AvgMinutesBetweenEdits,
+    fpd.UserTotalPostsOwned,
+    fpd.UserTotalScoreFromPosts,
+    fpd.UserTotalCommentsMade,
+    fpd.UserTotalUpVotesGiven,
+    fpd.UserTotalDownVotesGiven,
+    fpd.PostStatus,
+    fpd.OwnershipStatus,
+    fpd.AnswerCount,
+    fpd.CommentCount,
+    fpd.FavoriteCount,
+    fpd.PrimaryTags,
+    CASE
+        WHEN fpd.Score > 100 AND fpd.AnswerCount > 5 AND fpd.NumberOfDistinctEditors > 3 THEN 'High Engagement Post'
+        WHEN fpd.Score < 0 AND fpd.AnswerCount = 0 AND fpd.PostStatus = 'Open' THEN 'Low Performing Post'
+        WHEN fpd.OwnershipStatus = 'Community Owned' AND fpd.CreationDate < (DATE '2024-10-01' - INTERVAL '5' YEAR) THEN 'Aged Community Wiki'
+        ELSE 'Standard Post'
+    END AS PerformanceCategory,
+    CASE
+        WHEN COALESCE(uvc.DownVotesGiven, 0) > COALESCE(uvc.UpVotesGiven, 0) * 2 AND COALESCE(uvc.DownVotesGiven, 0) > 10 THEN 'High Downvote Ratio'
+        ELSE 'Normal Vote Ratio'
+    END AS VotePattern
+FROM FinalPostDetails fpd
+LEFT JOIN UserVoteContribution uvc ON fpd.OwnerUserId = uvc.UserId
+WHERE fpd.PostType IN ('Question', 'Answer')
+  AND EXTRACT(YEAR FROM fpd.CreationDate) BETWEEN 2020 AND 2023
+ORDER BY fpd.Score DESC, fpd.ViewCount DESC
+LIMIT 1000;

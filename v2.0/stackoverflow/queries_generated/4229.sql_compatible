@@ -1,0 +1,175 @@
+WITH
+  QuestionMetrics AS (
+    SELECT
+      p.Id AS QuestionId,
+      p.Title AS QuestionTitle,
+      p.OwnerUserId,
+      p.CreationDate AS QuestionCreationDate,
+      p.Score AS QuestionScore,
+      p.AnswerCount,
+      p.ViewCount AS QuestionViewCount,
+      p.FavoriteCount AS QuestionFavoriteCount,
+      p.ClosedDate,
+      CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+      ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.CreationDate ASC) AS RankByScore,
+      AVG(CAST(c.Score AS DECIMAL(10, 2))) OVER (PARTITION BY p.Id) AS AvgCommentScoreForQuestion,
+      COUNT(a.Id) OVER (PARTITION BY p.Id) AS AnswerCountFromAnswersTable,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id) AS UpVoteCountForQuestion,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id) AS DownVoteCountForQuestion,
+      STRING_AGG(t.TagName, ', ' ORDER BY t.TagName) AS AllTags
+    FROM
+      Posts AS p
+    LEFT JOIN
+      Tags AS t
+      ON CAST(SUBSTRING(p.Tags, 2, CHARINDEX('>', p.Tags) - 2) AS INT) = t.Id
+    LEFT JOIN
+      Comments AS c
+      ON p.Id = c.PostId
+    LEFT JOIN
+      Posts AS a
+      ON p.Id = a.ParentId AND a.PostTypeId = 2
+    LEFT JOIN
+      Votes AS v
+      ON p.Id = v.PostId AND v.VoteTypeId IN (2, 3)
+    WHERE
+      p.PostTypeId = 1
+      AND p.CreationDate >= '2023-01-01'
+      AND p.OwnerUserId IS NOT NULL
+    GROUP BY
+      p.Id,
+      p.Title,
+      p.OwnerUserId,
+      p.CreationDate,
+      p.Score,
+      p.AnswerCount,
+      p.ViewCount,
+      p.FavoriteCount,
+      p.ClosedDate
+  ),
+  UserEngagement AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate AS UserCreationDate,
+      COUNT(DISTINCT p.Id) AS QuestionsAsked,
+      COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersGiven,
+      COUNT(DISTINCT b.Id) AS BadgesEarned,
+      MAX(p.LastActivityDate) AS LastActivityOnAnyPost,
+      SUM(p.Score) AS TotalScoreOfUserPosts,
+      AVG(CAST(p.AnswerCount AS DECIMAL(10, 2))) AS AvgAnswerCountForUserQuestions,
+      MAX(p.ViewCount) AS MaxViewCountForUserQuestions
+    FROM
+      Users AS u
+    LEFT JOIN
+      Posts AS p
+      ON u.Id = p.OwnerUserId
+    LEFT JOIN
+      Badges AS b
+      ON u.Id = b.UserId
+    WHERE
+      u.DisplayName IS NOT NULL
+      AND u.Reputation > 1000
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate
+  ),
+  HighQualityQuestions AS (
+    SELECT
+      qm.QuestionId,
+      qm.QuestionTitle,
+      qm.OwnerUserId,
+      qm.QuestionCreationDate,
+      qm.QuestionScore,
+      qm.AnswerCount,
+      qm.QuestionViewCount,
+      qm.QuestionFavoriteCount,
+      qm.IsClosed,
+      qm.AvgCommentScoreForQuestion,
+      qm.UpVoteCountForQuestion,
+      qm.DownVoteCountForQuestion,
+      qm.AllTags,
+      COALESCE(ue.DisplayName, 'Deleted User') AS OwnerDisplayName,
+      ue.Reputation AS OwnerReputation,
+      ue.UserCreationDate AS OwnerCreationDate,
+      ue.BadgesEarned AS OwnerBadgesEarned,
+      ue.QuestionsAsked AS OwnerQuestionsAsked,
+      ue.AnswersGiven AS OwnerAnswersGiven,
+      ue.LastActivityOnAnyPost AS OwnerLastActivity,
+      DENSE_RANK() OVER (ORDER BY qm.QuestionScore DESC) AS GlobalQuestionRankByScore,
+      LAG(qm.QuestionScore, 1, 0) OVER (ORDER BY qm.QuestionCreationDate) AS PreviousQuestionScore
+    FROM
+      QuestionMetrics AS qm
+    LEFT JOIN
+      UserEngagement AS ue
+      ON qm.OwnerUserId = ue.UserId
+    WHERE
+      qm.QuestionScore > 50
+      AND qm.AnswerCount > 2
+      AND qm.QuestionViewCount > 1000
+      AND qm.IsClosed = 0
+      AND qm.AvgCommentScoreForQuestion > 0
+  )
+SELECT
+  hq.QuestionId,
+  hq.QuestionTitle,
+  hq.OwnerDisplayName,
+  hq.OwnerReputation,
+  hq.OwnerCreationDate,
+  hq.QuestionCreationDate,
+  hq.QuestionScore,
+  hq.AnswerCount,
+  hq.QuestionViewCount,
+  hq.QuestionFavoriteCount,
+  hq.AllTags,
+  hq.GlobalQuestionRankByScore,
+  hq.PreviousQuestionScore,
+  hq.OwnerBadgesEarned,
+  hq.OwnerQuestionsAsked,
+  hq.OwnerAnswersGiven,
+  hq.OwnerLastActivity,
+  CASE
+    WHEN hq.OwnerReputation > 100000 THEN 'Legendary'
+    WHEN hq.OwnerReputation > 25000 THEN 'Expert'
+    WHEN hq.OwnerReputation > 5000 THEN 'Senior'
+    WHEN hq.OwnerReputation > 1000 THEN 'Experienced'
+    ELSE 'Novice'
+  END AS OwnerReputationTier,
+  UPPER(SUBSTRING(hq.QuestionTitle, 1, 3)) AS FirstThreeCharsTitleUpper,
+  (hq.QuestionScore + hq.QuestionFavoriteCount - hq.DownVoteCountForQuestion) * LOG(hq.QuestionViewCount + 1) AS EngagementScore,
+  COUNT(DISTINCT ph.Id) AS PostHistoryEventsForQuestion
+FROM
+  HighQualityQuestions AS hq
+LEFT JOIN
+  PostHistory AS ph
+  ON hq.QuestionId = ph.PostId
+  AND ph.PostHistoryTypeId BETWEEN 1 AND 25
+WHERE
+  hq.QuestionTitle LIKE '%performance%'
+  OR hq.AllTags LIKE '%performance%'
+GROUP BY
+  hq.QuestionId,
+  hq.QuestionTitle,
+  hq.OwnerDisplayName,
+  hq.OwnerReputation,
+  hq.OwnerCreationDate,
+  hq.QuestionCreationDate,
+  hq.QuestionScore,
+  hq.AnswerCount,
+  hq.QuestionViewCount,
+  hq.QuestionFavoriteCount,
+  hq.AllTags,
+  hq.GlobalQuestionRankByScore,
+  hq.PreviousQuestionScore,
+  hq.OwnerBadgesEarned,
+  hq.OwnerQuestionsAsked,
+  hq.OwnerAnswersGiven,
+  hq.OwnerLastActivity
+HAVING
+  COUNT(ph.Id) > 5
+ORDER BY
+  EngagementScore DESC,
+  hq.QuestionScore DESC
+LIMIT 100;

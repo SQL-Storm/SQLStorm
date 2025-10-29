@@ -1,0 +1,81 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.Title,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.OwnerUserId,
+        U.DisplayName,
+        U.Reputation,
+        U.LastAccessDate,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.ViewCount DESC) AS Rank,
+        CASE 
+            WHEN P.PostTypeId = 1 THEN 
+                (SELECT COUNT(*) FROM Posts AS P2 WHERE P2.ParentId = P.Id AND P2.PostTypeId = 2)
+            ELSE 0
+        END AS AnswerCount
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId IN (1, 2)
+),
+BadgeStats AS (
+    SELECT 
+        U.Id,
+        U.DisplayName,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(COALESCE(B.Class, 0)) AS BadgePoints
+    FROM 
+        Users U
+    LEFT JOIN 
+        Badges B ON U.Id = B.UserId
+    GROUP BY 
+        U.Id,
+        U.DisplayName
+),
+CommentMetrics AS (
+    SELECT 
+        P.Id AS PostId,
+        COUNT(C.Id) AS CommentCount,
+        COUNT(DISTINCT C.UserId) AS UniqueCommenters
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Comments C ON P.Id = C.PostId
+    GROUP BY 
+        P.Id
+)
+SELECT 
+    RP.Id AS PostId,
+    RP.Title,
+    RP.Score,
+    RP.ViewCount,
+    RP.Rank,
+    RP.AnswerCount,
+    B.TotalBadges,
+    B.BadgePoints,
+    CM.CommentCount,
+    CM.UniqueCommenters,
+    CASE 
+        WHEN RP.Score > 100 THEN 'High'
+        WHEN RP.Score BETWEEN 50 AND 100 THEN 'Medium'
+        ELSE 'Low'
+    END AS ScoreTier,
+    CASE 
+        WHEN RP.ViewCount > 1000 THEN 'Popular'
+        WHEN RP.ViewCount BETWEEN 500 AND 1000 THEN 'Moderate'
+        ELSE 'Less Popular'
+    END AS ViewTier
+FROM 
+    RankedPosts RP
+LEFT JOIN 
+    BadgeStats B ON RP.OwnerUserId = B.Id
+LEFT JOIN 
+    CommentMetrics CM ON RP.Id = CM.PostId
+WHERE 
+    RP.Rank <= 10
+ORDER BY 
+    RP.Score DESC, RP.ViewCount DESC;

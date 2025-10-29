@@ -1,0 +1,197 @@
+WITH
+RecentActivePosts AS (
+  SELECT
+    p.Id,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.Title,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.AcceptedAnswerId,
+    p.ParentId,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.Body,
+    p.LastEditorUserId,
+    p.LastEditDate
+  FROM Posts p
+  WHERE p.LastActivityDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP)) - INTERVAL '30 days'
+),
+TopTags AS (
+  SELECT
+    t.tagname AS TagName,
+    COUNT(*) AS TagPostCount,
+    AVG(p.Score) AS AvgScorePerTag,
+    MAX(p.ViewCount) AS MaxViewsForTag
+  FROM RecentActivePosts rap
+  CROSS JOIN LATERAL (
+    SELECT unnest_tag AS tagname
+    FROM (
+      SELECT unnest(string_to_array(rap.Tags, '>')) AS unnest_tag
+    ) u
+  ) t
+  JOIN Posts p ON p.Id = rap.Id
+  GROUP BY t.tagname
+),
+InfluenceMetrics AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.LastActivityDate,
+    COALESCE(u.Reputation, 0) AS AuthorReputation,
+    u.DisplayName AS AuthorName,
+    COALESCE(vt.Name, 'Unknown') AS LastVoteType,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id) AS TotalVotes,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCount
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+  WHERE p.LastActivityDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP)) - INTERVAL '45 days'
+),
+ComplexDerived AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Tags,
+    p.Score,
+    p.ViewCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.AcceptedAnswerId,
+    p.ParentId,
+    p.Body,
+    p.LastEditorUserId,
+    p.LastEditDate,
+    (CASE WHEN p.Score > 0 THEN 'Positive' WHEN p.Score < 0 THEN 'Negative' ELSE 'Neutral' END) AS ScoreMood,
+    (CASE
+       WHEN p.ViewCount > 1000 THEN 'Popular'
+       WHEN p.ViewCount > 100 AND p.ViewCount <= 1000 THEN 'Spotted'
+       ELSE 'New'
+     END) AS VisibilityTier,
+    (EXTRACT(EPOCH FROM ((CAST('2024-10-01 12:34:56' AS TIMESTAMP)) - p.CreationDate)) / 3600) AS HoursSinceCreation
+  FROM Posts p
+),
+JoinedStats AS (
+  SELECT
+    c.Id,
+    c.Title,
+    c.PostTypeId,
+    c.OwnerUserId,
+    c.CreationDate,
+    c.LastActivityDate,
+    c.Tags,
+    c.Score,
+    c.ViewCount,
+    c.CommentCount,
+    c.FavoriteCount,
+    c.AcceptedAnswerId,
+    c.ParentId,
+    c.Body,
+    c.LastEditorUserId,
+    c.LastEditDate,
+    c.ScoreMood,
+    c.VisibilityTier,
+    c.HoursSinceCreation,
+    COALESCE(id.TotalVotes, 0) AS TotalVotes,
+    COALESCE(ic.CommentCount, 0) AS CommentCount
+  FROM ComplexDerived c
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS TotalVotes
+    FROM Votes
+    GROUP BY PostId
+  ) id ON id.PostId = c.Id
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS CommentCount
+    FROM Comments
+    GROUP BY PostId
+  ) ic ON ic.PostId = c.Id
+)
+SELECT
+  p.Id AS PostId,
+  p.Title,
+  p.PostTypeId,
+  pt.Name AS PostTypeName,
+  p.OwnerUserId,
+  u.DisplayName AS OwnerDisplayName,
+  u.Reputation AS OwnerReputation,
+  p.CreationDate,
+  p.LastActivityDate,
+  p.Score,
+  p.ViewCount,
+  CASE
+    WHEN p.AcceptedAnswerId IS NOT NULL THEN 'HasAccepted'
+    ELSE 'NoAccepted'
+  END AS HasAcceptedAnswer,
+  p.Tags,
+  COALESCE(b.Name, 'None') AS BadgeEarned,
+  b.Date AS BadgeDate,
+  b.Class AS BadgeClass,
+  COALESCE(vm.TotalVotes, 0) AS TotalVotes,
+  COALESCE(ic.CommentCount, 0) AS TotalComments,
+  vm_vt.Name AS LastVoteType,
+  tgs1.TagName,
+  tgs1.TagPostCount,
+  tgs1.AvgScorePerTag,
+  tgs1.MaxViewsForTag,
+  rf.HoursSinceCreation,
+  rf.ScoreMood,
+  rf.VisibilityTier
+FROM Posts p
+LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+LEFT JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN LATERAL (
+  SELECT b2.UserId, b2.Name, b2.Date, b2.Class
+  FROM Badges b2
+  WHERE b2.UserId = p.OwnerUserId
+  ORDER BY b2.Date DESC
+  LIMIT 1
+) b ON b.UserId = p.OwnerUserId
+LEFT JOIN (
+  SELECT PostId, COUNT(*) AS TotalVotes, SUM(CASE WHEN VoteTypeId = 1 THEN 1 ELSE 0 END) AS PositiveVotes, MAX(VoteTypeId) AS LastVoteTypeId
+  FROM Votes
+  GROUP BY PostId
+) vm ON vm.PostId = p.Id
+LEFT JOIN VoteTypes vt_last ON vt_last.Id = vm.LastVoteTypeId
+LEFT JOIN (
+  SELECT PostId, unnest_tags AS TagName
+  FROM (
+    SELECT p2.Id AS PostId, unnest(string_to_array(p2.Tags, '>')) AS unnest_tags
+    FROM Posts p2
+  ) sub
+) tgs ON tgs.PostId = p.Id
+LEFT JOIN (
+  SELECT TagName, COUNT(*) AS TagPostCount, AVG(Score) AS AvgScorePerTag, MAX(ViewCount) AS MaxViewsForTag
+  FROM (
+    SELECT p3.Id, unnest(string_to_array(p3.Tags, '>')) AS TagName, p3.Score, p3.ViewCount
+    FROM Posts p3
+  ) sub2
+  GROUP BY TagName
+) tgs1 ON tgs1.TagName = (
+  SELECT unnest_tag FROM (
+    SELECT unnest(string_to_array(p.Tags, '>')) AS unnest_tag
+  ) s LIMIT 1
+)
+LEFT JOIN (
+  SELECT c.Id AS PostId, c.HoursSinceCreation, c.ScoreMood, c.VisibilityTier
+  FROM ComplexDerived c
+) rf ON rf.PostId = p.Id
+LEFT JOIN (
+  SELECT PostId, COUNT(*) AS CommentCount
+  FROM Comments
+  GROUP BY PostId
+) ic ON ic.PostId = p.Id
+LEFT JOIN VoteTypes vm_vt ON vm_vt.Id = vm.LastVoteTypeId
+LEFT JOIN LATERAL (SELECT vm_vt.Name AS LastVoteType) vm_last ON TRUE
+ORDER BY p.LastActivityDate DESC
+LIMIT 100;

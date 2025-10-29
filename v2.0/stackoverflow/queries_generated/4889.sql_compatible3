@@ -1,0 +1,149 @@
+WITH
+  RankedPostEdits AS (
+    SELECT
+      ph.PostId,
+      ph.UserId,
+      ph.CreationDate,
+      ph.PostHistoryTypeId,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM
+      PostHistory ph
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6)
+  ),
+  LatestPostInfo AS (
+    SELECT
+      p.Id AS PostId,
+      p.OwnerUserId,
+      p.Title,
+      p.Tags,
+      p.CreationDate AS PostCreationDate,
+      MAX(p.LastActivityDate) AS LatestActivityDate
+    FROM
+      Posts p
+    GROUP BY
+      p.Id,
+      p.OwnerUserId,
+      p.Title,
+      p.Tags,
+      p.CreationDate
+  ),
+  UserContributions AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+      COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+      SUM(COALESCE(v.VoteTypeId, 0)) AS TotalVotesCast,
+      u.Reputation
+    FROM
+      Users u
+    LEFT JOIN
+      Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+      Votes v ON u.Id = v.UserId
+    WHERE
+      u.Reputation > 1000
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation
+  ),
+  PostEditDetails AS (
+    SELECT
+      lpe.PostId,
+      lpe.UserId AS EditorUserId,
+      lpe.CreationDate AS EditDate,
+      u.DisplayName AS EditorDisplayName,
+      CASE
+        WHEN lpe.PostHistoryTypeId = 4 THEN 'Title Edit'
+        WHEN lpe.PostHistoryTypeId = 5 THEN 'Body Edit'
+        WHEN lpe.PostHistoryTypeId = 6 THEN 'Tags Edit'
+        ELSE 'Unknown Edit'
+      END AS EditType,
+      lpe.rn
+    FROM
+      RankedPostEdits lpe
+    JOIN
+      Users u ON lpe.UserId = u.Id
+    WHERE
+      lpe.rn = 1
+  )
+SELECT
+  lpi.PostId,
+  lpi.Title,
+  lpe.EditType,
+  lpe.EditDate,
+  lpe.EditorDisplayName,
+  lpi.OwnerUserId,
+  uc.DisplayName AS OwnerDisplayName,
+  uc.QuestionCount,
+  uc.AnswerCount,
+  uc.TotalVotesCast,
+  CASE
+    WHEN lpi.LatestActivityDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30' DAY THEN 'Recent Activity'
+    WHEN lpi.PostCreationDate < CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365' DAY THEN 'Old Post'
+    ELSE 'Mid-Age Post'
+  END AS PostAgeCategory,
+  COALESCE(p.Score, 0) AS PostScore,
+  COALESCE(p.AnswerCount, 0) AS NumberOfAnswers,
+  CASE WHEN p.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS PostStatus,
+  CONCAT(
+    SUBSTRING(lpi.Tags FROM 2 FOR (POSITION('>' IN lpi.Tags) - 2)),
+    ', ',
+    SUBSTRING(
+      lpi.Tags
+      FROM (POSITION('>' IN lpi.Tags) + 2)
+      FOR (
+        (POSITION('><' IN (lpi.Tags || ' '), (POSITION('>' IN lpi.Tags) + 2))) - (POSITION('>' IN lpi.Tags) + 2)
+      )
+    )
+  ) AS FirstTwoTags
+FROM
+  LatestPostInfo lpi
+JOIN
+  PostEditDetails lpe ON lpi.PostId = lpe.PostId
+LEFT JOIN
+  UserContributions uc ON lpi.OwnerUserId = uc.UserId
+LEFT JOIN
+  Posts p ON lpi.PostId = p.Id
+WHERE
+  lpi.Title IS NOT NULL
+  AND uc.Reputation > 5000
+  AND (
+    uc.AnswerCount > 10
+    OR uc.QuestionCount > 5
+  )
+  AND EXISTS (
+    SELECT
+      1
+    FROM
+      Comments c
+    WHERE
+      c.PostId = lpi.PostId
+      AND c.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '7' DAY
+      AND CHAR_LENGTH(c.Text) > 50
+  )
+GROUP BY
+  lpi.PostId,
+  lpi.Title,
+  lpe.EditType,
+  lpe.EditDate,
+  lpe.EditorDisplayName,
+  lpi.OwnerUserId,
+  uc.DisplayName,
+  uc.QuestionCount,
+  uc.AnswerCount,
+  uc.TotalVotesCast,
+  lpi.LatestActivityDate,
+  lpi.PostCreationDate,
+  p.Score,
+  p.AnswerCount,
+  p.ClosedDate,
+  lpi.Tags,
+  p.Id,
+  uc.Reputation,
+  lpe.rn
+ORDER BY
+  lpe.EditDate DESC
+LIMIT 100;

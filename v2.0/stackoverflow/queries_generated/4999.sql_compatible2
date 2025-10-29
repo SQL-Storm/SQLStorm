@@ -1,0 +1,141 @@
+WITH RankedPostEdits AS (
+    SELECT
+        ph.PostId,
+        ph.UserId,
+        u.DisplayName AS EditorDisplayName,
+        ph.CreationDate AS EditDate,
+        ROW_NUMBER() OVER(PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) as rn
+    FROM PostHistory ph
+    JOIN Users u ON ph.UserId = u.Id
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6)
+),
+PostContributions AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        p.CreationDate,
+        p.Score,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+        CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN 1 ELSE 0 END AS IsCommunityOwned,
+        REPLACE(REPLACE(p.Tags, '<', ''), '>', '') AS RawTags
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+),
+SplitTags AS (
+    SELECT
+        pc.PostId,
+        NULLIF(BTRIM(SUBSTRING(pc.RawTags FROM 1 FOR CASE WHEN POSITION(' ' IN pc.RawTags) = 0 THEN CHAR_LENGTH(pc.RawTags) ELSE POSITION(' ' IN pc.RawTags)-1 END)), '') AS tag,
+        CASE WHEN POSITION(' ' IN pc.RawTags) = 0 THEN '' ELSE BTRIM(SUBSTRING(pc.RawTags FROM POSITION(' ' IN pc.RawTags)+1)) END AS rest
+    FROM PostContributions pc
+    WHERE pc.RawTags IS NOT NULL AND pc.RawTags <> ''
+    UNION ALL
+    SELECT
+        st.PostId,
+        NULLIF(BTRIM(SUBSTRING(st.rest FROM 1 FOR CASE WHEN POSITION(' ' IN st.rest) = 0 THEN CHAR_LENGTH(st.rest) ELSE POSITION(' ' IN st.rest)-1 END)), '') AS tag,
+        CASE WHEN POSITION(' ' IN st.rest) = 0 THEN '' ELSE BTRIM(SUBSTRING(st.rest FROM POSITION(' ' IN st.rest)+1)) END AS rest
+    FROM SplitTags st
+    WHERE st.rest IS NOT NULL AND st.rest <> ''
+),
+TagContributionSummary_Final AS (
+    SELECT
+        pc.PostId,
+        pc.OwnerUserId,
+        pc.OwnerDisplayName,
+        pc.CreationDate,
+        pc.Score,
+        pc.AnswerCount,
+        pc.CommentCount,
+        pc.FavoriteCount,
+        pc.IsClosed,
+        pc.IsCommunityOwned,
+        st.tag AS TagName,
+        ROW_NUMBER() OVER(PARTITION BY pc.PostId, st.tag ORDER BY pc.CreationDate DESC) as rn_tag
+    FROM PostContributions pc
+    JOIN SplitTags st ON pc.PostId = st.PostId
+    WHERE st.tag IS NOT NULL AND st.tag <> ''
+),
+TopEditorsPerPost AS (
+    SELECT
+        rpe.PostId,
+        rpe.UserId AS EditorUserId,
+        rpe.EditorDisplayName,
+        rpe.EditDate,
+        rpe.rn
+    FROM RankedPostEdits rpe
+    WHERE rpe.rn <= 3
+),
+PostVoteCounts AS (
+    SELECT
+        PostId,
+        SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        SUM(CASE WHEN VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoriteVotes,
+        SUM(CASE WHEN VoteTypeId = 8 THEN 1 ELSE 0 END) AS BountyStartVotes
+    FROM Votes
+    WHERE VoteTypeId IN (2, 3, 5, 8)
+    GROUP BY PostId
+)
+SELECT
+    pc.PostId,
+    pc.OwnerDisplayName,
+    pc.CreationDate,
+    pc.Score,
+    pc.AnswerCount,
+    pc.CommentCount,
+    pc.FavoriteCount,
+    pc.IsClosed,
+    pc.IsCommunityOwned,
+    pc.TagName,
+    COALESCE(pvc.UpVotes, 0) AS TotalUpVotes,
+    COALESCE(pvc.DownVotes, 0) AS TotalDownVotes,
+    COALESCE(pvc.FavoriteVotes, 0) AS TotalFavoriteVotes,
+    COALESCE(pvc.BountyStartVotes, 0) AS TotalBountyStartVotes,
+    CASE
+        WHEN tepp.EditorUserId IS NOT NULL THEN 'Edited'
+        ELSE 'Not Edited'
+    END AS EditStatus,
+    tepp.EditorDisplayName AS LatestEditor,
+    CAST(EXTRACT(DAY FROM (TIMESTAMP '2024-10-01 12:34:56' - pc.CreationDate)) AS INTEGER) AS DaysSinceCreation,
+    CHAR_LENGTH(pc.OwnerDisplayName) AS OwnerNameLength,
+    REPLACE(pc.OwnerDisplayName, ' ', '_') AS OwnerNameWithUnderscores,
+    CASE
+        WHEN pc.Score > 1000 THEN 'HighScore'
+        WHEN pc.Score BETWEEN 100 AND 1000 THEN 'MediumScore'
+        ELSE 'LowScore'
+    END AS ScoreCategory
+FROM TagContributionSummary_Final pc
+LEFT JOIN PostVoteCounts pvc ON pc.PostId = pvc.PostId
+LEFT JOIN TopEditorsPerPost tepp ON pc.PostId = tepp.PostId
+WHERE pc.rn_tag = 1
+
+UNION ALL
+
+SELECT
+    NULL AS PostId,
+    NULL AS OwnerDisplayName,
+    MIN(pc.CreationDate) AS CreationDate,
+    AVG(pc.Score) AS Score,
+    SUM(pc.AnswerCount) AS AnswerCount,
+    SUM(pc.CommentCount) AS CommentCount,
+    SUM(pc.FavoriteCount) AS FavoriteCount,
+    SUM(pc.IsClosed) AS IsClosed,
+    SUM(pc.IsCommunityOwned) AS IsCommunityOwned,
+    NULL AS TagName,
+    SUM(COALESCE(pvc.UpVotes, 0)) AS TotalUpVotes,
+    SUM(COALESCE(pvc.DownVotes, 0)) AS TotalDownVotes,
+    SUM(COALESCE(pvc.FavoriteVotes, 0)) AS TotalFavoriteVotes,
+    SUM(COALESCE(pvc.BountyStartVotes, 0)) AS TotalBountyStartVotes,
+    NULL AS EditStatus,
+    NULL AS LatestEditor,
+    AVG(CAST(EXTRACT(DAY FROM (TIMESTAMP '2024-10-01 12:34:56' - pc.CreationDate)) AS INTEGER)) AS AverageDaysSinceCreation,
+    AVG(CHAR_LENGTH(pc.OwnerDisplayName)) AS AverageOwnerNameLength,
+    NULL AS OwnerNameWithUnderscores,
+    NULL AS ScoreCategory
+FROM TagContributionSummary_Final pc
+LEFT JOIN PostVoteCounts pvc ON pc.PostId = pvc.PostId
+WHERE pc.rn_tag = 1;

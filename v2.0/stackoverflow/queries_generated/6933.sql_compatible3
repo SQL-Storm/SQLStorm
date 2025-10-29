@@ -1,0 +1,78 @@
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 3 THEN p.Id END) AS TotalWikis,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.PostId END) AS TotalUpVotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.PostId END) AS TotalDownVotes,
+    MAX(p.Score) AS HighestScoredPost,
+    COALESCE(MAX(p.ViewCount), 0) AS ViewCount,
+    MAX(ph.CreationDate) AS LastEdited,
+    MIN(p.CreationDate) AS FirstPost,
+    MAX(p.LastActivityDate) AS LastActivity,
+    b2.Name AS LatestBadge,
+    b2.Date AS BadgeDate,
+    tmost.TagName AS MostFrequentTag,
+    tmost.TagCount AS TagCount
+FROM 
+    Users u
+LEFT JOIN 
+    (SELECT 
+         ph.PostId,
+         ph.CreationDate,
+         ph.UserId,
+         ph.Comment
+     FROM 
+         PostHistory ph
+     WHERE 
+         ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 13, 14, 15, 19, 20, 35)
+    ) ph ON u.Id = ph.UserId
+LEFT JOIN 
+    Posts p ON ph.PostId = p.Id
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    (
+      SELECT b1.UserId, b1.Id, b1.Name, b1.Date, b1.Class
+      FROM Badges b1
+      JOIN (
+        SELECT UserId, MAX(Date) AS MaxDate
+        FROM Badges
+        WHERE Class = 1
+        GROUP BY UserId
+      ) bmax ON b1.UserId = bmax.UserId AND b1.Date = bmax.MaxDate
+      WHERE b1.Class = 1
+    ) b2 ON u.Id = b2.UserId
+LEFT JOIN 
+    (
+      SELECT ptm.UserId AS UserId, t.Name AS TagName, COUNT(*) AS TagCount
+      FROM PostTagMapping ptm
+      JOIN Posts p2 ON ptm.PostId = p2.Id
+      JOIN Tags t ON ptm.TagId = t.Id
+      JOIN (
+        SELECT OwnerUserId AS UserId
+        FROM Posts
+        WHERE OwnerUserId IS NOT NULL
+        GROUP BY OwnerUserId
+      ) users_posts ON users_posts.UserId = p2.OwnerUserId
+      GROUP BY ptm.UserId, t.Name
+    ) tmost ON u.Id = tmost.UserId
+GROUP BY 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    b2.Name,
+    b2.Date,
+    tmost.TagName,
+    tmost.TagCount
+HAVING 
+    u.Reputation > 1000
+ORDER BY 
+    TotalPosts DESC, 
+    HighestScoredPost DESC;

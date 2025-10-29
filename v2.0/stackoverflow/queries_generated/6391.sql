@@ -1,0 +1,47 @@
+-- {"query": "6391.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-micro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 545} 
+
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN pt.Name = 'Question' THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN pt.Name = 'Answer' THEN 1 ELSE 0 END) AS TotalAnswers,
+    COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN p.Id END) AS TotalDuplicates,
+    MAX(p.Score) AS HighestScoredPost,
+    MIN(p.CreationDate) AS FirstPostDate,
+    MAX(p.LastActivityDate) AS LastActivityDate,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) AS LastClosedPost,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.CreationDate END) AS LastReopenedPost,
+    COUNT(DISTINCT CASE WHEN b.TagBased = 0 THEN t.TagName END) AS TotalNonTagBasedBadges,
+    COUNT(DISTINCT CASE WHEN b.TagBased = 1 THEN t.TagName END) AS TotalTagBasedBadges,
+    STRING_AGG(DISTINCT CASE WHEN pl.LinkTypeId = 1 THEN pl.RelatedPostId ELSE NULL END, ', ') AS LinkedPosts,
+    STRING_AGG(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN pl.RelatedPostId ELSE NULL END, ', ') AS DuplicatePosts
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    PostTypes pt ON p.PostTypeId = pt.Id
+LEFT JOIN 
+    PostLinks pl ON p.Id = pl.PostId
+LEFT JOIN 
+    LinkTypes lt ON pl.LinkTypeId = lt.Id
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    Tags t ON b.TagBased = t.IsTagBased
+WHERE 
+    u.Id IN (
+        SELECT UserId 
+        FROM Votes 
+        WHERE VoteTypeId IN (1, 2, 3) 
+        GROUP BY UserId 
+        HAVING COUNT(DISTINCT PostId) > 10
+    )
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation, u.Location
+ORDER BY 
+    u.Reputation DESC;

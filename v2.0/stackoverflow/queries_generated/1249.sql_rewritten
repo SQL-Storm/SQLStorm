@@ -1,0 +1,292 @@
+-- {"query": "1249.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3975} 
+WITH UserBase AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        EXTRACT(DAY FROM (cast('2024-10-01 12:34:56' as timestamp) - u.CreationDate)) AS AccountAgeDays,
+        COALESCE(u.WebsiteUrl, 'N/A') AS UserWebsiteUrl,
+        CASE
+            WHEN u.Location IS NULL THEN 'Unknown'
+            WHEN u.Location LIKE '%United States%' OR u.Location LIKE '%USA%' THEN 'USA_Based'
+            ELSE 'International'
+        END AS UserLocationCategory,
+        u.UpVotes,
+        u.DownVotes,
+        CAST(u.UpVotes AS NUMERIC) / NULLIF((u.UpVotes + u.DownVotes), 0) AS UpVoteRatio,
+        u.Views AS UserProfileViews
+    FROM Users u
+    WHERE u.Reputation > 100
+),
+PostEngagement AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount AS PostViewCount,
+        p.OwnerUserId,
+        p.LastActivityDate,
+        p.LastEditDate,
+        p.AnswerCount,
+        p.CommentCount AS PostCommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.ParentId,
+        p.AcceptedAnswerId,
+        p.Title,
+        p.Tags,
+        (SELECT COUNT(c.Id) FROM Comments c WHERE c.PostId = p.Id) AS TotalCommentsOnPost,
+        (SELECT SUM(v.BountyAmount) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 8) AS TotalBountyAmount,
+        ARRAY_LENGTH(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><'), 1) AS TagCount,
+        p.CommunityOwnedDate IS NOT NULL AS IsCommunityWiki
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '3 years' -- Filter for more recent activity
+      AND p.ViewCount > 50
+      AND p.OwnerUserId IS NOT NULL
+),
+PostHistoryMetrics AS (
+    SELECT
+        ph.PostId,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN 1 END) AS TotalEdits,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 END) AS CloseEvents,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 END) AS ReopenEvents,
+        COUNT(DISTINCT ph.UserId) AS UniqueEditors,
+        MAX(ph.CreationDate) AS LastHistoryEventDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 AND ph.Comment IS NOT NULL THEN ph.Comment END) AS LastCloseReasonComment,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 AND ph.Text LIKE '%OriginalQuestionIds%' THEN TRUE ELSE FALSE END) AS WasClosedAsDuplicate
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+),
+BadgeAchievements AS (
+    SELECT
+        b.UserId,
+        COUNT(b.Id) AS TotalBadges,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserPostStats AS (
+    SELECT
+        pe.OwnerUserId AS UserId,
+        COUNT(pe.PostId) AS TotalPostsOwned,
+        COUNT(CASE WHEN pe.PostTypeId = 1 THEN 1 END) AS TotalQuestionsOwned,
+        COUNT(CASE WHEN pe.PostTypeId = 2 THEN 1 END) AS TotalAnswersOwned,
+        AVG(pe.PostScore) AS AvgPostScore,
+        SUM(pe.TotalCommentsOnPost) AS TotalCommentsOnOwnedPosts,
+        MAX(pe.LastActivityDate) AS LastPostActivityDate,
+        SUM(pe.PostViewCount) AS TotalOwnedPostViews,
+        -- Window function example: Rank users by their average post score for a given post type
+        RANK() OVER (PARTITION BY pe.PostTypeId ORDER BY AVG(pe.PostScore) DESC) AS PostTypeScoreRank
+    FROM PostEngagement pe
+    GROUP BY pe.OwnerUserId
+),
+TrendingPostsRaw AS ( -- Intermediate CTE for trending posts before user-level aggregation
+    SELECT
+        pe.PostId,
+        pe.PostTypeId,
+        pe.Title,
+        pe.PostScore,
+        pe.ViewCount AS PostViewCount,
+        pe.OwnerUserId,
+        phm.TotalEdits,
+        phm.CloseEvents,
+        phm.ReopenEvents,
+        (pe.PostScore * 0.5) + (pe.PostViewCount * 0.2) + (pe.TotalCommentsOnPost * 0.3) AS TrendScore,
+        -- Calculate the percentage of edits relative to post age in days
+        CAST(COALESCE(phm.TotalEdits, 0) AS NUMERIC) / NULLIF(EXTRACT(DAY FROM (cast('2024-10-01 12:34:56' as timestamp) - pe.PostCreationDate)), 0) AS EditsPerDayRatio,
+        LEAD(pe.LastActivityDate, 1) OVER (PARTITION BY pe.OwnerUserId ORDER BY pe.LastActivityDate) AS NextPostActivityDate
+    FROM PostEngagement pe
+    LEFT JOIN PostHistoryMetrics phm ON pe.PostId = phm.PostId
+    WHERE pe.PostTypeId IN (1,2) -- Questions and Answers
+      AND pe.PostScore > 10
+      AND pe.PostCreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year' -- Very recent posts for trend analysis
+),
+UserTrendingPostStats AS (
+    SELECT
+        tp.OwnerUserId AS UserId,
+        AVG(tp.EditsPerDayRatio) AS AvgTrendingPostEditsPerDay,
+        COUNT(tp.PostId) AS CountTrendingPosts
+    FROM TrendingPostsRaw tp
+    GROUP BY tp.OwnerUserId
+),
+LinkedPostUsers AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(pl.Id) AS TotalLinkedPosts,
+        SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS TotalDuplicateLinks
+    FROM Posts p
+    JOIN PostLinks pl ON p.Id = pl.PostId OR p.Id = pl.RelatedPostId
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+UserPostHistoryAgg AS (
+    SELECT
+        pe.OwnerUserId AS UserId,
+        SUM(COALESCE(phm.TotalEdits, 0)) AS UserTotalEdits,
+        SUM(COALESCE(phm.CloseEvents, 0)) AS UserCloseEvents,
+        SUM(COALESCE(phm.ReopenEvents, 0)) AS UserReopenEvents,
+        MAX(COALESCE(phm.WasClosedAsDuplicate, FALSE)) AS UserHadDuplicatePost
+    FROM PostEngagement pe
+    LEFT JOIN PostHistoryMetrics phm ON pe.PostId = phm.PostId
+    WHERE pe.OwnerUserId IS NOT NULL
+    GROUP BY pe.OwnerUserId
+),
+UserMostRecentAcceptedAnswer AS (
+    SELECT DISTINCT ON (pe.OwnerUserId)
+        pe.OwnerUserId AS UserId,
+        pe.AcceptedAnswerId AS MostRecentAcceptedAnswerId
+    FROM PostEngagement pe
+    WHERE pe.PostTypeId = 1
+      AND pe.AcceptedAnswerId IS NOT NULL
+      AND pe.OwnerUserId IS NOT NULL
+    ORDER BY pe.OwnerUserId, pe.PostCreationDate DESC
+),
+UserTagsSummary AS (
+    SELECT
+        ub.UserId,
+        SUBSTRING(
+            (SELECT STRING_AGG(DISTINCT t.TagName, ', ')
+             FROM PostEngagement pe_tags
+             CROSS JOIN LATERAL (
+                 SELECT unnest(string_to_array(SUBSTRING(pe_tags.Tags, 2, LENGTH(pe_tags.Tags) - 2), '><')) AS TagName
+             ) AS split_tags
+             JOIN Tags t ON split_tags.TagName = t.TagName
+             WHERE pe_tags.OwnerUserId = ub.UserId
+               AND pe_tags.Tags IS NOT NULL
+             ORDER BY pe_tags.PostScore DESC
+             LIMIT 5), 1, 100
+        ) AS TopPostTagsSummary
+    FROM UserBase ub
+    WHERE EXISTS (SELECT 1 FROM PostEngagement pe_exists WHERE pe_exists.OwnerUserId = ub.UserId AND pe_exists.Tags IS NOT NULL)
+)
+-- Branch 1: Highly Active Answerers with Significant Post History
+SELECT
+    ub.UserId,
+    ub.DisplayName,
+    ub.Reputation,
+    ub.AccountAgeDays,
+    ub.UserLocationCategory,
+    ub.UpVoteRatio,
+    COALESCE(ups.TotalPostsOwned, 0) AS TotalPostsOwned,
+    COALESCE(ups.TotalQuestionsOwned, 0) AS TotalQuestionsOwned,
+    COALESCE(ups.TotalAnswersOwned, 0) AS TotalAnswersOwned,
+    COALESCE(ba.GoldBadges, 0) AS GoldBadgesCount,
+    COALESCE(ba.SilverBadges, 0) AS SilverBadgesCount,
+    COALESCE(ba.BronzeBadges, 0) AS BronzeBadgesCount,
+    pe_aa.PostScore AS ScoreOfMostRecentAcceptedAnswer,
+    DENSE_RANK() OVER (ORDER BY ub.Reputation DESC, ub.AccountAgeDays ASC) AS GlobalReputationRank,
+    COALESCE(utps.AvgTrendingPostEditsPerDay, 0) AS AvgTrendingPostEditsPerDay,
+    CASE WHEN COALESCE(uph.UserCloseEvents, 0) > 0 THEN 'Closed' ELSE 'Open' END AS HasClosedPost,
+    COALESCE(lpu.TotalLinkedPosts, 0) AS UserLinkedPostsCount,
+    COALESCE(lpu.TotalDuplicateLinks, 0) AS UserDuplicateLinksCount,
+    (
+        CASE
+            WHEN COALESCE(ba.GoldBadges, 0) > 0
+             AND ub.Reputation > (SELECT AVG(Reputation) * 5 FROM Users)
+             AND ub.LastAccessDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days' THEN 'High_Impact_Active_User'
+            WHEN COALESCE(ba.SilverBadges, 0) > 0
+             AND ub.Reputation > (SELECT AVG(Reputation) * 2 FROM Users) THEN 'Mid_Impact_User'
+            ELSE 'Regular_User'
+        END
+    ) AS UserImpactCategory,
+    uts.TopPostTagsSummary,
+    'ActiveAnswerer' AS UserCategory
+FROM UserBase ub
+LEFT JOIN UserPostStats ups ON ub.UserId = ups.UserId
+LEFT JOIN BadgeAchievements ba ON ub.UserId = ba.UserId
+LEFT JOIN LinkedPostUsers lpu ON ub.UserId = lpu.UserId
+LEFT JOIN UserPostHistoryAgg uph ON ub.UserId = uph.UserId
+LEFT JOIN UserTrendingPostStats utps ON ub.UserId = utps.UserId
+LEFT JOIN UserMostRecentAcceptedAnswer umraa ON ub.UserId = umraa.UserId
+LEFT JOIN PostEngagement pe_aa ON umraa.MostRecentAcceptedAnswerId = pe_aa.PostId
+LEFT JOIN UserTagsSummary uts ON ub.UserId = uts.UserId
+WHERE ub.AccountAgeDays > 365
+  AND ub.UserProfileViews > 100
+  AND ub.LastAccessDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '90 days'
+  AND COALESCE(ups.TotalAnswersOwned, 0) > 10 -- Specific to answerers
+  AND (COALESCE(ba.TotalBadges, 0) > 0 OR ba.TotalBadges IS NULL) -- users with badges or no badges
+  AND (
+        ub.Reputation > 7500 -- Higher threshold for top answerers
+        OR (
+            ub.UpVoteRatio > 0.9
+            AND COALESCE(ups.TotalAnswersOwned, 0) > 20
+            AND (SELECT COUNT(c.Id) FROM Comments c WHERE c.UserId = ub.UserId AND c.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '60 days') > 15
+        )
+      )
+  AND (
+        COALESCE(utps.CountTrendingPosts, 0) > 0
+        OR COALESCE(ups.AvgPostScore, 0) > 100 -- Higher threshold for answerers
+      )
+ORDER BY ub.Reputation DESC, COALESCE(utps.AvgTrendingPostEditsPerDay, 0) DESC NULLS LAST
+LIMIT 50
+
+UNION ALL
+
+-- Branch 2: Highly Active Questioners with High Engagement
+SELECT
+    ub.UserId,
+    ub.DisplayName,
+    ub.Reputation,
+    ub.AccountAgeDays,
+    ub.UserLocationCategory,
+    ub.UpVoteRatio,
+    COALESCE(ups.TotalPostsOwned, 0) AS TotalPostsOwned,
+    COALESCE(ups.TotalQuestionsOwned, 0) AS TotalQuestionsOwned,
+    COALESCE(ups.TotalAnswersOwned, 0) AS TotalAnswersOwned,
+    COALESCE(ba.GoldBadges, 0) AS GoldBadgesCount,
+    COALESCE(ba.SilverBadges, 0) AS SilverBadgesCount,
+    COALESCE(ba.BronzeBadges, 0) AS BronzeBadgesCount,
+    pe_aa.PostScore AS ScoreOfMostRecentAcceptedAnswer,
+    DENSE_RANK() OVER (ORDER BY ub.Reputation DESC, ub.AccountAgeDays ASC) AS GlobalReputationRank,
+    COALESCE(utps.AvgTrendingPostEditsPerDay, 0) AS AvgTrendingPostEditsPerDay,
+    CASE WHEN COALESCE(uph.UserCloseEvents, 0) > 0 THEN 'Closed' ELSE 'Open' END AS HasClosedPost,
+    COALESCE(lpu.TotalLinkedPosts, 0) AS UserLinkedPostsCount,
+    COALESCE(lpu.TotalDuplicateLinks, 0) AS UserDuplicateLinksCount,
+    (
+        CASE
+            WHEN COALESCE(ba.GoldBadges, 0) > 0
+             AND ub.Reputation > (SELECT AVG(Reputation) * 5 FROM Users)
+             AND ub.LastAccessDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days' THEN 'High_Impact_Active_User'
+            WHEN COALESCE(ba.SilverBadges, 0) > 0
+             AND ub.Reputation > (SELECT AVG(Reputation) * 2 FROM Users) THEN 'Mid_Impact_User'
+            ELSE 'Regular_User'
+        END
+    ) AS UserImpactCategory,
+    uts.TopPostTagsSummary,
+    'ActiveQuestioner' AS UserCategory
+FROM UserBase ub
+LEFT JOIN UserPostStats ups ON ub.UserId = ups.UserId
+LEFT JOIN BadgeAchievements ba ON ub.UserId = ba.UserId
+LEFT JOIN LinkedPostUsers lpu ON ub.UserId = lpu.UserId
+LEFT JOIN UserPostHistoryAgg uph ON ub.UserId = uph.UserId
+LEFT JOIN UserTrendingPostStats utps ON ub.UserId = utps.UserId
+LEFT JOIN UserMostRecentAcceptedAnswer umraa ON ub.UserId = umraa.UserId
+LEFT JOIN PostEngagement pe_aa ON umraa.MostRecentAcceptedAnswerId = pe_aa.PostId
+LEFT JOIN UserTagsSummary uts ON ub.UserId = uts.UserId
+WHERE ub.AccountAgeDays > 365
+  AND ub.UserProfileViews > 100
+  AND ub.LastAccessDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '90 days'
+  AND COALESCE(ups.TotalQuestionsOwned, 0) > 5 -- Specific to questioners
+  AND (COALESCE(ba.TotalBadges, 0) > 0 OR ba.TotalBadges IS NULL)
+  AND (
+        ub.Reputation > 2000 -- Lower threshold for questioners
+        OR (
+            ub.UpVoteRatio > 0.7
+            AND COALESCE(ups.TotalQuestionsOwned, 0) > 10
+            AND (SELECT COUNT(c.Id) FROM Comments c WHERE c.UserId = ub.UserId AND c.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '60 days') > 5
+        )
+      )
+  AND (
+        COALESCE(utps.AvgTrendingPostEditsPerDay, 0) > 0.01 -- Must have some edits per day on trending posts
+        OR COALESCE(uph.UserCloseEvents, 0) > 0 AND COALESCE(uph.UserReopenEvents, 0) > COALESCE(uph.UserCloseEvents, 0) / 2 -- Posts were reopened significantly
+      )
+ORDER BY ub.Reputation DESC, COALESCE(utps.AvgTrendingPostEditsPerDay, 0) DESC NULLS LAST
+LIMIT 50;

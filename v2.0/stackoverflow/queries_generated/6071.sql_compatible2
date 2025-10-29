@@ -1,0 +1,48 @@
+SELECT 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    u.EmailHash,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 1 THEN p.Id END) AS InitialTitles,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 2 THEN p.Id END) AS InitialBodies,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 10 THEN p.Id END) AS ClosedPosts,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN p.Id END) AS UpVotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN p.Id END) AS DownVotes,
+    COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN p.Id END) AS DuplicatePosts,
+    AVG(p.Score) AS AvgScore,
+    MAX(p.LastActivityDate) AS LastActive,
+    (
+      SELECT MIN(t.Tag)
+      FROM (
+        SELECT DISTINCT TRIM(both '<>' FROM regexp_split_to_table(p2.Tags, '><')) AS Tag
+        FROM Posts p2
+        WHERE p2.OwnerUserId = u.Id AND p2.Tags IS NOT NULL
+      ) t
+    ) AS MostUsedTag
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+LEFT JOIN 
+    PostLinks pl ON p.Id = pl.PostId
+WHERE 
+    u.Reputation > 10000
+    AND (p.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '1' YEAR) OR p.CreationDate IS NULL)
+GROUP BY 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    u.EmailHash
+HAVING 
+    AVG(p.Score) > 10
+ORDER BY 
+    TotalPosts DESC, 
+    AvgScore DESC
+FETCH FIRST 100 ROWS ONLY;

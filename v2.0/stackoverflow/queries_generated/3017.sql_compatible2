@@ -1,0 +1,213 @@
+WITH
+user_posts AS (
+    SELECT
+        u.Id                             AS user_id,
+        u.DisplayName                    AS user_name,
+        u.Reputation                      AS reputation,
+        p.Id                             AS post_id,
+        p.PostTypeId,
+        p.CreationDate                   AS post_created,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        COALESCE(p.LastActivityDate, p.CreationDate) AS last_activity
+    FROM Users u
+    LEFT JOIN Posts p
+         ON p.OwnerUserId = u.Id
+),
+question_tags AS (
+    SELECT
+        up.user_id,
+        up.post_id,
+        unnest(
+            regexp_split_to_array(
+                trim(both '<>' FROM up.Tags), '><'
+            )
+        ) AS tag
+    FROM user_posts up
+    WHERE up.PostTypeId = 1
+      AND up.Tags IS NOT NULL
+),
+user_badges AS (
+    SELECT
+        b.UserId                              AS user_id,
+        COUNT(*)                              AS total_badges,
+        COUNT(*) FILTER (WHERE b.Class = 1)   AS gold_badges,
+        COUNT(*) FILTER (WHERE b.Class = 2)   AS silver_badges,
+        COUNT(*) FILTER (WHERE b.Class = 3)   AS bronze_badges,
+        COUNT(*) FILTER (WHERE b.TagBased)    AS tag_badges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+recent_activity AS (
+    SELECT
+        up.user_id,
+        GREATEST(
+            COALESCE(
+                (SELECT MAX(v.CreationDate) FROM Votes v WHERE v.UserId = up.user_id),
+                TIMESTAMP '1970-01-01'
+            ),
+            COALESCE(
+                (SELECT MAX(c.CreationDate) FROM Comments c WHERE c.UserId = up.user_id),
+                TIMESTAMP '1970-01-01'
+            ),
+            COALESCE(
+                (SELECT MAX(ph.CreationDate) FROM PostHistory ph WHERE ph.UserId = up.user_id),
+                TIMESTAMP '1970-01-01'
+            )
+        ) AS last_contrib_ts
+    FROM user_posts up
+    GROUP BY up.user_id
+),
+user_scores AS (
+    SELECT
+        up.user_id,
+        COUNT(*) FILTER (WHERE up.PostTypeId = 1)               AS question_cnt,
+        COUNT(*) FILTER (WHERE up.PostTypeId = 2)               AS answer_cnt,
+        SUM(CASE WHEN up.PostTypeId = 1 THEN up.Score ELSE 0 END) AS total_question_score,
+        SUM(CASE WHEN up.PostTypeId = 2 THEN up.Score ELSE 0 END) AS total_answer_score,
+        COUNT(*) FILTER (
+            WHERE up.PostTypeId = 2
+              AND EXISTS (
+                  SELECT 1 FROM Posts q
+                  WHERE q.Id = up.ParentId
+                    AND q.AcceptedAnswerId = up.post_id
+              )
+        )                                                      AS accepted_answer_cnt,
+        MAX(up.last_activity)                                 AS last_post_activity
+    FROM user_posts up
+    GROUP BY up.user_id
+),
+user_top_tag AS (
+    SELECT
+        qt.user_id,
+        qt.tag               AS top_tag,
+        cnt                  AS tag_usage_cnt
+    FROM (
+        SELECT
+            user_id,
+            tag,
+            COUNT(*) AS cnt,
+            ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY COUNT(*) DESC) AS rn
+        FROM question_tags
+        GROUP BY user_id, tag
+    ) qt
+    WHERE qt.rn = 1
+),
+user_composite AS (
+    SELECT
+        u.Id                                           AS user_id,
+        u.DisplayName                                  AS user_name,
+        COALESCE(us.question_cnt,0)                    AS questions,
+        COALESCE(us.answer_cnt,0)                      AS answers,
+        COALESCE(us.accepted_answer_cnt,0)             AS accepted_answers,
+        COALESCE(us.total_question_score,0)            AS q_score_sum,
+        COALESCE(us.total_answer_score,0)              AS a_score_sum,
+        COALESCE(ub.total_badges,0)                    AS badge_total,
+        COALESCE(ub.gold_badges,0)                     AS gold_badges,
+        COALESCE(ub.silver_badges,0)                   AS silver_badges,
+        COALESCE(ub.bronze_badges,0)                   AS bronze_badges,
+        COALESCE(ub.tag_badges,0)                      AS tag_badges,
+        COALESCE(ut.top_tag,'<none>')                  AS most_used_tag,
+        COALESCE(ut.tag_usage_cnt,0)                   AS tag_usage_cnt,
+        COALESCE(ra.last_contrib_ts, TIMESTAMP '1970-01-01') AS last_contrib,
+        GREATEST(
+            COALESCE(us.last_post_activity, TIMESTAMP '1970-01-01'),
+            COALESCE(ra.last_contrib_ts, TIMESTAMP '1970-01-01')
+        )                                               AS overall_last_activity,
+        (COALESCE(us.question_cnt,0) * 2
+         + COALESCE(us.answer_cnt,0) * 3
+         + COALESCE(us.accepted_answer_cnt,0) * 5
+         + COALESCE(ub.gold_badges,0) * 7
+         + COALESCE(ub.silver_badges,0) * 4
+         + COALESCE(ub.bronze_badges,0) * 2)          AS activity_score,
+        u.Reputation                                    AS reputation
+    FROM Users u
+    LEFT JOIN user_scores us      ON us.user_id = u.Id
+    LEFT JOIN user_badges ub      ON ub.user_id = u.Id
+    LEFT JOIN user_top_tag ut     ON ut.user_id = u.Id
+    LEFT JOIN recent_activity ra  ON ra.user_id = u.Id
+),
+ranked_users AS (
+    SELECT
+        uc.user_id,
+        uc.user_name,
+        uc.questions,
+        uc.answers,
+        uc.accepted_answers,
+        uc.q_score_sum,
+        uc.a_score_sum,
+        uc.badge_total,
+        uc.gold_badges,
+        uc.silver_badges,
+        uc.bronze_badges,
+        uc.tag_badges,
+        uc.most_used_tag,
+        uc.tag_usage_cnt,
+        uc.last_contrib,
+        uc.overall_last_activity,
+        uc.activity_score,
+        uc.reputation,
+        ROW_NUMBER() OVER (ORDER BY uc.activity_score DESC, uc.reputation DESC) AS rank_by_activity,
+        PERCENT_RANK() OVER (ORDER BY uc.activity_score)                           AS pct_rank
+    FROM user_composite uc
+),
+inactive_users AS (
+    SELECT
+        u.Id                           AS user_id,
+        u.DisplayName                  AS user_name,
+        0                              AS questions,
+        0                              AS answers,
+        0                              AS accepted_answers,
+        0                              AS q_score_sum,
+        0                              AS a_score_sum,
+        0                              AS badge_total,
+        0                              AS gold_badges,
+        0                              AS silver_badges,
+        0                              AS bronze_badges,
+        0                              AS tag_badges,
+        '<none>'                       AS most_used_tag,
+        0                              AS tag_usage_cnt,
+        TIMESTAMP '1970-01-01'         AS last_contrib,
+        TIMESTAMP '1970-01-01'         AS overall_last_activity,
+        0                              AS activity_score,
+        ROW_NUMBER() OVER (ORDER BY u.Id) AS rank_by_activity,
+        0.0                            AS pct_rank,
+        u.Reputation                    AS reputation
+    FROM Users u
+    WHERE NOT EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id)
+      AND NOT EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = u.Id)
+)
+SELECT *
+FROM (
+      SELECT *
+      FROM ranked_users
+      UNION ALL
+      SELECT
+        user_id,
+        user_name,
+        questions,
+        answers,
+        accepted_answers,
+        q_score_sum,
+        a_score_sum,
+        badge_total,
+        gold_badges,
+        silver_badges,
+        bronze_badges,
+        tag_badges,
+        most_used_tag,
+        tag_usage_cnt,
+        last_contrib,
+        overall_last_activity,
+        activity_score,
+        rank_by_activity,
+        pct_rank,
+        reputation
+      FROM inactive_users
+     ) final_set
+ORDER BY rank_by_activity
+LIMIT 200;

@@ -1,0 +1,108 @@
+WITH flagged_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.Body,
+    p.ContentLicense,
+    p.OwnerDisplayName,
+    p.LastEditorDisplayName,
+    p.LastEditDate,
+    p.PostTypeId,
+    p.CloseReasonId AS CloseReasonIndicator
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.Score BETWEEN -5 AND 50
+),
+recent_activity AS (
+  SELECT
+    q.PostId,
+    q.Title,
+    q.Tags,
+    q.CreationDate,
+    q.ViewCount,
+    q.Score,
+    q.OwnerUserId,
+    q.LastActivityDate,
+    q.AnswerCount,
+    q.CommentCount,
+    q.FavoriteCount,
+    q.Body,
+    q.ContentLicense,
+    q.OwnerDisplayName,
+    q.LastEditorDisplayName,
+    q.LastEditDate,
+    q.PostTypeId,
+    COALESCE(q.CloseReasonIndicator, 0) AS CloseReasonIndicator
+  FROM flagged_questions q
+  LEFT JOIN Votes v ON v.PostId = q.PostId AND v.VoteTypeId = 10
+  WHERE q.LastActivityDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days'
+),
+tag_popularity AS (
+  SELECT
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId,
+    t.WikiPostId,
+    ROW_NUMBER() OVER (ORDER BY t.Count DESC, t.TagName) AS rn
+  FROM Tags t
+  WHERE t.IsModeratorOnly = 0
+),
+coalesce_context AS (
+  SELECT
+    r.*,
+    u.DisplayName AS OwnerName,
+    e.DisplayName AS EditorName
+  FROM recent_activity r
+  LEFT JOIN Users u ON u.Id = r.OwnerUserId
+  LEFT JOIN Users e ON e.Id = CASE
+    WHEN r.LastEditorDisplayName ~ '^[0-9]+$' THEN CAST(r.LastEditorDisplayName AS INTEGER)
+    ELSE NULL
+  END
+)
+SELECT
+  c.PostId,
+  c.Title,
+  c.Tags,
+  c.CreationDate,
+  c.ViewCount,
+  c.Score,
+  c.OwnerName,
+  c.LastActivityDate,
+  c.AnswerCount,
+  c.CommentCount,
+  c.FavoriteCount,
+  c.Body,
+  c.ContentLicense,
+  c.EditorName,
+  c.LastEditDate,
+  c.PostTypeId,
+  c.CloseReasonIndicator,
+  tp.Name AS PostTypeName,
+  array_agg(DISTINCT tl.TagName) FILTER (WHERE tl.TagName IS NOT NULL) AS related_tags
+FROM coalesce_context c
+LEFT JOIN PostTypes tp ON tp.Id = c.PostTypeId
+LEFT JOIN (
+  SELECT
+    p.Id AS PostId,
+    TRIM(tag) AS TagName
+  FROM Posts p,
+       UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2), '><')) AS tag
+  WHERE p.PostTypeId = 1
+) AS t ON t.PostId = c.PostId
+LEFT JOIN Tags tl ON tl.WikiPostId = c.PostId OR tl.ExcerptPostId = c.PostId
+GROUP BY
+  c.PostId, c.Title, c.Tags, c.CreationDate, c.ViewCount, c.Score,
+  c.OwnerName, c.LastActivityDate, c.AnswerCount, c.CommentCount,
+  c.FavoriteCount, c.Body, c.ContentLicense, c.EditorName, c.LastEditDate,
+  c.PostTypeId, c.CloseReasonIndicator, tp.Name
+ORDER BY c.LastActivityDate DESC, c.Score DESC
+LIMIT 100;

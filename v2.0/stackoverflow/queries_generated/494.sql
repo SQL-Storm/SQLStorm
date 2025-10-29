@@ -1,0 +1,380 @@
+-- {"query": "494.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 4042} 
+with recent_active_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.location,
+        u.creationdate,
+        u.lastaccessdate,
+        coalesce(nullif(trim(u.websiteurl), ''), 'n/a') as websiteurl,
+        count(*) filter (where b.class = 1) as gold_badges,
+        count(*) filter (where b.class = 2) as silver_badges,
+        count(*) filter (where b.class = 3) as bronze_badges,
+        count(b.id) as total_badges,
+        max(b.date) as last_badge_date
+    from users u
+    left join badges b
+      on b.userid = u.id
+    where u.creationdate >= now() - interval '10 years'
+      and u.reputation >= 100
+    group by u.id, u.displayname, u.reputation, u.location, u.creationdate, u.lastaccessdate, u.websiteurl
+),
+qna as (
+    select
+        p.owneruserid as user_id,
+        count(*) filter (where p.posttypeid = 1) as questions,
+        count(*) filter (where p.posttypeid = 2) as answers,
+        sum(case when p.posttypeid = 1 then coalesce(p.viewcount, 0) else 0 end) as question_views,
+        sum(case when p.posttypeid in (1,2) then coalesce(p.score, 0) else 0 end) as qa_score,
+        count(*) filter (where p.posttypeid = 1 and p.acceptedanswerid is not null) as accepted_questions,
+        count(*) filter (where p.posttypeid = 2 and exists (
+            select 1
+            from posts q
+            where q.id = p.parentid
+              and q.acceptedanswerid = p.id
+        )) as accepted_answers,
+        count(*) filter (where p.posttypeid = 1 and p.closeddate is not null) as closed_questions,
+        max(p.lastactivitydate) as last_post_activity
+    from posts p
+    where p.owneruserid is not null
+      and p.owneruserid > 0
+      and p.creationdate >= now() - interval '10 years'
+    group by p.owneruserid
+),
+comment_stats as (
+    select
+        c.userid as user_id,
+        count(*) as comments,
+        avg(coalesce(c.score, 0)) as avg_comment_score,
+        max(c.creationdate) as last_comment_date,
+        sum(case when c.score > 0 then 1 else 0 end) as positive_comments
+    from comments c
+    where c.userid is not null
+      and c.creationdate >= now() - interval '10 years'
+    group by c.userid
+),
+vote_stats as (
+    select
+        v.userid as user_id,
+        count(*) filter (where v.votetypeid = 2) as upvotes_cast,
+        count(*) filter (where v.votetypeid = 3) as downvotes_cast,
+        sum(coalesce(v.bountyamount, 0)) filter (where v.votetypeid in (8,9)) as bounty_spent_received,
+        min(v.creationdate) as first_vote_date,
+        max(v.creationdate) as last_vote_date
+    from votes v
+    where v.userid is not null
+      and v.creationdate >= now() - interval '10 years'
+    group by v.userid
+),
+postlink_dupes as (
+    select
+        pl.postid,
+        count(*) filter (where pl.linktypeid = 3) as duplicate_links,
+        count(*) filter (where pl.linktypeid = 1) as related_links,
+        max(pl.creationdate) as last_link_date
+    from postlinks pl
+    group by pl.postid
+),
+question_tag_exploded as (
+    select
+        p.id as post_id,
+        p.owneruserid as user_id,
+        unnest(string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')) as tag
+    from posts p
+    where p.posttypeid = 1
+      and p.tags is not null
+      and p.owneruserid is not null
+),
+top_tags_per_user as (
+    select
+        qte.user_id,
+        t.tagname,
+        count(*) as tag_count,
+        row_number() over (partition by qte.user_id order by count(*) desc, t.tagname) as rn
+    from question_tag_exploded qte
+    join tags t
+      on lower(t.tagname) = lower(qte.tag)
+    group by qte.user_id, t.tagname
+),
+accepted_answer_latency as (
+    select
+        a.owneruserid as user_id,
+        percentile_cont(0.5) within group (order by extract(epoch from (a.creationdate - q.creationdate))) as p50_answer_latency_sec,
+        percentile_cont(0.9) within group (order by extract(epoch from (a.creationdate - q.creationdate))) as p90_answer_latency_sec,
+        avg(extract(epoch from (a.creationdate - q.creationdate))) as avg_answer_latency_sec
+    from posts a
+    join posts q
+      on q.id = a.parentid
+     and q.posttypeid = 1
+    where a.posttypeid = 2
+      and a.creationdate >= now() - interval '10 years'
+    group by a.owneruserid
+),
+edit_events as (
+    select
+        ph.userid as user_id,
+        count(*) filter (where ph.posthistorytypeid in (4,5,6,7,8,9,24)) as edits,
+        count(*) filter (where ph.posthistorytypeid in (10,11,12,13,14,15,19,20,35,36)) as mod_state_changes,
+        count(*) filter (where ph.posthistorytypeid in (50,52,53)) as community_visibility_events,
+        max(ph.creationdate) as last_edit_event
+    from posthistory ph
+    where ph.userid is not null
+      and ph.creationdate >= now() - interval '10 years'
+    group by ph.userid
+),
+question_quality as (
+    select
+        q.owneruserid as user_id,
+        count(*) as total_questions,
+        avg(coalesce(q.score, 0)) as avg_q_score,
+        avg(coalesce(q.viewcount, 0)) as avg_q_views,
+        sum(case when q.favoritecount is not null and q.favoritecount > 0 then 1 else 0 end) as favorited_questions,
+        sum(coalesce(pld.duplicate_links, 0)) as duplicate_link_refs
+    from posts q
+    left join postlink_dupes pld
+      on pld.postid = q.id
+    where q.posttypeid = 1
+      and q.creationdate >= now() - interval '10 years'
+      and q.owneruserid is not null
+    group by q.owneruserid
+),
+answer_quality as (
+    select
+        a.owneruserid as user_id,
+        count(*) as total_answers,
+        avg(coalesce(a.score, 0)) as avg_a_score,
+        sum(case when q.acceptedanswerid = a.id then 1 else 0 end) as accepted_answers,
+        avg(case when q.acceptedanswerid = a.id then 1.0 else 0.0 end) as acceptance_rate
+    from posts a
+    join posts q
+      on q.id = a.parentid
+     and q.posttypeid = 1
+    where a.posttypeid = 2
+      and a.creationdate >= now() - interval '10 years'
+    group by a.owneruserid
+),
+activity_calendar as (
+    select
+        p.owneruserid as user_id,
+        date_trunc('month', p.creationdate) as ym,
+        count(*) filter (where p.posttypeid = 1) as q_per_mo,
+        count(*) filter (where p.posttypeid = 2) as a_per_mo,
+        count(*) filter (where p.posttypeid not in (1,2) or p.posttypeid is null) as other_per_mo
+    from posts p
+    where p.owneruserid is not null
+      and p.creationdate >= now() - interval '3 years'
+    group by p.owneruserid, date_trunc('month', p.creationdate)
+),
+activity_rollup as (
+    select
+        user_id,
+        sum(q_per_mo) as q_36mo,
+        sum(a_per_mo) as a_36mo,
+        sum(other_per_mo) as other_36mo,
+        stddev_pop(q_per_mo + a_per_mo) as activity_volatility
+    from activity_calendar
+    group by user_id
+),
+user_rank as (
+    select
+        rau.user_id,
+        rau.displayname,
+        rau.reputation,
+        rau.location,
+        rau.creationdate,
+        rau.lastaccessdate,
+        rau.websiteurl,
+        rau.gold_badges,
+        rau.silver_badges,
+        rau.bronze_badges,
+        rau.total_badges,
+        rau.last_badge_date,
+        coalesce(qna.questions, 0) as questions,
+        coalesce(qna.answers, 0) as answers,
+        coalesce(qna.question_views, 0) as question_views,
+        coalesce(qna.qa_score, 0) as qa_score,
+        coalesce(qna.accepted_questions, 0) as accepted_questions,
+        coalesce(qna.accepted_answers, 0) as accepted_answers_from_qna,
+        coalesce(qna.closed_questions, 0) as closed_questions,
+        qna.last_post_activity,
+        coalesce(cs.comments, 0) as comments,
+        coalesce(cs.avg_comment_score, 0) as avg_comment_score,
+        cs.last_comment_date,
+        coalesce(cs.positive_comments, 0) as positive_comments,
+        coalesce(vs.upvotes_cast, 0) as upvotes_cast,
+        coalesce(vs.downvotes_cast, 0) as downvotes_cast,
+        coalesce(vs.bounty_spent_received, 0) as bounty_spent_received,
+        vs.first_vote_date,
+        vs.last_vote_date,
+        coalesce(aal.p50_answer_latency_sec, 0) as p50_answer_latency_sec,
+        coalesce(aal.p90_answer_latency_sec, 0) as p90_answer_latency_sec,
+        coalesce(aal.avg_answer_latency_sec, 0) as avg_answer_latency_sec,
+        coalesce(eq.edits, 0) as edits,
+        coalesce(eq.mod_state_changes, 0) as mod_state_changes,
+        coalesce(eq.community_visibility_events, 0) as community_visibility_events,
+        eq.last_edit_event,
+        coalesce(qq.total_questions, 0) as total_questions_10y,
+        coalesce(qq.avg_q_score, 0) as avg_q_score,
+        coalesce(qq.avg_q_views, 0) as avg_q_views,
+        coalesce(qq.favorited_questions, 0) as favorited_questions,
+        coalesce(qq.duplicate_link_refs, 0) as duplicate_link_refs,
+        coalesce(aq.total_answers, 0) as total_answers_10y,
+        coalesce(aq.avg_a_score, 0) as avg_a_score,
+        coalesce(aq.accepted_answers, 0) as accepted_answers_from_answers,
+        coalesce(aq.acceptance_rate, 0) as acceptance_rate,
+        coalesce(ar.q_36mo, 0) as q_36mo,
+        coalesce(ar.a_36mo, 0) as a_36mo,
+        coalesce(ar.other_36mo, 0) as other_36mo,
+        coalesce(ar.activity_volatility, 0) as activity_volatility,
+        coalesce(tt.tagname, '(none)') as top_tag,
+        coalesce(tt.tag_count, 0) as top_tag_count
+    from recent_active_users rau
+    left join qna
+      on qna.user_id = rau.user_id
+    left join comment_stats cs
+      on cs.user_id = rau.user_id
+    left join vote_stats vs
+      on vs.user_id = rau.user_id
+    left join accepted_answer_latency aal
+      on aal.user_id = rau.user_id
+    left join edit_events eq
+      on eq.user_id = rau.user_id
+    left join question_quality qq
+      on qq.user_id = rau.user_id
+    left join answer_quality aq
+      on aq.user_id = rau.user_id
+    left join activity_rollup ar
+      on ar.user_id = rau.user_id
+    left join lateral (
+        select tagname, tag_count
+        from top_tags_per_user t
+        where t.user_id = rau.user_id
+          and t.rn = 1
+    ) tt on true
+),
+scored as (
+    select
+        ur.*,
+        -- composite score combining various aspects; includes non-linear pieces and null handling
+        (
+            0.30 * ln(1 + greatest(ur.answers, 0)) +
+            0.15 * ln(1 + greatest(ur.questions, 0)) +
+            0.20 * ln(1 + greatest(ur.qa_score + ur.avg_q_score + ur.avg_a_score, 0)) +
+            0.10 * ln(1 + greatest(ur.accepted_answers_from_answers, 0)) +
+            0.05 * ln(1 + greatest(ur.accepted_questions, 0)) +
+            0.05 * ln(1 + greatest(ur.gold_badges*9 + ur.silver_badges*3 + ur.bronze_badges, 0)) +
+            0.05 * ln(1 + greatest(ur.comments, 0)) +
+            0.03 * ln(1 + greatest(ur.favorited_questions, 0)) -
+            0.04 * ln(1 + greatest(ur.closed_questions + ur.duplicate_link_refs, 0)) +
+            0.06 * ln(1 + greatest(ur.q_36mo + ur.a_36mo, 0)) -
+            0.01 * greatest(ur.activity_volatility, 0)
+        ) as composite_score,
+        case
+            when ur.last_post_activity is null and ur.last_comment_date is null then 'inactive'
+            when greatest(coalesce(ur.last_post_activity, 'epoch'::timestamp), coalesce(ur.last_comment_date, 'epoch'::timestamp)) >= now() - interval '30 days' then 'active_30d'
+            when greatest(coalesce(ur.last_post_activity, 'epoch'::timestamp), coalesce(ur.last_comment_date, 'epoch'::timestamp)) >= now() - interval '90 days' then 'active_90d'
+            else 'stale'
+        end as recency_bucket
+    from user_rank ur
+),
+ranked as (
+    select
+        s.*,
+        dense_rank() over (order by s.composite_score desc, s.reputation desc, s.answers desc, s.questions desc, s.total_badges desc, s.user_id) as global_rank,
+        row_number() over (partition by s.recency_bucket order by s.composite_score desc, s.reputation desc, s.answers desc) as bucket_rank,
+        percentile_cont(0.5) within group (order by s.composite_score) over () as p50_score_all,
+        percentile_cont(0.9) within group (order by s.composite_score) over () as p90_score_all
+    from scored s
+),
+paired_post_sample as (
+    select
+        p.owneruserid as user_id,
+        p.id as post_id,
+        p.posttypeid,
+        p.score,
+        p.viewcount,
+        p.creationdate,
+        pl.duplicate_links,
+        pl.related_links,
+        row_number() over (partition by p.owneruserid order by p.score desc nulls last, p.viewcount desc nulls last, p.creationdate desc) as rn_top,
+        row_number() over (partition by p.owneruserid order by p.score asc nulls first, p.viewcount asc nulls first, p.creationdate asc) as rn_bottom
+    from posts p
+    left join postlink_dupes pl
+      on pl.postid = p.id
+    where p.owneruserid is not null
+      and p.creationdate >= now() - interval '5 years'
+)
+select
+    r.global_rank,
+    r.bucket_rank,
+    r.recency_bucket,
+    r.user_id,
+    r.displayname,
+    r.reputation,
+    r.location,
+    r.websiteurl,
+    r.gold_badges,
+    r.silver_badges,
+    r.bronze_badges,
+    r.total_badges,
+    r.questions,
+    r.answers,
+    r.total_questions_10y,
+    r.total_answers_10y,
+    r.qa_score,
+    r.avg_q_score,
+    r.avg_a_score,
+    r.accepted_answers_from_answers,
+    r.acceptance_rate,
+    r.accepted_questions,
+    r.closed_questions,
+    r.question_views,
+    r.comments,
+    r.avg_comment_score,
+    r.positive_comments,
+    r.upvotes_cast,
+    r.downvotes_cast,
+    r.bounty_spent_received,
+    r.q_36mo,
+    r.a_36mo,
+    r.other_36mo,
+    r.activity_volatility,
+    r.top_tag,
+    r.top_tag_count,
+    r.p50_answer_latency_sec,
+    r.p90_answer_latency_sec,
+    r.avg_answer_latency_sec,
+    r.composite_score,
+    r.p50_score_all,
+    r.p90_score_all,
+    -- string expressions and NULL handling
+    coalesce(nullif(trim(r.displayname), ''), concat('User#', r.user_id::varchar)) as display_handle,
+    case when r.websiteurl ilike 'http%' then r.websiteurl else null end as normalized_website,
+    -- include top and bottom post per user using set operators via union all + outer join mapping
+    top_posts.post_id as top_post_id,
+    top_posts.posttypeid as top_post_type,
+    top_posts.score as top_post_score,
+    top_posts.viewcount as top_post_views,
+    bottom_posts.post_id as bottom_post_id,
+    bottom_posts.posttypeid as bottom_post_type,
+    bottom_posts.score as bottom_post_score,
+    bottom_posts.viewcount as bottom_post_views
+from ranked r
+left join lateral (
+    select pps.post_id, pps.posttypeid, pps.score, pps.viewcount
+    from paired_post_sample pps
+    where pps.user_id = r.user_id and pps.rn_top = 1
+) top_posts on true
+left join lateral (
+    select pps.post_id, pps.posttypeid, pps.score, pps.viewcount
+    from paired_post_sample pps
+    where pps.user_id = r.user_id and pps.rn_bottom = 1
+) bottom_posts on true
+where
+    r.global_rank <= 200
+    and (
+        r.composite_score >= r.p50_score_all
+        or r.recency_bucket = 'active_30d'
+    )
+order by r.global_rank, r.user_id;

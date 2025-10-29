@@ -1,0 +1,134 @@
+with RecursiveUserBadges as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class,
+        row_number() over (partition by u.Id order by b.Class, b.Date desc) as BadgeRank
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    where u.Reputation > 1000 or b.Class = 1
+),
+FilteredPosts as (
+    select p.Id, p.PostTypeId, p.OwnerUserId, p.Score, p.ViewCount, p.CreationDate, p.Title, p.Tags,
+           coalesce(p.AnswerCount,0) as AnswerCount,
+           case when p.ClosedDate is null then 0 else 1 end as IsClosed
+    from Posts p
+    where p.PostTypeId in (1,2)
+      and p.Score >= 0
+      and p.CreationDate > (cast('2024-10-01' as date) - interval '1 year')
+),
+AdditionalPostInfo as (
+    select p.Id,
+           (select count(*) from Comments c where c.PostId = p.Id and c.Score > 0) as PositiveCommentCount,
+           (select avg(case when v.VoteTypeId in (2,3) then v.VoteTypeId end) from Votes v where v.PostId = p.Id) as AvgVoteType,
+           p.OwnerUserId,
+           p.PostTypeId,
+           p.Title,
+           p.Tags,
+           p.Score,
+           p.ViewCount,
+           p.AnswerCount,
+           p.IsClosed,
+           p.CreationDate
+    from FilteredPosts p
+),
+AvgScores as (
+    select OwnerUserId,
+           PostTypeId,
+           avg(Score) as AvgScore,
+           count(*) as PostCount
+    from AdditionalPostInfo
+    group by OwnerUserId, PostTypeId
+),
+UserActivityWindow as (
+    select
+        OwnerUserId,
+        PostTypeId,
+        Score,
+        ViewCount,
+        row_number() over (partition by OwnerUserId, PostTypeId order by Score desc, ViewCount desc) as rn,
+        avg(Score) over (partition by OwnerUserId, PostTypeId order by Score desc rows between 4 preceding and current row) as AvgTop5Scores
+    from AdditionalPostInfo
+),
+ClosedDuplicateQuestions as (
+    select distinct p.Id as QuestionId, pl.RelatedPostId as OriginalQuestionId
+    from Posts p
+    join PostLinks pl on pl.PostId = p.Id and pl.LinkTypeId = 3
+    where p.PostTypeId = 1 and p.ClosedDate is not null
+),
+UserTagActivity as (
+    -- Split Tags into tag rows using standard SQL: extract tags by replacing angle brackets and splitting on whitespace.
+    -- Different SQL dialects may not have a built-in string-split; here we simulate splitting by joining against a numbers table.
+    select
+        fp.OwnerUserId,
+        trim(tag_part) as Tag,
+        count(*) as TagPostCount,
+        sum(fp.Score) as TagScoreSum
+    from FilteredPosts fp
+    join (
+        -- generate positions to extract up to, say, 20 tags per post; adjust max_n as needed
+        select 1 as n union all select 2 union all select 3 union all select 4 union all select 5
+        union all select 6 union all select 7 union all select 8 union all select 9 union all select 10
+        union all select 11 union all select 12 union all select 13 union all select 14 union all select 15
+        union all select 16 union all select 17 union all select 18 union all select 19 union all select 20
+    ) nums on fp.Tags is not null
+    cross join lateral (
+        -- replace angle brackets with spaces, collapse multiple spaces, then extract the n-th token
+        select
+            regexp_split_to_table(regexp_replace(regexp_replace(fp.Tags, '<', ' ', 'g'), '>', ' ', 'g'), '\s+') as tag_part,
+            generate_series as seq
+        from (
+            select 1 as dummy
+        ) d
+    ) parts
+    -- Note: Some dialects (Postgres) support regexp_split_to_table; if unavailable, replace this block with an appropriate splitter table/function.
+    where trim(parts.tag_part) <> ''
+    group by fp.OwnerUserId, trim(parts.tag_part)
+),
+UserReputationChange as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        max(ph.CreationDate) filter (where ph.PostHistoryTypeId = 10) as LastClosedPostDate,
+        (select count(*) from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 1 and p.ClosedDate is not null) as ClosedQuestionsCount
+    from Users u
+    left join PostHistory ph on ph.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate
+)
+select distinct
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    uba.BadgeName,
+    uba.Class as BadgeClass,
+    ap.Title as RecentPostTitle,
+    ap.Tags as RecentPostTags,
+    ap.Score as RecentPostScore,
+    ap.ViewCount as RecentPostViews,
+    ap.AnswerCount as RecentPostAnswerCount,
+    ap.IsClosed,
+    avgsc.AvgScore,
+    avgsc.PostCount,
+    uca.Tag,
+    uca.TagPostCount,
+    uca.TagScoreSum,
+    urc.LastClosedPostDate,
+    urc.ClosedQuestionsCount,
+    wd.OriginalQuestionId,
+    ua.AvgTop5Scores
+from Users u
+left join RecursiveUserBadges uba on u.Id = uba.UserId and uba.BadgeRank <= 3
+left join AdditionalPostInfo ap on ap.OwnerUserId = u.Id
+left join AvgScores avgsc on avgsc.OwnerUserId = u.Id and avgsc.PostTypeId = ap.PostTypeId
+left join UserTagActivity uca on uca.OwnerUserId = u.Id
+left join UserReputationChange urc on urc.UserId = u.Id
+left join ClosedDuplicateQuestions wd on wd.QuestionId = ap.Id
+left join UserActivityWindow ua on ua.OwnerUserId = u.Id and ua.PostTypeId = ap.PostTypeId
+where (ap.Score > coalesce(avgsc.AvgScore,0) or avgsc.PostCount > 10)
+  and (ap.IsClosed = 0 or wd.OriginalQuestionId is not null)
+  and (uba.BadgeRank is not null or urc.ClosedQuestionsCount < 5)
+order by u.Reputation desc, ap.Score desc
+limit 100;

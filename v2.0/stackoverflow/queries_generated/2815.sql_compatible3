@@ -1,0 +1,186 @@
+with RECURSIVE RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        cast(t.TagName as varchar(1000)) as TagPath,
+        1 as Level
+    from Tags t
+    where t.IsRequired = true
+
+    union all
+
+    select
+        c.Id,
+        c.TagName,
+        c.Count,
+        c.ExcerptPostId,
+        c.WikiPostId,
+        c.IsModeratorOnly,
+        c.IsRequired,
+        r.TagPath || ' > ' || c.TagName,
+        r.Level + 1
+    from Tags c
+    join RecursiveTagHierarchy r on c.Id = r.Id + 1
+    where c.IsRequired = true and r.Level < 3
+),
+LatestPostHistories as (
+    select ph.PostId, ph.PostHistoryTypeId, ph.CreationDate,
+           row_number() over (partition by ph.PostId, ph.PostHistoryTypeId order by ph.CreationDate desc) as rn
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (4,5,6)
+),
+FilteredLatestEdits as (
+    select ph.PostId,
+           max(case when ph.PostHistoryTypeId = 4 then ph.Text end) as LatestTitleEdit,
+           max(case when ph.PostHistoryTypeId = 5 then ph.Text end) as LatestBodyEdit,
+           max(case when ph.PostHistoryTypeId = 6 then ph.Text end) as LatestTagsEdit
+    from LatestPostHistories ph
+    where ph.rn = 1
+    group by ph.PostId
+),
+AnswerAggregates as (
+    select p.ParentId,
+           count(*) as AnswerCount,
+           avg(p.Score) as AvgAnswerScore,
+           bool_or(p.Score > 5) as HasHighScoreAnswer,
+           max(p.CreationDate) as LastAnswerDate
+    from Posts p
+    where p.PostTypeId = 2
+    group by p.ParentId
+),
+UserRanking as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        dense_rank() over (order by u.Reputation desc) as ReputationRank,
+        avg(b.Class) over (partition by u.Id) as AvgBadgeClass,
+        count(b.Id) over (partition by u.Id) as BadgeCount
+    from Users u
+    left join Badges b on u.Id = b.UserId
+),
+QuestionFavorites as (
+    select p.Id as QuestionId,
+           p.OwnerUserId,
+           count(case when v.VoteTypeId = 5 then 1 end) as FavoriteVotes,
+           count(case when v.VoteTypeId = 2 then 1 end) as UpVotes,
+           count(case when v.VoteTypeId = 3 then 1 end) as DownVotes
+    from Posts p
+    left join Votes v on p.Id = v.PostId
+    where p.PostTypeId = 1
+    group by p.Id, p.OwnerUserId
+),
+UserCommentActivity as (
+    select c.UserId,
+           count(c.Id) as CommentCount,
+           max(c.CreationDate) as LastCommentDate,
+           count(distinct c.PostId) as UniquePostsCommented
+    from Comments c
+    group by c.UserId
+),
+PostLinkInfo as (
+    select pl.PostId,
+           pl.LinkTypeId,
+           count(distinct pl.RelatedPostId) as RelatedPostCount
+    from PostLinks pl
+    group by pl.PostId, pl.LinkTypeId
+),
+ComplexFilterPosts as (
+    select
+        q.Id,
+        q.Title,
+        q.OwnerUserId,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        fa.FavoriteVotes,
+        fa.UpVotes,
+        fa.DownVotes,
+        aa.AnswerCount,
+        aa.AvgAnswerScore,
+        aa.HasHighScoreAnswer,
+        aa.LastAnswerDate,
+        u.DisplayName as OwnerName,
+        u.Reputation as OwnerReputation,
+        u.AvatarUrl,
+        fc.CommentCount,
+        fc.LastCommentDate,
+        fc.UniquePostsCommented,
+        pl.RelatedPostCount,
+        fle.LatestTitleEdit,
+        fle.LatestBodyEdit,
+        fle.LatestTagsEdit
+    from Posts q
+    left join QuestionFavorites fa on q.Id = fa.QuestionId
+    left join AnswerAggregates aa on q.Id = aa.ParentId
+    left join Users u on q.OwnerUserId = u.Id
+    left join UserCommentActivity fc on q.OwnerUserId = fc.UserId
+    left join PostLinkInfo pl on q.Id = pl.PostId and pl.LinkTypeId = 1
+    left join FilteredLatestEdits fle on q.Id = fle.PostId
+    where q.PostTypeId = 1
+      and q.Score > 10
+      and (coalesce(fa.FavoriteVotes,0) > 0 or coalesce(fa.UpVotes,0) > 5)
+      and (aa.AnswerCount is not null and aa.AnswerCount >= 2)
+      and (u.Reputation > 1000)
+      and (coalesce(fc.CommentCount,0) > 5 or coalesce(fc.UniquePostsCommented,0) > 3)
+      and (coalesce(pl.RelatedPostCount,0) > 1 or pl.RelatedPostCount is null)
+)
+
+select
+    cfp.Id as QuestionId,
+    cfp.Title,
+    cfp.OwnerName,
+    cfp.OwnerReputation,
+    cfp.CreationDate,
+    cfp.Score,
+    cfp.ViewCount,
+    coalesce(cfp.FavoriteVotes,0) as FavCount,
+    coalesce(cfp.UpVotes,0) as UpVotesCount,
+    coalesce(cfp.DownVotes,0) as DownVotesCount,
+    cfp.AnswerCount,
+    round(coalesce(cfp.AvgAnswerScore,0),2) as AvgAnswerScore,
+    case when cfp.HasHighScoreAnswer then 'Yes' else 'No' end as HasHighScoreAnswer,
+    cfp.LastAnswerDate,
+    cfp.CommentCount,
+    cfp.LastCommentDate,
+    cfp.UniquePostsCommented,
+    cfp.RelatedPostCount,
+    length(cfp.LatestTitleEdit) as LatestTitleEditLength,
+    length(cfp.LatestBodyEdit) as LatestBodyEditLength,
+    length(cfp.LatestTagsEdit) as LatestTagsEditLength,
+    initcap(substr(cfp.Title, 1, 50)) || '...' as ShortTitle,
+    coalesce(
+        (regexp_match(coalesce(cfp.LatestTagsEdit,''), '([a-z0-9]+)'))[1],
+        'NoTags'
+    ) as FirstTagExtracted
+from ComplexFilterPosts cfp
+where cfp.LatestTitleEdit is not null or cfp.LatestTagsEdit is not null
+group by
+    cfp.Id,
+    cfp.Title,
+    cfp.OwnerName,
+    cfp.OwnerReputation,
+    cfp.CreationDate,
+    cfp.Score,
+    cfp.ViewCount,
+    cfp.FavoriteVotes,
+    cfp.UpVotes,
+    cfp.DownVotes,
+    cfp.AnswerCount,
+    cfp.AvgAnswerScore,
+    cfp.HasHighScoreAnswer,
+    cfp.LastAnswerDate,
+    cfp.CommentCount,
+    cfp.LastCommentDate,
+    cfp.UniquePostsCommented,
+    cfp.RelatedPostCount,
+    cfp.LatestTitleEdit,
+    cfp.LatestBodyEdit,
+    cfp.LatestTagsEdit
+order by cfp.Score desc, cfp.ViewCount desc
+limit 50;

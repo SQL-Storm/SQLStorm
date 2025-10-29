@@ -1,0 +1,201 @@
+-- {"query": "1023.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3428} 
+
+WITH UserBaseStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.UpVotes AS UserGivenUpVotes,
+        u.DownVotes AS UserGivenDownVotes,
+        u.Views AS UserProfileViews,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostScore,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount END) AS AvgQuestionViewCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        COUNT(DISTINCT pl.RelatedPostId) FILTER (WHERE pl.LinkTypeId = 1) AS TotalLinkedPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS AcceptedAnswersForOwnQuestions,
+        -- Correlated subquery: count answers by this user that were accepted on a question by this user
+        (SELECT COUNT(A.Id)
+         FROM Posts A
+         WHERE A.PostTypeId = 2 AND A.OwnerUserId = u.Id
+           AND A.Id = (SELECT Q.AcceptedAnswerId FROM Posts Q WHERE Q.Id = A.ParentId AND Q.OwnerUserId = u.Id)) AS SelfAcceptedAnswers,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        SUM(COALESCE(C.Score, 0)) AS TotalCommentScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+    LEFT JOIN Comments C ON u.Id = C.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.UpVotes, u.DownVotes, u.Views
+),
+UserBadgeSummary AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(b.Id) AS TotalBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserReceivedVoteStats AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        SUM(CASE WHEN v.VoteTypeId = 1 THEN 1 ELSE 0 END) AS AcceptedAnswersReceived,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesReceived,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesReceived,
+        SUM(COALESCE(p.FavoriteCount, 0)) AS TotalFavoriteCountOnPosts
+    FROM Posts p
+    JOIN Votes v ON p.Id = v.PostId
+    WHERE p.OwnerUserId IS NOT NULL AND v.VoteTypeId IN (1, 2, 3)
+    GROUP BY p.OwnerUserId
+),
+PostModerationEvents AS (
+    SELECT
+        ph.PostId,
+        ph.UserId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        LAG(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS PrevEventDate,
+        LAG(ph.PostHistoryTypeId) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS PrevEventType
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (10, 11) -- 10 = Post Closed, 11 = Post Reopened
+),
+UserModerationSummary AS (
+    SELECT
+        pme.UserId,
+        COUNT(CASE WHEN pme.PostHistoryTypeId = 10 THEN 1 END) AS PostsClosedByThisUser,
+        COUNT(CASE WHEN pme.PostHistoryTypeId = 11 THEN 1 END) AS PostsReopenedByThisUser,
+        SUM(CASE WHEN pme.PostHistoryTypeId = 11 AND pme.PrevEventType = 10 AND pme.PrevEventDate IS NOT NULL
+                 THEN EXTRACT(EPOCH FROM (pme.CreationDate - pme.PrevEventDate)) / 3600.0 -- duration in hours
+                 ELSE 0 END) AS TotalHoursForReopening,
+        SUM(CASE WHEN pme.PostHistoryTypeId = 11 AND pme.PrevEventType = 10 AND pme.PrevEventDate IS NOT NULL THEN 1 ELSE 0 END) AS TimesReopenedByThisUserAfterClosing
+    FROM PostModerationEvents pme
+    WHERE pme.UserId IS NOT NULL
+    GROUP BY pme.UserId
+),
+UserTagActivity AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        LOWER(TRIM(unnest(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><')))) AS TagName
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.OwnerUserId IS NOT NULL AND p.Tags IS NOT NULL
+),
+UserTagSummary AS (
+    SELECT
+        uta.UserId,
+        COUNT(DISTINCT uta.TagName) AS DistinctTagsUsed
+    FROM UserTagActivity uta
+    GROUP BY uta.UserId
+),
+ComplexUserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(DISTINCT p_edited.Id) AS PostsEditedByThisUser,
+        COUNT(DISTINCT p_edited_others.Id) AS OthersPostsEditedByThisUser,
+        AVG(CASE WHEN p_ans.Id IS NOT NULL AND p_ans.Id = q.AcceptedAnswerId THEN LENGTH(p_ans.Body) ELSE NULL END) AS AvgAcceptedAnswerBodyLength,
+        COUNT(DISTINCT p_ans.Id) AS TotalAnswersWritten,
+        CAST(SUM(CASE WHEN p_ans.Id IS NOT NULL AND p_ans.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END) AS DECIMAL) * 1.0 / NULLIF(COUNT(DISTINCT p_ans.Id), 0) AS AcceptedAnswerRatio,
+        MAX(CASE WHEN u.WebsiteUrl IS NOT NULL AND u.Location IS NOT NULL THEN 1 ELSE 0 END) AS HasCompleteProfileInfo,
+        MAX(CASE WHEN p_com.OwnerUserId = c.UserId THEN 1 ELSE 0 END) AS CommentsOnOwnPosts,
+        MAX(CASE WHEN p_com.OwnerUserId <> c.UserId THEN 1 ELSE 0 END) AS CommentsOnOthersPosts,
+        SUM(CASE WHEN pl.LinkTypeId = 3 AND pl.RelatedPostId = p_ques.Id THEN 1 ELSE 0 END) AS QuestionsMarkedAsDuplicateCount
+    FROM Users u
+    LEFT JOIN Posts p_edited ON u.Id = p_edited.LastEditorUserId
+    LEFT JOIN Posts p_edited_others ON u.Id = p_edited_others.LastEditorUserId AND u.Id <> p_edited_others.OwnerUserId
+    LEFT JOIN Posts p_ans ON u.Id = p_ans.OwnerUserId AND p_ans.PostTypeId = 2
+    LEFT JOIN Posts q ON p_ans.ParentId = q.Id AND q.PostTypeId = 1
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Posts p_com ON c.PostId = p_com.Id
+    LEFT JOIN Posts p_ques ON u.Id = p_ques.OwnerUserId AND p_ques.PostTypeId = 1
+    LEFT JOIN PostLinks pl ON p_ques.Id = pl.PostId -- PostId being the source of the link
+    GROUP BY u.Id
+),
+UsersWhoClosedPosts AS (
+    SELECT DISTINCT UserId FROM PostHistory WHERE PostHistoryTypeId = 10 AND UserId IS NOT NULL
+),
+UsersWhoReopenedPosts AS (
+    SELECT DISTINCT UserId FROM PostHistory WHERE PostHistoryTypeId = 11 AND UserId IS NOT NULL
+),
+ClosingOnlyModerators AS (
+    SELECT UserId FROM UsersWhoClosedPosts
+    EXCEPT
+    SELECT UserId FROM UsersWhoReopenedPosts
+)
+SELECT
+    u.Id AS UserID,
+    u.DisplayName,
+    u.Reputation,
+    ubs.TotalPosts,
+    ubs.TotalQuestions,
+    ubs.TotalAnswers,
+    ubs.TotalPostScore,
+    COALESCE(ubs.AvgQuestionViewCount, 0) AS AvgQuestionViewCount,
+    COALESCE(ubs.AcceptedAnswersForOwnQuestions, 0) AS AcceptedAnswersForOwnQuestions,
+    COALESCE(ubs.SelfAcceptedAnswers, 0) AS SelfAcceptedAnswers,
+    COALESCE(ubs.TotalCommentsMade, 0) AS TotalCommentsMade,
+    COALESCE(urs.UpvotesReceived, 0) AS TotalUpvotesReceived,
+    COALESCE(urs.DownvotesReceived, 0) AS TotalDownvotesReceived,
+    COALESCE(urs.TotalFavoriteCountOnPosts, 0) AS TotalFavoritesOnPosts,
+    COALESCE(u.UpVotes, 0) AS UserGivenUpVotes,
+    COALESCE(u.DownVotes, 0) AS UserGivenDownVotes,
+    COALESCE(u.Views, 0) AS UserProfileViews,
+    COALESCE(ubs.TotalLinkedPosts, 0) AS TotalLinkedPosts,
+    COALESCE(u_badge.GoldBadges, 0) AS GoldBadges,
+    COALESCE(u_badge.SilverBadges, 0) AS SilverBadges,
+    COALESCE(u_badge.BronzeBadges, 0) AS BronzeBadges,
+    COALESCE(u_mod.PostsClosedByThisUser, 0) AS PostsClosedByThisUser,
+    COALESCE(u_mod.PostsReopenedByThisUser, 0) AS PostsReopenedByThisUser,
+    COALESCE(u_mod.TotalHoursForReopening, 0.0) AS TotalHoursForReopening,
+    COALESCE(uta_sum.DistinctTagsUsed, 0) AS DistinctTagsUsedInQuestions,
+    COALESCE(cue.AvgAcceptedAnswerBodyLength, 0) AS AvgAcceptedAnswerBodyLength,
+    COALESCE(cue.AcceptedAnswerRatio, 0.0) AS AcceptedAnswerRatio,
+    COALESCE(cue.OthersPostsEditedByThisUser, 0) AS OthersPostsEditedByThisUser,
+    COALESCE(cue.HasCompleteProfileInfo, 0) AS HasCompleteProfileInfo,
+    (EXTRACT(EPOCH FROM (u.LastAccessDate - u.CreationDate)) / (60 * 60 * 24 * 365.25)) AS YearsOnPlatform,
+    CASE WHEN u.AboutMe IS NOT NULL AND LENGTH(TRIM(u.AboutMe)) > 100 THEN TRUE ELSE FALSE END AS HasDetailedAboutMe,
+    CASE WHEN u.Location IS NOT NULL AND u.Location LIKE '%United States%' THEN TRUE ELSE FALSE END AS FromUSA,
+    RANK() OVER (ORDER BY
+        (u.Reputation * 0.5
+         + COALESCE(ubs.TotalPostScore, 0) * 0.2
+         + COALESCE(u_badge.GoldBadges, 0) * 100
+         + COALESCE(u_badge.SilverBadges, 0) * 20
+         + COALESCE(urs.UpvotesReceived, 0) * 0.1
+         - COALESCE(urs.DownvotesReceived, 0) * 0.05
+         + COALESCE(ubs.AvgQuestionViewCount, 0) * 0.001
+         + COALESCE(u_mod.PostsClosedByThisUser, 0) * 50
+         + COALESCE(uta_sum.DistinctTagsUsed, 0) * 10
+         + COALESCE(cue.AcceptedAnswerRatio, 0.0) * 1000
+         + COALESCE(cue.HasCompleteProfileInfo, 0) * 50) DESC
+    ) AS OverallInfluenceRank,
+    -- Correlated subquery to count posts owned by user that are themselves duplicates of others
+    (SELECT COUNT(DISTINCT p_dup_source.Id)
+     FROM Posts p_dup_source
+     JOIN PostLinks pl_dup ON p_dup_source.Id = pl_dup.PostId
+     WHERE p_dup_source.OwnerUserId = u.Id AND pl_dup.LinkTypeId = 3) AS TotalPostsDuplicatedAsSource,
+    -- Correlated subquery to get the latest moderation action date for the user
+    (SELECT COALESCE(MAX(ph_mod.CreationDate), '1900-01-01'::timestamp)
+     FROM PostHistory ph_mod
+     WHERE ph_mod.UserId = u.Id AND ph_mod.PostHistoryTypeId IN (10, 12, 14, 19)) AS LastModerationActionDate
+FROM Users u
+LEFT JOIN UserBaseStats ubs ON u.Id = ubs.UserId
+LEFT JOIN UserBadgeSummary u_badge ON u.Id = u_badge.UserId
+LEFT JOIN UserReceivedVoteStats urs ON u.Id = urs.UserId
+LEFT JOIN UserModerationSummary u_mod ON u.Id = u_mod.UserId
+LEFT JOIN UserTagSummary uta_sum ON u.Id = uta_sum.UserId
+LEFT JOIN ComplexUserEngagement cue ON u.Id = cue.UserId
+INNER JOIN ClosingOnlyModerators com_filter ON u.Id = com_filter.UserId -- Users who only close, but never reopen
+WHERE u.Reputation > 10000
+  AND COALESCE(ubs.TotalPosts, 0) > 50
+  AND ubs.LastPostDate > CURRENT_DATE - INTERVAL '6 months' -- Active in the last 6 months
+  AND COALESCE(u_mod.PostsClosedByThisUser, 0) > 2 -- Has closed at least 3 posts
+  AND COALESCE(cue.AvgAcceptedAnswerBodyLength, 0) > 150 -- Has substantial accepted answers
+  AND (LENGTH(COALESCE(u.AboutMe, '')) > 50 OR u.WebsiteUrl IS NOT NULL) -- Has some profile details
+  AND u.Id NOT IN (
+        SELECT v.UserId FROM Votes v WHERE v.VoteTypeId = 4 GROUP BY v.UserId HAVING COUNT(v.Id) > 3 -- Exclude users with more than 3 "Offensive" votes
+    )
+ORDER BY OverallInfluenceRank ASC, u.Reputation DESC
+LIMIT 100;

@@ -1,0 +1,147 @@
+-- {"query": "5492.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1175} 
+WITH
+-- sample correlated subquery to compute advanced metrics per user
+UserStats AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName AS UserName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    -- total posts by user
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id) AS PostCount,
+    -- total questions by user
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS QuestionCount,
+    -- total answers by user
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS AnswerCount,
+    -- total comments by user
+    (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id) AS CommentCount,
+    -- latest post activity date by user
+    (SELECT MAX(p.LastActivityDate) FROM Posts p WHERE p.OwnerUserId = u.Id) AS LastActivityForUser
+  FROM Users u
+  WHERE u.AccountId IS NOT NULL
+),
+-- gather top interactions via Votes with complex predicates and window functions
+TopVotes AS (
+  SELECT
+    v.UserId,
+    v.PostId,
+    v.VoteTypeId,
+    v.CreationDate,
+    p.PostTypeId,
+    p.Title,
+    p.Tags,
+    -- compute a weighted score by vote type and post type
+    CASE v.VoteTypeId
+      WHEN 2 THEN 3     -- UpMod
+      WHEN 10 THEN 5    -- Deletion
+      WHEN 11 THEN 4    -- Undeletion
+      WHEN 14 THEN 6    -- NominateModerator
+      WHEN 16 THEN 7    -- ApproveEditSuggestion
+      ELSE 1
+    END
+    * CASE p.PostTypeId
+        WHEN 1 THEN 2  -- questions get more weight
+        WHEN 2 THEN 1
+        ELSE 0
+      END
+    AS Weight
+  FROM Votes v
+  JOIN Posts p ON p.Id = v.PostId
+  WHERE v.CreationDate >= DATEADD(year, -2, cast('2024-10-01' as date))
+    AND v.VoteTypeId IN (2, 10, 11, 14, 16)
+),
+-- compute a rolling window for each user: last 7 days activity weighted by interactions
+RollingActivity AS (
+  SELECT
+    tv.UserId,
+    tv.PostId,
+    tv.VoteTypeId,
+    tv.CreationDate,
+    tv.Weight,
+    -- 7-day moving sum of weights for the user
+    SUM(tv.Weight) OVER (PARTITION BY tv.UserId
+                         ORDER BY tv.CreationDate
+                         ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS SevenDayWeight
+  FROM TopVotes tv
+),
+-- hot posts: correlate posts with near-duplicate links and tag-based activity
+HotPosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.ViewCount,
+    p.Score,
+    p.LastActivityDate,
+    -- count of related posts via links of type 1 (Linked) or 3 (Duplicate)
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId IN (1,3)) AS RelatedLinks,
+    -- whether post is community-owned
+    CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN 1 ELSE 0 END AS IsCommunityOwned
+  FROM Posts p
+  WHERE p.LastActivityDate >= DATEADD(quarter, -2, cast('2024-10-01' as date))
+),
+-- windowed ranking across posts by a composite signal
+PostRanking AS (
+  SELECT
+    hp.PostId,
+    hp.Title,
+    hp.Tags,
+    hp.ViewCount,
+    hp.Score,
+    hp.RelatedLinks,
+    hp.IsCommunityOwned,
+    ROW_NUMBER() OVER (
+      ORDER BY
+        hp.ViewCount * 0.4 +
+        hp.Score * 0.6 +
+        hp.RelatedLinks * 0.2 +
+        hp.IsCommunityOwned * 5
+    ) AS Ranking
+  FROM HotPosts hp
+  WHERE hp.LastActivityDate >= DATEADD(month, -1, cast('2024-10-01' as date))
+),
+-- final join: per-user activity with their top ranked posts and correlated stats
+BenchmarkQuery AS (
+  SELECT
+    us.UserId,
+    us.UserName,
+    us.Reputation,
+    us.PostCount,
+    us.QuestionCount,
+    us.AnswerCount,
+    ro.SevenDayWeight,
+    pr.PostId,
+    pr.Title AS PostTitle,
+    pr.Tags AS PostTags,
+    pr.ViewCount AS PostViews,
+    pr.Score AS PostScore,
+    pr.RelatedLinks,
+    pr.IsCommunityOwned,
+    ROW_NUMBER() OVER (PARTITION BY us.UserId ORDER BY pr.Ranking) AS UserPostRank
+  FROM UserStats us
+  LEFT JOIN RollingActivity ro ON ro.UserId = us.UserId
+  LEFT JOIN (
+      SELECT PostId, Title, Tags, ViewCount, Score, RelatedLinks, IsCommunityOwned, Ranking
+      FROM PostRanking
+  ) pr ON pr.PostId = ro.PostId
+)
+SELECT
+  UserId,
+  UserName,
+  Reputation,
+  PostCount,
+  QuestionCount,
+  AnswerCount,
+  SevenDayWeight,
+  PostId,
+  PostTitle,
+  PostTags,
+  PostViews,
+  PostScore,
+  RelatedLinks,
+  IsCommunityOwned,
+  UserPostRank
+FROM BenchmarkQuery
+WHERE UserPostRank <= 5
+ORDER BY UserName, UserPostRank;

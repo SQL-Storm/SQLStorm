@@ -1,0 +1,249 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT c.Id) as Comments,
+        COUNT(DISTINCT b.Id) as Badges,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        COALESCE(MAX(p.CreationDate), u.CreationDate) as LastActivity,
+        ROW_NUMBER() OVER (ORDER BY COALESCE(SUM(p.Score), 0) DESC) as RankByScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.CreationDate
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END as PostType,
+        CASE 
+            WHEN p.Score >= 100 THEN 'HighlyVoted'
+            WHEN p.Score >= 25 THEN 'ModeratelyVoted'
+            WHEN p.Score >= 1 THEN 'LowVoted'
+            ELSE 'NoVotes'
+        END as VoteCategory,
+        COALESCE(p.Tags, '') as Tags,
+        (SELECT STRING_AGG(DISTINCT SUBSTRING(p2.Tags FROM 2 FOR CHAR_LENGTH(p2.Tags) - 2), ', ')
+         FROM Posts p2
+         WHERE p2.OwnerUserId = p.OwnerUserId AND p2.Tags IS NOT NULL AND p2.Tags <> ''
+        ) as UserTagSummary,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as PostRank,
+        LAG(p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PreviousPostDate
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.Id IS NOT NULL
+    AND p.PostTypeId IN (1, 2)
+),
+ComplexPostMetrics AS (
+    SELECT 
+        pa.PostId,
+        pa.Title,
+        pa.Score,
+        pa.ViewCount,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.CreationDate,
+        pa.OwnerUserId,
+        pa.OwnerName,
+        pa.PostType,
+        pa.VoteCategory,
+        pa.Tags,
+        pa.UserTagSummary,
+        pa.PostRank,
+        CASE
+            WHEN pa.PreviousPostDate IS NOT NULL THEN
+                CAST(
+                    (EXTRACT(EPOCH FROM (CAST(pa.CreationDate AS TIMESTAMP) - CAST(pa.PreviousPostDate AS TIMESTAMP))) / 86400)
+                    AS INTEGER
+                )
+            ELSE
+                0
+        END as DaysSinceLastPost,
+        CASE 
+            WHEN pa.AnswerCount > 0 AND pa.Score > 0 THEN (pa.Score * 1.0 / pa.AnswerCount)
+            ELSE NULL 
+        END as ScorePerAnswer,
+        COALESCE(pa.Score, 0) + COALESCE(pa.ViewCount, 0) + COALESCE(pa.AnswerCount, 0) as CombinedMetric,
+        CASE 
+            WHEN pa.Score > (SELECT AVG(p3.Score) FROM Posts p3 WHERE p3.PostTypeId = 1) 
+                 AND pa.AnswerCount >= 3 
+                 AND pa.ViewCount > 100 
+                 AND pa.PostRank = 1 
+            THEN 'EliteQuestion'
+            WHEN pa.Score > 50 AND pa.AnswerCount >= 1 AND pa.ViewCount > 50 THEN 'PopularQuestion'
+            WHEN pa.Score <= 0 AND pa.ViewCount > 100 THEN 'LowScoreHighViewQuestion'
+            ELSE 'RegularQuestion'
+        END as QuestionClassification,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = pa.PostId) as CommentCountDirect
+    FROM PostAnalysis pa
+    WHERE pa.OwnerUserId IS NOT NULL
+    AND (pa.PostType = 'Question' OR pa.PostType = 'Answer')
+),
+UserPostSummary AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.Views,
+        uas.TotalPosts,
+        uas.Questions,
+        uas.Answers,
+        uas.Comments,
+        uas.Badges,
+        uas.TotalScore,
+        uas.LastActivity,
+        uas.RankByScore,
+        COALESCE(ups.PostsCount, 0) as LatestPostCount,
+        COALESCE(ups.ScoreSum, 0) as LatestScoreSum,
+        CASE 
+            WHEN uas.Reputation >= 10000 THEN 'Expert'
+            WHEN uas.Reputation >= 1000 THEN 'Intermediate'
+            WHEN uas.Reputation >= 100 THEN 'Beginner'
+            ELSE 'Novice'
+        END as UserLevel,
+        CASE 
+            WHEN uas.TotalPosts >= 100 THEN 'HighVolume'
+            WHEN uas.TotalPosts >= 50 THEN 'MediumVolume'
+            WHEN uas.TotalPosts >= 10 THEN 'LowVolume'
+            ELSE 'MinimalVolume'
+        END as ActivityLevel,
+        ROW_NUMBER() OVER (PARTITION BY 
+            CASE 
+                WHEN uas.Reputation >= 10000 THEN 'Expert'
+                WHEN uas.Reputation >= 1000 THEN 'Intermediate'
+                ELSE 'NonExpert'
+            END 
+            ORDER BY uas.TotalScore DESC) as InternalRank
+    FROM UserActivityStats uas
+    LEFT JOIN (
+        SELECT 
+            OwnerUserId,
+            COUNT(*) as PostsCount,
+            SUM(Score) as ScoreSum
+        FROM Posts 
+        WHERE CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6 months')
+        GROUP BY OwnerUserId
+    ) ups ON uas.UserId = ups.OwnerUserId
+),
+FinalAnalysis AS (
+    SELECT 
+        ups.UserId,
+        ups.DisplayName,
+        ups.Reputation,
+        ups.Views,
+        ups.TotalPosts,
+        ups.Questions,
+        ups.Answers,
+        ups.Comments,
+        ups.Badges,
+        ups.TotalScore,
+        ups.LastActivity,
+        ups.RankByScore,
+        ups.UserLevel,
+        ups.ActivityLevel,
+        ups.InternalRank,
+        MAX(cpm.PostId) as LatestPostId,
+        MAX(cpm.Title) as LatestTitle,
+        MAX(cpm.Score) as LatestScore,
+        MAX(cpm.ViewCount) as LatestViews,
+        MAX(cpm.AnswerCount) as LatestAnswers,
+        MAX(cpm.CommentCount) as LatestComments,
+        MAX(cpm.CombinedMetric) as MaxCombinedMetric,
+        STRING_AGG(DISTINCT cpm.QuestionClassification, ', ') as ClassificationSummaries,
+        STRING_AGG(DISTINCT CASE WHEN cpm.QuestionClassification LIKE 'Elite%' THEN cpm.Title END, ', ') as EliteTitles,
+        COALESCE(AVG(cpm.ScorePerAnswer), 0) as AvgScorePerAnswer,
+        COALESCE(SUM(CASE WHEN cpm.Score > 100 THEN 1 ELSE 0 END), 0) as HighScoreQuestions,
+        CASE 
+            WHEN ups.Reputation > 10000 AND ups.TotalPosts >= 50 THEN 'TopContributor'
+            WHEN ups.Reputation >= 5000 AND ups.TotalPosts >= 25 THEN 'ActiveContributor'
+            WHEN ups.TotalScore > 1000 THEN 'ActiveParticipant'
+            WHEN ups.Badges > 0 THEN 'BadgeHolder'
+            ELSE 'RegularMember'
+        END as ContributorStatus
+    FROM UserPostSummary ups
+    LEFT JOIN ComplexPostMetrics cpm ON ups.UserId = cpm.OwnerUserId
+    WHERE ups.UserId IS NOT NULL
+    GROUP BY 
+        ups.UserId,
+        ups.DisplayName,
+        ups.Reputation,
+        ups.Views,
+        ups.TotalPosts,
+        ups.Questions,
+        ups.Answers,
+        ups.Comments,
+        ups.Badges,
+        ups.TotalScore,
+        ups.LastActivity,
+        ups.RankByScore,
+        ups.UserLevel,
+        ups.ActivityLevel,
+        ups.InternalRank
+    HAVING COUNT(*) > 0
+)
+SELECT 
+    fa.UserId,
+    fa.DisplayName,
+    fa.Reputation,
+    fa.Views,
+    fa.TotalPosts,
+    fa.Questions,
+    fa.Answers,
+    fa.Comments,
+    fa.Badges,
+    fa.TotalScore,
+    fa.LastActivity,
+    fa.RankByScore,
+    fa.UserLevel,
+    fa.ActivityLevel,
+    fa.InternalRank,
+    fa.LatestPostId,
+    fa.LatestTitle,
+    fa.LatestScore,
+    fa.LatestViews,
+    fa.LatestAnswers,
+    fa.LatestComments,
+    fa.MaxCombinedMetric,
+    fa.ClassificationSummaries,
+    fa.EliteTitles,
+    fa.AvgScorePerAnswer,
+    fa.HighScoreQuestions,
+    fa.ContributorStatus,
+    CASE 
+        WHEN POSITION('Elite' IN COALESCE(fa.ClassificationSummaries, '')) > 0 THEN 'ContainsEliteQuestions'
+        WHEN POSITION('Popular' IN COALESCE(fa.ClassificationSummaries, '')) > 0 THEN 'ContainsPopularQuestions'
+        ELSE 'NoElitePopular'
+    END as QuestionTypeIndicator,
+    -- portable repeat: use REPEAT with explicit integer cast where needed; compute repeats between 1 and 10
+    REPEAT('*', CAST(((fa.TotalScore / 100) % 10) + 1 AS INTEGER)) as ScoreStarRating,
+    (SELECT COUNT(*) FROM FinalAnalysis WHERE ContributorStatus = 'TopContributor') as TopContributorCount,
+    (SELECT COUNT(*) FROM FinalAnalysis WHERE ContributorStatus = 'ActiveContributor') as ActiveContributorCount,
+    (SELECT COUNT(*) FROM FinalAnalysis WHERE ContributorStatus = 'ActiveParticipant') as ActiveParticipantCount,
+    (SELECT COUNT(*) FROM FinalAnalysis WHERE ContributorStatus = 'BadgeHolder') as BadgeHolderCount,
+    (SELECT COUNT(*) FROM FinalAnalysis WHERE ContributorStatus = 'RegularMember') as RegularMemberCount
+FROM FinalAnalysis fa
+WHERE fa.UserId IS NOT NULL
+AND (fa.Reputation > 100 OR fa.TotalPosts >= 1)
+ORDER BY fa.TotalScore DESC, fa.RankByScore ASC, fa.UserId ASC
+LIMIT 1000 OFFSET 0;

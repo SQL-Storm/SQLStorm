@@ -1,0 +1,199 @@
+-- {"query": "1442.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3062} 
+
+WITH UserActivitySummary AS (
+    -- Summarize user activity, reputation, and initial post engagement metrics
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName AS UserName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        MAX(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS HasGoldBadge, -- Binary flag for Gold badge
+        COUNT(p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        AVG(CAST(COALESCE(p.Score, 0) AS numeric)) AS AvgPostScore, -- Average score of all posts, handling NULL scores
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (10, 12, 14, 19) THEN 1 ELSE 0 END) AS ModerationActionCount, -- Count of close, delete, lock, protect actions
+        RANK() OVER (ORDER BY u.Reputation DESC, u.CreationDate ASC) AS ReputationRank -- Rank users by reputation and creation date
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId AND ph.PostId = p.Id AND ph.PostHistoryTypeId IN (10, 12, 14, 19)
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+    HAVING COUNT(p.Id) > 5 -- Filter for users with more than 5 posts to ensure active contributors
+),
+PostDetailStats AS (
+    -- Calculate detailed statistics for each post, including engagement, history, and temporal dynamics
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.LastActivityDate,
+        p.Score,
+        COALESCE(p.ViewCount, 0) AS ViewCount,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        COALESCE(p.CommentCount, 0) AS CommentCount,
+        COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+        p.Title,
+        p.Tags,
+        p.ClosedDate,
+        -- Engagement Score: Score weighted by comment density, handling division by zero for ViewCount
+        CAST(COALESCE(p.Score, 0) AS numeric) * (1.0 + COALESCE(p.CommentCount, 0) / NULLIF(COALESCE(p.ViewCount, 0), 0.1)) AS EngagementScore,
+        -- Correlated subquery: Count of distinct voters (upmod/downmod) within 30 days of post creation
+        (SELECT COUNT(DISTINCT v.UserId)
+         FROM Votes v
+         WHERE v.PostId = p.Id
+           AND v.VoteTypeId IN (2, 3) -- UpMod, DownMod
+           AND v.CreationDate BETWEEN p.CreationDate AND (p.CreationDate + INTERVAL '30 days')
+        ) AS InitialVoterCount,
+        -- Count of significant edits (body, title, tags revisions)
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6, 8, 9) THEN ph.Id END) AS SignificantEditCount,
+        -- Time difference in hours between last activity and last edit (or creation if no edit)
+        EXTRACT(EPOCH FROM (p.LastActivityDate - COALESCE(p.LastEditDate, p.CreationDate))) / 3600 AS HoursSinceLastEditToActivity,
+        -- Window functions: Previous post's score and type by the same owner
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostScore,
+        LAG(p.PostTypeId, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostType
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    WHERE p.PostTypeId IN (1, 2) -- Focus on Questions (1) and Answers (2)
+    GROUP BY p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.LastActivityDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.Title, p.Tags, p.ClosedDate, p.LastEditDate
+),
+TagPerformance AS (
+    -- Explode tags from posts to analyze individual tag performance
+    SELECT
+        PostId,
+        OwnerUserId,
+        unnest(string_to_array(substring(Tags, 2, length(Tags)-2), '><')) AS TagName, -- String function to parse tags
+        Score
+    FROM Posts
+    WHERE Tags IS NOT NULL AND Tags LIKE '<%>%<' -- Filter for valid tag strings
+),
+UserTagAgg AS (
+    -- Aggregate tag performance per user to find their most impactful tag
+    SELECT
+        tp.OwnerUserId AS UserId,
+        tp.TagName,
+        COUNT(tp.PostId) AS PostsInTag,
+        SUM(tp.Score) AS TotalTagScore,
+        RANK() OVER (PARTITION BY tp.OwnerUserId ORDER BY SUM(tp.Score) DESC, COUNT(tp.PostId) DESC) AS TagRankForUser -- Rank tags for each user
+    FROM TagPerformance tp
+    GROUP BY tp.OwnerUserId, tp.TagName
+),
+PostLinkAnalysis AS (
+    -- Analyze post linking (duplicates, related posts) to understand context and importance
+    SELECT
+        pl.PostId,
+        COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 1 THEN pl.RelatedPostId END) AS LinkedPostCount,
+        COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN pl.RelatedPostId END) AS DuplicatePostCount,
+        SUM(CASE WHEN p_related.Score > pl_current.Score THEN 1 ELSE 0 END) AS RelatedPostHigherScoreCount
+    FROM PostLinks pl
+    JOIN Posts pl_current ON pl.PostId = pl_current.Id
+    LEFT JOIN Posts p_related ON pl.RelatedPostId = p_related.Id
+    GROUP BY pl.PostId
+),
+PostsNeedingReview AS (
+    -- Set operator (UNION ALL): Identify posts that might require moderator or community attention
+    -- Branch 1: Older, highly viewed questions with no answers and low score
+    SELECT
+        p.Id AS PostId,
+        'StuckQuestion' AS ReviewReason,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.AnswerCount = 0
+      AND p.ViewCount > 1000
+      AND p.Score <= 0
+      AND p.CreationDate < (CURRENT_DATE - INTERVAL '6 months')
+    UNION ALL
+    -- Branch 2: Recently posted answers with significant downvotes
+    SELECT
+        p.Id AS PostId,
+        'LowQualityAnswer' AS ReviewReason,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        0 AS AnswerCount -- Not applicable for answers, set to 0 for union consistency
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+      AND p.Score < -5 -- Significantly downvoted
+      AND p.CreationDate > (CURRENT_DATE - INTERVAL '1 year')
+)
+-- Main query: Combines all CTEs to generate a comprehensive performance benchmark view
+SELECT
+    uas.UserId,
+    uas.UserName,
+    uas.Reputation,
+    uas.ReputationRank,
+    pds.PostId,
+    pds.Title,
+    pds.PostTypeId,
+    pds.PostCreationDate,
+    pds.LastActivityDate,
+    pds.Score AS PostScore,
+    pds.ViewCount,
+    pds.AnswerCount,
+    pds.CommentCount,
+    pds.FavoriteCount,
+    pds.EngagementScore,
+    pds.InitialVoterCount,
+    pds.SignificantEditCount,
+    pds.HoursSinceLastEditToActivity,
+    pds.PreviousPostScore,
+    pds.PreviousPostType,
+    pta.TagName AS TopTagForUser, -- The user's highest-ranking tag
+    pta.PostsInTag AS TopTagPostsCount,
+    pta.TotalTagScore AS TopTagTotalScore,
+    pla.LinkedPostCount,
+    pla.DuplicatePostCount,
+    pla.RelatedPostHigherScoreCount,
+    COALESCE(pnr.ReviewReason, 'NoReviewNeeded') AS ReviewReason, -- NULL logic: Indicates if post is flagged for review
+    -- Complex NULL logic and CASE statement for Post Status categorization
+    COALESCE(
+        CASE
+            WHEN pds.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN pnr.ReviewReason IS NOT NULL THEN 'FlaggedForReview'
+            WHEN pds.PostTypeId = 1 AND COALESCE(pds.AnswerCount, 0) = 0 AND pds.CreationDate < (CURRENT_DATE - INTERVAL '1 year') THEN 'StaleUnansweredQuestion'
+            WHEN pds.PostTypeId = 2 AND pds.Score < 0 AND pds.SignificantEditCount = 0 THEN 'LowQualityAnswerNoEdits'
+            ELSE 'Active'
+        END, 'Unknown' -- Fallback for unexpected NULLs
+    ) AS PostStatus,
+    -- Complicated calculation for Overall Post Health Score, weighted by multiple factors
+    ROUND(
+        (uas.AvgPostScore * 0.25) +
+        (COALESCE(pds.EngagementScore, 0) * 0.35) +
+        (CASE WHEN pta.TagName IS NOT NULL THEN COALESCE(pta.TotalTagScore, 0) / NULLIF(COALESCE(pta.PostsInTag, 0), 0) ELSE 0 END * 0.2) +
+        (CASE WHEN COALESCE(pds.SignificantEditCount, 0) > 0 AND pds.HoursSinceLastEditToActivity IS NOT NULL THEN 100.0 / (1.0 + pds.HoursSinceLastEditToActivity) ELSE 0 END * 0.1) +
+        (CASE WHEN COALESCE(pla.DuplicatePostCount, 0) > 0 THEN -50 ELSE 0 END * 0.1) -- Penalty for duplicates
+    , 2) AS OverallPostHealthScore,
+    -- Boolean flag for potentially "stuck" questions (high views, no answers, low score)
+    CASE
+        WHEN pds.PostTypeId = 1 AND COALESCE(pds.AnswerCount, 0) = 0 AND pds.ViewCount > 500 AND pds.Score <= 5 THEN TRUE
+        ELSE FALSE
+    END AS IsStuckQuestionFlag,
+    -- String expressions: Uppercase first 50 characters of title, lowercase first 100 characters of body
+    UPPER(LEFT(COALESCE(pds.Title, 'No Title'), 50)) AS TitleSnippet_UC,
+    LOWER(SUBSTRING(COALESCE(pds.Body, 'No Body') FROM 1 FOR 100)) AS BodyStartSnippet_LC,
+    -- Another complex calculation: User Influence Metric based on reputation and total posts
+    (uas.Reputation / 1000.0) * (uas.TotalPosts / 10.0) AS UserInfluenceMetric
+FROM UserActivitySummary uas
+INNER JOIN PostDetailStats pds ON uas.UserId = pds.OwnerUserId
+LEFT JOIN UserTagAgg pta ON uas.UserId = pta.UserId AND pta.TagRankForUser = 1 -- Join for the user's top tag
+LEFT JOIN PostLinkAnalysis pla ON pds.PostId = pla.PostId
+LEFT JOIN PostsNeedingReview pnr ON pds.PostId = pnr.PostId -- Join to identify posts flagged for review
+WHERE
+    uas.Reputation >= 5000 -- Filter for highly reputable users
+    AND pds.EngagementScore > 50 -- Filter for posts with significant engagement
+    AND (pds.PostTypeId = 1 OR (pds.PostTypeId = 2 AND pds.Score > 0)) -- Questions or answers with positive scores
+    AND pds.PostCreationDate BETWEEN (CURRENT_DATE - INTERVAL '3 year') AND CURRENT_DATE -- Posts from the last 3 years
+    AND (pds.Title ILIKE '%database%' OR pds.Tags ILIKE '%<sql>%') -- String predicate: Title contains 'database' or tags include '<sql>' (case-insensitive)
+    AND COALESCE(pds.AnswerCount, 0) >= 1 -- Only questions with at least one answer, or answers themselves
+ORDER BY
+    OverallPostHealthScore DESC,
+    UserInfluenceMetric DESC,
+    pds.LastActivityDate DESC
+LIMIT 500;

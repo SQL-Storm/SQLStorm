@@ -1,0 +1,125 @@
+SELECT 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) as TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN p.Id END) as QuestionsWithAcceptedAnswer,
+    AVG(CAST(p.Score AS DOUBLE PRECISION)) as AvgScore,
+    MAX(p.ViewCount) as MaxViews,
+    COUNT(DISTINCT b.Id) as BadgesCount,
+    STRING_AGG(DISTINCT b.Name, ', ') as BadgeNames,
+    COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) as GoldBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) as SilverBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) as BronzeBadges,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) - 
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN p.Id END) as UnansweredQuestions,
+    (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = u.Id AND p2.PostTypeId = 1 AND p2.Score > 0) as PositiveScoreQuestions,
+    (SELECT COUNT(*) FROM Posts p3 WHERE p3.OwnerUserId = u.Id AND p3.PostTypeId = 2 AND p3.Score > 0) as PositiveScoreAnswers,
+    COUNT(DISTINCT c.Id) as CommentsMade,
+    COUNT(DISTINCT ph.Id) as PostHistoryEntries,
+    COALESCE(NULLIF(STRING_AGG(DISTINCT SUBSTR(p.Title, 1, 50), ' | '), ''), 'No Titles') as SampleTitles,
+    CASE 
+        WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+            ROUND(
+              (CAST(COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS NUMERIC) / 
+               NULLIF(CAST(COUNT(DISTINCT p.Id) AS NUMERIC), 0) * 100)
+            , 2)
+        ELSE 0 
+    END as QuestionPercentage,
+    CASE 
+        WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+            ROUND(
+              (CAST(COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS NUMERIC) / 
+               NULLIF(CAST(COUNT(DISTINCT p.Id) AS NUMERIC), 0) * 100)
+            , 2)
+        ELSE 0 
+    END as AnswerPercentage,
+    (SELECT 
+        CASE 
+            WHEN COUNT(*) = 0 THEN 'No Votes'
+            WHEN SUM(CASE WHEN v.VoteTypeId IN (1,2,3) THEN 1 ELSE 0 END) = 0 THEN 'No Voting Activity'
+            ELSE 'Active Voted User'
+        END 
+     FROM Votes v 
+     WHERE v.UserId = u.Id
+    ) as VotingActivity,
+    LAG(u.Reputation, 1, 0) OVER (ORDER BY u.Reputation DESC) - u.Reputation as ReputationDifferenceFromNext,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) as ReputationRank,
+    RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) as PostCountRank,
+    DENSE_RANK() OVER (ORDER BY u.Reputation DESC) as DenseReputationRank,
+    (SELECT COUNT(*) FROM Posts p4 WHERE p4.OwnerUserId = u.Id AND p4.CreationDate > TIMESTAMP '2020-01-01') as PostsSince2020,
+    STRING_AGG(DISTINCT LOWER(TRIM(p.Tags)), ' ') as AllTags,
+    (SELECT COUNT(*) FROM Posts p5 WHERE p5.OwnerUserId = u.Id AND p5.ViewCount > 1000) as HighViewPosts,
+    (SELECT COUNT(*) FROM Posts p6 WHERE p6.OwnerUserId = u.Id AND p6.Score > 10) as HighScorePosts,
+    (SELECT COUNT(*) FROM Votes v2 WHERE v2.UserId = u.Id AND v2.VoteTypeId = 2) as UpVotes,
+    (SELECT COUNT(*) FROM Votes v3 WHERE v3.UserId = u.Id AND v3.VoteTypeId = 3) as DownVotes,
+    (SELECT COUNT(*) FROM Votes v4 WHERE v4.UserId = u.Id AND v4.VoteTypeId = 5) as Favorites,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = u.Id) AND pl.LinkTypeId = 3) as DuplicateLinks,
+    (SELECT COUNT(*) FROM Posts p7 WHERE p7.OwnerUserId = u.Id AND p7.PostTypeId = 1 AND p7.ClosedDate IS NOT NULL) as ClosedQuestions,
+    (SELECT COUNT(*) FROM Posts p8 WHERE p8.OwnerUserId = u.Id AND p8.PostTypeId = 1 AND p8.AnswerCount = 0) as NoAnswerQuestions,
+    (SELECT 
+        CASE 
+            WHEN COUNT(*) = 0 THEN 'No Recent Activity'
+            ELSE 'Active User'
+        END 
+     FROM Posts p9 
+     WHERE p9.OwnerUserId = u.Id AND p9.LastActivityDate > (TIMESTAMP '2024-10-01 12:34:56') - INTERVAL '30' DAY
+    ) as RecentActivityStatus,
+    (SELECT 
+        COALESCE(
+            STRING_AGG(
+                CASE 
+                    WHEN p10.CreationDate >= DATE '2020-01-01' THEN '2020+'
+                    WHEN p10.CreationDate >= DATE '2019-01-01' THEN '2019'
+                    WHEN p10.CreationDate >= DATE '2018-01-01' THEN '2018'
+                    WHEN p10.CreationDate >= DATE '2017-01-01' THEN '2017'
+                    ELSE 'Before 2017'
+                END, ', '
+            ), 
+            'No Posts'
+        ) 
+     FROM Posts p10 
+     WHERE p10.OwnerUserId = u.Id
+    ) as YearlyPostDistribution
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN Comments c ON u.Id = c.UserId
+LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+LEFT JOIN Posts p11 ON p11.OwnerUserId = u.Id
+WHERE u.Reputation > 1000
+    AND (u.LastAccessDate > (TIMESTAMP '2024-10-01 12:34:56') - INTERVAL '365' DAY OR u.CreationDate > (TIMESTAMP '2024-10-01 12:34:56') - INTERVAL '365' DAY)
+    AND u.Id IN (
+        SELECT UserId 
+        FROM Badges 
+        WHERE Name IN ('Populist', 'Great Question', 'Guru')
+        GROUP BY UserId 
+        HAVING COUNT(DISTINCT Name) >= 3
+    )
+GROUP BY 
+    u.Id, 
+    u.DisplayName, 
+    u.Reputation
+HAVING 
+    COUNT(DISTINCT p.Id) > 0
+    AND (
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 0 
+        OR COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) > 0
+    )
+    AND COUNT(DISTINCT b.Id) >= 1
+    AND (COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 0 
+        OR COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) > 0)
+    AND (
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) * 1.5 > 
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END)
+        OR
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) * 1.5 > 
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END)
+    )
+ORDER BY 
+    u.Reputation DESC,
+    COUNT(DISTINCT p.Id) DESC,
+    COUNT(DISTINCT b.Id) DESC
+LIMIT 10000;

@@ -1,0 +1,128 @@
+-- {"query": "4584.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1653} 
+WITH RankedPostEdits AS (
+    SELECT
+        ph.PostId,
+        ph.UserId,
+        ph.CreationDate,
+        ph.PostHistoryTypeId,
+        ph.Comment,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) as rn
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+),
+PostEditSummary AS (
+    SELECT
+        rpe.PostId,
+        COUNT(rpe.PostHistoryTypeId) AS NumberOfEdits,
+        MAX(CASE WHEN rpe.PostHistoryTypeId = 4 THEN 1 ELSE 0 END) AS HasTitleEdit,
+        MAX(CASE WHEN rpe.PostHistoryTypeId = 5 THEN 1 ELSE 0 END) AS HasBodyEdit,
+        MAX(CASE WHEN rpe.PostHistoryTypeId = 6 THEN 1 ELSE 0 END) AS HasTagsEdit,
+        AVG(DATEDIFF(minute,LAG(rpe.CreationDate, 1, rpe.CreationDate) OVER (PARTITION BY rpe.PostId ORDER BY rpe.CreationDate), rpe.CreationDate)) AS AvgEditTimeMinutes
+    FROM RankedPostEdits rpe
+    WHERE rpe.rn <= 5 -- Consider only the top 5 edits for each post
+    GROUP BY rpe.PostId
+),
+UserContributionScore AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        (u.Reputation * 0.6) + (b.GoldCount * 10) + (b.SilverCount * 5) + (b.BronzeCount * 1) AS TotalScore,
+        u.Views AS UserViews,
+        u.UpVotes AS UserUpVotes
+    FROM Users u
+    LEFT JOIN (
+        SELECT
+            UserId,
+            SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldCount,
+            SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverCount,
+            SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeCount
+        FROM Badges
+        GROUP BY UserId
+    ) b ON u.Id = b.UserId
+)
+SELECT
+    p.Id AS PostId,
+    pt.Name AS PostType,
+    p.Title,
+    p.CreationDate AS PostCreationDate,
+    p.Score AS PostScore,
+    COALESCE(p.ViewCount, 0) AS PostViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.OwnerUserId,
+    ucs.DisplayName AS OwnerDisplayName,
+    COALESCE(pes.NumberOfEdits, 0) AS TotalEditsOnPost,
+    COALESCE(pes.HasTitleEdit, 0) AS EditedTitle,
+    COALESCE(pes.HasBodyEdit, 0) AS EditedBody,
+    COALESCE(pes.HasTagsEdit, 0) AS EditedTags,
+    CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+    CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN 1 ELSE 0 END AS IsCommunityOwned,
+    CASE WHEN p.Tags IS NULL OR p.Tags = '' THEN 'No Tags' ELSE SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2) END AS FormattedTags,
+    CASE
+        WHEN ucs.TotalScore IS NULL THEN 0
+        WHEN ucs.TotalScore > 1000000 THEN 'Legendary'
+        WHEN ucs.TotalScore > 500000 THEN 'Expert'
+        WHEN ucs.TotalScore > 100000 THEN 'Advanced'
+        WHEN ucs.TotalScore > 25000 THEN 'Experienced'
+        WHEN ucs.TotalScore > 5000 THEN 'Intermediate'
+        WHEN ucs.TotalScore > 1000 THEN 'Novice'
+        ELSE 'Beginner'
+    END AS UserContributionLevel,
+    CASE
+        WHEN EXISTS (SELECT 1 FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) THEN 'HasUpvotes'
+        WHEN EXISTS (SELECT 1 FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) THEN 'HasDownvotes'
+        ELSE 'NoVotes'
+    END AS VoteStatus,
+    p.Score - COALESCE(p.AnswerCount, 0) AS NetScoreVsAnswers,
+    (p.Score * 1.0 / NULLIF(p.ViewCount, 0)) * 100 AS ScorePerViewPercentage,
+    DATEDIFF(day, p.CreationDate, cast('2024-10-01 12:34:56' as timestamp)) AS DaysSinceCreation,
+    CASE
+        WHEN p.OwnerUserId IS NOT NULL AND p.OwnerUserId = p.LastEditorUserId THEN 'OwnerLastEditor'
+        WHEN p.LastEditorUserId IS NOT NULL THEN 'DifferentEditor'
+        ELSE 'NoEditor'
+    END AS EditorType,
+    CASE
+        WHEN p.AcceptedAnswerId IS NOT NULL THEN 'AcceptedAnswerExists'
+        ELSE 'NoAcceptedAnswer'
+    END AS AnswerStatus,
+    CASE
+        WHEN p.Id = p.AcceptedAnswerId THEN 'IsAcceptedAnswer'
+        ELSE 'IsNotAcceptedAnswer'
+    END AS SelfAnswerStatus,
+    SUM(COALESCE(c.Score, 0)) OVER (PARTITION BY p.Id) AS TotalCommentScoreForPost,
+    AVG(DATEDIFF(minute, p.CreationDate, p.LastActivityDate)) OVER (PARTITION BY p.OwnerUserId) AS AvgPostActivityTimeForUser
+FROM Posts p
+JOIN PostTypes pt ON p.PostTypeId = pt.Id
+LEFT JOIN UserContributionScore ucs ON p.OwnerUserId = ucs.UserId
+LEFT JOIN PostEditSummary pes ON p.Id = pes.PostId
+LEFT JOIN Comments c ON p.Id = c.PostId
+WHERE p.CreationDate BETWEEN '2023-01-01' AND '2023-12-31'
+  AND p.Score > 5
+  AND p.PostTypeId IN (1, 2) -- Questions and Answers
+  AND EXISTS (SELECT 1 FROM Tags t WHERE t.TagName = 'sql')
+  AND (p.Title LIKE '%performance%' OR p.Body LIKE '%performance%')
+GROUP BY
+    p.Id,
+    pt.Name,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.OwnerUserId,
+    ucs.DisplayName,
+    ucs.TotalScore,
+    pes.NumberOfEdits,
+    pes.HasTitleEdit,
+    pes.HasBodyEdit,
+    pes.HasTagsEdit,
+    p.ClosedDate,
+    p.CommunityOwnedDate,
+    p.Tags,
+    p.AcceptedAnswerId,
+    p.LastEditorUserId,
+    p.LastActivityDate
+HAVING COUNT(c.Id) > 3 OR p.Score > 20;

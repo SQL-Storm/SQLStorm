@@ -1,0 +1,411 @@
+with recent_questions as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.Tags,
+        coalesce(q.AnswerCount, 0) as AnswerCount,
+        case when q.ClosedDate is null then 0 else 1 end as IsClosed
+    from Posts q
+    where q.PostTypeId = 1
+      and q.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+),
+user_activity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate as UserCreated,
+        u.Location,
+        u.UpVotes,
+        u.DownVotes,
+        u.Views as ProfileViews,
+        coalesce(b.badge_count, 0) as BadgeCount,
+        coalesce(b.gold_count, 0) as GoldBadges,
+        coalesce(b.silver_count, 0) as SilverBadges,
+        coalesce(b.bronze_count, 0) as BronzeBadges
+    from Users u
+    left join (
+        select
+            UserId,
+            count(*) as badge_count,
+            sum(case when Class = 1 then 1 else 0 end) as gold_count,
+            sum(case when Class = 2 then 1 else 0 end) as silver_count,
+            sum(case when Class = 3 then 1 else 0 end) as bronze_count
+        from Badges
+        group by UserId
+    ) b on b.UserId = u.Id
+),
+answers as (
+    select
+        a.ParentId as QuestionId,
+        count(*) as AnswerTotal,
+        sum(case when a.Score > 0 then 1 else 0 end) as PosAnswers,
+        sum(case when a.Score < 0 then 1 else 0 end) as NegAnswers,
+        max(a.Score) as MaxAnswerScore,
+        min(a.Score) as MinAnswerScore,
+        sum(a.Score) as SumAnswerScore
+    from Posts a
+    where a.PostTypeId = 2
+    group by a.ParentId
+),
+question_votes as (
+    select
+        v.PostId as QuestionId,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+        sum(case when v.VoteTypeId = 5 then 1 else 0 end) as Favorites
+    from Votes v
+    join Posts p on p.Id = v.PostId and p.PostTypeId = 1
+    group by v.PostId
+),
+dup_links as (
+    select
+        pl.PostId as QuestionId,
+        sum(case when pl.LinkTypeId = 3 then 1 else 0 end) as DuplicateCount,
+        sum(case when pl.LinkTypeId = 1 then 1 else 0 end) as LinkedCount
+    from PostLinks pl
+    group by pl.PostId
+),
+close_reasons as (
+    select
+        ph.PostId as QuestionId,
+        (array_agg(ph.Comment order by ph.CreationDate desc))[1] as LastCloseReasonId,
+        max(ph.CreationDate) as LastClosedAt
+    from PostHistory ph
+    where ph.PostHistoryTypeId = 10
+    group by ph.PostId
+),
+tag_expansion as (
+    select
+        q.QuestionId,
+        unnest(string_to_array(substring(q.Tags, 2, length(q.Tags)-2), '><')) as TagName
+    from recent_questions q
+    where q.Tags is not null and q.Tags like '<%>'
+),
+tag_stats as (
+    select
+        te.QuestionId,
+        array_agg(distinct te.TagName order by te.TagName) as TagsArray,
+        count(*) as TagCount,
+        sum(case when lower(te.TagName) in ('sql','postgresql','postgres','mysql','sqlite','tsql') then 1 else 0 end) as IsDataTag
+    from tag_expansion te
+    group by te.QuestionId
+),
+answerer_diversity as (
+    select
+        q.Id as QuestionId,
+        count(distinct a.OwnerUserId) filter (where a.OwnerUserId is not null) as DistinctAnswerers
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+    group by q.Id
+),
+comment_pulse as (
+    select
+        c.PostId as QuestionId,
+        count(*) as CommentCount,
+        max(c.CreationDate) as LastCommentAt,
+        sum(case when c.Score > 0 then 1 else 0 end) as PosComments
+    from Comments c
+    group by c.PostId
+),
+recent_activity as (
+    select
+        q.QuestionId,
+        greatest(
+            coalesce(q.CreationDate, cast('-infinity' as timestamp)),
+            coalesce(a2.LastAnsweredAt, cast('-infinity' as timestamp)),
+            coalesce(c2.LastCommentAt, cast('-infinity' as timestamp)),
+            coalesce(ph.LastClosedAt, cast('-infinity' as timestamp))
+        ) as LastActivityAt
+    from recent_questions q
+    left join (
+        select ParentId as QuestionId, max(CreationDate) as LastAnsweredAt
+        from Posts
+        where PostTypeId = 2
+        group by ParentId
+    ) a2 on a2.QuestionId = q.QuestionId
+    left join (
+        select PostId as QuestionId, max(CreationDate) as LastCommentAt
+        from Comments
+        group by PostId
+    ) c2 on c2.QuestionId = q.QuestionId
+    left join close_reasons ph on ph.QuestionId = q.QuestionId
+),
+ranked_questions as (
+    select
+        q.QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.IsClosed,
+        ts.TagsArray,
+        ts.TagCount,
+        ts.IsDataTag,
+        coalesce(a.AnswerTotal, 0) as AnswerTotal,
+        coalesce(a.PosAnswers, 0) as PosAnswers,
+        coalesce(a.NegAnswers, 0) as NegAnswers,
+        a.MaxAnswerScore,
+        a.MinAnswerScore,
+        a.SumAnswerScore,
+        coalesce(v.UpVotes, 0) as UpVoteCount,
+        coalesce(v.DownVotes, 0) as DownVoteCount,
+        coalesce(v.Favorites, 0) as FavoriteCount,
+        coalesce(dl.DuplicateCount, 0) as DuplicateCount,
+        coalesce(dl.LinkedCount, 0) as LinkedCount,
+        cr.LastCloseReasonId,
+        ra.LastActivityAt,
+        ap.DistinctAnswerers,
+        cp.CommentCount,
+        cp.LastCommentAt,
+        cp.PosComments,
+        (
+            0.4 * ln(1 + coalesce(v.UpVotes,0) - coalesce(v.DownVotes,0) + greatest(q.Score,0)) +
+            0.3 * ln(1 + coalesce(q.ViewCount,0)) +
+            0.2 * ln(1 + coalesce(a.AnswerTotal,0) + coalesce(cp.CommentCount,0)) +
+            0.1 * (case when q.IsClosed = 1 then 0 else 1 end) +
+            0.15 * coalesce(ts.IsDataTag,0) -
+            0.05 * coalesce(dl.DuplicateCount,0)
+        ) as RankScore
+    from recent_questions q
+    left join tag_stats ts on ts.QuestionId = q.QuestionId
+    left join answers a on a.QuestionId = q.QuestionId
+    left join question_votes v on v.QuestionId = q.QuestionId
+    left join dup_links dl on dl.QuestionId = q.QuestionId
+    left join close_reasons cr on cr.QuestionId = q.QuestionId
+    left join recent_activity ra on ra.QuestionId = q.QuestionId
+    left join answerer_diversity ap on ap.QuestionId = q.QuestionId
+    left join comment_pulse cp on cp.QuestionId = q.QuestionId
+),
+owner_enriched as (
+    select
+        rq.*,
+        ua.DisplayName as OwnerName,
+        ua.Reputation as OwnerRep,
+        ua.BadgeCount,
+        ua.GoldBadges,
+        ua.SilverBadges,
+        ua.BronzeBadges,
+        ua.Location as OwnerLocation,
+        ua.ProfileViews as OwnerProfileViews
+    from ranked_questions rq
+    left join user_activity ua on ua.UserId = rq.OwnerUserId
+),
+-- compute median (50th percentile) in a dialect-compatible way without ordered-set aggregate with OVER
+median_rank as (
+    select
+        percentiles.question_count,
+        percentiles.median_rank
+    from (
+        select
+            count(*) as question_count,
+            -- compute median via windowed row numbers: take value at floor((n+1)/2)
+            null as median_rank
+        from owner_enriched
+    ) init
+    cross join lateral (
+        select
+            -- choose median value robustly: for odd n take middle, for even take avg of two middles
+            case
+                when mod(init.question_count,2) = 1 then
+                    (select RankScore from (
+                        select RankScore, row_number() over (order by RankScore) as rn
+                        from owner_enriched
+                    ) t where rn = (init.question_count+1)/2)
+                else
+                    ((select RankScore from (
+                        select RankScore, row_number() over (order by RankScore) as rn
+                        from owner_enriched
+                    ) t where rn = init.question_count/2)
+                    +
+                    (select RankScore from (
+                        select RankScore, row_number() over (order by RankScore) as rn
+                        from owner_enriched
+                    ) t where rn = init.question_count/2 + 1)
+                    ) / 2.0
+            end as median_rank
+    ) percentiles
+),
+normalized as (
+    select
+        oe.QuestionId,
+        oe.Title,
+        oe.OwnerUserId,
+        oe.CreationDate,
+        oe.Score,
+        oe.ViewCount,
+        oe.TagsArray,
+        oe.TagCount,
+        oe.IsDataTag,
+        oe.AnswerTotal,
+        oe.PosAnswers,
+        oe.NegAnswers,
+        oe.MaxAnswerScore,
+        oe.MinAnswerScore,
+        oe.SumAnswerScore,
+        oe.UpVoteCount,
+        oe.DownVoteCount,
+        oe.FavoriteCount,
+        oe.DuplicateCount,
+        oe.LinkedCount,
+        oe.LastCloseReasonId,
+        oe.LastActivityAt,
+        oe.DistinctAnswerers,
+        oe.CommentCount,
+        oe.LastCommentAt,
+        oe.PosComments,
+        oe.RankScore,
+        oe.OwnerName,
+        oe.OwnerRep,
+        oe.BadgeCount,
+        oe.GoldBadges,
+        oe.SilverBadges,
+        oe.BronzeBadges,
+        oe.OwnerLocation,
+        oe.OwnerProfileViews,
+        avg(oe.RankScore) over () as AvgRank,
+        stddev_pop(oe.RankScore) over () as StdRank,
+        m.median_rank as P50Rank
+    from owner_enriched oe
+    cross join median_rank m
+),
+scored as (
+    select
+        n.*,
+        case
+            when n.StdRank is null or n.StdRank = 0 then 0
+            else (n.RankScore - n.AvgRank) / nullif(n.StdRank, 0)
+        end as ZScore,
+        row_number() over (order by n.RankScore desc, n.CreationDate desc) as RN_Global,
+        row_number() over (partition by case when n.IsDataTag > 0 then 'data' else 'other' end order by n.RankScore desc) as RN_ByDomain,
+        dense_rank() over (order by coalesce(n.OwnerRep, -1) desc) as OwnerRepRank
+    from normalized n
+),
+summarized as (
+    select
+        s.QuestionId,
+        s.Title,
+        s.OwnerUserId,
+        s.CreationDate,
+        s.Score,
+        s.ViewCount,
+        s.TagsArray,
+        s.TagCount,
+        s.IsDataTag,
+        s.AnswerTotal,
+        s.PosAnswers,
+        s.NegAnswers,
+        s.MaxAnswerScore,
+        s.MinAnswerScore,
+        s.SumAnswerScore,
+        s.UpVoteCount,
+        s.DownVoteCount,
+        s.FavoriteCount,
+        s.DuplicateCount,
+        s.LinkedCount,
+        s.LastCloseReasonId,
+        s.LastActivityAt,
+        s.DistinctAnswerers,
+        s.CommentCount,
+        s.LastCommentAt,
+        s.PosComments,
+        s.RankScore,
+        s.AvgRank,
+        s.StdRank,
+        s.P50Rank,
+        s.OwnerName,
+        s.OwnerRep,
+        s.BadgeCount,
+        s.GoldBadges,
+        s.SilverBadges,
+        s.BronzeBadges,
+        s.OwnerLocation,
+        s.OwnerProfileViews,
+        s.ZScore,
+        s.RN_Global,
+        s.RN_ByDomain,
+        s.OwnerRepRank,
+        case
+            when s.LastCloseReasonId in ('101','1') then 'Duplicate'
+            when s.LastCloseReasonId in ('102','2') then 'Off-topic'
+            when s.LastCloseReasonId in ('103') then 'Needs details or clarity'
+            when s.LastCloseReasonId in ('104') then 'Needs more focus'
+            when s.LastCloseReasonId in ('105') then 'Opinion-based'
+            when s.LastCloseReasonId is null then 'Open/Unknown'
+            else 'Other'
+        end as CloseReason,
+        coalesce(array_length(s.TagsArray, 1), 0) as TagArrayLen,
+        (case when s.OwnerName is null then '[deleted]' else s.OwnerName end) as OwnerNameSafe
+    from scored s
+),
+filtered as (
+    select *
+    from summarized
+    where
+        (
+            (IsClosed = 0 and coalesce(UpVoteCount,0) >= coalesce(DownVoteCount,0))
+            or (IsClosed = 1 and coalesce(FavoriteCount,0) > 0)
+        )
+        and coalesce(TagArrayLen,0) between 1 and 10
+        and (LastActivityAt is null or LastActivityAt >= CreationDate)
+        and (
+            OwnerRep is null
+            or (OwnerRep >= 50 and BadgeCount >= 1)
+            or (OwnerRep < 50 and FavoriteCount >= 2)
+        )
+)
+select
+    f.QuestionId,
+    f.Title,
+    f.OwnerNameSafe as OwnerName,
+    f.OwnerRep,
+    f.BadgeCount,
+    f.GoldBadges,
+    f.SilverBadges,
+    f.BronzeBadges,
+    f.OwnerLocation,
+    f.ViewCount,
+    f.Score as QuestionScore,
+    f.UpVoteCount,
+    f.DownVoteCount,
+    f.FavoriteCount,
+    f.AnswerCount,
+    f.AnswerTotal,
+    f.PosAnswers,
+    f.NegAnswers,
+    f.MaxAnswerScore,
+    f.MinAnswerScore,
+    f.SumAnswerScore,
+    f.DistinctAnswerers,
+    f.CommentCount,
+    f.PosComments,
+    f.DuplicateCount,
+    f.LinkedCount,
+    f.CloseReason,
+    f.TagsArray,
+    f.TagCount,
+    f.IsDataTag,
+    f.CreationDate,
+    f.LastActivityAt,
+    round(cast(f.RankScore as numeric), 4) as RankScore,
+    round(cast(f.ZScore as numeric), 4) as ZScore,
+    f.RN_Global,
+    f.RN_ByDomain,
+    f.OwnerRepRank
+from (
+    select *
+    from filtered
+) f
+where
+    (f.RN_Global <= 500 or f.RN_ByDomain <= 200)
+order by
+    f.RN_Global nulls last,
+    f.RankScore desc,
+    f.CreationDate desc;

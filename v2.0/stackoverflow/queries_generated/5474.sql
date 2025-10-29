@@ -1,0 +1,106 @@
+-- {"query": "5474.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 822} 
+WITH TopUsers AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.AccountId,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.LastAccessDate DESC) AS rn
+  FROM Users u
+  WHERE u.Reputation >= 1000
+),
+PostActivity AS (
+  SELECT
+    p.Id AS PostId,
+    p.OwnerUserId,
+    p.PostTypeId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Tags,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.CloseReasonId,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.Body,
+    p.ContentLicense,
+    COALESCE(vs.UpVotes, 0) AS UpVotes,
+    COALESCE(vs.DownVotes, 0) AS DownVotes,
+    CASE
+      WHEN p.PostTypeId = 1 THEN 'Question'
+      WHEN p.PostTypeId = 2 THEN 'Answer'
+      ELSE 'Other'
+    END AS PostKind,
+    -- computed score volatility proxy
+    (p.Score * 1.0) / NULLIF(p.ViewCount, 0) AS ScorePerView
+  FROM Posts p
+  LEFT JOIN (
+    SELECT
+      PostId,
+      SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+      SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+    FROM Votes
+    GROUP BY PostId
+  ) vs ON vs.PostId = p.Id
+  WHERE p.CreationDate >= DATEADD(year, -2, CURRENT_DATE)
+),
+CorrelatedStats AS (
+  SELECT
+    pa.PostId,
+    pa.OwnerUserId,
+    pa.PostTypeId,
+    pa.Title,
+    pa.Score,
+    pa.ViewCount,
+    pa.CreationDate,
+    pa.LastActivityDate,
+    pa.Tags,
+    pa.PostKind,
+    pa.ScorePerView,
+    u.DisplayName AS OwnerDisplayName,
+    b.Name AS BadgeName,
+    b.Class AS BadgeClass,
+    -- recent comments on the post
+    (SELECT STRING_AGG(C.Text, '; ')) FROM Comments C WHERE C.PostId = pa.PostId AND C.CreationDate >= DATEADD(month, -3, CURRENT_DATE) AS RecentComments
+  FROM PostActivity pa
+  LEFT JOIN Users u ON pa.OwnerUserId = u.Id
+  LEFT JOIN Badges b ON b.UserId = pa.OwnerUserId
+  WHERE pa.LastActivityDate >= DATEADD(month, -6, CURRENT_DATE)
+),
+Windowed AS (
+  SELECT
+    cs.*,
+    ROW_NUMBER() OVER (PARTITION BY cs.OwnerUserId ORDER BY cs.LastActivityDate DESC) AS rn_by_owner,
+    SUM(cs.Score) OVER (PARTITION BY cs.OwnerUserId ORDER BY cs.LastActivityDate ROWS BETWEEN 365 PRECEDING AND CURRENT ROW) AS RollingYearScore
+  FROM CorrelatedStats cs
+)
+SELECT
+  w.OwnerUserId,
+  w.OwnerDisplayName,
+  w.PostId,
+  w.PostTypeId,
+  w.Title,
+  w.Score,
+  w.ViewCount,
+  w.LastActivityDate,
+  w.Tags,
+  w.PostKind,
+  w.ScorePerView,
+  w.BadgeName,
+  w.BadgeClass,
+  w.RecentComments,
+  w.RollingYearScore
+FROM Windowed w
+WHERE w.rn_by_owner = 1
+  AND (w.Score > 0 OR w.ViewCount > 100)
+ORDER BY w.RollingYearScore DESC NULLS LAST, w.ScorePerView DESC NULLS LAST
+LIMIT 100;

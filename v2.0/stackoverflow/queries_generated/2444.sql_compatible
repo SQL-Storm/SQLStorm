@@ -1,0 +1,211 @@
+WITH RECURSIVE RecursivePostsCTE AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.Title,
+        0 AS Level,
+        ARRAY[p.Id] AS Path
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+
+    UNION ALL
+
+    SELECT
+        c.Id,
+        c.PostTypeId,
+        c.CreationDate,
+        c.Score,
+        c.ViewCount,
+        c.OwnerUserId,
+        c.AcceptedAnswerId,
+        c.ParentId,
+        c.Title,
+        r.Level + 1,
+        r.Path || c.Id
+    FROM Posts c
+    INNER JOIN RecursivePostsCTE r ON c.ParentId = r.Id
+    WHERE c.PostTypeId IN (2, 7)
+),
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        COUNT(*) AS TotalBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+PostVotesAggregated AS (
+    SELECT
+        v.PostId,
+        COUNT(CASE WHEN vt.Name = 'UpMod' THEN 1 END) AS UpVotes,
+        COUNT(CASE WHEN vt.Name = 'DownMod' THEN 1 END) AS DownVotes,
+        COUNT(CASE WHEN vt.Name = 'Favorite' THEN 1 END) AS Favorites,
+        COUNT(CASE WHEN vt.Name IN ('Close', 'Deletion') THEN 1 END) AS NegativeVotes,
+        MAX(v.CreationDate) AS LastVoteDate
+    FROM Votes v
+    JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    GROUP BY v.PostId
+),
+LatestPostHistory AS (
+    SELECT DISTINCT ON (ph.PostId)
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        pht.Name AS HistoryTypeName,
+        ph.UserId AS EditorUserId,
+        u.DisplayName AS EditorDisplayName,
+        ph.CreationDate AS HistoryDate,
+        ph.Comment
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    LEFT JOIN Users u ON ph.UserId = u.Id
+    ORDER BY ph.PostId, ph.CreationDate DESC
+),
+QuestionDuplicates AS (
+    SELECT
+        pl.PostId,
+        COUNT(CASE WHEN lt.Name = 'Duplicate' THEN 1 END) AS DuplicateCount,
+        STRING_AGG(DISTINCT p2.Title, '; ' ORDER BY p2.CreationDate) AS DuplicateTitles
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    JOIN Posts p2 ON pl.RelatedPostId = p2.Id
+    WHERE lt.Name = 'Duplicate'
+    GROUP BY pl.PostId
+),
+RecentCommentsCounts AS (
+    SELECT
+        c.PostId,
+        COUNT(*) AS RecentCommentsCount
+    FROM Comments c
+    WHERE c.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days'
+    GROUP BY c.PostId
+),
+RankedPosts AS (
+    SELECT
+        rp.Id,
+        rp.Level,
+        rp.Path,
+        rp.PostTypeId,
+        rp.CreationDate,
+        rp.Score,
+        rp.ViewCount,
+        rp.Title,
+        b.GoldBadges,
+        b.SilverBadges,
+        b.BronzeBadges,
+        b.TotalBadges,
+        pv.UpVotes,
+        pv.DownVotes,
+        pv.Favorites,
+        pv.NegativeVotes,
+        lh.HistoryTypeName AS LastEditType,
+        lh.EditorDisplayName,
+        lh.HistoryDate AS LastEditDate,
+        qd.DuplicateCount,
+        qd.DuplicateTitles,
+        rc.RecentCommentsCount,
+        u.Reputation,
+        u.DisplayName,
+        u.CreationDate AS UserCreationDate,
+        u.Location,
+        u.AboutMe
+    FROM RecursivePostsCTE rp
+    LEFT JOIN Users u ON rp.OwnerUserId = u.Id
+    LEFT JOIN UserBadgeCounts b ON u.Id = b.UserId
+    LEFT JOIN PostVotesAggregated pv ON rp.Id = pv.PostId
+    LEFT JOIN LatestPostHistory lh ON rp.Id = lh.PostId
+    LEFT JOIN QuestionDuplicates qd ON rp.Id = qd.PostId
+    LEFT JOIN RecentCommentsCounts rc ON rp.Id = rc.PostId
+    WHERE rp.PostTypeId = 1
+),
+WindowedStats AS (
+    SELECT
+        rp.Id,
+        rp.Level,
+        rp.Path,
+        rp.PostTypeId,
+        rp.CreationDate,
+        rp.Score,
+        rp.ViewCount,
+        rp.Title,
+        rp.GoldBadges,
+        rp.SilverBadges,
+        rp.BronzeBadges,
+        rp.TotalBadges,
+        rp.UpVotes,
+        rp.DownVotes,
+        rp.Favorites,
+        rp.NegativeVotes,
+        rp.LastEditType,
+        rp.EditorDisplayName,
+        rp.LastEditDate,
+        rp.DuplicateCount,
+        rp.DuplicateTitles,
+        rp.RecentCommentsCount,
+        rp.Reputation,
+        rp.DisplayName,
+        rp.UserCreationDate,
+        rp.Location,
+        rp.AboutMe,
+        RANK() OVER (PARTITION BY rp.Level ORDER BY rp.Score DESC, rp.ViewCount DESC) AS ScoreRankWithinLevel,
+        ROW_NUMBER() OVER (ORDER BY COALESCE(rp.Favorites,0) DESC, rp.Score DESC) AS FavoriteRankOverall,
+        AVG(rp.Score) OVER (PARTITION BY rp.Level) AS AvgScorePerLevel,
+        COUNT(*) OVER () AS TotalPosts,
+        COUNT(CASE WHEN COALESCE(rp.DuplicateCount,0) > 0 THEN 1 END) OVER () AS PostsWithDuplicates
+    FROM RankedPosts rp
+)
+SELECT
+    ws.Id AS QuestionId,
+    ws.Title,
+    ws.CreationDate,
+    ws.Score,
+    ws.ViewCount,
+    ws.UpVotes,
+    ws.DownVotes,
+    ws.Favorites,
+    ws.NegativeVotes,
+    ws.GoldBadges,
+    ws.SilverBadges,
+    ws.BronzeBadges,
+    ws.TotalBadges,
+    ws.LastEditType,
+    ws.EditorDisplayName,
+    ws.LastEditDate,
+    COALESCE(ws.DuplicateCount, 0) AS DuplicateCount,
+    ws.DuplicateTitles,
+    COALESCE(ws.RecentCommentsCount, 0) AS RecentCommentsCount,
+    ws.DisplayName AS OwnerDisplayName,
+    ws.Reputation,
+    ws.Location,
+    ws.AboutMe,
+    ws.Level,
+    ws.ScoreRankWithinLevel,
+    ws.FavoriteRankOverall,
+    ws.AvgScorePerLevel,
+    ws.TotalPosts,
+    ws.PostsWithDuplicates,
+    CASE
+        WHEN ws.LastEditDate IS NULL THEN 'Never Edited'
+        WHEN ws.LastEditDate < ws.CreationDate + INTERVAL '1 day' THEN 'Edited Quickly'
+        ELSE 'Edited Later'
+    END AS EditTimingCategory,
+    COALESCE(NULLIF(TRIM(ws.AboutMe), ''), 'No about me available') ||
+        ' | Location: ' || COALESCE(NULLIF(ws.Location, ''), 'Unknown') ||
+        ' | Owner since: ' || TO_CHAR(ws.UserCreationDate, 'YYYY-MM-DD') AS OwnerSummary
+FROM WindowedStats ws
+WHERE ws.Score >= (
+    SELECT PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY Score)
+    FROM Posts
+    WHERE PostTypeId = 1
+)
+AND COALESCE(ws.DuplicateCount, 0) = 0
+AND COALESCE(ws.RecentCommentsCount, 0) > 5
+ORDER BY ws.FavoriteRankOverall
+LIMIT 100;

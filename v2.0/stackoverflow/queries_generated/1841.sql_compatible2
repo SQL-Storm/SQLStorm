@@ -1,0 +1,221 @@
+WITH QuestionPosts AS (
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate
+    FROM Posts P
+    WHERE P.PostTypeId = 1
+),
+AnswerPosts AS (
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        P.Score,
+        P.ParentId,
+        P.CreationDate
+    FROM Posts P
+    WHERE P.PostTypeId = 2
+),
+UsersWithOnlyAnswers AS (
+    SELECT DISTINCT OwnerUserId FROM AnswerPosts
+    EXCEPT
+    SELECT DISTINCT OwnerUserId FROM QuestionPosts
+),
+UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT Q.PostId) AS TotalQuestions,
+        COUNT(DISTINCT A.PostId) AS TotalAnswers,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesGiven,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesGiven,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        MAX(P.CreationDate) AS LastPostDate,
+        MIN(P.CreationDate) AS FirstPostDate,
+        AVG(CASE WHEN P.PostTypeId IN (1,2) THEN P.Score * 1.0 END) AS AvgPostScore,
+        AVG(C.Score * 1.0) AS AvgCommentScore,
+        COALESCE(U.Location, 'Unknown') AS UserLocation,
+        CASE WHEN UOA.OwnerUserId IS NOT NULL THEN TRUE ELSE FALSE END AS HasOnlyAnswers
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Votes V ON U.Id = V.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN QuestionPosts Q ON U.Id = Q.OwnerUserId
+    LEFT JOIN AnswerPosts A ON U.Id = A.OwnerUserId
+    LEFT JOIN UsersWithOnlyAnswers UOA ON U.Id = UOA.OwnerUserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Location, UOA.OwnerUserId
+    HAVING COUNT(DISTINCT P.Id) > 5
+       AND U.Reputation > 100
+),
+PostContentAnalysis AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.Title,
+        P.CreationDate AS PostCreationDate,
+        P.LastEditDate,
+        P.LastActivityDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.FavoriteCount,
+        LENGTH(P.Body) AS BodyLength,
+        SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags)-2) AS RawTagsString,
+        COUNT(DISTINCT PH.Id) AS TotalHistoryEntries,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (4,5,6) THEN PH.Id END) AS TotalEdits,
+        MAX(PH.CreationDate) AS LastHistoryEditDate,
+        (SELECT MAX(C_sub.CreationDate) FROM Comments C_sub WHERE C_sub.PostId = P.Id) AS LatestCommentDate,
+        CASE
+            WHEN P.AcceptedAnswerId IS NOT NULL THEN 'HasAcceptedAnswer'
+            WHEN P.AnswerCount > 0 AND P.Score >= 10 THEN 'PopularQuestionWithAnswers'
+            WHEN P.ViewCount > 1000 AND P.Score >= 5 THEN 'HighlyViewedQuestion'
+            WHEN P.Score < 0 THEN 'PoorlyReceived'
+            ELSE 'Other'
+        END AS PostQualityCategory,
+        NULLIF(P.LastEditorUserId, P.OwnerUserId) AS EditorDifferentFromOwnerUserId
+    FROM Posts P
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    WHERE P.PostTypeId IN (1, 2)
+      AND P.CreationDate >= DATE '2020-01-01'
+    GROUP BY
+        P.Id, P.PostTypeId, P.OwnerUserId, P.Title, P.CreationDate, P.LastEditDate, P.LastActivityDate,
+        P.Score, P.ViewCount, P.AnswerCount, P.FavoriteCount, P.Body, P.Tags, P.AcceptedAnswerId, P.LastEditorUserId
+),
+PostCommentActivity AS (
+    SELECT
+        C.PostId,
+        C.UserId AS CommenterId,
+        C.CreationDate AS CommentCreationDate,
+        C.Score AS CommentScore,
+        ROW_NUMBER() OVER (PARTITION BY C.PostId ORDER BY C.CreationDate DESC) AS rn_latest_comment,
+        LAG(C.CreationDate, 1) OVER (PARTITION BY C.PostId ORDER BY C.CreationDate) AS PrevCommentDate,
+        (C.CreationDate - LAG(C.CreationDate, 1) OVER (PARTITION BY C.PostId ORDER BY C.CreationDate)) AS TimeSincePrevComment
+    FROM Comments C
+    WHERE C.CreationDate >= DATE '2020-01-01'
+),
+PostLinkAnalysis AS (
+    SELECT
+        PL.PostId,
+        SUM(CASE WHEN PL.LinkTypeId = 1 THEN 1 ELSE 0 END) AS LinkedPostsCount,
+        SUM(CASE WHEN PL.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicatePostsCount,
+        STRING_AGG(CASE WHEN PL.LinkTypeId = 3 THEN CAST(PL.RelatedPostId AS varchar) ELSE NULL END, ',') AS DuplicateOfPostIds_concat
+    FROM PostLinks PL
+    GROUP BY PL.PostId
+),
+TagPerformance AS (
+    SELECT
+        T.TagName,
+        SUM(P.Score) AS TotalTagScore,
+        AVG(P.ViewCount * 1.0) AS AvgTagViewCount,
+        COUNT(P.Id) AS PostsWithTag,
+        SUM(CASE WHEN P.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS AcceptedAnswersWithTag,
+        DENSE_RANK() OVER (ORDER BY SUM(P.Score) DESC) AS TagScoreRank
+    FROM Tags T
+    JOIN Posts P ON P.Tags LIKE '%' || '<' || T.TagName || '>' || '%'
+    WHERE P.PostTypeId = 1
+    GROUP BY T.TagName
+    HAVING COUNT(P.Id) > 10
+),
+UserPostEvolution AS (
+    SELECT
+        PH.PostId,
+        PH.UserId AS EditorId,
+        PH.CreationDate AS EditDate,
+        PH.PostHistoryTypeId,
+        LAG(PH.CreationDate) OVER (PARTITION BY PH.PostId, PH.UserId ORDER BY PH.CreationDate) AS PreviousEditDate,
+        (PH.CreationDate - LAG(PH.CreationDate) OVER (PARTITION BY PH.PostId, PH.UserId ORDER BY PH.CreationDate)) AS TimeSincePreviousEdit,
+        ROW_NUMBER() OVER (PARTITION BY PH.PostId, PH.UserId ORDER BY PH.CreationDate DESC) AS rn_latest_edit
+    FROM PostHistory PH
+    WHERE PH.PostHistoryTypeId IN (4, 5, 6)
+      AND PH.UserId IS NOT NULL
+)
+SELECT
+    UE.UserId,
+    UE.DisplayName,
+    UE.Reputation,
+    UE.UserLocation,
+    UE.HasOnlyAnswers,
+    PCA.PostId,
+    PCA.Title,
+    PCA.PostQualityCategory,
+    PCA.PostScore,
+    PCA.ViewCount,
+    PCA.TotalEdits,
+    TagsExtracted.TagName AS PrimaryTag,
+    TP.TotalTagScore,
+    TP.TagScoreRank,
+    PLA.LinkedPostsCount,
+    PLA.DuplicatePostsCount,
+    CASE WHEN PLA.DuplicateOfPostIds_concat IS NOT NULL THEN string_to_array(PLA.DuplicateOfPostIds_concat, ',')::bigint[] ELSE NULL END AS DuplicateRelatedPosts,
+    MAX(CASE WHEN PCE.rn_latest_comment = 1 THEN PCE.CommentCreationDate END) OVER (PARTITION BY UE.UserId) AS UsersLastCommentDate,
+    AVG(PCE.CommentScore) OVER (PARTITION BY UE.UserId, PCA.PostId) AS AvgCommentScoreOnPost,
+    CASE
+        WHEN UE.Reputation > 5000 AND PCA.PostScore > 50 THEN 'HighRepHighImpactPost'
+        WHEN UE.TotalBadges >= 10 AND PCA.TotalEdits > 3 THEN 'ExperiencedEditor'
+        WHEN UE.AvgPostScore IS NULL THEN 'NoPostsOrScores'
+        WHEN UE.HasOnlyAnswers THEN 'DedicatedAnswerer'
+        ELSE 'OtherEngagement'
+    END AS EngagementProfile,
+    EXTRACT(WEEK FROM PCA.PostCreationDate) AS WeekOfPostCreation,
+    (SELECT COUNT(DISTINCT UPE_sub.EditorId) FROM UserPostEvolution UPE_sub WHERE UPE_sub.PostId = PCA.PostId AND UPE_sub.EditDate = PCA.LastHistoryEditDate) AS DistinctLastEditors,
+    (SELECT AVG(UPE_sub.TimeSincePreviousEdit) FROM UserPostEvolution UPE_sub WHERE UPE_sub.PostId = PCA.PostId AND UPE_sub.EditorId = UE.UserId) AS AvgEditIntervalByOwner,
+    UPE_owner.TimeSincePreviousEdit AS LatestOwnerEditInterval,
+    RNK.UserPostRank AS TopUserPostRank,
+    LAG(PCA.PostCreationDate) OVER (PARTITION BY UE.UserId ORDER BY PCA.PostCreationDate) AS PreviousPostCreationDate,
+    (PCA.PostCreationDate - LAG(PCA.PostCreationDate) OVER (PARTITION BY UE.UserId ORDER BY PCA.PostCreationDate)) AS TimeBetweenPosts,
+    COUNT(CASE WHEN PCA.EditorDifferentFromOwnerUserId IS NOT NULL THEN 1 END) OVER (PARTITION BY UE.UserId) AS PostsEditedByOthersCount
+FROM UserEngagement UE
+INNER JOIN PostContentAnalysis PCA ON UE.UserId = PCA.OwnerUserId
+LEFT JOIN PostLinkAnalysis PLA ON PCA.PostId = PLA.PostId
+LEFT JOIN (
+    SELECT
+        P.Id AS PostId,
+        UNNEST(string_to_array(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags)-2), '><')) AS TagName
+    FROM Posts P
+    WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2
+) AS TagsExtracted ON PCA.PostId = TagsExtracted.PostId
+LEFT JOIN Tags T ON TagsExtracted.TagName = T.TagName
+LEFT JOIN TagPerformance TP ON T.TagName = TP.TagName
+LEFT JOIN PostCommentActivity PCE ON PCA.PostId = PCE.PostId
+LEFT JOIN UserPostEvolution UPE_owner ON PCA.PostId = UPE_owner.PostId
+    AND UPE_owner.EditorId = UE.UserId
+    AND UPE_owner.rn_latest_edit = 1
+LEFT JOIN (
+    SELECT
+        PostId,
+        OwnerUserId,
+        ROW_NUMBER() OVER (PARTITION BY OwnerUserId ORDER BY PostScore DESC, ViewCount DESC) AS UserPostRank
+    FROM PostContentAnalysis
+) AS RNK ON PCA.PostId = RNK.PostId AND PCA.OwnerUserId = RNK.OwnerUserId
+WHERE UE.LastAccessDate >= DATE '2023-01-01'
+  AND PCA.BodyLength > 100
+  AND PCA.TotalEdits > 1
+  AND (TagsExtracted.TagName LIKE 'sql%' OR TagsExtracted.TagName LIKE 'database%' OR TagsExtracted.TagName IS NULL)
+  AND PCA.PostScore > COALESCE(UE.AvgPostScore, 0)
+  AND ((UE.UserLocation IS NOT NULL AND UE.UserLocation NOT LIKE '%Earth%') OR UE.Reputation > 10000)
+  AND NOT EXISTS (
+      SELECT 1 FROM Badges B_sub
+      WHERE B_sub.UserId = UE.UserId AND B_sub.Name = 'Disciplined'
+  )
+GROUP BY
+    UE.UserId, UE.DisplayName, UE.Reputation, UE.UserLocation, UE.HasOnlyAnswers,
+    PCA.PostId, PCA.Title, PCA.PostQualityCategory, PCA.PostScore, PCA.ViewCount, PCA.TotalEdits,
+    TagsExtracted.TagName, TP.TotalTagScore, TP.TagScoreRank, PLA.LinkedPostsCount, PLA.DuplicatePostsCount,
+    PLA.DuplicateOfPostIds_concat,
+    UPE_owner.TimeSincePreviousEdit, RNK.UserPostRank, PCA.PostCreationDate,
+    PCA.EditorDifferentFromOwnerUserId, PCE.PostId, PCE.rn_latest_comment, PCE.CommentCreationDate, PCE.CommentScore
+HAVING
+    COUNT(DISTINCT PCE.CommenterId) > 1
+    AND (SUM(CASE WHEN PCE.CommentCreationDate > PCA.LastEditDate THEN 1 ELSE 0 END) > 0 OR MAX(PCA.PostScore) > 20)
+ORDER BY
+    UE.Reputation DESC, PCA.PostScore DESC, TopUserPostRank ASC
+LIMIT 1000;

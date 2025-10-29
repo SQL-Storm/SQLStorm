@@ -1,0 +1,160 @@
+-- {"query": "3983.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1633} 
+
+/*  Performance‑benchmarking query – combines CTEs, window functions, outer joins,
+    correlated subqueries, set operators, complex predicates, string ops and NULL handling */
+WITH
+/* 1️⃣  Users with at least one gold badge (class = 1) */
+gold_users AS (
+    SELECT
+        u.Id                           AS user_id,
+        u.DisplayName                  AS display_name,
+        u.Reputation,
+        COUNT(b.Id)                    AS gold_badge_cnt,
+        MIN(b.Date)                    AS first_gold_date
+    FROM Users u
+    LEFT JOIN Badges b
+        ON b.UserId = u.Id AND b.Class = 1
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(b.Id) > 0
+),
+
+/* 2️⃣  Recent activity (last 30 days) per user: posts + comments + votes */
+recent_activity AS (
+    SELECT
+        ua.user_id,
+        SUM(CASE WHEN ua.activity_type = 'post'   THEN 1 ELSE 0 END) AS post_cnt,
+        SUM(CASE WHEN ua.activity_type = 'comment' THEN 1 ELSE 0 END) AS comment_cnt,
+        SUM(CASE WHEN ua.activity_type = 'vote'    THEN 1 ELSE 0 END) AS vote_cnt
+    FROM (
+        /* posts */
+        SELECT OwnerUserId AS user_id, 'post'    AS activity_type
+        FROM Posts
+        WHERE OwnerUserId IS NOT NULL
+          AND CreationDate >= CURRENT_DATE - INTERVAL '30 days'
+
+        UNION ALL
+
+        /* comments */
+        SELECT UserId     AS user_id, 'comment' AS activity_type
+        FROM Comments
+        WHERE UserId IS NOT NULL
+          AND CreationDate >= CURRENT_DATE - INTERVAL '30 days'
+
+        UNION ALL
+
+        /* votes (excluding spam/offensive) */
+        SELECT UserId     AS user_id, 'vote'    AS activity_type
+        FROM Votes v
+        JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+        WHERE v.UserId IS NOT NULL
+          AND vt.Name NOT IN ('Spam','Offensive')
+          AND v.CreationDate >= CURRENT_DATE - INTERVAL '30 days'
+    ) ua
+    GROUP BY ua.user_id
+),
+
+/* 3️⃣  Tag usage per gold user – top 3 tags by count */
+user_tag_usage AS (
+    SELECT
+        gu.user_id,
+        t.TagName,
+        COUNT(*)                                                  AS tag_uses,
+        ROW_NUMBER() OVER (PARTITION BY gu.user_id ORDER BY COUNT(*) DESC) AS rn
+    FROM gold_users gu
+    JOIN Posts p
+        ON p.OwnerUserId = gu.user_id
+       AND p.PostTypeId = 1                -- only questions
+       AND p.Tags IS NOT NULL
+    CROSS JOIN LATERAL (
+        SELECT unnest(string_to_array(trim(both '<>' FROM p.Tags), '><')) AS TagName
+    ) AS tn
+    JOIN Tags t
+        ON t.TagName = tn.TagName
+    GROUP BY gu.user_id, t.TagName
+),
+
+/* 4️⃣  Score‑weighted recent vote summary per user – correlated subquery inside SELECT */
+vote_score_summary AS (
+    SELECT
+        gu.user_id,
+        COALESCE((
+            SELECT SUM(
+                       CASE vt.Name
+                           WHEN 'UpMod'   THEN 1
+                           WHEN 'DownMod' THEN -1
+                           WHEN 'AcceptedByOriginator' THEN 2
+                           ELSE 0
+                       END
+                   )
+            FROM Votes v
+            JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+            WHERE v.PostId IN (
+                SELECT Id FROM Posts p
+                WHERE p.OwnerUserId = gu.user_id
+                  AND p.CreationDate >= CURRENT_DATE - INTERVAL '90 days'
+            )
+            AND v.CreationDate >= CURRENT_DATE - INTERVAL '90 days'
+        ), 0) AS recent_vote_score
+    FROM gold_users gu
+),
+
+/* 5️⃣  Union of users who have either gold badges or have been mentioned in comments (as @displayname) */
+mentioned_users AS (
+    SELECT DISTINCT
+        u.Id AS user_id
+    FROM Users u
+    JOIN Comments c
+        ON c.Text ILIKE '%' || u.DisplayName || '%'
+    WHERE u.DisplayName IS NOT NULL
+),
+
+/* 6️⃣  Final ranking – combine gold users with activity, tags and vote score */
+ranked_users AS (
+    SELECT
+        gu.user_id,
+        gu.display_name,
+        gu.reputation,
+        gu.gold_badge_cnt,
+        ra.post_cnt,
+        ra.comment_cnt,
+        ra.vote_cnt,
+        vss.recent_vote_score,
+        -- concatenate top 3 tags (or NULL if none)
+        STRING_AGG(ut.TagName, ', ') FILTER (WHERE ut.rn <= 3) AS top_tags,
+        RANK() OVER (ORDER BY (gu.gold_badge_cnt * 10 + gu.reputation/1000
+                               + COALESCE(vss.recent_vote_score,0)) DESC) AS overall_rank
+    FROM gold_users gu
+    LEFT JOIN recent_activity ra
+        ON ra.user_id = gu.user_id
+    LEFT JOIN vote_score_summary vss
+        ON vss.user_id = gu.user_id
+    LEFT JOIN user_tag_usage ut
+        ON ut.user_id = gu.user_id
+    GROUP BY
+        gu.user_id, gu.display_name, gu.reputation,
+        gu.gold_badge_cnt, ra.post_cnt, ra.comment_cnt,
+        ra.vote_cnt, vss.recent_vote_score
+)
+
+/* 7️⃣  Pull together final result set – include users only if they are gold OR mentioned,
+    compute a flag via CASE expression handling NULLs */
+SELECT
+    ru.user_id,
+    ru.display_name,
+    ru.reputation,
+    ru.gold_badge_cnt,
+    ru.post_cnt,
+    ru.comment_cnt,
+    ru.vote_cnt,
+    ru.recent_vote_score,
+    ru.top_tags,
+    ru.overall_rank,
+    CASE
+        WHEN ru.gold_badge_cnt IS NULL OR ru.gold_badge_cnt = 0 THEN 'MentionedOnly'
+        WHEN ru.overall_rank <= 10 THEN 'Top10'
+        ELSE 'ActiveGold'
+    END AS user_category
+FROM ranked_users ru
+WHERE ru.user_id IN (SELECT user_id FROM mentioned_users UNION SELECT user_id FROM gold_users)
+ORDER BY ru.overall_rank ASC, ru.reputation DESC
+LIMIT 100;

@@ -1,0 +1,279 @@
+-- {"query": "782.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3369} 
+with recent_users as (
+  select u.id as user_id,
+         u.displayname,
+         u.reputation,
+         u.creationdate,
+         u.location,
+         coalesce(nullif(trim(split_part(coalesce(u.websiteurl, ''), '/', 3)), ''), 'unknown') as website_host,
+         row_number() over (order by u.creationdate desc, u.id desc) as rn
+  from users u
+  where u.creationdate >= (select date_trunc('year', max(creationdate)) - interval '2 years' from users)
+),
+user_activity as (
+  select p.owneruserid as user_id,
+         count(*) filter (where p.posttypeid = 1) as q_count,
+         count(*) filter (where p.posttypeid = 2) as a_count,
+         sum(greatest(p.score,0)) as nonneg_post_score,
+         sum(coalesce(p.viewcount,0)) as total_views,
+         max(p.lastactivitydate) as last_post_activity
+  from posts p
+  where p.owneruserid is not null
+  group by p.owneruserid
+),
+comment_activity as (
+  select c.userid as user_id,
+         count(*) as c_count,
+         sum(coalesce(c.score,0)) as c_score,
+         max(c.creationdate) as last_comment_activity
+  from comments c
+  where c.userid is not null
+  group by c.userid
+),
+badge_rollup as (
+  select b.userid as user_id,
+         count(*) as badge_count,
+         count(*) filter (where b.class = 1) as gold_count,
+         count(*) filter (where b.class = 2) as silver_count,
+         count(*) filter (where b.class = 3) as bronze_count,
+         max(b.date) as last_badge_date
+  from badges b
+  group by b.userid
+),
+question_metrics as (
+  select p.owneruserid as user_id,
+         count(*) as questions_total,
+         count(*) filter (where p.acceptedanswerid is not null) as accepted_qs,
+         avg(nullif(p.answercount,0)) as avg_answers_per_q,
+         avg(nullif(p.viewcount,0)) as avg_views_per_q,
+         percentile_cont(0.9) within group (order by coalesce(p.viewcount,0)) as p90_views_per_q
+  from posts p
+  where p.posttypeid = 1 and p.owneruserid is not null
+  group by p.owneruserid
+),
+answer_metrics as (
+  select p.owneruserid as user_id,
+         count(*) as answers_total,
+         sum(case when pa.id is not null and q.acceptedanswerid = p.id then 1 else 0 end) as answers_accepted_as_owner,
+         avg(greatest(p.score,0)) as avg_nonneg_answer_score
+  from posts p
+  left join posts q on q.id = p.parentid and q.posttypeid = 1
+  left join posts pa on pa.id = q.acceptedanswerid
+  where p.posttypeid = 2 and p.owneruserid is not null
+  group by p.owneruserid
+),
+vote_rollup as (
+  select v.userid as user_id,
+         count(*) filter (where v.votetypeid = 2) as upvotes_cast,
+         count(*) filter (where v.votetypeid = 3) as downvotes_cast,
+         count(*) filter (where v.votetypeid = 5) as favorites_cast,
+         sum(coalesce(v.bountyamount,0)) filter (where v.votetypeid in (8,9)) as bounty_flow
+  from votes v
+  where v.userid is not null
+  group by v.userid
+),
+closed_events as (
+  select ph.postid,
+         ph.userid,
+         ph.creationdate,
+         try_cast(ph.comment as int) as close_reason_id
+  from posthistory ph
+  where ph.posthistorytypeid = 10
+),
+user_close_behavior as (
+  select ce.userid as user_id,
+         count(*) as closes_initiated,
+         count(*) filter (where ce.close_reason_id in (101,102,103,104,105)) as closes_current_reasons,
+         min(ce.creationdate) as first_close_date,
+         max(ce.creationdate) as last_close_date
+  from closed_events ce
+  where ce.userid is not null
+  group by ce.userid
+),
+tag_usage as (
+  select p.owneruserid as user_id,
+         unnest(string_to_array(substring(p.tags, 2, greatest(length(p.tags)-2,0)), '><')) as tagname
+  from posts p
+  where p.posttypeid = 1 and p.tags is not null and p.owneruserid is not null
+),
+top_tags as (
+  select tu.user_id,
+         t.tagname,
+         count(*) as tag_count,
+         row_number() over (partition by tu.user_id order by count(*) desc, t.tagname) as tag_rank
+  from tag_usage tu
+  join tags t on lower(t.tagname) = lower(tu.tagname)
+  group by tu.user_id, t.tagname
+),
+hot_posts as (
+  select p.id,
+         p.owneruserid as user_id,
+         p.posttypeid,
+         p.score,
+         p.viewcount,
+         p.creationdate,
+         dense_rank() over (partition by p.owneruserid order by coalesce(p.score,0) desc, coalesce(p.viewcount,0) desc, p.id) as popularity_rank
+  from posts p
+  where p.owneruserid is not null
+),
+dupe_graph as (
+  select pl.postid,
+         pl.relatedpostid,
+         pl.creationdate,
+         pl.linktypeid,
+         case when pl.linktypeid = 3 then 1 else 0 end as is_duplicate
+  from postlinks pl
+),
+user_dupe_stats as (
+  select p.owneruserid as user_id,
+         count(*) filter (where dg.is_duplicate = 1) as dup_links_from_posts,
+         count(*) filter (where dg.is_duplicate = 0) as nondup_links_from_posts
+  from posts p
+  left join dupe_graph dg on dg.postid = p.id
+  where p.owneruserid is not null
+  group by p.owneruserid
+),
+activity_calendar as (
+  select ua.user_id,
+         date_trunc('month', coalesce(ua.last_post_activity, ca.last_comment_activity)) as last_active_month
+  from user_activity ua
+  full join comment_activity ca on ca.user_id = ua.user_id
+),
+recency_rank as (
+  select user_id,
+         last_active_month,
+         ntile(10) over (order by last_active_month nulls first) as recency_decile
+  from activity_calendar
+),
+norm_scales as (
+  select
+    max(coalesce(ua.q_count,0)) as max_q,
+    max(coalesce(ua.a_count,0)) as max_a,
+    max(coalesce(ua.nonneg_post_score,0)) as max_post_score,
+    max(coalesce(ua.total_views,0)) as max_views,
+    max(coalesce(cm.c_count,0)) as max_c,
+    max(coalesce(vr.upvotes_cast,0)) as max_uv_cast
+  from user_activity ua
+  full join comment_activity cm on cm.user_id = ua.user_id
+  full join vote_rollup vr on vr.user_id = coalesce(ua.user_id, cm.user_id)
+),
+user_summary as (
+  select
+    ru.user_id,
+    ru.displayname,
+    ru.reputation,
+    ru.creationdate,
+    ru.location,
+    ru.website_host,
+    coalesce(ua.q_count,0) as q_count,
+    coalesce(ua.a_count,0) as a_count,
+    coalesce(ua.nonneg_post_score,0) as post_score,
+    coalesce(ua.total_views,0) as views,
+    coalesce(cm.c_count,0) as comments,
+    coalesce(cm.c_score,0) as comment_score,
+    coalesce(br.badge_count,0) as badges,
+    coalesce(br.gold_count,0) as gold,
+    coalesce(br.silver_count,0) as silver,
+    coalesce(br.bronze_count,0) as bronze,
+    coalesce(qm.questions_total,0) as questions_total,
+    coalesce(qm.accepted_qs,0) as accepted_qs,
+    coalesce(qm.avg_answers_per_q,0)::numeric(12,4) as avg_answers_per_q,
+    coalesce(qm.avg_views_per_q,0)::numeric(12,4) as avg_views_per_q,
+    qm.p90_views_per_q::numeric(12,2) as p90_views_per_q,
+    coalesce(am.answers_total,0) as answers_total,
+    coalesce(am.answers_accepted_as_owner,0) as answers_accepted_as_owner,
+    coalesce(am.avg_nonneg_answer_score,0)::numeric(12,4) as avg_nonneg_answer_score,
+    coalesce(vr.upvotes_cast,0) as upvotes_cast,
+    coalesce(vr.downvotes_cast,0) as downvotes_cast,
+    coalesce(vr.favorites_cast,0) as favorites_cast,
+    coalesce(vr.bounty_flow,0) as bounty_flow,
+    coalesce(ucb.closes_initiated,0) as closes_initiated,
+    coalesce(ucb.closes_current_reasons,0) as closes_current_reasons,
+    ucb.first_close_date,
+    ucb.last_close_date,
+    coalesce(uds.dup_links_from_posts,0) as dup_links_from_posts,
+    coalesce(uds.nondup_links_from_posts,0) as nondup_links_from_posts,
+    max(case when hp.popularity_rank = 1 then hp.id end) as top_post_id,
+    max(case when hp.popularity_rank = 1 then hp.score end) as top_post_score,
+    max(case when hp.popularity_rank = 1 then hp.viewcount end) as top_post_views,
+    max(case when hp.popularity_rank = 1 then hp.creationdate end) as top_post_date,
+    string_agg(tt.tagname, ', ' order by tt.tagname) filter (where tt.tag_rank <= 3) as top_3_tags,
+    rr.recency_decile,
+    case
+      when coalesce(ua.q_count,0) + coalesce(ua.a_count,0) = 0 then 'lurker'
+      when coalesce(ua.q_count,0) >= 5 and coalesce(ua.a_count,0) = 0 then 'questioner'
+      when coalesce(ua.a_count,0) >= 5 and coalesce(ua.q_count,0) = 0 then 'answerer'
+      when coalesce(ua.a_count,0) > coalesce(ua.q_count,0) then 'lean_answerer'
+      when coalesce(ua.q_count,0) > coalesce(ua.a_count,0) then 'lean_questioner'
+      else 'balanced'
+    end as activity_archetype
+  from recent_users ru
+  left join user_activity ua on ua.user_id = ru.user_id
+  left join comment_activity cm on cm.user_id = ru.user_id
+  left join badge_rollup br on br.user_id = ru.user_id
+  left join question_metrics qm on qm.user_id = ru.user_id
+  left join answer_metrics am on am.user_id = ru.user_id
+  left join vote_rollup vr on vr.user_id = ru.user_id
+  left join user_close_behavior ucb on ucb.user_id = ru.user_id
+  left join user_dupe_stats uds on uds.user_id = ru.user_id
+  left join hot_posts hp on hp.user_id = ru.user_id and hp.popularity_rank = 1
+  left join (select user_id, tagname, tag_rank from top_tags where tag_rank <= 3) tt on tt.user_id = ru.user_id
+  left join recency_rank rr on rr.user_id = ru.user_id
+  group by
+    ru.user_id, ru.displayname, ru.reputation, ru.creationdate, ru.location, ru.website_host,
+    ua.q_count, ua.a_count, ua.nonneg_post_score, ua.total_views,
+    cm.c_count, cm.c_score,
+    br.badge_count, br.gold_count, br.silver_count, br.bronze_count,
+    qm.questions_total, qm.accepted_qs, qm.avg_answers_per_q, qm.avg_views_per_q, qm.p90_views_per_q,
+    am.answers_total, am.answers_accepted_as_owner, am.avg_nonneg_answer_score,
+    vr.upvotes_cast, vr.downvotes_cast, vr.favorites_cast, vr.bounty_flow,
+    ucb.closes_initiated, ucb.closes_current_reasons, ucb.first_close_date, ucb.last_close_date,
+    uds.dup_links_from_posts, uds.nondup_links_from_posts,
+    rr.recency_decile
+),
+scored as (
+  select us.*,
+         ns.max_q, ns.max_a, ns.max_post_score, ns.max_views, ns.max_c, ns.max_uv_cast,
+         coalesce(us.q_count::numeric / nullif(ns.max_q,0), 0) * 0.15 +
+         coalesce(us.a_count::numeric / nullif(ns.max_a,0), 0) * 0.25 +
+         coalesce(us.post_score::numeric / nullif(ns.max_post_score,0), 0) * 0.20 +
+         coalesce(us.views::numeric / nullif(ns.max_views,0), 0) * 0.15 +
+         coalesce(us.comments::numeric / nullif(ns.max_c,0), 0) * 0.10 +
+         coalesce(us.upvotes_cast::numeric / nullif(ns.max_uv_cast,0), 0) * 0.15
+         as engagement_score
+  from user_summary us
+  cross join norm_scales ns
+),
+ranked as (
+  select s.*,
+         dense_rank() over (order by s.engagement_score desc, s.reputation desc, s.user_id) as overall_rank,
+         row_number() over (partition by s.activity_archetype order by s.engagement_score desc, s.user_id) as archetype_rank
+  from scored s
+)
+select
+  r.user_id,
+  r.displayname,
+  r.reputation,
+  r.creationdate,
+  r.location,
+  r.website_host,
+  r.q_count, r.a_count, r.post_score, r.views, r.comments, r.comment_score,
+  r.badges, r.gold, r.silver, r.bronze,
+  r.questions_total, r.accepted_qs, r.avg_answers_per_q, r.avg_views_per_q, r.p90_views_per_q,
+  r.answers_total, r.answers_accepted_as_owner, r.avg_nonneg_answer_score,
+  r.upvotes_cast, r.downvotes_cast, r.favorites_cast, r.bounty_flow,
+  r.closes_initiated, r.closes_current_reasons, r.first_close_date, r.last_close_date,
+  r.dup_links_from_posts, r.nondup_links_from_posts,
+  r.top_post_id, r.top_post_score, r.top_post_views, r.top_post_date,
+  coalesce(r.top_3_tags, '(none)') as top_3_tags,
+  r.recency_decile,
+  r.activity_archetype,
+  r.engagement_score::numeric(12,6) as engagement_score,
+  r.overall_rank,
+  r.archetype_rank
+from ranked r
+where (r.rn <= 500 or r.overall_rank <= 200)
+  and coalesce(r.top_post_score, 0) >= 0
+  and (r.website_host not like '%stackexchange%' or r.website_host is null)
+  and not (r.location ilike '%test%' and r.reputation < 10)
+order by r.overall_rank, r.user_id;

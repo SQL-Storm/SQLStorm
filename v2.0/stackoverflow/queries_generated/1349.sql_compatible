@@ -1,0 +1,144 @@
+WITH UserReputationRank AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        RANK() OVER (PARTITION BY EXTRACT(YEAR FROM u.CreationDate) ORDER BY u.Reputation DESC, u.Id) AS AnnualRepRank,
+        NTILE(10) OVER (ORDER BY u.Reputation DESC) AS ReputationDecile,
+        AVG(u.Reputation) OVER (PARTITION BY COALESCE(u.Location, 'Unknown')) AS AvgReputationInLocation
+    FROM Users u
+    WHERE u.Reputation > 0 AND u.AccountId IS NOT NULL
+),
+PostCommentVotesAggregate AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 1 THEN 1 ELSE 0 END) AS AcceptedVoteCount,
+        MAX(v.CreationDate) AS LastVoteDate,
+        MIN(c.CreationDate) AS FirstCommentDate,
+        p.Score AS PostScore,
+        COALESCE(p.ViewCount, 0) AS PostViewCount,
+        p.CreationDate AS PostCreationDate,
+        p.LastEditDate,
+        p.ClosedDate,
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostScoreByOwner,
+        p.AcceptedAnswerId,
+        COALESCE(p.AnswerCount, 0) AS DirectAnswerCount
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE p.PostTypeId IN (1, 2)
+    GROUP BY p.Id, p.PostTypeId, p.OwnerUserId, p.Score, p.ViewCount, p.CreationDate, p.LastEditDate, p.ClosedDate, p.AcceptedAnswerId, p.AnswerCount
+),
+UserBadgeSummary AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(DISTINCT b.Name) AS UniqueBadgeTypes
+    FROM Badges b
+    GROUP BY b.UserId
+),
+PostHistoryStatusAggregate AS (
+    SELECT
+        ph.PostId,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS WasClosed,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS WasReopened,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 19 THEN 1 ELSE 0 END) AS WasProtected,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 35 THEN 1 ELSE 0 END) AS WasMigratedAway,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 8 THEN 1 ELSE 0 END) AS HasRollbackBodyHistory
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (10, 11, 19, 35, 8)
+    GROUP BY ph.PostId
+),
+TopAnswerRankPerUser AS (
+    -- compute rank per answer post per user (one row per answer post)
+    SELECT
+        pcva.OwnerUserId AS UserId,
+        pcva.PostId,
+        RANK() OVER (PARTITION BY pcva.OwnerUserId ORDER BY pcva.UpvoteCount DESC, pcva.PostCreationDate DESC) AS AnswerUpvoteRank
+    FROM PostCommentVotesAggregate pcva
+    WHERE pcva.PostTypeId = 2
+)
+SELECT
+    u.Id AS UserId,
+    COALESCE(u.DisplayName, 'Unknown User') AS UserDisplayName,
+    u.Reputation,
+    ur.AnnualRepRank,
+    ur.ReputationDecile,
+    ur.AvgReputationInLocation,
+    EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - u.CreationDate)) / (60 * 60 * 24 * 365.25) AS UserTenureYears,
+    COALESCE(ubs.GoldBadges, 0) AS TotalGoldBadges,
+    COALESCE(ubs.SilverBadges, 0) AS TotalSilverBadges,
+    COALESCE(ubs.BronzeBadges, 0) AS TotalBronzeBadges,
+    ubs.UniqueBadgeTypes,
+    SUM(CASE WHEN pcva_q.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsPosted,
+    SUM(CASE WHEN pcva_a.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersPosted,
+    SUM(COALESCE(pcva_q.CommentCount, 0) + COALESCE(pcva_a.CommentCount, 0)) AS TotalCommentsOnUserPosts,
+    SUM(COALESCE(pcva_q.UpvoteCount, 0) + COALESCE(pcva_a.UpvoteCount, 0)) AS TotalUpvotesReceived,
+    SUM(COALESCE(pcva_q.DownvoteCount, 0) + COALESCE(pcva_a.DownvoteCount, 0)) AS TotalDownvotesReceived,
+    AVG(pcva_q.PostScore) FILTER (WHERE pcva_q.PostTypeId = 1) AS AvgQuestionScore,
+    AVG(pcva_a.PostScore) FILTER (WHERE pcva_a.PostTypeId = 2) AS AvgAnswerScore,
+    (SUM(CASE WHEN pcva_q.PostTypeId = 1 THEN pcva_q.PostViewCount ELSE 0 END) * 1.0) / NULLIF(SUM(CASE WHEN pcva_q.PostTypeId = 1 THEN 1 ELSE 0 END), 0) AS AvgQuestionViewCount,
+    (SELECT COUNT(DISTINCT q_acc.Id)
+     FROM Posts q_acc
+     WHERE q_acc.AcceptedAnswerId IN (
+         SELECT a_inner.Id FROM Posts a_inner WHERE a_inner.OwnerUserId = u.Id AND a_inner.PostTypeId = 2
+     )
+       AND q_acc.OwnerUserId <> u.Id) AS AnswersAcceptedByOthersCount,
+    (SELECT COALESCE(SUM(sa.Score), 0)
+     FROM Posts sq
+     JOIN Posts sa ON sq.AcceptedAnswerId = sa.Id
+     WHERE sa.OwnerUserId = u.Id AND sq.OwnerUserId <> u.Id AND sa.PostTypeId = 2) AS ScoreFromAcceptedAnswers,
+    UPPER(SUBSTRING(COALESCE(u.Location, 'Unspecified') FROM 1 FOR 3)) || '-' || LPAD(CAST(COALESCE(LENGTH(COALESCE(u.AboutMe, '')), 0) AS VARCHAR), 4, '0') AS LocationAboutMeHash,
+    MAX(CASE WHEN phsa.WasClosed = 1 AND pcva_q.PostId IS NOT NULL THEN 'TRUE' ELSE 'FALSE' END) AS HasClosedQuestions,
+    MAX(CASE WHEN phsa.WasMigratedAway = 1 AND pcva_q.PostId IS NOT NULL THEN 'TRUE' ELSE 'FALSE' END) AS HasMigratedQuestions,
+    COALESCE(MAX(pcva_q.LastEditDate), MAX(pcva_a.LastEditDate), u.LastAccessDate) AS LastContentOrAccessActivity,
+    -- top answer rank for the user's best answer (take minimum rank value across their answers)
+    MIN(tar.AnswerUpvoteRank) AS TopAnswerUpvoteRank,
+    SUM(CASE WHEN pcva_q.PostTypeId = 1 AND pcva_q.PostScore > pcva_q.PreviousPostScoreByOwner THEN 1 ELSE 0 END) AS ImprovedQuestionScoresCount,
+    EXISTS (
+        SELECT 1
+        FROM PostHistory ph_rb
+        JOIN Posts p_rb ON ph_rb.PostId = p_rb.Id
+        WHERE p_rb.OwnerUserId = u.Id
+          AND p_rb.PostTypeId = 1
+          AND ph_rb.PostHistoryTypeId = 8
+    ) AS HasQuestionBodyRollbacks,
+    (SELECT c_by_user.Text
+     FROM Comments c_by_user
+     WHERE c_by_user.UserId = u.Id
+     ORDER BY c_by_user.CreationDate DESC
+     LIMIT 1) AS LatestCommentByYou,
+    (SUM(COALESCE(pcva_q.PostScore, 0)) + SUM(COALESCE(pcva_a.PostScore, 0))) * (COALESCE(ubs.GoldBadges, 0) + COALESCE(ubs.SilverBadges, 0) * 0.5 + 1) AS WeightedContentScore
+FROM Users u
+LEFT JOIN UserReputationRank ur ON u.Id = ur.UserId
+LEFT JOIN UserBadgeSummary ubs ON u.Id = ubs.UserId
+LEFT JOIN PostCommentVotesAggregate pcva_q ON u.Id = pcva_q.OwnerUserId AND pcva_q.PostTypeId = 1
+LEFT JOIN PostCommentVotesAggregate pcva_a ON u.Id = pcva_a.OwnerUserId AND pcva_a.PostTypeId = 2
+LEFT JOIN PostHistoryStatusAggregate phsa ON (pcva_q.PostId = phsa.PostId OR pcva_a.PostId = phsa.PostId)
+LEFT JOIN TopAnswerRankPerUser tar ON tar.UserId = u.Id
+WHERE
+    u.Views > (SELECT AVG(Views) FROM Users WHERE AccountId IS NOT NULL AND Views IS NOT NULL) * 0.5
+    AND u.UpVotes > u.DownVotes * 1.5
+    AND EXISTS (
+        SELECT 1 FROM Badges b_gold WHERE b_gold.UserId = u.Id AND b_gold.Class = 1
+    )
+    AND (pcva_q.PostId IS NOT NULL OR pcva_a.PostId IS NOT NULL)
+    AND COALESCE(u.Location, '') NOT LIKE '%[TEST]%'
+    AND u.CreationDate > DATE '2010-01-01'
+GROUP BY
+    u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location, u.AboutMe, u.Views, u.UpVotes, u.DownVotes, u.LastAccessDate,
+    ur.AnnualRepRank, ur.ReputationDecile, ur.AvgReputationInLocation,
+    ubs.GoldBadges, ubs.SilverBadges, ubs.BronzeBadges, ubs.UniqueBadgeTypes
+HAVING
+    SUM(COALESCE(pcva_q.PostScore, 0) + COALESCE(pcva_a.PostScore, 0)) > 100
+ORDER BY
+    WeightedContentScore DESC,
+    TotalUpvotesReceived DESC,
+    UserTenureYears DESC
+LIMIT 1000;

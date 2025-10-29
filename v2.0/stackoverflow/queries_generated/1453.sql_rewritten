@@ -1,0 +1,258 @@
+-- {"query": "1453.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3916} 
+WITH UserActivityMetrics AS (
+    -- Aggregates user-level activity and calculates basic metrics.
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.DisplayName,
+        u.Location,
+        u.Views AS UserViews,
+        u.UpVotes AS UserUpVotes,
+        u.DownVotes AS UserDownVotes,
+        -- Calculate user account age in days
+        DATE_PART('day', u.LastAccessDate - u.CreationDate) AS UserAccountAgeDays,
+        -- Count distinct posts owned by the user
+        COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+        -- Count questions and answers specifically
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsOwned,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersOwned,
+        -- Sum of scores for all posts owned
+        COALESCE(SUM(p.Score), 0) AS TotalPostScoreOwned,
+        -- Count comments made by the user
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        -- Sum of scores for all comments made
+        COALESCE(SUM(c.Score), 0) AS TotalCommentScoreMade,
+        -- Get the date of the last and first post made by the user
+        MAX(p.CreationDate) AS LastPostDate,
+        MIN(p.CreationDate) AS FirstPostDate,
+        -- Calculate the reputation change from the previous user created (ordered by creation date)
+        u.Reputation - LAG(u.Reputation, 1, 0) OVER (ORDER BY u.CreationDate) AS ReputationChangeFromPrevUserCreation
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    GROUP BY u.Id, u.Reputation, u.CreationDate, u.LastAccessDate, u.DisplayName, u.Location, u.Views, u.UpVotes, u.DownVotes
+),
+PostContentAnalysis AS (
+    -- Processes post content, extracts tags, and categorizes topics.
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.LastEditDate,
+        p.Title AS PostTitle, -- Include Title for later string matching
+        LENGTH(p.Body) AS BodyLength,
+        LENGTH(p.Title) AS TitleLength,
+        -- Approximate word count for body and title using regex split
+        ARRAY_LENGTH(REGEXP_SPLIT_TO_ARRAY(p.Body, '\s+'), 1) AS BodyWordCount,
+        ARRAY_LENGTH(REGEXP_SPLIT_TO_ARRAY(p.Title, '\s+'), 1) AS TitleWordCount,
+        -- Categorize posts based on keywords in their body text
+        CASE
+            WHEN LOWER(p.Body) LIKE '%sql%' AND LOWER(p.Body) LIKE '%performance%' THEN 'SQL_Perf_Related'
+            WHEN LOWER(p.Body) LIKE '%javascript%' AND LOWER(p.Body) LIKE '%react%' THEN 'JS_Frontend_Related'
+            WHEN LOWER(p.Body) LIKE '%python%' AND LOWER(p.Body) LIKE '%machine learning%' THEN 'Python_ML_Related'
+            ELSE 'Other_Topic'
+        END AS TopicCategory,
+        -- Extract the first tag from the 'Tags' string, defaulting to 'No_Tag' if none.
+        -- Uses string_to_array and UNNEST with LIMIT 1 for efficiency.
+        COALESCE(
+            (SELECT t_unnest FROM UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><')) AS t_unnest LIMIT 1),
+            'No_Tag'
+        ) AS PrimaryTag,
+        -- Boolean indicator for whether a question has an accepted answer
+        CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN TRUE ELSE FALSE END AS HasAcceptedAnswer
+    FROM Posts p
+    INNER JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.OwnerUserId IS NOT NULL -- Focus on posts with identifiable owners
+      AND p.Body IS NOT NULL AND LENGTH(p.Body) > 0 -- Ensure content exists
+),
+PostHistorySummary AS (
+    -- Summarizes post history events like edits, rollbacks, and closures.
+    SELECT
+        ph.PostId,
+        COUNT(ph.Id) AS TotalHistoryEntries,
+        -- Count specific types of history events
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (7, 8, 9) THEN 1 ELSE 0 END) AS RollbackCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenCount,
+        MAX(ph.CreationDate) AS LastHistoryDate,
+        -- Correlated subquery to find the latest close reason for a post
+        (
+            SELECT crt.Name
+            FROM PostHistory ph_inner
+            LEFT JOIN CloseReasonTypes crt ON ph_inner.Comment = crt.Id::text -- Assumes CloseReasonId is stored as text in Comment
+            WHERE ph_inner.PostId = ph.PostId
+              AND ph_inner.PostHistoryTypeId = 10 -- Only consider 'Post Closed' events
+              AND crt.Name IS NOT NULL
+            ORDER BY ph_inner.CreationDate DESC
+            LIMIT 1
+        ) AS LatestCloseReason
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+),
+TopUsersByReputationAndEngagement AS (
+    -- Identifies users with very high reputation, recent activity, and a significant number of badges.
+    SELECT
+        uam.UserId,
+        COUNT(b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM UserActivityMetrics uam
+    LEFT JOIN Badges b ON uam.UserId = b.UserId
+    WHERE uam.Reputation > 50000 -- High reputation threshold
+      AND uam.LastAccessDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '2 years' -- Active within the last two years
+    GROUP BY uam.UserId
+    HAVING COUNT(b.Id) > 100 -- Users with at least 100 badges
+),
+MainQueryBranch AS (
+    -- Combines user, post, and history data, applying window functions and correlated subqueries.
+    SELECT
+        uam.UserId,
+        uam.DisplayName,
+        uam.Reputation,
+        uam.UserAccountAgeDays,
+        uam.TotalPostsOwned,
+        uam.TotalQuestionsOwned,
+        uam.TotalAnswersOwned,
+        pca.PostId,
+        pca.PostTypeName,
+        pca.PostScore,
+        pca.ViewCount,
+        pca.BodyLength,
+        pca.BodyWordCount,
+        pca.TopicCategory,
+        pca.PrimaryTag,
+        pca.HasAcceptedAnswer,
+        phs.EditCount,
+        phs.RollbackCount,
+        phs.CloseCount,
+        phs.LatestCloseReason,
+        tu.GoldBadges,
+        -- Window function: Rank posts within each PostType by Score and ViewCount
+        RANK() OVER (PARTITION BY pca.PostTypeName ORDER BY pca.PostScore DESC, pca.ViewCount DESC) AS RankInPostType,
+        -- Window function: Calculate average post score for each unique Tag-PostType combination
+        AVG(pca.PostScore) OVER (PARTITION BY pca.PrimaryTag, pca.PostTypeName) AS AvgScoreForTagAndType,
+        -- Window function: Cumulative sum of word counts for a user's posts over time
+        SUM(pca.BodyWordCount) OVER (PARTITION BY uam.UserId ORDER BY pca.PostCreationDate) AS CumulativeWordsByUser,
+        -- Window function: Get the score of the user's previous post
+        LAG(pca.PostScore, 1, 0) OVER (PARTITION BY uam.UserId ORDER BY pca.PostCreationDate) AS PreviousPostScore,
+        -- Correlated subquery: Count duplicate links created *after* the post
+        (
+            SELECT COUNT(pl.Id)
+            FROM PostLinks pl
+            WHERE pl.RelatedPostId = pca.PostId
+              AND pl.LinkTypeId = 3 -- LinkType 3 typically means 'Duplicate'
+              AND pl.CreationDate > pca.PostCreationDate -- Only links created after the post
+        ) AS DuplicateLinkCount,
+        -- Complicated calculation: Ratio of edits to comments, handling potential division by zero
+        COALESCE(CAST(phs.EditCount AS NUMERIC) / NULLIF(pca.CommentCount, 0), 0.0) AS EditToCommentRatio,
+        -- String expression: Check if the post title contains its primary tag (case-insensitive)
+        CASE WHEN LOWER(pca.PostTitle) LIKE '%' || LOWER(pca.PrimaryTag) || '%' THEN TRUE ELSE FALSE END AS TitleContainsPrimaryTag,
+        -- NULL logic and conditional expression: Classify post status based on closure and acceptance
+        CASE
+            WHEN pca.ClosedDate IS NOT NULL AND phs.CloseCount > 0 THEN 'Closed_and_Tracked'
+            WHEN pca.ClosedDate IS NOT NULL THEN 'Closed_Untracked'
+            WHEN pca.HasAcceptedAnswer THEN 'Active_Answered'
+            ELSE 'Open_Unanswered'
+        END AS PostStatusClassifier,
+        -- Correlated subquery: Calculate the average score for the user's posts of the same type
+        (SELECT AVG(p_avg.Score) FROM Posts p_avg WHERE p_avg.OwnerUserId = uam.UserId AND p_avg.PostTypeId = pca.PostTypeId) AS UserAvgScoreForPostType,
+        'Main_High_Engagement' AS QueryBranchIdentifier -- Identifier for the UNION ALL
+    FROM UserActivityMetrics uam
+    INNER JOIN PostContentAnalysis pca ON uam.UserId = pca.OwnerUserId
+    LEFT JOIN PostHistorySummary phs ON pca.PostId = phs.PostId
+    LEFT JOIN TopUsersByReputationAndEngagement tu ON uam.UserId = tu.UserId
+    WHERE
+        uam.UserAccountAgeDays > 365 -- Filter for users active for over a year
+        AND pca.PostScore > (SELECT AVG(p_sub.Score) FROM Posts p_sub WHERE p_sub.OwnerUserId = uam.UserId) -- Post score must be above user's overall average
+        AND pca.TopicCategory IN ('SQL_Perf_Related', 'Python_ML_Related') -- Focus on specific topic categories
+        AND tu.UserId IS NOT NULL -- Ensure only users meeting 'TopUsers' criteria are included
+),
+AlternativeBranch AS (
+    -- This branch focuses on highly voted and commented posts, identifying controversial or highly favorited content.
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        DATE_PART('day', u.LastAccessDate - u.CreationDate) AS UserAccountAgeDays,
+        COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsOwned,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersOwned,
+        p.Id AS PostId,
+        pt.Name AS PostTypeName,
+        p.Score AS PostScore,
+        p.ViewCount,
+        LENGTH(p.Body) AS BodyLength,
+        ARRAY_LENGTH(REGEXP_SPLIT_TO_ARRAY(p.Body, '\s+'), 1) AS BodyWordCount,
+        -- Categorize posts based on keywords for this branch
+        CASE
+            WHEN LOWER(p.Body) LIKE '%security%' AND LOWER(p.Body) LIKE '%vulnerability%' THEN 'Security_Related'
+            WHEN LOWER(p.Body) LIKE '%blockchain%' AND LOWER(p.Body) LIKE '%crypto%' THEN 'Blockchain_Related'
+            ELSE 'Other_Topic'
+        END AS TopicCategory,
+        -- Extract the first tag for posts in this branch
+        COALESCE(
+            (SELECT t_unnest FROM UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><')) AS t_unnest LIMIT 1),
+            'No_Tag'
+        ) AS PrimaryTag,
+        CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN TRUE ELSE FALSE END AS HasAcceptedAnswer,
+        COALESCE(phs.EditCount, 0) AS EditCount,
+        COALESCE(phs.RollbackCount, 0) AS RollbackCount,
+        COALESCE(phs.CloseCount, 0) AS CloseCount,
+        phs.LatestCloseReason,
+        0 AS GoldBadges, -- Not applicable to this branch, set to 0 to match MainQueryBranch
+        DENSE_RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.ViewCount DESC) AS RankInPostType, -- Different window function
+        NULL AS AvgScoreForTagAndType, -- Different aggregation strategy
+        NULL AS CumulativeWordsByUser, -- Not calculated in this branch
+        NULL AS PreviousPostScore, -- Not calculated in this branch
+        -- Correlated subquery: Count comments made very shortly after post creation
+        (SELECT COUNT(DISTINCT c.Id) FROM Comments c WHERE c.PostId = p.Id AND c.CreationDate > p.CreationDate + INTERVAL '1 hour') AS QuickCommentCount,
+        COALESCE(CAST(phs.EditCount AS NUMERIC) / NULLIF(p.CommentCount, 0), 0.0) AS EditToCommentRatio,
+        -- String expression: Check if title contains ANY part of the tags (broader search)
+        CASE WHEN LOWER(p.Title) LIKE '%' || LOWER(COALESCE(p.Tags, '')) || '%' THEN TRUE ELSE FALSE END AS TitleContainsPrimaryTag,
+        -- Conditional expression: Classify posts as controversial or highly favorited
+        CASE
+            WHEN p.Score < 0 AND p.CommentCount > 5 THEN 'Controversial'
+            WHEN p.FavoriteCount > 100 THEN 'Highly_Favorited'
+            ELSE 'Standard'
+        END AS PostStatusClassifier,
+        NULL AS UserAvgScoreForPostType, -- Not calculated in this branch
+        'Alternative_High_Votes_Comments' AS QueryBranchIdentifier
+    FROM Posts p
+    INNER JOIN Users u ON p.OwnerUserId = u.Id
+    INNER JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN PostHistorySummary phs ON p.Id = phs.PostId
+    WHERE p.Score > 100 -- High score posts
+      AND p.CommentCount > 20 -- Many comments
+      AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '5 years' -- Relatively recent posts
+      AND p.Tags IS NOT NULL
+)
+-- Combine results from both branches using UNION ALL
+SELECT
+    UserId, DisplayName, Reputation, UserAccountAgeDays, TotalPostsOwned, TotalQuestionsOwned, TotalAnswersOwned,
+    PostId, PostTypeName, PostScore, ViewCount, BodyLength, BodyWordCount, TopicCategory, PrimaryTag, HasAcceptedAnswer,
+    EditCount, RollbackCount, CloseCount, LatestCloseReason, GoldBadges, RankInPostType, AvgScoreForTagAndType,
+    CumulativeWordsByUser, PreviousPostScore, DuplicateLinkCount, EditToCommentRatio, TitleContainsPrimaryTag,
+    PostStatusClassifier, UserAvgScoreForPostType, QueryBranchIdentifier
+FROM MainQueryBranch
+UNION ALL
+SELECT
+    UserId, DisplayName, Reputation, UserAccountAgeDays, TotalPostsOwned, TotalQuestionsOwned, TotalAnswersOwned,
+    PostId, PostTypeName, PostScore, ViewCount, BodyLength, BodyWordCount, TopicCategory, PrimaryTag, HasAcceptedAnswer,
+    EditCount, RollbackCount, CloseCount, LatestCloseReason, GoldBadges, RankInPostType, AvgScoreForTagAndType,
+    CumulativeWordsByUser, PreviousPostScore, QuickCommentCount AS DuplicateLinkCount, -- Alias to match column name/type
+    EditToCommentRatio, TitleContainsPrimaryTag,
+    PostStatusClassifier, UserAvgScoreForPostType, QueryBranchIdentifier
+FROM AlternativeBranch
+ORDER BY Reputation DESC, PostId -- Final sorting for the combined result
+LIMIT 2000;

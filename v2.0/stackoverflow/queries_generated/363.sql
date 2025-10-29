@@ -1,0 +1,418 @@
+-- {"query": "363.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3797} 
+with params as (
+  select 
+    date_trunc('month', now()) - interval '24 months' as start_month,
+    date_trunc('month', now()) as end_month
+),
+active_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.location,
+    coalesce(nullif(trim(split_part(coalesce(u.websiteurl, ''), '/', 3)), ''), 'unknown') as website_host,
+    greatest(u.upvotes - u.downvotes, 0) as net_votes_clamped,
+    case when u.views is null or u.views = 0 then null else u.upvotes::decimal / nullif(u.views,0) end as upvote_view_ratio,
+    row_number() over (order by u.reputation desc, u.id) as user_rank_overall
+  from users u
+  where u.reputation > 0
+),
+recent_questions as (
+  select
+    p.id as question_id,
+    p.owneruserid as owner_user_id,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.answercount,
+    p.title,
+    p.tags,
+    p.closeddate,
+    p.acceptedanswerid,
+    (extract(epoch from (now() - p.creationdate)) / 3600.0) as age_hours,
+    case when p.closeddate is not null then 1 else 0 end as is_closed
+  from posts p
+  join params pr on p.creationdate >= pr.start_month and p.creationdate < pr.end_month
+  where p.posttypeid = 1
+),
+tag_unrolled as (
+  select
+    q.question_id,
+    unnest(string_to_array(substring(q.tags from 2 for length(q.tags)-2), '><')) as tag_name
+  from recent_questions q
+  where q.tags is not null and length(q.tags) >= 2
+),
+tag_stats as (
+  select
+    t.tag_name,
+    count(*) as q_count,
+    avg(q.score) as avg_score,
+    percentile_cont(0.5) within group (order by q.viewcount) as p50_views,
+    sum(case when q.is_closed = 1 then 1 else 0 end) as closed_count
+  from tag_unrolled t
+  join recent_questions q on q.question_id = t.question_id
+  group by t.tag_name
+  having count(*) >= 10
+),
+answers as (
+  select
+    a.id as answer_id,
+    a.parentid as question_id,
+    a.owneruserid as owner_user_id,
+    a.creationdate,
+    a.score,
+    a.body,
+    length(coalesce(a.body, '')) as body_len
+  from posts a
+  join params pr on a.creationdate >= pr.start_month and a.creationdate < pr.end_month
+  where a.posttypeid = 2
+),
+first_answer_per_q as (
+  select distinct on (question_id)
+    question_id,
+    answer_id,
+    owner_user_id,
+    creationdate as first_answer_date
+  from answers
+  order by question_id, creationdate
+),
+comment_activity as (
+  select
+    c.postid,
+    count(*) filter (where c.creationdate >= (select start_month from params)) as total_comments_recent,
+    sum(case when c.score >= 5 then 1 else 0 end) as high_score_comments,
+    max(c.creationdate) as last_comment_date
+  from comments c
+  group by c.postid
+),
+vote_agg as (
+  select
+    v.postid,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started,
+    sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded,
+    count(*) filter (where v.votetypeid in (10,12)) as mod_actions
+  from votes v
+  group by v.postid
+),
+dup_links as (
+  select
+    pl.postid as duplicate_post_id,
+    pl.relatedpostid as original_post_id,
+    min(pl.creationdate) as first_dup_link_date
+  from postlinks pl
+  where pl.linktypeid = 3
+  group by pl.postid, pl.relatedpostid
+),
+close_events as (
+  select
+    ph.postid,
+    min(ph.creationdate) filter (where ph.posthistorytypeid = 10) as first_close_date,
+    max(ph.creationdate) filter (where ph.posthistorytypeid = 11) as last_reopen_date,
+    count(*) filter (where ph.posthistorytypeid = 10) as close_votes_count,
+    count(*) filter (where ph.posthistorytypeid = 11) as reopen_votes_count,
+    max(
+      case 
+        when ph.posthistorytypeid = 10 then
+          nullif(trim(regexp_replace(coalesce(ph.comment,''), '[^0-9]', '', 'g')), '')
+        else null
+      end
+    )::int as last_close_reason_id
+  from posthistory ph
+  where ph.posthistorytypeid in (10,11)
+  group by ph.postid
+),
+user_activity_rollup as (
+  select
+    u.user_id,
+    count(distinct q.question_id) as questions_authored,
+    count(distinct a.answer_id) as answers_authored,
+    sum(coalesce(q.score,0)) as q_score_sum,
+    sum(coalesce(a.score,0)) as a_score_sum,
+    max(coalesce(q.viewcount,0)) as max_q_views_recent,
+    max(coalesce(a.body_len,0)) as max_answer_len_recent
+  from active_users u
+  left join recent_questions q on q.owner_user_id = u.user_id
+  left join answers a on a.owner_user_id = u.user_id
+  group by u.user_id
+),
+top_users as (
+  select
+    u.user_id,
+    u.displayname,
+    u.reputation,
+    u.website_host,
+    u.user_rank_overall,
+    ua.questions_authored,
+    ua.answers_authored,
+    ua.q_score_sum,
+    ua.a_score_sum,
+    row_number() over (
+      order by coalesce(ua.q_score_sum,0) + coalesce(ua.a_score_sum,0) desc, u.reputation desc
+    ) as rank_recent_contrib
+  from active_users u
+  join user_activity_rollup ua on ua.user_id = u.user_id
+  where coalesce(ua.questions_authored,0) + coalesce(ua.answers_authored,0) > 0
+),
+q_enriched as (
+  select
+    q.question_id,
+    q.owner_user_id,
+    q.creationdate,
+    q.score,
+    q.viewcount,
+    q.answercount,
+    q.title,
+    q.tags,
+    q.closeddate,
+    q.acceptedanswerid,
+    q.age_hours,
+    q.is_closed,
+    coalesce(va.upvotes,0) as upvotes,
+    coalesce(va.downvotes,0) as downvotes,
+    coalesce(va.bounty_started,0) as bounty_started,
+    coalesce(va.bounty_awarded,0) as bounty_awarded,
+    coalesce(va.mod_actions,0) as mod_actions,
+    ca.total_comments_recent,
+    ca.high_score_comments,
+    ca.last_comment_date,
+    ce.first_close_date,
+    ce.last_reopen_date,
+    ce.close_votes_count,
+    ce.reopen_votes_count,
+    ce.last_close_reason_id,
+    dl.original_post_id,
+    dl.first_dup_link_date,
+    case 
+      when q.acceptedanswerid is not null then 1
+      when q.answercount > 0 then 0
+      else null
+    end as has_accept_flag
+  from recent_questions q
+  left join vote_agg va on va.postid = q.question_id
+  left join comment_activity ca on ca.postid = q.question_id
+  left join close_events ce on ce.postid = q.question_id
+  left join dup_links dl on dl.duplicate_post_id = q.question_id
+),
+question_quality as (
+  select
+    qe.*,
+    coalesce(nullif(regexp_replace(lower(coalesce(qe.title,'')), '\s+', ' ', 'g'), ''), '') as norm_title,
+    case 
+      when qe.viewcount is null or qe.viewcount = 0 then null
+      else (qe.upvotes - qe.downvotes)::decimal / nullif(qe.viewcount,0)
+    end as vote_view_ratio,
+    case 
+      when qe.answercount > 0 then greatest(least( (qe.score::decimal / nullif(qe.answercount,0)), 10), -10)
+      else null
+    end as score_per_answer_capped,
+    case 
+      when qe.acceptedanswerid is not null then 1
+      when qe.is_closed = 1 then 0
+      else null
+    end as solved_indicator,
+    case 
+      when qe.first_close_date is not null and qe.last_reopen_date is not null and qe.last_reopen_date > qe.first_close_date then 1
+      else 0
+    end as reopened_flag
+  from q_enriched qe
+),
+agg_by_user as (
+  select
+    qe.owner_user_id as user_id,
+    count(*) as q_count,
+    avg(coalesce(qe.vote_view_ratio,0)) as avg_vv_ratio,
+    avg(coalesce(qe.score_per_answer_capped,0)) as avg_score_per_answer_capped,
+    sum(case when qe.solved_indicator = 1 then 1 else 0 end) as solved_count,
+    sum(case when qe.is_closed = 1 then 1 else 0 end) as closed_count,
+    sum(case when qe.reopened_flag = 1 then 1 else 0 end) as reopened_count,
+    count(*) filter (where qe.original_post_id is not null) as dup_marked_count,
+    max(qe.viewcount) as max_views,
+    min(qe.creationdate) as first_q_date_recent,
+    max(qe.creationdate) as last_q_date_recent
+  from question_quality qe
+  group by qe.owner_user_id
+),
+title_tokens as (
+  select
+    qq.question_id,
+    lower(regexp_replace(tok, '[^\w]+', '', 'g')) as token
+  from question_quality qq,
+  lateral unnest(string_to_array(regexp_replace(coalesce(qq.title,''), '\s+', ' ', 'g'), ' ')) as tok
+),
+stopwords as (
+  select unnest(array['the','and','or','to','a','of','in','for','with','on','is','it','from','by','an','as','at','be','this','that','how','why','what','when','where']) as sw
+),
+title_token_stats as (
+  select
+    t.token,
+    count(distinct t.question_id) as q_appearances,
+    avg(qq.score) as avg_score_when_present
+  from title_tokens t
+  join question_quality qq on qq.question_id = t.question_id
+  left join stopwords s on s.sw = t.token
+  where coalesce(t.token,'') <> '' and s.sw is null
+  group by t.token
+  having count(distinct t.question_id) >= 20
+),
+monthly as (
+  select
+    date_trunc('month', qq.creationdate) as month,
+    count(*) as q_count,
+    avg(qq.score) as avg_score,
+    sum(case when qq.acceptedanswerid is not null then 1 else 0 end) as solved,
+    sum(case when qq.is_closed = 1 then 1 else 0 end) as closed
+  from question_quality qq
+  group by 1
+),
+user_tag_pref as (
+  select
+    q.owner_user_id as user_id,
+    t.tag_name,
+    count(*) as cnt,
+    avg(q.score) as avg_score
+  from tag_unrolled t
+  join recent_questions q on q.question_id = t.question_id
+  group by q.owner_user_id, t.tag_name
+),
+user_top_tag as (
+  select distinct on (user_id)
+    user_id,
+    tag_name,
+    cnt,
+    avg_score
+  from user_tag_pref
+  order by user_id, cnt desc, avg_score desc, tag_name
+),
+-- correlated subquery example: compute "streak" of questions per user per day
+daily_q as (
+  select
+    owner_user_id as user_id,
+    date_trunc('day', creationdate) as day,
+    count(*) as q_day_count
+  from recent_questions
+  group by owner_user_id, date_trunc('day', creationdate)
+),
+daily_streak as (
+  select
+    d.user_id,
+    d.day,
+    d.q_day_count,
+    sum(case when lag(d.day) over (partition by d.user_id order by d.day) = d.day - interval '1 day' then 0 else 1 end)
+      over (partition by d.user_id order by d.day) as streak_group
+  from daily_q d
+),
+streak_lengths as (
+  select
+    user_id,
+    max(count(*)) over (partition by user_id) as max_streak_len
+  from daily_streak
+  group by user_id, streak_group
+),
+final_user as (
+  select
+    tu.user_id,
+    tu.displayname,
+    tu.reputation,
+    tu.website_host,
+    tu.user_rank_overall,
+    tu.rank_recent_contrib,
+    coalesce(ab.q_count,0) as q_count_recent,
+    coalesce(ab.solved_count,0) as solved_count_recent,
+    coalesce(ab.closed_count,0) as closed_count_recent,
+    coalesce(ab.reopened_count,0) as reopened_count_recent,
+    coalesce(ab.dup_marked_count,0) as dup_marked_recent,
+    coalesce(ab.avg_vv_ratio,0) as avg_vote_view_ratio_recent,
+    coalesce(ab.avg_score_per_answer_capped,0) as avg_score_per_answer_capped_recent,
+    coalesce(st.max_streak_len,0) as max_daily_question_streak_recent,
+    utt.tag_name as top_tag_recent,
+    utt.cnt as top_tag_count_recent,
+    utt.avg_score as top_tag_avg_score_recent
+  from top_users tu
+  left join agg_by_user ab on ab.user_id = tu.user_id
+  left join streak_lengths st on st.user_id = tu.user_id
+  left join user_top_tag utt on utt.user_id = tu.user_id
+),
+score_buckets as (
+  select
+    qq.question_id,
+    case
+      when qq.score <= -5 then 'very low'
+      when qq.score between -4 and -1 then 'low'
+      when qq.score between 0 and 4 then 'mid'
+      when qq.score between 5 and 14 then 'high'
+      else 'very high'
+    end as score_bucket
+  from question_quality qq
+),
+-- set operator: union of high-perf tags and tokens to drive join cardinality
+hot_terms as (
+  select tag_name as term, 'tag' as term_type, q_count as weight
+  from tag_stats
+  where q_count >= 50 and avg_score >= 0
+  union all
+  select token as term, 'token' as term_type, q_appearances as weight
+  from title_token_stats
+  where q_appearances >= 50 and avg_score_when_present >= 0
+),
+question_term_match as (
+  select
+    qq.question_id,
+    ht.term,
+    ht.term_type
+  from question_quality qq
+  left join lateral (
+    select unnest(string_to_array(substring(qq.tags from 2 for length(qq.tags)-2), '><')) as tag_term
+  ) tag_l on qq.tags is not null and ht.term_type = 'tag' and ht.term = tag_l.tag_term
+  left join hot_terms ht on true
+  union all
+  select
+    t.question_id,
+    ht.term,
+    'token' as term_type
+  from title_tokens t
+  join hot_terms ht on ht.term_type = 'token' and ht.term = t.token
+),
+final as (
+  select
+    fu.user_id,
+    fu.displayname,
+    fu.reputation,
+    fu.website_host,
+    fu.user_rank_overall,
+    fu.rank_recent_contrib,
+    fu.q_count_recent,
+    fu.solved_count_recent,
+    fu.closed_count_recent,
+    fu.reopened_count_recent,
+    fu.dup_marked_recent,
+    fu.avg_vote_view_ratio_recent,
+    fu.avg_score_per_answer_capped_recent,
+    fu.max_daily_question_streak_recent,
+    fu.top_tag_recent,
+    fu.top_tag_count_recent,
+    fu.top_tag_avg_score_recent,
+    qq.question_id,
+    qq.title,
+    qq.score,
+    qq.viewcount,
+    qq.answercount,
+    qq.vote_view_ratio,
+    qq.score_per_answer_capped,
+    qq.solved_indicator,
+    qq.reopened_flag,
+    coalesce(sb.score_bucket, 'unknown') as score_bucket,
+    qt.term as matched_hot_term,
+    qt.term_type as matched_hot_type,
+    row_number() over (partition by fu.user_id order by qq.score desc nulls last, qq.viewcount desc nulls last, qq.creationdate desc) as rn_by_user
+  from final_user fu
+  join question_quality qq on qq.owner_user_id = fu.user_id
+  left join score_buckets sb on sb.question_id = qq.question_id
+  left join question_term_match qt on qt.question_id = qq.question_id
+)
+select *
+from final
+where rn_by_user <= 50
+order by rank_recent_contrib nulls last, reputation desc, user_id, rn_by_user;

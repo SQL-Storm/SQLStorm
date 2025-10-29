@@ -1,0 +1,228 @@
+-- {"query": "7110.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2409} 
+WITH UserActivityCTE AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        COUNT(DISTINCT c.Id) AS Comments,
+        COUNT(DISTINCT b.Id) AS Badges,
+        MAX(p.CreationDate) AS LastPostDate,
+        DATEDIFF(cast('2024-10-01 12:34:56' as timestamp), u.CreationDate) AS AccountAgeDays,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Elite'
+            WHEN u.Reputation >= 1000 THEN 'Veteran'
+            WHEN u.Reputation >= 100 THEN 'Regular'
+            ELSE 'Newbie'
+        END AS ReputationTier,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RankByReputation,
+        RANK() OVER (PARTITION BY CASE WHEN u.Reputation >= 1000 THEN 'Veteran' ELSE 'Other' END ORDER BY u.Reputation DESC) AS RankByTier
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 0 
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.CreationDate
+),
+PostStatsCTE AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName AS AuthorName,
+        p.PostTypeId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.Tags,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostType,
+        COALESCE(NULLIF(p.Tags, ''), 'No Tags') AS CleanTags,
+        CASE 
+            WHEN p.Score >= 100 THEN 'HighlyVoted'
+            WHEN p.Score >= 10 THEN 'ModeratelyVoted'
+            ELSE 'LowVoted'
+        END AS VotingTier,
+        DATEDIFF(cast('2024-10-01 12:34:56' as timestamp), p.CreationDate) AS AgeInDays,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpVotes,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS DownVotes,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCountActual,
+        p.ContentLicense,
+        p.AcceptedAnswerId,
+        p.ParentId
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.CreationDate >= '2023-01-01'
+),
+CombinedData AS (
+    SELECT 
+        u.UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.TotalPosts,
+        u.Questions,
+        u.Answers,
+        u.Comments,
+        u.Badges,
+        u.LastPostDate,
+        u.AccountAgeDays,
+        u.ReputationTier,
+        u.RankByReputation,
+        u.RankByTier,
+        p.PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate AS PostCreationDate,
+        p.AuthorName,
+        p.PostTypeId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.Tags,
+        p.PostType,
+        p.CleanTags,
+        p.VotingTier,
+        p.AgeInDays,
+        p.UpVotes,
+        p.DownVotes,
+        p.CommentCountActual,
+        p.ContentLicense,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        CASE 
+            WHEN u.TotalPosts > 50 AND u.Reputation > 5000 THEN 'Active Contributor'
+            WHEN u.TotalPosts > 10 AND u.Reputation > 1000 THEN 'Regular Poster'
+            WHEN u.TotalPosts > 0 THEN 'New Poster'
+            ELSE 'Inactive'
+        END AS UserActivityStatus,
+        (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = u.UserId AND p2.PostTypeId = 1 AND p2.CreationDate >= DATEADD(year, -1, cast('2024-10-01 12:34:56' as timestamp))) AS RecentQuestions,
+        (SELECT COUNT(*) FROM Posts p3 WHERE p3.OwnerUserId = u.UserId AND p3.PostTypeId = 2 AND p3.CreationDate >= DATEADD(year, -1, cast('2024-10-01 12:34:56' as timestamp))) AS RecentAnswers,
+        ABS((p.ViewCount - (SELECT AVG(ViewCount) FROM Posts)) / NULLIF((SELECT AVG(ViewCount) FROM Posts), 0)) AS ViewCountZScore,
+        COALESCE((SELECT SUM(v.BountyAmount) FROM Votes v WHERE v.PostId = p.PostId AND v.VoteTypeId = 8), 0) AS TotalBountyAmount,
+        (CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS HasAcceptedAnswer,
+        CASE 
+            WHEN p.CreationDate BETWEEN '2023-06-01' AND '2023-08-31' THEN 'Q3'
+            WHEN p.CreationDate BETWEEN '2023-03-01' AND '2023-05-31' THEN 'Q2'
+            WHEN p.CreationDate BETWEEN '2023-01-01' AND '2023-02-28' THEN 'Q1'
+            ELSE 'Other'
+        END AS QuarterCreated,
+        CASE WHEN p.Tags LIKE '%java%' THEN 1 ELSE 0 END AS HasJavaTag,
+        CASE WHEN p.Tags LIKE '%python%' THEN 1 ELSE 0 END AS HasPythonTag,
+        CASE WHEN p.Tags LIKE '%javascript%' THEN 1 ELSE 0 END AS HasJavaScriptTag
+    FROM UserActivityCTE u
+    LEFT JOIN PostStatsCTE p ON u.UserId = p.OwnerUserId
+    WHERE u.TotalPosts > 0
+)
+SELECT 
+    cd.UserId,
+    cd.DisplayName,
+    cd.Reputation,
+    cd.Views,
+    cd.TotalPosts,
+    cd.Questions,
+    cd.Answers,
+    cd.Comments,
+    cd.Badges,
+    cd.MostRecentPostDate = MAX(cd.PostCreationDate) OVER (PARTITION BY cd.UserId),
+    cd.AccountAgeDays,
+    cd.ReputationTier,
+    cd.RankByReputation,
+    cd.RankByTier,
+    cd.PostId,
+    cd.Title,
+    cd.Score,
+    cd.ViewCount,
+    cd.PostCreationDate,
+    cd.AuthorName,
+    cd.PostTypeId,
+    cd.AnswerCount,
+    cd.CommentCount,
+    cd.Tags,
+    cd.PostType,
+    cd.CleanTags,
+    cd.VotingTier,
+    cd.AgeInDays,
+    cd.UpVotes,
+    cd.DownVotes,
+    cd.CommentCountActual,
+    cd.ContentLicense,
+    cd.AcceptedAnswerId,
+    cd.ParentId,
+    cd.UserActivityStatus,
+    cd.RecentQuestions,
+    cd.RecentAnswers,
+    cd.ViewCountZScore,
+    cd.TotalBountyAmount,
+    cd.HasAcceptedAnswer,
+    cd.QuarterCreated,
+    cd.HasJavaTag,
+    cd.HasPythonTag,
+    cd.HasJavaScriptTag,
+    COUNT(*) OVER () AS TotalRecords,
+    SUM(cd.Score) OVER (ORDER BY cd.Reputation DESC ROWS UNBOUNDED PRECEDING) AS CumulativeScore,
+    RANK() OVER (ORDER BY cd.Score DESC) AS ScoreRank,
+    DENSE_RANK() OVER (ORDER BY cd.ViewCount DESC) AS ViewRank,
+    PERCENT_RANK() OVER (ORDER BY cd.Score) AS ScorePercentile,
+    NTILE(4) OVER (ORDER BY cd.Reputation) AS ReputationQuartile,
+    LAG(cd.Score, 1) OVER (ORDER BY cd.Score DESC) AS PrevScore,
+    LEAD(cd.Score, 1) OVER (ORDER BY cd.Score DESC) AS NextScore,
+    MAX(cd.Score) OVER (ORDER BY cd.Reputation DESC) AS MaxScoreByReputation,
+    MIN(cd.ViewCount) OVER (ORDER BY cd.Reputation DESC) AS MinViewCountByReputation,
+    AVG(cd.Score) OVER (ORDER BY cd.Reputation DESC ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING) AS MovingAvgScore,
+    CASE WHEN cd.Reputation > (SELECT AVG(Reputation) FROM Users) THEN 'AboveAverage' ELSE 'BelowAverage' END AS ReputationComparison,
+    CASE WHEN cd.Score > 0 THEN 'PositiveScore' ELSE 'ZeroOrNegativeScore' END AS ScoreStatus,
+    CASE 
+        WHEN cd.PostType = 'Question' AND cd.AnswerCount > 0 THEN 'AnsweredQuestion'
+        WHEN cd.PostType = 'Question' AND cd.AnswerCount = 0 THEN 'UnansweredQuestion'
+        ELSE 'Other'
+    END AS QuestionStatus,
+    (SELECT COUNT(*) FROM Users u2 WHERE u2.Reputation > cd.Reputation AND u2.Id != cd.UserId) AS UsersWithHigherReputation,
+    (SELECT COUNT(*) FROM Users u3 WHERE u3.Reputation < cd.Reputation AND u3.Id != cd.UserId) AS UsersWithLowerReputation,
+    CONCAT('User_', cd.UserId, '_', cd.DisplayName) AS UserIdentifier,
+    SUBSTRING(CAST(cd.Tags AS VARCHAR), 1, 50) AS TagPreview,
+    CASE 
+        WHEN cd.PostTypeId = 1 AND cd.Score >= 50 THEN 'HighValueQuestion'
+        WHEN cd.PostTypeId = 1 AND cd.Score >= 10 THEN 'ModerateValueQuestion'
+        ELSE 'LowValueQuestion'
+    END AS QuestionValueCategory,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = cd.PostId AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)) AS EditHistoryCount,
+    COALESCE((SELECT TOP 1 Comment FROM PostHistory WHERE PostId = cd.PostId AND PostHistoryTypeId = 10 ORDER BY CreationDate DESC), 'No Close Reason') AS RecentCloseReason,
+    CASE 
+        WHEN cd.AgeInDays <= 30 THEN 'NewPost'
+        WHEN cd.AgeInDays <= 180 THEN 'RecentPost'
+        ELSE 'OldPost'
+    END AS PostAgeCategory
+FROM CombinedData cd
+WHERE cd.UserId IS NOT NULL
+  AND (
+    cd.UserActivityStatus IN ('Active Contributor', 'Regular Poster')
+    OR cd.PostId IS NOT NULL
+  )
+  AND (
+    cd.ReputationTier IN ('Elite', 'Veteran')
+    OR cd.PostType IN ('Question', 'Answer')
+  )
+  AND (
+    cd.Score >= 0
+    OR cd.ViewCount >= 0
+  )
+  AND (
+    cd.Score IS NOT NULL
+    OR cd.ViewCount IS NOT NULL
+  )
+  AND (
+    cd.Title IS NOT NULL
+    OR cd.Tags IS NOT NULL
+  )
+ORDER BY cd.Reputation DESC, cd.Score DESC, cd.PostCreationDate DESC
+OFFSET 100 ROWS
+FETCH NEXT 1000 ROWS ONLY;

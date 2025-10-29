@@ -1,0 +1,163 @@
+-- {"query": "3152.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1768} 
+
+/*  Benchmark query:  comprehensive per‑user activity profile */
+WITH
+    /* 1️⃣ Aggregate badge counts per user, split by class */
+    user_badges AS (
+        SELECT
+            b.UserId,
+            SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_cnt,
+            SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_cnt,
+            SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_cnt,
+            COUNT(*)                                      AS total_badges
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+
+    /* 2️⃣ Latest activity (post or comment) per user */
+    latest_activity AS (
+        SELECT
+            u.Id AS user_id,
+            GREATEST(
+                COALESCE(u.LastAccessDate, '1970-01-01'::timestamp),
+                COALESCE(p.LastActivityDate, '1970-01-01'::timestamp),
+                COALESCE(c.CreationDate, '1970-01-01'::timestamp)
+            ) AS last_seen
+        FROM Users u
+        LEFT JOIN LATERAL (
+            SELECT MAX(LastActivityDate) AS LastActivityDate
+            FROM Posts p
+            WHERE p.OwnerUserId = u.Id
+        ) p ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT MAX(CreationDate) AS CreationDate
+            FROM Comments c
+            WHERE c.UserId = u.Id
+        ) c ON TRUE
+    ),
+
+    /* 3️⃣ Question score stats per user (average, median, stddev) */
+    question_stats AS (
+        SELECT
+            p.OwnerUserId AS user_id,
+            COUNT(*)                                 AS question_cnt,
+            AVG(p.Score)                             AS avg_score,
+            PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) AS median_score,
+            STDDEV_POP(p.Score)                      AS stddev_score
+        FROM Posts p
+        WHERE p.PostTypeId = 1               -- Question
+          AND p.OwnerUserId IS NOT NULL
+        GROUP BY p.OwnerUserId
+    ),
+
+    /* 4️⃣ Tag usage exploded per user */
+    user_tags AS (
+        SELECT
+            p.OwnerUserId               AS user_id,
+            UNNEST(STRING_TO_ARRAY(
+                REGEXP_REPLACE(p.Tags, '^<|>$', '', 'g'),   -- strip leading/trailing '<' '>'
+                '><'
+            ))                         AS tag
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+          AND p.Tags IS NOT NULL
+    ),
+
+    /* 5️⃣ Top three tags per user (by frequency) */
+    top_tags AS (
+        SELECT
+            ut.user_id,
+            STRING_AGG(ut.tag, ', ' ORDER BY cnt DESC) AS top_3_tags
+        FROM (
+            SELECT
+                user_id,
+                tag,
+                COUNT(*) AS cnt,
+                ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY COUNT(*) DESC) AS rn
+            FROM user_tags
+            GROUP BY user_id, tag
+        ) ut
+        WHERE ut.rn <= 3
+        GROUP BY ut.user_id
+    ),
+
+    /* 6️⃣ Users that have earned at least one gold AND one bronze badge */
+    gold_and_bronze AS (
+        SELECT ub.UserId
+        FROM user_badges ub
+        WHERE ub.gold_cnt > 0 AND ub.bronze_cnt > 0
+    ),
+
+    /* 7️⃣ Users that have earned only gold badges (no silver/bronze) */
+    gold_only AS (
+        SELECT ub.UserId
+        FROM user_badges ub
+        WHERE ub.gold_cnt > 0
+          AND ub.silver_cnt = 0
+          AND ub.bronze_cnt = 0
+    )
+
+SELECT
+    u.Id                                 AS user_id,
+    COALESCE(u.DisplayName, 'Anonymous') AS display_name,
+    u.Reputation,
+    COALESCE(qs.question_cnt, 0)          AS total_questions,
+    ROUND(COALESCE(qs.avg_score, 0), 2)   AS avg_question_score,
+    COALESCE(qs.median_score, 0)          AS median_question_score,
+    ROUND(COALESCE(qs.stddev_score, 0), 2) AS stddev_question_score,
+    COALESCE(b.gold_cnt, 0)               AS gold_badges,
+    COALESCE(b.silver_cnt, 0)             AS silver_badges,
+    COALESCE(b.bronze_cnt, 0)             AS bronze_badges,
+    COALESCE(t.top_3_tags, '')            AS top_tags,
+    la.last_seen                         AS last_activity,
+    CASE
+        WHEN g.id IS NOT NULL THEN 'Gold+Bronze'
+        WHEN go.id IS NOT NULL THEN 'Gold Only'
+        ELSE 'Other'
+    END                                   AS badge_category,
+    /* 8️⃣ Compute a “activity score” mixing reputation, badge weight and recent activity */
+    ROUND(
+        (u.Reputation * 0.4) +
+        (COALESCE(b.gold_cnt,0) * 50   +
+         COALESCE(b.silver_cnt,0) * 20 +
+         COALESCE(b.bronze_cnt,0) * 5) * 0.3 +
+        (EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - la.last_seen)) / 86400) * -0.2,
+        2
+    ) AS activity_index
+FROM Users u
+LEFT JOIN user_badges b      ON b.UserId = u.Id
+LEFT JOIN question_stats qs  ON qs.user_id = u.Id
+LEFT JOIN top_tags t         ON t.user_id = u.Id
+LEFT JOIN latest_activity la ON la.user_id = u.Id
+LEFT JOIN gold_and_bronze g   ON g.UserId = u.Id
+LEFT JOIN gold_only go        ON go.UserId = u.Id
+WHERE u.Id NOT IN (SELECT UserId FROM Users WHERE AccountId IS NULL)   -- exclude deleted accounts
+ORDER BY activity_index DESC
+LIMIT 100
+UNION ALL
+/* 9️⃣ Complementary set: users without any badges but with at least one question */
+SELECT
+    u.Id,
+    COALESCE(u.DisplayName, 'Anonymous'),
+    u.Reputation,
+    COALESCE(qs.question_cnt,0),
+    ROUND(COALESCE(qs.avg_score,0),2),
+    COALESCE(qs.median_score,0),
+    ROUND(COALESCE(qs.stddev_score,0),2),
+    0,0,0,
+    COALESCE(t.top_3_tags,''),
+    la.last_seen,
+    'No Badges',
+    ROUND(
+        (u.Reputation * 0.4) +
+        (EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - la.last_seen)) / 86400) * -0.2,
+        2
+    )
+FROM Users u
+LEFT JOIN question_stats qs  ON qs.user_id = u.Id
+LEFT JOIN top_tags t         ON t.user_id = u.Id
+LEFT JOIN latest_activity la ON la.user_id = u.Id
+WHERE NOT EXISTS (SELECT 1 FROM user_badges ub WHERE ub.UserId = u.Id)
+  AND COALESCE(qs.question_cnt,0) > 0
+ORDER BY activity_index DESC
+LIMIT 50;

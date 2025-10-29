@@ -1,0 +1,171 @@
+with recursive RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 as Level,
+        cast(t.TagName as varchar(500)) as TagPath
+    from Tags t
+    where t.IsRequired = true
+
+    union all
+
+    select
+        child.Id,
+        child.TagName,
+        child.ExcerptPostId,
+        child.WikiPostId,
+        p.Level + 1,
+        cast(p.TagPath || ' > ' || child.TagName as varchar(500)) as TagPath
+    from Tags child
+    inner join RecursiveTagHierarchy p on child.Id <> p.Id
+    where child.IsModeratorOnly = true
+      and child.Count < p.Level * 10
+      and child.TagName <> p.TagName
+      and child.Id > p.Id
+),
+QuestionAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.CreationDate as QuestionCreation,
+        q.Title,
+        q.Tags,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        u.Id as OwnerUserId,
+        u.DisplayName as OwnerName,
+        coalesce(u.Reputation,0) as OwnerReputation,
+        count(a.Id) filter (where a.Score > 0) as PosAnswersCount,
+        avg(a.Score) filter (where a.Score is not null) as AvgAnswerScore,
+        sum(case when ph.PostHistoryTypeId = 10 then 1 else 0 end) as CloseVotesCount,
+        max(v.VoteTypeId) filter (where v.VoteTypeId in (2,3)) as MaxVoteType,
+        row_number() over (partition by u.Id order by q.CreationDate desc) as UserRecentQuestionRank,
+        dense_rank() over (order by q.Score desc nulls last) as ScoreRank
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Users u on u.Id = q.OwnerUserId
+    left join PostHistory ph on ph.PostId = q.Id
+    left join Votes v on v.PostId = q.Id
+    where q.PostTypeId = 1
+    group by q.Id, u.Id, u.DisplayName, u.Reputation, q.CreationDate, q.Title, q.Tags, q.Score, q.ViewCount, q.AnswerCount
+),
+CloseReasonsCTE as (
+    select
+        ph.PostId,
+        crt.Name as CloseReasonName,
+        count(*) as CloseCount
+    from PostHistory ph
+    inner join CloseReasonTypes crt on cast(ph.Comment as integer) = crt.Id and ph.PostHistoryTypeId = 10
+    group by ph.PostId, crt.Name
+),
+UserBadgeAgg as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(case when b.Class = 1 then 1 end) as GoldBadges,
+        count(case when b.Class = 2 then 1 end) as SilverBadges,
+        count(case when b.Class = 3 then 1 end) as BronzeBadges,
+        count(distinct b.Name) as DistinctBadgeCount,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+TopPosts AS (
+    select 
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.CreationDate,
+        p.PostTypeId,
+        p.ParentId,
+        coalesce(vt.Name, 'Unknown') as VoteTypeName,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc) as RankPerUser
+    from Posts p
+    left join Votes v on v.PostId = p.Id
+    left join VoteTypes vt on vt.Id = v.VoteTypeId
+    where p.Score > 10
+),
+UserCommentStats AS (
+    select
+        c.UserId,
+        count(distinct c.PostId) as CommentedPostsCount,
+        count(*) as TotalComments,
+        avg(char_length(c.Text)) as AvgCommentLength,
+        max(c.CreationDate) as LastCommentDate
+    from Comments c
+    where c.UserId is not null
+    group by c.UserId
+),
+CombinedUserStats AS (
+    select
+        u.Id,
+        u.DisplayName,
+        coalesce(rb.GoldBadges,0) as GoldBadges,
+        coalesce(rb.SilverBadges,0) as SilverBadges,
+        coalesce(rb.BronzeBadges,0) as BronzeBadges,
+        coalesce(rb.DistinctBadgeCount,0) as DistinctBadgeCount,
+        coalesce(qas.AnswerCount, 0) as QuestionsCount,
+        coalesce(vs.PosAnswersCount, 0) as PositiveAnswersCount,
+        coalesce(cs.CommentedPostsCount, 0) as CommentedPostsCount,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        case when u.WebsiteUrl is null or char_length(u.WebsiteUrl) < 5 then 'No Website' else u.WebsiteUrl end as WebsiteUrlPlaceholder,
+        case when coalesce(char_length(u.Location),0) > 0 then u.Location else 'Unknown' end as LocationPlaceholder,
+        rb.LastBadgeDate,
+        cs.LastCommentDate
+    from Users u
+    left join UserBadgeAgg rb on rb.UserId = u.Id
+    left join QuestionAnswerStats qas on qas.OwnerUserId = u.Id
+    left join QuestionAnswerStats vs on vs.OwnerUserId = u.Id
+    left join UserCommentStats cs on cs.UserId = u.Id
+    where u.Reputation > 100
+)
+select 
+    cus.Id as UserId,
+    cus.DisplayName,
+    cus.Reputation,
+    cus.GoldBadges,
+    cus.SilverBadges,
+    cus.BronzeBadges,
+    cus.DistinctBadgeCount,
+    cus.QuestionsCount,
+    cus.PositiveAnswersCount,
+    cus.CommentedPostsCount,
+    cus.WebsiteUrlPlaceholder,
+    cus.LocationPlaceholder,
+    cus.LastBadgeDate,
+    cus.LastCommentDate,
+    coalesce(crc.CloseReasonName, 'None') as MostCommonCloseReason,
+    string_agg(distinct rth.TagName, ',' order by rth.TagName) as RequiredModeratorTagsInHierarchy,
+    sum(case when tp.PostTypeId = 1 then 1 else 0 end) as UserTopQuestionsCount,
+    sum(case when tp.PostTypeId = 2 then 1 else 0 end) as UserTopAnswersCount
+from CombinedUserStats cus
+left join CloseReasonsCTE crc on crc.PostId in (
+    select q.Id from Posts q where q.OwnerUserId = cus.Id and q.PostTypeId = 1
+)
+left join RecursiveTagHierarchy rth on rth.Level <= 3
+left join TopPosts tp on tp.OwnerUserId = cus.Id and tp.RankPerUser <= 3
+where (cus.GoldBadges + cus.SilverBadges + cus.BronzeBadges) > 5
+group by
+    cus.Id,
+    cus.DisplayName,
+    cus.Reputation,
+    cus.GoldBadges,
+    cus.SilverBadges,
+    cus.BronzeBadges,
+    cus.DistinctBadgeCount,
+    cus.QuestionsCount,
+    cus.PositiveAnswersCount,
+    cus.CommentedPostsCount,
+    cus.WebsiteUrlPlaceholder,
+    cus.LocationPlaceholder,
+    cus.LastBadgeDate,
+    cus.LastCommentDate,
+    crc.CloseReasonName
+order by cus.Reputation desc
+limit 100;

@@ -1,0 +1,191 @@
+-- {"query": "7473.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2052} 
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ParentId,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) as avg_score_3,
+        NTILE(4) OVER (ORDER BY p.Score) as quartile,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.Score > 10 THEN 'High_Question'
+            WHEN p.PostTypeId = 2 AND p.Score > 5 THEN 'High_Answer'
+            ELSE 'Normal'
+        END as post_category,
+        COALESCE(p.Title, 'No Title') as title_safe,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags != '' THEN ARRAY_LENGTH(string_to_array(trim(p.Tags, '<>'), '><'), 1)
+            ELSE 0
+        END as tag_count
+    FROM Posts p
+    WHERE p.CreationDate >= '2022-01-01'::timestamp
+),
+UserActivity AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT r.Id) as recent_posts,
+        COUNT(DISTINCT c.Id) as comments_made,
+        COUNT(DISTINCT b.Id) as badges_received,
+        SUM(CASE WHEN r.PostTypeId = 1 THEN 1 ELSE 0 END) as questions_asked,
+        SUM(CASE WHEN r.PostTypeId = 2 THEN 1 ELSE 0 END) as answers_given,
+        MAX(r.CreationDate) as last_activity
+    FROM Users u
+    LEFT JOIN Posts r ON u.Id = r.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= '2022-01-01'::timestamp
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as tag_count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 100 THEN 'Popular'
+            WHEN t.Count > 50 THEN 'Moderate'
+            WHEN t.Count > 10 THEN 'Niche'
+            ELSE 'Rare'
+        END as tag_popularity,
+        AVG(p.Score) as avg_score,
+        MAX(p.Score) as max_score
+    FROM Tags t
+    JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    WHERE p.CreationDate >= '2022-01-01'::timestamp
+    GROUP BY t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId
+),
+QuestionAnalysis AS (
+    SELECT 
+        q.Id as QuestionId,
+        q.Title,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.CommentCount,
+        q.CreationDate,
+        q.OwnerUserId,
+        q.Tags,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerDate,
+        COALESCE(a.OwnerUserId, -1) as AnswerOwnerId,
+        CASE 
+            WHEN a.Id IS NOT NULL AND a.Score > q.Score * 0.8 THEN 'High_Value_Answer'
+            WHEN a.Id IS NOT NULL AND a.Score > 0 THEN 'Moderate_Value_Answer'
+            ELSE 'Low_Value_Answer'
+        END as answer_quality,
+        ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY a.Score DESC) as answer_rank,
+        EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate)) / 3600 as hours_to_answer,
+        CASE 
+            WHEN a.Id IS NOT NULL THEN 'Has_Answers'
+            ELSE 'No_Answers'
+        END as has_answers
+    FROM Posts q
+    LEFT JOIN Posts a ON q.Id = a.ParentId AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+    AND q.CreationDate >= '2022-01-01'::timestamp
+    AND q.CreationDate <= '2023-12-31'::timestamp
+),
+PostHistorySummary AS (
+    SELECT 
+        ph.PostId,
+        COUNT(*) as edit_count,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6) THEN 1 END) as edit_operations,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN 1 END) as status_changes,
+        MAX(ph.CreationDate) as last_modified,
+        MIN(ph.CreationDate) as first_modified,
+        EXTRACT(EPOCH FROM (MAX(ph.CreationDate) - MIN(ph.CreationDate))) / 3600 as hours_between_edits
+    FROM PostHistory ph
+    WHERE ph.CreationDate >= '2022-01-01'::timestamp
+    GROUP BY ph.PostId
+)
+SELECT 
+    'Performance_Benchmark_Report' as report_title,
+    COUNT(*) as total_records,
+    COUNT(DISTINCT ra.QuestionId) as total_questions,
+    COUNT(DISTINCT ra.AnswerId) as total_answers,
+    AVG(ra.Score) as avg_question_score,
+    AVG(ra.AnswerScore) as avg_answer_score,
+    AVG(ra.hours_to_answer) as avg_hours_to_answer,
+    COUNT(DISTINCT CASE WHEN ra.answer_quality = 'High_Value_Answer' THEN ra.AnswerId END) as high_value_answers,
+    COUNT(DISTINCT CASE WHEN ra.has_answers = 'Has_Answers' THEN ra.QuestionId END) as questions_with_answers,
+    COUNT(DISTINCT ua.UserId) as total_active_users,
+    AVG(ua.questions_asked) as avg_questions_per_user,
+    AVG(ua.answers_given) as avg_answers_per_user,
+    AVG(CASE WHEN ta.tag_popularity = 'Popular' THEN ta.avg_score END) as avg_score_popular_tags,
+    AVG(CASE WHEN ta.tag_popularity = 'Moderate' THEN ta.avg_score END) as avg_score_moderate_tags,
+    AVG(CASE WHEN ta.tag_popularity = 'Niche' THEN ta.avg_score END) as avg_score_niche_tags,
+    AVG(CASE WHEN ta.tag_popularity = 'Rare' THEN ta.avg_score END) as avg_score_rare_tags,
+    COUNT(DISTINCT CASE WHEN ps.edit_count > 10 THEN ps.PostId END) as highly_edited_posts,
+    AVG(ps.edit_count) as avg_edits_per_post,
+    COUNT(DISTINCT CASE WHEN ps.status_changes > 0 THEN ps.PostId END) as posts_with_status_changes,
+    COUNT(DISTINCT CASE 
+        WHEN ra.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 week' THEN ra.QuestionId 
+        ELSE NULL 
+    END) as recent_questions,
+    COUNT(DISTINCT CASE 
+        WHEN ps.last_modified >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 week' THEN ps.PostId 
+        ELSE NULL 
+    END) as recently_updated_posts,
+    COUNT(DISTINCT CASE 
+        WHEN ua.last_activity >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 month' THEN ua.UserId 
+        ELSE NULL 
+    END) as active_users_last_month,
+    MAX(ra.CreationDate) as latest_question_date,
+    MIN(ra.CreationDate) as earliest_question_date,
+    COUNT(DISTINCT CASE 
+        WHEN ra.answer_rank = 1 THEN ra.QuestionId 
+        ELSE NULL 
+    END) as top_answered_questions,
+    SUM(CASE WHEN ra.answer_rank = 1 THEN 1 ELSE 0 END) as total_top_answers,
+    COUNT(DISTINCT CASE 
+        WHEN ra.answer_rank = 1 
+        AND ra.AnswerScore > (SELECT AVG(AnswerScore) FROM QuestionAnalysis) 
+        THEN ra.QuestionId 
+        ELSE NULL 
+    END) as high_scoring_top_questions,
+    AVG(CASE 
+        WHEN ra.has_answers = 'Has_Answers' 
+        THEN ra.AnswerCount 
+        ELSE NULL 
+    END) as avg_answers_per_question_with_answers,
+    AVG(CASE 
+        WHEN ra.has_answers = 'No_Answers' 
+        THEN ra.AnswerCount 
+        ELSE NULL 
+    END) as avg_answers_per_question_no_answers,
+    COUNT(DISTINCT CASE 
+        WHEN ra.score > (
+            SELECT AVG(score) FROM Posts WHERE PostTypeId = 1
+        ) * 1.5 THEN ra.QuestionId 
+        ELSE NULL 
+    END) as above_avg_questions,
+    COUNT(DISTINCT CASE 
+        WHEN ra.answer_score > (
+            SELECT AVG(AnswerScore) FROM QuestionAnalysis
+        ) * 1.2 THEN ra.AnswerId 
+        ELSE NULL 
+    END) as above_avg_answers
+FROM QuestionAnalysis ra
+FULL OUTER JOIN UserActivity ua ON ra.OwnerUserId = ua.UserId
+FULL OUTER JOIN TagAnalysis ta ON ta.TagName IN (
+    SELECT UNNEST(string_to_array(ra.Tags, '><')) FROM QuestionAnalysis ra WHERE ra.Tags IS NOT NULL
+)
+FULL OUTER JOIN PostHistorySummary ps ON ra.QuestionId = ps.PostId
+WHERE ra.CreationDate IS NOT NULL;

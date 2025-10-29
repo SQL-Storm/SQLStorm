@@ -1,0 +1,396 @@
+with recent_users as (
+    select
+        u.id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        u.location,
+        coalesce(nullif(trim(u.websiteurl), ''), 'n/a') as websiteurl,
+        u.upvotes,
+        u.downvotes,
+        u.views,
+        row_number() over (order by u.creationdate desc, u.id) as rn
+    from users u
+    where u.creationdate >= (
+        select date_trunc('month', max(p.creationdate)) - interval '12 months' from posts p
+    )
+),
+question_activity as (
+    select
+        p.id as question_id,
+        p.owneruserid as owner_id,
+        p.creationdate as q_credate,
+        p.score as q_score,
+        p.viewcount as q_views,
+        p.title,
+        p.tags,
+        p.acceptedanswerid,
+        p.answercount,
+        p.commentcount,
+        p.favoritecount,
+        p.closeddate,
+        p.lastactivitydate,
+        coalesce(ans.cnt_answers, 0) as cnt_answers,
+        coalesce(com.cnt_comments, 0) as cnt_comments,
+        ans.first_answer_ts,
+        extract(epoch from (ans.first_answer_ts - p.creationdate)) as secs_to_first_answer
+    from posts p
+    left join lateral (
+        select
+            count(*) as cnt_answers,
+            min(a.creationdate) as first_answer_ts
+        from posts a
+        where a.parentid = p.id
+          and a.posttypeid = 2
+    ) ans on true
+    left join lateral (
+        select count(*) as cnt_comments
+        from comments c
+        where c.postid = p.id
+    ) com on true
+    where p.posttypeid = 1
+      and p.creationdate >= (
+        select date_trunc('month', max(ph.creationdate)) - interval '18 months' from posthistory ph
+      )
+),
+badge_stats as (
+    select
+        b.userid,
+        count(case when b.class = 1 then 1 end) as gold_cnt,
+        count(case when b.class = 2 then 1 end) as silver_cnt,
+        count(case when b.class = 3 then 1 end) as bronze_cnt,
+        count(*) as total_badges,
+        max(b.date) as last_badge_date
+    from badges b
+    group by b.userid
+),
+user_votes as (
+    select
+        p.owneruserid as owner_id,
+        sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end) as net_votes,
+        count(case when v.votetypeid = 2 then 1 end) as upvotes_rcvd,
+        count(case when v.votetypeid = 3 then 1 end) as downvotes_rcvd,
+        count(case when v.votetypeid in (8,9) then 1 end) as bounty_events,
+        sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_sum
+    from votes v
+    join posts p on p.id = v.postid
+    group by p.owneruserid
+),
+dup_links as (
+    select
+        pl.postid as duplicate_post_id,
+        pl.relatedpostid as original_post_id,
+        min(pl.creationdate) as first_link_date,
+        count(*) as dup_link_count
+    from postlinks pl
+    where pl.linktypeid = 3
+    group by pl.postid, pl.relatedpostid
+),
+closure_events as (
+    select
+        ph.postid,
+        min(ph.creationdate) as first_close_ts,
+        max(ph.creationdate) as last_close_ts,
+        array_agg(distinct nullif(ph.comment, '')) filter (where ph.posthistorytypeid = 10) as close_reason_ids_raw
+    from posthistory ph
+    where ph.posthistorytypeid in (10,11)
+    group by ph.postid
+),
+tag_unpacked as (
+    select
+        q.question_id,
+        unnest(string_to_array(substring(q.tags, 2, greatest(length(q.tags)-2,0)), '><')) as tagname
+    from question_activity q
+    where q.tags is not null and q.tags like '<%>'
+),
+tag_rank as (
+    select
+        t.tagname,
+        count(*) as tag_q_count,
+        sum(q.q_score) as tag_total_score,
+        rank() over (order by count(*) desc, sum(q.q_score) desc) as tag_pop_rank
+    from tag_unpacked tu
+    join question_activity q on q.question_id = tu.question_id
+    join tags t on lower(t.tagname) = lower(tu.tagname)
+    group by t.tagname
+),
+user_question_rollup as (
+    select
+        q.owner_id,
+        count(*) as q_count,
+        sum(q.q_score) as q_score_sum,
+        avg(cast(q.q_score as numeric)) as q_score_avg,
+        max(q.q_score) as q_score_max,
+        sum(q.q_views) as q_views_sum,
+        avg(q.secs_to_first_answer) filter (where q.secs_to_first_answer is not null) as avg_secs_to_first_answer,
+        percentile_disc(0.5) within group (order by q.q_views) as median_views,
+        count(*) filter (where q.acceptedanswerid is not null) as q_with_accepted,
+        count(*) filter (where q.closeddate is not null) as q_closed_cnt,
+        max(q.lastactivitydate) as last_q_activity
+    from question_activity q
+    group by q.owner_id
+),
+accepted_answerers as (
+    select
+        q.owneruserid as asker_id,
+        a.owneruserid as answerer_id,
+        count(*) as accepted_answers_to_asker
+    from posts q
+    join posts a on a.id = q.acceptedanswerid
+    where q.posttypeid = 1
+    group by q.owneruserid, a.owneruserid
+),
+user_peer_network as (
+    select
+        asker_id as user_id,
+        count(distinct answerer_id) as distinct_helpers,
+        sum(accepted_answers_to_asker) as accepted_received
+    from accepted_answerers
+    group by asker_id
+),
+ranked_users as (
+    select
+        ru.owner_id as user_id,
+        ru.q_count,
+        ru.q_score_sum,
+        ru.q_score_avg,
+        ru.q_score_max,
+        ru.q_views_sum,
+        ru.avg_secs_to_first_answer,
+        ru.median_views,
+        ru.q_with_accepted,
+        ru.q_closed_cnt,
+        ru.last_q_activity,
+        uv.net_votes,
+        uv.upvotes_rcvd,
+        uv.downvotes_rcvd,
+        uv.bounty_events,
+        uv.bounty_sum,
+        bs.gold_cnt,
+        bs.silver_cnt,
+        bs.bronze_cnt,
+        bs.total_badges,
+        bs.last_badge_date,
+        pn.distinct_helpers,
+        pn.accepted_received,
+        row_number() over (
+            order by
+                coalesce(ru.q_score_sum,0) desc,
+                coalesce(uv.net_votes,0) desc,
+                coalesce(ru.q_views_sum,0) desc
+        ) as perf_rank
+    from user_question_rollup ru
+    left join user_votes uv on uv.owner_id = ru.owner_id
+    left join badge_stats bs on bs.userid = ru.owner_id
+    left join user_peer_network pn on pn.user_id = ru.owner_id
+),
+question_qualities as (
+    select
+        q.question_id,
+        q.owner_id,
+        q.q_score,
+        q.q_views,
+        q.answercount,
+        q.acceptedanswerid,
+        q.secs_to_first_answer,
+        case
+            when q.q_score >= 10 and q.acceptedanswerid is not null then 'Excellent'
+            when q.q_score between 5 and 9 then 'Good'
+            when q.q_score between 1 and 4 then 'Fair'
+            when q.q_score <= 0 and q.answercount = 0 then 'Unanswered/Low'
+            else 'Mixed'
+        end as quality_bucket
+    from question_activity q
+),
+user_last_touch as (
+    select
+        p.owneruserid as user_id,
+        max(p.lastactivitydate) as last_post_activity
+    from posts p
+    group by p.owneruserid
+),
+final_user_set as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        u.location,
+        u.websiteurl,
+        u.upvotes,
+        u.downvotes,
+        u.views,
+        rl.last_post_activity
+    from recent_users u
+    left join user_last_touch rl on rl.user_id = u.id
+    where u.rn <= 5000
+),
+dup_impact as (
+    select
+        q.owneruserid as owner_id,
+        count(distinct d.duplicate_post_id) as dup_marked_questions,
+        count(distinct d.original_post_id) as distinct_original_targets
+    from dup_links d
+    join posts q on q.id = d.duplicate_post_id and q.posttypeid = 1
+    group by q.owneruserid
+),
+close_impact as (
+    select
+        p.owneruserid as owner_id,
+        count(*) as total_close_events,
+        min(c.first_close_ts) as first_close_ts,
+        max(c.last_close_ts) as last_close_ts,
+        sum(case when c.first_close_ts is not null then 1 else 0 end) as questions_with_close_history
+    from closure_events c
+    join posts p on p.id = c.postid
+    where p.posttypeid = 1
+    group by p.owneruserid
+),
+user_tag_profile as (
+    select
+        q.owner_id as owner_id,
+        lower(tu.tagname) as tagname,
+        count(*) as tag_qs,
+        sum(q.q_score) as tag_score_sum,
+        avg(cast(q.q_score as numeric)) as tag_score_avg
+    from tag_unpacked tu
+    join question_activity q on q.question_id = tu.question_id
+    group by q.owner_id, lower(tu.tagname)
+),
+top3_tags as (
+    select owner_id as user_id,
+           string_agg(tagname || ':' || cast(tag_qs as text) || '/' || coalesce(cast(round(tag_score_avg::numeric,2) as text),'0'), ', ' order by tag_qs desc, tag_score_sum desc) as top_tags
+    from (
+        select
+            utp.*,
+            row_number() over (partition by owner_id order by tag_qs desc, tag_score_sum desc) as rn
+        from user_tag_profile utp
+    ) z
+    where rn <= 3
+    group by owner_id
+),
+post_type_mix as (
+    select
+        p.owneruserid as user_id,
+        count(case when p.posttypeid = 1 then 1 end) as qs,
+        count(case when p.posttypeid = 2 then 1 end) as ans,
+        count(*) as total_posts
+    from posts p
+    group by p.owneruserid
+),
+activity_density as (
+    select
+        q.owner_id as user_id,
+        count(*) as q_last_90d,
+        sum(q.q_score) as q_score_last_90d,
+        avg(extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - q.q_credate))) as avg_age_secs
+    from question_activity q
+    where q.q_credate >= cast('2024-10-01 12:34:56' as timestamp) - interval '90 days'
+    group by q.owner_id
+),
+user_quality_rollup as (
+    select
+        qq.owner_id as user_id,
+        count(case when qq.quality_bucket = 'Excellent' then 1 end) as exc_cnt,
+        count(case when qq.quality_bucket = 'Good' then 1 end) as good_cnt,
+        count(case when qq.quality_bucket = 'Fair' then 1 end) as fair_cnt,
+        count(case when qq.quality_bucket = 'Mixed' then 1 end) as mixed_cnt,
+        count(case when qq.quality_bucket = 'Unanswered/Low' then 1 end) as low_cnt
+    from question_qualities qq
+    group by qq.owner_id
+)
+select
+    fus.user_id,
+    fus.displayname,
+    fus.reputation,
+    fus.creationdate as user_since,
+    coalesce(nullif(fus.location, ''), 'Unknown') as location,
+    fus.websiteurl,
+    fus.upvotes as user_upvotes,
+    fus.downvotes as user_downvotes,
+    fus.views as profile_views,
+    fus.last_post_activity,
+    ru.q_count,
+    ru.q_score_sum,
+    ru.q_score_avg,
+    ru.q_score_max,
+    ru.q_views_sum,
+    ru.avg_secs_to_first_answer,
+    ru.median_views,
+    ru.q_with_accepted,
+    ru.q_closed_cnt,
+    ru.last_q_activity,
+    coalesce(uv.net_votes, 0) as net_votes_received,
+    coalesce(uv.upvotes_rcvd, 0) as upvotes_received,
+    coalesce(uv.downvotes_rcvd, 0) as downvotes_received,
+    coalesce(uv.bounty_events, 0) as bounty_events,
+    coalesce(uv.bounty_sum, 0) as bounty_sum,
+    coalesce(bs.gold_cnt, 0) as gold_badges,
+    coalesce(bs.silver_cnt, 0) as silver_badges,
+    coalesce(bs.bronze_cnt, 0) as bronze_badges,
+    coalesce(bs.total_badges, 0) as total_badges,
+    bs.last_badge_date,
+    coalesce(pn.distinct_helpers, 0) as distinct_helpers,
+    coalesce(pn.accepted_received, 0) as accepted_received_from_helpers,
+    coalesce(di.dup_marked_questions, 0) as dup_marked_questions,
+    coalesce(di.distinct_original_targets, 0) as dup_original_targets,
+    ci.total_close_events,
+    ci.first_close_ts,
+    ci.last_close_ts,
+    coalesce(ci.questions_with_close_history, 0) as questions_with_close_history,
+    t3.top_tags,
+    pm.qs as total_questions,
+    pm.ans as total_answers,
+    pm.total_posts,
+    ad.q_last_90d,
+    ad.q_score_last_90d,
+    round(coalesce(ad.avg_age_secs,0), 2) as avg_age_secs_recent_q,
+    uq.exc_cnt,
+    uq.good_cnt,
+    uq.fair_cnt,
+    uq.mixed_cnt,
+    uq.low_cnt,
+    ru.perf_rank,
+    case
+        when ru.q_count is null then 'NoQuestions'
+        when coalesce(ru.q_score_sum,0) >= 100 then 'A'
+        when coalesce(ru.q_score_sum,0) >= 25 then 'B'
+        when coalesce(ru.q_score_sum,0) >= 5 then 'C'
+        else 'D'
+    end as perf_grade
+from final_user_set fus
+left join ranked_users ru on ru.user_id = fus.user_id
+left join user_votes uv on uv.owner_id = fus.user_id
+left join badge_stats bs on bs.userid = fus.user_id
+left join user_peer_network pn on pn.user_id = fus.user_id
+left join dup_impact di on di.owner_id = fus.user_id
+left join close_impact ci on ci.owner_id = fus.user_id
+left join top3_tags t3 on t3.user_id = fus.user_id
+left join post_type_mix pm on pm.user_id = fus.user_id
+left join activity_density ad on ad.user_id = fus.user_id
+left join user_quality_rollup uq on uq.user_id = fus.user_id
+where
+    (
+        (
+            lower(fus.displayname) like lower('%data%')
+            or lower(fus.displayname) like lower('%sql%')
+            or lower(fus.displayname) like lower('%python%')
+        )
+        or (fus.websiteurl is not null and fus.websiteurl ~* '(github|gitlab|bitbucket)\\.com')
+        or (fus.location is null or fus.location ~* '(remote|anywhere)')
+    )
+    and coalesce(ru.q_count, 0) + coalesce(pm.ans, 0) > 0
+    and (bs.total_badges is null or bs.total_badges >= 1)
+    and not exists (
+        select 1
+        from posts pz
+        where pz.owneruserid = fus.user_id
+          and pz.posttypeid = 1
+          and pz.score < -10
+    )
+order by
+    ru.perf_rank nulls last,
+    coalesce(uv.net_votes, 0) desc,
+    fus.reputation desc,
+    fus.user_id
+limit 250;

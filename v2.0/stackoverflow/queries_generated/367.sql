@@ -1,0 +1,308 @@
+-- {"query": "367.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2717} 
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        u.location,
+        coalesce(nullif(trim(u.websiteurl), ''), 'n/a') as websiteurl_norm,
+        row_number() over (order by u.creationdate desc, u.id) as rn_recent
+    from users u
+    where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+q_posts as (
+    select
+        p.id as question_id,
+        p.owneruserid as owner_user_id,
+        p.creationdate as q_created,
+        p.score as q_score,
+        p.viewcount,
+        p.title,
+        p.tags,
+        p.acceptedanswerid,
+        case when p.closeddate is null then 0 else 1 end as is_closed
+    from posts p
+    where p.posttypeid = 1
+),
+a_posts as (
+    select
+        a.id as answer_id,
+        a.parentid as question_id,
+        a.owneruserid as owner_user_id,
+        a.creationdate as a_created,
+        a.score as a_score
+    from posts a
+    where a.posttypeid = 2
+),
+tag_expansion as (
+    select
+        q.question_id,
+        unnest(string_to_array(substring(q.tags, 2, length(q.tags)-2), '><')) as tagname
+    from q_posts q
+    where q.tags is not null and q.tags like '<%>'
+),
+tag_rank as (
+    select
+        t.tagname,
+        count(*) as tag_q_count,
+        dense_rank() over (order by count(*) desc, min(t.tagname)) as tag_pop_rank
+    from tag_expansion t
+    group by t.tagname
+),
+user_badges as (
+    select
+        b.userid,
+        count(*) filter (where b.class = 1) as gold_count,
+        count(*) filter (where b.class = 2) as silver_count,
+        count(*) filter (where b.class = 3) as bronze_count,
+        max(b.date) as last_badge_date,
+        min(b.date) as first_badge_date
+    from badges b
+    group by b.userid
+),
+q_activity as (
+    select
+        q.question_id,
+        q.owner_user_id,
+        q.q_created,
+        q.q_score,
+        q.viewcount,
+        q.title,
+        q.tags,
+        q.acceptedanswerid,
+        q.is_closed,
+        coalesce(sum(a.a_score), 0) as sum_answer_scores,
+        count(a.answer_id) as answer_count,
+        max(a.a_created) as last_answer_date
+    from q_posts q
+    left join a_posts a on a.question_id = q.question_id
+    group by q.question_id, q.owner_user_id, q.q_created, q.q_score, q.viewcount, q.title, q.tags, q.acceptedanswerid, q.is_closed
+),
+vote_agg as (
+    select
+        v.postid,
+        count(*) filter (where v.votetypeid = 2) as upvotes,
+        count(*) filter (where v.votetypeid = 3) as downvotes,
+        count(*) filter (where v.votetypeid = 5) as favorites,
+        sum(v.bountyamount) filter (where v.votetypeid in (8,9)) as bounty_total,
+        min(v.creationdate) filter (where v.votetypeid in (8,9)) as first_bounty_date,
+        max(v.creationdate) filter (where v.votetypeid in (8,9)) as last_bounty_date
+    from votes v
+    group by v.postid
+),
+ph_close as (
+    select
+        ph.postid,
+        count(*) filter (where ph.posthistorytypeid = 10) as close_events,
+        count(*) filter (where ph.posthistorytypeid = 11) as reopen_events,
+        max(ph.creationdate) filter (where ph.posthistorytypeid in (10,11)) as last_close_or_reopen
+    from posthistory ph
+    group by ph.postid
+),
+link_map as (
+    select
+        pl.postid,
+        count(*) filter (where pl.linktypeid = 1) as linked_count,
+        count(*) filter (where pl.linktypeid = 3) as duplicate_links
+    from postlinks pl
+    group by pl.postid
+),
+comment_stats as (
+    select
+        c.postid,
+        count(*) as comment_count,
+        coalesce(sum(greatest(c.score, 0)), 0) as nonneg_comment_score,
+        max(c.creationdate) as last_comment_date
+    from comments c
+    group by c.postid
+),
+owner_enriched as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        u.location,
+        ru.rn_recent,
+        ub.gold_count,
+        ub.silver_count,
+        ub.bronze_count,
+        ub.last_badge_date,
+        ub.first_badge_date
+    from users u
+    left join recent_users ru on ru.user_id = u.id
+    left join user_badges ub on ub.userid = u.id
+),
+question_enriched as (
+    select
+        qa.question_id,
+        qa.owner_user_id,
+        oe.displayname as owner_name,
+        oe.reputation as owner_rep,
+        oe.creationdate as owner_created,
+        oe.location as owner_location,
+        oe.rn_recent,
+        coalesce(oe.gold_count,0) as gold_count,
+        coalesce(oe.silver_count,0) as silver_count,
+        coalesce(oe.bronze_count,0) as bronze_count,
+        qa.q_created,
+        qa.q_score,
+        qa.viewcount,
+        qa.title,
+        qa.tags,
+        qa.acceptedanswerid,
+        qa.is_closed,
+        qa.sum_answer_scores,
+        qa.answer_count,
+        qa.last_answer_date,
+        va.upvotes,
+        va.downvotes,
+        va.favorites,
+        va.bounty_total,
+        va.first_bounty_date,
+        va.last_bounty_date,
+        pc.close_events,
+        pc.reopen_events,
+        pc.last_close_or_reopen,
+        lm.linked_count,
+        lm.duplicate_links,
+        cs.comment_count,
+        cs.nonneg_comment_score,
+        cs.last_comment_date
+    from q_activity qa
+    left join owner_enriched oe on oe.user_id = qa.owner_user_id
+    left join vote_agg va on va.postid = qa.question_id
+    left join ph_close pc on pc.postid = qa.question_id
+    left join link_map lm on lm.postid = qa.question_id
+    left join comment_stats cs on cs.postid = qa.question_id
+),
+tagged_ranked as (
+    select
+        qe.*,
+        tr.tagname as dominant_tag,
+        tr.tag_pop_rank,
+        count(*) over () as total_questions_window
+    from question_enriched qe
+    left join lateral (
+        select t.tagname
+        from tag_expansion t
+        where t.question_id = qe.question_id
+        order by (select tag_q_count from tag_rank r where r.tagname = t.tagname) desc nulls last,
+                 t.tagname
+        limit 1
+    ) dt on true
+    left join tag_rank tr on tr.tagname = dt.tagname
+),
+scored as (
+    select
+        tq.*,
+        coalesce(upvotes,0) - coalesce(downvotes,0) as net_votes,
+        case
+            when acceptedanswerid is not null then 1
+            when answer_count > 0 and last_answer_date <= q_created + interval '1 day' then 0.5
+            else 0
+        end as acceptance_signal,
+        greatest(1, ln(nullif(viewcount,0))) as ln_views,
+        case when favorites is null then 0 else favorites end as favs_safe,
+        case when q_score is null then 0 else q_score end as q_score_safe,
+        case when bounty_total is null then 0 else bounty_total end as bounty_safe,
+        case when close_events > reopen_events then 1 else 0 end as net_closed_flag,
+        case when owner_rep is null then -1 else owner_rep end as owner_rep_safe
+    from tagged_ranked tq
+),
+final_scores as (
+    select
+        s.*,
+        (
+            0.30 * q_score_safe +
+            0.20 * net_votes +
+            0.10 * acceptance_signal * 10 +
+            0.15 * ln_views +
+            0.10 * favs_safe +
+            0.05 * bounty_safe / 100 +
+            0.05 * coalesce(nonneg_comment_score,0) +
+            0.03 * coalesce(gold_count,0) +
+            0.02 * coalesce(silver_count,0) +
+            0.01 * coalesce(bronze_count,0) -
+            0.12 * net_closed_flag
+        ) as popularity_score,
+        case
+            when tag_pop_rank is null then 999999
+            else tag_pop_rank
+        end as tag_rank_safe,
+        row_number() over (
+            partition by coalesce(owner_location, 'Unknown')
+            order by
+                (
+                    0.30 * q_score_safe +
+                    0.20 * net_votes +
+                    0.10 * acceptance_signal * 10 +
+                    0.15 * ln_views +
+                    0.10 * favs_safe +
+                    0.05 * bounty_safe / 100 +
+                    0.05 * coalesce(nonneg_comment_score,0) +
+                    0.03 * coalesce(gold_count,0) +
+                    0.02 * coalesce(silver_count,0) +
+                    0.01 * coalesce(bronze_count,0) -
+                    0.12 * net_closed_flag
+                ) desc,
+                question_id
+        ) as rn_by_location
+    from scored s
+),
+topk as (
+    select
+        fs.*,
+        dense_rank() over (order by popularity_score desc, question_id) as global_rank
+    from final_scores fs
+)
+select
+    t.global_rank,
+    t.question_id,
+    left(coalesce(t.title, '[no title]'), 120) as title_snippet,
+    coalesce(t.dominant_tag, '[untagged]') as dominant_tag,
+    t.tag_rank_safe as tag_pop_rank,
+    coalesce(t.owner_name, '[unknown]') as owner_name,
+    coalesce(t.owner_location, 'Unknown') as owner_location,
+    t.owner_rep_safe as owner_rep,
+    to_char(t.q_created, 'YYYY-MM-DD') as q_created_date,
+    t.q_score_safe as q_score,
+    coalesce(t.upvotes,0) as upvotes,
+    coalesce(t.downvotes,0) as downvotes,
+    t.net_votes,
+    coalesce(t.answer_count,0) as answers,
+    case when t.acceptedanswerid is not null then 'Y' else 'N' end as has_accepted,
+    coalesce(t.viewcount,0) as views,
+    coalesce(t.favorites,0) as favorites,
+    coalesce(t.comment_count,0) as comments,
+    coalesce(t.bounty_total,0) as bounty_total,
+    coalesce(t.linked_count,0) as linked_count,
+    coalesce(t.duplicate_links,0) as duplicate_links,
+    coalesce(t.close_events,0) as close_events,
+    coalesce(t.reopen_events,0) as reopen_events,
+    t.net_closed_flag,
+    to_char(t.last_answer_date, 'YYYY-MM-DD HH24:MI') as last_answer_ts,
+    to_char(t.last_comment_date, 'YYYY-MM-DD HH24:MI') as last_comment_ts,
+    to_char(t.last_close_or_reopen, 'YYYY-MM-DD HH24:MI') as last_close_or_reopen_ts,
+    round(t.popularity_score::numeric, 3) as popularity_score,
+    t.rn_by_location,
+    t.rn_recent
+from topk t
+where
+    t.global_rank <= 250
+    and (
+        t.tag_rank_safe <= 100
+        or (t.answer_count >= 5 and t.net_votes >= 10)
+        or (t.bounty_total is not null and t.bounty_total > 0)
+    )
+    and (
+        t.owner_rep_safe >= 0
+        or (t.owner_rep_safe = -1 and t.q_score_safe >= 5)
+    )
+    and not (
+        t.is_closed = 1
+        and coalesce(t.reopen_events,0) = 0
+        and coalesce(t.duplicate_links,0) > 0
+    )
+order by t.global_rank, t.question_id;

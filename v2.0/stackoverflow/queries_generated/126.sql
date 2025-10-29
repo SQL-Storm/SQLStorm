@@ -1,0 +1,391 @@
+-- {"query": "126.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3675} 
+with recent_active_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.location,
+        u.websiteurl,
+        u.creationdate as user_created,
+        u.lastaccessdate,
+        date_trunc('month', u.creationdate) as user_cohort_month,
+        coalesce(nullif(trim(u.location), ''), 'Unknown') as norm_location
+    from users u
+    where u.lastaccessdate >= now() - interval '365 days'
+),
+user_badge_rollup as (
+    select
+        b.userid,
+        count(*) as total_badges,
+        sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+        sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+        sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+        min(b.date) as first_badge_date,
+        max(b.date) as last_badge_date
+    from badges b
+    group by b.userid
+),
+questions as (
+    select
+        p.id as qid,
+        p.owneruserid as owner_id,
+        p.creationdate as q_created,
+        p.score as q_score,
+        p.viewcount,
+        p.title,
+        p.tags,
+        p.acceptedanswerid,
+        p.closeddate,
+        case when p.closeddate is null then 0 else 1 end as is_closed
+    from posts p
+    where p.posttypeid = 1
+),
+answers as (
+    select
+        a.id as aid,
+        a.parentid as qid,
+        a.owneruserid as owner_id,
+        a.creationdate as a_created,
+        a.score as a_score
+    from posts a
+    where a.posttypeid = 2
+),
+question_stats as (
+    select
+        q.qid,
+        q.owner_id,
+        q.q_created,
+        q.q_score,
+        q.viewcount,
+        q.title,
+        q.tags,
+        q.acceptedanswerid,
+        q.closeddate,
+        q.is_closed,
+        count(a.aid) as answer_count,
+        max(a.a_score) as max_answer_score,
+        min(a.a_created) as first_answer_time,
+        sum(case when a.aid = q.acceptedanswerid then 1 else 0 end) as has_accepted_answer
+    from questions q
+    left join answers a on a.qid = q.qid
+    group by q.qid, q.owner_id, q.q_created, q.q_score, q.viewcount, q.title, q.tags, q.acceptedanswerid, q.closeddate, q.is_closed
+),
+tag_expansion as (
+    select
+        qs.qid,
+        unnest(string_to_array(substring(qs.tags, 2, greatest(length(qs.tags)-2,0)), '><')) as tagname
+    from question_stats qs
+    where qs.tags is not null
+),
+tag_rank as (
+    select
+        te.tagname,
+        count(*) as tag_q_count,
+        dense_rank() over (order by count(*) desc, tagname asc) as tag_popularity_rank
+    from tag_expansion te
+    group by te.tagname
+),
+post_votes as (
+    select
+        v.postid,
+        sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+        sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+        sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+        sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_total
+    from votes v
+    group by v.postid
+),
+comment_activity as (
+    select
+        c.postid,
+        count(*) as comment_count,
+        max(c.creationdate) as last_comment_date,
+        sum(case when c.score >= 5 then 1 else 0 end) as high_score_comments
+    from comments c
+    group by c.postid
+),
+post_history_flags as (
+    select
+        ph.postid,
+        sum(case when ph.posthistorytypeid in (10,35) then 1 else 0 end) as close_or_migrate_events,
+        sum(case when ph.posthistorytypeid in (12) then 1 else 0 end) as delete_events,
+        sum(case when ph.posthistorytypeid in (24) then 1 else 0 end) as suggested_edits_applied,
+        max(ph.creationdate) as last_history_date,
+        max(case when ph.posthistorytypeid in (10) then ph.comment end) filter (where ph.posthistorytypeid = 10) as last_close_reason_id
+    from posthistory ph
+    group by ph.postid
+),
+linked_duplicates as (
+    select
+        pl.postid as dup_post_id,
+        count(*) filter (where pl.linktypeid = 3) as duplicate_links,
+        count(*) filter (where pl.linktypeid = 1) as related_links
+    from postlinks pl
+    group by pl.postid
+),
+owner_activity as (
+    select
+        u.id as user_id,
+        count(*) filter (where p.posttypeid = 1) as questions_posted,
+        count(*) filter (where p.posttypeid = 2) as answers_posted,
+        sum(coalesce(p.score,0)) filter (where p.posttypeid in (1,2)) as net_post_score,
+        max(p.lastactivitydate) as last_post_activity
+    from users u
+    left join posts p on p.owneruserid = u.id
+    group by u.id
+),
+question_quality as (
+    select
+        qs.qid,
+        qs.owner_id,
+        qs.q_created,
+        qs.q_score,
+        qs.viewcount,
+        qs.answer_count,
+        qs.has_accepted_answer,
+        qs.first_answer_time,
+        pv.upvotes,
+        pv.downvotes,
+        pv.favorites,
+        pv.bounty_total,
+        ca.comment_count,
+        ca.last_comment_date,
+        ph.close_or_migrate_events,
+        ph.delete_events,
+        ph.suggested_edits_applied,
+        ph.last_history_date,
+        ld.duplicate_links,
+        ld.related_links,
+        -- compute time to first answer in minutes
+        extract(epoch from (min(qs.first_answer_time) over (partition by qs.qid) - qs.q_created)) / 60.0 as minutes_to_first_answer,
+        -- engagement score combining signals with null safety
+        coalesce(pv.upvotes,0) * 2
+        - coalesce(pv.downvotes,0) * 3
+        + coalesce(qs.viewcount,0) / nullif(100,0)
+        + coalesce(pv.favorites,0) * 5
+        + coalesce(ca.comment_count,0) * 0.5
+        + case when qs.has_accepted_answer > 0 then 10 else 0 end
+        - coalesce(ph.close_or_migrate_events,0) * 4
+        - coalesce(ph.delete_events,0) * 8
+        + coalesce(ld.related_links,0) * 0.25
+        - coalesce(ld.duplicate_links,0) * 2
+        as engagement_score
+    from question_stats qs
+    left join post_votes pv on pv.postid = qs.qid
+    left join comment_activity ca on ca.postid = qs.qid
+    left join post_history_flags ph on ph.postid = qs.qid
+    left join linked_duplicates ld on ld.dup_post_id = qs.qid
+),
+user_summary as (
+    select
+        ru.user_id,
+        ru.displayname,
+        ru.reputation,
+        ru.norm_location,
+        ru.user_cohort_month,
+        ub.total_badges,
+        ub.gold_badges,
+        ub.silver_badges,
+        ub.bronze_badges,
+        ub.first_badge_date,
+        ub.last_badge_date,
+        oa.questions_posted,
+        oa.answers_posted,
+        oa.net_post_score,
+        oa.last_post_activity
+    from recent_active_users ru
+    left join user_badge_rollup ub on ub.userid = ru.user_id
+    left join owner_activity oa on oa.user_id = ru.user_id
+),
+per_user_question_metrics as (
+    select
+        qq.owner_id as user_id,
+        count(*) as total_questions,
+        avg(qq.q_score) as avg_q_score,
+        avg(qq.viewcount) as avg_views,
+        avg(qq.answer_count) as avg_answers,
+        avg(qq.engagement_score) as avg_engagement,
+        percentile_cont(0.9) within group (order by qq.engagement_score) as p90_engagement,
+        sum(case when qq.has_accepted_answer > 0 then 1 else 0 end) as questions_with_accepted,
+        avg(qq.minutes_to_first_answer) as avg_minutes_to_first_answer
+    from question_quality qq
+    group by qq.owner_id
+),
+question_tag_profile as (
+    select
+        qq.qid,
+        array_agg(te.tagname order by tr.tag_popularity_rank nulls last) as tags_by_popularity,
+        max(tr.tag_popularity_rank) filter (where tr.tag_popularity_rank <= 100) as has_top100_tag_rank
+    from question_quality qq
+    left join tag_expansion te on te.qid = qq.qid
+    left join tag_rank tr on tr.tagname = te.tagname
+    group by qq.qid
+),
+user_tag_diversity as (
+    select
+        qs.owner_id as user_id,
+        count(distinct te.tagname) as distinct_tags_used,
+        count(*) as total_tag_mentions,
+        count(distinct case when tr.tag_popularity_rank <= 100 then te.tagname end) as top100_tags_used
+    from question_stats qs
+    left join tag_expansion te on te.qid = qs.qid
+    left join tag_rank tr on tr.tagname = te.tagname
+    group by qs.owner_id
+),
+ranked_users as (
+    select
+        us.*,
+        pum.total_questions,
+        pum.avg_q_score,
+        pum.avg_views,
+        pum.avg_answers,
+        pum.avg_engagement,
+        pum.p90_engagement,
+        pum.questions_with_accepted,
+        pum.avg_minutes_to_first_answer,
+        utd.distinct_tags_used,
+        utd.total_tag_mentions,
+        utd.top100_tags_used,
+        -- composite performance score
+        (
+            coalesce(us.reputation,0) * 0.01
+            + coalesce(pum.avg_engagement,0) * 1.5
+            + coalesce(pum.p90_engagement,0) * 0.5
+            + coalesce(pum.questions_with_accepted,0) * 2
+            + coalesce(us.gold_badges,0) * 3
+            + coalesce(us.silver_badges,0) * 1.5
+            + coalesce(us.bronze_badges,0) * 0.5
+            + coalesce(us.answers_posted,0) * 0.2
+            + coalesce(utd.top100_tags_used,0) * 0.3
+            - coalesce(greatest(date_part('day', now() - us.last_post_activity),0),0) * 0.01
+        ) as performance_score
+    from user_summary us
+    left join per_user_question_metrics pum on pum.user_id = us.user_id
+    left join user_tag_diversity utd on utd.user_id = us.user_id
+),
+question_enriched as (
+    select
+        qq.*,
+        qtp.tags_by_popularity,
+        qtp.has_top100_tag_rank,
+        -- correlated subquery: compute accepted answer score
+        (
+            select a.score
+            from posts a
+            where a.id = qq.acceptedanswerid
+        ) as accepted_answer_score,
+        -- window ranks across all questions by multiple dimensions
+        rank() over (order by qq.engagement_score desc nulls last) as rank_by_engagement,
+        rank() over (order by qq.viewcount desc nulls last) as rank_by_views,
+        rank() over (order by qq.q_score desc nulls last) as rank_by_score
+    from question_quality qq
+    left join question_tag_profile qtp on qtp.qid = qq.qid
+),
+combined as (
+    select
+        'user' as entity_type,
+        cast(ru.user_id as text) as entity_id,
+        ru.displayname as entity_label,
+        null::int as qid,
+        null::timestamp as created,
+        null::int as score,
+        null::int as views,
+        null::int as answers,
+        null::boolean as accepted,
+        null::numeric as engagement_score,
+        null::int as rank_by_engagement,
+        null::int as rank_by_views,
+        null::int as rank_by_score,
+        ru.performance_score as primary_metric,
+        json_build_object(
+            'reputation', ru.reputation,
+            'badges', json_build_object('gold', coalesce(ru.gold_badges,0), 'silver', coalesce(ru.silver_badges,0), 'bronze', coalesce(ru.bronze_badges,0)),
+            'questions_posted', coalesce(ru.questions_posted,0),
+            'answers_posted', coalesce(ru.answers_posted,0),
+            'avg_engagement', coalesce(ru.avg_engagement,0),
+            'p90_engagement', coalesce(ru.p90_engagement,0),
+            'distinct_tags_used', coalesce(ru.distinct_tags_used,0),
+            'top100_tags_used', coalesce(ru.top100_tags_used,0),
+            'cohort_month', ru.user_cohort_month
+        ) as extra
+    from ranked_users ru
+    union all
+    select
+        'question' as entity_type,
+        cast(qe.qid as text) as entity_id,
+        coalesce(qe.qid::text || ' - ' || left(coalesce((select p.title from posts p where p.id = qe.qid), ''), 60), qe.qid::text) as entity_label,
+        qe.qid,
+        qe.q_created,
+        qe.q_score,
+        qe.viewcount,
+        qe.answer_count,
+        qe.has_accepted_answer > 0,
+        qe.engagement_score,
+        qe.rank_by_engagement,
+        qe.rank_by_views,
+        qe.rank_by_score,
+        -- primary metric for questions is engagement, but boost for accepted answer and top tags
+        qe.engagement_score
+            + case when qe.has_accepted_answer > 0 then 5 else 0 end
+            + case when qe.has_top100_tag_rank is not null then 2 else 0 end
+            + coalesce(qe.accepted_answer_score,0) * 0.5
+            as primary_metric,
+        json_build_object(
+            'owner_id', qe.owner_id,
+            'minutes_to_first_answer', qe.minutes_to_first_answer,
+            'accepted_answer_score', coalesce(qe.accepted_answer_score, null),
+            'tags_by_popularity', coalesce(qe.tags_by_popularity, array[]::varchar[]),
+            'close_events', coalesce(qe.close_or_migrate_events,0),
+            'delete_events', coalesce(qe.delete_events,0),
+            'favorites', coalesce((select pv.favorites from post_votes pv where pv.postid = qe.qid),0)
+        ) as extra
+    from question_enriched qe
+),
+final_ranked as (
+    select
+        c.*,
+        row_number() over (partition by c.entity_type order by c.primary_metric desc nulls last, c.entity_id) as entity_rank
+    from combined c
+),
+filtered as (
+    select *
+    from final_ranked
+    where
+        -- keep top N per entity for benchmarking joins, windowing and filters
+        (
+            (entity_type = 'user' and entity_rank <= 500)
+            or
+            (entity_type = 'question' and entity_rank <= 1000)
+        )
+        -- complex predicate mixing null logic and expressions
+        and coalesce(primary_metric, -1) >= case when entity_type = 'user' then 0 else -10 end
+)
+select
+    f.entity_type,
+    f.entity_id,
+    f.entity_label,
+    f.qid,
+    f.created,
+    f.score,
+    f.views,
+    f.answers,
+    f.accepted,
+    round(coalesce(f.engagement_score, f.primary_metric)::numeric, 2) as engagement_score,
+    f.rank_by_engagement,
+    f.rank_by_views,
+    f.rank_by_score,
+    f.primary_metric,
+    f.entity_rank,
+    -- sprinkle in a set operator dependent scalar via correlated exists
+    case
+        when f.entity_type = 'question' and exists (
+            select 1
+            from linked_duplicates ld
+            where ld.dup_post_id = f.qid and coalesce(ld.duplicate_links,0) > 0
+        ) then 'has-duplicate-link'
+        when f.entity_type = 'question' then 'no-duplicate-link'
+        else null
+    end as duplicate_status,
+    f.extra
+from filtered f
+order by f.entity_type, f.entity_rank, f.entity_id;

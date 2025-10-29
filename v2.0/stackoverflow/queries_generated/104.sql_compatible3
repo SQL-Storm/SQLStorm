@@ -1,0 +1,347 @@
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        coalesce(nullif(trim(split_part(coalesce(u.location, ''), ',', 1)), ''), 'Unknown') as primary_location,
+        cast(extract(year from age(cast('2024-10-01 12:34:56' as timestamp), u.creationdate)) as integer) as acct_age_years,
+        row_number() over (order by u.reputation desc, u.id) as rn
+    from users u
+    where u.creationdate >= (
+        select date_trunc('year', max(creationdate)) - interval '3 years' from users
+    )
+),
+user_badge_agg as (
+    select
+        b.userid,
+        count(*) as badge_count,
+        sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+        sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+        sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+        min(b.date) as first_badge_date,
+        max(b.date) as last_badge_date
+    from badges b
+    group by b.userid
+),
+question_activity as (
+    select
+        p.owneruserid as user_id,
+        count(*) filter (where p.posttypeid = 1) as questions,
+        count(*) filter (where p.posttypeid = 2) as answers,
+        sum(coalesce(p.score, 0)) as total_post_score,
+        sum(coalesce(p.viewcount, 0)) filter (where p.posttypeid = 1) as question_views,
+        avg(nullif(p.answercount, 0)) filter (where p.posttypeid = 1) as avg_answer_count,
+        max(p.creationdate) as last_post_date
+    from posts p
+    where p.owneruserid is not null
+    group by p.owneruserid
+),
+vote_agg as (
+    select
+        v.userid as user_id,
+        count(*) filter (where v.votetypeid = 2) as upvotes_cast,
+        count(*) filter (where v.votetypeid = 3) as downvotes_cast,
+        sum(coalesce(v.bountyamount, 0)) filter (where v.votetypeid in (8,9)) as bounty_total,
+        min(v.creationdate) as first_vote_date,
+        max(v.creationdate) as last_vote_date
+    from votes v
+    where v.userid is not null
+    group by v.userid
+),
+comment_agg as (
+    select
+        c.userid as user_id,
+        count(*) as comments_made,
+        sum(case when c.score >= 10 then 1 else 0 end) as high_scoring_comments,
+        max(c.creationdate) as last_comment_date
+    from comments c
+    where c.userid is not null
+    group by c.userid
+),
+postlinks_dupes as (
+    select
+        pl.postid,
+        count(*) filter (where pl.linktypeid = 3) as duplicate_links,
+        count(*) filter (where pl.linktypeid = 1) as related_links
+    from postlinks pl
+    group by pl.postid
+),
+closed_info as (
+    select
+        ph.postid,
+        min(ph.creationdate) filter (where ph.posthistorytypeid = 10) as first_closed_date,
+        max(ph.creationdate) filter (where ph.posthistorytypeid = 11) as last_reopen_date,
+        count(*) filter (where ph.posthistorytypeid = 10) as close_events,
+        count(*) filter (where ph.posthistorytypeid = 11) as reopen_events,
+        max(
+            nullif(
+                regexp_replace(coalesce(ph.comment, ''), '[^0-9]', '', 'g'),
+                ''
+            )::integer
+        ) filter (where ph.posthistorytypeid = 10) as last_close_reason_id
+    from posthistory ph
+    where ph.posthistorytypeid in (10,11)
+    group by ph.postid
+),
+question_tags as (
+    select
+        p.id as post_id,
+        unnest(string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')) as tag
+    from posts p
+    where p.posttypeid = 1 and p.tags is not null and length(p.tags) > 2
+),
+tag_weight as (
+    select
+        qt.post_id,
+        sum(ln(greatest(t.count, 1))) as tag_popularity_weight
+    from question_tags qt
+    left join tags t on t.tagname = qt.tag
+    group by qt.post_id
+),
+question_quality as (
+    select
+        q.id as question_id,
+        q.owneruserid as user_id,
+        q.score,
+        q.viewcount,
+        q.favoritecount,
+        q.answercount,
+        coalesce(tw.tag_popularity_weight, 0) as tag_popularity_weight,
+        coalesce(pl.duplicate_links, 0) as duplicate_links,
+        coalesce(pl.related_links, 0) as related_links,
+        case when ci.first_closed_date is not null then 1 else 0 end as was_closed,
+        ci.close_events,
+        ci.reopen_events,
+        ci.last_close_reason_id,
+        greatest(0, q.score) * 2
+            + coalesce(ln(nullif(q.viewcount,0)), 0)
+            + coalesce(q.favoritecount, 0) * 0.5
+            + coalesce(q.answercount, 0) * 1.25
+            + coalesce(tw.tag_popularity_weight, 0) * 0.75
+            - coalesce(ci.close_events, 0) * 2
+            - coalesce(pl.duplicate_links, 0) * 1.5 as quality_score
+    from posts q
+    left join tag_weight tw on tw.post_id = q.id
+    left join postlinks_dupes pl on pl.postid = q.id
+    left join closed_info ci on ci.postid = q.id
+    where q.posttypeid = 1
+),
+user_quality as (
+    select
+        qq.user_id,
+        percentile_cont(0.9) within group (order by qq.quality_score) as p90_quality,
+        avg(qq.quality_score) as avg_quality,
+        count(*) as questions_considered,
+        sum(case when qq.was_closed = 1 then 1 else 0 end) as closed_questions,
+        sum(coalesce(qq.related_links,0)) as related_links_sum
+    from question_quality qq
+    group by qq.user_id
+),
+recent_accepts as (
+    select
+        a.owneruserid as user_id,
+        count(*) filter (
+            where exists (
+                select 1
+                from posts q
+                where q.id = a.parentid
+                  and q.acceptedanswerid = a.id
+            )
+        ) as accepted_answers_last_year
+    from posts a
+    where a.posttypeid = 2
+      and a.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+    group by a.owneruserid
+),
+activity_streaks as (
+    select
+        p.owneruserid as user_id,
+        max(streak_len) as max_posting_streak_days
+    from (
+        select
+            owneruserid,
+            cast(creationdate as date) as d,
+            row_number() over (partition by owneruserid order by cast(creationdate as date)) as rn
+        from posts
+        where owneruserid is not null
+        group by owneruserid, cast(creationdate as date)
+    ) x
+    group by owneruserid
+),
+activity_streaks_real as (
+    select
+        x.owneruserid as user_id,
+        max(consecutive_days) as max_posting_streak_days
+    from (
+        select
+            owneruserid,
+            d,
+            count(*) over (partition by owneruserid, grp) as consecutive_days
+        from (
+            select
+                owneruserid,
+                cast(creationdate as date) as d,
+                (cast(creationdate as date) - (row_number() over (partition by owneruserid order by cast(creationdate as date)))) as grp
+            from posts
+            where owneruserid is not null
+            group by owneruserid, cast(creationdate as date), creationdate
+        ) s
+    ) x
+    group by x.owneruserid
+),
+power_users as (
+    select
+        ru.user_id,
+        ru.displayname,
+        ru.primary_location,
+        ru.reputation,
+        ru.acct_age_years,
+        qa.questions,
+        qa.answers,
+        qa.total_post_score,
+        qa.question_views,
+        qa.avg_answer_count,
+        qa.last_post_date,
+        va.upvotes_cast,
+        va.downvotes_cast,
+        va.bounty_total,
+        va.first_vote_date,
+        va.last_vote_date,
+        ca.comments_made,
+        ca.high_scoring_comments,
+        ca.last_comment_date,
+        uba.badge_count,
+        uba.gold_badges,
+        uba.silver_badges,
+        uba.bronze_badges,
+        uba.first_badge_date,
+        uba.last_badge_date,
+        uq.p90_quality,
+        uq.avg_quality,
+        uq.questions_considered,
+        uq.closed_questions,
+        uq.related_links_sum,
+        coalesce(ra.accepted_answers_last_year, 0) as accepted_answers_last_year,
+        coalesce(asr.max_posting_streak_days, 0) as max_posting_streak_days
+    from recent_users ru
+    left join question_activity qa on qa.user_id = ru.user_id
+    left join vote_agg va on va.user_id = ru.user_id
+    left join comment_agg ca on ca.user_id = ru.user_id
+    left join user_badge_agg uba on uba.userid = ru.user_id
+    left join user_quality uq on uq.user_id = ru.user_id
+    left join recent_accepts ra on ra.user_id = ru.user_id
+    left join activity_streaks_real asr on asr.user_id = ru.user_id
+),
+ranked as (
+    select
+        pu.*,
+        coalesce(pu.reputation,0)
+        + coalesce(pu.total_post_score,0) * 3
+        + coalesce(pu.question_views,0) * 0.001
+        + coalesce(pu.badge_count,0) * 10
+        + coalesce(pu.gold_badges,0) * 25
+        + coalesce(pu.silver_badges,0) * 10
+        + coalesce(pu.bronze_badges,0) * 3
+        + coalesce(pu.upvotes_cast,0) * 1
+        - coalesce(pu.downvotes_cast,0) * 2
+        + coalesce(pu.bounty_total,0) * 0.5
+        + coalesce(pu.comments_made,0) * 0.25
+        + coalesce(pu.high_scoring_comments,0) * 2
+        + coalesce(pu.p90_quality,0) * 15
+        + coalesce(pu.avg_quality,0) * 5
+        - coalesce(pu.closed_questions,0) * 10
+        + coalesce(pu.related_links_sum,0) * 0.5
+        + coalesce(pu.accepted_answers_last_year,0) * 20
+        + coalesce(pu.max_posting_streak_days,0) * 0.75
+        + case when pu.acct_age_years >= 5 then 50 else 0 end
+        as performance_score,
+        row_number() over (order by
+            coalesce(pu.p90_quality, -1) desc,
+            coalesce(pu.reputation, -1) desc,
+            coalesce(pu.badge_count, -1) desc,
+            pu.user_id
+        ) as quality_rank,
+        dense_rank() over (order by
+            coalesce(pu.reputation, -1) desc,
+            coalesce(pu.answers, -1) desc,
+            coalesce(pu.questions, -1) desc
+        ) as rep_ans_rank
+    from power_users pu
+),
+top_vs_rest as (
+    select
+        case when r.quality_rank <= 100 then 'TOP100' else 'REST' end as segment,
+        count(*) as users_in_segment,
+        avg(r.performance_score) as avg_perf,
+        avg(coalesce(r.p90_quality,0)) as avg_p90q,
+        avg(coalesce(r.avg_quality,0)) as avg_avgq,
+        sum(coalesce(r.closed_questions,0)) as sum_closed,
+        sum(coalesce(r.answers,0)) as sum_answers
+    from ranked r
+    group by case when r.quality_rank <= 100 then 'TOP100' else 'REST' end
+),
+exploded_locations as (
+    select
+        r.user_id,
+        unnest(regexp_split_to_array(coalesce(r.primary_location,''), '\s*[\/|,-]\s*')) as location_token
+    from ranked r
+),
+location_norm as (
+    select
+        user_id,
+        upper(nullif(trim(regexp_replace(location_token, '\s+', ' ', 'g')), '')) as loc_norm
+    from exploded_locations
+),
+final_locations as (
+    select user_id, min(loc_norm) as loc_norm
+    from location_norm
+    where loc_norm is not null
+    group by user_id
+),
+final as (
+    select
+        r.user_id,
+        coalesce(r.displayname, concat('user#', cast(r.user_id as text))) as displayname,
+        coalesce(fl.loc_norm, 'UNKNOWN') as location_norm,
+        r.reputation,
+        r.acct_age_years,
+        r.questions,
+        r.answers,
+        r.total_post_score,
+        r.question_views,
+        cast(round(coalesce(r.avg_answer_count,0), 2) as numeric) as avg_answer_count,
+        r.badge_count, r.gold_badges, r.silver_badges, r.bronze_badges,
+        r.upvotes_cast, r.downvotes_cast, r.bounty_total,
+        r.comments_made, r.high_scoring_comments,
+        cast(round(coalesce(r.p90_quality,0), 2) as numeric) as p90_quality,
+        cast(round(coalesce(r.avg_quality,0), 2) as numeric) as avg_quality,
+        r.questions_considered, r.closed_questions, r.related_links_sum,
+        r.accepted_answers_last_year, r.max_posting_streak_days,
+        cast(round(r.performance_score, 2) as numeric) as performance_score,
+        r.quality_rank, r.rep_ans_rank
+    from ranked r
+    left join final_locations fl on fl.user_id = r.user_id
+)
+select *
+from final f
+where
+    coalesce(f.reputation,0) > 0
+    and (
+        f.location_norm in ('UNITED STATES','USA','US','UNITED KINGDOM','UK','CANADA')
+        or coalesce(f.answers,0) >= 10
+        or coalesce(f.p90_quality,0) > 5
+    )
+    and not (
+        coalesce(f.closed_questions,0) > coalesce(f.questions_considered,0) / 2
+        and coalesce(f.questions_considered,0) > 0
+    )
+    and (
+        f.performance_score > (
+            select avg(performance_score) + stddev_samp(performance_score)
+            from ranked r2
+        )
+        or f.quality_rank <= 200
+    )
+order by f.performance_score desc nulls last, f.quality_rank asc, f.user_id
+fetch first 250 rows only;

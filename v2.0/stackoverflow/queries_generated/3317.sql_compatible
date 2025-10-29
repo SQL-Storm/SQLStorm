@@ -1,0 +1,110 @@
+WITH BadgeCounts AS (
+    SELECT
+        UserId,
+        SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldCount,
+        SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverCount,
+        SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeCount,
+        COUNT(*)                                            AS TotalBadges
+    FROM Badges
+    GROUP BY UserId
+),
+PostStats AS (
+    SELECT
+        OwnerUserId                                   AS UserId,
+        COUNT(CASE WHEN PostTypeId = 1 THEN 1 END)    AS QuestionCount,
+        COUNT(CASE WHEN PostTypeId = 2 THEN 1 END)    AS AnswerCount,
+        AVG(CASE WHEN PostTypeId IN (1,2) THEN Score END) AS AvgScore,
+        MAX(CreationDate)                             AS LastPostDate,
+        SUM(COALESCE(ViewCount,0))                     AS TotalViews
+    FROM Posts
+    GROUP BY OwnerUserId
+),
+RecentActivity AS (
+    SELECT
+        u.Id,
+        GREATEST(
+            COALESCE(p.LastPostDate,    TIMESTAMP '1970-01-01'),
+            COALESCE(v.MaxVoteDate,     TIMESTAMP '1970-01-01'),
+            COALESCE(c.MaxCommentDate,  TIMESTAMP '1970-01-01')
+        ) AS LastActivity
+    FROM Users u
+    LEFT JOIN (
+        SELECT OwnerUserId, MAX(CreationDate) AS LastPostDate
+        FROM Posts
+        GROUP BY OwnerUserId
+    ) p ON u.Id = p.OwnerUserId
+    LEFT JOIN (
+        SELECT UserId, MAX(CreationDate) AS MaxVoteDate
+        FROM Votes
+        GROUP BY UserId
+    ) v ON u.Id = v.UserId
+    LEFT JOIN (
+        SELECT UserId, MAX(CreationDate) AS MaxCommentDate
+        FROM Comments
+        GROUP BY UserId
+    ) c ON u.Id = c.UserId
+),
+TagUsage AS (
+    -- move set-returning function to FROM LATERAL to avoid SRF inside aggregate
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(DISTINCT t.tag) AS UniqueTagCount
+    FROM Posts p
+    CROSS JOIN LATERAL (
+        SELECT regexp_split_to_table(trim(both '<>' FROM p.Tags), '><') AS tag
+    ) t
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+RankedUsers AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(bc.TotalBadges,   0) AS TotalBadges,
+        COALESCE(bc.GoldCount,     0) AS GoldBadges,
+        COALESCE(bc.SilverCount,   0) AS SilverBadges,
+        COALESCE(bc.BronzeCount,   0) AS BronzeBadges,
+        COALESCE(ps.QuestionCount,0) AS Questions,
+        COALESCE(ps.AnswerCount,  0) AS Answers,
+        COALESCE(ps.AvgScore,     0) AS AvgScore,
+        COALESCE(ps.TotalViews,   0) AS Views,
+        COALESCE(tu.UniqueTagCount,0) AS TagDiversity,
+        ra.LastActivity,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, COALESCE(bc.TotalBadges,0) DESC) AS ReputationRank,
+        CASE
+            WHEN u.Location ILIKE '%san francisco%' THEN 'SF'
+            WHEN u.Location ILIKE '%new york%'      THEN 'NY'
+            ELSE 'Other'
+        END AS Region
+    FROM Users u
+    LEFT JOIN BadgeCounts    bc ON u.Id = bc.UserId
+    LEFT JOIN PostStats      ps ON u.Id = ps.UserId
+    LEFT JOIN TagUsage       tu ON u.Id = tu.UserId
+    LEFT JOIN RecentActivity ra ON u.Id = ra.Id
+    WHERE u.Reputation > 1000
+      AND (COALESCE(bc.GoldCount,0) > 0 OR COALESCE(ps.QuestionCount,0) > 5)
+)
+SELECT *
+FROM RankedUsers
+WHERE ReputationRank <= 100
+
+UNION ALL
+
+SELECT
+    NULL AS Id,
+    'Aggregate' AS DisplayName,
+    NULL AS Reputation,
+    SUM(TotalBadges)   AS TotalBadges,
+    SUM(GoldBadges)    AS GoldBadges,
+    SUM(SilverBadges)  AS SilverBadges,
+    SUM(BronzeBadges)  AS BronzeBadges,
+    SUM(Questions)     AS Questions,
+    SUM(Answers)       AS Answers,
+    AVG(AvgScore)      AS AvgScore,
+    SUM(Views)         AS Views,
+    AVG(TagDiversity)  AS TagDiversity,
+    NULL               AS LastActivity,
+    NULL               AS ReputationRank,
+    NULL               AS Region
+FROM RankedUsers;

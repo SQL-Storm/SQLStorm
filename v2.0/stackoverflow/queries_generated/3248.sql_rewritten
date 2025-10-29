@@ -1,0 +1,102 @@
+-- {"query": "3248.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1794} 
+WITH
+/* 1️⃣ Aggregate user statistics */
+UserStats AS (
+    SELECT
+        u.Id                                   AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate                         AS UserSince,
+        /* badge counts per class */
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadges,
+        /* post counts by type */
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS QuestionCount,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS AnswerCount
+    FROM Users u
+    WHERE u.Reputation > 10_000
+),
+
+/* 2️⃣ Rank the users – window function */
+TopRankedUsers AS (
+    SELECT
+        *,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, GoldBadges DESC) AS RankByRep
+    FROM UserStats
+    WHERE (GoldBadges + SilverBadges + BronzeBadges) > 10
+),
+
+/* 3️⃣ Most recent activity per user – outer join + aggregation */
+RecentActivity AS (
+    SELECT
+        p.OwnerUserId                                 AS UserId,
+        MAX(p.CreationDate)                           AS LastPostDate,
+        MAX(v.CreationDate)                           AS LastVoteDate
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+
+/* 4️⃣ Tag usage statistics – set operator & filtered aggregates */
+TagUse AS (
+    SELECT
+        t.TagName,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 1) AS QuestionsWithTag,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 2) AS AnswersWithTag
+    FROM Tags t
+    JOIN Posts p ON p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+    GROUP BY t.TagName
+),
+
+/* 5️⃣ Badge‑Tag intersection – correlated subquery + string logic */
+BadgeTagIntersection AS (
+    SELECT
+        b.UserId,
+        t.TagName,
+        b.Name AS BadgeName
+    FROM Badges b
+    JOIN Posts p ON p.OwnerUserId = b.UserId
+    JOIN Tags t ON p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+    WHERE b.TagBased = 1
+),
+
+/* 6️⃣ Combine everything – complex expressions, NULL handling */
+Combined AS (
+    SELECT
+        u.UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.GoldBadges,
+        u.SilverBadges,
+        u.BronzeBadges,
+        u.QuestionCount,
+        u.AnswerCount,
+        COALESCE(a.LastPostDate, TIMESTAMP '1970-01-01') AS LastPostDate,
+        COALESCE(a.LastVoteDate, TIMESTAMP '1970-01-01') AS LastVoteDate,
+        CASE
+            WHEN u.QuestionCount = 0 THEN NULL
+            ELSE ROUND(u.AnswerCount * 1.0 / NULLIF(u.QuestionCount,0), 2)
+        END AS AnswerToQuestionRatio,
+        (SELECT STRING_AGG(DISTINCT bt.BadgeName, ', ')
+         FROM BadgeTagIntersection bt
+         WHERE bt.UserId = u.UserId) AS TagBasedBadges
+    FROM TopRankedUsers u
+    LEFT JOIN RecentActivity a ON a.UserId = u.UserId
+    WHERE u.RankByRep <= 50
+)
+
+/* 7️⃣ Final result set – UNION ALL, ordering, pagination */
+SELECT *
+FROM Combined
+WHERE (Reputation > 20_000 OR GoldBadges >= 5)
+
+UNION ALL
+
+SELECT *
+FROM Combined
+WHERE TagBasedBadges IS NOT NULL
+
+ORDER BY Reputation DESC, GoldBadges DESC
+OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY;

@@ -1,0 +1,325 @@
+with
+recent_questions as (
+  select
+    p.id as question_id,
+    p.creationdate,
+    p.owneruserid,
+    p.score,
+    p.viewcount,
+    p.favoritecount,
+    p.answercount,
+    lower(coalesce(p.title, '')) as title_lc,
+    string_to_array(substring(p.tags, 2, greatest(length(p.tags)-2,0)), '><') as tag_arr
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= (select max(creationdate) - interval '365 days' from posts where posttypeid = 1)
+),
+answers_ranked as (
+  select
+    a.parentid as question_id,
+    a.id as answer_id,
+    a.owneruserid as answerer_id,
+    a.score as answer_score,
+    a.creationdate as answer_created,
+    row_number() over (partition by a.parentid order by a.score desc nulls last, a.creationdate desc) as rn_score_desc,
+    row_number() over (partition by a.parentid order by a.creationdate desc) as rn_recent_desc
+  from posts a
+  where a.posttypeid = 2
+),
+vote_agg as (
+  select
+    v.postid as post_id,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+    count(*) as total_votes,
+    sum(coalesce(v.bountyamount,0)) filter (where v.votetypeid in (8,9)) as bounty_total
+  from votes v
+  group by v.postid
+),
+comment_stats as (
+  select
+    c.postid,
+    count(*) as comment_count,
+    avg(c.score) as avg_comment_score,
+    sum(case when c.text ilike any (array['%thanks%','%thank you%','%great%','%awesome%']) then 1 else 0 end) as pos_hint,
+    sum(case when c.text ilike any (array['%terrible%','%bad%','%wrong%','%spam%']) then 1 else 0 end) as neg_hint,
+    max(c.creationdate) as last_comment_at
+  from comments c
+  group by c.postid
+),
+tag_popularity as (
+  select
+    t.tagname,
+    t.count as tag_total_count,
+    dense_rank() over (order by t.count desc) as tag_pop_rank
+  from tags t
+),
+question_tags as (
+  select
+    rq.question_id,
+    unnest(rq.tag_arr) as tagname
+  from recent_questions rq
+),
+question_tag_enriched as (
+  select
+    qt.question_id,
+    qt.tagname,
+    tp.tag_total_count,
+    tp.tag_pop_rank,
+    coalesce(tg.ismoderatoronly::int, 0) as is_moderator_only,
+    coalesce(tg.isrequired::int, 0) as is_required
+  from question_tags qt
+  left join tag_popularity tp on tp.tagname = qt.tagname
+  left join tags tg on tg.tagname = qt.tagname
+),
+closure_info as (
+  select
+    ph.postid as question_id,
+    min(ph.creationdate) filter (where ph.posthistorytypeid = 10) as first_closed_at,
+    max(ph.creationdate) filter (where ph.posthistorytypeid = 11) as last_reopened_at,
+    max(case when ph.posthistorytypeid = 10 then cast(ph.comment as integer) end) as last_close_reason_id
+  from posthistory ph
+  where ph.posthistorytypeid in (10,11)
+  group by ph.postid
+),
+duplicate_links as (
+  select
+    pl.postid as duplicate_id,
+    pl.relatedpostid as original_id,
+    min(pl.creationdate) as first_linked_at
+  from postlinks pl
+  where pl.linktypeid = 3
+  group by pl.postid, pl.relatedpostid
+),
+user_profile as (
+  select
+    u.id as user_id,
+    u.reputation,
+    u.creationdate as user_created,
+    u.lastaccessdate as last_seen,
+    u.upvotes,
+    u.downvotes,
+    u.views as profile_views,
+    date_part('year', age(cast('2024-10-01 12:34:56' as timestamp), u.creationdate)) as acct_age_years
+  from users u
+),
+question_metrics as (
+  select
+    rq.question_id,
+    rq.creationdate,
+    rq.score,
+    rq.viewcount,
+    rq.favoritecount,
+    rq.answercount,
+    va.upvotes,
+    va.downvotes,
+    va.total_votes,
+    va.bounty_total,
+    cs.comment_count,
+    cs.avg_comment_score,
+    cs.pos_hint,
+    cs.neg_hint,
+    ci.first_closed_at,
+    ci.last_reopened_at,
+    ci.last_close_reason_id,
+    dl.original_id as duplicate_of_id,
+    dl.first_linked_at as duplicate_linked_at,
+    count(qte.tagname) as tag_count,
+    sum(coalesce(qte.tag_total_count,0)) as sum_tag_popularity,
+    min(qte.tag_pop_rank) as best_tag_rank,
+    bool_or(qte.is_moderator_only = 1) as has_mod_only_tag,
+    bool_or(qte.is_required = 1) as has_required_tag,
+    row_number() over (order by rq.viewcount desc nulls last) as rn_views,
+    row_number() over (order by rq.score desc nulls last) as rn_score,
+    row_number() over (order by coalesce(va.total_votes,0) desc) as rn_votes,
+    percentile_disc(0.9) within group (order by rq.viewcount) over () as p90_views,
+    percentile_disc(0.9) within group (order by rq.score) over () as p90_score
+  from recent_questions rq
+  left join vote_agg va on va.post_id = rq.question_id
+  left join comment_stats cs on cs.postid = rq.question_id
+  left join closure_info ci on ci.question_id = rq.question_id
+  left join duplicate_links dl on dl.duplicate_id = rq.question_id
+  left join question_tag_enriched qte on qte.question_id = rq.question_id
+  group by
+    rq.question_id, rq.creationdate, rq.score, rq.viewcount, rq.favoritecount, rq.answercount,
+    va.upvotes, va.downvotes, va.total_votes, va.bounty_total,
+    cs.comment_count, cs.avg_comment_score, cs.pos_hint, cs.neg_hint,
+    ci.first_closed_at, ci.last_reopened_at, ci.last_close_reason_id,
+    dl.original_id, dl.first_linked_at
+),
+top_answers as (
+  select
+    ar.question_id,
+    max(ar.answer_id) filter (where ar.rn_score_desc = 1) as top_answer_id,
+    max(ar.answer_score) filter (where ar.rn_score_desc = 1) as top_answer_score,
+    max(ar.answer_id) filter (where ar.rn_recent_desc = 1) as latest_answer_id
+  from answers_ranked ar
+  group by ar.question_id
+),
+accepted_answer as (
+  select
+    p.id as question_id,
+    p.acceptedanswerid as accepted_answer_id
+  from posts p
+  where p.posttypeid = 1 and p.acceptedanswerid is not null
+),
+filtered as (
+  select
+    qm.*,
+    ta.top_answer_id,
+    ta.top_answer_score,
+    ta.latest_answer_id,
+    aa.accepted_answer_id,
+    case
+      when aa.accepted_answer_id is not null and ta.top_answer_id is not null and aa.accepted_answer_id <> ta.top_answer_id then 1
+      else 0
+    end as accepted_not_top_flag,
+    case
+      when qm.first_closed_at is not null and (qm.last_reopened_at is null or qm.first_closed_at > qm.last_reopened_at) then 1
+      else 0
+    end as currently_closed_flag,
+    case
+      when qm.viewcount >= qm.p90_views then 'very_high'
+      when qm.viewcount >= qm.p90_views * 0.75 then 'high'
+      when qm.viewcount >= qm.p90_views * 0.5 then 'medium'
+      else 'low'
+    end as view_bucket
+  from question_metrics qm
+  left join top_answers ta on ta.question_id = qm.question_id
+  left join accepted_answer aa on aa.question_id = qm.question_id
+  where
+    (
+      (qm.upvotes is null and qm.downvotes is null and qm.total_votes is null)
+      or (coalesce(qm.upvotes,0) - coalesce(qm.downvotes,0)) >= 5
+      or (qm.bounty_total is not null and qm.bounty_total > 0)
+    )
+    and (
+      qm.tag_count between 1 and 5
+      or (qm.has_mod_only_tag and qm.score >= 0)
+    )
+    and not (
+      qm.viewcount is not null and qm.score is not null and qm.viewcount < 10 and qm.score < 0
+    )
+)
+select
+  f.question_id,
+  f.creationdate,
+  f.score,
+  f.viewcount,
+  f.favoritecount,
+  f.answercount,
+  coalesce(f.upvotes,0) as upvotes,
+  coalesce(f.downvotes,0) as downvotes,
+  coalesce(f.total_votes,0) as total_votes,
+  coalesce(f.bounty_total,0) as bounty_total,
+  coalesce(f.comment_count,0) as comment_count,
+  round(cast(coalesce(f.avg_comment_score,0) as numeric), 2) as avg_comment_score,
+  f.pos_hint,
+  f.neg_hint,
+  f.first_closed_at,
+  f.last_reopened_at,
+  f.last_close_reason_id,
+  f.duplicate_of_id,
+  f.duplicate_linked_at,
+  f.tag_count,
+  f.sum_tag_popularity,
+  f.best_tag_rank,
+  f.has_mod_only_tag,
+  f.has_required_tag,
+  f.rn_views,
+  f.rn_score,
+  f.rn_votes,
+  f.p90_views,
+  f.p90_score,
+  f.top_answer_id,
+  f.top_answer_score,
+  f.latest_answer_id,
+  f.accepted_answer_id,
+  f.accepted_not_top_flag,
+  f.currently_closed_flag,
+  f.view_bucket,
+  (
+    select
+      case when median_rep = 0 then null else round((cast(u.reputation as numeric) / median_rep), 3) end
+    from users u
+    cross join lateral (
+      select percentile_cont(0.5) within group (order by coalesce(u2.reputation,0)) as median_rep
+      from posts p2
+      join users u2 on u2.id = p2.owneruserid
+      where p2.posttypeid = 1
+        and p2.creationdate >= (select min(creationdate) from filtered)
+    ) m
+    where u.id = (select owneruserid from posts p where p.id = f.question_id)
+  ) as owner_rep_vs_median,
+  case
+    when f.accepted_not_top_flag = 1 then 'accepted-not-top'
+    when f.duplicate_of_id is not null then 'duplicate'
+    when f.currently_closed_flag = 1 then 'closed'
+    when f.view_bucket in ('very_high','high') and f.score >= 5 then 'hot'
+    when f.score < 0 then 'controversial'
+    else 'normal'
+  end as quality_label
+from filtered f
+where
+  exists (
+    select 1
+    from question_tag_enriched qte
+    where qte.question_id = f.question_id
+      and (
+        (qte.tagname ilike 'sql%' and coalesce(qte.tag_total_count,0) > 1000)
+        or (qte.tagname ilike any (array['%performance%','%postgres%','%mysql%','%tuning%']))
+      )
+  )
+union all
+select
+  qm.question_id,
+  qm.creationdate,
+  qm.score,
+  qm.viewcount,
+  qm.favoritecount,
+  qm.answercount,
+  coalesce(qm.upvotes,0),
+  coalesce(qm.downvotes,0),
+  coalesce(qm.total_votes,0),
+  coalesce(qm.bounty_total,0),
+  coalesce(qs.comment_count,0),
+  round(cast(coalesce(qs.avg_comment_score,0) as numeric), 2),
+  qs.pos_hint,
+  qs.neg_hint,
+  qm.first_closed_at,
+  qm.last_reopened_at,
+  qm.last_close_reason_id,
+  qm.duplicate_of_id,
+  qm.duplicate_linked_at,
+  qm.tag_count,
+  qm.sum_tag_popularity,
+  qm.best_tag_rank,
+  qm.has_mod_only_tag,
+  qm.has_required_tag,
+  qm.rn_views,
+  qm.rn_score,
+  qm.rn_votes,
+  qm.p90_views,
+  qm.p90_score,
+  cast(NULL as integer) as top_answer_id,
+  cast(NULL as integer) as top_answer_score,
+  cast(NULL as integer) as latest_answer_id,
+  cast(NULL as integer) as accepted_answer_id,
+  0 as accepted_not_top_flag,
+  case when qm.first_closed_at is not null and (qm.last_reopened_at is null or qm.first_closed_at > qm.last_reopened_at) then 1 else 0 end as currently_closed_flag,
+  case
+    when qm.viewcount >= qm.p90_views then 'very_high'
+    when qm.viewcount >= qm.p90_views * 0.75 then 'high'
+    when qm.viewcount >= qm.p90_views * 0.5 then 'medium'
+    else 'low'
+  end as view_bucket,
+  cast(NULL as numeric) as owner_rep_vs_median,
+  'low-sample' as quality_label
+from question_metrics qm
+left join comment_stats qs on qs.postid = qm.question_id
+where
+  coalesce(qm.total_votes,0) = 0
+  and qm.viewcount < (select percentile_disc(0.1) within group (order by coalesce(viewcount,0)) from question_metrics)
+  and not exists (select 1 from answers_ranked ar where ar.question_id = qm.question_id)
+limit 100;

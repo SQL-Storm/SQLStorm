@@ -1,0 +1,155 @@
+WITH
+RecentActiveUsers AS (
+  SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.WebsiteUrl,
+    u.AboutMe,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.ProfileImageUrl,
+    u.EmailHash,
+    u.AccountId,
+    ROW_NUMBER() OVER (ORDER BY u.LastAccessDate DESC, u.Reputation DESC) AS rn
+  FROM Users u
+  WHERE u.LastAccessDate IS NOT NULL
+    AND u.AccountId IS NOT NULL
+),
+TopTags AS (
+  SELECT
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId,
+    t.WikiPostId,
+    t.IsModeratorOnly,
+    t.IsRequired
+  FROM Tags t
+  WHERE COALESCE(t.IsModeratorOnly, 0) = 0
+    AND COALESCE(t.IsRequired, 0) = 0
+),
+PostActivity AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Title,
+    p.Tags,
+    p.OwnerUserId,
+    p.ViewCount,
+    p.Score,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.Body,
+    COALESCE(p.AcceptedAnswerId, 0) AS AcceptedAnswerId,
+    p.ParentId,
+    p.ClosedDate,
+    p.ContentLicense,
+    p.LastEditDate
+  FROM Posts p
+  WHERE p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 years')
+),
+VotesSummary AS (
+  SELECT
+    v.PostId,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+    SUM(CASE WHEN v.VoteTypeId = 8 THEN 1 ELSE 0 END) AS BountyStarts,
+    SUM(CASE WHEN v.VoteTypeId = 9 THEN 1 ELSE 0 END) AS BountyCloses,
+    COUNT(*) AS VoteCount
+  FROM Votes v
+  GROUP BY v.PostId
+),
+PostLinksAgg AS (
+  SELECT
+    pl.PostId,
+    pl.RelatedPostId,
+    pl.LinkTypeId,
+    lt.Name AS LinkTypeName
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+),
+RecentComments AS (
+  SELECT
+    c.PostId,
+    c.Id AS CommentId,
+    c.UserId,
+    c.Score,
+    c.Text,
+    c.CreationDate,
+    c.UserDisplayName,
+    c.ContentLicense
+  FROM Comments c
+  WHERE c.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 years')
+),
+TagPopularity AS (
+  SELECT
+    t.TagName,
+    t.Count AS TagCountExcerpts
+  FROM TopTags t
+)
+SELECT
+  u.Id AS UserId,
+  u.DisplayName AS UserName,
+  u.Reputation,
+  u.AccountId,
+  u.LastAccessDate,
+  u.Location,
+  u.WebsiteUrl,
+  u.AboutMe,
+  COALESCE(u.Views, 0) AS Views,
+  COALESCE(u.UpVotes, 0) AS UpVotes,
+  COALESCE(u.DownVotes, 0) AS DownVotes,
+  u.ProfileImageUrl,
+  u.EmailHash,
+  SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+  SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+  SUM(COALESCE(p.ViewCount,0)) AS ViewCountTotal,
+  SUM(COALESCE(vs.UpVotes,0)) AS TotalUpVotesOnPosts,
+  SUM(COALESCE(vs.DownVotes,0)) AS TotalDownVotesOnPosts,
+  SUM(COALESCE(vs.BountyStarts,0)) AS TotalBountyStarts,
+  SUM(COALESCE(vs.BountyCloses,0)) AS TotalBountyCloses,
+  MAX(p.LastActivityDate) AS LastActivityDate,
+  MAX(p.LastEditDate) AS LastEditDate,
+  STRING_AGG(DISTINCT tt.TagName, ',') AS FavoriteTags,
+  ('U' || CAST(u.Id AS varchar(20)) || ' | ' ||
+    'Rep:' || CAST(u.Reputation AS varchar(20)) || ' | ' ||
+    'Posts:' || CAST(
+      (SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) + SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END)
+      ) AS varchar(20)
+    )
+  ) AS MetaSummary
+FROM RecentActiveUsers u
+LEFT JOIN PostActivity p ON p.OwnerUserId = u.Id
+LEFT JOIN VotesSummary vs ON vs.PostId = p.PostId
+LEFT JOIN PostLinksAgg pla ON pla.PostId = p.PostId
+LEFT JOIN Posts tPost ON tPost.Id = p.PostId
+LEFT JOIN TopTags tt ON tt.TagName IS NOT NULL
+GROUP BY
+  u.Id,
+  u.DisplayName,
+  u.Reputation,
+  u.AccountId,
+  u.LastAccessDate,
+  u.Location,
+  u.WebsiteUrl,
+  u.AboutMe,
+  u.Views,
+  u.UpVotes,
+  u.DownVotes,
+  u.ProfileImageUrl,
+  u.EmailHash
+HAVING
+  SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) > 0
+  OR SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) > 0
+ORDER BY
+  LastActivityDate DESC,
+  Reputation DESC
+OFFSET 0 ROWS
+FETCH NEXT 100 ROWS ONLY;

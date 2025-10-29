@@ -1,0 +1,273 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        COUNT(DISTINCT c.Id) AS Comments,
+        COUNT(DISTINCT b.Id) AS Badges,
+        COALESCE(SUM(p.Score), 0) AS TotalScore,
+        COALESCE(MAX(p.CreationDate), u.CreationDate) AS LastActivity,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 
+            THEN RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) 
+            ELSE NULL 
+        END AS PostRank,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.Views DESC) AS ReputationRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate
+),
+TopTags AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        DENSE_RANK() OVER (ORDER BY t.Count DESC) AS TagRank,
+        AVG(t.Count) OVER (PARTITION BY t.IsRequired) AS AvgCountByRequired
+    FROM Tags t
+    WHERE t.TagName IS NOT NULL AND t.TagName != ''
+),
+UserPostStats AS (
+    SELECT 
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END AS PostType,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS RecentPostRank,
+        NTILE(10) OVER (ORDER BY p.Score DESC) AS ScoreQuartile
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL AND p.OwnerUserId > 0
+),
+QuestionMetrics AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.Tags,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.CommentCount,
+        q.CreationDate,
+        q.OwnerUserId,
+        q.AcceptedAnswerId,
+        COALESCE(a.Score, 0) AS AnswerScore,
+        CASE 
+            WHEN q.AcceptedAnswerId IS NOT NULL THEN 'Yes'
+            ELSE 'No'
+        END AS HasAcceptedAnswer,
+        EXTRACT(EPOCH FROM (q.LastActivityDate - q.CreationDate)) AS AgeInSeconds,
+        CASE 
+            WHEN q.CreationDate >= DATE '2020-01-01' THEN 'Recent'
+            WHEN q.CreationDate >= DATE '2018-01-01' THEN 'Mid'
+            ELSE 'Old'
+        END AS QuestionAgeGroup
+    FROM Posts q
+    LEFT JOIN Posts a ON q.AcceptedAnswerId = a.Id
+    WHERE q.PostTypeId = 1 AND q.Score IS NOT NULL
+)
+SELECT 
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.Views,
+    ua.UpVotes,
+    ua.DownVotes,
+    ua.TotalPosts,
+    ua.Questions,
+    ua.Answers,
+    ua.Comments,
+    ua.Badges,
+    ua.TotalScore,
+    ua.LastActivity,
+    ua.PostRank,
+    ua.ReputationRank,
+    CASE 
+        WHEN ua.TotalPosts >= 100 THEN 'Veteran'
+        WHEN ua.TotalPosts >= 50 THEN 'Experienced'
+        WHEN ua.TotalPosts >= 10 THEN 'Intermediate'
+        ELSE 'Beginner'
+    END AS UserExperienceLevel,
+    STRING_AGG(SUBSTRING(t.TagName FROM 2 FOR (CHAR_LENGTH(t.TagName) - 2)), ', ') AS TopTags,
+    STRING_AGG((ups.PostType || ': ' || ups.Score || ' points'), ', ') AS RecentPostActivity,
+    COALESCE(
+        (SELECT COUNT(*) 
+         FROM UserActivityStats uas 
+         WHERE uas.UserId = ua.UserId 
+         AND uas.LastActivity >= DATE '2023-01-01'), 
+        0
+    ) AS ActiveIn2023,
+    COALESCE(
+        (SELECT COUNT(*) 
+         FROM PostHistory ph2 
+         WHERE ph2.UserId = ua.UserId 
+         AND ph2.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 24)), 
+        0
+    ) AS EditingActivity,
+    CASE 
+        WHEN EXISTS (
+            SELECT 1 
+            FROM Votes v 
+            WHERE v.UserId = ua.UserId 
+            AND v.VoteTypeId IN (1, 2, 3)
+        ) THEN 'HasVoted'
+        ELSE 'NoVotes'
+    END AS VotingStatus,
+    (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = ua.UserId AND p2.PostTypeId = 2) AS AnswerCount,
+    CASE 
+        WHEN COUNT(DISTINCT CASE WHEN pm.QuestionAgeGroup = 'Recent' THEN pm.QuestionId END) > 0 
+        THEN 'ActiveRecentQuestions'
+        ELSE 'NoRecentQuestions'
+    END AS RecentQuestionStatus,
+    (SELECT COUNT(*) FROM UserActivityStats uas2 WHERE uas2.UserId = ua.UserId AND uas2.TotalPosts > 0) AS ActivePosts,
+    LEAD(ua.Reputation, 1) OVER (ORDER BY ua.Reputation DESC) AS NextTopReputation,
+    LAG(ua.Reputation, 1) OVER (ORDER BY ua.Reputation DESC) AS PreviousTopReputation,
+    PERCENT_RANK() OVER (ORDER BY ua.Reputation) AS ReputationPercentile,
+    CASE 
+        WHEN ua.Reputation > (SELECT AVG(u2.Reputation) FROM Users u2) THEN 'AboveAverage'
+        WHEN ua.Reputation < (SELECT AVG(u3.Reputation) FROM Users u3) THEN 'BelowAverage'
+        ELSE 'Average'
+    END AS ReputationComparison,
+    COALESCE((SELECT COUNT(DISTINCT c2.PostId) FROM Comments c2 WHERE c2.UserId = ua.UserId), 0) AS CommentCount,
+    COALESCE((SELECT COUNT(DISTINCT p3.Id) FROM Posts p3 WHERE p3.OwnerUserId = ua.UserId AND p3.Score > 100), 0) AS HighScorePosts,
+    COUNT(*) OVER (PARTITION BY ua.UserId) AS UserPostCount,
+    (SELECT COUNT(DISTINCT b2.Id) FROM Badges b2 WHERE b2.UserId = ua.UserId AND b2.Class = 1) AS GoldBadges,
+    (SELECT COUNT(DISTINCT b3.Id) FROM Badges b3 WHERE b3.UserId = ua.UserId AND b3.Class = 2) AS SilverBadges,
+    (SELECT COUNT(DISTINCT b4.Id) FROM Badges b4 WHERE b4.UserId = ua.UserId AND b4.Class = 3) AS BronzeBadges,
+    COUNT(DISTINCT CASE WHEN pm.QuestionAgeGroup = 'Recent' THEN pm.QuestionId END) AS RecentQuestions,
+    COALESCE(
+        (SELECT AVG(q2.Score) 
+         FROM Posts q2 
+         WHERE q2.OwnerUserId = ua.UserId 
+         AND q2.PostTypeId = 1 
+         AND q2.CreationDate >= DATE '2023-01-01'), 
+        0
+    ) AS RecentAvgScore,
+    CASE 
+        WHEN ua.Answers > ua.Questions THEN 'MoreAnswersThanQuestions'
+        WHEN ua.Answers < ua.Questions THEN 'MoreQuestionsThanAnswers'
+        ELSE 'EqualQuestionsAndAnswers'
+    END AS QuestionAnswerRatio,
+    COALESCE((SELECT COUNT(*) FROM Votes v2 WHERE v2.UserId = ua.UserId), 0) AS TotalVotes,
+    COALESCE(
+        (SELECT COUNT(*) 
+         FROM VoteTypes vt 
+         WHERE vt.Name IN ('UpMod', 'DownMod') 
+         AND EXISTS (SELECT 1 FROM Votes v3 WHERE v3.UserId = ua.UserId AND v3.VoteTypeId = vt.Id)), 
+        0
+    ) AS VotedUpOrDown,
+    STRING_AGG(pm.QuestionAgeGroup, ', ') AS QuestionAgeGroups,
+    COUNT(DISTINCT CASE WHEN pm.QuestionAgeGroup = 'Old' THEN pm.QuestionId END) AS OldQuestions,
+    COUNT(DISTINCT CASE WHEN pm.QuestionAgeGroup = 'Mid' THEN pm.QuestionId END) AS MidQuestions,
+    COUNT(DISTINCT CASE WHEN pm.QuestionAgeGroup = 'Recent' THEN pm.QuestionId END) AS RecentQuestionsCount,
+    COUNT(DISTINCT CASE WHEN q.PostTypeId = 1 AND q.ViewCount > 1000 THEN q.Id END) AS PopularQuestions,
+    (SELECT STRING_AGG((pv.PostTypeId || ':' || pv.Score), ', ') 
+     FROM Posts pv 
+     WHERE pv.OwnerUserId = ua.UserId
+     AND pv.PostTypeId IN (1, 2) 
+     AND pv.CreationDate >= DATE '2022-01-01'
+    ) AS RecentActivity,
+    CASE 
+        WHEN EXISTS (SELECT 1 FROM Posts p4 WHERE p4.PostTypeId = 1 AND p4.OwnerUserId = ua.UserId AND p4.CreationDate >= DATE '2023-01-01') 
+        THEN 'HasRecentQuestion'
+        ELSE 'NoRecentQuestion'
+    END AS RecentQuestionFlag,
+    CASE 
+        WHEN EXISTS (SELECT 1 FROM Posts p5 WHERE p5.PostTypeId = 2 AND p5.OwnerUserId = ua.UserId AND p5.CreationDate >= DATE '2023-01-01') 
+        THEN 'HasRecentAnswer'
+        ELSE 'NoRecentAnswer'
+    END AS RecentAnswerFlag,
+    COALESCE((SELECT COUNT(DISTINCT b5.Id) FROM Badges b5 WHERE b5.UserId = ua.UserId AND b5.Date >= DATE '2023-01-01'), 0) AS RecentBadges,
+    COALESCE((SELECT COUNT(DISTINCT p6.Id) FROM Posts p6 WHERE p6.OwnerUserId = ua.UserId AND p6.Score > 0), 0) AS PositiveScorePosts,
+    COALESCE((SELECT COUNT(DISTINCT p7.Id) FROM Posts p7 WHERE p7.OwnerUserId = ua.UserId AND p7.Score < 0), 0) AS NegativeScorePosts,
+    COALESCE((SELECT AVG(p8.Score) FROM Posts p8 WHERE p8.OwnerUserId = ua.UserId AND p8.PostTypeId = 1), 0) AS AvgQuestionScore,
+    COALESCE((SELECT AVG(p9.Score) FROM Posts p9 WHERE p9.OwnerUserId = ua.UserId AND p9.PostTypeId = 2), 0) AS AvgAnswerScore,
+    ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS RowNum,
+    (SELECT COUNT(DISTINCT ph3.PostId) FROM PostHistory ph3 WHERE ph3.UserId = ua.UserId AND ph3.CreationDate >= DATE '2023-01-01') AS RecentEdits,
+    CASE WHEN EXISTS (SELECT 1 FROM Users u2 WHERE u2.Id = ua.UserId AND u2.WebsiteUrl IS NOT NULL AND u2.WebsiteUrl != '') THEN 'HasWebsite' ELSE 'NoWebsite' END AS WebsiteStatus,
+    (SELECT COUNT(DISTINCT p10.Id) FROM Posts p10 WHERE p10.OwnerUserId = ua.UserId AND p10.CreationDate >= DATE '2023-01-01') AS RecentPosts,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = ua.UserId)) AS LinkCount,
+    CASE 
+        WHEN ua.Badges >= 10 THEN 'BadgeMaster'
+        WHEN ua.Badges >= 5 THEN 'BadgeEnthusiast'
+        ELSE 'BadgeSeeker'
+    END AS BadgeAchievement,
+    COALESCE(
+        (SELECT COUNT(DISTINCT ph4.PostId) 
+         FROM PostHistory ph4 
+         WHERE ph4.UserId = ua.UserId 
+         AND ph4.PostHistoryTypeId = 24), 
+        0
+    ) AS SuggestedEdits,
+    (SELECT COUNT(*) FROM Comments c3 WHERE c3.UserId = ua.UserId AND c3.CreationDate >= DATE '2023-01-01') AS RecentComments,
+    CASE 
+        WHEN ua.Reputation > (SELECT AVG(u4.Reputation) FROM Users u4 WHERE u4.Reputation > 0) * 1.5 THEN 'HighReputation'
+        WHEN ua.Reputation > (SELECT AVG(u5.Reputation) FROM Users u5 WHERE u5.Reputation > 0) * 0.75 THEN 'ModerateReputation'
+        ELSE 'LowReputation'
+    END AS ReputationTier
+FROM UserActivityStats ua
+LEFT JOIN UserPostStats ups ON ua.UserId = ups.OwnerUserId
+LEFT JOIN Posts p ON ua.UserId = p.OwnerUserId
+LEFT JOIN Tags t ON t.TagName IS NOT NULL -- keep join but will be filtered by aggregation
+LEFT JOIN QuestionMetrics pm ON pm.OwnerUserId = ua.UserId
+LEFT JOIN PostHistory ph ON ph.UserId = ua.UserId
+WHERE ua.UserId IN (
+    SELECT DISTINCT OwnerUserId 
+    FROM Posts 
+    WHERE OwnerUserId IS NOT NULL
+)
+GROUP BY 
+    ua.UserId, 
+    ua.DisplayName, 
+    ua.Reputation, 
+    ua.Views, 
+    ua.UpVotes, 
+    ua.DownVotes, 
+    ua.TotalPosts, 
+    ua.Questions, 
+    ua.Answers, 
+    ua.Comments, 
+    ua.Badges, 
+    ua.TotalScore, 
+    ua.LastActivity, 
+    ua.PostRank, 
+    ua.ReputationRank,
+    CASE 
+        WHEN ua.TotalPosts >= 100 THEN 'Veteran'
+        WHEN ua.TotalPosts >= 50 THEN 'Experienced'
+        WHEN ua.TotalPosts >= 10 THEN 'Intermediate'
+        ELSE 'Beginner'
+    END,
+    ua.UserId,
+    ups.PostType,
+    ups.Score,
+    t.TagName,
+    pm.QuestionAgeGroup,
+    q.Id,
+    q.PostTypeId,
+    q.ViewCount
+HAVING 
+    COUNT(DISTINCT ups.OwnerUserId) > 0 
+    OR COUNT(DISTINCT p.Id) > 0
+ORDER BY 
+    ua.Reputation DESC,
+    ua.Views DESC
+LIMIT 1000;

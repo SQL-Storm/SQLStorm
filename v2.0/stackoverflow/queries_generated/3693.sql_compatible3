@@ -1,0 +1,137 @@
+WITH
+UserStats AS (
+    SELECT
+        u.Id                                    AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        SUM(p.Score) FILTER (WHERE p.PostTypeId = 1) AS QuestionScore,
+        SUM(p.Score) FILTER (WHERE p.PostTypeId = 2) AS AnswerScore,
+        COUNT(b.Id)                             AS BadgeCount,
+        COUNT(*) FILTER (WHERE b.Class = 1)     AS GoldBadgeCount,
+        MAX(p.CreationDate)                     AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts   p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges  b ON b.UserId      = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+TopTags AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0
+),
+
+PostTagRows AS (
+    SELECT
+        p.OwnerUserId                         AS UserId,
+        TRIM(BOTH '<>' FROM UNNEST(string_to_array(p.Tags, '><'))) AS TagName,
+        p.Score,
+        p.PostTypeId
+    FROM Posts p
+    WHERE p.Tags IS NOT NULL
+),
+
+TagAggregates AS (
+    SELECT
+        pt.TagName,
+        SUM(CASE WHEN pt.PostTypeId = 1 THEN pt.Score ELSE 0 END) AS QScore,
+        SUM(CASE WHEN pt.PostTypeId = 2 THEN pt.Score ELSE 0 END) AS AScore,
+        COUNT(*)                                                  AS PostCnt
+    FROM PostTagRows pt
+    GROUP BY pt.TagName
+),
+
+RecentVotes AS (
+    SELECT
+        v.PostId,
+        v.VoteTypeId,
+        v.UserId,
+        v.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY v.PostId ORDER BY v.CreationDate DESC) AS rn
+    FROM Votes v
+    WHERE v.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days')
+),
+
+UserRecentVoteCnt AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(*)      AS RecentVoteCount
+    FROM Posts p
+    JOIN RecentVotes rv ON rv.PostId = p.Id AND rv.rn = 1
+    GROUP BY p.OwnerUserId
+),
+
+UserTopTags AS (
+    SELECT
+        pt.UserId,
+        pt.TagName,
+        ROW_NUMBER() OVER (PARTITION BY pt.UserId
+                           ORDER BY tt.Count DESC) AS TagRank
+    FROM PostTagRows pt
+    JOIN TopTags tt ON tt.TagName = pt.TagName
+),
+
+MainResult AS (
+    SELECT
+        u.Id                                    AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        us.QuestionCount,
+        us.AnswerCount,
+        us.GoldBadgeCount,
+        us.LastPostDate,
+        COALESCE(rv.RecentVoteCount,0)          AS RecentVoteCount,
+        CASE
+            WHEN (us.QuestionCount + us.AnswerCount) = 0 THEN NULL
+            ELSE ROUND(
+                 (us.QuestionScore + us.AnswerScore) / NULLIF((us.QuestionCount + us.AnswerCount),0), 2)
+        END                                    AS AvgScorePerPost,
+        STRING_AGG(DISTINCT utt.TagName, ', ')
+            FILTER (WHERE utt.TagRank <= 5)     AS Top5PopularTags
+    FROM Users u
+    LEFT JOIN UserStats       us  ON us.UserId = u.Id
+    LEFT JOIN UserRecentVoteCnt rv  ON rv.UserId = u.Id
+    LEFT JOIN UserTopTags   utt ON utt.UserId = u.Id
+    WHERE u.Reputation > 1000
+      AND (u.EmailHash IS NOT NULL OR u.AccountId IS NOT NULL)
+    GROUP BY u.Id, u.DisplayName, u.Reputation,
+             us.QuestionCount, us.AnswerCount,
+             us.GoldBadgeCount, us.LastPostDate,
+             rv.RecentVoteCount, us.QuestionScore, us.AnswerScore
+    HAVING COUNT(*) FILTER (WHERE us.QuestionCount IS NOT NULL) > 5
+),
+
+TotalsRow AS (
+    SELECT
+        -1                                     AS UserId,
+        'Aggregated Totals'                    AS DisplayName,
+        NULL                                   AS Reputation,
+        SUM(us.QuestionCount)                  AS QuestionCount,
+        SUM(us.AnswerCount)                    AS AnswerCount,
+        SUM(us.GoldBadgeCount)                 AS GoldBadgeCount,
+        NULL                                   AS LastPostDate,
+        SUM(COALESCE(rv.RecentVoteCount,0))    AS RecentVoteCount,
+        NULL                                   AS AvgScorePerPost,
+        NULL                                   AS Top5PopularTags
+    FROM UserStats us
+    LEFT JOIN UserRecentVoteCnt rv ON rv.UserId = us.UserId
+    WHERE us.QuestionCount > 0
+)
+
+SELECT *
+FROM (
+    SELECT *
+    FROM MainResult
+    ORDER BY AvgScorePerPost DESC NULLS LAST
+    LIMIT 100
+) AS main_limited
+
+UNION ALL
+
+SELECT *
+FROM TotalsRow;

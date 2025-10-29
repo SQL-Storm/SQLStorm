@@ -1,0 +1,162 @@
+WITH RECURSIVE
+    gold_badge_users AS (
+        SELECT DISTINCT b.UserId
+        FROM Badges b
+        WHERE b.Class = 1
+    ),
+
+    question_stats AS (
+        SELECT
+            q.Id                                   AS QuestionId,
+            q.OwnerUserId                          AS OwnerUserId,
+            q.Score                                AS QuestionScore,
+            COALESCE(q.AnswerCount, 0)             AS AnswerCount,
+            CASE WHEN q.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS HasAccepted,
+            (
+                SELECT COUNT(*)
+                FROM PostHistory ph
+                WHERE ph.PostId = q.Id
+                  AND ph.PostHistoryTypeId = 10
+                  AND ph.Comment = '101'
+            )                                      AS DuplicateCloseCount,
+            q.Tags                                 AS Tags
+        FROM Posts q
+        WHERE q.PostTypeId = 1
+    ),
+
+    question_tags AS (
+        SELECT
+            qs.QuestionId,
+            TRIM(BOTH '><' FROM UNNEST(
+                regexp_split_to_array(qs.Tags, '><')
+            )) AS Tag
+        FROM (
+            SELECT Id, Tags
+            FROM Posts
+            WHERE PostTypeId = 1 AND Tags IS NOT NULL
+        ) qs
+    ),
+
+    user_tag_agg AS (
+        SELECT
+            qs.OwnerUserId               AS UserId,
+            COUNT(DISTINCT qt.Tag)       AS DistinctTagCount,
+            STRING_AGG(DISTINCT qt.Tag, ',') FILTER (WHERE qt.Tag IS NOT NULL) AS TagList
+        FROM question_stats qs
+        LEFT JOIN question_tags qt
+               ON qs.QuestionId = qt.QuestionId
+        GROUP BY qs.OwnerUserId
+    ),
+
+    answer_stats AS (
+        SELECT
+            a.OwnerUserId                            AS UserId,
+            COUNT(*)                                 AS AnswerCount,
+            AVG(a.Score)                             AS AvgAnswerScore,
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END)  AS UpVoteTotal,
+            SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END)  AS DownVoteTotal
+        FROM Posts a
+        LEFT JOIN Votes v
+               ON v.PostId = a.Id AND v.VoteTypeId IN (2,3)
+        WHERE a.PostTypeId = 2
+        GROUP BY a.OwnerUserId
+    ),
+
+    recent_activity AS (
+        SELECT
+            u.Id                                      AS UserId,
+            GREATEST(
+                COALESCE(MAX(p.CreationDate), TIMESTAMP '1970-01-01'),
+                COALESCE(MAX(b.Date),          TIMESTAMP '1970-01-01')
+            )                                         AS LastActivityDate
+        FROM Users u
+        LEFT JOIN Posts p
+               ON p.OwnerUserId = u.Id
+        LEFT JOIN Badges b
+               ON b.UserId = u.Id
+        GROUP BY u.Id
+    ),
+
+    user_metrics AS (
+        SELECT
+            u.Id                                         AS UserId,
+            u.DisplayName,
+            u.Reputation,
+            COALESCE(qs_q.QuestionCount,0)                AS TotalQuestions,
+            COALESCE(qs_a.AnswerCount,0)                  AS TotalAnswers,
+            COALESCE(qs_a.AvgAnswerScore,0)               AS AvgAnswerScore,
+            COALESCE(gb.HasGoldBadge,0)                   AS HasGoldBadge,
+            COALESCE(uta.DistinctTagCount,0)              AS DistinctTagCount,
+            COALESCE(uta.TagList,'')                      AS TagList,
+            COALESCE(ra.LastActivityDate, TIMESTAMP '1970-01-01') AS LastActivityDate,
+            RANK() OVER (ORDER BY u.Reputation DESC)      AS ReputationRank,
+            ROW_NUMBER() OVER (PARTITION BY u.Reputation ORDER BY u.Id) AS RepTieBreaker
+        FROM Users u
+        LEFT JOIN (
+            SELECT OwnerUserId, COUNT(*) AS QuestionCount
+            FROM question_stats
+            GROUP BY OwnerUserId
+        ) qs_q
+               ON qs_q.OwnerUserId = u.Id
+        LEFT JOIN answer_stats qs_a
+               ON qs_a.UserId = u.Id
+        LEFT JOIN (
+            SELECT UserId, 1 AS HasGoldBadge
+            FROM gold_badge_users
+        ) gb
+               ON gb.UserId = u.Id
+        LEFT JOIN user_tag_agg uta
+               ON uta.UserId = u.Id
+        LEFT JOIN recent_activity ra
+               ON ra.UserId = u.Id
+    )
+
+SELECT
+    um.UserId,
+    um.DisplayName,
+    um.Reputation,
+    um.TotalQuestions,
+    um.TotalAnswers,
+    ROUND(CAST(um.AvgAnswerScore AS numeric),2)          AS AvgAnswerScore,
+    um.HasGoldBadge,
+    um.DistinctTagCount,
+    um.TagList,
+    um.LastActivityDate,
+    um.ReputationRank,
+    um.RepTieBreaker,
+    CAST(NULL AS varchar(35))           AS TagName,
+    CAST(NULL AS int)                   AS TagQuestionCount
+FROM user_metrics um
+WHERE um.ReputationRank <= 100
+  AND um.HasGoldBadge = 1
+  AND um.TotalQuestions >= 5
+  AND um.TotalAnswers >= 10
+
+UNION ALL
+
+SELECT
+    CAST(NULL AS int),
+    CAST(NULL AS varchar(40)),
+    CAST(NULL AS int),
+    CAST(NULL AS int),
+    CAST(NULL AS int),
+    CAST(NULL AS numeric),
+    CAST(NULL AS integer),
+    CAST(NULL AS int),
+    CAST(NULL AS varchar),
+    CAST(NULL AS timestamp),
+    CAST(NULL AS int),
+    CAST(NULL AS int),
+    t.TagName,
+    t.Count AS TagQuestionCount
+FROM (
+    SELECT
+        tg.TagName,
+        tg.Count,
+        ROW_NUMBER() OVER (ORDER BY tg.Count DESC) AS rn
+    FROM Tags tg
+) t
+WHERE t.rn <= 10
+ORDER BY
+    ReputationRank NULLS LAST,
+    TagQuestionCount DESC NULLS FIRST;

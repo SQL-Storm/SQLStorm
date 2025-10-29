@@ -1,0 +1,216 @@
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.CreationDate AS UserCreationDate,
+        U.Reputation,
+        U.Views,
+        U.UpVotes,
+        U.DownVotes,
+        COUNT(DISTINCT P.Id) FILTER (WHERE P.PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT P.Id) FILTER (WHERE P.PostTypeId = 2) AS AnswerCount,
+        SUM(COALESCE(P.Score, 0)) FILTER (WHERE P.PostTypeId = 1) AS TotalQuestionScore,
+        SUM(COALESCE(P.Score, 0)) FILTER (WHERE P.PostTypeId = 2) AS TotalAnswerScore,
+        SUM(COALESCE(C.Score, 0)) AS TotalCommentScore,
+        MAX(P.CreationDate) AS LastPostDate,
+        MIN(P.CreationDate) AS FirstPostDate
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    GROUP BY U.Id, U.CreationDate, U.Reputation, U.Views, U.UpVotes, U.DownVotes
+    HAVING COUNT(DISTINCT P.Id) FILTER (WHERE P.PostTypeId = 1) >= 1
+),
+HighlyEngagedQuestions AS (
+    SELECT
+        Q.Id AS QuestionId,
+        Q.OwnerUserId,
+        Q.CreationDate AS QuestionCreationDate,
+        Q.Score AS QuestionScore,
+        Q.ViewCount AS QuestionViewCount,
+        A.CreationDate AS AcceptedAnswerCreationDate,
+        EXTRACT(EPOCH FROM (A.CreationDate - Q.CreationDate)) / 3600.0 AS TimeToAcceptanceHours
+    FROM Posts AS Q
+    INNER JOIN Posts AS A ON Q.AcceptedAnswerId = A.Id
+    WHERE
+        Q.PostTypeId = 1
+        AND Q.AcceptedAnswerId IS NOT NULL
+        AND Q.Score >= 50
+        AND A.Score >= 10
+        AND Q.CreationDate BETWEEN '2020-01-01' AND '2023-06-30'
+),
+QuestionCommentEngagement AS (
+    SELECT
+        P.OwnerUserId AS UserId,
+        P.Id AS PostId,
+        COUNT(C.Id) AS NumCommentsByOwnerOnQuestion,
+        SUM(LENGTH(C.Text)) AS TotalCommentLengthByOwner,
+        AVG(C.Score) AS AvgCommentScoreByOwner
+    FROM Posts AS P
+    INNER JOIN Comments AS C ON P.Id = C.PostId AND P.OwnerUserId = C.UserId
+    WHERE P.PostTypeId = 1
+    GROUP BY P.OwnerUserId, P.Id
+    HAVING COUNT(C.Id) >= 2
+),
+PostHistoricalEdits AS (
+    SELECT
+        PH.PostId,
+        COUNT(PH.Id) FILTER (WHERE PH.PostHistoryTypeId IN (4, 5, 6)) AS SignificantEditCount,
+        MAX(PH.CreationDate) AS LastHistoryDate,
+        MIN(PH.CreationDate) FILTER (WHERE PH.PostHistoryTypeId IN (1, 2, 3)) AS InitialPostHistoryDate,
+        SUM(CASE WHEN PH.Text LIKE '%<a href="%"%' THEN 1 ELSE 0 END) AS LinkInsertionEditCount
+    FROM PostHistory AS PH
+    WHERE PH.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)
+    GROUP BY PH.PostId
+    HAVING COUNT(PH.Id) FILTER (WHERE PH.PostHistoryTypeId IN (4, 5, 6)) <= 3
+),
+MigrationInvolvedUsers AS (
+    SELECT DISTINCT
+        PH.UserId
+    FROM PostHistory AS PH
+    WHERE PH.PostHistoryTypeId IN (35, 36)
+    AND PH.UserId IS NOT NULL
+),
+TopGoldBadgeUsers AS (
+    SELECT
+        B.UserId,
+        COUNT(B.Id) AS GoldBadgeCount,
+        MAX(B.Date) AS LatestGoldBadgeDate
+    FROM Badges AS B
+    INNER JOIN Users AS U ON B.UserId = U.Id
+    WHERE B.Class = 1
+    AND U.Reputation >= 10000
+    GROUP BY B.UserId
+    HAVING COUNT(B.Id) >= 2
+)
+SELECT
+    UAS.UserId,
+    U.DisplayName,
+    U.Location,
+    UAS.UserCreationDate,
+    UAS.Reputation,
+    UAS.QuestionCount,
+    UAS.AnswerCount,
+    UAS.TotalQuestionScore,
+    UAS.TotalCommentScore,
+    HEQ.QuestionId,
+    HEQ.QuestionScore,
+    HEQ.TimeToAcceptanceHours,
+    HEQ.QuestionViewCount,
+    COALESCE(QCE.NumCommentsByOwnerOnQuestion, 0) AS OwnerCommentsOnQuestion,
+    COALESCE(QCE.AvgCommentScoreByOwner, 0.0) AS AvgOwnerCommentScore,
+    PHE.SignificantEditCount,
+    PHE.LinkInsertionEditCount,
+    DENSE_RANK() OVER (
+        ORDER BY
+            (UAS.Reputation * 0.4)
+            + (UAS.TotalQuestionScore * 0.25)
+            + (UAS.TotalAnswerScore * 0.15)
+            + (COALESCE(HEQ.QuestionScore, 0) * 0.1)
+            + (COALESCE(HEQ.QuestionViewCount, 0) / 500.0)
+            + (COALESCE(QCE.NumCommentsByOwnerOnQuestion, 0) * 8)
+            - (COALESCE(PHE.SignificantEditCount, 0) * 15)
+            + (CASE WHEN U.WebsiteUrl IS NOT NULL THEN 100 ELSE 0 END)
+            DESC,
+            UAS.LastPostDate DESC
+    ) AS InfluenceRank,
+    (UAS.UpVotes - UAS.DownVotes) AS NetVotes,
+    (CASE
+        WHEN UAS.Reputation > 75000 AND UAS.QuestionCount >= 20 AND UAS.AnswerCount >= 100 THEN 'Legendary Contributor'
+        WHEN UAS.Reputation > 25000 AND UAS.QuestionCount >= 10 AND HEQ.QuestionId IS NOT NULL THEN 'Proactive Influencer'
+        WHEN UAS.Reputation > 5000 AND UAS.AnswerCount >= 50 THEN 'Reliable Answerer'
+        ELSE 'Engaged Participant'
+    END) AS UserTier,
+    TO_CHAR(UAS.UserCreationDate, 'YYYY-MM') AS UserCreationMonth,
+    LENGTH(COALESCE(U.AboutMe, '')) AS AboutMeLength,
+    (SELECT AVG(SubP.Score) FROM Posts AS SubP WHERE SubP.OwnerUserId = UAS.UserId AND SubP.PostTypeId = 2) AS AvgUserAnswerScore,
+    EXISTS (
+        SELECT 1
+        FROM Posts AS P_TagCheck
+        WHERE P_TagCheck.OwnerUserId = UAS.UserId
+        AND P_TagCheck.PostTypeId = 1
+        AND P_TagCheck.Tags LIKE '%<sql>%'
+        AND P_TagCheck.Score >= 25
+    ) AS HasStrongSqlExpertise
+FROM UserActivitySummary AS UAS
+INNER JOIN Users AS U ON UAS.UserId = U.Id
+LEFT JOIN HighlyEngagedQuestions AS HEQ ON UAS.UserId = HEQ.OwnerUserId
+LEFT JOIN QuestionCommentEngagement AS QCE ON HEQ.QuestionId = QCE.PostId AND UAS.UserId = QCE.UserId
+LEFT JOIN PostHistoricalEdits AS PHE ON HEQ.QuestionId = PHE.PostId
+WHERE
+    U.LastAccessDate >= '2023-01-01'
+    AND UAS.TotalQuestionScore > 150
+    AND UAS.QuestionCount >= 3
+    AND UAS.AnswerCount >= 10
+    AND HEQ.TimeToAcceptanceHours BETWEEN 0.5 AND 120.0
+    AND NOT EXISTS (
+        SELECT 1
+        FROM MigrationInvolvedUsers AS MIU
+        WHERE MIU.UserId = UAS.UserId
+    )
+    AND (
+        (HEQ.QuestionId IS NOT NULL AND HEQ.QuestionScore > 100 AND HEQ.QuestionViewCount > 10000)
+        OR (UAS.Reputation > 30000 AND UAS.Views > 7500 AND (UAS.UpVotes - UAS.DownVotes) > 200)
+        OR (COALESCE(QCE.NumCommentsByOwnerOnQuestion, 0) > 3 AND COALESCE(QCE.AvgCommentScoreByOwner, 0) > 0.5)
+    )
+    AND COALESCE(U.Location, '') NOT LIKE '%[TEST]%' AND COALESCE(U.Location, '') NOT LIKE '%Unknown%'
+    AND (PHE.SignificantEditCount IS NULL OR PHE.SignificantEditCount <= 1)
+    AND U.DisplayName IS NOT NULL AND U.EmailHash IS NOT NULL AND U.AboutMe IS NOT NULL
+    AND LENGTH(TRIM(U.AboutMe)) > 50
+
+UNION ALL
+
+SELECT
+    TGBU.UserId,
+    U.DisplayName,
+    U.Location,
+    U.CreationDate AS UserCreationDate,
+    U.Reputation,
+    COALESCE(UAS_Union.QuestionCount, 0) AS QuestionCount,
+    COALESCE(UAS_Union.AnswerCount, 0) AS AnswerCount,
+    COALESCE(UAS_Union.TotalQuestionScore, 0) AS TotalQuestionScore,
+    COALESCE(UAS_Union.TotalCommentScore, 0) AS TotalCommentScore,
+    NULL AS QuestionId,
+    NULL AS QuestionScore,
+    NULL AS TimeToAcceptanceHours,
+    NULL AS QuestionViewCount,
+    COALESCE(QCE_Union.NumCommentsByOwnerOnQuestion, 0) AS OwnerCommentsOnQuestion,
+    COALESCE(QCE_Union.AvgCommentScoreByOwner, 0.0) AS AvgOwnerCommentScore,
+    NULL AS SignificantEditCount,
+    NULL AS LinkInsertionEditCount,
+    DENSE_RANK() OVER (
+        ORDER BY
+            (U.Reputation * 0.6)
+            + (TGBU.GoldBadgeCount * 150)
+            + (U.UpVotes * 0.1)
+            + (COALESCE(UAS_Union.TotalAnswerScore, 0) * 0.05)
+            DESC,
+            TGBU.LatestGoldBadgeDate DESC
+    ) AS InfluenceRank,
+    (U.UpVotes - U.DownVotes) AS NetVotes,
+    'Gold Badge Elite' AS UserTier,
+    TO_CHAR(U.CreationDate, 'YYYY-MM') AS UserCreationMonth,
+    LENGTH(COALESCE(U.AboutMe, '')) AS AboutMeLength,
+    (SELECT AVG(SubP.Score) FROM Posts AS SubP WHERE SubP.OwnerUserId = TGBU.UserId AND SubP.PostTypeId = 2) AS AvgUserAnswerScore,
+    EXISTS (
+        SELECT 1
+        FROM Posts AS P_TagCheck
+        WHERE P_TagCheck.OwnerUserId = TGBU.UserId
+        AND P_TagCheck.PostTypeId = 1
+        AND P_TagCheck.Tags LIKE '%<javascript>%'
+        AND P_TagCheck.Score >= 20
+    ) AS HasStrongSqlExpertise
+FROM TopGoldBadgeUsers AS TGBU
+INNER JOIN Users AS U ON TGBU.UserId = U.Id
+LEFT JOIN UserActivitySummary AS UAS_Union ON TGBU.UserId = UAS_Union.UserId
+LEFT JOIN QuestionCommentEngagement AS QCE_Union ON TGBU.UserId = QCE_Union.UserId
+WHERE
+    U.Reputation >= 20000
+    AND TGBU.GoldBadgeCount >= 3
+    AND U.LastAccessDate >= '2023-01-01'
+    AND NOT EXISTS (
+        SELECT 1
+        FROM MigrationInvolvedUsers AS MIU
+        WHERE MIU.UserId = TGBU.UserId
+    )
+    AND (U.WebsiteUrl IS NOT NULL OR LENGTH(COALESCE(U.Location, '')) > 0)
+ORDER BY InfluenceRank ASC, Reputation DESC
+LIMIT 1000;

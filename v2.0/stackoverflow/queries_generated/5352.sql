@@ -1,0 +1,143 @@
+-- {"query": "5352.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1010} 
+WITH
+-- A richly joined dataset combining users, posts, votes, and history
+UserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    u.LastAccessDate,
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.Tags,
+    p.CreationDate AS PostCreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Body,
+    p.OwnerUserId,
+    p.LastEditorUserId,
+    p.LastActivityDate,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ClosedDate,
+    p.CommunityOwnedDate,
+    -- recent activity delta
+    EXTRACT(epoch FROM (COALESCE(p.LastActivityDate, p.CreationDate) - u.CreationDate)) AS lifetime_seconds
+  FROM Users u
+  LEFT JOIN Posts p
+    ON p.OwnerUserId = u.Id
+  WHERE u.Reputation > 1000
+),
+-- Recent post history focused on edits and closings
+RecentPostHistory AS (
+  SELECT
+    ph.PostId,
+    ph.PostHistoryTypeId,
+    ph.CreationDate,
+    ph.UserId,
+    ph.Text,
+    ph.Comment,
+    ph.RevisionGUID
+  FROM PostHistory ph
+  WHERE ph.CreationDate > NOW() - INTERVAL '180 days'
+),
+-- Complex self-join graph: related posts via PostLinks (duplicates and links)
+LinkedPosts AS (
+  SELECT
+    pl.PostId,
+    pl.RelatedPostId,
+    pl.LinkTypeId,
+    pl.CreationDate
+  FROM PostLinks pl
+  WHERE pl.LinkTypeId IN (1, 3) -- Linked or Duplicate relations
+),
+-- Aggregations over tags to stress string and array handling
+TagAgg AS (
+  SELECT
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId,
+    t.WikiPostId
+  FROM Tags t
+  WHERE t.IsModeratorOnly = 0
+),
+-- Windowed ranking of posts by score within each post type
+RankedPosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    ROW_NUMBER() OVER (
+      PARTITION BY p.PostTypeId
+      ORDER BY p.Score DESC NULLS LAST, p.ViewCount DESC NULLS LAST, p.CreationDate
+    ) AS TypeRank
+  FROM Posts p
+),
+-- A subquery with correlated reference to PostHistory for close reasons
+CloseReasonCounts AS (
+  SELECT
+    ph.PostId,
+    MAX(CASE
+      WHEN ph.PostHistoryTypeId = 10 THEN CAST((ph.Text ->> 'CloseReasonId') AS int)
+      ELSE NULL
+    END) AS CloseReasonId
+  FROM PostHistory ph
+  GROUP BY ph.PostId
+)
+SELECT
+  ua.UserId,
+  ua.DisplayName AS UserDisplayName,
+  ua.Reputation,
+  ua.UserCreationDate,
+  ua.LastAccessDate,
+  ua.PostId,
+  ua.PostTypeId,
+  CASE
+    WHEN ua.PostTypeId = 1 THEN 'Question'
+    WHEN ua.PostTypeId = 2 THEN 'Answer'
+    ELSE 'Other'
+  END AS PostKind,
+  ua.Title,
+  ua.Tags,
+  ua.PostCreationDate,
+  ua.Score,
+  ua.ViewCount,
+  ua.Body,
+  ua.OwnerUserId,
+  ua.LastEditorUserId,
+  ua.LastActivityDate,
+  ua.AnswerCount,
+  ua.CommentCount,
+  ua.FavoriteCount,
+  ua.ClosedDate,
+  ua.CommunityOwnedDate,
+  ua.lifetime_seconds,
+  r.TypeRank,
+  rr.CloseReasonId,
+  lh.PostHistoryTypeId AS HistTypeId,
+  lh.CreationDate AS HistCreationDate,
+  lh.RevisionGUID,
+  lh.Text AS HistText,
+  lh.Comment AS HistComment,
+  bl.RelatedPostId AS LinkedRelatedPostId,
+  bl.LinkTypeId AS LinkedTypeId,
+  ga.TagName,
+  ga.Count AS TagCount
+FROM UserActivity ua
+LEFT JOIN RankedPosts r ON r.PostId = ua.PostId
+LEFT JOIN CloseReasonCounts rr ON rr.PostId = ua.PostId
+LEFT JOIN RecentPostHistory lh ON lh.PostId = ua.PostId
+LEFT JOIN LinkedPosts bl ON bl.PostId = ua.PostId
+LEFT JOIN TagAgg ga ON ga.ExcerptPostId = ua.PostId OR ga.WikiPostId = ua.PostId
+WHERE
+  ua.Score IS NOT NULL
+  AND (ua.Views IS NULL OR ua.Views >= 0)
+ORDER BY
+  ua.UserId, ua.PostId
+LIMIT 100;

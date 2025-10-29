@@ -1,0 +1,50 @@
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id ELSE NULL END) AS TotalQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id ELSE NULL END) AS TotalAnswers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 3 THEN p.Id ELSE NULL END) AS TotalWikis,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.PostId ELSE NULL END) AS TotalUpVotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.PostId ELSE NULL END) AS TotalDownVotes,
+    COUNT(DISTINCT pl.RelatedPostId) AS TotalLinkedPosts,
+    COUNT(DISTINCT CASE WHEN bh.PostHistoryTypeId = 10 THEN bh.PostId ELSE NULL END) AS TotalClosedPosts,
+    MAX(u.CreationDate) AS LatestAccountActivity,
+    MIN(p.CreationDate) AS EarliestPost,
+    -- use standard aggregate string concatenation: order by frequency descending then name
+    -- compute tag with subquery to ensure deterministic ordering across dialects
+    (SELECT STRING_AGG(tagname, ', ' ORDER BY cnt DESC, tagname)
+     FROM (
+       SELECT t2.TagName AS tagname, COUNT(*) AS cnt
+       FROM Posts p2
+       JOIN Tags t2 ON t2.ExcerptPostId = p2.Id
+       WHERE p2.OwnerUserId = u.Id
+       GROUP BY t2.TagName
+     ) sub
+    ) AS MostFrequentTags
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+LEFT JOIN 
+    PostLinks pl ON p.Id = pl.PostId
+LEFT JOIN 
+    PostHistory bh ON p.Id = bh.PostId
+LEFT JOIN 
+    Tags t ON t.ExcerptPostId = p.Id
+WHERE 
+    u.Reputation > 1000
+    AND u.Id NOT IN (
+        SELECT DISTINCT OwnerUserId 
+        FROM Posts 
+        WHERE PostTypeId = 1 AND ClosedDate IS NOT NULL
+    )
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation, u.Location
+HAVING 
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id ELSE NULL END) > 5
+ORDER BY 
+    u.Reputation DESC, u.Location ASC;

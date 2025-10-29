@@ -1,0 +1,35 @@
+SELECT
+  u.Id AS UserId,
+  u.DisplayName AS UserDisplayName,
+  COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+  AVG(p.Score) AS AvgPostScore,
+  SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+  SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+  MAX(p.LastActivityDate) AS LastActivity,
+  COUNT(DISTINCT b.Id) AS BadgesEarned,
+  STRING_AGG(t.Name, ',') AS TopTagsEarned
+FROM
+  Users u
+LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+LEFT JOIN Badges b ON b.UserId = u.Id
+LEFT JOIN LATERAL (
+  SELECT t2.Id, t2.Name, t2.TagName
+  FROM Tags t2
+  WHERE t2.IsModeratorOnly = FALSE
+    AND EXISTS (
+      SELECT 1
+      FROM Posts p2
+      WHERE p2.OwnerUserId = u.Id
+        AND p2.Tags LIKE '%' || '<' || t2.TagName || '>' || '%'
+    )
+  LIMIT 1
+) t ON TRUE
+WHERE
+  u.Id IS NOT NULL
+GROUP BY
+  u.Id, u.DisplayName, t.Id, t.Name, t.TagName
+HAVING
+  COUNT(DISTINCT p.Id) > 0
+ORDER BY
+  TotalPostsOwned DESC, LastActivity DESC
+LIMIT 100;

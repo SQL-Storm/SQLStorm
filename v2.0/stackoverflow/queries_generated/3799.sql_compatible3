@@ -1,0 +1,201 @@
+WITH
+    ParsedTags AS (
+        SELECT
+            p.Id                         AS PostId,
+            TRIM(BOTH '<>' FROM p.Tags)  AS _trimmed_tags,
+            -- split tags into rows in a dialect-neutral way using a recursive approach
+            1 AS _pos
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+          AND p.Tags IS NOT NULL
+    ),
+    ParsedTagsExp AS (
+        -- recursive splitter: extract tag at current position between '<' and '>'
+        SELECT
+            PostId,
+            CASE
+                WHEN CHARINDEX('<', _trimmed_tags) = 0 THEN NULL
+                ELSE SUBSTRING(
+                    _trimmed_tags,
+                    CHARINDEX('<', _trimmed_tags) + 1,
+                    CASE
+                        WHEN CHARINDEX('>', _trimmed_tags, CHARINDEX('<', _trimmed_tags) + 1) = 0 THEN LEN(_trimmed_tags)
+                        ELSE CHARINDEX('>', _trimmed_tags, CHARINDEX('<', _trimmed_tags) + 1) - CHARINDEX('<', _trimmed_tags) - 1
+                    END
+                )
+            END AS Tag,
+            CASE
+                WHEN CHARINDEX('>', _trimmed_tags) = 0 THEN NULL
+                ELSE SUBSTRING(_trimmed_tags, CHARINDEX('>', _trimmed_tags) + 1, LEN(_trimmed_tags))
+            END AS rest
+        FROM ParsedTags
+        UNION ALL
+        SELECT
+            PostId,
+            CASE
+                WHEN CHARINDEX('<', rest) = 0 THEN NULL
+                ELSE SUBSTRING(
+                    rest,
+                    CHARINDEX('<', rest) + 1,
+                    CASE
+                        WHEN CHARINDEX('>', rest, CHARINDEX('<', rest) + 1) = 0 THEN LEN(rest)
+                        ELSE CHARINDEX('>', rest, CHARINDEX('<', rest) + 1) - CHARINDEX('<', rest) - 1
+                    END
+                )
+            END AS Tag,
+            CASE
+                WHEN rest IS NULL THEN NULL
+                WHEN CHARINDEX('>', rest) = 0 THEN NULL
+                ELSE SUBSTRING(rest, CHARINDEX('>', rest) + 1, LEN(rest))
+            END AS rest
+        FROM ParsedTagsExp
+        WHERE rest IS NOT NULL AND rest <> ''
+    ),
+    ParsedTagsFinal AS (
+        SELECT PostId, Tag
+        FROM ParsedTagsExp
+        WHERE Tag IS NOT NULL AND Tag <> ''
+    ),
+    TagAgg AS (
+        SELECT
+            pt.Tag,
+            COUNT(*)                                    AS QuestionCount,
+            AVG(p.Score)                                AS AvgScore,
+            SUM(p.ViewCount)                            AS TotalViews,
+            COUNT(DISTINCT p.OwnerUserId)               AS DistinctAuthors
+        FROM ParsedTagsFinal pt
+        JOIN Posts p ON p.Id = pt.PostId
+        GROUP BY pt.Tag
+    ),
+    TopTags AS (
+        SELECT
+            t.Tag,
+            t.QuestionCount,
+            t.AvgScore,
+            t.TotalViews,
+            t.DistinctAuthors,
+            ROW_NUMBER() OVER (ORDER BY t.QuestionCount DESC) AS rn
+        FROM TagAgg t
+        WHERE t.QuestionCount >= 100
+    ),
+    AnswerStats AS (
+        SELECT
+            q.Id                                 AS QuestionId,
+            COALESCE(firstAnswers.FirstAnswerId, -1) AS FirstAnswerId,
+            CASE WHEN firstAnswers.FirstAnswerId IS NULL THEN 0 ELSE 1 END AS HasAnswer,
+            COALESCE(uv.UpVoteCount, 0) AS UpVoteCount,
+            COALESCE(dv.DownVoteCount, 0) AS DownVoteCount,
+            COALESCE(voters.VoterCount, 0) AS VoterCount
+        FROM Posts q
+        LEFT JOIN (
+            SELECT a.ParentId AS QuestionId, MIN(a.CreationDate) AS minCreation
+            FROM Posts a
+            WHERE a.PostTypeId = 2
+            GROUP BY a.ParentId
+        ) fa ON fa.QuestionId = q.Id
+        LEFT JOIN Posts firstAnswers ON firstAnswers.ParentId = q.Id AND firstAnswers.CreationDate = fa.minCreation
+        LEFT JOIN (
+            SELECT PostId, SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount
+            FROM Votes
+            GROUP BY PostId
+        ) uv ON uv.PostId = q.Id
+        LEFT JOIN (
+            SELECT PostId, SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount
+            FROM Votes
+            GROUP BY PostId
+        ) dv ON dv.PostId = q.Id
+        LEFT JOIN (
+            SELECT PostId, COUNT(DISTINCT UserId) AS VoterCount
+            FROM Votes
+            WHERE VoteTypeId IN (2,3)
+            GROUP BY PostId
+        ) voters ON voters.PostId = q.Id
+        WHERE q.PostTypeId = 1
+    ),
+    UserBadgeStats AS (
+        SELECT
+            u.Id                                 AS UserId,
+            u.DisplayName,
+            u.Reputation,
+            SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+            SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+            SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+            COUNT(DISTINCT t.TagName)               AS TaggedBadges
+        FROM Users u
+        LEFT JOIN Badges b ON b.UserId = u.Id
+        LEFT JOIN Tags t
+          ON t.IsModeratorOnly = FALSE
+         AND t.IsRequired = FALSE
+         AND EXISTS (
+                SELECT 1
+                  FROM Posts p
+                 WHERE p.OwnerUserId = u.Id
+                   AND p.Tags IS NOT NULL
+                   AND p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+              )
+        GROUP BY u.Id, u.DisplayName, u.Reputation
+    ),
+    Combined AS (
+        SELECT
+            tt.Tag,
+            tt.QuestionCount,
+            tt.AvgScore,
+            tt.TotalViews,
+            tt.DistinctAuthors,
+            ub.Reputation,
+            ub.GoldBadges,
+            ub.SilverBadges,
+            ub.BronzeBadges,
+            ub.TaggedBadges,
+            CASE
+                WHEN ub.Reputation IS NULL       THEN 'No Reputation'
+                WHEN ub.Reputation < 1000        THEN 'Low Rep'
+                ELSE                                 'High Rep'
+            END AS RepCategory,
+            tt.rn
+        FROM TopTags tt
+        LEFT JOIN UserBadgeStats ub
+               ON ub.GoldBadges > 0
+              AND ub.SilverBadges > 0
+        WHERE tt.rn <= 10
+        GROUP BY
+            tt.Tag,
+            tt.QuestionCount,
+            tt.AvgScore,
+            tt.TotalViews,
+            tt.DistinctAuthors,
+            ub.Reputation,
+            ub.GoldBadges,
+            ub.SilverBadges,
+            ub.BronzeBadges,
+            ub.TaggedBadges,
+            tt.rn
+    )
+
+SELECT *
+FROM Combined
+
+UNION ALL
+
+SELECT
+    'TOTAL'                     AS Tag,
+    SUM(QuestionCount)          AS QuestionCount,
+    AVG(AvgScore)               AS AvgScore,
+    SUM(TotalViews)             AS TotalViews,
+    SUM(DistinctAuthors)        AS DistinctAuthors,
+    NULL                        AS Reputation,
+    NULL                        AS GoldBadges,
+    NULL                        AS SilverBadges,
+    NULL                        AS BronzeBadges,
+    NULL                        AS TaggedBadges,
+    NULL                        AS RepCategory,
+    NULL                        AS rn
+FROM Combined
+
+EXCEPT
+
+SELECT
+    Tag, QuestionCount, AvgScore, TotalViews, DistinctAuthors, Reputation, GoldBadges, SilverBadges, BronzeBadges, TaggedBadges, RepCategory, rn
+FROM Combined
+
+ORDER BY QuestionCount DESC NULLS LAST;

@@ -1,0 +1,135 @@
+-- {"query": "2989.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1764} 
+with RecursiveTagHierarchy as (
+    -- Recursive CTE to find tag hierarchy where IsRequired = true
+    select Id, TagName, ExcerptPostId, WikiPostId, IsModeratorOnly, IsRequired, cast(TagName as varchar(350)) as FullPath, 1 as Depth
+    from Tags
+    where IsRequired = 1
+    union all
+    select t.Id, t.TagName, t.ExcerptPostId, t.WikiPostId, t.IsModeratorOnly, t.IsRequired,
+           r.FullPath || ' > ' || t.TagName, r.Depth + 1
+    from Tags t
+    join RecursiveTagHierarchy r on substring(t.TagName, 1, 1) = 'p' and t.IsRequired = 1 -- arbitrary join condition to force recursion, won't add new rows if condition blocks
+    where r.Depth < 3
+),
+UserPostStats as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        coalesce(sum(p.Score), 0) as TotalPostScore,
+        coalesce(sum(vc.UpVotes), 0) as UserUpVotes,
+        coalesce(sum(vd.DownVotes), 0) as UserDownVotes,
+        -- ratio of upvotes to downvotes, null safe
+        case when sum(vd.DownVotes) = 0 then null 
+             else round(cast(sum(vc.UpVotes) as numeric) / nullif(sum(vd.DownVotes), 0), 2) 
+        end as VoteRatio,
+        -- latest post date
+        max(p.CreationDate) as LastPostDate,
+        -- Days since creation till last access
+        extract(day from (u.LastAccessDate - u.CreationDate)) as DaysActive
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join (
+        select PostId, count(*) as UpVotes from Votes where VoteTypeId = 2 group by PostId
+    ) vc on vc.PostId = p.Id
+    left join (
+        select PostId, count(*) as DownVotes from Votes where VoteTypeId = 3 group by PostId
+    ) vd on vd.PostId = p.Id
+    group by u.Id, u.DisplayName, u.LastAccessDate, u.CreationDate
+),
+RecentPostHistorySummary as (
+    select ph.PostId, ph.PostHistoryTypeId, count(*) as EditCount, 
+           min(ph.CreationDate) as FirstEditDate,
+           max(ph.CreationDate) as LastEditDate
+    from PostHistory ph
+    where ph.CreationDate > current_date - interval '60 days'
+    group by ph.PostId, ph.PostHistoryTypeId
+),
+TopTags as (
+    select TagName, Count,
+        row_number() over (order by Count desc) as Rank
+    from Tags
+    where TagName is not null
+),
+QuestionsWithExtras as (
+    select p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount,
+           p.AnswerCount, p.CommentCount, p.FavoriteCount, p.AcceptedAnswerId, p.Tags,
+           strpos(lower(p.Title), 'sql') > 0 as TitleContainsSQL,
+           -- Count of linking duplicates
+           (select count(*) from PostLinks pl where pl.PostId = p.Id and pl.LinkTypeId = 3) as DuplicateCount,
+           -- Is question closed (exists a close history entry)
+           exists (
+             select 1 from PostHistory ph 
+             where ph.PostId = p.Id and ph.PostHistoryTypeId = 10
+           ) as IsClosed,
+           -- Count of distinct users answering the question
+           (select count(distinct a.OwnerUserId) from Posts a where a.ParentId = p.Id and a.PostTypeId = 2 and a.OwnerUserId is not null) as DistinctAnswerers
+    from Posts p
+    where p.PostTypeId = 1
+),
+UserBadgeAgg as (
+    select b.UserId, count(*) filter (where Class = 1) as GoldBadges,
+                    count(*) filter (where Class = 2) as SilverBadges,
+                    count(*) filter (where Class = 3) as BronzeBadges,
+                    count(distinct case when TagBased = 1 then Name else null end) as DistinctTagBadges
+    from Badges b
+    group by b.UserId
+),
+ScoreWindow as (
+    select PostId, Score,
+           dense_rank() over (partition by PostTypeId order by Score desc) as ScoreRank
+    from Posts
+    where PostTypeId in (1,2)
+),
+QualifiedAnswers as (
+    select a.Id as AnswerId, a.ParentId as QuestionId, a.OwnerUserId as AnswerUserId,
+           a.CreationDate as AnswerCreationDate, a.Score as AnswerScore,
+           row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as RankByScore
+    from Posts a
+    where a.PostTypeId = 2
+),
+QuestionsWithTopAnswer as (
+    select q.Id, q.Title, q.OwnerUserId, q.CreationDate, q.Score, q.ViewCount, q.Tags,
+           qa.AnswerId as TopAnswerId, qa.AnswerScore, qa.AnswerCreationDate, qa.AnswerUserId
+    from QuestionsWithExtras q
+    left join QualifiedAnswers qa on qa.QuestionId = q.Id and qa.RankByScore = 1
+    where q.IsClosed = false and q.DuplicateCount < 3 and q.TitleContainsSQL = true
+),
+AvgScorePerUser as (
+    select OwnerUserId, avg(Score) as AvgAnswerScore, count(*) as AnswerCount
+    from Posts
+    where PostTypeId = 2
+    group by OwnerUserId
+),
+FinalAggregates as (
+    select u.Id as UserId, u.DisplayName,
+           up.QuestionCount, up.AnswerCount, up.TotalPostScore,
+           ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges, ub.DistinctTagBadges,
+           avgScore.AvgAnswerScore, avgScore.AnswerCount as UserAnswerCount,
+           u.Reputation,
+           -- Composite popularity score (artificial complex expression)
+           ((up.TotalPostScore::float / nullif(up.AnswerCount + up.QuestionCount, 0)) * 0.4 +
+            coalesce(ub.GoldBadges,0)*3 + coalesce(ub.SilverBadges,0)*2 + coalesce(ub.BronzeBadges, 0)*1) * 
+            log(nullif(u.Reputation, 1))::float as PopularityScore
+    from Users u
+    left join UserPostStats up on up.UserId = u.Id
+    left join UserBadgeAgg ub on ub.UserId = u.Id
+    left join AvgScorePerUser avgScore on avgScore.OwnerUserId = u.Id
+    where u.Reputation > 1000
+)
+select fa.UserId, fa.DisplayName, fa.Reputation, fa.QuestionCount, fa.AnswerCount, fa.TotalPostScore,
+       fa.GoldBadges, fa.SilverBadges, fa.BronzeBadges, fa.DistinctTagBadges,
+       fa.AvgAnswerScore, fa.UserAnswerCount, round(fa.PopularityScore,2) as PopularityScore,
+       qt.Title as SampleQuestionTitle,
+       qt.AnswerScore as TopAnswerScore,
+       rph.EditCount as RecentEditCount,
+       rph.FirstEditDate, rph.LastEditDate,
+       rh.FullPath as RequiredTagPath
+from FinalAggregates fa
+left join QuestionsWithTopAnswer qt on qt.OwnerUserId = fa.UserId
+left join RecentPostHistorySummary rph on rph.PostId = qt.Id and rph.PostHistoryTypeId = 5
+left join (select distinct FullPath, TagName from RecursiveTagHierarchy) rh on rh.TagName = substring(qt.Tags from '<([^>]+)>')
+where fa.PopularityScore is not null
+order by fa.PopularityScore desc, fa.UserId
+limit 100;

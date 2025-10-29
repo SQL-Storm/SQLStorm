@@ -1,0 +1,97 @@
+WITH recent_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.Body,
+    p.ContentLicense,
+    u.Reputation AS UserReputation,
+    u.DisplayName AS UserDisplayName,
+    u.Location AS UserLocation,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id) AS BadgeCount
+  FROM Posts p
+  JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+),
+tag_burst AS (
+  SELECT
+    t.TagName,
+    t.Count,
+    t.IsModeratorOnly,
+    t.IsRequired,
+    CASE WHEN t.Count > 100 THEN 'HOT' ELSE 'WARM' END AS BurstLabel
+  FROM Tags t
+  WHERE t.Count >= 50
+),
+polygon AS (
+  SELECT
+    p1.Id AS PostId,
+    p1.Title AS PostTitle,
+    p1.Tags AS PostTags,
+    p2.Id AS RelatedPostId,
+    p2.Title AS RelatedPostTitle,
+    p2.Tags AS RelatedPostTags,
+    p1.Score - COALESCE(p2.Score, 0) AS ScoreDelta,
+    p1.ViewCount - COALESCE(p2.ViewCount, 0) AS ViewDelta,
+    ROW_NUMBER() OVER (PARTITION BY p1.Id ORDER BY (p1.Score - COALESCE(p2.Score,0)) DESC) AS rn
+  FROM Posts p1
+  LEFT JOIN PostLinks pl ON pl.PostId = p1.Id AND pl.LinkTypeId = 3
+  LEFT JOIN Posts p2 ON pl.RelatedPostId = p2.Id
+  WHERE p1.PostTypeId = 1
+    AND p1.CreationDate < cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '7 days'
+),
+correlated_notes AS (
+  SELECT
+    q.PostId,
+    q.PostTitle,
+    q.PostTags,
+    q.PostId % 5 AS mod_group,
+    (SELECT AVG(v.BountyAmount) FROM Votes v WHERE v.PostId = q.PostId AND v.BountyAmount IS NOT NULL) AS AvgBounty
+  FROM recent_questions q
+),
+window_stats AS (
+  SELECT
+    rp.PostId,
+    rp.PostTitle,
+    rp.PostTags,
+    rp.Score,
+    rp.ViewCount,
+    rp.OwnerUserId,
+    ROW_NUMBER() OVER (PARTITION BY rp.OwnerUserId ORDER BY rp.Score DESC) AS rank_by_user,
+    DENSE_RANK() OVER (ORDER BY rp.Score DESC) AS DENSE_RIFT
+  FROM recent_questions rp
+),
+set_ops AS (
+  SELECT PostId, PostTitle FROM recent_questions
+  UNION ALL
+  SELECT PostId, RelatedPostTitle AS PostTitle FROM polygon WHERE rn = 1
+)
+SELECT
+  ro.PostId,
+  ro.PostTitle,
+  ro.PostTags,
+  COALESCE(cn.AvgBounty, 0) AS AvgBounty,
+  cn.mod_group,
+  ws.rank_by_user,
+  ws.DENSE_RIFT,
+  wb.BurstLabel,
+  wb.IsModeratorOnly
+FROM correlated_notes cn
+JOIN window_stats ws ON ws.PostId = cn.PostId
+LEFT JOIN tag_burst wb ON wb.TagName = ANY(string_to_array(REPLACE(REPLACE(cn.PostTags, '<',''), '>', ''), ','))
+LEFT JOIN set_ops ro ON ro.PostId = cn.PostId
+LEFT JOIN (
+  SELECT DISTINCT ON (PostId) PostId, AvgBounty
+  FROM Votes
+  WHERE BountyAmount IS NOT NULL
+  ORDER BY PostId, CreationDate DESC
+) wb2 ON wb2.PostId = cn.PostId;

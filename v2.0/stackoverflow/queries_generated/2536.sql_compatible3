@@ -1,0 +1,177 @@
+with RecursiveBadgeCte as (
+    select
+        b.UserId,
+        b.Name as BadgeName,
+        b.Class,
+        b.Date,
+        row_number() over (partition by b.UserId order by b.Date) as BadgeRank
+    from Badges b
+    where b.TagBased = false
+),
+LatestUserDesc as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Location,
+        u.AboutMe,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as TotalQuestions,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as TotalAnswers,
+        max(case when p.PostTypeId in (1,2) then p.Score end) as MaxPostScore,
+        avg(case when p.PostTypeId in (1,2) then p.Score end) as AvgPostScore,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as TotalUpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as TotalDownVotes,
+        min(coalesce(ph.CreationDate, u.CreationDate)) as FirstActivityDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Votes v on v.PostId = p.Id
+    left join PostHistory ph on ph.PostId = p.Id and ph.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Location, u.AboutMe
+), UserBadgeRanks as (
+    select
+        l.UserId,
+        l.DisplayName,
+        l.Reputation,
+        l.TotalQuestions,
+        l.TotalAnswers,
+        l.MaxPostScore,
+        l.AvgPostScore,
+        l.TotalUpVotes,
+        l.TotalDownVotes,
+        l.FirstActivityDate,
+        b.BadgeName,
+        b.Class as BadgeClass,
+        b.Date as BadgeDate,
+        b.BadgeRank
+    from LatestUserDesc l
+    left join RecursiveBadgeCte b on l.UserId = b.UserId
+), QuestionAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionCreationDate,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViews,
+        q.OwnerUserId,
+        count(a.Id) as AnswerCount,
+        max(a.Score) as MaxAnswerScore,
+        avg(a.Score) as AvgAnswerScore,
+        string_agg(distinct t.TagName, ',' order by t.TagName) as TagsAggregated
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join (
+        select
+            -- extract individual tag names from Tags like '<tag1><tag2>'
+            regexp_split_to_table(substring(Tags from 2 for char_length(Tags) - 2), '><') as TagName,
+            Id
+        from Posts
+        where PostTypeId = 1
+    ) t on q.Id = t.Id
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount, q.OwnerUserId
+), QuestionLinkSummary as (
+    select
+        pl.PostId,
+        sum(case when pl.LinkTypeId = 1 then 1 else 0 end) as LinkedCount,
+        sum(case when pl.LinkTypeId = 3 then 1 else 0 end) as DuplicateCount,
+        count(*) as TotalLinks
+    from PostLinks pl
+    group by pl.PostId
+), PostCloseInfo as (
+    select
+        ph.PostId,
+        max(case when ph.PostHistoryTypeId = 10 then ph.CreationDate else null end) as CloseDate,
+        max(case when ph.PostHistoryTypeId = 11 then ph.CreationDate else null end) as ReopenDate,
+        max(case when ph.PostHistoryTypeId = 10 and trim(ph.Comment) <> '' then cast(trim(ph.Comment) as integer) else null end) as CloseReasonId
+    from PostHistory ph
+    group by ph.PostId
+), WindowedUserRanking as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        row_number() over (order by u.Reputation desc, u.Id) as ReputationRank,
+        dense_rank() over (partition by coalesce(u.Location, 'Unknown') order by u.Reputation desc) as LocationRepRank,
+        count(*) over (partition by coalesce(u.Location, 'Unknown')) as LocationUserCount
+    from Users u
+    where u.Reputation is not null
+)
+select
+    qas.QuestionId,
+    qas.Title,
+    qas.QuestionCreationDate,
+    qas.QuestionScore,
+    qas.QuestionViews,
+    coalesce(u.DisplayName, 'anonymous') as QuestionOwner,
+    u.Reputation as OwnerReputation,
+    qas.AnswerCount,
+    qas.MaxAnswerScore,
+    round(coalesce(qas.AvgAnswerScore,0),2) as AvgAnswerScore,
+    qls.LinkedCount,
+    qls.DuplicateCount,
+    qls.TotalLinks,
+    pci.CloseDate,
+    pci.ReopenDate,
+    crt.Name as CloseReasonName,
+    ub.BadgeName,
+    ub.BadgeClass,
+    ub.BadgeDate,
+    wur.LocationRepRank,
+    wur.LocationUserCount,
+    coalesce(nullif(u.Location, ''), 'Unknown') as UserLocation,
+    concat(substr(qas.Title, 1, 50), ' - Tags: ', coalesce(qas.TagsAggregated, 'None')) as TitleWithTags,
+    case
+        when qas.QuestionScore > 0 and qas.AnswerCount > 0 then
+            (qas.QuestionScore * 1.0) / qas.AnswerCount + coalesce(qas.AvgAnswerScore, 0) + coalesce(u.Reputation, 0) / 1000.0
+        else 0 end as CompositeScore,
+    (
+        select count(distinct a.OwnerUserId)
+        from Posts a
+        where a.ParentId = qas.QuestionId and a.PostTypeId = 2 and a.OwnerUserId is not null
+    ) as DistinctAnswerUsers,
+    rank() over (order by qas.QuestionScore desc) as QuestionScoreRank
+from QuestionAnswerStats qas
+left join Users u on u.Id = qas.OwnerUserId
+left join QuestionLinkSummary qls on qls.PostId = qas.QuestionId
+left join PostCloseInfo pci on pci.PostId = qas.QuestionId
+left join CloseReasonTypes crt on crt.Id = pci.CloseReasonId
+left join (
+    select ub1.UserId, ub1.BadgeName, ub1.BadgeClass, ub1.Date as BadgeDate
+    from RecursiveBadgeCte ub1
+    where ub1.BadgeRank = 1
+) ub on ub.UserId = qas.OwnerUserId
+left join WindowedUserRanking wur on wur.Id = qas.OwnerUserId
+where qas.QuestionScore > -5
+and (
+    pci.CloseDate is null or (pci.ReopenDate is not null and pci.ReopenDate > pci.CloseDate)
+)
+group by
+    qas.QuestionId,
+    qas.Title,
+    qas.QuestionCreationDate,
+    qas.QuestionScore,
+    qas.QuestionViews,
+    u.DisplayName,
+    u.Reputation,
+    qas.AnswerCount,
+    qas.MaxAnswerScore,
+    qas.AvgAnswerScore,
+    qls.LinkedCount,
+    qls.DuplicateCount,
+    qls.TotalLinks,
+    pci.CloseDate,
+    pci.ReopenDate,
+    crt.Name,
+    ub.BadgeName,
+    ub.BadgeClass,
+    ub.BadgeDate,
+    wur.LocationRepRank,
+    wur.LocationUserCount,
+    u.Location,
+    qas.TagsAggregated,
+    qas.Title,
+    qas.QuestionScore
+order by CompositeScore desc, qas.QuestionCreationDate desc
+limit 100;

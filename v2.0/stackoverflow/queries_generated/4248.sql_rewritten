@@ -1,0 +1,110 @@
+-- {"query": "4248.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1472} 
+WITH RankedPostEdits AS (
+    SELECT
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.UserId,
+        ph.CreationDate,
+        p.OwnerUserId AS OriginalOwnerUserId,
+        p.Title AS OriginalTitle,
+        ROW_NUMBER() OVER(PARTITION BY ph.PostId, ph.PostHistoryTypeId ORDER BY ph.CreationDate DESC) as rn
+    FROM PostHistory ph
+    JOIN Posts p ON ph.PostId = p.Id
+    WHERE ph.PostHistoryTypeId IN (4, 7) -- Edit Title, Rollback Title
+),
+PostEditComparison AS (
+    SELECT
+        r1.PostId,
+        r1.CreationDate AS EditDate,
+        r1.UserId AS EditorUserId,
+        r1.OriginalTitle AS TitleBeforeEdit,
+        r2.OriginalTitle AS TitleAfterEdit,
+        CASE
+            WHEN r1.OriginalTitle IS NULL AND r2.OriginalTitle IS NOT NULL THEN 'Added'
+            WHEN r1.OriginalTitle IS NOT NULL AND r2.OriginalTitle IS NULL THEN 'Removed'
+            WHEN r1.OriginalTitle <> r2.OriginalTitle THEN 'Changed'
+            ELSE 'Unchanged'
+        END AS TitleChangeStatus,
+        COALESCE(u.DisplayName, 'Unknown User') AS EditorDisplayName
+    FROM RankedPostEdits r1
+    JOIN RankedPostEdits r2 ON r1.PostId = r2.PostId AND r1.rn = 2 AND r2.rn = 1 -- Compare consecutive edits
+    LEFT JOIN Users u ON r1.UserId = u.Id
+    WHERE r1.PostHistoryTypeId = 4 AND r2.PostHistoryTypeId = 7 -- Edit followed by Rollback (for comparison of rollback effect)
+    UNION ALL
+    SELECT
+        r.PostId,
+        r.CreationDate AS EditDate,
+        r.UserId AS EditorUserId,
+        LEAD(r.OriginalTitle, 1, '---') OVER(PARTITION BY r.PostId ORDER BY r.CreationDate) AS TitleBeforeEdit,
+        r.OriginalTitle AS TitleAfterEdit,
+        CASE
+            WHEN LEAD(r.OriginalTitle, 1, '---') OVER(PARTITION BY r.PostId ORDER BY r.CreationDate) IS NULL AND r.OriginalTitle IS NOT NULL THEN 'Initial'
+            WHEN LEAD(r.OriginalTitle, 1, '---') OVER(PARTITION BY r.PostId ORDER BY r.CreationDate) <> r.OriginalTitle THEN 'Changed'
+            ELSE 'Unchanged'
+        END AS TitleChangeStatus,
+        COALESCE(u.DisplayName, 'Unknown User') AS EditorDisplayName
+    FROM RankedPostEdits r
+    LEFT JOIN Users u ON r.UserId = u.Id
+    WHERE r.rn = 1 -- Current state of the title after edits/rollbacks
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS QuestionCount,
+        COUNT(DISTINCT a.Id) AS AnswerCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadgeCount,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadgeCount,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadgeCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+    LEFT JOIN Posts a ON u.Id = a.OwnerUserId AND a.PostTypeId = 2
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName
+)
+SELECT
+    p.Id AS PostId,
+    p.Title,
+    pt.Name AS PostTypeName,
+    pc.EditorDisplayName,
+    pc.EditDate,
+    pc.TitleBeforeEdit,
+    pc.TitleAfterEdit,
+    pc.TitleChangeStatus,
+    ua.DisplayName AS OriginalOwnerDisplayName,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.UpVoteCount,
+    ua.DownVoteCount,
+    ua.GoldBadgeCount,
+    ua.SilverBadgeCount,
+    ua.BronzeBadgeCount,
+    COALESCE(cp.CommentCount, 0) AS TotalComments,
+    CASE
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+        ELSE 'Open'
+    END AS PostStatus,
+    NULLIF(p.FavoriteCount, 0) AS FavoriteCount,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3) AS DuplicateLinkCount
+FROM Posts p
+JOIN PostTypes pt ON p.PostTypeId = pt.Id
+LEFT JOIN PostEditComparison pc ON p.Id = pc.PostId
+LEFT JOIN UserActivity ua ON p.OwnerUserId = ua.UserId
+LEFT JOIN (
+    SELECT PostId, COUNT(*) AS CommentCount
+    FROM Comments
+    GROUP BY PostId
+) cp ON p.Id = cp.PostId
+WHERE p.CreationDate BETWEEN '2023-01-01' AND '2023-12-31'
+  AND p.Score > 10
+  AND (p.Title LIKE '%SQL%' OR p.Tags LIKE '%<sql>%' OR p.Body ILIKE '%SQL%')
+GROUP BY
+    p.Id, p.Title, pt.Name, pc.EditorDisplayName, pc.EditDate, pc.TitleBeforeEdit, pc.TitleAfterEdit, pc.TitleChangeStatus,
+    ua.DisplayName, ua.QuestionCount, ua.AnswerCount, ua.UpVoteCount, ua.DownVoteCount, ua.GoldBadgeCount, ua.SilverBadgeCount, ua.BronzeBadgeCount,
+    cp.CommentCount, p.ClosedDate, p.FavoriteCount
+HAVING COUNT(pc.PostId) > 0 OR p.Id IN (SELECT PostId FROM PostHistory WHERE PostHistoryTypeId IN (4, 7)) -- Ensure we only consider posts with edits or are candidates for comparison
+ORDER BY p.LastActivityDate DESC
+LIMIT 100;

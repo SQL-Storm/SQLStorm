@@ -1,0 +1,83 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.Title,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.OwnerUserId,
+        U.DisplayName,
+        U.Reputation,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.ViewCount DESC) AS rank
+    FROM 
+        Posts P
+    JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId IN (1, 2) AND P.Score > 0
+),
+BadgeCounts AS (
+    SELECT 
+        U.Id AS UserId,
+        COUNT(DISTINCT B.Id) AS BadgeCount
+    FROM 
+        Users U
+    JOIN 
+        Badges B ON U.Id = B.UserId
+    WHERE 
+        B.Class = 1 AND B.Date >= DATE '2024-10-01' - INTERVAL '1' YEAR
+    GROUP BY 
+        U.Id
+),
+PostTags AS (
+    -- normalize Tags string like '<tag1><tag2>' into one tag per row
+    SELECT
+        P.Id AS PostId,
+        TRIM(BOTH '<>' FROM UNNEST(STRING_TO_ARRAY(P.Tags, '><'))) AS Tag
+    FROM Posts P
+)
+SELECT 
+    RP.Id, 
+    RP.Title,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.rank,
+    U.DisplayName,
+    U.Reputation,
+    COALESCE(BC.BadgeCount, 0) AS BadgeCount,
+    SUM(V.Score) OVER (PARTITION BY RP.Id ORDER BY V.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cumulative_score,
+    CASE 
+        WHEN RP.rank <= 3 THEN 'Top'
+        WHEN RP.rank <= 10 THEN 'High'
+        ELSE 'Low'
+    END AS rank_category
+FROM 
+    RankedPosts RP
+LEFT JOIN 
+    Users U ON RP.OwnerUserId = U.Id
+LEFT JOIN 
+    BadgeCounts BC ON RP.OwnerUserId = BC.UserId
+LEFT JOIN 
+    Votes V ON RP.Id = V.PostId
+WHERE 
+    EXISTS (
+        SELECT 1
+        FROM PostTags PT
+        WHERE PT.PostId = RP.Id
+          AND PT.Tag IN ('SQL', 'Performance', 'Benchmarking')
+    )
+GROUP BY
+    RP.Id,
+    RP.Title,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.rank,
+    RP.OwnerUserId,
+    U.DisplayName,
+    U.Reputation,
+    BC.BadgeCount
+ORDER BY 
+    RP.rank, 
+    cumulative_score DESC;

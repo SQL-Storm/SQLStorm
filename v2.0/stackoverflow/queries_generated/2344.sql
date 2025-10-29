@@ -1,0 +1,140 @@
+-- {"query": "2344.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1536} 
+
+with RecursiveUserActivity AS (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        count(p.Id) FILTER (WHERE p.PostTypeId = 1) as QuestionCount,
+        count(p.Id) FILTER (WHERE p.PostTypeId = 2) as AnswerCount,
+        coalesce(sum(p.Score),0) as TotalPostScore,
+        coalesce(sum(vtUp.VoteCount),0) as UpVotesReceived,
+        coalesce(sum(vtDown.VoteCount),0) as DownVotesReceived,
+        row_number() over (order by u.Reputation desc, u.LastAccessDate desc) as RankByReputation
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join (
+        select PostId, count(*) as VoteCount 
+        from Votes 
+        where VoteTypeId = 2 -- UpMod
+        group by PostId
+    ) vtUp on vtUp.PostId = p.Id
+    left join (
+        select PostId, count(*) as VoteCount 
+        from Votes 
+        where VoteTypeId = 3 -- DownMod
+        group by PostId
+    ) vtDown on vtDown.PostId = p.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+TopActivePosts AS (
+    select
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        p.PostTypeId,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc) as PostRank
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId in (1,2) and p.Score > 0
+),
+CloseVoteAggregation AS (
+    select
+        ph.PostId,
+        count(*) filter (where ph.PostHistoryTypeId = 10) as CloseVotes,
+        count(*) filter (where ph.PostHistoryTypeId = 11) as ReopenVotes,
+        array_agg(distinct crt.Name) filter (where ph.PostHistoryTypeId = 10) as CloseReasons
+    from PostHistory ph
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int) 
+    group by ph.PostId
+),
+UserBadgeStats AS (
+    select
+        b.UserId,
+        count(*) filter (where b.Class = 1) as GoldBadges,
+        count(*) filter (where b.Class = 2) as SilverBadges,
+        count(*) filter (where b.Class = 3) as BronzeBadges,
+        count(distinct b.Date) as BadgeAwardDays,
+        min(b.Date) as FirstBadgeDate,
+        max(b.Date) as LastBadgeDate
+    from Badges b
+    group by b.UserId
+),
+UserPostAgg AS (
+    select
+        u.Id as UserId,
+        count(p.Id) as TotalPosts,
+        avg(p.Score) as AvgPostScore,
+        max(p.Score) as MaxPostScore,
+        min(p.Score) as MinPostScore,
+        sum(p.FavoriteCount) as TotalFavorites,
+        sum(case when p.ClosedDate is not null then 1 else 0 end) as ClosedPostsCount,
+        bool_or(p.CommunityOwnedDate is not null) as HasCommunityOwnedPost
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id
+)
+select
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.TotalPostScore,
+    ua.UpVotesReceived,
+    ua.DownVotesReceived,
+    coalesce(ubs.GoldBadges,0) as GoldBadges,
+    coalesce(ubs.SilverBadges,0) as SilverBadges,
+    coalesce(ubs.BronzeBadges,0) as BronzeBadges,
+    upa.TotalPosts,
+    upa.AvgPostScore,
+    upa.MaxPostScore,
+    upa.MinPostScore,
+    upa.TotalFavorites,
+    upa.ClosedPostsCount,
+    upa.HasCommunityOwnedPost,
+    cap.CloseVotes,
+    cap.ReopenVotes,
+    cap.CloseReasons,
+    array_agg(distinct tp.Title || ' (' || tp.Score || ' score, views: ' || tp.ViewCount || ')') filter (where tp.PostRank <= 3) as TopPostsSummary,
+    -- Calculate user active period in days; if null LastAccessDate use current_date
+    coalesce(date_part('epoch', ua.LastAccessDate - ua.CreationDate)/86400, 0) as ActiveDays,
+    -- Posts per day
+    case when coalesce(date_part('epoch', ua.LastAccessDate - ua.CreationDate)/86400,0) > 0 
+        then round(upa.TotalPosts / (date_part('epoch', ua.LastAccessDate - ua.CreationDate)/86400)::numeric, 3)
+        else null
+    end as PostsPerDay,
+    -- A complex score combining various factors with null-safe logic and string concatenations
+    (
+        0.5 * ua.Reputation + 
+        2.0 * coalesce(ubs.GoldBadges,0) * 100 + 
+        1.5 * coalesce(ubs.SilverBadges,0) * 25 + 
+        1.0 * coalesce(ubs.BronzeBadges,0) * 10 + 
+        0.1 * coalesce(ua.TotalPostScore, 0) + 
+        0.05 * coalesce(cap.CloseVotes, 0) * -10 + 
+        0.1 * coalesce(ua.UpVotesReceived,0) +
+        coalesce(upa.TotalFavorites, 0) * 0.15
+    ) as PerformanceIndex
+from RecursiveUserActivity ua
+left join UserBadgeStats ubs on ubs.UserId = ua.UserId
+left join UserPostAgg upa on upa.UserId = ua.UserId
+left join CloseVoteAggregation cap on cap.PostId = (
+    select p.Id from Posts p where p.OwnerUserId = ua.UserId and p.PostTypeId = 1 order by p.Score desc limit 1
+)
+left join TopActivePosts tp on tp.OwnerUserId = ua.UserId
+group by
+    ua.UserId, ua.DisplayName, ua.Reputation, ua.QuestionCount, ua.AnswerCount, ua.TotalPostScore,
+    ua.UpVotesReceived, ua.DownVotesReceived,
+    ubs.GoldBadges, ubs.SilverBadges, ubs.BronzeBadges,
+    upa.TotalPosts, upa.AvgPostScore, upa.MaxPostScore, upa.MinPostScore, upa.TotalFavorites, upa.ClosedPostsCount, upa.HasCommunityOwnedPost,
+    cap.CloseVotes, cap.ReopenVotes, cap.CloseReasons,
+    ua.CreationDate, ua.LastAccessDate
+order by PerformanceIndex desc NULLS LAST
+limit 50;

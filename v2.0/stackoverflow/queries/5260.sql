@@ -1,0 +1,156 @@
+WITH
+recent_posts AS (
+  SELECT
+    p.Id,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.AcceptedAnswerId,
+    p.ParentId,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ContentLicense
+  FROM Posts p
+  WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days'
+),
+hot_tags AS (
+  SELECT
+    t.TagName,
+    SUM(p.Score) AS score_sum,
+    COUNT(*) AS post_count
+  FROM Posts p
+  CROSS JOIN LATERAL (
+    SELECT TRIM(BOTH '<>' FROM tag) AS TagName
+    FROM UNNEST(string_to_array(p.Tags, '><')) AS u(tag)
+  ) t
+  WHERE p.PostTypeId = 1
+    AND t.TagName <> ''
+  GROUP BY t.TagName
+  ORDER BY score_sum DESC NULLS LAST
+  LIMIT 50
+),
+tag_popularity AS (
+  SELECT
+    ht.TagName,
+    ht.score_sum,
+    ht.post_count,
+    RANK() OVER (ORDER BY ht.score_sum DESC) AS popularity_rank
+  FROM hot_tags ht
+),
+complex_derived AS (
+  SELECT
+    rp.Id AS PostId,
+    rp.Title,
+    rp.CreationDate,
+    rp.LastActivityDate,
+    rp.Score,
+    rp.ViewCount,
+    rp.OwnerUserId,
+    COALESCE(u.Reputation, 0) AS OwnerReputation,
+    u.DisplayName AS OwnerDisplayName,
+    COALESCE(rp.CommentCount, 0) AS CommentCount,
+    COALESCE(rp.FavoriteCount, 0) AS FavoriteCount,
+    (EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - rp.CreationDate)) / 3600) AS hours_since_creation,
+    CASE WHEN rp.OwnerUserId IS NOT NULL THEN TRUE ELSE FALSE END AS IsAnsweredPossible
+  FROM recent_posts rp
+  LEFT JOIN Users u ON rp.OwnerUserId = u.Id
+  ORDER BY rp.LastActivityDate DESC
+  LIMIT 200
+),
+correlated AS (
+  SELECT
+    c.PostId,
+    c.Title,
+    c.CreationDate,
+    c.LastActivityDate,
+    c.Score,
+    c.ViewCount,
+    c.OwnerUserId,
+    c.OwnerReputation,
+    c.OwnerDisplayName,
+    c.CommentCount,
+    c.FavoriteCount,
+    c.hours_since_creation,
+    c.IsAnsweredPossible,
+    vt.VoteTypeId
+  FROM complex_derived c
+  LEFT JOIN Votes vt ON vt.PostId = c.PostId
+  WHERE vt.VoteTypeId IN (2, 3)
+),
+windowed AS (
+  SELECT
+    c.PostId,
+    c.Title,
+    c.CreationDate,
+    c.LastActivityDate,
+    c.Score,
+    c.ViewCount,
+    c.OwnerUserId,
+    c.OwnerReputation,
+    c.OwnerDisplayName,
+    c.CommentCount,
+    c.FavoriteCount,
+    c.hours_since_creation,
+    c.IsAnsweredPossible,
+    c.VoteTypeId,
+    ROW_NUMBER() OVER (PARTITION BY c.OwnerUserId ORDER BY c.LastActivityDate DESC) AS rn_by_author
+  FROM correlated c
+),
+final AS (
+  SELECT
+    w.PostId,
+    w.Title,
+    w.LastActivityDate,
+    w.Score,
+    w.ViewCount,
+    w.OwnerUserId,
+    w.OwnerDisplayName,
+    w.CommentCount,
+    w.FavoriteCount,
+    w.hours_since_creation,
+    w.IsAnsweredPossible,
+    wt.TagName,
+    wt.score_sum,
+    wt.post_count,
+    wt.popularity_rank
+  FROM windowed w
+  LEFT JOIN (
+    SELECT
+      TagName,
+      score_sum,
+      post_count,
+      popularity_rank
+    FROM tag_popularity
+  ) wt ON TRUE
+  WHERE w.rn_by_author = 1
+  ORDER BY w.LastActivityDate DESC, w.Score DESC
+  LIMIT 100
+)
+SELECT
+  f.PostId,
+  f.Title,
+  f.LastActivityDate,
+  f.Score,
+  f.ViewCount,
+  f.OwnerUserId,
+  f.OwnerDisplayName,
+  f.CommentCount,
+  f.FavoriteCount,
+  f.hours_since_creation,
+  f.IsAnsweredPossible,
+  COALESCE(t.TagName, 'untagged') AS TopTag,
+  t.score_sum AS TagScoreTotal,
+  t.post_count AS TagPostCount,
+  t.popularity_rank AS TagPopularityRank
+FROM final f
+LEFT JOIN LATERAL (
+  SELECT tp.TagName, tp.score_sum, tp.post_count, tp.popularity_rank
+  FROM tag_popularity tp
+  ORDER BY tp.popularity_rank ASC
+  LIMIT 1
+) t ON TRUE;

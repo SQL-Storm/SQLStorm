@@ -1,0 +1,112 @@
+-- {"query": "3059.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2368} 
+
+/*  Performance‑benchmarking query for the StackOverflow schema  */
+WITH
+/* 1️⃣ Badge aggregation per user */
+UserBadgeCounts AS (
+    SELECT
+        u.Id                                 AS UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1)  AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2)  AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3)  AS BronzeBadges,
+        COUNT(*)                             AS TotalBadges,
+        SUM(CASE WHEN b.TagBased = 1 THEN 1 ELSE 0 END) AS TagBasedBadges
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id
+),
+
+/* 2️⃣ Post statistics per user */
+UserPostAggregates AS (
+    SELECT
+        p.OwnerUserId                         AS UserId,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS Questions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS Answers,
+        SUM(COALESCE(p.ViewCount,0))          AS TotalViews,
+        SUM(COALESCE(p.Score,0))              AS TotalScore,
+        MAX(p.CreationDate)                  AS LastPostDate,
+        MIN(p.CreationDate)                  AS FirstPostDate
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+
+/* 3️⃣ Vote actions performed by each user */
+UserVoteStats AS (
+    SELECT
+        v.UserId                                            AS UserId,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 2)            AS UpVotesGiven,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 3)            AS DownVotesGiven,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 5)            AS FavoritesGiven,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 8)            AS BountiesStarted,
+        SUM(CASE WHEN v.VoteTypeId = 8 THEN v.BountyAmount ELSE 0 END) AS BountyAmountSpent
+    FROM Votes v
+    WHERE v.UserId IS NOT NULL
+    GROUP BY v.UserId
+),
+
+/* 4️⃣ Tag‑related edit activity extracted from PostHistory */
+UserTagActivity AS (
+    SELECT
+        ph.UserId,
+        COUNT(DISTINCT unnest(string_to_array(ph.Text, ','))) 
+            FILTER (WHERE ph.PostHistoryTypeId IN (3,6,9))   AS DistinctTagsEdited,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId = 3)    AS TagAdds,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId = 6)    AS TagEdits
+    FROM PostHistory ph
+    GROUP BY ph.UserId
+),
+
+/* 5️⃣ Combine all per‑user metrics */
+Combined AS (
+    SELECT
+        u.Id                                         AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(bc.TotalBadges,0)                   AS TotalBadges,
+        COALESCE(pa.Questions,0)                     AS Questions,
+        COALESCE(pa.Answers,0)                       AS Answers,
+        COALESCE(pa.TotalViews,0)                    AS TotalViews,
+        COALESCE(vs.UpVotesGiven,0) - COALESCE(vs.DownVotesGiven,0) AS NetVotesGiven,
+        COALESCE(ta.DistinctTagsEdited,0)            AS DistinctTagsEdited,
+        CASE
+            WHEN u.CreationDate < DATE '2010‑01‑01' THEN 'Veteran'
+            WHEN u.CreationDate BETWEEN DATE '2010‑01‑01' AND DATE '2015‑01‑01' THEN 'Established'
+            ELSE 'Newcomer'
+        END                                          AS UserEra,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC)            AS ReputationRank,
+        DENSE_RANK() OVER (
+            PARTITION BY COALESCE(u.Location,'Unknown')
+            ORDER BY u.Reputation DESC
+        )                                            AS LocationRepRank,
+        (SELECT COUNT(*) FROM Posts p2
+         WHERE p2.OwnerUserId = u.Id
+           AND p2.PostTypeId = 1
+           AND p2.Score > 0)                     AS PositiveScoreQuestions,
+        (SELECT MAX(p3.CreationDate) FROM Posts p3
+         WHERE p3.OwnerUserId = u.Id)                AS MostRecentPost
+    FROM Users u
+    LEFT JOIN UserBadgeCounts bc      ON bc.UserId = u.Id
+    LEFT JOIN UserPostAggregates pa   ON pa.UserId = u.Id
+    LEFT JOIN UserVoteStats vs        ON vs.UserId = u.Id
+    LEFT JOIN UserTagActivity ta      ON ta.UserId = u.Id
+),
+
+/* 6️⃣ Final result set using a UNION ALL to create two different slices */
+FinalSet AS (
+    SELECT *
+    FROM Combined
+    WHERE ReputationRank <= 1000                                    -- top‑ranked users
+
+    UNION ALL
+
+    SELECT *
+    FROM Combined
+    WHERE TotalBadges >= 10
+      AND DistinctTagsEdited > 5
+      AND ReputationRank > 1000                                     -- high‑badge, tag‑active users outside top‑rank
+)
+
+SELECT *
+FROM FinalSet
+ORDER BY ReputationRank ASC NULLS LAST, TotalBadges DESC;

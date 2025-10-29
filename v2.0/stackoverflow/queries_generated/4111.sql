@@ -1,0 +1,102 @@
+-- {"query": "4111.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1214} 
+
+WITH RankedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.OwnerUserId,
+        pt.Name AS PostTypeName,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS rn_score,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) AS rn_date,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate) AS PreviousDayScore,
+        LEAD(p.Score, 1, 0) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate) AS NextDayScore,
+        (p.ViewCount * 1.0 / NULLIF(p.AnswerCount, 0)) AS ViewsPerAnswer,
+        SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2) AS CleanTags
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.PostTypeId IN (1, 2) AND p.OwnerUserId IS NOT NULL AND p.CreationDate >= '2023-01-01'
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+        SUM(p.Score) AS TotalScoreOwned,
+        AVG(p.ViewCount) AS AvgViewCountOwned,
+        MAX(p.LastActivityDate) AS LastActivity,
+        SUM(CASE WHEN p.AnswerCount > 0 THEN 1 ELSE 0 END) AS PostsWithAnswers
+    FROM Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE p.CreationDate >= '2023-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+PostLinkAnalysis AS (
+    SELECT
+        pl.PostId,
+        COUNT(DISTINCT pl.RelatedPostId) AS NumberOfLinks,
+        SUM(CASE WHEN lt.Name = 'Duplicate' THEN 1 ELSE 0 END) AS DuplicateLinks,
+        SUM(CASE WHEN lt.Name = 'Linked' THEN 1 ELSE 0 END) AS LinkedLinks
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    GROUP BY pl.PostId
+),
+CommentEngagement AS (
+    SELECT
+        c.PostId,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        SUM(c.Score) AS TotalCommentScore,
+        AVG(c.Score) AS AvgCommentScore,
+        COUNT(DISTINCT c.UserId) AS DistinctCommenters,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM Comments c
+    WHERE c.CreationDate >= '2023-01-01'
+    GROUP BY c.PostId
+)
+SELECT
+    rp1.PostId,
+    rp1.Title,
+    rp1.PostTypeName,
+    rp1.Score,
+    rp1.ViewCount,
+    rp1.AnswerCount,
+    rp1.CommentCount,
+    rp1.FavoriteCount,
+    rp1.IsClosed,
+    ua.DisplayName AS OwnerDisplayName,
+    ua.Reputation AS OwnerReputation,
+    COALESCE(pla.NumberOfLinks, 0) AS PostLinksCount,
+    COALESCE(ce.CommentCount, 0) AS PostCommentCount,
+    rp1.PreviousDayScore,
+    rp1.NextDayScore,
+    rp1.ViewsPerAnswer,
+    rp1.CleanTags,
+    CASE
+        WHEN rp1.Score > rp2.Score THEN 'Higher Score'
+        WHEN rp1.Score < rp2.Score THEN 'Lower Score'
+        ELSE 'Same Score'
+    END AS ScoreComparisonWithNextPost,
+    CASE
+        WHEN ua.UserCreationDate < rp1.CreationDate - INTERVAL '1 year' THEN 'Experienced'
+        ELSE 'Newer'
+    END AS UserExperienceLevel,
+    CONCAT(
+        SUBSTRING(rp1.Title, 1, 10),
+        '...',
+        SUBSTRING(rp1.Title, LENGTH(rp1.Title) - 10, 10)
+    ) AS TruncatedTitle
+FROM RankedPosts rp1
+LEFT JOIN RankedPosts rp2 ON rp1.PostTypeId = rp2.PostTypeId AND rp1.rn_score + 1 = rp2.rn_score
+LEFT JOIN UserActivity ua ON rp1.OwnerUserId = ua.UserId
+LEFT JOIN PostLinkAnalysis pla ON rp1.PostId = pla.PostId
+LEFT JOIN CommentEngagement ce ON rp1.PostId = ce.PostId
+WHERE rp1.rn_score <= 1000
+ORDER BY rp1.PostTypeName, rp1.rn_score;

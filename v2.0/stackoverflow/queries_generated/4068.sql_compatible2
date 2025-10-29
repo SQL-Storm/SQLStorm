@@ -1,0 +1,130 @@
+WITH RecentQuestions AS (
+  SELECT
+    p.Id AS QuestionId,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate AS QuestionCreationDate,
+    p.Score AS QuestionScore,
+    p.AnswerCount,
+    ROW_NUMBER() OVER (ORDER BY p.CreationDate DESC) AS rn
+  FROM Posts p
+  WHERE
+    p.PostTypeId = 1 AND p.CommunityOwnedDate IS NULL
+), RankedAnswers AS (
+  SELECT
+    p.Id AS AnswerId,
+    p.ParentId AS QuestionId,
+    p.OwnerUserId,
+    p.CreationDate AS AnswerCreationDate,
+    p.Score AS AnswerScore,
+    ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS answer_rank
+  FROM Posts p
+  WHERE
+    p.PostTypeId = 2 AND p.ParentId IS NOT NULL
+), UserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsAsked,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersGiven,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived,
+    MAX(u.LastAccessDate) AS LastAccess,
+    AVG(CAST(LENGTH(COALESCE(ph.Comment, 'No Comment')) AS double precision)) AS AvgCommentLength
+  FROM Users u
+  LEFT JOIN Posts p
+    ON u.Id = p.OwnerUserId
+  LEFT JOIN Votes v
+    ON u.Id = v.UserId AND v.VoteTypeId IN (2, 3)
+  LEFT JOIN PostHistory ph
+    ON u.Id = ph.UserId AND ph.PostHistoryTypeId = 5
+  GROUP BY
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.LastAccessDate
+), TopQuestionsWithBestAnswers AS (
+  SELECT
+    rq.QuestionId,
+    rq.Title AS QuestionTitle,
+    rq.QuestionScore,
+    rq.AnswerCount,
+    ra.AnswerId AS BestAnswerId,
+    ra.AnswerScore AS BestAnswerScore,
+    u_q.DisplayName AS QuestionOwnerName,
+    u_a.DisplayName AS AnswerOwnerName,
+    CAST((EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - rq.QuestionCreationDate) ) / 86400) AS INTEGER) AS DaysSinceCreation,
+    CASE
+      WHEN rq.QuestionScore > 100 THEN 'HighScore'
+      WHEN rq.QuestionScore > 20 THEN 'MediumScore'
+      ELSE 'LowScore'
+    END AS ScoreCategory,
+    CASE WHEN rq.AnswerCount > 0
+         THEN CAST(rq.AnswerCount AS NUMERIC) / (GREATEST(CAST((EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - rq.QuestionCreationDate) ) / 86400) AS INTEGER), 0) + 1)
+         ELSE 0 END AS AnswersPerDay
+  FROM RecentQuestions rq
+  LEFT JOIN RankedAnswers ra
+    ON rq.QuestionId = ra.QuestionId AND ra.answer_rank = 1
+  LEFT JOIN Users u_q
+    ON rq.OwnerUserId = u_q.Id
+  LEFT JOIN Users u_a
+    ON ra.OwnerUserId = u_a.Id
+  WHERE
+    rq.rn <= 1000
+)
+SELECT
+  tq.QuestionId,
+  tq.QuestionTitle,
+  tq.QuestionScore,
+  tq.AnswerCount,
+  tq.BestAnswerId,
+  tq.BestAnswerScore,
+  tq.QuestionOwnerName,
+  tq.AnswerOwnerName,
+  tq.DaysSinceCreation,
+  tq.ScoreCategory,
+  tq.AnswersPerDay,
+  ua.Reputation AS AnswerOwnerReputation,
+  ua.QuestionsAsked AS AnswerOwnerQuestions,
+  ua.AnswersGiven AS AnswerOwnerAnswers,
+  ua.UpVotesReceived AS AnswerOwnerUpvotes,
+  ua.DownVotesReceived AS AnswerOwnerDownvotes,
+  ua.LastAccess AS AnswerOwnerLastAccess,
+  ua.AvgCommentLength
+FROM TopQuestionsWithBestAnswers tq
+LEFT JOIN UserActivity ua
+  ON tq.AnswerOwnerName = ua.DisplayName
+WHERE
+  tq.QuestionScore > 5
+  AND tq.BestAnswerScore IS NOT NULL
+  AND tq.DaysSinceCreation > 1
+
+UNION ALL
+
+SELECT
+  CAST(NULL AS bigint) AS QuestionId,
+  '--- Aggregate Statistics ---' AS QuestionTitle,
+  CAST(NULL AS integer) AS QuestionScore,
+  COUNT(*) AS AnswerCount,
+  CAST(NULL AS bigint) AS BestAnswerId,
+  AVG(CAST(tq.BestAnswerScore AS double precision)) AS BestAnswerScore,
+  CAST(NULL AS text) AS QuestionOwnerName,
+  CAST(NULL AS text) AS AnswerOwnerName,
+  AVG(CAST(tq.DaysSinceCreation AS double precision)) AS DaysSinceCreation,
+  CAST(NULL AS text) AS ScoreCategory,
+  AVG(tq.AnswersPerDay) AS AnswersPerDay,
+  AVG(CAST(ua.Reputation AS double precision)) AS AnswerOwnerReputation,
+  AVG(CAST(ua.QuestionsAsked AS double precision)) AS AnswerOwnerQuestions,
+  AVG(CAST(ua.AnswersGiven AS double precision)) AS AnswerOwnerAnswers,
+  AVG(CAST(ua.UpVotesReceived AS double precision)) AS AnswerOwnerUpvotes,
+  AVG(CAST(ua.DownVotesReceived AS double precision)) AS AnswerOwnerDownvotes,
+  CAST(NULL AS timestamp) AS AnswerOwnerLastAccess,
+  CAST(NULL AS double precision) AS AvgCommentLength
+FROM TopQuestionsWithBestAnswers tq
+LEFT JOIN UserActivity ua
+  ON tq.AnswerOwnerName = ua.DisplayName
+WHERE
+  tq.QuestionScore > 5
+  AND tq.BestAnswerScore IS NOT NULL
+  AND tq.DaysSinceCreation > 1;

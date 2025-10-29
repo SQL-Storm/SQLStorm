@@ -1,0 +1,217 @@
+-- {"query": "1561.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3358} 
+
+WITH UserEngagementAndBadges AS (
+    -- CTE 1: Aggregates user activities and badge information for highly reputable and active users.
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS UserUpVotesGiven,
+        U.DownVotes AS UserDownVotesGiven,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsOwned,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersOwned,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        -- Calculate the user's "activity score" based on posts, comments, and votes received, using weights.
+        CAST((SUM(COALESCE(P.Score, 0)) * 0.5 + COUNT(DISTINCT C.Id) * 1.5 + U.UpVotes * 0.2 - U.DownVotes * 0.1) AS NUMERIC) AS ActivityScore,
+        MAX(B.Date) AS LastBadgeDate,
+        COUNT(B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.TagBased = TRUE THEN 1 ELSE 0 END) AS TagBasedBadges
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    WHERE U.Reputation > 5000 AND U.LastAccessDate >= '2022-01-01' -- Filter for active and reputable users.
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.Views, U.UpVotes, U.DownVotes
+),
+PostHistoryDetails AS (
+    -- CTE 2: Summarizes post edit history, identifies closed posts with their reasons, and detects rollbacks.
+    SELECT
+        PH.PostId,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.Id END) AS TotalMajorEdits, -- Counts edits to Title, Body, Tags.
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.CreationDate ELSE NULL END) AS ClosureDateInHistory,
+        -- Correlated subquery to fetch the specific CloseReasonName based on PostHistory.Comment.
+        (SELECT CRS.Name FROM CloseReasonTypes CRS WHERE CRS.Id = CAST(PH.Comment AS SMALLINT) LIMIT 1) AS CloseReasonName,
+        MAX(PH.CreationDate) AS LastHistoryActivityDate,
+        -- Detects immediate body rollbacks after a body edit, indicating controversial changes.
+        SUM(CASE WHEN PH.PostHistoryTypeId = 8 AND LAG(PH.PostHistoryTypeId, 1, 0) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) = 5 THEN 1 ELSE 0 END) AS BodyRollbackCount
+    FROM PostHistory PH
+    WHERE PH.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9, 10, 11) -- Focus on edit, rollback, close, reopen events.
+    GROUP BY PH.PostId, PH.Comment -- Grouping by PH.Comment is crucial for the correlated subquery to work correctly.
+),
+QuestionAnswerDetails AS (
+    -- CTE 3: Combines core question and answer data with derived metrics and NULL logic.
+    SELECT
+        Q.Id AS QuestionId,
+        Q.Title AS QuestionTitle,
+        Q.CreationDate AS QuestionCreationDate,
+        Q.Score AS QuestionScore,
+        Q.ViewCount AS QuestionViewCount,
+        Q.AnswerCount,
+        Q.FavoriteCount,
+        Q.OwnerUserId AS QuestionOwnerId,
+        Q.Tags AS QuestionTags,
+        Q.AcceptedAnswerId,
+        Q.ClosedDate AS ActualClosedDate,
+        Q.CommunityOwnedDate,
+        PHT.TotalMajorEdits AS QuestionEditCount,
+        PHT.BodyRollbackCount AS QuestionBodyRollbackCount,
+        PHT.LastHistoryActivityDate AS QuestionLastEditOrActivity,
+        PHT.CloseReasonName,
+        A.Id AS AnswerId,
+        A.Score AS AnswerScore,
+        A.CreationDate AS AnswerCreationDate,
+        A.OwnerUserId AS AnswerOwnerId,
+        PHT_A.TotalMajorEdits AS AnswerEditCount,
+        -- Subquery for total comments on the question.
+        (SELECT COUNT(C.Id) FROM Comments C WHERE C.PostId = Q.Id) AS QuestionCommentCount,
+        -- Subquery for total comments on the current answer.
+        (SELECT COUNT(C.Id) FROM Comments C WHERE C.PostId = A.Id) AS AnswerCommentCount,
+        -- Calculate question age in days, using current timestamp if not closed (NULL logic).
+        EXTRACT(DAY FROM (COALESCE(Q.ClosedDate, NOW()) - Q.CreationDate)) AS QuestionAgeDays,
+        -- Extract the primary tag (first tag) using string manipulation.
+        LOWER(SUBSTRING(Q.Tags FROM 2 FOR COALESCE(NULLIF(POSITION('><' IN Q.Tags), 0), LENGTH(Q.Tags)+1) - 2)) AS PrimaryTag,
+        -- Calculate the total number of tags.
+        ARRAY_LENGTH(string_to_array(substring(Q.Tags, 2, length(Q.Tags)-2), '><'), 1) AS NumberOfTags,
+        -- Checks if the question is flagged as a duplicate using the PostLinks table.
+        EXISTS (SELECT 1 FROM PostLinks PL WHERE PL.PostId = Q.Id AND PL.LinkTypeId = 3) AS IsDuplicateFlagged
+    FROM Posts Q
+    LEFT JOIN Posts A ON Q.Id = A.ParentId AND A.PostTypeId = 2 -- Outer join to include questions without answers.
+    LEFT JOIN PostHistoryDetails PHT ON Q.Id = PHT.PostId
+    LEFT JOIN PostHistoryDetails PHT_A ON A.Id = PHT_A.PostId -- Joins history for answers as well.
+    WHERE Q.PostTypeId = 1 -- Only consider questions.
+    AND Q.CreationDate >= '2021-01-01' -- Focus on recent questions.
+    AND Q.Score >= 0
+),
+RankedAnswersByQuestion AS (
+    -- CTE 4: Ranks answers for each question based on score and creation date using window functions.
+    SELECT
+        QAD.QuestionId,
+        QAD.AnswerId,
+        QAD.AnswerScore,
+        QAD.AnswerOwnerId,
+        QAD.AnswerCreationDate,
+        -- Assigns a row number to each answer within a question, ordered by score then date.
+        ROW_NUMBER() OVER (PARTITION BY QAD.QuestionId ORDER BY QAD.AnswerScore DESC, QAD.AnswerCreationDate ASC) AS AnswerRankByScoreDate,
+        -- Calculates the average score of all answers for a given question.
+        AVG(QAD.AnswerScore) OVER (PARTITION BY QAD.QuestionId) AS AvgAnswerScoreForQuestion
+    FROM QuestionAnswerDetails QAD
+    WHERE QAD.AnswerId IS NOT NULL AND QAD.AnswerOwnerId IS NOT NULL
+),
+TagMetrics AS (
+    -- CTE 5: Aggregates metrics for popular tags, providing context for question quality.
+    SELECT
+        SPLIT_PART(unnest(string_to_array(substring(P.Tags, 2, length(P.Tags)-2), '><')), 1, 1) AS TagName,
+        COUNT(P.Id) AS TaggedPostCount,
+        AVG(P.Score) AS AvgScoreForTag,
+        SUM(P.ViewCount) AS TotalViewsForTag
+    FROM Posts P
+    WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL
+    GROUP BY TagName
+    HAVING COUNT(P.Id) > 500 -- Filters for tags with significant usage.
+),
+ControversialOrHighlyEditedPosts AS (
+    -- CTE 6: Identifies posts that are controversial or heavily edited using a UNION ALL set operator.
+    -- This combines different criteria for flagging posts as "problematic".
+    SELECT
+        P.Id AS PostId,
+        'LowScoreHighViews' AS IssueType,
+        P.Score,
+        P.ViewCount,
+        PHD.TotalMajorEdits
+    FROM Posts P
+    INNER JOIN PostHistoryDetails PHD ON P.Id = PHD.PostId
+    WHERE P.PostTypeId IN (1, 2)
+      AND P.Score < 0 -- Posts with negative score
+      AND P.ViewCount > 1000 -- Despite high views
+    UNION ALL
+    SELECT
+        P.Id AS PostId,
+        'HeavilyEdited' AS IssueType,
+        P.Score,
+        P.ViewCount,
+        PHD.TotalMajorEdits
+    FROM Posts P
+    INNER JOIN PostHistoryDetails PHD ON P.Id = PHD.PostId
+    WHERE P.PostTypeId IN (1, 2)
+      AND PHD.TotalMajorEdits > 10 -- Posts with many edits
+      AND P.CreationDate >= '2021-01-01'
+    UNION ALL
+    SELECT
+        P.Id AS PostId,
+        'HasSpamOrOffensiveVote' AS IssueType,
+        P.Score,
+        P.ViewCount,
+        PHD.TotalMajorEdits
+    FROM Posts P
+    INNER JOIN Votes V ON P.Id = V.PostId
+    INNER JOIN PostHistoryDetails PHD ON P.Id = PHD.PostId
+    WHERE V.VoteTypeId IN (4, 12) -- Posts that received offensive or spam votes.
+    AND P.CreationDate >= '2021-01-01'
+)
+-- Main query: Analyzes question and answer quality, user engagement, and post controversy by combining all CTEs.
+SELECT
+    UEAB.UserId,
+    UEAB.DisplayName AS UserDisplayName,
+    UEAB.Reputation,
+    UEAB.TotalQuestionsOwned,
+    UEAB.TotalAnswersOwned,
+    UEAB.ActivityScore,
+    UEAB.LastBadgeDate,
+    QAD.QuestionId,
+    QAD.QuestionTitle,
+    QAD.QuestionCreationDate,
+    QAD.QuestionScore,
+    QAD.QuestionViewCount,
+    QAD.AnswerCount,
+    QAD.FavoriteCount,
+    QAD.QuestionCommentCount,
+    QAD.QuestionEditCount,
+    QAD.QuestionBodyRollbackCount,
+    QAD.QuestionAgeDays,
+    QAD.ActualClosedDate,
+    QAD.CloseReasonName,
+    QAD.IsDuplicateFlagged,
+    QAD.PrimaryTag,
+    QAD.NumberOfTags,
+    RA.AnswerId AS TopAnswerId,
+    RA.AnswerScore AS TopAnswerScore,
+    RA.AnswerOwnerId AS TopAnswerOwnerId,
+    RA.AnswerCreationDate AS TopAnswerCreationDate,
+    RA.AvgAnswerScoreForQuestion,
+    COALESCE(RA.AnswerId = QAD.AcceptedAnswerId, FALSE) AS IsTopAnswerAccepted, -- NULL logic: if RA.AnswerId is NULL, it's not the accepted answer.
+    TM.AvgScoreForTag AS PrimaryTagAvgScore,
+    TM.TaggedPostCount AS PrimaryTagPostCount,
+    -- Window function: Ranks users by their total number of questions owned.
+    RANK() OVER (ORDER BY UEAB.TotalQuestionsOwned DESC, UEAB.Reputation DESC) AS UserQuestionRank,
+    -- Window function: Divides questions into 10 groups (deciles) based on their score.
+    NTILE(10) OVER (ORDER BY QAD.QuestionScore DESC) AS QuestionScoreDecile,
+    -- Complex calculation: A "Question Quality Index" combining various metrics with weighted factors.
+    CAST((QAD.QuestionScore * 0.7 + QAD.QuestionViewCount * 0.005 + QAD.QuestionCommentCount * 0.5 + QAD.FavoriteCount * 1.0 - QAD.QuestionEditCount * 0.2 - QAD.QuestionBodyRollbackCount * 0.5) AS NUMERIC) AS QuestionQualityIndex,
+    -- String expression: Checks if the question title contains high-impact technical keywords (case-insensitive).
+    (QAD.QuestionTitle ILIKE '%performance%' OR QAD.QuestionTitle ILIKE '%security%' OR QAD.QuestionTitle ILIKE '%optimization%' OR QAD.QuestionTitle ILIKE '%scaling%') AS HighImpactKeywordsPresent,
+    -- Boolean flag indicating if the post was identified as controversial or heavily edited in CTE 6.
+    CASE WHEN COHP.IssueType IS NOT NULL THEN TRUE ELSE FALSE END AS IsControversialOrHighlyEdited,
+    COHP.IssueType AS ControversialIssueType, -- The specific reason for controversy/edit.
+    -- NULL logic: Checks for essential missing data in the question.
+    (QAD.QuestionOwnerId IS NULL OR QAD.QuestionTitle IS NULL OR QAD.QuestionTags IS NULL OR QAD.QuestionBodyRollbackCount IS NULL) AS HasMissingQuestionOrHistoryData
+FROM UserEngagementAndBadges UEAB
+INNER JOIN QuestionAnswerDetails QAD ON UEAB.UserId = QAD.QuestionOwnerId
+LEFT JOIN RankedAnswersByQuestion RA ON QAD.QuestionId = RA.QuestionId AND RA.AnswerRankByScoreDate = 1 -- Join only the top-ranked answer.
+LEFT JOIN TagMetrics TM ON QAD.PrimaryTag = TM.TagName
+LEFT JOIN ControversialOrHighlyEditedPosts COHP ON QAD.QuestionId = COHP.PostId -- Join controversial flags.
+WHERE
+    QAD.QuestionScore >= 10 -- Filter for questions with a minimum positive score.
+    AND QAD.QuestionViewCount > 500 -- Focus on questions with significant visibility.
+    AND QAD.QuestionCommentCount >= 1 -- Ensure some discussion activity.
+    AND QAD.QuestionEditCount <= 7 -- Exclude excessively edited (potentially noisy) posts, but allow some edits.
+    AND UEAB.Reputation >= 10000 -- Only highly reputable users' questions for quality analysis.
+    AND QAD.QuestionTitle IS NOT NULL
+ORDER BY
+    QuestionQualityIndex DESC,
+    UEAB.Reputation DESC,
+    QAD.QuestionCreationDate DESC
+LIMIT 5000;

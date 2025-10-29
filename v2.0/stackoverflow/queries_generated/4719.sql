@@ -1,0 +1,190 @@
+-- {"query": "4719.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1796} 
+
+WITH
+  RelevantPosts AS (
+    SELECT
+      p.Id AS PostId,
+      p.PostTypeId,
+      p.OwnerUserId,
+      p.CreationDate AS PostCreationDate,
+      p.Title,
+      p.Score AS PostScore,
+      p.FavoriteCount,
+      p.AnswerCount,
+      p.CommentCount,
+      p.ClosedDate,
+      pt.Name AS PostTypeName,
+      u.DisplayName AS OwnerDisplayName,
+      CASE
+        WHEN p.PostTypeId = 1 THEN COALESCE(p.AnswerCount, 0)
+        ELSE (
+          SELECT
+            COUNT(c.Id)
+          FROM
+            Comments AS c
+          WHERE
+            c.PostId = p.Id
+        )
+      END AS CalculatedCommentCount,
+      ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) AS rn_post_type
+    FROM
+      Posts AS p
+      JOIN PostTypes AS pt ON p.PostTypeId = pt.Id
+      LEFT JOIN Users AS u ON p.OwnerUserId = u.Id
+    WHERE
+      p.CreationDate BETWEEN '2023-01-01' AND '2023-12-31'
+      AND p.OwnerUserId IS NOT NULL
+  ),
+  PostHistorySummary AS (
+    SELECT
+      ph.PostId,
+      COUNT(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 END) AS EditCount,
+      MAX(ph.CreationDate) AS LastEditDate,
+      STRING_AGG(DISTINCT u.DisplayName, '; ') AS Editors
+    FROM
+      PostHistory AS ph
+      LEFT JOIN Users AS u ON ph.UserId = u.Id
+    WHERE
+      ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 7, 8, 9)
+    GROUP BY
+      ph.PostId
+  ),
+  UserPostContributions AS (
+    SELECT
+      p.OwnerUserId,
+      COUNT(p.Id) AS TotalPostsOwned,
+      SUM(p.Score) AS TotalScoreReceived,
+      AVG(CAST(p.ViewCount AS DECIMAL(10, 2))) AS AvgPostViews
+    FROM
+      Posts AS p
+    WHERE
+      p.OwnerUserId IS NOT NULL
+    GROUP BY
+      p.OwnerUserId
+  ),
+  RecentComments AS (
+    SELECT
+      c.PostId,
+      COUNT(c.Id) AS RecentCommentCount,
+      MAX(c.CreationDate) AS LastCommentDate
+    FROM
+      Comments AS c
+    WHERE
+      c.CreationDate > DATE('now', '-30 day')
+    GROUP BY
+      c.PostId
+  ),
+  PostLinkAnalysis AS (
+    SELECT
+      pl.PostId,
+      COUNT(CASE WHEN pl.LinkTypeId = 3 THEN 1 END) AS DuplicateLinkCount,
+      COUNT(CASE WHEN pl.LinkTypeId = 1 THEN 1 END) AS LinkedPostCount
+    FROM
+      PostLinks AS pl
+    GROUP BY
+      pl.PostId
+  )
+SELECT
+  rp.PostId,
+  rp.PostTypeName,
+  rp.Title,
+  rp.PostScore,
+  rp.FavoriteCount,
+  rp.CalculatedCommentCount,
+  COALESCE(phs.EditCount, 0) AS EditCount,
+  phs.Editors,
+  rp.PostCreationDate,
+  rp.ClosedDate,
+  CASE
+    WHEN rp.ClosedDate IS NOT NULL THEN JULIANDAY(rp.ClosedDate) - JULIANDAY(rp.PostCreationDate)
+    ELSE NULL
+  END AS DaysToClose,
+  upc.TotalPostsOwned,
+  upc.TotalScoreReceived,
+  upc.AvgPostViews,
+  rc.RecentCommentCount,
+  p.TagName,
+  SUM(p.Count) OVER (PARTITION BY p.TagName) AS TotalTagCount,
+  CASE
+    WHEN rp.OwnerUserId IS NULL THEN 'Community'
+    ELSE COALESCE(rp.OwnerDisplayName, 'Deleted User')
+  END AS DisplayOwnerName,
+  CASE
+    WHEN rp.FavoriteCount > 1000 THEN 'High Engagement'
+    WHEN rp.FavoriteCount > 100 THEN 'Medium Engagement'
+    ELSE 'Low Engagement'
+  END AS EngagementLevel,
+  CASE
+    WHEN rp.PostScore < 0 THEN 'Negative Score'
+    WHEN rp.PostScore >= 0 AND rp.PostScore <= 10 THEN 'Low Score'
+    WHEN rp.PostScore > 10 THEN 'High Score'
+    ELSE 'No Score'
+  END AS ScoreCategory,
+  CASE
+    WHEN rp.AnswerCount > 0 AND rp.AnswerCount < 3 THEN 'Few Answers'
+    WHEN rp.AnswerCount >= 3 THEN 'Many Answers'
+    ELSE 'No Answers'
+  END AS AnswerCategory,
+  pl.DuplicateLinkCount,
+  pl.LinkedPostCount,
+  CASE
+    WHEN LENGTH(rp.Title) > 50 THEN SUBSTRING(rp.Title, 1, 50) || '...'
+    ELSE rp.Title
+  END AS TruncatedTitle,
+  CASE
+    WHEN rp.OwnerUserId IS NOT NULL AND EXISTS (
+      SELECT
+        1
+      FROM
+        Badges AS b
+      WHERE
+        b.UserId = rp.OwnerUserId AND b.Name LIKE '%Expert%'
+    ) THEN 'Has Expert Badge'
+    ELSE 'No Expert Badge'
+  END AS UserBadgeStatus
+FROM
+  RelevantPosts AS rp
+  LEFT JOIN PostHistorySummary AS phs ON rp.PostId = phs.PostId
+  LEFT JOIN UserPostContributions AS upc ON rp.OwnerUserId = upc.OwnerUserId
+  LEFT JOIN RecentComments AS rc ON rp.PostId = rc.PostId
+  LEFT JOIN PostLinks AS pl ON rp.PostId = pl.PostId
+  LEFT JOIN Tags AS t ON rp.Id = t.Id -- Joining Tags table on PostId for TagName, which is not directly available in schema, assuming PostId is used. This might require adjustment based on actual relationship.
+  LEFT JOIN Posts AS tag_post ON t.TagName = tag_post.Title -- Assuming TagName is related to Post Title for some reason. This is a speculative join.
+  LEFT JOIN Tags AS p ON LOWER(REPLACE(REPLACE(tag_post.Tags, '<', ''), '>', '')) LIKE '%' || LOWER(p.TagName) || '%' -- Trying to join to get TagName based on Post.Tags, another speculative join.
+WHERE
+  rp.rn_post_type <= 100 -- Limiting to top 100 posts per type for performance
+  AND (
+    rp.PostTypeName = 'Question'
+    OR rp.PostTypeName = 'Answer'
+  )
+  AND COALESCE(rp.OwnerDisplayName, 'Unknown') <> 'Deleted User'
+  AND rp.PostCreationDate >= DATE('now', '-1 year')
+  AND rp.PostScore > 0
+  AND EXISTS (
+    SELECT
+      1
+    FROM
+      Comments AS c
+    WHERE
+      c.PostId = rp.PostId AND c.Score > 5
+  )
+GROUP BY
+  rp.PostId,
+  rp.PostTypeName,
+  rp.Title,
+  rp.PostScore,
+  rp.FavoriteCount,
+  rp.CalculatedCommentCount,
+  phs.EditCount,
+  phs.Editors,
+  rp.PostCreationDate,
+  rp.ClosedDate,
+  upc.TotalPostsOwned,
+  upc.TotalScoreReceived,
+  upc.AvgPostViews,
+  rc.RecentCommentCount,
+  rp.OwnerDisplayName,
+  rp.OwnerUserId,
+  pl.DuplicateLinkCount,
+  pl.LinkedPostCount,
+  p.TagName;

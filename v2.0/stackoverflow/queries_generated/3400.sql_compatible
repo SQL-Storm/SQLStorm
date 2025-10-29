@@ -1,0 +1,142 @@
+WITH
+TagStats AS (
+    SELECT
+        t.TagName,
+        COUNT(p.Id)                              AS QuestionCount,
+        SUM(p.Score)                             AS TotalScore,
+        AVG(p.ViewCount)                         AS AvgViews,
+        MAX(p.CreationDate)                      AS MostRecentQuestion
+    FROM Tags t
+    JOIN Posts p ON p.Tags LIKE ('%<' || t.TagName || '>%')
+    WHERE p.PostTypeId = 1
+    GROUP BY t.TagName
+),
+UserActivity AS (
+    SELECT
+        u.Id                                            AS UserId,
+        u.DisplayName,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END),0) AS UpVotesGiven,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END),0) AS DownVotesGiven,
+        COALESCE(COUNT(DISTINCT c.Id),0)                AS CommentsMade,
+        MAX(p.CreationDate)                            AS LastPostDate
+    FROM Users u
+    LEFT JOIN Votes     v ON v.UserId = u.Id
+    LEFT JOIN Comments  c ON c.UserId = u.Id
+    LEFT JOIN Posts     p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+PostMetrics AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        COALESCE(v.UpVotes,0)      AS UpVotes,
+        COALESCE(v.DownVotes,0)    AS DownVotes,
+        COALESCE(c.CommentCount,0) AS CommentCount,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS RankByScore,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END               AS IsClosed,
+        (SELECT MIN(ph.CreationDate)
+         FROM PostHistory ph
+         WHERE ph.PostId = p.Id
+           AND ph.PostHistoryTypeId IN (4,5,6))                           AS FirstEditDate
+    FROM Posts p
+    LEFT JOIN (
+        SELECT
+            PostId,
+            SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes
+        GROUP BY PostId
+    ) v ON v.PostId = p.Id
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS CommentCount
+        FROM Comments
+        GROUP BY PostId
+    ) c ON c.PostId = p.Id
+    WHERE p.PostTypeId = 1
+),
+TopTags AS (
+    SELECT TagName
+    FROM TagStats
+    WHERE QuestionCount > 1000
+    ORDER BY TotalScore DESC
+    FETCH FIRST 10 ROWS ONLY
+)
+SELECT
+    pm.Id,
+    pm.Title,
+    pm.CreationDate,
+    pm.Score,
+    pm.ViewCount,
+    pm.AnswerCount,
+    pm.UpVotes,
+    pm.DownVotes,
+    pm.CommentCount,
+    pm.RankByScore,
+    pm.IsClosed,
+    pm.FirstEditDate,
+    ua.DisplayName          AS OwnerDisplayName,
+    ua.UpVotesGiven,
+    ua.DownVotesGiven,
+    ua.CommentsMade,
+    ua.LastPostDate,
+    tg.TagName,
+    COALESCE(ts.QuestionCount,0) AS TagQuestionCount,
+    COALESCE(ts.TotalScore,0)    AS TagTotalScore
+FROM PostMetrics pm
+LEFT JOIN Users u ON u.Id = pm.Id
+LEFT JOIN UserActivity ua ON ua.UserId = u.Id
+LEFT JOIN (
+    SELECT pm2.Id AS pm_id, trim(tn) AS TagName
+    FROM PostMetrics pm2,
+         UNNEST(STRING_TO_ARRAY(SUBSTRING(pm2.Title FROM 2 FOR CHAR_LENGTH(pm2.Title)-2), '><')) AS tn
+) tg ON tg.pm_id = pm.Id
+LEFT JOIN TagStats ts ON ts.TagName = tg.TagName
+WHERE pm.RankByScore <= 5
+  AND (ua.UpVotesGiven > 100 OR ua.DownVotesGiven IS NULL)
+  AND EXISTS (
+        SELECT 1
+        FROM PostLinks pl
+        WHERE pl.PostId = pm.Id
+          AND pl.LinkTypeId = 3
+          AND pl.RelatedPostId IN (
+                SELECT Id FROM Posts WHERE Score > 50
+          )
+  )
+  AND (pm.IsClosed = 0 OR pm.FirstEditDate IS NOT NULL)
+
+UNION ALL
+
+SELECT
+    p.Id,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    NULL AS AnswerCount,
+    NULL AS UpVotes,
+    NULL AS DownVotes,
+    NULL AS CommentCount,
+    NULL AS RankByScore,
+    NULL AS IsClosed,
+    NULL AS FirstEditDate,
+    NULL AS OwnerDisplayName,
+    NULL AS UpVotesGiven,
+    NULL AS DownVotesGiven,
+    NULL AS CommentsMade,
+    NULL AS LastPostDate,
+    NULL AS TagName,
+    NULL AS TagQuestionCount,
+    NULL AS TagTotalScore
+FROM Posts p
+WHERE p.PostTypeId = 2
+  AND p.Score < 0
+  AND NOT EXISTS (
+        SELECT 1 FROM Votes v
+        WHERE v.PostId = p.Id AND v.VoteTypeId = 2
+  )
+ORDER BY CreationDate DESC
+FETCH FIRST 50 ROWS ONLY;

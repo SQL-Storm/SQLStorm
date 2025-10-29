@@ -1,0 +1,199 @@
+-- {"query": "1494.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2610} 
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName AS UserName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        COALESCE(U.Location, 'Unknown Location') AS UserLocation,
+        SUM(P.Score) AS TotalPostScore,
+        COUNT(DISTINCT P.Id) AS TotalPostsCreated,
+        COUNT(DISTINCT B.Id) AS TotalBadgesEarned,
+        MAX(CASE WHEN B.Class = 1 THEN B.Date ELSE NULL END) AS LatestGoldBadgeDate,
+        (SELECT MAX(PH.CreationDate) FROM PostHistory PH WHERE PH.UserId = U.Id AND PH.PostHistoryTypeId IN (4, 5, 6)) AS LastEditActivityDate,
+        AVG(CASE WHEN P.PostTypeId = 1 THEN P.ViewCount ELSE NULL END) AS AvgQuestionViewCount,
+        COUNT(CASE WHEN P.PostTypeId = 1 THEN P.Id ELSE NULL END) AS QuestionsCount,
+        COUNT(CASE WHEN P.PostTypeId = 2 THEN P.Id ELSE NULL END) AS AnswersCount
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    WHERE U.Reputation >= 500
+      AND U.CreationDate >= '2020-01-01'
+      AND U.LastAccessDate >= '2023-01-01'
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Location
+    HAVING COUNT(P.Id) > 3 AND COUNT(B.Id) > 0
+),
+PostDetailedActivity AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.CreationDate AS PostCreationDate,
+        P.LastEditDate,
+        P.LastActivityDate,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.OwnerUserId,
+        P.Title,
+        P.Tags,
+        COALESCE(P.AcceptedAnswerId, -1) AS AcceptedAnswerIdResolved,
+        (SELECT COUNT(DISTINCT PH.UserId) FROM PostHistory PH WHERE PH.PostId = P.Id AND PH.PostHistoryTypeId IN (4, 5, 6)) AS DistinctEditorsCount,
+        COALESCE(
+            NULLIF(
+                SUBSTRING(P.Tags FROM POSITION('<benchmark>' IN P.Tags) + LENGTH('<benchmark>') FOR POSITION('</benchmark>' IN P.Tags) - (POSITION('<benchmark>' IN P.Tags) + LENGTH('<benchmark>'))),
+            ''),
+            'NoBenchmarkTag'
+        ) AS PrimaryBenchmarkTag,
+        CASE
+            WHEN P.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN P.CommunityOwnedDate IS NOT NULL THEN 'CommunityWiki'
+            WHEN P.AnswerCount > 0 AND P.AcceptedAnswerId IS NOT NULL THEN 'AcceptedAnswer'
+            WHEN P.LastActivityDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days' THEN 'Active'
+            ELSE 'Stale'
+        END AS PostStatusCategory,
+        NULLIF(P.ParentId, P.Id) AS EffectiveParentId
+    FROM Posts P
+    JOIN PostTypes PT ON P.PostTypeId = PT.Id
+    WHERE P.CreationDate BETWEEN '2022-01-01' AND '2023-12-31'
+      AND P.Score >= 10
+      AND P.ViewCount >= 100
+      AND (P.PostTypeId = 1 OR P.PostTypeId = 2)
+),
+PostLinkAnalytics AS (
+    SELECT
+        PL.PostId,
+        COUNT(DISTINCT PL.RelatedPostId) AS TotalRelatedPosts,
+        SUM(CASE WHEN PL.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicateLinkCount,
+        AVG(RP.Score) AS AvgRelatedPostScore,
+        MAX(RP.ViewCount) AS MaxRelatedPostViews
+    FROM PostLinks PL
+    JOIN Posts RP ON PL.RelatedPostId = RP.Id
+    GROUP BY PL.PostId
+),
+TagUsageStats AS (
+    SELECT
+        TRIM(UNNEST(string_to_array(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags) - 2), '><'))) AS TagName,
+        COUNT(DISTINCT P.Id) AS PostCountForTag,
+        AVG(P.Score) AS AvgScoreForTag,
+        SUM(P.ViewCount) AS TotalViewsForTag
+    FROM Posts P
+    WHERE P.Tags IS NOT NULL AND P.Tags LIKE '<%>'
+    GROUP BY TagName
+    HAVING COUNT(DISTINCT P.Id) > 50
+),
+CombinedAnalysis AS (
+    SELECT
+        PDA.PostId,
+        PDA.PostTypeName,
+        PDA.Title,
+        PDA.PostCreationDate,
+        PDA.Score,
+        PDA.ViewCount,
+        PDA.AnswerCount,
+        PDA.CommentCount,
+        PDA.FavoriteCount,
+        PDA.OwnerUserId,
+        UE.UserName,
+        UE.Reputation,
+        UE.UserLocation,
+        PDA.DistinctEditorsCount,
+        PDA.PrimaryBenchmarkTag,
+        PDA.PostStatusCategory,
+        PLA.TotalRelatedPosts,
+        PLA.DuplicateLinkCount,
+        PLA.AvgRelatedPostScore,
+        PLA.MaxRelatedPostViews,
+        TUS.AvgScoreForTag,
+        TUS.TotalViewsForTag,
+        (SELECT MAX(C.CreationDate) FROM Comments C WHERE C.PostId = PDA.PostId AND C.CreationDate > PDA.LastActivityDate) AS LatestCommentAfterActivity,
+        LAG(PDA.PostCreationDate, 1, PDA.PostCreationDate) OVER (PARTITION BY UE.UserId ORDER BY PDA.PostCreationDate) AS PreviousPostDateByUser,
+        NTILE(5) OVER (ORDER BY PDA.ViewCount DESC, PDA.Score DESC) AS PopularityQuintile,
+        ROW_NUMBER() OVER (PARTITION BY PDA.PostTypeName, UE.UserLocation ORDER BY PDA.Score DESC, PDA.ViewCount DESC) AS RankInTypeLocation,
+        SUM(PDA.Score) OVER (PARTITION BY UE.UserId) AS TotalScoreByUserAgg,
+        COALESCE(UE.AvgQuestionViewCount, 0) AS UserAvgQuestionViewCount
+    FROM PostDetailedActivity PDA
+    JOIN UserEngagement UE ON PDA.OwnerUserId = UE.UserId
+    LEFT JOIN PostLinkAnalytics PLA ON PDA.PostId = PLA.PostId
+    LEFT JOIN TagUsageStats TUS ON PDA.PrimaryBenchmarkTag = TUS.TagName
+    WHERE PDA.PostId IS NOT NULL
+      AND (PDA.LastEditDate IS NOT NULL OR PDA.CommentCount > 0)
+      AND PDA.Score > (UE.TotalPostScore / (NULLIF(UE.TotalPostsCreated, 0) + 0.1)) -- Post score vs. user's average post score
+      AND LENGTH(PDA.Title) > 20
+)
+SELECT
+    'HighImpactQuestion' AS ReportCategory,
+    CA.PostId,
+    CA.Title,
+    CA.PostCreationDate,
+    CA.Score,
+    CA.ViewCount,
+    CA.UserName,
+    CA.Reputation,
+    CA.UserLocation,
+    CA.PostStatusCategory,
+    CA.DistinctEditorsCount,
+    CA.TotalRelatedPosts,
+    CA.AvgRelatedPostScore,
+    CA.AvgScoreForTag,
+    CA.PopularityQuintile,
+    CA.RankInTypeLocation,
+    UPPER(SUBSTRING(REPLACE(CA.Title, ' ', ''), 1, 8)) || '-' || LOWER(SUBSTRING(REPLACE(CA.UserName, ' ', ''), 1, 8)) AS DerivedIdentifier,
+    (SELECT COUNT(V.Id) FROM Votes V WHERE V.PostId = CA.PostId AND V.VoteTypeId = 2 AND V.CreationDate BETWEEN CA.PostCreationDate AND CA.LastEditDate) AS UpvotesBeforeLastEdit,
+    COALESCE(CA.LatestCommentAfterActivity, CA.LastEditDate) AS CriticalActivityDate
+FROM CombinedAnalysis CA
+WHERE CA.PostTypeName = 'Question'
+  AND CA.PopularityQuintile = 1
+  AND CA.RankInTypeLocation <= 10
+  AND CA.AnswerCount > 0
+  AND CA.UserLocation NOT LIKE '%India%'
+  AND CA.PrimaryBenchmarkTag != 'NoBenchmarkTag'
+  AND CA.TotalRelatedPosts > 1
+  AND CA.AvgRelatedPostScore > CA.Score -- Linked posts have higher average score
+  AND (CA.PostCreationDate - CA.PreviousPostDateByUser > INTERVAL '10 days' OR CA.PreviousPostDateByUser = CA.PostCreationDate) -- Not a rapid-fire poster
+  AND CA.TotalScoreByUserAgg > 1000 -- User has substantial total score
+  AND CA.LatestCommentAfterActivity IS NOT NULL -- Recent comment activity
+  AND CA.DistinctEditorsCount >= 2
+  AND CA.UserAvgQuestionViewCount > 500
+
+UNION ALL
+
+SELECT
+    'HighlyRatedAnswer' AS ReportCategory,
+    CA.PostId,
+    CA.Title,
+    CA.PostCreationDate,
+    CA.Score,
+    CA.ViewCount,
+    CA.UserName,
+    CA.Reputation,
+    CA.UserLocation,
+    CA.PostStatusCategory,
+    CA.DistinctEditorsCount,
+    CA.TotalRelatedPosts,
+    CA.AvgRelatedPostScore,
+    CA.AvgScoreForTag,
+    CA.PopularityQuintile,
+    CA.RankInTypeLocation,
+    UPPER(SUBSTRING(REPLACE(CA.Title, ' ', ''), 1, 8)) || '-' || LOWER(SUBSTRING(REPLACE(CA.UserName, ' ', ''), 1, 8)) AS DerivedIdentifier,
+    (SELECT COUNT(V.Id) FROM Votes V WHERE V.PostId = CA.PostId AND V.VoteTypeId = 2 AND V.CreationDate BETWEEN CA.PostCreationDate AND CA.LastEditDate) AS UpvotesBeforeLastEdit,
+    COALESCE(CA.LatestCommentAfterActivity, CA.LastEditDate) AS CriticalActivityDate
+FROM CombinedAnalysis CA
+WHERE CA.PostTypeName = 'Answer'
+  AND CA.Score >= 100
+  AND CA.RankInTypeLocation <= 5
+  AND CA.CommentCount >= 5
+  AND CA.Reputation > 5000
+  AND CA.PrimaryBenchmarkTag = 'NoBenchmarkTag' -- Answers without specific benchmark tags
+  AND (CA.ViewCount > CA.MaxRelatedPostViews OR CA.MaxRelatedPostViews IS NULL) -- Answer is more viewed than related posts
+  AND CA.PostStatusCategory IN ('Active', 'AcceptedAnswer')
+  AND CA.AvgScoreForTag IS NOT NULL AND CA.AvgScoreForTag > 50
+  AND CA.TotalViewsForTag > 10000
+  AND CA.DistinctEditorsCount = 1 -- Only original author edited
+  AND CA.LatestCommentAfterActivity IS NOT NULL
+ORDER BY ReportCategory, Reputation DESC, Score DESC
+LIMIT 200;

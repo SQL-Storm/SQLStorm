@@ -1,0 +1,85 @@
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 3 THEN p.Id END) AS TotalWikis,
+    SUM(p.Score) AS TotalScore,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN COALESCE(p.AnswerCount,0) ELSE 0 END) AS TotalAnswersToQuestions,
+    MAX(u.LastAccessDate) AS LastAccess,
+    MIN(p.CreationDate) AS FirstPost,
+    MAX(p.LastActivityDate) AS LastActivity,
+    b.Class,
+    t.TagName,
+    ph_latest.RevisionGUID AS RevisionGUID,
+    ph_latest.Comment AS Comment,
+    ph_latest.LastEditDate AS LastEditDate,
+    v.VoteTypeId,
+    vl.BountyAmount
+FROM 
+    Users u
+LEFT JOIN 
+    (SELECT 
+         UserId, 
+         MAX(CASE WHEN PostHistoryTypeId = 1 THEN CreationDate END) AS LastEditDate
+     FROM 
+         PostHistory 
+     GROUP BY 
+         UserId) ph ON u.Id = ph.UserId
+LEFT JOIN 
+    (SELECT 
+         PostId, 
+         MAX(CASE WHEN PostHistoryTypeId = 1 THEN RevisionGUID END) AS RevisionGUID,
+         MAX(CASE WHEN PostHistoryTypeId = 1 THEN Comment END) AS Comment,
+         MAX(CASE WHEN PostHistoryTypeId = 1 THEN CreationDate END) AS LastEditDate,
+         MAX(UserId) AS AnyUserId
+     FROM 
+         PostHistory 
+     GROUP BY 
+         PostId) ph_latest ON u.Id = ph_latest.AnyUserId
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    (SELECT 
+         Id, 
+         TagName, 
+         COUNT(*) AS Count,
+         ExcerptPostId
+     FROM 
+         Tags 
+     GROUP BY 
+         Id, TagName, ExcerptPostId) t ON p.Id = t.ExcerptPostId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+LEFT JOIN 
+    (SELECT 
+         PostId, 
+         BountyAmount
+     FROM 
+         Votes 
+     WHERE 
+         VoteTypeId = 8) vl ON p.Id = vl.PostId
+WHERE 
+    u.Reputation > 1000
+    AND p.PostTypeId IN (1, 2)
+    AND (
+        u.LastAccessDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6' MONTH)
+        OR u.LastAccessDate IS NULL
+    )
+GROUP BY 
+    u.DisplayName,
+    u.Reputation,
+    b.Class,
+    t.TagName,
+    ph_latest.RevisionGUID,
+    ph_latest.Comment,
+    ph_latest.LastEditDate,
+    ph_latest.AnyUserId,
+    ph.LastEditDate,
+    v.VoteTypeId,
+    vl.BountyAmount
+ORDER BY 
+    u.Reputation DESC, TotalPosts DESC;

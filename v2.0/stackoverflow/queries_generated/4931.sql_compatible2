@@ -1,0 +1,129 @@
+WITH
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      COUNT(DISTINCT p.Id) AS TotalPosts,
+      SUM(CASE WHEN pt.Name = 'Question' THEN 1 ELSE 0 END) AS QuestionCount,
+      SUM(CASE WHEN pt.Name = 'Answer' THEN 1 ELSE 0 END) AS AnswerCount,
+      COUNT(DISTINCT c.Id) AS CommentCount,
+      COUNT(DISTINCT b.Id) AS BadgeCount,
+      ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RankByReputation,
+      AVG(p.Score) AS AvgPostScore,
+      u.Reputation
+    FROM Users u
+    LEFT JOIN Posts p
+      ON u.Id = p.OwnerUserId
+    LEFT JOIN PostTypes pt
+      ON p.PostTypeId = pt.Id
+    LEFT JOIN Comments c
+      ON u.Id = c.UserId
+    LEFT JOIN Badges b
+      ON u.Id = b.UserId
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation
+  ),
+  PostEngagement AS (
+    SELECT
+      p.Id AS PostId,
+      p.Title,
+      pt.Name AS PostType,
+      p.Score,
+      p.ViewCount,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      CASE
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        ELSE 'Active'
+      END AS PostStatus,
+      LAG(p.Score, 1, 0) OVER (ORDER BY p.CreationDate) AS PreviousPostScore,
+      LEAD(p.Score, 1, 0) OVER (ORDER BY p.CreationDate) AS NextPostScore,
+      ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS UserPostSequence,
+      p.OwnerUserId
+    FROM Posts p
+    JOIN PostTypes pt
+      ON p.PostTypeId = pt.Id
+    WHERE
+      p.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '1 year'
+  ),
+  HighValueUsers AS (
+    SELECT
+      UserId,
+      DisplayName
+    FROM UserActivity
+    WHERE
+      RankByReputation <= 100
+      AND AvgPostScore > 5
+  )
+SELECT
+  ua.DisplayName,
+  ua.TotalPosts,
+  ua.QuestionCount,
+  ua.AnswerCount,
+  ua.CommentCount,
+  ua.BadgeCount,
+  ua.RankByReputation,
+  ua.AvgPostScore,
+  COUNT(DISTINCT pe.PostId) AS PostsInLastYear,
+  SUM(pe.Score) AS TotalScoreInLastYear,
+  MAX(pe.ViewCount) AS MaxViewCountInLastYear,
+  CASE
+    WHEN ua.DisplayName LIKE '% %' THEN UPPER(SUBSTRING(ua.DisplayName FROM 1 FOR (POSITION(' ' IN ua.DisplayName) - 1)))
+    ELSE UPPER(ua.DisplayName)
+  END AS FirstName,
+  COALESCE(hvu.UserId, -1) AS IsHighValueUserIndicator
+FROM UserActivity ua
+LEFT JOIN PostEngagement pe
+  ON ua.UserId = pe.OwnerUserId
+LEFT JOIN HighValueUsers hvu
+  ON ua.UserId = hvu.UserId
+WHERE
+  ua.TotalPosts > 10
+GROUP BY
+  ua.DisplayName,
+  ua.TotalPosts,
+  ua.QuestionCount,
+  ua.AnswerCount,
+  ua.CommentCount,
+  ua.BadgeCount,
+  ua.RankByReputation,
+  ua.AvgPostScore,
+  COALESCE(hvu.UserId, -1),
+  CASE
+    WHEN ua.DisplayName LIKE '% %' THEN UPPER(SUBSTRING(ua.DisplayName FROM 1 FOR (POSITION(' ' IN ua.DisplayName) - 1)))
+    ELSE UPPER(ua.DisplayName)
+  END
+HAVING
+  COUNT(DISTINCT pe.PostId) > 5
+UNION ALL
+SELECT
+  'Summary Statistics' AS DisplayName,
+  COUNT(DISTINCT p.OwnerUserId) AS TotalPosts,
+  COUNT(DISTINCT CASE WHEN pt.Name = 'Question' THEN p.OwnerUserId ELSE NULL END) AS QuestionCount,
+  COUNT(DISTINCT CASE WHEN pt.Name = 'Answer' THEN p.OwnerUserId ELSE NULL END) AS AnswerCount,
+  COUNT(DISTINCT c.UserId) AS CommentCount,
+  COUNT(DISTINCT b.UserId) AS BadgeCount,
+  AVG(ua.RankByReputation) AS RankByReputation,
+  AVG(ua.AvgPostScore) AS AvgPostScore,
+  COUNT(DISTINCT pe.PostId) AS PostsInLastYear,
+  SUM(pe.Score) AS TotalScoreInLastYear,
+  MAX(pe.ViewCount) AS MaxViewCountInLastYear,
+  'N/A' AS FirstName,
+  -1 AS IsHighValueUserIndicator
+FROM UserActivity ua
+LEFT JOIN Posts p
+  ON ua.UserId = p.OwnerUserId
+LEFT JOIN PostTypes pt
+  ON p.PostTypeId = pt.Id
+LEFT JOIN Comments c
+  ON ua.UserId = c.UserId
+LEFT JOIN Badges b
+  ON ua.UserId = b.UserId
+LEFT JOIN PostEngagement pe
+  ON ua.UserId = pe.OwnerUserId
+WHERE
+  ua.TotalPosts > 10;

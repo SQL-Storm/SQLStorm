@@ -1,0 +1,132 @@
+WITH RankedPosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.PostTypeId,
+    pt.Name AS PostTypeName,
+    p.OwnerUserId,
+    u.DisplayName AS OwnerDisplayName,
+    p.CreationDate,
+    p.Score,
+    p.AnswerCount,
+    p.CommentCount,
+    ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS rn_by_score,
+    AVG(CAST(p.AnswerCount AS DOUBLE PRECISION)) OVER (PARTITION BY p.PostTypeId) AS avg_answers_for_type,
+    CASE
+      WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+      WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+      ELSE 'Open'
+    END AS PostStatus,
+    SUM(CASE WHEN c.UserId IS NOT NULL THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id) AS CommentCountForPost,
+    COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE NULL END) OVER (PARTITION BY p.Id) AS UpVoteCountForPost
+  FROM Posts AS p
+  JOIN PostTypes AS pt
+    ON p.PostTypeId = pt.Id
+  LEFT JOIN Users AS u
+    ON p.OwnerUserId = u.Id
+  LEFT JOIN Comments AS c
+    ON p.Id = c.PostId
+  LEFT JOIN Votes AS v
+    ON p.Id = v.PostId AND v.VoteTypeId = 2
+  WHERE
+    p.CreationDate >= DATE '2023-01-01' AND p.CreationDate < DATE '2024-01-01'
+), RecentUserActivity AS (
+  SELECT
+    ph.UserId,
+    ph.PostId,
+    MAX(ph.CreationDate) AS LastActivityDate,
+    COUNT(DISTINCT ph.PostHistoryTypeId) AS DistinctHistoryTypes
+  FROM PostHistory AS ph
+  WHERE
+    ph.CreationDate >= (cast('2024-10-01' as date) - INTERVAL '90' DAY)
+  GROUP BY
+    ph.UserId,
+    ph.PostId
+)
+SELECT
+  rp.PostId,
+  rp.Title,
+  rp.PostTypeName,
+  rp.OwnerDisplayName,
+  rp.CreationDate,
+  rp.Score,
+  rp.AnswerCount,
+  rp.CommentCount,
+  rp.PostStatus,
+  rp.CommentCountForPost,
+  rp.UpVoteCountForPost,
+  rua.LastActivityDate AS UserLastActivityOnPost,
+  rua.DistinctHistoryTypes AS UserDistinctHistoryTypesOnPost,
+  CASE
+    WHEN rp.Score > 100 THEN 'High Score'
+    WHEN rp.Score BETWEEN 10 AND 100 THEN 'Medium Score'
+    ELSE 'Low Score'
+  END AS ScoreCategory,
+  CASE
+    WHEN CHAR_LENGTH(rp.Title) > 60 THEN SUBSTRING(rp.Title FROM 1 FOR 60) || '...'
+    ELSE rp.Title
+  END AS TruncatedTitle,
+  CASE
+    WHEN rp.OwnerUserId IS NULL THEN 'Anonymous'
+    ELSE rp.OwnerDisplayName
+  END AS EffectiveOwnerName,
+  rp.Score / (rp.avg_answers_for_type + 1) AS ScoreToAvgAnswerRatio,
+  CASE
+    WHEN rp.rn_by_score <= 10 THEN 'Top 10'
+    ELSE 'Others'
+  END AS RankCategoryForType,
+  rp.OwnerUserId,
+  rp.avg_answers_for_type,
+  rp.rn_by_score
+FROM RankedPosts AS rp
+LEFT JOIN RecentUserActivity AS rua
+  ON rp.PostId = rua.PostId AND rp.OwnerUserId = rua.UserId
+WHERE
+  rp.rn_by_score <= 20
+  AND rp.PostTypeName IN ('Question', 'Answer')
+UNION ALL
+SELECT
+  rp.PostId,
+  rp.Title,
+  rp.PostTypeName,
+  rp.OwnerDisplayName,
+  rp.CreationDate,
+  rp.Score,
+  rp.AnswerCount,
+  rp.CommentCount,
+  rp.PostStatus,
+  rp.CommentCountForPost,
+  rp.UpVoteCountForPost,
+  rua.LastActivityDate AS UserLastActivityOnPost,
+  rua.DistinctHistoryTypes AS UserDistinctHistoryTypesOnPost,
+  CASE
+    WHEN rp.Score > 100 THEN 'High Score'
+    WHEN rp.Score BETWEEN 10 AND 100 THEN 'Medium Score'
+    ELSE 'Low Score'
+  END AS ScoreCategory,
+  CASE
+    WHEN CHAR_LENGTH(rp.Title) > 60 THEN SUBSTRING(rp.Title FROM 1 FOR 60) || '...'
+    ELSE rp.Title
+  END AS TruncatedTitle,
+  CASE
+    WHEN rp.OwnerUserId IS NULL THEN 'Anonymous'
+    ELSE rp.OwnerDisplayName
+  END AS EffectiveOwnerName,
+  rp.Score / (rp.avg_answers_for_type + 1) AS ScoreToAvgAnswerRatio,
+  CASE
+    WHEN rp.rn_by_score <= 10 THEN 'Top 10'
+    ELSE 'Others'
+  END AS RankCategoryForType,
+  rp.OwnerUserId,
+  rp.avg_answers_for_type,
+  rp.rn_by_score
+FROM RankedPosts AS rp
+LEFT JOIN RecentUserActivity AS rua
+  ON rp.PostId = rua.PostId AND rp.OwnerUserId = rua.UserId
+WHERE
+  rp.Score < 0 AND rp.PostTypeName = 'Question'
+ORDER BY
+  CreationDate DESC,
+  PostId,
+  Title
+LIMIT 50;

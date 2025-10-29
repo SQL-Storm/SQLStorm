@@ -1,0 +1,414 @@
+with recent_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.location,
+    coalesce(nullif(trim(u.websiteurl), ''), 'n/a') as websiteurl_norm,
+    width_bucket(u.reputation, 0, 100000, 10) as rep_bucket
+  from users u
+  where u.creationdate >= (select date_trunc('month', max(creationdate)) - interval '24 months' from users)
+),
+q_and_a as (
+  select
+    p.id,
+    p.posttypeid,
+    p.owneruserid,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.answercount,
+    p.favoritecount,
+    p.commentcount,
+    p.title,
+    p.tags,
+    p.acceptedanswerid,
+    case when p.posttypeid = 1 then 'Question'
+         when p.posttypeid = 2 then 'Answer'
+         else 'Other' end as post_kind
+  from posts p
+  where p.posttypeid in (1,2)
+),
+tag_expansion as (
+  select
+    qa.id as post_id,
+    qa.post_kind,
+    qa.owneruserid,
+    qa.creationdate,
+    qa.score,
+    qa.viewcount,
+    qa.answercount,
+    qa.favoritecount,
+    qa.commentcount,
+    qa.title,
+    lower(trim(tg)) as tag_name
+  from q_and_a qa
+  left join lateral (
+    select unnest(string_to_array(substring(qa.tags from 2 for length(qa.tags)-2), '><')) as tg
+  ) s on qa.post_kind = 'Question'
+),
+user_activity as (
+  select
+    ru.user_id,
+    count(*) filter (where te.post_kind = 'Question') as questions,
+    count(*) filter (where te.post_kind = 'Answer') as answers,
+    sum(te.score) as total_post_score,
+    sum(greatest(te.viewcount,0)) as total_views,
+    sum(coalesce(te.commentcount,0)) as total_comments,
+    max(te.creationdate) as last_post_date
+  from recent_users ru
+  left join tag_expansion te
+    on te.owneruserid = ru.user_id
+  group by ru.user_id
+),
+vote_agg as (
+  select
+    p.owneruserid as user_id,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes_rcvd,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes_rcvd,
+    sum(case when v.votetypeid = 10 then 1 else 0 end) as deletions,
+    sum(case when v.votetypeid = 11 then 1 else 0 end) as undeletions
+  from posts p
+  left join votes v
+    on v.postid = p.id
+  group by p.owneruserid
+),
+badge_agg as (
+  select
+    b.userid as user_id,
+    count(*) as badges_total,
+    sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+    sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+    sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+    sum(case when b.tagbased = true then 1 else 0 end) as tag_badges,
+    max(b.date) as last_badge_date
+  from badges b
+  group by b.userid
+),
+closure_events as (
+  select
+    ph.postid,
+    max(ph.creationdate) filter (where ph.posthistorytypeid = 10) as last_closed,
+    max(ph.creationdate) filter (where ph.posthistorytypeid = 11) as last_reopened,
+    count(*) filter (where ph.posthistorytypeid = 10) as close_events,
+    count(*) filter (where ph.posthistorytypeid = 11) as reopen_events,
+    count(*) filter (where ph.posthistorytypeid in (12,13)) as delete_undelete_events,
+    max(cast(ph.comment as varchar)) filter (where ph.posthistorytypeid = 10) as last_close_reason_raw
+  from posthistory ph
+  group by ph.postid
+),
+dup_links as (
+  select
+    pl.postid,
+    count(*) filter (where pl.linktypeid = 3) as dup_count,
+    max(pl.creationdate) filter (where pl.linktypeid = 3) as last_dup_link
+  from postlinks pl
+  group by pl.postid
+),
+question_quality as (
+  select
+    qa.id as question_id,
+    qa.owneruserid as user_id,
+    qa.creationdate,
+    qa.score,
+    qa.viewcount,
+    qa.answercount,
+    qa.favoritecount,
+    coalesce(qa.commentcount,0) as commentcount,
+    ce.close_events,
+    ce.reopen_events,
+    dp.dup_count,
+    case
+      when qa.answercount > 0 and qa.acceptedanswerid is not null then 1
+      else 0
+    end as has_accepted,
+    case
+      when qa.viewcount is null or qa.viewcount = 0 then null
+      else round(cast(qa.score as numeric) / nullif(qa.viewcount,0), 6)
+    end as score_per_view,
+    extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - qa.creationdate)) / 86400.0 as age_days
+  from q_and_a qa
+  left join closure_events ce on ce.postid = qa.id
+  left join dup_links dp on dp.postid = qa.id
+  where qa.post_kind = 'Question'
+),
+answer_latency as (
+  select
+    q.id as question_id,
+    min(a.creationdate) as first_answer_date,
+    extract(epoch from (min(a.creationdate) - q.creationdate)) / 3600.0 as hours_to_first_answer,
+    count(a.id) as total_answers
+  from posts q
+  left join posts a
+    on a.parentid = q.id and a.posttypeid = 2
+  where q.posttypeid = 1
+  group by q.id, q.creationdate
+),
+tag_popularity as (
+  select
+    lower(t.tagname) as tag_name,
+    sum(t.count) as total_tag_count
+  from tags t
+  group by lower(t.tagname)
+),
+user_tag_pref as (
+  select
+    te.owneruserid as user_id,
+    te.tag_name,
+    count(*) as posts_with_tag,
+    sum(te.score) as score_with_tag,
+    rank() over (partition by te.owneruserid order by count(*) desc, sum(te.score) desc, min(te.creationdate)) as tag_rank
+  from tag_expansion te
+  where te.tag_name is not null
+  group by te.owneruserid, te.tag_name
+),
+norms as (
+  select
+    avg(reputation) as avg_rep,
+    stddev_pop(reputation) as sd_rep,
+    avg(score) as avg_q_score,
+    stddev_pop(score) as sd_q_score,
+    avg(viewcount) as avg_q_views,
+    stddev_pop(viewcount) as sd_q_views
+  from posts
+  where posttypeid = 1
+),
+user_milestones as (
+  select
+    u.id as user_id,
+    min(p.creationdate) filter (where p.posttypeid = 1) as first_question_date,
+    min(p.creationdate) filter (where p.posttypeid = 2) as first_answer_date,
+    min(p.creationdate) as first_post_date,
+    count(*) filter (where p.posttypeid = 1) as total_questions,
+    count(*) filter (where p.posttypeid = 2) as total_answers
+  from users u
+  left join posts p on p.owneruserid = u.id
+  group by u.id
+),
+user_comment_activity as (
+  select
+    u.id as user_id,
+    count(c.id) as comments_made,
+    sum(c.score) as comment_score,
+    max(c.creationdate) as last_comment_date
+  from users u
+  left join comments c on c.userid = u.id
+  group by u.id
+),
+activity_calendar as (
+  select
+    p.owneruserid as user_id,
+    date_trunc('month', p.creationdate) as month,
+    count(*) as posts_in_month,
+    sum(p.score) as score_in_month
+  from posts p
+  group by p.owneruserid, date_trunc('month', p.creationdate)
+),
+activity_variance as (
+  select
+    user_id,
+    avg(posts_in_month) as avg_posts_month,
+    stddev_pop(posts_in_month) as sd_posts_month,
+    avg(score_in_month) as avg_score_month,
+    stddev_pop(score_in_month) as sd_score_month
+  from activity_calendar
+  group by user_id
+),
+user_qa_mix as (
+  select
+    u.id as user_id,
+    sum(case when p.posttypeid = 1 then 1 else 0 end) as q_count,
+    sum(case when p.posttypeid = 2 then 1 else 0 end) as a_count,
+    case
+      when sum(case when p.posttypeid in (1,2) then 1 else 0 end) = 0 then null
+      else round( (cast(sum(case when p.posttypeid = 1 then 1 else 0 end) as numeric)) /
+                  nullif(sum(case when p.posttypeid in (1,2) then 1 else 0 end),0), 6)
+    end as q_ratio
+  from users u
+  left join posts p on p.owneruserid = u.id
+  group by u.id
+),
+accepted_answer_stats as (
+  select
+    a.owneruserid as user_id,
+    count(*) as answers_authored,
+    count(*) filter (where a.id in (select distinct acceptedanswerid from posts where acceptedanswerid is not null)) as accepted_answers,
+    avg(extract(epoch from (a.creationdate - q.creationdate)) / 3600.0) as avg_hours_after_question
+  from posts a
+  join posts q on q.id = a.parentid and q.posttypeid = 1
+  where a.posttypeid = 2
+  group by a.owneruserid
+),
+post_age_buckets as (
+  select
+    p.owneruserid as user_id,
+    count(*) filter (where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days') as posts_30d,
+    count(*) filter (where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '90 days') as posts_90d,
+    count(*) filter (where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days') as posts_365d
+  from posts p
+  group by p.owneruserid
+),
+recent_hot_questions as (
+  select
+    ph.postid as question_id,
+    max(ph.creationdate) as hot_date
+  from posthistory ph
+  where ph.posthistorytypeid = 52
+  group by ph.postid
+),
+cte_union as (
+  select user_id from recent_users
+  union
+  select owneruserid from posts where owneruserid is not null
+  union
+  select userid from badges
+  union
+  select userid from comments where userid is not null
+),
+ranked_questions as (
+  select
+    qq.question_id,
+    qq.user_id,
+    qq.score,
+    qq.viewcount,
+    qq.has_accepted,
+    qq.score_per_view,
+    qq.age_days,
+    al.hours_to_first_answer,
+    row_number() over (partition by qq.user_id order by coalesce(qq.score, -2147483648) desc, coalesce(qq.viewcount, -1) desc, qq.question_id) as rn_best_question,
+    row_number() over (partition by qq.user_id order by coalesce(al.hours_to_first_answer, 1e12) asc nulls last, qq.question_id) as rn_fastest_answered
+  from question_quality qq
+  left join answer_latency al on al.question_id = qq.question_id
+)
+select
+  u.id as user_id,
+  u.displayname,
+  u.reputation,
+  ru.rep_bucket,
+  coalesce(ua.questions, 0) as questions_authored,
+  coalesce(ua.answers, 0) as answers_authored,
+  coalesce(ua.total_post_score, 0) as total_post_score,
+  coalesce(ua.total_views, 0) as total_views,
+  coalesce(ua.total_comments, 0) as total_comments,
+  ua.last_post_date,
+  coalesce(va.upvotes_rcvd, 0) as upvotes_received,
+  coalesce(va.downvotes_rcvd, 0) as downvotes_received,
+  coalesce(ba.badges_total, 0) as badges_total,
+  coalesce(ba.gold_badges, 0) as gold_badges,
+  coalesce(ba.silver_badges, 0) as silver_badges,
+  coalesce(ba.bronze_badges, 0) as bronze_badges,
+  coalesce(ba.tag_badges, 0) as tag_badges,
+  ba.last_badge_date,
+  um.first_post_date,
+  um.first_question_date,
+  um.first_answer_date,
+  coalesce(uca.comments_made, 0) as comments_made,
+  coalesce(uca.comment_score, 0) as comment_score,
+  uca.last_comment_date,
+  av.avg_posts_month,
+  av.sd_posts_month,
+  av.avg_score_month,
+  av.sd_score_month,
+  uqa.q_count,
+  uqa.a_count,
+  uqa.q_ratio,
+  aas.answers_authored as answers_written,
+  aas.accepted_answers,
+  round(coalesce(cast(aas.accepted_answers as numeric) / nullif(aas.answers_authored,0), null), 6) as acceptance_rate,
+  aas.avg_hours_after_question,
+  pab.posts_30d,
+  pab.posts_90d,
+  pab.posts_365d,
+  topq.score as best_question_score,
+  topq.viewcount as best_question_views,
+  topq.has_accepted as best_question_has_accepted,
+  topq.score_per_view as best_question_score_per_view,
+  fastq.hours_to_first_answer as fastest_hours_to_first_answer,
+  case
+    when n.sd_rep > 0 then round( (u.reputation - n.avg_rep) / nullif(n.sd_rep,0), 6)
+    else null
+  end as reputation_z,
+  case
+    when n.sd_q_score > 0 then round( (coalesce(topq.score, 0) - n.avg_q_score) / nullif(n.sd_q_score,0), 6)
+    else null
+  end as best_q_score_z,
+  case
+    when n.sd_q_views > 0 then round( (coalesce(topq.viewcount, 0) - n.avg_q_views) / nullif(n.sd_q_views,0), 6)
+    else null
+  end as best_q_views_z,
+  coalesce(utp.tag_name, '(none)') as top_tag,
+  coalesce(tp.total_tag_count, 0) as top_tag_global_count,
+  case
+    when u.websiteurl is null or trim(u.websiteurl) = '' then 'No'
+    when position('http' in lower(u.websiteurl)) = 1 then 'Yes'
+    else 'Maybe'
+  end as has_valid_websiteurl,
+  case
+    when position(',' in coalesce(u.location, '')) > 0 then split_part(u.location, ',', 2)
+    else u.location
+  end as location_hint,
+  exists (
+    select 1
+    from posts p
+    where p.owneruserid = u.id
+      and p.posttypeid = 1
+      and p.score >= 10
+  ) as has_great_question,
+  exists (
+    select 1
+    from posts p
+    where p.owneruserid = u.id
+      and p.posttypeid = 2
+      and p.score >= 10
+  ) as has_great_answer,
+  coalesce((
+    select count(*)
+    from posts px
+    where px.owneruserid = u.id
+      and px.posttypeid = 1
+      and px.id in (select question_id from recent_hot_questions)
+  ), 0) as hot_questions_count,
+  coalesce((
+    select sum(case when c.score > 0 then 1 else 0 end)
+    from comments c
+    where c.userid = u.id
+  ), 0) as positive_comments_made
+from cte_union cu
+left join users u on u.id = cu.user_id
+left join recent_users ru on ru.user_id = u.id
+left join user_activity ua on ua.user_id = u.id
+left join vote_agg va on va.user_id = u.id
+left join badge_agg ba on ba.user_id = u.id
+left join norms n on true
+left join user_milestones um on um.user_id = u.id
+left join user_comment_activity uca on uca.user_id = u.id
+left join activity_variance av on av.user_id = u.id
+left join user_qa_mix uqa on uqa.user_id = u.id
+left join accepted_answer_stats aas on aas.user_id = u.id
+left join post_age_buckets pab on pab.user_id = u.id
+left join lateral (
+  select
+    rq.user_id,
+    rq.score,
+    rq.viewcount,
+    rq.has_accepted,
+    rq.score_per_view
+  from ranked_questions rq
+  where rq.user_id = u.id and rq.rn_best_question = 1
+) topq on true
+left join lateral (
+  select
+    rq.user_id,
+    rq.hours_to_first_answer
+  from ranked_questions rq
+  where rq.user_id = u.id and rq.rn_fastest_answered = 1
+) fastq on true
+left join user_tag_pref utp on utp.user_id = u.id and utp.tag_rank = 1
+left join tag_popularity tp on tp.tag_name = utp.tag_name
+where u.id is not null
+order by
+  coalesce(ua.total_post_score, 0) desc,
+  u.reputation desc,
+  u.id
+limit 500;

@@ -1,0 +1,103 @@
+WITH 
+UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COALESCE(u.UpVotes,0) - COALESCE(u.DownVotes,0)                         AS NetVotes,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id)                 AS BadgeCount,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id 
+                                    AND p.PostTypeId = 1)                     AS QuestionCount,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id 
+                                    AND p.PostTypeId = 2)                     AS AnswerCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id 
+                                    AND v.VoteTypeId = 2)                     AS UpVotesGiven,
+        CASE 
+            WHEN u.Reputation >= 5000 THEN 'PowerUser'
+            ELSE 'Regular'
+        END                                                                    AS UserTier
+    FROM Users u
+    WHERE u.Reputation > 1000
+),
+
+TopTags AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS rn
+    FROM Tags t
+    WHERE COALESCE(t.IsModeratorOnly, FALSE) = FALSE
+),
+
+RecentPosts AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.OwnerUserId,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1                         -- only questions
+      AND p.CreationDate > (CAST('2024-10-01' AS date) - INTERVAL '30 days')
+)
+
+SELECT 
+    us.Id,
+    us.DisplayName,
+    us.Reputation,
+    us.NetVotes,
+    us.BadgeCount,
+    us.QuestionCount,
+    us.AnswerCount,
+    us.UpVotesGiven,
+    us.UserTier,
+    COALESCE(rp.Title, 'No recent question')                               AS RecentQuestionTitle,
+    rp.CreationDate                                                       AS RecentQuestionDate,
+    COALESCE(rp.Score,0)                                                   AS RecentQuestionScore,
+    COALESCE(string_agg(DISTINCT tt.TagName, ', ' ORDER BY tt.rn), '')     AS TopTagList
+FROM UserStats us
+LEFT JOIN RecentPosts rp
+       ON rp.OwnerUserId = us.Id AND rp.rn = 1
+LEFT JOIN LATERAL (
+        SELECT 
+            tag.tag_name AS TagName,
+            tt.rn
+        FROM regexp_split_to_table(COALESCE(rp.Tags, ''), '\\><') AS tag(tag_name)
+        JOIN TopTags tt 
+          ON tt.TagName = tag.tag_name
+        WHERE tt.rn <= 5
+) tt ON TRUE
+GROUP BY 
+    us.Id, us.DisplayName, us.Reputation, us.NetVotes, us.BadgeCount,
+    us.QuestionCount, us.AnswerCount, us.UpVotesGiven, us.UserTier,
+    rp.Title, rp.CreationDate, rp.Score
+HAVING COUNT(tt.TagName) > 0
+
+UNION ALL
+
+SELECT 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    0                             AS NetVotes,
+    0                             AS BadgeCount,
+    0                             AS QuestionCount,
+    0                             AS AnswerCount,
+    0                             AS UpVotesGiven,
+    CASE 
+        WHEN u.Reputation >= 800 THEN 'MidRange'
+        ELSE 'LowRange'
+    END                          AS UserTier,
+    NULL                         AS RecentQuestionTitle,
+    NULL                         AS RecentQuestionDate,
+    NULL                         AS RecentQuestionScore,
+    ''                           AS TopTagList
+FROM Users u
+WHERE u.Reputation BETWEEN 500 AND 999
+  AND NOT EXISTS (
+        SELECT 1 FROM Posts p 
+        WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1
+      );

@@ -1,0 +1,130 @@
+-- {"query": "4786.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1296} 
+WITH
+  RankedPosts AS (
+    SELECT
+      p.Id AS PostId,
+      p.Title,
+      p.Score,
+      p.ViewCount,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      p.CreationDate AS PostCreationDate,
+      u.DisplayName AS OwnerDisplayName,
+      u.Reputation AS OwnerReputation,
+      pt.Name AS PostTypeName,
+      pht.Name AS LastHistoryAction,
+      ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY ph.CreationDate DESC) AS rn
+    FROM Posts AS p
+    JOIN PostTypes AS pt
+      ON p.PostTypeId = pt.Id
+    LEFT JOIN Users AS u
+      ON p.OwnerUserId = u.Id
+    LEFT JOIN PostHistory AS ph
+      ON p.Id = ph.PostId
+    LEFT JOIN PostHistoryTypes AS pht
+      ON ph.PostHistoryTypeId = pht.Id
+    WHERE
+      p.OwnerUserId IS NOT NULL AND p.Score > 0 AND p.Title IS NOT NULL AND LENGTH(p.Title) > 10
+  ),
+  PostEngagement AS (
+    SELECT
+      rp.PostId,
+      rp.Title,
+      rp.Score,
+      rp.ViewCount,
+      rp.AnswerCount,
+      rp.CommentCount,
+      rp.FavoriteCount,
+      rp.PostCreationDate,
+      rp.OwnerDisplayName,
+      rp.OwnerReputation,
+      rp.PostTypeName,
+      rp.LastHistoryAction,
+      CASE
+        WHEN rp.ViewCount > 10000 AND rp.Score > 50 THEN 'High Engagement'
+        WHEN rp.ViewCount > 5000 AND rp.Score > 20 THEN 'Medium Engagement'
+        ELSE 'Low Engagement'
+      END AS EngagementLevel,
+      COUNT(c.Id) AS CommentCountTotal,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+      CASE
+        WHEN rp.PostCreationDate BETWEEN DATE_SUB(cast('2024-10-01 12:34:56' as timestamp), INTERVAL 7 DAY) AND cast('2024-10-01 12:34:56' as timestamp) THEN 'Recent'
+        WHEN rp.PostCreationDate BETWEEN DATE_SUB(cast('2024-10-01 12:34:56' as timestamp), INTERVAL 30 DAY) AND DATE_SUB(cast('2024-10-01 12:34:56' as timestamp), INTERVAL 7 DAY) THEN 'Monthly'
+        ELSE 'Older'
+      END AS AgeGroup
+    FROM RankedPosts AS rp
+    LEFT JOIN Comments AS c
+      ON rp.PostId = c.PostId
+    LEFT JOIN Votes AS v
+      ON rp.PostId = v.PostId
+    WHERE
+      rp.rn = 1
+    GROUP BY
+      rp.PostId,
+      rp.Title,
+      rp.Score,
+      rp.ViewCount,
+      rp.AnswerCount,
+      rp.CommentCount,
+      rp.FavoriteCount,
+      rp.PostCreationDate,
+      rp.OwnerDisplayName,
+      rp.OwnerReputation,
+      rp.PostTypeName,
+      rp.LastHistoryAction
+  )
+SELECT
+  pe.PostId,
+  pe.Title,
+  pe.PostTypeName,
+  pe.OwnerDisplayName,
+  pe.OwnerReputation,
+  pe.Score,
+  pe.ViewCount,
+  pe.AnswerCount,
+  pe.CommentCountTotal,
+  pe.UpVoteCount,
+  pe.DownVoteCount,
+  pe.FavoriteCount,
+  pe.EngagementLevel,
+  pe.AgeGroup,
+  pe.LastHistoryAction,
+  CASE
+    WHEN pe.OwnerReputation > 10000 AND pe.UpVoteCount > 100 THEN 'Highly Valued Contributor'
+    WHEN pe.OwnerReputation > 1000 AND pe.UpVoteCount > 20 THEN 'Valued Contributor'
+    ELSE 'Standard Contributor'
+  END AS ContributorTier,
+  SUBSTRING(pe.Title, 1, 20) AS ShortTitle,
+  CASE
+    WHEN pe.PostCreationDate IS NULL THEN 'Unknown'
+    WHEN pe.PostCreationDate < '2020-01-01' THEN 'Pre-2020'
+    ELSE '2020-Onwards'
+  END AS Era,
+  UPPER(REPLACE(pe.OwnerDisplayName, ' ', '_')) AS NormalizedOwnerName,
+  COALESCE(pe.FavoriteCount, 0) AS SafeFavoriteCount,
+  CONCAT(pe.PostTypeName, ' - ', pe.EngagementLevel) AS TypeAndEngagement,
+  CASE
+    WHEN pe.AgeGroup = 'Recent' AND pe.EngagementLevel = 'High Engagement' THEN 'Hot Topic'
+    WHEN pe.AgeGroup = 'Monthly' AND pe.EngagementLevel = 'Medium Engagement' THEN 'Popular Trend'
+    ELSE 'Standard Post'
+  END AS TrendStatus,
+  CAST(pe.Score AS DECIMAL(10, 2)) / NULLIF(pe.ViewCount, 0) AS ScoreToViewRatio,
+  (
+    SELECT
+      COUNT(*)
+    FROM Comments AS sub_c
+    WHERE
+      sub_c.PostId = pe.PostId AND LENGTH(sub_c.Text) > 50
+  ) AS LongCommentCount
+FROM PostEngagement AS pe
+WHERE
+  pe.OwnerReputation IS NOT NULL
+  AND pe.Score > 0
+  AND pe.ViewCount > 100
+  AND pe.PostTypeName IN ('Question', 'Answer')
+ORDER BY
+  pe.Score DESC,
+  pe.ViewCount DESC
+LIMIT 100;

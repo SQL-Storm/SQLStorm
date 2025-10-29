@@ -1,0 +1,143 @@
+-- {"query": "5873.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1142} 
+WITH top_posts AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.Tags,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.CommentCount,
+    p.AnswerCount,
+    p.LastActivityDate,
+    p.LastEditDate,
+    p.FavoriteCount,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.Body,
+    p.ContentLicense
+  FROM Posts p
+  LEFT JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId = 2 -- UpMod
+  WHERE p.PostTypeId = 1 -- questions
+    AND p.CreationDate >= NOW() - INTERVAL '180 days'
+),
+recent_comments AS (
+  SELECT
+    c.Id AS CommentId,
+    c.PostId,
+    c.Score AS CommentScore,
+    c.Text,
+    c.CreationDate,
+    c.UserDisplayName,
+    c.UserId
+  FROM Comments c
+  WHERE c.CreationDate >= NOW() - INTERVAL '30 days'
+),
+author_activity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.AccountId,
+    COUNT(DISTINCT p.Id) AS PostsCount,
+    AVG(p.Score) AS AvgPostScore,
+    MAX(p.LastActivityDate) AS LastActive
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes, u.AccountId
+),
+badge_summary AS (
+  SELECT
+    b.UserId,
+    COUNT(*) AS BadgeCount,
+    SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+    SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+    SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+  FROM Badges b
+  GROUP BY b.UserId
+),
+tag_engagement AS (
+  SELECT
+    t.Id AS TagId,
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId,
+    t.WikiPostId,
+    AVG(p.Score) AS AvgQuestionScore,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount
+  FROM Tags t
+  LEFT JOIN Posts p ON p.Id = t.WikiPostId
+  GROUP BY t.Id, t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId
+),
+link_network AS (
+  SELECT
+    pl.Id,
+    pl.PostId,
+    pl.RelatedPostId,
+    pl.LinkTypeId,
+    pl.CreationDate,
+    COUNT(*) OVER (PARTITION BY pl.PostId) AS TotalLinks
+  FROM PostLinks pl
+),
+complex_post_metrics AS (
+  SELECT
+    t.TagName AS TopTag,
+    p.Title,
+    p.Id AS PostId,
+    p.CreationDate,
+    p.Score AS PostScore,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    (p.ViewCount * 0.4 + p.Score * 2 + p.AnswerCount * 3) AS CompositeRank,
+    CASE
+      WHEN p.OwnerUserId IS NULL THEN 'Unknown'
+      WHEN p.OwnerUserId = -1 THEN 'Community'
+      ELSE 'User'
+    END AS OwnerType
+  FROM Top_Posts p
+  LEFT JOIN UNNEST(string_to_array(p.Tags[2: length(p.Tags)-1], '><')) WITH ORDINALITY AS t(TagName, ord)
+      ON TRUE
+  GROUP BY TopTag, p.Title, p.Id, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.OwnerUserId
+)
+SELECT
+  qp.PostId,
+  qp.Title,
+  qp.TopTag,
+  qp.CreationDate,
+  qp.PostScore,
+  qp.ViewCount,
+  qp.AnswerCount,
+  qp.CommentCount,
+  qp.CompositeRank,
+  au.UserId AS AuthorId,
+  au.DisplayName AS AuthorName,
+  au.Reputation AS AuthorReputation,
+  ab.GoldBadges,
+  ab.SilverBadges,
+  ab.BronzeBadges,
+  ba.BadgeCount,
+  tl.TotalLinks,
+  tl.RelatedPostId,
+  tc.CommentId,
+  tc.Text AS LatestComment,
+  CASE
+    WHEN v.BountyAmount IS NOT NULL THEN v.BountyAmount
+    ELSE NULL
+  END AS Bounty,
+  v.CreationDate AS VoteDate
+FROM complex_post_metrics qp
+LEFT JOIN author_activity au ON au.UserId = qp.OwnerUserId
+LEFT JOIN badge_summary ba ON ba.UserId = au.UserId
+LEFT JOIN Votes v ON v.PostId = qp.PostId AND v.VoteTypeId = 2
+LEFT JOIN link_network tl ON tl.PostId = qp.PostId
+LEFT JOIN recent_comments tc ON tc.PostId = qp.PostId
+ORDER BY qp.CompositeRank DESC, qp.ViewCount DESC
+LIMIT 200;

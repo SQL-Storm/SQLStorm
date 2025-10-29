@@ -1,0 +1,250 @@
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        coalesce(u.AboutMe, '') as AboutMe,
+        coalesce(badges_gold.badge_count,0) as GoldBadges,
+        coalesce(badges_silver.badge_count,0) as SilverBadges,
+        coalesce(badges_bronze.badge_count,0) as BronzeBadges,
+        coalesce(posts_count.post_count,0) as TotalPosts,
+        coalesce(questions_count.question_count,0) as QuestionsCount,
+        coalesce(answers_count.answer_count,0) as AnswersCount
+    from Users u
+    left join (
+        select UserId, count(*) as badge_count from Badges where Class = 1 group by UserId
+    ) badges_gold on badges_gold.UserId = u.Id
+    left join (
+        select UserId, count(*) as badge_count from Badges where Class = 2 group by UserId
+    ) badges_silver on badges_silver.UserId = u.Id
+    left join (
+        select UserId, count(*) as badge_count from Badges where Class = 3 group by UserId
+    ) badges_bronze on badges_bronze.UserId = u.Id
+    left join (
+        select OwnerUserId, count(*) as post_count from Posts where OwnerUserId is not null and OwnerUserId > 0 group by OwnerUserId
+    ) posts_count on posts_count.OwnerUserId = u.Id
+    left join (
+        select OwnerUserId, count(*) as question_count from Posts where PostTypeId=1 and OwnerUserId is not null and OwnerUserId > 0 group by OwnerUserId
+    ) questions_count on questions_count.OwnerUserId = u.Id
+    left join (
+        select OwnerUserId, count(*) as answer_count from Posts where PostTypeId=2 and OwnerUserId is not null and OwnerUserId > 0 group by OwnerUserId
+    ) answers_count on answers_count.OwnerUserId = u.Id
+),
+UserTopPosts as (
+    select
+        p.OwnerUserId as UserId,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc) as rn
+    from Posts p
+    where p.OwnerUserId is not null and p.OwnerUserId > 0
+),
+UserBestPosts as (
+    select
+        utp.UserId,
+        json_agg(json_build_object('PostId', utp.PostId, 'PostTypeId', utp.PostTypeId, 'Score', utp.Score)) as TopPosts
+    from UserTopPosts utp
+    where utp.rn <= 5
+    group by utp.UserId
+),
+QuestionWithAcceptedAnswer as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        ans.Id as AcceptedAnswerId,
+        ans.Score as AcceptedAnswerScore,
+        ans.CreationDate as AnswerCreationDate,
+        ans.OwnerUserId as AnswerOwnerUserId,
+        ans.Body as AnswerBody
+    from Posts q
+    left join Posts ans on ans.Id = q.AcceptedAnswerId
+    where q.PostTypeId = 1
+),
+PostsWithRecentActivity as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.LastActivityDate,
+        dense_rank() over (partition by p.OwnerUserId order by p.LastActivityDate desc) as rn
+    from Posts p
+    where p.OwnerUserId is not null and p.OwnerUserId > 0
+),
+FilteredTopRecentPosts as (
+    select * from PostsWithRecentActivity where rn <= 3
+),
+UserVotesSummary as (
+    select
+        v.UserId,
+        count(case when vt.Name = 'UpMod' then 1 end) as UpVotesGiven,
+        count(case when vt.Name = 'DownMod' then 1 end) as DownVotesGiven,
+        count(case when vt.Name = 'Favorite' then 1 end) as FavoritesGiven
+    from Votes v
+    join VoteTypes vt on v.VoteTypeId = vt.Id
+    where v.UserId is not null
+    group by v.UserId
+),
+UserCommentsSummary as (
+    select
+        c.UserId,
+        count(c.Id) as CommentsCount,
+        count(distinct c.PostId) as DistinctPostsCommentedOn,
+        max(c.CreationDate) as LastCommentDate
+    from Comments c
+    where c.UserId is not null
+    group by c.UserId
+),
+UserJoinInfo as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Location,
+        case when u.WebsiteUrl is null or trim(u.WebsiteUrl) = '' then 'No Website' else u.WebsiteUrl end as Website,
+        coalesce(u.UpVotes,0) as UpVotes,
+        coalesce(u.DownVotes,0) as DownVotes
+    from Users u
+),
+FinalUserStats as (
+    select
+        r.UserId,
+        r.DisplayName,
+        r.Reputation,
+        r.CreationDate,
+        r.Location,
+        r.AboutMe,
+        r.GoldBadges,
+        r.SilverBadges,
+        r.BronzeBadges,
+        r.TotalPosts,
+        r.QuestionsCount,
+        r.AnswersCount,
+        coalesce(b.TopPosts, json_array()) as TopPosts,
+        coalesce(v.UpVotesGiven,0) as UpVotesGiven,
+        coalesce(v.DownVotesGiven,0) as DownVotesGiven,
+        coalesce(v.FavoritesGiven,0) as FavoritesGiven,
+        coalesce(c.CommentsCount,0) as CommentsCount,
+        coalesce(c.DistinctPostsCommentedOn,0) as DistinctPostsCommentedOn,
+        c.LastCommentDate,
+        j.Website,
+        j.UpVotes as UserUpVotes,
+        j.DownVotes as UserDownVotes
+    from RecursiveUserActivity r
+    left join UserBestPosts b on b.UserId = r.UserId
+    left join UserVotesSummary v on v.UserId = r.UserId
+    left join UserCommentsSummary c on c.UserId = r.UserId
+    left join UserJoinInfo j on j.UserId = r.UserId
+),
+ClosedQuestionsWithReasons AS (
+    select
+        ph.PostId,
+        ph.CreationDate as CloseDate,
+        crt.Name as CloseReason
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where ph.PostHistoryTypeId = 10 and ph.Comment is not null
+),
+DuplicatedPostsRelations AS (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name as LinkType
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    where pl.LinkTypeId in (1,3)
+)
+select 
+    fus.UserId,
+    fus.DisplayName,
+    fus.Reputation,
+    fus.GoldBadges,
+    fus.SilverBadges,
+    fus.BronzeBadges,
+    fus.TotalPosts,
+    fus.QuestionsCount,
+    fus.AnswersCount,
+    fus.UpVotesGiven,
+    fus.DownVotesGiven,
+    fus.FavoritesGiven,
+    fus.CommentsCount,
+    fus.DistinctPostsCommentedOn,
+    fus.LastCommentDate,
+    fus.Website,
+    fus.UserUpVotes,
+    fus.UserDownVotes,
+    fus.AboutMe,
+    case when fus.TotalPosts > 0 then round(cast(fus.GoldBadges as numeric)/fus.TotalPosts, 4) else null end as GoldBadgePerPost,
+    case when fus.TotalPosts > 0 then round(cast(fus.SilverBadges as numeric)/fus.TotalPosts, 4) else null end as SilverBadgePerPost,
+    case when fus.TotalPosts > 0 then round(cast(fus.BronzeBadges as numeric)/fus.TotalPosts, 4) else null end as BronzeBadgePerPost,
+    case when fus.QuestionsCount > 0 then round(cast(fus.AnswersCount as numeric)/fus.QuestionsCount, 4) else null end as AnswerToQuestionRatio,
+    fus.TopPosts,
+    (
+        select json_agg(json_build_object(
+            'PostId', p.Id,
+            'PostTypeId', p.PostTypeId,
+            'Title', p.Title,
+            'Score', p.Score,
+            'Tags', p.Tags,
+            'LastActivityDate', to_char(p.LastActivityDate, 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+        ) order by p.LastActivityDate desc)
+        from FilteredTopRecentPosts p
+        where p.OwnerUserId = fus.UserId
+        limit 3
+    ) as RecentTopPosts,
+    (
+        select count(distinct ph.PostId) 
+        from PostHistory ph
+        where ph.UserId = fus.UserId and ph.PostHistoryTypeId = 10
+    ) as ClosedQuestionsCount,
+    (
+        select string_agg(distinct crt.Name, ', ' order by crt.Name)
+        from ClosedQuestionsWithReasons cqr
+        join Posts p on p.Id = cqr.PostId
+        join CloseReasonTypes crt on crt.Name = cqr.CloseReason
+        where p.OwnerUserId = fus.UserId
+        limit 5
+    ) as CommonCloseReasons,
+    (
+        select count(distinct dr.PostId)
+        from DuplicatedPostsRelations dr
+        join Posts p on p.Id = dr.PostId
+        where p.OwnerUserId = fus.UserId and dr.LinkType = 'Duplicate'
+    ) as DuplicatePostsCount,
+    length(fus.AboutMe) as AboutMeLength,
+    substring(fus.AboutMe from 1 for 50) as AboutMePreview,
+    case when lower(fus.AboutMe) like '%sql%' then true else false end as AboutMeMentionsSQL
+from FinalUserStats fus
+where fus.TotalPosts > 10
+group by
+    fus.UserId,
+    fus.DisplayName,
+    fus.Reputation,
+    fus.GoldBadges,
+    fus.SilverBadges,
+    fus.BronzeBadges,
+    fus.TotalPosts,
+    fus.QuestionsCount,
+    fus.AnswersCount,
+    fus.UpVotesGiven,
+    fus.DownVotesGiven,
+    fus.FavoritesGiven,
+    fus.CommentsCount,
+    fus.DistinctPostsCommentedOn,
+    fus.LastCommentDate,
+    fus.Website,
+    fus.UserUpVotes,
+    fus.UserDownVotes,
+    fus.AboutMe,
+    fus.TopPosts
+order by fus.Reputation desc, fus.GoldBadges desc, fus.UserId
+limit 100;

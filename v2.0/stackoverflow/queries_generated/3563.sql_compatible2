@@ -1,0 +1,104 @@
+WITH
+usr AS (
+    SELECT
+        u.Id                                   AS uid,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate                        AS user_created,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score END),0) AS q_score,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score END),0) AS a_score,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END)     AS q_cnt,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END)     AS a_cnt,
+        MAX(p.CreationDate)                  AS last_post_dt
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+badge AS (
+    SELECT
+        b.UserId                                     AS uid,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze,
+        COUNT(*)                                     AS total_badges,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId
+                           ORDER BY b.Date DESC)    AS rn_latest_badge
+    FROM Badges b
+    GROUP BY b.UserId
+),
+voted_30d AS (
+    SELECT
+        v.UserId                                       AS uid,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END)   AS up_votes,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END)   AS down_votes,
+        MAX(v.CreationDate)                           AS last_vote_dt
+    FROM Votes v
+    WHERE v.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '30 days')
+    GROUP BY v.UserId
+),
+top_tags AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS rn
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0
+),
+question_tags AS (
+    SELECT
+        p.Id                                            AS qid,
+        UNNEST(string_to_array(TRIM(BOTH '<>' FROM p.Tags), '><')) AS tag
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.Tags IS NOT NULL
+)
+
+SELECT
+    u.uid,
+    u.DisplayName,
+    u.Reputation,
+    u.q_score,
+    u.a_score,
+    u.q_cnt,
+    u.a_cnt,
+    COALESCE(b.gold,0)   AS gold_badges,
+    COALESCE(b.silver,0) AS silver_badges,
+    COALESCE(b.bronze,0) AS bronze_badges,
+    COALESCE(v.up_votes,0)   AS up_votes_30d,
+    COALESCE(v.down_votes,0) AS down_votes_30d,
+    GREATEST(
+        COALESCE(u.last_post_dt, TIMESTAMP '1970-01-01'),
+        COALESCE(v.last_vote_dt, TIMESTAMP '1970-01-01')
+    )                         AS last_activity_dt,
+    CASE WHEN u.a_cnt = 0 THEN NULL
+         ELSE CAST(u.a_score AS numeric) / u.a_cnt
+    END                        AS avg_answer_score,
+    CASE WHEN u.q_cnt = 0 THEN NULL
+         ELSE CAST(u.q_score AS numeric) / u.q_cnt
+    END                        AS avg_question_score,
+    STRING_AGG(DISTINCT qt.tag, ', ') FILTER (WHERE tt.rn <= 5) AS top_5_tags,
+    (SELECT COUNT(*)
+       FROM Comments c
+      WHERE c.UserId = u.uid)                       AS total_comments_made,
+    (SELECT b2.Name
+       FROM Badges b2
+      WHERE b2.UserId = u.uid
+      ORDER BY b2.Date DESC
+      FETCH FIRST 1 ROW ONLY) AS latest_badge_name
+FROM usr u
+LEFT JOIN badge b   ON b.uid = u.uid
+LEFT JOIN voted_30d v ON v.uid = u.uid
+LEFT JOIN question_tags qt ON qt.qid = u.uid
+LEFT JOIN top_tags tt ON tt.TagName = qt.tag
+WHERE u.Reputation > 1000
+  AND (u.q_cnt + u.a_cnt) >= 10
+GROUP BY
+    u.uid, u.DisplayName, u.Reputation,
+    u.q_score, u.a_score, u.q_cnt, u.a_cnt,
+    b.gold, b.silver, b.bronze,
+    v.up_votes, v.down_votes,
+    u.last_post_dt, v.last_vote_dt,
+    u.CreationDate
+HAVING COUNT(DISTINCT tt.TagName) > 0
+ORDER BY u.Reputation DESC, u.uid
+LIMIT 100;

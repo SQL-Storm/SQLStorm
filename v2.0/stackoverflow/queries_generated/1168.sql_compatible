@@ -1,0 +1,182 @@
+WITH UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.Location,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - u.CreationDate)) / (60 * 60 * 24) AS DaysSinceCreation,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - u.LastAccessDate)) / (60 * 60 * 24) AS DaysSinceLastAccess,
+        COALESCE(u.WebsiteUrl, 'N/A') AS UserWebsite,
+        CAST(u.UpVotes - u.DownVotes AS NUMERIC) / NULLIF(u.Views + COALESCE(u.UpVotes, 0) + COALESCE(u.DownVotes, 0), 0) AS EngagementRatio,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        MAX(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS HasGoldBadge,
+        STRING_AGG(DISTINCT b.Name, '; ') FILTER (WHERE b.Class = 1) AS GoldBadgeNames
+    FROM Users AS u
+    LEFT JOIN Badges AS b ON u.Id = b.UserId
+    WHERE u.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '5 year')
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.Location, u.CreationDate, u.LastAccessDate, u.WebsiteUrl
+    HAVING COUNT(DISTINCT b.Id) >= 3 AND u.Reputation >= 1000
+),
+PostHistoricalMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.Title,
+        p.Tags,
+        p.LastEditDate,
+        COUNT(DISTINCT ph.Id) AS RevisionCount,
+        MAX(ph.CreationDate) AS LastHistoryDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS WasEverClosed,
+        MIN(CASE WHEN ph.PostHistoryTypeId = 5 THEN ph.CreationDate END) - p.CreationDate AS TimeToFirstBodyEdit,
+        STRING_AGG(DISTINCT crt.Name, '; ') FILTER (WHERE ph.PostHistoryTypeId = 10 AND ph.Comment IS NOT NULL AND crt.Id IS NOT NULL) AS CloseReasons,
+        (
+            SELECT MAX(c.Score)
+            FROM Comments AS c
+            WHERE c.PostId = p.Id AND c.UserId = p.OwnerUserId
+        ) AS MaxOwnerCommentScore
+    FROM Posts AS p
+    LEFT JOIN PostHistory AS ph ON p.Id = ph.PostId
+    LEFT JOIN CloseReasonTypes AS crt ON ph.PostHistoryTypeId = 10 AND ph.Comment = CAST(crt.Id AS VARCHAR)
+    WHERE p.PostTypeId IN (1, 2)
+    GROUP BY p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.AcceptedAnswerId, p.ParentId, p.Title, p.Tags, p.LastEditDate
+    HAVING COUNT(DISTINCT ph.Id) > 1
+),
+PostTagAnalysis AS (
+    SELECT
+        phm.PostId,
+        phm.OwnerUserId,
+        phm.Score,
+        phm.ViewCount,
+        phm.Title,
+        UNNEST(string_to_array(SUBSTRING(phm.Tags FROM 2 FOR LENGTH(phm.Tags) - 2), '><')) AS TagName,
+        phm.WasEverClosed
+    FROM PostHistoricalMetrics AS phm
+    WHERE phm.Tags IS NOT NULL AND LENGTH(phm.Tags) > 2
+),
+TagPerformance AS (
+    SELECT
+        pta.TagName,
+        COUNT(DISTINCT pta.PostId) AS TaggedPostCount,
+        SUM(pta.Score) AS TotalTagScore,
+        SUM(pta.ViewCount) AS TotalTagViews,
+        AVG(pta.Score) AS AvgTagScore,
+        SUM(CASE WHEN pta.WasEverClosed = 1 THEN 1 ELSE 0 END) AS ClosedTaggedPostsCount,
+        DENSE_RANK() OVER (ORDER BY SUM(pta.ViewCount) DESC, SUM(pta.Score) DESC) AS ViewRank
+    FROM PostTagAnalysis AS pta
+    GROUP BY pta.TagName
+    HAVING COUNT(DISTINCT pta.PostId) >= 5
+),
+UserPostPerformance AS (
+    SELECT
+        phm.OwnerUserId AS UserId,
+        COUNT(phm.PostId) AS TotalOwnedPosts,
+        SUM(phm.Score) AS TotalPostScore,
+        AVG(phm.Score) AS AveragePostScore,
+        SUM(phm.ViewCount) AS TotalPostViews,
+        SUM(phm.RevisionCount) AS TotalRevisionsOnOwnedPosts,
+        MAX(phm.TimeToFirstBodyEdit) AS MaxTimeToFirstEdit,
+        AVG(phm.Score) OVER (PARTITION BY DATE_TRUNC('month', phm.PostCreationDate)) AS AvgScoreForPostsInMonth,
+        MAX(CASE WHEN phm.PostTypeId = 1 THEN phm.PostCreationDate ELSE NULL END) AS LatestQuestionDate,
+        MAX(CASE WHEN phm.PostTypeId = 2 THEN phm.PostCreationDate ELSE NULL END) AS LatestAnswerDate
+    FROM PostHistoricalMetrics AS phm
+    GROUP BY phm.OwnerUserId, DATE_TRUNC('month', phm.PostCreationDate)
+    HAVING COUNT(phm.PostId) > 0
+),
+ModeratorReviewSummary AS (
+    SELECT
+        v.PostId,
+        COUNT(DISTINCT v.UserId) AS ModeratorReviewers,
+        MAX(v.CreationDate) AS LastModeratorReview,
+        SUM(CASE WHEN v.VoteTypeId = 15 THEN 1 ELSE 0 END) AS ModReviewCount
+    FROM Votes AS v
+    LEFT JOIN PostLinks AS pl ON v.PostId = pl.PostId AND pl.LinkTypeId = 3
+    WHERE v.VoteTypeId = 15
+      AND pl.PostId IS NULL
+    GROUP BY v.PostId
+    HAVING COUNT(DISTINCT v.UserId) >= 2
+)
+SELECT
+    ue.UserId,
+    ue.DisplayName,
+    ue.Reputation,
+    ue.Location,
+    ue.DaysSinceCreation,
+    ue.EngagementRatio,
+    ue.TotalBadges,
+    ue.HasGoldBadge,
+    ue.GoldBadgeNames,
+    upp.TotalOwnedPosts,
+    upp.TotalPostScore,
+    upp.AveragePostScore,
+    upp.TotalPostViews,
+    upp.TotalRevisionsOnOwnedPosts,
+    upp.MaxTimeToFirstEdit,
+    upp.AvgScoreForPostsInMonth,
+    tp.TagName AS TopContributingTag,
+    tp.TotalTagScore AS TopTagScore,
+    tp.ViewRank AS TopTagViewRank,
+    phm_main.Title AS ExamplePostTitle,
+    phm_main.MaxOwnerCommentScore,
+    phm_main.RevisionCount AS ExamplePostRevisions,
+    COALESCE(phm_main.CloseReasons, 'Not Closed') AS ExamplePostCloseReasons,
+    COALESCE(mrs.ModeratorReviewers, 0) AS AssociatedModeratorReviewers,
+    LEFT(COALESCE(ue.Location, 'Unknown'), 20) AS ShortLocation,
+    CAST(upp.TotalPostScore AS NUMERIC) / NULLIF(ue.TotalBadges, 0) AS ScorePerBadgeRatio,
+    CAST(upp.AveragePostScore AS NUMERIC) / NULLIF(upp.AvgScoreForPostsInMonth, 0) AS UserVsMonthlyAvgScoreRatio,
+    EXISTS (
+        SELECT 1
+        FROM Posts AS p_ans
+        WHERE p_ans.PostTypeId = 2
+          AND p_ans.OwnerUserId = ue.UserId
+          AND p_ans.Id IN (SELECT q.AcceptedAnswerId FROM Posts AS q WHERE q.PostTypeId = 1 AND q.AcceptedAnswerId IS NOT NULL)
+    ) AS HasAcceptedAnswersToOtherQuestions,
+    CASE
+        WHEN ue.UserId IN (
+            SELECT p_q.OwnerUserId
+            FROM Posts AS p_q
+            INNER JOIN PostHistory AS ph_q ON p_q.Id = ph_q.PostId AND ph_q.UserId = p_q.OwnerUserId AND ph_q.PostHistoryTypeId IN (4, 5, 6)
+            WHERE p_q.PostTypeId = 1 AND p_q.ViewCount > 500
+            UNION
+            SELECT p_a.OwnerUserId
+            FROM Posts AS p_a
+            INNER JOIN PostHistory AS ph_a ON p_a.Id = ph_a.PostId AND ph_a.UserId = p_a.OwnerUserId AND ph_a.PostHistoryTypeId IN (4, 5, 6)
+            WHERE p_a.PostTypeId = 2 AND p_a.Score > 200
+        ) THEN TRUE
+        ELSE FALSE
+    END AS EditedPopularSelfPostsCombined
+FROM UserEngagement AS ue
+INNER JOIN UserPostPerformance AS upp ON ue.UserId = upp.UserId
+LEFT JOIN PostTagAnalysis AS pta_top ON ue.UserId = pta_top.OwnerUserId
+LEFT JOIN TagPerformance AS tp ON pta_top.TagName = tp.TagName AND tp.ViewRank = 1
+LEFT JOIN PostHistoricalMetrics AS phm_main ON ue.UserId = phm_main.OwnerUserId
+    AND phm_main.PostTypeId = 1
+    AND phm_main.Score = (
+        SELECT MAX(phm_sub.Score)
+        FROM PostHistoricalMetrics AS phm_sub
+        WHERE phm_sub.OwnerUserId = ue.UserId AND phm_sub.PostTypeId = 1
+    )
+LEFT JOIN ModeratorReviewSummary AS mrs ON phm_main.PostId = mrs.PostId
+WHERE
+    ue.EngagementRatio IS NOT NULL AND ue.EngagementRatio > 0.005
+    AND upp.TotalPostViews > 750
+    AND (
+        (phm_main.WasEverClosed = 0 OR phm_main.WasEverClosed IS NULL)
+        OR (phm_main.TimeToFirstBodyEdit IS NOT NULL AND phm_main.TimeToFirstBodyEdit < INTERVAL '2 hour')
+    )
+    AND COALESCE(phm_main.Title, '') LIKE '%SQL%'
+ORDER BY
+    ue.Reputation DESC,
+    ScorePerBadgeRatio DESC NULLS LAST,
+    UserVsMonthlyAvgScoreRatio DESC NULLS LAST
+LIMIT 100;

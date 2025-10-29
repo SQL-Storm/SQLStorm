@@ -1,0 +1,419 @@
+with recent_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.location,
+    coalesce(nullif(trim(u.websiteurl), ''), 'n/a') as website_url_norm,
+    date_trunc('month', u.creationdate) as cohort_month
+  from users u
+  where u.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - cast('3 years' as interval)
+),
+user_activity as (
+  select
+    p.owneruserid as user_id,
+    count(*) filter (where p.posttypeid = 1) as q_count,
+    count(*) filter (where p.posttypeid = 2) as a_count,
+    sum(coalesce(p.score,0)) as post_score_sum,
+    sum(coalesce(p.viewcount,0)) as view_sum,
+    count(*) filter (where p.closeddate is not null) as closed_q_count,
+    max(p.lastactivitydate) as last_post_activity
+  from posts p
+  where p.owneruserid is not null
+    and p.owneruserid > 0
+    and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - cast('3 years' as interval)
+  group by p.owneruserid
+),
+user_badges as (
+  select
+    b.userid as user_id,
+    count(*) as badge_count,
+    count(*) filter (where b.class = 1) as gold,
+    count(*) filter (where b.class = 2) as silver,
+    count(*) filter (where b.class = 3) as bronze,
+    max(b.date) as last_badge_date
+  from badges b
+  where b.date >= cast('2024-10-01 12:34:56' as timestamp) - cast('3 years' as interval)
+  group by b.userid
+),
+vote_stats as (
+  select
+    p.owneruserid as user_id,
+    count(*) filter (where v.votetypeid = 2) as upvotes_received,
+    count(*) filter (where v.votetypeid = 3) as downvotes_received,
+    count(*) filter (where v.votetypeid = 5) as favorites_received,
+    sum(coalesce(v.bountyamount,0)) filter (where v.votetypeid in (8,9)) as bounty_total_received
+  from posts p
+  left join votes v on v.postid = p.id
+  where p.owneruserid is not null
+    and p.owneruserid > 0
+    and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - cast('3 years' as interval)
+  group by p.owneruserid
+),
+comment_stats as (
+  select
+    p.owneruserid as user_id,
+    count(c.id) as comments_on_posts,
+    sum(coalesce(c.score,0)) as comment_score_sum
+  from posts p
+  left join comments c on c.postid = p.id
+  where p.owneruserid is not null
+    and p.owneruserid > 0
+    and c.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - cast('3 years' as interval)
+  group by p.owneruserid
+),
+closure_reasons as (
+  select
+    ph.postid,
+    min(ph.creationdate) as first_close_date,
+    min(
+      case
+        when ph.posthistorytypeid = 10 and ph.comment ~ '^[0-9]+' then cast(split_part(ph.comment, ' ', 1) as int)
+        else null
+      end
+    ) as close_reason_id
+  from posthistory ph
+  where ph.posthistorytypeid = 10
+  group by ph.postid
+),
+dupe_links as (
+  select
+    pl.postid,
+    count(*) filter (where pl.linktypeid = 3) as duplicate_links
+  from postlinks pl
+  where pl.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - cast('3 years' as interval)
+  group by pl.postid
+),
+tag_extraction as (
+  select
+    p.id as post_id,
+    unnest(string_to_array(substring(p.tags, 2, greatest(length(p.tags)-2,0)), '><')) as tag_name
+  from posts p
+  where p.posttypeid = 1
+    and p.tags is not null
+    and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - cast('3 years' as interval)
+),
+user_top_tags as (
+  select
+    p.owneruserid as user_id,
+    t.tag_name,
+    count(*) as tag_q_count,
+    row_number() over (partition by p.owneruserid order by count(*) desc, min(p.creationdate)) as rn
+  from posts p
+  join tag_extraction t on t.post_id = p.id
+  group by p.owneruserid, t.tag_name
+),
+accepted_answer_ratio as (
+  select
+    q.owneruserid as user_id,
+    count(*) as total_q,
+    count(*) filter (where q.acceptedanswerid is not null) as accepted_q,
+    round(100.0 * count(*) filter (where q.acceptedanswerid is not null) / nullif(count(*),0), 2) as accept_rate_pct
+  from posts q
+  where q.posttypeid = 1
+    and q.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - cast('3 years' as interval)
+  group by q.owneruserid
+),
+answer_latency as (
+  select
+    q.owneruserid as user_id,
+    cast(percentile_cont(0.5) within group (order by extract(epoch from (a.creationdate - q.creationdate))) as double precision) as p50_ans_latency,
+    cast(percentile_cont(0.9) within group (order by extract(epoch from (a.creationdate - q.creationdate))) as double precision) as p90_ans_latency
+  from posts q
+  join posts a on a.parentid = q.id and a.posttypeid = 2
+  where q.posttypeid = 1
+    and q.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - cast('3 years' as interval)
+  group by q.owneruserid
+),
+activity_timeline as (
+  select
+    u.id as user_id,
+    date_trunc('month', p.creationdate) as month,
+    count(*) as posts_in_month
+  from users u
+  left join posts p on p.owneruserid = u.id
+                   and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - cast('3 years' as interval)
+  where u.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - cast('3 years' as interval)
+  group by u.id, date_trunc('month', p.creationdate)
+),
+activity_rank as (
+  select
+    at.user_id,
+    avg(at.posts_in_month) as avg_posts_per_month,
+    stddev_pop(at.posts_in_month) as stddev_posts_per_month,
+    rank() over (order by avg(at.posts_in_month) desc nulls last) as activity_rank
+  from activity_timeline at
+  group by at.user_id
+),
+user_quality_score as (
+  select
+    ru.user_id,
+    (
+      coalesce(ua.post_score_sum,0) * 1.0
+      + coalesce(vs.upvotes_received,0) * 0.75
+      - coalesce(vs.downvotes_received,0) * 0.5
+      + coalesce(ub.gold,0) * 10
+      + coalesce(ub.silver,0) * 3
+      + coalesce(ub.bronze,0) * 1
+      + least(coalesce(ua.view_sum,0) / 100.0, 50)
+      + coalesce(ar.accept_rate_pct,0) * 0.2
+      + coalesce(vs.bounty_total_received,0) * 0.05
+      - coalesce(ua.closed_q_count,0) * 2
+    ) as quality_score
+  from recent_users ru
+  left join user_activity ua on ua.user_id = ru.user_id
+  left join vote_stats vs on vs.user_id = ru.user_id
+  left join user_badges ub on ub.user_id = ru.user_id
+  left join accepted_answer_ratio ar on ar.user_id = ru.user_id
+),
+post_null_diagnostics as (
+  select
+    p.owneruserid as user_id,
+    count(*) filter (where p.ownerdisplayname is null) as owner_displayname_nulls,
+    count(*) filter (where p.lasteditoruserid is null and p.lasteditdate is not null) as edited_without_editor,
+    count(*) filter (where p.communityowneddate is not null) as community_owned_count
+  from posts p
+  where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - cast('3 years' as interval)
+    and p.owneruserid is not null
+    and p.owneruserid > 0
+  group by p.owneruserid
+),
+recent_close_summary as (
+  select
+    q.owneruserid as user_id,
+    count(*) as closed_count,
+    count(*) filter (where cr.close_reason_id = 101) as dup_close_count,
+    min(cr.first_close_date) as earliest_close
+  from posts q
+  join closure_reasons cr on cr.postid = q.id
+  where q.posttypeid = 1
+    and q.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - cast('3 years' as interval)
+  group by q.owneruserid
+),
+dupe_pressure as (
+  select
+    q.owneruserid as user_id,
+    sum(coalesce(dl.duplicate_links,0)) as dupe_links_total
+  from posts q
+  left join dupe_links dl on dl.postid = q.id
+  where q.posttypeid = 1
+    and q.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - cast('3 years' as interval)
+  group by q.owneruserid
+),
+name_parse as (
+  select
+    ru.user_id,
+    split_part(coalesce(ru.displayname,''), ' ', 1) as first_token,
+    length(coalesce(ru.displayname,'')) as name_len,
+    (coalesce(ru.displayname,'') ilike any (array['%admin%','%root%','%test%'])) as is_suspicious_name
+  from recent_users ru
+),
+cross_user_comp as (
+  select
+    ru.user_id,
+    avg(other.reputation) as peer_avg_rep_same_loc
+  from recent_users ru
+  left join recent_users other
+    on other.location is not distinct from ru.location
+   and other.user_id <> ru.user_id
+  group by ru.user_id
+),
+cohort_peers as (
+  select
+    ru.user_id,
+    count(*) filter (where ru2.reputation > ru.reputation) as peers_with_higher_rep,
+    count(*) filter (where ru2.reputation < ru.reputation) as peers_with_lower_rep
+  from recent_users ru
+  left join recent_users ru2
+    on ru2.cohort_month = ru.cohort_month
+   and ru2.user_id <> ru.user_id
+  group by ru.user_id
+),
+posttype_lut as (
+  select id, name from posttypes
+),
+final_users as (
+  select
+    ru.user_id,
+    ru.displayname,
+    ru.reputation,
+    ru.cohort_month,
+    coalesce(ua.q_count,0) as q_count,
+    coalesce(ua.a_count,0) as a_count,
+    coalesce(ua.post_score_sum,0) as post_score_sum,
+    coalesce(ua.view_sum,0) as view_sum,
+    ua.last_post_activity,
+    coalesce(ub.badge_count,0) as badge_count,
+    coalesce(ub.gold,0) as gold,
+    coalesce(ub.silver,0) as silver,
+    coalesce(ub.bronze,0) as bronze,
+    ub.last_badge_date,
+    coalesce(vs.upvotes_received,0) as upvotes_received,
+    coalesce(vs.downvotes_received,0) as downvotes_received,
+    coalesce(vs.favorites_received,0) as favorites_received,
+    coalesce(vs.bounty_total_received,0) as bounty_total_received,
+    coalesce(cs.comments_on_posts,0) as comments_on_posts,
+    coalesce(cs.comment_score_sum,0) as comment_score_sum,
+    coalesce(ar.accept_rate_pct,0) as accept_rate_pct,
+    al.p50_ans_latency,
+    al.p90_ans_latency,
+    coalesce(ut.tag_name, '(none)') as top_tag,
+    coalesce(ut.tag_q_count,0) as top_tag_q_count,
+    coalesce(ars.avg_posts_per_month,0) as avg_posts_per_month,
+    ars.stddev_posts_per_month,
+    ars.activity_rank,
+    coalesce(uqs.quality_score,0) as quality_score,
+    coalesce(pnd.owner_displayname_nulls,0) as owner_displayname_nulls,
+    coalesce(pnd.edited_without_editor,0) as edited_without_editor,
+    coalesce(pnd.community_owned_count,0) as community_owned_count,
+    coalesce(rcs.closed_count,0) as closed_count,
+    coalesce(rcs.dup_close_count,0) as dup_close_count,
+    rcs.earliest_close,
+    coalesce(dp.dupe_links_total,0) as dupe_links_total,
+    np.first_token,
+    np.name_len,
+    np.is_suspicious_name,
+    cuc.peer_avg_rep_same_loc,
+    cp.peers_with_higher_rep,
+    cp.peers_with_lower_rep
+  from recent_users ru
+  left join user_activity ua on ua.user_id = ru.user_id
+  left join user_badges ub on ub.user_id = ru.user_id
+  left join vote_stats vs on vs.user_id = ru.user_id
+  left join comment_stats cs on cs.user_id = ru.user_id
+  left join accepted_answer_ratio ar on ar.user_id = ru.user_id
+  left join answer_latency al on al.user_id = ru.user_id
+  left join user_top_tags ut on ut.user_id = ru.user_id and ut.rn = 1
+  left join activity_rank ars on ars.user_id = ru.user_id
+  left join user_quality_score uqs on uqs.user_id = ru.user_id
+  left join post_null_diagnostics pnd on pnd.user_id = ru.user_id
+  left join recent_close_summary rcs on rcs.user_id = ru.user_id
+  left join dupe_pressure dp on dp.user_id = ru.user_id
+  left join name_parse np on np.user_id = ru.user_id
+  left join cross_user_comp cuc on cuc.user_id = ru.user_id
+  left join cohort_peers cp on cp.user_id = ru.user_id
+),
+user_json as (
+  select
+    fu.user_id,
+    jsonb_build_object(
+      'displayName', fu.displayname,
+      'reputation', fu.reputation,
+      'cohortMonth', fu.cohort_month,
+      'activity', jsonb_build_object(
+        'questions', fu.q_count,
+        'answers', fu.a_count,
+        'postScoreSum', fu.post_score_sum,
+        'views', fu.view_sum,
+        'lastPostActivity', fu.last_post_activity,
+        'avgPostsPerMonth', fu.avg_posts_per_month,
+        'stddevPostsPerMonth', fu.stddev_posts_per_month,
+        'activityRank', fu.activity_rank
+      ),
+      'badges', jsonb_build_object(
+        'total', fu.badge_count,
+        'gold', fu.gold,
+        'silver', fu.silver,
+        'bronze', fu.bronze,
+        'lastBadgeDate', fu.last_badge_date
+      ),
+      'votes', jsonb_build_object(
+        'up', fu.upvotes_received,
+        'down', fu.downvotes_received,
+        'favorites', fu.favorites_received,
+        'bounty', fu.bounty_total_received
+      ),
+      'qQuality', jsonb_build_object(
+        'acceptRatePct', fu.accept_rate_pct,
+        'p50AnswerLatency', fu.p50_ans_latency,
+        'p90AnswerLatency', fu.p90_ans_latency,
+        'closedCount', fu.closed_count,
+        'dupCloseCount', fu.dup_close_count,
+        'earliestClose', fu.earliest_close,
+        'duplicateLinksTotal', fu.dupe_links_total
+      ),
+      'topTag', jsonb_build_object(
+        'name', fu.top_tag,
+        'questionCount', fu.top_tag_q_count
+      ),
+      'diagnostics', jsonb_build_object(
+        'ownerDisplayNameNulls', fu.owner_displayname_nulls,
+        'editedWithoutEditor', fu.edited_without_editor,
+        'communityOwnedCount', fu.community_owned_count
+      ),
+      'name', jsonb_build_object(
+        'firstToken', fu.first_token,
+        'length', fu.name_len,
+        'suspicious', fu.is_suspicious_name
+      ),
+      'peers', jsonb_build_object(
+        'peerAvgRepSameLocation', fu.peer_avg_rep_same_loc,
+        'higherRepPeers', fu.peers_with_higher_rep,
+        'lowerRepPeers', fu.peers_with_lower_rep
+      ),
+      'qualityScore', fu.quality_score
+    ) as user_payload
+  from final_users fu
+),
+ranked as (
+  select
+    fu.*,
+    dense_rank() over (order by quality_score desc nulls last) as quality_rank,
+    dense_rank() over (order by (post_score_sum + upvotes_received - downvotes_received + badge_count*2) desc nulls last) as influence_rank,
+    row_number() over (order by avg_posts_per_month desc nulls last, accept_rate_pct desc nulls last) as consistency_rank
+  from final_users fu
+),
+top_and_rising as (
+  select user_id from ranked where quality_rank <= 50
+  union
+  select user_id from ranked
+  where consistency_rank <= 50
+    and coalesce(avg_posts_per_month,0) > 0
+)
+select
+  r.user_id,
+  r.displayname,
+  r.reputation,
+  r.quality_score,
+  r.quality_rank,
+  r.influence_rank,
+  r.consistency_rank,
+  uj.user_payload,
+  case
+    when tar.user_id is not null then 'featured'
+    when r.quality_rank <= 200 then 'notable'
+    else 'regular'
+  end as segment,
+  (
+    (coalesce(r.stddev_posts_per_month,0) > 2 and coalesce(r.accept_rate_pct,0) >= 70)
+    or (coalesce(r.closed_count,0) >= 5 and exists (
+      select 1
+      from name_parse np2
+      where np2.user_id = r.user_id
+        and np2.is_suspicious_name = true
+    ))
+  ) as flagged
+from ranked r
+left join user_json uj on uj.user_id = r.user_id
+left join top_and_rising tar on tar.user_id = r.user_id
+where
+  (
+    r.displayname is not null
+    and length(trim(r.displayname)) >= 3
+    and lower(r.displayname) !~ '(?:test|dummy|example)'
+  )
+  and (
+    r.view_sum is null
+    or r.view_sum >= 0
+  )
+  and (
+    r.top_tag is null
+    or r.top_tag not ilike any (array['meta','discussion'])
+  )
+order by
+  coalesce(tar.user_id, 0) desc,
+  r.quality_rank asc nulls last,
+  r.influence_rank asc nulls last,
+  r.user_id
+limit 500;

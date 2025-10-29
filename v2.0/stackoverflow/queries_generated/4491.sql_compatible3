@@ -1,0 +1,261 @@
+WITH
+  PostEngagement AS (
+    SELECT
+      p.Id AS PostId,
+      p.PostTypeId,
+      p.OwnerUserId,
+      p.CreationDate,
+      p.Score,
+      p.ViewCount,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      p.ClosedDate,
+      COALESCE(
+        (
+          SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id
+        ),
+        0
+      ) AS CommentCountSubquery,
+      COALESCE(
+        (
+          SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2
+        ),
+        0
+      ) AS UpVoteCountSubquery,
+      COALESCE(
+        (
+          SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3
+        ),
+        0
+      ) AS DownVoteCountSubquery,
+      COALESCE(
+        (
+          SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3
+        ),
+        0
+      ) AS DuplicateLinkCountSubquery,
+      ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserPostRank,
+      DENSE_RANK() OVER (ORDER BY p.Score DESC) AS GlobalScoreRank,
+      AVG(CAST(p.Score AS NUMERIC)) OVER (PARTITION BY p.PostTypeId) AS AvgScoreByPostType
+    FROM
+      Posts p
+    WHERE
+      p.PostTypeId IN (1, 2)
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.Reputation,
+      u.CreationDate AS UserCreationDate,
+      u.Views AS UserViews,
+      u.UpVotes AS UserUpVotes,
+      u.DownVotes AS UserDownVotes,
+      COUNT(DISTINCT ph.PostId) AS PostHistoryCount,
+      MAX(ph.CreationDate) AS LastPostHistoryDate,
+      COALESCE(
+        (
+          SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1
+        ),
+        0
+      ) AS GoldBadgeCount,
+      COALESCE(
+        (
+          SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2
+        ),
+        0
+      ) AS SilverBadgeCount,
+      COALESCE(
+        (
+          SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3
+        ),
+        0
+      ) AS BronzeBadgeCount,
+      u.DisplayName,
+      u.Location
+    FROM
+      Users u
+    LEFT JOIN
+      PostHistory ph
+      ON u.Id = ph.UserId
+    GROUP BY
+      u.Id,
+      u.Reputation,
+      u.CreationDate,
+      u.Views,
+      u.UpVotes,
+      u.DownVotes,
+      u.DisplayName,
+      u.Location
+  ),
+  HighEngagementPosts AS (
+    SELECT
+      pe.PostId,
+      pe.PostTypeId,
+      pe.OwnerUserId,
+      pe.CreationDate,
+      pe.Score,
+      pe.ViewCount,
+      pe.AnswerCount,
+      pe.CommentCount,
+      pe.FavoriteCount,
+      pe.ClosedDate,
+      pe.CommentCountSubquery,
+      pe.UpVoteCountSubquery,
+      pe.DownVoteCountSubquery,
+      pe.DuplicateLinkCountSubquery,
+      ua.Reputation AS OwnerReputation,
+      pe.UserPostRank,
+      ua.GoldBadgeCount,
+      ua.SilverBadgeCount,
+      ua.BronzeBadgeCount,
+      CASE
+        WHEN pe.FavoriteCount > 50 AND pe.Score > 100 THEN 'Highly Favorited & Scored'
+        WHEN pe.AnswerCount > 10 AND pe.Score > 50 THEN 'High Answer & Score'
+        WHEN pe.CommentCount > 20 THEN 'Highly Commented'
+        WHEN pe.ViewCount > 10000 THEN 'High View Count'
+        ELSE 'Moderate Engagement'
+      END AS EngagementLevel,
+      LEAST(COALESCE(pe.FavoriteCount, 0), COALESCE(pe.AnswerCount, 0), COALESCE(pe.CommentCount, 0)) AS MinEngagementMetric,
+      (pe.UpVoteCountSubquery - pe.DownVoteCountSubquery) AS NetVoteScore,
+      (CAST(pe.ViewCount AS NUMERIC) / NULLIF(pe.AnswerCount, 0)) AS ViewsPerAnswer,
+      SUBSTRING(ua.DisplayName FROM 1 FOR 3) AS DisplayNamePrefix,
+      CASE
+        WHEN ua.Location LIKE '%USA%' THEN 'US User'
+        WHEN ua.Location LIKE '%Europe%' THEN 'European User'
+        ELSE 'Other Location'
+      END AS UserRegion,
+      ua.UserCreationDate,
+      ua.UserViews,
+      ua.UserUpVotes,
+      ua.UserDownVotes,
+      ua.PostHistoryCount,
+      ua.LastPostHistoryDate
+    FROM
+      PostEngagement pe
+    JOIN
+      UserActivity ua
+      ON pe.OwnerUserId = ua.UserId
+    WHERE
+      pe.Score > 0
+      AND pe.PostTypeId = 1
+      AND COALESCE(pe.ClosedDate, TIMESTAMP '9999-12-31 00:00:00') > TIMESTAMP '2024-10-01 12:34:56'
+  )
+SELECT
+  h.PostId,
+  h.PostTypeId,
+  h.OwnerUserId,
+  h.OwnerReputation,
+  h.CreationDate,
+  h.Score,
+  h.ViewCount,
+  h.AnswerCount,
+  h.CommentCount,
+  h.FavoriteCount,
+  h.ClosedDate,
+  h.CommentCountSubquery,
+  h.UpVoteCountSubquery,
+  h.DownVoteCountSubquery,
+  h.DuplicateLinkCountSubquery,
+  h.UserPostRank,
+  h.GoldBadgeCount,
+  h.SilverBadgeCount,
+  h.BronzeBadgeCount,
+  h.EngagementLevel,
+  h.MinEngagementMetric,
+  h.NetVoteScore,
+  h.ViewsPerAnswer,
+  h.DisplayNamePrefix,
+  h.UserRegion,
+  h.UserCreationDate,
+  h.UserViews,
+  h.UserUpVotes,
+  h.UserDownVotes,
+  h.PostHistoryCount,
+  h.LastPostHistoryDate,
+  'GeneratedReport_' || TO_CHAR(CAST(h.CreationDate AS DATE), 'YYYYMMDD') AS ReportName,
+  CASE
+    WHEN h.OwnerReputation > 100000 THEN 'Expert'
+    WHEN h.OwnerReputation > 10000 THEN 'Experienced'
+    WHEN h.OwnerReputation > 1000 THEN 'Intermediate'
+    ELSE 'Beginner'
+  END AS OwnerExperienceLevel,
+  CASE
+    WHEN h.AnswerCount > 0 THEN ROUND((CAST(h.Score AS NUMERIC) / h.AnswerCount), 2)
+    ELSE CAST(h.Score AS NUMERIC)
+  END AS ScorePerAnswer,
+  CASE
+    WHEN EXISTS (
+      SELECT 1 FROM PostLinks pl_related WHERE pl_related.RelatedPostId = h.PostId AND pl_related.LinkTypeId = 3
+    ) THEN 'Is Duplicate Of'
+    ELSE 'Not a Duplicate Of'
+  END AS DuplicateStatus,
+  UPPER(h.DisplayNamePrefix || '_' || SUBSTRING(REPLACE(h.UserRegion, ' ', ''), 1, 5)) AS CompositeIdentifier
+FROM
+  HighEngagementPosts h
+WHERE
+  h.OwnerReputation > 1000
+  AND h.AnswerCount > 0
+  AND h.DuplicateLinkCountSubquery = 0
+  AND h.UserPostRank <= 10
+  AND h.NetVoteScore > 0
+UNION
+SELECT
+  h.PostId,
+  h.PostTypeId,
+  h.OwnerUserId,
+  h.OwnerReputation,
+  h.CreationDate,
+  h.Score,
+  h.ViewCount,
+  h.AnswerCount,
+  h.CommentCount,
+  h.FavoriteCount,
+  h.ClosedDate,
+  h.CommentCountSubquery,
+  h.UpVoteCountSubquery,
+  h.DownVoteCountSubquery,
+  h.DuplicateLinkCountSubquery,
+  h.UserPostRank,
+  h.GoldBadgeCount,
+  h.SilverBadgeCount,
+  h.BronzeBadgeCount,
+  h.EngagementLevel,
+  h.MinEngagementMetric,
+  h.NetVoteScore,
+  h.ViewsPerAnswer,
+  h.DisplayNamePrefix,
+  h.UserRegion,
+  h.UserCreationDate,
+  h.UserViews,
+  h.UserUpVotes,
+  h.UserDownVotes,
+  h.PostHistoryCount,
+  h.LastPostHistoryDate,
+  'GeneratedReport_' || TO_CHAR(CAST(h.CreationDate AS DATE), 'YYYYMMDD') AS ReportName,
+  CASE
+    WHEN h.OwnerReputation > 100000 THEN 'Expert'
+    WHEN h.OwnerReputation > 10000 THEN 'Experienced'
+    WHEN h.OwnerReputation > 1000 THEN 'Intermediate'
+    ELSE 'Beginner'
+  END AS OwnerExperienceLevel,
+  CASE
+    WHEN h.AnswerCount > 0 THEN ROUND((CAST(h.Score AS NUMERIC) / h.AnswerCount), 2)
+    ELSE CAST(h.Score AS NUMERIC)
+  END AS ScorePerAnswer,
+  CASE
+    WHEN EXISTS (
+      SELECT 1 FROM PostLinks pl_related WHERE pl_related.RelatedPostId = h.PostId AND pl_related.LinkTypeId = 3
+    ) THEN 'Is Duplicate Of'
+    ELSE 'Not a Duplicate Of'
+  END AS DuplicateStatus,
+  LOWER(h.DisplayNamePrefix || '_' || SUBSTRING(REPLACE(h.UserRegion, ' ', ''), 1, 5)) AS CompositeIdentifier
+FROM
+  HighEngagementPosts h
+WHERE
+  h.OwnerReputation <= 1000
+  AND h.AnswerCount > 5
+  AND h.ViewCount > 5000
+  AND h.DuplicateLinkCountSubquery = 0
+  AND h.UserPostRank <= 5
+  AND h.NetVoteScore > 10;

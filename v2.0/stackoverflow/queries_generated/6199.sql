@@ -1,0 +1,58 @@
+-- {"query": "6199.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-micro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 549} 
+
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    MAX(u.CreationDate) AS LatestAccountActivity,
+    MAX(p.LastActivityDate) AS LatestPostActivity,
+    MAX(ph.CreationDate) AS LatestPostHistoryEntry,
+    COUNT(DISTINCT v.PostId) AS TotalVotes,
+    COUNT(DISTINCT c.Id) AS TotalComments,
+    COUNT(DISTINCT pl.RelatedPostId) AS TotalLinkedPosts,
+    COUNT(DISTINCT t.Id) AS TotalTags,
+    b.Class,
+    b.TagBased,
+    (
+        SELECT COUNT(*)
+        FROM Posts p2
+        INNER JOIN Votes v2 ON p2.Id = v2.PostId
+        WHERE p2.Id = p.Id AND v2.VoteTypeId = 1
+    ) AS AcceptedAnswers,
+    (
+        SELECT STRING_AGG(TagName, ', ')
+        FROM Tags t
+        INNER JOIN Posts pt ON t.ExcerptPostId = pt.Id
+        WHERE pt.Id = p.Id
+    ) AS TagNames
+FROM 
+    Users u
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Comments c ON p.Id = c.PostId
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+LEFT JOIN 
+    PostLinks pl ON p.Id = pl.PostId
+LEFT JOIN 
+    Tags t ON p.Id = t.ExcerptPostId
+WHERE 
+    u.Reputation > 1000
+    AND u.LastAccessDate > NOW() - INTERVAL '30 days'
+    AND p.CreationDate > NOW() - INTERVAL '1 year'
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation, u.Location, b.Class, b.TagBased
+HAVING 
+    COUNT(DISTINCT p.Id) > 50
+ORDER BY 
+    u.Reputation DESC, 
+    TotalPosts DESC
+LIMIT 100;

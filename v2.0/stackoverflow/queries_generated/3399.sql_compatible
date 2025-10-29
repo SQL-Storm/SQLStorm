@@ -1,0 +1,118 @@
+WITH
+UserStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.UpVotes,0) - COALESCE(u.DownVotes,0) AS NetVotes,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadges,
+        (SELECT MAX(CreationDate) FROM Posts p WHERE p.OwnerUserId = u.Id) AS LastPostDate
+    FROM Users u
+),
+PostAgg AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswerCount,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) AS AvgAnswerScore,
+        SUM(p.ViewCount) AS TotalViews,
+        MAX(p.CreationDate) AS LatestPost
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+TagUsage AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        unnest(string_to_array(trim(both '<>' FROM p.Tags), '><')) AS Tag,
+        COUNT(*) AS TagCount
+    FROM Posts p
+    WHERE p.Tags IS NOT NULL
+      AND p.PostTypeId = 1
+    GROUP BY p.OwnerUserId, unnest(string_to_array(trim(both '<>' FROM p.Tags), '><'))
+),
+TopTags AS (
+    SELECT
+        UserId,
+        string_agg(Tag, ', ' ORDER BY TagCount DESC) FILTER (WHERE Tag IS NOT NULL) AS Top5Tags
+    FROM (
+        SELECT
+            tu.*,
+            ROW_NUMBER() OVER (PARTITION BY tu.UserId ORDER BY tu.TagCount DESC) AS rn
+        FROM TagUsage tu
+    ) t
+    WHERE rn <= 5
+    GROUP BY UserId
+),
+VoteStats AS (
+    SELECT
+        v.PostId,
+        SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS DownVotes
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY v.PostId
+),
+UserRank AS (
+    SELECT
+        us.Id,
+        ROW_NUMBER() OVER (ORDER BY us.Reputation DESC, us.NetVotes DESC) AS ReputationRank,
+        ROW_NUMBER() OVER (ORDER BY COALESCE(pa.TotalViews,0) DESC) AS ViewsRank
+    FROM UserStats us
+    LEFT JOIN PostAgg pa ON pa.UserId = us.Id
+)
+SELECT
+    us.Id AS UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.NetVotes,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    COALESCE(pa.QuestionCount,0) AS QuestionsAsked,
+    COALESCE(pa.AnswerCount,0) AS AnswersGiven,
+    ROUND(CASE WHEN us.Reputation = 0 THEN NULL ELSE CAST(us.NetVotes AS numeric) / NULLIF(us.Reputation,0) END, 2) AS VoteToRepRatio,
+    ROUND(COALESCE(CAST(pa.AvgQuestionScore AS numeric),0), 2) AS AvgQScore,
+    ROUND(COALESCE(CAST(pa.AvgAnswerScore AS numeric),0), 2) AS AvgAScore,
+    COALESCE(pa.TotalViews,0) AS TotalPostViews,
+    us.LastPostDate,
+    tt.Top5Tags,
+    ur.ReputationRank,
+    ur.ViewsRank,
+    CASE
+        WHEN ur.ReputationRank <= 100 THEN 'Top 100 Reputation'
+        WHEN ur.ViewsRank <= 100 THEN 'Top 100 Views'
+        ELSE 'Other'
+    END AS Tier
+FROM UserStats us
+LEFT JOIN PostAgg pa ON pa.UserId = us.Id
+LEFT JOIN TopTags tt ON tt.UserId = us.Id
+LEFT JOIN UserRank ur ON ur.Id = us.Id
+WHERE (us.Reputation > 10000 OR ur.ViewsRank <= 500)
+ORDER BY us.Reputation DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    NULL AS UserId,
+    NULL AS DisplayName,
+    NULL AS Reputation,
+    NULL AS NetVotes,
+    NULL AS GoldBadges,
+    NULL AS SilverBadges,
+    NULL AS BronzeBadges,
+    NULL AS QuestionsAsked,
+    NULL AS AnswersGiven,
+    NULL AS VoteToRepRatio,
+    NULL AS AvgQScore,
+    NULL AS AvgAScore,
+    NULL AS TotalPostViews,
+    NULL AS LastPostDate,
+    NULL AS Top5Tags,
+    NULL AS ReputationRank,
+    NULL AS ViewsRank,
+    CAST('--- End of Top Users ---' AS text) AS Tier;

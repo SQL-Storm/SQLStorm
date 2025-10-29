@@ -1,0 +1,179 @@
+WITH UserEngagementSummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName AS UserDisplayName,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestionsPosted,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswersPosted,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN COALESCE(P.ViewCount,0) ELSE 0 END) AS TotalQuestionViews,
+        SUM(COALESCE(P.Score,0)) AS TotalPostsScore,
+        SUM(CASE WHEN P.PostTypeId = 1 AND P.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS QuestionsWithAcceptedAnswers,
+        SUM(COALESCE(C.Score, 0)) AS TotalCommentScore,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY Ans.Score) FILTER (WHERE Ans.Id IS NOT NULL) AS MedianAnswerScore
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Posts Ans ON U.Id = Ans.OwnerUserId AND Ans.PostTypeId = 2
+    GROUP BY U.Id, U.DisplayName
+),
+PostHistoryAggregated AS (
+    SELECT
+        PH.PostId,
+        COUNT(DISTINCT PH.Id) AS TotalHistoryEvents,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9) THEN 1 ELSE 0 END) AS TotalEditRollbackCount,
+        MAX(PH.CreationDate) AS LastHistoryDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 AND PH.Comment LIKE '10%' THEN 1 ELSE 0 END) AS WasClosedRecently,
+        COUNT(DISTINCT PH.UserId) AS UniqueEditorsPerPost,
+        MAX(CASE WHEN PH.Comment ILIKE '%duplicate%' OR PH.Text ILIKE '%originalquestionids%' THEN 1 ELSE 0 END) AS HasDuplicateReference
+    FROM PostHistory PH
+    WHERE PH.PostHistoryTypeId BETWEEN 1 AND 38
+    GROUP BY PH.PostId
+),
+TagComplexityAnalysis AS (
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        CASE WHEN P.Tags IS NULL OR LENGTH(P.Tags) <= 2 THEN 0
+             ELSE COALESCE(ARRAY_LENGTH(STRING_TO_ARRAY(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><'), 1), 0)
+        END AS TagCount,
+        (
+            SELECT AVG(LENGTH(t.tag_name))
+            FROM UNNEST(STRING_TO_ARRAY(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><')) AS t(tag_name)
+        ) AS AvgTagLength,
+        P.Tags AS RawTagsString,
+        CASE
+            WHEN P.Tags LIKE '%<c++>%' OR P.Tags LIKE '%<java>%' OR P.Tags LIKE '%<python>%' THEN 1
+            ELSE 0
+        END AS HasComplexTags
+    FROM Posts P
+    WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2
+),
+RelatedPostsMetrics AS (
+    SELECT
+        PL.PostId,
+        COUNT(DISTINCT CASE WHEN PL.LinkTypeId = 1 THEN PL.RelatedPostId END) AS LinkedPostCount,
+        COUNT(DISTINCT CASE WHEN PL.LinkTypeId = 3 THEN PL.RelatedPostId END) AS DuplicateOfCount,
+        COUNT(DISTINCT P_Link.Id) AS TotalPostsRelatedToThisQuestion,
+        SUM(CASE WHEN PL.LinkTypeId = 1 AND P_Link.Score > 0 THEN COALESCE(P_Link.Score,0) ELSE 0 END) AS LinkedPostAggregateScore,
+        MAX(PL.CreationDate) AS LatestLinkActivityDate
+    FROM PostLinks PL
+    LEFT JOIN Posts P_Link ON PL.RelatedPostId = P_Link.Id
+    INNER JOIN Posts P_Question ON PL.PostId = P_Question.Id AND P_Question.PostTypeId = 1
+    GROUP BY PL.PostId
+),
+UserBadgesRanking AS (
+    SELECT
+        B.UserId,
+        COUNT(B.Id) AS TotalBadges,
+        SUM(CASE B.Class WHEN 1 THEN 300 WHEN 2 THEN 100 WHEN 3 THEN 10 ELSE 0 END) AS WeightedBadgeScore,
+        MAX(B.Date) AS LatestBadgeAwardDate,
+        DENSE_RANK() OVER (ORDER BY SUM(CASE B.Class WHEN 1 THEN 300 WHEN 2 THEN 100 WHEN 3 THEN 10 ELSE 0 END) DESC, COUNT(B.Id) DESC) AS UserBadgeRank
+    FROM Badges B
+    GROUP BY B.UserId
+),
+UserQuestionPerformance AS (
+    SELECT
+        P.Id AS QuestionId,
+        P.OwnerUserId,
+        P.CreationDate,
+        P.Score,
+        P.ViewCount,
+        P.AcceptedAnswerId,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.Score DESC, P.ViewCount DESC) AS UserQuestionScoreRank,
+        P.ViewCount - LAG(P.ViewCount, 1, 0) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate) AS ViewCountDeltaFromPrevious,
+        SUM(P.ViewCount) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate) AS CumulativeQuestionViews,
+        AVG(P.Score) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS RollingAvgScoreLast5Questions,
+        (
+            SELECT MAX(CASE WHEN C.Score > 5 THEN 1 ELSE 0 END)
+            FROM Comments C
+            WHERE C.PostId = P.Id
+        ) AS HasHighlyScoredComment
+    FROM Posts P
+    WHERE P.PostTypeId = 1
+)
+SELECT
+    U.Id AS UserId,
+    U.DisplayName,
+    U.Reputation,
+    U.CreationDate AS UserAccountCreationDate,
+    U.LastAccessDate,
+    UES.TotalQuestionsPosted,
+    UES.TotalAnswersPosted,
+    UES.TotalQuestionViews,
+    UES.TotalPostsScore,
+    UES.QuestionsWithAcceptedAnswers,
+    UES.TotalCommentsMade,
+    UES.MedianAnswerScore,
+    UBR.TotalBadges,
+    UBR.WeightedBadgeScore,
+    UBR.UserBadgeRank,
+    MAX(UQP.RollingAvgScoreLast5Questions) AS MaxRollingAvgScore,
+    MIN(UQP.UserQuestionScoreRank) AS BestQuestionRankByUser,
+    SUM(COALESCE(PHA.TotalEditRollbackCount, 0)) AS TotalHistoryModifications,
+    SUM(CASE WHEN COALESCE(PHA.WasClosedRecently,0) = 1 THEN 1 ELSE 0 END) AS QuestionsClosedRecentlyCount,
+    SUM(CASE WHEN COALESCE(PHA.UniqueEditorsPerPost,0) > 1 THEN 1 ELSE 0 END) AS PostsWithMultipleEditors,
+    SUM(COALESCE(RPM.LinkedPostCount, 0)) AS TotalLinkedQuestions,
+    SUM(COALESCE(RPM.DuplicateOfCount, 0)) AS TotalDuplicateReferences,
+    AVG(TCA.AvgTagLength) FILTER (WHERE TCA.AvgTagLength IS NOT NULL) AS AverageQuestionTagLength,
+    MAX(COALESCE(TCA.HasComplexTags,0)) AS HasPostedComplexTagQuestion,
+    COALESCE(
+        NULLIF(TRIM(SUBSTRING(U.Location FROM 1 FOR (POSITION(',' IN U.Location) - 1))), ''),
+        NULLIF(TRIM(U.Location), '')
+    ) AS PrimaryLocationSegment,
+    CASE
+        WHEN U.WebsiteUrl IS NOT NULL AND U.WebsiteUrl LIKE 'http://%' THEN 'HTTP'
+        WHEN U.WebsiteUrl IS NOT NULL AND U.WebsiteUrl LIKE 'https://%' THEN 'HTTPS'
+        WHEN U.WebsiteUrl IS NOT NULL AND U.WebsiteUrl LIKE '%stackexchange.com%' THEN 'SE_Link'
+        ELSE 'Other/None'
+    END AS WebsiteProtocolType,
+    (
+        SELECT
+            CASE WHEN COUNT(DISTINCT P_HighPerf.Id) > 0 THEN 1 ELSE 0 END
+        FROM Posts P_HighPerf
+        WHERE P_HighPerf.OwnerUserId = U.Id
+          AND P_HighPerf.PostTypeId = 1
+          AND COALESCE(P_HighPerf.Score,0) >= 100
+          AND COALESCE(P_HighPerf.CommentCount,0) >= 10
+    ) AS HasHighPerformanceQuestion,
+    (
+        SELECT COUNT(*) FROM (
+            SELECT DISTINCT P_Q.Id
+            FROM Posts P_Q
+            WHERE P_Q.OwnerUserId = U.Id AND P_Q.PostTypeId = 1
+            EXCEPT
+            SELECT DISTINCT P_A.ParentId
+            FROM Posts P_A
+            WHERE P_A.OwnerUserId = U.Id AND P_A.PostTypeId = 2
+        ) AS t
+    ) AS UnansweredQuestionsCountByThisUser,
+    EXTRACT(DAY FROM (U.LastAccessDate - U.CreationDate)) AS DaysSinceCreationToLastAccess
+FROM Users U
+INNER JOIN UserEngagementSummary UES ON U.Id = UES.UserId
+LEFT JOIN UserBadgesRanking UBR ON U.Id = UBR.UserId
+LEFT JOIN UserQuestionPerformance UQP ON U.Id = UQP.OwnerUserId
+LEFT JOIN Posts P_UserOwned ON U.Id = P_UserOwned.OwnerUserId
+LEFT JOIN PostHistoryAggregated PHA ON P_UserOwned.Id = PHA.PostId
+LEFT JOIN TagComplexityAnalysis TCA ON P_UserOwned.Id = TCA.PostId AND P_UserOwned.PostTypeId = 1
+LEFT JOIN RelatedPostsMetrics RPM ON P_UserOwned.Id = RPM.PostId
+WHERE
+    U.Reputation >= 5000
+    AND UES.TotalQuestionsPosted >= 10
+    AND UES.TotalAnswersPosted >= 5
+    AND UBR.WeightedBadgeScore IS NOT NULL
+    AND UQP.QuestionId IS NOT NULL
+GROUP BY
+    U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate,
+    UES.TotalQuestionsPosted, UES.TotalAnswersPosted, UES.TotalQuestionViews, UES.TotalPostsScore,
+    UES.QuestionsWithAcceptedAnswers, UES.TotalCommentsMade, UES.MedianAnswerScore,
+    UBR.TotalBadges, UBR.WeightedBadgeScore, UBR.UserBadgeRank,
+    U.Location, U.WebsiteUrl
+HAVING
+    COUNT(DISTINCT CASE WHEN UQP.QuestionId IS NOT NULL AND UQP.UserQuestionScoreRank = 1 AND UQP.Score >= 200 THEN UQP.QuestionId END) >= 1
+    AND SUM(COALESCE(PHA.TotalEditRollbackCount, 0)) >= 20
+    AND AVG(TCA.AvgTagLength) FILTER (WHERE TCA.AvgTagLength IS NOT NULL) > 4.5
+ORDER BY
+    UBR.WeightedBadgeScore DESC,
+    UES.TotalPostsScore DESC,
+    TotalHistoryModifications DESC,
+    UserAccountCreationDate ASC
+LIMIT 100 OFFSET 10;

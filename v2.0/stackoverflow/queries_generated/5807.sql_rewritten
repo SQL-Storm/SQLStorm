@@ -1,0 +1,126 @@
+-- {"query": "5807.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1100} 
+WITH RecentActivePosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate DESC) AS rn
+  FROM Posts p
+  WHERE p.PostTypeId = 1 -- Questions
+    AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '90 days'
+),
+TopOwners AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.ProfileImageUrl,
+    -- score distribution for their recent activity
+    COUNT(CASE WHEN p.Score > 50 THEN 1 END) AS HighScorePosts,
+    COUNT(*) AS TotalRecentPosts
+  FROM Users u
+  LEFT JOIN RecentActivePosts p
+    ON p.OwnerUserId = u.Id
+  GROUP BY
+    u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Location, u.Views, u.UpVotes, u.DownVotes, u.ProfileImageUrl
+),
+Engagement AS (
+  SELECT
+    p1.PostId,
+    p1.Title,
+    p1.OwnerUserId,
+    p1.LastActivityDate,
+    p1.ViewCount,
+    p1.Score,
+    p1.Tags,
+    COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotesFromVotes,
+    COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVotesFromVotes,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 WHEN v.VoteTypeId = 3 THEN -1 ELSE 0 END) AS NetVoteDelta,
+    SUM(CASE WHEN v.VoteTypeId = 14 THEN 1 ELSE 0 END) AS ModeratorVotes
+  FROM Posts p1
+  LEFT JOIN Votes v ON v.PostId = p1.Id
+  WHERE p1.PostTypeId = 1
+  GROUP BY p1.PostId, p1.Title, p1.OwnerUserId, p1.LastActivityDate, p1.ViewCount, p1.Score, p1.Tags
+),
+LinkedTags AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS TagCount,
+    AVG(p.Score) AS AvgPostScore
+  FROM Tags t
+  LEFT JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+  WHERE t.IsModeratorOnly = 0
+  GROUP BY t.TagName
+),
+RecentLinks AS (
+  SELECT
+    pl.Id,
+    pl.PostId,
+    pl.RelatedPostId,
+    pl.LinkTypeId,
+    pl.CreationDate
+  FROM PostLinks pl
+  WHERE pl.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '180 days'
+),
+Final AS (
+  SELECT
+    ro.UserId AS TopUserId,
+    ro.DisplayName AS TopUserName,
+    ro.Reputation,
+    ro.TotalRecentPosts,
+    ro.HighScorePosts,
+    e.PostId,
+    e.Title,
+    e.LastActivityDate,
+    e.ViewCount,
+    e.Score AS PostScore,
+    e.NetVoteDelta,
+    e.ModeratorVotes,
+    e.Tags,
+    ARRAY_AGG(DISTINCT tl.TagName) AS RelatedTags,
+    rl.RelatedPostId AS LinkedFromPostId,
+    (SELECT COUNT(*) FROM Votes v2 WHERE v2.PostId = e.PostId AND v2.VoteTypeId = 2) AS UpvotesOnPost,
+    (SELECT COUNT(*) FROM Votes v2 WHERE v2.PostId = e.PostId AND v2.VoteTypeId = 3) AS DownvotesOnPost
+  FROM TopOwners ro
+  LEFT JOIN Engagement e ON e.OwnerUserId = ro.UserId
+  LEFT JOIN LinkedTags lt ON true
+  LEFT JOIN RecentLinks rl ON rl.PostId = e.PostId
+  LEFT JOIN Tags t ON t.WikiPostId = e.PostId OR t.ExcerptPostId = e.PostId
+  GROUP BY
+    ro.UserId, ro.DisplayName, ro.Reputation, ro.TotalRecentPosts, ro.HighScorePosts,
+    e.PostId, e.Title, e.LastActivityDate, e.ViewCount, e.Score, e.NetVoteDelta, e.ModeratorVotes, e.Tags, rl.RelatedPostId
+)
+SELECT
+  'BenchmarkRun' AS BenchmarkLabel,
+  cast('2024-10-01 12:34:56' as timestamp) AS RunTimestamp,
+  Final.TopUserId,
+  Final.TopUserName,
+  Final.Reputation,
+  Final.TotalRecentPosts,
+  Final.HighScorePosts,
+  Final.PostId,
+  Final.Title,
+  Final.LastActivityDate,
+  Final.ViewCount,
+  Final.PostScore,
+  Final.NetVoteDelta,
+  Final.ModeratorVotes,
+  Final.Tags,
+  Final.RelatedTags,
+  Final.LinkedFromPostId,
+  Final.UpvotesOnPost,
+  Final.DownvotesOnPost
+FROM Final
+ORDER BY Final.Reputation DESC NULLS LAST, Final.TotalRecentPosts DESC
+LIMIT 100;

@@ -1,0 +1,277 @@
+-- {"query": "7227.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2323} 
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevScore,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS RankByScore,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) AS DenseRankByScore,
+        NTILE(10) OVER (ORDER BY p.Score DESC) AS ScoreDecile,
+        COALESCE(p.Tags, '') AS CleanTags,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN 'QuestionWithAnswers'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostCategory,
+        ISNULL(p.FavoriteCount, 0) + ISNULL(p.CommentCount, 0) AS EngagementScore,
+        DATEDIFF(day, p.CreationDate, GETDATE()) AS AgeInDays
+    FROM Posts p
+    WHERE p.CreationDate >= DATEADD(year, -2, GETDATE())
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.ViewCount,
+        u.UpVotes,
+        u.DownVotes,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(p.CreationDate) AS LatestPostDate,
+        STRING_AGG(DISTINCT p.Tags, ';') AS AllTags,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 100 THEN 'HighlyActive'
+            WHEN COUNT(DISTINCT p.Id) > 50 THEN 'Active'
+            WHEN COUNT(DISTINCT p.Id) > 10 THEN 'Moderate'
+            ELSE 'Low'
+        END AS ActivityLevel,
+        COALESCE(SUM(p.Score), 0) AS TotalScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.ViewCount, u.UpVotes, u.DownVotes, u.LastAccessDate
+    HAVING COUNT(DISTINCT p.Id) > 0
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            ELSE 'Niche'
+        END AS TagPopularity,
+        COALESCE(
+            (SELECT COUNT(*) FROM Posts p WHERE p.Tags LIKE '%' + t.TagName + '%'),
+            0
+        ) AS RelatedPostCount
+    FROM Tags t
+    WHERE t.TagName IS NOT NULL AND LEN(t.TagName) > 0
+),
+ComplexCalculations AS (
+    SELECT 
+        rp.Id,
+        rp.OwnerUserId,
+        rp.Score,
+        rp.ViewCount,
+        rp.CreationDate,
+        rp.Title,
+        rp.Tags,
+        rp.AnswerCount,
+        rp.CommentCount,
+        rp.FavoriteCount,
+        rp.PrevScore,
+        rp.RankByScore,
+        rp.DenseRankByScore,
+        rp.ScoreDecile,
+        rp.CleanTags,
+        rp.PostCategory,
+        rp.EngagementScore,
+        rp.AgeInDays,
+        ROUND(
+            (CASE 
+                WHEN rp.Score = 0 THEN 0 
+                ELSE (rp.EngagementScore * 100.0) / rp.Score 
+            END), 2
+        ) AS EfficiencyRatio,
+        CASE 
+            WHEN rp.Score > (SELECT AVG(Score) FROM Posts) THEN 'AboveAverage'
+            WHEN rp.Score > (SELECT AVG(Score) FROM Posts) * 0.8 THEN 'NearAverage'
+            ELSE 'BelowAverage'
+        END AS PerformanceTier,
+        COALESCE(
+            (SELECT TOP 1 b.Name 
+             FROM Badges b 
+             WHERE b.UserId = rp.OwnerUserId 
+               AND b.Date >= rp.CreationDate 
+               AND b.Name LIKE '%Favorite%'), 
+            'NoFavoriteBadge'
+        ) AS RecentFavoriteBadge,
+        -- Cross-join for all tags in a post
+        (SELECT STRING_AGG(tag, ', ') 
+         FROM STRING_SPLIT(rp.CleanTags, '<') AS split_tags 
+         WHERE LEN(split_tags.value) > 0) AS CleanTagList,
+        -- Subquery for user reputation analysis with filtering
+        (SELECT MAX(ua.Reputation) 
+         FROM UserActivity ua 
+         WHERE ua.UserId = rp.OwnerUserId 
+           AND ua.ActivityLevel IN ('HighlyActive', 'Active')) AS MaxReputationActiveUser,
+        -- Set operation result
+        (SELECT COUNT(*) 
+         FROM (
+             SELECT DISTINCT p1.Id FROM Posts p1 
+             WHERE p1.OwnerUserId = rp.OwnerUserId
+             INTERSECT
+             SELECT DISTINCT p2.Id FROM Posts p2 
+             WHERE p2.Tags LIKE '%python%'
+         ) AS common_posts) AS PythonPostsCount,
+        -- Window function on user activity
+        SUM(rp.Score) OVER (
+            PARTITION BY rp.OwnerUserId 
+            ORDER BY rp.CreationDate 
+            ROWS BETWEEN 10 PRECEDING AND CURRENT ROW
+        ) AS RollingScore10Posts
+    FROM RankedPosts rp
+),
+FinalAggregation AS (
+    SELECT 
+        ca.Id,
+        ca.OwnerUserId,
+        ca.Score,
+        ca.ViewCount,
+        ca.CreationDate,
+        ca.Title,
+        ca.Tags,
+        ca.AnswerCount,
+        ca.CommentCount,
+        ca.FavoriteCount,
+        ca.PrevScore,
+        ca.RankByScore,
+        ca.DenseRankByScore,
+        ca.ScoreDecile,
+        ca.CleanTags,
+        ca.PostCategory,
+        ca.EngagementScore,
+        ca.AgeInDays,
+        ca.EfficiencyRatio,
+        ca.PerformanceTier,
+        ca.RecentFavoriteBadge,
+        ca.CleanTagList,
+        ca.MaxReputationActiveUser,
+        ca.PythonPostsCount,
+        ca.RollingScore10Posts,
+        --
+        -- Complex predicate with multiple conditions
+        CASE 
+            WHEN ca.Score > 500 
+                 AND ca.ViewCount > 1000 
+                 AND ca.AgeInDays < 365 
+                 AND ca.EfficiencyRatio > 50 
+                 AND ca.PerformanceTier IN ('AboveAverage', 'NearAverage')
+                 AND (ca.CleanTagList LIKE '%python%' OR ca.CleanTagList LIKE '%java%')
+                 AND ca.RollingScore10Posts > 200
+            THEN 'ElitePost'
+            WHEN ca.Score > 100 
+                 AND ca.ViewCount > 100 
+                 AND ca.AgeInDays < 180 
+                 AND ca.EfficiencyRatio > 30 
+                 AND ca.RollingScore10Posts > 50
+            THEN 'PromisingPost'
+            WHEN ca.Score > 50 
+                 AND ca.ViewCount > 50 
+                 AND ca.AgeInDays < 90 
+                 AND ca.EfficiencyRatio > 20
+            THEN 'EmergingPost'
+            ELSE 'Standard'
+        END AS PostClassification,
+        --
+        -- Null handling with COALESCE
+        COALESCE(ca.Title, 'Untitled') AS SafeTitle,
+        COALESCE(ca.Tags, 'No Tags') AS SafeTags,
+        ISNULL(ca.AnswerCount, 0) AS SafeAnswerCount,
+        ISNULL(ca.CommentCount, 0) AS SafeCommentCount,
+        ISNULL(ca.FavoriteCount, 0) AS SafeFavoriteCount
+    FROM ComplexCalculations ca
+    WHERE ca.AgeInDays > 0
+)
+SELECT 
+    fa.Id,
+    fa.OwnerUserId,
+    fa.Score,
+    fa.ViewCount,
+    fa.CreationDate,
+    fa.SafeTitle,
+    fa.SafeTags,
+    fa.SafeAnswerCount,
+    fa.SafeCommentCount,
+    fa.SafeFavoriteCount,
+    fa.PostCategory,
+    fa.EngagementScore,
+    fa.AgeInDays,
+    fa.EfficiencyRatio,
+    fa.PerformanceTier,
+    fa.RecentFavoriteBadge,
+    fa.CleanTagList,
+    fa.MaxReputationActiveUser,
+    fa.PythonPostsCount,
+    fa.RollingScore10Posts,
+    fa.PostClassification,
+    --
+    -- Outer join logic (simulated in subqueries)
+    (SELECT TOP 1 t.TagName 
+     FROM Tags t 
+     WHERE t.TagName IN (SELECT value FROM STRING_SPLIT(fa.SafeTags, '<'))
+       AND t.Count > 100) AS PopularTag,
+    --
+    -- String functions in complex context
+    CASE 
+        WHEN LEN(fa.SafeTitle) > 50 THEN LEFT(fa.SafeTitle, 50) + '...'
+        ELSE fa.SafeTitle
+    END AS ShortenedTitle,
+    --
+    -- Set operators in the main query (UNION ALL for demonstration)
+    NULL AS DummyColumn1,
+    NULL AS DummyColumn2
+FROM FinalAggregation fa
+WHERE fa.PostClassification IN ('ElitePost', 'PromisingPost', 'EmergingPost')
+  AND fa.Score > (SELECT AVG(Score) FROM Posts WHERE CreationDate > DATEADD(year, -1, GETDATE()))
+  AND fa.ViewCount > (SELECT AVG(ViewCount) FROM Posts WHERE CreationDate > DATEADD(year, -1, GETDATE()))
+
+UNION ALL
+
+SELECT 
+    NULL AS Id,
+    NULL AS OwnerUserId,
+    NULL AS Score,
+    NULL AS ViewCount,
+    NULL AS CreationDate,
+    'Summary Row' AS SafeTitle,
+    'All Classified Posts' AS SafeTags,
+    0 AS SafeAnswerCount,
+    0 AS SafeCommentCount,
+    0 AS SafeFavoriteCount,
+    'Summary' AS PostCategory,
+    0 AS EngagementScore,
+    0 AS AgeInDays,
+    0 AS EfficiencyRatio,
+    'Summary' AS PerformanceTier,
+    'N/A' AS RecentFavoriteBadge,
+    'N/A' AS CleanTagList,
+    0 AS MaxReputationActiveUser,
+    0 AS PythonPostsCount,
+    0 AS RollingScore10Posts,
+    'Summary' AS PostClassification,
+    'Summary' AS ShortenedTitle,
+    NULL AS DummyColumn1,
+    NULL AS DummyColumn2
+FROM FinalAggregation
+WHERE PostClassification IN ('ElitePost', 'PromisingPost', 'EmergingPost')
+GROUP BY PostClassification
+
+ORDER BY 1, 2, 3 DESC, 4 DESC

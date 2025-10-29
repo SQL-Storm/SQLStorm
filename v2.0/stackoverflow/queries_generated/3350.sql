@@ -1,0 +1,120 @@
+-- {"query": "3350.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2177} 
+
+WITH TopUsers AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END)                     AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END)                     AS DownVotes,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1)                       AS GoldBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2)                       AS SilverBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3)                       AS BronzeBadges,
+        ROW_NUMBER() OVER (ORDER BY 
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) DESC)          AS rn
+    FROM Users u
+    LEFT JOIN Votes   v ON v.UserId = u.Id
+    LEFT JOIN Badges  b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+RecentQuestions AS (
+    SELECT 
+        p.Id                                 AS QuestionId,
+        p.Title,
+        p.CreationDate,
+        p.OwnerUserId,
+        COALESCE(p.Tags, '')                 AS TagString,
+        ARRAY_LENGTH(string_to_array(trim(both '<>' FROM p.Tags), '><'), 1) AS TagCount,
+        (SELECT COUNT(*) 
+         FROM Posts a 
+         WHERE a.ParentId = p.Id AND a.PostTypeId = 2)                               AS AnswerCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS q_rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= CURRENT_DATE - INTERVAL '30 days'
+),
+TagStats AS (
+    SELECT 
+        t.TagName,
+        t.Count                                   AS TagUseCount,
+        (SELECT COUNT(*) 
+         FROM Posts p 
+         WHERE p.Tags ILIKE CONCAT('%<', t.TagName, '>%'))                     AS RecentTagQuestions,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC)                             AS tag_rank
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0
+)
+SELECT
+    tu.Id                                   AS UserId,
+    tu.DisplayName,
+    tu.UpVotes,
+    tu.DownVotes,
+    tu.GoldBadges,
+    tu.SilverBadges,
+    tu.BronzeBadges,
+    rq.QuestionId,
+    rq.Title,
+    rq.CreationDate                         AS QuestionDate,
+    rq.TagCount,
+    ts.TagName,
+    ts.TagUseCount,
+    ts.RecentTagQuestions,
+    CASE
+        WHEN rq.AnswerCount = 0 THEN 'Unanswered'
+        WHEN rq.AnswerCount = 1 THEN 'SingleAnswer'
+        ELSE 'MultiAnswer'
+    END                                      AS AnswerStatus,
+    COALESCE(NULLIF(rq.TagString, ''), '<no tags>') AS NormalizedTags,
+    (SELECT COUNT(*) 
+     FROM Comments c 
+     WHERE c.PostId = rq.QuestionId AND c.Score > 0)                        AS PositiveCommentCount,
+    (SELECT MAX(v.CreationDate) 
+     FROM Votes v 
+     WHERE v.PostId = rq.QuestionId AND v.VoteTypeId = 2)                    AS LastUpvoteDate,
+    (SELECT COUNT(*) 
+     FROM PostHistory ph 
+     WHERE ph.PostId = rq.QuestionId 
+       AND ph.PostHistoryTypeId = 10 
+       AND ph.Comment::int = 101)                                           AS DuplicateCloseVotes
+FROM TopUsers tu
+LEFT JOIN RecentQuestions rq
+       ON rq.OwnerUserId = tu.Id AND rq.q_rn = 1
+LEFT JOIN LATERAL (
+    SELECT unnest(string_to_array(trim(both '<>' FROM rq.TagString), '><')) AS TagName
+) AS taglist ON true
+LEFT JOIN TagStats ts
+       ON ts.TagName = taglist.TagName AND ts.tag_rank <= 5
+WHERE tu.rn <= 100
+ORDER BY tu.rn, rq.CreationDate DESC
+LIMIT 200
+
+UNION ALL
+
+SELECT
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    p.Id,
+    p.Title,
+    p.CreationDate,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    'NoUser',
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL
+FROM Posts p
+WHERE p.PostTypeId = 1
+  AND NOT EXISTS (SELECT 1 FROM Users u WHERE u.Id = p.OwnerUserId)
+  AND p.CreationDate >= CURRENT_DATE - INTERVAL '7 days'
+ORDER BY QuestionDate DESC
+LIMIT 50;

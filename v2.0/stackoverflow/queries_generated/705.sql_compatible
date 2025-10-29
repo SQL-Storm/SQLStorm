@@ -1,0 +1,313 @@
+with
+-- normalize tags into rows for questions
+question_tags as (
+  select
+    p.id as question_id,
+    lower(trim(t::varchar)) as tag
+  from posts p
+  cross join lateral (
+    select unnest(
+      case
+        when p.posttypeid = 1 and p.tags is not null and length(p.tags) >= 2
+          then string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')
+        else array[]::varchar[]
+      end
+    ) as t
+  ) u
+  where p.posttypeid = 1
+),
+-- tag popularity percentile per tag
+tag_stats as (
+  select
+    qt.tag,
+    count(*) as questions_with_tag,
+    percentile_cont(0.5) within group (order by coalesce(p.score,0)) as median_score,
+    avg(coalesce(p.viewcount,0)) as avg_views
+  from question_tags qt
+  join posts p on p.id = qt.question_id
+  group by qt.tag
+),
+-- classify users by activity windows
+user_activity as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.location,
+    coalesce(nullif(trim(u.websiteurl),''),'(none)') as website_norm,
+    date_trunc('month', u.creationdate) as cohort_month,
+    count(distinct b.id) filter (where b.class = 1) as gold_badges,
+    count(distinct b.id) filter (where b.class = 2) as silver_badges,
+    count(distinct b.id) filter (where b.class = 3) as bronze_badges,
+    count(distinct p.id) filter (where p.posttypeid = 1) as questions_asked,
+    count(distinct p.id) filter (where p.posttypeid = 2) as answers_posted,
+    sum(coalesce(p.score,0)) filter (where p.posttypeid in (1,2)) as total_post_score,
+    max(u.lastaccessdate) as last_seen,
+    row_number() over (order by u.reputation desc, u.id) as rn_by_rep
+  from users u
+  left join badges b on b.userid = u.id
+  left join posts p on p.owneruserid = u.id
+  group by u.id, u.displayname, u.reputation, u.location, u.websiteurl, u.creationdate
+),
+-- recent hot or community-bumped questions
+recent_special_q as (
+  select
+    ph.postid as question_id,
+    max(ph.creationdate) as last_event_at,
+    max(case when ph.posthistorytypeid in (50,52) then ph.posthistorytypeid else null end) as any_special_type
+  from posthistory ph
+  join posts q on q.id = ph.postid and q.posttypeid = 1
+  where ph.posthistorytypeid in (50,52,53)
+    and ph.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+  group by ph.postid
+),
+-- answer acceptance and vote aggregates
+qa_agg as (
+  select
+    q.id as question_id,
+    q.owneruserid as asker_id,
+    q.acceptedanswerid,
+    q.creationdate as asked_at,
+    q.viewcount,
+    q.score as q_score,
+    sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end) filter (where a.id is null) as q_vote_delta,
+    count(a.id) as answer_count,
+    max(a.score) as max_answer_score,
+    sum(case when v2.votetypeid = 2 then 1 when v2.votetypeid = 3 then -1 else 0 end) as a_vote_delta,
+    count(distinct a.owneruserid) as distinct_answerers
+  from posts q
+  left join votes v on v.postid = q.id
+  left join posts a on a.parentid = q.id and a.posttypeid = 2
+  left join votes v2 on v2.postid = a.id
+  where q.posttypeid = 1
+  group by q.id, q.owneruserid, q.acceptedanswerid, q.creationdate, q.viewcount, q.score
+),
+-- compute duplicate clusters via PostLinks (duplicate links are symmetric-ish)
+dupe_clusters as (
+  select
+    least(pl.postid, pl.relatedpostid) as root_id,
+    greatest(pl.postid, pl.relatedpostid) as leaf_id,
+    min(pl.creationdate) as first_link_at
+  from postlinks pl
+  where pl.linktypeid = 3
+  group by least(pl.postid, pl.relatedpostid), greatest(pl.postid, pl.relatedpostid)
+),
+dupe_grouped as (
+  select
+    root_id,
+    count(*) + 1 as cluster_size,
+    min(first_link_at) as first_link_at
+  from dupe_clusters
+  group by root_id
+),
+-- compute rolling window popularity score per question based on time-decayed views and votes
+question_popularity as (
+  select
+    q.id as question_id,
+    q.creationdate,
+    q.viewcount,
+    q.score,
+    coalesce(exp(-extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - q.creationdate))/86400.0/30.0), 0) as decay_30d,
+    (coalesce(q.viewcount,0) * 0.001 + coalesce(q.score,0) * 1.0) *
+      coalesce(exp(-extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - q.creationdate))/86400.0/90.0), 0) as pop_score,
+    percent_rank() over (order by (coalesce(q.viewcount,0) * 0.001 + coalesce(q.score,0) * 1.0) desc) as pr_global
+  from posts q
+  where q.posttypeid = 1
+),
+-- comments sentiment-ish proxy: score distribution per post
+comment_agg as (
+  select
+    c.postid,
+    count(*) as comments_count,
+    avg(coalesce(c.score,0)) as avg_comment_score,
+    sum(case when coalesce(c.score,0) > 0 then 1 else 0 end) as pos_comments,
+    sum(case when coalesce(c.score,0) < 0 then 1 else 0 end) as neg_comments,
+    max(c.creationdate) as last_comment_at
+  from comments c
+  group by c.postid
+),
+-- correlate tags back to tag stats with null-safe behavior
+question_tag_enriched as (
+  select
+    qt.question_id,
+    qt.tag,
+    ts.questions_with_tag,
+    ts.median_score as tag_median_score,
+    ts.avg_views as tag_avg_views
+  from question_tags qt
+  left join tag_stats ts on ts.tag = qt.tag
+),
+-- per-question aggregates of tag metrics
+question_tag_agg as (
+  select
+    qte.question_id,
+    count(*) as tag_count,
+    avg(coalesce(qte.questions_with_tag,0)) as avg_tag_popularity,
+    min(coalesce(qte.tag_median_score,0)) as min_tag_median_score,
+    max(coalesce(qte.tag_avg_views,0)) as max_tag_avg_views,
+    string_agg(qte.tag, ',' order by qte.tag) as tag_list_csv
+  from question_tag_enriched qte
+  group by qte.question_id
+),
+-- compute acceptance correctness ratio for answerers on their accepted answers in recent period
+answerer_accept_stats as (
+  select
+    a.owneruserid as answerer_id,
+    count(*) filter (where q.acceptedanswerid = a.id) as accepted_answers,
+    count(*) as total_answers,
+    (count(*) filter (where q.acceptedanswerid = a.id))::numeric / nullif(count(*),0) as accept_rate
+  from posts a
+  join posts q on q.id = a.parentid and q.posttypeid = 1
+  where a.posttypeid = 2
+    and a.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+  group by a.owneruserid
+),
+-- bring it all together at the question grain
+question_feature as (
+  select
+    q.id as question_id,
+    coalesce(q.owneruserid, -1) as asker_id,
+    qa.answer_count,
+    qa.distinct_answerers,
+    qa.q_score,
+    qa.viewcount,
+    qa.a_vote_delta,
+    qa.q_vote_delta,
+    qp.pop_score,
+    qp.pr_global,
+    coalesce(qta.tag_count, 0) as tag_count,
+    coalesce(qta.avg_tag_popularity, 0) as avg_tag_popularity,
+    coalesce(qta.min_tag_median_score, 0) as min_tag_median_score,
+    coalesce(qta.max_tag_avg_views, 0) as max_tag_avg_views,
+    qta.tag_list_csv,
+    coalesce(ca.comments_count, 0) as comments_count,
+    coalesce(ca.avg_comment_score, 0) as avg_comment_score,
+    coalesce(ca.pos_comments, 0) as pos_comments,
+    coalesce(ca.neg_comments, 0) as neg_comments,
+    rs.any_special_type is not null as is_recent_special,
+    dg.cluster_size,
+    dg.first_link_at,
+    case when qa.acceptedanswerid is not null then 1 else 0 end as has_accepted_answer
+  from posts q
+  left join qa_agg qa on qa.question_id = q.id
+  left join question_popularity qp on qp.question_id = q.id
+  left join question_tag_agg qta on qta.question_id = q.id
+  left join comment_agg ca on ca.postid = q.id
+  left join recent_special_q rs on rs.question_id = q.id
+  left join dupe_grouped dg on dg.root_id = q.id
+  where q.posttypeid = 1
+),
+-- enrich with asker user features and recent answerer accept-rate via correlated subquery
+question_enriched as (
+  select
+    qf.*,
+    ua.displayname as asker_name,
+    ua.reputation as asker_rep,
+    ua.cohort_month,
+    ua.gold_badges,
+    ua.silver_badges,
+    ua.bronze_badges,
+    ua.questions_asked,
+    ua.answers_posted,
+    ua.total_post_score,
+    ua.rn_by_rep,
+    coalesce((
+      select avg(aas.accept_rate)
+      from posts a2
+      join answerer_accept_stats aas on aas.answerer_id = a2.owneruserid
+      where a2.parentid = qf.question_id and a2.posttypeid = 2
+    ), 0) as avg_answerer_accept_rate
+  from question_feature qf
+  left join user_activity ua on ua.user_id = qf.asker_id
+),
+-- window ranks for slicing
+ranked as (
+  select
+    qe.*,
+    row_number() over (partition by date_trunc('month', cast('2024-10-01 12:34:56' as timestamp)) order by qe.pop_score desc, qe.viewcount desc, qe.q_score desc) as rn_current_slice,
+    ntile(20) over (order by qe.pop_score desc) as ventiles_pop,
+    rank() over (order by qe.avg_answerer_accept_rate desc nulls last) as r_answerer_quality
+  from question_enriched qe
+),
+-- select challenging predicate set
+filtered as (
+  select
+    r.*
+  from ranked r
+  where
+    (
+      (coalesce(r.tag_count,0) between 1 and 5 and position('sql' in coalesce(r.tag_list_csv,'')) > 0)
+      or (r.is_recent_special and coalesce(r.viewcount,0) > 1000)
+      or (coalesce(r.cluster_size,1) > 3 and coalesce(r.avg_comment_score,0) <= 0)
+    )
+    and coalesce(r.pop_score,0) > 0
+    and (r.asker_rep is null or r.asker_rep >= 1000 or (r.gold_badges + r.silver_badges) >= 3)
+    and (
+      r.avg_answerer_accept_rate is null
+      or r.avg_answerer_accept_rate >= 0.2
+      or (r.answer_count >= 3 and r.distinct_answerers >= 2)
+    )
+)
+select *
+from (
+  select
+    f.question_id,
+    coalesce(f.asker_name, '(deleted)') as asker_name,
+    f.asker_rep,
+    f.q_score,
+    f.viewcount,
+    f.answer_count,
+    f.distinct_answerers,
+    f.tag_count,
+    f.tag_list_csv,
+    f.pop_score,
+    f.pr_global,
+    f.avg_answerer_accept_rate,
+    f.is_recent_special,
+    f.cluster_size,
+    f.rn_current_slice,
+    f.ventiles_pop,
+    f.r_answerer_quality,
+    date_trunc('month', f.cohort_month) as asker_cohort_month,
+    case
+      when f.has_accepted_answer = 1 then 'accepted'
+      when f.answer_count = 0 then 'unanswered'
+      else 'open'
+    end as answer_state,
+    case
+      when f.tag_count is null then 'untagged'
+      when f.tag_count = 1 then 'mono'
+      when f.tag_count between 2 and 3 then 'few'
+      else 'many'
+    end as tag_bucket
+  from filtered f
+  union all
+  select
+    -1 as question_id,
+    '(summary)' as asker_name,
+    null as asker_rep,
+    sum(f.q_score) as q_score,
+    sum(f.viewcount) as viewcount,
+    avg(f.answer_count) as answer_count,
+    avg(f.distinct_answerers) as distinct_answerers,
+    avg(f.tag_count) as tag_count,
+    null as tag_list_csv,
+    avg(f.pop_score) as pop_score,
+    avg(f.pr_global) as pr_global,
+    avg(f.avg_answerer_accept_rate) as avg_answerer_accept_rate,
+    null as is_recent_special,
+    null as cluster_size,
+    null as rn_current_slice,
+    null as ventiles_pop,
+    null as r_answerer_quality,
+    null as asker_cohort_month,
+    'summary' as answer_state,
+    'all' as tag_bucket
+  from filtered f
+) x
+order by
+  case when x.question_id = -1 then 1 else 0 end,
+  x.pop_score desc nulls last,
+  x.viewcount desc nulls last,
+  x.q_score desc nulls last
+limit 500;

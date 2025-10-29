@@ -1,0 +1,237 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY u.Reputation DESC) as RepRank,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) as RepDenseRank,
+        PERCENT_RANK() OVER (ORDER BY u.Reputation) as RepPercentile,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Gold'
+            WHEN u.Reputation >= 1000 THEN 'Silver'
+            WHEN u.Reputation >= 100 THEN 'Bronze'
+            ELSE 'Copper'
+        END as RepTier
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId OR u.Id = p.LastEditorUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId OR CAST(u.Id AS VARCHAR) = c.UserDisplayName
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        p.ParentId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END as PostType,
+        COALESCE(p.Tags, '') as Tags,
+        STRING_AGG(SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags)-2)), ', ') as TagList,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) as Upvotes,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) as Downvotes,
+        CASE 
+            WHEN p.Score > 100 THEN 'High'
+            WHEN p.Score > 10 THEN 'Medium'
+            WHEN p.Score > 0 THEN 'Low'
+            ELSE 'Negative'
+        END as ScoreCategory,
+        EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate)) as ActivityDuration,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as UserPostSequence,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) as TotalUserPosts,
+        SUM(p.Score) OVER (PARTITION BY p.OwnerUserId) as TotalUserScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as AvgUserScore
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.Score IS NOT NULL
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.CreationDate, p.LastActivityDate, p.OwnerUserId, u.DisplayName, p.ParentId, p.PostTypeId, p.Tags
+),
+QualityMetrics AS (
+    SELECT 
+        pa.PostId,
+        pa.Title,
+        pa.OwnerUserId,
+        pa.OwnerName,
+        pa.Score,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.FavoriteCount,
+        pa.ViewCount,
+        pa.ScoreCategory,
+        pa.UserPostSequence,
+        pa.TotalUserPosts,
+        pa.TotalUserScore,
+        pa.AvgUserScore,
+        CASE 
+            WHEN pa.AnswerCount > 0 AND pa.ViewCount > 1000 THEN 'High Engagement'
+            WHEN pa.AnswerCount > 5 AND pa.ViewCount > 100 THEN 'Moderate Engagement'
+            WHEN pa.AnswerCount > 0 AND pa.ViewCount <= 100 THEN 'Low Engagement'
+            ELSE 'No Answers'
+        END as EngagementLevel,
+        CASE 
+            WHEN pa.Score >= 100 AND pa.AnswerCount >= 10 THEN 'Excellent'
+            WHEN pa.Score >= 50 AND pa.AnswerCount >= 5 THEN 'Good'
+            WHEN pa.Score >= 10 AND pa.AnswerCount >= 1 THEN 'Fair'
+            ELSE 'Poor'
+        END as QualityScore,
+        (pa.AnswerCount * 1.0 / NULLIF(pa.ViewCount, 0)) as AnswerViewRatio,
+        (pa.CommentCount * 1.0 / NULLIF(pa.ViewCount, 0)) as CommentViewRatio,
+        (pa.FavoriteCount * 1.0 / NULLIF(pa.ViewCount, 0)) as FavoriteViewRatio,
+        pa.Tags
+    FROM PostAnalysis pa
+),
+UserMetrics AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.PostCount,
+        uas.CommentCount,
+        uas.BadgeCount,
+        uas.RepTier,
+        uas.RepRank,
+        uas.RepDenseRank,
+        uas.RepPercentile,
+        CASE 
+            WHEN uas.PostCount > 100 THEN 'Expert'
+            WHEN uas.PostCount > 50 THEN 'Advanced'
+            WHEN uas.PostCount > 10 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as ExperienceLevel,
+        CASE 
+            WHEN uas.BadgeCount > 50 THEN 'Veteran'
+            WHEN uas.BadgeCount > 25 THEN 'Experienced'
+            WHEN uas.BadgeCount > 5 THEN 'Novice'
+            ELSE 'Newbie'
+        END as BadgeExperience,
+        uas.LastPostDate,
+        uas.LastCommentDate,
+        EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - uas.LastPostDate)) as DaysSinceLastPost,
+        EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - uas.LastCommentDate)) as DaysSinceLastComment
+    FROM UserActivityStats uas
+),
+TagBasedAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Very Popular'
+            WHEN t.Count > 100 THEN 'Popular'
+            WHEN t.Count > 10 THEN 'Moderate'
+            ELSE 'Rare'
+        END as PopularityLevel,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as PopularityRank,
+        DENSE_RANK() OVER (ORDER BY t.Count DESC) as PopularityDenseRank,
+        PERCENT_RANK() OVER (ORDER BY t.Count) as PopularityPercentile
+    FROM Tags t
+    WHERE t.Count > 0
+),
+ComprehensiveAnalysis AS (
+    SELECT 
+        um.UserId,
+        um.DisplayName,
+        um.Reputation,
+        um.PostCount,
+        um.CommentCount,
+        um.BadgeCount,
+        um.RepTier,
+        um.ExperienceLevel,
+        um.BadgeExperience,
+        qa.PostId,
+        qa.Title,
+        qa.OwnerUserId,
+        qa.OwnerName,
+        qa.Score,
+        qa.AnswerCount,
+        qa.CommentCount as PostCommentCount,
+        qa.FavoriteCount,
+        qa.ViewCount,
+        qa.ScoreCategory,
+        qa.EngagementLevel,
+        qa.QualityScore,
+        qa.AnswerViewRatio,
+        qa.CommentViewRatio,
+        qa.FavoriteViewRatio,
+        ta.TagName,
+        ta.Count as TagCount,
+        ta.PopularityLevel,
+        CASE 
+            WHEN um.Reputation > 5000 AND qa.Score > 50 AND qa.AnswerCount > 5 THEN 'Premium'
+            WHEN um.Reputation > 1000 AND qa.Score > 20 AND qa.AnswerCount > 2 THEN 'Premium'
+            ELSE 'Standard'
+        END as UserPostCategory,
+        qa.Tags
+    FROM UserMetrics um
+    INNER JOIN QualityMetrics qa ON um.UserId = qa.OwnerUserId
+    LEFT JOIN TagBasedAnalysis ta ON qa.Tags LIKE '%' || ta.TagName || '%'
+    WHERE um.PostCount > 0
+)
+SELECT 
+    ca.UserId,
+    ca.DisplayName,
+    ca.Reputation,
+    ca.PostCount,
+    ca.CommentCount,
+    ca.BadgeCount,
+    ca.RepTier,
+    ca.ExperienceLevel,
+    ca.BadgeExperience,
+    ca.PostId,
+    ca.Title,
+    ca.OwnerUserId,
+    ca.OwnerName,
+    ca.Score,
+    ca.AnswerCount,
+    ca.PostCommentCount,
+    ca.FavoriteCount,
+    ca.ViewCount,
+    ca.ScoreCategory,
+    ca.EngagementLevel,
+    ca.QualityScore,
+    ca.AnswerViewRatio,
+    ca.CommentViewRatio,
+    ca.FavoriteViewRatio,
+    ca.TagName,
+    ca.TagCount,
+    ca.PopularityLevel,
+    ca.UserPostCategory,
+    (CASE WHEN ca.Reputation > 10000 THEN 1 ELSE 0 END +
+     CASE WHEN ca.PostCount > 100 THEN 1 ELSE 0 END +
+     CASE WHEN ca.BadgeCount > 50 THEN 1 ELSE 0 END +
+     CASE WHEN ca.AnswerCount > 20 THEN 1 ELSE 0 END +
+     CASE WHEN ca.ViewCount > 10000 THEN 1 ELSE 0 END) as EngagementScore,
+    ROW_NUMBER() OVER (ORDER BY ca.Reputation DESC, ca.Score DESC, ca.PostCount DESC) as OverallRank,
+    COUNT(*) OVER () as TotalRecords,
+    AVG(ca.Reputation) OVER () as AvgReputation,
+    STDDEV_POP(ca.Reputation) OVER () as StdDevReputation
+FROM ComprehensiveAnalysis ca
+WHERE (ca.Reputation > 1000 OR ca.PostCount > 10 OR ca.BadgeCount > 5)
+  AND ca.Score > -50
+  AND ca.Score < 10000
+ORDER BY ca.Reputation DESC, ca.Score DESC
+LIMIT 1000 OFFSET 0;

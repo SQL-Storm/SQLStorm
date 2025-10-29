@@ -1,0 +1,124 @@
+WITH
+RecentActiveQuestions AS (
+  SELECT
+    p.Id AS QuestionId,
+    p.Title,
+    p.CreationDate,
+    p.ViewCount,
+    p.Score,
+    p.OwnerUserId,
+    p.Tags,
+    p.LastActivityDate,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate DESC) AS rn
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND (p.DeletionDate IS NULL OR p.DeletionDate IS NOT DISTINCT FROM NULL)
+),
+UserStats AS (
+  SELECT
+    u.Id AS UserId,
+    u.Reputation,
+    u.CreationDate,
+    u.DisplayName,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.AccountId,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id) AS BadgeCount,
+    (SELECT STRING_AGG(b.Name, ',') FROM Badges b WHERE b.UserId = u.Id) AS BadgesList
+  FROM Users u
+),
+TopTagMedians AS (
+  SELECT
+    t.TagName,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) AS MedianScore
+  FROM Posts p
+  JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')) AS TagName
+  ) AS t ON TRUE
+  GROUP BY t.TagName
+),
+MergedQuery AS (
+  SELECT
+    rq.QuestionId,
+    rq.Title,
+    rq.CreationDate AS QuestionCreationDate,
+    rq.LastActivityDate,
+    rq.ViewCount,
+    rq.Score,
+    rq.AnswerCount,
+    rq.CommentCount,
+    rq.FavoriteCount,
+    rq.OwnerUserId,
+    us.DisplayName AS OwnerDisplayName,
+    us.Reputation,
+    us.BadgesList,
+    us.BadgeCount,
+    rq.Tags,
+    ROW_NUMBER() OVER (ORDER BY rq.LastActivityDate DESC, rq.Score DESC) AS seq
+  FROM RecentActiveQuestions rq
+  LEFT JOIN UserStats us ON rq.OwnerUserId = us.UserId
+  WHERE rq.rn = 1
+),
+Final AS (
+  SELECT
+    m.QuestionId,
+    m.Title,
+    m.QuestionCreationDate,
+    m.LastActivityDate,
+    m.ViewCount,
+    m.Score,
+    m.AnswerCount,
+    m.CommentCount,
+    m.FavoriteCount,
+    m.OwnerUserId,
+    m.OwnerDisplayName,
+    m.Reputation,
+    m.BadgesList,
+    m.BadgeCount,
+    m.Tags,
+    tm.MedianScore
+  FROM MergedQuery m
+  LEFT JOIN TopTagMedians tm ON TRUE
+  WHERE m.seq = 1
+)
+SELECT
+  f.QuestionId,
+  f.Title,
+  f.QuestionCreationDate,
+  f.LastActivityDate,
+  f.ViewCount,
+  f.Score,
+  f.AnswerCount,
+  f.CommentCount,
+  f.FavoriteCount,
+  f.OwnerUserId,
+  f.OwnerDisplayName,
+  f.Reputation,
+  f.BadgesList,
+  f.BadgeCount,
+  f.Tags,
+  f.MedianScore
+FROM Final f
+GROUP BY
+  f.QuestionId,
+  f.Title,
+  f.QuestionCreationDate,
+  f.LastActivityDate,
+  f.ViewCount,
+  f.Score,
+  f.AnswerCount,
+  f.CommentCount,
+  f.FavoriteCount,
+  f.OwnerUserId,
+  f.OwnerDisplayName,
+  f.Reputation,
+  f.BadgesList,
+  f.BadgeCount,
+  f.Tags,
+  f.MedianScore
+ORDER BY f.LastActivityDate DESC
+LIMIT 100;

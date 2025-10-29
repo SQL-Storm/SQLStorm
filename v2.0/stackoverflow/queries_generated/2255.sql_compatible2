@@ -1,0 +1,245 @@
+with recursive UserBadgeRanks as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class as BadgeClass,
+        row_number() over (partition by u.Id order by b.Class, b.Date) as BadgeRank
+    from Users u
+    join Badges b on u.Id = b.UserId
+    where b.Date >= cast('2024-10-01' as date) - interval '365 days'
+),
+RecentTopQuestions as (
+    select
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        p.CreationDate,
+        row_number() over (order by p.Score desc, p.ViewCount desc) as RankDesc
+    from Posts p
+    where p.PostTypeId = 1
+      and p.CreationDate >= cast('2024-10-01' as date) - interval '30 days'
+      and p.Score > 0
+),
+QuestionAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.CreationDate as QuestionCreationDate,
+        coalesce(count(a.Id),0) as AnswerCount,
+        coalesce(avg(a.Score),0) as AvgAnswerScore,
+        max(a.Score) as MaxAnswerScore,
+        count(distinct ph.Id) filter (where ph.PostHistoryTypeId = 10) as CloseVoteCount,
+        count(distinct ph.Id) filter (where ph.PostHistoryTypeId = 11) as ReopenVoteCount,
+        array_agg(distinct substring(t.TagName from 1 for 10)) as ShortTags,
+        string_agg(distinct lnk.Name, ',' order by lnk.Name) as LinkedPostTypes
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join PostHistory ph on ph.PostId = q.Id and ph.PostHistoryTypeId in (10,11)
+    left join LATERAL (
+      select unnest(string_to_array(substring(q.Tags from 2 for length(q.Tags)-2), '><')) as TagName
+    ) t on true
+    left join PostLinks pl on pl.PostId = q.Id
+    left join LinkTypes lnk on lnk.Id = pl.LinkTypeId
+    where q.PostTypeId = 1
+      and q.CreationDate >= cast('2024-10-01' as date) - interval '90 days'
+    group by q.Id, q.Title, q.OwnerUserId, q.CreationDate
+),
+UserReputationBuckets as (
+    select
+        Id as UserId,
+        DisplayName,
+        Reputation,
+        case
+            when Reputation >= 100000 then 'Legend'
+            when Reputation >= 20000 then 'Expert'
+            when Reputation >= 5000 then 'Contributor'
+            when Reputation >= 1000 then 'Participant'
+            else 'Newbie'
+        end as ReputationClass
+    from Users
+),
+UserLastActivity as (
+    select
+        u.Id,
+        u.DisplayName,
+        max(p.LastActivityDate) as LastPostActivity,
+        max(c.CreationDate) as LastCommentActivity,
+        greatest(
+            coalesce(max(p.LastActivityDate), timestamp '1970-01-01'),
+            coalesce(max(c.CreationDate), timestamp '1970-01-01')
+        ) as LastActivityDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+UserEngagement as (
+    select
+        ura.Id as UserId,
+        ura.DisplayName,
+        ur.ReputationClass,
+        ura.LastActivityDate,
+        coalesce(ub.BadgeCount,0) as BadgeCount,
+        coalesce(uaq.AnsweredQuestions,0) as AnsweredQuestions
+    from UserLastActivity ura
+    join UserReputationBuckets ur on ur.UserId = ura.Id
+    left join (
+        select UserId, count(*) as BadgeCount
+        from Badges
+        where Date >= cast('2024-10-01' as date) - interval '180 days'
+        group by UserId
+    ) ub on ub.UserId = ura.Id
+    left join (
+        select OwnerUserId, count(*) as AnsweredQuestions
+        from Posts
+        where PostTypeId = 2 AND CreationDate >= cast('2024-10-01' as date) - interval '180 days'
+        group by OwnerUserId
+    ) uaq on uaq.OwnerUserId = ura.Id
+),
+ComplexPosts as (
+    select
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Tags,
+        ph_edit.EditCount,
+        ph_close.CloseReasonId,
+        (select count(*) from Comments c where c.PostId = p.Id) as CommentTotal,
+        (select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 2) as UpVotesCount,
+        (select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 3) as DownVotesCount,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc) as OwnerTopPostRank
+    from Posts p
+    left join (
+        select PostId, count(*) as EditCount
+        from PostHistory
+        where PostHistoryTypeId in (4,5,6)
+        group by PostId
+    ) ph_edit on ph_edit.PostId = p.Id
+    left join (
+        select ph.PostId, max(c.Id) as CloseReasonId
+        from PostHistory ph
+        left join CloseReasonTypes c on cast(ph.Comment as integer) = c.Id
+        where ph.PostHistoryTypeId = 10
+        group by ph.PostId
+    ) ph_close on ph_close.PostId = p.Id
+    where p.PostTypeId in (1,2)
+      and p.CreationDate >= cast('2024-10-01' as date) - interval '60 days'
+)
+select 
+    cp.Id as PostId,
+    cp.Title,
+    coalesce(u.DisplayName, cast(cp.OwnerUserId as varchar)) as OwnerName,
+    ur.ReputationClass,
+    cp.Score,
+    cp.ViewCount,
+    cp.EditCount,
+    cp.CommentTotal,
+    cp.UpVotesCount,
+    cp.DownVotesCount,
+    cp.CloseReasonId,
+    cp.OwnerTopPostRank,
+    array_to_string(qas.ShortTags, ', ') as TagsPreview,
+    qas.AnswerCount,
+    qas.AvgAnswerScore,
+    qas.MaxAnswerScore,
+    qas.CloseVoteCount,
+    qas.ReopenVoteCount,
+    ue.BadgeCount,
+    ue.AnsweredQuestions,
+    ue.LastActivityDate,
+    dense_rank() over (order by cp.Score desc) as ScoreRank,
+    dense_rank() over (order by cp.ViewCount desc) as ViewRank,
+    dense_rank() over (order by ue.BadgeCount desc, ue.AnsweredQuestions desc) as EngagementRank,
+    case
+        when cp.Score > 100 then 'High Score'
+        when cp.Score between 20 and 100 then 'Moderate Score'
+        else 'Low Score'
+    end as ScoreCategory,
+    case
+        when ue.LastActivityDate < cast('2024-10-01' as date) - interval '90 days' then 'Inactive'
+        else 'Active'
+    end as UserActivityStatus,
+    concat(
+        'Score=', cp.Score, '; ',
+        'Views=', cp.ViewCount, '; ',
+        'Edits=', coalesce(cp.EditCount,0), '; ',
+        'Comments=', cp.CommentTotal, '; ',
+        'UpVotes=', cp.UpVotesCount, '; ',
+        'DownVotes=', cp.DownVotesCount
+    ) as StatsSummary
+from ComplexPosts cp
+left join Users u on u.Id = cp.OwnerUserId
+left join UserReputationBuckets ur on ur.UserId = cp.OwnerUserId
+left join QuestionAnswerStats qas on qas.QuestionId = cp.Id
+left join UserEngagement ue on ue.UserId = cp.OwnerUserId
+where cp.OwnerTopPostRank <= 3
+
+union all
+
+select 
+    p.Id,
+    p.Title,
+    coalesce(u2.DisplayName, cast(p.OwnerUserId as varchar)),
+    ur2.ReputationClass,
+    p.Score,
+    p.ViewCount,
+    0,
+    0,
+    0,
+    0,
+    null,
+    1,
+    null,
+    0,
+    0,
+    null,
+    null,
+    cast('2024-10-01' as date),
+    0,
+    'Inactive',
+    'No stats'
+from Posts p
+join Users u2 on u2.Id = p.OwnerUserId
+join UserReputationBuckets ur2 on ur2.UserId = p.OwnerUserId
+where p.PostTypeId = 1
+  and p.CreationDate >= cast('2024-10-01' as date) - interval '7 days'
+  and p.Score = 0
+
+except
+
+select 
+    cp.Id,
+    cp.Title,
+    coalesce(u.DisplayName, cast(cp.OwnerUserId as varchar)),
+    ur.ReputationClass,
+    cp.Score,
+    cp.ViewCount,
+    cp.EditCount,
+    cp.CommentTotal,
+    cp.UpVotesCount,
+    cp.DownVotesCount,
+    cp.CloseReasonId,
+    cp.OwnerTopPostRank,
+    null,
+    0,
+    0,
+    null,
+    null,
+    null,
+    0,
+    'Inactive',
+    'No stats'
+from ComplexPosts cp
+join Users u on u.Id = cp.OwnerUserId
+join UserReputationBuckets ur on ur.UserId = cp.OwnerUserId
+
+order by ScoreRank nulls last, ViewRank nulls last, EngagementRank nulls last, LastActivityDate desc
+limit 100;

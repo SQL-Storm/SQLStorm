@@ -1,0 +1,164 @@
+WITH
+  PostAggregates AS (
+    SELECT
+      p.Id AS PostId,
+      p.PostTypeId,
+      pt.Name AS PostTypeName,
+      p.OwnerUserId,
+      u.DisplayName AS OwnerDisplayName,
+      p.CreationDate AS PostCreationDate,
+      p.Score AS PostScore,
+      p.ViewCount AS PostViewCount,
+      p.AnswerCount AS PostAnswerCount,
+      p.CommentCount AS PostCommentCount,
+      p.FavoriteCount AS PostFavoriteCount,
+      p.ClosedDate,
+      CASE
+        WHEN p.ClosedDate IS NOT NULL THEN TIMESTAMP '2024-10-01 12:34:56' - p.ClosedDate
+        ELSE NULL
+      END AS DaysSinceClosed,
+      ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserPostRank,
+      AVG(CAST(c.Score AS DECIMAL(10,2))) FILTER (WHERE c.PostId IS NOT NULL) OVER (PARTITION BY p.Id) AS AvgCommentScoreForPost,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+      COUNT(DISTINCT pl.RelatedPostId) AS LinkedPostCount
+    FROM Posts p
+    JOIN PostTypes pt
+      ON p.PostTypeId = pt.Id
+    LEFT JOIN Users u
+      ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c
+      ON p.Id = c.PostId
+    LEFT JOIN Votes v
+      ON p.Id = v.PostId AND v.VoteTypeId IN (2, 3)
+    LEFT JOIN PostLinks pl
+      ON p.Id = pl.PostId AND pl.LinkTypeId = 1
+    GROUP BY
+      p.Id,
+      p.PostTypeId,
+      pt.Name,
+      p.OwnerUserId,
+      u.DisplayName,
+      p.CreationDate,
+      p.Score,
+      p.ViewCount,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      p.ClosedDate
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName AS UserDisplayName,
+      u.Reputation,
+      u.CreationDate AS UserCreationDate,
+      u.LastAccessDate,
+      TIMESTAMP '2024-10-01 12:34:56' - u.CreationDate AS DaysSinceUserCreation,
+      COUNT(DISTINCT pa.PostId) AS TotalPosts,
+      SUM(pa.PostScore) AS TotalPostScore,
+      AVG(CAST(pa.PostScore AS DECIMAL(10,2))) AS AvgPostScore,
+      SUM(pa.PostAnswerCount) AS TotalAnswers,
+      SUM(pa.PostCommentCount) AS TotalComments,
+      COUNT(DISTINCT b.Id) AS TotalBadges,
+      MAX(pa.PostCreationDate) AS LastPostAccessDate,
+      CASE
+        WHEN u.LastAccessDate > MAX(pa.PostCreationDate) THEN 1
+        ELSE 0
+      END AS RecentActivityAfterLastAccess
+    FROM Users u
+    JOIN PostAggregates pa
+      ON u.Id = pa.OwnerUserId
+    LEFT JOIN Badges b
+      ON u.Id = b.UserId
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate,
+      u.LastAccessDate
+  ),
+  HistoricalEdits AS (
+    SELECT
+      ph.PostId,
+      ph.UserId AS EditorUserId,
+      u.DisplayName AS EditorDisplayName,
+      ph.CreationDate AS EditDate,
+      ph.PostHistoryTypeId,
+      ph.Comment AS EditComment,
+      CASE
+        WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1
+        ELSE 0
+      END AS IsContentEdit,
+      CASE
+        WHEN ph.PostHistoryTypeId IN (1, 2, 3) THEN 1
+        ELSE 0
+      END AS IsInitialContent,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS EditRank
+    FROM PostHistory ph
+    LEFT JOIN Users u
+      ON ph.UserId = u.Id
+    WHERE
+      ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 7, 8, 9)
+  )
+SELECT
+  pa.PostId,
+  pa.PostTypeName,
+  pa.OwnerDisplayName,
+  pa.PostCreationDate,
+  pa.PostScore,
+  pa.PostViewCount,
+  pa.PostAnswerCount,
+  pa.PostCommentCount,
+  pa.PostFavoriteCount,
+  pa.DaysSinceClosed,
+  ua.UserDisplayName AS TopUserDisplayName,
+  ua.Reputation AS TopUserReputation,
+  ua.DaysSinceUserCreation AS TopUserAge,
+  ua.TotalPosts AS TopUserTotalPosts,
+  ua.AvgPostScore AS TopUserAvgPostScore,
+  ua.TotalBadges AS TopUserTotalBadges,
+  pa.AvgCommentScoreForPost,
+  pa.UpVoteCount,
+  pa.DownVoteCount,
+  pa.LinkedPostCount,
+  he.EditorDisplayName AS LastEditorDisplayName,
+  he.EditDate AS LastEditDate,
+  he.IsContentEdit,
+  he.IsInitialContent,
+  CASE
+    WHEN pa.PostScore > 100 AND pa.PostAnswerCount > 5 THEN 'HighEngagement'
+    WHEN pa.PostScore < 0 AND pa.ClosedDate IS NOT NULL THEN 'NegativeScoreClosed'
+    WHEN pa.PostViewCount > 10000 AND pa.PostFavoriteCount > 50 THEN 'PopularAndFavourited'
+    WHEN pa.PostTypeId = 1 AND ua.TotalBadges > 20 THEN 'HighlyBadgedUserQuestion'
+    WHEN pa.PostTypeId = 2 AND pa.PostScore > 0 AND he.EditorUserId IS NOT NULL THEN 'EditedAnswerWithPositiveScore'
+    WHEN pa.PostTypeId = 1 AND pa.ClosedDate IS NULL AND ua.Reputation > 10000 THEN 'HighReputationUserQuestion'
+    WHEN pa.PostFavoriteCount IS NULL OR pa.PostFavoriteCount = 0 THEN 'NoFavorites'
+    ELSE 'Standard'
+  END AS PostCategorization,
+  (pa.OwnerDisplayName || ' - ' || pa.PostTypeName || ' - ' || TO_CHAR(pa.PostCreationDate, 'YYYY-MM-DD')) AS CompositeKey,
+  CASE
+    WHEN COALESCE(ua.LastAccessDate, ua.UserCreationDate) < (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '12 months') THEN 'InactiveUser'
+    ELSE 'ActiveUser'
+  END AS UserStatus,
+  ua.RecentActivityAfterLastAccess,
+  CASE
+    WHEN pa.PostScore > ua.AvgPostScore * 2 THEN 'AboveAverageScore'
+    WHEN pa.PostScore < ua.AvgPostScore / 2 THEN 'BelowAverageScore'
+    ELSE 'AverageScore'
+  END AS ScoreRelativeToUserAvg,
+  LAG(pa.PostScore, 1, 0) OVER (PARTITION BY pa.OwnerUserId ORDER BY pa.PostCreationDate) AS PreviousPostScoreForUser,
+  LEAD(pa.PostScore, 1, 0) OVER (PARTITION BY pa.OwnerUserId ORDER BY pa.PostCreationDate) AS NextPostScoreForUser
+FROM PostAggregates pa
+LEFT JOIN UserActivity ua
+  ON pa.OwnerUserId = ua.UserId
+LEFT JOIN HistoricalEdits he
+  ON pa.PostId = he.PostId AND he.EditRank = 1
+WHERE
+  pa.PostCreationDate BETWEEN DATE '2023-01-01' AND DATE '2023-12-31'
+  AND ua.Reputation > 100
+  AND pa.PostTypeId IN (1, 2)
+  AND (ua.TotalPostScore > 500 OR ua.TotalBadges > 10)
+ORDER BY
+  pa.PostCreationDate DESC
+LIMIT 1000;

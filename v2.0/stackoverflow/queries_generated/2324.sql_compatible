@@ -1,0 +1,162 @@
+with RecursiveUserBadges as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class as BadgeClass,
+        b.Date as BadgeDate,
+        row_number() over (partition by u.Id order by b.Date desc) as BadgeRank
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    where u.Reputation > 1000
+),
+LatestPosts as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.Title,
+        p.AcceptedAnswerId,
+        -- Extract first tag or NULL
+        split_part(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><', 1) as FirstTag,
+        p.ParentId
+    from Posts p
+    where p.PostTypeId in (1,2) -- Questions and Answers
+      and p.CreationDate >= cast('2024-10-01' as date) - interval '1 year'
+),
+AnsweredQuestionsWithScores as (
+    select 
+        q.Id as QuestionId,
+        q.Title,
+        q.Tags,
+        q.ViewCount,
+        q.Score as QuestionScore,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.OwnerUserId as AnswerOwnerId,
+        a.CreationDate as AnswerCreationDate,
+        case when q.AcceptedAnswerId = a.Id then 1 else 0 end as IsAcceptedAnswer,
+        -- Use window function to rank answers by score per question
+        row_number() over (partition by q.Id order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from LatestPosts q
+    left join LatestPosts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+    and a.Id is not null
+),
+UserAggregateStats as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) as TotalPosts,
+        sum(case when p.PostTypeId = 1 then 1 else 0 end) as QuestionCount,
+        sum(case when p.PostTypeId = 2 then 1 else 0 end) as AnswerCount,
+        coalesce(sum(v.UpVotes), 0) as TotalUpVotesReceived,
+        coalesce(sum(v.DownVotes), 0) as TotalDownVotesReceived,
+        avg(p.Score) filter (where p.Score is not null) as AvgPostScore,
+        max(p.Score) as MaxPostScore,
+        min(p.Score) as MinPostScore,
+        -- Average score of accepted answers only
+        avg(case when p.Id in (select AcceptedAnswerId from Posts where AcceptedAnswerId is not null) then p.Score else null end) as AvgAcceptedAnswerScore
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Votes v on v.PostId = p.Id and v.VoteTypeId = 2 -- UpMod votes only
+    group by u.Id, u.DisplayName
+),
+QuestionCloseStats as (
+    select 
+        p.Id as QuestionId,
+        p.Title,
+        p.Tags,
+        cht.Name as CloseReason,
+        ph.CreationDate as CloseDate,
+        ph.UserId as CloseVoterUserId,
+        u.DisplayName as CloseVoterDisplayName,
+        -- Calculate days between creation and close
+        extract(day from ph.CreationDate - p.CreationDate) as DaysToClose
+    from Posts p
+    join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 10
+    join CloseReasonTypes cht on cht.Id = cast(ph.Comment as integer)
+    left join Users u on u.Id = ph.UserId
+    where p.PostTypeId = 1
+),
+UserRecentActivity as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        max(p.CreationDate) as LastPostDate,
+        max(c.CreationDate) as LastCommentDate,
+        max(ph.CreationDate) filter (where ph.UserId = u.Id) as LastEditDate,
+        greatest(
+            coalesce(max(p.CreationDate), timestamp '1970-01-01'),
+            coalesce(max(c.CreationDate), timestamp '1970-01-01'),
+            coalesce(max(ph.CreationDate) filter (where ph.UserId = u.Id), timestamp '1970-01-01')
+        ) as LastActivityDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join PostHistory ph on ph.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+DupLinkedQuestions as (
+    select 
+        pl.PostId as DuplicateQuestionId,
+        pl.RelatedPostId as OriginalQuestionId,
+        pl.CreationDate as DupLinkDate,
+        u.DisplayName as DuplicateOwner,
+        u2.DisplayName as OriginalOwner
+    from PostLinks pl
+    join Posts dup on dup.Id = pl.PostId and dup.PostTypeId = 1
+    join Posts orig on orig.Id = pl.RelatedPostId and orig.PostTypeId = 1
+    left join Users u on u.Id = dup.OwnerUserId
+    left join Users u2 on u2.Id = orig.OwnerUserId
+    where pl.LinkTypeId = 3 -- Duplicate link type
+)
+select 
+    rs.UserId,
+    rs.DisplayName,
+    rs.TotalPosts,
+    rs.QuestionCount,
+    rs.AnswerCount,
+    rs.TotalUpVotesReceived,
+    rs.TotalDownVotesReceived,
+    round(rs.AvgPostScore::numeric,2) as AvgPostScore,
+    rs.MaxPostScore,
+    rs.MinPostScore,
+    round(coalesce(rs.AvgAcceptedAnswerScore,0)::numeric,2) as AvgAcceptedAnswerScore,
+    ua.LastActivityDate,
+    qc.QuestionId as RecentlyClosedQuestionId,
+    qc.Title as RecentlyClosedQuestionTitle,
+    qc.CloseReason,
+    qc.DaysToClose,
+    dq.DuplicateQuestionId,
+    dq.OriginalQuestionId,
+    dq.DupLinkDate,
+    dq.DuplicateOwner,
+    dq.OriginalOwner,
+    rb.BadgeName,
+    rb.BadgeClass,
+    rb.BadgeDate
+from UserAggregateStats rs
+left join UserRecentActivity ua on ua.UserId = rs.UserId
+left join lateral (
+    select qc1.*
+    from QuestionCloseStats qc1
+    where qc1.CloseVoterUserId = rs.UserId
+    order by qc1.CloseDate desc
+    limit 1
+) qc on true
+left join lateral (
+    select dq1.*
+    from DupLinkedQuestions dq1
+    where dq1.DuplicateOwner = rs.DisplayName
+    order by dq1.DupLinkDate desc
+    limit 1
+) dq on true
+left join RecursiveUserBadges rb on rb.UserId = rs.UserId and rb.BadgeRank = 1
+where rs.TotalPosts >= 10
+order by rs.TotalUpVotesReceived desc, ua.LastActivityDate desc
+limit 100;

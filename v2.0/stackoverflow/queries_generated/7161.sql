@@ -1,0 +1,254 @@
+-- {"query": "7161.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2508} 
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        AVG(p.Score) as AvgPostScore,
+        MAX(p.CreationDate) as LatestPostDate,
+        STRING_AGG(DISTINCT p.Tags, ', ') as TagSummary
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        PostCount,
+        CommentCount,
+        BadgeCount,
+        AvgPostScore,
+        LatestPostDate,
+        TagSummary,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, PostCount DESC) as RankByReputation,
+        ROW_NUMBER() OVER (ORDER BY PostCount DESC, Reputation DESC) as RankByPostCount,
+        CASE 
+            WHEN Reputation > 100000 THEN 'Elite'
+            WHEN Reputation > 50000 THEN 'Veteran'
+            WHEN Reputation > 10000 THEN 'Expert'
+            ELSE 'Regular'
+        END as UserTier
+    FROM UserStats
+),
+PostMetrics AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        p.PostTypeId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            WHEN p.PostTypeId = 4 THEN 'TagExcerpt'
+            WHEN p.PostTypeId = 5 THEN 'TagWiki'
+            ELSE 'Other'
+        END as PostType,
+        COALESCE(p.AcceptedAnswerId, 0) as AcceptedAnswerId,
+        DATEDIFF(day, p.CreationDate, NOW()) as AgeInDays,
+        CASE 
+            WHEN p.Score > 100 THEN 'Popular'
+            WHEN p.Score > 10 THEN 'Standard'
+            ELSE 'Basic'
+        END as PopularityCategory,
+        IIF(p.ViewCount > 1000, 'HighTraffic', 'Normal') as TrafficLevel,
+        CASE 
+            WHEN p.AnswerCount > 10 THEN 'WellAnswered'
+            WHEN p.AnswerCount > 0 THEN 'Answered'
+            ELSE 'Unanswered'
+        END as AnswerStatus,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) as UpvoteCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) as DownvoteCount,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) as CommentCountActual
+    FROM Posts p
+    WHERE p.CreationDate > '2020-01-01'
+),
+UserActivityAnalysis AS (
+    SELECT 
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.PostCount,
+        tu.CommentCount,
+        tu.BadgeCount,
+        tu.AvgPostScore,
+        tu.LatestPostDate,
+        tu.TagSummary,
+        tu.RankByReputation,
+        tu.RankByPostCount,
+        tu.UserTier,
+        MAX(pm.CreationDate) as LastActivityDate,
+        COUNT(pm.PostId) as RecentPostCount,
+        SUM(pm.Score) as TotalRecentScore,
+        AVG(pm.Score) as AvgRecentScore,
+        STRING_AGG(pm.Title, '; ') as RecentPostTitles,
+        STRING_AGG(pm.Tags, '|') as RecentTagSet
+    FROM TopUsers tu
+    LEFT JOIN PostMetrics pm ON tu.UserId = pm.OwnerUserId
+    GROUP BY tu.UserId, tu.DisplayName, tu.Reputation, tu.PostCount, tu.CommentCount, tu.BadgeCount, 
+             tu.AvgPostScore, tu.LatestPostDate, tu.TagSummary, tu.RankByReputation, tu.RankByPostCount, tu.UserTier
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        pm.PostId,
+        pm.Title,
+        pm.Score,
+        pm.ViewCount,
+        pm.AnswerCount,
+        pm.CommentCount,
+        pm.CreationDate,
+        pm.OwnerUserId,
+        pm.PostType,
+        pm.AcceptedAnswerId,
+        pm.AgeInDays,
+        pm.PopularityCategory,
+        pm.TrafficLevel,
+        pm.AnswerStatus,
+        pm.UpvoteCount,
+        pm.DownvoteCount,
+        pm.CommentCountActual,
+        pm.Tags,
+        CASE 
+            WHEN pm.UpvoteCount > 0 THEN pm.UpvoteCount::FLOAT / (pm.UpvoteCount + pm.DownvoteCount + 1)
+            ELSE 0
+        END as UpvoteRatio,
+        ((pm.ViewCount * 1.0) / NULLIF(pm.AgeInDays + 1, 0)) as DailyViewRate,
+        CASE 
+            WHEN pm.AnswerCount > 0 THEN pm.CommentCountActual::FLOAT / pm.AnswerCount
+            ELSE NULL
+        END as CommentsPerAnswer,
+        CASE 
+            WHEN pm.AnswerCount > 0 AND pm.Score > 0 THEN pm.Score::FLOAT / pm.AnswerCount
+            ELSE NULL
+        END as ScorePerAnswer,
+        (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = pm.PostId AND ph.PostHistoryTypeId IN (1, 4, 6)) as EditCount,
+        (SELECT NAME FROM PostHistoryTypes WHERE Id = (
+            SELECT MAX(ph.PostHistoryTypeId) FROM PostHistory ph WHERE ph.PostId = pm.PostId
+        )) as LastActionType,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = pm.PostId AND v.VoteTypeId IN (1, 2, 3)) as VoteActivityCount,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = pm.PostId AND c.CreationDate > pm.CreationDate) as CommentActivityCount
+    FROM PostMetrics pm
+    WHERE pm.Score > 0
+),
+FinalAnalysis AS (
+    SELECT 
+        uaa.UserId,
+        uaa.DisplayName,
+        uaa.Reputation,
+        uaa.PostCount,
+        uaa.CommentCount,
+        uaa.BadgeCount,
+        uaa.AvgPostScore,
+        uaa.LatestPostDate,
+        uaa.TagSummary,
+        uaa.RankByReputation,
+        uaa.RankByPostCount,
+        uaa.UserTier,
+        uaa.LastActivityDate,
+        uaa.RecentPostCount,
+        uaa.TotalRecentScore,
+        uaa.AvgRecentScore,
+        uaa.RecentPostTitles,
+        uaa.RecentTagSet,
+        ARRAY_AGG(DISTINCT cpa.Title) as TopPosts,
+        STRING_AGG(DISTINCT cpa.PostType, ', ') as PostTypeUsage,
+        AVG(cpa.Score) as AvgPostScoreAnalysis,
+        MAX(cpa.ViewCount) as MaxViewCount,
+        MIN(cpa.AgeInDays) as MinAgeInDays,
+        COUNT(cpa.PostId) as TotalPostsAnalyzed
+    FROM UserActivityAnalysis uaa
+    LEFT JOIN ComplexPostAnalysis cpa ON uaa.UserId = cpa.OwnerUserId
+    GROUP BY uaa.UserId, uaa.DisplayName, uaa.Reputation, uaa.PostCount, uaa.CommentCount, uaa.BadgeCount, 
+             uaa.AvgPostScore, uaa.LatestPostDate, uaa.TagSummary, uaa.RankByReputation, uaa.RankByPostCount, 
+             uaa.UserTier, uaa.LastActivityDate, uaa.RecentPostCount, uaa.TotalRecentScore, uaa.AvgRecentScore,
+             uaa.RecentPostTitles, uaa.RecentTagSet
+)
+SELECT 
+    fa.UserId,
+    fa.DisplayName,
+    fa.Reputation,
+    fa.PostCount,
+    fa.CommentCount,
+    fa.BadgeCount,
+    fa.AvgPostScore,
+    fa.LatestPostDate,
+    fa.TagSummary,
+    fa.RankByReputation,
+    fa.RankByPostCount,
+    fa.UserTier,
+    fa.LastActivityDate,
+    fa.RecentPostCount,
+    fa.TotalRecentScore,
+    fa.AvgRecentScore,
+    fa.RecentPostTitles,
+    fa.RecentTagSet,
+    CASE 
+        WHEN fa.TotalPostsAnalyzed > 0 THEN 
+            COALESCE(ARRAY_TO_STRING(fa.TopPosts, '; '), 'No posts') 
+        ELSE 'No Analysis'
+    END as TopPostTitles,
+    STRING_AGG(DISTINCT CASE WHEN cpa.PostType = 'Question' THEN 'Q' ELSE 'A' END, ',') as QuestionAnswerFrequency,
+    AVG(cpa.Score) as WeightedAverageScore,
+    MAX(cpa.ViewCount) as PeakViewCount,
+    MIN(cpa.AgeInDays) as MinPostAge,
+    COUNT(DISTINCT cpa.PostId) as AnalyzedPosts,
+    NULLIF(COUNT(DISTINCT fa.UserId), 0) as UserCount,
+    CASE 
+        WHEN fa.Reputation > 50000 AND fa.PostCount > 100 THEN 'Highly Active'
+        WHEN fa.Reputation > 10000 AND fa.PostCount > 50 THEN 'Active'
+        WHEN fa.Reputation > 1000 AND fa.PostCount > 10 THEN 'Contributor'
+        ELSE 'Member'
+    END as EngagementLevel,
+    COALESCE(
+        (SELECT STRING_AGG(Title, ', ') 
+         FROM Posts p 
+         WHERE p.OwnerUserId = fa.UserId 
+         ORDER BY p.CreationDate DESC 
+         LIMIT 5), 
+        'No recent posts'
+    ) as RecentPostList,
+    CASE 
+        WHEN COUNT(DISTINCT cpa.PostId) > 5 THEN 'Multiple Post Types'
+        WHEN COUNT(DISTINCT cpa.PostId) = 1 THEN 'Single Post Type'
+        ELSE 'No Posts'
+    END as ContentDiversity,
+    SUM(cpa.Score * cpa.UpvoteCount) as WeightedScore,
+    (SUM(cpa.ViewCount) - 1000) / NULLIF(SUM(cpa.AgeInDays), 0) as ActivityEfficiency,
+    COALESCE(COUNT(DISTINCT cpa.PostId) + COUNT(DISTINCT uaa.CommentCount), 0) as TotalEngagementEvents
+FROM FinalAnalysis fa
+LEFT JOIN ComplexPostAnalysis cpa ON fa.UserId = cpa.OwnerUserId
+LEFT JOIN UserActivityAnalysis uaa ON fa.UserId = uaa.UserId
+WHERE fa.UserId IN (
+    SELECT UserId 
+    FROM UserStats 
+    WHERE Reputation > 10000
+)
+GROUP BY fa.UserId, fa.DisplayName, fa.Reputation, fa.PostCount, fa.CommentCount, fa.BadgeCount, 
+         fa.AvgPostScore, fa.LatestPostDate, fa.TagSummary, fa.RankByReputation, fa.RankByPostCount, 
+         fa.UserTier, fa.LastActivityDate, fa.RecentPostCount, fa.TotalRecentScore, fa.AvgRecentScore,
+         fa.RecentPostTitles, fa.RecentTagSet
+HAVING 
+    COUNT(DISTINCT cpa.PostId) > 0 
+    AND COUNT(DISTINCT uaa.UserId) > 0
+ORDER BY 
+    fa.RankByReputation,
+    fa.TotalRecentScore DESC,
+    fa.Reputation DESC
+LIMIT 100;

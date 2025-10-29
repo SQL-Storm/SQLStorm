@@ -1,0 +1,112 @@
+WITH RankedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.Body,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn_user_posts,
+        COUNT(c.Id) OVER (PARTITION BY p.Id) AS comment_count_for_post,
+        SUM(v.VoteTypeId) OVER (PARTITION BY p.Id) AS total_vote_score_for_post,
+        CASE
+            WHEN p.Title LIKE '%performance%' OR p.Body LIKE '%performance%' THEN 'Performance Related'
+            WHEN p.Title LIKE '%benchmark%' OR p.Body LIKE '%benchmark%' THEN 'Benchmarking Related'
+            ELSE 'Other'
+        END AS post_topic_category,
+        CASE
+            WHEN EXISTS (SELECT 1 FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3) THEN 'IsDuplicate'
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            ELSE 'Open'
+        END AS post_status
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE p.PostTypeId IN (1, 2)
+    GROUP BY
+        p.Id, p.PostTypeId, p.OwnerUserId, p.Title, p.CreationDate, p.Score, p.ViewCount,
+        p.AnswerCount, p.CommentCount, p.FavoriteCount, p.ClosedDate, p.Body
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(rp.PostId) AS TotalPosts,
+        SUM(CASE WHEN rp.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN rp.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        AVG(rp.Score) AS AvgPostScore,
+        MAX(rp.CreationDate) AS LastPostDate,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        SUM(CASE WHEN rp.post_status = 'Closed' THEN 1 ELSE 0 END) AS ClosedPostCount
+    FROM Users u
+    JOIN RankedPosts rp ON u.Id = rp.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE rp.rn_user_posts <= 50
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+PostPerformanceMetrics AS (
+    SELECT
+        rp.PostId,
+        rp.Title,
+        rp.post_topic_category,
+        rp.post_status,
+        rp.Score,
+        rp.ViewCount,
+        rp.comment_count_for_post,
+        rp.total_vote_score_for_post,
+        CASE
+            WHEN rp.post_topic_category = 'Performance Related' AND rp.post_status <> 'Closed' THEN (rp.Score * 1.5) + (rp.ViewCount * 0.1) + (rp.comment_count_for_post * 0.5)
+            WHEN rp.post_topic_category = 'Benchmarking Related' AND rp.post_status <> 'Closed' THEN (rp.Score * 1.2) + (rp.ViewCount * 0.05) + (rp.comment_count_for_post * 0.4)
+            ELSE rp.Score + (rp.ViewCount * 0.01)
+        END AS calculated_performance_index,
+        ua.DisplayName AS OwnerDisplayName,
+        ua.Reputation AS OwnerReputation,
+        ua.TotalPosts AS OwnerTotalPosts,
+        ua.ClosedPostCount AS OwnerClosedPostCount,
+        LEAST(rp.FavoriteCount, COALESCE(ua.TotalPosts, 0)) AS LimitedFavoriteCount,
+        CASE
+            WHEN rp.Title IS NULL OR LENGTH(TRIM(rp.Title)) = 0 THEN 'No Title'
+            WHEN POSITION('?' IN rp.Title) > 0 THEN 'Question Title'
+            ELSE 'Statement Title'
+        END AS title_characteristic,
+        rp.OwnerUserId
+    FROM RankedPosts rp
+    JOIN UserActivity ua ON rp.OwnerUserId = ua.UserId
+    WHERE rp.rn_user_posts <= 100
+)
+SELECT
+    ppm.PostId,
+    ppm.Title,
+    ppm.post_topic_category,
+    ppm.post_status,
+    ppm.calculated_performance_index,
+    ppm.OwnerDisplayName,
+    ppm.OwnerReputation,
+    ppm.OwnerTotalPosts,
+    ppm.OwnerClosedPostCount,
+    ppm.LimitedFavoriteCount,
+    ppm.title_characteristic,
+    CASE
+        WHEN ppm.calculated_performance_index > (SELECT AVG(calculated_performance_index) FROM PostPerformanceMetrics) * 1.5 THEN 'High Performer'
+        WHEN ppm.OwnerReputation > 10000 AND ppm.OwnerClosedPostCount < 5 THEN 'Expert Contributor'
+        ELSE 'Standard Contributor'
+    END AS user_performance_tier,
+    LOWER(SUBSTRING(ppm.Title FROM 1 FOR 3)) AS title_prefix,
+    COALESCE(ua.BadgeCount, 0) AS OwnerBadgeCount,
+    CASE
+        WHEN EXISTS (SELECT 1 FROM PostHistory ph WHERE ph.PostId = ppm.PostId AND ph.PostHistoryTypeId IN (10, 11, 12, 13)) THEN 'HasHistoryOfClosureOrDeletion'
+        ELSE 'NoHistoryOfClosureOrDeletion'
+    END AS post_history_flag
+FROM PostPerformanceMetrics ppm
+LEFT JOIN UserActivity ua ON ppm.OwnerUserId = ua.UserId
+WHERE ppm.Score > 0 OR ppm.ViewCount > 1000
+ORDER BY ppm.calculated_performance_index DESC
+LIMIT 50;

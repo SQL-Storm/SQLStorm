@@ -1,0 +1,129 @@
+-- {"query": "2951.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1261} 
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.CreationDate,
+        u.Reputation,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersCount,
+        count(distinct c.Id) as CommentsCount,
+        row_number() over (order by u.Reputation desc nulls last) as ReputationRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    group by u.Id, u.DisplayName, u.CreationDate, u.Reputation
+), UserBadgeAgg as (
+    select
+        b.UserId,
+        count(*) as TotalBadges,
+        count(*) filter (where b.Class = 1) as GoldBadges,
+        count(*) filter (where b.Class = 2) as SilverBadges,
+        count(*) filter (where b.Class = 3) as BronzeBadges,
+        bool_or(b.TagBased::bool) as HasTagBasedBadge
+    from Badges b
+    group by b.UserId
+), UserPostStats as (
+    select
+        p.OwnerUserId as UserId,
+        count(p.Id) as TotalPosts,
+        avg(p.Score) as AveragePostScore,
+        sum(case when p.ClosedDate is not null then 1 else 0 end) as ClosedPostsCount,
+        max(p.ViewCount) as MaxViewCount,
+        string_agg(distinct coalesce(p.Title, '') || ' (Score: ' || coalesce(p.Score::text, '0') || ')', ' | ') as SamplePostTitles
+    from Posts p
+    where p.OwnerUserId is not null
+    group by p.OwnerUserId
+), UserCloseReasonsCount as (
+    select
+        ph.UserId,
+        ph.PostId,
+        count(*) filter (where ph.PostHistoryTypeId = 10) as CloseVotesCount,
+        count(distinct case when ph.PostHistoryTypeId = 10 then cast(ph.Comment as integer) end) as DistinctCloseReasonsCount,
+        string_agg(distinct crt.Name, ', ') as CloseReasonNames
+    from PostHistory ph
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer) and ph.PostHistoryTypeId = 10
+    where ph.UserId is not null
+    group by ph.UserId, ph.PostId
+), UserCombined as (
+    select
+        ua.UserId,
+        ua.DisplayName,
+        ua.CreationDate,
+        ua.Reputation,
+        ua.QuestionsCount,
+        ua.AnswersCount,
+        ua.CommentsCount,
+        ub.TotalBadges,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ub.HasTagBasedBadge,
+        ups.TotalPosts,
+        ups.AveragePostScore,
+        ups.ClosedPostsCount,
+        ups.MaxViewCount,
+        ups.SamplePostTitles,
+        coalesce(sum(ucrc.CloseVotesCount), 0) as TotalCloseVotesCast,
+        coalesce(string_agg(distinct ucrc.CloseReasonNames, '; '), '') as AllCloseReasons
+    from RecursiveUserActivity ua
+    left join UserBadgeAgg ub on ub.UserId = ua.UserId
+    left join UserPostStats ups on ups.UserId = ua.UserId
+    left join UserCloseReasonsCount ucrc on ucrc.UserId = ua.UserId
+    group by ua.UserId, ua.DisplayName, ua.CreationDate, ua.Reputation, ua.QuestionsCount, ua.AnswersCount, ua.CommentsCount, ub.TotalBadges, ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges, ub.HasTagBasedBadge, ups.TotalPosts, ups.AveragePostScore, ups.ClosedPostsCount, ups.MaxViewCount, ups.SamplePostTitles
+)
+select
+    uc.UserId,
+    uc.DisplayName,
+    uc.Reputation,
+    uc.ReputationRank,
+    uc.QuestionsCount,
+    uc.AnswersCount,
+    uc.CommentsCount,
+    uc.TotalBadges,
+    uc.GoldBadges,
+    uc.SilverBadges,
+    uc.BronzeBadges,
+    uc.HasTagBasedBadge,
+    uc.TotalPosts,
+    round(uc.AveragePostScore::numeric,2) as AveragePostScore,
+    uc.ClosedPostsCount,
+    uc.MaxViewCount,
+    case when length(uc.SamplePostTitles) > 150 then substring(uc.SamplePostTitles from 1 for 147) || '...' else uc.SamplePostTitles end as PostTitleSamples,
+    uc.TotalCloseVotesCast,
+    nullif(uc.AllCloseReasons, '') as CloseReasonsInvolved
+from (
+    select uc.*, ru.ReputationRank
+    from UserCombined uc
+    join RecursiveUserActivity ru on ru.UserId = uc.UserId
+) uc
+where uc.Reputation is not null and uc.TotalPosts > 10
+order by uc.ReputationRank
+limit 50
+
+union all
+
+select 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    null as ReputationRank,
+    0 as QuestionsCount,
+    0 as AnswersCount,
+    0 as CommentsCount,
+    0 as TotalBadges,
+    0 as GoldBadges,
+    0 as SilverBadges,
+    0 as BronzeBadges,
+    false as HasTagBasedBadge,
+    0 as TotalPosts,
+    0.0 as AveragePostScore,
+    0 as ClosedPostsCount,
+    0 as MaxViewCount,
+    '' as PostTitleSamples,
+    0 as TotalCloseVotesCast,
+    null as CloseReasonsInvolved
+from Users u
+where not exists (select 1 from Posts p where p.OwnerUserId = u.Id)
+order by u.CreationDate desc
+limit 10;

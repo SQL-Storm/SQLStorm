@@ -1,0 +1,188 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        ARRAY[t.TagName]::text[] AS TagPath,
+        1 AS Level
+    FROM Tags t
+    WHERE t.IsModeratorOnly = FALSE
+  UNION ALL
+    SELECT
+        t.Id,
+        t.TagName,
+        r.TagPath || t.TagName,
+        r.Level + 1
+    FROM Tags t
+    JOIN RecursiveTagHierarchy r ON t.TagName LIKE r.TagName || '%'
+    WHERE t.Id <> r.Id AND r.Level < 3
+), LatestUserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        MAX(u.LastAccessDate) AS LastAccessDate,
+        COALESCE(u.WebsiteUrl, 'N/A') AS WebsiteUrl,
+        COALESCE(u.Location, 'Unknown') AS Location,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COALESCE(MAX(p.CreationDate), u.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.WebsiteUrl, u.Location, u.UpVotes, u.DownVotes
+), PostsWithAnswerStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate AS QuestionDate,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.FavoriteCount,
+        q.Tags,
+        q.OwnerUserId,
+        a.Id AS AnswerId,
+        a.CreationDate AS AnswerDate,
+        a.Score AS AnswerScore,
+        a.OwnerUserId AS AnswerOwnerUserId,
+        a.ParentId,
+        a.CommentCount AS AnswerCommentCount,
+        a.FavoriteCount AS AnswerFavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+), UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(DISTINCT p.Id) AS TotalQuestions,
+        COUNT(DISTINCT p2.Id) AS TotalAnswers,
+        COALESCE(SUM(p.Score), 0) AS TotalQuestionScore,
+        COALESCE(SUM(p2.Score), 0) AS TotalAnswerScore,
+        COALESCE(SUM(vUpCount.UpVotes), 0) AS TotalUpVotes,
+        COALESCE(SUM(vDownCount.DownVotes), 0) AS TotalDownVotes,
+        AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL) AS AvgQuestionScore,
+        AVG(p2.Score) FILTER (WHERE p2.Score IS NOT NULL) AS AvgAnswerScore
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+    LEFT JOIN Posts p2 ON p2.OwnerUserId = u.Id AND p2.PostTypeId = 2
+    LEFT JOIN (
+        SELECT 
+            PostId,
+            COUNT(*) AS UpVotes
+        FROM Votes
+        WHERE VoteTypeId = 2
+        GROUP BY PostId
+    ) vUpCount ON vUpCount.PostId = p.Id
+    LEFT JOIN (
+        SELECT 
+            PostId,
+            COUNT(*) AS DownVotes
+        FROM Votes
+        WHERE VoteTypeId = 3
+        GROUP BY PostId
+    ) vDownCount ON vDownCount.PostId = p2.Id
+    GROUP BY u.Id
+), DuplicateQuestionCTE AS (
+    SELECT DISTINCT
+        pl.PostId AS QuestionId,
+        pl.RelatedPostId AS DuplicateOfQuestionId,
+        pt.Name AS LinkTypeName
+    FROM PostLinks pl
+    JOIN PostTypes pt ON pt.Id = (SELECT PostTypeId FROM Posts WHERE Id = pl.PostId)
+    WHERE pl.LinkTypeId = 3
+), RankedAnswers AS (
+    SELECT 
+        QuestionId,
+        AnswerId,
+        AnswerScore,
+        AnswerDate,
+        AnswerOwnerUserId,
+        RANK() OVER (PARTITION BY QuestionId ORDER BY AnswerScore DESC, AnswerDate ASC) AS AnswerRank
+    FROM PostsWithAnswerStats
+    WHERE AnswerId IS NOT NULL
+), AnswerCommentsCount AS (
+    SELECT
+        c.PostId AS AnswerId,
+        COUNT(*) FILTER (WHERE c.Score > 0) AS PosComments,
+        COUNT(*) FILTER (WHERE c.Score <= 0 OR c.Score IS NULL) AS NonPosComments
+    FROM Comments c
+    WHERE EXISTS(SELECT 1 FROM Posts p WHERE p.Id = c.PostId AND p.PostTypeId = 2)
+    GROUP BY c.PostId
+)
+
+SELECT
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    ua.TotalQuestions,
+    ua.TotalAnswers,
+    ua.TotalQuestionScore,
+    ua.TotalAnswerScore,
+    ua.AvgQuestionScore,
+    ua.AvgAnswerScore,
+    dq.DuplicateOfQuestionId,
+    dq.LinkTypeName AS DuplicateLinkType,
+    q.Title AS QuestionTitle,
+    q.CreationDate AS QuestionCreated,
+    q.Score AS QuestionScore,
+    COALESCE(ra.AnswerId, -1) AS TopAnswerId,
+    COALESCE(ra.AnswerScore, 0) AS TopAnswerScore,
+    COALESCE(ac.PosComments, 0) AS TopAnswerPosComments,
+    COALESCE(ac.NonPosComments, 0) AS TopAnswerNonPosComments,
+    string_agg(DISTINCT r.TagName, ', ') FILTER (WHERE r.Level = 1) AS Level1Tags,
+    string_agg(DISTINCT r.TagName, ', ') FILTER (WHERE r.Level = 2) AS Level2TagsLike,
+    (TIMESTAMP '2024-10-01 12:34:56' - u.CreationDate) AS AccountAge,
+    ROUND(
+      COALESCE(ua.TotalQuestionScore * 0.7 + ua.TotalAnswerScore * 1.3, 0)
+      * (CASE WHEN u.Reputation = 0 THEN NULL ELSE CAST(u.Reputation AS numeric) END)
+      / NULLIF(COALESCE(ua.TotalQuestions,0) + COALESCE(ua.TotalAnswers,0), 0)
+    ,2) AS WeightedScorePerPost,
+    CASE
+        WHEN u.LastAccessDate > (DATE '2024-10-01' - INTERVAL '30' DAY) THEN 'Active last 30 days'
+        WHEN u.LastAccessDate > (DATE '2024-10-01' - INTERVAL '90' DAY) THEN 'Active last 90 days'
+        ELSE 'Inactive over 90 days'
+    END AS ActivityStatus,
+    LEFT(u.AboutMe, 50) || CASE WHEN LENGTH(COALESCE(u.AboutMe, '')) > 50 THEN '...' ELSE '' END AS AboutMePreview
+FROM Users u
+LEFT JOIN UserEngagement ua ON ua.UserId = u.Id
+LEFT JOIN Posts q ON q.OwnerUserId = u.Id AND q.PostTypeId = 1
+LEFT JOIN DuplicateQuestionCTE dq ON dq.QuestionId = q.Id
+LEFT JOIN RankedAnswers ra ON ra.QuestionId = q.Id AND ra.AnswerRank = 1
+LEFT JOIN AnswerCommentsCount ac ON ac.AnswerId = ra.AnswerId
+LEFT JOIN RecursiveTagHierarchy r ON r.TagName = ANY(string_to_array(TRIM(BOTH '<>' FROM q.Tags), '><'))
+WHERE u.Reputation > (
+    SELECT AVG(Reputation) FROM Users WHERE Reputation > 0
+)
+AND u.Location IS NOT NULL
+AND q.Score > 0
+AND (ra.AnswerScore > 5 OR ra.AnswerId IS NULL)
+GROUP BY
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    ua.TotalQuestions,
+    ua.TotalAnswers,
+    ua.TotalQuestionScore,
+    ua.TotalAnswerScore,
+    ua.AvgQuestionScore,
+    ua.AvgAnswerScore,
+    dq.DuplicateOfQuestionId,
+    dq.LinkTypeName,
+    q.Title,
+    q.CreationDate,
+    q.Score,
+    ra.AnswerId,
+    ra.AnswerScore,
+    ac.PosComments,
+    ac.NonPosComments,
+    r.TagName,
+    r.Level,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.AboutMe
+ORDER BY WeightedScorePerPost DESC NULLS LAST
+LIMIT 25;

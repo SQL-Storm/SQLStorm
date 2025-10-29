@@ -1,0 +1,329 @@
+-- {"query": "48.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3542} 
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        coalesce(nullif(trim(u.location), ''), 'Unknown') as location_norm,
+        date_trunc('month', u.creationdate) as cohort_month,
+        dense_rank() over (order by date_trunc('month', u.creationdate)) as cohort_rank
+    from users u
+    where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+user_activity as (
+    select
+        u.user_id,
+        count(distinct p.id) filter (where p.posttypeid in (1,2)) as posts_count,
+        sum(greatest(p.score, 0)) filter (where p.posttypeid in (1,2)) as nonneg_post_score,
+        count(distinct c.id) as comments_count,
+        sum(coalesce(v_up.cnt_up, 0)) as upvotes_received,
+        sum(coalesce(v_down.cnt_down, 0)) as downvotes_received,
+        sum(coalesce(v_fav.cnt_fav, 0)) as favorites_received,
+        max(p.lastactivitydate) as last_post_activity
+    from recent_users u
+    left join posts p
+      on p.owneruserid = u.user_id
+    left join lateral (
+        select count(*) as cnt_up
+        from votes v
+        where v.postid = p.id and v.votetypeid = 2
+    ) v_up on true
+    left join lateral (
+        select count(*) as cnt_down
+        from votes v
+        where v.postid = p.id and v.votetypeid = 3
+    ) v_down on true
+    left join lateral (
+        select count(*) as cnt_fav
+        from votes v
+        where v.postid = p.id and v.votetypeid = 5
+    ) v_fav on true
+    left join comments c
+      on c.userid = u.user_id
+    group by u.user_id
+),
+badges_rollup as (
+    select
+        b.userid as user_id,
+        sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+        sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+        sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+        count(*) filter (where b.tagbased = 1) as tag_badges,
+        min(b.date) as first_badge_date,
+        max(b.date) as last_badge_date
+    from badges b
+    group by b.userid
+),
+question_quality as (
+    select
+        q.owneruserid as user_id,
+        count(*) as questions,
+        avg(q.score) as avg_q_score,
+        sum(q.viewcount) as total_views,
+        sum(case when q.acceptedanswerid is not null then 1 else 0 end) as accepted_count,
+        count(*) filter (where q.closeddate is not null) as closed_count,
+        count(distinct ph.id) filter (where ph.posthistorytypeid in (10,11,12,13,14,15,19,20,35)) as mod_events
+    from posts q
+    left join posthistory ph
+      on ph.postid = q.id
+    where q.posttypeid = 1
+    group by q.owneruserid
+),
+answer_quality as (
+    select
+        a.owneruserid as user_id,
+        count(*) as answers,
+        avg(a.score) as avg_a_score,
+        sum(case when v.votetypeid = 1 then 1 else 0 end) as accepted_flags,
+        sum(case when a.score > 0 then 1 else 0 end) as positive_answers
+    from posts a
+    left join votes v
+      on v.postid = a.id and v.votetypeid = 1
+    where a.posttypeid = 2
+    group by a.owneruserid
+),
+tag_engagement as (
+    select
+        p.owneruserid as user_id,
+        lower(trim(unnest(string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')))) as tagname,
+        count(*) as tag_questions
+    from posts p
+    where p.posttypeid = 1 and p.tags is not null and length(p.tags) > 2
+    group by p.owneruserid, lower(trim(unnest(string_to_array(substring(p.tags, 2, length(p.tags)-2), '><'))))
+),
+top_tags as (
+    select user_id, tagname, tag_questions,
+           row_number() over (partition by user_id order by tag_questions desc, tagname) as rn
+    from tag_engagement
+),
+dedup_links as (
+    select
+        pl.postid,
+        pl.relatedpostid,
+        pl.linktypeid,
+        min(pl.creationdate) as first_link_date,
+        count(*) as link_count
+    from postlinks pl
+    group by pl.postid, pl.relatedpostid, pl.linktypeid
+),
+dup_clusters as (
+    select
+        q.owneruserid as user_id,
+        count(*) filter (where dl.linktypeid = 3) as duplicate_links,
+        count(*) filter (where dl.linktypeid = 1) as related_links
+    from dedup_links dl
+    join posts q on q.id = dl.postid and q.posttypeid = 1
+    group by q.owneruserid
+),
+user_recent_edit_bursts as (
+    select
+        ph.userid as user_id,
+        count(*) filter (
+            where ph.posthistorytypeid in (4,5,6,7,8,9,24)
+              and ph.creationdate >= (select max(creationdate) - interval '90 days' from posthistory)
+        ) as edits_90d
+    from posthistory ph
+    group by ph.userid
+),
+user_flags as (
+    select
+        u.id as user_id,
+        max(case when u.websiteurl ilike '%github%' then 1 else 0 end) as has_github,
+        max(case when u.aboutme ilike '%sql%' then 1 else 0 end) as mentions_sql,
+        max(case when u.location ilike '%remote%' then 1 else 0 end) as location_remote
+    from users u
+    group by u.id
+),
+comment_sentiment_proxy as (
+    select
+        c.userid as user_id,
+        avg(c.score) as avg_comment_score,
+        sum(case when c.text ~* '(thanks|great|helpful)' then 1 else 0 end) as positive_markers,
+        sum(case when c.text ~* '(wrong|bad|downvote)' then 1 else 0 end) as negative_markers
+    from comments c
+    group by c.userid
+),
+activity_weeks as (
+    select
+        u.user_id,
+        date_trunc('week', p.creationdate) as wk,
+        count(*) as posts_in_week
+    from recent_users u
+    left join posts p on p.owneruserid = u.user_id
+    group by u.user_id, date_trunc('week', p.creationdate)
+),
+consistency_score as (
+    select
+        aw.user_id,
+        stddev_pop(coalesce(aw.posts_in_week, 0)) as post_weekly_stddev,
+        avg(coalesce(aw.posts_in_week, 0)) as post_weekly_avg
+    from activity_weeks aw
+    group by aw.user_id
+),
+rep_velocity as (
+    select
+        u.id as user_id,
+        (u.reputation::numeric
+         / greatest(extract(epoch from (now() - u.creationdate)) / 86400.0, 1)) as rep_per_day
+    from users u
+),
+thresholds as (
+    select
+        percentile_cont(0.9) within group (order by coalesce(ua.nonneg_post_score,0)) as p90_score,
+        percentile_cont(0.9) within group (order by coalesce(qq.total_views,0)) as p90_views,
+        percentile_cont(0.9) within group (order by coalesce(rv.rep_per_day,0)) as p90_rep_day
+    from user_activity ua
+    left join question_quality qq on qq.user_id = ua.user_id
+    left join rep_velocity rv on rv.user_id = ua.user_id
+),
+qualified_users as (
+    select
+        u.user_id,
+        u.displayname,
+        u.reputation,
+        u.cohort_month,
+        u.cohort_rank,
+        ua.posts_count,
+        ua.nonneg_post_score,
+        ua.comments_count,
+        ua.upvotes_received,
+        ua.downvotes_received,
+        ua.favorites_received,
+        qq.questions,
+        qq.avg_q_score,
+        qq.total_views,
+        qq.accepted_count,
+        qq.closed_count,
+        qq.mod_events,
+        aq.answers,
+        aq.avg_a_score,
+        aq.accepted_flags,
+        aq.positive_answers,
+        coalesce(dc.duplicate_links,0) as duplicate_links,
+        coalesce(dc.related_links,0) as related_links,
+        coalesce(ub.edits_90d,0) as edits_90d,
+        coalesce(cf.avg_comment_score,0) as avg_comment_score,
+        coalesce(cf.positive_markers,0) as positive_markers,
+        coalesce(cf.negative_markers,0) as negative_markers,
+        coalesce(cs.post_weekly_stddev,0) as post_weekly_stddev,
+        coalesce(cs.post_weekly_avg,0) as post_weekly_avg,
+        coalesce(rv.rep_per_day,0) as rep_per_day,
+        coalesce(br.gold_badges,0) as gold_badges,
+        coalesce(br.silver_badges,0) as silver_badges,
+        coalesce(br.bronze_badges,0) as bronze_badges,
+        coalesce(br.tag_badges,0) as tag_badges,
+        u.location_norm,
+        max(case when tt.rn = 1 then tt.tagname end) as top_tag1,
+        max(case when tt.rn = 2 then tt.tagname end) as top_tag2,
+        max(case when tt.rn = 3 then tt.tagname end) as top_tag3
+    from recent_users u
+    left join user_activity ua on ua.user_id = u.user_id
+    left join question_quality qq on qq.user_id = u.user_id
+    left join answer_quality aq on aq.user_id = u.user_id
+    left join dup_clusters dc on dc.user_id = u.user_id
+    left join user_recent_edit_bursts ub on ub.user_id = u.user_id
+    left join comment_sentiment_proxy cf on cf.user_id = u.user_id
+    left join consistency_score cs on cs.user_id = u.user_id
+    left join rep_velocity rv on rv.user_id = u.user_id
+    left join badges_rollup br on br.user_id = u.user_id
+    left join top_tags tt on tt.user_id = u.user_id and tt.rn <= 3
+    group by
+        u.user_id, u.displayname, u.reputation, u.cohort_month, u.cohort_rank, u.location_norm,
+        ua.posts_count, ua.nonneg_post_score, ua.comments_count, ua.upvotes_received, ua.downvotes_received, ua.favorites_received,
+        qq.questions, qq.avg_q_score, qq.total_views, qq.accepted_count, qq.closed_count, qq.mod_events,
+        aq.answers, aq.avg_a_score, aq.accepted_flags, aq.positive_answers,
+        dc.duplicate_links, dc.related_links,
+        ub.edits_90d,
+        cf.avg_comment_score, cf.positive_markers, cf.negative_markers,
+        cs.post_weekly_stddev, cs.post_weekly_avg,
+        rv.rep_per_day,
+        br.gold_badges, br.silver_badges, br.bronze_badges, br.tag_badges
+),
+scored as (
+    select
+        qu.*,
+        -- Robust z-like scores with NULL handling
+        case when qu.posts_count is null or qu.posts_count = 0 then 0
+             else ln(1 + qu.posts_count) end
+             + ln(1 + coalesce(qu.nonneg_post_score,0))
+             + ln(1 + coalesce(qu.questions,0))
+             + ln(1 + coalesce(qu.answers,0))
+             + ln(1 + coalesce(qu.accepted_flags,0)) as activity_signal,
+        (coalesce(qu.avg_q_score,0) + coalesce(qu.avg_a_score,0)) / 2.0 as avg_post_score,
+        case when qu.post_weekly_stddev = 0 then 1.0
+             else least(5.0, greatest(0.1, qu.post_weekly_avg / nullif(qu.post_weekly_stddev,0))) end as consistency_ratio
+    from qualified_users qu
+),
+benchmarks as (
+    select
+        s.*,
+        t.p90_score,
+        t.p90_views,
+        t.p90_rep_day,
+        -- Complex predicate benchmark flags
+        case
+            when (coalesce(s.nonneg_post_score,0) >= t.p90_score
+                  and coalesce(s.total_views,0) >= t.p90_views)
+              or (coalesce(s.rep_per_day,0) >= t.p90_rep_day and coalesce(s.accepted_flags,0) > 0)
+            then 1 else 0 end as high_performer,
+        case
+            when coalesce(s.negative_markers,0) > coalesce(s.positive_markers,0) * 2
+                 and coalesce(s.avg_comment_score,0) < 0 then 1 else 0 end as likely_controversial
+    from scored s
+    cross join thresholds t
+),
+ranked as (
+    select
+        b.*,
+        -- Dense rank across multi-factor score
+        row_number() over (
+            order by
+                (b.activity_signal
+                 + 0.5 * coalesce(b.avg_post_score,0)
+                 + 0.25 * ln(1 + coalesce(b.total_views,0))
+                 + 0.75 * coalesce(b.rep_per_day,0)
+                 + 0.5 * coalesce(b.consistency_ratio,0)
+                 + 0.25 * coalesce(b.gold_badges,0)
+                 + 0.1 * coalesce(b.silver_badges,0)
+                 + 0.05 * coalesce(b.bronze_badges,0))
+                desc,
+                b.user_id
+        ) as overall_rank,
+        rank() over (partition by b.cohort_month order by b.rep_per_day desc nulls last) as cohort_rep_rank,
+        dense_rank() over (partition by coalesce(b.location_norm,'Unknown') order by b.nonneg_post_score desc nulls last) as location_score_rank
+    from benchmarks b
+)
+select
+    r.user_id,
+    r.displayname,
+    r.reputation,
+    r.cohort_month,
+    r.cohort_rank,
+    r.location_norm as location,
+    r.top_tag1, r.top_tag2, r.top_tag3,
+    r.posts_count, r.questions, r.answers,
+    r.nonneg_post_score, r.avg_post_score,
+    r.total_views, r.accepted_count, r.accepted_flags,
+    r.duplicate_links, r.related_links,
+    r.edits_90d, r.upvotes_received, r.downvotes_received, r.favorites_received,
+    r.avg_comment_score, r.positive_markers, r.negative_markers,
+    r.post_weekly_avg, r.post_weekly_stddev, r.consistency_ratio,
+    r.rep_per_day, r.gold_badges, r.silver_badges, r.bronze_badges, r.tag_badges,
+    r.high_performer, r.likely_controversial,
+    r.overall_rank, r.cohort_rep_rank, r.location_score_rank
+from ranked r
+where
+    -- Complex filter combining string, numeric and null logic
+    (
+        coalesce(r.top_tag1,'') <> coalesce(r.top_tag2,'')
+        or (r.top_tag2 is null and r.top_tag1 is not null)
+    )
+    and (
+        r.high_performer = 1
+        or (r.rep_per_day >= r.p90_rep_day and r.consistency_ratio >= 1.0)
+        or (r.avg_post_score >= 1.5 and r.post_weekly_avg >= 0.5)
+    )
+    and coalesce(r.location_norm, 'Unknown') not ilike '%test%'
+order by r.overall_rank
+limit 200;

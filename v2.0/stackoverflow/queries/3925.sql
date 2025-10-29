@@ -1,0 +1,125 @@
+WITH RecentAnswers AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.ParentId AS QuestionId,
+        p.Score,
+        p.CreationDate
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+      AND p.CreationDate >= CAST(CAST('2024-10-01' AS date) - INTERVAL '1 year' AS timestamp)
+),
+
+UserAnswerStats AS (
+    SELECT
+        a.OwnerUserId,
+        COUNT(*)                                           AS AnswerCount,
+        CAST(AVG(a.Score) AS numeric(10,2))                AS AvgScore,
+        SUM(CASE WHEN a.Score > 0 THEN 1 ELSE 0 END)       AS PositiveScoreCount,
+        SUM(CASE WHEN a.Score < 0 THEN 1 ELSE 0 END)       AS NegativeScoreCount,
+        MAX(a.CreationDate)                                AS LastAnswerDate
+    FROM RecentAnswers a
+    GROUP BY a.OwnerUserId
+    HAVING COUNT(*) >= 5
+),
+
+TagBadgeCounts AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.TagBased = TRUE THEN 1 ELSE 0 END)   AS TagBadgeCount,
+        SUM(CASE WHEN b.TagBased = FALSE THEN 1 ELSE 0 END)  AS NamedBadgeCount
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+UserLatestActivity AS (
+    SELECT
+        u.Id                                            AS UserId,
+        GREATEST(
+            u.LastAccessDate,
+            COALESCE(
+                (SELECT MAX(c.CreationDate)
+                 FROM Comments c
+                 WHERE c.UserId = u.Id),
+                TIMESTAMP '1970-01-01'
+            )
+        )                                                AS LatestActivity
+    FROM Users u
+),
+
+Combined AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        uas.AnswerCount,
+        uas.AvgScore,
+        COALESCE(tb.TagBadgeCount, 0)                AS TagBadgeCount,
+        COALESCE(tb.NamedBadgeCount, 0)              AS NamedBadgeCount,
+        COALESCE(uas.PositiveScoreCount,0) * 1.0
+            / NULLIF(COALESCE(uas.NegativeScoreCount,0),0) AS PosNegRatio,
+        u.LastAccessDate,
+        ua.LatestActivity,
+        (SELECT COUNT(DISTINCT tag)
+         FROM (
+               SELECT regexp_split_to_table(p.Tags, '[><]') AS tag
+               FROM Posts p
+               WHERE p.OwnerUserId = u.Id
+                 AND p.PostTypeId = 1
+         ) AS t)                                          AS DistinctQuestionTags,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY uas.AvgScore DESC) AS RankByAvgScore
+    FROM Users u
+    LEFT JOIN UserAnswerStats uas ON uas.OwnerUserId = u.Id
+    LEFT JOIN TagBadgeCounts tb   ON tb.UserId = u.Id
+    LEFT JOIN UserLatestActivity ua ON ua.UserId = u.Id
+    WHERE u.Reputation >= 1000
+      AND (uas.AnswerCount IS NOT NULL OR COALESCE(tb.TagBadgeCount,0) > 0)
+    GROUP BY
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        uas.AnswerCount,
+        uas.AvgScore,
+        tb.TagBadgeCount,
+        tb.NamedBadgeCount,
+        uas.PositiveScoreCount,
+        uas.NegativeScoreCount,
+        u.LastAccessDate,
+        ua.LatestActivity
+)
+
+SELECT
+    Id,
+    DisplayName,
+    Reputation,
+    AnswerCount,
+    AvgScore,
+    TagBadgeCount,
+    NamedBadgeCount,
+    PosNegRatio,
+    LastAccessDate,
+    LatestActivity,
+    DistinctQuestionTags,
+    RankByAvgScore
+FROM Combined
+WHERE RankByAvgScore = 1
+
+UNION ALL
+
+SELECT
+    NULL                                            AS Id,
+    'Aggregate Summary'                             AS DisplayName,
+    NULL                                            AS Reputation,
+    SUM(AnswerCount)                                AS AnswerCount,
+    AVG(AvgScore)                                   AS AvgScore,
+    SUM(TagBadgeCount)                              AS TagBadgeCount,
+    SUM(NamedBadgeCount)                            AS NamedBadgeCount,
+    NULL                                            AS PosNegRatio,
+    NULL                                            AS LastAccessDate,
+    MAX(LatestActivity)                             AS LatestActivity,
+    NULL                                            AS DistinctQuestionTags,
+    NULL                                            AS RankByAvgScore
+FROM Combined
+WHERE AnswerCount IS NOT NULL
+ORDER BY Reputation DESC NULLS LAST, AvgScore DESC NULLS LAST
+LIMIT 10;

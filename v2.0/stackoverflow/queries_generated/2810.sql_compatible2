@@ -1,0 +1,133 @@
+WITH RECURSIVE RecursiveCTE AS (
+    SELECT p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Tags,
+           unnest(string_to_array(trim(both '<>' FROM coalesce(p.Tags, '')), '><')) AS Tag,
+           1 AS Depth
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+    UNION ALL
+    SELECT pl.RelatedPostId AS Id, p2.PostTypeId, p2.OwnerUserId, p2.CreationDate, p2.Score, p2.ViewCount, p2.Tags,
+           unnest(string_to_array(trim(both '<>' FROM coalesce(p2.Tags, '')), '><')) AS Tag,
+           r.Depth + 1
+    FROM RecursiveCTE r
+    JOIN PostLinks pl ON pl.PostId = r.Id AND pl.LinkTypeId = 1
+    JOIN Posts p2 ON p2.Id = pl.RelatedPostId
+    WHERE r.Depth < 3
+),
+UserActivity AS (
+    SELECT u.Id AS UserId, u.DisplayName, u.Reputation,
+        count(distinct CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsAsked,
+        count(distinct CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersGiven,
+        count(distinct c.Id) AS CommentsMade,
+        count(distinct b.Id) AS BadgesCount,
+        max(vp.Score) AS MaxPostScore,
+        avg(CASE WHEN vp.Score > 0 THEN vp.Score END) AS AvgPositivePostScore,
+        sum(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+        sum(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived,
+        sum(CASE WHEN v.VoteTypeId = 8 THEN coalesce(v.BountyAmount,0) ELSE 0 END) AS TotalBountyStarted
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    LEFT JOIN Posts vp ON vp.Id = v.PostId
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+RankedPosts AS (
+    SELECT 
+        p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.Tags, p.OwnerUserId,
+        row_number() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC NULLS LAST, p.ViewCount DESC NULLS LAST) AS RankByScoreView,
+        count(*) OVER (PARTITION BY p.OwnerUserId) AS PostCountByUser,
+        dense_rank() OVER (ORDER BY p.Score DESC NULLS LAST) AS GlobalScoreRank
+    FROM Posts p
+    WHERE p.PostTypeId IN (1,2)
+),
+TopTags AS (
+    SELECT Tag, count(*) AS TagUsageCount
+    FROM RecursiveCTE
+    WHERE Tag IS NOT NULL AND length(Tag) > 0
+    GROUP BY Tag
+    HAVING count(*) > 50
+),
+FilteredQuestions AS (
+    SELECT p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.Tags, p.OwnerUserId,
+        (SELECT count(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCount,
+        (SELECT count(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpVotes,
+        (SELECT count(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS DownVotes
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.Score > 10
+      AND coalesce(p.ViewCount, 0) > 1000
+      AND EXISTS (
+        SELECT 1 FROM TopTags tt WHERE tt.Tag = ANY(string_to_array(trim(both '<>' FROM coalesce(p.Tags, '')), '><'))
+      )
+),
+TopTagsLimited AS (
+    -- select a small set of tags to join against without causing non-inner join on subquery issues
+    SELECT Tag FROM TopTags tt WHERE tt.Tag IS NOT NULL
+    ORDER BY Tag
+    LIMIT 5
+)
+SELECT
+    u.UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.QuestionsAsked,
+    u.AnswersGiven,
+    u.CommentsMade,
+    u.BadgesCount,
+    u.MaxPostScore,
+    u.AvgPositivePostScore,
+    u.UpVotesReceived,
+    u.DownVotesReceived,
+    u.TotalBountyStarted,
+    p.Id AS PostId,
+    p.Title AS PostTitle,
+    p.CreationDate AS PostCreated,
+    p.Score AS PostScore,
+    p.ViewCount AS PostViews,
+    p.Tags AS PostTags,
+    p.RankByScoreView,
+    p.PostCountByUser,
+    p.GlobalScoreRank,
+    fq.CommentCount,
+    fq.UpVotes,
+    fq.DownVotes,
+    coalesce(nullif(p.RankByScoreView, 0), 9999) * coalesce(p.Score, 0) / nullif(u.Reputation, 1) AS ScoreRatio,
+    CASE 
+        WHEN u.Reputation IS NULL OR u.Reputation < 100 THEN 'LowRep'
+        WHEN u.Reputation BETWEEN 100 AND 1000 THEN 'MediumRep'
+        ELSE 'HighRep'
+    END AS ReputationCategory,
+    array_agg(distinct ttl.Tag) FILTER (WHERE ttl.Tag IS NOT NULL) AS FrequentTags
+FROM UserActivity u
+LEFT JOIN RankedPosts p ON p.OwnerUserId = u.UserId AND p.RankByScoreView = 1
+LEFT JOIN FilteredQuestions fq ON fq.Id = p.Id
+LEFT JOIN TopTagsLimited ttl ON ttl.Tag = ANY(string_to_array(coalesce(p.Tags, ''), '><'))
+WHERE u.QuestionsAsked > 5 AND u.AnswersGiven > 10
+GROUP BY
+    u.UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.QuestionsAsked,
+    u.AnswersGiven,
+    u.CommentsMade,
+    u.BadgesCount,
+    u.MaxPostScore,
+    u.AvgPositivePostScore,
+    u.UpVotesReceived,
+    u.DownVotesReceived,
+    u.TotalBountyStarted,
+    p.Id,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.RankByScoreView,
+    p.PostCountByUser,
+    p.GlobalScoreRank,
+    fq.CommentCount,
+    fq.UpVotes,
+    fq.DownVotes
+ORDER BY u.Reputation DESC NULLS LAST, p.Score DESC NULLS LAST
+LIMIT 100;

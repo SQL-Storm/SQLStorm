@@ -1,0 +1,379 @@
+WITH UserPostStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) AS TotalPosts,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswerCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS TotalQuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS TotalAnswerScore,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) AS AvgAnswerScore,
+        MAX(p.CreationDate) AS LatestPostDate,
+        MIN(p.CreationDate) AS FirstPostDate,
+        CASE 
+            WHEN COUNT(p.Id) > 0 THEN CAST((EXTRACT(EPOCH FROM MAX(p.CreationDate)) - EXTRACT(EPOCH FROM MIN(p.CreationDate))) / 86400 AS INTEGER)
+            ELSE 0 
+        END AS DaysActive,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadges,
+        STRING_AGG(
+            CASE 
+                WHEN p.PostTypeId = 1 THEN 'Q:' || COALESCE(p.Title,'') || ' (' || COALESCE(CAST(p.Score AS TEXT),'0') || ')'
+                WHEN p.PostTypeId = 2 THEN 'A:' || SUBSTRING(COALESCE(p.Body,''), 1, 50) || '...'
+            END,
+            '; '
+        ) AS RecentActivity
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.EmailHash, u.WebsiteUrl, u.Location, u.AboutMe, u.AccountId
+),
+QuestionStats AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        u.DisplayName AS OwnerName,
+        CAST((EXTRACT(EPOCH FROM p.LastActivityDate) - EXTRACT(EPOCH FROM p.CreationDate)) / 86400 AS INTEGER) AS DaysSinceLastActivity,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+            ELSE 'Open'
+        END AS Status,
+        CASE 
+            WHEN p.AnswerCount > 0 THEN 
+                (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = p.Id AND a.Score > 0) * 100.0 / p.AnswerCount
+            ELSE 0 
+        END AS PositiveAnswerPercentage,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) - 
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS NetVotes,
+        STRING_AGG(
+            CASE WHEN v.VoteTypeId IN (2, 3) THEN 
+                CAST(v.UserId AS TEXT) || ':' || CASE WHEN v.VoteTypeId = 2 THEN 'Up' ELSE 'Down' END
+            END,
+            ', '
+        ) AS VoteActivity,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS ScoreRank
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (2, 3)
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, 
+             p.CreationDate, p.OwnerUserId, p.Tags, u.DisplayName, p.LastActivityDate, 
+             p.ClosedDate, p.CommunityOwnedDate
+),
+AnswerStats AS (
+    SELECT 
+        a.Id AS AnswerId,
+        a.ParentId,
+        a.Score,
+        a.CreationDate,
+        a.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = a.Id AND v.VoteTypeId = 2) AS Upvotes,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = a.Id AND v.VoteTypeId = 3) AS Downvotes,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC) AS RankInQuestion,
+        CASE 
+            WHEN a.Score > 0 THEN 'Positive'
+            WHEN a.Score < 0 THEN 'Negative'
+            ELSE 'Neutral'
+        END AS ScoreCategory,
+        CAST((EXTRACT(EPOCH FROM TIMESTAMP '2024-10-01 12:34:56') - EXTRACT(EPOCH FROM a.CreationDate)) / 86400 AS INTEGER) AS DaysOld,
+        (LENGTH(a.Body) * 1.0) / 100.0 AS BodyLength,
+        CASE 
+            WHEN a.OwnerUserId IS NOT NULL THEN 'User'
+            ELSE 'Community'
+        END AS AnswerType
+    FROM Posts a
+    LEFT JOIN Users u ON a.OwnerUserId = u.Id
+    WHERE a.PostTypeId = 2
+),
+TagStats AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagCount,
+        t.Count * 100.0 / (SELECT SUM(Count) FROM Tags) AS PercentageOfAllTags,
+        CASE 
+            WHEN t.Count > 500 THEN 'High'
+            WHEN t.Count > 100 THEN 'Medium'
+            WHEN t.Count > 10 THEN 'Low'
+            ELSE 'Very Low'
+        END AS PopularityLevel,
+        (SELECT COUNT(*) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%') AS QuestionsUsingTag,
+        (SELECT AVG(p.Score) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%') AS AvgScoreForTag,
+        STRING_AGG(
+            (SELECT p2.Title FROM Posts p2 WHERE p2.Tags LIKE '%' || t.TagName || '%' AND p2.PostTypeId = 1 ORDER BY p2.CreationDate DESC LIMIT 1),
+            '; '
+        ) AS RecentQuestions
+    FROM Tags t
+    GROUP BY t.TagName, t.Count
+)
+SELECT
+    'User Performance Report' AS ReportType,
+    u.DisplayName AS UserName,
+    u.Reputation,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    ups.TotalPosts,
+    ups.QuestionCount,
+    ups.AnswerCount,
+    ups.TotalQuestionScore,
+    ups.TotalAnswerScore,
+    ups.AvgQuestionScore,
+    ups.AvgAnswerScore,
+    ups.GoldBadges,
+    ups.SilverBadges,
+    ups.BronzeBadges,
+    ups.DaysActive,
+    ups.LatestPostDate,
+    ups.FirstPostDate,
+    CASE 
+        WHEN ups.TotalPosts > 0 THEN CAST(ups.DaysActive AS REAL) / ups.TotalPosts
+        ELSE 0 
+    END AS AvgPostsPerDay,
+    CASE 
+        WHEN ups.TotalQuestionScore + ups.TotalAnswerScore > 0 THEN 
+            (ups.TotalQuestionScore - ups.TotalAnswerScore) * 100.0 / (ups.TotalQuestionScore + ups.TotalAnswerScore)
+        ELSE 0 
+    END AS ScoreDifferencePercentage,
+    CASE 
+        WHEN ups.TotalQuestionScore > 0 THEN (ups.TotalQuestionScore * 100.0) / NULLIF(ups.GoldBadges,0)
+        ELSE 0 
+    END AS ScorePerGoldBadge,
+    CASE 
+        WHEN ups.TotalAnswerScore > 0 AND ups.AnswerCount > 0 THEN ups.TotalAnswerScore * 1.0 / ups.AnswerCount
+        ELSE 0 
+    END AS AvgAnswerScorePerAnswer,
+    SUBSTRING(ups.RecentActivity FROM 1 FOR 200) AS RecentActivitySample,
+    CASE 
+        WHEN ups.QuestionCount > 0 AND ups.AnswerCount > 0 THEN 
+            CAST(ups.AnswerCount AS REAL) / CAST(ups.QuestionCount AS REAL)
+        ELSE 0 
+    END AS AnswersPerQuestion,
+    (SELECT MAX(qs.Score) FROM QuestionStats qs WHERE qs.OwnerUserId = u.Id) AS HighestQuestionScore,
+    (SELECT MIN(qs.Score) FROM QuestionStats qs WHERE qs.OwnerUserId = u.Id) AS LowestQuestionScore,
+    (SELECT AVG(qs.Score) FROM QuestionStats qs WHERE qs.OwnerUserId = u.Id) AS AverageQuestionScore,
+    (SELECT COUNT(*) FROM QuestionStats qs WHERE qs.OwnerUserId = u.Id AND qs.DaysSinceLastActivity <= 1) AS RecentlyActiveQuestions,
+    STRING_AGG(
+        CASE 
+            WHEN q.Title IS NOT NULL THEN q.Title || ' (Score:' || COALESCE(CAST(q.Score AS TEXT),'0') || ')'
+        END, 
+        '; '
+    ) AS RecentQuestions,
+    STRING_AGG(
+        CASE 
+            WHEN a.Id IS NOT NULL THEN 'Answer for Q' || CAST(a.ParentId AS TEXT) || ' (Score:' || COALESCE(CAST(a.Score AS TEXT),'0') || ')'
+        END, 
+        '; '
+    ) AS RecentAnswers,
+    (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId IN (2, 3)) AS TotalVoteActivity,
+    (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id) AS CommentCount,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Date > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year') AS RecentBadges,
+    CASE 
+        WHEN u.EmailHash IS NOT NULL THEN 'Email Provided'
+        ELSE 'No Email'
+    END AS EmailStatus,
+    CASE 
+        WHEN u.WebsiteUrl IS NOT NULL THEN 'Website Provided'
+        ELSE 'No Website'
+    END AS WebsiteStatus,
+    CASE 
+        WHEN u.Location IS NOT NULL AND LENGTH(u.Location) > 0 THEN 'Location Provided'
+        ELSE 'No Location'
+    END AS LocationStatus,
+    COALESCE(u.AboutMe, 'No Bio') AS BiographicalInfo,
+    CASE 
+        WHEN u.AccountId < 0 THEN 'Deleted User'
+        ELSE 'Active User'
+    END AS AccountStatus,
+    CASE 
+        WHEN ups.TotalPosts > 100 THEN 'High Activity'
+        WHEN ups.TotalPosts > 20 THEN 'Medium Activity'
+        WHEN ups.TotalPosts > 0 THEN 'Low Activity'
+        ELSE 'No Posts'
+    END AS ActivityLevel,
+    CASE 
+        WHEN ups.GoldBadges > 5 THEN 'Elite Contributor'
+        WHEN ups.GoldBadges > 2 THEN 'Seasoned Contributor'
+        WHEN ups.GoldBadges > 0 THEN 'New Contributor'
+        ELSE 'Beginner'
+    END AS ContributionTier,
+    CASE 
+        WHEN u.Reputation > 10000 THEN 'Expert'
+        WHEN u.Reputation > 1000 THEN 'Advanced'
+        WHEN u.Reputation > 100 THEN 'Intermediate'
+        ELSE 'Beginner'
+    END AS ReputationTier,
+    (SELECT COUNT(DISTINCT p.OwnerUserId) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '6 months') AS RecentActivityLast6Months,
+    (SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '3 months') AS AvgScore3Months,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1 AND p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year') AS QuestionsLastYear,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2 AND p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year') AS AnswersLastYear,
+    (SELECT MAX(p.ViewCount) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS MaxQuestionViews,
+    (SELECT MAX(p.ViewCount) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS MaxAnswerViews,
+    (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id) AS VoteCount,
+    (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 2) AS UpvotesReceived,
+    (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 3) AS DownvotesReceived,
+    (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 4) AS OffensiveVotes,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.LastEditDate > p.CreationDate) AS EditedPosts,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.CommentCount > 0) AS CommentedPosts,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.AcceptedAnswerId IS NOT NULL) AS AcceptedAnswers,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.AnswerCount > 0) AS AnsweredQuestions,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.Score >= 10) AS HighScorePosts,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.Score < 0) AS NegativeScorePosts,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.ViewCount > 10000) AS HighlyViewedPosts,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.ViewCount BETWEEN 1000 AND 10000) AS IntermediateViewedPosts,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.ViewCount < 1000) AS LowViewedPosts,
+    (
+        SELECT COUNT(*) FROM Posts p 
+        LEFT JOIN Votes v ON p.Id = v.PostId 
+        WHERE p.OwnerUserId = u.Id 
+        AND v.VoteTypeId IN (2, 3)
+        AND v.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+    ) AS RecentVotingActivity,
+    (SELECT MAX(CAST((EXTRACT(EPOCH FROM TIMESTAMP '2024-10-01 12:34:56') - EXTRACT(EPOCH FROM p.CreationDate)) / 86400 AS INTEGER)) FROM Posts p WHERE p.OwnerUserId = u.Id) AS MaxPostAgeDays,
+    (SELECT AVG((EXTRACT(EPOCH FROM TIMESTAMP '2024-10-01 12:34:56') - EXTRACT(EPOCH FROM p.CreationDate)) / 86400.0) FROM Posts p WHERE p.OwnerUserId = u.Id) AS AvgPostAgeDays,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1 AND b.Date > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '6 months') AS RecentGoldBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2 AND b.Date > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '6 months') AS RecentSilverBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3 AND b.Date > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '6 months') AS RecentBronzeBadges,
+    (SELECT 
+        STRING_AGG('Badge:' || b.Name || ' Date:' || CAST(b.Date AS TEXT), ', ')
+        FROM Badges b 
+        WHERE b.UserId = u.Id 
+        AND b.Date > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '2 years'
+        ORDER BY b.Date DESC
+        LIMIT 5
+    ) AS RecentBadgesList,
+    (SELECT STRING_AGG(
+        CASE 
+            WHEN p.ViewCount > 5000 THEN 
+                'VIEWS:' || CAST(p.ViewCount AS TEXT) || ' TITLE:' || SUBSTRING(p.Title FROM 1 FOR 50)
+        END, 
+        ' | '
+    ) FROM Posts p WHERE p.OwnerUserId = u.Id) AS PopularPostsSample,
+    (SELECT STRING_AGG(
+        CASE 
+            WHEN p.Score > 5 THEN 
+                'SCORE:' || CAST(p.Score AS TEXT) || ' TITLE:' || SUBSTRING(p.Title FROM 1 FOR 50)
+        END, 
+        ' | '
+    ) FROM Posts p WHERE p.OwnerUserId = u.Id) AS HighScorePostsSample,
+    (SELECT STRING_AGG(
+        CASE 
+            WHEN p.CommentCount > 5 THEN 
+                'COMMENTS:' || CAST(p.CommentCount AS TEXT) || ' TITLE:' || SUBSTRING(p.Title FROM 1 FOR 50)
+        END, 
+        ' | '
+    ) FROM Posts p WHERE p.OwnerUserId = u.Id) AS CommentedPostsSample,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, ups.TotalPosts DESC) AS Ranking,
+    ENCODE(MD5(CAST((RANDOM()::TEXT || CLOCK_TIMESTAMP()::TEXT) AS TEXT)), 'hex') AS UniqueIdentifier,
+    TIMESTAMP '2024-10-01 12:34:56' AS ReportGenerationTime,
+    'Generated for Analysis' AS ReportContext,
+    CASE 
+        WHEN ups.TotalPosts > 0 AND ups.QuestionCount = 0 THEN 'Answer focused'
+        WHEN ups.TotalPosts > 0 AND ups.AnswerCount = 0 THEN 'Question focused'
+        ELSE 'Mixed focus'
+    END AS FocusArea,
+    CASE 
+        WHEN ups.DaysActive > 365 THEN 'Long term contributor'
+        WHEN ups.DaysActive > 180 THEN 'Regular contributor'
+        WHEN ups.DaysActive > 30 THEN 'Active contributor'
+        ELSE 'New contributor'
+    END AS ContributionDuration,
+    CASE 
+        WHEN (ups.GoldBadges + ups.SilverBadges + ups.BronzeBadges) > 10 THEN 'Achievement oriented'
+        WHEN (ups.GoldBadges + ups.SilverBadges + ups.BronzeBadges) > 5 THEN 'Regular achiever'
+        ELSE 'Occasional achiever'
+    END AS BadgeAchievementStyle,
+    CASE 
+        WHEN ups.TotalQuestionScore > 1000 THEN 'High scoring questioner'
+        WHEN ups.TotalQuestionScore > 100 THEN 'Moderate scoring questioner'
+        ELSE 'Low scoring questioner'
+    END AS QuestioningStyle,
+    CASE 
+        WHEN ups.TotalAnswerScore > 1000 THEN 'High scoring answerer'
+        WHEN ups.TotalAnswerScore > 100 THEN 'Moderate scoring answerer'
+        ELSE 'Low scoring answerer'
+    END AS AnsweringStyle,
+    (SELECT COUNT(*) FROM Posts p 
+     WHERE p.OwnerUserId = u.Id AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '7 days') AS RecentPostsLast7Days,
+    (SELECT COUNT(*) FROM Posts p 
+     WHERE p.OwnerUserId = u.Id AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days') AS RecentPostsLast30Days,
+    (SELECT COUNT(*) FROM Posts p 
+     WHERE p.OwnerUserId = u.Id AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '3 months') AS RecentPostsLast3Months,
+    (SELECT COUNT(*) FROM Posts p 
+     WHERE p.OwnerUserId = u.Id AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year') AS RecentPostsLastYear,
+    (SELECT COUNT(*) FROM Votes v 
+     WHERE v.UserId = u.Id AND v.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '7 days') AS RecentVotesLast7Days,
+    (SELECT COUNT(*) FROM Votes v 
+     WHERE v.UserId = u.Id AND v.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days') AS RecentVotesLast30Days,
+    (SELECT COUNT(*) FROM Votes v 
+     WHERE v.UserId = u.Id AND v.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '3 months') AS RecentVotesLast3Months,
+    (SELECT COUNT(*) FROM Comments c 
+     WHERE c.UserId = u.Id AND c.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '7 days') AS RecentCommentsLast7Days,
+    (SELECT COUNT(*) FROM Comments c 
+     WHERE c.UserId = u.Id AND c.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days') AS RecentCommentsLast30Days,
+    (SELECT AVG(v.BountyAmount) FROM Votes v 
+     WHERE v.UserId = u.Id AND v.BountyAmount IS NOT NULL) AS AvgBountyAmount,
+    (SELECT MAX(v.BountyAmount) FROM Votes v 
+     WHERE v.UserId = u.Id AND v.BountyAmount IS NOT NULL) AS MaxBountyAmount,
+    (SELECT COUNT(*) FROM Tags t 
+     WHERE t.Count > 100 AND EXISTS (
+         SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1 AND p.Tags LIKE '%' || t.TagName || '%'
+     )) AS PopularTagCount,
+    (SELECT t.TagName FROM Tags t 
+     WHERE t.Count > 100
+     ORDER BY t.Count DESC
+     LIMIT 1) AS TopTag,
+    CASE 
+        WHEN EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id AND p.Tags IS NOT NULL AND p.Tags LIKE '%<%') THEN 'Uses Tagging'
+        ELSE 'Does Not Use Tagging'
+    END AS TaggingUsage,
+    CASE 
+        WHEN EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id AND p.Body LIKE '%code%') THEN 'Code Focused'
+        ELSE 'Text Focused'
+    END AS ContentFocus,
+    CASE 
+        WHEN EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id AND p.Tags IS NOT NULL AND p.Tags LIKE '%discussion%') THEN 'Discussion Focused'
+        ELSE 'Not Discussion Focused'
+    END AS DiscussionFocus,
+    CASE 
+        WHEN EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id AND p.Tags IS NOT NULL AND p.Tags LIKE '%help%') THEN 'Help Focused'
+        ELSE 'Not Help Focused'
+    END AS HelpFocus,
+    (SELECT AVG(p.ViewCount) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS AvgQuestionViews,
+    (SELECT AVG(p.ViewCount) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS AvgAnswerViews,
+    (SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS AvgQuestionScore,
+    (SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS AvgAnswerScore,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1 AND p.ViewCount > 100) AS PopularQuestions,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2 AND p.ViewCount > 100) AS PopularAnswers,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1 AND p.CommentCount > 5) AS HighlyCommentedQuestions,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2 AND p.CommentCount > 5) AS HighlyCommentedAnswers,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1 AND p.AnswerCount > 10) AS QuestionsWithManyAnswers,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2 AND p.Score > 100) AS HighScoreAnswers,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1 AND p.Score > 100) AS HighScoreQuestions
+FROM Users u
+INNER JOIN UserPostStats ups ON u.Id = ups.UserId
+LEFT JOIN QuestionStats q ON u.Id = q.OwnerUserId
+LEFT JOIN AnswerStats a ON u.Id = a.OwnerUserId
+WHERE u.Id IS NOT NULL
+    AND u.Reputation > 0
+    AND ups.TotalPosts > 0
+    AND ups.DaysActive > 0
+GROUP BY
+    u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes,
+    ups.TotalPosts, ups.QuestionCount, ups.AnswerCount, ups.TotalQuestionScore, ups.TotalAnswerScore,
+    ups.AvgQuestionScore, ups.AvgAnswerScore, ups.GoldBadges, ups.SilverBadges, ups.BronzeBadges,
+    ups.DaysActive, ups.LatestPostDate, ups.FirstPostDate, ups.RecentActivity,
+    u.EmailHash, u.WebsiteUrl, u.Location, u.AboutMe, u.AccountId
+ORDER BY u.Reputation DESC, ups.TotalPosts DESC, ups.TotalQuestionScore DESC, ups.TotalAnswerScore DESC
+LIMIT 100;

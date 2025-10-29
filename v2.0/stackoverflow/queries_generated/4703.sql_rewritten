@@ -1,0 +1,235 @@
+-- {"query": "4703.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2545} 
+WITH
+  PostEditStats AS (
+    SELECT
+      ph.PostId,
+      COUNT(CASE WHEN ph.PostHistoryTypeId = 4 THEN 1 END) AS TitleEdits,
+      COUNT(CASE WHEN ph.PostHistoryTypeId = 5 THEN 1 END) AS BodyEdits,
+      COUNT(CASE WHEN ph.PostHistoryTypeId = 6 THEN 1 END) AS TagEdits,
+      MAX(CASE WHEN ph.PostHistoryTypeId = 4 THEN ph.CreationDate ELSE NULL END) AS LastTitleEditDate,
+      MAX(CASE WHEN ph.PostHistoryTypeId = 5 THEN ph.CreationDate ELSE NULL END) AS LastBodyEditDate,
+      MAX(CASE WHEN ph.PostHistoryTypeId = 6 THEN ph.CreationDate ELSE NULL END) AS LastTagEditDate,
+      SUM(CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20) THEN 1 ELSE 0 END) AS ModeratorActionCount,
+      SUM(CASE WHEN ph.PostHistoryTypeId = 52 THEN 1 ELSE 0 END) AS HotQuestionCount,
+      SUM(CASE WHEN ph.PostHistoryTypeId = 53 THEN 1 ELSE 0 END) AS RemovedHotQuestionCount
+    FROM
+      PostHistory AS ph
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6, 10, 11, 12, 13, 14, 15, 19, 20, 52, 53)
+    GROUP BY
+      ph.PostId
+  ),
+  UserPostActivity AS (
+    SELECT
+      p.OwnerUserId,
+      COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+      COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswerCount,
+      AVG(p.Score) AS AverageScore,
+      SUM(p.ViewCount) AS TotalViewCount,
+      SUM(p.FavoriteCount) AS TotalFavoriteCount,
+      MAX(p.CreationDate) AS LastPostCreationDate
+    FROM
+      Posts AS p
+    WHERE
+      p.OwnerUserId IS NOT NULL AND p.OwnerUserId <> -1
+    GROUP BY
+      p.OwnerUserId
+  ),
+  CommentEngagement AS (
+    SELECT
+      c.UserId,
+      COUNT(c.Id) AS CommentCount,
+      SUM(c.Score) AS TotalCommentScore,
+      AVG(c.Score) AS AverageCommentScore
+    FROM
+      Comments AS c
+    WHERE
+      c.UserId IS NOT NULL
+    GROUP BY
+      c.UserId
+  ),
+  VoteDistribution AS (
+    SELECT
+      v.UserId,
+      COUNT(CASE WHEN vt.Name = 'UpMod' THEN 1 END) AS UpVoteCount,
+      COUNT(CASE WHEN vt.Name = 'DownMod' THEN 1 END) AS DownVoteCount,
+      COUNT(CASE WHEN vt.Name = 'Favorite' THEN 1 END) AS FavoriteVoteCount
+    FROM
+      Votes AS v
+    JOIN
+      VoteTypes AS vt
+      ON v.VoteTypeId = vt.Id
+    WHERE
+      v.UserId IS NOT NULL
+    GROUP BY
+      v.UserId
+  ),
+  UserBadgeSummary AS (
+    SELECT
+      b.UserId,
+      COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadgeCount,
+      COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadgeCount,
+      COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadgeCount
+    FROM
+      Badges AS b
+    GROUP BY
+      b.UserId
+  ),
+  PostLinkAnalysis AS (
+    SELECT
+      pl.PostId,
+      COUNT(CASE WHEN lt.Name = 'Linked' THEN 1 END) AS LinkedPostCount,
+      COUNT(CASE WHEN lt.Name = 'Duplicate' THEN 1 END) AS DuplicatePostCount
+    FROM
+      PostLinks AS pl
+    JOIN
+      LinkTypes AS lt
+      ON pl.LinkTypeId = lt.Id
+    GROUP BY
+      pl.PostId
+  ),
+  UserReputationTrend AS (
+    SELECT
+      UserId,
+      Reputation,
+      CreationDate,
+      ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY CreationDate DESC) AS rn
+    FROM
+      PostHistory
+    WHERE
+      PostHistoryTypeId = 16 -- Community Owned could also be relevant here, but this is more specific to user reputation changes. For a more general trend, consider other types.
+  ),
+  QualifiedUsers AS (
+    SELECT DISTINCT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate,
+      u.Views,
+      u.UpVotes AS UserUpVotes,
+      u.DownVotes AS UserDownVotes,
+      CASE WHEN u.WebsiteUrl IS NULL OR u.WebsiteUrl = '' THEN 'No Website' ELSE 'Has Website' END AS WebsiteStatus,
+      CASE WHEN u.Location IS NULL OR u.Location = '' THEN 'No Location' ELSE 'Has Location' END AS LocationStatus,
+      CASE WHEN u.AboutMe IS NULL OR u.AboutMe = '' THEN 'No About Me' ELSE 'Has About Me' END AS AboutMeStatus,
+      CASE WHEN u.EmailHash IS NULL THEN 'No Email Hash' ELSE 'Has Email Hash' END AS EmailHashStatus,
+      COALESCE(pa.QuestionCount, 0) AS TotalQuestions,
+      COALESCE(pa.AnswerCount, 0) AS TotalAnswers,
+      COALESCE(pa.AverageScore, 0) AS AvgPostScore,
+      COALESCE(pa.TotalViewCount, 0) AS TotalPostViews,
+      COALESCE(pa.TotalFavoriteCount, 0) AS TotalPostFavorites,
+      COALESCE(ce.CommentCount, 0) AS TotalComments,
+      COALESCE(ce.TotalCommentScore, 0) AS TotalCommentScores,
+      COALESCE(vd.UpVoteCount, 0) AS TotalUpvotesGiven,
+      COALESCE(vd.DownVoteCount, 0) AS TotalDownvotesGiven,
+      COALESCE(vd.FavoriteVoteCount, 0) AS TotalFavoriteVotesGiven,
+      COALESCE(ubs.GoldBadgeCount, 0) AS GoldBadges,
+      COALESCE(ubs.SilverBadgeCount, 0) AS SilverBadges,
+      COALESCE(ubs.BronzeBadgeCount, 0) AS BronzeBadges
+    FROM
+      Users AS u
+    LEFT JOIN
+      UserPostActivity AS pa
+      ON u.Id = pa.OwnerUserId
+    LEFT JOIN
+      CommentEngagement AS ce
+      ON u.Id = ce.UserId
+    LEFT JOIN
+      VoteDistribution AS vd
+      ON u.Id = vd.UserId
+    LEFT JOIN
+      UserBadgeSummary AS ubs
+      ON u.Id = ubs.UserId
+    WHERE
+      u.Id <> -1 -- Exclude community user
+  )
+SELECT
+  qu.UserId,
+  qu.DisplayName,
+  qu.Reputation,
+  qu.CreationDate,
+  qu.Views AS UserViews,
+  qu.UserUpVotes,
+  qu.UserDownVotes,
+  qu.WebsiteStatus,
+  qu.LocationStatus,
+  qu.AboutMeStatus,
+  qu.EmailHashStatus,
+  qu.TotalQuestions,
+  qu.TotalAnswers,
+  qu.AvgPostScore,
+  qu.TotalPostViews,
+  qu.TotalPostFavorites,
+  qu.TotalComments,
+  qu.TotalCommentScores,
+  qu.TotalUpvotesGiven,
+  qu.TotalDownvotesGiven,
+  qu.TotalFavoriteVotesGiven,
+  qu.GoldBadges,
+  qu.SilverBadges,
+  qu.BronzeBadges,
+  pes.TitleEdits,
+  pes.BodyEdits,
+  pes.TagEdits,
+  pes.LastTitleEditDate,
+  pes.LastBodyEditDate,
+  pes.LastTagEditDate,
+  pes.ModeratorActionCount,
+  pes.HotQuestionCount,
+  pes.RemovedHotQuestionCount,
+  COALESCE(pla.LinkedPostCount, 0) AS TotalLinkedPosts,
+  COALESCE(pla.DuplicatePostCount, 0) AS TotalDuplicatePosts,
+  COALESCE(urt.Reputation, qu.Reputation) AS LatestReputation, -- Using urt directly if available, otherwise fallback to qu.Reputation
+  CASE
+    WHEN qu.TotalAnswers > 0 AND qu.AvgPostScore > 0 THEN (CAST(qu.TotalAnswers AS REAL) / qu.AvgPostScore)
+    WHEN qu.TotalQuestions > 0 THEN (CAST(qu.TotalQuestions AS REAL) / 10)
+    ELSE 0
+  END AS AnswerToScoreRatio,
+  LOWER(SUBSTRING(qu.DisplayName FROM 1 FOR 3)) AS FirstThreeCharsDisplayName,
+  CASE
+    WHEN qu.GoldBadges > 5 THEN 'High Achiever'
+    WHEN qu.SilverBadges > 10 OR qu.BronzeBadges > 50 THEN 'Consistent Contributor'
+    WHEN qu.TotalQuestions > 100 OR qu.TotalAnswers > 200 THEN 'Prolific Poster'
+    ELSE 'Standard User'
+  END AS UserTier,
+  CASE
+    WHEN qu.CreationDate < DATE('now', '-5 year') AND qu.LastPostCreationDate < DATE('now', '-1 year') THEN 'Inactive Long-Term'
+    WHEN qu.CreationDate < DATE('now', '-1 year') AND qu.LastPostCreationDate < DATE('now', '-6 months') THEN 'Inactive Medium-Term'
+    WHEN qu.LastPostCreationDate < DATE('now', '-3 months') THEN 'Recently Inactive'
+    ELSE 'Active'
+  END AS ActivityLevel,
+  CASE
+    WHEN q.Id IS NOT NULL THEN 'Has Accepted Answer'
+    ELSE 'No Accepted Answer'
+  END AS HasAcceptedAnswerFlag
+FROM
+  QualifiedUsers AS qu
+LEFT JOIN
+  PostEditStats AS pes
+  ON qu.UserId = pes.PostId
+LEFT JOIN
+  PostLinkAnalysis AS pla
+  ON qu.UserId = pla.PostId
+LEFT JOIN
+  UserReputationTrend AS urt
+  ON qu.UserId = urt.UserId AND urt.rn = 1
+LEFT JOIN
+  (
+    SELECT DISTINCT
+      p.OwnerUserId,
+      p.Id
+    FROM
+      Posts AS p
+    WHERE
+      p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL
+  ) AS q
+  ON qu.UserId = q.OwnerUserId
+WHERE
+  qu.Reputation > 1000 -- Filter for users with a certain reputation
+  AND (
+    qu.TotalQuestions > 10 OR qu.TotalAnswers > 20
+  ) -- Ensure some level of activity
+  AND qu.CreationDate < DATE('now', '-1 month') -- Exclude very new users
+ORDER BY
+  qu.Reputation DESC,
+  qu.TotalQuestions DESC,
+  qu.TotalAnswers DESC;

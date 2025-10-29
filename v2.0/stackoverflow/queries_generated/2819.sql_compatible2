@@ -1,0 +1,201 @@
+with RecursiveTagHierarchy as (
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        0 as Level,
+        cast(t.TagName as varchar(1000)) as FullPath
+    from Tags t
+    where t.IsRequired = true
+
+    union all
+
+    select 
+        child.Id,
+        child.TagName,
+        child.Count,
+        child.ExcerptPostId,
+        child.WikiPostId,
+        child.IsModeratorOnly,
+        child.IsRequired,
+        parent.Level + 1,
+        (parent.FullPath || ' > ' || child.TagName)
+    from Tags child
+    join RecursiveTagHierarchy parent on child.Id <> parent.Id
+    where child.IsRequired = true
+      and child.TagName like parent.TagName || '%'
+),
+DetailedPosts as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        pt.Name as PostTypeName,
+        p.OwnerUserId,
+        u.DisplayName,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.AcceptedAnswerId,
+        coalesce(p.AnswerCount,0) as AnswerCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.LastActivityDate,
+        case when p.ClosedDate is not null then 1 else 0 end as IsClosed,
+        substring(p.Tags from '<([^>]+)>') as FirstTag
+    from Posts p
+    left join PostTypes pt on p.PostTypeId = pt.Id
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId in (1,2)
+),
+AnswerStatistics as (
+    select
+        p.ParentId as QuestionId,
+        count(*) as TotalAnswers,
+        avg(p.Score) as AvgAnswerScore,
+        max(p.Score) as MaxAnswerScore,
+        sum(case when p.CreationDate < date_trunc('day', cast('2024-10-01 12:34:56' as timestamp) - interval '7 day') then 1 else 0 end) as AnswersOlderThanWeek
+    from Posts p
+    where p.PostTypeId = 2
+    group by p.ParentId
+),
+UserBadgeStats as (
+    select
+        b.UserId,
+        count(case when b.Class = 1 then 1 end) as GoldBadges,
+        count(case when b.Class = 2 then 1 end) as SilverBadges,
+        count(case when b.Class = 3 then 1 end) as BronzeBadges,
+        max(b.Date) as LastBadgeDate
+    from Badges b
+    group by b.UserId
+),
+RecentPostHistory as (
+    select
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        pht.Name as HistoryTypeName,
+        ph.UserId,
+        u.DisplayName as EditorName,
+        ph.CreationDate,
+        ph.Comment
+    from PostHistory ph
+    left join PostHistoryTypes pht on ph.PostHistoryTypeId = pht.Id
+    left join Users u on ph.UserId = u.Id
+    where ph.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '30 day'
+),
+QuestionsWithDuplicates as (
+    select 
+        q.Id as QuestionId,
+        count(distinct pl.RelatedPostId) as DuplicateCount
+    from Posts q
+    left join PostLinks pl on pl.PostId = q.Id and pl.LinkTypeId = 3
+    where q.PostTypeId = 1
+    group by q.Id
+),
+RankedPosts as (
+    select 
+        dp.Id,
+        dp.PostTypeId,
+        dp.PostTypeName,
+        dp.OwnerUserId,
+        dp.DisplayName,
+        dp.CreationDate,
+        dp.Score,
+        dp.ViewCount,
+        dp.Title,
+        dp.Tags,
+        dp.AcceptedAnswerId,
+        dp.AnswerCount,
+        dp.FavoriteCount,
+        dp.ClosedDate,
+        dp.LastActivityDate,
+        dp.IsClosed,
+        dp.FirstTag,
+        ubs.GoldBadges,
+        ubs.SilverBadges,
+        ubs.BronzeBadges,
+        asv.TotalAnswers,
+        asv.AvgAnswerScore,
+        asv.MaxAnswerScore,
+        asv.AnswersOlderThanWeek,
+        qwd.DuplicateCount,
+        row_number() over (partition by dp.PostTypeId order by dp.Score desc, dp.ViewCount desc) as RankWithinType,
+        rank() over (order by dp.Score desc) as GlobalScoreRank
+    from DetailedPosts dp
+    left join UserBadgeStats ubs on dp.OwnerUserId = ubs.UserId
+    left join AnswerStatistics asv on dp.Id = asv.QuestionId
+    left join QuestionsWithDuplicates qwd on dp.Id = qwd.QuestionId
+)
+select 
+    rp.Id,
+    rp.PostTypeName,
+    rp.Title,
+    rp.Score,
+    rp.ViewCount,
+    rp.AnswerCount,
+    rp.FavoriteCount,
+    rp.IsClosed,
+    rp.GoldBadges,
+    rp.SilverBadges,
+    rp.BronzeBadges,
+    rp.TotalAnswers,
+    rp.AvgAnswerScore,
+    rp.MaxAnswerScore,
+    rp.AnswersOlderThanWeek,
+    rp.DuplicateCount,
+    rp.RankWithinType,
+    rp.GlobalScoreRank,
+    coalesce(rp.Tags, '') || ' | FirstTag: ' || coalesce(rp.FirstTag, 'N/A') || ' | Owner: ' || coalesce(rp.DisplayName, 'Anonymous') as PostSummary,
+    case 
+        when rp.IsClosed = 1 then 'Closed'
+        when rp.Score > 100 then 'High Score'
+        when rp.ViewCount > 10000 then 'Popular'
+        else 'Standard'
+    end as PostCategory,
+    (select count(distinct c.UserId) from Comments c where c.PostId = rp.Id and c.UserId is not null) as DistinctCommenters,
+    case when exists (select 1 from Votes v where v.PostId = rp.Id and v.VoteTypeId = 3) then 1 else 0 end as HasDownVotes,
+    avg(rp.Score) over (partition by case 
+                                    when rp.IsClosed = 1 then 'Closed'
+                                    when rp.Score > 100 then 'High Score'
+                                    when rp.ViewCount > 10000 then 'Popular'
+                                    else 'Standard'
+                                end) as AverageCategoryScore
+from RankedPosts rp
+where rp.RankWithinType <= 100
+
+union all
+
+select
+    u.Id as Id,
+    'UserSummary' as PostTypeName,
+    u.DisplayName as Title,
+    u.Reputation as Score,
+    u.Views as ViewCount,
+    0 as AnswerCount,
+    (u.UpVotes - u.DownVotes) as FavoriteCount,
+    0 as IsClosed,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    0 as TotalAnswers,
+    null as AvgAnswerScore,
+    null as MaxAnswerScore,
+    0 as AnswersOlderThanWeek,
+    0 as DuplicateCount,
+    null as RankWithinType,
+    null as GlobalScoreRank,
+    'User Profile: ' || coalesce(u.AboutMe, '[No info]') as PostSummary,
+    'User' as PostCategory,
+    (select count(distinct b.Name) from Badges b where b.UserId = u.Id) as DistinctBadges,
+    0 as HasDownVotes,
+    null as AverageCategoryScore
+from Users u
+left join UserBadgeStats ubs on u.Id = ubs.UserId
+where u.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '365 day'
+order by Score desc
+limit 50;

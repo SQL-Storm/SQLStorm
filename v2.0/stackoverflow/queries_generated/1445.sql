@@ -1,0 +1,238 @@
+-- {"query": "1445.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3128} 
+
+WITH UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate AS UserLastAccessDate,
+        u.Views AS UserProfileViews,
+        u.UpVotes AS UserUpVotesGiven,
+        u.DownVotes AS UserDownVotesGiven,
+        COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsOwned,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersOwned,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostScoreReceived,
+        COUNT(DISTINCT b.Id) AS TotalBadgesEarned,
+        MAX(b.Date) AS LastBadgeAwardDate,
+        RANK() OVER (ORDER BY u.Reputation DESC, u.CreationDate ASC) AS ReputationRank,
+        NTILE(10) OVER (ORDER BY u.LastAccessDate DESC, u.Reputation DESC) AS LastAccessReputationDecile,
+        LAG(u.Reputation, 1, 0) OVER (PARTITION BY EXTRACT(YEAR FROM u.CreationDate) ORDER BY u.Reputation) AS PrevUserRankReputation,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 1) OVER (PARTITION BY u.Id) AS AvgQuestionScore,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 2) OVER (PARTITION BY u.Id) AS AvgAnswerScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes
+    HAVING COUNT(DISTINCT p.Id) > 0 OR COUNT(DISTINCT b.Id) > 0
+),
+PostDetails AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.ParentId AS ParentPostId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.Body AS PostBodyExcerpt,
+        p.Title AS PostTitle,
+        p.Tags,
+        p.CommentCount AS PostCommentCount,
+        p.FavoriteCount AS PostFavoriteCount,
+        p.ClosedDate AS PostClosedDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.CreationDate ELSE NULL END) AS LastEditDateByHistory,
+        (SELECT COUNT(DISTINCT v.Id) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpVoteCount,
+        (SELECT COUNT(DISTINCT v.Id) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS DownVoteCount,
+        AVG(CAST(v.VoteTypeId = 2 AS INT)) OVER (PARTITION BY p.PostTypeId) AS AvgUpVoteRatioForType,
+        SUM(COALESCE(p.FavoriteCount, 0)) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS CumulativeFavoritesByOwner,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL AND p.CommunityOwnedDate IS NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL AND p.ClosedDate IS NULL THEN 'CommunityOwned'
+            WHEN p.ClosedDate IS NOT NULL AND p.CommunityOwnedDate IS NOT NULL THEN 'ClosedAndCommunityOwned'
+            ELSE 'Open'
+        END AS PostStatus
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    GROUP BY p.Id, p.PostTypeId, p.OwnerUserId, p.AcceptedAnswerId, p.ParentId, p.CreationDate, p.Score, p.ViewCount, p.Body, p.Title, p.Tags, p.CommentCount, p.FavoriteCount, p.ClosedDate, p.CommunityOwnedDate
+),
+TagAnalysis AS (
+    SELECT
+        pd.PostId,
+        TRIM(LOWER(UNNEST(string_to_array(SUBSTRING(pd.Tags FROM 2 FOR LENGTH(pd.Tags) - 2), '><')))) AS TagName,
+        pd.PostTypeId
+    FROM PostDetails pd
+    WHERE pd.Tags IS NOT NULL AND LENGTH(pd.Tags) > 2
+),
+TagMetrics AS (
+    SELECT
+        ta.TagName,
+        COUNT(DISTINCT ta.PostId) AS TagPostCount,
+        SUM(CASE WHEN ta.PostTypeId = 1 THEN 1 ELSE 0 END) AS TagQuestionCount,
+        SUM(CASE WHEN ta.PostTypeId = 2 THEN 1 ELSE 0 END) AS TagAnswerCount,
+        COUNT(DISTINCT b.UserId) AS UsersWithBadgeInTag,
+        MAX(CASE WHEN b.Class = 1 AND b.TagBased = TRUE THEN 1 ELSE 0 END) AS HasGoldBadgeInTag
+    FROM TagAnalysis ta
+    LEFT JOIN Tags t ON ta.TagName = t.TagName
+    LEFT JOIN Badges b ON b.Name = ta.TagName AND b.TagBased = TRUE
+    GROUP BY ta.TagName
+),
+RecentPostHistorySummary AS (
+    SELECT
+        ph.PostId,
+        MAX(ph.CreationDate) AS LastHistoryActivityDate,
+        COUNT(ph.Id) AS TotalHistoryEntries,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (10, 101) THEN 1 ELSE 0 END) AS CloseVoteHistoryCount,
+        STRING_AGG(DISTINCT crt.Name, '; ' ORDER BY crt.Name) FILTER (WHERE ph.PostHistoryTypeId IN (10, 101) AND ph.Comment IS NOT NULL) AS CloseReasonNames,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 12 THEN 1 ELSE 0 END) AS DeletionHistoryCount
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON (ph.PostHistoryTypeId = 10 AND ph.Comment::smallint = crt.Id) OR (ph.PostHistoryTypeId = 101 AND ph.Comment::smallint = crt.Id)
+    GROUP BY ph.PostId
+),
+PostContributionSummary AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId AS ContributorUserId,
+        p.CreationDate AS ContributionDate,
+        p.Score AS ContributionScore,
+        'Post' AS ContributionType
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL AND p.Score IS NOT NULL
+
+    UNION ALL
+
+    SELECT
+        c.PostId AS PostId,
+        c.UserId AS ContributorUserId,
+        c.CreationDate AS ContributionDate,
+        c.Score AS ContributionScore,
+        'Comment' AS ContributionType
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL AND c.Score IS NOT NULL
+
+    UNION ALL
+
+    SELECT
+        ph.PostId AS PostId,
+        ph.UserId AS ContributorUserId,
+        ph.CreationDate AS ContributionDate,
+        0 AS ContributionScore, -- History events generally don't have a score
+        'HistoryEdit' AS ContributionType
+    FROM PostHistory ph
+    WHERE ph.UserId IS NOT NULL AND ph.PostHistoryTypeId IN (4, 5, 6, 24) -- Edits, Suggested Edit Applied
+),
+AggregatedContribution AS (
+    SELECT
+        pcs.PostId,
+        pcs.ContributorUserId,
+        MAX(pcs.ContributionDate) AS LatestContributionByContributor,
+        SUM(pcs.ContributionScore) AS TotalNetContributionScore,
+        STRING_AGG(DISTINCT pcs.ContributionType, ', ' ORDER BY pcs.ContributionType) AS AllContributionTypes
+    FROM PostContributionSummary pcs
+    GROUP BY pcs.PostId, pcs.ContributorUserId
+)
+SELECT
+    ue.UserId,
+    ue.DisplayName,
+    ue.Reputation,
+    ue.TotalPostsOwned,
+    ue.TotalQuestionsOwned,
+    ue.TotalAnswersOwned,
+    ue.ReputationRank,
+    ue.LastAccessReputationDecile,
+    ue.AvgQuestionScore,
+    ue.AvgAnswerScore,
+    pd.PostId,
+    pd.PostTypeId,
+    pd.PostCreationDate,
+    pd.PostScore,
+    pd.ViewCount,
+    pd.PostCommentCount,
+    pd.PostFavoriteCount,
+    pd.PostTitle,
+    pd.PostStatus,
+    COALESCE(pd.LastEditDateByHistory, pd.PostCreationDate) AS EffectiveLastModifiedDate,
+    AGE(NOW(), COALESCE(pd.LastEditDateByHistory, pd.PostCreationDate)) AS TimeSinceLastEdit,
+    pd.UpVoteCount,
+    pd.DownVoteCount,
+    (pd.UpVoteCount::NUMERIC / NULLIF(pd.UpVoteCount + pd.DownVoteCount, 0)) AS UpVotePercentage,
+    (pd.PostScore * (COALESCE(pd.ViewCount, 0) / 1000.0) + (COALESCE(pd.PostFavoriteCount, 0) * 5) + (COALESCE(pd.PostCommentCount, 0) * 2)) AS WeightedEngagementScore,
+    ta_main.TagName AS PrimaryTag,
+    tm.TagPostCount,
+    tm.TagQuestionCount,
+    tm.TagAnswerCount,
+    tm.HasGoldBadgeInTag AS PrimaryTagHasGoldBadgeHolders,
+    rphs.LastHistoryActivityDate,
+    rphs.TotalHistoryEntries AS PostHistoryEntryCount,
+    rphs.CloseVoteHistoryCount,
+    rphs.CloseReasonNames,
+    rphs.DeletionHistoryCount,
+    ac.TotalNetContributionScore AS ContributorOverallScore,
+    ac.AllContributionTypes AS ContributorActions,
+    (
+        SELECT COUNT(ans.Id)
+        FROM Posts ans
+        WHERE ans.ParentId = pd.PostId
+          AND ans.PostTypeId = 2
+          AND ans.CreationDate < pd.PostCreationDate + INTERVAL '1 hour'
+    ) AS InitialAnswerCount,
+    (
+        SELECT
+            MAX(sub_pd.PostScore)
+        FROM PostDetails sub_pd
+        WHERE sub_pd.OwnerUserId = ue.UserId
+          AND sub_pd.PostCreationDate < pd.PostCreationDate
+          AND sub_pd.PostTypeId = pd.PostTypeId
+    ) AS PreviousMaxPostScoreByOwner,
+    EXISTS (
+        SELECT 1
+        FROM Badges b
+        WHERE b.UserId = ue.UserId
+          AND b.Class = 1 -- Gold badge
+          AND b.TagBased = TRUE
+          AND EXISTS (SELECT 1 FROM TagAnalysis inner_ta WHERE inner_ta.PostId = pd.PostId AND inner_ta.TagName = b.Name)
+    ) AS HasGoldBadgeForPostTag,
+    (
+        SELECT COUNT(DISTINCT pl.RelatedPostId)
+        FROM PostLinks pl
+        WHERE pl.PostId = pd.PostId AND pl.LinkTypeId = 1 -- Linked posts
+    ) AS LinkedPostsCount,
+    (
+        SELECT COUNT(DISTINCT pl.RelatedPostId)
+        FROM PostLinks pl
+        WHERE pl.PostId = pd.PostId AND pl.LinkTypeId = 3 -- Duplicate posts
+    ) AS DuplicatePostsCount,
+    TRIM(SPLIT_PART(ue.DisplayName, ' ', 1)) AS FirstNameGuess,
+    NULLIF(TRIM(SPLIT_PART(ue.DisplayName, ' ', 2)), '') AS LastNameGuess,
+    COALESCE(LENGTH(pd.PostBodyExcerpt), 0) AS PostBodyLength,
+    NULLIF(REGEXP_REPLACE(pd.PostTitle, '[^A-Za-z0-9 ]', '', 'g'), '') AS CleanedPostTitle
+FROM UserEngagement ue
+INNER JOIN PostDetails pd ON ue.UserId = pd.OwnerUserId
+LEFT JOIN TagAnalysis ta_main ON pd.PostId = ta_main.PostId
+LEFT JOIN TagMetrics tm ON ta_main.TagName = tm.TagName AND tm.TagQuestionCount > 0
+LEFT JOIN RecentPostHistorySummary rphs ON pd.PostId = rphs.PostId
+LEFT JOIN AggregatedContribution ac ON pd.PostId = ac.PostId AND ue.UserId = ac.ContributorUserId
+WHERE
+    ue.Reputation > 5000
+    AND pd.PostTypeId IN (1, 2)
+    AND pd.PostCreationDate >= '2021-01-01'
+    AND pd.PostScore > 5
+    AND pd.ViewCount > 100
+    AND tm.TagName IS NOT NULL
+    AND rphs.DeletionHistoryCount = 0 -- Exclude deleted posts
+    AND NOT EXISTS (
+        SELECT 1
+        FROM Posts p_closed_duplicate
+        JOIN PostHistory ph_close ON p_closed_duplicate.Id = ph_close.PostId
+        WHERE p_closed_duplicate.Id = pd.PostId
+          AND ph_close.PostHistoryTypeId = 101 -- Closed as Duplicate
+          AND ph_close.CreationDate > pd.CreationDate + INTERVAL '1 day'
+    )
+ORDER BY
+    WeightedEngagementScore DESC,
+    ue.Reputation DESC,
+    pd.PostCreationDate DESC
+LIMIT 25000;

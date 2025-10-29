@@ -1,0 +1,279 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS user_post_rank,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) AS score_rank,
+        LAG(p.Score, 1) OVER (ORDER BY p.CreationDate) AS prev_score,
+        LEAD(p.Score, 1) OVER (ORDER BY p.CreationDate) AS next_score,
+        AVG(p.Score) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS mov_avg_score,
+        CASE 
+            WHEN p.Score > 100 THEN 'High'
+            WHEN p.Score > 50 THEN 'Medium'
+            WHEN p.Score > 0 THEN 'Low'
+            ELSE 'Negative'
+        END AS score_category,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags <> '' THEN 
+                COALESCE(array_length(string_to_array(substring(p.Tags FROM 2 FOR (length(p.Tags)-2)), '><'), 1), 0)
+            ELSE 0 
+        END AS tag_count,
+        COALESCE(
+            (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id), 
+            0
+        ) AS comment_count_with_subquery,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 
+                (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = p.Id AND a.PostTypeId = 2 AND a.DeletionDate IS NULL)
+            ELSE 0
+        END AS answer_count_with_correlated,
+        COALESCE(
+            (SELECT AVG(v.BountyAmount) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 8), 
+            0
+        ) AS avg_bounty_amount
+    FROM Posts p
+    WHERE p.CreationDate >= CAST('2018-01-01' AS TIMESTAMP) 
+      AND p.PostTypeId IN (1, 2) 
+      AND p.Score IS NOT NULL
+),
+PostMetrics AS (
+    SELECT 
+        rp.Id,
+        rp.PostTypeId,
+        rp.Score,
+        rp.ViewCount,
+        rp.CreationDate,
+        rp.Title,
+        rp.Tags,
+        rp.OwnerUserId,
+        rp.AnswerCount,
+        rp.CommentCount,
+        rp.FavoriteCount,
+        rp.user_post_rank,
+        rp.score_rank,
+        rp.prev_score,
+        rp.next_score,
+        rp.mov_avg_score,
+        rp.score_category,
+        rp.tag_count,
+        rp.comment_count_with_subquery,
+        rp.answer_count_with_correlated,
+        rp.avg_bounty_amount,
+        CASE 
+            WHEN rp.prev_score IS NOT NULL THEN rp.Score - rp.prev_score
+            ELSE 0 
+        END AS score_change_from_prev,
+        CASE 
+            WHEN rp.next_score IS NOT NULL THEN rp.next_score - rp.Score
+            ELSE 0 
+        END AS score_change_to_next,
+        CASE 
+            WHEN rp.score_rank <= 100 THEN 'Top100'
+            WHEN rp.score_rank <= 1000 THEN 'Top1000'
+            ELSE 'Other'
+        END AS rank_category,
+        CASE WHEN rp.tag_count > 5 THEN 'Many Tags' ELSE 'Few Tags' END AS tag_category,
+        CASE WHEN rp.AnswerCount > 10 THEN 'High Answer Count' ELSE 'Low Answer Count' END AS answer_category,
+        CASE 
+            WHEN rp.ViewCount > 10000 THEN 'High Views'
+            WHEN rp.ViewCount > 1000 THEN 'Medium Views'
+            ELSE 'Low Views'
+        END AS view_category,
+        (rp.Score * rp.AnswerCount) / NULLIF(rp.ViewCount, 0) AS score_per_view_ratio
+    FROM RankedPosts rp
+),
+UserMetrics AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.ViewCount AS user_views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS total_posts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS question_count,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS answer_count,
+        COALESCE(SUM(p.Score), 0) AS total_score,
+        COALESCE(AVG(p.Score), 0) AS avg_score,
+        MAX(p.CreationDate) AS last_post_date,
+        COALESCE(COUNT(DISTINCT b.Id), 0) AS total_badges,
+        COALESCE(COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END), 0) AS gold_badges,
+        COALESCE(COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END), 0) AS silver_badges,
+        COALESCE(COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END), 0) AS bronze_badges,
+        COALESCE(MAX(b.Date), CAST('1900-01-01' AS TIMESTAMP)) AS last_badge_date,
+        MAX(CASE WHEN b.Class = 1 THEN b.Date END) AS last_gold_badge_date,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN COUNT(DISTINCT p.Id) * 100.0 / NULLIF(COUNT(DISTINCT p.Id) + COUNT(DISTINCT a.Id), 0)
+            ELSE 0 
+        END AS question_percentage,
+        ROW_NUMBER() OVER (ORDER BY COALESCE(SUM(p.Score), 0) DESC) AS user_score_rank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId IN (1, 2) 
+    LEFT JOIN Posts a ON u.Id = a.OwnerUserId AND a.PostTypeId = 2
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= CAST('2018-01-01' AS TIMESTAMP)
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.ViewCount, u.UpVotes, u.DownVotes
+    HAVING COUNT(DISTINCT p.Id) >= 1 OR COUNT(DISTINCT b.Id) >= 1
+),
+ComplexCalculations AS (
+    SELECT 
+        pm.Id,
+        pm.PostTypeId,
+        pm.Score,
+        pm.ViewCount,
+        pm.CreationDate,
+        pm.Title,
+        pm.Tags,
+        pm.OwnerUserId,
+        pm.AnswerCount,
+        pm.CommentCount,
+        pm.FavoriteCount,
+        pm.user_post_rank,
+        pm.score_rank,
+        pm.prev_score,
+        pm.next_score,
+        pm.mov_avg_score,
+        pm.score_category,
+        pm.tag_count,
+        pm.comment_count_with_subquery,
+        pm.answer_count_with_correlated,
+        pm.avg_bounty_amount,
+        um.DisplayName AS owner_name,
+        um.Reputation AS owner_reputation,
+        um.total_posts,
+        um.total_score,
+        um.avg_score AS owner_avg_score,
+        pm.score_change_from_prev,
+        pm.score_change_to_next,
+        pm.score_per_view_ratio,
+        CASE 
+            WHEN pm.score_per_view_ratio > 1 THEN 'High Engagement'
+            WHEN pm.score_per_view_ratio > 0.5 THEN 'Medium Engagement'
+            ELSE 'Low Engagement'
+        END AS engagement_level,
+        CASE 
+            WHEN pm.user_post_rank = 1 THEN 'Most Recent Post'
+            WHEN pm.user_post_rank = 2 THEN 'Second Most Recent Post'
+            ELSE 'Other'
+        END AS user_post_status,
+        EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - pm.CreationDate)) AS days_since_creation,
+        CASE 
+            WHEN pm.Score > 50 AND pm.AnswerCount > 10 THEN 'Popular Question'
+            WHEN pm.Score > 100 THEN 'Highly Rated'
+            WHEN pm.ViewCount > 1000 THEN 'Highly Viewed'
+            ELSE 'Standard Post'
+        END AS post_category,
+        CASE WHEN pm.tag_count > 5 THEN 'Many Tags' ELSE 'Few Tags' END AS tag_category,
+        CASE WHEN pm.AnswerCount > 10 THEN 'High Answer Count' ELSE 'Low Answer Count' END AS answer_category,
+        CASE 
+            WHEN pm.ViewCount > 10000 THEN 'High Views'
+            WHEN pm.ViewCount > 1000 THEN 'Medium Views'
+            ELSE 'Low Views'
+        END AS view_category
+    FROM PostMetrics pm
+    INNER JOIN UserMetrics um ON pm.OwnerUserId = um.UserId
+    WHERE pm.Score > 0 
+      AND pm.ViewCount > 0 
+      AND pm.AnswerCount IS NOT NULL
+),
+AggregatedPerformance AS (
+    SELECT 
+        'Question' AS post_type,
+        COUNT(*) AS total_questions,
+        AVG(Score) AS avg_question_score,
+        SUM(ViewCount) AS total_views,
+        AVG(AnswerCount) AS avg_answers,
+        AVG(CommentCount) AS avg_comments,
+        AVG(FavoriteCount) AS avg_favorites,
+        AVG(tag_count) AS avg_tags,
+        COUNT(DISTINCT OwnerUserId) AS unique_owners
+    FROM ComplexCalculations 
+    WHERE PostTypeId = 1
+    
+    UNION ALL
+    
+    SELECT 
+        'Answer' AS post_type,
+        COUNT(*) AS total_answers,
+        AVG(Score) AS avg_answer_score,
+        SUM(ViewCount) AS total_views,
+        NULL::numeric AS avg_answers,
+        AVG(CommentCount) AS avg_comments,
+        AVG(FavoriteCount) AS avg_favorites,
+        NULL::numeric AS avg_tags,
+        COUNT(DISTINCT OwnerUserId) AS unique_owners
+    FROM ComplexCalculations 
+    WHERE PostTypeId = 2
+    
+    UNION ALL
+    
+    SELECT 
+        'Combined' AS post_type,
+        COUNT(*) AS total_posts,
+        AVG(Score) AS avg_score,
+        SUM(ViewCount) AS total_views,
+        AVG(AnswerCount) AS avg_answers,
+        AVG(CommentCount) AS avg_comments,
+        AVG(FavoriteCount) AS avg_favorites,
+        AVG(tag_count) AS avg_tags,
+        COUNT(DISTINCT OwnerUserId) AS unique_owners
+    FROM ComplexCalculations
+)
+SELECT 
+    ap.post_type,
+    ap.total_questions,
+    ap.avg_question_score,
+    ap.total_views,
+    ap.avg_answers,
+    ap.avg_comments,
+    ap.avg_favorites,
+    ap.avg_tags,
+    ap.unique_owners,
+    (CASE 
+        WHEN ap.total_questions > 0 THEN 
+            (SELECT COUNT(*) FROM ComplexCalculations cc 
+             WHERE cc.post_category = 'Popular Question' 
+               AND cc.PostTypeId = 1) * 100.0 / ap.total_questions
+        ELSE 0 
+    END) AS popular_question_percentage,
+    (CASE 
+        WHEN ap.total_answers > 0 THEN 
+            (SELECT COUNT(*) FROM ComplexCalculations cc 
+             WHERE cc.post_category = 'Highly Rated' 
+               AND cc.PostTypeId = 2) * 100.0 / ap.total_answers
+        ELSE 0 
+    END) AS highly_rated_answer_percentage,
+    (SELECT COUNT(*) FROM ComplexCalculations cc 
+     WHERE cc.engagement_level = 'High Engagement') AS highly_engaged_posts,
+    (SELECT COUNT(*) FROM ComplexCalculations cc 
+     WHERE cc.answer_category = 'High Answer Count') AS high_answer_count_posts,
+    (SELECT COUNT(*) FROM ComplexCalculations cc 
+     WHERE cc.view_category = 'High Views') AS high_view_posts,
+    (SELECT MAX(um.user_score_rank) FROM UserMetrics um) AS max_user_rank,
+    (SELECT AVG(um.avg_score) FROM UserMetrics um) AS overall_avg_user_score
+FROM AggregatedPerformance ap
+GROUP BY 
+    ap.post_type,
+    ap.total_questions,
+    ap.avg_question_score,
+    ap.total_views,
+    ap.avg_answers,
+    ap.avg_comments,
+    ap.avg_favorites,
+    ap.avg_tags,
+    ap.unique_owners
+ORDER BY 
+    CASE ap.post_type 
+        WHEN 'Question' THEN 1 
+        WHEN 'Answer' THEN 2 
+        WHEN 'Combined' THEN 3 
+    END;

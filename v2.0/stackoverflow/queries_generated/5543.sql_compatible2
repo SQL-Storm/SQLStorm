@@ -1,0 +1,148 @@
+WITH RecentActivePosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Body,
+    p.Tags,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.PostTypeId,
+    COALESCE(p.AcceptedAnswerId, 0) AS AcceptedAnswerId
+  FROM Posts p
+  WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '60' DAY
+),
+TopTags AS (
+  SELECT
+    unnest(string_to_array(p.Tags, '<>')) AS TagName,
+    p.Id AS PostId,
+    p.Score,
+    p.ViewCount
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+TagStats AS (
+  SELECT
+    TagName,
+    COUNT(*) AS PostCount,
+    AVG(Score) AS AvgScore,
+    MAX(ViewCount) AS MaxViews
+  FROM TopTags
+  GROUP BY TagName
+),
+UserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.ProfileImageUrl,
+    -- ensure TagBased comparison uses numeric literal to match column type
+    ul.TagBased AS TagBadge
+  FROM Users u
+  LEFT JOIN Badges ul ON ul.UserId = u.Id AND ul.TagBased = 0
+),
+RecentVotes AS (
+  SELECT
+    v.PostId,
+    v.VoteTypeId,
+    v.UserId,
+    v.CreationDate,
+    v.BountyAmount
+  FROM Votes v
+  WHERE v.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30' DAY
+),
+ImportantPostLinks AS (
+  SELECT
+    pl.PostId,
+    pl.RelatedPostId,
+    lt.Name AS LinkTypeName,
+    pl.CreationDate
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+  WHERE lt.Id IN (1, 3)
+),
+QualifiedPosts AS (
+  SELECT
+    rp.PostId,
+    rp.Title,
+    rp.LastActivityDate,
+    rp.Score,
+    rp.ViewCount,
+    rp.CommentCount,
+    rp.AcceptedAnswerId,
+    rp.OwnerUserId AS OwnerId,
+    u.DisplayName AS OwnerDisplayName,
+    JSON_BUILD_OBJECT(
+      'created', rp.CreationDate,
+      'lastActivity', rp.LastActivityDate,
+      'score', rp.Score,
+      'views', rp.ViewCount
+    ) AS Meta
+  FROM RecentActivePosts rp
+  LEFT JOIN Users u ON rp.OwnerUserId = u.Id
+)
+SELECT
+  p.PostId,
+  p.Title,
+  p.Body,
+  p.Tags,
+  p.CreationDate,
+  p.LastActivityDate,
+  p.Score,
+  p.ViewCount,
+  p.CommentCount,
+  p.FavoriteCount,
+  p.PostTypeId,
+  p.AcceptedAnswerId,
+  t.PostCount AS TagPostCount,
+  t.AvgScore AS TagAvgScore,
+  t.MaxViews AS TagMaxViews,
+  u.Id AS OwnerId,
+  u.DisplayName AS OwnerDisplayName,
+  u.Reputation,
+  u.CreationDate AS OwnerCreationDate,
+  u.LastAccessDate AS OwnerLastAccess,
+  -- portable JSON extraction: try JSON_VALUE (SQL standard) then JSON_EXTRACT for other dialects; use NULL if not available
+  CASE
+    WHEN p.Meta IS NOT NULL THEN
+      -- Use JSON_VALUE if supported; fallback to NULL (applications should adapt per dialect)
+      JSON_VALUE(p.Meta, '$.created')
+    ELSE NULL
+  END AS PostCreatedRaw
+FROM QualifiedPosts p
+LEFT JOIN TagStats t ON 1=1
+LEFT JOIN Users u ON p.OwnerId = u.Id
+LEFT JOIN UserActivity ua ON u.Id = ua.UserId
+GROUP BY
+  p.PostId,
+  p.Title,
+  p.Body,
+  p.Tags,
+  p.CreationDate,
+  p.LastActivityDate,
+  p.Score,
+  p.ViewCount,
+  p.CommentCount,
+  p.FavoriteCount,
+  p.PostTypeId,
+  p.AcceptedAnswerId,
+  t.PostCount,
+  t.AvgScore,
+  t.MaxViews,
+  u.Id,
+  u.DisplayName,
+  u.Reputation,
+  u.CreationDate,
+  u.LastAccessDate,
+  p.Meta
+ORDER BY p.LastActivityDate DESC, p.Score DESC
+LIMIT 100;

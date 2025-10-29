@@ -1,0 +1,242 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.ViewCount,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) as QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) as AnswerCount,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        AVG(p.Score) as AvgScore,
+        MAX(p.CreationDate) as LastPostDate,
+        ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) as PostRank,
+        RANK() OVER (ORDER BY SUM(p.Score) DESC) as ScoreRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.ViewCount, u.UpVotes, u.DownVotes
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        PostCount,
+        TotalScore,
+        ScoreRank,
+        PostRank,
+        CASE WHEN PostCount > 0 THEN (CAST(TotalScore AS DOUBLE PRECISION) / PostCount) ELSE 0 END as AvgScorePerPost
+    FROM UserStats
+    WHERE PostCount > 0
+),
+QuestionAnalysis AS (
+    SELECT 
+        p.Id as QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        u.DisplayName as AuthorName,
+        u.Reputation as AuthorReputation,
+        p.OwnerUserId,
+        p.Tags,
+        (CASE WHEN p.Tags IS NOT NULL AND p.Tags <> '' 
+              THEN regexp_split_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags)-2), '><')
+              ELSE ARRAY[]::text[] END) as TagArray,
+        COALESCE((SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2), 0) as UpvoteCount,
+        COALESCE((SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3), 0) as DownvoteCount,
+        COALESCE((SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id), 0) as CommentCountByQuestion,
+        COALESCE((SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (10, 11, 12, 13)), 0) as StatusChangeCount,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+            WHEN p.AnswerCount > 0 THEN 'Answered'
+            ELSE 'Unanswered'
+        END as QuestionStatus,
+        CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate)) / 86400 AS INTEGER) as AgeInDays,
+        COALESCE((SELECT MAX(ph.CreationDate) FROM PostHistory ph WHERE ph.PostId = p.Id), p.CreationDate) as LastModified
+    FROM Posts p
+    INNER JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE WHEN t.IsRequired = 1 THEN 'Required' ELSE 'Optional' END as TagType,
+        COALESCE((SELECT AVG(p2.Score) FROM Posts p2 WHERE p2.Tags LIKE '%' || t.TagName || '%'), 0) as AvgScoreForTag,
+        COUNT(DISTINCT p.Id) as QuestionsWithTag,
+        (SELECT COUNT(*) FROM Posts p3 WHERE p3.Tags LIKE '%' || t.TagName || '%') as TotalQuestionsWithTag,
+        RANK() OVER (ORDER BY t.Count DESC) as PopularityRank,
+        (SELECT AVG(p4.ViewCount) FROM Posts p4 WHERE p4.Tags LIKE '%' || t.TagName || '%') as AvgViewsForTag
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    GROUP BY t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId, t.IsRequired
+),
+ComplexPostHistory AS (
+    SELECT 
+        ph.Id,
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        p.Title as PostTitle,
+        ph.CreationDate,
+        ph.UserId,
+        u.DisplayName as UserName,
+        ph.Comment,
+        ph.Text,
+        CASE WHEN ph.Comment IS NOT NULL AND ph.Comment <> '' THEN 
+            CASE WHEN ph.PostHistoryTypeId = 10 THEN 
+                'Closed: ' || (SELECT Name FROM CloseReasonTypes WHERE Id = CAST(ph.Comment AS INTEGER))
+                WHEN ph.PostHistoryTypeId = 11 THEN 'Reopened'
+                WHEN ph.PostHistoryTypeId = 12 THEN 'Deleted'
+                WHEN ph.PostHistoryTypeId = 13 THEN 'Undeleted'
+                ELSE ph.Comment
+            END
+        ELSE 'No Comment' END as ActionComment,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate ASC) as ActionSequence,
+        LAG(ph.PostHistoryTypeId) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate ASC) as PreviousAction,
+        LEAD(ph.PostHistoryTypeId) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate ASC) as NextAction,
+        CAST(EXTRACT(EPOCH FROM (ph.CreationDate - LAG(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate ASC))) / 3600 AS INTEGER) as TimeBetweenActions
+    FROM PostHistory ph
+    INNER JOIN Posts p ON ph.PostId = p.Id
+    LEFT JOIN Users u ON ph.UserId = u.Id
+    WHERE ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20, 35, 36, 52, 53)
+),
+CombinedAnalysis AS (
+    SELECT 
+        qa.QuestionId,
+        qa.Title,
+        qa.Score,
+        qa.ViewCount,
+        qa.AnswerCount,
+        qa.CommentCountByQuestion,
+        qa.QuestionStatus,
+        qa.AgeInDays,
+        qa.AuthorName,
+        qa.AuthorReputation,
+        ta.TagName,
+        ta.TagCount,
+        ta.AvgScoreForTag,
+        ta.QuestionsWithTag,
+        ta.PopularityRank,
+        CASE 
+            WHEN qa.AgeInDays <= 7 THEN 'New'
+            WHEN qa.AgeInDays <= 30 THEN 'Recent'
+            WHEN qa.AgeInDays <= 365 THEN 'Established'
+            ELSE 'Legacy'
+        END as QuestionAgeCategory,
+        CASE 
+            WHEN qa.Score >= 100 THEN 'High'
+            WHEN qa.Score >= 25 THEN 'Medium'
+            WHEN qa.Score >= 0 THEN 'Low'
+            ELSE 'Negative'
+        END as ScoreCategory,
+        CASE 
+            WHEN qa.ViewCount >= 1000 THEN 'High Visibility'
+            WHEN qa.ViewCount >= 100 THEN 'Medium Visibility'
+            ELSE 'Low Visibility'
+        END as VisibilityCategory,
+        CASE WHEN ta.TagCount > 0 THEN 1 ELSE 0 END as HasTag,
+        COALESCE((SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = qa.QuestionId AND pl.LinkTypeId = 3), 0) as DuplicateLinkCount,
+        COALESCE((SELECT COUNT(*) FROM PostLinks pl WHERE pl.RelatedPostId = qa.QuestionId AND pl.LinkTypeId = 1), 0) as LinkedFromCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = qa.QuestionId AND v.VoteTypeId = 5) as FavoriteCount,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = qa.OwnerUserId AND b.Name = 'Good Question') as GoodQuestionBadgeCount,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = qa.OwnerUserId AND b.Name = 'Great Question') as GreatQuestionBadgeCount,
+        CASE 
+            WHEN qa.Score >= 50 AND qa.AnswerCount >= 3 THEN 'High Impact'
+            WHEN qa.Score >= 10 AND qa.AnswerCount >= 1 THEN 'Medium Impact'
+            ELSE 'Low Impact'
+        END as ImpactCategory
+    FROM QuestionAnalysis qa
+    LEFT JOIN TagAnalysis ta ON EXISTS (
+        SELECT 1 FROM unnest(qa.TagArray) t WHERE t = ta.TagName
+    )
+    WHERE qa.QuestionStatus IN ('Answered', 'Closed', 'Unanswered')
+)
+SELECT 
+    ca.QuestionId,
+    ca.Title,
+    ca.Score,
+    ca.ViewCount,
+    ca.AnswerCount,
+    ca.CommentCountByQuestion,
+    ca.QuestionStatus,
+    ca.AgeInDays,
+    ca.AuthorName,
+    ca.AuthorReputation,
+    ca.TagName,
+    ca.TagCount,
+    ca.AvgScoreForTag,
+    ca.QuestionsWithTag,
+    ca.PopularityRank,
+    ca.QuestionAgeCategory,
+    ca.ScoreCategory,
+    ca.VisibilityCategory,
+    ca.HasTag,
+    ca.DuplicateLinkCount,
+    ca.LinkedFromCount,
+    ca.FavoriteCount,
+    ca.GoodQuestionBadgeCount,
+    ca.GreatQuestionBadgeCount,
+    ca.ImpactCategory,
+    ROW_NUMBER() OVER (ORDER BY ca.Score DESC, ca.ViewCount DESC) as OverallRank,
+    RANK() OVER (PARTITION BY ca.QuestionAgeCategory ORDER BY ca.Score DESC) as AgeCategoryRank,
+    DENSE_RANK() OVER (ORDER BY ca.TagCount DESC) as TagCountRank,
+    AVG(ca.Score) OVER (PARTITION BY ca.QuestionAgeCategory) as AgeCategoryAvgScore,
+    PERCENT_RANK() OVER (ORDER BY ca.Score) as ScorePercentile,
+    NTILE(10) OVER (ORDER BY ca.ViewCount) as ViewCountDecile,
+    CASE 
+        WHEN ca.QuestionStatus = 'Closed' AND ca.AgeInDays > 30 THEN 'Overdue Closure'
+        WHEN ca.QuestionStatus = 'Closed' AND ca.AgeInDays <= 30 THEN 'Timely Closure'
+        WHEN ca.QuestionStatus = 'Answered' AND ca.AgeInDays > 30 THEN 'Late Answered'
+        WHEN ca.QuestionStatus = 'Answered' AND ca.AgeInDays <= 30 THEN 'Timely Answered'
+        ELSE 'Other'
+    END as StatusAgeClassification,
+    CASE 
+        WHEN ca.Score >= 50 AND ca.AnswerCount >= 1 AND ca.ViewCount >= 100 THEN 'Popular and Engaged'
+        WHEN ca.Score >= 25 AND ca.ViewCount >= 50 THEN 'Moderately Popular'
+        WHEN ca.Score >= 0 AND ca.ViewCount >= 25 THEN 'Basic Engagement'
+        ELSE 'Low Engagement'
+    END as EngagementLevel,
+    COALESCE((SELECT COUNT(*) FROM ComplexPostHistory cph WHERE cph.PostId = ca.QuestionId AND cph.ActionSequence > 1), 0) as AdditionalActionsCount,
+    CASE 
+        WHEN ca.TagCount > 0 AND ca.TagCount <= 5 THEN 'Light Tag Usage'
+        WHEN ca.TagCount > 5 AND ca.TagCount <= 10 THEN 'Moderate Tag Usage'
+        WHEN ca.TagCount > 10 THEN 'Heavy Tag Usage'
+        ELSE 'No Tags'
+    END as TagUsageLevel,
+    COALESCE((
+        SELECT STRING_AGG(COALESCE(ta2.TagName, 'No Tag'), ', ')
+        FROM (
+            SELECT unnest(string_to_array(coalesce(ca.Title, '') || ' ' || coalesce(ca.TagName, ''), ' ')) AS title_tag
+        ) ttags
+        LEFT JOIN Tags ta2 ON ta2.TagName = ttags.title_tag
+    ), '') as TitleBasedTags,
+    COALESCE((SELECT MAX(ph.CreationDate) FROM PostHistory ph WHERE ph.PostId = ca.QuestionId AND ph.PostHistoryTypeId IN (12, 13, 14, 15, 19, 20)), TIMESTAMP '1900-01-01 00:00:00') as LastImportantEventDate,
+    'QuestionID:' || ca.QuestionId || '|Title:' || SUBSTRING(ca.Title FROM 1 FOR 50) || '|Author:' || ca.AuthorName || '|Score:' || ca.Score || '|Views:' || ca.ViewCount as MetadataString,
+    CASE 
+        WHEN ca.ImpactCategory = 'High Impact' AND ca.QuestionStatus = 'Answered' THEN 'High Impact Answered'
+        WHEN ca.ImpactCategory = 'Medium Impact' AND ca.QuestionStatus = 'Answered' THEN 'Medium Impact Answered'
+        WHEN ca.QuestionStatus = 'Closed' THEN 'Closed Question'
+        ELSE 'Other Category'
+    END as SpecialCategory,
+    ABS(ca.Score - LAG(ca.Score) OVER (ORDER BY ca.Score DESC)) as ScoreDiffFromNext,
+    COUNT(*) OVER () as TotalQuestions
+FROM CombinedAnalysis ca
+WHERE ca.QuestionId IS NOT NULL
+  AND ca.Score IS NOT NULL
+  AND ca.QuestionStatus IS NOT NULL
+  AND (ca.TagName IS NULL OR ca.TagName != '')
+ORDER BY ca.Score DESC, ca.ViewCount DESC
+LIMIT 10000;

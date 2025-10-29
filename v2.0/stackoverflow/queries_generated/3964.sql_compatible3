@@ -1,0 +1,105 @@
+WITH 
+user_stats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        COALESCE(u.Reputation, 0) AS reputation,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS questions_cnt,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS answers_cnt,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS up_votes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS down_votes,
+        MAX(p.CreationDate) AS last_post_dt
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+badge_stats AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) AS total_badges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_cnt,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_cnt,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_cnt,
+        STRING_AGG(DISTINCT CASE WHEN b.Class = 1 THEN b.Name ELSE NULL END, ', ') AS gold_badge_names
+    FROM Badges b
+    GROUP BY b.UserId
+),
+tag_top_q AS (
+    SELECT 
+        t.TagName,
+        t.Count AS tag_use_cnt,
+        p.Title,
+        ROW_NUMBER() OVER (PARTITION BY t.TagName ORDER BY p.Score DESC NULLS LAST) AS rn,
+        t.IsModeratorOnly,
+        t.WikiPostId,
+        p.Id AS post_id,
+        p.Score
+    FROM Tags t
+    JOIN Posts p ON p.Id = t.WikiPostId
+),
+inactive_high_rep AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        COALESCE(u.Reputation, 0) AS reputation,
+        0 AS questions_cnt,
+        0 AS answers_cnt,
+        0 AS up_votes,
+        0 AS down_votes,
+        NULL AS last_post_dt
+    FROM Users u
+    WHERE u.Reputation > 20000
+      AND NOT EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id)
+)
+SELECT *
+FROM (
+    SELECT 
+        us.Id,
+        us.DisplayName,
+        us.reputation,
+        us.questions_cnt,
+        us.answers_cnt,
+        us.up_votes,
+        us.down_votes,
+        COALESCE(bs.total_badges, 0) AS total_badges,
+        COALESCE(bs.gold_cnt, 0) AS gold_badges,
+        COALESCE(bs.silver_cnt, 0) AS silver_badges,
+        COALESCE(bs.bronze_cnt, 0) AS bronze_badges,
+        bs.gold_badge_names,
+        tt.TagName,
+        tt.tag_use_cnt,
+        tt.Title AS top_question_for_tag,
+        us.last_post_dt
+    FROM user_stats us
+    LEFT JOIN badge_stats bs ON bs.UserId = us.Id
+    LEFT JOIN (
+        SELECT TagName, tag_use_cnt, Title, IsModeratorOnly, rn
+        FROM tag_top_q
+    ) tt ON tt.rn = 1 AND (tt.IsModeratorOnly = FALSE OR tt.IsModeratorOnly = 0)
+    WHERE us.reputation > 10000
+      AND (us.questions_cnt + us.answers_cnt) > 0
+)
+UNION ALL
+(
+    SELECT 
+        i.Id,
+        i.DisplayName,
+        i.reputation,
+        i.questions_cnt,
+        i.answers_cnt,
+        i.up_votes,
+        i.down_votes,
+        0 AS total_badges,
+        0 AS gold_badges,
+        0 AS silver_badges,
+        0 AS bronze_badges,
+        CAST(NULL AS varchar) AS gold_badge_names,
+        CAST(NULL AS varchar) AS TagName,
+        CAST(NULL AS bigint) AS tag_use_cnt,
+        CAST(NULL AS varchar) AS top_question_for_tag,
+        i.last_post_dt
+    FROM inactive_high_rep i
+)
+ORDER BY reputation DESC, total_badges DESC
+OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY;

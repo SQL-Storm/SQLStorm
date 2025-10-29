@@ -1,0 +1,419 @@
+with recent_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    coalesce(nullif(trim(split_part(coalesce(u.location, ''), ',', 1)), ''), 'Unknown') as country_guess,
+    date_trunc('month', u.creationdate) as cohort_month,
+    row_number() over (order by u.creationdate desc, u.id desc) as rn_recent
+  from users u
+  where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+user_badge_stats as (
+  select
+    b.userid,
+    count(*) as badge_count,
+    sum(case when b.class = 1 then 1 else 0 end) as gold_count,
+    sum(case when b.class = 2 then 1 else 0 end) as silver_count,
+    sum(case when b.class = 3 then 1 else 0 end) as bronze_count,
+    min(b.date) as first_badge_date,
+    max(b.date) as last_badge_date
+  from badges b
+  group by b.userid
+),
+question_base as (
+  select
+    p.id as post_id,
+    p.owneruserid as owner_id,
+    p.creationdate as post_created,
+    p.viewcount,
+    p.score,
+    p.answercount,
+    p.favoritecount,
+    p.commentcount,
+    p.tags,
+    p.title,
+    p.closeddate,
+    p.acceptedanswerid,
+    p.posttypeid
+  from posts p
+  where p.posttypeid = 1
+),
+answer_base as (
+  select
+    a.id as answer_id,
+    a.parentid as question_id,
+    a.owneruserid as answer_owner_id,
+    a.score as answer_score,
+    a.creationdate as answer_created
+  from posts a
+  where a.posttypeid = 2
+),
+question_activity as (
+  select
+    qb.post_id,
+    coalesce(sum(case when v.votetypeid = 2 then 1 else 0 end), 0) as upvotes,
+    coalesce(sum(case when v.votetypeid = 3 then 1 else 0 end), 0) as downvotes,
+    coalesce(sum(case when v.votetypeid = 5 then 1 else 0 end), 0) as favorites_legacy,
+    count(distinct c.id) filter (where c.id is not null) as comment_events,
+    count(distinct ph.id) filter (where ph.posthistorytypeid in (10,11,12,13,14,15,19,20,35)) as mod_events
+  from question_base qb
+  left join votes v on v.postid = qb.post_id
+  left join comments c on c.postid = qb.post_id
+  left join posthistory ph on ph.postid = qb.post_id
+  group by qb.post_id
+),
+duplicate_links as (
+  select
+    pl.postid as post_id,
+    count(*) filter (where pl.linktypeid = 3) as duplicate_count,
+    string_agg(distinct cast(pl.relatedpostid as varchar), ',') filter (where pl.linktypeid = 3) as duplicate_targets
+  from postlinks pl
+  group by pl.postid
+),
+tag_expansion as (
+  select
+    qb.post_id,
+    unnest(string_to_array(substring(qb.tags, 2, greatest(length(qb.tags)-2,0)), '><')) as tag
+  from question_base qb
+  where qb.tags is not null and qb.tags like '<%>'
+),
+top_tags as (
+  select
+    tag,
+    count(*) as tag_count,
+    row_number() over (order by count(*) desc, tag) as tag_rank
+  from tag_expansion
+  group by tag
+),
+answers_stats as (
+  select
+    qb.post_id,
+    count(a.answer_id) as answers_total,
+    max(a.answer_score) as best_answer_score,
+    min(a.answer_created) as first_answer_time
+  from question_base qb
+  left join answer_base a on a.question_id = qb.post_id
+  group by qb.post_id
+),
+accepted_answer_lag as (
+  select
+    qb.post_id,
+    qb.acceptedanswerid,
+    ab.answer_created as accepted_created,
+    qb.post_created,
+    cast(extract(epoch from (ab.answer_created - qb.post_created)) as bigint) as seconds_to_accept
+  from question_base qb
+  left join answer_base ab on ab.answer_id = qb.acceptedanswerid
+),
+question_quality as (
+  select
+    qb.post_id,
+    qb.owner_id,
+    qb.post_created,
+    qb.viewcount,
+    qb.score,
+    qb.answercount,
+    qb.favoritecount,
+    qa.upvotes,
+    qa.downvotes,
+    qa.favorites_legacy,
+    qa.comment_events,
+    qa.mod_events,
+    coalesce(al.seconds_to_accept, -1) as seconds_to_accept,
+    coalesce(ds.duplicate_count, 0) as duplicate_count,
+    coalesce(ds.duplicate_targets, '') as duplicate_targets,
+    greatest(qb.score, 0) + coalesce(qa.upvotes,0) - coalesce(qa.downvotes,0)
+      + coalesce(qa.comment_events,0)*0.1
+      + coalesce(qb.viewcount,0)*0.001
+      + case when qb.closeddate is null then 0.5 else -1 end
+      + case when qb.acceptedanswerid is not null then 1 else 0 end
+      + least(cast(coalesce(al.seconds_to_accept, 86400) as numeric) / 86400.0, 2.0) * -0.25
+      as quality_score
+  from question_base qb
+  left join question_activity qa on qa.post_id = qb.post_id
+  left join accepted_answer_lag al on al.post_id = qb.post_id
+  left join duplicate_links ds on ds.post_id = qb.post_id
+),
+user_post_enriched as (
+  select
+    qu.post_id,
+    ru.user_id,
+    ru.displayname,
+    ru.reputation,
+    ru.country_guess,
+    ru.cohort_month,
+    qs.quality_score,
+    qs.viewcount,
+    qs.score,
+    qs.answercount,
+    qs.favoritecount,
+    qs.upvotes,
+    qs.downvotes,
+    qs.comment_events,
+    qs.mod_events,
+    qs.seconds_to_accept,
+    qs.duplicate_count,
+    qs.duplicate_targets,
+    abs(mod(cast(coalesce(ru.displayname, '') as bigint), 2147483647)) % 10 as shard_key
+  from question_quality qs
+  join question_base qu on qu.post_id = qs.post_id
+  left join recent_users ru on ru.user_id = qu.owner_id
+),
+user_agg as (
+  select
+    upe.user_id,
+    count(*) as questions_asked,
+    avg(upe.quality_score) as avg_quality,
+    sum(case when upe.quality_score > 2 then 1 else 0 end) as high_quality_questions,
+    sum(upe.viewcount) as total_views,
+    sum(upe.upvotes - upe.downvotes) as net_votes,
+    max(upe.seconds_to_accept) filter (where upe.seconds_to_accept >= 0) as slowest_accept_seconds,
+    min(upe.seconds_to_accept) filter (where upe.seconds_to_accept >= 0) as fastest_accept_seconds,
+    count(*) filter (where upe.duplicate_count > 0) as dup_flagged_count
+  from user_post_enriched upe
+  group by upe.user_id
+),
+user_ranked as (
+  select
+    ru.user_id,
+    ru.displayname,
+    ru.reputation,
+    ru.country_guess,
+    ru.cohort_month,
+    coalesce(ua.questions_asked, 0) as questions_asked,
+    coalesce(ua.avg_quality, 0) as avg_quality,
+    coalesce(ua.high_quality_questions, 0) as high_quality_questions,
+    coalesce(ua.total_views, 0) as total_views,
+    coalesce(ua.net_votes, 0) as net_votes,
+    coalesce(ua.slowest_accept_seconds, -1) as slowest_accept_seconds,
+    coalesce(ua.fastest_accept_seconds, -1) as fastest_accept_seconds,
+    coalesce(ua.dup_flagged_count, 0) as dup_flagged_count,
+    coalesce(ubs.badge_count, 0) as badge_count,
+    coalesce(ubs.gold_count, 0) as gold_count,
+    coalesce(ubs.silver_count, 0) as silver_count,
+    coalesce(ubs.bronze_count, 0) as bronze_count,
+    ubs.first_badge_date,
+    ubs.last_badge_date,
+    row_number() over (partition by date_trunc('quarter', ru.cohort_month) order by coalesce(ua.avg_quality,0) desc, coalesce(ua.total_views,0) desc, ru.reputation desc) as cohort_rank,
+    dense_rank() over (order by coalesce(ua.avg_quality,0) desc) as global_quality_rank
+  from recent_users ru
+  left join user_agg ua on ua.user_id = ru.user_id
+  left join user_badge_stats ubs on ubs.userid = ru.user_id
+),
+volatile_flag as (
+  select
+    qu.post_id,
+    case
+      when qa.upvotes + qa.downvotes >= 10 and qa.comment_events >= 5 then 1
+      when qa.mod_events >= 2 then 1
+      else 0
+    end as is_volatile
+  from question_base qu
+  left join question_activity qa on qa.post_id = qu.post_id
+),
+tag_diversity as (
+  select
+    qb.owner_id as user_id,
+    count(distinct te.tag) as distinct_tags_used,
+    max(tt.tag) filter (where tt.tag_rank <= 50) as top_tag_hit
+  from question_base qb
+  left join tag_expansion te on te.post_id = qb.post_id
+  left join top_tags tt on tt.tag = te.tag
+  group by qb.owner_id
+),
+final_candidates as (
+  select
+    ur.user_id,
+    ur.displayname,
+    ur.reputation,
+    ur.country_guess,
+    ur.cohort_month,
+    ur.questions_asked,
+    ur.avg_quality,
+    ur.total_views,
+    ur.high_quality_questions,
+    ur.net_votes,
+    ur.badge_count,
+    ur.gold_count,
+    ur.silver_count,
+    ur.bronze_count,
+    ur.dup_flagged_count,
+    ur.volatile_questions,
+    ur.avg_quality_volatile,
+    ur.distinct_tags_used,
+    ur.top_tag_hit,
+    ur.cohort_rank,
+    ur.global_quality_rank,
+    coalesce(td.distinct_tags_used, 0) as distinct_tags_used_from_td,
+    td.top_tag_hit as td_top_tag_hit,
+    sum(case when vf.is_volatile = 1 then 1 else 0 end) over (partition by ur.user_id) as volatile_questions,
+    avg(case when vf.is_volatile = 1 then qs.quality_score else null end) over (partition by ur.user_id) as avg_quality_volatile
+  from user_ranked ur
+  left join user_post_enriched upe on upe.user_id = ur.user_id
+  left join question_quality qs on qs.post_id = upe.post_id
+  left join volatile_flag vf on vf.post_id = upe.post_id
+  left join tag_diversity td on td.user_id = ur.user_id
+),
+cohort_outliers as (
+  select
+    fc.user_id,
+    fc.displayname,
+    fc.reputation,
+    fc.country_guess,
+    fc.cohort_month,
+    fc.questions_asked,
+    fc.avg_quality,
+    fc.total_views,
+    fc.high_quality_questions,
+    fc.net_votes,
+    fc.badge_count,
+    fc.gold_count,
+    fc.silver_count,
+    fc.bronze_count,
+    fc.dup_flagged_count,
+    fc.volatile_questions,
+    fc.avg_quality_volatile,
+    fc.distinct_tags_used,
+    fc.top_tag_hit,
+    fc.cohort_rank,
+    fc.global_quality_rank,
+    avg(fc.avg_quality) over (partition by date_trunc('month', fc.cohort_month)) as cohort_avg_quality,
+    stddev_pop(fc.avg_quality) over (partition by date_trunc('month', fc.cohort_month)) as cohort_std_quality
+  from final_candidates fc
+),
+thresholds as (
+  select
+    percentile_cont(0.9) within group (order by avg_quality) as p90_quality,
+    percentile_cont(0.95) within group (order by total_views) as p95_views
+  from user_ranked
+),
+top_users as (
+  select
+    co.user_id,
+    co.displayname,
+    co.reputation,
+    co.country_guess,
+    co.cohort_month,
+    co.questions_asked,
+    co.avg_quality,
+    co.total_views,
+    co.high_quality_questions,
+    co.net_votes,
+    co.badge_count,
+    co.gold_count,
+    co.silver_count,
+    co.bronze_count,
+    co.dup_flagged_count,
+    co.volatile_questions,
+    co.avg_quality_volatile,
+    co.distinct_tags_used,
+    co.top_tag_hit,
+    co.cohort_rank,
+    co.global_quality_rank,
+    co.cohort_avg_quality,
+    co.cohort_std_quality
+  from cohort_outliers co
+  where co.avg_quality > coalesce(co.cohort_avg_quality + 2 * co.cohort_std_quality, co.avg_quality - 1)
+     or co.cohort_rank <= 10
+),
+bottom_users as (
+  select
+    co.user_id,
+    co.displayname,
+    co.reputation,
+    co.country_guess,
+    co.cohort_month,
+    co.questions_asked,
+    co.avg_quality,
+    co.total_views,
+    co.high_quality_questions,
+    co.net_votes,
+    co.badge_count,
+    co.gold_count,
+    co.silver_count,
+    co.bronze_count,
+    co.dup_flagged_count,
+    co.volatile_questions,
+    co.avg_quality_volatile,
+    co.distinct_tags_used,
+    co.top_tag_hit,
+    co.cohort_rank,
+    co.global_quality_rank,
+    co.cohort_avg_quality,
+    co.cohort_std_quality
+  from cohort_outliers co
+  where co.avg_quality < coalesce(co.cohort_avg_quality - 1.5 * co.cohort_std_quality, co.avg_quality + 1)
+     or (co.questions_asked >= 3 and co.high_quality_questions = 0)
+),
+unioned as (
+  select 'TOP' as segment, * from top_users
+  union all
+  select 'BOTTOM' as segment, * from bottom_users
+),
+ranked_final as (
+  select
+    u.segment,
+    u.user_id,
+    u.displayname,
+    u.reputation,
+    u.country_guess,
+    u.cohort_month,
+    u.questions_asked,
+    u.avg_quality,
+    u.total_views,
+    u.high_quality_questions,
+    u.net_votes,
+    u.badge_count,
+    u.gold_count,
+    u.silver_count,
+    u.bronze_count,
+    u.dup_flagged_count,
+    u.volatile_questions,
+    u.avg_quality_volatile,
+    u.distinct_tags_used,
+    u.top_tag_hit,
+    u.cohort_rank,
+    u.global_quality_rank,
+    row_number() over (
+      partition by u.segment
+      order by
+        u.avg_quality desc nulls last,
+        u.total_views desc nulls last,
+        u.reputation desc nulls last,
+        u.badge_count desc nulls last,
+        u.user_id
+    ) as seg_rank
+  from unioned u
+)
+select
+  rf.segment,
+  rf.seg_rank,
+  rf.user_id,
+  rf.displayname,
+  rf.reputation,
+  rf.country_guess,
+  to_char(rf.cohort_month, 'YYYY-MM') as cohort_month,
+  rf.questions_asked,
+  round(cast(rf.avg_quality as numeric), 3) as avg_quality,
+  rf.total_views,
+  rf.high_quality_questions,
+  rf.net_votes,
+  rf.badge_count,
+  rf.gold_count,
+  rf.silver_count,
+  rf.bronze_count,
+  rf.dup_flagged_count,
+  rf.volatile_questions,
+  round(cast(coalesce(rf.avg_quality_volatile, 0) as numeric), 3) as avg_quality_volatile,
+  rf.distinct_tags_used,
+  coalesce(rf.top_tag_hit, 'none') as top_tag_hit,
+  rf.cohort_rank,
+  rf.global_quality_rank
+from ranked_final rf
+join thresholds t on 1=1
+where (rf.segment = 'TOP' and rf.avg_quality >= t.p90_quality)
+   or (rf.segment = 'BOTTOM' and rf.total_views >= t.p95_views)
+order by rf.segment, rf.seg_rank
+limit 200;

@@ -1,0 +1,187 @@
+-- {"query": "7609.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2567} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.ViewCount,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) as QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) as AnswerCount,
+        AVG(p.Score) as AvgPostScore,
+        MAX(p.CreationDate) as LastPostDate,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.CreationDate DESC) as PostRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.ViewCount
+),
+PostStats AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        p.Tags,
+        STRING_AGG(COALESCE(t.TagName, 'Unknown'), ', ') as TagList,
+        CASE 
+            WHEN p.ParentId IS NOT NULL THEN 'Answer'
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as PostType,
+        CASE 
+            WHEN p.Score > 100 THEN 'Highly Popular'
+            WHEN p.Score > 50 THEN 'Popular'
+            WHEN p.Score > 10 THEN 'Moderate'
+            ELSE 'Low'
+        END as PopularityLevel,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) as ScoreRank,
+        RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as UserPostRank
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT DISTINCT 
+            p.Id as PostId,
+            t.TagName
+        FROM Posts p
+        LEFT JOIN (
+            SELECT Id, UNNEST(string_to_array(SUBSTRING(Tags, 2, LENGTH(Tags) - 2), '><')) as TagName
+            FROM Posts
+            WHERE Tags IS NOT NULL AND Tags != ''
+        ) t ON p.Id = t.Id
+        WHERE p.Tags IS NOT NULL
+    ) t ON p.Id = t.PostId
+    WHERE p.PostTypeId IN (1, 2) AND p.CreationDate > '2020-01-01'
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.CreationDate, p.OwnerUserId, u.DisplayName, p.Tags, p.ParentId, p.PostTypeId
+),
+RecentActivity AS (
+    SELECT 
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.UserId,
+        ph.CreationDate,
+        u.DisplayName as EditorName,
+        ph.Comment,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) as ActivityRank,
+        LAG(ph.CreationDate, 1) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) as PreviousActivityDate
+    FROM PostHistory ph
+    LEFT JOIN Users u ON ph.UserId = u.Id
+    WHERE ph.CreationDate > '2022-01-01'
+    AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)
+),
+UserPerformance AS (
+    SELECT 
+        u.Id as UserId,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionsCreated,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswersCreated,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) as UpvotesReceived,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) as DownvotesReceived,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) * 100.0 / NULLIF(COUNT(DISTINCT p.Id), 0) as QuestionRatio,
+        AVG(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) * 100.0 as UpvotePercentage,
+        ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) as UserPerformanceRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    GROUP BY u.Id
+)
+SELECT 
+    'Post Analysis Results' as AnalysisType,
+    COUNT(*) as TotalPosts,
+    AVG(p.Score) as AverageScore,
+    MAX(p.ViewCount) as MaxViews,
+    MIN(p.CreationDate) as EarliestPost,
+    MAX(p.CreationDate) as LatestPost,
+    COUNT(DISTINCT p.OwnerUserId) as DistinctOwners,
+    STRING_AGG(DISTINCT CASE WHEN p.PostTypeId = 1 THEN 'Questions' ELSE 'Answers' END, ', ') as PostTypes,
+    COUNT(CASE WHEN p.TagCount > 3 THEN 1 END) as PostsHavingMultipleTags,
+    'Performance BENCHMARK Query Complete' as Status,
+    (SELECT COUNT(*) FROM Users WHERE Reputation > 1000) as HighRepUsers,
+    (SELECT AVG(Reputation) FROM Users) as AvgUserReputation,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND CreationDate > '2022-01-01') as RecentQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 2 AND CreationDate > '2022-01-01') as RecentAnswers,
+    (SELECT COUNT(*) FROM Badges) as TotalBadges,
+    (SELECT COUNT(*) FROM Comments WHERE Text IS NOT NULL AND LENGTH(Text) > 20) as CommentCount,
+    (SELECT COUNT(*) FROM PostLinks WHERE LinkTypeId = 3) as DuplicateLinks,
+    (SELECT COUNT(DISTINCT UserId) FROM Votes WHERE VoteTypeId = 2) as UniqueUpvoters,
+    (SELECT COUNT(DISTINCT UserId) FROM Votes WHERE VoteTypeId = 3) as UniqueDownvoters,
+    COALESCE('Report Generated: ' || CURRENT_TIMESTAMP, 'Error') as ReportDate,
+    (SELECT AVG(COUNT(1)) FROM (SELECT COUNT(*) FROM Posts GROUP BY OwnerUserId) as p) as AvgPostsPerUser,
+    NULL as NullValueTest,
+    CASE 
+        WHEN AVG(p.Score) > 50 THEN 'High Average Score'
+        WHEN AVG(p.Score) > 20 THEN 'Medium Average Score'
+        ELSE 'Low Average Score'
+    END as ScoreCategory,
+    (SELECT COUNT(*) FROM PostHistory WHERE PostHistoryTypeId IN (10, 11, 12, 13)) as PostStatusChanges,
+    (SELECT COUNT(DISTINCT PostId) FROM PostHistory WHERE PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)) as EditedPostsCount,
+    (SELECT COUNT(*) FROM Posts WHERE Tags IS NOT NULL AND Tags != '') as TaggedPosts,
+    (SELECT COUNT(*) FROM Posts WHERE Title IS NOT NULL AND LENGTH(Title) > 10) as TitlePresent,
+    (SELECT COUNT(*) FROM Posts WHERE Body IS NOT NULL AND LENGTH(Body) > 500) as LongBodyPosts,
+    (SELECT COUNT(*) FROM Posts WHERE AnswerCount > 0) as AnsweredQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE CommentCount > 0) as CommentedPosts,
+    (SELECT COUNT(*) FROM Posts WHERE ViewCount > 1000) as HighlyViewedPosts,
+    (SELECT COUNT(*) FROM Posts WHERE Score > 100) as HighScoringPosts
+FROM PostStats p
+WHERE p.PostType IN ('Question', 'Answer')
+GROUP BY 
+    p.PostType,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND CreationDate > '2022-01-01'),
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 2 AND CreationDate > '2022-01-01')
+HAVING COUNT(*) > 0
+UNION ALL
+SELECT 
+    'User Analysis Results' as AnalysisType,
+    COUNT(*) as TotalPosts,
+    AVG(Reputation) as AverageScore,
+    MAX(Views) as MaxViews,
+    MIN(CreationDate) as EarliestPost,
+    MAX(LastAccessDate) as LatestPost,
+    COUNT(*) as DistinctOwners,
+    STRING_AGG(DISTINCT CASE WHEN Reputation > 5000 THEN 'HighReputation' ELSE 'Other' END, ', ') as PostTypes,
+    0 as PostsHavingMultipleTags,
+    'Performance BENCHMARK Query Complete' as Status,
+    (SELECT COUNT(*) FROM Users WHERE Reputation > 1000) as HighRepUsers,
+    (SELECT AVG(Reputation) FROM Users) as AvgUserReputation,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND CreationDate > '2022-01-01') as RecentQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 2 AND CreationDate > '2022-01-01') as RecentAnswers,
+    (SELECT COUNT(*) FROM Badges) as TotalBadges,
+    (SELECT COUNT(*) FROM Comments WHERE Text IS NOT NULL AND LENGTH(Text) > 20) as CommentCount,
+    (SELECT COUNT(*) FROM PostLinks WHERE LinkTypeId = 3) as DuplicateLinks,
+    (SELECT COUNT(DISTINCT UserId) FROM Votes WHERE VoteTypeId = 2) as UniqueUpvoters,
+    (SELECT COUNT(DISTINCT UserId) FROM Votes WHERE VoteTypeId = 3) as UniqueDownvoters,
+    COALESCE('Report Generated: ' || CURRENT_TIMESTAMP, 'Error') as ReportDate,
+    (SELECT AVG(COUNT(1)) FROM (SELECT COUNT(*) FROM Posts GROUP BY OwnerUserId) as p) as AvgPostsPerUser,
+    NULL as NullValueTest,
+    CASE 
+        WHEN AVG(Reputation) > 5000 THEN 'High Average Reputation'
+        WHEN AVG(Reputation) > 1000 THEN 'Medium Average Reputation'
+        ELSE 'Low Average Reputation'
+    END as ScoreCategory,
+    (SELECT COUNT(*) FROM PostHistory WHERE PostHistoryTypeId IN (10, 11, 12, 13)) as PostStatusChanges,
+    (SELECT COUNT(DISTINCT PostId) FROM PostHistory WHERE PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)) as EditedPostsCount,
+    (SELECT COUNT(*) FROM Posts WHERE Tags IS NOT NULL AND Tags != '') as TaggedPosts,
+    (SELECT COUNT(*) FROM Posts WHERE Title IS NOT NULL AND LENGTH(Title) > 10) as TitlePresent,
+    (SELECT COUNT(*) FROM Posts WHERE Body IS NOT NULL AND LENGTH(Body) > 500) as LongBodyPosts,
+    (SELECT COUNT(*) FROM Posts WHERE AnswerCount > 0) as AnsweredQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE CommentCount > 0) as CommentedPosts,
+    (SELECT COUNT(*) FROM Posts WHERE ViewCount > 1000) as HighlyViewedPosts,
+    (SELECT COUNT(*) FROM Posts WHERE Score > 100) as HighScoringPosts
+FROM Users u
+WHERE u.Reputation > 1000
+GROUP BY 
+    u.Reputation,
+    u.Views,
+    u.CreationDate,
+    u.LastAccessDate
+HAVING COUNT(*) > 0
+ORDER BY AnalysisType;

@@ -1,0 +1,232 @@
+WITH UserEngagementMetrics AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COALESCE(AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END), 0.0) AS AvgQuestionScore,
+        COALESCE(AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE NULL END), 0.0) AS AvgAnswerScore,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (10, 12, 14, 35) THEN 1 ELSE 0 END) AS ModerationActionsInitiated,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.Reputation, u.CreationDate, u.Views, u.UpVotes, u.DownVotes
+),
+QuestionDetailedStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.OwnerUserId,
+        q.CreationDate AS QuestionCreationDate,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        q.FavoriteCount,
+        q.ClosedDate,
+        q.Title,
+        q.Tags,
+        COALESCE((SELECT AVG(c.Score) FROM Comments c WHERE c.PostId = q.Id AND c.Score IS NOT NULL), 0.0) AS AvgCommentScore,
+        COALESCE((SELECT COUNT(pl.RelatedPostId) FROM PostLinks pl WHERE pl.PostId = q.Id AND pl.LinkTypeId = 3), 0) AS DuplicateLinkCount,
+        (SELECT MAX(ph_close.CreationDate) FROM PostHistory ph_close WHERE ph_close.PostId = q.Id AND ph_close.PostHistoryTypeId = 10) AS LastClosedHistoryDate,
+        (SELECT MIN(ph_reopen.CreationDate) FROM PostHistory ph_reopen WHERE ph_reopen.PostId = q.Id AND ph_reopen.PostHistoryTypeId = 11) AS FirstReopenedHistoryDate,
+        COALESCE(COUNT(DISTINCT a.Id), 0) AS TotalAnswersPosted,
+        COALESCE(MAX(a.Score), 0) AS MaxAnswerScore,
+        COALESCE(AVG(a_acc.Score) FILTER (WHERE a_acc.Id = q.AcceptedAnswerId), 0.0) AS AcceptedAnswerActualScore,
+        (SELECT COUNT(DISTINCT v.UserId) FROM Votes v WHERE v.PostId = q.Id AND v.VoteTypeId = 5) AS TotalFavoritesLegacy
+    FROM Posts q
+    LEFT JOIN Posts a ON q.Id = a.ParentId AND a.PostTypeId = 2
+    LEFT JOIN Posts a_acc ON q.AcceptedAnswerId = a_acc.Id AND a_acc.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+    GROUP BY
+        q.Id, q.OwnerUserId, q.CreationDate, q.Score, q.ViewCount, q.AnswerCount, q.FavoriteCount, q.ClosedDate, q.Title, q.Tags, q.AcceptedAnswerId
+),
+PostModerationTimelineAgg AS (
+    SELECT
+        ph.PostId,
+        COUNT(ph.Id) AS TotalHistoryEvents,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (10, 12, 14, 19, 35) THEN 1 ELSE 0 END) AS TotalNegativeModerationActions,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (11, 13, 15, 20, 36) THEN 1 ELSE 0 END) AS TotalPositiveModerationActions,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseEvents,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenEvents,
+        MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId IN (10,11,12,13,14,15,19,20,35,36)) AS LastModerationActionDate,
+        MIN(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId IN (10,11,12,13,14,15,19,20,35,36)) AS FirstModerationActionDate
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20, 35, 36)
+    GROUP BY ph.PostId
+),
+TagPerformance AS (
+    SELECT
+        TRIM(UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><'))) AS TagName,
+        COUNT(p.Id) AS TaggedQuestions,
+        AVG(p.Score) AS AvgTagScore,
+        SUM(p.ViewCount) AS TotalTagViews,
+        SUM(p.AnswerCount) AS TotalTagAnswers,
+        AVG(qds.AvgCommentScore) AS AvgTagCommentScore,
+        AVG(qds.AcceptedAnswerActualScore) AS AvgTagAcceptedAnswerScore,
+        SUM(qds.DuplicateLinkCount) AS TotalTagDuplicates
+    FROM Posts p
+    JOIN QuestionDetailedStats qds ON p.Id = qds.QuestionId
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2
+    GROUP BY TagName
+    HAVING COUNT(p.Id) > 50
+),
+UserPostTagAggregates AS (
+    SELECT
+        uem.UserId,
+        uem.Reputation,
+        qds.QuestionId,
+        qds.Title,
+        qds.QuestionScore,
+        qds.ViewCount,
+        qds.QuestionCreationDate,
+        qds.ClosedDate,
+        qds.AvgCommentScore,
+        qds.DuplicateLinkCount,
+        qds.AcceptedAnswerActualScore,
+        qds.TotalFavoritesLegacy,
+        phta.TotalNegativeModerationActions,
+        phta.TotalPositiveModerationActions,
+        STRING_AGG(DISTINCT TRIM(UNNEST(string_to_array(SUBSTRING(qds.Tags FROM 2 FOR LENGTH(qds.Tags) - 2), '><'))), ', ') AS QuestionTags,
+        SPLIT_PART(SUBSTRING(qds.Tags FROM 2 FOR LENGTH(qds.Tags) - 2), '><', 1) AS FirstTagInQuestion,
+        CASE
+            WHEN qds.ClosedDate IS NOT NULL AND qds.ClosedDate > qds.QuestionCreationDate THEN 'Closed'
+            WHEN qds.AcceptedAnswerActualScore > 0 THEN 'Answered & Accepted'
+            WHEN qds.TotalAnswersPosted > 0 AND qds.QuestionScore >= 10 THEN 'Highly Answered & Voted'
+            WHEN qds.ViewCount > 1000 AND qds.TotalAnswersPosted = 0 THEN 'High Traffic, No Answer'
+            ELSE 'Other'
+        END AS QuestionStatusCategory,
+        (SELECT COUNT(v.Id) FROM Votes v WHERE v.PostId = qds.QuestionId AND v.VoteTypeId = 2) AS UpvoteCount,
+        (SELECT COUNT(v.Id) FROM Votes v WHERE v.PostId = qds.QuestionId AND v.VoteTypeId = 3) AS DownvoteCount,
+        DENSE_RANK() OVER (PARTITION BY uem.UserId ORDER BY qds.QuestionScore DESC, qds.ViewCount DESC) AS UserQuestionScoreRank
+    FROM UserEngagementMetrics uem
+    INNER JOIN QuestionDetailedStats qds ON uem.UserId = qds.OwnerUserId
+    LEFT JOIN PostModerationTimelineAgg phta ON qds.QuestionId = phta.PostId
+    WHERE uem.Reputation >= 10000
+      AND qds.QuestionScore >= 5
+      AND qds.ViewCount >= 500
+    GROUP BY
+      uem.UserId,
+      uem.Reputation,
+      qds.QuestionId,
+      qds.Title,
+      qds.QuestionScore,
+      qds.ViewCount,
+      qds.QuestionCreationDate,
+      qds.ClosedDate,
+      qds.AvgCommentScore,
+      qds.DuplicateLinkCount,
+      qds.AcceptedAnswerActualScore,
+      qds.TotalFavoritesLegacy,
+      phta.TotalNegativeModerationActions,
+      phta.TotalPositiveModerationActions,
+      qds.Tags,
+      qds.TotalAnswersPosted,
+      qds.QuestionScore
+),
+-- Helper: DATEDIFF replacement for multiple dialects: use timestampdiff-like expression when supported.
+FinalResult AS (
+    SELECT
+        upta.UserId,
+        u.DisplayName AS UserName,
+        upta.Reputation,
+        upta.QuestionId,
+        upta.Title,
+        upta.QuestionCreationDate,
+        upta.QuestionScore,
+        upta.ViewCount,
+        upta.AcceptedAnswerActualScore,
+        upta.AvgCommentScore,
+        upta.DuplicateLinkCount,
+        upta.ClosedDate,
+        upta.QuestionStatusCategory,
+        upta.QuestionTags,
+        upta.UpvoteCount,
+        upta.DownvoteCount,
+        upta.TotalFavoritesLegacy,
+        upta.TotalNegativeModerationActions,
+        upta.TotalPositiveModerationActions,
+        tp.AvgTagScore,
+        tp.TotalTagViews,
+        tp.AvgTagCommentScore,
+        -- compute hours between timestamps as (extract(epoch from max) - extract(epoch from min))/3600 for Postgres,
+        -- use generic approach: ((CAST(upa_last_edit.CreationDate AS TIMESTAMP) - CAST(upa_first_edit.CreationDate AS TIMESTAMP)) / INTERVAL '1 hour')
+        CASE
+          WHEN upa_first_edit.CreationDate IS NOT NULL AND upa_last_edit.CreationDate IS NOT NULL
+            THEN FLOOR(EXTRACT(EPOCH FROM (CAST(upa_last_edit.CreationDate AS TIMESTAMP) - CAST(upa_first_edit.CreationDate AS TIMESTAMP))) / 3600)
+          ELSE NULL
+        END AS TimeBetweenFirstAndLastBodyEditHours,
+        COALESCE(NULLIF(ROUND(CASE WHEN (upta.UpvoteCount + COALESCE(upta.DownvoteCount,0)) = 0 THEN 0.0 ELSE (CAST(upta.UpvoteCount AS NUMERIC) / NULLIF(upta.UpvoteCount + upta.DownvoteCount, 0)) END, 2), 0), 0) AS UpvoteRatio,
+        (
+            SELECT
+                STRING_AGG(clt.Name || ' (' || CAST(ph_close.CreationDate AS TEXT) || ')', '; ' ORDER BY ph_close.CreationDate DESC)
+            FROM PostHistory ph_close
+            JOIN CloseReasonTypes clt ON TRY_CAST(ph_close.Comment AS INTEGER) = clt.Id
+            WHERE ph_close.PostId = upta.QuestionId
+              AND ph_close.PostHistoryTypeId = 10
+            GROUP BY ph_close.PostId
+        ) AS AllCloseReasonsHistory,
+        (
+            SELECT
+                MAX(ph_initial.CreationDate)
+            FROM PostHistory ph_initial
+            WHERE ph_initial.PostId = upta.QuestionId
+              AND ph_initial.PostHistoryTypeId = 2
+        ) AS InitialBodyPostHistoryDate,
+        EXISTS (
+            SELECT 1
+            FROM Badges b
+            WHERE b.UserId = upta.UserId
+              AND b.Name = 'Disciplined'
+        ) AS HasDisciplinedBadge,
+        EXISTS (
+            SELECT 1
+            FROM PostHistory ph_migrated
+            WHERE ph_migrated.PostId = upta.QuestionId
+              AND ph_migrated.PostHistoryTypeId IN (35, 36)
+        ) AS HasMigrationHistory,
+        COALESCE(ph_first_mig.CreationDate, TIMESTAMP '1900-01-01 00:00:00') AS FirstMigrationDate,
+        ph_first_mig.Text AS MigrationDetails
+    FROM UserPostTagAggregates upta
+    LEFT JOIN Users u ON upta.UserId = u.Id
+    LEFT JOIN TagPerformance tp ON upta.FirstTagInQuestion = tp.TagName
+    LEFT JOIN (
+        SELECT PostId, MIN(CreationDate) AS CreationDate
+        FROM PostHistory
+        WHERE PostHistoryTypeId = 5
+        GROUP BY PostId
+    ) upa_first_edit ON upta.QuestionId = upa_first_edit.PostId
+    LEFT JOIN (
+        SELECT PostId, MAX(CreationDate) AS CreationDate
+        FROM PostHistory
+        WHERE PostHistoryTypeId = 5
+        GROUP BY PostId
+    ) upa_last_edit ON upta.QuestionId = upa_last_edit.PostId
+    LEFT JOIN (
+        SELECT
+            PostId,
+            CreationDate,
+            Text,
+            ROW_NUMBER() OVER (PARTITION BY PostId ORDER BY CreationDate ASC) as rn
+        FROM PostHistory
+        WHERE PostHistoryTypeId IN (35, 36)
+    ) ph_first_mig ON upta.QuestionId = ph_first_mig.PostId AND ph_first_mig.rn = 1
+    WHERE upta.UserQuestionScoreRank <= 5
+)
+SELECT *
+FROM FinalResult
+ORDER BY
+    Reputation DESC,
+    QuestionScore DESC,
+    ViewCount DESC
+LIMIT 1000;

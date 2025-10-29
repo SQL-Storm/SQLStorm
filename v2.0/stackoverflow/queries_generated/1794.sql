@@ -1,0 +1,188 @@
+-- {"query": "1794.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2933} 
+
+WITH UserEngagementSummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate AS UserLastAccessDate,
+        COALESCE(SUM(P.Score), 0) AS TotalPostsScoreSum,
+        COUNT(DISTINCT P.Id) AS TotalPostsCount,
+        COUNT(DISTINCT C.Id) AS TotalCommentsCount,
+        COUNT(DISTINCT CASE WHEN B.Class = 1 THEN B.Id END) AS GoldBadgeCount,
+        COUNT(DISTINCT CASE WHEN B.Class = 2 THEN B.Id END) AS SilverBadgeCount,
+        COUNT(DISTINCT CASE WHEN B.Class = 3 THEN B.Id END) AS BronzeBadgeCount,
+        MAX(P.LastActivityDate) AS LastUserActivityOnPost,
+        MIN(C.CreationDate) AS FirstUserCommentDate,
+        ARRAY_AGG(DISTINCT B.Name) FILTER (WHERE B.Name IS NOT NULL) AS AllBadgesAwarded
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate
+),
+PostContentAnalysis AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.Body,
+        P.Tags,
+        P.CreationDate AS PostCreationDate,
+        P.LastActivityDate AS PostLastActivityDate,
+        LENGTH(P.Body) AS BodyLength,
+        LENGTH(REPLACE(P.Body, ' ', '')) AS BodyCharCountNoSpaces,
+        COALESCE(P.AnswerCount, 0) AS DeclaredAnswerCount,
+        COALESCE(P.CommentCount, 0) AS DeclaredCommentCount,
+        CASE
+            WHEN P.Title LIKE '%SQL%' THEN 'SQL_Topic'
+            WHEN P.Title LIKE '%performance%' OR P.Body LIKE '%benchmark%' THEN 'Performance_Topic'
+            WHEN P.Title LIKE '%JavaScript%' OR P.Tags LIKE '%<javascript>%' THEN 'JavaScript_Topic'
+            ELSE 'Other_Topic'
+        END AS ContentCategory,
+        COALESCE(P.ClosedDate, '1900-01-01'::timestamp) AS ClosedDateSafe,
+        (SELECT COUNT(DISTINCT PH.Id) FROM PostHistory PH WHERE PH.PostId = P.Id AND PH.PostHistoryTypeId IN (4, 5, 6)) AS ActualEditCount,
+        (SELECT MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.Comment END) FROM PostHistory PH WHERE PH.PostId = P.Id) AS LastCloseReasonCode
+    FROM Posts P
+    WHERE P.PostTypeId IN (1, 2) -- Questions and Answers
+),
+CommentSentimentAndActivity AS (
+    SELECT
+        C.PostId,
+        COUNT(C.Id) AS ActualCommentCount,
+        AVG(COALESCE(C.Score, 0)) AS AvgCommentScore,
+        MAX(C.CreationDate) AS LastCommentDate,
+        SUM(CASE WHEN C.Text ILIKE '%thank you%' OR C.Text ILIKE '%great answer%' THEN 1 ELSE 0 END) AS PositiveCommentCount,
+        SUM(CASE WHEN C.UserId IS NULL THEN 1 ELSE 0 END) AS AnonymousCommentCount,
+        STRING_AGG(C.Text, ' || ') FILTER (WHERE C.UserId IS NOT NULL AND C.Score > 2) AS TopCommentsText
+    FROM Comments C
+    GROUP BY C.PostId
+),
+QuestionAnswerAggregates AS (
+    SELECT
+        Q.PostId AS QuestionId,
+        COUNT(A.PostId) AS AssociatedAnswerCount,
+        COALESCE(SUM(A.PostScore), 0) AS SumAnswerScores,
+        AVG(CASE WHEN A.PostScore IS NOT NULL THEN A.PostScore ELSE 0 END) AS AvgAnswerScore,
+        MAX(A.PostCreationDate) AS LatestAnswerDate,
+        COUNT(DISTINCT A.OwnerUserId) AS DistinctAnswerers,
+        (SELECT COUNT(DISTINCT V.Id) FROM Votes V WHERE V.PostId = Q.PostId AND V.VoteTypeId = 1) AS AcceptedAnswerVoteCount -- AcceptedByOriginator vote
+    FROM PostContentAnalysis Q
+    LEFT JOIN PostContentAnalysis A ON Q.PostId = A.ParentId AND A.PostTypeId = 2
+    WHERE Q.PostTypeId = 1
+    GROUP BY Q.PostId
+),
+PostLinkAnalysis AS (
+    SELECT
+        PL.PostId,
+        COUNT(CASE WHEN PL.LinkTypeId = 1 THEN PL.RelatedPostId END) AS LinkedPostsCount,
+        COUNT(CASE WHEN PL.LinkTypeId = 3 THEN PL.RelatedPostId END) AS DuplicatePostsCount,
+        STRING_AGG(CAST(PL.RelatedPostId AS TEXT), ',') FILTER (WHERE PL.LinkTypeId = 3) AS DuplicatePostIds
+    FROM PostLinks PL
+    GROUP BY PL.PostId
+),
+RankedPostRevisions AS (
+    SELECT
+        PH.PostId,
+        PH.CreationDate AS RevisionDate,
+        PH.PostHistoryTypeId,
+        PH.UserId AS RevisionUserId,
+        PH.Text AS RevisionText,
+        ROW_NUMBER() OVER(PARTITION BY PH.PostId, PH.PostHistoryTypeId ORDER BY PH.CreationDate DESC) AS rn_latest_type,
+        LAG(PH.CreationDate, 1, '1900-01-01'::timestamp) OVER(PARTITION BY PH.PostId ORDER BY PH.CreationDate) AS PreviousRevisionDate
+    FROM PostHistory PH
+    WHERE PH.PostHistoryTypeId IN (2, 5, 8, 10, 11) -- Body Initial, Body Edit, Body Rollback, Post Closed, Post Reopened
+),
+TagPerformanceMetrics AS (
+    SELECT
+        unnest(string_to_array(substring(P.Tags, 2, length(P.Tags)-2), '><')) AS TagName,
+        AVG(P.Score) AS AvgTagScore,
+        SUM(P.ViewCount) AS TotalTagViews,
+        COUNT(P.Id) AS TaggedPostsCount
+    FROM Posts P
+    WHERE P.Tags IS NOT NULL AND P.PostTypeId = 1
+    GROUP BY TagName
+    HAVING COUNT(P.Id) > 50
+)
+SELECT
+    UES.UserId,
+    UES.DisplayName,
+    UES.Reputation,
+    UES.UserCreationDate,
+    UES.TotalPostsCount,
+    UES.TotalCommentsCount,
+    UES.TotalPostsScoreSum,
+    UES.GoldBadgeCount,
+    UES.SilverBadgeCount,
+    UES.BronzeBadgeCount,
+    PCA.PostId,
+    PCA.PostTypeId,
+    PCA.PostScore,
+    PCA.ViewCount,
+    PCA.PostCreationDate,
+    PCA.PostLastActivityDate,
+    PCA.BodyLength,
+    PCA.ContentCategory,
+    PCA.ActualEditCount,
+    PCA.DeclaredAnswerCount,
+    QAA.AssociatedAnswerCount,
+    QAA.SumAnswerScores,
+    QAA.AvgAnswerScore,
+    QAA.AcceptedAnswerVoteCount,
+    CSA.ActualCommentCount,
+    CSA.AvgCommentScore,
+    CSA.PositiveCommentCount,
+    PLA.LinkedPostsCount,
+    PLA.DuplicatePostsCount,
+    PLA.DuplicatePostIds,
+    (SELECT U2.DisplayName FROM Users U2 WHERE U2.Id = PCA.OwnerUserId) AS PostOwnerName,
+    COALESCE(RPR_Closed.RevisionDate, 'N/A') AS LastClosedDate,
+    COALESCE(RPR_Reopened.RevisionDate, 'N/A') AS LastReopenedDate,
+    DATE_PART('day', AGE(NOW(), PCA.PostCreationDate)) AS DaysSincePostCreation,
+    DATE_PART('hour', AGE(PCA.PostLastActivityDate, PCA.PostCreationDate)) AS HoursToFirstActivity,
+    CASE
+        WHEN UES.Reputation > 100000 AND PCA.PostScore > 500 THEN 'Elite_Contribution'
+        WHEN PCA.ViewCount > 10000 AND QAA.AvgAnswerScore > 10 THEN 'Popular_Solved_Problem'
+        WHEN PCA.PostTypeId = 1 AND PCA.DeclaredAnswerCount = 0 AND PCA.PostCreationDate < NOW() - INTERVAL '1 year' THEN 'Stale_Unanswered_Question'
+        WHEN PCA.LastCloseReasonCode IS NOT NULL THEN 'Post_Was_Closed'
+        ELSE 'General_Engagement'
+    END AS PostEngagementLevel,
+    ARRAY_TO_STRING(UES.AllBadgesAwarded, ', ') AS UserBadgeList,
+    (SELECT COUNT(DISTINCT V.Id) FROM Votes V WHERE V.PostId = PCA.PostId AND V.VoteTypeId = 2) AS UpvoteCountForPost,
+    (SELECT COUNT(DISTINCT V.Id) FROM Votes V WHERE V.PostId = PCA.PostId AND V.VoteTypeId = 3) AS DownvoteCountForPost,
+    AVG(PCA.PostScore) OVER (PARTITION BY UES.UserId ORDER BY PCA.PostCreationDate) AS UserAvgPostScoreCumulative,
+    RANK() OVER (PARTITION BY UES.UserId ORDER BY PCA.PostScore DESC) AS RankOfPostScoreByUser,
+    FIRST_VALUE(RPR_BodyEdit.RevisionText) OVER (PARTITION BY PCA.PostId ORDER BY RPR_BodyEdit.RevisionDate DESC) AS LatestBodyRevisionText,
+    NULLIF(DATE_PART('day', RPR_Closed.RevisionDate - RPR_BodyEdit.RevisionDate), 0) AS DaysBetweenLastEditAndClose,
+    TRIM(unnest(string_to_array(substring(PCA.Tags, 2, length(PCA.Tags)-2), '><'))) AS RelatedTag,
+    TPM.AvgTagScore AS TagAvgScore,
+    TPM.TotalTagViews AS TagTotalViews
+FROM UserEngagementSummary UES
+INNER JOIN PostContentAnalysis PCA ON UES.UserId = PCA.OwnerUserId
+LEFT JOIN QuestionAnswerAggregates QAA ON PCA.PostId = QAA.QuestionId AND PCA.PostTypeId = 1
+LEFT JOIN CommentSentimentAndActivity CSA ON PCA.PostId = CSA.PostId
+LEFT JOIN PostLinkAnalysis PLA ON PCA.PostId = PLA.PostId
+LEFT JOIN RankedPostRevisions RPR_Closed ON PCA.PostId = RPR_Closed.PostId AND RPR_Closed.PostHistoryTypeId = 10 AND RPR_Closed.rn_latest_type = 1
+LEFT JOIN RankedPostRevisions RPR_Reopened ON PCA.PostId = RPR_Reopened.PostId AND RPR_Reopened.PostHistoryTypeId = 11 AND RPR_Reopened.rn_latest_type = 1
+LEFT JOIN RankedPostRevisions RPR_BodyEdit ON PCA.PostId = RPR_BodyEdit.PostId AND RPR_BodyEdit.PostHistoryTypeId IN (2, 5, 8) AND RPR_BodyEdit.rn_latest_type = 1
+LEFT JOIN TagPerformanceMetrics TPM ON TRIM(unnest(string_to_array(substring(PCA.Tags, 2, length(PCA.Tags)-2), '><'))) = TPM.TagName
+WHERE
+    UES.Reputation > 5000
+    AND PCA.PostCreationDate >= '2021-01-01'
+    AND PCA.PostScore IS NOT NULL AND PCA.PostScore > 5
+    AND PCA.ViewCount IS NOT NULL AND PCA.ViewCount > 100
+    AND (
+        (PCA.ContentCategory = 'Performance_Topic' AND QAA.AvgAnswerScore > 5)
+        OR (PCA.Body ILIKE '%index%' AND PCA.Tags ILIKE '%<database>%')
+        OR (PCA.PostId IN (SELECT V.PostId FROM Votes V WHERE V.VoteTypeId = 5 AND V.UserId = UES.UserId LIMIT 10)) -- Posts favorited by the user
+    )
+    AND PCA.ClosedDate IS NOT DISTINCT FROM '1900-01-01'::timestamp -- Only include non-closed posts (using safe closed date)
+    AND (CSA.ActualCommentCount IS NULL OR CSA.ActualCommentCount < 50) -- Not overly commented posts
+ORDER BY
+    UES.Reputation DESC,
+    PCA.PostScore DESC,
+    DaysSincePostCreation ASC
+LIMIT 10000;

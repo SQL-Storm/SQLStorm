@@ -1,0 +1,153 @@
+WITH
+UserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.ProfileImageUrl,
+    COUNT(p.Id) AS PostCount,
+    COUNT(v.Id) AS VoteCount
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.UserId = u.Id
+  WHERE u.AccountId IS NOT NULL
+  GROUP BY
+    u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate,
+    u.Location, u.Views, u.UpVotes, u.DownVotes, u.ProfileImageUrl
+),
+RecentActivity AS (
+  SELECT
+    p.OwnerUserId AS UserId,
+    COUNT(*) FILTER (WHERE p.PostTypeId = 1) AS QuestionsLastYear,
+    COUNT(*) FILTER (WHERE p.PostTypeId = 2) AS AnswersLastYear,
+    SUM(CASE WHEN p.ViewCount > 0 THEN p.ViewCount ELSE 0 END) AS ViewsLastYear,
+    MAX(p.LastActivityDate) AS LastActive
+  FROM Posts p
+  WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days'
+  GROUP BY p.OwnerUserId
+),
+CloseReasonStats AS (
+  SELECT
+    u.Id AS UserId,
+    MAX(CASE
+          WHEN ph.PostHistoryTypeId = 10 THEN CAST((ph.Comment ->> 'CloseReasonId') AS integer)
+          ELSE NULL
+        END) AS MostRecentCloseReasonId
+  FROM Users u
+  LEFT JOIN Posts po ON po.OwnerUserId = u.Id
+  LEFT JOIN PostHistory ph ON ph.PostId = po.Id
+  WHERE ph.PostHistoryTypeId = 10
+  GROUP BY u.Id
+),
+TopBadgesAndTags AS (
+  SELECT
+    b.UserId,
+    b.Name AS BadgeName,
+    CAST(NULL AS text) AS TagName,
+    b.Date AS EventDate,
+    1 AS Source
+  FROM Badges b
+  UNION ALL
+  SELECT
+    t.UserId,
+    CAST(NULL AS text) AS BadgeName,
+    t.TagName AS TagName,
+    t.CreationDate AS EventDate,
+    2 AS Source
+  FROM (
+    SELECT
+      v.UserId,
+      t.TagName,
+      MAX(v.CreationDate) AS CreationDate
+    FROM Votes v
+    JOIN Posts p ON p.Id = v.PostId
+    JOIN LATERAL (
+      SELECT UNNEST(string_to_array(p.Tags, '>')) AS TagName
+    ) t ON true
+    WHERE v.VoteTypeId IN (2, 6)
+    GROUP BY v.UserId, t.TagName
+  ) t
+),
+RankedPosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.Title,
+    p.CreationDate,
+    ROW_NUMBER() OVER (
+      PARTITION BY p.OwnerUserId
+      ORDER BY p.Score DESC NULLS LAST, p.ViewCount DESC NULLS LAST, p.CreationDate ASC
+    ) AS PostRank
+  FROM Posts p
+  WHERE p.ParentId IS NULL
+),
+ComplexFilter AS (
+  SELECT
+    rp.PostId,
+    rp.OwnerUserId,
+    rp.Score,
+    rp.ViewCount,
+    rp.Title,
+    rp.CreationDate,
+    CASE
+      WHEN rp.Score IS NULL THEN 0
+      ELSE rp.Score
+    END
+    +
+    COALESCE(NULLIF(RIGHT(rp.Title, 3), ''), '0')::integer AS ScoreWithSuffix,
+    CASE
+      WHEN rp.ViewCount IS NULL THEN 0
+      ELSE rp.ViewCount
+    END
+    *
+    CASE
+      WHEN EXTRACT(DAY FROM CAST('2024-10-01' AS date) - DATE(rp.CreationDate)) < 30 THEN 2
+      ELSE 1
+    END AS WeightedViews
+  FROM RankedPosts rp
+  WHERE rp.PostRank <= 100
+),
+BenchmarkRow AS (
+  SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ra.QuestionsLastYear,
+    ra.AnswersLastYear,
+    ra.ViewsLastYear,
+    crs.MostRecentCloseReasonId,
+    tbad.EventDate,
+    tbad.Source,
+    bp.PostId,
+    bp.ScoreWithSuffix,
+    bp.WeightedViews
+  FROM UserActivity ua
+  LEFT JOIN RecentActivity ra ON ra.UserId = ua.UserId
+  LEFT JOIN CloseReasonStats crs ON crs.UserId = ua.UserId
+  LEFT JOIN TopBadgesAndTags tbad ON tbad.UserId = ua.UserId
+  LEFT JOIN ComplexFilter bp ON bp.OwnerUserId = ua.UserId
+)
+SELECT
+  br.UserId,
+  br.DisplayName,
+  br.Reputation,
+  br.QuestionsLastYear,
+  br.AnswersLastYear,
+  br.ViewsLastYear,
+  br.MostRecentCloseReasonId,
+  br.EventDate,
+  br.Source,
+  br.PostId,
+  br.ScoreWithSuffix,
+  br.WeightedViews
+FROM BenchmarkRow br
+ORDER BY br.Reputation DESC NULLS LAST, br.QuestionsLastYear DESC NULLS LAST, br.EventDate DESC NULLS LAST
+LIMIT 100;

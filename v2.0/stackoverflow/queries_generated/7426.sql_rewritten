@@ -1,0 +1,279 @@
+-- {"query": "7426.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2518} 
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+        COALESCE(p.Score, 0) - COALESCE(LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate), 0) as score_diff,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.Score > 100 THEN 'Highly_Voted_Question'
+            WHEN p.PostTypeId = 1 AND p.Score > 50 THEN 'Moderately_Voted_Question'
+            WHEN p.PostTypeId = 2 AND p.Score > 25 THEN 'Highly_Voted_Answer'
+            WHEN p.PostTypeId = 2 AND p.Score > 10 THEN 'Moderately_Voted_Answer'
+            ELSE 'Other'
+        END as post_category,
+        TRIM(BOTH '<>' FROM COALESCE(p.Tags, '')) as clean_tags,
+        STRING_TO_ARRAY(TRIM(BOTH '<>' FROM COALESCE(p.Tags, '')), '><') as tag_array,
+        CASE 
+            WHEN p.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) 
+            THEN 'Above_Avg_Question' 
+            ELSE 'Below_Avg_Question' 
+        END as avg_score_category
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserActivity AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as total_posts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as question_count,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as answer_count,
+        SUM(COALESCE(p.Score, 0)) as total_score,
+        AVG(COALESCE(p.Score, 0)) as avg_post_score,
+        MAX(p.CreationDate) as last_post_date,
+        MAX(COALESCE(p.LastEditDate, p.CreationDate)) as last_activity_date,
+        DATEDIFF('DAY', u.CreationDate, cast('2024-10-01 12:34:56' as timestamp)) as account_age_days,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Expert'
+            WHEN u.Reputation > 1000 THEN 'Intermediate'
+            WHEN u.Reputation > 100 THEN 'Beginner'
+            ELSE 'Newbie'
+        END as user_level,
+        CASE 
+            WHEN COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) > 10 THEN 'Frequent_Questioneer'
+            WHEN COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) > 50 THEN 'Frequent_Answerer'
+            ELSE 'Regular_User'
+        END as activity_level
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes, u.CreationDate
+),
+PostStats AS (
+    SELECT 
+        p.Id,
+        p.ParentId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        COALESCE(p.AnswerCount, 0) as answer_count,
+        COALESCE(p.CommentCount, 0) as comment_count,
+        COALESCE(p.FavoriteCount, 0) as favorite_count,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN 'Has_Answers'
+            WHEN p.PostTypeId = 2 THEN 'Answer_Post'
+            ELSE 'Question_Post'
+        END as post_status,
+        RANK() OVER (ORDER BY p.Score DESC) as score_rank,
+        DENSE_RANK() OVER (ORDER BY p.ViewCount DESC) as view_rank,
+        NTILE(10) OVER (ORDER BY p.Score DESC) as score_decile,
+        PERCENT_RANK() OVER (ORDER BY p.Score) as score_percentile,
+        LAG(p.Score, 1) OVER (ORDER BY p.Score DESC) as prev_score,
+        (p.Score - LAG(p.Score, 1) OVER (ORDER BY p.Score DESC)) / NULLIF(LAG(p.Score, 1) OVER (ORDER BY p.Score DESC), 0) * 100 as score_change_pct
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+TagAnalysis AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count as tag_count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE WHEN t.IsModeratorOnly = 1 THEN 'Moderator_Only' ELSE 'Public' END as tag_access_level,
+        CASE WHEN t.IsRequired = 1 THEN 'Required' ELSE 'Optional' END as tag_requirement,
+        CASE 
+            WHEN t.Count > (SELECT AVG(Count) FROM Tags) THEN 'Popular_Tag'
+            WHEN t.Count > (SELECT AVG(Count) FROM Tags) * 0.5 THEN 'Moderate_Tag'
+            ELSE 'Rare_Tag'
+        END as popularity_level
+    FROM Tags t
+),
+PostTagAnalysis AS (
+    SELECT 
+        ps.Id,
+        ps.Title,
+        ps.Tags,
+        ps.Tag_Array,
+        ta.TagName,
+        ta.tag_count,
+        ta.popularity_level,
+        CASE WHEN ps.PostTypeId = 1 THEN 'Question' ELSE 'Answer' END as post_type,
+        ROW_NUMBER() OVER (PARTITION BY ps.Id, ta.TagName ORDER BY ps.CreationDate DESC) as post_tag_row_num
+    FROM PostStats ps
+    CROSS JOIN LATERAL (
+        SELECT UNNEST(ps.tag_array) as tag_name
+    ) unnested_tags
+    JOIN TagAnalysis ta ON unnested_tags.tag_name = ta.TagName
+),
+ComplexQueryResult AS (
+    SELECT 
+        'Post' as result_type,
+        p.Id as entity_id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        u.DisplayName as owner_name,
+        pa.post_category,
+        pa.avg_score_category,
+        pa.score_diff,
+        CASE WHEN pa.prev_score IS NOT NULL THEN 'Yes' ELSE 'No' END as has_prev_score,
+        NULL as user_id,
+        NULL as user_name,
+        'Post' as entity_type,
+        p.CreationDate,
+        p.LastActivityDate,
+        CONCAT('Score: ', p.Score, 
+               ' Views: ', p.ViewCount,
+               ' Post Type: ', CASE WHEN p.PostTypeId = 1 THEN 'Question' ELSE 'Answer' END,
+               ' Tags: ', COALESCE(p.Tags, '')) as summary_text
+    FROM RankedPosts pa
+    JOIN Posts p ON pa.Id = p.Id
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE pa.rn = 1
+    AND pa.score_diff > 0
+    AND (pa.post_category IN ('Highly_Voted_Question', 'Highly_Voted_Answer')
+         OR pa.avg_score_category IN ('Above_Avg_Question', 'Above_Avg_Question'))
+    
+    UNION ALL
+    
+    SELECT 
+        'User' as result_type,
+        ua.UserId as entity_id,
+        NULL as Title,
+        NULL as Score,
+        NULL as ViewCount,
+        NULL as OwnerUserId,
+        NULL as owner_name,
+        NULL as post_category,
+        NULL as avg_score_category,
+        NULL as score_diff,
+        NULL as has_prev_score,
+        ua.UserId as user_id,
+        ua.DisplayName as user_name,
+        'User' as entity_type,
+        NULL as CreationDate,
+        NULL as LastActivityDate,
+        CONCAT('Reputation: ', ua.Reputation,
+               ' Total Posts: ', ua.total_posts,
+               ' User Level: ', ua.user_level,
+               ' Activity Level: ', ua.activity_level) as summary_text
+    FROM UserActivity ua
+    WHERE ua.total_posts > 5
+    AND ua.avg_post_score > 20
+    AND ua.account_age_days > 30
+    
+    UNION ALL
+    
+    SELECT 
+        'Tag' as result_type,
+        ta.Id as entity_id,
+        ta.TagName as Title,
+        ta.tag_count,
+        NULL as ViewCount,
+        NULL as OwnerUserId,
+        NULL as owner_name,
+        NULL as post_category,
+        NULL as avg_score_category,
+        NULL as score_diff,
+        NULL as has_prev_score,
+        NULL as user_id,
+        NULL as user_name,
+        'Tag' as entity_type,
+        NULL as CreationDate,
+        NULL as LastActivityDate,
+        CONCAT('Tag Count: ', ta.tag_count,
+               ' Popularity: ', ta.popularity_level,
+               ' Access Level: ', ta.tag_access_level) as summary_text
+    FROM TagAnalysis ta
+    WHERE ta.popularity_level IN ('Popular_Tag', 'Moderate_Tag')
+    AND ta.tag_access_level = 'Public'
+    
+    UNION ALL
+    
+    SELECT 
+        'Post-Tag' as result_type,
+        pta.Id as entity_id,
+        pta.Title,
+        pta.tag_count,
+        NULL as ViewCount,
+        NULL as OwnerUserId,
+        NULL as owner_name,
+        NULL as post_category,
+        NULL as avg_score_category,
+        NULL as score_diff,
+        NULL as has_prev_score,
+        NULL as user_id,
+        NULL as user_name,
+        'Post-Tag' as entity_type,
+        NULL as CreationDate,
+        NULL as LastActivityDate,
+        CONCAT('Tag: ', pta.TagName,
+               ' Post Type: ', pta.post_type,
+               ' Popularity: ', pta.popularity_level) as summary_text
+    FROM PostTagAnalysis pta
+    WHERE pta.post_tag_row_num = 1
+    AND (pta.post_type = 'Question' OR pta.tag_count > 100)
+)
+SELECT 
+    result_type,
+    entity_id,
+    Title,
+    Score,
+    ViewCount,
+    OwnerUserId,
+    owner_name,
+    post_category,
+    avg_score_category,
+    score_diff,
+    has_prev_score,
+    user_id,
+    user_name,
+    entity_type,
+    CreationDate,
+    LastActivityDate,
+    summary_text,
+    ROW_NUMBER() OVER (ORDER BY CreationDate DESC, Score DESC) as row_rank,
+    COUNT(*) OVER () as total_results,
+    FIRST_VALUE(entity_id) OVER (ORDER BY Score DESC) as highest_scoring_entity,
+    LAST_VALUE(entity_id) OVER (ORDER BY Score DESC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) as lowest_scoring_entity,
+    AVG(Score) OVER () as avg_score_all,
+    MAX(Score) OVER () as max_score_all,
+    MIN(Score) OVER () as min_score_all,
+    SUM(Score) OVER () as total_score_all,
+    RANK() OVER (ORDER BY Score DESC) as global_rank,
+    DENSE_RANK() OVER (ORDER BY Score DESC) as global_dense_rank
+FROM ComplexQueryResult
+WHERE result_type IN ('Post', 'User')
+ORDER BY 
+    CASE result_type 
+        WHEN 'Post' THEN 1
+        WHEN 'User' THEN 2
+        WHEN 'Tag' THEN 3
+        WHEN 'Post-Tag' THEN 4
+    END,
+    Score DESC,
+    CreationDate DESC,
+    entity_id
+LIMIT 1000;

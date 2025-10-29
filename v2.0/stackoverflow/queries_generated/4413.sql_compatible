@@ -1,0 +1,101 @@
+WITH
+  RankedUserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      COUNT(p.Id) AS PostCount,
+      ROW_NUMBER() OVER (
+        ORDER BY
+          u.Reputation DESC,
+          u.CreationDate ASC
+      ) AS ReputationRank,
+      AVG(p.Score) FILTER (WHERE p.Id IS NOT NULL) OVER (PARTITION BY u.Id) AS AvgPostScore,
+      SUM(CASE WHEN ph.PostHistoryTypeId IN (2, 5) THEN 1 ELSE 0 END) AS EditCount,
+      MAX(p.LastActivityDate) FILTER (WHERE p.Id IS NOT NULL) OVER (PARTITION BY u.Id) AS LastActivity
+    FROM
+      Users u
+    LEFT JOIN
+      Posts p
+      ON u.Id = p.OwnerUserId
+    LEFT JOIN
+      PostHistory ph
+      ON p.Id = ph.PostId
+    WHERE
+      u.CreationDate >= TIMESTAMP '2010-01-01' AND u.DisplayName IS NOT NULL
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate
+    HAVING
+      COUNT(p.Id) > 10
+  ),
+  HotQuestions AS (
+    SELECT
+      p.Id AS QuestionId,
+      p.Title,
+      p.AnswerCount,
+      p.FavoriteCount,
+      p.Score,
+      p.CreationDate,
+      ROW_NUMBER() OVER (
+        ORDER BY
+          p.Score DESC,
+          p.AnswerCount DESC,
+          p.FavoriteCount DESC
+      ) AS HotnessRank
+    FROM
+      Posts p
+    WHERE
+      p.PostTypeId = 1 AND p.ClosedDate IS NULL AND p.CommunityOwnedDate IS NULL
+      AND p.CreationDate BETWEEN TIMESTAMP '2023-01-01' AND TIMESTAMP '2023-12-31'
+  )
+SELECT
+  q.Title AS QuestionTitle,
+  q.HotnessRank,
+  rua.DisplayName AS TopUserDisplayName,
+  rua.Reputation AS TopUserReputation,
+  rua.ReputationRank AS TopUserRank,
+  rua.AvgPostScore AS TopUserAvgScore,
+  rua.EditCount AS TopUserEditCount,
+  CAST(
+    (EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - rua.LastActivity)) / 86400)
+    AS INTEGER
+  ) AS DaysSinceLastActivity,
+  (
+    SELECT
+      COUNT(c.Id)
+    FROM
+      Comments c
+    WHERE
+      c.PostId = q.QuestionId AND c.Score > 5
+  ) AS HighScoreCommentCount,
+  CASE
+    WHEN q.FavoriteCount > 100 THEN 'Very Popular'
+    WHEN q.FavoriteCount > 50 THEN 'Popular'
+    ELSE 'Standard'
+  END AS PopularityBucket,
+  CASE
+    WHEN EXISTS (
+      SELECT
+        1
+      FROM
+        PostLinks pl
+      WHERE
+        pl.PostId = q.QuestionId AND pl.LinkTypeId = 3
+    ) THEN 'Has Duplicate Link'
+    ELSE 'No Duplicate Link'
+  END AS DuplicateStatus
+FROM
+  HotQuestions q
+JOIN
+  RankedUserActivity rua
+  ON rua.ReputationRank BETWEEN 1 AND 50
+WHERE
+  q.HotnessRank BETWEEN 1 AND 10
+  AND q.Score > 0
+  AND q.AnswerCount > 0
+ORDER BY
+  q.HotnessRank,
+  rua.ReputationRank;

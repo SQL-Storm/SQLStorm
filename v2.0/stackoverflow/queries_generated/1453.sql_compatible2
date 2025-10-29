@@ -1,0 +1,230 @@
+WITH UserActivityMetrics AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.DisplayName,
+        u.Location,
+        u.Views AS UserViews,
+        u.UpVotes AS UserUpVotes,
+        u.DownVotes AS UserDownVotes,
+        DATE_PART('day', u.LastAccessDate - u.CreationDate) AS UserAccountAgeDays,
+        COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsOwned,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersOwned,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScoreOwned,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        COALESCE(SUM(c.Score), 0) AS TotalCommentScoreMade,
+        MAX(p.CreationDate) AS LastPostDate,
+        MIN(p.CreationDate) AS FirstPostDate,
+        u.Reputation - LAG(u.Reputation, 1, 0) OVER (ORDER BY u.CreationDate) AS ReputationChangeFromPrevUserCreation
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    GROUP BY u.Id, u.Reputation, u.CreationDate, u.LastAccessDate, u.DisplayName, u.Location, u.Views, u.UpVotes, u.DownVotes
+),
+PostContentAnalysis AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.LastEditDate,
+        p.Title AS PostTitle,
+        LENGTH(p.Body) AS BodyLength,
+        LENGTH(p.Title) AS TitleLength,
+        CARDINALITY(REGEXP_SPLIT_TO_ARRAY(p.Body, '\s+')) AS BodyWordCount,
+        CARDINALITY(REGEXP_SPLIT_TO_ARRAY(p.Title, '\s+')) AS TitleWordCount,
+        CASE
+            WHEN LOWER(p.Body) LIKE '%sql%' AND LOWER(p.Body) LIKE '%performance%' THEN 'SQL_Perf_Related'
+            WHEN LOWER(p.Body) LIKE '%javascript%' AND LOWER(p.Body) LIKE '%react%' THEN 'JS_Frontend_Related'
+            WHEN LOWER(p.Body) LIKE '%python%' AND LOWER(p.Body) LIKE '%machine learning%' THEN 'Python_ML_Related'
+            ELSE 'Other_Topic'
+        END AS TopicCategory,
+        COALESCE(
+            (SELECT t_unnest FROM UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><')) AS t_unnest LIMIT 1),
+            'No_Tag'
+        ) AS PrimaryTag,
+        CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN TRUE ELSE FALSE END AS HasAcceptedAnswer
+    FROM Posts p
+    INNER JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.OwnerUserId IS NOT NULL
+      AND p.Body IS NOT NULL AND LENGTH(p.Body) > 0
+),
+PostHistorySummary AS (
+    SELECT
+        ph.PostId,
+        COUNT(ph.Id) AS TotalHistoryEntries,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (7, 8, 9) THEN 1 ELSE 0 END) AS RollbackCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenCount,
+        MAX(ph.CreationDate) AS LastHistoryDate,
+        (
+            SELECT crt.Name
+            FROM PostHistory ph_inner
+            LEFT JOIN CloseReasonTypes crt ON ph_inner.Comment = CAST(crt.Id AS text)
+            WHERE ph_inner.PostId = ph.PostId
+              AND ph_inner.PostHistoryTypeId = 10
+              AND crt.Name IS NOT NULL
+            ORDER BY ph_inner.CreationDate DESC
+            LIMIT 1
+        ) AS LatestCloseReason
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+),
+TopUsersByReputationAndEngagement AS (
+    SELECT
+        uam.UserId,
+        COUNT(b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM UserActivityMetrics uam
+    LEFT JOIN Badges b ON uam.UserId = b.UserId
+    WHERE uam.Reputation > 50000
+      AND uam.LastAccessDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years')
+    GROUP BY uam.UserId
+    HAVING COUNT(b.Id) > 100
+),
+MainQueryBranch AS (
+    SELECT
+        uam.UserId,
+        uam.DisplayName,
+        uam.Reputation,
+        uam.UserAccountAgeDays,
+        uam.TotalPostsOwned,
+        uam.TotalQuestionsOwned,
+        uam.TotalAnswersOwned,
+        pca.PostId,
+        pca.PostTypeName,
+        pca.PostScore,
+        pca.ViewCount,
+        pca.BodyLength,
+        pca.BodyWordCount,
+        pca.TopicCategory,
+        pca.PrimaryTag,
+        pca.HasAcceptedAnswer,
+        phs.EditCount,
+        phs.RollbackCount,
+        phs.CloseCount,
+        phs.LatestCloseReason,
+        tu.GoldBadges,
+        RANK() OVER (PARTITION BY pca.PostTypeName ORDER BY pca.PostScore DESC, pca.ViewCount DESC) AS RankInPostType,
+        AVG(pca.PostScore) OVER (PARTITION BY pca.PrimaryTag, pca.PostTypeName) AS AvgScoreForTagAndType,
+        SUM(pca.BodyWordCount) OVER (PARTITION BY uam.UserId ORDER BY pca.PostCreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativeWordsByUser,
+        LAG(pca.PostScore, 1, 0) OVER (PARTITION BY uam.UserId ORDER BY pca.PostCreationDate) AS PreviousPostScore,
+        (
+            SELECT COUNT(pl.Id)
+            FROM PostLinks pl
+            WHERE pl.RelatedPostId = pca.PostId
+              AND pl.LinkTypeId = 3
+              AND pl.CreationDate > pca.PostCreationDate
+        ) AS DuplicateLinkCount,
+        COALESCE(CAST(phs.EditCount AS NUMERIC) / NULLIF(pca.CommentCount, 0), 0.0) AS EditToCommentRatio,
+        CASE WHEN LOWER(pca.PostTitle) LIKE '%' || LOWER(pca.PrimaryTag) || '%' THEN TRUE ELSE FALSE END AS TitleContainsPrimaryTag,
+        CASE
+            WHEN pca.ClosedDate IS NOT NULL AND phs.CloseCount > 0 THEN 'Closed_and_Tracked'
+            WHEN pca.ClosedDate IS NOT NULL THEN 'Closed_Untracked'
+            WHEN pca.HasAcceptedAnswer THEN 'Active_Answered'
+            ELSE 'Open_Unanswered'
+        END AS PostStatusClassifier,
+        (SELECT AVG(p_avg.Score) FROM Posts p_avg WHERE p_avg.OwnerUserId = uam.UserId AND p_avg.PostTypeId = pca.PostTypeId) AS UserAvgScoreForPostType,
+        'Main_High_Engagement' AS QueryBranchIdentifier
+    FROM UserActivityMetrics uam
+    INNER JOIN PostContentAnalysis pca ON uam.UserId = pca.OwnerUserId
+    LEFT JOIN PostHistorySummary phs ON pca.PostId = phs.PostId
+    LEFT JOIN TopUsersByReputationAndEngagement tu ON uam.UserId = tu.UserId
+    WHERE
+        uam.UserAccountAgeDays > 365
+        AND pca.PostScore > (SELECT AVG(p_sub.Score) FROM Posts p_sub WHERE p_sub.OwnerUserId = uam.UserId)
+        AND pca.TopicCategory IN ('SQL_Perf_Related', 'Python_ML_Related')
+        AND tu.UserId IS NOT NULL
+    GROUP BY
+        uam.UserId, uam.DisplayName, uam.Reputation, uam.UserAccountAgeDays, uam.TotalPostsOwned, uam.TotalQuestionsOwned, uam.TotalAnswersOwned,
+        pca.PostId, pca.PostTypeName, pca.PostScore, pca.ViewCount, pca.BodyLength, pca.BodyWordCount, pca.TopicCategory, pca.PrimaryTag, pca.HasAcceptedAnswer,
+        phs.EditCount, phs.RollbackCount, phs.CloseCount, phs.LatestCloseReason, tu.GoldBadges, pca.PostCreationDate, pca.PostTitle
+),
+AlternativeBranch AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        DATE_PART('day', u.LastAccessDate - u.CreationDate) AS UserAccountAgeDays,
+        COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsOwned,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersOwned,
+        p.Id AS PostId,
+        pt.Name AS PostTypeName,
+        p.Score AS PostScore,
+        p.ViewCount,
+        LENGTH(p.Body) AS BodyLength,
+        CARDINALITY(REGEXP_SPLIT_TO_ARRAY(p.Body, '\s+')) AS BodyWordCount,
+        CASE
+            WHEN LOWER(p.Body) LIKE '%security%' AND LOWER(p.Body) LIKE '%vulnerability%' THEN 'Security_Related'
+            WHEN LOWER(p.Body) LIKE '%blockchain%' AND LOWER(p.Body) LIKE '%crypto%' THEN 'Blockchain_Related'
+            ELSE 'Other_Topic'
+        END AS TopicCategory,
+        COALESCE(
+            (SELECT t_unnest FROM UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><')) AS t_unnest LIMIT 1),
+            'No_Tag'
+        ) AS PrimaryTag,
+        CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN TRUE ELSE FALSE END AS HasAcceptedAnswer,
+        COALESCE(phs.EditCount, 0) AS EditCount,
+        COALESCE(phs.RollbackCount, 0) AS RollbackCount,
+        COALESCE(phs.CloseCount, 0) AS CloseCount,
+        phs.LatestCloseReason,
+        0 AS GoldBadges,
+        DENSE_RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.ViewCount DESC) AS RankInPostType,
+        NULL::numeric AS AvgScoreForTagAndType,
+        NULL::bigint AS CumulativeWordsByUser,
+        NULL::numeric AS PreviousPostScore,
+        (SELECT COUNT(DISTINCT c.Id) FROM Comments c WHERE c.PostId = p.Id AND c.CreationDate > p.CreationDate + INTERVAL '1 hour') AS QuickCommentCount,
+        COALESCE(CAST(phs.EditCount AS NUMERIC) / NULLIF(p.CommentCount, 0), 0.0) AS EditToCommentRatio,
+        CASE WHEN LOWER(p.Title) LIKE '%' || LOWER(COALESCE(p.Tags, '')) || '%' THEN TRUE ELSE FALSE END AS TitleContainsPrimaryTag,
+        CASE
+            WHEN p.Score < 0 AND p.CommentCount > 5 THEN 'Controversial'
+            WHEN p.FavoriteCount > 100 THEN 'Highly_Favorited'
+            ELSE 'Standard'
+        END AS PostStatusClassifier,
+        NULL::numeric AS UserAvgScoreForPostType,
+        'Alternative_High_Votes_Comments' AS QueryBranchIdentifier
+    FROM Posts p
+    INNER JOIN Users u ON p.OwnerUserId = u.Id
+    INNER JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN PostHistorySummary phs ON p.Id = phs.PostId
+    WHERE p.Score > 100
+      AND p.CommentCount > 20
+      AND p.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '5 years')
+      AND p.Tags IS NOT NULL
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate,
+        p.Id, pt.Name, p.PostTypeId, p.Score, p.ViewCount, p.Body, p.Title,
+        p.CommentCount, p.FavoriteCount, p.ClosedDate, p.LastEditDate, p.Tags,
+        phs.EditCount, phs.RollbackCount, phs.CloseCount, phs.LatestCloseReason
+)
+SELECT
+    UserId, DisplayName, Reputation, UserAccountAgeDays, TotalPostsOwned, TotalQuestionsOwned, TotalAnswersOwned,
+    PostId, PostTypeName, PostScore, ViewCount, BodyLength, BodyWordCount, TopicCategory, PrimaryTag, HasAcceptedAnswer,
+    EditCount, RollbackCount, CloseCount, LatestCloseReason, GoldBadges, RankInPostType, AvgScoreForTagAndType,
+    CumulativeWordsByUser, PreviousPostScore, DuplicateLinkCount, EditToCommentRatio, TitleContainsPrimaryTag,
+    PostStatusClassifier, UserAvgScoreForPostType, QueryBranchIdentifier
+FROM MainQueryBranch
+UNION ALL
+SELECT
+    UserId, DisplayName, Reputation, UserAccountAgeDays, TotalPostsOwned, TotalQuestionsOwned, TotalAnswersOwned,
+    PostId, PostTypeName, PostScore, ViewCount, BodyLength, BodyWordCount, TopicCategory, PrimaryTag, HasAcceptedAnswer,
+    EditCount, RollbackCount, CloseCount, LatestCloseReason, GoldBadges, RankInPostType, AvgScoreForTagAndType,
+    CumulativeWordsByUser, PreviousPostScore, QuickCommentCount AS DuplicateLinkCount,
+    EditToCommentRatio, TitleContainsPrimaryTag,
+    PostStatusClassifier, UserAvgScoreForPostType, QueryBranchIdentifier
+FROM AlternativeBranch
+ORDER BY Reputation DESC, PostId
+LIMIT 2000;

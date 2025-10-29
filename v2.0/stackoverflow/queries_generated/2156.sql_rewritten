@@ -1,0 +1,221 @@
+-- {"query": "2156.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1991} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 as Level,
+        array[t.TagName] as Path
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+
+    union all
+
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        r.Level + 1,
+        r.Path || t2.TagName
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.WikiPostId = (select p.Id from Posts p where p.PostTypeId = 5 and p.Title = r.TagName limit 1)
+    where t2.Id <> all(r.Path)
+), 
+FilteredPosts as (
+    select
+        p.Id,
+        p.PostTypeId,
+        coalesce(p.OwnerUserId, -1) as OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.CreationDate,
+        p.Title,
+        p.AcceptedAnswerId,
+        row_number() over (partition by p.PostTypeId order by p.Score desc nulls last, p.ViewCount desc nulls last) as rn
+    from Posts p
+    where p.PostTypeId in (1, 2) -- Questions and Answers
+      and p.Score is not null
+      and p.CreationDate >= cast('2024-10-01' as date) - interval '3 years'
+), 
+UserActivity as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionCount,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswerCount,
+        count(distinct b.Id) as BadgeCount,
+        avg(p.Score) filter (where p.PostTypeId in (1,2) and p.Score is not null) as AvgPostScore,
+        max(p.CreationDate) as LastPostDate,
+        max(u.LastAccessDate) as LastAccessDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    where u.CreationDate < cast('2024-10-01' as date) - interval '1 year'
+    group by u.Id, u.DisplayName
+),
+PostTagExploded as (
+    select
+        p.Id as PostId,
+        unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><')) as TagName
+    from Posts p
+    where p.PostTypeId = 1
+),
+TopTags as (
+    select
+        TagName,
+        count(*) as QuestionCount
+    from PostTagExploded
+    group by TagName
+    having count(*) > 1000
+    order by QuestionCount desc
+    limit 50
+),
+TagPostStats as (
+    select
+        t.TagName,
+        count(distinct p.Id) as QuestionCount,
+        count(distinct a.Id) as AnswerCount,
+        coalesce(avg(p.Score), 0) as AvgQuestionScore,
+        coalesce(avg(a.Score), 0) as AvgAnswerScore,
+        count(distinct c.Id) as CommentCount
+    from TopTags t
+    left join Posts p on p.PostTypeId = 1 and p.Tags like concat('%<', t.TagName, '>%')
+    left join Posts a on a.PostTypeId = 2 and a.ParentId in (select p2.Id from Posts p2 where p2.Tags like concat('%<', t.TagName, '>%'))
+    left join Comments c on c.PostId in (select p3.Id from Posts p3 where p3.Tags like concat('%<', t.TagName, '>%'))
+    group by t.TagName
+),
+ClosedQuestionsDetails as (
+    select
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.ClosedDate,
+        ph.ClosureReasonName,
+        coalesce(vUp.Upvotes, 0) as Upvotes,
+        coalesce(vDown.Downvotes, 0) as Downvotes,
+        u.DisplayName as OwnerName,
+        p.Score,
+        p.ViewCount,
+        p.Tags
+    from Posts p
+    left join (
+        select ph.PostId, crt.Name as ClosureReasonName
+        from PostHistory ph
+        left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as smallint)
+        where ph.PostHistoryTypeId = 10 and ph.Comment is not null
+    ) ph on ph.PostId = p.Id
+    left join (
+        select PostId, count(*) as Upvotes
+        from Votes
+        where VoteTypeId = 2
+        group by PostId
+    ) vUp on vUp.PostId = p.Id
+    left join (
+        select PostId, count(*) as Downvotes
+        from Votes
+        where VoteTypeId = 3
+        group by PostId
+    ) vDown on vDown.PostId = p.Id
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId = 1 and p.ClosedDate is not null
+),
+AnswerAcceptanceStats as (
+    select
+        q.OwnerUserId as QuestionOwner,
+        a.OwnerUserId as AnswerOwner,
+        count(*) as AnswerCount,
+        sum(case when q.AcceptedAnswerId = a.Id then 1 else 0 end) as AcceptedCount,
+        avg(a.Score) as AverageAnswerScore
+    from Posts q
+    join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1 and q.AcceptedAnswerId is not null
+    group by q.OwnerUserId, a.OwnerUserId
+    having count(*) > 5
+),
+UserBadgeWindow as (
+    select
+        b.UserId,
+        b.Name,
+        b.Class,
+        b.Date,
+        row_number() over (partition by b.UserId order by b.Date) as BadgeRank,
+        lag(b.Name) over (partition by b.UserId order by b.Date) as PrevBadgeName,
+        lead(b.Name) over (partition by b.UserId order by b.Date) as NextBadgeName
+    from Badges b
+),
+UserActivityDifference as (
+    select
+        ua.UserId,
+        ua.DisplayName,
+        ua.LastAccessDate,
+        p1.PostCount as PostsLast1Year,
+        p3.PostCount as PostsLast3Years,
+        case 
+          when ua.LastAccessDate < cast('2024-10-01' as date) - interval '1 year' then 'Inactive > 1 year'
+          when ua.LastAccessDate >= cast('2024-10-01' as date) - interval '1 week' then 'Active last week'
+          else 'Active but > 1 week'
+        end as ActivityStatus
+    from UserActivity ua
+    left join (
+        select OwnerUserId, count(*) as PostCount
+        from Posts
+        where CreationDate >= cast('2024-10-01' as date) - interval '1 year'
+        group by OwnerUserId
+    ) p1 on p1.OwnerUserId = ua.UserId
+    left join (
+        select OwnerUserId, count(*) as PostCount
+        from Posts
+        where CreationDate >= cast('2024-10-01' as date) - interval '3 years'
+        group by OwnerUserId
+    ) p3 on p3.OwnerUserId = ua.UserId
+)
+select distinct
+    f.PostTypeId,
+    f.Id as PostId,
+    f.Title,
+    f.Score,
+    f.ViewCount,
+    ua.DisplayName as OwnerName,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.BadgeCount,
+    ua.AvgPostScore,
+    ts.TagName,
+    ts.QuestionCount as TagQuestionCount,
+    ts.AnswerCount as TagAnswerCount,
+    ts.AvgQuestionScore,
+    ts.AvgAnswerScore,
+    ts.CommentCount as TagCommentCount,
+    cd.ClosureReasonName,
+    cd.Upvotes,
+    cd.Downvotes,
+    cd.OwnerName as ClosedPostOwner,
+    aa.AnswerCount as AnswersPerUserPair,
+    aa.AcceptedCount,
+    aa.AverageAnswerScore,
+    ubw.Name as BadgeName,
+    ubw.Class as BadgeClass,
+    ubw.BadgeRank,
+    ubw.PrevBadgeName,
+    ubw.NextBadgeName,
+    uad.ActivityStatus,
+    uad.PostsLast1Year,
+    uad.PostsLast3Years,
+    rh.Level as TagHierarchyLevel,
+    rh.Path as TagPath,
+    length(f.Body) as BodyLength,
+    length(coalesce(f.Title, '')) as TitleLength
+from FilteredPosts f
+left join UserActivity ua on ua.UserId = f.OwnerUserId
+left join PostTagExploded pte on pte.PostId = f.Id
+left join TagPostStats ts on ts.TagName = pte.TagName
+left join ClosedQuestionsDetails cd on cd.Id = f.Id and f.PostTypeId = 1
+left join AnswerAcceptanceStats aa on aa.QuestionOwner = f.OwnerUserId
+left join UserBadgeWindow ubw on ubw.UserId = f.OwnerUserId
+left join UserActivityDifference uad on uad.UserId = f.OwnerUserId
+left join RecursiveTagHierarchy rh on rh.TagName = pte.TagName
+where f.rn <= 100
+  and (f.Score > 0 or f.ViewCount > 100)
+order by f.PostTypeId, f.Score desc nulls last, f.ViewCount desc nulls last
+limit 500;

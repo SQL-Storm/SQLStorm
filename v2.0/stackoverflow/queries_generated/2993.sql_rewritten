@@ -1,0 +1,130 @@
+-- {"query": "2993.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1333} 
+with RecursivePostHierarchy as (
+    select p.Id, p.ParentId, p.PostTypeId, p.Title, p.Score, p.ViewCount, p.OwnerUserId, 0 as Depth
+    from Posts p
+    where p.ParentId is null and p.PostTypeId = 1  -- base questions with no parent
+
+    union all
+
+    select c.Id, c.ParentId, c.PostTypeId, c.Title, c.Score, c.ViewCount, c.OwnerUserId, r.Depth + 1
+    from Posts c
+    inner join RecursivePostHierarchy r on c.ParentId = r.Id
+    where c.PostTypeId = 2 -- answers or comments linked to questions
+),
+BadgesByUserRanked as (
+    select
+        b.UserId,
+        b.Name as BadgeName,
+        b.Class,
+        b.Date,
+        row_number() over (partition by b.UserId order by b.Class, b.Date desc) as BadgeRank
+    from Badges b
+    where b.Class in (1,2,3)
+),
+UserScoreStats as (
+    select 
+        u.Id as UserId,
+        coalesce(sum(p.Score),0) as TotalScore,
+        count(p.Id) as PostCount,
+        max(p.CreationDate) as LastPostDate,
+        sum(case when p.Score > 0 then 1 else 0 end) as PositivePosts,
+        sum(case when p.Score <= 0 then 1 else 0 end) as NonPositivePosts
+    from users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id
+),
+CloseReasonCounts as (
+    select cht.Name as CloseReasonName, count(ph.Id) as CloseCount
+    from PostHistory ph
+    inner join PostHistoryTypes pht on ph.PostHistoryTypeId = pht.Id
+    inner join CloseReasonTypes cht on ph.Comment::int = cht.Id
+    where ph.PostHistoryTypeId = 10 -- Post Closed
+    group by cht.Name
+),
+PostTagAggregates as (
+    select
+        p.Id as PostId,
+        p.Title,
+        p.Tags,
+        array_agg(distinct t.TagName) filter (where t.TagName is not null) as TagArray,
+        string_agg(distinct t.TagName, ',' order by t.TagName) filter (where t.TagName is not null) as TagList
+    from Posts p
+    left join Tags t on position('<' || t.TagName || '>' in coalesce(p.Tags, '')) > 0 
+    where p.PostTypeId = 1
+    group by p.Id, p.Title, p.Tags
+),
+UserCommentStats as (
+    select 
+        c.UserId,
+        count(*) filter (where c.Text ilike '%error%' or c.Text ilike '%bug%') as ErrorComments,
+        count(*) filter (where c.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '1 year') as RecentComments,
+        count(*) as TotalComments
+    from Comments c
+    group by c.UserId
+),
+UserActivity as (
+    select 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        us.TotalScore,
+        us.PostCount,
+        coalesce(ucs.ErrorComments,0) as ErrorComments,
+        coalesce(ucs.RecentComments,0) as RecentComments,
+        coalesce(bbr.BadgeCount,0) as BadgeCount,
+        u.CreationDate,
+        u.LastAccessDate,
+        first_value(bbr.TopBadgeName) over (partition by u.Id order by bbr.TopBadgeClass, bbr.TopBadgeDate desc) as TopBadgeName
+    from Users u
+    left join UserScoreStats us on u.Id = us.UserId
+    left join UserCommentStats ucs on u.Id = ucs.UserId
+    left join (
+        select UserId, count(*) as BadgeCount,
+        min(Class) as TopBadgeClass,
+        max(Date) as TopBadgeDate,
+        min(Name) as TopBadgeName
+        from Badges
+        group by UserId
+    ) bbr on u.Id = bbr.UserId
+)
+select distinct
+    ph.PostId,
+    p.Title as QuestionTitle,
+    p.Score,
+    p.ViewCount,
+    rph.Depth as PostDepth,
+    ph.CreationDate as LastEdit,
+    concat_ws(' | ', 
+        'Score:', ph.Score::text,
+        'Views:', ph.ViewCount::text,
+        'Owner:', coalesce(u.DisplayName, 'anonymous'),
+        'Badges:', coalesce( (select string_agg(distinct BadgeName || '(' || Class || ')', ', ')
+            from Badges b where b.UserId = p.OwnerUserId ), 'none')
+    ) as OwnerInfo,
+    count(distinct c.Id) over (partition by ph.Id) as CommentCount,
+    us.TotalScore as OwnerTotalScore,
+    us.PostCount as OwnerPostCount,
+    us.PositivePosts,
+    us.NonPositivePosts,
+    crc.CloseReasonName,
+    crc.CloseCount,
+    (select count(1) from PostLinks pl where pl.PostId = ph.PostId and pl.LinkTypeId = 3) as DuplicateLinksCount,
+    row_number() over (partition by ph.PostId order by ph.CreationDate desc) as RevisionNum
+from Posts ph
+left join Posts p on ph.Id = p.Id
+left join RecursivePostHierarchy rph on rph.Id = ph.Id
+left join Users u on p.OwnerUserId = u.Id
+left join UserScoreStats us on u.Id = us.UserId
+left join Comments c on c.PostId = ph.Id
+left join (
+    select ph.PostId, ph.Comment::int as ReasonId, crt.Name as CloseReasonName, count(*) CloseCount
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = ph.Comment::int
+    where ph.PostHistoryTypeId = 10
+    group by ph.PostId, ph.Comment::int, crt.Name
+) crc on crc.PostId = ph.Id
+where ph.PostTypeId in (1, 2)
+  and (ph.Score > (select avg(Score) from Posts where PostTypeId = ph.PostTypeId))
+  and (p.Tags is not null or rph.Depth = 0)
+order by ph.CreationDate desc
+limit 100;

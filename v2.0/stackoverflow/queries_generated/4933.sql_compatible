@@ -1,0 +1,117 @@
+WITH
+  RankedPostEdits AS (
+    SELECT
+      ph.PostId,
+      ph.UserId,
+      ph.PostHistoryTypeId,
+      ph.CreationDate,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6)
+  ),
+  UserPostActivity AS (
+    SELECT
+      p.OwnerUserId,
+      COUNT(p.Id) AS TotalPosts,
+      SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+      AVG(p.Score) AS AverageScore,
+      MAX(p.CreationDate) AS LastPostCreationDate
+    FROM Posts p
+    WHERE
+      p.OwnerUserId IS NOT NULL AND p.OwnerUserId > 0
+    GROUP BY
+      p.OwnerUserId
+  ),
+  ReputationChanges AS (
+    SELECT
+      u.Id AS UserId,
+      u.Reputation - LAG(u.Reputation, 1, u.Reputation) OVER (ORDER BY u.CreationDate) AS InitialReputationGain,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesReceived,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesReceived
+    FROM Users u
+    LEFT JOIN Votes v
+      ON u.Id = v.UserId
+    GROUP BY
+      u.Id,
+      u.Reputation,
+      u.CreationDate
+  ),
+  TagCounts AS (
+    SELECT
+      t.TagName,
+      t.Count AS TotalTagCount,
+      (
+        SELECT
+          COUNT(*)
+        FROM Posts p
+        WHERE
+          p.Tags LIKE '%' || t.TagName || '%'
+      ) AS PostsWithTag
+    FROM Tags t
+    WHERE
+      t.IsModeratorOnly = 0
+  ),
+  TopTag AS (
+    SELECT
+      tc.TagName,
+      tc.PostsWithTag,
+      ROW_NUMBER() OVER (ORDER BY tc.PostsWithTag DESC, tc.TagName ASC) AS rn
+    FROM TagCounts tc
+  )
+SELECT
+  COALESCE(u.DisplayName, 'Deleted User') AS DisplayName,
+  COALESCE(upa.TotalPosts, 0) AS TotalPostsOwned,
+  COALESCE(upa.QuestionCount, 0) AS QuestionsAsked,
+  COALESCE(upa.AnswerCount, 0) AS AnswersGiven,
+  COALESCE(upa.AverageScore, 0.0) AS AvgPostScore,
+  rc.InitialReputationGain,
+  rc.UpvotesReceived,
+  rc.DownvotesReceived,
+  CASE
+    WHEN u.Reputation > 100000 THEN 'Legendary'
+    WHEN u.Reputation > 50000 THEN 'Expert'
+    WHEN u.Reputation > 10000 THEN 'Advanced'
+    WHEN u.Reputation > 1000 THEN 'Intermediate'
+    ELSE 'Beginner'
+  END AS ReputationLevel,
+  (
+    SELECT
+      COUNT(DISTINCT ph.PostId)
+    FROM RankedPostEdits ph
+    WHERE
+      ph.UserId = u.Id AND ph.rn = 1
+  ) AS PostsEdited,
+  ('https://example.com/users/' || CAST(u.Id AS VARCHAR) || '/posts' ||
+    (CASE WHEN u.DisplayName IS NOT NULL THEN '/' || REPLACE(REPLACE(REPLACE(REPLACE(u.DisplayName, ' ', '-'), '''', ''), '?', ''), '&', '') ELSE '' END)
+  ) AS UserProfileLink,
+  CASE
+    WHEN UPPER(u.Location) LIKE '%USA%' THEN 'North America'
+    WHEN UPPER(u.Location) LIKE '%CANADA%' THEN 'North America'
+    WHEN UPPER(u.Location) LIKE '%MEXICO%' THEN 'North America'
+    WHEN UPPER(u.Location) LIKE '%EUROPE%' THEN 'Europe'
+    WHEN UPPER(u.Location) LIKE '%ASIA%' THEN 'Asia'
+    WHEN UPPER(u.Location) LIKE '%AUSTRALIA%' THEN 'Oceania'
+    WHEN UPPER(u.Location) LIKE '%AFRICA%' THEN 'Africa'
+    WHEN UPPER(u.Location) LIKE '%SOUTH AMERICA%' THEN 'South America'
+    ELSE 'Unknown'
+  END AS Continent,
+  tt.TagName AS TopTag,
+  tt.PostsWithTag AS PostsWithTopTag
+FROM Users u
+LEFT JOIN UserPostActivity upa
+  ON u.Id = upa.OwnerUserId
+LEFT JOIN ReputationChanges rc
+  ON u.Id = rc.UserId
+LEFT JOIN (
+  SELECT TagName, PostsWithTag
+  FROM TopTag
+  WHERE rn = 1
+) tt
+  ON 1 = 1
+WHERE
+  u.Id < 100000
+ORDER BY
+  u.Reputation DESC
+LIMIT 100;

@@ -1,0 +1,283 @@
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        u.location,
+        coalesce(nullif(trim(u.websiteurl), ''), 'N/A') as websiteurl,
+        count(*) filter (where b.class = 1) as gold_badges,
+        count(*) filter (where b.class = 2) as silver_badges,
+        count(*) filter (where b.class = 3) as bronze_badges,
+        row_number() over (order by u.reputation desc, u.id) as rn_global
+    from users u
+    left join badges b
+      on b.userid = u.id
+     and b.date >= u.creationdate
+    where u.creationdate >= (select date_trunc('month', max(creationdate)) - interval '12 months' from users)
+    group by u.id, u.displayname, u.reputation, u.creationdate, u.location, u.websiteurl
+),
+question_activity as (
+    select
+        p.owneruserid as user_id,
+        count(*) as questions_count,
+        sum(p.viewcount) as total_views,
+        avg(nullif(p.score,0)) filter (where p.score is not null) as avg_nonzero_score,
+        sum(case when p.closureason is not null then 1 else 0 end) as closed_q
+    from (
+        select
+            q.*,
+            (select crt.name
+             from posthistory ph
+             join closereasontypes crt
+               on cast(crt.id as text) = ph.comment
+             where ph.postid = q.id
+               and ph.posthistorytypeid = 10
+             order by ph.creationdate desc
+             limit 1) as closureason
+        from posts q
+        where q.posttypeid = 1
+          and q.creationdate >= (select date_trunc('month', max(creationdate)) - interval '12 months' from posts)
+    ) p
+    group by p.owneruserid
+),
+answer_activity as (
+    select
+        a.owneruserid as user_id,
+        count(*) as answers_count,
+        sum(case when a.score > 0 then 1 else 0 end) as positive_answers,
+        count(distinct a.parentid) as distinct_questions_answered
+    from posts a
+    where a.posttypeid = 2
+      and a.creationdate >= (select date_trunc('month', max(creationdate)) - interval '12 months' from posts)
+    group by a.owneruserid
+),
+comment_activity as (
+    select
+        c.userid as user_id,
+        count(*) as comments_count,
+        sum(c.score) as comment_score_sum,
+        max(c.creationdate) as last_comment_date
+    from comments c
+    where c.creationdate >= (select date_trunc('month', max(creationdate)) - interval '12 months' from comments)
+    group by c.userid
+),
+post_reactions as (
+    select
+        v.userid as user_id,
+        count(*) filter (where v.votetypeid = 2) as upvotes_cast,
+        count(*) filter (where v.votetypeid = 3) as downvotes_cast,
+        count(*) filter (where v.votetypeid = 8) as bounties_started,
+        sum(v.bountyamount) filter (where v.votetypeid in (8,9)) as bounty_amount_total
+    from votes v
+    where v.creationdate >= (select date_trunc('month', max(creationdate)) - interval '12 months' from votes)
+    group by v.userid
+),
+tag_influence as (
+    select
+        q.owneruserid as user_id,
+        tag.tagname,
+        sum(q.viewcount) as views_by_tag,
+        count(*) as questions_by_tag
+    from posts q
+    cross join lateral (
+        select regexp_split_to_table(substring(q.tags from 2 for char_length(q.tags)-2), '><') as tagname
+    ) tag
+    where q.posttypeid = 1
+      and q.owneruserid is not null
+      and q.tags is not null
+      and q.creationdate >= (select date_trunc('month', max(creationdate)) - interval '12 months' from posts)
+    group by q.owneruserid, tag.tagname
+),
+top_tag_per_user as (
+    select user_id, tagname, views_by_tag, questions_by_tag
+    from (
+        select
+            ti.*,
+            rank() over (partition by ti.user_id order by views_by_tag desc nulls last, questions_by_tag desc nulls last, tagname) as rnk
+        from tag_influence ti
+    ) s
+    where rnk = 1
+),
+dupe_network as (
+    select
+        q.owneruserid as user_id,
+        count(distinct pl.relatedpostid) filter (where pl.linktypeid = 3) as dupes_marked_to,
+        count(distinct pl.postid) filter (where pl.linktypeid = 3) as dupes_from
+    from posts q
+    left join postlinks pl
+      on (pl.postid = q.id or pl.relatedpostid = q.id)
+     and pl.creationdate >= (select date_trunc('month', max(creationdate)) - interval '12 months' from postlinks)
+    where q.posttypeid = 1
+      and q.creationdate >= (select date_trunc('month', max(creationdate)) - interval '12 months' from posts)
+    group by q.owneruserid
+),
+accepted_answer_rate as (
+    select
+        u.id as user_id,
+        round(100.0 * sum(case when a.id = q.acceptedanswerid then 1 else 0 end) / nullif(count(a.id),0), 2) as accept_rate_pct
+    from users u
+    left join posts a
+      on a.owneruserid = u.id
+     and a.posttypeid = 2
+     and a.creationdate >= (select date_trunc('month', max(creationdate)) - interval '12 months' from posts)
+    left join posts q
+      on q.id = a.parentid
+     and q.posttypeid = 1
+    group by u.id
+),
+activity_union as (
+    select user_id, cast(questions_count as bigint) as acts, 'Q' as kind from question_activity
+    union all
+    select user_id, cast(answers_count as bigint), 'A' from answer_activity
+    union all
+    select user_id, cast(comments_count as bigint), 'C' from comment_activity
+),
+activity_rollup as (
+    select
+        user_id,
+        sum(acts) as total_acts,
+        sum(case when kind='Q' then acts else 0 end) as q_acts,
+        sum(case when kind='A' then acts else 0 end) as a_acts,
+        sum(case when kind='C' then acts else 0 end) as c_acts
+    from activity_union
+    group by user_id
+),
+recent_post_edits as (
+    select
+        ph.userid as user_id,
+        count(*) filter (where ph.posthistorytypeid in (4,5,6)) as edits_made,
+        count(*) filter (where ph.posthistorytypeid in (10)) as closes_cast,
+        max(ph.creationdate) as last_edit_date
+    from posthistory ph
+    where ph.creationdate >= (select date_trunc('month', max(creationdate)) - interval '12 months' from posthistory)
+    group by ph.userid
+),
+user_quality as (
+    select
+        u.user_id,
+        coalesce(aa.accept_rate_pct, 0) as accept_rate_pct,
+        coalesce(ra.edits_made,0) as edits_made,
+        coalesce(ra.closes_cast,0) as closes_cast,
+        case
+            when coalesce(aa.accept_rate_pct,0) >= 75 and coalesce(ra.edits_made,0) >= 5 then 'High'
+            when coalesce(aa.accept_rate_pct,0) >= 40 then 'Medium'
+            else 'Low'
+        end as quality_bucket
+    from recent_users u
+    left join accepted_answer_rate aa on aa.user_id = u.user_id
+    left join recent_post_edits ra on ra.user_id = u.user_id
+),
+leaderboard as (
+    select
+        ru.user_id,
+        ru.displayname,
+        ru.reputation,
+        ru.location,
+        ru.websiteurl,
+        ru.gold_badges,
+        ru.silver_badges,
+        ru.bronze_badges,
+        ar.total_acts,
+        ar.q_acts,
+        ar.a_acts,
+        ar.c_acts,
+        qa.questions_count,
+        qa.total_views,
+        qa.avg_nonzero_score,
+        aa.answers_count,
+        aa.positive_answers,
+        aa.distinct_questions_answered,
+        ca.comments_count,
+        ca.comment_score_sum,
+        pp.upvotes_cast,
+        pp.downvotes_cast,
+        pp.bounties_started,
+        pp.bounty_amount_total,
+        coalesce(tt.tagname, '(none)') as top_tag,
+        coalesce(tt.views_by_tag, 0) as top_tag_views,
+        coalesce(tt.questions_by_tag, 0) as top_tag_questions,
+        dn.dupes_marked_to,
+        dn.dupes_from,
+        uq.accept_rate_pct,
+        uq.quality_bucket,
+        ru.rn_global,
+        row_number() over (partition by uq.quality_bucket order by coalesce(ar.total_acts,0) desc, ru.reputation desc, ru.user_id) as rn_in_bucket
+    from recent_users ru
+    left join activity_rollup ar on ar.user_id = ru.user_id
+    left join question_activity qa on qa.user_id = ru.user_id
+    left join answer_activity aa on aa.user_id = ru.user_id
+    left join comment_activity ca on ca.user_id = ru.user_id
+    left join post_reactions pp on pp.user_id = ru.user_id
+    left join top_tag_per_user tt on tt.user_id = ru.user_id
+    left join dupe_network dn on dn.user_id = ru.user_id
+    left join user_quality uq on uq.user_id = ru.user_id
+),
+ranked as (
+    select
+        l.*,
+        dense_rank() over (order by
+            coalesce(l.total_acts,0) desc,
+            coalesce(l.accept_rate_pct,0) desc,
+            l.reputation desc,
+            l.gold_badges desc,
+            l.silver_badges desc,
+            l.bronze_badges desc,
+            l.user_id
+        ) as global_rank
+    from leaderboard l
+),
+outliers as (
+    select
+        r.*,
+        case
+            when coalesce(r.downvotes_cast,0) > coalesce(r.upvotes_cast,0) * 2 then 'Likely Harsh Voter'
+            when coalesce(r.total_views,0) > 100000 and coalesce(r.questions_count,0) <= 1 then 'One-Hit Wonder'
+            when coalesce(r.positive_answers,0) = 0 and coalesce(r.answers_count,0) > 10 then 'Needs Improvement'
+            else null
+        end as anomaly_flag
+    from ranked r
+)
+select
+    o.global_rank,
+    o.rn_in_bucket as rank_in_bucket,
+    o.quality_bucket,
+    o.user_id,
+    coalesce(o.displayname, '(anonymous)') as displayname,
+    o.location,
+    o.reputation,
+    o.gold_badges,
+    o.silver_badges,
+    o.bronze_badges,
+    o.total_acts,
+    o.q_acts,
+    o.a_acts,
+    o.c_acts,
+    o.questions_count,
+    o.total_views,
+    round(coalesce(o.avg_nonzero_score,0), 2) as avg_nonzero_score,
+    o.answers_count,
+    o.positive_answers,
+    o.distinct_questions_answered,
+    o.comments_count,
+    o.comment_score_sum,
+    o.upvotes_cast,
+    o.downvotes_cast,
+    o.bounties_started,
+    coalesce(o.bounty_amount_total,0) as bounty_amount_total,
+    o.top_tag,
+    o.top_tag_views,
+    o.top_tag_questions,
+    coalesce(o.dupes_marked_to,0) as dupes_marked_to,
+    coalesce(o.dupes_from,0) as dupes_from,
+    o.accept_rate_pct,
+    o.anomaly_flag,
+    case
+        when o.websiteurl like 'http%' then lower(split_part(split_part(o.websiteurl, '://', 2), '/', 1))
+        else null
+    end as website_host,
+    cast('2024-10-01 12:34:56' as timestamp) as generated_at
+from outliers o
+where (o.global_rank <= 100 or o.rn_in_bucket <= 20)
+  and coalesce(o.total_acts,0) > 0
+order by o.global_rank, o.user_id;

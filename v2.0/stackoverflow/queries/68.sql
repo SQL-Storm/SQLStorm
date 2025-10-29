@@ -1,0 +1,331 @@
+with
+-- recent active users with mixed null logic and string munging
+active_users as (
+    select
+        u.id as user_id,
+        coalesce(nullif(trim(u.DisplayName), ''), concat('user#', cast(u.Id as varchar))) as display_name,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Location,
+        u.UpVotes,
+        u.DownVotes,
+        greatest(u.UpVotes - coalesce(u.DownVotes, 0), 0) as net_votes_floor,
+        row_number() over (order by u.Reputation desc, u.Id) as rn_desc_rep
+    from Users u
+    where u.CreationDate >= (select date_trunc('year', max(CreationDate)) - interval '4 years' from Users)
+),
+-- questions and answers in the last N years with tags exploded
+recent_posts as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.ParentId,
+        p.AcceptedAnswerId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        case when p.Tags is not null and length(p.Tags) > 2
+             then string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')
+             else cast(array[] as text[]) end as tag_array
+    from Posts p
+    where p.CreationDate >= (select date_trunc('year', max(CreationDate)) - interval '4 years' from Posts)
+      and p.PostTypeId in (1,2)
+),
+-- compute per-post engagement using window functions
+post_engagement as (
+    select
+        rp.Id as post_id,
+        rp.PostTypeId,
+        rp.OwnerUserId,
+        rp.ParentId,
+        rp.AcceptedAnswerId,
+        rp.CreationDate,
+        rp.Score,
+        rp.ViewCount,
+        rp.Title,
+        rp.Tags,
+        rp.tag_array,
+        count(c.Id) filter (where c.Id is not null) as comment_count,
+        sum(cv.Score) filter (where cv.Id is not null and cv.Score is not null) as comment_score_sum,
+        count(distinct v2.Id) filter (where v2.VoteTypeId = 2) as upvote_count,
+        count(distinct v3.Id) filter (where v3.VoteTypeId = 3) as downvote_count,
+        avg(rp.Score) over (partition by rp.PostTypeId) as avg_score_by_type,
+        row_number() over (partition by rp.PostTypeId order by rp.Score desc nulls last, rp.ViewCount desc nulls last) as rn_score_desc
+    from recent_posts rp
+    left join Comments c on c.PostId = rp.Id
+    left join Comments cv on cv.PostId = rp.Id
+    left join Votes v2 on v2.PostId = rp.Id and v2.VoteTypeId = 2
+    left join Votes v3 on v3.PostId = rp.Id and v3.VoteTypeId = 3
+    group by rp.Id, rp.PostTypeId, rp.OwnerUserId, rp.ParentId, rp.AcceptedAnswerId, rp.CreationDate, rp.Score, rp.ViewCount, rp.Title, rp.Tags, rp.tag_array
+),
+-- answers with acceptance and parent question context
+answers_cte as (
+    select
+        pe.post_id as answer_id,
+        pe.OwnerUserId as answer_owner_id,
+        pe.ParentId as question_id,
+        pe.Score as answer_score,
+        pe.CreationDate as answer_created,
+        q.Score as question_score,
+        q.ViewCount as question_views,
+        (q.AcceptedAnswerId = pe.post_id) as is_accepted,
+        q.Title as question_title,
+        q.Tags as question_tags,
+        q.tag_array as question_tag_array
+    from post_engagement pe
+    join recent_posts q on q.Id = pe.ParentId and pe.PostTypeId = 2 and q.PostTypeId = 1
+),
+-- per-user aggregates combining questions and answers
+user_post_agg as (
+    select
+        au.user_id,
+        count(*) filter (where rp.PostTypeId = 1) as questions_count,
+        count(*) filter (where rp.PostTypeId = 2) as answers_count,
+        sum(rp.Score) as total_post_score,
+        sum(pe.upvote_count - pe.downvote_count) as total_net_votes,
+        count(*) filter (where rp.PostTypeId = 1 and rp.AcceptedAnswerId is not null) as accepted_questions,
+        count(*) filter (where rp.PostTypeId = 2 and exists (
+            select 1 from answers_cte a where a.answer_id = rp.Id and a.is_accepted
+        )) as accepted_answers,
+        max(pe.rn_score_desc) filter (where rp.PostTypeId = 1) as best_question_rank,
+        max(pe.rn_score_desc) filter (where rp.PostTypeId = 2) as best_answer_rank
+    from active_users au
+    left join recent_posts rp on rp.OwnerUserId = au.user_id
+    left join post_engagement pe on pe.post_id = rp.Id
+    group by au.user_id
+),
+-- badges recent window per user
+recent_badges as (
+    select
+        b.UserId,
+        b.Name,
+        b.Class,
+        b.Date,
+        count(*) over (partition by b.UserId) as badge_count_user,
+        row_number() over (partition by b.UserId order by b.Date desc, b.Id desc) as rn_badge
+    from Badges b
+    where b.Date >= (select date_trunc('year', max(Date)) - interval '4 years' from Badges)
+),
+-- tag popularity baseline
+tag_baseline as (
+    select
+        lower(t.TagName) as tagname,
+        t.Count as historical_count
+    from Tags t
+),
+-- derive per-user top tags from their questions using set-returning unnest
+user_top_tags as (
+    select
+        rp.OwnerUserId as user_id,
+        lower(t.tag) as tagname,
+        count(*) as tag_freq,
+        avg(rp.Score) as avg_tag_score,
+        sum(rp.ViewCount) as sum_tag_views,
+        row_number() over (partition by rp.OwnerUserId order by count(*) desc, avg(rp.Score) desc nulls last, lower(t.tag)) as rn_user_tag
+    from recent_posts rp
+    cross join lateral unnest(coalesce(rp.tag_array, cast(array[] as text[]))) as t(tag)
+    where rp.PostTypeId = 1
+    group by rp.OwnerUserId, lower(t.tag)
+),
+-- derive velocity metrics per user per quarter
+user_activity_quarters as (
+    select
+        rp.OwnerUserId as user_id,
+        date_trunc('quarter', rp.CreationDate) as qtr,
+        count(*) as posts_in_qtr,
+        avg(rp.Score) as avg_score_qtr,
+        count(*) filter (where rp.PostTypeId = 1) as questions_in_qtr,
+        count(*) filter (where rp.PostTypeId = 2) as answers_in_qtr
+    from recent_posts rp
+    group by rp.OwnerUserId, date_trunc('quarter', rp.CreationDate)
+),
+-- rank quarters by activity
+user_qtr_rank as (
+    select
+        uaq.*,
+        dense_rank() over (partition by uaq.user_id order by posts_in_qtr desc, avg_score_qtr desc nulls last, qtr desc) as activity_rank
+    from user_activity_quarters uaq
+),
+-- comments sentiment-ish proxy using simple expressions
+user_comment_proxy as (
+    select
+        c.UserId as user_id,
+        count(*) as total_comments,
+        sum(c.Score) as sum_comment_scores,
+        avg(c.Score) as avg_comment_score,
+        sum(case when position('thanks' in lower(c.Text)) > 0 then 1 else 0 end) as thanks_hits,
+        sum(case when position('help' in lower(c.Text)) > 0 then 1 else 0 end) as help_hits
+    from Comments c
+    where c.CreationDate >= (select date_trunc('year', max(CreationDate)) - interval '4 years' from Comments)
+      and c.UserId is not null
+    group by c.UserId
+),
+-- post closures and reasons
+closures as (
+    select
+        ph.PostId,
+        ph.CreationDate as closed_at,
+        ph.Comment as close_reason_id,
+        crt.Name as close_reason_name
+    from PostHistory ph
+    left join CloseReasonTypes crt on cast(crt.Id as varchar) = nullif(ph.Comment, '')
+    where ph.PostHistoryTypeId = 10
+),
+-- combine question closure data
+question_closure as (
+    select
+        rp.Id as question_id,
+        min(c.closed_at) as first_closed_at,
+        max(case when c.closed_at = first_closed_at_inner then c.close_reason_name else null end) as first_close_reason
+    from recent_posts rp
+    left join (
+      select c2.PostId, c2.closed_at, c2.close_reason_name,
+             min(c2.closed_at) over (partition by c2.PostId) as first_closed_at_inner
+      from closures c2
+    ) c on c.PostId = rp.Id
+    where rp.PostTypeId = 1
+    group by rp.Id, first_closed_at_inner
+),
+-- compute duplicate link density
+duplicate_links as (
+    select
+        pl.PostId as question_id,
+        count(*) filter (where pl.LinkTypeId = 3) as dup_links
+    from PostLinks pl
+    group by pl.PostId
+),
+-- user vote patterns
+user_votes as (
+    select
+        v.UserId as user_id,
+        count(*) filter (where v.VoteTypeId = 2) as cast_upvotes,
+        count(*) filter (where v.VoteTypeId = 3) as cast_downvotes,
+        sum(coalesce(v.BountyAmount,0)) as bounty_total
+    from Votes v
+    where v.UserId is not null
+      and v.CreationDate >= (select date_trunc('year', max(CreationDate)) - interval '4 years' from Votes)
+    group by v.UserId
+),
+-- aggressive filter for "interesting" questions
+interesting_questions as (
+    select
+        pe.post_id as question_id,
+        pe.OwnerUserId as user_id,
+        pe.Score,
+        pe.ViewCount,
+        pe.comment_count,
+        pe.upvote_count,
+        pe.downvote_count,
+        qc.first_closed_at,
+        qc.first_close_reason,
+        dl.dup_links,
+        case when pe.ViewCount > 0 then (cast(pe.upvote_count as numeric) - cast(pe.downvote_count as numeric)) / cast(pe.ViewCount as numeric) else null end as vote_view_ratio
+    from post_engagement pe
+    left join question_closure qc on qc.question_id = pe.post_id
+    left join duplicate_links dl on dl.question_id = pe.post_id
+    where pe.PostTypeId = 1
+      and (
+            (pe.Score >= coalesce((select avg(Score) from recent_posts where PostTypeId = 1), 0) + 5)
+         or (pe.ViewCount >= coalesce((select percentile_cont(0.9) within group (order by ViewCount) from recent_posts where PostTypeId = 1), 0))
+         or (qc.first_closed_at is not null and coalesce(dl.dup_links,0) >= 1)
+      )
+),
+-- union of users that either asked interesting questions or posted accepted answers
+seed_users as (
+    select iq.user_id
+    from interesting_questions iq
+    union
+    select a.answer_owner_id
+    from answers_cte a
+    where a.is_accepted
+),
+-- final metric assembly per seed user
+final_user_metrics as (
+    select
+        su.user_id,
+        au.display_name,
+        au.Reputation,
+        au.CreationDate,
+        au.LastAccessDate,
+        au.Location,
+        upa.questions_count,
+        upa.answers_count,
+        upa.total_post_score,
+        upa.total_net_votes,
+        coalesce(upa.accepted_questions, 0) as accepted_questions,
+        coalesce(upa.accepted_answers, 0) as accepted_answers,
+        rbn.Name as most_recent_badge_name,
+        rbn.Class as most_recent_badge_class,
+        rbn.Date as most_recent_badge_date,
+        utt.tagname as top_tag,
+        utt.tag_freq as top_tag_freq,
+        utt.avg_tag_score as top_tag_avg_score,
+        tb.historical_count as top_tag_hist_count,
+        uq.qtr as best_qtr,
+        uq.posts_in_qtr,
+        uq.avg_score_qtr,
+        ucp.total_comments,
+        ucp.sum_comment_scores,
+        ucp.avg_comment_score,
+        ucp.thanks_hits,
+        ucp.help_hits,
+        uv.cast_upvotes,
+        uv.cast_downvotes,
+        uv.bounty_total,
+        count(distinct iq.question_id) as interesting_questions_count,
+        avg(iq.vote_view_ratio) as avg_vote_view_ratio
+    from seed_users su
+    left join active_users au on au.user_id = su.user_id
+    left join user_post_agg upa on upa.user_id = su.user_id
+    left join recent_badges rbn on rbn.UserId = su.user_id and rbn.rn_badge = 1
+    left join user_top_tags utt on utt.user_id = su.user_id and utt.rn_user_tag = 1
+    left join tag_baseline tb on tb.tagname = utt.tagname
+    left join user_qtr_rank uq on uq.user_id = su.user_id and uq.activity_rank = 1
+    left join user_comment_proxy ucp on ucp.user_id = su.user_id
+    left join user_votes uv on uv.user_id = su.user_id
+    left join interesting_questions iq on iq.user_id = su.user_id
+    group by
+        su.user_id, au.display_name, au.Reputation, au.CreationDate, au.LastAccessDate, au.Location,
+        upa.questions_count, upa.answers_count, upa.total_post_score, upa.total_net_votes, upa.accepted_questions, upa.accepted_answers,
+        rbn.Name, rbn.Class, rbn.Date,
+        utt.tagname, utt.tag_freq, utt.avg_tag_score, tb.historical_count,
+        uq.qtr, uq.posts_in_qtr, uq.avg_score_qtr,
+        ucp.total_comments, ucp.sum_comment_scores, ucp.avg_comment_score, ucp.thanks_hits, ucp.help_hits,
+        uv.cast_upvotes, uv.cast_downvotes, uv.bounty_total
+)
+select
+    fum.*,
+    ntile(10) over (order by coalesce(fum.total_post_score,0) desc, coalesce(fum.Reputation,0) desc) as decile_by_score,
+    dense_rank() over (order by coalesce(fum.accepted_answers,0) desc, coalesce(fum.answers_count,0) desc) as rank_by_accepts,
+    case
+        when coalesce(fum.top_tag_hist_count,0) = 0 then 'n/a'
+        when fum.top_tag_hist_count > 100000 then 'mega'
+        when fum.top_tag_hist_count > 10000 then 'large'
+        when fum.top_tag_hist_count > 1000 then 'medium'
+        else 'small'
+    end as top_tag_bucket
+from final_user_metrics fum
+where
+    (
+        coalesce(fum.answers_count,0) + coalesce(fum.questions_count,0) >= 5
+        and (fum.accepted_answers is null or fum.accepted_answers >= 1 or fum.accepted_questions >= 1)
+    )
+    and (
+        fum.avg_vote_view_ratio is null
+        or fum.avg_vote_view_ratio >= (
+            select avg(x.avg_vote_view_ratio) from (
+                select avg(iq.vote_view_ratio) as avg_vote_view_ratio
+                from interesting_questions iq
+                group by iq.user_id
+            ) x
+        )
+    )
+order by
+    rank_by_accepts asc,
+    decile_by_score asc,
+    fum.user_id
+limit 200;

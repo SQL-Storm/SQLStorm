@@ -1,0 +1,264 @@
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END) AS AvgQuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS TotalAnswerScore,
+        MAX(u.LastAccessDate) AS LastAccessDate,
+        RANK() OVER (ORDER BY u.Reputation DESC, COUNT(DISTINCT p.Id) DESC, u.Id) AS UserRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    WHERE u.CreationDate >= TIMESTAMP '2020-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+    HAVING COUNT(DISTINCT p.Id) > 5
+),
+ParsedPostTags AS (
+    SELECT
+        p.Id AS PostId,
+        UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR GREATEST(LENGTH(p.Tags) - 2,0)), '><')) AS TagName
+    FROM Posts p
+    WHERE p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2
+      AND p.PostTypeId IN (1, 4, 5)
+),
+TagPopularity AS (
+    SELECT
+        ppt.TagName,
+        COUNT(DISTINCT ppt.PostId) AS TaggedPostCount,
+        AVG(p.Score) AS AvgScoreForTagPosts
+    FROM ParsedPostTags ppt
+    JOIN Posts p ON ppt.PostId = p.Id
+    GROUP BY ppt.TagName
+    HAVING COUNT(DISTINCT ppt.PostId) > 50
+),
+PostDetails AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate AS PostCreationDate,
+        p.LastActivityDate,
+        p.ClosedDate,
+        p.Tags,
+        p.AcceptedAnswerId,
+        (p.Score * 0.5 + COALESCE(p.ViewCount, 0) * 0.01 + COALESCE(p.AnswerCount, 0) * 0.8 + COALESCE(p.CommentCount, 0) * 0.6 + COALESCE(p.FavoriteCount, 0) * 1.5) AS EngagementScore,
+        EXISTS (
+            SELECT 1
+            FROM Comments sc
+            WHERE sc.PostId = p.Id
+              AND sc.Score > COALESCE((SELECT AVG(scc.Score) FROM Comments scc WHERE scc.UserId = sc.UserId AND scc.PostId <> sc.PostId), 0)
+        ) AS HasHighScoreCommentsByOwner,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId, EXTRACT(YEAR FROM p.CreationDate)) AS AvgOwnerScoreThisYear
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+      AND p.CreationDate >= TIMESTAMP '2021-01-01'
+),
+PostEditHistory AS (
+    SELECT
+        ph.PostId,
+        COUNT(DISTINCT ph.Id) AS EditCount,
+        MAX(ph.CreationDate) AS LastEditDate,
+        (SELECT u2.DisplayName FROM Users u2 WHERE u2.Id = ph.UserId ORDER BY ph.CreationDate DESC LIMIT 1) AS LastEditorDisplayName_Subquery,
+        ph.UserId
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6)
+    GROUP BY ph.PostId, ph.UserId
+),
+UsersWithHighRepPosts AS (
+    SELECT
+        ua.DisplayName AS UserDisplayName,
+        ua.Reputation,
+        pd.Title,
+        pd.PostId,
+        pd.PostTypeId,
+        pd.Score AS PostScore,
+        pd.EngagementScore,
+        pd.AvgOwnerScoreThisYear,
+        ph.EditCount,
+        ph.LastEditDate,
+        ph.LastEditorDisplayName_Subquery,
+        COALESCE(tp.TagName, 'Untagged') AS PrimaryTagName,
+        COALESCE(tp.AvgScoreForTagPosts, 0) AS AvgScoreForPrimaryTag,
+        COALESCE(pd.ClosedDate, TIMESTAMP '9999-12-31') AS EffectiveClosedDate,
+        CASE
+            WHEN pd.Title ILIKE '%sql%' OR pd.Tags ILIKE '%<sql>%' THEN 'SQL Related'
+            WHEN pd.Title ILIKE '%javascript%' OR pd.Tags ILIKE '%<javascript>%' THEN 'JavaScript Related'
+            WHEN pd.Title ILIKE '%python%' OR pd.Tags ILIKE '%<python>%' THEN 'Python Related'
+            WHEN pd.Tags ILIKE '%<c#>%' OR pd.Tags ILIKE '%<java>%' THEN 'Backend Related'
+            ELSE 'Other Tech'
+        END AS TechCategory,
+        ROW_NUMBER() OVER (PARTITION BY
+            CASE
+                WHEN pd.Title ILIKE '%sql%' OR pd.Tags ILIKE '%<sql>%' THEN 'SQL Related'
+                WHEN pd.Title ILIKE '%javascript%' OR pd.Tags ILIKE '%<javascript>%' THEN 'JavaScript Related'
+                WHEN pd.Title ILIKE '%python%' OR pd.Tags ILIKE '%<python>%' THEN 'Python Related'
+                WHEN pd.Tags ILIKE '%<c#>%' OR pd.Tags ILIKE '%<java>%' THEN 'Backend Related'
+                ELSE 'Other Tech'
+            END
+            ORDER BY pd.EngagementScore DESC, pd.PostCreationDate DESC
+        ) AS RankWithinTechCategory,
+        (SELECT COUNT(DISTINCT b.Id) FROM Badges b WHERE b.UserId = ua.UserId AND b.Class = 1) AS GoldBadgeCount,
+        (SELECT COUNT(DISTINCT vt.Id) FROM Votes vt WHERE vt.PostId = pd.PostId AND vt.VoteTypeId = 2) AS UpVoteCountForPost
+    FROM UserActivity ua
+    INNER JOIN PostDetails pd ON ua.UserId = pd.OwnerUserId
+    LEFT JOIN PostEditHistory ph ON pd.PostId = ph.PostId
+    LEFT JOIN LATERAL (
+        SELECT pt.TagName
+        FROM ParsedPostTags pt
+        WHERE pt.PostId = pd.PostId
+        ORDER BY pt.TagName
+        LIMIT 1
+    ) pt_first_tag ON TRUE
+    LEFT JOIN TagPopularity tp ON pt_first_tag.TagName = tp.TagName
+    WHERE ua.UserRank <= 500
+      AND pd.Score >= 10
+      AND pd.LastActivityDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year')
+      AND pd.HasHighScoreCommentsByOwner
+      AND pd.PostTypeId = 1
+      AND pd.Title IS NOT NULL
+      AND pd.AcceptedAnswerId IS NOT NULL
+),
+UsersWithHighEngagementAnswers AS (
+    SELECT
+        ua.DisplayName AS UserDisplayName,
+        ua.Reputation,
+        pd.Title,
+        pd.PostId,
+        pd.PostTypeId,
+        pd.Score AS PostScore,
+        pd.EngagementScore,
+        pd.AvgOwnerScoreThisYear,
+        ph.EditCount,
+        ph.LastEditDate,
+        ph.LastEditorDisplayName_Subquery,
+        COALESCE(tp.TagName, 'Untagged') AS PrimaryTagName,
+        COALESCE(tp.AvgScoreForTagPosts, 0) AS AvgScoreForPrimaryTag,
+        COALESCE(pd.ClosedDate, TIMESTAMP '9999-12-31') AS EffectiveClosedDate,
+        CASE
+            WHEN pd.Title ILIKE '%sql%' OR pd.Tags ILIKE '%<sql>%' THEN 'SQL Related'
+            WHEN pd.Title ILIKE '%javascript%' OR pd.Tags ILIKE '%<javascript>%' THEN 'JavaScript Related'
+            WHEN pd.Tags ILIKE '%<c#>%' OR pd.Tags ILIKE '%<java>%' THEN 'Backend Related'
+            ELSE 'Other Tech'
+        END AS TechCategory,
+        ROW_NUMBER() OVER (PARTITION BY
+            CASE
+                WHEN pd.Title ILIKE '%sql%' OR pd.Tags ILIKE '%<sql>%' THEN 'SQL Related'
+                WHEN pd.Title ILIKE '%javascript%' OR pd.Tags ILIKE '%<javascript>%' THEN 'JavaScript Related'
+                WHEN pd.Tags ILIKE '%<c#>%' OR pd.Tags ILIKE '%<java>%' THEN 'Backend Related'
+                ELSE 'Other Tech'
+            END
+            ORDER BY pd.EngagementScore DESC, pd.PostCreationDate DESC
+        ) AS RankWithinTechCategory,
+        (SELECT COUNT(DISTINCT b.Id) FROM Badges b WHERE b.UserId = ua.UserId AND b.Class = 2) AS SilverBadgeCount,
+        (SELECT COUNT(DISTINCT q.Id) FROM Posts q WHERE q.AcceptedAnswerId = pd.PostId) AS AcceptedAnswerCount
+    FROM UserActivity ua
+    INNER JOIN PostDetails pd ON ua.UserId = pd.OwnerUserId
+    LEFT JOIN PostEditHistory ph ON pd.PostId = ph.PostId
+    LEFT JOIN LATERAL (
+        SELECT pt.TagName
+        FROM ParsedPostTags pt
+        WHERE pt.PostId = pd.PostId
+        ORDER BY pt.TagName
+        LIMIT 1
+    ) pt_first_tag ON TRUE
+    LEFT JOIN TagPopularity tp ON pt_first_tag.TagName = tp.TagName
+    WHERE ua.TotalComments > 20
+      AND pd.Score >= 15
+      AND pd.PostTypeId = 2
+      AND pd.LastActivityDate IS NOT NULL
+      AND pd.OwnerUserId IS NOT NULL
+),
+UsersWhoVotedButNeverPosted AS (
+    SELECT DISTINCT u.Id AS UserId, u.DisplayName
+    FROM Users u
+    JOIN Votes v ON u.Id = v.UserId
+    EXCEPT
+    SELECT DISTINCT u.Id, u.DisplayName
+    FROM Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+)
+SELECT
+    'Question' AS PostTypeCategory,
+    hrp.UserDisplayName,
+    hrp.Reputation,
+    hrp.Title,
+    hrp.PostScore,
+    hrp.EngagementScore,
+    hrp.PrimaryTagName,
+    hrp.TechCategory,
+    hrp.RankWithinTechCategory,
+    hrp.GoldBadgeCount AS RelatedBadgeCount,
+    hrp.UpVoteCountForPost AS SpecificVoteCount,
+    CASE WHEN uvnp.UserId IS NOT NULL THEN 'Voter Only' ELSE 'Poster & Voter' END AS UserEngagementStatus,
+    COALESCE(EXTRACT(DAY FROM (TIMESTAMP '2024-10-01 12:34:56' - hrp.LastEditDate)), -1) AS DaysSinceLastEdit,
+    (
+        SELECT COALESCE(SUM(c.Score), 0)
+        FROM Comments c
+        WHERE c.PostId = hrp.PostId
+          AND c.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6 months')
+          AND c.UserId = (
+              SELECT phu.UserId
+              FROM PostHistory phu
+              WHERE phu.PostId = hrp.PostId AND phu.PostHistoryTypeId = 5
+              ORDER BY phu.CreationDate DESC
+              LIMIT 1
+          )
+    ) AS LastEditorRecentCommentScore,
+    AVG(hrp.EngagementScore) OVER (PARTITION BY hrp.PrimaryTagName) AS AvgEngagementScoreForTag,
+    MAX(hrp.PostScore) OVER (PARTITION BY hrp.TechCategory) AS MaxPostScoreInTechCategory,
+    CASE WHEN hrp.EngagementScore > 100 AND EXTRACT(DAY FROM (TIMESTAMP '2024-10-01 12:34:56' - hrp.PostCreationDate)) < 90 THEN TRUE ELSE FALSE END AS IsTrendingPost
+FROM UsersWithHighRepPosts hrp
+LEFT JOIN UsersWhoVotedButNeverPosted uvnp ON hrp.UserDisplayName = uvnp.DisplayName
+WHERE hrp.RankWithinTechCategory <= 20
+  AND hrp.Reputation > 5000
+  AND hrp.EngagementScore > 40
+
+UNION ALL
+
+SELECT
+    'Answer' AS PostTypeCategory,
+    hea.UserDisplayName,
+    hea.Reputation,
+    hea.Title,
+    hea.PostScore,
+    hea.EngagementScore,
+    hea.PrimaryTagName,
+    hea.TechCategory,
+    hea.RankWithinTechCategory,
+    hea.SilverBadgeCount AS RelatedBadgeCount,
+    hea.AcceptedAnswerCount AS SpecificVoteCount,
+    CASE WHEN uvnp.UserId IS NOT NULL THEN 'Voter Only' ELSE 'Poster & Voter' END AS UserEngagementStatus,
+    COALESCE(EXTRACT(DAY FROM (TIMESTAMP '2024-10-01 12:34:56' - hea.LastEditDate)), -1) AS DaysSinceLastEdit,
+    (
+        SELECT COALESCE(SUM(c.Score), 0)
+        FROM Comments c
+        WHERE c.PostId = hea.PostId
+          AND c.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6 months')
+          AND c.UserId = (
+              SELECT phu.UserId
+              FROM PostHistory phu
+              WHERE phu.PostId = hea.PostId AND phu.PostHistoryTypeId = 5
+              ORDER BY phu.CreationDate DESC
+              LIMIT 1
+          )
+    ) AS LastEditorRecentCommentScore,
+    AVG(hea.EngagementScore) OVER (PARTITION BY hea.PrimaryTagName) AS AvgEngagementScoreForTag,
+    MAX(hea.PostScore) OVER (PARTITION BY hea.TechCategory) AS MaxPostScoreInTechCategory,
+    CASE WHEN hea.EngagementScore > 80 AND hea.AcceptedAnswerCount > 0 THEN TRUE ELSE FALSE END AS IsTrendingPost
+FROM UsersWithHighEngagementAnswers hea
+LEFT JOIN UsersWhoVotedButNeverPosted uvnp ON hea.UserDisplayName = uvnp.DisplayName
+WHERE hea.RankWithinTechCategory <= 10
+  AND hea.Reputation > 2000
+  AND hea.PostScore > 20
+ORDER BY Reputation DESC, EngagementScore DESC
+LIMIT 2000;

@@ -1,0 +1,82 @@
+-- {"query": "4073.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1067} 
+WITH RankedPostEdits AS (
+    SELECT
+        ph.PostId,
+        ph.UserId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate DESC) as rn
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6) -- Edits to Title, Body, or Tags
+),
+UserContributionSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS QuestionsPosted,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersPosted,
+        COUNT(DISTINCT b.Id) AS BadgesEarned,
+        MAX(u.Reputation) AS MaxReputation
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName
+),
+HighReputationUsers AS (
+    SELECT
+        UserId
+    FROM UserContributionSummary
+    WHERE MaxReputation > 100000
+),
+RecentQuestions AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate AS QuestionCreationDate,
+        p.Score AS QuestionScore,
+        ROW_NUMBER() OVER (ORDER BY p.CreationDate DESC) as RecentQuestionRank
+    FROM Posts p
+    WHERE p.PostTypeId = 1 -- Questions
+      AND p.CreationDate >= DATE('now', '-30 days')
+),
+QuestionAnswerStats AS (
+    SELECT
+        q.QuestionId,
+        COUNT(a.Id) AS AnswerCount,
+        SUM(a.Score) AS TotalAnswerScore,
+        AVG(a.Score) AS AverageAnswerScore,
+        MAX(a.Score) AS MaxAnswerScore,
+        MIN(a.Score) AS MinAnswerScore,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = q.QuestionId AND c.UserId IS NOT NULL) AS CommentCountOnQuestion
+    FROM RecentQuestions q
+    LEFT JOIN Posts a ON q.QuestionId = a.ParentId AND a.PostTypeId = 2 -- Answers
+    GROUP BY q.QuestionId
+)
+SELECT
+    rq.QuestionId,
+    rq.Title,
+    u.DisplayName AS QuestionOwnerDisplayName,
+    rq.QuestionCreationDate,
+    rq.QuestionScore,
+    COALESCE(qas.AnswerCount, 0) AS ActualAnswerCount,
+    COALESCE(qas.TotalAnswerScore, 0) AS TotalAnswerScore,
+    qas.AverageAnswerScore,
+    qas.MaxAnswerScore,
+    qas.MinAnswerScore,
+    qas.CommentCountOnQuestion,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = rq.QuestionId AND pl.LinkTypeId = 3) AS DuplicateLinksToThisQuestion,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.RelatedPostId = rq.QuestionId AND pl.LinkTypeId = 1) AS LinkedFromOtherQuestions,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = rq.QuestionId AND ph.PostHistoryTypeId = 10) AS CloseVoteCount,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = rq.QuestionId AND ph.PostHistoryTypeId = 12) AS DeleteVoteCount,
+    CASE WHEN hr.UserId IS NOT NULL THEN 'High Reputation User' ELSE 'Standard User' END AS OwnerReputationTier,
+    CASE WHEN rpe.UserId IS NOT NULL THEN 'Has Recent Edits' ELSE 'No Recent Edits' END AS EditStatus,
+    CASE WHEN rq.QuestionScore > 0 THEN 'Positive Score' WHEN rq.QuestionScore < 0 THEN 'Negative Score' ELSE 'Zero Score' END AS ScoreCategory,
+    UPPER(SUBSTRING(rq.Title, 1, 1)) || LOWER(SUBSTRING(rq.Title, 2)) AS FormattedTitle -- Title with first letter capitalized
+FROM RecentQuestions rq
+LEFT JOIN Users u ON rq.OwnerUserId = u.Id
+LEFT JOIN QuestionAnswerStats qas ON rq.QuestionId = qas.QuestionId
+LEFT JOIN HighReputationUsers hr ON rq.OwnerUserId = hr.UserId
+LEFT JOIN RankedPostEdits rpe ON rq.QuestionId = rpe.PostId AND rpe.rn = 1 -- Get the most recent edit for each post
+WHERE rq.RecentQuestionRank <= 100 -- Limit to the top 100 most recent questions
+ORDER BY rq.RecentQuestionRank;

@@ -1,0 +1,85 @@
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id ELSE NULL END) AS TotalQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id ELSE NULL END) AS TotalAnswers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 3 THEN p.Id ELSE NULL END) AS TotalWikis,
+    SUM(p.Score) AS TotalScore,
+    SUM(p.ViewCount) AS TotalViews,
+    MAX(p.LastActivityDate) AS LastActivity,
+    MIN(p.CreationDate) AS FirstPost,
+    MAX(p.CreationDate) AS LastPost,
+    b.Class,
+    b.TagBased,
+    COALESCE(SUM(v.TotalBounty), 0) AS TotalBounty,
+    COALESCE(SUM(
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 
+                (SELECT COUNT(*) FROM Posts p2 WHERE p2.PostTypeId = 2 AND p2.AcceptedAnswerId = p.Id)
+            ELSE 
+                0
+        END
+    ), 0) AS AcceptedAnswerCount,
+    c.TotalComments,
+    ph.TotalEdits,
+    COALESCE(t.TagCount, 0) AS TagCount,
+    t.ExcerptPostId AS TagExcerptPostId,
+    t.WikiPostId AS TagWikiPostId,
+    COALESCE(bg.BadgeCount, 0) AS BadgeCount,
+    COALESCE(wiki.WikiCount, 0) AS WikiCount
+FROM 
+    Users u
+LEFT JOIN 
+    (SELECT UserId, COUNT(Id) AS TotalComments 
+     FROM Comments 
+     GROUP BY UserId) c ON u.Id = c.UserId
+LEFT JOIN 
+    (SELECT UserId, COUNT(Id) AS TotalEdits 
+     FROM PostHistory 
+     WHERE PostHistoryTypeId IN (2, 5, 6, 8, 9) 
+     GROUP BY UserId) ph ON u.Id = ph.UserId
+LEFT JOIN 
+    (SELECT UserId, COUNT(DISTINCT Id) AS BadgeCount 
+     FROM Badges 
+     GROUP BY UserId) bg ON u.Id = bg.UserId
+LEFT JOIN 
+    (SELECT OwnerUserId, Id, CreationDate, LastActivityDate, Score, ViewCount, PostTypeId, AcceptedAnswerId
+     FROM Posts) p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    (SELECT PostId, SUM(CASE WHEN VoteTypeId = 8 THEN BountyAmount ELSE 0 END) AS TotalBounty 
+     FROM Votes 
+     GROUP BY PostId) v ON p.Id = v.PostId
+LEFT JOIN 
+    (SELECT OwnerUserId, COUNT(DISTINCT Id) AS WikiCount 
+     FROM Posts 
+     WHERE PostTypeId = 3 
+     GROUP BY OwnerUserId) wiki ON u.Id = wiki.OwnerUserId
+LEFT JOIN 
+    (SELECT PostId, COUNT(*) AS TagCount, 
+            MIN(CASE WHEN IsModeratorOnly = 0 THEN Id ELSE NULL END) AS ExcerptPostId, 
+            MIN(CASE WHEN IsRequired = 0 THEN Id ELSE NULL END) AS WikiPostId 
+     FROM Tags 
+     GROUP BY PostId) t ON p.Id = t.PostId
+LEFT JOIN
+    Badges b ON u.Id = b.UserId
+WHERE 
+    u.Reputation >= 1000
+    AND u.LastAccessDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30' DAY)
+    AND (SELECT COUNT(*) FROM Badges WHERE UserId = u.Id AND Class = 1) > 0
+GROUP BY 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    b.Class,
+    b.TagBased,
+    c.TotalComments,
+    ph.TotalEdits,
+    t.TagCount,
+    t.ExcerptPostId,
+    t.WikiPostId,
+    bg.BadgeCount,
+    wiki.WikiCount
+ORDER BY 
+    u.Reputation DESC, 
+    TotalViews DESC;

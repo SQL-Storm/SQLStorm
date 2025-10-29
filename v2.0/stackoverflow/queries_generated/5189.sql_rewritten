@@ -1,0 +1,116 @@
+-- {"query": "5189.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 853} 
+WITH
+RecentHot AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.Tags,
+        p.LastActivityDate,
+        p.CommentCount,
+        p.FavoriteCount,
+        -- window: rank by activity per day
+        ROW_NUMBER() OVER (PARTITION BY CAST(p.CreationDate AS DATE)
+                           ORDER BY p.LastActivityDate DESC, p.Score DESC) AS rn_day
+    FROM Posts p
+    WHERE p.PostTypeId = 1 -- questions
+      AND p.ClosedDate IS NULL
+),
+TopTags AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0
+),
+UserPerf AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.AccountId,
+        -- derived activity score
+        (COALESCE(u.UpVotes,0) - COALESCE(u.DownVotes,0)) * 2
+        + COALESCE((SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '365 days'), 0) AS ActivityScore
+    FROM Users u
+),
+CrossLinks AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name AS LinkTypeName
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    WHERE lt.Name IN ('Linked','Duplicate')
+),
+Flagged AS (
+    SELECT
+        v.PostId,
+        v.VoteTypeId,
+        v.UserId,
+        v.CreationDate,
+        v.BountyAmount
+    FROM Votes v
+    WHERE v.VoteTypeId IN (14,16) -- ModeratorReview, ApproveEditSuggestion as proxy for activity
+),
+Agg AS (
+    SELECT
+        r.PostId,
+        r.Title,
+        r.CreationDate,
+        r.LastActivityDate,
+        r.Score,
+        r.ViewCount,
+        r.OwnerUserId,
+        r.Tags,
+        r.CommentCount,
+        r.FavoriteCount,
+        -- number of related posts via PostLinks
+        (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = r.PostId) AS LinkCount,
+        -- number of comments
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = r.PostId) AS CommentNum
+    FROM RecentHot r
+    WHERE r.rn_day = 1
+)
+SELECT
+    a.PostId,
+    a.Title,
+    a.CreationDate,
+    a.LastActivityDate,
+    a.Score,
+    a.ViewCount,
+    a.OwnerUserId,
+    a.Tags,
+    a.CommentNum,
+    a.FavoriteCount,
+    ul.DisplayName AS OwnerDisplayName,
+    u.Reputation,
+    (SELECT STRING_AGG(ct.Name, ',') FROM (SELECT DISTINCT v2.VoteTypeId FROM Votes v2 WHERE v2.PostId = a.PostId) vb
+      JOIN VoteTypes ct ON vb.VoteTypeId = ct.Id
+    ) AS VoteTypesOnPost,
+    COALESCE(lc.LinkCount,0) AS LinkCount,
+    COALESCE(cn.CommentNum,0) AS CommentCount
+FROM Agg a
+LEFT JOIN Users ul ON a.OwnerUserId = ul.Id
+LEFT JOIN Users u ON ul.Id = u.Id
+LEFT JOIN (
+    SELECT DISTINCT p.Id, p.OwnerUserId
+    FROM Posts p
+) x ON a.PostId = x.Id
+LEFT JOIN CrossLinks cl ON cl.PostId = a.PostId
+LEFT JOIN (
+    SELECT PostId, COUNT(*) AS CommentNum
+    FROM Comments
+    GROUP BY PostId
+) cn ON a.PostId = cn.PostId
+ORDER BY a.LastActivityDate DESC
+LIMIT 100;

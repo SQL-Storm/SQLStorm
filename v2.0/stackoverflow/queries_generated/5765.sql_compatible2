@@ -1,0 +1,65 @@
+WITH
+RecentActivePosts AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.LastActivityDate DESC) AS rn
+  FROM Posts p
+  WHERE p.LastActivityDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days'
+),
+TopTags AS (
+  SELECT
+    tag_name.tag AS tag,
+    AVG(p.Score) AS avg_score,
+    SUM(p.ViewCount) AS total_views,
+    COUNT(*) AS post_count
+  FROM RecentActivePosts p
+  CROSS JOIN LATERAL (
+    SELECT regexp_split_to_table(p.Tags, ',') AS tag
+  ) AS tag_name
+  GROUP BY tag_name.tag
+  HAVING COUNT(*) > 5
+),
+TagCrossStats AS (
+  SELECT
+    tt.tag,
+    tt.post_count,
+    tt.avg_score,
+    tt.total_views,
+    AVG(CASE WHEN posts_inner.PostTypeId = 2 THEN posts_inner.Score END) AS avg_answer_score,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes_for_tag,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes_for_tag
+  FROM TopTags tt
+  LEFT JOIN LATERAL (
+    SELECT p2.*
+    FROM Posts p2
+    WHERE p2.Id IN (
+      SELECT pl.PostId
+      FROM PostLinks pl
+      WHERE pl.RelatedPostId = p2.Id AND pl.LinkTypeId = 1
+    )
+  ) AS posts_inner ON true
+  LEFT JOIN Votes v ON v.PostId = posts_inner.Id
+  GROUP BY tt.tag, tt.post_count, tt.avg_score, tt.total_views
+)
+SELECT
+  tt.tag,
+  tt.post_count,
+  tt.avg_score,
+  tt.total_views,
+  COALESCE(a.avg_answer_score, 0) AS avg_answer_score,
+  COALESCE(a.upvotes_for_tag, 0) AS upvotes_for_tag,
+  COALESCE(a.downvotes_for_tag, 0) AS downvotes_for_tag
+FROM TagCrossStats a
+JOIN (
+  SELECT DISTINCT tag FROM TopTags
+) tt ON tt.tag = a.tag
+ORDER BY tt.tag
+LIMIT 100;

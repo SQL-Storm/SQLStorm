@@ -1,0 +1,143 @@
+WITH RecentActivePosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30' DAY
+),
+TopTags AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS TagQuestionCount,
+    AVG(rap.Score) AS AvgScorePerQuestion,
+    MAX(rap.LastActivityDate) AS LastActive
+  FROM RecentActivePosts rap,
+       -- split tags like '<tag1><tag2>' into rows without using regexp_split_to_table
+       -- use a recursive CTE to split on '><'
+       LATERAL (
+         WITH RECURSIVE split(pos, rest, TagName) AS (
+           SELECT
+             1,
+             rap.Tags,
+             NULL::varchar
+           UNION ALL
+           SELECT
+             CASE
+               WHEN instr(rest, '><') = 0 THEN -1
+               ELSE instr(rest, '><') + 2
+             END,
+             CASE
+               WHEN instr(rest, '><') = 0 THEN ''
+               ELSE substr(rest, instr(rest, '><') + 2)
+             END,
+             CASE
+               WHEN instr(rest, '><') = 0 THEN trim(both '<>' FROM rest)
+               ELSE trim(both '<>' FROM substr(rest, 1, instr(rest, '><') + 1))
+             END
+           FROM split
+           WHERE rest <> ''
+         )
+         SELECT DISTINCT TagName FROM split WHERE TagName IS NOT NULL AND TagName <> ''
+       ) t
+  GROUP BY t.TagName
+),
+HotVotes AS (
+  SELECT
+    v.PostId,
+    v.VoteTypeId,
+    v.UserId,
+    v.CreationDate,
+    u.DisplayName AS Voter
+  FROM Votes v
+  JOIN Users u ON v.UserId = u.Id
+  WHERE v.VoteTypeId IN (2, 6)
+    AND v.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '14' DAY
+),
+PostActivity AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.OwnerUserId,
+    p.ViewCount,
+    p.Score,
+    COALESCE(b.Name, 'NoBadge') AS BadgeName
+  FROM Posts p
+  LEFT JOIN Badges b ON p.OwnerUserId = b.UserId AND b.Class = 1
+  WHERE p.PostTypeId = 1
+),
+ComplexMetrics AS (
+  SELECT
+    rap.PostId,
+    rap.Title,
+    rap.Tags,
+    rap.CreationDate,
+    rap.LastActivityDate,
+    rap.OwnerUserId,
+    rap.Score,
+    rap.ViewCount,
+    COALESCE(SUM(CASE WHEN hv.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpvotesInWindow,
+    COALESCE(SUM(CASE WHEN hv.VoteTypeId = 6 THEN 1 ELSE 0 END), 0) AS CloseVotesInWindow,
+    pr.LastActive
+  FROM RecentActivePosts rap
+  LEFT JOIN HotVotes hv ON hv.PostId = rap.PostId
+  LEFT JOIN (
+    SELECT p.Id, MAX(p.LastActivityDate) AS LastActive
+    FROM Posts p
+    GROUP BY p.Id
+  ) pr ON rap.PostId = pr.Id
+  GROUP BY rap.PostId, rap.Title, rap.Tags, rap.CreationDate, rap.LastActivityDate, rap.OwnerUserId, rap.Score, rap.ViewCount, pr.LastActive
+)
+SELECT
+  cm.PostId,
+  cm.Title,
+  cm.Tags,
+  cm.CreationDate,
+  cm.LastActivityDate,
+  cm.OwnerUserId,
+  cm.Score,
+  cm.ViewCount,
+  cm.UpvotesInWindow,
+  cm.CloseVotesInWindow,
+  ht.TagName AS MostFrequentTag,
+  ta.BadgeName AS OwnerGoldBadge
+FROM ComplexMetrics cm
+LEFT JOIN TopTags ht ON ht.TagName IN (
+  -- convert '<a><b>' to array-like comparison by extracting tags
+  SELECT TagName FROM (
+    WITH RECURSIVE split(pos, rest, TagName) AS (
+      SELECT
+        1,
+        cm.Tags,
+        NULL::varchar
+      UNION ALL
+      SELECT
+        CASE
+          WHEN instr(rest, '><') = 0 THEN -1
+          ELSE instr(rest, '><') + 2
+        END,
+        CASE
+          WHEN instr(rest, '><') = 0 THEN ''
+          ELSE substr(rest, instr(rest, '><') + 2)
+        END,
+        CASE
+          WHEN instr(rest, '><') = 0 THEN trim(both '<>' FROM rest)
+          ELSE trim(both '<>' FROM substr(rest, 1, instr(rest, '><') + 1))
+        END
+      FROM split
+      WHERE rest <> ''
+    )
+    SELECT DISTINCT TagName FROM split WHERE TagName IS NOT NULL AND TagName <> ''
+  )
+)
+LEFT JOIN PostActivity ta ON ta.PostId = cm.PostId
+ORDER BY cm.LastActivityDate DESC
+LIMIT 100;

@@ -1,0 +1,116 @@
+-- {"query": "3951.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2351} 
+
+WITH 
+/* 1️⃣ User activity aggregates */
+UserStats AS (
+    SELECT 
+        u.Id                           AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT b.Id)                         AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsAsked,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersGiven,
+        AVG(COALESCE(p.Score,0)) FILTER (WHERE p.PostTypeId = 2) AS AvgAnswerScore,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank
+    FROM Users u
+    LEFT JOIN Badges b      ON b.UserId = u.Id
+    LEFT JOIN Posts  p      ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+/* 2️⃣ Frequently used tags (only those with >100 uses) */
+TopTags AS (
+    SELECT 
+        t.TagName,
+        COUNT(*)                                    AS TagUseCount,
+        ROW_NUMBER() OVER (ORDER BY COUNT(*) DESC) AS TagRank
+    FROM Posts p
+    CROSS JOIN LATERAL (
+        SELECT UNNEST(STRING_TO_ARRAY(TRIM(BOTH '><' FROM p.Tags), '><')) AS Tag
+    ) AS tlist
+    JOIN Tags t ON t.TagName = tlist.Tag
+    WHERE p.PostTypeId = 1                -- only questions
+    GROUP BY t.TagName
+    HAVING COUNT(*) > 100
+),
+
+/* 3️⃣ Most recent close‑reason per post (correlated sub‑query style) */
+RecentCloseReason AS (
+    SELECT 
+        ph.PostId,
+        CAST(ph.Comment AS INT)                AS CloseReasonId,
+        ph.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10          -- Post Closed
+),
+
+/* 4️⃣ Vote totals per post */
+VoteAgg AS (
+    SELECT 
+        v.PostId,
+        SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END)          AS UpVotes,
+        SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END)          AS DownVotes,
+        COUNT(*) FILTER (WHERE vt.Id IN (4,12))             AS NegativeFlags,
+        MAX(v.CreationDate)                                 AS LastVoteDate
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY v.PostId
+)
+
+SELECT 
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.RepRank,
+    us.BadgeCount,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    us.QuestionsAsked,
+    us.AnswersGiven,
+    ROUND(us.AvgAnswerScore,2)                AS AvgAnswerScore,
+    COALESCE(va.UpVotes,0)                    AS TotalUpVotes,
+    COALESCE(va.DownVotes,0)                  AS TotalDownVotes,
+    COALESCE(va.NegativeFlags,0)              AS TotalNegFlags,
+    CASE 
+        WHEN us.RepRank <= 10  THEN 'Elite'
+        WHEN us.RepRank <= 100 THEN 'Pro'
+        ELSE 'Member'
+    END                                        AS Tier,
+    STRING_AGG(DISTINCT tt.TagName, ', ') FILTER (WHERE tt.TagRank <= 5) AS PopularTags
+FROM UserStats us
+LEFT JOIN VoteAgg va
+       ON va.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = us.UserId LIMIT 1)
+LEFT JOIN (
+    SELECT 
+        p.OwnerUserId,
+        t.TagName,
+        tt.TagRank
+    FROM Posts p
+    CROSS JOIN LATERAL (
+        SELECT UNNEST(STRING_TO_ARRAY(TRIM(BOTH '><' FROM p.Tags), '><')) AS Tag
+    ) AS tl
+    JOIN Tags t  ON t.TagName = tl.Tag
+    JOIN TopTags tt ON tt.TagName = t.TagName
+    WHERE p.PostTypeId = 1
+) tt ON tt.OwnerUserId = us.UserId
+WHERE us.Reputation > 1000
+GROUP BY 
+    us.UserId, us.DisplayName, us.Reputation, us.RepRank,
+    us.BadgeCount, us.GoldBadges, us.SilverBadges, us.BronzeBadges,
+    us.QuestionsAsked, us.AnswersGiven, us.AvgAnswerScore,
+    va.UpVotes, va.DownVotes, va.NegativeFlags
+ORDER BY us.RepRank
+LIMIT 50
+
+UNION ALL
+
+/* Dummy row to exercise UNION processing */
+SELECT 
+    NULL, '---', NULL, NULL, NULL, NULL, NULL, NULL,
+    NULL, NULL, NULL, NULL, NULL, NULL, NULL
+FROM (SELECT 1) AS dummy;

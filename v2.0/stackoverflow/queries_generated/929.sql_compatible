@@ -1,0 +1,361 @@
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        coalesce(nullif(trim(u.location), ''), 'Unknown') as location_norm,
+        date_trunc('month', u.creationdate) as cohort_month
+    from users u
+    where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+q_and_a as (
+    select
+        p.id,
+        p.owneruserid,
+        p.posttypeid,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        p.title,
+        p.tags,
+        case when p.posttypeid = 1 then 1 else 0 end as is_question,
+        case when p.posttypeid = 2 then 1 else 0 end as is_answer
+    from posts p
+    where p.creationdate is not null
+      and p.posttypeid in (1,2)
+),
+user_activity as (
+    select
+        ru.user_id,
+        ru.displayname,
+        ru.reputation,
+        ru.location_norm,
+        ru.cohort_month,
+        count(*) filter (where qa.is_question = 1) as questions_posted,
+        count(*) filter (where qa.is_answer = 1) as answers_posted,
+        sum(qa.score) as total_post_score,
+        avg(qa.score) filter (where qa.is_question = 1) as avg_q_score,
+        avg(qa.score) filter (where qa.is_answer = 1) as avg_a_score,
+        max(qa.viewcount) filter (where qa.is_question = 1) as max_q_views,
+        min(qa.viewcount) filter (where qa.is_question = 1) as min_q_views
+    from recent_users ru
+    left join q_and_a qa
+      on qa.owneruserid = ru.user_id
+    group by ru.user_id, ru.displayname, ru.reputation, ru.location_norm, ru.cohort_month
+),
+vote_aggs as (
+    select
+        p.owneruserid as user_id,
+        count(*) filter (where v.votetypeid = 2) as upvotes_received,
+        count(*) filter (where v.votetypeid = 3) as downvotes_received,
+        count(*) filter (where v.votetypeid = 5) as favorites_received,
+        sum(v.bountyamount) filter (where v.votetypeid in (8,9)) as bounty_flow
+    from posts p
+    join votes v on v.postid = p.id
+    group by p.owneruserid
+),
+comment_stats as (
+    select
+        p.owneruserid as user_id,
+        count(*) as comments_received,
+        sum(c.score) as comment_score_sum,
+        avg(c.score) as comment_score_avg,
+        max(c.score) as comment_score_max
+    from comments c
+    join posts p on p.id = c.postid
+    group by p.owneruserid
+),
+badges_window as (
+    select
+        b.userid as user_id,
+        b.name,
+        b.class,
+        b.date,
+        count(*) over (partition by b.userid) as total_badges,
+        sum(case when b.class = 1 then 1 else 0 end) over (partition by b.userid) as gold_badges,
+        sum(case when b.class = 2 then 1 else 0 end) over (partition by b.userid) as silver_badges,
+        sum(case when b.class = 3 then 1 else 0 end) over (partition by b.userid) as bronze_badges,
+        row_number() over (partition by b.userid order by b.date desc, b.id desc) as rn,
+        min(b.date) over (partition by b.userid) as first_badge_date,
+        max(b.date) over (partition by b.userid) as last_badge_date
+    from badges b
+),
+badge_summary as (
+    select
+        user_id,
+        total_badges,
+        gold_badges,
+        silver_badges,
+        bronze_badges,
+        first_badge_date,
+        last_badge_date,
+        string_agg(name, ', ' order by date desc) filter (where rn <= 5) as top5_recent_badges
+    from badges_window
+    group by user_id, total_badges, gold_badges, silver_badges, bronze_badges, first_badge_date, last_badge_date
+),
+hot_questions as (
+    select
+        p.id as post_id,
+        p.owneruserid as user_id,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        p.title,
+        p.tags,
+        row_number() over (partition by p.owneruserid order by p.score desc nulls last, p.viewcount desc nulls last, p.id) as rn_hot
+    from posts p
+    where p.posttypeid = 1
+),
+dup_graph as (
+    select
+        pl.postid as post_id,
+        pl.relatedpostid as dup_of_id,
+        pl.creationdate as link_date
+    from postlinks pl
+    where pl.linktypeid = 3
+),
+dup_counts as (
+    select
+        p.owneruserid as user_id,
+        count(distinct d.post_id) as duplicates_marked_on_their_posts,
+        count(distinct d.dup_of_id) as originals_referenced
+    from dup_graph d
+    join posts p on p.id = d.post_id
+    group by p.owneruserid
+),
+closed_reasons as (
+    select
+        ph.postid,
+        max(ph.creationdate) as closed_at,
+        max(
+            case
+                when ph.posthistorytypeid = 10 then
+                    nullif(regexp_replace(coalesce(ph.comment, ''), '[^0-9]', '', 'g'), '')
+                else null
+            end
+        ) as close_reason_code_text
+    from posthistory ph
+    where ph.posthistorytypeid in (10,11)
+    group by ph.postid
+),
+closed_by_user as (
+    select
+        p.owneruserid as user_id,
+        count(*) filter (where cr.closed_at is not null) as posts_closed,
+        count(*) filter (where cr.closed_at is null) as posts_not_closed,
+        count(*) filter (where cr.close_reason_code_text in ('101','102','103','104','105')) as posts_closed_current_reasons,
+        count(*) filter (where cr.close_reason_code_text in ('1','2','3','4','7','10','20')) as posts_closed_legacy_reasons
+    from posts p
+    left join closed_reasons cr on cr.postid = p.id
+    group by p.owneruserid
+),
+tag_explode as (
+    select
+        p.id as post_id,
+        p.owneruserid as user_id,
+        unnest(string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')) as tagname
+    from posts p
+    where p.posttypeid = 1
+      and p.tags is not null
+      and length(p.tags) > 2
+),
+top_tags as (
+    select
+        te.user_id,
+        string_agg(tt.tagname, ', ' order by tt.cnt desc, tt.tagname) as top_tags_csv
+    from (
+        select
+            te.user_id,
+            te.tagname,
+            count(*) as cnt,
+            row_number() over (partition by te.user_id order by count(*) desc, te.tagname) as rn
+        from tag_explode te
+        group by te.user_id, te.tagname
+    ) tt
+    where tt.rn <= 5
+    group by te.user_id
+),
+activity_density as (
+    select
+        qa.owneruserid as user_id,
+        date_trunc('week', qa.creationdate) as week_bucket,
+        count(*) as posts_in_week
+    from q_and_a qa
+    group by qa.owneruserid, date_trunc('week', qa.creationdate)
+),
+activity_sparsity as (
+    select
+        ad.user_id,
+        coalesce(max(ad.posts_in_week), 0) as max_posts_in_a_week,
+        coalesce(percentile_cont(0.5) within group (order by ad.posts_in_week), 0) as median_posts_in_a_week
+    from activity_density ad
+    group by ad.user_id
+),
+user_ranked as (
+    select
+        ua.*,
+        coalesce(va.upvotes_received, 0) as upvotes_received,
+        coalesce(va.downvotes_received, 0) as downvotes_received,
+        coalesce(va.favorites_received, 0) as favorites_received,
+        coalesce(va.bounty_flow, 0) as bounty_flow,
+        coalesce(cs.comments_received, 0) as comments_received,
+        coalesce(cs.comment_score_sum, 0) as comment_score_sum,
+        coalesce(cs.comment_score_avg, 0) as comment_score_avg,
+        coalesce(cs.comment_score_max, 0) as comment_score_max,
+        coalesce(bs.total_badges, 0) as total_badges,
+        coalesce(bs.gold_badges, 0) as gold_badges,
+        coalesce(bs.silver_badges, 0) as silver_badges,
+        coalesce(bs.bronze_badges, 0) as bronze_badges,
+        bs.first_badge_date,
+        bs.last_badge_date,
+        bs.top5_recent_badges,
+        coalesce(dc.duplicates_marked_on_their_posts, 0) as duplicates_marked_on_their_posts,
+        coalesce(dc.originals_referenced, 0) as originals_referenced,
+        coalesce(cb.posts_closed, 0) as posts_closed,
+        coalesce(cb.posts_not_closed, 0) as posts_not_closed,
+        coalesce(cb.posts_closed_current_reasons, 0) as posts_closed_current_reasons,
+        coalesce(cb.posts_closed_legacy_reasons, 0) as posts_closed_legacy_reasons,
+        coalesce(ts.top_tags_csv, '') as top_tags_csv,
+        coalesce(aspar.max_posts_in_a_week, 0) as max_posts_in_a_week,
+        coalesce(aspar.median_posts_in_a_week, 0) as median_posts_in_a_week
+    from user_activity ua
+    left join vote_aggs va on va.user_id = ua.user_id
+    left join comment_stats cs on cs.user_id = ua.user_id
+    left join badge_summary bs on bs.user_id = ua.user_id
+    left join dup_counts dc on dc.user_id = ua.user_id
+    left join closed_by_user cb on cb.user_id = ua.user_id
+    left join top_tags ts on ts.user_id = ua.user_id
+    left join activity_sparsity aspar on aspar.user_id = ua.user_id
+),
+scored as (
+    select
+        ur.*,
+        -- composite engagement score with non-linear weighting and null-safe logic
+        (
+            0.40 * coalesce(ln(nullif(ur.questions_posted + ur.answers_posted,0) + 1), 0) +
+            0.25 * coalesce(ln(nullif(ur.total_post_score,0) + 5), 0) +
+            0.15 * greatest(cast(ur.avg_q_score as numeric), 0) +
+            0.10 * greatest(cast(ur.avg_a_score as numeric), 0) +
+            0.10 * coalesce(ln(nullif(ur.upvotes_received - ur.downvotes_received,0) + 10), 0)
+        ) +
+        (
+            0.05 * least(coalesce(ur.max_q_views,0) / 1000.0, 50) +
+            0.03 * coalesce(ur.favorites_received,0) +
+            0.02 * coalesce(ur.gold_badges,0) +
+            0.01 * coalesce(ur.silver_badges,0) +
+            0.005 * coalesce(ur.bronze_badges,0)
+        ) -
+        (
+            0.07 * greatest(coalesce(ur.downvotes_received,0) - coalesce(ur.upvotes_received,0), 0)
+        ) as engagement_score,
+        case
+            when ur.posts_closed > 0 then (cast(ur.posts_closed_current_reasons as numeric) / nullif(ur.posts_closed,0))
+            else null
+        end as frac_closed_current_reasons,
+        case
+            when ur.posts_closed > 0 then (cast(ur.posts_closed_legacy_reasons as numeric) / nullif(ur.posts_closed,0))
+            else null
+        end as frac_closed_legacy_reasons
+    from user_ranked ur
+),
+peers as (
+    select
+        s.*,
+        percentile_cont(0.5) within group (order by s.engagement_score) over (partition by s.cohort_month) as cohort_median_score,
+        avg(s.engagement_score) over (partition by s.cohort_month) as cohort_avg_score,
+        stddev_pop(s.engagement_score) over (partition by s.cohort_month) as cohort_std_score,
+        rank() over (order by s.engagement_score desc nulls last, s.reputation desc nulls last, s.user_id) as global_rank,
+        dense_rank() over (partition by s.cohort_month order by s.engagement_score desc nulls last) as cohort_rank
+    from scored s
+),
+hot_pick as (
+    select
+        hq.user_id,
+        hq.post_id as hottest_question_id,
+        hq.title as hottest_question_title,
+        hq.viewcount as hottest_question_views,
+        hq.score as hottest_question_score,
+        hq.tags as hottest_question_tags
+    from hot_questions hq
+    where hq.rn_hot = 1
+),
+final_set as (
+    select
+        p.user_id,
+        p.displayname,
+        p.location_norm,
+        p.reputation,
+        p.cohort_month,
+        p.global_rank,
+        p.cohort_rank,
+        round(cast(p.engagement_score as numeric), 3) as engagement_score,
+        round(cast(p.cohort_median_score as numeric), 3) as cohort_median_score,
+        round(cast(p.cohort_avg_score as numeric), 3) as cohort_avg_score,
+        round(cast(p.cohort_std_score as numeric), 3) as cohort_std_score,
+        p.questions_posted,
+        p.answers_posted,
+        p.total_post_score,
+        p.upvotes_received,
+        p.downvotes_received,
+        p.favorites_received,
+        p.bounty_flow,
+        p.comments_received,
+        p.total_badges,
+        p.gold_badges,
+        p.silver_badges,
+        p.bronze_badges,
+        p.first_badge_date,
+        p.last_badge_date,
+        p.top5_recent_badges,
+        p.duplicates_marked_on_their_posts,
+        p.originals_referenced,
+        p.posts_closed,
+        p.posts_not_closed,
+        round(coalesce(p.frac_closed_current_reasons, 0)::numeric, 3) as frac_closed_current_reasons,
+        round(coalesce(p.frac_closed_legacy_reasons, 0)::numeric, 3) as frac_closed_legacy_reasons,
+        p.top_tags_csv,
+        p.max_posts_in_a_week,
+        p.median_posts_in_a_week,
+        hp.hottest_question_id,
+        hp.hottest_question_title,
+        hp.hottest_question_views,
+        hp.hottest_question_score,
+        hp.hottest_question_tags
+    from peers p
+    left join hot_pick hp on hp.user_id = p.user_id
+),
+-- build a synthetic benchmark workload via set operators and complicated filters
+unioned as (
+    select * from final_set
+    union all
+    select * from final_set where engagement_score > cohort_avg_score
+    union all
+    select * from final_set where engagement_score < cohort_median_score
+),
+ranked_final as (
+    select
+        u.*,
+        row_number() over (order by engagement_score desc nulls last, reputation desc nulls last, user_id) as rownum_desc,
+        row_number() over (order by engagement_score asc nulls last, reputation asc nulls last, user_id) as rownum_asc
+    from unioned u
+)
+select
+    rf.*
+from ranked_final rf
+where
+    (
+        (rf.engagement_score is not null and rf.rownum_desc <= 250)
+        or
+        (rf.engagement_score is null and rf.rownum_asc <= 50)
+    )
+  and (
+      rf.location_norm ilike any (array['%united%','%india%','%canada%','%australia%','%germany%'])
+      or rf.top_tags_csv ~* '(sql|python|javascript|java|c\+\+)'
+      or (rf.gold_badges >= 1 and rf.questions_posted >= 5)
+  )
+order by
+    rf.engagement_score desc nulls last,
+    rf.reputation desc nulls last,
+    rf.user_id
+limit 500;

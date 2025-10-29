@@ -1,0 +1,395 @@
+with
+params as (
+  select
+    date_trunc('month', cast('2024-10-01 12:34:56' as timestamp)) - interval '24 months' as start_month,
+    date_trunc('month', cast('2024-10-01 12:34:56' as timestamp)) - interval '1 month'  as end_month
+),
+months as (
+  select generate_series(start_month, end_month, interval '1 month') as month_start
+  from params
+),
+user_activity as (
+  select
+    u.id as user_id,
+    date_trunc('month', u.creationdate) as join_month,
+    u.reputation,
+    coalesce(nullif(trim(u.location), ''), 'Unknown') as location_norm,
+    case
+      when u.websiteurl is null or u.websiteurl = '' then 0
+      when u.websiteurl ~* '(github|gitlab|bitbucket)' then 2
+      when u.websiteurl ~* '(linkedin|stack(over| )?flow|portfolio)' then 1
+      else 0
+    end as web_presence_score,
+    (u.upvotes - u.downvotes) as net_votes,
+    u.views
+  from users u
+),
+posts_enriched as (
+  select
+    p.id,
+    p.posttypeid,
+    p.owneruserid,
+    p.creationdate,
+    date_trunc('month', p.creationdate) as month_bucket,
+    p.score,
+    p.viewcount,
+    p.commentcount,
+    p.favoritecount,
+    p.answercount,
+    p.closeddate,
+    p.title,
+    p.tags,
+    coalesce(p.ownerdisplayname, p.ownerdisplayname) as ownerdisplayname
+  from posts p
+),
+votes_agg as (
+  select
+    v.postid,
+    date_trunc('month', v.creationdate) as month_bucket,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+    sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_total,
+    count(*) as total_votes
+  from votes v
+  group by v.postid, date_trunc('month', v.creationdate)
+),
+comments_agg as (
+  select
+    c.postid,
+    date_trunc('month', c.creationdate) as month_bucket,
+    count(*) as comments_count,
+    sum(greatest(coalesce(c.score,0),0)) as nonneg_comment_score
+  from comments c
+  group by c.postid, date_trunc('month', c.creationdate)
+),
+closures as (
+  select
+    ph.postid,
+    ph.creationdate as closed_at,
+    date_trunc('month', ph.creationdate) as month_bucket,
+    ph.comment as close_reason_id,
+    crt.name as close_reason_name
+  from posthistory ph
+  left join closerreasontypes crt on cast(crt.id as text) = nullif(ph.comment,'')
+  where ph.posthistorytypeid = 10
+),
+links_agg as (
+  select
+    pl.postid,
+    date_trunc('month', pl.creationdate) as month_bucket,
+    sum(case when pl.linktypeid = 1 then 1 else 0 end) as linked_refs,
+    sum(case when pl.linktypeid = 3 then 1 else 0 end) as duplicate_links
+  from postlinks pl
+  group by pl.postid, date_trunc('month', pl.creationdate)
+),
+tag_extract as (
+  select
+    p.id as post_id,
+    p.month_bucket,
+    unnest(string_to_array(substring(p.tags, 2, greatest(length(p.tags)-2,0)), '><')) as tag
+  from posts_enriched p
+  where p.posttypeid = 1
+),
+tag_quality as (
+  select
+    te.tag,
+    te.month_bucket,
+    count(*) as q_count,
+    avg(nullif(p.score,0)) filter (where p.score is not null) as avg_score_nonzero,
+    percentile_disc(0.9) within group (order by coalesce(p.viewcount,0)) as p90_views
+  from tag_extract te
+  join posts_enriched p on p.id = te.post_id
+  group by te.tag, te.month_bucket
+),
+per_post_month as (
+  select
+    p.id,
+    p.owneruserid,
+    p.posttypeid,
+    p.month_bucket,
+    p.score,
+    p.viewcount,
+    p.commentcount,
+    p.favoritecount,
+    p.answercount,
+    case when p.closeddate is not null then 1 else 0 end as is_closed,
+    coalesce(va.upvotes,0) as upvotes,
+    coalesce(va.downvotes,0) as downvotes,
+    coalesce(va.favorites,0) as fav_votes,
+    coalesce(va.bounty_total,0) as bounty_total,
+    coalesce(va.total_votes,0) as total_votes,
+    coalesce(ca.comments_count,0) as comments_count,
+    coalesce(ca.nonneg_comment_score,0) as nonneg_comment_score,
+    coalesce(la.linked_refs,0) as linked_refs,
+    coalesce(la.duplicate_links,0) as duplicate_links
+  from posts_enriched p
+  left join votes_agg va
+    on va.postid = p.id and va.month_bucket = p.month_bucket
+  left join comments_agg ca
+    on ca.postid = p.id and ca.month_bucket = p.month_bucket
+  left join links_agg la
+    on la.postid = p.id and la.month_bucket = p.month_bucket
+),
+user_month_rollup as (
+  select
+    u.user_id,
+    m.month_start as month_bucket,
+    coalesce(sum(case when pm.posttypeid = 1 then 1 else 0 end),0) as questions,
+    coalesce(sum(case when pm.posttypeid = 2 then 1 else 0 end),0) as answers,
+    coalesce(sum(pm.score),0) as sum_score,
+    coalesce(sum(pm.viewcount),0) as sum_views,
+    coalesce(sum(pm.comments_count),0) as sum_comments,
+    coalesce(sum(pm.upvotes - pm.downvotes),0) as net_votes,
+    coalesce(sum(pm.bounty_total),0) as sum_bounty,
+    coalesce(sum(pm.duplicate_links),0) as dup_links,
+    max(case when pm.is_closed=1 then 1 else 0 end) as any_closed
+  from months m
+  cross join user_activity u
+  left join per_post_month pm
+    on pm.owneruserid = u.user_id
+   and pm.month_bucket = m.month_start
+  group by u.user_id, m.month_start
+),
+user_trends as (
+  select
+    umr.user_id,
+    umr.month_bucket,
+    umr.questions,
+    umr.answers,
+    umr.sum_score,
+    umr.sum_views,
+    umr.sum_comments,
+    umr.net_votes,
+    umr.sum_bounty,
+    umr.dup_links,
+    umr.any_closed,
+    sum(umr.sum_score) over (partition by umr.user_id order by umr.month_bucket rows between 5 preceding and current row) as score_6m,
+    avg(umr.sum_views) over (partition by umr.user_id order by umr.month_bucket rows between 11 preceding and current row) as avg_views_12m,
+    lag(umr.sum_score, 1) over (partition by umr.user_id order by umr.month_bucket) as prev_score,
+    lead(umr.sum_score, 1) over (partition by umr.user_id order by umr.month_bucket) as next_score,
+    row_number() over (partition by umr.user_id order by umr.month_bucket) as rn
+  from user_month_rollup umr
+),
+user_flags as (
+  select
+    ut.user_id,
+    ut.month_bucket,
+    ut.questions,
+    ut.answers,
+    ut.sum_score,
+    ut.sum_views,
+    ut.sum_comments,
+    ut.net_votes,
+    ut.sum_bounty,
+    ut.dup_links,
+    ut.any_closed,
+    ut.score_6m,
+    ut.avg_views_12m,
+    ut.prev_score,
+    ut.next_score,
+    ut.rn,
+    case when ut.prev_score is null then 0
+         when ut.prev_score = 0 then case when ut.sum_score > 0 then 1 else 0 end
+         when ut.sum_score >= ut.prev_score * 2 and ut.sum_score >= 10 then 1
+         else 0 end as spike_flag,
+    case when coalesce(ut.avg_views_12m,0) > 10000 then 1 else 0 end as high_visibility_flag
+  from user_trends ut
+),
+best_tags_per_month as (
+  select
+    tq.month_bucket,
+    tq.tag,
+    tq.q_count,
+    tq.avg_score_nonzero,
+    dense_rank() over (partition by tq.month_bucket order by tq.q_count desc, tq.p90_views desc) as rnk
+  from tag_quality tq
+),
+user_badge_month as (
+  select
+    b.userid as user_id,
+    date_trunc('month', b.date) as month_bucket,
+    count(*) filter (where b.class = 1) as gold_badges,
+    count(*) filter (where b.class = 2) as silver_badges,
+    count(*) filter (where b.class = 3) as bronze_badges
+  from badges b
+  group by b.userid, date_trunc('month', b.date)
+),
+user_dim as (
+  select
+    u.user_id,
+    u.join_month,
+    u.reputation,
+    u.location_norm,
+    u.web_presence_score,
+    u.net_votes as user_net_votes,
+    u.views as user_profile_views
+  from user_activity u
+),
+user_month_final as (
+  select
+    um.user_id,
+    um.month_bucket,
+    um.questions,
+    um.answers,
+    um.sum_score,
+    um.sum_views,
+    um.sum_comments,
+    um.net_votes,
+    um.sum_bounty,
+    um.dup_links,
+    um.any_closed,
+    uf.spike_flag,
+    uf.high_visibility_flag,
+    coalesce(ubm.gold_badges,0) as gold_badges,
+    coalesce(ubm.silver_badges,0) as silver_badges,
+    coalesce(ubm.bronze_badges,0) as bronze_badges
+  from user_month_rollup um
+  join user_flags uf on uf.user_id = um.user_id and uf.month_bucket = um.month_bucket
+  left join user_badge_month ubm on ubm.user_id = um.user_id and ubm.month_bucket = um.month_bucket
+),
+question_quality as (
+  select
+    pm.id as post_id,
+    pm.month_bucket,
+    pm.score,
+    pm.viewcount,
+    pm.commentcount,
+    pm.favoritecount,
+    pm.upvotes,
+    pm.downvotes,
+    pm.fav_votes,
+    pm.total_votes,
+    pm.comments_count,
+    pm.nonneg_comment_score,
+    pm.linked_refs,
+    pm.duplicate_links,
+    case when pm.total_votes = 0 then null
+         else (cast(pm.upvotes as numeric) - cast(pm.downvotes as numeric)) / nullif(pm.total_votes,0) end as vote_ratio,
+    case when pm.viewcount is null or pm.viewcount = 0 then null
+         else cast(pm.score as numeric) / nullif(pm.viewcount,0) end as score_per_view
+  from per_post_month pm
+  where pm.posttypeid = 1
+),
+q_quality_stats as (
+  select
+    qm.month_bucket,
+    count(*) as q_count,
+    avg(score) as avg_score,
+    percentile_cont(0.5) within group (order by coalesce(score,0)) as med_score,
+    avg(vote_ratio) as avg_vote_ratio,
+    avg(score_per_view) as avg_score_per_view,
+    sum(duplicate_links) as dup_links_total
+  from question_quality qm
+  group by qm.month_bucket
+),
+top_contributors as (
+  select
+    umf.month_bucket,
+    umf.user_id,
+    row_number() over (partition by umf.month_bucket order by umf.sum_score desc, umf.answers desc, umf.questions desc) as rnk_score,
+    row_number() over (partition by umf.month_bucket order by umf.sum_views desc) as rnk_views
+  from user_month_final umf
+),
+final_calendar as (
+  select
+    m.month_start as month_bucket,
+    u.user_id
+  from months m
+  cross join (select id as user_id from users) u
+),
+synth as (
+  select
+    fc.month_bucket,
+    fc.user_id,
+    coalesce(umf.questions,0) as questions,
+    coalesce(umf.answers,0) as answers,
+    coalesce(umf.sum_score,0) as sum_score,
+    coalesce(umf.sum_views,0) as sum_views,
+    coalesce(umf.sum_comments,0) as sum_comments,
+    coalesce(umf.net_votes,0) as net_votes,
+    coalesce(umf.sum_bounty,0) as sum_bounty,
+    coalesce(umf.dup_links,0) as dup_links,
+    coalesce(umf.any_closed,0) as any_closed,
+    coalesce(umf.spike_flag,0) as spike_flag,
+    coalesce(umf.high_visibility_flag,0) as high_visibility_flag,
+    coalesce(umf.gold_badges,0) as gold_badges,
+    coalesce(umf.silver_badges,0) as silver_badges,
+    coalesce(umf.bronze_badges,0) as bronze_badges
+  from final_calendar fc
+  left join user_month_final umf
+    on umf.user_id = fc.user_id and umf.month_bucket = fc.month_bucket
+),
+user_ranks as (
+  select
+    s.month_bucket,
+    s.user_id,
+    s.questions,
+    s.answers,
+    s.sum_score,
+    s.sum_views,
+    s.sum_comments,
+    s.net_votes,
+    s.sum_bounty,
+    s.dup_links,
+    s.any_closed,
+    s.spike_flag,
+    s.high_visibility_flag,
+    s.gold_badges,
+    s.silver_badges,
+    s.bronze_badges,
+    rank() over (partition by s.month_bucket order by s.sum_score desc) as rk_sum_score,
+    rank() over (partition by s.month_bucket order by s.sum_views desc) as rk_sum_views,
+    dense_rank() over (partition by s.month_bucket order by (s.answers*2 + s.questions) desc) as rk_activity
+  from synth s
+),
+best_tag_labels as (
+  select
+    bm.month_bucket,
+    string_agg(bm.tag, ', ' order by bm.q_count desc) as top_tags
+  from best_tags_per_month bm
+  where bm.rnk <= 5
+  group by bm.month_bucket
+)
+select
+  ur.month_bucket,
+  ur.user_id,
+  ud.reputation,
+  ud.location_norm,
+  ud.web_presence_score,
+  ud.user_net_votes,
+  ud.user_profile_views,
+  ur.questions,
+  ur.answers,
+  ur.sum_score,
+  ur.sum_views,
+  ur.sum_comments,
+  ur.net_votes,
+  ur.sum_bounty,
+  ur.dup_links,
+  ur.any_closed,
+  ur.spike_flag,
+  ur.high_visibility_flag,
+  ur.gold_badges,
+  ur.silver_badges,
+  ur.bronze_badges,
+  ur.rk_sum_score,
+  ur.rk_sum_views,
+  ur.rk_activity,
+  coalesce(t1.rnk_score, NULL) as top_score_rank,
+  coalesce(t1.rnk_views, NULL) as top_views_rank,
+  coalesce(qs.q_count,0) as month_q_count,
+  coalesce(qs.avg_score,0) as month_avg_q_score,
+  coalesce(qs.med_score,0) as month_median_q_score,
+  coalesce(qs.avg_vote_ratio,0) as month_avg_vote_ratio,
+  coalesce(qs.avg_score_per_view,0) as month_avg_score_per_view,
+  coalesce(qs.dup_links_total,0) as month_dup_links,
+  coalesce(btl.top_tags,'') as top_5_tags
+from user_ranks ur
+left join user_dim ud on ud.user_id = ur.user_id
+left join top_contributors t1 on t1.user_id = ur.user_id and t1.month_bucket = ur.month_bucket
+left join q_quality_stats qs on qs.month_bucket = ur.month_bucket
+left join best_tag_labels btl on btl.month_bucket = ur.month_bucket
+where (ur.questions + ur.answers + ur.sum_score + ur.sum_views) > 0
+order by ur.month_bucket desc, ur.rk_sum_score asc, ur.user_id
+limit 500;

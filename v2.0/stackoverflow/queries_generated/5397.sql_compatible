@@ -1,0 +1,186 @@
+WITH recent_active AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.AccountId,
+    ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY u.LastAccessDate DESC) AS rn
+  FROM Users u
+),
+top_users AS (
+  SELECT
+    ra.UserId,
+    ra.DisplayName,
+    ra.Reputation,
+    ra.CreationDate,
+    ra.LastAccessDate,
+    ra.Location,
+    ra.Views,
+    ra.UpVotes,
+    ra.DownVotes,
+    ra.AccountId
+  FROM recent_active ra
+  WHERE ra.rn = 1
+),
+q1 AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.PostTypeId,
+    p.AcceptedAnswerId,
+    p.ParentId,
+    p.CommentCount,
+    p.FavoriteCount
+  FROM Posts p
+  WHERE p.PostTypeId = 1 -- Questions
+),
+q2 AS (
+  SELECT
+    v.PostId,
+    COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVotes,
+    COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVotes,
+    COUNT(*) AS TotalVotes,
+    AVG(CASE WHEN v.VoteTypeId = 2 THEN 1.0 ELSE 0 END) AS UpVoteShare
+  FROM Votes v
+  GROUP BY v.PostId
+),
+latest_comments AS (
+  SELECT
+    c.PostId,
+    c.Id AS CommentId,
+    c.Text,
+    c.CreationDate,
+    c.UserId,
+    c.UserDisplayName,
+    ROW_NUMBER() OVER (PARTITION BY c.PostId ORDER BY c.CreationDate DESC) AS rn
+  FROM Comments c
+),
+tag_stats AS (
+  SELECT
+    t.TagName,
+    t.Count AS TagCount,
+    t.ExcerptPostId,
+    t.WikiPostId,
+    p.OwnerUserId AS PostOwner
+  FROM Tags t
+  LEFT JOIN Posts p ON t.WikiPostId = p.Id
+),
+dups AS (
+  SELECT
+    pl.PostId,
+    pl.RelatedPostId,
+    lt.Name AS LinkType
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+  WHERE lt.Name IN ('Linked','Duplicate')
+),
+complex AS (
+  SELECT
+    pq.PostId,
+    pq.Title,
+    pq.CreationDate,
+    pq.Score,
+    pq.ViewCount,
+    COALESCE(vs.UpVotes, 0) AS UpVotes,
+    COALESCE(vs.DownVotes, 0) AS DownVotes,
+    pq.OwnerUserId,
+    COALESCE(cmt.CommentId, 0) AS FirstCommentId,
+    cmt.Text AS FirstCommentText,
+    cmt.CreationDate AS FirstCommentDate,
+    ROW_NUMBER() OVER (
+      PARTITION BY pq.PostId
+      ORDER BY pq.CreationDate DESC, cmt.CreationDate DESC
+    ) AS rn
+  FROM q1 pq
+  LEFT JOIN q2 vs ON vs.PostId = pq.PostId
+  LEFT JOIN latest_comments cmt ON cmt.PostId = pq.PostId AND cmt.rn = 1
+  WHERE pq.OwnerUserId IS NOT NULL
+)
+SELECT
+  u.Id AS UserId,
+  u.DisplayName AS UserName,
+  u.Reputation,
+  u.CreationDate AS UserCreation,
+  u.LastAccessDate AS UserLastAccess,
+  u.Location,
+  u.Views,
+  u.UpVotes,
+  u.DownVotes,
+  u.AccountId,
+  p.PostId,
+  p.Title,
+  p.CreationDate AS PostCreation,
+  p.Score,
+  p.ViewCount,
+  p.Tags,
+  p.OwnerUserId AS PostOwnerId,
+  p.LastActivityDate,
+  p.PostTypeId,
+  p.AcceptedAnswerId,
+  p.ParentId,
+  p.CommentCount,
+  p.FavoriteCount,
+  COALESCE(v.TotalVotes, 0) AS TotalVotes,
+  COALESCE(v.UpVotes, 0) AS UpVotesPost,
+  COALESCE(v.DownVotes, 0) AS DownVotesPost,
+  c.FirstCommentId,
+  c.FirstCommentText,
+  c.CreationDate AS FirstCommentDate,
+  RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS OwnerPostRank,
+  L.RightJoinNoteFlag
+FROM top_users u
+JOIN (
+  SELECT * FROM q1
+) p ON p.OwnerUserId = u.Id
+LEFT JOIN q2 v ON v.PostId = p.PostId
+LEFT JOIN latest_comments c ON c.PostId = p.PostId AND c.rn = 1
+LEFT JOIN (
+  SELECT 'OK' AS RightJoinNoteFlag
+) L ON TRUE
+WHERE p.CreationDate > (CAST('2024-10-01' AS date) - INTERVAL '180 days')
+  AND (p.Score > 0 OR p.ViewCount > 100)
+GROUP BY
+  u.Id,
+  u.DisplayName,
+  u.Reputation,
+  u.CreationDate,
+  u.LastAccessDate,
+  u.Location,
+  u.Views,
+  u.UpVotes,
+  u.DownVotes,
+  u.AccountId,
+  p.PostId,
+  p.Title,
+  p.CreationDate,
+  p.Score,
+  p.ViewCount,
+  p.Tags,
+  p.OwnerUserId,
+  p.LastActivityDate,
+  p.PostTypeId,
+  p.AcceptedAnswerId,
+  p.ParentId,
+  p.CommentCount,
+  p.FavoriteCount,
+  v.TotalVotes,
+  v.UpVotes,
+  v.DownVotes,
+  c.FirstCommentId,
+  c.FirstCommentText,
+  c.CreationDate,
+  L.RightJoinNoteFlag
+ORDER BY u.Reputation DESC, p.Score DESC
+LIMIT 100;

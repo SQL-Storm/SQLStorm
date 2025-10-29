@@ -1,0 +1,330 @@
+with recent_users as (
+  select
+    u.id,
+    u.displayname,
+    u.reputation,
+    u.location,
+    u.creationdate,
+    u.lastaccessdate,
+    coalesce(nullif(trim(u.websiteurl), ''), 'N/A') as websiteurl,
+    u.upvotes,
+    u.downvotes,
+    u.views,
+    dense_rank() over (order by u.creationdate desc) as dr_recent
+  from users u
+  where u.creationdate >= (select date_trunc('month', max(creationdate)) - cast('12 months' as interval) from users)
+),
+user_badge_agg as (
+  select
+    b.userid,
+    count(*) filter (where b.class = 1) as gold_badges,
+    count(*) filter (where b.class = 2) as silver_badges,
+    count(*) filter (where b.class = 3) as bronze_badges,
+    count(*) as total_badges,
+    max(b.date) as last_badge_date
+  from badges b
+  group by b.userid
+),
+question_core as (
+  select
+    p.id as question_id,
+    p.owneruserid as asker_id,
+    p.creationdate as question_date,
+    p.score as question_score,
+    p.viewcount,
+    p.title,
+    p.tags,
+    p.acceptedanswerid,
+    p.closeddate,
+    p.favoritecount,
+    p.commentcount,
+    p.lastactivitydate,
+    string_to_array(substring(p.tags, 2, greatest(length(p.tags)-2,0)), '><') as tag_arr
+  from posts p
+  where p.posttypeid = 1
+),
+answers as (
+  select
+    a.id as answer_id,
+    a.parentid as question_id,
+    a.owneruserid as answerer_id,
+    a.creationdate as answer_date,
+    a.score as answer_score
+  from posts a
+  where a.posttypeid = 2
+),
+answer_stats as (
+  select
+    q.question_id,
+    count(a.answer_id) as answer_count,
+    max(a.answer_score) as max_answer_score,
+    avg(cast(a.answer_score as numeric)) as avg_answer_score,
+    min(a.answer_date) as first_answer_date,
+    max(a.answer_date) as last_answer_date,
+    count(*) filter (where a.answer_id = q.acceptedanswerid) as has_accepted
+  from question_core q
+  left join answers a on a.question_id = q.question_id
+  group by q.question_id, q.acceptedanswerid
+),
+vote_agg as (
+  select
+    v.postid,
+    count(*) filter (where v.votetypeid = 2) as upvotes,
+    count(*) filter (where v.votetypeid = 3) as downvotes,
+    count(*) filter (where v.votetypeid = 5) as favorites,
+    count(*) filter (where v.votetypeid in (8,9)) as bounty_events,
+    sum(coalesce(v.bountyamount,0)) filter (where v.votetypeid in (8,9)) as bounty_total
+  from votes v
+  group by v.postid
+),
+close_events as (
+  select
+    ph.postid,
+    min(ph.creationdate) as first_close_date,
+    max(ph.creationdate) as last_close_date,
+    count(*) as close_actions,
+    count(*) filter (where ph.posthistorytypeid = 11) as reopen_actions
+  from posthistory ph
+  where ph.posthistorytypeid in (10,11)
+  group by ph.postid
+),
+dup_links as (
+  select
+    pl.postid as duplicate_question_id,
+    count(*) filter (where pl.linktypeid = 3) as duplicate_of_count,
+    count(*) filter (where pl.linktypeid = 1) as linked_count,
+    max(pl.creationdate) as last_link_date
+  from postlinks pl
+  group by pl.postid
+),
+tag_explode as (
+  select
+    q.question_id,
+    unnest(q.tag_arr) as tagname
+  from question_core q
+),
+tag_popularity as (
+  select
+    te.question_id,
+    sum(t.count) as tag_global_popularity,
+    avg(cast(t.count as numeric)) as tag_avg_popularity,
+    min(t.count) as tag_min_popularity,
+    max(t.count) as tag_max_popularity
+  from tag_explode te
+  left join tags t on lower(t.tagname) = lower(te.tagname)
+  group by te.question_id
+),
+user_activity as (
+  select
+    u.id as user_id,
+    count(distinct p.id) filter (where p.posttypeid = 1) as q_count,
+    count(distinct p.id) filter (where p.posttypeid = 2) as a_count,
+    count(distinct c.id) as comment_count,
+    max(coalesce(p.lastactivitydate, u.lastaccessdate)) as last_activity,
+    percentile_cont(0.5) within group (order by coalesce(p.score,0)) as median_post_score
+  from users u
+  left join posts p on p.owneruserid = u.id
+  left join comments c on c.userid = u.id
+  group by u.id
+),
+accepted_answer_delta as (
+  select
+    q.question_id,
+    case
+      when q.acceptedanswerid is null then null
+      else (select a.creationdate from posts a where a.id = q.acceptedanswerid) - q.question_date
+    end as time_to_accept
+  from question_core q
+),
+hot_candidate as (
+  select
+    q.question_id,
+    case
+      when q.viewcount > 0 then (cast(q.question_score as numeric) / nullif(q.viewcount,0)) else null end as score_per_view,
+    (extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - q.question_date)) / 3600.0) as age_hours,
+    coalesce(v.upvotes,0) - coalesce(v.downvotes,0) as net_votes,
+    coalesce(v.favorites,0) as favs
+  from question_core q
+  left join vote_agg v on v.postid = q.question_id
+),
+rankings as (
+  select
+    q.question_id,
+    row_number() over (order by coalesce(v.upvotes,0) desc, coalesce(a.answer_count,0) desc, q.viewcount desc) as rn_popular,
+    row_number() over (order by (coalesce(v.upvotes,0) - coalesce(v.downvotes,0)) desc, q.question_score desc) as rn_netvote,
+    row_number() over (order by coalesce(h.score_per_view,0) desc) as rn_efficiency,
+    dense_rank() over (order by coalesce(tp.tag_avg_popularity,0) desc) as dr_tag_pop
+  from question_core q
+  left join vote_agg v on v.postid = q.question_id
+  left join answer_stats a on a.question_id = q.question_id
+  left join tag_popularity tp on tp.question_id = q.question_id
+  left join hot_candidate h on h.question_id = q.question_id
+  group by q.question_id, v.upvotes, v.downvotes, a.answer_count, q.viewcount, q.question_score, h.score_per_view, tp.tag_avg_popularity
+),
+per_user_latest_q as (
+  select distinct on (q.asker_id)
+    q.asker_id,
+    q.question_id as latest_question_id,
+    q.question_date as latest_question_date
+  from question_core q
+  where q.asker_id is not null
+  order by q.asker_id, q.question_date desc
+),
+candidate_set as (
+  select
+    q.question_id,
+    q.asker_id,
+    q.question_date
+  from question_core q
+  where q.question_date >= (select max(creationdate) - cast('90 days' as interval) from posts where posttypeid = 1)
+  union
+  select
+    l.latest_question_id as question_id,
+    l.asker_id,
+    l.latest_question_date as question_date
+  from per_user_latest_q l
+),
+final as (
+  select
+    q.question_id,
+    q.title,
+    q.tags,
+    q.question_date,
+    q.viewcount,
+    q.question_score,
+    coalesce(a.answer_count,0) as answer_count,
+    a.avg_answer_score,
+    a.max_answer_score,
+    a.first_answer_date,
+    a.last_answer_date,
+    a.has_accepted,
+    ce.first_close_date,
+    ce.last_close_date,
+    ce.close_actions,
+    ce.reopen_actions,
+    d.duplicate_of_count,
+    d.linked_count,
+    d.last_link_date,
+    tp.tag_global_popularity,
+    tp.tag_avg_popularity,
+    tp.tag_min_popularity,
+    tp.tag_max_popularity,
+    h.score_per_view,
+    h.age_hours,
+    h.net_votes,
+    h.favs,
+    r.rn_popular,
+    r.rn_netvote,
+    r.rn_efficiency,
+    r.dr_tag_pop,
+    uu.id as user_id,
+    uu.displayname as user_displayname,
+    uu.reputation as user_reputation,
+    uu.location as user_location,
+    ua.q_count as user_q_count,
+    ua.a_count as user_a_count,
+    ua.comment_count as user_comment_count,
+    ua.last_activity as user_last_activity,
+    uba.gold_badges,
+    uba.silver_badges,
+    uba.bronze_badges,
+    uba.total_badges,
+    uba.last_badge_date,
+    ad.time_to_accept,
+    va.upvotes as post_upvotes,
+    va.downvotes as post_downvotes,
+    va.favorites as post_favorites,
+    va.bounty_events,
+    va.bounty_total,
+    case
+      when q.closeddate is not null then 'closed'
+      when a.has_accepted > 0 then 'answered'
+      when coalesce(a.answer_count,0) = 0 and extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - q.question_date)) > 86400 then 'stale'
+      else 'open'
+    end as status_bucket,
+    case
+      when tp.tag_avg_popularity is null then 'untagged/unknown'
+      when tp.tag_avg_popularity >= 100000 then 'very popular'
+      when tp.tag_avg_popularity >= 10000 then 'popular'
+      when tp.tag_avg_popularity >= 1000 then 'niche'
+      else 'rare'
+    end as tag_pop_bucket,
+    q.closeddate
+  from candidate_set cs
+  join question_core q on q.question_id = cs.question_id
+  left join answer_stats a on a.question_id = q.question_id
+  left join vote_agg va on va.postid = q.question_id
+  left join close_events ce on ce.postid = q.question_id
+  left join dup_links d on d.duplicate_question_id = q.question_id
+  left join tag_popularity tp on tp.question_id = q.question_id
+  left join hot_candidate h on h.question_id = q.question_id
+  left join rankings r on r.question_id = q.question_id
+  left join users uu on uu.id = q.asker_id
+  left join user_activity ua on ua.user_id = q.asker_id
+  left join user_badge_agg uba on uba.userid = q.asker_id
+  left join accepted_answer_delta ad on ad.question_id = q.question_id
+)
+select
+  f.*,
+  (
+    select string_agg(substring(c.text from 1 for 80), ' | ' order by c.score desc, c.creationdate asc)
+    from comments c
+    where c.postid = f.question_id
+      and c.score = (
+        select max(c2.score) from comments c2 where c2.postid = f.question_id
+      )
+  ) as top_comment_snippets,
+  exists (
+    select 1
+    from posthistory ph
+    where ph.postid = f.question_id
+      and ph.posthistorytypeid in (52)
+  ) as was_hot_question,
+  exists (
+    select 1
+    from posthistory ph
+    where ph.postid = f.question_id
+      and ph.posthistorytypeid in (50)
+  ) as was_community_bumped,
+  trim(both ' ' from coalesce(nullif(f.user_displayname, ''), '[unknown user]')) as normalized_user_displayname,
+  round(
+    coalesce(f.post_upvotes,0)*2
+    - coalesce(f.post_downvotes,0)
+    + coalesce(f.post_favorites,0)*0.5
+    + coalesce(f.viewcount,0)/1000.0
+    + coalesce(f.answer_count,0)*1.5
+    + case when f.has_accepted > 0 then 5 else 0 end
+    - case when f.status_bucket = 'closed' then 3 else 0 end
+  , 2) as engagement_score,
+  percentile_disc(0.9) within group (order by coalesce(f.viewcount,0)) over () as p90_views_over_resultset,
+  dense_rank() over (partition by f.user_id order by
+    coalesce(f.post_upvotes,0)*2 - coalesce(f.post_downvotes,0) + coalesce(f.post_favorites,0)*0.5 desc,
+    f.viewcount desc
+  ) as user_post_rank
+from final f
+where
+  (
+    f.question_date >= cast('2024-10-01 12:34:56' as timestamp) - cast('60 days' as interval)
+    or (f.rn_popular <= 100 or f.rn_efficiency <= 100)
+  )
+  and (
+    f.tag_pop_bucket in ('popular','very popular')
+    or (
+      f.tag_pop_bucket = 'niche' and coalesce(f.answer_count,0) >= 1
+    )
+    or (
+      f.tag_pop_bucket = 'rare' and coalesce(f.viewcount,0) >= 1000
+    )
+    or f.tags is null
+  )
+  and (
+    f.status_bucket <> 'stale'
+    or (exists (
+      select 1 from posthistory ph where ph.postid = f.question_id and ph.posthistorytypeid in (52)
+    ))
+  )
+order by
+  engagement_score desc,
+  f.rn_netvote asc,
+  f.question_date desc
+limit 500;

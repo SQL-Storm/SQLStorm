@@ -1,0 +1,169 @@
+-- {"query": "2094.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1509} 
+with RecursiveUserStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        coalesce(bc.BadgeCount, 0) as BadgeCount,
+        coalesce(ab.AnswersCount, 0) as AnswersCount,
+        coalesce(qc.QuestionsCount, 0) as QuestionsCount,
+        row_number() over (order by u.Reputation desc, u.ViewCount desc nulls last, u.Id) as UserRank
+    from Users u
+    left join (
+        select UserId, count(*) as BadgeCount
+        from Badges
+        group by UserId
+    ) bc on bc.UserId = u.Id
+    left join (
+        select OwnerUserId, count(*) as AnswersCount
+        from Posts
+        where PostTypeId = 2
+        group by OwnerUserId
+    ) ab on ab.OwnerUserId = u.Id
+    left join (
+        select OwnerUserId, count(*) as QuestionsCount
+        from Posts
+        where PostTypeId = 1
+        group by OwnerUserId
+    ) qc on qc.OwnerUserId = u.Id
+),
+TopQuestionsWithAnswers AS (
+    select 
+        p.Id as QuestionId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        u.UserId,
+        u.DisplayName,
+        u.Reputation,
+        p.AcceptedAnswerId
+    from Posts p
+    join RecursiveUserStats u on p.OwnerUserId = u.UserId
+    where p.PostTypeId = 1
+      and p.CreationDate >= current_date - interval '1 year'
+      and p.Score > 0
+),
+AcceptedAnswerDetails AS (
+    select 
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreationDate,
+        a.OwnerUserId as AnswerOwnerUserId,
+        u.DisplayName as AnswerOwnerDisplayName,
+        u.Reputation as AnswerOwnerReputation
+    from Posts a
+    left join Users u on a.OwnerUserId = u.Id
+    where a.PostTypeId = 2
+),
+CommentStats AS (
+    select
+        p.Id as PostId,
+        count(c.Id) as TotalComments,
+        sum(case when c.Score is null then 0 else c.Score end) as TotalCommentScore,
+        max(c.CreationDate) as LatestCommentDate
+    from Posts p
+    left join Comments c on p.Id = c.PostId
+    group by p.Id
+),
+PostHistoryEdits AS (
+    select 
+        ph.PostId,
+        count(distinct ph.Id) as EditCount,
+        max(ph.CreationDate) as LastEditDate,
+        bool_or(ph.PostHistoryTypeId in (10,12,14,19)) as ContainsCloseOrDeleteOrEditTypes
+    from PostHistory ph
+    group by ph.PostId
+),
+UserBadgesRanking as (
+    select 
+        b.UserId,
+        b.Name as BadgeName,
+        b.Class,
+        row_number() over (partition by b.UserId order by b.Date desc) as RecentBadgeRank
+    from Badges b
+),
+DuplicateQuestions AS (
+    select pl.PostId as DuplicateQuestionId, pl.RelatedPostId as OriginalQuestionId
+    from PostLinks pl
+    join LinkTypes lt on pl.LinkTypeId = lt.Id and lt.Name = 'Duplicate'
+    where pl.PostId in (select Id from Posts where PostTypeId = 1)
+      and pl.RelatedPostId in (select Id from Posts where PostTypeId = 1)
+),
+QuestionsWithDuplicates AS (
+    select 
+        q.Id as QuestionId,
+        coalesce(dq.DuplicateQuestionCount, 0) as DuplicateCount,
+        coalesce(dq.FirstDuplicateCreationDate, null) as FirstDuplicateCreationDate
+    from Posts q
+    left join (
+        select 
+            OriginalQuestionId,
+            count(DuplicateQuestionId) as DuplicateQuestionCount,
+            min((select CreationDate from Posts where Id = DuplicateQuestionId)) as FirstDuplicateCreationDate
+        from DuplicateQuestions
+        group by OriginalQuestionId
+    ) dq on q.Id = dq.OriginalQuestionId
+    where q.PostTypeId = 1
+)
+select 
+    tq.QuestionId,
+    tq.Title,
+    tq.Score,
+    tq.ViewCount,
+    tq.AnswerCount,
+    rq.UserRank,
+    rq.DisplayName as QuestionOwner,
+    rq.Reputation as OwnerReputation,
+    coalesce(aad.AnswerId, -1) as AcceptedAnswerId,
+    coalesce(aad.AnswerScore, 0) as AcceptedAnswerScore,
+    coalesce(aad.AnswerOwnerDisplayName, 'Unknown') as AcceptedAnswerOwner,
+    coalesce(aad.AnswerOwnerReputation, 0) as AcceptedAnswerOwnerReputation,
+    cs.TotalComments,
+    cs.TotalCommentScore,
+    cs.LatestCommentDate,
+    phe.EditCount,
+    phe.LastEditDate,
+    phe.ContainsCloseOrDeleteOrEditTypes,
+    qd.DuplicateCount,
+    qd.FirstDuplicateCreationDate,
+    -- Example complex expression combining string and null logic
+    case 
+        when strpos(tq.Title, 'SQL') > 0 then 'Has SQL in title' 
+        when strpos(tq.Title, 'error') > 0 or strpos(lower(tq.Title), 'fail') > 0 then 'Possible Issues'
+        else coalesce(nullif(trim(tq.Title), ''), 'No title') 
+    end as TitleStatus,
+    -- Window function over answer scores of all accepted answers per user
+    rank() over (partition by rq.UserId order by aad.AnswerScore desc nulls last) as RankAcceptedAnswerScorePerUser,
+    -- Correlated subquery for newest badge name
+    (
+        select b2.Name 
+        from Badges b2 
+        where b2.UserId = rq.UserId 
+        order by b2.Date desc 
+        limit 1
+    ) as MostRecentBadge,
+    -- Set operation demonstrating UNION of two sets of users: high rep or many badges
+    case 
+        when rq.UserId in (
+            select UserId from RecursiveUserStats where Reputation > 100000
+            union 
+            select UserId from RecursiveUserStats where BadgeCount > 50
+        ) then true else false end as HighlyDistinguishedUser
+from TopQuestionsWithAnswers tq
+join RecursiveUserStats rq on tq.UserId = rq.UserId
+left join AcceptedAnswerDetails aad on tq.AcceptedAnswerId = aad.AnswerId
+left join CommentStats cs on tq.QuestionId = cs.PostId
+left join PostHistoryEdits phe on tq.QuestionId = phe.PostId
+left join QuestionsWithDuplicates qd on tq.QuestionId = qd.QuestionId
+where (cs.TotalComments > 0 or phe.EditCount > 2)
+  and (qd.DuplicateCount > 0 or tq.Score > 10)
+order by rq.Reputation desc, tq.Score desc, cs.TotalCommentScore desc
+limit 100;

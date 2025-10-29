@@ -1,0 +1,159 @@
+-- {"query": "1941.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2624} 
+WITH TagFilteredPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate AS PostCreationDate,
+        p.LastActivityDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.AcceptedAnswerId,
+        p.ClosedDate,
+        LOWER(p.Body) AS PostBodyLower,
+        p.Tags,
+        p.Body AS CurrentRawBody,
+        STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><') AS TagArray
+    FROM Posts p
+    WHERE
+        p.PostTypeId = 1 -- Only questions
+        AND (
+            LOWER(p.Title) LIKE '%performance%' OR LOWER(p.Title) LIKE '%optimization%' OR LOWER(p.Title) LIKE '%benchmark%'
+            OR p.Tags LIKE '%<performance>%' OR p.Tags LIKE '%<optimization>%' OR p.Tags LIKE '%<benchmark>%'
+        )
+        AND p.CreationDate >= '2020-01-01' -- Recent enough posts for active analysis
+),
+PostHistoryDetails AS (
+    SELECT
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate AS HistoryEventDate,
+        ph.Text AS HistoryTextContent,
+        ph.Comment AS HistoryCommentValue,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) as rn_latest_event,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId, ph.PostHistoryTypeId ORDER BY ph.CreationDate DESC) as rn_latest_of_type
+    FROM PostHistory ph
+    WHERE ph.PostId IN (SELECT PostId FROM TagFilteredPosts)
+      AND ph.PostHistoryTypeId IN (
+          2,  -- Initial Body
+          5,  -- Edit Body
+          8,  -- Rollback Body
+          10, -- Post Closed
+          11  -- Post Reopened
+      )
+),
+AggregatedPostHistory AS (
+    SELECT
+        phd.PostId,
+        MAX(CASE WHEN phd.PostHistoryTypeId = 2 AND phd.rn_latest_of_type = 1 THEN phd.HistoryTextContent ELSE NULL END) AS InitialBodyContent,
+        MAX(CASE WHEN phd.PostHistoryTypeId IN (5, 8) AND phd.rn_latest_event = 1 THEN phd.HistoryTextContent ELSE NULL END) AS LatestEditBodyContent,
+        COUNT(DISTINCT CASE WHEN phd.PostHistoryTypeId IN (5, 8) THEN phd.HistoryEventDate ELSE NULL END) AS DistinctEditCount,
+        BOOL_OR(phd.PostHistoryTypeId = 10 AND phd.HistoryCommentValue IN ('101', '1', '2')) AS WasClosedAsDuplicateOrOffTopic, -- Old and new duplicate/off-topic reasons
+        BOOL_OR(phd.PostHistoryTypeId = 11) AS WasReopened,
+        MIN(CASE WHEN phd.PostHistoryTypeId = 10 THEN phd.HistoryEventDate ELSE NULL END) AS FirstCloseDate,
+        MAX(CASE WHEN phd.PostHistoryTypeId = 11 THEN phd.HistoryEventDate ELSE NULL END) AS LastReopenDate
+    FROM PostHistoryDetails phd
+    GROUP BY phd.PostId
+)
+SELECT
+    tfp.PostId,
+    tfp.Title,
+    tfp.PostScore,
+    tfp.ViewCount,
+    tfp.AnswerCount,
+    tfp.CommentCount,
+    tfp.FavoriteCount,
+    tfp.PostCreationDate,
+    tfp.LastActivityDate,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation AS OwnerReputation,
+    tfp.ClosedDate AS PostClosedDate,
+    COALESCE(aph.WasClosedAsDuplicateOrOffTopic, FALSE) AS FlaggedClosedAsDuplicateOrOffTopic,
+    COALESCE(aph.WasReopened, FALSE) AS FlaggedReopened,
+    COALESCE(aph.DistinctEditCount, 0) AS TotalDistinctEdits,
+    -- String operations and NULL logic
+    COALESCE(NULLIF(LENGTH(aph.LatestEditBodyContent), 0), LENGTH(tfp.CurrentRawBody)) AS FinalBodyLength,
+    ABS(LENGTH(COALESCE(aph.InitialBodyContent, '')) - LENGTH(COALESCE(aph.LatestEditBodyContent, tfp.CurrentRawBody, ''))) AS BodyLengthChange,
+    TRIM(SUBSTRING(tfp.Title FROM 1 FOR 75)) AS TitleExcerpt,
+    -- Aggregate and Window functions
+    SUM(CASE WHEN v.VoteTypeId = 8 THEN v.BountyAmount ELSE 0 END) AS TotalBountyOffered,
+    COUNT(DISTINCT c.Id) AS TotalCommentsReceived,
+    COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN pl.RelatedPostId ELSE NULL END) AS NumberOfDuplicateLinks,
+    AVG(tfp.PostScore) OVER (PARTITION BY tfp.OwnerUserId) AS AvgPostScoreByOwner,
+    RANK() OVER (ORDER BY tfp.PostScore DESC, tfp.ViewCount DESC, tfp.FavoriteCount DESC) AS GlobalPostEngagementRank,
+    LAG(tfp.PostCreationDate, 1, '1970-01-01'::timestamp) OVER (PARTITION BY tfp.OwnerUserId ORDER BY tfp.PostCreationDate) AS PreviousPostCreationDateByOwner,
+    -- Complex CASE expression for detailed post status
+    CASE
+        WHEN tfp.ClosedDate IS NOT NULL AND COALESCE(aph.WasClosedAsDuplicateOrOffTopic, FALSE) AND COALESCE(aph.WasReopened, FALSE) THEN 'Closed (Duplicate/Off-Topic) & Reopened'
+        WHEN tfp.ClosedDate IS NOT NULL AND COALESCE(aph.WasClosedAsDuplicateOrOffTopic, FALSE) THEN 'Closed as Duplicate/Off-Topic'
+        WHEN tfp.ClosedDate IS NOT NULL AND aph.FirstCloseDate IS NOT NULL THEN 'Closed (Other Reasons)'
+        WHEN tfp.ClosedDate IS NULL AND COALESCE(aph.WasReopened, FALSE) THEN 'Reopened But Currently Open'
+        ELSE 'Open and Active'
+    END AS DetailedPostState,
+    -- Correlated subquery 1: Check if owner has any *other* question with very high view count created within 6 months
+    EXISTS (
+        SELECT 1
+        FROM Posts op_corr
+        WHERE op_corr.OwnerUserId = tfp.OwnerUserId
+          AND op_corr.PostTypeId = 1 -- Looking for another question
+          AND op_corr.Id != tfp.PostId
+          AND op_corr.ViewCount > 75000
+          AND op_corr.CreationDate BETWEEN tfp.PostCreationDate - INTERVAL '6 months' AND tfp.PostCreationDate + INTERVAL '6 months'
+        LIMIT 1
+    ) AS OwnerHasOtherHighViewQuestionNearTime,
+    -- Correlated subquery 2: Count specific tag-based badges earned by the owner around the post creation date
+    (SELECT COUNT(b.Id)
+     FROM Badges b
+     WHERE b.UserId = tfp.OwnerUserId
+       AND b.TagBased = TRUE
+       AND LOWER(b.Name) IN ('performance', 'optimization', 'benchmarking')
+       AND b.Date >= tfp.PostCreationDate - INTERVAL '1 year' AND b.Date <= tfp.PostCreationDate + INTERVAL '6 months'
+    ) AS RelevantTagBadgesCount,
+    -- String array operations and filtering based on tags, counting specific tech tags
+    (SELECT COUNT(*) FROM UNNEST(tfp.TagArray) AS tag WHERE tag ILIKE 'c#%' OR tag ILIKE 'java%' OR tag ILIKE 'python%') AS SpecificTechTagCount,
+    -- Complicated calculation combining multiple factors
+    (u.Reputation * 0.05 + tfp.PostScore * 0.75 + tfp.ViewCount / 1500.0 + COALESCE(tfp.AnswerCount, 0) * 1.5 + COALESCE(tfp.FavoriteCount, 0) * 1.0) AS WeightedEngagementScore
+FROM TagFilteredPosts tfp
+LEFT JOIN Users u ON tfp.OwnerUserId = u.Id
+LEFT JOIN AggregatedPostHistory aph ON tfp.PostId = aph.PostId
+LEFT JOIN Votes v ON tfp.PostId = v.PostId
+LEFT JOIN Comments c ON tfp.PostId = c.PostId
+LEFT JOIN PostLinks pl ON tfp.PostId = pl.PostId
+WHERE
+    tfp.OwnerUserId IS NOT NULL
+    AND u.Reputation >= 10000 -- Filter for high-reputation users
+    AND tfp.PostScore >= 75 -- Only highly upvoted questions
+    AND COALESCE(aph.DistinctEditCount, 0) >= 2 -- At least two distinct edits
+    AND tfp.LastActivityDate > (tfp.PostCreationDate + INTERVAL '3 months') -- Post must have remained active for at least 3 months
+    AND (
+        (tfp.FavoriteCount > 15 AND tfp.AnswerCount > 3 AND tfp.ViewCount > 5000) -- Very popular and answered
+        OR (
+            COALESCE(aph.WasClosedAsDuplicateOrOffTopic, FALSE)
+            AND COALESCE(aph.WasReopened, FALSE)
+            AND aph.LastReopenDate IS NOT NULL AND aph.FirstCloseDate IS NOT NULL
+            AND aph.LastReopenDate > aph.FirstCloseDate
+            AND tfp.PostScore >= 100 -- Closed, reopened, and still high score
+        )
+    )
+    AND tfp.PostId IN ( -- Set operator: Find questions created post-2021 that also have a significant number of comments (more than 5)
+        SELECT p_id_filter.Id FROM Posts p_id_filter
+        WHERE p_id_filter.PostTypeId = 1 AND p_id_filter.CreationDate >= '2021-01-01'
+        INTERSECT
+        SELECT c_filter.PostId FROM Comments c_filter GROUP BY c_filter.PostId HAVING COUNT(c_filter.Id) > 5
+    )
+GROUP BY
+    tfp.PostId, tfp.Title, tfp.PostScore, tfp.ViewCount, tfp.AnswerCount, tfp.CommentCount, tfp.FavoriteCount,
+    tfp.PostCreationDate, tfp.LastActivityDate, u.DisplayName, u.Reputation, tfp.ClosedDate,
+    aph.WasClosedAsDuplicateOrOffTopic, aph.WasReopened, aph.DistinctEditCount, aph.InitialBodyContent,
+    aph.LatestEditBodyContent, tfp.CurrentRawBody, tfp.OwnerUserId, tfp.AcceptedAnswerId,
+    aph.FirstCloseDate, aph.LastReopenDate, tfp.TagArray
+HAVING
+    TotalCommentsReceived > 5 -- Further filter with aggregates
+    AND TotalBountyOffered >= 100 -- Significant bounty engagement
+    AND SpecificTechTagCount > 0 -- Must contain at least one of the specific tech tags
+ORDER BY
+    WeightedEngagementScore DESC, GlobalPostEngagementRank ASC, TotalBountyOffered DESC
+LIMIT 250;

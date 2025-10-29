@@ -1,0 +1,62 @@
+-- {"query": "6786.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-micro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 599} 
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    u.AboutMe,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    SUM(v.BountyAmount) AS TotalBountyAmount,
+    MAX(u.CreationDate) AS LatestAccountActivity,
+    MIN(CASE WHEN p.ClosedDate IS NOT NULL THEN p.ClosedDate ELSE p.LastActivityDate END) AS EarliestClosedPost,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate ELSE NULL END) AS LatestClosedReason,
+    STRING_AGG(DISTINCT t.TagName, ', ') AS PopularTags,
+    b.Class AS BadgeClass
+FROM 
+    Users u
+LEFT JOIN 
+    (SELECT 
+         UserId, 
+         MAX(CASE WHEN Class = 1 THEN Name ELSE NULL END) AS GoldBadge,
+         MAX(CASE WHEN Class = 2 THEN Name ELSE NULL END) AS SilverBadge,
+         MAX(CASE WHEN Class = 3 THEN Name ELSE NULL END) AS BronzeBadge
+     FROM 
+         Badges
+     GROUP BY 
+         UserId) b ON u.Id = b.UserId
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    (SELECT 
+         PostId, 
+         MAX(CASE WHEN PostHistoryTypeId = 10 THEN Comment ELSE NULL END) AS CloseReason
+     FROM 
+         PostHistory
+     WHERE 
+         PostHistoryTypeId = 10
+     GROUP BY 
+         PostId) ph ON p.Id = ph.PostId
+LEFT JOIN 
+    (SELECT 
+         PostId, 
+         SUM(BountyAmount) AS BountyAmount
+     FROM 
+         Votes
+     WHERE 
+         VoteTypeId = 8
+     GROUP BY 
+         PostId) v ON p.Id = v.PostId
+LEFT JOIN 
+    Tags t ON p.Id IN (t.ExcerptPostId, t.WikiPostId)
+WHERE 
+    (p.PostTypeId = 1 OR p.PostTypeId = 2)
+    AND u.Reputation > 100
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation, u.Location, u.AboutMe, b.GoldBadge, b.SilverBadge, b.BronzeBadge
+HAVING 
+    COUNT(DISTINCT p.Id) > 10
+ORDER BY 
+    TotalBountyAmount DESC, 
+    TotalPosts DESC
+LIMIT 100;

@@ -1,0 +1,156 @@
+-- {"query": "2700.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1451} 
+with RecursiveBadgeCounts as (
+    select UserId,
+           Name as BadgeName,
+           Class,
+           TagBased,
+           Row_Number() over (partition by UserId order by Date desc) as BadgeRank,
+           count(*) over (partition by UserId) as TotalBadges
+    from Badges
+    where Class in (1,2,3)
+),
+UserTopBadges as (
+    select UserId,
+           string_agg(distinct BadgeName || '(' || Class || ')', ', ' order by BadgeRank) as RecentBadges,
+           max(TotalBadges) as BadgeCount
+    from RecursiveBadgeCounts
+    where BadgeRank <= 5
+    group by UserId
+),
+UserActivityStats as (
+    select u.Id as UserId,
+           u.DisplayName,
+           u.Reputation,
+           u.Location,
+           u.CreationDate,
+           coalesce(pq.QCount,0) as QuestionCount,
+           coalesce(pa.ACount,0) as AnswerCount,
+           coalesce(vu.UpVotes,0) as TotalUpVotes,
+           coalesce(vd.DownVotes,0) as TotalDownVotes,
+           coalesce(cm.CCount,0) as CommentCount,
+           uts.RecentBadges,
+           uts.BadgeCount
+    from Users u
+    left join (
+        select OwnerUserId, count(*) as QCount
+        from Posts
+        where PostTypeId = 1
+        group by OwnerUserId
+    ) pq on pq.OwnerUserId = u.Id
+    left join (
+        select OwnerUserId, count(*) as ACount
+        from Posts
+        where PostTypeId = 2
+        group by OwnerUserId
+    ) pa on pa.OwnerUserId = u.Id
+    left join (
+        select UserId, sum(case when VoteTypeId = 2 then 1 else 0 end) as UpVotes
+        from Votes
+        group by UserId
+    ) vu on vu.UserId = u.Id
+    left join (
+        select UserId, sum(case when VoteTypeId = 3 then 1 else 0 end) as DownVotes
+        from Votes
+        group by UserId
+    ) vd on vd.UserId = u.Id
+    left join (
+        select UserId, count(*) as CCount
+        from Comments
+        where UserId is not null
+        group by UserId
+    ) cm on cm.UserId = u.Id
+    left join UserTopBadges uts on uts.UserId = u.Id
+),
+RecentHighlyVotedQuestions as (
+    select p.Id,
+           p.OwnerUserId,
+           p.Title,
+           p.CreationDate,
+           p.Score,
+           row_number() over (partition by OwnerUserId order by Score desc, CreationDate desc) as rn
+    from Posts p
+    where p.PostTypeId = 1
+      and p.Score > 10
+      and p.CreationDate > current_date - interval '180 days'
+),
+UserTopQuestions as (
+    select OwnerUserId,
+           json_agg(json_build_object('Id', Id, 'Title', Title, 'Score', Score)) filter (where rn <= 3) as TopQuestions
+    from RecentHighlyVotedQuestions
+    group by OwnerUserId
+),
+QuestionAnswerRatios as (
+    select u.Id as UserId,
+           coalesce(q.QCount,0) as Questions,
+           coalesce(a.ACount,0) as Answers,
+           case 
+             when coalesce(q.QCount,0) = 0 and coalesce(a.ACount,0) = 0 then null
+             when coalesce(q.QCount,0) = 0 then null
+             else round(cast(coalesce(a.ACount,0) as numeric) / nullif(q.QCount,0), 2) end as AnswerToQuestionRatio
+    from Users u
+    left join (
+        select OwnerUserId, count(*) as QCount
+        from Posts
+        where PostTypeId = 1
+        group by OwnerUserId
+    ) q on q.OwnerUserId = u.Id
+    left join (
+        select OwnerUserId, count(*) as ACount
+        from Posts
+        where PostTypeId = 2
+        group by OwnerUserId
+    ) a on a.OwnerUserId = u.Id
+),
+DuplicateLinkedPosts as (
+    select pl.PostId,
+           pl.RelatedPostId,
+           p1.Title as PostTitle,
+           p2.Title as RelatedPostTitle,
+           pl.CreationDate,
+           u.DisplayName as Poster,
+           row_number() over (partition by pl.PostId order by pl.CreationDate desc) as rn
+    from PostLinks pl
+    join Posts p1 on p1.Id = pl.PostId
+    join Posts p2 on p2.Id = pl.RelatedPostId
+    left join Users u on u.Id = p1.OwnerUserId
+    where pl.LinkTypeId = 3 -- Duplicate link type
+),
+LatestCloseAttempts as (
+    select ph.PostId,
+           max(ph.CreationDate) filter (where ph.PostHistoryTypeId = 10) as LastClosedDate,
+           max(ph.CreationDate) filter (where ph.PostHistoryTypeId = 11) as LastReopenedDate,
+           min(cr.Id) as CloseReasonId,
+           cr.Name as CloseReason
+    from PostHistory ph
+    left join CloseReasonTypes cr on cr.Id = cast(ph.Comment as int) and ph.PostHistoryTypeId = 10
+    group by ph.PostId, cr.Name, cr.Id
+)
+select ua.UserId,
+       ua.DisplayName,
+       ua.Reputation,
+       ua.Location,
+       ua.QuestionCount,
+       ua.AnswerCount,
+       ua.TotalUpVotes,
+       ua.TotalDownVotes,
+       ua.CommentCount,
+       ua.BadgeCount,
+       ua.RecentBadges,
+       qtr.AnswerToQuestionRatio,
+       utq.TopQuestions,
+       dup.PostTitle as DuplicatePostTitle,
+       dup.RelatedPostTitle as DuplicateRelatedTitle,
+       dup.CreationDate as DuplicateLinkCreatedAt,
+       dup.Poster as DuplicatePostOwner,
+       lca.LastClosedDate,
+       lca.LastReopenedDate,
+       lca.CloseReason
+from UserActivityStats ua
+left join QuestionAnswerRatios qtr on qtr.UserId = ua.UserId
+left join UserTopQuestions utq on utq.OwnerUserId = ua.UserId
+left join DuplicateLinkedPosts dup on dup.rn = 1 and dup.PostId in (select Id from Posts where OwnerUserId = ua.UserId)
+left join LatestCloseAttempts lca on lca.PostId in (select Id from Posts where OwnerUserId = ua.UserId)
+where ua.Reputation > 1000
+  and (ua.QuestionCount > 10 or ua.AnswerCount > 10)
+order by ua.Reputation desc, ua.BadgeCount desc
+limit 100;

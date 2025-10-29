@@ -1,0 +1,141 @@
+WITH UserStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1)                AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2)                AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3)                AS BronzeBadges,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1)           AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2)           AS AnswerCount,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC,
+                                    COUNT(b.Id) FILTER (WHERE b.Class = 1) DESC) AS ReputationRank
+    FROM Users u
+    LEFT JOIN Badges b   ON b.UserId = u.Id
+    LEFT JOIN Posts  p   ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+QuestionMetrics AS (
+    SELECT
+        q.Id,
+        q.Title,
+        q.CreationDate,
+        q.Score                         AS QuestionScore,
+        q.ViewCount,
+        q.FavoriteCount,
+        q.Tags,
+        q.AnswerCount,
+        COALESCE(q.AcceptedAnswerId, 0) AS HasAcceptedAnswer,
+        (SELECT AVG(a.Score)
+         FROM Posts a
+         WHERE a.ParentId = q.Id AND a.PostTypeId = 2) AS AvgAnswerScore,
+        ROW_NUMBER() OVER (PARTITION BY q.OwnerUserId ORDER BY q.CreationDate DESC) AS RecentQuestionRow,
+        q.OwnerUserId
+    FROM Posts q
+    WHERE q.PostTypeId = 1
+),
+
+TagInfo AS (
+    SELECT
+        t.TagName,
+        t.Count               AS TagUseCount,
+        COALESCE(e.Title,'')  AS ExcerptTitle,
+        COALESCE(w.Title,'')  AS WikiTitle
+    FROM Tags t
+    LEFT JOIN Posts e ON e.Id = t.ExcerptPostId
+    LEFT JOIN Posts w ON w.Id = t.WikiPostId
+),
+
+Combined AS (
+    SELECT
+        us.Id                     AS UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.GoldBadges,
+        us.SilverBadges,
+        us.BronzeBadges,
+        us.QuestionCount,
+        us.AnswerCount,
+        us.ReputationRank,
+        qm.Id                     AS QuestionId,
+        qm.Title,
+        qm.CreationDate,
+        qm.QuestionScore,
+        qm.ViewCount,
+        qm.FavoriteCount,
+        qm.Tags,
+        qm.AnswerCount           AS AnswersOnQuestion,
+        qm.HasAcceptedAnswer,
+        qm.AvgAnswerScore,
+        qm.RecentQuestionRow,
+        -- split tags like '<tag1><tag2>' into rows: produce tag without angle brackets
+        TRIM(BOTH '<>' FROM t.tag_part) AS SingleTag,
+        qm.OwnerUserId
+    FROM UserStats us
+    LEFT JOIN QuestionMetrics qm
+        ON qm.OwnerUserId = us.Id
+       AND qm.RecentQuestionRow = 1
+    LEFT JOIN LATERAL (
+        -- break tags string into rows by finding occurrences between '<' and '>'
+        SELECT
+            regexp_matches(qm.Tags, '<([^>]+)>', 'g') [1] AS tag_part
+    ) t ON qm.Tags IS NOT NULL
+)
+
+SELECT
+    c.UserId,
+    c.DisplayName,
+    c.Reputation,
+    c.ReputationRank,
+    c.GoldBadges,
+    c.SilverBadges,
+    c.BronzeBadges,
+    c.QuestionCount,
+    c.AnswerCount,
+    c.QuestionId,
+    c.Title,
+    c.QuestionScore,
+    c.ViewCount,
+    c.FavoriteCount,
+    COALESCE(ti.TagUseCount,0)                         AS TagPopularity,
+    CASE
+        WHEN c.AvgAnswerScore IS NULL THEN 'No Answers'
+        WHEN c.AvgAnswerScore > 5      THEN 'High Quality'
+        ELSE                               'Average'
+    END                                                AS AnswerQuality,
+    CASE WHEN c.HasAcceptedAnswer <> 0 THEN 'Accepted' ELSE 'Unaccepted' END AS AcceptanceStatus,
+    CASE
+        WHEN c.Tags ILIKE '%<sql>%'
+          OR c.Tags ILIKE '%<database>%'
+        THEN 1 ELSE 0
+    END                                                AS IsSQLRelated
+FROM Combined c
+LEFT JOIN TagInfo ti ON ti.TagName = c.SingleTag
+WHERE c.UserId IS NOT NULL
+
+UNION ALL
+
+SELECT
+    NULL                     AS UserId,
+    'Aggregated Summary'     AS DisplayName,
+    NULL                     AS Reputation,
+    NULL                     AS ReputationRank,
+    NULL                     AS GoldBadges,
+    NULL                     AS SilverBadges,
+    NULL                     AS BronzeBadges,
+    SUM(us.QuestionCount)   AS QuestionCount,
+    SUM(us.AnswerCount)     AS AnswerCount,
+    NULL                     AS QuestionId,
+    NULL                     AS Title,
+    NULL                     AS QuestionScore,
+    NULL                     AS ViewCount,
+    NULL                     AS FavoriteCount,
+    NULL                     AS TagPopularity,
+    NULL                     AS AnswerQuality,
+    NULL                     AS AcceptanceStatus,
+    NULL                     AS IsSQLRelated
+FROM UserStats us
+WHERE us.ReputationRank <= 100
+
+ORDER BY ReputationRank NULLS LAST, QuestionScore DESC NULLS LAST;

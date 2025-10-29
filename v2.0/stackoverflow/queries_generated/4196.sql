@@ -1,0 +1,190 @@
+-- {"query": "4196.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1424} 
+
+WITH
+  UserPostStats AS (
+    SELECT
+      p.OwnerUserId,
+      COUNT(p.Id) AS PostCount,
+      SUM(p.Score) AS TotalScore,
+      AVG(p.AnswerCount) AS AvgAnswerCount,
+      MAX(p.CreationDate) AS LastPostDate,
+      -- Calculate the day of the week for the last post
+      EXTRACT(
+        DOW
+        FROM
+          MAX(p.CreationDate)
+      ) AS LastPostDayOfWeek
+    FROM
+      Posts AS p
+    WHERE
+      p.OwnerUserId IS NOT NULL
+    GROUP BY
+      p.OwnerUserId
+  ),
+  TagEngagement AS (
+    SELECT
+      t.TagName,
+      COUNT(DISTINCT ph.PostId) AS TagPostHistoryCount,
+      COUNT(DISTINCT c.PostId) AS TagCommentCount,
+      COUNT(DISTINCT v.PostId) AS TagVoteCount,
+      -- Calculate a composite engagement score
+      (
+        COUNT(DISTINCT ph.PostId) * 1.5
+        + COUNT(DISTINCT c.PostId) * 0.7
+        + COUNT(DISTINCT v.PostId) * 0.3
+      ) AS EngagementScore
+    FROM
+      Tags AS t
+    LEFT JOIN
+      Posts AS p
+      ON p.Tags LIKE '%' || t.TagName || '%'
+    LEFT JOIN
+      PostHistory AS ph
+      ON p.Id = ph.PostId
+      AND ph.PostHistoryTypeId IN (
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9
+      ) -- Relevant post history types for content changes
+    LEFT JOIN
+      Comments AS c
+      ON p.Id = c.PostId
+    LEFT JOIN
+      Votes AS v
+      ON p.Id = v.PostId
+      AND v.VoteTypeId IN (2, 3) -- Upvotes and downvotes
+    GROUP BY
+      t.TagName
+  ),
+  HotQuestions AS (
+    SELECT
+      p.Id,
+      p.Title,
+      p.OwnerUserId,
+      p.CreationDate,
+      p.Score,
+      p.ViewCount,
+      -- A simplistic "hotness" score
+      (
+        p.Score * 10 + p.ViewCount * 0.1 + p.AnswerCount * 5
+      ) AS HotnessScore,
+      ROW_NUMBER() OVER (
+        ORDER BY
+          (
+            p.Score * 10 + p.ViewCount * 0.1 + p.AnswerCount * 5
+          ) DESC
+      ) AS RankByHotness
+    FROM
+      Posts AS p
+    WHERE
+      p.PostTypeId = 1 -- Questions only
+      AND p.ClosedDate IS NULL
+      AND p.Score > 10 -- Ensure some level of activity
+      AND p.AnswerCount > 0
+  )
+SELECT
+  u.DisplayName AS UserName,
+  ups.PostCount,
+  ups.TotalScore,
+  ups.AvgAnswerCount,
+  ups.LastPostDate,
+  -- Categorize user activity based on last post day of week
+  CASE ups.LastPostDayOfWeek
+    WHEN 0 THEN 'Sunday'
+    WHEN 1 THEN 'Monday'
+    WHEN 2 THEN 'Tuesday'
+    WHEN 3 THEN 'Wednesday'
+    WHEN 4 THEN 'Thursday'
+    WHEN 5 THEN 'Friday'
+    WHEN 6 THEN 'Saturday'
+    ELSE 'Unknown'
+  END AS LastPostDay,
+  -- Calculate a user engagement score incorporating badges and posts
+  (
+    ups.TotalScore * 0.5
+    + ups.AvgAnswerCount * 10
+    + (
+      SELECT
+        COUNT(*)
+      FROM
+        Badges AS b
+      WHERE
+        b.UserId = u.Id
+        AND b.Class = 1 -- Gold badges
+    ) * 50 -- Weighting gold badges heavily
+    + (
+      SELECT
+        COUNT(*)
+      FROM
+        Badges AS b
+      WHERE
+        b.UserId = u.Id
+        AND b.Class = 2 -- Silver badges
+    ) * 25 -- Weighting silver badges
+  ) AS UserEngagementScore,
+  hq.Title AS HottestQuestionTitle,
+  hq.HotnessScore AS HottestQuestionHotness,
+  -- Combine tag engagement scores for tags associated with the user's posts
+  (
+    SELECT
+      SUM(te.EngagementScore)
+    FROM
+      TagEngagement AS te
+    JOIN
+      Posts AS p_tags
+      ON p_tags.Tags LIKE '%' || te.TagName || '%'
+    WHERE
+      p_tags.OwnerUserId = u.Id
+  ) AS UserTagEngagementSum,
+  -- Count of posts older than a certain date, normalized by total posts
+  (
+    CAST(
+      COUNT(
+        CASE
+          WHEN p_old.CreationDate < (
+            SELECT
+              MIN(CreationDate)
+            FROM
+              Posts
+            WHERE
+              OwnerUserId = u.Id
+          ) + INTERVAL '1 year' THEN 1
+          ELSE NULL
+        END
+      ) AS REAL
+    ) * 100.0 / ups.PostCount
+  ) AS PercentageOfOldPosts
+FROM
+  Users AS u
+JOIN
+  UserPostStats AS ups
+  ON u.Id = ups.OwnerUserId
+LEFT JOIN
+  HotQuestions AS hq
+  ON hq.RankByHotness = ups.PostCount -- Arbitrary join condition to relate hot questions to user stats
+LEFT JOIN
+  Posts AS p_old -- Self-join to find older posts
+  ON u.Id = p_old.OwnerUserId
+GROUP BY
+  u.Id,
+  u.DisplayName,
+  ups.PostCount,
+  ups.TotalScore,
+  ups.AvgAnswerCount,
+  ups.LastPostDate,
+  ups.LastPostDayOfWeek,
+  hq.Title,
+  hq.HotnessScore
+HAVING
+  ups.PostCount > 50 -- Filter for users with a significant number of posts
+  AND ups.TotalScore > 1000
+ORDER BY
+  UserEngagementScore DESC,
+  ups.LastPostDate DESC
+LIMIT 100;

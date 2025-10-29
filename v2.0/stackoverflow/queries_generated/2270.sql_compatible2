@@ -1,0 +1,151 @@
+with RecursiveTagCount as (
+    select
+      p.Id as PostId,
+      unnest(string_to_array(substring(coalesce(p.Tags, ''), 2, length(coalesce(p.Tags, '')) - 2), '><')) as TagName
+    from Posts p
+    where p.PostTypeId = 1
+),
+TagUsage as (
+    select
+      rt.TagName,
+      count(distinct rt.PostId) as QuestionCount,
+      coalesce(t.Count, 0) as TotalCount,
+      max(case when t.IsModeratorOnly then 1 else 0 end) as IsModeratorOnly,
+      max(case when t.IsRequired then 1 else 0 end) as IsRequired
+    from RecursiveTagCount rt
+    left join Tags t on t.TagName = rt.TagName
+    group by rt.TagName, t.Count
+),
+UserBadgeStats as (
+    select
+      b.UserId,
+      count(case when b.Class = 1 then 1 end) as GoldBadges,
+      count(case when b.Class = 2 then 1 end) as SilverBadges,
+      count(case when b.Class = 3 then 1 end) as BronzeBadges,
+      count(distinct b.Name) as DistinctBadges
+    from Badges b
+    group by b.UserId
+),
+UserPostActivity as (
+    select
+      u.Id as UserId,
+      u.DisplayName,
+      count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsCount,
+      count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersCount,
+      sum(p.Score) as TotalPostScore,
+      avg(p.Score) as AvgPostScore,
+      max(p.CreationDate) as LastPostDate,
+      min(p.CreationDate) as FirstPostDate,
+      bool_or(p.ClosedDate is not null) as HasClosedPost
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName
+),
+AcceptedAnswerRanks as (
+    select
+      p.Id,
+      p.ParentId,
+      p.Score,
+      row_number() over (partition by p.ParentId order by p.Score desc, p.CreationDate asc) as ScoreRank
+    from Posts p
+    where p.PostTypeId = 2
+),
+QuestionsWithAcceptedAnswerInfo as (
+    select
+      q.Id as QuestionId,
+      q.Title,
+      q.Score as QuestionScore,
+      q.OwnerUserId,
+      a.Id as AcceptedAnswerId,
+      a.Score as AcceptedAnswerScore,
+      a.CreationDate as AcceptedAnswerCreationDate,
+      case when aar.ScoreRank = 1 then true else false end as AcceptedIsTopScore
+    from Posts q
+    left join Posts a on q.AcceptedAnswerId = a.Id
+    left join AcceptedAnswerRanks aar on aar.Id = a.Id
+    where q.PostTypeId = 1
+)
+select distinct 
+  u.Id as UserId,
+  u.DisplayName,
+  up.QuestionsCount,
+  up.AnswersCount,
+  up.TotalPostScore,
+  up.AvgPostScore,
+  up.HasClosedPost,
+  coalesce(ub.GoldBadges, 0) as GoldBadges,
+  coalesce(ub.SilverBadges, 0) as SilverBadges,
+  coalesce(ub.BronzeBadges, 0) as BronzeBadges,
+  ub.DistinctBadges,
+  (
+    select avg(score_diff)
+    from (
+      select
+        abs(a.Score - coalesce(pa.Score,0)) as score_diff
+      from Posts a
+      left join Posts pa on a.ParentId = pa.Id
+      where a.PostTypeId = 2 and a.OwnerUserId = u.Id
+    ) x
+  ) as AvgAnswerScoreDiffWithParent,
+  count(distinct ph.Id) filter (where ph.PostHistoryTypeId in (10,11)) as CloseReopenEvents,
+  count(distinct v.Id) filter (where v.VoteTypeId = 2) as UpVotesGiven,
+  count(distinct v.Id) filter (where v.VoteTypeId = 3) as DownVotesGiven,
+  count(distinct c.Id) as CommentsMade,
+  string_agg(distinct coalesce(tu.TagName, ''), ',') as TagsUsed,
+  (
+    select string_agg(name, ', ')
+    from (
+      select Name
+      from Badges b2
+      where b2.UserId = u.Id and coalesce(b2.TagBased, false) = true
+      group by Name
+      order by max(Date) desc
+      limit 5
+    ) btags
+  ) as Top5TagBadges,
+  case 
+    when up.LastPostDate is null then 'No Posts' 
+    when up.LastPostDate < cast('2024-10-01 12:34:56' as timestamp) - interval '1 year' then 'Inactive'
+    else 'Active'
+  end as UserActivityStatus,
+  (
+    select count(1)
+    from Posts p2
+    where p2.OwnerUserId = u.Id and p2.PostTypeId = 1 and p2.Score > 10 and p2.AcceptedAnswerId is not null
+  ) as HighScoreQuestionsWithAcceptedAnswers,
+  case 
+    when exists (
+      select 1 from Votes v2 where v2.UserId = u.Id and v2.VoteTypeId = 14
+    ) then true
+    else false
+  end as HasModeratorReviewVote,
+  (
+    select avg(accepted.AcceptedAnswerScore) filter (where accepted.AcceptedIsTopScore)
+    from QuestionsWithAcceptedAnswerInfo accepted
+    where accepted.OwnerUserId = u.Id and accepted.AcceptedAnswerId is not null
+  ) as AvgTopAcceptedAnswerScore,
+  greatest(u.Reputation, 1) / nullif(coalesce(up.QuestionsCount,0) + coalesce(up.AnswersCount,0), 0) as ReputationPerPost,
+  coalesce((
+     select sum(BountyAmount)
+     from Votes v3
+     join Posts p3 on p3.Id = v3.PostId
+     where v3.UserId = u.Id and v3.VoteTypeId = 8
+  ), 0) as TotalBountyStarted
+from Users u
+left join UserPostActivity up on up.UserId = u.Id
+left join UserBadgeStats ub on ub.UserId = u.Id
+left join PostHistory ph on ph.UserId = u.Id
+left join Votes v on v.UserId = u.Id
+left join Comments c on c.UserId = u.Id
+left join RecursiveTagCount rtc on rtc.PostId in (
+    select p.Id from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 1
+)
+left join TagUsage tu on tu.TagName = rtc.TagName
+where u.Reputation > (
+  select percentile_cont(0.75) within group (order by Reputation) from Users
+)
+and u.CreationDate <= cast('2024-10-01' as date) - interval '6 months'
+group by u.Id, u.DisplayName, up.QuestionsCount, up.AnswersCount, up.TotalPostScore, up.AvgPostScore, up.HasClosedPost, ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges, ub.DistinctBadges, up.LastPostDate, u.Reputation
+having avg(up.AvgPostScore) > 1
+order by ReputationPerPost desc
+limit 20;

@@ -1,0 +1,154 @@
+-- {"query": "4358.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1366} 
+
+WITH
+  QuestionDetails AS (
+    SELECT
+      p.Id AS QuestionId,
+      p.Title AS QuestionTitle,
+      p.Score AS QuestionScore,
+      p.ViewCount AS QuestionViewCount,
+      p.AnswerCount,
+      u.DisplayName AS OwnerDisplayName,
+      u.Reputation AS OwnerReputation,
+      p.Tags,
+      p.CreationDate AS QuestionCreationDate,
+      ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.ViewCount DESC) AS rn_score_views
+    FROM Posts AS p
+    JOIN Users AS u
+      ON p.OwnerUserId = u.Id
+    WHERE
+      p.PostTypeId = 1 AND p.ClosedDate IS NULL AND p.DeletionDate IS NULL
+  ),
+  AnswerDetails AS (
+    SELECT
+      a.Id AS AnswerId,
+      a.ParentId AS QuestionId,
+      a.Score AS AnswerScore,
+      a.CreationDate AS AnswerCreationDate,
+      ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS rn_answer_score
+    FROM Posts AS a
+    WHERE
+      a.PostTypeId = 2 AND a.DeletionDate IS NULL
+  ),
+  QuestionAnswers AS (
+    SELECT
+      qd.QuestionId,
+      qd.QuestionTitle,
+      qd.QuestionScore,
+      qd.QuestionViewCount,
+      qd.OwnerDisplayName,
+      qd.OwnerReputation,
+      qd.Tags,
+      qd.QuestionCreationDate,
+      ad.AnswerId,
+      ad.AnswerScore,
+      ad.AnswerCreationDate,
+      CASE
+        WHEN qd.AcceptedAnswerId = ad.AnswerId THEN 1
+        ELSE 0
+      END AS IsAcceptedAnswer,
+      ad.rn_answer_score
+    FROM QuestionDetails AS qd
+    LEFT JOIN AnswerDetails AS ad
+      ON qd.QuestionId = ad.QuestionId
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      COUNT(DISTINCT p.Id) AS QuestionsAsked,
+      COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersGiven,
+      SUM(p.Score) AS TotalScoreReceived,
+      MAX(p.CreationDate) AS LastPostDate
+    FROM Users AS u
+    LEFT JOIN Posts AS p
+      ON u.Id = p.OwnerUserId
+    WHERE
+      u.Id <> -1
+    GROUP BY
+      u.Id,
+      u.DisplayName
+  ),
+  TopTags AS (
+    SELECT
+      t.TagName,
+      COUNT(p.Id) AS TagCount
+    FROM Tags AS t
+    JOIN Posts AS p
+      ON ',' || p.Tags || ',' LIKE '%,' || t.TagName || ',%' AND p.PostTypeId = 1
+    GROUP BY
+      t.TagName
+    ORDER BY
+      TagCount DESC
+    LIMIT 10
+  ),
+  HighReputationUsers AS (
+    SELECT
+      u.Id,
+      u.DisplayName,
+      u.Reputation
+    FROM Users AS u
+    WHERE
+      u.Reputation > 100000
+  ),
+  CommentAnalysis AS (
+    SELECT
+      c.PostId,
+      COUNT(c.Id) AS CommentCount,
+      SUM(CASE WHEN c.Score > 0 THEN 1 ELSE 0 END) AS PositiveCommentCount,
+      AVG(c.Score) AS AvgCommentScore,
+      MAX(c.CreationDate) AS LastCommentDate
+    FROM Comments AS c
+    GROUP BY
+      c.PostId
+  )
+SELECT
+  qa.QuestionId,
+  qa.QuestionTitle,
+  qa.QuestionScore,
+  qa.QuestionViewCount,
+  qa.OwnerDisplayName,
+  qa.OwnerReputation,
+  qa.Tags,
+  qa.QuestionCreationDate,
+  qa.AnswerId,
+  qa.AnswerScore,
+  qa.AnswerCreationDate,
+  qa.IsAcceptedAnswer,
+  ua.QuestionsAsked AS OwnerQuestionsAsked,
+  ua.AnswersGiven AS OwnerAnswersGiven,
+  ua.TotalScoreReceived AS OwnerTotalScoreReceived,
+  CASE
+    WHEN qa.OwnerReputation > 100000 THEN 'High Rep'
+    WHEN ua.QuestionsAsked > 500 THEN 'Active Contributor'
+    ELSE 'Standard User'
+  END AS UserSegment,
+  CASE
+    WHEN qa.Tags LIKE '%<sql>%' AND qa.Tags LIKE '%<performance-tuning>%' THEN 'SQL Performance Focused'
+    WHEN qa.Tags LIKE '%<python>%' THEN 'Python Related'
+    ELSE 'General'
+  END AS TopicCategory,
+  COALESCE(ca.CommentCount, 0) AS TotalCommentsOnPost,
+  COALESCE(ca.PositiveCommentCount, 0) AS PositiveCommentsOnPost,
+  COALESCE(ca.AvgCommentScore, 0) AS AverageCommentScore,
+  CASE
+    WHEN qa.AnswerScore > 50 THEN 'Highly Rated Answer'
+    WHEN qa.IsAcceptedAnswer = 1 THEN 'Accepted Answer'
+    ELSE 'Standard Answer'
+  END AS AnswerQuality,
+  (
+    SELECT
+      GROUP_CONCAT(TagName ORDER BY TagCount DESC SEPARATOR ', ')
+    FROM TopTags
+  ) AS Top10TagsOverall
+FROM QuestionAnswers AS qa
+LEFT JOIN UserActivity AS ua
+  ON qa.OwnerDisplayName = ua.DisplayName -- Note: Using DisplayName for join, which can be problematic if not unique. UserID is preferred but not directly available in this CTE's join.
+LEFT JOIN CommentAnalysis AS ca
+  ON qa.QuestionId = ca.PostId
+WHERE
+  qa.rn_answer_score <= 5 AND qa.QuestionScore > 10 AND qa.QuestionViewCount > 1000
+ORDER BY
+  qa.QuestionScore DESC,
+  qa.QuestionViewCount DESC,
+  qa.AnswerScore DESC;

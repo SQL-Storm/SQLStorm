@@ -1,0 +1,32 @@
+SELECT
+  u.Id AS UserId,
+  u.DisplayName AS UserName,
+  COUNT(DISTINCT p.Id) AS PostCount,
+  SUM(COALESCE(p.Score, 0)) AS TotalScore,
+  AVG(COALESCE(u.Reputation, 0)) AS AvgReputation,
+  COUNT(DISTINCT CASE WHEN pv.VoteTypeId = 2 THEN p.Id END) AS UpvotedPosts,
+  COUNT(DISTINCT CASE WHEN pv.VoteTypeId = 3 THEN p.Id END) AS DownvotedPosts,
+  MAX(p.LastActivityDate) AS MostRecentActivity,
+  STRING_AGG(DISTINCT t.TagName, ',') FILTER (WHERE t.TagName IS NOT NULL) AS TagNames,
+  (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id) AS BadgeCount,
+  (SELECT COUNT(*) FROM Posts q WHERE q.OwnerUserId = u.Id AND q.PostTypeId = 1 AND q.AnswerCount > 0) AS QuestionsWithAnswers,
+  (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id) AS CommentCount
+FROM
+  Users u
+LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+LEFT JOIN Votes pv ON pv.PostId = p.Id
+LEFT JOIN LATERAL (
+  SELECT TRIM(BOTH '<>' FROM value) AS tname
+  FROM (
+    SELECT REGEXP_SPLIT_TO_ARRAY(COALESCE(p.Tags, ''), '><') AS arr
+  ) sub,
+  UNNEST(sub.arr) AS value
+) tn ON TRUE
+LEFT JOIN Tags t ON LOWER(t.TagName) = LOWER(tn.tname)
+GROUP BY
+  u.Id, u.DisplayName, u.Reputation
+HAVING
+  COUNT(DISTINCT p.Id) > 5
+ORDER BY
+  TotalScore DESC, PostCount DESC
+LIMIT 100;

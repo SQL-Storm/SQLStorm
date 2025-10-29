@@ -1,0 +1,89 @@
+WITH 
+UserActivity AS (
+    SELECT 
+        u.Id,
+        COALESCE(u.DisplayName, '[deleted]') AS DisplayName,
+        COALESCE(u.Reputation, 0) AS Reputation,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id)                     AS PostCount,
+        (SELECT COUNT(*) FROM Posts a WHERE a.OwnerUserId = u.Id AND a.PostTypeId = 2) AS AnswerCount,
+        (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id)                      AS CommentCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id)                         AS VoteGivenCount,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id)                        AS BadgeCount,
+        (SELECT MAX(p.CreationDate) FROM Posts p WHERE p.OwnerUserId = u.Id)         AS LastPostDate
+    FROM Users u
+),
+AvgScore AS (
+    SELECT OwnerUserId, CAST(AVG(Score) AS DECIMAL(10,2)) AS AvgScore
+    FROM Posts
+    GROUP BY OwnerUserId
+),
+RankedUsers AS (
+    SELECT 
+        a.Id,
+        a.DisplayName,
+        a.Reputation,
+        a.PostCount,
+        a.AnswerCount,
+        a.CommentCount,
+        a.VoteGivenCount,
+        a.BadgeCount,
+        a.LastPostDate,
+        s.AvgScore,
+        ROW_NUMBER() OVER (ORDER BY a.Reputation DESC, a.PostCount DESC) AS RepRank,
+        RANK() OVER (
+            PARTITION BY 
+                CASE 
+                    WHEN a.Reputation >= 10000 THEN 'high' 
+                    WHEN a.Reputation >= 1000  THEN 'mid' 
+                    ELSE 'low' 
+                END 
+            ORDER BY a.BadgeCount DESC
+        ) AS BadgeRank
+    FROM UserActivity a
+    LEFT JOIN AvgScore s ON s.OwnerUserId = a.Id
+),
+TopActiveUsers AS (
+    SELECT 
+        Id,
+        (DisplayName || ' (ID:' || Id || ')')                                   AS UserLabel,
+        Reputation,
+        PostCount,
+        AnswerCount,
+        CommentCount,
+        VoteGivenCount,
+        BadgeCount,
+        AvgScore,
+        RepRank,
+        BadgeRank,
+        CASE 
+            WHEN LastPostDate IS NULL THEN 'Never posted'
+            WHEN LastPostDate < (CAST('2024-10-01' AS DATE) - INTERVAL '1 year') THEN 'Stale'
+            ELSE 'Active'
+        END AS ActivityStatus
+    FROM RankedUsers
+    WHERE RepRank <= 100
+)
+SELECT *
+FROM TopActiveUsers
+WHERE ActivityStatus = 'Active'
+
+UNION ALL
+
+SELECT
+    u.Id,
+    (COALESCE(u.DisplayName, '[deleted]') || ' (ID:' || u.Id || ')') AS UserLabel,
+    COALESCE(u.Reputation,0)               AS Reputation,
+    0                                      AS PostCount,
+    0                                      AS AnswerCount,
+    0                                      AS CommentCount,
+    0                                      AS VoteGivenCount,
+    0                                      AS BadgeCount,
+    NULL                                   AS AvgScore,
+    NULL                                   AS RepRank,
+    NULL                                   AS BadgeRank,
+    'No activity'                          AS ActivityStatus
+FROM Users u
+WHERE NOT EXISTS (SELECT 1 FROM Posts p    WHERE p.OwnerUserId = u.Id)
+  AND NOT EXISTS (SELECT 1 FROM Comments c WHERE c.UserId      = u.Id)
+  AND NOT EXISTS (SELECT 1 FROM Badges b   WHERE b.UserId      = u.Id)
+ORDER BY Reputation DESC NULLS LAST, PostCount DESC;

@@ -1,0 +1,250 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.LastActivityDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS prev_score,
+        SUM(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cumulative_score
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT bp.Id) AS badge_count,
+        COUNT(DISTINCT CASE WHEN bp.Class = 1 THEN bp.Id END) AS gold_badges,
+        COUNT(DISTINCT CASE WHEN bp.Class = 2 THEN bp.Id END) AS silver_badges,
+        COUNT(DISTINCT CASE WHEN bp.Class = 3 THEN bp.Id END) AS bronze_badges,
+        AVG(CAST(bp.Date AS DATE) - CAST(u.CreationDate AS DATE)) AS avg_badge_days_since_join,
+        STRING_AGG(COALESCE(bp.Name, ''), ', ') AS badge_names
+    FROM Users u
+    LEFT JOIN Badges bp ON u.Id = bp.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostActivity AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        p.CommentCount,
+        p.ViewCount,
+        p.LastActivityDate,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostType,
+        (p.Score - COALESCE(p.AnswerCount, 0)) AS net_score,
+        ABS(p.ViewCount - COALESCE(p.AnswerCount, 0)) AS view_answer_difference,
+        (p.CommentCount * 100.0 / NULLIF(p.ViewCount, 0)) AS comment_ratio,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND LENGTH(TRIM(p.Tags)) > 0 THEN 1
+            ELSE 0
+        END AS has_tags,
+        CASE 
+            WHEN p.Score >= 10 THEN 'Popular'
+            WHEN p.Score >= 5 THEN 'Moderate'
+            WHEN p.Score >= 1 THEN 'Low'
+            ELSE 'Zero'
+        END AS popularity_level
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+      AND p.CreationDate >= DATE '2022-01-01'
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count AS tag_count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count >= 1000 THEN 'High'
+            WHEN t.Count >= 100 THEN 'Medium'
+            ELSE 'Low'
+        END AS tag_category,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC, t.TagName) AS tag_rank,
+        LAG(t.Count) OVER (ORDER BY t.Count DESC, t.TagName) AS prev_tag_count,
+        LAG(t.TagName) OVER (ORDER BY t.Count DESC, t.TagName) AS prev_tag_name,
+        (t.Count - LAG(t.Count) OVER (ORDER BY t.Count DESC, t.TagName)) AS count_change
+    FROM Tags t
+    WHERE t.Count > 0
+),
+PostTags AS (
+    SELECT
+        p.Id,
+        TRIM(tg.tag) AS TagName
+    FROM Posts p,
+    LATERAL (
+        SELECT UNNEST(STRING_TO_ARRAY(
+            REPLACE(REPLACE(p.Tags, '<', ''), '>', ''), 
+            '>'
+        )) AS tag
+    ) tg
+    WHERE p.Tags IS NOT NULL AND LENGTH(TRIM(p.Tags)) > 0
+),
+ComplexQuery AS (
+    SELECT 
+        rp.Id AS PostId,
+        rp.OwnerUserId,
+        rp.Score,
+        rp.prev_score,
+        rp.cumulative_score,
+        us.DisplayName,
+        us.Reputation,
+        us.badge_count,
+        us.gold_badges,
+        us.silver_badges,
+        us.bronze_badges,
+        us.avg_badge_days_since_join,
+        pa.Title,
+        pa.PostType,
+        pa.net_score,
+        pa.view_answer_difference,
+        pa.comment_ratio,
+        pa.has_tags,
+        pa.popularity_level,
+        ta.TagName,
+        ta.tag_count,
+        ta.tag_category,
+        CASE 
+            WHEN ta.tag_rank <= 5 THEN 'Top5'
+            WHEN ta.tag_rank <= 20 THEN 'Top20'
+            WHEN ta.tag_rank <= 100 THEN 'Top100'
+            ELSE 'Other'
+        END AS tag_rank_group,
+        ((ta.count_change * 100.0) / NULLIF(ta.prev_tag_count, 0)) AS percentage_change,
+        (rp.cumulative_score * pa.net_score * pa.view_answer_difference) AS complex_metric,
+        CASE 
+            WHEN rp.cumulative_score >= 1000 THEN 'High'
+            WHEN rp.cumulative_score >= 500 THEN 'Medium'
+            ELSE 'Low'
+        END AS cumulative_score_category,
+        CASE 
+            WHEN pa.comment_ratio >= 5.0 THEN 'High'
+            WHEN pa.comment_ratio >= 2.0 THEN 'Medium'
+            ELSE 'Low'
+        END AS comment_ratio_category,
+        pa.LastActivityDate
+    FROM RankedPosts rp
+    INNER JOIN UserStats us ON rp.OwnerUserId = us.Id
+    INNER JOIN PostActivity pa ON rp.Id = pa.PostId
+    LEFT JOIN PostTags pt ON pt.Id = rp.Id
+    LEFT JOIN TagAnalysis ta ON pt.TagName = ta.TagName
+    WHERE rp.rn = 1
+)
+SELECT 
+    COUNT(*) AS total_records,
+    COUNT(DISTINCT PostId) AS unique_posts,
+    COUNT(DISTINCT OwnerUserId) AS unique_users,
+    COUNT(DISTINCT DisplayName) AS unique_display_names,
+    AVG(Score) AS avg_score,
+    MAX(Score) AS max_score,
+    MIN(Score) AS min_score,
+    SUM(complex_metric) AS total_complex_metric,
+    AVG(complex_metric) AS avg_complex_metric,
+    MAX(complex_metric) AS max_complex_metric,
+    MIN(complex_metric) AS min_complex_metric,
+    SUM(CASE WHEN comment_ratio_category = 'High' THEN 1 ELSE 0 END) AS high_comment_ratio_count,
+    SUM(CASE WHEN cumulative_score_category = 'High' THEN 1 ELSE 0 END) AS high_cumulative_score_count,
+    SUM(CASE WHEN tag_rank_group = 'Top5' THEN 1 ELSE 0 END) AS top5_tag_count,
+    SUM(CASE WHEN popularity_level = 'Popular' THEN 1 ELSE 0 END) AS popular_posts_count,
+    SUM(CASE WHEN has_tags = 1 THEN 1 ELSE 0 END) AS tagged_posts_count,
+    SUM(CASE WHEN badge_count >= 10 THEN 1 ELSE 0 END) AS high_badge_count_users,
+    STRING_AGG(DISTINCT COALESCE(DisplayName, ''), ', ') AS all_user_names,
+    STRING_AGG(DISTINCT COALESCE(Title, ''), ' | ') AS all_titles,
+    STRING_AGG(DISTINCT COALESCE(TagName, ''), ', ') AS all_tags,
+    ('Results from: ' || COUNT(*) || ' records with complex filtering and JOINs') AS report_summary,
+    MAX(LastActivityDate) AS max_last_activity_date,
+    MIN(LastActivityDate) AS min_last_activity_date
+FROM ComplexQuery
+WHERE Score IS NOT NULL
+  AND Reputation IS NOT NULL
+  AND badge_count >= 0
+  AND view_answer_difference IS NOT NULL
+  AND comment_ratio IS NOT NULL
+  AND TagName IS NOT NULL
+  AND tag_count IS NOT NULL
+  AND net_score IS NOT NULL
+  AND complex_metric IS NOT NULL
+  AND (CASE WHEN complex_metric > 0 THEN 1 ELSE 0 END) = 1
+  AND NOT (Score = 0 AND Reputation = 0 AND badge_count = 0)
+  AND EXISTS (SELECT 1 FROM Posts p WHERE p.Id = ComplexQuery.PostId AND p.PostTypeId IN (1, 2))
+  AND (
+    ComplexQuery.PostType IN ('Question', 'Answer')
+    OR ComplexQuery.popularity_level IN ('Popular', 'Moderate', 'Low')
+  )
+  AND (
+    (complex_metric > 0 AND complex_metric < 100000)
+    OR complex_metric IS NULL
+  )
+  AND ComplexQuery.tag_rank_group IS NOT NULL
+  AND (
+    ComplexQuery.tag_category IN ('High', 'Medium', 'Low')
+  )
+  AND ComplexQuery.Score >= -1000
+  AND ComplexQuery.Reputation >= 0
+  AND ComplexQuery.badge_count BETWEEN 0 AND 5000
+  AND ComplexQuery.net_score BETWEEN -1000 AND 1000
+  AND ComplexQuery.view_answer_difference BETWEEN 0 AND 10000
+  AND ComplexQuery.comment_ratio BETWEEN 0 AND 100.0
+  AND ComplexQuery.tag_count BETWEEN 0 AND 100000
+  AND complex_metric >= 0
+  AND ComplexQuery.cumulative_score_category IS NOT NULL
+  AND ComplexQuery.comment_ratio_category IS NOT NULL
+  AND NOT (ComplexQuery.DisplayName = '' OR ComplexQuery.Title = '')
+  AND EXISTS (
+    SELECT 1 FROM PostHistory ph 
+    WHERE ph.PostId = ComplexQuery.PostId 
+      AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)
+      AND ph.CreationDate BETWEEN DATE '2022-01-01' AND DATE '2025-01-01'
+  ) 
+  AND (
+    ComplexQuery.gold_badges + ComplexQuery.silver_badges + ComplexQuery.bronze_badges >= 0
+  )
+  AND (
+    ComplexQuery.avg_badge_days_since_join IS NULL 
+    OR ComplexQuery.avg_badge_days_since_join BETWEEN 0 AND 3650
+  )
+  AND (ComplexQuery.LastActivityDate IS NOT NULL AND ComplexQuery.LastActivityDate > DATE '2022-01-01')
+GROUP BY 
+    PostId,
+    OwnerUserId,
+    Score,
+    DisplayName,
+    Reputation,
+    badge_count,
+    gold_badges,
+    silver_badges,
+    bronze_badges,
+    avg_badge_days_since_join,
+    Title,
+    PostType,
+    net_score,
+    view_answer_difference,
+    comment_ratio,
+    has_tags,
+    popularity_level,
+    TagName,
+    tag_count,
+    tag_category,
+    tag_rank_group,
+    percentage_change,
+    cumulative_score_category,
+    comment_ratio_category,
+    LastActivityDate;

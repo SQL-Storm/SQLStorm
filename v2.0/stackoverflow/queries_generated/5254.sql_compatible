@@ -1,0 +1,169 @@
+WITH per_post AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.OwnerUserId,
+    p.ViewCount,
+    p.Score,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.LastEditDate,
+    p.LastEditorUserId,
+    p.LastEditorDisplayName,
+    p.ContentLicense,
+    CASE WHEN p.Score > 0 THEN 1.0 * p.Score / NULLIF(p.ViewCount, 0) ELSE 0 END AS engagement_ratio,
+    (EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - p.CreationDate)) / 3600.0) AS hours_since_created
+  FROM Posts p
+),
+recent_comments AS (
+  SELECT
+    c.PostId,
+    COUNT(*) AS CommentCountRecent
+  FROM Comments c
+  WHERE c.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '30 days'
+  GROUP BY c.PostId
+),
+owner_activity AS (
+  SELECT
+    u.Id AS UserId,
+    u.Reputation,
+    u.CreationDate AS UserCreated,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.AccountId,
+    u.Location,
+    u.DisplayName
+  FROM Users u
+),
+tag_info AS (
+  SELECT
+    t.Id AS TagId,
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId,
+    t.IsModeratorOnly,
+    t.IsRequired
+  FROM Tags t
+),
+-- use a correlated LATERAL to fetch last edit details per post (standard SQL compatible)
+last_edit AS (
+  SELECT
+    phs.PostId,
+    phs.RevisionGUID,
+    phs.Id AS HistoryId,
+    phs.CreationDate AS RevisionDate,
+    phs.UserId AS EditorUserId,
+    phs.UserDisplayName,
+    phs.Comment
+  FROM (
+    SELECT ph_inner.*
+    FROM PostHistory ph_inner
+  ) phs
+)
+SELECT
+  pr.PostId,
+  pr.PostTypeId,
+  pt.Name AS PostTypeName,
+  pr.Title,
+  pr.Tags,
+  pr.CreationDate,
+  pr.LastActivityDate,
+  pr.OwnerUserId,
+  ou.DisplayName AS OwnerDisplayName,
+  ou.Reputation AS OwnerReputation,
+  COALESCE(rc.CommentCountRecent, 0) AS RecentComments,
+  pr.ViewCount,
+  pr.Score,
+  pr.CommentCount,
+  pr.FavoriteCount,
+  pr.AcceptedAnswerId,
+  pr.ParentId,
+  pr.LastEditDate,
+  pr.LastEditorUserId,
+  le.RevisionDate AS LastEditDateBenchmark,
+  le.EditorUserId AS LastEditorBenchmarkUserId,
+  le.Comment AS LastEditComment,
+  CASE WHEN pr.PostTypeId = 1 THEN pr.AnswerCount ELSE NULL END AS AnswerCountBenchmark,
+  eng.engagement_ratio,
+  eng.hours_since_created,
+  bl.Name AS BadgeName,
+  bl.Class AS BadgeClass,
+  ta.TagName AS TagNameBenchmark,
+  vt.Name AS VoteTypeBench
+FROM per_post pr
+LEFT JOIN PostTypes pt ON pr.PostTypeId = pt.Id
+LEFT JOIN recent_comments rc ON rc.PostId = pr.PostId
+LEFT JOIN Users ou ON pr.OwnerUserId = ou.Id
+LEFT JOIN owner_activity oa ON oa.UserId = pr.OwnerUserId
+LEFT JOIN LATERAL (
+  SELECT p2.engagement_ratio, p2.hours_since_created
+  FROM per_post p2
+  WHERE p2.PostId = pr.PostId
+  LIMIT 1
+) eng ON TRUE
+LEFT JOIN LATERAL (
+  SELECT ph_sub.RevisionGUID,
+         ph_sub.Id AS HistoryId,
+         ph_sub.CreationDate AS RevisionDate,
+         ph_sub.UserId AS EditorUserId,
+         ph_sub.UserDisplayName,
+         ph_sub.Comment,
+         ph_sub.PostId
+  FROM PostHistory ph_sub
+  WHERE ph_sub.PostHistoryTypeId IN (4,5,6,8,9,15,16,19,20)
+    AND ph_sub.PostId = pr.PostId
+  ORDER BY ph_sub.CreationDate DESC
+  LIMIT 1
+) le ON TRUE
+LEFT JOIN Badges bl ON bl.UserId = pr.OwnerUserId
+LEFT JOIN LATERAL (
+  SELECT t2.Id, t2.TagName
+  FROM Tags t2
+  WHERE t2.TagName = ANY (STRING_TO_ARRAY(REGEXP_REPLACE(pr.Tags, '[<>]', '', 'g'), '><'))
+  LIMIT 1
+) ta ON TRUE
+LEFT JOIN Votes vt ON vt.PostId = pr.PostId
+WHERE
+  pr.LastActivityDate >= pr.CreationDate - INTERVAL '1 year'
+  AND (pr.ViewCount > 0 OR pr.Score IS NOT NULL)
+GROUP BY
+  pr.PostId,
+  pr.PostTypeId,
+  pt.Name,
+  pr.Title,
+  pr.Tags,
+  pr.CreationDate,
+  pr.LastActivityDate,
+  pr.OwnerUserId,
+  ou.DisplayName,
+  ou.Reputation,
+  rc.CommentCountRecent,
+  pr.ViewCount,
+  pr.Score,
+  pr.CommentCount,
+  pr.FavoriteCount,
+  pr.AcceptedAnswerId,
+  pr.ParentId,
+  pr.LastEditDate,
+  pr.LastEditorUserId,
+  le.RevisionDate,
+  le.EditorUserId,
+  le.Comment,
+  pr.AnswerCount,
+  eng.engagement_ratio,
+  eng.hours_since_created,
+  bl.Name,
+  bl.Class,
+  ta.TagName,
+  vt.Name
+ORDER BY eng.hours_since_created DESC NULLS LAST
+LIMIT 200;

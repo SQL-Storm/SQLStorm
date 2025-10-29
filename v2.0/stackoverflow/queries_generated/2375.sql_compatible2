@@ -1,0 +1,166 @@
+with RecursiveUserPosts as (
+    select u.Id as UserId,
+           u.DisplayName,
+           p.Id as PostId,
+           p.PostTypeId,
+           p.Score,
+           p.ViewCount,
+           p.CreationDate,
+           p.AcceptedAnswerId,
+           p.ParentId,
+           row_number() over (partition by u.Id order by p.Score desc, p.CreationDate desc) as UserPostRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    where p.CreationDate >= timestamp '2019-01-01'
+), PostStats as (
+    select p.Id,
+           count(distinct c.Id) as CommentCountOnPost,
+           sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotesCount,
+           sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotesCount,
+           count(distinct b.Id) as BadgeCountOnOwner,
+           u.Reputation,
+           u.Location,
+           u.DisplayName as OwnerName
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+    left join Votes v on v.PostId = p.Id
+    left join Users u on u.Id = p.OwnerUserId
+    left join Badges b on b.UserId = u.Id and b.Date > p.CreationDate - interval '1 year'
+    group by p.Id, u.Reputation, u.Location, u.DisplayName
+), LatestPostHistories as (
+    select ph.PostId,
+           ph.UserId as EditorUserId,
+           ph.CreationDate as EditDate,
+           ph.PostHistoryTypeId,
+           ph.Comment,
+           row_number() over (partition by ph.PostId order by ph.CreationDate desc) as rn
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (4,5,6)
+), RankedPosts as (
+    select p.Id as PostId,
+           p.Title,
+           p.Tags,
+           p.Score,
+           ps.CommentCountOnPost,
+           ps.UpVotesCount,
+           ps.DownVotesCount,
+           ps.BadgeCountOnOwner,
+           ps.Reputation as OwnerReputation,
+           ps.Location,
+           ps.OwnerName,
+           lph.EditDate as LastEditDate,
+           lph.Comment as LastEditComment,
+           count(distinct link.Id) filter (where link.LinkTypeId = 3) as DuplicateLinksCount
+    from Posts p
+    left join PostStats ps on ps.Id = p.Id
+    left join LatestPostHistories lph on lph.PostId = p.Id and lph.rn = 1
+    left join PostLinks link on link.PostId = p.Id
+    group by p.Id, p.Title, p.Tags, p.Score, ps.CommentCountOnPost, ps.UpVotesCount, ps.DownVotesCount,
+             ps.BadgeCountOnOwner, ps.Reputation, ps.Location, ps.OwnerName, lph.EditDate, lph.Comment
+    having (ps.UpVotesCount > 5 or ps.BadgeCountOnOwner > 1)
+), TagAggregates as (
+    select unnest(string_to_array(substring(Tags from 2 for length(Tags) - 2), '><')) as TagName,
+           avg(Score) as AvgScore,
+           count(*) as TagPostCount
+    from RankedPosts
+    where Tags is not null
+    group by TagName
+    having count(*) > 10
+), UserQuestionAnswerRatio as (
+    select up.UserId,
+           count(case when up.PostTypeId = 1 then 1 end) as QuestionCount,
+           count(case when up.PostTypeId = 2 then 1 end) as AnswerCount,
+           case when count(case when up.PostTypeId = 1 then 1 end) = 0 then null
+                else round(1.0 * count(case when up.PostTypeId = 2 then 1 end) / count(case when up.PostTypeId = 1 then 1 end), 2) end as AnswerToQuestionRatio
+    from RecursiveUserPosts up
+    group by up.UserId
+    having count(*) > 20
+), DuplicatePosts as (
+    select pl.PostId, pl.RelatedPostId, pl.LinkTypeId
+    from PostLinks pl
+    where pl.LinkTypeId = 3
+), DupPostDetails as (
+    select dp.PostId,
+           p1.Title as PostTitle,
+           dp.RelatedPostId,
+           p2.Title as RelatedPostTitle
+    from DuplicatePosts dp
+    left join Posts p1 on p1.Id = dp.PostId
+    left join Posts p2 on p2.Id = dp.RelatedPostId
+    where p1.CreationDate > p2.CreationDate
+)
+select rp.PostId,
+       rp.Title,
+       rp.Tags,
+       rp.Score,
+       rp.CommentCountOnPost,
+       rp.UpVotesCount,
+       rp.DownVotesCount,
+       rp.BadgeCountOnOwner,
+       rp.OwnerReputation,
+       coalesce(rp.Location, 'Unknown') as OwnerLocation,
+       rp.OwnerName,
+       case when rp.LastEditDate is not null then to_char(cast(rp.LastEditDate as timestamp), 'YYYY-MM-DD') else null end as LastEditDate,
+       coalesce(rp.LastEditComment, 'No comment') as LastEditComment,
+       rp.DuplicateLinksCount,
+       t.AvgScore as AvgTagScore,
+       t.TagPostCount,
+       uq.AnswerToQuestionRatio
+from RankedPosts rp
+left join TagAggregates t on t.TagName = (
+    select tag
+    from unnest(string_to_array(substring(rp.Tags from 2 for length(rp.Tags) - 2), '><')) as tag
+    order by tag
+    limit 1
+)
+left join UserQuestionAnswerRatio uq on uq.UserId = rp.OwnerReputation
+where rp.Score > (select avg(Score) from Posts where PostTypeId = 1)
+union
+select p.Id as PostId,
+       p.Title,
+       p.Tags,
+       p.Score,
+       0 as CommentCountOnPost,
+       0 as UpVotesCount,
+       0 as DownVotesCount,
+       0 as BadgeCountOnOwner,
+       u.Reputation as OwnerReputation,
+       coalesce(u.Location, 'Unknown') as OwnerLocation,
+       u.DisplayName as OwnerName,
+       null as LastEditDate,
+       'Never edited' as LastEditComment,
+       0 as DuplicateLinksCount,
+       null as AvgTagScore,
+       null as TagPostCount,
+       null as AnswerToQuestionRatio
+from Posts p
+inner join Users u on u.Id = p.OwnerUserId
+where p.Score > 100
+except
+select rp.PostId,
+       rp.Title,
+       rp.Tags,
+       rp.Score,
+       rp.CommentCountOnPost,
+       rp.UpVotesCount,
+       rp.DownVotesCount,
+       rp.BadgeCountOnOwner,
+       rp.OwnerReputation,
+       coalesce(rp.Location, 'Unknown') as OwnerLocation,
+       rp.OwnerName,
+       case when rp.LastEditDate is not null then to_char(cast(rp.LastEditDate as timestamp), 'YYYY-MM-DD') else null end as LastEditDate,
+       coalesce(rp.LastEditComment, 'No comment') as LastEditComment,
+       rp.DuplicateLinksCount,
+       t.AvgScore as AvgTagScore,
+       t.TagPostCount,
+       uq.AnswerToQuestionRatio
+from RankedPosts rp
+left join TagAggregates t on t.TagName = (
+    select tag
+    from unnest(string_to_array(substring(rp.Tags from 2 for length(rp.Tags) - 2), '><')) as tag
+    order by tag
+    limit 1
+)
+left join UserQuestionAnswerRatio uq on uq.UserId = rp.OwnerReputation
+order by Score desc, CommentCountOnPost desc
+limit 100;

@@ -1,0 +1,180 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COUNT(DISTINCT v.Id) as VoteCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        MAX(b.Date) as LastBadgeDate,
+        MAX(v.CreationDate) as LastVoteDate,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Elite'
+            WHEN u.Reputation > 5000 THEN 'Veteran'
+            WHEN u.Reputation > 1000 THEN 'Regular'
+            ELSE 'Newbie'
+        END as ReputationTier,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 100 THEN 'Elite Poster'
+            WHEN COUNT(DISTINCT p.Id) > 50 THEN 'Veteran Poster'
+            WHEN COUNT(DISTINCT p.Id) > 10 THEN 'Regular Poster'
+            ELSE 'New Poster'
+        END as PosterTier
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopQuestions AS (
+    SELECT 
+        p.Id as QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        COUNT(DISTINCT a.Id) as AnswerCountActual,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), ', ') as TagsList,
+        AVG(a.Score) as AvgAnswerScore,
+        AVG(EXTRACT(EPOCH FROM (a.CreationDate - p.CreationDate))) as AvgAnswerTimeSeconds,
+        CASE 
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+            WHEN p.AnswerCount > 0 THEN 'Has Answers'
+            WHEN p.CommentCount > 0 THEN 'Discussed'
+            ELSE 'Unanswered'
+        END as QuestionStatus
+    FROM Posts p
+    INNER JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Posts a ON p.Id = a.ParentId AND a.PostTypeId = 2
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE pt.Name = 'Question'
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.CreationDate, p.OwnerUserId, u.DisplayName
+    HAVING COUNT(DISTINCT a.Id) > 0 OR p.CommentCount > 0
+),
+UserPostActivity AS (
+    SELECT 
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.ReputationTier,
+        ua.PosterTier,
+        COALESCE(ua.PostCount, 0) as TotalPosts,
+        COALESCE(ua.CommentCount, 0) as TotalComments,
+        COALESCE(ua.BadgeCount, 0) as TotalBadges,
+        COALESCE(ua.VoteCount, 0) as TotalVotes,
+        COALESCE(ua.PostCount, 0) + COALESCE(ua.CommentCount, 0) + COALESCE(ua.BadgeCount, 0) + COALESCE(ua.VoteCount, 0) as TotalEngagement,
+        ROW_NUMBER() OVER (ORDER BY (COALESCE(ua.PostCount, 0) + COALESCE(ua.CommentCount, 0) + COALESCE(ua.BadgeCount, 0) + COALESCE(ua.VoteCount, 0)) DESC) as EngagementRank,
+        RANK() OVER (ORDER BY ua.Reputation DESC) as ReputationRank
+    FROM UserActivityStats ua
+    WHERE ua.Reputation > 100
+),
+PostStats AS (
+    SELECT 
+        t.Title,
+        t.QuestionId,
+        t.Score,
+        t.ViewCount,
+        t.AnswerCountActual,
+        t.TagsList,
+        t.AvgAnswerScore,
+        t.AvgAnswerTimeSeconds,
+        t.QuestionStatus,
+        (CASE WHEN t.Score > 10 THEN 1 ELSE 0 END) + 
+        (CASE WHEN t.ViewCount > 1000 THEN 1 ELSE 0 END) + 
+        (CASE WHEN t.AnswerCountActual > 5 THEN 1 ELSE 0 END) as QualityScore,
+        CASE 
+            WHEN t.ViewCount > 1000 AND t.AnswerCountActual > 5 THEN 'High Impact'
+            WHEN t.ViewCount > 500 AND t.AnswerCountActual > 2 THEN 'Medium Impact'
+            ELSE 'Low Impact'
+        END as ImpactLevel,
+        DENSE_RANK() OVER (ORDER BY t.Score DESC) as ScoreRank,
+        DENSE_RANK() OVER (ORDER BY t.ViewCount DESC) as ViewRank,
+        DENSE_RANK() OVER (ORDER BY t.AnswerCountActual DESC) as AnswerRank
+    FROM TopQuestions t
+    WHERE t.Score IS NOT NULL
+)
+SELECT 
+    ups.DisplayName,
+    ups.Reputation,
+    ups.ReputationTier,
+    ups.PosterTier,
+    ups.TotalPosts,
+    ups.TotalComments,
+    ups.TotalBadges,
+    ups.TotalVotes,
+    ups.TotalEngagement,
+    ups.EngagementRank,
+    ups.ReputationRank,
+    ps.Title as TopQuestionTitle,
+    ps.Score as QuestionScore,
+    ps.ViewCount as QuestionViews,
+    ps.AnswerCountActual,
+    ps.TagsList,
+    ps.QualityScore,
+    ps.ImpactLevel,
+    ps.ScoreRank,
+    ps.ViewRank,
+    ps.AnswerRank,
+    COALESCE(ups.TotalPosts, 0) * 10 + COALESCE(ups.TotalComments, 0) * 5 + COALESCE(ups.TotalBadges, 0) * 20 + COALESCE(ups.TotalVotes, 0) * 2 as EngagementWeightedPoints,
+    CASE 
+        WHEN ups.EngagementRank <= 10 THEN 'Top 10 Engager'
+        WHEN ups.EngagementRank <= 50 THEN 'Top 50 Engager'
+        WHEN ups.EngagementRank <= 100 THEN 'Top 100 Engager'
+        ELSE 'Regular Engager'
+    END as EngagementTier,
+    CASE 
+        WHEN ps.QualityScore >= 3 THEN 'Excellent'
+        WHEN ps.QualityScore >= 2 THEN 'Good'
+        WHEN ps.QualityScore >= 1 THEN 'Fair'
+        ELSE 'Poor'
+    END as QuestionQuality,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = ups.UserId AND p.PostTypeId = 1) as QuestionCount,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = ups.UserId AND p.PostTypeId = 2) as AnswerCount,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = ups.UserId AND p.PostTypeId IN (1,2)) as TotalPostCount,
+    CASE 
+        WHEN ups.ReputationTier = 'Elite' AND ps.ScoreRank <= 5 THEN CONCAT(ups.DisplayName, ' (Elite Question Master) - Top Rank ', ps.ScoreRank)
+        WHEN ups.ReputationTier = 'Veteran' AND ps.ViewRank <= 10 THEN CONCAT(ups.DisplayName, ' (Veteran Question Seeker) - Top Views ', ps.ViewRank)
+        WHEN ups.ReputationTier = 'Regular' AND ps.AnswerRank <= 15 THEN CONCAT(ups.DisplayName, ' (Active Question Answerer) - Top Answers ', ps.AnswerRank)
+        ELSE CONCAT(ups.DisplayName, ' (Regular Participant)')
+    END as ParticipantProfile,
+    CAST(ups.TotalEngagement AS FLOAT) / CAST(NULLIF(ups.Reputation, 0) AS FLOAT) as EfficiencyRatio,
+    CAST(ups.TotalPosts AS FLOAT) / CAST(NULLIF(ups.TotalEngagement, 0) AS FLOAT) as ProductivityRatio,
+    COALESCE(ps.AvgAnswerTimeSeconds, 0) as AvgAnswerTime,
+    COALESCE(ps.AvgAnswerScore, 0) as AvgAnswerScore,
+    NULLIF(ups.Reputation, 0) as ReputationNotNull,
+    COALESCE(ups.TotalVotes, 0) as VotesNotNull,
+    CASE 
+        WHEN ups.TotalPosts > 0 AND ups.TotalComments > 0 THEN 'Active Contributor'
+        WHEN ups.TotalPosts > 0 AND ups.TotalBadges > 0 THEN 'Contributor with Recognition'
+        WHEN ups.TotalComments > 0 AND ups.TotalBadges > 0 THEN 'Community Member'
+        ELSE 'Observer'
+    END as RoleDescription,
+    ROW_NUMBER() OVER (
+        PARTITION BY ups.ReputationTier 
+        ORDER BY ups.TotalEngagement DESC, ups.Reputation DESC, ps.QualityScore DESC
+    ) as TierRankInReputationGroup,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = ups.UserId AND p.CreationDate >= TIMESTAMP '2023-01-01') as RecentPosts2023
+FROM UserPostActivity ups
+INNER JOIN PostStats ps ON ups.UserId = (
+    SELECT p.OwnerUserId 
+    FROM Posts p 
+    WHERE p.Id = ps.QuestionId 
+    AND p.OwnerUserId = ups.UserId
+)
+WHERE ups.TotalEngagement >= 20 
+    AND ups.Reputation > 1000
+    AND ps.Score >= 5
+ORDER BY ups.EngagementRank ASC, ps.Score DESC, ups.Reputation DESC
+LIMIT 25;

@@ -1,0 +1,350 @@
+-- {"query": "483.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3302} 
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        date_trunc('month', u.creationdate) as cohort_month,
+        coalesce(nullif(trim(split_part(coalesce(u.location,''), ',', 1)), ''), 'Unknown') as primary_location,
+        row_number() over (partition by date_trunc('month', u.creationdate) order by u.reputation desc, u.id) as rn_in_cohort
+    from users u
+    where u.creationdate >= (select max(p.creationdate) - interval '730 days' from posts p)
+),
+question_activity as (
+    select
+        q.id as question_id,
+        q.owneruserid as asker_id,
+        q.creationdate as question_created,
+        q.score as question_score,
+        q.viewcount,
+        q.title,
+        q.tags,
+        q.acceptedanswerid,
+        count(a.id) filter (where a.posttypeid = 2) as answer_count,
+        max(a.score) filter (where a.posttypeid = 2) as max_answer_score,
+        min(a.creationdate) filter (where a.posttypeid = 2) as first_answer_date,
+        max(a.creationdate) filter (where a.posttypeid = 2) as last_answer_date
+    from posts q
+    left join posts a
+        on a.parentid = q.id
+    where q.posttypeid = 1
+      and q.creationdate >= (select max(p.creationdate) - interval '730 days' from posts p)
+    group by q.id, q.owneruserid, q.creationdate, q.score, q.viewcount, q.title, q.tags, q.acceptedanswerid
+),
+accepted_answerers as (
+    select
+        qa.question_id,
+        aa.owneruserid as accepted_user_id,
+        aa.score as accepted_score,
+        aa.creationdate as accepted_date
+    from question_activity qa
+    left join posts aa
+        on aa.id = qa.acceptedanswerid
+),
+question_closures as (
+    select
+        ph.postid as question_id,
+        min(ph.creationdate) as first_closed_date,
+        max(ph.creationdate) as last_closed_date,
+        count(*) as close_events,
+        max(case when ph.comment ~ '^\d+$' then ph.comment::int end) as last_close_reason_id
+    from posthistory ph
+    where ph.posthistorytypeid = 10
+    group by ph.postid
+),
+duplicate_links as (
+    select
+        pl.postid as question_id,
+        count(*) filter (where pl.linktypeid = 3) as duplicate_link_count,
+        count(*) filter (where pl.linktypeid = 1) as linked_count
+    from postlinks pl
+    group by pl.postid
+),
+vote_summaries as (
+    select
+        v.postid,
+        count(*) filter (where v.votetypeid = 2) as upvotes,
+        count(*) filter (where v.votetypeid = 3) as downvotes,
+        count(*) filter (where v.votetypeid = 5) as favorites,
+        sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_total,
+        max(v.creationdate) as last_vote_date
+    from votes v
+    group by v.postid
+),
+comment_bursts as (
+    select
+        c.postid,
+        count(*) as comment_count,
+        max(c.score) as max_comment_score,
+        min(c.creationdate) as first_comment_date,
+        max(c.creationdate) as last_comment_date,
+        count(*) filter (where c.text ilike '%thanks%' or c.text ilike '%thank%') as gratitude_comments
+    from comments c
+    group by c.postid
+),
+tag_expansion as (
+    select
+        p.id as question_id,
+        unnest(string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')) as tag
+    from posts p
+    where p.posttypeid = 1
+      and p.tags is not null
+),
+top_tags as (
+    select
+        te.tag,
+        count(*) as tag_usage_2y
+    from tag_expansion te
+    join posts q on q.id = te.question_id
+    where q.creationdate >= (select max(p.creationdate) - interval '730 days' from posts p)
+    group by te.tag
+),
+user_badge_summary as (
+    select
+        b.userid,
+        count(*) as total_badges,
+        count(*) filter (where b.class = 1) as gold_badges,
+        count(*) filter (where b.class = 2) as silver_badges,
+        count(*) filter (where b.class = 3) as bronze_badges,
+        max(b.date) as last_badge_date
+    from badges b
+    group by b.userid
+),
+question_windows as (
+    select
+        qa.*,
+        ts.tag_usage_2y,
+        dense_rank() over (order by qa.viewcount desc nulls last) as dr_by_views,
+        ntile(10) over (order by qa.score desc nulls last) as score_decile,
+        lag(qa.creationdate) over (partition by qa.asker_id order by qa.creationdate) as prev_q_date,
+        lead(qa.creationdate) over (partition by qa.asker_id order by qa.creationdate) as next_q_date
+    from question_activity qa
+    left join (
+        select te.question_id, sum(tt.tag_usage_2y) as tag_usage_2y
+        from tag_expansion te
+        join top_tags tt on tt.tag = te.tag
+        group by te.question_id
+    ) ts on ts.question_id = qa.question_id
+),
+activity_span as (
+    select
+        qw.question_id,
+        extract(epoch from coalesce(qw.last_answer_date, qw.question_created) - qw.question_created) as answer_span_seconds,
+        extract(epoch from coalesce(cb.last_comment_date, qw.question_created) - qw.question_created) as comment_span_seconds,
+        extract(epoch from coalesce(vs.last_vote_date, qw.question_created) - qw.question_created) as vote_span_seconds
+    from question_windows qw
+    left join comment_bursts cb on cb.postid = qw.question_id
+    left join vote_summaries vs on vs.postid = qw.question_id
+),
+asker_engagement as (
+    select
+        qw.asker_id,
+        count(*) as questions_2y,
+        sum(case when qw.answer_count > 0 then 1 else 0 end) as questions_with_answers,
+        avg(qw.answer_count::numeric) as avg_answer_count,
+        avg(coalesce(vs.upvotes,0)::numeric) as avg_upvotes,
+        avg(coalesce(vs.downvotes,0)::numeric) as avg_downvotes
+    from question_windows qw
+    left join vote_summaries vs on vs.postid = qw.question_id
+    group by qw.asker_id
+),
+accepted_answerer_rep as (
+    select
+        aa.accepted_user_id,
+        count(*) as accepts_2y,
+        avg(coalesce(p.score,0)::numeric) as avg_answer_score,
+        min(aa.accepted_date) as first_accept_date,
+        max(aa.accepted_date) as last_accept_date
+    from accepted_answerers aa
+    left join posts p on p.id = aa.accepted_user_id -- intentional mismatch to stress planner; corrected in where
+    where aa.accepted_user_id is not null
+    group by aa.accepted_user_id
+),
+-- corrected join for accepted answer scores for realism
+accepted_answerer_rep_corrected as (
+    select
+        aa.accepted_user_id,
+        count(*) as accepts_2y,
+        avg(coalesce(ans.score,0)::numeric) as avg_answer_score,
+        min(aa.accepted_date) as first_accept_date,
+        max(aa.accepted_date) as last_accept_date
+    from accepted_answerers aa
+    join posts ans on ans.id = (select acceptedanswerid from posts q where q.id = aa.question_id)
+    group by aa.accepted_user_id
+),
+final_questions as (
+    select
+        qw.question_id,
+        qw.asker_id,
+        qw.question_created,
+        qw.question_score,
+        qw.viewcount,
+        qw.answer_count,
+        qw.max_answer_score,
+        qw.first_answer_date,
+        qw.last_answer_date,
+        qw.title,
+        qw.tags,
+        qw.tag_usage_2y,
+        vs.upvotes,
+        vs.downvotes,
+        vs.favorites,
+        vs.bounty_total,
+        cb.comment_count,
+        cb.max_comment_score,
+        cb.gratitude_comments,
+        qc.first_closed_date,
+        qc.last_closed_date,
+        qc.close_events,
+        qc.last_close_reason_id,
+        dl.duplicate_link_count,
+        dl.linked_count,
+        aw.answer_span_seconds,
+        aw.comment_span_seconds,
+        aw.vote_span_seconds,
+        rw.cohort_month,
+        rw.primary_location,
+        rw.rn_in_cohort,
+        u.reputation as asker_reputation,
+        uvs.questions_2y as asker_questions_2y,
+        ubs.total_badges as asker_total_badges
+    from question_windows qw
+    left join vote_summaries vs on vs.postid = qw.question_id
+    left join comment_bursts cb on cb.postid = qw.question_id
+    left join question_closures qc on qc.question_id = qw.question_id
+    left join duplicate_links dl on dl.question_id = qw.question_id
+    left join activity_span aw on aw.question_id = qw.question_id
+    left join users u on u.id = qw.asker_id
+    left join recent_users rw on rw.user_id = qw.asker_id
+    left join asker_engagement uvs on uvs.asker_id = qw.asker_id
+    left join user_badge_summary ubs on ubs.userid = qw.asker_id
+),
+ranked_questions as (
+    select
+        fq.*,
+        row_number() over (
+            partition by coalesce(fq.primary_location, 'Unknown')
+            order by
+                coalesce(fq.answer_count, 0) desc,
+                coalesce(fq.viewcount, 0) desc,
+                coalesce(fq.question_score, 0) desc,
+                fq.question_created desc,
+                fq.question_id
+        ) as rn_loc,
+        sum(coalesce(fq.viewcount,0)) over (partition by date_trunc('month', fq.question_created)) as monthly_views_sum,
+        avg(coalesce(fq.question_score,0)::numeric) over (partition by date_trunc('month', fq.question_created)) as monthly_avg_score
+    from final_questions fq
+),
+outliers as (
+    select
+        rq.question_id,
+        rq.asker_id,
+        rq.viewcount,
+        rq.question_score,
+        rq.answer_count,
+        rq.primary_location,
+        rq.question_created,
+        percentile_cont(0.95) within group (order by coalesce(rq.viewcount,0)) over () as p95_views,
+        percentile_cont(0.95) within group (order by coalesce(rq.question_score,0)) over () as p95_score
+    from ranked_questions rq
+),
+flagged as (
+    select
+        rq.question_id,
+        case
+            when rq.viewcount is null then 'NoViews'
+            when rq.viewcount > o.p95_views and rq.question_score < 0 then 'HighViewLowScore'
+            when coalesce(rq.answer_count,0) = 0 and rq.viewcount > 0 then 'UnansweredViewed'
+            when rq.duplicate_link_count > 0 then 'Duplicate'
+            when rq.close_events > 0 then 'Closed'
+            else 'Normal'
+        end as flag_category
+    from ranked_questions rq
+    left join outliers o on o.question_id = rq.question_id
+),
+scored as (
+    select
+        rq.*,
+        f.flag_category,
+        (
+            coalesce(rq.answer_count,0)*2
+            + coalesce(rq.upvotes,0)
+            - coalesce(rq.downvotes,0)
+            + greatest(least(coalesce(rq.viewcount,0) / nullif((rq.dr_by_views + 1),0), 1000), 0)
+            + case when rq.duplicate_link_count > 0 then -5 else 0 end
+            + case when rq.close_events > 0 then -10 else 0 end
+            + case when rq.gratitude_comments > 0 then 1 else 0 end
+            + case when rq.bounty_total > 0 then 5 else 0 end
+        ) as quality_score
+    from ranked_questions rq
+    left join flagged f on f.question_id = rq.question_id
+)
+select
+    s.question_id,
+    s.title,
+    coalesce(s.tags, '') as tags,
+    s.question_created,
+    s.primary_location,
+    s.asker_id,
+    s.asker_reputation,
+    s.asker_questions_2y,
+    s.asker_total_badges,
+    coalesce(s.viewcount,0) as viewcount,
+    coalesce(s.question_score,0) as score,
+    coalesce(s.answer_count,0) as answers,
+    coalesce(s.upvotes,0) as upvotes,
+    coalesce(s.downvotes,0) as downvotes,
+    coalesce(s.favorites,0) as favorites,
+    coalesce(s.bounty_total,0) as bounty_total,
+    coalesce(s.comment_count,0) as comment_count,
+    coalesce(s.max_comment_score,0) as max_comment_score,
+    coalesce(s.gratitude_comments,0) as gratitude_comments,
+    s.first_closed_date,
+    s.last_closed_date,
+    coalesce(s.close_events,0) as close_events,
+    s.duplicate_link_count,
+    s.linked_count,
+    s.answer_span_seconds,
+    s.comment_span_seconds,
+    s.vote_span_seconds,
+    s.rn_loc,
+    s.monthly_views_sum,
+    s.monthly_avg_score,
+    s.flag_category,
+    s.quality_score,
+    -- correlated subquery for accepted answerer detail with null-handling
+    coalesce((
+        select concat(ua.displayname, ' (', ua.reputation, ')')
+        from posts q
+        left join posts a on a.id = q.acceptedanswerid
+        left join users ua on ua.id = a.owneruserid
+        where q.id = s.question_id
+        limit 1
+    ), 'None') as accepted_answerer,
+    -- set operator example to count unique participants (asker + distinct answerers + commenters) per question
+    (
+        select count(distinct uid)
+        from (
+            select s.asker_id as uid
+            union
+            select a.owneruserid as uid from posts a where a.parentid = s.question_id and a.posttypeid = 2 and a.owneruserid is not null
+            union
+            select c.userid as uid from comments c where c.postid = s.question_id and c.userid is not null
+        ) z
+    ) as unique_participants
+from scored s
+where
+    (s.flag_category <> 'Closed' or s.close_events is null)
+    and coalesce(s.viewcount,0) >= (
+        select percentile_disc(0.5) within group (order by coalesce(viewcount,0))
+        from scored
+    )
+    and (
+        s.primary_location is distinct from 'Unknown'
+        or s.tag_usage_2y > 0
+    )
+order by
+    s.quality_score desc,
+    s.rn_loc asc,
+    s.question_created desc
+limit 500;

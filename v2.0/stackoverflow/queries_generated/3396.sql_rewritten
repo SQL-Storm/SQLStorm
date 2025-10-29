@@ -1,0 +1,116 @@
+-- {"query": "3396.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2041} 
+WITH recent_questions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.OwnerUserId,
+        regexp_split_to_table(p.Tags, '\\><') AS tag
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days'
+),
+
+tag_agg AS (
+    SELECT
+        q.tag,
+        COUNT(*)                     AS q_count,
+        SUM(q.Score)                 AS total_score,
+        AVG(q.Score)                 AS avg_score
+    FROM recent_questions q
+    GROUP BY q.tag
+),
+
+user_badges AS (
+    SELECT
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1)    AS gold_badges,
+        COUNT(*) FILTER (WHERE b.Class = 2)    AS silver_badges,
+        COUNT(*) FILTER (WHERE b.Class = 3)    AS bronze_badges,
+        COUNT(*) FILTER (WHERE b.TagBased = 1) AS tag_badges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+user_votes AS (
+    SELECT
+        v.UserId,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS up_votes_given,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS down_votes_given,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 8) AS bounties_started
+    FROM Votes v
+    WHERE v.UserId IS NOT NULL
+    GROUP BY v.UserId
+),
+
+user_activity AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(ub.gold_badges,   0) AS gold_badges,
+        COALESCE(ub.silver_badges, 0) AS silver_badges,
+        COALESCE(ub.bronze_badges, 0) AS bronze_badges,
+        COALESCE(ub.tag_badges,    0) AS tag_badges,
+        COALESCE(uv.up_votes_given,   0) AS up_votes_given,
+        COALESCE(uv.down_votes_given, 0) AS down_votes_given,
+        COALESCE(uv.bounties_started, 0) AS bounties_started,
+        (SELECT MAX(p.CreationDate) FROM Posts p WHERE p.OwnerUserId = u.Id) AS last_post_date,
+        (SELECT MAX(v.CreationDate) FROM Votes v WHERE v.UserId = u.Id)      AS last_vote_date
+    FROM Users u
+    LEFT JOIN user_badges ub ON ub.UserId = u.Id
+    LEFT JOIN user_votes uv ON uv.UserId = u.Id
+),
+
+ranked_users AS (
+    SELECT
+        *,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, gold_badges DESC, silver_badges DESC) AS rep_rank,
+        RANK()      OVER (ORDER BY (gold_badges * 100 + silver_badges * 10 + bronze_badges) DESC) AS badge_rank
+    FROM user_activity
+),
+
+top_tags AS (
+    SELECT
+        tag,
+        q_count,
+        total_score,
+        avg_score,
+        ROW_NUMBER() OVER (ORDER BY q_count DESC) AS tag_pop_rank
+    FROM tag_agg
+)
+
+SELECT
+    ru.Id,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.gold_badges,
+    ru.silver_badges,
+    ru.bronze_badges,
+    ru.tag_badges,
+    ru.up_votes_given,
+    ru.down_votes_given,
+    ru.bounties_started,
+    ru.rep_rank,
+    ru.badge_rank,
+    COALESCE(ru.last_post_date, TIMESTAMP '1970-01-01') AS last_post_date,
+    COALESCE(ru.last_vote_date, TIMESTAMP '1970-01-01') AS last_vote_date,
+    tt.tag,
+    tt.q_count,
+    tt.total_score,
+    tt.avg_score,
+    tt.tag_pop_rank
+FROM ranked_users ru
+FULL OUTER JOIN top_tags tt
+    ON tt.tag_pop_rank <= 5
+   AND ru.rep_rank <= 10
+WHERE (ru.Reputation > 10000 OR ru.gold_badges > 5)
+ORDER BY ru.rep_rank, tt.tag_pop_rank
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL
+WHERE NOT EXISTS (SELECT 1 FROM ranked_users ru WHERE ru.Reputation > 10000);

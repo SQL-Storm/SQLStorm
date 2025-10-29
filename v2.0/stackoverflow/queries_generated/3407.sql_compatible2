@@ -1,0 +1,155 @@
+WITH RECURSIVE
+/* 1. Recent activity (last 365 days) */
+recent_posts AS (
+    SELECT p.Id,
+           p.PostTypeId,
+           p.OwnerUserId,
+           p.CreationDate,
+           p.Score,
+           p.ViewCount,
+           p.Tags,
+           p.Title
+    FROM   Posts p
+    WHERE  p.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '365' DAY
+),
+
+/* 2. User-level aggregates from recent posts */
+user_post_stats AS (
+    SELECT  u.Id                                   AS UserId,
+            u.DisplayName,
+            COUNT(*)                               AS PostCnt,
+            SUM(p.Score)                           AS TotalScore,
+            AVG(p.Score)                           AS AvgScore,
+            SUM(p.ViewCount)                       AS TotalViews,
+            AVG(p.ViewCount)                       AS AvgViews,
+            COUNT(DISTINCT p.PostTypeId)           AS DistPostTypes,
+            /* extract distinct tag tokens */
+            COUNT(DISTINCT t.tag)                  AS DistTagTokens,
+            MAX(p.CreationDate)                    AS LastPostDate
+    FROM    Users u
+    LEFT JOIN recent_posts p
+           ON p.OwnerUserId = u.Id
+    LEFT JOIN LATERAL (
+        SELECT UNNEST(string_to_array(REPLACE(REPLACE(COALESCE(p.Tags,''), '<', ''), '>', ''), ' ')) AS tag
+    ) t ON TRUE
+    GROUP BY u.Id, u.DisplayName
+),
+
+/* 3. Badge statistics per user, split by class */
+user_badge_stats AS (
+    SELECT  b.UserId,
+            SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+            SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+            SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+            COUNT(*)                             AS TotalBadges,
+            MAX(b.Date)                          AS LastBadgeDate
+    FROM    Badges b
+    GROUP BY b.UserId
+),
+
+/* 4. Most recent vote type per user (correlated sub-query) */
+user_last_vote AS (
+    SELECT  v.UserId,
+            vt.Name AS LastVoteType,
+            v.CreationDate AS VoteDate
+    FROM   (
+        SELECT v1.*
+        FROM   Votes v1
+        JOIN (
+            SELECT UserId, MAX(CreationDate) AS max_cd
+            FROM Votes
+            GROUP BY UserId
+        ) mv ON v1.UserId = mv.UserId AND v1.CreationDate = mv.max_cd
+    ) v
+    LEFT JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+),
+
+/* 5. Users with zero activity (to be unioned later) */
+inactive_users AS (
+    SELECT u.Id   AS UserId,
+           u.DisplayName,
+           0      AS PostCnt,
+           0      AS TotalScore,
+           NULL   AS AvgScore,
+           0      AS TotalViews,
+           NULL   AS AvgViews,
+           0      AS DistPostTypes,
+           0      AS DistTagTokens,
+           NULL   AS LastPostDate,
+           0      AS GoldBadges,
+           0      AS SilverBadges,
+           0      AS BronzeBadges,
+           0      AS TotalBadges,
+           NULL   AS LastBadgeDate,
+           NULL   AS LastVoteType,
+           NULL   AS VoteDate
+    FROM   Users u
+    WHERE  NOT EXISTS (SELECT 1 FROM recent_posts rp WHERE rp.OwnerUserId = u.Id)
+)
+
+/* 6. Combine active and inactive users */
+SELECT *
+FROM (
+    SELECT  ups.UserId,
+            ups.DisplayName,
+            ups.PostCnt,
+            ups.TotalScore,
+            ups.AvgScore,
+            ups.TotalViews,
+            ups.AvgViews,
+            ups.DistPostTypes,
+            ups.DistTagTokens,
+            ups.LastPostDate,
+            COALESCE(ubs.GoldBadges,0)   AS GoldBadges,
+            COALESCE(ubs.SilverBadges,0) AS SilverBadges,
+            COALESCE(ubs.BronzeBadges,0) AS BronzeBadges,
+            COALESCE(ubs.TotalBadges,0)  AS TotalBadges,
+            ubs.LastBadgeDate,
+            ulv.LastVoteType,
+            ulv.VoteDate,
+            /* Composite performance score */
+            (COALESCE(ups.TotalScore,0) * 0.4) +
+            (COALESCE(ups.TotalViews,0) / NULLIF(ups.PostCnt,0) * 0.2) +
+            (COALESCE(ubs.GoldBadges,0)   * 10) +
+            (COALESCE(ubs.SilverBadges,0) * 5) +
+            (COALESCE(ubs.BronzeBadges,0) * 2) +
+            (CASE WHEN ulv.LastVoteType = 'AcceptedByOriginator' THEN 15 ELSE 0 END) AS CompositeScore,
+            ROW_NUMBER() OVER (ORDER BY
+                (COALESCE(ups.TotalScore,0) * 0.4) +
+                (COALESCE(ups.TotalViews,0) / NULLIF(ups.PostCnt,0) * 0.2) +
+                (COALESCE(ubs.GoldBadges,0)   * 10) +
+                (COALESCE(ubs.SilverBadges,0) * 5) +
+                (COALESCE(ubs.BronzeBadges,0) * 2) +
+                (CASE WHEN ulv.LastVoteType = 'AcceptedByOriginator' THEN 15 ELSE 0 END) DESC
+            ) AS Rank
+    FROM   user_post_stats ups
+    LEFT   JOIN user_badge_stats ubs
+           ON ubs.UserId = ups.UserId
+    LEFT   JOIN user_last_vote ulv
+           ON ulv.UserId = ups.UserId
+
+    UNION ALL
+
+    SELECT  iu.UserId,
+            iu.DisplayName,
+            iu.PostCnt,
+            iu.TotalScore,
+            iu.AvgScore,
+            iu.TotalViews,
+            iu.AvgViews,
+            iu.DistPostTypes,
+            iu.DistTagTokens,
+            iu.LastPostDate,
+            COALESCE(iu.GoldBadges,0)   AS GoldBadges,
+            COALESCE(iu.SilverBadges,0) AS SilverBadges,
+            COALESCE(iu.BronzeBadges,0) AS BronzeBadges,
+            COALESCE(iu.TotalBadges,0)  AS TotalBadges,
+            iu.LastBadgeDate,
+            iu.LastVoteType,
+            iu.VoteDate,
+            0.0 AS CompositeScore,
+            NULL AS Rank
+    FROM   inactive_users iu
+) combined
+ORDER BY CompositeScore DESC NULLS LAST
+LIMIT 100;

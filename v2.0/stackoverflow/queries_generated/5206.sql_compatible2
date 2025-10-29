@@ -1,0 +1,130 @@
+WITH
+RecentActivePosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Body,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.OwnerUserId,
+    p.Tags,
+    p.Score,
+    p.ViewCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.PostTypeId,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.LastEditorUserId
+  FROM Posts p
+  WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '90' DAY
+),
+TopTags AS (
+  SELECT
+    t.TagName,
+    SUM(t.Count) AS TagCount
+  FROM Tags t
+  GROUP BY t.TagName
+  ORDER BY TagCount DESC
+  FETCH FIRST 20 ROWS ONLY
+),
+UserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.AccountId,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.WebsiteUrl,
+    u.AboutMe,
+    u.ProfileImageUrl,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesGiven,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesGiven
+  FROM Users u
+  LEFT JOIN Votes v ON v.UserId = u.Id
+  GROUP BY
+    u.Id, u.DisplayName, u.Reputation, u.AccountId, u.CreationDate, u.LastAccessDate,
+    u.Location, u.Views, u.UpVotes, u.DownVotes, u.WebsiteUrl, u.AboutMe,
+    u.ProfileImageUrl
+),
+ExpiredOrReopened AS (
+  SELECT
+    ph.PostId,
+    ph.PostHistoryTypeId,
+    ph.CreationDate,
+    ph.UserId,
+    ph.Comment
+  FROM PostHistory ph
+  WHERE ph.PostHistoryTypeId IN (10, 11)
+)
+SELECT
+  rp.PostId,
+  rp.Title,
+  rp.CreationDate AS PostCreationDate,
+  rp.LastActivityDate,
+  rp.OwnerUserId,
+  ru.DisplayName AS OwnerDisplayName,
+  ru.Reputation AS OwnerReputation,
+  rp.Tags,
+  rp.Score,
+  rp.ViewCount,
+  rp.CommentCount,
+  rp.FavoriteCount,
+  CASE
+    WHEN rp.PostTypeId = 1 AND rp.AcceptedAnswerId IS NOT NULL THEN 'Question with Accepted Answer'
+    WHEN rp.PostTypeId = 2 THEN 'Answer'
+    ELSE 'Other'
+  END AS PostKind,
+  COALESCE(pt.Name, 'Unknown') AS PostTypeName,
+  tt.TagName AS TopTagName,
+  ta.TagCount,
+  ua.DisplayName AS LastEditorName,
+  ru2.DisplayName AS OwnerDisplayNameLegacy,
+  eor.Comment AS LastCloseOrReopenComment,
+  eor.CreationDate AS LastCloseOrReopenDate
+FROM
+  RecentActivePosts rp
+  LEFT JOIN PostTypes pt ON rp.PostTypeId = pt.Id
+  LEFT JOIN LATERAL (
+    SELECT
+      trim(both '<>' FROM part) AS TagName,
+      CAST(NULL AS INTEGER) AS CountValue,
+      CAST(NULL AS INTEGER) AS TagCount
+    FROM (
+      SELECT regexp_split_to_table(rp.Tags, '><') AS part
+    ) s
+  ) AS ta ON true
+  LEFT JOIN TopTags tt ON ta.TagName = tt.TagName
+  LEFT JOIN (SELECT DISTINCT Id AS UserId, DisplayName, Reputation FROM Users) ru ON rp.OwnerUserId = ru.UserId
+  LEFT JOIN Users ru2 ON rp.LastEditorUserId = ru2.Id
+  LEFT JOIN UserActivity ua ON rp.OwnerUserId = ua.UserId
+  LEFT JOIN ExpiredOrReopened eor ON rp.PostId = eor.PostId
+GROUP BY
+  rp.PostId,
+  rp.Title,
+  rp.CreationDate,
+  rp.LastActivityDate,
+  rp.OwnerUserId,
+  ru.DisplayName,
+  ru.Reputation,
+  rp.Tags,
+  rp.Score,
+  rp.ViewCount,
+  rp.CommentCount,
+  rp.FavoriteCount,
+  rp.PostTypeId,
+  rp.AcceptedAnswerId,
+  pt.Name,
+  tt.TagName,
+  ta.TagCount,
+  ua.DisplayName,
+  ru2.DisplayName,
+  eor.Comment,
+  eor.CreationDate
+ORDER BY rp.LastActivityDate DESC
+LIMIT 1000;

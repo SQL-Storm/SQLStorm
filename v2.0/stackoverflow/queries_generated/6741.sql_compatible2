@@ -1,0 +1,79 @@
+SELECT 
+    u.DisplayName, 
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    MAX(p.Score) AS HighestScoredPost,
+    MIN(p.CreationDate) AS FirstPost,
+    MAX(p.LastActivityDate) AS LastActivity,
+    b.Name AS LatestBadge,
+    ph.Comment AS LastEditComment,
+    v.VoteTypeId AS LastVoteType
+FROM 
+    Users u
+LEFT JOIN 
+    (
+     SELECT 
+         ph.PostId, 
+         ph.Comment, 
+         MAX(ph.CreationDate) AS LastEditDate
+     FROM 
+         PostHistory ph
+     WHERE 
+         ph.PostHistoryTypeId IN (2, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 19, 20, 35, 36)
+     GROUP BY 
+         ph.PostId, ph.Comment
+    ) ph ON ph.PostId = u.Id
+LEFT JOIN 
+    Posts p ON p.OwnerUserId = u.Id
+LEFT JOIN 
+    (
+     SELECT 
+         UserId, 
+         MAX(Date) AS LatestBadgeDate, 
+         Name
+     FROM 
+         Badges
+     GROUP BY 
+         UserId, Name
+    ) b ON b.UserId = u.Id
+LEFT JOIN 
+    (
+     SELECT 
+         UserId, 
+         VoteTypeId, 
+         CreationDate
+     FROM 
+         Votes
+     WHERE 
+         VoteTypeId = 11
+     GROUP BY 
+         UserId, VoteTypeId, CreationDate
+    ) v ON v.UserId = u.Id
+WHERE 
+    u.Reputation > 10000
+    AND u.Id IN 
+        (
+         SELECT 
+             CAST(UserDisplayName AS INTEGER)
+         FROM 
+             (
+              SELECT 
+                   UserDisplayName, 
+                   COUNT(*) AS CommentCount 
+               FROM 
+                   Comments 
+               GROUP BY 
+                   UserDisplayName 
+               HAVING 
+                   COUNT(*) > 10
+             ) AS sub
+        )
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation, b.Name, ph.Comment, v.VoteTypeId
+HAVING 
+    COUNT(DISTINCT p.Id) > 50
+ORDER BY 
+    u.Reputation DESC, 
+    TotalPosts DESC;

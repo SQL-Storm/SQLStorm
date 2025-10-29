@@ -1,0 +1,146 @@
+-- {"query": "3550.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2366} 
+
+/*  Performance‑rich benchmark query */
+WITH
+    /* 1️⃣  Users enriched with badge counts and recent up‑vote activity */
+    user_stats AS (
+        SELECT
+            u.Id                                      AS user_id,
+            u.DisplayName,
+            u.Reputation,
+            COUNT(b.Id)               FILTER (WHERE b.Class = 1) AS gold_badges,
+            COUNT(b.Id)               FILTER (WHERE b.Class = 2) AS silver_badges,
+            COUNT(b.Id)               FILTER (WHERE b.Class = 3) AS bronze_badges,
+            COALESCE(
+                SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 END) OVER (PARTITION BY u.Id ORDER BY v.CreationDate
+                                                                 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+                0)                                      AS cumulative_upvotes
+        FROM Users u
+        LEFT JOIN Badges b   ON b.UserId = u.Id
+        LEFT JOIN Votes  v   ON v.UserId = u.Id AND v.VoteTypeId = 2
+        GROUP BY u.Id, u.DisplayName, u.Reputation
+    ),
+
+    /* 2️⃣  Tag activity – parsed from the Posts.Tags CSV‑like column */
+    tag_activity AS (
+        SELECT
+            t.TagName,
+            COUNT(p.Id)                                           AS total_posts,
+            SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END)    AS questions,
+            SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END)    AS answers,
+            MAX(p.CreationDate)                                  AS last_post_date
+        FROM Tags t
+        LEFT JOIN Posts p
+               ON POSITION('<' || t.TagName || '>' IN p.Tags) > 0
+        GROUP BY t.TagName
+    ),
+
+    /* 3️⃣  The most recent closure event for each question (if any) */
+    recent_closure AS (
+        SELECT
+            ph.PostId,
+            MAX(ph.CreationDate)                                    AS closed_at,
+            MAX(CAST(ph.Comment AS INTEGER)) FILTER (WHERE ph.PostHistoryTypeId = 10) AS close_reason_id
+        FROM PostHistory ph
+        WHERE ph.PostHistoryTypeId = 10               -- “Post Closed”
+        GROUP BY ph.PostId
+    ),
+
+    /* 4️⃣  Question‑level statistics plus a row‑number per owner ordered by score */
+    question_metrics AS (
+        SELECT
+            q.Id,
+            q.Title,
+            q.Tags,
+            q.Score,
+            q.ViewCount,
+            q.AnswerCount,
+            q.FavoriteCount,
+            q.OwnerUserId,
+            COALESCE(rc.closed_at, q.CreationDate)                 AS reference_date,
+            ROW_NUMBER() OVER (PARTITION BY q.OwnerUserId
+                               ORDER BY q.Score DESC, q.CreationDate DESC) AS rn_per_user
+        FROM Posts q
+        LEFT JOIN recent_closure rc ON rc.PostId = q.Id
+        WHERE q.PostTypeId = 1                 -- only questions
+    ),
+
+    /* 5️⃣  Best tag per question – evaluated lazily via LATERAL join */
+    question_best_tag AS (
+        SELECT
+            qm.Id,
+            tb.TagName
+        FROM question_metrics qm
+        LEFT JOIN LATERAL (
+            SELECT t.TagName
+            FROM UNNEST(string_to_array(
+                         REPLACE(REPLACE(qm.Tags, '<', ''), '>', ''),   -- strip angle brackets
+                         ' ') ) AS tag(tag_name)
+            JOIN Tags t ON t.TagName = tag.tag_name
+            ORDER BY t.Count DESC
+            LIMIT 1
+        ) tb ON TRUE
+    ),
+
+    /* 6️⃣  Union of “real” questions and a synthetic set of “orphaned” tag‑only rows for set‑operator stress */
+    combined_questions AS (
+        SELECT
+            qm.Id,
+            qm.Title,
+            qm.Score,
+            qm.ViewCount,
+            qm.AnswerCount,
+            qm.FavoriteCount,
+            qm.OwnerUserId,
+            qm.reference_date,
+            qbt.TagName
+        FROM question_metrics qm
+        JOIN question_best_tag qbt ON qbt.Id = qm.Id
+        WHERE qm.rn_per_user = 1                -- top‑scoring question per user
+        UNION ALL
+        SELECT
+            NULL                         AS Id,
+            'No question – tag only'     AS Title,
+            NULL                         AS Score,
+            NULL                         AS ViewCount,
+            NULL                         AS AnswerCount,
+            NULL                         AS FavoriteCount,
+            NULL                         AS OwnerUserId,
+            NULL                         AS reference_date,
+            ta.TagName
+        FROM tag_activity ta
+        WHERE ta.questions = 0
+    )
+
+SELECT
+    us.user_id,
+    us.DisplayName,
+    us.Reputation,
+    us.gold_badges,
+    us.silver_badges,
+    us.bronze_badges,
+    us.cumulative_upvotes,
+    cq.Title,
+    cq.Score,
+    cq.ViewCount,
+    cq.AnswerCount,
+    cq.FavoriteCount,
+    cq.reference_date,
+    COALESCE(cq.TagName, 'UnTagged')               AS top_tag,
+    CASE
+        WHEN cq.Score > 0 AND cq.AnswerCount = 0 THEN 'UnansweredHighScore'
+        WHEN cq.Score < 0                           THEN 'NegScore'
+        ELSE                                            'Normal'
+    END                                          AS score_category,
+    /* correlated sub‑queries for comment/vote aggregates */
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = cq.Id AND c.Score > 0)    AS positive_comments,
+    (SELECT COUNT(*) FROM Votes v     WHERE v.PostId = cq.Id AND v.VoteTypeId = 2) AS upvotes,
+    (SELECT COUNT(*) FROM Votes v     WHERE v.PostId = cq.Id AND v.VoteTypeId = 3) AS downvotes,
+    /* Boolean flag – does the user own a “Great Question” badge? */
+    EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = us.user_id AND b.Name = 'Great Question')
+                                                 AS has_great_question_badge
+FROM user_stats us
+LEFT JOIN combined_questions cq ON cq.OwnerUserId = us.user_id
+WHERE cq.Score IS NOT NULL OR cq.Id IS NULL               -- keep tag‑only rows too
+ORDER BY us.Reputation DESC, cq.Score DESC NULLS LAST
+LIMIT 100;

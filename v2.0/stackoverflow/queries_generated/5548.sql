@@ -1,0 +1,37 @@
+-- {"query": "5548.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 427} 
+SELECT
+  u.Id AS UserId,
+  u.DisplayName AS UserName,
+  u.Reputation,
+  COUNT(DISTINCT p.Id) AS PostsCreated,
+  SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesGiven,
+  SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesGiven,
+  COUNT(DISTINCT CASE WHEN b.Id IS NOT NULL THEN b.Id END) AS BadgesEarned,
+  MAX(u.CreationDate) AS FirstActivityAt,
+  AVG(NULLIF(p.Score, 0)) AS AvgPostScore,
+  ARRAY_AGG(DISTINCT t.Name) FILTER (WHERE t.Name IS NOT NULL) AS TagsParticipated
+FROM
+  Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.UserId = u.Id AND v.VoteTypeId IN (2,3)
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  LEFT JOIN Posts tp ON tp.OwnerUserId = u.Id AND tp.PostTypeId = 1
+  LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+  LEFT JOIN Posts t ON t.Id = pl.RelatedPostId
+  LEFT JOIN Tags ta ON ta.WikiPostId = p.Id OR ta.ExcerptPostId = p.Id
+  LEFT JOIN (SELECT Id, Name FROM PostHistoryTypes) AS ttypes ON TRUE
+  CROSS JOIN LATERAL (
+    SELECT unnest(string_to_array(p.Tags, '>')) AS tag
+  ) AS ttag
+WHERE
+  u.AccountId IS NOT NULL
+  AND p.Id IS NOT NULL
+  AND p.CreationDate < NOW()
+GROUP BY
+  u.Id, u.DisplayName, u.Reputation
+HAVING
+  COUNT(DISTINCT p.Id) > 5
+ORDER BY
+  PostsCreated DESC,
+  UpvotesGiven - DownvotesGiven DESC
+LIMIT 100;

@@ -1,0 +1,380 @@
+-- {"query": "862.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3353} 
+with recent_users as (
+  select
+    u.id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.location,
+    coalesce(nullif(trim(u.websiteurl), ''), 'n/a') as websiteurl_norm,
+    date_trunc('month', u.creationdate) as cohort_month,
+    row_number() over (order by u.creationdate desc, u.id desc) as rn_global
+  from users u
+  where u.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+),
+user_badge_agg as (
+  select
+    b.userid,
+    count(*) filter (where b.class = 1) as gold_count,
+    count(*) filter (where b.class = 2) as silver_count,
+    count(*) filter (where b.class = 3) as bronze_count,
+    min(b.date) as first_badge_at,
+    max(b.date) as last_badge_at
+  from badges b
+  group by b.userid
+),
+post_activity as (
+  select
+    p.owneruserid as userid,
+    sum(case when p.posttypeid = 1 then 1 else 0 end) as q_count,
+    sum(case when p.posttypeid = 2 then 1 else 0 end) as a_count,
+    sum(coalesce(p.score,0)) as total_post_score,
+    sum(coalesce(p.viewcount,0)) as total_views,
+    count(*) filter (where p.closeddate is not null) as closed_posts,
+    max(p.lastactivitydate) as last_post_activity
+  from posts p
+  where p.owneruserid is not null
+  group by p.owneruserid
+),
+comment_activity as (
+  select
+    c.userid as userid,
+    count(*) as comment_count,
+    sum(coalesce(c.score,0)) as comment_score,
+    max(c.creationdate) as last_comment_at
+  from comments c
+  where c.userid is not null
+  group by c.userid
+),
+vote_breakdown as (
+  select
+    v.userid,
+    count(*) filter (where v.votetypeid = 2) as upvotes_cast,
+    count(*) filter (where v.votetypeid = 3) as downvotes_cast,
+    count(*) filter (where v.votetypeid = 5) as favorites_cast
+  from votes v
+  where v.userid is not null
+  group by v.userid
+),
+question_tag_counts as (
+  select
+    p.owneruserid as userid,
+    unnest(string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')) as tag
+  from posts p
+  where p.posttypeid = 1
+    and p.owneruserid is not null
+    and p.tags is not null
+),
+top_tags_per_user as (
+  select userid, tag, cnt, rn
+  from (
+    select
+      q.userid,
+      lower(q.tag) as tag,
+      count(*) as cnt,
+      row_number() over (partition by q.userid order by count(*) desc, lower(q.tag)) as rn
+    from question_tag_counts q
+    group by q.userid, lower(q.tag)
+  ) s
+  where s.rn <= 3
+),
+tag_string as (
+  select
+    t.userid,
+    string_agg(t.tag || '×' || t.cnt::text, ', ' order by t.rn) as top_tags
+  from top_tags_per_user t
+  group by t.userid
+),
+post_history_flags as (
+  select
+    ph.postid,
+    max(ph.creationdate) filter (where ph.posthistorytypeid in (10,11,12,13,14,15,19,20,35)) as last_moderation_event_at,
+    sum(case when ph.posthistorytypeid in (10,35) then 1 else 0 end) as close_or_migrate_events,
+    sum(case when ph.posthistorytypeid in (19) then 1 else 0 end) as protected_events
+  from posthistory ph
+  group by ph.postid
+),
+user_moderation_touch as (
+  select
+    p.owneruserid as userid,
+    max(h.last_moderation_event_at) as last_mod_touch,
+    sum(h.close_or_migrate_events) as total_close_migrate_events,
+    sum(h.protected_events) as total_protected_events
+  from posts p
+  join post_history_flags h on h.postid = p.id
+  where p.owneruserid is not null
+  group by p.owneruserid
+),
+dup_network as (
+  select
+    pl.postid,
+    pl.relatedpostid,
+    pl.linktypeid,
+    case when pl.linktypeid = 3 then 1 else 0 end as is_duplicate
+  from postlinks pl
+),
+user_duplicate_graph as (
+  select
+    p.owneruserid as userid,
+    count(*) filter (where d.is_duplicate = 1) as dup_edges,
+    count(*) filter (where d.linktypeid = 1) as linked_edges
+  from posts p
+  join dup_network d on d.postid = p.id
+  where p.owneruserid is not null
+  group by p.owneruserid
+),
+recent_hot_candidates as (
+  select
+    p.id,
+    p.owneruserid as userid,
+    p.score,
+    p.viewcount,
+    p.creationdate,
+    p.title,
+    exists (
+      select 1
+      from posthistory ph
+      where ph.postid = p.id
+        and ph.posthistorytypeid in (52)
+    ) as became_hot
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+    and p.owneruserid is not null
+),
+user_hotness as (
+  select
+    r.userid,
+    count(*) filter (where r.became_hot) as hot_questions,
+    percentile_cont(0.5) within group (order by coalesce(r.viewcount,0)) as p50_views_recent_q,
+    percentile_cont(0.9) within group (order by coalesce(r.score,0)) as p90_score_recent_q,
+    max(r.creationdate) as last_recent_q_at
+  from recent_hot_candidates r
+  group by r.userid
+),
+user_recentness_rank as (
+  select
+    ru.id as userid,
+    row_number() over (
+      order by coalesce(ua.last_post_activity, cr.last_comment_at, ru.creationdate) desc, ru.id desc
+    ) as activity_recency_rank
+  from recent_users ru
+  left join post_activity ua on ua.userid = ru.id
+  left join comment_activity cr on cr.userid = ru.id
+),
+power_users as (
+  select
+    ru.id as userid
+  from recent_users ru
+  left join post_activity pa on pa.userid = ru.id
+  left join vote_breakdown vb on vb.userid = ru.id
+  where coalesce(pa.q_count,0) + coalesce(pa.a_count,0) >= 50
+    and coalesce(vb.upvotes_cast,0) - coalesce(vb.downvotes_cast,0) >= 100
+),
+bench_base as (
+  select
+    ru.id as userid,
+    ru.displayname,
+    ru.reputation,
+    ru.cohort_month,
+    coalesce(pa.q_count,0) as q_count,
+    coalesce(pa.a_count,0) as a_count,
+    coalesce(pa.total_post_score,0) as total_post_score,
+    coalesce(pa.total_views,0) as total_views,
+    coalesce(pa.closed_posts,0) as closed_posts,
+    pa.last_post_activity,
+    coalesce(ca.comment_count,0) as comment_count,
+    coalesce(ca.comment_score,0) as comment_score,
+    ca.last_comment_at,
+    coalesce(vb.upvotes_cast,0) as upvotes_cast,
+    coalesce(vb.downvotes_cast,0) as downvotes_cast,
+    coalesce(vb.favorites_cast,0) as favorites_cast,
+    coalesce(ba.gold_count,0) as gold_badges,
+    coalesce(ba.silver_count,0) as silver_badges,
+    coalesce(ba.bronze_count,0) as bronze_badges,
+    ba.first_badge_at,
+    ba.last_badge_at,
+    coalesce(ts.top_tags, '(none)') as top_tags,
+    coalesce(mt.last_mod_touch, null) as last_mod_touch,
+    coalesce(mt.total_close_migrate_events,0) as total_close_migrate_events,
+    coalesce(mt.total_protected_events,0) as total_protected_events,
+    coalesce(udg.dup_edges,0) as duplicate_edges,
+    coalesce(udg.linked_edges,0) as linked_edges,
+    coalesce(uh.hot_questions,0) as hot_questions,
+    uh.p50_views_recent_q,
+    uh.p90_score_recent_q,
+    uh.last_recent_q_at
+  from recent_users ru
+  left join post_activity pa on pa.userid = ru.id
+  left join comment_activity ca on ca.userid = ru.id
+  left join vote_breakdown vb on vb.userid = ru.id
+  left join user_badge_agg ba on ba.userid = ru.id
+  left join tag_string ts on ts.userid = ru.id
+  left join user_moderation_touch mt on mt.userid = ru.id
+  left join user_duplicate_graph udg on udg.userid = ru.id
+  left join user_hotness uh on uh.userid = ru.id
+),
+scored as (
+  select
+    b.*,
+    case
+      when b.reputation >= 100000 then 'legend'
+      when b.reputation >= 25000 then 'elite'
+      when b.reputation >= 5000 then 'pro'
+      when b.reputation >= 1000 then 'adv'
+      else 'novice'
+    end as tier,
+    (coalesce(b.q_count,0) * 1.25 + coalesce(b.a_count,0) * 1.0
+     + greatest(coalesce(b.total_post_score,0), 0) * 0.2
+     + coalesce(b.comment_count,0) * 0.05
+     + coalesce(b.upvotes_cast,0) * 0.03
+     - coalesce(b.downvotes_cast,0) * 0.05
+     + coalesce(b.gold_badges,0) * 10
+     + coalesce(b.silver_badges,0) * 4
+     + coalesce(b.bronze_badges,0) * 1
+     + coalesce(b.hot_questions,0) * 15
+     - coalesce(b.closed_posts,0) * 2
+     - least(coalesce(b.duplicate_edges,0), 100) * 0.1
+    )::numeric(18,2) as activity_score,
+    case
+      when b.last_post_activity is null and b.last_comment_at is null then null
+      else greatest(coalesce(b.last_post_activity, 'epoch'), coalesce(b.last_comment_at, 'epoch'))
+    end as last_seen_at,
+    case when b.total_views > 0 then (b.total_post_score::numeric / b.total_views) else null end as score_per_view
+  from bench_base b
+),
+with_correlated as (
+  select
+    s.*,
+    (
+      select avg(coalesce(p.score,0))::numeric(18,2)
+      from posts p
+      where p.owneruserid = s.userid
+        and p.posttypeid = 2
+        and p.creationdate >= s.cohort_month
+    ) as avg_answer_score_since_cohort,
+    (
+      select count(1)
+      from posts p
+      where p.owneruserid = s.userid
+        and p.posttypeid = 1
+        and exists (
+          select 1
+          from votes v
+          where v.postid = p.id and v.votetypeid = 2
+        )
+    ) as questions_with_upvotes
+  from scored s
+),
+ranked as (
+  select
+    w.*,
+    row_number() over (order by w.activity_score desc nulls last, w.reputation desc, w.userid) as rank_overall,
+    row_number() over (partition by w.tier order by w.activity_score desc nulls last, w.reputation desc, w.userid) as rank_in_tier,
+    dense_rank() over (order by coalesce(date_trunc('year', w.cohort_month), date_trunc('year', cast('2024-10-01 12:34:56' as timestamp)))) as cohort_year_rank
+  from with_correlated w
+),
+final_union as (
+  select
+    r.userid,
+    r.displayname,
+    r.tier,
+    r.activity_score,
+    r.rank_overall,
+    r.rank_in_tier,
+    r.cohort_month,
+    r.reputation,
+    r.q_count,
+    r.a_count,
+    r.total_post_score,
+    r.total_views,
+    r.comment_count,
+    r.upvotes_cast,
+    r.downvotes_cast,
+    r.gold_badges,
+    r.silver_badges,
+    r.bronze_badges,
+    r.top_tags,
+    r.hot_questions,
+    r.p50_views_recent_q,
+    r.p90_score_recent_q,
+    r.avg_answer_score_since_cohort,
+    r.questions_with_upvotes,
+    r.last_seen_at,
+    'A' as segment
+  from ranked r
+  where r.activity_score >= (
+    select percentile_cont(0.90) within group (order by activity_score) from ranked
+  )
+
+  union all
+
+  select
+    r.userid,
+    r.displayname,
+    r.tier,
+    r.activity_score,
+    r.rank_overall,
+    r.rank_in_tier,
+    r.cohort_month,
+    r.reputation,
+    r.q_count,
+    r.a_count,
+    r.total_post_score,
+    r.total_views,
+    r.comment_count,
+    r.upvotes_cast,
+    r.downvotes_cast,
+    r.gold_badges,
+    r.silver_badges,
+    r.bronze_badges,
+    r.top_tags,
+    r.hot_questions,
+    r.p50_views_recent_q,
+    r.p90_score_recent_q,
+    r.avg_answer_score_since_cohort,
+    r.questions_with_upvotes,
+    r.last_seen_at,
+    'B' as segment
+  from ranked r
+  where r.userid in (select userid from power_users)
+)
+select
+  f.userid,
+  coalesce(nullif(f.displayname, ''), concat('user_', f.userid::text)) as displayname_norm,
+  f.tier,
+  f.segment,
+  f.activity_score,
+  f.rank_overall,
+  f.rank_in_tier,
+  f.cohort_month,
+  f.reputation,
+  f.q_count,
+  f.a_count,
+  f.total_post_score,
+  f.total_views,
+  f.comment_count,
+  f.upvotes_cast,
+  f.downvotes_cast,
+  f.gold_badges,
+  f.silver_badges,
+  f.bronze_badges,
+  f.top_tags,
+  f.hot_questions,
+  f.p50_views_recent_q,
+  f.p90_score_recent_q,
+  f.avg_answer_score_since_cohort,
+  f.questions_with_upvotes,
+  f.last_seen_at,
+  case
+    when f.score_per_view is null then 'n/a'
+    when f.score_per_view > 0.25 then 'high'
+    when f.score_per_view > 0.10 then 'medium'
+    when f.score_per_view > 0 then 'low'
+    when f.score_per_view = 0 then 'zero'
+    else 'neg'
+  end as score_per_view_bucket
+from final_union f
+qualify row_number() over (partition by f.userid order by (case when segment = 'A' then 1 else 2 end)) = 1
+order by f.segment, f.activity_score desc nulls last, f.rank_overall
+limit 500;

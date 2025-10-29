@@ -1,0 +1,307 @@
+with recent_users as (
+    select u.id as user_id,
+           u.displayname,
+           u.reputation,
+           u.creationdate,
+           u.location,
+           coalesce(nullif(trim(u.websiteurl), ''), 'unknown') as website_norm,
+           date_trunc('month', u.creationdate) as cohort_month,
+           row_number() over (order by u.creationdate desc, u.id desc) as rn_global
+    from users u
+    where u.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+),
+user_activity as (
+    select u.user_id,
+           count(*) filter (where p.posttypeid = 1) as q_count,
+           count(*) filter (where p.posttypeid = 2) as a_count,
+           sum(greatest(p.score, 0)) as nonneg_post_score,
+           sum(p.viewcount) as total_views,
+           count(distinct date_trunc('month', p.creationdate)) as active_post_months,
+           max(p.lastactivitydate) as last_post_activity
+    from recent_users u
+    left join posts p
+      on p.owneruserid = u.user_id
+     and p.creationdate >= u.creationdate
+    group by u.user_id
+),
+comment_stats as (
+    select u.user_id,
+           count(c.id) as comment_count,
+           coalesce(sum(c.score), 0) as comment_score,
+           avg(nullif(length(c.text),0)) as avg_comment_len
+    from recent_users u
+    left join comments c
+      on c.userid = u.user_id
+     and c.creationdate >= u.creationdate
+    group by u.user_id
+),
+badge_hist as (
+    select b.userid as user_id,
+           count(*) as badge_count,
+           count(*) filter (where b.class = 1) as gold_count,
+           count(*) filter (where b.class = 2) as silver_count,
+           count(*) filter (where b.class = 3) as bronze_count,
+           max(b.date) as last_badge_date
+    from badges b
+    join recent_users u on u.user_id = b.userid
+    where b.date >= u.creationdate
+    group by b.userid
+),
+q_detail as (
+    select p.owneruserid as user_id,
+           count(*) as closed_q_count,
+           count(*) filter (where p.acceptedanswerid is not null) as accepted_q_count,
+           avg(nullif(p.viewcount,0)) as avg_q_views,
+           percentile_cont(0.9) within group (order by p.score) as p90_q_score
+    from posts p
+    where p.posttypeid = 1
+      and p.owneruserid is not null
+    group by p.owneruserid
+),
+a_detail as (
+    select p.owneruserid as user_id,
+           count(*) filter (where v.votetypeid = 1) as accepted_by_originator,
+           sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started,
+           sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_earned,
+           avg(nullif(p.score,0)) as avg_a_score_nonzero
+    from posts p
+    left join votes v on v.postid = p.id
+    where p.posttypeid = 2
+      and p.owneruserid is not null
+    group by p.owneruserid
+),
+dup_graph as (
+    select pl.postid as src_q,
+           pl.relatedpostid as dup_of_q,
+           pl.creationdate,
+           row_number() over (partition by pl.postid order by pl.creationdate asc) as rn
+    from postlinks pl
+    join posts pq on pq.id = pl.postid and pq.posttypeid = 1
+    join posts pr on pr.id = pl.relatedpostid and pr.posttypeid = 1
+    where pl.linktypeid = 3
+),
+first_dups as (
+    select src_q, dup_of_q
+    from dup_graph
+    where rn = 1
+),
+tag_explosion as (
+    select p.id as post_id,
+           lower(trim(t)) as tag
+    from posts p
+    cross join lateral unnest(string_to_array(substring(p.tags, 2, greatest(length(p.tags)-2,0)), '><')) as t
+    where p.posttypeid = 1
+      and p.tags is not null
+),
+tech_bias as (
+    select u.user_id,
+           sum(case when te.tag in ('sql','postgresql','mysql','oracle','tsql','sql-server') then 1 else 0 end) as db_tag_hits,
+           sum(case when te.tag like any(array['python','java','c%','javascript','go','rust','ruby']) then 1 else 0 end) as lang_tag_hits,
+           count(*) as tag_hits_total
+    from recent_users u
+    join posts p on p.owneruserid = u.user_id and p.posttypeid = 1
+    join tag_explosion te on te.post_id = p.id
+    group by u.user_id
+),
+post_edits as (
+    select ph.postid,
+           count(*) filter (where ph.posthistorytypeid in (4,5,6)) as edit_events,
+           min(ph.creationdate) filter (where ph.posthistorytypeid in (4,5,6)) as first_edit_at,
+           max(ph.creationdate) filter (where ph.posthistorytypeid in (4,5,6)) as last_edit_at,
+           count(*) filter (where ph.posthistorytypeid = 10) as close_events
+    from posthistory ph
+    group by ph.postid
+),
+user_edit_summary as (
+    select u.user_id,
+           sum(pe.edit_events) as total_edits_on_posts,
+           max(pe.last_edit_at) as last_edit_seen,
+           sum(pe.close_events) as total_close_events_on_posts
+    from recent_users u
+    left join posts p on p.owneruserid = u.user_id
+    left join post_edits pe on pe.postid = p.id
+    group by u.user_id
+),
+user_last_seen as (
+    select u.user_id,
+           greatest(u.creationdate, coalesce(ua.last_post_activity, u.creationdate)) as last_seen_ts
+    from recent_users u
+    left join user_activity ua on ua.user_id = u.user_id
+),
+rankings as (
+    select u.user_id,
+           dense_rank() over (order by ua.nonneg_post_score desc nulls last, ua.total_views desc nulls last) as r_score_views,
+           dense_rank() over (order by coalesce(ua.q_count,0) + coalesce(ua.a_count,0) desc) as r_activity,
+           dense_rank() over (order by coalesce(bh.gold_count,0) desc, coalesce(bh.silver_count,0) desc, coalesce(bh.bronze_count,0) desc) as r_badges
+    from recent_users u
+    left join user_activity ua on ua.user_id = u.user_id
+    left join badge_hist bh on bh.user_id = u.user_id
+),
+monthly_engagement as (
+    select u.user_id,
+           date_trunc('month', p.creationdate) as ym,
+           count(*) filter (where p.posttypeid = 1) as q_in_month,
+           count(*) filter (where p.posttypeid = 2) as a_in_month,
+           count(distinct c.id) as comments_in_month
+    from recent_users u
+    left join posts p on p.owneruserid = u.user_id
+    left join comments c on c.userid = u.user_id and date_trunc('month', c.creationdate) = date_trunc('month', p.creationdate)
+    group by u.user_id, date_trunc('month', p.creationdate)
+),
+eng_summary as (
+    select user_id,
+           avg(q_in_month + a_in_month + comments_in_month) as avg_monthly_actions,
+           stddev_pop(q_in_month + a_in_month + comments_in_month) as std_monthly_actions
+    from monthly_engagement
+    group by user_id
+),
+activity_bins as (
+    select u.user_id,
+           case
+             when coalesce(ua.q_count,0) + coalesce(ua.a_count,0) >= 500 then 'ultra'
+             when coalesce(ua.q_count,0) + coalesce(ua.a_count,0) >= 200 then 'high'
+             when coalesce(ua.q_count,0) + coalesce(ua.a_count,0) >= 50 then 'medium'
+             when coalesce(ua.q_count,0) + coalesce(ua.a_count,0) > 0 then 'low'
+             else 'none'
+           end as activity_band
+    from recent_users u
+    left join user_activity ua on ua.user_id = u.user_id
+),
+answers_to_own_q as (
+    select q.owneruserid as user_id,
+           count(a.id) filter (where a.owneruserid = q.owneruserid) as self_answers,
+           count(a.id) as total_answers_to_own_q
+    from posts q
+    left join posts a on a.parentid = q.id and a.posttypeid = 2
+    where q.posttypeid = 1
+      and q.owneruserid is not null
+    group by q.owneruserid
+),
+question_close_reasons as (
+    select p.owneruserid as user_id,
+           count(*) filter (where ph.posthistorytypeid = 10 and cast(ph.comment as integer) = 101) as dup_closes,
+           count(*) filter (where ph.posthistorytypeid = 10 and cast(ph.comment as integer) = 102) as offtopic_closes,
+           count(*) filter (where ph.posthistorytypeid = 10 and cast(ph.comment as integer) = 103) as needs_details,
+           count(*) filter (where ph.posthistorytypeid = 10 and cast(ph.comment as integer) = 104) as needs_focus,
+           count(*) filter (where ph.posthistorytypeid = 10 and cast(ph.comment as integer) = 105) as opinion_based
+    from posthistory ph
+    join posts p on p.id = ph.postid and p.posttypeid = 1
+    where p.owneruserid is not null
+    group by p.owneruserid
+),
+favorited_posts as (
+    select v.userid as user_id,
+           count(*) filter (where v.votetypeid = 5) as favorites_count
+    from votes v
+    where v.votetypeid = 5
+    group by v.userid
+),
+recent_hot_bumps as (
+    select p.owneruserid as user_id,
+           count(*) filter (where ph.posthistorytypeid = 50) as community_bumps,
+           count(*) filter (where ph.posthistorytypeid = 52) as selected_hot_q,
+           count(*) filter (where ph.posthistorytypeid = 53) as removed_hot_q
+    from posts p
+    join posthistory ph on ph.postid = p.id
+    where p.owneruserid is not null
+    group by p.owneruserid
+),
+stringy as (
+    select u.user_id,
+           initcap(coalesce(u.displayname,'anonymous')) || ' @ ' ||
+           coalesce(nullif(split_part(u.website_norm, '/', 3), ''), 'nowhere') ||
+           ' (' || coalesce(nullif(u.location,''),'N/A') || ')' as signature,
+           length(coalesce(u.displayname,'')) as name_len,
+           position('stack' in lower(coalesce(u.displayname, ''))) as about_contains_stack
+    from recent_users u
+)
+select
+    u.user_id,
+    u.displayname,
+    u.reputation,
+    u.cohort_month,
+    s.signature,
+    ua.q_count,
+    ua.a_count,
+    ua.nonneg_post_score,
+    ua.total_views,
+    ua.active_post_months,
+    cs.comment_count,
+    cs.comment_score,
+    round(cast(cs.avg_comment_len as numeric), 2) as avg_comment_len,
+    coalesce(bh.badge_count,0) as badge_count,
+    coalesce(bh.gold_count,0) as gold_badges,
+    coalesce(bh.silver_count,0) as silver_badges,
+    coalesce(bh.bronze_count,0) as bronze_badges,
+    qd.closed_q_count,
+    qd.accepted_q_count,
+    round(cast(qd.avg_q_views as numeric), 2) as avg_q_views,
+    qd.p90_q_score,
+    ad.accepted_by_originator as answers_marked_accepted,
+    ad.bounty_started,
+    ad.bounty_earned,
+    round(cast(ad.avg_a_score_nonzero as numeric), 2) as avg_a_score_nonzero,
+    teb.db_tag_hits,
+    teb.lang_tag_hits,
+    teb.tag_hits_total,
+    ues.total_edits_on_posts,
+    ues.total_close_events_on_posts,
+    ues.last_edit_seen,
+    ul.last_seen_ts,
+    r.r_score_views,
+    r.r_activity,
+    r.r_badges,
+    es.avg_monthly_actions,
+    es.std_monthly_actions,
+    ab.activity_band,
+    ato.self_answers,
+    ato.total_answers_to_own_q,
+    qcr.dup_closes,
+    qcr.offtopic_closes,
+    qcr.needs_details,
+    qcr.needs_focus,
+    qcr.opinion_based,
+    fp.favorites_count,
+    rhb.community_bumps,
+    rhb.selected_hot_q,
+    rhb.removed_hot_q,
+    fd.dup_of_q as first_duplicate_of,
+    s.name_len,
+    s.about_contains_stack,
+    case when coalesce(ua.a_count,0) > coalesce(ua.q_count,0) then 'answerer'
+         when coalesce(ua.q_count,0) > coalesce(ua.a_count,0) then 'asker'
+         when coalesce(ua.q_count,0) + coalesce(ua.a_count,0) = 0 then 'inactive'
+         else 'balanced' end as role_guess,
+    case when cs.comment_count is null then 'no-comments'
+         when cs.comment_count = 0 then 'silent'
+         when cs.comment_count between 1 and 10 then 'light'
+         when cs.comment_count between 11 and 100 then 'chatty'
+         else 'very-chatty' end as commenter_profile
+from recent_users u
+left join user_activity ua on ua.user_id = u.user_id
+left join comment_stats cs on cs.user_id = u.user_id
+left join badge_hist bh on bh.user_id = u.user_id
+left join q_detail qd on qd.user_id = u.user_id
+left join a_detail ad on ad.user_id = u.user_id
+left join tech_bias teb on teb.user_id = u.user_id
+left join user_edit_summary ues on ues.user_id = u.user_id
+left join user_last_seen ul on ul.user_id = u.user_id
+left join rankings r on r.user_id = u.user_id
+left join eng_summary es on es.user_id = u.user_id
+left join activity_bins ab on ab.user_id = u.user_id
+left join answers_to_own_q ato on ato.user_id = u.user_id
+left join question_close_reasons qcr on qcr.user_id = u.user_id
+left join favorited_posts fp on fp.user_id = u.user_id
+left join recent_hot_bumps rhb on rhb.user_id = u.user_id
+left join first_dups fd on fd.src_q = (
+    select p2.id
+    from posts p2
+    where p2.owneruserid = u.user_id and p2.posttypeid = 1
+    order by p2.creationdate asc, p2.id asc
+    limit 1
+)
+left join stringy s on s.user_id = u.user_id
+where (u.rn_global <= 2000 or u.reputation >= 10000)
+  and coalesce(ua.q_count,0) + coalesce(ua.a_count,0) + coalesce(cs.comment_count,0) >= 0
+order by r.r_score_views nulls last, r.r_activity nulls last, u.user_id
+limit 1000;

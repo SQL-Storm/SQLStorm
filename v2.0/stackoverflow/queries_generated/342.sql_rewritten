@@ -1,0 +1,345 @@
+-- {"query": "342.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3304} 
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        u.location,
+        coalesce(nullif(trim(u.websiteurl), ''), 'n/a') as website_norm,
+        (extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - u.creationdate)) / 86400.0)::numeric(12,2) as days_on_site
+    from users u
+    where u.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+),
+badge_rollup as (
+    select
+        b.userid,
+        count(*) as total_badges,
+        sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+        sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+        sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+        max(b.date) as last_badge_date
+    from badges b
+    group by b.userid
+),
+questions as (
+    select
+        p.id as qid,
+        p.owneruserid as q_ownerid,
+        p.score as q_score,
+        p.viewcount,
+        p.answercount,
+        p.creationdate as q_created,
+        p.closeddate,
+        p.tags,
+        p.acceptedanswerid,
+        p.title
+    from posts p
+    where p.posttypeid = 1
+),
+answers as (
+    select
+        a.id as aid,
+        a.parentid as qid,
+        a.owneruserid as a_ownerid,
+        a.score as a_score,
+        a.creationdate as a_created
+    from posts a
+    where a.posttypeid = 2
+),
+answer_stats as (
+    select
+        q.qid,
+        count(a.aid) as answers_total,
+        sum(case when a.a_score > 0 then 1 else 0 end) as answers_positive,
+        max(a.a_score) as max_answer_score,
+        min(a.a_score) as min_answer_score,
+        avg(a.a_score)::numeric(12,4) as avg_answer_score,
+        count(*) filter (where a.a_ownerid is null) as answers_from_deleted_users
+    from questions q
+    left join answers a on a.qid = q.qid
+    group by q.qid
+),
+votes_agg as (
+    select
+        v.postid,
+        sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+        sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+        sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+        sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_total
+    from votes v
+    group by v.postid
+),
+comments_agg as (
+    select
+        c.postid,
+        count(*) as comments_count,
+        max(c.score) as max_comment_score,
+        avg(c.score)::numeric(12,4) as avg_comment_score,
+        min(c.creationdate) as first_comment_at,
+        max(c.creationdate) as last_comment_at
+    from comments c
+    group by c.postid
+),
+history_flags as (
+    select
+        ph.postid,
+        max(case when ph.posthistorytypeid in (10,11,12,13,14,15,19,20,35,36) then 1 else 0 end) as has_moderation_events,
+        max(case when ph.posthistorytypeid = 10 then 1 else 0 end) as was_closed,
+        max(case when ph.posthistorytypeid = 11 then 1 else 0 end) as was_reopened,
+        max(case when ph.posthistorytypeid in (24) then 1 else 0 end) as has_suggested_edits,
+        count(*) filter (where ph.posthistorytypeid in (4,5,6)) as edit_count
+    from posthistory ph
+    group by ph.postid
+),
+links_agg as (
+    select
+        pl.postid,
+        sum(case when pl.linktypeid = 1 then 1 else 0 end) as linked_count,
+        sum(case when pl.linktypeid = 3 then 1 else 0 end) as duplicate_count
+    from postlinks pl
+    group by pl.postid
+),
+tag_expansion as (
+    select
+        q.qid,
+        unnest(string_to_array(substring(q.tags, 2, greatest(length(q.tags)-2,0)), '><')) as tagname
+    from questions q
+    where q.tags is not null and q.tags like '<%>'
+),
+popular_tags as (
+    select
+        te.qid,
+        array_agg(te.tagname order by t.count desc nulls last) as tags_by_popularity,
+        count(*) as tag_count,
+        max(t.count) as max_tag_global_usage
+    from tag_expansion te
+    left join tags t on lower(t.tagname) = lower(te.tagname)
+    group by te.qid
+),
+owner_activity as (
+    select
+        q.qid,
+        u.id as owner_id,
+        u.displayname as owner_name,
+        u.reputation as owner_rep,
+        u.creationdate as owner_created,
+        coalesce(u.location, 'unknown') as owner_location,
+        coalesce(u.websiteurl, '') as owner_website,
+        u.upvotes as owner_upvotes,
+        u.downvotes as owner_downvotes,
+        br.total_badges,
+        br.gold_badges,
+        br.silver_badges,
+        br.bronze_badges,
+        br.last_badge_date
+    from questions q
+    left join users u on u.id = q.q_ownerid
+    left join badge_rollup br on br.userid = u.id
+),
+accepted_answerer as (
+    select
+        q.qid,
+        aa.a_ownerid as accepted_ownerid,
+        aa.a_score as accepted_score,
+        aa.a_created as accepted_created
+    from questions q
+    left join answers aa on aa.aid = q.acceptedanswerid
+),
+ranking as (
+    select
+        q.qid,
+        q.title,
+        q.q_score,
+        q.viewcount,
+        q.answercount,
+        q.q_created,
+        q.closeddate,
+        coalesce(va.upvotes,0) as upvotes,
+        coalesce(va.downvotes,0) as downvotes,
+        coalesce(va.favorites,0) as favorites,
+        coalesce(va.bounty_total,0) as bounty_total,
+        coalesce(ca.comments_count,0) as comments_count,
+        coalesce(ca.avg_comment_score,0) as avg_comment_score,
+        coalesce(ca.max_comment_score,0) as max_comment_score,
+        coalesce(ha.edit_count,0) as edit_count,
+        coalesce(ha.has_moderation_events,0) as has_moderation_events,
+        coalesce(ha.was_closed,0) as was_closed,
+        coalesce(ha.was_reopened,0) as was_reopened,
+        coalesce(la.linked_count,0) as linked_count,
+        coalesce(la.duplicate_count,0) as duplicate_count,
+        coalesce(as1.answers_total,0) as answers_total,
+        coalesce(as1.answers_positive,0) as answers_positive,
+        coalesce(as1.avg_answer_score,0) as avg_answer_score,
+        coalesce(as1.max_answer_score, null) as max_answer_score,
+        coalesce(as1.min_answer_score, null) as min_answer_score,
+        pt.tags_by_popularity,
+        pt.tag_count,
+        pt.max_tag_global_usage,
+        oa.owner_id,
+        oa.owner_name,
+        oa.owner_rep,
+        oa.owner_created,
+        oa.owner_location,
+        case
+            when oa.owner_website ilike 'http%' then oa.owner_website
+            when oa.owner_website is null or trim(oa.owner_website) = '' then null
+            else 'http://' || oa.owner_website
+        end as owner_website_norm,
+        oa.total_badges,
+        oa.gold_badges,
+        oa.silver_badges,
+        oa.bronze_badges,
+        oa.last_badge_date,
+        aa.accepted_ownerid,
+        aa.accepted_score,
+        aa.accepted_created,
+        row_number() over (order by q.viewcount desc nulls last) as rn_view,
+        row_number() over (order by q.q_score desc nulls last) as rn_score,
+        row_number() over (order by coalesce(va.upvotes,0) - coalesce(va.downvotes,0) desc) as rn_netvotes,
+        percentile_cont(0.5) within group (order by coalesce(as1.avg_answer_score,0)) over () as global_median_avg_answer_score
+    from questions q
+    left join votes_agg va on va.postid = q.qid
+    left join comments_agg ca on ca.postid = q.qid
+    left join history_flags ha on ha.postid = q.qid
+    left join links_agg la on la.postid = q.qid
+    left join answer_stats as1 on as1.qid = q.qid
+    left join popular_tags pt on pt.qid = q.qid
+    left join owner_activity oa on oa.qid = q.qid
+    left join accepted_answerer aa on aa.qid = q.qid
+),
+filtered as (
+    select
+        r.*,
+        (coalesce(r.upvotes,0) + 1.0) / (coalesce(r.downvotes,0) + 1.0) as up_down_ratio,
+        (coalesce(r.viewcount,0) + 10) / (extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - r.q_created)) / 86400.0 + 1) as views_per_day_adj,
+        case
+            when r.was_closed = 1 and r.was_reopened = 1 then 'closed-then-reopened'
+            when r.was_closed = 1 then 'closed'
+            else 'open-or-unknown'
+        end as closure_state,
+        case when r.tags_by_popularity is null or array_length(r.tags_by_popularity,1) = 0 then 0 else 1 end as has_tags_flag,
+        case when r.accepted_ownerid is not null and r.accepted_ownerid = r.owner_id then 1 else 0 end as self_accepted_flag
+    from ranking r
+    where (r.viewcount is not null and r.viewcount > 0)
+      and (r.tag_count is null or r.tag_count between 1 and 5)
+      and (r.owner_rep is null or r.owner_rep >= 1)
+),
+scored as (
+    select
+        f.*,
+        (
+            0.35 * ln(greatest(f.viewcount,1)) +
+            0.30 * coalesce(f.q_score,0) +
+            0.10 * coalesce(f.answers_total,0) +
+            0.15 * (coalesce(f.upvotes,0) - coalesce(f.downvotes,0)) +
+            0.05 * coalesce(f.favorites,0) +
+            0.05 * coalesce(f.bounty_total,0) / 100.0 -
+            0.10 * coalesce(f.duplicate_count,0) -
+            0.08 * case when f.has_moderation_events = 1 then 1 else 0 end
+        )::numeric(18,6) as hotness_score,
+        (case
+            when f.answers_total > 0 then coalesce(f.answers_positive,0)::numeric / nullif(f.answers_total,0)
+            else null
+        end)::numeric(12,6) as positive_answer_ratio
+    from filtered f
+),
+topk as (
+    select
+        s.*,
+        dense_rank() over (order by s.hotness_score desc nulls last) as dr_hot,
+        dense_rank() over (order by s.views_per_day_adj desc nulls last) as dr_vpd,
+        dense_rank() over (order by coalesce(s.favorites,0) desc nulls last) as dr_fav,
+        row_number() over (partition by s.closure_state order by s.hotness_score desc nulls last) as rn_by_state
+    from scored s
+),
+tagged_group as (
+    select
+        t.qid,
+        string_agg(tn.tagname, ';' order by tn.tagname) as tag_concat
+    from (
+        select q.qid, unnest(coalesce(tags_by_popularity, array[]::varchar[])) as tagname
+        from popular_tags q
+    ) tn
+    join topk t on t.qid = tn.qid
+    group by t.qid
+),
+user_quality as (
+    select
+        u.id as user_id,
+        count(*) filter (where p.posttypeid = 1) as q_count,
+        count(*) filter (where p.posttypeid = 2) as a_count,
+        avg(nullif(p.score,0)) as avg_post_score_nonzero,
+        sum(case when p.score > 0 then 1 else 0 end) as positive_posts
+    from users u
+    left join posts p on p.owneruserid = u.id
+    group by u.id
+),
+final_rank as (
+    select
+        tk.*,
+        coalesce(tg.tag_concat, '') as tag_concat,
+        uq.q_count,
+        uq.a_count,
+        uq.avg_post_score_nonzero,
+        uq.positive_posts,
+        row_number() over (order by (tk.dr_hot + tk.dr_vpd + tk.dr_fav) asc) as blended_rank
+    from topk tk
+    left join tagged_group tg on tg.qid = tk.qid
+    left join user_quality uq on uq.user_id = tk.owner_id
+)
+select
+    fr.qid,
+    coalesce(fr.title, '[no title]') as title,
+    fr.owner_id,
+    fr.owner_name,
+    fr.owner_rep,
+    fr.viewcount,
+    fr.q_score as score,
+    fr.upvotes,
+    fr.downvotes,
+    fr.favorites,
+    fr.answercount,
+    fr.answers_total,
+    fr.positive_answer_ratio,
+    fr.tags_by_popularity,
+    fr.tag_concat,
+    fr.hotness_score,
+    fr.views_per_day_adj,
+    fr.closure_state,
+    fr.has_tags_flag,
+    fr.self_accepted_flag,
+    fr.rn_view,
+    fr.rn_score,
+    fr.rn_netvotes,
+    fr.dr_hot,
+    fr.dr_vpd,
+    fr.dr_fav,
+    fr.blended_rank,
+    fr.q_created,
+    fr.closeddate,
+    fr.owner_location,
+    fr.owner_website_norm,
+    fr.total_badges,
+    fr.gold_badges,
+    fr.silver_badges,
+    fr.bronze_badges,
+    fr.last_badge_date
+from final_rank fr
+where (
+        fr.blended_rank <= 100
+        or fr.rn_by_state <= 10
+      )
+  and not exists (
+        select 1
+        from postlinks plx
+        where plx.postid = fr.qid
+          and plx.linktypeid = 3
+          and plx.relatedpostid in (
+              select q2.qid
+              from questions q2
+              where q2.q_score > fr.q_score
+          )
+    )
+order by fr.blended_rank, fr.dr_hot, fr.qid
+limit 200;

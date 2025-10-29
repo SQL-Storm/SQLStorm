@@ -1,0 +1,112 @@
+-- {"query": "3324.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2019} 
+WITH
+    UserStats AS (
+        SELECT 
+            u.Id,
+            u.DisplayName,
+            u.Reputation,
+            COALESCE(u.Location, 'Unknown') AS Location,
+            COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+            COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+            SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+            MAX(p.CreationDate) AS LastPostDate
+        FROM Users u
+        LEFT JOIN Posts p        ON p.OwnerUserId = u.Id
+        LEFT JOIN Votes v        ON v.PostId = p.Id
+        GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location
+    ),
+    BadgeStats AS (
+        SELECT 
+            b.UserId,
+            COUNT(*)                                                   AS TotalBadges,
+            COUNT(*) FILTER (WHERE b.Class = 1)                       AS GoldBadges,
+            COUNT(*) FILTER (WHERE b.Class = 2)                       AS SilverBadges,
+            COUNT(*) FILTER (WHERE b.Class = 3)                       AS BronzeBadges,
+            STRING_AGG(DISTINCT b.Name, ', ')                         AS BadgeNames
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+    TagScore AS (
+        SELECT 
+            t.TagName,
+            SUM(CASE WHEN ph.PostHistoryTypeId = 5 THEN 1 ELSE 0 END) AS Edits,
+            COUNT(DISTINCT ph.PostId)                                 AS PostsUsingTag,
+            ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT ph.PostId) DESC) AS TagRank
+        FROM Tags t
+        LEFT JOIN PostHistory ph 
+            ON ph.PostId IN (
+                SELECT p.Id 
+                FROM Posts p 
+                WHERE p.Tags LIKE ('%' || t.TagName || '%')
+            )
+        GROUP BY t.TagName
+    ),
+    TopUsers AS (
+        SELECT 
+            us.Id,
+            us.DisplayName,
+            us.Reputation,
+            COALESCE(bs.TotalBadges, 0)          AS TotalBadges,
+            us.QuestionCount,
+            us.AnswerCount,
+            (us.UpVoteCount - us.DownVoteCount) AS NetScore,
+            us.LastPostDate,
+            ROW_NUMBER() OVER (ORDER BY us.Reputation DESC, (us.UpVoteCount - us.DownVoteCount) DESC) AS Rank
+        FROM UserStats us
+        LEFT JOIN BadgeStats bs ON bs.UserId = us.Id
+        WHERE us.Reputation > 1000
+    )
+SELECT 
+    tu.Rank,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.TotalBadges,
+    tu.QuestionCount,
+    tu.AnswerCount,
+    tu.NetScore,
+    COALESCE(tu.LastPostDate, TIMESTAMP '1970-01-01') AS LastPostDate,
+    CASE WHEN tu.Rank <= 10 THEN 'Top 10' ELSE NULL END AS TopTier,
+    (
+        SELECT COUNT(*)
+        FROM Posts p
+        WHERE p.OwnerUserId = tu.Id
+          AND p.PostTypeId = 2
+          AND p.Score >= 10
+    ) AS HighScoringAnswers,
+    (
+        SELECT MAX(v.CreationDate)
+        FROM Votes v
+        WHERE v.UserId = tu.Id
+          AND v.VoteTypeId = 5   -- Favorite
+    ) AS LastFavoriteDate,
+    (
+        SELECT STRING_AGG(tag.TagName, '; ')
+        FROM (
+            SELECT unnest(string_to_array(p.Tags, '><')) AS TagName
+            FROM Posts p
+            WHERE p.OwnerUserId = tu.Id
+              AND p.PostTypeId = 1
+            LIMIT 5
+        ) AS t
+        JOIN Tags tag ON tag.TagName = t.TagName
+    ) AS SampleTags
+FROM TopUsers tu
+WHERE tu.Rank <= 100
+
+UNION ALL
+
+SELECT 
+    NULL AS Rank,
+    '---' AS DisplayName,
+    NULL AS Reputation,
+    NULL AS TotalBadges,
+    NULL AS QuestionCount,
+    NULL AS AnswerCount,
+    NULL AS NetScore,
+    NULL AS LastPostDate,
+    NULL AS TopTier,
+    NULL AS HighScoringAnswers,
+    NULL AS LastFavoriteDate,
+    NULL AS SampleTags
+LIMIT 101;

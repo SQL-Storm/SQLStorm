@@ -1,0 +1,133 @@
+-- {"query": "2027.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1231} 
+
+with RecursiveTagTree as (
+    select t.Id, t.TagName, 1 as Level, array[t.TagName] as AncestorPath
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+    union all
+    select t2.Id, t2.TagName, r.Level + 1, r.AncestorPath || t2.TagName
+    from Tags t2
+    join RecursiveTagTree r on t2.Id > r.Id and t2.IsModeratorOnly = 0 and t2.IsRequired = 0
+    where not t2.TagName = any(r.AncestorPath)
+    and r.Level < 3
+),
+UserBadgesRanked as (
+    select 
+        b.UserId,
+        b.Name,
+        b.Class,
+        b.Date,
+        row_number() over (partition by b.UserId order by b.Class, b.Date) as rn
+    from Badges b
+    where b.TagBased = 0
+),
+UserPostStats as (
+    select
+        u.Id as UserId,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        avg(p.Score) filter (where p.PostTypeId in (1, 2)) as AvgPostScore,
+        max(p.ViewCount) filter (where p.PostTypeId = 1) as MaxQuestionViews,
+        bool_or(p.ClosedDate is not null) as HasClosedQuestion,
+        count(distinct ph.Id) filter (where ph.PostHistoryTypeId = 10) as CloseVotesCount
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 10
+    group by u.Id
+),
+PostWithAcceptedAnswerDetails as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.Tags,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.CreationDate as QuestionCreated,
+        a.Id as AcceptedAnswerId,
+        a.Score as AcceptedAnswerScore,
+        a.CreationDate as AnswerCreated,
+        a.OwnerUserId as AnswerUserId,
+        u.DisplayName as AnswerUserName,
+        u.Reputation as AnswerUserReputation,
+        array_length(string_to_array(substring(q.Tags from 2 for length(q.Tags)-2), '><'), 1) as TagCount
+    from Posts q
+    left join Posts a on a.Id = q.AcceptedAnswerId and a.PostTypeId = 2
+    left join Users u on u.Id = a.OwnerUserId
+    where q.PostTypeId = 1
+),
+TopTagsByUsage as (
+    select
+        unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><')) as TagName,
+        count(*) as UsageCount
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+    group by 1
+    order by UsageCount desc
+    limit 100
+),
+ComplexUserActivity as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        us.QuestionCount,
+        us.AnswerCount,
+        ub.Name as TopBadge,
+        ub.Class as TopBadgeClass,
+        row_number() over (order by u.Reputation desc, us.AnswerCount desc) as ReputationRank,
+        (select count(*) from Votes v where v.UserId = u.Id and v.VoteTypeId = 2) as UpVotesGiven,
+        (select count(*) from Votes v where v.UserId = u.Id and v.VoteTypeId = 3) as DownVotesGiven,
+        case
+            when us.HasClosedQuestion then 'Has Closed Question'
+            else 'No Closed Question'
+        end as ClosureStatus
+    from Users u
+    left join UserPostStats us on us.UserId = u.Id
+    left join UserBadgesRanked ub on ub.UserId = u.Id and ub.rn = 1
+    where u.Reputation > 5000
+)
+select
+    cua.DisplayName,
+    cua.Reputation,
+    cua.ReputationRank,
+    cua.QuestionCount,
+    cua.AnswerCount,
+    cua.TopBadge,
+    case cua.TopBadgeClass
+        when 1 then 'Gold'
+        when 2 then 'Silver'
+        when 3 then 'Bronze'
+        else 'None'
+    end as BadgeClass,
+    cua.UpVotesGiven,
+    cua.DownVotesGiven,
+    cua.ClosureStatus,
+    q.AnswerUserName as AcceptedAnswerOwner,
+    q.AcceptedAnswerScore,
+    q.QuestionScore,
+    q.ViewCount as QuestionViews,
+    q.TagCount,
+    string_agg(distinct t.TagName, ', ') filter (where t.TagName is not null) as TagsInRecursiveTree
+from ComplexUserActivity cua
+left join PostWithAcceptedAnswerDetails q on q.AnswerUserId = cua.Id
+left join RecursiveTagTree t on t.TagName = any(string_to_array(substring(q.Tags from 2 for length(q.Tags)-2), '><'))
+where q.QuestionCreated > (current_date - interval '2 years')
+group by
+    cua.DisplayName,
+    cua.Reputation,
+    cua.ReputationRank,
+    cua.QuestionCount,
+    cua.AnswerCount,
+    cua.TopBadge,
+    cua.TopBadgeClass,
+    cua.UpVotesGiven,
+    cua.DownVotesGiven,
+    cua.ClosureStatus,
+    q.AnswerUserName,
+    q.AcceptedAnswerScore,
+    q.QuestionScore,
+    q.ViewCount,
+    q.TagCount
+having avg(q.QuestionScore) over () > 1
+order by cua.ReputationRank
+limit 50;

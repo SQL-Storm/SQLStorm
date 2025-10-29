@@ -1,0 +1,222 @@
+WITH RecursivePostHierarchy AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        0 as Level,
+        CAST(p.Id AS VARCHAR(1000)) as Path
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.ParentId IS NULL
+
+    UNION ALL
+
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        rph.Level + 1,
+        rph.Path || '>' || CAST(p.Id AS VARCHAR(10))
+    FROM Posts p
+    INNER JOIN RecursivePostHierarchy rph ON p.ParentId = rph.Id
+    WHERE rph.Level < 5
+),
+UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        AVG(p.Score) as AvgPostScore,
+        MAX(p.CreationDate) as LastPostDate,
+        STRING_AGG(SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags)-2)), ', ') as AllTags,
+        CASE WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 0 THEN 1 ELSE 0 END as HasQuestions,
+        CASE WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) > 0 THEN 1 ELSE 0 END as HasAnswers
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostPerformanceMetrics AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.LastActivityDate,
+        (EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate)) / 86400)::INT as DaysActive,
+        CASE 
+            WHEN p.Score > 100 THEN 'HighlyVoted'
+            WHEN p.Score > 50 THEN 'ModeratelyVoted'
+            WHEN p.Score > 0 THEN 'LowVoted'
+            ELSE 'Unvoted'
+        END as VoteCategory,
+        CASE 
+            WHEN p.ViewCount > 1000 THEN 'HighTraffic'
+            WHEN p.ViewCount > 500 THEN 'MediumTraffic'
+            WHEN p.ViewCount > 100 THEN 'LowTraffic'
+            ELSE 'MinimalTraffic'
+        END as TrafficCategory,
+        COALESCE(p.AnswerCount, 0) + COALESCE(p.CommentCount, 0) as EngagementCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as UserPostRank,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as AvgScorePerUser,
+        RANK() OVER (ORDER BY p.Score DESC) as GlobalRank,
+        PERCENT_RANK() OVER (ORDER BY p.Score) as ScorePercentile,
+        NTILE(10) OVER (ORDER BY p.ViewCount) as ViewDecile
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) AND p.Score IS NOT NULL
+),
+ComplexTagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.IsRequired = 1 THEN 'Required'
+            WHEN t.IsModeratorOnly = 1 THEN 'ModeratorOnly'
+            ELSE 'Standard'
+        END as TagType,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as PopularityRank,
+        AVG(t.Count) OVER () as AvgTagCount,
+        LAG(t.Count, 1) OVER (ORDER BY t.Count DESC) as PrevTagCount,
+        CASE WHEN t.Count > (SELECT AVG("Count") FROM Tags) THEN 1 ELSE 0 END as AboveAverage,
+        STRING_AGG(SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags)-2)), ', ' ORDER BY p.CreationDate) as TagUsageTimeline
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    GROUP BY t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId, t.IsRequired, t.IsModeratorOnly
+),
+ComprehensiveAnalysis AS (
+    SELECT 
+        uas.UserId,
+        uas.Reputation,
+        uas.Views,
+        uas.UpVotes,
+        uas.DownVotes,
+        uas.PostCount,
+        uas.CommentCount,
+        uas.BadgeCount,
+        uas.AvgPostScore,
+        uas.LastPostDate,
+        uas.AllTags,
+        uas.HasQuestions,
+        uas.HasAnswers,
+        COALESCE(pmetrics.Id, 0) as BestPostId,
+        COALESCE(pmetrics.Score, 0) as BestPostScore,
+        COALESCE(pmetrics.ViewCount, 0) as BestPostViews,
+        COALESCE(pmetrics.Title, 'No Title') as BestPostTitle,
+        COALESCE(pmetrics.Tags, '') as BestPostTags,
+        COALESCE(pmetrics.VoteCategory, 'Unvoted') as BestPostVoteCategory,
+        COALESCE(pmetrics.TrafficCategory, 'MinimalTraffic') as BestPostTrafficCategory,
+        CASE 
+            WHEN pmetrics.PostTypeId = 1 THEN 'Question'
+            WHEN pmetrics.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as BestPostType,
+        CASE 
+            WHEN uas.Reputation > 10000 THEN 'Elite'
+            WHEN uas.Reputation > 5000 THEN 'Veteran'
+            WHEN uas.Reputation > 1000 THEN 'Experienced'
+            ELSE 'Beginner'
+        END as UserTier,
+        COALESCE(cta.TagName, 'No Tags') as PopularTag,
+        COALESCE(cta.Count, 0) as PopularTagCount,
+        COALESCE(cta.TagType, 'None') as PopularTagType,
+        CASE 
+            WHEN uas.PostCount > 0 THEN (uas.UpVotes * 100.0) / NULLIF(uas.PostCount, 0)
+            ELSE 0
+        END as UpVoteRatio,
+        CASE 
+            WHEN uas.PostCount > 0 THEN (uas.DownVotes * 100.0) / NULLIF(uas.PostCount, 0)
+            ELSE 0
+        END as DownVoteRatio
+    FROM UserActivityStats uas
+    LEFT JOIN (
+        SELECT *
+        FROM (
+            SELECT *,
+                ROW_NUMBER() OVER (PARTITION BY OwnerUserId ORDER BY Score DESC) as rn
+            FROM PostPerformanceMetrics
+        ) pp
+        WHERE pp.rn = 1
+    ) pmetrics ON uas.UserId = pmetrics.OwnerUserId
+    LEFT JOIN ComplexTagAnalysis cta ON cta.PopularityRank = 1
+)
+SELECT 
+    ca.UserId,
+    ca.Reputation,
+    ca.Views,
+    ca.UpVotes,
+    ca.DownVotes,
+    ca.PostCount,
+    ca.CommentCount,
+    ca.BadgeCount,
+    ca.AvgPostScore,
+    ca.LastPostDate,
+    ca.AllTags,
+    ca.HasQuestions,
+    ca.HasAnswers,
+    ca.BestPostId,
+    ca.BestPostScore,
+    ca.BestPostViews,
+    ca.BestPostTitle,
+    ca.BestPostTags,
+    ca.BestPostVoteCategory,
+    ca.BestPostTrafficCategory,
+    ca.BestPostType,
+    ca.UserTier,
+    ca.PopularTag,
+    ca.PopularTagCount,
+    ca.PopularTagType,
+    ca.UpVoteRatio,
+    ca.DownVoteRatio,
+    CASE 
+        WHEN ca.PostCount > 0 AND ca.CommentCount > 0 THEN 'VeryActive'
+        WHEN ca.PostCount > 0 OR ca.CommentCount > 0 THEN 'Active'
+        ELSE 'Inactive'
+    END as ActivityLevel,
+    CASE 
+        WHEN ca.BadgeCount > 5 AND ca.Reputation > 1000 THEN 'Awarded'
+        WHEN ca.BadgeCount > 2 THEN 'Recognized'
+        WHEN ca.Reputation > 500 THEN 'Known'
+        ELSE 'New'
+    END as RecognitionStatus,
+    CASE 
+        WHEN ca.UserTier = 'Elite' THEN 1
+        WHEN ca.UserTier = 'Veteran' THEN 2
+        WHEN ca.UserTier = 'Experienced' THEN 3
+        ELSE 4
+    END as TierOrder
+FROM ComprehensiveAnalysis ca
+WHERE ca.Reputation > 1000
+  AND (ca.HasQuestions = 1 OR ca.HasAnswers = 1)
+  AND (ca.PostCount > 10 OR ca.CommentCount > 20)
+  AND (ca.BadgeCount > 5 OR ca.AvgPostScore > 25)
+  AND ca.LastPostDate > (cast('2024-10-01' as date) + INTERVAL '-2 years')
+ORDER BY ca.Reputation DESC, ca.PostCount DESC, ca.BadgeCount DESC
+OFFSET 100 ROWS
+FETCH NEXT 50 ROWS ONLY;

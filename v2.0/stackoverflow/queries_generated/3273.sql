@@ -1,0 +1,93 @@
+-- {"query": "3273.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1869} 
+
+WITH TopUsers AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.Location, 'Unknown')            AS Location,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1)    AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2)    AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3)    AS BronzeBadges,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.CreationDate) AS RepRank
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location, u.CreationDate
+    HAVING COUNT(*) > 0
+),
+
+UserPostScore AS (
+    SELECT 
+        p.OwnerUserId,
+        SUM(p.Score)                          AS TotalScore,
+        AVG(p.Score)                          AS AvgScore,
+        MAX(p.CreationDate)                   AS LastPostDate,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+
+RecentVotes AS (
+    SELECT 
+        v.UserId,
+        COUNT(*) AS VoteCountLast30d
+    FROM Votes v
+    WHERE v.CreationDate >= CURRENT_DATE - INTERVAL '30 day'
+      AND v.VoteTypeId = 2                       -- up‑votes
+    GROUP BY v.UserId
+),
+
+DuplicateLinks AS (
+    SELECT 
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name                                   AS LinkType,
+        ROW_NUMBER() OVER (PARTITION BY pl.PostId ORDER BY pl.CreationDate DESC) AS rn
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    WHERE pl.LinkTypeId = 3                       -- Duplicate
+),
+
+UserDupInfo AS (
+    SELECT 
+        d.PostId,
+        d.RelatedPostId,
+        p.Title                                    AS DuplicateTitle,
+        p.Tags                                     AS DuplicateTags
+    FROM DuplicateLinks d
+    JOIN Posts p ON p.Id = d.RelatedPostId
+    WHERE d.rn = 1
+)
+
+SELECT
+    tu.RepRank,
+    tu.Id                               AS UserId,
+    CONCAT(tu.DisplayName, ' (', tu.Reputation, ')') AS Display,
+    tu.GoldBadges,
+    tu.SilverBadges,
+    tu.BronzeBadges,
+    COALESCE(ups.TotalScore, 0)         AS TotalScore,
+    ROUND(COALESCE(ups.AvgScore, 0), 2) AS AvgScore,
+    COALESCE(ups.QuestionCount, 0)      AS Questions,
+    COALESCE(ups.AnswerCount, 0)        AS Answers,
+    COALESCE(rv.VoteCountLast30d, 0)    AS RecentUpVotes,
+    COALESCE(udi.DuplicateTitle, 'No Duplicates') AS RecentDuplicateTitle,
+    CASE 
+        WHEN udi.DuplicateTitle IS NULL THEN 0 
+        ELSE 1 
+    END                                 AS HasDuplicate
+FROM TopUsers tu
+LEFT JOIN UserPostScore ups   ON ups.OwnerUserId = tu.Id
+LEFT JOIN RecentVotes rv      ON rv.UserId = tu.Id
+LEFT JOIN UserDupInfo udi     ON udi.PostId = (
+    SELECT p.Id
+    FROM Posts p
+    WHERE p.OwnerUserId = tu.Id
+      AND p.PostTypeId = 1                     -- question
+    ORDER BY p.CreationDate DESC
+    LIMIT 1
+)
+WHERE tu.RepRank <= 100
+ORDER BY tu.RepRank;

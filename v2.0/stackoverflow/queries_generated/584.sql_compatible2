@@ -1,0 +1,303 @@
+with recent_users as (
+  select u.id as user_id,
+         u.displayname,
+         u.reputation,
+         u.creationdate,
+         u.location,
+         u.websiteurl,
+         u.upvotes,
+         u.downvotes,
+         u.views,
+         row_number() over (order by u.creationdate desc, u.id) as rn
+  from users u
+),
+tagged_questions as (
+  select p.id as question_id,
+         p.owneruserid,
+         p.acceptedanswerid,
+         p.creationdate,
+         p.score,
+         p.viewcount,
+         p.title,
+         p.tags,
+         p.favoritecount,
+         p.commentcount,
+         p.answercount,
+         coalesce(nullif(btrim(p.tags), ''), '[]') as raw_tags,
+         string_to_array(substring(p.tags, 2, length(p.tags)-2), '><') as tag_arr
+  from posts p
+  where p.posttypeid = 1
+),
+question_activity as (
+  select q.question_id,
+         count(distinct c.id) filter (where c.id is not null) as comments_count,
+         count(distinct v.id) filter (where v.votetypeid = 2) as upvotes_count,
+         count(distinct v.id) filter (where v.votetypeid = 3) as downvotes_count,
+         count(distinct v.id) filter (where v.votetypeid in (8,9)) as bounty_events,
+         max(c.creationdate) as last_comment_at,
+         max(v.creationdate) as last_vote_at
+  from tagged_questions q
+  left join comments c on c.postid = q.question_id
+  left join votes v on v.postid = q.question_id
+  group by q.question_id
+),
+dup_links as (
+  select pl.postid as question_id,
+         count(*) filter (where pl.linktypeid = 3) as duplicate_links,
+         count(*) filter (where pl.linktypeid = 1) as linked_links,
+         max(pl.creationdate) as last_link_at
+  from postlinks pl
+  group by pl.postid
+),
+close_events as (
+  select ph.postid as question_id,
+         count(*) filter (where ph.posthistorytypeid = 10) as close_votes,
+         count(*) filter (where ph.posthistorytypeid = 11) as reopen_votes,
+         max(ph.creationdate) filter (where ph.posthistorytypeid in (10,11)) as last_close_reopen_at,
+         array_agg(distinct crt.name) filter (where ph.posthistorytypeid = 10 and ph.comment ~ '^[0-9]+$') as close_reason_names
+  from posthistory ph
+  left join closerreasontypes crt
+    on crt.id = cast(ph.comment as smallint)
+       and ph.posthistorytypeid = 10
+       and ph.comment ~ '^[0-9]+$'
+  group by ph.postid
+),
+answer_stats as (
+  select a.parentid as question_id,
+         count(*) as answers_count,
+         max(a.score) as best_answer_score,
+         max(a.creationdate) as last_answer_at,
+         count(*) filter (where a.owneruserid is null) as anon_answers
+  from posts a
+  where a.posttypeid = 2
+  group by a.parentid
+),
+owner_badges as (
+  select b.userid,
+         count(*) as badges_total,
+         count(*) filter (where b.class = 1) as gold_badges,
+         count(*) filter (where b.class = 2) as silver_badges,
+         count(*) filter (where b.class = 3) as bronze_badges,
+         min(b.date) as first_badge_at,
+         max(b.date) as last_badge_at
+  from badges b
+  group by b.userid
+),
+tag_popularity as (
+  select t.tagname,
+         t.count,
+         dense_rank() over (order by t.count desc nulls last) as popularity_rank
+  from tags t
+),
+question_tag_expanded as (
+  select q.question_id,
+         lower(trim(tg)) as tagname
+  from tagged_questions q
+  cross join lateral unnest(q.tag_arr) as tg
+),
+question_tag_metrics as (
+  select qte.question_id,
+         count(*) as tag_count,
+         sum(tp.count) as total_tag_posts,
+         min(tp.popularity_rank) as best_tag_rank,
+         string_agg(qte.tagname, ',' order by tp.count desc nulls last) as tag_list
+  from question_tag_expanded qte
+  left join tag_popularity tp on tp.tagname = qte.tagname
+  group by qte.question_id
+),
+question_core as (
+  select q.question_id,
+         q.owneruserid,
+         q.acceptedanswerid,
+         q.creationdate,
+         q.score,
+         q.viewcount,
+         q.title,
+         q.tags,
+         coalesce(q.favoritecount, 0) as favoritecount,
+         coalesce(q.answercount, 0) as answercount,
+         qa.comments_count,
+         qa.upvotes_count,
+         qa.downvotes_count,
+         qa.bounty_events,
+         qa.last_comment_at,
+         qa.last_vote_at,
+         dl.duplicate_links,
+         dl.linked_links,
+         dl.last_link_at,
+         ce.close_votes,
+         ce.reopen_votes,
+         ce.last_close_reopen_at,
+         ce.close_reason_names,
+         ast.answers_count as actual_answers_count,
+         ast.best_answer_score,
+         ast.last_answer_at,
+         ast.anon_answers,
+         qtm.tag_count,
+         qtm.total_tag_posts,
+         qtm.best_tag_rank,
+         qtm.tag_list
+  from tagged_questions q
+  left join question_activity qa on qa.question_id = q.question_id
+  left join dup_links dl on dl.question_id = q.question_id
+  left join close_events ce on ce.question_id = q.question_id
+  left join answer_stats ast on ast.question_id = q.question_id
+  left join question_tag_metrics qtm on qtm.question_id = q.question_id
+),
+owner_enriched as (
+  select qc.*,
+         u.id as owner_id,
+         u.displayname as owner_name,
+         u.reputation as owner_rep,
+         u.creationdate as owner_created,
+         u.location as owner_location,
+         u.websiteurl as owner_website,
+         u.upvotes as owner_up,
+         u.downvotes as owner_down,
+         u.views as owner_views,
+         ob.badges_total,
+         ob.gold_badges,
+         ob.silver_badges,
+         ob.bronze_badges,
+         ob.first_badge_at,
+         ob.last_badge_at
+  from question_core qc
+  left join users u on u.id = qc.owneruserid
+  left join owner_badges ob on ob.userid = qc.owneruserid
+),
+calc as (
+  select oe.*,
+         coalesce(oe.actual_answers_count, 0) as answers_count_coalesced,
+         coalesce(oe.duplicate_links, 0) as duplicate_links_cz,
+         coalesce(oe.linked_links, 0) as linked_links_cz,
+         coalesce(oe.upvotes_count, 0) as up_cz,
+         coalesce(oe.downvotes_count, 0) as down_cz,
+         case when oe.acceptedanswerid is not null then 1 else 0 end as has_accepted_answer,
+         case when oe.close_votes > coalesce(oe.reopen_votes,0) then 1 else 0 end as net_closed_flag,
+         greatest(coalesce(oe.last_comment_at, timestamp 'epoch'),
+                  coalesce(oe.last_vote_at, timestamp 'epoch'),
+                  coalesce(oe.last_link_at, timestamp 'epoch'),
+                  coalesce(oe.last_answer_at, timestamp 'epoch'),
+                  coalesce(oe.last_close_reopen_at, timestamp 'epoch'),
+                  coalesce(oe.creationdate, timestamp 'epoch')) as last_activity_any,
+         nullif(trim(coalesce(oe.title, '')), '') as norm_title,
+         length(coalesce(oe.title, '')) as title_len,
+         regexp_replace(coalesce(oe.title, ''), '\s+', ' ', 'g') as title_squeezed,
+         position('how' in lower(coalesce(oe.title, ''))) > 0 as title_contains_how,
+         case
+           when coalesce(oe.viewcount,0) = 0 then 0
+           else round((coalesce(oe.upvotes_count,0) - coalesce(oe.downvotes_count,0)) / nullif(cast(oe.viewcount as numeric),0), 6)
+         end as score_per_view,
+         round(
+           coalesce(oe.score,0)
+           + 0.5 * coalesce(oe.favoritecount,0)
+           + 0.2 * coalesce(oe.comments_count,0)
+           + 0.8 * coalesce(oe.upvotes_count,0)
+           - 1.2 * coalesce(oe.downvotes_count,0)
+           + 0.3 * coalesce(oe.linked_links,0)
+           - 0.7 * coalesce(oe.duplicate_links,0)
+           + 1.5 * case when oe.acceptedanswerid is not null then 1 else 0 end
+           + 0.4 * least(coalesce(oe.tag_count,0), 5)
+         , 2) as engagement_score,
+         case
+           when coalesce(oe.tag_count,0) = 0 then null
+           else round(coalesce(oe.total_tag_posts,0) / nullif(cast(oe.tag_count as numeric),0), 2)
+         end as avg_tag_volume,
+         case
+           when oe.owner_rep is null then 'anonymous'
+           when oe.owner_rep >= 100000 then 'legend'
+           when oe.owner_rep >= 20000 then 'expert'
+           when oe.owner_rep >= 5000 then 'pro'
+           when oe.owner_rep >= 1000 then 'regular'
+           else 'newbie'
+         end as owner_segment
+  from owner_enriched oe
+),
+ranked as (
+  select c.*,
+         row_number() over (order by c.engagement_score desc nulls last, c.score desc nulls last, c.viewcount desc nulls last, c.creationdate desc nulls last) as global_rank,
+         dense_rank() over (partition by c.owner_segment order by c.engagement_score desc nulls last, c.viewcount desc nulls last) as segment_rank,
+         percent_rank() over (order by c.engagement_score) as engagement_percentile,
+         ntile(10) over (order by c.viewcount nulls last) as views_decile
+  from calc c
+),
+owner_activity_summary as (
+  select p.owneruserid as user_id,
+         count(*) filter (where p.posttypeid = 1) as q_count,
+         count(*) filter (where p.posttypeid = 2) as a_count,
+         max(p.lastactivitydate) as last_owner_activity
+  from posts p
+  where p.owneruserid is not null
+  group by p.owneruserid
+),
+final_set as (
+  select r.question_id,
+         r.norm_title as title,
+         r.tag_list,
+         r.owner_name,
+         r.owner_segment,
+         r.score,
+         r.viewcount,
+         r.up_cz - r.down_cz as net_votes,
+         r.favoritecount,
+         r.answers_count_coalesced,
+         r.has_accepted_answer,
+         r.duplicate_links_cz,
+         r.linked_links_cz,
+         r.net_closed_flag,
+         r.best_answer_score,
+         r.title_len,
+         r.title_contains_how,
+         r.score_per_view,
+         r.engagement_score,
+         r.engagement_percentile,
+         r.views_decile,
+         r.global_rank,
+         r.segment_rank,
+         r.tag_count,
+         r.avg_tag_volume,
+         r.last_activity_any,
+         oas.q_count,
+         oas.a_count,
+         oas.last_owner_activity,
+         coalesce(r.close_reason_names, ARRAY[]::varchar[]) as close_reason_names
+  from ranked r
+  left join owner_activity_summary oas on oas.user_id = r.owner_id
+),
+top_candidates as (
+  select *
+  from final_set
+  where coalesce(tag_count,0) >= 1
+    and coalesce(viewcount,0) > 0
+    and (engagement_score > 5 or (has_accepted_answer = 1 and net_votes >= 3))
+)
+select *
+from (
+  select 'TOP' as bucket, tc.*
+  from top_candidates tc
+  where tc.global_rank <= 200
+
+  union all
+
+  select 'SEGMENT_TOP' as bucket, fs.*
+  from (
+    select fs.*, row_number() over (partition by owner_segment order by engagement_score desc nulls last) as seg_rn
+    from final_set fs
+  ) fs
+  where fs.seg_rn <= 50
+
+  union all
+
+  select 'RECENT_ACTIVE' as bucket, fs.*
+  from final_set fs
+  where fs.last_activity_any >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days'
+
+  union all
+
+  select 'EDGE_CASES' as bucket, fs.*
+  from final_set fs
+  where (fs.tag_count is null or fs.tag_count = 0)
+     or (fs.viewcount is null or fs.viewcount = 0)
+     or (fs.owner_name is null and fs.has_accepted_answer = 1)
+) u
+order by bucket, global_rank nulls last, engagement_score desc nulls last, viewcount desc nulls last, question_id asc;

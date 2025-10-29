@@ -1,0 +1,87 @@
+-- {"query": "5256.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 667} 
+WITH
+RecentActivePosts AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.PostTypeId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.CommentCount,
+    p.AcceptedAnswerId,
+    p.ParentId,
+    p.Body
+  FROM Posts p
+  WHERE p.CreationDate >= CURRENT_DATE - INTERVAL '90 days'
+),
+TagNameMap AS (
+  SELECT
+    t.TagName,
+    t.Id AS TagId
+  FROM Tags t
+),
+TopVoters AS (
+  SELECT
+    v.PostId,
+    v.UserId,
+    v.VoteTypeId,
+    v.CreationDate,
+    ROW_NUMBER() OVER (PARTITION BY v.PostId ORDER BY v.CreationDate DESC) AS rn
+  FROM Votes v
+  WHERE v.VoteTypeId IN (2, 3) -- UpMod / DownMod
+),
+CorrelatedStats AS (
+  SELECT
+    rap.Id AS PostId,
+    rap.Title,
+    rap.PostTypeId,
+    rap.CreationDate AS PostCreationDate,
+    rap.LastActivityDate AS PostLastActivityDate,
+    rap.OwnerUserId,
+    rap.Score,
+    rap.ViewCount,
+    rap.Tags,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = rap.Id) AS CommentCount,
+    (SELECT TOP 1 u.DisplayName FROM Users u WHERE u.Id = rap.OwnerUserId) AS OwnerDisplayName,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = rap.Id AND v.VoteTypeId = 2) AS UpVotes,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = rap.Id AND v.VoteTypeId = 3) AS DownVotes,
+    (SELECT STRING_AGG(CONCAT('[' , v2.UserId, ':', v2.VoteTypeId, ']',), ',') 
+       FROM TopVoters v2 WHERE v2.PostId = rap.Id) AS VoteHistoryJson
+  FROM RecentActivePosts rap
+),
+WindowEnriched AS (
+  SELECT
+    cs.*,
+    ROW_NUMBER() OVER (PARTITION BY cs.OwnerUserId ORDER BY cs.PostLastActivityDate DESC) AS UserPostRank,
+    AVG(cs.Score) OVER (PARTITION BY cs.OwnerUserId) AS AvgScorePerUser
+  FROM CorrelatedStats cs
+)
+SELECT
+  w.OwnerUserId,
+  u.DisplayName AS OwnerDisplayName,
+  u.Reputation,
+  w.PostId,
+  w.Title,
+  w.PostTypeId,
+  w.PostCreationDate,
+  w.PostLastActivityDate,
+  w.Score,
+  w.ViewCount,
+  w.Tags,
+  w.CommentCount,
+  w.UpVotes,
+  w.DownVotes,
+  w.VoteHistoryJson,
+  w.UserPostRank,
+  w.AvgScorePerUser
+FROM WindowEnriched w
+LEFT JOIN Users u ON u.Id = w.OwnerUserId
+WHERE
+  w.UserPostRank <= 10
+  AND w.AvgScorePerUser > 0
+ORDER BY w.PostLastActivityDate DESC
+LIMIT 200;

@@ -1,0 +1,97 @@
+-- {"query": "7079.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1637} 
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.ViewCount > 1000 THEN p.Id END) AS HighViewQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.Score > 10 THEN p.Id END) AS HighScoreAnswers,
+    COUNT(DISTINCT b.Id) AS Badges,
+    COUNT(DISTINCT c.Id) AS Comments,
+    COUNT(DISTINCT ph.Id) AS PostHistoryEntries,
+    COALESCE(SUM(CASE WHEN v.VoteTypeId IN (2, 3) THEN 1 ELSE 0 END), 0) AS TotalVotes,
+    COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVotes,
+    COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownVotes,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN p.Id END) AS QuestionsWithAnswers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN p.Id END) AS QuestionsWithAcceptedAnswers,
+    CASE 
+        WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+            ROUND(CAST(COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS FLOAT) / 
+                  NULLIF(COUNT(DISTINCT p.Id), 0) * 100, 2)
+        ELSE 0 
+    END AS AnswerPercentage,
+    COALESCE(AVG(p.Score), 0) AS AveragePostScore,
+    MAX(p.CreationDate) AS LatestPostDate,
+    MIN(p.CreationDate) AS FirstPostDate,
+    DATEDIFF(DAY, MIN(p.CreationDate), MAX(p.CreationDate)) AS ActiveDays,
+    STRING_AGG(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Title END, '; ') AS QuestionTitles,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.Tags IS NOT NULL AND p.Tags != '' THEN p.Id END) AS TaggedQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL THEN p.Id END) AS ClosedQuestions,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END), 0) AS TotalViews,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.Tags LIKE '%java%' THEN p.Id END) AS JavaQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.Tags LIKE '%python%' THEN p.Id END) AS PythonQuestions,
+    STRING_AGG(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.Tags IS NOT NULL THEN p.Tags END, ', ') AS AllTags,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15) THEN ph.Id END) AS ModerationActions,
+    COALESCE(SUM(CASE WHEN v.VoteTypeId IN (8, 9) THEN v.BountyAmount ELSE 0 END), 0) AS TotalBounties,
+    CASE 
+        WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) = 0 THEN 'No Questions'
+        WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) = 0 THEN 'No Answers'
+        ELSE 'Active User'
+    END AS UserStatus,
+    ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS UserRanking,
+    NTILE(100) OVER (ORDER BY SUM(CASE WHEN v.VoteTypeId IN (2, 3) THEN 1 ELSE 0 END) DESC) AS VoteRanking,
+    LAG(u.Reputation, 1, 0) OVER (ORDER BY u.Reputation DESC) AS PreviousReputation,
+    LAG(u.Reputation, 1, 0) OVER (ORDER BY u.Reputation ASC) AS NextReputation,
+    CASE 
+        WHEN (COUNT(DISTINCT b.Id) > 0 AND COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 0) 
+        THEN 'Active Contributor' 
+        ELSE 'Passive User' 
+    END AS ContributionLevel,
+    CONCAT('User_', u.Id) AS UserIdentifier,
+    REPLICATE('=', 50) AS Separator,
+    CONCAT('Rank ', ROW_NUMBER() OVER (ORDER BY COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) DESC)) AS UserRankLabel,
+    CASE 
+        WHEN u.Reputation > (SELECT AVG(Reputation) FROM Users) THEN 'Above Average'
+        WHEN u.Reputation < (SELECT AVG(Reputation) FROM Users) THEN 'Below Average'
+        ELSE 'Average'
+    END AS ReputationLevel,
+    CASE 
+        WHEN (COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) >= 10000) AND 
+             (COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) >= 1000) THEN 'Veteran'
+        WHEN (COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) >= 1000) AND 
+             (COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) >= 100) THEN 'Experienced'
+        ELSE 'Beginner'
+    END AS ExperienceLevel
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId OR u.Id = p.LastEditorUserId
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN Comments c ON u.Id = c.UserId
+LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+LEFT JOIN Votes v ON u.Id = v.UserId
+WHERE u.Id IN (
+    SELECT Id 
+    FROM Users 
+    WHERE Reputation > 1000 
+      AND LastAccessDate > TIMESTAMPADD(DAY, -30, cast('2024-10-01 12:34:56' as timestamp))
+    INTERSECT
+    SELECT UserId 
+    FROM Badges 
+    WHERE Date > TIMESTAMPADD(DAY, -90, cast('2024-10-01 12:34:56' as timestamp))
+    EXCEPT
+    SELECT UserId 
+    FROM Votes 
+    WHERE VoteTypeId IN (10, 11, 12)
+) 
+GROUP BY u.Id, u.DisplayName, u.Reputation
+HAVING 
+    COUNT(DISTINCT p.Id) >= 5 
+    AND COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) >= 1
+    AND COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) >= 1
+    AND COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) > 0
+ORDER BY 
+    COUNT(DISTINCT p.Id) DESC,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) DESC,
+    u.Reputation DESC
+LIMIT 1000;

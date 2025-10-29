@@ -1,0 +1,153 @@
+WITH
+user_recent_activity AS (
+    SELECT
+        u.Id                                   AS user_id,
+        u.DisplayName,
+        MAX(p.CreationDate)                    AS last_post_date,
+        COUNT(DISTINCT p.Id)                   AS recent_posts,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS recent_upvotes,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS recent_downvotes,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) -
+                 SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END),0) AS recent_score
+    FROM Users u
+    LEFT JOIN Posts p   ON p.OwnerUserId = u.Id
+                         AND p.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '90' DAY
+    LEFT JOIN Votes v   ON v.UserId = u.Id
+                         AND v.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '90' DAY
+    GROUP BY u.Id, u.DisplayName
+),
+user_badge_summary AS (
+    SELECT
+        b.UserId                                   AS user_id,
+        COUNT(*)                                   AS total_badges,
+        COUNT(*) FILTER (WHERE b.Class = 1)        AS gold_badges,
+        COUNT(*) FILTER (WHERE b.Class = 2)        AS silver_badges,
+        COUNT(*) FILTER (WHERE b.Class = 3)        AS bronze_badges,
+        STRING_AGG(DISTINCT b.Name, '; ')          AS badge_list
+    FROM Badges b
+    GROUP BY b.UserId
+),
+tag_activity AS (
+    SELECT
+        t.Id                                      AS tag_id,
+        t.TagName,
+        t.Count                                   AS total_uses,
+        COUNT(p.Id)                               AS recent_questions,
+        COUNT(a.Id)                               AS recent_answers,
+        STRING_AGG(DISTINCT CAST(p.OwnerUserId AS text), ',') FILTER (WHERE p.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '30' DAY) AS recent_askers,
+        STRING_AGG(DISTINCT CAST(a.OwnerUserId AS text), ',') FILTER (WHERE a.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '30' DAY) AS recent_answerers
+    FROM Tags t
+    LEFT JOIN Posts p
+           ON p.PostTypeId = 1
+          AND p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+    LEFT JOIN Posts a
+           ON a.PostTypeId = 2
+          AND a.ParentId = p.Id
+    WHERE p.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '30' DAY
+       OR a.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '30' DAY
+    GROUP BY t.Id, t.TagName, t.Count
+),
+ranked_posts AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.PostTypeId,
+        p.Score,
+        p.CreationDate,
+        p.OwnerUserId,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.CreationDate ASC) AS rank_per_type
+    FROM Posts p
+    WHERE p.PostTypeId IN (1,2)
+      AND p.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '180' DAY
+),
+combined_recent AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.OwnerUserId,
+        CAST(NULL AS int)           AS parent_id,
+        CAST(NULL AS int)           AS accepted_answer_id
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '7' DAY
+    UNION ALL
+    SELECT
+        a.Id,
+        a.PostTypeId,
+        NULL               AS Title,
+        a.CreationDate,
+        a.Score,
+        a.OwnerUserId,
+        a.ParentId,
+        (SELECT q.AcceptedAnswerId FROM Posts q WHERE q.Id = a.ParentId) AS accepted_answer_id
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+      AND a.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '7' DAY
+)
+
+SELECT
+    ura.user_id,
+    ura.DisplayName,
+    COALESCE(ura.recent_posts,0)                               AS recent_posts,
+    COALESCE(ura.recent_score,0)                               AS recent_score,
+    COALESCE(ubs.total_badges,0)                               AS total_badges,
+    COALESCE(ubs.gold_badges,0)                                AS gold_badges,
+    COALESCE(ubs.silver_badges,0)                              AS silver_badges,
+    COALESCE(ubs.bronze_badges,0)                              AS bronze_badges,
+    COALESCE(ubs.badge_list,'')                               AS badge_list,
+    (SELECT STRING_AGG(t.TagName, ', ')
+     FROM Tags t
+     JOIN tag_activity ta ON ta.tag_id = t.Id
+     WHERE EXISTS (
+           SELECT 1
+           FROM Posts p
+           WHERE p.OwnerUserId = ura.user_id
+             AND p.PostTypeId = 1
+             AND p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+     )
+    )                                                          AS tags_used_recently,
+    (SELECT rp.Title
+     FROM ranked_posts rp
+     WHERE rp.OwnerUserId = ura.user_id
+       AND rp.rank_per_type = 1
+    )                                                          AS top_scoring_post,
+    (SELECT COUNT(DISTINCT t.Id)
+     FROM Posts p
+     JOIN LATERAL regexp_split_to_table(p.Tags, '[><]') AS tag_raw(tag)
+          ON true
+     JOIN Tags t ON t.TagName = tag_raw.tag
+     WHERE p.OwnerUserId = ura.user_id
+       AND p.PostTypeId = 1
+       AND p.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '30' DAY
+    )                                                          AS distinct_recent_tags,
+    (SELECT STRING_AGG(
+              CASE WHEN cr.PostTypeId = 1
+                   THEN CONCAT('Q:', cr.Title)
+                   ELSE CONCAT('A to Q#', CAST(cr.parent_id AS text))
+              END, ' | ')
+     FROM (
+          SELECT *
+          FROM combined_recent cr
+          WHERE cr.OwnerUserId = ura.user_id
+          ORDER BY cr.CreationDate DESC
+          LIMIT 5
+     ) cr
+    )                                                          AS recent_activity_summary
+FROM user_recent_activity ura
+LEFT JOIN user_badge_summary ubs
+       ON ubs.user_id = ura.user_id
+GROUP BY
+    ura.user_id,
+    ura.DisplayName,
+    ura.recent_posts,
+    ura.recent_score,
+    ubs.total_badges,
+    ubs.gold_badges,
+    ubs.silver_badges,
+    ubs.bronze_badges,
+    ubs.badge_list
+ORDER BY ura.recent_score DESC
+LIMIT 100;

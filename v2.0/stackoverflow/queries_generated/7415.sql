@@ -1,0 +1,217 @@
+-- {"query": "7415.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1886} 
+WITH UserActivityCTE AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        COUNT(DISTINCT b.Id) AS Badges,
+        COUNT(DISTINCT v.Id) AS Votes,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END), 0) AS TotalQuestionScore,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END), 0) AS TotalAnswerScore,
+        MAX(p.CreationDate) AS LatestPostDate,
+        DATEDIFF(DAY, u.CreationDate, GETDATE()) AS AccountAgeDays,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Elite'
+            WHEN u.Reputation >= 1000 THEN 'Veteran'
+            WHEN u.Reputation >= 100 THEN 'Participant'
+            ELSE 'Newbie'
+        END AS ReputationTier,
+        NULLIF(
+            COALESCE(
+                LEFT(u.WebsiteUrl, 50),
+                LEFT(u.Location, 50),
+                LEFT(u.AboutMe, 50)
+            ), ''
+        ) AS ProfileInfo,
+        (
+            SELECT TOP 1 p.Title
+            FROM Posts p
+            WHERE p.OwnerUserId = u.Id
+                AND p.PostTypeId = 1
+            ORDER BY p.Score DESC, p.CreationDate DESC
+        ) AS TopQuestionTitle
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.CreationDate, u.WebsiteUrl, u.Location, u.AboutMe
+),
+RankedUsers AS (
+    SELECT 
+        *,
+        ROW_NUMBER() OVER (ORDER BY TotalQuestionScore DESC, TotalAnswerScore DESC) AS RankByScore,
+        DENSE_RANK() OVER (ORDER BY Reputation DESC) AS RankByReputation,
+        NTILE(10) OVER (ORDER BY Views DESC) AS QuartileByViews
+    FROM UserActivityCTE
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.Tags,
+        COALESCE(p.Tags, '') AS CleanTags,
+        NULLIF(CAST(LEN(p.Tags) AS FLOAT) / CAST(LEN('<') AS FLOAT), 0) AS TagRatio,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 1
+            WHEN p.PostTypeId = 2 AND p.Score > 0 THEN 1
+            ELSE 0
+        END AS HasQualitySignal,
+        (
+            SELECT TOP 1 v.VoteTypeId
+            FROM Votes v
+            WHERE v.PostId = p.Id
+            GROUP BY v.VoteTypeId
+            ORDER BY COUNT(*) DESC
+        ) AS MostFrequentVoteType,
+        COALESCE(
+            (
+                SELECT COUNT(*)
+                FROM Comments c
+                WHERE c.PostId = p.Id
+            ), 0
+        ) AS CommentCountNormalized,
+        IIF(p.Score > 100, 1, 0) AS HighScoreIndicator,
+        CASE 
+            WHEN p.CreationDate >= DATEADD(MONTH, -6, GETDATE()) THEN 'Recent'
+            WHEN p.CreationDate >= DATEADD(MONTH, -12, GETDATE()) THEN 'LastYear'
+            ELSE 'Older'
+        END AS PostAgeGroup
+    FROM Posts p
+    WHERE p.Id IS NOT NULL
+    AND p.PostTypeId IN (1, 2)
+),
+ComplexAggregations AS (
+    SELECT 
+        'Total Posts' AS Metric,
+        COUNT(*) AS Value,
+        NULL AS Category
+    FROM Posts
+    UNION ALL
+    SELECT 
+        'High Score Questions' AS Metric,
+        COUNT(*) AS Value,
+        NULL AS Category
+    FROM Posts
+    WHERE PostTypeId = 1 AND Score > 100
+    UNION ALL
+    SELECT 
+        'Active Users' AS Metric,
+        COUNT(DISTINCT OwnerUserId) AS Value,
+        NULL AS Category
+    FROM Posts
+    WHERE OwnerUserId IS NOT NULL
+    UNION ALL
+    SELECT 
+        'Top User Reputation' AS Metric,
+        MAX(Reputation) AS Value,
+        NULL AS Category
+    FROM Users
+    UNION ALL
+    SELECT 
+        'Average Question Score' AS Metric,
+        AVG(CAST(Score AS FLOAT)) AS Value,
+        NULL AS Category
+    FROM Posts
+    WHERE PostTypeId = 1
+    UNION ALL
+    SELECT 
+        'Tags Used' AS Metric,
+        COUNT(DISTINCT TagName) AS Value,
+        NULL AS Category
+    FROM Tags
+),
+FilteredPosts AS (
+    SELECT pa.*
+    FROM PostAnalysis pa
+    WHERE pa.HasQualitySignal = 1
+    AND pa.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1)
+    AND pa.TagRatio IS NOT NULL
+)
+SELECT 
+    ru.UserId,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.TotalPosts,
+    ru.Questions,
+    ru.Answers,
+    ru.Badges,
+    ru.Votes,
+    ru.TotalQuestionScore,
+    ru.TotalAnswerScore,
+    ru.LatestPostDate,
+    ru.AccountAgeDays,
+    ru.ReputationTier,
+    ru.ProfileInfo,
+    ru.TopQuestionTitle,
+    ru.RankByScore,
+    ru.RankByReputation,
+    ru.QuartileByViews,
+    NULLIF(SQRT(CAST(ru.TotalQuestionScore AS FLOAT) + 1), 0) AS ScoreSquareRoot,
+    CASE 
+        WHEN (ru.Views * 2 + ru.UpVotes) > 1000 THEN 'HighVisibility'
+        WHEN (ru.Views * 2 + ru.UpVotes) > 100 THEN 'MediumVisibility'
+        ELSE 'LowVisibility'
+    END AS VisibilityLevel,
+    NULLIF(
+        (CAST(ru.ViewCount AS FLOAT) / NULLIF(CAST(ru.Views AS FLOAT), 0)) * 100, 0
+    ) AS ViewPercentage,
+    IIF(ru.Badges > 5, 'BadgeMaster', 'Regular') AS BadgeStatus,
+    NULLIF(
+        (CAST(ru.Answers AS FLOAT) / NULLIF(CAST(ru.Questions AS FLOAT), 0)) * 100, 0
+    ) AS AnswerQuestionRatio,
+    (
+        SELECT STRING_AGG(CONVERT(VARCHAR, fp.PostId), ', ')
+        FROM FilteredPosts fp
+        WHERE fp.OwnerUserId = ru.UserId
+    ) AS HighQualityPostIds,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = ru.UserId AND p.PostTypeId = 1 AND p.Score > 100) AS HighScoreQuestions,
+    (
+        SELECT STRING_AGG(CONVERT(VARCHAR, ps.PostId), ' ')
+        FROM (
+            SELECT fp.PostId
+            FROM FilteredPosts fp
+            WHERE fp.OwnerUserId = ru.UserId
+            ORDER BY fp.Score DESC
+            OFFSET 0 ROWS FETCH NEXT 3 ROWS ONLY
+        ) ps
+    ) AS TopPostsSummary,
+    (SELECT COUNT(*) FROM Votes v WHERE v.UserId = ru.UserId AND v.VoteTypeId = 2) AS UpvotesReceived,
+    (
+        SELECT COUNT(DISTINCT v.PostId)
+        FROM Votes v
+        WHERE v.UserId = ru.UserId AND v.VoteTypeId = 2
+        AND v.PostId IN (
+            SELECT Id 
+            FROM Posts 
+            WHERE PostTypeId = 1 AND Score > 50
+        )
+    ) AS UpvotesOnPopularQuestions,
+    (
+        SELECT MAX(p.Score) 
+        FROM Posts p 
+        WHERE p.OwnerUserId = ru.UserId AND p.PostTypeId = 1
+    ) AS MaxQuestionScore,
+    (
+        SELECT MAX(p.Score) 
+        FROM Posts p 
+        WHERE p.OwnerUserId = ru.UserId AND p.PostTypeId = 2
+    ) AS MaxAnswerScore
+FROM RankedUsers ru
+WHERE ru.RankByScore <= 100
+  AND ru.ReputationTier IN ('Elite', 'Veteran')
+  AND ru.AccountAgeDays > 30
+  AND ru.TotalPosts > 10
+ORDER BY ru.TotalQuestionScore DESC, ru.TotalAnswerScore DESC
+OFFSET 0 ROWS FETCH NEXT 25 ROWS ONLY;

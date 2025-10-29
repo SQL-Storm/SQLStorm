@@ -1,0 +1,324 @@
+-- {"query": "849.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3035} 
+with recent_questions as (
+  select
+    p.Id as QuestionId,
+    p.CreationDate as QuestionDate,
+    p.OwnerUserId as AskerId,
+    coalesce(nullif(trim(p.Title), ''), '(untitled)') as Title,
+    string_to_array(substring(p.Tags, 2, greatest(length(p.Tags)-2,0)), '><') as TagArray,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.AcceptedAnswerId
+  from Posts p
+  where p.PostTypeId = 1
+    and p.CreationDate >= (select max(CreationDate) - interval '365 days' from Posts where PostTypeId = 1)
+),
+answers as (
+  select
+    a.Id as AnswerId,
+    a.ParentId as QuestionId,
+    a.OwnerUserId as AnswererId,
+    a.CreationDate as AnswerDate,
+    a.Score as AnswerScore,
+    a.CommentCount as AnswerComments
+  from Posts a
+  where a.PostTypeId = 2
+),
+first_answer as (
+  select distinct on (QuestionId)
+    QuestionId,
+    AnswerId as FirstAnswerId,
+    AnswererId as FirstAnswererId,
+    AnswerDate as FirstAnswerDate,
+    AnswerScore as FirstAnswerScore
+  from answers
+  order by QuestionId, AnswerDate asc, AnswerId
+),
+accepted_answer as (
+  select
+    rq.QuestionId,
+    a.AnswerId as AcceptedAnswerId,
+    a.AnswererId as AcceptedAnswererId,
+    a.AnswerDate as AcceptedAnswerDate,
+    a.AnswerScore as AcceptedAnswerScore
+  from recent_questions rq
+  join answers a
+    on a.AnswerId = rq.AcceptedAnswerId
+),
+user_stats as (
+  select
+    u.Id as UserId,
+    u.Reputation,
+    u.UpVotes,
+    u.DownVotes,
+    u.Views as ProfileViews,
+    u.CreationDate as UserCreated,
+    coalesce(nullif(u.Location, ''), 'Unknown') as LocationNorm,
+    coalesce(nullif(lower(u.WebsiteUrl), ''), 'n/a') as WebsiteNorm
+  from Users u
+),
+badge_rollup as (
+  select
+    b.UserId,
+    sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+    sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+    sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+    count(*) as TotalBadges,
+    max(b.Date) as LastBadgeDate
+  from Badges b
+  group by b.UserId
+),
+question_votes as (
+  select
+    v.PostId as QuestionId,
+    sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+    sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+    sum(case when v.VoteTypeId = 5 then 1 else 0 end) as Favorites,
+    sum(case when v.VoteTypeId = 8 then coalesce(v.BountyAmount,0) else 0 end) as BountyStarted,
+    sum(case when v.VoteTypeId = 9 then coalesce(v.BountyAmount,0) else 0 end) as BountyAwarded,
+    count(*) as TotalVotes
+  from Votes v
+  group by v.PostId
+),
+comment_activity as (
+  select
+    c.PostId,
+    count(*) as CommentCount,
+    max(c.CreationDate) as LastCommentDate,
+    sum(case when c.Score >= 5 then 1 else 0 end) as HighScoreComments
+  from Comments c
+  group by c.PostId
+),
+close_events as (
+  select
+    ph.PostId as QuestionId,
+    min(ph.CreationDate) filter (where ph.PostHistoryTypeId = 10) as FirstClosedAt,
+    count(*) filter (where ph.PostHistoryTypeId = 10) as CloseEvents,
+    count(*) filter (where ph.PostHistoryTypeId = 11) as ReopenEvents,
+    max(ph.CreationDate) filter (where ph.PostHistoryTypeId = 35) as MigratedAwayAt,
+    max(ph.CreationDate) filter (where ph.PostHistoryTypeId = 36) as MigratedHereAt,
+    count(*) filter (where ph.PostHistoryTypeId in (33,34)) as NoticeChanges
+  from PostHistory ph
+  group by ph.PostId
+),
+dup_links as (
+  select
+    pl.PostId as DuplicateQuestionId,
+    count(*) filter (where pl.LinkTypeId = 3) as DuplicateOfCount,
+    count(*) filter (where pl.LinkTypeId = 1) as LinkedCount,
+    max(pl.CreationDate) as LastLinkDate
+  from PostLinks pl
+  group by pl.PostId
+),
+tag_explode as (
+  select
+    rq.QuestionId,
+    lower(trim(t)) as tag
+  from recent_questions rq
+  cross join lateral unnest(rq.TagArray) as t
+),
+top_tags as (
+  select
+    te.QuestionId,
+    string_agg(te.tag, ',' order by te.tag) as TagsCsv,
+    count(*) as TagCount,
+    max(te.tag) filter (where te.tag like '%sql%') as HasSqlTag
+  from tag_explode te
+  group by te.QuestionId
+),
+question_enriched as (
+  select
+    rq.*,
+    qv.UpVotes as QUp,
+    qv.DownVotes as QDown,
+    qv.Favorites as QFav,
+    qv.TotalVotes as QVotes,
+    qv.BountyStarted,
+    qv.BountyAwarded,
+    ca.CommentCount as QComments,
+    ca.LastCommentDate,
+    ce.FirstClosedAt,
+    ce.CloseEvents,
+    ce.ReopenEvents,
+    ce.MigratedAwayAt,
+    ce.MigratedHereAt,
+    ce.NoticeChanges,
+    tt.TagsCsv,
+    tt.TagCount,
+    (tt.HasSqlTag is not null) as HasSqlTagBool
+  from recent_questions rq
+  left join question_votes qv on qv.QuestionId = rq.QuestionId
+  left join comment_activity ca on ca.PostId = rq.QuestionId
+  left join close_events ce on ce.QuestionId = rq.QuestionId
+  left join top_tags tt on tt.QuestionId = rq.QuestionId
+),
+answer_rollup as (
+  select
+    a.QuestionId,
+    count(*) as AnswerTotal,
+    max(a.AnswerScore) as MaxAnswerScore,
+    avg(a.AnswerScore::numeric) as AvgAnswerScore,
+    min(a.AnswerDate) as FirstAnswerDate,
+    max(a.AnswerDate) as LastAnswerDate
+  from answers a
+  group by a.QuestionId
+),
+user_enriched as (
+  select
+    us.UserId,
+    us.Reputation,
+    us.UpVotes,
+    us.DownVotes,
+    us.ProfileViews,
+    us.UserCreated,
+    us.LocationNorm,
+    us.WebsiteNorm,
+    br.GoldBadges,
+    br.SilverBadges,
+    br.BronzeBadges,
+    br.TotalBadges,
+    br.LastBadgeDate
+  from user_stats us
+  left join badge_rollup br on br.UserId = us.UserId
+),
+answerer_metrics as (
+  select
+    a.AnswerId,
+    a.AnswererId,
+    ue.Reputation as AnswererRep,
+    ue.TotalBadges as AnswererBadges,
+    row_number() over (partition by a.QuestionId order by a.AnswerScore desc nulls last, a.AnswerDate asc, a.AnswerId) as RankByScore,
+    dense_rank() over (partition by a.QuestionId order by coalesce(a.AnswerScore, -2147483648) desc) as DenseRankByScore,
+    count(*) over (partition by a.AnswererId) as TotalAnswersByUser
+  from answers a
+  left join user_enriched ue on ue.UserId = a.AnswererId
+),
+quality_flags as (
+  select
+    qe.QuestionId,
+    case
+      when coalesce(qe.QUp,0) - coalesce(qe.QDown,0) >= 50 then 'hot'
+      when coalesce(qe.ViewCount,0) >= 10000 then 'popular'
+      when qe.FirstClosedAt is not null then 'controversial'
+      else 'normal'
+    end as PopularityBucket,
+    case
+      when qe.HasSqlTagBool then 1 else 0
+    end as IsSQLRelated,
+    case
+      when qe.AcceptedAnswerId is not null then 1 else 0
+    end as HasAccepted,
+    case
+      when qe.AnswerCount = 0 and qe.FirstClosedAt is not null then 1 else 0
+    end as ClosedWithoutAnswers
+  from question_enriched qe
+),
+final_scores as (
+  select
+    qe.QuestionId,
+    qe.Title,
+    qe.QuestionDate,
+    qe.Score as QScore,
+    coalesce(qe.QUp,0) - coalesce(qe.QDown,0) as NetVotes,
+    coalesce(qe.QFav,0) as Favorites,
+    coalesce(qe.ViewCount,0) as Views,
+    coalesce(qe.QComments,0) as Comments,
+    qe.AnswerCount,
+    coalesce(ar.AnswerTotal,0) as AnswerTotal,
+    ar.AvgAnswerScore,
+    ar.MaxAnswerScore,
+    fa.FirstAnswerDate,
+    aa.AcceptedAnswerDate,
+    extract(epoch from (coalesce(aa.AcceptedAnswerDate, cast('2024-10-01 12:34:56' as timestamp)) - qe.CreationDate)) / 3600.0 as HoursToAcceptOrNow,
+    extract(epoch from (coalesce(ar.LastAnswerDate, qe.CreationDate) - qe.CreationDate)) / 3600.0 as HoursToLastAnswer,
+    case
+      when qe.AcceptedAnswerId is not null and aa.AcceptedAnswererId = fa.FirstAnswererId then 1 else 0
+    end as FirstAnswerAccepted,
+    qf.PopularityBucket,
+    qf.IsSQLRelated,
+    qf.HasAccepted,
+    qf.ClosedWithoutAnswers,
+    qe.TagsCsv,
+    coalesce(qe.TagCount,0) as TagCount,
+    coalesce(qe.BountyStarted,0) as BountyStarted,
+    coalesce(qe.BountyAwarded,0) as BountyAwarded,
+    coalesce(dl.DuplicateOfCount,0) as DuplicateOfCount,
+    row_number() over (
+      partition by qf.PopularityBucket
+      order by
+        (coalesce(qe.QUp,0) - coalesce(qe.QDown,0)) desc,
+        coalesce(qe.ViewCount,0) desc,
+        qe.AnswerCount desc,
+        qe.QuestionId desc
+    ) as RankInBucket
+  from question_enriched qe
+  left join answer_rollup ar on ar.QuestionId = qe.QuestionId
+  left join first_answer fa on fa.QuestionId = qe.QuestionId
+  left join accepted_answer aa on aa.QuestionId = qe.QuestionId
+  left join quality_flags qf on qf.QuestionId = qe.QuestionId
+  left join dup_links dl on dl.DuplicateQuestionId = qe.QuestionId
+),
+ranked as (
+  select
+    fs.*,
+    percent_rank() over (order by NetVotes desc, Views desc, AnswerTotal desc, QuestionId desc) as PctRankGlobal,
+    ntile(10) over (order by coalesce(NetVotes,0) desc) as DecileByNetVotes,
+    sum(case when FirstAnswerAccepted = 1 then 1 else 0 end) over (partition by IsSQLRelated) as AcceptedFirstAnswersInGroup
+  from final_scores fs
+),
+filtered as (
+  select *
+  from ranked
+  where
+    -- mix of complex predicates to stress optimizer
+    (NetVotes >= 0 or (Favorites > 0 and Views > 100))
+    and not (TagCount = 0 and Coalesce(TagsCsv,'') <> '')
+    and (PopularityBucket in ('hot','popular') or (IsSQLRelated = 1 and DecileByNetVotes <= 7))
+    and (HoursToLastAnswer is null or HoursToLastAnswer >= 0)
+)
+select
+  f.QuestionId,
+  left(f.Title, 120) as TruncTitle,
+  f.QuestionDate,
+  f.PopularityBucket,
+  f.IsSQLRelated,
+  f.HasAccepted,
+  f.FirstAnswerAccepted,
+  f.NetVotes,
+  f.Favorites,
+  f.Views,
+  f.Comments,
+  f.AnswerCount,
+  f.AnswerTotal,
+  round(coalesce(f.AvgAnswerScore,0), 2) as AvgAnswerScore,
+  f.MaxAnswerScore,
+  round(coalesce(f.HoursToAcceptOrNow,0), 2) as HoursToAcceptOrNow,
+  round(coalesce(f.HoursToLastAnswer,0), 2) as HoursToLastAnswer,
+  f.BountyStarted,
+  f.BountyAwarded,
+  f.DuplicateOfCount,
+  coalesce(f.TagsCsv, '(no-tags)') as TagsCsv,
+  f.TagCount,
+  f.RankInBucket,
+  f.PctRankGlobal,
+  f.DecileByNetVotes,
+  -- additional correlated subquery: distinct answerers with silver+ badge count > 0
+  (
+    select count(distinct a.AnswererId)
+    from answers a
+    join badge_rollup br on br.UserId = a.AnswererId
+    where a.QuestionId = f.QuestionId
+      and (br.GoldBadges + br.SilverBadges) > 0
+  ) as DistinctExperiencedAnswerers,
+  -- string expression with null/empty handling
+  regexp_replace(
+    coalesce(nullif(f.TagsCsv,''), '(no-tags)'),
+    '(^|,)(sql|postgres|mysql)(,|$)', '\1DB\3', 'gi'
+  ) as TagsMasked
+from filtered f
+order by
+  f.RankInBucket asc,
+  f.PctRankGlobal desc,
+  f.QuestionId desc
+limit 250;

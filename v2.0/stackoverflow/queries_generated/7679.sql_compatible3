@@ -1,0 +1,239 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.ViewCount,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        SUM(COALESCE(p.Score, 0)) AS TotalScore,
+        MAX(p.CreationDate) AS LatestPostDate,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE NULL END) AS AvgQuestionViews,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.ViewCount ELSE NULL END) AS AvgAnswerViews,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2), ', ') AS AllTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.ViewCount
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        PostCount,
+        CommentCount,
+        BadgeCount,
+        QuestionCount,
+        AnswerCount,
+        TotalScore,
+        LatestPostDate,
+        AvgQuestionViews,
+        AvgAnswerViews,
+        AllTags,
+        ROW_NUMBER() OVER (ORDER BY TotalScore DESC, Reputation DESC) AS Rank,
+        NTILE(100) OVER (ORDER BY TotalScore DESC) AS Percentile
+    FROM UserStats
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        COALESCE(p.ViewCount, 0) AS WikiViews,
+        COALESCE(p.Score, 0) AS WikiScore,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Very Popular'
+            WHEN t.Count > 100 THEN 'Popular'
+            WHEN t.Count > 50 THEN 'Moderate'
+            ELSE 'Less Popular'
+        END AS PopularityLevel,
+        LAG(t.Count) OVER (ORDER BY t.Count DESC) - t.Count AS PopularityChange
+    FROM Tags t
+    LEFT JOIN Posts p ON t.WikiPostId = p.Id
+    GROUP BY t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId, p.ViewCount, p.Score
+),
+PostActivity AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END AS PostType,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        COALESCE(p.CommentCount, 0) AS CommentCount,
+        COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+        CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate)) / 86400 AS INTEGER) AS DaysSinceCreation,
+        COALESCE(p.LastActivityDate, p.CreationDate) AS LastActivity,
+        CASE 
+            WHEN CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate)) / 86400 AS INTEGER) > 30 THEN 'Old'
+            WHEN CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate)) / 86400 AS INTEGER) > 7 THEN 'Recent'
+            ELSE 'Fresh'
+        END AS AgeCategory,
+        p.Tags,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND CHAR_LENGTH(p.Tags) > 2 THEN 
+                CARDINALITY(string_to_array(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2), '><'))
+            ELSE 0 
+        END AS TagsCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserPostRank,
+        RANK() OVER (ORDER BY p.Score DESC) AS ScoreRank,
+        DENSE_RANK() OVER (ORDER BY p.ViewCount DESC) AS ViewRank
+    FROM Posts p
+    WHERE p.Id IS NOT NULL
+),
+ComplexAnalysis AS (
+    SELECT 
+        pa.Id,
+        pa.Title,
+        pa.Body,
+        pa.Score,
+        pa.ViewCount,
+        pa.CreationDate,
+        pa.OwnerUserId,
+        pa.PostType,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.FavoriteCount,
+        pa.DaysSinceCreation,
+        pa.LastActivity,
+        pa.AgeCategory,
+        pa.Tags,
+        pa.TagsCount,
+        pa.UserPostRank,
+        pa.ScoreRank,
+        pa.ViewRank,
+        tu.DisplayName AS OwnerDisplayName,
+        tu.Reputation AS OwnerReputation,
+        tu.PostCount AS OwnerPostCount,
+        tu.QuestionCount AS OwnerQuestionCount,
+        tu.AnswerCount AS OwnerAnswerCount,
+        tu.TotalScore AS OwnerTotalScore,
+        tu.Percentile AS OwnerPercentile,
+        ta.TagName,
+        ta.Count AS TagCount,
+        ta.WikiViews,
+        ta.WikiScore,
+        CASE 
+            WHEN pa.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'Above Average'
+            WHEN pa.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) * 0.8 THEN 'Average'
+            ELSE 'Below Average'
+        END AS ScorePerformance,
+        CASE 
+            WHEN pa.ViewCount > (SELECT AVG(ViewCount) FROM Posts) THEN 'Popular'
+            WHEN pa.ViewCount > (SELECT AVG(ViewCount) FROM Posts) * 0.8 THEN 'Moderate'
+            ELSE 'Low'
+        END AS ViewPerformance,
+        CAST(CASE 
+            WHEN pa.Tags IS NOT NULL AND CHAR_LENGTH(pa.Tags) > 2 THEN 
+                (CARDINALITY(string_to_array(SUBSTRING(pa.Tags FROM 2 FOR CHAR_LENGTH(pa.Tags)-2), '><')) * pa.Score) / NULLIF(pa.ViewCount, 0)
+            ELSE 0 
+        END AS DOUBLE PRECISION) AS TagScoreEfficiency,
+        CASE 
+            WHEN pa.Score > (SELECT AVG(Score) FROM Posts) 
+                 AND pa.ViewCount > (SELECT AVG(ViewCount) FROM Posts) THEN 'High Impact'
+            WHEN pa.Score > (SELECT AVG(Score) FROM Posts) 
+                 OR pa.ViewCount > (SELECT AVG(ViewCount) FROM Posts) THEN 'Moderate Impact'
+            ELSE 'Low Impact'
+        END AS ImpactCategory
+    FROM PostActivity pa
+    LEFT JOIN TopUsers tu ON pa.OwnerUserId = tu.UserId
+    LEFT JOIN TagAnalysis ta ON pa.Tags IS NOT NULL 
+        AND CHAR_LENGTH(pa.Tags) > 2 
+        AND ta.TagName IN (
+            SELECT TRIM(unnest(string_to_array(SUBSTRING(pa.Tags FROM 2 FOR CHAR_LENGTH(pa.Tags)-2), '><')))
+        )
+    WHERE pa.OwnerUserId IS NOT NULL 
+      AND pa.Score IS NOT NULL
+),
+FinalResults AS (
+    SELECT 
+        ca.Id,
+        ca.Title,
+        SUBSTRING(ca.Body FROM 1 FOR 200) || '...' AS BodySnippet,
+        ca.Score,
+        ca.ViewCount,
+        ca.CreationDate,
+        ca.OwnerUserId,
+        ca.OwnerDisplayName,
+        ca.OwnerReputation,
+        ca.OwnerPostCount,
+        ca.OwnerQuestionCount,
+        ca.OwnerAnswerCount,
+        ca.OwnerTotalScore,
+        ca.OwnerPercentile,
+        ca.PostType,
+        ca.AnswerCount,
+        ca.CommentCount,
+        ca.FavoriteCount,
+        ca.DaysSinceCreation,
+        ca.LastActivity,
+        ca.AgeCategory,
+        ca.Tags,
+        ca.TagsCount,
+        ca.UserPostRank,
+        ca.ScoreRank,
+        ca.ViewRank,
+        ca.TagName,
+        ca.TagCount,
+        ca.WikiViews,
+        ca.WikiScore,
+        ca.ScorePerformance,
+        ca.ViewPerformance,
+        ca.TagScoreEfficiency,
+        ca.ImpactCategory,
+        CASE 
+            WHEN ca.TagScoreEfficiency > 10 THEN 'High'
+            WHEN ca.TagScoreEfficiency > 5 THEN 'Medium'
+            ELSE 'Low'
+        END AS EfficiencyLevel,
+        COUNT(*) OVER () AS TotalResults,
+        ROW_NUMBER() OVER (ORDER BY ca.Score DESC, ca.ViewCount DESC) AS OverallRank,
+        PERCENT_RANK() OVER (ORDER BY ca.Score DESC) AS ScorePercentile,
+        NTILE(4) OVER (ORDER BY ca.ViewCount DESC) AS ViewQuartile,
+        LAG(ca.Score) OVER (ORDER BY ca.Score DESC) - ca.Score AS ScoreDiffFromPrev,
+        LEAD(ca.Score) OVER (ORDER BY ca.Score DESC) - ca.Score AS ScoreDiffFromNext,
+        AVG(ca.ViewCount) OVER (ORDER BY ca.Score DESC ROWS BETWEEN 10 PRECEDING AND 10 FOLLOWING) AS MovingAvgViewCount,
+        SUM(ca.Score) OVER (ORDER BY ca.CreationDate) AS CumulativeScore,
+        MAX(ca.Score) OVER (PARTITION BY ca.OwnerUserId ORDER BY ca.OwnerUserId) AS OwnerMaxScore,
+        MIN(ca.ViewCount) OVER (PARTITION BY ca.OwnerUserId ORDER BY ca.OwnerUserId) AS OwnerMinViews,
+        COUNT(ca.Id) OVER (PARTITION BY ca.OwnerUserId) AS OwnerPostCount,
+        CASE 
+            WHEN ca.Score >= (SELECT MAX(Score) FROM Posts WHERE PostTypeId = 1) * 0.9 THEN 'Elite'
+            WHEN ca.Score >= (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) * 1.5 THEN 'Above Average'
+            ELSE 'Regular'
+        END AS QualityCategory,
+        CASE 
+            WHEN ca.ViewCount >= (SELECT AVG(ViewCount) FROM Posts) * 2 THEN 'Viral'
+            WHEN ca.ViewCount >= (SELECT AVG(ViewCount) FROM Posts) THEN 'Popular'
+            ELSE 'Standard'
+        END AS PopularityCategory,
+        COALESCE(ca.OwnerDisplayName, 'Anonymous') AS FinalDisplayName,
+        COALESCE(ca.TagName, 'No Tags') AS FinalTagName
+    FROM ComplexAnalysis ca
+)
+SELECT *
+FROM FinalResults
+WHERE Id IS NOT NULL
+  AND Score IS NOT NULL
+  AND (OwnerDisplayName IS NOT NULL OR OwnerUserId IS NOT NULL)
+  AND (TagCount IS NOT NULL OR Score >= 0)
+  AND DaysSinceCreation >= 0
+  AND (Score > 0 OR ViewCount > 0)
+ORDER BY Score DESC, ViewCount DESC, CreationDate DESC
+LIMIT 1000;

@@ -1,0 +1,135 @@
+-- {"query": "5558.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 882} 
+WITH
+RecentActivePosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.Tags,
+    p.PostTypeId,
+    p.LastActivityDate,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount
+  FROM Posts p
+  WHERE p.CreationDate >= DATEADD(month, -6, GETDATE())
+),
+TopTags AS (
+  SELECT
+    unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS Tag,
+    COUNT(*) AS TagCount
+  FROM Posts p
+  JOIN RecentActivePosts rap ON rap.PostId = p.Id
+  WHERE p.PostTypeId = 1
+  GROUP BY Tag
+),
+TagQuality AS (
+  SELECT
+    t.Tag AS TagName,
+    t.TagCount,
+    CASE
+      WHEN t.TagCount > 50 THEN 'Hot'
+      WHEN t.TagCount > 20 THEN 'Warm'
+      ELSE 'New'
+    END AS TagTier
+  FROM TopTags t
+),
+UserStaging AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.UpVotes,
+    u.DownVotes,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.ProfileImageUrl,
+    ROW_NUMBER() OVER (PARTITION BY u.Location ORDER BY u.Reputation DESC) AS rn_by_location
+  FROM Users u
+  WHERE u.AccountId IS NOT NULL
+),
+FollowUp AS (
+  SELECT
+    rap.PostId,
+    rap.Title,
+    rap.OwnerUserId,
+    rap.CreationDate,
+    rap.LastActivityDate,
+    rap.ViewCount,
+    vb.TagName,
+    vb.TagTier,
+    ut.UserId AS VoterId,
+    vt.Name AS VoteType
+  FROM RecentActivePosts rap
+  LEFT JOIN Tags vb ON vb.ExcerptPostId = rap.PostId
+  LEFT JOIN Votes v ON v.PostId = rap.PostId
+  LEFT JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+  LEFT JOIN Users ut ON ut.Id = v.UserId
+  WHERE rap.PostTypeId = 1
+),
+ComplexPredicate AS (
+  SELECT
+    fp.PostId,
+    fp.Title,
+    fp.OwnerUserId,
+    fp.CreationDate,
+    fp.LastActivityDate,
+    fp.ViewCount,
+    fp.Score,
+    fp.AnswerCount,
+    fp.CommentCount,
+    fp.FavoriteCount,
+    (fp.Score * 1.0) / NULLIF(fp.ViewCount,0) AS ScorePerView,
+    CASE
+      WHEN fp.AnswerCount > 0 THEN 'Answered'
+      ELSE 'Unanswered'
+    END AS AnswerStatus
+  FROM RecentActivePosts fp
+),
+Aggregated AS (
+  SELECT
+    cp.PostId,
+    cp.Title,
+    cp.OwnerUserId,
+    cp.CreationDate,
+    cp.LastActivityDate,
+    cp.ViewCount,
+    cp.Score,
+    cp.AnswerCount,
+    cp.CommentCount,
+    cp.FavoriteCount,
+    cp.ScorePerView,
+    cp.AnswerStatus,
+    t.TagName,
+    t.TagTier,
+    s.DisplayName AS OwnerDisplayName,
+    ROW_NUMBER() OVER (PARTITION BY cp.PostId ORDER BY cp.LastActivityDate DESC) AS rn
+  FROM ComplexPredicate cp
+  LEFT JOIN Tags t ON t.ExcerptPostId = cp.PostId
+  LEFT JOIN Users s ON s.Id = cp.OwnerUserId
+)
+SELECT
+  a.PostId,
+  a.Title,
+  a.OwnerDisplayName,
+  a.CreationDate,
+  a.LastActivityDate,
+  a.ViewCount,
+  a.Score,
+  a.AnswerCount,
+  a.CommentCount,
+  a.FavoriteCount,
+  a.ScorePerView,
+  a.AnswerStatus,
+  a.TagName,
+  a.TagTier
+FROM Aggregated a
+WHERE a.rn = 1
+  AND a.TagTier IS NOT NULL
+ORDER BY a.LastActivityDate DESC
+OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY;

@@ -1,0 +1,177 @@
+WITH UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.Views AS UserProfileViews,
+        u.UpVotes AS UserTotalUpVotes,
+        u.DownVotes AS UserTotalDownVotes,
+        u.Location,
+        u.WebsiteUrl,
+        COUNT(DISTINCT q.Id) AS QuestionsPostedCount,
+        COUNT(DISTINCT a.Id) AS AnswersPostedCount,
+        COUNT(DISTINCT c.Id) AS CommentsMadeCount,
+        SUM(CASE WHEN p_all.PostTypeId = 1 THEN COALESCE(p_all.Score, 0) ELSE 0 END) AS TotalQuestionScore,
+        SUM(CASE WHEN p_all.PostTypeId = 2 THEN COALESCE(p_all.Score, 0) ELSE 0 END) AS TotalAnswerScore,
+        SUM(COALESCE(c.Score, 0)) AS TotalCommentScore,
+        MAX(b.Date) AS LatestBadgeAwardDate,
+        COUNT(b.Id) AS TotalBadgesEarned,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadgesCount,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadgesCount,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadgesCount
+    FROM Users u
+    LEFT JOIN Posts q ON u.Id = q.OwnerUserId AND q.PostTypeId = 1
+    LEFT JOIN Posts a ON u.Id = a.OwnerUserId AND a.PostTypeId = 2
+    LEFT JOIN Posts p_all ON u.Id = p_all.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate,
+        u.Views, u.UpVotes, u.DownVotes, u.Location, u.WebsiteUrl
+),
+PostDetailsExtended AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+        p.ClosedDate,
+        p.CommunityOwnedDate,
+        p.Title,
+        p.Tags,
+        COALESCE(p.AcceptedAnswerId, -1) AS AcceptedAnswerIdOrDefault,
+        (SELECT COUNT(v.Id) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS PostUpvoteCount,
+        (SELECT COUNT(v.Id) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS PostDownvoteCount,
+        EXISTS (
+            SELECT 1
+            FROM PostHistory ph_mod
+            WHERE ph_mod.PostId = p.Id
+              AND ph_mod.PostHistoryTypeId IN (10, 11, 14, 15, 19, 20)
+              AND ph_mod.UserId IS NOT NULL
+              AND ph_mod.CreationDate > p.CreationDate + INTERVAL '1 month'
+        ) AS HasDelayedModeratorAction,
+        (SELECT COUNT(DISTINCT phe.UserId)
+         FROM PostHistory phe
+         WHERE phe.PostId = p.Id
+           AND phe.PostHistoryTypeId IN (4, 5, 6)
+           AND phe.UserId IS NOT NULL
+           AND phe.UserId != p.OwnerUserId
+        ) AS NonOwnerEditorCount
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+),
+TagMetrics AS (
+    SELECT
+        pd.PostId,
+        LOWER(TRIM(UNNEST(string_to_array(SUBSTRING(pd.Tags FROM 2 FOR LENGTH(pd.Tags) - 2), '><')))) AS TagName,
+        pd.PostScore
+    FROM PostDetailsExtended pd
+    WHERE pd.Tags IS NOT NULL AND LENGTH(pd.Tags) > 2
+),
+PostRelationshipSummary AS (
+    SELECT
+        pl.PostId,
+        COUNT(DISTINCT CASE WHEN lt.Name = 'Linked' THEN pl.RelatedPostId END) AS TotalLinkedPosts,
+        COUNT(DISTINCT CASE WHEN lt.Name = 'Duplicate' THEN pl.RelatedPostId END) AS TotalDuplicateSources,
+        MAX(pl.CreationDate) AS LatestRelatedPostDate
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    GROUP BY pl.PostId
+),
+RecentPostEvents AS (
+    SELECT ph.PostId, 'Closed' AS EventType, ph.CreationDate AS EventDate
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10
+      AND ph.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '6 months'
+    UNION ALL
+    SELECT ph.PostId, 'Reopened' AS EventType, ph.CreationDate AS EventDate
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 11
+      AND ph.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '6 months'
+    UNION ALL
+    SELECT ph.PostId, 'CommunityBump' AS EventType, ph.CreationDate AS EventDate
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 50
+      AND ph.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '6 months'
+)
+SELECT
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.UserCreationDate,
+    uas.LastAccessDate,
+    EXTRACT(DAY FROM AGE(uas.LastAccessDate, uas.UserCreationDate)) AS UserAccountAgeDays,
+    COALESCE(uas.Location, 'Unspecified Location') AS UserLocationNormalized,
+    LOWER(SPLIT_PART(SUBSTRING(uas.WebsiteUrl FROM '://([^/]+)'), '.', 1)) AS WebsiteSubdomain,
+    uas.QuestionsPostedCount,
+    uas.AnswersPostedCount,
+    uas.CommentsMadeCount,
+    pde.PostId,
+    pde.PostTypeName,
+    pde.Title,
+    pde.PostCreationDate,
+    pde.PostScore,
+    pde.ViewCount,
+    pde.FavoriteCount,
+    pde.PostUpvoteCount,
+    pde.PostDownvoteCount,
+    pde.NonOwnerEditorCount,
+    pde.HasDelayedModeratorAction,
+    prs.TotalLinkedPosts,
+    prs.TotalDuplicateSources,
+    COALESCE(CAST(pde.PostUpvoteCount AS NUMERIC) / NULLIF(pde.PostUpvoteCount + pde.PostDownvoteCount, 0), 0.0) AS UpvoteSuccessRate,
+    RANK() OVER (PARTITION BY COALESCE(uas.Location, 'N/A') ORDER BY uas.Reputation DESC, uas.LastAccessDate DESC) AS RankByUserReputationInLocation,
+    AVG(pde.PostScore) OVER (PARTITION BY pde.PostTypeId ORDER BY pde.PostCreationDate ROWS BETWEEN 5 PRECEDING AND CURRENT ROW) AS RollingAvgPostScoreForType,
+    LEAD(pde.PostCreationDate, 1, CAST('9999-12-31' AS timestamp)) OVER (PARTITION BY uas.UserId ORDER BY pde.PostCreationDate) AS NextPostByCurrentUserDate,
+    (
+        SELECT ARRAY_AGG(DISTINCT tm_agg.TagName ORDER BY tm_agg.TagName) FILTER (WHERE tm_agg.TagName IS NOT NULL)
+        FROM TagMetrics tm_agg
+        WHERE tm_agg.PostId = pde.PostId
+        GROUP BY tm_agg.PostId
+    ) AS PostTagsArray,
+    CASE
+        WHEN pde.ClosedDate IS NOT NULL AND pde.PostCreationDate < CAST('2024-10-01' AS date) - INTERVAL '2 years' THEN 'Old & Closed'
+        WHEN pde.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        WHEN pde.LastEditDate > pde.PostCreationDate + INTERVAL '1 year' AND pde.LastActivityDate > CAST('2024-10-01' AS date) - INTERVAL '3 months' THEN 'Actively Maintained Old Post'
+        WHEN pde.PostCreationDate >= CAST('2024-10-01' AS date) - INTERVAL '6 months' THEN 'Recently Created'
+        ELSE 'Mature & Stable'
+    END AS PostAgeClassification,
+    EXISTS (
+        SELECT 1
+        FROM RecentPostEvents rpe
+        WHERE rpe.PostId = pde.PostId AND rpe.EventType = 'Reopened'
+    ) AS WasRecentlyReopened,
+    (
+        SELECT AVG(u_ans.Reputation)
+        FROM Posts ans
+        JOIN Users u_ans ON ans.OwnerUserId = u_ans.Id
+        WHERE ans.ParentId = pde.PostId AND ans.PostTypeId = 2 AND u_ans.Reputation IS NOT NULL
+    ) AS AvgAnswererReputation
+FROM
+    UserActivitySummary uas
+LEFT JOIN
+    PostDetailsExtended pde ON uas.UserId = pde.OwnerUserId
+LEFT JOIN
+    PostRelationshipSummary prs ON pde.PostId = prs.PostId
+WHERE
+    uas.Reputation >= 5000
+    AND pde.PostId IS NOT NULL
+    AND pde.PostTypeName IN ('Question', 'Answer')
+    AND pde.PostCreationDate BETWEEN CAST('2019-01-01' AS date) AND CAST('2023-12-31' AS date)
+    AND (pde.ViewCount > 1000 OR pde.FavoriteCount > 50 OR uas.TotalBadgesEarned > 10)
+    AND pde.PostScore >= 5
+ORDER BY
+    uas.Reputation DESC,
+    pde.PostScore DESC,
+    pde.PostCreationDate DESC,
+    uas.UserId;

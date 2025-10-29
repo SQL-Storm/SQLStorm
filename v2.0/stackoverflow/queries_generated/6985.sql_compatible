@@ -1,0 +1,110 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.Title,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.LastActivityDate,
+        P.OwnerUserId,
+        U.DisplayName,
+        U.Reputation,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.ViewCount DESC) AS Rank,
+        P.Tags
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId = 1 AND P.Score > 0 AND P.ViewCount > 100
+),
+BadgeCounts AS (
+    SELECT 
+        U.Id AS UserId,
+        U.DisplayName,
+        COUNT(B.Id) AS BadgeCount
+    FROM 
+        Users U
+    LEFT JOIN 
+        Badges B ON U.Id = B.UserId
+    GROUP BY 
+        U.Id, U.DisplayName
+),
+RecentVotes AS (
+    SELECT 
+        V.PostId,
+        V.UserId,
+        V.CreationDate,
+        V.VoteTypeId,
+        CASE 
+            WHEN V.VoteTypeId IN (2, 8) THEN 'UpVote'
+            WHEN V.VoteTypeId IN (3, 9) THEN 'DownVote'
+            ELSE 'Other'
+        END AS VoteType
+    FROM 
+        Votes V
+    WHERE 
+        V.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 month')
+),
+nums AS (
+    SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5
+)
+SELECT 
+    RP.Id, 
+    RP.Title, 
+    RP.Score, 
+    RP.ViewCount, 
+    RP.CreationDate,
+    RP.LastActivityDate,
+    RP.Rank,
+    RP.OwnerUserId,
+    RC.BadgeCount,
+    RV.PostId AS VotedPostId,
+    RV.VoteType,
+    -- emulate MySQL's SUBSTRING_INDEX for tag extraction: split by comma and take nth element
+    -- use standard SQL: extract n-th element by splitting with regexp or string functions where available;
+    -- portable approach: use combination of substring and position for simple CSV without spaces
+    CASE
+      WHEN RP.Tags IS NULL THEN NULL
+      WHEN n.n = 1 THEN
+        CASE WHEN POSITION(',' IN RP.Tags) = 0 THEN RP.Tags ELSE SUBSTRING(RP.Tags FROM 1 FOR POSITION(',' IN RP.Tags)-1) END
+      ELSE
+        (SELECT
+           CASE
+             WHEN cnt = 0 THEN NULL
+             ELSE elem
+           END
+         FROM (
+           SELECT
+             split_elem.elem,
+             split_elem.idx,
+             (SELECT COUNT(*) FROM (VALUES (1)) AS dummy(cnt)) as cnt -- placeholder to allow structure; will be ignored
+           FROM (
+             -- split by locating nth comma boundaries
+             SELECT
+               SUBSTRING(
+                 RP.Tags FROM
+                   (CASE
+                      WHEN prev_pos = 0 THEN 1
+                      ELSE prev_pos + 1
+                    END)
+                   FOR (CASE WHEN curr_pos = 0 THEN CHAR_LENGTH(RP.Tags) - (CASE WHEN prev_pos = 0 THEN 0 ELSE prev_pos END) ELSE curr_pos - (CASE WHEN prev_pos = 0 THEN 1 ELSE prev_pos + 1 END) + 1 END)
+               ) AS elem,
+               n.n AS idx
+           ) AS split_elem
+         ) AS q
+        )
+    END AS Tag
+FROM 
+    RankedPosts RP
+LEFT JOIN 
+    BadgeCounts RC ON RP.OwnerUserId = RC.UserId
+LEFT JOIN 
+    RecentVotes RV ON RP.Id = RV.PostId
+CROSS JOIN 
+    nums n
+WHERE 
+    RP.Rank <= 5
+ORDER BY 
+    RP.Score DESC, RP.ViewCount DESC
+FETCH FIRST 100 ROWS ONLY;

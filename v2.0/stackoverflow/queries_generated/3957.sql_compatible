@@ -1,0 +1,161 @@
+WITH
+UserTier AS (
+    SELECT
+        u.Id                               AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        CASE
+            WHEN u.Reputation >= 20000 THEN 'Elite'
+            WHEN u.Reputation >= 10000 THEN 'Pro'
+            WHEN u.Reputation >=  5000 THEN 'Experienced'
+            WHEN u.Reputation >=  1000 THEN 'Intermediate'
+            ELSE                              'Newbie'
+        END                                 AS ReputationTier,
+        COUNT(b.Id)                         AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+LatestPost AS (
+    SELECT
+        p.OwnerUserId                    AS UserId,
+        p.Id                             AS PostId,
+        p.PostTypeId,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+),
+UserLatestPost AS (
+    SELECT
+        lp.UserId,
+        lp.PostId,
+        lp.PostTypeId,
+        COALESCE(lp.Title,
+                 (SELECT Title FROM Posts WHERE Id = lp.ParentId LIMIT 1)) AS TitleOrParentTitle,
+        lp.Score,
+        lp.CreationDate,
+        REPLACE(REPLACE(lp.Tags, '<', ''), '>', ';') AS CleanTags
+    FROM LatestPost lp
+    WHERE lp.rn = 1
+),
+
+UserVotes AS (
+    SELECT
+        p.OwnerUserId                     AS UserId,
+        COUNT(*)                          AS TotalVotesReceived,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoriteVotes,
+        AVG(EXTRACT(EPOCH FROM v.CreationDate))::double precision * 1 AS AvgVoteDate -- keep numeric avg of timestamps
+    FROM Posts p
+    JOIN Votes v ON v.PostId = p.Id
+    WHERE v.VoteTypeId IN (2,3,5)
+      AND p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+
+UserTagStats AS (
+    SELECT
+        ulp.UserId,
+        split.tag AS TagName,
+        t.Count                           AS GlobalTagCount,
+        ROW_NUMBER() OVER (PARTITION BY ulp.UserId ORDER BY t.Count DESC) AS TagRank
+    FROM UserLatestPost ulp,
+    LATERAL (
+        SELECT UNNEST(string_to_array(NULLIF(ulp.CleanTags, ''), ';')) AS tag
+    ) split
+    JOIN Tags t ON t.TagName = split.tag
+),
+
+Combined AS (
+    SELECT
+        COALESCE(ut.UserId, uv.UserId, up.UserId)                     AS UserId,
+        ut.DisplayName,
+        ut.ReputationTier,
+        ut.TotalBadges,
+        ut.GoldBadges,
+        ut.SilverBadges,
+        ut.BronzeBadges,
+        up.PostId,
+        up.PostTypeId,
+        up.TitleOrParentTitle,
+        up.Score                              AS LatestPostScore,
+        up.CreationDate                       AS LatestPostDate,
+        up.CleanTags,
+        uv.TotalVotesReceived,
+        uv.UpVotes,
+        uv.DownVotes,
+        uv.FavoriteVotes,
+        uv.AvgVoteDate,
+        (SELECT STRING_AGG(t.TagName, ', ')
+         FROM (
+             SELECT TagName
+             FROM UserTagStats uts
+             WHERE uts.UserId = COALESCE(ut.UserId, uv.UserId, up.UserId)
+             ORDER BY GlobalTagCount DESC
+             LIMIT 3
+         ) t)                                 AS Top3Tags
+    FROM UserTier ut
+    FULL OUTER JOIN UserVotes uv   ON uv.UserId = ut.UserId
+    FULL OUTER JOIN UserLatestPost up ON up.UserId = COALESCE(ut.UserId, uv.UserId)
+),
+
+UserPerformance AS (
+    SELECT
+        c.*,
+        ROW_NUMBER() OVER (ORDER BY 
+            CASE c.ReputationTier
+              WHEN 'Elite' THEN 1
+              WHEN 'Pro' THEN 2
+              WHEN 'Experienced' THEN 3
+              WHEN 'Intermediate' THEN 4
+              ELSE 5
+            END,
+            COALESCE(c.TotalBadges,0) DESC,
+            COALESCE(c.LatestPostScore,0) DESC
+        ) AS GlobalRank,
+        CASE 
+            WHEN c.ReputationTier = 'Elite' THEN 1
+            WHEN c.ReputationTier = 'Pro'   THEN 2
+            WHEN c.ReputationTier = 'Experienced' THEN 3
+            WHEN c.ReputationTier = 'Intermediate' THEN 4
+            ELSE 5
+        END AS TierPriority
+    FROM Combined c
+)
+SELECT
+    up.UserId,
+    up.DisplayName,
+    up.ReputationTier,
+    up.TotalBadges,
+    up.GoldBadges,
+    up.SilverBadges,
+    up.BronzeBadges,
+    up.LatestPostScore,
+    up.Top3Tags,
+    up.GlobalRank
+FROM UserPerformance up
+WHERE up.UserId IS NOT NULL
+UNION ALL
+SELECT
+    NULL AS UserId,
+    'Site-Wide Summary' AS DisplayName,
+    NULL AS ReputationTier,
+    SUM(TotalBadges)        AS TotalBadges,
+    SUM(GoldBadges)         AS GoldBadges,
+    SUM(SilverBadges)       AS SilverBadges,
+    SUM(BronzeBadges)       AS BronzeBadges,
+    AVG(LatestPostScore)    AS AvgLatestPostScore,
+    STRING_AGG(Top3Tags, '; ') AS AllTopTags,
+    NULL                    AS GlobalRank
+FROM UserPerformance
+WHERE ReputationTier IS NOT NULL
+ORDER BY GlobalRank;

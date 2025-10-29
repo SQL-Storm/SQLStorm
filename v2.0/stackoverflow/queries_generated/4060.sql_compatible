@@ -1,0 +1,146 @@
+WITH
+  RankedPostEdits AS (
+    SELECT
+      ph.PostId,
+      ph.UserId,
+      ph.CreationDate AS EditDate,
+      ph.PostHistoryTypeId,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM
+      PostHistory ph
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6)
+      AND ph.UserId IS NOT NULL
+  ),
+  LatestPostInfo AS (
+    SELECT
+      p.Id AS PostId,
+      p.OwnerUserId,
+      p.CreationDate AS PostCreationDate,
+      p.LastEditDate,
+      p.Score AS PostScore,
+      COALESCE(u.DisplayName, 'Deleted User') AS OwnerDisplayName,
+      COALESCE(
+        (
+          SELECT COUNT(*)
+          FROM Comments c
+          WHERE c.PostId = p.Id AND c.Score > 0
+        ),
+        0
+      ) AS PositiveCommentCount
+    FROM
+      Posts p
+      LEFT JOIN Users u
+        ON p.OwnerUserId = u.Id
+    WHERE
+      p.PostTypeId = 1
+  ),
+  UserPostActivity AS (
+    SELECT
+      lp.PostId,
+      lp.OwnerUserId,
+      lp.PostCreationDate,
+      lp.LastEditDate,
+      lp.PostScore,
+      lp.OwnerDisplayName,
+      lp.PositiveCommentCount,
+      rpe.UserId AS LastEditorId,
+      rpe.EditDate AS LastEditTimestamp,
+      CAST(
+        (EXTRACT(EPOCH FROM COALESCE(lp.LastEditDate, lp.PostCreationDate)) -
+         EXTRACT(EPOCH FROM lp.PostCreationDate)
+        ) / 86400
+        AS INTEGER
+      ) AS DaysSinceCreationOrLastEdit,
+      CASE WHEN lp.LastEditDate IS NOT NULL THEN 1 ELSE 0 END AS WasEdited
+    FROM
+      LatestPostInfo lp
+      LEFT JOIN RankedPostEdits rpe
+        ON lp.PostId = rpe.PostId AND rpe.rn = 1
+  ),
+  TagPopularity AS (
+    SELECT
+      t.TagName,
+      t.Count AS TagCount,
+      COALESCE(
+        (
+          SELECT SUM(p.Score)
+          FROM Posts p
+          INNER JOIN Tags t_inner
+            ON p.Id = t_inner.WikiPostId
+          WHERE t_inner.TagName = t.TagName
+        ),
+        0
+      ) AS TagScoreSum
+    FROM
+      Tags t
+    WHERE
+      t.IsModeratorOnly = 0
+  )
+SELECT
+  upa.PostId,
+  upa.OwnerDisplayName,
+  upa.PostScore,
+  upa.PositiveCommentCount,
+  upa.DaysSinceCreationOrLastEdit,
+  upa.WasEdited,
+  tp.TagName,
+  tp.TagCount,
+  tp.TagScoreSum,
+  CASE
+    WHEN upa.PostScore > 1000 AND upa.PositiveCommentCount > 50 THEN 'High Engagement'
+    WHEN upa.DaysSinceCreationOrLastEdit > 365 THEN 'Aging'
+    WHEN upa.WasEdited = 1 AND upa.LastEditTimestamp < (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30 days') THEN 'Stale Edit'
+    ELSE 'Standard'
+  END AS PostCategory,
+  COALESCE(
+    (
+      SELECT COUNT(DISTINCT ph_late.UserId)
+      FROM PostHistory ph_late
+      WHERE
+        ph_late.PostId = upa.PostId
+        AND ph_late.CreationDate > upa.PostCreationDate - INTERVAL '7 days'
+        AND ph_late.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20)
+    ),
+    0
+  ) AS RecentModerationCount,
+  CASE
+    WHEN CHAR_LENGTH(upa.OwnerDisplayName) > 20 THEN SUBSTRING(upa.OwnerDisplayName FROM 1 FOR 17) || '...'
+    ELSE upa.OwnerDisplayName
+  END AS TruncatedOwnerName,
+  CASE
+    WHEN tp.TagCount > 10000 THEN 'Very Popular'
+    WHEN tp.TagCount > 1000 THEN 'Popular'
+    ELSE 'Less Common'
+  END AS TagPopularityLevel,
+  UPPER(tp.TagName) AS UppercaseTagName
+FROM
+  UserPostActivity upa
+  LEFT JOIN Posts p_tags
+    ON upa.PostId = p_tags.Id
+  LEFT JOIN LATERAL (
+    SELECT
+      t.TagName,
+      t.TagCount,
+      t.TagScoreSum
+    FROM
+      TagPopularity t
+    WHERE
+      t.TagName IN (
+        SELECT TRIM(value)
+        FROM regexp_split_to_table(
+          REPLACE(REPLACE(COALESCE(p_tags.Tags, ''), '<', ''), '>', ''),
+          ','
+        ) AS value
+      )
+    ORDER BY t.TagCount DESC
+    LIMIT 1
+  ) tp ON TRUE
+WHERE
+  upa.PostScore >= 0
+  AND tp.TagName IS NOT NULL
+  AND tp.TagCount > 10
+ORDER BY
+  upa.PostScore DESC,
+  tp.TagCount DESC
+LIMIT 100;

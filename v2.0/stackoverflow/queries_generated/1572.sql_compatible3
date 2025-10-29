@@ -1,0 +1,211 @@
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COALESCE(SUM(P.Score), 0) AS TotalPostScore,
+        COALESCE(SUM(CASE WHEN P.PostTypeId = 1 THEN P.ViewCount ELSE 0 END), 0) AS TotalQuestionViews,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        COALESCE(SUM(CASE WHEN C.UserId = U.Id THEN C.Score ELSE 0 END), 0) AS TotalCommentScore,
+        MAX(P.CreationDate) AS LatestPostDate,
+        MIN(P.CreationDate) AS EarliestPostDate,
+        (COALESCE(COUNT(DISTINCT P.Id) * 0.5, 0) + COALESCE(COUNT(DISTINCT C.Id) * 0.3, 0) + COALESCE(SUM(P.Score) * 0.2, 0)) AS RawActivityScore
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    GROUP BY U.Id, U.DisplayName
+),
+PostHistoryInsights AS (
+    SELECT
+        PH.UserId,
+        COUNT(PH.Id) AS TotalHistoryEntries,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS TotalEditsMade,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (10, 11) THEN 1 ELSE 0 END) AS TotalCloseReopenVotes,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 2 THEN 1 ELSE 0 END) AS InitialBodySubmissions,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (8, 9) THEN 1 ELSE 0 END) AS TotalRollbacks,
+        MAX(PH.CreationDate) AS LastHistoryActivityDate
+    FROM PostHistory PH
+    WHERE PH.UserId IS NOT NULL
+    GROUP BY PH.UserId
+),
+UserBadgeStats AS (
+    SELECT
+        B.UserId,
+        COUNT(B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        SUM(CASE WHEN B.TagBased = TRUE THEN 1 ELSE 0 END) AS TagBasedBadges
+    FROM Badges B
+    GROUP BY B.UserId
+),
+TopQuestionTags AS (
+    SELECT
+        P.OwnerUserId AS UserId,
+        tag AS TagName,
+        COUNT(*) AS TagPostCount,
+        SUM(P.Score) AS TagScoreSum,
+        MAX(P.CreationDate) AS LastTagPostDate
+    FROM (
+        SELECT
+            P.*,
+            TRIM(BOTH '<>' FROM P.Tags) AS tags_str
+        FROM Posts P
+        WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL AND CHAR_LENGTH(P.Tags) > 2
+    ) P
+    CROSS JOIN (
+        SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5
+        UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9 UNION ALL SELECT 10
+        UNION ALL SELECT 11 UNION ALL SELECT 12 UNION ALL SELECT 13 UNION ALL SELECT 14 UNION ALL SELECT 15
+    ) nums
+    CROSS JOIN LATERAL (
+        SELECT
+            CASE
+                WHEN nums.n = 1 THEN
+                    CASE
+                        WHEN POSITION('><' IN P.tags_str) = 0 THEN P.tags_str
+                        ELSE SUBSTRING(P.tags_str FROM 1 FOR POSITION('><' IN P.tags_str) - 1)
+                    END
+                ELSE
+                    (
+                        WITH offsets AS (
+                            SELECT
+                                nums.n AS n,
+                                P.tags_str AS s,
+                                (CASE WHEN nums.n = 1 THEN 0 ELSE (
+                                    -- Portable iterative locate: simulate finding the start position of the nth tag by repeated searches.
+                                    -- We implement a simple loop-like sequence for up to a few elements; for portability, fallback to NULL if not found.
+                                    (SELECT COALESCE(MAX(pos),0) FROM (
+                                        SELECT
+                                            CASE WHEN POSITION('><' IN s) = 0 THEN 0 ELSE POSITION('><' IN s) + 1 END AS pos,
+                                            1 AS r
+                                        UNION ALL
+                                        SELECT
+                                            CASE
+                                                WHEN POSITION('><' IN SUBSTRING(s FROM POSITION('><' IN s) + 2)) = 0 THEN 0
+                                                ELSE POSITION('><' IN s) + 1 + POSITION('><' IN SUBSTRING(s FROM POSITION('><' IN s) + 2))
+                                            END AS pos,
+                                            2 AS r
+                                        UNION ALL
+                                        SELECT
+                                            CASE
+                                                WHEN POSITION('><' IN SUBSTRING(s FROM (POSITION('><' IN s) + 2 + CASE WHEN POSITION('><' IN SUBSTRING(s FROM POSITION('><' IN s) + 2)) = 0 THEN 0 ELSE POSITION('><' IN s) + 2 END))) = 0 THEN 0
+                                                ELSE POSITION('><' IN s) + 1 + POSITION('><' IN SUBSTRING(s FROM POSITION('><' IN s) + 2)) + POSITION('><' IN SUBSTRING(s FROM (POSITION('><' IN s) + 2 + CASE WHEN POSITION('><' IN SUBSTRING(s FROM POSITION('><' IN s) + 2)) = 0 THEN 0 ELSE POSITION('><' IN s) + 2 END)))
+                                            END AS pos,
+                                            3 AS r
+                                        ) t WHERE r = nums.n - 1
+                                ) END) AS startpos
+                        )
+                        SELECT
+                            CASE
+                                WHEN startpos = 0 THEN NULL
+                                ELSE
+                                    SUBSTRING(s FROM startpos + 2 FOR 
+                                        CASE
+                                            WHEN POSITION('><' IN SUBSTRING(s FROM startpos + 2)) = 0 THEN CHAR_LENGTH(SUBSTRING(s FROM startpos + 2))
+                                            ELSE POSITION('><' IN SUBSTRING(s FROM startpos + 2)) - 1
+                                        END
+                                    )
+                            END
+                        FROM offsets
+                    )
+            END AS tag
+    ) t
+    WHERE t.tag IS NOT NULL AND CHAR_LENGTH(t.tag) > 0
+    GROUP BY P.OwnerUserId, t.tag
+    HAVING COUNT(*) >= 5
+),
+RankedTopQuestionTags AS (
+    SELECT
+        UserId,
+        TagName,
+        TagPostCount,
+        TagScoreSum,
+        LastTagPostDate,
+        ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY TagPostCount DESC, TagScoreSum DESC, LastTagPostDate DESC) as rn
+    FROM TopQuestionTags
+)
+SELECT
+    U.Id AS UserIdentifier,
+    U.DisplayName,
+    U.Reputation,
+    U.CreationDate AS UserCreationDate,
+    U.LastAccessDate,
+    U.Views AS UserProfileViews,
+    U.UpVotes AS TotalUpVotesGiven,
+    U.DownVotes AS TotalDownVotesGiven,
+    COALESCE(UE.TotalPosts, 0) AS UserTotalPosts,
+    COALESCE(UE.TotalQuestions, 0) AS UserTotalQuestions,
+    COALESCE(UE.TotalAnswers, 0) AS UserTotalAnswers,
+    COALESCE(UE.TotalPostScore, 0) AS UserTotalPostScore,
+    COALESCE(UE.TotalQuestionViews, 0) AS UserTotalQuestionViews,
+    COALESCE(UE.TotalCommentsMade, 0) AS UserTotalCommentsMade,
+    COALESCE(UE.TotalCommentScore, 0) AS UserTotalCommentScore,
+    COALESCE(PHI.TotalEditsMade, 0) AS UserTotalEditsMade,
+    COALESCE(PHI.TotalCloseReopenVotes, 0) AS UserTotalCloseReopenVotes,
+    COALESCE(UBS.GoldBadges, 0) AS UserGoldBadges,
+    COALESCE(UBS.SilverBadges, 0) AS UserSilverBadges,
+    COALESCE(UBS.BronzeBadges, 0) AS UserBronzeBadges,
+    COALESCE(UBS.TotalBadges, 0) AS UserTotalBadges,
+    U.Location,
+    U.AboutMe,
+    RTQT.TagName AS TopTagByPostCount,
+    RTQT.TagPostCount AS TopTagPosts,
+    RTQT.TagScoreSum AS TopTagScore,
+    RANK() OVER (ORDER BY U.Reputation DESC) AS GlobalReputationRank,
+    NTILE(10) OVER (ORDER BY COALESCE(UE.RawActivityScore, 0) DESC) AS ActivityDecile,
+    AVG(U.Reputation) OVER (PARTITION BY EXTRACT(YEAR FROM U.CreationDate)) AS AvgReputationInCreationYear,
+    (
+        SELECT COALESCE(AVG(P_Corr.Score), 0.0)
+        FROM Comments C_Corr
+        JOIN Posts P_Corr ON C_Corr.PostId = P_Corr.Id
+        WHERE C_Corr.UserId IN (
+            SELECT C2.UserId
+            FROM Comments C2
+            WHERE C2.PostId IN (SELECT P3.Id FROM Posts P3 WHERE P3.OwnerUserId = U.Id)
+            AND C2.UserId IS NOT NULL
+        )
+        AND P_Corr.OwnerUserId IS NOT NULL
+        AND P_Corr.OwnerUserId <> U.Id
+    ) AS AvgScoreOfRelatedUserPosts,
+    (
+        CASE
+            WHEN U.Reputation > 0
+            THEN (COALESCE(UE.RawActivityScore, 0) + COALESCE(PHI.TotalEditsMade, 0) * 0.1 + COALESCE(UBS.TotalBadges, 0) * 0.05) / U.Reputation
+            ELSE 0.0
+        END
+    ) AS EngagementReputationRatio,
+    LOWER(SUBSTRING(U.DisplayName FROM 1 FOR 3)) AS DisplayNamePrefix,
+    CHAR_LENGTH(COALESCE(U.AboutMe, '')) AS AboutMeLength,
+    CASE
+        WHEN U.LastAccessDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30' DAY THEN 'Active'
+        WHEN U.LastAccessDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1' YEAR THEN 'Recently Active'
+        ELSE 'Inactive'
+    END AS UserActivityStatus,
+    COALESCE(U.Location, 'Unknown') AS UserLocationDisplay,
+    (
+        (U.Reputation > 5000 AND COALESCE(UE.TotalPosts, 0) > 50 AND COALESCE(PHI.TotalEditsMade, 0) > 10)
+        OR (COALESCE(UBS.GoldBadges, 0) > 0 AND COALESCE(UE.TotalCommentsMade, 0) > 100)
+        OR (U.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2' YEAR AND COALESCE(UE.RawActivityScore, 0) > 100)
+    ) AS IsKeyContributorCandidate
+FROM Users U
+LEFT JOIN UserEngagement UE ON U.Id = UE.UserId
+LEFT JOIN PostHistoryInsights PHI ON U.Id = PHI.UserId
+LEFT JOIN UserBadgeStats UBS ON U.Id = UBS.UserId
+LEFT JOIN RankedTopQuestionTags RTQT ON U.Id = RTQT.UserId AND RTQT.rn = 1
+WHERE
+    U.Reputation IS NOT NULL AND U.Reputation > 1
+    AND U.DisplayName IS NOT NULL AND CHAR_LENGTH(U.DisplayName) > 0
+    AND U.LastAccessDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '5' YEAR
+    AND (
+        (COALESCE(UE.RawActivityScore, 0) > 50)
+        OR (COALESCE(PHI.TotalEditsMade, 0) > 5)
+        OR (COALESCE(UBS.TotalBadges, 0) > 5 AND COALESCE(UBS.SilverBadges, 0) > 0)
+    )
+ORDER BY
+    GlobalReputationRank ASC,
+    UserTotalPostScore DESC,
+    UserTotalEditsMade DESC
+LIMIT 5000;

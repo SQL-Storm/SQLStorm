@@ -1,0 +1,152 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS Questions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS Answers,
+        AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL) AS AvgScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+GoldBadgeUsers AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) AS GoldBadgeCount
+    FROM Badges b
+    WHERE b.Class = 1
+    GROUP BY b.UserId
+),
+TagInfo AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagUseCount,
+        COALESCE(e.Title, w.Title) AS TagTitle
+    FROM Tags t
+    LEFT JOIN Posts e ON e.Id = t.ExcerptPostId
+    LEFT JOIN Posts w ON w.Id = t.WikiPostId
+),
+RecentVotes AS (
+    SELECT 
+        v.UserId,
+        COUNT(*) AS RecentVoteCount,
+        SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS RecentUpVotes,
+        SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS RecentDownVotes
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE v.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '30 days')
+    GROUP BY v.UserId
+),
+UserTagActivity AS (
+    -- rewrite tag splitting using standard SQL: remove leading/trailing <> then split by '><'
+    -- Use a generic string-split approach via a recursive CTE to be dialect-friendly
+    SELECT
+        p.OwnerUserId AS UserId,
+        tag AS Tag,
+        COUNT(*) AS PostsWithTag
+    FROM (
+        SELECT
+            OwnerUserId,
+            -- trim leading '<' and trailing '>' if present
+            CASE
+                WHEN Tags LIKE '<%' AND Tags LIKE '%>' THEN SUBSTR(Tags, 2, LENGTH(Tags) - 2)
+                ELSE Tags
+            END AS tags_inner
+        FROM Posts
+        WHERE Tags IS NOT NULL
+    ) posts_expanded
+    CROSS JOIN LATERAL (
+        -- split tags_inner on '><' using a recursive split emulation
+        WITH RECURSIVE split(idx, rest, tag) AS (
+            SELECT 1,
+                   posts_expanded.tags_inner,
+                   NULL
+            UNION ALL
+            SELECT
+                idx + 1,
+                CASE
+                    WHEN INSTR(rest, '><') > 0 THEN SUBSTR(rest, INSTR(rest, '><') + 2)
+                    ELSE ''
+                END,
+                CASE
+                    WHEN INSTR(rest, '><') > 0 THEN SUBSTR(rest, 1, INSTR(rest, '><') - 1)
+                    ELSE rest
+                END
+            FROM split
+            WHERE rest <> ''
+        )
+        SELECT tag FROM split WHERE tag IS NOT NULL
+    ) s(tag)
+    JOIN Posts p ON p.OwnerUserId = posts_expanded.OwnerUserId AND posts_expanded.tags_inner IS NOT NULL
+    GROUP BY p.OwnerUserId, tag
+),
+MainResult AS (
+    SELECT
+        us.Id,
+        us.DisplayName,
+        us.Reputation,
+        us.ReputationRank,
+        us.TotalPosts,
+        us.Questions,
+        us.Answers,
+        ROUND(us.AvgScore, 2) AS AvgScore,
+        COALESCE(gb.GoldBadgeCount, 0) AS GoldBadgeCount,
+        COALESCE(rv.RecentVoteCount, 0) AS RecentVoteCount,
+        COALESCE(rv.RecentUpVotes, 0) AS RecentUpVotes,
+        COALESCE(rv.RecentDownVotes, 0) AS RecentDownVotes,
+        STRING_AGG(DISTINCT ti.TagName, ', ') FILTER (WHERE ti.TagUseCount > 1000) AS PopularTags,
+        MAX(ut.Tag) OVER (PARTITION BY us.Id ORDER BY ut.PostsWithTag DESC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS TopTagByPosts,
+        CASE
+            WHEN us.ReputationRank <= 10 THEN 'Top10'
+            WHEN us.ReputationRank <= 100 THEN 'Top100'
+            ELSE 'Other'
+        END AS ReputationTier,
+        CASE 
+            WHEN us.LastPostDate IS NULL THEN 'NeverPosted'
+            WHEN us.LastPostDate < (CAST('2024-10-01' AS DATE) - INTERVAL '1 year') THEN 'Stale'
+            ELSE 'Active'
+        END AS ActivityStatus
+    FROM UserStats us
+    LEFT JOIN GoldBadgeUsers gb   ON gb.UserId = us.Id
+    LEFT JOIN RecentVotes rv      ON rv.UserId = us.Id
+    LEFT JOIN UserTagActivity ut  ON ut.UserId = us.Id
+    LEFT JOIN TagInfo ti          ON ti.TagName = ut.Tag
+    WHERE us.Reputation > 0
+    GROUP BY
+        us.Id, us.DisplayName, us.Reputation, us.ReputationRank,
+        us.TotalPosts, us.Questions, us.Answers, us.AvgScore,
+        gb.GoldBadgeCount, rv.RecentVoteCount, rv.RecentUpVotes,
+        rv.RecentDownVotes, us.LastPostDate, ut.Tag, ut.PostsWithTag
+    HAVING COUNT(DISTINCT ti.TagName) > 0
+    ORDER BY us.ReputationRank
+    LIMIT 100
+)
+SELECT * FROM MainResult
+
+UNION ALL
+
+SELECT
+    NULL AS Id,
+    'Aggregate Summary' AS DisplayName,
+    NULL AS Reputation,
+    NULL AS ReputationRank,
+    SUM(us.TotalPosts) AS TotalPosts,
+    SUM(us.Questions) AS Questions,
+    SUM(us.Answers) AS Answers,
+    ROUND(AVG(us.AvgScore), 2) AS AvgScore,
+    SUM(COALESCE(gb.GoldBadgeCount,0)) AS GoldBadgeCount,
+    SUM(COALESCE(rv.RecentVoteCount,0)) AS RecentVoteCount,
+    SUM(COALESCE(rv.RecentUpVotes,0)) AS RecentUpVotes,
+    SUM(COALESCE(rv.RecentDownVotes,0)) AS RecentDownVotes,
+    NULL AS PopularTags,
+    NULL AS TopTagByPosts,
+    NULL AS ReputationTier,
+    NULL AS ActivityStatus
+FROM UserStats us
+LEFT JOIN GoldBadgeUsers gb   ON gb.UserId = us.Id
+LEFT JOIN RecentVotes rv      ON rv.UserId = us.Id
+WHERE us.Reputation > 0;

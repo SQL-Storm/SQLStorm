@@ -1,0 +1,194 @@
+WITH UserEngagementSummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT P.Id) AS TotalPostsAuthored,
+        COUNT(DISTINCT C.Id) AS TotalCommentsAuthored,
+        COUNT(DISTINCT B.Id) AS TotalBadgesEarned,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesGiven,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesGiven,
+        SUM(CASE WHEN PV.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesReceivedOnPosts,
+        SUM(CASE WHEN PV.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesReceivedOnPosts,
+        NTILE(4) OVER (ORDER BY U.Reputation DESC) AS ReputationQuartile,
+        AVG(CASE WHEN P_Owned.PostTypeId = 1 THEN P_Owned.Score END) AS AvgQuestionScoreOnOwnPosts,
+        SUM(CASE WHEN U.LastAccessDate > U.CreationDate + INTERVAL '1 year' THEN 1 ELSE 0 END) AS ActiveAfterFirstYear,
+        CASE WHEN COALESCE(U.AboutMe, '') LIKE '%developer%' THEN TRUE ELSE FALSE END AS IsDeveloperInAboutMe,
+        U.LastAccessDate,
+        U.AboutMe
+    FROM
+        Users U
+    LEFT JOIN
+        Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN
+        Comments C ON U.Id = C.UserId
+    LEFT JOIN
+        Badges B ON U.Id = B.UserId
+    LEFT JOIN
+        Votes V ON U.Id = V.UserId
+    LEFT JOIN
+        Posts P_Owned ON U.Id = P_Owned.OwnerUserId
+    LEFT JOIN
+        Votes PV ON P_Owned.Id = PV.PostId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.AboutMe
+),
+PostActivityMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.FavoriteCount,
+        COUNT(DISTINCT C.Id) AS TotalCommentsOnPost,
+        SUM(CASE WHEN V.VoteTypeId IN (2, 5) THEN 1 ELSE 0 END) AS UpvotesAndFavoritesOnPost,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesOnPost,
+        DENSE_RANK() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.ViewCount DESC) AS RankByScoreAndView,
+        EXTRACT(EPOCH FROM (P.LastActivityDate - P.CreationDate)) / 3600 AS HoursSinceCreationToLastActivity,
+        (SELECT U2.DisplayName FROM Users U2 WHERE U2.Id = P.OwnerUserId) AS PostOwnerDisplayNameFallback,
+        (SELECT AcceptedAnswer.Score FROM Posts AcceptedAnswer WHERE AcceptedAnswer.Id = P.AcceptedAnswerId) AS AcceptedAnswerScore,
+        CASE
+            WHEN P.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN P.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+            ELSE 'Open'
+        END AS PostStatus,
+        SUM(CASE WHEN V.VoteTypeId IN (8,9) THEN COALESCE(V.BountyAmount,0) ELSE 0 END) AS TotalBountyAmount,
+        COUNT(DISTINCT PH.UserId) FILTER (WHERE PH.PostHistoryTypeId IN (4,5,6)) AS UniqueEditorsCount,
+        P.LastActivityDate,
+        P.ClosedDate,
+        P.CommunityOwnedDate,
+        P.OwnerUserId,
+        P.AcceptedAnswerId
+    FROM
+        Posts P
+    LEFT JOIN
+        Comments C ON P.Id = C.PostId
+    LEFT JOIN
+        Votes V ON P.Id = V.PostId
+    LEFT JOIN
+        PostHistory PH ON P.Id = PH.PostId
+    GROUP BY
+        P.Id, P.PostTypeId, P.CreationDate, P.Score, P.ViewCount, P.AnswerCount, P.FavoriteCount, P.LastActivityDate, P.ClosedDate, P.CommunityOwnedDate, P.OwnerUserId, P.AcceptedAnswerId
+),
+-- Break the window-using calculations out so they are not inside aggregates
+PostHistoryWindows AS (
+    SELECT
+        PH.*,
+        LAG(PH.PostHistoryTypeId) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) AS PrevPostHistoryTypeId,
+        LEAD(PH.PostHistoryTypeId) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) AS NextPostHistoryTypeId
+    FROM PostHistory PH
+    WHERE PH.PostHistoryTypeId IN (10, 11, 12, 13, 17, 35, 36)
+),
+HistoricalEventAnalysis AS (
+    SELECT
+        phw.PostId,
+        MAX(CASE WHEN phw.PostHistoryTypeId = 10 THEN phw.CreationDate END) AS LastClosedDateFromHistory,
+        MAX(CASE WHEN phw.PostHistoryTypeId = 11 THEN phw.CreationDate END) AS LastReopenedDateFromHistory,
+        COUNT(CASE WHEN phw.PostHistoryTypeId = 10 THEN 1 END) AS CloseCount,
+        COUNT(CASE WHEN phw.PostHistoryTypeId = 11 THEN 1 END) AS ReopenCount,
+        MAX(CASE
+            WHEN phw.PostHistoryTypeId = 11 AND phw.PrevPostHistoryTypeId = 10
+            THEN phw.CreationDate
+        END) AS LastReopenAfterCloseDate,
+        MAX(CASE WHEN phw.PostHistoryTypeId = 35 AND phw.NextPostHistoryTypeId = 36 THEN TRUE ELSE FALSE END) AS MigratedAwayAndBack
+    FROM
+        PostHistoryWindows phw
+    GROUP BY
+        phw.PostId
+),
+TagPerformanceMetrics AS (
+    SELECT
+        T.TagName,
+        COUNT(DISTINCT P.Id) AS PostsWithTag,
+        AVG(P.Score) AS AvgScoreForTag,
+        SUM(P.ViewCount) AS TotalViewsForTag,
+        MAX(P.CreationDate) AS LatestPostDateForTag,
+        MIN(P.CreationDate) AS OldestPostDateForTag,
+        (SELECT COUNT(DISTINCT Badges.UserId) FROM Badges WHERE Badges.Name = T.TagName AND Badges.TagBased = TRUE) AS TagBadgeHoldersCount
+    FROM
+        Tags T
+    JOIN
+        Posts P ON P.Tags LIKE '%' || T.TagName || '%'
+    GROUP BY
+        T.TagName
+)
+SELECT
+    P.Id AS PostId,
+    P.Title,
+    P.Body,
+    P.CreationDate AS PostCreationDate,
+    P.Score,
+    P.ViewCount,
+    U.DisplayName AS OwnerDisplayName,
+    UES.Reputation AS OwnerReputation,
+    UES.TotalPostsAuthored AS OwnerTotalPosts,
+    UES.AvgQuestionScoreOnOwnPosts,
+    PAM.TotalCommentsOnPost,
+    PAM.UpvotesAndFavoritesOnPost,
+    PAM.DownvotesOnPost,
+    PAM.PostStatus,
+    PAM.RankByScoreAndView,
+    TPM.TagName AS DominantTagName,
+    TPM.AvgScoreForTag,
+    TPM.PostsWithTag,
+    HEA.CloseCount,
+    HEA.ReopenCount,
+    HEA.LastReopenAfterCloseDate,
+    HEA.MigratedAwayAndBack,
+    COALESCE(P.LastEditorDisplayName, 'No Recent Editor Name') AS LastEditorDisplayName,
+    EXTRACT(YEAR FROM P.CreationDate) AS CreationYear,
+    LENGTH(P.Body) AS BodyLength,
+    (P.Score * 1.0 / GREATEST(COALESCE(P.ViewCount, 0), 1)) AS ScoreToViewRatio,
+    (UES.TotalUpvotesReceivedOnPosts * 1.0 / GREATEST((UES.TotalUpvotesReceivedOnPosts + UES.TotalDownvotesReceivedOnPosts), 1)) AS OwnerUpvoteRatio,
+    CASE
+        WHEN P.ViewCount > 50000 AND P.Score > 200 THEN 'Viral Impact'
+        WHEN P.ViewCount > 10000 AND P.Score > 50 THEN 'High Impact'
+        WHEN P.ViewCount > 1000 OR P.Score > 10 THEN 'Medium Impact'
+        ELSE 'Low Impact'
+    END AS PostImpactCategory,
+    'https://stackoverflow.com/questions/' || P.Id AS PostUrl,
+    SUM(P.FavoriteCount) OVER (PARTITION BY UES.ReputationQuartile) AS TotalFavoritesInOwnerReputationQuartile,
+    AVG(PAM.AcceptedAnswerScore) OVER (PARTITION BY P.PostTypeId) AS AvgAcceptedAnswerScoreForPostType,
+    AVG(PAM.TotalBountyAmount) OVER (PARTITION BY P.PostTypeId) AS AvgBountyForPostType,
+    MAX(PAM.UniqueEditorsCount) OVER (PARTITION BY P.Id) AS MaxUniqueEditorsOnPost,
+    LOWER(SUBSTRING(P.Title FROM 1 FOR 50)) AS TruncatedLowerTitle,
+    (P.OwnerUserId IS NOT NULL AND P.AcceptedAnswerId IS NULL AND PAM.AnswerCount > 0) AS HasUnacceptedAnswers,
+    UES.ReputationQuartile,
+    PAM.PostTypeId,
+    PAM.HoursSinceCreationToLastActivity
+FROM
+    Posts P
+INNER JOIN
+    Users U ON P.OwnerUserId = U.Id
+LEFT JOIN
+    UserEngagementSummary UES ON U.Id = UES.UserId
+LEFT JOIN
+    PostActivityMetrics PAM ON P.Id = PAM.PostId
+LEFT JOIN
+    HistoricalEventAnalysis HEA ON P.Id = HEA.PostId
+LEFT JOIN LATERAL (
+    SELECT T_Lat.TagName, TPM_Lat.AvgScoreForTag, TPM_Lat.PostsWithTag
+    FROM unnest(string_to_array(substring(P.Tags, 2, char_length(P.Tags)-2), '><')) AS PostTag(tag)
+    JOIN TagPerformanceMetrics TPM_Lat ON PostTag.tag = TPM_Lat.TagName
+    ORDER BY TPM_Lat.PostsWithTag DESC, TPM_Lat.AvgScoreForTag DESC
+    LIMIT 1
+) TPM ON TRUE
+WHERE
+    P.PostTypeId = 1
+    AND P.CreationDate >= DATE '2023-01-01'
+    AND COALESCE(P.ViewCount, 0) > 100
+    AND P.Tags IS NOT NULL
+    AND (
+        LOWER(P.Title) LIKE '%sql%'
+        OR LOWER(P.Body) LIKE '%database%'
+        OR LOWER(P.Tags) LIKE '%<performance>%'
+    )
+    AND UES.ReputationQuartile = 1
+    AND PAM.HoursSinceCreationToLastActivity > 24 * 7
+    AND (HEA.CloseCount IS NULL OR HEA.CloseCount < 2)
+ORDER BY
+    UES.Reputation DESC, P.Score DESC, P.CreationDate DESC
+LIMIT 1000;

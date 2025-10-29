@@ -1,0 +1,106 @@
+WITH UserPostStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS Questions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS Answers,
+        AVG(NULLIF(p.Score, 0)) AS AvgScore,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+UserBadgeStats AS (
+    SELECT
+        b.UserId,
+        COUNT(*) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS Gold,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS Silver,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS Bronze,
+        SUM(CASE WHEN b.TagBased = TRUE THEN 1 ELSE 0 END) AS TagBased
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserVoteStats AS (
+    SELECT
+        v.UserId,
+        COUNT(*) AS TotalVotesCast,
+        SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotesGiven,
+        SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotesGiven,
+        SUM(CASE WHEN vt.Name = 'BountyStart' THEN COALESCE(v.BountyAmount, 0) ELSE 0 END) AS BountyStarted
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY v.UserId
+),
+RecentActiveUsers AS (
+    SELECT u.Id
+    FROM Users u
+    WHERE u.LastAccessDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '30' DAY)
+),
+TopTagsByUser AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        STRING_AGG(DISTINCT tag_table.tag, ',') AS TopTags
+    FROM Posts p
+    CROSS JOIN LATERAL (
+        SELECT regexp_split_to_table(
+            regexp_replace(p.Tags, '^<|>$', ''),
+            '><'
+        ) AS tag
+    ) AS tag_table
+    JOIN Tags t ON t.TagName = tag_table.tag
+    WHERE p.PostTypeId = 1
+      AND p.Tags IS NOT NULL
+    GROUP BY p.OwnerUserId
+)
+SELECT
+    up.UserId,
+    up.DisplayName,
+    up.TotalPosts,
+    up.Questions,
+    up.Answers,
+    up.AvgScore,
+    ub.TotalBadges,
+    ub.Gold,
+    ub.Silver,
+    ub.Bronze,
+    ub.TagBased,
+    uv.TotalVotesCast,
+    uv.UpVotesGiven,
+    uv.DownVotesGiven,
+    uv.BountyStarted,
+    CASE
+        WHEN up.LastPostDate IS NULL THEN 'Never posted'
+        ELSE to_char(up.LastPostDate, 'YYYY-MM-DD')
+    END AS LastPostDateStr,
+    CASE WHEN ru.Id IS NOT NULL THEN 1 ELSE 0 END AS IsRecentlyActive,
+    COALESCE(tt.TopTags, '') AS TopTags
+FROM UserPostStats up
+LEFT JOIN UserBadgeStats ub ON ub.UserId = up.UserId
+LEFT JOIN UserVoteStats uv ON uv.UserId = up.UserId
+LEFT JOIN RecentActiveUsers ru ON ru.Id = up.UserId
+LEFT JOIN TopTagsByUser tt ON tt.UserId = up.UserId
+WHERE (up.TotalPosts > 0 OR COALESCE(ub.TotalBadges, 0) > 0)
+GROUP BY
+    up.UserId,
+    up.DisplayName,
+    up.TotalPosts,
+    up.Questions,
+    up.Answers,
+    up.AvgScore,
+    up.LastPostDate,
+    ub.TotalBadges,
+    ub.Gold,
+    ub.Silver,
+    ub.Bronze,
+    ub.TagBased,
+    uv.TotalVotesCast,
+    uv.UpVotesGiven,
+    uv.DownVotesGiven,
+    uv.BountyStarted,
+    ru.Id,
+    tt.TopTags
+ORDER BY (up.TotalPosts * COALESCE(ub.TotalBadges, 0)) DESC
+LIMIT 100
+OFFSET 0;

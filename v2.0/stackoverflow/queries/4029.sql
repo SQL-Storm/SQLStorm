@@ -1,0 +1,149 @@
+WITH
+  UserPostInteraction AS (
+    SELECT
+      p.Id AS PostId,
+      p.OwnerUserId,
+      p.PostTypeId,
+      p.CreationDate AS PostCreationDate,
+      p.Score AS PostScore,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      p.ClosedDate,
+      u.DisplayName AS OwnerDisplayName,
+      u.Reputation AS OwnerReputation,
+      u.CreationDate AS OwnerCreationDate,
+      COUNT(DISTINCT c.Id) AS CommentCountOnPost,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+      SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoriteVoteCount
+    FROM Posts p
+    LEFT JOIN Users u
+      ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c
+      ON p.Id = c.PostId
+    LEFT JOIN Votes v
+      ON p.Id = v.PostId
+    WHERE
+      p.PostTypeId IN (1, 2) AND p.OwnerUserId IS NOT NULL
+    GROUP BY
+      p.Id,
+      p.OwnerUserId,
+      p.PostTypeId,
+      p.CreationDate,
+      p.Score,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      p.ClosedDate,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate
+  ),
+  PostHistorySummary AS (
+    SELECT
+      ph.PostId,
+      COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (1, 4, 7) THEN ph.Id ELSE NULL END) AS TitleEdits,
+      COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (2, 5, 8) THEN ph.Id ELSE NULL END) AS BodyEdits,
+      COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (3, 6, 9) THEN ph.Id ELSE NULL END) AS TagEdits,
+      MAX(ph.CreationDate) AS LastHistoryDate
+    FROM PostHistory ph
+    WHERE
+      ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 7, 8, 9)
+    GROUP BY
+      ph.PostId
+  ),
+  PostAge AS (
+    SELECT
+      Id,
+      PostTypeId,
+      CreationDate,
+      DATE_PART('day', (CAST('2024-10-01 12:34:56' AS timestamp) - CreationDate)) AS DaysSinceCreation
+    FROM Posts
+  ),
+  UserActivity AS (
+    SELECT
+      OwnerUserId AS UserId,
+      COUNT(Id) AS TotalPostsByThisUser,
+      AVG(Score) AS AvgScoreOfPostsByThisUser
+    FROM Posts
+    WHERE
+      OwnerUserId IS NOT NULL
+    GROUP BY
+      OwnerUserId
+  )
+SELECT
+  upi.PostId,
+  upi.OwnerDisplayName,
+  upi.OwnerReputation,
+  upi.OwnerCreationDate,
+  upi.PostCreationDate,
+  pa.DaysSinceCreation,
+  upi.PostScore,
+  upi.AnswerCount,
+  upi.CommentCountOnPost,
+  upi.UpVoteCount,
+  upi.DownVoteCount,
+  upi.FavoriteVoteCount,
+  COALESCE(phs.TitleEdits, 0) AS TotalTitleEdits,
+  COALESCE(phs.BodyEdits, 0) AS TotalBodyEdits,
+  COALESCE(phs.TagEdits, 0) AS TotalTagEdits,
+  CASE WHEN upi.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS PostStatus,
+  CASE WHEN upi.AnswerCount > 0 AND upi.PostTypeId = 1 THEN CAST(up.TotalPostsByThisUser AS numeric) / upi.AnswerCount ELSE NULL END AS PostAnswerRatio,
+  CASE WHEN upi.PostScore > 0 THEN CHAR_LENGTH(upi.OwnerDisplayName) * upi.PostScore ELSE 0 END AS WeightedScore,
+  UPPER(SUBSTRING(upi.OwnerDisplayName FROM 1 FOR 1)) AS OwnerInitial,
+  CASE
+    WHEN upi.OwnerReputation > 100000 THEN 'Legendary'
+    WHEN upi.OwnerReputation > 50000 THEN 'Expert'
+    WHEN upi.OwnerReputation > 10000 THEN 'Experienced'
+    WHEN upi.OwnerReputation > 1000 THEN 'Proficient'
+    ELSE 'Novice'
+  END AS ReputationTier,
+  COALESCE(up.AvgScoreOfPostsByThisUser, 0) AS AvgUserPostScore
+FROM UserPostInteraction upi
+LEFT JOIN PostHistorySummary phs
+  ON upi.PostId = phs.PostId
+LEFT JOIN PostAge pa
+  ON upi.PostId = pa.Id
+LEFT JOIN UserActivity up
+  ON upi.OwnerUserId = up.UserId
+WHERE
+  upi.PostTypeId = 1 AND upi.PostScore > 10 AND pa.DaysSinceCreation > 30 AND (upi.OwnerReputation > 5000 OR COALESCE(phs.BodyEdits, 0) > 2)
+UNION ALL
+SELECT
+  upi.PostId,
+  upi.OwnerDisplayName,
+  upi.OwnerReputation,
+  upi.OwnerCreationDate,
+  upi.PostCreationDate,
+  pa.DaysSinceCreation,
+  upi.PostScore,
+  upi.AnswerCount,
+  upi.CommentCountOnPost,
+  upi.UpVoteCount,
+  upi.DownVoteCount,
+  upi.FavoriteVoteCount,
+  COALESCE(phs.TitleEdits, 0) AS TotalTitleEdits,
+  COALESCE(phs.BodyEdits, 0) AS TotalBodyEdits,
+  COALESCE(phs.TagEdits, 0) AS TotalTagEdits,
+  CASE WHEN upi.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS PostStatus,
+  NULL AS PostAnswerRatio,
+  CASE WHEN upi.PostScore > 0 THEN CHAR_LENGTH(upi.OwnerDisplayName) * upi.PostScore ELSE 0 END AS WeightedScore,
+  UPPER(SUBSTRING(upi.OwnerDisplayName FROM 1 FOR 1)) AS OwnerInitial,
+  CASE
+    WHEN upi.OwnerReputation > 100000 THEN 'Legendary'
+    WHEN upi.OwnerReputation > 50000 THEN 'Expert'
+    WHEN upi.OwnerReputation > 10000 THEN 'Experienced'
+    WHEN upi.OwnerReputation > 1000 THEN 'Proficient'
+    ELSE 'Novice'
+  END AS ReputationTier,
+  COALESCE(ua.AvgScoreOfPostsByThisUser, 0) AS AvgUserPostScore
+FROM UserPostInteraction upi
+JOIN PostHistorySummary phs
+  ON upi.PostId = phs.PostId
+JOIN PostAge pa
+  ON upi.PostId = pa.Id
+LEFT JOIN UserActivity ua
+  ON upi.OwnerUserId = ua.UserId
+WHERE
+  upi.PostTypeId = 2 AND upi.PostScore > 5 AND pa.DaysSinceCreation < 7 AND COALESCE(phs.BodyEdits, 0) > 0;

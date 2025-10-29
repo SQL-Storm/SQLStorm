@@ -1,0 +1,208 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MIN(p.CreationDate) as FirstPostDate,
+        EXTRACT(DAY FROM (MAX(p.CreationDate) - MIN(p.CreationDate))) as DaysActive,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Elite'
+            WHEN u.Reputation > 5000 THEN 'Expert'
+            WHEN u.Reputation > 1000 THEN 'Advanced'
+            ELSE 'Beginner'
+        END as ReputationTier
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END as PostType,
+        p.Tags,
+        STRING_AGG(t.TagName, ', ') as TagList
+    FROM Posts p
+    LEFT JOIN (
+        SELECT 
+            Id,
+            UNNEST(STRING_TO_ARRAY(SUBSTRING(Tags FROM 1 FOR CHAR_LENGTH(Tags) - 1), '><')) as TagName
+        FROM Posts 
+        WHERE Tags IS NOT NULL AND Tags != ''
+    ) t ON p.Id = t.Id
+    WHERE p.PostTypeId IN (1, 2)
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.CreationDate, p.OwnerUserId, p.PostTypeId, p.Tags
+),
+UserActivity AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        COUNT(DISTINCT ph.Id) as HistoryCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 1 THEN ph.Id END) as TitleEdits,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (2, 5) THEN ph.Id END) as BodyEdits,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 6 THEN ph.Id END) as TagEdits,
+        MAX(ph.CreationDate) as LastActivity,
+        EXTRACT(DAY FROM (MAX(ph.CreationDate) - u.CreationDate)) as DaysSinceLastActivity
+    FROM Users u
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    WHERE ph.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 years')
+    GROUP BY u.Id, u.DisplayName, u.CreationDate
+)
+SELECT 
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.PostCount,
+    us.CommentCount,
+    us.BadgeCount,
+    us.ReputationTier,
+    pa.PostId,
+    pa.Title,
+    pa.Score,
+    pa.ViewCount,
+    pa.AnswerCount,
+    pa.CommentCount,
+    pa.CreationDate,
+    pa.PostType,
+    pa.TagList,
+    ua.HistoryCount,
+    ua.TitleEdits,
+    ua.BodyEdits,
+    ua.TagEdits,
+    ua.LastActivity,
+    CASE 
+        WHEN (us.PostCount > 0 AND us.Reputation > 100) THEN 
+            (us.PostCount * 0.3 + us.CommentCount * 0.2 + us.BadgeCount * 0.5) * 
+            POWER(1.1, (EXTRACT(DAY FROM ( (TIMESTAMP '2024-10-01 12:34:56') - us.FirstPostDate )) / 365.0))
+        ELSE 0
+    END as ActivityScore,
+    CASE 
+        WHEN us.PostCount > 0 AND pa.Score > 100 THEN 'Highly Engaged'
+        WHEN us.PostCount > 0 AND pa.Score > 10 THEN 'Engaged'
+        ELSE 'Low Engagement'
+    END as EngagementLevel,
+    CASE 
+        WHEN pa.Score > 500 AND pa.AnswerCount > 5 THEN 'Expert Contributor'
+        WHEN pa.Score > 100 AND pa.AnswerCount > 2 THEN 'Contributor'
+        ELSE 'Member'
+    END as ContributionLevel,
+    CASE 
+        WHEN ua.LastActivity IS NULL THEN 'Inactive'
+        WHEN EXTRACT(DAY FROM ( (TIMESTAMP '2024-10-01 12:34:56') - ua.LastActivity )) <= 30 THEN 'Active'
+        WHEN EXTRACT(DAY FROM ( (TIMESTAMP '2024-10-01 12:34:56') - ua.LastActivity )) <= 90 THEN 'Moderately Active'
+        ELSE 'Inactive'
+    END as ActivityStatus,
+    ROW_NUMBER() OVER (PARTITION BY pa.PostTypeId ORDER BY pa.Score DESC) as ScoreRankInType,
+    RANK() OVER (ORDER BY pa.Score DESC) as GlobalScoreRank,
+    DENSE_RANK() OVER (ORDER BY us.Reputation DESC) as ReputationRank,
+    NTILE(10) OVER (ORDER BY pa.Score DESC) as ScoreDecile,
+    LAG(pa.Score, 1) OVER (ORDER BY pa.Score DESC) as PreviousScore,
+    LEAD(pa.Score, 1) OVER (ORDER BY pa.Score DESC) as NextScore,
+    ABS(pa.Score - LAG(pa.Score, 1) OVER (ORDER BY pa.Score DESC)) as ScoreDifference,
+    COALESCE(pa.Tags, 'No Tags') as TagsOrNoTags,
+    CASE 
+        WHEN pa.Title ~* 'question' OR pa.Title ~* 'answer' THEN 'Relevant'
+        WHEN pa.Title ~* 'sql' OR pa.Title ~* 'schema' THEN 'Technical'
+        WHEN pa.Title ~* 'performance' OR pa.Title ~* 'benchmark' THEN 'Performance Focus'
+        ELSE 'General'
+    END as TitleCategory,
+    CASE 
+        WHEN us.Reputation < 100 THEN 'Beginner'
+        WHEN us.Reputation >= 100 AND us.Reputation < 1000 THEN 'Intermediate'
+        WHEN us.Reputation >= 1000 AND us.Reputation < 10000 THEN 'Advanced'
+        ELSE 'Expert'
+    END as UserExperienceLevel,
+    CASE 
+        WHEN us.BadgeCount > 10 AND us.PostCount > 50 THEN 'Super Contributor'
+        WHEN us.BadgeCount > 5 AND us.PostCount > 20 THEN 'Contributor'
+        ELSE 'Regular Member'
+    END as MembershipLevel,
+    CASE 
+        WHEN pa.ViewCount > (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = 1) THEN 'Popular'
+        WHEN pa.ViewCount > (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = 1) * 0.5 THEN 'Moderately Popular'
+        ELSE 'Low View'
+    END as PopularityLevel,
+    ('User: ' || us.DisplayName || ' | Post: ' || pa.Title || ' | Score: ' || COALESCE(CAST(pa.Score AS TEXT), 'NULL')) as CombinedIdentifiers,
+    CASE 
+        WHEN pa.Score IS NULL THEN 0
+        WHEN pa.Score > 0 THEN 1
+        WHEN pa.Score < 0 THEN -1
+        ELSE 0
+    END as ScoreSign,
+    EXTRACT(DAY FROM ( (TIMESTAMP '2024-10-01 12:34:56') - pa.CreationDate )) as DaysSincePost,
+    ('Final Report - ' || CAST(TIMESTAMP '2024-10-01 12:34:56' AS VARCHAR(20))) as ReportHeader
+FROM UserStats us
+INNER JOIN PostAnalysis pa ON us.UserId = pa.OwnerUserId
+LEFT JOIN UserActivity ua ON us.UserId = ua.UserId
+WHERE 
+    (pa.Score > 0 OR pa.Score IS NULL)
+    AND pa.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '3 years')
+    AND (us.PostCount > 0 OR us.CommentCount > 0)
+    AND (pa.Score >= 0 OR pa.Score IS NULL)
+    AND NOT (pa.PostType = 'Answer' AND pa.AnswerCount IS NULL)
+    AND (pa.TagList LIKE '%sql%' OR pa.TagList LIKE '%performance%')
+GROUP BY
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.PostCount,
+    us.CommentCount,
+    us.BadgeCount,
+    us.ReputationTier,
+    pa.PostId,
+    pa.Title,
+    pa.Score,
+    pa.ViewCount,
+    pa.AnswerCount,
+    pa.CommentCount,
+    pa.CreationDate,
+    pa.PostType,
+    pa.TagList,
+    pa.Tags,
+    pa.PostTypeId,
+    pa.OwnerUserId,
+    ua.HistoryCount,
+    ua.TitleEdits,
+    ua.BodyEdits,
+    ua.TagEdits,
+    ua.LastActivity,
+    us.FirstPostDate,
+    ua.LastActivity,
+    pa.Title,
+    us.BadgeCount,
+    us.Views,
+    us.UpVotes,
+    us.DownVotes
+HAVING 
+    COUNT(*) > 0
+    AND SUM(pa.Score) OVER () > 10000
+    AND COUNT(DISTINCT pa.PostTypeId) >= 1
+    AND COUNT(DISTINCT us.UserId) > 10
+ORDER BY 
+    pa.Score DESC,
+    us.Reputation DESC,
+    pa.CreationDate DESC
+OFFSET 1000 ROWS
+FETCH NEXT 1000 ROWS ONLY;

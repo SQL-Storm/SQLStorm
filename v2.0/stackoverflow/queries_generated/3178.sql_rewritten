@@ -1,0 +1,122 @@
+-- {"query": "3178.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2014} 
+WITH
+/* -----------------------------------------------------------------
+   1️⃣  User activity aggregates (questions, answers, comments, etc.)
+   ----------------------------------------------------------------- */
+user_stats AS (
+    SELECT
+        u.id                                      AS user_id,
+        u.displayname,
+        COUNT(p.id)                FILTER (WHERE p.posttypeid = 1) AS question_cnt,
+        COUNT(p.id)                FILTER (WHERE p.posttypeid = 2) AS answer_cnt,
+        SUM(COALESCE(p.score,0))   FILTER (WHERE p.posttypeid = 2) AS answer_score_sum,
+        COUNT(c.id)                                      AS comment_cnt,
+        MAX(p.creationdate)                              AS last_question_dt,
+        MAX(c.creationdate)                              AS last_comment_dt
+    FROM users u
+    LEFT JOIN posts    p ON p.owneruserid = u.id
+    LEFT JOIN comments c ON c.userid      = u.id
+    GROUP BY u.id, u.displayname
+),
+
+/* -----------------------------------------------------------------
+   2️⃣  Latest badge information per user (concatenated names per class)
+   ----------------------------------------------------------------- */
+latest_badges AS (
+    SELECT
+        b.userid,
+        STRING_AGG(b.name, ', ') FILTER (WHERE b.class = 1) AS gold_badges,
+        STRING_AGG(b.name, ', ') FILTER (WHERE b.class = 2) AS silver_badges,
+        MAX(b.date)                                          AS last_badge_dt
+    FROM badges b
+    GROUP BY b.userid
+),
+
+/* -----------------------------------------------------------------
+   3️⃣  Top‑scoring question per distinct tag (window function)
+   ----------------------------------------------------------------- */
+tag_top_questions AS (
+    SELECT
+        p.id                AS post_id,
+        p.title,
+        p.score,
+        unnest(string_to_array(trim(both '<>' from p.tags), '><')) AS tag,
+        ROW_NUMBER() OVER (PARTITION BY unnest(string_to_array(trim(both '<>' from p.tags), '><'))
+                           ORDER BY p.score DESC)                 AS rn
+    FROM posts p
+    WHERE p.posttypeid = 1                -- only questions
+      AND p.tags IS NOT NULL
+),
+
+/* -----------------------------------------------------------------
+   4️⃣  Union of two result sets (detailed per‑user + overall summary)
+   ----------------------------------------------------------------- */
+detailed AS (
+    SELECT
+        us.user_id,
+        us.displayname,
+        us.question_cnt,
+        us.answer_cnt,
+        us.answer_score_sum,
+        us.comment_cnt,
+        COALESCE(us.last_question_dt, us.last_comment_dt)          AS last_activity_dt,
+        lb.gold_badges,
+        lb.silver_badges,
+        lb.last_badge_dt,
+        /* correlated sub‑query: average score of this user's answers */
+        (SELECT AVG(p2.score)
+         FROM posts p2
+         WHERE p2.owneruserid = us.user_id
+           AND p2.posttypeid = 2)                                 AS avg_answer_score,
+        /* lateral join to fetch the highest‑scoring question of any tag the user has ever used */
+        tq.post_id,
+        tq.title           AS top_tag_question_title,
+        tq.score           AS top_tag_question_score
+    FROM user_stats us
+    LEFT JOIN latest_badges lb ON lb.userid = us.user_id
+    LEFT JOIN LATERAL (
+        SELECT tt.post_id, tt.title, tt.score
+        FROM tag_top_questions tt
+        WHERE tt.rn = 1
+          AND tt.tag = ANY (SELECT unnest(string_to_array(trim(both '<>' from p.tags), '><'))
+                            FROM posts p
+                            WHERE p.owneruserid = us.user_id
+                              AND p.posttypeid = 1
+                              AND p.tags IS NOT NULL
+                            LIMIT 1)               -- any tag the user ever used
+        LIMIT 1
+    ) tq ON TRUE
+    WHERE (us.question_cnt > 5 OR us.answer_cnt > 20)
+      AND (lb.last_badge_dt IS NULL
+           OR lb.last_badge_dt > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year')
+),
+
+summary AS (
+    SELECT
+        NULL::int               AS user_id,
+        'Overall Summary'       AS displayname,
+        SUM(us.question_cnt)    AS question_cnt,
+        SUM(us.answer_cnt)      AS answer_cnt,
+        SUM(us.answer_score_sum) AS answer_score_sum,
+        SUM(us.comment_cnt)     AS comment_cnt,
+        NULL::timestamp         AS last_activity_dt,
+        NULL                    AS gold_badges,
+        NULL                    AS silver_badges,
+        NULL                    AS last_badge_dt,
+        NULL::numeric           AS avg_answer_score,
+        NULL                    AS top_tag_question_post_id,
+        NULL                    AS top_tag_question_title,
+        NULL                    AS top_tag_question_score
+    FROM user_stats us
+    WHERE us.answer_cnt > 0
+)
+
+SELECT *
+FROM detailed
+ORDER BY answer_score_sum DESC NULLS LAST
+LIMIT 100
+
+UNION ALL
+
+SELECT *
+FROM summary;

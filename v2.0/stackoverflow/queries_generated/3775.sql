@@ -1,0 +1,140 @@
+-- {"query": "3775.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2168} 
+
+/*  Complex benchmark query on the StackOverflow schema  */
+WITH
+    /* User activity aggregates */
+    UserStats AS (
+        SELECT
+            u.Id                                           AS UserId,
+            u.DisplayName,
+            u.Reputation,
+            COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1)    AS QuestionCount,
+            COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2)    AS AnswerCount,
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+            SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+            MAX(p.CreationDate)                           AS LastPostDate
+        FROM Users u
+        LEFT JOIN Posts  p ON p.OwnerUserId = u.Id
+        LEFT JOIN Votes  v ON v.PostId = p.Id
+        GROUP BY u.Id, u.DisplayName, u.Reputation
+    ),
+
+    /* Top‑scoring answer per user together with its tags (tags are stored as <tag1><tag2>…) */
+    TopTagAnswers AS (
+        SELECT
+            a.OwnerUserId                                   AS UserId,
+            UNNEST(STRING_TO_ARRAY(SUBSTRING(a.Tags,2,LENGTH(a.Tags)-2),'><')) AS Tag,
+            a.Id                                            AS AnswerId,
+            a.Score,
+            ROW_NUMBER() OVER (PARTITION BY a.OwnerUserId
+                               ORDER BY a.Score DESC, a.CreationDate DESC) AS rn
+        FROM Posts a
+        WHERE a.PostTypeId = 2               -- answers only
+          AND a.Tags IS NOT NULL
+    ),
+
+    /* Badge counts per user */
+    UserBadgeAgg AS (
+        SELECT
+            b.UserId,
+            COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+            COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+            COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+            STRING_AGG(DISTINCT b.Name, ', ')    AS BadgeList
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+
+    /* Most recent closed question per user (if any) */
+    RecentClosedQuestions AS (
+        SELECT
+            ph.PostId,
+            MAX(ph.CreationDate)                                              AS ClosedDate,
+            MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Comment END)      AS CloseReasonJson
+        FROM PostHistory ph
+        WHERE ph.PostHistoryTypeId = 10          -- closed
+        GROUP BY ph.PostId
+    ),
+
+    /* Combine everything, using outer joins and a correlated sub‑query for the latest closed question */
+    Combined AS (
+        SELECT
+            us.UserId,
+            us.DisplayName,
+            us.Reputation,
+            us.QuestionCount,
+            us.AnswerCount,
+            us.UpVoteCount,
+            us.DownVoteCount,
+            ub.GoldBadges,
+            ub.SilverBadges,
+            ub.BronzeBadges,
+            ub.BadgeList,
+            ta.Tag,
+            ta.Score                                          AS TopAnswerScore,
+            rcq.ClosedDate,
+            rcq.CloseReasonJson
+        FROM UserStats us
+        LEFT JOIN UserBadgeAgg ub
+               ON ub.UserId = us.UserId
+        LEFT JOIN TopTagAnswers ta
+               ON ta.UserId = us.UserId AND ta.rn = 1
+        LEFT JOIN RecentClosedQuestions rcq
+               ON rcq.PostId = (
+                     SELECT p.Id
+                     FROM Posts p
+                     WHERE p.OwnerUserId = us.UserId
+                       AND p.PostTypeId = 1                         -- question
+                       AND EXISTS (SELECT 1
+                                   FROM PostHistory ph2
+                                   WHERE ph2.PostId = p.Id
+                                     AND ph2.PostHistoryTypeId = 10)
+                     ORDER BY p.CreationDate DESC
+                     LIMIT 1
+               )
+    )
+
+/* Final result set: detailed rows + a summary row (set operator) */
+SELECT
+    UserId,
+    DisplayName,
+    Reputation,
+    QuestionCount,
+    AnswerCount,
+    UpVoteCount,
+    DownVoteCount,
+    GoldBadges,
+    SilverBadges,
+    BronzeBadges,
+    BadgeList,
+    Tag,
+    TopAnswerScore,
+    ClosedDate,
+    CloseReasonJson
+FROM Combined
+WHERE (Reputation > 10000 OR GoldBadges IS NOT NULL)
+  AND (TopAnswerScore IS NULL OR TopAnswerScore >= 10)
+ORDER BY Reputation DESC NULLS LAST,
+         GoldBadges DESC NULLS LAST
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    NULL                AS UserId,
+    'Summary'           AS DisplayName,
+    NULL                AS Reputation,
+    SUM(QuestionCount)  AS QuestionCount,
+    SUM(AnswerCount)    AS AnswerCount,
+    SUM(UpVoteCount)    AS UpVoteCount,
+    SUM(DownVoteCount)  AS DownVoteCount,
+    NULL                AS GoldBadges,
+    NULL                AS SilverBadges,
+    NULL                AS BronzeBadges,
+    NULL                AS BadgeList,
+    NULL                AS Tag,
+    NULL                AS TopAnswerScore,
+    NULL                AS ClosedDate,
+    NULL                AS CloseReasonJson
+FROM Combined
+WHERE Reputation IS NOT NULL;

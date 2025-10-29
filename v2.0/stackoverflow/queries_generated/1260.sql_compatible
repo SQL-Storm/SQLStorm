@@ -1,0 +1,225 @@
+WITH UserStats AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName AS UserDisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        COUNT(DISTINCT P_Q.Id) AS QuestionsPosted,
+        COUNT(DISTINCT P_A.Id) AS AnswersPosted,
+        SUM(COALESCE(P_Q.Score, 0)) AS TotalQuestionScore,
+        SUM(COALESCE(P_A.Score, 0)) AS TotalAnswerScore,
+        AVG(COALESCE(P_Q.Score, 0)) FILTER (WHERE P_Q.PostTypeId = 1) AS AvgQuestionScore,
+        AVG(COALESCE(P_A.Score, 0)) FILTER (WHERE P_A.PostTypeId = 2) AS AvgAnswerScore,
+        NTILE(10) OVER (ORDER BY U.Reputation DESC) AS ReputationDecile
+    FROM Users U
+    LEFT JOIN Posts P_Q ON U.Id = P_Q.OwnerUserId AND P_Q.PostTypeId = 1
+    LEFT JOIN Posts P_A ON U.Id = P_A.OwnerUserId AND P_A.PostTypeId = 2
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate
+),
+PostTagAnalysis AS (
+    SELECT
+        P.Id AS PostId,
+        TRIM(UNNEST(string_to_array(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags) - 2), '><'))) AS TagName
+    FROM Posts P
+    WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL
+),
+QuestionRevisionSummary AS (
+    SELECT
+        PH.PostId,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.CreationDate END) AS LastEditDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.CreationDate END) AS LastClosedDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 11 THEN PH.CreationDate END) AS LastReopenedDate,
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 END) AS CloseCount,
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 END) AS ReopenCount,
+        (SELECT U.DisplayName FROM PostHistory PH_inner JOIN Users U ON PH_inner.UserId = U.Id
+         WHERE PH_inner.PostId = PH.PostId
+           AND PH_inner.PostHistoryTypeId IN (5, 8)
+         ORDER BY PH_inner.CreationDate DESC LIMIT 1) AS LatestBodyEditorDisplayName,
+        (SELECT CR.Name FROM PostHistory PH_close JOIN CloseReasonTypes CR ON CAST(PH_close.Comment AS SMALLINT) = CR.Id
+         WHERE PH_close.PostId = PH.PostId
+           AND PH_close.PostHistoryTypeId = 10
+         ORDER BY PH_close.CreationDate DESC LIMIT 1) AS MostRecentCloseReason
+    FROM PostHistory PH
+    WHERE PH.PostHistoryTypeId IN (4, 5, 6, 8, 10, 11, 12, 13)
+    GROUP BY PH.PostId
+),
+AnswerEngagement AS (
+    SELECT
+        P_Q.Id AS QuestionId,
+        COUNT(P_A.Id) AS TotalAnswers,
+        SUM(P_A.Score) AS SumAnswerScore,
+        AVG(P_A.Score) AS AvgAnswerScore,
+        MAX(P_A.CreationDate) AS LatestAnswerCreationDate,
+        COUNT(CASE WHEN P_A.Id = P_Q.AcceptedAnswerId THEN 1 END) AS AcceptedAnswersCount,
+        AVG(P_A.Score) OVER (PARTITION BY P_Q.Id ORDER BY P_A.CreationDate ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS RollingAvgAnswerScore
+    FROM Posts P_Q
+    LEFT JOIN Posts P_A ON P_Q.Id = P_A.ParentId AND P_A.PostTypeId = 2
+    WHERE P_Q.PostTypeId = 1
+    GROUP BY P_Q.Id
+),
+TopTagsByPost AS (
+    SELECT
+        PTA.PostId,
+        STRING_AGG(DISTINCT PTA.TagName, ',') AS AllQuestionTags,
+        MAX(CASE WHEN T.TagName IS NOT NULL THEN T.TagName END) FILTER (WHERE T.Count >= 10000 AND PTA.TagName IS NOT NULL) AS PrimaryHighVolumeTag,
+        COUNT(DISTINCT PTA.TagName) AS UniqueTagCount
+    FROM PostTagAnalysis PTA
+    LEFT JOIN Tags T ON PTA.TagName = T.TagName
+    GROUP BY PTA.PostId
+),
+QualifiedQuestions AS (
+    SELECT
+        P.Id AS QuestionId,
+        P.Title,
+        P.Body,
+        P.CreationDate,
+        P.Score AS QuestionScore,
+        P.ViewCount,
+        P.AnswerCount AS RawAnswerCount,
+        P.OwnerUserId,
+        P.AcceptedAnswerId,
+        P.LastActivityDate,
+        P.LastEditDate,
+        P.ClosedDate,
+        P.CommunityOwnedDate,
+        US.UserDisplayName AS OwnerDisplayName,
+        US.Reputation AS OwnerReputation,
+        US.ReputationDecile AS OwnerReputationDecile,
+        QRS.LastEditDate AS LatestPostEditDate,
+        QRS.LastClosedDate AS LatestPostClosedDate,
+        QRS.LatestBodyEditorDisplayName,
+        QRS.MostRecentCloseReason,
+        AE.TotalAnswers,
+        AE.SumAnswerScore,
+        AE.AvgAnswerScore,
+        AE.LatestAnswerCreationDate,
+        AE.AcceptedAnswersCount,
+        AE.RollingAvgAnswerScore,
+        TTP.AllQuestionTags,
+        TTP.PrimaryHighVolumeTag,
+        TTP.UniqueTagCount,
+        (SELECT COUNT(DISTINCT C.Id) FROM Comments C WHERE C.PostId = P.Id AND C.Score >= 3 AND C.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '60 days')) AS RecentHighlyVotedComments,
+        (SELECT EXISTS (
+            SELECT 1 FROM Badges B
+            JOIN Tags T ON B.Name = T.TagName AND T.TagBased = TRUE
+            WHERE B.UserId = P.OwnerUserId AND B.Class = 1
+            AND P.Tags LIKE '%' || '<' || T.TagName || '>' || '%'
+        )) AS OwnerHasRelevantGoldBadge
+    FROM Posts P
+    JOIN UserStats US ON P.OwnerUserId = US.UserId
+    LEFT JOIN QuestionRevisionSummary QRS ON P.Id = QRS.PostId
+    LEFT JOIN AnswerEngagement AE ON P.Id = AE.QuestionId
+    LEFT JOIN TopTagsByPost TTP ON P.Id = TTP.PostId
+    WHERE
+        P.PostTypeId = 1
+        AND P.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 years')
+        AND P.Score > 5
+        AND P.ViewCount > 100
+),
+ControversialQuestions AS (
+    SELECT
+        Q.Id AS QuestionId,
+        Q.Title,
+        U.DisplayName AS OwnerDisplayName,
+        U.Reputation AS OwnerReputation,
+        Q.CreationDate,
+        Q.Score AS QuestionScore,
+        Q.ViewCount,
+        QRS.CloseCount,
+        QRS.ReopenCount,
+        COALESCE(Q.ClosedDate, QRS.LastClosedDate) AS FinalClosedDate,
+        (EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - Q.CreationDate)) / 3600) AS HoursSinceCreation,
+        RANK() OVER (ORDER BY (QRS.CloseCount + QRS.ReopenCount) DESC, Q.Score DESC) AS ControversyRank
+    FROM Posts Q
+    JOIN Users U ON Q.OwnerUserId = U.Id
+    JOIN QuestionRevisionSummary QRS ON Q.Id = QRS.PostId
+    WHERE
+        Q.PostTypeId = 1
+        AND QRS.CloseCount >= 2
+        AND QRS.ReopenCount >= 1
+        AND Q.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '5 years')
+)
+SELECT
+    QQ.QuestionId,
+    QQ.Title,
+    QQ.OwnerDisplayName,
+    QQ.OwnerReputation,
+    QQ.CreationDate,
+    QQ.QuestionScore,
+    QQ.ViewCount,
+    QQ.TotalAnswers,
+    QQ.AvgAnswerScore,
+    QQ.LatestBodyEditorDisplayName,
+    QQ.MostRecentCloseReason,
+    QQ.AllQuestionTags,
+    QQ.PrimaryHighVolumeTag,
+    QQ.OwnerHasRelevantGoldBadge,
+    QQ.RecentHighlyVotedComments,
+    COALESCE(QQ.ClosedDate, QQ.LatestPostClosedDate, CAST('1970-01-01' AS TIMESTAMP)) AS ActualClosedOrFallbackDate,
+    QQ.LatestAnswerCreationDate,
+    QQ.RollingAvgAnswerScore,
+    (EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - QQ.CreationDate)) / 86400) AS DaysOld,
+    (QQ.QuestionScore * 0.5 + QQ.ViewCount * 0.1 + QQ.TotalAnswers * 2 + COALESCE(QQ.AvgAnswerScore, 0) * 1) AS CalculatedEngagementScore,
+    NTILE(4) OVER (ORDER BY (QQ.QuestionScore + COALESCE(QQ.SumAnswerScore, 0)) DESC) AS TopQuartileScore,
+    RANK() OVER (PARTITION BY QQ.OwnerReputationDecile ORDER BY (QQ.QuestionScore * 0.5 + QQ.ViewCount * 0.1 + QQ.TotalAnswers * 2 + COALESCE(QQ.AvgAnswerScore, 0) * 1) DESC) AS RankWithinRepDecile,
+    CASE
+        WHEN QQ.PrimaryHighVolumeTag IS NOT NULL AND QQ.OwnerHasRelevantGoldBadge THEN 'ExpertlyTaggedHighVolume'
+        WHEN QQ.TotalAnswers > 5 AND QQ.AcceptedAnswersCount >= 1 THEN 'WellAnsweredSolved'
+        WHEN QQ.ViewCount > 5000 AND QQ.TotalAnswers = 0 THEN 'ViralUnanswered'
+        WHEN QQ.LatestPostClosedDate IS NOT NULL AND QQ.MostRecentCloseReason = 'Duplicate' THEN 'ClosedAsDuplicate'
+        ELSE 'OtherEngagement'
+    END AS EngagementCategory,
+    PL_Linked.LinkedPostCount,
+    PL_Duplicate.DuplicatePostCount,
+    CASE WHEN LOWER(QQ.Body) LIKE '%<pre><code>%' THEN TRUE ELSE FALSE END AS HasCodeBlock
+FROM QualifiedQuestions QQ
+LEFT JOIN (
+    SELECT PostId, COUNT(Id) AS LinkedPostCount
+    FROM PostLinks
+    WHERE LinkTypeId = 1
+    GROUP BY PostId
+) AS PL_Linked ON QQ.QuestionId = PL_Linked.PostId
+LEFT JOIN (
+    SELECT PostId, COUNT(Id) AS DuplicatePostCount
+    FROM PostLinks
+    WHERE LinkTypeId = 3
+    GROUP BY PostId
+) AS PL_Duplicate ON QQ.QuestionId = PL_Duplicate.PostId
+WHERE
+    (QQ.QuestionScore * 0.5 + QQ.ViewCount * 0.1 + QQ.TotalAnswers * 2 + COALESCE(QQ.AvgAnswerScore, 0) * 1) > 100
+    AND (QQ.PrimaryHighVolumeTag IS NOT NULL OR QQ.UniqueTagCount > 3)
+    AND NOT (QQ.OwnerReputation < 1000 AND QQ.TotalAnswers = 0)
+    AND QQ.QuestionId NOT IN (SELECT QuestionId FROM ControversialQuestions WHERE ControversyRank <= 100)
+UNION ALL
+SELECT
+    CQ.QuestionId,
+    CQ.Title,
+    CQ.OwnerDisplayName,
+    CQ.OwnerReputation,
+    CQ.CreationDate,
+    CQ.QuestionScore,
+    CQ.ViewCount,
+    NULL AS TotalAnswers,
+    NULL AS AvgAnswerScore,
+    NULL AS LatestBodyEditorDisplayName,
+    NULL AS MostRecentCloseReason,
+    NULL AS AllQuestionTags,
+    NULL AS PrimaryHighVolumeTag,
+    NULL AS OwnerHasRelevantGoldBadge,
+    NULL AS RecentHighlyVotedComments,
+    CQ.FinalClosedDate AS ActualClosedOrFallbackDate,
+    NULL AS LatestAnswerCreationDate,
+    NULL AS RollingAvgAnswerScore,
+    CQ.HoursSinceCreation / 24 AS DaysOld,
+    (CQ.QuestionScore * 1.5 + CQ.ViewCount * 0.2 + CQ.ControversyRank * -10) AS CalculatedEngagementScore,
+    NTILE(4) OVER (ORDER BY CQ.ControversyRank) AS TopQuartileScore,
+    RANK() OVER (ORDER BY CQ.ControversyRank DESC) AS RankWithinRepDecile,
+    'HighlyControversial' AS EngagementCategory,
+    NULL AS LinkedPostCount,
+    NULL AS DuplicatePostCount,
+    FALSE AS HasCodeBlock
+FROM ControversialQuestions CQ
+WHERE CQ.ControversyRank <= 50
+ORDER BY CalculatedEngagementScore DESC, DaysOld ASC
+LIMIT 2000;

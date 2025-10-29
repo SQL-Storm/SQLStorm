@@ -1,0 +1,121 @@
+-- {"query": "5410.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 936} 
+WITH recent_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.ContentLicense,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn_owner
+  FROM Posts p
+  WHERE p.PostTypeId = 1 -- Questions
+    AND p.CreationDate >= current_timestamp - interval '90 days'
+),
+owner_summary AS (
+  SELECT
+    uq.OwnerUserId,
+    u.DisplayName AS OwnerDisplayName,
+    COUNT(*) AS question_count_last_90,
+    SUM(u.Reputation) AS total_reputation
+  FROM recent_questions uq
+  LEFT JOIN Users u ON u.Id = uq.OwnerUserId
+  WHERE uq.OwnerUserId IS NOT NULL
+  GROUP BY uq.OwnerUserId, u.DisplayName
+),
+tag_usage AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS tag_count,
+    SUM(CASE WHEN p.ViewCount > 1000 THEN 1 ELSE 0 END) AS popular_within_90
+  FROM Posts p
+  CROSS JOIN LATERAL (
+    SELECT unnest(string_to_array(substr(p.Tags, 2, length(p.Tags) - 2), '><')) AS TagName
+  ) AS tmap
+  JOIN Tags t ON t.TagName = tmap.TagName
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= current_timestamp - interval '90 days'
+  GROUP BY t.TagName
+),
+activity AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    CASE
+      WHEN p.Score > 0 THEN 'positive'
+      WHEN p.Score < 0 THEN 'negative'
+      ELSE 'neutral'
+    END AS score_category,
+    CASE
+      WHEN p.LastActivityDate > p.CreationDate + interval '7 days' THEN true
+      ELSE false
+    END AS active_recently
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= current_timestamp - interval '180 days'
+),
+coalesced AS (
+  SELECT
+    ar.PostId,
+    ar.Title,
+    ar.OwnerUserId,
+    ar.CreationDate,
+    ar.LastActivityDate,
+    ar.Score,
+    ar.ViewCount,
+    ar.score_category,
+    ar.active_recently,
+    o.DisplayName AS OwnerDisplayName
+  FROM activity ar
+  LEFT JOIN Users o ON o.Id = ar.OwnerUserId
+),
+correlated AS (
+  SELECT
+    c.PostId,
+    c.Title,
+    c.OwnerUserId,
+    c.OwnerDisplayName,
+    c.CreationDate,
+    c.LastActivityDate,
+    c.Score,
+    c.ViewCount,
+    c.score_category,
+    c.active_recently,
+    rs.question_count_last_90,
+    rs.total_reputation,
+    tu.TagName,
+    tu.tag_count,
+    tu.popular_within_90
+  FROM coalesced c
+  LEFT JOIN owner_summary rs ON rs.OwnerUserId = c.OwnerUserId
+  LEFT JOIN (
+    SELECT
+      t.TagName,
+      COUNT(*) AS tag_count,
+      SUM(CASE WHEN p.ViewCount > 1000 THEN 1 ELSE 0 END) AS popular_within_90
+    FROM Posts p
+    JOIN LATERAL (
+      SELECT unnest(string_to_array(substr(p.Tags, 2, length(p.Tags) - 2), '><')) AS TagName
+    ) AS t ON true
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= current_timestamp - interval '90 days'
+    GROUP BY t.TagName
+  ) tu ON true
+  WHERE c.PostId = c.PostId
+)
+SELECT
+  COR(PostId, Title, OwnerUserId, OwnerDisplayName, CreationDate, LastActivityDate, Score, ViewCount, score_category, active_recently, question_count_last_90, total_reputation, TagName, tag_count, popular_within_90) AS composite_row
+FROM correlated
+ORDER BY LastActivityDate DESC
+LIMIT 500;

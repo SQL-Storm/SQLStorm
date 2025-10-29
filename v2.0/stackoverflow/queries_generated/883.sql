@@ -1,0 +1,316 @@
+-- {"query": "883.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3160} 
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.location,
+        u.creationdate,
+        u.lastaccessdate,
+        coalesce(nullif(trim(u.websiteurl), ''), 'N/A') as websiteurl_norm,
+        extract(epoch from (current_timestamp - u.creationdate)) / 86400.0 as days_since_join
+    from users u
+    where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+user_activity as (
+    select
+        p.owneruserid as user_id,
+        count(*) filter (where p.posttypeid = 1) as q_count,
+        count(*) filter (where p.posttypeid = 2) as a_count,
+        sum(coalesce(p.score, 0)) as total_post_score,
+        sum(coalesce(p.viewcount, 0)) as total_views,
+        max(p.lastactivitydate) as last_post_activity,
+        sum(case when p.closeddate is not null then 1 else 0 end) as closed_posts
+    from posts p
+    where p.owneruserid is not null
+    group by p.owneruserid
+),
+user_badges as (
+    select
+        b.userid as user_id,
+        count(*) as badge_count,
+        count(*) filter (where b.class = 1) as gold_badges,
+        count(*) filter (where b.class = 2) as silver_badges,
+        count(*) filter (where b.class = 3) as bronze_badges,
+        count(*) filter (where b.tagbased = 1) as tag_badges,
+        min(b.date) as first_badge_date,
+        max(b.date) as last_badge_date
+    from badges b
+    group by b.userid
+),
+user_votes as (
+    select
+        v.userid as user_id,
+        count(*) filter (where v.votetypeid = 2) as up_votes_cast,
+        count(*) filter (where v.votetypeid = 3) as down_votes_cast,
+        count(*) filter (where v.votetypeid in (8,9)) as bounty_events,
+        sum(coalesce(v.bountyamount,0)) as bounty_amount_total,
+        min(v.creationdate) as first_vote_date,
+        max(v.creationdate) as last_vote_date
+    from votes v
+    where v.userid is not null
+    group by v.userid
+),
+question_metrics as (
+    select
+        p.owneruserid as user_id,
+        count(*) as questions_total,
+        avg(nullif(p.viewcount,0)) as avg_q_views_nonzero,
+        avg(p.score) as avg_q_score,
+        percentile_disc(0.9) within group (order by coalesce(p.viewcount,0)) as p90_q_views,
+        sum(case when p.acceptedanswerid is not null then 1 else 0 end) as accepted_count
+    from posts p
+    where p.posttypeid = 1 and p.owneruserid is not null
+    group by p.owneruserid
+),
+answer_metrics as (
+    select
+        p.owneruserid as user_id,
+        count(*) as answers_total,
+        avg(p.score) as avg_a_score,
+        sum(case when p.score > 0 then 1 else 0 end) as pos_answer_count
+    from posts p
+    where p.posttypeid = 2 and p.owneruserid is not null
+    group by p.owneruserid
+),
+comment_activity as (
+    select
+        c.userid as user_id,
+        count(*) as comments_total,
+        avg(c.score) as avg_comment_score,
+        sum(case when c.score > 0 then 1 else 0 end) as pos_comment_count,
+        max(c.creationdate) as last_comment_date
+    from comments c
+    where c.userid is not null
+    group by c.userid
+),
+link_dupes as (
+    select
+        p.owneruserid as user_id,
+        count(*) filter (where pl.linktypeid = 3) as duplicates_marked,
+        count(*) filter (where pl.linktypeid = 1) as links_marked
+    from posts p
+    join postlinks pl on pl.postid = p.id
+    where p.owneruserid is not null
+    group by p.owneruserid
+),
+closure_reasons as (
+    select
+        ph.postid,
+        max(ph.creationdate) as last_close_date,
+        max((regexp_match(ph.comment, '^[0-9]+'))[1]) as close_reason_id_text
+    from posthistory ph
+    where ph.posthistorytypeid = 10
+    group by ph.postid
+),
+user_closure as (
+    select
+        p.owneruserid as user_id,
+        count(*) as times_closed,
+        count(*) filter (where cr.close_reason_id_text::int = 101) as dup_closes,
+        count(*) filter (where cr.close_reason_id_text::int = 102) as offtopic_closes,
+        min(cr.last_close_date) as first_close_date,
+        max(cr.last_close_date) as last_close_date
+    from posts p
+    join closure_reasons cr on cr.postid = p.id
+    where p.owneruserid is not null
+    group by p.owneruserid
+),
+tag_expertise as (
+    select
+        q.owneruserid as user_id,
+        lower(trim(both '<>' from unnest(string_to_array(substring(q.tags, 2, length(q.tags)-2), '><')))) as tag_name,
+        count(*) as tag_q_count,
+        avg(q.score) as tag_avg_q_score
+    from posts q
+    where q.posttypeid = 1 and q.tags is not null and q.owneruserid is not null
+    group by q.owneruserid, lower(trim(both '<>' from unnest(string_to_array(substring(q.tags, 2, length(q.tags)-2), '><'))))
+),
+top_tag_per_user as (
+    select user_id, tag_name, tag_q_count, tag_avg_q_score,
+           row_number() over (partition by user_id order by tag_q_count desc, tag_avg_q_score desc nulls last, tag_name) as rn
+    from tag_expertise
+),
+activity_union as (
+    select user_id from user_activity
+    union
+    select user_id from user_badges
+    union
+    select user_id from user_votes
+    union
+    select user_id from question_metrics
+    union
+    select user_id from answer_metrics
+    union
+    select user_id from comment_activity
+    union
+    select user_id from link_dupes
+    union
+    select user_id from user_closure
+),
+score_components as (
+    select
+        au.user_id,
+        coalesce(ua.q_count,0) as q_count,
+        coalesce(ua.a_count,0) as a_count,
+        coalesce(ua.total_post_score,0) as total_post_score,
+        coalesce(uv.up_votes_cast,0) as up_votes_cast,
+        coalesce(uv.down_votes_cast,0) as down_votes_cast,
+        coalesce(qm.accepted_count,0) as accepted_q,
+        coalesce(am.answers_total,0) as answers_total,
+        coalesce(cm.comments_total,0) as comments_total,
+        coalesce(ld.duplicates_marked,0) as duplicates_marked,
+        coalesce(uc.times_closed,0) as times_closed
+    from activity_union au
+    left join user_activity ua on ua.user_id = au.user_id
+    left join user_votes uv on uv.user_id = au.user_id
+    left join question_metrics qm on qm.user_id = au.user_id
+    left join answer_metrics am on am.user_id = au.user_id
+    left join comment_activity cm on cm.user_id = au.user_id
+    left join link_dupes ld on ld.user_id = au.user_id
+    left join user_closure uc on uc.user_id = au.user_id
+),
+weighted_scores as (
+    select
+        sc.user_id,
+        (sc.q_count * 1.0)
+        + (sc.a_count * 2.0)
+        + (sc.total_post_score * 3.0)
+        + (sc.up_votes_cast * 0.5)
+        - (sc.down_votes_cast * 0.75)
+        + (sc.accepted_q * 5.0)
+        + (sc.answers_total * 1.25)
+        + (sc.comments_total * 0.1)
+        + (sc.duplicates_marked * 0.25)
+        - (sc.times_closed * 2.5) as engagement_score
+    from score_components sc
+),
+user_summary as (
+    select
+        au.user_id,
+        ru.displayname,
+        ru.reputation,
+        ru.location,
+        ru.days_since_join,
+        ua.q_count,
+        ua.a_count,
+        ua.total_post_score,
+        ua.total_views,
+        ua.last_post_activity,
+        ub.badge_count,
+        ub.gold_badges,
+        ub.silver_badges,
+        ub.bronze_badges,
+        ub.tag_badges,
+        uv.up_votes_cast,
+        uv.down_votes_cast,
+        uv.bounty_events,
+        uv.bounty_amount_total,
+        uv.first_vote_date,
+        uv.last_vote_date,
+        qm.questions_total,
+        qm.avg_q_views_nonzero,
+        qm.avg_q_score,
+        qm.p90_q_views,
+        qm.accepted_count,
+        am.answers_total,
+        am.avg_a_score,
+        am.pos_answer_count,
+        cm.comments_total,
+        cm.avg_comment_score,
+        cm.pos_comment_count,
+        cm.last_comment_date,
+        ld.duplicates_marked,
+        ld.links_marked,
+        uc.times_closed,
+        uc.dup_closes,
+        uc.offtopic_closes,
+        uc.first_close_date,
+        uc.last_close_date,
+        wt.engagement_score,
+        ttp.tag_name as top_tag,
+        ttp.tag_q_count as top_tag_q_count,
+        ttp.tag_avg_q_score as top_tag_avg_q_score
+    from activity_union au
+    left join recent_users ru on ru.user_id = au.user_id
+    left join user_activity ua on ua.user_id = au.user_id
+    left join user_badges ub on ub.user_id = au.user_id
+    left join user_votes uv on uv.user_id = au.user_id
+    left join question_metrics qm on qm.user_id = au.user_id
+    left join answer_metrics am on am.user_id = au.user_id
+    left join comment_activity cm on cm.user_id = au.user_id
+    left join link_dupes ld on ld.user_id = au.user_id
+    left join user_closure uc on uc.user_id = au.user_id
+    left join weighted_scores wt on wt.user_id = au.user_id
+    left join top_tag_per_user ttp on ttp.user_id = au.user_id and ttp.rn = 1
+),
+ranked as (
+    select
+        us.*,
+        row_number() over (order by coalesce(us.reputation,0) desc, coalesce(us.wt.engagement_score,0) desc nulls last, coalesce(us.total_views,0) desc, coalesce(us.badge_count,0) desc, coalesce(us.last_post_activity, timestamp 'epoch') desc) as rep_engagement_rank,
+        rank() over (order by coalesce(us.wt.engagement_score,0) desc nulls last) as engagement_rank,
+        dense_rank() over (order by coalesce(us.badge_count,0) desc) as badge_rank,
+        ntile(10) over (order by coalesce(us.total_post_score,0) desc) as score_decile
+    from user_summary us
+)
+select
+    r.user_id,
+    coalesce(r.displayname, concat('user_', r.user_id::text)) as display_name,
+    coalesce(r.location, 'Unknown') as location,
+    r.reputation,
+    round(coalesce(r.days_since_join, 0)::numeric, 2) as days_since_join,
+    r.q_count, r.a_count, r.questions_total, r.answers_total,
+    r.total_post_score, r.total_views,
+    r.badge_count, r.gold_badges, r.silver_badges, r.bronze_badges, r.tag_badges,
+    r.up_votes_cast, r.down_votes_cast,
+    r.bounty_events, r.bounty_amount_total,
+    r.accepted_count,
+    r.avg_q_views_nonzero, r.avg_q_score, r.p90_q_views,
+    r.avg_a_score, r.pos_answer_count,
+    r.comments_total, r.avg_comment_score, r.pos_comment_count,
+    r.duplicates_marked, r.links_marked,
+    r.times_closed, r.dup_closes, r.offtopic_closes,
+    r.top_tag, r.top_tag_q_count, r.top_tag_avg_q_score,
+    round(coalesce(r.engagement_score,0)::numeric, 2) as engagement_score,
+    r.rep_engagement_rank, r.engagement_rank, r.badge_rank, r.score_decile,
+    case
+        when coalesce(r.reputation,0) >= 100000 then 'legend'
+        when coalesce(r.reputation,0) >= 50000 then 'expert'
+        when coalesce(r.reputation,0) >= 10000 then 'advanced'
+        when coalesce(r.reputation,0) >= 1000 then 'intermediate'
+        else 'newbie'
+    end as rep_bucket,
+    case
+        when coalesce(r.engagement_score,0) >= 10000 then 'A'
+        when coalesce(r.engagement_score,0) >= 2500 then 'B'
+        when coalesce(r.engagement_score,0) >= 500 then 'C'
+        when coalesce(r.engagement_score,0) >= 100 then 'D'
+        else 'E'
+    end as engagement_grade,
+    case
+        when r.last_post_activity is null and r.last_comment_date is null then 'inactive'
+        when greatest(coalesce(r.last_post_activity, timestamp 'epoch'), coalesce(r.last_comment_date, timestamp 'epoch')) < current_timestamp - interval '180 days' then 'stale'
+        else 'active'
+    end as activity_status
+from ranked r
+where
+    -- complex predicate combining several dimensions
+    (
+        (coalesce(r.a_count,0) + coalesce(r.q_count,0)) > 0
+        or (coalesce(r.badge_count,0) > 0)
+        or (coalesce(r.up_votes_cast,0) + coalesce(r.down_votes_cast,0)) > 0
+    )
+    and not (
+        r.times_closed is not null
+        and r.times_closed > 10
+        and coalesce(r.total_post_score,0) < 0
+    )
+    and (
+        r.top_tag is null
+        or length(r.top_tag) between 1 and 35
+    )
+order by
+    engagement_rank nulls last,
+    rep_engagement_rank,
+    user_id
+limit 500;

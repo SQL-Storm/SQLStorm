@@ -1,0 +1,305 @@
+-- {"query": "7099.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2568} 
+WITH RECURSIVE PostHierarchy AS (
+    SELECT Id, ParentId, PostTypeId, OwnerUserId, Score, ViewCount, Title, 
+           1 as Level, CAST(Id AS VARCHAR(1000)) as Path
+    FROM Posts 
+    WHERE PostTypeId = 1 AND ParentId IS NULL
+    
+    UNION ALL
+    
+    SELECT p.Id, p.ParentId, p.PostTypeId, p.OwnerUserId, p.Score, p.ViewCount, p.Title,
+           ph.Level + 1, ph.Path || '->' || CAST(p.Id AS VARCHAR(1000))
+    FROM Posts p
+    INNER JOIN PostHierarchy ph ON p.ParentId = ph.Id
+    WHERE ph.Level < 5
+),
+UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT b.Id) as TotalBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) as GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) as SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) as BronzeBadges,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END) as AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE NULL END) as AvgAnswerScore
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 
+                (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = p.Id AND a.PostTypeId = 2)
+            ELSE 0 
+        END as AnswerCount,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 
+                (SELECT CAST(SUM(CAST(v.VoteTypeId AS INT)) AS FLOAT) / COUNT(*) 
+                 FROM Votes v 
+                 WHERE v.PostId = p.Id AND v.VoteTypeId IN (2, 3))
+            ELSE NULL 
+        END as AvgVoteScore,
+        COALESCE(
+            (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id), 
+            0
+        ) as CommentCount,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 
+                (SELECT MIN(ph.CreationDate) 
+                 FROM PostHistory ph 
+                 WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId = 10)
+            ELSE NULL 
+        END as CloseDate,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 
+                (SELECT COUNT(*) 
+                 FROM PostLinks pl 
+                 WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3)
+            ELSE 0 
+        END as DuplicateCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) as UserPostRank,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PrevScore,
+        (p.Score - LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate)) as ScoreChange,
+        CASE 
+            WHEN p.Score > 100 THEN 'High'
+            WHEN p.Score > 50 THEN 'Medium'
+            WHEN p.Score > 0 THEN 'Low'
+            ELSE 'Negative'
+        END as ScoreCategory,
+        CASE 
+            WHEN p.PostTypeId IN (1, 2) THEN 
+                (SELECT COUNT(*) 
+                 FROM PostHistory ph 
+                 WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (5, 6, 8))
+            ELSE 0 
+        END as EditCount
+    FROM Posts p
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        COALESCE(
+            (SELECT COUNT(DISTINCT p.Id) 
+             FROM Posts p 
+             WHERE p.Tags LIKE '%' || t.TagName || '%'), 
+            0
+        ) as PostsWithTag,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END) as AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE NULL END) as AvgAnswerScore,
+        STRING_AGG(
+            CASE WHEN p.PostTypeId = 1 THEN p.Title END, 
+            ' | ' ORDER BY p.Score DESC
+        ) as TopQuestions,
+        STRING_AGG(
+            CASE WHEN p.PostTypeId = 2 THEN p.Title END, 
+            ' | ' ORDER BY p.Score DESC
+        ) as TopAnswers
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    GROUP BY t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId
+)
+SELECT 
+    'Performance Benchmark Report' as ReportTitle,
+    COUNT(*) as TotalPosts,
+    COUNT(DISTINCT p.OwnerUserId) as ActiveUsers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+    AVG(p.Score) as OverallAvgScore,
+    MAX(p.ViewCount) as MaxViews,
+    MIN(p.CreationDate) as EarliestPost,
+    MAX(p.CreationDate) as LatestPost,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.Score > 100 THEN p.Id END) as HighScoreQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.Score > 50 THEN p.Id END) as HighScoreAnswers,
+    (SELECT COUNT(*) FROM UserStats) as UserStatsCount,
+    (SELECT COUNT(*) FROM PostHierarchy) as PostHierarchyCount,
+    (SELECT COUNT(*) FROM TagAnalysis) as TagAnalysisCount,
+    (
+        SELECT COUNT(*) FROM Posts p 
+        INNER JOIN Users u ON p.OwnerUserId = u.Id 
+        WHERE u.Reputation > 10000 
+        AND p.PostTypeId = 1 
+        AND p.Score > 50
+    ) as HighRepHighScoreQuestions,
+    (
+        SELECT AVG(Reputation) FROM Users u 
+        INNER JOIN Posts p ON u.Id = p.OwnerUserId 
+        WHERE p.PostTypeId = 2 
+        AND p.OwnerUserId IS NOT NULL
+    ) as AvgReputationOfAnswerers,
+    (
+        SELECT STRING_AGG(
+            CONCAT(u.DisplayName, ' (', u.Reputation, ')'), 
+            ', ' ORDER BY u.Reputation DESC
+        ) 
+        FROM Users u 
+        WHERE u.Reputation > 10000 
+        LIMIT 10
+    ) as TopUsersByReputation,
+    (
+        SELECT STRING_AGG(
+            CONCAT(t.TagName, ' (', t.Count, ')'), 
+            ', ' ORDER BY t.Count DESC
+        ) 
+        FROM Tags t 
+        LIMIT 10
+    ) as TopTagsByCount,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.Tags IS NOT NULL 
+        AND p.Tags != ''
+    ) as TaggedPosts,
+    (
+        SELECT COUNT(*) 
+        FROM Votes v 
+        INNER JOIN Posts p ON v.PostId = p.Id
+        WHERE v.VoteTypeId IN (2, 3) 
+        AND p.PostTypeId IN (1, 2)
+    ) as TotalVotes,
+    (
+        SELECT AVG(Score) 
+        FROM Posts p 
+        INNER JOIN Votes v ON p.Id = v.PostId
+        WHERE v.VoteTypeId IN (2, 3)
+    ) as AvgScoreWithVotes,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.CreationDate >= DATEADD('day', -7, CURRENT_TIMESTAMP)
+    ) as PostsLastWeek,
+    (
+        SELECT COUNT(*) 
+        FROM Users u 
+        WHERE u.CreationDate >= DATEADD('day', -30, CURRENT_TIMESTAMP)
+    ) as NewUsersLastMonth,
+    (
+        SELECT STRING_AGG(
+            CONCAT(p.Title, ' (', p.Score, ')'), 
+            ' | ' ORDER BY p.Score DESC
+        ) 
+        FROM Posts p 
+        WHERE p.PostTypeId = 1 
+        ORDER BY p.Score DESC
+        LIMIT 5
+    ) as TopQuestions,
+    (
+        SELECT STRING_AGG(
+            CONCAT(p.Title, ' (', p.Score, ')'), 
+            ' | ' ORDER BY p.Score DESC
+        ) 
+        FROM Posts p 
+        WHERE p.PostTypeId = 2 
+        ORDER BY p.Score DESC
+        LIMIT 5
+    ) as TopAnswers,
+    (
+        SELECT COUNT(*) 
+        FROM Comments c 
+        INNER JOIN Posts p ON c.PostId = p.Id
+        WHERE p.PostTypeId IN (1, 2)
+    ) as TotalComments,
+    (
+        SELECT COUNT(*) 
+        FROM Badges b 
+        INNER JOIN Users u ON b.UserId = u.Id
+        WHERE b.Class = 1 
+        AND u.Reputation > 5000
+    ) as GoldBadgesByHighRepUsers,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.CommunityOwnedDate IS NOT NULL
+    ) as CommunityOwnedPosts,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.ClosedDate IS NOT NULL
+    ) as ClosedPosts,
+    (
+        SELECT COUNT(*) 
+        FROM PostLinks pl 
+        WHERE pl.LinkTypeId = 3
+    ) as DuplicateLinks,
+    (
+        SELECT COUNT(*) 
+        FROM PostHistory ph 
+        WHERE ph.PostHistoryTypeId IN (10, 11, 12, 13)
+    ) as PostStatusChanges,
+    (
+        SELECT COUNT(*) 
+        FROM PostHistory ph 
+        WHERE ph.PostHistoryTypeId IN (5, 6, 8, 9)
+        AND ph.Text IS NOT NULL
+    ) as EditHistoryRecords,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        INNER JOIN Tags t ON p.Tags LIKE '%' || t.TagName || '%'
+        WHERE p.PostTypeId = 1
+    ) as TaggedQuestions,
+    (
+        SELECT COUNT(DISTINCT u.Id) 
+        FROM Users u 
+        INNER JOIN Posts p ON u.Id = p.OwnerUserId
+        INNER JOIN Votes v ON p.Id = v.PostId
+        WHERE v.VoteTypeId = 2 -- Upvote
+    ) as UsersWhoUpvoted,
+    (
+        SELECT COUNT(DISTINCT u.Id) 
+        FROM Users u 
+        INNER JOIN Posts p ON u.Id = p.OwnerUserId
+        INNER JOIN Comments c ON p.Id = c.PostId
+    ) as UsersWithComments,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.ViewCount > 1000
+    ) as HighlyViewedPosts,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.Score < 0
+    ) as NegativeScorePosts,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.OwnerUserId IS NULL
+    ) as PostsByDeletedUsers,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.ParentId IS NOT NULL 
+        AND p.PostTypeId = 2
+    ) as AnswerPosts,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.AcceptedAnswerId IS NOT NULL
+    ) as QuestionWithAcceptedAnswer,
+    (
+        SELECT COUNT(*) 
+        FROM Badges b 
+        WHERE b.TagBased = 1
+    ) as TagBasedBadges,
+    (
+        SELECT COUNT(*) 
+        FROM Badges b 
+        WHERE b.TagBased = 0
+    ) as NamedBadges;

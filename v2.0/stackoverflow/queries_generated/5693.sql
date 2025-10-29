@@ -1,0 +1,97 @@
+-- {"query": "5693.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 681} 
+WITH
+RecentActivePosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.OwnerUserId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.PostTypeId,
+    p.OwnerDisplayName,
+    p.LastEditorDisplayName
+  FROM Posts p
+  WHERE p.CreationDate >= now() - interval '180 days'
+),
+TopTags AS (
+  SELECT
+    t.TagName,
+    SUM(p.Score) AS ScoreSum,
+    AVG(p.ViewCount) AS AvgViews,
+    COUNT(*) AS PostCount
+  FROM RecentActivePosts rap
+  JOIN unnest(string_to_array(substring(rap.Tags, 2, length(rap.Tags)-2), '><')) AS t(TagName)
+    ON TRUE
+  GROUP BY t.TagName
+  HAVING COUNT(*) > 5
+),
+UserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    COUNT(p.Id) AS PostsCreated,
+    SUM(p.ViewCount) AS TotalViews,
+    SUM(p.Score) AS ReputationScore,
+    MAX(p.LastActivityDate) AS LastActive
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  WHERE u.CreationDate < now()
+  GROUP BY u.Id, u.DisplayName
+),
+QualifiedPosts AS (
+  SELECT
+    rap.PostId,
+    rap.OwnerUserId,
+    rap.Title,
+    rap.Tags,
+    rap.CreationDate,
+    rap.LastActivityDate,
+    rap.Score,
+    rap.ViewCount,
+    rap.AnswerCount,
+    rap.CommentCount,
+    rap.PostTypeId,
+    rap.OwnerDisplayName,
+    rap.LastEditorDisplayName
+  FROM RecentActivePosts rap
+  LEFT JOIN Votes v ON v.PostId = rap.PostId
+  WHERE rap.Score > 0 OR rap.ViewCount > 1000
+)
+SELECT
+  qp.PostId,
+  qp.Title,
+  qp.Tags,
+  qp.Score,
+  qp.ViewCount,
+  qp.AnswerCount,
+  qp.CommentCount,
+  qp.CreationDate,
+  qp.LastActivityDate,
+  qp.PostTypeId,
+  ua.UserId AS AuthorUserId,
+  ua.DisplayName AS AuthorDisplayName,
+  ua.TotalViews AS AuthorTotalViews,
+  ua.ReputationScore AS AuthorReputation,
+  wt.ScoreSum AS TagScoreTotal,
+  wt.AvgViews AS TagAverageViews,
+  wt.PostCount AS TagPostCount
+FROM QualifiedPosts qp
+LEFT JOIN UserActivity ua ON ua.UserId = qp.OwnerUserId
+LEFT JOIN (
+  SELECT
+    t.TagName,
+    SUM(p.Score) AS ScoreSum,
+    AVG(p.ViewCount) AS AvgViews,
+    COUNT(*) AS PostCount
+  FROM Posts p
+  JOIN unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS t(TagName)
+    ON TRUE
+  GROUP BY t.TagName
+) wt ON wt.TagName = substring(qp.Tags, 2, length(qp.Tags)-2)
+ORDER BY qp.LastActivityDate DESC, qp.Score DESC
+LIMIT 200;

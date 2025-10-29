@@ -1,0 +1,67 @@
+-- {"query": "5214.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 449} 
+WITH recent_comments AS (
+  SELECT
+    c.PostId,
+    COUNT(*) AS CommentCount,
+    MAX(c.CreationDate) AS LastCommentDate
+  FROM Comments c
+  GROUP BY c.PostId
+),
+top_posts AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.Views,
+    p.Score,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.Tags,
+    p.PostTypeId,
+    p.ParentId,
+    p.AnswerCount,
+    p.CommentCount,
+    p.LastActivityDate
+  FROM Posts p
+  LEFT JOIN recent_comments rc ON rc.PostId = p.Id
+  WHERE p.PostTypeId = 1 -- Questions
+    AND p.CreationDate >= CURRENT_DATE - INTERVAL '180 days'
+),
+tag_activity AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS QuestionCount,
+    SUM(p.Score) AS TotalScore,
+    AVG(p.Score) AS AvgScore,
+    MAX(p.LastActivityDate) AS LastActive
+  FROM Tags tg
+  JOIN Posts p ON p.Id = tg.ExcerptPostId
+  JOIN LATERAL unnest(string_to_array(lower(p.Tags), '>><')) AS tn(tag) ON TRUE
+  WHERE tg.IsModeratorOnly = 0
+  GROUP BY t.TagName
+  ORDER BY LastActive DESC
+  LIMIT 50
+)
+SELECT
+  'Benchmark_Sample_01' AS Benchmark,
+  tp.Id AS PostId,
+  tp.Title,
+  tp.Views,
+  tp.Score,
+  tp.CreationDate,
+  tp.OwnerUserId,
+  tp.Tags,
+  tp.LastActivityDate,
+  rc.CommentCount AS NumComments,
+  ta.QuestionCount AS TagQuestionCount,
+  ta.TotalScore AS TagTotalScore,
+  ta.AvgScore AS TagAvgScore,
+  ta.LastActive AS TagLastActive
+FROM top_posts tp
+LEFT JOIN recent_comments rc ON rc.PostId = tp.Id
+LEFT JOIN (
+  SELECT
+    "--" AS dummy
+) d ON TRUE
+LEFT JOIN tag_activity ta ON TRUE
+ORDER BY tp.LastActivityDate DESC, tp.Views DESC
+LIMIT 100;

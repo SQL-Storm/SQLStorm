@@ -1,0 +1,228 @@
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        MIN(P.CreationDate) AS FirstPostDate,
+        MAX(P.CreationDate) AS LastPostDate,
+        MAX(CASE WHEN PH_Edit.PostHistoryTypeId IN (4,5,6) AND PH_Edit.UserId = U.Id THEN PH_Edit.CreationDate ELSE NULL END) AS LastOwnEditDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id ELSE NULL END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id ELSE NULL END) AS TotalAnswers,
+        SUM(P.Score) AS TotalPostScore,
+        SUM(COALESCE(P.ViewCount, 0)) AS TotalPostViews,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        MAX(C.Score) AS MaxCommentScore,
+        AVG(CASE WHEN P.PostTypeId = 2 THEN P.Score ELSE NULL END) AS AvgAnswerScore,
+        SUM(CASE WHEN P.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS AcceptedAnswersGiven
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN PostHistory PH_Edit ON U.Id = PH_Edit.UserId AND P.Id = PH_Edit.PostId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate
+    HAVING COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id ELSE NULL END) >= 1
+       AND COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id ELSE NULL END) >= 1
+),
+UserBadgeStats AS (
+    SELECT
+        B.UserId,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(B.Id) AS TotalBadges
+    FROM Badges B
+    GROUP BY B.UserId
+),
+PostTagOccurrences AS (
+    SELECT
+        P.OwnerUserId AS UserId,
+        UNNEST(string_to_array(SUBSTRING(P.Tags FROM 2 FOR (CHAR_LENGTH(P.Tags)-2)), '><')) AS TagName,
+        P.CreationDate
+    FROM Posts P
+    WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL AND CHAR_LENGTH(P.Tags) > 2
+),
+PostActivityWindow AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId AS UserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.AcceptedAnswerId,
+        P.ParentId,
+        LAG(P.CreationDate, 1) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate) AS PrevPostDate,
+        LEAD(P.CreationDate, 1) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate) AS NextPostDate,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.Score DESC, P.CreationDate DESC) AS rn_best_post_score
+    FROM Posts P
+    WHERE P.OwnerUserId IS NOT NULL
+),
+UserPostPerformance AS (
+    SELECT
+        PAW.UserId,
+        PAW.PostId,
+        PAW.PostTypeId,
+        PAW.PostCreationDate,
+        PAW.PostScore,
+        PAW.AcceptedAnswerId,
+        PAW.ParentId,
+        PAW.PrevPostDate,
+        PAW.NextPostDate,
+        DENSE_RANK() OVER (PARTITION BY PAW.UserId ORDER BY PAW.PostScore DESC) AS RankOverallPostScore,
+        NTILE(4) OVER (PARTITION BY PAW.UserId ORDER BY PAW.PostScore DESC) AS ScoreQuartile,
+        AVG(PAW.PostScore) OVER (PARTITION BY PAW.UserId ORDER BY PAW.PostCreationDate ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS MovingAvgScore
+    FROM PostActivityWindow PAW
+),
+UserTagStats AS (
+    SELECT
+        PTA.UserId,
+        PTA.TagName,
+        COUNT(PTA.TagName) AS TagCount,
+        RANK() OVER (PARTITION BY PTA.UserId ORDER BY COUNT(PTA.TagName) DESC, PTA.TagName ASC) AS TagRank
+    FROM PostTagOccurrences PTA
+    GROUP BY PTA.UserId, PTA.TagName
+),
+RecentPostClosureEvents AS (
+    SELECT
+        PH.PostId,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.CreationDate ELSE NULL END) AS LatestCloseDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 11 THEN PH.CreationDate ELSE NULL END) AS LatestReopenDate,
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE NULL END) AS CloseEventCount,
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE NULL END) AS ReopenEventCount
+    FROM PostHistory PH
+    WHERE PH.PostHistoryTypeId IN (10, 11)
+    GROUP BY PH.PostId
+),
+HighValuePosts AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId AS UserId,
+        P.CreationDate AS CreationDate,
+        P.Score,
+        P.ViewCount,
+        P.Title AS PostTitle,
+        COALESCE(P.Tags, '<no-tags>') AS TagsString,
+        'Question' AS PostCategory
+    FROM Posts P
+    WHERE P.PostTypeId = 1 AND P.Score > 50 AND P.ViewCount > 1000 AND P.OwnerUserId IS NOT NULL
+    UNION ALL
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId AS UserId,
+        P.CreationDate AS CreationDate,
+        P.Score,
+        NULL AS ViewCount,
+        P.Body AS PostTitle,
+        '<answer>' AS TagsString,
+        'Answer' AS PostCategory
+    FROM Posts P
+    WHERE P.PostTypeId = 2 AND P.Score > 75 AND P.OwnerUserId IS NOT NULL
+),
+UserLinkAnalysis AS (
+    SELECT
+        PL.PostId,
+        PL.RelatedPostId,
+        PL.LinkTypeId,
+        LT.Name AS LinkTypeName,
+        P.OwnerUserId AS SourceUserId,
+        PR.OwnerUserId AS RelatedUserId,
+        CASE
+            WHEN PL.LinkTypeId = 1 THEN 'Linked'
+            WHEN PL.LinkTypeId = 3 THEN 'Duplicate'
+            ELSE 'Other'
+        END AS LinkCategory
+    FROM PostLinks PL
+    JOIN LinkTypes LT ON PL.LinkTypeId = LT.Id
+    LEFT JOIN Posts P ON PL.PostId = P.Id
+    LEFT JOIN Posts PR ON PL.RelatedPostId = PR.Id
+)
+SELECT
+    UAS.UserId,
+    UAS.DisplayName,
+    UAS.Reputation,
+    UAS.FirstPostDate,
+    UAS.LastPostDate,
+    UAS.LastOwnEditDate,
+    AGE(UAS.LastPostDate, UAS.FirstPostDate) AS UserActivityDuration,
+    COALESCE(UAS.TotalQuestions, 0) AS TotalQuestionsPosted,
+    COALESCE(UAS.TotalAnswers, 0) AS TotalAnswersPosted,
+    COALESCE(UAS.AvgAnswerScore, 0.0) AS AverageAnswerScore,
+    UBS.GoldBadges,
+    UBS.SilverBadges,
+    UBS.BronzeBadges,
+    UBS.TotalBadges,
+    (SELECT UTS.TagName FROM UserTagStats UTS WHERE UTS.UserId = UAS.UserId AND UTS.TagRank = 1 FETCH FIRST 1 ROWS ONLY) AS MostFrequentTag,
+    (SELECT MAX(Q.Score) FROM Posts Q WHERE Q.OwnerUserId = UAS.UserId AND Q.PostTypeId = 1) AS MaxQuestionScore,
+    UAS.TotalPostScore,
+    UAS.TotalPostViews,
+    UAS.TotalComments,
+    UAS.MaxCommentScore,
+    CASE
+        WHEN UAS.Reputation > 10000 AND UAS.TotalPosts > 200 AND UAS.LastOwnEditDate IS NOT NULL AND UAS.LastOwnEditDate > UAS.LastPostDate - INTERVAL '1 year' THEN 'Highly Engaged Veteran'
+        WHEN UAS.Reputation > 5000 AND UAS.TotalPosts > 100 AND UAS.LastOwnEditDate IS NOT NULL THEN 'Active Contributor'
+        WHEN UAS.Reputation > 1000 AND UAS.TotalPosts > 50 THEN 'Regular User'
+        ELSE 'Casual User'
+    END AS UserEngagementSegment,
+    UPP.PostId AS TopPerformingPostId,
+    UPP.PostTypeId AS TopPerformingPostType,
+    UPP.PostScore AS TopPerformingPostScore,
+    UPP.RankOverallPostScore,
+    UPP.ScoreQuartile,
+    UPP.MovingAvgScore,
+    AGE(UPP.PostCreationDate, UPP.PrevPostDate) AS TimeSincePrevPost,
+    CASE
+        WHEN UPP.PostTypeId = 2 AND EXISTS (SELECT 1 FROM Posts Q_ACC WHERE Q_ACC.Id = UPP.ParentId AND Q_ACC.AcceptedAnswerId = UPP.PostId) THEN TRUE
+        WHEN UPP.PostTypeId = 1 AND UPP.AcceptedAnswerId IS NOT NULL THEN TRUE
+        ELSE FALSE
+    END AS IsAcceptedOrHasAcceptedAnswer,
+    COALESCE(RPCE.CloseEventCount, 0) AS PostClosedCount,
+    COALESCE(RPCE.ReopenEventCount, 0) AS PostReopenedCount,
+    (RPCE.LatestCloseDate IS NOT NULL AND RPCE.LatestReopenDate IS NOT NULL AND RPCE.LatestReopenDate > RPCE.LatestCloseDate) AS WasReopenedAfterClose,
+    NULLIF(UAS.AcceptedAnswersGiven, 0) AS NonZeroAcceptedAnswers,
+    CAST(COALESCE(UBS.GoldBadges,0) AS NUMERIC) / NULLIF(COALESCE(UBS.TotalBadges,0), 0) AS GoldBadgeRatio,
+    U.LastAccessDate,
+    U.Location,
+    U.Views AS UserViews,
+    HVP.PostId AS HighValuePostExampleId,
+    HVP.Score AS HighValuePostExampleScore,
+    HVP.PostCategory AS HighValuePostCategory,
+    ULA_Out.LinkCategory,
+    COALESCE(U.AboutMe, 'No "About Me" provided') AS AboutMeSummary,
+    CHAR_LENGTH(COALESCE(U.AboutMe, '')) AS AboutMeLength,
+    LOWER(U.DisplayName) AS LowerCaseDisplayName,
+    TO_CHAR(U.CreationDate, 'YYYY-MM') AS UserCreationMonth
+FROM UserActivitySummary UAS
+INNER JOIN Users U ON UAS.UserId = U.Id
+LEFT JOIN UserBadgeStats UBS ON UAS.UserId = UBS.UserId
+LEFT JOIN (
+    SELECT UserId, PostId, PostTypeId, PostScore, RankOverallPostScore, ScoreQuartile, MovingAvgScore, PostCreationDate, PrevPostDate, AcceptedAnswerId, ParentId
+    FROM UserPostPerformance
+    WHERE RankOverallPostScore = 1
+) UPP ON UAS.UserId = UPP.UserId
+LEFT JOIN RecentPostClosureEvents RPCE ON UPP.PostId = RPCE.PostId
+LEFT JOIN HighValuePosts HVP ON UAS.UserId = HVP.UserId AND HVP.CreationDate = (
+    SELECT MAX(HVP2.CreationDate) FROM HighValuePosts HVP2 WHERE HVP2.UserId = UAS.UserId
+)
+LEFT JOIN UserLinkAnalysis ULA_Out ON UPP.PostId = ULA_Out.PostId
+WHERE
+    UAS.Reputation > 750
+    AND UAS.LastPostDate IS NOT NULL
+    AND UAS.FirstPostDate IS NOT NULL
+    AND UAS.TotalPosts >= 3
+    AND UAS.DisplayName IS NOT NULL AND CHAR_LENGTH(TRIM(UAS.DisplayName)) > 0
+    AND (U.Location LIKE '%USA%' OR U.Location LIKE '%Canada%' OR U.Location LIKE '%Europe%' OR U.Location IS NULL)
+    AND NOT EXISTS (
+        SELECT 1
+        FROM Badges B_Filter
+        WHERE B_Filter.UserId = UAS.UserId AND B_Filter.Name = 'Disciplined'
+    )
+    AND U.CreationDate BETWEEN DATE '2015-01-01' AND DATE '2022-12-31'
+ORDER BY
+    UAS.Reputation DESC,
+    UAS.TotalPosts DESC,
+    UAS.AvgAnswerScore DESC NULLS LAST,
+    UserActivityDuration DESC,
+    U.CreationDate
+FETCH FIRST 750 ROWS ONLY;

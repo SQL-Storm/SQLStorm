@@ -1,0 +1,228 @@
+WITH UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.Views AS UserProfileViews,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS TotalQuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS TotalAnswerScore,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(p.CreationDate) AS LatestPostDate,
+        NTILE(5) OVER (ORDER BY u.Reputation DESC, u.UpVotes DESC) AS ReputationTier
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Views, u.UpVotes, u.DownVotes
+),
+PostDetails AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.Title,
+        p.Body,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.LastActivityDate,
+        p.ClosedDate,
+        (SELECT COUNT(ph.Id) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4, 5, 6)) AS EditCount,
+        (SELECT MAX(ph.CreationDate) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4, 5, 6)) AS LastEditDate_Calculated,
+        COALESCE(p.LastEditorDisplayName, 'Community') AS LastEditorDisplayName_Coalesced,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.AnswerCount > 0 AND p.AcceptedAnswerId IS NOT NULL THEN 'Answered & Accepted'
+            WHEN p.AnswerCount > 0 THEN 'Answered'
+            ELSE 'Open'
+        END AS PostStatus,
+        CASE
+            WHEN p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2 THEN SPLIT_PART(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><', 1)
+            ELSE NULL
+        END AS PrimaryTag,
+        (
+            SELECT cm.Text
+            FROM Comments cm
+            WHERE cm.PostId = p.Id AND cm.Score = (SELECT MAX(c2.Score) FROM Comments c2 WHERE c2.PostId = p.Id)
+            ORDER BY cm.CreationDate DESC
+            FETCH FIRST 1 ROW ONLY
+        ) AS TopCommentText,
+        (
+            SELECT crt.Name
+            FROM PostHistory ph2
+            JOIN CloseReasonTypes crt ON TRY_CAST(ph2.Comment AS INTEGER) = crt.Id
+            WHERE ph2.PostId = p.Id AND ph2.PostHistoryTypeId = 10 AND ph2.Comment IS NOT NULL
+            ORDER BY ph2.CreationDate DESC
+            FETCH FIRST 1 ROW ONLY
+        ) AS LatestCloseReasonName
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+RankedPostHistoryEvents AS (
+    SELECT
+        ph.PostId,
+        ph.CreationDate AS HistoryEventDate,
+        ph.PostHistoryTypeId,
+        ph.UserId AS HistoryInitiatorUserId,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId, ph.PostHistoryTypeId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (10, 11, 12, 13, 19, 20)
+),
+LinkAnalysis AS (
+    SELECT
+        pl.PostId,
+        COUNT(CASE WHEN lt.Name = 'Linked' THEN 1 END) AS LinkedPostsCount,
+        COUNT(CASE WHEN lt.Name = 'Duplicate' THEN 1 END) AS DuplicateOfCount,
+        MAX(CASE WHEN lt.Name = 'Duplicate' THEN pl.RelatedPostId END) AS MostRecentDuplicatePostId
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    GROUP BY pl.PostId
+),
+UserBadgeStats AS (
+    SELECT
+        b.UserId,
+        COUNT(b.Id) AS UserBadgeCount,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadgeCount,
+        COUNT(CASE WHEN b.Name = 'Inquisitive' OR b.Name = 'Curious' THEN 1 END) AS QuestionRelatedBadges
+    FROM Badges b
+    GROUP BY b.UserId
+)
+SELECT
+    pd.PostId,
+    pd.PostTypeId,
+    ua.DisplayName AS OwnerDisplayName,
+    ua.Reputation AS OwnerReputation,
+    ua.UserProfileViews,
+    ubs.UserBadgeCount,
+    ubs.GoldBadgeCount,
+    pd.Title,
+    pd.PostCreationDate,
+    pd.Score AS PostScore,
+    pd.ViewCount AS PostViewCount,
+    pd.AnswerCount,
+    pd.CommentCount AS PostCommentCount,
+    pd.FavoriteCount,
+    pd.PostStatus,
+    pd.PrimaryTag,
+    pd.EditCount,
+    pd.LastEditDate_Calculated,
+    pd.LastEditorDisplayName_Coalesced,
+    pd.TopCommentText,
+    pd.LatestCloseReasonName,
+    la.LinkedPostsCount,
+    la.DuplicateOfCount,
+    p_acc.Score AS AcceptedAnswerScore,
+    p_acc_owner.DisplayName AS AcceptedAnswerOwnerDisplayName,
+    CASE
+        WHEN pd.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1 AND CreationDate >= DATE '2023-01-01') THEN 'AboveAvgScore2023'
+        WHEN pd.Score > 0 THEN 'HasPositiveScore'
+        ELSE 'NonPositiveScore'
+    END AS QuestionScoreCategory,
+    RANK() OVER (PARTITION BY pd.PrimaryTag ORDER BY pd.Score DESC, pd.ViewCount DESC) AS RankInPrimaryTag,
+    AVG(pd.Score) OVER (PARTITION BY ua.ReputationTier) AS AvgScoreInOwnerReputationTier,
+    SUM(pd.CommentCount) OVER (ORDER BY pd.PostCreationDate ROWS BETWEEN 90 PRECEDING AND CURRENT ROW) AS Rolling90DayCommentSum,
+    (pd.PostCreationDate - ua.UserCreationDate) AS PostAgeRelativeToUserCreation,
+    COALESCE(pd.FavoriteCount, 0) + COALESCE(pd.AnswerCount, 0) * 5 + COALESCE(la.LinkedPostsCount, 0) * 2 AS EngagementIndex,
+    EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = pd.OwnerUserId AND b.Name IN ('Enthusiast', 'Fanatic')) AS OwnerIsHighlyEngaged,
+    (SELECT rph.HistoryEventDate FROM RankedPostHistoryEvents rph WHERE rph.PostId = pd.PostId AND rph.PostHistoryTypeId = 10 AND rph.rn = 1) AS LastClosedDate,
+    (SELECT rph.HistoryEventDate FROM RankedPostHistoryEvents rph WHERE rph.PostId = pd.PostId AND rph.PostHistoryTypeId = 11 AND rph.rn = 1) AS LastReopenedDate
+FROM PostDetails pd
+INNER JOIN UserActivitySummary ua ON pd.OwnerUserId = ua.UserId
+LEFT JOIN UserBadgeStats ubs ON pd.OwnerUserId = ubs.UserId
+LEFT JOIN Posts p_acc ON pd.AcceptedAnswerId = p_acc.Id
+LEFT JOIN Users p_acc_owner ON p_acc.OwnerUserId = p_acc_owner.Id
+LEFT JOIN LinkAnalysis la ON pd.PostId = la.PostId
+WHERE
+    pd.PostTypeId = 1
+    AND pd.PostCreationDate BETWEEN DATE '2023-01-01' AND DATE '2023-12-31'
+    AND pd.Score >= 0
+    AND (pd.ViewCount > 1000 OR pd.FavoriteCount > 20 OR pd.AnswerCount > 5)
+    AND (
+        pd.PrimaryTag LIKE '%sql%'
+        OR pd.PrimaryTag LIKE '%performance%'
+        OR pd.PrimaryTag IS NULL
+    )
+    AND pd.OwnerUserId IS NOT NULL
+    AND NOT EXISTS (
+        SELECT 1
+        FROM Comments c
+        WHERE c.PostId = pd.PostId
+        AND LOWER(c.Text) LIKE '%bug report%'
+        AND c.CreationDate > pd.PostCreationDate + INTERVAL '1 month'
+    )
+    AND EXISTS (
+        SELECT 1
+        FROM Votes v
+        WHERE v.PostId = pd.PostId
+        AND v.VoteTypeId = 2
+        AND v.UserId IS NOT NULL
+        AND v.CreationDate < pd.LastActivityDate
+    )
+    AND (
+        (pd.ClosedDate IS NOT NULL AND pd.LatestCloseReasonName = 'Duplicate') OR pd.ClosedDate IS NULL
+    )
+UNION ALL
+SELECT
+    pd.PostId,
+    pd.PostTypeId,
+    ua.DisplayName AS OwnerDisplayName,
+    ua.Reputation AS OwnerReputation,
+    ua.UserProfileViews,
+    ubs.UserBadgeCount,
+    ubs.GoldBadgeCount,
+    SUBSTRING(pd.Body FROM 1 FOR 150) AS TitleSnippet,
+    pd.PostCreationDate,
+    pd.Score AS PostScore,
+    NULL AS PostViewCount,
+    NULL AS AnswerCount,
+    pd.CommentCount AS PostCommentCount,
+    NULL AS FavoriteCount,
+    pd.PostStatus,
+    pd.PrimaryTag,
+    pd.EditCount,
+    pd.LastEditDate_Calculated,
+    pd.LastEditorDisplayName_Coalesced,
+    pd.TopCommentText,
+    NULL AS LatestCloseReasonName,
+    la.LinkedPostsCount,
+    la.DuplicateOfCount,
+    NULL AS AcceptedAnswerScore,
+    NULL AS AcceptedAnswerOwnerDisplayName,
+    CASE
+        WHEN pd.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 2 AND CreationDate >= DATE '2023-01-01') THEN 'AboveAvgScore2023'
+        WHEN pd.Score >= 10 THEN 'HighlyRatedAnswer'
+        ELSE 'ModeratelyRatedAnswer'
+    END AS AnswerScoreCategory,
+    RANK() OVER (PARTITION BY pd.ParentId ORDER BY pd.Score DESC, pd.PostCreationDate ASC) AS RankInParentQuestionAnswers,
+    AVG(pd.Score) OVER (PARTITION BY ua.ReputationTier) AS AvgScoreInOwnerReputationTier,
+    SUM(pd.CommentCount) OVER (ORDER BY pd.PostCreationDate ROWS BETWEEN 90 PRECEDING AND CURRENT ROW) AS Rolling90DayCommentSum,
+    (pd.PostCreationDate - ua.UserCreationDate) AS PostAgeRelativeToUserCreation,
+    COALESCE(pd.Score, 0) * 3 + COALESCE(pd.CommentCount, 0) * 2 AS EngagementIndex,
+    EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = pd.OwnerUserId AND b.Name = 'Great Answer') AS OwnerHasGreatAnswerBadge,
+    NULL AS LastClosedDate,
+    NULL AS LastReopenedDate
+FROM PostDetails pd
+INNER JOIN UserActivitySummary ua ON pd.OwnerUserId = ua.UserId
+LEFT JOIN UserBadgeStats ubs ON pd.OwnerUserId = ubs.UserId
+LEFT JOIN LinkAnalysis la ON pd.PostId = la.PostId
+WHERE
+    pd.PostTypeId = 2
+    AND pd.Score >= 5
+    AND pd.PostCreationDate BETWEEN DATE '2023-01-01' AND DATE '2023-12-31'
+    AND pd.OwnerUserId IS NOT NULL
+    AND ua.Reputation >= 1000
+    AND (LOWER(pd.Body) LIKE '%index%' OR LOWER(pd.Body) LIKE '%optimization%')
+ORDER BY
+    OwnerReputation DESC, PostScore DESC, PostCreationDate DESC
+FETCH FIRST 25000 ROWS ONLY;

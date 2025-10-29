@@ -1,0 +1,369 @@
+with
+config as (
+  select
+    cast(365 as int) as recent_days,
+    cast(30 as int) as hot_window_days,
+    cast(0.05 as numeric) as heavy_editor_percentile
+),
+recent_questions as (
+  select
+    p.Id,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.FavoriteCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.ClosedDate,
+    p.Title,
+    p.Tags,
+    string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><') as tag_list,
+    coalesce(nullif(trim(lower(p.Title)), ''), '(no title)') as norm_title
+  from Posts p
+  join PostTypes pt on pt.Id = p.PostTypeId and pt.Name = 'Question'
+  cross join config c
+  where p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - cast((c.recent_days || ' days') as interval)
+),
+rq_tags as (
+  select
+    rq.Id as QuestionId,
+    unnest(rq.tag_list) as TagName
+  from recent_questions rq
+  where rq.tag_list is not null
+),
+tag_activity as (
+  select
+    rt.TagName,
+    count(distinct rt.QuestionId) as recent_q_count,
+    sum(coalesce(p.Score, 0)) as recent_score_sum
+  from rq_tags rt
+  join Tags t on t.TagName = rt.TagName
+  join Posts p on p.Id = rt.QuestionId
+  group by rt.TagName
+),
+top_tags as (
+  select
+    ta.TagName,
+    ta.recent_q_count,
+    ta.recent_score_sum,
+    dense_rank() over (order by ta.recent_q_count desc, ta.recent_score_sum desc, ta.TagName) as tag_rank
+  from tag_activity ta
+),
+hot_activity as (
+  select
+    rq.Id as QuestionId,
+    sum(case when cmt.Id is not null then 1 else 0 end) as hot_comments,
+    sum(case when v.Id is not null and v.VoteTypeId in (2,3,5,8,9) then 1 else 0 end) as hot_votes,
+    sum(case when v.Id is not null and v.VoteTypeId = 2 then 1 else 0 end) as hot_upvotes,
+    sum(case when v.Id is not null and v.VoteTypeId = 3 then 1 else 0 end) as hot_downvotes,
+    sum(case when ph.Id is not null and ph.PostHistoryTypeId in (4,5,6,24) then 1 else 0 end) as hot_edits
+  from recent_questions rq
+  cross join config cfg
+  left join Comments cmt
+    on cmt.PostId = rq.Id
+   and cmt.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - cast((cfg.hot_window_days || ' days') as interval)
+  left join Votes v
+    on v.PostId = rq.Id
+   and v.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - cast((cfg.hot_window_days || ' days') as interval)
+  left join PostHistory ph
+    on ph.PostId = rq.Id
+   and ph.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - cast((cfg.hot_window_days || ' days') as interval)
+  group by rq.Id
+),
+question_editors as (
+  select
+    ph.PostId as QuestionId,
+    ph.UserId as EditorUserId,
+    count(*) filter (where ph.PostHistoryTypeId in (4,5,6,24)) as edit_events
+  from PostHistory ph
+  join recent_questions rq on rq.Id = ph.PostId
+  group by ph.PostId, ph.UserId
+),
+question_edit_threshold as (
+  select
+    qe.QuestionId,
+    -- percentile_cont requires the ordering expression to reference grouped columns only.
+    -- compute per-question percentile by using an aggregate over edit_events per question.
+    percentile_cont((select cfg.heavy_editor_percentile from config cfg)) within group (order by qe.edit_events) as edit_threshold
+  from question_editors qe
+  group by qe.QuestionId
+),
+heavy_editors as (
+  select
+    qe.QuestionId,
+    qe.EditorUserId,
+    qe.edit_events
+  from question_editors qe
+  join question_edit_threshold qt
+    on qt.QuestionId = qe.QuestionId
+  where qe.edit_events >= qt.edit_threshold
+),
+heavy_editor_stats as (
+  select
+    he.QuestionId,
+    count(distinct he.EditorUserId) as heavy_editor_count,
+    max(he.edit_events) as max_edits_by_one_user
+  from heavy_editors he
+  group by he.QuestionId
+),
+link_and_answer as (
+  select
+    rq.Id as QuestionId,
+    max(case when pl.LinkTypeId = 3 then 1 else 0 end) as is_marked_duplicate,
+    count(*) filter (where pl.LinkTypeId = 1) as linked_count,
+    bool_or(pl.LinkTypeId = 3) as has_duplicate_link,
+    max(case when a.Id is not null then 1 else 0 end) as has_accepted_answer,
+    coalesce(a.Score, 0) as accepted_answer_score
+  from recent_questions rq
+  left join PostLinks pl
+    on pl.PostId = rq.Id
+  left join Posts a
+    on a.Id = (select p2.AcceptedAnswerId from Posts p2 where p2.Id = rq.Id)
+  group by rq.Id, a.Score
+),
+user_recent_reputation as (
+  select
+    u.Id as UserId,
+    u.Reputation as current_rep,
+    coalesce(sum(case when v.VoteTypeId = 2 then 10 when v.VoteTypeId = 3 then -2 else 0 end), 0) as approx_recent_rep_delta
+  from Users u
+  left join Votes v
+    on v.UserId = u.Id
+   and v.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+  group by u.Id, u.Reputation
+),
+user_badges as (
+  select
+    b.UserId,
+    sum(case when b.Class = 1 then 1 else 0 end) as gold_badges,
+    sum(case when b.Class = 2 then 1 else 0 end) as silver_badges,
+    sum(case when b.Class = 3 then 1 else 0 end) as bronze_badges,
+    sum(case when b.TagBased = 1 then 1 else 0 end) as tag_badges
+  from Badges b
+  group by b.UserId
+),
+question_hotness as (
+  select
+    rq.Id as QuestionId,
+    rq.Score,
+    rq.ViewCount,
+    rq.FavoriteCount,
+    rq.AnswerCount,
+    rq.CommentCount,
+    case when rq.ClosedDate is null then 0 else 1 end as is_closed,
+    coalesce(ha.hot_upvotes, 0) * 5
+      - coalesce(ha.hot_downvotes, 0) * 2
+      + coalesce(ha.hot_comments, 0) * 1
+      + coalesce(ha.hot_edits, 0) * 3
+      + coalesce(la.accepted_answer_score, 0) * 2
+      + least(coalesce(rq.ViewCount, 0) / 100, 1000)
+      + least(coalesce(rq.FavoriteCount, 0) * 2, 500)
+      + coalesce(rq.Score, 0) * 4
+      + case when la.is_marked_duplicate = 1 then -50 else 0 end
+      + case when rq.ClosedDate is not null then -100 else 0 end
+      as hotness_score
+  from recent_questions rq
+  left join hot_activity ha on ha.QuestionId = rq.Id
+  left join link_and_answer la on la.QuestionId = rq.Id
+),
+question_windows as (
+  select
+    qh.QuestionId,
+    qh.Score,
+    qh.ViewCount,
+    qh.FavoriteCount,
+    qh.AnswerCount,
+    qh.CommentCount,
+    qh.is_closed,
+    qh.hotness_score,
+    row_number() over(order by qh.hotness_score desc, qh.Score desc, qh.ViewCount desc) as rn_global,
+    percent_rank() over(order by qh.hotness_score desc) as pr_hotness,
+    ntile(20) over(order by qh.hotness_score desc) as ntile_hotness
+  from question_hotness qh
+),
+question_with_tags as (
+  select
+    qw.QuestionId,
+    array_agg(distinct rt.TagName order by rt.TagName) as tags,
+    min(tt.tag_rank) as best_tag_rank,
+    max(tt.recent_q_count) as max_tag_recent_qs
+  from question_windows qw
+  left join rq_tags rt on rt.QuestionId = qw.QuestionId
+  left join top_tags tt on tt.TagName = rt.TagName
+  group by qw.QuestionId
+),
+title_signature as (
+  select
+    rq.Id as QuestionId,
+    regexp_replace(regexp_replace(lower(coalesce(rq.Title, '')), '\s+', ' ', 'g'), '[^a-z0-9 ]', '', 'g') as sig
+  from recent_questions rq
+),
+similar_questions as (
+  select
+    ts1.QuestionId,
+    count(*) filter (where ts2.QuestionId is not null and ts2.QuestionId <> ts1.QuestionId) as similar_title_count
+  from title_signature ts1
+  left join title_signature ts2
+    on ts2.sig = ts1.sig
+  group by ts1.QuestionId
+),
+hotness_stats as (
+  select
+    avg(qw.hotness_score) as mean_hot,
+    stddev_pop(qw.hotness_score) as std_hot
+  from question_windows qw
+),
+question_outliers as (
+  select
+    qw.QuestionId,
+    qw.hotness_score,
+    hs.mean_hot,
+    hs.std_hot,
+    case
+      when hs.std_hot is null or hs.std_hot = 0 then 0
+      else (qw.hotness_score - hs.mean_hot) / hs.std_hot
+    end as hotness_z
+  from question_windows qw
+  cross join hotness_stats hs
+),
+final_assembly as (
+  select
+    rq.Id,
+    rq.Title,
+    qw.Score,
+    qw.ViewCount,
+    qw.FavoriteCount,
+    qw.AnswerCount,
+    qw.CommentCount,
+    qw.is_closed,
+    qw.hotness_score,
+    qo.hotness_z,
+    qw.rn_global,
+    qw.pr_hotness,
+    qw.ntile_hotness,
+    qwt.tags,
+    qwt.best_tag_rank,
+    qwt.max_tag_recent_qs,
+    coalesce(la.is_marked_duplicate, 0) as is_marked_duplicate,
+    la.has_accepted_answer,
+    la.accepted_answer_score,
+    coalesce(he.heavy_editor_count, 0) as heavy_editor_count,
+    coalesce(he.max_edits_by_one_user, 0) as max_edits_by_one_user,
+    coalesce(sq.similar_title_count, 0) as similar_title_count,
+    rq.OwnerUserId
+  from recent_questions rq
+  join question_windows qw on qw.QuestionId = rq.Id
+  join question_outliers qo on qo.QuestionId = rq.Id
+  left join question_with_tags qwt on qwt.QuestionId = rq.Id
+  left join link_and_answer la on la.QuestionId = rq.Id
+  left join heavy_editor_stats he on he.QuestionId = rq.Id
+  left join similar_questions sq on sq.QuestionId = rq.Id
+),
+final_with_users as (
+  select
+    fa.*,
+    u.DisplayName as owner_name,
+    u.Reputation,
+    urr.approx_recent_rep_delta,
+    coalesce(ub.gold_badges, 0) as gold_badges,
+    coalesce(ub.silver_badges, 0) as silver_badges,
+    coalesce(ub.bronze_badges, 0) as bronze_badges,
+    coalesce(ub.tag_badges, 0) as tag_badges
+  from final_assembly fa
+  left join Users u on u.Id = fa.OwnerUserId
+  left join user_recent_reputation urr on urr.UserId = fa.OwnerUserId
+  left join user_badges ub on ub.UserId = fa.OwnerUserId
+),
+top_hot as (
+  select QuestionId from question_windows where pr_hotness >= 0.9
+),
+top_tags_set as (
+  select qwt.QuestionId
+  from question_with_tags qwt
+  where coalesce(qwt.best_tag_rank, 999999) <= 50
+),
+intersection_set as (
+  select th.QuestionId
+  from top_hot th
+  intersect
+  select tt.QuestionId
+  from top_tags_set tt
+),
+scored as (
+  select
+    fwu.*,
+    case
+      when fwu.is_marked_duplicate = 1 then 'duplicate'
+      when fwu.is_closed = 1 then 'closed'
+      when fwu.hotness_z >= 2 then 'very_hot'
+      when fwu.ntile_hotness <= 2 then 'top_10_percent'
+      else 'normal'
+    end as status_bucket,
+    (
+    case
+      when fwu.best_tag_rank is null then 0
+      when fwu.best_tag_rank <= 10 then 50
+      when fwu.best_tag_rank <= 100 then 20
+      else 5
+    end
+    + case when fwu.heavy_editor_count >= 2 then 10 else 0 end
+    + greatest(least(coalesce(fwu.accepted_answer_score, 0), 50), -10)
+    + case when fwu.similar_title_count >= 3 then -15 else 0 end
+    + case when fwu.gold_badges >= 1 then 10 else 0 end
+    + case when fwu.approx_recent_rep_delta > 200 then 5 else 0 end
+    + case when fwu.is_closed = 1 then -30 else 0 end
+    ) as composite_bonus
+  from final_with_users fwu
+)
+select
+  s.Id as QuestionId,
+  s.Title,
+  s.owner_name,
+  s.Reputation,
+  s.gold_badges || '/' || s.silver_badges || '/' || s.bronze_badges as badge_mix,
+  s.tags,
+  s.Score,
+  s.ViewCount,
+  s.FavoriteCount,
+  s.AnswerCount,
+  s.CommentCount,
+  s.hotness_score,
+  round(cast(s.hotness_z as numeric), 3) as hotness_z,
+  s.ntile_hotness,
+  s.best_tag_rank,
+  s.max_tag_recent_qs,
+  s.heavy_editor_count,
+  s.max_edits_by_one_user,
+  s.is_marked_duplicate,
+  s.similar_title_count,
+  s.status_bucket,
+  s.composite_bonus,
+  case when s.Id in (select QuestionId from intersection_set) then 1 else 0 end as in_top_hot_and_top_tag,
+  coalesce((
+    select string_agg(distinct t2.TagName, ',')
+    from rq_tags rt2
+    join Tags t2 on t2.TagName = rt2.TagName
+    where rt2.QuestionId = s.Id
+  ), '(no tags)') as tag_list_csv,
+  left(coalesce(s.Title, ''), 120) as title_sample,
+  (length(coalesce(s.Title, '')) - length(replace(coalesce(s.Title, ''), ' ', ''))) + 1 as approx_word_count,
+  s.pr_hotness
+from scored s
+where
+  (
+    (s.pr_hotness >= 0.8 and s.Score >= 0)
+    or (s.hotness_z >= 1.0 and s.AnswerCount is not null)
+    or (s.is_marked_duplicate = 0 and s.similar_title_count <= 2)
+  )
+  and (
+    s.best_tag_rank is null
+    or s.best_tag_rank <= 200
+    or (s.best_tag_rank > 200 and s.hotness_score >= 50)
+  )
+order by
+  s.status_bucket,
+  (s.hotness_score + s.composite_bonus) desc,
+  s.ViewCount desc,
+  s.Score desc
+limit 250;

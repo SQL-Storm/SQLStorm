@@ -1,0 +1,167 @@
+WITH
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      COUNT(DISTINCT p.Id) AS PostCount,
+      SUM(p.ViewCount) AS TotalViews,
+      SUM(p.AnswerCount) AS TotalAnswers,
+      MAX(p.CreationDate) AS LastPostDate,
+      RANK() OVER (ORDER BY SUM(p.ViewCount) DESC) AS ViewRank,
+      ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS ActivityRank
+    FROM
+      Users u
+      LEFT JOIN Posts p
+        ON u.Id = p.OwnerUserId
+    WHERE
+      u.CreationDate < DATE '2023-01-01'
+    GROUP BY
+      u.Id,
+      u.DisplayName
+  ),
+  PostEngagement AS (
+    SELECT
+      p.Id AS PostId,
+      p.Title,
+      p.PostTypeId,
+      pt.Name AS PostTypeName,
+      COUNT(DISTINCT c.Id) AS CommentCount,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+      SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoriteCount,
+      AVG(p.Score) OVER (PARTITION BY p.PostTypeId) AS AvgScoreForPostType,
+      CASE
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        ELSE 'Active'
+      END AS PostStatus,
+      LEAD(p.CreationDate, 1, TIMESTAMP '2050-01-01 00:00:00') OVER (ORDER BY p.CreationDate) AS NextPostCreationDate,
+      p.ClosedDate,
+      p.CommunityOwnedDate,
+      p.CreationDate
+    FROM
+      Posts p
+      JOIN PostTypes pt
+        ON p.PostTypeId = pt.Id
+      LEFT JOIN Comments c
+        ON p.Id = c.PostId
+      LEFT JOIN Votes v
+        ON p.Id = v.PostId
+    WHERE
+      p.Score > 0 OR EXISTS (
+        SELECT 1 FROM Comments cc WHERE cc.PostId = p.Id
+      )
+    GROUP BY
+      p.Id,
+      p.Title,
+      p.PostTypeId,
+      pt.Name,
+      p.ClosedDate,
+      p.CommunityOwnedDate,
+      p.CreationDate
+  ),
+  ComplexCalculations AS (
+    SELECT
+      pe.PostId,
+      pe.Title,
+      pe.PostTypeName,
+      pe.CommentCount,
+      pe.UpVoteCount,
+      pe.DownVoteCount,
+      pe.FavoriteCount,
+      pe.AvgScoreForPostType,
+      pe.PostStatus,
+      (pe.UpVoteCount - pe.DownVoteCount) AS NetVoteScore,
+      CASE
+        WHEN pe.PostTypeName = 'Question' THEN pe.UpVoteCount * 10 + pe.CommentCount * 2
+        WHEN pe.PostTypeName = 'Answer' THEN pe.UpVoteCount * 5 + pe.CommentCount * 1
+        ELSE pe.UpVoteCount
+      END AS WeightedEngagement,
+      (CAST(pe.NextPostCreationDate AS DATE) - CAST(pe.CreationDate AS DATE)) AS DaysSinceLastActivity,
+      SUBSTRING(pe.Title FROM 1 FOR 30) AS ShortTitle,
+      REPLACE(pe.Title, ' ', '_') AS TitleWithUnderscores,
+      CASE
+        WHEN POSITION('(' IN pe.Title) > 0 THEN 'Has Parenthesis'
+        ELSE 'No Parenthesis'
+      END AS TitleFormat,
+      pe.CreationDate,
+      pe.NextPostCreationDate
+    FROM
+      PostEngagement pe
+  )
+SELECT
+  ua.DisplayName,
+  ua.PostCount,
+  ua.TotalViews,
+  cc.Title,
+  cc.PostTypeName,
+  cc.CommentCount,
+  cc.UpVoteCount,
+  cc.DownVoteCount,
+  cc.FavoriteCount,
+  cc.NetVoteScore,
+  cc.WeightedEngagement,
+  cc.DaysSinceLastActivity,
+  cc.TitleFormat,
+  CASE
+    WHEN ua.ViewRank <= 10 THEN 'Top 10 Viewer'
+    WHEN ua.ActivityRank <= 5 THEN 'Top 5 Poster'
+    ELSE 'Regular User'
+  END AS UserTier,
+  CASE
+    WHEN cc.PostStatus = 'Closed' AND cc.CommentCount > 10 THEN 'Highly Commented Closed Post'
+    WHEN cc.PostStatus = 'Community Owned' AND cc.WeightedEngagement > 500 THEN 'High Engagement Community Post'
+    WHEN cc.PostTypeName = 'Question' AND cc.NetVoteScore > 100 THEN 'Popular Question'
+    ELSE 'Standard Post'
+  END AS PostCategory
+FROM
+  UserActivity ua
+  RIGHT OUTER JOIN ComplexCalculations cc
+    ON ua.UserId = (
+      SELECT p.OwnerUserId FROM Posts p WHERE p.Id = cc.PostId LIMIT 1
+    )
+WHERE
+  cc.WeightedEngagement > 100
+  AND cc.DaysSinceLastActivity < 0
+  AND ua.TotalViews IS NOT NULL
+
+UNION
+
+SELECT
+  ua.DisplayName,
+  ua.PostCount,
+  ua.TotalViews,
+  cc.Title,
+  cc.PostTypeName,
+  cc.CommentCount,
+  cc.UpVoteCount,
+  cc.DownVoteCount,
+  cc.FavoriteCount,
+  cc.NetVoteScore,
+  cc.WeightedEngagement,
+  cc.DaysSinceLastActivity,
+  cc.TitleFormat,
+  CASE
+    WHEN ua.ViewRank <= 10 THEN 'Top 10 Viewer'
+    WHEN ua.ActivityRank <= 5 THEN 'Top 5 Poster'
+    ELSE 'Regular User'
+  END AS UserTier,
+  CASE
+    WHEN cc.PostStatus = 'Closed' AND cc.CommentCount > 10 THEN 'Highly Commented Closed Post'
+    WHEN cc.PostStatus = 'Community Owned' AND cc.WeightedEngagement > 500 THEN 'High Engagement Community Post'
+    WHEN cc.PostTypeName = 'Question' AND cc.NetVoteScore > 100 THEN 'Popular Question'
+    ELSE 'Standard Post'
+  END AS PostCategory
+FROM
+  UserActivity ua
+  FULL OUTER JOIN ComplexCalculations cc
+    ON ua.UserId = (
+      SELECT p.OwnerUserId FROM Posts p WHERE p.Id = cc.PostId LIMIT 1
+    )
+WHERE
+  cc.WeightedEngagement < 50
+  AND ua.PostCount IS NULL
+ORDER BY
+  UserTier DESC,
+  PostCategory ASC,
+  cc.WeightedEngagement DESC;

@@ -1,0 +1,174 @@
+-- {"query": "1548.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2661} 
+
+WITH UserEngagementStats AS (
+    -- Summarize user activities, compute reputation rank, and analyze voting patterns
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COUNT(V.Id) FILTER (WHERE V.VoteTypeId IN (2, 3, 5)) AS TotalContentVotesGiven, -- UpMod, DownMod, Favorite votes given by this user
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        RANK() OVER (ORDER BY U.Reputation DESC, U.CreationDate ASC) AS ReputationRank,
+        AVG(CASE WHEN V.VoteTypeId = 2 THEN 1.0 ELSE 0.0 END) AS AvgUpvoteRatioGiven -- Ratio of upvotes among all votes given by this user
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Votes V ON U.Id = V.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate
+    HAVING COUNT(DISTINCT P.Id) > 0 OR COUNT(DISTINCT C.Id) > 0 OR COUNT(V.Id) > 0
+),
+PostContentMetrics AS (
+    -- Analyze post performance, engagement, and owner's cumulative score
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount AS DirectCommentCount,
+        P.FavoriteCount,
+        P.Title,
+        P.Tags,
+        COALESCE(P.AcceptedAnswerId, -1) AS AcceptedAnswerId_Indicator, -- Using -1 to indicate no accepted answer
+        EXTRACT(EPOCH FROM (NOW() - P.CreationDate)) / 86400.0 AS PostAgeDays, -- Age in days as a float
+        (SELECT AVG(C.Score) FROM Comments C WHERE C.PostId = P.Id AND C.Score IS NOT NULL AND C.Score > 0) AS AveragePositiveCommentScore, -- Correlated subquery for comment sentiment
+        (SELECT COUNT(DISTINCT V.UserId) FROM Votes V WHERE V.PostId = P.Id AND V.VoteTypeId = 2) AS UniqueUpvoters, -- Correlated subquery for unique upvoters
+        LAG(P.LastActivityDate, 1, P.CreationDate) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate) AS PrevPostLastActivityDate, -- Window function: last activity date of the previous post by the same owner
+        SUM(P.Score) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativeOwnerScore -- Window function: running total of owner's post scores
+    FROM Posts P
+    WHERE P.PostTypeId IN (1, 2) -- Focus on Questions and Answers
+),
+PostLifecycleEvents AS (
+    -- Track key historical events for posts, including close reasons
+    SELECT
+        PH.PostId,
+        MIN(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.CreationDate END) AS FirstEditDate, -- First recorded title, body, or tag edit
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.CreationDate END) AS LastClosedDate,
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 END) AS CloseEventCount,
+        MAX(CASE
+                WHEN PH.PostHistoryTypeId = 10 AND PH.Comment ~ '^[0-9]+$' THEN -- Check if comment is a numeric ID
+                    (SELECT CRT.Name FROM CloseReasonTypes CRT WHERE CRT.Id = CAST(PH.Comment AS SMALLINT))
+                ELSE NULL
+            END) AS LastCloseReasonName -- Subquery within CASE for close reason name
+    FROM PostHistory PH
+    GROUP BY PH.PostId
+),
+TagAnalysis AS (
+    -- Unnest tags from question posts for individual tag analysis
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        TRIM(UNNEST(string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><'))) AS TagName, -- String manipulation and unnesting
+        P.Score AS PostScore,
+        P.ViewCount AS PostViewCount
+    FROM Posts P
+    WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2
+),
+AggregatedTagPerformance AS (
+    -- Aggregate performance metrics for tags and rank them by popularity
+    SELECT
+        TA.TagName,
+        COUNT(DISTINCT TA.PostId) AS TaggedPostsCount,
+        AVG(TA.PostScore) AS AvgTagPostScore,
+        SUM(TA.PostViewCount) AS TotalTagViewCount,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY TA.PostScore) AS MedianTagPostScore, -- Window function for median
+        RANK() OVER (ORDER BY COUNT(DISTINCT TA.PostId) DESC, AVG(TA.PostScore) DESC) AS TagPopularityRank -- Rank tags
+    FROM TagAnalysis TA
+    GROUP BY TA.TagName
+    HAVING COUNT(DISTINCT TA.PostId) > 50 AND AVG(TA.PostScore) > 0 -- Filter for significant and positively scored tags
+),
+HighPerformingContent AS (
+    -- Identify high-performing questions and answers using UNION ALL
+    SELECT P.OwnerUserId AS UserId, P.Id AS PostId, 'Question' AS ContentType
+    FROM Posts P
+    WHERE P.PostTypeId = 1 AND P.Score >= 100 AND P.ViewCount >= 5000 AND P.AnswerCount >= 3
+    UNION ALL
+    SELECT P.OwnerUserId AS UserId, P.Id AS PostId, 'Answer' AS ContentType
+    FROM Posts P
+    WHERE P.PostTypeId = 2 AND P.Score >= 50 AND P.ParentId IS NOT NULL AND P.AcceptedAnswerId IS NULL -- Answers that are high-scoring but not accepted
+),
+UsersWithHighEngagementButFewAnswers AS (
+    -- Find users who show high engagement (posts+comments) but have posted few (or no) answers with positive scores using EXCEPT
+    SELECT UES.UserId
+    FROM UserEngagementStats UES
+    WHERE UES.TotalPosts > 20 AND UES.TotalComments > 50
+    EXCEPT
+    SELECT P.OwnerUserId
+    FROM Posts P
+    WHERE P.PostTypeId = 2 AND P.Score > 0 -- Users who have posted at least one non-zero scored answer
+)
+-- Main complex query combining all derived data
+SELECT
+    UES.UserId,
+    UES.DisplayName AS UserDisplayName,
+    UES.Reputation,
+    UES.TotalPosts,
+    UES.TotalComments,
+    UES.TotalBadges,
+    UES.ReputationRank,
+    PM.PostId,
+    PM.Title AS PostTitle,
+    PM.PostTypeId,
+    PM.Score AS PostScore,
+    PM.ViewCount AS PostViewCount,
+    PM.PostAgeDays,
+    PM.AveragePositiveCommentScore,
+    PM.UniqueUpvoters,
+    PM.PrevPostLastActivityDate,
+    PM.CumulativeOwnerScore,
+    PLE.FirstEditDate,
+    PLE.LastClosedDate,
+    PLE.LastCloseReasonName,
+    ATP.AvgTagPostScore AS PrimaryTagAvgScore,
+    ATP.MedianTagPostScore AS PrimaryTagMedianScore,
+    ATP.TagPopularityRank AS PrimaryTagRank,
+    CASE
+        WHEN PM.Score > 75 AND PM.ViewCount > 5000 AND PM.AnswerCount > 3 THEN 'HighlyViralAndAnswered'
+        WHEN PM.Score > 25 AND PM.ViewCount > 1000 THEN 'ModeratelyEngaging'
+        WHEN PM.Score > 5 THEN 'LowEngagement'
+        ELSE 'NegligibleEngagement'
+    END AS PostEngagementCategory, -- Complicated conditional expression
+    COALESCE(U.Location, 'N/A') AS UserLocation, -- NULL logic with COALESCE
+    NULLIF(LOWER(SUBSTRING(U.DisplayName, 1, 3)), 'adm') AS DisplayNamePrefix, -- String function and NULL logic with NULLIF
+    EXTRACT(MONTH FROM UES.UserCreationDate) AS UserCreationMonth, -- Date part extraction
+    (SELECT COUNT(DISTINCT PL.RelatedPostId)
+     FROM PostLinks PL
+     WHERE PL.PostId = PM.PostId AND PL.LinkTypeId = 1 AND PL.CreationDate > (PM.PostCreationDate + INTERVAL '1 month')
+    ) AS DelayedLinkedPostCount, -- Correlated subquery with date arithmetic for delayed links
+    (SELECT COUNT(1) FROM Badges B WHERE B.UserId = UES.UserId AND B.Class = 1 AND B.TagBased = TRUE) AS GoldTagBadgeCount, -- Another correlated subquery for specific badge type
+    HPC.ContentType AS HighPerformingContentType -- Data from UNION ALL CTE
+FROM UserEngagementStats UES
+INNER JOIN Users U ON UES.UserId = U.Id
+LEFT JOIN PostContentMetrics PM ON UES.UserId = PM.OwnerUserId
+LEFT JOIN PostLifecycleEvents PLE ON PM.PostId = PLE.PostId
+LEFT JOIN (
+    -- Select the most popular tag for each post based on aggregated performance
+    SELECT DISTINCT ON (TA.PostId)
+        TA.PostId,
+        ATP.AvgTagPostScore,
+        ATP.MedianTagPostScore,
+        ATP.TagPopularityRank
+    FROM TagAnalysis TA
+    INNER JOIN AggregatedTagPerformance ATP ON TA.TagName = ATP.TagName
+    ORDER BY TA.PostId, ATP.TaggedPostsCount DESC, ATP.AvgTagPostScore DESC -- Prioritize tags by popularity then average score
+) ATP ON PM.PostId = ATP.PostId
+LEFT JOIN HighPerformingContent HPC ON UES.UserId = HPC.UserId AND PM.PostId = HPC.PostId
+WHERE UES.ReputationRank <= 500 -- Filter for top 500 users
+  AND PM.PostTypeId = 1 -- Focus primarily on question posts
+  AND PM.PostAgeDays BETWEEN 180 AND 1800 -- Posts between 6 months and 5 years old
+  AND PM.Score >= 5 -- Filter out low-scoring posts
+  AND (PM.Title LIKE '%SQL%' OR PM.Title ILIKE '%database%' OR PM.Tags ILIKE '%<postgresql>%' OR PM.Tags ILIKE '%<sql-server>%') -- Complicated string search predicate
+  AND EXISTS (
+      SELECT 1 FROM Badges B_sub WHERE B_sub.UserId = UES.UserId AND B_sub.Class = 2 AND B_sub.TagBased = FALSE
+  ) -- Correlated subquery in WHERE clause for users with a silver *named* badge
+  AND UES.UserId NOT IN (SELECT UserId FROM UsersWithHighEngagementButFewAnswers) -- Filter using the result of the EXCEPT CTE
+  AND (PM.OwnerUserId IS NOT NULL OR PM.OwnerDisplayName IS NOT NULL) -- NULL logic for post owner
+ORDER BY UES.Reputation DESC, PM.Score DESC, PM.PostCreationDate DESC
+LIMIT 1000;

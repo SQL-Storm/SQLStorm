@@ -1,0 +1,54 @@
+-- {"query": "6986.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-micro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 441} 
+SELECT 
+    u.DisplayName,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.PostId ELSE NULL END) AS TotalUpVotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.PostId ELSE NULL END) AS TotalDownVotes,
+    MAX(u.Reputation) AS MaxReputation,
+    MIN(u.CreationDate) AS EarliestUserCreationDate,
+    STRING_AGG(DISTINCT t.TagName, ', ') WITHIN GROUP AS (ORDER BY t.TagName) AS Tags,
+    (
+        SELECT 
+            COUNT(DISTINCT pl.RelatedPostId) 
+        FROM 
+            PostLinks pl
+        WHERE 
+            pl.PostId = p.Id AND pl.LinkTypeId = 3
+    ) AS DuplicateCount,
+    (
+        SELECT 
+            MAX(ph.CreationDate)
+        FROM 
+            PostHistory ph
+        WHERE 
+            ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+    ) AS LastClosedDate
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+LEFT JOIN 
+    Tags t ON p.Id = t.ExcerptPostId
+LEFT JOIN 
+    PostLinks pl ON p.Id = pl.PostId
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+WHERE 
+    u.Id IN (
+        SELECT 
+            UserId 
+        FROM 
+            Badges 
+        WHERE 
+            Class = 1
+    )
+GROUP BY 
+    u.DisplayName
+HAVING 
+    TotalPosts > 10 AND TotalUpVotes > TotalDownVotes
+ORDER BY 
+    MaxReputation DESC, 
+    EarliestUserCreationDate ASC;

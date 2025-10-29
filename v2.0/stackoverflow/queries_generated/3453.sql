@@ -1,0 +1,117 @@
+-- {"query": "3453.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2317} 
+
+WITH recent_posts AS (
+   SELECT p.Id,
+          p.PostTypeId,
+          p.OwnerUserId,
+          p.CreationDate,
+          p.Score,
+          p.Title,
+          p.Tags,
+          COALESCE(p.ViewCount,0) AS Views,
+          ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+   FROM Posts p
+   WHERE p.CreationDate >= CURRENT_DATE - INTERVAL '30 days'
+),
+user_stats AS (
+   SELECT u.Id                              AS UserId,
+          u.Reputation,
+          u.CreationDate                    AS UserSince,
+          COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+          COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+          COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+          SUM(CASE WHEN v.VoteTypeId = 2 THEN 1
+                   WHEN v.VoteTypeId = 3 THEN -1
+                   ELSE 0 END)          AS NetVoteScore,
+          MAX(rp.CreationDate)             AS LastPostDate
+   FROM Users u
+   LEFT JOIN Badges b        ON b.UserId = u.Id
+   LEFT JOIN Votes v         ON v.UserId = u.Id
+   LEFT JOIN recent_posts rp ON rp.OwnerUserId = u.Id
+   GROUP BY u.Id, u.Reputation, u.CreationDate
+),
+tag_stats AS (
+   SELECT t.TagName,
+          COUNT(DISTINCT p.Id)                         AS QuestionCount,
+          AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL) AS AvgScore,
+          SUM(p.ViewCount)                             AS TotalViews,
+          ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS TagRank
+   FROM Tags t
+   JOIN Posts p ON p.Tags IS NOT NULL
+               AND POSITION('<' || t.TagName || '>' IN p.Tags) > 0
+               AND p.PostTypeId = 1                      -- only questions
+   GROUP BY t.TagName
+),
+post_votes AS (
+   SELECT ph.PostId,
+          SUM(CASE WHEN v.VoteTypeId = 2 THEN 1
+                   WHEN v.VoteTypeId = 3 THEN -1
+                   ELSE 0 END)               AS VoteScore,
+          COUNT(*) FILTER (WHERE v.VoteTypeId = 5) AS FavoriteCount
+   FROM PostHistory ph
+   LEFT JOIN Votes v ON v.PostId = ph.PostId
+   WHERE ph.PostHistoryTypeId IN (1,2,3,4,5,6)   -- creation / edit events
+   GROUP BY ph.PostId
+),
+duplicate_links AS (
+   SELECT pl.PostId,
+          pl.RelatedPostId,
+          pl.CreationDate,
+          ROW_NUMBER() OVER (PARTITION BY pl.PostId ORDER BY pl.CreationDate DESC) AS dup_rank
+   FROM PostLinks pl
+   JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+                    AND lt.Name = 'Duplicate'
+)
+SELECT us.UserId,
+       us.Reputation,
+       us.GoldBadges,
+       us.SilverBadges,
+       us.BronzeBadges,
+       us.NetVoteScore,
+       us.LastPostDate,
+       COALESCE(rp.Title, '(no recent post)')   AS RecentTitle,
+       COALESCE(rp.Score, 0)                    AS RecentScore,
+       COALESCE(rp.Views, 0)                    AS RecentViews,
+       COALESCE(ts.TagName, '(no tag)')         AS TopTag,
+       ts.QuestionCount,
+       ts.AvgScore,
+       pv.VoteScore,
+       pv.FavoriteCount,
+       dl.RelatedPostId,
+       dl.CreationDate                         AS DuplicateDate
+FROM user_stats us
+LEFT JOIN recent_posts rp      ON rp.OwnerUserId = us.UserId AND rp.rn = 1
+LEFT JOIN LATERAL (
+   SELECT t.TagName, t.QuestionCount, t.AvgScore
+   FROM tag_stats t
+   ORDER BY t.TagRank
+   LIMIT 1
+) ts                         ON TRUE
+LEFT JOIN post_votes pv       ON pv.PostId = rp.Id
+LEFT JOIN duplicate_links dl  ON dl.PostId = rp.Id AND dl.dup_rank = 1
+WHERE (us.Reputation > 10000 OR us.GoldBadges > 0)
+  AND (rp.CreationDate IS NOT NULL OR dl.RelatedPostId IS NOT NULL)
+
+UNION ALL
+
+SELECT NULL AS UserId,
+       NULL,
+       NULL,
+       NULL,
+       NULL,
+       NULL,
+       NULL,
+       '--- Summary Row ---' AS RecentTitle,
+       NULL,
+       NULL,
+       NULL,
+       NULL,
+       NULL,
+       NULL,
+       NULL,
+       NULL
+
+EXCEPT
+
+SELECT *
+FROM (SELECT 1 AS dummy) s;

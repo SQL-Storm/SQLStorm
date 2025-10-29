@@ -1,0 +1,155 @@
+WITH recent_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.ViewCount,
+    p.Score,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.AcceptedAnswerId,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.Body,
+    p.PostTypeId,
+    p.ParentId
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days'
+),
+recent_activity AS (
+  SELECT
+    q.PostId,
+    q.Title,
+    q.CreationDate,
+    q.ViewCount,
+    q.Score,
+    q.OwnerUserId,
+    q.LastActivityDate,
+    q.CommentCount,
+    q.FavoriteCount,
+    q.Body,
+    q.Tags,
+    COALESCE(a.AnswerCount, 0) AS AnswerCount
+  FROM recent_questions q
+  LEFT JOIN (
+    SELECT ParentId, count(*) AS AnswerCount
+    FROM Posts
+    WHERE PostTypeId = 2
+    GROUP BY ParentId
+  ) a ON a.ParentId = q.PostId
+),
+tag_profiles AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.ProfileImageUrl,
+    u.UpVotes,
+    u.DownVotes,
+    u.Views,
+    b.Name AS BadgeName,
+    b.Date AS BadgeDate,
+    b.Class AS BadgeClass,
+    b.TagBased
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+),
+vote_summaries AS (
+  SELECT
+    PostId,
+    SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+    SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+    SUM(CASE WHEN VoteTypeId IN (2,3) THEN CASE WHEN VoteTypeId = 2 THEN 1 ELSE -1 END ELSE 0 END) AS TotalVotes
+  FROM Votes
+  GROUP BY PostId
+),
+complex_metrics AS (
+  SELECT
+    ra.PostId,
+    ra.Title,
+    ra.CreationDate,
+    ra.LastActivityDate,
+    ra.ViewCount,
+    ra.Score,
+    ra.OwnerUserId,
+    ra.CommentCount,
+    ra.FavoriteCount,
+    ra.Body,
+    ra.Tags,
+    ra.AnswerCount,
+    COALESCE(vs.TotalVotes, 0) AS total_votes,
+    COALESCE(vs.UpVotes, 0) AS UpVotes,
+    COALESCE(vs.DownVotes, 0) AS DownVotes
+  FROM recent_activity ra
+  LEFT JOIN vote_summaries vs ON vs.PostId = ra.PostId
+),
+final_select AS (
+  SELECT
+    cr.PostId,
+    cr.Title,
+    cr.Tags,
+    cr.CreationDate,
+    cr.LastActivityDate,
+    cr.ViewCount,
+    cr.Score,
+    cr.OwnerUserId,
+    cr.CommentCount,
+    cr.FavoriteCount,
+    cr.Body,
+    cr.AnswerCount,
+    cr.UpVotes,
+    cr.DownVotes,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation,
+    u.Location,
+    u.ProfileImageUrl,
+    CASE
+      WHEN cr.OwnerUserId IS NULL THEN 'Anonymous'
+      ELSE u.DisplayName
+    END AS EffectiveOwner,
+    json_agg(DISTINCT jsonb_build_object(
+      'TagName', t.TagName,
+      'Count', t.Count
+    )) FILTER (WHERE t.TagName IS NOT NULL) AS TagInfo
+  FROM complex_metrics cr
+  LEFT JOIN vote_summaries tv ON tv.PostId = cr.PostId
+  LEFT JOIN Users u ON u.Id = cr.OwnerUserId
+  LEFT JOIN Tags t ON t.Id = (
+    SELECT tt.Id FROM Tags tt
+    WHERE tt.TagName = ANY(string_to_array(cr.Tags, '><'))
+    LIMIT 1
+  )
+  GROUP BY
+    cr.PostId, cr.Title, cr.Tags, cr.CreationDate, cr.LastActivityDate,
+    cr.ViewCount, cr.Score, cr.OwnerUserId, cr.CommentCount, cr.FavoriteCount,
+    cr.Body, cr.AnswerCount, cr.UpVotes, cr.DownVotes, u.DisplayName, u.Reputation,
+    u.Location, u.ProfileImageUrl, EffectiveOwner
+)
+SELECT
+  PostId,
+  Title,
+  Tags,
+  CreationDate,
+  LastActivityDate,
+  ViewCount,
+  Score,
+  OwnerUserId,
+  CommentCount,
+  FavoriteCount,
+  Body,
+  AnswerCount,
+  UpVotes,
+  DownVotes,
+  EffectiveOwner,
+  Reputation,
+  Location,
+  ProfileImageUrl,
+  TagInfo
+FROM final_select
+ORDER BY LastActivityDate DESC
+LIMIT 500;

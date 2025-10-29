@@ -1,0 +1,260 @@
+-- {"query": "7705.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2415} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT b.Id) as Badges,
+        COUNT(DISTINCT c.Id) as Comments,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        MAX(p.CreationDate) as LastPostDate,
+        ROW_NUMBER() OVER (ORDER BY COALESCE(SUM(p.Score), 0) DESC) as RankByScore,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) as RankByReputation
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.Reputation, u.DisplayName
+),
+TopUsers AS (
+    SELECT UserId, DisplayName, TotalScore, RankByScore, RankByReputation
+    FROM UserActivityStats
+    WHERE RankByScore <= 100 AND RankByReputation <= 100
+),
+PostPerformance AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as PostType,
+        CASE 
+            WHEN p.Score > 100 THEN 'HighlyVoted'
+            WHEN p.Score > 50 THEN 'ModeratelyVoted'
+            WHEN p.Score > 0 THEN 'LowVoted'
+            ELSE 'Unvoted'
+        END as VotingCategory,
+        DATEDIFF(day, p.CreationDate, cast('2024-10-01 12:34:56' as timestamp)) as DaysSinceCreation,
+        CASE 
+            WHEN p.ViewCount > 1000 THEN 'HighTraffic'
+            WHEN p.ViewCount > 100 THEN 'MediumTraffic'
+            ELSE 'LowTraffic'
+        END as TrafficCategory,
+        COALESCE(p.AcceptedAnswerId, 0) as HasAcceptedAnswer,
+        CASE 
+            WHEN p.ParentId IS NOT NULL THEN (
+                SELECT TOP 1 Title 
+                FROM Posts p2 
+                WHERE p2.Id = p.ParentId
+            )
+            ELSE NULL
+        END as ParentQuestionTitle,
+        COALESCE(
+            (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2),
+            0
+        ) as Upvotes,
+        COALESCE(
+            (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3),
+            0
+        ) as Downvotes,
+        COALESCE(
+            (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 5),
+            0
+        ) as Favorites,
+        COALESCE(
+            (SELECT STRING_AGG(b.Name, ', ') 
+             FROM Badges b 
+             WHERE b.UserId = p.OwnerUserId 
+             AND b.TagBased = 0
+            ),
+            ''
+        ) as UserBadges,
+        ABS(p.Score) / NULLIF(COALESCE(p.ViewCount, 1), 0) as ScoreToViewRatio,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 AND p.AcceptedAnswerId IS NOT NULL THEN 1
+            ELSE 0
+        END as HasAcceptedAnswerAndAnswers
+    FROM Posts p
+    INNER JOIN TopUsers tu ON p.OwnerUserId = tu.UserId
+    WHERE p.CreationDate >= DATEADD(month, -12, cast('2024-10-01 12:34:56' as timestamp))
+),
+ComplexAnalytics AS (
+    SELECT 
+        pp.PostId,
+        pp.Title,
+        pp.Score,
+        pp.ViewCount,
+        pp.AnswerCount,
+        pp.CommentCount,
+        pp.PostType,
+        pp.VotingCategory,
+        pp.TrafficCategory,
+        pp.DaysSinceCreation,
+        pp.HasAcceptedAnswer,
+        pp.ParentQuestionTitle,
+        pp.Upvotes,
+        pp.Downvotes,
+        pp.Favorites,
+        pp.UserBadges,
+        pp.ScoreToViewRatio,
+        pp.HasAcceptedAnswerAndAnswers,
+        ROW_NUMBER() OVER (PARTITION BY pp.PostType ORDER BY pp.Score DESC) as TopScoreByType,
+        PERCENT_RANK() OVER (ORDER BY pp.Score) as ScorePercentile,
+        AVG(pp.Score) OVER (PARTITION BY pp.PostType) as AvgScorePerType,
+        STDDEV(pp.Score) OVER (PARTITION BY pp.PostType) as StdDevPerType,
+        LAG(pp.Score, 1) OVER (ORDER BY pp.CreationDate) as PreviousScore,
+        LEAD(pp.Score, 1) OVER (ORDER BY pp.CreationDate) as NextScore,
+        CASE 
+            WHEN pp.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = pp.PostType) THEN 1 
+            ELSE 0 
+        END as AboveAverage,
+        CASE 
+            WHEN pp.Score > (SELECT AVG(Score)*1.5 FROM Posts WHERE PostTypeId = pp.PostType) THEN 'SuperHigh'
+            WHEN pp.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = pp.PostType) THEN 'High'
+            WHEN pp.Score > (SELECT AVG(Score)*0.5 FROM Posts WHERE PostTypeId = pp.PostType) THEN 'Medium'
+            ELSE 'Low'
+        END as ScoreCategory,
+        (
+            SELECT COUNT(*) 
+            FROM PostHistory ph 
+            WHERE ph.PostId = pp.PostId 
+            AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)
+        ) as EditCount
+    FROM PostPerformance pp
+),
+FinalAggregation AS (
+    SELECT 
+        ca.PostId,
+        ca.Title,
+        ca.Score,
+        ca.ViewCount,
+        ca.AnswerCount,
+        ca.CommentCount,
+        ca.PostType,
+        ca.VotingCategory,
+        ca.TrafficCategory,
+        ca.DaysSinceCreation,
+        ca.HasAcceptedAnswer,
+        ca.ParentQuestionTitle,
+        ca.Upvotes,
+        ca.Downvotes,
+        ca.Favorites,
+        ca.UserBadges,
+        ca.ScoreToViewRatio,
+        ca.HasAcceptedAnswerAndAnswers,
+        ca.TopScoreByType,
+        ca.ScorePercentile,
+        ROUND(ca.AvgScorePerType, 2) as AvgScorePerType,
+        ROUND(ca.StdDevPerType, 2) as StdDevPerType,
+        ca.PreviousScore,
+        ca.NextScore,
+        ca.AboveAverage,
+        ca.ScoreCategory,
+        ca.EditCount,
+        CASE 
+            WHEN ca.EditCount > 0 AND ca.Score > 0 THEN CAST(ca.EditCount AS FLOAT) / CAST(ca.Score AS FLOAT)
+            ELSE NULL
+        END as EditToScoreRatio,
+        CASE 
+            WHEN ca.Score > 0 THEN 100.0 * CAST(ca.ViewCount AS FLOAT) / CAST(ca.Score AS FLOAT)
+            ELSE NULL
+        END as ViewsPerScore,
+        CASE 
+            WHEN ca.DaysSinceCreation > 0 THEN CAST(ca.ViewCount AS FLOAT) / CAST(ca.DaysSinceCreation AS FLOAT)
+            ELSE NULL
+        END as DailyViewRate,
+        CASE 
+            WHEN ca.AnswerCount > 0 THEN 100.0 * CAST(ca.CommentCount AS FLOAT) / CAST(ca.AnswerCount AS FLOAT)
+            ELSE NULL
+        END as CommentsPerAnswer,
+        CASE 
+            WHEN ca.HasAcceptedAnswer = 1 THEN 1 
+            ELSE 0 
+        END as HasAccepted,
+        CASE 
+            WHEN ca.Score > 100 AND ca.ViewCount > 1000 THEN 1 
+            ELSE 0 
+        END as HighValuePost
+    FROM ComplexAnalytics ca
+    WHERE ca.Score > 0 AND ca.ViewCount >= 0
+),
+CrossJoinAnalysis AS (
+    SELECT 
+        fa1.PostId as PostId1,
+        fa2.PostId as PostId2,
+        fa1.Title as Title1,
+        fa2.Title as Title2,
+        fa1.Score as Score1,
+        fa2.Score as Score2,
+        fa1.ViewCount as ViewCount1,
+        fa2.ViewCount as ViewCount2,
+        ABS(fa1.Score - fa2.Score) as ScoreDifference,
+        CASE 
+            WHEN fa1.Score > fa2.Score THEN 'Post1Higher'
+            WHEN fa1.Score < fa2.Score THEN 'Post2Higher'
+            ELSE 'Equal'
+        END as ScoreComparison,
+        CASE 
+            WHEN fa1.ViewCount > fa2.ViewCount THEN 1 
+            WHEN fa1.ViewCount < fa2.ViewCount THEN -1 
+            ELSE 0 
+        END as ViewComparison,
+        fa1.ScoreToViewRatio as Ratio1,
+        fa2.ScoreToViewRatio as Ratio2,
+        fa1.HasAcceptedAnswerAndAnswers as Acceptance1,
+        fa2.HasAcceptedAnswerAndAnswers as Acceptance2
+    FROM FinalAggregation fa1
+    CROSS JOIN FinalAggregation fa2
+    WHERE fa1.PostId != fa2.PostId 
+    AND fa1.Score > 0 
+    AND fa2.Score > 0
+)
+SELECT TOP 1000
+    'Post Analysis' as ReportType,
+    cja.PostId1,
+    cja.PostId2,
+    cja.Title1,
+    cja.Title2,
+    cja.Score1,
+    cja.Score2,
+    cja.ViewCount1,
+    cja.ViewCount2,
+    cja.ScoreDifference,
+    cja.ScoreComparison,
+    cja.ViewComparison,
+    cja.Ratio1,
+    cja.Ratio2,
+    cja.Acceptance1,
+    cja.Acceptance2,
+    CASE 
+        WHEN cja.ScoreDifference > 50 AND cja.Score1 > cja.Score2 THEN 'MajorDifferenceHigh'
+        WHEN cja.ScoreDifference > 50 AND cja.Score1 < cja.Score2 THEN 'MajorDifferenceLow'
+        WHEN cja.ScoreDifference < 20 THEN 'MinorDifference'
+        ELSE 'MediumDifference'
+    END as DifferenceCategory,
+    CASE 
+        WHEN cja.Score1 > 100 AND cja.ViewCount1 > 500 THEN 'HighPerformance1'
+        WHEN cja.Score1 <= 100 AND cja.ViewCount1 <= 500 THEN 'LowPerformance1'
+        ELSE 'ModeratePerformance1'
+    END as PerformanceCategory1,
+    CASE 
+        WHEN cja.Score2 > 100 AND cja.ViewCount2 > 500 THEN 'HighPerformance2'
+        WHEN cja.Score2 <= 100 AND cja.ViewCount2 <= 500 THEN 'LowPerformance2'
+        ELSE 'ModeratePerformance2'
+    END as PerformanceCategory2,
+    ROW_NUMBER() OVER (ORDER BY cja.ScoreDifference DESC) as Ranking,
+    COUNT(*) OVER () as TotalComparisons
+FROM CrossJoinAnalysis cja
+WHERE cja.ScoreDifference > 0
+ORDER BY cja.ScoreDifference DESC, cja.Score1 DESC, cja.Score2 DESC;

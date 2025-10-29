@@ -1,0 +1,209 @@
+WITH RankedPostHistory AS (
+    SELECT
+        ph.Id,
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.UserId,
+        ph.CreationDate,
+        pht.Name AS HistoryTypeName,
+        ROW_NUMBER() OVER(PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) as rn
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    WHERE ph.UserId IS NOT NULL
+),
+RecentEdits AS (
+    SELECT
+        rph.PostId,
+        rph.UserId,
+        rph.CreationDate,
+        rph.HistoryTypeName,
+        u.DisplayName AS EditorDisplayName,
+        u.Reputation AS EditorReputation,
+        rph.rn
+    FROM RankedPostHistory rph
+    JOIN Users u ON rph.UserId = u.Id
+    WHERE rph.rn <= 3
+),
+PostDetails AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.OwnerUserId,
+        u_owner.DisplayName AS OwnerDisplayName,
+        p.CreationDate AS PostCreationDate,
+        p.LastActivityDate,
+        p.Score,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL THEN EXTRACT(EPOCH FROM (p.ClosedDate - p.CreationDate)) / 60
+            ELSE NULL
+        END AS TimeToCloseMinutes,
+        COUNT(DISTINCT c.Id) AS CommentCountPerPost,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+        (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3) AS DuplicateLinkCount
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Users u_owner ON p.OwnerUserId = u_owner.Id
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE p.PostTypeId IN (1, 2)
+    GROUP BY
+        p.Id, p.Title, p.PostTypeId, pt.Name, p.OwnerUserId, u_owner.DisplayName, p.CreationDate, p.LastActivityDate, p.Score, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.ClosedDate
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName AS UserDisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id) AS UserPostCount,
+        (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id) AS UserCommentCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 2) AS UserUpVoteCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 3) AS UserDownVoteCount,
+        COUNT(DISTINCT b.Id) AS UserBadgeCount,
+        MAX(b.Date) AS LatestBadgeDate
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+CombinedData AS (
+    SELECT
+        pd.PostId,
+        pd.Title,
+        pd.PostTypeName,
+        pd.OwnerDisplayName,
+        pd.PostCreationDate,
+        pd.LastActivityDate,
+        pd.Score,
+        pd.AnswerCount,
+        pd.CommentCount AS PostCommentCount,
+        pd.FavoriteCount,
+        pd.ClosedDate,
+        pd.TimeToCloseMinutes,
+        pd.CommentCountPerPost,
+        pd.UpVoteCount AS PostUpVotes,
+        pd.DownVoteCount AS PostDownVotes,
+        pd.DuplicateLinkCount,
+        re.UserId AS LastEditorId,
+        re.EditorDisplayName AS LastEditorDisplayName,
+        re.EditorReputation AS LastEditorReputation,
+        re.CreationDate AS LastEditDate,
+        re.HistoryTypeName AS LastEditHistoryType,
+        ua.UserId AS OwnerUserId,
+        ua.UserDisplayName AS OwnerUserDisplayName,
+        ua.Reputation AS OwnerReputation,
+        ua.UserPostCount,
+        ua.UserCommentCount,
+        ua.UserUpVoteCount,
+        ua.UserDownVoteCount,
+        ua.UserBadgeCount,
+        ua.LatestBadgeDate
+    FROM PostDetails pd
+    LEFT JOIN RecentEdits re ON pd.PostId = re.PostId AND re.rn = 1
+    LEFT JOIN UserActivity ua ON pd.OwnerUserId = ua.UserId
+    WHERE pd.Score > 0 OR pd.AnswerCount > 0 OR pd.FavoriteCount > 0
+)
+SELECT
+    cd.PostId,
+    cd.Title,
+    cd.PostTypeName,
+    cd.OwnerUserDisplayName,
+    cd.OwnerReputation,
+    cd.PostCreationDate,
+    cd.LastActivityDate,
+    cd.Score,
+    cd.AnswerCount,
+    cd.PostCommentCount,
+    cd.FavoriteCount,
+    cd.ClosedDate,
+    cd.TimeToCloseMinutes,
+    cd.CommentCountPerPost,
+    cd.PostUpVotes,
+    cd.PostDownVotes,
+    cd.DuplicateLinkCount,
+    cd.LastEditorDisplayName,
+    cd.LastEditorReputation,
+    cd.LastEditDate,
+    cd.LastEditHistoryType,
+    ua.UserBadgeCount,
+    ua.LatestBadgeDate,
+    COALESCE(ua.UserPostCount, 0) + COALESCE(ua.UserCommentCount, 0) AS TotalUserActivityCount,
+    CASE
+        WHEN cd.Score > 1000 THEN 'High Score'
+        WHEN cd.Score BETWEEN 100 AND 1000 THEN 'Medium Score'
+        ELSE 'Low Score'
+    END AS ScoreCategory,
+    CASE
+        WHEN cd.ClosedDate IS NOT NULL THEN 'Closed'
+        ELSE 'Open'
+    END AS PostStatus,
+    UPPER(SUBSTRING(cd.Title FROM 1 FOR 3)) AS TitlePrefix,
+    CAST(cd.PostCreationDate AS DATE) AS PostCreationDateOnly,
+    COUNT(cd.PostId) OVER (PARTITION BY cd.PostTypeName) AS CountOfPostType,
+    AVG(cd.OwnerReputation) OVER (PARTITION BY cd.PostTypeName) AS AvgOwnerReputationForType,
+    SUM(cd.FavoriteCount) OVER () AS TotalFavoriteCountAcrossAllPosts
+FROM CombinedData cd
+JOIN UserActivity ua ON cd.OwnerUserId = ua.UserId
+WHERE
+    cd.PostCreationDate > DATE '2023-01-01'
+    AND cd.OwnerReputation > 500
+    AND cd.Title IS NOT NULL
+    AND LOWER(cd.Title) LIKE '%sql%'
+    AND COALESCE(cd.ClosedDate, DATE '2099-12-31') < DATE '2024-01-01'
+    AND ua.UserBadgeCount >= 5
+UNION
+SELECT
+    cd.PostId,
+    cd.Title,
+    cd.PostTypeName,
+    cd.OwnerUserDisplayName,
+    cd.OwnerReputation,
+    cd.PostCreationDate,
+    cd.LastActivityDate,
+    cd.Score,
+    cd.AnswerCount,
+    cd.PostCommentCount,
+    cd.FavoriteCount,
+    cd.ClosedDate,
+    cd.TimeToCloseMinutes,
+    cd.CommentCountPerPost,
+    cd.PostUpVotes,
+    cd.PostDownVotes,
+    cd.DuplicateLinkCount,
+    cd.LastEditorDisplayName,
+    cd.LastEditorReputation,
+    cd.LastEditDate,
+    cd.LastEditHistoryType,
+    ua.UserBadgeCount,
+    ua.LatestBadgeDate,
+    COALESCE(ua.UserPostCount, 0) + COALESCE(ua.UserCommentCount, 0) AS TotalUserActivityCount,
+    CASE
+        WHEN cd.Score > 1000 THEN 'High Score'
+        WHEN cd.Score BETWEEN 100 AND 1000 THEN 'Medium Score'
+        ELSE 'Low Score'
+    END AS ScoreCategory,
+    CASE
+        WHEN cd.ClosedDate IS NOT NULL THEN 'Closed'
+        ELSE 'Open'
+    END AS PostStatus,
+    UPPER(SUBSTRING(cd.Title FROM 1 FOR 3)) AS TitlePrefix,
+    CAST(cd.PostCreationDate AS DATE) AS PostCreationDateOnly,
+    COUNT(cd.PostId) OVER (PARTITION BY cd.PostTypeName) AS CountOfPostType,
+    AVG(cd.OwnerReputation) OVER (PARTITION BY cd.PostTypeName) AS AvgOwnerReputationForType,
+    SUM(cd.FavoriteCount) OVER () AS TotalFavoriteCountAcrossAllPosts
+FROM CombinedData cd
+JOIN UserActivity ua ON cd.OwnerUserId = ua.UserId
+WHERE
+    cd.PostCreationDate > DATE '2023-01-01'
+    AND cd.OwnerReputation <= 500
+    AND cd.Title IS NOT NULL
+    AND LOWER(cd.Title) LIKE '%database%'
+    AND COALESCE(cd.ClosedDate, DATE '2099-12-31') >= DATE '2024-01-01'
+    AND ua.UserBadgeCount < 5;

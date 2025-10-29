@@ -1,0 +1,360 @@
+with
+q_posts as (
+    select
+        p.Id as QuestionId,
+        p.OwnerUserId as QuestionOwnerId,
+        p.CreationDate as QuestionCreationDate,
+        p.Score as QuestionScore,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.ClosedDate,
+        coalesce(nullif(trim(p.OwnerDisplayName), ''), u.DisplayName, '(anonymous)') as QuestionOwnerName
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId = 1
+),
+a_posts as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId as AnswerOwnerId,
+        a.CreationDate as AnswerCreationDate,
+        a.Score as AnswerScore
+    from Posts a
+    where a.PostTypeId = 2
+),
+answer_ranked as (
+    select
+        a.*,
+        row_number() over (partition by a.QuestionId order by a.AnswerScore desc nulls last, a.AnswerCreationDate asc) as rn_by_score,
+        rank() over (partition by a.QuestionId order by a.AnswerScore desc nulls last) as rnk_by_score,
+        count(*) over (partition by a.QuestionId) as AnswerCountForQ
+    from a_posts a
+),
+votes_agg as (
+    select
+        v.PostId,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+        sum(case when v.VoteTypeId = 5 then 1 else 0 end) as Favorites,
+        sum(case when v.VoteTypeId in (8,9) then coalesce(v.BountyAmount,0) else 0 end) as BountyTotal,
+        min(v.CreationDate) as FirstVoteAt,
+        max(v.CreationDate) as LastVoteAt
+    from Votes v
+    group by v.PostId
+),
+comments_agg as (
+    select
+        c.PostId,
+        count(*) as CommentCount,
+        avg(nullif(c.Score,0)) as AvgNonZeroCommentScore,
+        max(length(c.Text)) as MaxCommentLength,
+        min(c.CreationDate) as FirstCommentAt,
+        max(c.CreationDate) as LastCommentAt
+    from Comments c
+    group by c.PostId
+),
+postlinks_dups as (
+    select
+        pl.PostId,
+        count(case when pl.LinkTypeId = 3 then 1 end) as DuplicateLinks,
+        count(case when pl.LinkTypeId = 1 then 1 end) as LinkedLinks
+    from PostLinks pl
+    group by pl.PostId
+),
+history_flags as (
+    select
+        ph.PostId,
+        count(case when ph.PostHistoryTypeId = 10 then 1 end) as ClosedEvents,
+        count(case when ph.PostHistoryTypeId = 11 then 1 end) as ReopenedEvents,
+        count(case when ph.PostHistoryTypeId in (12,13) then 1 end) as DeleteUndeleteEvents,
+        max(case when ph.PostHistoryTypeId = 10 then ph.CreationDate end) as LastClosedAt,
+        max(case when ph.PostHistoryTypeId = 11 then ph.CreationDate end) as LastReopenedAt
+    from PostHistory ph
+    group by ph.PostId
+),
+user_stats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        coalesce(u.UpVotes,0) as UserUpVotes,
+        coalesce(u.DownVotes,0) as UserDownVotes,
+        coalesce(u.Views,0) as ProfileViews,
+        cast(date_part('year', age(timestamp '2024-10-01 12:34:56', u.CreationDate)) as integer) as AccountAgeYears,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        count(b.Id) as TotalBadges
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes, u.Views, u.CreationDate
+),
+tag_split as (
+    select
+        q.QuestionId,
+        unnest(string_to_array(substring(q.Tags from 2 for greatest(length(q.Tags)-2,0)), '><')) as TagName
+    from q_posts q
+),
+tag_rank as (
+    select
+        ts.QuestionId,
+        ts.TagName,
+        row_number() over (partition by ts.QuestionId order by lower(ts.TagName)) as tag_pos
+    from tag_split ts
+),
+primary_tag as (
+    select QuestionId, TagName as PrimaryTag
+    from tag_rank
+    where tag_pos = 1
+),
+accepted_answer as (
+    select
+        q.QuestionId,
+        q.AcceptedAnswerId,
+        a.AnswerOwnerId as AcceptedOwnerId,
+        a.AnswerCreationDate as AcceptedCreationDate,
+        a.AnswerScore as AcceptedScore
+    from q_posts q
+    left join a_posts a on a.AnswerId = q.AcceptedAnswerId
+),
+top_scoring_answer as (
+    select
+        ar.QuestionId,
+        ar.AnswerId as TopAnswerId,
+        ar.AnswerOwnerId as TopOwnerId,
+        ar.AnswerCreationDate as TopCreationDate,
+        ar.AnswerScore as TopScore
+    from answer_ranked ar
+    where ar.rn_by_score = 1
+),
+question_activity as (
+    select
+        q.QuestionId,
+        q.QuestionCreationDate,
+        least(
+            coalesce(q.ClosedDate, timestamp 'infinity'),
+            coalesce(v.LastVoteAt, timestamp 'infinity'),
+            coalesce(c.LastCommentAt, timestamp 'infinity'),
+            coalesce(p.LastActivityDate, timestamp 'infinity')
+        ) as LastObservedActivity,
+        coalesce(v.UpVotes,0) as UpVotesQ,
+        coalesce(v.DownVotes,0) as DownVotesQ,
+        coalesce(v.Favorites,0) as FavoritesQ,
+        coalesce(v.BountyTotal,0) as BountyQ,
+        coalesce(c.CommentCount,0) as CommentCountQ,
+        coalesce(pl.DuplicateLinks,0) as DuplicateLinksQ
+    from q_posts q
+    left join votes_agg v on v.PostId = q.QuestionId
+    left join comments_agg c on c.PostId = q.QuestionId
+    left join postlinks_dups pl on pl.PostId = q.QuestionId
+    left join Posts p on p.Id = q.QuestionId
+),
+answer_activity as (
+    select
+        a.AnswerId,
+        a.QuestionId,
+        coalesce(v.UpVotes,0) as UpVotesA,
+        coalesce(v.DownVotes,0) as DownVotesA,
+        coalesce(c.CommentCount,0) as CommentCountA
+    from a_posts a
+    left join votes_agg v on v.PostId = a.AnswerId
+    left join comments_agg c on c.PostId = a.AnswerId
+),
+owner_cross as (
+    select
+        q.QuestionId,
+        q.QuestionOwnerId,
+        qa.AnswerOwnerId,
+        case when q.QuestionOwnerId is not null and qa.AnswerOwnerId is not null and q.QuestionOwnerId = qa.AnswerOwnerId then 1 else 0 end as IsSelfAnswer
+    from q_posts q
+    join a_posts qa on qa.QuestionId = q.QuestionId
+),
+owner_agg as (
+    select
+        oc.QuestionId,
+        max(oc.IsSelfAnswer) as HasSelfAnswer,
+        count(distinct oc.AnswerOwnerId) as DistinctAnswerOwners
+    from owner_cross oc
+    group by oc.QuestionId
+),
+question_quality as (
+    select
+        qa.QuestionId,
+        qa.UpVotesQ,
+        qa.DownVotesQ,
+        qa.FavoritesQ,
+        qa.BountyQ,
+        qa.CommentCountQ,
+        qa.DuplicateLinksQ,
+        q.ViewCount,
+        q.QuestionScore,
+        case when qa.UpVotesQ + qa.DownVotesQ = 0 then null
+             else round(cast(100.0 * qa.UpVotesQ / nullif(qa.UpVotesQ + qa.DownVotesQ,0) as numeric), 2)
+        end as UpvoteRatioPct,
+        round(
+            coalesce(q.ViewCount,0) * 0.0005
+            + qa.UpVotesQ * 2
+            - qa.DownVotesQ * 3
+            + qa.FavoritesQ * 1.5
+            + least(qa.CommentCountQ, 20) * 0.5
+            + case when qa.DuplicateLinksQ > 0 then -5 else 0 end
+            + q.QuestionScore * 1.2
+            + ln(greatest(qa.BountyQ + 1, 1))
+        , 2) as QualityScore
+    from question_activity qa
+    join q_posts q on q.QuestionId = qa.QuestionId
+),
+answer_summaries as (
+    select
+        ar.QuestionId,
+        sum(case when ar.AnswerScore > 0 then 1 else 0 end) as PosAnswers,
+        sum(case when ar.AnswerScore < 0 then 1 else 0 end) as NegAnswers,
+        avg(ar.AnswerScore) as AvgAnswerScore,
+        max(ar.AnswerScore) as MaxAnswerScore,
+        min(ar.AnswerCreationDate) as FirstAnswerAt,
+        max(ar.AnswerCreationDate) as LastAnswerAt
+    from answer_ranked ar
+    group by ar.QuestionId
+),
+q_enriched as (
+    select
+        q.QuestionId,
+        q.Title,
+        coalesce(pt.PrimaryTag, '(none)') as PrimaryTag,
+        q.QuestionOwnerId,
+        q.QuestionOwnerName,
+        us.DisplayName as QuestionOwnerDisplay,
+        us.Reputation as QuestionOwnerReputation,
+        us.TotalBadges as QuestionOwnerBadges,
+        oq.HasSelfAnswer,
+        oq.DistinctAnswerOwners,
+        qs.UpvoteRatioPct,
+        qs.QualityScore,
+        qs.UpVotesQ, qs.DownVotesQ, qs.FavoritesQ, qs.BountyQ, qs.CommentCountQ, qs.DuplicateLinksQ,
+        ans.AnswerCountForQ,
+        asu.PosAnswers, asu.NegAnswers, asu.AvgAnswerScore, asu.MaxAnswerScore,
+        ta.TopAnswerId, ta.TopOwnerId, ta.TopScore,
+        aa.AcceptedAnswerId, aa.AcceptedOwnerId, aa.AcceptedScore,
+        case
+            when aa.AcceptedAnswerId is not null and ta.TopAnswerId is not null and aa.AcceptedAnswerId = ta.TopAnswerId then 'AcceptedIsTop'
+            when aa.AcceptedAnswerId is not null and ta.TopAnswerId is not null and aa.AcceptedScore < ta.TopScore then 'AcceptedNotTop'
+            when aa.AcceptedAnswerId is null then 'NoAccepted'
+            else 'Other'
+        end as AcceptedVsTop,
+        q.QuestionCreationDate,
+        qa.LastObservedActivity,
+        q.ViewCount
+    from q_posts q
+    left join primary_tag pt on pt.QuestionId = q.QuestionId
+    left join user_stats us on us.UserId = q.QuestionOwnerId
+    left join owner_agg oq on oq.QuestionId = q.QuestionId
+    left join question_quality qs on qs.QuestionId = q.QuestionId
+    left join (
+        select QuestionId, count(*) as AnswerCountForQ
+        from a_posts group by QuestionId
+    ) ans on ans.QuestionId = q.QuestionId
+    left join answer_summaries asu on asu.QuestionId = q.QuestionId
+    left join top_scoring_answer ta on ta.QuestionId = q.QuestionId
+    left join accepted_answer aa on aa.QuestionId = q.QuestionId
+    left join question_activity qa on qa.QuestionId = q.QuestionId
+),
+recent_activity as (
+    select
+        qe.QuestionId,
+        sum(case when v.PostId = qe.QuestionId and v.CreationDate >= qe.LastObservedActivity - interval '30 days' then 1 else 0 end) as VotesLast30Q,
+        sum(case when c.PostId = qe.QuestionId and c.CreationDate >= qe.LastObservedActivity - interval '30 days' then 1 else 0 end) as CommentsLast30Q
+    from q_enriched qe
+    left join Votes v on v.PostId = qe.QuestionId
+    left join Comments c on c.PostId = qe.QuestionId
+    group by qe.QuestionId, qe.LastObservedActivity
+),
+dup_chain as (
+    select
+        q.QuestionId,
+        count(pl.Id) filter (where pl.LinkTypeId = 3) as DupOut,
+        count(pl2.Id) filter (where pl2.LinkTypeId = 3) as DupIn
+    from q_posts q
+    left join PostLinks pl on pl.PostId = q.QuestionId and pl.LinkTypeId = 3
+    left join PostLinks pl2 on pl2.RelatedPostId = q.QuestionId and pl2.LinkTypeId = 3
+    group by q.QuestionId
+),
+closed_reason as (
+    select
+        q.QuestionId,
+        max(crt.Name) filter (
+            where ph.PostHistoryTypeId = 10
+              and ph.Comment ~ '^[0-9]+$'
+              and crt.Id = cast(ph.Comment as integer)
+        ) as CloseReasonName
+    from q_posts q
+    left join PostHistory ph on ph.PostId = q.QuestionId
+    left join CloseReasonTypes crt on cast(crt.Id as text) = ph.Comment
+    group by q.QuestionId
+),
+normalized as (
+    select
+        qe.*,
+        coalesce(ra.VotesLast30Q,0) as VotesLast30Q,
+        coalesce(ra.CommentsLast30Q,0) as CommentsLast30Q,
+        coalesce(dc.DupOut,0) as DupOut,
+        coalesce(dc.DupIn,0) as DupIn,
+        coalesce(cr.CloseReasonName, '(unknown)') as CloseReasonNameNorm
+    from q_enriched qe
+    left join recent_activity ra on ra.QuestionId = qe.QuestionId
+    left join dup_chain dc on dc.QuestionId = qe.QuestionId
+    left join closed_reason cr on cr.QuestionId = qe.QuestionId
+)
+select
+    n.QuestionId,
+    n.Title,
+    n.PrimaryTag,
+    n.QuestionOwnerDisplay,
+    n.QuestionOwnerReputation,
+    n.QuestionOwnerBadges,
+    n.HasSelfAnswer,
+    n.DistinctAnswerOwners,
+    n.AnswerCountForQ,
+    n.AcceptedVsTop,
+    n.UpVotesQ,
+    n.DownVotesQ,
+    n.UpvoteRatioPct,
+    n.FavoritesQ,
+    n.BountyQ,
+    n.CommentCountQ,
+    n.DuplicateLinksQ,
+    n.PosAnswers,
+    n.NegAnswers,
+    round(cast(coalesce(n.AvgAnswerScore,0) as numeric),2) as AvgAnswerScore,
+    n.MaxAnswerScore,
+    n.TopScore,
+    n.AcceptedScore,
+    n.QualityScore,
+    n.VotesLast30Q,
+    n.CommentsLast30Q,
+    n.DupOut,
+    n.DupIn,
+    n.CloseReasonNameNorm,
+    n.QuestionCreationDate,
+    n.LastObservedActivity,
+    case when lower(n.PrimaryTag) like '%sql%' then 1 else 0 end as IsSQLish,
+    case
+        when n.ViewCount is null then null
+        when n.ViewCount = 0 then 0
+        else round(cast(1.0 * n.UpVotesQ / nullif(n.ViewCount,0) as numeric), 6)
+    end as UpvotesPerView,
+    coalesce(nullif(regexp_replace(n.Title, '\s+', ' ', 'g'), ''), '(no title)') as TitleNormalized
+from normalized n
+where
+    (n.QualityScore is not null and n.QualityScore > percentile_disc(0.75) within group (order by n.QualityScore))
+    or (n.AcceptedVsTop = 'AcceptedNotTop' and n.UpVotesQ - n.DownVotesQ >= 5)
+    or (n.HasSelfAnswer = 1 and n.AnswerCountForQ >= 3)
+    or (n.CloseReasonNameNorm not in ('(unknown)') and n.DupIn + n.DupOut >= 1)
+order by
+    n.QualityScore desc nulls last,
+    n.UpVotesQ - n.DownVotesQ desc,
+    n.FavoritesQ desc,
+    n.ViewCount desc nulls last
+limit 250;

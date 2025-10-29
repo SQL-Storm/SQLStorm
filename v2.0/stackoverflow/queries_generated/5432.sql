@@ -1,0 +1,80 @@
+-- {"query": "5432.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 767} 
+WITH TagActive AS (
+  SELECT t.Id, t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId
+  FROM Tags t
+  WHERE t.IsModeratorOnly = 0 AND t.IsRequired = 0
+),
+RecentPosts AS (
+  SELECT p.Id, p.PostTypeId, p.OwnerUserId, p.Title, p.Tags, p.CreationDate,
+         p.Score, p.ViewCount, p.CommentCount, p.AnswerCount
+  FROM Posts p
+  WHERE p.CreationDate >= NOW() - INTERVAL '30 days'
+),
+UserActivity AS (
+  SELECT u.Id AS UserId,
+         COUNT(DISTINCT rp.Id) AS PostsLast30d,
+         AVG(p.Score) AS AvgPostScore,
+         MAX(p.LastActivityDate) AS LastActivity
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN RecentPosts rp ON rp.OwnerUserId = u.Id
+  GROUP BY u.Id
+),
+CrossJoinStats AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COALESCE(uu.PostsLast30d, 0) AS PostsLast30d,
+    COALESCE(uu.AvgPostScore, 0) AS AvgPostScore,
+    COALESCE(uu.LastActivity, u.CreationDate) AS LastActive,
+    v.TotalVotes,
+    v.UpVotes,
+    v.DownVotes
+  FROM Users u
+  LEFT JOIN (
+    SELECT OwnerUserId,
+           COUNT(*) AS TotalVotes,
+           SUM(CASE WHEN VoteTypeId IN (2) THEN 1 ELSE 0 END) AS UpVotes,
+           SUM(CASE WHEN VoteTypeId IN (3) THEN 1 ELSE 0 END) AS DownVotes
+    FROM Votes
+    GROUP BY OwnerUserId
+  ) v ON v.OwnerUserId = u.Id
+  LEFT JOIN (
+    SELECT UserId,
+           COUNT(*) AS PostsLast30d
+    FROM Votes
+    WHERE CreationDate >= NOW() - INTERVAL '30 days'
+    GROUP BY UserId
+  ) uu ON uu.UserId = u.Id
+)
+SELECT
+  c.UserId,
+  c.DisplayName AS user_display_name,
+  c.Reputation,
+  c.PostsLast30d,
+  c.AvgPostScore,
+  c.LastActive,
+  c.TotalVotes,
+  c.UpVotes,
+  c.DownVotes,
+  pc.Title AS recent_top_question_title,
+  pc.AnswerCount AS recent_top_question_answers,
+  pc.ViewCount AS recent_top_question_views,
+  pc.Score AS recent_top_question_score,
+  pc.CreationDate AS recent_top_question_date,
+  STRING_AGG(t.TagName, ',') AS user_tags
+FROM CrossJoinStats c
+LEFT JOIN LATERAL (
+  SELECT p.Title, p.AnswerCount, p.ViewCount, p.Score, p.CreationDate
+  FROM Posts p
+  WHERE p.PostTypeId = 1 -- questions
+    AND p.OwnerUserId = c.UserId
+  ORDER BY p.Score DESC
+  LIMIT 1
+) pc ON true
+LEFT JOIN PostLinks pl ON pl.PostId = pc.Id
+LEFT JOIN Tags t ON t.ExcerptPostId = pc.Id OR t.WikiPostId = pc.Id
+GROUP BY
+  c.UserId, c.DisplayName, c.Reputation, c.PostsLast30d, c.AvgPostScore, c.LastActive,
+  c.TotalVotes, c.UpVotes, c.DownVotes, pc.Title, pc.AnswerCount, pc.ViewCount, pc.Score, pc.CreationDate;

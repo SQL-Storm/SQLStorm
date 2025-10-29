@@ -1,0 +1,206 @@
+WITH UserSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes AS TotalUpVotesGiven,
+        u.DownVotes AS TotalDownVotesGiven,
+        DATE_PART('day', CAST('2024-10-01 12:34:56' AS timestamp) - u.LastAccessDate) AS DaysSinceLastAccess,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswers,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END), 0) AS TotalQuestionViews,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        COALESCE(SUM(c.Score), 0) AS TotalCommentScoreMade,
+        SUM(CASE WHEN v.VoteTypeId = 2 AND p_for_votes.OwnerUserId = u.Id AND v.UserId != u.Id THEN 1 ELSE 0 END) AS TotalUpVotesReceived,
+        SUM(CASE WHEN v.VoteTypeId = 3 AND p_for_votes.OwnerUserId = u.Id AND v.UserId != u.Id THEN 1 ELSE 0 END) AS TotalDownVotesReceived,
+        MAX(p.CreationDate) AS LatestPostDate,
+        MIN(p.CreationDate) AS EarliestPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    LEFT JOIN Posts p_for_votes ON v.PostId = p_for_votes.Id AND p_for_votes.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.LastAccessDate
+),
+BadgeCounts AS (
+    SELECT
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+        COUNT(b.Id) AS TotalBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+PostEditAndCloseHistory AS (
+    SELECT
+        ph.PostId,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.Id END) AS EditCount,
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (10, 101, 102, 103, 104, 105) THEN 1 ELSE 0 END) AS WasClosed,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS WasReopened,
+        (SELECT MIN(ph_inner.CreationDate)
+         FROM PostHistory ph_inner
+         WHERE ph_inner.PostId = ph.PostId
+           AND ph_inner.PostHistoryTypeId IN (4, 5, 6)
+        ) AS FirstEditDate
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+),
+PostTagParsing AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><') AS TagArray,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AcceptedAnswerId,
+        p.Title,
+        p.Body,
+        (SELECT COUNT(c.Id) FROM Comments c WHERE c.PostId = p.Id AND c.Score >= 1) AS PositiveCommentCountOnPost,
+        p.PostTypeId
+    FROM Posts p
+    WHERE p.Tags IS NOT NULL AND p.PostTypeId = 1
+      AND p.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 years')
+),
+RankedTagContributions AS (
+    SELECT
+        ptp.OwnerUserId AS UserId,
+        tag AS TagName,
+        SUM(ptp.Score) AS UserTagScore,
+        COUNT(ptp.PostId) AS UserTagPostCount,
+        RANK() OVER (PARTITION BY tag ORDER BY SUM(ptp.Score) DESC, COUNT(ptp.PostId) DESC) AS RankInTagByScore,
+        ROW_NUMBER() OVER (PARTITION BY tag ORDER BY COUNT(ptp.PostId) DESC, SUM(ptp.Score) DESC) AS RankInTagByPosts
+    FROM PostTagParsing ptp,
+    UNNEST(ptp.TagArray) AS tag
+    GROUP BY ptp.OwnerUserId, tag
+    HAVING SUM(ptp.Score) > 0 AND COUNT(ptp.PostId) > 1
+),
+UserOverallMetrics AS (
+    SELECT
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.Views,
+        us.TotalPosts,
+        us.TotalQuestions,
+        us.TotalAnswers,
+        us.TotalPostScore,
+        us.TotalQuestionViews,
+        us.TotalCommentsMade,
+        us.TotalCommentScoreMade,
+        us.TotalUpVotesGiven,
+        us.TotalDownVotesGiven,
+        us.TotalUpVotesReceived,
+        us.TotalDownVotesReceived,
+        us.DaysSinceLastAccess,
+        COALESCE(bc.GoldBadges, 0) AS GoldBadges,
+        COALESCE(bc.SilverBadges, 0) AS SilverBadges,
+        COALESCE(bc.BronzeBadges, 0) AS BronzeBadges,
+        COALESCE(bc.TotalBadges, 0) AS TotalBadges,
+        COALESCE(CAST(us.TotalUpVotesReceived AS DECIMAL) / NULLIF(us.TotalDownVotesReceived, 0), 0) AS UpDownVoteRatioReceived,
+        COALESCE(CAST(us.TotalQuestions AS DECIMAL) / NULLIF(us.TotalAnswers, 0), 0) AS QARatio,
+        (
+            (us.Reputation * 0.05) +
+            (us.TotalPostScore * 0.3) +
+            (us.TotalCommentsMade * 0.1) +
+            (us.TotalUpVotesReceived * 0.6) +
+            (COALESCE(bc.GoldBadges, 0) * 40) +
+            (COALESCE(bc.SilverBadges, 0) * 15) +
+            (COALESCE(bc.BronzeBadges, 0) * 3) -
+            (us.DaysSinceLastAccess * 0.005)
+        ) AS InfluenceScore,
+        LAG(us.TotalPostScore, 1, 0) OVER (PARTITION BY us.UserId ORDER BY us.LatestPostDate) AS PreviousPostScoreForLag,
+        FIRST_VALUE(us.EarliestPostDate) OVER (PARTITION BY us.UserId ORDER BY us.EarliestPostDate) AS UserFirstActivityDate,
+        us.LatestPostDate,
+        us.EarliestPostDate
+    FROM UserSummary us
+    LEFT JOIN BadgeCounts bc ON us.UserId = bc.UserId
+    WHERE us.Reputation > 500 AND us.TotalPosts > 10 AND us.DaysSinceLastAccess < 730
+),
+ExtendedPostDetails AS (
+    SELECT
+        ptp.PostId,
+        ptp.OwnerUserId,
+        ptp.CreationDate AS PostCreationDate,
+        ptp.Score AS PostScore,
+        ptp.ViewCount,
+        ptp.Title,
+        ptp.Body,
+        ptp.PositiveCommentCountOnPost,
+        pech.EditCount,
+        pech.WasClosed,
+        pech.WasReopened,
+        pech.FirstEditDate,
+        COALESCE(DATE_PART('hour', pech.FirstEditDate - ptp.CreationDate), 0) AS HoursToFirstEdit,
+        (SELECT LENGTH(aa.Body) FROM Posts aa WHERE aa.Id = ptp.AcceptedAnswerId) AS AcceptedAnswerBodyLength,
+        (SELECT EXISTS (
+            SELECT 1 FROM Comments c_inner WHERE c_inner.PostId = ptp.PostId AND c_inner.UserId = ptp.OwnerUserId
+        )) AS OwnerCommentedOnOwnQuestion,
+        LENGTH(ptp.Title) - LENGTH(REPLACE(LOWER(ptp.Title), 'sql', '')) AS SqlKeywordCountInTitle,
+        LOWER(SUBSTRING(ptp.Title FROM 1 FOR 15)) AS TitlePrefixSample,
+        COALESCE(ptp.Score * (1 + (CAST(ptp.ViewCount AS NUMERIC) / NULLIF(pech.EditCount, 0)) * 0.05), 0) AS PostQualityMetric,
+        LENGTH(ptp.Body) - LENGTH(REPLACE(ptp.Body, '<code>', '')) AS CodeBlockCount,
+        ptp.PostTypeId
+    FROM PostTagParsing ptp
+    LEFT JOIN PostEditAndCloseHistory pech ON ptp.PostId = pech.PostId
+    WHERE ptp.PostTypeId = 1
+      AND ptp.Score > 0
+)
+SELECT
+    uom.UserId,
+    uom.DisplayName,
+    uom.Reputation,
+    uom.InfluenceScore,
+    uom.TotalPosts,
+    uom.TotalQuestions,
+    uom.TotalAnswers,
+    uom.GoldBadges,
+    uom.SilverBadges,
+    uom.BronzeBadges,
+    epd.PostId,
+    epd.PostCreationDate,
+    epd.PostScore,
+    epd.ViewCount,
+    epd.EditCount,
+    epd.WasClosed,
+    epd.WasReopened,
+    epd.HoursToFirstEdit,
+    epd.AcceptedAnswerBodyLength,
+    epd.OwnerCommentedOnOwnQuestion,
+    epd.SqlKeywordCountInTitle,
+    epd.CodeBlockCount,
+    epd.PostQualityMetric,
+    COALESCE(rt.TagName, 'Untagged/Minor') AS TopTagName,
+    rt.RankInTagByScore,
+    rt.UserTagPostCount,
+    ROW_NUMBER() OVER (ORDER BY uom.InfluenceScore DESC, uom.Reputation DESC, epd.PostQualityMetric DESC) AS OverallUserPostRank,
+    NTILE(5) OVER (ORDER BY uom.InfluenceScore DESC) AS InfluenceQuintile,
+    CASE
+        WHEN uom.Reputation >= 20000 AND uom.GoldBadges >= 10 AND epd.PostScore >= 50 THEN 'Guru'
+        WHEN uom.Reputation >= 5000 AND uom.TotalPosts >= 100 AND epd.PostScore >= 20 THEN 'ExpertContributor'
+        WHEN uom.TotalUpVotesReceived > uom.TotalDownVotesReceived * 3 AND uom.TotalPosts > 50 THEN 'HighlyRegarded'
+        ELSE 'ActiveMember'
+    END AS UserEngagementTier,
+    UPPER(SUBSTRING(uom.DisplayName FROM 1 FOR 4)) || '-' || TO_CHAR(epd.PostCreationDate, 'MMDDYY') || '-' || LPAD(CAST(epd.PostId AS VARCHAR), 7, '0') AS UniquePostIdentifier
+FROM UserOverallMetrics uom
+INNER JOIN ExtendedPostDetails epd ON uom.UserId = epd.OwnerUserId
+LEFT JOIN RankedTagContributions rt ON uom.UserId = rt.UserId AND rt.RankInTagByScore = 1
+WHERE
+    uom.InfluenceScore > 1000
+    AND epd.PostScore >= 10
+    AND epd.ViewCount >= 1000
+    AND epd.PostCreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 year')
+    AND epd.WasClosed = 0
+    AND (
+        epd.TitlePrefixSample LIKE 'how do i%'
+        OR epd.TitlePrefixSample LIKE 'what is the%'
+        OR epd.SqlKeywordCountInTitle > 2
+        OR epd.CodeBlockCount > 0
+    )
+    AND uom.UpDownVoteRatioReceived > 1.5
+ORDER BY OverallUserPostRank ASC, epd.PostId DESC
+LIMIT 5000;

@@ -1,0 +1,178 @@
+-- {"query": "2651.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1674} 
+with RecursiveTagCounts as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        p.Id as PostId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId
+    from Tags t
+    left join Posts p on p.Tags like concat('%<', t.TagName,'>%')
+    where t.IsRequired = 0
+), UserReputationRanks as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        rank() over (order by u.Reputation desc nulls last) as ReputationRank,
+        dense_rank() over (partition by date_trunc('year', u.CreationDate) order by u.Reputation desc nulls last) as YearlyRank
+    from Users u
+    where u.Reputation is not null and u.DisplayName is not null
+), PostVotesSummary as (
+    select
+        p.Id as PostId,
+        count(v.Id) filter (where v.VoteTypeId = 2) as UpVotes,
+        count(v.Id) filter (where v.VoteTypeId = 3) as DownVotes,
+        sum(case when v.VoteTypeId = 8 then coalesce(v.BountyAmount,0) else 0 end) as BountyStarted,
+        sum(case when v.VoteTypeId = 9 then coalesce(v.BountyAmount,0) else 0 end) as BountyClosed
+    from Posts p
+    left join Votes v on v.PostId = p.Id
+    group by p.Id
+), LatestPostHistoryEdits as (
+    select ph.PostId, max(ph.CreationDate) as LastEditDate
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (4,5,6,10,11,14) -- title/body/tags edits and close/reopen/edit applied
+    group by ph.PostId
+), UserBadgeAgg as (
+    select
+        b.UserId,
+        count(*) filter (where b.Class = 1) as GoldBadges,
+        count(*) filter (where b.Class = 2) as SilverBadges,
+        count(*) filter (where b.Class = 3) as BronzeBadges,
+        count(distinct b.Name) as DistinctBadges
+    from Badges b
+    group by b.UserId
+), PostAnswerStats as (
+    select
+        q.Id as QuestionId,
+        count(a.Id) as AnswerCount,
+        avg(a.Score) as AvgAnswerScore,
+        max(a.CreationDate) as LatestAnswerDate,
+        sum(case when a.OwnerUserId is null then 1 else 0 end) as AnonymousAnswers
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+    group by q.Id
+), ComplexPosts as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        coalesce(p.Tags,'') as Tags,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        coalesce(pas.AnswerCount,0) as Answers,
+        coalesce(pas.AvgAnswerScore,0) as AvgAnswerScore,
+        coalesce(pas.LatestAnswerDate,null) as LatestAnswerDate,
+        coalesce(ps.UpVotes,0) as UpVotes,
+        coalesce(ps.DownVotes,0) as DownVotes,
+        coalesce(ps.BountyStarted,0) as BountyStarted,
+        coalesce(ps.BountyClosed,0) as BountyClosed,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ub.DistinctBadges,
+        lph.LastEditDate
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    left join PostAnswerStats pas on pas.QuestionId = p.Id and p.PostTypeId=1
+    left join PostVotesSummary ps on ps.PostId = p.Id
+    left join UserBadgeAgg ub on ub.UserId = p.OwnerUserId
+    left join LatestPostHistoryEdits lph on lph.PostId = p.Id
+    where p.PostTypeId in (1,2)
+), RecursiveAncestorChain as (
+    select
+        p.Id as PostId,
+        p.ParentId,
+        p.Id as AncestorId,
+        0 as Level
+    from Posts p
+    where p.PostTypeId = 2
+    union all
+    select
+        rac.PostId,
+        p.ParentId,
+        p.Id as AncestorId,
+        rac.Level + 1
+    from RecursiveAncestorChain rac
+    join Posts p on p.Id = rac.ParentId
+    where p.PostTypeId = 2
+), FinalSelection as (
+    select
+        cp.*,
+        ur.DisplayName as OwnerUserDisplay,
+        ur.Reputation,
+        ur.ReputationRank,
+        ur.YearlyRank,
+        rac.Level,
+        rac.AncestorId
+    from ComplexPosts cp
+    left join Users ur on ur.Id = cp.OwnerUserId
+    left join RecursiveAncestorChain rac on rac.PostId = cp.Id
+    where cp.Score > 5 and (cp.Answers > 0 or cp.PostTypeId = 2)
+)
+select distinct
+    fs.Id as PostId,
+    fs.PostTypeId,
+    fs.Title,
+    fs.CreationDate,
+    fs.Score,
+    fs.ViewCount,
+    fs.Tags,
+    fs.OwnerUserId,
+    fs.OwnerName,
+    fs.Answers,
+    fs.AvgAnswerScore,
+    fs.LatestAnswerDate,
+    fs.UpVotes,
+    fs.DownVotes,
+    fs.BountyStarted,
+    fs.BountyClosed,
+    fs.GoldBadges,
+    fs.SilverBadges,
+    fs.BronzeBadges,
+    fs.DistinctBadges,
+    fs.LastEditDate,
+    fs.OwnerUserDisplay,
+    fs.Reputation,
+    fs.ReputationRank,
+    fs.YearlyRank,
+    fs.Level,
+    fs.AncestorId,
+    -- complex string expression with NULL logic and CASE
+    concat(
+        'Post #', fs.Id,
+        ' titled "', coalesce(nullif(fs.Title, ''), '[No Title]'), '"',
+        ' created on ', to_char(fs.CreationDate, 'YYYY-MM-DD'),
+        ' by user ', coalesce(fs.OwnerName, fs.OwnerUserDisplay, 'Unknown'),
+        ' (Reputation: ', coalesce(cast(fs.Reputation as varchar), 'N/A'), ')',
+        '. Score: ', fs.Score,
+        ', Views: ', fs.ViewCount,
+        ', Answers: ', fs.Answers,
+        ', Votes: (Up=', fs.UpVotes, ', Down=', fs.DownVotes, ')',
+        case
+            when fs.BountyStarted > 0 then concat(', Bounty Started: ', fs.BountyStarted)
+            else ''
+        end,
+        case
+            when fs.BountyClosed > 0 then concat(', Bounty Closed: ', fs.BountyClosed)
+            else ''
+        end,
+        '. Badges [Gold:', coalesce(cast(fs.GoldBadges as varchar), '0'),
+        ', Silver:', coalesce(cast(fs.SilverBadges as varchar), '0'),
+        ', Bronze:', coalesce(cast(fs.BronzeBadges as varchar), '0'), ']',
+        '. Last edit: ', coalesce(to_char(fs.LastEditDate, 'YYYY-MM-DD HH24:MI:SS'), 'Never'),
+        '. Ancestor level: ', fs.Level,
+        '. Ancestor Id: ', coalesce(cast(fs.AncestorId as varchar), 'None')
+    ) as PostSummary
+from FinalSelection fs
+order by fs.ReputationRank nulls last, fs.Score desc, fs.CreationDate desc
+limit 100;

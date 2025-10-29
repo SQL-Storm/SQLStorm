@@ -1,0 +1,132 @@
+WITH RankedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.FavoriteCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.Tags,
+        p.Title,
+        p.ClosedDate,
+        pt.Name AS PostTypeName,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) AS rn_desc_date,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS rn_desc_score,
+        COUNT(c.Id) OVER (PARTITION BY p.Id) AS CommentCountForPost,
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate) AS PreviousPostScore
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    WHERE p.Score > 0 OR p.ViewCount > 0 OR p.FavoriteCount > 0 OR p.AnswerCount IS NOT NULL OR p.CommentCount > 0
+),
+UserPostActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        AVG(p.Score) AS AveragePostScore,
+        MAX(p.CreationDate) AS LastPostCreationDate,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        -- STRING_AGG is not standard across all dialects; try to use a common form or fallback to LISTAGG if available.
+        -- Use standard SQL LISTAGG with WITHIN GROUP which is more widely supported; if not supported, adapt per dialect.
+        LISTAGG(b.Name, ';') WITHIN GROUP (ORDER BY b.Name) AS BadgeNames
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.DisplayName IS NOT NULL AND u.Reputation > 100
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+RecentClosedQuestions AS (
+    SELECT
+        Id,
+        Title,
+        ClosedDate,
+        OwnerUserId
+    FROM Posts
+    WHERE PostTypeId = 1 AND ClosedDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '30' DAY)
+),
+ClosedQuestionsWithReason AS (
+    SELECT
+        rcq.Id AS QuestionId,
+        rcq.Title AS QuestionTitle,
+        rcq.ClosedDate,
+        rcq.OwnerUserId,
+        crt.Name AS CloseReason
+    FROM RecentClosedQuestions rcq
+    LEFT JOIN PostHistory ph ON rcq.Id = ph.PostId
+    LEFT JOIN CloseReasonTypes crt ON CAST(ph.Comment AS INTEGER) = crt.Id
+    WHERE ph.PostHistoryTypeId = 10 AND ph.Comment IS NOT NULL
+),
+HighEngagementUsers AS (
+    SELECT
+        upa.UserId,
+        upa.DisplayName,
+        upa.Reputation,
+        upa.UserCreationDate,
+        upa.TotalPostsOwned,
+        upa.QuestionCount,
+        upa.AnswerCount,
+        upa.AveragePostScore,
+        upa.LastPostCreationDate,
+        upa.BadgeCount,
+        upa.BadgeNames
+    FROM UserPostActivity upa
+    WHERE upa.TotalPostsOwned > 50 AND upa.AveragePostScore > 5
+)
+SELECT
+    rp.PostId,
+    rp.PostTypeName,
+    rp.Title AS PostTitle,
+    rp.Score,
+    rp.ViewCount,
+    rp.FavoriteCount,
+    rp.CommentCountForPost,
+    rp.Tags,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation AS OwnerReputation,
+    COALESCE(rp.ClosedDate, DATE '1970-01-01') AS NormalizedClosedDate,
+    CASE
+        WHEN rp.Score < 0 THEN 'Negative Score'
+        WHEN rp.ViewCount > 10000 THEN 'High View Count'
+        WHEN rp.FavoriteCount > 50 THEN 'Highly Favorited'
+        WHEN rp.AnswerCount IS NOT NULL AND rp.AnswerCount > 10 THEN 'Many Answers'
+        ELSE 'Standard Engagement'
+    END AS EngagementLevel,
+    rp.rn_desc_score,
+    rp.PreviousPostScore,
+    heu.TotalPostsOwned AS OwnerTotalPosts,
+    heu.AveragePostScore AS OwnerAveragePostScore,
+    cqr.CloseReason
+FROM RankedPosts rp
+LEFT JOIN Users u ON rp.OwnerUserId = u.Id
+LEFT JOIN HighEngagementUsers heu ON rp.OwnerUserId = heu.UserId
+LEFT JOIN ClosedQuestionsWithReason cqr ON rp.PostId = cqr.QuestionId
+WHERE rp.rn_desc_score <= 100 AND rp.rn_desc_date <= 200 AND rp.PostTypeName IN ('Question', 'Answer')
+UNION ALL
+SELECT
+    NULL AS PostId,
+    'Summary' AS PostTypeName,
+    NULL AS PostTitle,
+    SUM(Score) AS Score,
+    SUM(ViewCount) AS ViewCount,
+    SUM(FavoriteCount) AS FavoriteCount,
+    SUM(CommentCountForPost) AS CommentCountForPost,
+    NULL AS Tags,
+    NULL AS OwnerDisplayName,
+    NULL AS OwnerReputation,
+    NULL AS NormalizedClosedDate,
+    NULL AS EngagementLevel,
+    NULL AS rn_desc_score,
+    NULL AS PreviousPostScore,
+    NULL AS OwnerTotalPosts,
+    NULL AS OwnerAveragePostScore,
+    NULL AS CloseReason
+FROM RankedPosts
+WHERE PostTypeName IN ('Question', 'Answer');

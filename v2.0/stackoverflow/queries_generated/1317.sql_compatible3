@@ -1,0 +1,215 @@
+WITH UserPostSummary AS (
+    SELECT
+        OwnerUserId AS UserId,
+        COUNT(Id) AS TotalPostsCreated,
+        COUNT(CASE WHEN PostTypeId = 1 THEN Id END) AS TotalQuestionsPosted,
+        COUNT(CASE WHEN PostTypeId = 2 THEN Id END) AS TotalAnswersPosted,
+        SUM(Score) AS TotalPostScoreReceived,
+        SUM(CASE WHEN PostTypeId = 1 THEN ViewCount ELSE 0 END) AS TotalQuestionViewCount,
+        AVG(CASE WHEN PostTypeId = 2 THEN Score END) AS AverageAnswerScore,
+        MAX(LastActivityDate) AS LastPostActivity
+    FROM Posts
+    WHERE OwnerUserId IS NOT NULL
+    GROUP BY OwnerUserId
+),
+UserCommentSummary AS (
+    SELECT
+        UserId,
+        COUNT(Id) AS TotalCommentsMade,
+        MAX(CreationDate) AS LastCommentActivity
+    FROM Comments
+    WHERE UserId IS NOT NULL
+    GROUP BY UserId
+),
+UserBadgeSummary AS (
+    SELECT
+        UserId,
+        COUNT(CASE WHEN Class = 1 THEN Id END) AS GoldBadgesCount,
+        COUNT(CASE WHEN Class = 2 THEN Id END) AS SilverBadgesCount,
+        COUNT(CASE WHEN Class = 3 THEN Id END) AS BronzeBadgesCount
+    FROM Badges
+    GROUP BY UserId
+),
+PostVoteAggregates AS (
+    SELECT
+        PostId,
+        SUM(CASE WHEN VoteTypeId = 1 THEN 1 ELSE 0 END) AS AcceptedVotes,
+        SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        SUM(CASE WHEN VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoriteVotes,
+        COUNT(DISTINCT UserId) AS DistinctVotersCount
+    FROM Votes
+    WHERE VoteTypeId IN (1,2,3,5)
+    GROUP BY PostId
+),
+AcceptedAnswerCounts AS (
+    SELECT
+        A.OwnerUserId AS UserId,
+        COUNT(DISTINCT Q.Id) AS AcceptedAnswersCount
+    FROM Posts Q
+    JOIN Posts A ON Q.AcceptedAnswerId = A.Id
+    WHERE A.PostTypeId = 2
+      AND A.OwnerUserId IS NOT NULL
+    GROUP BY A.OwnerUserId
+),
+PostHistoryEventSummary AS (
+    SELECT
+        PH.PostId,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.Id END) AS PostEditCount,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.Id END) AS PostClosedCount,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId = 11 THEN PH.Id END) AS PostReopenedCount,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId = 12 THEN PH.Id END) AS PostDeletedCount,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.CreationDate END) AS LastEditDateFromHistory,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.CreationDate END) AS LastClosedDate,
+        MIN(PH.CreationDate) AS FirstHistoryDate,
+        MAX(PH.CreationDate) AS LastHistoryDate,
+        (SELECT H.UserId FROM PostHistory H WHERE H.PostId = PH.PostId AND H.PostHistoryTypeId IN (4,5,6) ORDER BY H.CreationDate DESC LIMIT 1) AS LastEditorId_Correlated
+    FROM PostHistory PH
+    GROUP BY PH.PostId
+),
+PostLinkSummary AS (
+    SELECT
+        P.OwnerUserId AS UserId,
+        COUNT(PL.Id) AS TotalLinksFromUserPosts,
+        COUNT(CASE WHEN PL.LinkTypeId = 1 THEN PL.Id END) AS TotalLinkedPostsByUsers,
+        COUNT(CASE WHEN PL.LinkTypeId = 3 THEN PL.Id END) AS TotalDuplicateSourcesByUsers,
+        COUNT(DISTINCT PL.RelatedPostId) AS DistinctRelatedPostsByUsers
+    FROM Posts P
+    JOIN PostLinks PL ON P.Id = PL.PostId
+    WHERE P.OwnerUserId IS NOT NULL
+    GROUP BY P.OwnerUserId
+),
+DetailedPostAnalytics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount AS PostViewCount,
+        P.CommentCount AS PostCommentCount,
+        P.FavoriteCount AS PostFavoriteCount,
+        P.AnswerCount AS PostAnswerCount,
+        P.LastActivityDate AS PostLastActivityDate,
+        P.ClosedDate AS PostClosedDate,
+        P.ParentId,
+        COALESCE(P.Title, 'No Title (' || SUBSTRING(P.Body, 1, 50) || COALESCE('... (ID:' || CAST(P.Id AS VARCHAR), '') || ')') AS PostDisplayTitle,
+        TRIM(BOTH '>' FROM REPLACE(SUBSTRING(P.Tags, 2), '><', ',')) AS CleanedTagsString,
+        (CASE
+            WHEN LENGTH(COALESCE(P.Tags, '')) >= 2
+            THEN ( (LENGTH(COALESCE(P.Tags, '')) - 2) - LENGTH(REPLACE(SUBSTRING(COALESCE(P.Tags, ''), 2, LENGTH(COALESCE(P.Tags, ''))-2), '><', '')) ) / (CASE WHEN LENGTH('><') = 0 THEN 1 ELSE LENGTH('><') END) + 1
+            ELSE 0
+         END) AS NumberOfTags,
+        CASE
+            WHEN LOWER(P.Body) LIKE '%<pre><code>%' AND LOWER(P.Body) LIKE '%</code></pre>%' THEN TRUE
+            ELSE FALSE
+        END AS ContainsCodeBlock,
+        CASE
+            WHEN P.LastEditorUserId IS NOT NULL AND P.LastEditorUserId <> P.OwnerUserId THEN TRUE
+            ELSE FALSE
+        END AS EditedByOtherUser,
+        COALESCE(PHS.PostEditCount, 0) AS TotalPostEdits,
+        COALESCE(PHS.PostClosedCount, 0) AS TotalPostClosedEvents,
+        COALESCE(PHS.PostReopenedCount, 0) AS TotalPostReopenedEvents,
+        COALESCE(PHS.LastEditDateFromHistory, P.LastEditDate) AS EffectiveLastEditDate,
+        COALESCE(PHS.LastEditorId_Correlated, P.LastEditorUserId) AS EffectiveLastEditorId,
+        (EXTRACT(EPOCH FROM (COALESCE(PHS.LastClosedDate, P.ClosedDate) - P.CreationDate)) / 86400.0) AS DaysOpenBeforeClosure,
+        COALESCE(PVA.UpVotes, 0) AS TotalUpvotesOnPost,
+        COALESCE(PVA.DownVotes, 0) AS TotalDownvotesOnPost,
+        COALESCE(PVA.FavoriteVotes, 0) AS TotalFavoriteVotesOnPost,
+        COALESCE(PVA.DistinctVotersCount, 0) AS DistinctVotersOnPost,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId, P.PostTypeId ORDER BY P.Score DESC, P.CreationDate DESC) AS Rnk_PostScoreByUserType
+    FROM Posts P
+    LEFT JOIN PostHistoryEventSummary PHS ON P.Id = PHS.PostId
+    LEFT JOIN PostVoteAggregates PVA ON P.Id = PVA.PostId
+    WHERE P.OwnerUserId IS NOT NULL AND P.OwnerUserId > 0
+),
+UserOverallAggregatedStats AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS UserGivenUpVotes,
+        U.DownVotes AS UserGivenDownVotes,
+        U.Location,
+        U.LastAccessDate,
+        COALESCE(UPS.TotalPostsCreated, 0) AS TotalPostsCreated,
+        COALESCE(UPS.TotalQuestionsPosted, 0) AS TotalQuestionsPosted,
+        COALESCE(UPS.TotalAnswersPosted, 0) AS TotalAnswersPosted,
+        COALESCE(UCS.TotalCommentsMade, 0) AS TotalCommentsMade,
+        COALESCE(UPS.TotalPostScoreReceived, 0) AS TotalPostScoreReceived,
+        COALESCE(AAC.AcceptedAnswersCount, 0) AS TotalAcceptedAnswers,
+        COALESCE(UBS.GoldBadgesCount, 0) AS GoldBadgesCount,
+        COALESCE(UBS.SilverBadgesCount, 0) AS SilverBadgesCount,
+        COALESCE(UBS.BronzeBadgesCount, 0) AS BronzeBadgesCount,
+        COALESCE(UPS.TotalQuestionViewCount, 0) AS TotalQuestionViewCount,
+        COALESCE(UPS.AverageAnswerScore, 0.0) AS AverageAnswerScore,
+        COALESCE(PLS.TotalLinksFromUserPosts, 0) AS TotalLinksFromUserPosts,
+        COALESCE(PLS.TotalLinkedPostsByUsers, 0) AS TotalLinkedPostsByUsers,
+        COALESCE(PLS.TotalDuplicateSourcesByUsers, 0) AS TotalDuplicateSourcesByUsers,
+        GREATEST(COALESCE(UPS.LastPostActivity, TIMESTAMP '1900-01-01'), COALESCE(UCS.LastCommentActivity, TIMESTAMP '1900-01-01'), U.LastAccessDate) AS UserMostRecentActivity
+    FROM Users U
+    LEFT JOIN UserPostSummary UPS ON U.Id = UPS.UserId
+    LEFT JOIN UserCommentSummary UCS ON U.Id = UCS.UserId
+    LEFT JOIN UserBadgeSummary UBS ON U.Id = UBS.UserId
+    LEFT JOIN AcceptedAnswerCounts AAC ON U.Id = AAC.UserId
+    LEFT JOIN PostLinkSummary PLS ON U.Id = PLS.UserId
+    WHERE U.Id > 0
+),
+UserEngagementScores AS (
+    SELECT
+        UOS.UserId,
+        UOS.DisplayName,
+        UOS.Reputation,
+        UOS.Location,
+        UOS.TotalPostsCreated,
+        UOS.TotalQuestionsPosted,
+        UOS.TotalAnswersPosted,
+        UOS.TotalCommentsMade,
+        UOS.TotalPostScoreReceived,
+        UOS.TotalAcceptedAnswers,
+        UOS.GoldBadgesCount,
+        UOS.SilverBadgesCount,
+        UOS.BronzeBadgesCount,
+        UOS.TotalQuestionViewCount,
+        UOS.AverageAnswerScore,
+        UOS.TotalLinksFromUserPosts,
+        UOS.TotalLinkedPostsByUsers,
+        UOS.TotalDuplicateSourcesByUsers,
+        UOS.UserMostRecentActivity,
+        SUM(COALESCE(DPA.TotalUpvotesOnPost, 0)) AS TotalUpvotesReceivedByAllPosts,
+        SUM(COALESCE(DPA.TotalFavoriteVotesOnPost, 0)) AS TotalFavoritesReceivedByAllPosts,
+        SUM(COALESCE(DPA.TotalPostEdits, 0)) AS TotalEditsAcrossAllPosts,
+        SUM(COALESCE(DPA.TotalPostClosedEvents, 0)) AS TotalClosedEventsAcrossAllPosts,
+        SUM(COALESCE(DPA.DistinctVotersOnPost, 0)) AS SumDistinctVotersOnAllPosts,
+        AVG(CASE WHEN DPA.PostClosedDate IS NOT NULL THEN DPA.DaysOpenBeforeClosure END) AS AvgDaysOpenForClosedPosts,
+        (UOS.Reputation * 0.5 + UOS.TotalAcceptedAnswers * 50 + UOS.GoldBadgesCount * 100 + SUM(COALESCE(DPA.TotalUpvotesOnPost, 0)) * 1.0) AS BaseInfluenceScore
+    FROM UserOverallAggregatedStats UOS
+    LEFT JOIN DetailedPostAnalytics DPA ON UOS.UserId = DPA.OwnerUserId
+    GROUP BY
+        UOS.UserId,
+        UOS.DisplayName,
+        UOS.Reputation,
+        UOS.Location,
+        UOS.TotalPostsCreated,
+        UOS.TotalQuestionsPosted,
+        UOS.TotalAnswersPosted,
+        UOS.TotalCommentsMade,
+        UOS.TotalPostScoreReceived,
+        UOS.TotalAcceptedAnswers,
+        UOS.GoldBadgesCount,
+        UOS.SilverBadgesCount,
+        UOS.BronzeBadgesCount,
+        UOS.TotalQuestionViewCount,
+        UOS.AverageAnswerScore,
+        UOS.TotalLinksFromUserPosts,
+        UOS.TotalLinkedPostsByUsers,
+        UOS.TotalDuplicateSourcesByUsers,
+        UOS.UserMostRecentActivity
+)
+SELECT
+    UES.*,
+    (BaseInfluenceScore / NULLIF(GREATEST(1, MAX(BaseInfluenceScore) OVER ()), 0)) AS NormalizedInfluenceScore
+FROM UserEngagementScores UES;

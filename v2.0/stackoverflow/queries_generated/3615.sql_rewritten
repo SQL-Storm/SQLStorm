@@ -1,0 +1,163 @@
+-- {"query": "3615.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 3185} 
+WITH
+    /* Recent activity (last 30 days) */
+    LatestPosts AS (
+        SELECT
+            p.Id,
+            p.OwnerUserId,
+            p.PostTypeId,
+            p.CreationDate,
+            p.Score,
+            p.Title,
+            p.Tags,
+            ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+        FROM Posts p
+        WHERE p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '30 days'
+    ),
+
+    /* Aggregate per‑user post statistics */
+    UserPostAgg AS (
+        SELECT
+            lp.OwnerUserId,
+            COUNT(*) FILTER (WHERE lp.PostTypeId = 1) AS QuestionCount,
+            COUNT(*) FILTER (WHERE lp.PostTypeId = 2) AS AnswerCount,
+            SUM(lp.Score) FILTER (WHERE lp.PostTypeId = 1) AS TotalQuestionScore,
+            SUM(lp.Score) FILTER (WHERE lp.PostTypeId = 2) AS TotalAnswerScore,
+            MAX(lp.CreationDate) AS LastPostDate
+        FROM LatestPosts lp
+        GROUP BY lp.OwnerUserId
+    ),
+
+    /* Badge totals per user */
+    BadgeAgg AS (
+        SELECT
+            b.UserId,
+            COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+            COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+            COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+            STRING_AGG(DISTINCT b.Name, ', ') FILTER (WHERE b.TagBased = 0) AS NamedBadges,
+            STRING_AGG(DISTINCT b.Name, ', ') FILTER (WHERE b.TagBased = 1) AS TagBadges
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+
+    /* Vote summary per post */
+    VoteStats AS (
+        SELECT
+            v.PostId,
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+            MAX(v.CreationDate) AS LastVoteDate
+        FROM Votes v
+        GROUP BY v.PostId
+    ),
+
+    /* Most used tags per user (only tags used >5 times) */
+    UserTagPopularity AS (
+        SELECT
+            u.Id                AS UserId,
+            t.TagName,
+            COUNT(*)            AS TagUsageCount,
+            ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY COUNT(*) DESC) AS TagRank
+        FROM Users u
+        JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+        CROSS JOIN LATERAL (
+            SELECT UNNEST(string_to_array(TRIM(BOTH '<>' FROM p.Tags), '><')) AS TagName
+        ) AS tl
+        JOIN Tags t ON t.TagName = tl.TagName
+        GROUP BY u.Id, t.TagName
+        HAVING COUNT(*) > 5
+    ),
+
+    /* Combine user‑level data */
+    UserCombined AS (
+        SELECT
+            u.Id,
+            COALESCE(u.DisplayName, u.EmailHash)                     AS DisplayName,
+            u.Reputation,
+            u.CreationDate,
+            COALESCE(upqa.QuestionCount,0)                           AS RecentQuestionCount,
+            COALESCE(upqa.AnswerCount,0)                             AS RecentAnswerCount,
+            COALESCE(upqa.TotalQuestionScore,0)                      AS RecentQuestionScore,
+            COALESCE(upqa.TotalAnswerScore,0)                        AS RecentAnswerScore,
+            COALESCE(bag.GoldBadges,0)                               AS GoldBadges,
+            COALESCE(bag.SilverBadges,0)                             AS SilverBadges,
+            COALESCE(bag.BronzeBadges,0)                             AS BronzeBadges,
+            bag.NamedBadges,
+            bag.TagBadges,
+            ROW_NUMBER() OVER (ORDER BY u.Reputation DESC)          AS ReputationRank,
+            AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END)
+                OVER (PARTITION BY u.Id)                             AS AvgAnswerScore,
+            MAX(vs.LastVoteDate)                                     AS LastVoteSeen
+        FROM Users u
+        LEFT JOIN UserPostAgg upqa  ON upqa.OwnerUserId = u.Id
+        LEFT JOIN BadgeAgg bag      ON bag.UserId = u.Id
+        LEFT JOIN LatestPosts lp    ON lp.OwnerUserId = u.Id AND lp.rn = 1
+        LEFT JOIN Posts p           ON p.Id = lp.Id
+        LEFT JOIN VoteStats vs     ON vs.PostId = p.Id
+    )
+
+/* Final result set with user rows plus an aggregate summary row */
+SELECT
+    uc.Id,
+    uc.DisplayName,
+    uc.Reputation,
+    uc.ReputationRank,
+    uc.RecentQuestionCount,
+    uc.RecentAnswerCount,
+    uc.RecentQuestionScore,
+    uc.RecentAnswerScore,
+    ROUND(uc.AvgAnswerScore,2)                      AS AvgAnswerScore,
+    uc.GoldBadges,
+    uc.SilverBadges,
+    uc.BronzeBadges,
+    uc.NamedBadges,
+    uc.TagBadges,
+    COALESCE(utp.TagName,'None')                    AS TopTag,
+    COALESCE(utp.TagUsageCount,0)                   AS TopTagUsage,
+    CASE
+        WHEN uc.LastVoteSeen IS NULL                THEN 'Never Voted'
+        WHEN uc.LastVoteSeen < cast('2024-10-01' as date) - INTERVAL '180 days' THEN 'Stale'
+        ELSE 'Active'
+    END                                            AS VoteActivityStatus,
+    CASE
+        WHEN uc.DisplayName ILIKE '%test%' OR uc.EmailHash IS NULL THEN 'Potential Spam'
+        ELSE 'Legitimate'
+    END                                            AS QualityFlag
+FROM UserCombined uc
+LEFT JOIN LATERAL (
+    SELECT TagName, TagUsageCount
+    FROM UserTagPopularity utp
+    WHERE utp.UserId = uc.Id
+    ORDER BY utp.TagRank
+    LIMIT 1
+) utp ON TRUE
+WHERE uc.Reputation > 1000
+  AND (uc.GoldBadges + uc.SilverBadges) > 5
+  AND (uc.RecentQuestionCount + uc.RecentAnswerCount) >= 10
+ORDER BY uc.ReputationRank
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    NULL                                    AS Id,
+    'Aggregate Summary'                     AS DisplayName,
+    NULL                                    AS Reputation,
+    NULL                                    AS ReputationRank,
+    SUM(RecentQuestionCount)                AS RecentQuestionCount,
+    SUM(RecentAnswerCount)                  AS RecentAnswerCount,
+    SUM(RecentQuestionScore)                AS RecentQuestionScore,
+    SUM(RecentAnswerScore)                  AS RecentAnswerScore,
+    ROUND(AVG(AvgAnswerScore),2)            AS AvgAnswerScore,
+    NULL                                    AS GoldBadges,
+    NULL                                    AS SilverBadges,
+    NULL                                    AS BronzeBadges,
+    NULL                                    AS NamedBadges,
+    NULL                                    AS TagBadges,
+    NULL                                    AS TopTag,
+    NULL                                    AS TopTagUsage,
+    NULL                                    AS VoteActivityStatus,
+    NULL                                    AS QualityFlag
+FROM UserCombined
+WHERE Reputation > 1000;

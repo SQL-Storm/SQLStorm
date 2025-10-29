@@ -1,0 +1,271 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        AVG(p.Score) as AvgPostScore,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2), ', ') as AllTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.AccountId IS NOT NULL
+      AND p.Tags IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopPosts AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) as ScoreRank,
+        DENSE_RANK() OVER (ORDER BY p.ViewCount DESC) as ViewRank,
+        AVG(p.Score) OVER (PARTITION BY p.PostTypeId) as AvgScoreByType,
+        CASE 
+            WHEN p.Score > (SELECT AVG(p2.Score) FROM Posts p2 WHERE p2.PostTypeId = p.PostTypeId) 
+            THEN 'Above Average' 
+            ELSE 'Below Average' 
+        END as ScoreCategory,
+        CHAR_LENGTH(p.Body) as BodyLength,
+        COALESCE(p.AnswerCount, 0) as AnswerCount,
+        COALESCE(p.CommentCount, 0) as CommentCount
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserPostAnalysis AS (
+    SELECT 
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.PostCount,
+        ua.CommentCount,
+        ua.BadgeCount,
+        CASE 
+            WHEN ua.PostCount > 100 THEN 'Very Active'
+            WHEN ua.PostCount > 50 THEN 'Active'
+            WHEN ua.PostCount > 10 THEN 'Moderate'
+            ELSE 'Light'
+        END as ActivityLevel,
+        CAST(DATE_PART('day', TIMESTAMP '2024-10-01 12:34:56' - ua.LastPostDate) AS INTEGER) as DaysSinceLastPost,
+        COALESCE(ua.AllTags, 'None') as UserTags,
+        LAG(ua.PostCount) OVER (ORDER BY ua.PostCount DESC) as PrevUserPostCount,
+        ROW_NUMBER() OVER (ORDER BY ua.PostCount DESC) as UserRank
+    FROM UserActivityStats ua
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        tp.Id,
+        tp.Title,
+        tp.Score,
+        tp.ViewCount,
+        tp.CreationDate,
+        tp.OwnerUserId,
+        tp.PostTypeId,
+        tp.Tags,
+        tp.ScoreRank,
+        tp.ViewRank,
+        tp.AvgScoreByType,
+        tp.ScoreCategory,
+        tp.BodyLength,
+        tp.AnswerCount,
+        tp.CommentCount,
+        CASE 
+            WHEN tp.AnswerCount > 0 AND tp.CommentCount > 0 THEN 'Engaged'
+            WHEN tp.AnswerCount > 0 THEN 'Answered'
+            WHEN tp.CommentCount > 0 THEN 'Commented'
+            ELSE 'Unengaged'
+        END as EngagementLevel,
+        CASE 
+            WHEN tp.BodyLength > 1000 THEN 'Long'
+            WHEN tp.BodyLength > 500 THEN 'Medium'
+            ELSE 'Short'
+        END as PostLength,
+        ROUND((tp.ViewCount * 1.0 / NULLIF(tp.Score, 0)), 2) as ViewsPerScore,
+        ('POST_' || tp.Id || '_' || tp.Score) as PostIdentifier,
+        UPPER(tp.Title) as TitleUpper,
+        REPLACE(tp.Tags, '<', '') as CleanedTags,
+        COALESCE(tp.Tags, 'No Tags') as FullTags
+    FROM TopPosts tp
+    WHERE tp.ScoreRank <= 50 OR tp.ViewRank <= 50
+),
+FinalAnalysis AS (
+    SELECT 
+        upa.UserId,
+        upa.DisplayName,
+        upa.Reputation,
+        upa.PostCount,
+        upa.CommentCount,
+        upa.BadgeCount,
+        upa.ActivityLevel,
+        upa.DaysSinceLastPost,
+        upa.UserTags,
+        upa.UserRank,
+        cpa.Id as PostId,
+        cpa.Title,
+        cpa.Score,
+        cpa.ViewCount,
+        cpa.CreationDate,
+        cpa.ScoreRank,
+        cpa.ViewRank,
+        cpa.AvgScoreByType,
+        cpa.ScoreCategory,
+        cpa.BodyLength,
+        cpa.AnswerCount,
+        cpa.CommentCount,
+        cpa.EngagementLevel,
+        cpa.PostLength,
+        cpa.ViewsPerScore,
+        cpa.PostIdentifier,
+        cpa.TitleUpper,
+        cpa.CleanedTags,
+        cpa.FullTags,
+        CASE 
+            WHEN (upa.PostCount * upa.Reputation) > 10000 THEN 'High Impact'
+            WHEN (upa.PostCount * upa.Reputation) > 5000 THEN 'Medium Impact'
+            ELSE 'Low Impact'
+        END as ImpactLevel,
+        ABS(upa.PostCount - (SELECT AVG(u2.PostCount) FROM UserActivityStats u2)) as PostCountDeviation,
+        ROUND(AVG(cpa.Score) OVER (ORDER BY cpa.CreationDate ROWS BETWEEN 10 PRECEDING AND CURRENT ROW), 2) as MovingAvgScore,
+        SUBSTRING(cpa.TitleUpper FROM 1 FOR 50) as TitlePreview,
+        CASE 
+            WHEN cpa.FullTags LIKE '%<%' AND POSITION('>' IN cpa.FullTags) > 0 THEN 
+                (SELECT STRING_AGG(SUBSTRING(cpa.FullTags FROM (pos.open+1) FOR (pos.close - pos.open - 1)), ', ')
+                 FROM (
+                     SELECT 
+                        (POSITION('<' IN cpa.FullTags)) as open,
+                        (POSITION('>' IN cpa.FullTags)) as close
+                 ) pos)
+            ELSE 'No Tags'
+        END as TagList,
+        COALESCE(upa.UserTags, 'No Tags') as SafeUserTags,
+        CASE 
+            WHEN cpa.ScoreCategory IS NOT NULL AND cpa.ViewsPerScore > 5 THEN 'Popular'
+            WHEN cpa.ScoreCategory IS NOT NULL AND cpa.ViewsPerScore <= 5 THEN 'Less Popular'
+            ELSE 'Unknown'
+        END as PopularityCategory,
+        CASE 
+            WHEN EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = upa.UserId AND b.Class = 1) 
+            THEN 'Gold Badge Holder' 
+            WHEN EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = upa.UserId AND b.Class = 2) 
+            THEN 'Silver Badge Holder' 
+            ELSE 'No Gold/Silver'
+        END as BadgeStatus,
+        cpa.OwnerUserId
+    FROM UserPostAnalysis upa
+    INNER JOIN ComplexPostAnalysis cpa ON upa.UserId = cpa.OwnerUserId
+    WHERE upa.PostCount > 20 
+      AND cpa.ViewCount > 100 
+      AND cpa.Score > 5
+      AND upa.DaysSinceLastPost < 365
+)
+SELECT 
+    fa.UserId,
+    fa.DisplayName,
+    fa.Reputation,
+    fa.PostCount,
+    fa.CommentCount,
+    fa.BadgeCount,
+    fa.ActivityLevel,
+    fa.DaysSinceLastPost,
+    fa.UserTags,
+    fa.UserRank,
+    fa.PostId,
+    fa.Title,
+    fa.Score,
+    fa.ViewCount,
+    fa.CreationDate,
+    fa.ScoreRank,
+    fa.ViewRank,
+    fa.AvgScoreByType,
+    fa.ScoreCategory,
+    fa.BodyLength,
+    fa.AnswerCount,
+    fa.CommentCount,
+    fa.EngagementLevel,
+    fa.PostLength,
+    fa.ViewsPerScore,
+    fa.PostIdentifier,
+    fa.TitleUpper,
+    fa.CleanedTags,
+    fa.FullTags,
+    fa.ImpactLevel,
+    fa.PostCountDeviation,
+    fa.MovingAvgScore,
+    fa.TitlePreview,
+    fa.TagList,
+    fa.SafeUserTags,
+    fa.PopularityCategory,
+    fa.BadgeStatus
+FROM FinalAnalysis fa
+WHERE NOT EXISTS (
+    SELECT 1 FROM Posts p 
+    WHERE p.Id = fa.PostId 
+      AND p.ClosedDate IS NOT NULL
+      AND p.PostTypeId = 1
+)
+AND 
+(
+    (fa.Score > (SELECT AVG(p2.Score) FROM Posts p2 WHERE p2.PostTypeId = 1) * 1.5) 
+    OR 
+    (fa.ViewCount > (SELECT AVG(p3.ViewCount) FROM Posts p3 WHERE p3.PostTypeId = 1) * 2)
+)
+UNION ALL
+SELECT 
+    fa.UserId,
+    fa.DisplayName,
+    fa.Reputation,
+    fa.PostCount,
+    fa.CommentCount,
+    fa.BadgeCount,
+    fa.ActivityLevel,
+    fa.DaysSinceLastPost,
+    fa.UserTags,
+    fa.UserRank,
+    fa.PostId,
+    fa.Title,
+    fa.Score,
+    fa.ViewCount,
+    fa.CreationDate,
+    fa.ScoreRank,
+    fa.ViewRank,
+    fa.AvgScoreByType,
+    fa.ScoreCategory,
+    fa.BodyLength,
+    fa.AnswerCount,
+    fa.CommentCount,
+    fa.EngagementLevel,
+    fa.PostLength,
+    fa.ViewsPerScore,
+    fa.PostIdentifier,
+    fa.TitleUpper,
+    fa.CleanedTags,
+    fa.FullTags,
+    fa.ImpactLevel,
+    fa.PostCountDeviation,
+    fa.MovingAvgScore,
+    fa.TitlePreview,
+    fa.TagList,
+    fa.SafeUserTags,
+    fa.PopularityCategory,
+    fa.BadgeStatus
+FROM FinalAnalysis fa
+WHERE EXISTS (
+    SELECT 1 FROM Votes v 
+    WHERE v.PostId = fa.PostId 
+      AND v.VoteTypeId IN (2, 3)
+      AND v.UserId IN (
+        SELECT Id FROM Users u WHERE u.Reputation > (SELECT AVG(u2.Reputation) FROM Users u2) * 1.2
+      )
+)
+AND fa.ViewCount > 50
+ORDER BY Score DESC, ViewCount DESC
+LIMIT 5000;

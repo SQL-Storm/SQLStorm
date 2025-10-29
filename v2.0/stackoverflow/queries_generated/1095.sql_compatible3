@@ -1,0 +1,167 @@
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.Views AS UserViews,
+        U.UpVotes AS UserUpVotes,
+        U.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COUNT(C.Id) AS TotalComments,
+        COUNT(B.Id) AS TotalBadges,
+        MAX(P.CreationDate) AS LatestPostDate,
+        SUM(P.Score) AS TotalPostScore,
+        AVG(CASE WHEN P.PostTypeId = 1 THEN P.Score END) AS AvgQuestionScore,
+        AVG(CASE WHEN P.PostTypeId = 2 THEN P.Score END) AS AvgAnswerScore,
+        CAST(FLOOR(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - U.CreationDate)) / (3600 * 24)) AS integer) AS AccountAgeDays
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    LEFT JOIN Badges AS B ON U.Id = B.UserId
+    GROUP BY U.Id, U.Reputation, U.CreationDate, U.Views, U.UpVotes, U.DownVotes
+),
+PostEditActivity AS (
+    SELECT
+        PH.PostId,
+        COUNT(PH.Id) AS TotalEdits,
+        COUNT(DISTINCT PH.UserId) AS UniqueEditors,
+        MIN(PH.CreationDate) AS FirstEditDate,
+        MAX(PH.CreationDate) AS LastEditDate,
+        STRING_AGG(
+            CASE
+                WHEN PH.PostHistoryTypeId = 10 AND PH.Comment IS NOT NULL THEN COALESCE(CR_Old.Name, 'Old Reason (ID ' || PH.Comment || ')')
+                WHEN PH.PostHistoryTypeId IN (101, 102, 103, 104, 105) THEN COALESCE(CR_New.Name, 'New Reason (ID ' || PH.PostHistoryTypeId || ')')
+                ELSE NULL
+            END, '; '
+        ) FILTER (WHERE PH.PostHistoryTypeId IN (10, 101, 102, 103, 104, 105)) AS AllCloseReasons,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (10, 101, 102, 103, 104, 105) THEN 1 ELSE 0 END) AS CloseCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenCount
+    FROM PostHistory AS PH
+    LEFT JOIN CloseReasonTypes AS CR_Old ON PH.PostHistoryTypeId = 10 AND PH.Comment IS NOT NULL AND CR_Old.Id = CAST(PH.Comment AS smallint)
+    LEFT JOIN CloseReasonTypes AS CR_New ON PH.PostHistoryTypeId IN (101, 102, 103, 104, 105) AND CR_New.Id = PH.PostHistoryTypeId
+    GROUP BY PH.PostId
+),
+PostLinkSummary AS (
+    SELECT
+        PL.PostId,
+        COUNT(CASE WHEN PL.LinkTypeId = 1 THEN PL.RelatedPostId ELSE NULL END) AS LinkedPostsCount,
+        COUNT(CASE WHEN PL.LinkTypeId = 3 THEN PL.RelatedPostId ELSE NULL END) AS DuplicatePostsCount,
+        STRING_AGG(
+            CASE WHEN PL.LinkTypeId = 3 THEN CAST(PL.RelatedPostId AS varchar) ELSE NULL END, ', '
+        ) AS DuplicateOfPostIds
+    FROM PostLinks AS PL
+    GROUP BY PL.PostId
+),
+CommentSentiment AS (
+    SELECT
+        C.PostId,
+        C.Id AS CommentId,
+        C.Score AS CommentScore,
+        LENGTH(C.Text) AS CommentLength,
+        C.CreationDate AS CommentCreationDate,
+        U.DisplayName AS CommenterDisplayName,
+        ROW_NUMBER() OVER(PARTITION BY C.PostId ORDER BY C.Score DESC, LENGTH(C.Text) DESC) AS rn_top_comment
+    FROM Comments AS C
+    LEFT JOIN Users AS U ON C.UserId = U.Id
+),
+QuestionAnswerDetails AS (
+    SELECT
+        Q.Id AS QuestionId,
+        Q.Title AS QuestionTitle,
+        Q.Score AS QuestionScore,
+        Q.ViewCount AS QuestionViewCount,
+        Q.AnswerCount AS QuestionAnswerCount,
+        Q.CreationDate AS QuestionCreationDate,
+        Q.LastActivityDate AS QuestionLastActivityDate,
+        Q.OwnerUserId AS QuestionOwnerId,
+        Q.ClosedDate AS QuestionClosedDate,
+        Q.CommunityOwnedDate AS QuestionCommunityOwnedDate,
+        A.Id AS AcceptedAnswerId,
+        A.Score AS AcceptedAnswerScore,
+        A.OwnerUserId AS AcceptedAnswerOwnerId,
+        A.CreationDate AS AcceptedAnswerCreationDate,
+        (SELECT AVG(SubA.Score) FROM Posts AS SubA WHERE SubA.ParentId = Q.Id AND SubA.PostTypeId = 2) AS AvgAnswerScoreForQuestion,
+        (
+          SELECT STRING_AGG(tag, ', ')
+          FROM (
+            SELECT REPLACE(TRIM(SUBSTRING(tag FROM 1 FOR 30)), '&amp;', '&') AS tag
+            FROM (
+              SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(Q.Tags FROM 2 FOR (CHAR_LENGTH(Q.Tags) - 2)), '><')) AS tag
+            ) AS t
+            WHERE Q.Tags IS NOT NULL
+          ) sub
+        ) AS FormattedTags
+    FROM Posts AS Q
+    LEFT JOIN Posts AS A ON Q.AcceptedAnswerId = A.Id
+    WHERE Q.PostTypeId = 1
+    GROUP BY Q.Id, Q.Title, Q.Score, Q.ViewCount, Q.AnswerCount, Q.CreationDate, Q.LastActivityDate, Q.OwnerUserId, Q.ClosedDate, Q.CommunityOwnedDate, A.Id, A.Score, A.OwnerUserId, A.CreationDate, Q.Tags
+)
+SELECT
+    QAD.QuestionId,
+    QAD.QuestionTitle,
+    QAD.QuestionScore,
+    QAD.QuestionViewCount,
+    QAD.QuestionAnswerCount,
+    QAD.QuestionCreationDate,
+    QAD.QuestionLastActivityDate,
+    QAD.QuestionClosedDate,
+    QAD.QuestionCommunityOwnedDate,
+    QAD.FormattedTags,
+    UE_Q.Reputation AS QuestionOwnerReputation,
+    UE_Q.AccountAgeDays AS QuestionOwnerAccountAgeDays,
+    COALESCE(UE_Q.TotalQuestions, 0) AS QuestionOwnerTotalQuestions,
+    COALESCE(UE_Q.TotalAnswers, 0) AS QuestionOwnerTotalAnswers,
+    COALESCE(PEA.TotalEdits, 0) AS TotalPostEdits,
+    COALESCE(PEA.UniqueEditors, 0) AS UniquePostEditors,
+    PEA.AllCloseReasons,
+    COALESCE(PEA.CloseCount, 0) AS PostCloseCount,
+    COALESCE(PEA.ReopenCount, 0) AS PostReopenCount,
+    COALESCE(PLS.LinkedPostsCount, 0) AS RelatedLinksCount,
+    COALESCE(PLS.DuplicatePostsCount, 0) AS DuplicatesCount,
+    PLS.DuplicateOfPostIds,
+    CASE
+        WHEN QAD.AcceptedAnswerId IS NOT NULL THEN 'Has Accepted Answer'
+        WHEN QAD.QuestionAnswerCount > 0 THEN 'Has Answers, No Accepted'
+        ELSE 'No Answers'
+    END AS AnswerStatus,
+    QAD.AcceptedAnswerScore,
+    QAD.AvgAnswerScoreForQuestion,
+    UE_A.Reputation AS AcceptedAnswerOwnerReputation,
+    CS.CommentScore AS TopCommentScore,
+    CS.CommentLength AS TopCommentLength,
+    CS.CommenterDisplayName AS TopCommenter,
+    DENSE_RANK() OVER (ORDER BY QAD.QuestionScore DESC, QAD.QuestionViewCount DESC) AS GlobalScoreRank,
+    AVG(QAD.QuestionViewCount) OVER (PARTITION BY DATE_TRUNC('month', QAD.QuestionCreationDate)) AS AvgMonthlyQuestionViews,
+    LAG(QAD.QuestionScore, 1, 0) OVER (PARTITION BY QAD.QuestionOwnerId ORDER BY QAD.QuestionCreationDate) AS PrevQuestionScoreByOwner,
+    CAST(COALESCE(PEA.CloseCount, 0) AS NUMERIC) / NULLIF(UE_Q.TotalQuestions, 0) AS OwnerCloseRate,
+    (QAD.QuestionViewCount > 50000 AND QAD.QuestionAnswerCount > 10 AND QAD.QuestionScore > 100) AS IsHighImpactQuestion,
+    COALESCE(
+        REPLACE(
+            REPLACE(
+                LOWER(SUBSTRING(QAD.QuestionTitle FROM 1 FOR 50)),
+                'sql', 'database'
+            ),
+            'c#', 'dotnet'
+        ),
+        'NO TITLE PROVIDED'
+    ) AS ProcessedTitleSnippet,
+    (SELECT COUNT(B.Id) FROM Badges AS B WHERE B.UserId = QAD.QuestionOwnerId AND B.Class = 1) > 0 AS HasGoldBadge
+FROM QuestionAnswerDetails AS QAD
+LEFT JOIN UserEngagement AS UE_Q ON QAD.QuestionOwnerId = UE_Q.UserId
+LEFT JOIN UserEngagement AS UE_A ON QAD.AcceptedAnswerOwnerId = UE_A.UserId
+LEFT JOIN PostEditActivity AS PEA ON QAD.QuestionId = PEA.PostId
+LEFT JOIN PostLinkSummary AS PLS ON QAD.QuestionId = PLS.PostId
+LEFT JOIN CommentSentiment AS CS ON QAD.QuestionId = CS.PostId AND CS.rn_top_comment = 1
+WHERE
+    QAD.QuestionCreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '5 year'
+    AND QAD.QuestionTitle IS NOT NULL
+    AND (
+        QAD.QuestionClosedDate IS NULL
+        OR (COALESCE(PEA.CloseCount, 0) > 0 AND COALESCE(PEA.ReopenCount, 0) > 0)
+        OR (COALESCE(PEA.CloseCount, 0) > 0 AND QAD.QuestionClosedDate IS NOT NULL AND QAD.QuestionClosedDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')
+    )
+    AND EXISTS (SELECT 1 FROM Posts AS Ans WHERE Ans.ParentId = QAD.QuestionId AND Ans.PostTypeId = 2)
+ORDER BY GlobalScoreRank ASC, QAD.QuestionCreationDate DESC, QAD.QuestionId ASC
+LIMIT 1000;

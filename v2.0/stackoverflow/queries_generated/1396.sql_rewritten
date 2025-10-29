@@ -1,0 +1,266 @@
+-- {"query": "1396.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 4065} 
+WITH RecentHighActivityUsers AS (
+    -- Identifies users with recent significant activity (posts + comments) and a minimum reputation,
+    -- filtering for users active within the last year with reasonable reputation and combined interaction.
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        SUM(COALESCE(P.Score, 0)) AS TotalPostScore,
+        SUM(COALESCE(P.ViewCount, 0)) AS TotalPostViewCount
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    WHERE U.Reputation > 500
+      AND U.LastAccessDate >= cast('2024-10-01' as date) - INTERVAL '1 year'
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate
+    HAVING COUNT(DISTINCT P.Id) + COUNT(DISTINCT C.Id) > 50 -- Minimum combined activity to qualify for detailed analysis
+),
+RankedPosts AS (
+    -- Ranks posts (questions and answers) by a weighted performance score (score, view count, favorite count)
+    -- before applying a filter for top performers.
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.Title,
+        P.Body, -- Include Body for answer snippets
+        P.Tags,
+        COALESCE(P.FavoriteCount, 0) AS FavoriteCount,
+        -- Complex calculation for WeightedPerformanceScore
+        (P.Score * 0.6 + COALESCE(P.ViewCount, 0) * 0.05 + COALESCE(P.FavoriteCount, 0) * 0.3) AS WeightedPerformanceScore,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY (P.Score * 0.6 + COALESCE(P.ViewCount, 0) * 0.05 + COALESCE(P.FavoriteCount, 0) * 0.3) DESC, P.CreationDate DESC) AS RankWithinType
+    FROM Posts AS P
+    WHERE P.PostTypeId IN (1, 2) -- Focus on Questions (1) and Answers (2)
+      AND P.Score > 0 -- Exclude posts with zero or negative scores
+),
+TopPerformingPosts AS (
+    -- Selects only the top 100 performing posts for each PostType from the RankedPosts CTE.
+    SELECT *
+    FROM RankedPosts
+    WHERE RankWithinType <= 100
+),
+PostTagAnalysis AS (
+    -- Extracts individual tags from top-performing questions and associates them with post performance.
+    -- Uses string manipulation for tag parsing and UNNEST for array expansion.
+    SELECT
+        TPP.PostId,
+        TPP.OwnerUserId,
+        TPP.PostTypeId,
+        TPP.CreationDate,
+        TPP.Score,
+        TPP.ViewCount,
+        TRIM(UNNEST(STRING_TO_ARRAY(TRIM(BOTH '<>' FROM TPP.Tags), '><'))) AS TagName, -- Robust tag extraction
+        TPP.WeightedPerformanceScore
+    FROM TopPerformingPosts AS TPP
+    WHERE TPP.PostTypeId = 1 -- Only questions have tags for this analysis
+      AND TPP.Tags IS NOT NULL
+      AND LENGTH(TPP.Tags) > 2
+      AND TRIM(BOTH '<>' FROM TPP.Tags) != '' -- Filter out potentially empty tag strings
+),
+TagInfluence AS (
+    -- Calculates an "influence score" for each tag based on the aggregated performance of associated questions.
+    -- Uses DENSE_RANK to assign influence ranks.
+    SELECT
+        PTA.TagName,
+        COUNT(DISTINCT PTA.PostId) AS QuestionsCount,
+        SUM(PTA.WeightedPerformanceScore) AS TotalWeightedScore,
+        AVG(PTA.Score) AS AvgQuestionScore,
+        AVG(PTA.ViewCount) AS AvgQuestionViewCount,
+        DENSE_RANK() OVER (ORDER BY SUM(PTA.WeightedPerformanceScore) DESC, COUNT(DISTINCT PTA.PostId) DESC) AS TagInfluenceRank
+    FROM PostTagAnalysis AS PTA
+    GROUP BY PTA.TagName
+    HAVING COUNT(DISTINCT PTA.PostId) >= 5 -- Only consider tags with a minimum number of top questions
+),
+UserTagExpertise AS (
+    -- Determines each user's expertise within specific tags based on their contribution to top-performing questions.
+    -- Uses RANK to find a user's top tags and their standing within a tag.
+    SELECT
+        PTA.OwnerUserId AS UserId,
+        PTA.TagName,
+        COUNT(DISTINCT PTA.PostId) AS UserPostsInTag,
+        SUM(PTA.WeightedPerformanceScore) AS UserTagWeightedScore,
+        RANK() OVER (PARTITION BY PTA.OwnerUserId ORDER BY SUM(PTA.WeightedPerformanceScore) DESC) AS UserTagRank, -- User's rank within their own tags
+        ROW_NUMBER() OVER (PARTITION BY PTA.TagName ORDER BY SUM(PTA.WeightedPerformanceScore) DESC, COUNT(DISTINCT PTA.PostId) DESC) AS TagUserRank -- User's rank within a specific tag
+    FROM PostTagAnalysis AS PTA
+    WHERE PTA.OwnerUserId IS NOT NULL
+    GROUP BY PTA.OwnerUserId, PTA.TagName
+),
+HistoricalPostEventSummary AS (
+    -- Summarizes various historical events for posts (edits, closure, reopening, migration)
+    -- and calculates the average time between self-edits using LAG window function.
+    SELECT
+        PH.PostId,
+        P.OwnerUserId,
+        COUNT(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6, 8, 9) THEN PH.Id END) AS TotalEditEvents, -- Edits/rollbacks of title, body, tags
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS WasClosedFlag,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS WasReopenedFlag,
+        -- Calculate average hours between consecutive self-edits for a post owner
+        AVG(CASE WHEN PH.UserId = P.OwnerUserId AND LAG(PH.CreationDate) OVER (PARTITION BY PH.PostId, PH.UserId ORDER BY PH.CreationDate) IS NOT NULL
+                 THEN EXTRACT(EPOCH FROM (PH.CreationDate - LAG(PH.CreationDate) OVER (PARTITION BY PH.PostId, PH.UserId ORDER BY PH.CreationDate)))/3600.0
+                 ELSE NULL END) AS AvgHoursBetweenSelfEdits,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 35 THEN 1 ELSE 0 END) AS WasMigratedAway,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 36 THEN 1 ELSE 0 END) AS WasMigratedHere
+    FROM PostHistory AS PH
+    JOIN Posts AS P ON PH.PostId = P.Id
+    WHERE P.PostTypeId IN (1, 2)
+    GROUP BY PH.PostId, P.OwnerUserId
+),
+CommentInteractionSummary AS (
+    -- Aggregates comment statistics for posts, including total comments, unique commenters, and average length.
+    SELECT
+        C.PostId,
+        COUNT(C.Id) AS TotalComments,
+        COUNT(DISTINCT C.UserId) AS UniqueCommenters,
+        SUM(COALESCE(C.Score, 0)) AS TotalCommentScore,
+        MAX(C.CreationDate) AS LastCommentDate,
+        AVG(LENGTH(C.Text)) AS AvgCommentLength
+    FROM Comments AS C
+    GROUP BY C.PostId
+),
+HotContentCandidates AS (
+    -- Identifies "hot content" by combining posts that are either high-scoring or have very high view counts
+    -- using a UNION ALL set operator.
+    SELECT
+        TPP.PostId,
+        TPP.OwnerUserId,
+        TPP.PostTypeId,
+        TPP.CreationDate,
+        TPP.Score,
+        TPP.ViewCount,
+        TPP.FavoriteCount,
+        'HighPerformance' AS Criterion
+    FROM TopPerformingPosts AS TPP
+    WHERE TPP.RankWithinType <= 50 AND TPP.Score > 50
+
+    UNION ALL
+
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        P.PostTypeId,
+        P.CreationDate,
+        P.Score,
+        P.ViewCount,
+        COALESCE(P.FavoriteCount, 0) AS FavoriteCount,
+        'HighViewCount' AS Criterion
+    FROM Posts AS P
+    WHERE P.PostTypeId = 1 AND P.ViewCount > 100000 AND P.Score > 20 -- Questions with very high views
+      AND P.OwnerUserId IS NOT NULL
+)
+-- Final Elaborate Query: Combines all the CTEs to identify highly influential users and their key contributions,
+-- assessing their activity, post performance, tag expertise, historical impact on posts, and engagement.
+SELECT
+    RHAU.UserId,
+    COALESCE(RHAU.DisplayName, 'Anonymous User') AS UserDisplayName, -- NULL logic with COALESCE
+    RHAU.Reputation,
+    RHAU.LastAccessDate,
+    RHAU.TotalPostsOwned AS UserTotalPosts,
+    RHAU.TotalCommentsMade AS UserTotalComments,
+    RHAU.TotalPostScore AS UserAggregatedPostScore,
+    RHAU.TotalPostViewCount AS UserAggregatedPostViewCount,
+
+    -- Information about the user's top-performing question
+    MAX(CASE WHEN TPP_Q.PostTypeId = 1 THEN TPP_Q.Title ELSE NULL END) AS TopQuestionTitle,
+    MAX(CASE WHEN TPP_Q.PostTypeId = 1 THEN TPP_Q.Score ELSE NULL END) AS TopQuestionScore,
+    MAX(CASE WHEN TPP_Q.PostTypeId = 1 THEN TPP_Q.ViewCount ELSE NULL END) AS TopQuestionViewCount,
+    MAX(CASE WHEN TPP_Q.PostTypeId = 1 THEN TPP_Q.FavoriteCount ELSE NULL END) AS TopQuestionFavoriteCount,
+
+    -- Information about the user's top-performing answer
+    MAX(CASE WHEN TPP_A.PostTypeId = 2 THEN SUBSTRING(TPP_A.Body, 1, 100) || '...' ELSE NULL END) AS TopAnswerSnippet, -- String expression
+    MAX(CASE WHEN TPP_A.PostTypeId = 2 THEN TPP_A.Score ELSE NULL END) AS TopAnswerScore,
+    MAX(CASE WHEN TPP_A.PostTypeId = 2 THEN TPP_A.FavoriteCount ELSE NULL END) AS TopAnswerFavoriteCount,
+
+    -- User's top expert tags and their global influence ranks
+    STRING_AGG(DISTINCT UTE.TagName || ' (Rank: ' || UTE.UserTagRank || ')', '; ') FILTER (WHERE UTE.UserTagRank <= 3) AS Top3ExpertTags, -- String aggregation with filter
+    MAX(TI.TagName) FILTER (WHERE UTE.UserTagRank = 1) AS PrimaryExpertTag,
+    MAX(TI.TagInfluenceRank) FILTER (WHERE UTE.UserTagRank = 1) AS PrimaryTagGlobalInfluenceRank,
+    MAX(TI.TotalWeightedScore) FILTER (WHERE UTE.UserTagRank = 1) AS PrimaryTagGlobalWeightedScore,
+
+    -- Aggregated post history insights for all posts owned by the user
+    SUM(HPS.TotalEditEvents) AS TotalEditEventsOnUsersPosts,
+    SUM(HPS.WasClosedFlag) AS QuestionsClosedCount,
+    SUM(HPS.WasReopenedFlag) AS QuestionsReopenedCount,
+    AVG(HPS.AvgHoursBetweenSelfEdits) AS AvgHoursBetweenSelfEditsAcrossPosts, -- Average of LAG window function results
+    SUM(HPS.WasMigratedAway) AS PostsMigratedAwayCount,
+    SUM(HPS.WasMigratedHere) AS PostsMigratedHereCount,
+
+    -- Aggregated comment interaction for posts authored by the user
+    SUM(CIS.TotalComments) AS TotalCommentsOnUsersPosts,
+    AVG(CIS.UniqueCommenters) AS AvgUniqueCommentersPerPost,
+
+    -- Correlated subquery 1: Count specific "activity" badges
+    (
+        SELECT COUNT(B.Id)
+        FROM Badges AS B
+        WHERE B.UserId = RHAU.UserId
+          AND B.Name IN ('Enthusiast', 'Fanatic')
+    ) AS SpecificActivityBadgesCount,
+
+    -- Correlated subquery 2: Average score of answers provided by the user to their own questions (self-answers to self-questions)
+    (
+        SELECT COALESCE(AVG(P_ANS.Score), 0)
+        FROM Posts AS P_ANS
+        INNER JOIN Posts AS P_Q ON P_ANS.ParentId = P_Q.Id
+        WHERE P_ANS.OwnerUserId = RHAU.UserId
+          AND P_Q.OwnerUserId = RHAU.UserId
+          AND P_ANS.PostTypeId = 2
+          AND P_Q.PostTypeId = 1
+    ) AS AvgScoreOnSelfAnsweredQuestions,
+
+    -- Calculate a comprehensive user influence metric combining multiple factors
+    (
+        RHAU.Reputation * 0.4 +
+        RHAU.TotalPostScore * 0.15 +
+        RHAU.TotalPostViewCount * 0.01 +
+        RHAU.TotalCommentsMade * 0.05 +
+        COALESCE(MAX(TI.TotalWeightedScore) FILTER (WHERE UTE.UserTagRank = 1), 0) * 0.05 +
+        (SELECT COUNT(B.Id) FROM Badges AS B WHERE B.UserId = RHAU.UserId AND B.Class = 1) * 100 +
+        (SELECT COUNT(B.Id) FROM Badges AS B WHERE B.UserId = RHAU.UserId AND B.Class = 2) * 50
+    ) AS ComprehensiveInfluenceScore,
+
+    -- Count contributions to "hot content" categories
+    COUNT(DISTINCT HCC.PostId) AS HotContentContributionsCount,
+    MAX(CASE WHEN HCC.Criterion = 'HighPerformance' THEN 1 ELSE 0 END) AS ContributedToHighPerformancePostsFlag,
+    MAX(CASE WHEN HCC.Criterion = 'HighViewCount' THEN 1 ELSE 0 END) AS ContributedToHighViewCountPostsFlag,
+
+    -- Complex string expression with NULL logic for Posts to Comments Ratio
+    CASE
+        WHEN RHAU.TotalCommentsMade = 0 THEN 'N/A'
+        ELSE ROUND(CAST(RHAU.TotalPostsOwned AS NUMERIC) / NULLIF(RHAU.TotalCommentsMade, 0), 2)::TEXT
+    END AS PostsToCommentsRatioText,
+
+    -- Complex predicate using CASE statement for user categorization based on reputation, activity, and badge/tag influence
+    CASE
+        WHEN (SELECT COUNT(B.Id) FROM Badges AS B WHERE B.UserId = RHAU.UserId AND B.Class = 1) >
+             COALESCE(MAX(TI.TagInfluenceRank) FILTER (WHERE UTE.UserTagRank = 1), 999) / 10
+             AND RHAU.Reputation > 100000
+             THEN 'Elite Tag Expert'
+        WHEN RHAU.Reputation > 50000 AND RHAU.TotalPostsOwned > 500 THEN 'Prodigious Contributor'
+        WHEN RHAU.TotalPostsOwned > 100 AND RHAU.TotalCommentsMade > 100 AND RHAU.Reputation > 10000 THEN 'Highly Engaged User'
+        ELSE 'Active Contributor'
+    END AS UserCategory,
+
+    -- String expression: Concatenate user display name with their primary expert tag if it exists
+    CONCAT_WS(' - ', RHAU.DisplayName, COALESCE(MAX(TI.TagName) FILTER (WHERE UTE.UserTagRank = 1), 'Generalist')) AS UserAndPrimaryTagDescriptor
+FROM RecentHighActivityUsers AS RHAU
+LEFT JOIN TopPerformingPosts AS TPP_Q ON RHAU.UserId = TPP_Q.OwnerUserId AND TPP_Q.PostTypeId = 1 AND TPP_Q.RankWithinType = 1
+LEFT JOIN TopPerformingPosts AS TPP_A ON RHAU.UserId = TPP_A.OwnerUserId AND TPP_A.PostTypeId = 2 AND TPP_A.RankWithinType = 1
+LEFT JOIN UserTagExpertise AS UTE ON RHAU.UserId = UTE.UserId
+LEFT JOIN TagInfluence AS TI ON UTE.TagName = TI.TagName
+LEFT JOIN HistoricalPostEventSummary AS HPS ON RHAU.UserId = HPS.OwnerUserId
+LEFT JOIN CommentInteractionSummary AS CIS ON TPP_Q.PostId = CIS.PostId OR TPP_A.PostId = CIS.PostId -- Joins on user's top question/answer for comment summary
+LEFT JOIN HotContentCandidates AS HCC ON RHAU.UserId = HCC.OwnerUserId
+GROUP BY
+    RHAU.UserId, RHAU.DisplayName, RHAU.Reputation, RHAU.LastAccessDate,
+    RHAU.TotalPostsOwned, RHAU.TotalCommentsMade, RHAU.TotalPostScore, RHAU.TotalPostViewCount
+ORDER BY ComprehensiveInfluenceScore DESC, RHAU.Reputation DESC
+LIMIT 50;

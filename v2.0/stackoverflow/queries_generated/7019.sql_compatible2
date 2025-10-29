@@ -1,0 +1,271 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS QuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS AnswerScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        STRING_AGG(DISTINCT b.Name, ', ') AS BadgesEarned,
+        AVG(p.Score) AS AvgPostScore,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.ViewCount > 1000 THEN p.Id END) AS HighViewQuestions
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+RankedUsers AS (
+    SELECT 
+        us.*,
+        ROW_NUMBER() OVER (ORDER BY QuestionScore DESC, AnswerScore DESC) AS RankByScore,
+        DENSE_RANK() OVER (ORDER BY Reputation DESC) AS RankByReputation,
+        NTILE(10) OVER (ORDER BY QuestionCount DESC) AS QuestionDecile
+    FROM UserStats us
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        (SELECT COUNT(*) FROM Posts p2 WHERE p2.Tags LIKE '%' || t.TagName || '%') AS PostsWithTag,
+        AVG(p.Score) AS AvgScoreForTag,
+        STRING_AGG(DISTINCT u.DisplayName, ', ') AS TagUsers
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    GROUP BY t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId
+),
+PostActivity AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.Tags,
+        u.DisplayName AS OwnerName,
+        COALESCE(p.AcceptedAnswerId, 0) AS HasAcceptedAnswer,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+        CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN 1 ELSE 0 END AS IsCommunityOwned,
+        CAST(EXTRACT(EPOCH FROM (COALESCE(p.LastEditDate, p.LastActivityDate) - p.CreationDate)) AS BIGINT) AS TimeSinceLastActivity,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousScore,
+        LAG(p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS UserPostRank,
+        RANK() OVER (ORDER BY p.Score DESC) AS GlobalScoreRank
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1, 2)
+),
+ComprehensiveAnalysis AS (
+    SELECT 
+        ru.UserId,
+        ru.DisplayName,
+        ru.Reputation,
+        ru.PostCount,
+        ru.QuestionCount,
+        ru.AnswerCount,
+        ru.QuestionScore,
+        ru.AnswerScore,
+        ru.BadgeCount,
+        ru.BadgesEarned,
+        ru.AvgPostScore,
+        ru.HighViewQuestions,
+        ru.RankByScore,
+        ru.RankByReputation,
+        ru.QuestionDecile,
+        ta.TagName,
+        ta.TagCount,
+        ta.PostsWithTag,
+        ta.AvgScoreForTag,
+        ta.TagUsers,
+        pa.PostId,
+        pa.Title,
+        pa.Score AS PostScore,
+        pa.ViewCount,
+        pa.CreationDate AS PostCreationDate,
+        pa.OwnerName,
+        pa.HasAcceptedAnswer,
+        pa.IsClosed,
+        pa.IsCommunityOwned,
+        pa.TimeSinceLastActivity,
+        pa.PreviousScore,
+        pa.PreviousPostDate,
+        pa.UserPostRank,
+        pa.GlobalScoreRank,
+        CASE 
+            WHEN pa.PreviousScore IS NOT NULL AND pa.Score > pa.PreviousScore THEN 'Increased'
+            WHEN pa.PreviousScore IS NOT NULL AND pa.Score < pa.PreviousScore THEN 'Decreased'
+            ELSE 'Same'
+        END AS ScoreTrend,
+        CASE 
+            WHEN pa.Score > 100 THEN 'HighlyRated'
+            WHEN pa.Score > 50 THEN 'ModeratelyRated'
+            WHEN pa.Score > 10 THEN 'LowRated'
+            ELSE 'VeryLowRated'
+        END AS RatingCategory,
+        DENSE_RANK() OVER (PARTITION BY pa.OwnerUserId ORDER BY pa.GlobalScoreRank) AS OwnerRankedPosts
+    FROM RankedUsers ru
+    INNER JOIN TagAnalysis ta ON ru.BadgeCount > 0
+    INNER JOIN PostActivity pa ON ru.UserId = pa.OwnerUserId
+    WHERE ru.QuestionCount > 0
+),
+PerformanceMetrics AS (
+    SELECT 
+        COUNT(*) AS TotalRecords,
+        AVG(Reputation) AS AvgReputation,
+        MAX(QuestionScore) AS MaxQuestionScore,
+        MIN(AnswerScore) AS MinAnswerScore,
+        SUM(PostCount) AS TotalPosts,
+        STDDEV(Reputation) AS StdDevReputation,
+        COUNT(DISTINCT UserId) AS DistinctUsers,
+        COUNT(DISTINCT TagName) AS DistinctTags,
+        AVG(OwnScore) AS AvgOwnScore,
+        COUNT(DISTINCT CASE WHEN IsClosed = 1 THEN PostId END) AS ClosedPosts,
+        COUNT(DISTINCT CASE WHEN IsCommunityOwned = 1 THEN PostId END) AS CommunityOwnedPosts,
+        AVG(AvgTagScore) AS AvgTagScore,
+        COUNT(DISTINCT OwnerName) AS DistinctOwners,
+        COUNT(DISTINCT BadgesEarned) AS DistinctBadges,
+        COUNT(DISTINCT DisplayName) AS DistinctNames,
+        MIN(CreationDate) AS EarliestDate,
+        MAX(CreationDate) AS LatestDate,
+        MAX(AvgScoreForTag) AS MaxTagScore,
+        MIN(AvgScoreForTag) AS MinTagScore,
+        AVG(TimeSinceLastActivity) AS AvgTimeSinceActivity,
+        COUNT(DISTINCT CASE WHEN ScoreTrend = 'Increased' THEN PostId END) AS IncreasedScorePosts,
+        COUNT(DISTINCT CASE WHEN ScoreTrend = 'Decreased' THEN PostId END) AS DecreasedScorePosts,
+        COUNT(DISTINCT CASE WHEN ScoreTrend = 'Same' THEN PostId END) AS SameScorePosts
+    FROM (
+        SELECT 
+            ca.UserId,
+            ca.DisplayName,
+            ca.Reputation,
+            ca.PostCount,
+            ca.QuestionCount,
+            ca.AnswerCount,
+            ca.QuestionScore,
+            ca.AnswerScore,
+            ca.BadgeCount,
+            ca.BadgesEarned,
+            ca.AvgPostScore,
+            ca.HighViewQuestions,
+            ca.RankByScore,
+            ca.RankByReputation,
+            ca.QuestionDecile,
+            ca.TagName,
+            ca.TagCount,
+            ca.PostsWithTag,
+            ca.AvgScoreForTag,
+            ca.TagUsers,
+            ca.PostId,
+            ca.Title,
+            ca.PostScore,
+            ca.ViewCount,
+            ca.PostCreationDate AS CreationDate,
+            ca.OwnerName,
+            ca.HasAcceptedAnswer,
+            ca.IsClosed,
+            ca.IsCommunityOwned,
+            ca.TimeSinceLastActivity,
+            ca.PreviousScore,
+            ca.PreviousPostDate,
+            ca.UserPostRank,
+            ca.GlobalScoreRank,
+            ca.ScoreTrend,
+            ca.RatingCategory,
+            ca.OwnerRankedPosts,
+            ca.PostScore AS OwnScore,
+            ca.AvgScoreForTag AS AvgTagScore
+        FROM ComprehensiveAnalysis ca
+    ) derived_table
+)
+SELECT 
+    pm.TotalRecords,
+    pm.AvgReputation,
+    pm.MaxQuestionScore,
+    pm.MinAnswerScore,
+    pm.TotalPosts,
+    pm.StdDevReputation,
+    pm.DistinctUsers,
+    pm.DistinctTags,
+    pm.AvgOwnScore,
+    pm.ClosedPosts,
+    pm.CommunityOwnedPosts,
+    pm.AvgTagScore,
+    pm.DistinctOwners,
+    pm.DistinctBadges,
+    pm.DistinctNames,
+    pm.EarliestDate,
+    pm.LatestDate,
+    pm.MaxTagScore,
+    pm.MinTagScore,
+    pm.AvgTimeSinceActivity,
+    pm.IncreasedScorePosts,
+    pm.DecreasedScorePosts,
+    pm.SameScorePosts,
+    (SELECT COUNT(*) FROM Posts p WHERE p.PostTypeId = 1 AND p.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1)) AS HighScoreQuestions,
+    (SELECT COUNT(*) FROM Posts p WHERE p.PostTypeId = 2 AND p.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 2)) AS HighScoreAnswers,
+    (SELECT COUNT(*) FROM Posts p WHERE p.PostTypeId = 1 AND p.ViewCount > 1000 AND p.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1)) AS PopularHighScoreQuestions,
+    (SELECT COUNT(*) FROM Posts p WHERE p.PostTypeId = 2 AND p.ViewCount > 1000 AND p.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 2)) AS PopularHighScoreAnswers,
+    (SELECT COUNT(DISTINCT p.OwnerUserId) FROM Posts p WHERE p.PostTypeId = 1 AND p.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1)) AS HighScoreQuestionAuthors,
+    (SELECT COUNT(DISTINCT p.OwnerUserId) FROM Posts p WHERE p.PostTypeId = 2 AND p.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 2)) AS HighScoreAnswerAuthors,
+    (SELECT COUNT(DISTINCT p.OwnerUserId) FROM Posts p WHERE p.PostTypeId = 1 AND p.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) AND p.ViewCount > 1000) AS PopularHighScoreQuestionAuthors,
+    (SELECT COUNT(DISTINCT p.OwnerUserId) FROM Posts p WHERE p.PostTypeId = 2 AND p.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 2) AND p.ViewCount > 1000) AS PopularHighScoreAnswerAuthors,
+    (SELECT COUNT(*) FROM Comments c WHERE c.Score > 10) AS HighScoreComments,
+    (SELECT AVG(c.Score) FROM Comments c WHERE c.Score > 10) AS AvgHighScoreCommentScore,
+    (SELECT MAX(c.Score) FROM Comments c WHERE c.Score > 10) AS MaxHighScoreCommentScore,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostHistoryTypeId IN (10, 11, 12, 13)) AS ImportantPostHistoryEvents,
+    (SELECT COUNT(*) FROM Votes v WHERE v.VoteTypeId IN (1, 2, 3)) AS ImportantVotes,
+    (SELECT COUNT(DISTINCT ph.UserId) FROM PostHistory ph WHERE ph.PostHistoryTypeId IN (10, 11, 12, 13)) AS UniqueUsersWithPostHistoryEvents,
+    (SELECT COUNT(DISTINCT v.UserId) FROM Votes v WHERE v.VoteTypeId IN (1, 2, 3)) AS UniqueUsersWithVotes,
+    (SELECT COUNT(*) FROM (SELECT u.Id FROM Users u JOIN Posts p ON u.Id = p.OwnerUserId WHERE p.PostTypeId = 1 GROUP BY u.Id HAVING COUNT(p.Id) > 10) t) AS MultipleQuestionAuthors,
+    (SELECT COUNT(*) FROM (SELECT u.Id FROM Users u JOIN Posts p ON u.Id = p.OwnerUserId WHERE p.PostTypeId = 2 GROUP BY u.Id HAVING COUNT(p.Id) > 10) t) AS MultipleAnswerAuthors,
+    (SELECT STRING_AGG(DISTINCT DisplayName, ', ') FROM Users u WHERE u.Id IN (SELECT DISTINCT OwnerUserId FROM Posts WHERE Score > 50)) AS HighScorePostAuthors,
+    (SELECT STRING_AGG(DISTINCT TagName, ', ') FROM Tags WHERE Count > 1000) AS PopularTags,
+    (SELECT STRING_AGG(DISTINCT DisplayName, ', ') FROM Users WHERE Reputation > 10000) AS HighlyReputedUsers,
+    (SELECT COUNT(*) FROM Posts p WHERE p.Tags IS NOT NULL AND LENGTH(p.Tags) > 50) AS PostsWithLongTags,
+    (SELECT AVG(LENGTH(p.Tags)) FROM Posts p WHERE p.Tags IS NOT NULL) AS AvgTagLength,
+    (SELECT MAX(LENGTH(p.Tags)) FROM Posts p WHERE p.Tags IS NOT NULL) AS MaxTagLength,
+    (SELECT MIN(LENGTH(p.Tags)) FROM Posts p WHERE p.Tags IS NOT NULL) AS MinTagLength,
+    (SELECT COUNT(*) FROM Badges b WHERE b.Class = 1) AS TotalGoldBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.Class = 2) AS TotalSilverBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.Class = 3) AS TotalBronzeBadges,
+    (SELECT COUNT(*) FROM Users u WHERE u.WebsiteUrl IS NOT NULL AND u.WebsiteUrl <> '') AS UsersWithWebsite,
+    (SELECT COUNT(*) FROM Users u WHERE u.Location IS NOT NULL AND u.Location <> '') AS UsersWithLocation,
+    (SELECT COUNT(*) FROM Users u WHERE u.AboutMe IS NOT NULL AND LENGTH(u.AboutMe) > 100) AS UsersWithLongAboutMe,
+    (SELECT COUNT(*) FROM Posts p WHERE p.Body IS NOT NULL) AS PostsWithBody,
+    (SELECT AVG(LENGTH(p.Body)) FROM Posts p WHERE p.Body IS NOT NULL) AS AvgBodyLength,
+    (SELECT COUNT(*) FROM Posts p WHERE p.ParentId IS NOT NULL AND p.PostTypeId = 2) AS AnswerPosts,
+    (SELECT COUNT(*) FROM Posts p WHERE p.ParentId IS NULL AND p.PostTypeId = 1) AS QuestionPosts,
+    (SELECT COUNT(*) FROM Posts p WHERE p.AcceptedAnswerId IS NOT NULL AND p.PostTypeId = 1) AS QuestionsWithAcceptedAnswer,
+    (SELECT AVG(AnswerCount) FROM Posts p WHERE p.PostTypeId = 1) AS AvgAnswerCount,
+    (SELECT MAX(AnswerCount) FROM Posts p WHERE p.PostTypeId = 1) AS MaxAnswerCount,
+    (SELECT MIN(AnswerCount) FROM Posts p WHERE p.PostTypeId = 1) AS MinAnswerCount,
+    (SELECT COUNT(*) FROM Posts p WHERE p.CommentCount > 5) AS PostsWithManyComments,
+    (SELECT AVG(CommentCount) FROM Posts p) AS AvgCommentCount,
+    (SELECT MAX(CommentCount) FROM Posts p) AS MaxCommentCount,
+    (SELECT COUNT(*) FROM Posts p WHERE p.Score > 0) AS PositiveScorePosts,
+    (SELECT COUNT(*) FROM Posts p WHERE p.Score < 0) AS NegativeScorePosts,
+    (SELECT COUNT(*) FROM Posts p WHERE p.Score = 0) AS ZeroScorePosts,
+    (SELECT COUNT(*) FROM Posts p WHERE p.ViewCount > 10000) AS HighlyViewedPosts,
+    (SELECT COUNT(*) FROM Posts p WHERE p.ViewCount BETWEEN 1000 AND 10000) AS ModeratelyViewedPosts,
+    (SELECT COUNT(*) FROM Posts p WHERE p.ViewCount < 1000) AS LowViewedPosts,
+    (SELECT AVG(ViewCount) FROM Posts p WHERE p.PostTypeId IN (1, 2)) AS AvgViewsPerPost,
+    (SELECT AVG(Score) FROM Posts p WHERE p.PostTypeId IN (1, 2)) AS AvgScorePerPost,
+    (SELECT COUNT(*) FROM Posts p WHERE p.CreationDate > DATE '2020-01-01') AS RecentPosts,
+    (SELECT COUNT(*) FROM Posts p WHERE p.CreationDate < DATE '2020-01-01') AS OlderPosts,
+    (SELECT COUNT(*) FROM Posts p WHERE p.CreationDate BETWEEN DATE '2020-01-01' AND DATE '2021-01-01') AS Posts2020,
+    (SELECT COUNT(*) FROM Posts p WHERE p.CreationDate BETWEEN DATE '2021-01-01' AND DATE '2022-01-01') AS Posts2021,
+    (SELECT COUNT(*) FROM Posts p WHERE p.CreationDate BETWEEN DATE '2022-01-01' AND DATE '2023-01-01') AS Posts2022,
+    (SELECT COUNT(*) FROM Posts p WHERE p.CreationDate BETWEEN DATE '2023-01-01' AND DATE '2024-01-01') AS Posts2023,
+    (SELECT COUNT(*) FROM Posts p WHERE p.CreationDate BETWEEN DATE '2024-01-01' AND DATE '2025-01-01') AS Posts2024
+FROM PerformanceMetrics pm;

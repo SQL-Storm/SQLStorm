@@ -1,0 +1,99 @@
+-- {"query": "3837.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2179} 
+
+WITH UserAgg AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.UpVotes,0) - COALESCE(u.DownVotes,0) AS NetVotes,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) AS AvgAnswerScore,
+        SUM(CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS QuestionsWithAccepted,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes
+),
+UserRank AS (
+    SELECT
+        *,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, NetVotes DESC) AS ReputationRank,
+        RANK() OVER (ORDER BY (GoldBadges*3 + SilverBadges*2 + BronzeBadges) DESC) AS BadgeScoreRank
+    FROM UserAgg
+),
+TagAgg AS (
+    SELECT
+        t.TagName,
+        t.Count AS TagUseCount,
+        COALESCE(SUM(p.Score),0) AS TotalScoreOnTag,
+        COUNT(DISTINCT p.Id) AS PostsWithTag,
+        STRING_AGG(DISTINCT u.DisplayName, ', ') FILTER (WHERE u.Id IS NOT NULL) AS TopContributors
+    FROM Tags t
+    LEFT JOIN PostLinks pl ON pl.LinkTypeId = 1 AND pl.PostId = t.ExcerptPostId
+    LEFT JOIN Posts p ON p.Tags LIKE '%'||t.TagName||'%'
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    GROUP BY t.TagName, t.Count
+),
+Combined AS (
+    SELECT
+        ur.UserId,
+        ur.DisplayName,
+        ur.Reputation,
+        ur.NetVotes,
+        ur.GoldBadges,
+        ur.SilverBadges,
+        ur.BronzeBadges,
+        ur.QuestionCount,
+        ur.AnswerCount,
+        ur.AvgAnswerScore,
+        ur.QuestionsWithAccepted,
+        ur.LastPostDate,
+        ur.ReputationRank,
+        ur.BadgeScoreRank,
+        NULL::varchar AS TagName,
+        NULL::int AS TagUseCount,
+        NULL::bigint AS TotalScoreOnTag,
+        NULL::int AS PostsWithTag,
+        NULL::varchar AS TopContributors,
+        1 AS SortGroup
+    FROM UserRank ur
+    WHERE ur.ReputationRank <= 100
+
+    UNION ALL
+
+    SELECT
+        NULL AS UserId,
+        NULL AS DisplayName,
+        NULL AS Reputation,
+        NULL AS NetVotes,
+        NULL AS GoldBadges,
+        NULL AS SilverBadges,
+        NULL AS BronzeBadges,
+        NULL AS QuestionCount,
+        NULL AS AnswerCount,
+        NULL AS AvgAnswerScore,
+        NULL AS QuestionsWithAccepted,
+        NULL AS LastPostDate,
+        NULL AS ReputationRank,
+        NULL AS BadgeScoreRank,
+        ta.TagName,
+        ta.TagUseCount,
+        ta.TotalScoreOnTag,
+        ta.PostsWithTag,
+        ta.TopContributors,
+        2 AS SortGroup
+    FROM TagAgg ta
+    WHERE ta.TotalScoreOnTag > 0
+)
+SELECT *
+FROM Combined
+ORDER BY
+    SortGroup,
+    CASE WHEN SortGroup = 1 THEN ReputationRank END,
+    CASE WHEN SortGroup = 2 THEN TotalScoreOnTag END DESC
+LIMIT 200;

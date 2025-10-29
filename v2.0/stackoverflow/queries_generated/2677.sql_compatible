@@ -1,0 +1,194 @@
+with RankedPosts as (
+  select
+    p.Id,
+    p.PostTypeId,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.OwnerUserId,
+    u.DisplayName as OwnerName,
+    row_number() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as rn,
+    count(*) over (partition by p.PostTypeId) as total_posts
+  from Posts p
+  left join Users u on p.OwnerUserId = u.Id
+  where p.PostTypeId in (1, 2)
+),
+ClosedQuestions as (
+  select ph.PostId, cr.Name as CloseReason, ph.CreationDate as CloseDate
+  from PostHistory ph
+  join CloseReasonTypes cr on cast(ph.Comment as integer) = cr.Id
+  where ph.PostHistoryTypeId = 10 -- Post Closed
+),
+UserBadgeCounts as (
+  select 
+    UserId,
+    count(case when Class = 1 then 1 end) as GoldBadges,
+    count(case when Class = 2 then 1 end) as SilverBadges,
+    count(case when Class = 3 then 1 end) as BronzeBadges,
+    count(*) as TotalBadges
+  from Badges
+  group by UserId
+),
+AnswerCountsPerQuestion as (
+  select 
+    ParentId as QuestionId,
+    count(*) as AnswerCount
+  from Posts
+  where PostTypeId = 2
+  group by ParentId
+),
+TopTags as (
+  select 
+    unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><')) as Tag,
+    count(*) as TagCount
+  from Posts p
+  where p.PostTypeId = 1 and p.Tags is not null
+  group by Tag
+  order by TagCount desc
+  limit 10
+),
+QuestionsWithTopTags as (
+  select p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.Tags, p.OwnerUserId
+  from Posts p
+  join TopTags t on strpos(p.Tags, ( '<' || t.Tag || '>' )) > 0
+  where p.PostTypeId = 1
+  and p.ClosedDate is null
+),
+PostLinkCounts as (
+  select PostId, 
+         count(case when LinkTypeId = 1 then 1 end) as LinkedCount,
+         count(case when LinkTypeId = 3 then 1 end) as DuplicateCount
+  from PostLinks
+  group by PostId
+),
+UserActivityWindow as (
+  select 
+    u.Id as UserId,
+    u.DisplayName as UserName,
+    u.Reputation,
+    sum(p.Score) filter (where p.PostTypeId = 1) over (partition by u.Id order by p.CreationDate rows between unbounded preceding and current row) as CumulativeQuestionScore,
+    sum(p.Score) filter (where p.PostTypeId = 2) over (partition by u.Id order by p.CreationDate rows between unbounded preceding and current row) as CumulativeAnswerScore,
+    rank() over (order by u.Reputation desc) as ReputationRank
+  from Users u
+  left join Posts p on p.OwnerUserId = u.Id
+  where u.Reputation > 1000
+),
+QuestionAnswerMatch as (
+  select
+    q.Id as QuestionId,
+    q.Title as QuestionTitle,
+    a.Id as AnswerId,
+    a.Score as AnswerScore,
+    (a.Score - (select avg(score) from Posts where ParentId = q.Id and PostTypeId = 2)) as ScoreDiffFromAvg,
+    case when a.Id = q.AcceptedAnswerId then 1 else 0 end as IsAccepted,
+    u.DisplayName as AnswererName,
+    bc.GoldBadges,
+    bc.SilverBadges,
+    bc.BronzeBadges
+  from Posts q
+  join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+  left join Users u on a.OwnerUserId = u.Id
+  left join UserBadgeCounts bc on u.Id = bc.UserId
+  where q.PostTypeId = 1 and q.AcceptedAnswerId is not null
+),
+AllUsersWithEmailHash as (
+  select
+    Id,
+    DisplayName,
+    EmailHash,
+    case when EmailHash is null or length(EmailHash) <> 32 then 1 else 0 end as InvalidEmailHashFlag
+  from Users
+),
+BadgesStringAgg as (
+  select 
+    UserId,
+    string_agg(distinct Name || '(' || Class || ')', ', ' order by Class, Name) as BadgesList
+  from Badges
+  group by UserId
+)
+select distinct
+  rp.Id as PostId,
+  coalesce(rp.Title, '[no title]') as PostTitle,
+  rp.PostTypeId,
+  rp.CreationDate,
+  rp.Score,
+  rp.ViewCount,
+  rp.Tags,
+  rp.OwnerUserId,
+  rp.OwnerName,
+  uc.GoldBadges,
+  uc.SilverBadges,
+  uc.BronzeBadges,
+  coalesce(pc.AnswerCount, 0) as NumAnswers,
+  plc.LinkedCount,
+  plc.DuplicateCount,
+  cw.CloseReason,
+  cw.CloseDate,
+  uba.UserName as AnswererName,
+  uba.GoldBadges as AnswererGoldBadges,
+  ba.BadgesList as OwnerBadges,
+  ua.InvalidEmailHashFlag,
+  ua.EmailHash,
+  ua.DisplayName as UserDisplayName,
+  uac.ReputationRank as RankByReputation,
+  uac.CumulativeQuestionScore,
+  uac.CumulativeAnswerScore,
+  qam.AnswerScore,
+  qam.ScoreDiffFromAvg,
+  qam.IsAccepted
+from RankedPosts rp
+left join ClosedQuestions cw on cw.PostId = rp.Id
+left join AnswerCountsPerQuestion pc on pc.QuestionId = rp.Id
+left join PostLinkCounts plc on plc.PostId = rp.Id
+left join QuestionAnswerMatch qam on qam.QuestionId = rp.Id
+left join UserBadgeCounts uc on uc.UserId = rp.OwnerUserId
+left join BadgesStringAgg ba on ba.UserId = rp.OwnerUserId
+left join UserActivityWindow uac on uac.UserId = rp.OwnerUserId
+left join AllUsersWithEmailHash ua on ua.Id = rp.OwnerUserId
+left join UserBadgeCounts uba on uba.UserId = (
+  case 
+    when qam.AnswererName ~ '^[0-9]+$' then cast(qam.AnswererName as integer)
+    else null
+  end
+)
+where rp.rn <= 20
+union
+select 
+  p.Id,
+  p.Title,
+  p.PostTypeId,
+  p.CreationDate,
+  p.Score,
+  p.ViewCount,
+  p.Tags,
+  p.OwnerUserId,
+  u.DisplayName,
+  uc.GoldBadges,
+  uc.SilverBadges,
+  uc.BronzeBadges,
+  coalesce(ac.AnswerCount,0),
+  0,
+  0,
+  null,
+  null,
+  null,
+  null,
+  ba.BadgesList,
+  0,
+  null,
+  null,
+  null,
+  null,
+  null
+from Posts p
+join Users u on p.OwnerUserId = u.Id
+left join AnswerCountsPerQuestion ac on ac.QuestionId = p.Id
+left join UserBadgeCounts uc on uc.UserId = p.OwnerUserId
+left join BadgesStringAgg ba on ba.UserId = p.OwnerUserId
+where p.PostTypeId = 1
+  and p.CreationDate > cast(cast('2024-10-01' as date) - interval '7 days' as date)
+  and not exists (select 1 from RankedPosts rp where rp.Id = p.Id)
+order by Score desc, ViewCount desc
+limit 50;

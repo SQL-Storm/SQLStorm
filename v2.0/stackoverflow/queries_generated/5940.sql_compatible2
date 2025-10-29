@@ -1,0 +1,98 @@
+WITH TopTags AS (
+  SELECT
+    t.TagName,
+    SUM(p.ViewCount) AS TotalViews,
+    AVG(p.Score) AS AvgScore,
+    COUNT(*) AS PostCount
+  FROM Posts p
+  JOIN Tags t ON p.Tags LIKE '%' || t.TagName || '%'
+  WHERE p.PostTypeId = 1
+    AND p.ClosedDate IS NULL
+  GROUP BY t.TagName
+  ORDER BY SUM(p.ViewCount) DESC
+  LIMIT 10
+),
+TagEngagement AS (
+  SELECT
+    tt.TagName,
+    tt.TotalViews,
+    tt.AvgScore,
+    tt.PostCount,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+    MIN(CASE WHEN v.VoteTypeId = 2 THEN CAST(v.CreationDate AS TIMESTAMP) ELSE NULL END) AS FirstUpVoteDate
+  FROM TopTags tt
+  LEFT JOIN Posts p ON p.Tags LIKE '%' || tt.TagName || '%'
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  GROUP BY tt.TagName, tt.TotalViews, tt.AvgScore, tt.PostCount
+),
+CommunityCohort AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.ClosedDate IS NULL
+),
+InfluenceWindow AS (
+  SELECT
+    pc.PostId,
+    pc.OwnerUserId,
+    pc.CreationDate,
+    pc.ViewCount,
+    pc.Score,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY pc.PostId) AS UpVotesAlong,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) OVER (PARTITION BY pc.PostId) AS DownVotesAlong
+  FROM CommunityCohort pc
+  LEFT JOIN Votes v ON v.PostId = pc.PostId
+)
+SELECT
+  nt.TagName,
+  nt.TotalViews,
+  nt.AvgScore,
+  nt.PostCount,
+  ci.PostId,
+  ci.Title,
+  ci.Tags,
+  u.DisplayName AS Owner,
+  ci.CreationDate,
+  ci.LastActivityDate,
+  ci.ViewCount,
+  ci.Score,
+  iu.UpVotesAlong,
+  iu.DownVotesAlong,
+  (COALESCE(iu.UpVotesAlong, 0) - COALESCE(iu.DownVotesAlong, 0)) AS NetEngagement,
+  CASE
+    WHEN ci.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '180' DAY) THEN 'New'
+    WHEN ci.ViewCount > 1000 THEN 'Popular'
+    ELSE 'Established'
+  END AS WaveTag
+FROM TopTags nt
+LEFT JOIN TagEngagement te ON te.TagName = nt.TagName
+LEFT JOIN Posts ci ON ci.Tags LIKE '%' || nt.TagName || '%' AND ci.PostTypeId = 1 AND ci.ClosedDate IS NULL
+LEFT JOIN Users u ON u.Id = ci.OwnerUserId
+LEFT JOIN InfluenceWindow iu ON iu.PostId = ci.Id
+GROUP BY
+  nt.TagName,
+  nt.TotalViews,
+  nt.AvgScore,
+  nt.PostCount,
+  ci.PostId,
+  ci.Title,
+  ci.Tags,
+  u.DisplayName,
+  ci.CreationDate,
+  ci.LastActivityDate,
+  ci.ViewCount,
+  ci.Score,
+  iu.UpVotesAlong,
+  iu.DownVotesAlong
+ORDER BY nt.TotalViews DESC, NetEngagement DESC
+LIMIT 100;

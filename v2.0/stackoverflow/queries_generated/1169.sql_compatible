@@ -1,0 +1,217 @@
+WITH UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        COALESCE(u.DisplayName, 'Anonymous User') AS DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.Location,
+        u.WebsiteUrl,
+        u.AboutMe,
+        COUNT(DISTINCT b.Name) AS UniqueBadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        EXTRACT(EPOCH FROM (u.LastAccessDate - u.CreationDate)) / (60 * 60 * 24) AS AccountActiveDays,
+        COALESCE(u.WebsiteUrl, 'http://example.com/default') AS CoalescedWebsiteUrl
+    FROM Users AS u
+    LEFT JOIN Badges AS b ON u.Id = b.UserId
+    WHERE u.Reputation > 500
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate,
+        u.Views, u.UpVotes, u.DownVotes, u.Location, u.WebsiteUrl, u.AboutMe
+),
+PostAggregates AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsAsked,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersProvided,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostScore,
+        SUM(COALESCE(p.ViewCount, 0)) AS TotalPostViews,
+        AVG(CAST(p.Score AS NUMERIC)) FILTER (WHERE p.PostTypeId IN (1,2)) AS AvgRelevantPostScorePerPost,
+        MAX(p.CreationDate) AS LatestPostDate,
+        SUM(CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END) AS ClosedPostsCount
+    FROM Posts AS p
+    WHERE p.OwnerUserId IS NOT NULL
+      AND p.CreationDate >= DATE '2020-01-01'
+    GROUP BY p.OwnerUserId
+),
+AnswerAcceptance AS (
+    SELECT
+        p.AcceptedAnswerId AS AnswerId,
+        COUNT(DISTINCT p.Id) AS QuestionsAcceptedThisAnswerFor
+    FROM Posts AS p
+    WHERE p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL
+    GROUP BY p.AcceptedAnswerId
+),
+UserPostTagFrequencies AS (
+    -- Split tags without using UNNEST: use a recursive split approach compatible with many dialects
+    -- First, select question posts with trimmed tag strings and compute the tag string without leading/trailing <>
+    SELECT
+        p.OwnerUserId AS UserId,
+        TRIM(tag_part) AS TagName
+    FROM (
+        SELECT
+            OwnerUserId,
+            -- remove leading '<' and trailing '>' then keep the raw inner string
+            SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2) AS inner_tags
+        FROM Posts p
+        WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND LENGTH(TRIM(p.Tags)) > 2
+    ) q
+    CROSS JOIN LATERAL (
+        -- Expand by splitting on '><' using a numbers/tally approach
+        SELECT LOWER(TRIM(
+            CASE
+                WHEN pos_start = 1 THEN
+                    SUBSTRING(q.inner_tags FROM 1 FOR COALESCE(NULLIF(NULLIF(NULLIF(NULLIF(NULLIF(NULLIF(NULLIF(NULLIF(NULLIF(NULLIF(NULLIF(NULLIF(NULLIF(
+                        CHARINDEX('><', q.inner_tags),0),0),0),0),0),0),0),0),0),0),0),0) - 1)
+                ELSE
+                    SUBSTRING(q.inner_tags FROM pos_start FOR pos_end - pos_start)
+            END
+        )) AS tag_part
+        FROM (
+            -- generate positions of delimiters; works in many engines by using recursive CTE or string splitting function;
+            -- here emulate a simple splitter using a numbers approach via recursive CTE below
+            SELECT 1 AS pos_start, 
+                   CASE WHEN CHARINDEX('><', q.inner_tags) = 0 THEN LENGTH(q.inner_tags)+1 ELSE CHARINDEX('><', q.inner_tags) END AS pos_end,
+                   q.inner_tags
+        ) s
+        UNION ALL
+        SELECT LOWER(TRIM(SUBSTRING(q.inner_tags FROM s.pos_end + 2 FOR COALESCE(NULLIF(CHARINDEX('><', q.inner_tags, s.pos_end + 2),0), LENGTH(q.inner_tags) + 1) - (s.pos_end + 2)))) AS tag_part
+        FROM (
+            SELECT 
+                CHARINDEX('><', q.inner_tags, t.next_search_start) AS found,
+                t.next_search_start,
+                t.pos_end,
+                q.inner_tags
+            FROM (
+                SELECT CHARINDEX('><', q.inner_tags) + 1 AS next_search_start,
+                       CASE WHEN CHARINDEX('><', q.inner_tags) = 0 THEN 0 ELSE CHARINDEX('><', q.inner_tags) END AS pos_end
+            ) t
+            WHERE CHARINDEX('><', q.inner_tags, t.next_search_start) > 0
+        ) more
+    ) tags
+),
+RankedUserTags AS (
+    SELECT
+        UserId,
+        TagName,
+        COUNT(*) AS TagCount,
+        ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY COUNT(*) DESC, TagName ASC) AS rn
+    FROM (
+        SELECT UserId, TagName FROM UserPostTagFrequencies
+    ) up
+    GROUP BY UserId, TagName
+),
+PostHistoryEditAnalysis AS (
+    SELECT
+        ph.PostId,
+        ph.UserId AS EditorUserId,
+        COUNT(ph.Id) AS TotalHistoryEvents,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditEvents,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15) THEN 1 ELSE 0 END) AS StatusChangeEvents,
+        MAX(ph.CreationDate) AS LastHistoryDate,
+        AVG(LENGTH(ph.Text)) FILTER (WHERE ph.PostHistoryTypeId IN (2, 5, 8) AND ph.Text IS NOT NULL) AS AvgBodyContentLengthChange
+    FROM PostHistory AS ph
+    WHERE ph.PostHistoryTypeId NOT IN (1, 3)
+    GROUP BY ph.PostId, ph.UserId
+),
+OverallAverages AS (
+    SELECT
+        AVG(u.Reputation) AS AvgReputation,
+        AVG(u.Views) AS AvgViews,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId IN (1,2)) AS AvgPostScoreOverall,
+        AVG(LENGTH(c.Text)) AS AvgCommentLengthOverall
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON p.Id = c.PostId
+)
+SELECT
+    ue.UserId,
+    ue.DisplayName,
+    ue.Reputation,
+    ue.AccountActiveDays,
+    ue.UniqueBadgeCount,
+    ue.GoldBadges,
+    pa.TotalPosts,
+    pa.QuestionsAsked,
+    pa.AnswersProvided,
+    pa.TotalPostScore,
+    pa.TotalPostViews,
+    pa.AvgRelevantPostScorePerPost,
+    COALESCE(accepted_ans_owner.TotalAcceptedAnswersContributed, 0) AS AcceptedAnswersContributedByThisUser,
+    COALESCE(ph_user_summary.TotalUserEditEvents, 0) AS TotalUserEditEvents,
+    ph_user_summary.AvgEditContentLength,
+    COALESCE(comm_agg.TotalUserComments, 0) AS TotalUserComments,
+    comm_agg.AvgCommentScore,
+    tgs.TagName AS TopContributingTag,
+    tgs.TagCount AS TopContributingTagCount,
+    (SELECT AVG(sub_p.Score) FROM Posts sub_p WHERE sub_p.OwnerUserId = ue.UserId AND sub_p.PostTypeId = 2 AND sub_p.Score IS NOT NULL) AS AverageAnswerScoreByUser,
+    oa.AvgReputation AS OverallAvgReputation,
+    oa.AvgPostScoreOverall AS OverallAvgPostScore,
+    oa.AvgCommentLengthOverall AS OverallAvgCommentLength,
+    RANK() OVER (ORDER BY ue.Reputation DESC, pa.TotalPostScore DESC) AS GlobalUserRankByActivity,
+    NTILE(10) OVER (ORDER BY (ue.UpVotes - ue.DownVotes) DESC) AS NetVotePowerDecile,
+    LAG(ue.Reputation, 1, 0) OVER (ORDER BY ue.CreationDate) AS PreviousUserReputationByCreationOrder,
+    (SELECT COUNT(DISTINCT vp.PostId) FROM Votes vp WHERE vp.UserId = ue.UserId AND vp.VoteTypeId = 2) AS UpvotedPostsCountByUser,
+    CASE
+        WHEN ue.Reputation >= 20000 AND ue.GoldBadges >= 5 AND pa.QuestionsAsked > 20 AND pa.AnswersProvided > 50 THEN 'Super_Guru_Contributor'
+        WHEN ue.Reputation >= 10000 AND ue.GoldBadges >= 3 AND pa.AnswersProvided > 20 THEN 'HighRep_Experienced_Responder'
+        WHEN ue.Reputation >= 5000 AND pa.QuestionsAsked > 10 THEN 'MidRep_Active_Questioner'
+        WHEN ue.Reputation < 2000 AND ue.UniqueBadgeCount > 5 THEN 'Niche_Contributor'
+        ELSE 'General_User'
+    END AS UserContributionCategory,
+    COALESCE(ue.Location, 'Unspecified Location') AS DisplayLocation,
+    CAST(NULLIF(ue.UpVotes, 0) AS NUMERIC) / NULLIF(CAST(ue.UpVotes + ue.DownVotes AS NUMERIC), 0) AS NetVoteRatio,
+    SUBSTRING(ue.AboutMe FROM 1 FOR 100) AS AboutMeExcerpt,
+    LOWER(REPLACE(ue.DisplayName, ' ', '-')) AS DisplayNameSlug,
+    EXISTS (
+        SELECT 1 FROM Posts p_inner
+        WHERE p_inner.OwnerUserId = ue.UserId
+          AND p_inner.PostTypeId = 1
+          AND p_inner.Tags LIKE '%<sql>%'
+          AND p_inner.ViewCount > 5000
+          AND p_inner.CreationDate > (CAST('2024-10-01' AS DATE) - INTERVAL '1 year')
+    ) AS HasRecentHighViewSQLQuestions
+FROM UserEngagement AS ue
+LEFT JOIN PostAggregates AS pa ON ue.UserId = pa.UserId
+LEFT JOIN (
+    SELECT
+        p_ans.OwnerUserId AS AnswerOwnerUserId,
+        SUM(aa.QuestionsAcceptedThisAnswerFor) AS TotalAcceptedAnswersContributed
+    FROM AnswerAcceptance aa
+    JOIN Posts p_ans ON aa.AnswerId = p_ans.Id
+    WHERE p_ans.OwnerUserId IS NOT NULL
+    GROUP BY p_ans.OwnerUserId
+) AS accepted_ans_owner ON ue.UserId = accepted_ans_owner.AnswerOwnerUserId
+LEFT JOIN RankedUserTags AS tgs ON ue.UserId = tgs.UserId AND tgs.rn = 1
+LEFT JOIN (
+    SELECT
+        phe.EditorUserId AS UserId,
+        SUM(phe.EditEvents) AS TotalUserEditEvents,
+        AVG(phe.AvgBodyContentLengthChange) AS AvgEditContentLength
+    FROM PostHistoryEditAnalysis phe
+    GROUP BY phe.EditorUserId
+) AS ph_user_summary ON ue.UserId = ph_user_summary.UserId
+LEFT JOIN (
+    SELECT
+        c.UserId,
+        COUNT(c.Id) AS TotalUserComments,
+        AVG(CAST(c.Score AS NUMERIC)) AS AvgCommentScore
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+    GROUP BY c.UserId
+) AS comm_agg ON ue.UserId = comm_agg.UserId
+CROSS JOIN OverallAverages AS oa
+WHERE
+    ue.AccountActiveDays > 90
+    AND (ue.Location IS NOT NULL AND (ue.Location ILIKE '%Europe%' OR ue.Location ILIKE '%America%' OR ue.Location ILIKE '%Asia%'))
+    AND ((pa.AnswersProvided IS NOT NULL AND pa.AnswersProvided > 0) OR ue.GoldBadges > 2)
+    AND ue.Reputation >= 1500
+ORDER BY
+    GlobalUserRankByActivity ASC, ue.Reputation DESC, AcceptedAnswersContributedByThisUser DESC
+LIMIT 5000;

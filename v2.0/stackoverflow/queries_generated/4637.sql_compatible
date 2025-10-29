@@ -1,0 +1,116 @@
+WITH RankedQuestions AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title AS QuestionTitle,
+        p.OwnerUserId,
+        p.CreationDate AS QuestionCreationDate,
+        p.Score AS QuestionScore,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.OwnerUserId IS NOT NULL
+),
+UserContributions AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (2, 5) THEN 1 END) AS BodyEdits,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (1, 4) THEN 1 END) AS TitleEdits,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (3, 6) THEN 1 END) AS TagEdits,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId OR u.Id = p.LastEditorUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id > 0 AND u.Reputation > 100
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopUsers AS (
+    SELECT
+        uc.UserId,
+        uc.DisplayName,
+        uc.Reputation,
+        uc.BodyEdits,
+        uc.TitleEdits,
+        uc.TagEdits,
+        uc.UpVotesReceived,
+        uc.DownVotesReceived,
+        uc.BadgeCount,
+        uc.LastPostDate,
+        RANK() OVER (ORDER BY uc.UpVotesReceived DESC, uc.Reputation DESC) as user_rank
+    FROM UserContributions uc
+),
+CorrelatedAnswerScore AS (
+    SELECT
+        ans.Id AS AnswerId,
+        ans.ParentId AS QuestionId,
+        ans.OwnerUserId,
+        ans.Score AS AnswerScore,
+        (SELECT SUM(v_inner.BountyAmount) FROM Votes v_inner WHERE v_inner.PostId = ans.Id AND v_inner.VoteTypeId = 9) AS TotalBountyAwarded
+    FROM Posts ans
+    WHERE ans.PostTypeId = 2 AND ans.ParentId IS NOT NULL
+),
+PostLinkAnalysis AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name AS LinkType,
+        CASE
+            WHEN lt.Id = 1 THEN 'Linked'
+            WHEN lt.Id = 3 THEN 'Duplicate'
+            ELSE 'Other'
+        END AS LinkCategory
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    WHERE pl.CreationDate >= (cast('2024-10-01' as date) - INTERVAL '1 year')
+),
+RecentClosedQuestions AS (
+    SELECT
+        p.Id AS ClosedQuestionId,
+        p.Title AS ClosedQuestionTitle,
+        p.ClosedDate,
+        u.DisplayName AS CloserDisplayName,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 END) AS CloseVoteCount,
+        STRING_AGG(DISTINCT ph.Comment, '; ') AS CloseComments
+    FROM Posts p
+    JOIN PostHistory ph ON p.Id = ph.PostId
+    LEFT JOIN Users u ON ph.UserId = u.Id
+    WHERE p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL AND ph.PostHistoryTypeId = 10
+    GROUP BY p.Id, p.Title, p.ClosedDate, u.DisplayName
+    HAVING COUNT(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 END) > 3
+)
+SELECT
+    t.DisplayName AS UserDisplayName,
+    t.Reputation,
+    t.user_rank,
+    rq.QuestionTitle AS LatestQuestionTitle,
+    rq.QuestionScore AS LatestQuestionScore,
+    rcq.ClosedQuestionTitle AS RecentClosedQuestionTitle,
+    rcq.CloseVoteCount,
+    COALESCE(pla.LinkType, 'No Links') AS LinkStatus,
+    SUM(cas.AnswerScore) AS TotalAnswerScoreForUser,
+    AVG(cas.TotalBountyAwarded) AS AverageBountyOnAnswers,
+    CASE WHEN t.BadgeCount > 10 THEN 'Highly Decorated' WHEN t.BadgeCount > 5 THEN 'Decorated' ELSE 'Standard' END AS UserBadgeTier,
+    UPPER(SUBSTRING(t.DisplayName FROM 1 FOR 3)) || '-' || LPAD(CAST(t.Reputation AS VARCHAR), 7, '0') AS UserIdentifier
+FROM TopUsers t
+LEFT JOIN RankedQuestions rq ON t.UserId = rq.OwnerUserId AND rq.rn = 1
+LEFT JOIN RecentClosedQuestions rcq ON t.DisplayName = rcq.CloserDisplayName
+LEFT JOIN PostLinkAnalysis pla ON t.UserId = pla.PostId
+LEFT JOIN CorrelatedAnswerScore cas ON t.UserId = cas.OwnerUserId
+WHERE t.Reputation > 1000 AND t.DisplayName LIKE '%a%' AND t.DisplayName IS NOT NULL
+GROUP BY
+    t.DisplayName,
+    t.Reputation,
+    t.user_rank,
+    rq.QuestionTitle,
+    rq.QuestionScore,
+    rcq.ClosedQuestionTitle,
+    rcq.CloseVoteCount,
+    pla.LinkType,
+    t.BadgeCount
+HAVING COUNT(cas.AnswerId) > 0 OR pla.LinkType IS NOT NULL OR rcq.ClosedQuestionId IS NOT NULL
+ORDER BY t.user_rank, t.Reputation DESC;

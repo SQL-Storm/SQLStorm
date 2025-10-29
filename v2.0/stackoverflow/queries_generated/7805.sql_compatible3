@@ -1,0 +1,243 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.ViewCount, p.ViewCount) AS ViewCount,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        AVG(p.Score) AS AvgPostScore,
+        -- standard SQL aggregation for string concatenation may vary; use LISTAGG ANSI form
+        LISTAGG(p.Tags, '; ') WITHIN GROUP (ORDER BY p.Tags) AS AllTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= TIMESTAMP '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, COALESCE(u.ViewCount, p.ViewCount)
+),
+RankedPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS ScoreRank,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) AS ScoreDenseRank,
+        NTILE(100) OVER (ORDER BY p.Score DESC) AS ScorePercentile,
+        LAG(p.Score, 1) OVER (ORDER BY p.Score DESC) AS PrevScore,
+        LEAD(p.Score, 1) OVER (ORDER BY p.Score DESC) AS NextScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS UserAvgScore
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+TagAnalytics AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        (SELECT COUNT(*) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%') AS TagUsageCount,
+        (SELECT AVG(p2.Score) FROM Posts p2 WHERE p2.Tags LIKE '%' || t.TagName || '%') AS AvgScorePerTag
+    FROM Tags t
+),
+ComplexJoinTest AS (
+    SELECT 
+        up.UserId,
+        up.DisplayName,
+        up.Reputation,
+        up.PostCount,
+        up.CommentCount,
+        up.BadgeCount,
+        up.QuestionCount,
+        up.AnswerCount,
+        up.LastPostDate,
+        up.AvgPostScore,
+        up.AllTags,
+        rp.PostId,
+        rp.Title,
+        rp.Score,
+        rp.ViewCount,
+        rp.CreationDate,
+        rp.ScoreRank,
+        rp.ScoreDenseRank,
+        rp.ScorePercentile,
+        rp.PrevScore,
+        rp.NextScore,
+        rp.UserAvgScore,
+        ta.TagName,
+        ta.Count AS TagCount,
+        ta.ExcerptPostId,
+        ta.WikiPostId,
+        ta.TagUsageCount,
+        ta.AvgScorePerTag,
+        CASE 
+            WHEN up.Reputation >= 10000 THEN 'Elite'
+            WHEN up.Reputation >= 1000 THEN 'Advanced'
+            WHEN up.Reputation >= 100 THEN 'Regular'
+            ELSE 'New'
+        END AS UserLevel,
+        CASE 
+            WHEN up.PostCount > 100 THEN ' prolific'
+            WHEN up.PostCount > 50 THEN ' active'
+            WHEN up.PostCount > 10 THEN ' engaged'
+            ELSE ' casual'
+        END AS ActivityLevel,
+        CASE 
+            WHEN up.AvgPostScore > 10 THEN ' high'
+            WHEN up.AvgPostScore > 5 THEN ' medium'
+            WHEN up.AvgPostScore > 0 THEN ' low'
+            ELSE ' negative'
+        END AS ScoreLevel,
+        COALESCE(
+            (SELECT AVG(v.BountyAmount) 
+             FROM Votes v 
+             WHERE v.PostId = rp.PostId AND v.VoteTypeId = 8),
+            0
+        ) AS AvgBountyAmount,
+        (SELECT COUNT(*) 
+         FROM PostHistory ph 
+         WHERE ph.PostId = rp.PostId AND ph.PostHistoryTypeId IN (10, 11, 12, 13)) AS ModificationCount,
+        (SELECT COUNT(*) 
+         FROM Comments c 
+         WHERE c.PostId = rp.PostId) AS CommentCountOnPost,
+        (SELECT p2.Title 
+         FROM Posts p2 
+         WHERE p2.Id = rp.PostId 
+           AND p2.PostTypeId IN (1, 2)
+         FETCH FIRST 1 ROW ONLY) AS RelatedTitle,
+        CASE 
+            WHEN rp.ScorePercentile > 90 THEN 'Top 10%'
+            WHEN rp.ScorePercentile > 80 THEN 'Top 20%'
+            WHEN rp.ScorePercentile > 70 THEN 'Top 30%'
+            ELSE 'Below 70%'
+        END AS PerformanceGroup,
+        CASE 
+            WHEN up.PostCount > 50 AND up.BadgeCount > 10 AND up.Reputation > 5000 THEN 'True Contributor'
+            WHEN up.PostCount > 10 AND up.BadgeCount > 5 AND up.Reputation > 1000 THEN 'Active Member'
+            ELSE 'Regular User'
+        END AS UserRole,
+        CONCAT(
+            'User: ', up.DisplayName, 
+            ' | Rep: ', CAST(up.Reputation AS VARCHAR),
+            ' | Posts: ', CAST(up.PostCount AS VARCHAR),
+            ' | Score: ', CAST(up.AvgPostScore AS VARCHAR),
+            ' | Tag: ', COALESCE(rp.Title, 'No Title')
+        ) AS UserPostSummary
+    FROM UserStats up
+    LEFT JOIN RankedPosts rp ON up.UserId = rp.OwnerUserId
+    LEFT JOIN TagAnalytics ta ON rp.Tags ILIKE '%' || ta.TagName || '%'
+    WHERE up.PostCount >= 10
+)
+
+SELECT 
+    cjt.UserId,
+    cjt.DisplayName,
+    cjt.Reputation,
+    cjt.PostCount,
+    cjt.CommentCount,
+    cjt.BadgeCount,
+    cjt.QuestionCount,
+    cjt.AnswerCount,
+    cjt.LastPostDate,
+    cjt.AvgPostScore,
+    cjt.AllTags,
+    cjt.PostId,
+    cjt.Title,
+    cjt.Score,
+    cjt.ViewCount,
+    cjt.CreationDate,
+    cjt.ScoreRank,
+    cjt.ScoreDenseRank,
+    cjt.ScorePercentile,
+    cjt.PrevScore,
+    cjt.NextScore,
+    cjt.UserAvgScore,
+    cjt.TagName,
+    cjt.TagCount,
+    cjt.ExcerptPostId,
+    cjt.WikiPostId,
+    cjt.TagUsageCount,
+    cjt.AvgScorePerTag,
+    cjt.UserLevel,
+    cjt.ActivityLevel,
+    cjt.ScoreLevel,
+    cjt.AvgBountyAmount,
+    cjt.ModificationCount,
+    cjt.CommentCountOnPost,
+    cjt.RelatedTitle,
+    cjt.PerformanceGroup,
+    cjt.UserRole,
+    cjt.UserPostSummary,
+    -- standard timestamp arithmetic: subtract yields an interval in many DBs
+    (TIMESTAMP '2024-10-01 12:34:56' AT TIME ZONE 'UTC') - cjt.CreationDate AS _interval_diff,
+    CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - cjt.CreationDate)) / 86400 AS INTEGER) AS DaysSincePost,
+    CASE 
+        WHEN cjt.AvgBountyAmount > 100 THEN 'High Bounty'
+        WHEN cjt.AvgBountyAmount > 50 THEN 'Medium Bounty'
+        WHEN cjt.AvgBountyAmount > 0 THEN 'Low Bounty'
+        ELSE 'No Bounty'
+    END AS BountyCategory,
+    ROUND(CAST(cjt.AvgPostScore AS NUMERIC), 2) AS RoundedAvgScore,
+    CAST(cjt.Reputation AS VARCHAR(20)) || ' Rep' AS ReputationText,
+    CASE 
+        WHEN cjt.Score > (SELECT AVG(p.Score) FROM Posts p) THEN 'Above Average'
+        WHEN cjt.Score < (SELECT AVG(p.Score) FROM Posts p) THEN 'Below Average'
+        ELSE 'Average'
+    END AS ScoreComparison,
+    (SELECT COUNT(*) FROM ComplexJoinTest cjt2 WHERE cjt2.UserId = cjt.UserId AND cjt2.Score > cjt.Score) AS HigherRankedPosts,
+    LAG(cjt.Reputation, 1) OVER (ORDER BY cjt.Reputation DESC) AS PrevReputation,
+    LEAD(cjt.Reputation, 1) OVER (ORDER BY cjt.Reputation DESC) AS NextReputation,
+    NTILE(5) OVER (ORDER BY cjt.Reputation DESC) AS ReputationQuintile,
+    RANK() OVER (ORDER BY cjt.Reputation DESC) AS ReputationRank,
+    DENSE_RANK() OVER (ORDER BY cjt.Reputation DESC) AS ReputationDenseRank,
+    COUNT(*) OVER () AS TotalResults,
+    CASE 
+        WHEN (SELECT COUNT(*) FROM Votes v WHERE v.UserId = cjt.UserId AND v.VoteTypeId = 2) > 50 THEN 'Strong Voter'
+        WHEN (SELECT COUNT(*) FROM Votes v WHERE v.UserId = cjt.UserId AND v.VoteTypeId = 2) > 10 THEN 'Regular Voter'
+        ELSE 'Occasional Voter'
+    END AS VotingPattern,
+    CASE 
+        WHEN EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = cjt.UserId AND p.PostTypeId = 1 AND p.Score > 100) THEN 'High Scoring Poster'
+        ELSE 'Regular Poster'
+    END AS PosterCategory,
+    ROUND((cjt.Score * 100.0 / (SELECT MAX(p.Score) FROM Posts p)), 2) AS ScorePercentage,
+    CONCAT(
+        cjt.Title, 
+        ' (', 
+        CASE 
+            WHEN EXISTS (SELECT 1 FROM Posts p WHERE p.Id = cjt.PostId AND p.PostTypeId = 1) THEN 'Question'
+            WHEN EXISTS (SELECT 1 FROM Posts p WHERE p.Id = cjt.PostId AND p.PostTypeId = 2) THEN 'Answer'
+            ELSE 'Other'
+        END,
+        ')'
+    ) AS PostTypeTitle,
+    SUBSTRING(cjt.AllTags FROM 1 FOR 50) AS ShortTags,
+    CASE 
+        WHEN cjt.TagName IS NOT NULL THEN 'Tagged'
+        ELSE 'Untagged'
+    END AS TagStatus,
+    CONCAT(
+        'Posted on ', 
+        TO_CHAR(cjt.CreationDate, 'YYYY-MM-DD'),
+        ' by ', 
+        cjt.DisplayName
+    ) AS PostIdentifier
+FROM ComplexJoinTest cjt
+WHERE 
+    cjt.Reputation > 100 
+    AND cjt.PostCount > 5 
+    AND cjt.Score > 0
+    AND (cjt.TagName IS NOT NULL OR cjt.TagName = '')
+ORDER BY 
+    cjt.Reputation DESC,
+    cjt.Score DESC,
+    cjt.PostCount DESC
+FETCH FIRST 1000 ROWS ONLY;

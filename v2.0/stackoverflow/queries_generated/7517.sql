@@ -1,0 +1,225 @@
+-- {"query": "7517.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2236} 
+WITH UserPostStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        SUM(COALESCE(p.Score, 0)) as TotalScore,
+        MAX(p.CreationDate) as LastPostDate,
+        AVG(COALESCE(p.Score, 0)) as AvgScore,
+        STRING_AGG(DISTINCT p.Tags, ', ') as AllTags,
+        COUNT(DISTINCT CASE WHEN p.AnswerCount > 0 THEN p.Id END) as QuestionsWithAnswers,
+        COUNT(DISTINCT CASE WHEN p.CommentCount > 0 THEN p.Id END) as PostsWithComments,
+        SUM(COALESCE(p.ViewCount, 0)) as TotalViews,
+        ROW_NUMBER() OVER (ORDER BY SUM(COALESCE(p.Score, 0)) DESC) as ScoreRank,
+        RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) as PostRank,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) as RepRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.CreationDate >= '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+PostStats AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END as PostType,
+        COALESCE(p.Tags, '') as Tags,
+        CASE 
+            WHEN p.Score > 10 THEN 'Highly Scored'
+            WHEN p.Score > 5 THEN 'Moderately Scored'
+            WHEN p.Score > 0 THEN 'Low Scored'
+            ELSE 'No Score'
+        END as ScoreCategory,
+        COALESCE(p.OwnerDisplayName, 'Anonymous') as OwnerName,
+        DATEDIFF(day, p.CreationDate, GETDATE()) as DaysSinceCreation,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PreviousScore,
+        LEAD(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as NextScore,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) as UserPostCount,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as UserAvgScore
+    FROM Posts p
+    WHERE p.CreationDate >= '2015-01-01'
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        TotalPosts,
+        Questions,
+        Answers,
+        TotalScore,
+        LastPostDate,
+        AvgScore,
+        ScoreRank,
+        PostRank,
+        RepRank,
+        CASE 
+            WHEN TotalPosts > 100 AND TotalScore > 1000 THEN 'Elite'
+            WHEN TotalPosts > 50 AND TotalScore > 500 THEN 'Veteran'
+            WHEN TotalPosts > 10 AND TotalScore > 100 THEN 'Regular'
+            ELSE 'Newbie'
+        END as UserCategory
+    FROM UserPostStats
+    WHERE TotalPosts > 10
+),
+TagAggregates AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            WHEN t.Count > 10 THEN 'Niche'
+            ELSE 'Rare'
+        END as TagPopularity,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as PopularityRank,
+        AVG(t.Count) OVER () as AvgTagCount
+    FROM Tags t
+    WHERE t.Count > 0
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        ps.PostId,
+        ps.Title,
+        ps.Score,
+        ps.ViewCount,
+        ps.AnswerCount,
+        ps.CommentCount,
+        ps.FavoriteCount,
+        ps.CreationDate,
+        ps.OwnerUserId,
+        ps.PostType,
+        ps.Tags,
+        ps.ScoreCategory,
+        ps.OwnerName,
+        ps.DaysSinceCreation,
+        ps.PreviousScore,
+        ps.NextScore,
+        ps.UserPostCount,
+        ps.UserAvgScore,
+        CASE 
+            WHEN ps.AnswerCount > ps.CommentCount THEN 'More Answers ThanComments'
+            WHEN ps.AnswerCount < ps.CommentCount THEN 'More CommentsThanAnswers'
+            ELSE 'EqualAnswersAndComments'
+        END as PostActivityStatus,
+        CASE 
+            WHEN ps.Score > ps.UserAvgScore THEN 'AboveAverage'
+            WHEN ps.Score < ps.UserAvgScore THEN 'BelowAverage'
+            ELSE 'Average'
+        END as PerformanceStatus,
+        CASE 
+            WHEN ps.PostTypeId = 1 AND ps.AnswerCount = 0 THEN 'UnansweredQuestion'
+            WHEN ps.PostTypeId = 1 AND ps.AnswerCount > 0 THEN 'AnsweredQuestion'
+            ELSE 'Other'
+        END as QuestionStatus,
+        ABS(ps.Score - COALESCE(ps.PreviousScore, 0)) as ScoreChange,
+        CASE 
+            WHEN ps.ViewCount > 1000 AND ps.Score > 50 THEN 'HighImpact'
+            WHEN ps.ViewCount > 500 AND ps.Score > 25 THEN 'MediumImpact'
+            WHEN ps.ViewCount > 100 AND ps.Score > 10 THEN 'LowImpact'
+            ELSE 'MinimalImpact'
+        END as ImpactLevel,
+        RANK() OVER (PARTITION BY ps.OwnerUserId ORDER BY ps.Score DESC) as ScoreRankPerUser
+    FROM PostStats ps
+    WHERE ps.Score IS NOT NULL
+)
+SELECT 
+    TOP 1000
+    tu.UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.TotalPosts,
+    tu.Questions,
+    tu.Answers,
+    tu.TotalScore,
+    tu.LastPostDate,
+    tu.AvgScore,
+    tu.UserCategory,
+    COUNT(DISTINCT CASE WHEN cpa.PostId IS NOT NULL THEN cpa.PostId END) as AnalyzedPosts,
+    AVG(cpa.Score) as AvgAnalyzedScore,
+    MAX(cpa.DaysSinceCreation) as MaxDaysSinceCreation,
+    MAX(cpa.AnswerCount) as MaxAnswers,
+    SUM(CASE WHEN cpa.QuestionStatus = 'AnsweredQuestion' THEN 1 ELSE 0 END) as AnsweredQuestions,
+    SUM(CASE WHEN cpa.QuestionStatus = 'UnansweredQuestion' THEN 1 ELSE 0 END) as UnansweredQuestions,
+    STRING_AGG(DISTINCT CASE WHEN cpa.PostType = 'Question' THEN 'Q' ELSE 'A' END, ', ') as PostTypesInAnalysis,
+    STRING_AGG(DISTINCT ta.TagName, ', ') as RelevantTags,
+    STRING_AGG(DISTINCT cpa.OwnerName, ', ') as PostOwners,
+    COUNT(*) as TotalAnalysisCount,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY cpa.Score) as MedianScore,
+    ROUND(STDDEV(cpa.Score), 2) as ScoreStandardDeviation,
+    CASE 
+        WHEN COUNT(*) > 0 THEN 
+            ROUND(
+                (COUNT(CASE WHEN cpa.Score > 10 THEN 1 END) * 100.0 / COUNT(*)), 
+                2
+            )
+        ELSE 0 
+    END as HighScorePercentage,
+    CASE 
+        WHEN COUNT(*) > 0 AND AVG(cpa.Score) > 0 THEN 
+            ROUND(
+                (SUM(CASE WHEN cpa.Score > AVG(cpa.Score) THEN 1 ELSE 0 END) * 100.0 / COUNT(*)), 
+                2
+            )
+        ELSE 0 
+    END as AboveAveragePercentage,
+    MAX(CASE WHEN cpa.Score > 100 THEN cpa.Title ELSE NULL END) as HighScorePostTitle,
+    MAX(CASE WHEN cpa.Score > 100 THEN cpa.PostId ELSE NULL END) as HighScorePostId,
+    MAX(CASE WHEN cpa.DaysSinceCreation > 365 THEN 1 ELSE 0 END) as HasLongLivedPost,
+    COALESCE(
+        (SELECT COUNT(*) FROM Comments c WHERE c.UserId = tu.UserId), 
+        0
+    ) as CommentCount,
+    CASE 
+        WHEN tu.Reputation > 10000 THEN 'HighReputation'
+        WHEN tu.Reputation > 1000 THEN 'MediumReputation'
+        WHEN tu.Reputation > 100 THEN 'LowReputation'
+        ELSE 'VeryLowReputation'
+    END as RepStatus,
+    ROUND(AVG(ta.Count), 2) as AvgTagCount,
+    STRING_AGG(
+        CASE 
+            WHEN cpa.Score > 50 THEN CONCAT(cpa.Title, ' (Score: ', cpa.Score, ')')
+            ELSE NULL
+        END, 
+        '; '
+    ) as TopPerformerPosts
+FROM TopUsers tu
+LEFT JOIN ComplexPostAnalysis cpa ON tu.UserId = cpa.OwnerUserId
+LEFT JOIN TagAggregates ta ON ta.TagPopularity IN ('Popular', 'Moderate') 
+    AND EXISTS (
+        SELECT 1 FROM STRING_SPLIT(ta.TagName, ',') s 
+        WHERE s.value IN (SELECT value FROM STRING_SPLIT(cpa.Tags, '<>'))
+    )
+WHERE tu.UserId IS NOT NULL
+GROUP BY 
+    tu.UserId, tu.DisplayName, tu.Reputation, tu.TotalPosts, 
+    tu.Questions, tu.Answers, tu.TotalScore, tu.LastPostDate, 
+    tu.AvgScore, tu.UserCategory
+HAVING 
+    COUNT(DISTINCT CASE WHEN cpa.PostId IS NOT NULL THEN cpa.PostId END) > 0
+    AND COUNT(*) >= 5
+ORDER BY 
+    tu.TotalScore DESC,
+    tu.Reputation DESC,
+    COUNT(DISTINCT CASE WHEN cpa.PostId IS NOT NULL THEN cpa.PostId END) DESC
+OFFSET 10 ROWS FETCH NEXT 100 ROWS ONLY;

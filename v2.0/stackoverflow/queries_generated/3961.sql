@@ -1,0 +1,178 @@
+-- {"query": "3961.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1832} 
+
+/*  Complex performance‑benchmarking query on the StackOverflow schema  */
+WITH
+/* 1️⃣  Recent activity per user (last 90 days) */
+recent_activity AS (
+    SELECT
+        u.Id                         AS user_id,
+        MAX(p.CreationDate)          AS last_post_date,
+        MAX(c.CreationDate)          AS last_comment_date,
+        MAX(v.CreationDate)          AS last_vote_date,
+        GREATEST(
+            COALESCE(MAX(p.CreationDate), '1970-01-01'::timestamp),
+            COALESCE(MAX(c.CreationDate), '1970-01-01'::timestamp),
+            COALESCE(MAX(v.CreationDate), '1970-01-01'::timestamp)
+        )                            AS most_recent_activity
+    FROM Users u
+    LEFT JOIN Posts      p ON p.OwnerUserId = u.Id
+                           AND p.CreationDate >= CURRENT_DATE - INTERVAL '90 days'
+    LEFT JOIN Comments   c ON c.UserId = u.Id
+                           AND c.CreationDate >= CURRENT_DATE - INTERVAL '90 days'
+    LEFT JOIN Votes      v ON v.UserId = u.Id
+                           AND v.CreationDate >= CURRENT_DATE - INTERVAL '90 days'
+    GROUP BY u.Id
+),
+
+/* 2️⃣  Aggregated badge info per user */
+badge_summary AS (
+    SELECT
+        b.UserId                         AS user_id,
+        COUNT(*)                         AS total_badges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_badges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_badges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_badges,
+        STRING_AGG(DISTINCT b.Name, ';' ORDER BY b.Name) AS badge_names
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+/* 3️⃣  Question‑answer performance per user */
+qa_metrics AS (
+    SELECT
+        q.OwnerUserId                                    AS user_id,
+        COUNT(*)                                         AS questions_asked,
+        COUNT(a.Id)                                      AS answers_given,
+        SUM(CASE WHEN q.AcceptedAnswerId IS NOT NULL
+                 AND q.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END) AS accepted_answers,
+        AVG(NULLIF(q.Score,0))                           AS avg_question_score,
+        AVG(NULLIF(a.Score,0))                           AS avg_answer_score,
+        PERCENT_RANK() OVER (ORDER BY COUNT(a.Id))      AS answer_rate_rank
+    FROM Posts q
+    LEFT JOIN Posts a
+          ON a.ParentId = q.Id
+         AND a.PostTypeId = 2                 -- answers
+    WHERE q.PostTypeId = 1                     -- questions
+    GROUP BY q.OwnerUserId
+),
+
+/* 4️⃣  Latest vote type per post (correlated subquery in SELECT list) */
+latest_vote_per_post AS (
+    SELECT
+        p.Id                     AS post_id,
+        (SELECT vt.Name
+         FROM Votes v
+         JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+         WHERE v.PostId = p.Id
+         ORDER BY v.CreationDate DESC
+         LIMIT 1)                AS latest_vote_type
+    FROM Posts p
+),
+
+/* 5️⃣  Tag‑level activity for posts authored by users (array handling) */
+tag_activity AS (
+    SELECT
+        p.OwnerUserId                                    AS user_id,
+        UNNEST(STRING_TO_ARRAY(TRIM(BOTH '<>' FROM p.Tags), '><')) AS tag,
+        COUNT(*)                                         AS posts_per_tag
+    FROM Posts p
+    WHERE p.Tags IS NOT NULL
+      AND p.PostTypeId = 1                               -- only questions have tags
+    GROUP BY p.OwnerUserId, tag
+),
+
+/* 6️⃣  Union of question and answer statistics for set‑operator testing */
+qa_union AS (
+    SELECT
+        u.Id                        AS user_id,
+        'question'                  AS entity_type,
+        COUNT(p.Id)                 AS entity_count,
+        SUM(p.Score)                AS total_score,
+        AVG(p.ViewCount)            AS avg_views
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+    GROUP BY u.Id
+
+    UNION ALL
+
+    SELECT
+        u.Id,
+        'answer',
+        COUNT(p.Id),
+        SUM(p.Score),
+        NULL::numeric               -- answers have no view count
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 2
+    GROUP BY u.Id
+)
+
+SELECT
+    u.Id                                    AS user_id,
+    COALESCE(u.DisplayName, 'Anonymous')    AS display_name,
+    u.Reputation,
+    ra.most_recent_activity,
+    bs.total_badges,
+    bs.gold_badges,
+    bs.silver_badges,
+    bs.bronze_badges,
+    bs.badge_names,
+    qm.questions_asked,
+    qm.answers_given,
+    qm.accepted_answers,
+    qm.avg_question_score,
+    qm.avg_answer_score,
+    qm.answer_rate_rank,
+    /* 7️⃣  Window function: rank users by a composite score */
+    RANK() OVER (
+        ORDER BY
+            (u.Reputation * 0.4) +
+            (bs.gold_badges * 100) +
+            (bs.silver_badges * 50) +
+            (bs.bronze_badges * 20) +
+            (qm.avg_answer_score * 10) DESC
+    )                                       AS composite_rank,
+    /* 8️⃣  String aggregation of top 5 tags per user */
+    STRING_AGG(DISTINCT t.tag || ':' || t.posts_per_tag, ', '
+               ORDER BY t.posts_per_tag DESC) FILTER (WHERE t.posts_per_tag IS NOT NULL) 
+                                           AS top_tags,
+    /* 9️⃣  Latest vote type on the user's most recent question */
+    lv.latest_vote_type,
+    /* 🔟  Set‑operator derived counts */
+    qa_q.entity_count      AS question_count,
+    qa_q.total_score       AS question_score_sum,
+    qa_q.avg_views         AS question_avg_views,
+    qa_a.entity_count      AS answer_count,
+    qa_a.total_score       AS answer_score_sum
+FROM Users u
+LEFT JOIN recent_activity ra    ON ra.user_id = u.Id
+LEFT JOIN badge_summary   bs    ON bs.user_id = u.Id
+LEFT JOIN qa_metrics      qm    ON qm.user_id = u.Id
+LEFT JOIN LATERAL (
+    SELECT lv.latest_vote_type
+    FROM latest_vote_per_post lv
+    JOIN Posts p ON p.Id = lv.post_id
+    WHERE p.OwnerUserId = u.Id
+      AND p.PostTypeId = 1               -- only consider questions
+    ORDER BY p.CreationDate DESC
+    LIMIT 1
+) lv ON TRUE
+LEFT JOIN tag_activity t        ON t.user_id = u.Id
+LEFT JOIN (
+    SELECT user_id, entity_count, total_score, avg_views
+    FROM qa_union
+    WHERE entity_type = 'question'
+) qa_q ON qa_q.user_id = u.Id
+LEFT JOIN (
+    SELECT user_id, entity_count, total_score
+    FROM qa_union
+    WHERE entity_type = 'answer'
+) qa_a ON qa_a.user_id = u.Id
+GROUP BY
+    u.Id, u.DisplayName, u.Reputation,
+    ra.most_recent_activity,
+    bs.total_badges, bs.gold_badges, bs.silver_badges, bs.bronze_badges, bs.badge_names,
+    qm.questions_asked, qm.answers_given, qm.accepted_answers,
+    qm.avg_question_score, qm.avg_answer_score, qm.answer_rate_rank,
+    lv.latest_vote_type,
+    qa_q.entity_count, qa_q.total_score, qa_q.avg_views,
+    qa_a.entity_count, qa_a.total_score;

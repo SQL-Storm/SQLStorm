@@ -1,0 +1,113 @@
+WITH
+badge_counts AS (
+    SELECT 
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_cnt,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_cnt,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_cnt,
+        COUNT(*)                                   AS total_badges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+post_stats AS (
+    SELECT 
+        p.OwnerUserId                     AS user_id,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS question_cnt,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS answer_cnt,
+        ROUND(AVG(CAST(p.Score AS numeric)), 2)  AS avg_score,
+        CASE 
+            WHEN COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) = 0 THEN NULL
+            ELSE ROUND(
+                100.0 * 
+                SUM(CASE WHEN p.PostTypeId = 2 AND p.Id = p.AcceptedAnswerId THEN 1 ELSE 0 END)
+                / NULLIF(COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END),0)::numeric, 2)
+        END AS accept_rate_pct,
+        STRING_AGG(DISTINCT TRIM(BOTH '<>' FROM UNNEST(string_to_array(p.Tags, '><'))), ', ') 
+            FILTER (WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL) AS tags_used
+    FROM Posts p
+    GROUP BY p.OwnerUserId
+),
+recent_activity AS (
+    SELECT 
+        u.Id                                      AS user_id,
+        GREATEST(
+            COALESCE((SELECT MAX(CreationDate) FROM Posts    WHERE OwnerUserId = u.Id), TIMESTAMP '1970-01-01'),
+            COALESCE((SELECT MAX(CreationDate) FROM Votes    WHERE UserId       = u.Id), TIMESTAMP '1970-01-01'),
+            COALESCE((SELECT MAX(CreationDate) FROM Comments WHERE UserId       = u.Id), TIMESTAMP '1970-01-01')
+        )                                        AS last_activity_ts,
+        (SELECT COUNT(*) FROM Posts    WHERE OwnerUserId = u.Id AND CreationDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30 days') AS posts_last_30d,
+        (SELECT COUNT(*) FROM Votes    WHERE UserId       = u.Id AND CreationDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30 days') AS votes_last_30d,
+        (SELECT COUNT(*) FROM Comments WHERE UserId       = u.Id AND CreationDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30 days') AS comments_last_30d
+    FROM Users u
+),
+self_answerers AS (
+    SELECT DISTINCT q.OwnerUserId AS user_id
+    FROM Posts q
+    JOIN Posts a ON a.ParentId = q.Id
+    WHERE q.PostTypeId = 1
+      AND a.PostTypeId = 2
+      AND q.OwnerUserId = a.OwnerUserId
+),
+zero_badge_users AS (
+    SELECT u.Id AS user_id, u.DisplayName
+    FROM Users u
+    LEFT JOIN badge_counts bc ON bc.UserId = u.Id
+    WHERE bc.UserId IS NULL
+),
+main_users AS (
+    SELECT
+        u.Id                                 AS user_id,
+        COALESCE(u.DisplayName, '<deleted>') AS display_name,
+        u.Reputation,
+        COALESCE(bc.gold_cnt,   0)           AS gold_badges,
+        COALESCE(bc.silver_cnt, 0)           AS silver_badges,
+        COALESCE(bc.bronze_cnt, 0)           AS bronze_badges,
+        COALESCE(bc.total_badges,0)          AS total_badges,
+        COALESCE(ps.question_cnt,0)          AS questions,
+        COALESCE(ps.answer_cnt,0)            AS answers,
+        ps.avg_score,
+        ps.accept_rate_pct,
+        ps.tags_used,
+        ra.last_activity_ts,
+        ra.posts_last_30d,
+        ra.votes_last_30d,
+        ra.comments_last_30d,
+        CASE WHEN sa.user_id IS NOT NULL THEN 'YES' ELSE 'NO' END AS self_answered_flag,
+        RANK() OVER (ORDER BY u.Reputation DESC, COALESCE(bc.total_badges,0) DESC) AS reputation_rank
+    FROM Users u
+    LEFT JOIN badge_counts   bc ON bc.UserId = u.Id
+    LEFT JOIN post_stats     ps ON ps.user_id = u.Id
+    LEFT JOIN recent_activity ra ON ra.user_id = u.Id
+    LEFT JOIN self_answerers sa ON sa.user_id = u.Id
+    WHERE u.Id IS NOT NULL
+)
+SELECT *
+FROM (
+    SELECT * FROM main_users
+    ORDER BY Reputation DESC
+    LIMIT 5000
+
+    UNION ALL
+
+    SELECT
+        zbu.user_id,
+        zbu.display_name,
+        NULL            AS Reputation,
+        0               AS gold_badges,
+        0               AS silver_badges,
+        0               AS bronze_badges,
+        0               AS total_badges,
+        0               AS questions,
+        0               AS answers,
+        NULL            AS avg_score,
+        NULL            AS accept_rate_pct,
+        NULL            AS tags_used,
+        NULL            AS last_activity_ts,
+        0               AS posts_last_30d,
+        0               AS votes_last_30d,
+        0               AS comments_last_30d,
+        'NO'            AS self_answered_flag,
+        NULL            AS reputation_rank
+    FROM zero_badge_users zbu
+) t
+ORDER BY user_id;

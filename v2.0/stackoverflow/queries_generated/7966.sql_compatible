@@ -1,0 +1,277 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank,
+        DENSE_RANK() OVER (ORDER BY u.Views DESC) AS ViewRank,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Elite'
+            WHEN u.Reputation >= 5000 THEN 'Expert'
+            WHEN u.Reputation >= 1000 THEN 'Advanced'
+            ELSE 'Beginner'
+        END AS UserTier,
+        COALESCE(ROUND(AVG(p.Score) OVER (PARTITION BY u.Id), 2), 0) AS AvgPostScore,
+        STRING_AGG(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Title END, ' | ') AS QuestionTitles,
+        STRING_AGG(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Body END, ' | ') AS AnswerBodies
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopTags AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank,
+        PERCENT_RANK() OVER (ORDER BY t.Count DESC) AS TagPercentile,
+        CASE 
+            WHEN t.Count > (SELECT AVG("Count") FROM Tags) THEN 'Popular'
+            ELSE 'Moderate'
+        END AS TagCategory
+    FROM Tags t
+    WHERE t.TagName IS NOT NULL
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.ParentId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        CASE WHEN p.Score > 0 THEN 1 ELSE 0 END AS HasPositiveScore,
+        CASE WHEN p.ViewCount > 100 THEN 1 ELSE 0 END AS HighViewPost,
+        CASE WHEN p.AnswerCount > 0 THEN 1 ELSE 0 END AS HasAnswers,
+        CASE WHEN p.CommentCount > 0 THEN 1 ELSE 0 END AS HasComments,
+        CASE WHEN p.FavoriteCount > 0 THEN 1 ELSE 0 END AS HasFavorites,
+        CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate)) / 86400 AS INTEGER) AS DaysSinceCreation,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS PostSequence,
+        RANK() OVER (ORDER BY p.Score DESC) AS ScoreRank,
+        DENSE_RANK() OVER (ORDER BY p.ViewCount DESC) AS ViewRank,
+        NTILE(4) OVER (ORDER BY p.Score DESC) AS ScoreQuartile,
+        FIRST_VALUE(p.Title) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS FirstPostTitle,
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevPostScore,
+        LEAD(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextPostScore
+    FROM Posts p
+    WHERE p.CreationDate >= DATE '2020-01-01'
+),
+TagUsageAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Tags,
+        tag AS Tag,
+        ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY tag) AS TagOrder
+    FROM Posts p,
+    LATERAL (
+        SELECT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS tag
+    ) t
+    WHERE p.Tags IS NOT NULL AND p.Tags <> ''
+),
+FinalAggregatedData AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.ViewRank,
+        uas.RepRank,
+        uas.UserTier,
+        uas.TotalPosts,
+        uas.QuestionCount,
+        uas.AnswerCount,
+        uas.BadgeCount,
+        uas.CommentCount,
+        uas.VoteCount,
+        uas.LastPostDate,
+        uas.AvgPostScore,
+        uas.QuestionTitles,
+        uas.AnswerBodies,
+        COALESCE(MAX(pa.Score), 0) AS HighestPostScore,
+        COALESCE(MIN(pa.Score), 0) AS LowestPostScore,
+        COUNT(pa.PostId) AS ActivePosts,
+        COUNT(CASE WHEN pa.HasPositiveScore = 1 THEN 1 END) AS PositiveScoringPosts,
+        COUNT(CASE WHEN pa.HighViewPost = 1 THEN 1 END) AS HighViewPosts,
+        STRING_AGG(DISTINCT ta.Tag, ' | ') AS AllTagsUsed
+    FROM UserActivityStats uas
+    LEFT JOIN PostAnalysis pa ON uas.UserId = pa.OwnerUserId
+    LEFT JOIN TagUsageAnalysis ta ON pa.PostId = ta.PostId
+    WHERE uas.UserId IS NOT NULL
+    GROUP BY 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.ViewRank,
+        uas.RepRank,
+        uas.UserTier,
+        uas.TotalPosts,
+        uas.QuestionCount,
+        uas.AnswerCount,
+        uas.BadgeCount,
+        uas.CommentCount,
+        uas.VoteCount,
+        uas.LastPostDate,
+        uas.AvgPostScore,
+        uas.QuestionTitles,
+        uas.AnswerBodies
+),
+UserPostSummary AS (
+    SELECT 
+        fad.UserId,
+        fad.DisplayName,
+        fad.Reputation,
+        fad.ViewRank,
+        fad.RepRank,
+        fad.UserTier,
+        fad.TotalPosts,
+        fad.QuestionCount,
+        fad.AnswerCount,
+        fad.BadgeCount,
+        fad.CommentCount,
+        fad.VoteCount,
+        fad.LastPostDate,
+        fad.AvgPostScore,
+        fad.HighestPostScore,
+        fad.LowestPostScore,
+        fad.ActivePosts,
+        fad.PositiveScoringPosts,
+        fad.HighViewPosts,
+        fad.AllTagsUsed,
+        ROW_NUMBER() OVER (ORDER BY fad.Reputation DESC, fad.TotalPosts DESC) AS OverallRank,
+        CASE 
+            WHEN fad.Reputation >= 50000 THEN 'Legendary'
+            WHEN fad.Reputation >= 25000 THEN 'Master'
+            WHEN fad.Reputation >= 10000 THEN 'Expert'
+            WHEN fad.Reputation >= 5000 THEN 'Advanced'
+            ELSE 'Regular'
+        END AS ReputationTier,
+        COALESCE(ROUND((fad.PositiveScoringPosts * 100.0 / NULLIF(fad.ActivePosts, 0)), 2), 0) AS PositiveRatio,
+        CASE 
+            WHEN fad.BadgeCount > 0 THEN 
+                CASE 
+                    WHEN fad.BadgeCount >= 20 THEN 'Medalist'
+                    WHEN fad.BadgeCount >= 10 THEN 'Achiever'
+                    ELSE 'Participant'
+                END
+            ELSE 'Inactive'
+        END AS BadgeLevel,
+        CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - COALESCE(fad.LastPostDate, TIMESTAMP '1970-01-01'))) / 86400 AS INTEGER) AS DaysSinceLastPost
+    FROM FinalAggregatedData fad
+)
+SELECT 
+    ups.UserId,
+    ups.DisplayName,
+    ups.Reputation,
+    ups.ViewRank,
+    ups.RepRank,
+    ups.UserTier,
+    ups.TotalPosts,
+    ups.QuestionCount,
+    ups.AnswerCount,
+    ups.BadgeCount,
+    ups.CommentCount,
+    ups.VoteCount,
+    ups.LastPostDate,
+    ups.AvgPostScore,
+    ups.HighestPostScore,
+    ups.LowestPostScore,
+    ups.ActivePosts,
+    ups.PositiveScoringPosts,
+    ups.HighViewPosts,
+    ups.AllTagsUsed,
+    ups.OverallRank,
+    ups.ReputationTier,
+    ups.PositiveRatio,
+    ups.BadgeLevel,
+    ups.DaysSinceLastPost,
+    CASE 
+        WHEN ups.DaysSinceLastPost > 365 THEN 'Inactive'
+        WHEN ups.DaysSinceLastPost > 180 THEN 'Inactive'
+        WHEN ups.DaysSinceLastPost > 90 THEN 'Inactive'
+        ELSE 'Active'
+    END AS ActivityStatus,
+    COALESCE(ROUND(ups.Reputation::numeric / NULLIF(ups.TotalPosts, 0), 2), 0) AS RepPerPost,
+    COALESCE(ROUND(ups.TotalPosts * 1.0 / NULLIF(ups.Reputation, 0), 4), 0) AS PostPerRep,
+    CASE 
+        WHEN ups.QuestionCount > 0 AND ups.AnswerCount > 0 THEN
+            ROUND(ups.AnswerCount * 100.0 / NULLIF(ups.QuestionCount, 0), 2)
+        ELSE 0
+    END AS AnswerToQuestionRatio,
+    CASE 
+        WHEN ups.BadgeCount > 0 THEN
+            ROUND(ups.VoteCount * 1.0 / NULLIF(ups.BadgeCount, 0), 2)
+        ELSE 0
+    END AS VotePerBadge,
+    STRING_AGG(DISTINCT CASE WHEN LENGTH(ups.AllTagsUsed) > 0 THEN SUBSTRING(ups.AllTagsUsed FROM 1 FOR 50) END, ' | ') AS TagSnippet,
+    STRING_AGG(
+        CASE 
+            WHEN ups.QuestionCount + ups.AnswerCount > 0 THEN 
+                CONCAT(ups.DisplayName, ' (', ups.QuestionCount, '/', ups.AnswerCount, ')')
+            ELSE ups.DisplayName
+        END, 
+        ' | '
+    ) AS UserActivitySummary
+FROM UserPostSummary ups
+LEFT JOIN (
+    SELECT UserId, COUNT(*) AS PostCount
+    FROM Posts
+    GROUP BY UserId
+) pc ON ups.UserId = pc.UserId
+WHERE ups.UserId IS NOT NULL
+GROUP BY 
+    ups.UserId,
+    ups.DisplayName,
+    ups.Reputation,
+    ups.ViewRank,
+    ups.RepRank,
+    ups.UserTier,
+    ups.TotalPosts,
+    ups.QuestionCount,
+    ups.AnswerCount,
+    ups.BadgeCount,
+    ups.CommentCount,
+    ups.VoteCount,
+    ups.LastPostDate,
+    ups.AvgPostScore,
+    ups.HighestPostScore,
+    ups.LowestPostScore,
+    ups.ActivePosts,
+    ups.PositiveScoringPosts,
+    ups.HighViewPosts,
+    ups.AllTagsUsed,
+    ups.OverallRank,
+    ups.ReputationTier,
+    ups.PositiveRatio,
+    ups.BadgeLevel,
+    ups.DaysSinceLastPost
+HAVING 
+    (ups.TotalPosts > 0 OR ups.BadgeCount > 0 OR ups.VoteCount > 0)
+ORDER BY 
+    ups.Reputation DESC,
+    ups.TotalPosts DESC,
+    ups.BadgeCount DESC,
+    ups.ActivePosts DESC,
+    ups.RepRank ASC,
+    ups.ViewRank ASC,
+    ups.OverallRank ASC
+LIMIT 500;

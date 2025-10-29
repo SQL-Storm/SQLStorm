@@ -1,0 +1,158 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        ARRAY[t.TagName] AS Ancestors
+    FROM Tags t
+    WHERE t.Id IS NOT NULL AND (t.IsRequired = TRUE OR t.IsRequired = 1)
+
+    UNION ALL
+
+    SELECT
+        child.Id,
+        child.TagName,
+        child.Count,
+        child.IsModeratorOnly,
+        child.IsRequired,
+        p.Ancestors || child.TagName
+    FROM Tags child
+    JOIN PostLinks pl ON pl.PostId = child.WikiPostId
+    JOIN RecursiveTagHierarchy p ON pl.RelatedPostId = p.WikiPostId
+    WHERE NOT child.TagName = ANY(p.Ancestors)
+),
+UserRichness AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COUNT(DISTINCT q.Id) FILTER (WHERE q.PostTypeId = 1) AS QuestionsAsked,
+        COUNT(DISTINCT a.Id) FILTER (WHERE a.PostTypeId = 2) AS AnswersGiven,
+        AVG(a.Score) FILTER (WHERE a.PostTypeId = 2) AS AvgAnswerScore,
+        SUM(COALESCE(vt.UpVotes,0)) OVER (PARTITION BY u.Id) AS TotalUpVotes,
+        SUM(COALESCE(vt.DownVotes,0)) OVER (PARTITION BY u.Id) AS TotalDownVotes
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Posts q ON q.OwnerUserId = u.Id AND q.PostTypeId = 1
+    LEFT JOIN Posts a ON a.OwnerUserId = u.Id AND a.PostTypeId = 2
+    LEFT JOIN LATERAL (
+      SELECT
+          SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+          SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+      FROM Votes v
+      WHERE v.UserId = u.Id
+    ) vt ON true
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, vt.UpVotes, vt.DownVotes
+),
+PostScoreDiffs AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevScore,
+        LEAD(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextScore,
+        p.OwnerUserId
+    FROM Posts p
+    WHERE p.PostTypeId IN (1,2)
+),
+ComplexPostMetrics AS (
+    SELECT
+        psd.Id,
+        psd.Title,
+        psd.CreationDate,
+        psd.Score,
+        psd.PrevScore,
+        psd.NextScore,
+        psd.OwnerUserId,
+        COALESCE(psd.Score - psd.PrevScore, 0) AS ScoreDiffPrev,
+        COALESCE(psd.NextScore - psd.Score, 0) AS ScoreDiffNext,
+        LENGTH(COALESCE(p.Body, '')) AS BodyLength,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY psd.OwnerUserId ORDER BY psd.Score DESC) AS PostRankForUser
+    FROM PostScoreDiffs psd
+    LEFT JOIN Posts p ON p.Id = psd.Id
+),
+TopTagsByActivity AS (
+    SELECT
+        unnest(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><')) AS TagName,
+        COUNT(*) AS PostsCount,
+        SUM(p.ViewCount) AS TotalViews,
+        AVG(p.Score) AS AvgScore
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+    GROUP BY TagName
+    HAVING COUNT(*) > 50
+),
+TopAnswersForHotQuestions AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.CreationDate,
+        a.Score,
+        q.Title AS QuestionTitle,
+        q.Tags AS QuestionTags,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = a.Id) AS AnswerCommentsCount,
+        a.Body
+    FROM Posts a
+    JOIN Posts q ON q.Id = a.ParentId AND q.PostTypeId = 1
+    WHERE q.Score > 100 AND a.PostTypeId = 2
+),
+FinalOutput AS (
+    SELECT
+        u.DisplayName,
+        u.Reputation,
+        u.GoldBadges,
+        u.SilverBadges,
+        u.BronzeBadges,
+        u.QuestionsAsked,
+        u.AnswersGiven,
+        ROUND(u.AvgAnswerScore::numeric, 2) AS AvgAnswerScore,
+        cpm.Title AS TopPostTitle,
+        cpm.Score AS TopPostScore,
+        cpm.ScoreDiffPrev,
+        cpm.ScoreDiffNext,
+        cpm.BodyLength,
+        cpm.IsClosed,
+        ttba.TagName AS PopularTag,
+        ttba.PostsCount,
+        ttba.TotalViews,
+        ttba.AvgScore,
+        taq.AnswerId,
+        taq.QuestionTitle,
+        taq.AnswerCommentsCount
+    FROM UserRichness u
+    LEFT JOIN LATERAL (
+        SELECT cpm2.*
+        FROM ComplexPostMetrics cpm2
+        WHERE cpm2.OwnerUserId = u.UserId
+        ORDER BY cpm2.Score DESC NULLS LAST
+        LIMIT 1
+    ) cpm ON true
+    LEFT JOIN LATERAL (
+        SELECT ttba2.*
+        FROM TopTagsByActivity ttba2
+        ORDER BY ttba2.PostsCount DESC NULLS LAST
+        LIMIT 1
+    ) ttba ON true
+    LEFT JOIN LATERAL (
+        SELECT taq2.*
+        FROM TopAnswersForHotQuestions taq2
+        WHERE taq2.AnswerId IN (
+            SELECT p.Id FROM Posts p WHERE p.OwnerUserId = u.UserId
+        )
+        ORDER BY taq2.Score DESC NULLS LAST
+        LIMIT 1
+    ) taq ON true
+    WHERE u.Reputation > 1000
+    ORDER BY u.Reputation DESC
+    LIMIT 100
+)
+SELECT * FROM FinalOutput;

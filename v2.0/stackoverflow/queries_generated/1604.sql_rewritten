@@ -1,0 +1,196 @@
+-- {"query": "1604.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2906} 
+WITH UserContributionSummary AS (
+    -- Aggregates user-specific metrics: total posts, questions, answers, comments, and average scores for their posts.
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate AS UserLastAccessDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COALESCE(SUM(P.Score), 0) AS TotalPostScore,
+        COALESCE(AVG(P.Score) FILTER (WHERE P.PostTypeId = 1), 0.0) AS AvgQuestionScore,
+        COALESCE(AVG(P.Score) FILTER (WHERE P.PostTypeId = 2), 0.0) AS AvgAnswerScore,
+        COUNT(DISTINCT C.Id) AS TotalComments
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate
+),
+QuestionPerformance AS (
+    -- Provides detailed performance metrics for questions, including accepted answer info and history of edits/closures.
+    SELECT
+        Q.Id AS QuestionId,
+        Q.Title AS QuestionTitle,
+        Q.OwnerUserId AS QuestionOwnerUserId,
+        Q.ViewCount,
+        Q.Score AS QuestionScore,
+        Q.AnswerCount,
+        Q.FavoriteCount,
+        Q.CreationDate AS QuestionCreationDate,
+        Q.LastActivityDate AS QuestionLastActivityDate,
+        Q.ClosedDate,
+        A.Id AS AcceptedAnswerId,
+        A.Score AS AcceptedAnswerScore,
+        A.OwnerUserId AS AcceptedAnswerOwnerUserId,
+        COUNT(DISTINCT PH_Edit.Id) AS EditHistoryCount,
+        MAX(CASE WHEN PH_Close.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS IsClosedOnce,
+        MAX(CASE WHEN PH_Reopen.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS IsReopenedOnce,
+        COALESCE(MAX(CR.Name) FILTER (WHERE PH_Close.PostHistoryTypeId = 10), 'N/A') AS LastCloseReason
+    FROM Posts Q
+    LEFT JOIN Posts A ON Q.AcceptedAnswerId = A.Id AND A.PostTypeId = 2
+    LEFT JOIN PostHistory PH_Edit ON Q.Id = PH_Edit.PostId AND PH_Edit.PostHistoryTypeId IN (4, 5, 6, 8)
+    LEFT JOIN PostHistory PH_Close ON Q.Id = PH_Close.PostId AND PH_Close.PostHistoryTypeId = 10
+    LEFT JOIN CloseReasonTypes CR ON PH_Close.Comment = CR.Id::text -- Assuming Comment stores CloseReasonId as text
+    LEFT JOIN PostHistory PH_Reopen ON Q.Id = PH_Reopen.PostId AND PH_Reopen.PostHistoryTypeId = 11
+    WHERE Q.PostTypeId = 1 -- Only questions
+    GROUP BY
+        Q.Id, Q.Title, Q.OwnerUserId, Q.ViewCount, Q.Score, Q.AnswerCount, Q.FavoriteCount,
+        Q.CreationDate, Q.LastActivityDate, Q.ClosedDate, A.Id, A.Score, A.OwnerUserId
+),
+TopTagsPerUserRanked AS (
+    -- Identifies the top 3 most used tags by each user in their questions, using string parsing and ranking.
+    SELECT
+        UserId,
+        TagName,
+        TagCount,
+        ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY TagCount DESC, TagName ASC) as rn
+    FROM (
+        SELECT
+            P.OwnerUserId AS UserId,
+            UNNEST(string_to_array(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags) - 2), '><')) AS TagName,
+            COUNT(*) AS TagCount
+        FROM Posts P
+        WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL AND P.OwnerUserId IS NOT NULL
+        GROUP BY P.OwnerUserId, UNNEST(string_to_array(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags) - 2), '><'))
+    ) AS UserTagCounts
+),
+RecentHighValuePosts AS (
+    -- Combines high-scoring recent questions and answers using UNION ALL, categorizing them based on type and value.
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.OwnerUserId,
+        U.Reputation AS OwnerReputation,
+        'HighTrafficQuestion' AS PostCategory
+    FROM Posts P
+    JOIN Users U ON P.OwnerUserId = U.Id
+    WHERE P.PostTypeId = 1
+      AND P.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year')
+      AND P.ViewCount > 5000 AND P.Score > 50
+      AND P.OwnerUserId IS NOT NULL
+
+    UNION ALL
+
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.OwnerUserId,
+        U.Reputation AS OwnerReputation,
+        'HighImpactAnswer' AS PostCategory
+    FROM Posts P
+    JOIN Users U ON P.OwnerUserId = U.Id
+    WHERE P.PostTypeId = 2
+      AND P.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year')
+      AND P.Score > 100
+      AND P.OwnerUserId IS NOT NULL
+),
+UserBadgeAwards AS (
+    -- Summarizes badge information for each user, counting gold, silver, and bronze badges.
+    SELECT
+        B.UserId,
+        COUNT(B.Id) AS TotalBadges,
+        COUNT(CASE WHEN B.Class = 1 THEN B.Id END) AS GoldBadges,
+        COUNT(CASE WHEN B.Class = 2 THEN B.Id END) AS SilverBadges,
+        COUNT(CASE WHEN B.Class = 3 THEN B.Id END) AS BronzeBadges,
+        MAX(B.Date) AS LatestBadgeDate
+    FROM Badges B
+    GROUP BY B.UserId
+)
+SELECT
+    UCS.UserId,
+    UCS.DisplayName,
+    UCS.Reputation,
+    UCS.TotalPosts,
+    UCS.TotalQuestions,
+    UCS.TotalAnswers,
+    UCS.AvgQuestionScore,
+    UCS.AvgAnswerScore,
+    UBA.TotalBadges,
+    UBA.GoldBadges,
+    UBA.SilverBadges,
+    UBA.LatestBadgeDate,
+    Q.QuestionId,
+    Q.QuestionTitle,
+    Q.QuestionScore,
+    Q.ViewCount,
+    Q.AnswerCount,
+    Q.FavoriteCount,
+    Q.EditHistoryCount,
+    Q.IsClosedOnce,
+    Q.IsReopenedOnce,
+    Q.LastCloseReason,
+    Q.AcceptedAnswerId,
+    Q.AcceptedAnswerScore,
+    COALESCE(U_AccAns.DisplayName, 'N/A') AS AcceptedAnswerOwnerDisplayName,
+    TTU1.TagName AS TopTag1,
+    TTU1.TagCount AS TopTag1Count,
+    TTU2.TagName AS TopTag2,
+    TTU2.TagCount AS TopTag2Count,
+    TTU3.TagName AS TopTag3,
+    TTU3.TagCount AS TopTag3Count,
+    CASE
+        WHEN UCS.Reputation > 10000 AND UBA.GoldBadges > 5 THEN 'Legendary'
+        WHEN UCS.Reputation > 5000 AND UBA.SilverBadges > 10 THEN 'Expert'
+        WHEN UCS.TotalQuestions > 50 AND UCS.AvgQuestionScore > 10 THEN 'ProlificQuestioner'
+        WHEN UCS.TotalComments > 100 AND UCS.TotalPosts < 10 THEN 'HeavyCommenter'
+        ELSE 'ActiveContributor'
+    END AS UserInfluenceCategory,
+    COALESCE(U.Location, 'Unknown') AS UserLocation,
+    AVG(UCS.Reputation) OVER (PARTITION BY U.Location) AS AvgReputationInLocation,
+    RANK() OVER (PARTITION BY U.Location ORDER BY UCS.Reputation DESC) AS RankInLocationByReputation,
+    (SELECT COUNT(P_sub.Id) FROM Posts P_sub WHERE P_sub.OwnerUserId = UCS.UserId AND P_sub.CreationDate > (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '3 months')) AS PostsLast3Months,
+    (SELECT AVG(P_sub.Score) FROM Posts P_sub WHERE P_sub.PostTypeId = 2 AND P_sub.OwnerUserId = UCS.UserId AND P_sub.CreationDate > (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '6 months')) AS AvgAnswerScoreLast6Months,
+    -- Correlated Subquery: Checks if a user has any of their posts commented on with critical keywords in the last year.
+    EXISTS (
+        SELECT 1
+        FROM Comments C_corr
+        JOIN Posts P_corr ON C_corr.PostId = P_corr.Id
+        WHERE P_corr.OwnerUserId = UCS.UserId
+          AND C_corr.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year')
+          AND (LOWER(C_corr.Text) LIKE '%bug report%' OR LOWER(C_corr.Text) LIKE '%critical issue%' OR LOWER(C_corr.Text) LIKE '%needs clarification%')
+        LIMIT 1
+    ) AS HasCriticalCommentsOnOwnPosts,
+    FIRST_VALUE(Q.QuestionTitle) OVER (PARTITION BY UCS.UserId ORDER BY Q.QuestionScore DESC, Q.ViewCount DESC) AS TopQuestionByScore,
+    MAX(Q.QuestionLastActivityDate) OVER (PARTITION BY UCS.UserId) AS LatestPostActivityForUser,
+    -- String manipulations and NULL logic for a formatted user identifier.
+    COALESCE(UPPER(SUBSTRING(U.DisplayName FROM 1 FOR 1)) || LPAD(COALESCE(TO_CHAR(U.AccountId), '0'), 7, '0'), 'ANONYMOUS_' || UCS.UserId::text) AS UserIdentifierHash,
+    CASE WHEN Q.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS QuestionStatus,
+    COALESCE(RHP.PostCategory, 'NoRecentHighValueMatch') AS RecentPostCategory,
+    -- Non-correlated subqueries for bounty statistics.
+    (SELECT SUM(V.BountyAmount) FROM Votes V WHERE V.UserId = UCS.UserId AND V.VoteTypeId = 8) AS TotalBountyGiven,
+    (SELECT SUM(V.BountyAmount) FROM Votes V JOIN Posts P_bounty ON V.PostId = P_bounty.Id WHERE P_bounty.OwnerUserId = UCS.UserId AND V.VoteTypeId = 9) AS TotalBountyReceived,
+    EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - UCS.UserCreationDate))/3600/24/365.25 AS YearsSinceRegistration
+FROM UserContributionSummary UCS
+LEFT JOIN Users U ON UCS.UserId = U.Id
+LEFT JOIN UserBadgeAwards UBA ON UCS.UserId = UBA.UserId
+LEFT JOIN QuestionPerformance Q ON UCS.UserId = Q.QuestionOwnerUserId
+LEFT JOIN Users U_AccAns ON Q.AcceptedAnswerOwnerUserId = U_AccAns.Id -- Join for the accepted answer owner's display name
+LEFT JOIN TopTagsPerUserRanked TTU1 ON UCS.UserId = TTU1.UserId AND TTU1.rn = 1
+LEFT JOIN TopTagsPerUserRanked TTU2 ON UCS.UserId = TTU2.UserId AND TTU2.rn = 2
+LEFT JOIN TopTagsPerUserRanked TTU3 ON UCS.UserId = TTU3.UserId AND TTU3.rn = 3
+LEFT JOIN RecentHighValuePosts RHP ON Q.QuestionId = RHP.PostId -- Joins questions from Q to questions in RHP
+WHERE UCS.TotalPosts > 0
+  AND (UCS.Reputation > 500 OR UCS.TotalQuestions > 5 OR UCS.TotalAnswers > 10)
+  AND (U.Location IS NOT NULL OR UCS.DisplayName IS NOT NULL)
+  AND Q.QuestionTitle IS NOT NULL
+ORDER BY UCS.Reputation DESC, LatestPostActivityForUser DESC, UCS.UserId ASC
+LIMIT 1000;

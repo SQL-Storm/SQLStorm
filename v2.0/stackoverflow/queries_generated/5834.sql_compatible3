@@ -1,0 +1,119 @@
+WITH recent_activity AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.OwnerUserId,
+    p.ViewCount,
+    p.Score,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.Body,
+    p.ContentLicense,
+    u.Reputation,
+    u.DisplayName AS OwnerDisplayName,
+    u.Location,
+    u.CreationDate AS UserCreationDate,
+    u.LastAccessDate AS UserLastAccessDate,
+    b.Name AS BadgeName,
+    b.Class AS BadgesClass,
+    b.Date AS BadgeDate,
+    v.TotalUp AS UpVotesFromVotes
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  LEFT JOIN (
+    SELECT
+      V.PostId,
+      SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUp
+    FROM Votes V
+    GROUP BY V.PostId
+  ) v ON v.PostId = p.Id
+  WHERE p.PostTypeId IN (1, 2)
+    AND p.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90' DAY)
+),
+tag_stats AS (
+  SELECT
+    tag.TagName,
+    COUNT(*) AS TagPostCount,
+    AVG(p.Score) AS AvgPostScore,
+    SUM(p.ViewCount) AS TotalViews,
+    MAX(p.LastActivityDate) AS LastActiveTagPost
+  FROM Posts p
+  -- split tags like "<tag1><tag2>" into rows in a portable way using regexp functions
+  CROSS JOIN LATERAL (
+    SELECT m[1] AS TagName
+    FROM regexp_matches(p.Tags, '<([^>]+)>', 'g') AS m
+  ) tag
+  GROUP BY tag.TagName
+),
+correlated_extras AS (
+  SELECT
+    ra.PostId,
+    ra.Title,
+    ra.Tags,
+    ra.OwnerUserId,
+    ra.Reputation,
+    ra.OwnerDisplayName,
+    ra.Body,
+    ra.ViewCount,
+    ra.Score,
+    ra.CommentCount,
+    ra.AnswerCount,
+    ra.FavoriteCount,
+    ra.LastActivityDate,
+    ra.ContentLicense,
+    ROW_NUMBER() OVER (PARTITION BY ra.OwnerUserId ORDER BY ra.LastActivityDate DESC) AS rn
+  FROM recent_activity ra
+)
+SELECT
+  ce.PostId,
+  ce.Title,
+  ce.Tags,
+  ce.OwnerDisplayName,
+  ce.Reputation,
+  ce.LastActivityDate,
+  ce.ViewCount,
+  ce.Score,
+  ce.CommentCount,
+  ce.AnswerCount,
+  ce.FavoriteCount,
+  ce.Body,
+  ce.ContentLicense,
+  ts.TagName,
+  ts.TagPostCount,
+  ts.AvgPostScore,
+  ts.TotalViews,
+  ts.LastActiveTagPost
+FROM correlated_extras ce
+LEFT JOIN tag_stats ts ON TRUE
+WHERE ce.rn = 1
+  OR ce.LastActivityDate = (
+    SELECT MAX(r2.LastActivityDate) FROM recent_activity r2
+  )
+GROUP BY
+  ce.PostId,
+  ce.Title,
+  ce.Tags,
+  ce.OwnerDisplayName,
+  ce.Reputation,
+  ce.LastActivityDate,
+  ce.ViewCount,
+  ce.Score,
+  ce.CommentCount,
+  ce.AnswerCount,
+  ce.FavoriteCount,
+  ce.Body,
+  ce.ContentLicense,
+  ts.TagName,
+  ts.TagPostCount,
+  ts.AvgPostScore,
+  ts.TotalViews,
+  ts.LastActiveTagPost,
+  ce.rn
+ORDER BY ce.LastActivityDate DESC
+LIMIT 200;

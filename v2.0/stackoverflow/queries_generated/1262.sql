@@ -1,0 +1,187 @@
+-- {"query": "1262.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3136} 
+
+WITH UserEngagementStats AS (
+    -- CTE 1: Aggregates various user activities: total posts, comments, votes given, last access, and badge counts.
+    -- Uses LEFT JOIN to ensure all users are included, even if they have no related activities.
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.Views AS UserViews,
+        COALESCE(SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END), 0) AS TotalQuestions,
+        COALESCE(SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END), 0) AS TotalAnswers,
+        COALESCE(COUNT(DISTINCT P.Id), 0) AS TotalPosts,
+        COALESCE(COUNT(DISTINCT C.Id), 0) AS TotalComments,
+        COALESCE(SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS TotalUpVotesGiven, -- Votes given by user
+        COALESCE(SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS TotalDownVotesGiven, -- Votes given by user
+        MAX(COALESCE(P.LastActivityDate, C.CreationDate, U.LastAccessDate)) AS LastUserActivity, -- NULL logic with COALESCE
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Votes V ON U.Id = V.UserId -- Votes given by the user
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.Views
+),
+PostDetailsExtended AS (
+    -- CTE 2: Detailed post metrics including first tag extraction, content analysis, score ratios, and comment scores.
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.AcceptedAnswerId,
+        P.ClosedDate,
+        P.LastEditDate,
+        P.LastActivityDate,
+        P.Title,
+        P.Body,
+        -- String expression: Extract the first tag from the Tags column (e.g., "<tag1><tag2>" -> "tag1"). NULLIF handles empty strings.
+        NULLIF(SUBSTRING(P.Tags, 2, POSITION('>' IN P.Tags) - 2), '') AS FirstTag,
+        LENGTH(P.Body) AS BodyLength, -- String expression: Length of the post body.
+        -- Complicated calculation: Score-to-view ratio, using NULLIF for divide-by-zero prevention.
+        ROUND(CAST(P.Score AS NUMERIC) / NULLIF(P.ViewCount, 0) * 100, 2) AS ScoreViewRatio,
+        -- NULL logic and conditional expression: Does this post have an accepted answer?
+        (P.AcceptedAnswerId IS NOT NULL) AS HasAcceptedAnswer,
+        -- Correlated subquery: Calculate average score of comments specifically on *this* post.
+        (SELECT AVG(C.Score) FROM Comments C WHERE C.PostId = P.Id AND C.Score IS NOT NULL) AS AvgCommentScoreOnPost,
+        -- Window function: Rank posts by score within their PostType, ordered by creation date.
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.CreationDate DESC) AS PostTypeScoreRank
+    FROM Posts P
+    WHERE P.OwnerUserId IS NOT NULL -- Exclude community-owned posts or deleted user posts for this analysis
+),
+PostHistoryAggregates AS (
+    -- CTE 3: Aggregates post history events, focusing on edits, closes, reopens, and migrations for each post.
+    SELECT
+        PH.PostId,
+        COUNT(DISTINCT PH.Id) AS TotalHistoryEvents,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditCount, -- Title, Body, Tags edits
+        SUM(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (35, 36) THEN 1 ELSE 0 END) AS MigrationCount
+    FROM PostHistory PH
+    WHERE PH.PostHistoryTypeId IN (4,5,6,10,11,35,36) -- Filter for relevant history types
+    GROUP BY PH.PostId
+),
+UserTagUsage AS (
+    -- CTE 4: Aggregates distinct first tags used by each user across their questions.
+    SELECT
+        P.OwnerUserId AS UserId,
+        COUNT(DISTINCT NULLIF(SUBSTRING(P.Tags, 2, POSITION('>' IN P.Tags) - 2), '')) AS DistinctFirstTagsUsed,
+        STRING_AGG(DISTINCT NULLIF(SUBSTRING(P.Tags, 2, POSITION('>' IN P.Tags) - 2), ''), ', ') AS AllFirstTagsUsed -- String expression: Concatenates all distinct first tags
+    FROM Posts P
+    WHERE P.OwnerUserId IS NOT NULL AND P.Tags IS NOT NULL AND P.PostTypeId = 1 -- Only questions for tag usage
+    GROUP BY P.OwnerUserId
+),
+HighImpactPosts AS (
+    -- CTE 5: Identifies "high impact" posts using a set operator (UNION ALL).
+    -- Criteria: Posts that were closed AND subsequently reopened, OR posts with exceptionally high scores, OR posts with many favorites.
+    SELECT PD.PostId, PD.OwnerUserId, PD.Title, PD.Score, PD.PostTypeScoreRank
+    FROM PostDetailsExtended PD
+    JOIN PostHistoryAggregates PHA ON PD.PostId = PHA.PostId
+    WHERE (PHA.CloseCount > 0 AND PHA.ReopenCount > 0) -- Closed and reopened
+       OR (PD.Score > (SELECT AVG(Score) * 5 FROM Posts WHERE Score IS NOT NULL AND PostTypeId = 1)) -- Non-correlated subquery: Very high score compared to average
+    UNION ALL -- Set operator: Combines results from two different criteria.
+    SELECT PD.PostId, PD.OwnerUserId, PD.Title, PD.Score, PD.PostTypeScoreRank
+    FROM PostDetailsExtended PD
+    WHERE PD.FavoriteCount > (SELECT AVG(FavoriteCount) * 3 FROM Posts WHERE FavoriteCount IS NOT NULL AND PostTypeId = 1) -- Non-correlated subquery: Many favorites compared to average
+)
+-- Main Query: Selects "Elite Developers" and provides a comprehensive profile based on their activity and post performance.
+SELECT
+    UES.UserId,
+    UES.DisplayName,
+    UES.Reputation,
+    -- Complicated predicate/expression: Categorizes users into reputation tiers using CASE WHEN.
+    CASE
+        WHEN UES.Reputation >= 100000 THEN 'Legendary'
+        WHEN UES.Reputation >= 25000 THEN 'Elite'
+        WHEN UES.Reputation >= 5000 THEN 'Veteran'
+        ELSE 'Active Contributor'
+    END AS ReputationTier,
+    UES.UserCreationDate,
+    UES.TotalPosts,
+    UES.TotalQuestions,
+    UES.TotalAnswers,
+    UES.TotalComments,
+    UES.LastUserActivity,
+    UES.GoldBadges,
+    UES.SilverBadges,
+    UES.BronzeBadges,
+    -- Average ScoreViewRatio across all user's posts.
+    ROUND(AVG(PDE.ScoreViewRatio), 2) AS AveragePostScoreViewRatio,
+    -- Correlated subquery: Calculates the average score of comments made BY this user.
+    (SELECT ROUND(AVG(C.Score), 2) FROM Comments C WHERE C.UserId = UES.UserId AND C.Score IS NOT NULL) AS UserAvgCommentScore,
+    -- Correlated subquery with window function (LAG): Calculates the time difference between the user's two most recent posts.
+    (
+        SELECT AGE(MAX(p_lag.CreationDate), MIN(p_lag.CreationDate))
+        FROM (
+            SELECT
+                p_inner.CreationDate,
+                ROW_NUMBER() OVER (PARTITION BY p_inner.OwnerUserId ORDER BY p_inner.CreationDate DESC) AS rn
+            FROM Posts p_inner
+            WHERE p_inner.OwnerUserId = UES.UserId
+        ) AS p_lag
+        WHERE p_lag.rn <= 2
+        GROUP BY p_lag.OwnerUserId
+        HAVING COUNT(p_lag.CreationDate) >= 2
+    ) AS TimeBetweenLastTwoPosts,
+    UTA.DistinctFirstTagsUsed,
+    UTA.AllFirstTagsUsed,
+    -- Details of the user's highest-scored question (uses PostTypeScoreRank from PDE CTE).
+    MAX(CASE WHEN PDE.PostTypeId = 1 AND PDE.PostTypeScoreRank = 1 THEN PDE.Title END) AS TopQuestionTitle,
+    MAX(CASE WHEN PDE.PostTypeId = 1 AND PDE.PostTypeScoreRank = 1 THEN PDE.Score END) AS TopQuestionScore,
+    -- Complicated calculation: Counts posts where the body length is above the average for that specific PostType.
+    SUM(CASE WHEN PDE.BodyLength > (SELECT AVG(BodyLength) FROM PostDetailsExtended WHERE PostTypeId = PDE.PostTypeId AND BodyLength IS NOT NULL) THEN 1 ELSE 0 END) AS AboveAvgBodyLengthPosts,
+    -- Count of posts identified as "high impact" from the HighImpactPosts CTE.
+    COUNT(DISTINCT HIP.PostId) AS CountOfHighImpactPosts,
+    -- Complicated NULL logic/predicate: Counts recent questions (last 30 days) by the user that have a score of 0 (potentially ignored).
+    SUM(CASE WHEN PDE.PostTypeId = 1 AND PDE.Score = 0 AND PDE.CreationDate > NOW() - INTERVAL '30 days' THEN 1 ELSE 0 END) AS UnansweredRecentQuestionsCount,
+    -- Total count of upvotes and downvotes received on their posts.
+    COALESCE(SUM(PostVotesReceived.UpVotesReceived), 0) AS TotalPostUpVotesReceived,
+    COALESCE(SUM(PostVotesReceived.DownVotesReceived), 0) AS TotalPostDownVotesReceived,
+    -- Correlated subquery: Identifies the user who most frequently edited any of this user's posts.
+    (
+        SELECT U_Editor.DisplayName
+        FROM PostHistory PH_Inner
+        JOIN Posts P_Inner ON PH_Inner.PostId = P_Inner.Id
+        LEFT JOIN Users U_Editor ON PH_Inner.UserId = U_Editor.Id
+        WHERE P_Inner.OwnerUserId = UES.UserId
+        AND PH_Inner.PostHistoryTypeId IN (4,5,6) -- Only consider edit types
+        GROUP BY U_Editor.DisplayName
+        ORDER BY COUNT(*) DESC, U_Editor.DisplayName ASC
+        LIMIT 1
+    ) AS MostFrequentEditorOfAnyUserPost
+FROM UserEngagementStats UES
+LEFT JOIN PostDetailsExtended PDE ON UES.UserId = PDE.OwnerUserId
+LEFT JOIN PostHistoryAggregates PHA ON PDE.PostId = PHA.PostId
+LEFT JOIN UserTagUsage UTA ON UES.UserId = UTA.UserId
+LEFT JOIN HighImpactPosts HIP ON UES.UserId = HIP.OwnerUserId
+-- Nested LEFT JOIN for votes received on posts, aggregated per post.
+LEFT JOIN (
+    SELECT V.PostId,
+           SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+           SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived
+    FROM Votes V
+    GROUP BY V.PostId
+) AS PostVotesReceived ON PDE.PostId = PostVotesReceived.PostId
+WHERE UES.Reputation > 1000 -- Initial filter for somewhat influential users
+AND UES.TotalPosts > 10 -- And active users
+-- Complex final predicate: Users must have at least one Gold badge OR (more than 50 questions AND an average ScoreViewRatio > 1.5).
+AND (UES.GoldBadges > 0
+     OR (UES.TotalQuestions > 50 AND (SELECT AVG(ScoreViewRatio) FROM PostDetailsExtended WHERE OwnerUserId = UES.UserId) > 1.5))
+GROUP BY
+    UES.UserId, UES.DisplayName, UES.Reputation, UES.UserCreationDate, UES.TotalPosts,
+    UES.TotalQuestions, UES.TotalAnswers, UES.TotalComments, UES.LastUserActivity,
+    UES.GoldBadges, UES.SilverBadges, UES.BronzeBadges, UTA.DistinctFirstTagsUsed, UTA.AllFirstTagsUsed
+HAVING COUNT(DISTINCT PDE.PostId) > 0 -- Ensure only users with at least one processed post are included in the final result.
+ORDER BY UES.Reputation DESC, AveragePostScoreViewRatio DESC
+LIMIT 500;

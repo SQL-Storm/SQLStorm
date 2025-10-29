@@ -1,0 +1,108 @@
+WITH UserStats AS (
+    SELECT u.Id,
+           u.DisplayName,
+           u.Reputation,
+           COUNT(b.Id) FILTER (WHERE b.Class = 1)          AS GoldBadges,
+           COUNT(b.Id) FILTER (WHERE b.Class = 2)          AS SilverBadges,
+           COUNT(b.Id) FILTER (WHERE b.Class = 3)          AS BronzeBadges,
+           SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS TotalQuestionScore,
+           SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS TotalAnswerScore,
+           COUNT(*) FILTER (WHERE p.PostTypeId = 1)        AS QuestionCount,
+           COUNT(*) FILTER (WHERE p.PostTypeId = 2)        AS AnswerCount
+    FROM Users u
+    LEFT JOIN Badges b   ON b.UserId = u.Id
+    LEFT JOIN Posts  p   ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+RecentActivity AS (
+    SELECT ua.Id,
+           GREATEST(
+               COALESCE((SELECT MAX(CreationDate) FROM Posts    WHERE OwnerUserId = ua.Id), TIMESTAMP '1970-01-01'),
+               COALESCE((SELECT MAX(CreationDate) FROM Comments WHERE UserId      = ua.Id), TIMESTAMP '1970-01-01'),
+               COALESCE((SELECT MAX(CreationDate) FROM Votes    WHERE UserId      = ua.Id), TIMESTAMP '1970-01-01')
+           ) AS LastActivity
+    FROM UserStats ua
+),
+ClosedQuestions AS (
+    SELECT ph.PostId,
+           MIN(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) AS ClosedDate,
+           MIN(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Comment END)      AS CloseReasonId
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.PostId
+),
+TagUsage AS (
+    SELECT p.OwnerUserId AS UserId,
+           UNNEST(string_to_array(trim(both '<>' FROM p.Tags), '><')) AS Tag,
+           COUNT(*) AS TagPosts
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+    GROUP BY p.OwnerUserId, Tag
+),
+TopTags AS (
+    SELECT UserId,
+           STRING_AGG(Tag || ':' || TagPosts, ', ' ORDER BY TagPosts DESC) AS TopTagInfo
+    FROM (
+        SELECT tu.*,
+               ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY TagPosts DESC) AS rn
+        FROM TagUsage tu
+    ) t
+    WHERE rn <= 5
+    GROUP BY UserId
+),
+MainRows AS (
+SELECT
+    us.Id,
+    us.DisplayName,
+    us.Reputation,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    us.QuestionCount,
+    us.AnswerCount,
+    ROUND(CAST(us.TotalQuestionScore AS numeric) / NULLIF(us.QuestionCount,0), 2) AS AvgQuestionScore,
+    ROUND(CAST(us.TotalAnswerScore AS numeric) / NULLIF(us.AnswerCount,0), 2)   AS AvgAnswerScore,
+    ra.LastActivity,
+    COALESCE(cq.ClosedDate, TIMESTAMP '1970-01-01')                     AS LastClosedQuestionDate,
+    COALESCE(cr.Name, 'None')                                          AS LastCloseReason,
+    tt.TopTagInfo
+FROM UserStats us
+LEFT JOIN RecentActivity ra ON ra.Id = us.Id
+LEFT JOIN (
+    SELECT p.OwnerUserId AS OwnerUserId,
+           MAX(cq.ClosedDate)                     AS ClosedDate,
+           cq.CloseReasonId
+    FROM Posts p
+    JOIN ClosedQuestions cq ON cq.PostId = p.Id
+    WHERE p.PostTypeId = 1
+    GROUP BY p.OwnerUserId, cq.CloseReasonId
+) cq ON cq.OwnerUserId = us.Id
+LEFT JOIN CloseReasonTypes cr ON cr.Id = cq.CloseReasonId
+LEFT JOIN TopTags tt ON tt.UserId = us.Id
+WHERE us.Reputation > 10000
+)
+
+SELECT * FROM MainRows
+ORDER BY Reputation DESC NULLS LAST, GoldBadges DESC NULLS LAST
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    NULL::bigint                AS Id,
+    '--- Summary ---'            AS DisplayName,
+    NULL::integer               AS Reputation,
+    NULL::integer               AS GoldBadges,
+    NULL::integer               AS SilverBadges,
+    NULL::integer               AS BronzeBadges,
+    SUM(us.QuestionCount)       AS QuestionCount,
+    SUM(us.AnswerCount)         AS AnswerCount,
+    NULL::numeric               AS AvgQuestionScore,
+    NULL::numeric               AS AvgAnswerScore,
+    MAX(ra.LastActivity)        AS LastActivity,
+    NULL::timestamp             AS LastClosedQuestionDate,
+    NULL::text                  AS LastCloseReason,
+    NULL::text                  AS TopTagInfo
+FROM UserStats us
+JOIN RecentActivity ra ON ra.Id = us.Id
+WHERE us.Reputation > 10000;

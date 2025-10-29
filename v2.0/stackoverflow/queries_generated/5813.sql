@@ -1,0 +1,120 @@
+-- {"query": "5813.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 832} 
+WITH
+TopTags AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS PostCount,
+    AVG(p.Score) AS AvgScore,
+    SUM(p.ViewCount) AS TotalViews,
+    MAX(p.CreationDate) AS LastCreated
+  FROM Posts p
+  JOIN Posts tpost ON p.Id = tpost.ParentId -- unlikely; instead inner join on tag data via Tags is not direct; use Tags table to map tag to a tag entry
+  JOIN Tags t ON t.Id = t.ExcerptPostId OR t.Id = t.WikiPostId -- fallback mapping for tag associations
+  WHERE p.PostTypeId = 1
+    AND t.TagName IS NOT NULL
+    AND t.IsModeratorOnly = 0
+  GROUP BY t.TagName
+),
+RecentQualified AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.Tags,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.OwnerUserId,
+    COALESCE(v.Count, 0) AS VoteCount
+  FROM Posts p
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS Count
+    FROM Votes
+    WHERE VoteTypeId IN (2, 3) -- up and down votes
+    GROUP BY PostId
+  ) v ON v.PostId = p.Id
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate > NOW() - INTERVAL '30 days'
+),
+UserRank AS (
+  SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS RevRank
+  FROM Users u
+  WHERE u.Reputation IS NOT NULL
+),
+ComplexFilter AS (
+  SELECT
+    rp.Id AS PostId,
+    rp.Title,
+    rp.Tags,
+    rp.CreationDate,
+    rp.Score,
+    rp.ViewCount,
+    u.Id AS OwnerUserId,
+    u.DisplayName AS OwnerName,
+    u.Reputation,
+    CASE
+      WHEN w.Action IS NULL THEN 0
+      ELSE w.Action
+    END AS WindowAction
+  FROM RecentQualified rp
+  JOIN Users u ON u.Id = rp.OwnerUserId
+  LEFT JOIN (
+    SELECT
+      PostId,
+      MAX(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoted,
+      MAX(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoted,
+      1 AS Action
+    FROM Votes
+    GROUP BY PostId
+  ) w ON w.PostId = rp.Id
+  WHERE rp.ViewCount > 100 AND rp.Score >= -5
+),
+FinalCompute AS (
+  SELECT
+    cf.PostId,
+    cf.Title,
+    cf.Tags,
+    cf.CreationDate,
+    cf.Score,
+    cf.ViewCount,
+    cf.OwnerUserId,
+    cf.OwnerName,
+    cf.Reputation,
+    cf.WindowAction,
+    CASE
+      WHEN cf.Reputation IS NULL THEN 0
+      ELSE cf.Reputation * 0.5 + cf.Score * 1.2 + cf.ViewCount * 0.001
+    END AS BenchmarkScore
+  FROM ComplexFilter cf
+),
+Aggregates AS (
+  SELECT
+    ft.TagName,
+    ft.PostCount,
+    ft.AvgScore,
+    ft.TotalViews,
+    ft.LastCreated
+  FROM TopTags ft
+),
+Ranked AS (
+  SELECT
+    fc.*,
+    ROW_NUMBER() OVER (ORDER BY fc.BenchmarkScore DESC, fc.CreationDate DESC) AS RN
+  FROM FinalCompute fc
+)
+SELECT
+  r.PostId,
+  r.Title,
+  r.Tags,
+  r.OwnerName,
+  r.Reputation,
+  r.Score,
+  r.ViewCount,
+  r.BenchmarkScore,
+  r.RN
+FROM Ranked r
+WHERE r.RN <= 100
+ORDER BY r.BenchmarkScore DESC, r.RN ASC;

@@ -1,0 +1,168 @@
+with RecursiveTagCounts as (
+  select
+    t.TagName,
+    t.Count,
+    coalesce(p.AnswerCount, 0) as AnswerCount,
+    p.ViewCount,
+    p.Score,
+    p.Id as PostId
+  from Tags t
+  left join Posts p on p.Id = t.ExcerptPostId and p.PostTypeId = 1
+),
+UserBadgeStats as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    count(case when b.Class = 1 then 1 end) as GoldBadges,
+    count(case when b.Class = 2 then 1 end) as SilverBadges,
+    count(case when b.Class = 3 then 1 end) as BronzeBadges,
+    avg(case when b.TagBased = 0 then b.Class end) as AvgBadgeClass,
+    max(b.Date) as LastBadgeDate
+  from Users u
+  left join Badges b on b.UserId = u.Id
+  group by u.Id, u.DisplayName
+),
+PostActivityWindow as (
+  select
+    p.Id,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.CreationDate,
+    row_number() over (partition by p.OwnerUserId order by p.CreationDate) as UserPostRank,
+    lag(p.Score) over (partition by p.OwnerUserId order by p.CreationDate) as PrevScore,
+    lead(p.Score) over (partition by p.OwnerUserId order by p.CreationDate) as NextScore
+  from Posts p
+  where p.OwnerUserId is not null
+),
+ClosedQuestionsWithReasons as (
+  select
+    ph.PostId,
+    cr.Name as CloseReason,
+    ph.CreationDate as CloseDate,
+    ph.UserId as ClosedByUserId,
+    u.DisplayName as ClosedByUser
+  from PostHistory ph
+  join CloseReasonTypes cr on cr.Id = cast(ph.Comment as integer) -- stored close reason id as text in Comment
+  left join Users u on u.Id = ph.UserId
+  where ph.PostHistoryTypeId = 10
+),
+AnswersWithParentInfo as (
+  select
+    a.Id,
+    a.ParentId,
+    q.Title as QuestionTitle,
+    q.Tags,
+    q.OwnerUserId as QuestionOwner,
+    a.Score,
+    a.CreationDate,
+    a.OwnerUserId,
+    case when a.CreationDate < q.CreationDate + interval '1 day' then 1 else 0 end as AnsweredWithin1Day
+  from Posts a
+  join Posts q on q.Id = a.ParentId and q.PostTypeId = 1
+  where a.PostTypeId = 2
+),
+UserActivitySummary as (
+  select
+    u.Id,
+    u.DisplayName,
+    count(case when p.PostTypeId = 1 then 1 end) as QuestionCount,
+    count(case when p.PostTypeId = 2 then 1 end) as AnswerCount,
+    sum(case when p.PostTypeId in (1,2) then p.Score else 0 end) as TotalScore,
+    max(p.CreationDate) as LastPostDate,
+    count(distinct c.Id) as CommentCount,
+    sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotesReceived,
+    sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotesReceived
+  from Users u
+  left join Posts p on p.OwnerUserId = u.Id
+  left join Comments c on c.UserId = u.Id
+  left join Votes v on v.PostId = p.Id
+  group by u.Id, u.DisplayName
+)
+
+select
+  r.TagName,
+  r.Count as TagUseCount,
+  r.ViewCount,
+  r.Score as TagExcerptScore,
+  r.AnswerCount as TagExcerptAnswerCount,
+  u.DisplayName as TopUserForTag,
+  u.Reputation,
+  ubs.GoldBadges,
+  ubs.SilverBadges,
+  ubs.BronzeBadges,
+  ubs.AvgBadgeClass,
+  ca.CloseReason,
+  ca.CloseDate,
+  ca.ClosedByUser,
+  a.AnsweredWithin1Day,
+  uas.QuestionCount,
+  uas.AnswerCount,
+  uas.TotalScore,
+  uas.CommentCount,
+  uas.UpVotesReceived,
+  uas.DownVotesReceived
+from RecursiveTagCounts r
+left join lateral (
+  select u.Id, u.DisplayName, u.Reputation
+  from Users u
+  join Posts p2 on p2.OwnerUserId = u.Id and p2.Tags like ('%' || '<' || r.TagName || '>' || '%')
+  order by u.Reputation desc nulls last
+  limit 1
+) u on true
+left join UserBadgeStats ubs on ubs.UserId = u.Id
+left join ClosedQuestionsWithReasons ca on ca.PostId = r.PostId
+left join AnswersWithParentInfo a on a.ParentId = r.PostId
+left join UserActivitySummary uas on uas.Id = r.PostId
+where r.Count > 1000
+
+union
+
+select
+  t.TagName,
+  t.Count,
+  null, null, null,
+  null, null, null, null, null,
+  null, null, null,
+  null, null, null, null, null, null
+from Tags t
+where t.IsModeratorOnly = 1
+
+except
+
+select
+  r.TagName,
+  r.Count,
+  r.ViewCount,
+  r.Score,
+  r.AnswerCount,
+  u.DisplayName,
+  u.Reputation,
+  ubs.GoldBadges,
+  ubs.SilverBadges,
+  ubs.BronzeBadges,
+  ubs.AvgBadgeClass,
+  ca.CloseReason,
+  ca.CloseDate,
+  ca.ClosedByUser,
+  a.AnsweredWithin1Day,
+  uas.QuestionCount,
+  uas.AnswerCount,
+  uas.TotalScore,
+  uas.CommentCount,
+  uas.UpVotesReceived,
+  uas.DownVotesReceived
+from RecursiveTagCounts r
+left join lateral (
+  select u.Id, u.DisplayName, u.Reputation
+  from Users u
+  join Posts p2 on p2.OwnerUserId = u.Id and p2.Tags like ('%' || '<' || r.TagName || '>' || '%')
+  order by u.Reputation desc nulls last
+  limit 1
+) u on true
+left join UserBadgeStats ubs on ubs.UserId = u.Id
+left join ClosedQuestionsWithReasons ca on ca.PostId = r.PostId
+left join AnswersWithParentInfo a on a.ParentId = r.PostId
+left join UserActivitySummary uas on uas.Id = r.PostId
+where r.Count <= 1000
+order by TagUseCount desc, Reputation desc nulls last
+limit 100;

@@ -1,0 +1,262 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS UpvoteCount,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS DownvoteCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        AVG(p.Score) AS AvgScore,
+        STRING_AGG(DISTINCT t.TagName, ', ') AS Tags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN Tags t ON p.Tags LIKE '%' || t.TagName || '%'
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes
+),
+TopUsers AS (
+    SELECT 
+        us.UserId,
+        us.Reputation,
+        us.DisplayName,
+        us.PostCount,
+        us.QuestionCount,
+        us.AnswerCount,
+        us.BadgeCount,
+        us.UpvoteCount,
+        us.DownvoteCount,
+        us.LastPostDate,
+        us.AvgScore,
+        us.Tags,
+        ROW_NUMBER() OVER (ORDER BY us.Reputation DESC, us.PostCount DESC) AS RankByReputation,
+        ROW_NUMBER() OVER (ORDER BY us.PostCount DESC, us.Reputation DESC) AS RankByPostCount,
+        DENSE_RANK() OVER (ORDER BY us.AvgScore DESC) AS RankByAvgScore
+    FROM UserStats us
+    LEFT JOIN Posts p ON us.UserId = p.OwnerUserId
+    WHERE p.CreationDate >= DATE '2022-01-01'
+    GROUP BY us.UserId, us.Reputation, us.DisplayName, us.PostCount, us.QuestionCount, us.AnswerCount, us.BadgeCount, us.UpvoteCount, us.DownvoteCount, us.LastPostDate, us.AvgScore, us.Tags
+),
+QuestionAnalysis AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.CommentCount,
+        q.CreationDate,
+        q.OwnerUserId,
+        q.Tags,
+        STRING_AGG(DISTINCT CASE WHEN a.Score > 0 THEN CAST(a.OwnerUserId AS VARCHAR) END, ', ') AS PositiveAnswerAuthors,
+        COUNT(DISTINCT a.Id) AS TotalAnswerCount,
+        AVG(a.Score) AS AvgAnswerScore,
+        MAX(a.Score) AS MaxAnswerScore,
+        MIN(a.CreationDate) AS FirstAnswerDate,
+        MAX(a.CreationDate) AS LastAnswerDate,
+        COUNT(DISTINCT CASE WHEN a.OwnerUserId IS NOT NULL THEN a.OwnerUserId END) AS AnswerAuthorCount,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = q.Id) AS CommentCountOnQuestion,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = q.Id AND v.VoteTypeId = 2) AS UpvoteCountOnQuestion,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = q.Id AND v.VoteTypeId = 3) AS DownvoteCountOnQuestion,
+        (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = q.Id AND ph.PostHistoryTypeId IN (10, 11, 12, 13)) AS HistoryActionCount
+    FROM Posts q
+    LEFT JOIN Posts a ON q.Id = a.ParentId AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+        AND q.ViewCount > 1000
+        AND q.CreationDate >= DATE '2022-01-01'
+    GROUP BY q.Id, q.Title, q.Score, q.ViewCount, q.AnswerCount, q.CommentCount, q.CreationDate, q.OwnerUserId, q.Tags
+),
+DetailedUserAnalysis AS (
+    SELECT 
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.PostCount,
+        tu.QuestionCount,
+        tu.AnswerCount,
+        tu.BadgeCount,
+        tu.UpvoteCount,
+        tu.DownvoteCount,
+        tu.LastPostDate,
+        ROUND(CAST(tu.AvgScore AS NUMERIC), 2) AS AvgScore,
+        tu.Tags,
+        tu.RankByReputation,
+        tu.RankByPostCount,
+        tu.RankByAvgScore,
+        CASE WHEN tu.RankByReputation <= 10 THEN 'Top 10 Reputation' 
+             WHEN tu.RankByPostCount <= 20 THEN 'Top 20 Post Count' 
+             ELSE 'Other' END AS UserTier,
+        (CASE 
+            WHEN tu.Reputation >= 100000 THEN 'Legend'
+            WHEN tu.Reputation >= 50000 THEN 'Master'
+            WHEN tu.Reputation >= 10000 THEN 'Expert'
+            WHEN tu.Reputation >= 1000 THEN 'Beginner'
+            ELSE 'Newbie'
+        END) AS RepLevel,
+        (CASE 
+            WHEN tu.PostCount >= 100 THEN 'Elite'
+            WHEN tu.PostCount >= 50 THEN 'Veteran'
+            WHEN tu.PostCount >= 10 THEN 'Enthusiast'
+            ELSE 'Newbie'
+        END) AS PostLevel,
+        (tu.UpvoteCount - tu.DownvoteCount) AS NetVotes,
+        (tu.UpvoteCount * 1.0 / NULLIF(tu.UpvoteCount + tu.DownvoteCount, 0)) AS UpvoteRatio,
+        (tu.BadgeCount * 1.0 / NULLIF(tu.PostCount, 0)) AS BadgePerPostRatio,
+        (SELECT COUNT(*) FROM Votes v WHERE v.UserId = tu.UserId AND v.VoteTypeId = 5) AS FavoriteCount,
+        STRING_AGG(DISTINCT CASE 
+            WHEN v.VoteTypeId IN (2,3) THEN 'Vote' 
+            WHEN v.VoteTypeId IN (6,7) THEN 'Close/Open'
+            WHEN v.VoteTypeId IN (8,9) THEN 'Bounty'
+            ELSE 'Other'
+        END, ', ') AS VoteTypes
+    FROM TopUsers tu
+    LEFT JOIN Votes v ON tu.UserId = v.UserId
+    WHERE tu.Reputation >= 1000
+    GROUP BY tu.UserId, tu.DisplayName, tu.Reputation, tu.PostCount, tu.QuestionCount, tu.AnswerCount, 
+             tu.BadgeCount, tu.UpvoteCount, tu.DownvoteCount, tu.LastPostDate, tu.AvgScore, tu.Tags,
+             tu.RankByReputation, tu.RankByPostCount, tu.RankByAvgScore
+),
+CombinedAnalysis AS (
+    SELECT 
+        dua.UserId,
+        dua.DisplayName,
+        dua.Reputation,
+        dua.PostCount,
+        dua.QuestionCount,
+        dua.AnswerCount,
+        dua.BadgeCount,
+        dua.UpvoteCount,
+        dua.DownvoteCount,
+        dua.LastPostDate,
+        dua.AvgScore,
+        dua.Tags,
+        dua.RankByReputation,
+        dua.RankByPostCount,
+        dua.RankByAvgScore,
+        dua.UserTier,
+        dua.RepLevel,
+        dua.PostLevel,
+        dua.NetVotes,
+        ROUND(CAST(dua.UpvoteRatio AS NUMERIC), 3) AS UpvoteRatio,
+        ROUND(CAST(dua.BadgePerPostRatio AS NUMERIC), 3) AS BadgePerPostRatio,
+        dua.FavoriteCount,
+        COALESCE(dua.VoteTypes, '') AS VoteTypes,
+        qa.QuestionId,
+        qa.Title,
+        qa.Score AS QuestionScore,
+        qa.ViewCount,
+        qa.AnswerCount AS QuestionAnswerCount,
+        qa.CommentCount AS QuestionCommentCount,
+        qa.CreationDate AS QuestionCreationDate,
+        qa.Tags AS QuestionTags,
+        qa.PositiveAnswerAuthors,
+        qa.TotalAnswerCount,
+        ROUND(CAST(qa.AvgAnswerScore AS NUMERIC), 2) AS AvgAnswerScore,
+        qa.MaxAnswerScore,
+        qa.FirstAnswerDate,
+        qa.LastAnswerDate,
+        qa.AnswerAuthorCount,
+        qa.CommentCountOnQuestion,
+        qa.UpvoteCountOnQuestion,
+        qa.DownvoteCountOnQuestion,
+        qa.HistoryActionCount,
+        CASE 
+            WHEN qa.AnswerCount > 0 AND qa.ViewCount > 1000 AND qa.Score > 10 THEN 'High Impact Question'
+            WHEN qa.AnswerCount > 0 AND qa.ViewCount > 500 THEN 'Medium Impact Question'
+            ELSE 'Low Impact Question'
+        END AS QuestionCategory,
+        ROW_NUMBER() OVER (PARTITION BY dua.UserId ORDER BY qa.ViewCount DESC) AS UserQuestionRanking,
+        CASE 
+            WHEN dua.Reputation > 10000 AND qa.ViewCount > 5000 THEN 'Elite Question'
+            WHEN dua.Reputation > 5000 AND qa.ViewCount > 2000 THEN 'Expert Question'
+            WHEN dua.Reputation > 1000 AND qa.ViewCount > 500 THEN 'Regular Question'
+            ELSE 'Basic Question'
+        END AS QuestionTier
+    FROM DetailedUserAnalysis dua
+    LEFT JOIN QuestionAnalysis qa ON dua.UserId = qa.OwnerUserId
+    WHERE qa.QuestionId IS NOT NULL
+    GROUP BY
+        dua.UserId, dua.DisplayName, dua.Reputation, dua.PostCount, dua.QuestionCount, dua.AnswerCount, dua.BadgeCount,
+        dua.UpvoteCount, dua.DownvoteCount, dua.LastPostDate, dua.AvgScore, dua.Tags, dua.RankByReputation, dua.RankByPostCount,
+        dua.RankByAvgScore, dua.UserTier, dua.RepLevel, dua.PostLevel, dua.NetVotes, dua.UpvoteRatio, dua.BadgePerPostRatio,
+        dua.FavoriteCount, dua.VoteTypes,
+        qa.QuestionId, qa.Title, qa.Score, qa.ViewCount, qa.AnswerCount, qa.CommentCount, qa.CreationDate, qa.Tags,
+        qa.PositiveAnswerAuthors, qa.TotalAnswerCount, qa.AvgAnswerScore, qa.MaxAnswerScore, qa.FirstAnswerDate, qa.LastAnswerDate,
+        qa.AnswerAuthorCount, qa.CommentCountOnQuestion, qa.UpvoteCountOnQuestion, qa.DownvoteCountOnQuestion, qa.HistoryActionCount
+)
+SELECT 
+    ca.UserId,
+    ca.DisplayName,
+    ca.Reputation,
+    ca.PostCount,
+    ca.QuestionCount,
+    ca.AnswerCount,
+    ca.BadgeCount,
+    ca.UpvoteCount,
+    ca.DownvoteCount,
+    ca.LastPostDate,
+    ca.AvgScore,
+    ca.Tags,
+    ca.RankByReputation,
+    ca.RankByPostCount,
+    ca.RankByAvgScore,
+    ca.UserTier,
+    ca.RepLevel,
+    ca.PostLevel,
+    ca.NetVotes,
+    ca.UpvoteRatio,
+    ca.BadgePerPostRatio,
+    ca.FavoriteCount,
+    ca.VoteTypes,
+    ca.QuestionId,
+    ca.Title,
+    ca.QuestionScore,
+    ca.ViewCount,
+    ca.QuestionAnswerCount,
+    ca.QuestionCommentCount,
+    ca.QuestionCreationDate,
+    ca.QuestionTags,
+    ca.PositiveAnswerAuthors,
+    ca.TotalAnswerCount,
+    ca.AvgAnswerScore,
+    ca.MaxAnswerScore,
+    ca.FirstAnswerDate,
+    ca.LastAnswerDate,
+    ca.AnswerAuthorCount,
+    ca.CommentCountOnQuestion,
+    ca.UpvoteCountOnQuestion,
+    ca.DownvoteCountOnQuestion,
+    ca.HistoryActionCount,
+    ca.QuestionCategory,
+    ca.UserQuestionRanking,
+    ca.QuestionTier,
+    (CASE 
+        WHEN ca.QuestionScore > 50 AND ca.ViewCount > 1000 AND ca.TotalAnswerCount > 5 THEN 1
+        WHEN ca.QuestionScore > 20 AND ca.ViewCount > 500 AND ca.TotalAnswerCount > 2 THEN 1
+        ELSE 0
+    END) AS HighQualityQuestionFlag,
+    (SELECT COUNT(DISTINCT ph.Id) 
+     FROM PostHistory ph 
+     WHERE ph.PostId = ca.QuestionId 
+       AND ph.CreationDate BETWEEN DATE '2022-01-01' AND DATE '2023-01-01') AS RecentHistoryCount
+FROM CombinedAnalysis ca
+WHERE ca.Reputation > 1000
+  AND ca.ViewCount > 200
+  AND ca.QuestionScore >= 0
+  AND ca.TotalAnswerCount >= 0
+  AND ca.AvgAnswerScore IS NOT NULL
+ORDER BY 
+    ca.Reputation DESC,
+    ca.ViewCount DESC,
+    ca.QuestionScore DESC,
+    ca.UserQuestionRanking ASC,
+    ca.LastPostDate DESC
+LIMIT 500;

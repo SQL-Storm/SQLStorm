@@ -1,0 +1,96 @@
+-- {"query": "5223.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 789} 
+WITH TopPosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    u.Reputation AS OwnerReputation,
+    u.Location AS OwnerLocation,
+    u.DisplayName AS OwnerDisplayName,
+    c.Name AS CloseReason,
+    v1.CntUp AS UpVotesFromFollowers
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+  LEFT JOIN CloseReasonTypes c ON CAST(ph.Comment AS varchar(100)) LIKE '%' || CAST(c.Id AS varchar) || '%'
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS CntUp
+    FROM Votes v
+    JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    WHERE vt.Name IN ('UpMod', 'AcceptedByOriginator') -- selective subset
+    GROUP BY PostId
+  ) v1 ON v1.PostId = p.Id
+  WHERE p.PostTypeId = 1 -- questions only
+    AND p.Tags IS NOT NULL
+),
+Flagged AS (
+  SELECT
+    tp.PostId,
+    tp.Title,
+    tp.OwnerDisplayName,
+    tp.OwnerReputation,
+    tp.ViewCount,
+    tp.Score,
+    tp.CommentCount,
+    tp.AnswerCount,
+    tp.FavoriteCount,
+    tp.OwnerLocation,
+    tp.CreationDate,
+    tp.LastActivityDate,
+    ROW_NUMBER() OVER (ORDER BY tp.LastActivityDate DESC, tp.Score DESC) AS rn
+  FROM TopPosts tp
+  LEFT JOIN Votes v ON v.PostId = tp.PostId
+  LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+  WHERE vt.Name NOT IN ('DownMod', 'Spam') -- filter out obvious low quality votes
+    OR vt.Name IS NULL
+),
+JoinedStats AS (
+  SELECT
+    f.PostId,
+    f.Title,
+    f.OwnerDisplayName,
+    f.OwnerReputation,
+    f.ViewCount,
+    f.Score,
+    f.CommentCount,
+    f.AnswerCount,
+    f.FavoriteCount,
+    f.OwnerLocation,
+    f.CreationDate,
+    f.LastActivityDate,
+    COUNT(v.Id) FILTER (WHERE v.VoteTypeId IN (SELECT Id FROM VoteTypes WHERE Name IN ('UpMod','AcceptedByOriginator'))) AS UpVotesFromHistory,
+    ARRAY_AGG(DISTINCT t.TagName) FILTER (WHERE t.TagName IS NOT NULL) AS TagList
+  FROM Flagged f
+  LEFT JOIN Votes v ON v.PostId = f.PostId
+  LEFT JOIN TagRelations tr ON tr.PostId = f.PostId
+  LEFT JOIN Tags t ON t.Id = tr.TagId
+  GROUP BY
+    f.PostId, f.Title, f.OwnerDisplayName, f.OwnerReputation, f.ViewCount, f.Score,
+    f.CommentCount, f.AnswerCount, f.FavoriteCount, f.OwnerLocation, f.CreationDate, f.LastActivityDate
+)
+SELECT
+  j.PostId,
+  j.Title,
+  j.OwnerDisplayName,
+  j.OwnerReputation,
+  j.ViewCount,
+  j.Score,
+  j.CommentCount,
+  j.AnswerCount,
+  j.FavoriteCount,
+  j.OwnerLocation,
+  j.CreationDate,
+  j.LastActivityDate,
+  j.UpVotesFromHistory,
+  j.TagList
+FROM JoinedStats j
+WHERE j.rn <= 100
+ORDER BY j.LastActivityDate DESC, j.Score DESC;

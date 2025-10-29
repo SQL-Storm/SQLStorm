@@ -1,0 +1,249 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        COALESCE(u.ViewCount, 0) as AdjustedViews,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        ROUND(CAST(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS FLOAT) / NULLIF(COUNT(p.Id), 0) * 100, 2) as QuestionPercentage,
+        ROUND(CAST(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS FLOAT) / NULLIF(COUNT(p.Id), 0) * 100, 2) as AnswerPercentage
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= DATE '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.ViewCount
+),
+PostComplexityAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Tags,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND LENGTH(p.Tags) > 0 THEN 
+                (SELECT COUNT(*) FROM UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags)-2), '><')) AS t(tag))
+            ELSE 0 
+        END as TagCount,
+        LENGTH(p.Body) as BodyLength,
+        CASE 
+            WHEN p.Body IS NOT NULL THEN 
+                (SELECT COUNT(*) FROM UNNEST(string_to_array(p.Body, ' ')) AS w(word) WHERE LENGTH(word) > 5)
+            ELSE 0 
+        END as LongWordCount,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN 
+                CAST(p.Score AS FLOAT) / NULLIF(p.AnswerCount, 0)
+            ELSE NULL 
+        END as ScorePerAnswer,
+        ROUND(AVG(p.Score) OVER (PARTITION BY p.OwnerUserId), 2) as AvgScorePerUser,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as PostRank,
+        CASE 
+            WHEN p.CreationDate >= DATE '2019-01-01' THEN 'Recent'
+            WHEN p.CreationDate >= DATE '2015-01-01' THEN 'Mid'
+            WHEN p.CreationDate >= DATE '2010-01-01' THEN 'Old'
+            ELSE 'Very Old'
+        END as TimePeriod
+    FROM Posts p
+    WHERE p.DeletedDate IS NULL
+),
+TagPopularity AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        NULLIF(t.Count, 0) as NormalizedCount,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Very Popular'
+            WHEN t.Count > 500 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            ELSE 'Low'
+        END as PopularityLevel,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as Rank,
+        CAST(t.Count AS FLOAT) / NULLIF((SELECT SUM(tt.Count) FROM Tags tt),0) * 100 as Percentage
+    FROM Tags t
+    WHERE t.Count > 0
+)
+SELECT 
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.PostCount,
+    uas.CommentCount,
+    uas.BadgeCount,
+    uas.TotalScore,
+    uas.QuestionPercentage,
+    uas.AnswerPercentage,
+    pca.PostId,
+    pca.Title,
+    pca.Score,
+    pca.ViewCount,
+    pca.AnswerCount,
+    pca.CommentCount,
+    pca.CreationDate,
+    pca.TagCount,
+    pca.BodyLength,
+    pca.LongWordCount,
+    pca.ScorePerAnswer,
+    pca.AvgScorePerUser,
+    pca.PostRank,
+    pca.TimePeriod,
+    COALESCE(tp.TagName, 'N/A') as TopTag,
+    CASE 
+        WHEN uas.PostCount > 0 AND uas.CommentCount > 0 THEN 
+            (CAST(uas.CommentCount AS FLOAT) / NULLIF(uas.PostCount, 0))
+        ELSE 0 
+    END as CommentsPerPost,
+    CASE 
+        WHEN uas.Reputation > 10000 AND uas.PostCount > 500 THEN 'Elite'
+        WHEN uas.Reputation > 5000 AND uas.PostCount > 100 THEN 'Veteran'
+        WHEN uas.Reputation > 1000 THEN 'Experienced'
+        ELSE 'Regular'
+    END as UserStatus,
+    CASE 
+        WHEN pca.Score > 100 AND pca.BodyLength > 500 THEN 'High Impact'
+        WHEN pca.Score > 50 THEN 'Medium Impact'
+        WHEN pca.Score > 10 THEN 'Low Impact'
+        ELSE 'Minimal Impact'
+    END as ImpactLevel,
+    CASE 
+        WHEN pca.PostRank = 1 THEN 'Recent Post'
+        WHEN pca.PostRank = 2 THEN 'Second Recent'
+        WHEN pca.PostRank <= 5 THEN 'Top Posts'
+        ELSE 'Other'
+    END as PostPriority,
+    CASE 
+        WHEN pca.TimePeriod = 'Recent' AND pca.Score > 50 THEN 'Trending'
+        WHEN pca.TimePeriod = 'Recent' THEN 'Recent'
+        WHEN pca.Score > 50 THEN 'Important'
+        ELSE 'General'
+    END as PostCategory,
+    NULLIF(
+        CASE 
+            WHEN pca.BodyLength > 0 THEN 
+                CAST(pca.Score AS FLOAT) / NULLIF(pca.BodyLength, 0)
+            ELSE 0 
+        END, 0
+    ) as ScorePerCharacter
+FROM UserActivityStats uas
+INNER JOIN PostComplexityAnalysis pca ON uas.UserId = pca.OwnerUserId
+LEFT JOIN TagPopularity tp ON tp.Rank = 1
+WHERE 
+    uas.Reputation >= 1000
+    AND (
+        pca.PostTypeId = 1 
+        OR (
+            pca.PostTypeId = 2 
+            AND pca.AnswerCount > 0 
+            AND pca.Score >= 0
+        )
+    )
+    AND (
+        pca.CreationDate > DATE '2015-01-01' 
+        OR uas.LastPostDate > DATE '2015-01-01'
+    )
+    AND (
+        pca.Score >= 0 
+        OR pca.Score IS NULL
+    )
+UNION ALL
+SELECT 
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.PostCount,
+    uas.CommentCount,
+    uas.BadgeCount,
+    uas.TotalScore,
+    uas.QuestionPercentage,
+    uas.AnswerPercentage,
+    pca.PostId,
+    pca.Title,
+    pca.Score,
+    pca.ViewCount,
+    pca.AnswerCount,
+    pca.CommentCount,
+    pca.CreationDate,
+    pca.TagCount,
+    pca.BodyLength,
+    pca.LongWordCount,
+    pca.ScorePerAnswer,
+    pca.AvgScorePerUser,
+    pca.PostRank,
+    pca.TimePeriod,
+    COALESCE(tp.TagName, 'N/A') as TopTag,
+    CASE 
+        WHEN uas.PostCount > 0 AND uas.CommentCount > 0 THEN 
+            (CAST(uas.CommentCount AS FLOAT) / NULLIF(uas.PostCount, 0))
+        ELSE 0 
+    END as CommentsPerPost,
+    CASE 
+        WHEN uas.Reputation > 10000 AND uas.PostCount > 500 THEN 'Elite'
+        WHEN uas.Reputation > 5000 AND uas.PostCount > 100 THEN 'Veteran'
+        WHEN uas.Reputation > 1000 THEN 'Experienced'
+        ELSE 'Regular'
+    END as UserStatus,
+    CASE 
+        WHEN pca.Score > 100 AND pca.BodyLength > 500 THEN 'High Impact'
+        WHEN pca.Score > 50 THEN 'Medium Impact'
+        WHEN pca.Score > 10 THEN 'Low Impact'
+        ELSE 'Minimal Impact'
+    END as ImpactLevel,
+    CASE 
+        WHEN pca.PostRank = 1 THEN 'Recent Post'
+        WHEN pca.PostRank = 2 THEN 'Second Recent'
+        WHEN pca.PostRank <= 5 THEN 'Top Posts'
+        ELSE 'Other'
+    END as PostPriority,
+    CASE 
+        WHEN pca.TimePeriod = 'Recent' AND pca.Score > 50 THEN 'Trending'
+        WHEN pca.TimePeriod = 'Recent' THEN 'Recent'
+        WHEN pca.Score > 50 THEN 'Important'
+        ELSE 'General'
+    END as PostCategory,
+    NULLIF(
+        CASE 
+            WHEN pca.BodyLength > 0 THEN 
+                CAST(pca.Score AS FLOAT) / NULLIF(pca.BodyLength, 0)
+            ELSE 0 
+        END, 0
+    ) as ScorePerCharacter
+FROM UserActivityStats uas
+INNER JOIN PostComplexityAnalysis pca ON uas.UserId = pca.OwnerUserId
+LEFT JOIN TagPopularity tp ON tp.Rank = 1
+WHERE 
+    uas.Reputation < 1000
+    AND (
+        pca.PostTypeId = 1 
+        OR (
+            pca.PostTypeId = 2 
+            AND pca.AnswerCount > 0 
+            AND pca.Score >= 0
+        )
+    )
+    AND (
+        pca.CreationDate > DATE '2018-01-01' 
+        OR uas.LastPostDate > DATE '2018-01-01'
+    )
+    AND (
+        pca.Score >= 0 
+        OR pca.Score IS NULL
+    )
+ORDER BY 
+    CASE WHEN uas.Reputation > 5000 THEN 1 ELSE 2 END,
+    uas.PostCount DESC,
+    pca.Score DESC,
+    pca.CreationDate DESC;

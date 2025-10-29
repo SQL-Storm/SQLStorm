@@ -1,0 +1,158 @@
+with RecursiveTagCounts as (
+    select
+        p.Id as PostId,
+        unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><')) as Tag,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+),
+TagPopularity as (
+    select
+        Tag,
+        count(distinct PostId) as QuestionCount,
+        sum(Score) as TotalScore,
+        avg(ViewCount) as AvgViews
+    from RecursiveTagCounts
+    group by Tag
+),
+TopTags as (
+    select Tag from TagPopularity
+    order by QuestionCount desc, TotalScore desc
+    limit 10
+),
+UserBadges as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserReputations as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        coalesce(b_gold.BadgeCount, 0) as GoldBadges,
+        coalesce(b_silver.BadgeCount, 0) as SilverBadges,
+        coalesce(b_bronze.BadgeCount, 0) as BronzeBadges,
+        u.CreationDate,
+        dense_rank() over (order by u.Reputation desc) as RepRank
+    from Users u
+    left join UserBadges b_gold on b_gold.UserId = u.Id and b_gold.Class = 1
+    left join UserBadges b_silver on b_silver.UserId = u.Id and b_silver.Class = 2
+    left join UserBadges b_bronze on b_bronze.UserId = u.Id and b_bronze.Class = 3
+),
+RecentAnswersWithScore as (
+    select
+        a.Id,
+        a.ParentId as QuestionId,
+        a.CreationDate,
+        a.Score,
+        u.DisplayName as Answerer,
+        u.Reputation,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts a
+    join Users u on a.OwnerUserId = u.Id
+    where a.PostTypeId = 2
+      and a.Score is not null
+      and a.CreationDate > cast('2024-10-01' as date) - interval '1 year'
+),
+BestAnswersForTopQuestions as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.Tags,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.Answerer,
+        a.Reputation as AnswererReputation
+    from Posts q
+    left join RecentAnswersWithScore a on a.QuestionId = q.Id and a.AnswerRank = 1
+    where q.PostTypeId = 1
+      and exists (
+        select 1 from RecursiveTagCounts rtc where rtc.PostId = q.Id and rtc.Tag in (select Tag from TopTags)
+      )
+),
+ClosedQuestionsWithReasons as (
+    select
+        ph.PostId,
+        max(case when ph.PostHistoryTypeId = 10 then ph.Comment else null end) as CloseReasonId,
+        max(ph.CreationDate) as CloseDate
+    from PostHistory ph
+    where ph.PostHistoryTypeId = 10
+    group by ph.PostId
+),
+AggregatedComments as (
+    select
+        c.PostId,
+        count(*) filter (where c.Score > 0) as PositiveComments,
+        count(*) filter (where c.Score <= 0 or c.Score is null) as NonPositiveComments,
+        -- ORDER BY expression used in string_agg must appear in the aggregated expression in some SQL dialects.
+        -- Use substring(c.Text for 30) and order by max(CreationDate) is invalid; instead order by min(CreationDate) per PostId and include CreationDate in GROUP BY is not desired.
+        -- Use array_agg with order and then join, or use string_agg without DISTINCT ordering. Here use string_agg of distinct excerpts without ORDER BY to be portable.
+        string_agg(distinct substring(c.Text for 30), '; ') as CommentExcerpts
+    from Comments c
+    group by c.PostId
+),
+TagWikiUsage as (
+    select
+        t.TagName,
+        case when t.WikiPostId is not null then 1 else 0 end as HasWiki,
+        case when t.ExcerptPostId is not null then 1 else 0 end as HasExcerpt
+    from Tags t
+),
+TopTagAnalysis as (
+    select
+        tt.Tag,
+        tp.QuestionCount,
+        tp.TotalScore,
+        tp.AvgViews,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadgeCount,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadgeCount,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadgeCount,
+        sum(case when tw.HasWiki = 1 then 1 else 0 end) as WikiTaggedPosts,
+        sum(case when tw.HasExcerpt = 1 then 1 else 0 end) as ExcerptTaggedPosts
+    from TopTags tt
+    join TagPopularity tp on tp.Tag = tt.Tag
+    left join Tags tg on tg.TagName = tt.Tag
+    left join Badges b on b.TagBased = 1 and b.Name = tt.Tag
+    left join TagWikiUsage tw on tw.TagName = tt.Tag
+    group by tt.Tag, tp.QuestionCount, tp.TotalScore, tp.AvgViews
+)
+select
+    ta.Tag,
+    ta.QuestionCount,
+    ta.TotalScore,
+    round(ta.AvgViews,2) as AverageViews,
+    ta.GoldBadgeCount,
+    ta.SilverBadgeCount,
+    ta.BronzeBadgeCount,
+    ta.WikiTaggedPosts,
+    ta.ExcerptTaggedPosts,
+    ba.QuestionId,
+    ba.Title,
+    ba.QuestionScore,
+    ba.ViewCount as QuestionViews,
+    ba.AnswerId,
+    ba.AnswerScore,
+    ba.Answerer,
+    ba.AnswererReputation,
+    cq.CloseDate as ClosedDate,
+    coalesce(cr.Name, 'Not Closed') as CloseReason,
+    ac.PositiveComments,
+    ac.NonPositiveComments,
+    ac.CommentExcerpts
+from TopTagAnalysis ta
+left join BestAnswersForTopQuestions ba on ba.Tags like '%' || ta.Tag || '%'
+left join ClosedQuestionsWithReasons cq on cq.PostId = ba.QuestionId
+left join CloseReasonTypes cr on cast(cr.Id as text) = cq.CloseReasonId
+left join AggregatedComments ac on ac.PostId = ba.QuestionId
+where ba.QuestionId is not null
+order by ta.QuestionCount desc, ba.QuestionScore desc
+limit 50;

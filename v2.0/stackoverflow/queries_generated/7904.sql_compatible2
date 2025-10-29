@@ -1,0 +1,176 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY MAX(p.CreationDate) DESC) as rn
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopPosts AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            WHEN p.PostTypeId = 4 THEN 'Tag Wiki Excerpt'
+            WHEN p.PostTypeId = 5 THEN 'Tag Wiki'
+            ELSE 'Other'
+        END as PostType,
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PrevScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as AvgScore,
+        ROW_NUMBER() OVER (ORDER BY p.Score DESC) as RankByScore,
+        DENSE_RANK() OVER (ORDER BY p.ViewCount DESC) as RankByViews
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+      AND p.Score > 100
+      AND p.ViewCount > 1000
+),
+UserActivity AS (
+    SELECT 
+        u.Id as UserId,
+        COUNT(DISTINCT ph.Id) as HistoryCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN ph.Id END) as CloseReopenDeleteCount,
+        STRING_AGG(DISTINCT ph.Comment, '; ') as ActivityComments,
+        MAX(ph.CreationDate) as LastActivity
+    FROM Users u
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    WHERE ph.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '2 years')
+    GROUP BY u.Id
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Highly Popular'
+            WHEN t.Count > 500 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            ELSE 'Low'
+        END as PopularityLevel,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as RankByPopularity,
+        LAG(t.Count, 1, 0) OVER (ORDER BY t.Count DESC) as PrevCount,
+        (t.Count - LAG(t.Count, 1, 0) OVER (ORDER BY t.Count DESC)) as CountChange
+    FROM Tags t
+    WHERE t.Count > 50
+),
+TopUsersByVotes AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.UpVotes,
+        u.DownVotes,
+        (u.UpVotes - u.DownVotes) as VoteBalance,
+        RANK() OVER (ORDER BY (u.UpVotes - u.DownVotes) DESC) as VoteRank,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) as RepRank
+    FROM Users u
+    WHERE u.Reputation > 10000
+),
+ComplexPostStats AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        CASE 
+            WHEN p.AnswerCount > 5 THEN 'Many Answers'
+            WHEN p.AnswerCount > 2 THEN 'Some Answers'
+            ELSE 'Few Answers'
+        END as AnswerLevel,
+        CASE 
+            WHEN p.Score > 100 THEN 'High Score'
+            WHEN p.Score > 50 THEN 'Moderate Score'
+            ELSE 'Low Score'
+        END as ScoreLevel,
+        CASE 
+            WHEN p.CommentCount > 10 THEN 'Highly Commented'
+            WHEN p.CommentCount > 5 THEN 'Moderately Commented'
+            ELSE 'Low Comment Count'
+        END as CommentLevel
+    FROM Posts p
+    WHERE p.PostTypeId = 1 
+      AND p.Score > 0
+      AND p.ViewCount >= 100
+)
+SELECT 
+    'Performance Benchmark Report' as ReportTitle,
+    COUNT(DISTINCT us.UserId) as UniqueUsers,
+    COUNT(DISTINCT tp.PostId) as TopPostsCount,
+    COUNT(DISTINCT ta.TagName) as PopularTags,
+    COUNT(DISTINCT tuc.UserId) as TopVoteUsers,
+    COUNT(DISTINCT cps.PostId) as ComplexPostStatsCount,
+    (SELECT COUNT(*) FROM PostHistory) as TotalHistoryRecords,
+    (SELECT COUNT(*) FROM Comments) as TotalComments,
+    (SELECT COUNT(*) FROM Badges) as TotalBadges,
+    (
+        SELECT AVG(Reputation) 
+        FROM Users 
+        WHERE Reputation > 1000
+    ) as AvgReputation,
+    ('Top Tags: ' || STRING_AGG(ta.TagName || '(' || CAST(ta.Count AS VARCHAR) || ')', ', ')) as TopTagSummary,
+    CASE 
+        WHEN COUNT(DISTINCT us.UserId) > 1000 THEN 'High Activity'
+        WHEN COUNT(DISTINCT us.UserId) > 500 THEN 'Medium Activity'
+        ELSE 'Low Activity'
+    END as ActivityLevel,
+    CAST(
+        (COUNT(DISTINCT tp.PostId) * COUNT(DISTINCT ta.TagName) / 
+         NULLIF(COUNT(DISTINCT us.UserId), 0)) AS NUMERIC(10,2)
+    ) as ActivityRatio,
+    ('Generated on ' || CAST('2024-10-01 12:34:56' AS TIMESTAMP)) as GeneratedDate,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        JOIN PostTypes pt ON p.PostTypeId = pt.Id 
+        WHERE pt.Name = 'Question' 
+          AND p.Score > 50
+    ) as QuestionCountWithHighScore
+FROM UserStats us
+FULL OUTER JOIN TopPosts tp ON us.UserId = tp.OwnerUserId
+FULL OUTER JOIN TagAnalysis ta ON ta.RankByPopularity BETWEEN 1 AND 10
+FULL OUTER JOIN TopUsersByVotes tuc ON tuc.UserId = us.UserId
+FULL OUTER JOIN ComplexPostStats cps ON cps.PostId = tp.PostId
+WHERE (us.UserId IS NOT NULL OR tp.PostId IS NOT NULL OR ta.TagName IS NOT NULL)
+  AND (COALESCE(us.Reputation, 0) > 1000 OR COALESCE(tp.Score, 0) > 100 OR COALESCE(ta.Count, 0) > 100)
+  AND (COALESCE(tuc.VoteBalance, 0) > 0 OR COALESCE(cps.Score, 0) > 50)
+GROUP BY
+    'Performance Benchmark Report',
+    ('Top Tags: ' || STRING_AGG(ta.TagName || '(' || CAST(ta.Count AS VARCHAR) || ')', ', ')),
+    ('Generated on ' || CAST('2024-10-01 12:34:56' AS TIMESTAMP))
+HAVING COUNT(DISTINCT us.UserId) > 0
+   OR COUNT(DISTINCT tp.PostId) > 0
+   OR COUNT(DISTINCT ta.TagName) > 0
+   OR COUNT(DISTINCT tuc.UserId) > 0
+   OR COUNT(DISTINCT cps.PostId) > 0
+ORDER BY 
+    COUNT(DISTINCT us.UserId) DESC,
+    COUNT(DISTINCT tp.PostId) DESC,
+    COUNT(DISTINCT ta.TagName) DESC;

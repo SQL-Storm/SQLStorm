@@ -1,0 +1,181 @@
+-- {"query": "2930.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1771} 
+
+WITH 
+-- Top 10 users by reputation with badge counts and last activity
+UserSummary AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        COUNT(b.Id) AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(p.LastActivityDate) AS LastPostActivity
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+    ORDER BY u.Reputation DESC
+    LIMIT 10
+),
+-- Recent question details with accepted answer score differences and number of linked duplicates
+QuestionDetails AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        q.AcceptedAnswerId,
+        COALESCE(a.Score, 0) AS AcceptedAnswerScore,
+        q.Score - COALESCE(a.Score, 0) AS ScoreDiffQtoA,
+        (
+            SELECT COUNT(*)
+            FROM PostLinks pl
+            WHERE pl.PostId = q.Id AND pl.LinkTypeId = 3 -- Duplicate links
+        ) AS DuplicateLinksCount,
+        -- Split tags to count number of tags (handling NULL and empty string)
+        CASE 
+            WHEN q.Tags IS NULL OR q.Tags = '' THEN 0
+            ELSE array_length(string_to_array(substring(q.Tags FROM 2 FOR length(q.Tags) - 2), '><'), 1)
+        END AS TagCount
+    FROM Posts q
+    LEFT JOIN Posts a ON a.Id = q.AcceptedAnswerId
+    WHERE q.PostTypeId = 1
+      AND q.CreationDate > NOW() - INTERVAL '1 year'
+    ORDER BY q.Score DESC
+    LIMIT 20
+),
+-- Windowing over badges earned per user in last year with rank
+RecentBadges AS (
+    SELECT 
+        b.UserId,
+        b.Name AS BadgeName,
+        b.Class,
+        b.Date,
+        RANK() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC) AS BadgeRank
+    FROM Badges b
+    WHERE b.Date > NOW() - INTERVAL '1 year'
+),
+-- Latest post history entries per post, filtering complex statuses
+LatestPostHistory AS (
+    SELECT ph.*
+    FROM (
+        SELECT 
+            ph.PostId,
+            ph.Id,
+            ph.PostHistoryTypeId,
+            ph.CreationDate,
+            ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC, ph.Id DESC) AS rn
+        FROM PostHistory ph
+        WHERE ph.PostHistoryTypeId IN (10,11,12,13,14,15,19,20,35) AND ph.CreationDate > NOW()- INTERVAL '2 years'
+    ) ph
+    WHERE rn = 1
+),
+-- Combine posts, their latest post history, and user data to extract close reasons and engagement
+PostEngagement AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.ViewCount,
+        p.Score,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        lph.PostHistoryTypeId,
+        lph.Comment AS CloseReasonId,
+        crt.Name AS CloseReasonName,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.LastActivityDate,
+        -- Compute engagement score with weighted formula and NULL-safe logic
+        (COALESCE(p.Score,0) * 2 + COALESCE(p.ViewCount,0)/100 + COALESCE(p.FavoriteCount,0)*5 + COALESCE(p.CommentCount,0)*3) AS EngagementScore
+    FROM Posts p
+    LEFT JOIN LatestPostHistory lph ON lph.PostId = p.Id
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(NULLIF(lph.Comment,'') AS SMALLINT)
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1 -- questions only
+      AND p.CreationDate > NOW() - INTERVAL '3 years'
+),
+-- Using UNION ALL with EXCEPT to test set operators and NULL handling
+SetOperatorTest AS (
+    SELECT UserId, DisplayName FROM Users WHERE LastAccessDate > NOW() - INTERVAL '6 months'
+    EXCEPT
+    SELECT UserId, DisplayName FROM Users WHERE Reputation < 50 OR Reputation IS NULL
+    UNION ALL
+    SELECT u.Id, u.DisplayName FROM Users u WHERE u.Location LIKE '%United%' OR u.Location IS NULL
+),
+-- Complex correlated subquery to get average votes per user's answers with string/NULL manipulation
+UserAnswerVoteStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COALESCE(AVG(vc.VoteCount),0) AS AvgVotesPerAnswer,
+        -- String concatenation of top 3 badges names for the user in comma separated list
+        (
+            SELECT string_agg(DISTINCT b.Name, ', ' ORDER BY b.Date DESC)
+            FROM Badges b 
+            WHERE b.UserId = u.Id
+            LIMIT 3
+        ) AS TopBadges,
+        -- Use filter and CASE for vote type consideration, casting NULL votes to zero
+        COUNT(DISTINCT a.Id) AS AnswerCount
+    FROM Users u
+    LEFT JOIN Posts a ON a.OwnerUserId = u.Id AND a.PostTypeId = 2
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS VoteCount
+        FROM Votes
+        WHERE VoteTypeId IN (2,3) -- upvotes and downvotes only
+        GROUP BY PostId
+    ) vc ON vc.PostId = a.Id
+    GROUP BY u.Id, u.DisplayName
+    HAVING COUNT(DISTINCT a.Id) > 5
+),
+-- Window function example: Running total of questions created per month in the last 12 months
+MonthlyQuestionCounts AS (
+    SELECT 
+        DATE_TRUNC('month', CreationDate) AS Month,
+        COUNT(*) AS QuestionCount,
+        SUM(COUNT(*)) OVER (ORDER BY DATE_TRUNC('month', CreationDate)) AS RunningTotalQuestions
+    FROM Posts
+    WHERE PostTypeId = 1 AND CreationDate > NOW() - INTERVAL '12 months'
+    GROUP BY DATE_TRUNC('month', CreationDate)
+    ORDER BY Month
+),
+-- Final SELECT combining multiple CTEs with outer joins and complex predicates
+FinalResult AS (
+    SELECT 
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.BadgeCount,
+        ubv.AvgVotesPerAnswer,
+        ubv.TopBadges,
+        qd.QuestionId,
+        qd.Title AS TopQuestionTitle,
+        qd.ScoreDiffQtoA,
+        qd.DuplicateLinksCount,
+        pe.CloseReasonName,
+        pe.EngagementScore,
+        mqc.Month,
+        mqc.RunningTotalQuestions,
+        so.DisplayName AS SoTestUser,
+        so.UserId AS SoTestUserId
+    FROM UserSummary us
+    LEFT JOIN UserAnswerVoteStats ubv ON ubv.UserId = us.UserId
+    LEFT JOIN QuestionDetails qd ON qd.CreationDate = (
+        SELECT MAX(CreationDate) FROM QuestionDetails WHERE QuestionId IN (
+            SELECT Id FROM Posts WHERE OwnerUserId = us.UserId
+        )
+    )
+    LEFT JOIN PostEngagement pe ON pe.PostId = qd.QuestionId
+    LEFT JOIN MonthlyQuestionCounts mqc ON DATE_TRUNC('month', us.CreationDate) = mqc.Month
+    LEFT JOIN SetOperatorTest so ON so.UserId = us.UserId
+    WHERE us.Reputation > 5000 AND (pe.CloseReasonName IS NULL OR pe.CloseReasonName NOT IN ('Duplicate', 'Off-topic'))
+    ORDER BY us.Reputation DESC, pe.EngagementScore DESC NULLS LAST
+    LIMIT 15
+)
+SELECT * FROM FinalResult;

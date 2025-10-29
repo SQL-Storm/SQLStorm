@@ -1,0 +1,107 @@
+-- {"query": "3004.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1799} 
+WITH UserStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.UpVotes, 0) - COALESCE(u.DownVotes, 0) AS NetVotes,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS QuestionCount,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS AnswerCount,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadgeCount
+    FROM Users u
+    WHERE u.Reputation > 1000
+),
+
+RecentTopPosts AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Score,
+        p.CreationDate,
+        p.OwnerUserId,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '30 days'
+),
+
+TagStats AS (
+    SELECT
+        t.TagName,
+        COUNT(p.Id)                                      AS TagQuestionCount,
+        AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL) AS AvgScore,
+        STRING_AGG(DISTINCT u.DisplayName, ', ') FILTER (WHERE u.Id IS NOT NULL) AS TopContributors
+    FROM Tags t
+    JOIN Posts p ON p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    GROUP BY t.TagName
+    HAVING COUNT(p.Id) > 50
+),
+
+VoteAgg AS (
+    SELECT
+        v.PostId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        MAX(v.CreationDate)                                 AS LastVoteDate
+    FROM Votes v
+    GROUP BY v.PostId
+)
+
+SELECT
+    us.Id                        AS UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.NetVotes,
+    us.QuestionCount,
+    us.AnswerCount,
+    us.GoldBadgeCount,
+    rp.Title                     AS RecentTopQuestion,
+    rp.Score                     AS RecentTopScore,
+    COALESCE(va.UpVotes, 0)      AS TotalUpVotesOnTopQuestion,
+    COALESCE(va.DownVotes, 0)    AS TotalDownVotesOnTopQuestion,
+    ts.TagName,
+    ts.TagQuestionCount,
+    ROUND(ts.AvgScore, 2)        AS TagAvgScore,
+    ts.TopContributors
+FROM UserStats us
+LEFT JOIN RecentTopPosts rp
+       ON rp.OwnerUserId = us.Id AND rp.rn = 1
+LEFT JOIN VoteAgg va
+       ON va.PostId = rp.Id
+LEFT JOIN LATERAL (
+    SELECT
+        t.TagName,
+        t.TagQuestionCount,
+        t.AvgScore,
+        t.TopContributors
+    FROM TagStats t
+    WHERE EXISTS (
+        SELECT 1
+        FROM Posts p
+        WHERE p.OwnerUserId = us.Id
+          AND p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+    )
+    ORDER BY t.TagQuestionCount DESC
+    LIMIT 1
+) ts ON TRUE
+WHERE (us.Reputation + us.NetVotes) > 2000
+
+UNION ALL
+
+SELECT
+    NULL                        AS UserId,
+    'Aggregate Summary'         AS DisplayName,
+    SUM(us.Reputation)          AS Reputation,
+    SUM(us.NetVotes)            AS NetVotes,
+    SUM(us.QuestionCount)       AS QuestionCount,
+    SUM(us.AnswerCount)         AS AnswerCount,
+    SUM(us.GoldBadgeCount)      AS GoldBadgeCount,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL
+FROM UserStats us;

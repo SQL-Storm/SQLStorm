@@ -1,0 +1,164 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as UserPostRank,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) as ScoreRank,
+        LAG(p.Score) OVER (ORDER BY p.CreationDate) as PrevScore,
+        LEAD(p.ViewCount) OVER (ORDER BY p.CreationDate) as NextViewCount,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING) as UserScoreAvg,
+        COUNT(*) OVER () as TotalPosts,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags <> '' THEN 
+                (SELECT COUNT(*) FROM UNNEST(string_to_array(TRIM(both '<>' FROM p.Tags), '><')) AS tag)
+            ELSE 0 
+        END as TagCount
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) 
+),
+UserActivity AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        SUM(COALESCE(p.Score, 0)) as TotalScore,
+        AVG(COALESCE(p.Score, 0)) as AvgScore,
+        MAX(p.CreationDate) as LastPostDate,
+        STRING_AGG(DISTINCT COALESCE(p.Title, ''), '; ') as PostTitles
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+QuestionStats AS (
+    SELECT 
+        q.Id,
+        q.Title,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.CommentCount,
+        q.FavoriteCount,
+        q.CreationDate,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = q.Id) as CommentCount2,
+        CASE 
+            WHEN q.AnswerCount IS NULL OR q.AnswerCount = 0 THEN 'No Answers'
+            WHEN q.AnswerCount > 10 THEN 'Many Answers'
+            ELSE 'Few Answers'
+        END as AnswerCategory,
+        CAST(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - q.CreationDate)) / 86400 AS INTEGER) as DaysSinceCreation
+    FROM Posts q
+    WHERE q.PostTypeId = 1
+),
+AnswerStats AS (
+    SELECT 
+        a.Id,
+        a.ParentId,
+        a.Score,
+        a.CreationDate,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = a.Id AND v.VoteTypeId = 2) as UpvoteCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = a.Id AND v.VoteTypeId = 3) as DownvoteCount,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC) as AnswerRank,
+        AVG(a.Score) OVER (PARTITION BY a.ParentId) as AvgAnswerScore,
+        CASE 
+            WHEN a.Score > 10 THEN 'High Score'
+            WHEN a.Score > 0 THEN 'Positive Score'
+            ELSE 'Zero or Negative Score'
+        END as ScoreCategory
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+)
+SELECT 
+    rp.Id as PostId,
+    rp.PostTypeId,
+    rp.Title,
+    rp.Score,
+    rp.ViewCount,
+    rp.AnswerCount,
+    rp.TagCount,
+    rp.ScoreRank,
+    rp.UserPostRank,
+    rp.PrevScore,
+    rp.NextViewCount,
+    rp.UserScoreAvg,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.PostCount,
+    ua.TotalScore,
+    ua.AvgScore,
+    qs.AnswerCategory,
+    qs.CommentCount2,
+    as1.AnswerRank,
+    as1.ScoreCategory as AnswerScoreCategory,
+    CASE 
+        WHEN rp.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'Above Average'
+        WHEN rp.Score < (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'Below Average'
+        ELSE 'Average'
+    END as ScoreComparison,
+    CASE 
+        WHEN rp.TagCount > 5 THEN 'Tag Rich'
+        WHEN rp.TagCount > 0 THEN 'Tagged'
+        ELSE 'Untagged'
+    END as TagStatus,
+    CASE 
+        WHEN EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = rp.OwnerUserId AND b.Name IN ('Great Question', 'Good Question')) 
+        THEN 'Question Elite'
+        WHEN EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = rp.OwnerUserId AND b.Name IN ('Great Answer', 'Good Answer')) 
+        THEN 'Answer Elite'
+        ELSE 'Regular User'
+    END as UserStatus,
+    COALESCE(
+        (SELECT MIN(qs2.CommentCount) FROM QuestionStats qs2 WHERE qs2.Id = rp.Id),
+        (SELECT MIN(as2.UpvoteCount) FROM AnswerStats as2 WHERE as2.Id = rp.Id)
+    ) as MinComments,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = rp.Id AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)) as EditCount,
+    CASE 
+        WHEN rp.CreationDate < CAST('2010-01-01' AS timestamp) THEN 'Early'
+        WHEN rp.CreationDate > CAST('2020-01-01' AS timestamp) THEN 'Recent'
+        ELSE 'Modern'
+    END as TimeCategory,
+    LTRIM(RTRIM(LOWER(COALESCE(rp.Title, '') || ' ' || COALESCE(u.DisplayName, '') || ' ' || COALESCE(rp.Tags, '')))) as SearchText,
+    COALESCE(rp.ViewCount, 0) - COALESCE(rp.PrevScore, 0) as ScoreViewDifference,
+    CASE 
+        WHEN COALESCE(rp.ViewCount, 0) > 1000 AND COALESCE(rp.Score, 0) > 50 THEN 'Popular and Valuable'
+        WHEN COALESCE(rp.ViewCount, 0) > 1000 THEN 'Popular'
+        WHEN COALESCE(rp.Score, 0) > 50 THEN 'Valuable'
+        ELSE 'Standard'
+    END as PostClassification,
+    (SELECT COUNT(*) FROM Posts p2 WHERE p2.ParentId = rp.Id AND p2.PostTypeId = 2 AND p2.Score > 0) as PositiveAnswers
+FROM RankedPosts rp
+JOIN UserActivity ua ON rp.OwnerUserId = ua.UserId
+LEFT JOIN QuestionStats qs ON rp.Id = qs.Id AND rp.PostTypeId = 1
+LEFT JOIN AnswerStats as1 ON rp.Id = as1.Id AND rp.PostTypeId = 2
+LEFT JOIN Users u ON rp.OwnerUserId = u.Id
+WHERE rp.Score > 0 
+    AND rp.UserPostRank <= 100
+    AND (
+        EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = rp.OwnerUserId AND b.Class = 1)
+        OR EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = rp.OwnerUserId AND b.Class = 2)
+        OR EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = rp.OwnerUserId AND b.Class = 3)
+    )
+    AND COALESCE(rp.TagCount, 0) >= 2
+    AND EXISTS (
+        SELECT 1 FROM Posts p3 
+        INNER JOIN Votes v ON p3.Id = v.PostId 
+        WHERE p3.ParentId = rp.Id 
+        AND v.VoteTypeId = 2 
+        AND v.CreationDate > CAST('2010-06-01' AS timestamp)
+        GROUP BY p3.ParentId
+        HAVING COUNT(*) > 3
+    )
+ORDER BY rp.Score DESC, rp.ViewCount DESC, rp.CreationDate DESC
+LIMIT 1000;

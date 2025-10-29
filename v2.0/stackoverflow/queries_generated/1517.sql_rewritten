@@ -1,0 +1,218 @@
+-- {"query": "1517.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3381} 
+WITH RecentQuestionMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.LastEditorUserId,
+        p.Title,
+        p.Body,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+        p.ClosedDate,
+        p.AcceptedAnswerId,
+        p.Tags,
+        -- Complex calculated engagement score with NULL handling
+        (p.Score * 0.75) + (COALESCE(p.FavoriteCount, 0) * 1.2) + (p.CommentCount * 0.5) + (p.AnswerCount * 1.5) AS WeightedEngagementScore,
+        -- String expression: Extract the first tag, handling potential NULL or malformed tags
+        CASE
+            WHEN p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2 AND POSITION('>' IN p.Tags) > 1
+            THEN SUBSTRING(p.Tags FROM 2 FOR POSITION('>' IN p.Tags) - 2)
+            ELSE 'untagged'
+        END AS PrimaryTag
+    FROM Posts AS p
+    WHERE p.PostTypeId = 1 -- Only questions
+      AND p.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '5 years')
+      AND p.ViewCount > 100
+),
+UserEngagementStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName AS UserName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.UpVotes AS UserUpVotes,
+        u.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT p.Id) AS TotalOwnedPosts,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadgesCount,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadgesCount
+    FROM Users AS u
+    LEFT JOIN Posts AS p ON u.Id = p.OwnerUserId AND p.PostTypeId IN (1, 2)
+    LEFT JOIN Comments AS c ON u.Id = c.UserId
+    LEFT JOIN Badges AS b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.UpVotes, u.DownVotes
+    HAVING u.Reputation > 500 OR SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) > 0
+),
+PostHistoricalInteractions AS (
+    SELECT
+        ph.PostId,
+        COUNT(ph.Id) AS TotalHistoryEvents,
+        COUNT(DISTINCT ph.UserId) AS UniqueHistoricalUsers,
+        MAX(ph.CreationDate) AS LastHistoryEventDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (10, 101) THEN 1 ELSE 0 END) AS WasClosedStatus, -- 10: Post Closed, 101: Duplicate
+        -- Correlated subquery: Find the display name of the first unique editor if different from owner
+        (SELECT ue.DisplayName
+         FROM PostHistory AS ph_sub
+         JOIN Users AS ue ON ph_sub.UserId = ue.Id
+         WHERE ph_sub.PostId = ph.PostId
+           AND ph_sub.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Body, Tags
+           AND ph_sub.UserId IS NOT NULL
+           AND ue.DisplayName IS NOT NULL
+           AND ue.Id != (SELECT rqm_inner.OwnerUserId FROM RecentQuestionMetrics AS rqm_inner WHERE rqm_inner.PostId = ph.PostId LIMIT 1) -- Ensure different user
+         ORDER BY ph_sub.CreationDate ASC
+         LIMIT 1) AS FirstDifferentEditorDisplayName
+    FROM PostHistory AS ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6, 10, 11, 12, 13, 101, 35) -- Edits, Close/Reopen/Delete, Migrated Away
+    GROUP BY ph.PostId
+),
+TagPerformanceOverview AS (
+    SELECT
+        t.TagName,
+        t.Count AS TagQuestionCount,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC, t.TagName) AS TagGlobalRank,
+        AVG(rqm.Score) FILTER (WHERE rqm.Tags LIKE CONCAT('%<', t.TagName, '>%' )) AS AvgQuestionScore,
+        AVG(rqm.ViewCount) FILTER (WHERE rqm.Tags LIKE CONCAT('%<', t.TagName, '>%' )) AS AvgQuestionViewCount
+    FROM Tags AS t
+    LEFT JOIN RecentQuestionMetrics AS rqm ON rqm.Tags LIKE CONCAT('%<', t.TagName, '>%')
+    WHERE t.Count > 500
+    GROUP BY t.TagName, t.Count
+)
+-- Main Analytical Query Block 1
+SELECT
+    rqm.PostId,
+    rqm.Title,
+    rqm.CreationDate AS QuestionCreatedOn,
+    rqm.LastActivityDate AS LastActivityOn,
+    rqm.Score AS QuestionScore,
+    rqm.ViewCount AS QuestionViews,
+    rqm.PrimaryTag,
+    ues_owner.UserName AS QuestionOwnerName,
+    ues_owner.Reputation AS OwnerReputation,
+    ues_owner.GoldBadgesCount AS OwnerGoldBadges,
+    phi.TotalHistoryEvents,
+    phi.UniqueHistoricalUsers,
+    phi.WasClosedStatus AS QuestionWasClosed,
+    phi.FirstDifferentEditorDisplayName,
+    COALESCE(ans.Score, 0) AS AcceptedAnswerScore,
+    ans.CreationDate AS AcceptedAnswerDate,
+    ues_ans_owner.UserName AS AcceptedAnswerOwnerName,
+    -- Window Function: Rank questions by engagement score within their primary tag
+    RANK() OVER (PARTITION BY rqm.PrimaryTag ORDER BY rqm.WeightedEngagementScore DESC, rqm.PostId) AS TagEngagementRank,
+    -- Correlated Subquery: Count related posts (duplicates or linked)
+    (SELECT COUNT(pl.Id)
+     FROM PostLinks AS pl
+     WHERE pl.PostId = rqm.PostId
+       AND pl.LinkTypeId IN (1, 3)
+       AND pl.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '2 years')
+    ) AS RelatedPostCount,
+    -- Complex CASE expression for Post Status
+    CASE
+        WHEN rqm.ClosedDate IS NOT NULL AND rqm.WasClosedStatus = 1 THEN 'Closed & Flagged'
+        WHEN rqm.AcceptedAnswerId IS NOT NULL THEN 'Resolved with Acceptance'
+        WHEN rqm.AnswerCount > 0 AND rqm.CommentCount > 5 THEN 'Highly Discussed'
+        WHEN AGE(cast('2024-10-01 12:34:56' as timestamp), rqm.LastActivityDate) > INTERVAL '6 months' THEN 'Stale but Open'
+        ELSE 'Active & Open'
+    END AS DetailedPostStatus,
+    -- String manipulations and NULL logic
+    UPPER(LEFT(COALESCE(rqm.Title, 'NO TITLE PROVIDED'), 20)) AS TitleExcerptUpper,
+    REPLACE(REPLACE(REPLACE(SUBSTRING(rqm.Body, 1, 150), '<p>', ''), '</p>', ''), '&amp;', '&') AS BodyPreviewCleaned,
+    CASE
+        WHEN rqm.Body LIKE '%security%' OR rqm.Title LIKE '%vulnerability%' THEN 'Security Concern'
+        WHEN rqm.Body LIKE '%memory%' OR rqm.Title LIKE '%performance%' THEN 'Performance Topic'
+        ELSE 'General Discussion'
+    END AS ContentCategorization,
+    -- Date difference calculation
+    EXTRACT(DAY FROM AGE(cast('2024-10-01 12:34:56' as timestamp), rqm.CreationDate)) AS DaysSinceQuestionCreation,
+    tpo.TagQuestionCount AS PrimaryTagTotalQuestions,
+    tpo.AvgQuestionScore AS PrimaryTagAvgScore
+FROM RecentQuestionMetrics AS rqm
+LEFT JOIN UserEngagementStats AS ues_owner ON rqm.OwnerUserId = ues_owner.UserId
+LEFT JOIN PostHistoricalInteractions AS phi ON rqm.PostId = phi.PostId
+LEFT JOIN Posts AS ans ON rqm.AcceptedAnswerId = ans.Id AND ans.PostTypeId = 2
+LEFT JOIN UserEngagementStats AS ues_ans_owner ON ans.OwnerUserId = ues_ans_owner.UserId
+LEFT JOIN TagPerformanceOverview AS tpo ON rqm.PrimaryTag = tpo.TagName
+WHERE rqm.WeightedEngagementScore > 20
+  AND (rqm.PrimaryTag IN ('sql', 'postgresql', 'mysql') OR rqm.Tags LIKE '%<database>%')
+  AND (NOT EXISTS (SELECT 1 FROM Comments AS com WHERE com.PostId = rqm.PostId AND com.Text ILIKE '%please upvote%' OR com.Score < -2))
+  AND rqm.ViewCount / (EXTRACT(EPOCH FROM AGE(cast('2024-10-01 12:34:56' as timestamp), rqm.CreationDate)) / 3600 / 24 + 1) > 10 -- Avg views per day > 10
+ORDER BY rqm.WeightedEngagementScore DESC, rqm.LastActivityDate DESC
+LIMIT 75
+
+UNION ALL
+
+-- Main Analytical Query Block 2 (Complementary Data Set: Users with significant contributions but less popular questions)
+SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate AS QuestionCreatedOn,
+    p.LastActivityDate AS LastActivityOn,
+    p.Score AS QuestionScore,
+    p.ViewCount AS QuestionViews,
+    CASE
+        WHEN p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2 AND POSITION('>' IN p.Tags) > 1
+        THEN SUBSTRING(p.Tags FROM 2 FOR POSITION('>' IN p.Tags) - 2)
+        ELSE 'unspecified'
+    END AS PrimaryTag,
+    ues.UserName AS QuestionOwnerName,
+    ues.Reputation AS OwnerReputation,
+    ues.GoldBadgesCount AS OwnerGoldBadges,
+    COUNT(ph_sub.Id) AS TotalHistoryEvents, -- Simple history count for this block
+    COUNT(DISTINCT ph_sub.UserId) AS UniqueHistoricalUsers,
+    MAX(CASE WHEN ph_sub.PostHistoryTypeId IN (10, 101) THEN 1 ELSE 0 END) AS QuestionWasClosed,
+    (SELECT u_editor.DisplayName FROM Users AS u_editor WHERE u_editor.Id = p.LastEditorUserId LIMIT 1) AS FirstDifferentEditorDisplayName, -- Simpler editor info
+    COALESCE(ans_sub.Score, 0) AS AcceptedAnswerScore,
+    ans_sub.CreationDate AS AcceptedAnswerDate,
+    ues_ans.UserName AS AcceptedAnswerOwnerName,
+    -- Window Function: Rank posts by owner's total questions, then post score
+    ROW_NUMBER() OVER (PARTITION BY ues.UserId ORDER BY p.CreationDate DESC, p.Score DESC) AS TagEngagementRank,
+    -- Correlated Subquery: Count comments from high-reputation users
+    (SELECT COUNT(c_sub.Id)
+     FROM Comments AS c_sub
+     JOIN Users AS u_c_sub ON c_sub.UserId = u_c_sub.Id
+     WHERE c_sub.PostId = p.Id AND u_c_sub.Reputation > 5000
+    ) AS RelatedPostCount,
+    -- Complex CASE expression for post age categorization
+    CASE
+        WHEN AGE(cast('2024-10-01 12:34:56' as timestamp), p.CreationDate) < INTERVAL '3 months' THEN 'Recently Posted'
+        WHEN AGE(cast('2024-10-01 12:34:56' as timestamp), p.CreationDate) BETWEEN INTERVAL '3 months' AND INTERVAL '1 year' THEN 'Moderately Aged'
+        ELSE 'Older Post'
+    END AS DetailedPostStatus,
+    -- More string manipulation
+    LOWER(REVERSE(SUBSTRING(COALESCE(p.Title, 'UNKNOWN'), 1, 15))) AS TitleExcerptUpper,
+    TRIM(LEFT(p.Body, 120)) AS BodyPreviewCleaned,
+    CASE
+        WHEN p.Body ILIKE '%regex%' OR p.Tags LIKE '%<regex>%' THEN 'Regex Related'
+        WHEN p.Title ILIKE '%api%' OR p.Tags LIKE '%<api>%' THEN 'API Integration'
+        ELSE 'Uncategorized'
+    END AS ContentCategorization,
+    -- Date difference calculation in weeks
+    EXTRACT(WEEK FROM AGE(cast('2024-10-01 12:34:56' as timestamp), p.LastActivityDate)) AS WeeksSinceLastActivity,
+    tpo_sub.TagQuestionCount AS PrimaryTagTotalQuestions,
+    tpo_sub.AvgQuestionScore AS PrimaryTagAvgScore
+FROM Posts AS p
+JOIN UserEngagementStats AS ues ON p.OwnerUserId = ues.UserId
+LEFT JOIN PostHistory AS ph_sub ON p.Id = ph_sub.PostId AND ph_sub.PostHistoryTypeId IN (4, 5, 6, 10, 101)
+LEFT JOIN Posts AS ans_sub ON p.AcceptedAnswerId = ans_sub.Id AND ans_sub.PostTypeId = 2
+LEFT JOIN UserEngagementStats AS ues_ans ON ans_sub.OwnerUserId = ues_ans.UserId
+LEFT JOIN TagPerformanceOverview AS tpo_sub ON CASE
+    WHEN p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2 AND POSITION('>' IN p.Tags) > 1
+    THEN SUBSTRING(p.Tags FROM 2 FOR POSITION('>' IN p.Tags) - 2)
+    ELSE 'unspecified'
+END = tpo_sub.TagName
+WHERE p.PostTypeId = 1
+  AND ues.TotalOwnedPosts > 100 -- Users who have posted many questions
+  AND p.Score BETWEEN 5 AND 50 -- Questions with moderate score
+  AND p.AnswerCount >= 1 AND p.AnswerCount <= 5 -- Questions with some answers, but not too many
+  AND (p.Tags LIKE '%<python>%' OR p.Tags LIKE '%<javascript>%')
+GROUP BY p.Id, p.Title, p.CreationDate, p.LastActivityDate, p.Score, p.ViewCount, p.Tags,
+         ues.UserName, ues.Reputation, ues.GoldBadgesCount, p.LastEditorUserId,
+         ans_sub.Score, ans_sub.CreationDate, ues_ans.UserName, p.Body,
+         tpo_sub.TagQuestionCount, tpo_sub.AvgQuestionScore
+HAVING COUNT(ph_sub.Id) < 10 -- Questions that haven't been edited too many times
+ORDER BY ues.Reputation DESC, p.Score DESC
+LIMIT 75;

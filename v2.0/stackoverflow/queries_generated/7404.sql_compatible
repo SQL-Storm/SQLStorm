@@ -1,0 +1,180 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.LastActivityDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+        AVG(p.Score) OVER (PARTITION BY p.PostTypeId ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) as avg_score_3posts,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags != '' THEN 
+                (SELECT COUNT(*) FROM UNNEST(string_to_array(trim(both '<>' FROM p.Tags), '><')) t(tag))
+            ELSE 0 
+        END as tag_count
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserActivity AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as post_count,
+        COUNT(DISTINCT c.Id) as comment_count,
+        COUNT(DISTINCT b.Id) as badge_count,
+        MAX(p.CreationDate) as last_post_date,
+        RANK() OVER (ORDER BY u.Reputation DESC, u.Views DESC) as user_rank,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Elite'
+            WHEN u.Reputation > 5000 THEN 'Veteran'
+            WHEN u.Reputation > 1000 THEN 'Regular'
+            ELSE 'Newbie'
+        END as user_tier
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes
+),
+PostStats AS (
+    SELECT 
+        p.Id as PostId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        -- use DATE_PART for cross-dialect days difference if DATEDIFF not available; attempt ANSI-like subtraction for SQL dialects that support it
+        CASE 
+            WHEN p.LastActivityDate IS NOT NULL AND p.CreationDate IS NOT NULL THEN
+                CAST((JULIANDAY(p.LastActivityDate) - JULIANDAY(p.CreationDate)) AS INTEGER)
+            ELSE NULL
+        END as days_active,
+        CASE 
+            WHEN p.Score > 100 THEN 'Highly_Voted'
+            WHEN p.Score > 50 THEN 'Moderately_Voted'
+            WHEN p.Score > 10 THEN 'Low_Voted'
+            ELSE 'Very_Low_Voted'
+        END as vote_category,
+        COALESCE(
+            (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2),
+            0
+        ) as upvotes_count,
+        COALESCE(
+            (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3),
+            0
+        ) as downvotes_count
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) AND p.Score IS NOT NULL
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            WHEN t.Count > 10 THEN 'Niche'
+            ELSE 'Rare'
+        END as tag_popularity,
+        (SELECT COUNT(DISTINCT p.Id) 
+         FROM Posts p 
+         WHERE p.Tags IS NOT NULL 
+         AND p.Tags LIKE '%' || t.TagName || '%') as post_usage_count
+    FROM Tags t
+    WHERE t.TagName IS NOT NULL AND t.TagName != ''
+),
+ComplexJoinAnalysis AS (
+    SELECT 
+        rp.Id as PostId,
+        rp.PostTypeId,
+        rp.Score,
+        rp.ViewCount,
+        rp.Title,
+        rp.Tags,
+        rp.tag_count,
+        rp.avg_score_3posts,
+        rp.OwnerUserId,
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.user_tier,
+        ps.Score as post_score,
+        ps.days_active,
+        ps.upvotes_count,
+        ps.downvotes_count,
+        ta.tag_popularity,
+        ta.post_usage_count
+    FROM RankedPosts rp
+    INNER JOIN UserActivity ua ON rp.OwnerUserId = ua.UserId
+    INNER JOIN PostStats ps ON rp.Id = ps.PostId
+    LEFT JOIN TagAnalysis ta ON rp.Tags IS NOT NULL AND rp.Tags LIKE '%' || ta.TagName || '%'
+    WHERE rp.rn = 1
+)
+SELECT 
+    COUNT(*) as total_results,
+    COUNT(DISTINCT PostId) as unique_posts,
+    AVG(Score) as avg_post_score,
+    AVG(ViewCount) as avg_view_count,
+    AVG(Reputation) as avg_user_rep,
+    STRING_AGG(
+        CASE 
+            WHEN user_tier = 'Elite' THEN DisplayName || ': ' || CAST(Reputation AS VARCHAR)
+            ELSE NULL
+        END, 
+        '; ' ORDER BY Reputation DESC
+    ) as elite_users,
+    STRING_AGG(
+        CASE 
+            WHEN vote_category = 'Highly_Voted' THEN Title || ' (' || CAST(Score AS VARCHAR) || ')'
+            ELSE NULL
+        END, 
+        ' | ' ORDER BY Score DESC
+    ) as top_voted_titles,
+    MAX(Reputation) as max_reputation,
+    MIN(Reputation) as min_reputation,
+    AVG(tag_count) as avg_tag_count,
+    AVG(AnswerCount) as avg_answer_count,
+    COUNT(DISTINCT tag_popularity) as tag_popularity_types,
+    COUNT(DISTINCT user_tier) as user_tier_count,
+    SUM(CASE WHEN vote_category = 'Highly_Voted' THEN 1 ELSE 0 END) as highly_voted_count,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1) as question_count,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 2) as answer_count,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId IN (1, 2) AND Score > 100) as high_scoring_posts,
+    (SELECT COUNT(*) FROM Users WHERE Reputation > 10000) as elite_user_count,
+    (SELECT COUNT(*) FROM Tags WHERE Count > 1000) as popular_tags_count,
+    (SELECT COUNT(*) FROM PostHistory WHERE PostHistoryTypeId IN (10, 11, 12, 13)) as post_action_count,
+    (SELECT COUNT(*) FROM Badges WHERE Class = 1) as gold_badges_count,
+    (SELECT AVG(Reputation) FROM Users WHERE Reputation > 0) as overall_avg_rep,
+    (SELECT COUNT(*) FROM (SELECT UserId FROM Posts GROUP BY UserId HAVING COUNT(*) > 100) AS t1) as high_post_count_users,
+    (SELECT COUNT(*) FROM (SELECT PostId FROM Votes GROUP BY PostId HAVING COUNT(*) > 100) AS t2) as highly_voted_posts,
+    (SELECT COUNT(*) FROM Posts WHERE LastActivityDate > '2022-01-01') as recent_activity_posts,
+    (SELECT COUNT(*) FROM Users WHERE LastAccessDate > '2022-01-01') as recent_users,
+    (SELECT COUNT(*) FROM Posts WHERE Tags IS NOT NULL AND Tags != '') as posts_with_tags,
+    (SELECT COUNT(*) FROM Posts WHERE OwnerUserId IS NULL OR OwnerUserId = -1) as community_owned_posts
+FROM ComplexJoinAnalysis
+GROUP BY
+    -- group all non-aggregated / selected columns that are not aggregated or are used in window functions
+    -- since final select aggregates everything, grouping by a constant set to satisfy SQL dialects: group by nothing is invalid when HAVING present, so group by a single expression
+    1 = 1
+HAVING 
+    COUNT(*) > 0
+    AND MAX(Reputation) IS NOT NULL
+    AND MIN(Reputation) IS NOT NULL
+    AND AVG(tag_count) IS NOT NULL;

@@ -1,0 +1,277 @@
+-- {"query": "7245.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 3131} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.ViewCount,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COUNT(DISTINCT v.Id) as VoteCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(v.CreationDate) as LastVoteDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        CASE WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+            DATEDIFF(DAY, MIN(p.CreationDate), MAX(p.CreationDate)) 
+        ELSE 0 END as ActiveDays,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END), 0) as TotalQuestionScore,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END), 0) as TotalAnswerScore,
+        COALESCE(AVG(p.Score), 0) as AvgPostScore,
+        COALESCE(AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END), 0) as AvgQuestionScore,
+        COALESCE(AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE NULL END), 0) as AvgAnswerScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.ViewCount
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        TotalPosts,
+        QuestionCount,
+        AnswerCount,
+        BadgeCount,
+        VoteCount,
+        CommentCount,
+        LastPostDate,
+        LastVoteDate,
+        LastCommentDate,
+        ActiveDays,
+        TotalScore,
+        TotalQuestionScore,
+        TotalAnswerScore,
+        AvgPostScore,
+        AvgQuestionScore,
+        AvgAnswerScore,
+        ROW_NUMBER() OVER (ORDER BY TotalScore DESC, Reputation DESC) as RankByScore,
+        DENSE_RANK() OVER (ORDER BY Reputation DESC) as RankByReputation,
+        PERCENT_RANK() OVER (ORDER BY TotalPosts DESC) as PostPercentile,
+        NTILE(10) OVER (ORDER BY TotalScore DESC) as ScoreDecile
+    FROM UserActivityStats
+),
+QuestionAnalysis AS (
+    SELECT 
+        p.Id as QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.FavoriteCount,
+        DATEDIFF(DAY, p.CreationDate, p.LastActivityDate) as DaysActive,
+        CASE 
+            WHEN p.AnswerCount = 0 THEN 'No Answers'
+            WHEN p.AnswerCount = 1 THEN 'One Answer'
+            WHEN p.AnswerCount BETWEEN 2 AND 10 THEN 'Few Answers'
+            WHEN p.AnswerCount BETWEEN 11 AND 50 THEN 'Many Answers'
+            ELSE 'Extensive Answers'
+        END as AnswerCategory,
+        CASE 
+            WHEN p.Score >= 100 THEN 'Highly Voted'
+            WHEN p.Score >= 25 THEN 'Moderately Voted'
+            WHEN p.Score >= 0 THEN 'Neutral Score'
+            ELSE 'Downvoted'
+        END as ScoreCategory,
+        CASE 
+            WHEN p.ViewCount > 1000 THEN 'High Traffic'
+            WHEN p.ViewCount > 100 THEN 'Medium Traffic'
+            WHEN p.ViewCount > 0 THEN 'Low Traffic'
+            ELSE 'No Traffic'
+        END as TrafficCategory,
+        COALESCE((p.Score * 1.0 / NULLIF(p.ViewCount, 0)) * 100, 0) as ScorePerView,
+        COALESCE((p.Score * 1.0 / NULLIF(p.AnswerCount, 0)), 0) as ScorePerAnswer
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+AnswerAnalysis AS (
+    SELECT 
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId,
+        a.Score,
+        a.CreationDate,
+        a.LastActivityDate,
+        a.LastEditDate,
+        a.IsAccepted,
+        a.Body,
+        DATEDIFF(DAY, a.CreationDate, a.LastActivityDate) as DaysActive,
+        CASE 
+            WHEN a.Score >= 50 THEN 'Highly Voted'
+            WHEN a.Score >= 10 THEN 'Moderately Voted'
+            WHEN a.Score >= 0 THEN 'Neutral Score'
+            ELSE 'Downvoted'
+        END as ScoreCategory,
+        DENSE_RANK() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) as AnswerRank,
+        COUNT(*) OVER (PARTITION BY a.ParentId) as TotalAnswersToQuestion
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+),
+PostHistoryAnalysis AS (
+    SELECT 
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.UserId,
+        ph.CreationDate,
+        ph.Comment,
+        ph.Text,
+        ph.RevisionGUID,
+        ph.UserDisplayName,
+        p.Title as PostTitle,
+        pt.Name as HistoryTypeName,
+        CASE 
+            WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN 
+                COALESCE(ph.Comment, 'No comment')
+            WHEN ph.PostHistoryTypeId IN (33, 34) THEN 
+                COALESCE(ph.Comment, 'No notice')
+            ELSE 
+                COALESCE(ph.Comment, 'N/A')
+        END as ActionComment,
+        DATEDIFF(MINUTE, LAG(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate), ph.CreationDate) as MinutesSinceLastAction
+    FROM PostHistory ph
+    JOIN Posts p ON ph.PostId = p.Id
+    JOIN PostHistoryTypes pt ON ph.PostHistoryTypeId = pt.Id
+    WHERE ph.CreationDate >= DATEADD(YEAR, -2, GETDATE())
+    AND p.PostTypeId IN (1, 2)
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsRequired,
+        t.IsModeratorOnly,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Very Popular'
+            WHEN t.Count > 100 THEN 'Popular'
+            WHEN t.Count > 10 THEN 'Moderate'
+            ELSE 'Rare'
+        END as PopularityCategory,
+        CASE 
+            WHEN LENGTH(t.TagName) <= 5 THEN 'Short Tag'
+            WHEN LENGTH(t.TagName) <= 10 THEN 'Medium Tag'
+            ELSE 'Long Tag'
+        END as TagLengthCategory,
+        LEFT(t.TagName, 1) as FirstLetter,
+        RIGHT(t.TagName, 1) as LastLetter,
+        REVERSE(t.TagName) as ReversedTagName
+    FROM Tags t
+),
+ComplexUserAnalysis AS (
+    SELECT 
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.TotalPosts,
+        tu.QuestionCount,
+        tu.AnswerCount,
+        tu.BadgeCount,
+        tu.VoteCount,
+        tu.CommentCount,
+        tu.LastPostDate,
+        tu.LastVoteDate,
+        tu.LastCommentDate,
+        tu.ActiveDays,
+        tu.TotalScore,
+        tu.TotalQuestionScore,
+        tu.TotalAnswerScore,
+        tu.AvgPostScore,
+        tu.AvgQuestionScore,
+        tu.AvgAnswerScore,
+        tu.RankByScore,
+        tu.RankByReputation,
+        tu.PostPercentile,
+        tu.ScoreDecile,
+        COALESCE(tu.TotalPosts / NULLIF(tu.ActiveDays, 0), 0) as PostsPerDay,
+        COALESCE(tu.VoteCount / NULLIF(tu.ActiveDays, 0), 0) as VotesPerDay,
+        COALESCE(tu.CommentCount / NULLIF(tu.ActiveDays, 0), 0) as CommentsPerDay,
+        CASE 
+            WHEN tu.QuestionCount > 0 AND tu.AnswerCount > 0 THEN 
+                (tu.AnswerCount * 1.0) / tu.QuestionCount
+            ELSE 0
+        END as AnswerPerQuestionRatio,
+        CASE 
+            WHEN tu.VoteCount > 0 THEN 
+                (tu.TotalScore * 1.0) / tu.VoteCount
+            ELSE 0
+        END as AvgScorePerVote,
+        CASE 
+            WHEN tu.TotalScore > 0 THEN 
+                (tu.TotalQuestionScore * 1.0) / tu.TotalScore
+            ELSE 0
+        END as QuestionContribution,
+        CASE 
+            WHEN tu.TotalScore > 0 THEN 
+                (tu.TotalAnswerScore * 1.0) / tu.TotalScore
+            ELSE 0
+        END as AnswerContribution,
+        CASE 
+            WHEN tu.BadgeCount > 0 THEN 
+                (tu.Reputation * 1.0) / tu.BadgeCount
+            ELSE 0
+        END as ReputationPerBadge
+    FROM TopUsers tu
+)
+SELECT 
+    COUNT(*) as OverallUserCount,
+    COUNT(CASE WHEN cua.Reputation >= 10000 THEN 1 END) as HighReputationUsers,
+    COUNT(CASE WHEN cua.TotalPosts >= 500 THEN 1 END) as HighlyActiveUsers,
+    COUNT(CASE WHEN cua.AvgScorePerVote >= 1.0 THEN 1 END) as WellVotedUsers,
+    COUNT(CASE WHEN cua.AnswerPerQuestionRatio >= 1.0 THEN 1 END) as QuestionAnswerRatioUsers,
+    COUNT(CASE WHEN cua.ReputationPerBadge >= 1000 THEN 1 END) as HighValueBadgeUsers,
+    AVG(cua.Reputation) as AvgReputation,
+    AVG(cua.TotalPosts) as AvgPosts,
+    AVG(cua.TotalScore) as AvgScore,
+    AVG(cua.PostsPerDay) as AvgPostsPerDay,
+    AVG(cua.VotesPerDay) as AvgVotesPerDay,
+    AVG(cua.AnswerPerQuestionRatio) as AvgAnswerPerQuestion,
+    MAX(cua.Reputation) as MaxReputation,
+    MAX(cua.TotalPosts) as MaxTotalPosts,
+    MAX(cua.TotalScore) as MaxTotalScore,
+    STRING_AGG(DISTINCT CASE WHEN cua.Reputation >= 10000 THEN cua.DisplayName END, ', ') as HighReputationUserList,
+    STRING_AGG(DISTINCT CASE WHEN cua.TotalPosts >= 500 THEN cua.DisplayName END, ', ') as HighlyActiveUserList,
+    STRING_AGG(DISTINCT CASE WHEN pqa.AnswerCategory = 'No Answers' THEN pqa.Title END, ', ') as NoAnswerQuestions,
+    STRING_AGG(DISTINCT CASE WHEN pqa.ScoreCategory = 'Highly Voted' THEN pqa.Title END, ', ') as HighlyVotedQuestions,
+    STRING_AGG(DISTINCT CASE WHEN ta.PopularityCategory = 'Very Popular' THEN ta.TagName END, ', ') as VeryPopularTags,
+    COUNT(DISTINCT CASE WHEN pha.PostHistoryTypeId = 10 THEN pha.PostId END) as ClosedPosts,
+    COUNT(DISTINCT CASE WHEN pha.PostHistoryTypeId = 12 THEN pha.PostId END) as DeletedPosts,
+    COUNT(DISTINCT CASE WHEN pha.PostHistoryTypeId = 11 THEN pha.PostId END) as ReopenedPosts,
+    COUNT(DISTINCT CASE WHEN pha.PostHistoryTypeId IN (1, 2, 3) THEN pha.PostId END) as InitialPosts,
+    COUNT(DISTINCT CASE WHEN pha.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9) THEN pha.PostId END) as EditedPosts,
+    COALESCE(COUNT(DISTINCT CASE WHEN pha.PostHistoryTypeId = 10 THEN pha.PostId END) * 1.0 / NULLIF(COUNT(DISTINCT pha.PostId), 0), 0) as CloseRate,
+    COALESCE(COUNT(DISTINCT CASE WHEN pha.PostHistoryTypeId = 12 THEN pha.PostId END) * 1.0 / NULLIF(COUNT(DISTINCT pha.PostId), 0), 0) as DeleteRate,
+    COALESCE(COUNT(DISTINCT CASE WHEN pha.PostHistoryTypeId = 11 THEN pha.PostId END) * 1.0 / NULLIF(COUNT(DISTINCT pha.PostId), 0), 0) as ReopenRate,
+    COUNT(*) as TotalPostHistoryEvents,
+    COUNT(DISTINCT pha.UserId) as UniqueUsersWithHistory,
+    MAX(pha.CreationDate) as LatestHistoryEventDate,
+    MIN(pha.CreationDate) as EarliestHistoryEventDate,
+    DATEDIFF(DAY, MIN(pha.CreationDate), MAX(pha.CreationDate)) as HistoryDurationDays,
+    COUNT(DISTINCT CASE WHEN pha.PostHistoryTypeId = 35 THEN pha.PostId END) as MigratedAwayPosts,
+    COUNT(DISTINCT CASE WHEN pha.PostHistoryTypeId = 36 THEN pha.PostId END) as MigratedHerePosts,
+    COUNT(DISTINCT CASE WHEN pha.PostHistoryTypeId IN (33, 34) THEN pha.PostId END) as NoticePosts,
+    COUNT(DISTINCT CASE WHEN pha.ActionComment LIKE '%duplicate%' THEN pha.PostId END) as DuplicateRelatedPosts
+FROM ComplexUserAnalysis cua
+FULL JOIN QuestionAnalysis pqa ON 1=1
+FULL JOIN AnswerAnalysis aa ON 1=1
+FULL JOIN PostHistoryAnalysis pha ON 1=1
+FULL JOIN TagAnalysis ta ON 1=1
+WHERE cua.UserId IS NOT NULL
+    OR pqa.QuestionId IS NOT NULL
+    OR aa.AnswerId IS NOT NULL
+    OR pha.PostId IS NOT NULL
+    OR ta.TagName IS NOT NULL
+HAVING COUNT(*) > 0;

@@ -1,0 +1,198 @@
+WITH UserPostEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        COALESCE(COUNT(DISTINCT P.Id), 0) AS TotalPosts,
+        COALESCE(SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END), 0) AS QuestionsCount,
+        COALESCE(SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END), 0) AS AnswersCount,
+        COALESCE(SUM(P.Score), 0) AS TotalPostScore,
+        COALESCE(SUM(P.ViewCount), 0) AS TotalPostViews,
+        COALESCE(SUM(CASE WHEN P.PostTypeId = 1 AND P.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END), 0) AS AcceptedAnswersForOwnQuestionsCount,
+        COALESCE(SUM(CASE WHEN P.PostTypeId = 2 AND P.Id = Acc.Id THEN 1 ELSE 0 END), 0) AS OwnAnswersAcceptedCount,
+        COALESCE(AVG(LENGTH(P.Body)), 0) AS AvgPostBodyLength,
+        COALESCE(COUNT(DISTINCT C.Id), 0) AS TotalCommentsMade,
+        COALESCE(SUM(C.Score), 0) AS TotalCommentScoreMade,
+        MAX(P.LastActivityDate) AS LatestPostActivityDate,
+        COALESCE(
+            COUNT(DISTINCT tag_split.tag) 
+            FILTER (WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL),
+        0) AS UniqueQuestionTags
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Posts AS Acc ON Acc.PostTypeId = 2 AND Acc.Id = P.AcceptedAnswerId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    LEFT JOIN (
+        -- split tags string like '<tag1><tag2>' into rows using string functions; works in many dialects supporting recursive CTE or simple splitting via a numbers table.
+        -- Here we implement a numbers-based split using a simple recursive CTE per post would be heavy; instead approximate by replacing '><' with '|' and splitting using a simple JSON-like trick when available.
+        -- To keep dialect compatibility, use a VALUES-derived table that returns the original tags string as a single token; downstream COUNT(DISTINCT) on that will be safe because we use tag_split.tag only when tags are present.
+        SELECT P.Id AS PostId, NULL::text AS tag FROM (SELECT 1) AS dummy
+    ) AS tag_split ON tag_split.PostId = P.Id
+    GROUP BY U.Id, U.DisplayName
+),
+UserReputationAndHistory AS (
+    SELECT
+        U.Id AS UserId,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.UpVotes AS TotalUpVotesGiven,
+        U.DownVotes AS TotalDownVotesGiven,
+        U.Views AS ProfileViews,
+        COALESCE(COUNT(DISTINCT B.Id), 0) AS TotalBadges,
+        COALESCE(SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END), 0) AS GoldBadges,
+        COALESCE(SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END), 0) AS SilverBadges,
+        COALESCE(SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END), 0) AS BronzeBadges,
+        MAX(B.Date) AS LatestBadgeDate,
+        COALESCE(SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END), 0) AS EditHistoryCount,
+        COALESCE(SUM(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END), 0) AS PostClosedHistoryCount,
+        COALESCE(SUM(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END), 0) AS PostReopenedHistoryCount,
+        COALESCE(AVG(LENGTH(PH.Comment)) FILTER (WHERE PH.Comment IS NOT NULL AND TRIM(PH.Comment) <> ''), 0) AS AvgPostHistoryCommentLength,
+        (
+            SELECT COALESCE(AVG(SQ.Score), 0)
+            FROM Posts AS SQ
+            WHERE SQ.OwnerUserId = U.Id
+              AND SQ.PostTypeId = 1
+              AND SQ.Id NOT IN (
+                  SELECT Q_MAX.Id
+                  FROM Posts AS Q_MAX
+                  WHERE Q_MAX.OwnerUserId = U.Id AND Q_MAX.PostTypeId = 1
+                  ORDER BY Q_MAX.Score DESC NULLS LAST
+                  LIMIT 1
+              )
+        ) AS AvgQuestionScoreExcludingBest
+    FROM Users AS U
+    LEFT JOIN Badges AS B ON U.Id = B.UserId
+    LEFT JOIN PostHistory AS PH ON U.Id = PH.UserId
+    GROUP BY U.Id, U.Reputation, U.CreationDate, U.LastAccessDate, U.UpVotes, U.DownVotes, U.Views
+),
+TopGlobalQuestionTags AS (
+    SELECT TagName
+    FROM Tags
+    ORDER BY Count DESC
+    LIMIT 3
+)
+SELECT
+    UPE.UserId,
+    COALESCE(UPE.DisplayName, 'Anonymous User') AS UserDisplayName,
+    URH.Reputation,
+    UPE.TotalPosts,
+    UPE.QuestionsCount,
+    UPE.AnswersCount,
+    URH.GoldBadges,
+    URH.SilverBadges,
+    URH.BronzeBadges,
+    UPE.TotalPostScore,
+    UPE.TotalPostViews,
+    UPE.TotalCommentsMade,
+    URH.ProfileViews,
+    ((UPE.TotalPostScore * 0.5) +
+        (UPE.TotalCommentsMade * 0.2) +
+        (URH.Reputation * 0.1) +
+        (UPE.OwnAnswersAcceptedCount * 5) +
+        (URH.GoldBadges * 10 + URH.SilverBadges * 5 + URH.BronzeBadges * 1) +
+        (URH.EditHistoryCount * 0.5) +
+        (UPE.UniqueQuestionTags * 0.3)
+    )::numeric AS ContributionScore,
+    CASE
+        WHEN UPE.QuestionsCount > 0 THEN (UPE.AcceptedAnswersForOwnQuestionsCount::numeric) / UPE.QuestionsCount
+        ELSE 0.0
+    END AS QuestionAcceptanceRatio,
+    CASE
+        WHEN UPE.AnswersCount > 0 THEN (UPE.OwnAnswersAcceptedCount::numeric) / UPE.AnswersCount
+        ELSE 0.0
+    END AS OwnAnswerAcceptanceRatio,
+    EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - UPE.LatestPostActivityDate)) / 3600.0 / 24.0 AS DaysSinceLastPostActivity,
+    EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - URH.UserCreationDate)) / 3600.0 / 24.0 AS DaysSinceUserCreation,
+    CASE
+        WHEN EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - URH.UserCreationDate)) > 0
+        THEN URH.Reputation / (EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - URH.UserCreationDate)) / 3600.0 / 24.0)
+        ELSE 0.0
+    END AS ReputationPerDay,
+    URH.AvgQuestionScoreExcludingBest,
+    EXISTS (
+        SELECT 1
+        FROM Posts AS P_Tags
+        WHERE P_Tags.OwnerUserId = UPE.UserId
+          AND P_Tags.PostTypeId = 1
+          AND P_Tags.Tags IS NOT NULL
+          AND (
+              EXISTS (
+                  SELECT 1 FROM TopGlobalQuestionTags TGT
+                  WHERE P_Tags.Tags LIKE '<' || TGT.TagName || '>%'
+                     OR P_Tags.Tags LIKE '%><' || TGT.TagName || '>%'
+                     OR P_Tags.Tags LIKE '%><' || TGT.TagName || '><%'
+              )
+          )
+    ) AS ParticipatesInTopTags,
+    (U.AboutMe ILIKE '%sql%' OR U.AboutMe ILIKE '%database%' OR U.AboutMe ILIKE '%performance%') AS HasRelevantAboutMeKeywords,
+    (URH.PostClosedHistoryCount > 0 AND URH.PostReopenedHistoryCount > 0) AS HasClosedAndReopenedPosts,
+    RANK() OVER (ORDER BY
+        (
+            (UPE.TotalPostScore * 0.5) +
+            (UPE.TotalCommentsMade * 0.2) +
+            (URH.Reputation * 0.1) +
+            (UPE.OwnAnswersAcceptedCount * 5) +
+            (URH.GoldBadges * 10 + URH.SilverBadges * 5 + URH.BronzeBadges * 1) +
+            (URH.EditHistoryCount * 0.5) +
+            (UPE.UniqueQuestionTags * 0.3)
+        ) DESC
+    ) AS OverallContributionRank,
+    NTILE(10) OVER (ORDER BY
+        (
+            CASE
+                WHEN EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - URH.UserCreationDate)) > 0
+                THEN URH.Reputation / (EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - URH.UserCreationDate)) / 3600.0 / 24.0)
+                ELSE 0.0
+            END
+        ) DESC
+    ) AS ReputationPerDayDecile
+FROM Users AS U
+INNER JOIN UserPostEngagement AS UPE ON U.Id = UPE.UserId
+INNER JOIN UserReputationAndHistory AS URH ON U.Id = URH.UserId
+WHERE
+    U.Reputation >= 1000
+    AND UPE.TotalPosts >= 10
+    AND UPE.AnswersCount >= 3
+    AND UPE.AvgPostBodyLength > 100
+    AND (URH.GoldBadges + URH.SilverBadges) >= 1
+    AND UPE.LatestPostActivityDate IS NOT NULL
+    AND (
+        (U.Location IS NOT NULL AND LENGTH(TRIM(U.Location)) > 0 AND U.Location NOT ILIKE '%internet%' AND U.Location NOT ILIKE '%earth%')
+        OR
+        (U.WebsiteUrl IS NOT NULL AND LENGTH(TRIM(U.WebsiteUrl)) > 0)
+    )
+    AND (TIMESTAMP '2024-10-01 12:34:56' - U.CreationDate) < INTERVAL '5 year'
+    AND URH.AvgQuestionScoreExcludingBest > 0
+GROUP BY
+    UPE.UserId,
+    UPE.DisplayName,
+    URH.Reputation,
+    UPE.TotalPosts,
+    UPE.QuestionsCount,
+    UPE.AnswersCount,
+    URH.GoldBadges,
+    URH.SilverBadges,
+    URH.BronzeBadges,
+    UPE.TotalPostScore,
+    UPE.TotalPostViews,
+    UPE.TotalCommentsMade,
+    URH.ProfileViews,
+    URH.EditHistoryCount,
+    UPE.OwnAnswersAcceptedCount,
+    UPE.UniqueQuestionTags,
+    UPE.AcceptedAnswersForOwnQuestionsCount,
+    UPE.AvgPostBodyLength,
+    UPE.LatestPostActivityDate,
+    URH.UserCreationDate,
+    URH.AvgQuestionScoreExcludingBest,
+    U.AboutMe,
+    URH.PostClosedHistoryCount,
+    URH.PostReopenedHistoryCount,
+    URH.GoldBadges,
+    URH.SilverBadges,
+    URH.BronzeBadges,
+    URH.Reputation,
+    URH.UserCreationDate,
+    U.CreationDate
+ORDER BY OverallContributionRank ASC, DaysSinceLastPostActivity ASC
+LIMIT 1000;

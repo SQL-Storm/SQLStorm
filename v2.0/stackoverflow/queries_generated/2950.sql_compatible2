@@ -1,0 +1,170 @@
+with RecursiveUserBadges as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class as BadgeClass,
+        b.TagBased,
+        row_number() over (partition by u.Id order by b.Date desc) as rn
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    where u.Reputation > 1000
+),
+LatestPosts as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as rn
+    from Posts p
+    where p.PostTypeId in (1, 2)
+      and p.Score is not null
+),
+UserPostCounts as (
+    select 
+        u.Id as UserId,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        sum(p.Score) filter (where p.PostTypeId in (1, 2)) as TotalScore,
+        max(p.ViewCount) filter (where p.PostTypeId = 1) as MaxQuestionViews
+    from Users u
+    left join Posts p on u.Id = p.OwnerUserId
+    group by u.Id
+),
+TopTags as (
+    select 
+        unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')) as Tag,
+        p.OwnerUserId
+    from Posts p
+    where p.PostTypeId = 1
+),
+TagUserCounts as (
+    select 
+        Tag,
+        OwnerUserId as UserId,
+        count(*) as TagQuestionCount
+    from TopTags
+    group by Tag, OwnerUserId
+),
+TopUserTags as (
+    select
+        tuc.UserId,
+        tuc.Tag,
+        tuc.TagQuestionCount,
+        rank() over (partition by tuc.UserId order by tuc.TagQuestionCount desc) as tag_rank
+    from TagUserCounts tuc
+),
+UserRecentEdits as (
+    select 
+        ph.UserId,
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        p.PostTypeId,
+        u.DisplayName as EditorName,
+        ph.Comment,
+        row_number() over (partition by ph.UserId order by ph.CreationDate desc) as rn
+    from PostHistory ph
+    join Posts p on ph.PostId = p.Id
+    left join Users u on ph.UserId = u.Id
+    where ph.PostHistoryTypeId in (4,5,6)
+),
+DuplicateLinkCounts as (
+    select 
+        pl.PostId,
+        count(*) as DuplicateCount
+    from PostLinks pl
+    where pl.LinkTypeId = 3
+    group by pl.PostId
+),
+UserDuplicatedQuestions as (
+    select 
+        p.OwnerUserId as UserId,
+        count(distinct p.Id) as DuplicatedQuestionCount
+    from Posts p
+    join PostLinks pl on pl.PostId = p.Id and pl.LinkTypeId = 3
+    where p.PostTypeId = 1
+    group by p.OwnerUserId
+),
+FinalData as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        coalesce(upc.QuestionCount,0) as QuestionCount,
+        coalesce(upc.AnswerCount,0) as AnswerCount,
+        coalesce(upc.TotalScore,0) as TotalScore,
+        coalesce(upc.MaxQuestionViews,0) as MaxQuestionViews,
+        coalesce(udq.DuplicatedQuestionCount,0) as DuplicatedQuestions,
+        (select string_agg(distinct tb.BadgeName || ' (' || 
+            case tb.BadgeClass 
+                when 1 then 'Gold' 
+                when 2 then 'Silver'
+                when 3 then 'Bronze'
+                else 'Unknown'
+            end || ')', ', ')
+         from RecursiveUserBadges tb
+         where tb.UserId = u.Id and tb.rn <= 5
+        ) as TopBadges,
+        (select string_agg(tt.Tag || ' [' || tt.TagQuestionCount || ']', ', ')
+         from TopUserTags tt
+         where tt.UserId = u.Id and tt.tag_rank <= 3
+        ) as Top3Tags,
+        (select json_agg(
+            json_build_object(
+                'PostId', cast(ure.PostId as text),
+                'EditType', pht.Name,
+                'EditorName', ure.EditorName,
+                'EditDate', to_char(ure.CreationDate, 'YYYY-MM-DD"T"HH24:MI:SS'),
+                'Comment', ure.Comment
+            )
+        ) 
+        from UserRecentEdits ure
+        join PostHistoryTypes pht on ure.PostHistoryTypeId = pht.Id
+        where ure.UserId = u.Id and ure.rn <= 3
+        ) as RecentEdits
+    from Users u
+    left join UserPostCounts upc on u.Id = upc.UserId
+    left join UserDuplicatedQuestions udq on u.Id = udq.UserId
+    where u.Reputation > 1000
+)
+select 
+    fd.UserId,
+    fd.DisplayName,
+    fd.Reputation,
+    fd.QuestionCount,
+    fd.AnswerCount,
+    fd.TotalScore,
+    fd.MaxQuestionViews,
+    fd.DuplicatedQuestions,
+    coalesce(fd.TopBadges, 'No badges') as TopBadges,
+    coalesce(fd.Top3Tags, 'No top tags') as TopTags,
+    coalesce(cast(fd.RecentEdits as text), '[]') as RecentEditsJson,
+    case 
+        when fd.DuplicatedQuestions > 0 then 'High duplicate question poster'
+        when fd.QuestionCount > 50 and fd.TotalScore > 1000 then 'Prolific and well scored asker'
+        when fd.AnswerCount > fd.QuestionCount then 'Primarily an answerer'
+        else 'Mixed user'
+    end as UserType
+from FinalData fd
+group by
+    fd.UserId,
+    fd.DisplayName,
+    fd.Reputation,
+    fd.QuestionCount,
+    fd.AnswerCount,
+    fd.TotalScore,
+    fd.MaxQuestionViews,
+    fd.DuplicatedQuestions,
+    fd.TopBadges,
+    fd.Top3Tags,
+    fd.RecentEdits
+order by fd.TotalScore desc, fd.Reputation desc
+limit 100;

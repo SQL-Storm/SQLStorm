@@ -1,0 +1,137 @@
+WITH
+    /* Users with recent up-votes and total reputation */
+    user_stats AS (
+        SELECT
+            u.Id                               AS user_id,
+            u.DisplayName,
+            u.Reputation,
+            COALESCE(
+                SUM(CASE WHEN vt.Name = 'UpMod' AND v.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days'
+                         THEN 1 ELSE 0 END), 0) AS recent_upvotes,
+            COUNT(DISTINCT CASE WHEN vt.Name = 'AcceptedByOriginator' THEN v.Id END) AS accepted_answers
+        FROM Users u
+        LEFT JOIN Votes v     ON v.UserId = u.Id
+        LEFT JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+        GROUP BY u.Id, u.DisplayName, u.Reputation
+    ),
+
+    /* Tag usage aggregated per tag */
+    tag_stats AS (
+        SELECT
+            t.TagName,
+            COUNT(p.Id)                                   AS question_cnt,
+            ROUND(AVG(p.Score)::NUMERIC, 2)                AS avg_score,
+            STRING_AGG(DISTINCT u.DisplayName, ', ')      FILTER (WHERE u.Id IS NOT NULL) AS top_contributors
+        FROM Tags t
+        JOIN Posts p
+          ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'           -- naive tag match without special characters
+        LEFT JOIN Users u
+          ON u.Id = p.OwnerUserId
+        WHERE p.PostTypeId = 1                           -- only questions
+          AND p.ClosedDate IS NULL
+        GROUP BY t.TagName
+    ),
+
+    /* Highest-scoring recent questions */
+    recent_top_questions AS (
+        SELECT
+            p.Id,
+            p.Title,
+            p.Score,
+            p.ViewCount,
+            p.CreationDate,
+            ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.ViewCount DESC) AS rn
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+          AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180 days'
+          AND p.ClosedDate IS NULL
+    ),
+
+    /* Per-user tag score (correlated sub-query inside the CTE) */
+    user_tag_scores AS (
+        SELECT
+            u.Id                                     AS user_id,
+            tg.TagName,
+            SUM(p.Score)                             AS tag_score,
+            ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY SUM(p.Score) DESC) AS tag_rank
+        FROM Users u
+        JOIN Posts p
+          ON p.OwnerUserId = u.Id
+         AND p.PostTypeId = 1
+        JOIN LATERAL (
+            SELECT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS tag
+        ) AS pt ON TRUE
+        JOIN Tags tg
+          ON tg.TagName = pt.tag
+        GROUP BY u.Id, tg.TagName
+    ),
+
+    /* Recently closed questions with close reason extracted from PostHistory */
+    recent_closed AS (
+        SELECT
+            p.Id,
+            p.Title,
+            p.ClosedDate,
+            COALESCE(
+                (SELECT cr.Comment
+                 FROM PostHistory ph
+                 JOIN CloseReasonTypes cr ON CAST(cr.Id AS TEXT) = ph.Comment
+                 WHERE ph.PostId = p.Id
+                   AND ph.PostHistoryTypeId = 10
+                 LIMIT 1), 'unknown') AS close_reason
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+          AND p.ClosedDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days'
+    )
+
+SELECT
+    us.user_id,
+    us.DisplayName,
+    us.Reputation,
+    us.recent_upvotes,
+    us.accepted_answers,
+    COALESCE(uts.tag_score, 0)                AS top_tag_score,
+    uts.TagName                               AS top_tag,
+    rtq.Title                                 AS top_question_title,
+    rtq.Score                                 AS top_question_score,
+    rc.Title                                  AS recently_closed_title,
+    rc.close_reason,
+    ts.question_cnt,
+    ts.avg_score,
+    ts.top_contributors
+FROM user_stats us
+LEFT JOIN user_tag_scores uts
+       ON uts.user_id = us.user_id
+      AND uts.tag_rank = 1                                 -- best tag per user
+LEFT JOIN recent_top_questions rtq
+       ON rtq.rn = 1                                       -- globally best question
+LEFT JOIN recent_closed rc
+       ON rc.Id = us.user_id                               -- intentional mismatched join to keep outer rows
+FULL OUTER JOIN tag_stats ts
+       ON ts.TagName = uts.TagName
+WHERE (us.Reputation > 10000 OR uts.tag_score IS NOT NULL)
+GROUP BY
+    us.user_id,
+    us.DisplayName,
+    us.Reputation,
+    us.recent_upvotes,
+    us.accepted_answers,
+    uts.tag_score,
+    uts.TagName,
+    rtq.Title,
+    rtq.Score,
+    rc.Title,
+    rc.close_reason,
+    ts.question_cnt,
+    ts.avg_score,
+    ts.top_contributors
+ORDER BY us.Reputation DESC NULLS LAST
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    NULL, NULL, NULL, NULL, NULL,
+    NULL, NULL, NULL, NULL,
+    NULL, NULL, NULL, NULL
+WHERE FALSE;

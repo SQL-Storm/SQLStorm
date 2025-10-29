@@ -1,0 +1,225 @@
+WITH RankedPostEdits AS (
+    SELECT
+        ph.PostId,
+        ph.UserId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        ROW_NUMBER() OVER(PARTITION BY ph.PostId, ph.PostHistoryTypeId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6)
+),
+UserPostActivity AS (
+    SELECT
+        p.OwnerUserId,
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount AS PostViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.LastActivityDate,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+        CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN 1 ELSE 0 END AS IsCommunityOwned,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        CAST(julianday(p.CreationDate) - julianday(u.CreationDate) AS INTEGER) AS DaysSinceUserCreation,
+        CAST(julianday(p.LastActivityDate) - julianday(p.CreationDate) AS INTEGER) AS DaysSincePostCreationToLastActivity,
+        -- normalize tags string like '<tag1><tag2>' into a comma-separated list 'tag1,tag2'
+        NULLIF(TRIM(BOTH '<>' FROM p.Tags), '') AS RawTags
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+),
+LatestEdits AS (
+    SELECT
+        rpe.PostId,
+        MAX(CASE WHEN rpe.PostHistoryTypeId = 4 THEN rpe.CreationDate ELSE NULL END) AS LatestTitleEditDate,
+        MAX(CASE WHEN rpe.PostHistoryTypeId = 5 THEN rpe.CreationDate ELSE NULL END) AS LatestBodyEditDate,
+        MAX(CASE WHEN rpe.PostHistoryTypeId = 6 THEN rpe.CreationDate ELSE NULL END) AS LatestTagsEditDate
+    FROM RankedPostEdits rpe
+    WHERE rpe.rn = 1
+    GROUP BY rpe.PostId
+),
+PostVoteSummary AS (
+    SELECT
+        v.PostId,
+        SUM(CASE WHEN vv.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN vv.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVoteCount,
+        SUM(CASE WHEN vv.Name = 'Favorite' THEN 1 ELSE 0 END) AS FavoriteVoteCount
+    FROM Votes v
+    JOIN VoteTypes vv ON v.VoteTypeId = vv.Id
+    GROUP BY v.PostId
+),
+-- explode tags using a simple splitter into Tag rows (works in many dialects if supported; otherwise treated as conceptual)
+PostTagsExploded AS (
+    SELECT
+        upa.OwnerUserId,
+        upa.PostId,
+        upa.PostTypeId,
+        upa.PostCreationDate,
+        upa.PostScore,
+        upa.PostViewCount,
+        upa.AnswerCount,
+        upa.CommentCount,
+        upa.FavoriteCount,
+        upa.LastActivityDate,
+        upa.IsClosed,
+        upa.IsCommunityOwned,
+        upa.Reputation,
+        upa.UserCreationDate,
+        upa.DaysSinceUserCreation,
+        upa.DaysSincePostCreationToLastActivity,
+        TRIM(tag) AS Tag
+    FROM UserPostActivity upa
+    CROSS JOIN (
+        -- split RawTags into rows. Uses a common SQL approach with recursive CTE for portability.
+        SELECT upa2.PostId, upa2.RawTags, 
+               CASE WHEN upa2.RawTags IS NULL OR upa2.RawTags = '' THEN NULL ELSE upa2.RawTags END AS remaining
+        FROM UserPostActivity upa2
+    ) starter
+    LEFT JOIN (
+        -- recursive splitter: returns rows (PostId, tag, rest)
+        WITH RECURSIVE splitter(postid, tag, rest) AS (
+            SELECT
+                starter.PostId,
+                CASE
+                    WHEN instr(starter.remaining, '><') = 0 THEN starter.remaining
+                    ELSE substr(starter.remaining, 1, CASE WHEN instr(starter.remaining, '><') = 0 THEN length(starter.remaining) ELSE instr(starter.remaining, '><') - 1 END)
+                END AS tag,
+                CASE
+                    WHEN instr(starter.remaining, '><') = 0 THEN NULL
+                    ELSE substr(starter.remaining, instr(starter.remaining, '><') + 2)
+                END AS rest
+            FROM (SELECT starter.PostId, starter.remaining FROM (SELECT starter.PostId, starter.remaining) AS starter) AS starter
+            WHERE starter.remaining IS NOT NULL
+            UNION ALL
+            SELECT
+                postid,
+                CASE
+                    WHEN instr(rest, '><') = 0 THEN rest
+                    ELSE substr(rest, 1, CASE WHEN instr(rest, '><') = 0 THEN length(rest) ELSE instr(rest, '><') - 1 END)
+                END AS tag,
+                CASE
+                    WHEN instr(rest, '><') = 0 THEN NULL
+                    ELSE substr(rest, instr(rest, '><') + 2)
+                END AS rest
+            FROM splitter
+            WHERE rest IS NOT NULL
+        )
+        SELECT postid AS PostId, tag
+        FROM splitter
+    ) split ON split.PostId = starter.PostId
+    WHERE split.tag IS NOT NULL
+),
+TopTagsByScore AS (
+    SELECT
+        t.TagName,
+        AVG(pte.PostScore) AS AverageTagScore,
+        SUM(pte.PostScore) AS TotalTagScore,
+        COUNT(pte.PostId) AS TagPostCount
+    FROM PostTagsExploded pte
+    JOIN Tags t ON t.TagName = pte.Tag
+    GROUP BY t.TagName
+    HAVING COUNT(pte.PostId) > 100
+),
+FinalPostData AS (
+    SELECT
+        upa.OwnerUserId,
+        upa.PostId,
+        upa.PostTypeId,
+        upa.PostCreationDate,
+        upa.PostScore,
+        upa.PostViewCount,
+        upa.AnswerCount,
+        upa.CommentCount,
+        upa.FavoriteCount,
+        upa.LastActivityDate,
+        upa.IsClosed,
+        upa.IsCommunityOwned,
+        upa.Reputation,
+        upa.UserCreationDate,
+        upa.DaysSinceUserCreation,
+        upa.DaysSincePostCreationToLastActivity,
+        le.LatestTitleEditDate,
+        le.LatestBodyEditDate,
+        le.LatestTagsEditDate,
+        pvs.UpVoteCount,
+        pvs.DownVoteCount,
+        pvs.FavoriteVoteCount,
+        COALESCE(pvs.UpVoteCount, 0) - COALESCE(pvs.DownVoteCount, 0) AS NetVoteScore,
+        CASE WHEN le.LatestTitleEditDate IS NOT NULL THEN CAST(julianday(le.LatestTitleEditDate) - julianday(upa.PostCreationDate) AS INTEGER) ELSE NULL END AS DaysToFirstTitleEdit,
+        CASE WHEN le.LatestBodyEditDate IS NOT NULL THEN CAST(julianday(le.LatestBodyEditDate) - julianday(upa.PostCreationDate) AS INTEGER) ELSE NULL END AS DaysToFirstBodyEdit,
+        CASE WHEN le.LatestTagsEditDate IS NOT NULL THEN CAST(julianday(le.LatestTagsEditDate) - julianday(upa.PostCreationDate) AS INTEGER) ELSE NULL END AS DaysToFirstTagsEdit,
+        CASE WHEN upa.LastActivityDate < DATETIME('2024-10-01 12:34:56', '-365 days') THEN 1 ELSE 0 END AS IsOlderThanAYear,
+        upa.RawTags
+    FROM UserPostActivity upa
+    LEFT JOIN LatestEdits le ON upa.PostId = le.PostId
+    LEFT JOIN PostVoteSummary pvs ON upa.PostId = pvs.PostId
+)
+SELECT
+    fpd.PostId,
+    fpd.OwnerUserId,
+    fpd.Reputation AS OwnerReputation,
+    fpd.UserCreationDate AS OwnerCreationDate,
+    fpd.DaysSinceUserCreation,
+    fpd.PostCreationDate,
+    fpd.PostScore,
+    fpd.PostViewCount,
+    fpd.AnswerCount,
+    fpd.CommentCount,
+    fpd.FavoriteCount,
+    fpd.LastActivityDate,
+    fpd.IsClosed,
+    fpd.IsCommunityOwned,
+    fpd.NetVoteScore,
+    fpd.DaysToFirstTitleEdit,
+    fpd.DaysToFirstBodyEdit,
+    fpd.DaysToFirstTagsEdit,
+    fpd.IsOlderThanAYear,
+    CASE
+        WHEN fpd.PostScore > 100 AND fpd.AnswerCount > 10 AND fpd.CommentCount < 5 THEN 'High Engagement Potential'
+        WHEN fpd.PostScore < 0 AND fpd.IsClosed = 1 THEN 'Potentially Bad Question'
+        WHEN fpd.DaysSinceUserCreation < 7 AND fpd.Reputation < 100 THEN 'New User, Low Reputation'
+        ELSE 'Standard'
+    END AS PostQualityIndicator,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = fpd.PostId AND c.Score > 0) AS PositiveCommentCount,
+    COALESCE(tts.AverageTagScore, 0) AS RelatedTagAverageScore,
+    CASE
+        WHEN fpd.RawTags IS NULL THEN 'No Tags'
+        ELSE fpd.RawTags
+    END AS FormattedTags
+FROM FinalPostData fpd
+LEFT JOIN TopTagsByScore tts
+    ON EXISTS (
+        SELECT 1
+        FROM PostTagsExploded pte
+        WHERE pte.PostId = fpd.PostId
+          AND pte.Tag = tts.TagName
+    )
+GROUP BY
+    fpd.PostId,
+    fpd.OwnerUserId,
+    fpd.Reputation,
+    fpd.UserCreationDate,
+    fpd.DaysSinceUserCreation,
+    fpd.PostCreationDate,
+    fpd.PostScore,
+    fpd.PostViewCount,
+    fpd.AnswerCount,
+    fpd.CommentCount,
+    fpd.FavoriteCount,
+    fpd.LastActivityDate,
+    fpd.IsClosed,
+    fpd.IsCommunityOwned,
+    fpd.NetVoteScore,
+    fpd.DaysToFirstTitleEdit,
+    fpd.DaysToFirstBodyEdit,
+    fpd.DaysToFirstTagsEdit,
+    fpd.IsOlderThanAYear,
+    tts.AverageTagScore,
+    fpd.RawTags
+HAVING COUNT(fpd.PostId) > 5
+ORDER BY fpd.PostScore DESC, fpd.LastActivityDate DESC
+LIMIT 1000;

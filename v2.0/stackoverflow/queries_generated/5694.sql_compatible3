@@ -1,0 +1,63 @@
+SELECT
+  u.Id AS UserId,
+  u.DisplayName AS UserDisplayName,
+  u.Reputation,
+  u.CreationDate,
+  u.LastAccessDate,
+  COALESCE(p.owned_posts, 0) AS OwnedPosts,
+  COALESCE(votes_up.votes_up, 0) AS UpvotesCast,
+  COALESCE(cmt_cnt.CommentCount, 0) AS CommentCountByUser,
+  COALESCE(score_sums.score, 0) AS EngagementScore,
+  COALESCE(last_act.LastActivityDate, u.LastAccessDate) AS LastActivityDate
+FROM
+  Users u
+LEFT JOIN
+  (
+    SELECT OwnerUserId, COUNT(*) AS owned_posts
+    FROM Posts
+    GROUP BY OwnerUserId
+  ) p ON p.OwnerUserId = u.Id
+LEFT JOIN
+  (
+    SELECT UserId, COUNT(*) AS votes_up
+    FROM Votes
+    WHERE VoteTypeId = 2
+    GROUP BY UserId
+  ) votes_up ON votes_up.UserId = u.Id
+LEFT JOIN
+  (
+    SELECT UserId, COUNT(*) AS CommentCount
+    FROM Comments
+    GROUP BY UserId
+  ) cmt_cnt ON cmt_cnt.UserId = u.Id
+LEFT JOIN
+  (
+    SELECT
+      v.UserId,
+      SUM(
+        CASE
+          WHEN vt.Name = 'UpMod' THEN 3
+          WHEN vt.Name = 'AcceptedByOriginator' THEN 5
+          WHEN vt.Name = 'Favorite' THEN 2
+          WHEN vt.Name = 'ModeratorReview' THEN 4
+          WHEN vt.Name = 'BountyStart' THEN 6
+          ELSE 1
+        END
+      ) AS score
+    FROM Votes v
+    JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    GROUP BY v.UserId
+  ) score_sums ON score_sums.UserId = u.Id
+LEFT JOIN
+  (
+    SELECT UserId, MAX(COALESCE(LastActivityDate, CreationDate)) AS LastActivityDate
+    FROM Posts
+    GROUP BY UserId
+  ) last_act ON last_act.UserId = u.Id
+WHERE
+  u.LastAccessDate >= (
+    CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+  )
+ORDER BY
+  COALESCE(last_act.LastActivityDate, u.LastAccessDate) DESC
+LIMIT 100;

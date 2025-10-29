@@ -1,0 +1,132 @@
+-- {"query": "2958.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1198} 
+with RecursiveCTE as (
+    select 
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        coalesce(p.ViewCount,0) as ViewCount,
+        p.OwnerUserId,
+        u.Reputation,
+        u.Location,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as rn
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId = 1 and p.Score > 5
+), UserBadgeCounts as (
+    select 
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+), UserTopTags as (
+    select 
+        p.OwnerUserId,
+        unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')) as Tag,
+        count(*) as TagCount
+    from Posts p
+    where p.PostTypeId = 1
+    group by p.OwnerUserId, Tag
+), UserTopTagRanked as (
+    select 
+        ut.OwnerUserId,
+        ut.Tag,
+        ut.TagCount,
+        row_number() over (partition by ut.OwnerUserId order by ut.TagCount desc) as TagRank
+    from UserTopTags ut
+), PostCommentsScore as (
+    select
+        c.PostId,
+        sum(coalesce(c.Score,0)) as TotalCommentScore,
+        count(*) as CommentCount
+    from Comments c
+    group by c.PostId
+), PostHistoryCloseInfo as (
+    select
+        ph.PostId,
+        max(case when ph.PostHistoryTypeId = 10 then cast(ph.Comment as int) else null end) as CloseReasonId,
+        max(ph.CreationDate) as CloseDate
+    from PostHistory ph
+    where ph.PostHistoryTypeId = 10
+    group by ph.PostId
+), AggregateVotes as (
+    select 
+        v.PostId,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes
+    from Votes v
+    group by v.PostId
+), FinalSelection as (
+    select
+        r.Id as QuestionId,
+        r.Title,
+        r.CreationDate,
+        r.Score,
+        r.ViewCount,
+        r.OwnerUserId,
+        r.Reputation,
+        coalesce(ubg.Gold,0) as GoldBadges,
+        coalesce(ubg.Silver,0) as SilverBadges,
+        coalesce(ubg.Bronze,0) as BronzeBadges,
+        ut.Tag as TopTag,
+        pc.TotalCommentScore,
+        pc.CommentCount,
+        phci.CloseReasonId,
+        phci.CloseDate,
+        av.UpVotes,
+        av.DownVotes,
+        case 
+            when av.UpVotes > av.DownVotes then 'Mostly Positive'
+            when av.DownVotes > av.UpVotes then 'Mostly Negative'
+            else 'Neutral'
+        end as VoteSentiment,
+        /* Complex conditional expression with NULL logic */
+        case 
+            when r.ViewCount > 10000 and (r.Score + coalesce(pc.TotalCommentScore,0)) / nullif(r.ViewCount,0) > 0.01 then 'High Engagement'
+            when r.ViewCount is null then 'No Views Data'
+            else 'Low Engagement'
+        end as EngagementCategory
+    from RecursiveCTE r
+    left join (
+        select 
+            UserId,
+            max(case when Class = 1 then BadgeCount else 0 end) as Gold,
+            max(case when Class = 2 then BadgeCount else 0 end) as Silver,
+            max(case when Class = 3 then BadgeCount else 0 end) as Bronze
+        from UserBadgeCounts
+        group by UserId
+    ) ubg on r.OwnerUserId = ubg.UserId
+    left join (
+        select OwnerUserId, Tag
+        from UserTopTagRanked
+        where TagRank = 1
+    ) ut on r.OwnerUserId = ut.OwnerUserId
+    left join PostCommentsScore pc on r.Id = pc.PostId
+    left join PostHistoryCloseInfo phci on r.Id = phci.PostId
+    left join AggregateVotes av on r.Id = av.PostId
+)
+select 
+    fs.*,
+    /* Window function to rank questions by combined score */
+    rank() over (order by (fs.Score + coalesce(fs.TotalCommentScore,0)) desc) as QuestionRank,
+    /* String expression refining title */
+    concat(substring(fs.Title from 1 for 50), case when char_length(fs.Title) > 50 then '...' else '' end) as ShortTitle,
+    /* Correlated subquery for count of duplicates */
+    (
+        select count(*)
+        from PostLinks pl 
+        where pl.PostId = fs.QuestionId and pl.LinkTypeId = 3
+    ) as DuplicateCount,
+    /* Outer join with a complex predicate involving NULLs */
+    coalesce(
+        (select max(CreationDate)
+        from Posts p2 where p2.ParentId = fs.QuestionId and p2.Score > 0),
+        timestamp '1900-01-01'
+    ) as LatestPositiveAnswerDate
+from FinalSelection fs
+where 
+    (fs.Score > 10 or fs.GoldBadges > 0 or fs.Reputation > 1000)
+    and (fs.CloseDate is null or fs.CloseDate > fs.CreationDate + interval '30 days')
+order by QuestionRank asc
+limit 100;

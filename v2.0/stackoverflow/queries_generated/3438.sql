@@ -1,0 +1,156 @@
+-- {"query": "3438.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2549} 
+
+/*  Performance‑benchmarking query with CTEs, window functions, outer joins,
+    correlated sub‑queries, set operators, complex predicates and NULL logic   */
+WITH
+/* --------------------------------------------------------------
+   1.  Aggregate per‑user activity (posts, badges, votes, etc.)
+   -------------------------------------------------------------- */
+UserAgg AS (
+    SELECT
+        u.Id                                      AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(p.Id)                               AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL)  AS AvgPostScore,
+        COUNT(b.Id)   FILTER (WHERE b.Class = 1)  AS GoldBadges,
+        COUNT(b.Id)   FILTER (WHERE b.Class = 2)  AS SilverBadges,
+        COUNT(b.Id)   FILTER (WHERE b.Class = 3)  AS BronzeBadges,
+        COUNT(v.Id)   FILTER (WHERE v.VoteTypeId = 2) AS UpVotesGiven,
+        COUNT(v.Id)   FILTER (WHERE v.VoteTypeId = 3) AS DownVotesGiven
+    FROM Users u
+    LEFT JOIN Posts      p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges     b ON b.UserId      = u.Id
+    LEFT JOIN Votes      v ON v.UserId      = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+
+/* --------------------------------------------------------------
+   2.  Latest post per user (correlated sub‑query inside a CTE)
+   -------------------------------------------------------------- */
+LatestPost AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+
+/* --------------------------------------------------------------
+   3.  Pull details of that latest post (string ops, NULL logic)
+   -------------------------------------------------------------- */
+RecentPostDetails AS (
+    SELECT
+        lp.UserId,
+        lp.LastPostDate,
+        p.Id                                 AS PostId,
+        COALESCE(NULLIF(p.Title, ''), '<no title>')        AS Title,
+        p.Score,
+        p.ViewCount,
+        COALESCE(NULLIF(p.Tags, ''), '<none>')             AS Tags,
+        CASE p.PostTypeId
+            WHEN 1 THEN 'Question'
+            WHEN 2 THEN 'Answer'
+            ELSE 'Other'
+        END                                  AS PostKind,
+        ROW_NUMBER() OVER (PARTITION BY lp.UserId ORDER BY p.CreationDate DESC) AS rn
+    FROM LatestPost lp
+    JOIN Posts p
+      ON p.Id = (
+            SELECT Id
+            FROM Posts pp
+            WHERE pp.OwnerUserId = lp.UserId
+              AND pp.CreationDate = lp.LastPostDate
+            ORDER BY pp.Id DESC
+            LIMIT 1
+         )
+),
+
+/* --------------------------------------------------------------
+   4.  Tag statistics (set operator later will UNION with user rows)
+   -------------------------------------------------------------- */
+TagStats AS (
+    SELECT
+        t.TagName,
+        t.Count                                   AS TagUseCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        AVG(p.Score)                              AS AvgScore,
+        STRING_AGG(DISTINCT u.DisplayName, ', ') FILTER (WHERE u.Id IS NOT NULL) AS TopContributors
+    FROM Tags t
+    LEFT JOIN Posts p
+      ON p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+    LEFT JOIN Users u
+      ON p.OwnerUserId = u.Id
+    GROUP BY t.TagName, t.Count
+),
+
+/* --------------------------------------------------------------
+   5.  Combine user aggregates with their latest post (outer join)
+   -------------------------------------------------------------- */
+CombinedUser AS (
+    SELECT
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.TotalPosts,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.AvgPostScore,
+        ua.GoldBadges,
+        ua.SilverBadges,
+        ua.BronzeBadges,
+        ua.UpVotesGiven,
+        ua.DownVotesGiven,
+        rp.Title,
+        rp.Score           AS LastPostScore,
+        rp.ViewCount       AS LastPostViews,
+        rp.Tags            AS LastPostTags,
+        rp.PostKind,
+        ROW_NUMBER() OVER (ORDER BY ua.Reputation DESC, ua.TotalPosts DESC) AS ReputationRank
+    FROM UserAgg ua
+    LEFT JOIN RecentPostDetails rp
+      ON rp.UserId = ua.UserId AND rp.rn = 1
+),
+
+/* --------------------------------------------------------------
+   6.  Prepare tag rows to be UNIONed (matching column list)
+   -------------------------------------------------------------- */
+CombinedTag AS (
+    SELECT
+        NULL               AS UserId,
+        t.TagName          AS DisplayName,
+        NULL               AS Reputation,
+        NULL               AS TotalPosts,
+        NULL               AS QuestionCount,
+        NULL               AS AnswerCount,
+        t.AvgScore         AS AvgPostScore,
+        NULL               AS GoldBadges,
+        NULL               AS SilverBadges,
+        NULL               AS BronzeBadges,
+        NULL               AS UpVotesGiven,
+        NULL               AS DownVotesGiven,
+        t.TagName          AS Title,
+        t.TagUseCount      AS LastPostScore,
+        t.QuestionCount    AS LastPostViews,
+        t.AnswerCount      AS LastPostTags,
+        'Tag'              AS PostKind,
+        ROW_NUMBER() OVER (ORDER BY t.TagUseCount DESC) AS ReputationRank
+    FROM TagStats t
+    WHERE t.TagUseCount > 5000
+)
+
+SELECT *
+FROM CombinedUser
+WHERE ReputationRank <= 100
+
+UNION ALL
+
+SELECT *
+FROM CombinedTag
+ORDER BY ReputationRank, UserId
+LIMIT 150;

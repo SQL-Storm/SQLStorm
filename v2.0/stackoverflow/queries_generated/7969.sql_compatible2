@@ -1,0 +1,268 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        CAST((CAST('2024-10-01 12:34:56' AS TIMESTAMP) - CAST(u.CreationDate AS TIMESTAMP)) AS INTEGER) AS AccountAgeDays,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Elite'
+            WHEN u.Reputation >= 1000 THEN 'Advanced'
+            WHEN u.Reputation >= 100 THEN 'Basic'
+            ELSE 'Newbie'
+        END AS ReputationTier,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        RANK() OVER (PARTITION BY CASE WHEN u.Reputation >= 1000 THEN 1 ELSE 0 END ORDER BY u.Reputation DESC) AS ReputationRankByTier
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate
+),
+PostsWithComplexity AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags != '' THEN 
+                CARDINALITY(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags)-2), '><'))
+            ELSE 0
+        END AS TagsCount,
+        CASE 
+            WHEN p.Body IS NOT NULL AND length(p.Body) > 0 THEN length(p.Body)
+            ELSE 0
+        END AS BodyLength,
+        CASE 
+            WHEN p.Title IS NOT NULL AND length(p.Title) > 0 THEN length(p.Title)
+            ELSE 0
+        END AS TitleLength,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END AS PostTypeDesc,
+        CASE 
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 1
+            ELSE 0
+        END AS HasAcceptedAnswer,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+            ELSE 'Open'
+        END AS PostStatus
+    FROM Posts p
+    WHERE p.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year')
+),
+UserPostAnalysis AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.TotalPosts,
+        uas.QuestionCount,
+        uas.AnswerCount,
+        uas.BadgeCount,
+        uas.CommentCount,
+        uas.AccountAgeDays,
+        uas.ReputationTier,
+        uas.ReputationRank,
+        uas.ReputationRankByTier,
+        COALESCE(upper(substring(uas.DisplayName FROM 1 FOR 1)), 'X') AS DisplayInitial,
+        CASE 
+            WHEN uas.Reputation >= 10000 THEN 1
+            WHEN uas.Reputation >= 1000 THEN 2
+            WHEN uas.Reputation >= 100 THEN 3
+            ELSE 4
+        END AS RepTierNumeric,
+        COALESCE(uas.Views, 0) + COALESCE(uas.UpVotes, 0) - COALESCE(uas.DownVotes, 0) AS NetActivityScore,
+        LAG(uas.Reputation, 1) OVER (ORDER BY uas.Reputation DESC) AS PreviousReputation,
+        LAG(uas.TotalPosts, 1) OVER (ORDER BY uas.Reputation DESC) AS PreviousTotalPosts,
+        PERCENT_RANK() OVER (ORDER BY uas.Reputation) AS ReputationPercentile,
+        NTILE(4) OVER (ORDER BY uas.Reputation) AS ReputationQuartile
+    FROM UserActivityStats uas
+    WHERE uas.TotalPosts > 0
+),
+TopQuestionTags AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        RANK() OVER (ORDER BY t.Count DESC) AS TagRank,
+        DENSE_RANK() OVER (ORDER BY t.Count DESC) AS TagDenseRank
+    FROM Tags t
+    WHERE t.Count > 100
+),
+PostTagAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags != '' THEN string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags)-2), '><')
+            ELSE ARRAY[]::text
+        END AS PostTags,
+        COALESCE(substring(p.Title FROM 1 FOR 50), '') AS TitleSnippet,
+        COALESCE(substring(p.Body FROM 1 FOR 200), '') AS BodySnippet,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserPostSequence,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevScore,
+        LAG(p.ViewCount, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevViewCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+ComplexJoinResult AS (
+    SELECT 
+        upa.UserId,
+        upa.DisplayName,
+        upa.Reputation,
+        upa.ReputationTier,
+        upa.ReputationRank,
+        upa.NetActivityScore,
+        upa.ReputationPercentile,
+        upa.ReputationQuartile,
+        pa.PostId,
+        pa.Title,
+        pa.Score,
+        pa.ViewCount,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.FavoriteCount,
+        pa.CreationDate,
+        pa.PostTypeId,
+        pa.PostTypeId AS PostTypeId_alias,
+        pa.CreationDate AS CreationDate_alias,
+        pa.PostTypeId AS PostTypeId_for_desc,
+        pa.PostTypeId AS PostTypeId_for_flags,
+        pa.PostTypeId AS PostTypeId_for_tags,
+        pa.PostTypeId AS PostTypeId_for_lengths,
+        pa.PostTypeId AS PostTypeId_for_scorecalc,
+        CASE 
+            WHEN pa.PostTypeId = 1 THEN 'Question'
+            WHEN pa.PostTypeId = 2 THEN 'Answer'
+            WHEN pa.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END AS PostTypeDesc,
+        CASE WHEN pa.PostId IS NOT NULL AND EXISTS (SELECT 1 FROM Posts p2 WHERE p2.Id = pa.PostId AND p2.AcceptedAnswerId IS NOT NULL) THEN 1 ELSE 0 END AS HasAcceptedAnswer,
+        CASE WHEN pa.PostId IS NOT NULL AND EXISTS (SELECT 1 FROM Posts p3 WHERE p3.Id = pa.PostId AND p3.ClosedDate IS NOT NULL) THEN 'Closed' WHEN pa.PostId IS NOT NULL AND EXISTS (SELECT 1 FROM Posts p4 WHERE p4.Id = pa.PostId AND p4.CommunityOwnedDate IS NOT NULL) THEN 'Community Owned' ELSE 'Open' END AS PostStatus,
+        (SELECT CASE WHEN p5.Tags IS NOT NULL AND p5.Tags != '' THEN CARDINALITY(string_to_array(substring(p5.Tags FROM 2 FOR char_length(p5.Tags)-2), '><')) ELSE 0 END FROM Posts p5 WHERE p5.Id = pa.PostId) AS TagsCount,
+        (SELECT CASE WHEN p6.Body IS NOT NULL THEN length(p6.Body) ELSE 0 END FROM Posts p6 WHERE p6.Id = pa.PostId) AS BodyLength,
+        (SELECT CASE WHEN p7.Title IS NOT NULL THEN length(p7.Title) ELSE 0 END FROM Posts p7 WHERE p7.Id = pa.PostId) AS TitleLength,
+        CASE 
+            WHEN pa.Score >= 100 THEN 'High'
+            WHEN pa.Score >= 10 THEN 'Medium'
+            ELSE 'Low'
+        END AS ScoreCategory,
+        CAST((CAST('2024-10-01 12:34:56' AS TIMESTAMP) - CAST(pa.CreationDate AS TIMESTAMP)) AS INTEGER) AS DaysSincePost,
+        CASE 
+            WHEN pa.AnswerCount > 0 THEN (pa.Score * 1.0 / pa.AnswerCount)
+            ELSE 0
+        END AS ScorePerAnswer,
+        CASE 
+            WHEN pa.ViewCount > 0 THEN (pa.Score * 1.0 / pa.ViewCount)
+            ELSE 0
+        END AS ScorePerView,
+        CASE 
+            WHEN pa.CommentCount > 0 THEN (pa.Score * 1.0 / pa.CommentCount)
+            ELSE 0
+        END AS ScorePerComment,
+        CASE 
+            WHEN upa.QuestionCount > 0 THEN (upa.AnswerCount * 1.0 / upa.QuestionCount)
+            ELSE 0
+        END AS AnswerToQuestionRatio
+    FROM UserPostAnalysis upa
+    INNER JOIN PostTagAnalysis pa ON upa.UserId = pa.OwnerUserId
+    WHERE pa.Score >= 0
+      AND pa.ViewCount >= 0
+),
+FinalResult AS (
+    SELECT 
+        cro.UserId,
+        cro.DisplayName,
+        cro.Reputation,
+        cro.ReputationTier,
+        cro.ReputationRank,
+        cro.NetActivityScore,
+        cro.ReputationPercentile,
+        cro.ReputationQuartile,
+        cro.PostId,
+        cro.Title,
+        cro.Score,
+        cro.ViewCount,
+        cro.AnswerCount,
+        cro.CommentCount,
+        cro.FavoriteCount,
+        cro.CreationDate,
+        cro.PostTypeDesc,
+        cro.HasAcceptedAnswer,
+        cro.PostStatus,
+        cro.TagsCount,
+        cro.BodyLength,
+        cro.TitleLength,
+        cro.ScoreCategory,
+        cro.DaysSincePost,
+        cro.ScorePerAnswer,
+        cro.ScorePerView,
+        cro.ScorePerComment,
+        cro.AnswerToQuestionRatio,
+        DENSE_RANK() OVER (ORDER BY cro.Score DESC) AS GlobalScoreRank,
+        RANK() OVER (PARTITION BY cro.ReputationTier ORDER BY cro.Score DESC) AS TierScoreRank,
+        COUNT(*) OVER () AS TotalRecordCount,
+        AVG(cro.Score) OVER (PARTITION BY cro.ReputationTier) AS AvgScoreByTier,
+        STDDEV_POP(cro.Score) OVER (PARTITION BY cro.ReputationTier) AS StdDevScoreByTier,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY cro.Score) OVER (PARTITION BY cro.ReputationTier) AS MedianScoreByTier,
+        MAX(cro.Score) OVER (ORDER BY cro.CreationDate ROWS BETWEEN 5 PRECEDING AND CURRENT ROW) AS MovingMaxScore,
+        LAG(cro.Score, 1) OVER (ORDER BY cro.Score DESC) AS PrevScore,
+        LAG(cro.Reputation, 1) OVER (ORDER BY cro.Score DESC) AS PrevReputation,
+        CASE WHEN cro.Reputation > LAG(cro.Reputation, 1) OVER (ORDER BY cro.Score DESC) THEN 'Up' ELSE 'Down' END AS RepTrend,
+        CASE 
+            WHEN cro.Reputation > 10000 THEN 'Elite User'
+            WHEN cro.Reputation > 5000 THEN 'Senior User'
+            WHEN cro.Reputation > 1000 THEN 'Intermediate User'
+            ELSE 'New User'
+        END AS UserClassification,
+        (SELECT string_agg(DISTINCT t.TagName, ', ')
+         FROM Tags t
+         WHERE t.Count > 100
+           AND EXISTS (
+               SELECT 1 
+               FROM PostTagAnalysis pta 
+               WHERE pta.OwnerUserId = cro.UserId 
+                 AND t.TagName = ANY(pta.PostTags)
+           )
+        ) AS UserTagList
+    FROM ComplexJoinResult cro
+    WHERE cro.NetActivityScore > 0
+      AND cro.Score >= 0
+      AND cro.ViewCount BETWEEN 0 AND 100000
+)
+SELECT *
+FROM FinalResult
+ORDER BY Score DESC, CreationDate DESC
+LIMIT 1000;

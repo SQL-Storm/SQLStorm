@@ -1,0 +1,109 @@
+-- {"query": "3040.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2348} 
+
+WITH
+    top_users AS (
+        SELECT
+            u.id,
+            u.displayname,
+            u.reputation,
+            ROW_NUMBER() OVER (ORDER BY u.reputation DESC) AS rn
+        FROM users u
+        WHERE u.reputation IS NOT NULL
+    ),
+    badge_counts AS (
+        SELECT
+            b.userid,
+            SUM(CASE WHEN b.class = 1 THEN 1 ELSE 0 END) AS gold_badges,
+            SUM(CASE WHEN b.class = 2 THEN 1 ELSE 0 END) AS silver_badges,
+            SUM(CASE WHEN b.class = 3 THEN 1 ELSE 0 END) AS bronze_badges,
+            COUNT(*)                                            AS total_badges
+        FROM badges b
+        GROUP BY b.userid
+    ),
+    recent_posts AS (
+        SELECT
+            p.id,
+            p.owneruserid,
+            p.posttypeid,
+            p.score,
+            p.creationdate,
+            COALESCE(p.title, '<no title>') AS title,
+            COALESCE(p.tags, '')             AS tags,
+            ROW_NUMBER() OVER (PARTITION BY p.owneruserid ORDER BY p.creationdate DESC) AS rn_user
+        FROM posts p
+        WHERE p.creationdate >= (CURRENT_TIMESTAMP - INTERVAL '1 year')
+    ),
+    vote_summary AS (
+        SELECT
+            v.postid,
+            COUNT(*) FILTER (WHERE vt.name = 'UpMod')   AS up_votes,
+            COUNT(*) FILTER (WHERE vt.name = 'DownMod') AS down_votes,
+            MAX(CASE WHEN vt.name = 'UpMod'   THEN v.id END) AS last_up_vote_id,
+            MAX(CASE WHEN vt.name = 'DownMod' THEN v.id END) AS last_down_vote_id
+        FROM votes v
+        JOIN votetypes vt ON vt.id = v.votetypeid
+        GROUP BY v.postid
+    )
+SELECT
+    tu.id                                      AS user_id,
+    tu.displayname,
+    tu.reputation,
+    COALESCE(bc.gold_badges,   0)   AS gold_badges,
+    COALESCE(bc.silver_badges, 0)   AS silver_badges,
+    COALESCE(bc.bronze_badges, 0)   AS bronze_badges,
+    COALESCE(bc.total_badges,  0)   AS total_badges,
+    rp.id                            AS recent_post_id,
+    rp.title,
+    rp.score,
+    vs.up_votes,
+    vs.down_votes,
+    CASE
+        WHEN vs.up_votes > vs.down_votes THEN 'Positive'
+        WHEN vs.up_votes < vs.down_votes THEN 'Negative'
+        ELSE 'Neutral'
+    END                                   AS sentiment,
+    NULLIF(rp.tags, '')                AS tag_list,
+    CASE
+        WHEN rp.tags <> '' THEN
+            substring(rp.tags FROM 2 FOR position('><' IN rp.tags) - 2)
+        ELSE NULL
+    END                                 AS first_tag,
+    (SELECT ct.name
+       FROM posthistory ph
+       JOIN closereasontypes ct ON ct.id = CAST(ph.comment AS int)
+      WHERE ph.postid = rp.id
+        AND ph.posthistorytypeid = 10
+      ORDER BY ph.creationdate DESC
+      LIMIT 1)                         AS close_reason
+FROM top_users tu
+LEFT JOIN badge_counts bc   ON bc.userid = tu.id
+LEFT JOIN recent_posts rp   ON rp.owneruserid = tu.id AND rp.rn_user = 1
+LEFT JOIN vote_summary vs   ON vs.postid = rp.id
+WHERE tu.rn <= 1000
+ORDER BY tu.reputation DESC
+OFFSET 0 ROWS FETCH NEXT 500 ROWS ONLY
+
+UNION ALL
+
+SELECT
+    NULL                               AS user_id,
+    'Aggregate'                        AS displayname,
+    NULL                               AS reputation,
+    SUM(COALESCE(bc.gold_badges,   0)) AS gold_badges,
+    SUM(COALESCE(bc.silver_badges, 0)) AS silver_badges,
+    SUM(COALESCE(bc.bronze_badges, 0)) AS bronze_badges,
+    SUM(COALESCE(bc.total_badges,  0)) AS total_badges,
+    NULL                               AS recent_post_id,
+    NULL                               AS title,
+    AVG(rp.score)                      AS avg_score,
+    SUM(vs.up_votes)                   AS total_up_votes,
+    SUM(vs.down_votes)                 AS total_down_votes,
+    NULL                               AS sentiment,
+    NULL                               AS tag_list,
+    NULL                               AS first_tag,
+    NULL                               AS close_reason
+FROM top_users tu
+LEFT JOIN badge_counts bc ON bc.userid = tu.id
+LEFT JOIN recent_posts rp ON rp.owneruserid = tu.id
+LEFT JOIN vote_summary vs ON vs.postid = rp.id
+WHERE tu.rn <= 1000;

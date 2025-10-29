@@ -1,0 +1,137 @@
+WITH
+user_activity AS (
+    SELECT
+        u.Id                                     AS user_id,
+        u.DisplayName                            AS user_name,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(DISTINCT p.Id)                     AS total_posts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS total_answers,
+        COUNT(DISTINCT c.Id)                     AS total_comments,
+        SUM(CASE WHEN p.Score IS NOT NULL THEN p.Score ELSE 0 END) AS sum_post_score,
+        AVG(CASE WHEN p.Score IS NOT NULL THEN p.Score END)        AS avg_post_score,
+        COUNT(DISTINCT v.Id)                     AS total_votes_given,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END)    AS upvotes_given,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END)    AS downvotes_given,
+        MAX(p.CreationDate)                     AS last_post_date
+    FROM Users u
+    LEFT JOIN Posts p   ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v    ON v.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+badge_stats AS (
+    SELECT
+        b.UserId                                     AS user_id,
+        COUNT(*)                                     AS total_badges,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END)      AS gold_badges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END)      AS silver_badges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END)      AS bronze_badges,
+        COUNT(CASE WHEN b.TagBased = TRUE THEN 1 WHEN b.TagBased = 1 THEN 1 ELSE NULL END)   AS tag_badges,
+        STRING_AGG(DISTINCT b.Name, '; ')            AS badge_list
+    FROM Badges b
+    GROUP BY b.UserId
+),
+latest_post AS (
+    SELECT
+        p.OwnerUserId                               AS user_id,
+        p.Id                                        AS post_id,
+        p.Title,
+        p.CreationDate,
+        p.LastEditDate,
+        p.Score,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastEditDate DESC NULLS LAST) AS rn
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+),
+gold_answer_users AS (
+    SELECT
+        ua.user_id
+    FROM user_activity ua
+    JOIN badge_stats bs      ON bs.user_id = ua.user_id
+    WHERE bs.gold_badges > 0
+      AND ua.total_answers > 0
+),
+inactive_tagged_users AS (
+    SELECT
+        u.Id                                         AS user_id,
+        u.DisplayName                                AS user_name,
+        bs.badge_list
+    FROM Users u
+    LEFT JOIN user_activity ua ON ua.user_id = u.Id
+    JOIN badge_stats bs        ON bs.user_id = u.Id
+    WHERE ua.user_id IS NULL
+      AND bs.bronze_badges > 0
+      AND bs.tag_badges > 0
+),
+ranked_users AS (
+    SELECT
+        ua.user_id,
+        ua.user_name,
+        ua.Reputation,
+        ua.total_posts,
+        ua.total_answers,
+        ua.total_comments,
+        ua.sum_post_score,
+        ua.avg_post_score,
+        bs.total_badges,
+        bs.gold_badges,
+        bs.silver_badges,
+        bs.bronze_badges,
+        bs.tag_badges,
+        bs.badge_list,
+        lp.Title                              AS latest_post_title,
+        lp.Score                              AS latest_post_score,
+        DENSE_RANK() OVER (ORDER BY ua.Reputation DESC)      AS rep_rank,
+        ROW_NUMBER() OVER (ORDER BY bs.total_badges DESC, ua.Reputation DESC) AS badge_rank
+    FROM user_activity ua
+    LEFT JOIN badge_stats bs      ON bs.user_id = ua.user_id
+    LEFT JOIN latest_post lp      ON lp.user_id = ua.user_id AND lp.rn = 1
+    GROUP BY
+        ua.user_id,
+        ua.user_name,
+        ua.Reputation,
+        ua.total_posts,
+        ua.total_answers,
+        ua.total_comments,
+        ua.sum_post_score,
+        ua.avg_post_score,
+        bs.total_badges,
+        bs.gold_badges,
+        bs.silver_badges,
+        bs.bronze_badges,
+        bs.tag_badges,
+        bs.badge_list,
+        lp.Title,
+        lp.Score
+)
+SELECT *
+FROM ranked_users
+WHERE rep_rank <= 100
+   OR badge_rank <= 100
+   OR user_id IN (SELECT user_id FROM gold_answer_users)
+UNION ALL
+SELECT
+    i.user_id,
+    i.user_name,
+    NULL       AS Reputation,
+    0          AS total_posts,
+    0          AS total_answers,
+    0          AS total_comments,
+    0          AS sum_post_score,
+    NULL       AS avg_post_score,
+    0          AS total_badges,
+    0          AS gold_badges,
+    0          AS silver_badges,
+    0          AS bronze_badges,
+    0          AS tag_badges,
+    i.badge_list,
+    NULL       AS latest_post_title,
+    NULL       AS latest_post_score,
+    NULL       AS rep_rank,
+    NULL       AS badge_rank
+FROM inactive_tagged_users i
+ORDER BY
+    COALESCE(rep_rank, 999999),
+    COALESCE(badge_rank, 999999),
+    user_id;

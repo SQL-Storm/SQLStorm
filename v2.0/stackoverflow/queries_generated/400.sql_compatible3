@@ -1,0 +1,377 @@
+with recent_users as (
+    select
+        u.id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        u.location,
+        coalesce(nullif(trim(u.websiteurl), ''), 'N/A') as websiteurl,
+        date_trunc('month', u.creationdate) as cohort_month,
+        row_number() over (partition by date_trunc('month', u.creationdate) order by u.reputation desc, u.id) as rn_in_cohort
+    from users u
+    where u.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+),
+user_activity as (
+    select
+        p.owneruserid as user_id,
+        count(*) filter (where p.posttypeid = 1) as q_count,
+        count(*) filter (where p.posttypeid = 2) as a_count,
+        sum(greatest(p.score, 0)) as nonneg_post_score,
+        sum(coalesce(p.viewcount, 0)) as views_sum,
+        max(p.lastactivitydate) as last_post_activity
+    from posts p
+    where p.owneruserid is not null
+    group by p.owneruserid
+),
+comment_activity as (
+    select
+        c.userid as user_id,
+        count(*) as comment_count,
+        sum(coalesce(c.score, 0)) as comment_score_sum,
+        max(c.creationdate) as last_comment_activity
+    from comments c
+    where c.userid is not null
+    group by c.userid
+),
+vote_activity as (
+    select
+        v.userid as user_id,
+        count(*) filter (where v.votetypeid = 2) as upvotes_cast,
+        count(*) filter (where v.votetypeid = 3) as downvotes_cast,
+        count(*) filter (where v.votetypeid = 5) as favorites_cast,
+        count(*) filter (where v.votetypeid in (8,9)) as bounties_touched,
+        sum(coalesce(v.bountyamount,0)) filter (where v.votetypeid in (8,9)) as bounty_amount_total,
+        max(v.creationdate) as last_vote_activity
+    from votes v
+    where v.userid is not null
+    group by v.userid
+),
+badge_activity as (
+    select
+        b.userid as user_id,
+        count(*) as badges_total,
+        count(*) filter (where b.class = 1) as gold_badges,
+        count(*) filter (where b.class = 2) as silver_badges,
+        count(*) filter (where b.class = 3) as bronze_badges,
+        count(*) filter (where b.tagbased = true) as tag_badges,
+        max(b.date) as last_badge_date
+    from badges b
+    group by b.userid
+),
+question_quality as (
+    select
+        q.owneruserid as user_id,
+        count(*) as questions_total,
+        avg(nullif(q.score, 0)) as avg_nonzero_qscore,
+        percentile_disc(0.5) within group (order by coalesce(q.score,0)) as median_qscore,
+        sum(case when q.acceptedanswerid is not null then 1 else 0 end) as accepted_count,
+        sum(coalesce(q.favoritecount, 0)) as favorites_on_questions,
+        sum(case when q.closeddate is not null then 1 else 0 end) as closed_count,
+        avg(coalesce(q.viewcount,0)) as avg_q_views,
+        max(q.creationdate) as last_q_date
+    from posts q
+    where q.posttypeid = 1
+      and q.owneruserid is not null
+    group by q.owneruserid
+),
+answer_quality as (
+    select
+        a.owneruserid as user_id,
+        count(*) as answers_total,
+        avg(nullif(a.score, 0)) as avg_nonzero_ascore,
+        percentile_disc(0.9) within group (order by coalesce(a.score,0)) as p90_ascore,
+        sum(case when a.id = parent.acceptedanswerid then 1 else 0 end) as accepted_as_answers,
+        max(a.creationdate) as last_a_date
+    from posts a
+    join posts parent on parent.id = a.parentid and a.posttypeid = 2
+    where a.owneruserid is not null
+    group by a.owneruserid
+),
+linked_duplicates as (
+    select
+        pl.relatedpostid as canonical_post_id,
+        count(*) as dup_incoming_count,
+        min(pl.creationdate) as first_dup_link_date,
+        max(pl.creationdate) as last_dup_link_date
+    from postlinks pl
+    where pl.linktypeid = 3
+    group by pl.relatedpostid
+),
+user_duplicate_exposure as (
+    select
+        q.owneruserid as user_id,
+        count(*) filter (where pl.id is not null) as dup_links_on_their_questions,
+        count(distinct pl.relatedpostid) as distinct_canonical_targets
+    from posts q
+    left join postlinks pl on pl.postid = q.id and pl.linktypeid = 3
+    where q.posttypeid = 1 and q.owneruserid is not null
+    group by q.owneruserid
+),
+post_history_events as (
+    select
+        ph.userid as user_id,
+        count(*) filter (where ph.posthistorytypeid in (4,5,6)) as edit_events,
+        count(*) filter (where ph.posthistorytypeid in (10,11,12,13,14,15,19,20,35,36)) as mod_state_events,
+        count(*) filter (where ph.posthistorytypeid in (24)) as suggested_edits_applied,
+        max(ph.creationdate) as last_history_event
+    from posthistory ph
+    where ph.userid is not null
+    group by ph.userid
+),
+user_tag_focus as (
+    select
+        q.owneruserid as user_id,
+        lower(trim(both ' ' from unnest(string_to_array(substring(q.tags, 2, length(q.tags)-2), '><')))) as tagname
+    from posts q
+    where q.posttypeid = 1 and q.tags is not null and q.owneruserid is not null
+),
+top_tag_per_user as (
+    select user_id, tagname, tag_cnt, rn
+    from (
+        select
+            utf.user_id,
+            utf.tagname,
+            count(*) as tag_cnt,
+            row_number() over (partition by utf.user_id order by count(*) desc, tagname) as rn
+        from user_tag_focus utf
+        group by utf.user_id, utf.tagname
+    ) s
+    where rn = 1
+),
+recent_hot_questions as (
+    select
+        ph.postid,
+        min(ph.creationdate) as first_hot_date
+    from posthistory ph
+    where ph.posthistorytypeid = 52
+      and ph.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+    group by ph.postid
+),
+user_hot_exposure as (
+    select
+        p.owneruserid as user_id,
+        count(*) as hot_q_owned,
+        min(rhq.first_hot_date) as first_hot_owned_date
+    from recent_hot_questions rhq
+    join posts p on p.id = rhq.postid
+    where p.owneruserid is not null
+    group by p.owneruserid
+),
+cohort_stats as (
+    select
+        ru.cohort_month,
+        count(*) as users_in_cohort,
+        avg(ru.reputation) as cohort_avg_rep,
+        percentile_disc(0.5) within group (order by ru.reputation) as cohort_median_rep
+    from recent_users ru
+    group by ru.cohort_month
+),
+combined as (
+    select
+        ru.id as user_id,
+        ru.displayname,
+        ru.reputation,
+        ru.cohort_month,
+        ru.rn_in_cohort,
+        ua.q_count,
+        ua.a_count,
+        ua.nonneg_post_score,
+        ua.views_sum,
+        ca.comment_count,
+        ca.comment_score_sum,
+        va.upvotes_cast,
+        va.downvotes_cast,
+        va.favorites_cast,
+        va.bounties_touched,
+        va.bounty_amount_total,
+        ba.badges_total,
+        ba.gold_badges,
+        ba.silver_badges,
+        ba.bronze_badges,
+        ba.tag_badges,
+        qq.questions_total,
+        qq.avg_nonzero_qscore,
+        qq.median_qscore,
+        qq.accepted_count as accepted_on_own_questions,
+        qq.favorites_on_questions,
+        qq.closed_count,
+        qq.avg_q_views,
+        aq.answers_total,
+        aq.avg_nonzero_ascore,
+        aq.p90_ascore,
+        aq.accepted_as_answers,
+        ude.dup_links_on_their_questions,
+        ude.distinct_canonical_targets,
+        phe.edit_events,
+        phe.mod_state_events,
+        phe.suggested_edits_applied,
+        ttu.tagname as top_tag,
+        ttu.tag_cnt as top_tag_count,
+        uhe.hot_q_owned,
+        uhe.first_hot_owned_date,
+        greatest(coalesce(ua.last_post_activity, timestamp 'epoch'),
+                 coalesce(ca.last_comment_activity, timestamp 'epoch'),
+                 coalesce(va.last_vote_activity, timestamp 'epoch'),
+                 coalesce(ba.last_badge_date, timestamp 'epoch'),
+                 coalesce(qq.last_q_date, timestamp 'epoch'),
+                 coalesce(aq.last_a_date, timestamp 'epoch'),
+                 coalesce(phe.last_history_event, timestamp 'epoch')) as last_any_activity
+    from recent_users ru
+    left join user_activity ua on ua.user_id = ru.id
+    left join comment_activity ca on ca.user_id = ru.id
+    left join vote_activity va on va.user_id = ru.id
+    left join badge_activity ba on ba.user_id = ru.id
+    left join question_quality qq on qq.user_id = ru.id
+    left join answer_quality aq on aq.user_id = ru.id
+    left join user_duplicate_exposure ude on ude.user_id = ru.id
+    left join post_history_events phe on phe.user_id = ru.id
+    left join top_tag_per_user ttu on ttu.user_id = ru.id
+    left join user_hot_exposure uhe on uhe.user_id = ru.id
+),
+scored as (
+    select
+        c.*,
+        case
+            when c.last_any_activity is null then 0.0
+            else least(1.0, greatest(0.0, 1.0 - extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - c.last_any_activity)) / (60*60*24*365.0)))
+        end as recency_score,
+        case when coalesce(c.q_count,0)+coalesce(c.a_count,0) = 0 then null
+             else round(cast(c.q_count as numeric) / nullif(coalesce(c.q_count,0)+coalesce(c.a_count,0),0), 4)
+        end as question_ratio,
+        case when coalesce(c.q_count,0)+coalesce(c.a_count,0) = 0 then null
+             else round(cast(c.a_count as numeric) / nullif(coalesce(c.q_count,0)+coalesce(c.a_count,0),0), 4)
+        end as answer_ratio,
+        round(coalesce(cast(c.reputation as numeric) / nullif(coalesce(c.nonneg_post_score,0) + coalesce(c.comment_score_sum,0),0), 0), 4) as rep_per_point,
+        round(
+            coalesce(c.views_sum,0) * 0.0002
+          + coalesce(c.comment_count,0) * 0.02
+          + coalesce(c.upvotes_cast,0) * 0.01
+          - coalesce(c.downvotes_cast,0) * 0.015
+          + coalesce(c.badges_total,0) * 0.05
+          + coalesce(c.accepted_as_answers,0) * 0.2
+          + coalesce(c.accepted_on_own_questions,0) * 0.05
+          + coalesce(c.hot_q_owned,0) * 0.3
+        , 4) as engagement_score
+    from combined c
+),
+ranked as (
+    select
+        s.*,
+        dense_rank() over (order by (coalesce(s.engagement_score,0) * 0.7 + coalesce(s.recency_score,0) * 0.3) desc, s.reputation desc, s.user_id) as performance_rank,
+        ntile(10) over (order by coalesce(s.engagement_score,0) desc) as engagement_decile,
+        row_number() over (partition by s.cohort_month order by coalesce(s.engagement_score,0) desc, s.reputation desc) as rank_in_cohort
+    from scored s
+),
+cohort_enriched as (
+    select
+        r.*,
+        cs.users_in_cohort,
+        cs.cohort_avg_rep,
+        cs.cohort_median_rep
+    from ranked r
+    join cohort_stats cs on cs.cohort_month = r.cohort_month
+),
+mixed_set as (
+    select * from cohort_enriched where engagement_decile <= 2
+    union all
+    select * from cohort_enriched where performance_rank <= 100
+    union
+    select * from cohort_enriched where rank_in_cohort <= greatest(5, (users_in_cohort/20))
+),
+finalized as (
+    select
+        m.user_id,
+        m.displayname,
+        m.reputation,
+        m.cohort_month,
+        m.performance_rank,
+        m.rank_in_cohort,
+        m.engagement_decile,
+        m.users_in_cohort,
+        m.cohort_avg_rep,
+        m.cohort_median_rep,
+        m.q_count,
+        m.a_count,
+        m.questions_total,
+        m.answers_total,
+        m.accepted_as_answers,
+        m.accepted_on_own_questions,
+        m.nonneg_post_score,
+        m.comment_count,
+        m.comment_score_sum,
+        m.upvotes_cast,
+        m.downvotes_cast,
+        m.favorites_cast,
+        m.badges_total,
+        m.gold_badges,
+        m.silver_badges,
+        m.bronze_badges,
+        m.tag_badges,
+        m.avg_nonzero_qscore,
+        m.median_qscore,
+        m.avg_nonzero_ascore,
+        m.p90_ascore,
+        m.dup_links_on_their_questions,
+        m.distinct_canonical_targets,
+        m.edit_events,
+        m.mod_state_events,
+        m.suggested_edits_applied,
+        m.top_tag,
+        m.top_tag_count,
+        m.hot_q_owned,
+        m.first_hot_owned_date,
+        m.views_sum,
+        m.avg_q_views,
+        m.favorites_on_questions,
+        m.closed_count,
+        m.recency_score,
+        m.question_ratio,
+        m.answer_ratio,
+        m.rep_per_point,
+        m.engagement_score,
+        m.last_any_activity
+    from mixed_set m
+)
+select
+    f.*,
+    case
+        when coalesce(f.accepted_as_answers,0) >= 50 then 'Ace Answerer'
+        when coalesce(f.questions_total,0) >= 100 and coalesce(f.closed_count,0) = 0 then 'Prolific Questioner'
+        when coalesce(f.hot_q_owned,0) > 0 then 'Hot Owner'
+        when coalesce(f.badges_total,0) >= 100 then 'Decorated'
+        else 'Contributor'
+    end as user_label,
+    -- replace initcap with standard-capitalization expression: capitalize first letter of first token of displayname (simple implementation)
+    (
+      upper(substring(coalesce(nullif(trim(f.displayname), ''), 'Unknown User') from 1 for 1))
+      ||
+      lower(substring(coalesce(nullif(trim(f.displayname), ''), 'Unknown User') from 2 for 1000))
+    ) -- full displayname cased
+    ||
+    ' of ' ||
+    coalesce(nullif(trim(split_part(coalesce(f.top_tag, 'unknown'), '-', 1)), ''), 'misc') as vanity_title
+from finalized f
+where
+    coalesce(f.engagement_score, 0) >= (
+        select coalesce(percentile_disc(0.75) within group (order by coalesce(engagement_score,0)), 0)
+        from scored
+    )
+    and (
+        f.reputation >= coalesce((
+            select avg(reputation) from recent_users ru2 where ru2.cohort_month = f.cohort_month
+        ), 0)
+        or f.rank_in_cohort <= 10
+    )
+    and not exists (
+        select 1
+        from posts pban
+        where pban.owneruserid = f.user_id
+          and pban.posttypeid = 1
+          and pban.closeddate is not null
+          and pban.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days'
+    )
+order by
+    f.performance_rank,
+    f.rank_in_cohort,
+    f.user_id
+limit 200;

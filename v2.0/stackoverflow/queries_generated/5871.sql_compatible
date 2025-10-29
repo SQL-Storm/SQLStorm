@@ -1,0 +1,131 @@
+WITH
+RecentActivity AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.PostTypeId,
+    p.CreationDate,
+    p.ViewCount,
+    p.Score,
+    p.OwnerUserId,
+    p.Tags,
+    p.LastActivityDate,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.LastEditDate
+  FROM Posts p
+  WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180 days'
+),
+TopAuthors AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.Location,
+    u.WebsiteUrl,
+    u.AboutMe,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.UpVotes DESC, u.CreationDate ASC) AS rn
+  FROM Users u
+  WHERE u.Reputation > 1000
+),
+TaggedActivity AS (
+  SELECT
+    ra.PostId,
+    ra.Title,
+    ra.PostTypeId,
+    ra.CreationDate,
+    ra.ViewCount,
+    ra.Score,
+    ra.OwnerUserId,
+    ra.Tags,
+    ra.LastActivityDate,
+    ra.CommentCount,
+    ra.AnswerCount,
+    ra.FavoriteCount,
+    ra.LastEditDate,
+    t.TagName
+  FROM RecentActivity ra
+  LEFT JOIN LATERAL (
+    SELECT unnest(string_to_array(substr(ra.Tags, 2, length(ra.Tags) - 2), '><')) AS TagName
+  ) t ON TRUE
+  WHERE ra.PostTypeId = 1
+),
+WindowedStats AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.ViewCount,
+    p.Score,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.Tags,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) OVER (
+      PARTITION BY p.Id
+      ORDER BY v.CreationDate
+      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS UpvotesToDate,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) OVER (
+      PARTITION BY p.Id
+      ORDER BY v.CreationDate
+      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS DownvotesToDate
+  FROM Posts p
+  LEFT JOIN Votes v ON v.PostId = p.Id
+)
+SELECT
+  p.Id AS post_id,
+  p.Title AS post_title,
+  p.PostTypeId AS post_type_id,
+  pt.Name AS post_type_name,
+  COALESCE(u.DisplayName, p.OwnerDisplayName) AS owner,
+  p.CreationDate AS creation_date,
+  p.LastActivityDate AS last_activity_date,
+  p.ViewCount AS view_count,
+  p.Score AS score,
+  p.AnswerCount AS answer_count,
+  p.CommentCount AS comment_count,
+  p.FavoriteCount AS favorite_count,
+  p.Tags,
+  (SELECT AVG(p2.score) FROM Posts p2 WHERE p2.OwnerUserId = p.OwnerUserId) AS avg_owner_score,
+  (SELECT COUNT(*) FROM Posts p3 WHERE p3.OwnerUserId = p.OwnerUserId AND p3.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days') AS posts_last_30d,
+  ws.UpvotesToDate,
+  ws.DownvotesToDate,
+  CONCAT(
+    COALESCE(p.Title, ''),
+    ' | ',
+    COALESCE(p.Tags, ''),
+    ' | ',
+    COALESCE((SELECT Name FROM PostHistoryTypes WHERE Id = 36), '')
+  ) AS composite_text,
+  CASE
+    WHEN p.OwnerUserId IS NULL THEN 'anonymous'
+    WHEN p.OwnerUserId = -1 THEN 'community'
+    ELSE 'registered'
+  END AS owner_type,
+  pl.RelatedPostId AS linked_post_id
+FROM Posts p
+LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+LEFT JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN WindowedStats ws ON ws.PostId = p.Id
+LEFT JOIN (
+  SELECT PostId, RelatedPostId
+  FROM PostLinks
+  WHERE LinkTypeId = 1
+) pl ON pl.PostId = p.Id
+WHERE
+  p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days'
+  AND (p.ViewCount > (SELECT AVG(ViewCount) FROM Posts))
+  AND COALESCE(p.AcceptedAnswerId, -1) <> p.Id
+ORDER BY p.LastActivityDate DESC, p.Score DESC
+LIMIT 200;

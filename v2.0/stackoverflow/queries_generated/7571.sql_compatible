@@ -1,0 +1,402 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) as ScoreRank,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) as ScoreDenseRank,
+        LAG(p.Score) OVER (ORDER BY p.Score DESC) as PrevScore,
+        LEAD(p.Score) OVER (ORDER BY p.Score DESC) as NextScore,
+        AVG(p.Score) OVER (ORDER BY p.Score DESC ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) as AvgScoreAround,
+        NTILE(100) OVER (ORDER BY p.Score DESC) as ScorePercentile,
+        CASE 
+            WHEN p.Score > 100 THEN 'High'
+            WHEN p.Score > 10 THEN 'Medium'
+            WHEN p.Score > 0 THEN 'Low'
+            ELSE 'Negative'
+        END as ScoreCategory,
+        COALESCE(p.Tags, '') as ProcessedTags,
+        SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags) - 2)) as CleanTags,
+        string_to_array(SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags) - 2)), '><') as TagArray,
+        COALESCE(p.AnswerCount, 0) as SafeAnswerCount,
+        COALESCE(p.CommentCount, 0) as SafeCommentCount,
+        COALESCE(p.FavoriteCount, 0) as SafeFavoriteCount
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+TagStatistics AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            WHEN t.Count > 10 THEN 'Niche'
+            ELSE 'Rare'
+        END as PopularityLevel,
+        RANK() OVER (ORDER BY t.Count DESC) as PopularityRank,
+        DENSE_RANK() OVER (ORDER BY t.Count DESC) as PopularityDenseRank
+    FROM Tags t
+    WHERE t.Count > 0
+),
+UserActivity AS (
+    SELECT 
+        u.Id,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.AccountId,
+        COALESCE(u.Views, 0) as SafeViews,
+        COALESCE(u.UpVotes, 0) as SafeUpVotes,
+        COALESCE(u.DownVotes, 0) as SafeDownVotes,
+        (COALESCE(u.UpVotes, 0) - COALESCE(u.DownVotes, 0)) as NetVotes,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Elite'
+            WHEN u.Reputation >= 1000 THEN 'Expert'
+            WHEN u.Reputation >= 100 THEN 'Advanced'
+            WHEN u.Reputation >= 10 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as ReputationLevel
+    FROM Users u
+    WHERE u.Reputation IS NOT NULL
+),
+UserPostSummary AS (
+    SELECT 
+        up.OwnerUserId,
+        COUNT(up.Id) as TotalPosts,
+        SUM(up.Score) as TotalScore,
+        AVG(up.Score) as AvgScore,
+        MAX(up.Score) as MaxScore,
+        MIN(up.Score) as MinScore,
+        SUM(up.ViewCount) as TotalViews,
+        AVG(up.ViewCount) as AvgViews,
+        SUM(CASE WHEN up.PostTypeId = 1 THEN 1 ELSE 0 END) as QuestionCount,
+        SUM(CASE WHEN up.PostTypeId = 2 THEN 1 ELSE 0 END) as AnswerCount,
+        SUM(up.CommentCount) as TotalComments,
+        SUM(up.FavoriteCount) as TotalFavorites,
+        MAX(up.LastActivityDate) as LastPostActivity
+    FROM Posts up
+    WHERE up.OwnerUserId IS NOT NULL AND up.OwnerUserId > 0
+    GROUP BY up.OwnerUserId
+),
+ComplexUserAnalysis AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.AccountId,
+        COALESCE(u.Views, 0) as SafeViews,
+        COALESCE(u.UpVotes, 0) as SafeUpVotes,
+        COALESCE(u.DownVotes, 0) as SafeDownVotes,
+        (COALESCE(u.UpVotes, 0) - COALESCE(u.DownVotes, 0)) as NetVotes,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Elite'
+            WHEN u.Reputation >= 1000 THEN 'Expert'
+            WHEN u.Reputation >= 100 THEN 'Advanced'
+            WHEN u.Reputation >= 10 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as ReputationLevel,
+        ups.TotalPosts,
+        ups.TotalScore,
+        ups.AvgScore,
+        ups.MaxScore,
+        ups.MinScore,
+        ups.TotalViews,
+        ups.AvgViews,
+        ups.QuestionCount,
+        ups.AnswerCount,
+        ups.TotalComments,
+        ups.TotalFavorites,
+        ups.LastPostActivity,
+        CASE 
+            WHEN ups.TotalPosts > 100 THEN 'Highly Active'
+            WHEN ups.TotalPosts > 50 THEN 'Active'
+            WHEN ups.TotalPosts > 10 THEN 'Moderate'
+            ELSE 'Casual'
+        END as ActivityLevel,
+        CASE 
+            WHEN ups.AvgScore > 50 THEN 'High Scoring'
+            WHEN ups.AvgScore > 10 THEN 'Moderate Scoring'
+            ELSE 'Low Scoring'
+        END as ScoringLevel,
+        (CASE WHEN ups.AnswerCount > 0 THEN CAST(ups.AnswerCount AS DOUBLE PRECISION) / NULLIF(ups.QuestionCount, 0) ELSE 0 END) as AnswerToQuestionRatio,
+        CASE 
+            WHEN u.LastAccessDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30 days') THEN 'Recent'
+            WHEN u.LastAccessDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '90 days') THEN 'Active'
+            WHEN u.LastAccessDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '365 days') THEN 'Inactive'
+            ELSE 'Very Inactive'
+        END as ActivityStatus
+    FROM Users u
+    LEFT JOIN UserPostSummary ups ON u.Id = ups.OwnerUserId
+    WHERE u.Id IS NOT NULL AND u.Id > 0
+),
+PostDetails AS (
+    SELECT 
+        r.Id,
+        r.PostTypeId,
+        r.ParentId,
+        r.OwnerUserId,
+        r.Score,
+        r.ViewCount,
+        r.Title,
+        r.Tags,
+        r.AnswerCount,
+        r.CommentCount,
+        r.FavoriteCount,
+        r.CreationDate,
+        r.LastActivityDate,
+        r.ScoreRank,
+        r.ScoreDenseRank,
+        r.PrevScore,
+        r.NextScore,
+        r.AvgScoreAround,
+        r.ScorePercentile,
+        r.ScoreCategory,
+        r.ProcessedTags,
+        r.CleanTags,
+        r.TagArray,
+        r.SafeAnswerCount,
+        r.SafeCommentCount,
+        r.SafeFavoriteCount,
+        CASE 
+            WHEN r.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'Above Average'
+            ELSE 'Below Average'
+        END as ScorePerformance,
+        CASE 
+            WHEN r.ViewCount > (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = 1) THEN 'High View'
+            ELSE 'Low View'
+        END as ViewPerformance,
+        CASE 
+            WHEN r.AnswerCount > (SELECT AVG(AnswerCount) FROM Posts WHERE PostTypeId = 1) THEN 'Many Answers'
+            ELSE 'Few Answers'
+        END as AnswerPerformance,
+        CASE 
+            WHEN r.CommentCount > (SELECT AVG(CommentCount) FROM Posts WHERE PostTypeId = 1) THEN 'Many Comments'
+            ELSE 'Few Comments'
+        END as CommentPerformance,
+        CASE 
+            WHEN r.FavoriteCount > (SELECT AVG(FavoriteCount) FROM Posts WHERE PostTypeId = 1) THEN 'High Favorites'
+            ELSE 'Low Favorites'
+        END as FavoritePerformance
+    FROM RankedPosts r
+),
+DetailedPostAnalysis AS (
+    SELECT 
+        pd.Id,
+        pd.PostTypeId,
+        pd.ParentId,
+        pd.OwnerUserId,
+        pd.Score,
+        pd.ViewCount,
+        pd.Title,
+        pd.Tags,
+        pd.AnswerCount,
+        pd.CommentCount,
+        pd.FavoriteCount,
+        pd.CreationDate,
+        pd.LastActivityDate,
+        pd.ScoreRank,
+        pd.ScoreDenseRank,
+        pd.PrevScore,
+        pd.NextScore,
+        pd.AvgScoreAround,
+        pd.ScorePercentile,
+        pd.ScoreCategory,
+        pd.ProcessedTags,
+        pd.CleanTags,
+        pd.TagArray,
+        pd.SafeAnswerCount,
+        pd.SafeCommentCount,
+        pd.SafeFavoriteCount,
+        pd.ScorePerformance,
+        pd.ViewPerformance,
+        pd.AnswerPerformance,
+        pd.CommentPerformance,
+        pd.FavoritePerformance,
+        CASE 
+            WHEN pd.Tags LIKE '%<python>%' THEN 'Python Related'
+            WHEN pd.Tags LIKE '%<javascript>%' THEN 'Javascript Related'
+            WHEN pd.Tags LIKE '%<java>%' THEN 'Java Related'
+            WHEN pd.Tags LIKE '%<c++>%' THEN 'C++ Related'
+            ELSE 'Other'
+        END as ProgrammingCategory,
+        CASE 
+            WHEN pd.Score > 0 AND pd.Score < 10 THEN 'Low Engagement'
+            WHEN pd.Score >= 10 AND pd.Score < 50 THEN 'Medium Engagement'
+            WHEN pd.Score >= 50 THEN 'High Engagement'
+            ELSE 'No Engagement'
+        END as EngagementLevel,
+        (pd.LastActivityDate::date - pd.CreationDate::date) as DaysSinceLastActivity,
+        RANK() OVER (PARTITION BY pd.OwnerUserId ORDER BY pd.Score DESC) as OwnerPostRank,
+        DENSE_RANK() OVER (ORDER BY pd.Score DESC) as PublicScoreRank,
+        REGR_SLOPE(pd.Score, (pd.LastActivityDate::epoch - pd.CreationDate::epoch)/86400.0) OVER (ORDER BY pd.CreationDate ROWS BETWEEN 10 PRECEDING AND CURRENT ROW) as MovingScoreSlope,
+        ROW_NUMBER() OVER (ORDER BY pd.LastActivityDate DESC) as RecentActivityRank,
+        PERCENT_RANK() OVER (ORDER BY pd.Score) as ScorePercentileRank,
+        CUME_DIST() OVER (ORDER BY pd.ViewCount) as ViewDistribution,
+        NTILE(5) OVER (ORDER BY pd.Score) as ScoreQuintile
+    FROM PostDetails pd
+),
+-- Note: to keep compatibility across dialects, DaysSinceLastActivity computed above returned as interval difference; convert to integer in outer select if needed.
+Final AS (
+SELECT 
+    dpa.Id,
+    dpa.PostTypeId,
+    dpa.ParentId,
+    dpa.OwnerUserId,
+    dpa.Score,
+    dpa.ViewCount,
+    dpa.Title,
+    dpa.Tags,
+    dpa.AnswerCount,
+    dpa.CommentCount,
+    dpa.FavoriteCount,
+    dpa.CreationDate,
+    dpa.LastActivityDate,
+    dpa.ScoreRank,
+    dpa.ScoreDenseRank,
+    dpa.PrevScore,
+    dpa.NextScore,
+    dpa.AvgScoreAround,
+    dpa.ScorePercentile,
+    dpa.ScoreCategory,
+    dpa.ProcessedTags,
+    dpa.CleanTags,
+    dpa.TagArray,
+    dpa.SafeAnswerCount,
+    dpa.SafeCommentCount,
+    dpa.SafeFavoriteCount,
+    dpa.ScorePerformance,
+    dpa.ViewPerformance,
+    dpa.AnswerPerformance,
+    dpa.CommentPerformance,
+    dpa.FavoritePerformance,
+    dpa.ProgrammingCategory,
+    NULL::text as EntranceLevel,
+    dpa.DaysSinceLastActivity,
+    dpa.OwnerPostRank,
+    dpa.PublicScoreRank,
+    dpa.MovingScoreSlope,
+    dpa.RecentActivityRank,
+    dpa.ScorePercentileRank,
+    dpa.ViewDistribution,
+    dpa.ScoreQuintile,
+    CASE 
+        WHEN dpa.Score > 100 AND dpa.ViewCount > 500 THEN 'Premium Content'
+        WHEN dpa.Score > 50 AND dpa.ViewCount > 100 THEN 'Popular Content'
+        WHEN dpa.Score < 10 THEN 'Low Engagement Content'
+        ELSE 'Standard Content'
+    END as ContentCategory,
+    CASE 
+        WHEN dpa.OwnerUserId IS NOT NULL AND dpa.OwnerUserId > 0 THEN
+            (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = dpa.OwnerUserId AND p.PostTypeId = 1)
+        ELSE 0
+    END as UserQuestionCount,
+    CASE 
+        WHEN dpa.OwnerUserId IS NOT NULL AND dpa.OwnerUserId > 0 THEN
+            (SELECT AVG(score) FROM Posts p WHERE p.OwnerUserId = dpa.OwnerUserId AND p.PostTypeId = 1)
+        ELSE 0
+    END as UserQuestionAverageScore,
+    CASE 
+        WHEN dpa.OwnerUserId IS NOT NULL AND dpa.OwnerUserId > 0 THEN
+            (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = dpa.OwnerUserId AND p.PostTypeId = 1 AND p.Score > 100)
+        ELSE 0
+    END as UserHighScoreQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE Score > dpa.Score) as PostsAboveScore,
+    CASE 
+        WHEN dpa.ViewCount > (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = 1)
+        THEN 'Above Average Views' 
+        ELSE 'Below Average Views'
+    END as ViewComparison,
+    CASE 
+        WHEN dpa.AnswerCount > (SELECT AVG(AnswerCount) FROM Posts WHERE PostTypeId = 1)
+        THEN 'Above Average Answers' 
+        ELSE 'Below Average Answers'
+    END as AnswerComparison,
+    CASE 
+        WHEN dpa.CommentCount > (SELECT AVG(CommentCount) FROM Posts WHERE PostTypeId = 1)
+        THEN 'Above Average Comments' 
+        ELSE 'Below Average Comments'
+    END as CommentComparison,
+    CONCAT(
+        'PostRank:', dpa.ScoreRank,
+        ',UserRank:', 
+        COALESCE(
+            (SELECT dr.rnk FROM (
+                SELECT p.OwnerUserId, DENSE_RANK() OVER (ORDER BY SUM(p.Score) DESC) as rnk
+                FROM Posts p
+                GROUP BY p.OwnerUserId
+            ) dr WHERE dr.OwnerUserId = dpa.OwnerUserId), '0')
+    ) as CompositeRanking,
+    COALESCE(
+        (SELECT t.TagName 
+         FROM Tags t 
+         WHERE t.TagName = ANY(dpa.TagArray)
+         ORDER BY t.Count DESC
+         LIMIT 1), 
+        'No Tags'
+    ) as TopTag,
+    CASE 
+        WHEN (dpa.DaysSinceLastActivity)::int < 30 THEN 'Recently Active'
+        WHEN (dpa.DaysSinceLastActivity)::int < 90 THEN 'Active'
+        WHEN (dpa.DaysSinceLastActivity)::int < 365 THEN 'Inactive'
+        ELSE 'Very Inactive'
+    END as ActivityStatus,
+    CASE
+        WHEN dpa.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'Above' ELSE 'Below'
+    END as ScoreComparison,
+    (dpa.ScoreCategory || ' - ' || 
+    CASE 
+        WHEN dpa.ViewCount > 1000 THEN 'High Traffic'
+        WHEN dpa.ViewCount > 500 THEN 'Medium Traffic'
+        ELSE 'Low Traffic'
+    END || ' - ' || 
+    CASE 
+        WHEN dpa.AnswerCount > 10 THEN 'High Engagement'
+        WHEN dpa.AnswerCount > 5 THEN 'Moderate Engagement'
+        ELSE 'Low Engagement'
+    END) as ComprehensiveTagging,
+    ROW_NUMBER() OVER (ORDER BY dpa.Score DESC) as GlobalRanking,
+    RANK() OVER (PARTITION BY dpa.PostTypeId ORDER BY dpa.Score DESC) as TypeSpecificRanking,
+    DENSE_RANK() OVER (ORDER BY dpa.Score DESC) as DenseScoreRanking,
+    NTILE(10) OVER (ORDER BY dpa.Score DESC) as ScoreDecile,
+    PERCENT_RANK() OVER (ORDER BY dpa.Score DESC) as ScorePercentileRanking,
+    CASE 
+        WHEN (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = dpa.OwnerUserId) > 100 THEN 'Veteran'
+        WHEN (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = dpa.OwnerUserId) > 50 THEN 'Experienced'
+        WHEN (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = dpa.OwnerUserId) > 10 THEN 'Intermediate'
+        ELSE 'Novice'
+    END as UserExperienceLevel,
+    CASE 
+        WHEN dpa.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year') THEN 'Recent'
+        WHEN dpa.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '5 years') THEN 'Current'
+        WHEN dpa.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '10 years') THEN 'Old'
+        ELSE 'Very Old'
+    END as PostAge,
+    (SELECT COUNT(*) FROM Posts p WHERE p.ParentId = dpa.Id AND p.PostTypeId = 2) as AnswerCountForPost,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = dpa.Id) as CommentCountForPost,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = dpa.Id AND v.VoteTypeId = 2) as UpVoteCountForPost,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = dpa.Id AND v.VoteTypeId = 3) as DownVoteCountForPost
+FROM DetailedPostAnalysis dpa
+)
+SELECT *
+FROM Final
+WHERE (Score > -10 OR Id IS NOT NULL)
+  AND (Score > 5 OR ViewCount > 10 OR AnswerCount > 0 OR CommentCount > 0 OR FavoriteCount > 0)
+ORDER BY Score DESC, LastActivityDate DESC, ViewCount DESC;

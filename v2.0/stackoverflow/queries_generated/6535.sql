@@ -1,0 +1,35 @@
+-- {"query": "6535.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-micro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 388} 
+
+SELECT 
+    u.DisplayName,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 1 THEN p.Id ELSE NULL END) AS InitialTitles,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN p.Id ELSE NULL END) AS UpVotes,
+    COUNT(DISTINCT CASE WHEN b.TagBased = 0 THEN t.TagName ELSE NULL END) AS NamedBadges,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Comment ELSE NULL END) AS CloseReason,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 33 THEN ph.Comment ELSE NULL END) AS PostNoticeAdded,
+    AVG(p.Score) AS AvgScore,
+    SUM(p.ViewCount) AS TotalViews,
+    STRING_AGG(DISTINCT t.TagName, ', ') WITHIN GROUP AS (ORDER BY t.Count DESC) AS TopTags
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    Tags t ON p.Id = t.ExcerptPostId
+WHERE 
+    u.Reputation > 1000
+    AND p.PostTypeId = 1
+    AND p.LastActivityDate > DATEADD(month, -12, CURRENT_TIMESTAMP)
+GROUP BY 
+    u.DisplayName
+HAVING 
+    COUNT(DISTINCT p.Id) > 10
+ORDER BY 
+    TotalPosts DESC;

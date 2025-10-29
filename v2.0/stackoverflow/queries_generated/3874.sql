@@ -1,0 +1,163 @@
+-- {"query": "3874.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2306} 
+
+/* Benchmark query combining CTEs, window functions, outer joins, correlated subqueries,
+   set operators, string aggregation and extensive NULL/conditional logic */
+WITH
+    -- Top users by reputation (including ties)
+    TopReputation AS (
+        SELECT
+            u.Id,
+            u.DisplayName,
+            u.Reputation,
+            ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank,
+            DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS RepDenseRank
+        FROM Users u
+    ),
+    -- Badge counts per user
+    BadgeCounts AS (
+        SELECT
+            b.UserId,
+            COUNT(*) AS TotalBadges,
+            SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+            SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+            SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+    -- Post aggregates per owner (including a correlated subquery for average comment score)
+    PostAgg AS (
+        SELECT
+            p.OwnerUserId                      AS OwnerId,
+            COUNT(*)                           AS PostCount,
+            SUM(p.Score)                       AS TotalScore,
+            AVG(p.Score)                       AS AvgScore,
+            MAX(p.CreationDate)                AS LastPostDate,
+            COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Id END) AS CloseVotesCount,
+            (SELECT AVG(vc.Score)
+               FROM Votes vc
+               WHERE vc.PostId = p.Id
+                 AND vc.VoteTypeId = 3)       AS AvgDownVoteScore      -- correlated subquery
+        FROM Posts p
+        LEFT JOIN PostHistory ph
+               ON ph.PostId = p.Id
+              AND ph.PostHistoryTypeId = 10   -- closed events
+        WHERE p.OwnerUserId IS NOT NULL
+        GROUP BY p.OwnerUserId
+    ),
+    -- Recent activity snapshot (last 30 days) for each user
+    RecentActivity AS (
+        SELECT
+            u.Id                         AS UserId,
+            MAX(p.LastActivityDate)      AS LastActivity,
+            COUNT(DISTINCT p.Id)         AS RecentPosts,
+            STRING_AGG(
+                CASE
+                    WHEN p.Title IS NOT NULL THEN LEFT(p.Title, 30)
+                    ELSE '<no title>'
+                END,
+                ' | '
+            ) WITHIN GROUP (ORDER BY p.CreationDate DESC) AS RecentTitles
+        FROM Users u
+        LEFT JOIN Posts p
+               ON p.OwnerUserId = u.Id
+              AND p.CreationDate >= DATEADD(day, -30, GETUTCDATE())
+        GROUP BY u.Id
+    ),
+    -- Tag usage with latest excerpt titles
+    TagInfo AS (
+        SELECT
+            t.TagName,
+            t.Count                           AS TagUseCount,
+            COALESCE(e.Title, '<no excerpt>') AS ExcerptTitle,
+            STRING_AGG(
+                LEFT(p.Title, 40),
+                '; '
+            ) WITHIN GROUP (ORDER BY p.CreationDate DESC) AS RecentQuestionTitles
+        FROM Tags t
+        LEFT JOIN Posts e
+               ON e.Id = t.ExcerptPostId
+        LEFT JOIN Posts p
+               ON p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+              AND p.PostTypeId = 1               -- questions only
+        WHERE t.IsModeratorOnly = 0
+        GROUP BY t.TagName, t.Count, e.Title
+    )
+-- Final combined result set using UNION ALL to stitch two perspectives
+SELECT
+    tr.Id,
+    tr.DisplayName,
+    tr.Reputation,
+    tr.RepRank,
+    ISNULL(bc.TotalBadges, 0)           AS BadgeCount,
+    ISNULL(pa.PostCount, 0)             AS TotalPosts,
+    ISNULL(pa.TotalScore, 0)            AS CumulativeScore,
+    ROUND(ISNULL(pa.AvgScore, 0), 2)    AS AvgPostScore,
+    COALESCE(ra.LastActivity, tr.CreationDate) AS LastActive,
+    CASE
+        WHEN tr.Reputation > 20000 AND ISNULL(bc.GoldBadges,0) >= 5 THEN 'Elite'
+        WHEN tr.Reputation BETWEEN 10000 AND 20000 THEN 'Power User'
+        ELSE 'Member'
+    END                                 AS ReputationTier,
+    LEFT(ISNULL(ra.RecentTitles, ''), 200) AS RecentPostSamples,
+    -- Correlated sub‑query: total up‑votes across all posts of the user
+    (SELECT COUNT(*)
+       FROM Votes v
+       JOIN Posts p ON p.Id = v.PostId
+      WHERE v.VoteTypeId = 2          -- upvote
+        AND p.OwnerUserId = tr.Id)   AS TotalUpVotes,
+    -- NULL‑aware logic for close vote count
+    COALESCE(pa.CloseVotesCount, 0)     AS CloseVoteEvents,
+    -- Tag relevance score (simple heuristic)
+    (SELECT TOP 1 ti.TagUseCount
+       FROM TagInfo ti
+      WHERE ti.ExcerptTitle LIKE CONCAT('%', tr.DisplayName, '%')
+     ORDER BY ti.TagUseCount DESC)   AS MatchingTagPopularity
+FROM TopReputation tr
+LEFT JOIN BadgeCounts bc
+       ON bc.UserId = tr.Id
+LEFT JOIN PostAgg pa
+       ON pa.OwnerId = tr.Id
+LEFT JOIN RecentActivity ra
+       ON ra.UserId = tr.Id
+WHERE tr.RepDenseRank <= 1000
+  AND (bc.TotalBadges IS NOT NULL OR pa.PostCount IS NOT NULL)
+
+UNION ALL
+
+SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    NULL                               AS RepRank,
+    ISNULL(bc.TotalBadges, 0)          AS BadgeCount,
+    ISNULL(pa.PostCount, 0)            AS TotalPosts,
+    ISNULL(pa.TotalScore, 0)           AS CumulativeScore,
+    ROUND(ISNULL(pa.AvgScore, 0), 2)   AS AvgPostScore,
+    COALESCE(ra.LastActivity, u.CreationDate) AS LastActive,
+    CASE
+        WHEN bc.TotalBadges >= 50 THEN 'Badge Veteran'
+        WHEN bc.SilverBadges >= 20 THEN 'Silver Collector'
+        ELSE 'Badge Hunter'
+    END                                AS ReputationTier,
+    LEFT(ISNULL(ra.RecentTitles, ''), 200) AS RecentPostSamples,
+    (SELECT COUNT(*)
+       FROM Votes v
+       JOIN Posts p ON p.Id = v.PostId
+      WHERE v.VoteTypeId = 2
+        AND p.OwnerUserId = u.Id)    AS TotalUpVotes,
+    COALESCE(pa.CloseVotesCount, 0)    AS CloseVoteEvents,
+    (SELECT TOP 1 ti.TagUseCount
+       FROM TagInfo ti
+      WHERE ti.ExcerptTitle LIKE CONCAT('%', u.DisplayName, '%')
+     ORDER BY ti.TagUseCount DESC)    AS MatchingTagPopularity
+FROM Users u
+LEFT JOIN BadgeCounts bc
+       ON bc.UserId = u.Id
+LEFT JOIN PostAgg pa
+       ON pa.OwnerId = u.Id
+LEFT JOIN RecentActivity ra
+       ON ra.UserId = u.Id
+WHERE bc.TotalBadges >= 30
+   OR u.Reputation BETWEEN 5000 AND 9999
+   AND pa.PostCount IS NOT NULL
+ORDER BY Reputation DESC, BadgeCount DESC;

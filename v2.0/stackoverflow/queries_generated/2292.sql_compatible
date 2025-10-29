@@ -1,0 +1,121 @@
+WITH RECURSIVE RecursivePosts AS (
+    SELECT p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.OwnerUserId, p.AcceptedAnswerId,
+           1 AS Depth, ARRAY[p.Id] AS Path
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Score > 10 AND p.ViewCount > 1000
+
+    UNION ALL
+
+    SELECT c.Id, c.PostTypeId, c.CreationDate, c.Score, c.ViewCount, c.OwnerUserId, c.AcceptedAnswerId,
+           rp.Depth + 1, rp.Path || c.Id
+    FROM RecursivePosts rp
+    JOIN Posts c ON c.ParentId = rp.Id
+    WHERE rp.Depth < 3
+), BadgeCounts AS (
+    SELECT b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+), LatestPostHistory AS (
+    SELECT ph.PostId, ph.PostHistoryTypeId, ph.CreationDate,
+           row_number() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC, ph.Id DESC) AS rn
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (10, 11)
+), QuestionCloseStatus AS (
+    SELECT lph.PostId, lph.PostHistoryTypeId,
+           CASE WHEN lph.PostHistoryTypeId = 10 THEN 'Closed'
+                WHEN lph.PostHistoryTypeId = 11 THEN 'Reopened'
+                ELSE 'Unknown' END AS CloseStatus,
+           lph.CreationDate
+    FROM LatestPostHistory lph
+    WHERE lph.rn = 1
+), UserCommentStats AS (
+    SELECT c.UserId,
+           COUNT(*) AS CommentCount,
+           AVG(LENGTH(c.Text)) AS AvgCommentLength,
+           COUNT(DISTINCT c.PostId) AS UniquePostsCommented
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+    GROUP BY c.UserId
+), PostVotesAggregated AS (
+    SELECT v.PostId,
+           SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+           SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+           SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoriteVotes,
+           COUNT(*) AS TotalVotes
+    FROM Votes v
+    GROUP BY v.PostId
+), UserReputationRank AS (
+    SELECT u.Id, u.DisplayName, u.Reputation,
+           dense_rank() OVER (ORDER BY u.Reputation DESC NULLS LAST) AS RepRank
+    FROM Users u
+), CTE_QuestionsWithAnswers AS (
+    SELECT q.Id AS QuestionId, q.Title, q.CreationDate AS QuestionDate, q.Score AS QuestionScore,
+           a.Id AS AnswerId, a.Score AS AnswerScore, a.CreationDate AS AnswerDate, a.OwnerUserId AS AnswerOwner,
+           CASE WHEN a.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END AS IsAcceptedAnswer
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+), TaggedQuestions AS (
+    SELECT q.Id, q.Tags, q.Score,
+           unnest(string_to_array(substring(q.Tags FROM 2 FOR char_length(q.Tags) - 2), '><')) AS SingleTag
+    FROM Posts q
+    WHERE q.PostTypeId = 1 AND q.Tags IS NOT NULL
+), TopTagsByScore AS (
+    SELECT SingleTag, SUM(Score) AS TotalScore, COUNT(*) AS QuestionCount,
+           AVG(Score) AS AvgScore
+    FROM TaggedQuestions
+    GROUP BY SingleTag
+    HAVING COUNT(*) > 100
+    ORDER BY TotalScore DESC
+    LIMIT 10
+)
+SELECT 
+    rp.Id AS PostId,
+    rp.PostTypeId,
+    rp.CreationDate,
+    rp.Score,
+    rp.ViewCount,
+    u.DisplayName AS OwnerName,
+    COALESCE(bc.GoldBadges,0) AS GoldBadges,
+    COALESCE(bc.SilverBadges,0) AS SilverBadges,
+    COALESCE(bc.BronzeBadges,0) AS BronzeBadges,
+    COALESCE(ucs.CommentCount,0) AS UserCommentCount,
+    COALESCE(ucs.AvgCommentLength,0) AS AvgCommentLength,
+    COALESCE(ucs.UniquePostsCommented,0) AS UniquePostsCommented,
+    pva.UpVotes,
+    pva.DownVotes,
+    pva.FavoriteVotes,
+    qcs.CloseStatus,
+    ur.RepRank,
+    string_agg(DISTINCT lt.Name, ', ') AS LinkTypes,
+    string_agg(DISTINCT phType.Name, ', ') AS PostHistoryTypes,
+    MAX(p.Title) FILTER (WHERE p.PostTypeId = 1) AS QuestionTitle,
+    row_number() OVER (PARTITION BY rp.Id ORDER BY pva.UpVotes DESC NULLS LAST) AS VoteRank,
+    stbt.SingleTag AS TopTag,
+    stbt.TotalScore AS TagTotalScore,
+    round(stbt.AvgScore::numeric, 2) AS TagAvgScore
+FROM RecursivePosts rp
+LEFT JOIN Users u ON u.Id = rp.OwnerUserId
+LEFT JOIN BadgeCounts bc ON bc.UserId = u.Id
+LEFT JOIN UserCommentStats ucs ON ucs.UserId = u.Id
+LEFT JOIN PostVotesAggregated pva ON pva.PostId = rp.Id
+LEFT JOIN QuestionCloseStatus qcs ON qcs.PostId = rp.Id
+LEFT JOIN UserReputationRank ur ON ur.Id = u.Id
+LEFT JOIN PostLinks pl ON pl.PostId = rp.Id
+LEFT JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+LEFT JOIN PostHistory ph ON ph.PostId = rp.Id
+LEFT JOIN PostHistoryTypes phType ON phType.Id = ph.PostHistoryTypeId
+LEFT JOIN Posts p ON p.Id = rp.Id
+LEFT JOIN TaggedQuestions tq ON tq.Id = rp.Id
+LEFT JOIN TopTagsByScore stbt ON stbt.SingleTag = (
+    SELECT tag.SingleTag FROM TaggedQuestions tag WHERE tag.Id = rp.Id ORDER BY tag.Score DESC LIMIT 1
+)
+WHERE rp.Depth = 1
+GROUP BY rp.Id, rp.PostTypeId, rp.CreationDate, rp.Score, rp.ViewCount, u.DisplayName, bc.GoldBadges, bc.SilverBadges, bc.BronzeBadges,
+         ucs.CommentCount, ucs.AvgCommentLength, ucs.UniquePostsCommented,
+         pva.UpVotes, pva.DownVotes, pva.FavoriteVotes, qcs.CloseStatus, ur.RepRank, stbt.SingleTag, stbt.TotalScore, stbt.AvgScore, p.Title, rp.Path, rp.AcceptedAnswerId, rp.OwnerUserId
+ORDER BY rp.Score DESC NULLS LAST
+LIMIT 100;

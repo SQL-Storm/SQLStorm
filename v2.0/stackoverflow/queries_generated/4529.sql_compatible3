@@ -1,0 +1,232 @@
+WITH
+  RankedPostEdits AS (
+    SELECT
+      ph.PostId,
+      ph.UserId,
+      ph.PostHistoryTypeId,
+      ph.CreationDate,
+      ph.Comment,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId, ph.PostHistoryTypeId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6)
+  ),
+  UserContributionSummary AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id ELSE NULL END) AS QuestionCount,
+      COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id ELSE NULL END) AS AnswerCount,
+      COUNT(DISTINCT c.Id) AS CommentCount,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount
+    FROM Users u
+    LEFT JOIN Posts p
+      ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c
+      ON u.Id = c.UserId
+    LEFT JOIN Votes v
+      ON u.Id = v.UserId
+    GROUP BY
+      u.Id,
+      u.DisplayName
+  ),
+  TagWisdom AS (
+    SELECT
+      t.TagName,
+      COUNT(DISTINCT p.Id) AS TotalPosts,
+      AVG(CAST(p.Score AS DECIMAL(10, 2))) AS AvgPostScore,
+      MAX(p.ViewCount) AS MaxPostViewCount
+    FROM Tags t
+    JOIN Posts p
+      ON t.TagName = SUBSTRING(p.Tags FROM 2 FOR (POSITION('>' IN p.Tags) - 2))
+    WHERE
+      p.PostTypeId = 1
+    GROUP BY
+      t.TagName
+    HAVING
+      COUNT(DISTINCT p.Id) > 100
+  )
+SELECT
+  p.Id AS PostId,
+  p.Title,
+  pt.Name AS PostTypeName,
+  p.CreationDate,
+  p.Score,
+  p.ViewCount,
+  p.AnswerCount,
+  p.CommentCount,
+  p.FavoriteCount,
+  u.DisplayName AS OwnerDisplayName,
+  p.OwnerUserId,
+  CLOSE_REASON.Name AS CloseReason,
+  CASE
+    WHEN p.ClosedDate IS NOT NULL THEN 1
+    ELSE 0
+  END AS IsClosed,
+  COALESCE(UPPER(ucon.DisplayName), 'N/A') AS ContributorDisplayName,
+  COALESCE(ucon.QuestionCount, 0) AS ContributorQuestions,
+  COALESCE(ucon.AnswerCount, 0) AS ContributorAnswers,
+  COALESCE(ucon.CommentCount, 0) AS ContributorComments,
+  COALESCE(ucon.UpVoteCount, 0) AS ContributorUpVotes,
+  COALESCE(ucon.DownVoteCount, 0) AS ContributorDownVotes,
+  tw.TagName,
+  tw.TotalPosts AS TagTotalPosts,
+  tw.AvgPostScore AS TagAvgScore,
+  tw.MaxPostViewCount AS TagMaxViews,
+  ph_title.Comment AS LastTitleEditComment,
+  ph_body.Comment AS LastBodyEditComment,
+  ph_tags.Comment AS LastTagsEditComment
+FROM Posts p
+JOIN PostTypes pt
+  ON p.PostTypeId = pt.Id
+LEFT JOIN Users u
+  ON p.OwnerUserId = u.Id
+LEFT JOIN CloseReasonTypes CLOSE_REASON
+  ON CLOSE_REASON.Id = CASE WHEN p.Comment ~ '^\d+$' THEN CAST(p.Comment AS INTEGER) ELSE NULL END
+LEFT JOIN RankedPostEdits rpe_title
+  ON p.Id = rpe_title.PostId AND rpe_title.PostHistoryTypeId = 4 AND rpe_title.rn = 1
+LEFT JOIN RankedPostEdits rpe_body
+  ON p.Id = rpe_body.PostId AND rpe_body.PostHistoryTypeId = 5 AND rpe_body.rn = 1
+LEFT JOIN RankedPostEdits rpe_tags
+  ON p.Id = rpe_tags.PostId AND rpe_tags.PostHistoryTypeId = 6 AND rpe_tags.rn = 1
+LEFT JOIN PostHistory ph_title
+  ON p.Id = ph_title.PostId AND ph_title.PostHistoryTypeId = 4 AND ph_title.RevisionGUID = (
+    SELECT
+      RevisionGUID
+    FROM PostHistory
+    WHERE
+      PostId = p.Id AND PostHistoryTypeId = 4
+    ORDER BY
+      CreationDate DESC
+    LIMIT 1
+  )
+LEFT JOIN PostHistory ph_body
+  ON p.Id = ph_body.PostId AND ph_body.PostHistoryTypeId = 5 AND ph_body.RevisionGUID = (
+    SELECT
+      RevisionGUID
+    FROM PostHistory
+    WHERE
+      PostId = p.Id AND PostHistoryTypeId = 5
+    ORDER BY
+      CreationDate DESC
+    LIMIT 1
+  )
+LEFT JOIN PostHistory ph_tags
+  ON p.Id = ph_tags.PostId AND ph_tags.PostHistoryTypeId = 6 AND ph_tags.RevisionGUID = (
+    SELECT
+      RevisionGUID
+    FROM PostHistory
+    WHERE
+      PostId = p.Id AND PostHistoryTypeId = 6
+    ORDER BY
+      CreationDate DESC
+    LIMIT 1
+  )
+LEFT JOIN UserContributionSummary ucon
+  ON p.OwnerUserId = ucon.UserId
+LEFT JOIN TagWisdom tw
+  ON SUBSTRING(p.Tags FROM 2 FOR (POSITION('>' IN p.Tags) - 2)) = tw.TagName
+WHERE
+  p.PostTypeId IN (1, 2)
+  AND p.Score > 0
+  AND p.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '1 year')
+  AND (
+    p.Title LIKE '%SQL%' OR p.Body LIKE '%SQL%'
+  )
+UNION ALL
+SELECT
+  p.Id AS PostId,
+  p.Title,
+  pt.Name AS PostTypeName,
+  p.CreationDate,
+  p.Score,
+  p.ViewCount,
+  p.AnswerCount,
+  p.CommentCount,
+  p.FavoriteCount,
+  u.DisplayName AS OwnerDisplayName,
+  p.OwnerUserId,
+  CLOSE_REASON.Name AS CloseReason,
+  CASE
+    WHEN p.ClosedDate IS NOT NULL THEN 1
+    ELSE 0
+  END AS IsClosed,
+  COALESCE(UPPER(ucon.DisplayName), 'N/A') AS ContributorDisplayName,
+  COALESCE(ucon.QuestionCount, 0) AS ContributorQuestions,
+  COALESCE(ucon.AnswerCount, 0) AS ContributorAnswers,
+  COALESCE(ucon.CommentCount, 0) AS ContributorComments,
+  COALESCE(ucon.UpVoteCount, 0) AS ContributorUpVotes,
+  COALESCE(ucon.DownVoteCount, 0) AS ContributorDownVotes,
+  tw.TagName,
+  tw.TotalPosts AS TagTotalPosts,
+  tw.AvgPostScore AS TagAvgScore,
+  tw.MaxPostViewCount AS TagMaxViews,
+  ph_title.Comment AS LastTitleEditComment,
+  ph_body.Comment AS LastBodyEditComment,
+  ph_tags.Comment AS LastTagsEditComment
+FROM Posts p
+JOIN PostTypes pt
+  ON p.PostTypeId = pt.Id
+LEFT JOIN Users u
+  ON p.OwnerUserId = u.Id
+LEFT JOIN CloseReasonTypes CLOSE_REASON
+  ON CLOSE_REASON.Id = CASE WHEN p.Comment ~ '^\d+$' THEN CAST(p.Comment AS INTEGER) ELSE NULL END
+LEFT JOIN RankedPostEdits rpe_title
+  ON p.Id = rpe_title.PostId AND rpe_title.PostHistoryTypeId = 4 AND rpe_title.rn = 1
+LEFT JOIN RankedPostEdits rpe_body
+  ON p.Id = rpe_body.PostId AND rpe_body.PostHistoryTypeId = 5 AND rpe_body.rn = 1
+LEFT JOIN RankedPostEdits rpe_tags
+  ON p.Id = rpe_tags.PostId AND rpe_tags.PostHistoryTypeId = 6 AND rpe_tags.rn = 1
+LEFT JOIN PostHistory ph_title
+  ON p.Id = ph_title.PostId AND ph_title.PostHistoryTypeId = 4 AND ph_title.RevisionGUID = (
+    SELECT
+      RevisionGUID
+    FROM PostHistory
+    WHERE
+      PostId = p.Id AND PostHistoryTypeId = 4
+    ORDER BY
+      CreationDate DESC
+    LIMIT 1
+  )
+LEFT JOIN PostHistory ph_body
+  ON p.Id = ph_body.PostId AND ph_body.PostHistoryTypeId = 5 AND ph_body.RevisionGUID = (
+    SELECT
+      RevisionGUID
+    FROM PostHistory
+    WHERE
+      PostId = p.Id AND PostHistoryTypeId = 5
+    ORDER BY
+      CreationDate DESC
+    LIMIT 1
+  )
+LEFT JOIN PostHistory ph_tags
+  ON p.Id = ph_tags.PostId AND ph_tags.PostHistoryTypeId = 6 AND ph_tags.RevisionGUID = (
+    SELECT
+      RevisionGUID
+    FROM PostHistory
+    WHERE
+      PostId = p.Id AND PostHistoryTypeId = 6
+    ORDER BY
+      CreationDate DESC
+    LIMIT 1
+  )
+LEFT JOIN UserContributionSummary ucon
+  ON p.OwnerUserId = ucon.UserId
+LEFT JOIN TagWisdom tw
+  ON SUBSTRING(p.Tags FROM 2 FOR (POSITION('>' IN p.Tags) - 2)) = tw.TagName
+WHERE
+  p.PostTypeId = 1
+  AND p.OwnerUserId IS NOT NULL
+  AND p.AcceptedAnswerId IS NULL
+  AND p.ClosedDate IS NULL
+  AND EXISTS (
+    SELECT
+      1
+    FROM PostLinks pl
+    WHERE
+      pl.PostId = p.Id AND pl.LinkTypeId = 3
+  )
+ORDER BY
+  p.LastActivityDate DESC
+LIMIT 1000;

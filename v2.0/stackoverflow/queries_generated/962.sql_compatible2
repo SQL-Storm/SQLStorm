@@ -1,0 +1,295 @@
+with recent_users as (
+  select u.id as user_id,
+         u.displayname,
+         u.reputation,
+         u.creationdate,
+         u.location,
+         coalesce(nullif(trim(split_part(coalesce(u.websiteurl,''),'/',3)),''), 'unknown') as website_host,
+         date_trunc('month', u.creationdate) as cohort_month
+  from users u
+  where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+recent_questions as (
+  select p.id as post_id,
+         p.owneruserid as user_id,
+         p.creationdate,
+         p.score,
+         p.viewcount,
+         p.title,
+         p.tags,
+         p.answercount,
+         p.commentcount,
+         p.favoritecount,
+         date_trunc('month', p.creationdate) as q_month
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= (select max(creationdate) - interval '365 days' from posts where posttypeid = 1)
+),
+answer_stats as (
+  select a.parentid as question_id,
+         count(*) filter (where a.creationdate <= q.creationdate + interval '7 days') as answers_7d,
+         avg(a.score) as avg_answer_score,
+         max(a.score) as max_answer_score
+  from posts a
+  join posts q on q.id = a.parentid and q.posttypeid = 1
+  where a.posttypeid = 2
+    and a.creationdate >= (select max(creationdate) - interval '365 days' from posts where posttypeid = 2)
+  group by a.parentid, q.creationdate
+),
+vote_agg as (
+  select v.postid,
+         sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+         sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+         sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end) as net_votes,
+         count(*) filter (where v.votetypeid in (8,9)) as bounty_events,
+         sum(coalesce(v.bountyamount,0)) as bounty_amount
+  from votes v
+  where v.creationdate >= (select max(creationdate) - interval '365 days' from votes)
+  group by v.postid
+),
+comment_activity as (
+  select c.postid,
+         count(*) as comments_last_year,
+         max(c.creationdate) as last_comment_at
+  from comments c
+  where c.creationdate >= (select max(creationdate) - interval '365 days' from comments)
+  group by c.postid
+),
+linkage as (
+  select pl.postid,
+         sum(case when pl.linktypeid = 3 then 1 else 0 end) as duplicate_links,
+         sum(case when pl.linktypeid = 1 then 1 else 0 end) as linked_links,
+         count(*) as total_links
+  from postlinks pl
+  where pl.creationdate >= (select max(creationdate) - interval '365 days' from postlinks)
+  group by pl.postid
+),
+closings as (
+  select ph.postid,
+         min(ph.creationdate) filter (where ph.posthistorytypeid = 10) as first_closed_at,
+         max(case when ph.posthistorytypeid = 10 then try_cast(ph.comment as integer) else null end) as last_close_reason_id,
+         count(*) filter (where ph.posthistorytypeid = 10) as close_events,
+         count(*) filter (where ph.posthistorytypeid = 11) as reopen_events
+  from posthistory ph
+  where ph.posthistorytypeid in (10,11)
+  group by ph.postid
+),
+tag_expansion as (
+  select q.post_id,
+         lower(trim(t)) as tag
+  from recent_questions q
+  cross join lateral unnest(string_to_array(substring(coalesce(q.tags,''), 2, greatest(length(coalesce(q.tags,'')) - 2, 0)), '><')) as t
+),
+tag_rank as (
+  select te.post_id,
+         te.tag,
+         row_number() over (partition by te.post_id order by tg.count desc nulls last, te.tag) as tag_rank_by_popularity,
+         tg.count as global_tag_count
+  from tag_expansion te
+  left join tags tg on lower(tg.tagname) = te.tag
+),
+agg_per_question as (
+  select q.post_id,
+         q.user_id,
+         q.creationdate,
+         q.q_month,
+         q.score,
+         q.viewcount,
+         q.answercount,
+         q.commentcount,
+         q.favoritecount,
+         coalesce(v.net_votes, 0) as net_votes,
+         coalesce(v.upvotes, 0) as upvotes,
+         coalesce(v.downvotes, 0) as downvotes,
+         coalesce(v.bounty_amount, 0) as bounty_amount,
+         coalesce(v.bounty_events, 0) as bounty_events,
+         coalesce(ca.comments_last_year, 0) as comments_last_year,
+         ca.last_comment_at,
+         coalesce(l.duplicate_links, 0) as duplicate_links,
+         coalesce(l.linked_links, 0) as linked_links,
+         coalesce(l.total_links, 0) as total_links,
+         coalesce(ans.answers_7d, 0) as answers_7d,
+         coalesce(ans.avg_answer_score, 0) as avg_answer_score,
+         coalesce(ans.max_answer_score, 0) as max_answer_score,
+         cl.first_closed_at,
+         cl.last_close_reason_id,
+         cl.close_events,
+         cl.reopen_events
+  from recent_questions q
+  left join vote_agg v on v.postid = q.post_id
+  left join comment_activity ca on ca.postid = q.post_id
+  left join linkage l on l.postid = q.post_id
+  left join answer_stats ans on ans.question_id = q.post_id
+  left join closings cl on cl.postid = q.post_id
+),
+user_rollup as (
+  select ru.user_id,
+         ru.displayname,
+         ru.reputation,
+         ru.cohort_month,
+         ru.website_host,
+         count(*) as questions_last_year,
+         sum(case when aq.first_closed_at is not null then 1 else 0 end) as closed_questions,
+         avg(aq.score) as avg_q_score,
+         stddev_pop(aq.score) as stddev_q_score,
+         sum(aq.viewcount) as total_views,
+         sum(aq.answers_7d) as total_answers_7d,
+         sum(aq.favoritecount) as total_favs,
+         sum(aq.upvotes) as total_upvotes_on_q,
+         sum(aq.downvotes) as total_downvotes_on_q,
+         sum(aq.bounty_amount) as total_bounty_on_q,
+         max(aq.creationdate) as last_q_at
+  from recent_users ru
+  join agg_per_question aq on aq.user_id = ru.user_id
+  group by ru.user_id, ru.displayname, ru.reputation, ru.cohort_month, ru.website_host
+),
+ranked_questions as (
+  select aq.post_id,
+         aq.user_id,
+         aq.creationdate,
+         aq.score,
+         aq.viewcount,
+         aq.net_votes,
+         aq.upvotes,
+         aq.downvotes,
+         aq.answers_7d,
+         aq.avg_answer_score,
+         aq.duplicate_links,
+         aq.bounty_amount,
+         aq.first_closed_at,
+         aq.creationdate as aq_creationdate,
+         rank() over (partition by aq.user_id order by aq.score desc nulls last, aq.viewcount desc nulls last, aq.creationdate desc) as q_rank_by_score,
+         dense_rank() over (order by aq.viewcount desc nulls last) as global_view_rank,
+         ntile(10) over (order by coalesce(aq.viewcount,0)) as view_ntile,
+         case
+           when aq.first_closed_at is not null then 'closed'
+           when aq.duplicate_links > 0 then 'duplicate-linked'
+           when aq.bounty_amount > 0 then 'bountied'
+           else 'open'
+         end as status_bucket
+  from agg_per_question aq
+),
+top_tag_per_question as (
+  select tr.post_id,
+         min(tr.tag) filter (where tr.tag_rank_by_popularity = 1) as top_tag,
+         max(tr.global_tag_count) filter (where tr.tag_rank_by_popularity = 1) as top_tag_global_count
+  from tag_rank tr
+  group by tr.post_id
+),
+corr_user_activity as (
+  select ur.user_id,
+         sum(case when rq.status_bucket = 'closed' then 1 else 0 end) as closed_q,
+         avg(case when rq.status_bucket = 'bountied' then CAST(rq.bounty_amount AS numeric) else null end) as avg_bounty_when_bountied,
+         corr(CAST(rq.viewcount AS numeric), CAST(rq.score AS numeric)) as corr_views_score
+  from user_rollup ur
+  join ranked_questions rq on rq.user_id = ur.user_id
+  group by ur.user_id
+),
+monthly_trends as (
+  select date_trunc('month', aq.creationdate) as month,
+         count(*) as q_count,
+         avg(aq.viewcount) as avg_views,
+         -- use a standard-compliant approximation for percentile: compute 90th percentile via ordered aggregation using percentile_disc/percentile_cont where supported;
+         -- implement percentile using subquery to avoid ordered-set OVER() usage
+         (select max(vv) from (
+            select vv from (
+              select aq2.viewcount as vv,
+                     row_number() over (order by aq2.viewcount) as rn,
+                     count(*) over () as total_count
+              from agg_per_question aq2
+              where date_trunc('month', aq2.creationdate) = date_trunc('month', aq.creationdate)
+            ) s
+            where rn >= ceil(0.9 * total_count)
+         ) t) as p90_views,
+         sum(case when aq.first_closed_at is not null then 1 else 0 end) as closed_count
+  from agg_per_question aq
+  group by date_trunc('month', aq.creationdate)
+),
+final_scores as (
+  select rq.post_id,
+         rq.user_id,
+         rq.creationdate,
+         rq.score,
+         rq.viewcount,
+         rq.net_votes,
+         rq.upvotes,
+         rq.downvotes,
+         rq.answers_7d,
+         rq.avg_answer_score,
+         rq.duplicate_links,
+         rq.bounty_amount,
+         rq.q_rank_by_score,
+         rq.global_view_rank,
+         rq.view_ntile,
+         rq.status_bucket,
+         coalesce(tt.top_tag, 'no-tag') as top_tag,
+         coalesce(tt.top_tag_global_count, 0) as top_tag_global_count,
+         (coalesce(rq.viewcount,0) * 0.002
+          + coalesce(rq.score,0) * 1.5
+          + coalesce(rq.net_votes,0) * 0.8
+          + coalesce(rq.answers_7d,0) * 0.4
+          + case when rq.first_closed_at is not null then -5 else 0 end
+          + least(coalesce(rq.bounty_amount,0) / 100.0, 10)
+         ) as perf_score
+  from ranked_questions rq
+  left join top_tag_per_question tt on tt.post_id = rq.post_id
+),
+-- compute a cutoff value for top 5% perf_score per entire set without using ordered-set aggregate with OVER
+perf_cutoff as (
+  select max(ps.perf_score) as cutoff_val from (
+    select ps.perf_score,
+           row_number() over (order by ps.perf_score) as rn,
+           count(*) over () as total_count
+    from final_scores ps
+  ) s
+  where rn >= ceil(0.95 * total_count)
+)
+select
+  fs.post_id,
+  fs.user_id,
+  ru.displayname,
+  ru.reputation,
+  ru.cohort_month,
+  ru.website_host,
+  fs.creationdate,
+  fs.top_tag,
+  fs.top_tag_global_count,
+  fs.status_bucket,
+  fs.q_rank_by_score,
+  fs.global_view_rank,
+  fs.view_ntile,
+  fs.viewcount,
+  fs.score,
+  fs.net_votes,
+  fs.upvotes,
+  fs.downvotes,
+  fs.answers_7d,
+  fs.avg_answer_score,
+  fs.duplicate_links,
+  fs.bounty_amount,
+  round(CAST(fs.perf_score AS numeric), 2) as perf_score,
+  ua.closed_q,
+  round(CAST(coalesce(ua.avg_bounty_when_bountied,0) AS numeric),2) as avg_bounty_when_bountied,
+  round(CAST(coalesce(ua.corr_views_score,0) AS numeric),3) as corr_views_score,
+  mt.month as month_bucket,
+  mt.q_count as month_q_count,
+  round(CAST(mt.avg_views AS numeric),1) as month_avg_views,
+  mt.p90_views as month_p90_views,
+  mt.closed_count as month_closed_count,
+  case
+    when exists (select 1 from perf_cutoff pc where fs.perf_score >= pc.cutoff_val) and fs.view_ntile >= 9 then 'elite'
+    when fs.status_bucket = 'closed' and fs.score <= 0 then 'problematic'
+    when fs.answers_7d = 0 and fs.viewcount < 50 then 'low-engagement'
+    when fs.bounty_amount > 0 then 'bountied'
+    else 'normal'
+  end as perf_label
+from final_scores fs
+join user_rollup ru on ru.user_id = fs.user_id
+left join corr_user_activity ua on ua.user_id = fs.user_id
+left join monthly_trends mt on mt.month = date_trunc('month', fs.creationdate)
+where coalesce(fs.top_tag, '') is not null
+  and (ru.questions_last_year >= 1 or fs.viewcount > 0)
+  and not (lower(ru.website_host) like '%spam%' or lower(ru.website_host) like '%malware%')
+  and (fs.first_closed_at is null or fs.first_closed_at > fs.creationdate + interval '1 hour')
+order by fs.perf_score desc, fs.viewcount desc
+limit 500;

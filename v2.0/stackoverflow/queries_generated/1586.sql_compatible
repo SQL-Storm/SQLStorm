@@ -1,0 +1,156 @@
+WITH UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        COALESCE(u.DisplayName, 'Anonymous User ' || u.Id) AS DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes AS TotalUpvotesGivenByUsers,
+        u.DownVotes AS TotalDownvotesGivenByUsers,
+        COUNT(DISTINCT p.Id) AS TotalPostsCreated,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsCreated,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersCreated,
+        AVG(CASE WHEN p.PostTypeId IN (1, 2) THEN p.Score ELSE NULL END) AS AvgPostScoreOverall,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        NULLIF(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - u.CreationDate)) / (60 * 60 * 24 * 365.25), 0) AS YearsOnPlatform,
+        (u.Reputation / NULLIF(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - u.CreationDate)) / (60 * 60 * 24), 0)) AS ReputationPerDay
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate
+),
+PostHistoryTimeline AS (
+    SELECT
+        ph.PostId,
+        MIN(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.CreationDate END) AS FirstEditDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.CreationDate END) AS LastEditDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) AS LatestClosedDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.CreationDate END) AS LatestReopenedDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 12 THEN ph.CreationDate END) AS LatestDeletedDate,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.Id END) AS TotalEditCount,
+        (SELECT ph_cr.Comment
+         FROM PostHistory ph_cr
+         WHERE ph_cr.PostId = ph.PostId
+           AND ph_cr.PostHistoryTypeId = 10
+         ORDER BY ph_cr.CreationDate DESC
+         LIMIT 1
+        ) AS LastCloseReasonCommentId,
+        CASE WHEN MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) IS NOT NULL
+                  AND (MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.CreationDate END) IS NULL OR
+                       MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) > MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.CreationDate END))
+             THEN TRUE ELSE FALSE END AS IsCurrentlyClosed,
+        (SELECT ph_last_event.PostHistoryTypeId
+         FROM PostHistory ph_last_event
+         WHERE ph_last_event.PostId = ph.PostId
+         ORDER BY ph_last_event.CreationDate DESC
+         LIMIT 1) AS LastMajorEventType
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+),
+PostPrimaryTag AS (
+    SELECT
+        p.Id AS PostId,
+        CASE
+            WHEN p.Tags IS NOT NULL AND LENGTH(TRIM(p.Tags)) > 2 AND p.Tags LIKE '<%>%'
+            THEN (string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><'))[1]
+            ELSE NULL
+        END AS PrimaryTagName
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+TagAggregates AS (
+    SELECT
+        ppt.PrimaryTagName AS TagName,
+        COUNT(DISTINCT p.Id) AS QuestionsWithThisTag,
+        AVG(CAST(p.Score AS NUMERIC)) AS AvgQuestionScoreForTag,
+        SUM(p.ViewCount) AS TotalViewCountForTag,
+        (SELECT p_top.Title
+         FROM Posts p_top
+         JOIN PostPrimaryTag ppt_top ON p_top.Id = ppt_top.PostId
+         WHERE ppt_top.PrimaryTagName = ppt.PrimaryTagName
+           AND p_top.PostTypeId = 1
+         ORDER BY p_top.Score DESC, p_top.ViewCount DESC, p_top.CreationDate DESC
+         LIMIT 1) AS TopQuestionTitleForTag,
+        AVG(CASE WHEN p.ClosedDate IS NOT NULL THEN EXTRACT(EPOCH FROM (p.ClosedDate - p.CreationDate)) / (60 * 60 * 24) END) AS AvgDaysToCloseForTag
+    FROM PostPrimaryTag ppt
+    JOIN Posts p ON ppt.PostId = p.Id
+    GROUP BY ppt.PrimaryTagName
+)
+SELECT
+    q.Id AS QuestionId,
+    COALESCE(q.Title, 'No Title Provided') AS QuestionTitle,
+    uas.DisplayName AS OwnerDisplayName,
+    uas.Reputation AS OwnerReputation,
+    uas.YearsOnPlatform,
+    uas.ReputationPerDay,
+    q.CreationDate AS QuestionCreationDate,
+    q.Score AS QuestionScore,
+    q.ViewCount AS QuestionViewCount,
+    q.AnswerCount AS QuestionAnswerCount,
+    q.CommentCount AS QuestionCommentCount,
+    q.FavoriteCount AS QuestionFavoriteCount,
+    EXTRACT(HOUR FROM (pht.FirstEditDate - q.CreationDate)) AS HoursUntilFirstEdit,
+    EXTRACT(DAY FROM (pht.LatestClosedDate - q.CreationDate)) AS DaysUntilClosed,
+    pht.IsCurrentlyClosed,
+    cr.Name AS CurrentCloseReasonType,
+    pht.LastCloseReasonCommentId AS RawLastCloseReasonId,
+    pht.TotalEditCount,
+    pht.LastMajorEventType,
+    COALESCE(q.AcceptedAnswerId, -1) AS AcceptedAnswerId,
+    (SELECT pa.Score FROM Posts pa WHERE pa.Id = q.AcceptedAnswerId) AS AcceptedAnswerScore,
+    (SELECT COUNT(c_q.Id) FROM Comments c_q WHERE c_q.PostId = q.Id) AS DirectCommentCount,
+    (SELECT SUM(c_q.Score) FROM Comments c_q WHERE c_q.PostId = q.Id) AS SumOfCommentScores,
+    ppt.PrimaryTagName,
+    t_agg.QuestionsWithThisTag,
+    t_agg.AvgQuestionScoreForTag,
+    t_agg.TotalViewCountForTag,
+    t_agg.TopQuestionTitleForTag,
+    t_agg.AvgDaysToCloseForTag,
+    RANK() OVER (PARTITION BY ppt.PrimaryTagName ORDER BY q.Score DESC, q.ViewCount DESC) AS RankWithinTagByScore,
+    AVG(q.Score) OVER (PARTITION BY q.OwnerUserId) AS AvgScoreOfOwnersQuestions,
+    STRING_AGG(
+      (CASE WHEN pl.LinkTypeId = 1 THEN 'Linked' WHEN pl.LinkTypeId = 3 THEN 'Duplicate' ELSE NULL END) || ':' || CAST(pl.RelatedPostId AS VARCHAR),
+      '; '
+    ) AS RelatedPostsInfo,
+    CAST(q.CommentCount + COALESCE(q.AnswerCount, 0) + COALESCE(q.FavoriteCount, 0) AS NUMERIC) / NULLIF(q.ViewCount, 0) AS EngagementRatio,
+    CASE
+        WHEN q.Body LIKE '%performance%' OR q.Body LIKE '%optimize%' OR q.Body LIKE '%speed%' THEN 'Performance/Optimization Topic'
+        WHEN q.Body LIKE '%error%' OR q.Body LIKE '%bug%' OR q.Body LIKE '%exception%' THEN 'Bug/Error Topic'
+        WHEN q.Tags LIKE '%<sql>%' AND (q.Tags LIKE '%<database>%' OR q.Tags LIKE '%<postgresql>%' OR q.Tags LIKE '%<mysql>%') THEN 'SQL Database Specific'
+        WHEN q.Tags IS NULL OR LENGTH(TRIM(q.Tags)) <= 2 THEN 'Untagged/BarelyTagged'
+        ELSE 'Other Topic'
+    END AS QuestionTopicCategory,
+    CASE
+        WHEN uas.GoldBadges > 0 AND uas.QuestionsCreated > 100 THEN TRUE
+        ELSE FALSE
+    END AS HighEsteemHighVolumeUser
+FROM Posts q
+JOIN PostTypes pt ON q.PostTypeId = pt.Id
+LEFT JOIN Users u ON q.OwnerUserId = u.Id
+LEFT JOIN UserActivitySummary uas ON u.Id = uas.UserId
+LEFT JOIN PostHistoryTimeline pht ON q.Id = pht.PostId
+LEFT JOIN PostPrimaryTag ppt ON q.Id = ppt.PostId
+LEFT JOIN TagAggregates t_agg ON ppt.PrimaryTagName = t_agg.TagName
+LEFT JOIN PostLinks pl ON q.Id = pl.PostId
+LEFT JOIN CloseReasonTypes cr ON pht.LastCloseReasonCommentId = CAST(cr.Id AS VARCHAR)
+WHERE q.PostTypeId = 1
+  AND q.CreationDate >= DATE '2020-01-01'
+  AND (q.ViewCount > 500 OR q.Score > 50 OR pht.IsCurrentlyClosed = TRUE)
+  AND (q.Title IS NOT NULL AND LENGTH(TRIM(q.Title)) > 10)
+  AND (uas.Reputation > 1000 OR uas.TotalBadges > 10)
+GROUP BY
+    q.Id, q.Title, uas.DisplayName, uas.Reputation, uas.YearsOnPlatform, uas.ReputationPerDay, q.CreationDate, q.Score,
+    q.ViewCount, q.AnswerCount, q.CommentCount, q.FavoriteCount, pht.FirstEditDate, pht.LatestClosedDate,
+    pht.IsCurrentlyClosed, cr.Name, pht.LastCloseReasonCommentId, pht.TotalEditCount, pht.LastMajorEventType,
+    q.AcceptedAnswerId, ppt.PrimaryTagName, t_agg.QuestionsWithThisTag, t_agg.AvgQuestionScoreForTag,
+    t_agg.TotalViewCountForTag, t_agg.TopQuestionTitleForTag, t_agg.AvgDaysToCloseForTag, q.OwnerUserId, q.Body, q.Tags,
+    uas.GoldBadges, uas.QuestionsCreated
+HAVING
+    COUNT(pl.Id) > 0 OR pht.IsCurrentlyClosed = TRUE
+ORDER BY
+    EngagementRatio DESC NULLS LAST, QuestionScore DESC, QuestionCreationDate DESC
+LIMIT 100;

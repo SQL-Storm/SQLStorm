@@ -1,0 +1,94 @@
+-- {"query": "5609.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 760} 
+WITH
+RecentActivePosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.LastEditorUserId,
+    p.Tags,
+    p.ViewCount,
+    p.Score,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.ContentLicense,
+    u.Reputation,
+    u.DisplayName AS OwnerDisplayName
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.LastActivityDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+),
+TaggedActivity AS (
+  SELECT
+    ra.PostId,
+    ra.Title,
+    ra.LastActivityDate,
+    unnest(string_to_array(substr(ra.Tags, 2, length(ra.Tags)-2), '><')) AS TagName,
+    ra.Reputation,
+    ra.OwnerDisplayName,
+    CASE
+      WHEN ra.ViewCount > 1000 THEN 'high-traffic'
+      WHEN ra.ViewCount > 100 THEN 'mid-traffic'
+      ELSE 'low-traffic'
+    END AS TrafficBracket,
+    ra.Score
+  FROM RecentActivePosts ra
+  WHERE ra.Tags IS NOT NULL
+),
+TagBench AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS PostCount,
+    AVG(t.Score) AS AvgScore,
+    MAX(t.Score) AS MaxScore,
+    SUM(t.ViewCount) AS TotalViews
+  FROM TaggedActivity t
+  GROUP BY t.TagName
+),
+TopTags AS (
+  SELECT
+    tb.TagName,
+    tb.PostCount,
+    tb.AvgScore,
+    tb.MaxScore,
+    tb.TotalViews,
+    ROW_NUMBER() OVER (ORDER BY tb.TotalViews DESC, tb.PostCount DESC) AS rn
+  FROM TagBench tb
+)
+SELECT
+  tt.TagName,
+  tt.PostCount,
+  tt.AvgScore,
+  tt.MaxScore,
+  tt.TotalViews,
+  pp.PostId,
+  pp.Title,
+  pp.OwnerDisplayName,
+  pp.CreationDate,
+  pp.LastActivityDate,
+  pp.Score AS PostScore,
+  pp.ViewCount,
+  COALESCE(v.SumBounty, 0) AS BountySum,
+  CASE
+    WHEN pp.LastActivityDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '7 days' THEN 'recent'
+    ELSE 'stale'
+  END AS ActivityBucket,
+  STRING_AGG(DISTINCT cl.Name, ',') AS CloseReasons
+FROM TopTags tt
+JOIN TaggedActivity ta ON ta.TagName = tt.TagName
+JOIN RecentActivePosts pp ON pp.PostId = ta.PostId
+LEFT JOIN Votes v ON v.PostId = pp.PostId AND v.VoteTypeId IN (8,9) -- BountyStart/Close if any
+LEFT JOIN PostHistory ph ON ph.PostId = pp.PostId AND ph.PostHistoryTypeId = 10
+LEFT JOIN PostLinks pl ON pl.PostId = pp.PostId
+LEFT JOIN CloseReasonTypes cl ON CAST(ph.Comment AS varchar) LIKE '%' || CAST(cl.Id AS varchar) || '%'
+GROUP BY
+  tt.TagName, tt.PostCount, tt.AvgScore, tt.MaxScore, tt.TotalViews,
+  pp.PostId, pp.Title, pp.OwnerDisplayName, pp.CreationDate, pp.LastActivityDate,
+  pp.Score, pp.ViewCount, v.SumBounty, pp.LastEditorUserId, pp.Tags, pp.ContentLicense, pp.OwnerUserId
+HAVING tt.PostCount > 5
+ORDER BY tt.TotalViews DESC, tt.PostCount DESC
+LIMIT 100;

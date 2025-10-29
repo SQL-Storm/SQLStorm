@@ -1,0 +1,182 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        CASE 
+            WHEN u.Reputation >= 1000000 THEN 'Legendary'
+            WHEN u.Reputation >= 100000 THEN 'Grandmaster'
+            WHEN u.Reputation >= 10000 THEN 'Master'
+            WHEN u.Reputation >= 1000 THEN 'Expert'
+            ELSE 'Regular'
+        END AS ReputationTier
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.ParentId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.Tags,
+        p.FavoriteCount,
+        p.LastActivityDate,
+        COALESCE(p.OwnerDisplayName, 'Anonymous') AS OwnerDisplayName,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+            WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN 'HasAnswers'
+            WHEN p.PostTypeId = 1 THEN 'Unanswered'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostStatus,
+        CAST(
+            EXTRACT(EPOCH FROM (COALESCE(p.ClosedDate, p.LastActivityDate, TIMESTAMP '2024-10-01 12:34:56') - p.CreationDate))
+            / 86400
+        AS INTEGER) AS AgeInDays,
+        CASE 
+            WHEN p.Score > 100 THEN 'Hot'
+            WHEN p.Score > 50 THEN 'Popular'
+            WHEN p.Score > 10 THEN 'Moderate'
+            ELSE 'Low'
+        END AS PopularityLevel
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) 
+      AND p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 years')
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Trending'
+            WHEN t.Count > 500 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            ELSE 'Niche'
+        END AS TagPopularity,
+        STRING_AGG(
+            CASE 
+                WHEN p.PostTypeId = 1 THEN SUBSTRING(p.Title FROM 1 FOR 50) || '...'
+                ELSE 'Answer'
+            END, 
+            '; '
+        ) AS ExampleTitles
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    WHERE t.Count > 0
+    GROUP BY t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId
+),
+UserPostSummary AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        p.PostTypeId,
+        COUNT(p.Id) AS PostCount,
+        SUM(p.Score) AS TotalScore,
+        AVG(p.Score) AS AvgScore,
+        MAX(p.CreationDate) AS LatestPostDate,
+        STRING_AGG(
+            CASE 
+                WHEN p.PostTypeId = 1 THEN SUBSTRING(p.Title FROM 1 FOR 30)
+                ELSE 'Answer'
+            END, 
+            ' | '
+        ) AS RecentPosts,
+        CASE 
+            WHEN SUM(p.Score) > 10000 THEN 'HighlyActive'
+            WHEN SUM(p.Score) > 5000 THEN 'Active'
+            WHEN SUM(p.Score) > 1000 THEN 'Moderate'
+            ELSE 'Low'
+        END AS ActivityLevel
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6 months')
+    GROUP BY u.Id, u.DisplayName, u.Reputation, p.PostTypeId
+)
+SELECT 
+    COUNT(*) AS TotalUsers,
+    COUNT(DISTINCT uas.UserId) AS ActiveUsers,
+    AVG(uas.Reputation) AS AvgReputation,
+    MAX(uas.PostCount) AS MaxPosts,
+    MIN(uas.CommentCount) AS MinComments,
+    COUNT(DISTINCT CASE WHEN uas.ReputationTier = 'Legendary' THEN uas.UserId END) AS LegendaryUsers,
+    (
+        SELECT STRING_AGG(DISTINCT inner_uas.ReputationTier, ', ')
+        FROM UserActivityStats inner_uas
+        WHERE inner_uas.ReputationRank <= 50
+    ) AS TopReputationTier,
+    (
+        SELECT STRING_AGG(DISTINCT pa2.PostStatus, ', ')
+        FROM PostAnalysis pa2
+        WHERE pa2.AgeInDays <= 30
+    ) AS RecentPostStatuses,
+    STRING_AGG(
+        ta.TagName || '(' || CAST(ta.TagCount AS VARCHAR(10)) || ')', 
+        '; '
+    ) AS PopularTags,
+    (
+        SELECT COUNT(*)
+        FROM PostAnalysis pa3
+        WHERE pa3.PopularityLevel = 'Hot'
+    ) AS HotPostCount,
+    (
+        SELECT STRING_AGG(ups.RecentPosts, '; ')
+        FROM UserPostSummary ups
+        WHERE ups.ActivityLevel = 'HighlyActive'
+    ) AS HighlyActiveUserPosts,
+    (
+        SELECT STRING_AGG(DISTINCT CASE WHEN uas2.ReputationTier = 'Master' THEN uas2.DisplayName ELSE NULL END, ', ')
+        FROM UserActivityStats uas2
+        WHERE uas2.ReputationRank <= 200
+    ) AS MasterUsers,
+    (
+        SELECT COUNT(*)
+        FROM Posts p2
+        WHERE p2.PostTypeId = 1 
+          AND p2.Score > 50 
+          AND p2.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year')
+    ) AS HighScoreQuestions,
+    (
+        SELECT STRING_AGG(DISTINCT p3.Title, ' | ')
+        FROM Posts p3
+        WHERE p3.PostTypeId = 1
+          AND p3.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 week')
+          AND p3.Tags LIKE '%sql%'
+    ) AS RecentSQLQuestions,
+    (
+        SELECT COUNT(DISTINCT p4.OwnerUserId)
+        FROM Posts p4
+        WHERE p4.PostTypeId = 1
+          AND p4.Score > 100
+          AND p4.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '3 months')
+    ) AS ActiveHighScorers
+FROM UserActivityStats uas
+CROSS JOIN TagAnalysis ta
+INNER JOIN PostAnalysis pa ON pa.OwnerUserId = uas.UserId
+INNER JOIN UserPostSummary ups ON ups.UserId = uas.UserId
+WHERE uas.Reputation > 100
+  AND uas.LastPostDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6 months')
+  AND pa.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year')
+  AND ups.LatestPostDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 month')
+  AND ta.TagCount > 10
+  AND pa.Score > 0
+GROUP BY uas.UserId, uas.DisplayName, uas.Reputation, uas.PostCount, uas.CommentCount, uas.LastPostDate, uas.ReputationTier, uas.ReputationRank, ta.TagName, ta.TagCount, pa.PostId, pa.PostTypeId, pa.Title, pa.Score, pa.ViewCount, pa.CreationDate, pa.OwnerUserId, pa.ParentId, pa.AnswerCount, pa.CommentCount, pa.Tags, pa.FavoriteCount, pa.LastActivityDate, pa.OwnerDisplayName, pa.PostStatus, pa.AgeInDays, pa.PopularityLevel, ups.UserId, ups.DisplayName, ups.Reputation, ups.PostTypeId, ups.PostCount, ups.TotalScore, ups.AvgScore, ups.LatestPostDate, ups.RecentPosts, ups.ActivityLevel

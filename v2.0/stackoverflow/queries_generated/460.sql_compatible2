@@ -1,0 +1,340 @@
+with
+-- recent active users with richness metrics
+recent_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.lastaccessdate,
+    coalesce(nullif(trim(u.location), ''), 'Unknown') as location_norm,
+    date_trunc('month', u.creationdate) as cohort_month,
+    count(b.id) filter (where b.class = 1) as gold_badges,
+    count(b.id) filter (where b.class = 2) as silver_badges,
+    count(b.id) filter (where b.class = 3) as bronze_badges,
+    count(distinct case when b.tagbased = true then b.name end) as distinct_tag_badges,
+    sum(coalesce(u.upvotes,0)) over (partition by u.id) as total_upvotes_rep,
+    row_number() over (order by u.reputation desc, u.id) as rep_rank_global
+  from users u
+  left join badges b
+    on b.userid = u.id
+   and b.date >= u.creationdate
+  where u.creationdate >= (select coalesce(max(creationdate), timestamp '2024-10-01 12:34:56' - interval '10 years') from users) - interval '5 years'
+  group by u.id, u.displayname, u.reputation, u.creationdate, u.lastaccessdate, u.location
+),
+-- map posts to tag array and compute per-post metrics
+post_core as (
+  select
+    p.id,
+    p.posttypeid,
+    p.owneruserid,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.title,
+    p.tags,
+    case
+      when p.tags is null then array[]::text[]  -- kept as text[]; many dialects accept empty array literal typed as text[]
+      else string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')
+    end as tag_arr,
+    coalesce(p.answercount, 0) as answer_count,
+    coalesce(p.commentcount, 0) as comment_count,
+    p.acceptedanswerid,
+    p.parentid
+  from posts p
+  where p.creationdate >= (select coalesce(min(creationdate), timestamp '2024-10-01 12:34:56' - interval '20 years') from posts)
+),
+-- questions with exploded tags
+questions_exploded as (
+  select
+    pc.id as question_id,
+    pc.owneruserid as asker_id,
+    pc.creationdate as q_created,
+    pc.score as q_score,
+    pc.viewcount as q_views,
+    pc.title,
+    unnest(pc.tag_arr) as tagname
+  from post_core pc
+  where pc.posttypeid = 1
+),
+-- answers with QA linkage
+answers as (
+  select
+    pa.id as answer_id,
+    pa.owneruserid as answerer_id,
+    pa.creationdate as a_created,
+    pa.score as a_score,
+    pa.parentid as question_id
+  from post_core pa
+  where pa.posttypeid = 2
+),
+-- votes aggregated per post for certain vote types
+vote_agg as (
+  select
+    v.postid,
+    count(*) filter (where v.votetypeid = 2) as upvotes,
+    count(*) filter (where v.votetypeid = 3) as downvotes,
+    count(*) filter (where v.votetypeid = 5) as favorites,
+    count(*) filter (where v.votetypeid = 8) as bounties_started,
+    sum(coalesce(v.bountyamount,0)) filter (where v.votetypeid in (8,9)) as bounty_sum,
+    max(v.creationdate) as last_vote_at
+  from votes v
+  group by v.postid
+),
+-- comment activity per post
+comment_agg as (
+  select
+    c.postid,
+    count(*) as comments,
+    max(c.creationdate) as last_comment_at,
+    bool_or(c.userdisplayname is null and c.userid is null) as has_anon_comment
+  from comments c
+  group by c.postid
+),
+-- post history signals around closures/migrations/protections
+history_flags as (
+  select
+    ph.postid,
+    max(case when ph.posthistorytypeid in (10,35,36) then 1 else 0 end) as ever_closed_or_migrated,
+    max(case when ph.posthistorytypeid = 11 then 1 else 0 end) as ever_reopened,
+    max(case when ph.posthistorytypeid = 19 then 1 else 0 end) as ever_protected,
+    min(ph.creationdate) filter (where ph.posthistorytypeid = 10) as first_closed_at,
+    max(case when ph.posthistorytypeid in (10,11,12,13,14,15,19,20,35,36) and ph.text ilike '%"OriginalQuestionIds"%' then 1 else 0 end) as has_dup_detail_json
+  from posthistory ph
+  group by ph.postid
+),
+-- link graph signals for duplicates and related links
+link_graph as (
+  select
+    pl.postid,
+    count(*) filter (where pl.linktypeid = 3) as dup_links,
+    count(*) filter (where pl.linktypeid = 1) as related_links,
+    max(pl.creationdate) as last_link_at
+  from postlinks pl
+  group by pl.postid
+),
+-- per-user rolling activity windows (questions + answers)
+user_post_activity as (
+  select
+    u.id as user_id,
+    date_trunc('month', p.creationdate) as ym,
+    count(*) as posts_in_month,
+    count(*) filter (where p.posttypeid = 1) as questions_in_month,
+    count(*) filter (where p.posttypeid = 2) as answers_in_month
+  from users u
+  join posts p on p.owneruserid = u.id
+  group by u.id, date_trunc('month', p.creationdate)
+),
+user_post_activity_win as (
+  select
+    upa.user_id,
+    upa.ym,
+    upa.posts_in_month,
+    sum(upa.posts_in_month) over (partition by upa.user_id order by upa.ym rows between 11 preceding and current row) as posts_12m,
+    sum(upa.answers_in_month) over (partition by upa.user_id order by upa.ym rows between 11 preceding and current row) as answers_12m,
+    sum(upa.questions_in_month) over (partition by upa.user_id order by upa.ym rows between 11 preceding and current row) as questions_12m
+  from user_post_activity upa
+),
+-- join questions with answers and aggregates
+qa_join as (
+  select
+    q.question_id,
+    q.asker_id,
+    q.q_created,
+    q.q_score,
+    q.q_views,
+    q.title,
+    q.tagname,
+    coalesce(va.upvotes,0) as q_upvotes,
+    coalesce(va.downvotes,0) as q_downvotes,
+    coalesce(va.favorites,0) as q_favorites,
+    coalesce(va.bounty_sum,0) as q_bounty_sum,
+    coalesce(ca.comments,0) as q_comments,
+    coalesce(hf.ever_closed_or_migrated,0) as q_closed_or_migrated,
+    coalesce(hf.ever_reopened,0) as q_reopened,
+    coalesce(hf.ever_protected,0) as q_protected,
+    hf.first_closed_at,
+    coalesce(hf.has_dup_detail_json,0) as q_has_dup_detail_json,
+    coalesce(lg.dup_links,0) as q_dup_links,
+    coalesce(lg.related_links,0) as q_related_links,
+    lg.last_link_at,
+    count(a.answer_id) as answers_count,
+    count(*) filter (where a.a_score > 0) as pos_answers,
+    max(a.a_score) as max_answer_score,
+    min(a.a_score) as min_answer_score,
+    avg(a.a_score) as avg_answer_score,
+    max(a.a_created) as last_answer_at,
+    bool_or(a.answerer_id is null) as has_deleted_answerer
+  from questions_exploded q
+  left join answers a
+    on a.question_id = q.question_id
+  left join vote_agg va
+    on va.postid = q.question_id
+  left join comment_agg ca
+    on ca.postid = q.question_id
+  left join history_flags hf
+    on hf.postid = q.question_id
+  left join link_graph lg
+    on lg.postid = q.question_id
+  group by
+    q.question_id, q.asker_id, q.q_created, q.q_score, q.q_views, q.title, q.tagname,
+    va.upvotes, va.downvotes, va.favorites, va.bounty_sum,
+    ca.comments, hf.ever_closed_or_migrated, hf.ever_reopened, hf.ever_protected, hf.first_closed_at, hf.has_dup_detail_json,
+    lg.dup_links, lg.related_links, lg.last_link_at
+),
+-- compute per-tag stats using window functions
+tag_stats as (
+  select
+    qaj.*,
+    count(*) over (partition by tagname) as tag_total_questions,
+    avg(q_score) over (partition by tagname) as tag_avg_qscore,
+    -- replace ordered-set aggregate with aggregate percentile via windowing-friendly approach:
+    -- use the 90th percentile approximation via percentile_disc in a subquery per tag (correlated)
+    (
+      select percentile_disc(0.9) within group (order by q2.q_views)
+      from qa_join q2
+      where q2.tagname = qaj.tagname
+    ) as tag_views_p90,
+    row_number() over (partition by tagname order by q_views desc, q_score desc, question_id) as tag_popularity_rank
+  from qa_join qaj
+),
+-- correlated subquery example: first comment text for each question by creation time
+first_comment_per_q as (
+  select q.question_id,
+         (
+           select c.text
+           from comments c
+           where c.postid = q.question_id
+           order by c.creationdate asc, c.id asc
+           limit 1
+         ) as first_comment_text
+  from (select distinct question_id from qa_join) q
+),
+-- users with recent activity rollups
+recent_user_roll as (
+  select ru.user_id,
+         ru.displayname,
+         ru.location_norm,
+         ru.reputation,
+         ru.gold_badges, ru.silver_badges, ru.bronze_badges, ru.distinct_tag_badges,
+         ru.cohort_month,
+         coalesce(upr.posts_12m, 0) as posts_12m,
+         coalesce(upr.answers_12m, 0) as answers_12m,
+         coalesce(upr.questions_12m, 0) as questions_12m
+  from recent_users ru
+  left join lateral (
+    select upr.posts_12m, upr.answers_12m, upr.questions_12m
+    from user_post_activity_win upr
+    where upr.user_id = ru.user_id
+    order by upr.ym desc
+    limit 1
+  ) upr on true
+),
+-- set operator example: union of question and answer owners with type tag
+all_participants as (
+  select distinct pc.owneruserid as user_id, 1 as posttype
+  from post_core pc
+  where pc.posttypeid = 1
+  union
+  select distinct pc.owneruserid as user_id, 2 as posttype
+  from post_core pc
+  where pc.posttypeid = 2
+),
+-- rank users by multi-factor score
+user_influence as (
+  select
+    rur.user_id,
+    rur.displayname,
+    rur.location_norm,
+    rur.reputation,
+    rur.gold_badges, rur.silver_badges, rur.bronze_badges, rur.distinct_tag_badges,
+    rur.posts_12m, rur.answers_12m, rur.questions_12m,
+    sum(case when ap.posttype = 1 then 1 else 0 end) as has_questions_flag,
+    sum(case when ap.posttype = 2 then 1 else 0 end) as has_answers_flag,
+    (rur.reputation/100.0)
+    + 3.0 * sqrt(greatest(rur.answers_12m,0))
+    + 1.5 * sqrt(greatest(rur.questions_12m,0))
+    + 5.0 * rur.gold_badges
+    + 2.0 * rur.silver_badges
+    + 1.0 * rur.bronze_badges
+    + 0.5 * rur.distinct_tag_badges
+    as influence_score
+  from recent_user_roll rur
+  left join all_participants ap on ap.user_id = rur.user_id
+  group by
+    rur.user_id, rur.displayname, rur.location_norm, rur.reputation,
+    rur.gold_badges, rur.silver_badges, rur.bronze_badges, rur.distinct_tag_badges,
+    rur.posts_12m, rur.answers_12m, rur.questions_12m
+),
+-- pick top influencers per location
+top_influencers as (
+  select
+    ui.*,
+    rank() over (partition by ui.location_norm order by ui.influence_score desc, ui.reputation desc, ui.user_id) as rnk_loc
+  from user_influence ui
+),
+-- final assembly: join tags, questions, users; compute predicates and null logic
+final as (
+  select
+    ts.tagname,
+    ts.question_id,
+    ts.title,
+    ts.q_created,
+    ts.q_views,
+    ts.q_score,
+    ts.q_upvotes, ts.q_downvotes, ts.q_favorites, ts.q_bounty_sum,
+    ts.q_comments, ts.q_closed_or_migrated, ts.q_reopened, ts.q_protected, ts.first_closed_at, ts.q_has_dup_detail_json,
+    ts.q_dup_links, ts.q_related_links, ts.last_link_at,
+    ts.answers_count, ts.pos_answers, ts.max_answer_score, ts.min_answer_score, ts.avg_answer_score,
+    ts.tag_total_questions, ts.tag_avg_qscore, ts.tag_views_p90, ts.tag_popularity_rank,
+    fcpq.first_comment_text,
+    uask.id as asker_id,
+    coalesce(uask.displayname, p.ownerdisplayname, 'Community/User Deleted') as asker_display,
+    coalesce(nullif(uask.location, ''), 'Unknown') as asker_location_raw,
+    coalesce(ui.displayname, 'Unknown') as top_influencer_name_in_location,
+    ui.location_norm as location_norm,
+    ui.influence_score as location_influence_score,
+    (
+      case
+        when ts.q_views is null then 0
+        when ts.q_views = 0 and ts.answers_count > 0 then 10
+        else least(100000, ts.q_views)
+      end
+      + (coalesce(ts.q_upvotes,0) - coalesce(ts.q_downvotes,0)) * 25
+      + coalesce(ts.q_favorites,0) * 15
+      + coalesce(ts.q_bounty_sum,0) * 0.1
+      + case when ts.q_closed_or_migrated = 1 then -50 else 0 end
+      + case when ts.q_protected = 1 then 20 else 0 end
+      + coalesce(ts.avg_answer_score,0) * 30
+      + case when ts.q_has_dup_detail_json = 1 or ts.q_dup_links > 0 then -30 else 0 end
+    ) as composite_engagement_score,
+    concat_ws(' | ',
+      upper(ts.tagname),
+      substring(coalesce(ts.title,''), 1, 60),
+      case when ts.q_closed_or_migrated = 1 then 'CLOSED/MIG' when ts.q_protected = 1 then 'PROTECTED' else 'OPEN' end
+    ) as label_line,
+    (case when ts.answers_count > 0 then cast(ts.pos_answers as numeric) / ts.answers_count else null end) as pos_answer_ratio,
+    (case when ts.tag_total_questions > 0 then cast(ts.q_views as numeric) / ts.tag_total_questions else null end) as views_per_tag_question
+  from tag_stats ts
+  left join posts p on p.id = ts.question_id
+  left join users uask on uask.id = ts.asker_id
+  left join first_comment_per_q fcpq on fcpq.question_id = ts.question_id
+  left join top_influencers ui
+    on ui.location_norm = coalesce(nullif(uask.location, ''), 'Unknown')
+   and ui.rnk_loc = 1
+)
+select *
+from final
+where
+  (q_views >= coalesce(tag_views_p90, 0)
+   or (q_score >= coalesce(tag_avg_qscore, 0) + 5)
+   or (answers_count >= 3 and composite_engagement_score > 200))
+  and (first_closed_at is null or first_closed_at > q_created + interval '1 day')
+  and (q_dup_links = 0 or q_has_dup_detail_json = 0)
+  and (coalesce(max(q_comments) over (), 0) is not null)
+order by
+  composite_engagement_score desc,
+  q_views desc,
+  q_score desc,
+  question_id
+limit 250;

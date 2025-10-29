@@ -1,0 +1,66 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.Title,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.LastActivityDate,
+        U.DisplayName AS OwnerDisplayName,
+        U.Reputation,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.LastActivityDate DESC) AS Rank
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId = 1 AND P.Score > 0 AND P.ViewCount > 0
+),
+BadgeCounts AS (
+    SELECT 
+        U.Id AS UserId,
+        COUNT(DISTINCT B.Id) AS BadgeCount
+    FROM 
+        Users U
+    LEFT JOIN 
+        Badges B ON U.Id = B.UserId
+    GROUP BY 
+        U.Id
+)
+SELECT 
+    RP.Id,
+    RP.Title,
+    RP.Score,
+    RP.ViewCount,
+    TO_CHAR(RP.CreationDate, 'YYYY-MM-DD') AS CreationDate,
+    TO_CHAR(RP.LastActivityDate, 'YYYY-MM-DD') AS LastActivityDate,
+    RP.OwnerDisplayName,
+    RP.Reputation,
+    BC.BadgeCount,
+    SUM(V.Score) AS TotalVotes,
+    CASE 
+        WHEN RP.Rank <= 3 THEN 'Top'
+        WHEN RP.Rank <= 10 THEN 'High'
+        ELSE 'Low'
+    END AS Popularity,
+    CASE
+        WHEN RP.Score > 100 THEN 'High'
+        WHEN RP.Score > 50 THEN 'Medium'
+        ELSE 'Low'
+    END AS ScoreTier,
+    STRING_AGG(T.TagName, ', ' ORDER BY COALESCE(T.Count,0) DESC) AS TopTags
+FROM 
+    RankedPosts RP
+LEFT JOIN 
+    BadgeCounts BC ON RP.OwnerDisplayName = CAST(BC.UserId AS TEXT)
+LEFT JOIN 
+    Votes V ON RP.Id = V.PostId
+LEFT JOIN 
+    PostTags PT ON RP.Id = PT.PostId
+LEFT JOIN 
+    Tags T ON PT.TagId = T.Id
+GROUP BY 
+    RP.Id, RP.Title, RP.Score, RP.ViewCount, RP.CreationDate, RP.LastActivityDate, RP.OwnerDisplayName, RP.Reputation, BC.BadgeCount, RP.Rank
+ORDER BY 
+    TotalVotes DESC, RP.Rank ASC
+LIMIT 100;

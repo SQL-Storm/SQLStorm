@@ -1,0 +1,252 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.ViewCount,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        COUNT(DISTINCT c.Id) AS Comments,
+        COUNT(DISTINCT b.Id) AS Badges,
+        MAX(p.CreationDate) AS LastPostDate,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        ROW_NUMBER() OVER (PARTITION BY u.AccountId ORDER BY u.CreationDate) AS AccountMemberNumber
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.ViewCount, u.UpVotes, u.DownVotes, u.AccountId, u.CreationDate
+),
+PostPerformanceMetrics AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Tags,
+        u.DisplayName AS AuthorName,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostType,
+        CASE 
+            WHEN p.Score >= 100 THEN 'HighlyVoted'
+            WHEN p.Score >= 50 THEN 'ModeratelyVoted'
+            WHEN p.Score >= 10 THEN 'LowVoted'
+            ELSE 'Unrated'
+        END AS VoteCategory,
+        CAST((julianday(p.LastActivityDate) - julianday(p.CreationDate)) AS INTEGER) AS DaysSinceCreation,
+        COALESCE(p.AnswerCount, 0) + COALESCE(p.CommentCount, 0) AS EngagementCount,
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousScore,
+        LAG(p.ViewCount, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousViews,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS AverageUserScore,
+        PERCENT_RANK() OVER (ORDER BY p.Score) AS ScorePercentile,
+        NTILE(5) OVER (ORDER BY p.Score DESC) AS ScoreQuintile
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.CreationDate >= DATE('2024-10-01', '-2 years')
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 500 THEN 'Moderate'
+            WHEN t.Count > 100 THEN 'Niche'
+            ELSE 'Obscure'
+        END AS TagPopularity,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS PopularityRank,
+        RANK() OVER (ORDER BY t.Count DESC) AS PopularityGroup
+    FROM Tags t
+    WHERE t.TagName IS NOT NULL AND t.TagName <> ''
+),
+UserPostComplexity AS (
+    SELECT 
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.TotalPosts,
+        ua.Questions,
+        ua.Answers,
+        CASE 
+            WHEN ua.TotalPosts > 0 THEN 
+                (CAST(ua.Answers AS NUMERIC) / CAST(ua.TotalPosts AS NUMERIC)) * 100
+            ELSE 0 
+        END AS AnswerPercentage,
+        CASE 
+            WHEN ua.Questions > 0 THEN 
+                CAST(ua.Comments AS NUMERIC) / CAST(ua.Questions AS NUMERIC)
+            ELSE 0 
+        END AS AvgCommentsPerQuestion,
+        CASE 
+            WHEN ua.Answers > 0 THEN 
+                CAST(ua.Badges AS NUMERIC) / CAST(ua.Answers AS NUMERIC)
+            ELSE 0 
+        END AS AvgBadgesPerAnswer,
+        ROW_NUMBER() OVER (ORDER BY 
+            CASE 
+                WHEN ua.TotalPosts > 0 THEN (CAST(ua.Answers AS NUMERIC) / CAST(ua.TotalPosts AS NUMERIC)) * 100
+                ELSE 0
+            END DESC) AS AnswerPercentageRank,
+        RANK() OVER (ORDER BY ua.Reputation DESC) AS ReputationRank,
+        DENSE_RANK() OVER (ORDER BY ua.ViewCount DESC) AS ViewRank
+    FROM UserActivityStats ua
+    WHERE ua.TotalPosts > 0
+),
+PerformanceComparison AS (
+    SELECT 
+        pp.PostId,
+        pp.Title,
+        pp.Score,
+        pp.ViewCount,
+        pp.AnswerCount,
+        pp.CommentCount,
+        pp.DaysSinceCreation,
+        pp.EngagementCount,
+        pp.ScorePercentile,
+        pp.ScoreQuintile,
+        pp.PostType,
+        uac.AnswerPercentage,
+        CASE 
+            WHEN pp.ScoreQuintile = 1 THEN 'TopTier'
+            WHEN pp.ScoreQuintile = 2 THEN 'HighTier'
+            WHEN pp.ScoreQuintile = 3 THEN 'MediumTier'
+            WHEN pp.ScoreQuintile = 4 THEN 'LowTier'
+            ELSE 'BottomTier'
+        END AS TierCategory,
+        DENSE_RANK() OVER (ORDER BY pp.Score DESC) AS ScoreRank,
+        CASE 
+            WHEN pp.PreviousScore > 0 THEN 
+                ((pp.Score - pp.PreviousScore) * 100.0) / pp.PreviousScore
+            ELSE 0 
+        END AS ScoreChangePercentage,
+        CASE 
+            WHEN pp.PreviousViews > 0 THEN 
+                ((pp.ViewCount - pp.PreviousViews) * 100.0) / pp.PreviousViews
+            ELSE 0 
+        END AS ViewChangePercentage
+    FROM PostPerformanceMetrics pp
+    JOIN UserPostComplexity uac ON pp.AuthorName = uac.DisplayName
+),
+ComplexTagAnalysis AS (
+    SELECT 
+        ta.TagName,
+        ta.TagCount,
+        ta.TagPopularity,
+        ta.PopularityRank,
+        ta.PopularityGroup,
+        LAG(ta.TagCount, 1, 0) OVER (ORDER BY ta.TagCount DESC) AS PreviousTagCount,
+        (ROW_NUMBER() OVER (ORDER BY ta.TagCount DESC) - 
+         ROW_NUMBER() OVER (ORDER BY ta.TagCount ASC)) AS TagCountBucket
+    FROM TagAnalysis ta
+    WHERE ta.TagCount > 100
+),
+FinalAggregation AS (
+    SELECT 
+        DISTINCT 
+        pca.PostId,
+        pca.Title,
+        pca.Score,
+        pca.ViewCount,
+        pca.AnswerCount,
+        pca.CommentCount,
+        pca.DaysSinceCreation,
+        pca.EngagementCount,
+        pca.ScorePercentile,
+        pca.TierCategory,
+        pca.AnswerPercentage,
+        pca.ScoreChangePercentage,
+        pca.ViewChangePercentage,
+        upc.AnswerPercentageRank,
+        upc.ReputationRank,
+        upc.ViewRank,
+        ta.TagName,
+        ta.TagCount,
+        ta.TagPopularity,
+        ta.PopularityRank,
+        cta.TagCountBucket,
+        CASE 
+            WHEN pca.Score >= 50 AND pca.ViewCount >= 1000 THEN 'HighlyEngaged'
+            WHEN pca.Score >= 20 AND pca.ViewCount >= 500 THEN 'ModeratelyEngaged'
+            WHEN pca.Score >= 10 AND pca.ViewCount >= 100 THEN 'LowEngagement'
+            ELSE 'Inactive'
+        END AS EngagementStatus,
+        CASE 
+            WHEN pca.ScoreChangePercentage >= 100 THEN 'SignificantGrowth'
+            WHEN pca.ScoreChangePercentage >= 25 THEN 'ModerateGrowth'
+            WHEN pca.ScoreChangePercentage >= 0 THEN 'Stable'
+            WHEN pca.ScoreChangePercentage >= -50 THEN 'Decline'
+            ELSE 'SevereDecline'
+        END AS PerformanceTrend
+    FROM PerformanceComparison pca
+    JOIN UserPostComplexity upc ON pca.Title LIKE '%' || upc.DisplayName || '%'
+    JOIN ComplexTagAnalysis cta ON pca.Title LIKE '%' || cta.TagName || '%'
+    LEFT JOIN PostLinks pl ON pca.PostId = pl.PostId
+    LEFT JOIN Tags ta ON ta.TagName IN (
+        SELECT TRIM(SUBSTR(pca.Title, INSTR(pca.Title, '<') + 1, 
+            INSTR(pca.Title, '>') - INSTR(pca.Title, '<') - 1))
+        FROM Posts p2
+        WHERE p2.Id = pca.PostId
+        AND INSTR(pca.Title, '<') > 0
+        AND INSTR(pca.Title, '>') > INSTR(pca.Title, '<')
+    )
+    WHERE pca.ScorePercentile > 0.75
+    AND pca.ViewCount > 50
+    AND pca.AnswerPercentage > 20
+    AND upc.AnswerPercentageRank <= 100
+    AND ta.TagCountBucket IN (0, 1, 2)
+)
+SELECT 
+    fa.PostId,
+    fa.Title,
+    fa.Score,
+    fa.ViewCount,
+    fa.AnswerCount,
+    fa.CommentCount,
+    fa.DaysSinceCreation,
+    fa.EngagementCount,
+    fa.ScorePercentile,
+    fa.TierCategory,
+    fa.AnswerPercentage,
+    fa.ScoreChangePercentage,
+    fa.ViewChangePercentage,
+    fa.AnswerPercentageRank,
+    fa.ReputationRank,
+    fa.ViewRank,
+    fa.TagName,
+    fa.TagCount,
+    fa.TagPopularity,
+    fa.PopularityRank,
+    fa.TagCountBucket,
+    fa.EngagementStatus,
+    fa.PerformanceTrend,
+    CASE 
+        WHEN fa.Score >= 100 THEN 'SuperStar'
+        WHEN fa.Score >= 50 THEN 'Star'
+        WHEN fa.Score >= 25 THEN 'RisingStar'
+        ELSE 'Emerging'
+    END AS StarStatus,
+    ROW_NUMBER() OVER (ORDER BY fa.Score DESC, fa.ViewCount DESC) AS OverallRank,
+    COUNT(*) OVER () AS TotalRecords,
+    MIN(fa.Score) OVER () AS MinScore,
+    MAX(fa.Score) OVER () AS MaxScore,
+    AVG(fa.ViewCount) OVER () AS AvgViews,
+    STDDEV_SAMP(fa.ViewCount) OVER () AS StdDevViews
+FROM FinalAggregation fa
+WHERE fa.Title IS NOT NULL
+AND LENGTH(fa.Title) >= 10
+AND fa.Score > 0
+ORDER BY fa.Score DESC, fa.ViewCount DESC, fa.DaysSinceCreation ASC
+LIMIT 1000;

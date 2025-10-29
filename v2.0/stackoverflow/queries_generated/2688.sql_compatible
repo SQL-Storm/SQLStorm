@@ -1,0 +1,156 @@
+with RecursiveTagHierarchy as (
+    select 
+        t.Id,
+        t.TagName,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        cast(t.TagName as varchar(100)) as FullPath,
+        1 as Level
+    from Tags t
+    where t.IsRequired = true
+    union all
+    select 
+        child.Id,
+        child.TagName,
+        child.ExcerptPostId,
+        child.WikiPostId,
+        concat(parent.FullPath, '>', child.TagName),
+        parent.Level + 1
+    from Tags child
+    inner join RecursiveTagHierarchy parent on left(child.TagName, length(parent.TagName)) = parent.TagName
+    where child.TagName <> parent.TagName and child.IsRequired = true
+),
+UserActivity AS (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionsPosted,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswersPosted,
+        count(distinct c.Id) as CommentsMade,
+        count(distinct b.Id) as BadgesEarned,
+        coalesce(sum(case when vt.Name = 'UpMod' then 1 else 0 end), 0) as UpVotesCast
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    left join VoteTypes vt on vt.Id = v.VoteTypeId
+    group by u.Id, u.DisplayName
+),
+TopPostsWithAnswers AS (
+    select 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName as OwnerDisplayName,
+        p.AcceptedAnswerId,
+        count(a.Id) as AnswerCount,
+        row_number() over (order by p.Score desc, p.ViewCount desc) as rn
+    from Posts p
+    left join Posts a on a.ParentId = p.Id and a.PostTypeId = 2
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId = 1
+    group by p.Id, p.Title, p.Score, p.ViewCount, p.CreationDate, p.OwnerUserId, u.DisplayName, p.AcceptedAnswerId
+),
+AcceptedAnswerVotes AS (
+    select 
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        coalesce(sum(case when vt.Name = 'UpMod' then 1 else 0 end),0) as UpVotes,
+        coalesce(sum(case when vt.Name = 'DownMod' then 1 else 0 end),0) as DownVotes,
+        count(v.Id) as TotalVotes
+    from Posts a
+    left join Votes v on v.PostId = a.Id
+    left join VoteTypes vt on vt.Id = v.VoteTypeId
+    where a.PostTypeId = 2
+    group by a.Id, a.ParentId
+),
+RecentPostHistoryEdits AS (
+    select 
+        ph.PostId,
+        max(ph.CreationDate) as LastEditDate,
+        count(ph.Id) as TotalEdits,
+        sum(case when ph.PostHistoryTypeId in (4,5,6) then 1 else 0 end) as ContentEdits
+    from PostHistory ph
+    group by ph.PostId
+),
+DuplicateLinks AS (
+    select 
+        pl.PostId,
+        pl.RelatedPostId,
+        p.Title as RelatedTitle,
+        u.DisplayName as OriginalOwner,
+        pl.CreationDate as LinkCreationDate
+    from PostLinks pl
+    inner join Posts p on p.Id = pl.RelatedPostId and p.PostTypeId = 1
+    left join Users u on u.Id = p.OwnerUserId
+    where pl.LinkTypeId = 3
+),
+CorrelatedComments AS (
+    select 
+        c.PostId,
+        count(*) as CommentsCount,
+        max(c.CreationDate) as LastCommentDate,
+        string_agg(distinct left(c.Text, 100) || coalesce(' (' || c.UserDisplayName || ')', ''), ' | ' order by max(c.CreationDate) desc) as RecentCommentsPreview
+    from Comments c
+    group by c.PostId
+),
+FinalOutput as (
+    select 
+        t.Id as TagId,
+        t.TagName,
+        t.FullPath as TagHierarchy,
+        p.Id as QuestionId,
+        p.Title as QuestionTitle,
+        p.Score as QuestionScore,
+        p.ViewCount as QuestionViews,
+        p.OwnerUserId,
+        ua.DisplayName as QuestionOwner,
+        p.AnswerCount,
+        aav.UpVotes as AcceptedAnswerUpVotes,
+        aav.DownVotes as AcceptedAnswerDownVotes,
+        rphe.TotalEdits,
+        rphe.ContentEdits,
+        rphe.LastEditDate,
+        dl.RelatedPostId as DuplicateOfQuestionId,
+        dl.RelatedTitle as DuplicateOfQuestionTitle,
+        dl.OriginalOwner as DuplicateOriginalOwner,
+        dl.LinkCreationDate as DuplicateLinkDate,
+        cc.CommentsCount,
+        cc.LastCommentDate,
+        cc.RecentCommentsPreview,
+        ua.QuestionsPosted,
+        ua.AnswersPosted,
+        ua.CommentsMade,
+        ua.BadgesEarned,
+        ua.UpVotesCast,
+        lag(p.Score) over (partition by t.Id order by p.Score desc) as PreviousScore,
+        lead(p.Score) over (partition by t.Id order by p.Score desc) as NextScore,
+        case 
+            when p.Score > 100 then 'HighScore'
+            when p.Score between 50 and 100 then 'MediumScore'
+            else 'LowScore'
+        end as ScoreCategory,
+        case
+            when rphe.TotalEdits > 10 then 'HighlyEdited'
+            when rphe.TotalEdits between 5 and 10 then 'ModeratelyEdited'
+            else 'RarelyEdited'
+        end as EditFrequency
+    from RecursiveTagHierarchy t
+    inner join Posts p on p.PostTypeId = 1 and p.Tags like '%' || '<' || t.TagName || '>' || '%'
+    left join UserActivity ua on ua.UserId = p.OwnerUserId
+    left join AcceptedAnswerVotes aav on aav.QuestionId = p.Id and aav.AnswerId = p.AcceptedAnswerId
+    left join RecentPostHistoryEdits rphe on rphe.PostId = p.Id
+    left join DuplicateLinks dl on dl.PostId = p.Id
+    left join CorrelatedComments cc on cc.PostId = p.Id
+    where p.Score is not null
+)
+select *
+from FinalOutput
+where ScoreCategory <> 'LowScore'
+  and (coalesce(CommentsCount,0) > 10 or EditFrequency = 'HighlyEdited')
+order by TagHierarchy, QuestionScore desc
+limit 100;

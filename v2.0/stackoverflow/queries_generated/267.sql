@@ -1,0 +1,383 @@
+-- {"query": "267.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3496} 
+with recent_users as (
+  select u.id as user_id,
+         u.displayname,
+         u.reputation,
+         u.creationdate,
+         u.location,
+         u.websiteurl,
+         u.upvotes,
+         u.downvotes,
+         coalesce(nullif(trim(u.location), ''), 'Unknown') as norm_location
+  from users u
+  where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+user_badge_summary as (
+  select b.userid,
+         count(*) as total_badges,
+         sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+         sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+         sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+         min(b.date) as first_badge_date,
+         max(b.date) as last_badge_date
+  from badges b
+  group by b.userid
+),
+question_posts as (
+  select p.id,
+         p.owneruserid,
+         p.creationdate,
+         p.score,
+         p.viewcount,
+         p.title,
+         p.tags,
+         p.answercount,
+         p.favoritecount,
+         p.closeddate,
+         p.lastactivitydate
+  from posts p
+  where p.posttypeid = 1
+),
+answer_posts as (
+  select a.id,
+         a.parentid,
+         a.owneruserid,
+         a.creationdate,
+         a.score
+  from posts a
+  where a.posttypeid = 2
+),
+q_activity as (
+  select q.id as question_id,
+         q.owneruserid as asker_id,
+         q.creationdate as q_created,
+         q.score as q_score,
+         q.viewcount,
+         q.answercount,
+         q.favoritecount,
+         q.closeddate,
+         q.lastactivitydate,
+         -- tag normalization: split tags into array; count "how-many tags"
+         cardinality(string_to_array(substring(q.tags, 2, greatest(length(q.tags)-2,0)), '><')) as tag_count
+  from question_posts q
+),
+answer_stats as (
+  select a.parentid as question_id,
+         count(*) as answers_total,
+         avg(a.score)::numeric(18,4) as avg_answer_score,
+         max(a.score) as top_answer_score,
+         min(a.score) as worst_answer_score,
+         sum(case when a.score > 0 then 1 else 0 end) as pos_answers,
+         sum(case when a.score < 0 then 1 else 0 end) as neg_answers
+  from answer_posts a
+  group by a.parentid
+),
+accepted_ans as (
+  select q.id as question_id,
+         q.acceptedanswerid as accepted_id,
+         a.owneruserid as accepted_owner_id,
+         a.score as accepted_score,
+         a.creationdate as accepted_created
+  from posts q
+  left join posts a on a.id = q.acceptedanswerid
+  where q.posttypeid = 1
+),
+post_votes_agg as (
+  select v.postid,
+         sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+         sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+         sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started,
+         sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded
+  from votes v
+  group by v.postid
+),
+duplicate_links as (
+  select pl.postid as question_id,
+         count(*) filter (where pl.linktypeid = 3) as dup_count,
+         max(pl.creationdate) filter (where pl.linktypeid = 3) as last_dup_date
+  from postlinks pl
+  group by pl.postid
+),
+user_activity_window as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.location,
+    u.websiteurl,
+    u.upvotes,
+    u.downvotes,
+    sum(p.viewcount) filter (where p.posttypeid = 1) over (partition by u.id) as sum_question_views,
+    count(*) filter (where p.posttypeid = 1) over (partition by u.id) as question_count,
+    count(*) filter (where p.posttypeid = 2) over (partition by u.id) as answer_count,
+    avg(p.score) over (partition by u.id) as avg_post_score_overall
+  from users u
+  left join posts p on p.owneruserid = u.id
+),
+hot_questions as (
+  select
+    qa.question_id,
+    qa.asker_id,
+    qa.q_created,
+    qa.q_score,
+    qa.viewcount,
+    qa.answercount,
+    qa.favoritecount,
+    qa.closeddate,
+    qa.lastactivitydate,
+    qa.tag_count,
+    pv.upvotes as post_upvotes,
+    pv.downvotes as post_downvotes,
+    coalesce(pv.bounty_started - pv.bounty_awarded, 0) as net_bounty_flow,
+    coalesce(ds.dup_count, 0) as dup_count,
+    ds.last_dup_date,
+    row_number() over (order by qa.viewcount desc nulls last, qa.q_score desc nulls last) as rn_by_views
+  from q_activity qa
+  left join post_votes_agg pv on pv.postid = qa.question_id
+  left join duplicate_links ds on ds.question_id = qa.question_id
+),
+edits_cte as (
+  select ph.postid,
+         count(*) filter (where ph.posthistorytypeid in (4,5,6,7,8,9,24)) as edit_events,
+         count(*) filter (where ph.posthistorytypeid in (10,35)) as close_or_migrate_events,
+         max(ph.creationdate) filter (where ph.posthistorytypeid in (4,5,6,7,8,9,24)) as last_edit_date
+  from posthistory ph
+  group by ph.postid
+),
+comment_stats as (
+  select c.postid,
+         count(*) as comment_count,
+         avg(c.score)::numeric(18,4) as avg_comment_score,
+         max(c.score) as top_comment_score,
+         min(c.score) as worst_comment_score
+  from comments c
+  group by c.postid
+),
+top_tags as (
+  select t.tagname,
+         t.count,
+         t.ismoderatoronly,
+         t.isrequired,
+         row_number() over (order by t.count desc, t.tagname) as tag_rank
+  from tags t
+),
+user_tag_engagement as (
+  select
+    q.owneruserid as user_id,
+    lower(unnest(string_to_array(substring(q.tags, 2, greatest(length(q.tags)-2,0)), '><'))) as tagname
+  from posts q
+  where q.posttypeid = 1
+),
+user_top_tag as (
+  select ute.user_id,
+         ute.tagname,
+         count(*) as tag_use_count,
+         rank() over (partition by ute.user_id order by count(*) desc, ute.tagname) as rk
+  from user_tag_engagement ute
+  group by ute.user_id, ute.tagname
+),
+location_norm as (
+  select u.id as user_id,
+         case
+           when u.location ilike '%united states%' or u.location ilike '%usa%' or u.location ilike '%u.s.%' then 'USA'
+           when u.location ilike '%india%' then 'India'
+           when u.location ilike '%uk%' or u.location ilike '%united kingdom%' or u.location ilike '%england%' then 'UK'
+           when u.location ilike '%germany%' then 'Germany'
+           when u.location ilike '%canada%' then 'Canada'
+           when u.location ilike '%australia%' then 'Australia'
+           when u.location is null or btrim(u.location) = '' then 'Unknown'
+           else 'Other'
+         end as region
+  from users u
+),
+user_quality as (
+  select
+    u.id as user_id,
+    coalesce(nullif(u.displayname, ''), '(anonymous)') as displayname,
+    u.reputation,
+    exp(ln(greatest(u.reputation,1)) / 2.0) as rep_sqrt_exp,
+    u.upvotes - u.downvotes as net_votes,
+    (u.upvotes + 1.0) / (u.downvotes + 1.0) as vote_ratio,
+    case when u.websiteurl ~* '^https?://' then u.websiteurl else null end as normalized_url
+  from users u
+),
+q_score_bucket as (
+  select
+    hq.question_id,
+    case
+      when hq.q_score >= 100 then '100+'
+      when hq.q_score >= 50 then '50-99'
+      when hq.q_score >= 10 then '10-49'
+      when hq.q_score >= 0 then '0-9'
+      when hq.q_score >= -5 then '-5 - -1'
+      else '< -5'
+    end as score_bucket
+  from hot_questions hq
+),
+final_rank as (
+  select
+    hq.question_id,
+    hq.asker_id,
+    hq.q_created,
+    hq.q_score,
+    hq.viewcount,
+    hq.answercount,
+    hq.favoritecount,
+    hq.closeddate,
+    hq.lastactivitydate,
+    hq.tag_count,
+    hq.post_upvotes,
+    hq.post_downvotes,
+    hq.net_bounty_flow,
+    hq.dup_count,
+    hq.last_dup_date,
+    coalesce(es.edit_events,0) as edit_events,
+    coalesce(es.close_or_migrate_events,0) as close_or_migrate_events,
+    es.last_edit_date,
+    coalesce(cs.comment_count,0) as comment_count,
+    cs.avg_comment_score,
+    cs.top_comment_score,
+    cs.worst_comment_score,
+    uqs.displayname,
+    uqs.reputation,
+    uqs.rep_sqrt_exp,
+    uqs.net_votes,
+    uqs.vote_ratio,
+    ln(greatest(hq.viewcount + 1,1)) + coalesce(hq.q_score,0) / 10.0
+      + coalesce(cs.comment_count,0) / 20.0
+      + coalesce(es.edit_events,0) / 5.0
+      + coalesce(hq.favoritecount,0) / 10.0
+      - coalesce(hq.dup_count,0) / 2.0
+      + case when hq.closeddate is null then 1 else -1 end
+      + least(coalesce(hq.tag_count,0), 5) / 10.0
+      + ln(greatest(uqs.reputation + 10, 10)) / 3.0
+      as interestingness_score,
+    dense_rank() over (
+      order by
+        ln(greatest(hq.viewcount + 1,1)) + coalesce(hq.q_score,0) / 10.0
+        + coalesce(cs.comment_count,0) / 20.0
+        + coalesce(es.edit_events,0) / 5.0
+        + coalesce(hq.favoritecount,0) / 10.0
+        - coalesce(hq.dup_count,0) / 2.0
+        + case when hq.closeddate is null then 1 else -1 end
+        + least(coalesce(hq.tag_count,0), 5) / 10.0
+        + ln(greatest(uqs.reputation + 10, 10)) / 3.0
+      desc, hq.question_id
+    ) as rank_overall
+  from hot_questions hq
+  left join edits_cte es on es.postid = hq.question_id
+  left join comment_stats cs on cs.postid = hq.question_id
+  left join user_quality uqs on uqs.user_id = hq.asker_id
+),
+benchmark_set as (
+  select
+    fr.*,
+    ua.question_count,
+    ua.answer_count,
+    ua.sum_question_views,
+    ua.avg_post_score_overall,
+    qb.score_bucket,
+    lt.region,
+    uts.tagname as user_top_tag,
+    uts.tag_use_count
+  from final_rank fr
+  left join user_activity_window ua on ua.user_id = fr.asker_id
+  left join q_score_bucket qb on qb.question_id = fr.question_id
+  left join location_norm lt on lt.user_id = fr.asker_id
+  left join user_top_tag uts on uts.user_id = fr.asker_id and uts.rk = 1
+),
+cross_checks as (
+  select
+    b1.question_id as qid_a,
+    b2.question_id as qid_b,
+    b1.asker_id as asker_a,
+    b2.asker_id as asker_b,
+    b1.rank_overall as rank_a,
+    b2.rank_overall as rank_b
+  from benchmark_set b1
+  join benchmark_set b2
+    on b1.asker_id = b2.asker_id
+   and b1.question_id <> b2.question_id
+   and abs(b1.rank_overall - b2.rank_overall) <= 10
+),
+sampled as (
+  select *
+  from benchmark_set b
+  where
+    -- composite filter using NULL logic, string ops, and arithmetic
+    (b.region is null or b.region not in ('Unknown'))
+    and (b.user_top_tag is null or b.user_top_tag <> 'discussion')
+    and (b.question_count is null or b.question_count + coalesce(b.answer_count,0) > 0)
+    and coalesce(b.interestingness_score, -1e9) > -1e8
+    and (b.closeddate is null or b.favoritecount >= 0)
+)
+select
+  s.question_id,
+  s.asker_id,
+  s.displayname,
+  s.region,
+  s.user_top_tag,
+  s.tag_use_count,
+  s.q_created,
+  s.q_score,
+  s.score_bucket,
+  s.viewcount,
+  s.answercount,
+  s.favoritecount,
+  s.post_upvotes,
+  s.post_downvotes,
+  s.comment_count,
+  s.avg_comment_score,
+  s.edit_events,
+  s.close_or_migrate_events,
+  s.last_edit_date,
+  s.rep_sqrt_exp,
+  s.net_votes,
+  s.vote_ratio,
+  s.sum_question_views,
+  s.question_count,
+  s.answer_count,
+  s.avg_post_score_overall,
+  s.interestingness_score,
+  s.rank_overall,
+  case when exists (
+    select 1
+    from cross_checks cc
+    where cc.qid_a = s.question_id or cc.qid_b = s.question_id
+  ) then true else false end as has_nearby_peer_by_same_asker,
+  coalesce(tt.tagname, '(no tag)') as top_global_tagname,
+  tt.count as top_global_tag_count
+from sampled s
+left join top_tags tt on tt.tag_rank = 1
+where
+  -- purposely complex predicate for benchmarking
+  (
+    s.rank_overall <= 200
+    or (
+      s.interestingness_score >= (
+        select percentile_disc(0.9) within group (order by interestingness_score)
+        from benchmark_set
+      )
+      and s.viewcount >= (
+        select avg(viewcount) + stddev_pop(viewcount)
+        from benchmark_set
+        where region = s.region
+      )
+    )
+  )
+  and (
+    -- mix of text, nulls, and math
+    coalesce(length(trim(s.displayname)), 0) > 0
+    and (s.displayname not ilike any (array['%test%','%bot%','%dummy%']))
+  )
+  and (
+    -- correlated subquery referencing votes/comments to add more workload
+    coalesce((
+      select sum(v2.votetypeid = 2::smallint::int) - sum(v2.votetypeid = 3::smallint::int)
+      from votes v2
+      where v2.postid = s.question_id
+    ), 0) >= -10
+  )
+order by s.rank_overall, s.question_id
+limit 500;

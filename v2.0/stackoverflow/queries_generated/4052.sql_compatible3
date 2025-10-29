@@ -1,0 +1,104 @@
+WITH RankedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount AS PostViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        pt.Name AS PostTypeName,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS ScoreRank,
+        SUM(CASE WHEN c.UserId IS NOT NULL THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id) AS CommentCountPerPost,
+        AVG(p.Score) OVER (PARTITION BY p.PostTypeId) AS AvgScorePerPostType,
+        COUNT(ph.Id) OVER (PARTITION BY p.Id) AS PostHistoryCount
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    WHERE p.OwnerUserId IS NOT NULL
+      AND p.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '1 year')
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName AS UserDisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT rp.PostId) AS DistinctPostsCreated,
+        SUM(rp.PostScore) AS TotalScoreOfPosts,
+        MAX(rp.PostCreationDate) AS LastPostCreationDate,
+        AVG(rp.PostViewCount) AS AvgViewCountOfPosts,
+        SUM(CASE WHEN rp.ClosedDate IS NOT NULL THEN 1 ELSE 0 END) AS ClosedPostCount
+    FROM Users u
+    JOIN RankedPosts rp ON u.Id = rp.OwnerUserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+TagCounts AS (
+    SELECT
+        t.TagName,
+        t.Count AS TagPostCount,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS GlobalTagRank
+    FROM Tags t
+    WHERE t.TagName NOT LIKE '%[^a-z0-9-]%'
+),
+PostLinkAnalysis AS (
+    SELECT
+        pl.PostId,
+        COUNT(pl.RelatedPostId) AS LinkCount
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 1
+    GROUP BY pl.PostId
+)
+SELECT
+    rp.PostId,
+    rp.PostTypeName,
+    ua.UserDisplayName,
+    ua.Reputation,
+    rp.PostScore,
+    rp.PostViewCount,
+    rp.CommentCountPerPost,
+    rp.AvgScorePerPostType,
+    rp.PostHistoryCount,
+    COALESCE(pal.LinkCount, 0) AS NumberOfOutgoingLinks,
+    CASE
+        WHEN rp.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN rp.FavoriteCount > 1000 THEN 'Popular'
+        WHEN rp.PostScore > 500 AND rp.AnswerCount > 10 THEN 'Highly Engaged'
+        ELSE 'Standard'
+    END AS PostStatusCategory,
+    tc.TagName AS TopRelatedTag,
+    tc.GlobalTagRank AS TopRelatedTagRank,
+    (ua.TotalScoreOfPosts / NULLIF(ua.DistinctPostsCreated, 0)) AS AvgScorePerUserPost,
+    DATE_PART('day', rp.PostCreationDate - ua.UserCreationDate) AS DaysSinceUserCreation,
+    rp.PostCreationDate,
+    ua.LastPostCreationDate,
+    CASE WHEN ua.ClosedPostCount > 0 THEN 'HasClosedPosts' ELSE 'NoClosedPosts' END AS UserHasClosedPosts
+FROM RankedPosts rp
+JOIN UserActivity ua ON rp.OwnerUserId = ua.UserId
+LEFT JOIN PostLinkAnalysis pal ON rp.PostId = pal.PostId
+LEFT JOIN LATERAL (
+    SELECT t_top.TagName
+    FROM Tags t_top
+    WHERE t_top.TagName IS NOT NULL
+      AND rp.PostTypeId = 1
+      AND EXISTS (
+          SELECT 1
+          FROM Posts p2
+          WHERE p2.Id = rp.PostId
+            AND p2.Tags IS NOT NULL
+            AND POSITION(t_top.TagName IN p2.Tags) > 0
+      )
+    ORDER BY t_top.TagName
+    LIMIT 1
+) t_top ON TRUE
+LEFT JOIN TagCounts tc ON t_top.TagName = tc.TagName AND tc.GlobalTagRank <= 5
+WHERE rp.ScoreRank <= 100
+  AND rp.PostTypeId IN (1, 2)
+  AND ua.Reputation > 10000
+  AND COALESCE(rp.ClosedDate, DATE '9999-12-31') < DATE '2023-01-01'
+ORDER BY rp.PostScore DESC, ua.Reputation DESC
+LIMIT 500;

@@ -1,0 +1,571 @@
+WITH UserActivityStats AS (
+  SELECT 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.Views,
+    COUNT(DISTINCT p.Id) as PostCount,
+    COUNT(DISTINCT c.Id) as CommentCount,
+    COUNT(DISTINCT b.Id) as BadgeCount,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+    COALESCE(SUM(p.Score), 0) as TotalScore,
+    COALESCE(SUM(p.ViewCount), 0) as TotalViews,
+    MAX(p.CreationDate) as LastPostDate,
+    MAX(c.CreationDate) as LastCommentDate,
+    MAX(b.Date) as LastBadgeDate,
+    DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) as PostRank,
+    DENSE_RANK() OVER (ORDER BY COALESCE(SUM(p.Score), 0) DESC) as ScoreRank,
+    DENSE_RANK() OVER (ORDER BY u.Reputation DESC) as RepRank,
+    ROW_NUMBER() OVER (ORDER BY u.CreationDate ASC) as SeniorityRank,
+    CASE WHEN u.WebsiteUrl IS NOT NULL AND u.WebsiteUrl <> '' THEN 1 ELSE 0 END as HasWebsite,
+    CASE WHEN u.Location IS NOT NULL AND u.Location <> '' THEN 1 ELSE 0 END as HasLocation,
+    CASE WHEN u.AboutMe IS NOT NULL AND LENGTH(u.AboutMe) > 100 THEN 1 ELSE 0 END as HasBio,
+    LAG(u.Reputation) OVER (ORDER BY u.CreationDate) as PrevReputation,
+    LAG(u.Views) OVER (ORDER BY u.CreationDate) as PrevViews,
+    LAG(u.CreationDate) OVER (ORDER BY u.CreationDate) as PrevCreationDate,
+    CAST(
+      (EXTRACT(EPOCH FROM u.CreationDate) / 86400.0 - EXTRACT(EPOCH FROM LAG(u.CreationDate) OVER (ORDER BY u.CreationDate)) / 86400.0)
+      AS INTEGER
+    ) as DaysSinceLastAccount
+  FROM Users u
+  LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+  LEFT JOIN Comments c ON u.Id = c.UserId
+  LEFT JOIN Badges b ON u.Id = b.UserId
+  WHERE u.Id > 0
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.WebsiteUrl, u.Location, u.AboutMe, u.CreationDate
+),
+TopUsers AS (
+  SELECT 
+    UserId,
+    DisplayName,
+    Reputation,
+    Views,
+    PostCount,
+    CommentCount,
+    BadgeCount,
+    QuestionCount,
+    AnswerCount,
+    TotalScore,
+    TotalViews,
+    LastPostDate,
+    LastCommentDate,
+    LastBadgeDate,
+    PostRank,
+    ScoreRank,
+    RepRank,
+    SeniorityRank,
+    HasWebsite,
+    HasLocation,
+    HasBio,
+    PrevReputation,
+    PrevViews,
+    PrevCreationDate,
+    DaysSinceLastAccount
+  FROM UserActivityStats
+  WHERE PostRank <= 100 AND ScoreRank <= 100 AND RepRank <= 100
+),
+PostAnalytics AS (
+  SELECT 
+    p.Id as PostId,
+    p.PostTypeId,
+    p.ParentId,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.CreationDate,
+    p.Title,
+    p.Tags,
+    CASE 
+      WHEN p.PostTypeId = 1 THEN 'Question'
+      WHEN p.PostTypeId = 2 THEN 'Answer'
+      WHEN p.PostTypeId = 3 THEN 'Wiki'
+      ELSE 'Other'
+    END as PostTypeDesc,
+    CASE 
+      WHEN p.Score >= 100 THEN 'High'
+      WHEN p.Score >= 10 THEN 'Medium'
+      WHEN p.Score >= 0 THEN 'Low'
+      ELSE 'Negative'
+    END as ScoreCategory,
+    CASE 
+      WHEN p.ViewCount >= 1000 THEN 'High Views'
+      WHEN p.ViewCount >= 100 THEN 'Medium Views'
+      WHEN p.ViewCount >= 10 THEN 'Low Views'
+      ELSE 'Very Low Views'
+    END as ViewCategory,
+    CASE 
+      WHEN p.AnswerCount > 10 THEN 'Many Answers'
+      WHEN p.AnswerCount > 5 THEN 'Moderate Answers'
+      WHEN p.AnswerCount > 0 THEN 'Few Answers'
+      ELSE 'No Answers'
+    END as AnswerCategory,
+    CASE 
+      WHEN p.CommentCount > 50 THEN 'High Comments'
+      WHEN p.CommentCount > 10 THEN 'Moderate Comments'
+      WHEN p.CommentCount > 0 THEN 'Few Comments'
+      ELSE 'No Comments'
+    END as CommentCategory,
+    DENSE_RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) as ScoreRankByType,
+    RANK() OVER (ORDER BY p.ViewCount DESC) as ViewRank,
+    PERCENT_RANK() OVER (ORDER BY p.Score) as ScorePercentile,
+    AVG(p.Score) OVER (PARTITION BY p.PostTypeId) as AvgScoreByType,
+    AVG(p.ViewCount) OVER (PARTITION BY p.PostTypeId) as AvgViewsByType,
+    COUNT(*) OVER (PARTITION BY p.PostTypeId) as CountByType,
+    CASE WHEN p.Tags IS NOT NULL AND p.Tags <> '' THEN 1 ELSE 0 END as HasTags,
+    CASE WHEN p.Title IS NOT NULL AND p.Title <> '' THEN 1 ELSE 0 END as HasTitle,
+    CASE WHEN p.Body IS NOT NULL AND LENGTH(p.Body) > 100 THEN 1 ELSE 0 END as HasBody,
+    COALESCE(p.AcceptedAnswerId, 0) as AcceptedAnswerId,
+    CASE WHEN p.AcceptedAnswerId IS NOT NULL OR p.PostTypeId = 1 THEN 1 ELSE 0 END as IsQuestion,
+    p.ContentLicense,
+    ROW_NUMBER() OVER (ORDER BY p.CreationDate DESC) as RecencyRank,
+    LAG(p.Score) OVER (ORDER BY p.CreationDate) as PrevScore,
+    LAG(p.ViewCount) OVER (ORDER BY p.CreationDate) as PrevViewCount,
+    LAG(p.CreationDate) OVER (ORDER BY p.CreationDate) as PrevCreationDate,
+    CAST(
+      (EXTRACT(EPOCH FROM p.CreationDate) / 86400.0 - EXTRACT(EPOCH FROM LAG(p.CreationDate) OVER (ORDER BY p.CreationDate)) / 86400.0)
+      AS INTEGER
+    ) as DaysSinceLastPost
+  FROM Posts p
+  WHERE p.Id > 0 AND p.OwnerUserId IS NOT NULL
+),
+UserPostEngagement AS (
+  SELECT 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.Views,
+    COUNT(DISTINCT p.Id) as UserPostCount,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as UserQuestionCount,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as UserAnswerCount,
+    SUM(p.Score) as UserTotalScore,
+    SUM(p.ViewCount) as UserTotalViews,
+    AVG(p.Score) as UserAvgScore,
+    AVG(p.ViewCount) as UserAvgViews,
+    MAX(p.CreationDate) as UserLastPostDate,
+    (CAST((EXTRACT(EPOCH FROM MAX(p.CreationDate)) / 86400.0 - EXTRACT(EPOCH FROM MIN(p.CreationDate)) / 86400.0) AS INTEGER) + 1) as UserActivityDays,
+    CAST((EXTRACT(EPOCH FROM TIMESTAMP '2024-10-01 12:34:56') / 86400.0 - EXTRACT(EPOCH FROM MAX(p.CreationDate)) / 86400.0) AS INTEGER) as DaysSinceLastPost,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END), 0) as UserQuestionScoreTotal,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END), 0) as UserAnswerScoreTotal,
+    CASE WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+      CAST(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS FLOAT) / CAST(COUNT(DISTINCT p.Id) AS FLOAT) 
+    ELSE 0 END as AnswerPercentage,
+    CASE WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+      CAST(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS FLOAT) / CAST(COUNT(DISTINCT p.Id) AS FLOAT) 
+    ELSE 0 END as QuestionPercentage,
+    DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) as UserPostRank,
+    DENSE_RANK() OVER (ORDER BY SUM(p.Score) DESC) as UserScoreRank,
+    DENSE_RANK() OVER (ORDER BY AVG(p.Score) DESC) as UserAvgScoreRank
+  FROM Users u
+  LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+  WHERE u.Id > 0
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views
+),
+QuestionStats AS (
+  SELECT 
+    p.Id as QuestionId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Tags,
+    COALESCE(p.AcceptedAnswerId, 0) as AcceptedAnswerId,
+    CAST((EXTRACT(EPOCH FROM p.LastActivityDate) / 86400.0 - EXTRACT(EPOCH FROM p.CreationDate) / 86400.0) AS INTEGER) as DaysToLastActivity,
+    CASE 
+      WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 
+      ELSE 0 
+    END as HasAcceptedAnswer,
+    CASE 
+      WHEN EXISTS (SELECT 1 FROM Posts pa WHERE pa.ParentId = p.Id AND pa.PostTypeId = 2 AND pa.Score > 0) THEN 1 
+      ELSE 0 
+    END as HasUpvotedAnswer,
+    CASE 
+      WHEN EXISTS (SELECT 1 FROM Posts pa WHERE pa.ParentId = p.Id AND pa.PostTypeId = 2 AND pa.Score < 0) THEN 1 
+      ELSE 0 
+    END as HasDownvotedAnswer,
+    CASE 
+      WHEN p.AnswerCount > 0 THEN CAST(p.Score AS FLOAT) / CAST(p.AnswerCount AS FLOAT) 
+      ELSE 0 
+    END as ScorePerAnswer,
+    CASE 
+      WHEN p.AnswerCount > 0 THEN CAST(p.CommentCount AS FLOAT) / CAST(p.AnswerCount AS FLOAT) 
+      ELSE 0 
+    END as CommentsPerAnswer,
+    CASE 
+      WHEN p.ViewCount > 0 THEN CAST(p.Score AS FLOAT) / CAST(p.ViewCount AS FLOAT) 
+      ELSE 0 
+    END as ScorePerView,
+    CASE 
+      WHEN p.AnswerCount > 0 THEN CAST(p.Score AS FLOAT) / CAST(p.AnswerCount AS FLOAT) 
+      ELSE 0 
+    END as AvgAnswerScore,
+    p.ContentLicense,
+    ROW_NUMBER() OVER (ORDER BY p.Score DESC) as QuestionRankByScore,
+    ROW_NUMBER() OVER (ORDER BY p.ViewCount DESC) as QuestionRankByViews,
+    DENSE_RANK() OVER (ORDER BY p.AnswerCount DESC) as AnswerRank,
+    PERCENT_RANK() OVER (ORDER BY p.Score) as ScorePercentile,
+    PERCENT_RANK() OVER (ORDER BY p.ViewCount) as ViewPercentile,
+    RANK() OVER (ORDER BY p.LastActivityDate DESC) as LastActivityRank
+  FROM Posts p
+  WHERE p.PostTypeId = 1 AND p.Id > 0
+)
+SELECT 
+  'Performance Benchmark Report' as ReportTitle,
+  COUNT(*) as TotalRecords,
+  COUNT(CASE WHEN u.PostRank <= 10 THEN 1 END) as Top10PostUsers,
+  COUNT(CASE WHEN u.ScoreRank <= 10 THEN 1 END) as Top10ScoreUsers,
+  COUNT(CASE WHEN u.RepRank <= 10 THEN 1 END) as Top10RepUsers,
+  COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.PostId END) as TotalQuestions,
+  COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.PostId END) as TotalAnswers,
+  COUNT(DISTINCT CASE WHEN p.PostTypeId = 3 THEN p.PostId END) as TotalWikis,
+  COUNT(CASE WHEN p.HasTags = 1 THEN 1 END) as QuestionsWithTags,
+  COUNT(CASE WHEN p.HasTitle = 1 THEN 1 END) as QuestionsWithTitle,
+  COUNT(CASE WHEN p.HasBody = 1 THEN 1 END) as QuestionsWithBody,
+  AVG(u.PostCount) as AvgUserPosts,
+  AVG(u.TotalScore) as AvgUserScore,
+  AVG(u.TotalViews) as AvgUserViews,
+  AVG(p.Score) as AvgPostScore,
+  AVG(p.ViewCount) as AvgPostViews,
+  AVG(p.AnswerCount) as AvgAnswerCount,
+  AVG(p.CommentCount) as AvgCommentCount,
+  MAX(u.PostCount) as MaxUserPosts,
+  MAX(u.TotalScore) as MaxUserScore,
+  MAX(u.TotalViews) as MaxUserViews,
+  MAX(p.Score) as MaxPostScore,
+  MAX(p.ViewCount) as MaxPostViews,
+  MAX(p.AnswerCount) as MaxAnswerCount,
+  MAX(p.CommentCount) as MaxCommentCount,
+  MIN(u.PostCount) as MinUserPosts,
+  MIN(u.TotalScore) as MinUserScore,
+  MIN(u.TotalViews) as MinUserViews,
+  MIN(p.Score) as MinPostScore,
+  MIN(p.ViewCount) as MinPostViews,
+  MIN(p.AnswerCount) as MinAnswerCount,
+  MIN(p.CommentCount) as MinCommentCount,
+  COUNT(CASE WHEN p.ScoreCategory = 'High' THEN 1 END) as HighScorePosts,
+  COUNT(CASE WHEN p.ViewCategory = 'High Views' THEN 1 END) as HighViewPosts,
+  COUNT(CASE WHEN p.AnswerCategory = 'Many Answers' THEN 1 END) as ManyAnswerPosts,
+  COUNT(CASE WHEN p.CommentCategory = 'High Comments' THEN 1 END) as HighCommentPosts,
+  COUNT(CASE WHEN u.HasWebsite = 1 THEN 1 END) as UsersWithWebsite,
+  COUNT(CASE WHEN u.HasLocation = 1 THEN 1 END) as UsersWithLocation,
+  COUNT(CASE WHEN u.HasBio = 1 THEN 1 END) as UsersWithBio,
+  SUM(CASE WHEN upe.UserQuestionScoreTotal > 0 THEN 1 ELSE 0 END) as UsersWithQuestionScore,
+  SUM(CASE WHEN upe.UserAnswerScoreTotal > 0 THEN 1 ELSE 0 END) as UsersWithAnswerScore,
+  AVG(CASE WHEN upe.UserAnswerScoreTotal > 0 THEN upe.AnswerPercentage END) as AvgAnswerPercentage,
+  AVG(CASE WHEN upe.UserQuestionScoreTotal > 0 THEN upe.QuestionPercentage END) as AvgQuestionPercentage,
+  COUNT(CASE WHEN q.HasAcceptedAnswer = 1 THEN 1 END) as QuestionsWithAcceptedAnswer,
+  COUNT(CASE WHEN q.HasUpvotedAnswer = 1 THEN 1 END) as QuestionsWithUpvotedAnswer,
+  COUNT(CASE WHEN q.HasDownvotedAnswer = 1 THEN 1 END) as QuestionsWithDownvotedAnswer,
+  AVG(q.DaysToLastActivity) as AvgDaysToLastActivity,
+  MAX(q.DaysToLastActivity) as MaxDaysToLastActivity,
+  MIN(q.DaysToLastActivity) as MinDaysToLastActivity,
+  AVG(q.ScorePerAnswer) as AvgScorePerAnswer,
+  AVG(q.CommentsPerAnswer) as AvgCommentsPerAnswer,
+  AVG(q.ScorePerView) as AvgScorePerView,
+  AVG(q.AvgAnswerScore) as AvgAnswerScore,
+  ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) as RowId,
+  DATE '2024-10-01' as ReportDate,
+  CAST(CAST(COUNT(*) AS FLOAT) / 1000.0 AS INTEGER) as ThousandRecordGroups,
+  CASE 
+    WHEN COUNT(*) > 1000000 THEN 'Large Dataset'
+    WHEN COUNT(*) > 100000 THEN 'Medium Dataset'
+    WHEN COUNT(*) > 10000 THEN 'Small Dataset'
+    ELSE 'Tiny Dataset'
+  END as DatasetSize,
+  CASE 
+    WHEN COUNT(DISTINCT u.UserId) > 1000 THEN 'High User Activity'
+    WHEN COUNT(DISTINCT u.UserId) > 100 THEN 'Medium User Activity'
+    WHEN COUNT(DISTINCT u.UserId) > 10 THEN 'Low User Activity'
+    ELSE 'Minimal User Activity'
+  END as UserActivityLevel,
+  COUNT(DISTINCT CASE WHEN u.RepRank <= 10 THEN u.UserId END) as Top10RepUsersCount,
+  COUNT(DISTINCT CASE WHEN u.PostRank <= 10 THEN u.UserId END) as Top10PostUsersCount,
+  COUNT(DISTINCT CASE WHEN u.ScoreRank <= 10 THEN u.UserId END) as Top10ScoreUsersCount,
+  COUNT(CASE WHEN u.SeniorityRank <= 5 THEN 1 END) as Top5SeniorUsers,
+  COUNT(CASE WHEN u.SeniorityRank <= 50 THEN 1 END) as Top50SeniorUsers,
+  COUNT(CASE WHEN u.SeniorityRank <= 100 THEN 1 END) as Top100SeniorUsers,
+  AVG(CAST(u.DaysSinceLastAccount AS FLOAT)) as AvgDaysSinceLastAccount,
+  AVG(CAST(p.DaysSinceLastPost AS FLOAT)) as AvgDaysSinceLastPost,
+  CASE 
+    WHEN COUNT(*) > 0 THEN 
+      CAST(SUM(CASE WHEN p.Score > 0 THEN p.Score ELSE 0 END) AS FLOAT) / CAST(COUNT(*) AS FLOAT)
+    ELSE 0 
+  END as AvgPositiveScore,
+  CASE 
+    WHEN COUNT(*) > 0 THEN 
+      CAST(SUM(CASE WHEN p.Score < 0 THEN ABS(p.Score) ELSE 0 END) AS FLOAT) / CAST(COUNT(*) AS FLOAT)
+    ELSE 0 
+  END as AvgNegativeScore,
+  MAX(DATE(u.LastPostDate)) as MaxLastPostDate,
+  MAX(DATE(u.LastCommentDate)) as MaxLastCommentDate,
+  MAX(DATE(u.LastBadgeDate)) as MaxLastBadgeDate,
+  COUNT(CASE WHEN p.PrevScore IS NOT NULL THEN 1 END) as PostsWithPrevScore,
+  COUNT(CASE WHEN p.PrevViewCount IS NOT NULL THEN 1 END) as PostsWithPrevViews,
+  COUNT(CASE WHEN u.PrevReputation IS NOT NULL THEN 1 END) as UsersWithPrevRep,
+  COUNT(CASE WHEN u.PrevViews IS NOT NULL THEN 1 END) as UsersWithPrevViews,
+  COUNT(CASE WHEN q.QuestionRankByScore <= 10 THEN 1 END) as Top10QuestionRank,
+  COUNT(CASE WHEN q.QuestionRankByViews <= 10 THEN 1 END) as Top10ViewRank,
+  COUNT(CASE WHEN q.AnswerRank <= 10 THEN 1 END) as Top10AnswerRank,
+  COUNT(CASE WHEN q.QuestionRankByScore BETWEEN 50 AND 100 THEN 1 END) as Scores50To100Rank,
+  COUNT(CASE WHEN q.QuestionRankByViews BETWEEN 50 AND 100 THEN 1 END) as Views50To100Rank,
+  COUNT(CASE WHEN q.AnswerRank BETWEEN 50 AND 100 THEN 1 END) as Answers50To100Rank,
+  CASE 
+    WHEN COUNT(*) > 0 THEN 
+      CAST(SUM(CASE WHEN p.ViewCount > 0 AND p.Score > 0 THEN 1 ELSE 0 END) AS FLOAT) / CAST(COUNT(*) AS FLOAT)
+    ELSE 0 
+  END as ViewScoreRatio,
+  CASE 
+    WHEN COUNT(*) > 0 THEN 
+      CAST(SUM(CASE WHEN p.CommentCount > 0 AND p.Score > 0 THEN 1 ELSE 0 END) AS FLOAT) / CAST(COUNT(*) AS FLOAT)
+    ELSE 0 
+  END as CommentScoreRatio,
+  SUM(CASE WHEN LENGTH(COALESCE(p.Tags, '')) > 100 THEN 1 ELSE 0 END) as LongTagPosts,
+  SUM(CASE WHEN LENGTH(COALESCE(p.Body, '')) > 500 THEN 1 ELSE 0 END) as LongBodyPosts,
+  COUNT(CASE WHEN upe.UserActivityDays > 365 THEN 1 END) as ActiveUsersYear,
+  COUNT(CASE WHEN upe.UserActivityDays BETWEEN 180 AND 365 THEN 1 END) as ActiveUsersHalfYear,
+  COUNT(CASE WHEN upe.UserActivityDays BETWEEN 30 AND 180 THEN 1 END) as ActiveUsersMonth,
+  COUNT(CASE WHEN upe.UserActivityDays BETWEEN 1 AND 30 THEN 1 END) as ActiveUsersWeek,
+  COUNT(CASE WHEN upe.UserActivityDays <= 0 THEN 1 END) as InactiveUsers,
+  COUNT(CASE WHEN p.ScorePercentile > 0.9 THEN 1 END) as HighPercentilePosts,
+  COUNT(CASE WHEN p.ScorePercentile > 0.75 AND p.ScorePercentile <= 0.9 THEN 1 END) as MediumHighPercentilePosts,
+  COUNT(CASE WHEN p.ScorePercentile > 0.5 AND p.ScorePercentile <= 0.75 THEN 1 END) as MediumPercentilePosts,
+  COUNT(CASE WHEN p.ScorePercentile > 0.25 AND p.ScorePercentile <= 0.5 THEN 1 END) as MediumLowPercentilePosts,
+  COUNT(CASE WHEN p.ScorePercentile <= 0.25 THEN 1 END) as LowPercentilePosts,
+  COUNT(CASE WHEN q.LastActivityRank <= 10 THEN 1 END) as Top10LastActivity,
+  COUNT(CASE WHEN q.LastActivityRank BETWEEN 11 AND 50 THEN 1 END) as Activity11To50,
+  COUNT(CASE WHEN q.LastActivityRank BETWEEN 51 AND 100 THEN 1 END) as Activity51To100,
+  COUNT(CASE WHEN q.LastActivityRank > 100 THEN 1 END) as ActivityOver100,
+  AVG(CASE WHEN p.DaysSinceLastPost IS NOT NULL THEN p.DaysSinceLastPost ELSE 0 END) as AvgDaysSinceLastPostAll,
+  SUM(CASE WHEN u.PostCount > 100 THEN 1 ELSE 0 END) as HighlyActiveUsers,
+  SUM(CASE WHEN u.PostCount BETWEEN 50 AND 100 THEN 1 ELSE 0 END) as ModeratelyActiveUsers,
+  SUM(CASE WHEN u.PostCount BETWEEN 10 AND 50 THEN 1 ELSE 0 END) as LightlyActiveUsers,
+  SUM(CASE WHEN u.PostCount <= 10 THEN 1 ELSE 0 END) as InactiveUsersCount,
+  COUNT(DISTINCT CASE WHEN u.CreationDate >= (DATE '2024-10-01' - INTERVAL '1 year') THEN u.UserId END) as RecentUsers,
+  COUNT(DISTINCT CASE WHEN u.CreationDate BETWEEN (DATE '2024-10-01' - INTERVAL '2 year') AND (DATE '2024-10-01' - INTERVAL '1 year') THEN u.UserId END) as UsersLastYear,
+  COUNT(DISTINCT CASE WHEN u.CreationDate BETWEEN (DATE '2024-10-01' - INTERVAL '5 year') AND (DATE '2024-10-01' - INTERVAL '2 year') THEN u.UserId END) as UsersTwoToFiveYears,
+  COUNT(DISTINCT CASE WHEN u.CreationDate < (DATE '2024-10-01' - INTERVAL '5 year') THEN u.UserId END) as UsersMoreThanFiveYears,
+  COUNT(CASE WHEN u.Reputation > 100000 THEN 1 END) as EliteUsers,
+  COUNT(CASE WHEN u.Reputation BETWEEN 10000 AND 100000 THEN 1 END) as PowerUsers,
+  COUNT(CASE WHEN u.Reputation BETWEEN 1000 AND 10000 THEN 1 END) as RegularUsers,
+  COUNT(CASE WHEN u.Reputation < 1000 THEN 1 END) as NewUsers,
+  COUNT(DISTINCT CASE WHEN p.Score > 0 THEN p.OwnerUserId END) as UsersWithScorePosts,
+  COUNT(DISTINCT CASE WHEN p.Score < 0 THEN p.OwnerUserId END) as UsersWithNegativeScorePosts,
+  COUNT(DISTINCT CASE WHEN p.Score = 0 THEN p.OwnerUserId END) as UsersWithZeroScorePosts,
+  CAST(SUM(CASE WHEN p.Score > 0 THEN 1 ELSE 0 END) AS FLOAT) / CAST(COUNT(*) AS FLOAT) as PositiveScorePercentage,
+  CAST(SUM(CASE WHEN p.Score < 0 THEN 1 ELSE 0 END) AS FLOAT) / CAST(COUNT(*) AS FLOAT) as NegativeScorePercentage,
+  CAST(SUM(CASE WHEN p.Score = 0 THEN 1 ELSE 0 END) AS FLOAT) / CAST(COUNT(*) AS FLOAT) as ZeroScorePercentage
+FROM 
+  Users u
+  INNER JOIN PostAnalytics p ON u.Id = p.OwnerUserId
+  LEFT JOIN UserPostEngagement upe ON u.Id = upe.UserId
+  LEFT JOIN QuestionStats q ON p.PostTypeId = 1 AND p.PostId = q.QuestionId
+  LEFT JOIN TopUsers tu ON u.Id = tu.UserId
+WHERE 
+  u.Id > 0
+  AND (p.PostTypeId = 1 OR p.PostTypeId = 2 OR p.PostTypeId = 3)
+  AND (p.Score IS NOT NULL OR p.Score = 0)
+  AND (p.ViewCount >= 0 OR p.ViewCount IS NULL)
+  AND u.Reputation >= 0
+GROUP BY 
+  DATE '2024-10-01',
+  CASE 
+    WHEN COUNT(*) > 1000000 THEN 'Large Dataset'
+    WHEN COUNT(*) > 100000 THEN 'Medium Dataset'
+    WHEN COUNT(*) > 10000 THEN 'Small Dataset'
+    ELSE 'Tiny Dataset'
+  END,
+  CASE 
+    WHEN COUNT(DISTINCT u.UserId) > 1000 THEN 'High User Activity'
+    WHEN COUNT(DISTINCT u.UserId) > 100 THEN 'Medium User Activity'
+    WHEN COUNT(DISTINCT u.UserId) > 10 THEN 'Low User Activity'
+    ELSE 'Minimal User Activity'
+  END,
+  u.UserId,
+  u.DisplayName,
+  u.Reputation,
+  u.Views,
+  u.PostCount,
+  u.CommentCount,
+  u.BadgeCount,
+  u.QuestionCount,
+  u.AnswerCount,
+  u.TotalScore,
+  u.TotalViews,
+  u.LastPostDate,
+  u.LastCommentDate,
+  u.LastBadgeDate,
+  u.PostRank,
+  u.ScoreRank,
+  u.RepRank,
+  u.SeniorityRank,
+  u.HasWebsite,
+  u.HasLocation,
+  u.HasBio,
+  u.PrevReputation,
+  u.PrevViews,
+  u.PrevCreationDate,
+  u.DaysSinceLastAccount,
+  p.PostId,
+  p.PostTypeId,
+  p.ParentId,
+  p.OwnerUserId,
+  p.Score,
+  p.ViewCount,
+  p.AnswerCount,
+  p.CommentCount,
+  p.FavoriteCount,
+  p.CreationDate,
+  p.Title,
+  p.Tags,
+  p.PostTypeDesc,
+  p.ScoreCategory,
+  p.ViewCategory,
+  p.AnswerCategory,
+  p.CommentCategory,
+  p.ScoreRankByType,
+  p.ViewRank,
+  p.ScorePercentile,
+  p.AvgScoreByType,
+  p.AvgViewsByType,
+  p.CountByType,
+  p.HasTags,
+  p.HasTitle,
+  p.HasBody,
+  p.AcceptedAnswerId,
+  p.IsQuestion,
+  p.ContentLicense,
+  p.RecencyRank,
+  p.PrevScore,
+  p.PrevViewCount,
+  p.PrevCreationDate,
+  p.DaysSinceLastPost,
+  upe.UserId,
+  upe.DisplayName,
+  upe.Reputation,
+  upe.Views,
+  upe.UserPostCount,
+  upe.UserQuestionCount,
+  upe.UserAnswerCount,
+  upe.UserTotalScore,
+  upe.UserTotalViews,
+  upe.UserAvgScore,
+  upe.UserAvgViews,
+  upe.UserLastPostDate,
+  upe.UserActivityDays,
+  upe.DaysSinceLastPost,
+  upe.UserQuestionScoreTotal,
+  upe.UserAnswerScoreTotal,
+  upe.AnswerPercentage,
+  upe.QuestionPercentage,
+  upe.UserPostRank,
+  upe.UserScoreRank,
+  upe.UserAvgScoreRank,
+  q.QuestionId,
+  q.Title,
+  q.Score,
+  q.ViewCount,
+  q.AnswerCount,
+  q.CommentCount,
+  q.OwnerUserId,
+  q.CreationDate,
+  q.LastActivityDate,
+  q.Tags,
+  q.AcceptedAnswerId,
+  q.DaysToLastActivity,
+  q.HasAcceptedAnswer,
+  q.HasUpvotedAnswer,
+  q.HasDownvotedAnswer,
+  q.ScorePerAnswer,
+  q.CommentsPerAnswer,
+  q.ScorePerView,
+  q.AvgAnswerScore,
+  q.ContentLicense,
+  q.QuestionRankByScore,
+  q.QuestionRankByViews,
+  q.AnswerRank,
+  q.ScorePercentile,
+  q.ViewPercentile,
+  q.LastActivityRank,
+  tu.UserId,
+  tu.DisplayName,
+  tu.Reputation,
+  tu.Views,
+  tu.PostCount,
+  tu.CommentCount,
+  tu.BadgeCount,
+  tu.QuestionCount,
+  tu.AnswerCount,
+  tu.TotalScore,
+  tu.TotalViews,
+  tu.LastPostDate,
+  tu.LastCommentDate,
+  tu.LastBadgeDate,
+  tu.PostRank,
+  tu.ScoreRank,
+  tu.RepRank,
+  tu.SeniorityRank,
+  tu.HasWebsite,
+  tu.HasLocation,
+  tu.HasBio,
+  tu.PrevReputation,
+  tu.PrevViews,
+  tu.PrevCreationDate,
+  tu.DaysSinceLastAccount
+HAVING 
+  COUNT(*) > 0
+  AND COUNT(CASE WHEN u.PostRank <= 10 THEN 1 END) >= 1
+  AND COUNT(CASE WHEN u.ScoreRank <= 10 THEN 1 END) >= 1
+  AND COUNT(CASE WHEN u.RepRank <= 10 THEN 1 END) >= 1
+  AND COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.PostId END) >= 1
+  AND COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.PostId END) >= 1
+  AND COUNT(CASE WHEN p.HasTags = 1 THEN 1 END) >= 1
+  AND COUNT(CASE WHEN p.HasTitle = 1 THEN 1 END) >= 1
+  AND COUNT(CASE WHEN p.HasBody = 1 THEN 1 END) >= 1
+  AND AVG(u.PostCount) >= 0
+  AND AVG(u.TotalScore) >= 0
+  AND AVG(u.TotalViews) >= 0
+  AND AVG(p.Score) >= 0
+  AND AVG(p.ViewCount) >= 0
+  AND AVG(p.AnswerCount) >= 0
+  AND AVG(p.CommentCount) >= 0
+  AND MAX(u.PostCount) >= 0
+  AND MAX(u.TotalScore) >= 0
+  AND MAX(u.TotalViews) >= 0
+  AND MAX(p.Score) >= 0
+  AND MAX(p.ViewCount) >= 0
+  AND MAX(p.AnswerCount) >= 0
+  AND MAX(p.CommentCount) >= 0
+  AND MIN(u.PostCount) >= 0
+  AND MIN(u.TotalScore) >= 0
+  AND MIN(u.TotalViews) >= 0
+  AND MIN(p.Score) >= 0
+  AND MIN(p.ViewCount) >= 0
+  AND MIN(p.AnswerCount) >= 0
+  AND MIN(p.CommentCount) >= 0
+  AND COUNT(CASE WHEN u.HasWebsite = 1 THEN 1 END) >= 0
+  AND COUNT(CASE WHEN u.HasLocation = 1 THEN 1 END) >= 0
+  AND COUNT(CASE WHEN u.HasBio = 1 THEN 1 END) >= 0
+  AND SUM(CASE WHEN upe.UserQuestionScoreTotal > 0 THEN 1 ELSE 0 END) >= 0
+  AND SUM(CASE WHEN upe.UserAnswerScoreTotal > 0 THEN 1 ELSE 0 END) >= 0
+  AND AVG(CASE WHEN upe.UserAnswerScoreTotal > 0 THEN upe.AnswerPercentage END) IS NOT NULL
+  AND AVG(CASE WHEN upe.UserQuestionScoreTotal > 0 THEN upe.QuestionPercentage END) IS NOT NULL
+  AND COUNT(CASE WHEN q.HasAcceptedAnswer = 1 THEN 1 END) >= 0
+  AND COUNT(CASE WHEN q.HasUpvotedAnswer = 1 THEN 1 END) >= 0
+  AND COUNT(CASE WHEN q.HasDownvotedAnswer = 1 THEN 1 END) >= 0
+  AND AVG(q.DaysToLastActivity) IS NOT NULL
+  AND MAX(q.DaysToLastActivity) >= 0
+  AND MIN(q.DaysToLastActivity) >= 0
+  AND AVG(q.ScorePerAnswer) IS NOT NULL
+  AND AVG(q.CommentsPerAnswer) IS NOT NULL
+  AND AVG(q.ScorePerView) IS NOT NULL
+  AND AVG(q.AvgAnswerScore) IS NOT NULL
+ORDER BY 
+  COUNT(*) DESC,
+  COUNT(DISTINCT u.UserId) DESC;

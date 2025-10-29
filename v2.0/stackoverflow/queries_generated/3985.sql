@@ -1,0 +1,124 @@
+-- {"query": "3985.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2103} 
+
+WITH UserStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.CreationDate, TIMESTAMP '1970-01-01')          AS UserSince,
+        (SELECT MAX(p.CreationDate)
+         FROM Posts p
+         WHERE p.OwnerUserId = u.Id)                              AS LastPostDate,
+        (SELECT COUNT(*)
+         FROM Posts q
+         WHERE q.OwnerUserId = u.Id AND q.PostTypeId = 1)        AS QuestionCount,
+        (SELECT COUNT(*)
+         FROM Posts a
+         WHERE a.OwnerUserId = u.Id AND a.PostTypeId = 2)        AS AnswerCount,
+        (SELECT COUNT(*)
+         FROM Posts a
+         WHERE a.OwnerUserId = u.Id
+           AND a.PostTypeId = 2
+           AND EXISTS (SELECT 1
+                       FROM Posts q
+                       WHERE q.Id = a.ParentId
+                         AND q.AcceptedAnswerId = a.Id))          AS AcceptedAnswerCount,
+        (SELECT AVG(COALESCE(vt.Score,0))
+         FROM Votes vt
+         JOIN Posts p ON vt.PostId = p.Id
+         WHERE p.OwnerUserId = u.Id)                              AS AvgVoteScore,
+        (SELECT COUNT(*)
+         FROM Badges b
+         WHERE b.UserId = u.Id AND b.Class = 1)                  AS GoldBadgeCount,
+        (SELECT COUNT(*)
+         FROM Badges b
+         WHERE b.UserId = u.Id AND b.Class = 2)                  AS SilverBadgeCount,
+        (SELECT COUNT(*)
+         FROM Badges b
+         WHERE b.UserId = u.Id AND b.Class = 3)                  AS BronzeBadgeCount
+    FROM Users u
+),
+TagUsage AS (
+    SELECT
+        u.Id                                     AS UserId,
+        t.TagName,
+        COUNT(*)                                 AS TagCnt,
+        ROW_NUMBER() OVER (PARTITION BY u.Id
+                           ORDER BY COUNT(*) DESC) AS TagRank
+    FROM Users u
+    JOIN Posts p
+        ON p.OwnerUserId = u.Id
+       AND p.PostTypeId = 1
+       AND p.Tags IS NOT NULL
+    CROSS JOIN LATERAL
+        regexp_split_to_table(trim(both '<>' FROM p.Tags), '><') AS taglist(TagName)
+    JOIN Tags t
+        ON t.TagName = taglist.TagName
+    GROUP BY u.Id, t.TagName
+),
+TopTags AS (
+    SELECT
+        UserId,
+        STRING_AGG(TagName, ', ') FILTER (WHERE TagRank <= 3) AS Top3Tags
+    FROM TagUsage
+    GROUP BY UserId
+),
+RankedUsers AS (
+    SELECT
+        us.*,
+        tu.Top3Tags,
+        RANK() OVER (ORDER BY us.Reputation DESC,
+                               us.QuestionCount + us.AnswerCount DESC) AS ReputationRank,
+        CASE
+            WHEN us.QuestionCount = 0 THEN NULL
+            ELSE us.AnswerCount::float / us.QuestionCount
+        END AS AnswerToQuestionRatio
+    FROM UserStats us
+    LEFT JOIN TopTags tu
+        ON tu.UserId = us.Id
+)
+SELECT
+    ru.Id,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.ReputationRank,
+    ru.QuestionCount,
+    ru.AnswerCount,
+    ru.AcceptedAnswerCount,
+    ROUND(ru.AnswerToQuestionRatio, 2)                     AS AnswerToQuestionRatio,
+    COALESCE(ru.AvgVoteScore, 0)                           AS AvgVoteScore,
+    ru.GoldBadgeCount,
+    ru.SilverBadgeCount,
+    ru.BronzeBadgeCount,
+    ru.Top3Tags,
+    CASE
+        WHEN ru.LastPostDate IS NULL                THEN 'Never posted'
+        WHEN ru.LastPostDate < CURRENT_DATE - INTERVAL '365 days' THEN 'Inactive >1y'
+        ELSE 'Active'
+    END                                                AS ActivityStatus
+FROM RankedUsers ru
+WHERE ru.Reputation >= 1000
+   OR (ru.GoldBadgeCount > 0
+       AND ru.AnswerToQuestionRatio IS NOT NULL
+       AND ru.AnswerToQuestionRatio > 1)
+ORDER BY ru.ReputationRank
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    NULL AS Id,
+    '---' AS DisplayName,
+    NULL AS Reputation,
+    NULL AS ReputationRank,
+    NULL AS QuestionCount,
+    NULL AS AnswerCount,
+    NULL AS AcceptedAnswerCount,
+    NULL AS AnswerToQuestionRatio,
+    NULL AS AvgVoteScore,
+    NULL AS GoldBadgeCount,
+    NULL AS SilverBadgeCount,
+    NULL AS BronzeBadgeCount,
+    NULL AS Top3Tags,
+    NULL AS ActivityStatus
+LIMIT 0;

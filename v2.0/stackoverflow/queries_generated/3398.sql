@@ -1,0 +1,132 @@
+-- {"query": "3398.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2254} 
+
+/*  Benchmark query combining CTEs, window functions, lateral joins, 
+    correlated sub‑queries, set operators and rich predicates  */
+WITH
+    /* 1️⃣  User‑level post aggregates  */
+    usr_post_stats AS (
+        SELECT
+            u.Id                                    AS user_id,
+            u.DisplayName,
+            COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS q_cnt,
+            COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS a_cnt,
+            SUM(p.Score)                               AS tot_score,
+            SUM(p.ViewCount)                           AS tot_views,
+            MAX(p.CreationDate)                        AS last_post_dt
+        FROM Users u
+        LEFT JOIN Posts p
+               ON p.OwnerUserId = u.Id
+        GROUP BY u.Id, u.DisplayName
+    ),
+
+    /* 2️⃣  Tag contribution per user (splitting the <tag><tag> string) */
+    tag_contrib AS (
+        SELECT
+            u.Id                                      AS user_id,
+            LOWER(TRIM(t.tag))                        AS tag,
+            COUNT(*)                                  AS tag_post_cnt,
+            SUM(p.Score)                              AS tag_score
+        FROM Users u
+        JOIN Posts p
+          ON p.OwnerUserId = u.Id
+         AND p.PostTypeId = 1            -- only questions have tags
+         AND p.Tags IS NOT NULL
+        CROSS JOIN LATERAL
+            regexp_split_to_table(
+                TRIM(BOTH '<>' FROM p.Tags),      -- "<tag1><tag2>" → "tag1><tag2"
+                '><'
+            ) AS t(tag)
+        GROUP BY u.Id, LOWER(TRIM(t.tag))
+    ),
+
+    /* 3️⃣  Badge metrics per user */
+    badge_metrics AS (
+        SELECT
+            b.UserId                  AS user_id,
+            COUNT(*)                  AS badge_cnt,
+            SUM(CASE b.Class
+                    WHEN 1 THEN 1000   -- gold
+                    WHEN 2 THEN 500    -- silver
+                    ELSE 100           -- bronze
+                END)                  AS badge_weight,
+            MAX(b.Date)               AS last_badge_dt
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+
+    /* 4️⃣  Top‑5 tags per user (as an array) */
+    top5_tags AS (
+        SELECT
+            tc.user_id,
+            ARRAY_AGG(tc.tag ORDER BY tc.tag_score DESC, tc.tag_post_cnt DESC)[:5] AS tags_arr
+        FROM tag_contrib tc
+        GROUP BY tc.user_id
+    ),
+
+    /* 5️⃣  Recent activity window on posts per user */
+    recent_posts AS (
+        SELECT
+            p.Id                     AS post_id,
+            p.OwnerUserId            AS user_id,
+            p.CreationDate,
+            p.Score,
+            ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn,
+            LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate)      AS prev_score
+        FROM Posts p
+        WHERE p.OwnerUserId IS NOT NULL
+    ),
+
+    /* 6️⃣  Recent post (latest) per user – used for correlated vote counts */
+    latest_post_per_user AS (
+        SELECT DISTINCT ON (p.OwnerUserId)
+            p.OwnerUserId          AS user_id,
+            p.Id                   AS post_id
+        FROM Posts p
+        WHERE p.OwnerUserId IS NOT NULL
+        ORDER BY p.OwnerUserId, p.CreationDate DESC
+    )
+
+SELECT
+    u.Id                                          AS user_id,
+    u.DisplayName,
+    ups.q_cnt,
+    ups.a_cnt,
+    ups.tot_score,
+    ups.tot_views,
+    COALESCE(bm.badge_cnt,0)                      AS badge_cnt,
+    COALESCE(bm.badge_weight,0)                   AS badge_weight,
+    tt.tags_arr,
+    CASE
+        WHEN rp.rn = 1 THEN rp.Score - COALESCE(rp.prev_score,0)
+        ELSE NULL
+    END                                          AS recent_score_delta,
+    /* correlated sub‑queries for up‑/down‑vote tallies on the latest post */
+    (SELECT COUNT(*) FROM Votes v
+        WHERE v.PostId = lpp.post_id AND v.VoteTypeId = 2) AS up_votes,
+    (SELECT COUNT(*) FROM Votes v
+        WHERE v.PostId = lpp.post_id AND v.VoteTypeId = 3) AS down_votes,
+    EXISTS (SELECT 1 FROM PostLinks pl
+            WHERE pl.PostId = lpp.post_id AND pl.LinkTypeId = 3) AS has_duplicate_link,
+    CASE
+        WHEN u.EmailHash IS NULL THEN 'NO EMAIL'
+        ELSE 'HAS EMAIL'
+    END                                         AS email_status
+FROM Users u
+LEFT JOIN usr_post_stats ups        ON ups.user_id = u.Id
+LEFT JOIN badge_metrics bm         ON bm.user_id = u.Id
+LEFT JOIN top5_tags tt             ON tt.user_id = u.Id
+LEFT JOIN recent_posts rp          ON rp.user_id = u.Id AND rp.rn = 1
+LEFT JOIN latest_post_per_user lpp ON lpp.user_id = u.Id
+WHERE (ups.tot_score IS NOT NULL AND ups.tot_score > 0)
+   OR bm.badge_cnt > 0
+   OR tt.tags_arr IS NOT NULL
+ORDER BY ups.tot_score DESC NULLS LAST
+LIMIT 100
+
+UNION ALL
+
+/* 7️⃣  Dummy row to force use of set operator processing */
+SELECT
+    NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL
+EXCEPT
+SELECT * FROM (SELECT 1) AS dummy;

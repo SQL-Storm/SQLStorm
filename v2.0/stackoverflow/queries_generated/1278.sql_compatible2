@@ -1,0 +1,176 @@
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.UpVotes AS UserUpVotes,
+        U.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswers,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        MAX(P.CreationDate) AS LatestPostDate,
+        MAX(C.CreationDate) AS LatestCommentDate,
+        MAX(PH_Any.CreationDate) AS LatestHistoryDate,
+        CASE WHEN EXISTS (
+            SELECT 1
+            FROM Badges B_corr
+            WHERE B_corr.UserId = U.Id
+              AND B_corr.Class = 1
+              AND B_corr.TagBased = TRUE
+              AND B_corr.Name IN ('c#', 'java', 'python', 'javascript', 'html', 'css', 'sql', 'php', 'android', 'ios')
+        ) THEN TRUE ELSE FALSE END AS HasHighValueTagGoldBadge
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN PostHistory PH_Any ON U.Id = PH_Any.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.UpVotes, U.DownVotes
+),
+PostEngagementMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.LastActivityDate,
+        P.ViewCount,
+        P.Score AS PostScore,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.Title,
+        P.Tags,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotes,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotes,
+        COUNT(DISTINCT PH_Close.Id) AS CloseHistoryCount,
+        COUNT(DISTINCT PH_Reopen.Id) AS ReopenHistoryCount,
+        MAX(CRT.Name) AS LastCloseReason,
+        RANK() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score + COALESCE(P.FavoriteCount, 0) DESC, P.CreationDate DESC) AS PostEngagementRank,
+        COALESCE(P.Title, 'No Title Provided') AS DisplayTitle,
+        COALESCE(
+            SUBSTRING(P.Tags FROM 2 FOR (POSITION('><' IN P.Tags) - 2)),
+            'untagged'
+        ) AS FirstParsedTag,
+        (CAST(P.Score AS NUMERIC) / NULLIF(P.ViewCount, 0)) AS ScorePerViewRatio
+    FROM Posts P
+    LEFT JOIN Votes V ON P.Id = V.PostId
+    LEFT JOIN PostHistory PH_Close ON P.Id = PH_Close.PostId AND PH_Close.PostHistoryTypeId = 10
+    LEFT JOIN PostHistory PH_Reopen ON P.Id = PH_Reopen.PostId AND PH_Reopen.PostHistoryTypeId = 11
+    LEFT JOIN CloseReasonTypes CRT ON (
+        CASE
+            WHEN PH_Close.Comment IS NULL THEN NULL
+            ELSE
+                CASE
+                    WHEN PH_Close.Comment ~ '^[0-9]+$' THEN CAST(PH_Close.Comment AS INTEGER)
+                    ELSE NULL
+                END
+        END
+    ) = CRT.Id
+    GROUP BY P.Id, P.PostTypeId, P.OwnerUserId, P.CreationDate, P.LastActivityDate, P.ViewCount, P.Score, P.AnswerCount, P.CommentCount, P.FavoriteCount, P.Title, P.Tags
+),
+TagUsageMetrics AS (
+    SELECT
+        TRIM(unnested_tag.tag_name) AS TagName,
+        COUNT(DISTINCT P.Id) AS PostCount,
+        SUM(P.Score) AS TotalTagScore,
+        AVG(P.Score) AS AverageTagScore,
+        SUM(P.ViewCount) AS TotalTagViewCount,
+        RANK() OVER (ORDER BY SUM(P.Score) DESC, COUNT(DISTINCT P.Id) DESC) AS TagScoreRank
+    FROM Posts P
+    CROSS JOIN LATERAL (
+        SELECT unnest(string_to_array(substring(P.Tags FROM 2 FOR (char_length(P.Tags)-2)), '><')) AS tag_name
+    ) AS unnested_tag
+    WHERE P.Tags IS NOT NULL AND char_length(TRIM(unnested_tag.tag_name)) > 0
+    GROUP BY TRIM(unnested_tag.tag_name)
+    HAVING COUNT(DISTINCT P.Id) > 50 AND SUM(P.Score) > 0
+),
+ContentLifecycleEvents AS (
+    SELECT
+        PostId,
+        COUNT(CASE WHEN PostHistoryTypeId IN (4,5,6) THEN 1 END) AS TotalEditEvents,
+        COUNT(CASE WHEN PostHistoryTypeId IN (7,8,9) THEN 1 END) AS TotalRollbackEvents,
+        COUNT(CASE WHEN PostHistoryTypeId = 10 THEN 1 END) AS TotalCloseVotes,
+        COUNT(CASE WHEN PostHistoryTypeId = 11 THEN 1 END) AS TotalReopenVotes,
+        MAX(CASE WHEN PostHistoryTypeId = 10 THEN CreationDate END) AS LastClosedDate,
+        MIN(CASE WHEN PostHistoryTypeId = 11 THEN CreationDate END) AS FirstReopenedDate,
+        MAX(CASE WHEN prev_history_type = 10 AND PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS WasClosedThenReopenedFlag,
+        NTH_VALUE(UserId, 3) OVER (PARTITION BY PostId ORDER BY CreationDate ASC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS ThirdEditorUserId
+    FROM (
+        SELECT
+            PH.PostId,
+            PH.UserId,
+            PH.CreationDate,
+            PH.PostHistoryTypeId,
+            LAG(PH.PostHistoryTypeId, 1, 0) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) AS prev_history_type
+        FROM PostHistory PH
+        WHERE PH.PostHistoryTypeId IN (4,5,6,7,8,9,10,11)
+    ) AS history_with_prev_type
+    GROUP BY PostId, history_with_prev_type.PostId, history_with_prev_type.UserId, history_with_prev_type.CreationDate, history_with_prev_type.PostHistoryTypeId, history_with_prev_type.prev_history_type
+)
+SELECT
+    UAS.UserId,
+    UAS.DisplayName,
+    UAS.Reputation,
+    UAS.TotalQuestions,
+    UAS.TotalAnswers,
+    UAS.TotalBadges,
+    UAS.GoldBadges,
+    UAS.HasHighValueTagGoldBadge,
+    PEM.PostId,
+    PEM.DisplayTitle,
+    PEM.PostScore,
+    PEM.ViewCount,
+    PEM.FavoriteCount,
+    PEM.FirstParsedTag,
+    PEM.ScorePerViewRatio,
+    PEM.PostEngagementRank,
+    TU.TagName AS PopularRelatedTag,
+    TU.TotalTagScore AS PopularTagTotalScore,
+    CLE.TotalEditEvents,
+    CLE.TotalRollbackEvents,
+    CLE.TotalCloseVotes,
+    CLE.TotalReopenVotes,
+    CLE.WasClosedThenReopenedFlag,
+    CLE.ThirdEditorUserId,
+    EXTRACT(EPOCH FROM (COALESCE(UAS.LatestPostDate, UAS.LatestCommentDate, UAS.LastAccessDate) - UAS.UserCreationDate)) / (3600*24*365.25) AS YearsSinceCreationToLastActivity,
+    (CASE
+        WHEN PEM.PostTypeId = 1 THEN 'Question: '
+        WHEN PEM.PostTypeId = 2 THEN 'Answer: '
+        ELSE 'Other Post Type: '
+    END
+    || SUBSTRING(PEM.DisplayTitle FROM 1 FOR 75)
+    || ' [Score: ' || CAST(PEM.PostScore AS VARCHAR)
+    || ', Views: ' || CAST(COALESCE(PEM.ViewCount, 0) AS VARCHAR) || ']'
+    || COALESCE(' {Closed due to: ' || PEM.LastCloseReason || '}', '')
+    ) AS PostSummaryDescription,
+    (PEM.TotalUpVotes - PEM.TotalDownVotes + COALESCE(PEM.FavoriteCount, 0) * 2) AS EffectivePostEngagementScore,
+    (CAST(UAS.TotalAnswers AS NUMERIC) / NULLIF(UAS.TotalQuestions, 0)) AS AnswerToQuestionRatio,
+    CASE WHEN PEM.TotalUpVotes > UAS.UserUpVotes THEN 'True' ELSE 'False' END AS IsViralForUser
+FROM UserActivitySummary UAS
+INNER JOIN PostEngagementMetrics PEM ON UAS.UserId = PEM.OwnerUserId
+LEFT JOIN ContentLifecycleEvents CLE ON PEM.PostId = CLE.PostId
+LEFT JOIN TagUsageMetrics TU ON PEM.FirstParsedTag = TU.TagName
+WHERE UAS.Reputation > 7500
+  AND PEM.PostScore >= 20
+  AND PEM.PostTypeId IN (1, 2)
+  AND (PEM.ViewCount IS NULL OR PEM.ViewCount > 500)
+  AND UAS.HasHighValueTagGoldBadge = TRUE
+  AND (COALESCE(CLE.TotalEditEvents,0) > 3 OR COALESCE(CLE.TotalRollbackEvents,0) > 0 OR COALESCE(CLE.WasClosedThenReopenedFlag,0) = 1)
+  AND PEM.PostEngagementRank <= 500
+  AND NOT EXISTS (
+    SELECT 1
+    FROM Posts P_del
+    WHERE P_del.OwnerUserId = UAS.UserId
+      AND P_del.PostTypeId = 2
+      AND P_del.Id IN (SELECT PH_del.PostId FROM PostHistory PH_del WHERE PH_del.PostHistoryTypeId = 12)
+    GROUP BY P_del.OwnerUserId
+    HAVING COUNT(P_del.Id) > UAS.TotalAnswers * 0.1 OR COUNT(P_del.Id) > 5
+  )
+ORDER BY UAS.Reputation DESC, EffectivePostEngagementScore DESC, YearsSinceCreationToLastActivity ASC
+LIMIT 10000;

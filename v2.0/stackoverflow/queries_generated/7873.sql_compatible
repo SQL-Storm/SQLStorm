@@ -1,0 +1,266 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN p.Id END) as QuestionsWithAcceptedAnswer,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.Score > 0 THEN p.Id END) as PositiveAnswers,
+        AVG(CAST(p.Score AS DOUBLE PRECISION)) as AvgPostScore,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2), ', ') as AllTags,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.ViewCount > 1000 THEN p.Id END) as HighViewQuestions
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+DetailedPostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.PostTypeId,
+        u.DisplayName as OwnerName,
+        COALESCE(p.OwnerDisplayName, 'Anonymous') as OwnerDisplayName,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as PostTypeDesc,
+        CASE 
+            WHEN p.Score > 10 THEN 'High'
+            WHEN p.Score > 0 THEN 'Medium'
+            WHEN p.Score = 0 THEN 'Zero'
+            ELSE 'Negative'
+        END as ScoreCategory,
+        CASE 
+            WHEN p.ViewCount > 1000 THEN 'High View'
+            WHEN p.ViewCount > 100 THEN 'Medium View'
+            ELSE 'Low View'
+        END as ViewCategory,
+        -- Standard SQL date difference in days
+        DATE_PART('day', (p.LastActivityDate::timestamp - p.CreationDate::timestamp))::int as DaysSinceLastActivity,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 1
+            ELSE 0
+        END as HasAcceptedAnswer,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL THEN 1
+            ELSE 0
+        END as IsClosed,
+        p.Tags,
+        COALESCE(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2), 'No Tags') as CleanTags,
+        TRIM(SUBSTRING(p.Body FROM 1 FOR 200)) as PreviewBody,
+        CHAR_LENGTH(p.Body) as BodyLength,
+        p.ParentId,
+        COALESCE(p.AcceptedAnswerId, 0) as AcceptedAnswerId,
+        p.OwnerUserId
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.Id IS NOT NULL
+),
+UserPostSummary AS (
+    SELECT 
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.PostCount,
+        us.CommentCount,
+        us.BadgeCount,
+        us.QuestionCount,
+        us.AnswerCount,
+        us.QuestionsWithAcceptedAnswer,
+        us.PositiveAnswers,
+        us.AvgPostScore,
+        us.HighViewQuestions,
+        MAX(dp.CreationDate) as LastPostCreated,
+        MIN(dp.CreationDate) as FirstPostCreated
+    FROM UserStats us
+    LEFT JOIN DetailedPostAnalysis dp ON us.UserId = dp.OwnerUserId
+    GROUP BY us.UserId, us.DisplayName, us.Reputation, us.PostCount, us.CommentCount, us.BadgeCount, us.QuestionCount, us.AnswerCount, us.QuestionsWithAcceptedAnswer, us.PositiveAnswers, us.AvgPostScore, us.HighViewQuestions
+),
+PostTagAnalysis AS (
+    SELECT 
+        dp.PostId,
+        dp.Title,
+        dp.Score,
+        dp.ViewCount,
+        dp.PostTypeId,
+        dp.OwnerName,
+        dp.OwnerDisplayName,
+        dp.Tags,
+        dp.CleanTags,
+        dp.BodyLength,
+        dp.DaysSinceLastActivity,
+        ROW_NUMBER() OVER (PARTITION BY dp.OwnerUserId ORDER BY dp.Score DESC) as RankByScore,
+        DENSE_RANK() OVER (ORDER BY dp.ViewCount DESC) as RankByViews,
+        PERCENT_RANK() OVER (ORDER BY dp.Score) as ScorePercentile,
+        NTILE(4) OVER (ORDER BY dp.ViewCount) as ViewQuartile,
+        CASE 
+            WHEN dp.Tags IS NOT NULL AND dp.Tags != '' THEN 
+                CARDINALITY(STRING_TO_ARRAY(SUBSTRING(dp.Tags FROM 2 FOR CHAR_LENGTH(dp.Tags)-2), '><'))
+            ELSE 0 
+        END as TagCount,
+        dp.OwnerUserId
+    FROM DetailedPostAnalysis dp
+    WHERE dp.PostId IS NOT NULL
+)
+SELECT 
+    ups.UserId,
+    ups.DisplayName,
+    ups.Reputation,
+    ups.PostCount,
+    ups.CommentCount,
+    ups.BadgeCount,
+    ups.QuestionCount,
+    ups.AnswerCount,
+    ups.QuestionsWithAcceptedAnswer,
+    ups.PositiveAnswers,
+    ups.AvgPostScore,
+    ups.HighViewQuestions,
+    ups.LastPostCreated,
+    ups.FirstPostCreated,
+    CASE WHEN ups.QuestionCount > 0 THEN (ups.AnswerCount * 100.0 / ups.QuestionCount) ELSE 0 END as AnswerPercentageOfQuestions,
+    pa.Title,
+    pa.Score,
+    pa.ViewCount,
+    pa.PostTypeId,
+    pa.OwnerName,
+    pa.OwnerDisplayName,
+    pa.Tags as AllTags,
+    pa.CleanTags,
+    pa.BodyLength,
+    pa.DaysSinceLastActivity,
+    pa.RankByScore,
+    pa.RankByViews,
+    pa.ScorePercentile,
+    pa.ViewQuartile,
+    pa.TagCount,
+    CASE 
+        WHEN pa.Score > 100 THEN 'Very High'
+        WHEN pa.Score > 50 THEN 'High'
+        WHEN pa.Score > 10 THEN 'Medium'
+        ELSE 'Low'
+    END as ScoreCategory,
+    CASE 
+        WHEN pa.ViewCount > 10000 THEN 'Viral'
+        WHEN pa.ViewCount > 1000 THEN 'Popular'
+        WHEN pa.ViewCount > 100 THEN 'Moderate'
+        ELSE 'Unpopular'
+    END as PopularityLevel,
+    CASE 
+        WHEN pa.DaysSinceLastActivity <= 30 THEN 'Recently Active'
+        WHEN pa.DaysSinceLastActivity <= 90 THEN 'Active'
+        ELSE 'Inactive'
+    END as ActivityStatus,
+    CASE 
+        WHEN pa.TagCount > 3 THEN 'Multiple Tags'
+        WHEN pa.TagCount = 1 THEN 'Single Tag'
+        ELSE 'No Tags'
+    END as TagUsage,
+    CASE 
+        WHEN pa.BodyLength > 1000 THEN 'Long Post'
+        WHEN pa.BodyLength > 500 THEN 'Medium Post'
+        ELSE 'Short Post'
+    END as PostLength,
+    (SELECT COUNT(*) 
+     FROM PostHistory ph 
+     WHERE ph.PostId = pa.PostId 
+     AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 10, 11, 12, 13, 14, 15)) as RevisionCount,
+    (SELECT COUNT(*) 
+     FROM Votes v 
+     WHERE v.PostId = pa.PostId 
+     AND v.VoteTypeId = 2) as Upvotes,
+    (SELECT COUNT(*) 
+     FROM Votes v 
+     WHERE v.PostId = pa.PostId 
+     AND v.VoteTypeId = 3) as Downvotes,
+    CASE 
+        WHEN pa.Score > (SELECT AVG(Score) FROM Posts) THEN 1
+        ELSE 0
+    END as AboveAverageScore,
+    CASE 
+        WHEN pa.ViewCount > (SELECT AVG(ViewCount) FROM Posts) THEN 1
+        ELSE 0
+    END as AboveAverageViews,
+    (SELECT COUNT(*) 
+     FROM Comments c 
+     WHERE c.PostId = pa.PostId) as CommentCountOnPost,
+    CASE 
+        WHEN pa.Score IS NOT NULL AND pa.ViewCount IS NOT NULL THEN 
+            ROUND((pa.ViewCount * 1.0 / (pa.Score + 1))::numeric, 2)
+        ELSE 0
+    END as ViewToScoreRatio,
+    ROW_NUMBER() OVER (ORDER BY pa.Score DESC, pa.ViewCount DESC) as GlobalRank,
+    RANK() OVER (PARTITION BY pa.PostTypeId ORDER BY pa.Score DESC) as TypeSpecificRank,
+    DENSE_RANK() OVER (ORDER BY pa.Score DESC) as DenseRankByScore,
+    PERCENT_RANK() OVER (ORDER BY pa.Score) as PercentileRankByScore,
+    NTILE(10) OVER (ORDER BY pa.ViewCount) as ViewDecile,
+    LAG(pa.Title, 1) OVER (ORDER BY pa.Score DESC) as PreviousHighestScoredPost,
+    LEAD(pa.Title, 1) OVER (ORDER BY pa.Score DESC) as NextHighestScoredPost,
+    CASE 
+        WHEN (pa.CleanTags IS NOT NULL AND pa.CleanTags != '') THEN 
+            LOWER(SUBSTRING(pa.CleanTags FROM 1 FOR 1)) || 
+            SUBSTRING(pa.CleanTags FROM 2 FOR CHAR_LENGTH(pa.CleanTags)-1)
+        ELSE 'No Tags Available'
+    END as CapitalizedTags,
+    (SELECT COUNT(*) 
+     FROM PostLinks pl 
+     WHERE pl.PostId = pa.PostId 
+     AND pl.LinkTypeId = 1) as LinkedPostCount,
+    (SELECT COUNT(*) 
+     FROM Votes v 
+     WHERE v.PostId = pa.PostId 
+     AND v.VoteTypeId IN (2, 3)) as TotalVotes,
+    ROUND(
+        COALESCE(pa.Score, 0) * 
+        COALESCE(NULLIF(pa.ViewCount, 0), 1) / 
+        NULLIF(COALESCE(pa.PostTypeId, 0) * 0 + COALESCE(pa.BodyLength, 0) + COALESCE(pa.Score,0) - COALESCE(pa.Score,0) + 1, 0), 
+        2
+    ) as ScoreEfficiencyFactor,
+    (SELECT 
+        CASE 
+            WHEN COUNT(*) > 0 THEN 'Has History' 
+            ELSE 'No History' 
+        END 
+     FROM PostHistory ph 
+     WHERE ph.PostId = pa.PostId 
+     AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)) as HasEditHistoryStatus,
+    GREATEST(COALESCE(pa.Score, 0), COALESCE(pa.ViewCount, 0)) as MaxOfScoreAndViewCount,
+    CASE 
+        WHEN pa.Score > 0 AND pa.ViewCount > 0 THEN 
+            CASE 
+                WHEN (pa.ViewCount * 1.0 / pa.Score) > 100 THEN 'High View:Score Ratio'
+                WHEN (pa.ViewCount * 1.0 / pa.Score) > 50 THEN 'Moderate View:Score Ratio'
+                ELSE 'Low View:Score Ratio'
+            END
+        ELSE 'Insufficient Data'
+    END as ViewScoreRatioStatus,
+    CAST(ROW_NUMBER() OVER (ORDER BY pa.Score DESC) AS VARCHAR(10)) || 
+    ' of ' || 
+    CAST(COUNT(*) OVER() AS VARCHAR(10)) as RankString
+FROM UserPostSummary ups
+INNER JOIN PostTagAnalysis pa ON ups.UserId = pa.OwnerUserId
+WHERE ups.UserId IS NOT NULL 
+AND pa.PostId IS NOT NULL
+AND (pa.Score IS NOT NULL OR pa.ViewCount IS NOT NULL OR pa.BodyLength IS NOT NULL)
+AND NOT (pa.Score = 0 AND pa.ViewCount = 0 AND pa.BodyLength = 0)
+ORDER BY pa.Score DESC, pa.ViewCount DESC
+LIMIT 1000;

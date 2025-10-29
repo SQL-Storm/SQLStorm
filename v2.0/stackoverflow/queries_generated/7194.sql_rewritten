@@ -1,0 +1,189 @@
+-- {"query": "7194.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1557} 
+WITH PostStats AS (
+    SELECT 
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Title,
+        p.Tags,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostTypeDesc,
+        COALESCE(p.ViewCount, 0) + COALESCE(p.AnswerCount, 0) + COALESCE(p.CommentCount, 0) AS EngagementScore,
+        DATEDIFF(cast('2024-10-01 12:34:56' as timestamp), p.CreationDate) AS DaysSinceCreation,
+        CASE 
+            WHEN p.Score > 100 THEN 'High'
+            WHEN p.Score > 10 THEN 'Medium'
+            ELSE 'Low'
+        END AS ScoreCategory
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COALESCE(SUM(p.Score), 0) AS TotalScore,
+        AVG(p.Score) AS AvgScore,
+        MAX(p.CreationDate) AS LatestPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        COALESCE((SELECT COUNT(*) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%'), 0) AS PostsWithTag
+    FROM Tags t
+    WHERE t.Count > 100
+),
+RecentActivity AS (
+    SELECT 
+        ph.PostId,
+        ph.UserId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        ph.Comment,
+        CASE 
+            WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN 'ModAction'
+            WHEN ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6) THEN 'Edit'
+            ELSE 'Other'
+        END AS ActivityType,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    WHERE ph.CreationDate >= DATEADD(DAY, -30, cast('2024-10-01 12:34:56' as timestamp))
+),
+CombinedResults AS (
+    SELECT 
+        ps.PostId,
+        ps.PostTypeId,
+        ps.PostTypeDesc,
+        ps.OwnerUserId,
+        ps.Score,
+        ps.ViewCount,
+        ps.AnswerCount,
+        ps.CommentCount,
+        ps.FavoriteCount,
+        ps.CreationDate,
+        ps.LastActivityDate,
+        ps.Title,
+        ps.Tags,
+        ps.EngagementScore,
+        ps.DaysSinceCreation,
+        ps.ScoreCategory,
+        ua.DisplayName AS OwnerDisplayName,
+        ua.Reputation AS OwnerReputation,
+        ua.PostCount AS OwnerPostCount,
+        ua.CommentCount AS OwnerCommentCount,
+        ua.BadgeCount AS OwnerBadgeCount,
+        ua.TotalScore AS OwnerTotalScore,
+        ua.AvgScore AS OwnerAvgScore,
+        ta.TagName,
+        ta.TagCount,
+        ta.PostsWithTag,
+        ra.ActivityType,
+        CASE 
+            WHEN ps.PostTypeId = 1 AND ps.Score >= 100 THEN 1
+            WHEN ps.PostTypeId = 2 AND ps.Score >= 50 THEN 1
+            ELSE 0
+        END AS IsHighValue,
+        CASE 
+            WHEN ps.LastActivityDate >= DATEADD(DAY, -7, cast('2024-10-01 12:34:56' as timestamp)) THEN 'Recent'
+            ELSE 'Inactive'
+        END AS ActivityStatus,
+        CASE 
+            WHEN ps.Tags IS NOT NULL AND ps.Tags != '' THEN 
+                SPLIT_PART(ps.Tags, '>', 1) 
+            ELSE NULL 
+        END AS FirstTag
+    FROM PostStats ps
+    INNER JOIN UserActivity ua ON ps.OwnerUserId = ua.UserId
+    LEFT JOIN TagAnalysis ta ON ps.Tags LIKE '%' || ta.TagName || '%'
+    LEFT JOIN RecentActivity ra ON ps.PostId = ra.PostId AND ra.rn = 1
+)
+
+SELECT 
+    cr.PostId,
+    cr.PostTypeId,
+    cr.PostTypeDesc,
+    cr.OwnerUserId,
+    cr.Score,
+    cr.ViewCount,
+    cr.AnswerCount,
+    cr.CommentCount,
+    cr.FavoriteCount,
+    cr.CreationDate,
+    cr.LastActivityDate,
+    cr.Title,
+    cr.Tags,
+    cr.EngagementScore,
+    cr.DaysSinceCreation,
+    cr.ScoreCategory,
+    cr.OwnerDisplayName,
+    cr.OwnerReputation,
+    cr.OwnerPostCount,
+    cr.OwnerCommentCount,
+    cr.OwnerBadgeCount,
+    cr.OwnerTotalScore,
+    cr.OwnerAvgScore,
+    cr.TagName,
+    cr.TagCount,
+    cr.PostsWithTag,
+    cr.ActivityType,
+    cr.IsHighValue,
+    cr.ActivityStatus,
+    cr.FirstTag,
+    COUNT(*) OVER () AS TotalRecords,
+    RANK() OVER (ORDER BY cr.Score DESC) AS ScoreRank,
+    DENSE_RANK() OVER (ORDER BY cr.OwnerReputation DESC) AS ReputationRank,
+    NTILE(4) OVER (ORDER BY cr.EngagementScore DESC) AS EngagementQuartile,
+    ROW_NUMBER() OVER (PARTITION BY cr.PostTypeDesc ORDER BY cr.Score DESC) AS TypeRank,
+    LAG(cr.Score, 1) OVER (ORDER BY cr.Score DESC) AS PrevScore,
+    LEAD(cr.Score, 1) OVER (ORDER BY cr.Score DESC) AS NextScore,
+    AVG(cr.Score) OVER (PARTITION BY cr.PostTypeDesc) AS AvgScoreByType,
+    MAX(cr.Score) OVER (PARTITION BY cr.OwnerUserId) AS MaxScoreByUser,
+    MIN(cr.Score) OVER (PARTITION BY cr.OwnerUserId) AS MinScoreByUser,
+    SUM(cr.Score) OVER (ORDER BY cr.CreationDate) AS RunningScoreTotal,
+    CASE 
+        WHEN EXISTS (
+            SELECT 1 FROM Posts p2 
+            WHERE p2.ParentId = cr.PostId 
+            AND p2.PostTypeId = 2 
+            AND p2.Score >= 10
+        ) THEN 'HasHighValueAnswer'
+        ELSE 'NoHighValueAnswer'
+    END AS AnswerStatus
+FROM CombinedResults cr
+WHERE cr.Score >= 0 
+AND cr.EngagementScore > 0
+AND (cr.PostTypeId = 1 OR cr.PostTypeId = 2)
+AND cr.OwnerDisplayName IS NOT NULL
+AND EXISTS (
+    SELECT 1 FROM Users u 
+    WHERE u.Id = cr.OwnerUserId 
+    AND u.Reputation >= 1000
+)
+ORDER BY cr.Score DESC, cr.CreationDate DESC
+OFFSET 0 ROWS
+FETCH NEXT 1000 ROWS ONLY;

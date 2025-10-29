@@ -1,0 +1,191 @@
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestions,
+        COUNT(CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswers,
+        SUM(P.Score) AS TotalPostScore,
+        AVG(CASE WHEN P.PostTypeId IN (1, 2, 8) THEN P.Score END) AS AvgRelevantPostScore,
+        MAX(P.CreationDate) AS LatestPostDate,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COUNT(DISTINCT V.Id) AS TotalVotesGiven,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        (SELECT COUNT(PH.Id) FROM PostHistory PH WHERE PH.UserId = U.Id AND PH.PostHistoryTypeId IN (4, 5, 6)) AS TotalEditHistoryEntries,
+        SUM(CASE WHEN P.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS AcceptedAnswersReceivedCount
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Votes V ON U.Id = V.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate
+),
+PostDetailsExtended AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.FavoriteCount,
+        P.Tags,
+        P.Title,
+        P.AcceptedAnswerId,
+        COALESCE(P.ClosedDate, TIMESTAMP '2999-01-01 00:00:00') AS EffectiveClosedDate,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+        COUNT(DISTINCT Co.Id) AS CommentCount,
+        ROW_NUMBER() OVER(PARTITION BY P.PostTypeId, P.OwnerUserId ORDER BY P.Score DESC, P.CreationDate DESC) AS RankInPostTypeByUser,
+        AVG(P.Score) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate ROWS BETWEEN 15 PRECEDING AND 15 FOLLOWING) AS RollingAvgUserPostScore,
+        (
+            SELECT Co2.Text
+            FROM Comments Co2
+            WHERE Co2.PostId = P.Id
+            ORDER BY Co2.Score DESC, Co2.CreationDate DESC
+            LIMIT 1
+        ) AS TopCommentText
+    FROM Posts P
+    LEFT JOIN Votes V ON P.Id = V.PostId
+    LEFT JOIN Comments Co ON P.Id = Co.PostId
+    GROUP BY P.Id, P.PostTypeId, P.OwnerUserId, P.CreationDate, P.Score, P.ViewCount, P.AnswerCount, P.FavoriteCount, P.Tags, P.Title, P.AcceptedAnswerId, P.ClosedDate
+),
+TagAnalysis AS (
+    SELECT
+        PDE.OwnerUserId AS UserId,
+        T.TagName,
+        COUNT(DISTINCT PDE.PostId) AS PostsWithTag,
+        SUM(PDE.PostScore) AS TotalTagScore,
+        MAX(PDE.PostCreationDate) AS LatestTagPostDate
+    FROM PostDetailsExtended PDE,
+    LATERAL (
+      SELECT unnest(string_to_array(SUBSTRING(PDE.Tags FROM 2 FOR (CHAR_LENGTH(PDE.Tags)-2)), '><')) AS TagName
+    ) T
+    WHERE PDE.Tags IS NOT NULL AND PDE.OwnerUserId IS NOT NULL
+    GROUP BY PDE.OwnerUserId, T.TagName
+    HAVING COUNT(DISTINCT PDE.PostId) > 1
+),
+ComplexPostHistoryEvents AS (
+    SELECT
+        PH.PostId,
+        PH.UserId,
+        PH.CreationDate AS EventDate,
+        PH.PostHistoryTypeId,
+        PHT.Name AS EventType,
+        PH.Comment,
+        PH.Text AS HistoryText,
+        'PostHistory' AS SourceTable
+    FROM PostHistory PH
+    JOIN PostHistoryTypes PHT ON PH.PostHistoryTypeId = PHT.Id
+    WHERE PH.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20, 35, 36)
+    UNION ALL
+    SELECT
+        V.PostId,
+        V.UserId,
+        V.CreationDate AS EventDate,
+        V.VoteTypeId AS PostHistoryTypeId,
+        VT.Name AS EventType,
+        NULL AS Comment,
+        'Vote Action: ' || VT.Name AS HistoryText,
+        'Votes' AS SourceTable
+    FROM Votes V
+    JOIN VoteTypes VT ON V.VoteTypeId = VT.Id
+    WHERE V.VoteTypeId IN (4, 10, 11, 12)
+),
+AggregatedHistoryPerPost AS (
+    SELECT
+        CPE.PostId,
+        CPE.UserId,
+        MIN(CPE.EventDate) AS FirstEventDate,
+        MAX(CPE.EventDate) AS LastEventDate,
+        COUNT(DISTINCT CPE.PostHistoryTypeId) AS UniqueEventTypesCount,
+        STRING_AGG(DISTINCT CPE.EventType, '; ') AS AllEventTypes,
+        SUM(CASE WHEN CPE.EventType LIKE '%Close%' THEN 1 ELSE 0 END) AS CloseEvents,
+        SUM(CASE WHEN CPE.EventType LIKE '%Migrated%' THEN 1 ELSE 0 END) AS MigrationEvents,
+        RANK() OVER (PARTITION BY CPE.UserId ORDER BY MIN(CPE.EventDate)) AS EventPostRankByUser
+    FROM ComplexPostHistoryEvents CPE
+    GROUP BY CPE.PostId, CPE.UserId
+)
+SELECT
+    UAS.UserId,
+    COALESCE(UAS.DisplayName, 'AnonymousUser_' || CAST(UAS.UserId AS VARCHAR)) AS DisplayNameWithFallback,
+    UAS.Reputation,
+    UAS.UserCreationDate,
+    UAS.TotalPosts,
+    UAS.TotalQuestions,
+    UAS.TotalAnswers,
+    UAS.AvgRelevantPostScore,
+    UAS.LatestPostDate,
+    UAS.TotalEditHistoryEntries,
+    UAS.AcceptedAnswersReceivedCount,
+    MAX(CASE WHEN PDE.PostTypeId = 1 THEN PDE.ViewCount ELSE 0 END) AS MaxQuestionViewCount,
+    MAX(CASE WHEN PDE.PostTypeId = 2 THEN PDE.PostScore ELSE 0 END) AS MaxAnswerScore,
+    CAST(UAS.AcceptedAnswersReceivedCount AS DECIMAL) / NULLIF(UAS.TotalAnswers, 0) AS AcceptedAnswerRatio,
+    CASE
+        WHEN UAS.Reputation > 1000 AND UAS.LatestPostDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6 months') AND UAS.TotalBadges > 10 THEN 'Highly Active & Reputable'
+        WHEN UAS.Reputation > 200 AND UAS.LastAccessDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year') AND UAS.TotalPosts > 5 THEN 'Moderately Active'
+        ELSE 'Inactive/New User'
+    END AS UserActivityTier,
+    (
+        SELECT AVG(P.Score)
+        FROM Posts P
+        WHERE P.OwnerUserId = UAS.UserId
+          AND P.PostTypeId = 1
+          AND P.CreationDate BETWEEN UAS.UserCreationDate AND UAS.LatestPostDate
+    ) AS AvgQuestionScore,
+    RANK() OVER (ORDER BY UAS.TotalPostScore DESC, UAS.Reputation DESC) AS UserTotalScoreRank,
+    CAST(UAS.TotalQuestions AS DECIMAL) / NULLIF(SUM(UAS.TotalQuestions) OVER (), 0) * 100 AS PctOfTotalQuestions,
+    EXISTS (SELECT 1 FROM PostDetailsExtended PDE2 WHERE PDE2.OwnerUserId = UAS.UserId AND PDE2.PostTypeId = 1 AND PDE2.UpVoteCount > 50) AS HasHighlyUpvotedQuestion,
+    (
+        SELECT TA.TagName
+        FROM TagAnalysis TA
+        WHERE TA.UserId = UAS.UserId
+        ORDER BY TA.PostsWithTag DESC, TA.TotalTagScore DESC
+        LIMIT 1
+    ) AS MostFrequentTag,
+    COALESCE(SUM(AHP.UniqueEventTypesCount), 0) AS TotalUniquePostHistoryEvents,
+    UPPER(SUBSTRING(COALESCE(UAS.DisplayName, 'UNKNOWN') FROM 1 FOR 1)) || COALESCE(SUBSTRING(UAS.DisplayName FROM 2), '****') AS FormattedDisplayNamePrefix,
+    (UAS.Reputation * 0.1 + UAS.TotalPosts * 0.5 + UAS.TotalComments * 0.3 + UAS.TotalEditHistoryEntries * 0.7 + LN(COALESCE(NULLIF(UAS.TotalBadges, 0), 1) + 1) * 2) AS WeightedActivityScore
+FROM UserActivitySummary UAS
+LEFT JOIN PostDetailsExtended PDE ON UAS.UserId = PDE.OwnerUserId
+LEFT JOIN AggregatedHistoryPerPost AHP ON UAS.UserId = AHP.UserId
+WHERE
+    UAS.TotalQuestions > 0
+    AND UAS.TotalAnswers > 0
+    AND UAS.AcceptedAnswersReceivedCount > 0
+    AND UAS.LatestPostDate IS NOT NULL
+    AND UAS.Reputation > 50
+    AND EXISTS (
+        SELECT 1
+        FROM PostLinks PL
+        WHERE PL.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = UAS.UserId AND PostTypeId = 1 AND CreationDate > UAS.UserCreationDate)
+          AND PL.LinkTypeId = 3
+          AND PL.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '5 years')
+    )
+GROUP BY
+    UAS.UserId,
+    UAS.DisplayName,
+    UAS.Reputation,
+    UAS.UserCreationDate,
+    UAS.LastAccessDate,
+    UAS.TotalPosts,
+    UAS.TotalQuestions,
+    UAS.TotalAnswers,
+    UAS.AvgRelevantPostScore,
+    UAS.LatestPostDate,
+    UAS.TotalEditHistoryEntries,
+    UAS.AcceptedAnswersReceivedCount,
+    UAS.TotalBadges,
+    UAS.TotalComments,
+    UAS.TotalPostScore
+HAVING
+    SUM(CASE WHEN PDE.PostTypeId = 1 AND PDE.CommentCount > 5 AND PDE.ViewCount > 1000 THEN 1 ELSE 0 END) > 0
+    OR SUM(CASE WHEN PDE.PostTypeId = 2 AND PDE.PostScore > 20 AND PDE.RollingAvgUserPostScore > 15 THEN 1 ELSE 0 END) > 0
+ORDER BY
+    WeightedActivityScore DESC,
+    UserTotalScoreRank ASC
+LIMIT 100;

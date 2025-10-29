@@ -1,0 +1,180 @@
+-- {"query": "2250.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1685} 
+with RecursiveUserActivity as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        u.Views,
+        coalesce(u.UpVotes,0) as UpVotes,
+        coalesce(u.DownVotes,0) as DownVotes,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score as PostScore,
+        p.CreationDate as PostCreationDate,
+        p.Title,
+        row_number() over (partition by u.Id order by p.CreationDate desc) as RecentPostRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    where u.Reputation > (
+        select avg(Reputation) from Users
+    )
+),
+FilteredPosts as (
+    select 
+        p.*,
+        array_to_string(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2),'><'),'|') as ParsedTags
+    from Posts p
+    where p.PostTypeId = 1 -- Questions only
+      and p.CreationDate >= current_date - interval '1 year'
+      and (p.ClosedDate is null or p.ClosedDate > current_date - interval '6 months')
+),
+AnswerStats as (
+    select 
+        a.ParentId as QuestionId,
+        count(*) filter (where a.Score > 0) as PositiveAnswers,
+        count(*) filter (where a.Score <= 0) as NonPositiveAnswers,
+        avg(a.Score) as AvgAnswerScore,
+        max(a.Score) as MaxAnswerScore
+    from Posts a
+    where a.PostTypeId = 2 -- Answers only
+    group by a.ParentId
+),
+UserBadgeCounts as (
+    select 
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        count(*) as TotalBadges
+    from Badges b
+    group by b.UserId
+),
+RecentComments as (
+    select 
+        c.PostId,
+        c.UserId,
+        c.CreationDate,
+        c.Score,
+        c.Text,
+        row_number() over (partition by c.PostId order by c.CreationDate desc) as CommentRank
+    from Comments c
+    where c.CreationDate > current_date - interval '6 months'
+),
+LatestPostHistoryPerPost as (
+    select ph.PostId, max(ph.CreationDate) as LatestHistoryDate
+    from PostHistory ph
+    group by ph.PostId
+),
+PostHistoryDetails as (
+    select ph.*
+    from PostHistory ph
+    inner join LatestPostHistoryPerPost lpp on ph.PostId = lpp.PostId and ph.CreationDate = lpp.LatestHistoryDate
+),
+QuestionAnswerSummary as (
+    select 
+        q.Id as QuestionId,
+        q.Title,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        f.ParsedTags,
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        us.BadgeRank,
+        asc.PositiveAnswers,
+        asc.NonPositiveAnswers,
+        asc.AvgAnswerScore,
+        asc.MaxAnswerScore,
+        (select count(*) from Votes v where v.PostId = q.Id and v.VoteTypeId = 2) as QuestionUpVotes,
+        (select count(*) from Votes v where v.PostId = q.Id and v.VoteTypeId = 3) as QuestionDownVotes,
+        (select string_agg(distinct lt.Name, ', ') 
+         from PostLinks pl 
+         join LinkTypes lt on lt.Id = pl.LinkTypeId 
+         where pl.PostId = q.Id) as LinkTypeNames,
+        (select coalesce(string_agg(distinct pht.Name,'|'), '') 
+         from PostHistory ph 
+         join PostHistoryTypes pht on ph.PostHistoryTypeId = pht.Id 
+         where ph.PostId = q.Id) as HistoryTypeNames,
+        (select coalesce(string_agg(distinct c.UserDisplayName || ':' || c.Text, ' || '), '') 
+         from Comments c 
+         where c.PostId = q.Id and c.CreationDate > current_date - interval '1 month') as RecentCommentSummary
+    from FilteredPosts q
+    left join AnswerStats asc on asc.QuestionId = q.Id
+    left join RecursiveUserActivity ua on ua.UserId = q.OwnerUserId
+    left join (
+        select
+            u.Id,
+            rank() over (order by count(b.Id) desc) as BadgeRank
+        from Users u
+        left join Badges b on b.UserId = u.Id
+        group by u.Id
+    ) us on us.Id = ua.UserId
+    where q.Score > 5
+),
+HighReputationBadgeUsers as (
+    select u.Id, u.DisplayName, ubc.GoldBadges, ubc.SilverBadges, ubc.BronzeBadges, 
+           u.Reputation,
+           dense_rank() over (order by u.Reputation desc) as RepRank
+    from Users u
+    join UserBadgeCounts ubc on ubc.UserId = u.Id
+    where u.Reputation > 10000 and ubc.GoldBadges > 0
+),
+JoinedData as (
+    select qas.*, hrbu.GoldBadges, hrbu.SilverBadges, hrbu.BronzeBadges, hrbu.Reputation as UserReputation,
+           coalesce(hrbu.RepRank, null) as ReputationRank
+    from QuestionAnswerSummary qas
+    left join HighReputationBadgeUsers hrbu on hrbu.Id = qas.UserId
+),
+FinalWindowedRanks as (
+    select *,
+        rank() over (partition by ParsedTags order by QuestionScore desc nulls last, ViewCount desc nulls last) as TagBasedRank,
+        row_number() over (partition by UserId order by QuestionScore desc nulls last) as UserQuestionRank,
+        count(*) over (partition by ParsedTags) as TotalQuestionsPerTag
+    from JoinedData
+)
+select 
+    fw.UserId,
+    fw.DisplayName,
+    fw.ReputationRank,
+    fw.GoldBadges,
+    fw.SilverBadges,
+    fw.BronzeBadges,
+    fw.QuestionId,
+    fw.Title,
+    fw.QuestionScore,
+    fw.ViewCount,
+    fw.ParsedTags,
+    fw.PositiveAnswers,
+    fw.NonPositiveAnswers,
+    fw.AvgAnswerScore,
+    fw.MaxAnswerScore,
+    fw.QuestionUpVotes,
+    fw.QuestionDownVotes,
+    fw.LinkTypeNames,
+    fw.HistoryTypeNames,
+    substring(fw.RecentCommentSummary from 1 for 200) as RecentCommentSummarySnippet,
+    fw.TagBasedRank,
+    fw.UserQuestionRank,
+    fw.TotalQuestionsPerTag,
+    case 
+        when fw.ClosedDate is null then 'Open' 
+        else 'Closed' 
+    end as QuestionStatus,
+    coalesce(fw.LastActivityDate, fw.PostCreationDate) as ActivityDate,
+    -- Complex conditional scoring expression:
+    case 
+        when fw.QuestionScore > 50 and fw.PositiveAnswers > 10 then 'Highly Active'
+        when fw.QuestionScore between 10 and 50 then 'Moderately Active'
+        when fw.QuestionScore < 10 and fw.QuestionScore is not null then 'Low Activity'
+        else 'Unknown' 
+    end as ActivityCategory,
+    -- Calculated ratio appearance
+    case when fw.UpVotes + fw.DownVotes > 0 
+         then round(fw.UpVotes::numeric / nullif(fw.UpVotes + fw.DownVotes,0), 2)
+         else null end as UpvoteRatio
+from FinalWindowedRanks fw
+where fw.TagBasedRank <= 5
+order by fw.ParsedTags, fw.TagBasedRank, fw.QuestionScore desc;

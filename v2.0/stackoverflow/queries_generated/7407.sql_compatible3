@@ -1,0 +1,285 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        COUNT(DISTINCT CASE WHEN p.Score > 0 THEN p.Id END) as PositiveScorePosts,
+        COUNT(DISTINCT CASE WHEN p.Score < 0 THEN p.Id END) as NegativeScorePosts,
+        AVG(p.Score) as AvgPostScore,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags) - 2)), ', ') as TagList
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id IS NOT NULL
+      AND (p.Tags IS NOT NULL AND p.Tags <> '' OR p.Tags IS NULL)
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        Views,
+        UpVotes,
+        DownVotes,
+        TotalPosts,
+        QuestionCount,
+        AnswerCount,
+        CommentCount,
+        BadgeCount,
+        LastPostDate,
+        LastCommentDate,
+        PositiveScorePosts,
+        NegativeScorePosts,
+        AvgPostScore,
+        TagList,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, TotalPosts DESC) as RankByReputation,
+        RANK() OVER (ORDER BY Views DESC) as RankByViews,
+        DENSE_RANK() OVER (ORDER BY BadgeCount DESC) as RankByBadges
+    FROM UserActivityStats
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        u.DisplayName as OwnerName,
+        u.Reputation as OwnerReputation,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            WHEN p.PostTypeId = 4 THEN 'TagWikiExcerpt'
+            WHEN p.PostTypeId = 5 THEN 'TagWiki'
+            ELSE 'Other'
+        END as PostTypeDescription,
+        CASE 
+            WHEN p.Score >= 100 THEN 'Gold'
+            WHEN p.Score >= 25 THEN 'Silver'
+            ELSE 'Bronze'
+        END as ScoreTier,
+        COALESCE(p.Tags, '') as Tags,
+        CHAR_LENGTH(COALESCE(p.Tags, '')) as TagsLength,
+        CASE WHEN p.Tags IS NULL OR p.Tags = '' THEN '' ELSE SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags) - 2)) END as CleanTags,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags <> '' THEN 
+                (SELECT COUNT(*) FROM (SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags) - 2)), '><')) AS tag) t)
+            ELSE 0
+        END as TagCount,
+        ABS(p.Score - (SELECT AVG(p2.Score) FROM Posts p2 WHERE p2.PostTypeId = p.PostTypeId)) as ScoreDeviation,
+        (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (1, 2, 3)) as EditCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId IN (2, 3)) as VoteCount,
+        (SELECT AVG(v2.Score) FROM Votes v2 WHERE v2.PostId = p.Id AND v2.VoteTypeId IN (2, 3) AND v2.Score IS NOT NULL) as AvgVoteScore
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1, 2)
+),
+CombinedData AS (
+    SELECT 
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.Views,
+        tu.UpVotes,
+        tu.DownVotes,
+        tu.TotalPosts,
+        tu.QuestionCount,
+        tu.AnswerCount,
+        tu.CommentCount,
+        tu.BadgeCount,
+        tu.LastPostDate,
+        tu.LastCommentDate,
+        tu.PositiveScorePosts,
+        tu.NegativeScorePosts,
+        tu.AvgPostScore,
+        tu.TagList,
+        tu.RankByReputation,
+        tu.RankByViews,
+        tu.RankByBadges,
+        pa.PostId,
+        pa.PostTypeId,
+        pa.Title,
+        pa.Score,
+        pa.ViewCount,
+        pa.AnswerCount as PostAnswerCount,
+        pa.CommentCount as PostCommentCount,
+        pa.FavoriteCount,
+        pa.CreationDate as PostCreationDate,
+        pa.LastActivityDate as PostLastActivityDate,
+        pa.OwnerName,
+        pa.OwnerReputation,
+        pa.PostTypeDescription,
+        pa.ScoreTier,
+        pa.Tags,
+        pa.TagCount,
+        pa.EditCount,
+        pa.VoteCount,
+        pa.AvgVoteScore,
+        CAST((EXTRACT(EPOCH FROM (pa.LastActivityDate - pa.CreationDate))/86400) AS INTEGER) as DaysActive,
+        COALESCE(pa.Score, 0) + COALESCE(pa.ViewCount, 0) + COALESCE(pa.AnswerCount, 0) as ActivityScore,
+        ROW_NUMBER() OVER (PARTITION BY tu.UserId ORDER BY pa.Score DESC) as PostRankByScore,
+        RANK() OVER (PARTITION BY tu.UserId ORDER BY pa.CreationDate DESC) as PostRecentRank,
+        DENSE_RANK() OVER (ORDER BY pa.Score DESC) as GlobalScoreRank,
+        NTILE(10) OVER (ORDER BY pa.Score DESC) as ScoreQuartile
+    FROM TopUsers tu
+    LEFT JOIN PostAnalysis pa ON tu.UserId = 
+        CASE 
+            WHEN pa.OwnerName ~ '^[0-9]+$' THEN CAST(pa.OwnerName AS INTEGER) 
+            ELSE NULL 
+        END
+),
+FinalStats AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        Views,
+        UpVotes,
+        DownVotes,
+        TotalPosts,
+        QuestionCount,
+        AnswerCount,
+        CommentCount,
+        BadgeCount,
+        LastPostDate,
+        LastCommentDate,
+        PositiveScorePosts,
+        NegativeScorePosts,
+        AvgPostScore,
+        TagList,
+        RankByReputation,
+        RankByViews,
+        RankByBadges,
+        MAX(PostId) as LatestPostId,
+        MAX(Title) as LatestPostTitle,
+        MAX(PostTypeId) as LatestPostTypeId,
+        MAX(CreationDate) as LatestPostCreationDate,
+        MIN(AvgVoteScore) as MinAvgVoteScore,
+        MAX(AvgVoteScore) as MaxAvgVoteScore,
+        AVG(AvgVoteScore) as AvgAvgVoteScore,
+        STRING_AGG(DISTINCT PostTypeDescription, ', ') as AllPostTypes,
+        STRING_AGG(DISTINCT ScoreTier, ', ') as ScoreTiers,
+        COUNT(DISTINCT PostId) as DistinctPosts,
+        COUNT(DISTINCT CASE WHEN Score > 0 THEN PostId END) as PositiveScorePostsCount,
+        COUNT(DISTINCT CASE WHEN Score < 0 THEN PostId END) as NegativeScorePostsCount,
+        SUM(AvgVoteScore) as TotalVoteScore,
+        CAST(
+            CASE WHEN COUNT(DISTINCT PostId) > 0 THEN 
+                ROUND((COUNT(DISTINCT CASE WHEN Score > 0 THEN PostId END) * 100.0) / COUNT(DISTINCT PostId), 2)
+            ELSE 0 END
+        AS DECIMAL(5,2)) as PositiveScorePercentage,
+        CASE 
+            WHEN COUNT(DISTINCT PostId) >= 10 AND AVG(AvgVoteScore) > 2.5 AND AVG(Score) > 5 THEN 'Highly Engaged'
+            WHEN COUNT(DISTINCT PostId) >= 5 AND AVG(AvgVoteScore) > 1.5 THEN 'Moderately Engaged'
+            WHEN COUNT(DISTINCT PostId) >= 1 THEN 'Slightly Engaged'
+            ELSE 'Inactive'
+        END as EngagementLevel,
+        CASE 
+            WHEN MAX(AvgVoteScore) > 5 THEN 'Top Performer'
+            WHEN MAX(AvgVoteScore) > 3 THEN 'Good Performer'
+            WHEN MAX(AvgVoteScore) > 1 THEN 'Average Performer'
+            ELSE 'Below Average'
+        END as PerformanceLevel,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, TotalPosts DESC) as OverallRank
+    FROM CombinedData
+    GROUP BY 
+        UserId, DisplayName, Reputation, Views, UpVotes, DownVotes, TotalPosts, QuestionCount, 
+        AnswerCount, CommentCount, BadgeCount, LastPostDate, LastCommentDate, PositiveScorePosts, 
+        NegativeScorePosts, AvgPostScore, TagList, RankByReputation, RankByViews, RankByBadges
+)
+SELECT 
+    f.UserId,
+    f.DisplayName,
+    f.Reputation,
+    f.Views,
+    f.UpVotes,
+    f.DownVotes,
+    f.TotalPosts,
+    f.QuestionCount,
+    f.AnswerCount,
+    f.CommentCount,
+    f.BadgeCount,
+    f.LastPostDate,
+    f.LastCommentDate,
+    f.PositiveScorePosts,
+    f.NegativeScorePosts,
+    f.AvgPostScore,
+    f.TagList,
+    f.RankByReputation,
+    f.RankByViews,
+    f.RankByBadges,
+    f.LatestPostId,
+    f.LatestPostTitle,
+    f.LatestPostTypeId,
+    f.LatestPostCreationDate,
+    f.MinAvgVoteScore,
+    f.MaxAvgVoteScore,
+    f.AvgAvgVoteScore,
+    f.AllPostTypes,
+    f.ScoreTiers,
+    f.DistinctPosts,
+    f.PositiveScorePostsCount,
+    f.NegativeScorePostsCount,
+    f.TotalVoteScore,
+    f.PositiveScorePercentage,
+    f.EngagementLevel,
+    f.PerformanceLevel,
+    f.OverallRank,
+    CASE 
+        WHEN f.Reputation > 10000 THEN 'Elite'
+        WHEN f.Reputation > 5000 THEN 'Veteran'
+        WHEN f.Reputation > 1000 THEN 'Experienced'
+        WHEN f.Reputation > 100 THEN 'Beginner'
+        ELSE 'Newbie'
+    END as ReputationLevel,
+    CASE 
+        WHEN f.TotalPosts > 1000 THEN 'Legendary'
+        WHEN f.TotalPosts > 500 THEN 'Master'
+        WHEN f.TotalPosts > 100 THEN 'Professional'
+        WHEN f.TotalPosts > 10 THEN 'Intermediate'
+        ELSE 'Novice'
+    END as ContributionLevel,
+    (f.Reputation + f.Views + f.UpVotes - f.DownVotes) as CombinedActivityScore,
+    ROUND(
+        (f.Views * 1.0) / NULLIF(f.TotalPosts, 0), 2
+    ) as AvgViewsPerPost,
+    ROUND(
+        (f.CommentCount * 1.0) / NULLIF(f.TotalPosts, 0), 2
+    ) as AvgCommentsPerPost,
+    ROUND(
+        (f.BadgeCount * 1.0) / NULLIF(f.TotalPosts, 0), 2
+    ) as AvgBadgesPerPost,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = f.UserId AND b.Class = 1) as GoldBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = f.UserId AND b.Class = 2) as SilverBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = f.UserId AND b.Class = 3) as BronzeBadges,
+    CASE 
+        WHEN f.BadgeCount > 100 THEN 'Award-Winning'
+        WHEN f.BadgeCount > 50 THEN 'Recognized'
+        WHEN f.BadgeCount > 10 THEN 'Active'
+        ELSE 'Casual'
+    END as BadgeRecognitionLevel
+FROM FinalStats f
+WHERE f.Reputation > 100
+  AND f.TotalPosts >= 1
+  AND f.LastPostDate >= TIMESTAMP '2020-01-01 00:00:00'
+ORDER BY f.Reputation DESC, f.TotalPosts DESC
+LIMIT 1000 OFFSET 0;

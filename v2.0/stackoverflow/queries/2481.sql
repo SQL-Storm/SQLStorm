@@ -1,0 +1,137 @@
+WITH RECURSIVE RecursiveUserReputation AS (
+    SELECT u.Id, u.Reputation, 1 AS depth
+    FROM Users u
+    WHERE u.Reputation > 1000
+  UNION ALL
+    SELECT u.Id, u.Reputation, rur.depth + 1
+    FROM Users u
+    JOIN RecursiveUserReputation rur ON u.Id = rur.Id
+    WHERE rur.depth < 1
+),
+DetailedPostStats AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        u.Id AS OwnerUserId,
+        u.DisplayName AS OwnerName,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.AcceptedAnswerId,
+        COALESCE(p.Title,'') AS Title,
+        p.Tags,
+        p.FavoriteCount,
+        LEAD(p.Score) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) AS NextPostScore,
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS ScoreRank,
+        COUNT(c.Id) AS CommentCount,
+        MAX(v.CreationDate) AS LastVoteDate,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        (CASE WHEN EXISTS (
+            SELECT 1 FROM PostLinks pl
+            WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3
+        ) THEN TRUE ELSE FALSE END) AS HasDuplicateLink
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    WHERE p.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '1 year')
+    GROUP BY p.Id, p.PostTypeId, pt.Name, u.Id, u.DisplayName, p.Score, p.ViewCount, p.CreationDate, p.AcceptedAnswerId, p.Title, p.Tags, p.FavoriteCount
+),
+FilteredTagQuestions AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        -- array_agg with ORDER BY requires the ordered expression to be in the argument for DISTINCT in Postgres.
+        -- To be portable, aggregate tag names with their counts first, then sort and array_agg in an ordered subquery.
+        (
+          SELECT array_agg(tn.TagName)
+          FROM (
+            SELECT t.TagName
+            FROM (
+              SELECT UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR char_length(p.Tags)-2), '><')) AS TagName
+            ) AS tags_inner
+            JOIN Tags t ON t.TagName = tags_inner.TagName
+            GROUP BY t.TagName, t.Count
+            ORDER BY t.Count DESC, t.TagName
+          ) AS tn
+        ) AS PopularTags
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '6 months')
+    GROUP BY p.Id, p.Title, p.Tags, p.CreationDate, p.Score, p.ViewCount, p.OwnerUserId
+    HAVING COUNT(*) > 1
+),
+UserBadgeCounts AS (
+    SELECT 
+        b.UserId,
+        b.Class,
+        COUNT(*) AS BadgeCount,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId, b.Class
+),
+BadgePivot AS (
+    SELECT
+        ubc.UserId,
+        MAX(CASE WHEN ubc.Class = 1 THEN ubc.BadgeCount ELSE 0 END) AS GoldBadges,
+        MAX(CASE WHEN ubc.Class = 2 THEN ubc.BadgeCount ELSE 0 END) AS SilverBadges,
+        MAX(CASE WHEN ubc.Class = 3 THEN ubc.BadgeCount ELSE 0 END) AS BronzeBadges
+    FROM UserBadgeCounts ubc
+    GROUP BY ubc.UserId
+)
+SELECT 
+    dps.PostId,
+    dps.Title,
+    dps.PostTypeName,
+    dps.OwnerUserId,
+    dps.OwnerName,
+    dps.Score,
+    dps.ViewCount,
+    dps.FavoriteCount,
+    dps.CommentCount,
+    dps.UpVotes,
+    dps.DownVotes,
+    dps.LastVoteDate,
+    COALESCE(bp.GoldBadges,0) AS GoldBadges,
+    COALESCE(bp.SilverBadges,0) AS SilverBadges,
+    COALESCE(bp.BronzeBadges,0) AS BronzeBadges,
+    CASE WHEN dps.HasDuplicateLink THEN 'Yes' ELSE 'No' END AS HasDuplicateLink,
+    ftq.PopularTags,
+    rur.depth AS UserReputationDepth,
+    CASE 
+        WHEN dps.Score > 10 AND dps.ViewCount > 1000 THEN 'HighImpact'
+        WHEN dps.Score BETWEEN 1 AND 10 AND dps.ViewCount BETWEEN 100 AND 1000 THEN 'MediumImpact'
+        ELSE 'LowImpact'
+    END AS ImpactCategory,
+    LTRIM(RTRIM(TRANSLATE(COALESCE(dps.Title,'') || ' ' || COALESCE(dps.OwnerName,''), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'))) AS NormalizedTitle,
+    CASE WHEN dps.AcceptedAnswerId IS NOT NULL 
+        THEN (SELECT p2.Score FROM Posts p2 WHERE p2.Id = dps.AcceptedAnswerId)
+        ELSE NULL
+    END AS AcceptedAnswerScore,
+    (
+        SELECT COUNT(*)
+        FROM PostHistory ph
+        WHERE ph.PostId = dps.PostId 
+          AND ph.PostHistoryTypeId IN (10,12)
+          AND ph.CreationDate > (CAST('2024-10-01' AS date) - INTERVAL '1 year')
+    ) AS CloseOrDeleteEvents,
+    (
+        SELECT STRING_AGG(DISTINCT lh.Name, ', ')
+        FROM PostLinks pl2
+        JOIN LinkTypes lh ON pl2.LinkTypeId = lh.Id
+        WHERE pl2.PostId = dps.PostId
+    ) AS LinkTypesEncountered
+FROM DetailedPostStats dps
+LEFT JOIN FilteredTagQuestions ftq ON ftq.Id = dps.PostId
+LEFT JOIN BadgePivot bp ON bp.UserId = dps.OwnerUserId
+LEFT JOIN RecursiveUserReputation rur ON rur.Id = dps.OwnerUserId
+WHERE dps.ScoreRank <= 500
+ORDER BY dps.Score DESC, dps.ViewCount DESC
+LIMIT 100;

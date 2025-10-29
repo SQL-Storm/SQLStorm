@@ -1,0 +1,237 @@
+-- {"query": "1502.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3404} 
+
+WITH UserContributionSummary AS (
+    -- Aggregates various metrics for users' contributions
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Views AS ProfileViews,
+        U.UpVotes AS UserUpVotesGiven,
+        U.DownVotes AS UserDownVotesGiven,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsOwned,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersOwned,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        COALESCE(SUM(P.Score), 0) AS TotalPostScoreReceived,
+        COALESCE(SUM(P.ViewCount), 0) AS TotalPostViewsForOwnedPosts,
+        MAX(P.LastActivityDate) AS LatestActivityOnOwnedPost,
+        (SELECT COUNT(DISTINCT B.Id) FROM Badges B WHERE B.UserId = U.Id) AS TotalBadgesEarned,
+        (SELECT COUNT(V.Id) FROM Votes V WHERE V.UserId = U.Id AND V.VoteTypeId IN (2, 3, 5)) AS TotalVotesCastOrFavorited,
+        (SELECT SUM(V.BountyAmount) FROM Votes V WHERE V.UserId = U.Id AND V.VoteTypeId = 8) AS TotalBountyPosted
+    FROM
+        Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Views, U.UpVotes, U.DownVotes
+),
+PostVersionHistory AS (
+    -- Tracks post modifications, including editor, type of change, and time difference between edits
+    SELECT
+        PH1.PostId,
+        PH1.Id AS HistoryId,
+        PH1.PostHistoryTypeId,
+        PHT.Name AS HistoryTypeName,
+        PH1.CreationDate AS EventDate,
+        PH1.UserId AS EditorId,
+        PH1.UserDisplayName AS EditorDisplayName,
+        PH1.Comment,
+        PH1.Text AS HistoryText,
+        LAG(PH1.CreationDate, 1, PH1.CreationDate) OVER (PARTITION BY PH1.PostId ORDER BY PH1.CreationDate) AS PrevEventDate,
+        EXTRACT(EPOCH FROM (PH1.CreationDate - LAG(PH1.CreationDate, 1, PH1.CreationDate) OVER (PARTITION BY PH1.PostId ORDER BY PH1.CreationDate))) / 3600.0 AS HoursSinceLastEdit, -- Time difference in hours
+        ROW_NUMBER() OVER (PARTITION BY PH1.PostId ORDER BY PH1.CreationDate DESC) AS rn_latest_event,
+        ROW_NUMBER() OVER (PARTITION BY PH1.PostId, PH1.PostHistoryTypeId ORDER BY PH1.CreationDate DESC) AS rn_latest_event_type
+    FROM
+        PostHistory PH1
+    JOIN
+        PostHistoryTypes PHT ON PH1.PostHistoryTypeId = PHT.Id
+    WHERE PH1.PostHistoryTypeId IN (1,2,3,4,5,6,10,11,12,13,19,20,35,36) -- Initial, Edits, Close, Reopen, Delete, Undelete, Protect, Unprotect, Migrate
+),
+PostContentAnalysis AS (
+    -- Extracts tags, calculates readability score (simple word count based), and checks for specific content
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.ClosedDate,
+        P.LastActivityDate,
+        P.Title,
+        P.Body,
+        P.Tags,
+        COALESCE(LENGTH(P.Body) - LENGTH(REPLACE(P.Body, ' ', '')), 0) + 1 AS BodyWordCount,
+        LENGTH(P.Title) AS TitleLength,
+        (SELECT COUNT(DISTINCT L.Id) FROM PostLinks L WHERE L.PostId = P.Id AND L.LinkTypeId = 1) AS OutgoingLinksCount,
+        (SELECT COUNT(DISTINCT L.Id) FROM PostLinks L WHERE L.RelatedPostId = P.Id AND L.LinkTypeId = 1) AS IncomingLinksCount,
+        (SELECT COUNT(DISTINCT V.UserId) FROM Votes V WHERE V.PostId = P.Id AND V.VoteTypeId = 5) AS TotalBookmarks,
+        ARRAY(SELECT TRIM(UNNEST(string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><')))) AS ParsedTags,
+        (SELECT COALESCE(SUM(C.Score), 0) FROM Comments C WHERE C.PostId = P.Id) AS TotalCommentScore,
+        P.AcceptedAnswerId,
+        (SELECT P_ACC.OwnerUserId FROM Posts P_ACC WHERE P_ACC.Id = P.AcceptedAnswerId) AS AcceptedAnswerOwnerId,
+        (SELECT P_ACC.Score FROM Posts P_ACC WHERE P_ACC.Id = P.AcceptedAnswerId) AS AcceptedAnswerScore,
+        CASE
+            WHEN P.Body ILIKE '%error%' OR P.Body ILIKE '%bug%' OR P.Body ILIKE '%exception%' THEN TRUE
+            ELSE FALSE
+        END AS ContainsKeyword_ErrorBugException
+    FROM
+        Posts P
+    JOIN
+        PostTypes PT ON P.PostTypeId = PT.Id
+    WHERE
+        P.PostTypeId IN (1, 2) -- Focus on Questions and Answers
+),
+TopTagsByPostCount AS (
+    -- Identifies the most popular tags based on number of associated posts
+    SELECT
+        Tag.TagName,
+        COUNT(DISTINCT PCA.PostId) AS PostCountForTag,
+        AVG(PCA.Score) AS AvgScoreForTagPosts
+    FROM
+        PostContentAnalysis PCA,
+        UNNEST(PCA.ParsedTags) AS Tag(TagName)
+    GROUP BY
+        Tag.TagName
+    ORDER BY
+        PostCountForTag DESC
+    LIMIT 100
+),
+ModerationSummary AS (
+    -- Summarizes moderation actions on posts
+    SELECT
+        PH.PostId,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (10, 12, 19) THEN PH.Id END) AS TotalCloseDeleteProtectEvents,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (11, 13, 20) THEN PH.Id END) AS TotalReopenUndeleteUnprotectEvents,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN TRUE ELSE FALSE END) AS WasEverClosed,
+        MAX(PH.CreationDate) FILTER (WHERE PH.PostHistoryTypeId IN (4,5,6)) AS LastEditDateByAnyUser,
+        MAX(PH.CreationDate) FILTER (WHERE PH.PostHistoryTypeId = 10) AS LastClosedDate,
+        ARRAY_AGG(DISTINCT PH.UserId) FILTER (WHERE PH.PostHistoryTypeId IN (10, 11, 12, 13) AND PH.UserId IS NOT NULL) AS UsersInvolvedInModeration
+    FROM
+        PostHistory PH
+    WHERE
+        PH.PostHistoryTypeId IN (10, 11, 12, 13, 19, 20) -- Close, Reopen, Delete, Undelete, Protect, Unprotect
+    GROUP BY PH.PostId
+),
+HighlyInteractedPosts AS (
+    -- Identify posts with high engagement (high score, many comments/answers, or linked/duplicated)
+    SELECT
+        PCA.PostId,
+        PCA.PostTypeId,
+        PCA.OwnerUserId,
+        PCA.Score,
+        PCA.ViewCount,
+        PCA.AnswerCount,
+        PCA.CommentCount,
+        COUNT(DISTINCT PL_DUP.PostId) AS DuplicateSourceCount,
+        COUNT(DISTINCT PL_LINK.PostId) AS LinkedSourceCount,
+        'HighEngagement' AS PostCategory
+    FROM
+        PostContentAnalysis PCA
+    LEFT JOIN PostLinks PL_DUP ON PCA.PostId = PL_DUP.RelatedPostId AND PL_DUP.LinkTypeId = 3 -- This post is a target of a duplicate
+    LEFT JOIN PostLinks PL_LINK ON PCA.PostId = PL_LINK.RelatedPostId AND PL_LINK.LinkTypeId = 1 -- This post is linked by others
+    WHERE
+        (PCA.Score >= 50 OR PCA.CommentCount >= 10 OR PCA.AnswerCount >= 5 OR PCA.FavoriteCount >= 5)
+        OR EXISTS (SELECT 1 FROM PostLinks PLX WHERE PLX.RelatedPostId = PCA.PostId AND PLX.LinkTypeId IN (1,3))
+    GROUP BY
+        PCA.PostId, PCA.PostTypeId, PCA.OwnerUserId, PCA.Score, PCA.ViewCount, PCA.AnswerCount, PCA.CommentCount
+),
+UsersWhoOnlyAskQuestions AS (
+    -- Users who have asked questions but never provided an answer
+    SELECT UserId FROM UserContributionSummary WHERE QuestionsOwned > 0
+    EXCEPT
+    SELECT UserId FROM UserContributionSummary WHERE AnswersOwned > 0
+)
+-- Main Query: Combine all CTEs and add final logic
+SELECT
+    UCS.UserId,
+    UCS.DisplayName,
+    UCS.Reputation,
+    UCS.UserCreationDate,
+    UCS.LastAccessDate,
+    UCS.TotalPostsOwned,
+    UCS.QuestionsOwned,
+    UCS.AnswersOwned,
+    UCS.TotalCommentsMade,
+    UCS.TotalPostScoreReceived,
+    UCS.TotalBadgesEarned,
+    UCS.TotalVotesCastOrFavorited,
+    UCS.TotalBountyPosted,
+    PCA.PostId,
+    PCA.PostTypeName,
+    PCA.Title,
+    PCA.PostCreationDate,
+    PCA.Score AS PostScore,
+    PCA.ViewCount AS PostViewCount,
+    PCA.BodyWordCount,
+    PCA.TitleLength,
+    PCA.AnswerCount,
+    PCA.FavoriteCount,
+    PCA.TotalBookmarks,
+    PCA.OutgoingLinksCount,
+    PCA.IncomingLinksCount,
+    PCA.ParsedTags,
+    PCA.ContainsKeyword_ErrorBugException,
+    PCA.TotalCommentScore,
+    PCA.AcceptedAnswerId,
+    PCA.AcceptedAnswerScore,
+    COALESCE(MS.WasEverClosed, FALSE) AS PostWasEverClosed,
+    MS.LastClosedDate,
+    MS.LastEditDateByAnyUser,
+    MS.TotalCloseDeleteProtectEvents,
+    MS.TotalReopenUndeleteUnprotectEvents,
+    PVH.EventDate AS LatestPostHistoryEventDate,
+    PVH.HistoryTypeName AS LatestPostHistoryEventType,
+    PVH.EditorId AS LatestEditorId,
+    PVH.EditorDisplayName AS LatestEditorDisplayName,
+    PVH.HoursSinceLastEdit AS HoursSincePrevEdit,
+    (
+        SELECT COUNT(DISTINCT PH_SUB.UserId)
+        FROM PostHistory PH_SUB
+        WHERE PH_SUB.PostId = PCA.PostId
+          AND PH_SUB.PostHistoryTypeId IN (4, 5, 6) -- Edit Title/Body/Tags
+          AND PH_SUB.UserId IS NOT NULL
+          AND PH_SUB.UserId <> PCA.OwnerUserId -- Edited by someone other than the owner
+    ) AS EditsByOtherUsersCount,
+    (
+        SELECT COUNT(DISTINCT V.UserId)
+        FROM Votes V
+        WHERE V.PostId = PCA.PostId AND V.VoteTypeId = 2 -- Upvotes
+    ) AS TotalUpVotesForPost,
+    (
+        SELECT AVG(InnerP.Score)
+        FROM Posts InnerP
+        WHERE InnerP.OwnerUserId = UCS.UserId
+          AND InnerP.PostTypeId = PCA.PostTypeId
+          AND InnerP.CreationDate BETWEEN UCS.UserCreationDate AND PCA.PostCreationDate
+    ) AS AvgPostScoreByOwnerUpToThisPost,
+    CASE
+        WHEN UCS.Reputation >= 20000 AND UCS.AnswersOwned > 100 AND UCS.TotalBadgesEarned >= 50 AND PCA.AcceptedAnswerId IS NOT NULL AND PCA.AcceptedAnswerOwnerId = UCS.UserId THEN 'Highly_Influential_Answerer'
+        WHEN UCS.Reputation >= 10000 AND UCS.QuestionsOwned > 50 AND UCS.TotalPostsOwned > 200 THEN 'Pro_Community_Engager'
+        WHEN UCS.Reputation < 500 AND UCS.TotalPostsOwned < 5 THEN 'Novice_Contributor'
+        ELSE 'Regular_Engager'
+    END AS UserEngagementTier,
+    NTILE(5) OVER (ORDER BY UCS.Reputation DESC, UCS.TotalPostScoreReceived DESC) AS ReputationQuintile,
+    RANK() OVER (PARTITION BY PCA.PostTypeId ORDER BY PCA.Score DESC, PCA.ViewCount DESC) AS RankWithinPostType,
+    AVG(PCA.Score) OVER (PARTITION BY PCA.PostTypeId ORDER BY PCA.CreationDate RANGE BETWEEN INTERVAL '30 DAY' PRECEDING AND CURRENT ROW) AS RollingAvgScoreLast30Days,
+    COALESCE(TTB.PostCountForTag, 0) AS MostPopTagPostsCount,
+    COALESCE(TTB.AvgScoreForTagPosts, 0.0) AS MostPopTagAvgScore,
+    LAG(PCA.PostCreationDate, 1) OVER (PARTITION BY UCS.UserId ORDER BY PCA.PostCreationDate) AS PreviousPostDate,
+    EXTRACT(DAY FROM (PCA.PostCreationDate - LAG(PCA.PostCreationDate, 1) OVER (PARTITION BY UCS.UserId ORDER BY PCA.PostCreationDate))) AS DaysBetweenPosts,
+    NOT (PCA.OwnerUserId IS NOT NULL AND PCA.OwnerUserId = PCA.AcceptedAnswerOwnerId) AS AcceptedAnswerByOtherUser, -- TRUE if accepted answer is by someone else or none
+    ARRAY_TO_STRING(MS.UsersInvolvedInModeration, ',') AS ModerationUserIdsList,
+    (
+        SELECT COALESCE(SUM(P_LINK.Score), 0)
+        FROM PostLinks PL_INNER
+        JOIN Posts P_LINK ON PL_INNER.RelatedPostId = P_LINK.Id
+        WHERE PL_INNER.PostId = PCA.PostId AND PL_INNER.LinkTypeId = 1
+    ) AS SumScoreOfLinkedPosts,
+    HI.PostCategory AS HighlyInteractedCategory,
+    HI.DuplicateSourceCount AS Post

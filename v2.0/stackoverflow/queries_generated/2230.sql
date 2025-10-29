@@ -1,0 +1,179 @@
+-- {"query": "2230.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1514} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.WikiPostId,
+        0 as Level,
+        array[t.TagName] as Path
+    from Tags t
+    where t.WikiPostId is not null
+
+    union all
+
+    select
+        t.Id,
+        t.TagName,
+        t.WikiPostId,
+        r.Level + 1,
+        r.Path || t.TagName
+    from Tags t
+    inner join RecursiveTagHierarchy r on t.ExcerptPostId = r.WikiPostId
+    where not t.TagName = any(r.Path)
+),
+LatestUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        max(coalesce(p.LastActivityDate, c.CreationDate)) as LastActiveAt
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+UserBadgeRanks as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+TopQuestionsWithAnswers as (
+    select
+        p.Id as QuestionId,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        (select count(*) from Comments c where c.PostId = p.Id) as CommentTotal,
+        (select string_agg(distinct u.DisplayName, ', ') from Users u where u.Id in (
+            select a.OwnerUserId from Posts a where a.ParentId = p.Id and a.PostTypeId = 2
+        )) as Answerers,
+        row_number() over (partition by date_trunc('month', p.CreationDate) order by p.Score desc) as MonthlyRank
+    from Posts p
+    where p.PostTypeId = 1
+      and p.Score > 5
+      and p.AnswerCount > 0
+      and p.Tags is not null
+),
+DuplicateQuestionRelations as (
+    select
+        pl.PostId as DuplicateQuestionId,
+        pl.RelatedPostId as OriginalQuestionId
+    from PostLinks pl
+    inner join LinkTypes lt on lt.Id = pl.LinkTypeId and lt.Name = 'Duplicate'
+),
+QuestionClosureDetails as (
+    select
+        ph.PostId,
+        crt.Name as CloseReason,
+        ph.CreationDate as ClosedAt,
+        ph.UserId as ClosedByUserId,
+        u.DisplayName as ClosedByUserName
+    from PostHistory ph
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    left join Users u on u.Id = ph.UserId
+    where ph.PostHistoryTypeId = 10
+),
+AnswersWithVotes as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId,
+        a.Score as AnswerScore,
+        a.CreationDate,
+        coalesce(sum(case when v.VoteTypeId = 2 then 1 else 0 end),0) as UpVotes,
+        coalesce(sum(case when v.VoteTypeId = 3 then 1 else 0 end),0) as DownVotes,
+        count(distinct v.Id) as TotalVotes
+    from Posts a
+    left join Votes v on v.PostId = a.Id
+    where a.PostTypeId = 2
+    group by a.Id, a.ParentId, a.OwnerUserId, a.Score, a.CreationDate
+),
+UserScoreStats as (
+    select
+        u.Id,
+        u.DisplayName,
+        coalesce(us.Reputation,0) as Reputation,
+        coalesce(ub.GoldCount,0) as GoldBadges,
+        coalesce(ub.SilverCount,0) as SilverBadges,
+        coalesce(ub.BronzeCount,0) as BronzeBadges,
+        coalesce(u.Views,0) as ProfileViews,
+        row_number() over (order by coalesce(us.Reputation,0) desc) as ReputationRank
+    from Users u
+    left join (
+        select 
+            UserId,
+            max(Reputation) as Reputation
+        from Users
+        group by UserId
+    ) us on us.UserId = u.Id
+    left join (
+        select
+            UserId,
+            sum(case when Class = 1 then BadgeCount else 0 end) as GoldCount,
+            sum(case when Class = 2 then BadgeCount else 0 end) as SilverCount,
+            sum(case when Class = 3 then BadgeCount else 0 end) as BronzeCount
+        from UserBadgeRanks
+        group by UserId
+    ) ub on ub.UserId = u.Id
+),
+UserAnswerRanks as (
+    select
+        a.OwnerUserId,
+        count(*) as AnswersCount,
+        avg(a.AnswerScore) as AvgAnswerScore,
+        max(a.AnswerScore) as MaxAnswerScore,
+        min(a.AnswerScore) as MinAnswerScore
+    from Posts a
+    where a.PostTypeId = 2
+    group by a.OwnerUserId
+)
+select 
+    tq.QuestionId,
+    tq.Title,
+    coalesce(tq.Tags, '') as Tags,
+    tq.CreationDate,
+    tq.Score,
+    tq.ViewCount,
+    tq.AnswerCount,
+    tq.CommentTotal,
+    regexp_replace(tq.Tags, '[<>]', '', 'g') as CleanedTags,
+    dq.OriginalQuestionId,
+    qc.CloseReason,
+    qc.ClosedAt,
+    qc.ClosedByUserName,
+    tq.Answerers,
+    ua.AnswersCount,
+    ua.AvgAnswerScore,
+    ua.MaxAnswerScore,
+    ua.MinAnswerScore,
+    us.DisplayName as QuestionOwner,
+    us.Reputation as OwnerReputation,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    us.ProfileViews,
+    us.ReputationRank,
+    lag(tq.Score) over (order by tq.CreationDate) as PrevQuestionScore,
+    lead(tq.Score) over (order by tq.CreationDate) as NextQuestionScore,
+    length(tq.Title) as TitleLength,
+    case 
+        when tq.ViewCount > 1000 then 'Popular'
+        when tq.ViewCount between 100 and 1000 then 'Average'
+        else 'Niche'
+    end as PopularityCategory,
+    array_length(string_to_array(tq.Tags, '><'), 1) as TagsCount
+from TopQuestionsWithAnswers tq
+left join DuplicateQuestionRelations dq on dq.DuplicateQuestionId = tq.QuestionId
+left join QuestionClosureDetails qc on qc.PostId = tq.QuestionId
+left join UserAnswerRanks ua on ua.OwnerUserId = tq.OwnerUserId
+left join UserScoreStats us on us.Id = tq.OwnerUserId
+where (qc.ClosedAt is null or qc.ClosedAt > now() - interval '1 year')
+  and ua.AnswersCount is not null
+order by tq.CreationDate desc, tq.Score desc
+limit 100;

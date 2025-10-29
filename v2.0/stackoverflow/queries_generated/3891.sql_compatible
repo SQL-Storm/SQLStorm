@@ -1,0 +1,107 @@
+WITH 
+user_base AS (
+    SELECT 
+        u.Id                                    AS user_id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.UpVotes,0) - COALESCE(u.DownVotes,0) AS net_votes,
+        u.CreationDate,
+        EXTRACT(YEAR FROM AGE(CAST('2024-10-01 12:34:56' AS timestamp), u.CreationDate)) AS years_on_site
+    FROM Users u
+),
+badge_agg AS (
+    SELECT 
+        b.UserId                               AS user_id,
+        COUNT(*)                               AS total_badges,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS gold_badges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS silver_badges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS bronze_badges,
+        STRING_AGG(DISTINCT b.Name, ';' ORDER BY b.Name) AS badge_list
+    FROM Badges b
+    GROUP BY b.UserId
+),
+activity AS (
+    SELECT 
+        p.OwnerUserId                         AS user_id,
+        MAX(p.CreationDate)                  AS last_post_date,
+        MAX(c.CreationDate)                  AS last_comment_date,
+        MAX(v.CreationDate)                  AS last_vote_date
+    FROM Posts p
+    LEFT JOIN Comments c   ON c.UserId = p.OwnerUserId
+    LEFT JOIN Votes v      ON v.UserId = p.OwnerUserId
+    GROUP BY p.OwnerUserId
+),
+user_tags AS (
+    SELECT 
+        p.OwnerUserId                         AS user_id,
+        tag,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId, tag) AS tag_usage
+    FROM (
+      SELECT p.OwnerUserId,
+             UNNEST(STRING_TO_ARRAY(TRIM(BOTH '<>' FROM p.Tags), '><')) AS tag
+      FROM Posts p
+      WHERE p.PostTypeId = 1
+        AND p.Tags IS NOT NULL
+    ) sub
+),
+top_tags AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS tag_rank
+    FROM Tags t
+    WHERE COALESCE(t.IsModeratorOnly, 0) = 0
+),
+reputation_velocity AS (
+    SELECT 
+        ub.user_id,
+        ub.reputation / NULLIF(ub.years_on_site,0) AS rep_per_year,
+        (SELECT COUNT(*) 
+         FROM Posts p2 
+         WHERE p2.OwnerUserId = ub.user_id 
+           AND p2.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '30 days') 
+         AS recent_posts_30d
+    FROM user_base ub
+),
+high_activity_or_gold AS (
+    SELECT user_id FROM activity
+    WHERE GREATEST(
+            EXTRACT(EPOCH FROM COALESCE(last_post_date, TIMESTAMP '1970-01-01')),
+            EXTRACT(EPOCH FROM COALESCE(last_comment_date, TIMESTAMP '1970-01-01')),
+            EXTRACT(EPOCH FROM COALESCE(last_vote_date, TIMESTAMP '1970-01-01'))
+          ) 
+          > EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '7 days'))
+    UNION
+    SELECT user_id FROM badge_agg
+    WHERE gold_badges > 0
+)
+SELECT 
+    ub.user_id,
+    ub.DisplayName,
+    ub.reputation,
+    ub.net_votes,
+    ub.years_on_site,
+    rv.rep_per_year,
+    rv.recent_posts_30d,
+    ba.total_badges,
+    ba.gold_badges,
+    ba.silver_badges,
+    ba.bronze_badges,
+    ba.badge_list,
+    COALESCE(a.last_post_date, a.last_comment_date, a.last_vote_date) AS most_recent_activity,
+    STRING_AGG(DISTINCT ut.tag, ', ' ORDER BY MAX(ut.tag_usage) DESC) AS top_user_tags,
+    STRING_AGG(DISTINCT tt.TagName, ', ' ORDER BY MIN(tt.tag_rank))   AS global_top_tags
+FROM user_base ub
+LEFT JOIN badge_agg ba          ON ba.user_id = ub.user_id
+LEFT JOIN activity a           ON a.user_id = ub.user_id
+LEFT JOIN reputation_velocity rv ON rv.user_id = ub.user_id
+LEFT JOIN user_tags ut         ON ut.user_id = ub.user_id
+LEFT JOIN top_tags tt          ON tt.tag_rank <= 5
+WHERE ub.user_id IN (SELECT user_id FROM high_activity_or_gold)
+GROUP BY 
+    ub.user_id, ub.DisplayName, ub.reputation, ub.net_votes,
+    ub.years_on_site, rv.rep_per_year, rv.recent_posts_30d,
+    ba.total_badges, ba.gold_badges, ba.silver_badges, ba.bronze_badges,
+    ba.badge_list, a.last_post_date, a.last_comment_date, a.last_vote_date
+ORDER BY rv.rep_per_year DESC NULLS LAST
+LIMIT 100;

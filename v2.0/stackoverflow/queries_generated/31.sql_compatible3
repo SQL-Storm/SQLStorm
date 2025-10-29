@@ -1,0 +1,314 @@
+WITH recent_users AS (
+  SELECT u.id AS user_id,
+         u.displayname,
+         u.reputation,
+         u.creationdate,
+         u.location,
+         COALESCE(NULLIF(TRIM(u.websiteurl), ''), 'N/A') AS websiteurl,
+         row_number() OVER (ORDER BY u.creationdate DESC, u.id DESC) AS rn_newest,
+         ntile(10) OVER (ORDER BY u.reputation DESC) AS rep_decile
+  FROM users u
+),
+badge_rollup AS (
+  SELECT b.userid,
+         count(*) AS total_badges,
+         sum(CASE WHEN b.class = 1 THEN 1 ELSE 0 END) AS gold_badges,
+         sum(CASE WHEN b.class = 2 THEN 1 ELSE 0 END) AS silver_badges,
+         sum(CASE WHEN b.class = 3 THEN 1 ELSE 0 END) AS bronze_badges,
+         min(b.date) AS first_badge_date,
+         max(b.date) AS last_badge_date
+  FROM badges b
+  GROUP BY b.userid
+),
+user_posts AS (
+  SELECT p.owneruserid AS user_id,
+         count(CASE WHEN p.posttypeid = 1 THEN 1 END) AS q_count,
+         count(CASE WHEN p.posttypeid = 2 THEN 1 END) AS a_count,
+         avg(NULLIF(p.score, 0)) AS avg_nonzero_score,
+         sum(CASE WHEN p.viewcount > 0 THEN p.viewcount ELSE 0 END) AS total_views,
+         max(p.creationdate) AS last_post_date
+  FROM posts p
+  WHERE p.owneruserid IS NOT NULL
+  GROUP BY p.owneruserid
+),
+accepted_answers AS (
+  SELECT a.owneruserid AS user_id,
+         count(*) AS accepted_count
+  FROM posts q
+  JOIN posts a
+    ON a.id = q.acceptedanswerid
+  WHERE q.posttypeid = 1
+    AND a.posttypeid = 2
+    AND a.owneruserid IS NOT NULL
+  GROUP BY a.owneruserid
+),
+comment_stats AS (
+  SELECT c.userid AS user_id,
+         count(*) AS comment_count,
+         avg(c.score) AS avg_comment_score,
+         max(c.creationdate) AS last_comment_date
+  FROM comments c
+  WHERE c.userid IS NOT NULL
+  GROUP BY c.userid
+),
+vote_stats AS (
+  SELECT v.userid AS user_id,
+         count(CASE WHEN v.votetypeid = 2 THEN 1 END) AS upvotes_cast,
+         count(CASE WHEN v.votetypeid = 3 THEN 1 END) AS downvotes_cast,
+         count(CASE WHEN v.votetypeid = 5 THEN 1 END) AS favorites_cast,
+         sum(COALESCE(v.bountyamount,0)) AS bounty_total_cast
+  FROM votes v
+  WHERE v.userid IS NOT NULL
+  GROUP BY v.userid
+),
+post_reactions AS (
+  SELECT p.owneruserid AS user_id,
+         count(CASE WHEN v.votetypeid = 2 THEN 1 END) AS upvotes_received,
+         count(CASE WHEN v.votetypeid = 3 THEN 1 END) AS downvotes_received,
+         count(CASE WHEN v.votetypeid = 1 THEN 1 END) AS accepts_received
+  FROM posts p
+  LEFT JOIN votes v
+    ON v.postid = p.id
+  WHERE p.owneruserid IS NOT NULL
+  GROUP BY p.owneruserid
+),
+question_tag_counts AS (
+  SELECT p.owneruserid AS user_id,
+         sum(cardinality(string_to_array(substring(p.tags, 2, length(p.tags)-2), '><'))) AS tag_token_count,
+         count(*) AS tagged_question_count
+  FROM posts p
+  WHERE p.posttypeid = 1
+    AND p.owneruserid IS NOT NULL
+    AND p.tags IS NOT NULL
+  GROUP BY p.owneruserid
+),
+closed_questions AS (
+  SELECT p.owneruserid AS user_id,
+         count(*) AS closed_q_count,
+         min(p.closeddate) AS first_closed_q_date
+  FROM posts p
+  WHERE p.posttypeid = 1
+    AND p.owneruserid IS NOT NULL
+    AND p.closeddate IS NOT NULL
+  GROUP BY p.owneruserid
+),
+duplicate_links AS (
+  SELECT p.owneruserid AS user_id,
+         count(*) AS dup_out_links
+  FROM postlinks pl
+  JOIN posts p ON p.id = pl.postid
+  WHERE pl.linktypeid = 3
+    AND p.owneruserid IS NOT NULL
+  GROUP BY p.owneruserid
+),
+edit_events AS (
+  SELECT ph.userid AS user_id,
+         count(CASE WHEN ph.posthistorytypeid IN (4,5,6,7,8,9,24) THEN 1 END) AS edit_events_count,
+         count(CASE WHEN ph.posthistorytypeid IN (10,11,12,13,14,15,19,20) THEN 1 END) AS mod_events_count,
+         max(ph.creationdate) AS last_ph_date
+  FROM posthistory ph
+  WHERE ph.userid IS NOT NULL
+  GROUP BY ph.userid
+),
+activity_span AS (
+  SELECT u.id AS user_id,
+         (SELECT min(p.creationdate) FROM posts p WHERE p.owneruserid = u.id) AS first_post_date,
+         (SELECT max(p.creationdate) FROM posts p WHERE p.owneruserid = u.id) AS last_post_date,
+         (SELECT min(c.creationdate) FROM comments c WHERE c.userid = u.id) AS first_comment_date,
+         (SELECT max(c.creationdate) FROM comments c WHERE c.userid = u.id) AS last_comment_date
+  FROM users u
+),
+user_quality AS (
+  SELECT u.id AS user_id,
+         CASE
+           WHEN COALESCE(up.upvotes_received,0) + COALESCE(up.downvotes_received,0) = 0 THEN NULL
+           ELSE round(100.0 * COALESCE(up.upvotes_received,0) / NULLIF(COALESCE(up.upvotes_received,0) + COALESCE(up.downvotes_received,0),0), 2)
+         END AS upvote_ratio_pct,
+         COALESCE(aa.accepted_count,0) AS accepted_answers,
+         COALESCE(uc.a_count,0) AS answers_authored,
+         CASE
+           WHEN COALESCE(uc.a_count,0) = 0 THEN NULL
+           ELSE round(COALESCE(aa.accepted_count,0) / NULLIF(uc.a_count,0), 4)
+         END AS accept_rate
+  FROM users u
+  LEFT JOIN post_reactions up ON up.user_id = u.id
+  LEFT JOIN accepted_answers aa ON aa.user_id = u.id
+  LEFT JOIN user_posts uc ON uc.user_id = u.id
+),
+ranks AS (
+  SELECT u.id AS user_id,
+         dense_rank() OVER (ORDER BY COALESCE(pr.upvotes_received,0) - COALESCE(pr.downvotes_received,0) DESC, u.reputation DESC, u.id) AS net_vote_rank,
+         dense_rank() OVER (ORDER BY COALESCE(aa.accepted_count,0) DESC, COALESCE(uc.a_count,0) DESC, u.id) AS accepted_rank,
+         percent_rank() OVER (ORDER BY COALESCE(uc.total_views,0) DESC) AS views_pct_rank
+  FROM users u
+  LEFT JOIN post_reactions pr ON pr.user_id = u.id
+  LEFT JOIN accepted_answers aa ON aa.user_id = u.id
+  LEFT JOIN user_posts uc ON uc.user_id = u.id
+),
+heavy_users AS (
+  SELECT ru.user_id
+  FROM recent_users ru
+  LEFT JOIN user_posts up ON up.user_id = ru.user_id
+  LEFT JOIN comment_stats cs ON cs.user_id = ru.user_id
+  WHERE COALESCE(up.q_count,0) + COALESCE(up.a_count,0) + COALESCE(cs.comment_count,0) >= 50
+),
+final_agg AS (
+  SELECT
+    ru.user_id,
+    ru.displayname,
+    ru.reputation,
+    ru.creationdate,
+    ru.location,
+    ru.websiteurl,
+    ru.rn_newest,
+    ru.rep_decile,
+    COALESCE(br.total_badges,0) AS total_badges,
+    COALESCE(br.gold_badges,0) AS gold_badges,
+    COALESCE(br.silver_badges,0) AS silver_badges,
+    COALESCE(br.bronze_badges,0) AS bronze_badges,
+    br.first_badge_date,
+    br.last_badge_date,
+    COALESCE(up.q_count,0) AS q_count,
+    COALESCE(up.a_count,0) AS a_count,
+    up.avg_nonzero_score,
+    COALESCE(up.total_views,0) AS total_views,
+    up.last_post_date,
+    COALESCE(aa.accepted_count,0) AS accepted_count,
+    COALESCE(cs.comment_count,0) AS comment_count,
+    cs.avg_comment_score,
+    cs.last_comment_date,
+    COALESCE(vs.upvotes_cast,0) AS upvotes_cast,
+    COALESCE(vs.downvotes_cast,0) AS downvotes_cast,
+    COALESCE(vs.favorites_cast,0) AS favorites_cast,
+    COALESCE(vs.bounty_total_cast,0) AS bounty_total_cast,
+    COALESCE(pr.upvotes_received,0) AS upvotes_received,
+    COALESCE(pr.downvotes_received,0) AS downvotes_received,
+    COALESCE(pr.accepts_received,0) AS accepts_received,
+    COALESCE(qt.tag_token_count,0) AS tag_token_count,
+    COALESCE(qt.tagged_question_count,0) AS tagged_question_count,
+    COALESCE(cq.closed_q_count,0) AS closed_q_count,
+    cq.first_closed_q_date,
+    COALESCE(dl.dup_out_links,0) AS dup_out_links,
+    COALESCE(ee.edit_events_count,0) AS edit_events_count,
+    COALESCE(ee.mod_events_count,0) AS mod_events_count,
+    ee.last_ph_date,
+    aq.upvote_ratio_pct,
+    aq.accepted_answers,
+    aq.answers_authored,
+    aq.accept_rate,
+    r.net_vote_rank,
+    r.accepted_rank,
+    r.views_pct_rank,
+    CASE
+      WHEN hu.user_id IS NOT NULL THEN TRUE
+      ELSE FALSE
+    END AS is_heavy_user,
+    up.last_post_date AS final_last_post_date
+  FROM recent_users ru
+  LEFT JOIN badge_rollup br ON br.userid = ru.user_id
+  LEFT JOIN user_posts up ON up.user_id = ru.user_id
+  LEFT JOIN accepted_answers aa ON aa.user_id = ru.user_id
+  LEFT JOIN comment_stats cs ON cs.user_id = ru.user_id
+  LEFT JOIN vote_stats vs ON vs.user_id = ru.user_id
+  LEFT JOIN post_reactions pr ON pr.user_id = ru.user_id
+  LEFT JOIN question_tag_counts qt ON qt.user_id = ru.user_id
+  LEFT JOIN closed_questions cq ON cq.user_id = ru.user_id
+  LEFT JOIN duplicate_links dl ON dl.user_id = ru.user_id
+  LEFT JOIN edit_events ee ON ee.user_id = ru.user_id
+  LEFT JOIN user_quality aq ON aq.user_id = ru.user_id
+  LEFT JOIN ranks r ON r.user_id = ru.user_id
+  LEFT JOIN heavy_users hu ON hu.user_id = ru.user_id
+),
+top_and_bottom_prep AS (
+  SELECT fa.*,
+         row_number() OVER (ORDER BY fa.reputation DESC, fa.total_views DESC, fa.total_badges DESC, fa.user_id) AS rn_desc,
+         row_number() OVER (ORDER BY fa.reputation ASC, fa.total_views ASC, fa.total_badges ASC, fa.user_id) AS rn_asc
+  FROM final_agg fa
+),
+top_and_bottom AS (
+  SELECT *
+  FROM top_and_bottom_prep
+  WHERE rn_desc <= 50 OR rn_asc <= 50
+),
+tag_mix AS (
+  SELECT p.owneruserid AS user_id,
+         count(CASE WHEN lower(p.tags) LIKE '%<python>%' THEN 1 END) AS py_qs,
+         count(CASE WHEN lower(p.tags) LIKE '%<java>%' THEN 1 END) AS java_qs,
+         count(CASE WHEN lower(p.tags) LIKE '%<javascript>%' THEN 1 END) AS js_qs
+  FROM posts p
+  WHERE p.posttypeid = 1
+    AND p.owneruserid IS NOT NULL
+  GROUP BY p.owneruserid
+)
+SELECT
+  fa.user_id,
+  COALESCE(NULLIF(fa.displayname, ''), ('user-' || CAST(fa.user_id AS varchar))) AS displayname,
+  fa.reputation,
+  fa.rep_decile,
+  fa.rn_newest,
+  fa.total_badges,
+  fa.gold_badges,
+  fa.silver_badges,
+  fa.bronze_badges,
+  fa.q_count,
+  fa.a_count,
+  fa.accepted_count,
+  fa.upvotes_received,
+  fa.downvotes_received,
+  fa.accepts_received,
+  fa.upvotes_cast,
+  fa.downvotes_cast,
+  fa.favorites_cast,
+  fa.total_views,
+  fa.closed_q_count,
+  fa.dup_out_links,
+  fa.edit_events_count,
+  fa.mod_events_count,
+  round(COALESCE(fa.avg_nonzero_score, 0)::numeric, 3) AS avg_nonzero_score,
+  -- cast views_pct_rank to numeric before rounding for compatibility
+  round(COALESCE(CAST(fa.views_pct_rank AS numeric), 0), 4) AS views_pct_rank,
+  COALESCE(fa.upvote_ratio_pct, 0) AS upvote_ratio_pct,
+  COALESCE(fa.accept_rate, 0) AS accept_rate,
+  CASE
+    WHEN (COALESCE(fa.upvotes_received,0) - COALESCE(fa.downvotes_received,0)) > 1000 THEN 'superb'
+    WHEN (COALESCE(fa.upvotes_received,0) - COALESCE(fa.downvotes_received,0)) BETWEEN 100 AND 1000 THEN 'great'
+    WHEN (COALESCE(fa.upvotes_received,0) - COALESCE(fa.downvotes_received,0)) BETWEEN 10 AND 99 THEN 'good'
+    WHEN (COALESCE(fa.upvotes_received,0) - COALESCE(fa.downvotes_received,0)) BETWEEN -9 AND 9 THEN 'neutral'
+    ELSE 'controversial'
+  END AS sentiment_bucket,
+  tm.py_qs,
+  tm.java_qs,
+  tm.js_qs,
+  CASE
+    WHEN COALESCE(tm.py_qs,0) > greatest(COALESCE(tm.java_qs,0), COALESCE(tm.js_qs,0)) THEN 'python-heavy'
+    WHEN COALESCE(tm.java_qs,0) > greatest(COALESCE(tm.py_qs,0), COALESCE(tm.js_qs,0)) THEN 'java-heavy'
+    WHEN COALESCE(tm.js_qs,0) > greatest(COALESCE(tm.py_qs,0), COALESCE(tm.java_qs,0)) THEN 'javascript-heavy'
+    ELSE 'mixed/other'
+  END AS tag_focus,
+  fa.is_heavy_user,
+  fa.net_vote_rank,
+  fa.accepted_rank,
+  COALESCE(TO_CHAR(fa.creationdate, 'YYYY-MM'), 'unknown') AS created_month,
+  COALESCE(NULLIF(TRIM(fa.location), ''), 'unspecified') AS location_norm
+FROM final_agg fa
+LEFT JOIN tag_mix tm ON tm.user_id = fa.user_id
+WHERE
+  (
+    fa.is_heavy_user
+    OR COALESCE(fa.gold_badges,0) >= 1
+    OR (fa.reputation >= 10000 AND COALESCE(fa.accept_rate,0) >= 0.2)
+    OR (COALESCE(fa.views_pct_rank,0) >= 0.99 AND fa.total_views > 0)
+  )
+  AND (
+    fa.final_last_post_date IS NULL
+    OR fa.final_last_post_date >= fa.creationdate
+  )
+  AND NOT (
+    fa.location ILIKE ANY (ARRAY['%bot%', '%test%', '%dummy%'])
+    AND fa.reputation < 100
+  )
+ORDER BY
+  fa.net_vote_rank,
+  fa.accepted_rank,
+  fa.user_id
+LIMIT 500;

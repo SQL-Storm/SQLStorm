@@ -1,0 +1,48 @@
+-- {"query": "6250.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-micro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 507} 
+
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    COUNT(DISTINCT v.PostId) AS TotalVotes,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id ELSE NULL END) AS TotalQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id ELSE NULL END) AS TotalAnswers,
+    MAX(p.Score) AS HighestScoredPost,
+    MIN(p.CreationDate) AS FirstPostDate,
+    AVG(p.ViewCount) AS AvgViewCount,
+    MAX(b.Date) AS LastBadgeEarned,
+    STRING_AGG(t.TagName, ', ') AS PopularTags
+FROM 
+    Users u
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Votes v ON u.Id = v.UserId
+LEFT JOIN 
+    (SELECT 
+         pt.Id AS PostId, 
+         STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), ''><<') AS TagArray
+     FROM 
+         Posts p
+     JOIN 
+         PostTypes pt ON p.PostTypeId = pt.Id
+     WHERE 
+         pt.Name = 'Question') q ON p.Id = q.PostId
+LEFT JOIN 
+    UNNEST(q.TagArray) AS t(TagName) 
+LEFT JOIN 
+    Tags t ON t.TagName = t.TagName
+WHERE 
+    u.Reputation > 10000
+    AND u.Id NOT IN (SELECT AccountId FROM Users WHERE AccountId IS NOT NULL)
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation, u.Location
+HAVING 
+    COUNT(DISTINCT p.Id) > 50
+ORDER BY 
+    u.Reputation DESC, TotalPosts DESC;

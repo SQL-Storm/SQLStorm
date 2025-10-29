@@ -1,0 +1,237 @@
+WITH TargetedUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.LastAccessDate,
+        'HighRep_PositiveVoteRatio' AS UserSegment
+    FROM Users AS u
+    LEFT JOIN (
+        SELECT
+            p.OwnerUserId AS PostOwnerId,
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesOnPosts,
+            SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesOnPosts
+        FROM Posts AS p
+        INNER JOIN Votes AS v ON p.Id = v.PostId
+        WHERE p.OwnerUserId IS NOT NULL
+        GROUP BY p.OwnerUserId
+    ) AS PostVotesAgg ON u.Id = PostVotesAgg.PostOwnerId
+    WHERE u.Reputation > 5000
+      AND u.AccountID IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.LastAccessDate
+    HAVING COALESCE(SUM(PostVotesAgg.TotalUpVotesOnPosts), 0) > COALESCE(SUM(PostVotesAgg.TotalDownVotesOnPosts), 0) * 1.5
+       AND (SELECT COUNT(DISTINCT p2.Id) FROM Posts p2 WHERE p2.OwnerUserId = u.Id AND p2.PostTypeId = 1) > 5
+       AND (SELECT COUNT(DISTINCT p3.Id) FROM Posts p3 WHERE p3.OwnerUserId = u.Id AND p3.PostTypeId = 2) > 5
+
+    UNION ALL
+
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.LastAccessDate,
+        'LowRep_ActiveCommenter' AS UserSegment
+    FROM Users AS u
+    LEFT JOIN Comments AS c ON u.Id = c.UserId
+    LEFT JOIN Badges AS b ON u.Id = b.UserId
+    WHERE u.Reputation <= 100
+      AND u.AccountID IS NOT NULL
+      AND c.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '6 months'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.LastAccessDate
+    HAVING COUNT(DISTINCT c.Id) > 100
+       AND COUNT(DISTINCT b.Id) > 10
+),
+UserActivityMetrics AS (
+    SELECT
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.UserSegment,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.Views AS TotalProfileViews,
+        u.UpVotes AS TotalGivenUpVotes,
+        u.DownVotes AS TotalGivenDownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPostsCreated,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsAsked,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersProvided,
+        SUM(COALESCE(p.Score, 0)) AS SumOfPostScores,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 1) AS AvgQuestionScore,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 2) AS AvgAnswerScore,
+        COUNT(DISTINCT c.Id) AS TotalCommentsAuthored,
+        COUNT(DISTINCT b.Id) AS TotalBadgesReceived,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+        MAX(p.LastActivityDate) AS LastPostActivityDate,
+        MAX(c.CreationDate) AS LastCommentActivityDate,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL THEN p.Id END) AS ClosedQuestionsCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN p.Id END) AS QuestionsWithAcceptedAnswers,
+        SUM(COALESCE(p.FavoriteCount, 0)) AS TotalFavoriteCountsOnPosts
+    FROM TargetedUsers AS tu
+    INNER JOIN Users AS u ON tu.UserId = u.Id
+    LEFT JOIN Posts AS p ON tu.UserId = p.OwnerUserId
+    LEFT JOIN Comments AS c ON tu.UserId = c.UserId
+    LEFT JOIN Badges AS b ON tu.UserId = b.UserId
+    GROUP BY
+        tu.UserId, tu.DisplayName, tu.Reputation, tu.UserSegment, u.CreationDate, u.LastAccessDate,
+        u.Views, u.UpVotes, u.DownVotes
+),
+PostEditAndVoteAnalysis AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(ph.Id) AS TotalHistoryEvents,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.PostId END) AS UniquePostsEdited,
+        COUNT(ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (4, 5, 6)) AS TotalEditsMade,
+        MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId IN (4, 5, 6)) AS LastEditDate,
+        ARRAY_AGG(DISTINCT ph_close.Comment) FILTER (WHERE ph_close.PostHistoryTypeId = 10 AND ph_close.Comment IS NOT NULL) AS DistinctCloseReasons,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesReceived,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesReceived,
+        SUM(CASE WHEN v.VoteTypeId = 1 THEN 1 ELSE 0 END) AS AcceptedAnswersReceived,
+        SUM(CASE WHEN v.VoteTypeId = 8 THEN v.BountyAmount ELSE 0 END) AS TotalBountyGiven,
+        SUM(CASE WHEN v.VoteTypeId = 9 THEN v.BountyAmount ELSE 0 END) AS TotalBountyReceived
+    FROM Posts AS p
+    LEFT JOIN PostHistory AS ph ON p.Id = ph.PostId
+    LEFT JOIN PostHistory AS ph_close ON p.Id = ph_close.PostId AND ph_close.PostHistoryTypeId = 10
+    LEFT JOIN Votes AS v ON p.Id = v.PostId
+    WHERE p.OwnerUserId IN (SELECT UserId FROM TargetedUsers)
+    GROUP BY p.OwnerUserId
+),
+UserTagComplexity AS (
+    SELECT
+        ut.UserId,
+        (SELECT ARRAY_AGG(tn ORDER BY tn_count DESC, tn) FROM (
+             SELECT TagName AS tn, TagCount AS tn_count
+             FROM (
+                 SELECT
+                     p.OwnerUserId AS UserId_inner,
+                     TRIM(tag_val) AS TagName,
+                     COUNT(p.Id) AS TagCount
+                 FROM Posts p
+                 CROSS JOIN LATERAL (
+                     SELECT UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><')) AS tag_val
+                 ) AS tags(tag_val)
+                 WHERE p.OwnerUserId IN (SELECT UserId FROM TargetedUsers)
+                   AND p.Tags IS NOT NULL
+                   AND LENGTH(p.Tags) > 2
+                 GROUP BY p.OwnerUserId, TRIM(tag_val)
+             ) t_inner
+             WHERE t_inner.UserId_inner = ut.UserId
+         ) top_tags LIMIT 3) AS Top3Tags,
+        AVG(LENGTH(ut.TagName)) AS AvgTagLength,
+        COUNT(DISTINCT ut.TagName) AS UniqueTagsUsed,
+        SUM(ut.TagCount) AS TotalTagUses
+    FROM (
+        SELECT
+            p.OwnerUserId AS UserId,
+            TRIM(tag_val) AS TagName,
+            COUNT(p.Id) AS TagCount
+        FROM Posts p
+        CROSS JOIN LATERAL (
+            SELECT UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><')) AS tag_val
+        ) AS tags(tag_val)
+        WHERE
+            p.OwnerUserId IN (SELECT UserId FROM TargetedUsers)
+            AND p.Tags IS NOT NULL
+            AND LENGTH(p.Tags) > 2
+            AND p.Tags LIKE '<%><%><%>'
+        GROUP BY p.OwnerUserId, TRIM(tag_val)
+    ) AS ut
+    GROUP BY ut.UserId
+),
+PostCommentSentiment AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        p.Id AS PostId,
+        (SELECT COUNT(c_sub.Id) FROM Comments AS c_sub WHERE c_sub.PostId = p.Id AND LOWER(c_sub.Text) LIKE '%great%') AS GreatCommentCount,
+        (SELECT COUNT(c_sub.Id) FROM Comments AS c_sub WHERE c_sub.PostId = p.Id AND LOWER(c_sub.Text) LIKE '%problem%') AS ProblemCommentCount
+    FROM Posts AS p
+    WHERE p.OwnerUserId IN (SELECT UserId FROM TargetedUsers)
+),
+AggregatedCommentSentiment AS (
+    SELECT
+        UserId,
+        SUM(GreatCommentCount) AS TotalGreatComments,
+        SUM(ProblemCommentCount) AS TotalProblemComments,
+        CAST(SUM(GreatCommentCount) AS NUMERIC) / NULLIF(SUM(GreatCommentCount) + SUM(ProblemCommentCount), 0) AS UserPostSentimentRatio
+    FROM PostCommentSentiment
+    GROUP BY UserId
+)
+SELECT
+    uam.UserId,
+    uam.DisplayName,
+    uam.Reputation,
+    uam.UserSegment,
+    uam.TotalProfileViews,
+    uam.QuestionsAsked,
+    uam.AnswersProvided,
+    uam.SumOfPostScores,
+    uam.TotalCommentsAuthored,
+    uam.GoldBadges,
+    uam.SilverBadges,
+    uam.BronzeBadges,
+    pea.TotalUpVotesReceived,
+    pea.TotalDownVotesReceived,
+    pea.AcceptedAnswersReceived,
+    pea.TotalBountyGiven,
+    pea.TotalBountyReceived,
+    utc.Top3Tags,
+    utc.AvgTagLength,
+    acs.TotalGreatComments,
+    acs.TotalProblemComments,
+    acs.UserPostSentimentRatio,
+    RANK() OVER (PARTITION BY uam.UserSegment,
+        CASE
+            WHEN uam.QuestionsAsked > 0 AND uam.AnswersProvided > 0 THEN 'Q&A User'
+            WHEN uam.QuestionsAsked > 0 THEN 'Questioner'
+            WHEN uam.AnswersProvided > 0 THEN 'Answerer'
+            ELSE 'Lurker'
+        END
+        ORDER BY uam.Reputation DESC, uam.SumOfPostScores DESC
+    ) AS ReputationRankByCategory,
+    (uam.GoldBadges * 1000 + uam.SilverBadges * 100 + uam.BronzeBadges * 10) AS WeightedBadgeScore,
+    CASE
+        WHEN uam.LastPostActivityDate IS NOT NULL AND uam.LastPostActivityDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '6 months') THEN 'Highly Active Post'
+        WHEN uam.LastCommentActivityDate IS NOT NULL AND uam.LastCommentActivityDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '6 months') THEN 'Highly Active Comment'
+        WHEN uam.LastAccessDate IS NOT NULL AND uam.LastAccessDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year') THEN 'Recently Accessed'
+        ELSE 'Inactive'
+    END AS DetailedActivityStatus,
+    (CAST(COALESCE(uam.SumOfPostScores, 0) AS NUMERIC) * 0.7
+        + COALESCE(uam.TotalCommentsAuthored, 0) * 0.1
+        + COALESCE(uam.TotalFavoriteCountsOnPosts, 0) * 0.2)
+    / NULLIF(uam.TotalPostsCreated + uam.TotalCommentsAuthored + COALESCE(uam.TotalFavoriteCountsOnPosts, 0), 0) AS WeightedEngagementRatio,
+    COALESCE(array_length(pea.DistinctCloseReasons, 1), 0) AS DistinctCloseReasonCount,
+    COALESCE(
+        CASE
+            WHEN ARRAY_TO_STRING(pea.DistinctCloseReasons, ', ') ILIKE '%duplicate%' THEN 'ExperiencedDuplicates'
+            WHEN ARRAY_TO_STRING(pea.DistinctCloseReasons, ', ') ILIKE '%off-topic%' THEN 'ExperiencedOffTopic'
+            ELSE NULL
+        END, 'NoSpecificCloseReasonExperience'
+    ) AS CloseReasonExperience,
+    COALESCE(
+        CASE
+            WHEN ARRAY_TO_STRING(utc.Top3Tags, ', ') ILIKE '%javascript%' OR ARRAY_TO_STRING(utc.Top3Tags, ', ') ILIKE '%node%' THEN 'JS/Node Dev'
+            WHEN ARRAY_TO_STRING(utc.Top3Tags, ', ') ILIKE '%python%' OR ARRAY_TO_STRING(utc.Top3Tags, ', ') ILIKE '%django%' THEN 'Python Dev'
+            WHEN ARRAY_TO_STRING(utc.Top3Tags, ', ') ILIKE '%c#%' OR ARRAY_TO_STRING(utc.Top3Tags, ', ') ILIKE '%dotnet%' THEN 'C#/.NET Dev'
+            ELSE 'Other Tech'
+        END, 'Undefined Tech Focus'
+    ) AS PrimaryTechFocus
+FROM
+    UserActivityMetrics AS uam
+LEFT JOIN
+    PostEditAndVoteAnalysis AS pea ON uam.UserId = pea.UserId
+LEFT JOIN
+    UserTagComplexity AS utc ON uam.UserId = utc.UserId
+LEFT JOIN
+    AggregatedCommentSentiment AS acs ON uam.UserId = acs.UserId
+WHERE
+    uam.Reputation > 50
+    AND uam.TotalBadgesReceived > 0
+    AND (uam.QuestionsAsked > 0 OR uam.AnswersProvided > 0)
+    AND (uam.TotalProfileViews IS NULL OR uam.TotalProfileViews > 100)
+    AND (uam.UserCreationDate < CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years' OR uam.Reputation > 1000)
+ORDER BY
+    uam.Reputation DESC,
+    WeightedEngagementRatio DESC,
+    ReputationRankByCategory
+LIMIT 500;

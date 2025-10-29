@@ -1,0 +1,131 @@
+with recursive RecursivePostRelations as (
+    select p.Id, p.Title, p.PostTypeId, p.OwnerUserId, 0 as Depth, cast(null as int) as RootPostId
+    from Posts p
+    where p.PostTypeId = 1
+  union all
+    select c.Id, c.Title, c.PostTypeId, c.OwnerUserId, r.Depth + 1, coalesce(r.RootPostId, r.Id)
+    from Posts c
+    join RecursivePostRelations r on c.ParentId = r.Id
+    where c.PostTypeId in (2, 3)
+),
+UserBadgeCounts as (
+    select 
+        u.Id as UserId,
+        count(distinct b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(distinct b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(distinct b.Id) filter (where b.Class = 3) as BronzeBadges
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    group by u.Id
+),
+PostScoreStats as (
+    select 
+        p.OwnerUserId,
+        count(*) as TotalPosts,
+        avg(p.Score) as AvgScore,
+        max(p.Score) as MaxScore,
+        min(p.Score) as MinScore,
+        sum(case when p.AcceptedAnswerId is not null then 1 else 0 end) as AcceptedAnswers
+    from Posts p
+    where p.OwnerUserId is not null
+    group by p.OwnerUserId
+),
+TagQuestions as (
+    select 
+        t.TagName,
+        count(distinct p.Id) as QuestionsWithTag,
+        avg(p.ViewCount) as AvgViews,
+        max(p.ViewCount) as MaxViews,
+        sum(p.Score) as TotalScore
+    from Tags t
+    join Posts p on p.PostTypeId = 1 and p.Tags like '%' || t.TagName || '%'
+    group by t.TagName
+),
+PostCommentsAndVotes as (
+    select 
+        p.Id as PostId,
+        count(distinct c.Id) as CommentCount,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+        coalesce(sum(case when v.VoteTypeId = 8 then v.BountyAmount else 0 end), 0) as TotalBounty
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+    left join Votes v on v.PostId = p.Id
+    group by p.Id
+),
+CloseOpenHistory as (
+    select 
+        ph.PostId,
+        max(case when ph.PostHistoryTypeId = 10 then ph.CreationDate end) as LastCloseDate,
+        max(case when ph.PostHistoryTypeId = 11 then ph.CreationDate end) as LastReopenDate
+    from PostHistory ph
+    group by ph.PostId
+),
+RankedUserPosts as (
+    select 
+        p.Id,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.CreationDate desc) as PostRank
+    from Posts p
+    where p.OwnerUserId is not null
+)
+select 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    ubc.GoldBadges, ubc.SilverBadges, ubc.BronzeBadges,
+    coalesce(ps.TotalPosts, 0) as TotalPosts,
+    coalesce(ps.AvgScore, 0) as AvgPostScore,
+    coalesce(ps.MaxScore, 0) as MaxPostScore,
+    coalesce(ps.MinScore, 0) as MinPostScore,
+    coalesce(ps.AcceptedAnswers, 0) as AcceptedAnswersCount,
+    qTags.TopTag,
+    qTags.TagQuestionCount,
+    qTags.TagAvgViews,
+    qTags.TagTotalScore,
+    pc.UpVotes,
+    pc.DownVotes,
+    pc.CommentCount,
+    pc.TotalBounty,
+    ph.LastCloseDate,
+    ph.LastReopenDate,
+    rposts.PostRank,
+    rposts.Id as TopPostId,
+    rposts.Score as TopPostScore,
+    case 
+      when rposts.Score > 100 then 'High scoring post'
+      when rposts.Score between 50 and 100 then 'Medium scoring post'
+      else 'Low scoring post or no posts'
+    end as TopPostScoreCategory,
+    -- calculating a complex string expression with NULL logic
+    concat_ws(' | ', 
+        'User created: ' || to_char(u.CreationDate, 'YYYY-MM-DD'),
+        coalesce('Location: ' || nullif(u.Location, ''), 'Location: Unknown'),
+        coalesce('Website: ' || nullif(u.WebsiteUrl, ''), 'No Website'),
+        concat('Rep/Views Ratio: ', 
+          case when u.Views > 0 then cast(round(cast(u.Reputation as numeric) / u.Views, 4) as text) else 'N/A' end)
+    ) as UserSummary
+from Users u
+left join UserBadgeCounts ubc on u.Id = ubc.UserId
+left join PostScoreStats ps on u.Id = ps.OwnerUserId
+left join (
+    select
+        p.OwnerUserId,
+        t.TagName as TopTag,
+        count(*) as TagQuestionCount,
+        avg(p.ViewCount) as TagAvgViews,
+        sum(p.Score) as TagTotalScore
+    from Posts p
+    join lateral (select unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) as TagName) t on true
+    group by p.OwnerUserId, t.TagName
+    order by count(*) desc
+    limit 1
+) qTags on qTags.OwnerUserId = u.Id
+left join RankedUserPosts rposts on rposts.OwnerUserId = u.Id and rposts.PostRank = 1
+left join PostCommentsAndVotes pc on pc.PostId = rposts.Id
+left join CloseOpenHistory ph on ph.PostId = rposts.Id
+where u.Reputation > 1000
+order by u.Reputation desc
+limit 100;

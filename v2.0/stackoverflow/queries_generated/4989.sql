@@ -1,0 +1,223 @@
+-- {"query": "4989.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2202} 
+
+WITH
+  PostScores AS (
+    SELECT
+      p.Id AS PostId,
+      p.OwnerUserId,
+      p.PostTypeId,
+      p.Score,
+      p.ViewCount,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      p.CreationDate,
+      p.ClosedDate,
+      CASE
+        WHEN p.ClosedDate IS NOT NULL THEN 1
+        ELSE 0
+      END AS IsClosed,
+      ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS RowNumByOwnerDesc,
+      AVG(CAST(p.Score AS DECIMAL(10, 2))) OVER (PARTITION BY p.OwnerUserId) AS AvgScoreByOwner,
+      COUNT(DISTINCT c.Id) OVER (PARTITION BY p.Id) AS CommentCountForPost,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+      LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostScore,
+      LEAD(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextPostScore
+    FROM Posts AS p
+    LEFT JOIN Votes AS v
+      ON p.Id = v.PostId
+    LEFT JOIN Comments AS c
+      ON p.Id = c.PostId
+    WHERE
+      p.OwnerUserId IS NOT NULL AND p.OwnerUserId <> -1 AND p.PostTypeId IN (1, 2)
+    GROUP BY
+      p.Id,
+      p.OwnerUserId,
+      p.PostTypeId,
+      p.Score,
+      p.ViewCount,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      p.CreationDate,
+      p.ClosedDate
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate AS UserCreationDate,
+      MAX(ps.CreationDate) AS LastPostCreationDate,
+      COUNT(DISTINCT ps.PostId) AS TotalPosts,
+      SUM(ps.Score) AS TotalScore,
+      AVG(ps.Score) AS AvgPostScore,
+      SUM(ps.ViewCount) AS TotalViews,
+      SUM(ps.AnswerCount) AS TotalAnswers,
+      SUM(ps.CommentCountForPost) AS TotalComments,
+      SUM(ps.FavoriteCount) AS TotalFavorites,
+      COUNT(DISTINCT CASE WHEN ps.IsClosed = 1 THEN ps.PostId ELSE NULL END) AS ClosedPosts,
+      SUM(CASE WHEN ps.UpVoteCount > ps.DownVoteCount THEN 1 ELSE 0 END) AS NetPositiveScorePosts,
+      MAX(ps.RowNumByOwnerDesc) AS MaxRowNumByOwnerDesc
+    FROM Users AS u
+    JOIN PostScores AS ps
+      ON u.Id = ps.OwnerUserId
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate
+  ),
+  BadgeCounts AS (
+    SELECT
+      UserId,
+      COUNT(CASE WHEN Class = 1 THEN 1 ELSE NULL END) AS GoldBadges,
+      COUNT(CASE WHEN Class = 2 THEN 1 ELSE NULL END) AS SilverBadges,
+      COUNT(CASE WHEN Class = 3 THEN 1 ELSE NULL END) AS BronzeBadges
+    FROM Badges
+    GROUP BY
+      UserId
+  ),
+  TopUsers AS (
+    SELECT
+      ua.UserId
+    FROM UserActivity AS ua
+    WHERE
+      ua.TotalPosts > 100 AND ua.Reputation > 10000
+    ORDER BY
+      ua.Reputation DESC,
+      ua.TotalScore DESC
+    LIMIT 50
+  ),
+  PostHistoryAnalysis AS (
+    SELECT
+      ph.PostId,
+      ph.PostHistoryTypeId,
+      COUNT(*) AS HistoryCount,
+      MAX(ph.CreationDate) AS LastHistoryDate
+    FROM PostHistory AS ph
+    WHERE
+      ph.PostHistoryTypeId IN (2, 5, 8) /* Body edits */
+    GROUP BY
+      ph.PostId,
+      ph.PostHistoryTypeId
+  )
+SELECT
+  -- User Information
+  ua.UserId,
+  ua.DisplayName,
+  ua.Reputation,
+  ua.UserCreationDate,
+  ua.LastPostCreationDate,
+  ua.TotalPosts,
+  ua.TotalScore,
+  ua.AvgPostScore,
+  ua.TotalViews,
+  ua.TotalAnswers,
+  ua.TotalComments,
+  ua.TotalFavorites,
+  ua.ClosedPosts,
+  ua.NetPositiveScorePosts,
+  -- Badge Information
+  COALESCE(bc.GoldBadges, 0) AS GoldBadges,
+  COALESCE(bc.SilverBadges, 0) AS SilverBadges,
+  COALESCE(bc.BronzeBadges, 0) AS BronzeBadges,
+  -- Post Aggregations (Joined from PostScores)
+  SUM(ps.Score) AS OverallScore,
+  AVG(ps.Score) AS AverageScore,
+  SUM(ps.ViewCount) AS TotalViewCount,
+  AVG(ps.ViewCount) AS AverageViewCount,
+  SUM(ps.CommentCountForPost) AS TotalCommentCountOnPosts,
+  AVG(ps.CommentCountForPost) AS AverageCommentCountOnPosts,
+  SUM(ps.FavoriteCount) AS TotalFavoriteCountOnPosts,
+  AVG(ps.FavoriteCount) AS AverageFavoriteCountOnPosts,
+  COUNT(DISTINCT ps.PostId) AS NumberOfPosts,
+  COUNT(DISTINCT CASE WHEN ps.IsClosed = 1 THEN ps.PostId ELSE NULL END) AS NumberOfClosedPosts,
+  SUM(ps.UpVoteCount) AS TotalUpVotes,
+  SUM(ps.DownVoteCount) AS TotalDownVotes,
+  -- Calculations and Expressions
+  CAST(SUM(ps.Score) AS FLOAT) / NULLIF(SUM(ps.ViewCount), 0) * 1000 AS ScorePer1kViews,
+  CASE
+    WHEN SUM(ps.Score) > 0 THEN 'Positive'
+    WHEN SUM(ps.Score) < 0 THEN 'Negative'
+    ELSE 'Neutral'
+  END AS ScoreSentiment,
+  ua.TotalPosts - ua.ClosedPosts AS OpenPosts,
+  ua.TotalPosts * 1.0 / (
+    ua.TotalScore + 1
+  ) AS PostsPerScore,
+  -- Outer Join Example (to ensure all top users are included even if they have no badges)
+  CASE
+    WHEN bc.UserId IS NULL THEN 'No Badges'
+    ELSE 'Has Badges'
+  END AS BadgeStatus,
+  -- CTEs and Window Functions (already incorporated within PostScores and UserActivity CTEs)
+  -- Subquery Example (implicit in the JOIN conditions and WHERE clauses)
+  -- String Expressions
+  LOWER(ua.DisplayName) AS LowercaseDisplayName,
+  SUBSTRING(ua.DisplayName FROM 1 FOR 3) AS FirstThreeCharsOfName,
+  -- NULL Logic
+  COALESCE(ua.TotalAnswers, 0) AS NonNullTotalAnswers,
+  CASE
+    WHEN ua.LastPostCreationDate IS NULL THEN 'Never Posted'
+    ELSE CAST(ua.LastPostCreationDate AS VARCHAR)
+  END AS LastPostDateString,
+  -- Set Operators (Demonstrative, not directly joining tables, but could be used for comparing distinct sets)
+  (
+    SELECT
+      COUNT(*)
+    FROM PostHistoryAnalysis AS pha
+    WHERE
+      pha.PostId IN (
+        SELECT
+          ps.PostId
+        FROM PostScores AS ps
+        WHERE
+          ps.OwnerUserId = ua.UserId
+      ) AND pha.PostHistoryTypeId = 2
+  ) AS InitialBodyEdits,
+  (
+    SELECT
+      COUNT(*)
+    FROM PostHistoryAnalysis AS pha
+    WHERE
+      pha.PostId IN (
+        SELECT
+          ps.PostId
+        FROM PostScores AS ps
+        WHERE
+          ps.OwnerUserId = ua.UserId
+      ) AND pha.PostHistoryTypeId = 5
+  ) AS EditedBodyEdits,
+  -- More complicated predicates/expressions/calculations
+  CASE
+    WHEN (
+      ua.TotalPosts > 500 AND ua.Reputation > 50000 AND bc.GoldBadges > 10
+    ) THEN 'High Contributor'
+    WHEN (
+      ua.TotalPosts > 100 AND ua.Reputation > 10000
+    ) THEN 'Active Contributor'
+    ELSE 'Standard Contributor'
+  END AS ContributorLevel,
+  (
+    ps.Score * 1.0 / NULLIF(ps.ViewCount, 0)
+  ) * 100 AS ScoreToViewRatio,
+  (
+    ps.NextPostScore - ps.PreviousPostScore
+  ) AS ScoreDifferenceWithAdjacentPosts
+FROM UserActivity AS ua
+JOIN PostScores AS ps
+  ON ua.UserId = ps.OwnerUserId
+LEFT JOIN BadgeCounts AS bc
+  ON ua.UserId = bc.UserId
+WHERE
+  ua.UserId IN (
+    SELECT
+      UserId
+    FROM TopUsers
+  ) AND ua.TotalPosts > 50 AND ps.Score > 0
+ORDER BY
+  ua.Reputation DESC,
+  ua.TotalScore DESC,
+  ps.Score DESC;

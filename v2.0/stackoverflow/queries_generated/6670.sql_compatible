@@ -1,0 +1,71 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.Title,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.OwnerUserId,
+        U.DisplayName,
+        U.Reputation,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.ViewCount DESC) AS rank
+    FROM 
+        Posts P
+    JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId IN (1, 2) AND P.Score > 0
+),
+BadgesSummary AS (
+    SELECT 
+        B.UserId,
+        COUNT(DISTINCT B.Id) AS total_badges,
+        SUM(B.Class) AS badge_points
+    FROM 
+        Badges B
+    GROUP BY 
+        B.UserId
+)
+SELECT 
+    RP.Id,
+    RP.Title,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.rank,
+    U.DisplayName,
+    U.Reputation,
+    B.total_badges,
+    B.badge_points,
+    CASE 
+        WHEN RP.rank <= 3 THEN 'Top'
+        WHEN RP.rank <= 10 THEN 'High'
+        ELSE 'Low'
+    END AS rank_status,
+    SUBSTRING(U.Location FROM 1 FOR 10) AS short_location,
+    CASE 
+        WHEN U.Reputation >= 10000 THEN 'Veteran'
+        WHEN U.Reputation >= 5000 THEN 'Experienced'
+        ELSE 'Newbie'
+    END AS reputation_level
+FROM 
+    RankedPosts RP
+LEFT JOIN 
+    Users U ON RP.OwnerUserId = U.Id
+LEFT JOIN 
+    BadgesSummary B ON RP.OwnerUserId = B.UserId
+GROUP BY
+    RP.Id,
+    RP.Title,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.rank,
+    RP.OwnerUserId,
+    U.DisplayName,
+    U.Reputation,
+    B.total_badges,
+    B.badge_points,
+    U.Location
+ORDER BY 
+    RP.rank, RP.Score DESC;

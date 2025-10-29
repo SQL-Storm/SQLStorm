@@ -1,0 +1,112 @@
+WITH UserStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.Location, 'Unknown') AS Location,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        SUM(p.Score) FILTER (WHERE p.PostTypeId = 1) AS QuestionScoreSum,
+        SUM(p.Score) FILTER (WHERE p.PostTypeId = 2) AS AnswerScoreSum,
+        COUNT(DISTINCT
+            CASE
+                WHEN p.PostTypeId = 1 AND p.Tags IS NOT NULL
+                THEN unnest(string_to_array(trim(both '<>' FROM p.Tags), '><'))
+            END) AS DistinctTagsUsed
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location
+),
+BadgeAgg AS (
+    SELECT
+        b.UserId,
+        COUNT(*) AS TotalBadges,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COUNT(*) FILTER (WHERE b.TagBased = 1) AS TagBasedBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+VoteStats AS (
+    SELECT
+        v.PostId,
+        SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS DownVotes
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY v.PostId
+),
+TopUsers AS (
+    SELECT
+        us.Id,
+        us.DisplayName,
+        us.Reputation,
+        us.QuestionCount,
+        us.AnswerCount,
+        us.QuestionScoreSum,
+        us.AnswerScoreSum,
+        us.DistinctTagsUsed,
+        COALESCE(ba.TotalBadges,0) AS TotalBadges,
+        COALESCE(ba.GoldBadges,0) AS GoldBadges,
+        COALESCE(ba.SilverBadges,0) AS SilverBadges,
+        COALESCE(ba.BronzeBadges,0) AS BronzeBadges,
+        COALESCE(ba.TagBasedBadges,0) AS TagBasedBadges,
+        ROW_NUMBER() OVER (ORDER BY us.Reputation DESC, us.AnswerCount DESC) AS Rank
+    FROM UserStats us
+    LEFT JOIN BadgeAgg ba ON ba.UserId = us.Id
+    WHERE us.Reputation > 10000
+)
+SELECT
+    tu.Rank,
+    tu.Id,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.QuestionCount,
+    tu.AnswerCount,
+    tu.QuestionScoreSum,
+    tu.AnswerScoreSum,
+    tu.DistinctTagsUsed,
+    tu.TotalBadges,
+    tu.GoldBadges,
+    tu.SilverBadges,
+    tu.BronzeBadges,
+    CASE
+        WHEN tu.AnswerCount = 0 THEN NULL
+        ELSE ROUND(
+            (SELECT CAST(COUNT(*) AS numeric)
+             FROM Posts p
+             WHERE p.OwnerUserId = tu.Id
+               AND p.PostTypeId = 2
+               AND p.Id = p.AcceptedAnswerId), 2)
+    END AS AcceptanceRate,
+    COALESCE((
+        SELECT STRING_AGG(DISTINCT tag.tag, ', ')
+        FROM Posts p
+        CROSS JOIN LATERAL unnest(string_to_array(trim(both '<>' FROM p.Tags), '><')) AS tag(tag)
+        JOIN Tags t ON t.TagName = tag.tag
+        WHERE p.OwnerUserId = tu.Id AND p.PostTypeId = 1
+    ), '') AS TopTags
+FROM TopUsers tu
+WHERE tu.Rank <= 50
+ORDER BY tu.Rank
+
+UNION ALL
+
+SELECT
+    CAST(NULL AS integer) AS Rank,
+    CAST(NULL AS integer) AS Id,
+    '--- Summary ---' AS DisplayName,
+    CAST(NULL AS bigint) AS Reputation,
+    SUM(tu.QuestionCount) AS QuestionCount,
+    SUM(tu.AnswerCount) AS AnswerCount,
+    SUM(tu.QuestionScoreSum) AS QuestionScoreSum,
+    SUM(tu.AnswerScoreSum) AS AnswerScoreSum,
+    COUNT(DISTINCT tu.Id) AS DistinctTagsUsed,
+    SUM(tu.TotalBadges) AS TotalBadges,
+    SUM(tu.GoldBadges) AS GoldBadges,
+    SUM(tu.SilverBadges) AS SilverBadges,
+    SUM(tu.BronzeBadges) AS BronzeBadges,
+    CAST(NULL AS numeric) AS AcceptanceRate,
+    CAST(NULL AS text) AS TopTags
+FROM TopUsers tu;

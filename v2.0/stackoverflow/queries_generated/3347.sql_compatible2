@@ -1,0 +1,97 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.CreationDate, CAST('1970-01-01' AS TIMESTAMP)) AS UserCreated,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS QuestionScoreSum,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS AnswerScoreSum,
+        COUNT(b.Id) AS BadgeCount,
+        MAX(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS HasGoldBadge,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS UpVoteCount,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS DownVoteCount
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+
+RecentActivity AS (
+    SELECT 
+        p.OwnerUserId AS UserId,
+        MAX(p.CreationDate) AS LastPostDate,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS RecentQuestions,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS RecentAnswers
+    FROM Posts p
+    WHERE p.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days')
+    GROUP BY p.OwnerUserId
+),
+
+TagSearch AS (
+    SELECT DISTINCT
+        u.Id AS UserId,
+        t.TagName,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY t.Count DESC) AS TagRank
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id
+    JOIN LATERAL (
+        SELECT UNNEST(string_to_array(TRIM(BOTH '[]' FROM p.Tags), '><')) AS rawTag
+    ) AS taglist ON TRUE
+    JOIN Tags t ON t.TagName = taglist.rawTag
+    WHERE p.Tags IS NOT NULL
+),
+
+Combined AS (
+    SELECT
+        us.Id,
+        us.DisplayName,
+        us.Reputation,
+        us.QuestionCount,
+        us.AnswerCount,
+        us.QuestionScoreSum,
+        us.AnswerScoreSum,
+        us.BadgeCount,
+        us.HasGoldBadge,
+        us.UpVoteCount,
+        us.DownVoteCount,
+        COALESCE(ra.LastPostDate, CAST('1970-01-01' AS TIMESTAMP)) AS LastPostDate,
+        COALESCE(ra.RecentQuestions, 0) AS RecentQuestions,
+        COALESCE(ra.RecentAnswers, 0) AS RecentAnswers,
+        COALESCE(ts.TagName, 'none') AS TopTag,
+        ts.TagRank
+    FROM UserStats us
+    LEFT JOIN RecentActivity ra ON ra.UserId = us.Id
+    LEFT JOIN TagSearch ts ON ts.UserId = us.Id AND ts.TagRank = 1
+)
+
+SELECT *
+FROM Combined
+WHERE (Reputation > 10000 OR HasGoldBadge = 1)
+  AND (QuestionCount + AnswerCount) > 0
+  AND (TopTag IS NOT NULL AND TopTag <> 'none')
+ORDER BY Reputation DESC NULLS LAST
+LIMIT 100
+
+UNION ALL
+
+SELECT 
+    CAST(NULL AS INTEGER) AS Id,
+    CAST(NULL AS VARCHAR) AS DisplayName,
+    CAST(NULL AS INTEGER) AS Reputation,
+    CAST(NULL AS INTEGER) AS QuestionCount,
+    CAST(NULL AS INTEGER) AS AnswerCount,
+    CAST(NULL AS INTEGER) AS QuestionScoreSum,
+    CAST(NULL AS INTEGER) AS AnswerScoreSum,
+    CAST(NULL AS INTEGER) AS BadgeCount,
+    CAST(NULL AS INTEGER) AS HasGoldBadge,
+    CAST(NULL AS INTEGER) AS UpVoteCount,
+    CAST(NULL AS INTEGER) AS DownVoteCount,
+    CAST(NULL AS TIMESTAMP) AS LastPostDate,
+    CAST(NULL AS INTEGER) AS RecentQuestions,
+    CAST(NULL AS INTEGER) AS RecentAnswers,
+    CAST(NULL AS VARCHAR) AS TopTag,
+    CAST(NULL AS INTEGER) AS TagRank
+WHERE FALSE;

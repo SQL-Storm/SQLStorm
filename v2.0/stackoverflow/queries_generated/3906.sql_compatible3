@@ -1,0 +1,205 @@
+WITH
+    recent_posts AS (
+        SELECT
+            p.Id                          AS PostId,
+            p.OwnerUserId                 AS OwnerUserId,
+            p.PostTypeId,
+            p.CreationDate,
+            p.Score,
+            p.ViewCount,
+            COALESCE(p.Tags, '')          AS TagsRaw,
+            CASE
+                WHEN p.Tags IS NULL THEN 0
+                ELSE (LENGTH(p.Tags) - LENGTH(REPLACE(p.Tags, '><', ''))) / 2 + 1
+            END                          AS TagCount
+        FROM Posts p
+        WHERE p.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '90 days'
+    ),
+
+    recent_comments AS (
+        SELECT
+            c.PostId,
+            SUM(CASE WHEN c.Score > 0 THEN 1 ELSE 0 END)    AS PositiveComments,
+            SUM(CASE WHEN c.Score <= 0 THEN 1 ELSE 0 END)   AS NonPositiveComments,
+            MAX(c.CreationDate)                             AS LastCommentDate
+        FROM Comments c
+        WHERE c.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '90 days'
+        GROUP BY c.PostId
+    ),
+
+    recent_votes AS (
+        SELECT
+            v.PostId,
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+            SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS Favorites,
+            MAX(v.CreationDate)                               AS LastVoteDate
+        FROM Votes v
+        WHERE v.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '90 days'
+        GROUP BY v.PostId
+    ),
+
+    recent_badges AS (
+        SELECT
+            b.UserId,
+            SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+            SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+            SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+            MAX(b.Date)                         AS LastBadgeDate
+        FROM Badges b
+        WHERE b.Date >= CAST('2024-10-01' AS DATE) - INTERVAL '90 days'
+        GROUP BY b.UserId
+    ),
+
+    user_stats AS (
+        SELECT
+            u.Id                              AS UserId,
+            u.DisplayName,
+            u.Reputation,
+            COALESCE(rp.PostCount, 0)         AS RecentPostCount,
+            COALESCE(rc.PositiveCommentsSum,0) + COALESCE(rc.NonPositiveCommentsSum,0) AS RecentCommentCount,
+            COALESCE(rv.UpVotesSum,0)         AS RecentUpVotes,
+            COALESCE(rv.DownVotesSum,0)       AS RecentDownVotes,
+            COALESCE(rb.GoldBadges,0)         AS RecentGoldBadges,
+            COALESCE(rb.SilverBadges,0)       AS RecentSilverBadges,
+            COALESCE(rb.BronzeBadges,0)       AS RecentBronzeBadges,
+            GREATEST(
+                COALESCE(rp.LastPostDate, TIMESTAMP '1970-01-01 00:00:00'),
+                COALESCE(rc.LastCommentDate, TIMESTAMP '1970-01-01 00:00:00'),
+                COALESCE(rv.LastVoteDate, TIMESTAMP '1970-01-01 00:00:00'),
+                COALESCE(rb.LastBadgeDate, TIMESTAMP '1970-01-01 00:00:00')
+            )                                 AS LastActivityDate
+        FROM Users u
+        LEFT JOIN (
+            SELECT
+                OwnerUserId,
+                COUNT(*)                         AS PostCount,
+                MAX(CreationDate)                AS LastPostDate
+            FROM recent_posts
+            GROUP BY OwnerUserId
+        ) rp ON rp.OwnerUserId = u.Id
+        LEFT JOIN (
+            SELECT
+                p.OwnerUserId,
+                SUM(COALESCE(rc.PositiveComments,0))    AS PositiveCommentsSum,
+                SUM(COALESCE(rc.NonPositiveComments,0)) AS NonPositiveCommentsSum,
+                MAX(rc.LastCommentDate)                 AS LastCommentDate
+            FROM recent_posts p
+            LEFT JOIN recent_comments rc ON rc.PostId = p.PostId
+            GROUP BY p.OwnerUserId
+        ) rc ON rc.OwnerUserId = u.Id
+        LEFT JOIN (
+            SELECT
+                p.OwnerUserId,
+                SUM(COALESCE(rv.UpVotes,0))     AS UpVotesSum,
+                SUM(COALESCE(rv.DownVotes,0))   AS DownVotesSum,
+                MAX(rv.LastVoteDate)            AS LastVoteDate
+            FROM recent_posts p
+            LEFT JOIN recent_votes rv ON rv.PostId = p.PostId
+            GROUP BY p.OwnerUserId
+        ) rv ON rv.OwnerUserId = u.Id
+        LEFT JOIN recent_badges rb ON rb.UserId = u.Id
+    ),
+
+    tag_popularity AS (
+        SELECT
+            tag AS Tag,
+            COUNT(*) AS RecentUseCount
+        FROM (
+            SELECT
+                p.PostId,
+                TRIM(BOTH '<' FROM chunk) AS tag
+            FROM recent_posts p,
+            LATERAL (
+                SELECT REGEXP_SPLIT_TO_TABLE(REGEXP_REPLACE(p.TagsRaw, '^>|<$', ''), '><') AS chunk
+            ) s
+            WHERE p.TagsRaw <> ''
+        ) t
+        GROUP BY tag
+    ),
+
+    top_tags AS (
+        SELECT
+            Tag,
+            RecentUseCount,
+            ROW_NUMBER() OVER (ORDER BY RecentUseCount DESC, Tag) AS TagRank
+        FROM tag_popularity
+        ORDER BY RecentUseCount DESC
+        LIMIT 10
+    ),
+
+    gold_or_active_users AS (
+        SELECT UserId FROM recent_badges WHERE GoldBadges > 0
+        UNION
+        SELECT OwnerUserId AS UserId FROM recent_posts GROUP BY OwnerUserId HAVING COUNT(*) >= 5
+    ),
+
+    user_latest_title AS (
+        SELECT
+            u.Id AS UserId,
+            (SELECT p.Title
+             FROM Posts p
+             WHERE p.OwnerUserId = u.Id
+               AND p.CreationDate = (
+                   SELECT MAX(CreationDate) FROM Posts WHERE OwnerUserId = u.Id
+               )
+             LIMIT 1) AS LatestTitle
+        FROM Users u
+    ),
+
+    final_report AS (
+        SELECT
+            us.UserId,
+            us.DisplayName,
+            us.Reputation,
+            us.RecentPostCount,
+            us.RecentCommentCount,
+            COALESCE(us.RecentUpVotes,0)    AS RecentUpVotes,
+            COALESCE(us.RecentDownVotes,0)  AS RecentDownVotes,
+            us.RecentGoldBadges,
+            us.RecentSilverBadges,
+            us.RecentBronzeBadges,
+            us.LastActivityDate,
+            ul.LatestTitle,
+            CASE
+                WHEN us.RecentGoldBadges > 0 THEN 'Gold'
+                WHEN us.RecentSilverBadges > 0 THEN 'Silver'
+                WHEN us.RecentBronzeBadges > 0 THEN 'Bronze'
+                ELSE 'None'
+            END AS HighestBadgeClass,
+            COALESCE((
+                SELECT STRING_AGG(t.Tag, ', ' ORDER BY t.RecentUseCount DESC, t.Tag)
+                FROM top_tags t
+                WHERE t.TagRank <= 3
+            ), '(no top tags)') AS TopThreeTags
+        FROM user_stats us
+        INNER JOIN gold_or_active_users gau ON gau.UserId = us.UserId
+        LEFT JOIN user_latest_title ul ON ul.UserId = us.UserId
+        WHERE us.LastActivityDate >= CAST('2024-10-01' AS DATE) - INTERVAL '30 days'
+    )
+
+SELECT
+    fr.UserId,
+    fr.DisplayName,
+    fr.Reputation,
+    fr.RecentPostCount,
+    fr.RecentCommentCount,
+    fr.RecentUpVotes,
+    fr.RecentDownVotes,
+    fr.RecentGoldBadges,
+    fr.RecentSilverBadges,
+    fr.RecentBronzeBadges,
+    fr.LastActivityDate,
+    fr.LatestTitle,
+    fr.HighestBadgeClass,
+    fr.TopThreeTags,
+    (fr.RecentPostCount * 4
+     + fr.RecentCommentCount * 2
+     + fr.RecentUpVotes * 3
+     - fr.RecentDownVotes
+     + fr.RecentGoldBadges * 10
+     + fr.RecentSilverBadges * 5
+     + fr.RecentBronzeBadges * 2) AS ActivityScore
+FROM final_report fr
+ORDER BY ActivityScore DESC, fr.Reputation DESC
+LIMIT 100;

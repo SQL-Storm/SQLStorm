@@ -1,0 +1,136 @@
+WITH
+  RankedPostEdits AS (
+    SELECT
+      ph.PostId,
+      ph.UserId,
+      ph.CreationDate AS EditDate,
+      ph.PostHistoryTypeId,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6)
+  ),
+  UserContributionSummary AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+      COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+      SUM(COALESCE(p.Score, 0)) AS TotalScore,
+      COUNT(DISTINCT b.Id) AS BadgeCount,
+      MAX(p.LastActivityDate) AS LastPostActivityDate
+    FROM Users u
+    LEFT JOIN Posts p
+      ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b
+      ON u.Id = b.UserId
+    GROUP BY
+      u.Id,
+      u.DisplayName
+  ),
+  QuestionWithAcceptedAnswer AS (
+    SELECT
+      q.Id AS QuestionId,
+      q.Title AS QuestionTitle,
+      q.CreationDate AS QuestionCreationDate,
+      q.OwnerUserId AS QuestionOwnerUserId,
+      a.Id AS AcceptedAnswerId,
+      a.OwnerUserId AS AcceptedAnswerOwnerUserId,
+      a.CreationDate AS AcceptedAnswerCreationDate,
+      (CAST(julianday(a.CreationDate) AS DOUBLE) - CAST(julianday(q.CreationDate) AS DOUBLE)) * 24.0 * 60.0 AS TimeToAcceptedAnswerMinutes
+    FROM Posts q
+    JOIN Posts a
+      ON q.AcceptedAnswerId = a.Id
+    WHERE
+      q.PostTypeId = 1
+      AND q.AcceptedAnswerId IS NOT NULL
+  )
+SELECT
+  q.QuestionId,
+  q.QuestionTitle,
+  q.QuestionCreationDate,
+  q.TimeToAcceptedAnswerMinutes,
+  q.AcceptedAnswerCreationDate,
+  qus.DisplayName AS QuestionOwnerDisplayName,
+  qaa.DisplayName AS AcceptedAnswerOwnerDisplayName,
+  qaa.TotalScore AS AcceptedAnswerOwnerTotalScore,
+  qaa.BadgeCount AS AcceptedAnswerOwnerBadgeCount,
+  (
+    SELECT
+      AVG(COALESCE(a2.Score, 0))
+    FROM Posts a2
+    WHERE
+      a2.ParentId = q.QuestionId
+      AND a2.Id <> q.AcceptedAnswerId
+  ) AS AverageScoreOfOtherAnswers,
+  CASE
+    WHEN q.QuestionOwnerUserId = q.AcceptedAnswerOwnerUserId THEN 'OwnerAnsweredOwn'
+    ELSE 'OwnerDidNotAnswer'
+  END AS OwnerAnsweredOwnStatus,
+  (
+    SELECT
+      rpe.EditDate
+    FROM RankedPostEdits rpe
+    WHERE
+      rpe.PostId = q.QuestionId
+      AND rpe.UserId = q.QuestionOwnerUserId
+      AND rpe.rn = 1
+  ) AS LatestQuestionEditDateByOwner,
+  (
+    SELECT
+      rpe.EditDate
+    FROM RankedPostEdits rpe
+    WHERE
+      rpe.PostId = q.AcceptedAnswerId
+      AND rpe.UserId = q.AcceptedAnswerOwnerUserId
+      AND rpe.rn = 1
+  ) AS LatestAnswerEditDateByOwner,
+  (
+    SELECT
+      COUNT(a3.Id)
+    FROM Posts a3
+    JOIN Users u3
+      ON a3.OwnerUserId = u3.Id
+    WHERE
+      a3.ParentId = q.QuestionId
+      AND u3.Reputation > 1000
+  ) AS HighReputationAnswerCount,
+  (
+    SELECT
+      COUNT(DISTINCT u4.Id)
+    FROM Users u4
+    WHERE
+      u4.Id IN (q.QuestionOwnerUserId, q.AcceptedAnswerOwnerUserId)
+  ) AS DistinctUsersInvolved,
+  CASE
+    WHEN q.AcceptedAnswerId IS NULL
+    OR q.AcceptedAnswerOwnerUserId IS NULL
+    OR q.QuestionOwnerUserId IS NULL THEN 'IncompleteData'
+    ELSE 'CompleteData'
+  END AS DataCompletenessStatus
+FROM QuestionWithAcceptedAnswer q
+LEFT JOIN UserContributionSummary qus
+  ON q.QuestionOwnerUserId = qus.UserId
+LEFT JOIN UserContributionSummary qaa
+  ON q.AcceptedAnswerOwnerUserId = qaa.UserId
+WHERE
+  q.TimeToAcceptedAnswerMinutes BETWEEN 1 AND 10000
+  AND q.QuestionOwnerUserId <> q.AcceptedAnswerOwnerUserId
+  AND q.QuestionTitle NOT LIKE '%How do I%'
+  AND q.QuestionCreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '5' YEAR)
+GROUP BY
+  q.QuestionId,
+  q.QuestionTitle,
+  q.QuestionCreationDate,
+  q.TimeToAcceptedAnswerMinutes,
+  q.AcceptedAnswerCreationDate,
+  q.QuestionOwnerUserId,
+  q.AcceptedAnswerOwnerUserId,
+  qus.DisplayName,
+  qaa.DisplayName,
+  qaa.TotalScore,
+  qaa.BadgeCount
+HAVING
+  COUNT(DISTINCT q.QuestionId) > 5
+ORDER BY
+  q.TimeToAcceptedAnswerMinutes ASC,
+  q.QuestionCreationDate DESC;

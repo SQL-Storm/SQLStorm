@@ -1,0 +1,272 @@
+with
+params as (
+  select
+    cast('2024-10-01 12:34:56' as timestamp) - interval '365 days' as since_date,
+    cast(0.05 as double precision) as top_fraction
+),
+user_activity as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    coalesce(u.location, 'Unknown') as location,
+    sum(case when p.posttypeid in (1,2) and p.creationdate >= params.since_date then 1 else 0 end) as posts_last_year,
+    count(distinct case when c.creationdate >= params.since_date then c.id end) as comments_last_year,
+    sum(case when v.creationdate >= params.since_date then (case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end) else 0 end) as net_votes_last_year,
+    count(*) filter (where b.class = 1) as gold_badges,
+    count(*) filter (where b.class = 2) as silver_badges,
+    count(*) filter (where b.class = 3) as bronze_badges
+  from users u
+  left join posts p on p.owneruserid = u.id
+  left join comments c on c.userid = u.id
+  left join votes v on v.userid = u.id
+  left join badges b on b.userid = u.id
+  cross join params
+  group by u.id, u.displayname, u.reputation, u.creationdate, u.location, params.since_date
+),
+user_ranks as (
+  select
+    ua.*,
+    percent_rank() over (order by coalesce(ua.net_votes_last_year,0)) as pr_net_votes,
+    percent_rank() over (order by coalesce(ua.posts_last_year,0)) as pr_posts,
+    ntile(10) over (order by coalesce(ua.reputation,0) desc) as rep_decile
+  from user_activity ua
+),
+post_engagement as (
+  select
+    p.id as post_id,
+    p.posttypeid,
+    p.owneruserid,
+    p.parentid,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.answercount,
+    p.commentcount,
+    p.title,
+    p.tags,
+    exists (
+      select 1
+      from posthistory ph
+      where ph.postid = p.id
+        and ph.posthistorytypeid in (5,6,24)
+        and ph.creationdate >= p.creationdate
+        and ph.creationdate < p.creationdate + interval '2 days'
+    ) as edited_early,
+    (
+      select count(*)
+      from votes v
+      where v.postid = p.id
+        and v.votetypeid in (2,3)
+    ) as total_votes,
+    (
+      select count(*)
+      from postlinks pl
+      where pl.postid = p.id and pl.linktypeid = 3
+    ) as dup_links_out,
+    (
+      select count(*)
+      from postlinks pl
+      where pl.relatedpostid = p.id and pl.linktypeid = 3
+    ) as dup_links_in
+  from posts p
+),
+tag_expansion as (
+  -- expand tags without LATERAL by using string functions and a numbers table approach
+  select
+    p.id as post_id,
+    trim(x.tag) as tagname,
+    p.posttypeid,
+    p.creationdate
+  from posts p
+  cross join params
+  join (
+    -- generate sequence of possible tag positions up to a reasonable max, e.g., 20 tags per post
+    select generate_series(1,20) as idx
+  ) s on true
+  cross join lateral (
+    select
+      -- attempt to extract idx-th tag from >< separated tags string using regexp_split_to_table concept
+      (regexp_split_to_array(substring(p.tags from 2 for char_length(p.tags)-2), '><'))[s.idx] as tag
+  ) x on true
+  where p.tags is not null
+),
+tag_perf as (
+  select
+    t.tagname,
+    count(*) as q_count,
+    avg(p.score) as avg_score,
+    avg(coalesce(p.viewcount,0)) as avg_views,
+    avg(coalesce(p.answercount,0)) as avg_answers,
+    sum(case when pe.edited_early then 1 else 0 end) / nullif(count(*),0) as pct_edited_early
+  from posts p
+  join post_engagement pe on pe.post_id = p.id
+  join params on p.creationdate >= params.since_date and p.posttypeid = 1
+  -- simpler tag split using regexp_split_to_table if available; fallback to tag_expansion
+  left join lateral (
+    select regexp_split_to_table(substring(p.tags, 2, char_length(p.tags)-2), '><') as tagname
+  ) t1 on true
+  left join (
+    select post_id, tagname from tag_expansion
+  ) t on t.post_id = p.id and (t1.tagname is null and t.tagname is not null or t1.tagname = t.tagname)
+  group by t.tagname
+),
+top_tags as (
+  select tp.*,
+         row_number() over (order by (coalesce(tp.avg_score,0) * 1.0) + (coalesce(tp.avg_views,0) / 1000.0) desc) as rn
+  from tag_perf tp
+  where tp.q_count >= 5
+),
+candidate_questions as (
+  select
+    p.id as question_id,
+    p.title,
+    p.creationdate,
+    pe.score,
+    pe.viewcount,
+    pe.answercount,
+    pe.total_votes,
+    pe.dup_links_out,
+    pe.dup_links_in,
+    pe.edited_early,
+    ua.user_id,
+    ua.displayname,
+    ur.rep_decile,
+    t.tagname,
+    tt.avg_score as tag_avg_score,
+    tt.avg_views as tag_avg_views
+  from posts p
+  join post_engagement pe on pe.post_id = p.id and p.posttypeid = 1
+  cross join params
+  left join lateral (
+    select regexp_split_to_table(substring(p.tags, 2, char_length(p.tags)-2), '><') as tagname
+  ) t on true
+  join top_tags tt on tt.tagname = t.tagname
+  join params par on true
+  where p.creationdate >= par.since_date
+    and tt.rn <= greatest(10, (select ceil(count(*) * (select top_fraction from params)) from top_tags)
+    )
+  left join users u on u.id = p.owneruserid
+  left join user_ranks ur on ur.user_id = u.id
+  left join user_activity ua on ua.user_id = u.id
+),
+answer_metrics as (
+  select
+    a.parentid as question_id,
+    count(*) as answers_count,
+    min(a.creationdate) - q.creationdate as time_to_first_answer,
+    avg(a.score) as avg_answer_score,
+    max(a.score) as max_answer_score,
+    count(*) filter (where a.id = q.acceptedanswerid) as accepted_present
+  from posts a
+  join posts q on q.id = a.parentid
+  where a.posttypeid = 2
+    and q.id in (select question_id from candidate_questions)
+  group by a.parentid, q.creationdate, q.acceptedanswerid
+),
+question_flags as (
+  select
+    q.id as question_id,
+    bool_or(coalesce(pl.linktypeid,0) = 3) as has_dup_link,
+    max(case when ph.posthistorytypeid = 10 then cast(ph.comment as integer) end) as close_reason_id,
+    count(*) filter (where ph.posthistorytypeid = 10) as close_events
+  from posts q
+  left join postlinks pl on pl.postid = q.id
+  left join posthistory ph on ph.postid = q.id and ph.posthistorytypeid in (10)
+  where q.id in (select question_id from candidate_questions)
+  group by q.id
+),
+scored as (
+  select
+    cq.question_id,
+    cq.title,
+    cq.creationdate,
+    cq.score,
+    cq.viewcount,
+    cq.answercount,
+    cq.total_votes,
+    cq.dup_links_out,
+    cq.dup_links_in,
+    cq.edited_early,
+    cq.displayname,
+    cq.rep_decile,
+    cq.tagname,
+    am.answers_count,
+    am.time_to_first_answer,
+    am.avg_answer_score,
+    am.max_answer_score,
+    qf.has_dup_link,
+    qf.close_reason_id,
+    qf.close_events,
+    (
+      coalesce(cq.viewcount,0) / 500.0
+      + coalesce(cq.score,0) * 1.5
+      + coalesce(am.avg_answer_score,0)
+      + coalesce(am.answers_count,0) * 0.5
+      + case when cq.edited_early then 0.5 else 0 end
+      - coalesce(cq.dup_links_in,0) * 2.0
+      - case when qf.has_dup_link then 3.0 else 0.0 end
+      - coalesce(qf.close_events,0) * 1.0
+    ) as perf_score,
+    case
+      when am.time_to_first_answer is null then 0.0
+      when am.time_to_first_answer <= interval '1 hour' then 1.0
+      when am.time_to_first_answer <= interval '1 day' then 0.5
+      when am.time_to_first_answer <= interval '7 days' then 0.2
+      else -0.2
+    end as response_bonus
+  from candidate_questions cq
+  left join answer_metrics am on am.question_id = cq.question_id
+  left join question_flags qf on qf.question_id = cq.question_id
+),
+ranked as (
+  select
+    s.*,
+    (s.perf_score + s.response_bonus) as final_score,
+    row_number() over (order by (s.perf_score + s.response_bonus) desc) as global_rank,
+    row_number() over (partition by s.tagname order by (s.perf_score + s.response_bonus) desc) as tag_rank,
+    dense_rank() over (order by coalesce(s.rep_decile, 10), (s.perf_score + s.response_bonus) desc) as decile_rank
+  from scored s
+),
+close_reasons as (
+  select
+    crt.id as close_reason_id,
+    crt.name as close_reason_name
+  from closereasontypes crt
+)
+select
+  r.global_rank,
+  r.tag_rank,
+  r.decile_rank,
+  r.final_score,
+  r.question_id,
+  coalesce(nullif(trim(regexp_replace(r.title, '\s+', ' ', 'g')), ''), '[no title]') as normalized_title,
+  r.tagname as tag,
+  r.displayname as owner_displayname,
+  r.rep_decile,
+  r.score,
+  r.viewcount,
+  r.answercount,
+  r.total_votes,
+  r.edited_early,
+  r.has_dup_link,
+  r.dup_links_in,
+  r.dup_links_out,
+  r.close_events,
+  coalesce(cr.close_reason_name, 'Unknown/Not Closed') as close_reason_name,
+  r.time_to_first_answer,
+  r.avg_answer_score,
+  r.max_answer_score,
+  (
+    'Tag=' || r.tagname
+    || '; Owner=' || coalesce(r.displayname, 'Anonymous')
+    || '; RepDecile=' || coalesce(cast(r.rep_decile as text), 'N/A')
+    || '; Views=' || coalesce(cast(r.viewcount as text), '0')
+    || '; Score=' || coalesce(cast(r.score as text), '0')
+  ) as summary
+from ranked r
+left join close_reasons cr on cr.close_reason_id = r.close_reason_id
+where r.tag_rank <= 5
+   or r.global_rank <= 50
+order by r.global_rank nulls last, r.tagname, r.tag_rank;

@@ -1,0 +1,132 @@
+WITH
+q AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate,
+        REGEXP_REPLACE(p.Tags, '[><]', ',', 'g') AS tag_csv,
+        p.Score,
+        p.ViewCount,
+        p.FavoriteCount,
+        p.AcceptedAnswerId
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= (DATE_TRUNC('year', CAST('2024-10-01' AS date)) - INTERVAL '1 year')
+),
+
+usr_stats AS (
+    SELECT
+        u.Id AS user_id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(q.Id) AS ques_cnt,
+        SUM(q.Score) AS total_ques_score,
+        AVG(q.Score) AS avg_ques_score,
+        COUNT(a.Id) AS ans_cnt,
+        SUM(CASE WHEN q.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END) AS acc_ans_cnt,
+        ROUND(
+            100.0 *
+            NULLIF(SUM(CASE WHEN q.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END), 0) /
+            NULLIF(COUNT(a.Id), 0)
+        , 2) AS acc_rate_pct,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS rep_rank,
+        (SELECT p2.Title
+         FROM Posts p2
+         WHERE p2.OwnerUserId = u.Id AND p2.PostTypeId = 1
+         ORDER BY p2.CreationDate DESC
+         LIMIT 1) AS latest_ques_title
+    FROM Users u
+    LEFT JOIN q ON q.OwnerUserId = u.Id
+    LEFT JOIN Posts a ON a.PostTypeId = 2 AND a.ParentId = q.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(q.Id) > 5
+),
+
+usr_badges AS (
+    SELECT
+        b.UserId,
+        STRING_AGG(DISTINCT b.Name, ', ') AS badge_list,
+        MAX(b.Class) AS top_badge_class
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+cmt_cnt AS (
+    SELECT
+        c.PostId,
+        COUNT(*) AS comment_cnt
+    FROM Comments c
+    GROUP BY c.PostId
+),
+
+tag_stats AS (
+    SELECT
+        t.TagName,
+        t.Count AS tag_use_cnt,
+        COUNT(p.Id) FILTER (WHERE p.Id IS NOT NULL) AS ques_cnt,
+        AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL) AS avg_score,
+        SUM(v.vote_cnt) AS total_votes
+    FROM Tags t
+    LEFT JOIN Posts p
+           ON p.PostTypeId = 1
+          AND p.Tags LIKE '%' || t.TagName || '%'
+    LEFT JOIN (
+        SELECT
+            v.PostId,
+            COUNT(*) AS vote_cnt
+        FROM Votes v
+        GROUP BY v.PostId
+    ) v ON v.PostId = p.Id
+    GROUP BY t.TagName, t.Count
+    HAVING COUNT(p.Id) > 10
+)
+
+SELECT
+    us.user_id,
+    us.DisplayName,
+    us.Reputation,
+    us.ques_cnt,
+    us.total_ques_score,
+    us.avg_ques_score,
+    us.ans_cnt,
+    us.acc_ans_cnt,
+    us.acc_rate_pct,
+    us.rep_rank,
+    COALESCE(ub.badge_list, 'None') AS badges,
+    ub.top_badge_class,
+    COALESCE(cc.comment_total, 0) AS total_comments_on_questions,
+    us.latest_ques_title
+FROM usr_stats us
+LEFT JOIN usr_badges ub
+       ON ub.UserId = us.user_id
+LEFT JOIN (
+    SELECT
+        q.OwnerUserId AS uid,
+        SUM(c.comment_cnt) AS comment_total
+    FROM q
+    LEFT JOIN cmt_cnt c ON c.PostId = q.Id
+    GROUP BY q.OwnerUserId
+) cc ON cc.uid = us.user_id
+WHERE us.Reputation > 5000
+
+UNION ALL
+
+SELECT
+    NULL AS user_id,
+    ts.TagName AS DisplayName,
+    ts.tag_use_cnt AS Reputation,
+    ts.ques_cnt,
+    NULL AS total_ques_score,
+    ts.avg_score AS avg_ques_score,
+    NULL AS ans_cnt,
+    NULL AS acc_ans_cnt,
+    NULL AS acc_rate_pct,
+    NULL AS rep_rank,
+    NULL AS badges,
+    NULL AS top_badge_class,
+    ts.total_votes AS total_comments_on_questions,
+    NULL AS latest_ques_title
+FROM tag_stats ts
+ORDER BY Reputation DESC, acc_rate_pct DESC NULLS LAST
+LIMIT 100;

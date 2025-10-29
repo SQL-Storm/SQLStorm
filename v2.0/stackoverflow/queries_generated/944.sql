@@ -1,0 +1,273 @@
+-- {"query": "944.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2597} 
+with recent_questions as (
+    select
+        p.Id as QuestionId,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Score as QuestionScore,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.AcceptedAnswerId,
+        coalesce(p.AnswerCount, 0) as AnswerCount
+    from Posts p
+    where p.PostTypeId = 1
+      and p.CreationDate >= (select max(CreationDate) - interval '365 days' from Posts where PostTypeId = 1)
+),
+answers as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId as AnswerUserId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreationDate
+    from Posts a
+    where a.PostTypeId = 2
+),
+user_stats as (
+    select
+        u.Id as UserId,
+        u.Reputation,
+        u.CreationDate as UserCreationDate,
+        u.DisplayName,
+        u.UpVotes,
+        u.DownVotes,
+        u.Views as ProfileViews,
+        count(distinct b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(distinct b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(distinct b.Id) filter (where b.Class = 3) as BronzeBadges
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.Reputation, u.CreationDate, u.DisplayName, u.UpVotes, u.DownVotes, u.Views
+),
+question_activity as (
+    select
+        q.QuestionId,
+        count(distinct c.Id) as CommentCount,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpvoteCount,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownvoteCount,
+        sum(case when v.VoteTypeId = 5 then 1 else 0 end) as FavoriteCountLegacy
+    from recent_questions q
+    left join Comments c on c.PostId = q.QuestionId
+    left join Votes v on v.PostId = q.QuestionId
+    group by q.QuestionId
+),
+first_answer as (
+    select distinct on (a.QuestionId)
+        a.QuestionId,
+        a.AnswerId,
+        a.AnswerUserId,
+        a.AnswerScore,
+        a.AnswerCreationDate
+    from answers a
+    join recent_questions q on q.QuestionId = a.QuestionId
+    order by a.QuestionId, a.AnswerCreationDate asc, a.AnswerId asc
+),
+accepted_answer as (
+    select
+        q.QuestionId,
+        q.AcceptedAnswerId,
+        a.AnswerUserId as AcceptedUserId,
+        a.AnswerScore as AcceptedScore,
+        a.AnswerCreationDate as AcceptedCreationDate
+    from recent_questions q
+    left join answers a on a.AnswerId = q.AcceptedAnswerId
+),
+dup_links as (
+    select
+        pl.PostId as DuplicateOfId,
+        pl.RelatedPostId as CanonicalId,
+        count(*) as DupLinkCount
+    from PostLinks pl
+    where pl.LinkTypeId = 3
+    group by pl.PostId, pl.RelatedPostId
+),
+tag_expansion as (
+    select
+        q.QuestionId,
+        unnest(string_to_array(substring(q.Tags, 2, greatest(length(q.Tags)-2, 0)), '><')) as tag
+    from recent_questions q
+),
+tag_scores as (
+    select
+        te.QuestionId,
+        min(lower(trim(te.tag))) as first_tag,
+        count(*) as tag_count
+    from tag_expansion te
+    group by te.QuestionId
+),
+close_events as (
+    select
+        ph.PostId as QuestionId,
+        min(ph.CreationDate) as FirstCloseDate,
+        max(ph.CreationDate) as LastCloseDate,
+        count(*) filter (where ph.PostHistoryTypeId = 10) as CloseVotesRecorded,
+        max(
+            nullif(
+                regexp_replace(ph.Comment, '[^0-9]', '', 'g'),
+                ''
+            )::int
+        ) as AnyCloseReasonId
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (10, 11, 12, 13, 35)
+    group by ph.PostId
+),
+question_user_rollup as (
+    select
+        q.QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        qs.CommentCount,
+        qs.UpvoteCount,
+        qs.DownvoteCount,
+        qs.FavoriteCountLegacy,
+        ts.first_tag,
+        ts.tag_count,
+        coalesce(ce.FirstCloseDate, timestamp '1970-01-01') as FirstCloseDate,
+        ce.AnyCloseReasonId,
+        case
+            when ce.AnyCloseReasonId is not null then crt.Name
+            else null
+        end as CloseReasonName,
+        fu.AnswerId as FirstAnswerId,
+        fu.AnswerScore as FirstAnswerScore,
+        extract(epoch from (fu.AnswerCreationDate - q.CreationDate)) as FirstAnswerLatencySecs,
+        ac.AcceptedAnswerId,
+        ac.AcceptedScore,
+        extract(epoch from (ac.AcceptedCreationDate - q.CreationDate)) as AcceptedLatencySecs,
+        u.DisplayName as AskerDisplayName,
+        u.Reputation as AskerReputation,
+        us.GoldBadges as AskerGold,
+        us.SilverBadges as AskerSilver,
+        us.BronzeBadges as AskerBronze
+    from recent_questions q
+    left join question_activity qs on qs.QuestionId = q.QuestionId
+    left join tag_scores ts on ts.QuestionId = q.QuestionId
+    left join close_events ce on ce.QuestionId = q.QuestionId
+    left join CloseReasonTypes crt on crt.Id = ce.AnyCloseReasonId
+    left join first_answer fu on fu.QuestionId = q.QuestionId
+    left join accepted_answer ac on ac.QuestionId = q.QuestionId
+    left join Users u on u.Id = q.OwnerUserId
+    left join user_stats us on us.UserId = q.OwnerUserId
+),
+question_quality as (
+    select
+        qur.*,
+        case
+            when coalesce(qur.UpvoteCount,0) + coalesce(qur.DownvoteCount,0) = 0 then null
+            else round(100.0 * coalesce(qur.UpvoteCount,0) / nullif(coalesce(qur.UpvoteCount,0) + coalesce(qur.DownvoteCount,0),0), 2)
+        end as UpvoteRatioPct,
+        case
+            when qur.ViewCount is null or qur.ViewCount = 0 then null
+            else round(1.0 * coalesce(qur.QuestionScore,0) / nullif(qur.ViewCount,0), 6)
+        end as ScorePerView,
+        case
+            when qur.AnswerCount = 0 then 1
+            when qur.AnswerCount is null then null
+            else 0
+        end as IsUnansweredFlag,
+        case
+            when qur.AcceptedAnswerId is not null then 1
+            else 0
+        end as HasAcceptedFlag,
+        case
+            when qur.FirstAnswerLatencySecs is null then null
+            when qur.FirstAnswerLatencySecs <= 600 then '10m'
+            when qur.FirstAnswerLatencySecs <= 3600 then '1h'
+            when qur.FirstAnswerLatencySecs <= 21600 then '6h'
+            when qur.FirstAnswerLatencySecs <= 86400 then '1d'
+            else '>1d'
+        end as FirstAnswerLatencyBucket,
+        width_bucket(coalesce(qur.QuestionScore,0), -5, 50, 11) as ScoreBucket
+    from question_user_rollup qur
+),
+dup_context as (
+    select
+        q.QuestionId,
+        max(case when d.DuplicateOfId is not null then 1 else 0 end) as IsMarkedDuplicate,
+        count(distinct d.CanonicalId) as CanonicalTargets,
+        string_agg(distinct p2.Title, ' | ') filter (where d.CanonicalId is not null) as CanonicalTitles
+    from recent_questions q
+    left join dup_links d on d.DuplicateOfId = q.QuestionId
+    left join Posts p2 on p2.Id = d.CanonicalId
+    group by q.QuestionId
+),
+engagement_window as (
+    select
+        q.QuestionId,
+        avg(c.Score) filter (where c.CreationDate <= q.CreationDate + interval '7 days') as AvgCommentScore7d,
+        count(*) filter (where c.CreationDate <= q.CreationDate + interval '7 days') as CommentCount7d,
+        count(distinct v.UserId) filter (where v.CreationDate <= q.CreationDate + interval '7 days' and v.VoteTypeId in (2,3)) as UniqueVoters7d
+    from recent_questions q
+    left join Comments c on c.PostId = q.QuestionId
+    left join Votes v on v.PostId = q.QuestionId
+    group by q.QuestionId
+),
+rankings as (
+    select
+        qq.QuestionId,
+        row_number() over (order by coalesce(qq.ScorePerView, -1) desc nulls last, coalesce(qq.UpvoteRatioPct, -1) desc nulls last, qq.QuestionScore desc nulls last) as RankQuality,
+        dense_rank() over (order by qq.FirstAnswerLatencySecs asc nulls last) as RankFastAnswer,
+        percent_rank() over (order by qq.QuestionScore desc nulls last) as PctScore,
+        ntile(10) over (order by coalesce(qq.ViewCount,0) desc) as ViewsDecile
+    from question_quality qq
+)
+select
+    qq.QuestionId,
+    coalesce(nullif(trim(qq.Title), ''), concat('[untitled-', qq.QuestionId::text, ']')) as SafeTitle,
+    qq.AskerDisplayName,
+    qq.AskerReputation,
+    qq.AskerGold,
+    qq.AskerSilver,
+    qq.AskerBronze,
+    qq.CreationDate,
+    qq.QuestionScore,
+    qq.ViewCount,
+    qq.AnswerCount,
+    qq.UpvoteCount,
+    qq.DownvoteCount,
+    qq.FavoriteCountLegacy,
+    qq.UpvoteRatioPct,
+    qq.ScorePerView,
+    qq.IsUnansweredFlag,
+    qq.HasAcceptedFlag,
+    qq.FirstAnswerLatencySecs,
+    qq.FirstAnswerLatencyBucket,
+    qq.AcceptedLatencySecs,
+    qq.first_tag as PrimaryTag,
+    qq.tag_count as TagCount,
+    qq.CloseReasonName,
+    dc.IsMarkedDuplicate,
+    dc.CanonicalTargets,
+    left(coalesce(dc.CanonicalTitles, ''), 200) as CanonicalTitlesSample,
+    ew.AvgCommentScore7d,
+    ew.CommentCount7d,
+    ew.UniqueVoters7d,
+    r.RankQuality,
+    r.RankFastAnswer,
+    r.PctScore,
+    r.ViewsDecile,
+    case
+        when qq.CloseReasonName is not null then 'closed'
+        when dc.IsMarkedDuplicate = 1 then 'duplicate'
+        when qq.HasAcceptedFlag = 1 then 'answered'
+        when qq.IsUnansweredFlag = 1 then 'unanswered'
+        else 'open'
+    end as StatusCategory
+from question_quality qq
+left join dup_context dc on dc.QuestionId = qq.QuestionId
+left join engagement_window ew on ew.QuestionId = qq.QuestionId
+left join rankings r on r.QuestionId = qq.QuestionId
+where
+    (
+        qq.first_tag is null
+        or qq.first_tag not ilike any (array['meta%', 'discussion%', 'support%'])
+    )
+    and coalesce(qq.QuestionScore, 0) + coalesce(qq.UpvoteCount, 0) - coalesce(qq.DownvoteCount, 0) >= -5
+order by
+    r.RankQuality asc,
+    qq.CreationDate desc
+limit 500;

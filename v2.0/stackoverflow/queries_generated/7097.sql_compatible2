@@ -1,0 +1,203 @@
+WITH PostStats AS (
+  SELECT 
+    p.Id,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Title,
+    p.Tags,
+    p.Body,
+    CASE 
+      WHEN p.PostTypeId = 1 THEN 'Question'
+      WHEN p.PostTypeId = 2 THEN 'Answer'
+      WHEN p.PostTypeId = 3 THEN 'Wiki'
+      ELSE 'Other'
+    END AS PostTypeDisplayName,
+    COALESCE(p.Title, 'No Title') AS CleanTitle,
+    LENGTH(p.Body) AS BodyLength,
+    COALESCE(p.AnswerCount, 0) + COALESCE(p.CommentCount, 0) AS EngagementCount,
+    CAST(EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate)) / 86400 AS INTEGER) AS DaysActive,
+    CASE 
+      WHEN p.Score > 100 THEN 'Highly Voted'
+      WHEN p.Score > 50 THEN 'Moderately Voted'
+      WHEN p.Score > 0 THEN 'Low Voted'
+      ELSE 'Unvoted'
+    END AS VoteCategory,
+    CASE 
+      WHEN p.Tags IS NOT NULL AND p.Tags <> '' THEN 
+        (
+          SELECT COUNT(*) 
+          FROM UNNEST(string_to_array(trim(both '<>' FROM p.Tags), '><')) AS t(tag)
+        )
+      ELSE 0
+    END AS TagCount
+  FROM Posts p
+  WHERE p.PostTypeId IN (1, 2)
+),
+UserActivity AS (
+  SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.AccountId,
+    COUNT(DISTINCT p.Id) AS PostCount,
+    COUNT(DISTINCT c.Id) AS CommentCount,
+    COUNT(DISTINCT b.Id) AS BadgeCount,
+    AVG(p.Score) AS AvgPostScore,
+    MAX(p.CreationDate) AS LastPostDate,
+    MAX(c.CreationDate) AS LastCommentDate
+  FROM Users u
+  LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+  LEFT JOIN Comments c ON u.Id = c.UserId
+  LEFT JOIN Badges b ON u.Id = b.UserId
+  WHERE u.Id IS NOT NULL
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.AccountId
+),
+TopTaggedPosts AS (
+  SELECT 
+    ps.Id AS PostId,
+    ps.Title,
+    ps.Tags,
+    ps.Score,
+    ps.ViewCount,
+    ps.PostTypeDisplayName,
+    ps.TagCount,
+    ps.CreationDate,
+    ps.LastActivityDate,
+    ps.VoteCategory,
+    ROW_NUMBER() OVER (PARTITION BY ps.TagCount ORDER BY ps.Score DESC) AS TagScoreRank
+  FROM PostStats ps
+  WHERE ps.Tags IS NOT NULL AND ps.Tags <> ''
+),
+TagAnalysis AS (
+  SELECT 
+    ta.PostId,
+    ta.Title,
+    ta.Tags,
+    ta.Score,
+    ta.ViewCount,
+    ta.PostTypeDisplayName,
+    ta.TagCount,
+    ta.CreationDate,
+    ta.LastActivityDate,
+    ta.VoteCategory,
+    ta.TagScoreRank,
+    CASE 
+      WHEN ta.TagCount >= 3 THEN 'Many Tags'
+      WHEN ta.TagCount = 2 THEN 'Medium Tags'
+      WHEN ta.TagCount = 1 THEN 'Single Tag'
+      ELSE 'No Tags'
+    END AS TagDensity,
+    ROW_NUMBER() OVER (ORDER BY ta.Score DESC) AS OverallRank,
+    SUM(ta.Score) OVER (ORDER BY ta.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativeScore,
+    LAG(ta.Score, 1) OVER (ORDER BY ta.CreationDate) AS PreviousScore,
+    LAG(ta.Title, 1) OVER (ORDER BY ta.CreationDate) AS PreviousTitle,
+    CAST(EXTRACT(EPOCH FROM (ta.CreationDate - LAG(ta.CreationDate, 1) OVER (ORDER BY ta.CreationDate))) / 86400 AS INTEGER) AS DaysSinceLastPost,
+    CASE 
+      WHEN ta.Score > (SELECT AVG(p2.Score) FROM Posts p2 WHERE p2.PostTypeId = 1) THEN 'Above Average'
+      WHEN ta.Score < (SELECT AVG(p2.Score) FROM Posts p2 WHERE p2.PostTypeId = 1) THEN 'Below Average'
+      ELSE 'Average'
+    END AS ScoreComparison
+  FROM TopTaggedPosts ta
+),
+ActivitySummary AS (
+  SELECT 
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.Views,
+    ua.UpVotes,
+    ua.DownVotes,
+    ua.AccountId,
+    ua.PostCount,
+    ua.CommentCount,
+    ua.BadgeCount,
+    ua.AvgPostScore,
+    ua.LastPostDate,
+    ua.LastCommentDate,
+    CASE 
+      WHEN ua.PostCount > 100 THEN 'Highly Active'
+      WHEN ua.PostCount > 50 THEN 'Moderately Active'
+      WHEN ua.PostCount > 10 THEN 'Active'
+      ELSE 'Inactive'
+    END AS ActivityLevel,
+    CASE 
+      WHEN ua.Reputation > 100000 THEN 'Legendary'
+      WHEN ua.Reputation > 10000 THEN 'Master'
+      WHEN ua.Reputation > 1000 THEN 'Expert'
+      WHEN ua.Reputation > 100 THEN 'Intermediate'
+      ELSE 'Beginner'
+    END AS ReputationLevel,
+    CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - ua.LastPostDate)) / 86400 AS INTEGER) AS DaysSinceLastPost,
+    CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - ua.LastCommentDate)) / 86400 AS INTEGER) AS DaysSinceLastComment
+  FROM UserActivity ua
+)
+SELECT 
+  ta.PostId,
+  ta.Title,
+  ta.Tags,
+  ta.Score,
+  ta.ViewCount,
+  ta.PostTypeDisplayName,
+  ta.TagCount,
+  ta.CreationDate,
+  ta.LastActivityDate,
+  ta.VoteCategory,
+  ta.TagScoreRank,
+  ta.TagDensity,
+  ta.OverallRank,
+  ta.CumulativeScore,
+  ta.PreviousScore,
+  ta.PreviousTitle,
+  ta.DaysSinceLastPost,
+  ta.ScoreComparison,
+  CASE 
+    WHEN ta.Score > (SELECT AVG(p.Score) FROM Posts p) THEN 1
+    WHEN ta.Score < (SELECT AVG(p.Score) FROM Posts p) THEN -1
+    ELSE 0
+  END AS ScoreDeviation,
+  CASE 
+    WHEN ta.TagCount > 3 THEN 1
+    ELSE 0
+  END AS MultipleTagFlag,
+  CASE 
+    WHEN ta.Score > 100 AND ta.ViewCount > 1000 THEN 'Popular'
+    WHEN ta.Score > 50 AND ta.ViewCount > 500 THEN 'Notable'
+    ELSE 'Regular'
+  END AS PopularityCategory,
+  COALESCE(ua.DisplayName, 'Unknown') AS AuthorName,
+  COALESCE(ua.Reputation, 0) AS AuthorReputation,
+  COALESCE(ua.ActivityLevel, 'Unknown') AS AuthorActivityLevel,
+  COALESCE(ua.ReputationLevel, 'Unknown') AS AuthorReputationLevel,
+  CASE 
+    WHEN ta.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '7' DAY) THEN 'This Week'
+    WHEN ta.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30' DAY) THEN 'This Month'
+    WHEN ta.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '90' DAY) THEN 'This Quarter'
+    ELSE 'Older'
+  END AS TimeCategory,
+  ROW_NUMBER() OVER (PARTITION BY ta.ScoreComparison, ta.TagDensity ORDER BY ta.Score DESC) AS ComprehensiveRank
+FROM TagAnalysis ta
+LEFT JOIN ActivitySummary ua ON ua.UserId = (
+  SELECT p.OwnerUserId FROM Posts p WHERE p.Id = ta.PostId
+)
+WHERE ta.PostId IS NOT NULL 
+  AND ta.Score IS NOT NULL
+  AND (ta.Score BETWEEN -50 AND 200)
+  AND (ta.ViewCount IS NULL OR ta.ViewCount BETWEEN 0 AND 50000)
+  AND (ta.Title IS NOT NULL AND LENGTH(TRIM(ta.Title)) > 0)
+  AND (
+    (ta.VoteCategory = 'Highly Voted' AND ta.TagCount >= 1)
+    OR (ta.TagCount >= 2 AND ta.Score > 20)
+    OR (ta.Score > 1000 AND ta.ViewCount > 10000)
+  )
+ORDER BY ta.Score DESC, ta.ViewCount DESC, ta.CreationDate DESC
+LIMIT 1000;

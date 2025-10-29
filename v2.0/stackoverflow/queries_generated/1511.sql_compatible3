@@ -1,0 +1,159 @@
+WITH UserEngagementSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesCast,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesCast,
+        COUNT(DISTINCT b.Id) AS TotalBadgesReceived,
+        MAX(b.Date) AS LatestBadgeDate,
+        AVG(CASE WHEN p_owned.PostTypeId = 1 THEN p_owned.Score END) AS AvgQuestionScoreOwned,
+        AVG(CASE WHEN p_owned.PostTypeId = 1 THEN p_owned.ViewCount END) AS AvgQuestionViewCountOwned,
+        SUM(CASE WHEN p_owned.PostTypeId = 1 THEN COALESCE(p_owned.FavoriteCount,0) ELSE 0 END) AS TotalFavoriteCountsOnOwnedQuestions
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Posts p_owned ON u.Id = p_owned.OwnerUserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+PostHistoricalMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN ph.CreationDate END) AS LastEditDate,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN 1 ELSE 0 END) AS EditCount,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN 'Closed' WHEN ph.PostHistoryTypeId = 11 THEN 'Reopened' ELSE NULL END) AS LatestStatusChange,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (10,11) THEN ph.UserId END) AS UniqueModeratorActions
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    GROUP BY p.Id, p.PostTypeId
+),
+PostTagAnalysis AS (
+    SELECT
+        p.Id AS PostId,
+        STRING_AGG(t.TagName, ', ' ORDER BY t.TagName) AS AssociatedTags,
+        COUNT(t.Id) AS TagCount,
+        (CASE WHEN EXISTS (
+            SELECT 1
+            FROM Tags tr
+            WHERE tr.TagName = ANY(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><'))
+              AND tr.Count > 100000
+        ) THEN TRUE ELSE FALSE END) AS HasVeryPopularTag
+    FROM Posts p
+    JOIN Tags t ON t.TagName = ANY(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><'))
+    WHERE p.Tags IS NOT NULL AND char_length(p.Tags) > 2
+    GROUP BY p.Id, p.Tags
+),
+MonthlyUserActivityRank AS (
+    SELECT
+        u.Id AS UserId,
+        TO_CHAR(p.CreationDate, 'YYYY-MM') AS PostCreationMonth,
+        COUNT(p.Id) AS PostsCreatedInMonth,
+        SUM(p.Score) AS ScoreFromPostsInMonth,
+        RANK() OVER (PARTITION BY TO_CHAR(p.CreationDate, 'YYYY-MM') ORDER BY COUNT(p.Id) DESC, SUM(p.Score) DESC) AS RankByPostsAndScore
+    FROM Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1
+    GROUP BY u.Id, TO_CHAR(p.CreationDate, 'YYYY-MM')
+),
+PostCommentScores AS (
+    SELECT
+        c.PostId,
+        AVG(c.Score) AS AvgCommentScore,
+        MAX(c.CreationDate) AS LatestCommentDate,
+        COUNT(c.Id) AS TotalCommentsOnPost
+    FROM Comments c
+    GROUP BY c.PostId
+)
+SELECT
+    ues.UserId,
+    ues.DisplayName,
+    ues.Reputation,
+    ues.UserCreationDate,
+    COALESCE(ues.TotalPostsOwned, 0) AS UserTotalPosts,
+    COALESCE(ues.TotalCommentsMade, 0) AS UserTotalComments,
+    ues.TotalUpVotesCast AS UserTotalUpVotesGiven,
+    ues.TotalDownVotesCast AS UserTotalDownVotesGiven,
+    ues.TotalBadgesReceived,
+    ues.LatestBadgeDate,
+    COALESCE(ROUND(CAST(ues.AvgQuestionScoreOwned AS NUMERIC), 2), 0.0) AS UserAvgQuestionScore,
+    COALESCE(ROUND(CAST(ues.AvgQuestionViewCountOwned AS NUMERIC), 2), 0.0) AS UserAvgQuestionViews,
+    p.Id AS PostId,
+    pt.Name AS PostTypeName,
+    p.Title AS PostTitle,
+    p.CreationDate AS PostCreationDate,
+    p.Score AS PostScore,
+    p.ViewCount AS PostViewCount,
+    COALESCE(p.AnswerCount, 0) AS PostAnswerCount,
+    COALESCE(p.CommentCount, 0) AS PostCommentCountInitial,
+    COALESCE(p.FavoriteCount, 0) AS PostFavoriteCount,
+    phm.LastEditDate,
+    phm.EditCount AS PostEditCount,
+    phm.LatestStatusChange AS PostModerationStatus,
+    phm.UniqueModeratorActions,
+    pcs.AvgCommentScore,
+    pcs.LatestCommentDate AS PostLatestCommentDate,
+    pcs.TotalCommentsOnPost AS PostTotalCommentsActual,
+    pta.AssociatedTags,
+    pta.TagCount,
+    pta.HasVeryPopularTag,
+    CASE
+        WHEN ues.Reputation >= 50000 AND ues.TotalPostsOwned >= 100 AND ues.TotalBadgesReceived >= 20 THEN 'Elite Contributor'
+        WHEN ues.Reputation >= 5000 AND ues.TotalPostsOwned >= 20 AND ues.TotalBadgesReceived >= 5 THEN 'Active Contributor'
+        WHEN ues.Reputation < 5000 AND ues.TotalCommentsMade > 0 AND ues.TotalPostsOwned > 0 THEN 'Engaged Newbie'
+        ELSE 'Passive User'
+    END AS UserEngagementLevel,
+    ROUND(
+        (COALESCE(p.Score, 0) * 2.0)
+        + (COALESCE(p.ViewCount, 0) / 50.0)
+        + (COALESCE(p.FavoriteCount, 0) * 10)
+        - (COALESCE(phm.EditCount, 0) * 0.75)
+        + (COALESCE(pcs.AvgCommentScore, 0) * 3)
+        + (CASE WHEN p.AnswerCount IS NOT NULL THEN p.AnswerCount * 5 ELSE 0 END)
+        - (CASE WHEN p.ClosedDate IS NOT NULL THEN 150 ELSE 0 END)
+        + (CASE WHEN pta.HasVeryPopularTag THEN 50 ELSE 0 END)
+    , 2) AS PostEngagementMetric,
+    UPPER(SUBSTRING(ues.DisplayName FROM 1 FOR 3)) || LPAD(CAST(ues.UserId AS VARCHAR), 7, '0') AS UserIdentifierCode,
+    COALESCE(p.ContentLicense, 'Unknown License') AS PostContentLicenseDetail,
+    mura.RankByPostsAndScore AS MonthlyUserPostRank,
+    (SELECT COUNT(b2.Id) FROM Badges b2 WHERE b2.UserId = ues.UserId AND b2.Name LIKE '%Analyst%' AND b2.Class = 1) AS GoldAnalystBadgeCount,
+    (
+        SELECT TRUE
+        WHERE ues.UserId IN (
+            SELECT u_inner.Id
+            FROM Users u_inner
+            JOIN Badges b_inner ON u_inner.Id = b_inner.UserId
+            WHERE b_inner.Class = 1
+            GROUP BY u_inner.Id
+            HAVING COUNT(b_inner.Id) >= 2
+            INTERSECT
+            SELECT p_inner.OwnerUserId
+            FROM Posts p_inner
+            WHERE p_inner.Tags LIKE '%<sql>%' AND p_inner.PostTypeId = 1
+        )
+    ) AS IsHighCaliberSQLContributor,
+    (SELECT c_latest.Text
+     FROM Comments c_latest
+     WHERE c_latest.PostId = p.Id
+     ORDER BY c_latest.CreationDate DESC
+     LIMIT 1) AS LatestCommentText
+FROM UserEngagementSummary ues
+LEFT JOIN Posts p ON ues.UserId = p.OwnerUserId
+LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+LEFT JOIN PostHistoricalMetrics phm ON p.Id = phm.PostId
+LEFT JOIN PostTagAnalysis pta ON p.Id = pta.PostId
+LEFT JOIN MonthlyUserActivityRank mura ON ues.UserId = mura.UserId AND TO_CHAR(p.CreationDate, 'YYYY-MM') = mura.PostCreationMonth
+LEFT JOIN PostCommentScores pcs ON p.Id = pcs.PostId
+WHERE ues.Reputation > 500
+  AND p.CreationDate BETWEEN DATE '2021-01-01' AND DATE '2023-12-31'
+  AND (p.ViewCount > 5000 OR p.FavoriteCount > 10)
+  AND (p.ClosedDate IS NULL OR p.LastActivityDate > p.ClosedDate + INTERVAL '7' DAY)
+  AND ues.DisplayName IS NOT NULL AND ues.DisplayName <> ''
+  AND p.PostTypeId = 1
+ORDER BY
+    ues.Reputation DESC, p.CreationDate DESC, p.Id;

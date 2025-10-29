@@ -1,0 +1,231 @@
+-- {"query": "1299.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3586} 
+WITH UserEngagementStats AS (
+    -- CTE 1: Aggregate user-level statistics including badge types and reputation tiers,
+    -- and calculate time since creation.
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Views AS UserViews,
+        U.UpVotes AS UserUpVotes,
+        U.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT P.Id) AS TotalPostsByOwner,
+        COUNT(DISTINCT C.Id) AS TotalCommentsByOwner,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        CASE
+            WHEN U.Reputation >= 10000 THEN 'Legendary Contributor'
+            WHEN U.Reputation >= 5000 THEN 'Expert User'
+            WHEN U.Reputation >= 1000 THEN 'Advanced Participant'
+            ELSE 'Novice Member'
+        END AS ReputationTier,
+        U.Location,
+        U.AboutMe,
+        EXTRACT(DAY FROM AGE(cast('2024-10-01 12:34:56' as timestamp), U.CreationDate)) AS DaysSinceUserCreation
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Views, U.UpVotes, U.DownVotes, U.Location, U.AboutMe
+),
+PostDetailsWithInitialMetrics AS (
+    -- CTE 2: Extract detailed post information, parse tags, and get initial vote counts
+    -- using correlated subqueries for specific vote types.
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.AcceptedAnswerId,
+        P.ParentId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount AS PostCommentCount,
+        P.FavoriteCount,
+        P.Title,
+        P.Body,
+        -- Complex string parsing for tags: remove leading/trailing '><', trim, and NULL if empty
+        NULLIF(TRIM(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags) - 2)), '') AS RawTagsString,
+        -- Correlated subquery for initial upvotes
+        (SELECT COUNT(V.Id) FROM Votes V WHERE V.PostId = P.Id AND V.VoteTypeId = 2) AS InitialUpVotes,
+        -- Correlated subquery for initial downvotes
+        (SELECT COUNT(V.Id) FROM Votes V WHERE V.PostId = P.Id AND V.VoteTypeId = 3) AS InitialDownVotes,
+        -- Count of specific edit history types (Title, Body, Tags edits)
+        (SELECT COUNT(PH.Id) FROM PostHistory PH WHERE PH.PostId = P.Id AND PH.PostHistoryTypeId IN (4,5,6)) AS EditCount
+    FROM Posts P
+    WHERE P.OwnerUserId IS NOT NULL -- Focus on posts by registered users
+),
+AggregatedPostHistoryAndLinks AS (
+    -- CTE 3: Aggregate post history details (close reasons, community ownership) and link counts.
+    -- Features a complex CASE expression for `LatestCloseReason` leveraging schema notes.
+    SELECT
+        PD.PostId,
+        PD.PostTypeId,
+        PD.OwnerUserId,
+        PD.PostCreationDate,
+        PD.PostScore,
+        PD.ViewCount,
+        PD.AnswerCount,
+        PD.PostCommentCount,
+        PD.FavoriteCount,
+        PD.Title,
+        PD.Body,
+        PD.RawTagsString,
+        PD.InitialUpVotes,
+        PD.InitialDownVotes,
+        PD.EditCount,
+        (PD.InitialUpVotes - PD.InitialDownVotes) AS NetVotes,
+        COUNT(DISTINCT CO.Id) AS TotalCommentsOnPost, -- Total comments on the post
+        SUM(CASE WHEN PL.LinkTypeId = 1 THEN 1 ELSE 0 END) AS LinkedPostCount,
+        SUM(CASE WHEN PL.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicateOfCount,
+        -- Complex NULL-aware logic to determine the latest close reason name from PostHistory.Comment
+        COALESCE(
+            MAX(CASE
+                WHEN PH.PostHistoryTypeId = 10 AND PH.Comment IS NOT NULL AND LENGTH(TRIM(PH.Comment)) > 0
+                THEN (SELECT Name FROM CloseReasonTypes WHERE Id = CAST(TRIM(PH.Comment) AS smallint))
+                ELSE NULL
+            END) FILTER (WHERE PH.CreationDate = (SELECT MAX(PH2.CreationDate) FROM PostHistory PH2 WHERE PH2.PostId = PD.PostId AND PH2.PostHistoryTypeId = 10)),
+            'Not Closed/Unknown'
+        ) AS LatestCloseReason,
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE NULL END) AS CloseVoteHistoryCount,
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE NULL END) AS ReopenHistoryCount,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 16 THEN 'Yes' ELSE 'No' END) AS IsCommunityOwned
+    FROM PostDetailsWithInitialMetrics PD
+    LEFT JOIN Comments CO ON PD.PostId = CO.PostId
+    LEFT JOIN PostHistory PH ON PD.PostId = PH.PostId
+    LEFT JOIN PostLinks PL ON PD.PostId = PL.PostId
+    GROUP BY
+        PD.PostId, PD.PostTypeId, PD.OwnerUserId, PD.PostCreationDate, PD.PostScore, PD.ViewCount, PD.AnswerCount,
+        PD.PostCommentCount, PD.FavoriteCount, PD.Title, PD.Body, PD.RawTagsString,
+        PD.InitialUpVotes, PD.InitialDownVotes, PD.EditCount
+),
+RankedAndWindowedPosts AS (
+    -- CTE 4: Apply various window functions for ranking, rolling averages, and temporal analysis
+    SELECT
+        APH.*,
+        ROW_NUMBER() OVER (PARTITION BY APH.PostTypeId ORDER BY APH.PostScore DESC, APH.ViewCount DESC) AS RankByScoreAndViews,
+        DENSE_RANK() OVER (PARTITION BY APH.OwnerUserId ORDER BY APH.PostCreationDate DESC) AS RankUserLatestPost,
+        -- Rolling average of post score over the last 10 posts of the same type
+        AVG(APH.PostScore) OVER (PARTITION BY APH.PostTypeId ORDER BY APH.PostCreationDate ROWS BETWEEN 10 PRECEDING AND CURRENT ROW) AS RollingAvgPostScore,
+        -- Date of the user's previous post, for temporal analysis
+        LAG(APH.PostCreationDate, 1) OVER (PARTITION BY APH.OwnerUserId ORDER BY APH.PostCreationDate) AS PreviousPostDate,
+        -- Calculate hours since the previous post, handling NULL for the first post
+        COALESCE(EXTRACT(EPOCH FROM (APH.PostCreationDate - LAG(APH.PostCreationDate, 1) OVER (PARTITION BY APH.OwnerUserId ORDER BY APH.PostCreationDate))) / 3600, 0) AS HoursSincePreviousPost,
+        -- Percent rank of net votes across all relevant posts
+        PERCENT_RANK() OVER (ORDER BY APH.NetVotes DESC) AS NetVotesPercentRank
+    FROM AggregatedPostHistoryAndLinks APH
+    WHERE APH.PostScore > 0 -- Filter for posts with positive engagement
+),
+PostTagAnalysis AS (
+    -- CTE 5: Unnest tags for each post for easier filtering and aggregation
+    SELECT
+        RP.PostId,
+        LOWER(TRIM(unnest(string_to_array(RP.RawTagsString, '><')))) AS TagName
+    FROM RankedAndWindowedPosts RP
+    WHERE RP.RawTagsString IS NOT NULL AND RP.RawTagsString != ''
+)
+-- Main Query: Combines all CTEs, applies complex filtering, expressions, and string manipulation.
+SELECT
+    UES.UserId,
+    UES.DisplayName,
+    UES.Reputation,
+    UES.ReputationTier,
+    UES.DaysSinceUserCreation,
+    UES.GoldBadges,
+    UES.SilverBadges,
+    UES.BronzeBadges,
+    RW.PostId,
+    RW.PostTypeId,
+    CASE
+        WHEN RW.PostTypeId = 1 THEN 'Question'
+        WHEN RW.PostTypeId = 2 THEN 'Answer'
+        WHEN RW.PostTypeId = 5 THEN 'TagWiki'
+        ELSE 'Other Post Type'
+    END AS PostTypeName,
+    RW.Title,
+    RW.PostCreationDate,
+    RW.PostScore,
+    RW.ViewCount,
+    RW.InitialUpVotes,
+    RW.InitialDownVotes,
+    RW.NetVotes,
+    RW.EditCount,
+    RW.CloseVoteHistoryCount,
+    RW.ReopenHistoryCount,
+    RW.LatestCloseReason,
+    RW.IsCommunityOwned,
+    RW.TotalCommentsOnPost,
+    RW.FavoriteCount,
+    RW.RankByScoreAndViews,
+    RW.RollingAvgPostScore,
+    RW.HoursSincePreviousPost,
+    RW.NetVotesPercentRank,
+    -- Aggregate and format tags into a single comma-separated string
+    STRING_AGG(DISTINCT PTA.TagName, ', ') FILTER (WHERE PTA.TagName IS NOT NULL) AS FormattedPostTags,
+    COALESCE(RW.LinkedPostCount, 0) AS LinkedPosts,
+    COALESCE(RW.DuplicateOfCount, 0) AS DuplicatePosts,
+    -- Correlated subquery to count moderator-only tags for a post
+    (SELECT COUNT(DISTINCT T.Id) FROM PostTagAnalysis PTA2 JOIN Tags T ON PTA2.TagName = T.TagName WHERE PTA2.PostId = RW.PostId AND T.IsModeratorOnly = true) AS ModeratorOnlyTagsCount,
+    -- Complex calculation for a 'Post Health' metric, avoiding division by zero
+    CAST(RW.PostScore AS DECIMAL) / NULLIF((RW.ViewCount + 1), 0) * CAST((RW.InitialUpVotes + 1) AS DECIMAL) / NULLIF((RW.EditCount + RW.CloseVoteHistoryCount + 1), 0) AS PostHealthMetric,
+    -- String manipulation and NULL logic for a truncated AboutMe snippet
+    COALESCE(
+        CASE
+            WHEN UES.AboutMe IS NOT NULL AND LENGTH(UES.AboutMe) > 100
+            THEN SUBSTRING(UES.AboutMe FROM 1 FOR 50) || '... (truncated) ...' || SUBSTRING(UES.AboutMe FROM LENGTH(UES.AboutMe) - 49 FOR 50)
+            WHEN UES.AboutMe IS NOT NULL THEN UES.AboutMe
+            ELSE NULL
+        END, 'No "About Me" provided') AS AboutMeSnippet,
+    -- Ratio of upvotes to downvotes, handling division by zero and NULL results
+    NULLIF(CAST(RW.InitialUpVotes AS DECIMAL) / NULLIF(RW.InitialDownVotes, 0), 0) AS UpvoteToDownvoteRatio,
+    -- Complex boolean logic to derive a "High Impact Post" flag
+    (RW.PostScore >= 50 AND RW.ViewCount >= 5000 AND RW.NetVotesPercentRank > 0.9) OR
+    (RW.TotalCommentsOnPost >= 10 AND RW.FavoriteCount >= 5 AND RW.EditCount >= 3) AS IsHighImpactPost
+FROM UserEngagementStats UES
+INNER JOIN RankedAndWindowedPosts RW ON UES.UserId = RW.OwnerUserId
+LEFT JOIN PostTagAnalysis PTA ON RW.PostId = PTA.PostId
+WHERE
+    UES.Reputation >= 750 -- Filter for users with a decent reputation
+    AND UES.ReputationTier != 'Novice Member'
+    AND RW.RankByScoreAndViews <= 100 -- Top 100 posts by score and views within their type
+    AND RW.NetVotes > 10 -- Only posts with a significant positive net vote count
+    AND RW.PostCreationDate BETWEEN '2021-07-01' AND '2023-06-30' -- Specific date range
+    -- Complex predicate combining post type specific conditions and requiring a title
+    AND (
+        (RW.PostTypeId = 1 AND RW.ViewCount > 2000 AND RW.AnswerCount IS NOT NULL AND RW.AnswerCount > 2) -- High-view questions with multiple answers
+        OR
+        (RW.PostTypeId = 2 AND RW.PostScore >= 30 AND RW.AcceptedAnswerId IS NOT NULL AND RW.TotalCommentsOnPost > 5) -- Highly scored accepted answers with comments
+    )
+    AND RW.Title IS NOT NULL AND LENGTH(TRIM(RW.Title)) > 5 -- Ensure posts have a meaningful title
+    -- Correlated subquery: Exclude posts that were deleted at some point and never undeleted later
+    AND NOT EXISTS (
+        SELECT 1
+        FROM PostHistory PH_DEL
+        WHERE PH_DEL.PostId = RW.PostId AND PH_DEL.PostHistoryTypeId = 12 -- Post Deleted
+          AND NOT EXISTS (
+              SELECT 1 FROM PostHistory PH_UNDEL
+              WHERE PH_UNDEL.PostId = RW.PostId AND PH_UNDEL.PostHistoryTypeId = 13 -- Post Undeleted
+                AND PH_UNDEL.CreationDate > PH_DEL.CreationDate -- Undeleted *after* deletion
+          )
+    )
+GROUP BY
+    UES.UserId, UES.DisplayName, UES.Reputation, UES.ReputationTier, UES.DaysSinceUserCreation, UES.GoldBadges, UES.SilverBadges, UES.BronzeBadges,
+    RW.PostId, RW.PostTypeId, RW.Title, RW.PostCreationDate, RW.PostScore, RW.ViewCount, RW.InitialUpVotes, RW.InitialDownVotes, RW.NetVotes,
+    RW.EditCount, RW.CloseVoteHistoryCount, RW.ReopenHistoryCount, RW.LatestCloseReason, RW.IsCommunityOwned,
+    RW.TotalCommentsOnPost, RW.FavoriteCount, RW.RankByScoreAndViews, RW.RollingAvgPostScore,
+    RW.HoursSincePreviousPost, RW.NetVotesPercentRank, RW.LinkedPostCount, RW.DuplicateOfCount,
+    UES.AboutMe, RW.AcceptedAnswerId
+HAVING
+    COUNT(DISTINCT PTA.TagName) >= 3 -- Posts must have at least 3 distinct tags
+    -- Posts must contain at least one tag related to 'sql', 'database', or 'performance'
+    AND (SUM(CASE WHEN PTA.TagName LIKE '%sql%' THEN 1 ELSE 0 END) > 0
+         OR SUM(CASE WHEN PTA.TagName LIKE '%database%' THEN 1 ELSE 0 END) > 0
+         OR SUM(CASE WHEN PTA.TagName LIKE '%performance%' THEN 1 ELSE 0 END) > 0)
+    AND UES.GoldBadges >= 1 -- Only consider users with at least one Gold badge
+ORDER BY
+    UES.Reputation DESC, RW.NetVotes DESC, RW.PostScore DESC
+LIMIT 1000;

@@ -1,0 +1,181 @@
+WITH RankedPostEdits AS (
+  SELECT
+    ph.PostId,
+    ph.UserId,
+    u.DisplayName AS EditorDisplayName,
+    ph.PostHistoryTypeId,
+    ph.CreationDate AS EditDate,
+    ROW_NUMBER() OVER (PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate DESC) AS rn
+  FROM PostHistory ph
+  JOIN Users u
+    ON ph.UserId = u.Id
+  WHERE
+    ph.PostHistoryTypeId IN (4, 5, 6)
+), PostEditCounts AS (
+  SELECT
+    PostId,
+    COUNT(DISTINCT UserId) AS DistinctEditors,
+    MAX(EditDate) AS LatestEditDate
+  FROM RankedPostEdits
+  GROUP BY
+    PostId
+), LatestEditorInfo AS (
+  SELECT
+    rpe.PostId,
+    rpe.EditorDisplayName AS LatestEditorName,
+    rpe.EditDate AS LatestEditorDate
+  FROM RankedPostEdits rpe
+  WHERE
+    rpe.rn = 1
+), HighReputationEditors AS (
+  SELECT
+    Id
+  FROM Users
+  WHERE
+    Reputation > 10000
+), FrequentUsers AS (
+  SELECT
+    OwnerUserId AS UserId,
+    COUNT(*) AS PostCount
+  FROM Posts
+  WHERE
+    OwnerUserId IS NOT NULL
+    AND OwnerUserId <> -1
+  GROUP BY
+    OwnerUserId
+  HAVING
+    COUNT(*) > 100
+), TaggedQuestions AS (
+  SELECT
+    p.Id AS QuestionId,
+    p.Title,
+    p.CreationDate AS QuestionCreationDate,
+    p.OwnerUserId AS QuestionOwnerUserId,
+    p.AnswerCount,
+    p.FavoriteCount,
+    CASE
+      WHEN p.Tags LIKE '%<sql>%' THEN 1
+      ELSE 0
+    END AS HasSqlTag
+  FROM Posts p
+  WHERE
+    p.PostTypeId = 1
+    AND p.OwnerUserId IN (
+      SELECT
+        UserId
+      FROM FrequentUsers
+    )
+), QuestionActivity AS (
+  SELECT
+    tq.QuestionId,
+    tq.Title,
+    tq.QuestionCreationDate,
+    tq.AnswerCount,
+    tq.FavoriteCount,
+    tq.HasSqlTag,
+    COUNT(c.Id) AS CommentCountOnQuestion,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvoteCountOnQuestion,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvoteCountOnQuestion
+  FROM TaggedQuestions tq
+  LEFT JOIN Comments c
+    ON tq.QuestionId = c.PostId
+  LEFT JOIN Votes v
+    ON tq.QuestionId = v.PostId
+  GROUP BY
+    tq.QuestionId,
+    tq.Title,
+    tq.QuestionCreationDate,
+    tq.AnswerCount,
+    tq.FavoriteCount,
+    tq.HasSqlTag
+), AnswerDetails AS (
+  SELECT
+    p.ParentId AS QuestionId,
+    COUNT(p.Id) AS AnswerCountPerQuestion,
+    AVG(p.Score) AS AvgAnswerScore,
+    MAX(p.CreationDate) AS LatestAnswerDate
+  FROM Posts p
+  WHERE
+    p.PostTypeId = 2
+    AND p.ParentId IN (
+      SELECT
+        QuestionId
+      FROM TaggedQuestions
+    )
+  GROUP BY
+    p.ParentId
+), UserBadgeCount AS (
+  SELECT
+    UserId,
+    COUNT(*) AS TotalBadges
+  FROM Badges
+  GROUP BY
+    UserId
+), FinalBenchmark AS (
+  SELECT
+    qa.QuestionId,
+    qa.Title,
+    qa.QuestionCreationDate,
+    qa.AnswerCount,
+    qa.FavoriteCount,
+    qa.CommentCountOnQuestion,
+    qa.UpvoteCountOnQuestion,
+    qa.DownvoteCountOnQuestion,
+    ad.AnswerCountPerQuestion,
+    ad.AvgAnswerScore,
+    ad.LatestAnswerDate,
+    lei.LatestEditorName,
+    lei.LatestEditorDate,
+    pec.DistinctEditors,
+    COALESCE(ubc.TotalBadges, 0) AS UserTotalBadges,
+    CASE
+      WHEN qa.QuestionCreationDate BETWEEN DATE '2023-01-01' AND DATE '2023-12-31' THEN '2023'
+      WHEN qa.QuestionCreationDate BETWEEN DATE '2022-01-01' AND DATE '2022-12-31' THEN '2022'
+      ELSE 'Other'
+    END AS QuestionYear,
+    CASE WHEN qa.HasSqlTag = 1 THEN 'Yes' ELSE 'No' END AS IsSqlRelated,
+    COALESCE(qa.AnswerCount, 0) + COALESCE(ad.AnswerCountPerQuestion, 0) AS TotalAnswersRelated,
+    CAST(qa.FavoriteCount AS DOUBLE PRECISION) / NULLIF(qa.AnswerCount, 0) AS FavPerAnswerRatio,
+    qa.QuestionOwnerUserId
+  FROM QuestionActivity qa
+  LEFT JOIN AnswerDetails ad
+    ON qa.QuestionId = ad.QuestionId
+  LEFT JOIN LatestEditorInfo lei
+    ON qa.QuestionId = lei.PostId
+  LEFT JOIN PostEditCounts pec
+    ON qa.QuestionId = pec.PostId
+  LEFT JOIN UserBadgeCount ubc
+    ON qa.QuestionOwnerUserId = ubc.UserId
+)
+SELECT
+  fb.QuestionId,
+  fb.Title,
+  fb.QuestionCreationDate,
+  fb.QuestionYear,
+  fb.IsSqlRelated,
+  fb.AnswerCount,
+  fb.AnswerCountPerQuestion,
+  fb.TotalAnswersRelated,
+  fb.FavoriteCount,
+  fb.FavPerAnswerRatio,
+  fb.CommentCountOnQuestion,
+  fb.UpvoteCountOnQuestion,
+  fb.DownvoteCountOnQuestion,
+  fb.AvgAnswerScore,
+  fb.LatestAnswerDate,
+  fb.LatestEditorName,
+  fb.LatestEditorDate,
+  fb.DistinctEditors,
+  fb.UserTotalBadges,
+  'AnalysisComplete' AS Status,
+  fb.QuestionOwnerUserId
+FROM FinalBenchmark fb
+WHERE
+  fb.QuestionCreationDate IS NOT NULL
+  AND fb.AnswerCountPerQuestion IS NOT NULL
+  AND fb.AvgAnswerScore > 0
+  AND fb.DistinctEditors > 1
+ORDER BY
+  fb.QuestionCreationDate DESC,
+  fb.FavoriteCount DESC
+LIMIT 100;

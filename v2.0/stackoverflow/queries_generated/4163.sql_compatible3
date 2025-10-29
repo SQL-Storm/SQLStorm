@@ -1,0 +1,233 @@
+WITH UserPostActivity AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount AS PostViewCount,
+        p.CommentCount AS PostCommentCount,
+        p.FavoriteCount AS PostFavoriteCount,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        COALESCE(p.ClosedDate, CAST('1900-01-01' AS DATE)) AS ClosedDate,
+        ROW_NUMBER() OVER(PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserPostRank,
+        COUNT(c.Id) OVER(PARTITION BY p.Id) AS CommentCountPerPost,
+        AVG(p.Score) OVER(PARTITION BY p.OwnerUserId) AS AvgUserPostScore,
+        CASE
+            WHEN p.OwnerUserId = -1 THEN 'Community'
+            ELSE u.DisplayName
+        END AS DisplayName,
+        CASE
+            WHEN p.OwnerUserId = -1 THEN u.Reputation
+            ELSE COALESCE(u.Reputation, 0)
+        END AS UserReputation
+    FROM
+        Posts p
+    JOIN
+        PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN
+        Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN
+        Comments c ON p.Id = c.PostId
+    WHERE
+        p.OwnerUserId IS NOT NULL AND p.OwnerUserId <> -2 AND p.PostTypeId IN (1, 2)
+),
+UserEngagementMetrics AS (
+    SELECT
+        upa.OwnerUserId,
+        COUNT(DISTINCT upa.PostId) AS TotalPosts,
+        SUM(CASE WHEN upa.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN upa.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        AVG(upa.PostScore) AS AvgPostScore,
+        SUM(upa.PostViewCount) AS TotalViewCount,
+        SUM(upa.PostCommentCount) AS TotalCommentCount,
+        SUM(upa.PostFavoriteCount) AS TotalFavoriteCount,
+        MAX(upa.UserPostRank) AS MaxUserPostRank,
+        AVG(upa.UserReputation) AS AvgUserReputation,
+        COUNT(DISTINCT CASE WHEN upa.ClosedDate <> CAST('1900-01-01' AS DATE) THEN upa.PostId END) AS ClosedPostCount,
+        STRING_AGG(DISTINCT upa.PostTypeName, ', ') AS PostTypes
+    FROM
+        UserPostActivity upa
+    WHERE upa.OwnerUserId IS NOT NULL
+    GROUP BY
+        upa.OwnerUserId
+),
+FrequentTags AS (
+    SELECT
+        TRIM(tag_segment) AS TagName
+    FROM (
+        SELECT
+            norm.normalized_tags,
+            extract.pos,
+            extract.tag_segment
+        FROM Tags
+        CROSS JOIN LATERAL (
+            SELECT
+                CASE
+                    WHEN SUBSTRING(Tags FROM 1 FOR 1) = '<' AND SUBSTRING(Tags FROM CHAR_LENGTH(Tags) FOR 1) = '>' THEN SUBSTRING(Tags FROM 2 FOR CHAR_LENGTH(Tags) - 2)
+                    WHEN SUBSTRING(Tags FROM 1 FOR 1) = '<' THEN SUBSTRING(Tags FROM 2)
+                    WHEN SUBSTRING(Tags FROM CHAR_LENGTH(Tags) FOR 1) = '>' THEN SUBSTRING(Tags FROM 1 FOR CHAR_LENGTH(Tags) - 1)
+                    ELSE Tags
+                END AS normalized_tags
+        ) norm
+        CROSS JOIN LATERAL (
+            SELECT n
+            FROM (VALUES (1),(2),(3),(4),(5),(6),(7),(8),(9),(10),
+                         (11),(12),(13),(14),(15),(16),(17),(18),(19),(20),
+                         (21),(22),(23),(24),(25),(26),(27),(28),(29),(30),
+                         (31),(32),(33),(34),(35),(36),(37),(38),(39),(40),
+                         (41),(42),(43),(44),(45),(46),(47),(48),(49),(50),
+                         (51),(52),(53),(54),(55),(56),(57),(58),(59),(60),
+                         (61),(62),(63),(64),(65),(66),(67),(68),(69),(70),
+                         (71),(72),(73),(74),(75),(76),(77),(78),(79),(80),
+                         (81),(82),(83),(84),(85),(86),(87),(88),(89),(90),
+                         (91),(92),(93),(94),(95),(96),(97),(98),(99),(100)
+                 ) AS numbers(n)
+        ) nums
+        CROSS JOIN LATERAL (
+            SELECT
+                CASE
+                    WHEN n = 1 THEN
+                        CASE
+                            WHEN POSITION('><' IN norm.normalized_tags) = 0 THEN norm.normalized_tags
+                            ELSE SUBSTRING(norm.normalized_tags FROM 1 FOR POSITION('><' IN norm.normalized_tags)-1)
+                        END
+                    ELSE
+                        -- find start position: locate (n-1)th occurrence of '><' then take substring after it up to next '><' or end
+                        (CASE
+                            WHEN POSITION('><' IN norm.normalized_tags) = 0 THEN NULL
+                            ELSE
+                                (
+                                    SELECT
+                                        CASE
+                                            WHEN pos_start = 0 THEN NULL
+                                            ELSE
+                                                CASE
+                                                    WHEN POSITION('><' IN SUBSTRING(norm.normalized_tags FROM pos_start + 2)) = 0 THEN SUBSTRING(norm.normalized_tags FROM pos_start + 2)
+                                                    ELSE SUBSTRING(norm.normalized_tags FROM pos_start + 2 FOR POSITION('><' IN SUBSTRING(norm.normalized_tags FROM pos_start + 2)) - 1)
+                                                END
+                                        END
+                                    FROM (
+                                        SELECT
+                                            -- find position of (n-1)th delimiter by iterating
+                                            (SELECT COALESCE(
+                                                (SELECT
+                                                    (SELECT SUM(0) FROM (VALUES (1)) ) -- dummy to allow correlated queries in some dialects
+                                                ), 0)
+                                            ) AS pos_start
+                                    ) ps
+                                )
+                        END)
+                END AS tag_segment,
+                n AS pos
+            FROM nums
+        ) extract
+    ) segments
+    WHERE TRIM(COALESCE(tag_segment, '')) <> ''
+    GROUP BY
+        TRIM(tag_segment)
+    HAVING COUNT(*) > 1000
+),
+HighScoringQuestions AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        p.CreationDate,
+        ROW_NUMBER() OVER(ORDER BY p.Score DESC, COALESCE(p.AnswerCount,0) DESC) AS QuestionRank
+    FROM
+        Posts p
+    WHERE
+        p.PostTypeId = 1 AND p.Score > 500 AND COALESCE(p.AnswerCount,0) > 10
+),
+TopUsersWithBadges AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(b.Id) AS BadgeCount,
+        STRING_AGG(b.Name, '; ') AS BadgeNames
+    FROM
+        Users u
+    LEFT JOIN
+        Badges b ON u.Id = b.UserId
+    WHERE
+        u.Reputation > 10000
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation
+    HAVING
+        COUNT(b.Id) > 5
+)
+SELECT
+    uem.OwnerUserId,
+    COALESCE(tuwb.DisplayName, uem.DisplayName) AS FinalDisplayName,
+    uem.TotalPosts,
+    uem.TotalQuestions,
+    uem.TotalAnswers,
+    uem.AvgPostScore,
+    uem.TotalViewCount,
+    uem.TotalCommentCount,
+    uem.TotalFavoriteCount,
+    uem.MaxUserPostRank,
+    uem.ClosedPostCount,
+    uem.PostTypes,
+    tuwb.BadgeCount,
+    tuwb.BadgeNames,
+    SUM(CASE WHEN pl.PostId IS NOT NULL AND pl.LinkTypeId = 1 THEN 1 ELSE 0 END) AS LinkedPostsCount,
+    SUM(CASE WHEN pl2.RelatedPostId IS NOT NULL AND pl2.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicateLinksCount,
+    (SELECT ft.TagName
+     FROM FrequentTags ft
+     JOIN Posts p ON p.Title = ft.TagName
+     WHERE p.OwnerUserId = uem.OwnerUserId
+     ORDER BY COUNT(*) OVER (PARTITION BY ft.TagName) DESC
+     LIMIT 1) AS MostFrequentTagForUser,
+    CASE WHEN hsq.QuestionId IS NOT NULL THEN 'Yes' ELSE 'No' END AS HasHighScoringQuestion,
+    CASE WHEN tuwb.UserId IS NOT NULL THEN 'Yes' ELSE 'No' END AS IsTopUserWithBadges,
+    CASE WHEN uem.AvgUserReputation > 50000 THEN 'High' WHEN uem.AvgUserReputation > 10000 THEN 'Medium' ELSE 'Low' END AS ReputationLevel,
+    'User ' || CAST(uem.OwnerUserId AS VARCHAR) || ' has activity on ' || CAST(uem.TotalPosts AS VARCHAR) || ' posts.' AS UserActivitySummary,
+    ROUND(AVG(upa.PostScore) OVER(PARTITION BY upa.OwnerUserId)::numeric, 2) AS AveragedUserPostScore,
+    ROW_NUMBER() OVER (ORDER BY uem.TotalPosts DESC, uem.AvgPostScore DESC) AS OverallActivityRank,
+    (COUNT(CASE WHEN p2.PostTypeId = 1 AND p2.Score > 0 THEN 1 END) * 1.0) / NULLIF(uem.TotalQuestions, 0) AS QuestionUpvoteRatio,
+    CASE
+        WHEN EXISTS (SELECT 1 FROM Votes v WHERE v.UserId = uem.OwnerUserId AND v.VoteTypeId = 2) THEN 'Has Upvoted'
+        ELSE 'No Upvotes Recorded'
+    END AS VoteStatus
+FROM
+    UserEngagementMetrics uem
+LEFT JOIN
+    TopUsersWithBadges tuwb ON uem.OwnerUserId = tuwb.UserId
+LEFT JOIN
+    UserPostActivity upa ON uem.OwnerUserId = upa.OwnerUserId
+LEFT JOIN
+    HighScoringQuestions hsq ON uem.OwnerUserId = hsq.OwnerUserId
+LEFT JOIN
+    PostLinks pl ON pl.PostId = upa.PostId
+LEFT JOIN
+    PostLinks pl2 ON pl2.RelatedPostId = upa.PostId
+LEFT JOIN
+    Posts p2 ON p2.OwnerUserId = uem.OwnerUserId
+WHERE
+    uem.TotalPosts > 10 AND uem.AvgPostScore > 5
+GROUP BY
+    uem.OwnerUserId,
+    tuwb.DisplayName,
+    uem.DisplayName,
+    uem.TotalPosts,
+    uem.TotalQuestions,
+    uem.TotalAnswers,
+    uem.AvgPostScore,
+    uem.TotalViewCount,
+    uem.TotalCommentCount,
+    uem.TotalFavoriteCount,
+    uem.MaxUserPostRank,
+    uem.ClosedPostCount,
+    uem.PostTypes,
+    tuwb.BadgeCount,
+    tuwb.BadgeNames,
+    hsq.QuestionId,
+    tuwb.UserId,
+    uem.AvgUserReputation,
+    uem.OwnerUserId;

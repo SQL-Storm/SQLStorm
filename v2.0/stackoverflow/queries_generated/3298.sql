@@ -1,0 +1,123 @@
+-- {"query": "3298.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1780} 
+
+WITH 
+    -- All tags that appear in question posts
+    tag_questions AS (
+        SELECT 
+            t.Id               AS tag_id,
+            t.TagName          AS tag_name,
+            p.Id               AS question_id,
+            p.OwnerUserId      AS question_owner_id,
+            p.CreationDate    AS question_created,
+            p.Score            AS question_score
+        FROM Tags t
+        JOIN Posts p
+          ON p.PostTypeId = 1                         -- only questions
+         AND p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+    ),
+
+    -- All answer posts
+    answer_posts AS (
+        SELECT 
+            a.Id               AS answer_id,
+            a.ParentId         AS question_id,
+            a.OwnerUserId      AS answer_owner_id,
+            a.CreationDate    AS answer_created,
+            a.Score            AS answer_score
+        FROM Posts a
+        WHERE a.PostTypeId = 2                         -- only answers
+    ),
+
+    -- Aggregate answers per (tag, user) pair
+    user_tag_agg AS (
+        SELECT
+            tq.tag_id,
+            tq.tag_name,
+            ap.answer_owner_id,
+            COUNT(*)                                   AS answers_cnt,
+            AVG(ap.answer_score*1.0)                   AS avg_answer_score,
+            MAX(ap.answer_created)                     AS last_answer_ts
+        FROM tag_questions tq
+        JOIN answer_posts ap
+          ON ap.question_id = tq.question_id
+        GROUP BY 
+            tq.tag_id,
+            tq.tag_name,
+            ap.answer_owner_id
+    ),
+
+    -- Rank users per tag by activity
+    ranked_users AS (
+        SELECT
+            uta.*,
+            ROW_NUMBER() OVER (
+                PARTITION BY uta.tag_id
+                ORDER BY uta.answers_cnt DESC,
+                         uta.avg_answer_score DESC,
+                         uta.last_answer_ts DESC
+            )                                           AS rn
+        FROM user_tag_agg uta
+    ),
+
+    -- Latest badge per user (if any)
+    latest_badge AS (
+        SELECT 
+            b.UserId,
+            b.Name,
+            b.Date,
+            ROW_NUMBER() OVER (
+                PARTITION BY b.UserId
+                ORDER BY b.Date DESC
+            )                                           AS rn
+        FROM Badges b
+    )
+
+SELECT
+    t.tag_name,
+    COALESCE(u.DisplayName, 'Anonymous')                             AS user_display,
+    ru.answers_cnt,
+    ru.avg_answer_score,
+    ru.last_answer_ts,
+    lb.Name                                                          AS last_badge_name,
+    lb.Date                                                          AS last_badge_date,
+    -- scalar correlated sub‑query: total up‑votes the user ever cast
+    (SELECT COUNT(*)
+       FROM Votes v
+      WHERE v.UserId = ru.answer_owner_id
+        AND v.VoteTypeId = 2)                                       AS upvotes_given,
+    -- example of complex expression with NULL handling
+    CASE 
+        WHEN ru.avg_answer_score IS NULL THEN NULL
+        WHEN ru.avg_answer_score >= 10 THEN 'Excellent'
+        WHEN ru.avg_answer_score >= 5  THEN 'Good'
+        ELSE 'Average'
+    END                                                             AS quality_tier,
+    CONCAT(t.tag_name, ':', COALESCE(u.DisplayName, 'Anon'))        AS tag_user_key
+FROM 
+    ranked_users ru
+LEFT JOIN Users u          ON u.Id = ru.answer_owner_id
+LEFT JOIN Tags t           ON t.Id = ru.tag_id
+LEFT JOIN latest_badge lb  ON lb.UserId = ru.answer_owner_id AND lb.rn = 1
+WHERE 
+    ru.rn <= 5                                    -- top‑5 per tag
+/* ------------------------------------------------------------------ */
+/* Include tags that have no answers at all (outer side of UNION ALL) */
+UNION ALL
+SELECT
+    t.tag_name,
+    NULL                                            AS user_display,
+    0                                               AS answers_cnt,
+    NULL                                            AS avg_answer_score,
+    NULL                                            AS last_answer_ts,
+    NULL                                            AS last_badge_name,
+    NULL                                            AS last_badge_date,
+    0                                               AS upvotes_given,
+    NULL                                            AS quality_tier,
+    CONCAT(t.tag_name, ':NoAnswers')                AS tag_user_key
+FROM 
+    Tags t
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM tag_questions tq
+    WHERE tq.tag_id = t.Id
+);

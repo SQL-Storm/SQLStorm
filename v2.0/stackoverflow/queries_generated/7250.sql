@@ -1,0 +1,85 @@
+-- {"query": "7250.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2011} 
+SELECT 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) as TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN p.Id END) as QuestionsWithAcceptedAnswer,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.Score > 0 THEN p.Id END) as PositiveScoreAnswers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.ViewCount > 1000 THEN p.Id END) as HighViewQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.OwnerUserId = u.Id THEN p.Id END) as OwnAnswers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AnswerCount > 5 THEN p.Id END) as QuestionsWithManyAnswers,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END), 0) as TotalQuestionScore,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END), 0) as TotalAnswerScore,
+    AVG(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE NULL END) as AvgQuestionViews,
+    MAX(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END) as MaxQuestionViews,
+    MAX(p.CreationDate) as LatestPostDate,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) as GoldBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) as SilverBadges,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) as BronzeBadges,
+    (SELECT STRING_AGG(b.Name, ', ') FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) as GoldBadgeNames,
+    (SELECT STRING_AGG(b.Name, ', ') FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) as SilverBadgeNames,
+    (SELECT STRING_AGG(b.Name, ', ') FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) as BronzeBadgeNames,
+    COUNT(DISTINCT c.Id) as CommentCount,
+    COUNT(DISTINCT CASE WHEN c.Score > 0 THEN c.Id END) as PositiveScoreComments,
+    COUNT(DISTINCT CASE WHEN u.Id IS NULL THEN p.Id END) as PostsByDeletedUsers,
+    CASE 
+        WHEN COUNT(DISTINCT p.Id) > 1000 THEN 'Elite'
+        WHEN COUNT(DISTINCT p.Id) > 500 THEN 'Veteran'
+        WHEN COUNT(DISTINCT p.Id) > 100 THEN 'Regular'
+        WHEN COUNT(DISTINCT p.Id) > 10 THEN 'Newbie'
+        ELSE 'Beginner'
+    END as UserTier,
+    (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = u.Id AND p2.PostTypeId = 1 AND p2.Score >= 50) as HighScoreQuestions,
+    (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = u.Id AND p2.PostTypeId = 2 AND p2.Score >= 50) as HighScoreAnswers,
+    COALESCE(AVG(DATEDIFF(day, p.CreationDate, p.LastActivityDate)), 0) as AvgDaysBetweenCreationAndActivity,
+    (SELECT COUNT(*) FROM Posts p3 WHERE p3.OwnerUserId = u.Id AND p3.PostTypeId = 1 AND p3.ClosedDate IS NOT NULL AND p3.LastActivityDate > p3.ClosedDate) as ClosedQuestionsResolved,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.UserId = u.Id AND ph.PostHistoryTypeId IN (1, 2, 4, 5, 6, 24)) as EditCount,
+    (SELECT COUNT(DISTINCT ph.PostId) FROM PostHistory ph WHERE ph.UserId = u.Id AND ph.PostHistoryTypeId IN (1, 2, 4, 5, 6, 24)) as EditablePostsCount,
+    (SELECT COUNT(*)
+     FROM Posts p4 
+     WHERE p4.OwnerUserId = u.Id 
+     AND p4.PostTypeId = 1
+     AND EXISTS (SELECT 1 FROM PostHistory ph2 WHERE ph2.PostId = p4.Id AND ph2.PostHistoryTypeId IN (1, 2, 4, 5, 6, 24) AND ph2.UserId = u.Id)
+    ) as EditedQuestions,
+    (SELECT STRING_AGG(DISTINCT t.TagName, ', ')
+     FROM Posts p5
+     INNER JOIN (
+         SELECT REGEXP_SPLIT_TO_TABLE(p6.Tags, '[<>]+') as TagName
+         FROM Posts p6
+         WHERE p6.OwnerUserId = u.Id AND p6.PostTypeId = 1 AND p6.Tags IS NOT NULL
+     ) t ON t.TagName IS NOT NULL
+     WHERE LENGTH(TRIM(t.TagName)) > 0
+    ) as UserTags,
+    ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC, u.Reputation DESC) as RankByPosts,
+    DENSE_RANK() OVER (ORDER BY u.Reputation DESC) as RankByReputation,
+    NTILE(10) OVER (ORDER BY u.Reputation DESC) as ReputationDecile,
+    LAG(u.Reputation, 1) OVER (ORDER BY u.Reputation DESC) as PreviousUserReputation,
+    LAG(u.Id, 1) OVER (ORDER BY u.Reputation DESC) as PreviousUserId,
+    (u.Reputation - LAG(u.Reputation, 1) OVER (ORDER BY u.Reputation DESC)) as ReputationDifferenceFromPrevious,
+    (SELECT COUNT(DISTINCT v.PostId) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId IN (1, 2, 3)) as TotalVotes,
+    (SELECT COUNT(DISTINCT v.PostId) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 2) as UpVotes,
+    (SELECT COUNT(DISTINCT v.PostId) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 3) as DownVotes,
+    (SELECT COUNT(DISTINCT v.PostId) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 1) as AcceptedAnswers,
+    (SELECT COUNT(DISTINCT v.PostId) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 5) as FavoriteCount,
+    (SELECT COUNT(DISTINCT p7.Id) FROM Posts p7 INNER JOIN PostHistory ph3 ON ph3.PostId = p7.Id WHERE ph3.UserId = u.Id AND ph3.PostHistoryTypeId = 35) as PostsMigratedAway,
+    (SELECT COUNT(DISTINCT p8.Id) FROM Posts p8 INNER JOIN PostHistory ph4 ON ph4.PostId = p8.Id WHERE ph4.UserId = u.Id AND ph4.PostHistoryTypeId = 36) as PostsMigratedHere,
+    (SELECT COUNT(DISTINCT ph5.PostId) FROM PostHistory ph5 WHERE ph5.UserId = u.Id AND ph5.PostHistoryTypeId = 19) as QuestionsProtected,
+    (SELECT COUNT(DISTINCT ph6.PostId) FROM PostHistory ph6 WHERE ph6.UserId = u.Id AND ph6.PostHistoryTypeId = 20) as QuestionsUnprotected,
+    (SELECT COUNT(DISTINCT ph7.PostId) FROM PostHistory ph7 WHERE ph7.UserId = u.Id AND ph7.PostHistoryTypeId = 14) as PostsLocked,
+    (SELECT COUNT(DISTINCT ph8.PostId) FROM PostHistory ph8 WHERE ph8.UserId = u.Id AND ph8.PostHistoryTypeId = 15) as PostsUnlocked,
+    (SELECT COALESCE(SUM(p9.Score), 0) FROM Posts p9 WHERE p9.OwnerUserId = u.Id AND p9.PostTypeId = 1) as TotalQuestionScoreAllTime,
+    (SELECT COALESCE(SUM(p10.Score), 0) FROM Posts p10 WHERE p10.OwnerUserId = u.Id AND p10.PostTypeId = 2) as TotalAnswerScoreAllTime,
+    (SELECT COUNT(*) FROM PostLinks pl1 WHERE pl1.PostId = u.Id) as TotalLinks,
+    (SELECT COUNT(DISTINCT pl2.RelatedPostId) FROM PostLinks pl2 WHERE pl2.PostId = u.Id) as UniqueLinkedPosts,
+    (SELECT COUNT(*) FROM PostHistory ph9 WHERE ph9.UserId = u.Id AND ph9.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20, 35, 36)) as PostActivityCount
+FROM Users u
+LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+LEFT JOIN Comments c ON c.UserId = u.Id
+WHERE u.Reputation > 0
+GROUP BY u.Id, u.DisplayName, u.Reputation
+HAVING COUNT(DISTINCT p.Id) > 0
+ORDER BY COUNT(DISTINCT p.Id) DESC, u.Reputation DESC
+LIMIT 10000;

@@ -1,0 +1,143 @@
+-- {"query": "3643.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2125} 
+
+/*  Complex benchmark query on the StackOverflow schema  */
+WITH
+/* --------------------------------------------------------------------
+   1) Base statistics per user (questions, answers, badges, vote score)
+   -------------------------------------------------------------------- */
+user_stats AS (
+    SELECT
+        u.id                                      AS user_id,
+        u.displayname                             AS display_name,
+        u.reputation,
+        COALESCE(u.views,0)                       AS total_views,
+        /* number of questions owned by the user */
+        (SELECT COUNT(*) FROM posts p
+         WHERE p.owneruserid = u.id AND p.posttypeid = 1) AS ques_cnt,
+        /* number of answers owned by the user */
+        (SELECT COUNT(*) FROM posts p
+         WHERE p.owneruserid = u.id AND p.posttypeid = 2) AS ans_cnt,
+        /* number of badges earned */
+        (SELECT COUNT(*) FROM badges b
+         WHERE b.userid = u.id)                  AS badge_cnt,
+        /* sum of vote scores on all the user’s posts */
+        (SELECT COALESCE(SUM(v.vote_type_id),0)
+         FROM votes v
+         JOIN posts p ON p.id = v.postid
+         WHERE p.owneruserid = u.id)             AS vote_score,
+        ROW_NUMBER() OVER (ORDER BY u.reputation DESC) AS rn_rep
+    FROM users u
+),
+
+/* --------------------------------------------------------------------
+   2) Keep only “high‑rep” users (rep > 10 000) and give them a rank
+   -------------------------------------------------------------------- */
+top_users AS (
+    SELECT *
+    FROM user_stats
+    WHERE rn_rep = 1 AND reputation > 10000
+),
+
+/* --------------------------------------------------------------------
+   3) Recent closed questions (latest close event per question)
+   -------------------------------------------------------------------- */
+recent_closed AS (
+    SELECT
+        p.id                                   AS post_id,
+        p.title,
+        ph.creationdate                        AS closed_date,
+        CAST(ph.comment AS INTEGER)            AS close_reason_id,
+        ROW_NUMBER() OVER (PARTITION BY p.id
+                           ORDER BY ph.creationdate DESC) AS rn
+    FROM posts p
+    JOIN posthistory ph
+      ON ph.postid = p.id
+     AND ph.posthistorytypeid = 10               -- Post Closed
+    WHERE p.posttypeid = 1                       -- only questions
+),
+
+/* --------------------------------------------------------------------
+   4) Tag usage summary (most used tag per user, derived from question tags)
+   -------------------------------------------------------------------- */
+user_tags AS (
+    SELECT
+        pu.owneruserid                         AS user_id,
+        TRIM(BOTH '<>' FROM UNNEST(string_to_array(pu.tags,'><')) ) AS tag,
+        COUNT(*)                               AS tag_use_cnt,
+        ROW_NUMBER() OVER (PARTITION BY pu.owneruserid
+                           ORDER BY COUNT(*) DESC) AS rn_tag
+    FROM posts pu
+    WHERE pu.posttypeid = 1                      -- questions only
+      AND pu.owneruserid IS NOT NULL
+      AND pu.tags IS NOT NULL
+    GROUP BY pu.owneruserid, tag
+),
+
+/* --------------------------------------------------------------------
+   5) Assemble everything per top user
+   -------------------------------------------------------------------- */
+aggregated AS (
+    SELECT
+        tu.user_id,
+        tu.display_name,
+        tu.reputation,
+        tu.total_views,
+        tu.ques_cnt,
+        tu.ans_cnt,
+        tu.badge_cnt,
+        tu.vote_score,
+        /* last closed question (if any) */
+        rc.title                                 AS last_closed_q_title,
+        rc.closed_date                           AS last_closed_q_date,
+        COALESCE(crt.name,'<unknown>')           AS close_reason_name,
+        /* most used tag for the user */
+        ut.tag                                    AS top_tag,
+        ut.tag_use_cnt                           AS top_tag_use_cnt
+    FROM top_users tu
+    /* left‑join to the most recent closed question of any of the user’s posts */
+    LEFT JOIN LATERAL (
+        SELECT rc2.title, rc2.closed_date, rc2.close_reason_id
+        FROM recent_closed rc2
+        WHERE rc2.rn = 1
+          AND EXISTS (SELECT 1 FROM posts p
+                      WHERE p.id = rc2.post_id
+                        AND p.owneruserid = tu.user_id)
+        ORDER BY rc2.closed_date DESC
+        LIMIT 1
+    ) rc ON TRUE
+    LEFT JOIN closereasontypes crt
+      ON rc.close_reason_id = crt.id
+    /* left‑join to the user’s most used tag */
+    LEFT JOIN LATERAL (
+        SELECT tag, tag_use_cnt
+        FROM user_tags ut2
+        WHERE ut2.user_id = tu.user_id
+          AND ut2.rn_tag = 1
+    ) ut ON TRUE
+)
+
+SELECT
+    user_id,
+    display_name,
+    reputation,
+    total_views,
+    ques_cnt,
+    ans_cnt,
+    badge_cnt,
+    vote_score,
+    COALESCE(last_closed_q_title,'<none>')   AS last_closed_question,
+    COALESCE(last_closed_q_date,'1970-01-01') AS last_closed_date,
+    close_reason_name,
+    COALESCE(top_tag,'<none>')               AS most_used_tag,
+    COALESCE(top_tag_use_cnt,0)              AS most_used_tag_count
+FROM aggregated
+WHERE vote_score IS NOT NULL
+ORDER BY reputation DESC, vote_score DESC
+OFFSET 0 FETCH FIRST 50 ROWS ONLY
+
+UNION ALL
+
+/*  Dummy row to keep the result‑set shape stable for some benchmarks  */
+SELECT
+    NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,
+    NULL,NULL,NULL,NULL,NULL;

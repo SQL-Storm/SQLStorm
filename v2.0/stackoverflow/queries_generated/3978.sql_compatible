@@ -1,0 +1,115 @@
+WITH UserPostStats AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COALESCE(SUM(p.Score), 0) AS TotalScore,
+        ROUND(AVG(p.Score)::numeric, 2) AS AvgScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        COUNT(DISTINCT regexp_split_to_table(p.Tags, '\><')) FILTER (WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL) AS DistinctTagCount
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id
+),
+UserBadgeStats AS (
+    SELECT
+        b.UserId,
+        COUNT(*) AS TotalBadges,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserVoteStats AS (
+    SELECT
+        v.UserId,
+        COUNT(*) FILTER (WHERE vt.Name = 'UpMod') AS UpVotesGiven,
+        COUNT(*) FILTER (WHERE vt.Name = 'DownMod') AS DownVotesGiven,
+        COUNT(*) FILTER (WHERE vt.Name = 'Favorite') AS FavoritesGiven
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY v.UserId
+),
+RecentActivity AS (
+    SELECT
+        ua.UserId,
+        GREATEST(
+            COALESCE(ua.LastPostDate, TIMESTAMP '1970-01-01'),
+            COALESCE(ua.LastBadgeDate, TIMESTAMP '1970-01-01'),
+            COALESCE(c.MaxCommentDate, TIMESTAMP '1970-01-01')
+        ) AS RecentActivityDate
+    FROM (
+        SELECT u.Id AS UserId,
+               up.LastPostDate,
+               ub.LastBadgeDate
+        FROM Users u
+        LEFT JOIN UserPostStats up ON up.UserId = u.Id
+        LEFT JOIN UserBadgeStats ub ON ub.UserId = u.Id
+    ) ua
+    LEFT JOIN (
+        SELECT UserId, MAX(CreationDate) AS MaxCommentDate
+        FROM Comments
+        GROUP BY UserId
+    ) c ON c.UserId = ua.UserId
+),
+Combined AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        COALESCE(up.QuestionCount, 0)      AS Questions,
+        COALESCE(up.AnswerCount, 0)        AS Answers,
+        COALESCE(up.TotalScore, 0)         AS ScoreSum,
+        COALESCE(up.AvgScore, 0)           AS AvgScore,
+        COALESCE(ub.TotalBadges, 0)        AS Badges,
+        COALESCE(ub.GoldBadges, 0)         AS Gold,
+        COALESCE(ub.SilverBadges, 0)       AS Silver,
+        COALESCE(ub.BronzeBadges, 0)       AS Bronze,
+        COALESCE(uv.UpVotesGiven, 0)       AS UpVotesGiven,
+        COALESCE(uv.DownVotesGiven, 0)     AS DownVotesGiven,
+        COALESCE(uv.FavoritesGiven, 0)     AS FavoritesGiven,
+        COALESCE(r.RecentActivityDate, u.CreationDate) AS RecentActivity,
+        CASE
+            WHEN u.Location IS NULL THEN 'Unknown'
+            WHEN LOWER(u.Location) LIKE '%usa%' THEN 'USA'
+            ELSE 'Other'
+        END                                 AS LocationGroup,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC)                         AS ReputationRank,
+        RANK()      OVER (ORDER BY COALESCE(up.TotalScore, 0) + COALESCE(ub.TotalBadges, 0) * 10 DESC) AS ContributionRank
+    FROM Users u
+    LEFT JOIN UserPostStats up ON up.UserId = u.Id
+    LEFT JOIN UserBadgeStats ub ON ub.UserId = u.Id
+    LEFT JOIN UserVoteStats uv ON uv.UserId = u.Id
+    LEFT JOIN RecentActivity r ON r.UserId = u.Id
+)
+
+SELECT *
+FROM Combined
+WHERE ReputationRank <= 100
+   OR ContributionRank <= 100
+   OR RecentActivity >= (CAST('2024-10-01' AS date) - INTERVAL '30' DAY)
+ORDER BY ReputationRank
+
+UNION ALL
+
+SELECT
+    -1                                          AS Id,
+    'Aggregated Totals'                         AS DisplayName,
+    SUM(Questions)                              AS Questions,
+    SUM(Answers)                                AS Answers,
+    SUM(ScoreSum)                               AS ScoreSum,
+    ROUND(AVG(AvgScore), 2)                     AS AvgScore,
+    SUM(Badges)                                 AS Badges,
+    SUM(Gold)                                   AS Gold,
+    SUM(Silver)                                 AS Silver,
+    SUM(Bronze)                                 AS Bronze,
+    SUM(UpVotesGiven)                           AS UpVotesGiven,
+    SUM(DownVotesGiven)                         AS DownVotesGiven,
+    SUM(FavoritesGiven)                         AS FavoritesGiven,
+    MAX(RecentActivity)                         AS RecentActivity,
+    NULL                                        AS LocationGroup,
+    NULL                                        AS ReputationRank,
+    NULL                                        AS ContributionRank
+FROM Combined
+WHERE ReputationRank IS NOT NULL;

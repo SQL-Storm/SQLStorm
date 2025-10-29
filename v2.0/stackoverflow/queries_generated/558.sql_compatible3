@@ -1,0 +1,409 @@
+WITH
+recent_user_activity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId IN (1,2) AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - interval '365 days') AS posts_last_year,
+        COUNT(DISTINCT c.Id) FILTER (WHERE c.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - interval '365 days') AS comments_last_year,
+        COUNT(v.Id) FILTER (WHERE v.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - interval '365 days' AND v.VoteTypeId IN (2,3,5)) AS votes_last_year,
+        SUM(COALESCE(p.Score,0)) FILTER (WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - interval '365 days') AS post_score_last_year
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+ranked_active_users AS (
+    SELECT
+        rua.*,
+        ROW_NUMBER() OVER (
+            ORDER BY
+                (posts_last_year*3 + comments_last_year*1 + votes_last_year*0.5 + COALESCE(post_score_last_year,0)*0.2) DESC,
+                Reputation DESC,
+                UserId
+        ) AS rn
+    FROM recent_user_activity rua
+),
+top_users AS (
+    SELECT *
+    FROM ranked_active_users
+    WHERE rn <= 200
+),
+questions AS (
+    SELECT
+        q.Id,
+        q.OwnerUserId,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.Title,
+        q.Tags,
+        q.AcceptedAnswerId,
+        q.ClosedDate,
+        q.AnswerCount,
+        q.FavoriteCount,
+        q.CommentCount,
+        COALESCE(q.LastActivityDate, q.CreationDate) AS LastActivityDate
+    FROM Posts q
+    WHERE q.PostTypeId = 1
+),
+question_tags AS (
+    SELECT
+        q.Id AS QuestionId,
+        string_to_array(substring(q.Tags, 2, GREATEST(length(q.Tags)-2, 0)), '><') AS tag_array,
+        COALESCE(NULLIF(regexp_replace(COALESCE(q.Tags,''), '[<>]+', ' ', 'g'), ''), '') AS tags_norm
+    FROM questions q
+),
+tag_popularity AS (
+    SELECT
+        t.TagName,
+        t.Count AS TagGlobalCount
+    FROM Tags t
+),
+post_vote_agg AS (
+    SELECT
+        v.PostId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes,
+        SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS favorites,
+        SUM(CASE WHEN v.VoteTypeId = 8 THEN COALESCE(v.BountyAmount,0) ELSE 0 END) AS bounty_started,
+        SUM(CASE WHEN v.VoteTypeId = 9 THEN COALESCE(v.BountyAmount,0) ELSE 0 END) AS bounty_awarded
+    FROM Votes v
+    WHERE v.VoteTypeId IN (2,3,5,8,9)
+    GROUP BY v.PostId
+),
+comment_activity AS (
+    SELECT
+        c.PostId,
+        date_trunc('hour', c.CreationDate) AS hour_bucket,
+        COUNT(*) AS comment_count_hour,
+        SUM(c.Score) AS comment_score_hour
+    FROM Comments c
+    GROUP BY c.PostId, date_trunc('hour', c.CreationDate)
+),
+comment_activity_roll AS (
+    SELECT
+        ca.PostId,
+        ca.hour_bucket,
+        ca.comment_count_hour,
+        SUM(ca.comment_count_hour) OVER (PARTITION BY ca.PostId ORDER BY ca.hour_bucket ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS comments_7h_moving_sum,
+        AVG(ca.comment_score_hour) OVER (PARTITION BY ca.PostId ORDER BY ca.hour_bucket ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS comment_score_7h_moving_avg
+    FROM comment_activity ca
+),
+post_history_signals AS (
+    SELECT
+        ph.PostId,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS closes,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS reopens,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4,5,6,24) THEN 1 ELSE 0 END) AS edits,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) AS last_closed_at,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.CreationDate END) AS last_reopened_at
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4,5,6,10,11,24)
+    GROUP BY ph.PostId
+),
+duplicates AS (
+    SELECT
+        pl.PostId,
+        COUNT(*) FILTER (WHERE pl.LinkTypeId = 3) AS dup_marks,
+        COUNT(*) FILTER (WHERE pl.LinkTypeId = 1) AS linked_marks,
+        MAX(CASE WHEN pl.LinkTypeId = 3 THEN pl.RelatedPostId END) AS sample_duplicate_of
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId IN (1,3)
+    GROUP BY pl.PostId
+),
+answers AS (
+    SELECT
+        a.Id,
+        a.ParentId AS QuestionId,
+        a.OwnerUserId,
+        a.CreationDate,
+        a.Score
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+),
+accepted_answer_info AS (
+    SELECT
+        q.Id AS QuestionId,
+        a.Id AS AcceptedAnswerId,
+        a.OwnerUserId AS AcceptedOwnerId,
+        a.CreationDate AS AcceptedCreated,
+        a.Score AS AcceptedScore,
+        CAST(EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate)) AS bigint) AS seconds_to_accept
+    FROM questions q
+    JOIN answers a ON a.Id = q.AcceptedAnswerId
+),
+answer_stats AS (
+    SELECT
+        a.QuestionId,
+        COUNT(*) AS total_answers,
+        AVG(a.Score) AS avg_answer_score,
+        MAX(a.Score) AS max_answer_score,
+        MIN(a.Score) AS min_answer_score,
+        COUNT(*) FILTER (WHERE a.Score > 0) AS positive_answers
+    FROM answers a
+    GROUP BY a.QuestionId
+),
+question_tag_explode AS (
+    SELECT
+        qt.QuestionId,
+        LOWER(trim(t)) AS tagname
+    FROM question_tags qt
+    CROSS JOIN LATERAL unnest(qt.tag_array) AS t
+),
+question_tag_metrics AS (
+    SELECT
+        qte.QuestionId,
+        COUNT(*) AS tag_count,
+        SUM(COALESCE(tp.TagGlobalCount,0)) AS sum_tag_popularity,
+        AVG(NULLIF(tp.TagGlobalCount,0)) AS avg_tag_popularity_nonzero,
+        MIN(tp.TagGlobalCount) AS min_tag_popularity,
+        MAX(tp.TagGlobalCount) AS max_tag_popularity
+    FROM question_tag_explode qte
+    LEFT JOIN tag_popularity tp ON tp.TagName = qte.tagname
+    GROUP BY qte.QuestionId
+),
+question_month_scores AS (
+    SELECT
+        date_trunc('month', q.CreationDate) AS month_start,
+        q.Score
+    FROM questions q
+),
+monthly_percentiles AS (
+    SELECT
+        month_start,
+        array_agg(score ORDER BY score) AS scores_sorted,
+        COUNT(*) AS cnt
+    FROM question_month_scores
+    GROUP BY month_start
+),
+question_score_percentiles AS (
+    SELECT
+        q.Id AS QuestionId,
+        mp_month.p50 AS p50_month_score,
+        mp_month.p90 AS p90_month_score
+    FROM questions q
+    LEFT JOIN (
+        SELECT
+            month_start,
+            CASE WHEN cnt = 0 THEN NULL
+                 ELSE scores_sorted[CAST(CEIL(0.5 * cnt) AS integer)] END AS p50,
+            CASE WHEN cnt = 0 THEN NULL
+                 ELSE scores_sorted[CAST(CEIL(0.9 * cnt) AS integer)] END AS p90
+        FROM monthly_percentiles
+    ) mp_month
+    ON mp_month.month_start = date_trunc('month', q.CreationDate)
+),
+top_user_questions AS (
+    SELECT
+        q.*,
+        tu.UserId AS OwnerId,
+        tu.DisplayName AS OwnerName,
+        tu.Reputation AS OwnerRep
+    FROM questions q
+    JOIN top_users tu ON tu.UserId = q.OwnerUserId
+    WHERE q.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - interval '2 years'
+),
+enriched AS (
+    SELECT
+        tuq.Id AS QuestionId,
+        tuq.OwnerId,
+        tuq.OwnerName,
+        tuq.OwnerRep,
+        tuq.Title,
+        tuq.Tags,
+        tuq.Score,
+        tuq.ViewCount,
+        tuq.AnswerCount,
+        tuq.FavoriteCount,
+        tuq.CommentCount,
+        tuq.CreationDate,
+        tuq.LastActivityDate,
+        COALESCE(pva.upvotes,0) AS upvotes,
+        COALESCE(pva.downvotes,0) AS downvotes,
+        COALESCE(pva.favorites,0) AS favorites_votes,
+        COALESCE(pva.bounty_started,0) AS bounty_started,
+        COALESCE(pva.bounty_awarded,0) AS bounty_awarded,
+        COALESCE(phs.closes,0) AS closes,
+        COALESCE(phs.reopens,0) AS reopens,
+        COALESCE(phs.edits,0) AS edits,
+        phs.last_closed_at,
+        phs.last_reopened_at,
+        COALESCE(d.dup_marks,0) AS dup_marks,
+        COALESCE(d.linked_marks,0) AS linked_marks,
+        d.sample_duplicate_of,
+        COALESCE(as2.total_answers,0) AS total_answers,
+        as2.avg_answer_score,
+        as2.max_answer_score,
+        as2.min_answer_score,
+        COALESCE(as2.positive_answers,0) AS positive_answers,
+        COALESCE(qtm.tag_count, 0) AS tag_count,
+        COALESCE(qtm.sum_tag_popularity, 0) AS sum_tag_popularity,
+        qtm.avg_tag_popularity_nonzero,
+        qtm.min_tag_popularity,
+        qtm.max_tag_popularity,
+        qsp.p50_month_score,
+        qsp.p90_month_score,
+        aai.AcceptedAnswerId,
+        aai.AcceptedOwnerId,
+        aai.AcceptedCreated,
+        aai.AcceptedScore,
+        aai.seconds_to_accept,
+        CASE
+            WHEN tuq.ClosedDate IS NOT NULL AND COALESCE(phs.reopens,0) = 0 THEN 'ClosedOnly'
+            WHEN tuq.ClosedDate IS NOT NULL AND COALESCE(phs.reopens,0) > 0 THEN 'ClosedThenReopened'
+            WHEN COALESCE(phs.closes,0) = 0 AND COALESCE(phs.edits,0) > 2 THEN 'HeavilyEditedOpen'
+            ELSE 'OpenOrLightlyEdited'
+        END AS lifecycle_bucket,
+        CASE
+            WHEN COALESCE(pva.upvotes,0) + COALESCE(pva.downvotes,0) = 0 THEN NULL
+            ELSE ROUND((CAST(COALESCE(pva.upvotes,0) AS numeric)) / NULLIF(CAST((COALESCE(pva.upvotes,0)+COALESCE(pva.downvotes,0)) AS numeric),0), 4)
+        END AS upvote_ratio,
+        CASE WHEN tuq.Score >= COALESCE(qsp.p90_month_score, tuq.Score) THEN 1 ELSE 0 END AS is_top_decile_month,
+        CASE WHEN tuq.Score >= COALESCE(qsp.p50_month_score, tuq.Score) THEN 1 ELSE 0 END AS is_above_median_month,
+        CASE WHEN aai.AcceptedOwnerId = tuq.OwnerId THEN 1 ELSE 0 END AS accepted_by_op,
+        NULLIF(length(COALESCE(tuq.Title,'')),0) AS title_len,
+        NULLIF(length(regexp_replace(COALESCE(tuq.Tags,''), '[<>]', '', 'g')),0) AS tags_len_sans_brackets
+    FROM top_user_questions tuq
+    LEFT JOIN post_vote_agg pva ON pva.PostId = tuq.Id
+    LEFT JOIN post_history_signals phs ON phs.PostId = tuq.Id
+    LEFT JOIN duplicates d ON d.PostId = tuq.Id
+    LEFT JOIN answer_stats as2 ON as2.QuestionId = tuq.Id
+    LEFT JOIN question_tag_metrics qtm ON qtm.QuestionId = tuq.Id
+    LEFT JOIN question_score_percentiles qsp ON qsp.QuestionId = tuq.Id
+    LEFT JOIN accepted_answer_info aai ON aai.QuestionId = tuq.Id
+),
+ranked AS (
+    SELECT
+        e.*,
+        ROW_NUMBER() OVER (
+            PARTITION BY e.OwnerId
+            ORDER BY
+                (e.Score*2 + COALESCE(e.upvotes,0) - COALESCE(e.downvotes,0) + COALESCE(e.favorites_votes,0)*0.25 + COALESCE(e.bounty_awarded,0)*0.01) DESC,
+                e.ViewCount DESC,
+                e.AnswerCount DESC,
+                e.CreationDate DESC
+        ) AS rn_user,
+        NTILE(20) OVER (ORDER BY e.Score DESC NULLS LAST) AS score_ventile,
+        RANK() OVER (ORDER BY (COALESCE(e.sum_tag_popularity,0)) DESC NULLS LAST) AS rank_tag_popularity
+    FROM enriched e
+),
+latest_comment_window AS (
+    SELECT DISTINCT ON (car.PostId)
+        car.PostId,
+        car.hour_bucket,
+        car.comments_7h_moving_sum,
+        car.comment_score_7h_moving_avg
+    FROM comment_activity_roll car
+    ORDER BY car.PostId, car.hour_bucket DESC
+),
+non_top_highscore AS (
+    SELECT q.Id
+    FROM questions q
+    LEFT JOIN top_users tu ON tu.UserId = q.OwnerUserId
+    WHERE tu.UserId IS NULL
+      AND q.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - interval '2 years'
+      AND q.Score >= (
+          SELECT COALESCE(
+              (SELECT scores_sorted[CAST(CEIL(0.95 * cnt) AS integer)]
+               FROM (
+                 SELECT array_agg(score ORDER BY score) AS scores_sorted, COUNT(*) AS cnt
+                 FROM questions q2
+                 WHERE q2.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - interval '2 years'
+               ) t
+              ), 0)
+      )
+    LIMIT 500
+),
+target_question_ids AS (
+    SELECT QuestionId FROM ranked WHERE rn_user <= 20
+    UNION
+    SELECT Id AS QuestionId FROM non_top_highscore
+),
+final_set AS (
+    SELECT r.*
+    FROM ranked r
+    JOIN target_question_ids tqi ON tqi.QuestionId = r.QuestionId
+)
+SELECT
+    f.QuestionId,
+    f.OwnerId,
+    f.OwnerName,
+    f.OwnerRep,
+    f.Title,
+    COALESCE(f.Tags,'') AS Tags,
+    f.Score,
+    f.ViewCount,
+    f.AnswerCount,
+    f.FavoriteCount,
+    f.CommentCount,
+    f.CreationDate,
+    f.LastActivityDate,
+    f.upvotes,
+    f.downvotes,
+    f.favorites_votes,
+    f.bounty_started,
+    f.bounty_awarded,
+    f.closes,
+    f.reopens,
+    f.edits,
+    f.last_closed_at,
+    f.last_reopened_at,
+    f.dup_marks,
+    f.linked_marks,
+    f.sample_duplicate_of,
+    f.total_answers,
+    f.avg_answer_score,
+    f.max_answer_score,
+    f.min_answer_score,
+    f.positive_answers,
+    f.tag_count,
+    f.sum_tag_popularity,
+    f.avg_tag_popularity_nonzero,
+    f.min_tag_popularity,
+    f.max_tag_popularity,
+    f.p50_month_score,
+    f.p90_month_score,
+    f.AcceptedAnswerId,
+    f.AcceptedOwnerId,
+    f.AcceptedCreated,
+    f.AcceptedScore,
+    f.seconds_to_accept,
+    f.lifecycle_bucket,
+    f.upvote_ratio,
+    f.is_top_decile_month,
+    f.is_above_median_month,
+    f.accepted_by_op,
+    f.title_len,
+    f.tags_len_sans_brackets,
+    f.rn_user,
+    f.score_ventile,
+    f.rank_tag_popularity,
+    lcw.comments_7h_moving_sum,
+    lcw.comment_score_7h_moving_avg,
+    CASE
+        WHEN COALESCE(f.dup_marks,0) > 0 AND COALESCE(f.upvote_ratio,0) < 0.6 THEN 'DupLikelyLowQuality'
+        WHEN f.is_top_decile_month = 1 AND COALESCE(f.sum_tag_popularity,0) > 0 THEN 'TopDecilePopularTags'
+        WHEN f.accepted_by_op = 1 AND COALESCE(f.seconds_to_accept,0) < 3600 THEN 'FastSelfAccept'
+        ELSE 'Other'
+    END AS diagnostic_bucket
+FROM final_set f
+LEFT JOIN latest_comment_window lcw ON lcw.PostId = f.QuestionId
+WHERE
+    (
+        f.tags_len_sans_brackets IS NULL
+        OR f.tag_count BETWEEN 1 AND 5
+        OR (f.sum_tag_popularity IS NOT NULL AND f.sum_tag_popularity > 0)
+    )
+    AND (
+        f.Title ILIKE ANY (ARRAY['%how to%','%error%','%exception%','%best practice%'])
+        OR f.Score >= COALESCE(f.p90_month_score, f.Score)
+        OR f.upvote_ratio IS NULL
+        OR (f.upvote_ratio >= 0.75 AND f.ViewCount >= 1000)
+    )
+ORDER BY
+    f.rn_user NULLS LAST,
+    f.Score DESC NULLS LAST,
+    f.ViewCount DESC NULLS LAST
+LIMIT 1000;

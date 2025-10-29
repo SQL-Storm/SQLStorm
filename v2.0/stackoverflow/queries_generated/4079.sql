@@ -1,0 +1,111 @@
+-- {"query": "4079.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1412} 
+
+WITH RankedPostEdits AS (
+    SELECT
+        ph.PostId,
+        ph.UserId,
+        ph.CreationDate,
+        p.Title,
+        ROW_NUMBER() OVER(PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) as rn
+    FROM PostHistory ph
+    JOIN Posts p ON ph.PostId = p.Id
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+    AND p.PostTypeId = 1 -- Only consider Questions
+),
+UserEditStats AS (
+    SELECT
+        rpe.UserId,
+        COUNT(DISTINCT rpe.PostId) AS DistinctPostsEdited,
+        SUM(CASE WHEN SUBSTRING(p.Tags, 2, CHARINDEX('>', p.Tags) - 2) = 'sql' THEN 1 ELSE 0 END) AS SqlTagEdits,
+        AVG(DATEDIFF(minute, u.CreationDate, rpe.CreationDate)) AS AvgMinutesToFirstEdit
+    FROM RankedPostEdits rpe
+    JOIN Users u ON rpe.UserId = u.Id
+    LEFT JOIN Posts p ON rpe.PostId = p.Id
+    WHERE rpe.rn = 1 -- Consider only the latest edit for each post by a user
+    GROUP BY rpe.UserId
+),
+PostContentAnalysis AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Title,
+        p.Body,
+        p.Tags,
+        LENGTH(p.Body) AS BodyLength,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCount,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL THEN 1
+            ELSE 0
+        END AS IsClosed,
+        CASE
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 1
+            ELSE 0
+        END AS IsCommunityOwned,
+        COALESCE(p.AnswerCount, 0) AS NonNullAnswerCount,
+        CASE WHEN p.OwnerUserId IS NULL THEN 'Unknown' WHEN p.OwnerUserId = -1 THEN 'Community' ELSE u.DisplayName END AS OwnerDisplayName,
+        CASE WHEN p.Score > 100 THEN 'High' WHEN p.Score > 0 THEN 'Medium' WHEN p.Score = 0 THEN 'Zero' ELSE 'Negative' END AS ScoreCategory
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1 -- Questions
+),
+UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS QuestionsAsked,
+        COUNT(DISTINCT a.Id) AS AnswersGiven,
+        MAX(p.CreationDate) AS LastQuestionDate,
+        MAX(a.CreationDate) AS LastAnswerDate,
+        SUM(CASE WHEN p.Score > 0 THEN 1 ELSE 0 END) AS PositiveScoreQuestions,
+        SUM(CASE WHEN p.Score < 0 THEN 1 ELSE 0 END) AS NegativeScoreQuestions,
+        AVG(p.ViewCount) AS AvgQuestionViews,
+        (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 2) AS UpVotesGiven
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+    LEFT JOIN Posts a ON u.Id = a.OwnerUserId AND a.PostTypeId = 2
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+)
+SELECT
+    pca.PostId,
+    pca.Title AS QuestionTitle,
+    pca.OwnerDisplayName AS OriginalOwner,
+    pca.ScoreCategory,
+    pca.IsClosed,
+    pca.IsCommunityOwned,
+    pca.NonNullAnswerCount,
+    pca.BodyLength,
+    pca.CommentCount,
+    pca.Tags,
+    ues.SqlTagEdits,
+    ues.AvgMinutesToFirstEdit,
+    uas.Reputation AS OwnerReputation,
+    uas.QuestionsAsked,
+    uas.AnswersGiven,
+    uas.PositiveScoreQuestions,
+    uas.NegativeScoreQuestions,
+    uas.UpVotesGiven,
+    CASE
+        WHEN pca.BodyLength > 1000 AND pca.CommentCount > 5 AND pca.IsClosed = 0 AND pca.OwnerReputation > 5000 THEN 'Complex_High_Engagement'
+        WHEN pca.BodyLength < 200 AND pca.CommentCount < 2 AND pca.IsClosed = 1 THEN 'Simple_Low_Engagement_Closed'
+        WHEN pca.Tags LIKE '%<sql>%' AND pca.OwnerReputation > 10000 THEN 'SQL_Expert_Question'
+        WHEN uas.AnswersGiven > 50 AND uas.AvgQuestionViews > 1000 THEN 'Prolific_High_View_Author'
+        ELSE 'Standard_Question'
+    END AS QuestionArchetype,
+    CONCAT(pca.OwnerDisplayName, '_', pca.PostId) AS CompositeKey,
+    -- Correlated subquery to find the user who made the most edits to this post
+    (
+        SELECT TOP 1 UserDisplayName
+        FROM PostHistory ph_inner
+        WHERE ph_inner.PostId = pca.PostId
+        AND ph_inner.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Body, Tags
+        GROUP BY UserDisplayName
+        ORDER BY COUNT(*) DESC
+    ) AS MostFrequentEditor
+FROM PostContentAnalysis pca
+LEFT JOIN UserEditStats ues ON pca.PostId = ANY (SELECT PostId FROM RankedPostEdits WHERE UserId = ues.UserId) -- Join based on ANY post edited by user, not just latest
+LEFT JOIN UserActivitySummary uas ON pca.OwnerUserId = uas.UserId
+WHERE pca.OwnerReputation >= 0 -- Ensure owner reputation is not null or negative in this context
+AND pca.BodyLength > 100 -- Filter for posts with a substantial body
+ORDER BY pca.ScoreCategory DESC, uas.Reputation DESC, pca.BodyLength DESC
+OFFSET 10 ROWS FETCH NEXT 20 ROWS ONLY;

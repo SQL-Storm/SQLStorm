@@ -1,0 +1,156 @@
+WITH RankedAnswers AS (
+    SELECT
+        p.Id AS PostId,
+        p.ParentId AS QuestionId,
+        p.OwnerUserId,
+        p.CreationDate AS AnswerCreationDate,
+        ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS RankNum,
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS PreviousScore,
+        LEAD(p.Score, 1, 0) OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS NextScore,
+        SUM(p.Score) OVER (PARTITION BY p.ParentId) AS TotalQuestionScore,
+        p.Score
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+),
+UserAnswerStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT a.PostId) AS TotalAnswers,
+        AVG(CAST(a.Score AS DOUBLE PRECISION)) AS AverageAnswerScore,
+        SUM(CASE WHEN a.RankNum = 1 THEN 1 ELSE 0 END) AS AcceptedAnswersCount,
+        MAX(a.AnswerCreationDate) AS LatestAnswerDate
+    FROM Users u
+    JOIN RankedAnswers a ON u.Id = a.OwnerUserId
+    GROUP BY u.Id, u.DisplayName
+),
+QuestionDetails AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate AS QuestionCreationDate,
+        q.OwnerUserId AS QuestionOwnerUserId,
+        q.Score AS QuestionScore,
+        q.AnswerCount,
+        q.FavoriteCount,
+        q.ClosedDate,
+        pt.Name AS PostTypeName,
+        CASE
+            WHEN q.ClosedDate IS NOT NULL
+            THEN CAST(EXTRACT(EPOCH FROM (q.ClosedDate - q.CreationDate)) / 86400 AS INTEGER)
+            ELSE NULL
+        END AS TimeToClose,
+        CASE WHEN EXISTS (SELECT 1 FROM PostLinks pl WHERE pl.PostId = q.Id AND pl.LinkTypeId = 3) THEN 'Duplicate' ELSE 'Not Duplicate' END AS DuplicateStatus
+    FROM Posts q
+    JOIN PostTypes pt ON q.PostTypeId = pt.Id
+    WHERE q.PostTypeId = 1
+),
+RecentActivity AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.LastActivityDate,
+        ROW_NUMBER() OVER (ORDER BY p.LastActivityDate DESC) AS ActivityRank
+    FROM Posts p
+    WHERE p.LastActivityDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6' MONTH)
+),
+UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS PostsOwned,
+        MAX(p.LastActivityDate) AS UserLastActivity,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id ELSE NULL END) AS QuestionsOwned,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id ELSE NULL END) AS AnswersOwned
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id, u.DisplayName
+),
+HighlyVotedAnswers AS (
+    SELECT
+        ra.QuestionId,
+        COUNT(ra.PostId) AS NumHighlyVotedAnswers
+    FROM RankedAnswers ra
+    WHERE ra.Score >= 50
+    GROUP BY ra.QuestionId
+)
+SELECT
+    qd.QuestionId,
+    qd.Title,
+    qd.QuestionCreationDate,
+    qd.QuestionOwnerUserId,
+    u.DisplayName AS QuestionOwnerDisplayName,
+    qd.QuestionScore,
+    qd.AnswerCount,
+    qd.FavoriteCount,
+    qd.ClosedDate,
+    qd.TimeToClose,
+    qd.DuplicateStatus,
+    uas.TotalAnswers AS DistinctTotalAnswers,
+    COALESCE(uas.AverageAnswerScore, 0) AS AvgAnswerScore,
+    uas.AcceptedAnswersCount,
+    uas.LatestAnswerDate,
+    hva.NumHighlyVotedAnswers,
+    ra.RankNum AS BestAnswerRank,
+    ra.Score AS BestAnswerScore,
+    ra.AnswerCreationDate AS BestAnswerCreationDate,
+    CASE
+        WHEN qd.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN qd.FavoriteCount > 1000 THEN 'Very Popular'
+        WHEN qd.QuestionScore > 500 THEN 'Highly Rated'
+        ELSE 'Standard'
+    END AS QuestionCategory,
+    CASE
+        WHEN uas.AcceptedAnswersCount > 0 AND qd.AnswerCount > 0 THEN CAST(uas.AcceptedAnswersCount AS DOUBLE PRECISION) / qd.AnswerCount
+        ELSE 0.0
+    END AS AcceptanceRate,
+    SUBSTR(qd.Title, 1, 50) AS TruncatedTitle,
+    REPLACE(qd.Title, ' ', '_') AS TitleWithUnderscores,
+    (qd.FavoriteCount * 1.5 + qd.QuestionScore) AS WeightedScore,
+    ua.PostsOwned AS OwnerTotalPosts,
+    ua.UserLastActivity,
+    ra.TotalQuestionScore AS SumOfAllAnswerScores,
+    CASE
+        WHEN ra.RankNum = 1 AND ra.Score > ra.PreviousScore AND ra.Score > ra.NextScore THEN 'Peak Performance Answer'
+        WHEN ra.RankNum <= 3 AND ra.Score > 10 THEN 'Top 3 Answer'
+        ELSE 'Other'
+    END AS AnswerQualityTier
+FROM QuestionDetails qd
+LEFT JOIN Users u ON qd.QuestionOwnerUserId = u.Id
+LEFT JOIN UserAnswerStats uas ON qd.QuestionOwnerUserId = uas.UserId
+LEFT JOIN RankedAnswers ra ON qd.QuestionId = ra.QuestionId AND ra.RankNum = 1
+LEFT JOIN RecentActivity ra_recent ON ra_recent.Id = qd.QuestionId
+LEFT JOIN UserActivitySummary ua ON qd.QuestionOwnerUserId = ua.UserId
+LEFT JOIN HighlyVotedAnswers hva ON qd.QuestionId = hva.QuestionId
+WHERE qd.QuestionCreationDate BETWEEN (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1' YEAR) AND CAST('2024-10-01 12:34:56' AS TIMESTAMP)
+  AND qd.AnswerCount IS NOT NULL
+  AND qd.PostTypeName = 'Question'
+GROUP BY
+    qd.QuestionId,
+    qd.Title,
+    qd.QuestionCreationDate,
+    qd.QuestionOwnerUserId,
+    u.DisplayName,
+    qd.QuestionScore,
+    qd.AnswerCount,
+    qd.FavoriteCount,
+    qd.ClosedDate,
+    qd.TimeToClose,
+    qd.DuplicateStatus,
+    uas.TotalAnswers,
+    uas.AverageAnswerScore,
+    uas.AcceptedAnswersCount,
+    uas.LatestAnswerDate,
+    hva.NumHighlyVotedAnswers,
+    ra.RankNum,
+    ra.Score,
+    ra.AnswerCreationDate,
+    qd.FavoriteCount,
+    uas.AcceptedAnswersCount,
+    ua.PostsOwned,
+    ua.UserLastActivity,
+    ra.TotalQuestionScore,
+    ra.PreviousScore,
+    ra.NextScore
+ORDER BY qd.QuestionScore DESC, qd.FavoriteCount DESC
+LIMIT 100;

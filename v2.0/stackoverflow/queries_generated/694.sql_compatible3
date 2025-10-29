@@ -1,0 +1,333 @@
+WITH recent_users AS (
+  SELECT
+    u.id AS user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.lastaccessdate,
+    COALESCE(NULLIF(TRIM(u.location), ''), 'Unknown') AS norm_location,
+    EXTRACT(YEAR FROM u.creationdate) AS create_year
+  FROM users u
+  WHERE u.creationdate >= (
+    SELECT MAX(creationdate) - INTERVAL '365 days' FROM users
+  )
+),
+user_activity AS (
+  SELECT
+    p.owneruserid AS user_id,
+    COUNT(*) FILTER (WHERE p.posttypeid = 1) AS q_count,
+    COUNT(*) FILTER (WHERE p.posttypeid = 2) AS a_count,
+    SUM(COALESCE(p.score,0)) AS total_post_score,
+    AVG(NULLIF(p.viewcount,0)) AS avg_views_nonzero
+  FROM posts p
+  WHERE p.owneruserid IS NOT NULL
+  GROUP BY p.owneruserid
+),
+comment_aggr AS (
+  SELECT
+    c.userid AS user_id,
+    COUNT(*) AS comment_count,
+    SUM(COALESCE(c.score,0)) AS comment_score_sum,
+    MAX(c.creationdate) AS last_comment_at
+  FROM comments c
+  WHERE c.userid IS NOT NULL
+  GROUP BY c.userid
+),
+badge_aggr AS (
+  SELECT
+    b.userid AS user_id,
+    COUNT(*) AS badges_total,
+    COUNT(*) FILTER (WHERE b.class = 1) AS gold_badges,
+    COUNT(*) FILTER (WHERE b.class = 2) AS silver_badges,
+    COUNT(*) FILTER (WHERE b.class = 3) AS bronze_badges,
+    COUNT(*) FILTER (WHERE COALESCE(b.tagbased, FALSE) = TRUE) AS tag_badges
+  FROM badges b
+  GROUP BY b.userid
+),
+post_intervals AS (
+  SELECT
+    p.owneruserid AS user_id,
+    p.id AS post_id,
+    p.posttypeid,
+    p.creationdate,
+    LAG(p.creationdate) OVER (PARTITION BY p.owneruserid ORDER BY p.creationdate) AS prev_creation,
+    LEAD(p.creationdate) OVER (PARTITION BY p.owneruserid ORDER BY p.creationdate) AS next_creation
+  FROM posts p
+  WHERE p.owneruserid IS NOT NULL
+),
+post_gaps AS (
+  SELECT
+    user_id,
+    AVG(EXTRACT(EPOCH FROM (creationdate - prev_creation))) AS avg_gap_seconds_prev,
+    AVG(EXTRACT(EPOCH FROM (next_creation - creationdate))) AS avg_gap_seconds_next
+  FROM post_intervals
+  WHERE prev_creation IS NOT NULL OR next_creation IS NOT NULL
+  GROUP BY user_id
+),
+question_quality AS (
+  SELECT
+    q.owneruserid AS user_id,
+    COUNT(*) AS questions_total,
+    SUM(CASE WHEN q.acceptedanswerid IS NOT NULL THEN 1 ELSE 0 END) AS accepted_count,
+    AVG(q.score) AS avg_q_score,
+    PERCENTILE_DISC(0.9) WITHIN GROUP (ORDER BY q.viewcount) AS p90_q_views,
+    SUM(CASE WHEN q.closeddate IS NOT NULL THEN 1 ELSE 0 END) AS closed_q
+  FROM posts q
+  WHERE q.posttypeid = 1 AND q.owneruserid IS NOT NULL
+  GROUP BY q.owneruserid
+),
+answer_quality AS (
+  SELECT
+    a.owneruserid AS user_id,
+    COUNT(*) AS answers_total,
+    AVG(a.score) AS avg_a_score,
+    SUM(CASE WHEN EXISTS (
+      SELECT 1
+      FROM posts q
+      WHERE q.id = a.parentid
+        AND q.acceptedanswerid = a.id
+    ) THEN 1 ELSE 0 END) AS accepted_by_op_count
+  FROM posts a
+  WHERE a.posttypeid = 2 AND a.owneruserid IS NOT NULL
+  GROUP BY a.owneruserid
+),
+tag_exposure AS (
+  SELECT
+    p.owneruserid AS user_id,
+    LOWER(TRIM(tg)) AS tag_name,
+    COUNT(*) AS tag_hits
+  FROM posts p
+  CROSS JOIN LATERAL UNNEST(
+    CASE
+      WHEN p.posttypeid = 1 AND p.tags IS NOT NULL AND LENGTH(p.tags) >= 2
+      THEN string_to_array(SUBSTRING(p.tags FROM 2 FOR LENGTH(p.tags)-2), '><')
+      ELSE string_to_array('', '')
+    END
+  ) AS tg
+  WHERE p.owneruserid IS NOT NULL
+  GROUP BY p.owneruserid, LOWER(TRIM(tg))
+),
+top_tags AS (
+  SELECT DISTINCT ON (user_id)
+    user_id,
+    tag_name,
+    tag_hits
+  FROM (
+    SELECT
+      te.user_id,
+      te.tag_name,
+      te.tag_hits,
+      ROW_NUMBER() OVER (PARTITION BY te.user_id ORDER BY te.tag_hits DESC, te.tag_name) AS rn
+    FROM tag_exposure te
+  ) s
+  WHERE rn <= 3
+  ORDER BY user_id, tag_hits DESC, tag_name
+),
+top_tags_pivot AS (
+  SELECT
+    user_id,
+    MAX(CASE WHEN rn = 1 THEN tag_name END) AS top_tag_1,
+    MAX(CASE WHEN rn = 1 THEN tag_hits END) AS top_tag_1_hits,
+    MAX(CASE WHEN rn = 2 THEN tag_name END) AS top_tag_2,
+    MAX(CASE WHEN rn = 2 THEN tag_hits END) AS top_tag_2_hits,
+    MAX(CASE WHEN rn = 3 THEN tag_name END) AS top_tag_3,
+    MAX(CASE WHEN rn = 3 THEN tag_hits END) AS top_tag_3_hits
+  FROM (
+    SELECT
+      te.user_id,
+      te.tag_name,
+      te.tag_hits,
+      ROW_NUMBER() OVER (PARTITION BY te.user_id ORDER BY te.tag_hits DESC, te.tag_name) AS rn
+    FROM tag_exposure te
+  ) x
+  WHERE rn <= 3
+  GROUP BY user_id
+),
+vote_aggr AS (
+  SELECT
+    v.userid AS voter_id,
+    COUNT(*) FILTER (WHERE v.votetypeid = 2) AS upvotes_cast,
+    COUNT(*) FILTER (WHERE v.votetypeid = 3) AS downvotes_cast,
+    COUNT(*) FILTER (WHERE v.votetypeid = 5) AS favorites_cast,
+    COUNT(*) FILTER (WHERE v.votetypeid IN (8,9)) AS bounties_events,
+    SUM(COALESCE(v.bountyamount,0)) AS bounty_amount_total
+  FROM votes v
+  WHERE v.userid IS NOT NULL
+  GROUP BY v.userid
+),
+post_vote_received AS (
+  SELECT
+    p.owneruserid AS user_id,
+    COUNT(*) FILTER (WHERE v.votetypeid = 2) AS upvotes_received,
+    COUNT(*) FILTER (WHERE v.votetypeid = 3) AS downvotes_received
+  FROM posts p
+  LEFT JOIN votes v ON v.postid = p.id
+  WHERE p.owneruserid IS NOT NULL
+  GROUP BY p.owneruserid
+),
+dup_links AS (
+  SELECT
+    pl.postid AS post_id,
+    pl.relatedpostid AS related_id,
+    pl.creationdate AS link_date
+  FROM postlinks pl
+  WHERE pl.linktypeid = 3
+),
+dup_activity AS (
+  SELECT
+    COALESCE(p.owneruserid, pr.owneruserid) AS user_id,
+    COUNT(DISTINCT CASE WHEN p.posttypeid = 1 THEN p.id END) AS user_questions_marked_duplicate,
+    COUNT(DISTINCT CASE WHEN pr.posttypeid = 1 THEN pr.id END) AS user_originals_with_dupes
+  FROM dup_links d
+  LEFT JOIN posts p ON p.id = d.post_id
+  LEFT JOIN posts pr ON pr.id = d.related_id
+  GROUP BY COALESCE(p.owneruserid, pr.owneruserid)
+),
+closures AS (
+  SELECT
+    ph.postid,
+    MAX(ph.creationdate) AS last_closed_at,
+    MAX(CASE WHEN ph.comment ~ '^[0-9]+' THEN CAST(REGEXP_REPLACE(ph.comment, '^(\\d+).*', '\\1') AS INTEGER) END) AS last_close_reason_id
+  FROM posthistory ph
+  WHERE ph.posthistorytypeid = 10
+  GROUP BY ph.postid
+),
+close_reason_name AS (
+  SELECT
+    c.postid,
+    crt.name AS close_reason_name
+  FROM closures c
+  LEFT JOIN close_reason_types crt ON crt.id = c.last_close_reason_id
+),
+post_edit_counts AS (
+  SELECT
+    ph.postid,
+    COUNT(*) FILTER (WHERE ph.posthistorytypeid IN (4,5,6)) AS content_edits,
+    COUNT(*) FILTER (WHERE ph.posthistorytypeid IN (24)) AS suggested_applied
+  FROM posthistory ph
+  GROUP BY ph.postid
+),
+user_post_edit_aggr AS (
+  SELECT
+    p.owneruserid AS user_id,
+    SUM(COALESCE(pe.content_edits,0)) AS total_content_edits,
+    SUM(COALESCE(pe.suggested_applied,0)) AS total_suggested_applied
+  FROM posts p
+  LEFT JOIN post_edit_counts pe ON pe.postid = p.id
+  WHERE p.owneruserid IS NOT NULL
+  GROUP BY p.owneruserid
+),
+ranked_users AS (
+  SELECT
+    ru.user_id,
+    ru.displayname,
+    ru.reputation,
+    ru.norm_location,
+    ua.q_count,
+    ua.a_count,
+    qa.questions_total,
+    aa.answers_total,
+    pv.upvotes_received,
+    pv.downvotes_received,
+    va.upvotes_cast,
+    va.downvotes_cast,
+    COALESCE(qa.accepted_count,0) AS accepted_q_count,
+    COALESCE(aa.accepted_by_op_count,0) AS accepted_a_count,
+    COALESCE(ua.total_post_score,0) AS total_post_score,
+    COALESCE(ua.avg_views_nonzero,0) AS avg_views_nonzero,
+    COALESCE(qa.avg_q_score,0) AS avg_q_score,
+    COALESCE(aa.avg_a_score,0) AS avg_a_score,
+    COALESCE(qa.p90_q_views,0) AS p90_q_views,
+    COALESCE(qa.closed_q,0) AS closed_q,
+    COALESCE(pe.total_content_edits,0) AS total_content_edits,
+    COALESCE(pe.total_suggested_applied,0) AS total_suggested_applied,
+    COALESCE(pg.avg_gap_seconds_prev,0) AS avg_gap_seconds_prev,
+    COALESCE(pg.avg_gap_seconds_next,0) AS avg_gap_seconds_next,
+    COALESCE(ba.badges_total,0) AS badges_total,
+    COALESCE(ba.gold_badges,0) AS gold_badges,
+    COALESCE(ba.silver_badges,0) AS silver_badges,
+    COALESCE(ba.bronze_badges,0) AS bronze_badges,
+    COALESCE(ba.tag_badges,0) AS tag_badges
+  FROM recent_users ru
+  LEFT JOIN user_activity ua ON ua.user_id = ru.user_id
+  LEFT JOIN question_quality qa ON qa.user_id = ru.user_id
+  LEFT JOIN answer_quality aa ON aa.user_id = ru.user_id
+  LEFT JOIN post_vote_received pv ON pv.user_id = ru.user_id
+  LEFT JOIN vote_aggr va ON va.voter_id = ru.user_id
+  LEFT JOIN user_post_edit_aggr pe ON pe.user_id = ru.user_id
+  LEFT JOIN post_gaps pg ON pg.user_id = ru.user_id
+  LEFT JOIN badge_aggr ba ON ba.user_id = ru.user_id
+),
+scored AS (
+  SELECT
+    r.*,
+    COALESCE(
+      0.40 * LN(1 + GREATEST(r.reputation,0)) +
+      0.15 * LN(1 + GREATEST(r.q_count,0)) +
+      0.20 * LN(1 + GREATEST(r.a_count,0)) +
+      0.10 * LN(1 + GREATEST(r.upvotes_received - COALESCE(r.downvotes_received,0),0)) +
+      0.05 * LN(1 + GREATEST(r.badges_total + r.gold_badges*2 + r.silver_badges*1.5,0)) +
+      0.05 * LN(1 + GREATEST(r.total_content_edits,0)) +
+      0.05 * LN(1 + GREATEST(r.accepted_a_count,0))
+    , 0) AS perf_score
+  FROM ranked_users r
+),
+filter_rank AS (
+  SELECT
+    s.*,
+    ROW_NUMBER() OVER (ORDER BY s.perf_score DESC NULLS LAST, s.reputation DESC, s.user_id) AS global_rank,
+    DENSE_RANK() OVER (PARTITION BY s.norm_location ORDER BY s.perf_score DESC NULLS LAST, s.reputation DESC, s.user_id) AS region_rank
+  FROM scored s
+  WHERE COALESCE(s.q_count,0) + COALESCE(s.a_count,0) >= 5
+)
+SELECT
+  fr.user_id,
+  fr.displayname,
+  fr.norm_location,
+  fr.reputation,
+  fr.q_count,
+  fr.a_count,
+  fr.questions_total,
+  fr.answers_total,
+  fr.upvotes_received,
+  fr.downvotes_received,
+  fr.upvotes_cast,
+  fr.downvotes_cast,
+  fr.accepted_q_count,
+  fr.accepted_a_count,
+  fr.avg_q_score,
+  fr.avg_a_score,
+  fr.p90_q_views,
+  fr.closed_q,
+  fr.total_content_edits,
+  fr.total_suggested_applied,
+  CAST(ROUND(fr.avg_gap_seconds_prev) AS bigint) AS avg_gap_seconds_prev,
+  CAST(ROUND(fr.avg_gap_seconds_next) AS bigint) AS avg_gap_seconds_next,
+  fr.badges_total,
+  fr.gold_badges,
+  fr.silver_badges,
+  fr.bronze_badges,
+  fr.tag_badges,
+  COALESCE(tt.top_tag_1,'') AS top_tag_1,
+  COALESCE(tt.top_tag_1_hits,0) AS top_tag_1_hits,
+  COALESCE(tt.top_tag_2,'') AS top_tag_2,
+  COALESCE(tt.top_tag_2_hits,0) AS top_tag_2_hits,
+  COALESCE(tt.top_tag_3,'') AS top_tag_3,
+  COALESCE(tt.top_tag_3_hits,0) AS top_tag_3_hits,
+  dn.close_reason_name,
+  fr.perf_score,
+  fr.global_rank,
+  fr.region_rank
+FROM filter_rank fr
+LEFT JOIN top_tags_pivot tt ON tt.user_id = fr.user_id
+LEFT JOIN (
+  SELECT DISTINCT ON (p.owneruserid)
+    p.owneruserid AS user_id,
+    crn.close_reason_name
+  FROM posts p
+  LEFT JOIN close_reason_name crn ON crn.postid = p.id
+  WHERE p.posttypeid = 1 AND p.owneruserid IS NOT NULL AND crn.close_reason_name IS NOT NULL
+  ORDER BY p.owneruserid, p.creationdate DESC
+) dn ON dn.user_id = fr.user_id
+ORDER BY fr.global_rank
+LIMIT 200;

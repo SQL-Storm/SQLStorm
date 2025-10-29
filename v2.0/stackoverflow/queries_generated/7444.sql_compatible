@@ -1,0 +1,175 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN p.Id END) AS QuestionWithAcceptedAnswer,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN p.Id END) AS QuestionWithAnswers,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.Score > 0 THEN p.Id END) AS HighScoreAnswers,
+        AVG(CAST(p.Score AS FLOAT)) AS AvgPostScore,
+        STRING_AGG(DISTINCT p.Tags, ', ') AS AllTags,
+        COUNT(DISTINCT ph.Id) AS EditCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN ph.Id END) AS ModerationActivities
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 24)
+    WHERE u.CreationDate >= TIMESTAMP '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+UserPerformance AS (
+    SELECT 
+        uas.*,
+        CASE 
+            WHEN Reputation >= 10000 THEN 'Elite'
+            WHEN Reputation >= 5000 THEN 'Advanced'
+            WHEN Reputation >= 1000 THEN 'Intermediate'
+            WHEN Reputation >= 100 THEN 'Beginner'
+            ELSE 'Newbie'
+        END AS ReputationTier,
+        CASE 
+            WHEN PostCount >= 1000 THEN 'Prolific'
+            WHEN PostCount >= 500 THEN 'Active'
+            WHEN PostCount >= 100 THEN 'Regular'
+            WHEN PostCount >= 10 THEN 'Casual'
+            ELSE 'Occasional'
+        END AS ActivityLevel,
+        CASE 
+            WHEN QuestionCount > 0 THEN CAST(AnswerCount AS FLOAT) / CAST(QuestionCount AS FLOAT)
+            ELSE 0 
+        END AS AnswerToQuestionRatio,
+        CASE 
+            WHEN QuestionCount > 0 THEN CAST(QuestionWithAcceptedAnswer AS FLOAT) / CAST(QuestionCount AS FLOAT)
+            ELSE 0 
+        END AS AcceptedAnswerRate,
+        CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - COALESCE(LastPostDate, TIMESTAMP '2024-10-01 12:34:56'))) / 86400.0 AS FLOAT) AS DaysSinceLastPost,
+        COALESCE(0, 0) AS FinalScore  -- placeholder FinalScore since original Score source missing
+    FROM UserActivityStats uas
+),
+TopUsers AS (
+    SELECT 
+        up.UserId,
+        up.DisplayName,
+        up.Reputation,
+        up.PostCount,
+        up.CommentCount,
+        up.BadgeCount,
+        up.LastPostDate,
+        up.QuestionCount,
+        up.AnswerCount,
+        up.AnswerToQuestionRatio,
+        up.AcceptedAnswerRate,
+        up.DaysSinceLastPost,
+        up.ReputationTier,
+        up.ActivityLevel,
+        up.FinalScore,
+        ROW_NUMBER() OVER (ORDER BY up.Reputation DESC, up.PostCount DESC) AS RankByReputation,
+        ROW_NUMBER() OVER (ORDER BY up.PostCount DESC, up.Reputation DESC) AS RankByActivity,
+        DENSE_RANK() OVER (PARTITION BY up.ReputationTier ORDER BY up.PostCount DESC) AS TierActivityRank,
+        PERCENT_RANK() OVER (ORDER BY up.Reputation) AS ReputationPercentile,
+        NTILE(100) OVER (ORDER BY up.Reputation) AS ReputationDecile
+    FROM UserPerformance up
+),
+ComplexFilter AS (
+    SELECT 
+        tu.*,
+        CASE 
+            WHEN tu.Reputation > 50000 AND tu.PostCount > 5000 THEN 'Legendary'
+            WHEN tu.Reputation > 20000 AND tu.PostCount > 2000 THEN 'Veteran'
+            WHEN tu.Reputation > 10000 AND tu.PostCount > 1000 THEN 'Experienced'
+            ELSE 'Standard'
+        END AS RecognitionLevel,
+        CASE 
+            WHEN ABS(tu.DaysSinceLastPost) > 365 THEN 'Inactive'
+            WHEN tu.DaysSinceLastPost > 30 THEN 'LessActive'
+            WHEN tu.DaysSinceLastPost < 10 THEN 'Active'
+            ELSE 'ModeratelyActive'
+        END AS ActivityStatus,
+        CASE 
+            WHEN tu.PostCount > 500 AND tu.AnswerCount > 100 AND tu.QuestionCount > 100 THEN 'Productive'
+            WHEN tu.PostCount > 200 AND tu.AnswerCount > 50 THEN 'Contributor'
+            ELSE 'Participant'
+        END AS ContributionLevel,
+        AVG(tu.Reputation) OVER (PARTITION BY tu.ReputationTier) AS AvgReputationByTier,
+        AVG(tu.PostCount) OVER (PARTITION BY tu.ReputationTier) AS AvgPostCountByTier,
+        SUM(tu.PostCount) OVER (ORDER BY tu.Reputation DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativePostCount,
+        LAG(tu.PostCount, 1) OVER (ORDER BY tu.Reputation DESC) AS PreviousPostCount,
+        LEAD(tu.PostCount, 1) OVER (ORDER BY tu.Reputation DESC) AS NextPostCount,
+        ABS(tu.PostCount - LAG(tu.PostCount, 1) OVER (ORDER BY tu.Reputation DESC)) AS PostCountChange,
+        CASE 
+            WHEN tu.PostCount > (SELECT AVG(t2.PostCount) FROM TopUsers t2) * 2 THEN 'AboveAverage'
+            WHEN tu.PostCount > (SELECT AVG(t2.PostCount) FROM TopUsers t2) THEN 'Average'
+            ELSE 'BelowAverage'
+        END AS PerformanceCategory
+    FROM TopUsers tu
+)
+SELECT 
+    cf.UserId,
+    cf.DisplayName,
+    cf.Reputation,
+    cf.PostCount,
+    cf.CommentCount,
+    cf.BadgeCount,
+    cf.LastPostDate,
+    cf.QuestionCount,
+    cf.AnswerCount,
+    cf.AnswerToQuestionRatio,
+    cf.AcceptedAnswerRate,
+    cf.DaysSinceLastPost,
+    cf.ReputationTier,
+    cf.ActivityLevel,
+    cf.FinalScore,
+    cf.RankByReputation,
+    cf.RankByActivity,
+    cf.TierActivityRank,
+    cf.ReputationPercentile,
+    cf.ReputationDecile,
+    cf.RecognitionLevel,
+    cf.ActivityStatus,
+    cf.ContributionLevel,
+    cf.AvgReputationByTier,
+    cf.AvgPostCountByTier,
+    cf.CumulativePostCount,
+    cf.PreviousPostCount,
+    cf.NextPostCount,
+    cf.PostCountChange,
+    cf.PerformanceCategory,
+    CASE 
+        WHEN cf.RankByReputation <= 10 AND cf.Reputation > 100000 THEN 'Top10Reputation'
+        WHEN cf.RankByActivity <= 10 AND cf.PostCount > 5000 THEN 'Top10Activity'
+        WHEN cf.ReputationTier = 'Elite' AND cf.RankByReputation <= 5 THEN 'EliteTop5'
+        ELSE 'Other'
+    END AS TopStatus,
+    CASE 
+        WHEN cf.Reputation >= 100000 THEN 'Master'
+        WHEN cf.Reputation >= 10000 THEN 'Expert'
+        WHEN cf.Reputation >= 1000 THEN 'Professional'
+        WHEN cf.Reputation >= 100 THEN 'Novice'
+        ELSE 'Beginner'
+    END AS AchievementTier,
+    ROW_NUMBER() OVER (ORDER BY cf.Reputation - 100000 DESC) AS GlobalRank,
+    DENSE_RANK() OVER (ORDER BY cf.Reputation DESC) AS GlobalDenseRank,
+    COUNT(*) OVER () AS TotalUsers
+FROM ComplexFilter cf
+WHERE 
+    (cf.Reputation > 5000 OR cf.PostCount > 100 OR cf.CommentCount > 50) 
+    AND (cf.ActivityStatus IN ('Active', 'ModeratelyActive') OR cf.DaysSinceLastPost < 30)
+    AND (cf.AnswerToQuestionRatio >= 0.5 OR cf.AcceptedAnswerRate >= 0.7)
+    AND cf.FinalScore > (SELECT AVG(f.FinalScore) FROM ComplexFilter f)
+ORDER BY 
+    CASE WHEN cf.Reputation > 100000 THEN 1 ELSE 2 END,
+    cf.Reputation DESC,
+    cf.PostCount DESC,
+    cf.CommentCount DESC,
+    cf.BadgeCount DESC;

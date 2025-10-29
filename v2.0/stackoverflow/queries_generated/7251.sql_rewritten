@@ -1,0 +1,246 @@
+-- {"query": "7251.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2593} 
+WITH PostStats AS (
+    SELECT 
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        u.DisplayName as OwnerDisplayName,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            WHEN p.PostTypeId = 4 THEN 'TagWikiExcerpt'
+            WHEN p.PostTypeId = 5 THEN 'TagWiki'
+            WHEN p.PostTypeId = 6 THEN 'ModeratorNomination'
+            WHEN p.PostTypeId = 7 THEN 'WikiPlaceholder'
+            WHEN p.PostTypeId = 8 THEN 'PrivilegeWiki'
+            ELSE 'Unknown'
+        END as PostTypeName,
+        COALESCE(p.Title, 'No Title') as NormalizedTitle,
+        LEN(p.Tags) as TagLength,
+        CASE 
+            WHEN p.Tags IS NULL OR p.Tags = '' THEN 0
+            ELSE LEN(p.Tags) - LEN(REPLACE(p.Tags, '>', '')) + 1
+        END as TagCount,
+        DATEDIFF(day, p.CreationDate, COALESCE(p.ClosedDate, p.LastActivityDate, cast('2024-10-01 12:34:56' as timestamp))) as AgeInDays,
+        CASE 
+            WHEN p.Score >= 100 THEN 'High'
+            WHEN p.Score >= 10 THEN 'Medium'
+            WHEN p.Score >= 0 THEN 'Low'
+            ELSE 'Negative'
+        END as ScoreCategory,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as UserPostRank,
+        SUM(p.Score) OVER (PARTITION BY p.OwnerUserId) as TotalUserScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as AvgUserScore,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PreviousScore,
+        LEAD(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as NextScore,
+        CASE 
+            WHEN p.Score > LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) THEN 'Improved'
+            WHEN p.Score < LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) THEN 'Declined'
+            ELSE 'Stable'
+        END as ScoreTrend,
+        RANK() OVER (ORDER BY p.Score DESC) as GlobalScoreRank,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) as GlobalScoreDenseRank
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1, 2) 
+),
+TagAnalysis AS (
+    SELECT 
+        ta.TagName,
+        ta.Count as TagCount,
+        ta.ExcerptPostId,
+        ta.WikiPostId,
+        CASE 
+            WHEN ta.IsRequired = 1 THEN 'Required'
+            WHEN ta.IsModeratorOnly = 1 THEN 'Moderator Only'
+            ELSE 'Regular'
+        END as TagType,
+        ROW_NUMBER() OVER (ORDER BY ta.Count DESC) as PopularityRank,
+        PERCENT_RANK() OVER (ORDER BY ta.Count) as PopularityPercentile,
+        NTILE(100) OVER (ORDER BY ta.Count) as PopularityDecile        
+    FROM Tags ta
+),
+UserActivity AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        DATEDIFF(day, u.CreationDate, cast('2024-10-01 12:34:56' as timestamp)) as AccountAge,
+        u.WebsiteUrl,
+        CASE 
+            WHEN u.WebsiteUrl IS NULL OR u.WebsiteUrl = '' THEN 'No Website'
+            WHEN u.WebsiteUrl LIKE '%github%' THEN 'GitHub'
+            WHEN u.WebsiteUrl LIKE '%linkedin%' THEN 'LinkedIn'
+            WHEN u.WebsiteUrl LIKE '%stackoverflow%' THEN 'StackOverflow'
+            ELSE 'Other'
+        END as WebsiteType,
+        COALESCE(u.AboutMe, 'No Bio') as UserBio,
+        u.Location,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) as QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) as AnswerCount,
+        SUM(p.Score) as TotalScore,
+        AVG(p.Score) as AvgScore,
+        MAX(p.CreationDate) as LastPostDate,
+        MIN(p.CreationDate) as FirstPostDate,
+        DATEDIFF(day, MIN(p.CreationDate), MAX(p.CreationDate)) as ActivePeriodDays
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate, u.WebsiteUrl, u.AboutMe, u.Location
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        ps.PostId,
+        ps.PostTypeName,
+        ps.Score,
+        ps.ViewCount,
+        ps.AnswerCount,
+        ps.CommentCount,
+        ps.FavoriteCount,
+        ps.Title,
+        ps.NormalizedTitle,
+        ps.TagCount,
+        ps.AgeInDays,
+        ps.ScoreCategory,
+        ps.UserPostRank,
+        ps.TotalUserScore,
+        ps.AvgUserScore,
+        ps.ScoreTrend,
+        ps.GlobalScoreRank,
+        ps.GlobalScoreDenseRank,
+        u.DisplayName as PostOwner,
+        u.Reputation as OwnerReputation,
+        u.Views as OwnerViews,
+        u.UpVotes as OwnerUpVotes,
+        u.DownVotes as OwnerDownVotes,
+        DATEDIFF(day, ps.CreationDate, cast('2024-10-01 12:34:56' as timestamp)) as DaysSinceCreation,
+        IIF(ps.Score > 10, 'Popular', 'Normal') as PopularityStatus,
+        CASE 
+            WHEN ps.AnswerCount = 0 AND ps.PostTypeName = 'Question' THEN 'Unanswered'
+            WHEN ps.AnswerCount > 0 AND ps.PostTypeName = 'Question' THEN 'Answered'
+            ELSE 'Unknown'
+        END as QuestionStatus,
+        CASE 
+            WHEN ps.CommentCount > 0 THEN 'Discussed'
+            WHEN ps.FavoriteCount > 0 THEN 'Favorited'
+            ELSE 'Undiscussed'
+        END as EngagementType,
+        RANK() OVER (ORDER BY ps.AnswerCount DESC) as AnswerRank,
+        DENSE_RANK() OVER (ORDER BY ps.ViewCount DESC) as ViewRank,
+        RANK() OVER (PARTITION BY ps.PostTypeName ORDER BY ps.Score DESC) as TypeScoreRank,
+        CASE 
+            WHEN ps.AnswerCount >= 10 THEN 'Highly Answered'
+            WHEN ps.AnswerCount >= 5 THEN 'Moderately Answered'
+            WHEN ps.AnswerCount >= 1 THEN 'Low Answered'
+            ELSE 'Unanswered'
+        END as AnswerQuality,
+        CASE 
+            WHEN ps.ViewCount > 1000 THEN 'Viral'
+            WHEN ps.ViewCount > 100 THEN 'Popular'
+            WHEN ps.ViewCount > 10 THEN 'Noticeable'
+            ELSE 'Obscure'
+        END as ViewStatus,
+        COALESCE(ps.Title, ps.NormalizedTitle) as EffectiveTitle
+    FROM PostStats ps
+    JOIN Users u ON ps.OwnerUserId = u.Id
+),
+PostTagRelationships AS (
+    SELECT 
+        cpa.PostId,
+        cpa.PostTypeName,
+        cpa.Score,
+        cpa.ScoreCategory,
+        cpa.AnswerCount,
+        cpa.ViewCount,
+        cpa.EffectiveTitle,
+        ta.TagName,
+        ta.TagCount as TagFrequency,
+        ta.PopularityRank,
+        CASE WHEN ta.TagName LIKE '%sql%' THEN 1 ELSE 0 END as HasSQL,
+        CASE WHEN ta.TagName LIKE '%python%' THEN 1 ELSE 0 END as HasPython,
+        CASE WHEN ta.TagName LIKE '%javascript%' THEN 1 ELSE 0 END as HasJavaScript,
+        CASE WHEN ta.TagName LIKE '%java%' THEN 1 ELSE 0 END as HasJava,
+        CASE WHEN ta.TagName LIKE '%c#' THEN 1 ELSE 0 END as HasCSharp,
+        CASE WHEN ta.TagName LIKE '%php%' THEN 1 ELSE 0 END as HasPHP
+    FROM ComplexPostAnalysis cpa
+    LEFT JOIN Tags ta ON ta.TagName IN (
+        SELECT value FROM STRING_SPLIT(
+            CASE WHEN cpa.Tags IS NULL THEN '' ELSE SUBSTRING(cpa.Tags, 2, LEN(cpa.Tags) - 2) END, 
+            '><'
+        )
+    )
+    WHERE ta.TagName IS NOT NULL
+),
+FinalAnalysis AS (
+    SELECT 
+        ptr.PostId,
+        ptr.PostTypeName,
+        ptr.Score,
+        ptr.ScoreCategory,
+        ptr.AnswerCount,
+        ptr.ViewCount,
+        ptr.EffectiveTitle,
+        ptr.TagName,
+        ptr.TagFrequency,
+        ptr.PopularityRank,
+        ptr.HasSQL,
+        ptr.HasPython,
+        ptr.HasJavaScript,
+        ptr.HasJava,
+        ptr.HasCSharp,
+        ptr.HasPHP,
+        CASE 
+            WHEN ptr.HasSQL = 1 AND ptr.HasPython = 1 THEN 'SQL/Python'
+            WHEN ptr.HasSQL = 1 AND ptr.HasJavaScript = 1 THEN 'SQL/JavaScript'
+            WHEN ptr.HasJava = 1 AND ptr.HasCSharp = 1 THEN 'Java/C#'
+            WHEN ptr.HasPHP = 1 AND ptr.HasJavaScript = 1 THEN 'PHP/JavaScript'
+            ELSE 'Other'
+        END as TechnologyPair,
+        ROW_NUMBER() OVER (PARTITION BY ptr.PostTypeName, ptr.ScoreCategory ORDER BY ptr.ViewCount DESC) as ViewRankByTypeAndCategory,
+        RANK() OVER (PARTITION BY ptr.PostTypeName, ptr.ScoreCategory ORDER BY ptr.Score DESC) as ScoreRankByTypeAndCategory,
+        DENSE_RANK() OVER (ORDER BY ptr.ViewCount DESC) as GlobalViewRank,
+        DENSE_RANK() OVER (ORDER BY ptr.Score DESC) as GlobalScoreRank,
+        AVG(ptr.ViewCount) OVER (PARTITION BY ptr.PostTypeName, ptr.ScoreCategory) as AvgViewCountByTypeCategory,
+        AVG(ptr.Score) OVER (PARTITION BY ptr.PostTypeName, ptr.ScoreCategory) as AvgScoreByTypeCategory,
+        IIF(ptr.ViewCount > (SELECT AVG(ViewCount) FROM Posts), 'Above Average', 'Below Average') as ViewPerformance,
+        CASE 
+            WHEN ptr.Score > 100 AND ptr.ViewCount > 1000 THEN 'Trending'
+            WHEN ptr.Score > 50 AND ptr.ViewCount > 500 THEN 'Popular'
+            WHEN ptr.Score > 0 AND ptr.ViewCount > 100 THEN 'Noticeable'
+            ELSE 'Underperforming'
+        END as PerformanceStatus,
+        COUNT(*) OVER () as TotalRecordCount
+    FROM PostTagRelationships ptr
+)
+SELECT 
+    *,
+    CASE WHEN HasSQL = 1 OR HasPython = 1 OR HasJavaScript = 1 THEN 1 ELSE 0 END as HasPopularTech,
+    CASE 
+        WHEN TechnologyPair IN ('SQL/Python', 'SQL/JavaScript', 'Java/C#', 'PHP/JavaScript') THEN 'Popular Technology Pair'
+        ELSE 'Other Technology Pair'
+    END as PopularTechPairStatus,
+    CASE 
+        WHEN GlobalViewRank <= 10 THEN 'Top 10 Views'
+        WHEN GlobalScoreRank <= 10 THEN 'Top 10 Scores'
+        ELSE 'Regular'
+    END as PerformanceTier
+FROM FinalAnalysis
+WHERE Score > 0 AND ViewCount > 0 
+    AND (HasSQL = 1 OR HasPython = 1 OR HasJavaScript = 1 OR HasJava = 1 OR HasCSharp = 1 OR HasPHP = 1)
+    AND (PopularityRank <= 50 OR TechnologyPair = 'Popular Technology Pair')
+    AND PostTypeName IN ('Question', 'Answer')
+ORDER BY Score DESC, ViewCount DESC
+OFFSET 0 ROWS FETCH NEXT 1000 ROWS ONLY;

@@ -1,0 +1,204 @@
+-- {"query": "7301.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1978} 
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank,
+        DENSE_RANK() OVER (ORDER BY u.Views DESC) AS ViewRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.Tags,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END AS PostType,
+        CASE 
+            WHEN p.Score > 100 THEN 'HighlyVoted'
+            WHEN p.Score > 10 THEN 'ModeratelyVoted'
+            WHEN p.Score >= 0 THEN 'LowVoted'
+            ELSE 'NegativeVoted'
+        END AS VoteCategory,
+        COALESCE(
+            (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2),
+            0
+        ) AS UpVoteCount,
+        COALESCE(
+            (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3),
+            0
+        ) AS DownVoteCount,
+        COALESCE(
+            (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id),
+            0
+        ) AS CommentCountActual,
+        TRIM(BOTH '<>' FROM COALESCE(p.Tags, '')) AS CleanTags,
+        STRING_TO_ARRAY(TRIM(BOTH '<>' FROM COALESCE(p.Tags, '')), '><') AS TagArray
+    FROM Posts p
+    WHERE p.Score IS NOT NULL
+),
+ComplexAnalysis AS (
+    SELECT 
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.Views,
+        ua.PostCount,
+        ua.CommentCount,
+        ua.BadgeCount,
+        pa.PostId,
+        pa.Title,
+        pa.Score,
+        pa.ViewCount,
+        pa.CreationDate,
+        pa.PostType,
+        pa.VoteCategory,
+        pa.UpVoteCount,
+        pa.DownVoteCount,
+        pa.CommentCountActual,
+        pa.TagArray,
+        CASE 
+            WHEN ARRAY_LENGTH(pa.TagArray, 1) > 0 THEN 
+                (SELECT STRING_AGG(t.TagName, ', ') 
+                 FROM Tags t 
+                 WHERE t.TagName = ANY(pa.TagArray))
+            ELSE 'No Tags'
+        END AS TagNames,
+        DATEDIFF('day', pa.CreationDate, CURRENT_TIMESTAMP) AS DaysSinceCreation,
+        CASE 
+            WHEN pa.ViewCount > 1000 THEN 'Popular'
+            WHEN pa.ViewCount > 100 THEN 'Moderate'
+            WHEN pa.ViewCount > 0 THEN 'Low'
+            ELSE 'No Views'
+        END AS PopularityLevel,
+        COALESCE(
+            (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = pa.PostId AND pl.LinkTypeId = 3),
+            0
+        ) AS DuplicateLinkCount,
+        COALESCE(
+            (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = pa.PostId AND ph.PostHistoryTypeId = 10 AND ph.Comment IS NOT NULL),
+            0
+        ) AS CloseCount,
+        ROW_NUMBER() OVER (PARTITION BY pa.OwnerUserId ORDER BY pa.Score DESC) AS ScoreRankWithinUser,
+        RANK() OVER (ORDER BY pa.Score DESC) AS GlobalScoreRank
+    FROM UserStats ua
+    INNER JOIN PostAnalysis pa ON ua.UserId = pa.OwnerUserId
+    WHERE ua.PostCount > 0
+)
+SELECT 
+    ca.UserId,
+    ca.DisplayName,
+    ca.Reputation,
+    ca.Views,
+    ca.PostCount,
+    ca.CommentCount,
+    ca.BadgeCount,
+    ca.PostId,
+    ca.Title,
+    ca.Score,
+    ca.ViewCount,
+    ca.CreationDate,
+    ca.PostType,
+    ca.VoteCategory,
+    ca.UpVoteCount,
+    ca.DownVoteCount,
+    ca.CommentCountActual,
+    ca.TagNames,
+    ca.DaysSinceCreation,
+    ca.PopularityLevel,
+    ca.DuplicateLinkCount,
+    ca.CloseCount,
+    ca.ScoreRankWithinUser,
+    ca.GlobalScoreRank,
+    CASE 
+        WHEN ca.Reputation > 100000 THEN 'Elite'
+        WHEN ca.Reputation > 50000 THEN 'Veteran'
+        WHEN ca.Reputation > 10000 THEN 'Experienced'
+        WHEN ca.Reputation > 1000 THEN 'Beginner'
+        ELSE 'Newbie'
+    END AS UserTier,
+    CASE 
+        WHEN ca.Views > 10000 AND ca.Reputation > 5000 THEN 'HighlyActive'
+        WHEN ca.Views > 1000 AND ca.Reputation > 1000 THEN 'Active'
+        ELSE 'Regular'
+    END AS ActivityLevel,
+    (SELECT COUNT(*) FROM Votes v WHERE v.UserId = ca.UserId AND v.VoteTypeId = 2) AS TotalUpVotesGiven,
+    (SELECT COUNT(*) FROM Votes v WHERE v.UserId = ca.UserId AND v.VoteTypeId = 3) AS TotalDownVotesGiven,
+    ((ca.UpVoteCount * 1.0) / NULLIF((ca.UpVoteCount + ca.DownVoteCount), 0)) * 100 AS UpVotePercentage,
+    (SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = ca.UserId) AS AvgUserPostScore,
+    COALESCE(
+        (SELECT MIN(p.Score) FROM Posts p WHERE p.OwnerUserId = ca.UserId),
+        0
+    ) AS MinUserPostScore,
+    COALESCE(
+        (SELECT MAX(p.Score) FROM Posts p WHERE p.OwnerUserId = ca.UserId),
+        0
+    ) AS MaxUserPostScore,
+    LAG(ca.Score, 1) OVER (PARTITION BY ca.UserId ORDER BY ca.CreationDate) AS PrevPostScore,
+    LEAD(ca.Score, 1) OVER (PARTITION BY ca.UserId ORDER BY ca.CreationDate) AS NextPostScore,
+    COALESCE(
+        (SELECT STRING_AGG(DISTINCT b.Name, ', ') 
+         FROM Badges b 
+         WHERE b.UserId = ca.UserId AND b.Class = 1),
+        'No Gold Badges'
+    ) AS GoldBadges,
+    COALESCE(
+        (SELECT STRING_AGG(DISTINCT b.Name, ', ') 
+         FROM Badges b 
+         WHERE b.UserId = ca.UserId AND b.Class = 2),
+        'No Silver Badges'
+    ) AS SilverBadges,
+    COALESCE(
+        (SELECT STRING_AGG(DISTINCT b.Name, ', ') 
+         FROM Badges b 
+         WHERE b.UserId = ca.UserId AND b.Class = 3),
+        'No Bronze Badges'
+    ) AS BronzeBadges,
+    CASE 
+        WHEN EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = ca.UserId AND b.Name LIKE '%Famous%') THEN 'Famous'
+        WHEN EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = ca.UserId AND b.Name LIKE '%Popular%') THEN 'Popular'
+        WHEN EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = ca.UserId AND b.Name LIKE '%Notable%') THEN 'Notable'
+        ELSE 'Regular'
+    END AS BadgeRecognition,
+    CURRENT_TIMESTAMP - ca.CreationDate AS TimeSinceLastActivity,
+    ROW_NUMBER() OVER (ORDER BY ca.Score DESC, ca.Reputation DESC) AS OverallPosition,
+    DENSE_RANK() OVER (ORDER BY ca.Reputation DESC) AS ReputationRank,
+    RANK() OVER (ORDER BY ca.PostCount DESC) AS PostCountRank,
+    CASE 
+        WHEN ca.Score > 100 AND ca.ViewCount > 500 THEN 'HighPerformance'
+        WHEN ca.Score > 50 AND ca.ViewCount > 200 THEN 'MediumPerformance'
+        WHEN ca.Score > 10 AND ca.ViewCount > 100 THEN 'LowPerformance'
+        ELSE 'VeryLowPerformance'
+    END AS PerformanceLevel
+FROM ComplexAnalysis ca
+WHERE ca.PostCount >= 2
+  AND ca.Reputation >= 1000
+  AND (ca.PostType = 'Question' OR ca.PostType = 'Answer')
+  AND ca.Score BETWEEN -10 AND 1000
+  AND ca.DaysSinceCreation <= 365
+ORDER BY ca.Reputation DESC, ca.GlobalScoreRank ASC, ca.PostCount DESC
+LIMIT 1000;

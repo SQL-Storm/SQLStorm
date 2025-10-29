@@ -1,0 +1,133 @@
+-- {"query": "5593.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 918} 
+WITH
+recent_user_activity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.Location,
+    u.WebsiteUrl,
+    u.AboutMe,
+    u.EmailHash,
+    u.AccountId,
+    ROW_NUMBER() OVER (ORDER BY u.LastAccessDate DESC) AS rn
+  FROM Users u
+),
+top_tags AS (
+  SELECT
+    t.TagName,
+    t.Count,
+    ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS tag_rank
+  FROM Tags t
+  WHERE t.IsModeratorOnly = 0
+),
+posts_summary AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.Tags,
+    pc.Name AS PostTypeName,
+    COALESCE(a.Id, NULL) AS AcceptedAnswerId,
+    CASE
+      WHEN p.OwnerUserId IS NOT NULL THEN u.DisplayName
+      ELSE p.OwnerDisplayName
+    END AS PostOwnerDisplayName
+  FROM Posts p
+  JOIN PostTypes pc ON p.PostTypeId = pc.Id
+  LEFT JOIN Posts a ON p.AcceptedAnswerId = a.Id
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.LastActivityDate > NOW() - INTERVAL '180 days'
+),
+edge_cases AS (
+  SELECT
+    p.PostId,
+    p.Title,
+    p.PostTypeId,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.Tags,
+    p.PostTypeName,
+    p.AcceptedAnswerId,
+    p.PostOwnerDisplayName,
+    -- nested correlated subquery to fetch last editor details
+    (SELECT le.DisplayName
+     FROM Users le
+     WHERE le.Id = p.LastEditorUserId) AS LastEditorDisplayName,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.PostId) AS TotalComments
+  FROM posts_summary p
+),
+combined AS (
+  SELECT
+    e.PostId,
+    e.Title,
+    e.PostTypeId,
+    e.PostTypeName,
+    e.Score,
+    e.ViewCount,
+    e.AnswerCount,
+    e.CommentCount,
+    e.TotalComments,
+    e.Tags,
+    e.PostOwnerDisplayName,
+    e.LastEditorDisplayName,
+    e.AcceptedAnswerId,
+    e.CreationDate,
+    e.LastActivityDate
+  FROM edge_cases e
+  LEFT JOIN PostLinks pl ON pl.PostId = e.PostId
+  LEFT JOIN Posts related ON pl.RelatedPostId = related.Id
+  WHERE e.Score IS NOT NULL
+),
+final AS (
+  SELECT
+    c.*,
+    -- window function to compute a running rank per tag and post type
+    SUM(CASE WHEN c.PostTypeId = 1 THEN 1 ELSE 0 END) OVER (ORDER BY c.CreationDate) AS cumulative_questions,
+    SUM(CASE WHEN c.PostTypeId = 2 THEN 1 ELSE 0 END) OVER (ORDER BY c.CreationDate) AS cumulative_answers,
+    -- string expression: create a combined label
+    CONCAT(c.Title, ' [', c.PostTypeName, ']') AS TitleWithType,
+    -- complex predicate with NULL handling
+    CASE
+      WHEN c.OwnerUserId IS NULL THEN 'Anonymous'
+      WHEN c.OwnerUserId IN (SELECT Id FROM Users WHERE Reputation < 100) THEN 'Newbie'
+      ELSE 'Registered'
+    END AS OwnerCategory
+  FROM combined c
+)
+SELECT
+  f.PostId,
+  f.Title,
+  f.PostTypeName,
+  f.Score,
+  f.ViewCount,
+  f.AnswerCount,
+  f.CommentCount,
+  f.TotalComments,
+  f.Tags,
+  f.PostOwnerDisplayName,
+  f.LastEditorDisplayName,
+  f.AcceptedAnswerId,
+  f.CreationDate,
+  f.LastActivityDate,
+  f.TitleWithType,
+  f.cumulative_questions,
+  f.cumulative_answers,
+  f.OwnerCategory
+FROM final f
+ORDER BY f.LastActivityDate DESC
+LIMIT 500;

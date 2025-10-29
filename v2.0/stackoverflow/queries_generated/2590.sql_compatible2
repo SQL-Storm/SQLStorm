@@ -1,0 +1,165 @@
+with RankedPosts as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.Title,
+        p.AnswerCount,
+        p.ClosedDate,
+        row_number() over (
+            partition by p.OwnerUserId 
+            order by p.Score desc, p.CreationDate desc
+        ) as rn
+    from Posts p
+    where p.PostTypeId in (1, 2)
+      and p.OwnerUserId is not null
+      and p.Score is not null
+),
+TopQuestions as (
+    select rp.*
+    from RankedPosts rp
+    where rp.PostTypeId = 1 and rp.rn = 1
+),
+TopAnswers as (
+    select rp.*
+    from RankedPosts rp
+    where rp.PostTypeId = 2 and rp.rn = 1
+),
+UserBadges as (
+    select
+        b.UserId,
+        count(*) as TotalBadges,
+        count(case when b.Class = 1 then 1 end) as GoldBadges,
+        count(case when b.Class = 2 then 1 end) as SilverBadges,
+        count(case when b.Class = 3 then 1 end) as BronzeBadges,
+        string_agg(distinct b.Name, ', ' order by b.Name) as BadgeNames
+    from Badges b
+    group by b.UserId
+),
+CloseReasonsCounts as (
+    select
+        cast(ph.Comment as integer) as CloseReasonId,
+        crt.Name,
+        count(*) as CloseCount
+    from PostHistory ph
+    inner join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where ph.PostHistoryTypeId = 10
+      and ph.CreationDate > (cast('2024-10-01' as date) - interval '365' day)
+    group by cast(ph.Comment as integer), crt.Name
+    order by CloseCount desc
+    fetch first 5 rows only
+),
+UsersSummary as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        ub.TotalBadges,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ub.BadgeNames,
+        tq.Title as TopQuestionTitle,
+        tq.Score as TopQuestionScore,
+        ta.Title as TopAnswerTitle,
+        ta.Score as TopAnswerScore,
+        extract(day from (cast('2024-10-01 12:34:56' as timestamp) - u.CreationDate)) as DaysSinceCreation,
+        extract(day from (cast('2024-10-01 12:34:56' as timestamp) - u.LastAccessDate)) as DaysSinceLastAccess,
+        coalesce(u.Location, 'Unknown') as Location,
+        NULL as Reputation95pct
+    from Users u
+    left join UserBadges ub on ub.UserId = u.Id
+    left join TopQuestions tq on tq.OwnerUserId = u.Id
+    left join TopAnswers ta on ta.OwnerUserId = u.Id
+),
+ExplodedTags as (
+    select
+        p.Id as PostId,
+        p.PostTypeId,
+        -- split string of form '<tag1><tag2>' into elements; use replace/regexp to be portable
+        trim(t.tag) as Tag
+    from Posts p,
+    lateral (
+        select regexp_split_to_table(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><') as tag
+    ) t
+    where p.Tags is not null
+),
+TagStats as (
+    select
+        et.Tag,
+        count(distinct et.PostId) as TaggedPosts,
+        avg(p.Score) as AvgScore,
+        count(distinct case when p.PostTypeId = 1 and p.ClosedDate is null then p.Id end) as OpenQuestions
+    from ExplodedTags et
+    inner join Posts p on p.Id = et.PostId
+    group by et.Tag
+    having count(distinct et.PostId) > 100
+),
+UserTopQAnswerCount as (
+    select
+        u.Id as UserId,
+        coalesce((
+          select count(*)
+          from Posts a
+          where a.PostTypeId = 2
+          and a.ParentId = (
+              select q.Id from Posts q where q.PostTypeId = 1 and q.OwnerUserId = u.Id order by q.Score desc fetch first 1 row only
+          )
+          and a.CreationDate > (cast('2024-10-01 12:34:56' as timestamp) - interval '30' day)
+        ), 0) as RecentAnswersOnTopQuestion
+    from Users u
+),
+ReputationPercentile as (
+    select
+        percentile_cont(0.95) within group (order by Reputation) as Reputation95pct
+    from Users
+)
+select
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    coalesce(rp.Reputation95pct, us.Reputation95pct) as Reputation95pct,
+    us.DaysSinceCreation,
+    us.DaysSinceLastAccess,
+    us.Location,
+    us.TotalBadges,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    us.BadgeNames,
+    us.TopQuestionTitle,
+    us.TopQuestionScore,
+    us.TopAnswerTitle,
+    us.TopAnswerScore,
+    uqc.RecentAnswersOnTopQuestion,
+    tr.Tag as PopularTag,
+    tr.TaggedPosts,
+    tr.AvgScore,
+    tr.OpenQuestions,
+    crc.Name as PopularCloseReason,
+    crc.CloseCount
+from UsersSummary us
+left join UserTopQAnswerCount uqc on uqc.UserId = us.UserId
+left join lateral (
+    select ts.Tag, ts.TaggedPosts, ts.AvgScore, ts.OpenQuestions
+    from TagStats ts
+    where ts.Tag = (
+        select et.Tag from ExplodedTags et
+        where et.PostId = (
+            select tq.Id from TopQuestions tq where tq.OwnerUserId = us.UserId fetch first 1 row only
+        )
+        fetch first 1 row only
+    )
+    fetch first 1 row only
+) tr on true
+left join CloseReasonsCounts crc on crc.CloseReasonId = 102
+left join ReputationPercentile rp on true
+where us.Reputation > 1000
+order by us.Reputation desc nulls last
+fetch first 50 rows only;

@@ -1,0 +1,308 @@
+-- {"query": "857.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2950} 
+with recent_questions as (
+    select
+        p.Id as QuestionId,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        coalesce(p.AnswerCount, 0) as AnswerCount,
+        case when p.ClosedDate is null then 0 else 1 end as IsClosed
+    from Posts p
+    where p.PostTypeId = 1
+      and p.CreationDate >= (select max(CreationDate) - interval '365 days' from Posts where PostTypeId = 1)
+),
+answers as (
+    select
+        a.ParentId as QuestionId,
+        a.Id as AnswerId,
+        a.OwnerUserId as AnswerOwnerId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreationDate
+    from Posts a
+    where a.PostTypeId = 2
+),
+q_owner as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Location,
+        u.UpVotes,
+        u.DownVotes,
+        u.CreationDate as UserCreationDate
+    from Users u
+),
+badges_by_user as (
+    select
+        b.UserId,
+        count(*) as BadgeCount,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldCount,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverCount,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeCount,
+        max(b.Date) as LastBadgeDate
+    from Badges b
+    group by b.UserId
+),
+votes_agg as (
+    select
+        v.PostId,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+        sum(case when v.VoteTypeId = 5 then 1 else 0 end) as Favorites,
+        sum(case when v.VoteTypeId in (8,9) then coalesce(v.BountyAmount,0) else 0 end) as BountyTotal
+    from Votes v
+    group by v.PostId
+),
+comments_agg as (
+    select
+        c.PostId,
+        count(*) as CommentCount,
+        max(c.CreationDate) as LastCommentDate,
+        sum(case when c.Score > 0 then 1 else 0 end) as PositiveComments
+    from Comments c
+    group by c.PostId
+),
+dup_links as (
+    select
+        pl.PostId as DuplicateOfId,
+        count(*) as DuplicateCount
+    from PostLinks pl
+    where pl.LinkTypeId = 3
+    group by pl.PostId
+),
+tag_expansion as (
+    select
+        q.QuestionId,
+        unnest(string_to_array(substring(q.Tags, 2, length(q.Tags) - 2), '><')) as TagName
+    from recent_questions q
+    where q.Tags is not null
+),
+top_tags as (
+    select
+        te.QuestionId,
+        te.TagName,
+        row_number() over (partition by te.QuestionId order by t.Count desc, te.TagName) as TagRank,
+        t.Count as GlobalTagCount
+    from tag_expansion te
+    left join Tags t on lower(t.TagName) = lower(te.TagName)
+),
+accepted_status as (
+    select
+        q.QuestionId,
+        case when p.AcceptedAnswerId is not null then 1 else 0 end as HasAcceptedAnswer
+    from recent_questions q
+    left join Posts p on p.Id = q.QuestionId
+),
+answer_stats as (
+    select
+        a.QuestionId,
+        count(*) as AnswersTotal,
+        max(a.AnswerScore) as MaxAnswerScore,
+        min(a.AnswerScore) as MinAnswerScore,
+        avg(a.AnswerScore::decimal) as AvgAnswerScore,
+        max(a.AnswerCreationDate) as LastAnswerDate
+    from answers a
+    group by a.QuestionId
+),
+owner_activity as (
+    select
+        q.QuestionId,
+        u.UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Location,
+        coalesce(b.BadgeCount, 0) as BadgeCount,
+        coalesce(b.GoldCount, 0) as GoldBadges,
+        coalesce(b.SilverCount, 0) as SilverBadges,
+        coalesce(b.BronzeCount, 0) as BronzeBadges,
+        u.UpVotes as UserUpVotes,
+        u.DownVotes as UserDownVotes,
+        date_part('day', current_timestamp - u.UserCreationDate) as UserAgeDays
+    from recent_questions q
+    left join q_owner u on u.UserId = q.OwnerUserId
+    left join badges_by_user b on b.UserId = u.UserId
+),
+quality_score as (
+    select
+        q.QuestionId,
+        (coalesce(v.UpVotes,0) - coalesce(v.DownVotes,0)) * 1.0
+        + coalesce(v.Favorites,0) * 0.5
+        + coalesce(v.BountyTotal,0) * 0.01
+        + coalesce(a.AnswersTotal,0) * 0.2
+        + case when ac.HasAcceptedAnswer = 1 then 2 else 0 end
+        + case when q.IsClosed = 1 then -1.5 else 0 end
+        + least(coalesce(c.CommentCount,0), 20) * 0.05
+        + case when q.ViewCount is null then 0 else ln(greatest(q.ViewCount,1)) end
+        as QualityScore
+    from recent_questions q
+    left join votes_agg v on v.PostId = q.QuestionId
+    left join comments_agg c on c.PostId = q.QuestionId
+    left join answer_stats a on a.QuestionId = q.QuestionId
+    left join accepted_status ac on ac.QuestionId = q.QuestionId
+),
+history_flags as (
+    select
+        ph.PostId as QuestionId,
+        max(case when ph.PostHistoryTypeId in (10,35) then 1 else 0 end) as WasClosedOrMigrated,
+        max(case when ph.PostHistoryTypeId in (11) then 1 else 0 end) as WasReopened,
+        max(case when ph.PostHistoryTypeId in (19) then 1 else 0 end) as WasProtected,
+        sum(case when ph.PostHistoryTypeId in (4,5,6) then 1 else 0 end) as EditOperations
+    from PostHistory ph
+    join Posts p on p.Id = ph.PostId and p.PostTypeId = 1
+    group by ph.PostId
+),
+tag_top3 as (
+    select
+        tt.QuestionId,
+        string_agg(tt.TagName, ', ' order by tt.TagRank) as Top3Tags
+    from top_tags tt
+    where tt.TagRank <= 3
+    group by tt.QuestionId
+),
+ranked as (
+    select
+        q.QuestionId,
+        q.Title,
+        coalesce(tt.Top3Tags, '(no tags)') as TopTags,
+        oa.DisplayName as Owner,
+        coalesce(oa.Reputation, 0) as OwnerReputation,
+        coalesce(oa.BadgeCount, 0) as OwnerBadges,
+        coalesce(v.UpVotes,0) as UpVotes,
+        coalesce(v.DownVotes,0) as DownVotes,
+        coalesce(v.Favorites,0) as Favorites,
+        coalesce(v.BountyTotal,0) as BountyTotal,
+        coalesce(c.CommentCount,0) as CommentCount,
+        coalesce(a.AnswersTotal,0) as AnswersTotal,
+        coalesce(ac.HasAcceptedAnswer,0) as HasAcceptedAnswer,
+        q.Score as PostScore,
+        q.ViewCount,
+        q.CreationDate,
+        coalesce(df.DuplicateCount,0) as DuplicateLinks,
+        coalesce(hf.WasClosedOrMigrated,0) as WasClosedOrMigrated,
+        coalesce(hf.WasReopened,0) as WasReopened,
+        coalesce(hf.WasProtected,0) as WasProtected,
+        coalesce(hf.EditOperations,0) as EditOperations,
+        qs.QualityScore,
+        row_number() over (
+            order by
+                qs.QualityScore desc,
+                coalesce(a.AnswersTotal,0) desc,
+                coalesce(v.UpVotes,0) desc,
+                q.ViewCount desc,
+                q.CreationDate desc
+        ) as RankOverall,
+        rank() over (order by coalesce(v.UpVotes,0) - coalesce(v.DownVotes,0) desc) as RankNetVotes,
+        dense_rank() over (order by coalesce(a.AnswersTotal,0) desc) as RankAnswers,
+        percent_rank() over (order by qs.QualityScore) as PctQuality
+    from recent_questions q
+    left join votes_agg v on v.PostId = q.QuestionId
+    left join comments_agg c on c.PostId = q.QuestionId
+    left join answer_stats a on a.QuestionId = q.QuestionId
+    left join accepted_status ac on ac.QuestionId = q.QuestionId
+    left join owner_activity oa on oa.QuestionId = q.QuestionId
+    left join dup_links df on df.DuplicateOfId = q.QuestionId
+    left join history_flags hf on hf.QuestionId = q.QuestionId
+    left join quality_score qs on qs.QuestionId = q.QuestionId
+    left join tag_top3 tt on tt.QuestionId = q.QuestionId
+),
+bench as (
+    select
+        r.*,
+        sum(case when r.HasAcceptedAnswer = 1 then 1 else 0 end) over () as TotalWithAccepted,
+        avg(r.QualityScore) over () as AvgQualityAll,
+        stddev_pop(r.QualityScore) over () as StdQualityAll,
+        avg(r.QualityScore) over (partition by case when r.WasClosedOrMigrated = 1 then 'closed' else 'open' end) as AvgQualityByClosed,
+        count(*) over (partition by case when r.WasProtected = 1 then 'protected' else 'unprotected' end) as CntByProtection,
+        lag(r.QualityScore) over (order by r.CreationDate) as PrevQuality,
+        lead(r.QualityScore) over (order by r.CreationDate) as NextQuality
+    from ranked r
+),
+outliers as (
+    select
+        b.QuestionId,
+        case
+            when b.StdQualityAll is null or b.StdQualityAll = 0 then 0
+            when abs(b.QualityScore - b.AvgQualityAll) > 2 * b.StdQualityAll then 1
+            else 0
+        end as IsQualityOutlier
+    from bench b
+),
+final as (
+    select
+        b.QuestionId,
+        b.Title,
+        b.TopTags,
+        b.Owner,
+        b.OwnerReputation,
+        b.OwnerBadges,
+        b.UpVotes,
+        b.DownVotes,
+        b.Favorites,
+        b.BountyTotal,
+        b.CommentCount,
+        b.AnswersTotal,
+        b.HasAcceptedAnswer,
+        b.PostScore,
+        b.ViewCount,
+        b.CreationDate,
+        b.DuplicateLinks,
+        b.WasClosedOrMigrated,
+        b.WasReopened,
+        b.WasProtected,
+        b.EditOperations,
+        b.QualityScore,
+        b.RankOverall,
+        b.RankNetVotes,
+        b.RankAnswers,
+        b.PctQuality,
+        b.TotalWithAccepted,
+        b.AvgQualityAll,
+        b.StdQualityAll,
+        b.AvgQualityByClosed,
+        b.CntByProtection,
+        b.PrevQuality,
+        b.NextQuality,
+        o.IsQualityOutlier,
+        case
+            when b.Owner is null then 'Anonymous'
+            when b.OwnerReputation >= 20000 then 'Legend'
+            when b.OwnerReputation >= 10000 then 'Veteran'
+            when b.OwnerReputation >= 1000 then 'Regular'
+            else 'Newbie'
+        end as OwnerTier,
+        case
+            when coalesce(b.UpVotes,0) + coalesce(b.DownVotes,0) = 0 then null
+            else round(100.0 * coalesce(b.UpVotes,0) / (coalesce(b.UpVotes,0) + coalesce(b.DownVotes,0)), 1)
+        end as UpvoteRatioPct
+    from bench b
+    left join outliers o on o.QuestionId = b.QuestionId
+)
+select
+    f.*
+from final f
+where
+    -- showcase complex predicate logic and null handling
+    (
+        (f.HasAcceptedAnswer = 1 and f.AnswersTotal >= 1)
+        or (f.HasAcceptedAnswer = 0 and coalesce(f.AnswersTotal,0) >= 3 and f.IsQualityOutlier = 1)
+        or (f.WasClosedOrMigrated = 1 and f.QualityScore > coalesce(f.AvgQualityByClosed, f.AvgQualityAll))
+    )
+    and (
+        f.Owner is null
+        or (f.Owner is not null and f.OwnerTier in ('Legend','Veteran','Regular'))
+    )
+    and (
+        f.TopTags is not null
+        or (f.TopTags is null and f.DuplicateLinks = 0)
+    )
+    and (
+        coalesce(f.ViewCount, 0) >= 0
+        and (f.PrevQuality is null or f.QualityScore >= f.PrevQuality - 1)
+        and (f.NextQuality is null or f.QualityScore <= f.NextQuality + 1)
+    )
+order by
+    f.RankOverall
+fetch first 200 rows only;

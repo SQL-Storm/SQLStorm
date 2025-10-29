@@ -1,0 +1,231 @@
+WITH UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END), 0) AS TotalQuestions,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END), 0) AS TotalAnswers,
+        COALESCE(COUNT(DISTINCT p.Id), 0) AS TotalPosts,
+        COALESCE(COUNT(DISTINCT c.Id), 0) AS TotalComments,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId IN (1,2,5) THEN 1 ELSE 0 END), 0) AS TotalUpVotesGiven,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS TotalDownVotesGiven,
+        COALESCE(COUNT(DISTINCT b.Id), 0) AS TotalBadges,
+        MAX(b.Date) AS LastBadgeDate,
+        DATE_PART('day', AGE(CAST('2024-10-01 12:34:56' AS timestamp), u.CreationDate)) AS DaysSinceCreation,
+        u.Views AS UserProfileViews
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views
+),
+PostEngagementMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        COALESCE(CAST(p.Score AS NUMERIC) / NULLIF(p.ViewCount, 0), 0) AS ScorePerViewRatio,
+        COALESCE(CAST(p.AnswerCount AS NUMERIC) / NULLIF(p.CommentCount + p.AnswerCount + 1, 0), 0) AS AnswerCommentRatio,
+        (SELECT COALESCE(SUM(v.BountyAmount), 0) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 8) AS TotalBountyOffered,
+        p.Title,
+        p.Tags,
+        p.LastActivityDate,
+        p.ClosedDate
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+),
+PostHistoryTimeline AS (
+    SELECT
+        ph.PostId,
+        ph.CreationDate AS HistoryEventDate,
+        ph.PostHistoryTypeId,
+        ph.UserId AS EditorUserId,
+        LAG(ph.PostHistoryTypeId, 1, 0) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS PreviousHistoryTypeId,
+        ph.Comment AS HistoryComment,
+        ph.Text AS HistoryText
+    FROM PostHistory ph
+),
+PostEditCounts AS (
+    SELECT
+        ph.PostId,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 END) AS EditCount,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (10, 101, 102, 103, 104, 105) THEN 1 END) AS CloseVoteCount,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 END) AS ReopenVoteCount,
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (10, 101, 102, 103, 104, 105) THEN ph.CreationDate END) AS LastClosedDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.CreationDate END) AS LastReopenedDate
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+),
+TagAnalysis AS (
+    SELECT
+        pem.PostId,
+        pem.OwnerUserId,
+        LOWER(TRIM(unnest(string_to_array(SUBSTRING(pem.Tags FROM 2 FOR LENGTH(pem.Tags) - 2), '><')))) AS TagName
+    FROM PostEngagementMetrics pem
+    WHERE pem.Tags IS NOT NULL AND LENGTH(pem.Tags) > 2 AND pem.PostTypeId = 1
+),
+RankedUsers AS (
+    SELECT
+        uas.UserId,
+        uas.Reputation,
+        uas.TotalQuestions,
+        uas.TotalAnswers,
+        RANK() OVER (ORDER BY uas.Reputation DESC) AS ReputationRank,
+        DENSE_RANK() OVER (ORDER BY uas.TotalQuestions DESC, uas.TotalAnswers DESC) AS PostCountRank,
+        NTILE(10) OVER (ORDER BY uas.UserProfileViews DESC NULLS LAST) AS UserViewsDecile
+    FROM UserActivitySummary uas
+),
+CombinedUserMetrics AS (
+    SELECT
+        ru.UserId,
+        u.DisplayName,
+        ru.Reputation,
+        ru.ReputationRank,
+        ru.PostCountRank,
+        ru.UserViewsDecile,
+        uas.TotalQuestions,
+        uas.TotalAnswers,
+        uas.TotalComments,
+        uas.TotalBadges,
+        AVG(pem_agg.AvgPostScore) AS AverageOverallPostScore,
+        AVG(pem_agg.AvgQuestionScore) AS AverageQuestionScore,
+        MAX(pem_agg.MaxPostViewCount) AS MaxPostViews,
+        COUNT(DISTINCT ta.TagName) AS UniqueTagsPosted,
+        SUM(pec_agg.TotalPostEditCount) AS TotalEditsAcrossPosts,
+        SUM(pec_agg.TotalPostCloseVoteCount) AS TotalCloseEvents,
+        SUM(pec_agg.TotalPostReopenVoteCount) AS TotalReopenEvents,
+        (SELECT COUNT(DISTINCT pl.RelatedPostId) FROM PostLinks pl WHERE pl.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = ru.UserId) AND pl.LinkTypeId = 3) AS TotalDuplicateQuestionsLinked,
+        CASE
+            WHEN uas.UserProfileViews > 1000 AND ru.ReputationRank <= 1000 THEN 'High Profile, Top Rep'
+            WHEN uas.UserProfileViews > 500 AND ru.ReputationRank <= 5000 THEN 'Engaged Contributor'
+            WHEN uas.LastAccessDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days' AND uas.TotalPosts > 0 THEN 'Recent Active User'
+            ELSE 'Casual User or Inactive'
+        END AS UserEngagementSegment,
+        (
+            SELECT COALESCE(MAX(editor_u.Reputation), 0)
+            FROM Posts p_inner
+            JOIN Users editor_u ON p_inner.LastEditorUserId = editor_u.Id
+            WHERE p_inner.OwnerUserId = ru.UserId
+              AND p_inner.LastEditorUserId IS NOT NULL
+              AND p_inner.LastEditDate >= uas.LastAccessDate - INTERVAL '1 year'
+        ) AS MaxEditorReputationForUserPosts,
+        COALESCE(
+            MAX(CASE WHEN uas.TotalQuestions > 0 THEN pem_agg.AvgScorePerViewRatio END),
+            0
+        ) AS AvgQuestionScorePerView,
+        MAX(CASE WHEN uas.LastAccessDate IS NULL THEN 'Never Logged In' ELSE 'Has Logged In' END) AS LoginStatusDescription,
+        AVG(uas.TotalUpVotesGiven) OVER (PARTITION BY ru.UserViewsDecile) AS AvgUpVotesInViewsDecile,
+        AVG(uas.TotalDownVotesGiven) OVER (PARTITION BY ru.UserViewsDecile) AS AvgDownVotesInViewsDecile
+    FROM RankedUsers ru
+    JOIN Users u ON ru.UserId = u.Id
+    LEFT JOIN UserActivitySummary uas ON ru.UserId = uas.UserId
+    LEFT JOIN (
+        SELECT
+            pem.OwnerUserId,
+            AVG(pem.Score) AS AvgPostScore,
+            MAX(pem.ViewCount) AS MaxPostViewCount,
+            AVG(CASE WHEN pem.PostTypeId = 1 THEN pem.Score ELSE NULL END) AS AvgQuestionScore,
+            AVG(CASE WHEN pem.PostTypeId = 1 THEN pem.ScorePerViewRatio ELSE NULL END) AS AvgScorePerViewRatio
+        FROM PostEngagementMetrics pem
+        GROUP BY pem.OwnerUserId
+    ) AS pem_agg ON ru.UserId = pem_agg.OwnerUserId
+    LEFT JOIN (
+        SELECT
+            p.OwnerUserId,
+            SUM(pec.EditCount) AS TotalPostEditCount,
+            SUM(pec.CloseVoteCount) AS TotalPostCloseVoteCount,
+            SUM(pec.ReopenVoteCount) AS TotalPostReopenVoteCount
+        FROM PostEditCounts pec
+        JOIN Posts p ON pec.PostId = p.Id
+        GROUP BY p.OwnerUserId
+    ) AS pec_agg ON ru.UserId = pec_agg.OwnerUserId
+    LEFT JOIN TagAnalysis ta ON ru.UserId = ta.OwnerUserId
+    GROUP BY
+        ru.UserId, u.DisplayName, ru.Reputation, ru.ReputationRank, ru.PostCountRank, ru.UserViewsDecile,
+        uas.TotalQuestions, uas.TotalAnswers, uas.TotalComments, uas.TotalBadges, uas.UserProfileViews, uas.LastAccessDate, u.CreationDate,
+        uas.TotalUpVotesGiven, uas.TotalDownVotesGiven
+)
+SELECT
+    cum.UserId,
+    cum.DisplayName,
+    cum.Reputation,
+    cum.ReputationRank,
+    cum.PostCountRank,
+    cum.UserViewsDecile,
+    cum.TotalQuestions,
+    cum.TotalAnswers,
+    cum.TotalComments,
+    cum.TotalBadges,
+    cum.AverageOverallPostScore,
+    cum.AverageQuestionScore,
+    cum.MaxPostViews,
+    cum.UniqueTagsPosted,
+    cum.TotalEditsAcrossPosts,
+    cum.TotalCloseEvents,
+    cum.TotalReopenEvents,
+    cum.TotalDuplicateQuestionsLinked,
+    cum.UserEngagementSegment,
+    cum.MaxEditorReputationForUserPosts,
+    cum.AvgQuestionScorePerView,
+    cum.LoginStatusDescription,
+    cum.AvgUpVotesInViewsDecile,
+    cum.AvgDownVotesInViewsDecile,
+    'High Engagement Profile' AS EngagementCategory
+FROM CombinedUserMetrics cum
+WHERE
+    cum.Reputation > 5000
+    AND cum.TotalQuestions >= 10
+    AND cum.TotalAnswers >= 20
+    AND cum.TotalBadges >= 5
+    AND cum.LoginStatusDescription = 'Has Logged In'
+    AND cum.MaxPostViews > 10000
+    AND cum.TotalCloseEvents IS DISTINCT FROM 0
+    AND cum.UniqueTagsPosted > 10
+UNION ALL
+SELECT
+    cum.UserId,
+    cum.DisplayName,
+    cum.Reputation,
+    cum.ReputationRank,
+    cum.PostCountRank,
+    cum.UserViewsDecile,
+    cum.TotalQuestions,
+    cum.TotalAnswers,
+    cum.TotalComments,
+    cum.TotalBadges,
+    cum.AverageOverallPostScore,
+    cum.AverageQuestionScore,
+    cum.MaxPostViews,
+    cum.UniqueTagsPosted,
+    cum.TotalEditsAcrossPosts,
+    cum.TotalCloseEvents,
+    cum.TotalReopenEvents,
+    cum.TotalDuplicateQuestionsLinked,
+    cum.UserEngagementSegment,
+    cum.MaxEditorReputationForUserPosts,
+    cum.AvgQuestionScorePerView,
+    cum.LoginStatusDescription,
+    cum.AvgUpVotesInViewsDecile,
+    cum.AvgDownVotesInViewsDecile,
+    'Moderate Engagement & Niche Interest' AS EngagementCategory
+FROM CombinedUserMetrics cum
+WHERE
+    cum.Reputation BETWEEN 1000 AND 5000
+    AND cum.TotalPosts > 5
+    AND cum.LoginStatusDescription = 'Has Logged In'
+    AND cum.AvgQuestionScorePerView > 0.1
+    AND (
+        EXISTS (SELECT 1 FROM TagAnalysis ta WHERE ta.OwnerUserId = cum.UserId AND ta.TagName IN ('sql', 'postgresql', 'database', 'performance'))
+        OR EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = cum.UserId AND p.Body LIKE '%benchmark%' AND p.PostTypeId = 1 AND p.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years')
+    )
+ORDER BY
+    ReputationRank ASC, UserViewsDecile DESC
+LIMIT 200;

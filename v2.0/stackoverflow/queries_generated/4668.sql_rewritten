@@ -1,0 +1,134 @@
+-- {"query": "4668.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1237} 
+WITH
+  UserEngagement AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      COUNT(DISTINCT p.Id) AS TotalPosts,
+      SUM(CASE WHEN pt.Name = 'Question' THEN 1 ELSE 0 END) AS QuestionCount,
+      SUM(CASE WHEN pt.Name = 'Answer' THEN 1 ELSE 0 END) AS AnswerCount,
+      COUNT(DISTINCT c.Id) AS CommentCount,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount
+    FROM
+      Users AS u
+      LEFT JOIN Posts AS p
+        ON u.Id = p.OwnerUserId
+      LEFT JOIN PostTypes AS pt
+        ON p.PostTypeId = pt.Id
+      LEFT JOIN Comments AS c
+        ON u.Id = c.UserId
+      LEFT JOIN Votes AS v
+        ON u.Id = v.UserId
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation
+  ),
+  PostInteraction AS (
+    SELECT
+      p.Id AS PostId,
+      p.Title,
+      p.OwnerUserId,
+      pt.Name AS PostType,
+      COALESCE(p.AnswerCount, 0) AS AnswerCount,
+      p.Score,
+      p.FavoriteCount,
+      p.CommentCount AS PostCommentCount,
+      COUNT(DISTINCT c.Id) AS TotalComments,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS PostUpVotes,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS PostDownVotes,
+      ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS PostRankByDate,
+      AVG(CAST(p.Score AS REAL)) OVER (PARTITION BY p.OwnerUserId) AS AvgUserPostScore
+    FROM
+      Posts AS p
+      JOIN PostTypes AS pt
+        ON p.PostTypeId = pt.Id
+      LEFT JOIN Comments AS c
+        ON p.Id = c.PostId
+      LEFT JOIN Votes AS v
+        ON p.Id = v.PostId
+    GROUP BY
+      p.Id,
+      p.Title,
+      p.OwnerUserId,
+      pt.Name,
+      p.AnswerCount,
+      p.Score,
+      p.FavoriteCount,
+      p.CommentCount,
+      p.CreationDate
+  ),
+  TagPopularity AS (
+    SELECT
+      t.TagName,
+      t.Count AS TagCount,
+      COUNT(DISTINCT pl.PostId) AS PostsWithTag,
+      SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCountWithTag,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCountWithTag,
+      AVG(CAST(p.Score AS REAL)) AS AvgPostScoreForTag
+    FROM
+      Tags AS t
+      LEFT JOIN Posts AS p
+        ON ',' + REPLACE(p.Tags, '><', ',') + ',' LIKE '%,' + t.TagName + ',%'
+    WHERE
+      p.PostTypeId = 1 OR p.PostTypeId = 2
+    GROUP BY
+      t.TagName,
+      t.Count
+    HAVING
+      t.Count > 100
+  )
+SELECT
+  ue.DisplayName,
+  ue.Reputation,
+  ue.TotalPosts,
+  ue.QuestionCount,
+  ue.AnswerCount,
+  ue.CommentCount,
+  ue.UpVoteCount,
+  ue.DownVoteCount,
+  pi.Title AS MostRecentPostTitle,
+  pi.PostType,
+  pi.Score AS MostRecentPostScore,
+  pi.AnswerCount AS MostRecentPostAnswerCount,
+  pi.FavoriteCount AS MostRecentPostFavoriteCount,
+  pi.TotalComments AS MostRecentPostTotalComments,
+  pi.PostUpVotes AS MostRecentPostUpVotes,
+  pi.PostDownVotes AS MostRecentPostDownVotes,
+  pi.AvgUserPostScore,
+  tp.TagName AS PopularTag,
+  tp.TagCount AS PopularTagCount,
+  tp.PostsWithTag AS PostsWithPopularTag,
+  tp.AvgPostScoreForTag
+FROM
+  UserEngagement AS ue
+  LEFT JOIN PostInteraction AS pi
+    ON ue.UserId = pi.OwnerUserId AND pi.PostRankByDate = 1
+  LEFT JOIN (
+    SELECT
+      ue_inner.UserId,
+      tp_inner.TagName,
+      tp_inner.TagCount,
+      tp_inner.PostsWithTag,
+      tp_inner.AvgPostScoreForTag
+    FROM
+      UserEngagement AS ue_inner
+      CROSS JOIN TagPopularity AS tp_inner
+    WHERE
+      RAND() < 0.1
+  ) AS tp
+    ON ue.UserId = ue.UserId
+WHERE
+  ue.Reputation > 1000
+  AND ue.TotalPosts > 5
+  AND (
+    ue.DisplayName LIKE '%John%'
+    OR ue.DisplayName LIKE '%Doe%'
+  )
+ORDER BY
+  ue.Reputation DESC,
+  ue.TotalPosts DESC,
+  tp.TagCount DESC
+LIMIT 100;

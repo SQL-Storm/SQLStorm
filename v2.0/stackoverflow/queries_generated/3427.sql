@@ -1,0 +1,74 @@
+-- {"query": "3427.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1704} 
+WITH RecentPosts AS (
+    SELECT p.Id,
+           p.OwnerUserId,
+           p.CreationDate,
+           p.Score,
+           p.PostTypeId,
+           ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE p.CreationDate >= CURRENT_DATE - INTERVAL '30 days'
+),
+UserBadgeAgg AS (
+    SELECT b.UserId,
+           COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+           COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+           COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+           COUNT(*) AS TotalBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserScoreStats AS (
+    SELECT p.OwnerUserId,
+           AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL) AS AvgScore,
+           SUM(CASE WHEN p.Score > 0 THEN 1 ELSE 0 END) AS PositiveScoreCount,
+           SUM(CASE WHEN p.Score < 0 THEN 1 ELSE 0 END) AS NegativeScoreCount,
+           COUNT(*) AS TotalPosts
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+UserLastActivity AS (
+    SELECT u.Id AS UserId,
+           GREATEST(
+               u.LastAccessDate,
+               COALESCE((SELECT MAX(v.CreationDate) FROM Votes v WHERE v.UserId = u.Id), TIMESTAMP '1970-01-01')
+           ) AS LastActivity
+    FROM Users u
+)
+SELECT u.Id,
+       u.DisplayName,
+       u.Reputation,
+       COALESCE(uba.GoldBadges, 0)      AS GoldBadges,
+       COALESCE(uba.SilverBadges, 0)    AS SilverBadges,
+       COALESCE(uba.BronzeBadges, 0)    AS BronzeBadges,
+       COALESCE(uss.AvgScore, 0)        AS AvgPostScore,
+       COALESCE(uss.PositiveScoreCount, 0) AS PosScorePosts,
+       COALESCE(uss.NegativeScoreCount, 0) AS NegScorePosts,
+       COALESCE(rp.TotalRecent, 0)      AS RecentPostCount,
+       ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+       CASE
+           WHEN u.Location IS NULL OR TRIM(u.Location) = '' THEN 'Unknown'
+           ELSE u.Location
+       END                              AS UserLocation,
+       ul.LastActivity
+FROM Users u
+LEFT JOIN UserBadgeAgg uba   ON uba.UserId = u.Id
+LEFT JOIN UserScoreStats uss ON uss.OwnerUserId = u.Id
+LEFT JOIN (
+    SELECT OwnerUserId, COUNT(*) AS TotalRecent
+    FROM RecentPosts
+    WHERE rn <= 5
+    GROUP BY OwnerUserId
+) rp ON rp.OwnerUserId = u.Id
+LEFT JOIN UserLastActivity ul ON ul.UserId = u.Id
+WHERE u.Reputation > 1000
+  AND (u.CreationDate < CURRENT_DATE - INTERVAL '1 year' OR u.CreationDate IS NULL)
+ORDER BY u.Reputation DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
+FROM (SELECT 1) dummy
+ORDER BY ReputationRank NULLS LAST;

@@ -1,0 +1,35 @@
+SELECT 
+    u.displayname,
+    u.reputation,
+    COUNT(DISTINCT p.id) AS totalposts,
+    COUNT(DISTINCT CASE WHEN ph.posthistorytypeid = 1 THEN p.id END) AS totalquestions,
+    COUNT(DISTINCT CASE WHEN p.posttypeid = 2 THEN p.id END) AS totalanswers,
+    COUNT(DISTINCT CASE WHEN pl.linktypeid = 3 THEN p.id END) AS totalduplicates,
+    COUNT(DISTINCT CASE WHEN b.id IS NOT NULL THEN p.id END) AS totalbadges,
+    MAX(u.creationdate) AS lastaccountactivity,
+    MAX(CASE WHEN p.posttypeid = 1 THEN p.lastactivitydate END) AS lastquestionactivity,
+    MAX(p.lastactivitydate) AS lastpostactivity,
+    STRING_AGG(DISTINCT t.tagname, ', ') AS mostfrequenttags
+FROM 
+    users u
+LEFT JOIN 
+    posts p ON u.id = p.owneruserid
+LEFT JOIN 
+    posthistory ph ON p.id = ph.postid
+LEFT JOIN 
+    badges b ON u.id = b.userid
+LEFT JOIN 
+    postlinks pl ON p.id = pl.postid
+LEFT JOIN 
+    tags t ON p.id = t.excerptpostid
+LEFT JOIN 
+    (SELECT tags.postid, COUNT(*) AS tagcount FROM tags GROUP BY tags.postid HAVING COUNT(*) > 2) tg ON p.id = tg.postid
+WHERE 
+    (p.posttypeid IN (1, 2) OR p.id IS NULL) -- allow users without posts to remain in LEFT JOIN results
+    AND u.reputation > 100
+    AND (u.lastaccessdate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30' DAY) OR u.lastaccessdate IS NULL)
+GROUP BY 
+    u.id, u.displayname, u.reputation
+ORDER BY 
+    u.reputation DESC, totalposts DESC
+LIMIT 100;

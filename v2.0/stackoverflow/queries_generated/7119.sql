@@ -1,0 +1,184 @@
+-- {"query": "7119.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1823} 
+SELECT 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) as TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.ViewCount > 1000 THEN p.Id END) as HighViewQuestions,
+    COUNT(DISTINCT b.Id) as Badges,
+    STRING_AGG(DISTINCT b.Name, ', ') as BadgeNames,
+    AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END) as AvgQuestionScore,
+    AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE NULL END) as AvgAnswerScore,
+    MAX(p.Score) as MaxScore,
+    MIN(p.Score) as MinScore,
+    COUNT(DISTINCT c.Id) as CommentCount,
+    COUNT(DISTINCT ph.Id) as PostHistoryCount,
+    COUNT(DISTINCT pl.Id) as PostLinkCount,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN ph.Id END) as ModerationEvents,
+    COALESCE(SUM(CASE WHEN v.VoteTypeId IN (2, 3) THEN 1 ELSE 0 END), 0) as VoteActivity,
+    COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) as Upvotes,
+    COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) as Downvotes,
+    ROUND(
+        (COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) * 100.0) / 
+        NULLIF(COALESCE(SUM(CASE WHEN v.VoteTypeId IN (2, 3) THEN 1 ELSE 0 END), 0), 0), 
+        2
+    ) as UpvotePercentage,
+    ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) as UserRankByPosts,
+    DENSE_RANK() OVER (ORDER BY u.Reputation DESC) as UserRankByReputation,
+    PERCENT_RANK() OVER (ORDER BY u.Reputation ASC) as ReputationPercentile,
+    CASE 
+        WHEN COUNT(DISTINCT p.Id) > 1000 THEN 'Elite'
+        WHEN COUNT(DISTINCT p.Id) > 500 THEN 'Veteran'
+        WHEN COUNT(DISTINCT p.Id) > 100 THEN 'Contributor'
+        WHEN COUNT(DISTINCT p.Id) > 0 THEN 'Active'
+        ELSE 'Newbie'
+    END as UserStatus,
+    STRING_AGG(
+        CASE 
+            WHEN p.PostTypeId = 1 THEN CONCAT('Q:', p.Title, ' (', p.Score, ')')
+            WHEN p.PostTypeId = 2 THEN CONCAT('A:', SUBSTRING(p.Body, 1, 50), '...')
+        END, 
+        '; '
+    ) as RecentActivity,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p2 
+        WHERE p2.OwnerUserId = u.Id 
+        AND p2.CreationDate > DATEADD(YEAR, -1, GETDATE())
+        AND p2.PostTypeId = 1
+    ) as RecentQuestions,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p3 
+        WHERE p3.OwnerUserId = u.Id 
+        AND p3.CreationDate > DATEADD(YEAR, -1, GETDATE())
+        AND p3.PostTypeId = 2
+    ) as RecentAnswers,
+    COALESCE(
+        (
+            SELECT AVG(p4.Score) 
+            FROM Posts p4 
+            WHERE p4.OwnerUserId = u.Id 
+            AND p4.PostTypeId = 1
+        ), 
+        0
+    ) as AvgRecentQuestionScore,
+    (
+        SELECT COUNT(DISTINCT v2.Id) 
+        FROM Votes v2 
+        WHERE v2.UserId = u.Id 
+        AND v2.CreationDate > DATEADD(DAY, -7, GETDATE())
+    ) as WeeklyVotes,
+    CASE 
+        WHEN EXISTS (
+            SELECT 1 
+            FROM Posts p5 
+            WHERE p5.OwnerUserId = u.Id 
+            AND p5.PostTypeId = 1 
+            AND p5.Score > 100
+        ) THEN 'HighlyVotedQuestionAuthor'
+        ELSE 'RegularAuthor'
+    END as AuthorType,
+    (
+        SELECT COUNT(*) 
+        FROM Badges b2 
+        WHERE b2.UserId = u.Id 
+        AND b2.Date > DATEADD(MONTH, -6, GETDATE())
+    ) as RecentBadgesCount,
+    (
+        SELECT STRING_AGG(CONCAT(b3.Name, '(', b3.Class, ')'), ', ')
+        FROM Badges b3 
+        WHERE b3.UserId = u.Id 
+        AND b3.Date > DATEADD(YEAR, -1, GETDATE())
+    ) as RecentBadges,
+    ABS(
+        (
+            SELECT AVG(p6.Score) 
+            FROM Posts p6 
+            WHERE p6.OwnerUserId = u.Id 
+            AND p6.PostTypeId = 2
+        ) - 
+        (
+            SELECT AVG(p7.Score) 
+            FROM Posts p7 
+            WHERE p7.OwnerUserId = u.Id 
+            AND p7.PostTypeId = 1
+        )
+    ) as ScoreDifference,
+    CONCAT(
+        'User-', u.Id, '-Posts-', COUNT(DISTINCT p.Id)
+    ) as UserIdentifier,
+    CASE 
+        WHEN u.Reputation > 1000000 THEN 'Legendary'
+        WHEN u.Reputation > 100000 THEN 'Master'
+        WHEN u.Reputation > 10000 THEN 'Expert'
+        WHEN u.Reputation > 1000 THEN 'Contributor'
+        WHEN u.Reputation > 100 THEN 'Member'
+        ELSE 'Newbie'
+    END as ReputationCategory,
+    (
+        SELECT TOP 1 p8.Title 
+        FROM Posts p8 
+        WHERE p8.OwnerUserId = u.Id 
+        AND p8.PostTypeId = 1 
+        ORDER BY p8.Score DESC
+    ) as HighestScoringQuestion,
+    (
+        SELECT TOP 1 p9.Body 
+        FROM Posts p9 
+        WHERE p9.OwnerUserId = u.Id 
+        AND p9.PostTypeId = 2 
+        ORDER BY p9.Score DESC
+    ) as HighestScoringAnswer,
+    (
+        SELECT MIN(p10.CreationDate) 
+        FROM Posts p10 
+        WHERE p10.OwnerUserId = u.Id
+    ) as FirstPostDate,
+    (
+        SELECT MAX(p11.CreationDate) 
+        FROM Posts p11 
+        WHERE p11.OwnerUserId = u.Id
+    ) as LastPostDate,
+    DATEDIFF(DAY, 
+        (
+            SELECT MIN(p12.CreationDate) 
+            FROM Posts p12 
+            WHERE p12.OwnerUserId = u.Id
+        ),
+        (
+            SELECT MAX(p13.CreationDate) 
+            FROM Posts p13 
+            WHERE p13.OwnerUserId = u.Id
+        )
+    ) as ActiveDays
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN Comments c ON u.Id = c.UserId
+LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+LEFT JOIN PostLinks pl ON u.Id = pl.PostId
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN Votes v ON u.Id = v.UserId
+WHERE u.Reputation >= 100
+    AND u.CreationDate < DATEADD(YEAR, -2, GETDATE())
+    AND (
+        EXISTS (
+            SELECT 1 
+            FROM Posts p4 
+            WHERE p4.OwnerUserId = u.Id 
+            AND p4.PostTypeId = 1
+        ) OR EXISTS (
+            SELECT 1 
+            FROM Posts p5 
+            WHERE p5.OwnerUserId = u.Id 
+            AND p5.PostTypeId = 2
+        )
+    )
+GROUP BY u.Id, u.DisplayName, u.Reputation
+HAVING COUNT(DISTINCT p.Id) >= 5
+    AND COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) >= 1
+ORDER BY COUNT(DISTINCT p.Id) DESC, u.Reputation DESC
+OFFSET 0 ROWS
+FETCH NEXT 100 ROWS ONLY;

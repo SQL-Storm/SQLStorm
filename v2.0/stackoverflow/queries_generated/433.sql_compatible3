@@ -1,0 +1,394 @@
+with
+params as (
+    select 
+        date_trunc('month', cast('2024-10-01 12:34:56' as timestamp)) - interval '24 months' as start_month,
+        date_trunc('month', cast('2024-10-01 12:34:56' as timestamp)) as end_month
+),
+months as (
+    select generate_series(start_month, end_month, interval '1 month')::date as month_start
+    from params
+),
+questions as (
+    select 
+        p.Id,
+        p.OwnerUserId,
+        cast(p.CreationDate as date) as created_date,
+        cast(date_trunc('month', p.CreationDate) as date) as month_start,
+        coalesce(p.Score, 0) as score,
+        coalesce(p.ViewCount, 0) as views,
+        p.Title,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.ClosedDate,
+        p.CreationDate
+    from Posts p
+    where p.PostTypeId = 1
+      and p.CreationDate >= (select start_month from params)
+),
+answers as (
+    select 
+        a.Id,
+        a.ParentId as QuestionId,
+        a.OwnerUserId,
+        a.CreationDate,
+        coalesce(a.Score, 0) as score
+    from Posts a
+    where a.PostTypeId = 2
+      and a.CreationDate >= (select start_month from params)
+),
+first_answer_per_q as (
+    select distinct on (a.QuestionId)
+        a.QuestionId,
+        a.Id as AnswerId,
+        a.OwnerUserId as AnswerOwnerId,
+        a.CreationDate as FirstAnswerDate
+    from answers a
+    order by a.QuestionId, a.CreationDate
+),
+votes_q as (
+    select 
+        v.PostId,
+        v.VoteTypeId,
+        cast(date_trunc('month', v.CreationDate) as date) as month_start,
+        count(*) as cnt,
+        count(*) filter (where v.VoteTypeId = 2) as up_cnt,
+        count(*) filter (where v.VoteTypeId = 3) as down_cnt
+    from Votes v
+    join questions q on q.Id = v.PostId
+    group by v.PostId, v.VoteTypeId, date_trunc('month', v.CreationDate)
+),
+agg_votes_q as (
+    select 
+        PostId,
+        month_start,
+        sum(case when VoteTypeId = 2 then cnt else 0 end) as upvotes,
+        sum(case when VoteTypeId = 3 then cnt else 0 end) as downvotes,
+        sum(cnt) as total_votes
+    from votes_q
+    group by PostId, month_start
+),
+dup_links as (
+    select 
+        pl.PostId,
+        pl.RelatedPostId,
+        cast(pl.CreationDate as date) as dup_date
+    from PostLinks pl
+    where pl.LinkTypeId = 3
+),
+closures as (
+    select
+        ph.PostId,
+        cast(ph.CreationDate as date) as close_date,
+        nullif(trim(ph.Comment), '') as close_reason_id_text
+    from PostHistory ph
+    where ph.PostHistoryTypeId = 10
+),
+closure_reason as (
+    select
+        c.PostId,
+        c.close_date,
+        crt.Name as close_reason_name
+    from closures c
+    left join CloseReasonTypes crt
+      on cast(crt.Id as varchar) = c.close_reason_id_text
+),
+user_stats as (
+    select
+        u.Id as UserId,
+        u.Reputation,
+        coalesce(u.UpVotes, 0) as UpVotes,
+        coalesce(u.DownVotes, 0) as DownVotes,
+        coalesce(u.Views, 0) as ProfileViews,
+        coalesce(nullif(trim(u.Location), ''), 'Unknown') as LocationNorm,
+        cast(date_trunc('month', u.CreationDate) as date) as user_cohort
+    from Users u
+),
+badges_agg as (
+    select
+        b.UserId,
+        count(*) as badges_total,
+        count(*) filter (where b.Class = 1) as gold,
+        count(*) filter (where b.Class = 2) as silver,
+        count(*) filter (where b.Class = 3) as bronze,
+        max(b.Date) as last_badge_date
+    from Badges b
+    group by b.UserId
+),
+question_metrics as (
+    select
+        m.month_start,
+        q.Id as QuestionId,
+        q.OwnerUserId,
+        q.Title,
+        q.Tags,
+        q.score,
+        q.views,
+        q.AcceptedAnswerId,
+        q.ClosedDate,
+        av.upvotes,
+        av.downvotes,
+        av.total_votes,
+        fa.FirstAnswerDate,
+        extract(epoch from (fa.FirstAnswerDate - q.CreationDate)) / 60.0 as minutes_to_first_answer,
+        case when q.AcceptedAnswerId is not null then 1 else 0 end as has_accepted,
+        case when q.ClosedDate is not null then 1 else 0 end as is_closed
+    from months m
+    left join questions q
+      on q.month_start = m.month_start
+    left join agg_votes_q av
+      on av.PostId = q.Id
+     and av.month_start = m.month_start
+    left join first_answer_per_q fa
+      on fa.QuestionId = q.Id
+),
+tag_expansion as (
+    select
+        qm.QuestionId,
+        qm.month_start,
+        qm.OwnerUserId,
+        qm.Title,
+        qm.Tags,
+        qm.score,
+        qm.views,
+        qm.AcceptedAnswerId,
+        qm.ClosedDate,
+        qm.upvotes,
+        qm.downvotes,
+        qm.total_votes,
+        qm.FirstAnswerDate,
+        qm.minutes_to_first_answer,
+        qm.has_accepted,
+        qm.is_closed,
+        unnest(
+            case 
+                when qm.Tags is null then array[]::varchar[]
+                else string_to_array(substring(qm.Tags from 2 for greatest(length(qm.Tags)-2,0)), '><')
+            end
+        ) as tag_name
+    from question_metrics qm
+),
+tag_ranks as (
+    select
+        tag_name,
+        month_start,
+        count(*) as q_count,
+        sum(has_accepted) as accepted_count,
+        avg(minutes_to_first_answer) as avg_minutes_to_first_answer,
+        percentile_cont(0.5) within group (order by minutes_to_first_answer) as median_minutes_to_first_answer,
+        sum(score) as total_score,
+        sum(views) as total_views
+    from tag_expansion
+    group by tag_name, month_start
+),
+rolling_tag as (
+    select
+        tr.tag_name,
+        tr.month_start,
+        tr.q_count,
+        tr.accepted_count,
+        tr.avg_minutes_to_first_answer,
+        sum(tr.q_count) over (partition by tr.tag_name order by tr.month_start rows between 5 preceding and current row) as q_count_6mo,
+        sum(tr.accepted_count) over (partition by tr.tag_name order by tr.month_start rows between 5 preceding and current row) as acc_count_6mo,
+        avg(tr.avg_minutes_to_first_answer) over (partition by tr.tag_name order by tr.month_start rows between 5 preceding and current row) as avg_time_6mo
+    from tag_ranks tr
+),
+user_contrib as (
+    select
+        q.OwnerUserId as UserId,
+        cast(date_trunc('month', q.CreationDate) as date) as month_start,
+        count(*) as questions_authored,
+        sum(q.Score) as q_score,
+        sum(coalesce(q.ViewCount,0)) as q_views,
+        sum(case when q.AcceptedAnswerId is not null then 1 else 0 end) as q_with_accept
+    from Posts q
+    where q.PostTypeId = 1
+      and q.CreationDate >= (select start_month from params)
+    group by q.OwnerUserId, cast(date_trunc('month', q.CreationDate) as date)
+),
+answer_contrib as (
+    select
+        a.OwnerUserId as UserId,
+        cast(date_trunc('month', a.CreationDate) as date) as month_start,
+        count(*) as answers_authored,
+        sum(a.Score) as a_score
+    from Posts a
+    where a.PostTypeId = 2
+      and a.CreationDate >= (select start_month from params)
+    group by a.OwnerUserId, cast(date_trunc('month', a.CreationDate) as date)
+),
+user_activity as (
+    select
+        coalesce(uc.UserId, ac.UserId) as UserId,
+        coalesce(uc.month_start, ac.month_start) as month_start,
+        coalesce(uc.questions_authored, 0) as questions_authored,
+        coalesce(ac.answers_authored, 0) as answers_authored,
+        coalesce(uc.q_score, 0) + coalesce(ac.a_score, 0) as net_post_score,
+        coalesce(uc.q_views, 0) as q_views,
+        coalesce(uc.q_with_accept, 0) as q_with_accept
+    from user_contrib uc
+    full outer join answer_contrib ac
+      on ac.UserId = uc.UserId
+     and ac.month_start = uc.month_start
+),
+user_activity_ranked as (
+    select
+        ua.UserId,
+        ua.month_start,
+        ua.questions_authored,
+        ua.answers_authored,
+        ua.net_post_score,
+        ua.q_views,
+        ua.q_with_accept,
+        rank() over (partition by ua.month_start order by net_post_score desc) as score_rank,
+        dense_rank() over (partition by ua.month_start order by (questions_authored + answers_authored) desc) as volume_rank
+    from user_activity ua
+),
+comment_sentiment as (
+    select
+        c.PostId,
+        cast(date_trunc('month', c.CreationDate) as date) as month_start,
+        count(*) as comment_count,
+        avg(c.Score) as avg_comment_score,
+        sum(case when lower(c.Text) like '%thanks%' or lower(c.Text) like '%great%' then 1 else 0 end) as pos_hits,
+        sum(case when lower(c.Text) like '%bad%' or lower(c.Text) like '%wrong%' then 1 else 0 end) as neg_hits
+    from Comments c
+    where c.CreationDate >= (select start_month from params)
+    group by c.PostId, cast(date_trunc('month', c.CreationDate) as date)
+),
+accepted_answer_time as (
+    select
+        q.Id as QuestionId,
+        q.CreationDate,
+        acc.CreationDate as AcceptedAnswerDate,
+        extract(epoch from (acc.CreationDate - q.CreationDate))/3600.0 as hours_to_accept
+    from Posts q
+    join Posts acc on acc.Id = q.AcceptedAnswerId
+    where q.PostTypeId = 1
+      and q.CreationDate >= (select start_month from params)
+),
+dup_clusters as (
+    select
+        d.RelatedPostId as canonical_id,
+        count(*) as dup_count,
+        min(d.dup_date) as first_dup_date
+    from dup_links d
+    group by d.RelatedPostId
+),
+final as (
+    select
+        m.month_start,
+        q.QuestionId,
+        q.Title,
+        coalesce(te.tag_name, '(no-tag)') as tag_name,
+        rtag.q_count_6mo,
+        rtag.acc_count_6mo,
+        round(cast(rtag.avg_time_6mo as numeric), 2) as rolling_avg_minutes_to_first_answer,
+        q.score,
+        q.views,
+        coalesce(q.upvotes, 0) as upvotes,
+        coalesce(q.downvotes, 0) as downvotes,
+        coalesce(q.total_votes, 0) as total_votes,
+        ca.hours_to_accept,
+        cr.close_reason_name,
+        case 
+            when cr.close_reason_name is null and dc.dup_count is not null then 'Duplicate (via PostLinks)'
+            when cr.close_reason_name is not null then cr.close_reason_name
+            else null
+        end as normalized_close_reason,
+        cs.comment_count,
+        cs.avg_comment_score,
+        (cs.pos_hits - cs.neg_hits) as comment_sentiment_delta,
+        u.DisplayName as owner_name,
+        us.LocationNorm as owner_location,
+        us.Reputation as owner_rep,
+        coalesce(b.badges_total, 0) as badges_total,
+        coalesce(b.gold, 0) as gold,
+        coalesce(b.silver, 0) as silver,
+        coalesce(b.bronze, 0) as bronze,
+        ua.net_post_score as owner_net_score_month,
+        uar.score_rank as owner_score_rank_month,
+        uar.volume_rank as owner_volume_rank_month,
+        q.OwnerUserId
+    from months m
+    left join tag_expansion te
+      on te.month_start = m.month_start
+    left join question_metrics q
+      on q.QuestionId = te.QuestionId
+     and q.month_start = te.month_start
+    left join rolling_tag rtag
+      on rtag.tag_name = te.tag_name
+     and rtag.month_start = m.month_start
+    left join accepted_answer_time ca
+      on ca.QuestionId = q.QuestionId
+    left join closure_reason cr
+      on cr.PostId = q.QuestionId
+     and cr.close_date >= m.month_start
+     and cr.close_date < (m.month_start + interval '1 month')
+    left join dup_clusters dc
+      on dc.canonical_id = q.QuestionId
+    left join comment_sentiment cs
+      on cs.PostId = q.QuestionId
+     and cs.month_start = m.month_start
+    left join Users u
+      on u.Id = q.OwnerUserId
+    left join user_stats us
+      on us.UserId = q.OwnerUserId
+    left join badges_agg b
+      on b.UserId = q.OwnerUserId
+    left join user_activity ua
+      on ua.UserId = q.OwnerUserId
+     and ua.month_start = m.month_start
+    left join user_activity_ranked uar
+      on uar.UserId = ua.UserId
+     and uar.month_start = ua.month_start
+),
+scored as (
+    select
+        f.*,
+        (
+            coalesce(ln(nullif(f.views,0)), 0) * 0.4
+          + coalesce(f.score, 0) * 0.3
+          + coalesce((case when f.hours_to_accept is null then 0 else greatest(0, 72 - f.hours_to_accept) end), 0) * 0.05
+          + coalesce(f.upvotes - f.downvotes, 0) * 0.2
+          + coalesce((case when f.comment_sentiment_delta is null then 0 else f.comment_sentiment_delta end), 0) * 0.05
+        ) as engagement_score
+    from final f
+),
+ranked as (
+    select
+        s.*,
+        row_number() over (partition by s.month_start order by s.engagement_score desc) as month_rownum,
+        percentile_disc(0.9) within group (order by s.engagement_score) over (partition by s.month_start) as p90_engagement
+    from scored s
+)
+select
+    r.month_start,
+    r.QuestionId,
+    left(coalesce(r.Title, ''), 120) as TitlePreview,
+    r.tag_name,
+    r.score,
+    r.views,
+    r.upvotes,
+    r.downvotes,
+    r.total_votes,
+    round(cast(r.engagement_score as numeric), 3) as engagement_score,
+    r.month_rownum,
+    r.p90_engagement,
+    r.rolling_avg_minutes_to_first_answer,
+    r.hours_to_accept,
+    r.normalized_close_reason,
+    r.comment_count,
+    round(coalesce(r.avg_comment_score, 0), 2) as avg_comment_score,
+    r.owner_name,
+    r.owner_location,
+    r.owner_rep,
+    r.badges_total,
+    r.gold,
+    r.silver,
+    r.bronze,
+    r.owner_net_score_month,
+    r.owner_score_rank_month,
+    r.owner_volume_rank_month
+from ranked r
+where r.month_rownum <= 50
+order by r.month_start desc, r.engagement_score desc, r.QuestionId;

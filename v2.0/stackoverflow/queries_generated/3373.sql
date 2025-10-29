@@ -1,0 +1,148 @@
+-- {"query": "3373.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2714} 
+
+/*  Complex benchmark query using CTEs, joins, subqueries, window functions, set operators, 
+    string manipulation and NULL handling on the StackOverflow schema  */
+WITH
+    /*  per‑user post statistics  */
+    user_post_stats AS (
+        SELECT
+            u.id                                     AS user_id,
+            u.displayname,
+            u.reputation,
+            COUNT(p.id) FILTER (WHERE p.posttypeid = 1)        AS question_cnt,
+            COUNT(p.id) FILTER (WHERE p.posttypeid = 2)        AS answer_cnt,
+            COALESCE(SUM(p.score),0)                           AS total_score,
+            AVG(p.score) FILTER (WHERE p.posttypeid = 1)       AS avg_question_score,
+            MAX(p.creationdate)                               AS last_post_date
+        FROM users u
+        LEFT JOIN posts p ON p.owneruserid = u.id
+        GROUP BY u.id, u.displayname, u.reputation
+    ),
+
+    /*  badge aggregation per user  */
+    badge_agg AS (
+        SELECT
+            b.userid,
+            STRING_AGG(DISTINCT b.name, ', ')                 AS badge_list,
+            SUM(CASE WHEN b.class = 1 THEN 1 ELSE 0 END)      AS gold_cnt,
+            SUM(CASE WHEN b.class = 2 THEN 1 ELSE 0 END)      AS silver_cnt,
+            SUM(CASE WHEN b.class = 3 THEN 1 ELSE 0 END)      AS bronze_cnt
+        FROM badges b
+        GROUP BY b.userid
+    ),
+
+    /*  votes in the last 30 days per user  */
+    recent_votes AS (
+        SELECT
+            v.userid,
+            COUNT(*)                                          AS vote_cnt,
+            SUM(CASE WHEN v.votetypeid = 2 THEN 1 ELSE 0 END) AS upvote_cnt,
+            SUM(CASE WHEN v.votetypeid = 3 THEN 1 ELSE 0 END) AS downvote_cnt,
+            MAX(v.creationdate)                               AS last_vote_date
+        FROM votes v
+        WHERE v.creationdate >= CURRENT_DATE - INTERVAL '30 days'
+        GROUP BY v.userid
+    ),
+
+    /*  tag‑pair frequencies (used for set‑operator demo later)  */
+    tag_pairs AS (
+        SELECT
+            t1.tagname AS tag_a,
+            t2.tagname AS tag_b,
+            COUNT(*)   AS pair_cnt
+        FROM posts p
+        JOIN LATERAL regexp_split_to_table(p.tags, '<>') AS tag1 ON TRUE
+        JOIN LATERAL regexp_split_to_table(p.tags, '<>') AS tag2 ON TRUE
+        JOIN tags t1 ON t1.tagname = tag1
+        JOIN tags t2 ON t2.tagname = tag2
+        WHERE p.posttypeid = 1                         -- only questions
+          AND tag1 < tag2                               -- avoid duplicate pairs
+        GROUP BY t1.tagname, t2.tagname
+        HAVING COUNT(*) > 100
+    ),
+
+    /*  ranking of users by reputation and total score  */
+    user_rankings AS (
+        SELECT
+            up.user_id,
+            ROW_NUMBER() OVER (ORDER BY up.reputation DESC, up.total_score DESC) AS rep_rank,
+            ROW_NUMBER() OVER (ORDER BY up.total_score DESC)                     AS score_rank
+        FROM (
+            SELECT
+                u.id          AS user_id,
+                u.reputation,
+                COALESCE(SUM(p.score),0) AS total_score
+            FROM users u
+            LEFT JOIN posts p ON p.owneruserid = u.id
+            GROUP BY u.id, u.reputation
+        ) up
+    )
+
+/*  final result set – unioned with an empty row to test set‑operator handling  */
+SELECT
+    ups.user_id,
+    ups.displayname,
+    ups.reputation,
+    ups.question_cnt,
+    ups.answer_cnt,
+    ups.total_score,
+    ups.avg_question_score,
+    COALESCE(b.badge_list, '')               AS badges,
+    COALESCE(b.gold_cnt, 0)                  AS gold_badges,
+    COALESCE(b.silver_cnt, 0)                AS silver_badges,
+    COALESCE(b.bronze_cnt, 0)                AS bronze_badges,
+    COALESCE(rv.vote_cnt, 0)                 AS recent_vote_cnt,
+    COALESCE(rv.upvote_cnt, 0)               AS recent_upvotes,
+    COALESCE(rv.downvote_cnt, 0)             AS recent_downvotes,
+    rv.last_vote_date,
+    ur.rep_rank,
+    ur.score_rank,
+    CASE
+        WHEN ups.reputation > 20000 THEN 'High'
+        WHEN ups.reputation BETWEEN 10000 AND 20000 THEN 'Medium'
+        ELSE 'Low'
+    END                                      AS reputation_tier,
+    /* correlated sub‑query – posts in the last week */
+    (SELECT COUNT(*) 
+       FROM posts p2 
+      WHERE p2.owneruserid = ups.user_id 
+        AND p2.creationdate > CURRENT_DATE - INTERVAL '7 days') AS posts_last_week,
+    /* another correlated sub‑query – recent distinct post‑history types */
+    (SELECT STRING_AGG(DISTINCT pht.name, ', ')
+       FROM posthistory ph
+       JOIN posthistorytypes pht ON pht.id = ph.posthistorytypeid
+      WHERE ph.userid = ups.user_id
+        AND ph.creationdate > CURRENT_DATE - INTERVAL '30 days') AS recent_history_types
+FROM user_post_stats ups
+LEFT JOIN badge_agg b           ON b.userid = ups.user_id
+LEFT JOIN recent_votes rv      ON rv.userid = ups.user_id
+LEFT JOIN user_rankings ur     ON ur.user_id = ups.user_id
+WHERE ups.reputation IS NOT NULL
+ORDER BY ups.reputation DESC
+LIMIT 100
+
+UNION ALL
+
+/*  an empty placeholder row – demonstrates set‑operator handling of NULLs  */
+SELECT
+    NULL AS user_id,
+    NULL AS displayname,
+    NULL AS reputation,
+    NULL AS question_cnt,
+    NULL AS answer_cnt,
+    NULL AS total_score,
+    NULL AS avg_question_score,
+    NULL AS badges,
+    NULL AS gold_badges,
+    NULL AS silver_badges,
+    NULL AS bronze_badges,
+    NULL AS recent_vote_cnt,
+    NULL AS recent_upvotes,
+    NULL AS recent_downvotes,
+    NULL AS last_vote_date,
+    NULL AS rep_rank,
+    NULL AS score_rank,
+    NULL AS reputation_tier,
+    NULL AS posts_last_week,
+    NULL AS recent_history_types
+WHERE NOT EXISTS (SELECT 1 FROM users WHERE reputation > 0);

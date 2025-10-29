@@ -1,0 +1,173 @@
+-- {"query": "1819.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2637} 
+WITH UserPostStats AS (
+    -- Aggregate statistics for posts owned by users
+    SELECT
+        OwnerUserId AS UserId,
+        COUNT(Id) AS TotalPostsOwned,
+        COUNT(CASE WHEN PostTypeId = 1 THEN 1 END) AS TotalQuestionsOwned,
+        COUNT(CASE WHEN PostTypeId = 2 THEN 1 END) AS TotalAnswersOwned,
+        SUM(Score) AS TotalPostScoreOwned,
+        SUM(ViewCount) AS TotalPostViewCountOwned,
+        SUM(AnswerCount) AS TotalAnswersReceivedOnQuestions, -- Only meaningful for questions (PostTypeId = 1)
+        SUM(CommentCount) AS TotalCommentsReceivedOnPosts,
+        SUM(FavoriteCount) AS TotalFavoriteCountReceivedOnPosts
+    FROM Posts
+    WHERE OwnerUserId IS NOT NULL -- Exclude community-owned posts or posts with no owner
+    GROUP BY OwnerUserId
+),
+UserCommentStats AS (
+    -- Aggregate statistics for comments made by users
+    SELECT
+        UserId,
+        COUNT(Id) AS TotalCommentsMade,
+        SUM(Score) AS TotalCommentScoreMade
+    FROM Comments
+    WHERE UserId IS NOT NULL
+    GROUP BY UserId
+),
+UserVoteStats AS (
+    -- Aggregate statistics for votes cast by users
+    SELECT
+        UserId,
+        COUNT(Id) AS TotalVotesCast
+    FROM Votes
+    WHERE UserId IS NOT NULL
+    GROUP BY UserId
+),
+UserReceivedVoteStats AS (
+    -- Aggregate statistics for votes received on posts owned by users
+    SELECT
+        P.OwnerUserId AS UserId,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS ReceivedUpVotesOnPosts,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS ReceivedDownVotesOnPosts
+    FROM Posts AS P
+    JOIN Votes AS V ON P.Id = V.PostId
+    WHERE P.OwnerUserId IS NOT NULL AND V.VoteTypeId IN (2, 3) -- UpMod (2), DownMod (3)
+    GROUP BY P.OwnerUserId
+),
+UserActivitySummary AS (
+    -- Consolidate all user-related activity into a single summary
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate,
+        U.LastAccessDate,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS TotalUpVotesGivenByBadges, -- Assuming U.UpVotes is from a summary in Users table itself
+        U.DownVotes AS TotalDownVotesGivenByBadges, -- Assuming U.DownVotes is from a summary in Users table itself
+        COALESCE(UPS.TotalPostsOwned, 0) AS TotalPostsOwned,
+        COALESCE(UPS.TotalQuestionsOwned, 0) AS TotalQuestionsOwned,
+        COALESCE(UPS.TotalAnswersOwned, 0) AS TotalAnswersOwned,
+        COALESCE(UPS.TotalPostScoreOwned, 0) AS TotalPostScoreOwned,
+        COALESCE(UPS.TotalPostViewCountOwned, 0) AS TotalPostViewCountOwned,
+        COALESCE(UPS.TotalAnswersReceivedOnQuestions, 0) AS TotalAnswersReceivedOnQuestions,
+        COALESCE(UPS.TotalCommentsReceivedOnPosts, 0) AS TotalCommentsReceivedOnPosts,
+        COALESCE(UPS.TotalFavoriteCountReceivedOnPosts, 0) AS TotalFavoriteCountReceivedOnPosts,
+        COALESCE(UCS.TotalCommentsMade, 0) AS TotalCommentsMade,
+        COALESCE(UCS.TotalCommentScoreMade, 0) AS TotalCommentScoreMade,
+        COALESCE(UVS.TotalVotesCast, 0) AS TotalVotesCast,
+        COALESCE(URVS.ReceivedUpVotesOnPosts, 0) AS ReceivedUpVotesOnPosts,
+        COALESCE(URVS.ReceivedDownVotesOnPosts, 0) AS ReceivedDownVotesOnPosts
+    FROM Users AS U
+    LEFT JOIN UserPostStats AS UPS ON U.Id = UPS.UserId
+    LEFT JOIN UserCommentStats AS UCS ON U.Id = UCS.UserId
+    LEFT JOIN UserVoteStats AS UVS ON U.Id = UVS.UserId
+    LEFT JOIN UserReceivedVoteStats AS URVS ON U.Id = URVS.UserId
+),
+PostElaborateMetrics AS (
+    -- Calculate detailed metrics for individual posts, including complex expressions and subqueries
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount AS PostViewCount,
+        P.OwnerUserId,
+        P.Title,
+        P.Tags,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.ClosedDate,
+        LENGTH(P.Body) AS BodyLength,
+        P.ParentId, -- Include ParentId for answers
+        -- String expression to extract the first tag from the Tags string
+        TRIM(BOTH '<>' FROM SUBSTRING(P.Tags, 1, POSITION('>' IN P.Tags))) AS PrimaryTag,
+        -- Complicated calculation: Ratio of positive comments to total comments for this post
+        CAST(COALESCE(SUM(CASE WHEN C.Score > 0 THEN 1 ELSE 0 END), 0) AS NUMERIC) / NULLIF(COUNT(C.Id), 0) AS PositiveCommentRatio,
+        -- Correlated subquery: Number of unique users who commented on this post
+        (SELECT COUNT(DISTINCT C_Sub.UserId) FROM Comments AS C_Sub WHERE C_Sub.PostId = P.Id AND C_Sub.UserId IS NOT NULL) AS UniqueCommenters,
+        -- Correlated subquery: Count of "duplicate" links for this post
+        (SELECT COUNT(PL_Sub.RelatedPostId) FROM PostLinks AS PL_Sub WHERE PL_Sub.PostId = P.Id AND PL_Sub.LinkTypeId = 3) AS DuplicateLinkCount,
+        -- NULL logic: Determine post status based on ClosedDate
+        CASE WHEN P.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS PostStatus,
+        -- Window function: Rank posts by score within their PostTypeId
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.CreationDate DESC) AS PostScoreRankType,
+        -- Window function: Calculate cumulative average score of posts by the same owner, ordered by creation date
+        AVG(P.Score) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate) AS AvgOwnerPostScoreCumulative,
+        -- Complicated predicate/expression: Categorize posts based on age, score, and content
+        CASE
+            WHEN P.PostTypeId = 1 AND P.CreationDate < '2015-01-01' AND P.Score > 50 AND P.AnswerCount > 5 AND P.FavoriteCount > 10
+            THEN 'High-Impact Old Question'
+            WHEN P.PostTypeId = 2 AND P.CreationDate < '2015-01-01' AND P.Score > 75 AND P.Body LIKE '%<pre><code>%' -- Check for code snippets in old answers
+            THEN 'High-Quality Old Code Answer'
+            ELSE 'Other Post'
+        END AS PostImpactCategory,
+        -- Correlated subquery: Sum of scores of all answers to this question
+        (SELECT COALESCE(SUM(A.Score), 0) FROM Posts AS A WHERE A.ParentId = P.Id AND A.PostTypeId = 2) AS SumOfAnswerScores,
+        -- Correlated subquery: Score of the accepted answer
+        (SELECT A.Score FROM Posts AS A WHERE A.Id = P.AcceptedAnswerId) AS AcceptedAnswerScore,
+        -- Correlated subquery: Count of distinct users who provided answers to this question
+        (SELECT COUNT(DISTINCT A.OwnerUserId) FROM Posts AS A WHERE A.ParentId = P.Id AND A.PostTypeId = 2 AND A.OwnerUserId IS NOT NULL) AS UniqueAnswererCount
+    FROM Posts AS P
+    LEFT JOIN Comments AS C ON P.Id = C.PostId
+    WHERE P.OwnerUserId IS NOT NULL AND P.PostTypeId IN (1, 2) -- Focus on Questions (1) and Answers (2)
+    GROUP BY
+        P.Id, P.PostTypeId, P.CreationDate, P.Score, P.ViewCount, P.OwnerUserId, P.Title, P.Tags,
+        P.AnswerCount, P.CommentCount, P.FavoriteCount, P.ClosedDate, P.Body, P.AcceptedAnswerId, P.ParentId
+),
+ModerationSummary AS (
+    -- Summarize moderation actions for posts
+    SELECT
+        PH.PostId,
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE NULL END) AS CloseEvents,
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE NULL END) AS ReopenEvents,
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 12 THEN 1 ELSE NULL END) AS DeleteEvents,
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 13 THEN 1 ELSE NULL END) AS UndeleteEvents,
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 14 THEN 1 ELSE NULL END) AS LockEvents,
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 15 THEN 1 ELSE NULL END) AS UnlockEvents,
+        COUNT(DISTINCT PH.UserId) AS DistinctModeratorActioners,
+        -- String aggregation for distinct close reasons (PostgreSQL specific STRING_AGG with FILTER)
+        STRING_AGG(DISTINCT CRT.Name, '; ') FILTER (WHERE PH.PostHistoryTypeId = 10 AND PH.Comment IS NOT NULL) AS DistinctCloseReasons
+    FROM PostHistory AS PH
+    LEFT JOIN CloseReasonTypes AS CRT ON PH.PostHistoryTypeId = 10 AND CAST(PH.Comment AS SMALLINT) = CRT.Id
+    WHERE PH.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20) -- Relevant moderation events
+    GROUP BY PH.PostId
+)
+-- Main query: Analyze influential users and their questions
+SELECT
+    'Question' AS RecordType,
+    UAS.UserId,
+    UAS.DisplayName,
+    UAS.Reputation,
+    UAS.UserProfileViews,
+    UAS.TotalPostsOwned,
+    UAS.TotalQuestionsOwned,
+    UAS.TotalAnswersOwned,
+    UAS.TotalPostScoreOwned,
+    UAS.TotalCommentsMade,
+    UAS.TotalCommentScoreMade,
+    UAS.ReceivedUpVotesOnPosts,
+    UAS.ReceivedDownVotesOnPosts,
+    -- Complex calculation: Net upvote ratio for a user's posts
+    (CAST(UAS.ReceivedUpVotesOnPosts AS NUMERIC) / NULLIF(UAS.ReceivedUpVotesOnPosts + UAS.ReceivedDownVotesOnPosts, 0)) AS NetUpvoteRatio,
+    -- Calculation: Ratio of questions to total posts owned by user
+    (CAST(UAS.TotalQuestionsOwned AS NUMERIC) / NULLIF(UAS.TotalPostsOwned, 0)) AS QuestionToPostRatio,
+    -- Date expression: Years since user creation
+    DATE_PART('year', AGE(cast('2024-10-01 12:34:56' as timestamp), UAS.CreationDate)) AS YearsActive,
+    PEM.PostId AS RelatedPostId,
+    PEM.Title AS RelatedPostTitle,
+    PEM.PostScore AS RelatedPostScore,
+    PEM.PostViewCount AS RelatedPostViewCount,
+    PEM.PrimaryTag AS Primary

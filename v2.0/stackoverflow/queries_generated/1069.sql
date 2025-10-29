@@ -1,0 +1,204 @@
+-- {"query": "1069.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2910} 
+
+WITH UserEngagementSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.Views AS UserProfileViews,
+        u.UpVotes AS UserUpVotesGiven,
+        u.DownVotes AS UserDownVotesGiven,
+        COUNT(DISTINCT p.Id) AS TotalPostsCreated,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersCount,
+        COALESCE(SUM(p.Score), 0) AS TotalPostsScore,
+        COALESCE(SUM(p.ViewCount), 0) AS TotalPostsViewCount,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT ph.Id) AS TotalPostHistoryEventsTriggered,
+        (u.UpVotes - u.DownVotes) AS UserNetVotesBalance
+    FROM
+        Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes
+),
+QuestionDetailedMetrics AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.OwnerUserId,
+        q.CreationDate AS QuestionCreationDate,
+        q.Score AS QuestionScore,
+        q.ViewCount AS QuestionViewCount,
+        q.AnswerCount,
+        q.FavoriteCount,
+        q.ClosedDate,
+        LOWER(q.Title) AS LowercaseTitle,
+        -- Safely extract tags, assuming '><' delimiters
+        COALESCE(string_to_array(SUBSTRING(q.Tags FROM 2 FOR LENGTH(q.Tags) - 2), '><'), ARRAY[]::varchar[]) AS TagArray,
+        -- Correlated subquery 1: count of comments within a short period after creation
+        (SELECT COUNT(cm.Id) FROM Comments cm WHERE cm.PostId = q.Id AND cm.CreationDate < (q.CreationDate + INTERVAL '1 hour')) AS InitialHourComments,
+        -- Correlated subquery 2: check if owner has a gold badge
+        EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = q.OwnerUserId AND b.Class = 1 AND b.Name LIKE '%Gold%') AS OwnerHasGoldBadge,
+        -- Correlated subquery 3: get the latest body edit date
+        (SELECT MAX(ph2.CreationDate) FROM PostHistory ph2 WHERE ph2.PostId = q.Id AND ph2.PostHistoryTypeId IN (5, 8)) AS LastBodyEditDate
+    FROM
+        Posts q
+    WHERE
+        q.PostTypeId = 1 -- Only questions
+        AND q.CreationDate >= '2023-01-01' -- Focus on recent questions
+        AND q.ViewCount > 500 -- Popular questions
+),
+PostHistoricalActionTypes AS (
+    SELECT
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate AS HistoryEventDate,
+        ph.UserId AS HistoryInitiatorUserId,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC, ph.Id DESC) AS rn_latest_event,
+        LAG(ph.PostHistoryTypeId, 1, 0) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate, ph.Id) AS PreviousEventType,
+        LEAD(ph.PostHistoryTypeId, 1, 0) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate, ph.Id) AS NextEventType,
+        -- Complicated comment analysis
+        CASE
+            WHEN ph.Comment IS NULL OR TRIM(ph.Comment) = '' THEN 'No comment'
+            WHEN LENGTH(ph.Comment) > 100 THEN SUBSTRING(ph.Comment FROM 1 FOR 97) || '...'
+            ELSE ph.Comment
+        END AS ProcessedCommentSnippet,
+        LENGTH(ph.Text) AS HistoryTextContentLength,
+        -- Categorize history action
+        CASE
+            WHEN ph.PostHistoryTypeId IN (10, 101) THEN 'Closed'
+            WHEN ph.PostHistoryTypeId IN (11, 106) THEN 'Reopened'
+            WHEN ph.PostHistoryTypeId IN (12, 107) THEN 'Deleted'
+            WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 'Edited'
+            WHEN ph.PostHistoryTypeId IN (35, 36) THEN 'Migrated'
+            ELSE 'Other_Activity'
+        END AS HistoricalActionCategory
+    FROM
+        PostHistory ph
+),
+FrequentTags AS (
+    SELECT
+        UNNEST(q.TagArray) AS TagName,
+        COUNT(q.QuestionId) AS TagUsageCount
+    FROM
+        QuestionDetailedMetrics q
+    GROUP BY
+        UNNEST(q.TagArray)
+    HAVING COUNT(q.QuestionId) > 100 -- Only tags used on more than 100 questions
+),
+UserPerformanceRanking AS (
+    SELECT
+        ues.UserId,
+        ues.DisplayName,
+        ues.Reputation,
+        ues.TotalPostsCreated,
+        ues.QuestionsCount,
+        ues.AnswersCount,
+        ues.TotalPostsScore,
+        ues.TotalPostsViewCount,
+        ues.UserNetVotesBalance,
+        RANK() OVER (ORDER BY ues.Reputation DESC, ues.TotalPostsScore DESC) AS GlobalReputationRank,
+        NTILE(5) OVER (ORDER BY (ues.QuestionsCount * 2 + ues.AnswersCount * 3) DESC) AS TopContributorQuintile,
+        AVG(ues.TotalPostsScore) OVER (PARTITION BY EXTRACT(MONTH FROM ues.UserCreationDate)) AS AvgMonthlyJoinerScore,
+        -- Total score from gold, silver, bronze badges
+        COALESCE(
+            SUM(CASE b.Class WHEN 1 THEN 100 WHEN 2 THEN 20 WHEN 3 THEN 5 ELSE 0 END) OVER (PARTITION BY ues.UserId), 0
+        ) AS TotalBadgeScoreValue
+    FROM
+        UserEngagementSummary ues
+    LEFT JOIN Badges b ON ues.UserId = b.UserId
+    WHERE
+        ues.Reputation > 1000 -- Filter for significant users
+),
+PostRelationStats AS (
+    SELECT
+        pl.PostId,
+        COUNT(DISTINCT pl.RelatedPostId) AS TotalRelatedPosts,
+        SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicateLinksMade,
+        MAX(pl.CreationDate) AS LatestLinkDate
+    FROM
+        PostLinks pl
+    GROUP BY pl.PostId
+)
+SELECT
+    upr.UserId,
+    upr.DisplayName,
+    upr.Reputation,
+    upr.GlobalReputationRank,
+    upr.TopContributorQuintile,
+    qdm.QuestionId,
+    qdm.LowercaseTitle AS QuestionTitle,
+    qdm.QuestionScore,
+    qdm.QuestionViewCount,
+    qdm.AnswerCount,
+    -- Aggregate common tags into a comma-separated string
+    STRING_AGG(ft.TagName, '; ') FILTER (WHERE ft.TagName IS NOT NULL) AS QuestionCommonTags,
+    phat.HistoricalActionCategory AS LatestPostHistoryCategory,
+    phat.HistoryEventDate AS LatestPostHistoryDate,
+    phat.HistoryTextContentLength,
+    prs.TotalRelatedPosts,
+    prs.DuplicateLinksMade,
+    -- Complex calculated metric for question engagement
+    (qdm.FavoriteCount * 2.5) + (qdm.QuestionScore * 1.8) + (qdm.AnswerCount * 1.2) + (qdm.InitialHourComments * 5) AS WeightedQuestionEngagementScore,
+    -- Correlated subquery 4: Average score of accepted answers for the question
+    (SELECT AVG(ans.Score)
+     FROM Posts ans
+     WHERE ans.Id = qdm.AcceptedAnswerId AND ans.PostTypeId = 2
+    ) AS AcceptedAnswerAvgScore,
+    -- Conditional categorization of question state
+    CASE
+        WHEN qdm.ClosedDate IS NOT NULL THEN 'Closed_Question'
+        WHEN qdm.AnswerCount = 0 AND qdm.QuestionCreationDate < (NOW() - INTERVAL '60 days') THEN 'Stale_No_Answers'
+        WHEN qdm.QuestionScore < 0 THEN 'Negative_Score_Question'
+        ELSE 'Active_Or_Open'
+    END AS QuestionLifecycleStatus,
+    -- Null-aware date comparison for user's last comment on this question
+    COALESCE(
+        (SELECT MAX(c.CreationDate) FROM Comments c WHERE c.PostId = qdm.QuestionId AND c.UserId = upr.UserId),
+        '1970-01-01'::timestamp -- A very old date if no comments
+    ) AS LastUserCommentOnQuestionDate,
+    -- Correlated subquery 5: Count of unique editors for the question's body
+    (SELECT COUNT(DISTINCT ph_edit.UserId) FROM PostHistory ph_edit WHERE ph_edit.PostId = qdm.QuestionId AND ph_edit.PostHistoryTypeId IN (5, 8)) AS UniqueBodyEditorsCount,
+    -- Super complex performance metric involving log and sqrt
+    (upr.Reputation * LOG(GREATEST(qdm.QuestionScore + 10, 10)) * SQRT(GREATEST(upr.UserProfileViews, 1))) / (GREATEST(qdm.QuestionViewCount, 1) + 100) AS HyperbolicPerformanceIndex
+FROM
+    UserPerformanceRanking upr
+INNER JOIN QuestionDetailedMetrics qdm ON upr.UserId = qdm.OwnerUserId
+LEFT JOIN (
+    -- Subquery to get the latest history event for each post, avoiding redundant joins
+    SELECT PostId, HistoryEventDate AS MaxHistoryDate
+    FROM PostHistoricalActionTypes
+    WHERE rn_latest_event = 1
+) AS latest_ph_summary ON qdm.QuestionId = latest_ph_summary.PostId
+LEFT JOIN PostHistoricalActionTypes phat ON latest_ph_summary.PostId = phat.PostId AND latest_ph_summary.MaxHistoryDate = phat.HistoryEventDate AND phat.rn_latest_event = 1
+LEFT JOIN PostRelationStats prs ON qdm.QuestionId = prs.PostId
+LEFT JOIN FrequentTags ft ON UNNEST(qdm.TagArray) = ft.TagName
+WHERE
+    upr.GlobalReputationRank <= 500 -- Top 500 users
+    AND upr.TopContributorQuintile = 1 -- Top 20% contributors by post/answer count
+    AND qdm.OwnerHasGoldBadge IS TRUE -- Only questions from gold badge owners
+    AND qdm.QuestionCreationDate > (upr.UserCreationDate + INTERVAL '180 days') -- Questions posted after user tenure
+    AND (
+        qdm.LowercaseTitle LIKE '%sql%'
+        OR qdm.LowercaseTitle LIKE '%database%'
+        OR qdm.LowercaseTitle LIKE '%performance%'
+    )
+    AND qdm.LastBodyEditDate IS NOT NULL -- Must have at least one body edit
+    AND phat.HistoricalActionCategory NOT IN ('Deleted', 'Migrated') -- Exclude deleted/migrated questions
+    AND phat.PreviousEventType NOT IN (10, 101) -- Exclude questions that were previously closed
+GROUP BY
+    upr.UserId, upr.DisplayName, upr.Reputation, upr.GlobalReputationRank, upr.TopContributorQuintile, upr.UserProfileViews,
+    qdm.QuestionId, qdm.LowercaseTitle, qdm.QuestionScore, qdm.QuestionViewCount, qdm.AnswerCount, qdm.FavoriteCount,
+    qdm.ClosedDate, qdm.QuestionCreationDate, qdm.InitialHourComments, qdm.AcceptedAnswerId,
+    phat.HistoricalActionCategory, phat.HistoryEventDate, phat.HistoryTextContentLength,
+    prs.TotalRelatedPosts, prs.DuplicateLinksMade
+HAVING
+    COUNT(DISTINCT ft.TagName) >= 3 -- At least three frequent tags
+    AND SUM(CASE WHEN qdm.QuestionScore > 100 THEN 1 ELSE 0 END) > 0 -- At least one highly scored question
+ORDER BY
+    HyperbolicPerformanceIndex DESC, upr.Reputation DESC, WeightedQuestionEngagementScore DESC
+LIMIT 1000;

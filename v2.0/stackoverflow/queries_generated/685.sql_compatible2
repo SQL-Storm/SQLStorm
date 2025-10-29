@@ -1,0 +1,339 @@
+with recent_users as (
+  select u.id as user_id,
+         u.displayname,
+         u.reputation,
+         u.creationdate,
+         u.location,
+         coalesce(nullif(trim(u.websiteurl), ''), 'unknown') as websiteurl_norm
+  from users u
+  where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+active_questions as (
+  select p.id as question_id,
+         p.owneruserid,
+         p.creationdate,
+         p.score,
+         p.viewcount,
+         p.title,
+         p.tags,
+         p.acceptedanswerid,
+         p.closeddate,
+         p.lastactivitydate
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= (select max(creationdate) - interval '365 days' from posts where posttypeid = 1)
+),
+answers as (
+  select a.id as answer_id,
+         a.parentid as question_id,
+         a.owneruserid as answerer_id,
+         a.creationdate,
+         a.score
+  from posts a
+  where a.posttypeid = 2
+),
+q_votes as (
+  select v.postid as question_id,
+         sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+         sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+         sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+         count(*) as total_votes
+  from votes v
+  where exists (select 1 from posts p where p.id = v.postid and p.posttypeid = 1)
+  group by v.postid
+),
+a_votes as (
+  select v.postid as answer_id,
+         sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+         sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+         count(*) as total_votes
+  from votes v
+  where exists (select 1 from posts p where p.id = v.postid and p.posttypeid = 2)
+  group by v.postid
+),
+comment_stats as (
+  select c.postid,
+         count(*) as comment_count,
+         sum(case when c.score > 0 then 1 else 0 end) as pos_comments,
+         max(c.creationdate) as last_comment_date
+  from comments c
+  group by c.postid
+),
+tag_explode as (
+  select q.question_id,
+         unnest(string_to_array(substring(q.tags, 2, length(q.tags)-2), '><')) as tag
+  from active_questions q
+  where q.tags is not null and length(q.tags) >= 2
+),
+tag_rank as (
+  select t.tag,
+         count(*) as tag_q_count,
+         dense_rank() over (order by count(*) desc, tag) as tag_rank_desc
+  from tag_explode t
+  group by t.tag
+),
+duplicate_links as (
+  select pl.postid as question_id,
+         count(*) filter (where pl.linktypeid = 3) as dup_count,
+         count(*) filter (where pl.linktypeid = 1) as linked_count,
+         max(pl.creationdate) as last_link_date
+  from postlinks pl
+  group by pl.postid
+),
+closure_events as (
+  select ph.postid as question_id,
+         max(case when ph.posthistorytypeid = 10 then ph.creationdate end) as closed_at,
+         max(case when ph.posthistorytypeid = 11 then ph.creationdate end) as reopened_at,
+         max(case when ph.posthistorytypeid = 10 then nullif(ph.comment, '') end) as last_close_reason_id
+  from posthistory ph
+  where ph.posthistorytypeid in (10,11)
+  group by ph.postid
+),
+close_reason_map as (
+  select crt.id as close_reason_id, crt.name as close_reason_name
+  from closereasontypes crt
+),
+user_badges as (
+  select b.userid,
+         sum(case when b.class = 1 then 1 else 0 end) as gold,
+         sum(case when b.class = 2 then 1 else 0 end) as silver,
+         sum(case when b.class = 3 then 1 else 0 end) as bronze,
+         count(*) as total_badges,
+         max(b.date) as last_badge_date
+  from badges b
+  group by b.userid
+),
+answerer_activity as (
+  select a.question_id,
+         count(*) as answer_count,
+         max(a.creationdate) as last_answer_date,
+         sum(greatest(coalesce(av.upvotes,0) - coalesce(av.downvotes,0), 0)) as net_answer_score
+  from answers a
+  left join a_votes av on av.answer_id = a.answer_id
+  group by a.question_id
+),
+accepted_answer_stats as (
+  select q.question_id,
+         aa.answer_id,
+         aa.answerer_id,
+         aa.score as accepted_score,
+         coalesce(av.upvotes,0) as accepted_upvotes,
+         coalesce(av.downvotes,0) as accepted_downvotes
+  from active_questions q
+  join answers aa on aa.answer_id = q.acceptedanswerid
+  left join a_votes av on av.answer_id = aa.answer_id
+),
+question_enriched as (
+  select
+    q.question_id,
+    q.owneruserid as asker_id,
+    q.creationdate as question_created,
+    q.lastactivitydate,
+    q.score as question_score,
+    q.viewcount,
+    q.title,
+    q.tags,
+    q.acceptedanswerid,
+    q.closeddate,
+    coalesce(qv.upvotes,0) as q_upvotes,
+    coalesce(qv.downvotes,0) as q_downvotes,
+    coalesce(qv.favorites,0) as q_favorites,
+    coalesce(qv.total_votes,0) as q_total_votes,
+    coalesce(cs.comment_count,0) as comment_count,
+    coalesce(cs.pos_comments,0) as pos_comments,
+    cs.last_comment_date,
+    coalesce(dl.dup_count,0) as dup_links,
+    coalesce(dl.linked_count,0) as other_links,
+    dl.last_link_date,
+    ce.closed_at,
+    ce.reopened_at,
+    ce.last_close_reason_id,
+    crm.close_reason_name as last_close_reason_name,
+    aa.answer_count,
+    aa.last_answer_date,
+    aa.net_answer_score,
+    aas.answer_id as accepted_answer_id,
+    aas.accepted_score,
+    aas.accepted_upvotes,
+    aas.accepted_downvotes
+  from active_questions q
+  left join q_votes qv on qv.question_id = q.question_id
+  left join comment_stats cs on cs.postid = q.question_id
+  left join duplicate_links dl on dl.question_id = q.question_id
+  left join closure_events ce on ce.question_id = q.question_id
+  left join close_reason_map crm on crm.close_reason_id = cast(ce.last_close_reason_id as integer)
+  left join answerer_activity aa on aa.question_id = q.question_id
+  left join accepted_answer_stats aas on aas.question_id = q.question_id
+),
+asker_enriched as (
+  select
+    qe.*,
+    u.displayname as asker_name,
+    u.reputation as asker_rep,
+    u.creationdate as asker_created,
+    u.location as asker_location,
+    ub.total_badges as asker_total_badges,
+    ub.gold as asker_gold,
+    ub.silver as asker_silver,
+    ub.bronze as asker_bronze,
+    ub.last_badge_date as asker_last_badge
+  from question_enriched qe
+  left join users u on u.id = qe.asker_id
+  left join user_badges ub on ub.userid = qe.asker_id
+),
+tag_density as (
+  select
+    te.question_id,
+    count(*) as tag_count,
+    array_agg(te.tag order by te.tag) as tags_sorted
+  from tag_explode te
+  group by te.question_id
+),
+ranked_questions as (
+  select
+    ae.*,
+    td.tag_count,
+    td.tags_sorted,
+    tr_top.tag as top_tag,
+    tr_top.tag_rank_desc as top_tag_rank,
+    row_number() over (
+      partition by coalesce(tr_top.tag, 'zzzz_no_tag')
+      order by
+        coalesce(ae.accepted_score, -9999) desc,
+        ae.q_upvotes - ae.q_downvotes desc,
+        ae.viewcount desc,
+        ae.question_created desc
+    ) as rn_within_top_tag,
+    percentile_cont(0.5) within group (order by ae.q_upvotes - ae.q_downvotes) over () as global_median_net_votes,
+    avg(ae.viewcount) over () as global_avg_views
+  from asker_enriched ae
+  left join tag_density td on td.question_id = ae.question_id
+  left join lateral (
+    select te.tag,
+           (select tr.tag_rank_desc from tag_rank tr where tr.tag = te.tag) as tag_rank_desc
+    from tag_explode te
+    where te.question_id = ae.question_id
+    order by (select tr.tag_rank_desc from tag_rank tr where tr.tag = te.tag) asc, te.tag asc
+    limit 1
+  ) tr_top on true
+),
+bench_base as (
+  select
+    rq.question_id,
+    rq.title,
+    rq.tags_sorted,
+    rq.asker_name,
+    rq.asker_rep,
+    rq.asker_total_badges,
+    rq.question_created,
+    rq.lastactivitydate,
+    rq.q_upvotes,
+    rq.q_downvotes,
+    rq.q_favorites,
+    rq.q_total_votes,
+    rq.viewcount,
+    rq.comment_count,
+    rq.pos_comments,
+    rq.dup_links,
+    rq.other_links,
+    rq.closed_at,
+    rq.reopened_at,
+    rq.last_close_reason_name,
+    rq.answer_count,
+    rq.last_answer_date,
+    rq.accepted_answer_id,
+    rq.accepted_score,
+    rq.accepted_upvotes,
+    rq.accepted_downvotes,
+    rq.tag_count,
+    rq.top_tag,
+    rq.top_tag_rank,
+    rq.rn_within_top_tag,
+    rq.global_median_net_votes,
+    rq.global_avg_views,
+    case
+      when rq.closed_at is not null and rq.reopened_at is null then 'Closed'
+      when rq.closed_at is not null and rq.reopened_at is not null and rq.reopened_at > rq.closed_at then 'Reopened'
+      else 'Open'
+    end as close_state,
+    (rq.q_upvotes - rq.q_downvotes) as net_votes,
+    case when rq.q_total_votes = 0 then null else (rq.q_upvotes * 1.0 / rq.q_total_votes) end as upvote_ratio,
+    case when rq.viewcount = 0 then null else (rq.q_favorites * 1.0 / rq.viewcount) end as fav_per_view,
+    case when rq.tag_count is null or rq.tag_count = 0 then 0 else rq.tag_count end as tag_ct_nonnull
+  from ranked_questions rq
+),
+topk as (
+  select *
+  from bench_base
+  where rn_within_top_tag <= 50
+),
+unioned as (
+  select * from topk
+  union all
+  select bb.*
+  from bench_base bb
+  where bb.net_votes > bb.global_median_net_votes
+    and bb.viewcount > bb.global_avg_views
+),
+final_rank as (
+  select
+    u.*,
+    dense_rank() over (
+      order by
+        ((coalesce(accepted_score, -1000) * 2)
+        + (net_votes)
+        + least(coalesce(comment_count,0), 50)
+        + (coalesce(answer_count,0) * 0.5)
+        + (case when close_state = 'Open' then 5 when close_state = 'Reopened' then 2 else -5 end)
+        + (case when tag_ct_nonnull >= 5 then 3 else 0 end)
+        + (case when q_favorites is null then 0 else least(q_favorites, 100) end)
+        ) desc,
+        question_created desc
+    ) as dense_quality_rank,
+    row_number() over (order by question_created desc, question_id) as recency_rank
+  from unioned u
+)
+select
+  fr.dense_quality_rank,
+  fr.recency_rank,
+  fr.question_id,
+  fr.title,
+  fr.top_tag,
+  fr.tag_count,
+  fr.tags_sorted,
+  fr.asker_name,
+  fr.asker_rep,
+  fr.asker_total_badges,
+  fr.question_created,
+  fr.lastactivitydate,
+  fr.close_state,
+  fr.last_close_reason_name,
+  fr.q_upvotes,
+  fr.q_downvotes,
+  fr.net_votes,
+  fr.upvote_ratio,
+  fr.q_favorites,
+  fr.fav_per_view,
+  fr.viewcount,
+  fr.comment_count,
+  fr.pos_comments,
+  fr.dup_links,
+  fr.other_links,
+  fr.answer_count,
+  fr.last_answer_date,
+  fr.accepted_answer_id,
+  fr.accepted_score,
+  fr.accepted_upvotes,
+  fr.accepted_downvotes,
+  fr.reopened_at
+from final_rank fr
+where (fr.accepted_answer_id is not null or fr.answer_count >= 2)
+  and (fr.close_state <> 'Closed' or fr.reopened_at is not null)
+  and not exists (
+    select 1
+    from posthistory ph
+    where ph.postid = fr.question_id
+      and ph.posthistorytypeid = 14
+  )
+order by fr.dense_quality_rank, fr.recency_rank
+limit 500;

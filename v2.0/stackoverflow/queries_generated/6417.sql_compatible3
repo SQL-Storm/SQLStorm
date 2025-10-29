@@ -1,0 +1,71 @@
+SELECT 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    MAX(u.CreationDate) AS LatestAccountActivity,
+    MAX(p.LastActivityDate) AS LatestPostActivity,
+    b.Class AS BadgeClass,
+    t.TagName
+FROM 
+    Users u
+LEFT JOIN 
+    (
+      SELECT 
+         UserId, 
+         MIN(Date) AS FirstBadgeDate, 
+         Class, 
+         TagBased
+      FROM 
+         Badges
+      GROUP BY 
+         UserId, Class, TagBased
+    ) b ON u.Id = b.UserId
+LEFT JOIN 
+    (
+      SELECT 
+         Id, 
+         Name AS TagName
+      FROM 
+         Tags
+      WHERE 
+         IsRequired = 0 AND IsModeratorOnly = 0
+    ) t ON EXISTS (
+         SELECT 1
+         FROM Posts p2
+         JOIN (
+              SELECT 
+                  PostId, 
+                  STRING_AGG(TagName, ',') AS TagNames
+              FROM (
+                   SELECT 
+                       p3.Id AS PostId, 
+                       t3.Name AS TagName
+                   FROM 
+                       Posts p3
+                   JOIN 
+                       Tags t3 ON t3.ExcerptPostId = p3.Id
+                   GROUP BY 
+                       p3.Id, t3.Name
+              ) sub
+              GROUP BY 
+                  PostId
+         ) tt ON p2.Id = tt.PostId
+         WHERE tt.TagNames LIKE '%' || t.TagName || '%'
+    )
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+WHERE 
+    u.Reputation > 10000
+    AND p.Score > 0
+    AND p.LastEditDate > (CAST('2024-10-01' AS DATE) - INTERVAL '1 year')
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation, b.Class, t.TagName
+HAVING 
+    COUNT(DISTINCT p.Id) > 100
+ORDER BY 
+    u.Reputation DESC, 
+    TotalPosts DESC
+LIMIT 10;

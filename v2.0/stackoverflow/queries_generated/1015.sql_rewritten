@@ -1,0 +1,203 @@
+-- {"query": "1015.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2628} 
+WITH UserEngagementSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName AS UserName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate AS UserLastAccessDate,
+        u.Views AS UserViews,
+        u.UpVotes AS UserUpVotesGiven,
+        u.DownVotes AS UserDownVotesGiven,
+        COUNT(DISTINCT p.Id) AS TotalPostsCreated,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestionsCreated,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswersCreated,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        SUM(p.Score) AS TotalPostScoreReceived,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END) AS TotalQuestionViewsReceived,
+        COUNT(DISTINCT b.Id) AS TotalBadgesAwarded,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        (CAST(u.UpVotes AS BIGINT) - CAST(u.DownVotes AS BIGINT)) AS NetVotesGiven,
+        -- Complex calculation and NULL handling for a User engagement score
+        (
+            (CAST(u.Reputation AS NUMERIC) / 1000.0) +
+            (CAST(COUNT(DISTINCT p.Id) AS NUMERIC) / 10.0) +
+            (CAST(COUNT(DISTINCT c.Id) AS NUMERIC) / 5.0) +
+            (CAST(COUNT(DISTINCT b.Id) AS NUMERIC) * 2.0) +
+            (COALESCE(CAST(SUM(p.Score) AS NUMERIC), 0) / 50.0) +
+            (COALESCE(CAST(SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END) AS NUMERIC), 0) / 1000.0)
+        ) AS UserCalculatedEngagementScore,
+        CASE
+            WHEN u.Reputation >= 20000 THEN 'Legendary'
+            WHEN u.Reputation >= 5000 THEN 'Expert'
+            WHEN u.Reputation >= 1000 THEN 'Journeyman'
+            WHEN u.Reputation >= 200 THEN 'Apprentice'
+            ELSE 'Newbie'
+        END AS ReputationTier,
+        EXTRACT(DAY FROM (cast('2024-10-01 12:34:56' as timestamp) - u.CreationDate)) AS AccountAgeDays
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes
+),
+PostQualityMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.OwnerUserId,
+        COALESCE(p.OwnerDisplayName, 'Community') AS PostOwnerDisplayName,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.CommunityOwnedDate,
+        p.LastActivityDate,
+        p.Title,
+        p.Tags,
+        -- Calculate post age in hours
+        EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - p.CreationDate)) / 3600 AS PostAgeHours,
+        -- Indicate if the post is considered "active" (last activity within 7 days)
+        CASE WHEN p.LastActivityDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '7 days' THEN 'Active' ELSE 'Stale' END AS ActivityStatus,
+        -- Categorize posts based on score and view count
+        CASE
+            WHEN p.Score >= 100 AND p.ViewCount >= 10000 THEN 'Viral_HighScore'
+            WHEN p.Score >= 50 AND p.ViewCount >= 5000 THEN 'Popular_GoodScore'
+            WHEN p.Score >= 10 THEN 'AboveAverage'
+            ELSE 'Average_Low'
+        END AS PostQualityCategory,
+        -- String processing for tags: get the first tag, handle NULLs and empty strings
+        LOWER(NULLIF((string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><'))[1], '')) AS PrimaryTag,
+        -- Count total unique editors using a correlated subquery for complexity
+        (
+            SELECT COUNT(DISTINCT ph.UserId)
+            FROM PostHistory ph
+            WHERE ph.PostId = p.Id
+              AND ph.PostHistoryTypeId IN (4, 5, 6, 8) -- Edit Title, Edit Body, Edit Tags, Rollback Body
+        ) AS TotalUniqueEditors,
+        -- Window function: Rank posts by score within their PostType, handling ties
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.CreationDate DESC) AS PostScoreRankByType,
+        -- Window function: Average score for posts created in the same month as this post
+        AVG(p.Score) OVER (PARTITION BY DATE_TRUNC('month', p.CreationDate)) AS MonthlyAvgScoreForPostType,
+        -- Additional boolean flags
+        p.AcceptedAnswerId IS NOT NULL AS HasAcceptedAnswer,
+        p.ParentId IS NOT NULL AS IsAnswerToAnotherPost,
+        p.ClosedDate IS NOT NULL AS IsClosed,
+        p.CommunityOwnedDate IS NOT NULL AS IsCommunityOwned
+    FROM
+        Posts p
+    JOIN
+        PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE
+        p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '2 years' -- Limit data for performance simulation
+        AND p.OwnerUserId IS NOT NULL -- Exclude community-owned posts without a real owner for this analysis
+),
+TagPerformanceStats AS (
+    SELECT
+        LOWER(UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><'))) AS TagName,
+        COUNT(DISTINCT p.Id) AS TaggedQuestionCount,
+        AVG(p.Score) AS AvgQuestionScoreForTag,
+        AVG(p.AnswerCount) AS AvgAnswerCountForTag,
+        -- Window function: Calculate the cumulative question count for tags ordered by average score
+        SUM(COUNT(DISTINCT p.Id)) OVER (ORDER BY AVG(p.Score) DESC) AS CumulativeTaggedQuestionCountByScore
+    FROM
+        Posts p
+    WHERE
+        p.PostTypeId = 1 -- Only questions have 'Tags' in this context
+        AND p.Tags IS NOT NULL
+        AND LENGTH(p.Tags) > 2 -- Ensure tags string is not empty or just "<>"
+    GROUP BY
+        LOWER(UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><')))
+    HAVING
+        COUNT(DISTINCT p.Id) > 10 -- Only consider tags with significant usage
+)
+-- Main query combining user engagement, post quality, and tag performance
+SELECT
+    ues.UserId,
+    ues.UserName,
+    ues.Reputation,
+    ues.ReputationTier,
+    ues.UserCalculatedEngagementScore,
+    ues.TotalPostsCreated,
+    ues.TotalQuestionsCreated,
+    ues.TotalAnswersCreated,
+    pqm.PostId,
+    pqm.PostTypeName,
+    pqm.PostCreationDate,
+    pqm.PostScore,
+    pqm.ViewCount,
+    pqm.FavoriteCount,
+    pqm.PostQualityCategory,
+    pqm.TotalUniqueEditors,
+    pqm.PostScoreRankByType,
+    pqm.PrimaryTag,
+    tps.AvgQuestionScoreForTag,
+    tps.TaggedQuestionCount,
+    -- Correlated subquery in SELECT clause: Check if user has a 'Great Answer' badge (Class = 1 and Name similar to 'answer')
+    (
+        SELECT
+            COUNT(b_sub.Id) > 0
+        FROM
+            Badges b_sub
+        WHERE
+            b_sub.UserId = ues.UserId
+            AND b_sub.Class = 1 -- Gold badge
+            AND LOWER(b_sub.Name) LIKE '%answer%'
+    ) AS HasGreatAnswerBadge,
+    -- Complicated string expression for a hypothetical post summary
+    CONCAT_WS(' | ',
+        'ID: ' || CAST(pqm.PostId AS VARCHAR),
+        'Type: ' || pqm.PostTypeName,
+        'Score: ' || CAST(pqm.PostScore AS VARCHAR),
+        'Views: ' || COALESCE(CAST(pqm.ViewCount AS VARCHAR), '0'),
+        'Owner: ' || COALESCE(pqm.PostOwnerDisplayName, 'N/A')
+    ) AS PostSummaryInfo,
+    -- Using NULLIF to prevent division by zero for score/views ratio
+    pqm.PostScore * 1.0 / NULLIF(pqm.ViewCount, 0) AS ScorePerViewRatio,
+    -- A final calculated metric based on multiple factors
+    (
+        (pqm.PostScore * 0.5) +
+        (COALESCE(pqm.FavoriteCount, 0) * 2.0) +
+        (pqm.TotalUniqueEditors * 0.1) +
+        (CASE WHEN pqm.HasAcceptedAnswer THEN 10.0 ELSE 0.0 END) +
+        (CASE WHEN pqm.IsClosed THEN -5.0 ELSE 0.0 END)
+    ) AS PostEngagementImpactScore
+FROM
+    UserEngagementSummary ues
+LEFT JOIN
+    PostQualityMetrics pqm ON ues.UserId = pqm.OwnerUserId
+LEFT JOIN
+    TagPerformanceStats tps ON pqm.PrimaryTag = tps.TagName
+WHERE
+    ues.Reputation > 500 -- Filter for more established users
+    AND pqm.PostScore > 5 -- Filter for posts with some engagement
+    -- More complex predicate using string and date functions
+    AND (
+        (LOWER(pqm.Title) LIKE '%sql%' OR LOWER(pqm.Title) LIKE '%database%')
+        OR
+        (pqm.PostCreationDate BETWEEN cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year' AND cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '6 months' AND pqm.PostQualityCategory = 'Viral_HighScore')
+    )
+    -- Predicate involving a correlated subquery for existence check
+    AND EXISTS (
+        SELECT 1
+        FROM PostLinks pl
+        WHERE pl.PostId = pqm.PostId
+          AND pl.LinkTypeId = 1 -- Linked posts
+          AND pl.CreationDate >= pqm.PostCreationDate
+    )
+ORDER BY
+    ues.UserCalculatedEngagementScore DESC,
+    pqm.PostEngagementImpactScore DESC,
+    pqm.PostCreationDate DESC
+LIMIT 1000;

@@ -1,0 +1,61 @@
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    MAX(u.CreationDate) AS LatestAccountActivity,
+    MAX(p.LastActivityDate) AS LatestPostActivity,
+    b.Class,
+    t.TagName,
+    ph.RevisionGUID,
+    ph.Comment,
+    CASE 
+        WHEN ph.PostHistoryTypeId = 10 THEN cr.Name
+        ELSE NULL
+    END AS CloseReason,
+    (
+        SELECT STRING_AGG(CAST(vl.VoteTypeId AS varchar), ', ')
+        FROM Votes vl
+        WHERE vl.PostId = p.Id
+    ) AS VoteTypes,
+    (
+        SELECT COUNT(*) 
+        FROM Badges bg 
+        WHERE bg.UserId = u.Id AND bg.Class = 1
+    ) AS GoldBadgeCount
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN LATERAL (
+    SELECT tag.TagName
+    FROM Tags tag
+    WHERE tag.Id = ANY (
+        SELECT CAST(x AS integer)
+        FROM (
+            SELECT x
+            FROM UNNEST(string_to_array(COALESCE(p.Tags, ''), '/><')) AS x
+        ) AS unnested
+        WHERE unnested.x <> ''
+        LIMIT 1
+    )
+) t ON TRUE
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN 
+    CloseReasonTypes cr ON ph.Comment = CAST(cr.Id AS varchar)
+WHERE 
+    p.PostTypeId IN (1, 2) 
+    AND u.Reputation > 1000 
+    AND p.LastEditDate > (CAST('2024-10-01' AS date) - INTERVAL '1 year')
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation, u.CreationDate, b.Class, t.TagName, ph.RevisionGUID, ph.Comment, ph.PostHistoryTypeId, cr.Name
+HAVING 
+    COUNT(DISTINCT p.Id) > 50
+ORDER BY 
+    u.Reputation DESC, 
+    TotalPosts DESC
+LIMIT 10;

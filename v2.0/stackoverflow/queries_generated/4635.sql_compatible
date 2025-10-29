@@ -1,0 +1,122 @@
+WITH
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      COUNT(DISTINCT p.Id) AS PostsCount,
+      SUM(CASE WHEN pt.Name = 'Question' THEN 1 ELSE 0 END) AS QuestionsCount,
+      SUM(CASE WHEN pt.Name = 'Answer' THEN 1 ELSE 0 END) AS AnswersCount,
+      COUNT(DISTINCT c.Id) AS CommentsCount,
+      COUNT(DISTINCT b.Id) AS BadgesCount,
+      ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS ActivityRank
+    FROM Users u
+    LEFT JOIN Posts p
+      ON u.Id = p.OwnerUserId
+    LEFT JOIN PostTypes pt
+      ON p.PostTypeId = pt.Id
+    LEFT JOIN Comments c
+      ON u.Id = c.UserId
+    LEFT JOIN Badges b
+      ON u.Id = b.UserId
+    WHERE
+      u.Id > 0 AND u.CreationDate >= '2010-01-01'
+    GROUP BY
+      u.Id,
+      u.DisplayName
+  ),
+  PostEngagement AS (
+    SELECT
+      p.Id AS PostId,
+      p.Title,
+      pt.Name AS PostType,
+      u.DisplayName AS OwnerDisplayName,
+      p.Score,
+      p.ViewCount,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+      ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS ScoreRank,
+      COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN pl.RelatedPostId END) AS DuplicateLinks,
+      AVG(c.Score) OVER (PARTITION BY p.Id) AS AvgCommentScore,
+      SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id) AS CloseEventCount
+    FROM Posts p
+    LEFT JOIN PostTypes pt
+      ON p.PostTypeId = pt.Id
+    LEFT JOIN Users u
+      ON p.OwnerUserId = u.Id
+    LEFT JOIN PostLinks pl
+      ON p.Id = pl.PostId
+    LEFT JOIN Comments c
+      ON p.Id = c.PostId
+    LEFT JOIN PostHistory ph
+      ON p.Id = ph.PostId AND ph.PostHistoryTypeId = 10
+    WHERE
+      p.CreationDate >= '2015-01-01' AND pt.Name IN ('Question', 'Answer')
+    GROUP BY
+      p.Id,
+      p.Title,
+      pt.Name,
+      u.DisplayName,
+      p.Score,
+      p.ViewCount,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      p.ClosedDate,
+      p.PostTypeId
+  ),
+  RandomPostOwner AS (
+    -- portable method to pick a single random Id across dialects: order by a random() function where available.
+    -- Use RANDOM() for Postgres, RAND() for MySQL; here use COALESCE of functions is not portable, so use a deterministic substitute:
+    -- select a single Id using OFFSET with a computed row number (works in most dialects). First get count then offset by modulo.
+    cnt AS (
+      SELECT COUNT(*) AS total FROM Posts
+    ),
+    numbered AS (
+      SELECT Id, ROW_NUMBER() OVER (ORDER BY Id) AS rn
+      FROM Posts
+    ),
+    pick AS (
+      SELECT Id
+      FROM numbered, cnt
+      WHERE rn = ((cnt.total - 1) % GREATEST(cnt.total,1)) + 1
+      LIMIT 1
+    )
+    SELECT Id AS RandomPostId FROM pick
+  )
+SELECT
+  ua.DisplayName AS UserDisplayName,
+  ua.ActivityRank AS UserActivityRank,
+  pe.Title AS PostTitle,
+  pe.PostType,
+  pe.Score,
+  pe.ViewCount,
+  pe.AnswerCount,
+  pe.CommentCount,
+  pe.FavoriteCount,
+  pe.IsClosed,
+  pe.ScoreRank AS PostScoreRankForType,
+  pe.DuplicateLinks,
+  COALESCE(pe.AvgCommentScore, 0) AS AverageCommentScore,
+  CASE WHEN pe.CloseEventCount > 0 THEN 'Closed' ELSE 'Open' END AS PostStatus,
+  CONCAT(ua.DisplayName, ' has created ', ua.PostsCount, ' posts and received ', ua.BadgesCount, ' badges.') AS UserSummary,
+  CASE
+    WHEN pe.Score > 100 AND pe.AnswerCount > 10 THEN 'High Performing Post'
+    WHEN pe.ViewCount > 10000 AND pe.IsClosed = 0 THEN 'Popular Open Post'
+    WHEN pe.DuplicateLinks > 0 THEN 'Has Duplicates'
+    ELSE 'Standard Post'
+  END AS PostClassification
+FROM UserActivity ua
+FULL OUTER JOIN PostEngagement pe
+  ON ua.UserId = (
+    SELECT OwnerUserId
+    FROM Posts
+    WHERE Id = (SELECT RandomPostId FROM RandomPostOwner)
+    LIMIT 1
+  )
+WHERE
+  ua.ActivityRank <= 100 OR pe.ScoreRank <= 50
+ORDER BY
+  ua.ActivityRank,
+  pe.ScoreRank;

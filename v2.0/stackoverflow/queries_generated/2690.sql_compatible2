@@ -1,0 +1,162 @@
+with UserBadgeStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) as TotalBadges,
+        count(case when b.Class = 1 then 1 end) as GoldBadges,
+        count(case when b.Class = 2 then 1 end) as SilverBadges,
+        count(case when b.Class = 3 then 1 end) as BronzeBadges,
+        coalesce(sum(case when b.TagBased = true then 1 else 0 end),0) as TagBasedBadges
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    group by u.Id, u.DisplayName
+),
+UserPostActivity as (
+    select 
+        u.Id as UserId,
+        count(distinct p.Id) as PostsCount,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionsCount,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswersCount,
+        coalesce(avg(p.Score),0) as AvgScore,
+        max(p.Score) as MaxScore,
+        count(distinct ph.Id) as TotalPostEdits,
+        max(ph.CreationDate) as LastEditDate
+    from Users u
+    left join Posts p on u.Id = p.OwnerUserId
+    left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId in (4,5,6,7,8,9,24)
+    group by u.Id
+),
+RecentHotQuestions as (
+    select 
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        row_number() over (partition by date_trunc('day', p.CreationDate) order by p.Score desc, p.ViewCount desc) as rn
+    from Posts p
+    join Votes v on p.Id = v.PostId and v.VoteTypeId = 52
+    where p.PostTypeId = 1 and p.CreationDate > (timestamp '2024-10-01 12:34:56' - interval '30 day')
+),
+DuplicateQuestionInfo as (
+    select 
+        pl.PostId as DuplicateQuestionId,
+        pl.RelatedPostId as OriginalQuestionId,
+        p1.Title as DuplicateTitle,
+        p2.Title as OriginalTitle,
+        p1.CreationDate as DuplicateCreation,
+        p2.CreationDate as OriginalCreation,
+        p2.OwnerUserId as OriginalOwnerUserId,
+        u.DisplayName as OriginalQuestionOwner
+    from PostLinks pl
+    join Posts p1 on pl.PostId = p1.Id and p1.PostTypeId = 1
+    join Posts p2 on pl.RelatedPostId = p2.Id and p2.PostTypeId = 1
+    left join Users u on p2.OwnerUserId = u.Id
+    where pl.LinkTypeId = 3
+),
+TaggedQuestionStats as (
+    select
+        t.tag as tag,
+        count(distinct p.Id) as QuestionCount,
+        avg(p.Score) as AvgScore,
+        max(p.Score) as MaxScore,
+        sum(p.ViewCount) as TotalViews,
+        sum(p.AnswerCount) as TotalAnswers
+    from Posts p
+    cross join lateral (
+      select unnest(string_to_array(trim(both '<>' from p.Tags), '><')) as tag
+    ) t
+    where p.PostTypeId = 1
+    group by t.tag
+),
+UserCommentScores as (
+    select
+        c.UserId,
+        count(c.Id) as TotalComments,
+        sum(c.Score) as TotalCommentScore,
+        avg(c.Score) as AvgCommentScore
+    from Comments c
+    where c.UserId is not null
+    group by c.UserId
+),
+UserLatestPostEdit as (
+    select ph.UserId, ph.PostId, max(ph.CreationDate) as LastEditDate
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (4,5,6)
+    group by ph.UserId, ph.PostId
+),
+UserPostVoteStats as (
+    select
+        p.OwnerUserId as UserId,
+        count(case when v.VoteTypeId = 2 then v.Id end) as UpVotesCount,
+        count(case when v.VoteTypeId = 3 then v.Id end) as DownVotesCount,
+        count(case when v.VoteTypeId = 1 then v.Id end) as AcceptedAnswerVotes,
+        count(case when v.VoteTypeId = 5 then v.Id end) as FavoriteVotes
+    from Posts p
+    left join Votes v on p.Id = v.PostId
+    where p.OwnerUserId is not null
+    group by p.OwnerUserId
+)
+select 
+    u.Id as UserId,
+    u.DisplayName,
+    coalesce(uba.GoldBadges,0) as GoldBadgeCount,
+    coalesce(uba.SilverBadges,0) as SilverBadgeCount,
+    coalesce(uba.BronzeBadges,0) as BronzeBadgeCount,
+    coalesce(upa.QuestionsCount,0) as QuestionsPosted,
+    coalesce(upa.AnswersCount,0) as AnswersPosted,
+    coalesce(upv.UpVotesCount,0) as TotalUpVotesOnPosts,
+    coalesce(upv.DownVotesCount,0) as TotalDownVotesOnPosts,
+    coalesce(upv.AcceptedAnswerVotes,0) as AcceptedAnswersCount,
+    coalesce(ucs.TotalComments,0) as CommentCount,
+    u.Reputation,
+    u.Views,
+    uas.LastEditDate as LastPostEditDate,
+    dup.OriginalTitle as DuplicateOf,
+    dup.DuplicateTitle as ThisIsDuplicateOf,
+    ds.MaxScore as MaxQuestionScoreInUserTags,
+    ds.TotalAnswers as TotalAnswersInUserTags,
+    ds.AvgScore as AvgQuestionScoreInUserTags,
+    case 
+        when u.Location is null then 'Unknown' 
+        else upper(substring(u.Location from 1 for 3)) end as LocationAbbreviation,
+    case
+        when u.WebsiteUrl is null or u.WebsiteUrl = '' then 'no_website'
+        else substring(u.WebsiteUrl from 'https?://([^/]+)') end as DomainName,
+    rb.RankByReputation,
+    row_number() over (order by u.Reputation desc) as RankGlobalReputation
+from Users u
+left join UserBadgeStats uba on u.Id = uba.UserId
+left join UserPostActivity upa on u.Id = upa.UserId
+left join UserPostVoteStats upv on u.Id = upv.UserId
+left join UserCommentScores ucs on u.Id = ucs.UserId
+left join UserLatestPostEdit uas on u.Id = uas.UserId
+left join (
+    select 
+        dup.DuplicateQuestionId,
+        dup.OriginalTitle,
+        dup.DuplicateTitle,
+        dup.OriginalOwnerUserId
+    from DuplicateQuestionInfo dup
+) dup on dup.DuplicateQuestionId = (
+    select p.Id from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 1
+    and exists (select 1 from PostLinks pl where pl.PostId = p.Id and pl.LinkTypeId = 3)
+    limit 1
+)
+left join (
+    select
+        tag,
+        max(MaxScore) as MaxScore,
+        sum(TotalAnswers) as TotalAnswers,
+        avg(AvgScore) as AvgScore
+    from TaggedQuestionStats
+    group by tag
+) ds on exists (
+    select 1 from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 1 and p.Tags like '%' || ds.tag || '%'
+)
+cross join lateral (
+    select rank() over (order by u.Reputation desc) as RankByReputation
+) rb
+where u.Reputation > 1000
+order by u.Reputation desc
+limit 50;

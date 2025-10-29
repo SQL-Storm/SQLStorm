@@ -1,0 +1,305 @@
+WITH RECURSIVE UserHierarchy AS (
+    SELECT Id, DisplayName, AccountId, 0 AS Level
+    FROM Users
+    WHERE AccountId IS NOT NULL
+    UNION ALL
+    SELECT u.Id, u.DisplayName, u.AccountId, uh.Level + 1
+    FROM Users u
+    INNER JOIN UserHierarchy uh ON u.AccountId = uh.Id
+),
+PostStats AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Title,
+        p.Tags,
+        COALESCE(p.Body, '') AS Body,
+        CASE WHEN p.PostTypeId = 1 THEN 'Question' ELSE 'Answer' END AS PostType,
+        CASE 
+            WHEN p.Score >= 100 THEN 'High'
+            WHEN p.Score >= 50 THEN 'Medium'
+            ELSE 'Low'
+        END AS ScoreCategory,
+        DENSE_RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS ScoreRank,
+        ROW_NUMBER() OVER (ORDER BY p.CreationDate DESC) AS RowNum,
+        LAG(p.Score) OVER (ORDER BY p.CreationDate) AS PrevScore,
+        LEAD(p.Score) OVER (ORDER BY p.CreationDate) AS NextScore,
+        AVG(p.Score) OVER (PARTITION BY p.PostTypeId) AS AvgScoreByType,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) AS UserPostCount,
+        SUM(p.Score) OVER (PARTITION BY p.OwnerUserId) AS UserTotalScore
+    FROM Posts p
+),
+UserActivity AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        SUM(p.Score) AS TotalScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 AND COUNT(DISTINCT p.Id) < 10 THEN 'Beginner'
+            WHEN COUNT(DISTINCT p.Id) >= 10 AND COUNT(DISTINCT p.Id) < 50 THEN 'Intermediate'
+            WHEN COUNT(DISTINCT p.Id) >= 50 THEN 'Advanced'
+            ELSE 'Inactive'
+        END AS ActivityLevel
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TagAnalysis AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            ELSE 'Rare'
+        END AS PopularityLevel,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS PopularityRank,
+        RANK() OVER (ORDER BY t.Count DESC) AS PopularityRankDense,
+        LAG(t.Count) OVER (ORDER BY t.Count DESC) AS PrevCount,
+        LEAD(t.Count) OVER (ORDER BY t.Count DESC) AS NextCount,
+        PERCENT_RANK() OVER (ORDER BY t.Count) AS PercentileRank
+    FROM Tags t
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        ps.Id,
+        ps.PostTypeId,
+        ps.OwnerUserId,
+        ps.Score,
+        ps.ViewCount,
+        ps.AnswerCount,
+        ps.CommentCount,
+        ps.FavoriteCount,
+        ps.CreationDate,
+        ps.LastActivityDate,
+        ps.Title,
+        ps.Tags,
+        ps.Body,
+        ps.PostType,
+        ps.ScoreCategory,
+        ps.ScoreRank,
+        ps.RowNum,
+        ps.PrevScore,
+        ps.NextScore,
+        ps.AvgScoreByType,
+        ps.UserPostCount,
+        ps.UserTotalScore,
+        CASE 
+            WHEN ps.Score > ps.AvgScoreByType THEN 'Above Average'
+            WHEN ps.Score < ps.AvgScoreByType THEN 'Below Average'
+            ELSE 'Average'
+        END AS ScorePerformance,
+        CASE 
+            WHEN ps.AnswerCount > 0 AND ps.Score > 50 THEN 'Well Answered'
+            WHEN ps.AnswerCount = 0 AND ps.Score > 25 THEN 'Highly Rated No Answer'
+            ELSE 'Other'
+        END AS AnswerStatus,
+        COALESCE(
+            (SELECT COUNT(*) FROM Comments c WHERE c.PostId = ps.Id),
+            0
+        ) AS CommentCountSubquery,
+        COALESCE(
+            (SELECT COUNT(*) FROM Votes v WHERE v.PostId = ps.Id AND v.VoteTypeId = 2),
+            0
+        ) AS UpvoteCountSubquery,
+        COALESCE(
+            (SELECT COUNT(*) FROM Votes v WHERE v.PostId = ps.Id AND v.VoteTypeId = 3),
+            0
+        ) AS DownvoteCountSubquery,
+        COALESCE(
+            (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = ps.Id AND pl.LinkTypeId = 3),
+            0
+        ) AS DuplicateCountSubquery,
+        CASE 
+            WHEN ps.Score > 100 AND ps.AnswerCount > 5 THEN 'High Impact'
+            WHEN ps.Score > 50 AND ps.AnswerCount > 2 THEN 'Medium Impact'
+            WHEN ps.Score > 25 THEN 'Low Impact'
+            ELSE 'Minimal Impact'
+        END AS ImpactLevel,
+        CASE
+            WHEN ps.LastActivityDate IS NULL THEN ps.CreationDate - INTERVAL '10' DAY
+            ELSE ps.LastActivityDate
+        END AS EffectiveLastActivityDate,
+        (CAST(COALESCE(ps.LastActivityDate, TIMESTAMP '2024-10-01 12:34:56') AS TIMESTAMP) - CAST(ps.CreationDate AS TIMESTAMP)) / 86400.0 AS DaysSinceCreation,
+        CASE 
+            WHEN ps.FavoriteCount > 0 THEN 'Favorited'
+            ELSE 'Not Favorited'
+        END AS FavoriteStatus
+    FROM PostStats ps
+)
+SELECT 
+    ca.Id,
+    ca.PostTypeId,
+    ca.OwnerUserId,
+    ca.Score,
+    ca.ViewCount,
+    ca.AnswerCount,
+    ca.CommentCount,
+    ca.FavoriteCount,
+    ca.CreationDate,
+    ca.LastActivityDate,
+    ca.Title,
+    ca.Tags,
+    CASE 
+        WHEN LENGTH(ca.Body) > 1000 THEN SUBSTRING(ca.Body FROM 1 FOR 1000) || '...'
+        ELSE ca.Body
+    END AS BodyPreview,
+    ca.PostType,
+    ca.ScoreCategory,
+    ca.ScoreRank,
+    ca.RowNum,
+    ca.PrevScore,
+    ca.NextScore,
+    ca.AvgScoreByType,
+    ca.UserPostCount,
+    ca.UserTotalScore,
+    ca.ScorePerformance,
+    ca.AnswerStatus,
+    ca.CommentCountSubquery,
+    ca.UpvoteCountSubquery,
+    ca.DownvoteCountSubquery,
+    ca.DuplicateCountSubquery,
+    ca.ImpactLevel,
+    ca.EffectiveLastActivityDate,
+    ca.DaysSinceCreation,
+    ca.FavoriteStatus,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation AS OwnerReputation,
+    ua.PostCount AS OwnerPostCount,
+    ua.CommentCount AS OwnerCommentCount,
+    ua.TotalScore AS OwnerTotalScore,
+    ta.TagName,
+    ta.Count AS TagCount,
+    ta.PopularityLevel,
+    ta.PopularityRank,
+    ta.PopularityRankDense,
+    ta.PrevCount,
+    ta.NextCount,
+    ta.PercentileRank,
+    uh.Level AS UserLevel,
+    uh.DisplayName AS UserHierarchyName,
+    u.EmailHash,
+    u.Location,
+    u.WebsiteUrl,
+    u.AboutMe,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.LastAccessDate,
+    u.AccountId,
+    CASE 
+        WHEN ua.ActivityLevel IN ('Advanced', 'Expert') THEN 1
+        WHEN ua.ActivityLevel IN ('Intermediate', 'Moderate') THEN 0.5
+        ELSE 0.1
+    END AS ActivityMultiplier,
+    CASE 
+        WHEN ca.Score > 100 AND ca.AnswerCount > 3 THEN (ca.Score * ca.AnswerCount) / NULLIF(ca.ViewCount, 0)
+        WHEN ca.Score > 50 THEN (ca.Score * 0.7) / NULLIF(ca.ViewCount, 0)
+        ELSE (ca.Score * 0.3) / NULLIF(ca.ViewCount, 0)
+    END AS EngagementRate,
+    CASE 
+        WHEN ca.DaysSinceCreation > 365 THEN 'Archived'
+        WHEN ca.DaysSinceCreation BETWEEN 90 AND 365 THEN 'Vintage'
+        WHEN ca.DaysSinceCreation BETWEEN 30 AND 90 THEN 'Recent'
+        WHEN ca.DaysSinceCreation < 30 THEN 'New'
+        ELSE 'Unknown'
+    END AS PostAgeCategory,
+    CASE 
+        WHEN SUBSTRING(ca.Title FROM 1 FOR 1) = UPPER(SUBSTRING(ca.Title FROM 1 FOR 1)) THEN 'Properly Capitalized'
+        ELSE 'Not Properly Capitalized'
+    END AS TitleCapitalization,
+    CASE 
+        WHEN ca.Tags IS NOT NULL AND LENGTH(ca.Tags) > 0 THEN 
+            (CASE WHEN POSITION('>' IN ca.Tags) > 0 THEN 'Multiple Tags' ELSE 'Single Tag' END)
+        ELSE 'No Tags'
+    END AS TagStructure,
+    COALESCE(
+        (SELECT ph.Comment FROM PostHistory ph 
+         WHERE ph.PostId = ca.Id AND ph.PostHistoryTypeId IN (10, 11) 
+         ORDER BY ph.CreationDate DESC
+         LIMIT 1),
+        'No Close/Reopen Info'
+    ) AS RecentPostHistory,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = ca.OwnerUserId AND b.Class = 1) AS GoldBadgeCount,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = ca.OwnerUserId AND b.Class = 2) AS SilverBadgeCount,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = ca.OwnerUserId AND b.Class = 3) AS BronzeBadgeCount,
+    CASE 
+        WHEN (SELECT COUNT(*) FROM Votes v WHERE v.PostId = ca.Id AND v.VoteTypeId IN (2, 3)) > 0 
+        THEN 
+            (SELECT AVG(vv.BountyAmount) FROM Votes vv WHERE vv.PostId = ca.Id AND vv.BountyAmount IS NOT NULL)
+        ELSE NULL 
+    END AS AverageBounty,
+    NULLIF(
+        (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = ca.Id AND ph.PostHistoryTypeId IN (2, 5, 6)),
+        0
+    ) AS EditCount,
+    CASE 
+        WHEN (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = ca.Id AND pl.LinkTypeId = 1) > 0 
+        THEN 'Linked'
+        ELSE 'Not Linked'
+    END AS LinkStatus,
+    CASE 
+        WHEN (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = ca.Id AND ph.PostHistoryTypeId = 10) > 0 
+        THEN 'Closed'
+        ELSE 'Open'
+    END AS PostState,
+    TIMESTAMP '2024-10-01 12:34:56' AS QueryExecutionTime,
+    1 AS BenchmarkScore
+FROM ComplexPostAnalysis ca
+LEFT JOIN Users u ON ca.OwnerUserId = u.Id
+LEFT JOIN UserActivity ua ON ca.OwnerUserId = ua.Id
+LEFT JOIN Tags ta ON (
+    ca.Tags IS NOT NULL 
+    AND LENGTH(ca.Tags) > 0 
+    AND ta.TagName IN (
+        SELECT TRIM(value) FROM (
+            SELECT UNNEST(STRING_TO_ARRAY(REPLACE(REPLACE(ca.Tags,'<',''),'>',''), '>')) AS value
+        ) AS sub
+    )
+)
+LEFT JOIN UserHierarchy uh ON ca.OwnerUserId = uh.Id
+WHERE ca.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1' YEAR)
+    AND (ca.Score IS NOT NULL OR ca.AnswerCount IS NOT NULL OR ca.ViewCount IS NOT NULL)
+    AND (
+        ca.PostTypeId IN (1, 2)
+        OR ca.Id IN (
+            SELECT ParentId FROM Posts WHERE ParentId IS NOT NULL AND PostTypeId = 2
+        )
+    )
+    AND ca.AnswerCount IS NOT NULL
+    AND ca.ViewCount IS NOT NULL
+    AND ca.Score > -100
+    AND ca.Score < 10000
+    AND (
+        ca.OwnerUserId IS NOT NULL 
+        OR u.DisplayName IS NOT NULL 
+        OR ca.Id IN (
+            SELECT ph.PostId 
+            FROM PostHistory ph 
+            WHERE ph.PostId IS NOT NULL 
+            AND ph.UserId IS NOT NULL
+        )
+    )
+ORDER BY ca.Score DESC, ca.CreationDate DESC
+OFFSET 100 ROWS
+FETCH NEXT 50 ROWS ONLY;

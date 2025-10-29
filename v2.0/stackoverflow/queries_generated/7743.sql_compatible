@@ -1,0 +1,295 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        COUNT(DISTINCT b.Id) AS Badges,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags) - 2)), ', ') AS TagList,
+        MAX(p.CreationDate) AS LastPostDate,
+        AVG(p.Score) AS AvgScore,
+        COUNT(DISTINCT c.Id) AS Comments,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END), 0) AS TotalViews,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.Views DESC) AS ReputationRank,
+        CASE 
+            WHEN u.Reputation > 100000 THEN 'Elite'
+            WHEN u.Reputation > 10000 THEN 'Veteran'
+            WHEN u.Reputation > 1000 THEN 'Contributor'
+            ELSE 'Member'
+        END AS UserTier
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    WHERE u.CreationDate >= TIMESTAMP '2010-01-01 00:00:00'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+    HAVING COUNT(DISTINCT p.Id) > 0
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.ParentId,
+        p.PostTypeId,
+        COALESCE(p.AcceptedAnswerId, 0) AS AcceptedAnswerId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.Tags,
+        p.LastActivityDate,
+        p.LastEditDate,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostType,
+        CASE 
+            WHEN p.Score > 100 THEN 'Highly Rated'
+            WHEN p.Score > 50 THEN 'Moderately Rated'
+            WHEN p.Score > 0 THEN 'Positive'
+            WHEN p.Score < 0 THEN 'Negative'
+            ELSE 'Neutral'
+        END AS RatingCategory,
+        COALESCE(p.ViewCount, 0) + COALESCE(p.Score, 0) AS ActivityScore,
+        CAST((p.LastActivityDate::timestamp - p.CreationDate::timestamp) AS INTERVAL) AS _tmp_interval,
+        EXTRACT(DAY FROM (p.LastActivityDate - p.CreationDate))::bigint AS DaysSinceLastActivity,
+        EXTRACT(DAY FROM (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate))::bigint AS DaysSinceCreation
+    FROM Posts p
+    WHERE p.CreationDate >= TIMESTAMP '2015-01-01 00:00:00'
+    AND p.PostTypeId IN (1, 2)
+),
+CombinedData AS (
+    SELECT 
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.Views,
+        us.UpVotes,
+        us.DownVotes,
+        us.TotalPosts,
+        us.Questions,
+        us.Answers,
+        us.Badges,
+        us.TagList,
+        us.LastPostDate,
+        us.AvgScore,
+        us.Comments,
+        us.TotalViews,
+        us.ReputationRank,
+        us.UserTier,
+        pa.PostId,
+        pa.Title,
+        pa.Score,
+        pa.ViewCount,
+        pa.CreationDate,
+        pa.ParentId,
+        pa.PostTypeId,
+        pa.AcceptedAnswerId,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.Tags,
+        pa.LastActivityDate,
+        pa.LastEditDate,
+        pa.PostType,
+        pa.RatingCategory,
+        pa.ActivityScore,
+        pa.DaysSinceLastActivity,
+        pa.DaysSinceCreation,
+        ROW_NUMBER() OVER (PARTITION BY us.UserId ORDER BY pa.Score DESC) AS PostRank
+    FROM UserStats us
+    LEFT JOIN PostAnalysis pa ON us.UserId = pa.OwnerUserId
+    WHERE pa.PostId IS NOT NULL
+),
+UserPostPerformance AS (
+    SELECT 
+        cd.UserId,
+        cd.DisplayName,
+        cd.Reputation,
+        cd.Views,
+        cd.UpVotes,
+        cd.DownVotes,
+        cd.TotalPosts,
+        cd.Questions,
+        cd.Answers,
+        cd.Badges,
+        cd.TagList,
+        cd.LastPostDate,
+        cd.AvgScore,
+        cd.Comments,
+        cd.TotalViews,
+        cd.ReputationRank,
+        cd.UserTier,
+        cd.PostId,
+        cd.Title,
+        cd.Score,
+        cd.ViewCount,
+        cd.CreationDate,
+        cd.ParentId,
+        cd.PostTypeId,
+        cd.AcceptedAnswerId,
+        cd.AnswerCount,
+        cd.CommentCount,
+        cd.Tags,
+        cd.LastActivityDate,
+        cd.LastEditDate,
+        cd.PostType,
+        cd.RatingCategory,
+        cd.ActivityScore,
+        cd.DaysSinceLastActivity,
+        cd.DaysSinceCreation,
+        cd.PostRank,
+        CASE 
+            WHEN cd.Score >= 100 AND cd.ViewCount >= 1000 THEN 'Viral'
+            WHEN cd.Score >= 50 AND cd.ViewCount >= 500 THEN 'Popular'
+            WHEN cd.Score >= 20 AND cd.ViewCount >= 100 THEN 'Good'
+            WHEN cd.Score >= 0 AND cd.ViewCount >= 0 THEN 'Fair'
+            ELSE 'Poor'
+        END AS PostPerformance,
+        DENSE_RANK() OVER (PARTITION BY cd.UserId ORDER BY cd.Score DESC) AS ScoreRankWithinUser,
+        PERCENT_RANK() OVER (ORDER BY cd.Score) AS ScorePercentile,
+        (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = cd.UserId AND p2.CreationDate >= TIMESTAMP '2015-01-01 00:00:00') AS UserTotalPosts2015,
+        (
+            SELECT COUNT(*) 
+            FROM Posts p3 
+            WHERE p3.OwnerUserId = cd.UserId 
+            AND p3.PostTypeId = 1 
+            AND p3.CreationDate >= TIMESTAMP '2015-01-01 00:00:00'
+        ) AS UserQuestions2015,
+        (
+            SELECT COUNT(*) 
+            FROM Posts p4 
+            WHERE p4.OwnerUserId = cd.UserId 
+            AND p4.PostTypeId = 2 
+            AND p4.CreationDate >= TIMESTAMP '2015-01-01 00:00:00'
+        ) AS UserAnswers2015,
+        COALESCE(
+            (
+                SELECT AVG(p5.Score) 
+                FROM Posts p5 
+                WHERE p5.OwnerUserId = cd.UserId 
+                AND p5.CreationDate >= TIMESTAMP '2015-01-01 00:00:00'
+            ), 0
+        ) AS UserAvgScore2015,
+        EXISTS(
+            SELECT 1 
+            FROM Posts ps 
+            WHERE ps.OwnerUserId = cd.UserId 
+            AND ps.LastActivityDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30 DAY')
+        ) AS ActiveInLast30Days
+    FROM CombinedData cd
+    WHERE cd.Score IS NOT NULL
+)
+SELECT 
+    upp.UserId,
+    upp.DisplayName,
+    upp.Reputation,
+    upp.Views,
+    upp.UpVotes,
+    upp.DownVotes,
+    upp.TotalPosts,
+    upp.Questions,
+    upp.Answers,
+    upp.Badges,
+    upp.TagList,
+    upp.LastPostDate,
+    upp.AvgScore AS AverageScore,
+    upp.Comments,
+    upp.TotalViews,
+    upp.ReputationRank,
+    upp.UserTier,
+    upp.PostId,
+    upp.Title,
+    upp.Score,
+    upp.ViewCount,
+    upp.CreationDate,
+    upp.ParentId,
+    upp.PostTypeId,
+    upp.AcceptedAnswerId,
+    upp.AnswerCount,
+    upp.CommentCount,
+    upp.Tags,
+    upp.LastActivityDate,
+    upp.LastEditDate,
+    upp.PostType,
+    upp.RatingCategory,
+    upp.ActivityScore,
+    upp.DaysSinceLastActivity,
+    upp.DaysSinceCreation,
+    upp.PostRank,
+    upp.PostPerformance,
+    upp.ScoreRankWithinUser,
+    upp.ScorePercentile,
+    upp.UserTotalPosts2015,
+    upp.UserQuestions2015,
+    upp.UserAnswers2015,
+    upp.UserAvgScore2015,
+    upp.ActiveInLast30Days,
+    CASE 
+        WHEN upp.PostPerformance = 'Viral' THEN 
+            UPPER(SUBSTRING(upp.Title FROM 1 FOR 50)) || ' - ' || 
+            ('Viral!' || ' Views: ' || COALESCE(upp.ViewCount::text, '0') || ' Score: ' || COALESCE(upp.Score::text, '0'))
+        WHEN upp.PostPerformance = 'Popular' THEN 
+            UPPER(SUBSTRING(upp.Title FROM 1 FOR 30)) || ' - ' || 
+            ('Popular!' || ' Views: ' || COALESCE(upp.ViewCount::text, '0') || ' Score: ' || COALESCE(upp.Score::text, '0'))
+        ELSE 
+            (SUBSTRING(upp.Title FROM 1 FOR 25) || '...') 
+    END AS FormattedTitle,
+    COALESCE(
+        (
+            SELECT COUNT(*) 
+            FROM Posts p6 
+            WHERE p6.ParentId = upp.PostId 
+            AND p6.PostTypeId = 2
+        ), 0
+    ) AS AnswerCountForQuestion,
+    CASE 
+        WHEN upp.DaysSinceCreation > 365 THEN 'Veteran'
+        WHEN upp.DaysSinceCreation > 90 THEN 'Experienced'
+        WHEN upp.DaysSinceCreation > 30 THEN 'Active'
+        ELSE 'New'
+    END AS EngagementStatus,
+    CASE 
+        WHEN upp.Reputation > 50000 OR upp.Badges > 20 THEN 'Elite Contributor'
+        WHEN upp.Reputation > 10000 OR upp.Badges > 10 THEN 'Veteran Contributor'
+        WHEN upp.Reputation > 1000 OR upp.Badges > 5 THEN 'Contributor'
+        ELSE 'Active Member'
+    END AS ContributionTier,
+    (
+        SELECT COUNT(*) 
+        FROM Badges b2 
+        WHERE b2.UserId = upp.UserId 
+        AND b2.Date >= TIMESTAMP '2015-01-01 00:00:00'
+    ) AS Badges2015,
+    (
+        SELECT 
+            STRING_AGG(b3.Name, ', ') 
+            FROM Badges b3 
+            WHERE b3.UserId = upp.UserId 
+            AND b3.Date >= TIMESTAMP '2015-01-01 00:00:00'
+    ) AS RecentBadges,
+    DENSE_RANK() OVER (ORDER BY upp.AvgScore DESC) AS AvgScoreRank,
+    LAG(upp.Score, 1) OVER (ORDER BY upp.Score DESC) - upp.Score AS ScoreDifferenceFromAbove,
+    LEAD(upp.Score, 1) OVER (ORDER BY upp.Score DESC) - upp.Score AS ScoreDifferenceFromBelow,
+    NTILE(4) OVER (ORDER BY upp.Score) AS ScoreQuartile,
+    ROUND(upp.Score::numeric / NULLIF(upp.TotalViews, 0) * 100, 2) AS ScoreToViewRatio,
+    ROUND(upp.Score::numeric / NULLIF(upp.DaysSinceCreation, 0), 2) AS ScorePerDay,
+    (SELECT MAX(s) FROM (VALUES (upp.Score::numeric), (COALESCE(upp.ViewCount,0)::numeric), (COALESCE(upp.AnswerCount,0)::numeric)) AS v(s)) AS MaxMetric,
+    (SELECT MIN(s) FROM (VALUES (upp.Score::numeric), (COALESCE(upp.ViewCount,0)::numeric), (COALESCE(upp.AnswerCount,0)::numeric)) AS v(s)) AS MinMetric,
+    (SELECT AVG(s) FROM (VALUES (upp.Score::numeric), (COALESCE(upp.ViewCount,0)::numeric), (COALESCE(upp.AnswerCount,0)::numeric)) AS v(s)) AS AvgMetric,
+    (SELECT STDDEV(s) FROM (VALUES (upp.Score::numeric), (COALESCE(upp.ViewCount,0)::numeric), (COALESCE(upp.AnswerCount,0)::numeric)) AS v(s)) AS StdMetric,
+    (SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY s) FROM (VALUES (upp.Score::numeric), (COALESCE(upp.ViewCount,0)::numeric), (COALESCE(upp.AnswerCount,0)::numeric)) AS v(s)) AS MedianMetric
+FROM UserPostPerformance upp
+WHERE upp.Reputation >= 100
+AND upp.PostId IS NOT NULL
+AND upp.Score > 0
+AND upp.ActiveInLast30Days = TRUE
+ORDER BY upp.Reputation DESC, upp.Score DESC, upp.TotalViews DESC, upp.DaysSinceLastActivity ASC
+LIMIT 1000;

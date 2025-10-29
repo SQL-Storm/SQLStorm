@@ -1,0 +1,186 @@
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+    COALESCE(SUM(p.Score), 0) AS TotalScore,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END), 0) AS QuestionScore,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END), 0) AS AnswerScore,
+    COUNT(DISTINCT b.Id) AS BadgesCount,
+    COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+    COUNT(DISTINCT c.Id) AS CommentsCount,
+    COUNT(DISTINCT ph.Id) AS EditHistoryCount,
+    AVG(CAST(p.ViewCount AS DOUBLE PRECISION)) AS AvgViewCount,
+    MAX(p.CreationDate) AS LatestPostDate,
+    MIN(p.CreationDate) AS FirstPostDate,
+    (EXTRACT(EPOCH FROM MAX(p.CreationDate)) - EXTRACT(EPOCH FROM MIN(p.CreationDate))) / 86400 AS ActiveDays,
+    CASE 
+        WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+            CAST(COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS DOUBLE PRECISION) * 100.0 / COUNT(DISTINCT p.Id)
+        ELSE 0 
+    END AS AnswerPercentage,
+    COALESCE(
+        (SELECT t.TagName 
+         FROM (
+             SELECT TRIM(BOTH '<>' FROM tag_value) AS tag_clean, COUNT(*) AS cnt
+             FROM Posts p2,
+             LATERAL regexp_split_to_table(p2.Tags, '><') AS tag_value
+             WHERE p2.OwnerUserId = u.Id 
+               AND p2.PostTypeId = 1
+             GROUP BY tag_clean
+             ORDER BY cnt DESC
+             LIMIT 1
+         ) top_tag
+         LEFT JOIN Tags t ON t.TagName = top_tag.tag_clean
+        ), 
+        'No Tags'
+    ) AS PrimaryTag,
+    COALESCE(
+        (SELECT string_agg(t.TagName, ', ')
+         FROM (
+             SELECT tag_clean
+             FROM (
+                 SELECT TRIM(BOTH '<>' FROM tag_value) AS tag_clean
+                 FROM Posts p2,
+                 LATERAL regexp_split_to_table(p2.Tags, '><') AS tag_value
+                 WHERE p2.OwnerUserId = u.Id 
+                   AND p2.PostTypeId = 1
+             ) s
+             GROUP BY tag_clean
+             ORDER BY COUNT(*) DESC
+             LIMIT 5
+         ) top5
+         LEFT JOIN Tags t ON t.TagName = top5.tag_clean
+        ), 
+        'None'
+    ) AS Top5Tags,
+    (SELECT COUNT(*) 
+     FROM Votes v 
+     INNER JOIN Posts p2 ON v.PostId = p2.Id 
+     WHERE v.UserId = u.Id 
+     AND v.VoteTypeId IN (2, 3) 
+     AND p2.PostTypeId IN (1, 2)) AS VoteActivity,
+    (SELECT COUNT(*) 
+     FROM Posts p2 
+     WHERE p2.OwnerUserId = u.Id 
+     AND p2.Score > 50) AS HighScorePosts,
+    (SELECT COUNT(*) 
+     FROM Posts p2 
+     WHERE p2.OwnerUserId = u.Id 
+     AND p2.AnswerCount > 5) AS QuestionWithManyAnswers,
+    (SELECT MAX(p2.Score) 
+     FROM Posts p2 
+     WHERE p2.OwnerUserId = u.Id) AS MaxPostScore,
+    (SELECT AVG(p2.Score) 
+     FROM Posts p2 
+     WHERE p2.OwnerUserId = u.Id) AS AvgPostScore,
+    (SELECT COUNT(*) 
+     FROM Posts p2 
+     WHERE p2.OwnerUserId = u.Id 
+     AND p2.ViewCount > 1000) AS PopularPosts,
+    (SELECT COUNT(*) 
+     FROM Posts p2 
+     WHERE p2.OwnerUserId = u.Id 
+     AND p2.AcceptedAnswerId IS NOT NULL
+     AND p2.PostTypeId = 1) AS QuestionsWithAcceptedAnswers,
+    (SELECT COUNT(*) 
+     FROM PostHistory ph2 
+     WHERE ph2.UserId = u.Id 
+     AND ph2.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)) AS EditActivity,
+    (SELECT COUNT(*) 
+     FROM Comments c2 
+     WHERE c2.UserId = u.Id) AS CommentActivity,
+    (SELECT COUNT(*) 
+     FROM Badges b2 
+     WHERE b2.UserId = u.Id 
+     AND b2.Date > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year')) AS RecentBadges,
+    (SELECT string_agg(
+        CASE 
+            WHEN v2.VoteTypeId = 2 THEN 'Upvote'
+            WHEN v2.VoteTypeId = 3 THEN 'Downvote'
+            WHEN v2.VoteTypeId = 4 THEN 'Offensive'
+            WHEN v2.VoteTypeId = 5 THEN 'Favorite'
+            ELSE 'Other'
+        END, ', '
+    ) 
+    FROM Votes v2 
+    WHERE v2.UserId = u.Id 
+    AND v2.VoteTypeId IN (2, 3, 4, 5)
+    ) AS VoteTypesUsed,
+    ROW_NUMBER() OVER (ORDER BY COALESCE(SUM(p.Score), 0) DESC) AS RankByScore,
+    RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS RankByPostCount,
+    DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT b.Id) DESC) AS RankByBadgeCount,
+    NTILE(10) OVER (ORDER BY COUNT(DISTINCT p.Id)) AS PostCountDecile,
+    LAG(u.Reputation, 1, 0) OVER (ORDER BY u.Reputation DESC) AS PreviousReputation,
+    LEAD(u.Reputation, 1, 0) OVER (ORDER BY u.Reputation DESC) AS NextReputation,
+    PERCENT_RANK() OVER (ORDER BY COUNT(DISTINCT p.Id)) AS PostPercentageRank,
+    CUME_DIST() OVER (ORDER BY u.Reputation) AS ReputationDistribution,
+    AVG(COUNT(DISTINCT p.Id)) OVER (PARTITION BY u.AccountId ORDER BY u.CreationDate ROWS UNBOUNDED PRECEDING) AS AvgPostsPerAccount,
+    CASE 
+        WHEN EXISTS (SELECT 1 FROM Posts p2 WHERE p2.OwnerUserId = u.Id AND p2.PostTypeId = 1 AND p2.Score > 100) 
+        THEN 'Highly Active'
+        WHEN EXISTS (SELECT 1 FROM Posts p2 WHERE p2.OwnerUserId = u.Id AND p2.PostTypeId = 1 AND p2.Score > 50) 
+        THEN 'Moderately Active'
+        ELSE 'Inactive'
+    END AS ActivityLevel,
+    COALESCE(
+        (SELECT t.TagName 
+         FROM (
+             SELECT TRIM(BOTH '<>' FROM tag_value) AS tag_clean, SUM(p2.Score) AS total_score
+             FROM Posts p2,
+             LATERAL regexp_split_to_table(p2.Tags, '><') AS tag_value
+             WHERE p2.OwnerUserId = u.Id 
+               AND p2.PostTypeId = 1
+             GROUP BY tag_clean
+             ORDER BY total_score DESC
+             LIMIT 1
+         ) top_tag2
+         LEFT JOIN Tags t ON t.TagName = top_tag2.tag_clean
+        ), 
+        'No Tags'
+    ) AS TagWithHighestScore,
+    (SELECT COUNT(*) 
+     FROM Posts p2 
+     WHERE p2.OwnerUserId = u.Id 
+     AND p2.ParentId IS NOT NULL 
+     AND p2.PostTypeId = 2) AS AnsweredQuestions,
+    (SELECT COUNT(*) 
+     FROM Posts p2 
+     WHERE p2.OwnerUserId = u.Id 
+     AND p2.ParentId IS NULL 
+     AND p2.PostTypeId = 1) AS QuestionsAsked,
+    (SELECT string_agg(CAST(p2.Id AS TEXT), ',' ORDER BY p2.CreationDate DESC)
+     FROM Posts p2 
+     WHERE p2.OwnerUserId = u.Id 
+     AND p2.PostTypeId = 1) AS QuestionIds,
+    (SELECT string_agg(CAST(p2.Id AS TEXT), ',' ORDER BY p2.CreationDate DESC)
+     FROM Posts p2 
+     WHERE p2.OwnerUserId = u.Id 
+     AND p2.PostTypeId = 2) AS AnswerIds,
+    CASE 
+        WHEN EXISTS (SELECT 1 FROM Posts p2 WHERE p2.OwnerUserId = u.Id AND p2.PostTypeId = 1 AND p2.AcceptedAnswerId IS NOT NULL) 
+        THEN 'Has Accepted Answers'
+        ELSE 'No Accepted Answers'
+    END AS AcceptedAnswerStatus,
+    (SELECT COUNT(*) 
+     FROM PostHistory ph2 
+     WHERE ph2.UserId = u.Id 
+     AND ph2.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15)) AS ModerationActivity,
+    (SELECT COUNT(DISTINCT ph2.PostId) 
+     FROM PostHistory ph2 
+     WHERE ph2.UserId = u.Id 
+     AND ph2.PostHistoryTypeId = 24) AS EditAppliedCount
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN Comments c ON u.Id = c.UserId
+LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+WHERE u.Reputation > 100
+GROUP BY u.Id, u.DisplayName, u.Reputation, u.AccountId, u.CreationDate
+HAVING COUNT(DISTINCT p.Id) > 0
+ORDER BY u.Reputation DESC
+OFFSET 0 ROWS FETCH NEXT 1000 ROWS ONLY;

@@ -1,0 +1,275 @@
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Location,
+        U.Views AS UserViews,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        MAX(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS HasGoldBadge,
+        AVG(CASE WHEN P.PostTypeId = 1 THEN P.Score END) AS AvgQuestionScore,
+        AVG(CASE WHEN P.PostTypeId = 2 THEN P.Score END) AS AvgAnswerScore
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    LEFT JOIN Badges AS B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Location, U.Views
+    HAVING COUNT(DISTINCT P.Id) > 5
+),
+PostHistoricalAnalysis AS (
+    SELECT
+        PH.PostId,
+        COUNT(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9) THEN 1 END) AS EditCount,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.CreationDate END) AS LastEditDate,
+        COUNT(DISTINCT PH.RevisionGUID) AS DistinctRevisions,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN 'Closed'
+                 WHEN PH.PostHistoryTypeId = 11 THEN 'Reopened'
+            END) AS LastStatusChangeType,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.CreationDate END) AS LastClosedDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 11 THEN PH.CreationDate END) AS LastReopenedDate,
+        (
+            SELECT Text
+            FROM PostHistory
+            WHERE PostId = PH.PostId AND PostHistoryTypeId = 2
+            ORDER BY CreationDate ASC
+            LIMIT 1
+        ) AS InitialBodyText
+    FROM PostHistory AS PH
+    GROUP BY PH.PostId
+),
+BasePostStats AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.Title,
+        P.Tags,
+        P.OwnerUserId,
+        P.AcceptedAnswerId,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.ClosedDate,
+        COALESCE(P.OwnerDisplayName, U.DisplayName) AS PostOwnerDisplayName,
+        COUNT(DISTINCT C.Id) AS ActualCommentCount,
+        AVG(C.Score) AS AvgCommentScore,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+        MAX(CASE WHEN EXISTS (SELECT 1 FROM PostLinks PL WHERE PL.PostId = P.Id AND PL.LinkTypeId = 3) THEN 1 ELSE 0 END) AS IsDuplicateSource,
+        MAX(CASE WHEN EXISTS (SELECT 1 FROM PostLinks PL WHERE PL.RelatedPostId = P.Id AND PL.LinkTypeId = 3) THEN 1 ELSE 0 END) AS IsDuplicateTarget
+    FROM Posts AS P
+    LEFT JOIN Users AS U ON P.OwnerUserId = U.Id
+    LEFT JOIN Comments AS C ON P.Id = C.PostId
+    LEFT JOIN Votes AS V ON P.Id = V.PostId
+    WHERE P.PostTypeId = 1
+    GROUP BY P.Id, P.PostTypeId, P.CreationDate, P.Score, P.ViewCount, P.Title, P.Tags, P.OwnerUserId, P.AcceptedAnswerId, P.AnswerCount, P.CommentCount, P.FavoriteCount, P.ClosedDate, U.DisplayName, P.OwnerDisplayName
+),
+HighlyEngagedPosts AS (
+    SELECT
+        BP.PostId,
+        BP.PostTypeId,
+        BP.PostCreationDate,
+        BP.PostScore,
+        BP.ViewCount,
+        BP.Title,
+        BP.Tags,
+        BP.OwnerUserId,
+        UAS.DisplayName AS OwnerDisplayName,
+        UAS.Reputation AS OwnerReputation,
+        UAS.Location AS OwnerLocation,
+        UAS.HasGoldBadge AS OwnerHasGoldBadge,
+        BP.AcceptedAnswerId,
+        BP.AnswerCount,
+        BP.ActualCommentCount,
+        BP.AvgCommentScore,
+        BP.FavoriteCount,
+        PHA.EditCount,
+        PHA.LastEditDate,
+        PHA.LastStatusChangeType,
+        PHA.InitialBodyText,
+        BP.UpVoteCount,
+        BP.DownVoteCount,
+        BP.IsDuplicateSource,
+        BP.IsDuplicateTarget,
+        (BP.PostScore * 1.0 / NULLIF(BP.ViewCount, 0)) AS ScorePerViewRatio,
+        (BP.ActualCommentCount * 1.0 / NULLIF(BP.AnswerCount, 0)) AS CommentsPerAnswerRatio,
+        'HighlyEngaged' AS PostCategory,
+        CASE
+            WHEN PHA.LastClosedDate IS NOT NULL AND PHA.LastReopenedDate IS NOT NULL AND PHA.LastReopenedDate > PHA.LastClosedDate THEN TRUE
+            ELSE FALSE
+        END AS WasClosedThenReopened,
+        (
+            SELECT C2.Text
+            FROM Comments AS C2
+            WHERE C2.PostId = BP.PostId
+            AND C2.Score >= (SELECT AVG(C3.Score) FROM Comments C3 WHERE C3.PostId = BP.PostId AND C3.Score IS NOT NULL)
+            ORDER BY C2.CreationDate DESC
+            LIMIT 1
+        ) AS LatestHighlyRatedCommentText
+    FROM BasePostStats AS BP
+    LEFT JOIN UserActivitySummary AS UAS ON BP.OwnerUserId = UAS.UserId
+    LEFT JOIN PostHistoricalAnalysis AS PHA ON BP.PostId = PHA.PostId
+    WHERE BP.PostCreationDate BETWEEN CAST('2020-01-01' AS timestamp) AND CAST('2022-12-31' AS timestamp)
+      AND UAS.Reputation >= 5000
+      AND BP.ViewCount > 1000
+      AND BP.PostScore >= 10
+      AND (BP.Tags LIKE '%<sql>%' OR BP.Tags LIKE '%<postgresql>%')
+      AND NOT EXISTS (
+        SELECT 1 FROM PostLinks PL WHERE PL.RelatedPostId = BP.PostId AND PL.LinkTypeId = 3
+      )
+),
+ModeratelyEngagedPosts AS (
+    SELECT
+        BP.PostId,
+        BP.PostTypeId,
+        BP.PostCreationDate,
+        BP.PostScore,
+        BP.ViewCount,
+        BP.Title,
+        BP.Tags,
+        BP.OwnerUserId,
+        UAS.DisplayName AS OwnerDisplayName,
+        UAS.Reputation AS OwnerReputation,
+        UAS.Location AS OwnerLocation,
+        UAS.HasGoldBadge AS OwnerHasGoldBadge,
+        BP.AcceptedAnswerId,
+        BP.AnswerCount,
+        BP.ActualCommentCount,
+        BP.AvgCommentScore,
+        BP.FavoriteCount,
+        PHA.EditCount,
+        PHA.LastEditDate,
+        PHA.LastStatusChangeType,
+        PHA.InitialBodyText,
+        BP.UpVoteCount,
+        BP.DownVoteCount,
+        BP.IsDuplicateSource,
+        BP.IsDuplicateTarget,
+        (BP.PostScore * 1.0 / NULLIF(BP.ViewCount, 0)) AS ScorePerViewRatio,
+        (BP.ActualCommentCount * 1.0 / NULLIF(BP.AnswerCount, 0)) AS CommentsPerAnswerRatio,
+        'ModeratelyEngaged' AS PostCategory,
+        CASE
+            WHEN PHA.LastClosedDate IS NOT NULL AND PHA.LastReopenedDate IS NOT NULL AND PHA.LastReopenedDate > PHA.LastClosedDate THEN TRUE
+            ELSE FALSE
+        END AS WasClosedThenReopened,
+        (
+            SELECT C2.Text
+            FROM Comments AS C2
+            WHERE C2.PostId = BP.PostId
+            AND C2.Score >= (SELECT AVG(C3.Score) FROM Comments C3 WHERE C3.PostId = BP.PostId AND C3.Score IS NOT NULL)
+            ORDER BY C2.CreationDate DESC
+            LIMIT 1
+        ) AS LatestHighlyRatedCommentText
+    FROM BasePostStats AS BP
+    LEFT JOIN UserActivitySummary AS UAS ON BP.OwnerUserId = UAS.UserId
+    LEFT JOIN PostHistoricalAnalysis AS PHA ON BP.PostId = PHA.PostId
+    WHERE BP.PostCreationDate BETWEEN CAST('2021-01-01' AS timestamp) AND CAST('2023-12-31' AS timestamp)
+      AND UAS.Reputation BETWEEN 1000 AND 4999
+      AND BP.ViewCount BETWEEN 100 AND 999
+      AND BP.PostScore BETWEEN 2 AND 9
+      AND (BP.Tags LIKE '%<sql>%' OR BP.Tags LIKE '%<query>%')
+      AND (PHA.EditCount IS NULL OR PHA.EditCount < 5)
+      AND PHA.InitialBodyText IS NOT NULL AND LENGTH(PHA.InitialBodyText) > 100
+)
+SELECT
+    PostId,
+    PostTypeId,
+    PostCreationDate,
+    PostScore,
+    ViewCount,
+    Title,
+    Tags,
+    OwnerUserId,
+    OwnerDisplayName,
+    OwnerReputation,
+    OwnerLocation,
+    OwnerHasGoldBadge,
+    AcceptedAnswerId,
+    AnswerCount,
+    ActualCommentCount,
+    AvgCommentScore,
+    FavoriteCount AS EffectiveFavoriteCount,
+    EditCount,
+    LastEditDate,
+    LastStatusChangeType,
+    InitialBodyText,
+    UpVoteCount,
+    DownVoteCount,
+    IsDuplicateSource,
+    IsDuplicateTarget,
+    ScorePerViewRatio,
+    CommentsPerAnswerRatio,
+    PostCategory,
+    WasClosedThenReopened,
+    EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - PostCreationDate)) / 3600 AS HoursSinceCreation,
+    SUBSTRING(Title, 1, 50) AS TitleSnippet,
+    ARRAY_LENGTH(string_to_array(SUBSTRING(Tags, 2, LENGTH(Tags) - 2), '><'), 1) AS TagCount,
+    RANK() OVER (PARTITION BY OwnerLocation ORDER BY ScorePerViewRatio DESC, PostCreationDate DESC) AS RankWithinLocationByEngagement,
+    NTILE(5) OVER (ORDER BY OwnerReputation DESC, PostScore DESC) AS UserPostReputationTier,
+    LAG(PostCreationDate, 1, CAST('1970-01-01' AS timestamp)) OVER (PARTITION BY OwnerUserId ORDER BY PostCreationDate) AS PreviousPostDateByOwner,
+    LatestHighlyRatedCommentText,
+    CASE
+        WHEN PostScore >= 20 AND ViewCount >= 5000 AND ActualCommentCount >= 15 THEN 'Viral'
+        WHEN PostScore >= 5 AND AnswerCount >= 3 THEN 'AnsweredWell'
+        WHEN WasClosedThenReopened THEN 'Resurrected'
+        ELSE 'Standard'
+    END AS PostLifeCycleStatus
+FROM HighlyEngagedPosts
+UNION ALL
+SELECT
+    PostId,
+    PostTypeId,
+    PostCreationDate,
+    PostScore,
+    ViewCount,
+    Title,
+    Tags,
+    OwnerUserId,
+    OwnerDisplayName,
+    OwnerReputation,
+    OwnerLocation,
+    OwnerHasGoldBadge,
+    AcceptedAnswerId,
+    AnswerCount,
+    ActualCommentCount,
+    AvgCommentScore,
+    FavoriteCount AS EffectiveFavoriteCount,
+    EditCount,
+    LastEditDate,
+    LastStatusChangeType,
+    InitialBodyText,
+    UpVoteCount,
+    DownVoteCount,
+    IsDuplicateSource,
+    IsDuplicateTarget,
+    ScorePerViewRatio,
+    CommentsPerAnswerRatio,
+    PostCategory,
+    WasClosedThenReopened,
+    EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - PostCreationDate)) / 3600 AS HoursSinceCreation,
+    SUBSTRING(Title, 1, 50) AS TitleSnippet,
+    ARRAY_LENGTH(string_to_array(SUBSTRING(Tags, 2, LENGTH(Tags) - 2), '><'), 1) AS TagCount,
+    RANK() OVER (PARTITION BY OwnerLocation ORDER BY ScorePerViewRatio DESC, PostCreationDate DESC) AS RankWithinLocationByEngagement,
+    NTILE(5) OVER (ORDER BY OwnerReputation DESC, PostScore DESC) AS UserPostReputationTier,
+    LAG(PostCreationDate, 1, CAST('1970-01-01' AS timestamp)) OVER (PARTITION BY OwnerUserId ORDER BY PostCreationDate) AS PreviousPostDateByOwner,
+    LatestHighlyRatedCommentText,
+    CASE
+        WHEN PostScore >= 20 AND ViewCount >= 5000 AND ActualCommentCount >= 15 THEN 'Viral'
+        WHEN PostScore >= 5 AND AnswerCount >= 3 THEN 'AnsweredWell'
+        WHEN WasClosedThenReopened THEN 'Resurrected'
+        ELSE 'Standard'
+    END AS PostLifeCycleStatus
+FROM ModeratelyEngagedPosts
+ORDER BY
+    OwnerReputation DESC,
+    ScorePerViewRatio DESC,
+    PostCreationDate DESC
+LIMIT 2000;

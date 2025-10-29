@@ -1,0 +1,98 @@
+-- {"query": "3163.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1882} 
+
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1)          AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2)          AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3)          AS BronzeBadges,
+        COALESCE(SUM(p.Score), 0)                       AS TotalQuestionScore,
+        AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL) AS AvgQuestionScore,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1)      AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2)      AS AnswerCount,
+        MAX(p.CreationDate)                             AS LastPostDate
+    FROM Users u
+    LEFT JOIN Badges b   ON b.UserId = u.Id
+    LEFT JOIN Posts  p   ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+    GROUP BY u.Id, u.DisplayName
+),
+
+TagUsage AS (
+    SELECT 
+        t.TagName,
+        COUNT(*)                                            AS TagPostCount,
+        SUM(CASE WHEN p.Score > 0 THEN 1 ELSE 0 END)       AS PositiveScorePosts,
+        STRING_AGG(DISTINCT u.DisplayName, ', ') 
+            FILTER (WHERE u.Id IS NOT NULL)                AS TopContributors
+    FROM Posts p
+    JOIN LATERAL regexp_split_to_table(p.Tags, '><') AS tag_raw ON TRUE
+    JOIN Tags t ON t.TagName = tag_raw
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1
+    GROUP BY t.TagName
+    HAVING COUNT(*) > 100
+),
+
+RankedUsers AS (
+    SELECT 
+        us.*,
+        RANK() OVER (ORDER BY us.GoldBadges DESC, us.TotalQuestionScore DESC) AS GoldScoreRank,
+        ROW_NUMBER() OVER (PARTITION BY (us.TotalQuestionScore > 0) ORDER BY us.AnswerCount DESC) AS AnswerCountRow
+    FROM UserStats us
+)
+
+SELECT
+    ru.Id,
+    ru.DisplayName,
+    ru.GoldBadges,
+    ru.SilverBadges,
+    ru.BronzeBadges,
+    ru.QuestionCount,
+    ru.AnswerCount,
+    ru.AvgQuestionScore,
+    ru.TotalQuestionScore,
+    ru.GoldScoreRank,
+    ru.AnswerCountRow,
+    COALESCE(tu.TagName, 'NoTag')                 AS TopTag,
+    tu.TagPostCount,
+    tu.PositiveScorePosts,
+    tu.TopContributors,
+    (SELECT COUNT(*) 
+       FROM PostLinks pl 
+      WHERE pl.PostId = ru.Id AND pl.LinkTypeId = 3) AS DuplicateCount
+FROM RankedUsers ru
+LEFT JOIN LATERAL (
+    SELECT 
+        tu.TagName,
+        tu.TagPostCount,
+        tu.PositiveScorePosts,
+        tu.TopContributors
+    FROM TagUsage tu
+    ORDER BY tu.PositiveScorePosts DESC, tu.TagPostCount DESC
+    LIMIT 1
+) tu ON TRUE
+WHERE ru.GoldScoreRank <= 10
+  AND (ru.TotalQuestionScore IS NOT NULL OR ru.AnswerCount > 0)
+
+UNION ALL
+
+SELECT
+    NULL                                 AS Id,
+    '--- Summary ---'                    AS DisplayName,
+    NULL                                 AS GoldBadges,
+    NULL                                 AS SilverBadges,
+    NULL                                 AS BronzeBadges,
+    SUM(QuestionCount)                   AS QuestionCount,
+    SUM(AnswerCount)                     AS AnswerCount,
+    AVG(AvgQuestionScore)                AS AvgQuestionScore,
+    SUM(TotalQuestionScore)              AS TotalQuestionScore,
+    NULL                                 AS GoldScoreRank,
+    NULL                                 AS AnswerCountRow,
+    NULL                                 AS TopTag,
+    NULL                                 AS TagPostCount,
+    NULL                                 AS PositiveScorePosts,
+    NULL                                 AS TopContributors,
+    NULL                                 AS DuplicateCount
+FROM RankedUsers
+ORDER BY GoldScoreRank NULLS LAST, Id;

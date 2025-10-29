@@ -1,0 +1,37 @@
+r.net_hot_hits,
+    r.avg_q_views,
+    r.top_tag_name,
+    r.top_tag_uses,
+    r.top_tag_global_count,
+    cs.users_in_cohort,
+    cs.avg_contrib_score as cohort_avg_contrib,
+    cs.p50_contrib_score as cohort_p50_contrib,
+    cs.p90_contrib_score as cohort_p90_contrib,
+    rq.avg_q_score_1y,
+    rq.avg_q_views_1y,
+    rq.q_count_1y,
+    r.is_recently_active,
+    r.bounty_total,
+    r.dup_signals,
+    case
+        when r.reputation >= 10000 then 'legend'
+        when r.reputation >= 3000 then 'expert'
+        when r.reputation >= 1000 then 'intermediate'
+        when r.reputation is not null then 'novice'
+        else 'unknown'
+    end as reputation_band,
+    case
+        when coalesce(r.avg_post_score,0) > 5 and coalesce(r.answer_accept_rate,0) > 0.2 then 'high_quality'
+        when coalesce(r.avg_post_score,0) < 0 and coalesce(r.q_close_rate,0) > 0.3 then 'needs_attention'
+        else 'normal'
+    end as quality_segment
+from ranked r
+left join cohort_stats cs on cs.cohort_month = r.cohort_month
+left join recent_question_quality rq on rq.user_id = r.user_id
+where
+    (r.total_contrib_score is not null or r.weighted_badges > 0 or r.reputation > 0)
+    and (r.top_tag_name is null or lower(r.top_tag_name) not like '%test%')
+    and coalesce(r.downvotes_cast,0) <= coalesce(r.upvotes_cast,0) * 2
+order by
+    r.global_rank
+limit 500;

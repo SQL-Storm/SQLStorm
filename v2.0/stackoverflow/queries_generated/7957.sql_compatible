@@ -1,0 +1,334 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.ViewCount,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        COUNT(DISTINCT c.Id) AS Comments,
+        COUNT(DISTINCT b.Id) AS Badges,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        CAST(('2024-10-01 12:34:56') AS timestamp) - u.CreationDate AS AccountAgeInterval,
+        EXTRACT(DAY FROM CAST(('2024-10-01 12:34:56') AS timestamp) - u.CreationDate) AS AccountAgeDays,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Elite'
+            WHEN u.Reputation >= 1000 THEN 'Veteran'
+            WHEN u.Reputation >= 100 THEN 'Regular'
+            ELSE 'Newbie'
+        END AS ReputationTier,
+        COALESCE(SUBSTRING(u.AboutMe FROM 1 FOR 100), 'No bio available') AS ShortBio
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.ViewCount, u.UpVotes, u.DownVotes, u.AboutMe, u.CreationDate
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.ParentId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END AS PostType,
+        CASE 
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Yes'
+            ELSE 'No'
+        END AS HasAcceptedAnswer,
+        COALESCE(p.Tags, 'No tags') AS Tags,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevScore,
+        LEAD(p.CreationDate, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextPostDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS ScoreRank,
+        RANK() OVER (ORDER BY p.Score DESC) AS GlobalScoreRank,
+        DENSE_RANK() OVER (ORDER BY p.CreationDate) AS PostChronologicalRank
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) AND p.CreationDate >= DATE '2020-01-01'
+),
+PostTagAnalysis AS (
+    SELECT 
+        pa.PostId,
+        pa.OwnerUserId,
+        pa.Title,
+        pa.Score,
+        pa.Tags,
+        -- Split tags: generic approach using regexp_split_to_table for Postgres-compatible; if not supported, replace accordingly in target dialect
+        regexp_split_to_array(replace(replace(pa.Tags, '<', ''), '>', ''), ' ') AS TagArray,
+        CASE 
+            WHEN pa.Tags LIKE '%<sql>%' THEN 'SQL'
+            WHEN pa.Tags LIKE '%<python>%' THEN 'Python'
+            WHEN pa.Tags LIKE '%<javascript>%' THEN 'JavaScript'
+            ELSE 'Other'
+        END AS PrimaryTagCategory
+    FROM PostAnalysis pa
+),
+UserActivityMatrix AS (
+    SELECT 
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.TotalPosts,
+        us.Questions,
+        us.Answers,
+        us.Comments,
+        us.Badges,
+        us.AvgPostScore,
+        us.AccountAgeDays,
+        us.ReputationTier,
+        us.ShortBio,
+        CASE 
+            WHEN us.TotalPosts > 100 AND us.AvgPostScore > 50 THEN 'Highly Active'
+            WHEN us.TotalPosts > 50 AND us.AvgPostScore > 25 THEN 'Moderately Active'
+            WHEN us.TotalPosts > 10 THEN 'Lightly Active'
+            ELSE 'Inactive'
+        END AS ActivityLevel,
+        CASE 
+            WHEN us.Reputation BETWEEN 1 AND 99 THEN 'Beginner'
+            WHEN us.Reputation BETWEEN 100 AND 999 THEN 'Intermediate'
+            WHEN us.Reputation BETWEEN 1000 AND 9999 THEN 'Advanced'
+            WHEN us.Reputation >= 10000 THEN 'Expert'
+            ELSE 'N/A'
+        END AS SkillLevel,
+        DENSE_RANK() OVER (ORDER BY us.Reputation DESC) AS ReputationRank,
+        PERCENT_RANK() OVER (ORDER BY us.Reputation) AS ReputationPercentile
+    FROM UserStats us
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        pa.PostId,
+        pa.OwnerUserId,
+        pa.Title,
+        pa.Score,
+        pa.ViewCount,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.CreationDate,
+        pa.PostType,
+        pa.HasAcceptedAnswer,
+        CASE 
+            WHEN pa.Score < 0 THEN 'Negative'
+            WHEN pa.Score BETWEEN 0 AND 10 THEN 'Low'
+            WHEN pa.Score BETWEEN 11 AND 50 THEN 'Medium'
+            WHEN pa.Score BETWEEN 51 AND 100 THEN 'High'
+            ELSE 'Very High'
+        END AS ScoreCategory,
+        CASE 
+            WHEN pa.AnswerCount > 10 THEN 'Highly Answered'
+            WHEN pa.AnswerCount BETWEEN 5 AND 10 THEN 'Moderately Answered'
+            ELSE 'Low Answered'
+        END AS AnswerLevel,
+        COALESCE(pa.ParentId, 0) AS ParentId,
+        pa.ScoreRank,
+        pa.GlobalScoreRank,
+        pa.PostChronologicalRank,
+        EXTRACT(DAY FROM (CAST(('2024-10-01 12:34:56') AS timestamp) - pa.CreationDate)) AS DaysSincePost,
+        EXTRACT(DAY FROM ( 
+            SELECT MIN(ph.CreationDate) 
+            FROM PostHistory ph 
+            WHERE ph.PostId = pa.PostId AND ph.PostHistoryTypeId IN (10, 11, 12)
+        ) - pa.CreationDate) AS DaysToFirstAction,
+        EXISTS (
+            SELECT 1 
+            FROM PostLinks pl 
+            WHERE pl.PostId = pa.PostId AND pl.LinkTypeId = 3
+        ) AS IsDuplicate
+    FROM PostAnalysis pa
+),
+TagDistribution AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 100 THEN 'Popular'
+            WHEN t.Count > 50 THEN 'Moderate'
+            WHEN t.Count > 10 THEN 'Common'
+            ELSE 'Rare'
+        END AS PopularityLevel
+    FROM Tags t
+    WHERE t.Count > 0
+),
+CombinedAnalysis AS (
+    SELECT 
+        uam.UserId,
+        uam.DisplayName,
+        uam.Reputation,
+        uam.TotalPosts,
+        uam.Questions,
+        uam.Answers,
+        uam.Comments,
+        uam.Badges,
+        uam.AvgPostScore,
+        uam.AccountAgeDays,
+        uam.ReputationTier,
+        uam.ActivityLevel,
+        uam.SkillLevel,
+        uam.ReputationRank,
+        uam.ReputationPercentile,
+        cpa.PostId,
+        cpa.Title,
+        cpa.Score,
+        cpa.ViewCount,
+        cpa.AnswerCount,
+        cpa.CommentCount,
+        cpa.CreationDate,
+        cpa.PostType,
+        cpa.HasAcceptedAnswer,
+        cpa.ScoreCategory,
+        cpa.AnswerLevel,
+        cpa.DaysSincePost,
+        cpa.IsDuplicate,
+        pta.TagArray,
+        pta.PrimaryTagCategory,
+        CASE 
+            WHEN uam.ReputationRank <= 10 THEN 'Top 10'
+            WHEN uam.ReputationRank <= 50 THEN 'Top 50'
+            WHEN uam.ReputationRank <= 100 THEN 'Top 100'
+            ELSE 'Others'
+        END AS ReputationBracket,
+        COALESCE(MAX(cpa.Score) OVER (PARTITION BY uam.UserId), 0) AS MaxScorePerUser,
+        COALESCE(AVG(cpa.Score) OVER (PARTITION BY uam.UserId), 0) AS AvgScorePerUser,
+        COALESCE(COUNT(cpa.PostId) OVER (PARTITION BY uam.UserId), 0) AS PostCountPerUser,
+        (COALESCE(uam.ShortBio, '') || ' UserID: ' || uam.UserId::text) AS BioSummary
+    FROM UserActivityMatrix uam
+    INNER JOIN ComplexPostAnalysis cpa ON uam.UserId = cpa.OwnerUserId
+    INNER JOIN PostTagAnalysis pta ON cpa.PostId = pta.PostId
+    WHERE cpa.Score > 0 AND uam.Reputation > 100
+),
+FinalResultSet AS (
+    SELECT 
+        ca.UserId,
+        ca.DisplayName,
+        ca.Reputation,
+        ca.TotalPosts,
+        ca.Questions,
+        ca.Answers,
+        ca.Comments,
+        ca.Badges,
+        ca.AvgPostScore,
+        ca.AccountAgeDays,
+        ca.ReputationTier,
+        ca.ActivityLevel,
+        ca.SkillLevel,
+        ca.ReputationRank,
+        ca.ReputationPercentile,
+        ca.PostId,
+        ca.Title,
+        ca.Score,
+        ca.ViewCount,
+        ca.AnswerCount,
+        ca.CommentCount,
+        ca.CreationDate,
+        ca.PostType,
+        ca.HasAcceptedAnswer,
+        ca.ScoreCategory,
+        ca.AnswerLevel,
+        ca.DaysSincePost,
+        ca.IsDuplicate,
+        ca.TagArray,
+        ca.PrimaryTagCategory,
+        ca.ReputationBracket,
+        ca.MaxScorePerUser,
+        ca.AvgScorePerUser,
+        ca.PostCountPerUser,
+        ca.BioSummary,
+        ROW_NUMBER() OVER (PARTITION BY ca.UserId ORDER BY ca.Score DESC) AS UserTopPostRank,
+        RANK() OVER (ORDER BY ca.Score DESC) AS GlobalPostRank,
+        DENSE_RANK() OVER (ORDER BY ca.Reputation DESC, ca.Score DESC) AS CombinedRank,
+        CASE 
+            WHEN ca.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) * 1.5 THEN 'Exceptional'
+            WHEN ca.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'Above Average'
+            WHEN ca.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) * 0.5 THEN 'Below Average'
+            ELSE 'Poor'
+        END AS PerformanceLevel,
+        CASE 
+            WHEN ca.ReputationTier = 'Elite' AND ca.Score > 1000 THEN 'Elite Performer'
+            WHEN ca.ReputationTier = 'Veteran' AND ca.Score > 500 THEN 'Veteran Performer'
+            WHEN ca.ActivityLevel = 'Highly Active' AND ca.Score > 200 THEN 'Active Performer'
+            ELSE 'Regular User'
+        END AS UserClassification,
+        ABS(ca.Score - COALESCE((SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1), 0)) AS ScoreDeviation
+    FROM CombinedAnalysis ca
+)
+SELECT 
+    frs.UserId,
+    frs.DisplayName,
+    frs.Reputation,
+    frs.TotalPosts,
+    frs.Questions,
+    frs.Answers,
+    frs.Comments,
+    frs.Badges,
+    frs.AvgPostScore,
+    frs.AccountAgeDays,
+    frs.ReputationTier,
+    frs.ActivityLevel,
+    frs.SkillLevel,
+    frs.ReputationRank,
+    frs.ReputationPercentile,
+    frs.PostId,
+    frs.Title,
+    frs.Score,
+    frs.ViewCount,
+    frs.AnswerCount,
+    frs.CommentCount,
+    frs.CreationDate,
+    frs.PostType,
+    frs.HasAcceptedAnswer,
+    frs.ScoreCategory,
+    frs.AnswerLevel,
+    frs.DaysSincePost,
+    frs.IsDuplicate,
+    frs.TagArray,
+    frs.PrimaryTagCategory,
+    frs.ReputationBracket,
+    frs.MaxScorePerUser,
+    frs.AvgScorePerUser,
+    frs.PostCountPerUser,
+    frs.BioSummary,
+    frs.UserTopPostRank,
+    frs.GlobalPostRank,
+    frs.CombinedRank,
+    frs.PerformanceLevel,
+    frs.UserClassification,
+    frs.ScoreDeviation
+FROM FinalResultSet frs
+WHERE frs.PostId IS NOT NULL
+  AND (
+    -- safe extraction: take first element of TagArray if array, cast to integer when possible
+    (CASE 
+        WHEN array_length(frs.TagArray, 1) >= 1 AND frs.TagArray[1] ~ '^[0-9]+$' 
+        THEN (frs.TagArray[1])::integer
+        ELSE NULL
+     END) BETWEEN 0 AND 1000
+  )
+  AND EXISTS (
+    SELECT 1 FROM Tags t 
+    WHERE t.TagName = CASE WHEN array_length(frs.TagArray,1) >= 1 THEN frs.TagArray[1] ELSE NULL END
+      AND t.Count > (SELECT AVG(Count) FROM Tags)
+  )
+  AND frs.UserId IN (
+    SELECT DISTINCT u.Id
+    FROM Users u
+    WHERE u.Reputation > 1000
+      AND u.CreationDate <= (CAST(('2024-10-01 12:34:56') AS timestamp) - INTERVAL '1 year')
+  )
+  AND frs.DaysSincePost BETWEEN 0 AND 365
+ORDER BY frs.Reputation DESC, frs.Score DESC
+OFFSET 0 ROWS FETCH NEXT 1000 ROWS ONLY;

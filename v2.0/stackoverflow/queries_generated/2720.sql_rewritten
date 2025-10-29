@@ -1,0 +1,140 @@
+-- {"query": "2720.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1190} 
+with RecursiveBadgeCounts as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        b.Class,
+        count(*) as BadgeCount
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    group by u.Id, u.DisplayName, b.Class
+
+    union all
+
+    select
+        rbc.UserId,
+        rbc.DisplayName,
+        rbc.Class,
+        rbc.BadgeCount + 1
+    from RecursiveBadgeCounts rbc
+    where rbc.BadgeCount < 100
+),
+UserPostStats as (
+    select
+        p.OwnerUserId as UserId,
+        count(case when p.PostTypeId = 1 then 1 end) as QuestionsAsked,
+        count(case when p.PostTypeId = 2 then 1 end) as AnswersGiven,
+        avg(p.Score) filter (where p.PostTypeId in (1, 2)) as AvgPostScore,
+        max(p.CreationDate) as LastPostDate
+    from Posts p
+    where p.OwnerUserId is not null
+    group by p.OwnerUserId
+),
+TopTags as (
+    select
+        unnest(string_to_array(trim(both '<>' from t.Tags), '><')) as Tag,
+        count(*) as TagCount
+    from Posts t
+    where t.PostTypeId = 1
+    group by Tag
+    having count(*) > 1000
+),
+UserTagActivity as (
+    select
+        ups.UserId,
+        tt.Tag,
+        count(*) as PostsWithTag
+    from UserPostStats ups
+    join Posts p on ups.UserId = p.OwnerUserId and p.PostTypeId = 1
+    join Lateral (
+        select unnest(string_to_array(trim(both '<>' from p.Tags), '><')) as Tag
+    ) as tt on true
+    group by ups.UserId, tt.Tag
+),
+RankedUserTags as (
+    select
+        uta.UserId,
+        uta.Tag,
+        uta.PostsWithTag,
+        row_number() over(partition by uta.UserId order by uta.PostsWithTag desc) as TagRank
+    from UserTagActivity uta
+),
+RecentQuestionsWithComments as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.CreationDate,
+        c.Id as CommentId,
+        c.Text as CommentText,
+        row_number() over(partition by q.Id order by c.Score desc nulls last, c.CreationDate desc) as CommentRank
+    from Posts q
+    left join Comments c on q.Id = c.PostId
+    where q.PostTypeId = 1
+      and q.CreationDate > cast('2024-10-01' as date) - interval '30 days'
+),
+PostLinkDuplicates as (
+    select
+        pl.PostId,
+        count(distinct pl.RelatedPostId) filter (where pl.LinkTypeId = 3) as DuplicateCount,
+        max(pl.CreationDate) as LastDuplicateLinkDate
+    from PostLinks pl
+    group by pl.PostId
+),
+UserActivitySummary as (
+    select
+        u.Id,
+        u.DisplayName,
+        COALESCE(ups.QuestionsAsked, 0) as QuestionsAsked,
+        COALESCE(ups.AnswersGiven, 0) as AnswersGiven,
+        COALESCE(ups.AvgPostScore, 0) as AvgPostScore,
+        COALESCE(rbc.BadgeCount, 0) as TotalBadges,
+        COALESCE(pld.DuplicateCount, 0) as TotalDuplicatesLinked,
+        u.Reputation,
+        u.CreationDate
+    from Users u
+    left join UserPostStats ups on ups.UserId = u.Id
+    left join (
+        select UserId, sum(BadgeCount) as BadgeCount
+        from RecursiveBadgeCounts
+        group by UserId
+    ) rbc on rbc.UserId = u.Id
+    left join (
+        select p.OwnerUserId, sum(coalesce(pl.DuplicateCount, 0)) as DuplicateCount
+        from Posts p
+        left join PostLinkDuplicates pl on p.Id = pl.PostId
+        where p.PostTypeId = 1
+        group by p.OwnerUserId
+    ) pld on pld.OwnerUserId = u.Id
+)
+select
+    uas.DisplayName,
+    uas.Reputation,
+    uas.QuestionsAsked,
+    uas.AnswersGiven,
+    uas.AvgPostScore,
+    uas.TotalBadges,
+    uas.TotalDuplicatesLinked,
+    t.Tag as TopUserTag,
+    tagRank.PostsWithTag as PostsWithTopTag,
+    rq.CommentText as MostPopularRecentComment,
+    rq.CommentRank as CommentRank,
+    case
+        when uas.Reputation > 100000 then 'Legendary'
+        when uas.Reputation between 50000 and 100000 then 'Expert'
+        when uas.Reputation < 10000 then 'Newbie'
+        else 'Intermediate'
+    end as ReputationCategory
+from UserActivitySummary uas
+left join RankedUserTags tagRank on uas.Id = tagRank.UserId and tagRank.TagRank = 1
+left join TopTags t on t.Tag = tagRank.Tag
+left join Lateral (
+    select CommentText, CommentRank from RecentQuestionsWithComments rq2
+    where rq2.OwnerUserId = uas.Id
+    order by rq2.CommentRank
+    limit 1
+) rq on true
+where uas.QuestionsAsked > 5
+  and (uas.AvgPostScore > 5 or uas.TotalBadges > 10)
+order by uas.Reputation desc, uas.TotalBadges desc, uas.AnswersGiven desc
+limit 100;

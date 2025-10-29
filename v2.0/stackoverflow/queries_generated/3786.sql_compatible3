@@ -1,0 +1,158 @@
+WITH
+user_stats AS (
+    SELECT u.Id,
+           u.DisplayName,
+           u.Reputation,
+           COALESCE(u.UpVotes,0) - COALESCE(u.DownVotes,0) AS net_votes,
+           (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS gold_badges,
+           (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS silver_badges,
+           (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS bronze_badges,
+           (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS q_cnt,
+           (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS a_cnt,
+           (SELECT COUNT(*) FROM PostHistory ph
+               WHERE ph.UserId = u.Id AND ph.PostHistoryTypeId = 10) AS closed_votes_cast
+    FROM   Users u
+    WHERE  u.Reputation > 0
+),
+
+tag_activity AS (
+    SELECT t.TagName,
+           COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS question_posts,
+           COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS answer_posts,
+           ROUND(AVG(CAST(p.Score AS NUMERIC)),2) AS avg_score,
+           STRING_AGG(DISTINCT u.DisplayName, ', ') FILTER (WHERE u.Reputation > 10000) AS top_contributors
+    FROM   Tags t
+    LEFT   JOIN Posts p
+           ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    LEFT   JOIN Users u
+           ON u.Id = p.OwnerUserId
+    GROUP  BY t.TagName
+    HAVING COUNT(*) > 10
+),
+
+user_rankings AS (
+    SELECT us.Id,
+           us.DisplayName,
+           us.Reputation,
+           us.net_votes,
+           us.gold_badges,
+           us.silver_badges,
+           us.bronze_badges,
+           us.q_cnt,
+           us.a_cnt,
+           ROW_NUMBER() OVER (ORDER BY us.Reputation DESC, us.net_votes DESC) AS rep_rank,
+           RANK() OVER (ORDER BY (us.gold_badges*3 + us.silver_badges*2 + us.bronze_badges) DESC) AS badge_rank
+    FROM   user_stats us
+),
+
+recent_votes AS (
+    SELECT v.PostId,
+           v.VoteTypeId,
+           vt.Name                                     AS vote_type,
+           v.CreationDate,
+           CASE WHEN v.UserId IS NULL THEN 'Anonymous' ELSE u.DisplayName END AS voter_name
+    FROM   Votes v
+    JOIN   VoteTypes vt ON vt.Id = v.VoteTypeId
+    LEFT   JOIN Users u   ON u.Id = v.UserId
+    WHERE  v.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '30' DAY)
+),
+
+agg_posts AS (
+    SELECT p.Id,
+           p.Title,
+           p.PostTypeId,
+           pt.Name                                 AS post_type,
+           COALESCE(p.Score,0)                     AS score,
+           p.ViewCount,
+           p.AnswerCount,
+           p.FavoriteCount,
+           p.CreationDate,
+           p.OwnerUserId,
+           u.DisplayName                          AS owner_name,
+           COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS up_votes,
+           COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS down_votes,
+           ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS score_rank_within_type
+    FROM   Posts p
+    JOIN   PostTypes pt ON pt.Id = p.PostTypeId
+    LEFT   JOIN Users u   ON u.Id = p.OwnerUserId
+    LEFT   JOIN Votes v   ON v.PostId = p.Id
+    GROUP  BY p.Id, p.Title, p.PostTypeId, pt.Name, COALESCE(p.Score,0), p.ViewCount, p.AnswerCount, p.FavoriteCount, p.CreationDate, p.OwnerUserId, u.DisplayName
+)
+
+SELECT
+    ur.Id,
+    ur.DisplayName,
+    ur.Reputation,
+    ur.net_votes,
+    ur.gold_badges,
+    ur.silver_badges,
+    ur.bronze_badges,
+    ur.q_cnt,
+    ur.a_cnt,
+    ur.rep_rank,
+    ur.badge_rank,
+    ta.TagName,
+    ta.question_posts,
+    ta.answer_posts,
+    ta.avg_score,
+    ta.top_contributors,
+    ap.Title,
+    ap.post_type,
+    ap.score,
+    ap.ViewCount,
+    ap.up_votes,
+    ap.down_votes,
+    ap.score_rank_within_type,
+    rv.vote_type,
+    rv.CreationDate   AS recent_vote_date,
+    rv.voter_name
+FROM   user_rankings ur
+LEFT   JOIN tag_activity ta
+       ON ta.TagName = (
+              SELECT t.TagName
+              FROM   Tags t
+              WHERE  LOWER(t.TagName) LIKE '%' || LOWER(ur.DisplayName) || '%'
+              LIMIT  1
+          )
+LEFT   JOIN agg_posts ap
+       ON ap.OwnerUserId = ur.Id
+      AND ap.score_rank_within_type <= 5
+LEFT   JOIN LATERAL (
+              SELECT rv2.PostId, rv2.VoteTypeId, rv2.vote_type, rv2.CreationDate, rv2.voter_name
+              FROM   recent_votes rv2
+              WHERE  rv2.PostId = ap.Id
+              ORDER  BY rv2.CreationDate DESC
+              LIMIT  1
+          ) rv ON TRUE
+WHERE  ur.rep_rank <= 100
+ORDER  BY ur.rep_rank ASC, ur.badge_rank ASC
+LIMIT  100
+
+UNION ALL
+
+SELECT CAST(NULL AS INTEGER) AS Id,
+       CAST(NULL AS TEXT)    AS DisplayName,
+       CAST(NULL AS INTEGER) AS Reputation,
+       CAST(NULL AS INTEGER) AS net_votes,
+       CAST(NULL AS INTEGER) AS gold_badges,
+       CAST(NULL AS INTEGER) AS silver_badges,
+       CAST(NULL AS INTEGER) AS bronze_badges,
+       CAST(NULL AS INTEGER) AS q_cnt,
+       CAST(NULL AS INTEGER) AS a_cnt,
+       CAST(NULL AS INTEGER) AS rep_rank,
+       CAST(NULL AS INTEGER) AS badge_rank,
+       CAST(NULL AS TEXT)    AS TagName,
+       CAST(NULL AS INTEGER) AS question_posts,
+       CAST(NULL AS INTEGER) AS answer_posts,
+       CAST(NULL AS NUMERIC) AS avg_score,
+       CAST(NULL AS TEXT)    AS top_contributors,
+       CAST(NULL AS TEXT)    AS Title,
+       CAST(NULL AS TEXT)    AS post_type,
+       CAST(NULL AS INTEGER) AS score,
+       CAST(NULL AS INTEGER) AS ViewCount,
+       CAST(NULL AS INTEGER) AS up_votes,
+       CAST(NULL AS INTEGER) AS down_votes,
+       CAST(NULL AS INTEGER) AS score_rank_within_type,
+       CAST(NULL AS TEXT)    AS vote_type,
+       CAST(NULL AS TIMESTAMP) AS recent_vote_date,
+       CAST(NULL AS TEXT)     AS voter_name;

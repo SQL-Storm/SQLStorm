@@ -1,0 +1,320 @@
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        u.location,
+        u.upvotes,
+        u.downvotes,
+        u.views,
+        date_trunc('month', u.creationdate) as cohort_month,
+        row_number() over (order by u.creationdate desc, u.id desc) as rn_newest
+    from users u
+    where u.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+),
+user_activity as (
+    select
+        p.owneruserid as user_id,
+        count(*) filter (where p.posttypeid = 1) as q_count,
+        count(*) filter (where p.posttypeid = 2) as a_count,
+        coalesce(sum(nullif(p.viewcount,0)),0) as total_views,
+        coalesce(sum(nullif(p.score,0)),0) as total_score,
+        max(p.lastactivitydate) as last_post_activity
+    from posts p
+    where p.owneruserid is not null
+      and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+    group by p.owneruserid
+),
+user_comments as (
+    select
+        c.userid as user_id,
+        count(*) as comment_count,
+        coalesce(sum(nullif(c.score,0)),0) as comment_score,
+        max(c.creationdate) as last_comment_date
+    from comments c
+    where c.userid is not null
+      and c.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+    group by c.userid
+),
+user_badges as (
+    select
+        b.userid as user_id,
+        count(*) as badge_count,
+        count(*) filter (where b.class = 1) as gold_badges,
+        count(*) filter (where b.class = 2) as silver_badges,
+        count(*) filter (where b.class = 3) as bronze_badges,
+        max(b.date) as last_badge_date
+    from badges b
+    where b.date >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+    group by b.userid
+),
+question_quality as (
+    select
+        p.owneruserid as user_id,
+        avg(p.score) filter (where p.posttypeid = 1) as avg_q_score,
+        avg(p.answercount) as avg_answers_per_q,
+        percentile_cont(0.9) within group (order by p.viewcount) as p90_q_views,
+        count(*) filter (where p.closeddate is not null) as closed_qs
+    from posts p
+    where p.posttypeid = 1
+      and p.owneruserid is not null
+      and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+    group by p.owneruserid
+),
+answer_accepts as (
+    select
+        a.owneruserid as user_id,
+        count(*) as answers_with_accepts,
+        sum(case when q.acceptedanswerid = a.id then 1 else 0 end) as accepted_answers,
+        avg(a.score) as avg_a_score
+    from posts a
+    join posts q on q.id = a.parentid and q.posttypeid = 1
+    where a.posttypeid = 2
+      and a.owneruserid is not null
+      and a.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+    group by a.owneruserid
+),
+linkage as (
+    select
+        p.owneruserid as user_id,
+        count(distinct pl.relatedpostid) filter (where pl.linktypeid = 1) as linked_out_count,
+        count(distinct pl.postid) filter (where pl.linktypeid = 3) as marked_duplicate_count
+    from postlinks pl
+    join posts p on p.id = pl.postid
+    where p.owneruserid is not null
+      and pl.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+    group by p.owneruserid
+),
+vote_summaries as (
+    select
+        v.userid as voter_id,
+        count(*) filter (where v.votetypeid = 2) as upvotes_cast,
+        count(*) filter (where v.votetypeid = 3) as downvotes_cast,
+        count(*) filter (where v.votetypeid = 8) as bounties_started,
+        count(*) filter (where v.votetypeid = 9) as bounties_awarded,
+        coalesce(sum(v.bountyamount) filter (where v.votetypeid in (8,9)),0) as bounty_amount_total,
+        max(v.creationdate) as last_vote_date
+    from votes v
+    where v.userid is not null
+      and v.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+    group by v.userid
+),
+tag_expertise as (
+    select
+        p.owneruserid as user_id,
+        unnest(string_to_array(substring(p.tags, 2, greatest(length(p.tags)-2,0)), '><')) as tagname
+    from posts p
+    where p.posttypeid = 1
+      and p.tags is not null
+      and p.owneruserid is not null
+      and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+),
+top_tags as (
+    select
+        tt.user_id,
+        string_agg(tt.tagname, ', ' order by tt.cnt desc, tt.tagname asc) as top3_tags
+    from (
+        select user_id, tagname, count(*) as cnt,
+               row_number() over (partition by user_id order by count(*) desc, tagname asc) as rn
+        from tag_expertise
+        group by user_id, tagname
+    ) tt
+    where tt.rn <= 3
+    group by tt.user_id
+),
+post_edit_events as (
+    select
+        ph.postid,
+        ph.userid,
+        sum(case when ph.posthistorytypeid in (4,5,6) then 1 else 0 end) as edit_count,
+        max(ph.creationdate) as last_edit_date
+    from posthistory ph
+    where ph.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+    group by ph.postid, ph.userid
+),
+user_edits as (
+    select
+        pe.userid as user_id,
+        sum(pe.edit_count) as total_edits,
+        max(pe.last_edit_date) as last_edit_date
+    from post_edit_events pe
+    where pe.userid is not null
+    group by pe.userid
+),
+question_close_reasons as (
+    select
+        p.owneruserid as user_id,
+        count(*) as close_events,
+        count(*) filter (
+            where coalesce(nullif(trim(ph.comment),''),'0') ~ '^[0-9]+$'
+              and cast(ph.comment as int) in (101,102,103,104,105)
+        ) as close_events_with_reason
+    from posthistory ph
+    join posts p on p.id = ph.postid and p.posttypeid = 1
+    where ph.posthistorytypeid = 10
+      and ph.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+      and p.owneruserid is not null
+    group by p.owneruserid
+),
+activity_calendar as (
+    select
+        u.id as user_id,
+        d as activity_date,
+        coalesce((
+            select count(*) from posts p
+            where p.owneruserid = u.id
+              and cast(p.creationdate as date) = d
+        ),0) +
+        coalesce((
+            select count(*) from comments c
+            where c.userid = u.id
+              and cast(c.creationdate as date) = d
+        ),0) as daily_events
+    from users u
+    join lateral (
+        select generate_series(cast(date_trunc('month', cast('2024-10-01 12:34:56' as timestamp)) as date) - interval '365 days',
+                               cast(date_trunc('day', cast('2024-10-01 12:34:56' as timestamp)) as date),
+                               interval '1 day') as d
+    ) gs on true
+),
+active_streaks as (
+    select user_id,
+           max(streak_len) as longest_streak_days
+    from (
+        select
+            ac.user_id,
+            ac.activity_date,
+            sum(case when ac.daily_events > 0 then 0 else 1 end) over (partition by ac.user_id order by ac.activity_date) as grp,
+            count(*) filter (where ac.daily_events > 0)
+                over (partition by ac.user_id,
+                                 sum(case when ac.daily_events > 0 then 0 else 1 end) over (partition by ac.user_id order by ac.activity_date)) as streak_len
+        from activity_calendar ac
+    ) s
+    where s.streak_len > 0
+    group by user_id
+),
+power_users as (
+    select
+        ru.user_id,
+        ru.displayname,
+        ru.reputation,
+        ru.cohort_month,
+        coalesce(ua.q_count,0) as q_count,
+        coalesce(ua.a_count,0) as a_count,
+        coalesce(ua.total_views,0) as total_views,
+        coalesce(ua.total_score,0) as total_score,
+        coalesce(uc.comment_count,0) as comment_count,
+        coalesce(uc.comment_score,0) as comment_score,
+        coalesce(ub.badge_count,0) as badge_count,
+        coalesce(ub.gold_badges,0) as gold_badges,
+        coalesce(ub.silver_badges,0) as silver_badges,
+        coalesce(ub.bronze_badges,0) as bronze_badges,
+        coalesce(qq.avg_q_score,0) as avg_q_score,
+        coalesce(qq.avg_answers_per_q,0) as avg_answers_per_q,
+        coalesce(qq.p90_q_views,0) as p90_q_views,
+        coalesce(qq.closed_qs,0) as closed_qs,
+        coalesce(aa.answers_with_accepts,0) as answers_with_accepts,
+        coalesce(aa.accepted_answers,0) as accepted_answers,
+        coalesce(aa.avg_a_score,0) as avg_a_score,
+        coalesce(lk.linked_out_count,0) as linked_out_count,
+        coalesce(lk.marked_duplicate_count,0) as marked_duplicate_count,
+        coalesce(vs.upvotes_cast,0) as upvotes_cast,
+        coalesce(vs.downvotes_cast,0) as downvotes_cast,
+        coalesce(vs.bounties_started,0) as bounties_started,
+        coalesce(vs.bounties_awarded,0) as bounties_awarded,
+        coalesce(vs.bounty_amount_total,0) as bounty_amount_total,
+        coalesce(ue.total_edits,0) as total_edits,
+        coalesce(qcr.close_events,0) as close_events,
+        coalesce(qcr.close_events_with_reason,0) as close_events_with_reason,
+        coalesce(ts.top3_tags, '(none)') as top3_tags,
+        coalesce(asq.longest_streak_days,0) as longest_streak_days,
+        ru.rn_newest
+    from recent_users ru
+    left join user_activity ua on ua.user_id = ru.user_id
+    left join user_comments uc on uc.user_id = ru.user_id
+    left join user_badges ub on ub.user_id = ru.user_id
+    left join question_quality qq on qq.user_id = ru.user_id
+    left join answer_accepts aa on aa.user_id = ru.user_id
+    left join linkage lk on lk.user_id = ru.user_id
+    left join vote_summaries vs on vs.voter_id = ru.user_id
+    left join user_edits ue on ue.user_id = ru.user_id
+    left join question_close_reasons qcr on qcr.user_id = ru.user_id
+    left join top_tags ts on ts.user_id = ru.user_id
+    left join active_streaks asq on asq.user_id = ru.user_id
+),
+cohort_stats as (
+    select
+        cohort_month,
+        count(*) as users_in_cohort,
+        avg(reputation) as avg_rep,
+        percentile_cont(0.5) within group (order by reputation) as p50_rep,
+        percentile_cont(0.9) within group (order by reputation) as p90_rep,
+        avg(total_score) as avg_total_score,
+        avg(a_count) as avg_answers,
+        avg(q_count) as avg_questions
+    from power_users
+    group by cohort_month
+),
+ranked_users as (
+    select
+        pu.*,
+        dense_rank() over (order by
+            (coalesce(accepted_answers,0) * 5
+             + coalesce(a_count,0) * 2
+             + coalesce(q_count,0)
+             + coalesce(total_score,0) * 0.1
+             + coalesce(bounty_amount_total,0) * 0.01
+             + coalesce(gold_badges,0) * 10
+             + coalesce(silver_badges,0) * 3
+             + coalesce(bronze_badges,0)) desc,
+            reputation desc,
+            user_id asc
+        ) as performance_rank
+    from power_users pu
+)
+select
+    ru.user_id,
+    ru.displayname,
+    ru.reputation,
+    ru.cohort_month,
+    ru.q_count,
+    ru.a_count,
+    ru.accepted_answers,
+    ru.answers_with_accepts,
+    ru.avg_a_score,
+    ru.avg_q_score,
+    ru.avg_answers_per_q,
+    ru.p90_q_views,
+    ru.total_views,
+    ru.total_score,
+    ru.comment_count,
+    ru.comment_score,
+    ru.badge_count,
+    ru.gold_badges,
+    ru.silver_badges,
+    ru.bronze_badges,
+    ru.total_edits,
+    ru.close_events,
+    ru.close_events_with_reason,
+    ru.linked_out_count,
+    ru.marked_duplicate_count,
+    ru.upvotes_cast,
+    ru.downvotes_cast,
+    ru.bounties_started,
+    ru.bounties_awarded,
+    ru.bounty_amount_total,
+    ru.longest_streak_days,
+    ru.top3_tags,
+    cs.users_in_cohort,
+    cs.avg_rep as cohort_avg_rep,
+    cs.p50_rep as cohort_p50_rep,
+    cs.p90_rep as cohort_p90_rep,
+    cs.avg_total_score as cohort_avg_total_score,
+    cs.avg_answers as cohort_avg_answers,
+    cs.avg_questions as cohort_avg_questions,
+    ru.performance_rank
+from ranked_users ru
+left join cohort_stats cs on cs.cohort_month = ru.cohort_month
+where ru.performance_rank <= 100
+order by ru.performance_rank, ru.user_id;

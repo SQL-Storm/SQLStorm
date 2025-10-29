@@ -1,0 +1,128 @@
+WITH UserStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(b.GoldCnt, 0)   AS GoldBadges,
+        COALESCE(b.SilverCnt, 0) AS SilverBadges,
+        COALESCE(b.BronzeCnt, 0) AS BronzeBadges,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS QuestionCount,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS AnswerCount,
+        (SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = u.Id) AS AvgPostScore,
+        (SELECT MAX(p.CreationDate) FROM Posts p WHERE p.OwnerUserId = u.Id) AS LastPostDate
+    FROM Users u
+    LEFT JOIN (
+        SELECT
+            UserId,
+            SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldCnt,
+            SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverCnt,
+            SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeCnt
+        FROM Badges
+        GROUP BY UserId
+    ) b ON b.UserId = u.Id
+),
+TaggedQuestions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        -- replace postgres regexp_split_to_table with a generic split: assume Tags like '<tag1><tag2>'
+        TRIM(BOTH '<>' FROM regexp_substr(p.Tags, '[^<>]+', 1, gs.seq)) AS Tag,
+        p.Score,
+        p.CreationDate,
+        p.OwnerUserId,
+        ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY ph.CreationDate DESC) AS rn
+    FROM Posts p
+    LEFT JOIN PostHistory ph
+        ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 3
+    -- generate sequence to split tags in a dialect-agnostic way:
+    JOIN (
+        SELECT 1 AS seq UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5
+        UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9 UNION ALL SELECT 10
+    ) gs ON regexp_substr(p.Tags, '[^<>]+', 1, gs.seq) IS NOT NULL
+    WHERE p.PostTypeId = 1
+),
+TagStats AS (
+    SELECT
+        t.TagName,
+        COUNT(DISTINCT tq.Id)                      AS QuestionCount,
+        AVG(tq.Score)                              AS AvgScore,
+        SUM(CASE WHEN tq.Score > 10 THEN 1 ELSE 0 END) AS HighScoreCount
+    FROM Tags t
+    JOIN TaggedQuestions tq ON tq.Tag = t.TagName
+    GROUP BY t.TagName
+),
+DuplicateLinks AS (
+    SELECT
+        pl.PostId,
+        SUM(CASE WHEN lt.Id = 3 THEN 1 ELSE 0 END) AS DuplicateCount,
+        -- use LISTAGG-like aggregate for portability; many DBs support STRING_AGG or LISTAGG. Use STRING_AGG with CAST to text.
+        STRING_AGG(CAST(pl.RelatedPostId AS VARCHAR), ',') AS Duplicates
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    GROUP BY pl.PostId
+),
+MainResults AS (
+SELECT
+    us.Id,
+    us.DisplayName,
+    us.Reputation,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    us.QuestionCount,
+    us.AnswerCount,
+    ROUND(CAST(us.AvgPostScore AS NUMERIC), 2)                       AS AvgPostScore,
+    COALESCE(dl.DuplicateCount, 0)                           AS DuplicateLinksSeen,
+    CASE
+        WHEN us.Reputation > 20000 THEN 'Legendary'
+        WHEN us.Reputation > 10000 THEN 'Expert'
+        WHEN us.Reputation > 5000  THEN 'Contributor'
+        ELSE 'Novice'
+    END                                                     AS ReputationTier,
+    -- STRING_AGG with DISTINCT is not supported everywhere; emulate by aggregating tag names per user via subquery
+    (SELECT STRING_AGG(DISTINCT ts2.TagName, ', ')
+     FROM TagStats ts2
+     WHERE ts2.TagName IS NOT NULL
+       AND ts2.TagName = ANY (regexp_split_to_array(us.DisplayName, '\s+'))
+    ) AS PopularTags,
+    ROW_NUMBER() OVER (ORDER BY us.Reputation DESC)        AS RankByReputation,
+    (SELECT COUNT(*) FROM Votes v
+        WHERE v.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = us.Id)
+          AND v.VoteTypeId = 2)                           AS TotalUpVotes,
+    (SELECT COUNT(*) FROM Votes v
+        WHERE v.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = us.Id)
+          AND v.VoteTypeId = 3)                           AS TotalDownVotes
+FROM UserStats us
+LEFT JOIN DuplicateLinks dl      ON dl.PostId = us.Id
+LEFT JOIN TagStats ts           ON ts.TagName = ANY (regexp_split_to_array(us.DisplayName, '\s+'))
+GROUP BY
+    us.Id, us.DisplayName, us.Reputation,
+    us.GoldBadges, us.SilverBadges, us.BronzeBadges,
+    us.QuestionCount, us.AnswerCount, us.AvgPostScore,
+    dl.DuplicateCount
+HAVING COUNT(*) FILTER (WHERE us.Reputation IS NOT NULL) > 0
+)
+SELECT *
+FROM MainResults
+ORDER BY Reputation DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    CAST(NULL AS BIGINT) AS Id,
+    'Aggregated Totals' AS DisplayName,
+    SUM(us.Reputation) AS Reputation,
+    SUM(us.GoldBadges) AS GoldBadges,
+    SUM(us.SilverBadges) AS SilverBadges,
+    SUM(us.BronzeBadges) AS BronzeBadges,
+    SUM(us.QuestionCount) AS QuestionCount,
+    SUM(us.AnswerCount) AS AnswerCount,
+    ROUND(AVG(CAST(us.AvgPostScore AS NUMERIC)), 2) AS AvgPostScore,
+    CAST(NULL AS INTEGER) AS DuplicateLinksSeen,
+    CAST(NULL AS VARCHAR) AS ReputationTier,
+    CAST(NULL AS VARCHAR) AS PopularTags,
+    CAST(NULL AS INTEGER) AS RankByReputation,
+    CAST(NULL AS INTEGER) AS TotalUpVotes,
+    CAST(NULL AS INTEGER) AS TotalDownVotes
+FROM UserStats us;

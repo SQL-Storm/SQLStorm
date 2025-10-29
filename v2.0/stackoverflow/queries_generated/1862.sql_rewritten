@@ -1,0 +1,207 @@
+-- {"query": "1862.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3565} 
+WITH UserActivitySummary AS (
+    -- CTE 1: Aggregates various activities for each user, including post counts, comment counts, and vote statistics.
+    -- This CTE uses LEFT JOINs to ensure all users are included, even those with no posts/comments/votes.
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate,
+        U.LastAccessDate,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesGiven, -- Upvotes cast by the user
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesGiven, -- Downvotes cast by the user
+        SUM(CASE WHEN PV.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesReceivedOnPosts, -- Upvotes received on user's posts
+        SUM(CASE WHEN PV.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesReceivedOnPosts, -- Downvotes received on user's posts
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS QuestionsAsked,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS AnswersProvided
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Votes V ON U.Id = V.UserId -- Votes cast by user
+    LEFT JOIN Votes PV ON P.Id = PV.PostId AND PV.VoteTypeId IN (2, 3) -- Votes on user's posts (filtered to up/down)
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate
+),
+QuestionPerformanceMetrics AS (
+    -- CTE 2: Evaluates performance metrics for each question, including duplicate links and ranks questions by score for each owner.
+    -- This allows selecting a "best" question per user later.
+    SELECT
+        Q.Id AS QuestionId,
+        Q.OwnerUserId,
+        Q.CreationDate AS QuestionCreationDate,
+        Q.Score AS QuestionScore,
+        Q.ViewCount,
+        COALESCE(Q.AnswerCount, 0) AS AnswerCount, -- NULL logic: default AnswerCount to 0 if NULL
+        TRIM(REPLACE(REPLACE(REPLACE(Q.Tags, '><', ' '), '<', ''), '>', '')) AS CleanedTags, -- String expression for cleaning tags
+        Q.FavoriteCount,
+        Q.ClosedDate,
+        Q.LastActivityDate,
+        (SELECT COUNT(DISTINCT PL.RelatedPostId) FROM PostLinks PL WHERE PL.PostId = Q.Id AND PL.LinkTypeId = 3) AS DuplicateCount, -- Correlated subquery for duplicate links
+        RANK() OVER (PARTITION BY Q.OwnerUserId ORDER BY Q.Score DESC, Q.CreationDate DESC) AS RankByScore -- Window function for ranking questions
+    FROM Posts Q
+    WHERE Q.PostTypeId = 1
+),
+PostEditAnalysisAggregated AS (
+    -- CTE 3: Analyzes post revision history, calculating total revisions, distinct editors, and identifying quick successive edits.
+    -- This CTE uses a subquery with LAG to identify rapid edits.
+    SELECT
+        PostId,
+        COUNT(Id) AS TotalRevisions,
+        COUNT(DISTINCT UserId) AS DistinctEditors,
+        MAX(CreationDate) AS LastEditDate,
+        MIN(CreationDate) AS FirstEditDate,
+        (MAX(CreationDate) - MIN(CreationDate)) AS TimeSpanOfEdits, -- Date/Time calculation
+        -- Check if any edit for this post was a quick successive one (within 1 hour of the previous)
+        MAX(CASE WHEN prev_edit_time IS NOT NULL AND EXTRACT(EPOCH FROM (CreationDate - prev_edit_time)) < 3600 THEN TRUE ELSE FALSE END) AS HasQuickSuccessiveEdit -- Complicated predicate and aggregation
+    FROM (
+        SELECT
+            PH.PostId,
+            PH.Id,
+            PH.UserId,
+            PH.CreationDate,
+            LAG(PH.CreationDate, 1, PH.CreationDate) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) AS prev_edit_time -- Window function for previous edit time
+        FROM PostHistory PH
+        WHERE PH.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+    ) AS EditHistoryWithLag
+    GROUP BY PostId
+    HAVING COUNT(Id) > 1 -- Only consider posts with multiple revisions
+),
+TopTagsByInfluence AS (
+    -- CTE 4: Ranks tags based on a composite score derived from average post score and view count.
+    SELECT
+        T.TagName,
+        AVG(P.Score) AS AveragePostScore,
+        AVG(P.ViewCount) AS AverageViewCount,
+        DENSE_RANK() OVER (ORDER BY AVG(P.Score) DESC, AVG(P.ViewCount) DESC) AS TagInfluenceRank -- Window function for ranking tags
+    FROM Tags T
+    JOIN Posts P ON P.Tags LIKE '%' || T.TagName || '%' -- String expression with LIKE for tag matching
+    WHERE P.PostTypeId = 1 AND P.Score IS NOT NULL AND P.ViewCount IS NOT NULL
+    GROUP BY T.TagName
+    HAVING COUNT(P.Id) > 50
+),
+UserCommentSentiment AS (
+    -- CTE 5: Analyzes comment text for simple sentiment indicators (positive/negative keywords) and averages comment scores.
+    SELECT
+        C.UserId,
+        SUM(CASE WHEN LOWER(C.Text) LIKE '%thank%' OR LOWER(C.Text) LIKE '%appreciat%' THEN 1 ELSE 0 END) AS PositiveCommentCount, -- String expression and conditional aggregation
+        SUM(CASE WHEN LOWER(C.Text) LIKE '%bug%' OR LOWER(C.Text) LIKE '%error%' OR LOWER(C.Text) LIKE '%issue%' THEN 1 ELSE 0 END) AS NegativeCommentCount,
+        AVG(C.Score) AS AvgUserCommentScore
+    FROM Comments C
+    WHERE C.UserId IS NOT NULL
+    GROUP BY C.UserId
+),
+SpecialUserTypes AS (
+    -- CTE 6: Uses UNION ALL (set operator) to categorize users based on different criteria like high reputation/questions, prolific answering, or community contributions.
+    SELECT
+        UAS.UserId,
+        'HighRep_ManyQs' AS UserTypeCategory
+    FROM UserActivitySummary UAS
+    WHERE UAS.Reputation >= 10000 AND UAS.QuestionsAsked >= 50
+    UNION ALL
+    SELECT
+        UAS.UserId,
+        'Prolific_Answerer' AS UserTypeCategory
+    FROM UserActivitySummary UAS
+    WHERE UAS.AnswersProvided >= 100 AND NULLIF(UAS.TotalUpvotesReceivedOnPosts, 0) > 3 * NULLIF(UAS.TotalDownvotesReceivedOnPosts, 0) -- NULL logic (NULLIF to prevent division by zero)
+    UNION ALL
+    SELECT
+        P.OwnerUserId AS UserId,
+        'Community_Contributor' AS UserTypeCategory
+    FROM Posts P
+    WHERE P.CommunityOwnedDate IS NOT NULL OR EXISTS (SELECT 1 FROM PostEditAnalysisAggregated PEA WHERE PEA.PostId = P.Id AND PEA.TotalRevisions > 10) -- Correlated subquery (EXISTS)
+    GROUP BY P.OwnerUserId
+)
+SELECT
+    U.Id AS UserId,
+    U.DisplayName,
+    U.Reputation,
+    U.CreationDate,
+    U.LastAccessDate,
+    UAS.TotalPostsOwned,
+    UAS.TotalCommentsMade,
+    UAS.TotalUpvotesGiven,
+    UAS.TotalDownvotesGiven,
+    UAS.TotalUpvotesReceivedOnPosts,
+    UAS.TotalDownvotesReceivedOnPosts,
+    UAS.QuestionsAsked,
+    UAS.AnswersProvided,
+    QP_Best.QuestionId AS BestQuestionId,
+    QP_Best.QuestionCreationDate AS BestQuestionCreationDate,
+    QP_Best.QuestionScore AS BestQuestionScore,
+    QP_Best.ViewCount AS BestQuestionViewCount,
+    QP_Best.AnswerCount AS BestQuestionAnswerCount,
+    QP_Best.CleanedTags AS BestQuestionTags,
+    QP_Best.FavoriteCount AS BestQuestionFavoriteCount,
+    QP_Best.ClosedDate AS BestQuestionClosedDate,
+    QP_Best.LastActivityDate AS BestQuestionLastActivityDate,
+    QP_Best.DuplicateCount AS BestQuestionDuplicateCount,
+    (SELECT AVG(SubP.Score) FROM Posts SubP WHERE SubP.OwnerUserId = U.Id AND SubP.PostTypeId = 1 AND SubP.Id <> QP_Best.QuestionId) AS AvgOwnerOtherQuestionScore, -- Correlated subquery for user's overall other question score
+    PEA_User.AvgPostRevisions AS UserAvgPostRevisions,
+    PEA_User.AvgDistinctEditors AS UserAvgDistinctEditors,
+    PEA_User.AvgTimeSpanOfEdits AS UserAvgTimeSpanOfEditsSeconds,
+    PEA_User.HasAnyQuickSuccessiveEdit AS UserHasAnyQuickSuccessiveEdit,
+    TT.TagName AS MostInfluentialTagOfBestQuestion,
+    TT.TagInfluenceRank,
+    UCS.PositiveCommentCount AS UserPositiveCommentCount,
+    UCS.NegativeCommentCount AS UserNegativeCommentCount,
+    UCS.AvgUserCommentScore,
+    SUT.UserTypeCategory,
+    (SELECT B.Name FROM Badges B WHERE B.UserId = U.Id AND B.Class = 1 ORDER BY B.Date DESC LIMIT 1) AS LatestGoldBadgeName, -- Correlated subquery for latest gold badge
+    (SELECT COALESCE(SUM(V.BountyAmount), 0) FROM Votes V WHERE V.UserId = U.Id AND V.VoteTypeId = 8) AS TotalBountyPostedByUser, -- Correlated subquery for total bounty posted
+    LAG(UAS.Reputation, 1, 0) OVER (PARTITION BY U.Id ORDER BY UAS.LastAccessDate) AS PreviousReputationByAccessDate, -- Window function: previous reputation based on access date
+    AVG(UAS.Reputation) OVER (ORDER BY UAS.CreationDate ROWS BETWEEN 99 PRECEDING AND CURRENT ROW) AS MovingAvgReputation99Users, -- Window function: moving average of reputation over user creation dates
+    (SELECT CR.Name FROM CloseReasonTypes CR WHERE CR.Id = CAST(SUBSTRING(PHC.Comment FROM 1 FOR 4) AS smallint) LIMIT 1) AS LatestQuestionCloseReason, -- Correlated subquery with string parsing and casting
+    CASE
+        WHEN UAS.Reputation >= 20000 AND UAS.QuestionsAsked > 100 THEN 'Legendary_User'
+        WHEN UAS.Reputation >= 5000 AND UAS.AnswersProvided > 50 THEN 'Expert_Contributor'
+        WHEN UAS.Reputation < 100 AND UAS.TotalPostsOwned = 0 THEN 'Newbie_Lurker'
+        WHEN U.DisplayName IS NULL OR LENGTH(U.DisplayName) < 5 THEN 'Anonymous_Or_Placeholder' -- NULL logic and string length expression
+        ELSE 'General_Participant'
+    END AS UserEngagementTier,
+    COALESCE(U.Location, 'Unknown Region') AS UserLocation, -- NULL logic (COALESCE for default value)
+    U.Views AS UserProfileViews,
+    U.AboutMe,
+    EXISTS (SELECT 1 FROM Posts A WHERE A.AcceptedAnswerId = QP_Best.QuestionId AND A.PostTypeId = 2 AND A.CreationDate > (U.LastAccessDate - INTERVAL '1 year')) AS HasRecentAcceptedAnswerForBestQuestion, -- Correlated subquery (EXISTS)
+    NOT EXISTS (SELECT 1 FROM Badges B WHERE B.UserId = U.Id AND B.Name = 'Critic' AND B.Date > (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '6 months')) AS NotCriticBadgeRecently -- Correlated subquery (NOT EXISTS)
+FROM Users U
+LEFT JOIN UserActivitySummary UAS ON U.Id = UAS.UserId
+LEFT JOIN QuestionPerformanceMetrics QP_Best ON U.Id = QP_Best.OwnerUserId AND QP_Best.RankByScore = 1 -- Join to the user's highest-scored question
+LEFT JOIN ( -- Subquery to aggregate PostEditAnalysisAggregated results per user
+    SELECT
+        P.OwnerUserId,
+        AVG(PEA.TotalRevisions) AS AvgPostRevisions,
+        AVG(PEA.DistinctEditors) AS AvgDistinctEditors,
+        AVG(EXTRACT(EPOCH FROM PEA.TimeSpanOfEdits)) AS AvgTimeSpanOfEdits,
+        MAX(PEA.HasQuickSuccessiveEdit) AS HasAnyQuickSuccessiveEdit
+    FROM Posts P
+    JOIN PostEditAnalysisAggregated PEA ON P.Id = PEA.PostId
+    WHERE P.PostTypeId = 1 -- Only consider question edits for this aggregation
+    GROUP BY P.OwnerUserId
+) AS PEA_User ON U.Id = PEA_User.OwnerUserId
+LEFT JOIN TopTagsByInfluence TT ON QP_Best.CleanedTags LIKE '%' || TT.TagName || '%' AND TT.TagInfluenceRank = 1 -- Join to the most influential tag of their best question
+LEFT JOIN UserCommentSentiment UCS ON U.Id = UCS.UserId
+LEFT JOIN SpecialUserTypes SUT ON U.Id = SUT.UserId
+LEFT JOIN PostHistory PHC ON QP_Best.QuestionId = PHC.PostId AND PHC.PostHistoryTypeId = 10 AND PHC.Comment IS NOT NULL -- For latest close reason of the best question
+WHERE
+    UAS.Reputation IS NOT NULL AND UAS.Reputation > 100 -- NULL logic and numerical comparison
+    AND UAS.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '5 years') -- Date filtering
+    AND (
+        (U.Location IS NOT NULL AND U.Location LIKE '%USA%') -- Complicated predicate (string search in location)
+        OR (U.WebsiteUrl IS NOT NULL AND U.WebsiteUrl LIKE '%stackexchange.com%') -- String expression
+        OR (U.AboutMe IS NOT NULL AND LOWER(U.AboutMe) LIKE '%developer%') -- String expression (lower and search in AboutMe)
+    )
+    AND (QP_Best.QuestionScore IS NULL OR QP_Best.QuestionScore > 10) -- Ensure questions have a minimum score or are absent
+    AND (QP_Best.ClosedDate IS NULL OR QP_Best.ClosedDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '2 years')) -- Only recently closed questions or open ones
+    AND (PEA_User.AvgPostRevisions IS NULL OR PEA_User.AvgPostRevisions < 50) -- Filter out excessively edited posts
+    AND (UCS.PositiveCommentCount IS NULL OR UCS.PositiveCommentCount > UCS.NegativeCommentCount) -- Comment sentiment comparison (NULL logic)
+    AND (
+        (SELECT COUNT(DISTINCT B.Id) FROM Badges B WHERE B.UserId = U.Id AND B.Class = 1) >= 2 -- Correlated subquery in WHERE
+        OR (U.UpVotes + U.DownVotes > 1000 AND U.Reputation > 5000) -- Complex numerical predicate
+    )
+ORDER BY
+    UAS.Reputation DESC,
+    UAS.TotalPostsOwned DESC,
+    QP_Best.QuestionScore DESC NULLS LAST, -- NULL logic in ORDER BY
+    TT.TagInfluenceRank ASC NULLS LAST
+LIMIT 10000;

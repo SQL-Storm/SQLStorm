@@ -1,0 +1,240 @@
+-- {"query": "1622.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3274} 
+WITH UserBaseMetrics AS (
+    -- Aggregates user-specific metrics including post, comment, and badge counts
+    SELECT
+        U.Id AS UserId,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate AS UserLastAccessDate,
+        U.DisplayName,
+        U.Views AS UserViews,
+        U.UpVotes AS UserUpVotes,
+        U.DownVotes AS UserDownVotes,
+        U.Location,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id ELSE NULL END) AS TotalQuestionsOwned,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id ELSE NULL END) AS TotalAnswersOwned,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT B.Id) AS TotalBadgesEarned,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    LEFT JOIN Badges AS B ON U.Id = B.UserId
+    GROUP BY
+        U.Id, U.Reputation, U.CreationDate, U.LastAccessDate, U.DisplayName,
+        U.Views, U.UpVotes, U.DownVotes, U.Location
+),
+PostEventLog AS (
+    -- Collects distinct significant post events from history using UNION ALL
+    SELECT
+        PostId,
+        CreationDate,
+        UserId,
+        PostHistoryTypeId,
+        'Edit' AS EventCategory
+    FROM PostHistory
+    WHERE PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+    UNION ALL
+    SELECT
+        PostId,
+        CreationDate,
+        UserId,
+        PostHistoryTypeId,
+        'Moderation' AS EventCategory
+    FROM PostHistory
+    WHERE PostHistoryTypeId IN (10, 11, 12, 13, 14, 15) -- Close, Reopen, Delete, Undelete, Lock, Unlock
+),
+ComplexPostHistoryStats AS (
+    -- Aggregates history events and identifies specific roles
+    SELECT
+        PEL.PostId,
+        COUNT(CASE WHEN PEL.EventCategory = 'Edit' THEN 1 ELSE NULL END) AS TotalEditEvents,
+        COUNT(CASE WHEN PEL.PostHistoryTypeId = 10 THEN 1 ELSE NULL END) AS CloseEventCount,
+        COUNT(CASE WHEN PEL.PostHistoryTypeId = 11 THEN 1 ELSE NULL END) AS ReopenEventCount,
+        MIN(CASE WHEN PEL.EventCategory = 'Edit' THEN PEL.CreationDate ELSE NULL END) AS FirstEditDate,
+        MAX(CASE WHEN PEL.EventCategory = 'Edit' THEN PEL.CreationDate ELSE NULL END) AS LatestEditDate,
+        -- Correlated subquery to find the display name of the first user to make a body edit
+        (SELECT U_sub.DisplayName
+         FROM Users AS U_sub
+         WHERE U_sub.Id = (
+            SELECT PH_inner.UserId
+            FROM PostHistory AS PH_inner
+            WHERE PH_inner.PostId = PEL.PostId AND PH_inner.PostHistoryTypeId = 5 -- Body Edit
+            ORDER BY PH_inner.CreationDate ASC
+            LIMIT 1
+         )
+        ) AS FirstBodyEditorDisplayName
+    FROM PostEventLog AS PEL
+    GROUP BY PEL.PostId
+),
+PostActivityDetails AS (
+    -- Gathers detailed activity and score metrics for questions
+    SELECT
+        Q.Id AS QuestionId,
+        Q.Title AS QuestionTitle,
+        Q.CreationDate AS QuestionCreationDate,
+        Q.Score AS QuestionScore,
+        Q.ViewCount AS QuestionViewCount,
+        Q.OwnerUserId AS QuestionOwnerUserId,
+        Q.AcceptedAnswerId,
+        Q.LastEditDate,
+        Q.LastActivityDate,
+        Q.CommentCount AS QuestionCommentCount,
+        Q.FavoriteCount AS QuestionFavoriteCount,
+        Q.Tags AS QuestionTags,
+        COUNT(DISTINCT A.Id) AS TotalAnswersGiven,
+        SUM(A.Score) AS SumAnswerScores,
+        AVG(A.Score) AS AvgAnswerScore,
+        -- Count distinct non-owner editors for the question
+        COUNT(DISTINCT CASE WHEN PH.UserId IS NOT NULL AND PH.UserId != Q.OwnerUserId THEN PH.UserId ELSE NULL END) AS DistinctEditorsCount,
+        MAX(PH.CreationDate) AS LastHistoryEventDate,
+        -- Boolean flag for accepted answer presence
+        CASE WHEN Q.AcceptedAnswerId IS NOT NULL THEN TRUE ELSE FALSE END AS HasAcceptedAnswer
+    FROM Posts AS Q
+    LEFT JOIN Posts AS A ON Q.Id = A.ParentId AND A.PostTypeId = 2 -- Answers to this question
+    LEFT JOIN PostHistory AS PH ON Q.Id = PH.PostId AND PH.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+    WHERE Q.PostTypeId = 1 -- Only questions
+    GROUP BY
+        Q.Id, Q.Title, Q.CreationDate, Q.Score, Q.ViewCount, Q.OwnerUserId,
+        Q.AcceptedAnswerId, Q.LastEditDate, Q.LastActivityDate, Q.CommentCount,
+        Q.FavoriteCount, Q.Tags
+),
+UserPerformanceRanks AS (
+    -- Ranks users based on reputation and engagement within their creation year
+    SELECT
+        UBM.UserId,
+        UBM.DisplayName,
+        UBM.Reputation,
+        UBM.UserCreationDate,
+        UBM.TotalQuestionsOwned,
+        UBM.TotalAnswersOwned,
+        UBM.GoldBadges,
+        ROW_NUMBER() OVER (PARTITION BY EXTRACT(YEAR FROM UBM.UserCreationDate) ORDER BY UBM.Reputation DESC, UBM.TotalPostsOwned DESC) AS RankInCreationYearByRep,
+        NTILE(5) OVER (ORDER BY UBM.Reputation DESC, UBM.TotalPostsOwned DESC) AS ReputationQuintile
+    FROM UserBaseMetrics AS UBM
+    WHERE UBM.TotalPostsOwned > 0 OR UBM.TotalCommentsMade > 0 OR UBM.TotalBadgesEarned > 0
+)
+SELECT
+    UPR.UserId,
+    UPR.DisplayName AS UserDisplayName,
+    UPR.Reputation,
+    UPR.RankInCreationYearByRep,
+    UPR.ReputationQuintile,
+    UPR.UserCreationDate,
+    UBM.TotalPostsOwned,
+    UBM.TotalQuestionsOwned,
+    UBM.TotalAnswersOwned,
+    UBM.TotalCommentsMade,
+    UBM.GoldBadges,
+    UBM.SilverBadges,
+    UBM.BronzeBadges,
+    PAD.QuestionId,
+    PAD.QuestionTitle,
+    PAD.QuestionScore,
+    PAD.QuestionViewCount,
+    PAD.QuestionCreationDate,
+    PAD.TotalAnswersGiven,
+    PAD.AvgAnswerScore,
+    PAD.DistinctEditorsCount AS QuestionDistinctEditors,
+    CPS.TotalEditEvents AS QuestionTotalEditEvents,
+    CPS.CloseEventCount AS QuestionCloseEventCount,
+    CPS.ReopenEventCount AS QuestionReopenEventCount,
+    CPS.FirstBodyEditorDisplayName,
+    AA_U.DisplayName AS AcceptedAnswerOwnerDisplayName,
+    AA_U.Reputation AS AcceptedAnswerOwnerReputation,
+
+    -- Complicated Calculation: Question Quality Score incorporating various metrics
+    (
+        CAST(PAD.QuestionScore AS DECIMAL) * 0.5 +
+        COALESCE(PAD.AvgAnswerScore, 0) * 0.3 +
+        CAST(PAD.QuestionViewCount AS DECIMAL) / 1000 * 0.1 +
+        CASE WHEN PAD.HasAcceptedAnswer THEN 10 ELSE 0 END +
+        COALESCE(PAD.QuestionFavoriteCount, 0) * 0.05
+    ) AS CalculatedQuestionQualityScore,
+
+    -- String Expression: Formatted Tags, handling potential NULLs
+    '<' || REPLACE(REPLACE(TRIM(SUBSTRING(COALESCE(PAD.QuestionTags, '') FROM 2 FOR LENGTH(COALESCE(PAD.QuestionTags, ''))-2)), '><', '> <'), '<', '') || '>' AS FormattedQuestionTags,
+
+    -- NULL Logic & CASE Statement: Categorizes user activity level
+    CASE
+        WHEN UBM.TotalPostsOwned + UBM.TotalCommentsMade > 50 AND UBM.Reputation > 1000 THEN 'Very High Activity'
+        WHEN UBM.TotalPostsOwned + UBM.TotalCommentsMade > 10 OR UBM.Reputation > 100 THEN 'Medium Activity'
+        WHEN UBM.TotalPostsOwned IS NULL AND UBM.TotalCommentsMade IS NULL AND UBM.TotalBadgesEarned = 0 THEN 'Inactive'
+        ELSE 'Low Activity'
+    END AS UserActivityLevel,
+
+    -- Correlated Subquery 1: Check if user has any badges named 'Enthusiast' or 'Fanatic'
+    (
+        SELECT COUNT(B2.Id)
+        FROM Badges AS B2
+        WHERE B2.UserId = UPR.UserId
+          AND B2.Name IN ('Enthusiast', 'Fanatic')
+    ) AS EnthusiastFanaticBadgesCount,
+
+    -- Correlated Subquery 2: For each user, check if they have edited a post owned by a user with very high reputation (>10000)
+    (
+        SELECT CASE WHEN COUNT(PH_sub.Id) > 0 THEN TRUE ELSE FALSE END
+        FROM PostHistory AS PH_sub
+        JOIN Posts AS P_sub ON PH_sub.PostId = P_sub.Id
+        JOIN Users AS U_sub ON P_sub.OwnerUserId = U_sub.Id
+        WHERE PH_sub.UserId = UPR.UserId -- The current user (UPR.UserId) is the editor
+          AND U_sub.Reputation > 10000 -- The post owner has very high reputation
+          AND PH_sub.PostHistoryTypeId IN (4, 5, 6) -- An actual edit
+          AND P_sub.OwnerUserId IS NOT NULL -- Ensure there's an owner
+    ) AS HasEditedHighRepUserPost,
+
+    -- Window Function: Ranks users within their reputation quintile based on a composite score
+    RANK() OVER (PARTITION BY UPR.ReputationQuintile ORDER BY (UPR.Reputation * 0.6 + UBM.TotalPostsOwned * 0.2 + UBM.GoldBadges * 0.2) DESC) AS UserCompositeRankInQuintile,
+
+    -- Complicated Predicate/Expression: Categorizes question impact based on various thresholds
+    CASE
+        WHEN PAD.QuestionScore > 50 AND PAD.TotalAnswersGiven > 5 AND COALESCE(PAD.AvgAnswerScore, 0) > 10 THEN 'High Impact Question'
+        WHEN PAD.QuestionViewCount > 10000 AND (PAD.QuestionFavoriteCount IS NULL OR PAD.QuestionFavoriteCount < 10) THEN 'Viewed But Not Favorited'
+        WHEN PAD.QuestionOwnerUserId IS NULL AND PAD.QuestionScore < 0 THEN 'Community Owned Low Score'
+        WHEN PAD.QuestionId IS NULL THEN 'N/A' -- User has no questions
+        ELSE 'Regular Question'
+    END AS QuestionImpactCategory,
+
+    -- NULLIF & COALESCE: Ratio of comments to posts, avoiding division by zero
+    COALESCE(CAST(UBM.TotalCommentsMade AS DECIMAL) / NULLIF(UBM.TotalPostsOwned, 0), 0.0) AS CommentsPerPostRatio,
+
+    -- String Expression & NULL Handling: Detailed user location with classification
+    COALESCE(UBM.Location, 'Unknown Location') ||
+    CASE
+        WHEN UBM.Location LIKE '%United States%' OR UBM.Location LIKE '%USA%' THEN ' (North America)'
+        WHEN UBM.Location LIKE '%Canada%' OR UBM.Location LIKE '%Mexico%' THEN ' (North America)'
+        WHEN UBM.Location LIKE '%UK%' OR UBM.Location LIKE '%England%' OR UBM.Location LIKE '%Germany%' THEN ' (Europe)'
+        WHEN UBM.Location LIKE '%India%' OR UBM.Location LIKE '%China%' OR UBM.Location LIKE '%Japan%' THEN ' (Asia)'
+        ELSE ''
+    END AS UserLocationClassification,
+
+    -- Date Expression: Days between user creation and last access date
+    EXTRACT(DAY FROM (UBM.UserLastAccessDate - UBM.UserCreationDate)) AS DaysBetweenCreationAndLastAccess
+
+FROM UserPerformanceRanks AS UPR
+JOIN UserBaseMetrics AS UBM ON UPR.UserId = UBM.UserId
+LEFT JOIN PostActivityDetails AS PAD ON UPR.UserId = PAD.QuestionOwnerUserId
+LEFT JOIN ComplexPostHistoryStats AS CPS ON PAD.QuestionId = CPS.PostId
+LEFT JOIN Posts AS AA ON PAD.AcceptedAnswerId = AA.Id -- Get accepted answer post details
+LEFT JOIN Users AS AA_U ON AA.OwnerUserId = AA_U.Id -- Get accepted answer owner details
+WHERE
+    UPR.Reputation >= 1000 -- Filter for more active/reputed users
+    AND (
+        PAD.QuestionScore > 5 OR PAD.QuestionId IS NULL -- Include users without questions, or questions with some score
+    )
+    AND (
+        PAD.QuestionTags LIKE '%<sql>%' OR
+        PAD.QuestionTags LIKE '%<database>%' OR
+        PAD.QuestionTags LIKE '%<performance>%' OR
+        PAD.QuestionTags IS NULL -- Include questions without these specific tags, or users without questions
+    )
+    AND UPR.UserCreationDate >= '2015-01-01' -- Filter for relatively recent users
+    AND (UBM.Location IS NOT NULL AND UBM.Location != '') -- Filter for users with a specified location
+ORDER BY
+    UPR.Reputation DESC,
+    CalculatedQuestionQualityScore DESC NULLS LAST,
+    UserCompositeRankInQuintile ASC
+LIMIT 1000;

@@ -1,0 +1,131 @@
+WITH
+  UserPostCounts AS (
+    SELECT
+      OwnerUserId,
+      COUNT(Id) AS PostCount
+    FROM
+      Posts
+    WHERE
+      OwnerUserId IS NOT NULL
+    GROUP BY
+      OwnerUserId
+  ),
+  UserVoteTotals AS (
+    SELECT
+      v.UserId,
+      SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
+      SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes,
+      COUNT(v.Id) AS TotalVotes
+    FROM
+      Votes v
+      JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    WHERE
+      v.UserId IS NOT NULL
+    GROUP BY
+      v.UserId
+  ),
+  HighReputationUsers AS (
+    SELECT
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      (
+        SELECT
+          COUNT(*)
+        FROM
+          Badges b
+        WHERE
+          b.UserId = u.Id AND b.Class = 1
+      ) AS GoldBadges
+    FROM
+      Users u
+    WHERE
+      u.Reputation > 10000
+  ),
+  RecentQuestions AS (
+    SELECT
+      p.Id,
+      p.Title,
+      p.OwnerUserId,
+      p.CreationDate,
+      p.AnswerCount,
+      p.Score,
+      (
+        SELECT
+          COUNT(*)
+        FROM
+          Comments c
+        WHERE
+          c.PostId = p.Id AND c.Score > 5
+      ) AS HighScoringComments
+    FROM
+      Posts p
+    WHERE
+      p.PostTypeId = 1 -- Question
+      AND p.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days')
+  )
+SELECT
+  COALESCE(hr.DisplayName, 'N/A') AS UserName,
+  COALESCE(hr.Reputation, 0) AS UserReputation,
+  COALESCE(hr.GoldBadges, 0) AS UserGoldBadges,
+  COALESCE(upc.PostCount, 0) AS TotalPosts,
+  COALESCE(uvt.UpVotes, 0) AS TotalUpVotes,
+  COALESCE(uvt.DownVotes, 0) AS TotalDownVotes,
+  rq.Title AS LatestQuestionTitle,
+  rq.CreationDate AS LatestQuestionDate,
+  rq.AnswerCount AS LatestQuestionAnswerCount,
+  rq.Score AS LatestQuestionScore,
+  rq.HighScoringComments AS LatestQuestionHighScoringComments,
+  CASE
+    WHEN rq.OwnerUserId IS NULL THEN 'Community'
+    WHEN rq.OwnerUserId = -1 THEN 'Community'
+    ELSE 'User'
+  END AS QuestionOwnerType,
+  CASE
+    WHEN EXISTS (
+      SELECT
+        1
+      FROM
+        PostLinks pl
+      WHERE
+        pl.PostId = rq.Id AND pl.LinkTypeId = 3
+    ) THEN 'Is Duplicate'
+    ELSE 'Not Duplicate'
+  END AS DuplicateStatus,
+  UPPER(SUBSTRING(rq.Title FROM 1 FOR (CASE WHEN POSITION(' ' IN rq.Title) = 0 THEN CHAR_LENGTH(rq.Title) ELSE POSITION(' ' IN rq.Title) - 1 END))) AS FirstWordOfTitle
+FROM
+  HighReputationUsers hr
+  LEFT JOIN UserPostCounts upc ON hr.Id = upc.OwnerUserId
+  LEFT JOIN UserVoteTotals uvt ON hr.Id = uvt.UserId
+  LEFT JOIN RecentQuestions rq ON hr.Id = rq.OwnerUserId AND rq.CreationDate = (
+    SELECT
+      MAX(rqq.CreationDate)
+    FROM
+      RecentQuestions rqq
+    WHERE
+      rqq.OwnerUserId = hr.Id
+  )
+WHERE
+  (
+    COALESCE(upc.PostCount, 0) > 100 OR COALESCE(uvt.TotalVotes, 0) > 500
+  )
+  AND hr.DisplayName LIKE '%a%'
+GROUP BY
+  hr.Id,
+  hr.DisplayName,
+  hr.Reputation,
+  hr.GoldBadges,
+  upc.PostCount,
+  uvt.UpVotes,
+  uvt.DownVotes,
+  uvt.TotalVotes,
+  rq.Id,
+  rq.Title,
+  rq.OwnerUserId,
+  rq.CreationDate,
+  rq.AnswerCount,
+  rq.Score,
+  rq.HighScoringComments
+ORDER BY
+  hr.Reputation DESC
+LIMIT 10;

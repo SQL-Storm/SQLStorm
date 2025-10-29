@@ -1,0 +1,198 @@
+-- {"query": "7017.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1829} 
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.UpVotes,
+        u.DownVotes,
+        u.ViewCount,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.CreationDate DESC) AS PostRank,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        CASE 
+            WHEN u.Reputation >= 100000 THEN 'Legendary'
+            WHEN u.Reputation >= 10000 THEN 'Master'
+            WHEN u.Reputation >= 1000 THEN 'Expert'
+            WHEN u.Reputation >= 100 THEN 'Novice'
+            ELSE 'Beginner'
+        END AS ReputationTier
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= '2010-01-01' 
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes, u.ViewCount
+),
+TopPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ParentId,
+        p.AcceptedAnswerId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostType,
+        COALESCE(p.Tags, '') AS CleanTags,
+        COALESCE(p.Title, '') AS CleanTitle,
+        CASE 
+            WHEN p.Score >= 100 THEN 'Highly Rated'
+            WHEN p.Score >= 50 THEN 'Moderately Rated'
+            WHEN p.Score >= 10 THEN 'Low Rated'
+            ELSE 'Very Low Rated'
+        END AS RatingCategory
+    FROM Posts p
+    WHERE p.CreationDate >= '2019-01-01'
+),
+PostStats AS (
+    SELECT 
+        tp.PostId,
+        tp.Title,
+        tp.Score,
+        tp.ViewCount,
+        tp.CreationDate,
+        tp.OwnerUserId,
+        tp.PostType,
+        tp.CleanTags,
+        tp.CleanTitle,
+        tp.RatingCategory,
+        COUNT(ph.Id) AS EditCount,
+        MAX(ph.CreationDate) AS LastEditDate,
+        AVG(ph.CreationDate::date - tp.CreationDate::date) AS AvgDaysBetweenCreationAndEdit,
+        STRING_AGG(DISTINCT ph.UserDisplayName, ', ') AS Editors,
+        STRING_AGG(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN ph.Comment END, ' | ') AS EditComments
+    FROM TopPosts tp
+    LEFT JOIN PostHistory ph ON tp.PostId = ph.PostId
+    GROUP BY tp.PostId, tp.Title, tp.Score, tp.ViewCount, tp.CreationDate, tp.OwnerUserId, tp.PostType, tp.CleanTags, tp.CleanTitle, tp.RatingCategory
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.IsRequired,
+        t.IsModeratorOnly,
+        COUNT(DISTINCT p.Id) AS PostsUsingTag,
+        AVG(p.Score) AS AvgScoreForTag,
+        MAX(p.CreationDate) AS LastPostWithTag,
+        ARRAY_AGG(DISTINCT p.Id) AS PostIds,
+        STRING_AGG(DISTINCT p.Title, ' | ' ORDER BY p.CreationDate DESC) AS RecentTitles,
+        CASE 
+            WHEN t.Count < 50 THEN 'Rare'
+            WHEN t.Count < 500 THEN 'Common'
+            WHEN t.Count < 5000 THEN 'Popular'
+            ELSE 'Trending'
+        END AS TagPopularityCategory
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    WHERE t.TagName IS NOT NULL
+    GROUP BY t.TagName, t.Count, t.IsRequired, t.IsModeratorOnly
+),
+CombinedView AS (
+    SELECT 
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.UpVotes,
+        us.DownVotes,
+        us.ViewCount,
+        us.PostCount,
+        us.CommentCount,
+        us.BadgeCount,
+        us.LastPostDate,
+        us.ReputationRank,
+        us.ReputationTier,
+        ps.PostId,
+        ps.Title,
+        ps.Score,
+        ps.ViewCount AS PostViewCount,
+        ps.CreationDate AS PostCreationDate,
+        ps.PostType,
+        ps.CleanTags,
+        ps.CleanTitle,
+        ps.RatingCategory,
+        ps.EditCount,
+        ps.LastEditDate,
+        ps.AvgDaysBetweenCreationAndEdit,
+        ps.Editors,
+        ps.EditComments,
+        ta.TagName,
+        ta.Count AS TagCount,
+        ta.IsRequired AS TagIsRequired,
+        ta.IsModeratorOnly AS TagIsModeratorOnly,
+        ta.PostsUsingTag,
+        ta.AvgScoreForTag,
+        ta.LastPostWithTag,
+        ta.TagPopularityCategory
+    FROM UserStats us
+    LEFT JOIN PostStats ps ON us.UserId = ps.OwnerUserId
+    LEFT JOIN Tags t ON ps.CleanTags LIKE '%' || t.TagName || '%' AND t.TagName IS NOT NULL
+    LEFT JOIN TagAnalysis ta ON t.TagName = ta.TagName
+    WHERE (ta.TagName IS NULL OR ta.TagName IS NOT NULL)
+)
+SELECT 
+    cv.UserId,
+    cv.DisplayName,
+    cv.Reputation,
+    cv.ReputationTier,
+    cv.PostCount,
+    cv.CommentCount,
+    cv.BadgeCount,
+    COALESCE(cv.PostId, 0) AS PostId,
+    COALESCE(cv.Title, 'No Title') AS Title,
+    COALESCE(cv.Score, 0) AS Score,
+    COALESCE(cv.EditCount, 0) AS EditCount,
+    CASE 
+        WHEN cv.PostCount > 0 THEN 
+            (cv.PostCount * 100.0) / NULLIF((SELECT COUNT(*) FROM Posts WHERE OwnerUserId = cv.UserId), 0)
+        ELSE 0 
+    END AS PostPercentageOfUser,
+    CASE 
+        WHEN cv.Score > 0 THEN 
+            (cv.Score * 100.0) / NULLIF((SELECT SUM(Score) FROM Posts WHERE OwnerUserId = cv.UserId), 0)
+        ELSE 0 
+    END AS ScorePercentageOfUser,
+    COALESCE(cv.CleanTags, 'No Tags') AS Tags,
+    COALESCE(cv.TagName, 'No Tag') AS TagName,
+    COALESCE(cv.TagCount, 0) AS TagCount,
+    COALESCE(cv.TagPopularityCategory, 'Unknown') AS TagPopularity,
+    CASE 
+        WHEN cv.PostType = 'Question' THEN 'Q'
+        WHEN cv.PostType = 'Answer' THEN 'A'
+        ELSE 'O'
+    END AS TypeShort,
+    COALESCE(cv.RatingCategory, 'Unknown') AS Rating,
+    CASE 
+        WHEN cv.Editors IS NOT NULL AND cv.Editors != '' THEN 
+            CONCAT('Edits by: ', LEFT(cv.Editors, 50), '...')
+        ELSE 'No Edits'
+    END AS EditorSummary,
+    CASE 
+        WHEN cv.LastPostDate >= '2023-01-01' THEN 'Active User'
+        WHEN cv.LastPostDate >= '2022-01-01' THEN 'Recent User'
+        WHEN cv.LastPostDate >= '2021-01-01' THEN 'Regular User'
+        ELSE 'Inactive User'
+    END AS UserActivityStatus,
+    CASE 
+        WHEN cv.Reputation >= 10000 THEN 'High Reputation'
+        WHEN cv.Reputation >= 1000 THEN 'Medium Reputation'
+        ELSE 'Low Reputation'
+    END AS ReputationCategory
+FROM CombinedView cv
+WHERE cv.PostCount > 0 
+    AND (cv.Score > 0 OR cv.CommentCount > 0 OR cv.BadgeCount > 0)
+ORDER BY cv.Reputation DESC, cv.PostCount DESC, cv.Score DESC
+LIMIT 1000;

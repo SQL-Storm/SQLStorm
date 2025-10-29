@@ -1,0 +1,107 @@
+WITH RECURSIVE RecursiveCTE AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.Tags,
+        dense_rank() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PostRank
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+    UNION ALL
+    SELECT
+        p2.Id,
+        p2.PostTypeId,
+        p2.CreationDate,
+        p2.Score,
+        p2.ViewCount,
+        p2.OwnerUserId,
+        p2.Tags,
+        r.PostRank + 1
+    FROM Posts p2
+    INNER JOIN RecursiveCTE r ON p2.OwnerUserId = r.OwnerUserId AND p2.CreationDate > r.CreationDate
+    WHERE p2.PostTypeId IN (1, 2)
+)
+, UserBadgeStats AS (
+    SELECT
+        b.UserId,
+        count(*) AS TotalBadges,
+        sum(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        sum(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        sum(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        bool_or(b.TagBased = 1) AS HasTagBadges
+    FROM Badges b
+    GROUP BY b.UserId
+)
+, LatestPostHistory AS (
+    SELECT
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        ph.UserId,
+        ph.Comment,
+        row_number() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (10, 11, 12, 13)
+)
+, PostVoteSummary AS (
+    SELECT
+        v.PostId,
+        sum(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        sum(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        sum(CASE WHEN v.VoteTypeId = 8 THEN coalesce(v.BountyAmount,0) ELSE 0 END) AS TotalBounty
+    FROM Votes v
+    GROUP BY v.PostId
+)
+SELECT DISTINCT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    ub.TotalBadges,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ub.HasTagBadges,
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.Tags,
+    p.Score,
+    p.ViewCount,
+    coalesce(pvs.UpVotes, 0) AS PostUpVotes,
+    coalesce(pvs.DownVotes, 0) AS PostDownVotes,
+    coalesce(pvs.TotalBounty, 0) AS PostTotalBounty,
+    ph.Comment AS CloseReason,
+    row_number() OVER (PARTITION BY u.Id ORDER BY p.Score DESC NULLS LAST, p.ViewCount DESC NULLS LAST) AS UserTopPostsRank,
+    string_agg(distinct nullif(t.TagName, ''), ',' ORDER BY t.TagName) OVER (PARTITION BY u.Id) AS UserTags,
+    CASE WHEN EXISTS (
+      SELECT 1 FROM Comments c WHERE c.PostId = p.Id AND c.Score > 5
+    ) THEN 'Yes' ELSE 'No' END AS HasHighlyVotedComments,
+    length(coalesce(p.Body, '')) AS PostBodyLength,
+    CASE
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN lastph.PostHistoryTypeId = 11 THEN 'Reopened'
+        ELSE 'Open'
+    END AS PostStatus,
+    coalesce((
+        SELECT count(*) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3
+    ), 0) AS DuplicateLinksCount,
+    coalesce(
+        substring(p.Tags FROM '<([^>]+)>'),
+        'no-tag'
+    ) AS FirstTag,
+    coalesce(p.CreationDate, u.CreationDate) AS EffectiveCreationDate
+FROM Users u
+LEFT JOIN UserBadgeStats ub ON u.Id = ub.UserId
+LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+LEFT JOIN LatestPostHistory ph ON ph.PostId = p.Id AND ph.rn = 1
+LEFT JOIN LatestPostHistory lastph ON lastph.PostId = p.Id AND lastph.rn = 1
+LEFT JOIN PostVoteSummary pvs ON p.Id = pvs.PostId
+LEFT JOIN Tags t ON position(concat('<', t.TagName, '>') IN coalesce(p.Tags, '')) > 0
+WHERE u.Reputation > 1000
+  AND (p.PostTypeId = 1 OR p.PostTypeId IS NULL)
+  AND (ph.PostHistoryTypeId IS NULL OR ph.PostHistoryTypeId <> 12)
+ORDER BY u.Reputation DESC, p.Score DESC NULLS LAST
+LIMIT 100;

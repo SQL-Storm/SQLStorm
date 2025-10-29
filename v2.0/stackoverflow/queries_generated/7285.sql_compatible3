@@ -1,0 +1,288 @@
+WITH PostStats AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        p.ParentId,
+        COALESCE(p.AcceptedAnswerId, 0) AS AcceptedAnswerId,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN 'Question with Answers'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 1 AND p.AnswerCount = 0 THEN 'Question without Answers'
+            ELSE 'Other'
+        END AS PostCategory,
+        CAST(EXTRACT(EPOCH FROM (COALESCE(p.ClosedDate, p.LastActivityDate) - p.CreationDate)) / 86400 AS INTEGER) AS DaysActive,
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS ScoreRank,
+        ROW_NUMBER() OVER (ORDER BY p.Score DESC) AS GlobalRank,
+        PERCENT_RANK() OVER (ORDER BY p.Score) AS ScorePercentile,
+        NTILE(100) OVER (ORDER BY p.Score) AS ScoreQuintile,
+        LAG(p.Score, 1) OVER (ORDER BY p.CreationDate) AS PreviousScore,
+        LEAD(p.Score, 1) OVER (ORDER BY p.CreationDate) AS NextScore,
+        AVG(p.Score) OVER (ORDER BY p.CreationDate ROWS BETWEEN 10 PRECEDING AND CURRENT ROW) AS MovingAverageScore
+    FROM Posts p
+    WHERE p.Score IS NOT NULL
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        STRING_AGG(DISTINCT u.Location, ', ') AS Locations,
+        STRING_AGG(DISTINCT CASE WHEN p.PostTypeId = 1 THEN 'Q' WHEN p.PostTypeId = 2 THEN 'A' ELSE 'Other' END, ', ') AS PostTypes,
+        AVG(CAST(p.Score AS DOUBLE PRECISION)) AS AveragePostScore,
+        MIN(p.CreationDate) AS FirstPostDate,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes, u.LastAccessDate
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            WHEN t.Count > 10 THEN 'Rare'
+            ELSE 'Very Rare'
+        END AS PopularityLevel,
+        LAG(t.Count, 1) OVER (ORDER BY t.Count DESC) - t.Count AS CountDifference,
+        AVG(t.Count) OVER (ORDER BY t.Count ROWS BETWEEN 5 PRECEDING AND CURRENT ROW) AS MovingAverage
+    FROM Tags t
+    WHERE t.Count IS NOT NULL
+),
+PostHistoryAnalysis AS (
+    SELECT 
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        ph.UserId,
+        ph.Comment,
+        ph.Text,
+        CASE 
+            WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN 'Status Change'
+            WHEN ph.PostHistoryTypeId IN (1, 4, 5, 6, 7, 8, 9) THEN 'Content Change'
+            ELSE 'Other'
+        END AS ChangeType,
+        CAST(EXTRACT(EPOCH FROM (ph.CreationDate - LAG(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate))) / 86400 AS INTEGER) AS DaySinceLastChange
+    FROM PostHistory ph
+    WHERE ph.CreationDate > DATE '2020-01-01'
+),
+CombinedAnalysis AS (
+    SELECT 
+        ps.Id AS PostId,
+        ps.PostTypeId,
+        ps.Score,
+        ps.ViewCount,
+        ps.AnswerCount,
+        ps.CommentCount,
+        ps.FavoriteCount,
+        ps.DaysActive,
+        ps.ScoreRank,
+        ps.GlobalRank,
+        ps.ScorePercentile,
+        ps.ScoreQuintile,
+        ps.MovingAverageScore,
+        ps.PostCategory,
+        ps.Title,
+        ps.Tags,
+        ps.OwnerUserId,
+        ps.ParentId,
+        ps.AcceptedAnswerId,
+        ps.PreviousScore,
+        ps.NextScore,
+        ua.UserId,
+        ua.Reputation,
+        ua.DisplayName,
+        ua.Views,
+        ua.UpVotes,
+        ua.DownVotes,
+        ua.PostCount,
+        ua.CommentCount,
+        ua.BadgeCount,
+        ua.Locations,
+        ua.PostTypes,
+        ua.AveragePostScore,
+        ua.FirstPostDate,
+        ua.LastPostDate,
+        ta.TagName,
+        ta.Count AS TagCount,
+        ta.PopularityLevel,
+        ta.CountDifference,
+        ta.MovingAverage,
+        ph.ChangeType,
+        ph.DaySinceLastChange,
+        CASE 
+            WHEN ps.Score > 0 AND ps.Score >= ps.MovingAverageScore THEN 'Above Average'
+            WHEN ps.Score < 0 AND ps.Score <= ps.MovingAverageScore THEN 'Below Average'
+            ELSE 'Average'
+        END AS ScoreStatus,
+        CASE 
+            WHEN ps.DaysActive > 30 THEN 'Long Term'
+            WHEN ps.DaysActive > 7 THEN 'Medium Term'
+            WHEN ps.DaysActive > 0 THEN 'Short Term'
+            ELSE 'New'
+        END AS ActivityPeriod,
+        CASE 
+            WHEN ua.PostCount > 100 THEN 'High Activity'
+            WHEN ua.PostCount > 10 THEN 'Medium Activity'
+            WHEN ua.PostCount > 0 THEN 'Low Activity'
+            ELSE 'No Activity'
+        END AS UserActivityLevel,
+        CASE 
+            WHEN ta.PopularityLevel IN ('Popular', 'Moderate') THEN 'High'
+            WHEN ta.PopularityLevel IN ('Rare', 'Very Rare') THEN 'Low'
+            ELSE 'Medium'
+        END AS TagPopularity,
+        ROW_NUMBER() OVER (ORDER BY ps.Score DESC, ua.Reputation DESC) AS CombinedRank
+    FROM PostStats ps
+    LEFT JOIN UserActivity ua ON ps.OwnerUserId = ua.UserId
+    LEFT JOIN TagAnalysis ta ON ps.Tags LIKE '%' || ta.TagName || '%'
+    LEFT JOIN PostHistoryAnalysis ph ON ps.Id = ph.PostId
+    WHERE ps.Score IS NOT NULL AND ps.OwnerUserId IS NOT NULL
+)
+SELECT 
+    ca.PostId,
+    ca.PostTypeId,
+    ca.Score,
+    ca.ViewCount,
+    ca.AnswerCount,
+    ca.CommentCount,
+    ca.FavoriteCount,
+    ca.DaysActive,
+    ca.MovingAverageScore,
+    ca.PostCategory,
+    ca.Title,
+    CASE 
+        WHEN ca.Tags IS NOT NULL THEN TRIM(SUBSTRING(ca.Tags FROM 2 FOR CHAR_LENGTH(ca.Tags) - 2))
+        ELSE ''
+    END AS CleanedTags,
+    ca.OwnerUserId,
+    ca.PreviousScore,
+    ca.NextScore,
+    ca.UserId,
+    ca.Reputation,
+    ca.DisplayName,
+    CASE 
+        WHEN ca.Views > 0 THEN CAST(ca.Views AS DECIMAL) / 1000 || 'K'
+        ELSE '0'
+    END AS ViewCountDisplay,
+    CASE 
+        WHEN ca.ScorePercentile > 0.9 THEN 'Top 10%'
+        WHEN ca.ScorePercentile > 0.75 THEN 'Top 25%'
+        WHEN ca.ScorePercentile > 0.5 THEN 'Top 50%'
+        ELSE 'Below Average'
+    END AS ScorePercentileLevel,
+    ca.ActivityPeriod,
+    ca.ScoreStatus,
+    ca.UserActivityLevel,
+    ca.TagPopularity,
+    DENSE_RANK() OVER (PARTITION BY ca.PostCategory ORDER BY ca.Score DESC) AS CategoryRank,
+    PERCENT_RANK() OVER (PARTITION BY ca.PostCategory ORDER BY ca.Score) AS CategoryScorePercentile,
+    (
+        SELECT string_agg(DISTINCT t.TagName, ', ')
+        FROM Tags t
+        WHERE t.TagName IN (
+            SELECT TRIM(value)
+            FROM regexp_split_to_table(
+                CASE 
+                    WHEN ca.Tags IS NOT NULL THEN SUBSTRING(ca.Tags FROM 2 FOR CHAR_LENGTH(ca.Tags) - 2)
+                    ELSE ''
+                END,
+                '><'
+            ) AS value
+        )
+    ) AS ExtractedTags,
+    COUNT(*) OVER () AS TotalResults,
+    RANK() OVER (ORDER BY ca.Score DESC) AS OverallRank,
+    CASE 
+        WHEN ca.PreviousScore IS NOT NULL THEN ROUND((ca.Score - ca.PreviousScore) * 100.0 / NULLIF(ca.PreviousScore, 0), 2)
+        ELSE NULL
+    END AS ScoreChangePercent,
+    CASE 
+        WHEN ca.DaySinceLastChange IS NOT NULL AND ca.DaySinceLastChange > 0 THEN 
+            ca.DaySinceLastChange || ' days since last change'
+        ELSE 'No previous change'
+    END AS ChangeTimingInfo,
+    CASE 
+        WHEN ca.Score > (
+            SELECT AVG(Score) 
+            FROM Posts 
+            WHERE PostTypeId = ca.PostTypeId
+        ) THEN 'Above Category Average'
+        ELSE 'Below Category Average'
+    END AS CategoryScoreComparison,
+    CASE 
+        WHEN ca.Score > (
+            SELECT AVG(Score) 
+            FROM Posts
+        ) THEN 'Above Global Average'
+        ELSE 'Below Global Average'
+    END AS GlobalScoreComparison
+FROM CombinedAnalysis ca
+WHERE (ca.Score > 0 OR ca.Reputation > 1000)
+GROUP BY
+    ca.PostId,
+    ca.PostTypeId,
+    ca.Score,
+    ca.ViewCount,
+    ca.AnswerCount,
+    ca.CommentCount,
+    ca.FavoriteCount,
+    ca.DaysActive,
+    ca.MovingAverageScore,
+    ca.PostCategory,
+    ca.Title,
+    ca.Tags,
+    ca.OwnerUserId,
+    ca.PreviousScore,
+    ca.NextScore,
+    ca.UserId,
+    ca.Reputation,
+    ca.DisplayName,
+    ca.Views,
+    ca.ScorePercentile,
+    ca.ActivityPeriod,
+    ca.ScoreStatus,
+    ca.UserActivityLevel,
+    ca.TagPopularity,
+    ca.GlobalRank,
+    ca.DaySinceLastChange,
+    ca.PostCount
+HAVING 
+    (
+        ca.Score IS NOT NULL 
+        AND (ca.Score > 10 OR ca.Reputation > 1000)
+    )
+    OR (
+        ca.PostCount > 10 
+        AND ca.TagPopularity IN ('High', 'Medium')
+    )
+ORDER BY 
+    ca.Score DESC,
+    ca.Reputation DESC,
+    ca.ViewCount DESC,
+    ca.GlobalRank
+OFFSET 0
+FETCH NEXT 10000 ROWS ONLY;

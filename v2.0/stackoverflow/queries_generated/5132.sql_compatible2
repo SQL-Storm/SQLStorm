@@ -1,0 +1,130 @@
+WITH
+RecentHot AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.ViewCount,
+    p.Score,
+    p.OwnerUserId,
+    p.Tags,
+    p.LastActivityDate,
+    COUNT(v.Id) AS VoteCount
+  FROM Posts p
+  LEFT JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId IN (2,3)
+  WHERE p.PostTypeId = 1 -- questions
+    AND p.ClosedDate IS NULL
+  GROUP BY p.Id, p.Title, p.CreationDate, p.ViewCount, p.Score, p.OwnerUserId, p.Tags, p.LastActivityDate
+),
+TagStats AS (
+  SELECT
+    tag.TagName,
+    COUNT(*) AS TagQuestionCount,
+    AVG(p.Score) AS AvgQuestionScore,
+    SUM(p.ViewCount) AS TotalViews
+  FROM Posts p
+  JOIN LATERAL (
+    SELECT regexp_split_to_table(substr(p.Tags, 2, length(p.Tags)-2), '><') AS TagName
+  ) tag ON TRUE
+  WHERE p.PostTypeId = 1
+  GROUP BY tag.TagName
+),
+UserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.AccountId,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS Questions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS Answers,
+    COUNT(c.Id) AS CommentsMade,
+    AVG(p.Score) AS AvgPostScore,
+    MAX(p.LastActivityDate) AS LastActive
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Comments c ON c.UserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.AccountId
+),
+CorrelatedInsights AS (
+  SELECT
+    rh.PostId,
+    rh.Title,
+    rh.ViewCount,
+    rh.Score,
+    rh.VoteCount,
+    us.LastActive,
+    us.Reputation AS UserReputation,
+    CASE
+      WHEN rh.ViewCount > 1000 THEN 'High-Visibility'
+      WHEN rh.Score < 0 THEN 'Low-Score'
+      ELSE 'Moderate'
+    END AS VisibilityBucket,
+    rh.OwnerUserId
+  FROM RecentHot rh
+  LEFT JOIN UserActivity us ON us.UserId = rh.OwnerUserId
+),
+ComplexAggregate AS (
+  SELECT
+    ci.PostId,
+    ci.Title,
+    ci.ViewCount,
+    ci.Score,
+    ci.VoteCount,
+    ci.LastActive,
+    ci.UserReputation,
+    ci.VisibilityBucket,
+    ci.OwnerUserId,
+    (ci.ViewCount * 0.5 + ci.Score * 2) AS EngagementScore,
+    (SELECT AVG(v.BountyAmount) FROM Votes v WHERE v.PostId = ci.PostId AND v.BountyAmount IS NOT NULL) AS AvgBounty
+  FROM CorrelatedInsights ci
+)
+SELECT
+  ca.PostId,
+  ca.Title,
+  ca.ViewCount,
+  ca.Score AS PostScore,
+  ca.VoteCount,
+  ca.LastActive,
+  ca.UserReputation,
+  ca.VisibilityBucket,
+  ca.EngagementScore,
+  ca.AvgBounty,
+  ts.TagName,
+  ts.TagQuestionCount,
+  ts.AvgQuestionScore,
+  ts.TotalViews,
+  a.DisplayName AS LastEditor,
+  a2.DisplayName AS OwnerDisplay
+FROM ComplexAggregate ca
+LEFT JOIN LATERAL (
+  SELECT tag.TagName
+  FROM LATERAL (
+    SELECT regexp_split_to_table(substr(p.Tags, 2, length(p.Tags)-2), '><') AS TagName
+    FROM Posts p
+    WHERE p.Id = ca.PostId
+    LIMIT 1
+  ) tag
+) ts ON TRUE
+LEFT JOIN Posts p2 ON p2.Id = ca.PostId
+LEFT JOIN Users a ON a.Id = p2.LastEditorUserId
+LEFT JOIN Users a2 ON a2.Id = p2.OwnerUserId
+LEFT JOIN TagStats ON TagStats.TagName = ts.TagName
+GROUP BY
+  ca.PostId,
+  ca.Title,
+  ca.ViewCount,
+  ca.Score,
+  ca.VoteCount,
+  ca.LastActive,
+  ca.UserReputation,
+  ca.VisibilityBucket,
+  ca.EngagementScore,
+  ca.AvgBounty,
+  ts.TagName,
+  ts.TagQuestionCount,
+  ts.AvgQuestionScore,
+  ts.TotalViews,
+  a.DisplayName,
+  a2.DisplayName
+ORDER BY ca.EngagementScore DESC NULLS LAST
+LIMIT 100;

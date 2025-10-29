@@ -1,0 +1,130 @@
+-- {"query": "3210.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2029} 
+
+/*  Benchmark query – mix of CTEs, window functions, outer joins, correlated subqueries,
+    set operators, string handling and NULL logic                                            */
+WITH 
+/* -------------------------------------------------------------------------
+   User‑level aggregates (questions, answers, badges, post scores, reputation rank)
+   ------------------------------------------------------------------------- */
+UserStats AS (
+    SELECT 
+        u.Id                                       AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(pq.QuestionCount, 0)               AS QuestionCount,
+        COALESCE(pq.AnswerCount, 0)                 AS AnswerCount,
+        COALESCE(bc.GoldBadgeCount, 0)              AS GoldBadgeCount,
+        COALESCE(ps.TotalScore, 0)                  AS TotalPostScore,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank,
+        AVG(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) 
+            OVER (PARTITION BY u.Id)               AS AvgUpVotesPerUser
+    FROM Users u
+    /* questions / answers per user */
+    LEFT JOIN (
+        SELECT 
+            OwnerUserId,
+            SUM(CASE WHEN PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+            SUM(CASE WHEN PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount
+        FROM Posts
+        GROUP BY OwnerUserId
+    ) pq ON pq.OwnerUserId = u.Id
+    /* gold badges per user */
+    LEFT JOIN (
+        SELECT 
+            UserId,
+            COUNT(*) FILTER (WHERE Class = 1) AS GoldBadgeCount
+        FROM Badges
+        GROUP BY UserId
+    ) bc ON bc.UserId = u.Id
+    /* total sum of scores of all posts owned by the user */
+    LEFT JOIN (
+        SELECT 
+            OwnerUserId,
+            SUM(Score) AS TotalScore
+        FROM Posts
+        GROUP BY OwnerUserId
+    ) ps ON ps.OwnerUserId = u.Id
+    /* user votes (only for window function above) */
+    LEFT JOIN Votes v ON v.UserId = u.Id
+),
+
+/* -------------------------------------------------------------------------
+   Most recent closed question per question (using PostHistory type 10)
+   ------------------------------------------------------------------------- */
+RecentClosedQuestions AS (
+    SELECT 
+        ph.PostId,
+        p.Title,
+        ph.CreationDate AS ClosedDate,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    JOIN Posts p ON p.Id = ph.PostId
+    WHERE ph.PostHistoryTypeId = 10               -- Close event
+      AND p.PostTypeId = 1                        -- Question
+),
+
+/* -------------------------------------------------------------------------
+   Latest activity snapshot for each user (most recent post id)
+   ------------------------------------------------------------------------- */
+LatestUserPost AS (
+    SELECT 
+        p.OwnerUserId,
+        p.Id AS LatestPostId,
+        p.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+)
+
+/* -------------------------------------------------------------------------
+   Final result set – individual users + aggregated totals (UNION ALL)
+   ------------------------------------------------------------------------- */
+SELECT 
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.RepRank,
+    us.QuestionCount,
+    us.AnswerCount,
+    us.GoldBadgeCount,
+    us.TotalPostScore,
+    COALESCE(rc.Title, 'No recent closures')        AS RecentClosedTitle,
+    CASE 
+        WHEN us.QuestionCount = 0 THEN NULL
+        ELSE us.AnswerCount * 1.0 / us.QuestionCount
+    END                                            AS AnswerToQuestionRatio,
+    (SELECT COUNT(*) 
+     FROM Comments c 
+     WHERE c.UserId = us.UserId 
+       AND c.CreationDate > CURRENT_DATE - INTERVAL '30 days') 
+                                                    AS RecentCommentCount
+FROM UserStats us
+LEFT JOIN RecentClosedQuestions rc 
+       ON rc.PostId = (
+              SELECT p.Id
+              FROM Posts p
+              WHERE p.OwnerUserId = us.UserId 
+                AND p.PostTypeId = 1                -- questions only
+              ORDER BY p.CreationDate DESC
+              LIMIT 1
+          )
+       AND rc.rn = 1
+WHERE us.Reputation > 1000
+  AND (us.GoldBadgeCount > 0 OR us.TotalPostScore > 500)
+
+UNION ALL
+
+SELECT 
+    NULL                                           AS UserId,
+    'Aggregated Totals'                            AS DisplayName,
+    NULL                                           AS Reputation,
+    NULL                                           AS RepRank,
+    SUM(us.QuestionCount)                          AS QuestionCount,
+    SUM(us.AnswerCount)                            AS AnswerCount,
+    SUM(us.GoldBadgeCount)                         AS GoldBadgeCount,
+    SUM(us.TotalPostScore)                         AS TotalPostScore,
+    NULL                                           AS RecentClosedTitle,
+    NULL                                           AS AnswerToQuestionRatio,
+    NULL                                           AS RecentCommentCount
+FROM UserStats us
+WHERE us.Reputation > 1000;

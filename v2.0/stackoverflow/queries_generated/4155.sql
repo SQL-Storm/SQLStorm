@@ -1,0 +1,103 @@
+-- {"query": "4155.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1309} 
+
+WITH RankedUserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.CreationDate ASC) AS RankByReputation,
+        COUNT(DISTINCT p.Id) AS QuestionCount,
+        COUNT(DISTINCT a.Id) AS AnswerCount,
+        SUM(CASE WHEN c.Score > 10 THEN 1 ELSE 0 END) AS HighScoreCommentCount,
+        MAX(p.CreationDate) AS LastQuestionDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1 -- Questions
+    LEFT JOIN Posts a ON u.Id = a.OwnerUserId AND a.PostTypeId = 2 -- Answers
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    WHERE u.DisplayName IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+UserPostInteractions AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(DISTINCT ph.Id) AS PostHistoryCount,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id ELSE NULL END) AS UpVotesReceived,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id ELSE NULL END) AS DownVotesReceived,
+        SUM(CASE WHEN p.FavoriteCount IS NOT NULL THEN p.FavoriteCount ELSE 0 END) AS TotalFavorites,
+        AVG(CASE WHEN p.Score IS NOT NULL THEN CAST(p.Score AS FLOAT) ELSE NULL END) AS AveragePostScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId AND p.Id = v.PostId
+    WHERE u.DisplayName LIKE '%[a-z]%' -- Filter for users with at least one letter in their name
+    GROUP BY u.Id
+),
+CompositeUserScore AS (
+    SELECT
+        rua.UserId,
+        rua.DisplayName,
+        rua.Reputation,
+        rua.CreationDate,
+        rua.RankByReputation,
+        COALESCE(rua.QuestionCount, 0) AS Questions,
+        COALESCE(rua.AnswerCount, 0) AS Answers,
+        COALESCE(upi.PostHistoryCount, 0) AS HistoryEvents,
+        COALESCE(upi.UpVotesReceived, 0) AS ReceivedUpVotes,
+        COALESCE(upi.DownVotesReceived, 0) AS ReceivedDownVotes,
+        COALESCE(rua.HighScoreCommentCount, 0) AS HighScoreComments,
+        COALESCE(upi.TotalFavorites, 0) AS BookmarkedCount,
+        COALESCE(upi.AveragePostScore, 0.0) AS AvgScore,
+        (rua.Reputation * 0.4 +
+         (rua.QuestionCount * 10) * 0.3 +
+         (rua.AnswerCount * 5) * 0.3 +
+         (COALESCE(upi.UpVotesReceived, 0) * 0.1) -
+         (COALESCE(upi.DownVotesReceived, 0) * 0.05)
+        ) AS PerformanceScore
+    FROM RankedUserActivity rua
+    FULL OUTER JOIN UserPostInteractions upi ON rua.UserId = upi.UserId
+    WHERE COALESCE(rua.QuestionCount, 0) + COALESCE(rua.AnswerCount, 0) > 5 -- Users with at least 5 posts (questions or answers)
+)
+SELECT
+    cus.UserId,
+    cus.DisplayName,
+    cus.Reputation,
+    cus.PerformanceScore,
+    CASE
+        WHEN cus.PerformanceScore > 1000 THEN 'Exceptional'
+        WHEN cus.PerformanceScore > 500 THEN 'Excellent'
+        WHEN cus.PerformanceScore > 200 THEN 'Good'
+        WHEN cus.PerformanceScore > 50 THEN 'Average'
+        ELSE 'Novice'
+    END AS PerformanceTier,
+    p.Title AS LastQuestionTitle,
+    p.CreationDate AS LastQuestionDate,
+    CASE
+        WHEN cus.AvgScore > 50 THEN 'Highly Scored'
+        WHEN cus.AvgScore > 10 THEN 'Moderately Scored'
+        ELSE 'Standard Score'
+    END AS ScoreCategory,
+    (
+        SELECT COUNT(*)
+        FROM PostLinks pl
+        WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3 -- Duplicate links
+    ) AS DuplicateLinkCount,
+    (
+        SELECT COUNT(*)
+        FROM Comments c_sub
+        WHERE c_sub.PostId = p.Id AND LENGTH(c_sub.Text) > 200
+    ) AS LongCommentCount,
+    COALESCE(pt.Name, 'Unknown Post Type') AS LastPostType,
+    IIF(cus.Questions > 0 AND cus.Answers > 0, 'Active Contributor', 'Focused Contributor') AS ContributionStyle
+FROM CompositeUserScore cus
+LEFT JOIN Posts p ON cus.UserId = p.OwnerUserId AND p.Id = (
+    SELECT Id
+    FROM Posts
+    WHERE OwnerUserId = cus.UserId AND PostTypeId = 1
+    ORDER BY CreationDate DESC
+    LIMIT 1
+)
+LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+WHERE cus.PerformanceScore > 100 AND cus.Reputation > 1000
+ORDER BY cus.PerformanceScore DESC, cus.Reputation DESC
+LIMIT 50;

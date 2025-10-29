@@ -1,0 +1,190 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 AS Level
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+
+    UNION ALL
+
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        r.Level + 1
+    FROM Tags t
+    JOIN RecursiveTagHierarchy r ON t.Id = r.Id + 1
+    WHERE t.IsRequired = FALSE AND r.Level < 3
+),
+UserBadgeCounts AS (
+    SELECT 
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(*) AS TotalBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+PostScoresWithRanks AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Title,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS UserPostRank,
+        DENSE_RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS ScoreRank
+    FROM Posts p
+    WHERE p.PostTypeId IN (1,2)
+),
+TopPostsWithAnswers AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title AS QuestionTitle,
+        q.Score AS QuestionScore,
+        q.ViewCount AS QuestionViews,
+        q.OwnerUserId AS QuestionOwner,
+        COALESCE(a.AnswerCount,0) AS AnswerCount,
+        COALESCE(aa.AcceptedAnswerScore, 0) AS AcceptedAnswerScore,
+        COALESCE(aa.AcceptedAnswerOwnerReputation,0) AS AcceptedAnswerOwnerReputation
+    FROM Posts q
+    LEFT JOIN (
+        SELECT ParentId, COUNT(*) AS AnswerCount 
+        FROM Posts 
+        WHERE PostTypeId = 2
+        GROUP BY ParentId
+    ) a ON q.Id = a.ParentId
+    LEFT JOIN (
+        SELECT a.ParentId,
+            MAX(a.Score) AS AcceptedAnswerScore,
+            u.Reputation AS AcceptedAnswerOwnerReputation
+        FROM Posts a
+        LEFT JOIN Users u ON a.OwnerUserId = u.Id
+        WHERE a.PostTypeId = 2 AND a.Id IN (
+            SELECT AcceptedAnswerId FROM Posts WHERE AcceptedAnswerId IS NOT NULL
+        )
+        GROUP BY a.ParentId, u.Reputation
+    ) aa ON q.Id = aa.ParentId
+    WHERE q.PostTypeId = 1 
+        AND q.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '6 months')
+),
+CommentRichness AS (
+    SELECT 
+        c.PostId,
+        COUNT(c.Id) AS CommentCount,
+        AVG(CHAR_LENGTH(c.Text)) AS AvgCommentLength,
+        SUM(CASE WHEN c.UserId IS NULL THEN 1 ELSE 0 END) AS AnonymousComments,
+        SUM(CASE WHEN LOWER(c.Text) SIMILAR TO '%(bug|error|fail|issue)%' THEN 1 ELSE 0 END) AS ProblematicComments
+    FROM Comments c
+    GROUP BY c.PostId
+),
+VotesSummary AS (
+    SELECT 
+        v.PostId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        SUM(CASE WHEN v.VoteTypeId = 8 THEN COALESCE(v.BountyAmount,0) ELSE 0 END) AS TotalBounty,
+        COUNT(DISTINCT v.UserId) AS UniqueVoters
+    FROM Votes v
+    GROUP BY v.PostId
+),
+UserActivityWindow AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.CreationDate,
+        u.Reputation,
+        u.Location,
+        -- Replace COUNT(DISTINCT ...) FILTER ... OVER (...) with COUNT(*) FILTER ... OVER (PARTITION BY u.Id ORDER BY ph.CreationDate ROWS BETWEEN 30 PRECEDING AND CURRENT ROW)
+        -- and deduplicate PostId per user per window by using a subquery that yields distinct PostId per CreationDate bucket.
+        COALESCE(
+          SUM(CASE WHEN ph.PostHistoryTypeId IN (10,12) THEN 1 ELSE 0 END) 
+            OVER (PARTITION BY u.Id ORDER BY ph.CreationDate ROWS BETWEEN 30 PRECEDING AND CURRENT ROW),
+          0
+        ) AS CloseOrDeleteEventsLast30Days,
+        COALESCE(
+          SUM(CASE WHEN ph.PostHistoryTypeId = 25 THEN 1 ELSE 0 END)
+            OVER (PARTITION BY u.Id ORDER BY ph.CreationDate ROWS BETWEEN 365 PRECEDING AND CURRENT ROW),
+          0
+        ) AS TweetsLastYear
+    FROM Users u
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+),
+DuplicatePostLinks AS (
+    SELECT 
+        pl.PostId,
+        pl.RelatedPostId,
+        p1.Title AS PostTitle,
+        p2.Title AS RelatedPostTitle
+    FROM PostLinks pl
+    INNER JOIN Posts p1 ON pl.PostId = p1.Id
+    INNER JOIN Posts p2 ON pl.RelatedPostId = p2.Id
+    WHERE pl.LinkTypeId = 3
+)
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    ubc.GoldBadges,
+    ubc.SilverBadges,
+    ubc.BronzeBadges,
+    ua.CloseOrDeleteEventsLast30Days,
+    ua.TweetsLastYear,
+    pswr.Id AS PostId,
+    pswr.PostTypeId,
+    pswr.Score AS PostScore,
+    pswr.ViewCount AS PostViewCount,
+    pswr.UserPostRank,
+    tpa.QuestionTitle,
+    tpa.AnswerCount,
+    tpa.AcceptedAnswerScore,
+    tpa.AcceptedAnswerOwnerReputation,
+    cr.CommentCount,
+    cr.AvgCommentLength,
+    cr.AnonymousComments,
+    cr.ProblematicComments,
+    vs.UpVotes,
+    vs.DownVotes,
+    vs.TotalBounty,
+    vs.UniqueVoters,
+    dtl.RelatedPostId AS DuplicateOfPostId,
+    dtl.RelatedPostTitle AS DuplicateOfPostTitle,
+    CASE 
+        WHEN pswr.Score > AVG(pswr.Score) OVER (PARTITION BY pswr.PostTypeId) THEN 'AboveAverageScore'
+        ELSE 'BelowAverageScore' 
+    END AS ScorePerformance,
+    SUBSTRING(tpa.QuestionTitle || ' - ' || COALESCE(u.Location, 'Unknown Location') FROM 1 FOR 80) AS CombinedTitleLocation,
+    CASE 
+        WHEN u.Reputation > 10000 THEN 'Expert'
+        WHEN u.Reputation BETWEEN 1000 AND 10000 THEN 'Intermediate'
+        ELSE 'Newbie'
+    END AS UserExperienceLevel,
+    CASE 
+        WHEN COALESCE(cr.ProblematicComments,0) > 0 THEN 'FlaggedComments'
+        ELSE 'CleanComments'
+    END AS CommentQualityFlag
+FROM Users u
+LEFT JOIN UserBadgeCounts ubc ON u.Id = ubc.UserId
+LEFT JOIN UserActivityWindow ua ON u.Id = ua.Id
+LEFT JOIN PostScoresWithRanks pswr ON pswr.OwnerUserId = u.Id AND pswr.UserPostRank <= 3
+LEFT JOIN TopPostsWithAnswers tpa ON tpa.QuestionId = pswr.Id
+LEFT JOIN CommentRichness cr ON cr.PostId = pswr.Id
+LEFT JOIN VotesSummary vs ON vs.PostId = pswr.Id
+LEFT JOIN DuplicatePostLinks dtl ON dtl.PostId = pswr.Id
+WHERE (pswr.Score IS NOT NULL AND pswr.Score > 5) OR (COALESCE(ubc.TotalBadges,0) > 5)
+ORDER BY u.Reputation DESC, pswr.Score DESC
+LIMIT 100;

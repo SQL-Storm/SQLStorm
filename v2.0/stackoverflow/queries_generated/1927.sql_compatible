@@ -1,0 +1,260 @@
+WITH RecentHighRepUsers AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate,
+        U.LastAccessDate,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesGiven,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesGiven,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        MAX(P.CreationDate) AS LastPostDate
+    FROM
+        Users U
+    LEFT JOIN
+        Votes V ON U.Id = V.UserId
+    LEFT JOIN
+        Badges B ON U.Id = B.UserId
+    LEFT JOIN
+        Posts P ON U.Id = P.OwnerUserId
+    WHERE
+        U.Reputation >= 50000
+        AND U.LastAccessDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6 months'
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate
+    HAVING
+        COUNT(DISTINCT P.Id) >= 5
+),
+PostCommentAggregates AS (
+    SELECT
+        C.PostId,
+        SUM(C.Score) AS TotalCommentScore,
+        COUNT(C.Id) AS ActualCommentCount,
+        MAX(C.CreationDate) AS LastCommentDate,
+        (SELECT C_sub.Text FROM Comments C_sub WHERE C_sub.PostId = C.PostId ORDER BY C_sub.CreationDate DESC LIMIT 1) AS LatestCommentText
+    FROM
+        Comments C
+    GROUP BY
+        C.PostId
+),
+PostHistoryAggregates AS (
+    SELECT
+        PH.PostId,
+        COUNT(PH.Id) AS TotalHistoryEntries,
+        COUNT(DISTINCT PH.UserId) AS DistinctHistoryEditors,
+        MAX(PH.CreationDate) AS LastHistoryDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.Comment END) AS LatestCloseReasonCommentId,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4,5,6) THEN 1 ELSE 0 END) AS EditHistoryCount
+    FROM
+        PostHistory PH
+    GROUP BY
+        PH.PostId
+),
+PostLinkAggregates AS (
+    SELECT
+        PL.PostId,
+        COUNT(DISTINCT PL.RelatedPostId) AS TotalRelatedLinks,
+        COUNT(DISTINCT PL.RelatedPostId) FILTER (WHERE PL.LinkTypeId = 3) AS DuplicateLinksCount
+    FROM
+        PostLinks PL
+    GROUP BY
+        PL.PostId
+),
+PostVoteAggregates AS (
+    SELECT
+        V.PostId,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+        COUNT(DISTINCT V.UserId) FILTER (WHERE V.VoteTypeId = 5) AS FavoriteCountAgg
+    FROM
+        Votes V
+    WHERE
+        V.VoteTypeId IN (2, 3, 5)
+    GROUP BY
+        V.PostId
+),
+EngagingQuestions AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.Title,
+        P.Body,
+        P.ViewCount,
+        P.AnswerCount,
+        P.Score,
+        P.OwnerUserId,
+        P.CreationDate,
+        P.Tags,
+        P.AcceptedAnswerId,
+        CAST(NULL AS INTEGER) AS ParentId,
+        P.ClosedDate,
+        P.CommunityOwnedDate,
+        COALESCE(PCA.TotalCommentScore, 0) AS TotalCommentScore,
+        COALESCE(PCA.ActualCommentCount, P.CommentCount) AS ActualCommentCount,
+        PCA.LatestCommentText,
+        COALESCE(PHA.TotalHistoryEntries, 0) AS TotalHistoryEntries,
+        COALESCE(PHA.DistinctHistoryEditors, 0) AS DistinctHistoryEditors,
+        PHA.LatestCloseReasonCommentId,
+        PHA.EditHistoryCount,
+        COALESCE(PLA.TotalRelatedLinks, 0) AS TotalRelatedLinks,
+        COALESCE(PLA.DuplicateLinksCount, 0) AS DuplicateLinksCount,
+        COALESCE(PVA.UpVoteCount, 0) AS UpVoteCount,
+        COALESCE(PVA.DownVoteCount, 0) AS DownVoteCount,
+        COALESCE(PVA.FavoriteCountAgg, 0) AS FavoriteCountAgg
+    FROM
+        Posts P
+    JOIN
+        PostTypes PT ON P.PostTypeId = PT.Id
+    LEFT JOIN PostCommentAggregates PCA ON P.Id = PCA.PostId
+    LEFT JOIN PostHistoryAggregates PHA ON P.Id = PHA.PostId
+    LEFT JOIN PostLinkAggregates PLA ON P.Id = PLA.PostId
+    LEFT JOIN PostVoteAggregates PVA ON P.Id = PVA.PostId
+    WHERE
+        P.PostTypeId = 1
+        AND P.OwnerUserId IS NOT NULL
+        AND P.CreationDate BETWEEN CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '3 year' AND CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6 months'
+        AND P.ViewCount > 5000
+        AND P.AnswerCount >= 5
+        AND P.Score >= 50
+        AND COALESCE(PCA.ActualCommentCount,0) >= 10
+),
+EngagingAnswers AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.Title,
+        P.Body,
+        CAST(NULL AS INTEGER) AS ViewCount,
+        CAST(NULL AS INTEGER) AS AnswerCount,
+        P.Score,
+        P.OwnerUserId,
+        P.CreationDate,
+        P.Tags,
+        CAST(NULL AS INTEGER) AS AcceptedAnswerId,
+        P.ParentId,
+        P.ClosedDate,
+        P.CommunityOwnedDate,
+        COALESCE(PCA.TotalCommentScore, 0) AS TotalCommentScore,
+        COALESCE(PCA.ActualCommentCount, P.CommentCount) AS ActualCommentCount,
+        PCA.LatestCommentText,
+        COALESCE(PHA.TotalHistoryEntries, 0) AS TotalHistoryEntries,
+        COALESCE(PHA.DistinctHistoryEditors, 0) AS DistinctHistoryEditors,
+        PHA.LatestCloseReasonCommentId,
+        PHA.EditHistoryCount,
+        COALESCE(PLA.TotalRelatedLinks, 0) AS TotalRelatedLinks,
+        COALESCE(PLA.DuplicateLinksCount, 0) AS DuplicateLinksCount,
+        COALESCE(PVA.UpVoteCount, 0) AS UpVoteCount,
+        COALESCE(PVA.DownVoteCount, 0) AS DownVoteCount,
+        COALESCE(PVA.FavoriteCountAgg, 0) AS FavoriteCountAgg
+    FROM
+        Posts P
+    JOIN
+        PostTypes PT ON P.PostTypeId = PT.Id
+    LEFT JOIN PostCommentAggregates PCA ON P.Id = PCA.PostId
+    LEFT JOIN PostHistoryAggregates PHA ON P.Id = PHA.PostId
+    LEFT JOIN PostLinkAggregates PLA ON P.Id = PLA.PostId
+    LEFT JOIN PostVoteAggregates PVA ON P.Id = PVA.PostId
+    WHERE
+        P.PostTypeId = 2
+        AND P.OwnerUserId IS NOT NULL
+        AND P.ParentId IS NOT NULL
+        AND P.CreationDate BETWEEN CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '3 year' AND CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6 months'
+        AND P.Score >= 100
+        AND COALESCE(PCA.ActualCommentCount,0) >= 5
+        AND COALESCE(PHA.EditHistoryCount,0) >= 2
+),
+UnifiedEngagingPosts AS (
+    SELECT * FROM EngagingQuestions
+    UNION ALL
+    SELECT * FROM EngagingAnswers
+),
+UserOverallPerformance AS (
+    SELECT
+        P.OwnerUserId AS UserId,
+        PT.Name AS PostTypeName,
+        COUNT(P.Id) AS TotalPostsByType,
+        AVG(P.Score) AS AvgScoreByType,
+        SUM(P.ViewCount) AS TotalViewsByType,
+        COALESCE(AVG(NULLIF(P.AnswerCount, 0)), 0) AS AvgAnswersPerQuestion
+    FROM
+        Posts P
+    JOIN
+        PostTypes PT ON P.PostTypeId = PT.Id
+    WHERE
+        P.OwnerUserId IS NOT NULL
+        AND P.PostTypeId IN (1, 2)
+    GROUP BY
+        P.OwnerUserId, PT.Name
+)
+SELECT
+    R.DisplayName AS User_DisplayName,
+    R.Reputation AS User_Reputation,
+    R.CreationDate AS User_CreationDate,
+    R.TotalBadges AS User_TotalBadges,
+    R.TotalUpVotesGiven AS User_TotalUpVotesGiven,
+    R.TotalDownVotesGiven AS User_TotalDownVotesGiven,
+    UEP.PostTypeName AS Post_Type,
+    UEP.PostId AS Post_Id,
+    UEP.Title AS Post_Title,
+    LEFT(UEP.Body, 200) AS Post_BodySnippet,
+    UEP.ViewCount AS Post_ViewCount,
+    UEP.AnswerCount AS Post_AnswerCount,
+    UEP.Score AS Post_Score,
+    COALESCE(UEP.ActualCommentCount, 0) AS Post_ActualCommentCount,
+    UEP.TotalCommentScore AS Post_TotalCommentScore,
+    UEP.LatestCommentText AS Post_LatestCommentText,
+    UEP.UpVoteCount AS Post_UpVotes,
+    UEP.DownVoteCount AS Post_DownVotes,
+    UEP.FavoriteCountAgg AS Post_Favorites,
+    COALESCE(REGEXP_SUBSTR(UEP.Tags, '<([^>]*)>'), 'no-tag') AS PrimaryTag,
+    COALESCE(UOP_Q.AvgScoreByType, 0.0) AS User_AvgQuestionScore,
+    COALESCE(UOP_A.AvgScoreByType, 0.0) AS User_AvgAnswerScore,
+    COALESCE(UOP_Q.TotalPostsByType, 0) AS User_TotalQuestions,
+    COALESCE(UOP_A.TotalPostsByType, 0) AS User_TotalAnswers,
+    UEP.TotalRelatedLinks AS Post_LinkedPostsCount,
+    UEP.DuplicateLinksCount AS Post_DuplicateLinksCount,
+    UEP.TotalHistoryEntries AS Post_TotalHistoryEntries,
+    UEP.DistinctHistoryEditors AS Post_DistinctHistoryEditors,
+    UEP.EditHistoryCount AS Post_EditHistoryCount,
+    LAG(UEP.Score, 1, 0) OVER (PARTITION BY R.UserId, UEP.PostTypeId ORDER BY UEP.CreationDate) AS PreviousPostScoreByType,
+    RANK() OVER (PARTITION BY R.UserId, UEP.PostTypeId ORDER BY UEP.Score DESC, UEP.CreationDate DESC) AS UserPostRankByType,
+    NTILE(4) OVER (ORDER BY UEP.Score DESC, UEP.CreationDate DESC) AS GlobalScoreQuartile,
+    CASE
+        WHEN UEP.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN UEP.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        WHEN UEP.AcceptedAnswerId IS NOT NULL AND UEP.PostTypeId = 1 THEN 'Answered & Accepted'
+        WHEN UEP.ParentId IS NOT NULL AND UEP.PostTypeId = 2 THEN 'Answer to Question'
+        ELSE 'Open & Unanswered/Regular'
+    END AS PostStatusDetail,
+    COALESCE(CR.Name, 'No Specific Close Reason') AS Post_CloseReason,
+    (COALESCE(UEP.Score, 0) * 0.5
+     + COALESCE(UEP.ActualCommentCount, 0) * 0.2
+     + COALESCE(UEP.UpVoteCount, 0) * 0.3
+     - COALESCE(UEP.DownVoteCount, 0) * 0.1
+     + CASE WHEN UEP.PostTypeId = 1 AND UEP.AcceptedAnswerId IS NOT NULL THEN 50 ELSE 0 END
+     + CASE WHEN UEP.PostTypeId = 2 AND UEP.ParentId IS NOT NULL AND UEP.Score >= 200 THEN 30 ELSE 0 END
+    ) AS WeightedEngagementScore,
+    LOWER(REVERSE(SUBSTRING(COALESCE(UEP.Title, UEP.Body, 'No Content'), 1, 10))) AS ReversedBodyTitleStart
+FROM
+    RecentHighRepUsers R
+INNER JOIN
+    UnifiedEngagingPosts UEP ON R.UserId = UEP.OwnerUserId
+LEFT JOIN
+    UserOverallPerformance UOP_Q ON R.UserId = UOP_Q.UserId AND UOP_Q.PostTypeName = 'Question'
+LEFT JOIN
+    UserOverallPerformance UOP_A ON R.UserId = UOP_A.UserId AND UOP_A.PostTypeName = 'Answer'
+LEFT JOIN
+    CloseReasonTypes CR ON UEP.LatestCloseReasonCommentId = CAST(CR.Id AS VARCHAR)
+WHERE
+    (
+        (UEP.PostTypeId = 1 AND UEP.Tags LIKE '%<sql>%' AND COALESCE(UEP.ViewCount,0) > 10000 AND COALESCE(UEP.AnswerCount,0) > 0 AND UEP.AcceptedAnswerId IS NOT NULL)
+        OR
+        (UEP.PostTypeId = 2 AND UEP.ParentId IS NOT NULL AND UEP.Body LIKE '%transaction%' AND UEP.Score >= 150 AND COALESCE(UEP.DistinctHistoryEditors,0) >= 3)
+    )
+    AND UEP.CreationDate IS NOT NULL
+    AND R.Reputation >= 60000
+ORDER BY
+    R.Reputation DESC, WeightedEngagementScore DESC, UEP.CreationDate DESC
+LIMIT 1000;

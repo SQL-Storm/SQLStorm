@@ -1,0 +1,130 @@
+WITH 
+BadgeUsers AS (
+    SELECT DISTINCT b.UserId AS UserId
+    FROM Badges b
+    WHERE b.UserId IS NOT NULL
+),
+ActiveVoters AS (
+    SELECT v.UserId
+    FROM Votes v
+    GROUP BY v.UserId
+    HAVING COUNT(*) >= 50
+),
+CombinedUsers AS (
+    SELECT UserId FROM BadgeUsers
+    UNION
+    SELECT UserId FROM ActiveVoters
+),
+UserStats AS (
+    SELECT 
+        u.Id,
+        COALESCE(u.DisplayName, '<unknown>')               AS DisplayName,
+        u.Reputation,
+        COALESCE(u.Views,0)                                 AS Views,
+        COALESCE(u.UpVotes,0) - COALESCE(u.DownVotes,0)     AS NetVotes,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+        MAX(p.CreationDate)                                AS LastPostDate,
+        MAX(v.CreationDate)                                AS LastVoteDate,
+        STRING_AGG(DISTINCT pt.Name, ',')                  AS PostTypesParticipated
+    FROM Users u
+    LEFT JOIN Badges b      ON b.UserId = u.Id
+    LEFT JOIN Posts p       ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v       ON v.UserId = u.Id
+    LEFT JOIN PostTypes pt  ON p.PostTypeId = pt.Id
+    WHERE u.Id IN (SELECT UserId FROM CombinedUsers)
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+RecentActivity AS (
+    SELECT 
+        us.Id,
+        GREATEST(COALESCE(us.LastPostDate, TIMESTAMP '1970-01-01'), COALESCE(us.LastVoteDate, TIMESTAMP '1970-01-01')) AS LastActivity,
+        ROW_NUMBER() OVER (PARTITION BY us.Id 
+                           ORDER BY GREATEST(COALESCE(us.LastPostDate, TIMESTAMP '1970-01-01'), COALESCE(us.LastVoteDate, TIMESTAMP '1970-01-01')) DESC) AS rn
+    FROM UserStats us
+),
+-- split tags using standard string functions: remove outer <> and split on '><'
+PostTagPairs AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        TRIM(tag) AS TagText
+    FROM Posts p
+    CROSS JOIN LATERAL (
+        SELECT value AS tag
+        FROM UNNEST(
+            CASE
+                WHEN p.Tags IS NULL THEN ARRAY[]::text[]
+                -- remove leading '<' and trailing '>' if present, then split on '><' 
+                ELSE string_split( regexp_replace(p.Tags, '^<|>$', ''), '><' )
+            END
+        ) AS t(value)
+    ) AS s
+),
+TopTags AS (
+    SELECT 
+        t.TagName,
+        COUNT(*)                                            AS TagUseCount,
+        ROW_NUMBER() OVER (ORDER BY COUNT(*) DESC)         AS TagRank
+    FROM PostTagPairs ptp
+    JOIN Tags t ON t.TagName = ptp.TagText
+    WHERE ptp.PostTypeId = 1
+    GROUP BY t.TagName
+    HAVING COUNT(*) > 100
+),
+UserTagAffinity AS (
+    SELECT 
+        u.Id                                            AS UserId,
+        t.TagName,
+        COUNT(*)                                        AS UserTagPosts,
+        RANK() OVER (PARTITION BY u.Id ORDER BY COUNT(*) DESC) AS TagRank
+    FROM Users u
+    JOIN PostTagPairs ptp ON ptp.PostId IN (
+        SELECT p2.Id FROM Posts p2 WHERE p2.OwnerUserId = u.Id
+    )
+    JOIN Tags t ON t.TagName = ptp.TagText
+    WHERE ptp.PostTypeId = 1
+    GROUP BY u.Id, t.TagName
+    HAVING COUNT(*) >= 5
+),
+UserCommentCounts AS (
+    SELECT 
+        u.Id,
+        (SELECT COUNT(*) 
+         FROM Comments c 
+         WHERE c.UserId = u.Id) AS CommentCount
+    FROM Users u
+    WHERE u.Id IN (SELECT UserId FROM CombinedUsers)
+)
+
+SELECT
+    ra.Id,
+    us.DisplayName,
+    us.Reputation,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    us.NetVotes,
+    us.PostTypesParticipated,
+    ra.LastActivity,
+    CASE
+        WHEN us.Reputation > 20000 THEN 'Veteran'
+        WHEN us.Reputation BETWEEN 10000 AND 20000 THEN 'Experienced'
+        ELSE 'Rising'
+    END                                          AS ReputationTier,
+    ucc.CommentCount,
+    STRING_AGG(DISTINCT uta.TagName, ',')  AS Top3UserTags,
+    STRING_AGG(DISTINCT tt.TagName, ',')   AS GlobalTop5Tags
+FROM RecentActivity ra
+JOIN UserStats us          ON us.Id = ra.Id
+LEFT JOIN UserCommentCounts ucc ON ucc.Id = ra.Id
+LEFT JOIN UserTagAffinity uta   ON uta.UserId = ra.Id AND uta.TagRank <= 3
+LEFT JOIN TopTags tt            ON tt.TagRank <= 5
+WHERE ra.rn = 1
+GROUP BY 
+    ra.Id, us.DisplayName, us.Reputation, us.GoldBadges, us.SilverBadges,
+    us.BronzeBadges, us.NetVotes, us.PostTypesParticipated,
+    ra.LastActivity, ReputationTier, ucc.CommentCount
+ORDER BY us.Reputation DESC
+LIMIT 100;

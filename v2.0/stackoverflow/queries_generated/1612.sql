@@ -1,0 +1,198 @@
+-- {"query": "1612.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2756} 
+
+WITH UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.UpVotes AS UserUpVotes,
+        u.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostScore,
+        AVG(COALESCE(p.Score, 0)) AS AvgPostScore,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT ph.Id) AS TotalPostHistoryEvents,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS TotalEditsMade,
+        MAX(p.LastActivityDate) AS LastPostActivity,
+        -- Calculate net votes contribution as a proxy for direct impact
+        (u.UpVotes - u.DownVotes) AS NetVotesContribution,
+        NTILE(4) OVER (ORDER BY u.Reputation DESC) AS ReputationQuartile
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.UpVotes, u.DownVotes
+),
+PostQuestionStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.OwnerUserId,
+        q.CreationDate AS QuestionCreationDate,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        q.CommentCount AS QuestionCommentCount,
+        q.FavoriteCount,
+        q.Title,
+        q.Tags,
+        q.AcceptedAnswerId,
+        COALESCE(qa.Score, 0) AS AcceptedAnswerScore,
+        -- Calculate score density (score per view)
+        CAST(q.Score AS numeric) / NULLIF(q.ViewCount, 0) AS ScorePerView,
+        -- Total score of all answers for this question
+        (SELECT SUM(a.Score) FROM Posts a WHERE a.ParentId = q.Id AND a.PostTypeId = 2) AS TotalAnswersScore,
+        -- Number of distinct users who answered this question
+        (SELECT COUNT(DISTINCT a.OwnerUserId) FROM Posts a WHERE a.ParentId = q.Id AND a.PostTypeId = 2 AND a.OwnerUserId IS NOT NULL) AS DistinctAnswerers,
+        -- Latest major edit date for the question by someone other than the owner
+        (SELECT MAX(ph_edit.CreationDate)
+         FROM PostHistory ph_edit
+         WHERE ph_edit.PostId = q.Id
+           AND ph_edit.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+           AND ph_edit.UserId IS NOT NULL
+           AND ph_edit.UserId <> q.OwnerUserId
+           AND ph_edit.CreationDate < NOW() -- Ensure no future dates
+        ) AS LastExternalEditDate,
+        ROW_NUMBER() OVER (PARTITION BY q.OwnerUserId ORDER BY q.CreationDate DESC) AS UserQuestionRankDesc,
+        DENSE_RANK() OVER (ORDER BY q.ViewCount DESC, q.Score DESC) AS GlobalQuestionRank
+    FROM Posts q
+    LEFT JOIN Posts qa ON q.AcceptedAnswerId = qa.Id
+    WHERE q.PostTypeId = 1
+),
+RecentCloseOrReopenEvents AS (
+    SELECT
+        ph.PostId,
+        ph.CreationDate AS EventDate,
+        ph.PostHistoryTypeId,
+        ph.Comment AS CloseReasonComment,
+        c.Name AS CloseReasonTypeName,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes c ON ph.PostHistoryTypeId = 10 AND CAST(ph.Comment AS smallint) = c.Id -- Assuming Comment can be cast to smallint for close reasons
+    WHERE ph.PostHistoryTypeId IN (10, 11) -- 10 = Post Closed, 11 = Post Reopened
+),
+BadgeMilestones AS (
+    SELECT
+        b.UserId,
+        b.Name AS BadgeName,
+        b.Date AS BadgeDate,
+        b.Class AS BadgeClass,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId, b.Class ORDER BY b.Date ASC) AS RankInClass,
+        -- Calculate time difference between current and previous badge for the user
+        EXTRACT(EPOCH FROM (b.Date - LAG(b.Date, 1, b.Date) OVER (PARTITION BY b.UserId ORDER BY b.Date ASC))) / 86400.0 AS DaysSincePrevBadge
+    FROM Badges b
+),
+LatestBadgeForUser AS (
+    SELECT
+        b.UserId,
+        b.Name AS LatestBadgeName,
+        b.Date AS LatestBadgeDate,
+        b.Class AS LatestBadgeClass,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC) AS rn,
+        -- Calculate time since previous badge for the latest badge, using LAG
+        EXTRACT(EPOCH FROM (b.Date - LAG(b.Date, 1, b.Date) OVER (PARTITION BY b.UserId ORDER BY b.Date ASC))) / 86400.0 AS DaysSincePrevBadgeForLatest
+    FROM Badges b
+),
+ProcessedTags AS (
+    SELECT
+        p.Id AS PostId,
+        TRIM(UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><'))) AS TagName
+    FROM Posts p
+    WHERE p.Tags IS NOT NULL AND p.Tags <> ' ' AND p.PostTypeId = 1 -- Only questions have meaningful tags like this
+)
+SELECT
+    ue.DisplayName,
+    ue.Reputation,
+    ue.TotalQuestions,
+    ue.TotalAnswers,
+    ue.AvgPostScore,
+    ue.NetVotesContribution,
+    ue.ReputationQuartile,
+    pqs.QuestionId,
+    pqs.QuestionCreationDate,
+    pqs.QuestionScore,
+    pqs.ViewCount,
+    pqs.AnswerCount,
+    pqs.FavoriteCount,
+    pqs.Title AS QuestionTitle,
+    COALESCE(pqs.AcceptedAnswerScore, 0) AS AcceptedAnswerScore,
+    pqs.ScorePerView,
+    pqs.TotalAnswersScore,
+    pqs.DistinctAnswerers,
+    pqs.LastExternalEditDate,
+    CASE
+        WHEN pqs.LastExternalEditDate IS NOT NULL AND pqs.LastExternalEditDate > pqs.QuestionCreationDate THEN 'ExternalEditPresent'
+        ELSE 'NoExternalEdit'
+    END AS ExternalEditStatus,
+    rcre.EventDate AS LastCloseReopenDate,
+    rcre.CloseReasonTypeName,
+    lbu.LatestBadgeName AS RecentBadgeName,
+    lbu.LatestBadgeDate AS RecentBadgeDate,
+    lbu.DaysSincePrevBadgeForLatest AS DaysSinceLastBadge,
+    pt.TagName AS PrimaryTag,
+    -- Aggregate gold and silver badge counts for each user
+    SUM(CASE WHEN bm_all.BadgeClass = 1 THEN 1 ELSE 0 END) OVER (PARTITION BY ue.UserId) AS GoldBadgesCount,
+    SUM(CASE WHEN bm_all.BadgeClass = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY ue.UserId) AS SilverBadgesCount,
+    -- Correlated subquery: check if user has ever received a 'Great Answer' badge
+    EXISTS (
+        SELECT 1
+        FROM Badges sub_b
+        WHERE sub_b.UserId = ue.UserId
+          AND sub_b.Name = 'Great Answer'
+    ) AS HasGreatAnswerBadge,
+    -- Nested subquery for average comment score on user's specific question
+    (
+        SELECT
+            AVG(c_q.Score)
+        FROM Comments c_q
+        WHERE c_q.PostId = pqs.QuestionId AND c_q.UserId IS NOT NULL
+          AND c_q.CreationDate > pqs.QuestionCreationDate -- Only comments after question creation
+    ) AS AvgQuestionCommentScore,
+    -- String manipulation and NULL logic on Tags: extract first 10 chars of first tag, convert to upper, handle NULLs
+    COALESCE(
+        UPPER(SUBSTRING(pqs.Tags, 2, LEAST(LENGTH(pqs.Tags) - 2, 10))),
+        'NO_TAGS_FOUND'
+    ) AS FirstTagFragmentUpper,
+    -- Conditional categorization based on view count and favorite count
+    CASE
+        WHEN pqs.ViewCount > 10000 AND pqs.FavoriteCount > 100 THEN
+            'Highly Viewed & Favorited'
+        WHEN pqs.ViewCount BETWEEN 1000 AND 9999 AND pqs.FavoriteCount BETWEEN 10 AND 99 THEN
+            'Moderately Popular'
+        WHEN pqs.ViewCount IS NULL OR pqs.ViewCount < 1000 THEN
+            'Low Engagement'
+        ELSE
+            'Other Engagement Category'
+    END AS EngagementCategory,
+    -- Calculate a weighted quality score for the question, incorporating various metrics and penalties
+    (pqs.QuestionScore * 0.5) + (COALESCE(pqs.AcceptedAnswerScore, 0) * 0.3) + (COALESCE(pqs.ScorePerView, 0) * 100 * 0.2)
+    + (CASE WHEN pqs.LastExternalEditDate IS NOT NULL THEN -5 ELSE 0 END) -- Penalty for external edits
+    AS WeightedQuestionQualityScore,
+    -- Ranking of the question within the user's questions based on score and views
+    pqs.UserQuestionRankDesc,
+    pqs.GlobalQuestionRank
+FROM UserEngagement ue
+LEFT JOIN PostQuestionStats pqs ON ue.UserId = pqs.OwnerUserId
+LEFT JOIN RecentCloseOrReopenEvents rcre ON pqs.QuestionId = rcre.PostId AND rcre.rn = 1
+LEFT JOIN LatestBadgeForUser lbu ON ue.UserId = lbu.UserId AND lbu.rn = 1
+LEFT JOIN ProcessedTags pt ON pqs.QuestionId = pt.PostId
+LEFT JOIN Badges bm_all ON ue.UserId = bm_all.UserId -- For aggregate badge counts using window functions
+WHERE
+    ue.Reputation >= 1000 -- Focus on more established users
+    AND ue.TotalQuestions >= 5
+    AND ue.TotalAnswers > 0
+    AND pqs.QuestionScore IS NOT NULL AND pqs.QuestionScore > 0 -- Exclude questions without a positive score
+    AND pqs.QuestionCreationDate BETWEEN '2019-01-01' AND '2023-12-31'
+    AND pqs.ScorePerView IS NOT NULL AND pqs.ScorePerView > 0.001 -- Filter for questions with some engagement per view
+    AND (rcre.PostId IS NULL OR rcre.CloseReasonTypeName IS NOT NULL) -- Ensure close reason is present if post was closed
+    AND NOT (pqs.Tags LIKE '%<sql>%' AND pqs.Tags LIKE '%<t-sql>%') -- Exclude posts tagged with both 'sql' and 't-sql'
+    AND ue.DisplayName NOT LIKE 'user%' -- Exclude generic display names
+    AND ue.DisplayName IS NOT NULL
+ORDER BY
+    WeightedQuestionQualityScore DESC,
+    ue.Reputation DESC,
+    pqs.QuestionCreationDate DESC
+LIMIT 500;

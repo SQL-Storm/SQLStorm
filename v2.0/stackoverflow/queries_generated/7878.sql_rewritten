@@ -1,0 +1,243 @@
+-- {"query": "7878.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2150} 
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+        LEAD(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as next_score,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) as total_posts_by_user,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as avg_score_by_user,
+        CASE 
+            WHEN p.Score > (SELECT AVG(Score) FROM Posts WHERE OwnerUserId = p.OwnerUserId) 
+            THEN 'Above Average' 
+            ELSE 'Below Average' 
+        END as score_category
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as total_posts,
+        COUNT(DISTINCT c.Id) as total_comments,
+        COUNT(DISTINCT b.Id) as total_badges,
+        MAX(p.CreationDate) as last_post_date,
+        MIN(p.CreationDate) as first_post_date,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 
+            THEN DATEDIFF(DAY, MIN(p.CreationDate), MAX(p.CreationDate)) 
+            ELSE 0 
+        END as active_days,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 AND COUNT(DISTINCT p.Id) > 0 
+            THEN (CAST(SUM(p.Score) AS FLOAT) / CAST(COUNT(DISTINCT p.Id) AS FLOAT)) 
+            ELSE 0 
+        END as avg_posts_score,
+        STRING_AGG(p.Title, ' | ') as all_titles
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostTagAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Tags,
+        p.Score,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags != '' 
+            THEN STRING_TO_ARRAY(REPLACE(REPLACE(p.Tags, '<', ''), '>', ''), '<>') 
+            ELSE ARRAY[]::varchar[] 
+        END as tag_array,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags != '' 
+            THEN ARRAY_LENGTH(STRING_TO_ARRAY(REPLACE(REPLACE(p.Tags, '<', ''), '>', ''), '<>'), 1) 
+            ELSE 0 
+        END as tag_count,
+        COALESCE((SELECT AVG(Score) FROM Posts WHERE Tags LIKE '%' || t.tag_val || '%'), 0) as avg_score_for_tag
+    FROM Posts p
+    CROSS JOIN LATERAL (
+        SELECT unnest(STRING_TO_ARRAY(REPLACE(REPLACE(p.Tags, '<', ''), '>', ''), '<>')) AS tag_val
+    ) t
+    WHERE p.PostTypeId = 1
+),
+ComplexFiltering AS (
+    SELECT 
+        rp.*,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.total_posts,
+        uas.avg_posts_score,
+        pta.tag_array,
+        pta.tag_count,
+        pta.avg_score_for_tag,
+        CASE 
+            WHEN rp.prev_score IS NOT NULL AND rp.next_score IS NOT NULL 
+            THEN CAST(rp.Score - rp.prev_score AS FLOAT) / NULLIF(rp.next_score - rp.prev_score, 0) 
+            ELSE 0 
+        END as score_change_factor,
+        IIF(rp.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1), 1, 0) as is_high_scoring_question,
+        CASE 
+            WHEN rp.Score > 100 AND rp.ViewCount > 1000 THEN 'Viral'
+            WHEN rp.Score > 50 AND rp.ViewCount > 500 THEN 'Popular'
+            WHEN rp.Score > 10 AND rp.ViewCount > 100 THEN 'Moderate'
+            ELSE 'Low'
+        END as popularity_level,
+        CASE 
+            WHEN rp.AnswerCount IS NOT NULL AND rp.AnswerCount > 0 
+            THEN CAST(rp.Score AS FLOAT) / NULLIF(rp.AnswerCount, 0) 
+            ELSE 0 
+        END as score_per_answer,
+        DATEDIFF(DAY, rp.CreationDate, cast('2024-10-01 12:34:56' as timestamp)) as days_since_creation,
+        CASE 
+            WHEN EXISTS (
+                SELECT 1 
+                FROM Comments c 
+                WHERE c.PostId = rp.Id 
+                AND c.CreationDate > rp.CreationDate 
+                AND c.CreationDate < DATEADD(DAY, 30, rp.CreationDate)
+            ) 
+            THEN 'Has Recent Comments' 
+            ELSE 'No Recent Comments' 
+        END as comment_status
+    FROM RankedPosts rp
+    INNER JOIN UserActivityStats uas ON rp.OwnerUserId = uas.UserId
+    LEFT JOIN PostTagAnalysis pta ON rp.Id = pta.PostId
+    WHERE rp.rn = 1
+    AND rp.Score >= 0
+    AND (rp.PostTypeId = 1 OR (rp.PostTypeId = 2 AND r.Score > 0))
+),
+FinalMetrics AS (
+    SELECT 
+        *,
+        ROW_NUMBER() OVER (ORDER BY Score DESC, ViewCount DESC) as global_rank,
+        PERCENT_RANK() OVER (ORDER BY Score) as score_percentile,
+        NTILE(10) OVER (ORDER BY Score) as score_decile,
+        CASE 
+            WHEN Score >= (SELECT PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY Score) FROM Posts WHERE PostTypeId = 1) 
+            THEN 1 
+            ELSE 0 
+        END as top_5_percent,
+        CASE 
+            WHEN Score >= (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) 
+            THEN 'Above Average' 
+            ELSE 'Below Average' 
+        END as score_vs_avg,
+        CASE 
+            WHEN AnswerCount IS NOT NULL AND AnswerCount > 0 
+            THEN 'Answered' 
+            ELSE 'Unanswered' 
+        END as answered_status,
+        COALESCE(
+            (SELECT COUNT(*) FROM Posts p2 WHERE p2.ParentId = cm.Id AND p2.PostTypeId = 2), 
+            0
+        ) as answer_count_with_calculation,
+        STRING_AGG(
+            CASE 
+                WHEN tag_element IS NOT NULL THEN tag_element 
+                ELSE '' 
+            END, 
+            ', '
+        ) WITHIN GROUP (ORDER BY tag_element) as consolidated_tags,
+        CASE 
+            WHEN total_posts_by_user > 0 
+            THEN CAST(Score AS FLOAT) / NULLIF(total_posts_by_user, 0) 
+            ELSE 0 
+        END as score_per_total_post,
+        NULLIF(avg_score_by_user, 0) as normalized_avg_score,
+        CASE 
+            WHEN score_category = 'Above Average' THEN 'High Performer' 
+            ELSE 'Standard Performer' 
+        END as performance_level
+    FROM ComplexFiltering cm
+    CROSS JOIN LATERAL (
+        SELECT unnest(tag_array) as tag_element
+    ) tags
+    GROUP BY 
+        cm.Id, cm.PostTypeId, cm.OwnerUserId, cm.Score, cm.ViewCount, cm.CreationDate, 
+        cm.Title, cm.Tags, cm.AnswerCount, cm.CommentCount, cm.FavoriteCount, 
+        cm.rn, cm.prev_score, cm.next_score, cm.total_posts_by_user, 
+        cm.avg_score_by_user, cm.score_category, cm.DisplayName, cm.Reputation, 
+        cm.total_posts, cm.avg_posts_score, cm.tag_array, cm.tag_count, 
+        cm.avg_score_for_tag, cm.score_change_factor, cm.is_high_scoring_question, 
+        cm.popularity_level, cm.score_per_answer, cm.days_since_creation, 
+        cm.comment_status, cm.global_rank, cm.score_percentile, cm.score_decile, 
+        cm.top_5_percent, cm.score_vs_avg, cm.answered_status, cm.answer_count_with_calculation, 
+        cm.score_per_total_post, cm.normalized_avg_score, cm.performance_level
+)
+SELECT 
+    Id,
+    PostTypeId,
+    OwnerUserId,
+    Score,
+    ViewCount,
+    CreationDate,
+    Title,
+    Tags,
+    AnswerCount,
+    CommentCount,
+    FavoriteCount,
+    DisplayName,
+    Reputation,
+    total_posts,
+    avg_posts_score,
+    tag_count,
+    avg_score_for_tag,
+    score_change_factor,
+    is_high_scoring_question,
+    popularity_level,
+    score_per_answer,
+    days_since_creation,
+    comment_status,
+    global_rank,
+    score_percentile,
+    score_decile,
+    top_5_percent,
+    score_vs_avg,
+    answered_status,
+    answer_count_with_calculation,
+    score_per_total_post,
+    normalized_avg_score,
+    performance_level,
+    consolidated_tags
+FROM FinalMetrics
+WHERE (
+    Score > 0 
+    OR AnswerCount > 0 
+    OR CommentCount > 0
+)
+AND (
+    Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) 
+    OR ViewCount > (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = 1)
+)
+AND (
+    tag_count > 0 
+    OR Tags IS NOT NULL
+)
+AND (
+    CASE 
+        WHEN score_change_factor >= 0 THEN 'Positive Trend' 
+        WHEN score_change_factor < 0 THEN 'Negative Trend' 
+        ELSE 'Neutral Trend' 
+    END = 'Positive Trend' 
+    OR score_change_factor IS NULL
+)
+ORDER BY Score DESC, ViewCount DESC
+LIMIT 1000;

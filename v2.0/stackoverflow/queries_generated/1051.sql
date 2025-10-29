@@ -1,0 +1,146 @@
+-- {"query": "1051.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1990} 
+
+WITH UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS TotalAnswerScore,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE NULL END) AS AvgQuestionViewCount,
+        RANK() OVER (PARTITION BY EXTRACT(YEAR FROM u.CreationDate) ORDER BY u.Reputation DESC, u.UpVotes DESC) AS RepRankByYear,
+        NTILE(4) OVER (ORDER BY u.Reputation DESC) AS ReputationQuartile,
+        COALESCE(u.Location, 'Unknown') AS UserLocation
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.UpVotes, u.DownVotes, u.Location
+),
+PostDetails AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.OwnerUserId,
+        COALESCE(p.OwnerDisplayName, u_owner.DisplayName, 'Community') AS ActualOwnerDisplayName,
+        p.LastEditorUserId,
+        u_editor.DisplayName AS LastEditorDisplayName,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount AS PostCommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        (SELECT COUNT(ph.Id) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4,5,6)) AS EditCount,
+        (SELECT SUM(s.Score) FROM Comments s WHERE s.PostId = p.Id) AS TotalCommentScore,
+        AGE(CURRENT_TIMESTAMP, p.CreationDate) AS PostAge,
+        CASE
+            WHEN p.FavoriteCount >= 100 AND p.Score >= 50 THEN 'High Engagement'
+            WHEN p.FavoriteCount >= 20 OR p.Score >= 10 THEN 'Medium Engagement'
+            ELSE 'Low Engagement'
+        END AS EngagementLevel,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS RankByScoreViews
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Users u_owner ON p.OwnerUserId = u_owner.Id
+    LEFT JOIN Users u_editor ON p.LastEditorUserId = u_editor.Id
+),
+TagMetrics AS (
+    SELECT
+        LOWER(TRIM(REPLACE(REPLACE(tag_array.value, '&quot;', '"'), '&#39;', ''''))) AS TagName,
+        COUNT(DISTINCT pd.PostId) AS PostsWithTagCount,
+        AVG(pd.PostScore) AS AvgPostScoreForTag,
+        SUM(CASE WHEN pd.ClosedDate IS NOT NULL THEN 1 ELSE 0 END) AS ClosedPostsWithTagCount
+    FROM PostDetails pd
+    CROSS JOIN LATERAL UNNEST(string_to_array(SUBSTRING(pd.Tags FROM 2 FOR LENGTH(pd.Tags) - 2), '><')) AS tag_array(value)
+    WHERE pd.Tags IS NOT NULL AND LENGTH(pd.Tags) > 2
+    GROUP BY TagName
+    HAVING COUNT(DISTINCT pd.PostId) > 100
+),
+PostCloseAnalysis AS (
+    SELECT
+        ph.PostId,
+        cr.Name AS CloseReasonName,
+        COUNT(ph.Id) AS CloseVoteCount,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY COUNT(ph.Id) DESC) AS CloseReasonRank
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes cr ON ph.PostHistoryTypeId = 10 AND ph.Comment::smallint = cr.Id -- Assuming Comment stores CloseReasonId for type 10
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.PostId, cr.Name
+)
+SELECT
+    ue.DisplayName AS User_DisplayName,
+    ue.Reputation,
+    ue.ReputationQuartile,
+    ue.UserCreationDate,
+    ue.TotalPosts,
+    ue.TotalComments,
+    ue.TotalBadges,
+    ue.AvgQuestionViewCount,
+    pd.PostTypeName,
+    pd.PostId,
+    pd.Title AS Post_Title,
+    pd.PostCreationDate,
+    pd.PostScore,
+    pd.ViewCount AS Post_ViewCount,
+    pd.PostAge,
+    pd.EngagementLevel,
+    pd.EditCount,
+    pd.LastEditorDisplayName,
+    pd.LastEditDate,
+    pd.ClosedDate,
+    pca.CloseReasonName,
+    pca.CloseVoteCount,
+    tm.TagName AS MostFrequentTag,
+    tm.PostsWithTagCount AS MostFrequentTagPostsCount,
+    tm.AvgPostScoreForTag AS MostFrequentTagAvgScore,
+    (SELECT COUNT(DISTINCT v.UserId) FROM Votes v WHERE v.PostId = pd.PostId AND v.VoteTypeId = 5) AS TotalFavoritedByUsers,
+    (SELECT AVG(p_ans.Score) FROM Posts p_ans WHERE p_ans.ParentId = pd.PostId AND p_ans.PostTypeId = 2) AS AvgAnswerScoreForQuestion,
+    CASE
+        WHEN pd.PostTypeId = 1 AND pd.AcceptedAnswerId IS NOT NULL THEN 'Accepted Answer'
+        WHEN pd.PostTypeId = 1 AND pd.AcceptedAnswerId IS NULL AND pd.AnswerCount > 0 THEN 'No Accepted Answer'
+        WHEN pd.PostTypeId = 1 AND pd.AnswerCount = 0 THEN 'No Answers Yet'
+        ELSE 'N/A'
+    END AS QuestionStatus,
+    COALESCE(LOWER(SUBSTRING(TRIM(pd.Title) FROM 1 FOR 50)), 'Untitled') AS ShortTitlePreview,
+    LAG(pd.PostScore, 1, 0) OVER (PARTITION BY ue.UserId ORDER BY pd.PostCreationDate) AS PreviousPostScoreByAuthor,
+    LEAD(pd.PostScore, 1, 0) OVER (PARTITION BY ue.UserId ORDER BY pd.PostCreationDate) AS NextPostScoreByAuthor
+FROM UserEngagement ue
+JOIN PostDetails pd ON ue.UserId = pd.OwnerUserId
+LEFT JOIN PostCloseAnalysis pca ON pd.PostId = pca.PostId AND pca.CloseReasonRank = 1
+LEFT JOIN (
+    SELECT
+        PostId,
+        LOWER(TRIM(REPLACE(REPLACE(tag_array.value, '&quot;', '"'), '&#39;', ''''))) AS TagName,
+        ROW_NUMBER() OVER (PARTITION BY PostId ORDER BY COUNT(*) DESC) as rn
+    FROM PostDetails
+    CROSS JOIN LATERAL UNNEST(string_to_array(SUBSTRING(Tags FROM 2 FOR LENGTH(Tags) - 2), '><')) AS tag_array(value)
+    WHERE Tags IS NOT NULL AND LENGTH(Tags) > 2
+    GROUP BY PostId, tag_array.value
+) AS post_top_tag ON pd.PostId = post_top_tag.PostId AND post_top_tag.rn = 1
+LEFT JOIN TagMetrics tm ON post_top_tag.TagName = tm.TagName
+WHERE
+    ue.Reputation > 5000
+    AND pd.PostTypeId IN (1, 2)
+    AND pd.PostScore > 5
+    AND pd.PostCreationDate >= '2020-01-01'
+    AND (pd.ClosedDate IS NULL OR pca.CloseReasonName IS NOT NULL)
+    AND pd.ViewCount > (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = pd.PostTypeId)
+ORDER BY
+    ue.Reputation DESC,
+    pd.PostCreationDate DESC,
+    pd.PostScore DESC
+LIMIT 1000;

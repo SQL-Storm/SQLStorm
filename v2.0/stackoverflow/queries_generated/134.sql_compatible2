@@ -1,0 +1,435 @@
+with recent_activity as (
+    select
+        p.id as post_id,
+        p.posttypeid,
+        p.owneruserid,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        p.title,
+        p.tags,
+        coalesce(p.answercount, 0) as answercount,
+        p.closeddate,
+        p.lastactivitydate,
+        u.reputation,
+        u.location,
+        u.displayname as owner_name
+    from posts p
+    left join users u on u.id = p.owneruserid
+    where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+),
+post_scores as (
+    select
+        ra.post_id,
+        ra.posttypeid,
+        ra.owneruserid,
+        ra.creationdate,
+        ra.title,
+        ra.tags,
+        ra.viewcount,
+        ra.answercount,
+        ra.closeddate,
+        ra.lastactivitydate,
+        ra.reputation,
+        ra.location,
+        ra.owner_name,
+        sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end) as net_votes,
+        sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+        sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_sum,
+        count(*) filter (where v.votetypeid in (2,3,5,8,9)) as total_vote_events
+    from recent_activity ra
+    left join votes v on v.postid = ra.post_id
+      and v.creationdate >= ra.creationdate
+    group by
+        ra.post_id, ra.posttypeid, ra.owneruserid, ra.creationdate, ra.title, ra.tags,
+        ra.viewcount, ra.answercount, ra.closeddate, ra.lastactivitydate, ra.reputation, ra.location, ra.owner_name
+),
+comment_stats as (
+    select
+        c.postid,
+        count(*) as comment_count,
+        coalesce(sum(case when c.score > 0 then 1 else 0 end),0) as positive_comments,
+        max(c.creationdate) as last_comment_at,
+        avg(nullif(length(c.text),0)) as avg_comment_len
+    from comments c
+    where c.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+    group by c.postid
+),
+edit_events as (
+    select
+        ph.postid,
+        count(*) filter (where ph.posthistorytypeid in (4,5,6,7,8,9,24)) as edit_count,
+        max(ph.creationdate) as last_edit_at,
+        bool_or(ph.posthistorytypeid in (10,11,12,13,14,15,19,20,35)) as had_moderation
+    from posthistory ph
+    where ph.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+    group by ph.postid
+),
+linking as (
+    select
+        pl.postid,
+        count(*) filter (where pl.linktypeid = 1) as linked_count,
+        count(*) filter (where pl.linktypeid = 3) as duplicate_count,
+        max(pl.creationdate) as last_link_at
+    from postlinks pl
+    where pl.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+    group by pl.postid
+),
+tag_explode as (
+    select
+        p.id as post_id,
+        unnest(string_to_array(substring(p.tags, 2, greatest(length(p.tags)-2,0)), '><')) as tagname
+    from posts p
+    where p.posttypeid = 1
+      and p.tags is not null
+      and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+),
+tag_quality as (
+    select
+        te.post_id,
+        count(*) as tag_count,
+        sum(case when t.count > 0 then 1 else 0 end) as known_tags,
+        avg(ln(greatest(t.count,1))) as avg_tag_popularity
+    from tag_explode te
+    left join tags t on lower(t.tagname) = lower(te.tagname)
+    group by te.post_id
+),
+user_badges as (
+    select
+        u.id as user_id,
+        count(*) as total_badges,
+        count(*) filter (where b.class = 1) as gold_badges,
+        count(*) filter (where b.class = 2) as silver_badges,
+        count(*) filter (where b.class = 3) as bronze_badges,
+        max(b.date) as last_badge_at
+    from users u
+    left join badges b on b.userid = u.id
+    group by u.id
+),
+dup_clusters as (
+    select
+        q.id as original_qid,
+        a.id as answer_id,
+        row_number() over (partition by q.id order by a.score desc nulls last, a.creationdate asc) as rn
+    from posts q
+    join posts a on a.parentid = q.id and a.posttypeid = 2
+    where q.posttypeid = 1
+      and q.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+),
+accepted_vs_top as (
+    select
+        q.id as question_id,
+        q.acceptedanswerid,
+        sum(case when dc.rn = 1 then 1 else 0 end) as has_top_answer,
+        sum(case when dc.rn = 1 and dc.answer_id = q.acceptedanswerid then 1 else 0 end) as accepted_is_top
+    from posts q
+    left join dup_clusters dc on dc.original_qid = q.id
+    where q.posttypeid = 1
+      and q.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+    group by q.id, q.acceptedanswerid
+),
+activity_rank as (
+    select
+        ps.*,
+        cs.comment_count,
+        cs.positive_comments,
+        cs.last_comment_at,
+        cs.avg_comment_len,
+        ee.edit_count,
+        ee.last_edit_at,
+        ee.had_moderation,
+        lk.linked_count,
+        lk.duplicate_count,
+        lk.last_link_at,
+        tq.tag_count,
+        tq.known_tags,
+        tq.avg_tag_popularity,
+        ub.total_badges,
+        ub.gold_badges,
+        ub.silver_badges,
+        ub.bronze_badges,
+        avs.accepted_is_top,
+        avs.has_top_answer,
+        (coalesce(ps.net_votes,0) * 3
+         + coalesce(ps.favorites,0) * 2
+         + coalesce(ps.bounty_sum,0) * 0.01
+         + coalesce(cs.comment_count,0) * 0.5
+         + coalesce(ee.edit_count,0) * 0.75
+         + coalesce(lk.linked_count,0) * 1.25
+         - coalesce(lk.duplicate_count,0) * 2
+         + coalesce(case when ps.posttypeid = 1 then ps.answercount else 0 end,0) * 0.8
+         + coalesce(case when avs.accepted_is_top = 1 then 2 else 0 end,0)
+         + coalesce(ub.gold_badges,0) * 0.2
+        ) as composite_score
+    from post_scores ps
+    left join comment_stats cs on cs.postid = ps.post_id
+    left join edit_events ee on ee.postid = ps.post_id
+    left join linking lk on lk.postid = ps.post_id
+    left join tag_quality tq on tq.post_id = ps.post_id
+    left join user_badges ub on ub.user_id = ps.owneruserid
+    left join accepted_vs_top avs on avs.question_id = ps.post_id
+),
+post_dimensions as (
+    select
+        ar.*,
+        case when ar.posttypeid = 1 then 'Question'
+             when ar.posttypeid = 2 then 'Answer'
+             else 'Other' end as post_type_name,
+        case when ar.closeddate is not null then 1 else 0 end as is_closed,
+        extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - ar.creationdate)) / 86400.0 as age_days,
+        nullif(position('java' in lower(coalesce(ar.tags,''))),0) as has_java,
+        nullif(position('python' in lower(coalesce(ar.tags,''))),0) as has_python,
+        case
+            when ar.location ~* '(us|united states|usa)' then 'US'
+            when ar.location ~* '(india)' then 'IN'
+            when ar.location ~* '(uk|united kingdom|england|scotland|wales)' then 'UK'
+            when ar.location is null then 'Unknown'
+            else 'Other'
+        end as user_region
+    from activity_rank ar
+),
+median_calc as (
+    select
+        nt.post_id,
+        nt.net_votes,
+        nt.composite_score,
+        nt.posttypeid,
+        nt.owneruserid,
+        nt.creationdate,
+        nt.title,
+        nt.tags,
+        nt.viewcount,
+        nt.answercount,
+        nt.closeddate,
+        nt.lastactivitydate,
+        nt.reputation,
+        nt.location,
+        nt.owner_name,
+        nt.comment_count,
+        nt.positive_comments,
+        nt.last_comment_at,
+        nt.avg_comment_len,
+        nt.edit_count,
+        nt.last_edit_at,
+        nt.had_moderation,
+        nt.linked_count,
+        nt.duplicate_count,
+        nt.last_link_at,
+        nt.tag_count,
+        nt.known_tags,
+        nt.avg_tag_popularity,
+        nt.total_badges,
+        nt.gold_badges,
+        nt.silver_badges,
+        nt.bronze_badges,
+        nt.accepted_is_top,
+        nt.has_top_answer,
+        nt.post_type_name,
+        nt.is_closed,
+        nt.age_days,
+        nt.has_java,
+        nt.has_python,
+        nt.user_region
+    from post_dimensions nt
+),
+agg_stats as (
+    select
+        count(*) as cnt,
+        avg(coalesce(net_votes,0)) as avg_votes,
+        stddev_pop(coalesce(net_votes,0)) as sd_votes
+    from median_calc
+),
+median_value as (
+    select
+        case
+            when cnt = 0 then 0
+            else (
+                select avg(val) from (
+                    select val, row_number() over (order by val) as rn, cnt as total_cnt
+                    from (
+                        select unnest(array_agg(coalesce(net_votes,0) order by coalesce(net_votes,0))) as val
+                        from median_calc
+                    ) s
+                ) t
+                where t.rn in (cast(floor((t.total_cnt+1)/2.0) as integer), cast(ceil((t.total_cnt+1)/2.0) as integer))
+            )
+        end as median_votes
+    from agg_stats
+),
+normalized as (
+    select
+        pd.post_id,
+        pd.posttypeid,
+        pd.owneruserid,
+        pd.creationdate,
+        pd.title,
+        pd.tags,
+        pd.viewcount,
+        pd.answercount,
+        pd.closeddate,
+        pd.lastactivitydate,
+        pd.reputation,
+        pd.location,
+        pd.owner_name,
+        pd.net_votes,
+        pd.favorites,
+        pd.bounty_sum,
+        pd.total_vote_events,
+        pd.comment_count,
+        pd.positive_comments,
+        pd.last_comment_at,
+        pd.avg_comment_len,
+        pd.edit_count,
+        pd.last_edit_at,
+        pd.had_moderation,
+        pd.linked_count,
+        pd.duplicate_count,
+        pd.last_link_at,
+        pd.tag_count,
+        pd.known_tags,
+        pd.avg_tag_popularity,
+        pd.total_badges,
+        pd.gold_badges,
+        pd.silver_badges,
+        pd.bronze_badges,
+        pd.accepted_is_top,
+        pd.has_top_answer,
+        pd.post_type_name,
+        pd.is_closed,
+        pd.age_days,
+        pd.has_java,
+        pd.has_python,
+        pd.user_region,
+        mv.median_votes,
+        ag.avg_votes,
+        ag.sd_votes,
+        rank() over (order by pd.composite_score desc nulls last) as score_rank,
+        dense_rank() over (partition by pd.post_type_name order by pd.composite_score desc nulls last) as rank_within_type,
+        row_number() over (partition by pd.user_region order by pd.composite_score desc nulls last, pd.lastactivitydate desc nulls last) as regional_rownum,
+        lag(pd.composite_score) over (order by pd.lastactivitydate) as prev_score,
+        lead(pd.composite_score) over (order by pd.lastactivitydate) as next_score,
+        pd.composite_score
+    from post_dimensions pd
+    cross join agg_stats ag
+    cross join median_value mv
+),
+anomalies as (
+    select
+        n.*,
+        case
+            when n.sd_votes > 0 and (coalesce(n.net_votes,0) - n.avg_votes) / nullif(n.sd_votes,0) > 3 then 'HighOutlier'
+            when n.sd_votes > 0 and (coalesce(n.net_votes,0) - n.avg_votes) / nullif(n.sd_votes,0) < -3 then 'LowOutlier'
+            else 'Normal'
+        end as vote_outlier_flag,
+        case
+            when n.is_closed = 1 and coalesce(n.net_votes,0) > coalesce(n.median_votes,0) then 'ClosedButPopular'
+            when n.is_closed = 0 and coalesce(n.net_votes,0) < 0 then 'OpenButNegative'
+            else 'Typical'
+        end as status_flag
+    from normalized n
+),
+user_activity_summary as (
+    select
+        u.id as user_id,
+        count(*) filter (where p.posttypeid = 1) as q_count,
+        count(*) filter (where p.posttypeid = 2) as a_count,
+        avg(p.score) filter (where p.posttypeid in (1,2)) as avg_score,
+        sum(case when p.communityowneddate is not null then 1 else 0 end) as wiki_contribs,
+        max(p.lastactivitydate) as last_seen_post
+    from users u
+    left join posts p on p.owneruserid = u.id
+        and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+    group by u.id
+),
+final_enriched as (
+    select
+        a.*,
+        uas.q_count,
+        uas.a_count,
+        uas.avg_score as user_avg_post_score,
+        uas.wiki_contribs,
+        uas.last_seen_post
+    from anomalies a
+    left join user_activity_summary uas on uas.user_id = a.owneruserid
+),
+rank_buckets as (
+    select
+        fe.*,
+        width_bucket(fe.composite_score, min(fe.composite_score) over (), max(fe.composite_score) over (), 10) as score_decile,
+        case
+            when fe.age_days <= 1 then 'D1'
+            when fe.age_days <= 7 then 'D7'
+            when fe.age_days <= 30 then 'D30'
+            when fe.age_days <= 90 then 'D90'
+            else 'D365'
+        end as recency_bucket
+    from final_enriched fe
+)
+select
+    rb.post_id,
+    rb.post_type_name,
+    rb.title,
+    rb.owner_name,
+    coalesce(rb.location, 'Unknown') as owner_location,
+    rb.user_region,
+    rb.reputation,
+    rb.viewcount,
+    rb.net_votes,
+    rb.favorites,
+    rb.bounty_sum,
+    rb.comment_count,
+    rb.edit_count,
+    rb.linked_count,
+    rb.duplicate_count,
+    rb.tag_count,
+    round(coalesce(rb.avg_tag_popularity,0)::numeric, 3) as avg_tag_popularity,
+    rb.accepted_is_top,
+    rb.has_top_answer,
+    rb.total_badges,
+    rb.gold_badges,
+    rb.silver_badges,
+    rb.bronze_badges,
+    rb.q_count,
+    rb.a_count,
+    round(coalesce(rb.user_avg_post_score,0)::numeric, 2) as user_avg_post_score,
+    rb.wiki_contribs,
+    rb.is_closed,
+    rb.vote_outlier_flag,
+    rb.status_flag,
+    round(rb.composite_score::numeric,2) as composite_score,
+    rb.score_rank,
+    rb.rank_within_type,
+    rb.regional_rownum,
+    rb.score_decile,
+    rb.recency_bucket,
+    rb.creationdate,
+    rb.lastactivitydate,
+    rb.last_edit_at,
+    rb.last_comment_at,
+    rb.last_link_at,
+    case when rb.has_java is not null then 1 else 0 end as has_java_tag,
+    case when rb.has_python is not null then 1 else 0 end as has_python_tag
+from rank_buckets rb
+where
+    coalesce(rb.net_votes,0) + coalesce(rb.favorites,0) + (coalesce(rb.comment_count,0) / 2.0) > (
+        select avg(coalesce(ps.net_votes,0) + coalesce(ps.favorites,0) + coalesce(cs.comment_count,0)/2.0)
+        from post_scores ps
+        left join comment_stats cs on cs.postid = ps.post_id
+    )
+    and (rb.is_closed = 0 or rb.duplicate_count = 0 or rb.vote_outlier_flag = 'HighOutlier')
+    and (
+        rb.post_type_name in ('Question','Answer')
+        or (rb.tag_count is not null and rb.tag_count >= 1)
+    )
+    and (
+        rb.owneruserid is null
+        or exists (
+            select 1
+            from badges b
+            where b.userid = rb.owneruserid
+              and b.class in (1,2)
+              and b.date >= cast('2024-10-01 12:34:56' as timestamp) - interval '730 days'
+        )
+    )
+order by rb.score_decile desc, rb.composite_score desc, rb.lastactivitydate desc
+limit 250;

@@ -1,0 +1,213 @@
+-- {"query": "7475.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2392} 
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.LastActivityDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) as rn,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as avg_score,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) as total_posts,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+        LEAD(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as next_score,
+        CASE WHEN p.Tags IS NULL OR p.Tags = '' THEN 0 ELSE 1 END as has_tags,
+        CASE WHEN p.AnswerCount > 0 THEN 1 ELSE 0 END as has_answers,
+        CASE WHEN p.CommentCount > 0 THEN 1 ELSE 0 END as has_comments,
+        CASE WHEN p.FavoriteCount > 0 THEN 1 ELSE 0 END as is_favorite,
+        ISNULL(p.Score, 0) + ISNULL(p.ViewCount, 0) + ISNULL(p.AnswerCount, 0) + ISNULL(p.CommentCount, 0) as combined_metrics,
+        DATEDIFF(day, p.CreationDate, GETDATE()) as days_since_creation,
+        DATEDIFF(day, p.CreationDate, p.LastActivityDate) as days_since_activity
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT rp.Id) as user_post_count,
+        SUM(ISNULL(rp.Score, 0)) as total_score,
+        AVG(ISNULL(rp.Score, 0)) as avg_score,
+        MAX(ISNULL(rp.Score, 0)) as max_score,
+        SUM(ISNULL(rp.ViewCount, 0)) as total_views,
+        SUM(ISNULL(rp.AnswerCount, 0)) as total_answers,
+        SUM(ISNULL(rp.CommentCount, 0)) as total_comments,
+        SUM(ISNULL(rp.FavoriteCount, 0)) as total_favorites,
+        DATEADD(day, 30, u.CreationDate) as thirty_days_from_join,
+        CASE WHEN u.Reputation > 10000 THEN 'High' 
+             WHEN u.Reputation > 5000 THEN 'Medium' 
+             ELSE 'Low' END as rep_level
+    FROM Users u
+    LEFT JOIN RankedPosts rp ON u.Id = rp.OwnerUserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate
+),
+TagAnalysis AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE WHEN t.Count > 1000 THEN 'Popular' 
+             WHEN t.Count > 100 THEN 'Moderate' 
+             ELSE 'Rare' END as tag_category,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        ISNULL(t.Count, 0) * 1.5 as adjusted_count,
+        LAG(t.Count, 1) OVER (ORDER BY t.Count DESC) as prev_count,
+        LEAD(t.Count, 1) OVER (ORDER BY t.Count DESC) as next_count,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as rank_by_count
+    FROM Tags t
+),
+QuestionAnalysis AS (
+    SELECT 
+        q.Id as QuestionId,
+        q.Title,
+        q.Tags,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.CommentCount,
+        q.FavoriteCount,
+        q.CreationDate,
+        q.LastActivityDate,
+        ISNULL(q.Score, 0) + ISNULL(q.ViewCount, 0) as question_complexity,
+        CASE WHEN q.Tags IS NOT NULL AND q.Tags != '' THEN 
+            (LEN(q.Tags) - LEN(REPLACE(q.Tags, '>', ''))) END as tag_count,
+        CASE WHEN q.Score > 10 THEN 'Highly Upvoted' 
+             WHEN q.Score > 5 THEN 'Moderately Upvoted' 
+             ELSE 'Low Upvoted' END as upvote_category,
+        ISNULL(q.AnswerCount, 0) as answer_count,
+        ISNULL(q.CommentCount, 0) as comment_count,
+        ISNULL(q.FavoriteCount, 0) as favorite_count
+    FROM Posts q
+    WHERE q.PostTypeId = 1
+)
+SELECT 
+    'Performance Benchmark Query Results' as QueryType,
+    COUNT(*) as TotalRecords,
+    COUNT(DISTINCT us.UserId) as DistinctUsers,
+    COUNT(DISTINCT ta.Id) as DistinctTags,
+    COUNT(DISTINCT qa.QuestionId) as DistinctQuestions,
+    SUM(ISNULL(us.total_score, 0)) as TotalUserScores,
+    AVG(ISNULL(us.avg_score, 0)) as AverageUserScore,
+    MAX(ISNULL(us.max_score, 0)) as MaxUserScore,
+    SUM(ISNULL(ta.adjusted_count, 0)) as TotalAdjustedTagCounts,
+    AVG(ISNULL(ta.adjusted_count, 0)) as AverageTagCount,
+    SUM(ISNULL(qa.question_complexity, 0)) as TotalQuestionComplexity,
+    AVG(ISNULL(qa.question_complexity, 0)) as AverageQuestionComplexity,
+    STRING_AGG(CAST(us.UserId AS VARCHAR(20)), ', ') as UserIds,
+    STRING_AGG(CAST(ta.TagName AS VARCHAR(50)), ', ') as TagNames,
+    STRING_AGG(CAST(qa.Title AS VARCHAR(100)), ', ') as QuestionTitles,
+    STUFF((
+        SELECT ', ' + CAST(rp.Id AS VARCHAR(10))
+        FROM RankedPosts rp
+        WHERE rp.OwnerUserId = us.UserId
+        AND rp.rn <= 3
+        FOR XML PATH(''), TYPE).value('.', 'VARCHAR(MAX)'), 1, 2, '') as TopRankedPosts,
+    CASE 
+        WHEN SUM(ISNULL(us.total_score, 0)) > 100000 THEN 'High'
+        WHEN SUM(ISNULL(us.total_score, 0)) > 50000 THEN 'Medium'
+        ELSE 'Low' 
+    END as ScoreLevel,
+    CASE 
+        WHEN COUNT(DISTINCT ta.Id) > 500 THEN 'Large'
+        WHEN COUNT(DISTINCT ta.Id) > 100 THEN 'Medium'
+        ELSE 'Small' 
+    END as TagSize,
+    CASE 
+        WHEN COUNT(DISTINCT qa.QuestionId) > 10000 THEN 'Very High'
+        WHEN COUNT(DISTINCT qa.QuestionId) > 5000 THEN 'High'
+        WHEN COUNT(DISTINCT qa.QuestionId) > 1000 THEN 'Medium'
+        ELSE 'Low' 
+    END as QuestionVolume,
+    CASE 
+        WHEN AVG(ISNULL(us.avg_score, 0)) > 50 THEN 'Expert'
+        WHEN AVG(ISNULL(us.avg_score, 0)) > 25 THEN 'Intermediate'
+        WHEN AVG(ISNULL(us.avg_score, 0)) > 10 THEN 'Beginner'
+        ELSE 'Novice' 
+    END as UserSkillLevel,
+    COUNT(DISTINCT us.UserId) * COUNT(DISTINCT ta.Id) * COUNT(DISTINCT qa.QuestionId) as InteractionMetric,
+    CASE 
+        WHEN SUM(ISNULL(us.total_score, 0)) > 0 
+        THEN (SUM(ISNULL(qa.question_complexity, 0)) * 100.0) / SUM(ISNULL(us.total_score, 0)) 
+        ELSE 0 
+    END as ScoreEfficiencyRatio,
+    CASE 
+        WHEN AVG(ISNULL(qa.question_complexity, 0)) > 100 
+        THEN 'Complex' 
+        WHEN AVG(ISNULL(qa.question_complexity, 0)) > 50 
+        THEN 'Moderate' 
+        ELSE 'Simple' 
+    END as AvgQuestionComplexityLevel,
+    CASE 
+        WHEN AVG(ISNULL(ta.adjusted_count, 0)) > 500 
+        THEN 'High Tag Popularity' 
+        WHEN AVG(ISNULL(ta.adjusted_count, 0)) > 100 
+        THEN 'Moderate Tag Popularity' 
+        ELSE 'Low Tag Popularity' 
+    END as TagPopularityLevel,
+    ROW_NUMBER() OVER (ORDER BY SUM(ISNULL(us.total_score, 0)) DESC) as OverallRank,
+    COUNT(*) OVER() as TotalQueryResultLines
+FROM UserStats us
+FULL OUTER JOIN TagAnalysis ta ON 1=1
+LEFT JOIN QuestionAnalysis qa ON 1=1
+LEFT JOIN RankedPosts rp ON us.UserId = rp.OwnerUserId
+WHERE (us.UserId IS NOT NULL OR ta.Id IS NOT NULL OR qa.QuestionId IS NOT NULL)
+    AND (us.rep_level IN ('High', 'Medium') OR ta.tag_category IN ('Popular', 'Moderate'))
+    AND (qa.question_complexity > 50 OR qa.question_complexity IS NULL)
+    AND (us.thirty_days_from_join < GETDATE())
+    AND ISNULL(qa.question_complexity, 0) <= 500
+    AND (ta.rank_by_count BETWEEN 1 AND 100 OR ta.rank_by_count IS NULL)
+    AND EXISTS (
+        SELECT 1 
+        FROM Posts p 
+        WHERE p.OwnerUserId = us.UserId 
+        AND p.CreationDate > DATEADD(day, -365, GETDATE())
+        AND p.PostTypeId IN (1, 2)
+    )
+    AND (
+        EXISTS (
+            SELECT 1 
+            FROM Posts p 
+            WHERE p.OwnerUserId = us.UserId 
+            AND p.Tags LIKE '%<%' 
+            AND p.Tags LIKE '%>%' 
+        )
+        OR ta.tag_category IN ('Popular', 'Moderate')
+    )
+    AND (
+        (qa.QuestionId IS NOT NULL AND qa.Score IS NOT NULL AND qa.Score > 0) 
+        OR (qa.QuestionId IS NULL AND ta.Id IS NOT NULL)
+    )
+    AND ISNULL(rp.Score, 0) BETWEEN 0 AND 1000
+    AND (us.total_score IS NULL OR us.total_score > 10)
+GROUP BY 
+    us.UserId,
+    ta.Id,
+    qa.QuestionId
+HAVING 
+    COUNT(*) > 0
+    AND (
+        COUNT(DISTINCT us.UserId) > 0 
+        OR COUNT(DISTINCT ta.Id) > 0 
+        OR COUNT(DISTINCT qa.QuestionId) > 0
+    )
+ORDER BY 
+    SUM(ISNULL(us.total_score, 0)) DESC,
+    SUM(ISNULL(ta.adjusted_count, 0)) DESC,
+    SUM(ISNULL(qa.question_complexity, 0)) DESC
+OFFSET 0 ROWS
+FETCH NEXT 1000 ROWS ONLY;

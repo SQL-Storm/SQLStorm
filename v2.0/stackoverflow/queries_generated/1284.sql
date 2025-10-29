@@ -1,0 +1,219 @@
+-- {"query": "1284.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3378} 
+
+WITH UserAggregateStats AS (
+    -- CTE 1: Summarizes comprehensive user activity, reputation, and badge statistics.
+    -- Includes total posts, comments, votes given and received, and badge counts.
+    -- Utilizes LEFT JOINs to ensure all users are included, even those with no activity in certain tables.
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.Views AS UserProfileViews,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.WebsiteUrl,
+        U.Location,
+        U.AboutMe,
+        COUNT(DISTINCT P.Id) AS TotalPostsCreated,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestionsCreated,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswersCreated,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        -- COALESCE handles cases where a user has no votes recorded, defaulting to 0.
+        COALESCE(SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS TotalUpVotesGiven,
+        COALESCE(SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS TotalDownVotesGiven,
+        COALESCE(SUM(CASE WHEN PV.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS TotalPostsUpVotedReceived,
+        COALESCE(SUM(CASE WHEN PV.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS TotalPostsDownVotedReceived,
+        COUNT(DISTINCT B.Id) AS TotalBadgesEarned,
+        MAX(CASE WHEN B.Class = 1 THEN B.Date END) AS LastGoldBadgeDate,
+        -- Calculates user tenure in years using date functions.
+        EXTRACT(YEAR FROM AGE(CURRENT_DATE, U.CreationDate)) AS UserTenureYears,
+        -- Window function: Ranks users globally by reputation.
+        RANK() OVER (ORDER BY U.Reputation DESC, U.CreationDate ASC) AS ReputationRank
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Votes V ON U.Id = V.UserId -- Votes cast by the user
+    LEFT JOIN Votes PV ON P.Id = PV.PostId AND PV.VoteTypeId IN (2,3) -- Votes received on the user's posts
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.Views, U.CreationDate, U.LastAccessDate, U.WebsiteUrl, U.Location, U.AboutMe
+),
+PostEngagementMetrics AS (
+    -- CTE 2: Analyzes post-specific engagement metrics, including a calculated 'impact score'.
+    -- Incorporates correlated subqueries for detailed comment and editor statistics.
+    -- Processes tags using string functions and handles NULLs for various counts.
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score,
+        COALESCE(P.ViewCount, 0) AS ViewCount,
+        COALESCE(P.AnswerCount, 0) AS AnswerCount,
+        COALESCE(P.CommentCount, 0) AS CommentCount,
+        COALESCE(P.FavoriteCount, 0) AS FavoriteCount,
+        P.LastActivityDate,
+        P.Title,
+        P.Tags,
+        -- String expression: Extracts and aggregates tags from the 'Tags' column, checking against the Tags table.
+        -- Uses substring and string_to_array as per schema description.
+        COALESCE(
+            (SELECT STRING_AGG(DISTINCT Tag.TagName, ';')
+             FROM (SELECT UNNEST(string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags)-2), '><')) AS TagName) AS Tag
+             WHERE EXISTS (SELECT 1 FROM Tags T WHERE T.TagName = Tag.TagName)),
+            'untagged'
+        ) AS FormattedTags,
+        -- Complicated calculation: A weighted 'Impact Score' for posts.
+        (P.Score * 5 + COALESCE(P.ViewCount, 0) * 0.05 + COALESCE(P.AnswerCount, 0) * 8 + COALESCE(P.CommentCount, 0) * 4 + COALESCE(P.FavoriteCount, 0) * 10) AS PostImpactScore,
+        -- NULL logic: Checks if an accepted answer exists.
+        CASE WHEN P.AcceptedAnswerId IS NOT NULL THEN TRUE ELSE FALSE END AS HasAcceptedAnswer,
+        -- Correlated subquery: Fetches the score of the accepted answer.
+        (SELECT A.Score FROM Posts A WHERE A.Id = P.AcceptedAnswerId AND A.PostTypeId = 2) AS AcceptedAnswerScore,
+        -- Correlated subquery: Calculates average comment score for the post, handling NULLs.
+        COALESCE((SELECT AVG(C.Score) FROM Comments C WHERE C.PostId = P.Id), 0.0) AS AvgCommentScore,
+        -- Correlated subquery: Counts unique users who commented on the post.
+        (SELECT COUNT(DISTINCT C.UserId) FROM Comments C WHERE C.PostId = P.Id AND C.UserId IS NOT NULL) AS UniqueCommenters,
+        -- Complicated predicate/expression: Categorizes posts based on various criteria.
+        CASE
+            WHEN P.Score < 0 AND P.CommentCount > 5 THEN 'Potentially Controversial'
+            WHEN P.PostTypeId = 1 AND P.ViewCount > 50000 AND COALESCE(P.AnswerCount, 0) = 0 THEN 'High Traffic, No Answers'
+            WHEN P.ClosedDate IS NOT NULL AND P.PostTypeId = 1 THEN 'Closed Question'
+            ELSE 'Standard'
+        END AS PostStatusCategory
+    FROM Posts P
+    LEFT JOIN PostTypes PT ON P.PostTypeId = PT.Id
+    WHERE P.PostTypeId IN (1, 2) -- Focus on Questions and Answers
+),
+PostHistoryDetails AS (
+    -- CTE 3: Summarizes post history events, focusing on edits and closures.
+    -- Uses conditional aggregation and string aggregation for close reasons.
+    SELECT
+        PH.PostId,
+        COUNT(DISTINCT PH.UserId) FILTER (WHERE PH.PostHistoryTypeId IN (4,5,6)) AS NumDistinctEditors, -- Edit Title, Edit Body, Edit Tags
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4,5,6) THEN 1 ELSE 0 END) AS TotalEditRevisions,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS TotalCloseEvents,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS TotalReopenEvents,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.CreationDate END) AS LatestCloseDate,
+        -- String aggregation for all unique close reasons, handling potential non-numeric comments.
+        STRING_AGG(DISTINCT CRT.Name, '; ') FILTER (WHERE PH.PostHistoryTypeId = 10 AND PH.Comment IS NOT NULL AND PH.Comment ~ '^[0-9]+$') AS AllCloseReasonNames
+    FROM PostHistory PH
+    LEFT JOIN CloseReasonTypes CRT ON PH.PostHistoryTypeId = 10 AND PH.Comment IS NOT NULL AND PH.Comment ~ '^[0-9]+$' AND PH.Comment::smallint = CRT.Id
+    GROUP BY PH.PostId
+),
+UserPostPerformance AS (
+    -- CTE 4: Joins user and post metrics, adding more granular post-level analysis and rankings.
+    -- Calculates post age and cumulative user impact.
+    SELECT
+        UAS.UserId,
+        UAS.DisplayName,
+        UAS.Reputation,
+        UAS.UserTenureYears,
+        UAS.TotalPostsCreated,
+        UAS.TotalQuestionsCreated,
+        UAS.TotalAnswersCreated,
+        UAS.TotalCommentsMade,
+        UAS.TotalBadgesEarned,
+        UAS.TotalPostsUpVotedReceived,
+        PEM.PostId,
+        PEM.PostTypeName,
+        PEM.PostCreationDate,
+        PEM.Score,
+        PEM.ViewCount,
+        PEM.AnswerCount,
+        PEM.CommentCount,
+        PEM.FavoriteCount,
+        PEM.PostImpactScore,
+        PEM.FormattedTags,
+        PEM.HasAcceptedAnswer,
+        PEM.AcceptedAnswerScore,
+        PEM.AvgCommentScore,
+        PEM.UniqueCommenters,
+        PEM.PostStatusCategory,
+        PHD.NumDistinctEditors,
+        PHD.TotalEditRevisions,
+        PHD.TotalCloseEvents,
+        PHD.TotalReopenEvents,
+        PHD.AllCloseReasonNames,
+        -- Calculates post age in days.
+        EXTRACT(DAY FROM (CURRENT_DATE - PEM.PostCreationDate)) AS PostAgeDays,
+        -- Window function: Divides users into 4 tiers based on reputation.
+        NTILE(4) OVER (ORDER BY UAS.Reputation DESC) AS UserReputationTier,
+        -- Window function: Ranks each user's posts by their impact score.
+        ROW_NUMBER() OVER (PARTITION BY UAS.UserId ORDER BY PEM.PostImpactScore DESC, PEM.PostCreationDate DESC) AS PostRankByOwnerImpact,
+        -- Window function: Calculates a running total of impact score for a user's posts over time.
+        SUM(PEM.PostImpactScore) OVER (PARTITION BY UAS.UserId ORDER BY PEM.PostCreationDate) AS CumulativeUserPostImpact
+    FROM UserAggregateStats UAS
+    INNER JOIN PostEngagementMetrics PEM ON UAS.UserId = PEM.OwnerUserId
+    LEFT JOIN PostHistoryDetails PHD ON PEM.PostId = PHD.PostId
+    WHERE UAS.TotalPostsCreated > 0 AND PEM.Score > -5 -- Filters out inactive users or extremely low-scored posts
+),
+TagUsageDiversity AS (
+    -- CTE 5: Analyzes the diversity and impact of tags used by individual users for questions.
+    SELECT
+        UPP.UserId,
+        UPP.DisplayName,
+        TRIM(UNNEST(string_to_array(UPP.FormattedTags, ';'))) AS TagName, -- Extracts individual tags from the aggregated string
+        COUNT(DISTINCT UPP.PostId) AS PostsWithTag,
+        AVG(UPP.PostImpactScore) AS AvgTagPostImpact
+    FROM UserPostPerformance UPP
+    WHERE UPP.PostTypeId = 1 AND UPP.FormattedTags IS NOT NULL AND UPP.FormattedTags <> 'untagged'
+    GROUP BY UPP.UserId, UPP.DisplayName, TRIM(UNNEST(string_to_array(UPP.FormattedTags, ';')))
+    HAVING TRIM(UNNEST(string_to_array(UPP.FormattedTags, ';'))) IS NOT NULL AND TRIM(UNNEST(string_to_array(UPP.FormattedTags, ';'))) <> ''
+),
+TopTagsByImpact AS (
+    -- CTE 6: Identifies globally top-performing tags based on average post impact.
+    SELECT
+        T.TagName,
+        COUNT(DISTINCT PEM.PostId) AS TotalQuestionsForTag,
+        AVG(PEM.PostImpactScore) AS AvgImpactScorePerTag,
+        AVG(PEM.ViewCount) AS AvgViewsPerTag,
+        -- Window function: Ranks tags by their average impact score.
+        RANK() OVER (ORDER BY AVG(PEM.PostImpactScore) DESC) AS TagImpactRank
+    FROM PostEngagementMetrics PEM
+    -- Lateral join to unnest tags from post data.
+    JOIN LATERAL (SELECT UNNEST(string_to_array(SUBSTRING(PEM.Tags, 2, LENGTH(PEM.Tags)-2), '><')) AS TagName) AS TagList ON PEM.Tags IS NOT NULL AND PEM.Tags <> ''
+    JOIN Tags T ON TagList.TagName = T.TagName
+    WHERE PEM.PostTypeId = 1 -- Only consider tags on questions
+    GROUP BY T.TagName
+),
+FinalAnalysis AS (
+    -- CTE 7: Consolidates all previous CTEs to derive final analytical insights.
+    -- Includes complex expressions for an 'OverallEngagementScore' and user archetyping.
+    SELECT
+        UPP.UserId,
+        UPP.DisplayName,
+        UPP.Reputation,
+        UPP.UserTenureYears,
+        UPP.TotalPostsCreated,
+        UPP.TotalBadgesEarned,
+        UPP.TotalPostsUpVotedReceived,
+        UPP.PostId,
+        UPP.PostTypeName,
+        UPP.PostCreationDate,
+        UPP.Score,
+        UPP.ViewCount,
+        UPP.AnswerCount,
+        UPP.CommentCount,
+        UPP.FavoriteCount,
+        UPP.PostImpactScore,
+        UPP.FormattedTags,
+        UPP.PostStatusCategory,
+        UPP.NumDistinctEditors,
+        UPP.TotalEditRevisions,
+        UPP.TotalCloseEvents,
+        UPP.TotalReopenEvents,
+        UPP.AllCloseReasonNames,
+        UPP.PostAgeDays,
+        UPP.UserReputationTier,
+        UPP.PostRankByOwnerImpact,
+        UPP.CumulativeUserPostImpact,
+        TUD.TagName AS PrimaryTagUsedByUser,
+        TUD.PostsWithTag AS UserPostsWithPrimaryTag,
+        TUD.AvgTagPostImpact AS UserAvgTagImpact,
+        TTI.AvgImpactScorePerTag AS GlobalAvgTagImpact,
+        TTI.TagImpactRank AS GlobalTagImpactRank,
+        -- Complicated calculation: An 'Overall Engagement Score' combining multiple user and post metrics.
+        (UPP.Reputation * 0.1 + UPP.TotalPostsCreated * 2 + UPP.TotalBadgesEarned * 5 + UPP.TotalPostsUpVotedReceived * 0.5 + UPP.PostImpactScore * 0.7) AS OverallEngagementScore,
+        -- String expression: Generates a descriptive summary for each post, handling NULLs.
+        COALESCE(UPP.DisplayName, 'Anonymous User') || ' (Rep: ' || UPP.Reputation || ') created a ' || LOWER(UPP.PostTypeName) || ' titled "' || COALESCE(UPP.Title, 'No Title') || '" (' || COALESCE(UPP.FormattedTags, 'Untagged') || '). It has ' || UPP.PostImpactScore || ' impact points and is '

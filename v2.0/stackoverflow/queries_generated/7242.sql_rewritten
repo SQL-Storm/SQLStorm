@@ -1,0 +1,268 @@
+-- {"query": "7242.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2750} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        STRING_AGG(DISTINCT SUBSTRING(p.Title, 1, 50), ' | ') as RecentTitles,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN AVG(p.Score) 
+            ELSE 0 
+        END as AvgPostScore,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 3 THEN p.Id END) as WikiCount,
+        STRING_AGG(DISTINCT COALESCE(u.Location, 'Unknown'), '; ') as Locations,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) as GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) as SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) as BronzeBadges,
+        MAX(u.CreationDate) as UserCreationDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+RankedUsers AS (
+    SELECT 
+        *,
+        ROW_NUMBER() OVER (ORDER BY TotalScore DESC, Reputation DESC) as ScoreRank,
+        DENSE_RANK() OVER (ORDER BY Reputation DESC) as RepRank,
+        NTILE(100) OVER (ORDER BY Reputation DESC) as RepPercentile,
+        RANK() OVER (ORDER BY PostCount DESC) as PostRank
+    FROM UserActivityStats
+),
+TopPosts AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ParentId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END as PostType,
+        CASE 
+            WHEN p.Score > 100 THEN 'High'
+            WHEN p.Score > 50 THEN 'Medium'
+            WHEN p.Score > 10 THEN 'Low'
+            ELSE 'Very Low'
+        END as ScoreCategory,
+        LENGTH(p.Body) as BodyLength,
+        STRING_TO_ARRAY(p.Tags, '<') as TagArray,
+        COALESCE(p.AnswerCount, 0) + COALESCE(p.CommentCount, 0) as EngagementCount,
+        ABS(p.Score - (SELECT AVG(Score) FROM Posts)) as ScoreDeviation,
+        DATEDIFF('day', p.CreationDate, cast('2024-10-01 12:34:56' as timestamp)) as DaysSinceCreation,
+        CASE 
+            WHEN p.ParentId IS NOT NULL THEN 
+                (SELECT COUNT(*) FROM Posts p2 WHERE p2.ParentId = p.Id)
+            ELSE 0 
+        END as ChildCount
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) 
+      AND p.CreationDate >= DATEADD('year', -2, cast('2024-10-01 12:34:56' as timestamp))
+),
+UserPostActivity AS (
+    SELECT 
+        ru.UserId,
+        ru.DisplayName,
+        ru.Reputation,
+        ru.PostCount,
+        ru.CommentCount,
+        ru.BadgeCount,
+        ru.TotalScore,
+        ru.AvgPostScore,
+        ru.QuestionCount,
+        ru.AnswerCount,
+        ru.WikiCount,
+        ru.ScoreRank,
+        ru.RepRank,
+        ru.RepPercentile,
+        ru.PostRank,
+        COALESCE(MAX(tp.Score), 0) as MaxPostScore,
+        COALESCE(AVG(tp.Score), 0) as AvgPostScoreByUser,
+        COALESCE(COUNT(tp.PostId), 0) as ActivePosts,
+        STRING_AGG(COALESCE(tp.Title, 'No Title'), ' || ') as UserPostTitles,
+        STRING_AGG(COALESCE(tp.PostType, 'Unknown'), ' | ') as PostTypes,
+        STRING_AGG(COALESCE(tp.TagArray::TEXT, ''), ', ') as UserTags,
+        STRING_AGG(COALESCE(tp.ScoreCategory, 'Unknown'), ' | ') as ScoreCategories,
+        COALESCE(SUM(tp.BodyLength), 0) as TotalBodyLength,
+        COALESCE(SUM(tp.EngagementCount), 0) as TotalEngagement,
+        COALESCE(SUM(tp.ScoreDeviation), 0) as TotalDeviation,
+        COALESCE(AVG(tp.DaysSinceCreation), 0) as AvgDaysSinceCreation,
+        COUNT(CASE WHEN tp.ChildCount > 0 THEN 1 END) as PostsWithChildren
+    FROM RankedUsers ru
+    LEFT JOIN TopPosts tp ON ru.UserId = tp.OwnerUserId
+    WHERE ru.RepPercentile <= 10 
+      AND ru.ScoreRank <= 20
+      AND ru.PostCount >= 5
+    GROUP BY 
+        ru.UserId, ru.DisplayName, ru.Reputation, 
+        ru.PostCount, ru.CommentCount, ru.BadgeCount,
+        ru.TotalScore, ru.AvgPostScore, ru.QuestionCount,
+        ru.AnswerCount, ru.WikiCount, ru.ScoreRank, ru.RepRank,
+        ru.RepPercentile, ru.PostRank
+),
+DetailedBadges AS (
+    SELECT 
+        b.UserId,
+        b.Name as BadgeName,
+        b.Date as BadgeDate,
+        b.Class as BadgeClass,
+        b.TagBased,
+        CASE 
+            WHEN b.Class = 1 THEN 'Gold'
+            WHEN b.Class = 2 THEN 'Silver'
+            WHEN b.Class = 3 THEN 'Bronze'
+            ELSE 'Unknown'
+        END as BadgeLevel,
+        COALESCE(b.Name, 'Unknown') || ' - ' || 
+        CASE 
+            WHEN b.Class = 1 THEN 'Gold'
+            WHEN b.Class = 2 THEN 'Silver'
+            WHEN b.Class = 3 THEN 'Bronze'
+        END as BadgeDescription,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId, b.Class ORDER BY b.Date DESC) as BadgeRank,
+        COUNT(*) OVER (PARTITION BY b.UserId) as UserBadgeCount,
+        DENSE_RANK() OVER (ORDER BY b.Date) as BadgeSequence
+    FROM Badges b
+    WHERE b.Date >= DATEADD('year', -1, cast('2024-10-01 12:34:56' as timestamp))
+)
+SELECT 
+    upa.UserId,
+    upa.DisplayName,
+    upa.Reputation,
+    upa.PostCount,
+    upa.CommentCount,
+    upa.BadgeCount,
+    upa.TotalScore,
+    upa.AvgPostScore,
+    upa.QuestionCount,
+    upa.AnswerCount,
+    upa.WikiCount,
+    upa.ScoreRank,
+    upa.RepRank,
+    upa.RepPercentile,
+    upa.PostRank,
+    upa.MaxPostScore,
+    upa.AvgPostScoreByUser,
+    upa.ActivePosts,
+    upa.UserPostTitles,
+    upa.PostTypes,
+    upa.UserTags,
+    upa.ScoreCategories,
+    upa.TotalBodyLength,
+    upa.TotalEngagement,
+    upa.TotalDeviation,
+    upa.AvgDaysSinceCreation,
+    upa.PostsWithChildren,
+    CASE 
+        WHEN upa.ActivePosts > 0 THEN 
+            (upa.TotalScore / upa.ActivePosts)::DECIMAL(10,2)
+        ELSE 0 
+    END as ScorePerActivePost,
+    CASE 
+        WHEN upa.UserBadgeCount > 0 THEN 
+            (upa.BadgeCount::DECIMAL(10,2) / upa.UserBadgeCount::DECIMAL(10,2)) * 100
+        ELSE 0 
+    END as BadgeEfficiencyPercentage,
+    STRING_AGG(
+        CASE 
+            WHEN db.BadgeRank = 1 THEN db.BadgeDescription 
+            ELSE NULL 
+        END, ' | '
+    ) as TopBadges,
+    STRING_AGG(
+        CASE 
+            WHEN db.BadgeRank = 1 AND db.BadgeLevel = 'Gold' THEN db.BadgeDescription 
+            ELSE NULL 
+        END, ' | '
+    ) as TopGoldBadges,
+    STRING_AGG(
+        CASE 
+            WHEN db.BadgeRank = 1 AND db.BadgeLevel = 'Silver' THEN db.BadgeDescription 
+            ELSE NULL 
+        END, ' | '
+    ) as TopSilverBadges,
+    STRING_AGG(
+        CASE 
+            WHEN db.BadgeRank = 1 AND db.BadgeLevel = 'Bronze' THEN db.BadgeDescription 
+            ELSE NULL 
+        END, ' | '
+    ) as TopBronzeBadges,
+    COUNT(CASE WHEN db.BadgeLevel = 'Gold' THEN 1 END) as GoldBadgeCount,
+    COUNT(CASE WHEN db.BadgeLevel = 'Silver' THEN 1 END) as SilverBadgeCount,
+    COUNT(CASE WHEN db.BadgeLevel = 'Bronze' THEN 1 END) as BronzeBadgeCount,
+    MIN(db.BadgeDate) as FirstBadgeDate,
+    MAX(db.BadgeDate) as LastBadgeDate,
+    DATEDIFF('day', MIN(db.BadgeDate), MAX(db.BadgeDate)) as BadgeActivePeriodDays,
+    AVG(CASE WHEN db.BadgeSequence IS NOT NULL THEN db.BadgeSequence END) as AvgBadgeSequence,
+    COUNT(DISTINCT CASE WHEN db.BadgeSequence > 100 THEN 1 END) as HighBadgeSequenceCount,
+    CASE 
+        WHEN upa.PostCount > 0 AND upa.BadgeCount > 0 THEN 
+            (upa.BadgeCount::DECIMAL(10,2) / upa.PostCount::DECIMAL(10,2)) * 100
+        ELSE 0 
+    END as BadgeToPostRatio,
+    CASE 
+        WHEN upa.ScorePerActivePost > 10 THEN 'High Scoring'
+        WHEN upa.ScorePerActivePost > 5 THEN 'Moderate Scoring'
+        WHEN upa.ScorePerActivePost > 0 THEN 'Low Scoring'
+        ELSE 'No Activity'
+    END as ScoringLevel,
+    CASE 
+        WHEN upa.PostsWitChildren > 0 THEN 'Has Parents'
+        ELSE 'No Children'
+    END as PostParentStatus,
+    CASE 
+        WHEN upa.RepRank = 1 THEN 'Top Rep'
+        WHEN upa.RepRank <= 10 THEN 'Top 10 Rep'
+        WHEN upa.RepRank <= 50 THEN 'Top 50 Rep'
+        WHEN upa.RepPercentile <= 10 THEN 'Top 10 Percentile'
+        ELSE 'Normal'
+    END as RepStatus,
+    CASE 
+        WHEN upa.RepPercentile <= 5 THEN 'Elite'
+        WHEN upa.RepPercentile <= 10 THEN 'Super Elite'
+        WHEN upa.RepPercentile <= 25 THEN 'High Achiever'
+        ELSE 'Average'
+    END as RepTier
+FROM UserPostActivity upa
+LEFT JOIN DetailedBadges db ON upa.UserId = db.UserId
+WHERE upa.RepPercentile <= 10
+GROUP BY 
+    upa.UserId, upa.DisplayName, upa.Reputation, 
+    upa.PostCount, upa.CommentCount, upa.BadgeCount,
+    upa.TotalScore, upa.AvgPostScore, upa.QuestionCount,
+    upa.AnswerCount, upa.WikiCount, upa.ScoreRank, upa.RepRank,
+    upa.RepPercentile, upa.PostRank, upa.MaxPostScore,
+    upa.AvgPostScoreByUser, upa.ActivePosts, upa.UserPostTitles,
+    upa.PostTypes, upa.UserTags, upa.ScoreCategories,
+    upa.TotalBodyLength, upa.TotalEngagement, upa.TotalDeviation,
+    upa.AvgDaysSinceCreation, upa.PostsWithChildren,
+    upa.ScorePerActivePost, upa.BadgeEfficiencyPercentage,
+    upa.BadgeCount, upa.UserBadgeCount
+HAVING 
+    COUNT(*) > 0
+ORDER BY 
+    upa.TotalScore DESC,
+    upa.RepRank ASC,
+    upa.PostCount DESC,
+    upa.BadgeCount DESC
+LIMIT 1000;

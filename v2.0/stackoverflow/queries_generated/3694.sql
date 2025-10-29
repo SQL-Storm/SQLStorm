@@ -1,0 +1,162 @@
+-- {"query": "3694.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2095} 
+
+/* ------------- Benchmark Query -------------------------------------------------
+   This query mixes CTEs, correlated subqueries, window functions, outer joins,
+   set operators, string manipulations, NULL handling and assorted predicates.
+   ------------------------------------------------------------------------------- */
+
+WITH
+-- 1. Recent questions (last 30 days) with exploded tag list
+recent_questions AS (
+    SELECT
+        p.Id                              AS QId,
+        p.Title,
+        p.CreationDate,
+        p.Score                           AS QScore,
+        p.ViewCount,
+        p.OwnerUserId,
+        unnest(                      -- explode tags like "<tag1><tag2>"
+            string_to_array(
+                substring(p.Tags FROM 2 FOR char_length(p.Tags)-2),
+                '><'
+            )
+        )                                 AS Tag
+    FROM Posts p
+    WHERE p.PostTypeId = 1                         -- Question
+      AND p.CreationDate >= (CURRENT_DATE - INTERVAL '30 days')
+),
+
+-- 2. Aggregate user activity (posts, scores, reputation, badge classes)
+user_activity AS (
+    SELECT
+        u.Id                                 AS UserId,
+        u.DisplayName,
+        COUNT(p.Id)                           AS TotalPosts,
+        SUM(COALESCE(p.Score,0))              AS TotalScore,
+        AVG(COALESCE(p.ViewCount,0))          AS AvgViews,
+        MAX(u.Reputation)                     AS MaxReputation,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Posts p      ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b    ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+
+-- 3. Answer statistics per question (including correlated sub‑query)
+answer_stats AS (
+    SELECT
+        q.Id                                 AS QId,
+        COUNT(a.Id)                          AS AnswerCount,
+        SUM(CASE WHEN a.Score > q.Score THEN 1 ELSE 0 END) AS BetterAnswers,
+        AVG(COALESCE(a.Score,0))             AS AvgAnswerScore,
+        MAX(a.CreationDate)                 AS LastAnswerDate
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2     -- Answer
+    WHERE q.PostTypeId = 1                                         -- Question
+    GROUP BY q.Id
+),
+
+-- 4. Vote summary per post (window function to get running totals)
+vote_summary AS (
+    SELECT
+        v.PostId,
+        SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY v.PostId) AS UpVotes,
+        SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) OVER (PARTITION BY v.PostId) AS DownVotes,
+        SUM(CASE WHEN vt.Id = 5 THEN 1 ELSE 0 END) OVER (PARTITION BY v.PostId) AS Favorites
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+),
+
+-- 5. Tag popularity (including tags without posts via FULL OUTER JOIN)
+tag_popularity AS (
+    SELECT
+        t.TagName,
+        COALESCE(t.Count,0)                           AS TagCount,
+        COALESCE(pcnt.PostsWithTag,0)                AS PostsWithTag
+    FROM Tags t
+    FULL OUTER JOIN (
+        SELECT Tag, COUNT(DISTINCT QId) AS PostsWithTag
+        FROM recent_questions
+        GROUP BY Tag
+    ) pcnt ON pcnt.Tag = t.TagName
+),
+
+-- 6. Duplicate relationships (union of duplicate and linked posts)
+duplicate_links AS (
+    SELECT
+        pl.PostId      AS SourceId,
+        pl.RelatedPostId,
+        lt.Name        AS LinkType,
+        pl.CreationDate
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    WHERE lt.Id IN (1,3)                     -- Linked or Duplicate
+),
+
+-- 7. Combine question info with tags (using UNION ALL with tag‑wiki entries)
+question_or_wiki AS (
+    SELECT
+        q.Id           AS EntityId,
+        q.Title        AS Title,
+        q.CreationDate,
+        'question'     AS EntityType,
+        rq.Tag
+    FROM Posts q
+    JOIN recent_questions rq ON rq.QId = q.Id
+    WHERE q.PostTypeId = 1
+
+    UNION ALL
+
+    SELECT
+        tw.Id          AS EntityId,
+        tw.Title       AS Title,
+        tw.CreationDate,
+        'tag_wiki'     AS EntityType,
+        t.TagName
+    FROM Posts tw
+    JOIN Tags t ON t.WikiPostId = tw.Id
+    WHERE tw.PostTypeId IN (5,4)                -- TagWiki / TagWikiExcerpt
+)
+
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.TotalPosts,
+    ua.TotalScore,
+    ua.AvgViews,
+    ua.MaxReputation,
+    ua.GoldBadges,
+    ua.SilverBadges,
+    ua.BronzeBadges,
+    q.Title,
+    q.CreationDate               AS QuestionDate,
+    q.QScore,
+    q.ViewCount,
+    q.Tag,
+    COALESCE(asr.AnswerCount,0)  AS AnswerCount,
+    COALESCE(asr.BetterAnswers,0) AS BetterAnswers,
+    COALESCE(vs.UpVotes,0)       AS UpVotes,
+    COALESCE(vs.DownVotes,0)     AS DownVotes,
+    COALESCE(vs.Favorites,0)     AS Favorites,
+    ROW_NUMBER() OVER (PARTITION BY q.Tag ORDER BY q.CreationDate DESC) AS TagRank,
+    LAG(q.CreationDate) OVER (PARTITION BY q.Tag ORDER BY q.CreationDate) AS PrevQuestionDate,
+    LEAD(q.CreationDate) OVER (PARTITION BY q.Tag ORDER BY q.CreationDate) AS NextQuestionDate,
+    COALESCE(dl.LinkType, 'none') AS LinkType,
+    COALESCE(dl.RelatedPostId, -1) AS RelatedPostId,
+    COALESCE(tp.TagCount,0)      AS TagGlobalCount,
+    COALESCE(tp.PostsWithTag,0)  AS RecentPostsWithTag
+FROM user_activity ua
+LEFT JOIN Posts p            ON p.OwnerUserId = ua.UserId
+LEFT JOIN recent_questions q ON q.QId = p.Id
+LEFT JOIN answer_stats asr   ON asr.QId = q.QId
+LEFT JOIN vote_summary vs    ON vs.PostId = q.QId
+LEFT JOIN duplicate_links dl ON dl.SourceId = q.QId
+LEFT JOIN tag_popularity tp  ON tp.TagName = q.Tag
+WHERE ua.TotalPosts > 10
+  AND (ua.GoldBadges > 0 OR ua.SilverBadges > 1)
+  AND q.QScore IS NOT NULL
+  AND (q.ViewCount > 100 OR COALESCE(vs.Favorites,0) > 5)
+ORDER BY ua.TotalScore DESC, q.CreationDate DESC
+LIMIT 200;

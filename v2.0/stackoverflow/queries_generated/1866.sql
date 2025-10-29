@@ -1,0 +1,218 @@
+-- {"query": "1866.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3562} 
+
+WITH UserEngagementSummary AS (
+    -- Aggregates core user activity metrics from Posts, Comments, and Votes
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Location,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        AVG(CASE WHEN P.Score IS NOT NULL THEN P.Score ELSE 0 END) AS AvgPostScore,
+        SUM(CASE WHEN P.PostTypeId = 1 AND P.ViewCount IS NOT NULL THEN P.ViewCount ELSE 0 END) AS TotalQuestionViews,
+        MAX(CASE WHEN P.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS HasAcceptedAnswer,
+        (SELECT COUNT(B.Id) FROM Badges B WHERE B.UserId = U.Id AND B.Class = 1) AS GoldBadgesCount, -- Correlated subquery for Gold Badges
+        SUM(CASE WHEN PV.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesReceived,
+        SUM(CASE WHEN PV.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesReceived
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Votes PV ON P.Id = PV.PostId AND PV.VoteTypeId IN (2,3) -- Only consider up/down votes for post itself
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Location
+),
+PostHistoryAggregates AS (
+    -- Aggregates post revision and lifecycle history
+    SELECT
+        PH.PostId,
+        COUNT(PH.Id) AS TotalHistoryEntries,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4,5,6) THEN 1 ELSE 0 END) AS TotalEditRevisions, -- Edit Title, Body, Tags
+        MAX(PH.CreationDate) AS LastEditOrHistoryDate,
+        MIN(PH.CreationDate) AS FirstHistoryDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS WasClosed, -- Post Closed history type
+        MAX(CASE WHEN PH.PostHistoryTypeId = 12 THEN 1 ELSE 0 END) AS WasDeleted -- Post Deleted history type
+    FROM PostHistory PH
+    GROUP BY PH.PostId
+),
+TagPerformanceMetrics AS (
+    -- Analyzes performance for each tag based on associated questions
+    SELECT
+        T.TagName,
+        COUNT(P.Id) AS PostsTaggedWithThis,
+        AVG(P.Score) AS AvgScoreForTagPosts,
+        SUM(P.ViewCount) AS TotalViewsForTagPosts,
+        NTILE(5) OVER (ORDER BY SUM(P.Score) DESC, COUNT(P.Id) DESC) AS TagPopularityQuintile -- Window function for ranking tags
+    FROM Tags T
+    JOIN Posts P ON P.Tags LIKE '%<' || T.TagName || '>%' AND P.PostTypeId = 1 -- String expression for tag matching
+    WHERE P.OwnerUserId IS NOT NULL
+    GROUP BY T.TagName
+),
+UserPostHistoryBase AS (
+    -- Combines user engagement with post history details and calculates derived metrics
+    SELECT
+        UES.UserId,
+        UES.DisplayName,
+        UES.Reputation,
+        UES.UserCreationDate,
+        UES.LastAccessDate,
+        UES.Location,
+        UES.TotalPosts,
+        UES.TotalQuestions,
+        UES.TotalAnswers,
+        UES.TotalComments,
+        UES.AvgPostScore,
+        UES.TotalQuestionViews,
+        UES.HasAcceptedAnswer,
+        UES.GoldBadgesCount,
+        UES.TotalUpvotesReceived,
+        UES.TotalDownvotesReceived,
+        CAST(UES.TotalUpvotesReceived AS DECIMAL) / NULLIF(UES.TotalUpvotesReceived + UES.TotalDownvotesReceived, 0) AS UpvoteRatio, -- NULLIF for division by zero
+        COALESCE(SUM(PRA.TotalHistoryEntries), 0) AS UserTotalHistoryEntries, -- NULL logic
+        COALESCE(SUM(PRA.TotalEditRevisions), 0) AS UserTotalEditRevisions,
+        AGE(MAX(PRA.LastEditOrHistoryDate), MIN(PRA.FirstHistoryDate)) AS UserEditTimeSpan, -- Date calculation
+        MAX(CASE WHEN PRA.WasClosed = 1 THEN 1 ELSE 0 END) AS HasClosedPosts,
+        MAX(CASE WHEN PRA.WasDeleted = 1 THEN 1 ELSE 0 END) AS HasDeletedPosts,
+        RANK() OVER (ORDER BY UES.Reputation DESC, UES.UserCreationDate ASC) AS ReputationRank, -- Window function for user rank
+        CUME_DIST() OVER (ORDER BY UES.Reputation DESC) AS ReputationCumDist, -- Window function for cumulative distribution
+        LAG(UES.LastAccessDate, 1, UES.UserCreationDate) OVER (PARTITION BY UES.Location ORDER BY UES.UserCreationDate) AS PreviousUserAccessInLocation, -- Window function for sequential access
+        AVG(UES.AvgPostScore) OVER (PARTITION BY UES.Location) AS AvgPostScoreInLocation, -- Window function for regional average
+        (SELECT COUNT(DISTINCT P_sub.Id) -- Correlated subquery for high-scoring posts
+         FROM Posts P_sub
+         WHERE P_sub.OwnerUserId = UES.UserId
+           AND P_sub.CreationDate > UES.UserCreationDate + INTERVAL '1 year'
+           AND P_sub.Score > COALESCE((SELECT AVG(P_avg.Score) FROM Posts P_avg WHERE P_avg.OwnerUserId = UES.UserId), 0) -- Nested correlated subquery
+        ) AS PostsAboveAvgScoreAfterFirstYear,
+        (SELECT SUM(V_sub.BountyAmount) -- Correlated subquery for bounty given
+         FROM Votes V_sub
+         WHERE V_sub.UserId = UES.UserId AND V_sub.VoteTypeId = 8
+        ) AS TotalBountyGivenByThisUser
+    FROM UserEngagementSummary UES
+    LEFT JOIN Posts P ON P.OwnerUserId = UES.UserId
+    LEFT JOIN PostHistoryAggregates PRA ON PRA.PostId = P.Id
+    GROUP BY
+        UES.UserId, UES.DisplayName, UES.Reputation, UES.UserCreationDate, UES.LastAccessDate, UES.Location,
+        UES.TotalPosts, UES.TotalQuestions, UES.TotalAnswers, UES.AvgPostScore, UES.TotalQuestionViews,
+        UES.HasAcceptedAnswer, UES.GoldBadgesCount, UES.TotalUpvotesReceived, UES.TotalDownvotesReceived,
+        UES.TotalComments
+)
+-- Branch 1: Highly Engaged and Influential Users
+SELECT
+    UPHB.UserId,
+    COALESCE(UPHB.DisplayName, 'Anon-' || UPHB.UserId) AS UserDisplayName, -- NULL logic, string expression
+    UPHB.Reputation,
+    UPHB.Location,
+    UPHB.UserCreationDate,
+    UPHB.LastAccessDate,
+    UPHB.TotalPosts,
+    UPHB.TotalQuestions,
+    UPHB.TotalAnswers,
+    UPHB.AvgPostScore,
+    UPHB.UpvoteRatio,
+    UPHB.UserTotalEditRevisions,
+    UPHB.PostsAboveAvgScoreAfterFirstYear,
+    UPHB.TotalBountyGivenByThisUser,
+    TPM.TagName AS TopContributingTag,
+    TPM.AvgScoreForTagPosts,
+    TPM.TagPopularityQuintile,
+    'Highly Engaged Influencer' AS UserClassification,
+    NTILE(4) OVER (ORDER BY UPHB.Reputation DESC) AS ReputationQuartile, -- Window function for quartiles
+    UPHB.ReputationRank,
+    UPHB.ReputationCumDist,
+    UPHB.PreviousUserAccessInLocation,
+    UPHB.AvgPostScoreInLocation,
+    (SELECT STRING_AGG(DISTINCT T_inner.TagName, ', ') -- Correlated subquery, string aggregation (PostgreSQL specific)
+     FROM Tags T_inner
+     JOIN Posts P_inner ON P_inner.Tags LIKE '%<' || T_inner.TagName || '>%' AND P_inner.PostTypeId = 1
+     WHERE P_inner.OwnerUserId = UPHB.UserId
+    ) AS AllTagsContributedTo,
+    SUM(CASE WHEN PL.LinkTypeId = 1 THEN 1 ELSE 0 END) OVER (PARTITION BY UPHB.UserId) AS TotalLinkedPostsCreated, -- Window function
+    SUM(CASE WHEN PL.LinkTypeId = 3 THEN 1 ELSE 0 END) OVER (PARTITION BY UPHB.UserId) AS TotalDuplicateSourcesCreated -- Window function
+FROM UserPostHistoryBase UPHB
+LEFT JOIN LATERAL ( -- Lateral join for finding the single most relevant tag
+    SELECT T_lat.TagName, T_lat.AvgScoreForTagPosts, T_lat.TotalViewsForTagPosts, T_lat.TagPopularityQuintile
+    FROM TagPerformanceMetrics T_lat
+    JOIN Posts P_lat ON P_lat.Tags LIKE '%<' || T_lat.TagName || '>%' AND P_lat.OwnerUserId = UPHB.UserId
+    ORDER BY T_lat.AvgScoreForTagPosts DESC, T_lat.TotalViewsForTagPosts DESC
+    LIMIT 1
+) AS TPM ON TRUE
+LEFT JOIN Posts P_link ON P_link.OwnerUserId = UPHB.UserId -- Join to posts to enable PostLinks
+LEFT JOIN PostLinks PL ON P_link.Id = PL.PostId OR P_link.Id = PL.RelatedPostId -- Complex join for linked/duplicate posts
+WHERE
+    UPHB.Reputation >= 5000
+    AND UPHB.TotalPosts >= 100
+    AND UPHB.UserTotalEditRevisions >= 10
+    AND UPHB.UpvoteRatio IS NOT NULL AND UPHB.UpvoteRatio >= 0.8 -- Complex predicate, NULL logic
+    AND UPHB.HasAcceptedAnswer = 1
+    AND UPHB.Location IS NOT NULL
+GROUP BY -- Extensive grouping due to aggregate and window functions
+    UPHB.UserId, UPHB.DisplayName, UPHB.Reputation, UPHB.Location, UPHB.UserCreationDate, UPHB.LastAccessDate,
+    UPHB.TotalPosts, UPHB.TotalQuestions, UPHB.TotalAnswers, UPHB.AvgPostScore, UPHB.UpvoteRatio, UPHB.UserTotalEditRevisions,
+    UPHB.PostsAboveAvgScoreAfterFirstYear, UPHB.TotalBountyGivenByThisUser,
+    TPM.TagName, TPM.AvgScoreForTagPosts, TPM.TagPopularityQuintile,
+    UPHB.ReputationRank, UPHB.ReputationCumDist, UPHB.PreviousUserAccessInLocation, UPHB.AvgPostScoreInLocation
+HAVING COUNT(DISTINCT P_link.Id) > 0 -- Ensure at least one post for post-link context
+UNION ALL
+-- Branch 2: Moderately Engaged Users with Recent Activity
+SELECT
+    UPHB.UserId,
+    COALESCE(UPHB.DisplayName, 'Anon-' || UPHB.UserId) AS UserDisplayName,
+    UPHB.Reputation,
+    UPHB.Location,
+    UPHB.UserCreationDate,
+    UPHB.LastAccessDate,
+    UPHB.TotalPosts,
+    UPHB.TotalQuestions,
+    UPHB.TotalAnswers,
+    UPHB.AvgPostScore,
+    UPHB.UpvoteRatio,
+    UPHB.UserTotalEditRevisions,
+    UPHB.PostsAboveAvgScoreAfterFirstYear,
+    UPHB.TotalBountyGivenByThisUser,
+    TPM.TagName AS TopContributingTag,
+    TPM.AvgScoreForTagPosts,
+    TPM.TagPopularityQuintile,
+    'Moderately Engaged Active' AS UserClassification,
+    NTILE(4) OVER (ORDER BY UPHB.Reputation DESC) AS ReputationQuartile,
+    UPHB.ReputationRank,
+    UPHB.ReputationCumDist,
+    UPHB.PreviousUserAccessInLocation,
+    UPHB.AvgPostScoreInLocation,
+    (SELECT STRING_AGG(DISTINCT T_inner.TagName, ', ')
+     FROM Tags T_inner
+     JOIN Posts P_inner ON P_inner.Tags LIKE '%<' || T_inner.TagName || '>%' AND P_inner.PostTypeId = 1
+     WHERE P_inner.OwnerUserId = UPHB.UserId
+    ) AS AllTagsContributedTo,
+    SUM(CASE WHEN PL.LinkTypeId = 1 THEN 1 ELSE 0 END) OVER (PARTITION BY UPHB.UserId) AS TotalLinkedPostsCreated,
+    SUM(CASE WHEN PL.LinkTypeId = 3 THEN 1 ELSE 0 END) OVER (PARTITION BY UPHB.UserId) AS TotalDuplicateSourcesCreated
+FROM UserPostHistoryBase UPHB
+LEFT JOIN LATERAL (
+    SELECT T_lat.TagName, T_lat.AvgScoreForTagPosts, T_lat.TotalViewsForTagPosts, T_lat.TagPopularityQuintile
+    FROM TagPerformanceMetrics T_lat
+    JOIN Posts P_lat ON P_lat.Tags LIKE '%<' || T_lat.TagName || '>%' AND P_lat.OwnerUserId = UPHB.UserId
+    ORDER BY T_lat.AvgScoreForTagPosts DESC, T_lat.TotalViewsForTagPosts DESC
+    LIMIT 1
+) AS TPM ON TRUE
+LEFT JOIN Posts P_link ON P_link.OwnerUserId = UPHB.UserId
+LEFT JOIN PostLinks PL ON P_link.Id = PL.PostId OR P_link.Id = PL.RelatedPostId
+WHERE
+    UPHB.Reputation BETWEEN 500 AND 4999
+    AND UPHB.TotalPosts BETWEEN 10 AND 99
+    AND UPHB.LastAccessDate > NOW() - INTERVAL '3 months' -- Recently active (date expression)
+    AND UPHB.UserTotalEditRevisions BETWEEN 1 AND 9
+    AND UPHB.HasDeletedPosts = 0
+    AND UPHB.Location IS NOT NULL
+GROUP BY
+    UPHB.UserId, UPHB.DisplayName, UPHB.Reputation, UPHB.Location, UPHB.UserCreationDate, UPHB.LastAccessDate,
+    UPHB.TotalPosts, UPHB.TotalQuestions, UPHB.TotalAnswers, UPHB.AvgPostScore, UPHB.UpvoteRatio, UPHB.UserTotalEditRevisions,
+    UPHB.PostsAboveAvgScoreAfterFirstYear, UPHB.TotalBountyGivenByThisUser,
+    TPM.TagName, TPM.AvgScoreForTagPosts, TPM.TagPopularityQuintile,
+    UPHB.ReputationRank, UPHB.ReputationCumDist, UPHB.PreviousUserAccessInLocation, UPHB.AvgPostScoreInLocation
+HAVING COUNT(DISTINCT P_link.Id) > 0
+ORDER BY
+    Reputation DESC, PostsAboveAvgScoreAfterFirstYear DESC, LastAccessDate DESC
+LIMIT 2000;

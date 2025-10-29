@@ -1,0 +1,317 @@
+-- {"query": "1587.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 4220} 
+WITH UserEngagement AS (
+    -- Aggregates comprehensive user statistics including post counts, comment counts, and badge distribution
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.UpVotes,
+        u.DownVotes,
+        u.Views AS UserProfileViews,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(u.LastAccessDate) AS LastUserActivityDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.Reputation, u.UpVotes, u.DownVotes, u.Views
+),
+PostHistoricalMetrics AS (
+    -- Calculates various historical and activity metrics for each post
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.Title AS PostTitle,
+        p.Body AS PostBody, -- Including body for potential string ops/length
+        p.Tags AS PostTags,
+        p.Score AS PostScore,
+        p.ViewCount AS PostViewCount,
+        p.AnswerCount,
+        p.CommentCount AS PostCommentCount,
+        p.FavoriteCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9, 24) THEN 1 ELSE 0 END) AS EditCount, -- Various edit types
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 12 THEN 1 ELSE 0 END) AS DeleteCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 13 THEN 1 ELSE 0 END) AS UndeleteCount,
+        SUM(CASE WHEN vt_up.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotes,
+        SUM(CASE WHEN vt_down.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotes,
+        COUNT(DISTINCT pl_link.RelatedPostId) AS LinkedPostsCount,
+        COUNT(DISTINCT pl_dup.RelatedPostId) AS DuplicatePostsCount,
+        -- Correlated subquery: Checks if the post's owner has ever had a post migrated away
+        (SELECT COUNT(DISTINCT phd_mig.PostId)
+         FROM PostHistory phd_mig
+         WHERE phd_mig.UserId = p.OwnerUserId
+           AND phd_mig.PostHistoryTypeId = 35 -- Post Migrated Away
+           AND phd_mig.CreationDate BETWEEN p.CreationDate AND cast('2024-10-01 12:34:56' as timestamp)
+        ) > 0 AS OwnerHasMigratedPostAway
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    LEFT JOIN Votes vt_up ON p.Id = vt_up.PostId AND vt_up.VoteTypeId = 2
+    LEFT JOIN Votes vt_down ON p.Id = vt_down.PostId AND vt_down.VoteTypeId = 3
+    LEFT JOIN PostLinks pl_link ON p.Id = pl_link.PostId AND pl_link.LinkTypeId = 1
+    LEFT JOIN PostLinks pl_dup ON p.Id = pl_dup.PostId AND pl_dup.LinkTypeId = 3
+    WHERE p.OwnerUserId IS NOT NULL -- Exclude posts by the community user
+    GROUP BY
+        p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.LastEditDate, p.LastActivityDate,
+        p.Title, p.Body, p.Tags, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount
+),
+RankedControversialQuestions AS (
+    -- Ranks questions based on a calculated 'controversy score' per user using a window function
+    SELECT
+        phm.PostId,
+        phm.OwnerUserId,
+        phm.PostTitle,
+        phm.PostTags,
+        phm.PostScore,
+        phm.PostCreationDate,
+        phm.LastEditDate,
+        phm.LastActivityDate,
+        phm.EditCount,
+        phm.CloseCount,
+        phm.ReopenCount,
+        phm.DeleteCount,
+        phm.UndeleteCount,
+        phm.TotalUpvotes,
+        phm.TotalDownvotes,
+        phm.LinkedPostsCount,
+        phm.DuplicatePostsCount,
+        phm.OwnerHasMigratedPostAway,
+        -- Complex Controversy Score calculation
+        (phm.EditCount * 0.5) + (phm.CloseCount * 2) + (phm.TotalDownvotes * 1.5) + (phm.DeleteCount * 3)
+        - (phm.TotalUpvotes * 0.1) - (phm.ReopenCount * 0.5) - (phm.UndeleteCount * 1.0) AS ControversyScore,
+        ROW_NUMBER() OVER (PARTITION BY phm.OwnerUserId ORDER BY
+            (phm.EditCount * 0.5) + (phm.CloseCount * 2) + (phm.TotalDownvotes * 1.5) + (phm.DeleteCount * 3)
+            - (phm.TotalUpvotes * 0.1) - (phm.ReopenCount * 0.5) - (phm.UndeleteCount * 1.0) DESC,
+            phm.PostCreationDate DESC
+        ) AS rn_controversy
+    FROM PostHistoricalMetrics phm
+    WHERE phm.PostTypeId = 1 -- Focus on Questions for controversy
+),
+RankedHighlyScoredAnswers AS (
+    -- Ranks answers by score per user, to be used in the UNION ALL part
+    SELECT
+        phm.PostId,
+        phm.OwnerUserId,
+        phm.PostBody, -- Use body for answers
+        phm.PostScore,
+        phm.PostCreationDate,
+        phm.LastEditDate,
+        phm.LastActivityDate,
+        phm.EditCount,
+        phm.TotalUpvotes,
+        phm.TotalDownvotes,
+        ROW_NUMBER() OVER (PARTITION BY phm.OwnerUserId ORDER BY phm.PostScore DESC, phm.PostCreationDate DESC) AS rn_score
+    FROM PostHistoricalMetrics phm
+    WHERE phm.PostTypeId = 2 -- Focus on Answers
+),
+AggregatedAnswerStats AS (
+    -- Aggregates answer scores and counts for each question
+    SELECT
+        p.ParentId AS QuestionId,
+        AVG(p.Score) AS AvgAnswerScore,
+        COUNT(DISTINCT p.Id) AS AnswerCountActual,
+        MAX(p.CreationDate) AS LatestAnswerDate
+    FROM Posts p
+    WHERE p.PostTypeId = 2 -- Answers
+    GROUP BY p.ParentId
+),
+PostTagFrequency AS (
+    -- Determines the most frequent tag for each question, handling the string-array conversion
+    SELECT
+        p.Id AS PostId,
+        COALESCE(
+            (SELECT tag_name
+             FROM UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><')) AS tag(tag_name)
+             GROUP BY tag_name
+             ORDER BY COUNT(*) DESC, tag_name
+             LIMIT 1
+            ), 'untagged') AS MostFrequentTag
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2
+),
+FinalControversialUserPosts AS (
+    -- Main branch: Selects top controversial questions by influential users
+    SELECT
+        ue.UserId,
+        u.DisplayName AS UserName,
+        ue.Reputation,
+        ue.TotalQuestions,
+        ue.TotalAnswers,
+        ue.GoldBadges,
+        rcq.PostId AS RelatedPostId,
+        'Question' AS PostTypeCategory,
+        rcq.PostTitle AS RelatedPostContentSummary,
+        rcq.PostScore AS RelatedPostScore,
+        rcq.PostViewCount,
+        rcq.EditCount,
+        rcq.CloseCount,
+        rcq.ReopenCount,
+        rcq.DeleteCount,
+        rcq.UndeleteCount,
+        rcq.TotalDownvotes AS RelatedPostDownvotes,
+        rcq.ControversyScore,
+        ptf.MostFrequentTag,
+        COALESCE(aas.AvgAnswerScore, 0.0) AS AverageAnswerScoreForQuestion,
+        COALESCE(aas.AnswerCountActual, 0) AS ActualAnswerCountForQuestion,
+        COALESCE(
+            EXTRACT(EPOCH FROM (rcq.LastEditDate - rcq.PostCreationDate)) / 3600.0, -- Time in hours
+            EXTRACT(EPOCH FROM (rcq.LastActivityDate - rcq.PostCreationDate)) / 3600.0,
+            0.0
+        ) AS TimeToLastActivityHours,
+        CASE
+            WHEN rcq.CloseCount > 0 AND rcq.ReopenCount > 0 THEN 'Closed & Reopened'
+            WHEN rcq.CloseCount > 0 THEN 'Closed'
+            WHEN rcq.EditCount > 5 AND rcq.TotalDownvotes > rcq.TotalUpvotes THEN 'Heavily Edited & Negative'
+            WHEN rcq.PostScore > 100 AND rcq.AnswerCount > 5 THEN 'Popular & Engaged'
+            ELSE 'Standard Question'
+        END AS PostStatusCategory,
+        LAG(rcq.PostCreationDate, 1, '1970-01-01 00:00:00'::timestamp) OVER (PARTITION BY ue.UserId ORDER BY rcq.PostCreationDate) AS PreviousUserPostDate,
+        LEAD(rcq.PostCreationDate, 1, '2099-12-31 23:59:59'::timestamp) OVER (PARTITION BY ue.UserId ORDER BY rcq.PostCreationDate) AS NextUserPostDate,
+        NTILE(10) OVER (ORDER BY ue.TotalQuestions DESC) AS EngagementCountTier, -- NTILE for question activity
+        rcq.OwnerHasMigratedPostAway,
+        NULLIF(LENGTH(rcq.PostTitle), 0) AS PostTitleLength, -- NULLIF example on string length
+        'Controversial Questions Analysis' AS ResultType
+    FROM UserEngagement ue
+    INNER JOIN Users u ON ue.UserId = u.Id
+    INNER JOIN RankedControversialQuestions rcq ON ue.UserId = rcq.OwnerUserId AND rcq.rn_controversy <= 3 -- Top 3 controversial questions per user
+    LEFT JOIN AggregatedAnswerStats aas ON rcq.PostId = aas.QuestionId
+    LEFT JOIN PostTagFrequency ptf ON rcq.PostId = ptf.PostId
+    WHERE
+        ue.Reputation >= 10000 -- Filter for influential users
+        AND ue.TotalQuestions >= 10 -- Active question askers
+        AND (rcq.CloseCount > 0 OR rcq.EditCount > 3 OR rcq.TotalDownvotes > 5) -- Truly controversial posts criterion
+        AND rcq.OwnerHasMigratedPostAway IS TRUE -- Apply correlated subquery result
+        AND POSITION('database' IN LOWER(COALESCE(rcq.PostTags, ''))) > 0 -- String expression: Contains 'database' tag (case-insensitive)
+),
+FinalHighlyScoredUserAnswers AS (
+    -- Second branch: Selects top highly scored answers from active answerers
+    SELECT
+        ue.UserId,
+        u.DisplayName AS UserName,
+        ue.Reputation,
+        ue.TotalQuestions,
+        ue.TotalAnswers,
+        ue.GoldBadges,
+        rhsa.PostId AS RelatedPostId,
+        'Answer' AS PostTypeCategory,
+        SUBSTRING(rhsa.PostBody, 1, 100) AS RelatedPostContentSummary, -- Substring for answer body
+        rhsa.PostScore AS RelatedPostScore,
+        NULL AS PostViewCount, -- N/A for answers directly in this view
+        rhsa.EditCount,
+        NULL AS CloseCount,
+        NULL AS ReopenCount,
+        NULL AS DeleteCount,
+        NULL AS UndeleteCount,
+        rhsa.TotalDownvotes AS RelatedPostDownvotes,
+        NULL AS ControversyScore, -- Not applicable for answers in this context
+        NULL AS MostFrequentTag, -- Not applicable for answers
+        NULL AS AverageAnswerScoreForQuestion,
+        NULL AS ActualAnswerCountForQuestion,
+        COALESCE(
+            EXTRACT(EPOCH FROM (rhsa.LastEditDate - rhsa.PostCreationDate)) / 3600.0,
+            EXTRACT(EPOCH FROM (rhsa.LastActivityDate - rhsa.PostCreationDate)) / 3600.0,
+            0.0
+        ) AS TimeToLastActivityHours,
+        CASE
+            WHEN rhsa.PostScore >= 50 THEN 'Highly Upvoted'
+            WHEN rhsa.PostScore >= 10 AND rhsa.TotalUpvotes > rhsa.TotalDownvotes * 2 THEN 'Positive Engagement'
+            ELSE 'Standard Answer'
+        END AS PostStatusCategory,
+        LAG(rhsa.PostCreationDate, 1, '1970-01-01 00:00:00'::timestamp) OVER (PARTITION BY ue.UserId ORDER BY rhsa.PostCreationDate) AS PreviousUserPostDate,
+        LEAD(rhsa.PostCreationDate, 1, '2099-12-31 23:59:59'::timestamp) OVER (PARTITION BY ue.UserId ORDER BY rhsa.PostCreationDate) AS NextUserPostDate,
+        NTILE(10) OVER (ORDER BY ue.TotalAnswers DESC) AS EngagementCountTier, -- NTILE for answer activity
+        rhsa.OwnerHasMigratedPostAway,
+        NULLIF(LENGTH(rhsa.PostBody), 0) AS PostTitleLength, -- Use body length for answers
+        'Highly Scored Answers Analysis' AS ResultType
+    FROM UserEngagement ue
+    INNER JOIN Users u ON ue.UserId = u.Id
+    INNER JOIN RankedHighlyScoredAnswers rhsa ON ue.UserId = rhsa.OwnerUserId AND rhsa.rn_score <= 5 -- Top 5 highest scored answers per user
+    WHERE
+        ue.Reputation >= 5000 -- Slightly lower reputation for answer analysis
+        AND ue.TotalAnswers >= 20 -- Active answerers
+        AND rhsa.PostScore >= 10 -- Only consider highly scored answers
+        AND rhsa.TotalUpvotes > rhsa.TotalDownvotes * 2 -- Significant upvote to downvote ratio
+)
+-- Combine the two result sets using UNION ALL and apply final ordering
+SELECT
+    fcup.UserId,
+    fcup.UserName,
+    fcup.Reputation,
+    fcup.TotalQuestions,
+    fcup.TotalAnswers,
+    fcup.GoldBadges,
+    fcup.RelatedPostId,
+    fcup.PostTypeCategory,
+    fcup.RelatedPostContentSummary,
+    fcup.RelatedPostScore,
+    fcup.PostViewCount,
+    fcup.EditCount,
+    fcup.CloseCount,
+    fcup.ReopenCount,
+    fcup.DeleteCount,
+    fcup.UndeleteCount,
+    fcup.RelatedPostDownvotes,
+    fcup.ControversyScore,
+    fcup.MostFrequentTag,
+    fcup.AverageAnswerScoreForQuestion,
+    fcup.ActualAnswerCountForQuestion,
+    fcup.TimeToLastActivityHours,
+    fcup.PostStatusCategory,
+    fcup.PreviousUserPostDate,
+    fcup.NextUserPostDate,
+    fcup.EngagementCountTier,
+    fcup.OwnerHasMigratedPostAway,
+    fcup.PostTitleLength,
+    fcup.ResultType
+FROM FinalControversialUserPosts fcup
+
+UNION ALL
+
+SELECT
+    fhsa.UserId,
+    fhsa.UserName,
+    fhsa.Reputation,
+    fhsa.TotalQuestions,
+    fhsa.TotalAnswers,
+    fhsa.GoldBadges,
+    fhsa.RelatedPostId,
+    fhsa.PostTypeCategory,
+    fhsa.RelatedPostContentSummary,
+    fhsa.RelatedPostScore,
+    fhsa.PostViewCount,
+    fhsa.EditCount,
+    fhsa.CloseCount,
+    fhsa.ReopenCount,
+    fhsa.DeleteCount,
+    fhsa.UndeleteCount,
+    fhsa.RelatedPostDownvotes,
+    fhsa.ControversyScore,
+    fhsa.MostFrequentTag,
+    fhsa.AverageAnswerScoreForQuestion,
+    fhsa.ActualAnswerCountForQuestion,
+    fhsa.TimeToLastActivityHours,
+    fhsa.PostStatusCategory,
+    fhsa.PreviousUserPostDate,
+    fhsa.NextUserPostDate,
+    fhsa.EngagementCountTier,
+    fhsa.OwnerHasMigratedPostAway,
+    fhsa.PostTitleLength,
+    fhsa.ResultType
+FROM FinalHighlyScoredUserAnswers fhsa
+
+ORDER BY
+    Reputation DESC,
+    UserId,
+    PostTypeCategory DESC, -- Questions first, then Answers
+    RelatedPostScore DESC,
+    TimeToLastActivityHours DESC;

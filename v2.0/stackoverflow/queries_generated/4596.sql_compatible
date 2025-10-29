@@ -1,0 +1,136 @@
+WITH
+  RankedPostHistory AS (
+    SELECT
+      ph.PostId,
+      ph.PostHistoryTypeId,
+      ph.UserId,
+      ph.CreationDate,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId, ph.PostHistoryTypeId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory AS ph
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6)
+  ),
+  LatestEdits AS (
+    SELECT
+      rph.PostId,
+      MAX(CASE WHEN rph.PostHistoryTypeId = 4 THEN rph.UserId ELSE NULL END) AS LastEditorUserId_Title,
+      MAX(CASE WHEN rph.PostHistoryTypeId = 5 THEN rph.UserId ELSE NULL END) AS LastEditorUserId_Body,
+      MAX(CASE WHEN rph.PostHistoryTypeId = 6 THEN rph.UserId ELSE NULL END) AS LastEditorUserId_Tags,
+      MAX(CASE WHEN rph.PostHistoryTypeId = 4 THEN rph.CreationDate ELSE NULL END) AS LastEditDate_Title,
+      MAX(CASE WHEN rph.PostHistoryTypeId = 5 THEN rph.CreationDate ELSE NULL END) AS LastEditDate_Body,
+      MAX(CASE WHEN rph.PostHistoryTypeId = 6 THEN rph.CreationDate ELSE NULL END) AS LastEditDate_Tags
+    FROM RankedPostHistory AS rph
+    WHERE
+      rph.rn = 1
+    GROUP BY
+      rph.PostId
+  ),
+  UserPostCounts AS (
+    SELECT
+      p.OwnerUserId,
+      COUNT(p.Id) AS TotalPostsByOwner
+    FROM Posts AS p
+    WHERE
+      p.OwnerUserId IS NOT NULL
+    GROUP BY
+      p.OwnerUserId
+  ),
+  PostTagCounts AS (
+    SELECT
+      p.Id AS PostId,
+      -- use standard SQL string functions: remove leading '<' and trailing '>' then split by '><'
+      CARDINALITY(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags) - 2)), '><')) AS TagCount
+    FROM Posts AS p
+    WHERE
+      p.PostTypeId = 1 AND p.Tags IS NOT NULL
+  ),
+  UserReputationChange AS (
+    SELECT
+      u.Id AS UserId,
+      u.Reputation,
+      LEAD(u.Reputation, 1, u.Reputation) OVER (ORDER BY u.CreationDate) - u.Reputation AS ReputationDelta
+    FROM Users AS u
+  ),
+  HotQuestions AS (
+    SELECT
+      p.Id,
+      p.Title,
+      p.CreationDate,
+      p.Score,
+      ROW_NUMBER() OVER (ORDER BY p.FavoriteCount DESC, p.Score DESC) AS HotRank
+    FROM Posts AS p
+    WHERE
+      p.PostTypeId = 1
+      AND p.FavoriteCount > 0
+      AND p.AnswerCount > 0
+      AND p.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days'
+  )
+SELECT
+  COALESCE(p.Id, ph.PostId) AS PostIdentifier,
+  pt.Name AS PostTypeName,
+  p.Title,
+  p.Score,
+  p.ViewCount,
+  p.CreationDate AS PostCreationDate,
+  p.LastActivityDate,
+  COALESCE(u.DisplayName, p.OwnerDisplayName) AS OwnerDisplayName,
+  u.Reputation AS OwnerReputation,
+  le.LastEditorUserId_Title,
+  le.LastEditorUserId_Body,
+  le.LastEditorUserId_Tags,
+  le.LastEditDate_Title,
+  le.LastEditDate_Body,
+  le.LastEditDate_Tags,
+  COALESCE(upc.TotalPostsByOwner, 0) AS OwnerTotalPosts,
+  ptc.TagCount,
+  CASE
+    WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+    WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+    ELSE 'Active'
+  END AS PostStatus,
+  ph.Comment AS LatestEditComment,
+  ph.CreationDate AS LatestEditDate,
+  ph.PostHistoryTypeId,
+  CASE
+    WHEN utc.ReputationDelta IS NOT NULL AND utc.ReputationDelta > 1000 THEN 'Significant Gain'
+    WHEN utc.ReputationDelta IS NOT NULL AND utc.ReputationDelta < -500 THEN 'Significant Loss'
+    ELSE 'Stable'
+  END AS UserReputationTrend,
+  hq.HotRank
+FROM Posts AS p
+FULL OUTER JOIN LatestEdits AS le
+  ON p.Id = le.PostId
+LEFT JOIN PostHistoryTypes AS pht
+  ON pht.Id = 5
+LEFT JOIN PostHistory AS ph
+  ON p.Id = ph.PostId AND ph.PostHistoryTypeId = 5 AND ph.Id = (
+    SELECT
+      MAX(ph2.Id)
+    FROM PostHistory AS ph2
+    WHERE
+      ph2.PostId = p.Id AND ph2.PostHistoryTypeId = 5
+  )
+LEFT JOIN PostTypes AS pt
+  ON p.PostTypeId = pt.Id
+LEFT JOIN Users AS u
+  ON p.OwnerUserId = u.Id
+LEFT JOIN UserPostCounts AS upc
+  ON p.OwnerUserId = upc.OwnerUserId
+LEFT JOIN PostTagCounts AS ptc
+  ON p.Id = ptc.PostId
+LEFT JOIN UserReputationChange AS utc
+  ON u.Id = utc.UserId AND u.CreationDate = (
+    SELECT
+      MAX(u2.CreationDate)
+    FROM Users AS u2
+    WHERE
+      u2.Id = u.Id AND u2.CreationDate < p.CreationDate
+  )
+LEFT JOIN HotQuestions AS hq
+  ON p.Id = hq.Id
+WHERE
+  p.OwnerUserId IS NOT NULL
+  OR ph.PostId IS NOT NULL
+ORDER BY
+  p.LastActivityDate DESC
+LIMIT 100;

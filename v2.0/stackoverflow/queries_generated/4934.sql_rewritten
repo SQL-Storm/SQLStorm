@@ -1,0 +1,161 @@
+-- {"query": "4934.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1285} 
+WITH
+  RankedPostEdits AS (
+    SELECT
+      ph.PostId,
+      ph.PostHistoryTypeId,
+      ph.CreationDate,
+      u.DisplayName AS EditorDisplayName,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory AS ph
+    LEFT JOIN Users AS u
+      ON ph.UserId = u.Id
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 7, 8) -- Title/Body Edits and Rollbacks
+  ),
+  PostSummary AS (
+    SELECT
+      p.Id AS PostId,
+      p.Title,
+      p.PostTypeId,
+      pt.Name AS PostTypeName,
+      p.OwnerUserId,
+      u.DisplayName AS OwnerDisplayName,
+      p.CreationDate AS PostCreationDate,
+      p.LastActivityDate,
+      p.Score,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      p.ClosedDate,
+      CASE
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        WHEN p.AnswerCount > 100 THEN 'Popular'
+        ELSE 'Active'
+      END AS PostStatus,
+      COUNT(c.Id) AS CommentCount_
+    FROM Posts AS p
+    JOIN PostTypes AS pt
+      ON p.PostTypeId = pt.Id
+    LEFT JOIN Users AS u
+      ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments AS c
+      ON p.Id = c.PostId
+    WHERE
+      p.PostTypeId IN (1, 2) -- Questions and Answers
+    GROUP BY
+      p.Id,
+      p.Title,
+      p.PostTypeId,
+      pt.Name,
+      p.OwnerUserId,
+      u.DisplayName,
+      p.CreationDate,
+      p.LastActivityDate,
+      p.Score,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      p.ClosedDate,
+      p.CommunityOwnedDate
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVotesReceived,
+      COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVotesReceived,
+      COUNT(DISTINCT b.Id) AS NumberOfBadges,
+      MAX(p.LastActivityDate) AS LastPostActivityDate
+    FROM Users AS u
+    LEFT JOIN Votes AS v
+      ON u.Id = v.UserId
+    LEFT JOIN Badges AS b
+      ON u.Id = b.UserId
+    LEFT JOIN Posts AS p
+      ON u.Id = p.OwnerUserId
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation
+  )
+SELECT
+  ps.PostId,
+  ps.Title,
+  ps.PostTypeName,
+  ps.OwnerDisplayName,
+  ps.PostCreationDate,
+  ps.LastActivityDate,
+  ps.Score,
+  ps.AnswerCount,
+  ps.CommentCount AS CommentCountFromPosts,
+  ps.FavoriteCount,
+  ps.PostStatus,
+  rpe.EditorDisplayName,
+  rpe.CreationDate AS LastEditDate,
+  ua.Reputation AS OwnerReputation,
+  ua.NumberOfBadges AS OwnerBadges,
+  ua.UpVotesReceived AS OwnerUpVotesReceived,
+  ua.DownVotesReceived AS OwnerDownVotesReceived,
+  ua.LastPostActivityDate,
+  (
+    SELECT
+      COUNT(*)
+    FROM Comments AS c_inner
+    WHERE
+      c_inner.PostId = ps.PostId
+      AND c_inner.UserId = ps.OwnerUserId
+  ) AS OwnerCommentsOnOwnPost,
+  CASE
+    WHEN ps.ClosedDate IS NOT NULL THEN DATEDIFF(day, ps.ClosedDate, cast('2024-10-01 12:34:56' as timestamp))
+    ELSE NULL
+  END AS DaysSinceClosed,
+  LENGTH(ps.Title) AS TitleLength,
+  SUBSTRING(ps.Title, 1, 10) AS TitlePrefix,
+  CASE
+    WHEN ps.OwnerUserId IS NULL THEN 'Community'
+    WHEN ps.OwnerDisplayName LIKE '%[deleted]%' THEN 'Deleted User'
+    ELSE ua.DisplayName
+  END AS FinalOwnerDisplayName
+FROM PostSummary AS ps
+LEFT JOIN RankedPostEdits AS rpe
+  ON ps.PostId = rpe.PostId AND rpe.rn = 1
+LEFT JOIN UserActivity AS ua
+  ON ps.OwnerUserId = ua.UserId
+WHERE
+  ps.Score > 0
+  AND ps.CommentCount_ > 0
+  AND ps.PostTypeName IN ('Question', 'Answer')
+  AND (
+    ps.OwnerUserId IS NULL OR ua.Reputation > 1000 OR ua.NumberOfBadges >= 5
+  )
+UNION ALL
+SELECT
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL
+FROM Users AS u
+WHERE
+  u.Id NOT IN (SELECT OwnerUserId FROM PostSummary WHERE OwnerUserId IS NOT NULL)
+  AND u.Reputation > 5000;

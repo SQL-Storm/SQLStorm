@@ -1,0 +1,174 @@
+with RecursiveTagHierarchy as (
+  select 
+    t.Id,
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId,
+    t.WikiPostId,
+    1 as Level,
+    cast(t.TagName as varchar(255)) as Path
+  from Tags t
+  where t.IsModeratorOnly = 0 and t.IsRequired = 0
+  union all
+  select 
+    t.Id,
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId,
+    t.WikiPostId,
+    r.Level + 1,
+    r.Path || '>' || t.TagName
+  from Tags t
+  join RecursiveTagHierarchy r on t.Id != r.Id and t.Count < r.Count
+  where r.Level < 3
+),
+UserBadgeStats as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    count(case when b.Class = 1 then 1 end) as GoldBadges,
+    count(case when b.Class = 2 then 1 end) as SilverBadges,
+    count(case when b.Class = 3 then 1 end) as BronzeBadges,
+    max(b.Date) as LatestBadgeDate,
+    -- emulate "keep (dense_rank last order by b.Date)" by taking the badge name for the max(date)
+    (select b2.Name
+     from Badges b2
+     where b2.UserId = u.Id
+     order by b2.Date desc
+     limit 1) as LatestBadgeName
+  from Users u
+  left join Badges b on b.UserId = u.Id
+  group by u.Id, u.DisplayName
+),
+PostScoreRanks as (
+  select 
+    p.Id,
+    p.PostTypeId,
+    coalesce(p.OwnerUserId, -1) as OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.Title,
+    row_number() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as ScoreRank,
+    first_value(p.Title) over (partition by p.PostTypeId order by p.Score desc) as TopPostTitle
+  from Posts p
+  where p.PostTypeId in (1,2)
+),
+TopPostsWithAnswers as (
+  select
+    q.Id as QuestionId,
+    q.Title as QuestionTitle,
+    q.Score as QuestionScore,
+    q.ViewCount as QuestionViews,
+    a.Id as AnswerId,
+    a.Score as AnswerScore,
+    a.CreationDate as AnswerCreationDate,
+    u.DisplayName as AnswererDisplayName,
+    abs(extract(epoch from (a.CreationDate - q.CreationDate))) / 3600 as HoursToAnswer,
+    (select count(*) from Comments c where c.PostId = a.Id and c.CreationDate > a.CreationDate) as CommentsAfterAnswer
+  from Posts q
+  left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+  left join Users u on u.Id = a.OwnerUserId
+  where q.PostTypeId = 1
+    and q.Score > 100
+    and a.Score is not null
+),
+VoteAggregates as (
+  select
+    p.Id as PostId,
+    p.PostTypeId,
+    sum(case when v.VoteTypeId = 2 then 1 else 0 end) as Upvotes,
+    sum(case when v.VoteTypeId = 3 then 1 else 0 end) as Downvotes,
+    count(distinct v.UserId) as DistinctVoters,
+    max(v.BountyAmount) as MaxBounty
+  from Posts p
+  left join Votes v on v.PostId = p.Id
+  group by p.Id, p.PostTypeId
+),
+ClosedQuestionsWithReasons as (
+  select
+    ph.PostId,
+    cast(ph.Comment as integer) as CloseReasonId,
+    crt.Name as CloseReasonName,
+    count(*) as CloseVoteCount,
+    max(ph.CreationDate) as LastCloseVoteDate
+  from PostHistory ph
+  join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+  where ph.PostHistoryTypeId = 10
+  group by ph.PostId, cast(ph.Comment as integer), crt.Name
+),
+FinalResult as (
+  select 
+    p.Id as PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    u.DisplayName as OwnerName,
+    u.Reputation,
+    coalesce(v.Upvotes,0) as Upvotes,
+    coalesce(v.Downvotes,0) as Downvotes,
+    coalesce(v.DistinctVoters,0) as DistinctVoters,
+    coalesce(v.MaxBounty,0) as MaxBounty,
+    coalesce(ub.GoldBadges,0) as GoldBadges,
+    coalesce(ub.SilverBadges,0) as SilverBadges,
+    coalesce(ub.BronzeBadges,0) as BronzeBadges,
+    ps.ScoreRank,
+    ps.TopPostTitle,
+    cq.CloseReasonName,
+    cq.CloseVoteCount,
+    tqh.Level as TagComplexityLevel,
+    tqh.Path as TagHierarchyPath
+  from Posts p
+  left join Users u on u.Id = p.OwnerUserId
+  left join VoteAggregates v on v.PostId = p.Id
+  left join UserBadgeStats ub on ub.UserId = p.OwnerUserId
+  left join PostScoreRanks ps on ps.Id = p.Id
+  left join ClosedQuestionsWithReasons cq on cq.PostId = p.Id
+  left join RecursiveTagHierarchy tqh on position('<' || tqh.TagName || '>' in coalesce(p.Tags, '')) > 0
+  where p.PostTypeId = 1
+    and (p.Score > 50 or coalesce(v.Upvotes,0) > 40)
+)
+select distinct
+  fr.PostId,
+  fr.Title,
+  fr.OwnerName,
+  fr.Reputation,
+  fr.Upvotes,
+  fr.Downvotes,
+  fr.DistinctVoters,
+  fr.MaxBounty,
+  fr.GoldBadges,
+  fr.SilverBadges,
+  fr.BronzeBadges,
+  fr.ScoreRank,
+  fr.TopPostTitle,
+  fr.CloseReasonName,
+  fr.CloseVoteCount,
+  fr.TagComplexityLevel,
+  fr.TagHierarchyPath,
+  (case 
+    when fr.CloseReasonName is not null then 'Closed: ' || fr.CloseReasonName
+    else 'Open'
+   end) as PostStatus,
+  coalesce((
+    select avg(a.Score::numeric)
+    from Posts a
+    where a.ParentId = fr.PostId and a.PostTypeId = 2
+  ), 0) as AverageAnswerScore,
+  coalesce((
+    select count(*)
+    from Comments c
+    where c.PostId = fr.PostId and c.UserId is not null
+  ), 0) as CommentCount,
+  (
+    select string_agg(distinct u2.DisplayName, '; ') 
+    from Users u2
+    join Posts p2 on p2.OwnerUserId = u2.Id 
+    where p2.Id in (
+      select pl.RelatedPostId from PostLinks pl where pl.PostId = fr.PostId and pl.LinkTypeId = 1
+    )
+  ) as LinkedPostOwners
+from FinalResult fr
+order by fr.Upvotes desc, fr.Reputation desc, fr.ScoreRank
+limit 50;

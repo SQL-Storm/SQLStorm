@@ -1,0 +1,204 @@
+-- {"query": "1890.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3506} 
+WITH UserReputationCategories AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostScoreOwned,
+        SUM(COALESCE(v_up.UpVoteCount, 0)) - SUM(COALESCE(v_down.DownVoteCount, 0)) AS NetVotesOnOwnedPosts,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        CASE
+            WHEN u.Reputation >= 100000 THEN 'Diamond'
+            WHEN u.Reputation >= 25000 THEN 'Platinum'
+            WHEN u.Reputation >= 5000 THEN 'Gold'
+            WHEN u.Reputation >= 1000 THEN 'Silver'
+            ELSE 'Bronze'
+        END AS ReputationTier,
+        CAST(EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - u.CreationDate)) / (3600 * 24) AS bigint) AS DaysSinceCreation
+    FROM Users AS u
+    LEFT JOIN Posts AS p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments AS c ON u.Id = c.UserId
+    LEFT JOIN (SELECT PostId, COUNT(Id) AS UpVoteCount FROM Votes WHERE VoteTypeId = 2 GROUP BY PostId) AS v_up ON p.Id = v_up.PostId
+    LEFT JOIN (SELECT PostId, COUNT(Id) AS DownVoteCount FROM Votes WHERE VoteTypeId = 3 GROUP BY PostId) AS v_down ON p.Id = v_down.PostId
+    LEFT JOIN Badges AS b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+PostHistoricalMetrics AS (
+    SELECT
+        ph.PostId,
+        COUNT(ph.Id) AS TotalHistoryEntries,
+        COUNT(DISTINCT ph.UserId) AS UniqueEditors,
+        MAX(ph.CreationDate) AS LastHistoryDate,
+        MIN(ph.CreationDate) AS InitialHistoryDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.CreationDate END) AS LastContentEditDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) AS LastClosedDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.CreationDate END) AS LastReopenedDate,
+        COALESCE(MAX(u_editor.Reputation), 0) AS MaxEditorReputation -- Max reputation of anyone who ever edited the post
+    FROM PostHistory AS ph
+    LEFT JOIN Users AS u_editor ON ph.UserId = u_editor.Id
+    GROUP BY ph.PostId
+),
+PostCommentSummary AS (
+    SELECT
+        c.PostId,
+        COUNT(c.Id) AS TotalComments,
+        SUM(c.Score) AS TotalCommentScore,
+        AVG(CAST(c.Score AS NUMERIC)) AS AverageCommentScore,
+        MAX(c.CreationDate) AS LatestCommentDate,
+        MAX(COALESCE(u_commenter.Reputation, 0)) AS HighestCommenterReputation,
+        SUM(CASE WHEN LENGTH(c.Text) > 100 THEN 1 ELSE 0 END) AS LongCommentsCount
+    FROM Comments AS c
+    LEFT JOIN Users AS u_commenter ON c.UserId = u_commenter.Id
+    GROUP BY c.PostId
+),
+PostTaggingData AS (
+    SELECT
+        p.Id AS PostId,
+        COALESCE(ARRAY_LENGTH(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><'), 1), 0) AS NumberOfTags,
+        STRING_AGG(DISTINCT t.TagName, ', ') FILTER (WHERE t.TagName IS NOT NULL) AS AssociatedTagNames,
+        AVG(t_stats.AvgScoreForTag) FILTER (WHERE t_stats.TagName IS NOT NULL) AS AverageAssociatedTagScore,
+        SUM(CASE WHEN t.IsModeratorOnly THEN 1 ELSE 0 END) AS ModeratorOnlyTagCount
+    FROM Posts AS p
+    LEFT JOIN LATERAL (
+        SELECT UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><')) AS TagName
+    ) AS unnested_tags ON TRUE
+    LEFT JOIN Tags AS t ON unnested_tags.TagName = t.TagName
+    LEFT JOIN (
+        SELECT t_inner.TagName, AVG(p_inner.Score) AS AvgScoreForTag
+        FROM Tags AS t_inner
+        JOIN Posts AS p_inner ON p_inner.Tags LIKE '%<' || t_inner.TagName || '>%'
+        WHERE p_inner.PostTypeId = 1 AND p_inner.Score IS NOT NULL
+        GROUP BY t_inner.TagName
+    ) AS t_stats ON t.TagName = t_stats.TagName
+    WHERE p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2
+    GROUP BY p.Id, p.Tags
+)
+-- Main Query Branch 1: Highly Engaged and Maintained Questions
+SELECT
+    p.Id AS PostId,
+    pt.Name AS PostTypeName,
+    p.Title,
+    urc_owner.DisplayName AS OwnerName,
+    urc_owner.Reputation AS OwnerReputation,
+    urc_owner.ReputationTier AS OwnerReputationTier,
+    p.CreationDate AS PostCreationDate,
+    p.Score AS PostScore,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    phm.TotalHistoryEntries,
+    phm.UniqueEditors,
+    phm.MaxEditorReputation,
+    pcs.AverageCommentScore,
+    pcs.HighestCommenterReputation,
+    ptd.NumberOfTags,
+    ptd.AssociatedTagNames,
+    ptd.AverageAssociatedTagScore,
+    ptd.ModeratorOnlyTagCount,
+    EXTRACT(EPOCH FROM (COALESCE(p.LastActivityDate, p.CreationDate) - p.CreationDate)) / (3600 * 24) AS PostLifespanDays,
+    (SELECT COUNT(DISTINCT pl_dup.PostId) FROM PostLinks pl_dup WHERE pl_dup.RelatedPostId = p.Id AND pl_dup.LinkTypeId = 3) AS DuplicatedByCount,
+    (SELECT MAX(ph_mig.CreationDate) FROM PostHistory ph_mig WHERE ph_mig.PostId = p.Id AND ph_mig.PostHistoryTypeId IN (35, 36)) AS LastMigrationDate,
+    CASE
+        WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Accepted Answer Present'
+        WHEN p.AnswerCount > 0 THEN 'Answers Present, No Accepted'
+        ELSE 'No Answers'
+    END AS AnswerStatus,
+    COALESCE(p.FavoriteCount, 0) + (p.Score * 0.7) + (phm.TotalHistoryEntries * 0.2) + (pcs.TotalComments * 0.3) AS CalculatedEngagementScore,
+    RANK() OVER (PARTITION BY urc_owner.ReputationTier ORDER BY p.Score DESC, p.ViewCount DESC) AS RankWithinOwnerTier,
+    NTILE(5) OVER (ORDER BY p.ViewCount DESC) AS ViewCountQuintile,
+    LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostScoreByOwner,
+    LEAD(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextPostScoreByOwner,
+    (SELECT COUNT(DISTINCT ph_editors.UserId) FROM PostHistory ph_editors WHERE ph_editors.PostId = p.Id AND ph_editors.UserId != p.OwnerUserId) AS ExternalEditorCount, -- Correlated Subquery 1
+    (SELECT AVG(LENGTH(c_text.Text)) FROM Comments c_text WHERE c_text.PostId = p.Id AND c_text.Score > 0 AND c_text.Text IS NOT NULL) AS AvgPositiveCommentLength, -- Correlated Subquery 2
+    urc_owner.DaysSinceCreation,
+    phm.LastContentEditDate
+FROM Posts AS p
+INNER JOIN PostTypes AS pt ON p.PostTypeId = pt.Id
+INNER JOIN UserReputationCategories AS urc_owner ON p.OwnerUserId = urc_owner.UserId
+LEFT JOIN PostHistoricalMetrics AS phm ON p.Id = phm.PostId
+LEFT JOIN PostCommentSummary AS pcs ON p.Id = pcs.PostId
+LEFT JOIN PostTaggingData AS ptd ON p.Id = ptd.PostId
+WHERE
+    p.PostTypeId = 1 -- Questions only
+    AND p.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '3 year') -- Recently created questions
+    AND p.ViewCount > 5000 -- High view count
+    AND p.Score >= 10 -- High score
+    AND (p.Title ILIKE '%performance%' OR p.Title ILIKE '%optimization%' OR ptd.AssociatedTagNames ILIKE '%sql%') -- Specific topics
+    AND COALESCE(phm.UniqueEditors, 0) > 1 -- At least one editor other than the owner
+    AND (p.ClosedDate IS NULL OR p.ClosedDate > (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '6 months')) -- Not recently closed permanently
+    AND COALESCE(phm.LastContentEditDate, p.CreationDate) >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year') -- Actively maintained
+    AND (SELECT COUNT(DISTINCT pl_dup.PostId) FROM PostLinks pl_dup WHERE pl_dup.RelatedPostId = p.Id AND pl_dup.LinkTypeId = 3) < 5 -- Not overly duplicated (repeated subquery for stress)
+    AND NOT EXISTS (
+        SELECT 1
+        FROM PostHistory ph_close_reason
+        WHERE ph_close_reason.PostId = p.Id
+          AND ph_close_reason.PostHistoryTypeId = 10 -- Post Closed
+          AND ph_close_reason.Comment = '102' -- Off-topic
+          AND ph_close_reason.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year')
+    )
+    AND urc_owner.ReputationTier IN ('Gold', 'Platinum', 'Diamond') -- Owner is highly reputable
+    AND COALESCE(pcs.TotalComments, 0) > 5 -- Has significant discussion
+    AND COALESCE(pcs.AverageCommentScore, 0) >= 0.5 -- Comments are generally positive or neutral
+UNION ALL
+-- Main Query Branch 2: Highly Valued Answers by Influential Users
+SELECT
+    p.Id AS PostId,
+    pt.Name AS PostTypeName,
+    (SELECT Title FROM Posts WHERE Id = p.ParentId) AS Title, -- Get parent question title for answers
+    urc_owner.DisplayName AS OwnerName,
+    urc_owner.Reputation AS OwnerReputation,
+    urc_owner.ReputationTier AS OwnerReputationTier,
+    p.CreationDate AS PostCreationDate,
+    p.Score AS PostScore,
+    p.ViewCount,
+    NULL AS AnswerCount, -- Answers don't have this column directly in Posts
+    p.CommentCount,
+    p.FavoriteCount,
+    phm.TotalHistoryEntries,
+    phm.UniqueEditors,
+    phm.MaxEditorReputation,
+    pcs.AverageCommentScore,
+    pcs.HighestCommenterReputation,
+    ptd.NumberOfTags,
+    ptd.AssociatedTagNames,
+    ptd.AverageAssociatedTagScore,
+    ptd.ModeratorOnlyTagCount,
+    EXTRACT(EPOCH FROM (COALESCE(p.LastActivityDate, p.CreationDate) - p.CreationDate)) / (3600 * 24) AS PostLifespanDays,
+    (SELECT COUNT(DISTINCT pl_dup.PostId) FROM PostLinks pl_dup WHERE pl_dup.RelatedPostId = p.Id AND pl_dup.LinkTypeId = 3) AS DuplicatedByCount,
+    (SELECT MAX(ph_mig.CreationDate) FROM PostHistory ph_mig WHERE ph_mig.PostId = p.Id AND ph_mig.PostHistoryTypeId IN (35, 36)) AS LastMigrationDate,
+    'Accepted Answer' AS AnswerStatus, -- Specific status for this branch
+    (p.Score * 1.5) + (COALESCE(p.FavoriteCount, 0) * 1.0) + (COALESCE(pcs.TotalComments, 0) * 0.5) AS CalculatedEngagementScore,
+    RANK() OVER (PARTITION BY urc_owner.ReputationTier ORDER BY p.Score DESC, p.CreationDate DESC) AS RankWithinOwnerTier,
+    NTILE(5) OVER (ORDER BY p.Score DESC) AS ViewCountQuintile, -- Using PostScore for quintile for answers
+    LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostScoreByOwner,
+    LEAD(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextPostScoreByOwner,
+    (SELECT COUNT(DISTINCT ph_editors.UserId) FROM PostHistory ph_editors WHERE ph_editors.PostId = p.Id AND ph_editors.UserId != p.OwnerUserId) AS ExternalEditorCount,
+    (SELECT AVG(LENGTH(c_text.Text)) FROM Comments c_text WHERE c_text.PostId = p.Id AND c_text.Score > 0 AND c_text.Text IS NOT NULL) AS AvgPositiveCommentLength,
+    urc_owner.DaysSinceCreation,
+    phm.LastContentEditDate
+FROM Posts AS p
+INNER JOIN PostTypes AS pt ON p.PostTypeId = pt.Id
+INNER JOIN UserReputationCategories AS urc_owner ON p.OwnerUserId = urc_owner.UserId
+LEFT JOIN PostHistoricalMetrics AS phm ON p.Id = phm.PostId
+LEFT JOIN PostCommentSummary AS pcs ON p.Id = pcs.PostId
+LEFT JOIN PostTaggingData AS ptd ON p.Id = ptd.PostId
+WHERE
+    p.PostTypeId = 2 -- Answers only
+    AND p.Score >= 20 -- High scoring answers
+    AND p.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '5 year')
+    AND urc_owner.Reputation >= 10000 -- Very reputable answerer
+    AND EXISTS (
+        SELECT 1
+        FROM Posts q
+        WHERE q.Id = p.ParentId AND q.AcceptedAnswerId = p.Id -- Is an accepted answer
+    )
+    AND COALESCE(phm.UniqueEditors, 0) >= 1 -- Has been edited at least once (including initial post)
+ORDER BY
+    CalculatedEngagementScore DESC,
+    OwnerReputation DESC
+LIMIT 200;

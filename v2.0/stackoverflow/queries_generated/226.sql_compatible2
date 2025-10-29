@@ -1,0 +1,421 @@
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        coalesce(nullif(trim(split_part(coalesce(u.location,''), ',', 1)), ''), 'Unknown') as location_region,
+        date_trunc('month', u.creationdate) as cohort_month
+    from users u
+    where u.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+),
+question_posts as (
+    select
+        p.id as post_id,
+        p.owneruserid as user_id,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        p.answercount,
+        p.title,
+        p.tags,
+        p.closeddate,
+        p.communityowneddate
+    from posts p
+    where p.posttypeid = 1
+),
+answer_posts as (
+    select
+        a.id as answer_id,
+        a.parentid as question_id,
+        a.owneruserid as user_id,
+        a.creationdate as answer_creationdate,
+        a.score as answer_score
+    from posts a
+    where a.posttypeid = 2
+),
+q_activity as (
+    select
+        q.post_id,
+        q.user_id,
+        q.creationdate,
+        q.score,
+        q.viewcount,
+        q.answercount,
+        q.title,
+        q.tags,
+        q.closeddate,
+        q.communityowneddate,
+        sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end) as net_votes,
+        count(*) filter (where v.votetypeid = 5) as favorites_count,
+        min(a.answer_creationdate) as first_answer_date,
+        count(a.answer_id) as total_answers,
+        max(a.answer_score) as max_answer_score
+    from question_posts q
+    left join votes v on v.postid = q.post_id
+    left join answer_posts a on a.question_id = q.post_id
+    group by q.post_id, q.user_id, q.creationdate, q.score, q.viewcount, q.answercount, q.title, q.tags, q.closeddate, q.communityowneddate
+),
+tag_expansion as (
+    select
+        qa.post_id,
+        unnest(string_to_array(substring(coalesce(qa.tags,''), 2, greatest(length(coalesce(qa.tags,'')) - 2, 0)), '><')) as tagname
+    from q_activity qa
+),
+tag_rank as (
+    select
+        te.tagname,
+        count(distinct te.post_id) as tag_questions,
+        rank() over (order by count(distinct te.post_id) desc) as tag_popularity_rank
+    from tag_expansion te
+    where te.tagname is not null and te.tagname <> ''
+    group by te.tagname
+),
+user_badge_agg as (
+    select
+        b.userid,
+        count(*) filter (where b.class = 1) as gold_badges,
+        count(*) filter (where b.class = 2) as silver_badges,
+        count(*) filter (where b.class = 3) as bronze_badges,
+        count(*) filter (where b.tagbased = TRUE) as tag_badges,
+        max(b.date) as last_badge_date
+    from badges b
+    group by b.userid
+),
+post_edit_stats as (
+    select
+        ph.postid,
+        count(*) filter (where ph.posthistorytypeid in (4,5,6,7,8,9,24)) as edit_events,
+        min(ph.creationdate) filter (where ph.posthistorytypeid in (4,5,6,7,8,9,24)) as first_edit_date,
+        max(ph.creationdate) filter (where ph.posthistorytypeid in (4,5,6,7,8,9,24)) as last_edit_date,
+        count(*) filter (where ph.posthistorytypeid in (10,11,12,13,14,15,19,20)) as mod_state_changes,
+        sum(case when ph.posthistorytypeid = 10 and nullif(ph.comment, '') ~ '^[0-9]+' then 1 else 0 end) as close_events
+    from posthistory ph
+    group by ph.postid
+),
+dup_links as (
+    select
+        pl.postid,
+        pl.relatedpostid,
+        pl.creationdate as dup_link_date
+    from postlinks pl
+    where pl.linktypeid = 3
+),
+question_quality as (
+    select
+        qa.post_id,
+        qa.user_id,
+        qa.creationdate,
+        qa.title,
+        qa.tags,
+        qa.viewcount,
+        qa.score,
+        qa.net_votes,
+        qa.favorites_count,
+        qa.total_answers,
+        qa.max_answer_score,
+        qa.first_answer_date,
+        pes.edit_events,
+        pes.first_edit_date,
+        pes.last_edit_date,
+        pes.mod_state_changes,
+        pes.close_events,
+        case
+            when qa.closeddate is not null then 'Closed'
+            when qa.communityowneddate is not null then 'CommunityOwned'
+            else 'Open'
+        end as lifecycle_state,
+        case
+            when qa.viewcount is null or qa.viewcount = 0 then null
+            else round((qa.net_votes + coalesce(qa.favorites_count,0)) / nullif(qa.viewcount,0) * 1000, 4)
+        end as engagement_per_k_views,
+        extract(epoch from (coalesce(qa.first_answer_date, qa.creationdate) - qa.creationdate)) / 3600.0 as hours_to_first_answer
+    from q_activity qa
+    left join post_edit_stats pes on pes.postid = qa.post_id
+),
+user_activity as (
+    select
+        ru.user_id,
+        ru.displayname,
+        ru.reputation,
+        ru.location_region,
+        ru.cohort_month,
+        count(distinct qp.post_id) as questions_asked,
+        count(distinct ap.answer_id) as answers_posted,
+        sum(greatest(qp.score,0)) as question_positive_score,
+        sum(greatest(ap.answer_score,0)) as answer_positive_score,
+        max(qp.creationdate) as last_question_date,
+        max(ap.answer_creationdate) as last_answer_date
+    from recent_users ru
+    left join question_posts qp on qp.user_id = ru.user_id
+    left join answer_posts ap on ap.user_id = ru.user_id
+    group by ru.user_id, ru.displayname, ru.reputation, ru.location_region, ru.cohort_month
+),
+question_flags as (
+    select
+        qq.post_id,
+        case when exists (
+            select 1
+            from dup_links dl
+            where dl.postid = qq.post_id
+        ) then 1 else 0 end as has_duplicate_link,
+        case when exists (
+            select 1
+            from votes v
+            where v.postid = qq.post_id and v.votetypeid in (12,4)
+        ) then 1 else 0 end as has_spam_or_offensive_votes
+    from question_quality qq
+),
+question_tag_features as (
+    select
+        te.post_id,
+        max(case when tr.tag_popularity_rank <= 10 then 1 else 0 end) as has_top10_tag,
+        max(case when tr.tag_popularity_rank between 11 and 100 then 1 else 0 end) as has_top100_tag,
+        count(*) as tag_count
+    from tag_expansion te
+    left join tag_rank tr on tr.tagname = te.tagname
+    group by te.post_id
+),
+answerer_mix as (
+    select
+        qa.post_id,
+        count(distinct case when ap.user_id = qa.user_id then null else ap.user_id end) as distinct_non_owner_answerers,
+        avg(ap.answer_score) as avg_answer_score,
+        percentile_disc(0.5) within group (order by ap.answer_score) as median_answer_score
+    from q_activity qa
+    left join answer_posts ap on ap.question_id = qa.post_id
+    group by qa.post_id
+),
+question_scoring as (
+    select
+        qq.post_id,
+        qq.user_id,
+        qq.creationdate,
+        qq.title,
+        qq.tags,
+        qq.viewcount,
+        qq.score,
+        qq.net_votes,
+        qq.favorites_count,
+        qq.total_answers,
+        qq.max_answer_score,
+        qq.first_answer_date,
+        qq.edit_events,
+        qq.first_edit_date,
+        qq.last_edit_date,
+        qq.mod_state_changes,
+        qq.close_events,
+        qq.lifecycle_state,
+        qq.engagement_per_k_views,
+        qq.hours_to_first_answer,
+        qf.has_duplicate_link,
+        qf.has_spam_or_offensive_votes,
+        qtf.has_top10_tag,
+        qtf.has_top100_tag,
+        qtf.tag_count,
+        am.distinct_non_owner_answerers,
+        am.avg_answer_score,
+        am.median_answer_score,
+        (
+            coalesce(qq.engagement_per_k_views, 0) * 0.5
+            + coalesce(qq.total_answers, 0) * 0.2
+            + coalesce(qq.max_answer_score, 0) * 0.1
+            - coalesce(qq.close_events, 0) * 1.0
+            - coalesce(qf.has_spam_or_offensive_votes,0) * 2.0
+            + coalesce(qtf.has_top10_tag,0) * 0.3
+            + coalesce(qtf.has_top100_tag,0) * 0.1
+            + case when qq.hours_to_first_answer is null then 0 else greatest(0, 24 - qq.hours_to_first_answer) * 0.02 end
+        ) as quality_score
+    from question_quality qq
+    left join question_flags qf on qf.post_id = qq.post_id
+    left join question_tag_features qtf on qtf.post_id = qq.post_id
+    left join answerer_mix am on am.post_id = qq.post_id
+),
+user_rollup as (
+    select
+        ua.user_id,
+        ua.displayname,
+        ua.reputation,
+        ua.location_region,
+        ua.cohort_month,
+        ua.questions_asked,
+        ua.answers_posted,
+        ua.question_positive_score,
+        ua.answer_positive_score,
+        ub.gold_badges,
+        ub.silver_badges,
+        ub.bronze_badges,
+        ub.tag_badges,
+        ub.last_badge_date,
+        sum(case when qs.lifecycle_state = 'Closed' then 1 else 0 end) as closed_questions,
+        sum(case when qs.has_duplicate_link = 1 then 1 else 0 end) as duplicate_marked_questions,
+        avg(qs.quality_score) as avg_quality_score,
+        percentile_disc(0.9) within group (order by qs.quality_score) as p90_quality_score,
+        count(*) as total_questions_evaluated,
+        max(qs.creationdate) as last_question_date_eval
+    from user_activity ua
+    left join user_badge_agg ub on ub.userid = ua.user_id
+    left join question_scoring qs on qs.user_id = ua.user_id
+    group by ua.user_id, ua.displayname, ua.reputation, ua.location_region, ua.cohort_month, ub.gold_badges, ub.silver_badges, ub.bronze_badges, ub.tag_badges, ub.last_badge_date
+),
+cohort_vs_global as (
+    select
+        ur.*,
+        avg(ur.avg_quality_score) over () as global_avg_quality,
+        avg(ur.avg_quality_score) over (partition by ur.cohort_month) as cohort_avg_quality,
+        avg(ur.avg_quality_score) over (partition by ur.location_region) as region_avg_quality,
+        rank() over (order by ur.avg_quality_score desc nulls last) as user_quality_rank_global,
+        rank() over (partition by ur.cohort_month order by ur.avg_quality_score desc nulls last) as user_quality_rank_cohort
+    from user_rollup ur
+),
+heavy_users as (
+    select
+        c.user_id
+    from cohort_vs_global c
+    where coalesce(c.questions_asked,0) + coalesce(c.answers_posted,0) >= 50
+),
+final_set as (
+    select
+        'heavy' as segment,
+        c.*
+    from cohort_vs_global c
+    inner join heavy_users h on h.user_id = c.user_id
+    union all
+    select
+        'light' as segment,
+        c.*
+    from cohort_vs_global c
+    where c.user_id not in (select user_id from heavy_users)
+),
+stringified as (
+    select
+        f.segment,
+        f.user_id,
+        coalesce(f.displayname, concat('user_', cast(f.user_id as varchar))) as displayname_norm,
+        f.reputation,
+        f.location_region,
+        to_char(f.cohort_month, 'YYYY-MM') as cohort_key,
+        f.questions_asked,
+        f.answers_posted,
+        f.question_positive_score,
+        f.answer_positive_score,
+        coalesce(f.gold_badges,0) as gold_badges,
+        coalesce(f.silver_badges,0) as silver_badges,
+        coalesce(f.bronze_badges,0) as bronze_badges,
+        coalesce(f.tag_badges,0) as tag_badges,
+        f.closed_questions,
+        f.duplicate_marked_questions,
+        round(cast(f.avg_quality_score as numeric), 4) as avg_quality_score,
+        round(cast(f.p90_quality_score as numeric), 4) as p90_quality_score,
+        f.total_questions_evaluated,
+        f.user_quality_rank_global,
+        f.user_quality_rank_cohort,
+        round(cast(f.global_avg_quality as numeric), 4) as global_avg_quality,
+        round(cast(f.cohort_avg_quality as numeric), 4) as cohort_avg_quality,
+        round(cast(f.region_avg_quality as numeric), 4) as region_avg_quality,
+        case
+            when f.avg_quality_score is null then 'Unknown'
+            when f.avg_quality_score >= f.global_avg_quality then 'AboveGlobal'
+            else 'BelowGlobal'
+        end as global_position,
+        case
+            when f.avg_quality_score is null or f.cohort_avg_quality is null then 'Unknown'
+            when f.avg_quality_score >= f.cohort_avg_quality then 'AboveCohort'
+            else 'BelowCohort'
+        end as cohort_position,
+        case
+            when f.avg_quality_score is null or f.region_avg_quality is null then 'Unknown'
+            when f.avg_quality_score >= f.region_avg_quality then 'AboveRegion'
+            else 'BelowRegion'
+        end as region_position,
+        greatest(
+            coalesce(f.last_question_date_eval, timestamp 'epoch'),
+            coalesce(f.last_badge_date, timestamp 'epoch')
+        ) as last_activity_marker
+    from final_set f
+),
+ranked AS (
+    select
+        s.segment,
+        s.user_id,
+        s.displayname_norm,
+        s.reputation,
+        s.location_region,
+        s.cohort_key,
+        s.questions_asked,
+        s.answers_posted,
+        s.question_positive_score,
+        s.answer_positive_score,
+        s.gold_badges,
+        s.silver_badges,
+        s.bronze_badges,
+        s.tag_badges,
+        s.closed_questions,
+        s.duplicate_marked_questions,
+        s.avg_quality_score,
+        s.p90_quality_score,
+        s.total_questions_evaluated,
+        s.user_quality_rank_global,
+        s.user_quality_rank_cohort,
+        s.global_avg_quality,
+        s.cohort_avg_quality,
+        s.region_avg_quality,
+        s.global_position,
+        s.cohort_position,
+        s.region_position,
+        s.last_activity_marker,
+        case
+            when s.questions_asked = 0 and s.answers_posted = 0 then 'Inactive'
+            when s.questions_asked > 0 and s.answers_posted = 0 then 'Questioner'
+            when s.answers_posted > 0 and s.questions_asked = 0 then 'Answerer'
+            else 'Mixed'
+        end as contributor_mix,
+        case
+            when s.reputation >= 100000 then 'Legend'
+            when s.reputation >= 25000 then 'High'
+            when s.reputation >= 5000 then 'Medium'
+            else 'Low'
+        end as reputation_bucket,
+        row_number() over (partition by s.segment order by s.avg_quality_score desc nulls last, s.user_quality_rank_global) as segment_rank,
+        row_number() over (order by s.avg_quality_score desc nulls last, s.user_quality_rank_global) as global_row_num
+    from stringified s
+    where (
+        s.avg_quality_score is not null
+        or s.questions_asked + s.answers_posted > 0
+    )
+)
+select
+    r.segment,
+    r.user_id,
+    r.displayname_norm,
+    r.reputation,
+    r.location_region,
+    r.cohort_key,
+    r.questions_asked,
+    r.answers_posted,
+    r.question_positive_score,
+    r.answer_positive_score,
+    r.gold_badges,
+    r.silver_badges,
+    r.bronze_badges,
+    r.tag_badges,
+    r.closed_questions,
+    r.duplicate_marked_questions,
+    r.avg_quality_score,
+    r.p90_quality_score,
+    r.total_questions_evaluated,
+    r.user_quality_rank_global,
+    r.user_quality_rank_cohort,
+    r.global_avg_quality,
+    r.cohort_avg_quality,
+    r.region_avg_quality,
+    r.global_position,
+    r.cohort_position,
+    r.region_position,
+    r.last_activity_marker,
+    r.contributor_mix,
+    r.reputation_bucket,
+    r.segment_rank
+from ranked r
+where r.global_row_num <= 1000
+order by r.segment, r.segment_rank;

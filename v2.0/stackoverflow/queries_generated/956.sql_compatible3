@@ -1,0 +1,377 @@
+with
+q_posts as (
+  select p.Id as QuestionId,
+         p.OwnerUserId as QOwnerId,
+         p.CreationDate as QCreated,
+         p.Score as QScore,
+         p.ViewCount as QViews,
+         p.Title,
+         p.Tags,
+         coalesce(p.AnswerCount, 0) as AnswerCount,
+         p.AcceptedAnswerId
+  from Posts p
+  where p.PostTypeId = 1
+),
+a_posts as (
+  select a.Id as AnswerId,
+         a.ParentId as QuestionId,
+         a.OwnerUserId as AOwnerId,
+         a.CreationDate as ACreated,
+         a.Score as AScore
+  from Posts a
+  where a.PostTypeId = 2
+),
+user_stats as (
+  select
+    u.Id as UserId,
+    u.Reputation,
+    u.CreationDate,
+    u.DisplayName,
+    u.Location,
+    u.UpVotes,
+    u.DownVotes,
+    u.Views,
+    sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+    sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+    sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+    count(b.Id) as TotalBadges
+  from Users u
+  left join Badges b on b.UserId = u.Id
+  group by u.Id, u.Reputation, u.CreationDate, u.DisplayName, u.Location, u.UpVotes, u.DownVotes, u.Views
+),
+q_activity as (
+  select
+    q.QuestionId,
+    count(distinct c.Id) filter (where c.Id is not null) as CommentCount,
+    count(distinct case when v.VoteTypeId = 2 then v.Id end) as UpvoteCount,
+    count(distinct case when v.VoteTypeId = 3 then v.Id end) as DownvoteCount,
+    count(distinct case when v.VoteTypeId = 5 then v.Id end) as FavoriteCount
+  from q_posts q
+  left join Comments c on c.PostId = q.QuestionId
+  left join Votes v on v.PostId = q.QuestionId
+  group by q.QuestionId
+),
+dup_info as (
+  select
+    pl.PostId as QuestionId,
+    count(*) filter (where pl.LinkTypeId = 3) as DuplicateLinks,
+    min(pl.CreationDate) filter (where pl.LinkTypeId = 3) as FirstDupLinkDate
+  from PostLinks pl
+  group by pl.PostId
+),
+close_info as (
+  select
+    ph.PostId as QuestionId,
+    count(*) filter (where ph.PostHistoryTypeId = 10) as CloseEvents,
+    max(ph.CreationDate) filter (where ph.PostHistoryTypeId = 10) as LastClosedDate,
+    count(*) filter (where ph.PostHistoryTypeId = 11) as ReopenEvents
+  from PostHistory ph
+  group by ph.PostId
+),
+answer_rank as (
+  select
+    a.QuestionId,
+    a.AnswerId,
+    a.AOwnerId,
+    a.ACreated,
+    a.AScore,
+    row_number() over (partition by a.QuestionId order by a.AScore desc, a.ACreated asc) as rn_score,
+    row_number() over (partition by a.QuestionId order by a.ACreated asc) as rn_fastest,
+    max(a.AScore) over (partition by a.QuestionId) as MaxAScore,
+    count(*) over (partition by a.QuestionId) as AnswerCnt
+  from a_posts a
+),
+accepted_vs_best as (
+  select
+    q.QuestionId,
+    q.AcceptedAnswerId,
+    ar_best.AnswerId as BestByScoreId,
+    ar_best.AScore as BestByScore,
+    ar_fast.AnswerId as FastestAnswerId,
+    ar_fast.ACreated as FastestAnswerDate
+  from q_posts q
+  left join answer_rank ar_best
+    on ar_best.QuestionId = q.QuestionId and ar_best.rn_score = 1
+  left join answer_rank ar_fast
+    on ar_fast.QuestionId = q.QuestionId and ar_fast.rn_fastest = 1
+),
+tag_expand as (
+  select
+    q.QuestionId,
+    trim(t) as Tag
+  from q_posts q
+  cross join lateral unnest(string_to_array(coalesce(substring(q.Tags, 2, greatest(length(q.Tags)-2,0)), ''), '><')) as t(t)
+),
+tag_quality as (
+  select
+    te.Tag,
+    count(*) as QCount,
+    avg(CAST(q.QScore AS numeric)) as AvgQScore,
+    sum(case when q.AcceptedAnswerId is not null then 1 else 0 end) as AcceptedCount
+  from tag_expand te
+  join q_posts q on q.QuestionId = te.QuestionId
+  group by te.Tag
+),
+recent_users as (
+  select us.*
+  from user_stats us
+  where us.CreationDate > (select date_trunc('year', max(CreationDate)) - interval '3 years' from Users)
+),
+question_user_mix as (
+  select
+    q.QuestionId,
+    q.QOwnerId,
+    us.Reputation as QOwnerRep,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    us.TotalBadges,
+    nullif(us.DisplayName, '') as QOwnerName,
+    case
+      when coalesce(us.Location, '') ilike '%remote%' then 'Remote'
+      when coalesce(us.Location, '') = '' then 'Unknown'
+      else split_part(us.Location, ',', 1)
+    end as QOwnerRegion
+  from q_posts q
+  left join user_stats us on us.UserId = q.QOwnerId
+),
+posttype_names as (
+  select Id, Name from PostTypes
+),
+heavy_calc as (
+  select
+    q.QuestionId,
+    q.QScore,
+    q.QViews,
+    qa.UpvoteCount,
+    qa.DownvoteCount,
+    qa.FavoriteCount,
+    greatest(1, COALESCE(qa.UpvoteCount,0) + COALESCE(qa.DownvoteCount,0)) as VoteTotal,
+    case
+      when q.QViews is null or q.QViews = 0 then null
+      else (CAST(q.QScore AS numeric) / nullif(q.QViews,0)) * ln(greatest(2, COALESCE(qa.UpvoteCount,0) + COALESCE(qa.DownvoteCount,0))) end as ScorePerViewWeighted,
+    (coalesce(qa.UpvoteCount,0) - coalesce(qa.DownvoteCount,0)) / nullif(greatest(1, abs(coalesce(qa.DownvoteCount,0))), 0) as SentimentRatio
+  from q_posts q
+  left join q_activity qa on qa.QuestionId = q.QuestionId
+),
+ranked_questions as (
+  select
+    q.QuestionId,
+    q.Title,
+    q.QScore,
+    q.QViews,
+    q.AnswerCount,
+    q.AcceptedAnswerId,
+    qa.CommentCount,
+    qa.UpvoteCount,
+    qa.DownvoteCount,
+    qa.FavoriteCount,
+    di.DuplicateLinks,
+    ci.CloseEvents,
+    ci.ReopenEvents,
+    ci.LastClosedDate,
+    hv.ScorePerViewWeighted,
+    hv.SentimentRatio,
+    row_number() over (order by coalesce(hv.ScorePerViewWeighted, -1e9) desc, q.QScore desc, q.QViews desc) as rn_spvw,
+    dense_rank() over (order by coalesce(qa.FavoriteCount,0) desc, q.QViews desc) as dr_fav,
+    ntile(10) over (order by coalesce(q.QViews,0) desc) as view_decile
+  from q_posts q
+  left join q_activity qa on qa.QuestionId = q.QuestionId
+  left join dup_info di on di.QuestionId = q.QuestionId
+  left join close_info ci on ci.QuestionId = q.QuestionId
+  left join heavy_calc hv on hv.QuestionId = q.QuestionId
+),
+post_type_lkp as (
+  select 1 as PostTypeId, Name from posttype_names where Id = 1
+  union all
+  select 2 as PostTypeId, Name from posttype_names where Id = 2
+),
+answer_user as (
+  select
+    ar.QuestionId,
+    ar.AnswerId,
+    ar.AOwnerId,
+    us.DisplayName as AOwnerName,
+    us.Reputation as AOwnerRep,
+    ar.AScore,
+    ar.ACreated,
+    row_number() over (partition by ar.QuestionId order by ar.AScore desc, ar.ACreated asc) as rn_best
+  from answer_rank ar
+  left join user_stats us on us.UserId = ar.AOwnerId
+),
+per_tag_top as (
+  select
+    te.Tag,
+    q.QuestionId,
+    rq.rn_spvw,
+    row_number() over (partition by te.Tag order by rq.rn_spvw) as rn_tag
+  from tag_expand te
+  join ranked_questions rq on rq.QuestionId = te.QuestionId
+),
+accepted_alignment as (
+  select
+    q.QuestionId,
+    case when q.AcceptedAnswerId is not null and q.AcceptedAnswerId = avb.BestByScoreId then 1 else 0 end as AcceptedIsBestByScore,
+    case when q.AcceptedAnswerId is not null and q.AcceptedAnswerId = avb.FastestAnswerId then 1 else 0 end as AcceptedIsFastest
+  from q_posts q
+  left join accepted_vs_best avb on avb.QuestionId = q.QuestionId
+),
+question_health as (
+  select
+    rq.QuestionId,
+    case when rq.CloseEvents is null then 0 else rq.CloseEvents end as CloseEventsSafe,
+    case when rq.DuplicateLinks is null then 0 else rq.DuplicateLinks end as DuplicateLinksSafe,
+    case when rq.AnswerCount is null then 0 else rq.AnswerCount end as AnswersSafe,
+    case when rq.QScore is null then 0 else rq.QScore end as ScoreSafe,
+    case when rq.CommentCount is null then 0 else rq.CommentCount end as CommentsSafe
+  from ranked_questions rq
+),
+zero_activity_candidates as (
+  select q.QuestionId
+  from q_posts q
+  where coalesce(q.AnswerCount,0) = 0
+    and not exists (select 1 from Comments c where c.PostId = q.QuestionId)
+    and not exists (select 1 from Votes v where v.PostId = q.QuestionId and v.VoteTypeId in (2,3,5))
+),
+final_agg as (
+  select
+    rq.QuestionId,
+    rq.Title,
+    rq.QScore,
+    rq.QViews,
+    rq.AnswerCount,
+    rq.CommentCount,
+    rq.UpvoteCount,
+    rq.DownvoteCount,
+    rq.FavoriteCount,
+    rq.DuplicateLinks,
+    rq.CloseEvents,
+    rq.ReopenEvents,
+    rq.LastClosedDate,
+    rq.ScorePerViewWeighted,
+    rq.SentimentRatio,
+    qmix.QOwnerId,
+    qmix.QOwnerRep,
+    qmix.QOwnerName,
+    qmix.QOwnerRegion,
+    coalesce(aa.AcceptedIsBestByScore,0) as AcceptedIsBestByScore,
+    coalesce(aa.AcceptedIsFastest,0) as AcceptedIsFastest,
+    case when zac.QuestionId is not null then 1 else 0 end as IsZeroActivity,
+    string_agg(distinct te.Tag, ',' order by te.Tag) as TagsCSV,
+    sum(case when pt.PostTypeId = 1 then 1 else 0 end) as PostTypeQ,
+    max(au.AOwnerRep) filter (where au.rn_best = 1) as BestAnswererRep,
+    max(au.AScore) filter (where au.rn_best = 1) as BestAnswerScore
+  from ranked_questions rq
+  left join question_user_mix qmix on qmix.QuestionId = rq.QuestionId
+  left join accepted_alignment aa on aa.QuestionId = rq.QuestionId
+  left join zero_activity_candidates zac on zac.QuestionId = rq.QuestionId
+  left join tag_expand te on te.QuestionId = rq.QuestionId
+  left join post_type_lkp pt on pt.PostTypeId = 1
+  left join answer_user au on au.QuestionId = rq.QuestionId
+  group by
+    rq.QuestionId, rq.Title, rq.QScore, rq.QViews, rq.AnswerCount, rq.CommentCount,
+    rq.UpvoteCount, rq.DownvoteCount, rq.FavoriteCount, rq.DuplicateLinks, rq.CloseEvents,
+    rq.ReopenEvents, rq.LastClosedDate, rq.ScorePerViewWeighted, rq.SentimentRatio,
+    qmix.QOwnerId, qmix.QOwnerRep, qmix.QOwnerName, qmix.QOwnerRegion, aa.AcceptedIsBestByScore,
+    aa.AcceptedIsFastest, zac.QuestionId
+),
+tag_summaries as (
+  select
+    tq.Tag,
+    tq.QCount,
+    tq.AvgQScore,
+    tq.AcceptedCount,
+    count(*) filter (where pt.rn_tag <= 5) as Top5IncludedQuestions
+  from tag_quality tq
+  left join per_tag_top pt on pt.Tag = tq.Tag
+  group by tq.Tag, tq.QCount, tq.AvgQScore, tq.AcceptedCount
+),
+bench_union as (
+  select
+    CAST(fa.QuestionId AS bigint) as EntityId,
+    'Question' as EntityType,
+    fa.Title as Label,
+    coalesce(fa.ScorePerViewWeighted, -1e9) as MetricA,
+    coalesce(fa.SentimentRatio, 0) as MetricB,
+    fa.QViews as Volume,
+    fa.AnswerCount as Dim1,
+    fa.CommentCount as Dim2,
+    fa.FavoriteCount as Dim3,
+    fa.QOwnerRep as UserRep,
+    CAST(NULL AS varchar) as ExtraTag
+  from final_agg fa
+  union all
+  select
+    nextval('pg_temp.seq') as EntityId,
+    'Tag' as EntityType,
+    ts.Tag as Label,
+    coalesce(ts.AvgQScore, 0) as MetricA,
+    (CAST(ts.AcceptedCount AS numeric) / nullif(ts.QCount,0)) as MetricB,
+    ts.QCount as Volume,
+    ts.Top5IncludedQuestions as Dim1,
+    CAST(NULL AS int) as Dim2,
+    CAST(NULL AS int) as Dim3,
+    CAST(NULL AS int) as UserRep,
+    ts.Tag as ExtraTag
+  from tag_summaries ts
+),
+ranked_entities as (
+  select
+    b.EntityId,
+    b.EntityType,
+    b.Label,
+    b.MetricA,
+    b.MetricB,
+    b.Volume,
+    b.Dim1,
+    b.Dim2,
+    b.Dim3,
+    b.UserRep,
+    b.ExtraTag,
+    rank() over (partition by b.EntityType order by b.MetricA desc) as RankByA,
+    rank() over (partition by b.EntityType order by b.MetricB desc) as RankByB,
+    row_number() over (partition by b.EntityType order by b.Volume desc, b.MetricA desc) as RN_ByVolume
+  from bench_union b
+)
+select
+  re.EntityType,
+  re.Label,
+  re.MetricA,
+  re.MetricB,
+  re.Volume,
+  re.Dim1,
+  re.Dim2,
+  re.Dim3,
+  re.UserRep,
+  re.RankByA,
+  re.RankByB,
+  re.RN_ByVolume,
+  case
+    when re.EntityType = 'Question' and re.MetricA > (select avg(MetricA) from ranked_entities where EntityType = 'Question') then 'AboveAvg'
+    when re.EntityType = 'Question' then 'BelowAvg'
+    else null
+  end as PerfBucket,
+  coalesce(re.ExtraTag, split_part(re.Label, ' ', 1)) as PrimaryToken
+from ranked_entities re
+where
+  (
+    re.EntityType = 'Question'
+    and re.RN_ByVolume <= 100
+    and not exists (
+      select 1
+      from ranked_questions rq
+      where rq.QuestionId = CAST(re.EntityId AS int)
+        and rq.view_decile = 1
+        and coalesce(rq.DownvoteCount,0) > coalesce(rq.UpvoteCount,0)
+    )
+  )
+  or
+  (
+    re.EntityType = 'Tag'
+    and re.RankByA <= 50
+  )
+order by
+  re.EntityType asc,
+  coalesce(re.RankByA, 999999) asc,
+  re.RN_ByVolume asc,
+  re.Label asc;

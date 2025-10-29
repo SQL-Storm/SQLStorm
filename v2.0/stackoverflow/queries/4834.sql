@@ -1,0 +1,153 @@
+WITH RECURSIVE
+PostEditCounts AS (
+    SELECT
+        p.OwnerUserId,
+        COUNT(ph.Id) AS EditCount
+    FROM Posts p
+    JOIN PostHistory ph ON p.Id = ph.PostId
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6)
+    GROUP BY p.OwnerUserId
+),
+PostTags AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        TRIM(LOWER(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2))) AS raw_tags
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND p.Tags <> ''
+),
+SplitTags AS (
+    SELECT
+        PostId,
+        OwnerUserId,
+        CASE
+            WHEN POSITION('><' IN raw_tags) = 0 THEN raw_tags
+            ELSE SUBSTRING(raw_tags FROM 1 FOR CASE WHEN POSITION('><' IN raw_tags) = 0 THEN CHAR_LENGTH(raw_tags) ELSE POSITION('><' IN raw_tags)-1 END)
+        END AS tag,
+        CASE
+            WHEN POSITION('><' IN raw_tags) = 0 THEN NULL
+            ELSE SUBSTRING(raw_tags FROM POSITION('><' IN raw_tags) + 2)
+        END AS rest
+    FROM PostTags
+    UNION ALL
+    SELECT
+        PostId,
+        OwnerUserId,
+        CASE
+            WHEN POSITION('><' IN rest) = 0 THEN rest
+            ELSE SUBSTRING(rest FROM 1 FOR POSITION('><' IN rest)-1)
+        END AS tag,
+        CASE
+            WHEN POSITION('><' IN rest) = 0 THEN NULL
+            ELSE SUBSTRING(rest FROM POSITION('><' IN rest) + 2)
+        END AS rest
+    FROM SplitTags
+    WHERE rest IS NOT NULL AND rest <> ''
+),
+TagPopularity AS (
+    SELECT
+        t.TagName,
+        COUNT(DISTINCT st.PostId) AS PostCount,
+        SUM(p.AnswerCount) AS TotalAnswersForTag,
+        AVG(p.FavoriteCount) AS AverageFavoriteCount
+    FROM Tags t
+    JOIN SplitTags st ON t.TagName = st.tag
+    JOIN Posts p ON p.Id = st.PostId
+    GROUP BY t.TagName
+),
+TopTags AS (
+    SELECT
+        TagName,
+        PostCount,
+        ROW_NUMBER() OVER (ORDER BY PostCount DESC) AS TagRank
+    FROM TagPopularity
+    WHERE PostCount > 1000
+),
+UserPostSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        AVG(p.Score) AS AveragePostScore,
+        MAX(p.CreationDate) AS LatestPostDate,
+        u.CreationDate AS UserCreationDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+RankedEdits AS (
+    SELECT
+        pec.OwnerUserId,
+        pec.EditCount,
+        ROW_NUMBER() OVER (ORDER BY pec.EditCount DESC) AS EditRank
+    FROM PostEditCounts pec
+),
+UserActivity AS (
+    SELECT
+        u.Id,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT v.Id) AS VoteCount
+    FROM Users u
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId AND v.VoteTypeId IN (2, 3)
+    GROUP BY u.Id
+),
+UserTags AS (
+    SELECT DISTINCT
+        st.tag AS TagName,
+        st.OwnerUserId
+    FROM SplitTags st
+)
+SELECT
+    ups.DisplayName,
+    ups.Reputation,
+    ups.UserCreationDate,
+    ups.TotalPosts,
+    ups.QuestionCount,
+    ups.AnswerCount,
+    COALESCE(ups.AveragePostScore, 0.0) AS AveragePostScore,
+    ups.LatestPostDate,
+    COALESCE(re.EditCount, 0) AS TotalEdits,
+    re.EditRank,
+    ua.CommentCount,
+    ua.VoteCount,
+    CASE
+        WHEN ups.LatestPostDate > (ups.UserCreationDate + INTERVAL '1' YEAR) THEN 'Experienced'
+        WHEN ups.LatestPostDate > (ups.UserCreationDate + INTERVAL '3' MONTH) THEN 'Intermediate'
+        ELSE 'New'
+    END AS UserExperienceLevel,
+    STRING_AGG(tt.TagName, ', ') AS TopTags
+FROM UserPostSummary ups
+LEFT JOIN RankedEdits re ON ups.UserId = re.OwnerUserId
+LEFT JOIN UserActivity ua ON ups.UserId = ua.Id
+LEFT JOIN Posts p_latest ON ups.UserId = p_latest.OwnerUserId AND p_latest.Id = (
+    SELECT p2.Id
+    FROM Posts p2
+    WHERE p2.OwnerUserId = ups.UserId
+    ORDER BY p2.CreationDate DESC
+    LIMIT 1
+)
+LEFT JOIN UserTags user_tags ON ups.UserId = user_tags.OwnerUserId
+LEFT JOIN TopTags tt ON user_tags.TagName = tt.TagName
+GROUP BY
+    ups.DisplayName,
+    ups.Reputation,
+    ups.UserCreationDate,
+    ups.TotalPosts,
+    ups.QuestionCount,
+    ups.AnswerCount,
+    ups.AveragePostScore,
+    ups.LatestPostDate,
+    re.EditCount,
+    re.EditRank,
+    ua.CommentCount,
+    ua.VoteCount,
+    ups.UserId
+HAVING
+    ups.TotalPosts > 10 AND ups.Reputation > 500
+ORDER BY
+    ups.Reputation DESC, ups.LatestPostDate DESC
+LIMIT 100;

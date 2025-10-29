@@ -1,0 +1,125 @@
+WITH
+u_agg AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS gold_badges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS silver_badges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS bronze_badges,
+        SUM(CASE WHEN b.TagBased = TRUE THEN 1 ELSE 0 END) AS tag_based_badges
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+latest_post AS (
+    SELECT
+        p.OwnerUserId,
+        MAX(p.CreationDate) AS last_post_date,
+        MAX(p.Id) FILTER (WHERE p.CreationDate = MAX(p.CreationDate)) AS last_post_id
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+post_votes AS (
+    SELECT
+        v.PostId,
+        SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS up_votes,
+        SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS down_votes
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY v.PostId
+),
+user_rank AS (
+    SELECT
+        ua.*,
+        ROW_NUMBER() OVER (
+            ORDER BY ua.Reputation DESC,
+                     (ua.gold_badges*3 + ua.silver_badges*2 + ua.bronze_badges) DESC,
+                     COALESCE(lp.last_post_date, TIMESTAMP '1970-01-01') DESC
+        ) AS rnk
+    FROM u_agg ua
+    LEFT JOIN latest_post lp ON lp.OwnerUserId = ua.Id
+),
+tag_stats AS (
+    SELECT
+        t.TagName,
+        COUNT(*)               AS question_count,
+        SUM(p.ViewCount)       AS total_views,
+        ROW_NUMBER() OVER (ORDER BY COUNT(*) DESC) AS tag_rank
+    FROM Posts p
+    JOIN LATERAL (
+        SELECT unnest(string_to_array(trim(both '<>' FROM p.Tags), '><')) AS tag
+    ) tg ON true
+    JOIN Tags t ON t.TagName = tg.tag
+    WHERE p.PostTypeId = 1
+    GROUP BY t.TagName
+),
+duplicate_links AS (
+    SELECT
+        pl.PostId        AS dup_post_id,
+        pl.RelatedPostId AS target_post_id,
+        p.Title          AS dup_title,
+        pt.Title         AS target_title,
+        pl.CreationDate  AS dup_link_date
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId AND lt.Id = 3
+    JOIN Posts p  ON p.Id = pl.PostId
+    JOIN Posts pt ON pt.Id = pl.RelatedPostId
+),
+post_recent_activity AS (
+    SELECT
+        p.Id,
+        COALESCE(
+            (SELECT MAX(c.CreationDate) FROM Comments c WHERE c.PostId = p.Id),
+            (SELECT MAX(ph.CreationDate) FROM PostHistory ph WHERE ph.PostId = p.Id)
+        ) AS last_activity
+    FROM Posts p
+)
+SELECT
+    ur.rnk,
+    ur.DisplayName,
+    ur.Reputation,
+    ur.gold_badges,
+    ur.silver_badges,
+    ur.bronze_badges,
+    ur.tag_based_badges,
+    COALESCE(lp.last_post_date, TIMESTAMP '1970-01-01') AS last_post_date,
+    COALESCE(SUM(COALESCE(pv.up_votes,0)), 0)    AS total_up_votes,
+    COALESCE(SUM(COALESCE(pv.down_votes,0)), 0)  AS total_down_votes,
+    CASE
+        WHEN ur.rnk <= 10  THEN 'Top 10'
+        WHEN ur.rnk <= 100 THEN 'Top 100'
+        ELSE 'Other'
+    END                         AS rank_group,
+    STRING_AGG(DISTINCT ts.TagName, ', ') FILTER (WHERE ts.tag_rank <= 5) AS hot_tags
+FROM user_rank ur
+LEFT JOIN latest_post lp   ON lp.OwnerUserId = ur.Id
+LEFT JOIN Posts p          ON p.OwnerUserId = ur.Id
+LEFT JOIN post_votes pv   ON pv.PostId = p.Id
+LEFT JOIN tag_stats ts    ON ts.TagName = ANY (string_to_array(trim(both '<>' FROM p.Tags), '><'))
+WHERE ur.rnk <= 200
+GROUP BY
+    ur.rnk, ur.DisplayName, ur.Reputation,
+    ur.gold_badges, ur.silver_badges, ur.bronze_badges, ur.tag_based_badges,
+    lp.last_post_date
+UNION ALL
+SELECT
+    NULL                                   AS rnk,
+    'Duplicate Summary'                    AS DisplayName,
+    NULL                                   AS Reputation,
+    NULL                                   AS gold_badges,
+    NULL                                   AS silver_badges,
+    NULL                                   AS bronze_badges,
+    NULL                                   AS tag_based_badges,
+    NULL                                   AS last_post_date,
+    NULL                                   AS total_up_votes,
+    NULL                                   AS total_down_votes,
+    NULL                                   AS rank_group,
+    STRING_AGG(
+        CONCAT('Q', d.dup_post_id, ' -> Q', d.target_post_id, ': ', d.dup_title),
+        '; ' ORDER BY d.dup_link_date DESC
+    )                                      AS hot_tags
+FROM duplicate_links d
+WHERE d.dup_link_date > (CAST('2024-10-01' AS date) - INTERVAL '30 days')
+LIMIT 1;

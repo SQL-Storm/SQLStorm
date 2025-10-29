@@ -1,0 +1,194 @@
+-- {"query": "1289.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2788} 
+
+WITH UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.Views AS UserProfileViews,
+        u.UpVotes AS UserUpVotesGiven,
+        u.DownVotes AS UserDownVotesGiven,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsPosted,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersPosted,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesOnPostsGiven, -- Votes made by this user on other posts
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesOnPostsGiven, -- Votes made by this user on other posts
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        NULLIF(EXTRACT(YEAR FROM AGE(CURRENT_TIMESTAMP, u.CreationDate)), 0) AS AccountAgeYears,
+        CAST(u.Reputation AS numeric) / NULLIF(EXTRACT(YEAR FROM AGE(CURRENT_TIMESTAMP, u.CreationDate)), 0) AS ReputationPerYear,
+        MAX(u.LastAccessDate) AS LastAccessDate,
+        MIN(u.CreationDate) AS FirstActivityDate -- Redundant but good for complexity
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Views, u.UpVotes, u.DownVotes
+),
+PostActivityMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        COUNT(ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (4, 5, 6)) AS EditEvents, -- Title, Body, Tags edits
+        COUNT(ph.Id) FILTER (WHERE ph.PostHistoryTypeId = 10) AS CloseEvents,
+        COUNT(ph.Id) FILTER (WHERE ph.PostHistoryTypeId = 11) AS ReopenEvents,
+        COUNT(ph.Id) FILTER (WHERE ph.PostHistoryTypeId = 12) AS DeleteEvents,
+        COALESCE(p.LastEditDate, p.CreationDate) AS EffectiveLastEditDate,
+        COALESCE(p.LastActivityDate, p.CreationDate) AS EffectiveLastActivityDate,
+        NULLIF(p.Score, 0) / NULLIF(p.ViewCount, 0) AS ScorePerViewRatio,
+        NULLIF(p.AnswerCount, 0) / NULLIF(p.ViewCount, 0) AS AnswerPerViewRatio,
+        CASE
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Has Accepted Answer'
+            WHEN p.AnswerCount > 0 THEN 'Has Answers But No Accepted'
+            ELSE 'No Answers'
+        END AS AnswerStatus
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    GROUP BY
+        p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount,
+        p.AnswerCount, p.CommentCount, p.FavoriteCount, p.LastEditDate,
+        p.LastActivityDate, p.AcceptedAnswerId
+),
+PostTagSplit AS (
+    SELECT
+        p.Id AS PostId,
+        TRIM(UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><'))) AS TagName
+    FROM Posts p
+    WHERE p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2 AND p.PostTypeId = 1 -- Only questions have meaningful tags for this purpose
+),
+TagPerformance AS (
+    SELECT
+        pts.TagName,
+        COUNT(DISTINCT pts.PostId) AS TaggedPosts,
+        SUM(p.Score) AS TotalTagScore,
+        AVG(p.Score) AS AvgTagScore,
+        AVG(p.ViewCount) AS AvgTagViewCount,
+        RANK() OVER (ORDER BY SUM(p.Score) DESC) AS TagScoreRank
+    FROM PostTagSplit pts
+    JOIN Posts p ON pts.PostId = p.Id
+    GROUP BY pts.TagName
+),
+TopCommentUsers AS (
+    SELECT
+        c.UserId,
+        c.PostId,
+        c.Id AS CommentId,
+        c.Score AS CommentScore,
+        ROW_NUMBER() OVER (PARTITION BY c.PostId ORDER BY c.Score DESC, c.CreationDate DESC) AS rn
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+),
+PostsWithDuplicateInfo AS (
+    SELECT
+        p.Id AS PostId,
+        COUNT(pl.Id) FILTER (WHERE pl.LinkTypeId = 3) AS DuplicateCount,
+        COUNT(pl.Id) FILTER (WHERE pl.LinkTypeId = 1) AS LinkedCount,
+        ARRAY_AGG(DISTINCT pl.RelatedPostId) FILTER (WHERE pl.LinkTypeId = 3) AS DuplicatePostIds
+    FROM Posts p
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+    GROUP BY p.Id
+)
+SELECT
+    p.Id AS QuestionId,
+    p.Title,
+    pt.Name AS PostTypeName,
+    ue.DisplayName AS OwnerDisplayName,
+    ue.Reputation AS OwnerReputation,
+    pam.Score AS QuestionScore,
+    pam.ViewCount AS QuestionViewCount,
+    pam.AnswerCount AS QuestionAnswerCount,
+    pam.CommentCount AS QuestionCommentCount,
+    pam.FavoriteCount AS QuestionFavoriteCount,
+    (SELECT COUNT(DISTINCT co.Id) FROM Comments co WHERE co.PostId = p.Id AND co.Text ILIKE '%thank you%' AND co.UserId IS NOT NULL) AS ThankYouCommentsCount,
+    COALESCE(pam.ScorePerViewRatio, 0.0) AS ScorePerViewRatio,
+    COALESCE(pam.AnswerPerViewRatio, 0.0) AS AnswerPerViewRatio,
+    pam.AnswerStatus,
+    EXTRACT(EPOCH FROM (pam.EffectiveLastActivityDate - p.CreationDate)) / 3600.0 AS HoursSinceCreationToLastActivity,
+    CASE
+        WHEN p.Body ILIKE '%[javascript]%' OR p.Body ILIKE '%jquery%' THEN 'Frontend Related'
+        WHEN p.Body ILIKE '%[java]%' OR p.Body ILIKE '%[c#]%' OR p.Body ILIKE '%python%' THEN 'Backend Related'
+        WHEN p.Body ILIKE '%[sql]%' OR p.Body ILIKE '%database%' THEN 'Database Related'
+        ELSE 'General Programming'
+    END AS ContentCategory,
+    LOWER(SUBSTRING(p.Title FROM 1 FOR 1)) AS FirstCharOfTitle,
+    NULLIF(ue.QuestionsPosted, 0) AS OwnerQuestionsPosted,
+    NULLIF(ue.AnswersPosted, 0) AS OwnerAnswersPosted,
+    ue.TotalBadges AS OwnerTotalBadges,
+    ue.GoldBadges AS OwnerGoldBadges,
+    tp.AvgTagScore AS PrimaryTagAvgScore,
+    tp.TaggedPosts AS PrimaryTagTotalPosts,
+    RANK() OVER (PARTITION BY pt.Name ORDER BY pam.Score DESC, p.ViewCount DESC) AS RankWithinPostTypeByScore,
+    NTILE(5) OVER (ORDER BY pam.ViewCount DESC) AS ViewCountQuintile,
+    AVG(pam.Score) OVER (PARTITION BY ue.UserId ORDER BY p.CreationDate ROWS BETWEEN 5 PRECEDING AND CURRENT ROW) AS OwnerAvgRecentScore,
+    LEAD(pam.Score, 1, 0) OVER (PARTITION BY ue.UserId ORDER BY p.CreationDate) AS NextPostScoreByOwner,
+    LAG(pam.Score, 1, 0) OVER (PARTITION BY ue.UserId ORDER BY p.CreationDate) AS PreviousPostScoreByOwner,
+    (
+        SELECT AVG(p2.Score)
+        FROM Posts p2
+        WHERE p2.OwnerUserId = p.OwnerUserId
+          AND p2.PostTypeId = p.PostTypeId
+          AND p2.CreationDate < p.CreationDate
+    ) AS OwnerHistoricalAvgScoreBeforeThisPost,
+    (
+        SELECT COUNT(DISTINCT ph2.UserId)
+        FROM PostHistory ph2
+        WHERE ph2.PostId = p.Id AND ph2.PostHistoryTypeId IN (4, 5, 6)
+          AND ph2.UserId IS NOT NULL
+          AND ph2.UserId <> p.OwnerUserId
+    ) AS ExternalEditorCount,
+    CASE
+        WHEN pam.CloseEvents > 0 AND pam.ReopenEvents > 0 THEN 'Closed and Reopened'
+        WHEN pam.CloseEvents > 0 THEN 'Closed'
+        WHEN pam.DeleteEvents > 0 THEN 'Deleted'
+        ELSE 'Active'
+    END AS PostLifecycleStatus,
+    tcu.CommentScore AS TopCommentScore,
+    (
+        SELECT MAX(c2.Score)
+        FROM Comments c2
+        WHERE c2.PostId = p.Id
+          AND c2.UserId IS NULL
+          AND c2.Text LIKE '%community%'
+    ) AS MaxCommunityCommentScore,
+    (SELECT COUNT(DISTINCT b.Name) FROM Badges b WHERE b.UserId = p.OwnerUserId AND b.Class = 1) AS GoldBadgesForOwner,
+    pdi.DuplicateCount,
+    pdi.LinkedCount,
+    ARRAY_TO_STRING(pdi.DuplicatePostIds, ',') AS RelatedDuplicatePostIds,
+    NULLIF(ue.Reputation, 0) / NULLIF(ue.UserProfileViews, 0) AS RepViewRatio
+FROM Posts p
+INNER JOIN PostTypes pt ON p.PostTypeId = pt.Id
+LEFT JOIN UserEngagement ue ON p.OwnerUserId = ue.UserId
+LEFT JOIN PostActivityMetrics pam ON p.Id = pam.PostId
+LEFT JOIN (
+    SELECT pts.PostId, MIN(pts.TagName) AS PrimaryTag -- Pick one tag for simplicity if multiple
+    FROM PostTagSplit pts
+    GROUP BY pts.PostId
+) AS primary_tag_for_post ON p.Id = primary_tag_for_post.PostId
+LEFT JOIN TagPerformance tp ON primary_tag_for_post.PrimaryTag = tp.TagName
+LEFT JOIN TopCommentUsers tcu ON p.Id = tcu.PostId AND tcu.rn = 1
+LEFT JOIN PostsWithDuplicateInfo pdi ON p.Id = pdi.PostId
+WHERE p.PostTypeId = 1 -- Focus on Questions
+  AND p.CreationDate BETWEEN '2020-01-01' AND '2023-12-31'
+  AND (p.ViewCount > 500 OR p.Score > 5)
+  AND ue.Reputation IS NOT NULL
+  AND NOT EXISTS (
+      SELECT 1 FROM Posts pp WHERE pp.ParentId = p.Id AND pp.Body ILIKE '%closed%' AND pp.Score < 0
+  ) -- Exclude questions that have heavily downvoted answers mentioning "closed"
+  AND p.Id NOT IN (
+      SELECT PostId FROM PostHistory WHERE PostHistoryTypeId = 12 AND CreationDate > '2022-01-01'
+      UNION ALL
+      SELECT PostId FROM PostHistory WHERE PostHistoryTypeId = 10 AND Comment ILIKE '%off-topic%'
+  )
+ORDER BY
+    pam.Score DESC,
+    p.CreationDate DESC,
+    OwnerAvgRecentScore DESC
+LIMIT 5000;

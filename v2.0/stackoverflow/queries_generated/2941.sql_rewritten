@@ -1,0 +1,187 @@
+-- {"query": "2941.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1672} 
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        COALESCE(p.Id, 0) AS ExcerptPostId,
+        COALESCE(p2.Id, 0) AS WikiPostId,
+        1 AS Depth
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Id = t.ExcerptPostId
+    LEFT JOIN Posts p2 ON p2.Id = t.WikiPostId
+    WHERE t.IsRequired = 0
+
+    UNION ALL
+
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        COALESCE(p.Id, 0) AS ExcerptPostId,
+        COALESCE(p2.Id, 0) AS WikiPostId,
+        r.Depth + 1
+    FROM Tags t
+    JOIN RecursiveTagHierarchy r ON t.Id = r.Id + 1
+    LEFT JOIN Posts p ON p.Id = t.ExcerptPostId
+    LEFT JOIN Posts p2 ON p2.Id = t.WikiPostId
+    WHERE r.Depth < 3
+),
+UserPostSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        SUM(p.Score) AS TotalScore,
+        AVG(COALESCE(p.ViewCount, 0)) AS AvgViewCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        STRING_AGG(DISTINCT COALESCE(b.Name, '')) FILTER (WHERE b.Id IS NOT NULL) AS BadgeNames,
+        EXISTS(
+            SELECT 1 FROM Posts p2
+            WHERE p2.OwnerUserId = u.Id AND p2.AcceptedAnswerId IS NOT NULL
+        ) AS HasAcceptedAnswer
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+PostDetails AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.ParentId,
+        p.AcceptedAnswerId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        ph.MaxEditDate,
+        ph.EditCount,
+        ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY p.Score DESC, p.CreationDate ASC) AS RankByScore,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) AS PostsByUserCount
+    FROM Posts p
+    LEFT JOIN PostTypes pt ON pt.Id = p.PostTypeId
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    LEFT JOIN (
+        SELECT
+            PostId,
+            MAX(CreationDate) AS MaxEditDate,
+            COUNT(*) AS EditCount
+        FROM PostHistory
+        WHERE PostHistoryTypeId IN (4,5,6,7,8,9)
+        GROUP BY PostId
+    ) ph ON ph.PostId = p.Id
+),
+TopVotedAnswers AS (
+    SELECT DISTINCT ON (p.ParentId)
+        p.ParentId AS QuestionId,
+        p.Id AS AnswerId,
+        p.Score AS AnswerScore,
+        p.OwnerUserId AS AnswerOwnerId,
+        u.DisplayName AS AnswerOwnerName
+    FROM Posts p
+    INNER JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 2
+    ORDER BY p.ParentId, p.Score DESC, p.CreationDate ASC
+),
+DuplicationLinks AS (
+    SELECT
+        pl.PostId AS DuplicatePostId,
+        pl.RelatedPostId AS OriginalPostId,
+        p1.Title AS DuplicateTitle,
+        p2.Title AS OriginalTitle
+    FROM PostLinks pl
+    JOIN Posts p1 ON p1.Id = pl.PostId
+    JOIN Posts p2 ON p2.Id = pl.RelatedPostId
+    WHERE pl.LinkTypeId = 3
+),
+BadgesRanked AS (
+    SELECT
+        b.*,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC) AS BadgeRank
+    FROM Badges b
+),
+UserBadgeStats AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id
+),
+QuestionCloseInfo AS (
+    SELECT
+        ph.PostId,
+        COUNT(*) AS CloseVotesCount,
+        BOOL_OR(ph.PostHistoryTypeId = 10) AS HasCloseReason,
+        STRING_AGG(DISTINCT crt.Name, ', ') AS CloseReasons
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS smallint)
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.PostId
+)
+SELECT DISTINCT
+    p.Id AS PostId,
+    p.Title,
+    p.PostTypeName,
+    COALESCE(u.DisplayName, 'Community') AS Owner,
+    u.Reputation,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.EditCount,
+    p.MaxEditDate,
+    us.BadgeCount,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    qci.CloseVotesCount,
+    qci.HasCloseReason,
+    qci.CloseReasons,
+    t.TagName,
+    t.Depth AS TagHierarchyDepth,
+    dv.AnswerId AS TopAnswerId,
+    dv.AnswerScore AS TopAnswerScore,
+    dv.AnswerOwnerName AS TopAnswerOwner,
+    CASE 
+        WHEN p.AcceptedAnswerId IS NOT NULL THEN 'AcceptedAnswerPresent'
+        ELSE 'NoAcceptedAnswer' 
+    END AS AcceptedAnswerStatus,
+    CASE 
+        WHEN p.Score < 0 THEN CONCAT('NegativeScore: ', p.Score)
+        WHEN p.Score = 0 THEN 'ScoreZero'
+        ELSE CONCAT('PositiveScore: ', p.Score)
+    END AS ScoreClassification,
+    CASE 
+        WHEN u.LastAccessDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days' THEN 'ActiveUser'
+        ELSE 'InactiveUser'
+    END AS UserActivityStatus,
+    bs.Name AS LatestBadgeName,
+    bs.Date AS LatestBadgeDate
+FROM PostDetails p
+LEFT JOIN Users u ON u.Id = p.OwnerUserId
+LEFT JOIN UserPostSummary ups ON ups.UserId = p.OwnerUserId
+LEFT JOIN UserBadgeStats us ON us.UserId = p.OwnerUserId
+LEFT JOIN QuestionCloseInfo qci ON qci.PostId = p.Id AND p.PostTypeId = 1
+LEFT JOIN RecursiveTagHierarchy t ON POSITION(CONCAT('<', t.TagName, '>') IN COALESCE(p.Tags, '')) > 0
+LEFT JOIN TopVotedAnswers dv ON dv.QuestionId = p.Id
+LEFT JOIN BadgesRanked bs ON bs.UserId = p.OwnerUserId AND bs.BadgeRank = 1
+WHERE p.PostTypeId IN (1,2)
+AND (p.Score >= 0 OR p.ViewCount > 100)
+ORDER BY p.Score DESC, p.ViewCount DESC, p.CreationDate DESC
+LIMIT 100;

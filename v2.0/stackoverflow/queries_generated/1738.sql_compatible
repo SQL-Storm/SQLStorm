@@ -1,0 +1,224 @@
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        COALESCE(U.DisplayName, 'Anonymous') AS DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        EXTRACT(YEAR FROM U.CreationDate) AS UserCreationYear,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(DISTINCT P_Q.Id) AS TotalQuestionsPosted,
+        COUNT(DISTINCT P_A.Id) AS TotalAnswersPosted,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        COALESCE(AVG(P_Q.Score), 0) AS AvgQuestionScore,
+        COALESCE(AVG(P_A.Score), 0) AS AvgAnswerScore,
+        U.UpVotes AS UserUpVotesGiven,
+        U.DownVotes AS UserDownVotesGiven,
+        SUM(CASE WHEN PV.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesReceived,
+        SUM(CASE WHEN PV.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesReceived,
+        (U.UpVotes + U.DownVotes) * 1.0 / NULLIF(U.Views, 0) AS UserEngagementRatio
+    FROM Users U
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN Posts P_Q ON U.Id = P_Q.OwnerUserId AND P_Q.PostTypeId = 1
+    LEFT JOIN Posts P_A ON U.Id = P_A.OwnerUserId AND P_A.PostTypeId = 2
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Posts P_ALL ON U.Id = P_ALL.OwnerUserId
+    LEFT JOIN Votes PV ON P_ALL.Id = PV.PostId AND PV.VoteTypeId IN (2,3)
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.UpVotes, U.DownVotes, U.Views
+),
+PostEngagementDetails AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        COALESCE(P.Title, SUBSTRING(P.Body FROM 1 FOR 50) || '...') AS PostTitle,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.CreationDate AS PostCreationDate,
+        P.ClosedDate,
+        P.CommunityOwnedDate,
+        CASE
+            WHEN P.Tags IS NULL OR P.Tags = '' THEN ARRAY[]::VARCHAR[]
+            ELSE string_to_array(SUBSTRING(P.Tags FROM 2 FOR CHAR_LENGTH(P.Tags) - 2), '><')
+        END AS PostTagsArray,
+        P.Score * 1.0 / NULLIF(P.ViewCount, 0) AS ScorePerViewRatio,
+        P.CommentCount * 1.0 / NULLIF(P.AnswerCount, 0) AS CommentsPerAnswerRatio,
+        (
+            SELECT COUNT(DISTINCT C_sub.UserId)
+            FROM Comments C_sub
+            WHERE C_sub.PostId = P.Id
+              AND C_sub.CreationDate BETWEEN P.CreationDate AND P.CreationDate + INTERVAL '30 days'
+        ) AS DistinctCommentersFirstMonth,
+        RANK() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.CreationDate ASC) AS RankInPostType,
+        CASE
+            WHEN P.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN P.AcceptedAnswerId IS NOT NULL THEN 'Answered & Accepted'
+            WHEN P.AnswerCount > 0 THEN 'Answered'
+            ELSE 'Open'
+        END AS PostStatusCategory,
+        CASE
+            WHEN P.OwnerUserId IS NULL AND P.PostTypeId IN (1,2) THEN 'Community Owned or Deleted User'
+            ELSE 'User Owned'
+        END AS OwnerStatus,
+        EXISTS (SELECT 1 FROM Votes V_sub WHERE V_sub.PostId = P.Id AND V_sub.VoteTypeId = 8) AS HasBounty
+    FROM Posts P
+    WHERE P.PostTypeId IN (1, 2)
+),
+HistoricalPostChanges AS (
+    SELECT
+        PH.PostId,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.CreationDate END) AS LastEditDate,
+        COUNT(DISTINCT PH.Id) FILTER (WHERE PH.PostHistoryTypeId IN (4, 5, 6)) AS TotalEdits,
+        COUNT(DISTINCT PH.UserId) FILTER (WHERE PH.PostHistoryTypeId IN (4, 5, 6)) AS DistinctEditors,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN 'Closed' END) AS WasClosed,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 11 THEN 'Reopened' END) AS WasReopened,
+        AVG(EXTRACT(EPOCH FROM (PH.CreationDate - PH.PrevCreationDate))) FILTER (WHERE PH.PostHistoryTypeId IN (4, 5, 6)) AS AvgEditIntervalSeconds,
+        EXISTS (
+            SELECT 1
+            FROM PostHistory PH_sub
+            WHERE PH_sub.PostId = PH.PostId
+              AND PH_sub.PostHistoryTypeId IN (7, 8, 9)
+        ) AS HadRollback
+    FROM (
+        SELECT
+            PH_inner.*,
+            LAG(PH_inner.CreationDate) OVER (PARTITION BY PH_inner.PostId ORDER BY PH_inner.CreationDate) AS PrevCreationDate
+        FROM PostHistory PH_inner
+        WHERE PH_inner.PostHistoryTypeId IN (4, 5, 6, 10, 11, 7, 8, 9)
+    ) PH
+    GROUP BY PH.PostId
+)
+SELECT
+    'Question' AS PostCategory,
+    UAS.UserId,
+    UAS.DisplayName,
+    UAS.Reputation,
+    UAS.UserCreationYear,
+    UAS.GoldBadges,
+    UAS.TotalQuestionsPosted,
+    PED.PostId,
+    PED.PostTitle,
+    PED.PostScore,
+    PED.ViewCount,
+    PED.RankInPostType,
+    PED.ScorePerViewRatio,
+    PED.DistinctCommentersFirstMonth,
+    HPC.TotalEdits,
+    HPC.DistinctEditors,
+    HPC.LastEditDate,
+    HPC.WasClosed,
+    HPC.HadRollback,
+    PED.HasBounty,
+    COALESCE(
+        (SELECT STRING_AGG(tag_val, ', ')
+         FROM UNNEST(PED.PostTagsArray) AS tag_val
+         WHERE CHAR_LENGTH(tag_val) > 3
+         ORDER BY tag_val ASC
+         LIMIT 3),
+        'No significant tags'
+    ) AS TopPostTagsSummary,
+    CASE
+        WHEN PED.ScorePerViewRatio > 0.5 AND COALESCE(HPC.TotalEdits, 0) > 5 THEN 'High Engagement & Highly Refined'
+        WHEN PED.ScorePerViewRatio > 0.1 AND COALESCE(HPC.TotalEdits, 0) > 1 THEN 'Moderate Engagement & Edited'
+        ELSE 'Low Engagement or Minimal Edits'
+    END AS PostQualityCategory,
+    COALESCE(CAST(HPC.AvgEditIntervalSeconds AS VARCHAR), 'No multiple edits to calculate interval') AS AvgEditInterval,
+    EXISTS (
+        SELECT 1
+        FROM PostLinks PL_sub
+        WHERE PL_sub.PostId = PED.PostId
+          AND PL_sub.LinkTypeId = 3
+    ) AS IsDuplicateSource,
+    AVG(UAS.Reputation) OVER (PARTITION BY UAS.UserCreationYear) AS AvgReputationInUserCohort,
+    (SELECT COUNT(DISTINCT U_v.Id)
+     FROM Votes V_q
+     JOIN Users U_v ON V_q.UserId = U_v.Id
+     WHERE V_q.PostId = PED.PostId
+       AND V_q.VoteTypeId = 2
+       AND U_v.Reputation > UAS.Reputation
+       AND V_q.CreationDate > PED.PostCreationDate + INTERVAL '1 hour') AS HigherRepUpvotersPostCreationHour
+FROM UserActivitySummary UAS
+JOIN PostEngagementDetails PED ON UAS.UserId = PED.OwnerUserId
+LEFT JOIN HistoricalPostChanges HPC ON PED.PostId = HPC.PostId
+WHERE PED.PostTypeId = 1
+  AND UAS.Reputation > 500
+  AND PED.PostScore > 25
+  AND (PED.ViewCount > 1000 OR PED.FavoriteCount > 5)
+  AND (HPC.TotalEdits IS NULL OR HPC.TotalEdits >= 1)
+  AND NOT EXISTS (
+      SELECT 1 FROM PostHistory PH_filter
+      WHERE PH_filter.PostId = PED.PostId
+        AND PH_filter.PostHistoryTypeId = 12
+        AND PH_filter.CreationDate > PED.PostCreationDate - INTERVAL '1 year'
+  )
+UNION ALL
+SELECT
+    'Answer' AS PostCategory,
+    UAS.UserId,
+    UAS.DisplayName,
+    UAS.Reputation,
+    UAS.UserCreationYear,
+    UAS.GoldBadges,
+    UAS.TotalQuestionsPosted,
+    PED.PostId,
+    PED.PostTitle,
+    PED.PostScore,
+    PED.ViewCount,
+    PED.RankInPostType,
+    PED.ScorePerViewRatio,
+    PED.DistinctCommentersFirstMonth,
+    HPC.TotalEdits,
+    HPC.DistinctEditors,
+    HPC.LastEditDate,
+    HPC.WasClosed,
+    HPC.HadRollback,
+    PED.HasBounty,
+    COALESCE(
+        (SELECT STRING_AGG(tag_val, ', ')
+         FROM UNNEST(PED.PostTagsArray) AS tag_val
+         WHERE CHAR_LENGTH(tag_val) > 3
+         ORDER BY tag_val ASC
+         LIMIT 3),
+        'No specific tags for answer'
+    ) AS TopPostTagsSummary,
+    CASE
+        WHEN PED.PostScore > 100 AND COALESCE(HPC.TotalEdits, 0) > 3 THEN 'Highly Valued & Refined Answer'
+        WHEN PED.PostScore > 20 AND COALESCE(HPC.TotalEdits, 0) > 0 THEN 'Good Answer, Some Edits'
+        ELSE 'Basic Answer'
+    END AS PostQualityCategory,
+    COALESCE(CAST(HPC.AvgEditIntervalSeconds AS VARCHAR), 'No multiple edits to calculate interval') AS AvgEditInterval,
+    EXISTS (
+        SELECT 1
+        FROM Posts Q_parent
+        WHERE Q_parent.AcceptedAnswerId = PED.PostId
+    ) AS IsAcceptedAnswer,
+    AVG(UAS.Reputation) OVER (PARTITION BY UAS.UserCreationYear) AS AvgReputationInUserCohort,
+    (SELECT COUNT(DISTINCT U_v.Id)
+     FROM Votes V_a
+     JOIN Users U_v ON V_a.UserId = U_v.Id
+     WHERE V_a.PostId = PED.PostId
+       AND V_a.VoteTypeId = 2
+       AND U_v.Reputation < UAS.Reputation
+       AND V_a.CreationDate BETWEEN PED.PostCreationDate AND PED.PostCreationDate + INTERVAL '7 days') AS LowerRepUpvotersWeekOne
+FROM UserActivitySummary UAS
+JOIN PostEngagementDetails PED ON UAS.UserId = PED.OwnerUserId
+LEFT JOIN HistoricalPostChanges HPC ON PED.PostId = HPC.PostId
+WHERE PED.PostTypeId = 2
+  AND UAS.Reputation > 200
+  AND PED.PostScore > 10
+  AND NOT EXISTS (
+      SELECT 1 FROM PostHistory PH_filter
+      WHERE PH_filter.PostId = PED.PostId
+        AND PH_filter.PostHistoryTypeId = 12
+        AND PH_filter.CreationDate > PED.PostCreationDate - INTERVAL '6 months'
+  )
+ORDER BY
+    Reputation DESC,
+    PostScore DESC
+LIMIT 2000;

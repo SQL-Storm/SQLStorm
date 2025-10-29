@@ -1,0 +1,101 @@
+-- {"query": "3280.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1863} 
+
+WITH 
+UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id)                                      AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        MAX(p.CreationDate)                              AS LastPostDate,
+        AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL)  AS AvgScore,
+        COUNT(DISTINCT UNNEST(string_to_array(p.Tags, '><'))) AS DistinctTagUses
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+BadgeAgg AS (
+    SELECT 
+        b.UserId,
+        COUNT(*)                                           AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END)       AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END)       AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END)       AS BronzeBadges,
+        STRING_AGG(DISTINCT b.Name, ', ')                  AS BadgeNames
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+TopTagPerUser AS (
+    SELECT 
+        us.Id                                           AS UserId,
+        t.TagName,
+        t.cnt,
+        ROW_NUMBER() OVER (PARTITION BY us.Id ORDER BY t.cnt DESC) AS rn
+    FROM UserStats us
+    JOIN LATERAL (
+        SELECT 
+            trim(both '<>' FROM tag) AS TagName,
+            COUNT(*)                AS cnt
+        FROM Posts p
+        CROSS JOIN LATERAL regexp_split_to_table(p.Tags, '><') AS tag
+        WHERE p.OwnerUserId = us.Id
+          AND p.PostTypeId = 2                 -- only answers
+        GROUP BY trim(both '<>' FROM tag)
+    ) t ON true
+),
+
+LatestActivity AS (
+    SELECT 
+        u.Id,
+        COALESCE(
+            (SELECT MAX(v.CreationDate) FROM Votes v WHERE v.UserId = u.Id),
+            (SELECT MAX(c.CreationDate) FROM Comments c WHERE c.UserId = u.Id),
+            (SELECT MAX(p.LastEditDate) FROM Posts p WHERE p.OwnerUserId = u.Id),
+            u.LastAccessDate
+        ) AS LastActivity
+    FROM Users u
+),
+
+Combined AS (
+    SELECT 
+        us.Id,
+        us.DisplayName,
+        us.Reputation,
+        us.TotalPosts,
+        us.QuestionCount,
+        us.AnswerCount,
+        us.AvgScore,
+        ba.BadgeCount,
+        ba.GoldBadges,
+        ba.SilverBadges,
+        ba.BronzeBadges,
+        ba.BadgeNames,
+        la.LastActivity,
+        tt.TagName  AS TopTag,
+        tt.cnt      AS TopTagCount
+    FROM UserStats us
+    LEFT JOIN BadgeAgg      ba ON ba.UserId = us.Id
+    LEFT JOIN LatestActivity la ON la.Id = us.Id
+    LEFT JOIN TopTagPerUser tt ON tt.UserId = us.Id AND tt.rn = 1
+    WHERE ba.BadgeCount >= 5 OR ba.BadgeCount IS NULL
+)
+
+SELECT *
+FROM Combined
+WHERE (Reputation > 10000 AND BadgeCount >= 10)
+   OR (Reputation BETWEEN 5000 AND 10000 AND GoldBadges > 2)
+
+UNION ALL
+
+SELECT *
+FROM Combined
+WHERE BadgeCount IS NULL
+
+ORDER BY 
+    Reputation DESC NULLS LAST,
+    BadgeCount DESC NULLS LAST
+LIMIT 100;

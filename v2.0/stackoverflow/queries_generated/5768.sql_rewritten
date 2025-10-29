@@ -1,0 +1,112 @@
+-- {"query": "5768.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 865} 
+WITH
+ActiveUsers AS (
+  SELECT u.Id,
+         u.DisplayName,
+         u.Reputation,
+         u.CreationDate,
+         u.LastAccessDate,
+         u.Location,
+         u.AboutMe,
+         u.Views,
+         u.UpVotes,
+         u.DownVotes,
+         u.ProfileImageUrl,
+         u.EmailHash,
+         u.AccountId
+  FROM Users u
+  WHERE u.AccountId IS NOT NULL
+),
+TopTags AS (
+  SELECT t.TagName,
+         t.Count,
+         t.ExcerptPostId,
+         t.WikiPostId
+  FROM Tags t
+  WHERE t.IsModeratorOnly = 0
+),
+RecentPosts AS (
+  SELECT p.Id,
+         p.PostTypeId,
+         p.Title,
+         p.Tags,
+         p.OwnerUserId,
+         p.CreationDate,
+         p.Score,
+         p.ViewCount,
+         p.CommentCount,
+         p.AnswerCount,
+         p.LastActivityDate,
+         p.ParentId,
+         p.AcceptedAnswerId,
+         p.CloseReason
+  FROM Posts p
+  WHERE p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '180 days'
+),
+TaggedActivity AS (
+  SELECT rp.OwnerUserId,
+         rp.Id AS PostId,
+         rp.Title,
+         rp.CreationDate,
+         rp.LastActivityDate,
+         t.TagName,
+         ROW_NUMBER() OVER (PARTITION BY rp.OwnerUserId, t.TagName ORDER BY rp.LastActivityDate DESC) AS rn
+  FROM RecentPosts rp
+  JOIN LATERAL (SELECT unnest(string_to_array(rp.Tags, '> <')) AS TagName) t ON TRUE
+  WHERE rp.PostTypeId = 1
+),
+ComplexMetrics AS (
+  SELECT
+    au.Id AS UserId,
+    au.DisplayName,
+    au.Reputation,
+    au.CreationDate AS UserCreationDate,
+    COALESCE(SUM(v.BountyAmount), 0) AS TotalBountiesReceived,
+    COUNT(DISTINCT rp.PostId) AS RecentPostCount,
+    MAX(rp.LastActivityDate) AS LastActivity,
+    STRING_AGG(DISTINCT ta.TagName, ',') AS DistinctTags,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesGiven,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesGiven,
+    SUM(CASE WHEN v.VoteTypeId = 6 THEN 1 ELSE 0 END) AS CloseVotesCast,
+    SUM(CASE WHEN v.VoteTypeId = 8 THEN 1 ELSE 0 END) AS BountyStartsCreated
+  FROM ActiveUsers au
+  LEFT JOIN Posts p ON p.OwnerUserId = au.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  LEFT JOIN RecentPosts rp ON rp.OwnerUserId = au.Id
+  LEFT JOIN TaggedActivity ta ON ta.PostId = rp.Id
+  GROUP BY au.Id, au.DisplayName, au.Reputation, au.CreationDate
+),
+Windowed AS (
+  SELECT
+    cm.UserId,
+    cm.DisplayName,
+    cm.Reputation,
+    cm.UserCreationDate,
+    cm.TotalBountiesReceived,
+    cm.RecentPostCount,
+    cm.LastActivity,
+    cm.DistinctTags,
+    cm.UpvotesGiven,
+    cm.DownvotesGiven,
+    cm.CloseVotesCast,
+    cm.BountyStartsCreated,
+    DENSE_RANK() OVER (ORDER BY cm.Reputation DESC, cm.RecentPostCount DESC) AS Rnk
+  FROM ComplexMetrics cm
+)
+SELECT
+  w.UserId,
+  w.DisplayName,
+  w.Reputation,
+  w.UserCreationDate,
+  w.TotalBountiesReceived,
+  w.RecentPostCount,
+  w.LastActivity,
+  w.DistinctTags,
+  w.UpvotesGiven,
+  w.DownvotesGiven,
+  w.CloseVotesCast,
+  w.BountyStartsCreated,
+  w.Rnk
+FROM Windowed w
+WHERE w.Rnk <= 100
+ORDER BY w.Rnk, w.Reputation DESC, w.RecentPostCount DESC;

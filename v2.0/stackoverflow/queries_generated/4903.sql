@@ -1,0 +1,100 @@
+-- {"query": "4903.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1164} 
+
+WITH RankedPostEdits AS (
+    SELECT
+        ph.PostId,
+        ph.UserId,
+        ph.CreationDate,
+        ph.PostHistoryTypeId,
+        ROW_NUMBER() OVER(PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate DESC) as rn
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6) -- Edits to Title, Body, or Tags
+),
+UserPostActivity AS (
+    SELECT
+        p.OwnerUserId,
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount AS PostViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        pt.Name AS PostTypeName,
+        CASE
+            WHEN p.OwnerUserId IS NULL THEN 'Community'
+            ELSE COALESCE(u.DisplayName, 'Unknown User')
+        END AS OwnerDisplayName,
+        COALESCE(u.Reputation, 0) AS OwnerReputation,
+        CASE
+            WHEN p.OwnerUserId IS NULL THEN 0
+            ELSE TIMESTAMPDIFF(YEAR, u.CreationDate, NOW())
+        END AS UserAgeInYears,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id AND c.Score > 5) AS HighScoreCommentCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpVoteCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS DownVoteCount,
+        (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3) AS DuplicateLinkCount,
+        COALESCE(rp.rn, 0) AS RecentEditRankForUser
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN RankedPostEdits rp ON p.Id = rp.PostId AND p.OwnerUserId = rp.UserId AND rp.rn = 1
+    WHERE p.CreationDate >= DATE_SUB(NOW(), INTERVAL 365 DAY) -- Posts created in the last year
+),
+TopUsersByReputation AS (
+    SELECT
+        UserId,
+        DisplayName,
+        Reputation,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC) as rep_rank
+    FROM Users
+    WHERE CreationDate >= DATE_SUB(NOW(), INTERVAL 365 DAY)
+)
+SELECT
+    upa.PostId,
+    upa.PostTypeName,
+    upa.OwnerDisplayName,
+    upa.OwnerReputation,
+    upa.UserAgeInYears,
+    upa.PostCreationDate,
+    upa.PostScore,
+    upa.PostViewCount,
+    upa.AnswerCount,
+    upa.CommentCount,
+    upa.FavoriteCount,
+    upa.ClosedDate,
+    upa.HighScoreCommentCount,
+    upa.UpVoteCount,
+    upa.DownVoteCount,
+    upa.DuplicateLinkCount,
+    upa.RecentEditRankForUser,
+    tur.rep_rank AS OwnerReputationRank,
+    CASE
+        WHEN upa.PostScore > 100 THEN 'HighScore'
+        WHEN upa.AnswerCount > 10 THEN 'Popular'
+        WHEN upa.CommentCount > 20 THEN 'TalkedAbout'
+        ELSE 'Standard'
+    END AS PostCategory,
+    UPPER(SUBSTRING(upa.OwnerDisplayName, 1, 3)) AS DisplayNamePrefix,
+    CASE
+        WHEN upa.PostCreationDate < NOW() - INTERVAL 7 DAY THEN 'Old'
+        WHEN upa.PostCreationDate >= NOW() - INTERVAL 7 DAY THEN 'Recent'
+        ELSE 'UnknownAge'
+    END AS PostAgeGroup,
+    CASE
+        WHEN upa.ClosedDate IS NOT NULL AND upa.ClosedDate > NOW() - INTERVAL 30 DAY THEN 'RecentlyClosed'
+        WHEN upa.ClosedDate IS NOT NULL THEN 'PreviouslyClosed'
+        ELSE 'Open'
+    END AS ClosureStatus,
+    LENGTH(upa.PostTypeName) + LENGTH(upa.OwnerDisplayName) AS CombinedLengthMetric
+FROM UserPostActivity upa
+LEFT JOIN TopUsersByReputation tur ON upa.OwnerUserId = tur.UserId
+WHERE upa.OwnerReputation > 5000 -- Filter for users with significant reputation
+  AND upa.PostScore >= 0 -- Exclude posts with negative scores if desired
+  AND upa.UserAgeInYears > 0 -- Exclude users created today
+  AND upa.PostViewCount > (upa.OwnerReputation / 1000) -- Posts viewed proportionally to owner's reputation
+  AND upa.RecentEditRankForUser <= 3 -- Consider users who have recently edited their posts
+ORDER BY upa.PostScore DESC, upa.PostCreationDate DESC
+LIMIT 1000;

@@ -1,0 +1,265 @@
+WITH UserStatsAndInfluence AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.UpVotes,
+        U.DownVotes,
+        U.Views AS UserViews,
+        U.Location,
+        U.AboutMe,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(DISTINCT P_Q.Id) AS TotalQuestions,
+        COUNT(DISTINCT P_A.Id) AS TotalAnswers,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COALESCE(SUM(P_Q.Score), 0) AS TotalQuestionScore,
+        COALESCE(SUM(P_A.Score), 0) AS TotalAnswerScore,
+        COALESCE(AVG(P_Q.Score) FILTER (WHERE P_Q.Id IS NOT NULL), 0.0) AS AvgQuestionScore,
+        COALESCE(AVG(P_A.Score) FILTER (WHERE P_A.Id IS NOT NULL), 0.0) AS AvgAnswerScore,
+        SUM(CASE WHEN P_Q.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS QuestionsWithAcceptedAnswer,
+        NTILE(10) OVER (ORDER BY U.Reputation DESC) AS ReputationDecile,
+        LAG(U.LastAccessDate, 1) OVER (PARTITION BY U.Location ORDER BY U.LastAccessDate) AS PreviousAccessDateInLocation
+    FROM
+        Users U
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN Posts P_Q ON U.Id = P_Q.OwnerUserId AND P_Q.PostTypeId = 1
+    LEFT JOIN Posts P_A ON U.Id = P_A.OwnerUserId AND P_A.PostTypeId = 2
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.UpVotes, U.DownVotes, U.Views, U.Location, U.AboutMe
+),
+PostQualityAndActivity AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.Title,
+        P.CreationDate AS PostCreationDate,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.OwnerUserId,
+        P.LastEditorUserId,
+        P.LastEditDate,
+        P.LastActivityDate,
+        P.ClosedDate,
+        P.Tags,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - P.LastEditDate)) / (3600 * 24) AS DaysSinceLastEdit,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - P.LastActivityDate)) / (3600 * 24) AS DaysSinceLastActivity,
+        COUNT(DISTINCT PH.Id) AS TotalHistoryEntries,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.Id END) AS EditHistoryCount,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.Id END) AS CloseHistoryCount,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId = 11 THEN PH.Id END) AS ReopenHistoryCount,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (35, 36) THEN PH.Id END) AS MigrationHistoryCount,
+        DENSE_RANK() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.ViewCount DESC) AS PostRankByScoreViews,
+        CASE
+            WHEN P.PostTypeId = 1 AND P.AcceptedAnswerId IS NULL AND P.AnswerCount = 0 AND P.ViewCount > 500 AND P.CreationDate < (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year') THEN TRUE
+            ELSE FALSE
+        END AS IsUnansweredStaleQuestion,
+        EXISTS (SELECT 1 FROM PostLinks PL WHERE PL.PostId = P.Id AND PL.LinkTypeId = 3) AS IsDuplicateSource,
+        EXISTS (SELECT 1 FROM PostLinks PL WHERE PL.RelatedPostId = P.Id AND PL.LinkTypeId = 3) AS IsDuplicateTarget,
+        RANK() OVER (PARTITION BY P.PostTypeId ORDER BY P.FavoriteCount DESC NULLS LAST) AS FavoriteRank
+    FROM
+        Posts P
+    JOIN PostTypes PT ON P.PostTypeId = PT.Id
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    GROUP BY
+        P.Id, P.PostTypeId, PT.Name, P.Title, P.CreationDate, P.Score, P.ViewCount, P.AnswerCount, P.CommentCount,
+        P.FavoriteCount, P.OwnerUserId, P.LastEditorUserId, P.LastEditDate, P.LastActivityDate, P.ClosedDate, P.Tags
+),
+TagEngagementAndPerformance AS (
+    SELECT
+        T.TagName,
+        COUNT(DISTINCT P.Id) AS TaggedPostsCount,
+        SUM(P.Score) AS TotalScoreForTag,
+        AVG(P.Score) AS AvgScoreForTag,
+        SUM(P.ViewCount) AS TotalViewsForTag,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TaggedQuestionsCount,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TaggedAnswersCount,
+        COUNT(DISTINCT CASE WHEN P.ClosedDate IS NOT NULL AND P.PostTypeId = 1 THEN P.Id END) AS ClosedQuestionsWithTag,
+        (COUNT(DISTINCT CASE WHEN P.ClosedDate IS NOT NULL AND P.PostTypeId = 1 THEN P.Id END) * 100.0) / NULLIF(COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END), 0) AS ClosedQuestionRate,
+        LAG(COUNT(DISTINCT P.Id), 1, 0) OVER (ORDER BY COUNT(DISTINCT P.Id) DESC) AS PreviousTagCountByUsage,
+        LEAD(AVG(P.Score), 1, 0.0) OVER (ORDER BY AVG(P.Score) DESC) AS NextTagAvgScore
+    FROM
+        Posts P,
+        UNNEST(string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><')) AS T(TagName)
+    WHERE
+        P.Tags IS NOT NULL AND LENGTH(TRIM(P.Tags)) > 2
+        AND P.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '3 years')
+    GROUP BY
+        T.TagName
+    HAVING
+        COUNT(DISTINCT P.Id) > 100
+),
+AdvancedPostHistoryAnalysis AS (
+    SELECT
+        PH.PostId,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.CreationDate ELSE NULL END) AS LastClosedDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 11 THEN PH.CreationDate ELSE NULL END) AS LastReopenedDate,
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 END) AS CloseVoteCount,
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 END) AS ReopenVoteCount,
+        COUNT(DISTINCT PH.UserId) AS DistinctEditorsInHistory,
+        (SELECT C.Text FROM Comments C WHERE C.PostId = PH.PostId ORDER BY C.CreationDate DESC LIMIT 1) AS LatestCommentText,
+        STRING_AGG(DISTINCT CR.Name, '; ' ORDER BY CR.Name) FILTER (WHERE PH.PostHistoryTypeId = 10 AND PH.Comment IS NOT NULL) AS AllCloseReasons,
+        STRING_AGG(DISTINCT U.DisplayName, ', ' ORDER BY U.DisplayName) FILTER (WHERE PH.PostHistoryTypeId = 10 AND PH.UserId IS NOT NULL) AS UsersWhoClosedPost
+    FROM
+        PostHistory PH
+    LEFT JOIN CloseReasonTypes CR ON PH.PostHistoryTypeId = 10 AND PH.Comment IS NOT NULL AND CR.Id = CAST(PH.Comment AS SMALLINT)
+    LEFT JOIN Users U ON PH.UserId = U.Id
+    GROUP BY
+        PH.PostId
+),
+ComplexUserReputationBreakdown AS (
+    SELECT
+        USI.UserId,
+        USI.DisplayName,
+        USI.Reputation,
+        USI.Location,
+        USI.UserCreationDate,
+        USI.LastAccessDate,
+        USI.TotalBadges,
+        USI.GoldBadges,
+        USI.SilverBadges,
+        USI.BronzeBadges,
+        USI.TotalQuestions,
+        USI.TotalAnswers,
+        USI.TotalComments,
+        USI.TotalQuestionScore,
+        USI.TotalAnswerScore,
+        USI.AvgQuestionScore,
+        USI.AvgAnswerScore,
+        USI.ReputationDecile,
+        RANK() OVER (PARTITION BY COALESCE(USI.Location, 'Unknown') ORDER BY USI.Reputation DESC) AS RankInLocation,
+        (USI.TotalQuestionScore * 1.0) / NULLIF((USI.TotalQuestionScore + USI.TotalAnswerScore), 0) AS QuestionScoreRatio,
+        USI.Reputation / NULLIF(EXTRACT(EPOCH FROM (USI.LastAccessDate - USI.UserCreationDate)) / (3600 * 24), 0) AS AvgReputationPerDayActive,
+        (USI.TotalAnswers * 100.0) / NULLIF((USI.TotalQuestions + USI.TotalAnswers), 0) AS AnswerContributionPercentage,
+        (USI.AboutMe IS NOT NULL AND USI.AboutMe <> '' AND USI.LastAccessDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '90 days')) AS HasActiveProfileDescription,
+        COALESCE(UPPER(SUBSTRING(USI.Location, 1, 3)), 'NON') AS LocationPrefix
+    FROM
+        UserStatsAndInfluence USI
+)
+SELECT
+    'HighReputationUsers' AS AnalysisCategory,
+    CRBD.DisplayName AS EntityName,
+    COALESCE(CRBD.Location, 'Unspecified') AS EntityLocation,
+    CRBD.Reputation,
+    CRBD.RankInLocation,
+    NULL AS PostTitle,
+    NULL AS TagName,
+    CRBD.TotalQuestions,
+    CRBD.TotalAnswers,
+    CRBD.TotalBadges,
+    CRBD.AvgReputationPerDayActive,
+    CRBD.AnswerContributionPercentage,
+    NULL AS PostScore,
+    NULL AS PostViewCount,
+    NULL AS DaysSinceLastActivity,
+    CAST(NULL AS DOUBLE PRECISION) AS ClosedQuestionRate,
+    NULL AS LatestCommentExcerpt,
+    NULL AS AllCloseReasons,
+    CRBD.UserCreationDate,
+    CRBD.LastAccessDate,
+    NULL AS IsDuplicateSource,
+    NULL AS IsUnansweredStaleQuestion,
+    CRBD.HasActiveProfileDescription,
+    CRBD.LocationPrefix,
+    /* include TaggedPostsCount for ORDER BY reference */
+    NULL AS TaggedPostsCount
+FROM
+    ComplexUserReputationBreakdown CRBD
+WHERE
+    CRBD.ReputationDecile = 1
+    AND (CRBD.TotalQuestions + CRBD.TotalAnswers) > 100
+    AND CRBD.GoldBadges >= 3
+    AND CRBD.AvgReputationPerDayActive > 10
+    AND CRBD.Location IS NOT NULL
+UNION ALL
+SELECT
+    'PotentiallyProblematicQuestions' AS AnalysisCategory,
+    COALESCE(USI.DisplayName, 'Community') AS EntityName,
+    COALESCE(USI.Location, 'N/A') AS EntityLocation,
+    COALESCE(USI.Reputation, 0) AS Reputation,
+    COALESCE(CRBD.RankInLocation, 0) AS RankInLocation,
+    PQA.Title AS PostTitle,
+    NULL AS TagName,
+    COALESCE(USI.TotalQuestions, 0) AS TotalQuestions,
+    COALESCE(USI.TotalAnswers, 0) AS TotalAnswers,
+    COALESCE(USI.TotalBadges, 0) AS TotalBadges,
+    COALESCE(CRBD.AvgReputationPerDayActive, 0.0) AS AvgReputationPerDayActive,
+    COALESCE(CRBD.AnswerContributionPercentage, 0.0) AS AnswerContributionPercentage,
+    PQA.Score AS PostScore,
+    PQA.ViewCount AS PostViewCount,
+    PQA.DaysSinceLastActivity,
+    CAST(NULL AS DOUBLE PRECISION) AS ClosedQuestionRate,
+    SUBSTRING(APHA.LatestCommentText, 1, 100) AS LatestCommentExcerpt,
+    APHA.AllCloseReasons,
+    PQA.PostCreationDate,
+    PQA.LastActivityDate,
+    PQA.IsDuplicateSource,
+    PQA.IsUnansweredStaleQuestion,
+    COALESCE(CRBD.HasActiveProfileDescription, FALSE) AS HasActiveProfileDescription,
+    COALESCE(CRBD.LocationPrefix, 'N/A') AS LocationPrefix,
+    /* include TaggedPostsCount for ORDER BY reference */
+    NULL AS TaggedPostsCount
+FROM
+    PostQualityAndActivity PQA
+LEFT JOIN UserStatsAndInfluence USI ON PQA.OwnerUserId = USI.UserId
+LEFT JOIN ComplexUserReputationBreakdown CRBD ON PQA.OwnerUserId = CRBD.UserId
+LEFT JOIN AdvancedPostHistoryAnalysis APHA ON PQA.PostId = APHA.PostId
+WHERE
+    PQA.PostTypeId = 1
+    AND PQA.PostCreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '5 years')
+    AND (
+        PQA.IsUnansweredStaleQuestion = TRUE
+        OR PQA.EditHistoryCount > 5
+        OR APHA.ReopenVoteCount > 0
+        OR PQA.IsDuplicateSource = TRUE
+        OR (PQA.Score < 5 AND PQA.ViewCount > 1000)
+        OR APHA.UsersWhoClosedPost IS NOT NULL
+    )
+UNION ALL
+SELECT
+    'TrendingTagsWithHighCloseRate' AS AnalysisCategory,
+    NULL AS EntityName,
+    NULL AS EntityLocation,
+    CAST(NULL AS BIGINT) AS Reputation,
+    CAST(NULL AS BIGINT) AS RankInLocation,
+    NULL AS PostTitle,
+    TEP.TagName,
+    CAST(NULL AS BIGINT) AS TotalQuestions,
+    CAST(NULL AS BIGINT) AS TotalAnswers,
+    CAST(NULL AS BIGINT) AS TotalBadges,
+    CAST(NULL AS DOUBLE PRECISION) AS AvgReputationPerDayActive,
+    CAST(NULL AS DOUBLE PRECISION) AS AnswerContributionPercentage,
+    CAST(NULL AS INTEGER) AS PostScore,
+    CAST(NULL AS INTEGER) AS PostViewCount,
+    CAST(NULL AS DOUBLE PRECISION) AS DaysSinceLastActivity,
+    TEP.ClosedQuestionRate,
+    NULL AS LatestCommentExcerpt,
+    CAST(TEP.NextTagAvgScore AS TEXT) AS AllCloseReasons,
+    CAST(NULL AS TIMESTAMP) AS UserCreationDate,
+    CAST(NULL AS TIMESTAMP) AS LastAccessDate,
+    CAST(NULL AS BOOLEAN) AS IsDuplicateSource,
+    CAST(NULL AS BOOLEAN) AS IsUnansweredStaleQuestion,
+    FALSE AS HasActiveProfileDescription,
+    'N/A' AS LocationPrefix,
+    TEP.TaggedPostsCount
+FROM
+    TagEngagementAndPerformance TEP
+WHERE
+    TEP.ClosedQuestionRate > 20
+    AND TEP.TaggedQuestionsCount > 500
+    AND TEP.AvgScoreForTag < 5
+    AND TEP.PreviousTagCountByUsage > 0
+ORDER BY
+    AnalysisCategory,
+    Reputation DESC NULLS LAST,
+    PostScore DESC NULLS LAST,
+    TaggedPostsCount DESC NULLS LAST;

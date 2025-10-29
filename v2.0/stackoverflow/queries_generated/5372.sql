@@ -1,0 +1,94 @@
+-- {"query": "5372.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 829} 
+WITH recent_top_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    u.Reputation,
+    u.DisplayName AS OwnerDisplayName,
+    ARRAY_AGG(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) FILTER (WHERE v.VoteTypeId = 2) AS UpvotesInPeriod,
+    COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS UpvoteCountLast30Days
+  FROM Posts p
+  JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id
+        AND v.CreationDate >= NOW() - INTERVAL '30 days'
+  WHERE p.PostTypeId = 1 -- questions
+    AND p.ClosedDate IS NULL
+  GROUP BY p.Id, p.Title, p.Tags, p.CreationDate, p.Score, p.ViewCount, p.OwnerUserId, u.Reputation, u.DisplayName
+),
+tag_brightness AS (
+  SELECT
+    t.TagName,
+    t.Count AS TagCount,
+    t.WikiPostId
+  FROM Tags t
+  WHERE t.IsModeratorOnly = 0
+),
+cross_link AS (
+  SELECT
+    rl.RelatedPostId,
+    p.Id AS PostId,
+    p.Title AS PostTitle,
+    pl.LinkTypeId,
+    p.OwnerUserId,
+    p.CreationDate
+  FROM PostLinks pl
+  JOIN Posts p ON pl.PostId = p.Id
+  JOIN PostLinks rl ON rl.Id = pl.Id -- self-reference placeholder to ensure multiple relations
+  WHERE pl.LinkTypeId IN (1, 3) -- Linked or Duplicate
+),
+complex_calc AS (
+  SELECT
+    rp.PostId,
+    rp.PostTitle,
+    rp.OwnerUserId,
+    rp.CreationDate,
+    rp.ViewCount,
+    rp.Score,
+    u.Reputation,
+    (EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - rp.CreationDate)) / 3600) AS hours_alive,
+    CASE
+      WHEN rp.ViewCount > 0 THEN rp.Score::float / rp.ViewCount
+      ELSE NULL
+    END AS score_per_view,
+    CASE
+      WHEN u.Reputation > 1000 THEN 'veteran'
+      WHEN u.Reputation > 100 THEN 'trusted'
+      ELSE 'newbie'
+    END AS author_tier
+  FROM recent_top_questions rp
+  JOIN Users u ON rp.OwnerUserId = u.Id
+),
+final_top AS (
+  SELECT
+    c.*,
+    ARRAY_AGG(DISTINCT t.TagName) AS TagList,
+    (SELECT COUNT(*) FROM Comments cm WHERE cm.PostId = c.PostId) AS CommentCount
+  FROM complex_calc c
+  LEFT JOIN Posts p ON p.Id = c.PostId
+  LEFT JOIN Tags t ON t.Id = ANY(string_to_array(REPLACE(REPLACE(p.Tags, '<', ''), '>', ''), ','))
+  GROUP BY c.PostId, c.PostTitle, c.OwnerUserId, c.CreationDate, c.ViewCount, c.Score, c.Reputation, c.hours_alive, c.score_per_view, c.author_tier
+)
+SELECT
+  ft.PostId,
+  ft.PostTitle AS title,
+  ft.TagList,
+  ft.CreationDate,
+  ft.ViewCount,
+  ft.Score,
+  ft.Reputation AS owner_reputation,
+  ft.OwnerUserId,
+  ft.AuthorTier AS owner_tier,
+  json_build_object(
+    'hours_alive', ft.hours_alive,
+    'score_per_view', ft.score_per_view
+  ) AS metrics,
+  ft.CommentCount,
+  ft.TagList && ARRAY['performance','benchmark'] AS has_benchmark_tags
+FROM final_top ft
+ORDER BY ft.hours_alive ASCNULLS LAST, ft.Score DESC
+LIMIT 100;

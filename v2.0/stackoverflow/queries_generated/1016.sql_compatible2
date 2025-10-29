@@ -1,0 +1,178 @@
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS UserUpVotesGiven,
+        U.DownVotes AS UserDownVotesGiven,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT PA.Id) AS TotalAnswersOwned,
+        COUNT(DISTINCT PQ.Id) AS TotalQuestionsOwned,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        SUM(P.Score) AS TotalPostScoreOwned,
+        SUM(COALESCE(C.Score, 0)) AS TotalCommentScoreMade,
+        MAX(P.LastActivityDate) AS LatestPostActivityDate,
+        MAX(C.CreationDate) AS LatestCommentActivityDate,
+        (SELECT COUNT(*) FROM Badges B WHERE B.UserId = U.Id AND B.Class = 1) AS GoldBadges,
+        (SELECT COUNT(*) FROM Badges B WHERE B.UserId = U.Id AND B.Class = 2) AS SilverBadges,
+        (SELECT COUNT(*) FROM Badges B WHERE B.UserId = U.Id AND B.Class = 3) AS BronzeBadges
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Posts PA ON U.Id = PA.OwnerUserId AND PA.PostTypeId = 2
+    LEFT JOIN Posts PQ ON U.Id = PQ.OwnerUserId AND PQ.PostTypeId = 1
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    WHERE U.Reputation > 1000
+      AND U.LastAccessDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '3 year'
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.Views, U.UpVotes, U.DownVotes
+),
+RecentPostEngagement AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.FavoriteCount,
+        P.LastActivityDate,
+        EXTRACT(YEAR FROM P.CreationDate) AS CreationYear,
+        EXTRACT(MONTH FROM P.CreationDate) AS CreationMonth,
+        RANK() OVER (PARTITION BY EXTRACT(YEAR FROM P.CreationDate), EXTRACT(MONTH FROM P.CreationDate) ORDER BY P.Score DESC, P.ViewCount DESC) AS RankInMonthByScore,
+        AVG(P.Score) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate RANGE BETWEEN INTERVAL '60 days' PRECEDING AND CURRENT ROW) AS AvgScoreLast60DaysByUser,
+        CASE
+            WHEN P.Tags IS NULL THEN 'Untagged'
+            WHEN P.Tags LIKE '%<sql>%' OR P.Tags LIKE '%<postgresql>%' OR P.Tags LIKE '%<mysql>%' THEN 'SQL_Database_Related'
+            WHEN P.Tags LIKE '%<javascript>%' OR P.Tags LIKE '%<node.js>%' OR P.Tags LIKE '%<reactjs>%' THEN 'JavaScript_Frontend_Related'
+            WHEN P.Tags LIKE '%<python>%' OR P.Tags LIKE '%<django>%' OR P.Tags LIKE '%<flask>%' THEN 'Python_Related'
+            ELSE 'Other_Technology'
+        END AS TechnologyCategory,
+        COALESCE(P.AcceptedAnswerId, -1) AS AcceptedAnswerPostId_IfQuestion
+    FROM Posts P
+    WHERE P.PostTypeId IN (1, 2)
+      AND P.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 year'
+      AND P.Score > 0
+      AND P.ViewCount > 10
+),
+PostHistoricalModifications AS (
+    SELECT
+        PH.PostId,
+        COUNT(DISTINCT PH.UserId) AS UniqueEditorCount,
+        COUNT(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9) THEN 1 ELSE NULL END) AS TotalEditRollbackActions,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS BodyTitleTagEditsCount,
+        FIRST_VALUE(PH.UserId) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate ASC) AS InitialEditorUserId,
+        FIRST_VALUE(PH.CreationDate) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate ASC) AS FirstModificationDate,
+        MAX(PH.CreationDate) AS LastModificationDate
+    FROM PostHistory PH
+    WHERE PH.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 19, 20)
+    GROUP BY PH.PostId
+    HAVING COUNT(DISTINCT PH.UserId) > 1 OR COUNT(PH.Id) > 3
+),
+DuplicatePostIdentification AS (
+    SELECT
+        PL.PostId AS DuplicatePostId,
+        PL.RelatedPostId AS OriginalQuestionId,
+        PH.UserId AS ClosedByModeratorOrUser,
+        CAST(PH.Comment AS SMALLINT) AS CloseReasonTypeId,
+        CRT.Name AS CloseReasonTypeName,
+        PL.CreationDate AS LinkCreationDate
+    FROM PostLinks PL
+    JOIN PostHistory PH ON PL.PostId = PH.PostId AND PH.PostHistoryTypeId = 10
+    LEFT JOIN CloseReasonTypes CRT ON CAST(PH.Comment AS SMALLINT) = CRT.Id
+    WHERE PL.LinkTypeId = 3
+      AND PH.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '3 year'
+),
+CombinedPostMetrics AS (
+    SELECT
+        RPE.PostId,
+        RPE.PostTypeId,
+        RPE.OwnerUserId,
+        RPE.PostCreationDate,
+        RPE.PostScore,
+        RPE.ViewCount,
+        RPE.AnswerCount,
+        RPE.FavoriteCount,
+        RPE.LastActivityDate,
+        RPE.TechnologyCategory,
+        RPE.RankInMonthByScore,
+        RPE.AvgScoreLast60DaysByUser,
+        COALESCE(PHM.UniqueEditorCount, 0) AS PostUniqueEditorCount,
+        COALESCE(PHM.BodyTitleTagEditsCount, 0) AS PostSignificantEditsCount,
+        PHM.InitialEditorUserId AS PostInitialEditorId,
+        DPI.OriginalQuestionId AS IsDuplicateOfQuestionId,
+        DPI.ClosedByModeratorOrUser AS DuplicateClosedByUserId,
+        DPI.CloseReasonTypeName AS DuplicateCloseReason
+    FROM RecentPostEngagement RPE
+    LEFT JOIN PostHistoricalModifications PHM ON RPE.PostId = PHM.PostId
+    LEFT JOIN DuplicatePostIdentification DPI ON RPE.PostId = DPI.DuplicatePostId
+)
+SELECT
+    UAS.UserId,
+    UAS.DisplayName,
+    UAS.Reputation,
+    UAS.UserCreationDate,
+    UAS.UserProfileViews,
+    UAS.GoldBadges,
+    UAS.SilverBadges,
+    UAS.BronzeBadges,
+    UAS.TotalPostsOwned,
+    UAS.TotalQuestionsOwned,
+    UAS.TotalAnswersOwned,
+    SUM(CPM.PostScore) AS TotalRecentPostScore,
+    AVG(CPM.ViewCount) AS AverageRecentPostViewCount,
+    COUNT(DISTINCT CPM.PostId) AS CountRecentActivePosts,
+    COUNT(DISTINCT CASE WHEN CPM.TechnologyCategory = 'SQL_Database_Related' THEN CPM.PostId ELSE NULL END) AS RecentSQLPostsCount,
+    COUNT(DISTINCT CASE WHEN CPM.IsDuplicateOfQuestionId IS NOT NULL THEN CPM.PostId ELSE NULL END) AS RecentDuplicatePostsCount,
+    COUNT(DISTINCT CASE WHEN CPM.PostSignificantEditsCount >= 2 THEN CPM.PostId ELSE NULL END) AS RecentMultiEditedPostsCount,
+    NTILE(4) OVER (ORDER BY SUM(CPM.PostScore) DESC, AVG(CPM.ViewCount) DESC) AS UserPerformanceTier,
+    CASE
+        WHEN SUM(CPM.PostSignificantEditsCount) > 0 THEN CAST(UAS.GoldBadges AS NUMERIC) / SUM(CPM.PostSignificantEditsCount)
+        ELSE 0.0
+    END AS GoldBadgeToSignificantEditRatio,
+    (
+        SELECT TO_CHAR(DATE_TRUNC('month', P.CreationDate), 'YYYY-MM')
+        FROM Posts P
+        WHERE P.OwnerUserId = UAS.UserId
+        GROUP BY DATE_TRUNC('month', P.CreationDate)
+        ORDER BY COUNT(P.Id) DESC, SUM(P.Score) DESC
+        LIMIT 1
+    ) AS UserMostActiveMonth,
+    EXISTS (
+        SELECT 1
+        FROM Posts Q
+        JOIN Posts A ON Q.AcceptedAnswerId = A.Id
+        WHERE Q.OwnerUserId = UAS.UserId
+          AND A.OwnerUserId = UAS.UserId
+          AND Q.PostTypeId = 1
+          AND A.PostTypeId = 2
+          AND Q.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '5 year'
+    ) AS HasSelfAcceptedAnswerForOwnQuestion,
+    LAG(SUM(CPM.PostScore), 1, 0) OVER (PARTITION BY UAS.UserId ORDER BY EXTRACT(YEAR FROM CPM.PostCreationDate)) AS PreviousYearRecentPostScore,
+    EXTRACT(YEAR FROM CPM.PostCreationDate) AS PostCreationYearForGrouping
+FROM UserActivitySummary UAS
+LEFT JOIN CombinedPostMetrics CPM ON UAS.UserId = CPM.OwnerUserId
+GROUP BY
+    UAS.UserId,
+    UAS.DisplayName,
+    UAS.Reputation,
+    UAS.UserCreationDate,
+    UAS.UserProfileViews,
+    UAS.GoldBadges,
+    UAS.SilverBadges,
+    UAS.BronzeBadges,
+    UAS.TotalPostsOwned,
+    UAS.TotalQuestionsOwned,
+    UAS.TotalAnswersOwned,
+    EXTRACT(YEAR FROM CPM.PostCreationDate)
+HAVING
+    COUNT(CPM.PostId) > 10
+    AND SUM(CPM.PostScore) > 50
+    AND UAS.Reputation >= 2000
+ORDER BY
+    UserPerformanceTier ASC,
+    TotalRecentPostScore DESC,
+    UAS.Reputation DESC,
+    UAS.DisplayName
+LIMIT 500;

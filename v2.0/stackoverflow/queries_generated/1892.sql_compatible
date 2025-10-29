@@ -1,0 +1,220 @@
+WITH RecentHighValuePosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.Tags,
+        p.ClosedDate,
+        'Question' AS PostCategory,
+        CAST(NULL AS INTEGER) AS RelatedPostScore,
+        CAST(NULL AS TIMESTAMP) AS RelatedPostCreationDate
+    FROM
+        Posts p
+    WHERE
+        p.PostTypeId = 1
+        AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 years'
+        AND (p.Score >= 5 OR p.ViewCount >= 500)
+
+    UNION ALL
+
+    SELECT
+        a.Id AS PostId,
+        a.PostTypeId,
+        a.OwnerUserId,
+        q.Title AS Title,
+        a.Body,
+        a.Score,
+        NULL AS ViewCount,
+        NULL AS AnswerCount,
+        a.CommentCount,
+        NULL AS FavoriteCount,
+        a.CreationDate,
+        a.LastActivityDate,
+        NULL AS AcceptedAnswerId,
+        a.ParentId,
+        q.Tags AS Tags,
+        NULL AS ClosedDate,
+        'Answer' AS PostCategory,
+        q.Score AS RelatedPostScore,
+        q.CreationDate AS RelatedPostCreationDate
+    FROM
+        Posts a
+    INNER JOIN
+        Posts q ON a.ParentId = q.Id
+    WHERE
+        a.PostTypeId = 2
+        AND a.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 years'
+        AND a.Score >= 3
+        AND q.PostTypeId = 1
+        AND q.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 years'
+),
+AggregatedUserMetrics AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT p_posts.Id) AS TotalPostsByAuthor,
+        COUNT(DISTINCT c.Id) AS TotalCommentsByAuthor,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesGiven,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesGiven,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        MAX(b.Date) AS LastBadgeAwardDate,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges
+    FROM
+        Users u
+    LEFT JOIN Posts p_posts ON u.Id = p_posts.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+    HAVING
+        u.Reputation > 1000 OR COUNT(DISTINCT p_posts.Id) > 5 OR COUNT(DISTINCT c.Id) > 10
+),
+PostHistoryDetails AS (
+    SELECT
+        ph.PostId,
+        MAX(ph.CreationDate) AS LatestHistoryDate,
+        COUNT(ph.Id) AS HistoryEntryCount,
+        ARRAY_AGG(DISTINCT pht.Name ORDER BY pht.Name) AS HistoryTypeNames,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditCount,
+        (
+            SELECT pht_inner.Name
+            FROM PostHistory ph_inner
+            JOIN PostHistoryTypes pht_inner ON ph_inner.PostHistoryTypeId = pht_inner.Id
+            WHERE ph_inner.PostId = ph.PostId
+            AND ph_inner.PostHistoryTypeId > 3
+            ORDER BY ph_inner.CreationDate DESC, ph_inner.Id DESC
+            LIMIT 1
+        ) AS LastSignificantHistoryType
+    FROM
+        PostHistory ph
+    JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    GROUP BY
+        ph.PostId
+),
+TagPerformanceMetrics AS (
+    SELECT
+        t.TagName,
+        COUNT(DISTINCT p.Id) AS TotalTaggedPosts,
+        AVG(p.Score) AS AvgScoreForTag,
+        MAX(p.CreationDate) AS LastTagUsageDate
+    FROM
+        Tags t
+    JOIN Posts p ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    WHERE
+        p.PostTypeId = 1
+        AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '3 years'
+    GROUP BY
+        t.TagName
+    HAVING
+        COUNT(DISTINCT p.Id) > 10
+)
+SELECT
+    rhvp.PostId,
+    rhvp.PostTypeId,
+    rhvp.PostCategory,
+    rhvp.Title,
+    COALESCE(aum_owner.DisplayName, 'Deleted User (' || rhvp.OwnerUserId || ')') AS OwnerDisplayName,
+    aum_owner.Reputation AS OwnerReputation,
+    rhvp.CreationDate,
+    rhvp.Score AS PostScore,
+    rhvp.ViewCount,
+    NULLIF(rhvp.AnswerCount, 0) AS NonZeroAnswerCount,
+    rhvp.CommentCount,
+    rhvp.FavoriteCount,
+    rhvp.ClosedDate,
+    phd.LastSignificantHistoryType,
+    phd.EditCount AS TotalPostEdits,
+    (SELECT EXISTS (SELECT 1 FROM Posts sub_a WHERE sub_a.ParentId = rhvp.PostId AND sub_a.PostTypeId = 2 AND sub_a.Score > 5)) AS HasHighlyRatedAnswer,
+    SUBSTRING(REPLACE(REPLACE(REPLACE(SUBSTRING(rhvp.Body, 1, 200), '<code>', ''), '</code>', ''), '<p>', ''), 1, 100) ||
+        CASE WHEN POSITION('<pre><code>' IN rhvp.Body) > 0 THEN '... [Contains Code]' ELSE '' END AS BodySnippet,
+    COALESCE(CAST(aum_owner.LastAccessDate AS VARCHAR), 'N/A') AS OwnerLastAccessDate,
+    RANK() OVER (PARTITION BY EXTRACT(YEAR FROM rhvp.CreationDate), rhvp.PostTypeId ORDER BY rhvp.Score DESC, rhvp.CreationDate DESC) AS RankInYearByType,
+    AVG(rhvp.Score) OVER (PARTITION BY rhvp.OwnerUserId ORDER BY rhvp.CreationDate ASC ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS OwnerScoreMovingAvg,
+    ( (rhvp.Tags LIKE '%<sql>%') OR (rhvp.Tags LIKE '%<database>%') ) AND COALESCE(aum_owner.GoldBadges, 0) > 0 AS IsDatabaseGoldUserPost,
+    tpm.AvgScoreForTag,
+    tpm.TotalTaggedPosts,
+    STRING_AGG(DISTINCT lt.Name || ': ' || CAST(pl.RelatedPostId AS VARCHAR), '; ') FILTER (WHERE pl.Id IS NOT NULL) AS RelatedPostsInfo,
+    aum_owner.TotalPostsByAuthor,
+    aum_owner.TotalCommentsByAuthor,
+    aum_owner.TotalBadges AS OwnerTotalBadges
+FROM
+    RecentHighValuePosts rhvp
+LEFT JOIN AggregatedUserMetrics aum_owner ON rhvp.OwnerUserId = aum_owner.UserId
+LEFT JOIN PostHistoryDetails phd ON rhvp.PostId = phd.PostId
+LEFT JOIN PostLinks pl ON rhvp.PostId = pl.PostId
+LEFT JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+LEFT JOIN LATERAL (
+    SELECT
+        tpm_inner.AvgScoreForTag,
+        tpm_inner.TotalTaggedPosts
+    FROM
+        TagPerformanceMetrics tpm_inner
+    WHERE
+        rhvp.Tags IS NOT NULL AND rhvp.Tags != '><' AND
+        tpm_inner.TagName = (
+            SELECT unnest_tag
+            FROM unnest(string_to_array(SUBSTRING(rhvp.Tags, 2, LENGTH(rhvp.Tags) - 2), '><')) AS unnest_tag
+            ORDER BY 1
+            LIMIT 1
+        )
+    LIMIT 1
+) tpm ON TRUE
+WHERE
+    rhvp.OwnerUserId IS NOT NULL
+    AND rhvp.Score > 0
+    AND (
+        (rhvp.PostTypeId = 1 AND rhvp.AnswerCount > 0 AND rhvp.AcceptedAnswerId IS NOT NULL)
+        OR
+        (rhvp.PostTypeId = 2 AND rhvp.Score >= 10)
+        OR
+        (rhvp.PostTypeId = 1 AND rhvp.ClosedDate IS NULL AND rhvp.ViewCount >= 1000 AND phd.LastSignificantHistoryType IS DISTINCT FROM 'Deleted')
+    )
+GROUP BY
+    rhvp.PostId,
+    rhvp.PostTypeId,
+    rhvp.PostCategory,
+    rhvp.Title,
+    aum_owner.DisplayName,
+    aum_owner.Reputation,
+    rhvp.CreationDate,
+    rhvp.Score,
+    rhvp.ViewCount,
+    rhvp.AnswerCount,
+    rhvp.CommentCount,
+    rhvp.FavoriteCount,
+    rhvp.ClosedDate,
+    phd.LastSignificantHistoryType,
+    phd.EditCount,
+    rhvp.Body,
+    aum_owner.LastAccessDate,
+    rhvp.OwnerUserId,
+    aum_owner.GoldBadges,
+    tpm.AvgScoreForTag,
+    tpm.TotalTaggedPosts,
+    aum_owner.TotalPostsByAuthor,
+    aum_owner.TotalCommentsByAuthor,
+    aum_owner.TotalBadges,
+    rhvp.Tags,
+    pl.Id,
+    lt.Name,
+    pl.RelatedPostId
+ORDER BY
+    OwnerReputation DESC,
+    RankInYearByType ASC
+LIMIT 5000;

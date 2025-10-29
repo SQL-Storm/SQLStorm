@@ -1,0 +1,302 @@
+-- {"query": "7330.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 3018} 
+WITH RankedPosts AS (
+  SELECT 
+    p.Id,
+    p.PostTypeId,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.Title,
+    p.Tags,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn,
+    LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+    AVG(p.Score) OVER (PARTITION BY p.PostTypeId ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING) as moving_avg_score,
+    CASE 
+      WHEN p.Score > 100 THEN 'High'
+      WHEN p.Score > 50 THEN 'Medium'
+      ELSE 'Low'
+    END as score_category
+  FROM Posts p
+  WHERE p.PostTypeId IN (1, 2) AND p.CreationDate >= '2022-01-01'
+),
+UserStats AS (
+  SELECT 
+    u.Id as UserId,
+    u.Reputation,
+    u.DisplayName,
+    COUNT(DISTINCT p.Id) as total_posts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as answers,
+    SUM(p.Score) as total_score,
+    AVG(p.Score) as avg_score,
+    MAX(p.CreationDate) as latest_activity,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(*), 0), 0) as question_percentage
+  FROM Users u
+  LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+  WHERE u.CreationDate >= '2020-01-01'
+  GROUP BY u.Id, u.Reputation, u.DisplayName
+  HAVING COUNT(DISTINCT p.Id) > 0
+),
+TagAnalysis AS (
+  SELECT 
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId,
+    t.WikiPostId,
+    CASE 
+      WHEN t.Count > 1000 THEN 'Popular'
+      WHEN t.Count > 100 THEN 'Moderate'
+      ELSE 'Niche'
+    END as tag_popularity,
+    COALESCE(
+      (SELECT COUNT(*) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%'),
+      0
+    ) as related_posts,
+    (SELECT COUNT(*) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%') - t.Count as discrepancy
+  FROM Tags t
+  WHERE t.Count > 50
+),
+PostDetails AS (
+  SELECT 
+    r.Id,
+    r.PostTypeId,
+    r.Score,
+    r.ViewCount,
+    r.CreationDate,
+    r.OwnerUserId,
+    r.Title,
+    r.Tags,
+    r.AnswerCount,
+    r.CommentCount,
+    r.FavoriteCount,
+    r.rn,
+    r.prev_score,
+    r.moving_avg_score,
+    r.score_category,
+    u.DisplayName as owner_name,
+    u.Reputation as owner_reputation,
+    CASE 
+      WHEN r.prev_score IS NULL THEN 'New'
+      WHEN r.Score > r.prev_score THEN 'Improved'
+      WHEN r.Score < r.prev_score THEN 'Degraded'
+      ELSE 'Maintained'
+    END as score_trend,
+    CASE 
+      WHEN r.AnswerCount > 5 THEN 'Highly Answered'
+      WHEN r.AnswerCount > 0 THEN 'Answered'
+      ELSE 'Unanswered'
+    END as answer_status,
+    ROW_NUMBER() OVER (ORDER BY r.ViewCount DESC) as view_rank,
+    PERCENT_RANK() OVER (ORDER BY r.Score) as score_percentile,
+    LAG(r.Score) OVER (ORDER BY r.Score) as next_lower_score,
+    LEAD(r.Score) OVER (ORDER BY r.Score) as next_higher_score
+  FROM RankedPosts r
+  INNER JOIN Users u ON r.OwnerUserId = u.Id
+  WHERE r.rn <= 5
+)
+SELECT 
+  'Performance Benchmark Query Results' as query_title,
+  COUNT(*) as total_records,
+  COUNT(DISTINCT pd.OwnerUserId) as unique_users,
+  AVG(pd.Score) as avg_score,
+  MAX(pd.ViewCount) as max_views,
+  MIN(pd.CreationDate) as earliest_post,
+  MAX(pd.CreationDate) as latest_post,
+  STRING_AGG(pd.Title, '; ') as all_titles,
+  COUNT(*) FILTER (WHERE pd.PostTypeId = 1) as question_count,
+  COUNT(*) FILTER (WHERE pd.PostTypeId = 2) as answer_count,
+  STRING_AGG(CASE WHEN pd.score_trend = 'Improved' THEN pd.Title END, '; ') as improved_posts,
+  COUNT(*) FILTER (WHERE pd.answer_status = 'Highly Answered') as highly_answered_count,
+  COUNT(*) FILTER (WHERE pd.answer_status = 'Unanswered') as unanswered_count,
+  STRING_AGG(CASE WHEN pd.score_percentile > 0.9 THEN pd.Title END, '; ') as top_10_percentile_posts,
+  AVG(pd.moving_avg_score) as global_avg_moving_score,
+  STRING_AGG(
+    CASE 
+      WHEN ta.tag_popularity = 'Popular' THEN ta.TagName 
+      ELSE NULL 
+    END, ', '
+  ) as popular_tags,
+  COUNT(DISTINCT CASE WHEN u.question_percentage >= 50 THEN u.UserId END) as high_question_ratio_users,
+  AVG(u.total_score) as avg_user_total_score,
+  COUNT(*) FILTER (WHERE pd.prev_score IS NOT NULL) as scored_posts,
+  COUNT(*) FILTER (WHERE pd.prev_score IS NULL) as new_posts,
+  (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId IN (SELECT Id FROM Posts WHERE PostTypeId = 1)) as question_history_events,
+  (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId IN (SELECT Id FROM Posts WHERE PostTypeId = 2)) as answer_history_events,
+  CASE 
+    WHEN COUNT(*) > 100 THEN 'Large Dataset'
+    WHEN COUNT(*) > 10 THEN 'Medium Dataset'
+    ELSE 'Small Dataset'
+  END as dataset_size,
+  'Complex Query with CTEs, Window Functions, Subqueries, Joins, Aggregates, Calculations and Predicates' as query_description,
+  CURRENT_TIMESTAMP as benchmark_timestamp,
+  ROUND(AVG(pd.FavoriteCount), 2) as avg_favorites,
+  MAX(pd.Score) - MIN(pd.Score) as score_range,
+  COUNT(DISTINCT pd.Tags) as distinct_tags_used,
+  ROUND(STDDEV(pd.Score), 2) as score_standard_deviation,
+  (SELECT COUNT(*) FROM Tags WHERE Count > (SELECT AVG(Count) FROM Tags)) as above_average_tags,
+  COUNT(*) FILTER (WHERE pd.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1)) as high_scoring_questions,
+  (SELECT COUNT(*) FROM Comments c WHERE c.PostId IN (SELECT Id FROM Posts WHERE PostTypeId = 1)) as question_comments,
+  COUNT(*) FILTER (WHERE pd.ViewCount > (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = 1)) as high_view_questions
+FROM PostDetails pd
+JOIN UserStats u ON pd.OwnerUserId = u.UserId
+LEFT JOIN TagAnalysis ta ON ta.TagName IN (
+  SELECT unnest(string_to_array(pd.Tags, '>'))
+  WHERE unnest(string_to_array(pd.Tags, '>')) != ''
+)
+WHERE pd.CreationDate >= '2023-01-01'
+  AND pd.Score > 0
+  AND pd.OwnerUserId IS NOT NULL
+  AND pd.OwnerUserId IN (SELECT Id FROM Users WHERE Reputation > 1000)
+  AND (pd.Tags IS NOT NULL AND pd.Tags != '')
+  AND pd.Title IS NOT NULL
+  AND pd.Title != ''
+  AND pd.Title LIKE '%SQL%'
+  AND EXISTS (
+    SELECT 1 FROM Posts p 
+    WHERE p.OwnerUserId = pd.OwnerUserId 
+    AND p.PostTypeId = 1
+    AND p.CreationDate >= '2022-06-01'
+    AND p.CreationDate <= '2023-06-01'
+  )
+  AND (
+    pd.prev_score IS NULL 
+    OR (pd.Score > 10 AND pd.prev_score < 5)
+    OR (pd.Score < 2 AND pd.prev_score > 10)
+  )
+  AND (pd.answer_status IN ('Highly Answered', 'Answered') OR pd.answer_status IS NULL)
+  AND (
+    (pd.score_category = 'High' AND pd.moving_avg_score > 15)
+    OR (pd.score_category = 'Medium' AND pd.moving_avg_score > 10)
+    OR (pd.score_category = 'Low' AND pd.moving_avg_score > 5)
+  )
+  AND LENGTH(pd.Title) BETWEEN 10 AND 300
+  AND pd.OwnerUserId IN (
+    SELECT UserId 
+    FROM Badges 
+    WHERE Name IN ('Autobiographer', 'Popular Question', 'Notable Question')
+    AND Date >= '2022-01-01'
+    GROUP BY UserId
+    HAVING COUNT(*) >= 2
+  )
+  AND pd.CreationDate BETWEEN 
+    (SELECT MIN(CreationDate) FROM Posts WHERE OwnerUserId = pd.OwnerUserId) 
+    AND 
+    (SELECT MAX(CreationDate) FROM Posts WHERE OwnerUserId = pd.OwnerUserId)
+  AND (
+    pd.ViewCount > 0 
+    OR EXISTS (
+      SELECT 1 FROM Posts p 
+      WHERE p.ParentId = pd.Id 
+      AND p.ViewCount > 0
+    )
+  )
+  AND (
+    pd.OwnerUserId IN (SELECT Id FROM Users WHERE LastAccessDate >= '2022-12-01')
+    OR pd.OwnerUserId IN (SELECT UserId FROM Badges WHERE Date >= '2022-06-01')
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM Posts p 
+    WHERE p.ParentId = pd.Id 
+    AND p.CreationDate < '2023-01-01'
+  )
+  AND (
+    pd.Id IN (
+      SELECT PostId 
+      FROM PostHistory 
+      WHERE PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)
+      AND CreationDate >= '2023-01-01'
+      AND CreationDate <= '2023-12-31'
+      GROUP BY PostId
+      HAVING COUNT(*) >= 2
+    )
+    OR pd.OwnerUserId NOT IN (
+      SELECT DISTINCT OwnerUserId 
+      FROM Posts 
+      WHERE CreationDate >= '2023-01-01'
+      AND CreationDate <= '2023-12-31'
+    )
+  )
+  AND pd.Score > 0 
+  AND pd.ViewCount >= 0
+  AND pd.AnswerCount >= 0
+  AND pd.CommentCount >= 0
+  AND pd.FavoriteCount >= 0
+  AND (
+    pd.OwnerUserId IN (
+      SELECT UserId FROM Votes WHERE VoteTypeId IN (2, 3) AND CreationDate >= '2022-01-01' GROUP BY UserId HAVING COUNT(*) >= 10
+    )
+    OR (
+      pd.OwnerUserId IN (
+        SELECT UserId FROM Comments WHERE CreationDate >= '2022-01-01' GROUP BY UserId HAVING COUNT(*) >= 5
+      )
+    )
+  )
+  AND pd.Tags IS NOT NULL 
+  AND pd.Tags != ''
+  AND pd.Title IS NOT NULL
+  AND pd.Title != ''
+  AND (
+    EXISTS (
+      SELECT 1 FROM PostLinks pl 
+      WHERE pl.PostId = pd.Id 
+      AND pl.LinkTypeId = 1
+      AND pl.CreationDate >= '2022-01-01'
+    )
+    OR EXISTS (
+      SELECT 1 FROM PostHistory ph 
+      WHERE ph.PostId = pd.Id 
+      AND ph.PostHistoryTypeId IN (16, 17, 18)
+      AND ph.CreationDate >= '2022-01-01'
+    )
+  )
+  AND (
+    pd.Id IN (
+      SELECT p.Id 
+      FROM Posts p 
+      WHERE p.OwnerUserId = pd.OwnerUserId 
+      AND p.PostTypeId = 1 
+      AND p.CreationDate >= '2022-01-01'
+      AND p.CreationDate <= '2023-12-31'
+      AND p.Score > 0
+      GROUP BY p.Id, p.OwnerUserId
+      HAVING COUNT(*) >= 3
+    )
+  )
+  AND pd.rn <= 5
+  AND pd.score_category IN ('High', 'Medium', 'Low')
+  AND (
+    pd.prev_score IS NULL 
+    OR (
+      pd.Score - pd.prev_score BETWEEN -10 AND 10
+    )
+  )
+  AND pd.moving_avg_score BETWEEN 0 AND 1000
+  AND pd.score_percentile BETWEEN 0 AND 1
+  AND pd.ViewCount > (
+    SELECT AVG(ViewCount) 
+    FROM Posts 
+    WHERE PostTypeId = 1 
+    AND CreationDate >= '2022-01-01'
+  ) OR pd.ViewCount IS NULL
+  AND pd.AnswerCount > (
+    SELECT AVG(AnswerCount) 
+    FROM Posts 
+    WHERE PostTypeId = 1 
+    AND CreationDate >= '2022-01-01'
+  ) OR pd.AnswerCount IS NULL
+  AND pd.CommentCount > (
+    SELECT AVG(CommentCount) 
+    FROM Posts 
+    WHERE PostTypeId = 1 
+    AND CreationDate >= '2022-01-01'
+  ) OR pd.CommentCount IS NULL
+  AND pd.FavoriteCount > (
+    SELECT AVG(FavoriteCount) 
+    FROM Posts 
+    WHERE PostTypeId = 1 
+    AND CreationDate >= '2022-01-01'
+  ) OR pd.FavoriteCount IS NULL

@@ -1,0 +1,190 @@
+with RecursiveTagParents as (
+    select t.Id, t.TagName, array[t.TagName] as AncestorPath
+    from Tags t
+    where t.IsRequired = true
+    union all
+    select t2.Id, t2.TagName, r.AncestorPath || t2.TagName
+    from Tags t2
+    join RecursiveTagParents r on array_length(r.AncestorPath, 1) > 0 and not t2.TagName = any(r.AncestorPath)
+    where t2.IsRequired = true
+),
+UserBadgeStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct b.Id) as TotalBadges,
+        count(distinct case when b.Class = 1 then b.Id end) as GoldBadges,
+        count(distinct case when b.Class = 2 then b.Id end) as SilverBadges,
+        count(distinct case when b.Class = 3 then b.Id end) as BronzeBadges,
+        bool_or(cast(b.TagBased as boolean)) as HasTagBasedBadges,
+        row_number() over (partition by u.Id order by b.Date desc) as rn
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+TopQuestions as (
+    select
+        p.Id,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.Title,
+        p.Tags,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc nulls last, p.ViewCount desc nulls last) as RankByScore
+    from Posts p
+    where p.PostTypeId = 1
+      and p.CreationDate > cast('2024-10-01' as date) - interval '365 days'
+      and p.Score is not null
+),
+RecentCommentsPerUserPost as (
+    select
+        c.UserId,
+        c.PostId,
+        c.CreationDate,
+        c.Score,
+        row_number() over (partition by c.UserId, c.PostId order by c.CreationDate desc) as rn
+    from Comments c
+),
+UserActivityCTE as (
+    select
+        u.Id as UserId,
+        max(case when p.PostTypeId = 1 then p.CreationDate end) as LastQuestionDate,
+        max(case when p.PostTypeId = 2 then p.CreationDate end) as LastAnswerDate,
+        max(c.CreationDate) as LastCommentDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    group by u.Id
+),
+AnswerWithScoreRank as (
+    select
+        a.Id,
+        a.ParentId as QuestionId,
+        a.OwnerUserId,
+        a.Score,
+        rank() over (partition by a.ParentId order by a.Score desc nulls last) as ScoreRank
+    from Posts a
+    where a.PostTypeId = 2
+),
+QuestionAnswerAgg as (
+    select
+        q.Id as QuestionId,
+        count(a.Id) filter (where a.Score >= 5) as GoodAnswersCount,
+        count(a.Id) filter (where a.Score < 0) as BadAnswersCount,
+        max(a.Score) as MaxAnswerScore,
+        min(a.Score) as MinAnswerScore,
+        avg(a.Score) as AvgAnswerScore
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+    group by q.Id
+),
+DuplicateQuestions as (
+    select pl.PostId as DuplicateId, pl.RelatedPostId as OriginalId
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId and lt.Name = 'Duplicate'
+),
+QuestionClosureReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReason,
+        ph.CreationDate
+    from PostHistory ph
+    join PostHistoryTypes pht on pht.Id = ph.PostHistoryTypeId and pht.Name = 'Post Closed'
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where ph.PostId in (select Id from Posts where PostTypeId = 1)
+),
+UserCommentStats as (
+    select
+        c.UserId,
+        count(c.Id) as CommentsCount,
+        avg(length(c.Text)) as AvgCommentLength,
+        count(distinct c.PostId) as DistinctCommentedPosts
+    from Comments c
+    group by c.UserId
+),
+ComplexUserSummary as (
+    select
+        u.Id,
+        u.DisplayName,
+        coalesce(b.TotalBadges,0) as BadgeCount,
+        coalesce(b.GoldBadges,0) as GoldBadgeCount,
+        coalesce(b.SilverBadges,0) as SilverBadgeCount,
+        coalesce(b.BronzeBadges,0) as BronzeBadgeCount,
+        coalesce(s.CommentsCount,0) as TotalComments,
+        coalesce(s.AvgCommentLength,0) as AverageCommentLength,
+        coalesce(s.DistinctCommentedPosts,0) as PostsCommented,
+        ua.LastQuestionDate,
+        ua.LastAnswerDate,
+        ua.LastCommentDate,
+        u.Reputation,
+        count(distinct tq.Id) filter (where tq.RankByScore = 1) as TopScoringQuestions,
+        (select count(*) from AnswerWithScoreRank awsr where awsr.OwnerUserId = u.Id and awsr.ScoreRank = 1) as TopRankedAnswers
+    from Users u
+    left join UserBadgeStats b on b.UserId = u.Id and b.rn = 1
+    left join UserCommentStats s on s.UserId = u.Id
+    left join UserActivityCTE ua on ua.UserId = u.Id
+    left join TopQuestions tq on tq.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName, b.TotalBadges, b.GoldBadges, b.SilverBadges, b.BronzeBadges,
+             s.CommentsCount, s.AvgCommentLength, s.DistinctCommentedPosts,
+             ua.LastQuestionDate, ua.LastAnswerDate, ua.LastCommentDate, u.Reputation
+)
+select distinct
+    cus.Id as UserId,
+    cus.DisplayName,
+    cus.Reputation,
+    cus.BadgeCount,
+    cus.GoldBadgeCount,
+    cus.SilverBadgeCount,
+    cus.BronzeBadgeCount,
+    cus.TotalComments,
+    cus.AverageCommentLength,
+    cus.PostsCommented,
+    coalesce(qa.GoodAnswersCount,0) as GoodAnswersForTheirQuestions,
+    coalesce(qa.BadAnswersCount,0) as BadAnswersForTheirQuestions,
+    coalesce(qa.MaxAnswerScore,0) as MaxAnswerScoreOnTheirQuestions,
+    coalesce(qa.MinAnswerScore,0) as MinAnswerScoreOnTheirQuestions,
+    coalesce(qa.AvgAnswerScore,0) as AvgAnswerScoreOnTheirQuestions,
+    coalesce(
+        (select count(*) from DuplicateQuestions dq join Posts p on p.Id = dq.DuplicateId where p.OwnerUserId = cus.Id),
+        0
+    ) as DuplicateQuestionsCount,
+    (select count(1)
+       from QuestionClosureReasons qcr
+       join Posts pq on pq.Id = qcr.PostId and pq.OwnerUserId = cus.Id
+       where qcr.CreationDate > cast('2024-10-01' as date) - interval '2 years'
+    ) as ClosureCountLast2Years,
+    (select length(ph.Text)
+     from PostHistory ph
+     where ph.PostId = (select min(pq.Id) from Posts pq where pq.OwnerUserId = cus.Id and pq.PostTypeId = 1)
+       and ph.PostHistoryTypeId = 2
+     fetch first 1 row only
+    ) as InitialBodyLengthOfFirstQuestion,
+    (select string_agg(p.Title, ' || ' ORDER BY p.Score desc NULLS LAST)
+     from (
+       select p.Title, p.Score
+       from Posts p
+       where p.OwnerUserId = cus.Id and p.PostTypeId = 1
+       order by p.Score desc nulls last
+       fetch first 5 rows only
+     ) p
+    ) as TopQuestionTitles,
+    (select greatest(
+        coalesce(max(p.LastActivityDate), timestamp '1900-01-01'),
+        coalesce(max(c.CreationDate), timestamp '1900-01-01')
+    )
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+    where p.OwnerUserId = cus.Id
+    ) as LastActivityDate,
+    rank() over (order by cus.Reputation desc nulls last, cus.BadgeCount desc nulls last) as UserRankByRep,
+    percentile_cont(0.9) within group (order by cus.Reputation) over () as Rep90Percentile
+from ComplexUserSummary cus
+left join QuestionAnswerAgg qa on qa.QuestionId = (
+    select min(p.Id) from Posts p where p.OwnerUserId = cus.Id and p.PostTypeId = 1
+)
+where cus.Reputation > 1000
+  and (cus.BadgeCount >= 10 or cus.TotalComments > 50)
+order by cus.Reputation desc, cus.BadgeCount desc
+limit 100;

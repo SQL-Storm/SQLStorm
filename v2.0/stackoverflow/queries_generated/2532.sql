@@ -1,0 +1,158 @@
+-- {"query": "2532.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1428} 
+with RecursiveTaggedPosts as (
+    select p.Id as PostId,
+           p.Title,
+           p.Tags,
+           p.OwnerUserId,
+           p.Score,
+           p.ViewCount,
+           u.Reputation,
+           u.CreationDate as UserCreationDate,
+           row_number() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc) as UserTopPostRank,
+           coalesce(NULLIF(p.Tags, ''), '<>') as TagsSafe -- prevent null issues
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId = 1 -- questions only
+),
+ParsedTags as (
+    select PostId,
+           unnest(string_to_array(substring(TagsSafe from 2 for length(TagsSafe) - 2), '><')) as Tag
+    from RecursiveTaggedPosts
+),
+TagCounts as (
+    select Tag,
+           count(distinct PostId) as QuestionCount,
+           avg(Score) as AvgScore,
+           median_view_count.median_view as MedianViewCount
+    from ParsedTags pt
+    join RecursiveTaggedPosts rtp on rtp.PostId = pt.PostId
+    left join lateral (
+        select percentile_cont(0.5) within group (order by ViewCount) as median_view
+        from RecursiveTaggedPosts rtp2
+        join ParsedTags pt2 on pt2.PostId = rtp2.PostId
+        where pt2.Tag = pt.Tag
+    ) median_view_count on true
+    group by Tag
+),
+UserBadgeCounts as (
+    select b.UserId,
+           b.Class,
+           count(*) as BadgeCount
+    from Badges b
+    where b.TagBased = 0
+    group by b.UserId, b.Class
+),
+UserTopTags as (
+    select pt.OwnerUserId as UserId,
+           pt.Tag,
+           count(*) as TagUseCount,
+           row_number() over (partition by pt.OwnerUserId order by count(*) desc) as TagRank
+    from ParsedTags pt
+    group by pt.OwnerUserId, pt.Tag
+),
+UserStats as (
+    select u.Id,
+           u.DisplayName,
+           u.Reputation,
+           u.CreationDate,
+           coalesce((select sum(bc.BadgeCount) from UserBadgeCounts bc where bc.UserId = u.Id), 0) as TotalBadges,
+           max(COALESCE(bc.BadgeCount, 0)) filter (where bc.Class = 1) as GoldBadges,
+           max(COALESCE(bc.BadgeCount, 0)) filter (where bc.Class = 2) as SilverBadges,
+           max(COALESCE(bc.BadgeCount, 0)) filter (where bc.Class = 3) as BronzeBadges,
+           (select string_agg(ut.Tag || ':' || ut.TagUseCount, ',' order by ut.TagUseCount desc) from UserTopTags ut where ut.UserId = u.Id and ut.TagRank <= 3) as Top3Tags
+    from Users u
+    left join UserBadgeCounts bc on bc.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate
+    order by u.Reputation desc
+    limit 100
+),
+AcceptedAnswerDetails as (
+    select q.Id as QuestionId,
+           q.Title as QuestionTitle,
+           a.Id as AcceptedAnswerId,
+           a.Score as AcceptedAnswerScore,
+           a.OwnerUserId as AcceptedAnswerOwnerId,
+           u.DisplayName as AcceptedAnswerOwner,
+           a.CreationDate as AcceptedAnswerCreationDate
+    from Posts q
+    left join Posts a on q.AcceptedAnswerId = a.Id
+    left join Users u on u.Id = a.OwnerUserId
+    where q.PostTypeId = 1 and q.AcceptedAnswerId is not null
+),
+PostLinkAggregates as (
+    select pl.PostId,
+           count(distinct case when lt.Name = 'Duplicate' then pl.RelatedPostId end) as DuplicateCount,
+           count(distinct case when lt.Name = 'Linked' then pl.RelatedPostId end) as LinkedCount
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    group by pl.PostId
+)
+select us.DisplayName,
+       us.Reputation,
+       us.UserCreationDate,
+       us.TotalBadges,
+       us.GoldBadges,
+       us.SilverBadges,
+       us.BronzeBadges,
+       us.Top3Tags,
+       q.PostId as QuestionId,
+       q.Title as QuestionTitle,
+       q.Score as QuestionScore,
+       q.ViewCount as QuestionViews,
+       coalesce(pl.DuplicateCount,0) as DuplicateLinks,
+       coalesce(pl.LinkedCount, 0) as LinkedPosts,
+       ad.AcceptedAnswerId,
+       ad.AcceptedAnswerScore,
+       ad.AcceptedAnswerOwner as AcceptedAnswerUser,
+       ad.AcceptedAnswerCreationDate,
+       rank() over (partition by us.Id order by q.Score desc) as QuestionRankByUser,
+       lag(q.Score) over (partition by us.Id order by q.Score desc) as PrevQuestionScore,
+       lead(q.Score) over (partition by us.Id order by q.Score desc) as NextQuestionScore,
+       (case 
+           when q.ViewCount > 10000 then 'High Viewership'
+           when q.ViewCount between 1000 and 10000 then 'Medium Viewership'
+           when q.ViewCount is null then 'Unknown Viewership'
+           else 'Low Viewership'
+        end) as ViewershipCategory,
+       case
+         when q.Tags like '%<sql>%'
+             or q.Tags like '%<performance>%'
+             or q.Tags like '%<optimization>%'
+         then 'Tech Tags'
+         else 'Other Tags'
+       end as TagCategory
+from RecursiveTaggedPosts q
+join UserStats us on q.OwnerUserId = us.Id
+left join AcceptedAnswerDetails ad on ad.QuestionId = q.PostId
+left join PostLinkAggregates pl on pl.PostId = q.PostId
+where us.Reputation > 1000
+  and q.Score >= all (
+      select score
+      from Posts p2
+      where p2.OwnerUserId = q.OwnerUserId
+        and p2.PostTypeId = 1
+  )
+union
+select u.DisplayName,
+       u.Reputation,
+       u.CreationDate,
+       0,
+       0,
+       0,
+       0,
+       null,
+       null,
+       null,
+       null,
+       null,
+       null,
+       null,
+       null,
+       null,
+       null,
+       null,
+       null
+from Users u
+where u.Id not in (select OwnerUserId from RecursiveTaggedPosts)
+order by Reputation desc, QuestionScore desc nulls last
+limit 50;

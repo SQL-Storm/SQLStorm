@@ -1,0 +1,171 @@
+-- {"query": "1230.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2449} 
+WITH UserActivityMetrics AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate,
+        U.LastAccessDate,
+        COALESCE(SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END), 0) AS TotalQuestions,
+        COALESCE(SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END), 0) AS TotalAnswers,
+        COALESCE(COUNT(DISTINCT P.Id), 0) AS TotalPostsAuthored,
+        COALESCE(COUNT(DISTINCT C.Id), 0) AS TotalCommentsAuthored,
+        COALESCE(SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS TotalUpvotesGiven,
+        COALESCE(SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS TotalDownvotesGiven,
+        COALESCE(SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END), 0) AS GoldBadges,
+        COALESCE(SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END), 0) AS SilverBadges,
+        COALESCE(SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END), 0) AS BronzeBadges,
+        U.Views AS ProfileViews,
+        U.UpVotes AS TotalUserUpVotesReceived, -- From Posts/Answers
+        U.DownVotes AS TotalUserDownVotesReceived, -- From Posts/Answers
+        EXTRACT(MONTH FROM U.CreationDate) AS CreationMonth,
+        EXTRACT(YEAR FROM U.CreationDate) AS CreationYear,
+        COALESCE(LENGTH(U.AboutMe), 0) AS AboutMeLength
+    FROM
+        Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Votes V ON U.Id = V.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Views, U.UpVotes, U.DownVotes, U.AboutMe
+),
+PostDetailsAndHistory AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount AS PostViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.AcceptedAnswerId,
+        P.OwnerUserId,
+        P.LastActivityDate,
+        P.LastEditDate,
+        LENGTH(P.Body) AS BodyLength,
+        COALESCE(P.Title, 'Untitled Post') AS PostTitle,
+        P.Tags,
+        P.ClosedDate,
+        P.CommunityOwnedDate,
+        -- Correlated subquery: Count unique editors for a post
+        (SELECT COUNT(DISTINCT PH.UserId)
+         FROM PostHistory PH
+         WHERE PH.PostId = P.Id
+           AND PH.PostHistoryTypeId IN (4, 5, 6, 8, 9)) AS UniqueEditorCount,
+        -- Correlated subquery: Get display name of the most recent editor
+        (SELECT COALESCE(U_editor.DisplayName, PH_latest.UserDisplayName, 'Community')
+         FROM PostHistory PH_latest
+         LEFT JOIN Users U_editor ON PH_latest.UserId = U_editor.Id
+         WHERE PH_latest.PostId = P.Id
+           AND PH_latest.PostHistoryTypeId IN (4, 5, 6, 8, 9) -- Edit/Rollback events
+         ORDER BY PH_latest.CreationDate DESC
+         LIMIT 1
+        ) AS LastEditorName,
+        -- Complex calculation involving multiple fields and NULL logic
+        COALESCE(P.ViewCount, 0) * 0.1 + COALESCE(P.Score, 0) * 0.5 + COALESCE(P.CommentCount, 0) * 0.3 + COALESCE(P.FavoriteCount, 0) * 1.0 AS CalculatedPostEngagementScore,
+        EXTRACT(HOUR FROM (P.LastActivityDate - P.CreationDate)) AS TimeToFirstActivityHours,
+        string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags)-2), '><') AS ParsedTagsArray
+    FROM
+        Posts P
+    WHERE P.PostTypeId IN (1, 2) -- Focus on Questions and Answers
+),
+TagPerformanceData AS (
+    SELECT
+        PHD.PostId,
+        UNNEST(PHD.ParsedTagsArray) AS TagName,
+        PHD.PostCreationDate,
+        PHD.PostScore,
+        PHD.AcceptedAnswerId
+    FROM
+        PostDetailsAndHistory PHD
+    WHERE
+        PHD.PostTypeId = 1 -- Only questions for tag stats
+),
+AggregatedTagStats AS (
+    SELECT
+        TagName,
+        EXTRACT(YEAR FROM PostCreationDate) AS TagYear,
+        COUNT(DISTINCT PostId) AS TaggedQuestionsCount,
+        AVG(PostScore) AS AvgQuestionScoreForTag,
+        COALESCE(CAST(COUNT(DISTINCT PostId) FILTER (WHERE AcceptedAnswerId IS NOT NULL) AS DECIMAL) / NULLIF(COUNT(DISTINCT PostId), 0), 0) AS TagAcceptanceRate,
+        SUM(PostScore) AS TotalTagScore,
+        -- Window function: Rank tags by number of questions within each year
+        RANK() OVER (PARTITION BY EXTRACT(YEAR FROM PostCreationDate) ORDER BY COUNT(DISTINCT PostId) DESC, SUM(PostScore) DESC) AS TagRankByActivityYearly
+    FROM
+        TagPerformanceData
+    GROUP BY
+        TagName, EXTRACT(YEAR FROM PostCreationDate)
+)
+SELECT
+    UAM.UserId,
+    UAM.DisplayName,
+    UAM.Reputation,
+    UAM.CreationDate,
+    UAM.LastAccessDate,
+    UAM.TotalQuestions,
+    UAM.TotalAnswers,
+    UAM.TotalPostsAuthored,
+    UAM.TotalCommentsAuthored,
+    UAM.TotalUpvotesGiven,
+    UAM.TotalDownvotesGiven,
+    UAM.GoldBadges,
+    UAM.SilverBadges,
+    UAM.BronzeBadges,
+    UAM.ProfileViews,
+    UAM.TotalUserUpVotesReceived,
+    UAM.TotalUserDownVotesReceived,
+    UAM.AboutMeLength,
+    PDH.PostId,
+    PDH.PostTitle,
+    PDH.PostTypeId,
+    PDH.PostScore,
+    PDH.PostViewCount,
+    PDH.BodyLength,
+    PDH.UniqueEditorCount,
+    PDH.LastEditorName,
+    PDH.CalculatedPostEngagementScore,
+    PDH.TimeToFirstActivityHours,
+    PDH.LastActivityDate,
+    PDH.ClosedDate,
+    PDH.CommunityOwnedDate,
+    ATS.TagName AS PrimaryTag,
+    ATS.AvgQuestionScoreForTag,
+    ATS.TagAcceptanceRate,
+    ATS.TagRankByActivityYearly,
+    -- Window function: Average reputation of users created in the same month/year as this user
+    AVG(UAM.Reputation) OVER (PARTITION BY UAM.CreationYear, UAM.CreationMonth) AS AvgReputationInUserCohort,
+    -- Window function: Running total of post scores for a user
+    SUM(PDH.PostScore) OVER (PARTITION BY UAM.UserId ORDER BY PDH.PostCreationDate) AS UserRunningPostScore,
+    -- Window function: Score of the previous post by the same user
+    LAG(PDH.PostScore, 1, 0) OVER (PARTITION BY UAM.UserId ORDER BY PDH.PostCreationDate) AS PreviousUserPostScore,
+    -- String expression: Extract first 30 chars of title, uppercase, and concatenate
+    UPPER(SUBSTRING(PDH.PostTitle, 1, 30)) || CASE WHEN LENGTH(PDH.PostTitle) > 30 THEN '...' ELSE '' END AS ShortUpperTitle,
+    -- String expression: Replace "sql" with "database" in post body preview
+    REPLACE(LOWER(SUBSTRING(PDH.Body, 1, 200)), 'sql', 'database') AS BodyPreviewModified,
+    -- NULL logic and complex arithmetic for User-Post compatibility score
+    COALESCE(UAM.Reputation / NULLIF(UAM.TotalPostsAuthored, 0), 0) * (PDH.CalculatedPostEngagementScore * 0.1) AS UserPostMatchScore,
+    -- Case statement with multiple conditions and NULL checks
+    CASE
+        WHEN PDH.ClosedDate IS NOT NULL AND PDH.AcceptedAnswerId IS NULL THEN 'ClosedNoAnswer'
+        WHEN PDH.AcceptedAnswerId IS NOT NULL AND PDH.PostScore > 50 THEN 'HighImpactAnswered'
+        WHEN PDH.PostViewCount > 10000 AND PDH.FavoriteCount > 100 THEN 'VeryPopular'
+        WHEN PDH.PostViewCount IS NULL OR PDH.PostScore <= 0 THEN 'LowVisibilityOrNegative'
+        ELSE 'ActiveButNotViral'
+    END AS PostStatusCategory
+FROM
+    UserActivityMetrics UAM
+INNER JOIN PostDetailsAndHistory PDH ON UAM.UserId = PDH.OwnerUserId
+LEFT JOIN TagPerformanceData TPD ON PDH.PostId = TPD.PostId
+LEFT JOIN AggregatedTagStats ATS ON TPD.TagName = ATS.TagName AND EXTRACT(YEAR FROM TPD.PostCreationDate) = ATS.TagYear
+WHERE
+    UAM.Reputation > 500 AND UAM.TotalPostsAuthored > 5
+    AND PDH.PostCreationDate > '2020-01-01'
+    AND (PDH.PostTitle ILIKE '%query%' OR PDH.PostTitle ILIKE '%database%' OR PDH.Tags ILIKE '%<sql>%')
+    AND PDH.BodyLength IS NOT NULL AND PDH.BodyLength > 200
+    AND PDH.CalculatedPostEngagementScore > 10
+    AND (PDH.ClosedDate IS NULL OR PDH.ClosedDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year')
+ORDER BY
+    UAM.Reputation DESC, PDH.PostScore DESC, PDH.PostCreationDate DESC
+LIMIT 5000;

@@ -1,0 +1,131 @@
+-- {"query": "3330.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2345} 
+
+WITH
+    TopUsers AS (
+        SELECT
+            u.Id,
+            u.DisplayName,
+            u.Reputation,
+            COALESCE(u.Location, 'Unknown') AS Location,
+            ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS rn
+        FROM Users u
+        WHERE u.Reputation > 10000
+    ),
+    BadgeAgg AS (
+        SELECT
+            b.UserId,
+            SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END)      AS GoldCount,
+            SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END)      AS SilverCount,
+            SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END)      AS BronzeCount,
+            COUNT(*) FILTER (WHERE b.TagBased = 1)            AS TagBasedCount
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+    PostAgg AS (
+        SELECT
+            p.OwnerUserId                                          AS UserId,
+            COUNT(*) FILTER (WHERE p.PostTypeId = 1)               AS QuestionCount,
+            COUNT(*) FILTER (WHERE p.PostTypeId = 2)               AS AnswerCount,
+            SUM(COALESCE(p.Score,0))                               AS TotalScore,
+            MAX(p.CreationDate)                                    AS LastPostDate
+        FROM Posts p
+        WHERE p.OwnerUserId IS NOT NULL
+        GROUP BY p.OwnerUserId
+    ),
+    RecentVotes AS (
+        SELECT
+            v.PostId,
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END)     AS UpVotes,
+            SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END)     AS DownVotes,
+            MAX(v.CreationDate)                                   AS LastVoteDate
+        FROM Votes v
+        WHERE v.CreationDate >= CURRENT_DATE - INTERVAL '30 days'
+        GROUP BY v.PostId
+    ),
+    QuestionTags AS (
+        SELECT
+            p.Id                                            AS QuestionId,
+            UNNEST(string_to_array(substr(p.Tags,2,length(p.Tags)-2),'><')) AS Tag
+        FROM Posts p
+        WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+    ),
+    TagPopularity AS (
+        SELECT
+            qt.Tag,
+            COUNT(DISTINCT qt.QuestionId)                 AS QuestionUseCount,
+            SUM(p.Score)                                 AS ScoreSum
+        FROM QuestionTags qt
+        JOIN Posts p ON p.Id = qt.QuestionId
+        GROUP BY qt.Tag
+        HAVING COUNT(DISTINCT qt.QuestionId) > 100
+    )
+SELECT
+    tu.Id,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.Location,
+    COALESCE(b.GoldCount,0)                               AS GoldBadges,
+    COALESCE(b.SilverCount,0)                             AS SilverBadges,
+    COALESCE(b.BronzeCount,0)                             AS BronzeBadges,
+    COALESCE(b.TagBasedCount,0)                           AS TagBasedBadges,
+    COALESCE(pa.QuestionCount,0)                          AS Questions,
+    COALESCE(pa.AnswerCount,0)                            AS Answers,
+    COALESCE(pa.TotalScore,0)                             AS PostScore,
+    pa.LastPostDate,
+    rv.UpVotes,
+    rv.DownVotes,
+    rv.LastVoteDate,
+    STRING_AGG(DISTINCT tp.Tag, ', ') FILTER (WHERE tp.Tag IS NOT NULL) AS PopularTags
+FROM TopUsers tu
+LEFT JOIN BadgeAgg b      ON b.UserId = tu.Id
+LEFT JOIN PostAgg pa      ON pa.UserId = tu.Id
+LEFT JOIN (
+        SELECT
+            p.OwnerUserId                         AS OwnerUserId,
+            SUM(rv.UpVotes)                       AS UpVotes,
+            SUM(rv.DownVotes)                     AS DownVotes,
+            MAX(rv.LastVoteDate)                  AS LastVoteDate
+        FROM Posts p
+        JOIN RecentVotes rv ON rv.PostId = p.Id
+        GROUP BY p.OwnerUserId
+) rv ON rv.OwnerUserId = tu.Id
+LEFT JOIN (
+        SELECT
+            pa.UserId,
+            STRING_AGG(tp.Tag, ', ') AS Tag
+        FROM PostAgg pa
+        JOIN Posts p                ON p.OwnerUserId = pa.UserId
+        JOIN QuestionTags qt        ON qt.QuestionId = p.Id
+        JOIN TagPopularity tp       ON tp.Tag = qt.Tag
+        GROUP BY pa.UserId
+) tp ON tp.UserId = tu.Id
+WHERE tu.rn <= 50
+GROUP BY
+    tu.Id, tu.DisplayName, tu.Reputation, tu.Location,
+    b.GoldCount, b.SilverCount, b.BronzeCount, b.TagBasedCount,
+    pa.QuestionCount, pa.AnswerCount, pa.TotalScore, pa.LastPostDate,
+    rv.UpVotes, rv.DownVotes, rv.LastVoteDate
+ORDER BY tu.Reputation DESC, GoldBadges DESC
+
+UNION ALL
+
+SELECT
+    NULL                     AS Id,
+    '---'                    AS DisplayName,
+    NULL                     AS Reputation,
+    NULL                     AS Location,
+    NULL                     AS GoldBadges,
+    NULL                     AS SilverBadges,
+    NULL                     AS BronzeBadges,
+    NULL                     AS TagBasedBadges,
+    NULL                     AS Questions,
+    NULL                     AS Answers,
+    NULL                     AS PostScore,
+    NULL                     AS LastPostDate,
+    NULL                     AS UpVotes,
+    NULL                     AS DownVotes,
+    NULL                     AS LastVoteDate,
+    STRING_AGG(Tag, ', ')    AS AllPopularTags
+FROM TagPopularity
+WHERE ScoreSum > 0
+LIMIT 1;

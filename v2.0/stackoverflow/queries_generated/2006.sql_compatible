@@ -1,0 +1,198 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        0 AS Level
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+  UNION ALL
+    SELECT
+        c.Id,
+        c.TagName,
+        c.ExcerptPostId,
+        c.WikiPostId,
+        rh.Level + 1
+    FROM Tags c
+    INNER JOIN PostLinks pl ON pl.PostId = c.ExcerptPostId AND pl.LinkTypeId = 1
+    INNER JOIN RecursiveTagHierarchy rh ON rh.ExcerptPostId = pl.RelatedPostId
+    WHERE c.IsRequired = TRUE
+),
+UserPostStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswerCount,
+        COALESCE(SUM(p.Score),0) AS TotalPostScore,
+        AVG(CASE WHEN p.PostTypeId IN (1,2) THEN p.Score END) AS AvgPostScore,
+        MAX(p.LastActivityDate) AS LastActive,
+        COUNT(DISTINCT b.Id) AS DistinctBadges,
+        MAX(b.Class) AS MaxBadgeClass,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS UpVotesGiven,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS DownVotesGiven,
+        SUM(
+            CASE WHEN EXISTS (
+                SELECT 1 FROM Posts ap 
+                WHERE ap.OwnerUserId = u.Id AND ap.PostTypeId = 1 AND ap.AcceptedAnswerId IS NOT NULL
+                AND EXISTS (SELECT 1 FROM Posts a WHERE a.Id = ap.AcceptedAnswerId AND a.OwnerUserId = u.Id)
+            ) THEN 1 ELSE 0 END
+        ) AS QuestionsWithOwnAcceptedAnswerCount
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+PostWithActivity AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.ParentId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Tags,
+        COALESCE(array_length(string_to_array(substring(p.Tags FROM 2 FOR length(p.Tags)-2), '><'), 1), 0) AS TagCount,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS RankInType,
+        LEAD(p.Score) OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS NextScore,
+        LAG(p.CreationDate) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate ASC) AS PrevCreationDate
+    FROM Posts p
+),
+RecentEditsFiltered AS (
+    SELECT DISTINCT ON (ph.PostId)
+        ph.PostId,
+        ph.Id AS HistoryId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        ph.UserId,
+        ph.UserDisplayName,
+        ph.Comment,
+        ph.Text
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4,5,6)
+    ORDER BY ph.PostId, ph.CreationDate DESC
+),
+AnswerScoresWithQuestion AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.Score AS AnswerScore,
+        q.Title AS QuestionTitle,
+        q.ViewCount AS QuestionViews,
+        u.DisplayName AS AnswerOwnerName,
+        u.Reputation AS AnswerOwnerReputation
+    FROM Posts a
+    INNER JOIN Posts q ON q.Id = a.ParentId AND q.PostTypeId = 1
+    INNER JOIN Users u ON u.Id = a.OwnerUserId
+    WHERE a.PostTypeId = 2
+),
+VotesSummary AS (
+    SELECT
+        p.Id AS PostId,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVotes,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVotes,
+        COUNT(CASE WHEN v.VoteTypeId = 5 THEN 1 END) AS FavoritesVotes,
+        COUNT(CASE WHEN v.VoteTypeId IN (8,9) THEN 1 END) AS BountyVotes
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    GROUP BY p.Id
+)
+SELECT
+    ups.UserId,
+    ups.DisplayName,
+    ups.QuestionCount,
+    ups.AnswerCount,
+    ups.TotalPostScore,
+    ups.AvgPostScore,
+    CASE
+        WHEN ups.MaxBadgeClass = 1 THEN 'Gold'
+        WHEN ups.MaxBadgeClass = 2 THEN 'Silver'
+        WHEN ups.MaxBadgeClass = 3 THEN 'Bronze'
+        ELSE 'None'
+    END AS HighestBadgeClass,
+    ups.CommentCount,
+    ups.UpVotesGiven,
+    ups.DownVotesGiven,
+    ups.QuestionsWithOwnAcceptedAnswerCount,
+    COALESCE(pwa.QuestionTitle, '(No accepted answers)') AS SampleQuestionTitle,
+    pwa.AnswerScore AS SampleAnswerScore,
+    pwa.AnswerOwnerName,
+    pwa.AnswerOwnerReputation,
+    vs.UpVotes,
+    vs.DownVotes,
+    vs.FavoritesVotes,
+    vs.BountyVotes,
+    rh.Level AS TagDepthLevel,
+    rh.TagName,
+    COALESCE((
+      SELECT string_agg(tn, ',' ORDER BY ord)
+      FROM (
+        SELECT tn, ord FROM (
+          SELECT unnest(string_to_array(substring(p.Tags FROM 2 FOR length(p.Tags)-2), '><')) AS tn, generate_series(1,100) AS ord
+        ) t2
+        LIMIT 3
+      ) sub
+    ), '') AS TopTags,
+    CASE
+        WHEN ups.LastActive IS NULL THEN 'Never Active'
+        WHEN ups.LastActive < (CAST('2024-10-01' AS date) - INTERVAL '365 days') THEN 'Inactive > 1 year'
+        ELSE 'Active Recently'
+    END AS ActivityStatus,
+    p.CreationDate,
+    p.RankInType,
+    p.TagCount,
+    p.Score,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id AND (c.UserId IS NULL OR c.UserId <> p.OwnerUserId)) AS CommentCountNotOwner,
+    CASE 
+        WHEN p.NextScore IS NULL THEN 'Top Scorer'
+        WHEN p.Score = p.NextScore THEN 'Tie Top Score'
+        ELSE 'Non Top Score'
+    END AS ScoreRankStatus
+FROM UserPostStats ups
+LEFT JOIN AnswerScoresWithQuestion pwa ON pwa.AnswerOwnerName = ups.DisplayName
+LEFT JOIN VotesSummary vs ON vs.PostId = pwa.AnswerId
+LEFT JOIN RecursiveTagHierarchy rh ON rh.Level < 3
+LEFT JOIN PostWithActivity p ON p.OwnerUserId = ups.UserId AND p.RankInType = 1
+WHERE ups.QuestionCount > 5
+AND p.RankInType IS NOT NULL
+AND (COALESCE(vs.UpVotes,0) > 10 OR COALESCE(vs.FavoritesVotes,0) > 0)
+GROUP BY
+    ups.UserId,
+    ups.DisplayName,
+    ups.QuestionCount,
+    ups.AnswerCount,
+    ups.TotalPostScore,
+    ups.AvgPostScore,
+    ups.MaxBadgeClass,
+    ups.CommentCount,
+    ups.UpVotesGiven,
+    ups.DownVotesGiven,
+    ups.QuestionsWithOwnAcceptedAnswerCount,
+    pwa.QuestionTitle,
+    pwa.AnswerScore,
+    pwa.AnswerOwnerName,
+    pwa.AnswerOwnerReputation,
+    vs.UpVotes,
+    vs.DownVotes,
+    vs.FavoritesVotes,
+    vs.BountyVotes,
+    rh.Level,
+    rh.TagName,
+    p.Tags,
+    p.CreationDate,
+    p.RankInType,
+    p.TagCount,
+    p.Score,
+    p.NextScore,
+    ups.LastActive,
+    p.Id,
+    p.OwnerUserId
+ORDER BY ups.TotalPostScore DESC, ups.CommentCount DESC
+LIMIT 100;

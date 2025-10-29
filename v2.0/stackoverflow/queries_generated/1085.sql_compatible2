@@ -1,0 +1,234 @@
+WITH UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT p_all.Id) AS TotalPostsCreated,
+        SUM(CASE WHEN p_all.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsAsked,
+        SUM(CASE WHEN p_all.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersPosted,
+        SUM(CASE WHEN p_all.PostTypeId = 1 AND p_all.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS QuestionsWithAcceptedAnswer,
+        SUM(CASE WHEN p_all.PostTypeId = 2 AND p_all.Id = (SELECT p_q.AcceptedAnswerId FROM Posts p_q WHERE p_q.Id = p_all.ParentId) THEN 1 ELSE 0 END) AS AnswersAcceptedByOthers,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS TotalEditsMade,
+        SUM(p_all.Score) AS TotalPostScore,
+        SUM(p_all.ViewCount) AS TotalPostViews,
+        MAX(p_all.CreationDate) AS LastPostDate,
+        MIN(p_all.CreationDate) AS FirstPostDate,
+        AVG(CASE WHEN p_all.PostTypeId = 1 THEN p_all.Score ELSE NULL END) AS AvgQuestionScore,
+        AVG(CASE WHEN p_all.PostTypeId = 2 THEN p_all.Score ELSE NULL END) AS AvgAnswerScore,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade
+    FROM Users u
+    LEFT JOIN Posts p_all ON u.Id = p_all.OwnerUserId AND p_all.CreationDate >= (u.CreationDate - INTERVAL '180 days')
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId AND ph.PostHistoryTypeId IN (4, 5, 6) AND ph.CreationDate >= (u.CreationDate - INTERVAL '180 days')
+    LEFT JOIN Comments c ON u.Id = c.UserId AND c.CreationDate >= (u.CreationDate - INTERVAL '180 days')
+    GROUP BY u.Id, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+TagPerformance AS (
+    SELECT
+        tag AS TagName,
+        COUNT(DISTINCT p.Id) AS TotalQuestionsInTag,
+        AVG(p.Score) AS AvgQuestionScoreInTag,
+        AVG(p.ViewCount) AS AvgQuestionViewsInTag,
+        SUM(p.AnswerCount) AS TotalAnswersToTagQuestions,
+        COUNT(DISTINCT p.OwnerUserId) AS UniqueQuestionAsk_Users
+    FROM (
+        SELECT
+            p.*,
+            TRIM(tag) AS tag
+        FROM Posts p,
+        UNNEST(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS t(tag)
+        WHERE p.PostTypeId = 1
+          AND p.Tags IS NOT NULL
+          AND length(p.Tags) > 2
+    ) p
+    GROUP BY tag
+    HAVING COUNT(DISTINCT p.Id) > 50
+),
+PostEditMetrics AS (
+    SELECT
+        PostId,
+        EditCount,
+        FirstEditDate,
+        LastEditDate,
+        InitialPostCreationDate,
+        EXTRACT(EPOCH FROM (FirstEditDate - InitialPostCreationDate)) / 3600.0 AS HoursToFirstEdit,
+        EXTRACT(EPOCH FROM (LastEditDate - FirstEditDate)) / 3600.0 AS HoursFromFirstToLastEdit
+    FROM (
+        SELECT
+            ph.PostId,
+            COUNT(ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (4, 5, 6)) AS EditCount,
+            MIN(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.CreationDate END) AS FirstEditDate,
+            MAX(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.CreationDate END) AS LastEditDate,
+            MIN(CASE WHEN ph.PostHistoryTypeId IN (1, 2, 3) THEN ph.CreationDate END) AS InitialPostCreationDate
+        FROM PostHistory ph
+        WHERE ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)
+        GROUP BY ph.PostId
+    ) AS PostAggregatedEdits
+    WHERE InitialPostCreationDate IS NOT NULL AND FirstEditDate IS NOT NULL
+),
+RecentClosedQuestions AS (
+    SELECT
+        ph.PostId,
+        p.Title,
+        p.OwnerUserId,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate ELSE NULL END) AS LastClosedDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.CreationDate ELSE NULL END) AS LastReopenedDate,
+        STRING_AGG(DISTINCT crt.Name, ' | ') FILTER (WHERE ph.PostHistoryTypeId = 10 AND ph.Comment IS NOT NULL) AS CloseReasons,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Id ELSE NULL END) AS ClosureCount
+    FROM PostHistory ph
+    JOIN Posts p ON ph.PostId = p.Id
+    LEFT JOIN CloseReasonTypes crt ON ph.PostHistoryTypeId = 10 AND ph.Comment = CAST(crt.Id AS varchar)
+    WHERE ph.PostHistoryTypeId IN (10, 11)
+      AND ph.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days'
+      AND p.PostTypeId = 1
+    GROUP BY ph.PostId, p.Title, p.OwnerUserId
+),
+UserBadgeSummary AS (
+    SELECT
+        b.UserId,
+        b.Name AS BadgeName,
+        b.Class AS BadgeClass
+    FROM Badges b
+    WHERE b.Class IN (1, 2)
+),
+AnomalousPosts AS (
+    SELECT p.Id AS PostId, 'HighEditCountFastEdit' AS AnomalyType, p.OwnerUserId
+    FROM Posts p
+    JOIN PostEditMetrics pem ON p.Id = pem.PostId
+    WHERE pem.EditCount > 5 AND EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS timestamp) - p.CreationDate)) < 60
+      AND pem.HoursToFirstEdit IS NOT NULL AND pem.HoursToFirstEdit < 0.5
+
+    UNION ALL
+
+    SELECT rcq.PostId, 'MultipleClosedNoReopen' AS AnomalyType, rcq.OwnerUserId
+    FROM RecentClosedQuestions rcq
+    WHERE rcq.ClosureCount > 1 AND rcq.LastReopenedDate IS NULL
+
+    UNION ALL
+
+    SELECT p.Id AS PostId, 'LowReputationHighScoreQuestion' AS AnomalyType, p.OwnerUserId
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE u.Reputation < 50 AND p.Score > 20 AND p.PostTypeId = 1
+      AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180 days'
+)
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    uas.Reputation,
+    uas.TotalPostsCreated,
+    uas.TotalQuestionsAsked,
+    uas.TotalAnswersPosted,
+    uas.AnswersAcceptedByOthers,
+    uas.TotalEditsMade,
+    COALESCE(uas.AvgQuestionScore, 0.0) AS AvgQuestionScore,
+    COALESCE(uas.AvgAnswerScore, 0.0) AS AvgAnswerScore,
+    COALESCE(uas.TotalPostScore, 0) AS TotalPostScoreAggregate,
+    COALESCE(uas.TotalPostViews, 0) AS TotalPostViewsAggregate,
+    rcq.LastClosedDate,
+    rcq.LastReopenedDate,
+    rcq.CloseReasons,
+    pea.EditCount AS LastQuestionEditCount,
+    pea.HoursToFirstEdit AS LastQuestionHoursToFirstEdit,
+    pea.HoursFromFirstToLastEdit AS LastQuestionHoursFromFirstToLastEdit,
+    tp_user.TagName AS UsersTopTagName,
+    tp_user.AvgQuestionScoreInTag AS UsersTopTagAvgScore,
+    tp_user.AvgQuestionViewsInTag AS UsersTopTagAvgViews,
+    (SELECT COUNT(ub.BadgeName) FROM UserBadgeSummary ub WHERE ub.UserId = u.Id AND ub.BadgeClass = 1) AS GoldBadgesCount,
+    (SELECT SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE -1 END)
+     FROM Votes v JOIN Posts p_v ON v.PostId = p_v.Id
+     WHERE p_v.OwnerUserId = u.Id AND v.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days'
+    ) AS RecentNetVotesOnOwnPosts,
+    COALESCE(SUM(CASE WHEN ap.AnomalyType = 'HighEditCountFastEdit' THEN 1 ELSE 0 END), 0) AS HighEditFastAnomalyCount,
+    COALESCE(SUM(CASE WHEN ap.AnomalyType = 'MultipleClosedNoReopen' THEN 1 ELSE 0 END), 0) AS MultipleClosedAnomalyCount,
+    COALESCE(SUM(CASE WHEN ap.AnomalyType = 'LowReputationHighScoreQuestion' THEN 1 ELSE 0 END), 0) AS LowReputationHighScoreAnomalyCount,
+    CASE
+        WHEN uas.TotalQuestionsAsked > 0 AND uas.AnswersAcceptedByOthers > 0
+             AND uas.TotalAnswersPosted > 0 AND (uas.AnswersAcceptedByOthers * 1.0 / uas.TotalAnswersPosted) > 0.5
+        THEN 'HighAcceptanceRate'
+        WHEN uas.TotalEditsMade > COALESCE(uas.TotalPostsCreated, 0) * 3 THEN 'FrequentEditor'
+        WHEN rcq.ClosureCount > 1 AND rcq.LastReopenedDate IS NULL THEN 'MultipleClosedNoReopen'
+        ELSE 'Normal'
+    END AS UserBehaviorCategory,
+    RANK() OVER (PARTITION BY (uas.TotalQuestionsAsked > 0) ORDER BY COALESCE(uas.AvgQuestionScore, -1) DESC) AS QuestionScoreRank,
+    NTILE(10) OVER (ORDER BY uas.Reputation DESC) AS ReputationDecile,
+    LOWER(SUBSTRING(u.DisplayName FROM 1 FOR 5)) || '...' || UPPER(SUBSTRING(u.DisplayName FROM GREATEST(length(u.DisplayName) - 4, 1) FOR 5)) AS DisplayNameSignature,
+    COALESCE(u.Location, 'Unknown Location') AS UserLocation,
+    (u.AboutMe LIKE '%SQL%' OR u.AboutMe LIKE '%database%' OR u.AboutMe LIKE '%query%') AS IsAboutSQLOrDB,
+    NULLIF(u.WebsiteUrl, '') AS UserWebsiteUrlNullIfEmpty,
+    EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS timestamp) - u.CreationDate)) AS DaysSinceUserCreation
+FROM
+    Users u
+LEFT JOIN
+    UserActivitySummary uas ON u.Id = uas.UserId
+LEFT JOIN
+    RecentClosedQuestions rcq ON u.Id = rcq.OwnerUserId AND rcq.PostId = (
+        SELECT p_q_recent.Id
+        FROM Posts p_q_recent
+        WHERE p_q_recent.OwnerUserId = u.Id AND p_q_recent.PostTypeId = 1
+        ORDER BY p_q_recent.CreationDate DESC
+        LIMIT 1
+    )
+LEFT JOIN
+    PostEditMetrics pea ON pea.PostId = rcq.PostId
+LEFT JOIN LATERAL (
+    SELECT
+        tp.TagName,
+        tp.AvgQuestionScoreInTag,
+        tp.AvgQuestionViewsInTag
+    FROM TagPerformance tp
+    WHERE EXISTS (
+        SELECT 1
+        FROM Posts p_tag_user,
+        UNNEST(string_to_array(substring(p_tag_user.Tags, 2, length(p_tag_user.Tags)-2), '><')) AS t(tag)
+        WHERE p_tag_user.PostTypeId = 1
+          AND p_tag_user.OwnerUserId = u.Id
+          AND p_tag_user.Tags IS NOT NULL
+          AND tp.TagName = TRIM(tag)
+        LIMIT 1
+    )
+    ORDER BY tp.AvgQuestionScoreInTag DESC, tp.AvgQuestionViewsInTag DESC
+    LIMIT 1
+) AS tp_user ON TRUE
+LEFT JOIN
+    AnomalousPosts ap ON u.Id = ap.OwnerUserId
+WHERE
+    u.Reputation > 500
+    AND u.LastAccessDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days'
+    AND (u.Location IS NOT NULL OR u.AboutMe IS NOT NULL)
+    AND COALESCE(uas.TotalPostsCreated, 0) > 10
+GROUP BY
+    u.Id,
+    u.DisplayName,
+    uas.Reputation,
+    uas.TotalPostsCreated,
+    uas.TotalQuestionsAsked,
+    uas.TotalAnswersPosted,
+    uas.AnswersAcceptedByOthers,
+    uas.TotalEditsMade,
+    uas.AvgQuestionScore,
+    uas.AvgAnswerScore,
+    uas.TotalPostScore,
+    uas.TotalPostViews,
+    rcq.LastClosedDate,
+    rcq.LastReopenedDate,
+    rcq.CloseReasons,
+    rcq.ClosureCount,
+    pea.EditCount,
+    pea.HoursToFirstEdit,
+    pea.HoursFromFirstToLastEdit,
+    tp_user.TagName,
+    tp_user.AvgQuestionScoreInTag,
+    tp_user.AvgQuestionViewsInTag,
+    u.Location,
+    u.AboutMe,
+    u.WebsiteUrl,
+    u.CreationDate,
+    u.Id -- ensure grouped
+HAVING
+    COUNT(ap.PostId) < 3
+ORDER BY
+    u.Reputation DESC,
+    GoldBadgesCount DESC,
+    uas.TotalPostsCreated DESC
+LIMIT 500;

@@ -1,0 +1,235 @@
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.Reputation,
+        U.Views AS UserViews,
+        U.UpVotes AS UserUpVotes,
+        U.DownVotes AS UserDownVotes,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate AS UserLastAccessDate,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        COUNT(DISTINCT CASE WHEN B.Class = 1 THEN B.Id END) AS GoldBadges,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsPosted,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersPosted,
+        SUM(COALESCE(P.Score, 0)) AS TotalPostScore,
+        SUM(COALESCE(P.ViewCount, 0)) AS TotalPostViews,
+        SUM(COALESCE(C.Score, 0)) AS TotalCommentScore,
+        COUNT(DISTINCT C.Id) AS TotalComments
+    FROM Users U
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    GROUP BY U.Id, U.Reputation, U.Views, U.UpVotes, U.DownVotes, U.CreationDate, U.LastAccessDate
+),
+PostHistoricalMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.CreationDate AS PostCreationDate,
+        P.LastEditDate,
+        P.ClosedDate,
+        P.AcceptedAnswerId,
+        P.ParentId,
+        P.Score AS PostScore,
+        P.ViewCount AS PostViewCount,
+        P.OwnerUserId,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.Tags,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.CreationDate END) AS FirstClosedDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 11 THEN PH.CreationDate END) AS LastReopenedDate,
+        MIN(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.CreationDate END) AS FirstEditDate,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9) THEN PH.Id END) AS EditCount,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.Id END) AS CloseEvents,
+        (SELECT COUNT(DISTINCT Cmt.Id) FROM Comments Cmt WHERE Cmt.PostId = P.Id AND Cmt.CreationDate < P.CreationDate + INTERVAL '1 day' AND LENGTH(Cmt.Text) > 50) AS InitialDayLongComments
+    FROM Posts P
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    WHERE P.PostTypeId = 1
+    GROUP BY P.Id, P.PostTypeId, P.CreationDate, P.LastEditDate, P.ClosedDate, P.AcceptedAnswerId, P.ParentId, P.Score, P.ViewCount, P.OwnerUserId, P.AnswerCount, P.CommentCount, P.FavoriteCount, P.Tags
+),
+TagAnalysis AS (
+    SELECT
+        PHM.PostId,
+        COALESCE(array_length(string_to_array(NULLIF(substring(PHM.Tags FROM 2 FOR char_length(PHM.Tags)-2), ''), '><'), 1), 0) AS NumberOfTags,
+        SUM(CASE WHEN T.TagName IS NOT NULL THEN T.Count ELSE 0 END) AS TotalTagUsageCount,
+        MAX(CASE WHEN LOWER(T.TagName) LIKE '%sql%' OR LOWER(T.TagName) LIKE '%database%' OR LOWER(T.TagName) LIKE '%nosql%' THEN 1 ELSE 0 END) AS HasDatabaseTag,
+        MAX(CASE WHEN LOWER(T.TagName) LIKE '%python%' OR LOWER(T.TagName) LIKE '%java%' OR LOWER(T.TagName) LIKE '%javascript%' THEN 1 ELSE 0 END) AS HasProgrammingTag
+    FROM PostHistoricalMetrics PHM
+    LEFT JOIN Tags T ON T.TagName = ANY(string_to_array(NULLIF(substring(PHM.Tags FROM 2 FOR char_length(PHM.Tags)-2), ''), '><'))
+    GROUP BY PHM.PostId, PHM.Tags
+),
+QuestionPerformance AS (
+    SELECT
+        PHM.PostId,
+        PHM.PostTypeId,
+        PHM.OwnerUserId,
+        PHM.PostCreationDate,
+        PHM.PostScore,
+        PHM.PostViewCount,
+        PHM.AnswerCount,
+        PHM.FavoriteCount,
+        PHM.FirstClosedDate,
+        PHM.LastReopenedDate,
+        PHM.FirstEditDate,
+        PHM.EditCount,
+        PHM.InitialDayLongComments,
+        TA.NumberOfTags,
+        TA.HasDatabaseTag,
+        TA.HasProgrammingTag,
+        EXTRACT(EPOCH FROM (COALESCE(PHM.LastEditDate, PHM.PostCreationDate) - PHM.PostCreationDate)) / 3600 AS TimeToFirstEditHours,
+        (COALESCE(PHM.PostScore, 0) * 1.5 + COALESCE(PHM.PostViewCount, 0) / 10.0 + COALESCE(PHM.AnswerCount, 0) * 5 + COALESCE(PHM.FavoriteCount, 0) * 2) AS RawEngagementScore,
+        'HighValue' AS SelectionType,
+        CASE
+            WHEN PHM.PostScore > 50 AND PHM.AnswerCount >= 5 THEN 'High Impact'
+            WHEN PHM.PostScore > 10 AND PHM.AnswerCount >= 1 THEN 'Medium Impact'
+            ELSE 'Low Impact'
+        END AS PostImpactCategory
+    FROM PostHistoricalMetrics PHM
+    LEFT JOIN TagAnalysis TA ON PHM.PostId = TA.PostId
+    WHERE (PHM.PostScore > 100 AND PHM.AnswerCount >= 3)
+       OR (PHM.FavoriteCount > 20)
+       OR (PHM.PostViewCount > 10000 AND PHM.AnswerCount > 0)
+    UNION ALL
+    SELECT
+        PHM.PostId,
+        PHM.PostTypeId,
+        PHM.OwnerUserId,
+        PHM.PostCreationDate,
+        PHM.PostScore,
+        PHM.PostViewCount,
+        PHM.AnswerCount,
+        PHM.FavoriteCount,
+        PHM.FirstClosedDate,
+        PHM.LastReopenedDate,
+        PHM.FirstEditDate,
+        PHM.EditCount,
+        PHM.InitialDayLongComments,
+        TA.NumberOfTags,
+        TA.HasDatabaseTag,
+        TA.HasProgrammingTag,
+        EXTRACT(EPOCH FROM (COALESCE(PHM.LastEditDate, PHM.PostCreationDate) - PHM.PostCreationDate)) / 3600 AS TimeToFirstEditHours,
+        (COALESCE(PHM.PostScore, 0) * 1.5 + COALESCE(PHM.PostViewCount, 0) / 10.0 + COALESCE(PHM.AnswerCount, 0) * 5 + COALESCE(PHM.FavoriteCount, 0) * 2) AS RawEngagementScore,
+        'ActiveOrControversial' AS SelectionType,
+        CASE
+            WHEN PHM.PostScore > 50 AND PHM.AnswerCount >= 5 THEN 'High Impact'
+            WHEN PHM.PostScore > 10 AND PHM.AnswerCount >= 1 THEN 'Medium Impact'
+            ELSE 'Low Impact'
+        END AS PostImpactCategory
+    FROM PostHistoricalMetrics PHM
+    LEFT JOIN TagAnalysis TA ON PHM.PostId = TA.PostId
+    WHERE PHM.LastEditDate > (DATE '2024-10-01' - INTERVAL '6 months')
+      AND (PHM.CloseEvents > 0 OR PHM.CommentCount > 15 OR PHM.InitialDayLongComments > 0)
+      AND NOT EXISTS (SELECT 1 FROM PostLinks PL WHERE PL.RelatedPostId = PHM.PostId AND PL.LinkTypeId = 3)
+),
+UserQuestionStats AS (
+    SELECT
+        QE.OwnerUserId AS UserId,
+        COUNT(DISTINCT QE.PostId) AS UserTotalQuestionsConsidered,
+        SUM(QE.RawEngagementScore) AS UserTotalEngagementScore,
+        AVG(QE.PostScore) AS UserAvgQuestionScore,
+        MAX(QE.PostViewCount) AS UserMaxQuestionViews,
+        MIN(QE.TimeToFirstEditHours) AS UserMinTimeToFirstEditHours,
+        COUNT(CASE WHEN QE.HasDatabaseTag = 1 THEN QE.PostId END) AS UserDatabaseQuestions,
+        COUNT(CASE WHEN QE.HasProgrammingTag = 1 THEN QE.PostId END) AS UserProgrammingQuestions,
+        RANK() OVER (PARTITION BY UE_Loc.UserLocationGroup ORDER BY SUM(QE.RawEngagementScore) DESC, COUNT(DISTINCT QE.PostId) DESC) AS RankByEngagementInLocation
+    FROM QuestionPerformance QE
+    JOIN Users U ON QE.OwnerUserId = U.Id
+    JOIN (
+        SELECT Id,
+               CASE
+                   WHEN Location IS NULL OR Location = '' THEN 'Unknown'
+                   WHEN LOWER(Location) LIKE '%us%' OR LOWER(Location) LIKE '%usa%' OR LOWER(Location) LIKE '%america%' THEN 'USA'
+                   WHEN LOWER(Location) LIKE '%india%' THEN 'India'
+                   WHEN LOWER(Location) LIKE '%europe%' OR LOWER(Location) LIKE '%uk%' OR LOWER(Location) LIKE '%germany%' OR LOWER(Location) LIKE '%france%' OR LOWER(Location) LIKE '%spain%' THEN 'Europe'
+                   WHEN LOWER(Location) LIKE '%canada%' THEN 'Canada'
+                   WHEN LOWER(Location) LIKE '%australia%' THEN 'Australia'
+                   ELSE 'Other'
+               END AS UserLocationGroup
+        FROM Users
+    ) UE_Loc ON U.Id = UE_Loc.Id
+    GROUP BY QE.OwnerUserId, UE_Loc.UserLocationGroup
+)
+SELECT
+    UE.Id AS UserId,
+    UE.DisplayName,
+    UES.Reputation,
+    UES.GoldBadges,
+    UES.TotalPosts,
+    UES.QuestionsPosted,
+    UES.AnswersPosted,
+    UES.TotalPostScore,
+    UES.TotalCommentScore,
+    UQS.UserTotalQuestionsConsidered,
+    UQS.UserTotalEngagementScore,
+    UQS.UserAvgQuestionScore,
+    UQS.UserMaxQuestionViews,
+    UQS.UserMinTimeToFirstEditHours,
+    UQS.UserDatabaseQuestions,
+    UQS.UserProgrammingQuestions,
+    UQS.RankByEngagementInLocation,
+    QP.PostId,
+    QP.PostCreationDate,
+    QP.PostScore,
+    QP.PostViewCount,
+    QP.AnswerCount,
+    QP.FavoriteCount,
+    QP.FirstClosedDate,
+    QP.LastReopenedDate,
+    QP.EditCount,
+    QP.TimeToFirstEditHours,
+    QP.InitialDayLongComments,
+    QP.NumberOfTags,
+    QP.HasDatabaseTag,
+    QP.HasProgrammingTag,
+    QP.PostImpactCategory,
+    QP.SelectionType,
+    PH_CR.Text AS LastCloseVoteUsers,
+    COALESCE(CLT.Name, 'NoCloseReason') AS DominantCloseReasonName,
+    LAG(QP.RawEngagementScore, 1, 0) OVER (PARTITION BY UE.Id ORDER BY QP.PostCreationDate) AS PreviousQuestionEngagementScore,
+    LEAD(QP.RawEngagementScore, 1, 0) OVER (PARTITION BY UE.Id ORDER BY QP.PostCreationDate) AS NextQuestionEngagementScore,
+    CASE
+        WHEN QP.FirstClosedDate IS NOT NULL AND QP.LastReopenedDate IS NULL
+             AND (EXTRACT(DAY FROM (DATE '2024-10-01' - QP.FirstClosedDate)) < 90) THEN 'RecentlyClosed_NotReopened'
+        WHEN QP.FirstClosedDate IS NOT NULL AND QP.LastReopenedDate IS NOT NULL
+             AND QP.FirstClosedDate < QP.LastReopenedDate
+             AND (EXTRACT(DAY FROM (QP.LastReopenedDate - QP.FirstClosedDate)) < 7) THEN 'QuicklyReopened'
+        WHEN QP.PostCreationDate < (DATE '2024-10-01' - INTERVAL '2 year')
+             AND QP.AnswerCount = 0 AND QP.PostViewCount > 5000 THEN 'OldUnansweredHighViews'
+        WHEN EXISTS (
+            SELECT 1 FROM PostLinks PL WHERE PL.PostId = QP.PostId AND PL.LinkTypeId = 3
+            AND PL.RelatedPostId IN (SELECT Q2.PostId FROM QuestionPerformance Q2 WHERE Q2.PostScore > QP.PostScore AND Q2.OwnerUserId <> QP.OwnerUserId)
+        ) THEN 'DuplicateOfHigherScoringOtherUserPost'
+        ELSE 'Normal'
+    END AS PostLifecycleStatus
+FROM Users UE
+JOIN UserEngagement UES ON UE.Id = UES.UserId
+LEFT JOIN UserQuestionStats UQS ON UE.Id = UQS.UserId
+LEFT JOIN QuestionPerformance QP ON UE.Id = QP.OwnerUserId
+LEFT JOIN PostHistory PH_CR ON QP.PostId = PH_CR.PostId
+    AND PH_CR.PostHistoryTypeId = 10
+    AND PH_CR.CreationDate = QP.FirstClosedDate
+LEFT JOIN CloseReasonTypes CLT ON CAST(PH_CR.Comment AS SMALLINT) = CLT.Id
+WHERE UES.Reputation > 20000
+  AND UES.GoldBadges >= 5
+  AND UES.QuestionsPosted >= 10
+  AND UQS.UserTotalQuestionsConsidered IS NOT NULL
+  AND QP.PostId IS NOT NULL
+  AND QP.PostScore > (
+        SELECT COALESCE(AVG(p2.Score), 0)
+        FROM Posts p2
+        WHERE p2.PostTypeId = 1
+          AND p2.CreationDate > (DATE '2024-10-01' - INTERVAL '1 year')
+      ) * 1.5
+  AND QP.TimeToFirstEditHours < 48
+  AND (QP.HasDatabaseTag = 1 OR QP.HasProgrammingTag = 1)
+  AND (
+        (QP.FirstClosedDate IS NOT NULL AND QP.LastReopenedDate IS NOT NULL AND QP.FirstClosedDate < QP.LastReopenedDate AND QP.EditCount > 2)
+        OR
+        (QP.FirstClosedDate IS NULL AND QP.PostCreationDate > (DATE '2024-10-01' - INTERVAL '1 year') AND QP.PostViewCount > 1000 AND QP.InitialDayLongComments > 0)
+        OR
+        (QP.PostImpactCategory = 'High Impact' AND QP.NumberOfTags >= 3)
+      )
+ORDER BY UES.Reputation DESC, UQS.RankByEngagementInLocation ASC, QP.RawEngagementScore DESC, QP.PostCreationDate DESC
+LIMIT 500;

@@ -1,0 +1,151 @@
+WITH
+RecentActivePosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.PostTypeId,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ParentId,
+    p.AcceptedAnswerId
+  FROM Posts p
+  WHERE p.LastActivityDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days'
+),
+TopAuthors AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.AccountId,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.LastAccessDate DESC) AS rn
+  FROM Users u
+  WHERE u.Reputation IS NOT NULL
+),
+TagHotness AS (
+  SELECT
+    t.TagName,
+    SUM(p.Score) AS ScoreSum,
+    COUNT(*) AS PostCount,
+    AVG(p.ViewCount) AS AvgViews
+  FROM Posts p
+  JOIN LATERAL (
+    SELECT trim(x) AS TagName
+    FROM unnest(string_to_array(p.Tags, '> <')) AS x
+  ) t ON TRUE
+  WHERE p.PostTypeId = 1
+  GROUP BY t.TagName
+),
+ExpandedLinks AS (
+  SELECT
+    pl.PostId,
+    pl.RelatedPostId,
+    pl.LinkTypeId,
+    lt.Name AS LinkTypeName
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+  WHERE pl.LinkTypeId IN (1, 3)
+),
+PostHistoryAgg AS (
+  SELECT
+    ph.PostId,
+    MAX(CASE WHEN pht.Name = 'Post Closed' THEN ph.CreationDate END) AS LastClosedDate,
+    MAX(CASE WHEN pht.Name = 'Post Reopened' THEN ph.CreationDate END) AS LastReopenedDate,
+    JSON_AGG(JSON_BUILD_OBJECT(
+      'type', pht.Name,
+      'date', ph.CreationDate,
+      'user', ph.UserDisplayName,
+      'comment', ph.Comment
+    )) AS HistoryEvents
+  FROM PostHistory ph
+  JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+  GROUP BY ph.PostId
+),
+Combined AS (
+  SELECT
+    rap.PostId,
+    rap.Title,
+    rap.Tags,
+    rap.CreationDate,
+    rap.LastActivityDate,
+    rap.Score,
+    rap.ViewCount,
+    rap.OwnerUserId,
+    rap.PostTypeId,
+    rap.AnswerCount,
+    rap.CommentCount,
+    rap.FavoriteCount,
+    rap.ParentId,
+    rap.AcceptedAnswerId,
+    bua.DisplayName AS OwnerName,
+    ROW_NUMBER() OVER (
+      PARTITION BY rap.PostTypeId
+      ORDER BY rap.Score DESC, rap.ViewCount DESC, rap.LastActivityDate DESC
+    ) AS rk
+  FROM RecentActivePosts rap
+  LEFT JOIN Users bua ON rap.OwnerUserId = bua.Id
+),
+FinalPreQualify AS (
+  SELECT
+    c.PostId,
+    c.Title,
+    c.Tags,
+    c.CreationDate,
+    c.LastActivityDate,
+    c.Score,
+    c.ViewCount,
+    c.OwnerUserId,
+    c.PostTypeId,
+    c.AnswerCount,
+    c.CommentCount,
+    c.FavoriteCount,
+    c.ParentId,
+    c.AcceptedAnswerId,
+    c.OwnerName,
+    ta.ScoreSum,
+    ta.PostCount,
+    ta.AvgViews,
+    bh.LastClosedDate,
+    bh.LastReopenedDate,
+    bh.HistoryEvents,
+    ei.rn AS top_rank,
+    ROW_NUMBER() OVER (
+      PARTITION BY c.PostTypeId
+      ORDER BY c.Score DESC, c.LastActivityDate DESC
+    ) AS row_num_per_type
+  FROM Combined c
+  LEFT JOIN TagHotness ta ON TRUE
+  LEFT JOIN PostHistoryAgg bh ON bh.PostId = c.PostId
+  LEFT JOIN TopAuthors ei ON ei.UserId = c.OwnerUserId
+  WHERE c.rk <= 100
+)
+SELECT
+  f.PostId,
+  f.Title,
+  f.Tags,
+  f.CreationDate,
+  f.LastActivityDate,
+  f.Score,
+  f.ViewCount,
+  f.OwnerName,
+  f.PostTypeId,
+  f.AnswerCount,
+  f.CommentCount,
+  f.FavoriteCount,
+  f.ParentId,
+  f.AcceptedAnswerId,
+  f.ScoreSum AS TagOverallScore,
+  f.PostCount AS TagPostCount,
+  f.AvgViews AS TagAvgViews,
+  f.LastClosedDate,
+  f.LastReopenedDate,
+  f.HistoryEvents
+FROM FinalPreQualify f
+WHERE f.row_num_per_type <= 5
+ORDER BY f.top_rank, f.LastActivityDate DESC;

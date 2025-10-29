@@ -1,0 +1,53 @@
+-- {"query": "1177.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 784} 
+
+WITH UserPostStats AS (
+    -- Summarizes user post and comment activity, including first/last activity dates
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(P.Score) AS TotalPostScore,
+        -- Calculate average body length only for actual questions or answers, handling potential NULLs
+        AVG(LENGTH(P.Body)) FILTER (WHERE P.PostTypeId IN (1, 2) AND P.Body IS NOT NULL) AS AvgPostBodyLength,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        MAX(P.CreationDate) AS LatestPostCreationDate,
+        MIN(P.CreationDate) AS EarliestPostCreationDate,
+        MAX(P.LastActivityDate) AS LatestPostActivityDate,
+        MAX(C.CreationDate) AS LatestCommentDate
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate
+    HAVING COUNT(DISTINCT P.Id) > 5 AND U.Reputation > 500
+),
+PostHistoryMetrics AS (
+    -- Gathers detailed historical data for posts, including edit counts, close/reopen dates, and specific flags
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.ClosedDate,
+        P.CommunityOwnedDate,
+        P.OwnerUserId,
+        COUNT(PH.Id) AS TotalHistoryEntries,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditCount,
+        COUNT(DISTINCT PH.UserId) AS UniqueEditors,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (10, 101) THEN PH.CreationDate ELSE NULL END) AS LastClosedDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (11) THEN PH.CreationDate ELSE NULL END) AS LastReopenedDate,
+        COALESCE(
+            (SELECT CR.Name FROM CloseReasonTypes CR WHERE CR.Id = CAST(PH_Close.Comment AS SMALLINT) LIMIT 1),
+            'Not Closed'
+        ) AS CurrentCloseReasonName, -- Correlated subquery for the latest close reason name
+        (SELECT COUNT(DISTINCT V.UserId) FROM Votes V WHERE V.PostId = P.Id AND V.VoteTypeId = 5 AND V.UserId IS NOT NULL) AS DistinctFavoritorsCount, -- Correlated subquery for distinct favoritors
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (17, 35, 36) THEN 1 ELSE 0 END) AS IsMigratedPost, -- Flag if the post was ever migrated
+        -- Calculate the time difference

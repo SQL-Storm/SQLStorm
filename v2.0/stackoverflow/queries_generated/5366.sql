@@ -1,0 +1,102 @@
+-- {"query": "5366.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 827} 
+WITH
+-- recent popular posts with complex scoring and tag normalization
+RecentQuestionScores AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.ViewCount,
+    p.Score,
+    p.OwnerUserId,
+    ARRAY_AGG(DISTINCT t.Name) AS TagNames,
+    COUNT(DISTINCT c.Id) AS CommentCount
+  FROM Posts p
+  LEFT JOIN UnnestTags(p.Tags) AS t ON TRUE
+  LEFT JOIN Comments c ON c.PostId = p.Id
+  WHERE p.PostTypeId = 1 -- questions
+    AND p.ClosedDate IS NULL
+  GROUP BY p.Id
+),
+-- correlate with recent edits per post to simulate churn
+PostEditActivity AS (
+  SELECT
+    p.Id AS PostId,
+    MAX(p.LastEditDate) AS LastEditDate,
+    COUNT(*) FILTER (WHERE ph.Id IS NOT NULL) AS RevisionCount
+  FROM Posts p
+  LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4,5,6,8,9,10,11,12,14,15,16,19,20,24)
+  WHERE p.PostTypeId = 1
+  GROUP BY p.Id
+),
+-- windowed ranking by combined score and recency
+Ranked AS (
+  SELECT
+    r.PostId,
+    r.Title,
+    r.TagNames,
+    r.CreationDate,
+    r.ViewCount,
+    r.Score,
+    r.OwnerUserId,
+    r.CommentCount,
+    e.LastEditDate,
+    e.RevisionCount,
+    ROW_NUMBER() OVER (
+      PARTITION BY r.OwnerUserId
+      ORDER BY
+        (r.ViewCount * 1.0 + GREATEST(r.Score, 0) * 10.0) / NULLIF(EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - r.CreationDate)) / 86400.0, 0.001) DESC,
+        r.CreationDate DESC
+    ) AS rn
+  FROM RecentQuestionScores r
+  LEFT JOIN PostEditActivity e ON e.PostId = r.PostId
+),
+-- heavy join back with user data and a few null-robust predicates
+Enriched AS (
+  SELECT
+    t.PostId,
+    t.Title,
+    t.TagNames,
+    t.CreationDate,
+    t.ViewCount,
+    t.Score,
+    u.Id AS UserId,
+    u.DisplayName AS UserName,
+    u.Reputation,
+    t.CommentCount,
+    t.LastEditDate,
+    t.RevisionCount
+  FROM Ranked t
+  LEFT JOIN Users u ON u.Id = t.OwnerUserId
+  WHERE t.rn <= 50
+),
+-- final complex predicate with NULL handling and string expressions
+Final AS (
+  SELECT
+    e.PostId,
+    e.Title,
+    COALESCE(array_to_string(e.TagNames, ', '), 'untagged') AS TagsList,
+    e.CreationDate,
+    e.ViewCount,
+    e.Score,
+    COALESCE(e.UserName, 'community') AS PostedBy,
+    e.Reputation,
+    e.CommentCount,
+    CASE
+      WHEN e.LastEditDate IS NULL THEN 'never edited'
+      ELSE TO_CHAR(e.LastEditDate, 'YYYY-MM-DD HH24:MI:SS')
+    END AS LastEditTimestamp,
+    e.RevisionCount,
+    -- a complicated computed boolean expression with NULLs
+    (CASE
+       WHEN e.Reputation > 1000 THEN true
+       WHEN e.Reputation IS NULL THEN NULL
+       ELSE false
+     END) AS IsPowerUser,
+    -- string manipulation: derive a short token from title
+    LOWER(SUBSTRING(e.Title FROM 1 FOR 12)) AS TitleToken
+  FROM Enriched e
+  ORDER BY e.Score DESC, e.ViewCount DESC, e.RevisionCount DESC
+)
+SELECT * FROM Final;

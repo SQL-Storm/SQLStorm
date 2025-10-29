@@ -1,0 +1,198 @@
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesReceivedOnPosts,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesReceivedOnPosts,
+        SUM(CASE WHEN V.VoteTypeId = 5 THEN 1 ELSE 0 END) AS TotalFavoritesReceivedOnPosts,
+        COALESCE(AVG(P.Score), 0) AS AvgPostScore,
+        SUM(CASE WHEN U.AccountId IS NULL THEN 1 ELSE 0 END) AS HasNullAccountId
+    FROM
+        Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Votes V ON P.Id = V.PostId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate
+),
+PostEngagementMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.CommentCount AS PostCommentCount,
+        P.FavoriteCount AS PostFavoriteCount,
+        P.LastActivityDate,
+        P.LastEditDate,
+        P.OwnerUserId,
+        P.Title,
+        P.Tags,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesCount,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesCount,
+        SUM(CASE WHEN V.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoriteVotesCount,
+        MAX(CASE WHEN P.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS HasAcceptedAnswer,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.Score DESC, P.CreationDate DESC) AS PostRankByOwnerScore,
+        DENSE_RANK() OVER (ORDER BY P.ViewCount DESC, P.Score DESC) AS GlobalViewRank
+    FROM
+        Posts P
+    LEFT JOIN Votes V ON P.Id = V.PostId
+    GROUP BY
+        P.Id, P.PostTypeId, P.CreationDate, P.Score, P.ViewCount, P.CommentCount, P.FavoriteCount, P.LastActivityDate, P.LastEditDate, P.OwnerUserId, P.Title, P.Tags
+),
+-- Replace PostgreSQL-specific UNNEST/STRING_TO_ARRAY with a more portable approach:
+-- split tags by parsing substrings between angle brackets using a recursive CTE
+TagPairs AS (
+    SELECT
+        P.Id AS PostId,
+        TRIM(SUBSTR(P.Tags, 2, LENGTH(P.Tags) - 2)) AS InnerTags
+    FROM Posts P
+    WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL AND LENGTH(TRIM(P.Tags)) > 2
+),
+TagSplit AS (
+    -- iterative splitting: extract first tag and the rest
+    SELECT
+        PostId,
+        -- first tag up to delimiter '><' or whole string if no delimiter
+        CASE
+            WHEN INSTR(InnerTags, '><') = 0 THEN InnerTags
+            ELSE SUBSTR(InnerTags, 1, INSTR(InnerTags, '><') - 1)
+        END AS TagName,
+        CASE
+            WHEN INSTR(InnerTags, '><') = 0 THEN NULL
+            ELSE SUBSTR(InnerTags, INSTR(InnerTags, '><') + 2)
+        END AS Remainder
+    FROM TagPairs
+    UNION ALL
+    SELECT
+        ts.PostId,
+        CASE
+            WHEN INSTR(ts.Remainder, '><') = 0 THEN ts.Remainder
+            ELSE SUBSTR(ts.Remainder, 1, INSTR(ts.Remainder, '><') - 1)
+        END AS TagName,
+        CASE
+            WHEN INSTR(ts.Remainder, '><') = 0 THEN NULL
+            ELSE SUBSTR(ts.Remainder, INSTR(ts.Remainder, '><') + 2)
+        END AS Remainder
+    FROM TagSplit ts
+    WHERE ts.Remainder IS NOT NULL AND ts.Remainder <> ''
+),
+TagPerformance AS (
+    SELECT
+        TRIM(TagName) AS TagName,
+        COUNT(DISTINCT P.Id) AS TotalQuestionsWithTag,
+        AVG(P.Score) AS AvgTagQuestionScore,
+        SUM(P.ViewCount) AS TotalTagViewCount,
+        COUNT(DISTINCT P.OwnerUserId) AS UniqueTagOwners
+    FROM
+        Posts P
+    JOIN TagSplit TS ON P.Id = TS.PostId
+    GROUP BY
+        TRIM(TagName)
+    HAVING
+        COUNT(DISTINCT P.Id) > 10
+),
+PostHistoryBodyDiffs AS (
+    SELECT
+        PH.PostId,
+        PH.CreationDate AS HistoryDate,
+        PH.Text AS CurrentBodyText,
+        LAG(PH.Text, 1, '') OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) AS PreviousBodyText,
+        LENGTH(PH.Text) - LENGTH(LAG(PH.Text, 1, '') OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate)) AS BodyLengthChange
+    FROM
+        PostHistory PH
+    WHERE
+        PH.PostHistoryTypeId IN (2, 5, 8)
+),
+HighlyEngagedPosts AS (
+    SELECT PostId FROM PostEngagementMetrics WHERE UpvotesCount > 50 AND PostCommentCount > 10
+),
+HighlyReputedUsers AS (
+    SELECT UserId FROM UserActivitySummary WHERE Reputation > 10000 AND TotalPosts > 50
+)
+SELECT
+    UAS.UserId,
+    UAS.DisplayName AS UserDisplayName,
+    UAS.Reputation,
+    UAS.TotalPosts,
+    UAS.TotalQuestions,
+    UAS.TotalAnswers,
+    UAS.TotalCommentsMade,
+    UAS.AvgPostScore,
+    UAS.TotalUpvotesReceivedOnPosts,
+    PEM.PostId,
+    PEM.Title AS PostTitle,
+    PEM.PostScore AS CurrentPostScore,
+    PEM.ViewCount AS CurrentPostViewCount,
+    PEM.UpvotesCount AS PostUpvoteCount,
+    PEM.DownvotesCount AS PostDownvoteCount,
+    PEM.PostFavoriteCount,
+    PEM.HasAcceptedAnswer,
+    PEM.PostRankByOwnerScore,
+    PEM.GlobalViewRank,
+    PHBD.BodyLengthChange AS LastBodyEditChange,
+    TP.TagName AS TopPerformingTag,
+    TP.AvgTagQuestionScore,
+    TP.TotalTagViewCount,
+    TP.UniqueTagOwners,
+    PL.RelatedPostId AS LinkedPostId,
+    LT.Name AS LinkTypeName,
+    CASE
+        WHEN UAS.Reputation > 10000 AND PEM.PostScore > 50 THEN 'High-Impact User & Post'
+        WHEN UAS.Reputation BETWEEN 1000 AND 10000 AND PEM.ViewCount > 5000 THEN 'Mid-Tier User, Popular Post'
+        WHEN UAS.HasNullAccountId > 0 THEN 'User with Missing Account Info'
+        ELSE 'Regular Activity'
+    END AS UserPostSegment,
+    (
+        SELECT
+            COUNT(DISTINCT PL_Inner.RelatedPostId)
+        FROM
+            PostLinks PL_Inner
+        INNER JOIN Posts P_Inner ON PL_Inner.RelatedPostId = P_Inner.Id
+        WHERE
+            PL_Inner.PostId = PEM.PostId
+            AND PL_Inner.LinkTypeId = (SELECT Id FROM LinkTypes WHERE Name = 'Duplicate' LIMIT 1)
+            AND P_Inner.Score > PEM.PostScore * 1.5
+            AND P_Inner.OwnerUserId IN (SELECT UserId FROM HighlyReputedUsers)
+    ) AS CountOfHigherScoringDuplicates,
+    (LENGTH(PEM.Title) * 100 +
+     LENGTH(REPLACE(LOWER(PEM.Title), 'how', '')) * 50 +
+     LENGTH(REPLACE(LOWER(PEM.Title), 'what', '')) * 25 +
+     COALESCE(NULLIF(LENGTH(REPLACE(LOWER(PEM.Title), '?', '')), LENGTH(LOWER(PEM.Title))), 0) * 10) AS TitleComplexityScore
+FROM
+    UserActivitySummary UAS
+INNER JOIN PostEngagementMetrics PEM ON UAS.UserId = PEM.OwnerUserId
+LEFT JOIN PostHistoryBodyDiffs PHBD ON PEM.PostId = PHBD.PostId
+LEFT JOIN PostLinks PL ON PEM.PostId = PL.PostId
+LEFT JOIN LinkTypes LT ON PL.LinkTypeId = LT.Id
+LEFT JOIN (
+    SELECT
+        TagName,
+        AvgTagQuestionScore,
+        TotalTagViewCount,
+        UniqueTagOwners,
+        ROW_NUMBER() OVER (ORDER BY AvgTagQuestionScore DESC, TotalTagViewCount DESC) AS TagRank
+    FROM TagPerformance
+) TP ON PEM.Tags LIKE '%' || '<' || TP.TagName || '>' || '%' AND TP.TagRank = 1
+WHERE
+    UAS.Reputation > 500
+    AND PEM.PostTypeId = 1
+    AND PEM.PostCreationDate BETWEEN DATE '2020-01-01' AND DATE '2022-12-31'
+    AND (
+        (PEM.ViewCount > 10000 AND PEM.UpvotesCount > 100)
+        OR (PEM.PostFavoriteCount > 50 AND PEM.PostCommentCount > 20)
+    )
+    AND UAS.DisplayName IS NOT NULL
+    AND PEM.PostId IN (SELECT PostId FROM HighlyEngagedPosts)
+ORDER BY
+    UAS.Reputation DESC,
+    PEM.GlobalViewRank ASC,
+    PHBD.BodyLengthChange DESC
+LIMIT 500;

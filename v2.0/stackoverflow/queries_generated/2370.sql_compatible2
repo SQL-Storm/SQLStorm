@@ -1,0 +1,182 @@
+with UserStats as (
+    select 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.Location,
+        coalesce(u.UpVotes,0) as UpVotes,
+        coalesce(u.DownVotes,0) as DownVotes,
+        count(distinct b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(distinct b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(distinct b.Id) filter (where b.Class = 3) as BronzeBadges,
+        row_number() over (order by u.Reputation desc, u.Id) as UserRank
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.Location, u.UpVotes, u.DownVotes
+), PostAnswers as (
+    select 
+        p.Id as AnswerId,
+        p.ParentId as QuestionId,
+        p.OwnerUserId,
+        p.Score,
+        p.CreationDate,
+        p.Body,
+        row_number() over (partition by p.ParentId order by p.Score desc, p.CreationDate) as AnswerRank,
+        count(*) over (partition by p.ParentId) as AnswerCountForQuestion
+    from Posts p
+    where p.PostTypeId = 2
+), QuestionInfo as (
+    select 
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.Tags,
+        q.AcceptedAnswerId,
+        q.AnswerCount,
+        q.FavoriteCount,
+        q.ClosedDate,
+        us.DisplayName as QuestionOwnerName,
+        us.Reputation as QuestionOwnerReputation,
+        array_remove(string_to_array(substring(q.Tags, 2, length(q.Tags)-2), '><'), '') as ParsedTags
+    from Posts q
+    left join Users us on us.Id = q.OwnerUserId
+    where q.PostTypeId = 1
+), ComplexPostRelations as (
+    select
+        qi.QuestionId,
+        qi.Title,
+        qi.QuestionOwnerName,
+        qi.QuestionOwnerReputation,
+        qi.CreationDate as QuestionCreation,
+        qi.Score as QuestionScore,
+        qi.ViewCount,
+        qi.FavoriteCount,
+        qi.AnswerCount,
+        pi.AnswerId,
+        pi.Score as AnswerScore,
+        pi.CreationDate as AnswerCreation,
+        pi.AnswerRank,
+        pi.AnswerCountForQuestion,
+        ua.DisplayName as AnswerOwnerName,
+        ua.Reputation as AnswerOwnerReputation,
+        (select count(*) from Comments c where c.PostId = qi.QuestionId) as QuestionCommentCount,
+        (select count(*) from Comments c where c.PostId = pi.AnswerId) as AnswerCommentCount,
+        coalesce(pl_link.Id, 0) as LinkedPostLinkId,
+        lt.Name as LinkTypeName,
+        linked_p.Id as LinkedPostId,
+        linked_p.PostTypeId as LinkedPostType,
+        qi.CreationDate, qi.Score, qi.ViewCount, qi.FavoriteCount, qi.AnswerCount, pi.AnswerId, pi.Score, pi.CreationDate, pi.AnswerRank, pi.AnswerCountForQuestion, ua.DisplayName, ua.Reputation
+    from QuestionInfo qi
+    left join PostAnswers pi on pi.QuestionId = qi.QuestionId
+    left join Users ua on ua.Id = pi.OwnerUserId
+    left join PostLinks pl_link on pl_link.PostId = qi.QuestionId and pl_link.RelatedPostId = pi.AnswerId
+    left join LinkTypes lt on lt.Id = pl_link.LinkTypeId
+    left join Posts linked_p on linked_p.Id = pl_link.RelatedPostId
+    where qi.ClosedDate is null
+), RankedQuestions as (
+    select
+        QuestionId,
+        Title,
+        QuestionOwnerName,
+        QuestionOwnerReputation,
+        CreationDate as QuestionCreation,
+        Score as QuestionScore,
+        ViewCount,
+        FavoriteCount,
+        AnswerCount,
+        dense_rank() over (order by Score desc, ViewCount desc, FavoriteCount desc) as ScoreRank
+    from QuestionInfo
+    where Score > 0 and ViewCount > 1000
+), BadgeAggregates as (
+    select 
+        UserId,
+        json_agg(json_build_object(
+            'BadgeName', Name,
+            'Class', Class,
+            'Date', Date
+        ) order by Date desc) as BadgesJson,
+        -- include a non-json grouping column to allow grouping by non-json equality (some engines require deterministic grouping)
+        min(Name) as _example_badge_name
+    from Badges
+    group by UserId
+)
+select
+    cq.QuestionId,
+    cq.Title,
+    cq.QuestionOwnerName,
+    cq.QuestionOwnerReputation,
+    cq.QuestionCreation,
+    cq.QuestionScore,
+    cq.ViewCount,
+    cq.FavoriteCount,
+    cq.AnswerCount,
+    cq.AnswerId,
+    cq.AnswerScore,
+    cq.AnswerCreation,
+    cq.AnswerRank,
+    cq.AnswerCountForQuestion,
+    cq.AnswerOwnerName,
+    cq.AnswerOwnerReputation,
+    cq.QuestionCommentCount,
+    cq.AnswerCommentCount,
+    cq.LinkedPostLinkId,
+    cq.LinkTypeName,
+    cq.LinkedPostId,
+    cq.LinkedPostType,
+    ua.UpVotes,
+    ua.DownVotes,
+    ba.BadgesJson,
+    us.UserRank,
+    case 
+        when cq.AnswerScore > (cq.QuestionScore * 0.75) then 'Highly rated answer'
+        when cq.AnswerScore between (cq.QuestionScore * 0.25) and (cq.QuestionScore * 0.75) then 'Moderately rated answer'
+        else 'Low rated answer'
+    end as AnswerRatingCategory
+from ComplexPostRelations cq
+left join UserStats ua on ua.DisplayName = cq.AnswerOwnerName
+left join BadgeAggregates ba on ba.UserId = ua.Id
+left join UserStats us on us.DisplayName = cq.QuestionOwnerName
+where cq.AnswerRank <= 3
+and cq.QuestionCreation > (cast('2024-10-01' as date) - interval '365 day')
+and (
+    (cq.AnswerScore > 10 and (cq.AnswerCommentCount > 2 or cq.QuestionCommentCount > 5))
+    or (cq.ViewCount > 10000 and cq.FavoriteCount > 10)
+)
+union
+select 
+    q.QuestionId,
+    q.Title,
+    q.QuestionOwnerName,
+    q.QuestionOwnerReputation,
+    q.QuestionCreation,
+    q.QuestionScore,
+    q.ViewCount,
+    q.FavoriteCount,
+    q.AnswerCount,
+    null as AnswerId,
+    null as AnswerScore,
+    null as AnswerCreation,
+    null as AnswerRank,
+    null as AnswerCountForQuestion,
+    null as AnswerOwnerName,
+    null as AnswerOwnerReputation, 
+    (select count(*) from Comments c where c.PostId = q.QuestionId) as QuestionCommentCount,
+    null as AnswerCommentCount,
+    0 as LinkedPostLinkId,
+    null as LinkTypeName,
+    null as LinkedPostId,
+    null as LinkedPostType,
+    us.UpVotes,
+    us.DownVotes,
+    ba.BadgesJson,
+    us.UserRank,
+    'No Answers' as AnswerRatingCategory
+from RankedQuestions q
+left join UserStats us on us.DisplayName = q.QuestionOwnerName
+left join BadgeAggregates ba on ba.UserId = us.Id
+where q.AnswerCount = 0
+order by QuestionScore desc, AnswerScore desc nulls last, ViewCount desc
+limit 100;

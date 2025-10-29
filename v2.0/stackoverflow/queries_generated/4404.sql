@@ -1,0 +1,115 @@
+-- {"query": "4404.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1125} 
+
+WITH RankedPosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    pt.Name AS PostTypeName,
+    COALESCE(p.AnswerCount, 0) AS AnswerCount,
+    COALESCE(p.CommentCount, 0) AS CommentCount,
+    ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS ScoreRank,
+    LAG(p.Score, 1, 0) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate) AS PreviousScore,
+    SUM(p.Score) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativeScore
+  FROM Posts AS p
+  JOIN PostTypes AS pt
+    ON p.PostTypeId = pt.Id
+  WHERE
+    p.Score > 5 AND p.CreationDate > '2023-01-01'
+), PostInteractionSummary AS (
+  SELECT
+    p.Id,
+    COUNT(c.Id) AS CommentCount,
+    COUNT(DISTINCT v.UserId) AS DistinctVoterCount,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount
+  FROM Posts AS p
+  LEFT JOIN Comments AS c
+    ON p.Id = c.PostId
+  LEFT JOIN Votes AS v
+    ON p.Id = v.PostId
+  GROUP BY
+    p.Id
+)
+SELECT
+  rp.PostId,
+  rp.PostTypeName,
+  u.DisplayName AS OwnerDisplayName,
+  rp.CreationDate,
+  rp.Score,
+  rp.ViewCount,
+  rp.AnswerCount,
+  rp.CommentCount AS PostHistoryCommentCount,
+  pis.CommentCount AS ActualCommentCount,
+  pis.UpVoteCount,
+  pis.DownVoteCount,
+  (rp.Score - pis.UpVoteCount + pis.DownVoteCount) AS NetScoreCalculation,
+  CASE
+    WHEN rp.ScoreRank <= 5 THEN 'Top 5 in Type'
+    WHEN rp.Score > 100 AND rp.AnswerCount > 10 THEN 'High Score & High Answers'
+    ELSE 'Standard Post'
+  END AS PostCategory,
+  CASE
+    WHEN u.Reputation > 10000 THEN 'High Reputation User'
+    WHEN u.Reputation BETWEEN 1000 AND 10000 THEN 'Medium Reputation User'
+    ELSE 'Low Reputation User'
+  END AS UserReputationLevel,
+  SUBSTRING(rp.PostTypeName, 1, 3) AS PostTypePrefix,
+  rp.ScoreRank,
+  rp.CumulativeScore,
+  ph.Comment AS LastEditComment,
+  CASE
+    WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 'Edit'
+    WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15) THEN 'ModerationAction'
+    ELSE 'Other'
+  END AS LastActionType
+FROM RankedPosts AS rp
+LEFT JOIN Users AS u
+  ON rp.OwnerUserId = u.Id
+LEFT JOIN PostInteractionSummary AS pis
+  ON rp.PostId = pis.Id
+LEFT JOIN PostHistory AS ph
+  ON rp.PostId = ph.PostId AND ph.CreationDate = (
+    SELECT
+      MAX(CreationDate)
+    FROM PostHistory
+    WHERE
+      PostId = rp.PostId AND PostHistoryTypeId IN (4, 5, 6, 10, 11, 12, 13, 14, 15)
+  )
+WHERE
+  rp.Score > 0 OR rp.AnswerCount > 0
+UNION
+SELECT
+  p.Id,
+  pt.Name,
+  u.DisplayName,
+  p.CreationDate,
+  p.Score,
+  p.ViewCount,
+  COALESCE(p.AnswerCount, 0),
+  COALESCE(p.CommentCount, 0),
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL
+FROM Posts AS p
+JOIN PostTypes AS pt
+  ON p.PostTypeId = pt.Id
+LEFT JOIN Users AS u
+  ON p.OwnerUserId = u.Id
+WHERE
+  p.Score < 0 AND p.CreationDate > '2023-01-01'
+ORDER BY
+  rp.Score DESC NULLS LAST,
+  rp.CreationDate DESC;

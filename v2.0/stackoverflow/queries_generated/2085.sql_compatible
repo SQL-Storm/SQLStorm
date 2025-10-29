@@ -1,0 +1,164 @@
+with RecursiveTagCounts as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        p.Id as PostId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags
+    from Tags t
+    left join Posts p on p.Tags like '%' || '<' || t.TagName || '>' || '%'
+    where p.PostTypeId = 1
+
+    union all
+
+    select
+        rt.Id,
+        rt.TagName,
+        rt.Count,
+        rt.IsModeratorOnly,
+        rt.IsRequired,
+        p2.Id,
+        p2.CreationDate,
+        p2.Score,
+        p2.ViewCount,
+        p2.Tags
+    from RecursiveTagCounts rt
+    join Posts p2 on p2.ParentId = rt.PostId and p2.PostTypeId = 2
+),
+UserEngagement as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct ph.PostId) filter (where ph.PostHistoryTypeId in (4,5,6)) as EditsMade,
+        count(distinct v.PostId) filter (where v.VoteTypeId = 2) as UpVotesMade,
+        count(distinct b.Id) as TotalBadges,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        first_value(u.Location) over (partition by u.Id order by u.LastAccessDate desc) as LocationLatestAccess
+    from Users u
+    left join PostHistory ph on ph.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.Location, u.LastAccessDate
+),
+QuestionAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionDate,
+        coalesce(a.AnswerCount,0) as AnswerCount,
+        coalesce(a.MaxScore,0) as MaxAnswerScore,
+        coalesce(a.TotalAnswerScore,0) as TotalAnswerScore,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        q.OwnerUserId,
+        q.AcceptedAnswerId
+    from Posts q
+    left join (
+        select
+            p.ParentId,
+            count(*) as AnswerCount,
+            max(p.Score) as MaxScore,
+            sum(p.Score) as TotalAnswerScore
+        from Posts p
+        where p.PostTypeId = 2
+        group by p.ParentId
+    ) a on a.ParentId = q.Id
+    where q.PostTypeId = 1
+),
+TopUsersByAnswerScore as (
+    select
+        u.Id,
+        u.DisplayName,
+        sum(coalesce(p.Score,0)) as TotalAnswerScore,
+        dense_rank() over (order by sum(coalesce(p.Score,0)) desc) as ScoreRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 2
+    group by u.Id, u.DisplayName
+    having sum(coalesce(p.Score,0)) is not null
+),
+UserAnswerDetails as (
+    select
+        p.Id as AnswerId,
+        p.ParentId as QuestionId,
+        p.OwnerUserId,
+        p.CreationDate as AnswerCreationDate,
+        p.Score as AnswerScore,
+        q.Score as QuestionScore,
+        u.DisplayName as AnswerOwner,
+        q.Title as QuestionTitle,
+        row_number() over (partition by p.ParentId order by p.Score desc, p.CreationDate asc) as AnswerRank,
+        case when q.AcceptedAnswerId = p.Id then 1 else 0 end as IsAccepted
+    from Posts p
+    join Posts q on q.Id = p.ParentId and q.PostTypeId = 1
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId = 2
+),
+PostsWithCloseStatus as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.Tags,
+        p.ClosedDate,
+        cr.Name as CloseReason,
+        ph.Comment as CloseReasonIdJson
+    from Posts p
+    left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 10
+    left join CloseReasonTypes cr on cast(ph.Comment as integer) = cr.Id
+    where p.PostTypeId = 1
+)
+select distinct
+    qas.QuestionId,
+    qas.Title as QuestionTitle,
+    qas.CreationDate as QuestionCreated,
+    qas.AnswerCount,
+    qas.MaxAnswerScore,
+    qas.TotalAnswerScore,
+    qas.QuestionScore,
+    qas.ViewCount,
+    qas.Tags,
+    u.DisplayName as QuestionOwner,
+    ua.AnswerId,
+    ua.AnswerScore,
+    ua.IsAccepted,
+    ua.AnswerRank,
+    ua.AnswerOwner,
+    pws.CloseReason,
+    ueg.EdtasMade,
+    ueg.UpVotesMade,
+    ueg.TotalBadges,
+    ueg.GoldBadges,
+    ueg.SilverBadges,
+    ueg.BronzeBadges,
+    ueg.LocationLatestAccess
+from QuestionAnswerStats qas
+left join Posts p on p.Id = qas.AcceptedAnswerId and p.PostTypeId = 2
+left join Users u on u.Id = qas.OwnerUserId
+left join UserAnswerDetails ua on ua.QuestionId = qas.QuestionId and ua.AnswerRank <= 3
+left join PostsWithCloseStatus pws on pws.Id = qas.QuestionId
+left join UserEngagement ueg on ueg.UserId = qas.OwnerUserId
+where qas.ViewCount > (
+    select avg(ViewCount) from Posts where PostTypeId = 1
+) and (
+    pws.CloseReason is null or pws.CloseReason = 'Off-topic'
+)
+and (
+    ua.AnswerScore is not null and ua.AnswerScore > (
+        select avg(Score) from Posts where PostTypeId = 2
+    )
+)
+order by qas.ViewCount desc, qas.QuestionScore desc, ua.AnswerScore desc
+limit 100;

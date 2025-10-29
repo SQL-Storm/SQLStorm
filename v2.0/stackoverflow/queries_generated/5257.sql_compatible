@@ -1,0 +1,135 @@
+WITH ranked_posts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.PostTypeId,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.Body,
+    p.ContentLicense,
+    COALESCE(u.Reputation, 0) AS UserReputation,
+    COALESCE(a.DisplayName, p.OwnerDisplayName) AS PostOwnerName,
+    ROW_NUMBER() OVER (
+      PARTITION BY p.OwnerUserId
+      ORDER BY p.CreationDate DESC
+    ) AS rn_owner
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Users a ON p.LastEditorUserId = a.Id
+  WHERE p.PostTypeId IN (1, 2)
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days'
+),
+recent_actions AS (
+  SELECT
+    ph.Id AS HistoryId,
+    ph.PostId,
+    ph.PostHistoryTypeId,
+    ph.UserId,
+    ph.CreationDate,
+    ph.Comment,
+    ph.Text,
+    ph.RevisionGUID,
+    ph.PostNoticeId,
+    NULL AS VotedForCloseReason,
+    ph.ContentLicense
+  FROM PostHistory ph
+  WHERE ph.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180 days'
+    AND ph.PostHistoryTypeId IN (10, 11, 16, 24, 52, 53)
+),
+tag_aggregates AS (
+  SELECT
+    t.Id AS TagId,
+    t.TagName,
+    t.Count,
+    t.IsModeratorOnly,
+    t.IsRequired
+  FROM Tags t
+  WHERE t.Count > 0
+),
+complex_filter AS (
+  SELECT
+    rp.PostId,
+    rp.Title,
+    rp.Tags,
+    rp.CreationDate,
+    rp.Score,
+    rp.ViewCount,
+    rp.UserReputation,
+    rp.PostOwnerName,
+    rp.LastActivityDate,
+    rp.PostTypeId,
+    rp.ParentId,
+    rp.AcceptedAnswerId,
+    rp.CommentCount,
+    rp.FavoriteCount,
+    rp.Body,
+    rp.ContentLicense,
+    rz.AverageTagRelevance
+  FROM ranked_posts rp
+  LEFT JOIN (
+    SELECT
+      t.TagName,
+      AVG(COALESCE(v.BountyAmount, 0)) AS AverageTagRelevance
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Id = t.WikiPostId
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    WHERE t.TagName IS NOT NULL
+    GROUP BY t.TagName
+  ) AS rz ON rz.TagName = (
+    -- extract first tag from rp.Tags which are like '<tag1><tag2>'
+    -- use standard SQL string functions: get substring between first '<' and first '>'
+    CASE
+      WHEN rp.Tags IS NULL THEN NULL
+      WHEN POSITION('>' IN rp.Tags) > 0 THEN
+        SUBSTRING(rp.Tags FROM 2 FOR (POSITION('>' IN rp.Tags) - 2))
+      ELSE rp.Tags
+    END
+  )
+  WHERE rp.rn_owner = 1
+    AND rp.Score > 0
+    AND rp.ViewCount > 100
+)
+SELECT
+  cp.PostId,
+  cp.Title,
+  cp.Tags,
+  cp.CreationDate,
+  cp.Score,
+  cp.ViewCount,
+  cp.UserReputation,
+  cp.PostOwnerName,
+  cp.LastActivityDate,
+  cp.PostTypeId,
+  cp.ParentId,
+  cp.AcceptedAnswerId,
+  cp.CommentCount,
+  cp.FavoriteCount,
+  cp.Body,
+  cp.ContentLicense,
+  COALESCE((
+    SELECT STRING_AGG(tag, ',')
+    FROM (
+      SELECT TRIM(BOTH '<' FROM TRIM(BOTH '>' FROM unnest(string_to_array(cp.Tags, '><')))) AS tag
+    ) t
+  ), '') AS TagList,
+  CASE
+    WHEN cp.PostTypeId = 1 THEN 'Question'
+    WHEN cp.PostTypeId = 2 THEN 'Answer'
+    ELSE 'Other'
+  END AS PostKind
+FROM complex_filter cp
+LEFT JOIN LATERAL (
+  SELECT AVG(v.BountyAmount) AS AverageBounty
+  FROM Votes v
+  WHERE v.PostId = cp.PostId
+) AS av ON TRUE
+ORDER BY cp.LastActivityDate DESC
+LIMIT 100;

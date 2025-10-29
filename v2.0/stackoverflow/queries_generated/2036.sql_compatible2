@@ -1,0 +1,213 @@
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 as Level,
+        array[t.TagName] as Path
+    from Tags t
+    where (t.IsModeratorOnly = false OR t.IsModeratorOnly = 0 OR t.IsModeratorOnly IS NULL) 
+      and (t.IsRequired = false OR t.IsRequired = 0 OR t.IsRequired IS NULL)
+    union all
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Level + 1,
+        r.Path || t.TagName
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id > r.Id and not t.TagName = any(r.Path)
+    where (t.IsModeratorOnly = false OR t.IsModeratorOnly = 0 OR t.IsModeratorOnly IS NULL)
+      and (t.IsRequired = false OR t.IsRequired = 0 OR t.IsRequired IS NULL)
+      and r.Level < 3
+),
+FilteredPosts as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.Tags,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.Title,
+        u.Reputation,
+        u.DisplayName as OwnerDisplayName,
+        u.UpVotes,
+        u.DownVotes,
+        case 
+            when p.ClosedDate is null then 'Open'
+            else 'Closed'
+        end as PostStatus,
+        row_number() over(partition by p.OwnerUserId order by p.Score desc, p.CreationDate desc) as rn
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId = 1 -- questions only
+      and p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '1 year'
+      and p.Score >= 0
+      and u.Reputation > 50
+),
+AcceptedAnswerInfo as (
+    select
+        p.Id as QuestionId,
+        a.Id as AcceptedAnswerId,
+        a.Score as AcceptedAnswerScore,
+        a.CreationDate as AcceptedAnswerCreationDate,
+        a.OwnerUserId as AnswerOwnerUserId,
+        u.DisplayName as AnswerOwnerDisplayName
+    from Posts p
+    left join Posts a on p.AcceptedAnswerId = a.Id
+    left join Users u on a.OwnerUserId = u.Id
+    where p.PostTypeId = 1 and a.PostTypeId = 2
+),
+UserBadgeStats as (
+    select 
+        b.UserId,
+        count(case when b.Class = 1 then 1 end) as GoldBadges,
+        count(case when b.Class = 2 then 1 end) as SilverBadges,
+        count(case when b.Class = 3 then 1 end) as BronzeBadges,
+        count(*) as TotalBadges
+    from Badges b
+    group by b.UserId
+),
+PostCommentStats as (
+    select 
+        p.Id as PostId,
+        count(c.Id) as CommentCount,
+        max(c.Score) as MaxCommentScore,
+        max(c.CreationDate) as LastCommentDate
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+    group by p.Id
+),
+TopPostsWithDetails as (
+    select
+        fp.Id,
+        fp.Title,
+        fp.CreationDate,
+        fp.Score,
+        fp.ViewCount,
+        fp.AnswerCount,
+        fp.FavoriteCount,
+        fp.PostStatus,
+        fp.OwnerUserId,
+        fp.OwnerDisplayName,
+        fp.Reputation,
+        fp.UpVotes,
+        fp.DownVotes,
+        abi.AcceptedAnswerId,
+        abi.AcceptedAnswerScore,
+        abi.AcceptedAnswerCreationDate,
+        abi.AnswerOwnerUserId,
+        abi.AnswerOwnerDisplayName,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ub.TotalBadges,
+        pcs.CommentCount,
+        pcs.MaxCommentScore,
+        pcs.LastCommentDate,
+        (fp.Score * 1.5 + fp.ViewCount * 0.01 + fp.AnswerCount * 2.0 + fp.FavoriteCount * 3.0 + coalesce(ub.GoldBadges,0) * 10 + coalesce(ub.SilverBadges,0) * 5 + coalesce(ub.BronzeBadges,0) * 1 + coalesce(pcs.CommentCount,0) * 1.2) as EngagementScore,
+        regexp_replace(split_part(fp.Tags, '><', 1), '[<>]', '', 'g') as FirstTag
+    from FilteredPosts fp
+    left join AcceptedAnswerInfo abi on abi.QuestionId = fp.Id
+    left join UserBadgeStats ub on ub.UserId = fp.OwnerUserId
+    left join PostCommentStats pcs on pcs.PostId = fp.Id
+    where fp.rn <= 10
+),
+QuestionsWithDuplicates as (
+    select
+        pl.PostId as DuplicateQuestionId,
+        pl.RelatedPostId as OriginalQuestionId,
+        orig.Title as OriginalTitle,
+        dup.Title as DuplicateTitle,
+        pl.CreationDate as LinkCreationDate
+    from PostLinks pl
+    join Posts orig on pl.RelatedPostId = orig.Id and orig.PostTypeId = 1
+    join Posts dup on pl.PostId = dup.Id and dup.PostTypeId = 1
+    where pl.LinkTypeId = 3 -- Duplicate link type
+),
+RecentEdits AS (
+    select
+        ph.PostId,
+        ph.UserId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        p.Title,
+        u.DisplayName as EditorName,
+        row_number() over (partition by ph.PostId order by ph.CreationDate desc) as rn
+    from PostHistory ph
+    join Posts p on p.Id = ph.PostId
+    left join Users u on u.Id = ph.UserId
+    where ph.PostHistoryTypeId in (4,5,6) -- Title, Body, Tags edits
+      and ph.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 months'
+),
+AggregatedUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) as QuestionCount,
+        count(distinct a.Id) as AnswerCount,
+        max(p.Score) as MaxQuestionScore,
+        max(a.Score) as MaxAnswerScore,
+        sum(coalesce(vt_counts.UpVotes,0)) as TotalUpVotes,
+        sum(coalesce(vt_counts.DownVotes,0)) as TotalDownVotes,
+        case when u.LastAccessDate > cast('2024-10-01 12:34:56' as timestamp) - interval '30 days' then 1 else 0 end as ActiveLast30Days
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 1
+    left join Posts a on a.OwnerUserId = u.Id and a.PostTypeId = 2
+    left join (
+        select
+            v.UserId,
+            sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+            sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes
+        from Votes v
+        join VoteTypes vt on v.VoteTypeId = vt.Id
+        group by v.UserId
+    ) vt_counts on vt_counts.UserId = u.Id
+    group by u.Id, u.DisplayName, u.LastAccessDate
+)
+select
+    tpd.Id,
+    tpd.Title,
+    tpd.FirstTag,
+    tpd.CreationDate,
+    tpd.Score,
+    tpd.ViewCount,
+    tpd.AnswerCount,
+    tpd.FavoriteCount,
+    tpd.PostStatus,
+    tpd.OwnerUserId,
+    tpd.OwnerDisplayName,
+    tpd.Reputation,
+    tpd.UpVotes,
+    tpd.DownVotes,
+    tpd.GoldBadges,
+    tpd.SilverBadges,
+    tpd.BronzeBadges,
+    tpd.TotalBadges,
+    tpd.CommentCount,
+    tpd.MaxCommentScore,
+    tpd.LastCommentDate,
+    tpd.EngagementScore,
+    qd.OriginalQuestionId,
+    qd.OriginalTitle,
+    qd.LinkCreationDate as DuplicateLinkCreatedAt,
+    re.EditorName as LastEditor,
+    re.CreationDate as LastEditDate,
+    aua.QuestionCount as OwnerQuestionCount,
+    aua.AnswerCount as OwnerAnswerCount,
+    aua.MaxQuestionScore as OwnerMaxQuestionScore,
+    aua.MaxAnswerScore as OwnerMaxAnswerScore,
+    aua.TotalUpVotes as OwnerTotalUpVotes,
+    aua.TotalDownVotes as OwnerTotalDownVotes,
+    aua.ActiveLast30Days as OwnerActiveRecently
+from TopPostsWithDetails tpd
+left join QuestionsWithDuplicates qd on qd.DuplicateQuestionId = tpd.Id
+left join RecentEdits re on re.PostId = tpd.Id and re.rn = 1
+left join AggregatedUserActivity aua on aua.UserId = tpd.OwnerUserId
+order by tpd.EngagementScore desc, tpd.Score desc, tpd.CreationDate desc
+limit 50;

@@ -1,0 +1,103 @@
+-- {"query": "4043.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1082} 
+
+WITH RankedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        pt.Name AS PostTypeName,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn_desc,
+        RANK() OVER (ORDER BY p.Score DESC) AS rnk_score
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.Score > 10
+),
+UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount
+    FROM Users u
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate < DATE('now', '-1 year')
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING u.Reputation > 5000 OR COUNT(DISTINCT c.Id) > 50
+),
+HighScoringAnswers AS (
+    SELECT
+        pr.ParentId,
+        COUNT(pr.Id) AS HighScoringAnswerCount,
+        AVG(pr.Score) AS AvgHighScoringAnswerScore
+    FROM Posts pr
+    WHERE pr.PostTypeId = 2 AND pr.Score > 5
+    GROUP BY pr.ParentId
+)
+SELECT
+    rp.PostId,
+    rp.Title,
+    rp.PostTypeName,
+    ue.DisplayName AS OwnerDisplayName,
+    ue.Reputation,
+    ue.CommentCount,
+    ue.UpVoteCount,
+    ue.DownVoteCount,
+    ue.BadgeCount,
+    hsa.HighScoringAnswerCount,
+    hsa.AvgHighScoringAnswerScore,
+    CASE
+        WHEN rp.rn_desc <= 5 THEN 'Recent High Scorer'
+        WHEN rp.rnk_score <= 100 THEN 'Top Rated Post'
+        ELSE 'Other'
+    END AS PostCategory,
+    LENGTH(rp.Title) AS TitleLength,
+    COALESCE(rp.ViewCount, 0) AS Views,
+    CASE WHEN rp.OwnerUserId IS NULL THEN 'Community Owned' ELSE 'User Owned' END AS OwnershipType,
+    rp.CreationDate AS PostCreationDate,
+    ue.CreationDate AS UserCreationDate
+FROM RankedPosts rp
+JOIN UserEngagement ue ON rp.OwnerUserId = ue.UserId
+LEFT JOIN HighScoringAnswers hsa ON rp.PostId = hsa.ParentId
+WHERE rp.PostTypeName = 'Question'
+  AND rp.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = (SELECT Id FROM PostTypes WHERE Name = 'Question'))
+  AND ue.DisplayName IS NOT NULL
+  AND ue.DisplayName LIKE 'A%'
+  AND COALESCE(ue.Location, 'Unknown') != 'Unknown'
+UNION ALL
+SELECT
+    rp.PostId,
+    rp.Title,
+    rp.PostTypeName,
+    ue.DisplayName AS OwnerDisplayName,
+    ue.Reputation,
+    ue.CommentCount,
+    ue.UpVoteCount,
+    ue.DownVoteCount,
+    ue.BadgeCount,
+    hsa.HighScoringAnswerCount,
+    hsa.AvgHighScoringAnswerScore,
+    CASE
+        WHEN rp.rn_desc <= 5 THEN 'Recent High Scorer'
+        WHEN rp.rnk_score <= 100 THEN 'Top Rated Post'
+        ELSE 'Other'
+    END AS PostCategory,
+    LENGTH(rp.Title) AS TitleLength,
+    COALESCE(rp.ViewCount, 0) AS Views,
+    CASE WHEN rp.OwnerUserId IS NULL THEN 'Community Owned' ELSE 'User Owned' END AS OwnershipType,
+    rp.CreationDate AS PostCreationDate,
+    ue.CreationDate AS UserCreationDate
+FROM RankedPosts rp
+JOIN UserEngagement ue ON rp.OwnerUserId = ue.UserId
+LEFT JOIN HighScoringAnswers hsa ON rp.PostId = hsa.ParentId
+WHERE rp.PostTypeName = 'Answer'
+  AND rp.Score > 1
+  AND ue.Reputation BETWEEN 1000 AND 10000
+ORDER BY PostCreationDate DESC
+LIMIT 50;

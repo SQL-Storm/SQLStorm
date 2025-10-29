@@ -1,0 +1,416 @@
+with
+-- Capture recent active users with window stats
+recent_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.location,
+    u.websiteurl,
+    coalesce(nullif(trim(lower(u.location)), ''), 'unknown') as norm_location,
+    date_trunc('month', u.creationdate) as created_month,
+    count(*) over (partition by coalesce(nullif(trim(lower(u.location)), ''), 'unknown')) as users_per_location,
+    row_number() over (partition by coalesce(nullif(trim(lower(u.location)), ''), 'unknown') order by u.reputation desc, u.id) as rn_loc_rep
+  from users u
+  where u.creationdate >= (select date_trunc('year', max(creationdate)) - interval '3 years' from users)
+),
+-- Posts for these users, with classification and tag array
+user_posts as (
+  select
+    p.id as post_id,
+    p.owneruserid as user_id,
+    p.posttypeid,
+    p.creationdate,
+    p.lastactivitydate,
+    p.score,
+    p.viewcount,
+    p.answercount,
+    p.commentcount,
+    p.favoritecount,
+    p.closeddate,
+    p.title,
+    p.tags,
+    case p.posttypeid when 1 then 'Question' when 2 then 'Answer' else 'Other' end as post_kind,
+    string_to_array(substring(p.tags, 2, greatest(length(p.tags)-2,0)), '><') as tag_list
+  from posts p
+  where p.owneruserid in (select user_id from recent_users)
+),
+-- Aggregate votes per post with window distributions
+post_votes as (
+  select
+    v.postid,
+    count(*) filter (where v.votetypeid = 2) as upvotes,
+    count(*) filter (where v.votetypeid = 3) as downvotes,
+    count(*) filter (where v.votetypeid in (8,9)) as bounty_events,
+    sum(v.bountyamount) filter (where v.votetypeid in (8,9)) as bounty_total,
+    max(v.creationdate) as last_vote_at
+  from votes v
+  where v.postid in (select post_id from user_posts)
+  group by v.postid
+),
+-- Comment engagement
+post_comments as (
+  select
+    c.postid,
+    count(*) as comments,
+    max(c.creationdate) as last_comment_at,
+    sum(case when c.score >= 5 then 1 else 0 end) as hot_comments
+  from comments c
+  where c.postid in (select post_id from user_posts)
+  group by c.postid
+),
+-- Badge rollups for users
+user_badges as (
+  select
+    b.userid as user_id,
+    count(*) as total_badges,
+    count(*) filter (where b.class = 1) as gold_badges,
+    count(*) filter (where b.class = 2) as silver_badges,
+    count(*) filter (where b.class = 3) as bronze_badges,
+    count(*) filter (where b.tagbased = true) as tag_badges,
+    max(b.date) as last_badge_at
+  from badges b
+  where b.userid in (select user_id from recent_users)
+  group by b.userid
+),
+-- Parse tag list into rows
+post_tags as (
+  select
+    up.post_id,
+    unnest(up.tag_list) as tagname
+  from user_posts up
+  where up.posttypeid = 1
+),
+-- Join tag metadata (optional outer)
+post_tag_meta as (
+  select
+    pt.post_id,
+    t.tagname,
+    t.count as tag_usage_global,
+    t.ismoderaTORonly as mod_only,
+    t.isrequired as is_required
+  from post_tags pt
+  left join tags t on lower(t.tagname) = lower(pt.tagname)
+),
+-- Post link information for duplicates and links
+post_links as (
+  select
+    pl.postid,
+    count(*) filter (where pl.linktypeid = 3) as dup_links,
+    count(*) filter (where pl.linktypeid = 1) as related_links,
+    max(pl.creationdate) as last_link_at
+  from postlinks pl
+  where pl.postid in (select post_id from user_posts)
+  group by pl.postid
+),
+-- Post history metrics including close reasons
+post_history_rollup as (
+  select
+    ph.postid,
+    count(*) filter (where ph.posthistorytypeid in (10)) as close_events,
+    count(*) filter (where ph.posthistorytypeid in (11)) as reopen_events,
+    count(*) filter (where ph.posthistorytypeid in (12)) as delete_events,
+    count(*) filter (where ph.posthistorytypeid in (13)) as undelete_events,
+    max(ph.creationdate) filter (where ph.posthistorytypeid in (10,11,12,13)) as last_moderation_at,
+    -- extract close reason numeric if possible
+    max(
+      nullif(regexp_replace(coalesce(ph.comment,''), '[^0-9]', '', 'g'), '')
+    ) as close_reason_code_text
+  from posthistory ph
+  where ph.postid in (select post_id from user_posts)
+  group by ph.postid
+),
+-- Close reason names mapped from extracted codes
+post_close_reasons as (
+  select
+    phr.postid,
+    crt.name as close_reason_name
+  from post_history_rollup phr
+  left join closerreasontypes crt
+    on cast(crt.id as text) = phr.close_reason_code_text
+),
+-- Compute per-user aggregates with window functions
+user_post_agg as (
+  select
+    up.user_id,
+    count(*) as posts_total,
+    count(*) filter (where up.posttypeid = 1) as questions_total,
+    count(*) filter (where up.posttypeid = 2) as answers_total,
+    sum(coalesce(up.score,0)) as score_total,
+    avg(nullif(up.score,0)) filter (where up.score is not null) as avg_score_nonzero,
+    sum(coalesce(up.viewcount,0)) as views_total,
+    max(up.lastactivitydate) as last_activity_at,
+    sum(case when up.closeddate is not null then 1 else 0 end) as closed_posts,
+    count(distinct up.title) filter (where up.posttypeid = 1 and up.title is not null) as distinct_titles,
+    percentile_cont(0.9) within group (order by coalesce(up.viewcount,0)) as p90_views
+  from user_posts up
+  group by up.user_id
+),
+-- Build a denormalized per-post view with all optional joins
+post_denorm as (
+  select
+    up.post_id,
+    up.user_id,
+    up.post_kind,
+    up.creationdate,
+    up.lastactivitydate,
+    up.score,
+    up.viewcount,
+    up.answercount,
+    up.commentcount,
+    up.favoritecount,
+    up.closeddate,
+    pv.upvotes,
+    pv.downvotes,
+    pv.bounty_events,
+    pv.bounty_total,
+    pv.last_vote_at,
+    pc.comments,
+    pc.last_comment_at,
+    pc.hot_comments,
+    pl.dup_links,
+    pl.related_links,
+    pl.last_link_at,
+    phr.close_events,
+    phr.reopen_events,
+    phr.delete_events,
+    phr.undelete_events,
+    phr.last_moderation_at,
+    pcr.close_reason_name,
+    -- composite engagement score (cast to bigint using standard SQL cast)
+    cast(
+      (
+        coalesce(up.score,0) * 3
+        + coalesce(pv.upvotes,0) * 2
+        - coalesce(pv.downvotes,0) * 2
+        + coalesce(pc.comments,0)
+        + least(coalesce(up.viewcount,0)/100, 100)
+        + coalesce(pl.related_links,0)
+        - coalesce(pl.dup_links,0) * 3
+        + coalesce(pv.bounty_events,0) * 5
+      ) as bigint
+    ) as engagement_score
+  from user_posts up
+  left join post_votes pv on pv.postid = up.post_id
+  left join post_comments pc on pc.postid = up.post_id
+  left join post_links pl on pl.postid = up.post_id
+  left join post_history_rollup phr on phr.postid = up.post_id
+  left join post_close_reasons pcr on pcr.postid = up.post_id
+),
+-- Rank posts per user by engagement with ties
+post_ranks as (
+  select
+    pd.post_id,
+    pd.user_id,
+    pd.post_kind,
+    pd.creationdate,
+    pd.lastactivitydate,
+    pd.score,
+    pd.viewcount,
+    pd.answercount,
+    pd.commentcount,
+    pd.favoritecount,
+    pd.closeddate,
+    pd.upvotes,
+    pd.downvotes,
+    pd.bounty_events,
+    pd.bounty_total,
+    pd.last_vote_at,
+    pd.comments,
+    pd.last_comment_at,
+    pd.hot_comments,
+    pd.dup_links,
+    pd.related_links,
+    pd.last_link_at,
+    pd.close_events,
+    pd.reopen_events,
+    pd.delete_events,
+    pd.undelete_events,
+    pd.last_moderation_at,
+    pd.close_reason_name,
+    pd.engagement_score,
+    dense_rank() over (partition by pd.user_id order by pd.engagement_score desc nulls last, pd.post_id) as rank_by_user
+  from post_denorm pd
+),
+-- Identify tag specialties per user (top 3 tags by appearance in questions)
+user_tag_specialties as (
+  select user_id, tagname, tag_usage_global,
+         row_number() over (partition by user_id order by count(*) desc, coalesce(tag_usage_global,0) desc, lower(tagname)) as rn
+  from (
+    select up.user_id, ptm.tagname, max(ptm.tag_usage_global) as tag_usage_global
+    from user_posts up
+    join post_tag_meta ptm on ptm.post_id = up.post_id
+    group by up.user_id, ptm.tagname
+  ) s
+  group by user_id, tagname, tag_usage_global
+),
+-- Build a compact string of top tags
+user_top_tags as (
+  select
+    uts.user_id,
+    string_agg(uts.tagname, ', ' order by uts.rn) as top_tags
+  from user_tag_specialties uts
+  where uts.rn <= 3
+  group by uts.user_id
+),
+-- Compute cross-user percentiles for engagement and scores
+user_scoring as (
+  select
+    ua.user_id,
+    ua.posts_total,
+    ua.questions_total,
+    ua.answers_total,
+    ua.score_total,
+    ua.avg_score_nonzero,
+    ua.views_total,
+    ua.last_activity_at,
+    ua.closed_posts,
+    ua.p90_views,
+    percentile_disc(0.9) within group (order by ua.score_total) over () as global_p90_score,
+    percentile_disc(0.9) within group (order by ua.views_total) over () as global_p90_views
+  from user_post_agg ua
+),
+-- Combine everything per user with location-based windows
+user_summary as (
+  select
+    ru.user_id,
+    ru.displayname,
+    ru.reputation,
+    ru.creationdate,
+    ru.norm_location,
+    ru.users_per_location,
+    ru.rn_loc_rep,
+    us.posts_total,
+    us.questions_total,
+    us.answers_total,
+    us.score_total,
+    us.avg_score_nonzero,
+    us.views_total,
+    us.last_activity_at,
+    us.closed_posts,
+    us.p90_views,
+    ut.top_tags,
+    case
+      when us.score_total >= us.global_p90_score and us.views_total >= us.global_p90_views then 'Elite'
+      when us.score_total >= us.global_p90_score then 'High-Score'
+      when us.views_total >= us.global_p90_views then 'High-Views'
+      else 'Regular'
+    end as cohort
+  from recent_users ru
+  left join user_scoring us on us.user_id = ru.user_id
+  left join user_top_tags ut on ut.user_id = ru.user_id
+),
+-- Pick top N posts per user, but ensure at least 1 even if all NULL scores
+top_posts_per_user as (
+  select pr.*
+  from post_ranks pr
+  where pr.rank_by_user <= 5
+),
+-- Build a fallback for users with no posts
+users_no_posts as (
+  select us.user_id
+  from user_summary us
+  left join user_post_agg ua on ua.user_id = us.user_id
+  where coalesce(ua.posts_total,0) = 0
+)
+select
+  us.user_id,
+  us.displayname,
+  us.reputation,
+  us.norm_location,
+  us.users_per_location,
+  us.rn_loc_rep,
+  us.cohort,
+  us.posts_total,
+  us.questions_total,
+  us.answers_total,
+  us.score_total,
+  us.avg_score_nonzero,
+  us.views_total,
+  us.p90_views,
+  coalesce(us.top_tags, '(none)') as top_tags,
+  tp.post_id,
+  tp.post_kind,
+  tp.creationdate as post_created_at,
+  tp.lastactivitydate as post_last_activity_at,
+  tp.score as post_score,
+  tp.viewcount as post_views,
+  tp.answercount as post_answers,
+  tp.commentcount as post_comments,
+  tp.favoritecount as post_favorites,
+  tp.closeddate as post_closed_at,
+  tp.upvotes,
+  tp.downvotes,
+  tp.bounty_events,
+  tp.bounty_total,
+  tp.last_vote_at,
+  tp.comments as comments_count,
+  tp.last_comment_at,
+  tp.hot_comments,
+  tp.dup_links,
+  tp.related_links,
+  tp.last_link_at,
+  tp.close_events,
+  tp.reopen_events,
+  tp.delete_events,
+  tp.undelete_events,
+  tp.last_moderation_at,
+  coalesce(tp.close_reason_name, '(n/a)') as close_reason_name,
+  tp.engagement_score,
+  dense_rank() over (order by coalesce(us.reputation,0) desc, us.user_id) as global_user_rank
+from user_summary us
+left join top_posts_per_user tp on tp.user_id = us.user_id
+-- Include users with no posts as rows with NULL post fields
+union all
+select
+  us.user_id,
+  us.displayname,
+  us.reputation,
+  us.norm_location,
+  us.users_per_location,
+  us.rn_loc_rep,
+  us.cohort,
+  us.posts_total,
+  us.questions_total,
+  us.answers_total,
+  us.score_total,
+  us.avg_score_nonzero,
+  us.views_total,
+  us.p90_views,
+  coalesce(us.top_tags, '(none)') as top_tags,
+  cast(null as integer) as post_id,
+  cast(null as varchar) as post_kind,
+  cast(null as timestamp) as post_created_at,
+  cast(null as timestamp) as post_last_activity_at,
+  cast(null as integer) as post_score,
+  cast(null as integer) as post_views,
+  cast(null as integer) as post_answers,
+  cast(null as integer) as post_comments,
+  cast(null as integer) as post_favorites,
+  cast(null as timestamp) as post_closed_at,
+  cast(null as integer) as upvotes,
+  cast(null as integer) as downvotes,
+  cast(null as integer) as bounty_events,
+  cast(null as integer) as bounty_total,
+  cast(null as timestamp) as last_vote_at,
+  cast(null as integer) as comments_count,
+  cast(null as timestamp) as last_comment_at,
+  cast(null as integer) as hot_comments,
+  cast(null as integer) as dup_links,
+  cast(null as integer) as related_links,
+  cast(null as timestamp) as last_link_at,
+  cast(null as integer) as close_events,
+  cast(null as integer) as reopen_events,
+  cast(null as integer) as delete_events,
+  cast(null as integer) as undelete_events,
+  cast(null as timestamp) as last_moderation_at,
+  cast(null as varchar) as close_reason_name,
+  cast(null as bigint) as engagement_score,
+  dense_rank() over (order by coalesce(us.reputation,0) desc, us.user_id) as global_user_rank
+from user_summary us
+join users_no_posts unp on unp.user_id = us.user_id
+order by
+  global_user_rank,
+  us.user_id,
+  post_id nulls last;

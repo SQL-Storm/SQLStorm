@@ -1,0 +1,146 @@
+WITH split_tags AS (
+  SELECT
+    p.Id AS PostId,
+    TRIM(BOTH '<' FROM TRIM(BOTH '>' FROM p.Tags)) AS tags_str
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+tags_exploded AS (
+  SELECT
+    PostId,
+    CASE
+      WHEN tags_str = '' THEN NULL
+      ELSE
+        CASE WHEN POSITION('><' IN tags_str) = 0 THEN tags_str
+             ELSE SUBSTRING(tags_str FROM 1 FOR POSITION('><' IN tags_str) - 1)
+        END
+    END AS tag,
+    CASE
+      WHEN tags_str = '' THEN ''
+      WHEN POSITION('><' IN tags_str) = 0 THEN ''
+      ELSE SUBSTRING(tags_str FROM POSITION('><' IN tags_str) + 2)
+    END AS rest,
+    1 AS lvl
+  FROM split_tags
+  UNION ALL
+  SELECT
+    PostId,
+    CASE
+      WHEN rest = '' THEN NULL
+      ELSE
+        CASE WHEN POSITION('><' IN rest) = 0 THEN rest
+             ELSE SUBSTRING(rest FROM 1 FOR POSITION('><' IN rest) - 1)
+        END
+    END AS tag,
+    CASE
+      WHEN rest = '' THEN ''
+      WHEN POSITION('><' IN rest) = 0 THEN ''
+      ELSE SUBSTRING(rest FROM POSITION('><' IN rest) + 2)
+    END AS rest,
+    lvl + 1
+  FROM tags_exploded
+  WHERE rest <> ''
+),
+recent_top_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.ViewCount,
+    p.Score,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.Tags,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC, p.CreationDate ASC) AS rn_owner
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.ClosedDate IS NULL
+),
+tag_stats AS (
+  SELECT
+    te.tag AS tag,
+    COUNT(DISTINCT p.Id) AS questions_with_tag,
+    MAX(p.Score) AS max_score_for_tag,
+    AVG(p.ViewCount) AS avg_views_per_tag
+  FROM tags_exploded te
+  JOIN Posts p ON p.Id = te.PostId
+  WHERE te.tag IS NOT NULL
+    AND p.PostTypeId = 1
+  GROUP BY te.tag
+),
+complex_derived AS (
+  SELECT
+    r.PostId,
+    r.Title,
+    r.ViewCount,
+    r.Score,
+    r.CreationDate,
+    r.OwnerUserId,
+    r.Tags,
+    t.tag,
+    t.questions_with_tag,
+    t.max_score_for_tag,
+    t.avg_views_per_tag,
+    CASE
+      WHEN r.ViewCount > 1000 THEN 'Heavy'
+      WHEN r.ViewCount > 100 THEN 'Medium'
+      ELSE 'Light'
+    END AS popularity_bucket,
+    CASE
+      WHEN r.Score >= 10 THEN TRUE
+      ELSE FALSE
+    END AS highly_scored
+  FROM recent_top_questions r
+  LEFT JOIN tag_stats t
+    ON EXISTS (
+      SELECT 1 FROM tags_exploded te2 WHERE te2.PostId = r.PostId AND te2.tag = t.tag
+    )
+  WHERE r.rn_owner = 1
+),
+activity_window AS (
+  SELECT
+    c.PostId,
+    c.Title,
+    c.ViewCount,
+    c.Score,
+    c.CreationDate,
+    c.OwnerUserId,
+    c.Tags,
+    c.tag,
+    c.questions_with_tag,
+    c.max_score_for_tag,
+    c.avg_views_per_tag,
+    c.popularity_bucket,
+    c.highly_scored,
+    LAG(c.ViewCount) OVER (PARTITION BY c.OwnerUserId ORDER BY c.CreationDate) AS prev_views,
+    LEAD(c.ViewCount) OVER (PARTITION BY c.OwnerUserId ORDER BY c.CreationDate) AS next_views,
+    EXTRACT(EPOCH FROM (LEAD(c.CreationDate) OVER (PARTITION BY c.OwnerUserId ORDER BY c.CreationDate) - c.CreationDate)) AS seconds_to_next
+  FROM complex_derived c
+),
+final_select AS (
+  SELECT
+    a.PostId,
+    a.Title,
+    a.OwnerUserId,
+    u.DisplayName AS OwnerDisplayName,
+    a.ViewCount,
+    a.Score,
+    a.CreationDate,
+    a.Tags,
+    a.popularity_bucket,
+    a.highly_scored,
+    a.max_score_for_tag,
+    a.avg_views_per_tag,
+    a.seconds_to_next,
+    a.prev_views,
+    a.next_views
+  FROM activity_window a
+  LEFT JOIN Users u ON u.Id = a.OwnerUserId
+  WHERE a.popularity_bucket IS NOT NULL
+    AND a.highly_scored = TRUE
+  ORDER BY a.Score DESC NULLS LAST, a.ViewCount DESC NULLS LAST
+  LIMIT 200
+)
+SELECT *
+FROM final_select
+OFFSET 0 ROWS
+FETCH NEXT 200 ROWS ONLY;

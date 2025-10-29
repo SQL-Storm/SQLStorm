@@ -1,0 +1,146 @@
+-- {"query": "5143.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 920} 
+WITH
+RecentActivePosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.LastActivityDate,
+    p.PostTypeId,
+    p.AcceptedAnswerId,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ParentId,
+    p.Body,
+    p.LastEditorUserId,
+    p.LastEditDate,
+    p.ContentLicense
+  FROM Posts p
+  WHERE p.CreationDate >= now() - interval '180 days'
+),
+TopTags AS (
+  SELECT
+    unnest(string_to_array(substr(p.Tags, 2, length(p.Tags)-2), '><')) AS TagName
+  FROM Posts p
+  WHERE p.Tags IS NOT NULL
+  GROUP BY p.Tags
+  ORDER BY count(*) DESC
+  LIMIT 100
+),
+TagScore AS (
+  SELECT
+    t.TagName,
+    SUM(p.Score) AS TotalScore,
+    AVG(p.Score) AS AvgScore,
+    MAX(p.ViewCount) AS MaxViews,
+    MIN(p.ViewCount) AS MinViews
+  FROM TopTags t
+  JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+  GROUP BY t.TagName
+),
+CorrelatedUsers AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.Location,
+    u.AboutMe,
+    u.ProfileImageUrl,
+    u.EmailHash
+  FROM Users u
+  WHERE u.Reputation > 1000
+),
+RecentComments AS (
+  SELECT
+    c.Id AS CommentId,
+    c.PostId,
+    c.UserId,
+    c.UserDisplayName,
+    c.Text,
+    c.CreationDate,
+    c.Score,
+    c.ContentLicense
+  FROM Comments c
+  JOIN RecentActivePosts rap ON rap.PostId = c.PostId
+  WHERE c.CreationDate >= now() - interval '90 days'
+),
+PostHistorySummary AS (
+  SELECT
+    ph.PostId,
+    ph.PostHistoryTypeId,
+    ph.CreationDate,
+    ph.UserId,
+    ph.Comment,
+    ph.Text
+  FROM PostHistory ph
+  WHERE ph.CreationDate >= now() - interval '365 days'
+),
+Combined AS (
+  SELECT
+    rap.PostId,
+    rap.Title,
+    rap.CreationDate AS PostCreation,
+    rap.LastActivityDate,
+    rap.Score,
+    rap.ViewCount,
+    rap.Tags,
+    rap.OwnerUserId,
+    rap.Body,
+    pc.Name AS PostTypeName,
+    ta.TagName,
+    ts.TotalScore,
+    ts.AvgScore,
+    ts.MaxViews,
+    ts.MinViews,
+    ru.UserId AS ResponderUserId,
+    cu.DisplayName AS ResponderName,
+    rc.CommentId AS CommentId,
+    rc.Text AS CommentText,
+    rh.PostId AS HistoryPostId,
+    rh.PostHistoryTypeId,
+    rh.CreationDate AS HistoryDate,
+    rh.UserId AS HistoryUserId
+  FROM RecentActivePosts rap
+  LEFT JOIN PostTypes pc ON rap.PostTypeId = pc.Id
+  LEFT JOIN TagScore ts ON ts.TagName = substring(rap.Tags, 2, length(rap.Tags)-2)
+  LEFT JOIN TopTags ta ON ta.TagName = ts.TagName
+  LEFT JOIN CorrelatedUsers ru ON rap.OwnerUserId = ru.UserId
+  LEFT JOIN Comments cr ON cr.PostId = rap.PostId
+  LEFT JOIN RecentComments rc ON rc.CommentId = cr.Id
+  LEFT JOIN PostHistory rh ON rh.PostId = rap.PostId
+)
+SELECT
+  PostId,
+  Title,
+  PostCreation,
+  LastActivityDate,
+  Score,
+  ViewCount,
+  Tags,
+  OwnerUserId,
+  Body,
+  PostTypeName,
+  COALESCE(TagName, 'Untagged') AS PrimaryTag,
+  TotalScore,
+  AvgScore,
+  MaxViews,
+  MinViews,
+  ResponderUserId,
+  ResponderName,
+  CommentId,
+  CommentText,
+  HistoryPostId,
+  HistoryDate,
+  HistoryUserId
+FROM Combined
+ORDER BY LastActivityDate DESC, Score DESC
+LIMIT 200;

@@ -1,0 +1,128 @@
+-- {"query": "5704.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 918} 
+WITH
+RecentActivePosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.LastEditorUserId,
+    p.LastEditDate
+  FROM Posts p
+  WHERE p.CreationDate >= NOW() - INTERVAL '30 days'
+),
+TopTags AS (
+  SELECT
+    unnest(string_to_array(substr(p.Tags, 2, length(p.Tags) - 2), '><')) AS tag
+  FROM Posts p
+  JOIN RecentActivePosts rap ON rap.PostId = p.Id
+  WHERE p.PostTypeId = 1
+),
+TagScores AS (
+  SELECT
+    t.tag,
+    count(*) AS post_count,
+    sum(p.Score) AS total_score,
+    avg(p.Score) AS avg_score
+  FROM TopTags t
+  JOIN Posts p ON p.Tags LIKE '%' || t.tag || '%'
+  WHERE p.PostTypeId = 1
+  GROUP BY t.tag
+  ORDER BY total_score DESC
+  LIMIT 20
+),
+CommunityInfluence AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.UpVotes,
+    u.DownVotes,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.WebsiteUrl,
+    u.AccountId,
+    COALESCE(b.Class, 0) AS BadgeClass,
+    MAX(b.Date) OVER (PARTITION BY u.Id) AS LastBadgeDate
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  WHERE u.AccountId IS NOT NULL
+),
+ActivityWindow AS (
+  SELECT
+    p.Id AS PostId,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.ViewCount,
+    p.Score,
+    p.AnswerCount,
+    p.CommentCount,
+    COUNT(c.Id) OVER (PARTITION BY p.Id) AS CommentCountFromComments
+  FROM Posts p
+  LEFT JOIN Comments c ON c.PostId = p.Id
+  WHERE p.LastActivityDate >= NOW() - INTERVAL '14 days'
+),
+CorrelationAndStats AS (
+  SELECT
+    rp.PostId,
+    rp.OwnerUserId,
+    rp.CreationDate,
+    rp.LastActivityDate,
+    rp.Score,
+    rp.ViewCount,
+    rp.AnswerCount,
+    rp.CommentCount,
+    ROW_NUMBER() OVER (PARTITION BY rp.OwnerUserId ORDER BY rp.LastActivityDate DESC) AS RankByOwner
+  FROM RecentActivePosts rp
+)
+SELECT
+  rap.PostId,
+  rap.PostTypeId,
+  rap.Title,
+  rap.Tags,
+  rap.OwnerUserId,
+  cu.DisplayName AS OwnerName,
+  cu.Reputation,
+  cu.LastBadgeDate,
+  cu.BadgeClass,
+  aw.LastActivityDate AS ActivityDate,
+  aw.ViewCount,
+  aw.Score,
+  aw.AnswerCount,
+  aw.CommentCount,
+  vc.post_count AS TagPostCount,
+  ts.total_score AS TagTotalScore,
+  ts.avg_score AS TagAvgScore,
+  CASE
+    WHEN rap.Score IS NULL THEN 0
+    ELSE rap.Score * 1.0 / NULLIF(aw.ViewCount, 0)
+  END AS ScorePerView,
+  CASE
+    WHEN rap.LastEditorUserId IS NOT NULL THEN rap.LastEditorDisplayName
+    ELSE rap.OwnerDisplayName
+  END AS EditorOrOwner
+FROM RecentActivePosts rap
+LEFT JOIN CommunityInfluence cu ON cu.UserId = rap.OwnerUserId
+LEFT JOIN ActivityWindow aw ON aw.PostId = rap.Id
+LEFT JOIN TagScores ts ON ts.tag = ANY(string_to_array(substr(rap.Tags, 2, length(rap.Tags) - 2), '><'))
+LEFT JOIN LATERAL (SELECT p.Tags FROM Posts p WHERE p.Id = rap.Id) t ON true
+LEFT JOIN (
+  SELECT tag, count(*) AS post_count
+  FROM TopTags
+  GROUP BY tag
+) vc ON true
+ORDER BY rap.LastActivityDate DESC, rap.Score DESC
+LIMIT 100;

@@ -1,0 +1,290 @@
+WITH UserEngagementSummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.Views AS UserViews,
+        U.UpVotes AS UserUpVotes,
+        U.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        COUNT(CASE WHEN B.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN B.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN B.Class = 3 THEN 1 END) AS BronzeBadges,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT V.Id) AS TotalVotesCast,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesCast,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesCast,
+        AVG(CASE WHEN P.PostTypeId = 1 THEN P.Score END) AS AvgQuestionScoreOwned,
+        AVG(CASE WHEN P.PostTypeId = 2 THEN P.Score END) AS AvgAnswerScoreOwned,
+        MAX(U.LastAccessDate) AS LastUserActivity
+    FROM Users U
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Votes V ON U.Id = V.UserId
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.Views, U.UpVotes, U.DownVotes, U.LastAccessDate
+),
+QuestionMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.CreationDate AS PostCreationDate,
+        P.LastEditDate,
+        P.LastActivityDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.OwnerUserId,
+        P.Title,
+        P.Tags,
+        P.AcceptedAnswerId,
+        P.ClosedDate,
+        COALESCE(COUNT(PH.Id), 0) AS TotalHistoryEvents,
+        COALESCE(COUNT(DISTINCT PH.UserId), 0) AS DistinctEditors,
+        COALESCE(SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END), 0) AS EditCount,
+        COALESCE(SUM(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END), 0) AS CloseVoteCount,
+        (
+            SELECT AVG(
+                EXTRACT(EPOCH FROM (
+                    LEAD(PH_Inner.CreationDate) OVER (ORDER BY PH_Inner.CreationDate) - PH_Inner.CreationDate
+                ))
+            )
+            FROM PostHistory PH_Inner
+            WHERE PH_Inner.PostId = P.Id AND PH_Inner.PostHistoryTypeId IN (4, 5, 6)
+        ) AS AvgTimeBetweenEditsSeconds,
+        (
+            SELECT COUNT(DISTINCT C.UserId)
+            FROM Comments C
+            WHERE C.PostId = P.Id
+              AND C.CreationDate <= P.CreationDate + INTERVAL '24 hours'
+        ) AS UsersCommentingInFirstDay,
+        (
+            SELECT A.Id
+            FROM Posts A
+            WHERE A.ParentId = P.Id
+            ORDER BY A.Score DESC, A.CreationDate ASC
+            LIMIT 1
+        ) AS TopAnswerId,
+        COALESCE(COUNT(DISTINCT PL_Linked.Id), 0) AS LinkedPostCount,
+        COALESCE(COUNT(DISTINCT PL_Duplicated.Id), 0) AS DuplicatePostCount,
+        P.LastActivityDate,
+        P.AcceptedAnswerId,
+        P.OwnerUserId
+    FROM Posts P
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    LEFT JOIN PostLinks PL_Linked ON P.Id = PL_Linked.PostId AND PL_Linked.LinkTypeId = 1
+    LEFT JOIN PostLinks PL_Duplicated ON P.Id = PL_Duplicated.PostId AND PL_Duplicated.LinkTypeId = 3
+    WHERE P.PostTypeId = 1
+    GROUP BY
+        P.Id, P.PostTypeId, P.CreationDate, P.LastEditDate, P.LastActivityDate, P.Score,
+        P.ViewCount, P.AnswerCount, P.CommentCount, P.FavoriteCount, P.OwnerUserId,
+        P.Title, P.Tags, P.AcceptedAnswerId, P.ClosedDate
+),
+TagAnalysis AS (
+    SELECT
+        PostId,
+        TRIM(UNNEST(string_to_array(SUBSTRING(Tags FROM 2 FOR LENGTH(Tags) - 2), '><'))) AS TagName
+    FROM Posts
+    WHERE Tags IS NOT NULL AND PostTypeId = 1
+),
+AggregatedTagMetrics AS (
+    SELECT
+        TA.TagName,
+        COUNT(DISTINCT TA.PostId) AS QuestionsWithTag,
+        AVG(QM.PostScore) AS AvgScoreForTag,
+        AVG(QM.ViewCount) AS AvgViewCountForTag,
+        SUM(QM.AnswerCount) AS TotalAnswersForTag,
+        SUM(QM.CommentCount) AS TotalCommentsForTag
+    FROM TagAnalysis TA
+    JOIN QuestionMetrics QM ON TA.PostId = QM.PostId
+    GROUP BY TA.TagName
+),
+OwnerRunningPostStats AS (
+    SELECT
+        P.OwnerUserId AS UserId,
+        P.Id AS PostId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        AVG(P.Score) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate) AS OwnerCumulativeAvgQuestionScore
+    FROM Posts P
+    WHERE P.PostTypeId = 1 AND P.OwnerUserId IS NOT NULL
+),
+BaseQueryResults AS (
+    SELECT
+        Q.PostId,
+        Q.Title,
+        Q.PostCreationDate,
+        Q.PostScore,
+        Q.ViewCount,
+        Q.AnswerCount,
+        Q.FavoriteCount,
+        Q.ClosedDate,
+        UES.DisplayName AS OwnerDisplayName,
+        UES.Reputation AS OwnerReputation,
+        UES.GoldBadges AS OwnerGoldBadges,
+        UES.TotalCommentsMade AS OwnerTotalCommentsMade,
+        Q.TotalHistoryEvents,
+        Q.DistinctEditors,
+        Q.EditCount,
+        Q.CloseVoteCount,
+        COALESCE(Q.AvgTimeBetweenEditsSeconds, 0) AS AvgTimeBetweenEditsSeconds,
+        Q.UsersCommentingInFirstDay,
+        Q.LinkedPostCount,
+        Q.DuplicatePostCount,
+        P_TopAnswer.Score AS TopAnswerScore,
+        P_TopAnswer.CreationDate AS TopAnswerCreationDate,
+        COALESCE(P_TopAnswer.OwnerDisplayName, 'Community') AS TopAnswerOwnerDisplayName,
+        REPLACE(REPLACE(REPLACE(Q.Tags, '>', ', '), '<', ''), ', ,', ',') AS FormattedTags,
+        (
+            (Q.PostScore * 0.5) +
+            (Q.ViewCount * 0.01) +
+            (Q.AnswerCount * 2) +
+            (Q.FavoriteCount * 3) +
+            (Q.EditCount * 0.8) +
+            (Q.UsersCommentingInFirstDay * 1.5) +
+            (UES.Reputation * 0.001) +
+            COALESCE(ORS.OwnerCumulativeAvgQuestionScore * 0.1, 0)
+        ) AS CombinedActivityScore,
+        RANK() OVER (ORDER BY (
+            (Q.PostScore * 0.5) +
+            (Q.ViewCount * 0.01) +
+            (Q.AnswerCount * 2) +
+            (Q.FavoriteCount * 3) +
+            (Q.EditCount * 0.8) +
+            (Q.UsersCommentingInFirstDay * 1.5) +
+            (UES.Reputation * 0.001) +
+            COALESCE(ORS.OwnerCumulativeAvgQuestionScore * 0.1, 0)
+        ) DESC, Q.PostCreationDate ASC) AS ActivityRank,
+        ORS.OwnerCumulativeAvgQuestionScore,
+        CASE
+            WHEN Q.ClosedDate IS NOT NULL AND Q.PostScore < 0 THEN 'Closed & Downvoted'
+            WHEN Q.ClosedDate IS NOT NULL AND Q.PostScore >= 0 THEN 'Closed & Not Negatively Scored'
+            WHEN Q.AcceptedAnswerId IS NOT NULL AND Q.AnswerCount > 0 THEN 'Open with Accepted Answer'
+            WHEN Q.AcceptedAnswerId IS NULL AND Q.AnswerCount > 0 THEN 'Open with Answers (No Accepted)'
+            ELSE 'Open & Unanswered'
+        END AS PostStatusClassification,
+        ATM_CommonTag.AvgScoreForTag AS CommonTagAvgScore,
+        ATM_CommonTag.QuestionsWithTag AS CommonTagQuestionCount,
+        (
+            SELECT COUNT(V.UserId)
+            FROM Votes V
+            WHERE V.PostId = Q.PostId
+              AND V.VoteTypeId = 5
+              AND V.CreationDate BETWEEN Q.PostCreationDate AND COALESCE(Q.LastActivityDate, TIMESTAMP '2024-10-01 12:34:56')
+        ) AS HistoricalFavoritesCount,
+        Q.LastActivityDate,
+        Q.OwnerUserId,
+        Q.PostTypeId
+    FROM QuestionMetrics Q
+    LEFT JOIN UserEngagementSummary UES ON Q.OwnerUserId = UES.UserId
+    LEFT JOIN Posts P_TopAnswer ON Q.TopAnswerId = P_TopAnswer.Id
+    LEFT JOIN OwnerRunningPostStats ORS ON Q.PostId = ORS.PostId AND Q.OwnerUserId = ORS.UserId
+    LEFT JOIN LATERAL (
+        SELECT TA_L.TagName, ATM.AvgScoreForTag, ATM.QuestionsWithTag
+        FROM TagAnalysis TA_L
+        JOIN AggregatedTagMetrics ATM ON TA_L.TagName = ATM.TagName
+        WHERE TA_L.PostId = Q.PostId
+        ORDER BY ATM.QuestionsWithTag DESC, ATM.AvgScoreForTag DESC
+        LIMIT 1
+    ) AS ATM_CommonTag ON TRUE
+    WHERE
+        Q.PostTypeId = 1
+        AND Q.PostScore > -5
+        AND Q.ViewCount > 100
+        AND Q.LastActivityDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '3 years'
+        AND (
+            Q.EditCount > 2 OR
+            Q.AnswerCount > 1 OR
+            Q.FavoriteCount > 0 OR
+            UES.Reputation > 10000
+        )
+        AND UES.DisplayName IS NOT NULL
+        AND UPPER(Q.Title) LIKE '%SQL%'
+)
+SELECT *
+FROM (
+    SELECT
+        PostId,
+        Title,
+        PostCreationDate,
+        PostScore,
+        ViewCount,
+        AnswerCount,
+        FavoriteCount,
+        ClosedDate,
+        OwnerDisplayName,
+        OwnerReputation,
+        OwnerGoldBadges,
+        OwnerTotalCommentsMade,
+        TotalHistoryEvents,
+        DistinctEditors,
+        EditCount,
+        CloseVoteCount,
+        AvgTimeBetweenEditsSeconds,
+        UsersCommentingInFirstDay,
+        LinkedPostCount,
+        DuplicatePostCount,
+        TopAnswerScore,
+        TopAnswerCreationDate,
+        TopAnswerOwnerDisplayName,
+        FormattedTags,
+        CombinedActivityScore,
+        ActivityRank,
+        OwnerCumulativeAvgQuestionScore,
+        PostStatusClassification,
+        CommonTagAvgScore,
+        CommonTagQuestionCount,
+        HistoricalFavoritesCount,
+        'Open Question' AS QuerySegment,
+        CombinedActivityScore AS ord_score,
+        ActivityRank AS ord_rank
+    FROM BaseQueryResults
+    WHERE ClosedDate IS NULL
+    ORDER BY CombinedActivityScore DESC, ActivityRank ASC
+    LIMIT 50
+
+    UNION ALL
+
+    SELECT
+        PostId,
+        Title,
+        PostCreationDate,
+        PostScore,
+        ViewCount,
+        AnswerCount,
+        FavoriteCount,
+        ClosedDate,
+        OwnerDisplayName,
+        OwnerReputation,
+        OwnerGoldBadges,
+        OwnerTotalCommentsMade,
+        TotalHistoryEvents,
+        DistinctEditors,
+        EditCount,
+        CloseVoteCount,
+        AvgTimeBetweenEditsSeconds,
+        UsersCommentingInFirstDay,
+        LinkedPostCount,
+        DuplicatePostCount,
+        TopAnswerScore,
+        TopAnswerCreationDate,
+        TopAnswerOwnerDisplayName,
+        FormattedTags,
+        CombinedActivityScore,
+        ActivityRank,
+        OwnerCumulativeAvgQuestionScore,
+        PostStatusClassification,
+        CommonTagAvgScore,
+        CommonTagQuestionCount,
+        HistoricalFavoritesCount,
+        'Recently Closed Question' AS QuerySegment,
+        CombinedActivityScore AS ord_score,
+        ActivityRank AS ord_rank
+    FROM BaseQueryResults
+    WHERE ClosedDate IS NOT NULL AND ClosedDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year'
+    ORDER BY CombinedActivityScore DESC, ActivityRank ASC
+    LIMIT 50
+) AS unioned
+ORDER BY ord_score DESC, ord_rank ASC;

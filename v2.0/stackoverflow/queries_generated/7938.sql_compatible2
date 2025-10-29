@@ -1,0 +1,235 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        ROW_NUMBER() OVER (ORDER BY u.Views DESC) AS ViewRank,
+        NTILE(10) OVER (ORDER BY u.Reputation) AS ReputationDecile
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostMetrics AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CommentCount,
+        p.AnswerCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            WHEN p.PostTypeId = 4 THEN 'TagWikiExcerpt'
+            WHEN p.PostTypeId = 5 THEN 'TagWiki'
+            ELSE 'Other'
+        END AS PostTypeDescription,
+        COALESCE(p.Tags, 'No Tags') AS Tags,
+        CASE 
+            WHEN p.Score > 100 THEN 'Highly Voted'
+            WHEN p.Score > 50 THEN 'Moderately Voted'
+            WHEN p.Score > 0 THEN 'Slightly Voted'
+            ELSE 'No Votes'
+        END AS VoteCategory,
+        CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate)) / 86400 AS INTEGER) AS DaysOld,
+        CASE 
+            WHEN p.AnswerCount > 0 AND p.AcceptedAnswerId IS NOT NULL THEN 'Answered with Accepted'
+            WHEN p.AnswerCount > 0 THEN 'Answered'
+            ELSE 'Unanswered'
+        END AS AnswerStatus,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS ScoreRankInType,
+        RANK() OVER (ORDER BY p.ViewCount DESC) AS ViewRank,
+        DENSE_RANK() OVER (ORDER BY p.CreationDate DESC) AS FreshnessRank
+    FROM Posts p
+    WHERE p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 years')
+),
+TopPosts AS (
+    SELECT 
+        pm.PostId,
+        pm.Title,
+        pm.Score,
+        pm.ViewCount,
+        pm.CommentCount,
+        pm.AnswerCount,
+        pm.PostTypeDescription,
+        pm.VoteCategory,
+        pm.DaysOld,
+        pm.AnswerStatus,
+        pm.ScoreRankInType,
+        pm.ViewRank,
+        us.DisplayName AS AuthorName,
+        us.Reputation AS AuthorReputation,
+        us.ReputationRank AS AuthorReputationRank,
+        us.ViewRank AS AuthorViewRank,
+        CASE 
+            WHEN pm.Score > 100 THEN 1
+            ELSE 0
+        END AS IsHighlyVoted,
+        CASE 
+            WHEN pm.ViewCount > 1000 THEN 1
+            ELSE 0
+        END AS IsHighlyViewed,
+        CASE 
+            WHEN pm.AnswerCount > 10 THEN 1
+            ELSE 0
+        END AS HasManyAnswers,
+        pm.CreationDate,
+        pm.OwnerUserId,
+        pm.PostTypeId
+    FROM PostMetrics pm
+    JOIN UserStats us ON pm.OwnerUserId = us.UserId
+    WHERE pm.ScoreRankInType <= 50 OR pm.ViewRank <= 50
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        COUNT(DISTINCT c.Id) AS Comments,
+        COUNT(DISTINCT v.Id) AS Votes,
+        COUNT(DISTINCT b.Id) AS Badges,
+        MAX(p.CreationDate) AS LastPost,
+        CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - u.CreationDate)) / 86400 AS INTEGER) AS DaysAsMember,
+        CASE 
+            WHEN COUNT(DISTINCT v.Id) > 100 THEN 'Active'
+            WHEN COUNT(DISTINCT v.Id) > 50 THEN 'Moderately Active' 
+            ELSE 'Inactive'
+        END AS ActivityLevel,
+        AVG(p.Score) AS AvgPostScore,
+        AVG(p.ViewCount) AS AvgPostViews,
+        STRING_AGG(p.Title, ' | ') AS RecentPostTitles
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+ComplexAnalysis AS (
+    SELECT 
+        ta.PostId,
+        ta.Title,
+        ta.Score,
+        ta.ViewCount,
+        ta.CommentCount,
+        ta.AnswerCount,
+        ta.PostTypeDescription,
+        ta.VoteCategory,
+        ta.DaysOld,
+        ta.AnswerStatus,
+        ta.AuthorName,
+        ta.AuthorReputation,
+        ta.AuthorReputationRank,
+        ta.AuthorViewRank,
+        ta.IsHighlyVoted,
+        ta.IsHighlyViewed,
+        ta.HasManyAnswers,
+        CASE 
+            WHEN ta.AuthorReputation > 10000 THEN 'High Rep'
+            WHEN ta.AuthorReputation > 5000 THEN 'Medium Rep'
+            WHEN ta.AuthorReputation > 1000 THEN 'Low Rep'
+            ELSE 'Newbie'
+        END AS AuthorRepTier,
+        CASE 
+            WHEN ta.IsHighlyVoted = 1 AND ta.IsHighlyViewed = 1 THEN 'Popular'
+            WHEN ta.IsHighlyVoted = 1 OR ta.IsHighlyViewed = 1 THEN 'Notable'
+            ELSE 'Ordinary'
+        END AS PostPopularity,
+        RANK() OVER (ORDER BY (ta.Score * ta.ViewCount) DESC) AS CombinedScoreRank,
+        DENSE_RANK() OVER (ORDER BY ta.DaysOld) AS OldnessRank,
+        LAG(ta.Score, 1) OVER (ORDER BY ta.Score DESC) AS PreviousHighScore,
+        LAG(ta.ViewCount, 1) OVER (ORDER BY ta.ViewCount DESC) AS PreviousHighViews,
+        ROW_NUMBER() OVER (PARTITION BY ta.PostTypeDescription ORDER BY ta.Score DESC) AS TypeSpecificScoreRank,
+        ta.CreationDate,
+        ta.OwnerUserId,
+        ta.PostTypeId
+    FROM TopPosts ta
+)
+SELECT 
+    ca.PostId,
+    ca.Title,
+    ca.Score,
+    ca.ViewCount,
+    ca.CommentCount,
+    ca.AnswerCount,
+    ca.PostTypeDescription,
+    ca.VoteCategory,
+    ca.DaysOld,
+    ca.AnswerStatus,
+    ca.AuthorName,
+    ca.AuthorReputation,
+    ca.AuthorReputationRank,
+    ca.AuthorViewRank,
+    ca.IsHighlyVoted,
+    ca.IsHighlyViewed,
+    ca.HasManyAnswers,
+    ca.AuthorRepTier,
+    ca.PostPopularity,
+    ca.CombinedScoreRank,
+    ca.OldnessRank,
+    ca.PreviousHighScore,
+    ca.PreviousHighViews,
+    ca.TypeSpecificScoreRank,
+    CASE 
+        WHEN ca.CombinedScoreRank <= 10 THEN 'Top 10'
+        WHEN ca.CombinedScoreRank <= 50 THEN 'Top 50'
+        WHEN ca.CombinedScoreRank <= 100 THEN 'Top 100'
+        ELSE 'Beyond Top 100'
+    END AS TopRankCategory,
+    CASE 
+        WHEN ca.Score > (SELECT AVG(p2.Score) FROM Posts p2 WHERE p2.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year')) THEN 'Above Avg Score'
+        ELSE 'Below Avg Score'
+    END AS ScoreComparison,
+    CASE 
+        WHEN ca.ViewCount > (SELECT AVG(p3.ViewCount) FROM Posts p3 WHERE p3.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year')) THEN 'Above Avg Views'
+        ELSE 'Below Avg Views'
+    END AS ViewComparison,
+    CASE 
+        WHEN CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - ca.CreationDate)) / 86400 AS INTEGER) <= 7 THEN 'Recently Active'
+        WHEN CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - ca.CreationDate)) / 86400 AS INTEGER) <= 30 THEN 'Active Last Month'
+        ELSE 'Inactive'
+    END AS UserActivityStatus,
+    DENSE_RANK() OVER (ORDER BY ca.AuthorReputation DESC) AS AuthorRepRank,
+    ROW_NUMBER() OVER (ORDER BY ca.Score DESC) AS OverallScoreRank,
+    COUNT(*) OVER () AS TotalPostsConsidered,
+    AVG(ca.Score) OVER () AS AvgScoreAcrossAllPosts,
+    MAX(ca.ViewCount) OVER () AS MaxViews,
+    MIN(ca.DaysOld) OVER () AS MinDaysOld,
+    STRING_AGG(CASE WHEN ca.PostPopularity = 'Popular' THEN ca.Title END, ' | ') AS PopularPostTitles,
+    STRING_AGG(CASE WHEN ca.AuthorRepTier = 'High Rep' THEN ca.AuthorName END, ' | ') AS HighRepAuthors
+FROM ComplexAnalysis ca
+LEFT JOIN (
+    SELECT 
+        p.OwnerUserId,
+        MAX(p.CreationDate) AS LastPost
+    FROM Posts p
+    WHERE p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year')
+    GROUP BY p.OwnerUserId
+) recent ON ca.OwnerUserId = recent.OwnerUserId
+WHERE ca.Score > 0 
+    AND ca.ViewCount > 0
+    AND ca.DaysOld BETWEEN 1 AND 365
+    AND (ca.PostPopularity = 'Popular' OR ca.PostPopularity = 'Notable')
+ORDER BY ca.CombinedScoreRank, ca.AuthorReputation DESC, ca.ViewCount DESC
+LIMIT 250;

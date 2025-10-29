@@ -1,0 +1,36 @@
+-- {"query": "6163.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-micro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 360} 
+
+SELECT 
+    u.DisplayName, 
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.ParentId END) AS TotalAnswers,
+    MAX(u.Reputation) AS MaxReputation,
+    MIN(u.CreationDate) AS EarliestUser,
+    MAX(v.BountyAmount) AS MaxBounty,
+    b.Name AS TopBadge,
+    t.TagName AS MostUsedTag
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId AND v.VoteTypeId = 8
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId AND b.Date = (SELECT MAX(Date) FROM Badges WHERE UserId = u.Id)
+LEFT JOIN 
+    Tags t ON p.Tags LIKE '%' || t.TagName || '%'
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId = 10
+WHERE 
+    p.PostTypeId IN (1, 2)
+    AND (p.Score > 10 OR p.AnswerCount > 0)
+    AND u.Reputation > 100
+GROUP BY 
+    u.DisplayName
+HAVING 
+    COUNT(DISTINCT p.Id) > 10
+ORDER BY 
+    MaxReputation DESC, 
+    MostUsedTag ASC
+LIMIT 10;

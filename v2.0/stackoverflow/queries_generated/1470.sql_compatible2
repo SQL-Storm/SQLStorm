@@ -1,0 +1,250 @@
+WITH UserAggregateStats AS (
+    SELECT
+        U.Id AS UserId,
+        COALESCE(U.DisplayName, 'Anonymous User') AS DisplayName,
+        U.Reputation,
+        U.UpVotes AS UserUpVotes,
+        U.DownVotes AS UserDownVotes,
+        U.Views AS UserProfileViews,
+        U.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(P.Score) AS TotalPostScore,
+        SUM(P.ViewCount) AS TotalPostViews,
+        AVG(P.Score) AS AvgPostScore,
+        AVG(P.ViewCount) AS AvgPostViewCount,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        SUM(C.Score) AS TotalCommentScore,
+        (U.Reputation * (U.UpVotes + 1) + SUM(COALESCE(P.Score, 0)) * 0.5 + SUM(COALESCE(P.ViewCount, 0)) * 0.01) / NULLIF(U.Views + 1, 0) AS UserInfluenceScore,
+        RANK() OVER (ORDER BY U.Reputation DESC, U.UpVotes DESC, U.CreationDate ASC) AS UserReputationRank
+    FROM Users U
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    WHERE U.CreationDate >= TIMESTAMP '2019-01-01'
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.UpVotes, U.DownVotes, U.Views, U.CreationDate
+    HAVING COUNT(DISTINCT P.Id) >= 5
+),
+PostActivityDetails AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.ParentId,
+        P.AcceptedAnswerId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount AS PostViewCount,
+        P.AnswerCount,
+        P.CommentCount AS PostCommentCount,
+        P.LastActivityDate,
+        COALESCE(P.Title, 'No Title - ' || SUBSTRING(P.Body FROM 1 FOR 30) || '...') AS PostTitle,
+        COALESCE(P.Tags, '<untagged>') AS PostTags,
+        PT.Name AS PostTypeName,
+        PH_Initial.CreationDate AS InitialPostHistoryDate,
+        COUNT(DISTINCT PH.Id) AS TotalHistoryEvents,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9, 24) THEN 1 ELSE 0 END) AS EditRevertHistoryCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (10, 101, 102, 103, 104, 105) THEN 1 ELSE 0 END) AS CloseHistoryCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (11) THEN 1 ELSE 0 END) AS ReopenHistoryCount,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (10, 101, 102, 103, 104, 105) THEN PH.CreationDate ELSE NULL END) AS LastClosedHistoryDate,
+        (SELECT MAX(C_sub.CreationDate) FROM Comments C_sub WHERE C_sub.PostId = P.Id) AS LastCommentDateOnPost,
+        (SELECT AVG(C_sub.Score) FROM Comments C_sub WHERE C_sub.PostId = P.Id) AS AvgCommentScoreOnPost,
+        COUNT(DISTINCT PL_Linked.RelatedPostId) AS NumberOfLinkedPosts,
+        COUNT(DISTINCT PL_Dup.RelatedPostId) AS NumberOfDuplicatePosts,
+        CASE
+            WHEN P.Tags IS NULL OR P.Tags = '' THEN 0
+            ELSE CARDINALITY(REGEXP_SPLIT_TO_ARRAY(SUBSTRING(COALESCE(P.Tags, '<>') FROM 2 FOR CHAR_LENGTH(COALESCE(P.Tags, '<>'))-2), E'><'))
+        END AS DistinctTagsUsedCount,
+        CASE
+            WHEN P.Body ILIKE '%performance%' OR P.Title ILIKE '%performance%' THEN 'Performance Topic'
+            WHEN P.Body ILIKE '%database%' OR P.Title ILIKE '%database%' THEN 'Database Topic'
+            WHEN P.Body ILIKE '%cloud%' OR P.Title ILIKE '%cloud%' THEN 'Cloud Topic'
+            WHEN P.Tags ILIKE '%<sql>%' OR P.Tags ILIKE '%<postgresql>%' OR P.Tags ILIKE '%<mysql>%' THEN 'SQL/DB Tagged'
+            ELSE 'General Topic'
+        END AS ContentCategory,
+        NULLIF(P.Score, 0) / (EXTRACT(EPOCH FROM (P.LastActivityDate - P.CreationDate)) / (3600 * 24) + 1) AS ScorePerDayActive,
+        (P.Score + P.CommentCount * 2 + P.AnswerCount * 3 + COUNT(DISTINCT PH.Id) * 0.5) AS EngagementMetric,
+        LAG(P.CreationDate, 1) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate) AS PreviousPostCreationDateByOwner,
+        (P.AcceptedAnswerId IS NOT NULL) AS HasAcceptedAnswer,
+        P.LastActivityDate
+    FROM Posts P
+    JOIN PostTypes PT ON P.PostTypeId = PT.Id
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    LEFT JOIN PostHistory PH_Initial ON P.Id = PH_Initial.PostId AND PH_Initial.PostHistoryTypeId = 1
+    LEFT JOIN PostLinks PL_Linked ON P.Id = PL_Linked.PostId AND PL_Linked.LinkTypeId = 1
+    LEFT JOIN PostLinks PL_Dup ON P.Id = PL_Dup.PostId AND PL_Dup.LinkTypeId = 3
+    WHERE P.OwnerUserId IS NOT NULL
+      AND P.CreationDate BETWEEN TIMESTAMP '2020-01-01' AND TIMESTAMP '2023-12-31'
+      AND P.Score >= 0
+    GROUP BY
+        P.Id, P.PostTypeId, P.OwnerUserId, P.ParentId, P.AcceptedAnswerId, P.CreationDate,
+        P.Score, P.ViewCount, P.AnswerCount, P.CommentCount, P.LastActivityDate,
+        P.Title, P.Tags, P.Body, PT.Name, PH_Initial.CreationDate
+),
+QualifiedPostsAndUsers AS (
+    SELECT
+        UAS.UserId,
+        UAS.DisplayName,
+        UAS.Reputation,
+        UAS.UserInfluenceScore,
+        UAS.TotalBadges,
+        UAS.GoldBadges,
+        UAS.TotalPosts AS TotalUserPosts,
+        PAD.PostId,
+        PAD.PostTypeName,
+        PAD.PostCreationDate,
+        PAD.PostTitle,
+        PAD.PostScore,
+        PAD.PostViewCount,
+        PAD.AnswerCount,
+        PAD.PostCommentCount,
+        PAD.TotalHistoryEvents,
+        PAD.EditRevertHistoryCount,
+        PAD.CloseHistoryCount,
+        PAD.ReopenHistoryCount,
+        PAD.LastClosedHistoryDate,
+        PAD.NumberOfLinkedPosts,
+        PAD.NumberOfDuplicatePosts,
+        PAD.DistinctTagsUsedCount,
+        PAD.ContentCategory,
+        PAD.ScorePerDayActive,
+        PAD.EngagementMetric,
+        COALESCE(EXTRACT(EPOCH FROM (PAD.PostCreationDate - PAD.PreviousPostCreationDateByOwner)) / (3600 * 24), 0) AS DaysSincePreviousPost,
+        PAD.HasAcceptedAnswer,
+        PAD.AvgCommentScoreOnPost,
+        (PAD.DistinctTagsUsedCount + 1) * PAD.EngagementMetric AS TagDiversityScore,
+        (SELECT COUNT(DISTINCT B_sub.Id) FROM Badges B_sub WHERE B_sub.UserId = UAS.UserId AND B_sub.Name = 'Commentator' AND B_sub.Date >= PAD.PostCreationDate) AS EarnedCommentatorBadgeAfterPost,
+        PAD.PostTypeId,
+        PAD.LastActivityDate,
+        PAD.PostTitle AS PostTitleDuplicate,
+        UAS.AvgPostScore,
+        PAD.NumberOfLinkedPosts AS NumLinkedPosts,
+        PAD.PostCreationDate AS PAD_PostCreationDate,
+        PAD.PostScore AS PAD_PostScore
+    FROM UserAggregateStats UAS
+    INNER JOIN PostActivityDetails PAD ON UAS.UserId = PAD.OwnerUserId
+    WHERE PAD.PostTypeId IN (1, 2)
+      AND PAD.PostScore >= (UAS.AvgPostScore * 0.75)
+      AND PAD.PostViewCount > 500
+      AND PAD.LastActivityDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6 MONTH')
+      AND NOT EXISTS (
+          SELECT 1 FROM PostHistory PH_closed
+          WHERE PH_closed.PostId = PAD.PostId
+            AND PH_closed.PostHistoryTypeId IN (10, 101, 102, 103, 104, 105)
+            AND PH_closed.CreationDate > (PAD.PostCreationDate + INTERVAL '1 YEAR')
+            AND PH_closed.Comment ILIKE '%off-topic%'
+      )
+)
+SELECT
+    FinalResults.UserId,
+    FinalResults.DisplayName,
+    FinalResults.Reputation,
+    FinalResults.UserInfluenceScore,
+    FinalResults.PostId,
+    FinalResults.PostTitle,
+    FinalResults.PostTypeName,
+    FinalResults.PostCreationDate,
+    FinalResults.PostScore,
+    FinalResults.PostViewCount,
+    FinalResults.PostCommentCount,
+    FinalResults.TotalHistoryEvents,
+    FinalResults.EditRevertHistoryCount,
+    FinalResults.CloseHistoryCount,
+    FinalResults.ReopenHistoryCount,
+    FinalResults.DaysSincePreviousPost,
+    FinalResults.ContentCategory,
+    FinalResults.EngagementMetric,
+    FinalResults.TagDiversityScore,
+    FinalResults.AvgCommentScoreOnPost,
+    FinalResults.HasAcceptedAnswer,
+    SUM(CASE WHEN FinalResults.PostTypeName = 'Question' THEN 1 ELSE 0 END) OVER (PARTITION BY FinalResults.UserId) AS TotalQuestionsByUser,
+    SUM(CASE WHEN FinalResults.PostTypeName = 'Answer' THEN 1 ELSE 0 END) OVER (PARTITION BY FinalResults.UserId) AS TotalAnswersByUser,
+    AVG(FinalResults.PostScore) OVER (PARTITION BY FinalResults.ContentCategory) AS AvgScoreForContentCategory,
+    NTH_VALUE(FinalResults.PostTitle, 1) OVER (PARTITION BY FinalResults.UserId ORDER BY FinalResults.PostScore DESC, FinalResults.PostViewCount DESC) AS TopPostTitleByScore,
+    LAG(FinalResults.PostScore, 1, 0) OVER (PARTITION BY FinalResults.UserId ORDER BY FinalResults.PostCreationDate) AS PreviousPostScore,
+    COALESCE(FinalResults.LastClosedHistoryDate, TIMESTAMP '1900-01-01') AS EffectiveLastClosedDate,
+    CASE
+        WHEN FinalResults.ReopenHistoryCount > 0 AND FinalResults.CloseHistoryCount > 0 THEN 'Closed & Reopened'
+        WHEN FinalResults.CloseHistoryCount > 0 THEN 'Only Closed'
+        ELSE 'Never Closed'
+    END AS ClosureStatusDescription,
+    MD5(FinalResults.DisplayName || FinalResults.PostTitle || CAST(FinalResults.PostCreationDate AS TEXT)) AS UniqueInteractionHash
+FROM (
+    SELECT
+        QP.UserId,
+        QP.DisplayName,
+        QP.Reputation,
+        QP.UserInfluenceScore,
+        QP.PostId,
+        QP.PostTitle,
+        QP.PostTypeName,
+        QP.PostCreationDate,
+        QP.PostScore,
+        QP.PostViewCount,
+        QP.PostCommentCount,
+        QP.TotalHistoryEvents,
+        QP.EditRevertHistoryCount,
+        QP.CloseHistoryCount,
+        QP.ReopenHistoryCount,
+        QP.DaysSincePreviousPost,
+        QP.ContentCategory,
+        QP.EngagementMetric,
+        QP.TagDiversityScore,
+        QP.AvgCommentScoreOnPost,
+        QP.HasAcceptedAnswer,
+        QP.LastClosedHistoryDate,
+        QP.GoldBadges,
+        QP.NumberOfLinkedPosts,
+        QP.EarnedCommentatorBadgeAfterPost,
+        QP.PostTypeId
+    FROM QualifiedPostsAndUsers QP
+    WHERE QP.GoldBadges >= 1
+      AND QP.NumberOfLinkedPosts > 0
+      AND QP.EditRevertHistoryCount > 0
+      AND QP.ContentCategory IN ('Performance Topic', 'Database Topic', 'SQL/DB Tagged')
+    UNION ALL
+    SELECT
+        QP.UserId,
+        QP.DisplayName,
+        QP.Reputation,
+        QP.UserInfluenceScore * 0.8 AS UserInfluenceScore,
+        QP.PostId,
+        QP.PostTitle,
+        QP.PostTypeName,
+        QP.PostCreationDate,
+        QP.PostScore,
+        QP.PostViewCount,
+        QP.PostCommentCount,
+        QP.TotalHistoryEvents,
+        QP.EditRevertHistoryCount,
+        QP.CloseHistoryCount,
+        QP.ReopenHistoryCount,
+        QP.DaysSincePreviousPost,
+        QP.ContentCategory,
+        QP.EngagementMetric,
+        QP.TagDiversityScore * 0.7 AS TagDiversityScore,
+        QP.AvgCommentScoreOnPost,
+        QP.HasAcceptedAnswer,
+        QP.LastClosedHistoryDate,
+        QP.GoldBadges,
+        QP.NumberOfLinkedPosts,
+        QP.EarnedCommentatorBadgeAfterPost,
+        QP.PostTypeId
+    FROM QualifiedPostsAndUsers QP
+    WHERE QP.PostTypeId = 2
+      AND QP.HasAcceptedAnswer = TRUE
+      AND QP.AvgCommentScoreOnPost IS NOT NULL AND QP.AvgCommentScoreOnPost >= 2
+      AND QP.CloseHistoryCount = 0
+      AND QP.PostCreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 YEAR')
+      AND QP.UserInfluenceScore > 500
+      AND QP.EarnedCommentatorBadgeAfterPost > 0
+) AS FinalResults
+ORDER BY
+    FinalResults.UserInfluenceScore DESC,
+    FinalResults.PostScore DESC,
+    FinalResults.PostCreationDate DESC
+LIMIT 1000;

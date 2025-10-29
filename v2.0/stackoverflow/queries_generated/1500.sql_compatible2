@@ -1,0 +1,254 @@
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT P_Q.Id) AS TotalQuestionsPosted,
+        COUNT(DISTINCT P_A.Id) AS TotalAnswersPosted,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN V_Given.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesGiven,
+        SUM(CASE WHEN V_Given.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesGiven,
+        SUM(P_Q.ViewCount) AS TotalQuestionViews,
+        SUM(P_Q.Score) AS TotalQuestionScore,
+        SUM(P_A.Score) AS TotalAnswerScore,
+        MAX(COALESCE(P_Q.LastActivityDate, P_A.LastActivityDate, C.CreationDate, U.LastAccessDate)) AS LatestUserActivity,
+        AVG(CASE WHEN P_Q.Id IS NOT NULL THEN LENGTH(P_Q.Body) ELSE NULL END) AS AvgQuestionBodyLength,
+        AVG(CASE WHEN P_A.Id IS NOT NULL THEN LENGTH(P_A.Body) ELSE NULL END) AS AvgAnswerBodyLength
+    FROM Users U
+    LEFT JOIN Posts P_Q ON U.Id = P_Q.OwnerUserId AND P_Q.PostTypeId = 1
+    LEFT JOIN Posts P_A ON U.Id = P_A.OwnerUserId AND P_A.PostTypeId = 2
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Votes V_Given ON U.Id = V_Given.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate
+),
+PostDetails AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score,
+        P.ViewCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.LastActivityDate,
+        P.AcceptedAnswerId,
+        P.ParentId,
+        P.Title,
+        P.Tags,
+        LENGTH(P.Body) AS BodyLength,
+        COUNT(DISTINCT PH.UserId) AS DistinctEditorsCount,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.CreationDate ELSE NULL END) AS ClosedDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 11 THEN PH.CreationDate ELSE NULL END) AS ReopenedDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 12 THEN PH.CreationDate ELSE NULL END) AS DeletedDate,
+        (
+            SELECT PH_inner.Comment
+            FROM PostHistory PH_inner
+            WHERE PH_inner.PostId = P.Id
+              AND PH_inner.PostHistoryTypeId = 10
+            ORDER BY PH_inner.CreationDate DESC
+            LIMIT 1
+        ) AS LatestCloseReasonText,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesReceived,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesReceived
+    FROM Posts P
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId AND PH.PostHistoryTypeId IN (4, 5, 6, 10, 11, 12, 19, 20)
+    LEFT JOIN Votes V ON P.Id = V.PostId AND V.VoteTypeId IN (2, 3)
+    GROUP BY P.Id, P.PostTypeId, P.OwnerUserId, P.CreationDate, P.Score, P.ViewCount, P.CommentCount, P.FavoriteCount, P.LastActivityDate, P.AcceptedAnswerId, P.ParentId, P.Title, P.Tags, LENGTH(P.Body)
+),
+QuestionAnswerAggregates AS (
+    SELECT
+        PD_Q.PostId AS QuestionId,
+        PD_Q.OwnerUserId AS QuestionOwnerId,
+        PD_Q.Score AS QuestionScore,
+        PD_Q.ViewCount AS QuestionViewCount,
+        PD_Q.CommentCount AS QuestionCommentCount,
+        PD_Q.FavoriteCount AS QuestionFavoriteCount,
+        PD_Q.BodyLength AS QuestionBodyLength,
+        PD_Q.Tags AS QuestionTags,
+        PD_Q.LatestCloseReasonText AS QuestionLastCloseReason,
+        COUNT(PD_A.PostId) AS AnswerCount,
+        SUM(PD_A.Score) AS TotalAnswerScoreForQuestion,
+        AVG(PD_A.Score) AS AvgAnswerScoreForQuestion,
+        MAX(PD_A.Score) AS MaxAnswerScoreForQuestion,
+        COUNT(DISTINCT PD_A.OwnerUserId) AS DistinctAnswerers,
+        MAX(CASE WHEN PD_A.PostId = PD_Q.AcceptedAnswerId THEN PD_A.PostId ELSE NULL END) AS AcceptedAnswerId,
+        (SELECT COUNT(1) FROM Posts PA WHERE PA.ParentId = PD_Q.PostId AND PA.Score > PD_Q.Score * 2) AS HighScoringAnswersCount
+    FROM PostDetails PD_Q
+    LEFT JOIN PostDetails PD_A ON PD_Q.PostId = PD_A.ParentId AND PD_A.PostTypeId = 2
+    WHERE PD_Q.PostTypeId = 1
+    GROUP BY PD_Q.PostId, PD_Q.OwnerUserId, PD_Q.Score, PD_Q.ViewCount, PD_Q.CommentCount, PD_Q.FavoriteCount, PD_Q.BodyLength, PD_Q.Tags, PD_Q.LatestCloseReasonText
+),
+-- Convert tags like '<tag1><tag2>' into rows using a portable approach: iterative splitting via a numbers table (generate_series equivalent).
+Numbers AS (
+    SELECT 1 AS n
+    UNION ALL
+    SELECT n + 1 FROM Numbers WHERE n < 100
+),
+TagExploded AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        TRIM(SUBSTRING(tags_inner FROM 1 FOR CASE WHEN POSITION('><' IN tags_inner)>0 THEN POSITION('><' IN tags_inner)-1 ELSE LENGTH(tags_inner) END)) AS TagName
+    FROM Posts P
+    JOIN (
+        SELECT
+            Id,
+            -- remove leading '<' and trailing '>' if present
+            CASE
+                WHEN Tags IS NULL THEN NULL
+                WHEN LENGTH(Tags) >= 2 AND LEFT(Tags,1) = '<' AND RIGHT(Tags,1) = '>' THEN SUBSTRING(Tags FROM 2 FOR CHAR_LENGTH(Tags) - 2)
+                ELSE Tags
+            END AS tags_no_brackets
+        FROM Posts
+    ) p_clean ON p_clean.Id = P.Id
+    JOIN Numbers ON CHAR_LENGTH(p_clean.tags_no_brackets) > 0
+    CROSS JOIN LATERAL (
+        -- extract the nth tag by locating separators; this emulates splitting without regexp_split_to_table
+        SELECT
+            CASE
+                WHEN N.n = 1 THEN
+                    CASE WHEN POSITION('><' IN p_clean.tags_no_brackets) = 0 THEN p_clean.tags_no_brackets
+                         ELSE SUBSTRING(p_clean.tags_no_brackets FROM 1 FOR POSITION('><' IN p_clean.tags_no_brackets)-1)
+                    END
+                ELSE
+                    -- remove first n-1 tags and take the next
+                    (SELECT
+                        CASE
+                            WHEN POSITION('><' IN rest) = 0 THEN rest
+                            ELSE SUBSTRING(rest FROM 1 FOR POSITION('><' IN rest)-1)
+                        END
+                     FROM (
+                        SELECT
+                            SUBSTRING(p_clean.tags_no_brackets FROM ( 
+                                (SELECT SUM(1 + POSITION('><' IN x) - 1) FROM (SELECT 1) AS dummy) 
+                                ) ) AS rest
+                     ) AS sub
+                    )
+            END AS tags_inner
+        FROM (SELECT n AS n FROM Numbers) N
+        WHERE N.n <= 100
+    ) AS split ON TRUE
+    WHERE p_clean.tags_no_brackets IS NOT NULL
+      AND p_clean.tags_no_brackets <> ''
+      AND P.PostTypeId IN (1, 5)
+      AND TRIM(
+            CASE
+                WHEN POSITION('><' IN p_clean.tags_no_brackets) = 0 AND Numbers.n = 1 THEN p_clean.tags_no_brackets
+                ELSE NULL
+            END
+          ) IS NOT NULL
+),
+TagPerformanceMetrics AS (
+    SELECT
+        TagName,
+        COUNT(DISTINCT PostId) AS TotalPostsWithTag,
+        AVG(pd.Score) AS AvgScoreForTagPosts,
+        SUM(CASE WHEN pd.PostTypeId = 1 THEN pd.ViewCount ELSE 0 END) AS TotalTagViews,
+        COUNT(DISTINCT pd.OwnerUserId) AS DistinctUsersPostingWithTag
+    FROM TagExploded te
+    JOIN Posts pd ON te.PostId = pd.Id
+    GROUP BY TagName
+    HAVING COUNT(DISTINCT PostId) > 100
+)
+SELECT
+    UE.UserId,
+    UE.DisplayName,
+    UE.Reputation,
+    UE.UserCreationDate,
+    UE.TotalQuestionsPosted,
+    UE.TotalAnswersPosted,
+    UE.TotalCommentsMade,
+    UE.TotalUpvotesGiven,
+    UE.TotalDownvotesGiven,
+    UE.TotalQuestionViews,
+    UE.TotalQuestionScore,
+    UE.TotalAnswerScore,
+    UE.LatestUserActivity,
+    UE.AvgQuestionBodyLength,
+    UE.AvgAnswerBodyLength,
+    RANK() OVER (ORDER BY UE.Reputation DESC, UE.TotalQuestionsPosted DESC) AS UserReputationRank,
+    NTILE(10) OVER (ORDER BY UE.TotalUpvotesGiven DESC) AS UpvoteGiverDecile,
+    LAG(UE.DisplayName, 1, 'N/A') OVER (ORDER BY UE.Reputation DESC) AS PreviousReputableUser,
+    LEAD(UE.DisplayName, 1, 'N/A') OVER (ORDER BY UE.Reputation DESC) AS NextReputableUser,
+    (
+        SELECT PD_MaxQ.Title
+        FROM PostDetails PD_MaxQ
+        WHERE PD_MaxQ.OwnerUserId = UE.UserId AND PD_MaxQ.PostTypeId = 1
+        ORDER BY PD_MaxQ.Score DESC, PD_MaxQ.ViewCount DESC
+        LIMIT 1
+    ) AS TopScoringQuestionTitle,
+    (
+        SELECT PD_MaxQ.Score
+        FROM PostDetails PD_MaxQ
+        WHERE PD_MaxQ.OwnerUserId = UE.UserId AND PD_MaxQ.PostTypeId = 1
+        ORDER BY PD_MaxQ.Score DESC, PD_MaxQ.ViewCount DESC
+        LIMIT 1
+    ) AS TopScoringQuestionScore,
+    (
+        SELECT COUNT(B.Id)
+        FROM Badges B
+        WHERE B.UserId = UE.UserId
+          AND B.Date >= (CAST('2024-10-01' AS date) - INTERVAL '1 year')
+    ) AS BadgesLastYearCount,
+    SUM(QA.AnswerCount) AS TotalAnswersReceivedByUserQuestions,
+    AVG(QA.AvgAnswerScoreForQuestion) AS AvgAnswerScoreOnUserQuestions,
+    SUM(QA.HighScoringAnswersCount) AS UserQuestionsWithHighScoringAnswers,
+    CASE
+        WHEN UE.Reputation > 100000 AND UE.TotalQuestionsPosted > 500 AND UE.TotalAnswersPosted > 1000 THEN 'Legendary Contributor'
+        WHEN UE.Reputation > 50000 AND UE.TotalQuestionsPosted + UE.TotalAnswersPosted > 1000 THEN 'Highly Esteemed Expert'
+        WHEN UE.Reputation > 10000 AND (UE.TotalQuestionsPosted > 100 OR UE.TotalAnswersPosted > 500) AND UE.AvgAnswerBodyLength IS NOT NULL THEN 'Active Proponent'
+        WHEN UE.Reputation > 1000 AND UE.LatestUserActivity > (CAST('2024-10-01' AS date) - INTERVAL '6 months') THEN 'Engaged Member'
+        ELSE 'Casual User'
+    END AS UserContributionTier,
+    COALESCE(TPM_HighestAvgScore.TagName, 'No High-Performing Tag') AS UsersHighestAvgScoreTag,
+    TPM_HighestAvgScore.AvgScoreForTagPosts AS HighestAvgScoreTagValue,
+    UPPER(SUBSTRING(COALESCE(UE.DisplayName, 'Anonymous') FROM 1 FOR 1)) || '-' ||
+    REPLACE(LOWER(SUBSTRING(COALESCE(UE.DisplayName, 'Anonymous') FROM 2 FOR 3)), 'a', '@') ||
+    RIGHT(CAST(UE.UserId AS VARCHAR), 3) AS UserHandleHash,
+    CASE WHEN UE.TotalDownvotesGiven > (UE.TotalUpvotesGiven * 0.5) AND UE.TotalDownvotesGiven > 100 THEN 'Potentially Controversial' ELSE 'Generally Positive' END AS VoteSentiment,
+    (
+        SELECT TPM_inner.TagName
+        FROM Posts P_Tag
+        JOIN TagPerformanceMetrics TPM_inner ON P_Tag.Tags LIKE '%' || '<' || TPM_inner.TagName || '>' || '%'
+        WHERE P_Tag.OwnerUserId = UE.UserId AND P_Tag.PostTypeId = 1
+        ORDER BY TPM_inner.AvgScoreForTagPosts DESC
+        LIMIT 1
+    ) AS TopAssociatedTagByAvgScore
+FROM UserEngagement UE
+LEFT JOIN QuestionAnswerAggregates QA ON UE.UserId = QA.QuestionOwnerId
+LEFT JOIN (
+    SELECT
+        TPM.TagName,
+        TPM.AvgScoreForTagPosts
+    FROM TagPerformanceMetrics TPM
+    ORDER BY TPM.AvgScoreForTagPosts DESC
+    LIMIT 1
+) AS TPM_HighestAvgScore ON TRUE
+WHERE
+    UE.Reputation IS NOT NULL
+    AND (UE.TotalQuestionsPosted > 0 OR UE.TotalAnswersPosted > 0 OR UE.TotalCommentsMade > 0)
+    AND (UE.TotalUpvotesGiven + UE.TotalDownvotesGiven) > 10
+GROUP BY
+    UE.UserId,
+    UE.DisplayName,
+    UE.Reputation,
+    UE.UserCreationDate,
+    UE.TotalQuestionsPosted,
+    UE.TotalAnswersPosted,
+    UE.TotalCommentsMade,
+    UE.TotalUpvotesGiven,
+    UE.TotalDownvotesGiven,
+    UE.TotalQuestionViews,
+    UE.TotalQuestionScore,
+    UE.TotalAnswerScore,
+    UE.LatestUserActivity,
+    UE.AvgQuestionBodyLength,
+    UE.AvgAnswerBodyLength,
+    TPM_HighestAvgScore.TagName,
+    TPM_HighestAvgScore.AvgScoreForTagPosts
+ORDER BY
+    UE.Reputation DESC, UE.LatestUserActivity DESC
+LIMIT 1000;

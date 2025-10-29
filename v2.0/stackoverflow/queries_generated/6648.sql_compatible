@@ -1,0 +1,45 @@
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    MAX(u.CreationDate) AS LatestAccountActivity,
+    MAX(p.LastActivityDate) AS LatestPostActivity,
+    AVG(p.Score) AS AvgPostScore,
+    MAX(ph.CreationDate) AS LatestPostHistoryEntry,
+    SUM(CASE WHEN v_up.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotes,
+    SUM(CASE WHEN v_dn.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotes,
+    (
+        SELECT STRING_AGG(t.TagName, ', ')
+        FROM Tags t
+        WHERE t.Id IN (
+            SELECT tt.Id
+            FROM Tags tt
+            WHERE tt.TagName IN (
+                SELECT ttt.TagName
+                FROM Tags ttt
+                WHERE ttt.Posts_Id = p.Id
+            )
+        )
+    ) AS AssociatedTags
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN
+    Votes v_up ON v_up.PostId = p.Id AND v_up.VoteTypeId = 2
+LEFT JOIN
+    Votes v_dn ON v_dn.PostId = p.Id AND v_dn.VoteTypeId = 3
+WHERE 
+    u.Reputation > 1000
+    AND p.LastActivityDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1' YEAR)
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation
+HAVING 
+    COUNT(DISTINCT p.Id) > 50
+ORDER BY 
+    AVG(p.Score) DESC
+LIMIT 100;

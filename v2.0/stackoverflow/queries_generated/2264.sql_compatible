@@ -1,0 +1,183 @@
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate as PostCreationDate,
+        p.AcceptedAnswerId,
+        rank() over(partition by u.Id order by p.CreationDate desc) as PostRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    where u.Reputation > 1000
+),
+RankedComments as (
+    select c.Id as CommentId, c.PostId, c.UserId, c.CreationDate, c.Score,
+           row_number() over(partition by c.PostId order by c.Score desc, c.CreationDate) as CommentRank
+    from Comments c
+),
+AggregatedVotes as (
+    select
+        v.PostId,
+        sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+        sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes,
+        sum(case when vt.Name = 'Favorite' then 1 else 0 end) as FavoriteVotes
+    from Votes v
+    join VoteTypes vt on vt.Id = v.VoteTypeId
+    group by v.PostId
+),
+PostLinkStats as (
+    select
+        pl.PostId,
+        count(distinct pl.RelatedPostId) as LinkedPostsCount,
+        sum(case when lt.Name = 'Duplicate' then 1 else 0 end) as DuplicatesCount
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    group by pl.PostId
+),
+BadgeCounts as (
+    select
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges
+    from Badges b
+    group by b.UserId
+),
+UserPostSummary as (
+    select
+        rua.UserId,
+        rua.DisplayName,
+        rua.Reputation,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        coalesce(sum(p.Score), 0) as TotalPostScore,
+        max(p.ViewCount) filter (where p.PostTypeId = 1) as MaxQuestionViewCount,
+        coalesce(sum(av.UpVotes), 0) as TotalUpVotes,
+        coalesce(sum(av.DownVotes), 0) as TotalDownVotes,
+        coalesce(sum(av.FavoriteVotes), 0) as TotalFavoriteVotes,
+        coalesce(bc.GoldBadges, 0) as GoldBadges,
+        coalesce(bc.SilverBadges, 0) as SilverBadges,
+        coalesce(bc.BronzeBadges, 0) as BronzeBadges
+    from RecursiveUserActivity rua
+    left join Posts p on p.OwnerUserId = rua.UserId
+    left join AggregatedVotes av on av.PostId = p.Id
+    left join BadgeCounts bc on bc.UserId = rua.UserId
+    group by rua.UserId, rua.DisplayName, rua.Reputation, bc.GoldBadges, bc.SilverBadges, bc.BronzeBadges
+),
+ComplexPostAnalysis as (
+    select
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        pl.LinkedPostsCount,
+        pl.DuplicatesCount,
+        row_number() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as RankWithinType,
+        case
+            when p.ClosedDate is not null then 1
+            else 0
+        end as IsClosed,
+        case
+            when array_length(string_to_array(trim(both '<>' from coalesce(p.Tags, '')), '><'), 1) > 3 then 1
+            else 0
+        end as HasManyTags,
+        (select max(ph.CreationDate)
+         from PostHistory ph
+         where ph.PostId = p.Id
+           and ph.PostHistoryTypeId in (4,5,6)
+        ) as LastEditDate
+    from Posts p
+    left join PostLinkStats pl on pl.PostId = p.Id
+    where p.PostTypeId in (1,2)
+),
+FinalSelection as (
+    select
+        up.UserId,
+        up.DisplayName,
+        up.Reputation,
+        up.QuestionCount,
+        up.AnswerCount,
+        up.TotalPostScore,
+        up.MaxQuestionViewCount,
+        up.TotalUpVotes,
+        up.TotalDownVotes,
+        up.TotalFavoriteVotes,
+        up.GoldBadges,
+        up.SilverBadges,
+        up.BronzeBadges,
+        cpa.Id as PostId,
+        cpa.Title,
+        cpa.Tags,
+        cpa.CreationDate as PostCreation,
+        cpa.Score as PostScore,
+        cpa.ViewCount as PostViews,
+        cpa.LinkedPostsCount,
+        cpa.DuplicatesCount,
+        cpa.RankWithinType,
+        cpa.IsClosed,
+        cpa.HasManyTags,
+        cpa.LastEditDate,
+        coalesce(rc.CommentCount,0) as TopCommentCount,
+        coalesce(rc.TopCommentText,'') as TopCommentText
+    from UserPostSummary up
+    inner join ComplexPostAnalysis cpa on cpa.Id = (
+        select p.Id from Posts p where p.OwnerUserId = up.UserId order by p.Score desc limit 1
+    )
+    left join (
+        select
+            c.PostId,
+            count(1) as CommentCount,
+            string_agg(c.Text, ' | ' order by c.Score desc, c.CreationDate asc) filter(where c.Score > 5) as TopCommentText
+        from Comments c
+        group by c.PostId
+    ) rc on rc.PostId = cpa.Id
+    where up.Reputation > 2000 and cpa.IsClosed = 0
+)
+select
+    fs.UserId,
+    fs.DisplayName,
+    fs.Reputation,
+    fs.QuestionCount,
+    fs.AnswerCount,
+    fs.TotalPostScore,
+    fs.MaxQuestionViewCount,
+    fs.TotalUpVotes,
+    fs.TotalDownVotes,
+    fs.TotalFavoriteVotes,
+    fs.GoldBadges,
+    fs.SilverBadges,
+    fs.BronzeBadges,
+    fs.PostId,
+    coalesce(nullif(fs.Title, ''), '[No Title]') as PostTitle,
+    fs.Tags,
+    fs.PostCreation,
+    fs.PostScore,
+    fs.PostViews,
+    fs.LinkedPostsCount,
+    fs.DuplicatesCount,
+    fs.RankWithinType,
+    fs.TopCommentCount,
+    substr(regexp_replace(fs.TopCommentText, E'[\r\n]+', ' ', 'g'), 1, 200) as SampleTopComments,
+    case
+        when fs.HasManyTags = 1 then 'Multi-Tagged'
+        else 'Fewer Tags'
+    end as TagCategory,
+    EXTRACT(epoch FROM age(timestamp '2024-10-01 12:34:56', fs.PostCreation))/86400 as PostAgeDays,
+    (select count(1) from PostHistory ph2 where ph2.PostId = fs.PostId and ph2.PostHistoryTypeId in (10, 11)) as CloseReopenActions,
+    case
+        when fs.LastEditDate is null then 'Never Edited'
+        when fs.LastEditDate < fs.PostCreation then 'Invalid Edit Date'
+        else concat('Last edited on ', to_char(fs.LastEditDate, 'YYYY-MM-DD'))
+    end as LastEditInfo
+from FinalSelection fs
+where fs.GoldBadges + fs.SilverBadges + fs.BronzeBadges >= 5
+order by fs.Reputation desc, fs.TotalPostScore desc
+limit 50;

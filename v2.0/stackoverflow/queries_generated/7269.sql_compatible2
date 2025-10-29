@@ -1,0 +1,220 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT c.Id) as Comments,
+        COUNT(DISTINCT b.Id) as Badges,
+        MAX(p.CreationDate) as LastPostDate,
+        CAST(
+            EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - u.CreationDate))
+            / 86400
+        AS INTEGER) as AccountAgeDays,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Gold'
+            WHEN u.Reputation >= 1000 THEN 'Silver'
+            WHEN u.Reputation >= 100 THEN 'Bronze'
+            ELSE 'Beginner'
+        END as ReputationTier,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) as ReputationRank,
+        PERCENT_RANK() OVER (ORDER BY u.Reputation) as ReputationPercentile,
+        AVG(p.Score) as AvgPostScore,
+        MAX(p.Score) as MaxPostScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags <> '' THEN 
+                TRIM(BOTH '<>' FROM SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags)-2)))
+            ELSE ''
+        END as TagList,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 
+                CASE 
+                    WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+                    WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+                    ELSE 'Unanswered'
+                END
+            ELSE 'N/A'
+        END as QuestionStatus,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN 
+                CAST(p.AnswerCount AS DOUBLE PRECISION) / NULLIF(p.ViewCount, 0)
+            ELSE 0.0
+        END as AnswerToViewRatio,
+        CAST(
+            EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - p.CreationDate))
+            / 86400
+        AS INTEGER) as AgeInDays,
+        COALESCE(p.AcceptedAnswerId, 0) as HasAcceptedAnswer,
+        p.ContentLicense
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserPostAggregations AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as TotalQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as TotalAnswers,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) as TotalQuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) as TotalAnswerScore,
+        COUNT(DISTINCT p.Id) as TotalPostsWithVotes,
+        AVG(p.Score) as AvgPostScore,
+        MAX(p.Score) as MaxPostScore,
+        COUNT(DISTINCT p.AnswerCount) as DistinctAnswerCounts,
+        STRING_AGG(DISTINCT p.Tags, ';') as AllTags,
+        COUNT(CASE WHEN p.Score > 0 THEN 1 END) as PostsWithPositiveScore,
+        COUNT(CASE WHEN p.Score < 0 THEN 1 END) as PostsWithNegativeScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.DisplayName
+),
+TagPopularity AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            ELSE 'Niche'
+        END as PopularityLevel,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as RankByPopularity,
+        RANK() OVER (ORDER BY t.Count DESC, t.TagName) as RankByPopularityAndName
+    FROM Tags t
+    WHERE t.Count > 0
+),
+ComplexVoteAnalysis AS (
+    SELECT 
+        v.PostId,
+        v.VoteTypeId,
+        v.UserId,
+        v.CreationDate,
+        v.BountyAmount,
+        CASE 
+            WHEN v.VoteTypeId IN (2, 3) THEN 'Moderation'
+            WHEN v.VoteTypeId IN (8, 9) THEN 'Bounty'
+            WHEN v.VoteTypeId IN (6, 7) THEN 'Close/Open'
+            ELSE 'Other'
+        END as VoteCategory,
+        COUNT(*) OVER (PARTITION BY v.PostId) as TotalVotesOnPost,
+        DENSE_RANK() OVER (PARTITION BY v.PostId ORDER BY v.CreationDate) as VoteSequence,
+        AVG(v.BountyAmount) OVER (PARTITION BY v.PostId) as AvgBountyOnPost,
+        LAG(v.CreationDate, 1) OVER (PARTITION BY v.PostId ORDER BY v.CreationDate) as PreviousVoteDate,
+        COALESCE(v.BountyAmount, 0) as BountyAmountCoalesced
+    FROM Votes v
+    WHERE v.VoteTypeId IN (2, 3, 6, 7, 8, 9)
+)
+SELECT 
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.ReputationTier,
+    uas.ReputationRank,
+    uas.ReputationPercentile,
+    uas.TotalPosts,
+    uas.Questions,
+    uas.Answers,
+    uas.Comments,
+    uas.Badges,
+    uas.LastPostDate,
+    uas.AccountAgeDays,
+    uas.AvgPostScore,
+    uas.MaxPostScore,
+    COALESCE(upa.TotalQuestions, 0) as TotalQuestionsByUser,
+    COALESCE(upa.TotalAnswers, 0) as TotalAnswersByUser,
+    COALESCE(upa.TotalQuestionScore, 0) as TotalQuestionScore,
+    COALESCE(upa.TotalAnswerScore, 0) as TotalAnswerScore,
+    COALESCE(upa.TotalPostsWithVotes, 0) as TotalPostsWithVotes,
+    COALESCE(upa.AvgPostScore, 0.0) as AvgPostScoreByUser,
+    COALESCE(upa.MaxPostScore, 0) as MaxPostScoreByUser,
+    COALESCE(upa.PostsWithPositiveScore, 0) as PostsWithPositiveScore,
+    COALESCE(upa.PostsWithNegativeScore, 0) as PostsWithNegativeScore,
+    CASE 
+        WHEN uas.Questions > 0 THEN 
+            CAST(uas.Answers AS DOUBLE PRECISION) / NULLIF(uas.Questions, 0)
+        ELSE 0.0
+    END as AnswerToQuestionRatio,
+    CASE 
+        WHEN uas.TotalPosts > 0 THEN 
+            CAST(uas.Comments AS DOUBLE PRECISION) / NULLIF(uas.TotalPosts, 0)
+        ELSE 0.0
+    END as CommentToPostRatio,
+    COALESCE(
+        (SELECT STRING_AGG(pt.TagList, ', ') 
+         FROM PostAnalysis pt 
+         WHERE pt.OwnerUserId = uas.UserId 
+         AND pt.TagList IS NOT NULL 
+         AND pt.TagList <> ''), 
+        ''
+    ) as CommonTagSets,
+    COUNT(DISTINCT CASE 
+        WHEN pa.PostTypeId = 1 AND pa.Score > 10 THEN pa.PostId 
+        ELSE NULL 
+    END) as HighScoreQuestions,
+    COUNT(DISTINCT CASE 
+        WHEN pa.PostTypeId = 2 AND pa.Score > 5 THEN pa.PostId 
+        ELSE NULL 
+    END) as HighScoreAnswers,
+    (SELECT COUNT(*) FROM ComplexVoteAnalysis cva WHERE cva.UserId = uas.UserId) as TotalVotesByUser,
+    COALESCE(
+        (SELECT STRING_AGG(DISTINCT tpop.TagName, ', ') 
+         FROM TagPopularity tpop 
+         WHERE tpop.RankByPopularity <= 10), 
+        ''
+    ) as TopTags,
+    CASE 
+        WHEN uas.Reputation > 5000 AND uas.TotalPosts > 100 THEN 'Active Contributor'
+        WHEN uas.Reputation > 1000 AND uas.TotalPosts > 50 THEN 'Regular Contributor'  
+        WHEN uas.Reputation > 100 AND uas.TotalPosts > 10 THEN 'Occasional Contributor'
+        ELSE 'New User'
+    END as ContributionLevel
+FROM UserActivityStats uas
+LEFT JOIN UserPostAggregations upa ON uas.UserId = upa.UserId
+LEFT JOIN PostAnalysis pa ON uas.UserId = pa.OwnerUserId
+GROUP BY 
+    uas.UserId, uas.DisplayName, uas.Reputation, uas.ReputationTier, 
+    uas.ReputationRank, uas.ReputationPercentile, uas.TotalPosts, 
+    uas.Questions, uas.Answers, uas.Comments, uas.Badges, 
+    uas.LastPostDate, uas.AccountAgeDays, uas.AvgPostScore, uas.MaxPostScore, 
+    upa.TotalQuestions, upa.TotalAnswers, upa.TotalQuestionScore, 
+    upa.TotalAnswerScore, upa.TotalPostsWithVotes, upa.AvgPostScore, 
+    upa.MaxPostScore, upa.PostsWithPositiveScore, upa.PostsWithNegativeScore
+HAVING 
+    MAX(uas.Reputation) > 100 
+    AND MAX(uas.AccountAgeDays) > 30
+    AND (
+        MAX(uas.TotalPosts) > 0 
+        OR MAX(uas.Comments) > 0 
+        OR MAX(uas.Badges) > 0
+    )
+ORDER BY 
+    uas.Reputation DESC, 
+    uas.TotalPosts DESC,
+    uas.LastPostDate DESC
+LIMIT 500;

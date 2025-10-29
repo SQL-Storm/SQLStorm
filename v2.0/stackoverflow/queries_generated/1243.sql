@@ -1,0 +1,267 @@
+-- {"query": "1243.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3366} 
+
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.Views AS UserViews,
+        U.UpVotes AS UserUpVotes,
+        U.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT P.Id) FILTER (WHERE P.PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT P.Id) FILTER (WHERE P.PostTypeId = 2) AS AnswerCount,
+        COUNT(DISTINCT C.Id) AS CommentCount,
+        SUM(CASE WHEN P.PostTypeId IN (1, 2) THEN P.Score ELSE 0 END) AS TotalPostScore,
+        AVG(CASE WHEN P.PostTypeId IN (1, 2) THEN P.Score ELSE NULL END) AS AvgPostScore,
+        COUNT(DISTINCT B.Id) AS BadgeCount,
+        RANK() OVER (ORDER BY U.Reputation DESC, U.UpVotes DESC) AS ReputationRank,
+        NTILE(10) OVER (ORDER BY U.LastAccessDate DESC, U.CreationDate ASC) AS AccessDateTile
+    FROM
+        Users AS U
+    LEFT JOIN
+        Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN
+        Comments AS C ON U.Id = C.UserId
+    LEFT JOIN
+        Badges AS B ON U.Id = B.UserId
+    WHERE
+        U.Reputation >= 1000
+        AND U.LastAccessDate >= U.CreationDate + INTERVAL '90 days'
+        AND U.Location IS NOT NULL
+        AND LENGTH(U.DisplayName) > 3
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.Views, U.UpVotes, U.DownVotes, U.LastAccessDate
+),
+QuestionEngagementMetrics AS (
+    SELECT
+        Q.Id AS QuestionId,
+        Q.OwnerUserId,
+        Q.CreationDate AS QuestionCreationDate,
+        Q.Score AS QuestionScore,
+        Q.ViewCount,
+        Q.AnswerCount AS NumAnswers,
+        Q.CommentCount AS NumCommentsOnQuestion,
+        Q.FavoriteCount,
+        Q.Title AS QuestionTitle,
+        Q.Tags AS QuestionTags,
+        EXTRACT(EPOCH FROM (Q.LastActivityDate - Q.CreationDate)) / 3600 AS HoursSinceCreationToLastActivity, -- In hours
+        (SELECT AVG(A.Score) FROM Posts AS A WHERE A.ParentId = Q.Id AND A.PostTypeId = 2) AS AvgAnswerScore,
+        (SELECT MAX(A2.Score) FROM Posts AS A2 WHERE A2.ParentId = Q.Id AND A2.PostTypeId = 2) AS MaxAnswerScore,
+        COUNT(DISTINCT V.Id) FILTER (WHERE V.VoteTypeId = 2) AS QuestionUpVotes, -- UpMod
+        COUNT(DISTINCT V.Id) FILTER (WHERE V.VoteTypeId = 3) AS QuestionDownVotes, -- DownMod
+        DENSE_RANK() OVER (PARTITION BY Q.OwnerUserId ORDER BY Q.Score DESC, Q.ViewCount DESC) AS UserQuestionRank,
+        COALESCE(Q.ClosedDate, Q.LastActivityDate) AS EffectiveCloseOrActivityDate,
+        Q.CommunityOwnedDate IS NOT NULL AS IsCommunityOwned,
+        LOWER(TRIM(SUBSTRING(Q.Title FROM 1 FOR 50))) AS NormalizedTitlePrefix -- String expression
+    FROM
+        Posts AS Q
+    LEFT JOIN
+        Votes AS V ON Q.Id = V.PostId AND V.VoteTypeId IN (2, 3) -- UpMod, DownMod
+    WHERE
+        Q.PostTypeId = 1 -- Only questions
+        AND Q.ViewCount >= 500
+        AND Q.Score >= 10
+        AND Q.CreationDate >= '2020-01-01' -- Recent questions
+        AND Q.OwnerUserId IS NOT NULL -- Exclude community-owned questions here (handled specifically for IsCommunityOwned)
+    GROUP BY
+        Q.Id, Q.OwnerUserId, Q.CreationDate, Q.Score, Q.ViewCount, Q.AnswerCount, Q.CommentCount,
+        Q.FavoriteCount, Q.Title, Q.Tags, Q.LastActivityDate, Q.ClosedDate, Q.CommunityOwnedDate
+),
+PostHistoricalEvents AS (
+    -- Initial Body events
+    SELECT
+        PH.PostId,
+        PH.CreationDate AS EventDate,
+        PH.PostHistoryTypeId,
+        PHT.Name AS EventTypeName,
+        PH.UserId AS EventInitiatorUserId,
+        PH.Comment AS EventComment,
+        PH.Text AS EventText,
+        ROW_NUMBER() OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate, PH.PostHistoryTypeId) AS EventSequenceNum
+    FROM
+        PostHistory AS PH
+    JOIN
+        PostHistoryTypes AS PHT ON PH.PostHistoryTypeId = PHT.Id
+    WHERE
+        PH.PostHistoryTypeId = 2 -- Initial Body
+        AND PH.CreationDate >= '2020-01-01'
+    UNION ALL
+    -- Edit Body events
+    SELECT
+        PH.PostId,
+        PH.CreationDate AS EventDate,
+        PH.PostHistoryTypeId,
+        PHT.Name AS EventTypeName,
+        PH.UserId AS EventInitiatorUserId,
+        PH.Comment AS EventComment,
+        PH.Text AS EventText,
+        ROW_NUMBER() OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate, PH.PostHistoryTypeId) AS EventSequenceNum
+    FROM
+        PostHistory AS PH
+    JOIN
+        PostHistoryTypes AS PHT ON PH.PostHistoryTypeId = PHT.Id
+    WHERE
+        PH.PostHistoryTypeId = 5 -- Edit Body
+        AND PH.CreationDate >= '2020-01-01'
+    UNION ALL
+    -- Post Closed/Reopened events
+    SELECT
+        PH.PostId,
+        PH.CreationDate AS EventDate,
+        PH.PostHistoryTypeId,
+        PHT.Name AS EventTypeName,
+        PH.UserId AS EventInitiatorUserId,
+        PH.Comment AS EventComment,
+        PH.Text AS EventText,
+        ROW_NUMBER() OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate, PH.PostHistoryTypeId) AS EventSequenceNum
+    FROM
+        PostHistory AS PH
+    JOIN
+        PostHistoryTypes AS PHT ON PH.PostHistoryTypeId = PHT.Id
+    WHERE
+        PH.PostHistoryTypeId IN (10, 11) -- Post Closed, Post Reopened
+        AND PH.CreationDate >= '2020-01-01'
+)
+SELECT
+    UAS.UserId,
+    UAS.DisplayName,
+    UAS.Reputation,
+    UAS.QuestionCount,
+    UAS.AnswerCount,
+    UAS.CommentCount,
+    UAS.TotalPostScore,
+    UAS.BadgeCount,
+    UAS.ReputationRank,
+    UAS.AccessDateTile,
+    PEM.QuestionId,
+    PEM.QuestionTitle,
+    PEM.NormalizedTitlePrefix,
+    PEM.QuestionScore,
+    PEM.ViewCount,
+    PEM.NumAnswers,
+    PEM.NumCommentsOnQuestion,
+    PEM.FavoriteCount,
+    PEM.AvgAnswerScore,
+    PEM.MaxAnswerScore,
+    PEM.HoursSinceCreationToLastActivity,
+    PEM.QuestionUpVotes,
+    PEM.QuestionDownVotes,
+    PEM.UserQuestionRank,
+    PEM.IsCommunityOwned,
+    COALESCE(HistoricalSummary.TotalEditsToQuestion, 0) AS TotalEditsToQuestion,
+    HistoricalSummary.FirstBodyEditDate,
+    HistoricalSummary.LastBodyEditDate,
+    HistoricalSummary.AvgTimeBetweenBodyEditsSec,
+    ARRAY_AGG(DISTINCT T.TagName) FILTER (WHERE T.TagName IS NOT NULL) AS RelatedQuestionTags,
+    COALESCE(PL.RelatedQuestionCount, 0) AS LinkedAndDuplicateCount,
+    -- Complicated expression combining string functions, NULL handling, and date calculations
+    CASE
+        WHEN UAS.Reputation > 50000 AND PEM.QuestionScore > 100 AND PEM.NumAnswers > 10 THEN 'High-Impact Pro'
+        WHEN UAS.Reputation > 10000 AND PEM.QuestionScore > 50 AND PEM.NumAnswers > 5 THEN 'Mid-Tier Influencer'
+        WHEN UAS.Reputation > 1000 AND PEM.QuestionScore > 20 THEN 'Emerging Contributor'
+        WHEN PEM.IsCommunityOwned THEN 'Community-Driven' -- Specific NULL logic (community owned posts usually have NULL OwnerUserId)
+        ELSE 'Active Participant'
+    END AS UserQuestionImpactCategory,
+    -- Correlated Subquery demonstrating NULL logic and complex predicate
+    (
+        SELECT
+            COALESCE(MAX(C.Score), 0)
+        FROM
+            Comments AS C
+        WHERE
+            C.PostId = PEM.QuestionId
+            AND C.UserId = UAS.UserId -- Specific user comments on their question
+            AND C.CreationDate BETWEEN PEM.QuestionCreationDate AND PEM.EffectiveCloseOrActivityDate
+            AND (C.Text LIKE '%bug%' OR C.Text LIKE '%error%' OR C.Text LIKE '%fix%') -- Extended keywords
+    ) AS MaxUserCommentScoreOnQuestionForKeywords,
+    -- Another correlated subquery for recent comment activity by any user
+    (
+        SELECT
+            COUNT(DISTINCT COM.Id)
+        FROM
+            Comments AS COM
+        WHERE
+            COM.PostId = PEM.QuestionId
+            AND COM.CreationDate BETWEEN PEM.EffectiveCloseOrActivityDate - INTERVAL '7 days' AND PEM.EffectiveCloseOrActivityDate
+            AND COM.UserId IS NOT NULL
+            AND COM.Score > 0 -- Only positive scored comments
+    ) AS RecentPositiveCommentActivityCount,
+    -- String array operations and filtering for specific tags using EXISTS for efficiency potentially
+    (
+        SELECT
+            COUNT(DISTINCT TR.Id)
+        FROM
+            Tags AS TR
+        WHERE EXISTS (
+                SELECT 1
+                FROM UNNEST(string_to_array(SUBSTRING(PEM.QuestionTags FROM 2 FOR LENGTH(PEM.QuestionTags) - 2), '><')) AS QTag
+                WHERE TR.TagName = QTag
+                AND TR.TagName IN ('sql', 'postgresql', 'database', 'performance', 'indexing', 'query-optimization')
+            )
+    ) AS RelevantTechTagCount
+FROM
+    UserActivitySummary AS UAS
+INNER JOIN -- Using INNER JOIN to focus on users who have active questions
+    QuestionEngagementMetrics AS PEM ON UAS.UserId = PEM.OwnerUserId
+LEFT JOIN -- Summarize historical events for each question
+    (
+        SELECT
+            PHE.PostId,
+            COUNT(DISTINCT PHE.EventDate) FILTER (WHERE PHE.PostHistoryTypeId = 5) AS TotalEditsToQuestion,
+            MIN(PHE.EventDate) FILTER (WHERE PHE.PostHistoryTypeId = 2) AS FirstBodyEditDate,
+            MAX(PHE.EventDate) FILTER (WHERE PHE.PostHistoryTypeId = 5) AS LastBodyEditDate,
+            AVG(EXTRACT(EPOCH FROM (NextEdit.EventDate - PHE.EventDate))) FILTER (WHERE PHE.PostHistoryTypeId = 5 AND NextEdit.EventDate IS NOT NULL) AS AvgTimeBetweenBodyEditsSec
+        FROM
+            PostHistoricalEvents AS PHE
+        LEFT JOIN LATERAL (
+            SELECT EventDate
+            FROM PostHistoricalEvents AS NextPHE
+            WHERE NextPHE.PostId = PHE.PostId
+              AND NextPHE.EventDate > PHE.EventDate
+              AND NextPHE.PostHistoryTypeId = 5 -- Consider only body edits for this average
+            ORDER BY NextPHE.EventDate
+            LIMIT 1
+        ) AS NextEdit ON TRUE
+        GROUP BY PHE.PostId
+    ) AS HistoricalSummary ON PEM.QuestionId = HistoricalSummary.PostId
+LEFT JOIN -- Find related posts for the questions (Linked or Duplicate)
+    (
+        SELECT
+            PL.PostId,
+            COUNT(DISTINCT PL.RelatedPostId) AS RelatedQuestionCount
+        FROM
+            PostLinks AS PL
+        WHERE
+            PL.LinkTypeId IN (1, 3) -- Linked or Duplicate
+        GROUP BY
+            PL.PostId
+    ) AS PL ON PEM.QuestionId = PL.PostId
+LEFT JOIN
+    LATERAL (SELECT UNNEST(string_to_array(SUBSTRING(PEM.QuestionTags FROM 2 FOR LENGTH(PEM.QuestionTags) - 2), '><')) AS TagName) AS UNNESTED_TAGS ON TRUE
+LEFT JOIN
+    Tags AS T ON UNNESTED_TAGS.TagName = T.TagName
+WHERE
+    UAS.ReputationRank <= 1000 -- Top users by reputation
+    AND PEM.UserQuestionRank <= 5 -- Top 5 questions for each of those users
+    AND (
+        PEM.QuestionTags LIKE '%<sql>%'
+        OR PEM.QuestionTags LIKE '%<database>%'
+        OR PEM.QuestionTags LIKE '%<performance>%'
+        OR PEM.QuestionTags LIKE '%<optimization>%' -- Added a new tag
+    )
+    AND COALESCE(PEM.AvgAnswerScore, 0) > 0 -- Ensure there's at least one answer with a positive score
+    AND (HistoricalSummary.TotalEditsToQuestion IS NULL OR HistoricalSummary.TotalEditsToQuestion <= 20) -- Limit complexity if too many edits
+    AND LENGTH(PEM.NormalizedTitlePrefix) > 10 -- String expression filter
+GROUP BY
+    UAS.UserId, UAS.DisplayName, UAS.Reputation, UAS.QuestionCount, UAS.AnswerCount, UAS.CommentCount,
+    UAS.TotalPostScore, UAS.BadgeCount, UAS.ReputationRank, UAS.AccessDateTile,
+    PEM.QuestionId, PEM.QuestionTitle, PEM.NormalizedTitlePrefix, PEM.QuestionScore, PEM.ViewCount, PEM.NumAnswers,
+    PEM.NumCommentsOnQuestion, PEM.FavoriteCount, PEM.AvgAnswerScore, PEM.MaxAnswerScore,
+    PEM.HoursSinceCreationToLastActivity, PEM.QuestionUpVotes, PEM.QuestionDownVotes,
+    PEM.UserQuestionRank, PEM.IsCommunityOwned, PL.RelatedQuestionCount,
+    PEM.QuestionCreationDate, PEM.EffectiveCloseOrActivityDate, PEM.QuestionTags,
+    HistoricalSummary.TotalEditsToQuestion, HistoricalSummary.FirstBodyEditDate, HistoricalSummary.LastBodyEditDate, HistoricalSummary.AvgTimeBetweenBodyEditsSec
+ORDER BY
+    UAS.Reputation DESC, PEM.QuestionScore DESC, PEM.ViewCount DESC
+LIMIT 500;

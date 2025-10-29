@@ -1,0 +1,314 @@
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        0 as Level,
+        array[t.Id] as Path
+    from Tags t
+    where t.IsModeratorOnly = false and t.IsRequired = false
+
+    union all
+
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Level + 1,
+        r.Path || t.Id
+    from Tags t
+    join RecursiveTagHierarchy r on t.WikiPostId = r.Id
+    where not t.Id = any(r.Path)
+    and r.Level < 3
+),
+TopUsers as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        row_number() over (order by u.Reputation desc, u.LastAccessDate desc nulls last) as rank
+    from Users u
+    where u.Reputation > 1000
+),
+RecentGoldBadges as (
+    select
+        b.UserId,
+        b.Name as BadgeName,
+        b.Date as AwardedDate,
+        row_number() over (partition by b.UserId order by b.Date desc) as rn
+    from Badges b
+    where b.Class = 1
+      and b.Date > cast('2024-10-01' as date) - interval '2 year'
+),
+QuestionsWithStats as (
+    select
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        coalesce(p.Tags, '') as Tags,
+        (select count(*) from Comments c where c.PostId = p.Id) as CommentCount,
+        (select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 2) as UpVotesCount,
+        (select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 3) as DownVotesCount,
+        (select count(distinct ph.UserId) from PostHistory ph where ph.PostId = p.Id) as EditorCount,
+        case when p.AcceptedAnswerId is not null then 1 else 0 end as HasAcceptedAnswer,
+        p.ClosedDate
+    from Posts p
+    where p.PostTypeId = 1
+      and p.CreationDate >= cast('2024-10-01' as date) - interval '1 year'
+),
+AnswerScores as (
+    select
+        a.ParentId as QuestionId,
+        avg(a.Score) as AvgAnswerScore,
+        max(a.Score) as MaxAnswerScore,
+        min(a.Score) as MinAnswerScore,
+        count(a.Id) as TotalAnswers
+    from Posts a
+    where a.PostTypeId = 2
+      and a.CreationDate >= cast('2024-10-01' as date) - interval '1 year'
+    group by a.ParentId
+),
+CloseReasonDescs as (
+    select crt.Id, crt.Name from CloseReasonTypes crt
+),
+QuestionCloseDetails as (
+    select
+        ph.PostId,
+        max(crt.Name) as CloseReason,
+        max(ph.CreationDate) as CloseDate
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where ph.PostHistoryTypeId = 10 -- Post Closed
+    group by ph.PostId
+),
+LatestEdits as (
+    select distinct on (ph.PostId)
+        ph.PostId,
+        ph.UserId as LastEditorUserId,
+        u.DisplayName as LastEditorDisplayName,
+        ph.CreationDate as LastEditDate,
+        ph.Comment as EditComment
+    from PostHistory ph
+    left join Users u on u.Id = ph.UserId
+    where ph.PostHistoryTypeId in (4,5,6) -- Title, Body, Tags edit types
+    order by ph.PostId, ph.CreationDate desc
+),
+UserBadgeCounts as (
+    select
+      b.UserId,
+      sum(case when b.Class = 1 then 1 else 0 end) as GoldCount,
+      sum(case when b.Class = 2 then 1 else 0 end) as SilverCount,
+      sum(case when b.Class = 3 then 1 else 0 end) as BronzeCount
+    from Badges b
+    group by b.UserId
+),
+QuestionsWithAnswersAndEdits as (
+    select
+        q.Id,
+        q.Title,
+        q.OwnerUserId,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.CommentCount,
+        q.UpVotesCount,
+        q.DownVotesCount,
+        q.EditorCount,
+        q.HasAcceptedAnswer,
+        coalesce(a.AvgAnswerScore, 0) as AvgAnswerScore,
+        coalesce(a.MaxAnswerScore, 0) as MaxAnswerScore,
+        coalesce(a.MinAnswerScore, 0) as MinAnswerScore,
+        crd.CloseReason,
+        crd.CloseDate,
+        le.LastEditorUserId,
+        le.LastEditorDisplayName,
+        le.LastEditDate,
+        le.EditComment
+    from QuestionsWithStats q
+    left join AnswerScores a on a.QuestionId = q.Id
+    left join QuestionCloseDetails crd on crd.PostId = q.Id
+    left join LatestEdits le on le.PostId = q.Id
+),
+UserActivitySummary as (
+    select
+        u.Id,
+        u.DisplayName,
+        count(distinct p.Id) as QuestionsAsked,
+        count(distinct a.Id) as AnswersGiven,
+        count(distinct c.Id) as CommentsMade,
+        coalesce(ub.GoldCount, 0) as GoldBadges,
+        coalesce(ub.SilverCount, 0) as SilverBadges,
+        coalesce(ub.BronzeCount, 0) as BronzeBadges,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 1
+    left join Posts a on a.OwnerUserId = u.Id and a.PostTypeId = 2
+    left join Comments c on c.UserId = u.Id
+    left join UserBadgeCounts ub on ub.UserId = u.Id
+    group by u.Id, u.DisplayName, ub.GoldCount, ub.SilverCount, ub.BronzeCount, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+TopQuestionsWithUserInfo as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.CommentCount,
+        q.UpVotesCount,
+        q.DownVotesCount,
+        q.EditorCount,
+        q.HasAcceptedAnswer,
+        q.AvgAnswerScore,
+        q.MaxAnswerScore,
+        q.MinAnswerScore,
+        q.CloseReason,
+        q.CloseDate,
+        q.LastEditorUserId,
+        q.LastEditorDisplayName,
+        q.LastEditDate,
+        q.EditComment,
+        u.Id as UserId,
+        u.DisplayName as OwnerDisplayName,
+        u.Reputation as OwnerReputation,
+        u.GoldBadges,
+        u.SilverBadges,
+        u.BronzeBadges,
+        u.CreationDate as UserCreationDate,
+        u.LastAccessDate as UserLastAccess
+    from QuestionsWithAnswersAndEdits q
+    left join UserActivitySummary u on u.Id = q.OwnerUserId
+    where q.Score > 10
+      and q.ViewCount > 1000
+      and (q.CloseReason is null or q.CloseReason = '')
+      and u.Reputation > 5000
+)
+select distinct
+    tq.QuestionId,
+    tq.Title,
+    substring(tq.Title from 1 for 80) || '...' as PreviewTitle,
+    tq.CreationDate,
+    tq.Score,
+    tq.ViewCount,
+    tq.AnswerCount,
+    tq.CommentCount,
+    tq.UpVotesCount,
+    tq.DownVotesCount,
+    tq.EditorCount,
+    case when tq.HasAcceptedAnswer = 1 then 'Yes' else 'No' end as AcceptedAnswer,
+    round(cast(tq.AvgAnswerScore as numeric), 2) as AverageAnswerScore,
+    tq.MaxAnswerScore,
+    tq.MinAnswerScore,
+    coalesce(tq.CloseReason, 'Open') as PostStatus,
+    coalesce(to_char(tq.CloseDate, 'YYYY-MM-DD'), 'N/A') as CloseDate,
+    coalesce(tq.LastEditorDisplayName, 'No edits') as LastEditor,
+    to_char(tq.LastEditDate, 'YYYY-MM-DD HH24:MI') as LastEditTimestamp,
+    substr(coalesce(tq.EditComment, 'No comment'), 1, 60) as LastEditCommentSnippet,
+    tq.OwnerDisplayName as QuestionOwner,
+    tq.OwnerReputation,
+    tq.GoldBadges,
+    tq.SilverBadges,
+    tq.BronzeBadges,
+    to_char(tq.UserCreationDate, 'YYYY-MM-DD') as UserCreation,
+    to_char(tq.UserLastAccess, 'YYYY-MM-DD') as UserLastAccess,
+    coalesce((
+        select string_agg(distinct lt.Name, ',' order by lt.Name)
+        from PostLinks pl
+        join LinkTypes lt on lt.Id = pl.LinkTypeId
+        where pl.PostId = tq.QuestionId
+          and lt.Name in ('Linked', 'Duplicate')
+    ), 'No Links') as LinkTypesUsed,
+    length(tq.Title) + coalesce(tq.AnswerCount,0) * 2 - coalesce(tq.CommentCount,0) as CustomPostScore,
+    (
+        select count(*)
+        from Votes v
+        where v.PostId = tq.QuestionId
+          and v.VoteTypeId in (2,5)
+          and v.CreationDate >= cast('2024-10-01' as date) - interval '30 day'
+    ) as RecentPositiveVotes,
+    (
+        select u.DisplayName
+        from Posts a
+        join Users u on u.Id = a.OwnerUserId
+        where a.ParentId = tq.QuestionId
+          and a.PostTypeId = 2
+        order by a.Score desc nulls last
+        limit 1
+    ) as TopAnswerer,
+    rank() over (order by tq.Score desc) as ScoreRank
+from TopQuestionsWithUserInfo tq
+where exists (
+    select 1
+    from RecursiveTagHierarchy rth
+    where strpos(tq.Title || ' ' || coalesce(substr(coalesce(tq.EditComment, 'No comment'), 1, 60), ''), rth.TagName) > 0
+)
+group by
+    tq.QuestionId,
+    tq.Title,
+    tq.CreationDate,
+    tq.Score,
+    tq.ViewCount,
+    tq.AnswerCount,
+    tq.CommentCount,
+    tq.UpVotesCount,
+    tq.DownVotesCount,
+    tq.EditorCount,
+    tq.HasAcceptedAnswer,
+    tq.AvgAnswerScore,
+    tq.MaxAnswerScore,
+    tq.MinAnswerScore,
+    tq.CloseReason,
+    tq.CloseDate,
+    tq.LastEditorDisplayName,
+    tq.LastEditDate,
+    tq.EditComment,
+    tq.OwnerDisplayName,
+    tq.OwnerReputation,
+    tq.GoldBadges,
+    tq.SilverBadges,
+    tq.BronzeBadges,
+    tq.UserCreationDate,
+    tq.UserLastAccess,
+    tq.OwnerDisplayName,
+    tq.OwnerReputation,
+    tq.GoldBadges,
+    tq.SilverBadges,
+    tq.BronzeBadges,
+    tq.UserCreationDate,
+    tq.UserLastAccess,
+    tq.OwnerDisplayName,
+    tq.OwnerReputation,
+    tq.GoldBadges,
+    tq.SilverBadges,
+    tq.BronzeBadges,
+    tq.UserCreationDate,
+    tq.UserLastAccess,
+    tq.OwnerDisplayName,
+    tq.OwnerReputation,
+    tq.GoldBadges,
+    tq.SilverBadges,
+    tq.BronzeBadges,
+    tq.UserCreationDate,
+    tq.UserLastAccess,
+    tq.OwnerDisplayName,
+    tq.OwnerReputation,
+    tq.GoldBadges,
+    tq.SilverBadges,
+    tq.BronzeBadges,
+    tq.UserCreationDate,
+    tq.UserLastAccess,
+    tq.EditComment,
+    tq.LastEditorDisplayName,
+    tq.QuestionId
+order by ScoreRank
+limit 50;

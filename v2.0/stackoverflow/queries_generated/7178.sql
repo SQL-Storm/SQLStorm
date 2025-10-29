@@ -1,0 +1,259 @@
+-- {"query": "7178.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2701} 
+WITH UserPostStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) as TotalQuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) as TotalAnswerScore,
+        MAX(p.CreationDate) as LastPostDate,
+        AVG(p.Score) as AvgScore,
+        STRING_AGG(DISTINCT COALESCE(p.Tags, ''), ' | ') as AllTags,
+        COUNT(DISTINCT b.Id) as BadgesCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.ViewCount > 1000 THEN p.Id END) as HighViewQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.Score > 10 THEN p.Id END) as HighScoreAnswers
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+RankedUsers AS (
+    SELECT 
+        *,
+        ROW_NUMBER() OVER (ORDER BY TotalQuestionScore DESC) as RankByScore,
+        RANK() OVER (ORDER BY TotalPosts DESC) as RankByPostCount,
+        DENSE_RANK() OVER (ORDER BY BadgesCount DESC) as RankByBadges
+    FROM UserPostStats
+),
+UserActivity AS (
+    SELECT 
+        r.UserId,
+        r.DisplayName,
+        r.Reputation,
+        r.TotalPosts,
+        r.Questions,
+        r.Answers,
+        r.TotalQuestionScore,
+        r.TotalAnswerScore,
+        r.LastPostDate,
+        r.AvgScore,
+        r.AllTags,
+        r.BadgesCount,
+        COALESCE(r.HighViewQuestions, 0) as HighViewQuestions,
+        COALESCE(r.HighScoreAnswers, 0) as HighScoreAnswers,
+        CASE 
+            WHEN r.TotalPosts > 100 AND r.BadgesCount > 10 THEN 'Active'
+            WHEN r.TotalPosts > 50 AND r.BadgesCount > 5 THEN 'Moderate'
+            WHEN r.TotalPosts > 10 THEN 'Beginner'
+            ELSE 'New'
+        END as ActivityLevel,
+        DATEDIFF(day, r.LastPostDate, CURRENT_TIMESTAMP) as DaysSinceLastPost,
+        LAG(r.TotalPosts) OVER (ORDER BY r.TotalPosts DESC) - r.TotalPosts as PostsDifferenceFromNextUser,
+        PERCENT_RANK() OVER (ORDER BY r.TotalQuestionScore) as ScorePercentile,
+        (r.TotalQuestionScore + r.TotalAnswerScore) / NULLIF((r.Questions + r.Answers), 0) as AvgScorePerPost,
+        CASE WHEN r.TotalQuestionScore > 10000 THEN 'Top Contributor' 
+             WHEN r.TotalQuestionScore > 5000 THEN 'Good Contributor' 
+             ELSE 'Regular Contributor' END as ContributionTier
+    FROM RankedUsers r
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        u.DisplayName as OwnerName,
+        p.PostTypeId,
+        p.Tags,
+        CASE WHEN p.ParentId IS NOT NULL THEN 'Answer' ELSE 'Question' END as PostType,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as PostsByUser,
+        RANK() OVER (ORDER BY p.Score DESC) as ScoreRank,
+        DENSE_RANK() OVER (ORDER BY p.ViewCount DESC) as ViewRank,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as AvgScorePerUser,
+        PERCENT_RANK() OVER (ORDER BY p.ViewCount) as ViewPercentile,
+        LAG(p.Score) OVER (ORDER BY p.Score DESC) - p.Score as ScoreDifference,
+        CASE WHEN p.Tags IS NOT NULL AND p.Tags LIKE '%<%' THEN 
+            ARRAY_LENGTH(SPLIT_PART(p.Tags, '><', '1', ''), '<') 
+        ELSE 0 END as TagCount,
+        COALESCE(p.AnswerCount, 0) / NULLIF(COALESCE(p.ViewCount, 1), 0) as AnswerToViewRatio,
+        CASE WHEN p.Score > 100 THEN 'High' 
+             WHEN p.Score > 50 THEN 'Medium' 
+             ELSE 'Low' END as ScoreCategory
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1, 2)
+      AND p.CreationDate > '2020-01-01'
+),
+TagFrequency AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Very Popular'
+            WHEN t.Count > 500 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            ELSE 'Less Popular'
+        END as PopularityLevel,
+        RANK() OVER (ORDER BY t.Count DESC) as PopularityRank,
+        PERCENT_RANK() OVER (ORDER BY t.Count) as PopularityPercentile
+    FROM Tags t
+),
+CombinedAnalysis AS (
+    SELECT 
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.TotalPosts,
+        ua.Questions,
+        ua.Answers,
+        ua.TotalQuestionScore,
+        ua.TotalAnswerScore,
+        ua.LastPostDate,
+        ua.AvgScore,
+        ua.AllTags,
+        ua.BadgesCount,
+        ua.HighViewQuestions,
+        ua.HighScoreAnswers,
+        ua.ActivityLevel,
+        ua.DaysSinceLastPost,
+        ua.PostsDifferenceFromNextUser,
+        ua.ScorePercentile,
+        ua.AvgScorePerPost,
+        ua.ContributionTier,
+        COALESCE(pa.ScoreRank, 0) as HighestScoreRank,
+        COALESCE(pa.ViewRank, 0) as HighestViewRank,
+        COALESCE(pa.TagCount, 0) as TagsUsed,
+        COALESCE(pa.ScoreCategory, 'Unknown') as ContentScoreCategory,
+        COALESCE(tf.PopularityLevel, 'N/A') as TagPopularity,
+        COALESCE(tf.PopularityRank, 0) as TagPopularityRank,
+        COALESCE(pa.PostType, 'N/A') as PostType
+    FROM UserActivity ua
+    LEFT JOIN (
+        SELECT 
+            PostId,
+            MAX(ScoreRank) as ScoreRank,
+            MAX(ViewRank) as ViewRank,
+            MAX(TagCount) as TagCount,
+            MAX(ScoreCategory) as ScoreCategory,
+            MAX(PostType) as PostType
+        FROM PostAnalysis
+        GROUP BY PostId
+    ) pa ON 1=1
+    LEFT JOIN TagFrequency tf ON tf.TagName LIKE '%' || SUBSTRING(ua.AllTags, 1, 5) || '%'
+    WHERE ua.Reputation > 1000
+)
+SELECT 
+    CAST(ROW_NUMBER() OVER (ORDER BY ca.TotalQuestionScore DESC) AS BIGINT) as RowNum,
+    ca.UserId,
+    ca.DisplayName,
+    ca.Reputation,
+    ca.TotalPosts,
+    ca.Questions,
+    ca.Answers,
+    ca.TotalQuestionScore,
+    ca.TotalAnswerScore,
+    ca.LastPostDate,
+    ca.AvgScore,
+    CASE 
+        WHEN ca.AllTags IS NOT NULL THEN 
+            CASE 
+                WHEN LENGTH(ca.AllTags) > 500 THEN LEFT(ca.AllTags, 500) || '...' 
+                ELSE ca.AllTags 
+            END
+        ELSE 'No Tags'
+    END as CleanedTags,
+    ca.BadgesCount,
+    ca.HighViewQuestions,
+    ca.HighScoreAnswers,
+    ca.ActivityLevel,
+    ca.DaysSinceLastPost,
+    ca.PostsDifferenceFromNextUser,
+    ROUND(ca.ScorePercentile * 100, 2) as ScorePercentile,
+    ROUND(ca.AvgScorePerPost, 2) as AvgScorePerPost,
+    ca.ContributionTier,
+    CASE 
+        WHEN ca.HighestScoreRank > 0 THEN CONCAT('Top ', ca.HighestScoreRank, ' Score')
+        ELSE 'Not Ranked'
+    END as ScorePosition,
+    CASE 
+        WHEN ca.HighestViewRank > 0 THEN CONCAT('Top ', ca.HighestViewRank, ' Views')
+        ELSE 'Not Ranked'
+    END as ViewPosition,
+    CASE 
+        WHEN ca.TagsUsed > 0 THEN CONCAT('Used ', ca.TagsUsed, ' tags')
+        ELSE 'No tags used'
+    END as TagUsage,
+    CASE 
+        WHEN ca.ContentScoreCategory = 'High' THEN 'High-Quality Content'
+        WHEN ca.ContentScoreCategory = 'Medium' THEN 'Medium-Quality Content'
+        ELSE 'Low-Quality Content'
+    END as ContentQuality,
+    CASE 
+        WHEN ca.TagPopularityRank > 0 THEN 
+            CASE 
+                WHEN ca.TagPopularityRank <= 50 THEN CONCAT('Among Top 50: ', ca.TagPopularity)
+                WHEN ca.TagPopularityRank <= 100 THEN CONCAT('Among Top 100: ', ca.TagPopularity)
+                ELSE CONCAT('Among Other: ', ca.TagPopularity)
+            END
+        ELSE 'No Tag Popularity'
+    END as TagPopularityLevel,
+    CASE 
+        WHEN ca.PostType = 'Answer' THEN 'Answer Type'
+        WHEN ca.PostType = 'Question' THEN 'Question Type'
+        ELSE 'Mixed Post Types'
+    END as PostFocusType,
+    -- Complex NULL handling
+    COALESCE(NULLIF(ca.HighestScoreRank, 0), 999999) as EffectiveScoreRank,
+    COALESCE(NULLIF(ca.HighestViewRank, 0), 999999) as EffectiveViewRank,
+    -- Complex set operators and aggregations
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = ca.UserId AND p.PostTypeId = 1) as UserQuestions,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = ca.UserId AND p.PostTypeId = 2) as UserAnswers,
+    (SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = ca.UserId AND p.PostTypeId = 1) as AvgQuestionScore,
+    (SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = ca.UserId AND p.PostTypeId = 2) as AvgAnswerScore,
+    (SELECT STRING_AGG(p.Title, ' | ') FROM Posts p WHERE p.OwnerUserId = ca.UserId AND p.PostTypeId = 1 LIMIT 10) as RecentQuestions,
+    COALESCE(
+        (SELECT COUNT(*) FROM Comments c WHERE c.UserId = ca.UserId AND c.CreationDate > '2020-01-01'), 
+        0
+    ) as RecentComments,
+    -- Correlated subquery with complex join
+    (
+        SELECT COUNT(*) 
+        FROM Posts p1 
+        JOIN Posts p2 ON p1.ParentId = p2.Id 
+        JOIN Users u1 ON p1.OwnerUserId = u1.Id 
+        WHERE u1.Id = ca.UserId 
+          AND p1.CreationDate > '2020-01-01'
+    ) as RecentAnsweredQuestions,
+    -- Window functions and complex expressions
+    CASE 
+        WHEN ca.AvgScorePerPost > 10 THEN 'Above Average'
+        WHEN ca.AvgScorePerPost > 5 THEN 'Average'
+        ELSE 'Below Average'
+    END as PerformanceTier,
+    -- Set operations in expression
+    CASE 
+        WHEN ca.TotalPosts > 50 OR ca.BadgesCount > 5 THEN 'Engaged'
+        WHEN ca.TotalPosts > 10 OR ca.BadgesCount > 2 THEN 'Participating'
+        ELSE 'Observing'
+    END as EngagementLevel
+FROM CombinedAnalysis ca
+WHERE ca.Reputation > 1000
+  AND (
+    ca.TotalQuestionScore > 1000 OR 
+    ca.TotalAnswerScore > 1000 OR 
+    ca.BadgesCount > 10 OR 
+    ca.HighViewQuestions > 5 OR 
+    ca.HighScoreAnswers > 5
+  )
+  AND ca.DaysSinceLastPost < 365
+ORDER BY ca.TotalQuestionScore DESC
+LIMIT 1000;

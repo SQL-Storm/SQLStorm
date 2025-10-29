@@ -1,0 +1,220 @@
+-- {"query": "1452.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2782} 
+WITH UserActivitySummary AS (
+    -- Aggregates user-specific metrics including posts, comments, votes, badges, and tenure.
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        COUNT(DISTINCT P.Id) AS TotalPostsCreated,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestionsAsked,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswersProvided,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT B.Id) AS TotalBadgesEarned,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesGiven,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesGiven,
+        SUM(P.Score) AS TotalPostScoreOwned, -- Sum of scores of posts owned by user
+        AVG(P.Score) FILTER (WHERE P.Score IS NOT NULL) AS AveragePostScorePerUser,
+        DATE_PART('day', AGE(U.LastAccessDate, U.CreationDate)) AS UserTenureDays,
+        COALESCE(MAX(P.LastActivityDate), U.LastAccessDate) AS LastPostOrAccessActivity
+    FROM
+        Users AS U
+    LEFT JOIN
+        Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN
+        Comments AS C ON U.Id = C.UserId
+    LEFT JOIN
+        Badges AS B ON U.Id = B.UserId
+    LEFT JOIN
+        Votes AS V ON U.Id = V.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate
+),
+QuestionEngagementMetrics AS (
+    -- Calculates various engagement metrics for questions, including answer statistics and time-to-first-answer.
+    SELECT
+        Q.Id AS QuestionId,
+        Q.Title AS QuestionTitle,
+        Q.CreationDate AS QuestionCreationDate,
+        Q.Score AS QuestionScore,
+        Q.ViewCount,
+        Q.AnswerCount AS DeclaredAnswerCount,
+        Q.CommentCount AS QuestionCommentCount,
+        Q.FavoriteCount,
+        Q.OwnerUserId,
+        Q.Tags,
+        MIN(A.CreationDate) AS FirstAnswerDate,
+        MAX(A.CreationDate) AS LastAnswerDate,
+        COUNT(A.Id) AS ActualAnswerCount,
+        SUM(A.Score) AS TotalAnswerScore,
+        AVG(A.Score) AS AvgAnswerScore,
+        EXTRACT(EPOCH FROM (MIN(A.CreationDate) - Q.CreationDate)) AS TimeToFirstAnswerSeconds, -- Time difference in seconds
+        LENGTH(Q.Body) AS QuestionBodyLength
+    FROM
+        Posts AS Q
+    WHERE
+        Q.PostTypeId = 1 -- Only questions
+    LEFT JOIN
+        Posts AS A ON Q.Id = A.ParentId AND A.PostTypeId = 2 -- Answers to this question
+    GROUP BY
+        Q.Id, Q.Title, Q.CreationDate, Q.Score, Q.ViewCount, Q.AnswerCount, Q.CommentCount, Q.FavoriteCount, Q.OwnerUserId, Q.Tags, Q.Body
+),
+PostHistoryAnalysis AS (
+    -- Analyzes post history for moderation events, significant edits, and identifies the last editor.
+    SELECT
+        PH.PostId,
+        COUNT(CASE WHEN PH.PostHistoryTypeId IN (10, 101, 102, 103, 104, 105) THEN 1 END) AS CloseEventsCount,
+        COUNT(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6, 8) THEN 1 END) AS MajorEditEventsCount,
+        COUNT(CASE WHEN PH.PostHistoryTypeId IN (12, 13) THEN 1 END) AS DeleteUndeleteEventsCount,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (10, 101, 102, 103, 104, 105) THEN PH.CreationDate ELSE NULL END) AS LastCloseDate,
+        -- Correlated subquery to find the display name of the last editor for a body edit
+        (
+            SELECT
+                COALESCE(U_INNER.DisplayName, PH_INNER.UserDisplayName, 'Community')
+            FROM
+                PostHistory AS PH_INNER
+            LEFT JOIN
+                Users AS U_INNER ON PH_INNER.UserId = U_INNER.Id
+            WHERE
+                PH_INNER.PostId = PH.PostId
+                AND PH_INNER.PostHistoryTypeId IN (5) -- Body Edit
+            ORDER BY
+                PH_INNER.CreationDate DESC
+            LIMIT 1
+        ) AS LastBodyEditorDisplayName,
+        -- Aggregates distinct close reasons into a single string.
+        STRING_AGG(DISTINCT CR.Name, '; ') FILTER (WHERE PH.PostHistoryTypeId = 10 AND PH.Comment IS NOT NULL) AS AllCloseReasons
+    FROM
+        PostHistory AS PH
+    LEFT JOIN
+        CloseReasonTypes AS CR ON PH.Comment = CR.Id::varchar(50) -- Cast for potential type mismatch if Comment stores numeric ID as string.
+    GROUP BY
+        PH.PostId
+),
+PostTagAnalysis AS (
+    -- Expands the 'Tags' string into individual tags for each question using string_to_array and UNNEST.
+    SELECT
+        Q.QuestionId,
+        UNNEST(string_to_array(SUBSTRING(Q.Tags, 2, LENGTH(Q.Tags) - 2), '><')) AS TagName
+    FROM
+        QuestionEngagementMetrics AS Q
+    WHERE
+        Q.Tags IS NOT NULL AND LENGTH(Q.Tags) > 2
+),
+AggregatedTagMetrics AS (
+    -- Aggregates performance metrics for each tag.
+    SELECT
+        PTA.TagName,
+        COUNT(DISTINCT PTA.QuestionId) AS TaggedQuestionCount,
+        SUM(QEM.QuestionScore) AS TotalTagScore,
+        AVG(QEM.QuestionScore) AS AvgTagQuestionScore,
+        AVG(QEM.TimeToFirstAnswerSeconds) FILTER (WHERE QEM.TimeToFirstAnswerSeconds IS NOT NULL) AS AvgTimeToFirstAnswerForTag,
+        COUNT(DISTINCT PHA.PostId) FILTER (WHERE PHA.CloseEventsCount > 0) AS QuestionsWithCloseEventsInTag
+    FROM
+        PostTagAnalysis AS PTA
+    JOIN
+        QuestionEngagementMetrics AS QEM ON PTA.QuestionId = QEM.QuestionId
+    LEFT JOIN
+        PostHistoryAnalysis AS PHA ON PTA.QuestionId = PHA.PostId
+    GROUP BY
+        PTA.TagName
+),
+RankedAggregatedTagMetrics AS (
+    -- Ranks tags based on average question score and categorizes them into quintiles based on closed events.
+    SELECT
+        TagName,
+        TaggedQuestionCount,
+        TotalTagScore,
+        AvgTagQuestionScore,
+        AvgTimeToFirstAnswerForTag,
+        QuestionsWithCloseEventsInTag,
+        RANK() OVER (ORDER BY AvgTagQuestionScore DESC, TaggedQuestionCount DESC) AS TagAvgScoreRank,
+        NTILE(5) OVER (ORDER BY QuestionsWithCloseEventsInTag DESC, TaggedQuestionCount DESC) AS TagClosedQuestionQuintile
+    FROM
+        AggregatedTagMetrics
+    WHERE
+        TaggedQuestionCount >= 10 -- Filters for tags with sufficient data
+),
+FinalReportData AS (
+    -- Combines all previous CTEs to generate a comprehensive dataset for the final report.
+    SELECT
+        UAS.UserId,
+        UAS.DisplayName AS UserDisplayName,
+        UAS.Reputation,
+        UAS.UserTenureDays,
+        UAS.TotalPostsCreated,
+        UAS.TotalQuestionsAsked,
+        UAS.TotalAnswersProvided,
+        UAS.TotalBadgesEarned,
+        QEM.QuestionId,
+        QEM.QuestionTitle,
+        QEM.QuestionCreationDate,
+        QEM.QuestionScore,
+        QEM.ViewCount,
+        QEM.FavoriteCount,
+        QEM.ActualAnswerCount,
+        QEM.AvgAnswerScore,
+        QEM.TimeToFirstAnswerSeconds,
+        PHA.CloseEventsCount,
+        PHA.MajorEditEventsCount,
+        PHA.LastBodyEditorDisplayName,
+        PHA.AllCloseReasons,
+        RAT.TagName AS PrimaryTagForQuestion, -- Selects the 'first' tag alphabetically for consistent primary tag representation
+        RAT.AvgTagQuestionScore AS PrimaryTagAvgScore,
+        RAT.TagAvgScoreRank,
+        -- Complex calculation: A weighted score combining question score, average answer score, favorites, and view-to-body-length ratio.
+        (QEM.QuestionScore * 0.5 + COALESCE(QEM.AvgAnswerScore, 0) * 0.3 + COALESCE(QEM.FavoriteCount, 0) * 0.2)
+        * (1 + (QEM.ViewCount / NULLIF(QEM.QuestionBodyLength, 0)::numeric / 1000.0)) AS EngagementImpactScore,
+        -- Categorizes questions based on various thresholds of engagement and moderation actions.
+        CASE
+            WHEN QEM.QuestionScore > 100 AND QEM.ActualAnswerCount >= 5 THEN 'Highly Engaged & Answered'
+            WHEN QEM.ViewCount > 5000 AND QEM.TimeToFirstAnswerSeconds IS NOT NULL AND QEM.TimeToFirstAnswerSeconds < 3600 THEN 'Popular & Quick Resolution'
+            WHEN PHA.CloseEventsCount > 0 AND PHA.MajorEditEventsCount > 2 THEN 'Debated/Modified'
+            WHEN QEM.FavoriteCount IS NOT NULL AND QEM.FavoriteCount > 0 THEN 'Favorited'
+            ELSE 'Standard'
+        END AS QuestionCategory,
+        NULLIF(QEM.QuestionScore, 0) / NULLIF(QEM.ViewCount, 0)::numeric AS ScorePerViewRatio,
+        ABS(COALESCE(UAS.TotalUpvotesGiven, 0) - COALESCE(UAS.TotalDownvotesGiven, 0)) AS VoteSpreadMagnitude
+    FROM
+        UserActivitySummary AS UAS
+    INNER JOIN
+        QuestionEngagementMetrics AS QEM ON UAS.UserId = QEM.OwnerUserId
+    LEFT JOIN
+        PostHistoryAnalysis AS PHA ON QEM.QuestionId = PHA.PostId
+    LEFT JOIN LATERAL ( -- Lateral join to retrieve metrics for the 'primary' tag of each question.
+        SELECT
+            TA.TagName,
+            RAM.AvgTagQuestionScore,
+            RAM.TagAvgScoreRank
+        FROM
+            PostTagAnalysis AS TA
+        JOIN
+            RankedAggregatedTagMetrics AS RAM ON TA.TagName = RAM.TagName
+        WHERE TA.QuestionId = QEM.QuestionId
+        ORDER BY TA.TagName -- Ensures a consistent "primary" tag is chosen if multiple exist
+        LIMIT 1
+    ) AS RAT ON TRUE
+    WHERE
+        UAS.Reputation > 10000 -- Focuses on questions from highly reputed users
+        AND QEM.QuestionCreationDate >= '2022-01-01' -- Filters for recent questions
+        AND QEM.QuestionBodyLength IS NOT NULL AND QEM.QuestionBodyLength > 50 -- Excludes trivial questions
+)
+SELECT
+    *,
+    ROW_NUMBER() OVER (PARTITION BY UserDisplayName ORDER BY EngagementImpactScore DESC, QuestionCreationDate DESC) AS UserQuestionRank,
+    DENSE_RANK() OVER (ORDER BY EngagementImpactScore DESC, QuestionId DESC) AS GlobalEngagementRank
+FROM
+    FinalReportData
+WHERE
+    EngagementImpactScore IS NOT NULL
+    AND ScorePerViewRatio IS NOT NULL
+    AND (
+        QuestionCategory = 'Highly Engaged & Answered'
+        OR QuestionCategory = 'Popular & Quick Resolution'
+        OR PrimaryTagAvgScore > 50 -- High-performing tag criteria
+        OR VoteSpreadMagnitude > 50 -- Significant vote activity
+    )
+ORDER BY
+    GlobalEngagementRank ASC, UserDisplayName, UserQuestionRank
+LIMIT 500;

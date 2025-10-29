@@ -1,0 +1,168 @@
+WITH PostTags AS (
+    -- Recursive CTE to split tags like '<tag1><tag2>' into multiple rows.
+    SELECT
+        p.OwnerUserId AS UserId,
+        TRIM(BOTH '<>' FROM p.Tags) AS RawTags,
+        CAST(NULL AS VARCHAR) AS Tag,
+        0 AS ord
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.OwnerUserId IS NOT NULL AND p.Tags IS NOT NULL
+
+    UNION ALL
+
+    SELECT
+        UserId,
+        CASE
+            WHEN POSITION('><' IN RawTags) > 0 THEN SUBSTRING(RawTags FROM POSITION('><' IN RawTags) + 2)
+            ELSE ''
+        END AS RawTags,
+        CASE
+            WHEN POSITION('><' IN RawTags) > 0 THEN SUBSTRING(RawTags FROM 1 FOR POSITION('><' IN RawTags) - 1)
+            ELSE RawTags
+        END AS Tag,
+        ord + 1 AS ord
+    FROM PostTags
+    WHERE RawTags <> ''
+),
+
+ExplodedTags AS (
+    SELECT UserId, Tag
+    FROM PostTags
+    WHERE Tag IS NOT NULL AND Tag <> ''
+),
+
+UserPosts AS (
+    SELECT 
+        u.Id                              AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate                    AS UserCreated,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswerCount,
+        SUM(p.Score)                      AS TotalScore,
+        MAX(p.CreationDate)               AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+
+UserBadges AS (
+    SELECT 
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        MAX(b.Date)                         AS LastBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+UserTopTags AS (
+    SELECT 
+        ub.UserId,
+        t.TagName,
+        ROW_NUMBER() OVER (PARTITION BY ub.UserId ORDER BY ub.cnt DESC, t.TagName) AS rn,
+        ub.cnt
+    FROM (
+        SELECT 
+            et.UserId,
+            et.Tag,
+            COUNT(*) AS cnt
+        FROM ExplodedTags et
+        GROUP BY et.UserId, et.Tag
+    ) ub
+    JOIN Tags t ON t.TagName = ub.Tag
+),
+
+RecentVotes AS (
+    SELECT 
+        v.UserId,
+        COUNT(CASE WHEN vt.Name = 'UpMod' THEN 1 END)   AS UpVotesGiven,
+        COUNT(CASE WHEN vt.Name = 'DownMod' THEN 1 END) AS DownVotesGiven,
+        MAX(v.CreationDate)                         AS LastVoteDate
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE v.UserId IS NOT NULL
+    GROUP BY v.UserId
+),
+
+Combined AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(up.QuestionCount, 0) AS QuestionCount,
+        COALESCE(up.AnswerCount, 0)   AS AnswerCount,
+        COALESCE(up.TotalScore, 0)    AS TotalScore,
+        COALESCE(ub.GoldBadges, 0)    AS GoldBadges,
+        COALESCE(ub.SilverBadges, 0)  AS SilverBadges,
+        COALESCE(ub.BronzeBadges, 0)  AS BronzeBadges,
+        COALESCE(rv.UpVotesGiven, 0)  AS UpVotesGiven,
+        COALESCE(rv.DownVotesGiven,0) AS DownVotesGiven,
+        up.LastPostDate,
+        ub.LastBadgeDate,
+        rv.LastVoteDate
+    FROM Users u
+    LEFT JOIN UserPosts   up ON up.UserId = u.Id
+    LEFT JOIN UserBadges  ub ON ub.UserId = u.Id
+    LEFT JOIN RecentVotes rv ON rv.UserId = u.Id
+),
+
+Final AS (
+    SELECT 
+        c.Id,
+        c.DisplayName,
+        c.Reputation,
+        c.QuestionCount,
+        c.AnswerCount,
+        c.TotalScore,
+        c.GoldBadges,
+        c.SilverBadges,
+        c.BronzeBadges,
+        c.UpVotesGiven,
+        c.DownVotesGiven,
+        c.LastPostDate,
+        c.LastBadgeDate,
+        c.LastVoteDate,
+        ROW_NUMBER() OVER (ORDER BY c.Reputation DESC, c.TotalScore DESC) AS ReputationRank,
+        CASE 
+            WHEN c.QuestionCount = 0 AND c.AnswerCount = 0 THEN 'NoPosts'
+            WHEN c.QuestionCount > c.AnswerCount          THEN 'QuestionHeavy'
+            WHEN c.AnswerCount > c.QuestionCount          THEN 'AnswerHeavy'
+            ELSE 'Balanced'
+        END AS PostingProfile
+    FROM Combined c
+)
+
+SELECT 
+    f.Id,
+    f.DisplayName,
+    f.Reputation,
+    f.ReputationRank,
+    f.QuestionCount,
+    f.AnswerCount,
+    f.TotalScore,
+    f.GoldBadges,
+    f.SilverBadges,
+    f.BronzeBadges,
+    f.UpVotesGiven,
+    f.DownVotesGiven,
+    COALESCE(t.TagName, 'N/A') AS TopTag,
+    t.cnt                      AS TopTagUsage,
+    f.PostingProfile,
+    CASE 
+        WHEN f.LastPostDate IS NULL THEN NULL
+        ELSE EXTRACT(DAY FROM (TIMESTAMP '2024-10-01 12:34:56' - f.LastPostDate))
+    END AS DaysSinceLastPost,
+    CASE 
+        WHEN f.LastBadgeDate IS NULL THEN NULL
+        ELSE EXTRACT(DAY FROM (TIMESTAMP '2024-10-01 12:34:56' - f.LastBadgeDate))
+    END AS DaysSinceLastBadge
+FROM Final f
+LEFT JOIN (
+    SELECT ut.UserId, ut.TagName, ut.cnt
+    FROM UserTopTags ut
+    WHERE ut.rn = 1
+) t ON t.UserId = f.Id
+WHERE f.ReputationRank <= 100
+ORDER BY f.ReputationRank;

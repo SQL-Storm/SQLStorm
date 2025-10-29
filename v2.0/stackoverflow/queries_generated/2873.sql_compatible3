@@ -1,0 +1,202 @@
+WITH RecursiveUserActivityCTE AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.CreationDate,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(b.Date) AS LastBadgeDate,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY ph.CreationDate DESC) AS ActivityRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id AND b.Class = 1
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.CreationDate, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopActiveUsers AS (
+    SELECT UserId, DisplayName, Reputation, QuestionCount, AnswerCount, BadgeCount, LastBadgeDate
+    FROM RecursiveUserActivityCTE
+    WHERE ActivityRank = 1
+      AND Reputation > 1000
+),
+PostScoreStats AS (
+    SELECT 
+        p.OwnerUserId,
+        AVG(p.Score) AS AvgPostScore,
+        STDDEV_POP(p.Score) AS StdDevPostScore,
+        MAX(p.Score) AS MaxPostScore,
+        MIN(p.Score) AS MinPostScore,
+        COUNT(*) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS Questions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS Answers,
+        SUM(CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END) AS ClosedPosts
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+TopPosts AS (
+    SELECT 
+        p.Id,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.PostTypeId,
+        p.Title,
+        p.Tags,
+        p.ViewCount,
+        p.AnswerCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate ASC) AS rn
+    FROM Posts p
+    WHERE p.Score > 10 AND p.PostTypeId IN (1,2)
+),
+UserTagEngagement AS (
+    SELECT 
+        p.OwnerUserId,
+        LOWER(TRIM(regexp_split_to_table(TRIM(BOTH '<>' FROM COALESCE(p.Tags, '')), '><'))) AS Tag,
+        COUNT(*) AS TagPostsCount,
+        SUM(p.Score) AS TotalTagScore
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.OwnerUserId IS NOT NULL AND p.Tags IS NOT NULL
+    GROUP BY p.OwnerUserId, LOWER(TRIM(regexp_split_to_table(TRIM(BOTH '<>' FROM COALESCE(p.Tags, '')), '><')))
+),
+UserCloseReasons AS (
+    SELECT
+        ph.UserId,
+        crt.Name AS CloseReasonName,
+        COUNT(*) AS CloseVotesCast
+    FROM PostHistory ph
+    INNER JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS integer)
+    WHERE ph.PostHistoryTypeId = 10 AND ph.UserId IS NOT NULL
+    GROUP BY ph.UserId, crt.Name
+),
+UserBadgeDistribution AS (
+    SELECT
+        b.UserId,
+        b.Class,
+        COUNT(*) AS BadgeCount
+    FROM Badges b
+    GROUP BY b.UserId, b.Class
+),
+UserActivitySummary AS (
+    SELECT
+        u.UserId,
+        u.DisplayName,
+        u.Reputation,
+        pss.TotalPosts,
+        pss.Questions,
+        pss.Answers,
+        pss.ClosedPosts,
+        u.BadgeCount AS GoldBadges,
+        COALESCE(bdSilver.BadgeCount,0) AS SilverBadges,
+        COALESCE(bdBronze.BadgeCount,0) AS BronzeBadges,
+        uae.Tag,
+        uae.TagPostsCount,
+        uae.TotalTagScore,
+        COALESCE(uc.CloseReasonName, 'No Close Votes') AS CloseReason,
+        COALESCE(uc.CloseVotesCast,0) AS CloseVotesCast,
+        tp.Id AS TopPostId,
+        tp.Title AS TopPostTitle,
+        tp.Score AS TopPostScore,
+        tp.CreationDate AS TopPostCreationDate
+    FROM TopActiveUsers u
+    LEFT JOIN PostScoreStats pss ON pss.OwnerUserId = u.UserId
+    LEFT JOIN UserBadgeDistribution bdSilver ON bdSilver.UserId = u.UserId AND bdSilver.Class = 2
+    LEFT JOIN UserBadgeDistribution bdBronze ON bdBronze.UserId = u.UserId AND bdBronze.Class = 3
+    LEFT JOIN UserTagEngagement uae ON uae.OwnerUserId = u.UserId
+    LEFT JOIN (
+        SELECT UserId, CloseReasonName, CloseVotesCast
+        FROM UserCloseReasons
+    ) uc ON uc.UserId = u.UserId
+    LEFT JOIN TopPosts tp ON tp.OwnerUserId = u.UserId AND tp.rn = 1
+)
+SELECT
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.TotalPosts,
+    uas.Questions,
+    uas.Answers,
+    uas.ClosedPosts,
+    uas.GoldBadges,
+    uas.SilverBadges,
+    uas.BronzeBadges,
+    COALESCE(u1.HighQuestionScore, 0) AS HighestQScore,
+    COALESCE(u2.HighAnswerScore, 0) AS HighestAScore,
+    uas.Tag,
+    uas.TagPostsCount,
+    uas.TotalTagScore,
+    uas.CloseReason,
+    uas.CloseVotesCast,
+    uas.TopPostId,
+    uas.TopPostTitle,
+    uas.TopPostScore,
+    uas.TopPostCreationDate,
+    CASE 
+        WHEN uas.TopPostTitle IS NOT NULL AND uas.TopPostScore > 50 THEN
+            CONCAT(SUBSTRING(uas.TopPostTitle FROM 1 FOR 25), '... [HOT]')
+        WHEN uas.TopPostTitle IS NULL THEN '<No Top Post>'
+        ELSE
+            uas.TopPostTitle
+    END AS TopPostDisplayTitle,
+    PERCENT_RANK() OVER (ORDER BY uas.Reputation DESC) AS ReputationPercentile,
+    CASE 
+        WHEN NOT EXISTS (
+            SELECT 1 
+            FROM Posts p 
+            WHERE p.OwnerUserId = uas.UserId AND p.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '180 days')
+        ) THEN 'Dormant'
+        ELSE 'Active'
+    END AS RecentActivityStatus
+FROM UserActivitySummary uas
+LEFT JOIN (
+    SELECT OwnerUserId, MAX(Score) AS HighQuestionScore
+    FROM Posts
+    WHERE PostTypeId = 1
+    GROUP BY OwnerUserId
+) u1 ON u1.OwnerUserId = uas.UserId
+LEFT JOIN (
+    SELECT OwnerUserId, MAX(Score) AS HighAnswerScore
+    FROM Posts
+    WHERE PostTypeId = 2
+    GROUP BY OwnerUserId
+) u2 ON u2.OwnerUserId = uas.UserId
+WHERE PERCENT_RANK() OVER (ORDER BY uas.Reputation DESC) BETWEEN 0.8 AND 1.0
+ORDER BY uas.Reputation DESC, uas.TotalPosts DESC
+LIMIT 50
+
+UNION ALL
+
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    0 AS TotalPosts,
+    0 AS Questions,
+    0 AS Answers,
+    0 AS ClosedPosts,
+    0 AS GoldBadges,
+    0 AS SilverBadges,
+    0 AS BronzeBadges,
+    NULL::integer AS HighestQScore,
+    NULL::integer AS HighestAScore,
+    NULL::text AS Tag,
+    NULL::integer AS TagPostsCount,
+    NULL::integer AS TotalTagScore,
+    '<No Data>' AS CloseReason,
+    0 AS CloseVotesCast,
+    NULL::integer AS TopPostId,
+    NULL::text AS TopPostTitle,
+    NULL::integer AS TopPostScore,
+    NULL::timestamp AS TopPostCreationDate,
+    '<No Data>' AS TopPostDisplayTitle,
+    0.0 AS ReputationPercentile,
+    'NoPosts' AS RecentActivityStatus
+FROM Users u
+WHERE NOT EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id)
+ORDER BY u.Reputation DESC
+LIMIT 10;

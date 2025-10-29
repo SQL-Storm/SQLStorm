@@ -1,0 +1,179 @@
+-- {"query": "4675.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1608} 
+WITH
+  RankedPostHistory AS (
+    SELECT
+      ph.PostId,
+      ph.PostHistoryTypeId,
+      ph.CreationDate,
+      ph.UserId,
+      ph.Comment,
+      ph.Text AS HistoryText,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM
+      PostHistory AS ph
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+  ),
+  LatestEdits AS (
+    SELECT
+      rph.PostId,
+      rph.PostHistoryTypeId,
+      rph.CreationDate AS LastEditDate,
+      rph.UserId AS LastEditorUserId,
+      rph.Comment AS LastEditComment,
+      rph.HistoryText AS LastEditContent
+    FROM
+      RankedPostHistory AS rph
+    WHERE
+      rph.rn = 1
+  ),
+  PostTags AS (
+    SELECT
+      p.Id AS PostId,
+      TRIM(SPLIT_PART(REPLACE(REPLACE(p.Tags, '<', ''), '>', ''), ',', n.n)) AS Tag
+    FROM
+      Posts AS p
+      CROSS JOIN (
+        SELECT
+          ROW_NUMBER() OVER () AS n
+        FROM
+          generate_series(1, 100)
+      ) AS n
+    WHERE
+      p.Tags IS NOT NULL
+      AND n.n <= LENGTH(p.Tags) - LENGTH(REPLACE(p.Tags, ',', '')) + 1
+  ),
+  UserPostActivity AS (
+    SELECT
+      p.OwnerUserId,
+      COUNT(DISTINCT p.Id) AS NumberOfPosts,
+      SUM(p.ViewCount) AS TotalViewCount,
+      AVG(p.Score) AS AverageScore,
+      MAX(p.CreationDate) AS LatestPostDate
+    FROM
+      Posts AS p
+    WHERE
+      p.OwnerUserId IS NOT NULL
+      AND p.OwnerUserId > 0
+    GROUP BY
+      p.OwnerUserId
+  ),
+  UserBadgeCounts AS (
+    SELECT
+      b.UserId,
+      COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+      COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+      COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges
+    FROM
+      Badges AS b
+    GROUP BY
+      b.UserId
+  ),
+  PostCloseInfo AS (
+    SELECT
+      ph.PostId,
+      MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Comment ELSE NULL END) AS CloseReasonId,
+      MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate ELSE NULL END) AS CloseDate
+    FROM
+      PostHistory AS ph
+    WHERE
+      ph.PostHistoryTypeId = 10
+    GROUP BY
+      ph.PostId
+  ),
+  HighReputationUsers AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      COALESCE(ubc.GoldBadges, 0) AS GoldBadges,
+      COALESCE(ubc.SilverBadges, 0) AS SilverBadges,
+      COALESCE(ubc.BronzeBadges, 0) AS BronzeBadges
+    FROM
+      Users AS u
+      LEFT JOIN UserBadgeCounts AS ubc ON u.Id = ubc.UserId
+    WHERE
+      u.Reputation > 10000
+  )
+SELECT
+  p.Id AS PostId,
+  pt.Name AS PostType,
+  p.Title,
+  COALESCE(p.OwnerDisplayName, u.DisplayName, 'Community') AS OwnerDisplayName,
+  p.CreationDate,
+  p.Score,
+  p.ViewCount,
+  p.AnswerCount,
+  p.CommentCount,
+  p.FavoriteCount,
+  p.ClosedDate,
+  p.CommunityOwnedDate,
+  le.LastEditDate,
+  le.LastEditorDisplayName,
+  le.LastEditComment,
+  COALESCE(pci.CloseReasonId, crt.Id) AS ExplicitCloseReasonId,
+  COALESCE(pci.CloseDate, p.ClosedDate) AS ActualCloseDate,
+  CASE
+    WHEN p.PostTypeId = 1 THEN STRING_AGG(DISTINCT ptg.Tag, ';') WITHIN GROUP (ORDER BY ptg.Tag)
+    ELSE NULL
+  END AS FormattedTags,
+  COALESCE(upa.NumberOfPosts, 0) AS UserTotalPosts,
+  COALESCE(upa.TotalViewCount, 0) AS UserTotalViews,
+  COALESCE(upa.AverageScore, 0.0) AS UserAverageScore,
+  hru.Reputation AS HighReputationScore,
+  hru.DisplayName AS HighReputationUserDisplayName
+FROM
+  Posts AS p
+  INNER JOIN PostTypes AS pt ON p.PostTypeId = pt.Id
+  LEFT JOIN Users AS u ON p.OwnerUserId = u.Id
+  LEFT JOIN LatestEdits AS le ON p.Id = le.PostId
+  LEFT JOIN PostTags AS ptg ON p.Id = ptg.PostId
+  LEFT JOIN UserPostActivity AS upa ON p.OwnerUserId = upa.OwnerUserId
+  LEFT JOIN HighReputationUsers AS hru ON p.OwnerUserId = hru.UserId
+  LEFT JOIN PostCloseInfo AS pci ON p.Id = pci.PostId
+  LEFT JOIN CloseReasonTypes AS crt ON pci.CloseReasonId = crt.Id
+WHERE
+  p.CreationDate BETWEEN '2023-01-01' AND '2023-12-31'
+  AND p.Score > 10
+  AND (
+    p.Title LIKE '%SQL%'
+    OR EXISTS (
+      SELECT
+        1
+      FROM
+        Comments AS c
+      WHERE
+        c.PostId = p.Id
+        AND c.Text LIKE '%performance%'
+    )
+  )
+GROUP BY
+  p.Id,
+  pt.Name,
+  p.Title,
+  OwnerDisplayName,
+  u.DisplayName,
+  p.CreationDate,
+  p.Score,
+  p.ViewCount,
+  p.AnswerCount,
+  p.CommentCount,
+  p.FavoriteCount,
+  p.ClosedDate,
+  p.CommunityOwnedDate,
+  le.LastEditDate,
+  le.LastEditorDisplayName,
+  le.LastEditComment,
+  pci.CloseReasonId,
+  pci.CloseDate,
+  crt.Id,
+  upa.NumberOfPosts,
+  upa.TotalViewCount,
+  upa.AverageScore,
+  hru.Reputation,
+  hru.DisplayName
+HAVING
+  COUNT(DISTINCT ptg.Tag) > 2
+ORDER BY
+  p.Score DESC
+LIMIT 100;

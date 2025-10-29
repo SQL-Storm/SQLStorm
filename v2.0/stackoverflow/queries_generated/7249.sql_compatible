@@ -1,0 +1,232 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+                SUM(COALESCE(p.Score, 0)) * 1.0 / NULLIF(COUNT(DISTINCT p.Id), 0)
+            ELSE 0 
+        END AS AvgPostScore,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags) - 2)), ', ') AS TagList,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= DATE '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+RankedUsers AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.PostCount,
+        uas.CommentCount,
+        uas.BadgeCount,
+        uas.LastPostDate,
+        uas.LastCommentDate,
+        uas.AvgPostScore,
+        uas.TagList,
+        uas.QuestionCount,
+        uas.AnswerCount,
+        ROW_NUMBER() OVER (ORDER BY uas.Reputation DESC, uas.PostCount DESC) AS RankByReputation,
+        DENSE_RANK() OVER (ORDER BY uas.AvgPostScore DESC) AS RankByAvgScore,
+        NTILE(10) OVER (ORDER BY uas.Reputation DESC) AS Decile
+    FROM UserActivityStats uas
+),
+QuestionAnalysis AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        CASE 
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Yes'
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.Score < 0 THEN 'Negative Score'
+            ELSE 'Active'
+        END AS QuestionStatus,
+        CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS HasAcceptedAnswer,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS UserAvgScore,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS QuestionSequence
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1 
+    AND p.CreationDate >= DATE '2015-01-01'
+),
+AnswerQuality AS (
+    SELECT 
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.Score,
+        a.CreationDate,
+        a.OwnerUserId,
+        CASE 
+            WHEN a.Score > 10 THEN 'High Quality'
+            WHEN a.Score > 0 THEN 'Medium Quality'
+            WHEN a.Score = 0 THEN 'Neutral'
+            ELSE 'Low Quality'
+        END AS QualityLevel,
+        RANK() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS RankInQuestion
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+    AND a.CreationDate >= DATE '2015-01-01'
+),
+UserVotingPatterns AS (
+    SELECT 
+        v.UserId,
+        COUNT(DISTINCT v.PostId) AS VotesCast,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoriteVotes,
+        CASE WHEN SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) = 0 
+             THEN NULL 
+             ELSE SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) * 1.0 / SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END)
+        END AS UpDownRatio,
+        MIN(v.CreationDate) AS FirstVoteDate,
+        MAX(v.CreationDate) AS LastVoteDate
+    FROM Votes v
+    WHERE v.CreationDate >= DATE '2015-01-01'
+    GROUP BY v.UserId
+),
+UserEngagement AS (
+    SELECT 
+        ru.UserId,
+        ru.DisplayName,
+        ru.Reputation,
+        ru.PostCount,
+        ru.CommentCount,
+        ru.BadgeCount,
+        ru.AvgPostScore,
+        ru.QuestionCount,
+        ru.AnswerCount,
+        COALESCE(uvp.VotesCast, 0) AS TotalVotesCast,
+        COALESCE(uvp.UpVotes, 0) AS TotalUpVotes,
+        COALESCE(uvp.DownVotes, 0) AS TotalDownVotes,
+        COALESCE(uvp.UpDownRatio, 0) AS UpDownRatio,
+        CASE 
+            WHEN ru.PostCount > 100 THEN 'High Engagement'
+            WHEN ru.PostCount > 25 THEN 'Medium Engagement'
+            WHEN ru.PostCount > 0 THEN 'Low Engagement'
+            ELSE 'Inactive'
+        END AS EngagementLevel
+    FROM RankedUsers ru
+    LEFT JOIN UserVotingPatterns uvp ON ru.UserId = uvp.UserId
+    WHERE ru.PostCount > 0
+)
+SELECT 
+    (
+        'User: ' || ue.DisplayName
+        || ' | Rank: ' || CAST(ru.RankByReputation AS VARCHAR)
+        || ' | Reputation: ' || CAST(ue.Reputation AS VARCHAR)
+        || ' | Posts: ' || CAST(ue.PostCount AS VARCHAR)
+        || ' | Avg Score: ' || CAST(ROUND(ue.AvgPostScore::numeric, 2) AS VARCHAR)
+        || ' | Engagement: ' || ue.EngagementLevel
+        || ' | Tags: ' ||
+        CASE 
+            WHEN COUNT(DISTINCT qa.QuestionId) > 0 THEN 'Questions with answers'
+            ELSE 'No questions'
+        END
+    ) AS UserProfileSummary,
+    
+    COUNT(DISTINCT qa.QuestionId) AS QuestionsWithAnswers,
+    COUNT(DISTINCT aa.AnswerId) AS AnswersWithScores,
+    
+    STRING_AGG(DISTINCT (qa.QuestionId::text || ':' || qa.Title), '|') AS QuestionTitles,
+    
+    STRING_AGG(DISTINCT (aa.AnswerId::text || ':' || aa.Score::text), '|') AS AnswerScores,
+    
+    MAX(ue.TotalVotesCast) AS MaxVotesCast,
+    MIN(ue.TotalUpVotes) AS MinUpVotes,
+    AVG(ue.TotalDownVotes) AS AvgDownVotes,
+    
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.OwnerUserId = ue.UserId 
+        AND p.PostTypeId = 1
+        AND p.CreationDate >= DATE '2020-01-01'
+    ) AS RecentQuestions,
+    
+    CASE 
+        WHEN EXISTS (
+            SELECT 1 
+            FROM Posts p 
+            JOIN PostHistory ph ON p.Id = ph.PostId 
+            WHERE p.OwnerUserId = ue.UserId 
+            AND ph.PostHistoryTypeId = 10 
+            AND ph.CreationDate >= DATE '2020-01-01'
+        ) THEN 'Has Closed Posts'
+        ELSE 'No Closed Posts'
+    END AS CloseHistory,
+    
+    CASE 
+        WHEN EXISTS (
+            SELECT 1 
+            FROM Badges b 
+            WHERE b.UserId = ue.UserId 
+            AND b.Date >= DATE '2020-01-01'
+        ) THEN 'Recent Badges'
+        ELSE 'No Recent Badges'
+    END AS BadgeStatus,
+    
+    CASE 
+        WHEN 
+            (SELECT COUNT(DISTINCT p.Id) FROM Posts p WHERE p.OwnerUserId = ue.UserId AND p.PostTypeId = 1) > 50
+            AND (SELECT COUNT(DISTINCT c.Id) FROM Comments c WHERE c.UserId = ue.UserId) < 100
+        THEN 'Potential Spam User'
+        ELSE 'Normal User'
+    END AS UserClassification,
+    
+    CASE 
+        WHEN (ue.PostCount + ue.CommentCount + ue.BadgeCount) > 1000
+             AND ue.Reputation > 10000
+        THEN 'High Achiever'
+        ELSE 'Other'
+    END AS AchievementLevel
+    
+FROM UserEngagement ue
+LEFT JOIN RankedUsers ru ON ue.UserId = ru.UserId
+LEFT JOIN QuestionAnalysis qa ON ue.UserId = qa.OwnerUserId
+LEFT JOIN AnswerQuality aa ON ue.UserId = aa.OwnerUserId
+WHERE ue.Reputation > 1000
+GROUP BY 
+    ue.UserId, 
+    ue.DisplayName, 
+    ue.Reputation, 
+    ue.PostCount, 
+    ue.CommentCount, 
+    ue.BadgeCount, 
+    ue.AvgPostScore, 
+    ue.QuestionCount, 
+    ue.AnswerCount, 
+    ue.TotalVotesCast, 
+    ue.TotalUpVotes, 
+    ue.TotalDownVotes,
+    ue.UpDownRatio,
+    ue.EngagementLevel,
+    ru.RankByReputation
+HAVING 
+    COUNT(DISTINCT qa.QuestionId) > 0
+    AND COUNT(DISTINCT aa.AnswerId) > 0
+    AND MIN(ue.TotalVotesCast) > 0
+    AND MAX(ue.TotalUpVotes) > 0
+ORDER BY 
+    ue.Reputation DESC,
+    ue.PostCount DESC,
+    ue.AvgPostScore DESC
+LIMIT 1000;

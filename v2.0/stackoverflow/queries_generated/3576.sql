@@ -1,0 +1,185 @@
+-- {"query": "3576.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1784} 
+
+/*  Complex benchmark query over the StackOverflow schema  */
+WITH RECURSIVE
+    /* 1. Base user metrics – reputation, total votes received, badge score  */
+    user_metrics AS (
+        SELECT
+            u.Id                                      AS user_id,
+            u.DisplayName,
+            u.Reputation,
+            COALESCE(SUM(
+                CASE vt.Name
+                    WHEN 'UpMod'      THEN 1
+                    WHEN 'DownMod'    THEN -1
+                    WHEN 'AcceptedByOriginator' THEN 2
+                    ELSE 0
+                END
+            ), 0)                                      AS vote_balance,
+            COALESCE(SUM(
+                CASE b.Class
+                    WHEN 1 THEN 100      -- Gold
+                    WHEN 2 THEN 50       -- Silver
+                    WHEN 3 THEN 20       -- Bronze
+                    ELSE 0
+                END
+            ), 0)                                      AS badge_score,
+            COUNT(DISTINCT b.Id)                      AS badge_count
+        FROM Users u
+        LEFT JOIN Posts p               ON p.OwnerUserId = u.Id
+        LEFT JOIN Votes v               ON v.PostId = p.Id
+        LEFT JOIN VoteTypes vt          ON vt.Id = v.VoteTypeId
+        LEFT JOIN Badges b              ON b.UserId = u.Id
+        GROUP BY u.Id, u.DisplayName, u.Reputation
+    ),
+
+    /* 2. Recent activity per user – last post, last comment, last vote */
+    recent_activity AS (
+        SELECT
+            ua.user_id,
+            MAX(p.CreationDate)               AS last_post_date,
+            MAX(c.CreationDate)               AS last_comment_date,
+            MAX(v.CreationDate)               AS last_vote_date,
+            ROW_NUMBER() OVER (PARTITION BY ua.user_id ORDER BY p.CreationDate DESC) AS post_rn,
+            ROW_NUMBER() OVER (PARTITION BY ua.user_id ORDER BY c.CreationDate DESC) AS comment_rn,
+            ROW_NUMBER() OVER (PARTITION BY ua.user_id ORDER BY v.CreationDate DESC) AS vote_rn
+        FROM user_metrics ua
+        LEFT JOIN Posts p               ON p.OwnerUserId = ua.user_id
+        LEFT JOIN Comments c            ON c.UserId = ua.user_id
+        LEFT JOIN Votes v               ON v.UserId = ua.user_id
+        GROUP BY ua.user_id
+    ),
+
+    /* 3. Tag‑level statistics – average score, answer ratio, recent hotness */
+    tag_stats AS (
+        SELECT
+            TRIM(BOTH '><' FROM t.TagName)                              AS tag,
+            COUNT(DISTINCT p.Id)                                        AS question_cnt,
+            AVG(p.Score)                                                AS avg_question_score,
+            SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END)::decimal
+                                                                      / NULLIF(COUNT(p.Id),0) AS answer_accept_ratio,
+            MAX(p.CreationDate)                                         AS most_recent_question,
+            /*  Hotness: weighted by score and view count in the last 30 days  */
+            SUM(
+                CASE
+                    WHEN p.CreationDate >= CURRENT_DATE - INTERVAL '30 days'
+                    THEN (p.Score * 2 + p.ViewCount * 0.1)
+                    ELSE 0
+                END
+            )                                                            AS recent_hotness
+        FROM Posts p
+        JOIN LATERAL (
+            SELECT regexp_split_to_table(p.Tags, '><') AS TagName
+        ) t ON TRUE
+        WHERE p.PostTypeId = 1               -- only questions
+        GROUP BY t.TagName
+    ),
+
+    /* 4. Correlated subquery calculating each user's “influence” per tag */
+    user_tag_influence AS (
+        SELECT
+            um.user_id,
+            ts.tag,
+            /*  Influence = sum of scores of user's answers on questions with this tag  */
+            COALESCE((
+                SELECT SUM(a.Score)
+                FROM Posts a
+                JOIN Posts q ON q.Id = a.ParentId
+                WHERE a.OwnerUserId = um.user_id
+                  AND a.PostTypeId = 2                     -- answers
+                  AND q.PostTypeId = 1                     -- questions
+                  AND q.Tags LIKE '%'||'<'||ts.tag||'>'||'%'
+            ), 0)                                         AS tag_answer_score,
+            ROW_NUMBER() OVER (PARTITION BY um.user_id ORDER BY
+                COALESCE((
+                    SELECT SUM(a.Score)
+                    FROM Posts a
+                    JOIN Posts q ON q.Id = a.ParentId
+                    WHERE a.OwnerUserId = um.user_id
+                      AND a.PostTypeId = 2
+                      AND q.Tags LIKE '%'||'<'||ts.tag||'>'||'%'
+                ),0) DESC)                               AS tag_rank
+        FROM user_metrics um
+        CROSS JOIN tag_stats ts
+    ),
+
+    /* 5. Combine everything – outer join to keep users without tags  */
+    combined AS (
+        SELECT
+            um.user_id,
+            um.DisplayName,
+            um.Reputation,
+            um.vote_balance,
+            um.badge_score,
+            um.badge_count,
+            ra.last_post_date,
+            ra.last_comment_date,
+            ra.last_vote_date,
+            COALESCE(uti.tag, '<<no-tag>>')               AS top_tag,
+            uti.tag_answer_score,
+            uti.tag_rank,
+            ts.avg_question_score,
+            ts.recent_hotness
+        FROM user_metrics um
+        LEFT JOIN recent_activity ra          ON ra.user_id = um.user_id
+        LEFT JOIN LATERAL (
+            SELECT *
+            FROM user_tag_influence uti
+            WHERE uti.user_id = um.user_id
+            ORDER BY uti.tag_rank
+            FETCH FIRST 1 ROW ONLY
+        ) uti ON TRUE
+        LEFT JOIN tag_stats ts               ON ts.tag = uti.tag
+    )
+
+/* Final result set – ordering by a composite performance score */
+SELECT
+    c.user_id,
+    c.DisplayName,
+    c.Reputation,
+    c.badge_score,
+    c.vote_balance,
+    c.badge_count,
+    c.last_post_date,
+    c.last_comment_date,
+    c.last_vote_date,
+    c.top_tag,
+    c.tag_answer_score,
+    c.tag_rank,
+    c.avg_question_score,
+    c.recent_hotness,
+    /* Composite score: weighted combination of metrics */
+    ROUND(
+        (c.Reputation * 0.2) +
+        (c.badge_score * 0.3) +
+        (c.vote_balance * 0.15) +
+        (COALESCE(c.tag_answer_score,0) * 0.15) +
+        (COALESCE(c.recent_hotness,0) * 0.1), 2
+    ) AS performance_score
+FROM combined c
+WHERE c.Reputation > 1000
+   OR c.badge_score > 0
+ORDER BY performance_score DESC
+LIMIT 100
+
+/*  UNION with a set‑operator branch that finds “orphan” tags (no questions)  */
+UNION ALL
+SELECT
+    NULL AS user_id,
+    NULL AS DisplayName,
+    NULL AS Reputation,
+    0    AS badge_score,
+    0    AS vote_balance,
+    0    AS badge_count,
+    NULL AS last_post_date,
+    NULL AS last_comment_date,
+    NULL AS last_vote_date,
+    t.tag AS top_tag,
+    0    AS tag_answer_score,
+    NULL AS tag_rank,
+    t.avg_question_score,
+    t.recent_hotness,
+    0    AS performance_score
+FROM tag_stats t
+WHERE t.question_cnt = 0
+ORDER BY top_tag;

@@ -1,0 +1,103 @@
+-- {"query": "2342.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1286} 
+with UserBadges as (
+    select u.Id as UserId, u.DisplayName,
+           count(*) filter (where b.Class = 1) as GoldBadges,
+           count(*) filter (where b.Class = 2) as SilverBadges,
+           count(*) filter (where b.Class = 3) as BronzeBadges,
+           max(b.Date) as LastBadgeDate
+      from Users u
+      left join Badges b on b.UserId = u.Id
+     group by u.Id, u.DisplayName
+),
+PostRankings as (
+    select p.Id, p.OwnerUserId, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount,
+           dense_rank() over (partition by p.OwnerUserId order by p.Score desc) as UserPostScoreRank,
+           row_number() over (partition by p.PostTypeId order by p.CreationDate) as PostTypeChronoRank
+      from Posts p
+     where p.OwnerUserId is not null
+),
+RecentAcceptedAnswers as (
+    select a.Id as AnswerId, a.ParentId as QuestionId, a.OwnerUserId as AnswerUserId,
+           q.OwnerUserId as QuestionUserId, a.Score as AnswerScore, a.CreationDate as AnswerCreation,
+           q.Score as QuestionScore, q.CreationDate as QuestionCreation
+      from Posts a
+      join Posts q on q.Id = a.ParentId and q.PostTypeId = 1
+     where a.PostTypeId = 2
+       and a.Id in (
+            select AcceptedAnswerId from Posts where AcceptedAnswerId is not null
+            and CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '90 days'
+       )
+),
+ClosedQuestionsWithReason as (
+    select ph.PostId, ph.Comment as CloseReasonId,
+           crt.Name as CloseReasonName,
+           ph.CreationDate as CloseDate,
+           p.Title,
+           p.OwnerUserId,
+           p.Score,
+           p.ViewCount
+      from PostHistory ph
+      join CloseReasonTypes crt on crt.Id = cast(ph.Comment as smallint)
+      join Posts p on p.Id = ph.PostId
+     where ph.PostHistoryTypeId = 10
+       and ph.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '180 days'
+),
+UserActivitySummary as (
+    select u.Id as UserId, u.DisplayName,
+           count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+           count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+           coalesce(sum(p.Score),0) as TotalPostScore,
+           count(distinct c.Id) as CommentCount,
+           count(distinct v.Id) filter (where v.VoteTypeId = 2) as UpVotesReceived,
+           count(distinct v.Id) filter (where v.VoteTypeId = 3) as DownVotesReceived,
+           max(p.CreationDate) as LastPostDate
+      from Users u
+      left join Posts p on p.OwnerUserId = u.Id
+      left join Comments c on c.UserId = u.Id
+      left join Votes v on v.PostId = p.Id
+     group by u.Id, u.DisplayName
+)
+select ub.UserId, ub.DisplayName,
+       ua.QuestionCount, ua.AnswerCount, ua.TotalPostScore,
+       ua.UpVotesReceived, ua.DownVotesReceived,
+       ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges, ub.LastBadgeDate,
+       ua.CommentCount,
+       sum(case when pq.CloseReasonName is not null then 1 else 0 end) over (partition by ub.UserId) as RecentClosedQuestions,
+       avg(pr.Score) over (partition by ub.UserId) as AvgPostScore,
+       max(pr.UserPostScoreRank) as MaxPostScoreRank,
+       string_agg(distinct coalesce(t.TagName, '') , ',') filter (where t.TagName is not null) as UserTags,
+       raa.AnswerId, raa.AnswerScore, raa.AnswerCreation,
+       raa.QuestionId, raa.QuestionScore, raa.QuestionCreation,
+       raa.AnswerUserId, raa.QuestionUserId,
+       case when ua.LastPostDate is null then 'No posts'
+            when ua.LastPostDate > cast('2024-10-01 12:34:56' as timestamp) - interval '30 days' then 'Active last 30 days'
+            when ua.LastPostDate > cast('2024-10-01 12:34:56' as timestamp) - interval '180 days' then 'Active last 6 months'
+            else 'Inactive > 6 months' end as ActivityStatus
+  from UserBadges ub
+  left join UserActivitySummary ua on ua.UserId = ub.UserId
+  left join ClosedQuestionsWithReason pq on pq.OwnerUserId = ub.UserId
+  left join PostRankings pr on pr.OwnerUserId = ub.UserId
+  left join Tags t on t.Id in (
+        select unnest(string_to_array(trim(both '<>' from p.Tags), '><'))::int
+          from Posts p where p.OwnerUserId = ub.UserId limit 1
+      )
+  left join RecentAcceptedAnswers raa on raa.AnswerUserId = ub.UserId
+ where ub.GoldBadges > 0 or ua.TotalPostScore > 100
+union
+select null, 'Summary Totals',
+       sum(ua.QuestionCount), sum(ua.AnswerCount), sum(ua.TotalPostScore),
+       sum(ua.UpVotesReceived), sum(ua.DownVotesReceived),
+       sum(ub.GoldBadges), sum(ub.SilverBadges), sum(ub.BronzeBadges), null,
+       sum(ua.CommentCount),
+       count(pq.PostId),
+       avg(pr.Score),
+       max(pr.UserPostScoreRank),
+       null,
+       null, null, null,
+       null, null, null,
+       null,
+       'Overall Summary'
+  from UserBadges ub
+  left join UserActivitySummary ua on ua.UserId = ub.UserId
+  left join ClosedQuestionsWithReason pq on pq.OwnerUserId = ub.UserId
+  left join PostRankings pr on pr.OwnerUserId = ub.UserId;

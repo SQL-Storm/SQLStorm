@@ -1,0 +1,336 @@
+with
+q_posts as (
+  select p.Id as QuestionId,
+         p.Title,
+         p.CreationDate,
+         p.OwnerUserId,
+         p.Score,
+         p.ViewCount,
+         p.AnswerCount,
+         p.Tags,
+         p.AcceptedAnswerId
+  from Posts p
+  where p.PostTypeId = 1
+),
+a_posts as (
+  select a.Id as AnswerId,
+         a.ParentId as QuestionId,
+         a.OwnerUserId,
+         a.Score as AnswerScore,
+         a.CreationDate as AnswerCreationDate
+  from Posts a
+  where a.PostTypeId = 2
+),
+user_snap as (
+  select u.Id as UserId,
+         u.DisplayName,
+         u.Reputation,
+         u.CreationDate as UserCreationDate,
+         u.Location,
+         coalesce(nullif(trim(u.WebsiteUrl), ''), 'n/a') as WebsiteUrlNorm,
+         u.UpVotes,
+         u.DownVotes,
+         u.Views as ProfileViews
+  from Users u
+),
+tag_expanded as (
+  select qp.QuestionId,
+         lower(trim(tag)) as tag
+  from q_posts qp
+  cross join lateral unnest(string_to_array(substring(qp.Tags, 2, greatest(length(qp.Tags)-2,0)), '><')) as tag
+),
+score_buckets as (
+  select qp.QuestionId,
+         case
+           when qp.Score >= 50 then 'elite'
+           when qp.Score >= 20 then 'high'
+           when qp.Score >= 5  then 'medium'
+           when qp.Score >= 0  then 'low'
+           else 'negative'
+         end as score_bucket
+  from q_posts qp
+),
+vote_agg as (
+  select v.PostId,
+         sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+         sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+         sum(case when v.VoteTypeId = 5 then 1 else 0 end) as Favorites,
+         count(*) as TotalVotes,
+         max(v.CreationDate) as LastVoteAt
+  from Votes v
+  group by v.PostId
+),
+comment_stats as (
+  select c.PostId,
+         count(*) as CommentCount,
+         coalesce(sum(case when c.Score > 0 then 1 else 0 end),0) as PositiveComments,
+         max(c.CreationDate) as LastCommentAt
+  from Comments c
+  group by c.PostId
+),
+answerer_first_seen as (
+  select a.QuestionId,
+         min(a.AnswerCreationDate) as FirstAnswerAt,
+         count(*) as TotalAnswers,
+         max(a.AnswerScore) as MaxAnswerScore
+  from a_posts a
+  group by a.QuestionId
+),
+accepted_answerer as (
+  select a.QuestionId,
+         a.OwnerUserId as AcceptedAnswerUserId,
+         a.AnswerId,
+         a.AnswerScore
+  from a_posts a
+  join q_posts q on q.AcceptedAnswerId = a.AnswerId
+),
+badge_rollup as (
+  select b.UserId,
+         sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+         sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+         sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+         sum(1) as TotalBadges,
+         max(b.Date) as LastBadgeAt
+  from Badges b
+  group by b.UserId
+),
+link_dupes as (
+  select pl.PostId,
+         sum(case when pl.LinkTypeId = 3 then 1 else 0 end) as DuplicateLinks,
+         sum(case when pl.LinkTypeId = 1 then 1 else 0 end) as RelatedLinks,
+         count(*) as AllLinks
+  from PostLinks pl
+  group by pl.PostId
+),
+closed_reasons as (
+  select ph.PostId,
+         max(case when ph.PostHistoryTypeId = 10 then ph.CreationDate end) as ClosedAt,
+         max(case when ph.PostHistoryTypeId = 11 then ph.CreationDate end) as ReopenedAt,
+         max(case when ph.PostHistoryTypeId = 10 then nullif(ph.Comment,'') end) as CloseReasonIdRaw
+  from PostHistory ph
+  where ph.PostHistoryTypeId in (10,11)
+  group by ph.PostId
+),
+hot_bumps as (
+  select ph.PostId,
+         sum(case when ph.PostHistoryTypeId = 50 then 1 else 0 end) as CommunityBumps,
+         sum(case when ph.PostHistoryTypeId = 52 then 1 else 0 end) as HotSelected,
+         sum(case when ph.PostHistoryTypeId = 53 then 1 else 0 end) as HotRemoved
+  from PostHistory ph
+  where ph.PostHistoryTypeId in (50,52,53)
+  group by ph.PostId
+),
+tag_popularity as (
+  select t.TagName,
+         t.Count,
+         row_number() over (order by t.Count desc nulls last, t.TagName) as PopRank
+  from Tags t
+),
+owner_activity as (
+  select p.OwnerUserId as UserId,
+         sum(case when p.PostTypeId = 1 then 1 else 0 end) as QuestionsAuthored,
+         sum(case when p.PostTypeId = 2 then 1 else 0 end) as AnswersAuthored,
+         sum(coalesce(p.Score,0)) as AggregatePostScore,
+         max(p.LastActivityDate) as LastActivityAt
+  from Posts p
+  where p.OwnerUserId is not null
+  group by p.OwnerUserId
+),
+question_quality as (
+  select qp.QuestionId,
+         round(
+           0.5 * coalesce(va.UpVotes - va.DownVotes, 0)
+           + 0.3 * coalesce(qp.ViewCount, 0) * 1.0 / nullif(qp.ViewCount + 100,0)
+           + 0.2 * coalesce(cs.PositiveComments,0)
+           + case when cr.ClosedAt is not null then -2 else 0 end
+           + case when hb.HotSelected > 0 then 1 else 0 end
+         , 3) as QualityScore
+  from q_posts qp
+  left join vote_agg va on va.PostId = qp.QuestionId
+  left join comment_stats cs on cs.PostId = qp.QuestionId
+  left join closed_reasons cr on cr.PostId = qp.QuestionId
+  left join hot_bumps hb on hb.PostId = qp.QuestionId
+),
+tag_top as (
+  select te.QuestionId,
+         min(tp.PopRank) as BestTagRank,
+         string_agg(distinct te.tag, ', ' order by te.tag) as TagList
+  from tag_expanded te
+  left join tag_popularity tp on tp.TagName = te.tag
+  group by te.QuestionId
+),
+user_influence as (
+  select us.UserId,
+         coalesce(br.TotalBadges,0) as TotalBadges,
+         coalesce(br.GoldBadges,0) as GoldBadges,
+         coalesce(oa.QuestionsAuthored,0) as QuestionsAuthored,
+         coalesce(oa.AnswersAuthored,0) as AnswersAuthored,
+         coalesce(oa.AggregatePostScore,0) as AggregatePostScore,
+         coalesce(us.Reputation,0) as Reputation,
+         case
+           when coalesce(oa.AnswersAuthored,0) = 0 then null
+           else round((coalesce(oa.AggregatePostScore,0) * 1.0 / nullif(oa.AnswersAuthored,0)),2)
+         end as AvgAnswerScore
+  from user_snap us
+  left join badge_rollup br on br.UserId = us.UserId
+  left join owner_activity oa on oa.UserId = us.UserId
+),
+ranked_answers as (
+  select a.QuestionId,
+         a.AnswerId,
+         a.OwnerUserId,
+         a.AnswerScore,
+         row_number() over (partition by a.QuestionId order by a.AnswerScore desc nulls last, a.AnswerId) as rn_score_desc,
+         dense_rank() over (partition by a.QuestionId order by a.AnswerScore desc nulls last) as dr_score
+  from a_posts a
+),
+answer_diversity as (
+  select ra.QuestionId,
+         count(*) as Answerers,
+         count(distinct ra.OwnerUserId) as UniqueAnswerers,
+         stddev_pop(ra.AnswerScore) as ScoreStdDev,
+         sum(case when ra.AnswerScore >= 1 then 1 else 0 end) as NonNegAnswers
+  from ranked_answers ra
+  group by ra.QuestionId
+),
+posttype_map as (
+  select Id, Name from PostTypes
+),
+final as (
+  select
+    qp.QuestionId,
+    qp.Title,
+    qp.CreationDate as QuestionCreatedAt,
+    us.DisplayName as OwnerName,
+    coalesce(us.Reputation,0) as OwnerReputation,
+    coalesce(ui.TotalBadges,0) as OwnerTotalBadges,
+    tt.TagList,
+    tt.BestTagRank,
+    sb.score_bucket,
+    coalesce(va.UpVotes,0) as UpVotes,
+    coalesce(va.DownVotes,0) as DownVotes,
+    coalesce(va.Favorites,0) as Favorites,
+    coalesce(cs.CommentCount,0) as CommentCount,
+    ad.UniqueAnswerers,
+    ad.ScoreStdDev,
+    aa.AcceptedAnswerUserId,
+    case when aa.AcceptedAnswerUserId is not null then 1 else 0 end as HasAccepted,
+    extract(epoch from (af.FirstAnswerAt - qp.CreationDate)) as SecsToFirstAnswer,
+    qa.QualityScore,
+    cr.ClosedAt,
+    cr.ReopenedAt,
+    l.AllLinks,
+    l.DuplicateLinks,
+    hb.HotSelected,
+    hb.CommunityBumps,
+    pm.Name as PostTypeName,
+    qp.ViewCount
+  from q_posts qp
+  left join user_snap us on us.UserId = qp.OwnerUserId
+  left join user_influence ui on ui.UserId = qp.OwnerUserId
+  left join vote_agg va on va.PostId = qp.QuestionId
+  left join comment_stats cs on cs.PostId = qp.QuestionId
+  left join answerer_first_seen af on af.QuestionId = qp.QuestionId
+  left join accepted_answerer aa on aa.QuestionId = qp.QuestionId
+  left join answer_diversity ad on ad.QuestionId = qp.QuestionId
+  left join question_quality qa on qa.QuestionId = qp.QuestionId
+  left join tag_top tt on tt.QuestionId = qp.QuestionId
+  left join link_dupes l on l.PostId = qp.QuestionId
+  left join closed_reasons cr on cr.PostId = qp.QuestionId
+  left join hot_bumps hb on hb.PostId = qp.QuestionId
+  left join posttype_map pm on pm.Id = 1
+  left join score_buckets sb on sb.QuestionId = qp.QuestionId
+  where (
+    (qp.ViewCount is not null and qp.ViewCount > 0)
+    or (va.TotalVotes is not null and va.TotalVotes >= 1)
+    or (cs.CommentCount is not null and cs.CommentCount >= 1)
+  )
+),
+outliers as (
+  select f.QuestionId,
+         case
+           when f.UpVotes - f.DownVotes >= 100 then 'viral'
+           when f.DownVotes >= 20 and f.UpVotes <= 1 then 'controversial'
+           when f.QualityScore <= -3 then 'toxic'
+           else null
+         end as OutlierClass
+  from final f
+),
+ranked as (
+  select
+    f.QuestionId,
+    f.Title,
+    f.QuestionCreatedAt,
+    f.OwnerName,
+    f.OwnerReputation,
+    f.OwnerTotalBadges,
+    f.TagList,
+    f.BestTagRank,
+    f.score_bucket,
+    f.UpVotes,
+    f.DownVotes,
+    f.Favorites,
+    f.CommentCount,
+    f.UniqueAnswerers,
+    f.ScoreStdDev,
+    f.AcceptedAnswerUserId,
+    f.HasAccepted,
+    f.SecsToFirstAnswer,
+    f.QualityScore,
+    f.ClosedAt,
+    f.ReopenedAt,
+    f.AllLinks,
+    f.DuplicateLinks,
+    f.HotSelected,
+    f.CommunityBumps,
+    f.PostTypeName,
+    f.ViewCount,
+    row_number() over (order by coalesce(f.QualityScore, -999) desc nulls last, f.UpVotes - f.DownVotes desc, f.ViewCount desc nulls last, f.QuestionId) as rn_quality,
+    dense_rank() over (order by coalesce(f.UpVotes - f.DownVotes, -999) desc nulls last) as dr_net_votes,
+    percentile_cont(0.9) within group (order by coalesce(f.QualityScore,0)) over () as p90_quality
+  from final f
+)
+select
+  r.QuestionId,
+  r.Title,
+  r.OwnerName,
+  r.OwnerReputation,
+  r.OwnerTotalBadges,
+  r.TagList,
+  r.BestTagRank,
+  r.score_bucket,
+  r.UpVotes,
+  r.DownVotes,
+  (r.UpVotes - r.DownVotes) as NetVotes,
+  r.Favorites,
+  r.CommentCount,
+  r.UniqueAnswerers,
+  round(coalesce(r.ScoreStdDev,0) * 1.0, 3) as AnswerScoreStdDev,
+  r.HasAccepted,
+  r.SecsToFirstAnswer,
+  r.QualityScore,
+  o.OutlierClass,
+  r.HotSelected,
+  r.CommunityBumps,
+  r.ClosedAt,
+  r.ReopenedAt,
+  r.AllLinks,
+  r.DuplicateLinks,
+  r.PostTypeName as PostTypeName,
+  r.rn_quality,
+  r.dr_net_votes,
+  r.p90_quality
+from ranked r
+left join outliers o on o.QuestionId = r.QuestionId
+where (
+  r.QualityScore >= coalesce(r.p90_quality, r.QualityScore)
+  or coalesce(o.OutlierClass,'') <> ''
+  or r.HasAccepted = 1
+)
+order by
+  r.HasAccepted desc,
+  r.QualityScore desc nulls last,
+  NetVotes desc,
+  r.QuestionCreatedAt desc,
+  r.QuestionId
+limit 500;

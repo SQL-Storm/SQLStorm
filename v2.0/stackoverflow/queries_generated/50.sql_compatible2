@@ -1,0 +1,447 @@
+with
+question_tags as (
+  select
+    p.Id as QuestionId,
+    lower(trim(t)) as TagName
+  from Posts p
+  cross join lateral unnest(
+    case
+      when p.PostTypeId = 1 and p.Tags is not null and length(p.Tags) >= 2
+      then string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')
+      else array[]::varchar[]
+    end
+  ) as t
+  where p.PostTypeId = 1
+),
+user_activity as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    coalesce(nullif(trim(u.Location), ''), 'Unknown') as LocationNorm,
+    date_part('year', age(u.LastAccessDate, u.CreationDate)) as YearsActive,
+    case
+      when u.Reputation >= 100000 then 'Legend'
+      when u.Reputation >= 20000 then 'Veteran'
+      when u.Reputation >= 3000 then 'Established'
+      when u.Reputation >= 500 then 'Contributor'
+      else 'Newbie'
+    end as RepBand,
+    greatest(extract(epoch from (u.LastAccessDate - u.CreationDate)) / 86400.0, 0) as DaysBetweenFirstAndLastSeen
+  from Users u
+),
+badge_agg as (
+  select
+    b.UserId,
+    count(*) as BadgeCount,
+    sum(case when b.Class = 1 then 1 else 0 end) as GoldCount,
+    sum(case when b.Class = 2 then 1 else 0 end) as SilverCount,
+    sum(case when b.Class = 3 then 1 else 0 end) as BronzeCount,
+    sum(case when b.TagBased = true then 1 else 0 end) as TagBadges,
+    min(b.Date) as FirstBadgeAt,
+    max(b.Date) as LastBadgeAt
+  from Badges b
+  group by b.UserId
+),
+question_agg as (
+  select
+    q.Id as QuestionId,
+    q.OwnerUserId as AskerId,
+    q.CreationDate as AskedAt,
+    q.Score as QuestionScore,
+    q.ViewCount,
+    q.FavoriteCount,
+    q.AnswerCount,
+    count(distinct qt.TagName) as TagDiversity,
+    string_agg(distinct qt.TagName, ',' order by qt.TagName) as TagsCsv,
+    bool_or(ph_closed.PostId is not null) as WasEverClosed,
+    bool_or(ph_reopened.PostId is not null) as WasEverReopened,
+    bool_or(ph_protected.PostId is not null) as WasEverProtected
+  from Posts q
+  left join question_tags qt on qt.QuestionId = q.Id
+  left join lateral (
+    select 1 as PostId
+    from PostHistory ph
+    where ph.PostId = q.Id and ph.PostHistoryTypeId = 10
+    limit 1
+  ) ph_closed on true
+  left join lateral (
+    select 1 as PostId
+    from PostHistory ph
+    where ph.PostId = q.Id and ph.PostHistoryTypeId = 11
+    limit 1
+  ) ph_reopened on true
+  left join lateral (
+    select 1 as PostId
+    from PostHistory ph
+    where ph.PostId = q.Id and ph.PostHistoryTypeId = 19
+    limit 1
+  ) ph_protected on true
+  where q.PostTypeId = 1
+  group by q.Id, q.OwnerUserId, q.CreationDate, q.Score, q.ViewCount, q.FavoriteCount, q.AnswerCount
+),
+answer_agg as (
+  select
+    a.ParentId as QuestionId,
+    count(*) as AnswerTotal,
+    sum(case when a.Id = q.AcceptedAnswerId then 1 else 0 end) as AcceptedCount,
+    max(a.Score) as MaxAnswerScore,
+    avg(cast(a.Score as double precision)) as AvgAnswerScore,
+    sum(case when a.Score > 0 then 1 else 0 end) as PositiveAnswers,
+    sum(case when a.Score < 0 then 1 else 0 end) as NegativeAnswers,
+    min(a.CreationDate) as FirstAnswerAt,
+    max(a.CreationDate) as LastAnswerAt
+  from Posts a
+  join Posts q on q.Id = a.ParentId and q.PostTypeId = 1
+  where a.PostTypeId = 2
+  group by a.ParentId
+),
+vote_agg as (
+  select
+    v.PostId as QuestionId,
+    sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+    sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+    sum(case when v.VoteTypeId = 5 then 1 else 0 end) as FavoritesLegacy,
+    sum(case when v.VoteTypeId in (8,9) then coalesce(v.BountyAmount,0) else 0 end) as BountySum
+  from Votes v
+  group by v.PostId
+),
+link_agg as (
+  select
+    pl.PostId as QuestionId,
+    sum(case when pl.LinkTypeId = 3 then 1 else 0 end) as DuplicateLinks,
+    sum(case when pl.LinkTypeId = 1 then 1 else 0 end) as RelatedLinks,
+    min(pl.CreationDate) as FirstLinkAt
+  from PostLinks pl
+  group by pl.PostId
+),
+comment_agg as (
+  select
+    c.PostId as QuestionId,
+    count(*) as CommentCount,
+    sum(coalesce(c.Score,0)) as CommentScoreSum,
+    max(c.CreationDate) as LastCommentAt
+  from Comments c
+  group by c.PostId
+),
+user_post_agg as (
+  select
+    p.OwnerUserId as UserId,
+    sum(case when p.PostTypeId = 1 then 1 else 0 end) as QuestionsAuthored,
+    sum(case when p.PostTypeId = 2 then 1 else 0 end) as AnswersAuthored,
+    sum(case when p.PostTypeId = 1 and p.AcceptedAnswerId is not null then 1 else 0 end) as QuestionsWithAccepted,
+    sum(case when p.PostTypeId = 2 and exists (select 1 from Posts q where q.Id = p.ParentId and q.AcceptedAnswerId = p.Id) then 1 else 0 end) as AcceptedAnswersAuthored,
+    sum(coalesce(p.Score,0)) as TotalPostScore,
+    max(p.LastActivityDate) as LastPostActivityAt
+  from Posts p
+  where p.OwnerUserId is not null
+  group by p.OwnerUserId
+),
+candidate_questions as (
+  select
+    qa.QuestionId,
+    qa.AskerId,
+    qa.AskedAt,
+    qa.QuestionScore,
+    qa.ViewCount,
+    qa.FavoriteCount,
+    qa.AnswerCount,
+    qa.TagDiversity,
+    qa.TagsCsv,
+    qa.WasEverClosed,
+    qa.WasEverReopened,
+    qa.WasEverProtected
+  from question_agg qa
+  where
+    (qa.ViewCount >= 1000 or qa.QuestionScore between -2 and 2)
+    and coalesce(qa.TagDiversity,0) between 1 and 5
+),
+user_rankings as (
+  select
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.RepBand,
+    ua.YearsActive,
+    ba.BadgeCount,
+    coalesce(ba.GoldCount,0) as GoldCount,
+    coalesce(ba.SilverCount,0) as SilverCount,
+    coalesce(ba.BronzeCount,0) as BronzeCount,
+    upa.QuestionsAuthored,
+    upa.AnswersAuthored,
+    upa.AcceptedAnswersAuthored,
+    upa.QuestionsWithAccepted,
+    upa.TotalPostScore,
+    ua.LocationNorm,
+    (
+      ua.Reputation * 0.0025
+      + coalesce(ba.GoldCount,0) * 3.0
+      + coalesce(upa.AcceptedAnswersAuthored,0) * 1.25
+      + coalesce(upa.TotalPostScore,0) * 0.01
+      + least(coalesce(extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - upa.LastPostActivityAt)) / 86400.0, 3650), 3650) * -0.001
+    ) as PerfScore,
+    row_number() over (
+      partition by ua.LocationNorm
+      order by
+        (
+          ua.Reputation * 0.0025
+          + coalesce(ba.GoldCount,0) * 3.0
+          + coalesce(upa.AcceptedAnswersAuthored,0) * 1.25
+          + coalesce(upa.TotalPostScore,0) * 0.01
+          + least(coalesce(extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - upa.LastPostActivityAt)) / 86400.0, 3650), 3650) * -0.001
+        ) desc nulls last,
+        ua.UserId
+    ) as RankInLocation
+  from user_activity ua
+  left join badge_agg ba on ba.UserId = ua.UserId
+  left join user_post_agg upa on upa.UserId = ua.UserId
+),
+question_user_join as (
+  select
+    cq.QuestionId,
+    cq.AskerId,
+    cq.AskedAt,
+    cq.QuestionScore,
+    cq.ViewCount,
+    cq.FavoriteCount,
+    cq.AnswerCount,
+    cq.TagDiversity,
+    cq.TagsCsv,
+    cq.WasEverClosed,
+    cq.WasEverReopened,
+    cq.WasEverProtected,
+    ur.DisplayName as AskerName,
+    ur.RepBand as AskerRepBand,
+    ur.PerfScore as AskerPerfScore,
+    ur.RankInLocation as AskerRankInLoc,
+    ur.LocationNorm as AskerLocation,
+    aa.AnswerTotal,
+    aa.AcceptedCount,
+    aa.MaxAnswerScore,
+    aa.AvgAnswerScore,
+    aa.PositiveAnswers,
+    aa.NegativeAnswers,
+    va.UpVotes,
+    va.DownVotes,
+    coalesce(va.FavoritesLegacy, 0) + coalesce(cq.FavoriteCount, 0) as FavoriteCombined,
+    va.BountySum,
+    la.DuplicateLinks,
+    la.RelatedLinks,
+    ca.CommentCount,
+    ca.CommentScoreSum,
+    la.FirstLinkAt,
+    ca.LastCommentAt
+  from candidate_questions cq
+  left join user_rankings ur on ur.UserId = cq.AskerId
+  left join answer_agg aa on aa.QuestionId = cq.QuestionId
+  left join vote_agg va on va.QuestionId = cq.QuestionId
+  left join link_agg la on la.QuestionId = cq.QuestionId
+  left join comment_agg ca on ca.QuestionId = cq.QuestionId
+),
+question_metrics as (
+  select
+    quj.QuestionId,
+    quj.AskerId,
+    quj.AskedAt,
+    quj.QuestionScore,
+    quj.ViewCount,
+    quj.FavoriteCount,
+    quj.AnswerCount,
+    quj.TagDiversity,
+    quj.TagsCsv,
+    quj.WasEverClosed,
+    quj.WasEverReopened,
+    quj.WasEverProtected,
+    quj.AskerName,
+    quj.AskerRepBand,
+    quj.AskerPerfScore,
+    quj.AskerRankInLoc,
+    quj.AskerLocation,
+    quj.AnswerTotal,
+    quj.AcceptedCount,
+    quj.MaxAnswerScore,
+    quj.AvgAnswerScore,
+    quj.PositiveAnswers,
+    quj.NegativeAnswers,
+    quj.UpVotes,
+    quj.DownVotes,
+    quj.FavoriteCombined,
+    quj.BountySum,
+    quj.DuplicateLinks,
+    quj.RelatedLinks,
+    quj.CommentCount,
+    quj.CommentScoreSum,
+    quj.FirstLinkAt,
+    quj.LastCommentAt,
+    case
+      when quj.AnswerTotal > 0 and quj.FirstLinkAt is not null
+        then extract(epoch from (quj.FirstLinkAt - quj.AskedAt)) / greatest(quj.AnswerTotal,1)
+      else null
+    end as SecsPerAnswerUntilFirstLink,
+    case
+      when quj.LastCommentAt is not null
+        then extract(epoch from (quj.LastCommentAt - quj.AskedAt)) / 3600.0
+      else null
+    end as HoursUntilLastComment,
+    (
+      coalesce(quj.CommentCount,0) >= 10
+      and coalesce(quj.UpVotes,0) >= 5
+      and coalesce(quj.DownVotes,0) >= 3
+      and (quj.WasEverClosed or quj.WasEverReopened)
+    ) as IsControversial,
+    (
+      coalesce(quj.AcceptedCount,0) = 1
+      and coalesce(quj.MaxAnswerScore,0) >= 2
+      and coalesce(quj.QuestionScore,0) >= 1
+    ) as HasStrongAnswer
+  from question_user_join quj
+),
+tag_level as (
+  select
+    qm.QuestionId,
+    t.TagName,
+    qm.QuestionScore,
+    qm.ViewCount,
+    qm.FavoriteCombined,
+    qm.AcceptedCount,
+    avg(qm.QuestionScore) over (partition by t.TagName) as AvgScoreByTag,
+    -- replace ordered-set percentile_cont with an approximate percentile using windowed row_number
+    -- compute 90th percentile per tag by ranking view counts and selecting the value at ceil(0.9 * count)
+    max(case when rn_for_percentile = target_rank then ViewCount_val end) over (partition by t.TagName) as P90ViewsByTag,
+    rank() over (partition by t.TagName order by coalesce(qm.FavoriteCombined,0) desc, qm.ViewCount desc) as FavRankInTag
+  from (
+    select
+      qm.*,
+      t.TagName,
+      qmv.ViewCount as ViewCount_val,
+      row_number() over (partition by t.TagName order by qmv.ViewCount) as rn_for_percentile,
+      ceil(0.9 * count(*) over (partition by t.TagName))::int as target_rank
+    from question_metrics qm
+    join question_tags t on t.QuestionId = qm.QuestionId
+    join lateral (
+      select qm2.ViewCount
+      from question_metrics qm2
+      where exists (select 1 from question_tags tt where tt.QuestionId = qm2.QuestionId and tt.TagName = t.TagName)
+      order by qm2.ViewCount
+    ) qmv on true
+  ) s
+),
+tag_rollup as (
+  select
+    tl.QuestionId,
+    count(*) as TagCountForRoll,
+    min(tl.FavRankInTag) as BestFavRankInAnyTag,
+    avg(tl.AvgScoreByTag) as MeanTagAvgScore,
+    max(tl.P90ViewsByTag) as MaxP90ViewsAmongTags
+  from tag_level tl
+  group by tl.QuestionId
+),
+question_final as (
+  select
+    qm.*,
+    tr.TagCountForRoll,
+    tr.BestFavRankInAnyTag,
+    tr.MeanTagAvgScore,
+    tr.MaxP90ViewsAmongTags,
+    (
+      coalesce(qm.QuestionScore,0) * 1.5
+      + least(coalesce(qm.ViewCount,0), 200000) * 0.0005
+      + coalesce(qm.FavoriteCombined,0) * 0.75
+      + coalesce(qm.UpVotes,0) * 0.5
+      - coalesce(qm.DownVotes,0) * 0.7
+      + coalesce(qm.BountySum,0) * 0.01
+      + case when qm.HasStrongAnswer then 5 else 0 end
+      + case when qm.IsControversial then 3 else 0 end
+      + case when tr.BestFavRankInAnyTag is not null and tr.BestFavRankInAnyTag <= 10 then 2 else 0 end
+      + case when tr.MeanTagAvgScore is not null then tr.MeanTagAvgScore * 0.15 else 0 end
+    ) as FinalScore
+  from question_metrics qm
+  left join tag_rollup tr on tr.QuestionId = qm.QuestionId
+),
+highlights as (
+  (
+    select qf.*
+    from question_final qf
+    where qf.FinalScore >= (
+      select coalesce(avg(FinalScore) + 2 * stddev_pop(FinalScore), 0) from question_final
+    )
+  )
+  union
+  (
+    select qf.*
+    from question_final qf
+    where qf.ViewCount >= (
+      select coalesce(
+        -- approximate 95th percentile by ordering and selecting the value at ceil(0.95 * count)
+        (select ViewCount from (
+           select ViewCount, row_number() over (order by ViewCount) as rn, ceil(0.95 * count(*) over ())::int as target_rn
+           from question_final
+         ) t2 where rn = target_rn limit 1), 0)
+      from question_final limit 1
+    )
+  )
+  except
+  (
+    select qf.*
+    from question_final qf
+    join link_agg la on la.QuestionId = qf.QuestionId
+    where coalesce(la.DuplicateLinks,0) >= 1
+  )
+),
+ranked as (
+  select
+    h.*,
+    dense_rank() over (order by h.FinalScore desc, h.ViewCount desc nulls last, h.QuestionId) as GlobalRank,
+    dense_rank() over (partition by coalesce(h.AskerRepBand,'Newbie') order by h.FinalScore desc) as RankInBand
+  from highlights h
+)
+select
+  r.GlobalRank,
+  r.RankInBand,
+  r.QuestionId,
+  r.AskedAt,
+  r.AskerId,
+  coalesce(r.AskerName, concat('user#', cast(r.AskerId as text))) as AskerName,
+  coalesce(r.AskerLocation, 'Unknown') as AskerLocation,
+  coalesce(r.AskerRepBand, 'Newbie') as AskerRepBand,
+  round(coalesce(r.AskerPerfScore,0), 3) as AskerPerfScore,
+  r.TagsCsv,
+  r.TagDiversity,
+  r.QuestionScore,
+  r.ViewCount,
+  r.FavoriteCombined,
+  r.AnswerTotal,
+  r.AcceptedCount,
+  r.MaxAnswerScore,
+  round(coalesce(r.AvgAnswerScore,0), 3) as AvgAnswerScore,
+  r.UpVotes,
+  r.DownVotes,
+  r.BountySum,
+  r.DuplicateLinks,
+  r.RelatedLinks,
+  r.CommentCount,
+  r.CommentScoreSum,
+  r.WasEverClosed,
+  r.WasEverReopened,
+  r.WasEverProtected,
+  round(coalesce(r.SecsPerAnswerUntilFirstLink,0), 3) as SecsPerAnswerUntilFirstLink,
+  round(coalesce(r.HoursUntilLastComment,0), 3) as HoursUntilLastComment,
+  r.IsControversial,
+  r.HasStrongAnswer,
+  r.TagCountForRoll,
+  r.BestFavRankInAnyTag,
+  round(coalesce(r.MeanTagAvgScore,0), 3) as MeanTagAvgScore,
+  r.MaxP90ViewsAmongTags,
+  round(r.FinalScore, 3) as FinalScore
+from ranked r
+where
+  (r.FinalScore > 0 and coalesce(r.TagDiversity,0) >= 1)
+  and not (r.WasEverClosed and r.WasEverReopened = false and coalesce(r.ViewCount,0) < 500)
+  and (
+    (r.AskerRepBand in ('Veteran','Legend') and r.AnswerTotal >= 1)
+    or (r.AskerRepBand not in ('Veteran','Legend') and coalesce(r.UpVotes,0) - coalesce(r.DownVotes,0) >= 0)
+  )
+order by r.GlobalRank, r.QuestionId
+limit 200;

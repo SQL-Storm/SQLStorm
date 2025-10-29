@@ -1,0 +1,146 @@
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate,
+        U.LastAccessDate,
+        U.Views AS TotalViews,
+        U.UpVotes,
+        U.DownVotes,
+        COUNT(B.Id) AS TotalBadges,
+        COUNT(CASE WHEN B.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN B.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN B.Class = 3 THEN 1 END) AS BronzeBadges,
+        CAST(U.Reputation AS numeric) / NULLIF(EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS timestamp) - U.CreationDate)) + 1, 0) AS AvgDailyReputation,
+        CASE
+            WHEN U.AboutMe IS NULL THEN 'No Bio'
+            WHEN LENGTH(U.AboutMe) < 100 THEN 'Short Bio'
+            ELSE 'Long Bio'
+        END AS AboutMeCategory
+    FROM Users AS U
+    LEFT JOIN Badges AS B ON U.Id = B.UserId
+    WHERE U.Reputation > 5000
+      AND U.LastAccessDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate,
+        U.Views, U.UpVotes, U.DownVotes, U.AboutMe
+),
+PostDetailsWithHistory AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.Title,
+        P.Score,
+        P.ViewCount,
+        P.OwnerUserId,
+        COALESCE(P.OwnerDisplayName, 'Community') AS PostOwnerDisplayName,
+        P.CreationDate AS PostCreationDate,
+        P.LastActivityDate,
+        P.Tags,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.ClosedDate,
+        P.Body,
+        P.AcceptedAnswerId,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotes,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotes,
+        AVG(C.Score) AS AverageCommentScore,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.CreationDate END) AS LatestEditHistoryDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.UserDisplayName END) AS LatestEditorDisplayName,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN CREASON.Name END) AS CloseReasonName,
+        ROW_NUMBER() OVER (PARTITION BY P.Id ORDER BY P.CreationDate) AS rn
+    FROM Posts AS P
+    LEFT JOIN Votes AS V ON P.Id = V.PostId
+    LEFT JOIN Comments AS C ON P.Id = C.PostId
+    LEFT JOIN PostHistory AS PH ON P.Id = PH.PostId
+    LEFT JOIN CloseReasonTypes AS CREASON ON (CASE WHEN PH.Comment ~ '^\s*\d+\s*$' THEN CAST(TRIM(PH.Comment) AS integer) ELSE NULL END) = CREASON.Id
+        AND PH.PostHistoryTypeId = 10
+    WHERE P.PostTypeId IN (1, 2)
+      AND P.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '5 years'
+      AND P.ViewCount IS NOT NULL
+    GROUP BY
+        P.Id, P.PostTypeId, P.Title, P.Score, P.ViewCount, P.OwnerUserId,
+        P.OwnerDisplayName, P.CreationDate, P.LastActivityDate, P.Tags,
+        P.AnswerCount, P.CommentCount, P.FavoriteCount, P.ClosedDate, P.Body, P.AcceptedAnswerId
+    HAVING COUNT(V.Id) > 5
+),
+TagFrequency AS (
+    SELECT
+        TRIM(UNNEST(string_to_array(SUBSTRING(PD.Tags, 2, LENGTH(PD.Tags) - 2), '><'))) AS TagName,
+        COUNT(PD.PostId) AS TagPostCount,
+        AVG(PD.Score) AS TagAvgScore,
+        SUM(PD.ViewCount) AS TagTotalViews
+    FROM PostDetailsWithHistory AS PD
+    WHERE PD.Tags IS NOT NULL AND LENGTH(PD.Tags) > 2
+    GROUP BY TRIM(UNNEST(string_to_array(SUBSTRING(PD.Tags, 2, LENGTH(PD.Tags) - 2), '><')))
+    HAVING COUNT(PD.PostId) > 50
+)
+SELECT
+    UE.DisplayName AS UserDisplayName,
+    UE.Reputation,
+    UE.GoldBadges,
+    UE.AvgDailyReputation,
+    UE.AboutMeCategory,
+    PD.PostId,
+    PD.PostOwnerDisplayName,
+    COALESCE(PD.Title, 'Untitled Post (ID: ' || PD.PostId || ')') AS PostTitle,
+    PD.Score AS PostScore,
+    PD.ViewCount,
+    PD.FavoriteCount,
+    (PD.TotalUpVotes * 1.0) / NULLIF((PD.TotalUpVotes + PD.TotalDownVotes), 0) AS UpvoteRatio,
+    COALESCE(PD.AverageCommentScore, 0) AS AvgCommentScore,
+    PD.PostCreationDate,
+    PD.LatestEditHistoryDate,
+    COALESCE(PD.LatestEditorDisplayName, 'Original Author') AS EditorInfo,
+    PD.CloseReasonName,
+    CASE
+        WHEN PD.ClosedDate IS NOT NULL AND PD.AnswerCount = 0 THEN 'Closed & Unanswered'
+        WHEN PD.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN P_MAIN.AcceptedAnswerId IS NOT NULL THEN 'Accepted Answered'
+        WHEN PD.AnswerCount > 0 THEN 'Answered'
+        ELSE 'Open & Unanswered'
+    END AS PostStatus,
+    TF.TagName AS MostFrequentTag,
+    TF.TagPostCount,
+    TF.TagAvgScore,
+    LENGTH(PD.Body) AS BodyLength,
+    SUBSTRING(PD.Body, 1, 150) || '...' AS BodySnippet,
+    (
+        SELECT A.CreationDate
+        FROM Posts AS A
+        WHERE A.Id = P_MAIN.AcceptedAnswerId AND P_MAIN.PostTypeId = 1
+        LIMIT 1
+    ) AS AcceptedAnswerCreationDate,
+    RANK() OVER (PARTITION BY UE.UserId ORDER BY PD.Score DESC, PD.ViewCount DESC) AS RankWithinUserPosts,
+    NTILE(10) OVER (ORDER BY PD.Score * 0.7 + PD.FavoriteCount * 2 + PD.CommentCount * 0.1 DESC) AS OverallEngagementDecile,
+    LAG(PD.PostCreationDate, 1, CAST('1970-01-01' AS timestamp)) OVER (PARTITION BY UE.UserId ORDER BY PD.PostCreationDate) AS PrevPostCreationDate,
+    LEAD(PD.PostCreationDate, 1, CAST('2024-10-01 12:34:56' AS timestamp)) OVER (PARTITION BY UE.UserId ORDER BY PD.PostCreationDate) AS NextPostCreationDate
+FROM UserEngagement AS UE
+JOIN PostDetailsWithHistory AS PD ON UE.UserId = PD.OwnerUserId
+LEFT JOIN Posts AS P_MAIN ON PD.PostId = P_MAIN.Id
+LEFT JOIN TagFrequency AS TF ON TF.TagName = (
+    SELECT TRIM(UNNEST(string_to_array(SUBSTRING(PD.Tags, 2, LENGTH(PD.Tags) - 2), '><')) )
+    FROM (SELECT 1) AS dummy
+    LIMIT 1
+)
+WHERE PD.Score > 50
+  AND (PD.Tags LIKE '%<sql>%' OR PD.Tags LIKE '%<database>%')
+  AND PD.ViewCount > 1000
+  AND PD.CommentCount IS NOT NULL
+  AND PD.PostId NOT IN (
+        SELECT PL.PostId FROM PostLinks AS PL WHERE PL.LinkTypeId = 3
+    )
+GROUP BY
+    UE.DisplayName, UE.Reputation, UE.GoldBadges, UE.AvgDailyReputation, UE.AboutMeCategory,
+    PD.PostId, PD.PostOwnerDisplayName, PD.Title, PD.Score, PD.ViewCount, PD.FavoriteCount,
+    PD.TotalUpVotes, PD.TotalDownVotes, PD.AverageCommentScore, PD.PostCreationDate, PD.LatestEditHistoryDate,
+    PD.LatestEditorDisplayName, PD.CloseReasonName, PD.ClosedDate, PD.AnswerCount, P_MAIN.AcceptedAnswerId,
+    TF.TagName, TF.TagPostCount, TF.TagAvgScore, PD.Body, PD.Tags, UE.UserId, PD.CommentCount
+ORDER BY
+    OverallEngagementDecile,
+    UE.Reputation DESC,
+    RankWithinUserPosts,
+    PD.PostCreationDate DESC
+LIMIT 1000;

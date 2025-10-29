@@ -1,0 +1,217 @@
+WITH UserEngagementMetrics AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.Views AS UserProfileViews,
+        u.UpVotes AS TotalUpVotesGivenByMe,
+        u.DownVotes AS TotalDownVotesGivenByMe,
+        COUNT(DISTINCT p_q.Id) AS TotalQuestionsPosted,
+        COUNT(DISTINCT p_a.Id) AS TotalAnswersPosted,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT b.Id) AS TotalBadgesEarned,
+        SUM(COALESCE(p_q.Score, 0)) AS TotalQuestionScoreReceived,
+        SUM(COALESCE(p_a.Score, 0)) AS TotalAnswerScoreReceived,
+        MAX(COALESCE(p_q.LastActivityDate, p_a.LastActivityDate)) AS LatestPostActivity,
+        MAX(c.CreationDate) AS LatestCommentActivity,
+        EXTRACT(EPOCH FROM (u.LastAccessDate - u.CreationDate)) / (60 * 60 * 24) AS DaysActiveSinceCreation
+    FROM Users u
+    LEFT JOIN Posts p_q ON u.Id = p_q.OwnerUserId AND p_q.PostTypeId = 1
+    LEFT JOIN Posts p_a ON u.Id = p_a.OwnerUserId AND p_a.PostTypeId = 2
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= DATE '2020-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes
+),
+QuestionDetailedMetrics AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title AS QuestionTitle,
+        q.OwnerUserId AS QuestionOwnerUserId,
+        q.CreationDate AS QuestionCreationDate,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.AnswerCount AS DeclaredAnswerCount,
+        q.CommentCount AS DeclaredCommentCount,
+        q.FavoriteCount,
+        q.Tags,
+        q.LastActivityDate AS QuestionLastActivityDate,
+        q.ClosedDate,
+        COUNT(DISTINCT ans.Id) AS ActualAnswerCount,
+        AVG(ans.Score) FILTER (WHERE ans.Id IS NOT NULL) AS AverageAnswerScore,
+        SUM(ans.CommentCount) AS TotalCommentsOnAnswers,
+        (SELECT crt.Name
+         FROM PostHistory ph_close
+         LEFT JOIN CloseReasonTypes crt ON ph_close.Comment = CAST(crt.Id AS varchar)
+         WHERE ph_close.PostId = q.Id
+           AND ph_close.PostHistoryTypeId = 10
+           AND ph_close.Comment IS NOT NULL AND ph_close.Comment ~ '^[0-9]+$'
+         ORDER BY ph_close.CreationDate DESC
+         LIMIT 1) AS MostRecentCloseReason,
+        (SELECT EXTRACT(EPOCH FROM (MIN(ph_edit.CreationDate) - q.CreationDate)) / (60 * 60)
+         FROM PostHistory ph_edit
+         WHERE ph_edit.PostId = q.Id
+           AND ph_edit.PostHistoryTypeId IN (4, 5, 6)
+           AND ph_edit.CreationDate > q.CreationDate
+         GROUP BY ph_edit.PostId) AS HoursToFirstEdit,
+        COALESCE(SUBSTRING(q.Tags FROM 2 FOR POSITION('>' IN q.Tags) - 2), 'no_primary_tag') AS PrimaryTagExtracted
+    FROM Posts q
+    LEFT JOIN Posts ans ON q.Id = ans.ParentId AND ans.PostTypeId = 2
+    WHERE q.PostTypeId = 1 AND q.CreationDate >= DATE '2021-01-01'
+    GROUP BY q.Id, q.Title, q.OwnerUserId, q.CreationDate, q.Score, q.ViewCount, q.AnswerCount, q.CommentCount, q.FavoriteCount, q.Tags, q.LastActivityDate, q.ClosedDate
+),
+TagClusterPerformance AS (
+    SELECT
+        t.TagName,
+        COUNT(DISTINCT p.Id) AS TaggedQuestionCount,
+        AVG(p.Score) AS AvgQuestionScoreForTag,
+        AVG(p.ViewCount) AS AvgQuestionViewCountForTag,
+        SUM(COALESCE(p.AnswerCount, 0)) AS TotalAnswersForTag,
+        COUNT(DISTINCT pl.RelatedPostId) FILTER (WHERE pl.LinkTypeId = 3) AS DuplicateLinkedQuestions,
+        CAST(COUNT(DISTINCT pl.RelatedPostId) FILTER (WHERE pl.LinkTypeId = 3) AS NUMERIC) / NULLIF(COUNT(DISTINCT p.Id), 0) AS DuplicateLinkRatio
+    FROM Tags t
+    JOIN Posts p ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%' AND p.PostTypeId = 1
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+    WHERE p.CreationDate >= DATE '2021-01-01'
+    GROUP BY t.TagName
+),
+PostHistorySummary AS (
+    SELECT
+        ph.PostId,
+        COUNT(DISTINCT ph.Id) AS TotalHistoryEvents,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN 1 ELSE 0 END) AS TotalEditEvents,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS TotalClosedEvents,
+        MIN(ph.CreationDate) AS FirstHistoryEventDate,
+        MAX(ph.CreationDate) AS LatestHistoryEventDate,
+        AVG(EXTRACT(EPOCH FROM (ph.CreationDate - prev_creation)) / 3600.0) AS AvgHoursBetweenEdits
+    FROM (
+        SELECT
+            ph.*,
+            LAG(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS prev_creation
+        FROM PostHistory ph
+        WHERE ph.CreationDate >= DATE '2021-01-01'
+    ) ph
+    GROUP BY ph.PostId
+),
+CombinedPostInfo AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Title AS PostTitle,
+        p.Score,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        p.ViewCount,
+        'HighScoringQuestion' AS PostCategory,
+        NULL AS ParentQuestionId
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Score > 100 AND p.ViewCount > 5000
+      AND p.CreationDate >= DATE '2022-01-01'
+    UNION ALL
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        COALESCE(SUBSTRING(p.Body, 1, 100), 'Answer Body Snippet') AS PostTitle,
+        p.Score,
+        p.CreationDate,
+        p.OwnerUserId,
+        (SELECT q.Tags FROM Posts q WHERE q.Id = p.ParentId) AS Tags,
+        NULL AS ViewCount,
+        'HighScoringAnswer' AS PostCategory,
+        p.ParentId AS ParentQuestionId
+    FROM Posts p
+    WHERE p.PostTypeId = 2 AND p.Score > 50 AND p.CreationDate >= DATE '2022-01-01'
+),
+PostsWithoutNormalOwners AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title AS PostTitle,
+        p.PostTypeId,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Score
+    FROM Posts p
+    WHERE p.OwnerUserId IS NULL OR p.OwnerUserId = -1 OR p.PostTypeId IN (4,5)
+)
+SELECT
+    COALESCE(uem.DisplayName, 'Unknown User') AS User_DisplayName,
+    COALESCE(uem.Reputation, 0) AS User_Reputation,
+    uem.UserCreationDate,
+    uem.TotalQuestionsPosted,
+    uem.TotalAnswersPosted,
+    uem.TotalBadgesEarned,
+    uem.LatestPostActivity,
+    uem.DaysActiveSinceCreation,
+    qdm.QuestionTitle,
+    qdm.QuestionScore AS Q_Score,
+    qdm.ViewCount AS Q_ViewCount,
+    qdm.DeclaredAnswerCount AS Q_DeclaredAnswerCount,
+    COALESCE(qdm.AverageAnswerScore, 0.0) AS Q_AvgAnswerScore,
+    qdm.MostRecentCloseReason,
+    qdm.PrimaryTagExtracted,
+    qdm.HoursToFirstEdit,
+    tcp.TagName AS TopRelevantTag,
+    tcp.AvgQuestionScoreForTag,
+    COALESCE(tcp.DuplicateLinkRatio, 0.0) AS Tag_DuplicateLinkRatio,
+    phs.TotalEditEvents AS Post_TotalEditEvents,
+    phs.AvgHoursBetweenEdits AS Post_AvgHoursBetweenEdits,
+    cpi.PostCategory,
+    cpi.PostTitle AS Combined_PostTitle,
+    cpi.Score AS Combined_PostScore,
+    cpi.ViewCount AS Combined_PostViewCount,
+    pwo.PostId AS PWO_PostId,
+    pwo.PostTitle AS PWO_PostTitle,
+    pwo.PostTypeId AS PWO_PostType,
+    (uem.Reputation / NULLIF(uem.TotalQuestionsPosted + uem.TotalAnswersPosted, 0)) AS RepPerPostRatio,
+    COALESCE(qdm.FavoriteCount, 0) * (uem.UserProfileViews / 100.0) AS WeightedFavoriteScore,
+    RANK() OVER (ORDER BY uem.Reputation DESC, uem.TotalQuestionsPosted DESC) AS GlobalUserRank,
+    NTILE(10) OVER (ORDER BY qdm.QuestionScore DESC, qdm.ViewCount DESC) AS QuestionEngagementDecile,
+    (SELECT u_editor.DisplayName
+     FROM PostHistory ph_latest_editor
+     JOIN Users u_editor ON ph_latest_editor.UserId = u_editor.Id
+     WHERE ph_latest_editor.PostId = qdm.QuestionId
+       AND ph_latest_editor.PostHistoryTypeId = 5
+     ORDER BY ph_latest_editor.CreationDate DESC
+     LIMIT 1) AS LatestBodyEditorDisplayName,
+    CASE
+        WHEN uem.Reputation > 10000 AND uem.TotalBadgesEarned >= 20 AND uem.DaysActiveSinceCreation > 730 AND qdm.QuestionId IS NOT NULL THEN 'Veteran_HighRep_Engaged_Q'
+        WHEN uem.Reputation > 2000 AND uem.TotalQuestionsPosted > 10 AND uem.TotalAnswersPosted > 20 AND qdm.QuestionId IS NOT NULL THEN 'Active_Contributor_Q'
+        WHEN uem.UserId IS NOT NULL AND pwo.PostId IS NOT NULL THEN 'User_With_NoNormalOwnerPost'
+        WHEN qdm.MostRecentCloseReason IS NOT NULL AND qdm.MostRecentCloseReason LIKE '%Duplicate%' THEN 'Closed_Duplicate_Question'
+        WHEN cpi.PostCategory = 'HighScoringAnswer' THEN 'High_Impact_Answer'
+        ELSE 'General_Engagement_Or_Unclassified'
+    END AS UserQuestionEngagementTier,
+    (SELECT SUBSTRING(p_body.Body, 1, 100) FROM Posts p_body WHERE p_body.Id = qdm.QuestionId) AS QuestionBodySnippet,
+    (uem.TotalQuestionsPosted + uem.TotalAnswersPosted + uem.TotalCommentsMade + uem.TotalBadgesEarned) = 0 AS IsInactiveUserFlag
+FROM UserEngagementMetrics uem
+FULL OUTER JOIN PostsWithoutNormalOwners pwo ON uem.UserId = pwo.OwnerUserId
+LEFT JOIN QuestionDetailedMetrics qdm ON uem.UserId = qdm.QuestionOwnerUserId AND qdm.QuestionId = COALESCE(pwo.PostId, qdm.QuestionId)
+LEFT JOIN LATERAL (
+    SELECT tcp_inner.TagName, tcp_inner.AvgQuestionScoreForTag, tcp_inner.DuplicateLinkRatio
+    FROM TagClusterPerformance tcp_inner
+    WHERE qdm.Tags LIKE '%' || '<' || tcp_inner.TagName || '>' || '%'
+    ORDER BY tcp_inner.AvgQuestionScoreForTag DESC, tcp_inner.TaggedQuestionCount DESC
+    LIMIT 1
+) tcp ON TRUE
+LEFT JOIN PostHistorySummary phs ON qdm.QuestionId = phs.PostId
+LEFT JOIN CombinedPostInfo cpi ON uem.UserId = cpi.OwnerUserId AND qdm.QuestionId = cpi.PostId
+WHERE
+    (uem.Reputation > 1000 OR pwo.PostId IS NOT NULL)
+    AND (qdm.QuestionScore > 10 OR qdm.ViewCount > 1000 OR qdm.AverageAnswerScore > 5 OR pwo.PostId IS NOT NULL)
+    AND COALESCE(qdm.PrimaryTagExtracted, 'N/A') != 'javascript'
+    AND uem.LatestPostActivity IS NOT NULL
+    AND uem.DaysActiveSinceCreation > 30
+    AND NOT EXISTS (
+        SELECT 1
+        FROM Posts p_body_check
+        WHERE p_body_check.OwnerUserId = uem.UserId
+          AND p_body_check.PostTypeId = 1
+          AND LENGTH(p_body_check.Body) < 100
+        GROUP BY p_body_check.OwnerUserId
+        HAVING COUNT(p_body_check.Id) = uem.TotalQuestionsPosted
+    )
+ORDER BY GlobalUserRank ASC, QuestionEngagementDecile ASC, COALESCE(pwo.PostId, -1) DESC
+LIMIT 1000;

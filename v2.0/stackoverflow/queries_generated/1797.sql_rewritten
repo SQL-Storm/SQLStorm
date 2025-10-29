@@ -1,0 +1,280 @@
+-- {"query": "1797.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3916} 
+WITH UserActivity AS (
+    -- CTE 1: Summarizes user activity, reputation, and ranks users
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END) AS AvgQuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS TotalAnswerScore,
+        MAX(p.LastAccessDate) AS LastAccessDate,
+        -- Window function: Rank users by reputation and then by total posts
+        RANK() OVER (ORDER BY u.Reputation DESC, COUNT(DISTINCT p.Id) DESC, u.Id) AS UserRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    WHERE u.CreationDate >= '2020-01-01' -- Filter for users created after a specific date
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+    HAVING COUNT(DISTINCT p.Id) > 5 -- Only include users with more than 5 posts
+),
+ParsedPostTags AS (
+    -- CTE 2: Parses tags from posts using string_to_array and UNNEST
+    SELECT
+        p.Id AS PostId,
+        UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><')) AS TagName
+    FROM Posts p
+    WHERE p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2
+      AND p.PostTypeId IN (1, 4, 5) -- Tags are relevant for Questions, TagWikiExcerpt, TagWiki
+),
+TagPopularity AS (
+    -- CTE 3: Calculates popularity metrics for tags
+    SELECT
+        ppt.TagName,
+        COUNT(DISTINCT ppt.PostId) AS TaggedPostCount,
+        AVG(p.Score) AS AvgScoreForTagPosts
+    FROM ParsedPostTags ppt
+    JOIN Posts p ON ppt.PostId = p.Id
+    GROUP BY ppt.TagName
+    HAVING COUNT(DISTINCT ppt.PostId) > 50 -- Consider only popular tags
+),
+PostDetails AS (
+    -- CTE 4: Gathers core post details and calculates engagement scores
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate AS PostCreationDate,
+        p.LastActivityDate,
+        p.ClosedDate,
+        p.Tags,
+        p.AcceptedAnswerId,
+        -- Complicated calculation for 'engagement score'
+        (p.Score * 0.5 + COALESCE(p.ViewCount, 0) * 0.01 + COALESCE(p.AnswerCount, 0) * 0.8 + COALESCE(p.CommentCount, 0) * 0.6 + COALESCE(p.FavoriteCount, 0) * 1.5) AS EngagementScore,
+        -- Correlated subquery: Check if the post has any comments from users with above-average comment scores for their *other* comments
+        EXISTS (
+            SELECT 1
+            FROM Comments sc
+            WHERE sc.PostId = p.Id
+              AND sc.Score > COALESCE((SELECT AVG(scc.Score) FROM Comments scc WHERE scc.UserId = sc.UserId AND scc.PostId != sc.PostId), 0)
+        ) AS HasHighScoreCommentsByOwner,
+        -- Window function: Average score of posts by the same owner in the same calendar year
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId, EXTRACT(YEAR FROM p.CreationDate)) AS AvgOwnerScoreThisYear
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) -- Focus on Questions (1) and Answers (2)
+      AND p.CreationDate >= '2021-01-01'
+),
+PostEditHistory AS (
+    -- CTE 5: Summarizes post edit activity
+    SELECT
+        ph.PostId,
+        COUNT(DISTINCT ph.Id) AS EditCount,
+        MAX(ph.CreationDate) AS LastEditDate,
+        -- Correlated subquery: Get the DisplayName of the most recent editor
+        (SELECT u.DisplayName FROM Users u WHERE u.Id = ph.UserId ORDER BY ph.CreationDate DESC LIMIT 1) AS LastEditorDisplayName_Subquery
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+    GROUP BY ph.PostId
+),
+UsersWithHighRepPosts AS (
+    -- CTE 6: Identifies high-reputation users with highly engaging questions
+    SELECT
+        ua.DisplayName AS UserDisplayName,
+        ua.Reputation,
+        pd.Title,
+        pd.PostId,
+        pd.PostTypeId,
+        pd.Score AS PostScore,
+        pd.EngagementScore,
+        pd.AvgOwnerScoreThisYear,
+        ph.EditCount,
+        ph.LastEditDate,
+        ph.LastEditorDisplayName_Subquery,
+        COALESCE(tp.TagName, 'Untagged') AS PrimaryTagName, -- NULL logic for posts without recognized tags
+        COALESCE(tp.AvgScoreForTagPosts, 0) AS AvgScoreForPrimaryTag,
+        COALESCE(pd.ClosedDate, '9999-12-31'::timestamp) AS EffectiveClosedDate, -- NULL logic for closed date
+        -- String expressions and complicated predicate for tech categorization
+        CASE
+            WHEN pd.Title ILIKE '%sql%' OR pd.Tags ILIKE '%<sql>%' THEN 'SQL Related'
+            WHEN pd.Title ILIKE '%javascript%' OR pd.Tags ILIKE '%<javascript>%' THEN 'JavaScript Related'
+            WHEN pd.Title ILIKE '%python%' OR pd.Tags ILIKE '%<python>%' THEN 'Python Related'
+            WHEN pd.Tags ILIKE '%<c#>%' OR pd.Tags ILIKE '%<java>%' THEN 'Backend Related'
+            ELSE 'Other Tech'
+        END AS TechCategory,
+        -- Window function: Rank posts by engagement within their tech category
+        ROW_NUMBER() OVER (PARTITION BY
+            CASE
+                WHEN pd.Title ILIKE '%sql%' OR pd.Tags ILIKE '%<sql>%' THEN 'SQL Related'
+                WHEN pd.Title ILIKE '%javascript%' OR pd.Tags ILIKE '%<javascript>%' THEN 'JavaScript Related'
+                WHEN pd.Title ILIKE '%python%' OR pd.Tags ILIKE '%<python>%' THEN 'Python Related'
+                WHEN pd.Tags ILIKE '%<c#>%' OR pd.Tags ILIKE '%<java>%' THEN 'Backend Related'
+                ELSE 'Other Tech'
+            END
+            ORDER BY pd.EngagementScore DESC, pd.CreationDate DESC
+        ) AS RankWithinTechCategory,
+        -- Correlated subquery: Count gold badges for the user
+        (SELECT COUNT(DISTINCT b.Id) FROM Badges b WHERE b.UserId = ua.UserId AND b.Class = 1) AS GoldBadgeCount,
+        -- Correlated subquery: Count upvotes for the post
+        (SELECT COUNT(DISTINCT vt.Id) FROM Votes vt WHERE vt.PostId = pd.PostId AND vt.VoteTypeId = 2) AS UpVoteCountForPost
+    FROM UserActivity ua
+    INNER JOIN PostDetails pd ON ua.UserId = pd.OwnerUserId
+    LEFT JOIN PostEditHistory ph ON pd.PostId = ph.PostId
+    -- Lateral join to get the first tag for the post
+    LEFT JOIN LATERAL (
+        SELECT pt.TagName
+        FROM ParsedPostTags pt
+        WHERE pt.PostId = pd.PostId
+        ORDER BY pt.TagName -- Consistent selection if multiple tags
+        LIMIT 1
+    ) AS pt_first_tag ON TRUE
+    LEFT JOIN TagPopularity tp ON pt_first_tag.TagName = tp.TagName
+    WHERE ua.UserRank <= 500 -- Top 500 users
+      AND pd.Score >= 10
+      AND pd.LastActivityDate > (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year') -- Posts active in the last year
+      AND pd.HasHighScoreCommentsByOwner
+      AND pd.PostTypeId = 1 -- Only questions
+      AND pd.Title IS NOT NULL
+      AND pd.AcceptedAnswerId IS NOT NULL -- Only questions with an accepted answer
+),
+UsersWithHighEngagementAnswers AS (
+    -- CTE 7: Identifies active commenters with highly engaging answers
+    SELECT
+        ua.DisplayName AS UserDisplayName,
+        ua.Reputation,
+        pd.Title,
+        pd.PostId,
+        pd.PostTypeId,
+        pd.Score AS PostScore,
+        pd.EngagementScore,
+        pd.AvgOwnerScoreThisYear,
+        ph.EditCount,
+        ph.LastEditDate,
+        ph.LastEditorDisplayName_Subquery,
+        COALESCE(tp.TagName, 'Untagged') AS PrimaryTagName,
+        COALESCE(tp.AvgScoreForTagPosts, 0) AS AvgScoreForPrimaryTag,
+        COALESCE(pd.ClosedDate, '9999-12-31'::timestamp) AS EffectiveClosedDate,
+        CASE
+            WHEN pd.Title ILIKE '%sql%' OR pd.Tags ILIKE '%<sql>%' THEN 'SQL Related'
+            WHEN pd.Title ILIKE '%javascript%' OR pd.Tags ILIKE '%<javascript>%' THEN 'JavaScript Related'
+            WHEN pd.Tags ILIKE '%<c#>%' OR pd.Tags ILIKE '%<java>%' THEN 'Backend Related'
+            ELSE 'Other Tech'
+        END AS TechCategory,
+        ROW_NUMBER() OVER (PARTITION BY
+            CASE
+                WHEN pd.Title ILIKE '%sql%' OR pd.Tags ILIKE '%<sql>%' THEN 'SQL Related'
+                WHEN pd.Title ILIKE '%javascript%' OR pd.Tags ILIKE '%<javascript>%' THEN 'JavaScript Related'
+                WHEN pd.Tags ILIKE '%<c#>%' OR pd.Tags ILIKE '%<java>%' THEN 'Backend Related'
+                ELSE 'Other Tech'
+            END
+            ORDER BY pd.EngagementScore DESC, pd.CreationDate DESC
+        ) AS RankWithinTechCategory,
+        -- Correlated subquery: Count silver badges for the user
+        (SELECT COUNT(DISTINCT b.Id) FROM Badges b WHERE b.UserId = ua.UserId AND b.Class = 2) AS SilverBadgeCount,
+        -- Correlated subquery: Check if this answer was accepted
+        (SELECT COUNT(DISTINCT q.Id) FROM Posts q WHERE q.AcceptedAnswerId = pd.PostId) AS AcceptedAnswerCount
+    FROM UserActivity ua
+    INNER JOIN PostDetails pd ON ua.UserId = pd.OwnerUserId
+    LEFT JOIN PostEditHistory ph ON pd.PostId = ph.PostId
+    LEFT JOIN LATERAL (
+        SELECT pt.TagName
+        FROM ParsedPostTags pt
+        WHERE pt.PostId = pd.PostId
+        ORDER BY pt.TagName
+        LIMIT 1
+    ) AS pt_first_tag ON TRUE
+    LEFT JOIN TagPopularity tp ON pt_first_tag.TagName = tp.TagName
+    WHERE ua.TotalComments > 20 -- Users with significant commenting activity
+      AND pd.Score >= 15 -- High-scoring answers
+      AND pd.PostTypeId = 2 -- Only answers
+      AND pd.LastActivityDate IS NOT NULL
+      AND pd.OwnerUserId IS NOT NULL
+),
+UsersWhoVotedButNeverPosted AS (
+    -- CTE 8: Finds users who have voted but never created a post
+    SELECT DISTINCT u.Id AS UserId, u.DisplayName
+    FROM Users u
+    JOIN Votes v ON u.Id = v.UserId
+    EXCEPT
+    SELECT DISTINCT u.Id, u.DisplayName
+    FROM Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+)
+-- Main query: Combines results from high-reputation questions and high-engagement answers using UNION ALL
+SELECT
+    'Question' AS PostTypeCategory,
+    hrp.UserDisplayName,
+    hrp.Reputation,
+    hrp.Title,
+    hrp.PostScore,
+    hrp.EngagementScore,
+    hrp.PrimaryTagName,
+    hrp.TechCategory,
+    hrp.RankWithinTechCategory,
+    hrp.GoldBadgeCount AS RelatedBadgeCount,
+    hrp.UpVoteCountForPost AS SpecificVoteCount,
+    -- NULL logic: Determine user engagement status based on 'UsersWhoVotedButNeverPosted'
+    CASE WHEN uvnp.UserId IS NOT NULL THEN 'Voter Only' ELSE 'Poster & Voter' END AS UserEngagementStatus,
+    -- Complicated calculation: Days since last edit, handling potential NULLs
+    COALESCE(EXTRACT(DAY FROM (cast('2024-10-01 12:34:56' as timestamp) - hrp.LastEditDate)), -1) AS DaysSinceLastEdit,
+    -- Correlated subquery in SELECT: Sum of recent comment scores by the last editor
+    (
+        SELECT COALESCE(SUM(c.Score), 0)
+        FROM Comments c
+        WHERE c.PostId = hrp.PostId
+          AND c.CreationDate > (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '6 months')
+          AND c.UserId = (SELECT phu.UserId FROM PostHistory phu WHERE phu.PostId = hrp.PostId AND phu.PostHistoryTypeId = 5 ORDER BY phu.CreationDate DESC LIMIT 1)
+    ) AS LastEditorRecentCommentScore,
+    -- Window function: Average engagement score for posts in the same primary tag
+    AVG(hrp.EngagementScore) OVER (PARTITION BY hrp.PrimaryTagName) AS AvgEngagementScoreForTag,
+    -- Window function: Maximum post score in the same tech category
+    MAX(hrp.PostScore) OVER (PARTITION BY hrp.TechCategory) AS MaxPostScoreInTechCategory,
+    -- Complicated expression: Check if a post is considered 'trending'
+    CASE WHEN hrp.EngagementScore > 100 AND EXTRACT(DAY FROM (cast('2024-10-01 12:34:56' as timestamp) - hrp.PostCreationDate)) < 90 THEN TRUE ELSE FALSE END AS IsTrendingPost
+FROM UsersWithHighRepPosts hrp
+-- Joining on DisplayName to introduce potential ambiguity/NULLs for benchmarking
+LEFT JOIN UsersWhoVotedButNeverPosted uvnp ON hrp.UserDisplayName = uvnp.DisplayName
+WHERE hrp.RankWithinTechCategory <= 20 -- Limit to top 20 questions in each category
+  AND hrp.Reputation > 5000 -- Only highly reputable users
+  AND hrp.EngagementScore > 40 -- High engagement only
+
+UNION ALL -- Set operator to combine questions and answers
+
+SELECT
+    'Answer' AS PostTypeCategory,
+    hea.UserDisplayName,
+    hea.Reputation,
+    hea.Title,
+    hea.PostScore,
+    hea.EngagementScore,
+    hea.PrimaryTagName,
+    hea.TechCategory,
+    hea.RankWithinTechCategory,
+    hea.SilverBadgeCount AS RelatedBadgeCount,
+    hea.AcceptedAnswerCount AS SpecificVoteCount,
+    CASE WHEN uvnp.UserId IS NOT NULL THEN 'Voter Only' ELSE 'Poster & Voter' END AS UserEngagementStatus,
+    COALESCE(EXTRACT(DAY FROM (cast('2024-10-01 12:34:56' as timestamp) - hea.LastEditDate)), -1) AS DaysSinceLastEdit,
+    (
+        SELECT COALESCE(SUM(c.Score), 0)
+        FROM Comments c
+        WHERE c.PostId = hea.PostId
+          AND c.CreationDate > (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '6 months')
+          AND c.UserId = (SELECT phu.UserId FROM PostHistory phu WHERE phu.PostId = hea.PostId AND phu.PostHistoryTypeId = 5 ORDER BY phu.CreationDate DESC LIMIT 1)
+    ) AS LastEditorRecentCommentScore,
+    AVG(hea.EngagementScore) OVER (PARTITION BY hea.PrimaryTagName) AS AvgEngagementScoreForTag,
+    MAX(hea.PostScore) OVER (PARTITION BY hea.TechCategory) AS MaxPostScoreInTechCategory,
+    CASE WHEN hea.EngagementScore > 80 AND hea.AcceptedAnswerCount > 0 THEN TRUE ELSE FALSE END AS IsTrendingPost
+FROM UsersWithHighEngagementAnswers hea
+LEFT JOIN UsersWhoVotedButNeverPosted uvnp ON hea.UserDisplayName = uvnp.DisplayName
+WHERE hea.RankWithinTechCategory <= 10 -- Limit to top 10 answers in each category
+  AND hea.Reputation > 2000 -- Reputable users
+  AND hea.PostScore > 20 -- Highly scored answers
+ORDER BY Reputation DESC, EngagementScore DESC
+LIMIT 2000;

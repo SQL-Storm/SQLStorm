@@ -1,0 +1,246 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT c.Id) as Comments,
+        COUNT(DISTINCT b.Id) as Badges,
+        MAX(p.CreationDate) as LastPostDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) as ReputationRank,
+        DENSE_RANK() OVER (ORDER BY u.Views DESC) as ViewRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.AccountId IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TagPerformance AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'High'
+            WHEN t.Count > 100 THEN 'Medium'
+            ELSE 'Low'
+        END as PopularityLevel,
+        COALESCE((SELECT AVG(p.Score) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%'), 0) as AvgScore
+    FROM Tags t
+    WHERE t.TagName IS NOT NULL
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.LastActivityDate,
+        p.Tags,
+        p.PostTypeId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END as PostTypeDescription,
+        CASE 
+            WHEN p.Score >= 100 THEN 'Highly Voted'
+            WHEN p.Score >= 10 THEN 'Moderately Voted'
+            WHEN p.Score >= 0 THEN 'Neutral'
+            ELSE 'Downvoted'
+        END as VoteCategory,
+        CASE 
+            WHEN p.ViewCount > 1000 THEN 'Viral'
+            WHEN p.ViewCount > 100 THEN 'Popular'
+            WHEN p.ViewCount > 10 THEN 'Notable'
+            ELSE 'Obscure'
+        END as ViewCategory,
+        CAST(p.LastActivityDate AS DATE) - CAST(p.CreationDate AS DATE) as AgeInDays,
+        COALESCE((SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id), 0) as CommentsCount,
+        COALESCE((SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId IN (2, 3)), 0) as VoteCount
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserPostMetrics AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END), 0) as QuestionsPosted,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END), 0) as AnswersPosted,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        COALESCE(AVG(p.Score), 0) as AvgScore,
+        COALESCE(COUNT(DISTINCT p.Id), 0) as PostsCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id, u.DisplayName
+),
+ComplexUserAnalysis AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COALESCE(ums.QuestionsPosted, 0) as QuestionsPosted,
+        COALESCE(ums.AnswersPosted, 0) as AnswersPosted,
+        COALESCE(ums.TotalScore, 0) as TotalScore,
+        COALESCE(ums.AvgScore, 0) as AvgScore,
+        COALESCE(ums.PostsCount, 0) as PostsCount,
+        CASE 
+            WHEN COALESCE(ums.QuestionsPosted, 0) > 0 THEN 
+                COALESCE(ums.AnswersPosted, 0) * 1.0 / COALESCE(ums.QuestionsPosted, 1)
+            ELSE 0 
+        END as AnswerToQuestionRatio,
+        CASE 
+            WHEN COALESCE(ums.PostsCount, 0) > 0 THEN 
+                COALESCE(ums.TotalScore, 0) * 1.0 / COALESCE(ums.PostsCount, 1)
+            ELSE 0 
+        END as ScorePerPost,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Expert'
+            WHEN u.Reputation > 1000 THEN 'Advanced'
+            WHEN u.Reputation > 100 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as UserLevel,
+        CASE 
+            WHEN u.Views > 10000 THEN 'High Traffic'
+            WHEN u.Views > 1000 THEN 'Medium Traffic'
+            ELSE 'Low Traffic'
+        END as TrafficLevel,
+        COALESCE((SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1), 0) as GoldBadges,
+        COALESCE((SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2), 0) as SilverBadges,
+        COALESCE((SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3), 0) as BronzeBadges,
+        COALESCE((SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.Score > 100), 0) as HighScorePosts
+    FROM Users u
+    FULL OUTER JOIN UserPostMetrics ums ON u.Id = ums.UserId
+    WHERE u.Id IS NOT NULL
+)
+SELECT 
+    'User Activity Benchmark' as MetricGroup,
+    COUNT(*) as TotalRecords,
+    COUNT(DISTINCT u.Id) as DistinctUsers,
+    AVG(u.Reputation) as AvgReputation,
+    MAX(u.Reputation) as MaxReputation,
+    MIN(u.Reputation) as MinReputation,
+    SUM(CASE WHEN u.Reputation > 10000 THEN 1 ELSE 0 END) as ExpertUsers,
+    COUNT(DISTINCT CASE WHEN u.Views > 1000 THEN u.Id END) as HighTrafficUsers,
+    COUNT(DISTINCT CASE WHEN u.Views < 100 THEN u.Id END) as LowTrafficUsers,
+    COUNT(DISTINCT CASE WHEN c.UserId IS NOT NULL THEN c.UserId END) as ActiveCommenters,
+    COUNT(DISTINCT CASE WHEN b.UserId IS NOT NULL THEN b.UserId END) as BadgeHolders,
+    (SELECT COUNT(*) FROM Posts p WHERE p.PostTypeId = 1) as QuestionCount,
+    (SELECT COUNT(*) FROM Posts p WHERE p.PostTypeId = 2) as AnswerCount,
+    (SELECT COUNT(*) FROM Posts p WHERE p.PostTypeId = 3) as WikiCount,
+    (SELECT COUNT(*) FROM Posts p WHERE p.PostTypeId = 4) as TagWikiExcerptCount,
+    (SELECT COUNT(*) FROM Badges b WHERE b.Class = 1) as GoldBadgeCount,
+    (SELECT COUNT(*) FROM Badges b WHERE b.Class = 2) as SilverBadgeCount,
+    (SELECT COUNT(*) FROM Badges b WHERE b.Class = 3) as BronzeBadgeCount,
+    SUM(CASE WHEN p.Score > 100 THEN 1 ELSE 0 END) as HighScorePosts,
+    SUM(CASE WHEN p.ViewCount > 1000 THEN 1 ELSE 0 END) as ViralPosts,
+    COUNT(DISTINCT p.OwnerUserId) as PostAuthors,
+    COUNT(DISTINCT p.LastEditorUserId) as PostEditors,
+    AVG(p.ViewCount) as AvgViewCount,
+    MAX(p.ViewCount) as MaxViewCount,
+    MIN(p.ViewCount) as MinViewCount,
+    (SELECT AVG(LENGTH(p.Title)) FROM Posts p WHERE p.Title IS NOT NULL) as AvgTitleLength,
+    (SELECT AVG(LENGTH(p.Body)) FROM Posts p WHERE p.Body IS NOT NULL) as AvgBodyLength,
+    COUNT(DISTINCT t.Id) as TotalTags,
+    COUNT(DISTINCT CASE WHEN t.Count > 1000 THEN t.Id END) as PopularTags,
+    COUNT(DISTINCT CASE WHEN t.Count < 100 THEN t.Id END) as RareTags,
+    'User Performance Analysis' as AnalysisType,
+    'StackOverflow Benchmarking Query' as QueryPurpose,
+    (SELECT COUNT(*) FROM Posts WHERE Tags IS NOT NULL AND Tags LIKE '%<%') as PostsWithTagData,
+    (SELECT COUNT(*) FROM Comments WHERE Text IS NOT NULL AND LENGTH(Text) > 100) as LongComments,
+    (SELECT COUNT(*) FROM Badges WHERE Date IS NOT NULL) as BadgesWithDates,
+    (SELECT COUNT(*) FROM Posts WHERE LastActivityDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 month')) as RecentActivityPosts,
+    (SELECT COUNT(*) FROM Comments WHERE CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 month')) as RecentActivityComments,
+    'Complex Analysis Complete' as Status
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN Comments c ON u.Id = c.UserId
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN Tags t ON 1=1
+WHERE u.Id IS NOT NULL
+GROUP BY 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes
+HAVING 
+    COUNT(*) > 0
+    AND AVG(u.Reputation) IS NOT NULL
+    AND MAX(u.Reputation) IS NOT NULL
+UNION ALL
+SELECT 
+    'Post Analysis Benchmark' as MetricGroup,
+    COUNT(*) as TotalRecords,
+    COUNT(DISTINCT p.OwnerUserId) as DistinctAuthors,
+    AVG(p.Score) as AvgScore,
+    MAX(p.Score) as MaxScore,
+    MIN(p.Score) as MinScore,
+    COUNT(DISTINCT CASE WHEN p.Score > 100 THEN p.Id END) as HighScore,
+    COUNT(DISTINCT CASE WHEN p.Score > 10 THEN p.Id END) as ModerateScore,
+    COUNT(DISTINCT CASE WHEN p.Score < 0 THEN p.Id END) as NegativeScore,
+    COUNT(DISTINCT CASE WHEN p.ViewCount > 1000 THEN p.Id END) as ViralPosts,
+    COUNT(DISTINCT CASE WHEN p.ViewCount > 100 THEN p.Id END) as PopularPosts,
+    COUNT(DISTINCT CASE WHEN p.ViewCount < 10 THEN p.Id END) as LowViewPosts,
+    COUNT(DISTINCT CASE WHEN p.AnswerCount > 10 THEN p.Id END) as HighlyAnswered,
+    COUNT(DISTINCT CASE WHEN p.CommentCount > 5 THEN p.Id END) as HighlyCommented,
+    COUNT(DISTINCT CASE WHEN p.CommentCount = 0 THEN p.Id END) as NoComments,
+    COUNT(DISTINCT CASE WHEN p.Score > 50 AND p.ViewCount > 1000 THEN p.Id END) as HighValuePosts,
+    COUNT(DISTINCT p.ParentId) as AnsweredQuestions,
+    COUNT(DISTINCT p.Id) as TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 3 THEN p.Id END) as Wikis,
+    (SELECT COUNT(*) FROM Posts WHERE CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year')) as RecentPosts,
+    (SELECT COUNT(*) FROM Posts WHERE LastActivityDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year')) as RecentActivity,
+    (SELECT COUNT(*) FROM Posts WHERE Tags IS NOT NULL AND LENGTH(Tags) > 50) as PostsWithLongTags,
+    (SELECT COUNT(*) FROM Posts WHERE LENGTH(Body) > 1000) as LongBodyPosts,
+    (SELECT COUNT(*) FROM Posts WHERE LENGTH(Title) > 100) as LongTitlePosts,
+    'Post Activity Analysis' as AnalysisType,
+    'StackOverflow Benchmarking Query' as QueryPurpose,
+    COUNT(DISTINCT CASE WHEN p.Score > 100 AND p.ViewCount > 1000 THEN p.Id END) as HighValueContent,
+    COUNT(DISTINCT p.Id) as ContentItems,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId IN (1, 2) AND Score > 0) as PositiveScored,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId IN (1, 2) AND Score < 0) as NegativeScored,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId IN (1, 2) AND Score = 0) as ZeroScored,
+    (SELECT AVG(LENGTH(p.Tags)) FROM Posts p WHERE p.Tags IS NOT NULL) as AvgTagsLength,
+    COUNT(DISTINCT CASE WHEN p.OwnerUserId IS NOT NULL THEN p.OwnerUserId END) as AuthoredPosts,
+    COUNT(DISTINCT CASE WHEN p.OwnerUserId IS NULL THEN p.Id END) as AnonymousPosts,
+    'Post Analysis Complete' as Status
+FROM Posts p
+WHERE p.Id IS NOT NULL
+GROUP BY 
+    p.Id,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.PostTypeId
+HAVING 
+    COUNT(*) > 0
+    AND AVG(p.Score) IS NOT NULL
+    AND MAX(p.Score) IS NOT NULL
+ORDER BY 
+    CASE 
+        WHEN MetricGroup = 'User Activity Benchmark' THEN 1
+        WHEN MetricGroup = 'Post Analysis Benchmark' THEN 2
+        ELSE 3
+    END,
+    TotalRecords DESC;

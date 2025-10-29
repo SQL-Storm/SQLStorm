@@ -1,0 +1,342 @@
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        u.location,
+        coalesce(nullif(trim(u.websiteurl), ''), 'N/A') as websiteurl,
+        row_number() over (order by u.creationdate desc, u.id desc) as rn
+    from users u
+),
+tagged_questions as (
+    select
+        p.id as question_id,
+        p.owneruserid,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        p.title,
+        p.tags,
+        string_to_array(substring(p.tags, 2, length(p.tags)-2), '><') as tag_array
+    from posts p
+    where p.posttypeid = 1
+),
+answers as (
+    select
+        a.id as answer_id,
+        a.parentid as question_id,
+        a.owneruserid as answer_owner_id,
+        a.creationdate as answer_date,
+        a.score as answer_score,
+        case when a.id = q.acceptedanswerid then 1 else 0 end as is_accepted
+    from posts a
+    join posts q on q.id = a.parentid and a.posttypeid = 2 and q.posttypeid = 1
+),
+votes_agg as (
+    select
+        v.postid,
+        sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+        sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+        sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+        count(*) filter (where v.votetypeid in (2,3,5)) as counted_votes,
+        max(v.creationdate) as last_vote_at
+    from votes v
+    group by v.postid
+),
+badge_counts as (
+    select
+        b.userid,
+        sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+        sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+        sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+        sum(case when b.tagbased = 1 then 1 else 0 end) as tag_badges
+    from badges b
+    group by b.userid
+),
+question_activity as (
+    select
+        q.question_id,
+        q.owneruserid,
+        q.creationdate as question_date,
+        q.title,
+        q.viewcount,
+        q.score as question_score,
+        coalesce(va.upvotes,0) as upvotes,
+        coalesce(va.downvotes,0) as downvotes,
+        coalesce(va.favorites,0) as favorites,
+        coalesce(va.counted_votes,0) as vote_events,
+        va.last_vote_at,
+        count(a.answer_id) as answer_count,
+        sum(a.is_accepted) as accepted_answer_count,
+        max(a.answer_date) as last_answer_at,
+        percentile_disc(0.5) within group (order by a.answer_score) as median_answer_score,
+        array_length(q.tag_array, 1) as tag_count,
+        q.tags,
+        case
+            when q.tags is null then 'untagged'
+            when position('<sql>' in q.tags) > 0 then 'sql'
+            when position('<java>' in q.tags) > 0 then 'java'
+            when position('<python>' in q.tags) > 0 then 'python'
+            else 'other'
+        end as primary_tag_group
+    from tagged_questions q
+    left join answers a on a.question_id = q.question_id
+    left join votes_agg va on va.postid = q.question_id
+    group by q.question_id, q.owneruserid, q.creationdate, q.title, q.viewcount, q.score, va.upvotes, va.downvotes, va.favorites, va.counted_votes, va.last_vote_at, q.tag_array, q.tags
+),
+post_history_flags as (
+    select
+        ph.postid,
+        max(ph.creationdate) filter (where ph.posthistorytypeid in (10,35,36)) as last_moderation_event_at,
+        sum(case when ph.posthistorytypeid = 10 then 1 else 0 end) as close_events,
+        sum(case when ph.posthistorytypeid = 11 then 1 else 0 end) as reopen_events,
+        sum(case when ph.posthistorytypeid in (12,13) then 1 else 0 end) as delete_undelete_events,
+        bool_or(ph.posthistorytypeid in (19)) as was_protected
+    from posthistory ph
+    group by ph.postid
+),
+duplicates as (
+    select
+        pl.postid as duplicate_id,
+        pl.relatedpostid as canonical_id,
+        min(pl.creationdate) as first_dup_link_at,
+        count(*) as dup_link_count
+    from postlinks pl
+    where pl.linktypeid = 3
+    group by pl.postid, pl.relatedpostid
+),
+user_quality as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        coalesce(bc.gold_badges,0) as gold_badges,
+        coalesce(bc.silver_badges,0) as silver_badges,
+        coalesce(bc.bronze_badges,0) as bronze_badges,
+        coalesce(bc.tag_badges,0) as tag_badges,
+        coalesce(nullif(trim(u.location), ''), 'Unknown') as location_norm,
+        coalesce(u.upvotes,0) - coalesce(u.downvotes,0) as net_votes,
+        coalesce(u.views,0) as profile_views,
+        row_number() over (order by coalesce(bc.gold_badges,0) desc, u.reputation desc) as user_rank
+    from users u
+    left join badge_counts bc on bc.userid = u.id
+),
+recent_hot as (
+    select
+        qa.question_id,
+        qa.question_date,
+        qa.title,
+        qa.viewcount,
+        qa.question_score,
+        qa.upvotes,
+        qa.downvotes,
+        qa.favorites,
+        qa.vote_events,
+        qa.answer_count,
+        qa.accepted_answer_count,
+        qa.last_answer_at,
+        qa.median_answer_score,
+        qa.tag_count,
+        qa.tags,
+        qa.primary_tag_group,
+        ph.last_moderation_event_at,
+        ph.close_events,
+        ph.reopen_events,
+        ph.delete_undelete_events,
+        ph.was_protected,
+        d.canonical_id,
+        d.first_dup_link_at,
+        d.dup_link_count
+    from question_activity qa
+    left join post_history_flags ph on ph.postid = qa.question_id
+    left join duplicates d on d.duplicate_id = qa.question_id
+    where qa.viewcount > 0
+      and (qa.upvotes - qa.downvotes) >= greatest(2, qa.tag_count)
+      and (qa.answer_count > 0 or qa.vote_events > 3 or qa.viewcount > 100)
+),
+ranked_questions as (
+    select
+        rh.*,
+        uq.user_id,
+        uq.displayname as owner_name,
+        uq.reputation as owner_reputation,
+        uq.gold_badges,
+        uq.silver_badges,
+        uq.bronze_badges,
+        uq.tag_badges,
+        uq.location_norm,
+        uq.net_votes as owner_net_votes,
+        uq.user_rank,
+        (
+            coalesce(rh.question_score,0) * 2
+            + coalesce(rh.upvotes,0)
+            - coalesce(rh.downvotes,0) * 1.5
+            + coalesce(rh.favorites,0) * 0.5
+            + least(coalesce(rh.viewcount,0) / 50.0, 50)
+            + coalesce(rh.answer_count,0) * 1.2
+            + coalesce(rh.accepted_answer_count,0) * 3
+            + case when rh.primary_tag_group in ('sql','python') then 5 else 0 end
+            - case when rh.close_events > 0 then 10 else 0 end
+            - case when rh.canonical_id is not null then 8 else 0 end
+            + case when rh.was_protected then 2 else 0 end
+            + least(coalesce(uq.reputation,0) / 500.0, 20)
+        ) as interesting_score,
+        row_number() over (
+            partition by rh.primary_tag_group
+            order by
+                (
+                    coalesce(rh.question_score,0) * 2
+                    + coalesce(rh.upvotes,0)
+                    - coalesce(rh.downvotes,0) * 1.5
+                    + coalesce(rh.favorites,0) * 0.5
+                    + least(coalesce(rh.viewcount,0) / 50.0, 50)
+                    + coalesce(rh.answer_count,0) * 1.2
+                    + coalesce(rh.accepted_answer_count,0) * 3
+                    + case when rh.primary_tag_group in ('sql','python') then 5 else 0 end
+                    - case when rh.close_events > 0 then 10 else 0 end
+                    - case when rh.canonical_id is not null then 8 else 0 end
+                    + case when rh.was_protected then 2 else 0 end
+                    + least(coalesce(uq.reputation,0) / 500.0, 20)
+                ) desc,
+                rh.viewcount desc,
+                rh.question_id desc
+        ) as grp_rank
+    from recent_hot rh
+    left join user_quality uq on uq.user_id = rh.owneruserid
+),
+owner_recent_comment as (
+    select distinct on (c.postid)
+        c.postid,
+        c.id as comment_id,
+        c.userid as commenter_id,
+        c.creationdate as comment_date,
+        c.score as comment_score,
+        c.text as comment_text
+    from comments c
+    where c.text is not null
+    order by c.postid, c.creationdate desc, c.id desc
+),
+final as (
+    select
+        rq.primary_tag_group,
+        rq.question_id,
+        rq.title,
+        rq.tags,
+        rq.question_date,
+        rq.viewcount,
+        rq.question_score,
+        rq.upvotes,
+        rq.downvotes,
+        rq.favorites,
+        rq.answer_count,
+        rq.accepted_answer_count,
+        rq.last_answer_at,
+        rq.median_answer_score,
+        rq.close_events,
+        rq.reopen_events,
+        rq.delete_undelete_events,
+        rq.was_protected,
+        rq.canonical_id,
+        rq.first_dup_link_at,
+        rq.dup_link_count,
+        rq.owner_name,
+        rq.owner_reputation,
+        rq.gold_badges,
+        rq.silver_badges,
+        rq.bronze_badges,
+        rq.tag_badges,
+        rq.location_norm,
+        rq.owner_net_votes,
+        rq.user_rank,
+        rq.interesting_score,
+        rq.grp_rank,
+        orc.comment_id as recent_comment_id,
+        substr(coalesce(orc.comment_text, ''), 1, 140) as recent_comment_snippet,
+        coalesce(orc.comment_score,0) as recent_comment_score,
+        orc.comment_date as recent_comment_date
+    from ranked_questions rq
+    left join owner_recent_comment orc on orc.postid = rq.question_id
+    where rq.grp_rank <= 50
+),
+null_prober as (
+    select
+        f.*,
+        case when f.canonical_id is null and f.close_events is null then 1 else 0 end as both_null_flag,
+        case when f.canonical_id is null then 'none' else 'has_canonical' end as canonical_state
+    from final f
+),
+tag_leaders as (
+    select
+        np.primary_tag_group,
+        np.owner_name,
+        count(*) as posts_in_group,
+        avg(np.interesting_score) as avg_score_in_group,
+        rank() over (partition by np.primary_tag_group order by count(*) desc, avg(np.interesting_score) desc) as leader_rank
+    from null_prober np
+    group by np.primary_tag_group, np.owner_name
+)
+select
+    np.primary_tag_group,
+    np.question_id,
+    np.title,
+    np.tags,
+    np.question_date,
+    np.viewcount,
+    np.question_score,
+    np.upvotes,
+    np.downvotes,
+    np.favorites,
+    np.answer_count,
+    np.accepted_answer_count,
+    np.last_answer_at,
+    np.median_answer_score,
+    np.close_events,
+    np.reopen_events,
+    np.delete_undelete_events,
+    np.was_protected,
+    np.canonical_id,
+    np.first_dup_link_at,
+    np.dup_link_count,
+    np.owner_name,
+    np.owner_reputation,
+    np.gold_badges,
+    np.silver_badges,
+    np.bronze_badges,
+    np.tag_badges,
+    np.location_norm,
+    np.owner_net_votes,
+    np.user_rank,
+    round(np.interesting_score::numeric, 2) as interesting_score,
+    np.grp_rank,
+    np.recent_comment_id,
+    np.recent_comment_snippet,
+    np.recent_comment_score,
+    np.recent_comment_date,
+    case
+        when np.viewcount = 0 then null
+        else round((np.upvotes::numeric - np.downvotes::numeric) / nullif(np.viewcount::numeric, 0), 5)
+    end as net_votes_per_view,
+    case when np.both_null_flag = 1 then 'clean' else 'needs-review' end as dup_or_close_status,
+    coalesce(tl.owner_name, ' - ') as top_contributor_in_group,
+    coalesce(tl.posts_in_group, 0) as top_contributor_posts_in_group,
+    round(coalesce(tl.avg_score_in_group, 0)::numeric, 2) as top_contributor_avg_score
+from null_prober np
+left join tag_leaders tl
+  on tl.primary_tag_group = np.primary_tag_group
+ and tl.leader_rank = 1
+where (
+        np.primary_tag_group <> 'other'
+        or (np.interesting_score > 10 and (np.favorites > 0 or np.accepted_answer_count > 0))
+      )
+  and (
+        np.owner_reputation >= 1
+        or (np.upvotes - np.downvotes) >= 3
+      )
+order by
+    np.primary_tag_group,
+    np.grp_rank,
+    np.interesting_score desc,
+    np.viewcount desc,
+    np.question_id desc
+limit 500;

@@ -1,0 +1,134 @@
+WITH UserStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(qc.QuestionCnt, 0) AS QuestionCnt,
+        COALESCE(ac.AnswerCnt, 0) AS AnswerCnt,
+        COALESCE(bc.GoldCnt, 0) AS GoldCnt,
+        COALESCE(bc.SilverCnt, 0) AS SilverCnt,
+        COALESCE(bc.BronzeCnt, 0) AS BronzeCnt,
+        COALESCE(vu.UpVotes, 0) - COALESCE(vu.DownVotes, 0) AS NetVoteScore,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank
+    FROM Users u
+    LEFT JOIN (
+        SELECT OwnerUserId,
+               SUM(CASE WHEN PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCnt,
+               SUM(CASE WHEN PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCnt
+        FROM Posts
+        GROUP BY OwnerUserId
+    ) qc ON u.Id = qc.OwnerUserId
+    LEFT JOIN (
+        SELECT OwnerUserId,
+               SUM(CASE WHEN PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCnt
+        FROM Posts
+        GROUP BY OwnerUserId
+    ) ac ON u.Id = ac.OwnerUserId
+    LEFT JOIN (
+        SELECT UserId,
+               SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldCnt,
+               SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverCnt,
+               SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeCnt
+        FROM Badges
+        GROUP BY UserId
+    ) bc ON u.Id = bc.UserId
+    LEFT JOIN (
+        SELECT UserId,
+               SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+               SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes
+        GROUP BY UserId
+    ) vu ON u.Id = vu.UserId
+),
+
+TagUsage AS (
+    SELECT
+        t.TagName,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QPosts,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS APosts,
+        AVG(p.Score) AS AvgScore,
+        -- STRING_AGG with DISTINCT and FILTER is not standard everywhere; emulate using LISTAGG-like behavior when available.
+        -- Use GROUP_CONCAT style for broader compatibility (MySQL/SQLite/Oracle variants may differ). Keep generic name TopContributors.
+        -- If the target dialect supports LISTAGG or STRING_AGG, replace accordingly.
+        GROUP_CONCAT(DISTINCT u.DisplayName, ', ') AS TopContributors
+    FROM Tags t
+    LEFT JOIN (
+        SELECT p.*
+        FROM Posts p
+    ) p ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    GROUP BY t.TagName
+    HAVING COUNT(p.Id) > 0
+),
+
+RandomTagForUser AS (
+    SELECT
+        us.Id,
+        -- Get random word from DisplayName in a more portable way:
+        -- Split by space using a derived table approach
+        (SELECT w.word
+         FROM (
+             SELECT TRIM(SUBSTRING_INDEX(SUBSTRING_INDEX(us.DisplayName, ' ', n.n), ' ', -1)) AS word
+             FROM (
+                 SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5
+                 UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9 UNION ALL SELECT 10
+             ) n
+         ) w
+         WHERE w.word <> ''
+         ORDER BY RAND()
+         LIMIT 1
+        ) AS RandomWord
+    FROM UserStats us
+)
+
+SELECT
+    us.Id,
+    us.DisplayName,
+    us.Reputation,
+    us.QuestionCnt,
+    us.AnswerCnt,
+    us.GoldCnt,
+    us.SilverCnt,
+    us.BronzeCnt,
+    us.NetVoteScore,
+    us.RepRank,
+    tu.TagName,
+    tu.QPosts,
+    tu.APosts,
+    tu.AvgScore,
+    tu.TopContributors
+FROM UserStats us
+LEFT JOIN RandomTagForUser rtu ON rtu.Id = us.Id
+LEFT JOIN TagUsage tu
+       ON tu.TagName = rtu.RandomWord
+WHERE us.Reputation > 1000
+  AND (us.QuestionCnt + us.AnswerCnt) > 10
+  AND NOT EXISTS (
+        SELECT 1
+        FROM Posts p
+        WHERE p.OwnerUserId = us.Id
+          AND p.CreationDate > (CAST('2024-10-01' AS DATE) - INTERVAL '30' DAY)
+          AND p.PostTypeId = 1
+          AND p.Title IS NULL
+    )
+UNION ALL
+SELECT
+    CAST(NULL AS INTEGER) AS Id,
+    'Aggregate Summary' AS DisplayName,
+    CAST(NULL AS INTEGER) AS Reputation,
+    SUM(QuestionCnt) AS QuestionCnt,
+    SUM(AnswerCnt) AS AnswerCnt,
+    SUM(GoldCnt) AS GoldCnt,
+    SUM(SilverCnt) AS SilverCnt,
+    SUM(BronzeCnt) AS BronzeCnt,
+    SUM(NetVoteScore) AS NetVoteScore,
+    CAST(NULL AS INTEGER) AS RepRank,
+    CAST(NULL AS VARCHAR(200)) AS TagName,
+    CAST(NULL AS INTEGER) AS QPosts,
+    CAST(NULL AS INTEGER) AS APosts,
+    CAST(NULL AS DECIMAL) AS AvgScore,
+    CAST(NULL AS VARCHAR(4000)) AS TopContributors
+FROM UserStats
+WHERE Reputation > 5000
+ORDER BY RepRank
+LIMIT 100;

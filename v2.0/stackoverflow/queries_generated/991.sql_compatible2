@@ -1,0 +1,411 @@
+with recent_activity as (
+  select
+    p.id as post_id,
+    p.posttypeid,
+    p.title,
+    p.tags,
+    p.owneruserid,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.answercount,
+    p.commentcount,
+    coalesce(p.favoritecount, 0) as favoritecount,
+    p.closeddate,
+    p.lastactivitydate,
+    u.displayname as owner_name,
+    u.reputation as owner_rep,
+    date_trunc('month', p.creationdate) as month_bucket
+  from posts p
+  left join users u on u.id = p.owneruserid
+  where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '36 months'
+),
+tag_expanded as (
+  select
+    ra.*,
+    lower(trim(t.tag_text)) as tag
+  from recent_activity ra,
+  lateral (
+    select t0.tag_text
+    from (
+      select
+        case
+          when ra.tags is null then null
+          else unnest(string_to_array(substring(ra.tags, 2, greatest(length(ra.tags)-2, 0)), '><'))
+        end as tag_text
+    ) t0
+    where t0.tag_text is not null
+  ) t
+),
+user_activity as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.lastaccessdate,
+    u.location,
+    u.views as profile_views,
+    coalesce(u.upvotes,0) as upvotes,
+    coalesce(u.downvotes,0) as downvotes,
+    count(distinct p.id) filter (where p.owneruserid = u.id) as total_posts,
+    count(*) filter (where p.posttypeid = 1 and p.owneruserid = u.id) as total_questions,
+    count(*) filter (where p.posttypeid = 2 and p.owneruserid = u.id) as total_answers
+  from users u
+  left join posts p on p.owneruserid = u.id and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '36 months'
+  group by u.id, u.displayname, u.reputation, u.creationdate, u.lastaccessdate, u.location, u.views, u.upvotes, u.downvotes
+),
+votes_agg as (
+  select
+    v.postid,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started,
+    sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded,
+    count(*) filter (where v.votetypeid in (10,12)) as destructive_votes
+  from votes v
+  where v.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '36 months'
+  group by v.postid
+),
+comments_agg as (
+  select
+    c.postid,
+    count(*) as comment_count,
+    max(c.creationdate) as last_comment_date,
+    sum(case when c.score >= 5 then 1 else 0 end) as high_score_comments
+  from comments c
+  where c.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '36 months'
+  group by c.postid
+),
+links_agg as (
+  select
+    pl.postid,
+    sum(case when pl.linktypeid = 1 then 1 else 0 end) as linked_out,
+    sum(case when pl.linktypeid = 3 then 1 else 0 end) as marked_duplicate_of
+  from postlinks pl
+  where pl.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '36 months'
+  group by pl.postid
+),
+post_edits as (
+  select
+    ph.postid,
+    count(*) filter (where ph.posthistorytypeid in (4,5,6)) as edit_count,
+    min(ph.creationdate) filter (where ph.posthistorytypeid in (4,5,6)) as first_edit_date,
+    max(ph.creationdate) filter (where ph.posthistorytypeid in (4,5,6)) as last_edit_date,
+    count(*) filter (where ph.posthistorytypeid in (10,11,12,13,14,15,19,20,35)) as moderation_events
+  from posthistory ph
+  where ph.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '36 months'
+  group by ph.postid
+),
+badges_agg as (
+  select
+    b.userid,
+    count(*) as total_badges,
+    sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+    sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+    sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+    sum(case when b.tagbased then 1 else 0 end) as tag_badges
+  from badges b
+  where b.date >= cast('2024-10-01 12:34:56' as timestamp) - interval '36 months'
+  group by b.userid
+),
+per_post as (
+  select
+    te.post_id,
+    te.posttypeid,
+    te.title,
+    te.tag,
+    te.creationdate,
+    te.lastactivitydate,
+    te.score,
+    te.viewcount,
+    te.answercount,
+    te.commentcount,
+    te.favoritecount,
+    te.owneruserid,
+    te.owner_name,
+    te.owner_rep,
+    te.closeddate,
+    va.upvotes,
+    va.downvotes,
+    va.bounty_started,
+    va.bounty_awarded,
+    va.destructive_votes,
+    ca.comment_count,
+    ca.last_comment_date,
+    ca.high_score_comments,
+    la.linked_out,
+    la.marked_duplicate_of,
+    pe.edit_count,
+    pe.first_edit_date,
+    pe.last_edit_date,
+    pe.moderation_events
+  from tag_expanded te
+  left join votes_agg va on va.postid = te.post_id
+  left join comments_agg ca on ca.postid = te.post_id
+  left join links_agg la on la.postid = te.post_id
+  left join post_edits pe on pe.postid = te.post_id
+),
+windowed as (
+  select
+    pp.*,
+    row_number() over (partition by pp.owneruserid order by pp.score desc, pp.viewcount desc, pp.creationdate desc) as rn_owner_top,
+    dense_rank() over (partition by pp.tag order by coalesce(pp.score,0) desc) as dr_tag_score,
+    sum(coalesce(pp.viewcount,0)) over (partition by pp.tag order by pp.creationdate rows between unbounded preceding and current row) as rolling_tag_views,
+    avg(coalesce(pp.score,0)) over (partition by pp.tag) as avg_tag_score,
+    null as p90_tag_views
+  from per_post pp
+),
+windowed_with_p90 as (
+  select
+    w.*,
+    (
+      select max(sub.viewcount)
+      from (
+        select viewcount,
+               ntile(100) over (order by coalesce(viewcount,0)) as pct_rank,
+               row_number() over () as rn
+        from per_post p2
+        where p2.tag = w.tag
+      ) sub
+      where sub.pct_rank >= 90
+      limit 1
+    ) as p90_tag_views_calc
+  from windowed w
+),
+tag_quality as (
+  select
+    tag,
+    count(*) as posts_in_tag,
+    avg(coalesce(score,0)) as avg_score,
+    avg(coalesce(viewcount,0)) as avg_views,
+    sum(case when coalesce(answercount,0) > 0 then 1 else 0 end)::float / nullif(count(*),0) as answer_rate,
+    sum(coalesce(marked_duplicate_of,0)) as total_dupes,
+    sum(coalesce(edit_count,0)) as total_edits,
+    max(coalesce(p90_tag_views_calc,0)) as p90_views
+  from windowed_with_p90
+  group by tag
+),
+user_scored as (
+  select
+    ua.user_id,
+    ua.displayname,
+    ua.reputation,
+    ua.creationdate,
+    ua.lastaccessdate,
+    ua.location,
+    ua.profile_views,
+    ua.upvotes,
+    ua.downvotes,
+    ua.total_posts,
+    ua.total_questions,
+    ua.total_answers,
+    ba.total_badges,
+    ba.gold_badges,
+    ba.silver_badges,
+    ba.bronze_badges,
+    ba.tag_badges,
+    coalesce(ba.total_badges,0) * 10
+      + greatest(ua.reputation,0) / 100
+      + coalesce(ua.total_answers,0) * 2
+      + coalesce(ua.total_questions,0) * 1
+      - coalesce(ua.downvotes,0) * 0.5 as activity_score
+  from user_activity ua
+  left join badges_agg ba on ba.userid = ua.user_id
+),
+owner_stats as (
+  select
+    w.owneruserid as user_id,
+    count(*) as owned_posts,
+    avg(coalesce(w.score,0)) as avg_post_score,
+    sum(coalesce(w.viewcount,0)) as total_views,
+    sum(coalesce(w.answercount,0)) as total_answers_on_questions,
+    sum(case when w.closeddate is not null then 1 else 0 end) as closes,
+    sum(coalesce(w.edit_count,0)) as edits_made
+  from windowed_with_p90 w
+  group by w.owneruserid
+),
+ranked_posts as (
+  select
+    w.*,
+    tq.posts_in_tag,
+    tq.avg_score as tag_avg_score,
+    tq.avg_views as tag_avg_views,
+    tq.answer_rate as tag_answer_rate,
+    tq.total_dupes as tag_total_dupes,
+    os.owned_posts,
+    os.avg_post_score,
+    os.total_views as owner_total_views,
+    os.total_answers_on_questions,
+    os.closes as owner_closes,
+    os.edits_made as owner_edits,
+    us.activity_score as owner_activity_score,
+    case
+      when w.posttypeid = 1 then 'Question'
+      when w.posttypeid = 2 then 'Answer'
+      when w.posttypeid = 3 then 'Wiki'
+      when w.posttypeid = 4 then 'TagWikiExcerpt'
+      when w.posttypeid = 5 then 'TagWiki'
+      when w.posttypeid = 6 then 'ModeratorNomination'
+      when w.posttypeid = 7 then 'WikiPlaceholder'
+      when w.posttypeid = 8 then 'PrivilegeWiki'
+      else 'Other'
+    end as post_type_name,
+    case
+      when w.closeddate is not null then 1
+      when coalesce(w.marked_duplicate_of,0) > 0 then 1
+      else 0
+    end as is_closed_or_dupe,
+    coalesce(w.upvotes,0) - coalesce(w.downvotes,0) as net_votes,
+    coalesce(w.score,0) - coalesce(tq.avg_score,0) as score_vs_tag_avg,
+    case when tq.posts_in_tag >= 10
+      then (coalesce(w.score,0) - tq.avg_score) / nullif(tq.p90_views,0)
+      else null
+    end as normalized_popularity
+  from windowed_with_p90 w
+  left join tag_quality tq on tq.tag = w.tag
+  left join owner_stats os on os.user_id = w.owneruserid
+  left join user_scored us on us.user_id = w.owneruserid
+),
+q_and_a_pairs as (
+  select
+    q.id as question_id,
+    q.owneruserid as asker_id,
+    a.id as answer_id,
+    a.owneruserid as answerer_id,
+    a.score as answer_score,
+    a.creationdate as answer_date,
+    q.creationdate as question_date,
+    (a.acceptedanswerid is not null or q.acceptedanswerid = a.id) as is_accepted_flag
+  from posts q
+  join posts a on a.parentid = q.id and a.posttypeid = 2
+  where q.posttypeid = 1
+    and q.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '36 months'
+),
+answerer_perf as (
+  select
+    answerer_id as user_id,
+    count(*) as answers_given,
+    avg(coalesce(answer_score,0)) as avg_answer_score,
+    sum(case when is_accepted_flag then 1 else 0 end) as accepted_count,
+    sum(case when answer_score >= 5 then 1 else 0 end) as high_score_answers
+  from q_and_a_pairs
+  group by answerer_id
+),
+final_scored as (
+  select
+    rp.*,
+    ap.answers_given,
+    ap.avg_answer_score,
+    ap.accepted_count,
+    ap.high_score_answers,
+    case
+      when rp.posttypeid = 2 then
+        coalesce(rp.score,0) * 1.0
+        + coalesce(rp.net_votes,0) * 0.3
+        + coalesce(ap.avg_answer_score,0) * 0.5
+        + coalesce(ap.accepted_count,0) * 0.8
+        + coalesce(rp.owner_activity_score,0) * 0.02
+        - case when rp.is_closed_or_dupe = 1 then 2 else 0 end
+      else
+        coalesce(rp.score,0) * 1.2
+        + coalesce(rp.viewcount,0) / 500.0
+        + coalesce(rp.net_votes,0) * 0.4
+        + coalesce(rp.high_score_comments,0) * 0.5
+        + coalesce(rp.owner_activity_score,0) * 0.02
+        - coalesce(rp.marked_duplicate_of,0) * 1.5
+        - case when rp.is_closed_or_dupe = 1 then 3 else 0 end
+    end as composite_score
+  from ranked_posts rp
+  left join answerer_perf ap on ap.user_id = rp.owneruserid
+),
+selected as (
+  select
+    fs.*,
+    case
+      when fs.owner_rep is null then 'Anonymous/Deleted'
+      when fs.owner_rep >= 100000 then 'Legend'
+      when fs.owner_rep >= 25000 then 'Expert'
+      when fs.owner_rep >= 5000 then 'Advanced'
+      when fs.owner_rep >= 1000 then 'Intermediate'
+      else 'Beginner'
+    end as owner_tier,
+    case
+      when fs.tag in ('sql','postgresql','mysql','sqlite','tsql') then 'Database'
+      when fs.tag in ('javascript','typescript','node.js','reactjs','vue.js') then 'Web'
+      when fs.tag in ('python','pandas','numpy','django','flask') then 'Python'
+      when fs.tag is null then 'Untagged'
+      else 'Other'
+    end as tag_cluster
+  from final_scored fs
+)
+select
+  s.post_id,
+  s.post_type_name,
+  s.title,
+  s.tag,
+  s.tag_cluster,
+  s.creationdate,
+  s.lastactivitydate,
+  s.owneruserid,
+  s.owner_name,
+  s.owner_tier,
+  s.owner_rep,
+  s.score,
+  s.net_votes,
+  s.viewcount,
+  s.answercount,
+  s.commentcount,
+  s.favoritecount,
+  s.is_closed_or_dupe,
+  s.edit_count,
+  s.moderation_events,
+  s.linked_out,
+  s.marked_duplicate_of,
+  s.comment_count as comments_last_36m,
+  s.high_score_comments,
+  s.avg_post_score as owner_avg_post_score,
+  s.owner_activity_score,
+  s.answers_given,
+  s.avg_answer_score,
+  s.accepted_count,
+  s.high_score_answers,
+  s.posts_in_tag,
+  s.tag_avg_score,
+  s.tag_avg_views,
+  s.tag_answer_rate,
+  s.tag_total_dupes,
+  s.p90_tag_views_calc as p90_tag_views,
+  s.rn_owner_top,
+  s.dr_tag_score,
+  s.rolling_tag_views,
+  s.score_vs_tag_avg,
+  s.normalized_popularity,
+  s.composite_score,
+  rank() over (partition by s.tag_cluster order by s.composite_score desc, s.viewcount desc, s.creationdate desc) as rank_in_cluster,
+  dense_rank() over (order by s.composite_score desc) as global_dense_rank
+from selected s
+where
+  (
+    s.posttypeid in (1,2)
+    and coalesce(s.score,0) >= 0
+    and (
+      s.tag is not null
+      or s.viewcount >= 100
+      or s.edit_count >= 1
+    )
+  )
+  and not exists (
+    select 1
+    from posthistory ph
+    where ph.postid = s.post_id
+      and ph.posthistorytypeid = 12
+      and ph.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '36 months'
+  )
+  and (
+    s.owner_name is not null
+    or s.owneruserid is null
+    or s.owner_rep >= 0
+  )
+order by s.composite_score desc, s.viewcount desc, s.creationdate desc
+limit 500;

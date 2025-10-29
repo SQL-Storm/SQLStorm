@@ -1,0 +1,114 @@
+-- {"query": "3621.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2182} 
+WITH recent_posts AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        COALESCE(p.Title, '')                              AS Title,
+        ROW_NUMBER() OVER (
+            PARTITION BY p.OwnerUserId
+            ORDER BY p.CreationDate DESC
+        )                                                  AS rn_user_recent
+    FROM Posts p
+    WHERE p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '30 days'
+),
+user_badge_stats AS (
+    SELECT
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1)                AS gold_badges,
+        COUNT(*) FILTER (WHERE b.Class = 2)                AS silver_badges,
+        COUNT(*) FILTER (WHERE b.Class = 3)                AS bronze_badges,
+        COUNT(*)                                          AS total_badges,
+        STRING_AGG(DISTINCT b.Name, ', ')                 AS badge_list
+    FROM Badges b
+    GROUP BY b.UserId
+),
+user_vote_stats AS (
+    SELECT
+        v.UserId,
+        SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END)        AS up_votes,
+        SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END)        AS down_votes,
+        COUNT(*)                                          AS total_votes
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY v.UserId
+),
+top_questions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        ARRAY_TO_STRING(
+            REGEXP_SPLIT_TO_ARRAY(TRIM(BOTH '<>' FROM p.Tags), '><'),
+            ', '
+        )                                                  AS tag_list,
+        ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.ViewCount DESC) AS rank_q
+    FROM Posts p
+    WHERE p.PostTypeId = 1            -- questions only
+)
+SELECT
+    u.Id                                                  AS user_id,
+    COALESCE(u.DisplayName, 'Anonymous')                   AS display_name,
+    u.Reputation,
+    ub.gold_badges,
+    ub.silver_badges,
+    ub.bronze_badges,
+    ub.total_badges,
+    ub.badge_list,
+    uv.up_votes,
+    uv.down_votes,
+    uv.total_votes,
+    rp.Title                                               AS latest_post_title,
+    rp.Score                                               AS latest_post_score,
+    rp.ViewCount                                           AS latest_post_views,
+    (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id) AS comment_count,
+    CASE
+        WHEN ub.total_badges > 10                           THEN 'Power User'
+        WHEN uv.up_votes > uv.down_votes                     THEN 'Positive Voter'
+        ELSE                                                 'Participant'
+    END                                                    AS user_category,
+    tq.Title                                               AS top_question_title,
+    tq.Score                                               AS top_question_score,
+    tq.tag_list                                            AS top_question_tags
+FROM Users u
+LEFT JOIN user_badge_stats ub      ON ub.UserId = u.Id
+LEFT JOIN user_vote_stats uv       ON uv.UserId = u.Id
+LEFT JOIN recent_posts rp          ON rp.OwnerUserId = u.Id AND rp.rn_user_recent = 1
+LEFT JOIN (
+    SELECT *
+    FROM top_questions
+    WHERE rank_q <= 5
+) tq                               ON TRUE               -- cross join to expose columns
+WHERE u.Reputation > 1000
+  AND (u.EmailHash IS NOT NULL OR u.AccountId IS NOT NULL)
+ORDER BY u.Reputation DESC
+
+UNION ALL
+
+SELECT
+    NULL                                                  AS user_id,
+    '--- Summary ---'                                      AS display_name,
+    NULL,
+    SUM(COALESCE(ub.gold_badges,0)),
+    SUM(COALESCE(ub.silver_badges,0)),
+    SUM(COALESCE(ub.bronze_badges,0)),
+    SUM(COALESCE(ub.total_badges,0)),
+    NULL,
+    SUM(COALESCE(uv.up_votes,0)),
+    SUM(COALESCE(uv.down_votes,0)),
+    SUM(COALESCE(uv.total_votes,0)),
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL
+FROM Users u
+LEFT JOIN user_badge_stats ub ON ub.UserId = u.Id
+LEFT JOIN user_vote_stats uv  ON uv.UserId = u.Id
+WHERE u.Reputation > 1000;

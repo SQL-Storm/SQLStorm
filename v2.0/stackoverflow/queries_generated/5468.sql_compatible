@@ -1,0 +1,160 @@
+WITH
+ActiveUsers AS (
+  SELECT u.Id,
+         u.DisplayName,
+         u.Reputation,
+         u.CreationDate,
+         u.LastAccessDate,
+         u.Views,
+         u.UpVotes,
+         u.DownVotes,
+         u.Location,
+         u.AboutMe,
+         u.ProfileImageUrl,
+         u.AccountId,
+         ROW_NUMBER() OVER (PARTITION BY u.Location ORDER BY u.Reputation DESC, u.LastAccessDate DESC) AS rn_loc
+  FROM Users u
+  WHERE u.AccountId IS NOT NULL
+),
+TagWikis AS (
+  SELECT p.Id AS PostId,
+         p.Title,
+         p.Tags,
+         p.CreationDate,
+         p.OwnerUserId,
+         p.LastActivityDate,
+         p.ViewCount,
+         p.Score,
+         p.CommentCount,
+         p.AnswerCount,
+         p.FavoriteCount,
+         p.Body,
+         p.OwnerDisplayName,
+         p.LastEditorDisplayName,
+         p.LastEditDate,
+         p.PostTypeId
+  FROM Posts p
+  WHERE p.PostTypeId IN (1, 4, 5)
+),
+RecentEdits AS (
+  SELECT ph.PostId,
+         ph.Id AS HistoryId,
+         ph.PostHistoryTypeId,
+         ph.CreationDate AS EditDate,
+         ph.UserId AS EditorUserId,
+         ph.UserDisplayName AS EditorDisplayName,
+         ph.Comment,
+         ph.Text
+  FROM PostHistory ph
+  WHERE ph.PostHistoryTypeId IN (4,5,6,10,11,16,36)
+),
+LinkedPosts AS (
+  SELECT pl.PostId,
+         pl.RelatedPostId,
+         pl.LinkTypeId,
+         lt.Name AS LinkTypeName
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+  WHERE pl.LinkTypeId IN (1,3)
+),
+TaggedActivity AS (
+  SELECT t.TagName,
+         t.Count,
+         t.ExcerptPostId,
+         t.WikiPostId
+  FROM Tags t
+  WHERE t.IsModeratorOnly = 0
+),
+Scores AS (
+  SELECT v.PostId,
+         SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesTotal,
+         SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesTotal,
+         SUM(CASE WHEN v.VoteTypeId = 10 THEN 1 ELSE 0 END) AS Deletions,
+         SUM(CASE WHEN v.VoteTypeId = 8 THEN 1 ELSE 0 END) AS BountyStarts
+  FROM Votes v
+  GROUP BY v.PostId
+),
+TopContributors AS (
+  SELECT u.Id AS UserId,
+         u.DisplayName,
+         SUM(v.BountyAmount) AS TotalBounty,
+         COUNT(*) AS TotalVotes
+  FROM Votes v
+  JOIN Users u ON v.UserId = u.Id
+  WHERE v.BountyAmount > 0
+  GROUP BY u.Id, u.DisplayName
+),
+ComplexQuery AS (
+  SELECT
+    a.Id AS UserId,
+    a.DisplayName AS UserDisplayName,
+    a.Reputation,
+    a.CreationDate AS UserCreationDate,
+    a.LastAccessDate,
+    a.Location,
+    a.Views,
+    a.UpVotes AS UserUpVotes,
+    a.DownVotes AS UserDownVotes,
+    e.EditDate,
+    e.EditorDisplayName,
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.ViewCount,
+    p.Score,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.Body,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.OwnerDisplayName,
+    p.LastEditDate,
+    p.LastActivityDate,
+    s.UpVotesTotal,
+    s.DownVotesTotal,
+    s.Deletions,
+    s.BountyStarts,
+    ROW_NUMBER() OVER (PARTITION BY a.Id ORDER BY p.CreationDate DESC) AS rn_post
+  FROM ActiveUsers a
+  LEFT JOIN TaggedActivity t ON 1=1
+  LEFT JOIN TopContributors tc ON a.Id = tc.UserId
+  LEFT JOIN Posts p ON p.OwnerUserId = a.Id
+  LEFT JOIN RecentEdits e ON e.PostId = p.Id
+  LEFT JOIN Scores s ON s.PostId = p.Id
+  WHERE a.rn_loc = 1
+    AND p.CreationDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180' DAY)
+    AND p.PostTypeId IN (1,2)
+)
+
+SELECT
+  uc.UserId,
+  uc.UserDisplayName,
+  uc.Reputation,
+  uc.UserCreationDate,
+  uc.LastAccessDate,
+  uc.Location,
+  uc.Views,
+  uc.UserUpVotes,
+  uc.UserDownVotes,
+  uc.PostId,
+  uc.Title AS PostTitle,
+  uc.Tags,
+  uc.ViewCount,
+  uc.Score,
+  uc.AnswerCount,
+  uc.CommentCount,
+  uc.FavoriteCount,
+  uc.Body,
+  uc.PostTypeId,
+  uc.OwnerUserId,
+  uc.OwnerDisplayName,
+  uc.LastEditDate,
+  uc.LastActivityDate,
+  tc.TotalBounty AS TopBounty,
+  tc.TotalVotes AS TopVotes
+FROM ComplexQuery uc
+LEFT JOIN TopContributors tc ON tc.UserId = uc.UserId
+WHERE uc.rn_post = 1
+ORDER BY uc.Reputation DESC, uc.LastActivityDate DESC
+LIMIT 100;

@@ -1,0 +1,166 @@
+-- {"query": "3850.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2455} 
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1)        AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2)        AS AnswerCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived,
+        MAX(p.CreationDate)                               AS LastPostDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC)   AS RepRank
+    FROM Users u
+    LEFT JOIN Posts  p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes  v ON v.PostId = p.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+BadgeAgg AS (
+    SELECT 
+        b.UserId,
+        COUNT(*)                                           AS TotalBadges,
+        COUNT(*) FILTER (WHERE b.Class = 1)                AS GoldBadges,
+        STRING_AGG(DISTINCT b.Name, ',')                   AS BadgeNames
+    FROM Badges b
+    GROUP BY b.UserId
+),
+TagActivity AS (
+    SELECT 
+        t.TagName,
+        COUNT(p.Id)                         AS TaggedPosts,
+        COUNT(DISTINCT p.OwnerUserId)       AS UniqueAuthors,
+        SUM(p.Score)                        AS TotalScore,
+        RANK() OVER (ORDER BY COUNT(p.Id) DESC) AS TagPopularityRank
+    FROM Tags t
+    JOIN Posts p ON p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+    WHERE p.PostTypeId = 1
+    GROUP BY t.TagName
+    HAVING COUNT(p.Id) > 100
+),
+RecentClosed AS (
+    SELECT 
+        ph.PostId,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) AS ClosedDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.CreationDate END) AS ReopenedDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Comment END)     AS CloseReasonId
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (10, 11)
+    GROUP BY ph.PostId
+),
+Final AS (
+    SELECT 
+        us.Id,
+        us.DisplayName,
+        us.Reputation,
+        us.QuestionCount,
+        us.AnswerCount,
+        us.UpVotesReceived,
+        us.DownVotesReceived,
+        us.LastPostDate,
+        us.RepRank,
+        COALESCE(ba.TotalBadges, 0)     AS TotalBadges,
+        COALESCE(ba.GoldBadges, 0)      AS GoldBadges,
+        ba.BadgeNames,
+        CASE WHEN us.RepRank <= 100 THEN 'Top100' ELSE 'Other' END AS RankGroup,
+        EXISTS (
+            SELECT 1 
+            FROM Posts p 
+            WHERE p.OwnerUserId = us.Id 
+              AND p.CreationDate > cast('2024-10-01' as date) - INTERVAL '30 day'
+        ) AS ActiveInLast30Days,
+        (
+            SELECT COUNT(*) 
+            FROM Comments c 
+            WHERE c.UserId = us.Id 
+              AND c.Score > 0
+        ) AS PositiveCommentCount
+    FROM UserStats us
+    LEFT JOIN BadgeAgg ba ON ba.UserId = us.Id
+)
+SELECT 
+    f.Id,
+    f.DisplayName,
+    f.Reputation,
+    f.QuestionCount,
+    f.AnswerCount,
+    f.UpVotesReceived,
+    f.DownVotesReceived,
+    f.TotalBadges,
+    f.GoldBadges,
+    f.BadgeNames,
+    f.RankGroup,
+    f.ActiveInLast30Days,
+    f.PositiveCommentCount,
+    rc.ClosedDate,
+    rc.ReopenedDate,
+    cr.Name                     AS CloseReasonName,
+    ta.TagName,
+    ta.TaggedPosts,
+    ta.UniqueAuthors,
+    ta.TotalScore,
+    ta.TagPopularityRank
+FROM Final f
+LEFT JOIN RecentClosed rc 
+       ON rc.PostId = (
+           SELECT p.Id
+           FROM Posts p
+           WHERE p.OwnerUserId = f.Id 
+             AND p.PostTypeId = 1
+           ORDER BY p.CreationDate DESC
+           LIMIT 1
+       )
+LEFT JOIN CloseReasonTypes cr ON cr.Id = rc.CloseReasonId::smallint
+LEFT JOIN LATERAL (
+    SELECT 
+        t.TagName,
+        t.TaggedPosts,
+        t.UniqueAuthors,
+        t.TotalScore,
+        t.TagPopularityRank
+    FROM TagActivity t
+    WHERE t.TagName = ANY (
+        SELECT UNNEST(regexp_split_to_array(p.Tags, '[><]')) 
+        FROM Posts p 
+        WHERE p.OwnerUserId = f.Id 
+          AND p.PostTypeId = 1 
+        ORDER BY p.CreationDate DESC 
+        LIMIT 5
+    )
+    ORDER BY t.TagPopularityRank
+    LIMIT 1
+) ta ON TRUE
+WHERE f.Reputation > 1000
+
+UNION ALL
+
+SELECT 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    CASE 
+        WHEN u.Reputation > (SELECT AVG(Reputation) FROM Users) THEN 'AboveAvg' 
+        ELSE 'BelowAvg' 
+    END,
+    FALSE,
+    0,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL
+FROM Users u
+WHERE u.Id NOT IN (SELECT Id FROM Final)
+ORDER BY Reputation DESC
+LIMIT 50;

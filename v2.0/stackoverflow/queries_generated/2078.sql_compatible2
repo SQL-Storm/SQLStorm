@@ -1,0 +1,157 @@
+with UserBadges as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        max(b.Date) as LastBadgeDate,
+        coalesce(u.Reputation,0) as Reputation,
+        dense_rank() over (order by coalesce(u.Reputation,0) desc) as RepRank
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+),
+TopQuestions as (
+    select
+        p.Id,
+        p.OwnerUserId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Tags,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc) as Rnk
+    from Posts p
+    where p.PostTypeId = 1
+),
+AnswerStats as (
+    select
+        a.ParentId as QuestionId,
+        count(a.Id) as AnswerCount,
+        sum(case when a.Score >= 0 then 1 else 0 end) as PosAnswers,
+        sum(case when a.Score < 0 then 1 else 0 end) as NegAnswers,
+        avg(coalesce(a.Score,0)) as AvgAnswerScore,
+        max(coalesce(a.Score,0)) as MaxAnswerScore
+    from Posts a
+    where a.PostTypeId = 2
+    group by a.ParentId
+),
+RecentActivity as (
+    select
+        p.Id as PostId,
+        p.Title,
+        p.OwnerUserId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate as HistoryDate,
+        ph.Comment as CloseReason,
+        crt.Name as CloseReasonName,
+        row_number() over (partition by p.Id order by ph.CreationDate desc) as rn
+    from Posts p
+    left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId in (10,11)
+    left join CloseReasonTypes crt on crt.Id::text = ph.Comment
+    where p.PostTypeId = 1
+),
+LinkedDuplicates as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name as LinkType,
+        p1.Title as OriginalTitle,
+        p2.Title as RelatedTitle
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    left join Posts p1 on p1.Id = pl.PostId
+    left join Posts p2 on p2.Id = pl.RelatedPostId
+    where lt.Name = 'Duplicate'
+),
+TagStats as (
+    select
+        t.TagName,
+        t.Count,
+        coalesce(q_stats.QuestionCount, 0) as QuestionCount,
+        coalesce(q_stats.AvgScore, 0) as AvgQuestionScore,
+        coalesce(a_stats.AvgAnswerScore, 0) as AvgAnswerScore
+    from Tags t
+    left join (
+        select
+            Tag,
+            count(p.Id) as QuestionCount,
+            avg(p.Score) as AvgScore
+        from (
+            select p.Id, p.Score,
+                unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><')) as Tag
+            from Posts p
+            where p.PostTypeId = 1 and p.Tags is not null
+        ) p
+        group by Tag
+    ) q_stats on q_stats.Tag = t.TagName
+    left join (
+        select
+            Tag,
+            avg(Score) as AvgAnswerScore
+        from (
+            select q.Id as QId,
+                unnest(string_to_array(substring(q.Tags from 2 for length(q.Tags)-2), '><')) as Tag,
+                a.Score
+            from Posts q
+            join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+            where q.PostTypeId = 1 and q.Tags is not null
+        ) qa
+        group by Tag
+    ) a_stats on a_stats.Tag = t.TagName
+)
+select
+    ub.UserId,
+    ub.DisplayName,
+    ub.Reputation,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ub.LastBadgeDate,
+    tq.Id as TopQuestionId,
+    tq.Title as TopQuestionTitle,
+    tq.Score as TopQuestionScore,
+    tq.ViewCount as TopQuestionViews,
+    tq.CreationDate as TopQuestionCreated,
+    as_.AnswerCount,
+    as_.PosAnswers,
+    as_.NegAnswers,
+    as_.AvgAnswerScore,
+    as_.MaxAnswerScore,
+    ra.CloseReasonName as LastCloseReason,
+    ra.HistoryDate as LastCloseDate,
+    count(distinct ld.RelatedPostId) as DuplicateCount,
+    string_agg(distinct ld.RelatedTitle, '; ' ORDER BY ld.RelatedTitle) as DuplicateTitles,
+    ts.TagName,
+    ts.Count as TagUseCount,
+    ts.QuestionCount,
+    ts.AvgQuestionScore,
+    ts.AvgAnswerScore
+from UserBadges ub
+left join TopQuestions tq on tq.OwnerUserId = ub.UserId and tq.Rnk = 1
+left join AnswerStats as_ on as_.QuestionId = tq.Id
+left join (
+    select PostId, CloseReasonName, HistoryDate, OwnerUserId 
+    from RecentActivity 
+    where rn = 1
+) ra on ra.PostId = tq.Id
+left join LinkedDuplicates ld on ld.PostId = tq.Id
+left join lateral (
+    select ts.*
+    from TagStats ts
+    where ts.TagName in (
+        select unnest(string_to_array(substring(coalesce(tq.Tags,'') from 2 for greatest(0,length(tq.Tags) - 2)), '><'))
+    )
+    order by ts.Count desc
+    limit 1
+) ts on true
+where ub.Reputation > 1000 and ub.GoldBadges > 0
+group by
+    ub.UserId, ub.DisplayName, ub.Reputation, ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges, ub.LastBadgeDate,
+    tq.Id, tq.Title, tq.Score, tq.ViewCount, tq.CreationDate, tq.Tags,
+    as_.AnswerCount, as_.PosAnswers, as_.NegAnswers, as_.AvgAnswerScore, as_.MaxAnswerScore,
+    ra.CloseReasonName, ra.HistoryDate, ra.OwnerUserId,
+    ts.TagName, ts.Count, ts.QuestionCount, ts.AvgQuestionScore, ts.AvgAnswerScore
+order by ub.Reputation desc, as_.MaxAnswerScore desc
+limit 100;

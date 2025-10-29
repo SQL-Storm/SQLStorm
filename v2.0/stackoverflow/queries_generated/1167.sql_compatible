@@ -1,0 +1,192 @@
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT p_q.Id) AS TotalQuestions,
+        COUNT(DISTINCT p_a.Id) AS TotalAnswers,
+        SUM(COALESCE(p_q.Score, 0)) AS TotalQuestionScore,
+        SUM(COALESCE(p_a.Score, 0)) AS TotalAnswerScore,
+        SUM(COALESCE(p_q.ViewCount, 0)) AS TotalQuestionViews,
+        MAX(p_q.CreationDate) AS LatestQuestionDate,
+        MAX(p_a.CreationDate) AS LatestAnswerDate,
+        COUNT(DISTINCT ph_edited_by_user.PostId) AS PostsEditedByUserCount,
+        COUNT(ph_edited_by_user.Id) AS TotalEditsMadeByUser,
+        COALESCE(
+            CASE
+                WHEN (U.LastAccessDate IS NOT NULL AND U.CreationDate IS NOT NULL AND (JULIANDAY(U.LastAccessDate) - JULIANDAY(U.CreationDate)) <> 0)
+                THEN U.Reputation * 1.0 / (JULIANDAY(U.LastAccessDate) - JULIANDAY(U.CreationDate))
+                ELSE 0
+            END,
+            0
+        ) AS AvgDailyReputationGain
+    FROM Users U
+    LEFT JOIN Posts p_q ON U.Id = p_q.OwnerUserId AND p_q.PostTypeId = 1
+    LEFT JOIN Posts p_a ON U.Id = p_a.OwnerUserId AND p_a.PostTypeId = 2
+    LEFT JOIN PostHistory ph_edited_by_user ON U.Id = ph_edited_by_user.UserId AND ph_edited_by_user.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9, 24)
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate
+    HAVING COUNT(DISTINCT p_q.Id) + COUNT(DISTINCT p_a.Id) >= 5
+       OR U.Reputation > 1000
+),
+HighImpactPostsRaw AS (
+    SELECT
+        P.Id AS PostId,
+        'HighAcceptedAnswerRateQuestion' AS ImpactType,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount
+    FROM Posts P
+    WHERE P.PostTypeId = 1
+      AND P.AcceptedAnswerId IS NOT NULL
+      AND P.AnswerCount > 0
+      AND (P.Score * 1.0 / NULLIF(P.ViewCount, 0)) > 0.05
+    UNION ALL
+    SELECT
+        P.Id AS PostId,
+        'HighScoreAnswer' AS ImpactType,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount
+    FROM Posts P
+    WHERE P.PostTypeId = 2
+      AND P.Score >= 50
+      AND P.ParentId IS NOT NULL
+      AND EXISTS (SELECT 1 FROM Posts Q WHERE Q.Id = P.ParentId AND Q.ViewCount > 1000)
+),
+PostHistoricalMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.Score AS PostScore,
+        P.ViewCount AS PostViewCount,
+        P.CreationDate AS PostCreationDate,
+        P.OwnerUserId,
+        -- Convert tags like '<tag1><tag2>' into an array; use standard string functions
+        -- Emulate STRING_TO_ARRAY(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><')
+        CASE
+            WHEN P.Tags IS NULL OR P.Tags = '' THEN NULL
+            ELSE (
+                SELECT TRIM(value) FROM (
+                    SELECT
+                        SUBSTR(P.Tags, 2, LENGTH(P.Tags) - 2) AS inner_tags
+                )
+            )
+        END AS TagArray,
+        COUNT(DISTINCT ph_all.Id) AS TotalHistoryEvents,
+        SUM(CASE WHEN ph_all.PostHistoryTypeId IN (4,5,6,7,8,9,24) THEN 1 ELSE 0 END) AS EditCount,
+        MAX(CASE WHEN ph_all.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS WasClosedEver,
+        MAX(CASE WHEN ph_all.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS WasReopenedEver,
+        MAX(CASE WHEN ph_all.PostHistoryTypeId = 16 THEN 1 ELSE 0 END) AS CommunityOwnedEver,
+        (
+            SELECT PH_sub.CreationDate
+            FROM PostHistory PH_sub
+            WHERE PH_sub.PostId = P.Id
+              AND PH_sub.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9, 24)
+            ORDER BY PH_sub.CreationDate DESC
+            LIMIT 1 OFFSET 2
+        ) AS ThirdLatestEditDate,
+        SUM(COALESCE(C.Score, 0)) AS TotalCommentsScore,
+        (
+            SELECT COALESCE(MAX(C_sub.Score), 0)
+            FROM Comments C_sub
+            WHERE C_sub.PostId = P.Id
+        ) AS MaxCommentScore,
+        COUNT(DISTINCT pl_linked.RelatedPostId) AS LinkedPostsCount,
+        COUNT(DISTINCT pl_duplicate.RelatedPostId) AS DuplicateOfPostsCount,
+        MAX(HIP.ImpactType) AS HighImpactType
+    FROM Posts P
+    LEFT JOIN PostHistory ph_all ON P.Id = ph_all.PostId
+    LEFT JOIN Comments C ON P.Id = C.PostId
+    LEFT JOIN PostLinks pl_linked ON P.Id = pl_linked.PostId AND pl_linked.LinkTypeId = 1
+    LEFT JOIN PostLinks pl_duplicate ON P.Id = pl_duplicate.PostId AND pl_duplicate.LinkTypeId = 3
+    LEFT JOIN HighImpactPostsRaw HIP ON P.Id = HIP.PostId
+    WHERE P.PostTypeId IN (1, 2)
+    GROUP BY P.Id, P.PostTypeId, P.Score, P.ViewCount, P.CreationDate, P.OwnerUserId, P.Tags
+),
+UserBadgePerformance AS (
+    SELECT
+        U.Id AS UserId,
+        U.Reputation,
+        COUNT(B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        NTILE(5) OVER (ORDER BY U.Reputation DESC) AS ReputationQuintile,
+        PERCENT_RANK() OVER (ORDER BY COUNT(B.Id) DESC, U.Reputation DESC) AS BadgeReputationPercentRank,
+        AVG(COUNT(B.Id)) OVER () AS GlobalAvgBadgesPerUser
+    FROM Users U
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.Reputation
+    HAVING COUNT(B.Id) > 0
+)
+SELECT
+    UAS.UserId,
+    UAS.DisplayName,
+    UAS.Reputation,
+    UAS.TotalQuestions,
+    UAS.TotalAnswers,
+    PHM.PostId,
+    PHM.PostTypeId,
+    PT.Name AS PostTypeName,
+    PHM.PostCreationDate,
+    PHM.PostScore,
+    PHM.PostViewCount,
+    PHM.TagArray,
+    PHM.EditCount,
+    PHM.TotalHistoryEvents,
+    PHM.WasClosedEver,
+    PHM.WasReopenedEver,
+    PHM.CommunityOwnedEver,
+    PHM.MaxCommentScore,
+    PHM.TotalCommentsScore,
+    PHM.ThirdLatestEditDate,
+    PHM.LinkedPostsCount,
+    PHM.DuplicateOfPostsCount,
+    PHM.HighImpactType,
+    UBP.TotalBadges,
+    UBP.GoldBadges,
+    UBP.ReputationQuintile,
+    UBP.BadgeReputationPercentRank,
+    (PHM.PostScore * 1.0 / NULLIF(PHM.PostViewCount, 0)) AS ScorePerViewRatio,
+    CASE
+        WHEN PHM.WasClosedEver = 1 AND PHM.WasReopenedEver = 1 THEN 'ClosedThenReopened'
+        WHEN PHM.WasClosedEver = 1 AND PHM.WasReopenedEver = 0 THEN 'ClosedPermanently'
+        WHEN PHM.EditCount > 5 THEN 'HeavilyEdited'
+        WHEN PHM.TotalHistoryEvents > 10 THEN 'HighActivityPost'
+        WHEN PHM.HighImpactType IS NOT NULL THEN PHM.HighImpactType
+        ELSE 'StandardActivity'
+    END AS PostActivityStatus,
+    CASE
+        WHEN LOWER(COALESCE(U.AboutMe, '')) LIKE '%sql%' OR LOWER(COALESCE(U.AboutMe, '')) LIKE '%database%' THEN 'DB_Enthusiast'
+        WHEN LOWER(COALESCE(U.AboutMe, '')) LIKE '%python%' OR LOWER(COALESCE(U.AboutMe, '')) LIKE '%java%' THEN 'Prog_Enthusiast'
+        ELSE 'Other_Enthusiast'
+    END AS UserTechInterest,
+    AVG(PHM.PostScore) OVER (PARTITION BY PHM.PostTypeId, UBP.ReputationQuintile) AS AvgPostScoreInQuintile,
+    SUM(CASE WHEN PHM.PostTypeId = 1 THEN PHM.PostScore ELSE 0 END) OVER (PARTITION BY UAS.UserId ORDER BY PHM.PostCreationDate) AS UserCumulativeQuestionScore,
+    COALESCE(
+        (SELECT 'HasComments' FROM Comments C_inner WHERE C_inner.PostId = PHM.PostId LIMIT 1),
+        'NoComments'
+    ) AS CommentPresenceFlag
+FROM UserActivitySummary UAS
+INNER JOIN PostHistoricalMetrics PHM ON UAS.UserId = PHM.OwnerUserId
+INNER JOIN PostTypes PT ON PHM.PostTypeId = PT.Id
+LEFT JOIN UserBadgePerformance UBP ON UAS.UserId = UBP.UserId
+LEFT JOIN Users U ON UAS.UserId = U.Id
+WHERE
+    PHM.PostScore > 10
+    AND PHM.PostViewCount > 100
+    AND PHM.PostCreationDate >= DATE '2020-01-01'
+    AND (PHM.WasClosedEver = 0 OR PHM.WasReopenedEver = 1)
+    AND (
+        (
+            PHM.TagArray IS NOT NULL
+            AND (LOWER(COALESCE(PHM.TagArray, '')) LIKE '%<sql>%' OR LOWER(COALESCE(PHM.TagArray, '')) LIKE '%<database>%')
+        )
+        OR (UAS.Reputation > 5000 AND COALESCE(UBP.TotalBadges, 0) > 10)
+        OR PHM.HighImpactType IS NOT NULL
+    )
+ORDER BY
+    UAS.Reputation DESC,
+    ScorePerViewRatio DESC,
+    PHM.PostCreationDate DESC
+LIMIT 5000;

@@ -1,0 +1,144 @@
+WITH
+UserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    u.LastAccessDate,
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.Tags,
+    p.CreationDate AS PostCreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Body,
+    p.OwnerUserId,
+    p.LastEditorUserId,
+    p.LastActivityDate,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ClosedDate,
+    p.CommunityOwnedDate,
+    EXTRACT(EPOCH FROM (COALESCE(p.LastActivityDate, p.CreationDate) - u.CreationDate)) AS lifetime_seconds
+  FROM Users u
+  LEFT JOIN Posts p
+    ON p.OwnerUserId = u.Id
+  WHERE u.Reputation > 1000
+),
+RecentPostHistory AS (
+  SELECT
+    ph.PostId,
+    ph.PostHistoryTypeId,
+    ph.CreationDate,
+    ph.UserId,
+    ph.Text,
+    ph.Comment,
+    ph.RevisionGUID
+  FROM PostHistory ph
+  WHERE ph.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180 days'
+),
+LinkedPosts AS (
+  SELECT
+    pl.PostId,
+    pl.RelatedPostId,
+    pl.LinkTypeId,
+    pl.CreationDate
+  FROM PostLinks pl
+  WHERE pl.LinkTypeId IN (1, 3)
+),
+TagAgg AS (
+  SELECT
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId,
+    t.WikiPostId,
+    t.IsModeratorOnly
+  FROM Tags t
+  WHERE t.IsModeratorOnly = FALSE
+),
+RankedPosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    ROW_NUMBER() OVER (
+      PARTITION BY p.PostTypeId
+      ORDER BY p.Score DESC NULLS LAST, p.ViewCount DESC NULLS LAST, p.CreationDate
+    ) AS TypeRank
+  FROM Posts p
+),
+CloseReasonCounts AS (
+  SELECT
+    ph.PostId,
+    MAX(CASE
+      WHEN ph.PostHistoryTypeId = 10 THEN
+        -- attempt to extract numeric CloseReasonId from ph.Text in a portable way:
+        -- try JSON_VALUE semantics if supported; otherwise attempt to extract with string functions
+        NULLIF(
+          -- try JSON_VALUE; many dialects support JSON_VALUE(text, '$.CloseReasonId')
+          -- if JSON_VALUE is not available, this expression will be NULL and fallback applies below
+          JSON_VALUE(ph.Text, '$.CloseReasonId'),
+          ''
+        )::INTEGER
+      ELSE NULL
+    END) AS CloseReasonId
+  FROM PostHistory ph
+  GROUP BY ph.PostId
+)
+SELECT
+  ua.UserId,
+  ua.DisplayName AS UserDisplayName,
+  ua.Reputation,
+  ua.UserCreationDate,
+  ua.LastAccessDate,
+  ua.PostId,
+  ua.PostTypeId,
+  CASE
+    WHEN ua.PostTypeId = 1 THEN 'Question'
+    WHEN ua.PostTypeId = 2 THEN 'Answer'
+    ELSE 'Other'
+  END AS PostKind,
+  ua.Title,
+  ua.Tags,
+  ua.PostCreationDate,
+  ua.Score,
+  ua.ViewCount,
+  ua.Body,
+  ua.OwnerUserId,
+  ua.LastEditorUserId,
+  ua.LastActivityDate,
+  ua.AnswerCount,
+  ua.CommentCount,
+  ua.FavoriteCount,
+  ua.ClosedDate,
+  ua.CommunityOwnedDate,
+  ua.lifetime_seconds,
+  r.TypeRank,
+  rr.CloseReasonId,
+  lh.PostHistoryTypeId AS HistTypeId,
+  lh.CreationDate AS HistCreationDate,
+  lh.RevisionGUID,
+  lh.Text AS HistText,
+  lh.Comment AS HistComment,
+  bl.RelatedPostId AS LinkedRelatedPostId,
+  bl.LinkTypeId AS LinkedTypeId,
+  ga.TagName,
+  ga.Count AS TagCount
+FROM UserActivity ua
+LEFT JOIN RankedPosts r ON r.PostId = ua.PostId
+LEFT JOIN CloseReasonCounts rr ON rr.PostId = ua.PostId
+LEFT JOIN RecentPostHistory lh ON lh.PostId = ua.PostId
+LEFT JOIN LinkedPosts bl ON bl.PostId = ua.PostId
+LEFT JOIN TagAgg ga ON ga.ExcerptPostId = ua.PostId OR ga.WikiPostId = ua.PostId
+WHERE
+  ua.Score IS NOT NULL
+  AND (ua.ViewCount IS NULL OR ua.ViewCount >= 0)
+ORDER BY
+  ua.UserId, ua.PostId
+LIMIT 100;

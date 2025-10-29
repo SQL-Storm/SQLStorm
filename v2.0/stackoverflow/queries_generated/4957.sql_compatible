@@ -1,0 +1,204 @@
+WITH
+  RecentQuestions AS (
+    SELECT
+      Id,
+      OwnerUserId,
+      Title,
+      Tags,
+      AnswerCount,
+      FavoriteCount,
+      ViewCount,
+      Score,
+      CreationDate,
+      ROW_NUMBER() OVER (
+        ORDER BY
+          CreationDate DESC
+      ) AS rn
+    FROM Posts
+    WHERE
+      PostTypeId = 1
+      AND CreationDate >= (cast('2024-10-01' as date) - INTERVAL '30 days')
+  ),
+  HighReputationUsers AS (
+    SELECT
+      Id,
+      DisplayName,
+      Reputation,
+      UpVotes,
+      DownVotes,
+      Views
+    FROM Users
+    WHERE
+      Reputation > 10000
+  ),
+  QuestionTagAnalysis AS (
+    SELECT
+      rq.Id AS QuestionId,
+      rq.Title,
+      rq.Tags,
+      CASE
+        WHEN rq.Tags LIKE '%<sql>%' THEN 'SQL'
+        WHEN rq.Tags LIKE '%<python>%' THEN 'Python'
+        WHEN rq.Tags LIKE '%<javascript>%' THEN 'JavaScript'
+        WHEN rq.Tags LIKE '%<java>%' THEN 'Java'
+        WHEN rq.Tags LIKE '%<c#>%' THEN 'C#'
+        ELSE 'Other'
+      END AS PrimaryTag,
+      (CHAR_LENGTH(rq.Tags) - CHAR_LENGTH(REPLACE(rq.Tags, '><', '')) + 1) AS TagCount,
+      hru.DisplayName AS OwnerDisplayName,
+      hru.Reputation AS OwnerReputation,
+      rq.AnswerCount,
+      rq.FavoriteCount,
+      rq.ViewCount,
+      rq.Score,
+      (
+        rq.AnswerCount * 1.0 / NULLIF(rq.ViewCount, 0)
+      ) AS AnswerRate,
+      (
+        rq.FavoriteCount * 1.0 / NULLIF(rq.ViewCount, 0)
+      ) AS FavoriteRate,
+      CASE
+        WHEN rq.Score > 50 THEN 'High'
+        WHEN rq.Score > 10 THEN 'Medium'
+        ELSE 'Low'
+      END AS ScoreBucket,
+      CASE
+        WHEN COALESCE(hru.DownVotes, 0) > COALESCE(hru.UpVotes, 0) * 5 THEN 'Potentially Problematic User'
+        ELSE 'Standard User'
+      END AS UserStatus,
+      rq.CreationDate
+    FROM RecentQuestions rq
+    LEFT OUTER JOIN HighReputationUsers hru
+      ON rq.OwnerUserId = hru.Id
+    WHERE
+      rq.rn <= 100
+  ),
+  CommentMetrics AS (
+    SELECT
+      p.Id AS PostId,
+      COUNT(c.Id) AS CommentCount,
+      SUM(CASE WHEN c.Score > 0 THEN 1 ELSE 0 END) AS PositiveCommentCount,
+      AVG(c.Score) AS AverageCommentScore
+    FROM Posts p
+    JOIN Comments c
+      ON p.Id = c.PostId
+    WHERE
+      p.PostTypeId = 1
+    GROUP BY
+      p.Id
+  ),
+  PostHistorySummary AS (
+    SELECT
+      ph.PostId,
+      COUNT(CASE WHEN ph.PostHistoryTypeId = 4 THEN 1 ELSE NULL END) AS TitleEditCount,
+      COUNT(CASE WHEN ph.PostHistoryTypeId = 5 THEN 1 ELSE NULL END) AS BodyEditCount,
+      MAX(ph.CreationDate) AS LastEditDate
+    FROM PostHistory ph
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5)
+    GROUP BY
+      ph.PostId
+  ),
+  FinalAnalysis AS (
+    SELECT
+      qta.QuestionId,
+      qta.Title,
+      qta.PrimaryTag,
+      qta.TagCount,
+      qta.OwnerDisplayName,
+      qta.OwnerReputation,
+      qta.AnswerCount,
+      qta.FavoriteCount,
+      qta.ViewCount,
+      qta.Score,
+      qta.AnswerRate,
+      qta.FavoriteRate,
+      qta.ScoreBucket,
+      qta.UserStatus,
+      COALESCE(cm.CommentCount, 0) AS TotalComments,
+      COALESCE(cm.PositiveCommentCount, 0) AS PositiveComments,
+      COALESCE(cm.AverageCommentScore, 0.0) AS AvgCommentScore,
+      COALESCE(phs.TitleEditCount, 0) AS TitleEdits,
+      COALESCE(phs.BodyEditCount, 0) AS BodyEdits,
+      COALESCE(phs.LastEditDate, qta.CreationDate) AS LastActivity
+    FROM QuestionTagAnalysis qta
+    LEFT JOIN CommentMetrics cm
+      ON qta.QuestionId = cm.PostId
+    LEFT JOIN PostHistorySummary phs
+      ON qta.QuestionId = phs.PostId
+  )
+SELECT
+  fa.QuestionId,
+  fa.Title,
+  fa.PrimaryTag,
+  fa.TagCount,
+  fa.OwnerDisplayName,
+  fa.OwnerReputation,
+  fa.Score,
+  fa.ViewCount,
+  fa.AnswerCount,
+  fa.FavoriteCount,
+  fa.AnswerRate,
+  fa.FavoriteRate,
+  fa.ScoreBucket,
+  fa.UserStatus,
+  fa.TotalComments,
+  fa.PositiveComments,
+  fa.AvgCommentScore,
+  fa.TitleEdits,
+  fa.BodyEdits,
+  fa.LastActivity,
+  CASE
+    WHEN fa.AvgCommentScore > 2 THEN 'Highly Discussed'
+    WHEN fa.AvgCommentScore > 0 THEN 'Moderately Discussed'
+    ELSE 'Less Discussed'
+  END AS DiscussionLevel,
+  CASE
+    WHEN fa.BodyEdits > 5 AND fa.TitleEdits > 2 THEN 'Highly Edited'
+    WHEN fa.BodyEdits > 2 OR fa.TitleEdits > 1 THEN 'Moderately Edited'
+    ELSE 'Minimally Edited'
+  END AS EditFrequency,
+  CASE
+    WHEN fa.OwnerReputation >= 100000 THEN 'Elite'
+    WHEN fa.OwnerReputation >= 50000 THEN 'Legendary'
+    WHEN fa.OwnerReputation >= 10000 THEN ' destacado'
+    ELSE 'Regular'
+  END AS UserTier,
+  TO_CHAR(fa.LastActivity, 'YYYY-MM') AS ActivityYearMonth,
+  'Processed' AS ProcessingStatus
+FROM FinalAnalysis fa
+WHERE
+  fa.Score > 0 AND fa.ViewCount > 100
+UNION ALL
+SELECT
+  NULL AS QuestionId,
+  'Summary Statistics' AS Title,
+  'Overall' AS PrimaryTag,
+  AVG(CAST(fa.TagCount AS DOUBLE PRECISION)) AS TagCount,
+  'N/A' AS OwnerDisplayName,
+  AVG(CAST(fa.OwnerReputation AS DOUBLE PRECISION)) AS OwnerReputation,
+  SUM(fa.Score) AS Score,
+  SUM(fa.ViewCount) AS ViewCount,
+  SUM(fa.AnswerCount) AS AnswerCount,
+  SUM(fa.FavoriteCount) AS FavoriteCount,
+  AVG(fa.AnswerRate) AS AnswerRate,
+  AVG(fa.FavoriteRate) AS FavoriteRate,
+  'N/A' AS ScoreBucket,
+  'N/A' AS UserStatus,
+  SUM(fa.TotalComments) AS TotalComments,
+  SUM(fa.PositiveComments) AS PositiveComments,
+  AVG(fa.AvgCommentScore) AS AvgCommentScore,
+  SUM(fa.TitleEdits) AS TitleEdits,
+  SUM(fa.BodyEdits) AS BodyEdits,
+  MAX(fa.LastActivity) AS LastActivity,
+  'N/A' AS DiscussionLevel,
+  'N/A' AS EditFrequency,
+  'N/A' AS UserTier,
+  'N/A' AS ActivityYearMonth,
+  'Summary' AS ProcessingStatus
+FROM FinalAnalysis fa
+WHERE
+  fa.Score > 0 AND fa.ViewCount > 100
+ORDER BY
+  ProcessingStatus DESC,
+  Score DESC;

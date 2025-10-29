@@ -1,0 +1,215 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.CreationDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        COUNT(DISTINCT b.Id) AS Badges,
+        COALESCE(SUM(p.Score), 0) AS TotalScore,
+        AVG(p.Score) AS AvgScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - u.CreationDate)) / 86400.0 AS AccountAgeDays,
+        CASE 
+            WHEN u.Reputation >= 1000000 THEN 'Magnificent'
+            WHEN u.Reputation >= 100000 THEN 'Legendary'
+            WHEN u.Reputation >= 10000 THEN 'Epic'
+            WHEN u.Reputation >= 1000 THEN 'Master'
+            WHEN u.Reputation >= 100 THEN 'Expert'
+            ELSE 'Novice'
+        END AS ReputationTier,
+        STRING_AGG(DISTINCT CASE 
+            WHEN p.PostTypeId = 1 AND p.Tags IS NOT NULL THEN 
+                TRIM(BOTH '<>' FROM SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2))
+            END, ', ') AS PostTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        TotalPosts,
+        Questions,
+        Answers,
+        Badges,
+        TotalScore,
+        AvgScore,
+        LastPostDate,
+        AccountAgeDays,
+        ReputationTier,
+        PostTags,
+        ROW_NUMBER() OVER (ORDER BY TotalScore DESC) AS ScoreRank,
+        RANK() OVER (ORDER BY Reputation DESC) AS RepRank
+    FROM UserStats
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.ParentId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.Tags,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 
+                CASE 
+                    WHEN p.AnswerCount > 0 THEN 'HasAnswer'
+                    ELSE 'NoAnswer'
+                END
+            ELSE 'NotQuestion'
+        END AS QuestionStatus,
+        CASE 
+            WHEN p.Score >= 100 THEN 'HighlyVoted'
+            WHEN p.Score >= 10 THEN 'ModeratelyVoted'
+            WHEN p.Score >= 0 THEN 'Neutral'
+            ELSE 'DownVoted'
+        END AS PopularityLevel,
+        EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate)) / 86400.0 AS AgeInDays,
+        COALESCE(p.AnswerCount, 0) + COALESCE(p.CommentCount, 0) AS EngagementLevel,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND CHAR_LENGTH(p.Tags) > 2 THEN 
+                CAST( array_length(string_to_array(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2), '><'), 1) AS integer)
+            ELSE 0
+        END AS TagCount,
+        (CAST(p.ViewCount AS double precision) / NULLIF((EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate)) / 86400.0 + 1), 0)) AS ViewsPerDay,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserPostRank
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+      AND p.CreationDate <= TIMESTAMP '2024-10-01 12:34:56'
+),
+UserPostStats AS (
+    SELECT 
+        pa.OwnerUserId,
+        COUNT(pa.PostId) AS TotalPosts,
+        SUM(pa.Score) AS UserTotalScore,
+        AVG(pa.Score) AS UserAvgScore,
+        MAX(pa.CreationDate) AS MostRecentPost,
+        STRING_AGG(pa.Title, '; ') AS AllTitles
+    FROM PostAnalysis pa
+    GROUP BY pa.OwnerUserId
+),
+ComplexQueryResult AS (
+    SELECT 
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.TotalPosts,
+        tu.Questions,
+        tu.Answers,
+        tu.Badges,
+        tu.TotalScore,
+        tu.AvgScore,
+        tu.LastPostDate,
+        tu.AccountAgeDays,
+        tu.ReputationTier,
+        tu.PostTags,
+        tu.ScoreRank,
+        tu.RepRank,
+        ups.TotalPosts AS UserPostCount,
+        ups.UserTotalScore,
+        ups.UserAvgScore,
+        ups.MostRecentPost,
+        ups.AllTitles,
+        pa.PostId,
+        pa.Title,
+        pa.PostTypeId,
+        pa.Score,
+        pa.ViewCount,
+        pa.CreationDate,
+        pa.ParentId,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.FavoriteCount,
+        pa.QuestionStatus,
+        pa.PopularityLevel,
+        pa.AgeInDays,
+        pa.EngagementLevel,
+        pa.TagCount,
+        pa.ViewsPerDay,
+        pa.UserPostRank,
+        CASE 
+            WHEN pa.Score > (SELECT AVG(ph.Score) FROM PostHistory ph WHERE ph.PostId = pa.PostId) THEN 'AboveAvg'
+            WHEN pa.Score < (SELECT AVG(ph.Score) FROM PostHistory ph WHERE ph.PostId = pa.PostId) THEN 'BelowAvg'
+            ELSE 'Avg'
+        END AS ScoreComparison,
+        DENSE_RANK() OVER (ORDER BY pa.TagCount DESC) AS TagRank,
+        CASE 
+            WHEN pa.TagCount > 5 THEN 'HeavyTagUser'
+            WHEN pa.TagCount > 2 THEN 'ModerateTagUser'
+            ELSE 'LightTagUser'
+        END AS TagIntensity,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = pa.PostId) AS CommentCount,
+        (SELECT COALESCE(SUM(v.BountyAmount), 0) FROM Votes v WHERE v.PostId = pa.PostId AND v.VoteTypeId = 8) AS TotalBounty,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = pa.PostId AND v.VoteTypeId IN (2, 3)) AS VoteCount,
+        CASE 
+            WHEN (SELECT COUNT(*) FROM Votes v WHERE v.PostId = pa.PostId AND v.VoteTypeId = 2) > 0 
+                 AND (SELECT COUNT(*) FROM Votes v WHERE v.PostId = pa.PostId AND v.VoteTypeId = 3) > 0 THEN 'MixedVoted'
+            WHEN (SELECT COUNT(*) FROM Votes v WHERE v.PostId = pa.PostId AND v.VoteTypeId = 2) > 0 THEN 'UpVoted'
+            WHEN (SELECT COUNT(*) FROM Votes v WHERE v.PostId = pa.PostId AND v.VoteTypeId = 3) > 0 THEN 'DownVoted'
+            ELSE 'NoVotes'
+        END AS VotingPattern,
+        CASE 
+            WHEN pa.PostTypeId = 1 THEN COALESCE(pa.AnswerCount, 0)
+            WHEN pa.PostTypeId = 2 THEN 
+                (SELECT COUNT(*) FROM Posts p2 WHERE p2.ParentId = pa.PostId)
+            ELSE 0
+        END AS ActualAnswerCount,
+        (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = pa.PostId AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)) AS RevisionCount,
+        CASE 
+            WHEN pa.AgeInDays > 365 THEN 'OldPost'
+            WHEN pa.AgeInDays > 30 THEN 'RecentPost'
+            ELSE 'NewPost'
+        END AS PostAgeCategory,
+        CASE 
+            WHEN pa.ViewCount > 1000 THEN 'Popular'
+            WHEN pa.ViewCount > 100 THEN 'Moderate'
+            WHEN pa.ViewCount > 10 THEN 'Low'
+            ELSE 'VeryLow'
+        END AS ViewCategory,
+        LAG(pa.Score, 1) OVER (PARTITION BY pa.OwnerUserId ORDER BY pa.CreationDate) AS PrevPostScore,
+        LEAD(pa.Score, 1) OVER (PARTITION BY pa.OwnerUserId ORDER BY pa.CreationDate) AS NextPostScore,
+        NTILE(4) OVER (ORDER BY pa.Score) AS ScoreQuartile,
+        COUNT(*) OVER (PARTITION BY pa.OwnerUserId) AS TotalPostsByUser
+    FROM TopUsers tu
+    INNER JOIN UserPostStats ups ON tu.UserId = ups.OwnerUserId
+    INNER JOIN PostAnalysis pa ON tu.UserId = pa.OwnerUserId
+    WHERE pa.CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '365 days'
+      AND pa.Score IS NOT NULL
+)
+SELECT 
+    COUNT(*) AS TotalRecords,
+    COUNT(DISTINCT UserId) AS UniqueUsers,
+    COUNT(DISTINCT PostId) AS UniquePosts,
+    AVG(TotalScore) AS AvgTotalScore,
+    AVG(AvgScore) AS AvgAvgScore,
+    AVG(AccountAgeDays) AS AvgAccountAge,
+    AVG(ViewsPerDay) AS AvgViewsPerDay,
+    AVG(TagCount) AS AvgTagCount,
+    AVG(EngagementLevel) AS AvgEngagement,
+    COUNT(CASE WHEN ReputationTier = 'Epic' THEN 1 END) AS EpicTiers,
+    COUNT(CASE WHEN ReputationTier = 'Legendary' THEN 1 END) AS LegendaryTiers,
+    COUNT(CASE WHEN ReputationTier = 'Magnificent' THEN 1 END) AS MagnificentTiers
+FROM ComplexQueryResult
+WHERE UserId IS NOT NULL
+  AND ScoreComparison IS NOT NULL
+  AND PostAgeCategory IS NOT NULL
+  AND ViewCategory IS NOT NULL
+  AND TagIntensity IS NOT NULL
+GROUP BY UserId, DisplayName, Reputation, TotalPosts, Questions, Answers, Badges, TotalScore, AvgScore, LastPostDate, AccountAgeDays, ReputationTier, PostTags, ScoreRank, RepRank, UserPostCount, UserTotalScore, UserAvgScore, MostRecentPost, AllTitles, PostId, Title, PostTypeId, Score, ViewCount, CreationDate, ParentId, AnswerCount, CommentCount, FavoriteCount, QuestionStatus, PopularityLevel, AgeInDays, EngagementLevel, TagCount, ViewsPerDay, UserPostRank, ScoreComparison, TagRank, TagIntensity, CommentCount, TotalBounty, VoteCount, VotingPattern, ActualAnswerCount, RevisionCount, PostAgeCategory, ViewCategory, PrevPostScore, NextPostScore, ScoreQuartile, TotalPostsByUser
+HAVING AVG(ViewsPerDay) > 0;

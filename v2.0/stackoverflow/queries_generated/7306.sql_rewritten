@@ -1,0 +1,273 @@
+-- {"query": "7306.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2508} 
+WITH RankedPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.LastActivityDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+        LEAD(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as next_score,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING) as moving_avg_score,
+        NTILE(4) OVER (ORDER BY p.Score DESC) as score_quartile
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Elite'
+            WHEN u.Reputation > 1000 THEN 'High'
+            WHEN u.Reputation > 100 THEN 'Medium'
+            ELSE 'Low'
+        END as RepCategory,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 100 THEN 'Active'
+            WHEN COUNT(DISTINCT p.Id) > 10 THEN 'Moderate'
+            ELSE 'Occasional'
+        END as ActivityLevel
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE WHEN t.IsRequired = 1 THEN 'Required' ELSE 'Optional' END as TagType,
+        PERCENT_RANK() OVER (ORDER BY t.Count DESC) as popularity_rank,
+        AVG(t.Count) OVER () as avg_tag_count
+    FROM Tags t
+    WHERE t.Count > 10
+),
+PostAnalysis AS (
+    SELECT 
+        r.PostId,
+        r.PostTypeId,
+        r.Score,
+        r.ViewCount,
+        r.CreationDate,
+        r.OwnerUserId,
+        r.Title,
+        r.Tags,
+        r.AnswerCount,
+        r.CommentCount,
+        r.FavoriteCount,
+        r.LastActivityDate,
+        r.rn,
+        r.prev_score,
+        r.next_score,
+        r.moving_avg_score,
+        r.score_quartile,
+        CASE 
+            WHEN r.Score > 50 THEN 'High'
+            WHEN r.Score > 10 THEN 'Medium'
+            ELSE 'Low'
+        END as ScoreCategory,
+        CASE 
+            WHEN r.AnswerCount > 10 THEN 'Highly Answered'
+            WHEN r.AnswerCount > 0 THEN 'Answered'
+            ELSE 'Unanswered'
+        END as AnswerStatus,
+        CASE 
+            WHEN r.CommentCount > 20 THEN 'Highly Commented'
+            WHEN r.CommentCount > 5 THEN 'Commented'
+            ELSE 'Sparsely Commented'
+        END as CommentStatus,
+        DATEDIFF('DAY', r.CreationDate, r.LastActivityDate) as DaysSinceActivity,
+        ROW_NUMBER() OVER (ORDER BY r.Score DESC) as RankByScore,
+        RANK() OVER (ORDER BY r.Score DESC, r.ViewCount DESC) as RankByScoreAndView,
+        DENSE_RANK() OVER (ORDER BY r.Score DESC) as DenseRankByScore
+    FROM RankedPosts r
+),
+ComplexJoinAnalysis AS (
+    SELECT DISTINCT
+        pa.PostId,
+        pa.PostTypeId,
+        pa.Score,
+        pa.ViewCount,
+        pa.CreationDate,
+        pa.OwnerUserId,
+        pa.Title,
+        pa.Tags,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.FavoriteCount,
+        pa.LastActivityDate,
+        pa.RankByScore,
+        pa.RankByScoreAndView,
+        pa.DenseRankByScore,
+        pa.ScoreCategory,
+        pa.AnswerStatus,
+        pa.CommentStatus,
+        pa.DaysSinceActivity,
+        ua.RepCategory,
+        ua.ActivityLevel,
+        ta.TagName,
+        ta.Count as TagCount,
+        ta.popularity_rank,
+        CASE 
+            WHEN pa.Score > 100 AND ua.ActivityLevel = 'Active' THEN 'Elite Post'
+            WHEN pa.Score > 50 AND ua.RepCategory = 'Elite' THEN 'Elite Reputation Post'
+            WHEN pa.AnswerCount > 5 AND pa.CommentCount > 10 THEN 'Engaged Post'
+            ELSE 'Regular Post'
+        END as PostClassification,
+        (pa.Score + pa.ViewCount + pa.AnswerCount * 10) AS PostComplexityScore,
+        LTRIM(RTRIM(REGEXP_REPLACE(pa.Tags, '<|>', ''))) as CleanTags,
+        CASE 
+            WHEN LOWER(pa.Title) LIKE '%sql%' OR LOWER(pa.Title) LIKE '%query%' THEN 'Technical Focus'
+            WHEN LOWER(pa.Title) LIKE '%performance%' OR LOWER(pa.Title) LIKE '%optimization%' THEN 'Performance Focus'
+            ELSE 'General'
+        END as TopicFocus,
+        CASE 
+            WHEN pa.FavoriteCount > 5 THEN 'Popular'
+            WHEN pa.FavoriteCount > 1 THEN 'Moderately Popular'
+            ELSE 'Not Popular'
+        END as PopularityStatus,
+        EXISTS (
+            SELECT 1 
+            FROM PostHistory ph 
+            WHERE ph.PostId = pa.PostId 
+            AND ph.PostHistoryTypeId IN (10, 12, 13, 14, 15)
+            AND ph.CreationDate > pa.CreationDate
+        ) as HasHistory,
+        COALESCE(
+            (SELECT COUNT(*) 
+             FROM Comments c 
+             WHERE c.PostId = pa.PostId 
+             AND c.Score > 0), 
+            0
+        ) as PositiveCommentsCount,
+        CASE 
+            WHEN pa.DaysSinceActivity < 30 AND pa.Score > 20 THEN 'Recently Active'
+            WHEN pa.DaysSinceActivity BETWEEN 30 AND 90 AND pa.Score > 10 THEN 'Recently Engaged'
+            WHEN pa.DaysSinceActivity > 90 THEN 'Inactive'
+            ELSE 'Unknown'
+        END as FreshnessStatus
+    FROM PostAnalysis pa
+    LEFT JOIN UserActivityStats ua ON pa.OwnerUserId = ua.UserId
+    LEFT JOIN Tags ta ON pa.Tags LIKE '%' || ta.TagName || '%'
+    WHERE pa.RankByScore <= 1000
+      AND ua.RepCategory IN ('Elite', 'High')
+      AND pa.LastActivityDate > DATEADD('YEAR', -2, cast('2024-10-01' as date))
+      AND (pa.CommentCount > 0 OR pa.AnswerCount > 0)
+)
+SELECT 
+    cja.PostId,
+    cja.PostTypeId,
+    cja.Score,
+    cja.ViewCount,
+    cja.ScoreCategory,
+    cja.AnswerStatus,
+    cja.CommentStatus,
+    cja.RepCategory,
+    cja.ActivityLevel,
+    cja.TagName,
+    cja.TagCount,
+    cja.PostClassification,
+    cja.PostComplexityScore,
+    cja.TopicFocus,
+    cja.PopularityStatus,
+    cja.HasHistory,
+    cja.PositiveCommentsCount,
+    cja.FreshnessStatus,
+    (SELECT COUNT(*) 
+     FROM Posts p2 
+     WHERE p2.OwnerUserId = cja.OwnerUserId 
+     AND p2.CreationDate > DATEADD('MONTH', -6, cast('2024-10-01' as date))
+    ) as RecentPostCount,
+    (SELECT AVG(ps.Score) 
+     FROM Posts ps 
+     WHERE ps.OwnerUserId = cja.OwnerUserId 
+     AND ps.CreationDate > DATEADD('MONTH', -12, cast('2024-10-01' as date))
+    ) as RecentAvgScore,
+    CASE 
+        WHEN cja.PostComplexityScore > (SELECT AVG(pcs) FROM (SELECT PostComplexityScore FROM ComplexJoinAnalysis) avg_subquery) 
+        THEN 'Above Average'
+        ELSE 'Below Average'
+    END as ComplexityStatus,
+    CASE 
+        WHEN cja.Score > (SELECT MAX(Score) FROM ComplexJoinAnalysis WHERE PostTypeId = 1) * 0.75 
+        THEN 'High Impact'
+        ELSE 'Standard'
+    END as ImpactRating,
+    CONCAT(
+        'Post ID: ', 
+        cja.PostId, 
+        ' | Score: ', 
+        cja.Score, 
+        ' | Created: ', 
+        cja.CreationDate, 
+        ' | Type: ', 
+        CASE cja.PostTypeId WHEN 1 THEN 'Question' WHEN 2 THEN 'Answer' END,
+        ' | Topic: ', 
+        cja.TopicFocus,
+        ' | Status: ', 
+        cja.FreshnessStatus
+    ) as PostSummary,
+    ROW_NUMBER() OVER (ORDER BY cja.Score DESC) as OverallRank,
+    RANK() OVER (ORDER BY cja.PostComplexityScore DESC) as ComplexityRank,
+    DENSE_RANK() OVER (ORDER BY cja.Score DESC, cja.ViewCount DESC) as CombinedRank,
+    NTILE(10) OVER (ORDER BY cja.Score DESC) as ScoreDecile,
+    PERCENT_RANK() OVER (ORDER BY cja.Score DESC) as ScorePercentile,
+    CUME_DIST() OVER (ORDER BY cja.Score DESC) as CumulativeDistribution,
+    LAG(cja.Score) OVER (ORDER BY cja.Score DESC) as PreviousScore,
+    LEAD(cja.Score) OVER (ORDER BY cja.Score DESC) as NextScore,
+    (SELECT COUNT(*) FROM ComplexJoinAnalysis WHERE PostTypeId = 1) as TotalQuestions,
+    (SELECT COUNT(*) FROM ComplexJoinAnalysis WHERE PostTypeId = 2) as TotalAnswers,
+    CASE 
+        WHEN cja.Score = (SELECT MAX(Score) FROM ComplexJoinAnalysis) THEN 1
+        WHEN cja.Score = (SELECT MIN(Score) FROM ComplexJoinAnalysis) THEN 0
+        ELSE 0.5
+    END as ExtremenessScore,
+    CONCAT(
+        cja.TagName, 
+        ' - ', 
+        CASE 
+            WHEN cja.TagCount > 1000 THEN 'Very Popular'
+            WHEN cja.TagCount > 500 THEN 'Popular'
+            ELSE 'Moderate'
+        END,
+        ' | Score: ', 
+        ROUND(cja.Score, 2),
+        ' | Views: ', 
+        cja.ViewCount
+    ) as TagScoreSummary,
+    EXISTS (
+        SELECT 1 
+        FROM PostHistory ph 
+        WHERE ph.PostId = cja.PostId 
+        AND ph.PostHistoryTypeId IN (1, 2, 3)
+        AND ph.CreationDate = cja.CreationDate
+    ) as HasInitialRevision
+FROM ComplexJoinAnalysis cja
+WHERE cja.Score > 0
+  AND cja.ViewCount > 0
+  AND cja.PostClassification IN ('Elite Post', 'Elite Reputation Post', 'Engaged Post') 
+  AND cja.FreshnessStatus IN ('Recently Active', 'Recently Engaged')
+ORDER BY cja.Score DESC,
+         cja.ViewCount DESC,
+         cja.PostComplexityScore DESC,
+         cja.RankByScore ASC
+LIMIT 500;

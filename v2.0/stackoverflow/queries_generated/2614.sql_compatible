@@ -1,0 +1,171 @@
+with RecursiveUserRecency as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.LastAccessDate,
+        dense_rank() over (order by u.LastAccessDate desc) as RecentRank
+    from Users u
+    where u.Reputation > 1000
+),
+QuestionDetails as (
+    select
+        p.Id,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.AcceptedAnswerId,
+        p.ClosedDate,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as UserPostRank,
+        case 
+            when p.ClosedDate is not null then 'Closed'
+            when p.AcceptedAnswerId is not null then 'Accepted'
+            else 'Open'
+        end as PostStatus
+    from Posts p
+    where p.PostTypeId = 1
+),
+LatestAnswerScores as (
+    select
+        a.ParentId as QuestionId,
+        max(a.Score) as MaxAnswerScore,
+        avg(a.Score) as AvgAnswerScore
+    from Posts a
+    where a.PostTypeId = 2
+    group by a.ParentId
+),
+BadgeCounts as (
+    select
+        b.UserId,
+        count(case when b.Class = 1 then 1 end) as GoldBadges,
+        count(case when b.Class = 2 then 1 end) as SilverBadges,
+        count(case when b.Class = 3 then 1 end) as BronzeBadges,
+        count(distinct b.Name) as DistinctBadges
+    from Badges b
+    group by b.UserId
+),
+PostLinkDupes as (
+    select
+        pl.PostId,
+        count(distinct pl.RelatedPostId) as DuplicateLinksCount
+    from PostLinks pl
+    where pl.LinkTypeId = 3
+    group by pl.PostId
+),
+ComplexPostAggregation as (
+    select
+        q.Id,
+        q.OwnerUserId,
+        u.DisplayName as OwnerName,
+        q.Title,
+        q.Tags,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        las.MaxAnswerScore,
+        las.AvgAnswerScore,
+        bc.GoldBadges,
+        bc.SilverBadges,
+        bc.BronzeBadges,
+        bc.DistinctBadges,
+        coalesce(pld.DuplicateLinksCount, 0) as DuplicateLinksCount,
+        q.PostStatus,
+        q.UserPostRank,
+        r.RecentRank,
+        coalesce(nullif(q.Tags,''),'<none>') as CleanTags,
+        length(q.Title) as TitleLength,
+        case when q.Score < 0 then 'Negative' when q.Score = 0 then 'Zero' else 'Positive' end as ScoreCategory,
+        case when q.ClosedDate is null then 0 else 1 end as IsClosed,
+        (select count(1)
+         from Comments c
+         where c.PostId = q.Id
+           and (lower(c.Text) like '%error%' or lower(c.Text) like '%fail%' or lower(c.Text) like '%bug%')
+        ) as ErrorCommentCount,
+        q.CreationDate
+    from QuestionDetails q
+    left join Users u on u.Id = q.OwnerUserId
+    left join LatestAnswerScores las on las.QuestionId = q.Id
+    left join BadgeCounts bc on bc.UserId = q.OwnerUserId
+    left join PostLinkDupes pld on pld.PostId = q.Id
+    left join RecursiveUserRecency r on r.Id = q.OwnerUserId
+),
+FilteredComplex as (
+    select *
+    from ComplexPostAggregation
+    where (Score > 5 or DuplicateLinksCount > 0)
+      and (GoldBadges + SilverBadges + BronzeBadges) > 2
+      and (RecentRank between 1 and 5000 or RecentRank is null)
+)
+select
+    f.Id as QuestionId,
+    f.OwnerUserId,
+    f.OwnerName,
+    f.Title,
+    substring(f.CleanTags from 1 for 50) as ShortTags,
+    f.TitleLength,
+    f.Score,
+    f.ScoreCategory,
+    f.ViewCount,
+    f.AnswerCount,
+    coalesce(f.MaxAnswerScore, 0) as MaxAnswerScore,
+    coalesce(round(f.AvgAnswerScore::numeric,2), 0) as AvgAnswerScore,
+    f.GoldBadges,
+    f.SilverBadges,
+    f.BronzeBadges,
+    f.DistinctBadges,
+    f.DuplicateLinksCount,
+    f.PostStatus,
+    f.IsClosed,
+    f.ErrorCommentCount,
+    f.RecentRank,
+    f.UserPostRank,
+    lag(f.Score) over (partition by f.OwnerUserId order by f.CreationDate desc) as PreviousPostScore,
+    lead(f.Score) over (partition by f.OwnerUserId order by f.CreationDate desc) as NextPostScore
+from FilteredComplex f
+where exists (
+    select 1
+    from Votes v
+    where v.PostId = f.Id
+      and v.VoteTypeId = 2
+      and v.CreationDate > cast('2024-10-01' as date) - interval '30 days'
+)
+union
+select
+    p.Id as QuestionId,
+    p.OwnerUserId,
+    u.DisplayName as OwnerName,
+    p.Title,
+    substring(coalesce(p.Tags,'<none>') from 1 for 50) as ShortTags,
+    length(p.Title) as TitleLength,
+    p.Score,
+    case when p.Score < 0 then 'Negative' when p.Score = 0 then 'Zero' else 'Positive' end as ScoreCategory,
+    p.ViewCount,
+    p.AnswerCount,
+    0 as MaxAnswerScore,
+    0 as AvgAnswerScore,
+    0 as GoldBadges,
+    0 as SilverBadges,
+    0 as BronzeBadges,
+    0 as DistinctBadges,
+    0 as DuplicateLinksCount,
+    'Open' as PostStatus,
+    0 as IsClosed,
+    0 as ErrorCommentCount,
+    null as RecentRank,
+    null as UserPostRank,
+    null as PreviousPostScore,
+    null as NextPostScore
+from Posts p
+left join Users u on u.Id = p.OwnerUserId
+where p.PostTypeId = 1
+  and p.Score > 50
+  and p.ViewCount > 10000
+  and not exists (
+      select 1 from Votes v2 where v2.PostId = p.Id and v2.VoteTypeId = 3
+  )
+order by Score desc, ViewCount desc
+limit 100;

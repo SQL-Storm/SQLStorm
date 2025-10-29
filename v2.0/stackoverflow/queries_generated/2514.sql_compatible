@@ -1,0 +1,120 @@
+WITH RecursiveTagCounts AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        COALESCE(a.AnswerCount, 0) AS TotalAnswers,
+        t.Count + COALESCE(a.AnswerCount, 0) AS PopularityScore
+    FROM Tags t
+    LEFT JOIN (
+        SELECT
+            tag AS TagName,
+            SUM(COALESCE(a.AnswerCount,0)) AS AnswerCount
+        FROM (
+            SELECT
+                p.Id,
+                -- remove surrounding angle brackets then split on '><'
+                REGEXP_SPLIT_TO_TABLE(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2), '><') AS tag,
+                a.AnswerCount
+            FROM Posts p
+            LEFT JOIN (
+                SELECT ParentId, COUNT(*) AS AnswerCount
+                FROM Posts
+                WHERE PostTypeId = 2
+                GROUP BY ParentId
+            ) a ON p.Id = a.ParentId
+            WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+        ) s
+        GROUP BY tag
+    ) a ON t.TagName = a.TagName
+),
+UserBadgeAgg AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY MAX(b.Date) DESC) AS LastBadgeRank
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+TopPosts AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Tags,
+        u.DisplayName,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS UserTopRank
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1 AND p.Score >= 5 AND p.Tags IS NOT NULL
+),
+CloseVoteCounts AS (
+    SELECT
+        ph.PostId,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseVotes,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenVotes,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN TRY_CAST(ph.Comment AS INTEGER) END) AS CloseReasonId
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (10, 11)
+    GROUP BY ph.PostId
+),
+PostLinkSummary AS (
+    SELECT
+        pl.PostId,
+        SUM(CASE WHEN pl.LinkTypeId = 1 THEN 1 ELSE 0 END) AS LinkedCount,
+        SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicateCount,
+        COUNT(*) AS TotalLinks
+    FROM PostLinks pl
+    GROUP BY pl.PostId
+)
+SELECT
+    t.TagName,
+    t.Count AS OriginalTagCount,
+    t.TotalAnswers,
+    t.PopularityScore,
+    up.DisplayName AS TopUser,
+    up.GoldBadges,
+    up.SilverBadges,
+    up.BronzeBadges,
+    tp.Title AS TopQuestionTitle,
+    tp.Score AS TopQuestionScore,
+    tp.ViewCount AS TopQuestionViews,
+    COALESCE(cv.CloseVotes, 0) AS TotalCloseVotes,
+    COALESCE(cv.ReopenVotes, 0) AS TotalReopenVotes,
+    crt.Name AS CloseReason,
+    pls.LinkedCount,
+    pls.DuplicateCount,
+    pls.TotalLinks,
+    CONCAT(
+        COALESCE(up.DisplayName, 'Unknown User'), ' - ',
+        COALESCE(tp.Title, 'No Question Title'), ' | ',
+        'Score: ', COALESCE(CAST(tp.Score AS TEXT), '0'), ', ',
+        'Views: ', COALESCE(CAST(tp.ViewCount AS TEXT), '0'), ', ',
+        'Badges: G', COALESCE(CAST(up.GoldBadges AS TEXT), '0'), ' S', COALESCE(CAST(up.SilverBadges AS TEXT), '0'), ' B', COALESCE(CAST(up.BronzeBadges AS TEXT), '0')
+    ) AS SummaryInfo
+FROM RecursiveTagCounts t
+LEFT JOIN LATERAL (
+    SELECT uga.*
+    FROM UserBadgeAgg uga
+    WHERE uga.UserId = (
+        SELECT OwnerUserId FROM Posts
+        WHERE PostTypeId = 1 AND Tags LIKE ('%<' || t.TagName || '>%')
+        ORDER BY Score DESC LIMIT 1
+    )
+    LIMIT 1
+) up ON TRUE
+LEFT JOIN TopPosts tp ON tp.Tags LIKE ('%<' || t.TagName || '>%') AND tp.UserTopRank = 1
+LEFT JOIN CloseVoteCounts cv ON cv.PostId = tp.Id
+LEFT JOIN CloseReasonTypes crt ON crt.Id = cv.CloseReasonId
+LEFT JOIN PostLinkSummary pls ON pls.PostId = tp.Id
+WHERE t.PopularityScore > 1000
+ORDER BY t.PopularityScore DESC, tp.Score DESC
+LIMIT 50;

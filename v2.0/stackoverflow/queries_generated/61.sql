@@ -1,0 +1,344 @@
+-- {"query": "61.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2880} 
+with
+q as (
+  select p.Id as QuestionId,
+         p.Title,
+         p.Tags,
+         p.OwnerUserId,
+         p.Score as QScore,
+         p.ViewCount,
+         p.CreationDate as QCreated,
+         p.AcceptedAnswerId
+  from Posts p
+  where p.PostTypeId = 1
+),
+answers as (
+  select a.Id as AnswerId,
+         a.ParentId as QuestionId,
+         a.OwnerUserId as AnswerOwnerId,
+         a.Score as AScore,
+         a.CreationDate as ACreated
+  from Posts a
+  where a.PostTypeId = 2
+),
+first_answer as (
+  select a.QuestionId,
+         a.AnswerId,
+         a.AScore,
+         a.AnswerOwnerId,
+         a.ACreated,
+         row_number() over (partition by a.QuestionId order by a.ACreated asc, a.AnswerId) as rn
+  from answers a
+),
+agg_answers as (
+  select a.QuestionId,
+         count(*) as AnswerCnt,
+         sum(case when a.AScore > 0 then 1 else 0 end) as PosAns,
+         sum(case when a.AScore < 0 then 1 else 0 end) as NegAns,
+         coalesce(avg(nullif(a.AScore, null)), 0) as AvgAScore,
+         max(a.AScore) as MaxAScore,
+         min(a.AScore) as MinAScore
+  from answers a
+  group by a.QuestionId
+),
+accepted as (
+  select q.QuestionId,
+         aa.Id as AcceptedId,
+         aa.OwnerUserId as AcceptedOwnerId,
+         aa.Score as AcceptedScore,
+         aa.CreationDate as AcceptedCreated
+  from q
+  left join Posts aa on aa.Id = q.AcceptedAnswerId
+),
+q_votes as (
+  select v.PostId as QuestionId,
+         sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+         sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+         sum(case when v.VoteTypeId = 5 then 1 else 0 end) as Favorites
+  from Votes v
+  group by v.PostId
+),
+q_comments as (
+  select c.PostId as QuestionId,
+         count(*) as CommentCnt,
+         max(c.Score) as MaxCommentScore,
+         min(c.Score) as MinCommentScore
+  from Comments c
+  group by c.PostId
+),
+owner_metrics as (
+  select u.Id as UserId,
+         u.Reputation,
+         u.UpVotes,
+         u.DownVotes,
+         coalesce(u.Location, '') as Location,
+         date_part('year', age(u.CreationDate)) as AccountAgeYears,
+         percentile_cont(0.5) within group (order by u.Reputation) over () as GlobalRepMedian
+  from Users u
+),
+badge_counts as (
+  select b.UserId,
+         sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+         sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+         sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+         sum(case when b.TagBased = 1 then 1 else 0 end) as TagBadges
+  from Badges b
+  group by b.UserId
+),
+close_events as (
+  select ph.PostId as QuestionId,
+         min(case when ph.PostHistoryTypeId = 10 then ph.CreationDate end) as FirstClosedAt,
+         min(case when ph.PostHistoryTypeId = 11 then ph.CreationDate end) as FirstReopenedAt,
+         count(*) filter (where ph.PostHistoryTypeId = 10) as CloseVotesCount
+  from PostHistory ph
+  where ph.PostHistoryTypeId in (10,11)
+  group by ph.PostId
+),
+dup_links as (
+  select pl.PostId as QuestionId,
+         count(*) filter (where pl.LinkTypeId = 3) as DuplicateLinks,
+         count(*) filter (where pl.LinkTypeId = 1) as RelatedLinks
+  from PostLinks pl
+  group by pl.PostId
+),
+tag_split as (
+  select q.QuestionId,
+         unnest(string_to_array(substring(q.Tags, 2, greatest(length(q.Tags)-2,0)), '><')) as tag
+  from q
+  where q.Tags is not null and q.Tags like '<%>'
+),
+top_tag as (
+  select ts.QuestionId,
+         min(ts.tag) as FirstTag,
+         count(*) as TagCount
+  from tag_split ts
+  group by ts.QuestionId
+),
+complex_pred as (
+  select q.QuestionId,
+         case
+           when q.QScore >= 10 and coalesce(qa.UpVotes,0) - coalesce(qa.DownVotes,0) > 5 then 'hot'
+           when q.ViewCount > 10000 and coalesce(agg.AnswerCnt,0) = 0 then 'unanswered_high_view'
+           when q.AcceptedAnswerId is null and coalesce(agg.AnswerCnt,0) > 3 then 'many_no_accept'
+           else 'normal'
+         end as QCategory
+  from q
+  left join q_votes qa on qa.QuestionId = q.QuestionId
+  left join agg_answers agg on agg.QuestionId = q.QuestionId
+),
+fa as (
+  select fa1.QuestionId,
+         fa1.AnswerId as FirstAnswerId,
+         fa1.AScore as FirstAnswerScore,
+         fa1.AnswerOwnerId as FirstAnswerOwnerId,
+         fa1.ACreated as FirstAnswerCreated
+  from first_answer fa1
+  where fa1.rn = 1
+),
+user_rollup as (
+  select
+    u.UserId,
+    u.Reputation,
+    u.UpVotes as UUp,
+    u.DownVotes as UDown,
+    bc.GoldBadges,
+    bc.SilverBadges,
+    bc.BronzeBadges,
+    bc.TagBadges,
+    u.AccountAgeYears,
+    u.GlobalRepMedian,
+    (coalesce(bc.GoldBadges,0) * 100 + coalesce(bc.SilverBadges,0) * 10 + coalesce(bc.BronzeBadges,0)) as BadgeScore
+  from owner_metrics u
+  left join badge_counts bc on bc.UserId = u.UserId
+),
+question_rank as (
+  select
+    q.QuestionId,
+    q.Title,
+    q.QScore,
+    q.ViewCount,
+    qa.UpVotes,
+    qa.DownVotes,
+    coalesce(qa.UpVotes,0) - coalesce(qa.DownVotes,0) as NetVotes,
+    qc.CommentCnt,
+    agg.AnswerCnt,
+    agg.AvgAScore,
+    agg.MaxAScore,
+    agg.MinAScore,
+    co.FirstClosedAt,
+    co.FirstReopenedAt,
+    dl.DuplicateLinks,
+    dl.RelatedLinks,
+    tt.FirstTag,
+    cp.QCategory,
+    a.AcceptedId,
+    fa.FirstAnswerId,
+    fa.FirstAnswerScore,
+    case
+      when a.AcceptedId is not null then 'accepted'
+      when fa.FirstAnswerId is not null then 'answered'
+      else 'unanswered'
+    end as AnswerStatus
+  from q
+  left join q_votes qa on qa.QuestionId = q.QuestionId
+  left join q_comments qc on qc.QuestionId = q.QuestionId
+  left join agg_answers agg on agg.QuestionId = q.QuestionId
+  left join close_events co on co.QuestionId = q.QuestionId
+  left join dup_links dl on dl.QuestionId = q.QuestionId
+  left join top_tag tt on tt.QuestionId = q.QuestionId
+  left join accepted a on a.QuestionId = q.QuestionId
+  left join fa on fa.QuestionId = q.QuestionId
+),
+scored as (
+  select
+    qr.*,
+    -- composite complexity score mixing various signals
+    (
+      coalesce(qr.QScore,0) * 2
+      + greatest(coalesce(qr.NetVotes,0), 0)
+      + coalesce(qr.ViewCount,0) / 500
+      + coalesce(qr.AnswerCnt,0) * 3
+      + case when qr.AnswerStatus = 'accepted' then 25 when qr.AnswerStatus = 'answered' then 10 else 0 end
+      + case when qr.DuplicateLinks > 0 then -15 else 0 end
+      + case when qr.FirstClosedAt is not null then -20 else 0 end
+    )::numeric as ComplexityScore
+  from question_rank qr
+),
+ranked as (
+  select
+    s.*,
+    dense_rank() over (order by s.ComplexityScore desc, s.ViewCount desc, s.QScore desc, s.QuestionId) as GlobalRank,
+    row_number() over (partition by coalesce(s.FirstTag,'<none>')
+                       order by s.ComplexityScore desc, s.ViewCount desc, s.QScore desc, s.QuestionId) as RankWithinTag
+  from scored s
+),
+user_enriched as (
+  select
+    r.*,
+    ur.Reputation as OwnerReputation,
+    ur.BadgeScore as OwnerBadgeScore,
+    ur.AccountAgeYears as OwnerAgeYears,
+    ur.GlobalRepMedian
+  from ranked r
+  left join q q0 on q0.QuestionId = r.QuestionId
+  left join user_rollup ur on ur.UserId = q0.OwnerUserId
+),
+null_logic as (
+  select
+    ue.*,
+    coalesce(ue.FirstTag, '<none>') as SafeFirstTag,
+    coalesce(ue.UpVotes, 0) as SafeUpVotes,
+    coalesce(ue.DownVotes, 0) as SafeDownVotes,
+    coalesce(ue.CommentCnt, 0) as SafeCommentCnt,
+    coalesce(ue.AnswerCnt, 0) as SafeAnswerCnt,
+    coalesce(ue.DuplicateLinks, 0) as SafeDuplicateLinks
+  from user_enriched ue
+),
+bucketed as (
+  select
+    nl.*,
+    case
+      when nl.ComplexityScore >= 100 then 'S'
+      when nl.ComplexityScore >= 60 then 'A'
+      when nl.ComplexityScore >= 30 then 'B'
+      when nl.ComplexityScore >= 10 then 'C'
+      else 'D'
+    end as PerfBucket
+  from null_logic nl
+),
+winner_per_tag as (
+  select distinct on (SafeFirstTag)
+    SafeFirstTag,
+    QuestionId as TopQuestionId,
+    Title as TopTitle,
+    ComplexityScore as TopScore
+  from bucketed
+  order by SafeFirstTag, ComplexityScore desc, ViewCount desc, QScore desc, QuestionId
+),
+unioned as (
+  select
+    b.QuestionId,
+    b.Title,
+    b.SafeFirstTag as TagKey,
+    b.ComplexityScore,
+    b.GlobalRank,
+    b.RankWithinTag,
+    b.AnswerStatus,
+    b.PerfBucket,
+    b.ViewCount,
+    b.QScore,
+    b.SafeUpVotes,
+    b.SafeDownVotes,
+    b.SafeCommentCnt,
+    b.SafeAnswerCnt,
+    b.SafeDuplicateLinks,
+    b.OwnerReputation,
+    b.OwnerBadgeScore,
+    b.OwnerAgeYears,
+    b.GlobalRepMedian,
+    false as IsTagWinner
+  from bucketed b
+  where b.GlobalRank <= 100
+  union all
+  select
+    b.QuestionId,
+    b.Title,
+    w.SafeFirstTag as TagKey,
+    b.ComplexityScore,
+    b.GlobalRank,
+    b.RankWithinTag,
+    b.AnswerStatus,
+    b.PerfBucket,
+    b.ViewCount,
+    b.QScore,
+    b.SafeUpVotes,
+    b.SafeDownVotes,
+    b.SafeCommentCnt,
+    b.SafeAnswerCnt,
+    b.SafeDuplicateLinks,
+    b.OwnerReputation,
+    b.OwnerBadgeScore,
+    b.OwnerAgeYears,
+    b.GlobalRepMedian,
+    true as IsTagWinner
+  from bucketed b
+  join (select SafeFirstTag from winner_per_tag) w on w.SafeFirstTag = b.SafeFirstTag
+  where b.RankWithinTag = 1
+),
+final_rank as (
+  select
+    u.*,
+    row_number() over (order by
+      (case when IsTagWinner then 1 else 0 end) desc,
+      PerfBucket asc,
+      ComplexityScore desc,
+      ViewCount desc,
+      QScore desc,
+      QuestionId) as FinalOrder
+  from unioned u
+)
+select
+  fr.FinalOrder,
+  fr.IsTagWinner,
+  fr.PerfBucket,
+  fr.QuestionId,
+  substring(coalesce(fr.Title,''), 1, 140) as TitlePreview,
+  fr.TagKey as PrimaryTag,
+  fr.AnswerStatus,
+  fr.ComplexityScore,
+  fr.GlobalRank,
+  fr.RankWithinTag,
+  fr.ViewCount,
+  fr.QScore,
+  fr.SafeUpVotes as UpVotes,
+  fr.SafeDownVotes as DownVotes,
+  fr.SafeCommentCnt as CommentCnt,
+  fr.SafeAnswerCnt as AnswerCnt,
+  fr.SafeDuplicateLinks as DuplicateLinks,
+  fr.OwnerReputation,
+  fr.OwnerBadgeScore,
+  fr.OwnerAgeYears,
+  case when fr.OwnerReputation >= fr.GlobalRepMedian then 'above_median' else 'below_median' end as OwnerRepVsMedian
+from final_rank fr
+order by fr.FinalOrder
+limit 200;

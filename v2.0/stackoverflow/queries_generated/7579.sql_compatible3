@@ -1,0 +1,331 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        COUNT(DISTINCT c.Id) AS Comments,
+        COUNT(DISTINCT b.Id) AS Badges,
+        MAX(p.CreationDate) AS LastPostDate,
+        CAST('2024-10-01 12:34:56' AS timestamp) - MIN(p.CreationDate) AS DaysRegistered,
+        COALESCE(SUM(COALESCE(p.Score,0)), 0) AS TotalScore,
+        COALESCE(SUM(COALESCE(p.ViewCount,0)), 0) AS TotalViews,
+        AVG(p.Score) AS AvgPostScore,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) AS MedianPostScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= DATE '2010-01-01'
+    GROUP BY u.Id, u.Reputation, u.DisplayName
+),
+TopTags AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS RankByPopularity,
+        AVG(t.Count) OVER () AS AvgTagCount,
+        (t.Count - AVG(t.Count) OVER ()) / NULLIF(STDDEV(t.Count) OVER (), 0) AS ZScore
+    FROM Tags t
+    WHERE t.Count > 0
+),
+QuestionAnalysis AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        u.DisplayName AS OwnerName,
+        CAST('2024-10-01 12:34:56' AS timestamp) - p.CreationDate AS AgeInDays,
+        CASE 
+            WHEN p.AnswerCount = 0 THEN 'No Answers'
+            WHEN p.AnswerCount = 1 THEN 'One Answer'
+            WHEN p.AnswerCount BETWEEN 2 AND 5 THEN 'Few Answers'
+            ELSE 'Many Answers'
+        END AS AnswerCategory,
+        CASE 
+            WHEN p.Score > 100 THEN 'Highly Upvoted'
+            WHEN p.Score > 10 THEN 'Upvoted'
+            WHEN p.Score < 0 THEN 'Downvoted'
+            ELSE 'Neutral'
+        END AS ScoreCategory,
+        STRING_AGG(
+            SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags) - 2)), 
+            '|' 
+        ) OVER (PARTITION BY p.OwnerUserId ORDER BY CHAR_LENGTH(SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags) - 2))) DESC) AS UserTags,
+        CASE 
+            WHEN SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags) - 2)) LIKE '%<java>%' THEN 1
+            WHEN SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags) - 2)) LIKE '%<python>%' THEN 1
+            WHEN SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags) - 2)) LIKE '%<c++>%' THEN 1
+            ELSE 0
+        END AS HasPopularTechTag,
+        ABS(p.Score - (
+            SELECT AVG(p2.Score) 
+            FROM Posts p2 
+            WHERE p2.PostTypeId = 1 
+            AND p2.CreationDate BETWEEN (p.CreationDate - INTERVAL '30' DAY) AND (p.CreationDate + INTERVAL '30' DAY)
+        )) AS ScoreDeviationFromAvg
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1 
+    AND p.CreationDate >= DATE '2020-01-01'
+),
+ComplexUserMetrics AS (
+    SELECT 
+        uas.UserId,
+        uas.Reputation,
+        uas.DisplayName,
+        uas.TotalPosts,
+        uas.Questions,
+        uas.Answers,
+        uas.Comments,
+        uas.Badges,
+        uas.LastPostDate,
+        uas.DaysRegistered,
+        uas.TotalScore,
+        uas.TotalViews,
+        uas.AvgPostScore,
+        uas.MedianPostScore,
+        CASE 
+            WHEN uas.TotalPosts > 100 AND uas.Reputation > 10000 THEN 'Elite Contributor'
+            WHEN uas.TotalPosts > 50 AND uas.Reputation > 5000 THEN 'Active Contributor'
+            WHEN uas.TotalPosts > 10 AND uas.Reputation > 1000 THEN 'Regular Contributor'
+            ELSE 'New Contributor'
+        END AS ContributionLevel,
+        RANK() OVER (ORDER BY uas.Reputation DESC) AS ReputationRank,
+        DENSE_RANK() OVER (ORDER BY uas.TotalPosts DESC) AS PostsRank,
+        PERCENT_RANK() OVER (ORDER BY uas.TotalScore DESC) AS ScorePercentile,
+        NTH_VALUE(uas.DisplayName, 1) OVER (ORDER BY uas.TotalScore DESC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS TopScorer
+    FROM UserActivityStats uas
+)
+SELECT 
+    cu.UserId,
+    cu.DisplayName,
+    cu.Reputation,
+    cu.Questions,
+    cu.Answers,
+    cu.Comments,
+    cu.Badges,
+    cu.TotalScore,
+    cu.AvgPostScore,
+    cu.ContributionLevel,
+    cu.ReputationRank,
+    cu.PostsRank,
+    cu.ScorePercentile,
+    cu.TopScorer,
+    ta.TagName,
+    ta.Count AS TagCount,
+    ta.RankByPopularity,
+    ta.ZScore,
+    qa.QuestionId,
+    qa.Title,
+    qa.Score AS QuestionScore,
+    qa.ViewCount,
+    qa.AnswerCount,
+    qa.HasPopularTechTag,
+    qa.ScoreDeviationFromAvg,
+    CASE 
+        WHEN cu.TotalPosts > 0 THEN 
+            (cu.Answers * 100.0) / NULLIF(cu.TotalPosts, 0)
+        ELSE 0 
+    END AS AnswerPercentage,
+    CASE 
+        WHEN cu.DaysRegistered IS NOT NULL AND cu.DaysRegistered <> (CAST('0' AS interval)) THEN 
+            (cu.TotalPosts * 1.0) / (EXTRACT(EPOCH FROM cu.DaysRegistered) / 86400.0)
+        ELSE 0 
+    END AS PostsPerDay,
+    COALESCE(
+        (SELECT COUNT(*) 
+         FROM Posts p 
+         WHERE p.ParentId = qa.QuestionId 
+         AND p.PostTypeId = 2 
+         AND p.CreationDate > qa.CreationDate
+        ), 0
+    ) AS FollowUpAnswers,
+    EXISTS (
+        SELECT 1 
+        FROM PostHistory ph 
+        WHERE ph.PostId = qa.QuestionId 
+        AND ph.PostHistoryTypeId IN (10, 11)
+        AND ph.CreationDate >= qa.CreationDate
+        AND ph.CreationDate <= qa.CreationDate + INTERVAL '7' DAY
+    ) AS WasClosedOrReopened,
+    CASE 
+        WHEN cu.MedianPostScore > 10 THEN 'Highly Rated'
+        WHEN cu.MedianPostScore > 1 THEN 'Moderately Rated'
+        ELSE 'Low Rated'
+    END AS RatingLevel,
+    COALESCE(
+        (SELECT AVG(p2.Score) 
+         FROM Posts p2 
+         WHERE p2.OwnerUserId = cu.UserId 
+         AND p2.PostTypeId = 2
+        ), 0
+    ) AS AvgAnswerScore,
+    CASE 
+        WHEN EXISTS (
+            SELECT 1 
+            FROM Badges b 
+            WHERE b.UserId = cu.UserId 
+            AND b.Class = 1
+        ) THEN 1
+        ELSE 0
+    END AS HasGoldBadge,
+    ABS(cu.TotalScore - (
+        SELECT AVG(u2.TotalScore) 
+        FROM ComplexUserMetrics u2
+        WHERE u2.ContributionLevel = cu.ContributionLevel
+    )) AS ScoreDeviationFromLevel,
+    COUNT(*) OVER() AS TotalUsers,
+    ROW_NUMBER() OVER (ORDER BY cu.TotalScore DESC) AS GlobalRank,
+    RANK() OVER (ORDER BY cu.Reputation DESC) AS ReputationRanking,
+    DENSE_RANK() OVER (PARTITION BY cu.ContributionLevel ORDER BY cu.TotalScore DESC) AS LevelRank,
+    NTILE(10) OVER (ORDER BY cu.TotalScore DESC) AS ScoreDecile,
+    CASE 
+        WHEN cu.ReputationRank <= 100 THEN 'Top 100'
+        WHEN cu.ReputationRank <= 1000 THEN 'Top 1000'
+        ELSE 'Others'
+    END AS ReputationBracket,
+    'User ' || cu.UserId || ' (' || cu.DisplayName || ') asked ' || cu.Questions || ' questions and answered ' || cu.Answers || ' answers' AS UserSummary,
+    NULLIF(
+        (cu.TotalScore / NULLIF(cu.Comments, 0)), 0
+    ) AS ScorePerComment,
+    COALESCE(
+        (SELECT COUNT(*) 
+         FROM Comments c 
+         WHERE c.UserId = cu.UserId 
+         AND c.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1' MONTH)
+        ), 0
+    ) AS RecentComments
+FROM ComplexUserMetrics cu
+JOIN TopTags ta ON ta.RankByPopularity <= 50
+JOIN QuestionAnalysis qa ON EXISTS (
+    SELECT 1 
+    FROM Posts p 
+    WHERE p.OwnerUserId = cu.UserId 
+    AND p.Id = qa.QuestionId
+    AND p.CreationDate >= qa.CreationDate - INTERVAL '1' YEAR
+)
+WHERE cu.Reputation > 1000 
+AND cu.TotalPosts > 10
+AND EXISTS (
+    SELECT 1 
+    FROM Posts p2 
+    WHERE p2.OwnerUserId = cu.UserId 
+    AND p2.PostTypeId = 1
+)
+AND (cu.Reputation > 20000 OR cu.TotalScore > 500)
+UNION ALL
+SELECT 
+    cu.UserId,
+    cu.DisplayName,
+    cu.Reputation,
+    cu.Questions,
+    cu.Answers,
+    cu.Comments,
+    cu.Badges,
+    cu.TotalScore,
+    cu.AvgPostScore,
+    cu.ContributionLevel,
+    cu.ReputationRank,
+    cu.PostsRank,
+    cu.ScorePercentile,
+    cu.TopScorer,
+    'Overall' AS TagName,
+    NULL AS TagCount,
+    0 AS RankByPopularity,
+    0 AS ZScore,
+    0 AS QuestionId,
+    'N/A' AS Title,
+    NULL AS QuestionScore,
+    NULL AS ViewCount,
+    NULL AS AnswerCount,
+    NULL AS HasPopularTechTag,
+    NULL AS ScoreDeviationFromAvg,
+    CASE 
+        WHEN cu.TotalPosts > 0 THEN 
+            (cu.Answers * 100.0) / NULLIF(cu.TotalPosts, 0)
+        ELSE 0 
+    END AS AnswerPercentage,
+    CASE 
+        WHEN cu.DaysRegistered IS NOT NULL AND cu.DaysRegistered <> (CAST('0' AS interval)) THEN 
+            (cu.TotalPosts * 1.0) / (EXTRACT(EPOCH FROM cu.DaysRegistered) / 86400.0)
+        ELSE 0 
+    END AS PostsPerDay,
+    0 AS FollowUpAnswers,
+    FALSE AS WasClosedOrReopened,
+    'All Users' AS RatingLevel,
+    COALESCE(
+        (SELECT AVG(p2.Score) 
+         FROM Posts p2 
+         WHERE p2.OwnerUserId = cu.UserId 
+         AND p2.PostTypeId = 2
+        ), 0
+    ) AS AvgAnswerScore,
+    CASE 
+        WHEN EXISTS (
+            SELECT 1 
+            FROM Badges b 
+            WHERE b.UserId = cu.UserId 
+            AND b.Class = 1
+        ) THEN 1
+        ELSE 0
+    END AS HasGoldBadge,
+    ABS(cu.TotalScore - (
+        SELECT AVG(u2.TotalScore) 
+        FROM ComplexUserMetrics u2
+    )) AS ScoreDeviationFromLevel,
+    COUNT(*) OVER() AS TotalUsers,
+    ROW_NUMBER() OVER (ORDER BY cu.TotalScore DESC) AS GlobalRank,
+    RANK() OVER (ORDER BY cu.Reputation DESC) AS ReputationRanking,
+    DENSE_RANK() OVER (PARTITION BY cu.ContributionLevel ORDER BY cu.TotalScore DESC) AS LevelRank,
+    NTILE(10) OVER (ORDER BY cu.TotalScore DESC) AS ScoreDecile,
+    CASE 
+        WHEN cu.ReputationRank <= 100 THEN 'Top 100'
+        WHEN cu.ReputationRank <= 1000 THEN 'Top 1000'
+        ELSE 'Others'
+    END AS ReputationBracket,
+    'User ' || cu.UserId || ' (' || cu.DisplayName || ') asked ' || cu.Questions || ' questions and answered ' || cu.Answers || ' answers' AS UserSummary,
+    NULLIF(
+        (cu.TotalScore / NULLIF(cu.Comments, 0)), 0
+    ) AS ScorePerComment,
+    COALESCE(
+        (SELECT COUNT(*) 
+         FROM Comments c 
+         WHERE c.UserId = cu.UserId 
+         AND c.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1' MONTH)
+        ), 0
+    ) AS RecentComments
+FROM ComplexUserMetrics cu
+WHERE cu.Reputation > 5000
+AND cu.TotalPosts > 50
+AND cu.TotalScore > 1000
+GROUP BY
+    cu.UserId,
+    cu.DisplayName,
+    cu.Reputation,
+    cu.Questions,
+    cu.Answers,
+    cu.Comments,
+    cu.Badges,
+    cu.TotalScore,
+    cu.AvgPostScore,
+    cu.ContributionLevel,
+    cu.ReputationRank,
+    cu.PostsRank,
+    cu.ScorePercentile,
+    cu.TopScorer,
+    cu.DaysRegistered,
+    cu.TotalPosts
+HAVING COUNT(*) > 1
+ORDER BY cu.TotalScore DESC, cu.Reputation DESC, cu.TotalPosts DESC;

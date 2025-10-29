@@ -1,0 +1,354 @@
+-- {"query": "7584.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 3560} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COUNT(DISTINCT ph.Id) as HistoryCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        MAX(b.Date) as LastBadgeDate,
+        MAX(ph.CreationDate) as LastHistoryDate,
+        CASE 
+            WHEN u.Views > 0 THEN CAST(u.UpVotes AS FLOAT) / u.Views 
+            ELSE 0 
+        END as UpVoteRatio,
+        CASE 
+            WHEN u.DownVotes > 0 THEN CAST(u.DownVotes AS FLOAT) / u.Reputation 
+            ELSE 0 
+        END as DownVoteRatio
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    WHERE u.CreationDate >= '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostPerformanceMetrics AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        DATEDIFF(day, p.CreationDate, p.LastActivityDate) as DaysActive,
+        CASE 
+            WHEN p.Score > 0 AND p.LastActivityDate > p.CreationDate THEN 
+                CAST(p.ViewCount AS FLOAT) / (DATEDIFF(day, p.CreationDate, p.LastActivityDate) + 1)
+            ELSE 0 
+        END as AvgViewsPerDay,
+        CASE 
+            WHEN p.AnswerCount > 0 THEN 
+                CAST(p.Score AS FLOAT) / p.AnswerCount
+            ELSE 0 
+        END as AvgScorePerAnswer,
+        CASE 
+            WHEN p.CommentCount > 0 THEN 
+                CAST(p.Score AS FLOAT) / p.CommentCount
+            ELSE 0 
+        END as AvgScorePerComment,
+        p.OwnerUserId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as PostType,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+            ELSE 'Open'
+        END as PostStatus
+    FROM Posts p
+    WHERE p.CreationDate >= '2015-01-01'
+    AND p.Score IS NOT NULL
+),
+ComplexUserAnalysis AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.PostCount,
+        uas.CommentCount,
+        uas.BadgeCount,
+        uas.HistoryCount,
+        uas.UpVoteRatio,
+        uas.DownVoteRatio,
+        CASE 
+            WHEN uas.PostCount > 100 THEN 'Highly Active'
+            WHEN uas.PostCount > 50 THEN 'Active'
+            WHEN uas.PostCount > 10 THEN 'Moderate'
+            ELSE 'Low'
+        END as ActivityLevel,
+        CASE 
+            WHEN uas.Reputation > 100000 THEN 'Elite'
+            WHEN uas.Reputation > 10000 THEN 'Advanced'
+            WHEN uas.Reputation > 1000 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as ReputationTier,
+        ROW_NUMBER() OVER (ORDER BY uas.Reputation DESC) as ReputationRank,
+        RANK() OVER (ORDER BY uas.PostCount DESC) as PostRank,
+        DENSE_RANK() OVER (ORDER BY uas.CommentCount DESC) as CommentRank
+    FROM UserActivityStats uas
+    WHERE uas.Reputation > 1000
+),
+TagPerformance AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            WHEN t.Count > 10 THEN 'Niche'
+            ELSE 'Obscure'
+        END as PopularityLevel,
+        CASE 
+            WHEN t.Count > 500 THEN 'High Interest'
+            ELSE 'Low Interest'
+        END as InterestLevel,
+        LAG(t.Count, 1) OVER (ORDER BY t.Count DESC) as PreviousCount,
+        LEAD(t.Count, 1) OVER (ORDER BY t.Count DESC) as NextCount,
+        AVG(t.Count) OVER (PARTITION BY t.IsRequired, t.IsModeratorOnly) as AvgCountByCategory
+    FROM Tags t
+    WHERE t.Count > 0
+),
+CombinedAnalysis AS (
+    SELECT 
+        cua.UserId,
+        cua.DisplayName,
+        cua.Reputation,
+        cua.PostCount,
+        cua.CommentCount,
+        cua.BadgeCount,
+        cua.HistoryCount,
+        cua.UpVoteRatio,
+        cua.DownVoteRatio,
+        cua.ActivityLevel,
+        cua.ReputationTier,
+        cua.ReputationRank,
+        cua.PostRank,
+        cua.CommentRank,
+        pp.Title,
+        pp.Score,
+        pp.ViewCount,
+        pp.AnswerCount,
+        pp.CommentCount,
+        pp.FavoriteCount,
+        pp.CreationDate,
+        pp.LastActivityDate,
+        pp.DaysActive,
+        pp.AvgViewsPerDay,
+        pp.AvgScorePerAnswer,
+        pp.AvgScorePerComment,
+        pp.PostType,
+        pp.PostStatus,
+        tp.TagName,
+        tp.Count as TagCount,
+        tp.PopularityLevel,
+        tp.InterestLevel,
+        tp.PreviousCount,
+        tp.NextCount,
+        tp.AvgCountByCategory,
+        CASE 
+            WHEN cua.Reputation > 50000 AND pp.Score > 100 THEN 'High Performer'
+            WHEN cua.Reputation > 10000 AND pp.Score > 50 THEN 'Mid Performer'
+            WHEN pp.Score > 25 THEN 'Low Performer'
+            ELSE 'Non-Performer'
+        END as PerformanceCategory,
+        CASE 
+            WHEN cua.CommentCount > 100 AND pp.CommentCount > 10 THEN 'Engaged Contributor'
+            ELSE 'Regular Contributor'
+        END as ContributionType,
+        CAST(POWER(CAST(cua.PostCount AS FLOAT) * cua.Reputation, 0.5) AS INTEGER) as ActivityIndex,
+        CAST(100 * (cua.PostCount * pp.Score) / NULLIF((cua.Reputation + pp.ViewCount), 0) AS FLOAT) as EfficiencyScore,
+        DENSE_RANK() OVER (PARTITION BY pp.PostType ORDER BY pp.Score DESC) as ScoreRankByType,
+        DENSE_RANK() OVER (PARTITION BY pp.PostStatus ORDER BY pp.ViewCount DESC) as ViewRankByStatus,
+        LAG(cua.Reputation, 1) OVER (ORDER BY cua.Reputation DESC) as PrevUserReputation,
+        LEAD(cua.Reputation, 1) OVER (ORDER BY cua.Reputation DESC) as NextUserReputation,
+        AVG(cua.Reputation) OVER (ORDER BY cua.Reputation ROWS BETWEEN 5 PRECEDING AND 5 FOLLOWING) as ReputationMovingAvg,
+        COUNT(*) OVER (PARTITION BY pp.PostType) as PostCountByType,
+        MAX(pp.Score) OVER (PARTITION BY pp.PostType) as MaxScoreByType,
+        MIN(pp.ViewCount) OVER (PARTITION BY pp.PostStatus) as MinViewsByStatus
+    FROM ComplexUserAnalysis cua
+    INNER JOIN PostPerformanceMetrics pp ON cua.UserId = pp.OwnerUserId
+    LEFT JOIN TagPerformance tp ON pp.Title LIKE '%' || tp.TagName || '%' OR pp.Title LIKE '% ' || tp.TagName || ' %'
+    WHERE pp.Score > 0
+    AND pp.ViewCount > 0
+    AND pp.LastActivityDate > '2020-01-01'
+)
+SELECT 
+    ca.UserId,
+    ca.DisplayName,
+    ca.Reputation,
+    ca.PostCount,
+    ca.CommentCount,
+    ca.BadgeCount,
+    ca.HistoryCount,
+    ca.ActivityLevel,
+    ca.ReputationTier,
+    ca.ReputationRank,
+    ca.PostRank,
+    ca.CommentRank,
+    ca.Title,
+    ca.Score,
+    ca.ViewCount,
+    ca.AnswerCount,
+    ca.CommentCount as PostCommentCount,
+    ca.FavoriteCount,
+    ca.CreationDate,
+    ca.LastActivityDate,
+    ca.DaysActive,
+    ca.AvgViewsPerDay,
+    ca.AvgScorePerAnswer,
+    ca.AvgScorePerComment,
+    ca.PostType,
+    ca.PostStatus,
+    ca.TagName,
+    ca.TagCount,
+    ca.PopularityLevel,
+    ca.InterestLevel,
+    ca.PerformanceCategory,
+    ca.ContributionType,
+    ca.ActivityIndex,
+    ca.EfficiencyScore,
+    ca.ScoreRankByType,
+    ca.ViewRankByStatus,
+    ca.ReputationMovingAvg,
+    ca.PostCountByType,
+    ca.MaxScoreByType,
+    ca.MinViewsByStatus,
+    CASE 
+        WHEN ca.Score > (SELECT AVG(Score) FROM Posts) * 2 THEN 'Exceptional Post'
+        WHEN ca.Score > (SELECT AVG(Score) FROM Posts) THEN 'Above Average Post'
+        WHEN ca.Score < (SELECT AVG(Score) FROM Posts) / 2 THEN 'Below Average Post'
+        ELSE 'Average Post'
+    END as ScoreCategory,
+    CASE 
+        WHEN ca.ViewCount > (SELECT AVG(ViewCount) FROM Posts) * 1.5 THEN 'High Traffic Post'
+        WHEN ca.ViewCount > (SELECT AVG(ViewCount) FROM Posts) THEN 'Standard Traffic Post'
+        ELSE 'Low Traffic Post'
+    END as TrafficCategory,
+    DENSE_RANK() OVER (ORDER BY ca.EfficiencyScore DESC) as EfficiencyRank,
+    ROW_NUMBER() OVER (PARTITION BY ca.PostType ORDER BY ca.Score DESC) as TypeSpecificRank,
+    NTILE(4) OVER (ORDER BY ca.Reputation DESC) as ReputationQuartile,
+    PERCENT_RANK() OVER (ORDER BY ca.Score) as ScorePercentile,
+    CAST(SUM(ca.Score) OVER (ORDER BY ca.Reputation DESC ROWS UNBOUNDED PRECEDING) AS FLOAT) as CumulativeScore,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = ca.UserId AND p.CreationDate >= '2020-01-01') as RecentPostCount,
+    (SELECT MAX(p.Score) FROM Posts p WHERE p.OwnerUserId = ca.UserId AND p.PostTypeId = 1) as MaxQuestionScore,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = ca.UserId AND p.PostTypeId = 2) as AnswerCount,
+    CAST((SELECT AVG(b.Date) FROM Badges b WHERE b.UserId = ca.UserId) AS VARCHAR(20)) as AvgBadgeDate,
+    (SELECT COUNT(*) FROM Votes v WHERE v.UserId = ca.UserId AND v.VoteTypeId = 2) as UpVoteCount,
+    (SELECT COUNT(*) FROM Votes v WHERE v.UserId = ca.UserId AND v.VoteTypeId = 3) as DownVoteCount,
+    COALESCE(ca.Score, 0) + COALESCE(ca.ViewCount, 0) + COALESCE(ca.AnswerCount, 0) as CombinedMetric,
+    CASE 
+        WHEN (ca.PostCount * ca.CommentCount) > 1000 THEN 'High Engagement User'
+        WHEN (ca.PostCount * ca.CommentCount) > 100 THEN 'Moderate Engagement User'
+        ELSE 'Low Engagement User'
+    END as EngagementTier,
+    CAST(POWER(CAST(ca.PostCount AS FLOAT) + CAST(ca.Reputation AS FLOAT), 0.7) AS INTEGER) as CompositeScore,
+    CASE 
+        WHEN ca.TagName IS NOT NULL THEN 
+            UPPER(SUBSTRING(ca.TagName, 1, 1)) || LOWER(SUBSTRING(ca.TagName, 2, LEN(ca.TagName)))
+        ELSE 'No Tag'
+    END as FormattedTagName,
+    CAST(REPLACE(REPLACE(CAST(ca.CreationDate AS VARCHAR(20)), ' ', 'T'), '-', '/') AS VARCHAR(30)) as FormattedCreationDate,
+    CAST(CAST(ca.Score AS FLOAT) * 100 / NULLIF(MAX(ca.Score) OVER(), 0) AS INTEGER) as ScorePercentage,
+    (SELECT COUNT(*) FROM VoteTypes vt WHERE vt.Id IN (2, 3, 4, 5)) as VoteTypeCount,
+    (SELECT COUNT(DISTINCT p.OwnerUserId) FROM Posts p WHERE p.PostTypeId = 1 AND p.Score > 10) as HighScoreQuestionUsers,
+    CAST(ROUND(100.0 * (ca.ViewCount * 1.0) / NULLIF((ca.PostCount * 1.0), 0), 2) AS FLOAT) as ViewsPerPostRatio,
+    COUNT(*) OVER() as TotalRecords
+FROM CombinedAnalysis ca
+WHERE ca.Reputation > 1000
+AND ca.PostCount > 5
+AND ca.Score > 5
+AND (ca.ViewCount > 10 OR ca.AnswerCount > 0)
+ORDER BY ca.Reputation DESC, ca.Score DESC, ca.ViewCount DESC
+OFFSET 1000 ROWS
+FETCH NEXT 500 ROWS ONLY
+UNION ALL
+SELECT 
+    -1 as UserId,
+    'Summary' as DisplayName,
+    0 as Reputation,
+    COUNT(*) as PostCount,
+    COUNT(DISTINCT ca.UserId) as CommentCount,
+    COUNT(DISTINCT ca.UserId) as BadgeCount,
+    0 as HistoryCount,
+    'Summary' as ActivityLevel,
+    'Summary' as ReputationTier,
+    0 as ReputationRank,
+    0 as PostRank,
+    0 as CommentRank,
+    'All Posts' as Title,
+    SUM(ca.Score) as Score,
+    SUM(ca.ViewCount) as ViewCount,
+    SUM(ca.AnswerCount) as AnswerCount,
+    SUM(ca.CommentCount) as PostCommentCount,
+    SUM(ca.FavoriteCount) as FavoriteCount,
+    MIN(ca.CreationDate) as CreationDate,
+    MAX(ca.LastActivityDate) as LastActivityDate,
+    0 as DaysActive,
+    0 as AvgViewsPerDay,
+    0 as AvgScorePerAnswer,
+    0 as AvgScorePerComment,
+    'All' as PostType,
+    'All' as PostStatus,
+    'Summary' as TagName,
+    COUNT(*) as TagCount,
+    'Summary' as PopularityLevel,
+    'Summary' as InterestLevel,
+    'Summary' as PerformanceCategory,
+    'Summary' as ContributionType,
+    0 as ActivityIndex,
+    0 as EfficiencyScore,
+    0 as ScoreRankByType,
+    0 as ViewRankByStatus,
+    0 as ReputationMovingAvg,
+    0 as PostCountByType,
+    0 as MaxScoreByType,
+    0 as MinViewsByStatus,
+    'Summary' as ScoreCategory,
+    'Summary' as TrafficCategory,
+    0 as EfficiencyRank,
+    0 as TypeSpecificRank,
+    0 as ReputationQuartile,
+    0 as ScorePercentile,
+    0 as CumulativeScore,
+    0 as RecentPostCount,
+    0 as MaxQuestionScore,
+    0 as AnswerCount,
+    '0' as AvgBadgeDate,
+    0 as UpVoteCount,
+    0 as DownVoteCount,
+    COUNT(*) * 10 as CombinedMetric,
+    'Summary' as EngagementTier,
+    COUNT(*) * 100 as CompositeScore,
+    'Summary' as FormattedTagName,
+    'Summary' as FormattedCreationDate,
+    0 as ScorePercentage,
+    0 as VoteTypeCount,
+    0 as HighScoreQuestionUsers,
+    0 as ViewsPerPostRatio,
+    COUNT(*) as TotalRecords
+FROM CombinedAnalysis ca
+WHERE ca.Reputation > 1000
+AND ca.PostCount > 5
+AND ca.Score > 5
+GROUP BY 'Summary'
+ORDER BY TotalRecords DESC
+OFFSET 0 ROWS
+FETCH NEXT 1 ROWS ONLY;

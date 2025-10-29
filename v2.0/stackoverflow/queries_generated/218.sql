@@ -1,0 +1,327 @@
+-- {"query": "218.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3304} 
+with
+-- 1) isolate questions and answers with useful derived fields
+qa as (
+  select
+    p.Id,
+    p.PostTypeId,
+    p.ParentId,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    coalesce(p.ViewCount, 0) as ViewCount,
+    p.AnswerCount,
+    p.Title,
+    p.Tags,
+    -- explode tags to array once (if DB is PostgreSQL as hinted)
+    string_to_array(substring(p.Tags, 2, greatest(length(p.Tags)-2,0)), '><') as tag_arr
+  from Posts p
+  where p.PostTypeId in (1,2)
+),
+-- 2) accepted answers joined back to their parent questions
+accepted as (
+  select
+    q.Id as QuestionId,
+    q.OwnerUserId as QuestionOwnerId,
+    a.Id as AcceptedAnswerId,
+    a.OwnerUserId as AcceptedOwnerId,
+    a.Score as AcceptedScore,
+    a.CreationDate as AcceptedCreationDate
+  from Posts q
+  join Posts a
+    on a.Id = q.AcceptedAnswerId
+  where q.PostTypeId = 1
+),
+-- 3) compute per-question aggregates via window functions
+question_metrics as (
+  select
+    q.Id as QuestionId,
+    q.OwnerUserId,
+    q.CreationDate,
+    q.Score as QuestionScore,
+    q.ViewCount,
+    q.AnswerCount,
+    -- windowed rank by score within month, and dense rank by views across all time
+    rank() over (partition by date_trunc('month', q.CreationDate) order by q.Score desc nulls last, q.ViewCount desc nulls last) as score_rank_in_month,
+    dense_rank() over (order by q.ViewCount desc nulls last) as view_dense_rank_all,
+    -- count of distinct tags (NULL-safe)
+    (select count(*) from unnest(coalesce(q.tag_arr, array[]::varchar[])) t where nullif(t, '') is not null) as tag_count,
+    -- heuristic complexity: engagement = log1p(views) * (score + answers + 1)
+    ln(1 + coalesce(q.ViewCount,0)) * (coalesce(q.Score,0) + coalesce(q.AnswerCount,0) + 1) as engagement_score
+  from qa q
+  where q.PostTypeId = 1
+),
+-- 4) recent comment activity per post (correlated subquery alternative + CTE)
+recent_comments as (
+  select
+    c.PostId,
+    count(*) filter (where c.CreationDate >= now() - interval '365 days') as comments_last_year,
+    max(c.CreationDate) as last_comment_at,
+    sum(coalesce(c.Score,0)) as comment_score_sum
+  from Comments c
+  group by c.PostId
+),
+-- 5) votes summary with conditional aggregation and NULL logic
+vote_summary as (
+  select
+    v.PostId,
+    sum(case when v.VoteTypeId = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.VoteTypeId = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.VoteTypeId = 8 then coalesce(v.BountyAmount,0) else 0 end) as bounty_started,
+    sum(case when v.VoteTypeId = 9 then coalesce(v.BountyAmount,0) else 0 end) as bounty_awarded,
+    min(v.CreationDate) as first_vote_at,
+    max(v.CreationDate) as last_vote_at
+  from Votes v
+  group by v.PostId
+),
+-- 6) users' activity features
+user_features as (
+  select
+    u.Id as UserId,
+    u.Reputation,
+    date_part('year', age(now(), u.CreationDate)) as account_age_years,
+    coalesce(u.UpVotes,0) - coalesce(u.DownVotes,0) as net_votes,
+    -- rough activity score using log transforms
+    ln(1 + greatest(u.Views,0)) + 0.1 * (coalesce(u.UpVotes,0) + coalesce(u.DownVotes,0)) as user_activity_score,
+    nullif(trim(coalesce(u.Location, '')), '') as normalized_location
+  from Users u
+),
+-- 7) badge counts per user with pivot-like rollup
+badge_counts as (
+  select
+    b.UserId,
+    count(*) as total_badges,
+    sum(case when b.Class = 1 then 1 else 0 end) as gold_badges,
+    sum(case when b.Class = 2 then 1 else 0 end) as silver_badges,
+    sum(case when b.Class = 3 then 1 else 0 end) as bronze_badges,
+    sum(case when b.TagBased = 1 then 1 else 0 end) as tag_badges
+  from Badges b
+  group by b.UserId
+),
+-- 8) duplicates and linked posts per question
+link_rollup as (
+  select
+    pl.PostId,
+    sum(case when pl.LinkTypeId = 3 then 1 else 0 end) as duplicate_links,
+    sum(case when pl.LinkTypeId = 1 then 1 else 0 end) as related_links,
+    max(pl.CreationDate) as last_link_at
+  from PostLinks pl
+  group by pl.PostId
+),
+-- 9) closure info mined from PostHistory with JSON presence check and reason mapping
+closure as (
+  select
+    ph.PostId,
+    min(case when ph.PostHistoryTypeId = 10 then ph.CreationDate end) as first_closed_at,
+    max(case when ph.PostHistoryTypeId = 11 then ph.CreationDate end) as last_reopened_at,
+    count(*) filter (where ph.PostHistoryTypeId = 10) as close_events,
+    -- parse reason id embedded in Comment for closure rows when numeric
+    mode() within group (order by
+      case
+        when ph.PostHistoryTypeId = 10 and ph.Comment ~ '^[0-9]+$'
+          then cast(ph.Comment as int)
+        else null
+      end
+    ) as most_common_close_reason_id
+  from PostHistory ph
+  where ph.PostHistoryTypeId in (10,11)
+  group by ph.PostId
+),
+-- 10) tag popularity lookup
+tag_popularity as (
+  select
+    t.TagName,
+    t.Count as tag_global_count
+  from Tags t
+),
+-- 11) explode question tags to measure per-question tag popularity statistics
+question_tag_stats as (
+  select
+    q.Id as QuestionId,
+    avg(tp.tag_global_count::numeric) as avg_tag_popularity,
+    min(tp.tag_global_count) as min_tag_popularity,
+    max(tp.tag_global_count) as max_tag_popularity,
+    count(*) as tag_used_count
+  from qa q
+  cross join lateral unnest(coalesce(q.tag_arr, array[]::varchar[])) as tag(tagname)
+  left join tag_popularity tp on lower(tp.TagName) = lower(tag.tagname)
+  where q.PostTypeId = 1
+  group by q.Id
+),
+-- 12) compute per-answer metrics and join to their parent question
+answer_metrics as (
+  select
+    a.Id as AnswerId,
+    a.ParentId as QuestionId,
+    a.OwnerUserId as AnswerOwnerId,
+    a.Score as AnswerScore,
+    a.CreationDate as AnswerCreationDate,
+    row_number() over (partition by a.ParentId order by a.Score desc nulls last, a.CreationDate asc) as answer_rank_by_score,
+    avg(a.Score) over (partition by a.ParentId) as avg_answer_score_for_question
+  from qa a
+  where a.PostTypeId = 2
+),
+-- 13) combine per-question with top answers and accepted answers in one row via lateral joins
+question_enriched as (
+  select
+    qm.QuestionId,
+    qm.OwnerUserId,
+    qm.CreationDate,
+    qm.QuestionScore,
+    qm.ViewCount,
+    qm.AnswerCount,
+    qm.score_rank_in_month,
+    qm.view_dense_rank_all,
+    qm.tag_count,
+    qm.engagement_score,
+    qts.avg_tag_popularity,
+    qts.min_tag_popularity,
+    qts.max_tag_popularity,
+    qts.tag_used_count,
+    coalesce(rs.comments_last_year, 0) as comments_last_year,
+    rs.last_comment_at,
+    rs.comment_score_sum,
+    vs.upvotes,
+    vs.downvotes,
+    vs.bounty_started,
+    vs.bounty_awarded,
+    vs.first_vote_at,
+    vs.last_vote_at,
+    lr.duplicate_links,
+    lr.related_links,
+    lr.last_link_at,
+    cl.first_closed_at,
+    cl.last_reopened_at,
+    cl.close_events,
+    cl.most_common_close_reason_id,
+    acc.AcceptedAnswerId,
+    acc.AcceptedOwnerId,
+    acc.AcceptedScore,
+    acc.AcceptedCreationDate,
+    top_ans.AnswerId as TopAnswerId,
+    top_ans.AnswerOwnerId as TopAnswerOwnerId,
+    top_ans.AnswerScore as TopAnswerScore,
+    top_ans.AnswerCreationDate as TopAnswerCreationDate,
+    top_ans.avg_answer_score_for_question as AvgAnswerScoreForQuestion
+  from question_metrics qm
+  left join question_tag_stats qts on qts.QuestionId = qm.QuestionId
+  left join recent_comments rs on rs.PostId = qm.QuestionId
+  left join vote_summary vs on vs.PostId = qm.QuestionId
+  left join link_rollup lr on lr.PostId = qm.QuestionId
+  left join closure cl on cl.PostId = qm.QuestionId
+  left join accepted acc on acc.QuestionId = qm.QuestionId
+  left join lateral (
+    select am.*
+    from answer_metrics am
+    where am.QuestionId = qm.QuestionId
+    order by am.answer_rank_by_score
+    limit 1
+  ) top_ans on true
+),
+-- 14) enrich with user features for question owner, accepted answerer, and top answerer
+question_user_enriched as (
+  select
+    qe.*,
+    qu.Reputation as QOwnerReputation,
+    qu.account_age_years as QOwnerAgeYears,
+    qu.net_votes as QOwnerNetVotes,
+    qu.user_activity_score as QOwnerActivityScore,
+    coalesce(bcq.total_badges,0) as QOwnerBadgesTotal,
+    coalesce(bcq.gold_badges,0) as QOwnerGold,
+    coalesce(bcq.silver_badges,0) as QOwnerSilver,
+    coalesce(bcq.bronze_badges,0) as QOwnerBronze,
+    au.Reputation as AccOwnerReputation,
+    au.account_age_years as AccOwnerAgeYears,
+    coalesce(bca.total_badges,0) as AccOwnerBadgesTotal,
+    tu.Reputation as TopOwnerReputation,
+    tu.account_age_years as TopOwnerAgeYears,
+    coalesce(bct.total_badges,0) as TopOwnerBadgesTotal
+  from question_enriched qe
+  left join user_features qu on qu.UserId = qe.OwnerUserId
+  left join badge_counts bcq on bcq.UserId = qe.OwnerUserId
+  left join user_features au on au.UserId = qe.AcceptedOwnerId
+  left join badge_counts bca on bca.UserId = qe.AcceptedOwnerId
+  left join user_features tu on tu.UserId = qe.TopAnswerOwnerId
+  left join badge_counts bct on bct.UserId = qe.TopAnswerOwnerId
+),
+-- 15) derive a composite score using multiple signals, guarding against NULLs
+scored as (
+  select
+    que.*,
+    (
+      0.30 * coalesce(ln(1 + nullif(que.ViewCount,0)), 0) +
+      0.25 * coalesce(que.QuestionScore, 0) +
+      0.15 * coalesce(que.AnswerCount, 0) +
+      0.10 * coalesce(que.upvotes - coalesce(que.downvotes,0), 0) +
+      0.05 * coalesce(que.comments_last_year, 0) +
+      0.05 * coalesce(que.QOwnerReputation / nullif(que.QOwnerAgeYears + 1,0), 0) +
+      0.10 * coalesce(que.AvgAnswerScoreForQuestion, 0)
+    ) as composite_score
+  from question_user_enriched que
+),
+-- 16) percentile ranks over the composite score and engagement
+ranked as (
+  select
+    s.*,
+    ntile(100) over (order by s.composite_score desc nulls last) as composite_percentile,
+    ntile(100) over (order by s.engagement_score desc nulls last) as engagement_percentile
+  from scored s
+),
+-- 17) build a label describing closure/duplicate/accepted presence using string expressions
+labeled as (
+  select
+    r.*,
+    trim(both ' |' from concat_ws(' |',
+      case when r.close_events > 0 then 'Closed' end,
+      case when coalesce(r.duplicate_links,0) > 0 then 'HasDuplicateLink' end,
+      case when r.AcceptedAnswerId is not null then 'HasAccepted' else 'NoAccepted' end
+    )) as flags_label
+  from ranked r
+),
+-- 18) create synthetic buckets for benchmarking joins and groupings
+bucketed as (
+  select
+    l.*,
+    case
+      when coalesce(l.ViewCount,0) >= 100000 then 'Ultra'
+      when coalesce(l.ViewCount,0) >= 20000 then 'High'
+      when coalesce(l.ViewCount,0) >= 5000 then 'Medium'
+      when coalesce(l.ViewCount,0) >= 1000 then 'Low'
+      else 'Tiny'
+    end as view_bucket,
+    case
+      when coalesce(l.QuestionScore,0) >= 50 then 'S50+'
+      when coalesce(l.QuestionScore,0) >= 20 then 'S20-49'
+      when coalesce(l.QuestionScore,0) >= 5 then 'S5-19'
+      when coalesce(l.QuestionScore,0) > 0 then 'S1-4'
+      when coalesce(l.QuestionScore,0) = 0 then 'S0'
+      else 'S<0'
+    end as score_bucket
+  from labeled l
+)
+-- Final selection with set operators to add synthetic comparator rows
+select *
+from bucketed
+where
+  -- complex predicate mixing NULL logic and string checks
+  (
+    (flags_label is null or flags_label not like '%Closed%')
+    and (AcceptedAnswerId is not null or coalesce(AnswerCount,0) > 0)
+    and coalesce(tag_count, 0) between 1 and 5
+  )
+  or
+  (
+    -- prefer recent activity, but allow high engagement historical
+    (last_activitydate is null or now() - coalesce(last_comment_at, CreationDate) <= interval '365 days')
+    or engagement_percentile >= 95
+  )
+intersect
+select *
+from bucketed
+where composite_percentile >= 90
+except
+select *
+from bucketed
+where score_bucket = 'S<0'
+order by composite_percentile desc, engagement_percentile desc, ViewCount desc nulls last, QuestionId
+limit 500;

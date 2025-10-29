@@ -1,0 +1,326 @@
+with recent_users as (
+    select
+        u.Id as user_id,
+        u.DisplayName,
+        u.Reputation,
+        u.Location,
+        u.CreationDate as user_created,
+        u.LastAccessDate,
+        coalesce(nullif(trim(u.WebsiteUrl), ''), 'N/A') as website_url,
+        date_trunc('month', u.CreationDate) as cohort_month
+    from Users u
+    where u.CreationDate >= (select date_trunc('year', max(CreationDate)) from Users)
+),
+user_activity as (
+    select
+        p.OwnerUserId as user_id,
+        count(*) filter (where p.PostTypeId = 1) as q_count,
+        count(*) filter (where p.PostTypeId = 2) as a_count,
+        sum(coalesce(p.Score,0)) as total_post_score,
+        sum(coalesce(p.ViewCount,0)) as total_views,
+        max(p.LastActivityDate) as last_post_activity,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as distinct_questions
+    from Posts p
+    where p.OwnerUserId is not null
+      and p.OwnerUserId > 0
+      and p.CreationDate >= (select date_trunc('year', max(CreationDate)) from Posts)
+    group by p.OwnerUserId
+),
+vote_aggs as (
+    select
+        v.PostId,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as upvotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as downvotes,
+        sum(case when v.VoteTypeId = 5 then 1 else 0 end) as favorites,
+        sum(case when v.VoteTypeId in (8,9) then coalesce(v.BountyAmount,0) else 0 end) as bounty_total
+    from Votes v
+    where v.CreationDate >= (select date_trunc('year', max(CreationDate)) from Votes)
+    group by v.PostId
+),
+post_enriched as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Title,
+        p.Tags,
+        va.upvotes,
+        va.downvotes,
+        va.favorites,
+        va.bounty_total,
+        case
+            when p.PostTypeId = 1 then p.AnswerCount
+            else null
+        end as answer_count,
+        array_length(string_to_array(nullif(substring(p.Tags, 2, greatest(length(p.Tags)-2,0)), ''), '><'), 1) as tag_count
+    from Posts p
+    left join vote_aggs va on va.PostId = p.Id
+),
+question_quality as (
+    select
+        pe.Id as question_id,
+        pe.OwnerUserId as user_id,
+        coalesce(pe.Score,0) as q_score,
+        coalesce(pe.ViewCount,0) as q_views,
+        coalesce(pe.upvotes,0) as q_upvotes,
+        coalesce(pe.downvotes,0) as q_downvotes,
+        coalesce(pe.favorites,0) as q_favs,
+        coalesce(pe.bounty_total,0) as q_bounty,
+        coalesce(pe.answer_count,0) as answers,
+        coalesce(pe.tag_count,0) as tag_count,
+        pe.CreationDate as q_created,
+        pe.LastActivityDate as q_last_activity,
+        -- compute a composite metric with varying weights and null-safe ops
+        CAST(
+        (coalesce(pe.Score,0) * 3
+         + greatest(coalesce(pe.upvotes,0) - coalesce(pe.downvotes,0), 0) * 2
+         + least(CAST(coalesce(pe.ViewCount,0) AS numeric), 10000) / 250
+         + coalesce(pe.favorites,0) * 1.5
+         + ln(1 + coalesce(pe.bounty_total,0))
+         + case when coalesce(pe.answer_count,0) >= 2 then 5 else 0 end
+         - case when coalesce(pe.downvotes,0) > coalesce(pe.upvotes,0) then 3 else 0 end
+        ) AS numeric(18,4)) as quality_score
+    from post_enriched pe
+    where pe.PostTypeId = 1
+),
+answer_latency as (
+    select
+        q.Id as question_id,
+        min(a.CreationDate) as first_answer_time,
+        count(a.Id) as total_answers,
+        avg(extract(epoch from (a.CreationDate - q.CreationDate)) / 3600.0) as avg_answer_hours
+    from Posts q
+    left join Posts a
+        on a.ParentId = q.Id
+       and a.PostTypeId = 2
+    where q.PostTypeId = 1
+      and q.CreationDate >= (select date_trunc('year', max(CreationDate)) from Posts)
+    group by q.Id
+),
+duplicate_links as (
+    select
+        pl.PostId as question_id,
+        count(*) filter (where pl.LinkTypeId = 3) as dup_links
+    from PostLinks pl
+    group by pl.PostId
+),
+edits_agg as (
+    select
+        ph.PostId as post_id,
+        count(*) filter (where ph.PostHistoryTypeId in (4,5,6)) as edit_count,
+        count(*) filter (where ph.PostHistoryTypeId in (10)) as close_events,
+        count(*) filter (where ph.PostHistoryTypeId in (11)) as reopen_events,
+        max(ph.CreationDate) as last_edit_date
+    from PostHistory ph
+    where ph.CreationDate >= (select date_trunc('year', max(CreationDate)) from PostHistory)
+    group by ph.PostId
+),
+user_badges as (
+    select
+        b.UserId as user_id,
+        count(*) as badge_count,
+        count(*) filter (where b.Class = 1) as gold_count,
+        count(*) filter (where b.Class = 2) as silver_count,
+        count(*) filter (where b.Class = 3) as bronze_count,
+        count(*) filter (where CAST(b.TagBased AS integer) = 1) as tag_badges
+    from Badges b
+    group by b.UserId
+),
+user_comment_stats as (
+    select
+        c.UserId as user_id,
+        count(*) as comment_count,
+        avg(coalesce(c.Score,0)) as avg_comment_score,
+        max(c.CreationDate) as last_comment_date,
+        sum(length(coalesce(c.Text,''))) as total_comment_chars
+    from Comments c
+    where c.UserId is not null
+    group by c.UserId
+),
+tag_exploded as (
+    select
+        q.Id as question_id,
+        lower(trim(t)) as tag
+    from Posts q
+    cross join lateral unnest(
+        case
+            when q.Tags is null or length(q.Tags) < 2 then array[]::varchar[]
+            else string_to_array(substring(q.Tags, 2, greatest(length(q.Tags)-2,0)), '><')
+        end
+    ) as t(tag)
+    where q.PostTypeId = 1
+),
+top_user_tag as (
+    select
+        te.question_id,
+        te.tag,
+        rank() over (partition by te.question_id order by count(*) desc, te.tag) as rnk
+    from tag_exploded te
+    group by te.question_id, te.tag
+),
+user_rankings as (
+    select
+        ru.user_id,
+        ru.DisplayName,
+        ru.Reputation,
+        ru.Location,
+        ru.website_url,
+        ru.cohort_month,
+        ua.q_count,
+        ua.a_count,
+        ua.total_post_score,
+        ua.total_views,
+        ua.last_post_activity,
+        ub.badge_count,
+        ub.gold_count,
+        ub.silver_count,
+        ub.bronze_count,
+        ub.tag_badges,
+        ucs.comment_count,
+        ucs.avg_comment_score,
+        ucs.last_comment_date,
+        ucs.total_comment_chars,
+        -- windowed ranks for benchmarking
+        rank() over (order by coalesce(ua.total_views,0) desc nulls last) as r_views,
+        dense_rank() over (order by coalesce(ua.total_post_score,0) desc nulls last) as r_score,
+        row_number() over (order by coalesce(ub.badge_count,0) desc nulls last) as r_badges
+    from recent_users ru
+    left join user_activity ua on ua.user_id = ru.user_id
+    left join user_badges ub on ub.user_id = ru.user_id
+    left join user_comment_stats ucs on ucs.user_id = ru.user_id
+),
+question_final as (
+    select
+        qq.question_id,
+        qq.user_id,
+        qq.q_score,
+        qq.q_views,
+        qq.q_upvotes,
+        qq.q_downvotes,
+        qq.q_favs,
+        qq.q_bounty,
+        qq.answers,
+        qq.tag_count,
+        qq.q_created,
+        qq.q_last_activity,
+        al.first_answer_time,
+        al.total_answers,
+        al.avg_answer_hours,
+        coalesce(dl.dup_links,0) as dup_links,
+        coalesce(ea.edit_count,0) as edit_count,
+        coalesce(ea.close_events,0) as close_events,
+        coalesce(ea.reopen_events,0) as reopen_events,
+        ea.last_edit_date,
+        -- incorporate a decay factor and penalties/bonuses
+        CAST(
+        (
+            qq.quality_score
+            + case when coalesce(dl.dup_links,0) > 0 then -5 else 0 end
+            + case when coalesce(ea.close_events,0) > 0 then -7 else 0 end
+            + case when coalesce(al.total_answers,0) >= 3 then 2 else 0 end
+            + case when coalesce(qq.tag_count,0) between 3 and 5 then 1 else 0 end
+        ) AS numeric(18,4)) as adjusted_quality,
+        extract(epoch from (coalesce(qq.q_last_activity, qq.q_created) - qq.q_created)) / 3600.0 as active_hours
+    from question_quality qq
+    left join answer_latency al on al.question_id = qq.question_id
+    left join duplicate_links dl on dl.question_id = qq.question_id
+    left join edits_agg ea on ea.post_id = qq.question_id
+),
+user_question_rollup as (
+    select
+        qf.user_id,
+        count(*) as questions_count,
+        avg(qf.adjusted_quality) as avg_adj_quality,
+        percentile_cont(0.9) within group (order by qf.adjusted_quality) as p90_adj_quality,
+        sum(case when qf.dup_links > 0 then 1 else 0 end) as dup_flagged_questions,
+        avg(coalesce(qf.avg_answer_hours, 24.0)) as avg_answer_latency_hours,
+        max(qf.q_views) as max_q_views
+    from question_final qf
+    group by qf.user_id
+),
+accepted_rate as (
+    select
+        q.OwnerUserId as user_id,
+        avg(case when q.AcceptedAnswerId is not null then 1.0 else 0.0 end) as accept_rate
+    from Posts q
+    where q.PostTypeId = 1
+    group by q.OwnerUserId
+),
+ctas as (
+    select
+        ur.user_id,
+        count(*) filter (where pe.PostTypeId = 2 and pe.CreationDate >= ur.user_created + interval '7 days') as answers_first_week,
+        count(*) filter (where pe.PostTypeId = 1 and pe.CreationDate >= ur.user_created + interval '7 days') as questions_first_week
+    from recent_users ur
+    left join post_enriched pe on pe.OwnerUserId = ur.user_id
+    group by ur.user_id
+)
+select
+    urk.user_id,
+    urk.DisplayName,
+    coalesce(urk.Location, 'Unknown') as Location,
+    urk.website_url,
+    urk.cohort_month,
+    coalesce(urk.q_count,0) as q_count_year,
+    coalesce(urk.a_count,0) as a_count_year,
+    coalesce(ur.questions_count,0) as questions_count_total,
+    round(coalesce(ur.avg_adj_quality,0)::numeric, 2) as avg_adj_quality,
+    round(coalesce(ur.p90_adj_quality,0)::numeric, 2) as p90_adj_quality,
+    coalesce(ur.dup_flagged_questions,0) as dup_flagged_questions,
+    round(coalesce(ur.avg_answer_latency_hours,0)::numeric, 2) as avg_answer_latency_hours,
+    coalesce(ur.max_q_views,0) as max_q_views,
+    round(coalesce(ar.accept_rate,0)::numeric, 4) as accept_rate,
+    coalesce(ub.badge_count,0) as badges_total,
+    ub.gold_count, ub.silver_count, ub.bronze_count,
+    coalesce(ucs.comment_count,0) as comments_total,
+    round(coalesce(ucs.avg_comment_score,0)::numeric, 2) as avg_comment_score,
+    coalesce(ct.answers_first_week,0) as answers_first_week,
+    coalesce(ct.questions_first_week,0) as questions_first_week,
+    -- window statistics for benchmarking
+    avg(coalesce(ur.avg_adj_quality,0)) over () as global_avg_adj_quality,
+    stddev_pop(coalesce(ur.avg_adj_quality,0)) over () as global_std_adj_quality,
+    percent_rank() over (order by coalesce(ur.avg_adj_quality,0)) as pct_rank_adj_quality,
+    ntile(10) over (order by coalesce(urk.total_views,0) desc nulls last) as decile_total_views,
+    -- a composite engagement score
+    CAST(
+    (
+        coalesce(urk.total_views,0) / 100.0
+        + coalesce(urk.total_post_score,0) * 0.5
+        + coalesce(ub.badge_count,0) * 0.2
+        + coalesce(ucs.comment_count,0) * 0.05
+        + coalesce(ur.questions_count,0) * 0.3
+        + coalesce(urk.a_count,0) * 0.4
+        + 2 * coalesce(ar.accept_rate,0)
+        - ln(1 + greatest(0, coalesce(ur.dup_flagged_questions,0)))
+    ) AS numeric(18,4)) as engagement_score
+from user_rankings urk
+left join user_question_rollup ur on ur.user_id = urk.user_id
+left join user_badges ub on ub.user_id = urk.user_id
+left join user_comment_stats ucs on ucs.user_id = urk.user_id
+left join accepted_rate ar on ar.user_id = urk.user_id
+left join ctas ct on ct.user_id = urk.user_id
+where
+    -- complex predicate combining string, null, numeric logic
+    (
+        coalesce(urk.Reputation,0) >= 50
+        or (coalesce(ub.gold_count,0) + coalesce(ub.silver_count,0)) >= 3
+        or (coalesce(urk.q_count,0) + coalesce(urk.a_count,0)) >= 5
+    )
+    and (
+        urk.Location is null
+        or position('united' in lower(urk.Location)) > 0
+        or position('india' in lower(urk.Location)) > 0
+        or length(urk.Location) >= 3
+    )
+    and coalesce(urk.LastAccessDate, CAST('2024-10-01 12:34:56' AS timestamp)) >= urk.user_created
+    and (ar.accept_rate is null or ar.accept_rate >= 0)
+order by
+    engagement_score desc nulls last,
+    urk.r_views,
+    urk.r_score,
+    urk.r_badges
+limit 200;

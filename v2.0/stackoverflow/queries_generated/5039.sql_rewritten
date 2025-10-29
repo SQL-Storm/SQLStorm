@@ -1,0 +1,49 @@
+-- {"query": "5039.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 500} 
+SELECT
+    U.Id AS UserId,
+    U.DisplayName AS UserName,
+    U.Reputation,
+    COUNT(DISTINCT P.Id) AS PostCount,
+    SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsCount,
+    SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersCount,
+    AVG(P.Score) AS AvgPostScore,
+    MAX(P.LastActivityDate) AS LastActive,
+    -- Window function: rank users by total score within a 7-day rolling window from their CreationDate
+    SUM(P.Score) OVER (
+        ORDER BY U.CreationDate
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS CumulativeScore,
+    -- Correlated subquery: count unique tags used by user's questions, with string parsing
+    (
+        SELECT COUNT(DISTINCT TRIM(T.TagName))
+        FROM Posts AS Q
+        JOIN Tags AS T ON Q.Tags LIKE CONCAT('%<', T.TagName, '>%')
+        WHERE Q.OwnerUserId = U.Id
+          AND Q.PostTypeId = 1
+    ) AS UniqueQuestionTagsUsed,
+    -- Left join to compute number of linked posts across the network with non-null relations
+    COALESCE(LINKS.LinkedCount, 0) AS LinkedPostsCount
+FROM
+    Users U
+    LEFT JOIN Posts P ON P.OwnerUserId = U.Id
+    LEFT JOIN (
+        SELECT
+            P.OwnerUserId,
+            COUNT(*) AS LinkedCount
+        FROM
+            Posts P
+            JOIN PostLinks PL ON PL.PostId = P.Id
+        WHERE
+            PL.LinkTypeId IN (1, 3) -- Linked or Duplicate
+        GROUP BY
+            P.OwnerUserId
+    ) AS LINKS ON LINKS.OwnerUserId = U.Id
+WHERE
+    U.CreationDate >= DATEADD(year, -2, cast('2024-10-01 12:34:56' as timestamp)) -- benchmark window: last 2 years
+GROUP BY
+    U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate
+HAVING
+    AVG(CASE WHEN P.PostTypeId IN (1,2) THEN P.Score ELSE NULL END) > 0
+ORDER BY
+    CumulativeScore DESC
+OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY;

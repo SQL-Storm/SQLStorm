@@ -1,0 +1,229 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+        LAG(p.ViewCount) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_views
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) 
+),
+UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.ViewCount,
+        u.UpVotes,
+        u.DownVotes,
+        u.AccountId,
+        COUNT(DISTINCT r.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN r.PostTypeId = 1 THEN r.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN r.PostTypeId = 2 THEN r.Id END) as AnswerCount,
+        SUM(COALESCE(r.Score, 0)) as TotalScore,
+        AVG(COALESCE(r.Score, 0)) as AvgScore,
+        MAX(COALESCE(r.ViewCount, 0)) as MaxViews,
+        MIN(COALESCE(r.ViewCount, 0)) as MinViews,
+        STRING_AGG(COALESCE(r.Title, ''), ' | ') as AllTitles,
+        STRING_AGG(COALESCE(r.Tags, ''), ', ') as AllTags
+    FROM Users u
+    LEFT JOIN RankedPosts r ON u.Id = r.OwnerUserId
+    GROUP BY u.Id, u.Reputation, u.ViewCount, u.UpVotes, u.DownVotes, u.AccountId
+),
+PostsWithComments AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        COUNT(c.Id) as CommentCount,
+        STRING_AGG(c.Text, ' || ') as AllComments,
+        STRING_AGG(CASE WHEN c.UserId IS NOT NULL THEN u.DisplayName ELSE c.UserDisplayName END, ' && ') as CommentAuthors
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Users u ON c.UserId = u.Id
+    WHERE p.PostTypeId = 1 AND p.CreationDate >= DATE '2019-01-01'
+    GROUP BY p.Id, p.Title, p.Body, p.Score, p.ViewCount
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        t.ExcerptPostId,
+        COALESCE(p.ViewCount, 0) as ExcerptViews,
+        (SELECT COUNT(*) FROM Posts WHERE Tags LIKE '%' || t.TagName || '%') as RelatedPosts,
+        CASE 
+            WHEN t.Count > (SELECT AVG("Count") FROM Tags) THEN 'High'
+            WHEN t.Count > (SELECT AVG("Count") * 0.5 FROM Tags) THEN 'Medium'
+            ELSE 'Low'
+        END as TagPopularity
+    FROM Tags t
+    LEFT JOIN Posts p ON t.ExcerptPostId = p.Id
+),
+ComplexUserAnalysis AS (
+    SELECT 
+        us.UserId,
+        us.Reputation,
+        us.TotalPosts,
+        us.QuestionCount,
+        us.AnswerCount,
+        us.TotalScore,
+        us.AvgScore,
+        us.MaxViews,
+        us.MinViews,
+        us.AllTitles,
+        us.AllTags,
+        CASE 
+            WHEN us.TotalPosts > 100 AND us.AvgScore > 5 THEN 'HighlyActive'
+            WHEN us.TotalPosts > 50 AND us.AvgScore > 3 THEN 'Active'
+            WHEN us.TotalPosts > 20 AND us.AvgScore > 1 THEN 'Moderate'
+            ELSE 'Inactive'
+        END as ActivityLevel,
+        CASE 
+            WHEN us.Reputation > 10000 THEN 'Expert'
+            WHEN us.Reputation > 5000 THEN 'Advanced'
+            WHEN us.Reputation > 1000 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as RepLevel,
+        COALESCE(us.AllTitles, '') as TitlesWithNulls,
+        COALESCE(us.AllTags, '') as TagsWithNulls,
+        LENGTH(COALESCE(us.AllTitles, '')) as TitlesLength,
+        LENGTH(COALESCE(us.AllTags, '')) as TagsLength
+    FROM UserStats us
+),
+FinalAnalysis AS (
+    SELECT 
+        cua.UserId,
+        cua.Reputation,
+        cua.ActivityLevel,
+        cua.RepLevel,
+        cua.TotalPosts,
+        cua.QuestionCount,
+        cua.AnswerCount,
+        cua.TotalScore,
+        cua.AvgScore,
+        cua.MaxViews,
+        cua.MinViews,
+        cua.TitlesLength,
+        cua.TagsLength,
+        CASE 
+            WHEN cua.RepLevel = 'Expert' AND cua.TotalPosts > 50 THEN 'Elite'
+            WHEN cua.RepLevel IN ('Advanced', 'Expert') AND cua.TotalScore > 50 THEN 'TopContributor'
+            ELSE 'Regular'
+        END as UserTier,
+        CASE 
+            WHEN cua.RepLevel = 'Expert' AND cua.TotalPosts > 50 THEN 'Super User'
+            WHEN cua.RepLevel IN ('Advanced', 'Expert') AND cua.TotalScore > 50 THEN 'Power User'
+            ELSE 'Regular User'
+        END as UserRole,
+        ROW_NUMBER() OVER (ORDER BY cua.TotalScore DESC, cua.Reputation DESC) as RankByScore,
+        PERCENT_RANK() OVER (ORDER BY cua.TotalScore) as ScorePercentile,
+        cua.TitlesWithNulls,
+        cua.TagsWithNulls,
+        'User_' || cua.UserId || '_Analysis' as AnalysisLabel
+    FROM ComplexUserAnalysis cua
+    WHERE cua.TotalPosts > 0
+)
+SELECT 
+    fa.UserId,
+    fa.Reputation,
+    fa.ActivityLevel,
+    fa.RepLevel,
+    fa.TotalPosts,
+    fa.QuestionCount,
+    fa.AnswerCount,
+    fa.TotalScore,
+    fa.AvgScore,
+    fa.MaxViews,
+    fa.MinViews,
+    fa.TitlesLength,
+    fa.TagsLength,
+    fa.UserTier,
+    fa.UserRole,
+    fa.RankByScore,
+    fa.ScorePercentile,
+    fa.AnalysisLabel,
+    SUBSTRING(fa.TitlesWithNulls FROM 1 FOR 100) as ShortenedTitles,
+    SUBSTRING(fa.TagsWithNulls FROM 1 FOR 100) as ShortenedTags,
+    CASE 
+        WHEN fa.ScorePercentile > 0.8 THEN 'Top 20%'
+        WHEN fa.ScorePercentile > 0.6 THEN 'Top 40%'
+        WHEN fa.ScorePercentile > 0.4 THEN 'Top 60%'
+        ELSE 'Below Average'
+    END as PerformanceCategory,
+    COALESCE(
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = fa.UserId AND p.PostTypeId = 1),
+        0
+    ) as QuestionCountFromPostsTable,
+    COALESCE(
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = fa.UserId AND p.PostTypeId = 2),
+        0
+    ) as AnswerCountFromPostsTable,
+    COALESCE(
+        (SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = fa.UserId AND p.PostTypeId = 1),
+        0
+    ) as AvgQuestionScore,
+    COALESCE(
+        (SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = fa.UserId AND p.PostTypeId = 2),
+        0
+    ) as AvgAnswerScore,
+    CASE 
+        WHEN fa.Reputation > 10000 AND fa.AnswerCount > 50 THEN 'HighValueAnswerer'
+        WHEN fa.Reputation > 5000 AND fa.QuestionCount > 20 THEN 'QuestionMaster'
+        WHEN fa.Reputation > 1000 THEN 'Contributor'
+        ELSE 'NewUser'
+    END as ContributionType,
+    (CAST('2024-10-01' AS date) - DATE '2019-01-01') as DaysSinceSample,
+    COALESCE(
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = fa.UserId AND b.Date >= DATE '2020-01-01'),
+        0
+    ) as RecentBadgeCount,
+    CASE 
+        WHEN fa.AnswerCount > 0 AND fa.QuestionCount > 0 THEN CAST(fa.AnswerCount AS DOUBLE PRECISION) / NULLIF(fa.QuestionCount, 0)
+        ELSE 0
+    END as AnswerToQuestionRatio,
+    CASE 
+        WHEN fa.AnswerCount > 0 THEN CAST(fa.TotalScore / NULLIF(fa.AnswerCount, 0) AS DOUBLE PRECISION)
+        ELSE 0
+    END as AvgScorePerAnswer,
+    (SELECT COUNT(*) 
+     FROM Posts p1 
+     JOIN Posts p2 ON p1.ParentId = p2.Id 
+     WHERE p1.OwnerUserId = fa.UserId 
+     AND p2.OwnerUserId IN (
+         SELECT v2.UserId 
+         FROM Votes v 
+         JOIN Posts p ON v.PostId = p.Id 
+         JOIN Users u ON p.OwnerUserId = u.Id
+         WHERE v.VoteTypeId = 2 AND p.OwnerUserId = fa.UserId
+     )
+     AND p1.CreationDate >= DATE '2020-01-01'
+    ) as ConnectedQuestions,
+    CASE 
+        WHEN fa.TotalPosts > 100 AND fa.QuestionCount > 20 AND fa.AnswerCount > 50 THEN 'Veteran'
+        WHEN fa.TotalPosts > 50 AND fa.QuestionCount > 10 AND fa.AnswerCount > 25 THEN 'Experienced'
+        WHEN fa.TotalPosts > 10 AND fa.QuestionCount > 5 AND fa.AnswerCount > 10 THEN 'Intermediate'
+        ELSE 'Beginner'
+    END as ExperienceLevel,
+    (SELECT 
+        COALESCE(SUM(CASE WHEN Score > 0 THEN 1 ELSE 0 END), 0) 
+        FROM Posts p 
+        WHERE p.OwnerUserId = fa.UserId AND p.PostTypeId = 1
+    ) as PositiveQuestions,
+    (SELECT 
+        COALESCE(SUM(CASE WHEN Score > 0 THEN 1 ELSE 0 END), 0) 
+        FROM Posts p 
+        WHERE p.OwnerUserId = fa.UserId AND p.PostTypeId = 2
+    ) as PositiveAnswers
+FROM FinalAnalysis fa
+ORDER BY fa.RankByScore ASC
+LIMIT 10000;

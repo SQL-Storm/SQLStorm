@@ -1,0 +1,101 @@
+WITH TopQuestions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.ContentLicense,
+    u.Reputation,
+    u.DisplayName AS OwnerDisplayName,
+    u.AccountId,
+    ROW_NUMBER() OVER (
+      PARTITION BY CAST(p.CreationDate AS DATE)
+      ORDER BY p.Score DESC, p.ViewCount DESC, p.CreationDate ASC
+    ) AS DayRank
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId = 1
+    AND p.ClosedDate IS NULL
+    AND p.Tags IS NOT NULL
+),
+TagAggregates AS (
+  -- split tags like '<tag1><tag2>' into rows: tag1, tag2
+  SELECT
+    tg.TagName,
+    COUNT(*) AS QuestionCount,
+    AVG(tg.UsageCount) AS AvgTagUsage
+  FROM (
+    SELECT
+      t.Id,
+      TRIM(s.tag) AS TagName,
+      1 AS UsageCount
+    FROM Tags t
+    CROSS JOIN LATERAL (
+      -- replace PostgreSQL-specific functions with generic string processing where possible
+      -- assume tags stored like '<tag1><tag2>'
+      SELECT regexp_split AS tag
+      FROM (
+        SELECT regexp_split_to_table(
+          SUBSTRING(t.TagName FROM 2 FOR CHAR_LENGTH(t.TagName)-2),
+          '><'
+        ) AS regexp_split
+      ) s_inner
+    ) s
+  ) tg
+  GROUP BY tg.TagName
+),
+CommentStats AS (
+  SELECT
+    p.Id AS PostId,
+    COUNT(c.Id) AS CommentCount
+  FROM Posts p
+  LEFT JOIN Comments c ON c.PostId = p.Id
+  GROUP BY p.Id
+),
+RecentActivity AS (
+  SELECT
+    p.Id AS PostId,
+    MAX(v.CreationDate) AS LastVoteDate
+  FROM Posts p
+  LEFT JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId IN (2,3,16)
+  GROUP BY p.Id
+)
+SELECT
+  tq.PostId,
+  tq.Title,
+  tq.Tags,
+  tq.CreationDate,
+  tq.Score,
+  tq.ViewCount,
+  tq.OwnerDisplayName,
+  tq.Reputation,
+  COALESCE(tc.CommentCount, 0) AS CommentCount,
+  ra.LastVoteDate,
+  ta.QuestionCount,
+  ta.AvgTagUsage,
+  (CASE WHEN tq.Score > 100 THEN 'Hot' ELSE 'Normal' END) AS Bucketing,
+  (CASE WHEN tq.ViewCount > 10000 THEN CAST(1 AS BOOLEAN) ELSE CAST(0 AS BOOLEAN) END) AS HighView
+FROM TopQuestions tq
+LEFT JOIN CommentStats tc ON tc.PostId = tq.PostId
+LEFT JOIN RecentActivity ra ON ra.PostId = tq.PostId
+LEFT JOIN TagAggregates ta ON EXISTS (
+  SELECT 1
+  FROM (
+    SELECT regexp_split_to_table(
+      SUBSTRING(tq.Tags FROM 2 FOR CHAR_LENGTH(tq.Tags)-2),
+      '><'
+    ) AS tag
+  ) split_tags
+  WHERE split_tags.tag = ta.TagName
+)
+WHERE
+  tq.DayRank <= 5
+ORDER BY tq.CreationDate DESC
+LIMIT 200;

@@ -1,0 +1,237 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.ViewCount,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COALESCE(SUM(p.Score), 0) AS TotalScore,
+        COALESCE(SUM(p.ViewCount), 0) AS TotalViews,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(u.LastAccessDate) AS LastAccess,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags) - 2)), ', ') AS TagList,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN p.Id END) AS AcceptedQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.Score > 0 THEN p.Id END) AS HighScoreAnswers
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId 
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.ViewCount, u.UpVotes, u.DownVotes
+),
+Rankings AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        PostCount,
+        CommentCount,
+        BadgeCount,
+        QuestionCount,
+        AnswerCount,
+        TotalScore,
+        TotalViews,
+        LastPostDate,
+        LastAccess,
+        TagList,
+        AcceptedQuestions,
+        HighScoreAnswers,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, PostCount DESC) AS RepRank,
+        RANK() OVER (ORDER BY TotalScore DESC) AS ScoreRank,
+        DENSE_RANK() OVER (ORDER BY BadgeCount DESC) AS BadgeRank,
+        NTILE(4) OVER (ORDER BY PostCount DESC) AS PostQuartile,
+        LAG(DisplayName) OVER (ORDER BY Reputation DESC) AS PrevUser,
+        LEAD(DisplayName) OVER (ORDER BY Reputation DESC) AS NextUser,
+        AVG(Reputation) OVER (ORDER BY Reputation ROWS BETWEEN 10 PRECEDING AND 10 FOLLOWING) AS RepMovingAvg,
+        COUNT(*) OVER () AS TotalUsers
+    FROM UserStats
+),
+PerformanceMetrics AS (
+    SELECT 
+        r.UserId,
+        r.DisplayName,
+        r.Reputation,
+        r.PostCount,
+        r.CommentCount,
+        r.BadgeCount,
+        r.QuestionCount,
+        r.AnswerCount,
+        r.TotalScore,
+        r.TotalViews,
+        r.LastPostDate,
+        r.LastAccess,
+        r.TagList,
+        r.AcceptedQuestions,
+        r.HighScoreAnswers,
+        r.RepRank,
+        r.ScoreRank,
+        r.BadgeRank,
+        r.PostQuartile,
+        r.PrevUser,
+        r.NextUser,
+        r.RepMovingAvg,
+        r.TotalUsers,
+        CASE 
+            WHEN r.Reputation > 10000 THEN 'Veteran'
+            WHEN r.Reputation > 5000 THEN 'Experienced'
+            WHEN r.Reputation > 1000 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END AS UserLevel,
+        CASE 
+            WHEN r.PostCount > 500 THEN 'Highly Active'
+            WHEN r.PostCount > 200 THEN 'Active'
+            WHEN r.PostCount > 50 THEN 'Moderate'
+            ELSE 'Casual'
+        END AS ActivityLevel,
+        CASE 
+            WHEN r.BadgeCount > 100 THEN 'Elite'
+            WHEN r.BadgeCount > 50 THEN 'Experienced'
+            WHEN r.BadgeCount > 10 THEN 'Competent'
+            ELSE 'Novice'
+        END AS BadgeLevel,
+        (r.Reputation + r.TotalScore + r.TotalViews) / NULLIF(r.PostCount, 0) AS EfficiencyScore,
+        CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - COALESCE(r.LastPostDate, TIMESTAMP '1970-01-01')))/86400 AS BIGINT) AS DaysSinceLastPost,
+        CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - COALESCE(r.LastAccess, TIMESTAMP '1970-01-01')))/86400 AS BIGINT) AS DaysSinceLastAccess,
+        CASE 
+            WHEN r.BadgeCount > 0 AND r.QuestionCount = 0 THEN 'Non-Question User'
+            WHEN r.QuestionCount > 0 AND r.AnswerCount = 0 THEN 'Question-Only User'
+            WHEN r.QuestionCount > 0 AND r.AnswerCount > 0 THEN 'Question-Answer User'
+            ELSE 'Unknown'
+        END AS EngagementType
+    FROM Rankings r
+),
+ComplexQuery AS (
+    SELECT 
+        pm.UserId,
+        pm.DisplayName,
+        pm.Reputation,
+        pm.PostCount,
+        pm.CommentCount,
+        pm.BadgeCount,
+        pm.QuestionCount,
+        pm.AnswerCount,
+        pm.TotalScore,
+        pm.TotalViews,
+        pm.LastPostDate,
+        pm.LastAccess,
+        pm.TagList,
+        pm.AcceptedQuestions,
+        pm.HighScoreAnswers,
+        pm.RepRank,
+        pm.ScoreRank,
+        pm.BadgeRank,
+        pm.PostQuartile,
+        pm.PrevUser,
+        pm.NextUser,
+        pm.RepMovingAvg,
+        pm.TotalUsers,
+        pm.UserLevel,
+        pm.ActivityLevel,
+        pm.BadgeLevel,
+        pm.EfficiencyScore,
+        pm.DaysSinceLastPost,
+        pm.DaysSinceLastAccess,
+        pm.EngagementType,
+        TRIM(BOTH FROM UPPER(pm.TagList)) AS CleanTags,
+        SUBSTRING(pm.TagList FROM 1 FOR 50) AS First50Tags,
+        CHAR_LENGTH(pm.TagList) AS TagListLength,
+        REPLACE(pm.TagList, ' ', '') AS TagListNoSpaces,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = pm.UserId AND p.PostTypeId = 1 AND p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6 months')) AS RecentQuestions,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = pm.UserId AND p.PostTypeId = 2 AND p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6 months')) AS RecentAnswers,
+        (SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = pm.UserId AND p.PostTypeId = 1) AS AvgQuestionScore,
+        (SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = pm.UserId AND p.PostTypeId = 2) AS AvgAnswerScore,
+        CASE 
+            WHEN pm.Reputation > (SELECT AVG(u2.Reputation) FROM Users u2) THEN 'Above Average'
+            WHEN pm.Reputation < (SELECT AVG(u2.Reputation) FROM Users u2) THEN 'Below Average'
+            ELSE 'Average'
+        END AS RepComparison,
+        CASE 
+            WHEN pm.PostCount > (SELECT AVG(us.PostCount) FROM UserStats us) THEN 'Above Average Posts'
+            WHEN pm.PostCount < (SELECT AVG(us.PostCount) FROM UserStats us) THEN 'Below Average Posts'
+            ELSE 'Average Posts'
+        END AS PostComparison,
+        CASE 
+            WHEN pm.BadgeCount > (SELECT AVG(us.BadgeCount) FROM UserStats us) THEN 'Above Average Badges'
+            WHEN pm.BadgeCount < (SELECT AVG(us.BadgeCount) FROM UserStats us) THEN 'Below Average Badges'
+            ELSE 'Average Badges'
+        END AS BadgeComparison,
+        (pm.PostCount * pm.Reputation) + pm.TotalScore AS CompositeScore,
+        (pm.QuestionCount * pm.AnswerCount) AS QAPairScore,
+        LN(pm.TotalViews + 1) AS LogViews,
+        SQRT(pm.TotalScore) AS SqrtScore,
+        (pm.Reputation * pm.BadgeCount) / NULLIF(pm.PostCount, 0) AS ReputationToBadgeRatio
+    FROM PerformanceMetrics pm
+    WHERE pm.Reputation > 0
+)
+SELECT 
+    cq.UserId,
+    cq.DisplayName,
+    cq.Reputation,
+    cq.PostCount,
+    cq.CommentCount,
+    cq.BadgeCount,
+    cq.QuestionCount,
+    cq.AnswerCount,
+    cq.TotalScore,
+    cq.TotalViews,
+    cq.LastPostDate,
+    cq.LastAccess,
+    cq.TagList,
+    cq.AcceptedQuestions,
+    cq.HighScoreAnswers,
+    cq.RepRank,
+    cq.ScoreRank,
+    cq.BadgeRank,
+    cq.PostQuartile,
+    cq.PrevUser,
+    cq.NextUser,
+    cq.RepMovingAvg,
+    cq.TotalUsers,
+    cq.UserLevel,
+    cq.ActivityLevel,
+    cq.BadgeLevel,
+    cq.EfficiencyScore,
+    cq.DaysSinceLastPost,
+    cq.DaysSinceLastAccess,
+    cq.EngagementType,
+    cq.CleanTags,
+    cq.First50Tags,
+    cq.TagListLength,
+    cq.TagListNoSpaces,
+    cq.RecentQuestions,
+    cq.RecentAnswers,
+    cq.AvgQuestionScore,
+    cq.AvgAnswerScore,
+    cq.RepComparison,
+    cq.PostComparison,
+    cq.BadgeComparison,
+    cq.CompositeScore,
+    cq.QAPairScore,
+    cq.LogViews,
+    cq.SqrtScore,
+    cq.ReputationToBadgeRatio,
+    CASE 
+        WHEN cq.CompositeScore > (SELECT AVG(c2.CompositeScore) FROM ComplexQuery c2) THEN 1
+        ELSE 0
+    END AS AboveAvgComposite,
+    CASE 
+        WHEN cq.EfficiencyScore > (SELECT AVG(c2.EfficiencyScore) FROM ComplexQuery c2) THEN 1
+        ELSE 0
+    END AS AboveAvgEfficiency,
+    CASE 
+        WHEN cq.ReputationToBadgeRatio > (SELECT AVG(c2.ReputationToBadgeRatio) FROM ComplexQuery c2) THEN 1
+        ELSE 0
+    END AS AboveAvgRepBadgeRatio
+FROM ComplexQuery cq
+WHERE cq.Reputation BETWEEN 100 AND 100000
+    AND cq.PostCount > 0
+    AND cq.TagList IS NOT NULL
+    AND cq.TagList <> ''
+ORDER BY cq.CompositeScore DESC, cq.Reputation DESC, cq.EfficiencyScore DESC
+LIMIT 1000;

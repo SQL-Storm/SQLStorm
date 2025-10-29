@@ -1,0 +1,49 @@
+-- {"query": "6591.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-micro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 811} 
+
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id ELSE NULL END) AS TotalQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id ELSE NULL END) AS TotalAnswers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 3 THEN p.Id ELSE NULL END) AS TotalWikis,
+    SUM(p.Score) AS TotalScore,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN p.AnswerCount ELSE 0 END) AS TotalAnswersToQuestions,
+    SUM(v.BountyAmount) AS TotalBountyAmount,
+    MAX(u.LastAccessDate) AS LastAccess,
+    MIN(u.CreationDate) AS AccountCreated,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate ELSE NULL END) AS LastClosedPost,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.CreationDate ELSE NULL END) AS LastReopenedPost,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 12 THEN ph.CreationDate ELSE NULL END) AS LastDeletedPost,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 13 THEN ph.CreationDate ELSE NULL END) AS LastUndeletedPost,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 14 THEN ph.CreationDate ELSE NULL END) AS LastLockedPost,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 15 THEN ph.CreationDate ELSE NULL END) AS LastUnlockedPost,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 24 THEN ph.CreationDate ELSE NULL END) AS LastSuggestedEditApplied,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 101 THEN ph.CreationDate ELSE NULL END) AS LastDuplicateClose,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 102 THEN ph.CreationDate ELSE NULL END) AS LastOffTopicClose,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 103 THEN ph.CreationDate ELSE NULL END) AS LastNeedsDetailsClose,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 104 THEN ph.CreationDate ELSE NULL END) AS LastNeedsFocusClose,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 105 THEN ph.CreationDate ELSE NULL END) AS LastOpinionBasedClose,
+    COALESCE(SUM(CASE WHEN b.TagBased = 0 THEN 1 ELSE 0 END), 0) AS NamedBadges,
+    COALESCE(SUM(CASE WHEN b.TagBased = 1 THEN 1 ELSE 0 END), 0) AS TagBadges,
+    ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.LastActivityDate DESC) AS MostRecentActivity
+FROM 
+    Users u
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId AND v.VoteTypeId = 8
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+WHERE 
+    u.Reputation > 1000
+    AND p.CreationDate >= DATEADD(year, -5, GETDATE())
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation
+HAVING 
+    COUNT(DISTINCT p.Id) > 50
+ORDER BY 
+    TotalScore DESC, 
+    TotalPosts DESC;

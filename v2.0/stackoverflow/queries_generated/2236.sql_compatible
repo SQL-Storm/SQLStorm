@@ -1,0 +1,141 @@
+with UserBadgeCounts as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter(where b.Class = 1) as GoldBadges,
+        count(b.Id) filter(where b.Class = 2) as SilverBadges,
+        count(b.Id) filter(where b.Class = 3) as BronzeBadges,
+        row_number() over(partition by u.Id order by max(b.Date) desc) as LastBadgeRank
+    from 
+        Users u
+        left join Badges b on u.Id = b.UserId
+    group by u.Id, u.DisplayName
+),
+TopScoringPosts as (
+    select 
+        p.Id,
+        p.OwnerUserId,
+        p.Score,
+        p.CreationDate,
+        p.PostTypeId,
+        p.Title,
+        coalesce(p.Tags, '') as Tags,
+        u.DisplayName as OwnerDisplayName,
+        rank() over(partition by p.PostTypeId order by p.Score desc) as ScoreRank
+    from 
+        Posts p
+        left join Users u on p.OwnerUserId = u.Id
+    where 
+        p.Score > 50 and
+        p.PostTypeId in (1,2)
+),
+PostDetailsCTE as (
+    select
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        coalesce((select count(*) from Comments c where c.PostId = p.Id), 0) as CommentCount,
+        coalesce((select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 2),0) as UpvotesCount,
+        coalesce((select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 3),0) as DownvotesCount,
+        case 
+            when p.AcceptedAnswerId is not null then 1 
+            else 0 
+        end as HasAcceptedAnswer,
+        (
+            select ph_name.Name from (
+                select ph.PostId, ph.PostHistoryTypeId, ph.CreationDate
+                from PostHistory ph
+                where ph.PostId = p.Id
+                order by ph.CreationDate desc
+                limit 1
+            ) latest
+            join PostHistory ph2 on ph2.PostId = latest.PostId and ph2.PostHistoryTypeId = latest.PostHistoryTypeId and ph2.CreationDate = latest.CreationDate
+            join PostHistoryTypes ph_name on ph_name.Id = ph2.PostHistoryTypeId
+            limit 1
+        ) as LastHistoryTypeName
+    from 
+        Posts p
+        left join Users u on p.OwnerUserId = u.Id
+    where 
+        p.PostTypeId = 1 and p.ClosedDate is null
+),
+DuplicatesCTE as (
+    select
+        pl.PostId,
+        count(distinct pl.RelatedPostId) as DuplicateCount
+    from
+        PostLinks pl
+    where 
+        pl.LinkTypeId = 3
+    group by pl.PostId
+),
+QuestionRanks as (
+    select 
+        p.Id as QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        row_number() over (partition by date_trunc('month', p.CreationDate) order by p.Score desc, p.ViewCount desc) as MonthlyRank,
+        p.CreationDate
+    from 
+        Posts p
+        left join Users u on p.OwnerUserId = u.Id
+    where 
+        p.PostTypeId = 1
+), 
+BadgeSummary as (
+    select
+        b.UserId,
+        array_agg(distinct b.Name) over (partition by b.UserId) as BadgeNames,
+        count(*) over (partition by b.UserId) as BadgeCount
+    from Badges b
+)
+select
+    q.QuestionId,
+    q.Title,
+    q.Score,
+    q.ViewCount,
+    (length(coalesce(q.Tags, '')) - length(replace(coalesce(q.Tags, ''), '><', '')) + case when coalesce(q.Tags, '') = '' then 0 else 1 end) as TagCount,
+    q.OwnerName,
+    coalesce(d.DuplicateCount, 0) as DuplicateCount,
+    pdc.CommentCount,
+    pdc.UpvotesCount,
+    pdc.DownvotesCount,
+    pdc.HasAcceptedAnswer,
+    pdc.LastHistoryTypeName,
+    coalesce(ubc.GoldBadges, 0) as GoldBadges,
+    coalesce(ubc.SilverBadges, 0) as SilverBadges,
+    coalesce(ubc.BronzeBadges, 0) as BronzeBadges,
+    coalesce(bs.BadgeCount, 0) as BadgeCount,
+    case when q.MonthlyRank <= 10 then 'Top 10' else 'Other' end as PopularityCategory,
+    concat(
+        left(coalesce(q.Title, ''), 30),
+        case when length(coalesce(q.Title, '')) > 30 then '...' else '' end
+    ) as ShortTitle,
+    case 
+        when q.ViewCount > 10000 and q.Score > 100 then 'Hot Question'
+        when q.ViewCount > 5000 then 'Warm Question'
+        else 'Normal Question' 
+    end as QuestionHeatStatus
+from
+    QuestionRanks q
+    left join DuplicatesCTE d on q.QuestionId = d.PostId
+    left join PostDetailsCTE pdc on q.QuestionId = pdc.Id
+    left join UserBadgeCounts ubc on q.OwnerUserId = ubc.UserId
+    left join BadgeSummary bs on q.OwnerUserId = bs.UserId
+where
+    (q.Score > 75 or q.ViewCount > 8000)
+    and (coalesce(ubc.GoldBadges,0) + coalesce(ubc.SilverBadges,0) + coalesce(ubc.BronzeBadges,0)) > 0
+order by
+    q.CreationDate desc,
+    q.Score desc,
+    q.ViewCount desc
+limit 100;

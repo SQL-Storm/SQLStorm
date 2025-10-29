@@ -1,0 +1,129 @@
+WITH UserStats AS (
+    SELECT u.Id,
+           u.DisplayName,
+           u.Reputation,
+           COALESCE(pcnt.PostCount, 0) AS PostCount,
+           COALESCE(vcnt.UpVotes, 0) AS UpVoteCount,
+           COALESCE(bcnt.Gold, 0) AS GoldBadges,
+           COALESCE(bcnt.Silver, 0) AS SilverBadges,
+           COALESCE(bcnt.Bronze, 0) AS BronzeBadges,
+           ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank
+    FROM Users u
+    LEFT JOIN (
+        SELECT OwnerUserId, COUNT(*) AS PostCount
+        FROM Posts
+        WHERE OwnerUserId IS NOT NULL
+        GROUP BY OwnerUserId
+    ) pcnt ON pcnt.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT v.UserId,
+               SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes
+        FROM Votes v
+        JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+        WHERE v.UserId IS NOT NULL
+        GROUP BY v.UserId
+    ) vcnt ON vcnt.UserId = u.Id
+    LEFT JOIN (
+        SELECT b.UserId,
+               SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS Gold,
+               SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS Silver,
+               SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS Bronze
+        FROM Badges b
+        GROUP BY b.UserId
+    ) bcnt ON bcnt.UserId = u.Id
+),
+RecentActivity AS (
+    SELECT u.Id,
+           GREATEST(
+               COALESCE(MAX(p.CreationDate), TIMESTAMP '1970-01-01'),
+               COALESCE(MAX(c.CreationDate), TIMESTAMP '1970-01-01')
+           ) AS LastActivity
+    FROM Users u
+    LEFT JOIN Posts p    ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId      = u.Id
+    GROUP BY u.Id
+),
+TagUsage AS (
+    SELECT t.Id      AS TagId,
+           t.TagName,
+           t.Count    AS GlobalTagCount,
+           SUM(
+               CASE WHEN p.Tags IS NOT NULL
+                    THEN array_length(string_to_array(trim(both '<>' FROM p.Tags), '><'), 1)
+               ELSE 0 END
+           ) AS QuestionTagOccurrences
+    FROM Tags t
+    LEFT JOIN Posts p
+           ON p.PostTypeId = 1
+          AND p.Tags LIKE '%' || t.TagName || '%'
+    GROUP BY t.Id, t.TagName, t.Count
+),
+TopQuestions AS (
+    SELECT q.Id,
+           q.Title,
+           q.Score,
+           q.ViewCount,
+           q.CreationDate,
+           q.OwnerUserId,
+           ROW_NUMBER() OVER (PARTITION BY q.OwnerUserId ORDER BY q.Score DESC, q.CreationDate DESC) AS RankInUser,
+           LAG(q.Score) OVER (PARTITION BY q.OwnerUserId ORDER BY q.CreationDate) AS PrevScore
+    FROM Posts q
+    WHERE q.PostTypeId = 1
+)
+SELECT us.Id,
+       us.DisplayName,
+       us.Reputation,
+       us.RepRank,
+       us.PostCount,
+       us.UpVoteCount,
+       us.GoldBadges,
+       us.SilverBadges,
+       us.BronzeBadges,
+       ra.LastActivity,
+       COALESCE(tu.QuestionTagOccurrences, 0) AS TagQuestionOccurrences,
+       tq.Title                               AS TopQuestionTitle,
+       tq.Score                               AS TopQuestionScore,
+       (tq.Score - COALESCE(tq.PrevScore, 0))  AS ScoreDeltaFromPrev
+FROM UserStats us
+LEFT JOIN RecentActivity ra ON ra.Id = us.Id
+LEFT JOIN TagUsage tu
+       ON tu.TagId = (
+           SELECT t.Id
+           FROM Tags t
+           WHERE t.TagName = (
+                 SELECT split_part(split_part(us.DisplayName, ' ', 1), '-', 1)
+           )
+           LIMIT 1
+       )
+LEFT JOIN TopQuestions tq
+       ON tq.Id = (
+           SELECT qsub.Id
+           FROM TopQuestions qsub
+           WHERE qsub.OwnerUserId = us.Id
+             AND qsub.RankInUser = 1
+           ORDER BY qsub.Score DESC
+           LIMIT 1
+       )
+WHERE us.Reputation > 1000
+  AND ra.LastActivity > CAST('2024-10-01' AS date) - INTERVAL '180' DAY
+  AND (tq.Score IS NOT NULL OR tu.QuestionTagOccurrences > 0)
+
+UNION ALL
+
+SELECT NULL AS Id,
+       'Aggregated Totals' AS DisplayName,
+       SUM(us.Reputation) AS Reputation,
+       NULL AS RepRank,
+       SUM(us.PostCount) AS PostCount,
+       SUM(us.UpVoteCount) AS UpVoteCount,
+       SUM(us.GoldBadges) AS GoldBadges,
+       SUM(us.SilverBadges) AS SilverBadges,
+       SUM(us.BronzeBadges) AS BronzeBadges,
+       NULL AS LastActivity,
+       NULL AS TagQuestionOccurrences,
+       NULL AS TopQuestionTitle,
+       NULL AS TopQuestionScore,
+       NULL AS ScoreDeltaFromPrev
+FROM UserStats us
+WHERE us.RepRank <= 100
+ORDER BY 2 NULLS LAST, 1;

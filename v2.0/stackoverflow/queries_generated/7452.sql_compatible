@@ -1,0 +1,263 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT c.Id) as Comments,
+        COUNT(DISTINCT b.Id) as Badges,
+        MAX(p.CreationDate) as LastPostDate,
+        RANK() OVER (ORDER BY u.Reputation DESC) as ReputationRank,
+        DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) as PostActivityRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= TIMESTAMP '2010-01-01 00:00:00'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostComplexity AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.ParentId,
+        p.PostTypeId,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags != '' THEN 
+                (LENGTH(p.Tags) - LENGTH(REPLACE(p.Tags, '<', ''))) / 2
+            ELSE 0 
+        END as TagCount,
+        CASE 
+            WHEN p.Body IS NOT NULL THEN LENGTH(p.Body)
+            ELSE 0 
+        END as BodyLength,
+        CASE 
+            WHEN p.Title IS NOT NULL THEN LENGTH(p.Title)
+            ELSE 0 
+        END as TitleLength,
+        EXTRACT(EPOCH FROM (COALESCE(p.LastEditDate, p.CreationDate) - p.CreationDate))::BIGINT as AgeInSeconds,
+        CASE 
+            WHEN p.Score > 100 THEN 'HighlyVoted'
+            WHEN p.Score > 10 THEN 'ModeratelyVoted'
+            WHEN p.Score > 0 THEN 'SlightlyVoted'
+            ELSE 'ZeroOrNegative'
+        END as VoteCategory,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as PostSequence
+    FROM Posts p
+    WHERE p.CreationDate >= TIMESTAMP '2015-01-01 00:00:00' AND p.PostTypeId IN (1, 2)
+),
+UserPostAggregation AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.TotalPosts,
+        uas.Questions,
+        uas.Answers,
+        uas.Comments,
+        uas.Badges,
+        uas.ReputationRank,
+        uas.PostActivityRank,
+        AVG(pcs.Score) as AvgScore,
+        AVG(pcs.ViewCount) as AvgViews,
+        AVG(pcs.AnswerCount) as AvgAnswers,
+        AVG(pcs.CommentCount) as AvgComments,
+        MAX(pcs.TagCount) as MaxTags,
+        MAX(pcs.BodyLength) as MaxBodyLength,
+        AVG(pcs.AgeInSeconds) as AvgAgeSeconds,
+        COUNT(CASE WHEN pcs.VoteCategory = 'HighlyVoted' THEN 1 END) as HighlyVotedPosts,
+        COUNT(CASE WHEN pcs.VoteCategory = 'ModeratelyVoted' THEN 1 END) as ModeratelyVotedPosts,
+        COUNT(CASE WHEN pcs.VoteCategory = 'SlightlyVoted' THEN 1 END) as SlightlyVotedPosts,
+        COUNT(CASE WHEN pcs.VoteCategory = 'ZeroOrNegative' THEN 1 END) as ZeroOrNegativePosts
+    FROM UserActivityStats uas
+    LEFT JOIN PostComplexity pcs ON uas.UserId = pcs.OwnerUserId
+    GROUP BY uas.UserId, uas.DisplayName, uas.Reputation, uas.TotalPosts, uas.Questions, uas.Answers, uas.Comments, uas.Badges, uas.ReputationRank, uas.PostActivityRank
+),
+TopUsers AS (
+    SELECT 
+        upa.*,
+        CASE 
+            WHEN TotalPosts > 1000 THEN 'Elite'
+            WHEN TotalPosts > 500 THEN 'Veteran'
+            WHEN TotalPosts > 100 THEN 'Experienced'
+            WHEN TotalPosts > 10 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as UserLevel,
+        CASE 
+            WHEN AvgScore > 50 THEN 'HighlyActive'
+            WHEN AvgScore > 20 THEN 'Active'
+            WHEN AvgScore > 5 THEN 'Moderate'
+            ELSE 'LowActivity'
+        END as ActivityLevel
+    FROM UserPostAggregation upa
+    WHERE TotalPosts > 10
+),
+PostAnalysis AS (
+    SELECT 
+        pa.UserId,
+        pa.DisplayName,
+        pa.Reputation,
+        pa.TotalPosts,
+        pa.AvgScore,
+        pa.AvgViews,
+        pa.AvgAnswers,
+        pa.AvgComments,
+        pa.MaxTags,
+        pa.MaxBodyLength,
+        pa.HighlyVotedPosts,
+        pa.ModeratelyVotedPosts,
+        pa.SlightlyVotedPosts,
+        pa.ZeroOrNegativePosts,
+        pa.UserLevel,
+        pa.ActivityLevel,
+        ROW_NUMBER() OVER (PARTITION BY pa.UserLevel ORDER BY pa.Reputation DESC) as RankWithinLevel,
+        PERCENT_RANK() OVER (ORDER BY pa.Reputation) as ReputationPercentile,
+        NTILE(4) OVER (ORDER BY pa.AvgScore) as ScoreQuartile,
+        CASE 
+            WHEN pa.AvgScore > 1000 THEN 'Legend'
+            WHEN pa.AvgScore > 500 THEN 'Master'
+            WHEN pa.AvgScore > 100 THEN 'Expert'
+            WHEN pa.AvgScore > 50 THEN 'Advanced'
+            ELSE 'Regular'
+        END as ContributorTier
+    FROM TopUsers pa
+),
+QualityMetrics AS (
+    SELECT 
+        pa.UserId,
+        pa.DisplayName,
+        pa.Reputation,
+        pa.TotalPosts,
+        pa.AvgScore,
+        pa.AvgViews,
+        pa.AvgAnswers,
+        pa.AvgComments,
+        pa.MaxTags,
+        pa.MaxBodyLength,
+        pa.HighlyVotedPosts,
+        pa.ModeratelyVotedPosts,
+        pa.SlightlyVotedPosts,
+        pa.ZeroOrNegativePosts,
+        pa.UserLevel,
+        pa.ActivityLevel,
+        pa.RankWithinLevel,
+        pa.ReputationPercentile,
+        pa.ScoreQuartile,
+        pa.ContributorTier,
+        CASE 
+            WHEN pa.HighlyVotedPosts > 0 AND pa.AvgScore > 100 THEN 'Exceptional'
+            WHEN pa.AvgScore > 50 AND pa.TotalPosts > 100 THEN 'Strong'
+            WHEN pa.AvgScore > 20 THEN 'Competent'
+            WHEN pa.AvgScore > 0 THEN 'Novice'
+            ELSE 'Struggling'
+        END as PerformanceRating,
+        CASE 
+            WHEN pa.UserLevel = 'Elite' AND pa.ContributorTier = 'Legend' THEN 'Ultra'
+            WHEN pa.UserLevel IN ('Veteran', 'Experienced') AND pa.ContributorTier IN ('Master', 'Expert') THEN 'Pro'
+            WHEN pa.UserLevel IN ('Intermediate', 'Beginner') THEN 'Amateur'
+            ELSE 'Newbie'
+        END as StatusLevel
+    FROM PostAnalysis pa
+),
+AdvancedUserAnalysis AS (
+    SELECT 
+        qm.UserId,
+        qm.DisplayName,
+        qm.Reputation,
+        qm.TotalPosts,
+        qm.AvgScore,
+        qm.AvgViews,
+        qm.AvgAnswers,
+        qm.AvgComments,
+        qm.MaxTags,
+        qm.MaxBodyLength,
+        qm.HighlyVotedPosts,
+        qm.ModeratelyVotedPosts,
+        qm.SlightlyVotedPosts,
+        qm.ZeroOrNegativePosts,
+        qm.UserLevel,
+        qm.ActivityLevel,
+        qm.RankWithinLevel,
+        qm.ReputationPercentile,
+        qm.ScoreQuartile,
+        qm.ContributorTier,
+        qm.PerformanceRating,
+        qm.StatusLevel,
+        DENSE_RANK() OVER (ORDER BY qm.TotalPosts, qm.AvgScore DESC) as OverallRank,
+        NTILE(5) OVER (ORDER BY qm.AvgScore) as ScoreDistribution,
+        CASE 
+            WHEN qm.Reputation > 10000 AND qm.TotalPosts > 500 THEN 'PowerUser'
+            WHEN qm.Reputation > 5000 AND qm.TotalPosts > 200 THEN 'ActiveUser'
+            WHEN qm.Reputation > 1000 AND qm.TotalPosts > 50 THEN 'Contributor'
+            WHEN qm.Reputation > 500 THEN 'RegularUser'
+            ELSE 'CasualUser'
+        END as UserCategory
+    FROM QualityMetrics qm
+)
+SELECT 
+    aua.UserId,
+    aua.DisplayName,
+    aua.Reputation,
+    aua.TotalPosts,
+    aua.AvgScore,
+    aua.AvgViews,
+    aua.AvgAnswers,
+    aua.AvgComments,
+    aua.MaxTags,
+    aua.MaxBodyLength,
+    aua.HighlyVotedPosts,
+    aua.ModeratelyVotedPosts,
+    aua.SlightlyVotedPosts,
+    aua.ZeroOrNegativePosts,
+    aua.UserLevel,
+    aua.ActivityLevel,
+    aua.RankWithinLevel,
+    aua.ReputationPercentile,
+    aua.ScoreQuartile,
+    aua.ContributorTier,
+    aua.PerformanceRating,
+    aua.StatusLevel,
+    aua.OverallRank,
+    aua.ScoreDistribution,
+    aua.UserCategory,
+    CASE 
+        WHEN (aua.HighlyVotedPosts + aua.ModeratelyVotedPosts) > (aua.TotalPosts * 0.3) THEN 'HighEngagement'
+        WHEN (aua.HighlyVotedPosts + aua.ModeratelyVotedPosts) > (aua.TotalPosts * 0.1) THEN 'MediumEngagement'
+        WHEN (aua.HighlyVotedPosts + aua.ModeratelyVotedPosts) > (aua.TotalPosts * 0.05) THEN 'LowEngagement'
+        ELSE 'PoorEngagement'
+    END as EngagementStatus,
+    CASE 
+        WHEN aua.AvgScore > 100 THEN 100 - (100 * (1 / (1 + EXP(-0.05 * (aua.AvgScore - 100)))))
+        WHEN aua.AvgScore > 50 THEN 50 - (50 * (1 / (1 + EXP(-0.1 * (aua.AvgScore - 50)))))
+        ELSE 0
+    END as EngagementScore,
+    CASE 
+        WHEN aua.Reputation > 10000 THEN 1.5
+        WHEN aua.Reputation > 5000 THEN 1.2
+        WHEN aua.Reputation > 1000 THEN 1.0
+        WHEN aua.Reputation > 500 THEN 0.8
+        ELSE 0.5
+    END as ReputationMultiplier,
+    ROUND((aua.ScoreQuartile + aua.ReputationPercentile + aua.RankWithinLevel) / 3.0, 2) as CompositeScore,
+    CAST(LENGTH(aua.DisplayName) AS FLOAT) / 10 as NameComplexityFactor,
+    (aua.AvgScore * aua.ReputationMultiplier * 0.1) / (aua.Reputation / 10000 + 1) as AdjustedContribution,
+    ROW_NUMBER() OVER (ORDER BY aua.Reputation DESC, aua.TotalPosts DESC) as RankingOrder,
+    COUNT(*) OVER () as TotalUsers
+FROM AdvancedUserAnalysis aua
+WHERE aua.TotalPosts >= 50 
+    AND aua.Reputation > 1000
+    AND aua.UserCategory IN ('PowerUser', 'ActiveUser', 'Contributor')
+    AND (aua.PerformanceRating IN ('Exceptional', 'Strong') OR aua.ScoreDistribution >= 3)
+ORDER BY aua.Reputation DESC, aua.OverallRank ASC;

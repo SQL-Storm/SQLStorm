@@ -1,0 +1,193 @@
+with RecursiveTagCounts as (
+    select
+        t.Id as TagId,
+        t.TagName,
+        t.Count,
+        p.Id as PostId,
+        p.Score,
+        p.CreationDate,
+        u.Id as OwnerUserId,
+        u.DisplayName,
+        u.Reputation,
+        row_number() over (partition by t.Id order by p.Score desc) as rn
+    from Tags t
+    inner join Posts p on p.PostTypeId = 1 and p.Tags like '%' || '<' || t.TagName || '>' || '%'
+    left join Users u on u.Id = p.OwnerUserId
+    where coalesce(t.IsModeratorOnly, false) = false and coalesce(t.IsRequired, false) = false
+),
+FilteredPosts as (
+    select rt.TagId, rt.TagName, rt.PostId, rt.Score, rt.CreationDate, rt.OwnerUserId, rt.DisplayName, rt.Reputation
+    from RecursiveTagCounts rt
+    where rt.rn <= 5
+),
+UserBadges as (
+    select
+        b.UserId,
+        b.Name,
+        count(*) as BadgeCount,
+        max(b.Date) as LastBadgeDate,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges
+    from Badges b
+    group by b.UserId, b.Name
+),
+UserRecentVotes as (
+    select
+        v.UserId,
+        v.PostId,
+        v.VoteTypeId,
+        v.CreationDate,
+        count(*) over (partition by v.UserId, v.VoteTypeId order by v.CreationDate rows between 29 preceding and current row) as RollingVotesLast30Days
+    from Votes v
+    where v.CreationDate >= cast('2024-10-01' as date) - interval '60' day
+),
+UserSummaries as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        coalesce(sum(p.Score),0) as TotalPostScore,
+        coalesce(sum(case when p.PostTypeId = 1 then 1 else 0 end),0) as QuestionCount,
+        coalesce(sum(case when p.PostTypeId = 2 then 1 else 0 end),0) as AnswerCount,
+        coalesce(sum(distinctBadgeCounts.GoldBadges),0) as GoldBadges,
+        coalesce(sum(distinctBadgeCounts.SilverBadges),0) as SilverBadges,
+        coalesce(sum(distinctBadgeCounts.BronzeBadges),0) as BronzeBadges,
+        max(p.CreationDate) as LastPostDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join (
+        select UserId, sum(GoldBadges) as GoldBadges, sum(SilverBadges) as SilverBadges, sum(BronzeBadges) as BronzeBadges
+        from UserBadges
+        group by UserId
+    ) distinctBadgeCounts on distinctBadgeCounts.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+),
+HighImpactAnswers as (
+    select 
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId,
+        a.Score,
+        a.CreationDate,
+        q.Tags,
+        q.Title,
+        dense_rank() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts a
+    inner join Posts q on q.Id = a.ParentId and q.PostTypeId = 1
+    where a.PostTypeId = 2
+),
+AnswerCommentsStats as (
+    select 
+        c.PostId as AnswerId,
+        count(c.Id) as CommentCount,
+        avg(char_length(c.Text)) as AvgCommentLength,
+        max(c.CreationDate) as LastCommentDate
+    from Comments c
+    group by c.PostId
+),
+QuestionCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReasonName,
+        max(ph.CreationDate) as CloseDate
+    from PostHistory ph
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where ph.PostHistoryTypeId = 10
+    group by ph.PostId, crt.Name
+),
+UserActivityWindows as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.CreationDate,
+        lag(p.CreationDate) over (partition by u.Id order by p.CreationDate) as PrevPostDate,
+        lead(p.CreationDate) over (partition by u.Id order by p.CreationDate) as NextPostDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    where p.CreationDate between u.CreationDate and cast('2024-10-01 12:34:56' as timestamp)
+)
+select
+    fp.TagName,
+    fp.PostId,
+    fp.Score as PostScore,
+    fp.CreationDate as PostCreationDate,
+    coalesce(us.DisplayName, 'Anonymous') as OwnerName,
+    us.Reputation as OwnerReputation,
+    us.TotalPostScore,
+    us.QuestionCount,
+    us.AnswerCount,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    ha.AnswerId,
+    ha.Score as AnswerScore,
+    ha.AnswerRank,
+    acs.CommentCount as AnswerCommentCount,
+    acs.AvgCommentLength as AnswerAvgCommentLength,
+    qcr.CloseReasonName,
+    qcr.CloseDate,
+    ua.PrevPostDate,
+    ua.NextPostDate,
+    case
+        when fp.Score > 10 and us.Reputation > 1000 then 'High Quality'
+        when fp.Score between 5 and 10 then 'Moderate Quality'
+        else 'Low Quality'
+    end as PostQualityCategory,
+    substring(fp.TagName from 1 for 3) || '-' || cast(fp.PostId as varchar) as TagPostCode,
+    coalesce(ub.BadgeCount,0) as UserBadgeCount,
+    coalesce(rv.RollingVotesLast30Days,0) as RecentUserVotes
+from FilteredPosts fp
+left join UserSummaries us on us.UserId = fp.OwnerUserId
+left join HighImpactAnswers ha on ha.QuestionId = fp.PostId and ha.AnswerRank = 1
+left join AnswerCommentsStats acs on acs.AnswerId = ha.AnswerId
+left join QuestionCloseReasons qcr on qcr.PostId = fp.PostId
+left join UserActivityWindows ua on ua.UserId = fp.OwnerUserId and ua.PostId = fp.PostId
+left join (
+    select UserId, count(*) as BadgeCount
+    from Badges
+    where Date > cast('2024-10-01' as date) - interval '1' year
+    group by UserId
+) ub on ub.UserId = fp.OwnerUserId
+left join UserRecentVotes rv on rv.UserId = fp.OwnerUserId and rv.VoteTypeId = 2
+where fp.Score is not null
+  and (qcr.CloseReasonName is null or qcr.CloseDate > cast('2024-10-01' as date) - interval '30' day)
+union
+select
+    'Orphan' as TagName,
+    p.Id as PostId,
+    p.Score,
+    p.CreationDate,
+    coalesce(u.DisplayName, 'DeletedUser') as DisplayName,
+    u.Reputation,
+    0 as TotalPostScore,
+    0 as QuestionCount,
+    0 as AnswerCount,
+    0 as GoldBadges,
+    0 as SilverBadges,
+    0 as BronzeBadges,
+    null as AnswerId,
+    null as AnswerScore,
+    null as AnswerRank,
+    null as AnswerCommentCount,
+    null as AnswerAvgCommentLength,
+    null as CloseReasonName,
+    null as CloseDate,
+    null as PrevPostDate,
+    null as NextPostDate,
+    'Orphan' as PostQualityCategory,
+    'ORP-' || cast(p.Id as varchar) as TagPostCode,
+    0 as UserBadgeCount,
+    0 as RecentUserVotes
+from Posts p
+left join Users u on u.Id = p.OwnerUserId
+where p.PostTypeId = 1
+  and not exists (
+    select 1 from Tags t where p.Tags like '%' || '<' || t.TagName || '>' || '%'
+  )
+order by TagName, PostScore desc
+limit 100;

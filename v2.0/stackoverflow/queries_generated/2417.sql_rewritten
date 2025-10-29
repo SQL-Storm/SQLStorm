@@ -1,0 +1,163 @@
+-- {"query": "2417.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1372} 
+with RecursiveUserActivity as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate as PostCreationDate,
+        row_number() over (partition by u.Id order by p.CreationDate desc) as PostRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    where u.Reputation > 1000
+), BadgeCounts as (
+    select 
+        b.UserId,
+        count(case when b.Class = 1 then 1 end) as GoldBadges,
+        count(case when b.Class = 2 then 1 end) as SilverBadges,
+        count(case when b.Class = 3 then 1 end) as BronzeBadges,
+        sum(case when b.TagBased = 1 then 1 else 0 end) as TagBasedBadges
+    from Badges b
+    group by b.UserId
+), RecentCommentsOnUserPosts as (
+    select
+        c.Id as CommentId,
+        c.PostId,
+        c.UserId as CommenterUserId,
+        c.CreationDate as CommentDate,
+        c.Text,
+        p.OwnerUserId as PostOwnerUserId
+    from Comments c
+    inner join Posts p on p.Id = c.PostId
+    where c.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '30 days'
+), UserPostLinkDuplicates as (
+    select 
+        pl.PostId,
+        pl.RelatedPostId,
+        u.Id as UserId,
+        count(*) over (partition by u.Id) as DuplicateLinkCount
+    from PostLinks pl
+    inner join Posts p1 on p1.Id = pl.PostId
+    inner join Posts p2 on p2.Id = pl.RelatedPostId
+    inner join Users u on u.Id = p1.OwnerUserId
+    where pl.LinkTypeId = 3 -- Duplicate link type
+), PostHistorySummary as (
+    select 
+        ph.PostId,
+        ph.UserId,
+        count(*) filter (where ph.PostHistoryTypeId = 10) as ClosedCount,
+        count(*) filter (where ph.PostHistoryTypeId = 11) as ReopenedCount,
+        count(distinct ph.PostHistoryTypeId) as DistinctHistoryEvents
+    from PostHistory ph
+    group by ph.PostId, ph.UserId
+), PostScoreStats as (
+    select
+        PostTypeId,
+        percentile_cont(0.5) within group (order by Score) as MedianScore,
+        avg(Score) as AvgScore,
+        count(*) as PostCount
+    from Posts
+    group by PostTypeId
+), ComplexUserAnalysis as (
+    select
+        r.UserId,
+        r.DisplayName,
+        r.Reputation,
+        bc.GoldBadges,
+        bc.SilverBadges,
+        bc.BronzeBadges,
+        bc.TagBasedBadges,
+        r.PostCount,
+        r.AvgScore,
+        r.MedianScore,
+        coalesce(ul.DuplicateLinkCount, 0) as DuplicateLinks,
+        phs.ClosedCount,
+        phs.ReopenedCount,
+        phs.DistinctHistoryEvents,
+        rc.CommentCountLast30Days,
+        case 
+            when r.Reputation > 10000 then 'HighReputation'
+            when r.Reputation between 5000 and 10000 then 'MediumReputation'
+            else 'LowReputation' 
+        end as ReputationCategory
+    from (
+        select
+            ua.UserId,
+            ua.DisplayName,
+            ua.Reputation,
+            ps.PostCount,
+            ps.AvgScore,
+            ps.MedianScore
+        from (
+            select UserId, DisplayName, Reputation from Users where Reputation > 1000
+        ) ua
+        left join (
+            select OwnerUserId as UserId, count(*) as PostCount, avg(Score) as AvgScore, percentile_cont(0.5) within group (order by Score) as MedianScore
+            from Posts
+            group by OwnerUserId
+        ) ps on ps.UserId = ua.UserId
+    ) r
+    left join BadgeCounts bc on bc.UserId = r.UserId
+    left join (
+        select UserId, max(DuplicateLinkCount) as DuplicateLinkCount 
+        from UserPostLinkDuplicates group by UserId
+    ) ul on ul.UserId = r.UserId
+    left join PostHistorySummary phs on phs.UserId = r.UserId
+    left join (
+        select PostOwnerUserId as UserId, count(*) as CommentCountLast30Days
+        from RecentCommentsOnUserPosts group by PostOwnerUserId
+    ) rc on rc.UserId = r.UserId
+)
+select 
+    cua.UserId,
+    cua.DisplayName,
+    cua.Reputation,
+    cua.GoldBadges,
+    cua.SilverBadges,
+    cua.BronzeBadges,
+    cua.TagBasedBadges,
+    cua.PostCount,
+    cua.AvgScore,
+    cua.MedianScore,
+    cua.DuplicateLinks,
+    cua.ClosedCount,
+    cua.ReopenedCount,
+    cua.DistinctHistoryEvents,
+    cua.CommentCountLast30Days,
+    cua.ReputationCategory,
+    string_agg(distinct t.TagName, ', ') as TopTags
+from ComplexUserAnalysis cua
+left join (
+    select ut.UserId, t.TagName
+    from Posts p
+    join unnest(string_to_array(trim(both '<>' from p.Tags), '><')) as tag_name on true
+    join Tags t on t.TagName = tag_name
+    join Users ut on ut.Id = p.OwnerUserId
+    group by ut.UserId, t.TagName
+    order by count(*) desc
+    limit 5
+) t on t.UserId = cua.UserId
+where cua.PostCount > 5 and cua.AvgScore is not null
+group by 
+    cua.UserId,
+    cua.DisplayName,
+    cua.Reputation,
+    cua.GoldBadges,
+    cua.SilverBadges,
+    cua.BronzeBadges,
+    cua.TagBasedBadges,
+    cua.PostCount,
+    cua.AvgScore,
+    cua.MedianScore,
+    cua.DuplicateLinks,
+    cua.ClosedCount,
+    cua.ReopenedCount,
+    cua.DistinctHistoryEvents,
+    cua.CommentCountLast30Days,
+    cua.ReputationCategory
+order by cua.Reputation desc, cua.PostCount desc
+limit 100;

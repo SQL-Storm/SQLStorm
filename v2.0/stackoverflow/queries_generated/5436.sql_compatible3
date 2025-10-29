@@ -1,0 +1,190 @@
+WITH
+EarlyPosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.LastActivityDate,
+    p.AcceptedAnswerId,
+    p.ParentId,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ContentLicense
+  FROM Posts p
+  WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180' DAY
+),
+TagTagged AS (
+  SELECT
+    p.PostId,
+    -- replace Postgres-specific unnest/string_to_array with generic split logic where available;
+    -- using regexp_split_to_table is Postgres-specific; for standard SQL, use a generic split function placeholder.
+    -- Here we emulate by using a table-valued function SPLIT(p.Tags, '><') which should be replaced per dialect.
+    s.value AS Tag,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate
+  FROM EarlyPosts p,
+  LATERAL (
+    SELECT value FROM (SELECT TRIM(BOTH '<>' FROM p.Tags) AS t) AS __t,
+    -- split into rows; replace SPLIT_TO_TABLE with appropriate function in target dialect
+    TABLE(SPLIT_TO_TABLE(TRIM(BOTH '<>' FROM p.Tags), '><')) AS s(value)
+  ) s
+),
+TagAggregates AS (
+  SELECT
+    Tag,
+    COUNT(*) AS PostCount,
+    AVG(Score) AS AvgScore,
+    SUM(ViewCount) AS TotalViews,
+    MAX(CreationDate) AS LastCreated
+  FROM TagTagged
+  GROUP BY Tag
+),
+TopTags AS (
+  SELECT
+    t.Tag,
+    t.PostCount,
+    t.AvgScore,
+    t.TotalViews,
+    t.LastCreated,
+    ROW_NUMBER() OVER (ORDER BY t.PostCount DESC, t.TotalViews DESC, t.AvgScore DESC) AS rn
+  FROM TagAggregates t
+),
+Qualified AS (
+  SELECT
+    tt.Tag,
+    tt.PostCount,
+    tt.AvgScore,
+    tt.TotalViews,
+    tt.LastCreated
+  FROM TopTags tt
+  WHERE tt.rn <= 10
+),
+UserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id) AS PostsOwned,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id) AS BadgesEarned
+  FROM Users u
+  WHERE u.Reputation >= 1000
+),
+RecentVotes AS (
+  SELECT
+    v.PostId,
+    v.VoteTypeId,
+    v.UserId,
+    v.CreationDate,
+    vt.Name AS VoteName,
+    u.DisplayName AS VoterName
+  FROM Votes v
+  JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+  LEFT JOIN Users u ON v.UserId = u.Id
+  WHERE v.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30' DAY
+),
+PostLinksSummary AS (
+  SELECT
+    pl.PostId,
+    COUNT(*) AS LinkCount,
+    SUM(CASE WHEN LOWER(lt.Name) LIKE 'duplicate' THEN 1 ELSE 0 END) AS DuplicateLinks
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+  GROUP BY pl.PostId
+),
+Combined AS (
+  SELECT
+    p.PostId,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.LastActivityDate,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ContentLicense,
+    p.Tags,
+    COALESCE(ls.LinkCount, 0) AS LinkCount,
+    COALESCE(dt.DuplicateLinks, 0) AS DuplicateLinks
+  FROM EarlyPosts p
+  LEFT JOIN PostLinksSummary ls ON ls.PostId = p.PostId
+  LEFT JOIN PostLinksSummary dt ON dt.PostId = p.PostId
+),
+Windowed AS (
+  SELECT
+    c.PostId,
+    c.Title,
+    c.OwnerUserId,
+    c.CreationDate,
+    c.Score,
+    c.ViewCount,
+    c.LastActivityDate,
+    c.CommentCount,
+    c.FavoriteCount,
+    c.ContentLicense,
+    c.Tags,
+    c.LinkCount,
+    c.DuplicateLinks,
+    ROW_NUMBER() OVER (PARTITION BY c.OwnerUserId ORDER BY c.LastActivityDate DESC) AS rn_per_user
+  FROM Combined c
+  WHERE c.ViewCount > 0
+)
+SELECT
+  w.PostId,
+  w.Title,
+  w.OwnerUserId,
+  w.CreationDate,
+  w.Score,
+  w.ViewCount,
+  w.LastActivityDate,
+  w.CommentCount,
+  w.FavoriteCount,
+  w.ContentLicense,
+  w.LinkCount,
+  w.DuplicateLinks,
+  ua.UserId AS TopAuthorUserId,
+  ua.DisplayName AS TopAuthorName,
+  ua.Reputation AS TopAuthorRep,
+  wt.Tag,
+  ta.PostCount AS TagPostCount,
+  ta.AvgScore AS TagAvgScore,
+  ta.TotalViews AS TagTotalViews,
+  ta.LastCreated AS TagLastCreated,
+  rv.VoteTypeId AS RecentVoteTypeId,
+  rv.VoteName AS RecentVoteName,
+  rv.CreationDate AS RecentVoteDate
+FROM Windowed w
+LEFT JOIN UserActivity ua ON w.OwnerUserId = ua.UserId
+LEFT JOIN Qualified ta ON EXISTS (
+  SELECT 1
+  FROM TABLE(SPLIT_TO_TABLE(TRIM(BOTH '<>' FROM w.Tags), '><')) AS s(value)
+  WHERE s.value = ta.Tag
+)
+LEFT JOIN RecentVotes rv ON rv.PostId = w.PostId
+-- simple cross join source for wt (keeps semantics without non-inner join on subquery)
+LEFT JOIN (
+  SELECT qt.Tag AS Tag FROM Qualified qt
+) wt_src ON 1=1
+LEFT JOIN LATERAL (
+  SELECT ws.Tag
+  FROM Qualified ws
+  WHERE EXISTS (
+    SELECT 1
+    FROM TABLE(SPLIT_TO_TABLE(TRIM(BOTH '<>' FROM w.Tags), '><')) AS s(value)
+    WHERE s.value = ws.Tag
+  )
+  FETCH FIRST 1 ROWS ONLY
+) wt ON TRUE
+ORDER BY w.LastActivityDate DESC
+LIMIT 200;

@@ -1,0 +1,185 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.ParentId,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) as user_post_count,
+        CASE 
+            WHEN p.Score > 100 THEN 'High'
+            WHEN p.Score > 50 THEN 'Medium'
+            ELSE 'Low'
+        END as score_category,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags != '' THEN 
+                COALESCE(array_length(string_to_array(trim(both '<>' FROM p.Tags), '><'), 1), 0)
+            ELSE 0 
+        END as tag_count
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) 
+        AND p.CreationDate >= DATE '2020-01-01'
+),
+UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT r.PostId) as posts_count,
+        AVG(r.Score) as avg_score,
+        MAX(r.CreationDate) as last_post_date,
+        STRING_AGG(DISTINCT r.Tags, '; ') as all_tags
+    FROM Users u
+    LEFT JOIN RankedPosts r ON u.Id = r.OwnerUserId
+    WHERE u.CreationDate >= DATE '2019-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        COALESCE(p.Score, 0) as excerpt_score,
+        CASE 
+            WHEN t.Count > 100 THEN 'Popular'
+            WHEN t.Count > 50 THEN 'Medium'
+            ELSE 'Rare'
+        END as tag_popularity,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as popularity_rank
+    FROM Tags t
+    LEFT JOIN Posts p ON t.ExcerptPostId = p.Id
+    WHERE t.Count > 0
+),
+AnswerStats AS (
+    SELECT 
+        a.Id as PostId,
+        a.Score as answer_score,
+        a.CreationDate as answer_date,
+        q.Score as question_score,
+        q.Title as question_title,
+        a.OwnerUserId,
+        COALESCE(a.OwnerUserId, a.LastEditorUserId) as effective_user_id,
+        CAST((a.CreationDate - q.CreationDate) AS INTEGER) as days_to_answer,
+        CASE 
+            WHEN a.Score > q.Score THEN 'Above Question Score'
+            WHEN a.Score = q.Score THEN 'Equal to Question Score'
+            ELSE 'Below Question Score'
+        END as score_comparison
+    FROM Posts a
+    INNER JOIN Posts q ON a.ParentId = q.Id
+    WHERE a.PostTypeId = 2 AND a.CreationDate >= DATE '2020-01-01'
+),
+QualityPosts AS (
+    SELECT 
+        rp.PostId,
+        rp.Title,
+        rp.Score,
+        rp.ViewCount,
+        rp.Score - COALESCE(rp.prev_score, 0) as score_change,
+        rp.tag_count,
+        COALESCE(us.avg_score, 0) as user_avg_score,
+        CASE 
+            WHEN rp.Score > 100 AND rp.ViewCount > 500 THEN 'High Quality'
+            WHEN rp.Score > 50 AND rp.ViewCount > 200 THEN 'Medium Quality'
+            ELSE 'Low Quality'
+        END as quality_level,
+        CASE 
+            WHEN rp.user_post_count > 10 THEN 'Active Poster'
+            WHEN rp.user_post_count > 5 THEN 'Regular Poster'
+            ELSE 'Occasional Poster'
+        END as posting_frequency
+    FROM RankedPosts rp
+    LEFT JOIN UserStats us ON rp.OwnerUserId = us.UserId
+    WHERE rp.rn = 1
+)
+SELECT 
+    'Performance Benchmark Query Results' as query_info,
+    COUNT(*) as total_records,
+    COUNT(DISTINCT up.UserId) as unique_users,
+    COUNT(DISTINCT ta.TagName) as total_tags,
+    COUNT(DISTINCT ap.PostId) as answers_count,
+    ROUND(AVG(qp.score_change)::numeric, 2) as avg_score_change,
+    STRING_AGG(
+        CONCAT(
+            'User:', up.DisplayName, 
+            ' | Posts:', COALESCE(up.posts_count,0),
+            ' | Avg Score:', COALESCE(ROUND(up.avg_score::numeric, 2)::text, '0'),
+            ' | Tags:', COALESCE(up.all_tags, 'None')
+        ), 
+        ' || ' 
+    ) as user_summary,
+    STRING_AGG(
+        CONCAT(
+            'Tag:', ta.TagName, 
+            ' | Popularity:', ta.tag_popularity,
+            ' | Count:', COALESCE(ta.Count::text, '0')
+        ), 
+        ' || ' 
+    ) as tag_summary,
+    STRING_AGG(
+        CONCAT(
+            'Title:', qp.Title, 
+            ' | Quality:', qp.quality_level,
+            ' | Score:', COALESCE(qp.Score::text, '0'),
+            ' | Views:', COALESCE(qp.ViewCount::text, '0')
+        ), 
+        ' || ' 
+    ) as post_summary
+FROM UserStats up
+FULL OUTER JOIN TagAnalysis ta ON 1=1
+FULL OUTER JOIN AnswerStats ap ON 1=1
+FULL OUTER JOIN QualityPosts qp ON 1=1
+WHERE 
+    (up.UserId IS NOT NULL OR ta.TagName IS NOT NULL OR ap.PostId IS NOT NULL OR qp.PostId IS NOT NULL)
+    AND (
+        COALESCE(up.Reputation,0) > 1000 
+        OR COALESCE(ta.Count,0) > 10 
+        OR COALESCE(ap.answer_score,0) > 5 
+        OR COALESCE(qp.Score,0) > 10
+    )
+    AND (
+        (COALESCE(up.posts_count,0) > 1 OR ap.PostId IS NOT NULL OR qp.PostId IS NOT NULL)
+        OR ta.TagName IS NOT NULL
+    )
+    AND (
+        COALESCE(up.last_post_date, DATE '1900-01-01') >= DATE '2020-01-01' 
+        OR COALESCE(ap.answer_date, DATE '1900-01-01') >= DATE '2020-01-01'
+        OR COALESCE(qp.Score,0) > 0
+    )
+GROUP BY
+    query_info
+HAVING 
+    COUNT(*) > 0
+UNION ALL
+SELECT 
+    'Additional Performance Metrics' as query_info,
+    COUNT(DISTINCT up.UserId) as total_users,
+    SUM(COALESCE(up.posts_count,0)) as total_posts,
+    COUNT(DISTINCT ta.TagName) as total_tags,
+    COUNT(DISTINCT ap.PostId) as total_answers,
+    AVG(qp.score_change) as avg_score_change,
+    STRING_AGG(DISTINCT up.DisplayName, ', ') as most_active_users,
+    STRING_AGG(DISTINCT ta.TagName, ', ') as most_popular_tags,
+    STRING_AGG(DISTINCT qp.Title, ', ') as sample_questions
+FROM UserStats up
+LEFT JOIN TagAnalysis ta ON 1=1
+LEFT JOIN AnswerStats ap ON 1=1
+LEFT JOIN QualityPosts qp ON 1=1
+WHERE 
+    COALESCE(up.Reputation,0) > 500 
+    AND COALESCE(ta.Count,0) >= 5 
+    AND COALESCE(ap.answer_score,0) >= 3 
+    AND COALESCE(qp.Score,0) >= 5
+    AND COALESCE(up.last_post_date, DATE '1900-01-01') >= DATE '2021-01-01'
+    AND COALESCE(ta.popularity_rank, 999999) <= 50
+ORDER BY 1;

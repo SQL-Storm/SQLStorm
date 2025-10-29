@@ -1,0 +1,112 @@
+WITH
+HighlyViewedQuestions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.ViewCount,
+    p.Score,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.Tags,
+    p.LastActivityDate,
+    p.AnswerCount,
+    ROW_NUMBER() OVER (ORDER BY p.ViewCount DESC, p.Score DESC, p.CreationDate DESC) AS rn
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.ViewCount > 1000
+),
+TagAgg AS (
+  SELECT
+    t.TagName,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS Downvotes,
+    AVG(p.Score) AS AvgScore,
+    COUNT(*) AS NumQuestions
+  FROM Posts p
+  JOIN Votes v ON v.PostId = p.Id
+  CROSS JOIN LATERAL (
+    SELECT unnest(string_to_array(substr(p.Tags, 2, length(p.Tags)-2), '><')) AS TagName
+  ) t
+  WHERE p.PostTypeId = 1
+  GROUP BY t.TagName
+),
+LastEditorInfo AS (
+  SELECT
+    p.Id AS PostId,
+    p.LastEditorUserId,
+    u.DisplayName AS LastEditorName,
+    p.LastEditDate
+  FROM Posts p
+  LEFT JOIN Users u ON p.LastEditorUserId = u.Id
+  WHERE p.LastEditDate IS NOT NULL
+),
+PostLinksSub AS (
+  SELECT
+    pl.PostId,
+    COUNT(CASE WHEN lt.Name = 'Linked' THEN 1 END) AS LinkedCount,
+    COUNT(CASE WHEN lt.Name = 'Duplicate' THEN 1 END) AS DuplicateCount
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+  GROUP BY pl.PostId
+),
+CommentCountSub AS (
+  SELECT
+    c.PostId,
+    COUNT(*) AS TotalComments,
+    MAX(c.CreationDate) AS LatestCommentDate
+  FROM Comments c
+  GROUP BY c.PostId
+),
+PerformanceBenchmark AS (
+  SELECT
+    hp.PostId,
+    hp.Title,
+    hp.ViewCount,
+    hp.Score,
+    hp.CreationDate,
+    COALESCE(lu.Reputation, 0) AS OwnerReputation,
+    COALESCE(bc.NumBadges, 0) AS NumBadges,
+    h.LastEditorName,
+    h.LastEditDate,
+    pc.LinkedCount,
+    pc.DuplicateCount,
+    cc.TotalComments,
+    cc.LatestCommentDate,
+    tg.Upvotes AS TagUpvotes,
+    tg.Downvotes AS TagDownvotes,
+    tg.AvgScore AS TagAvgScore,
+    tg.NumQuestions AS TagQuestionCount
+  FROM HighlyViewedQuestions hp
+  LEFT JOIN Users lu ON hp.OwnerUserId = lu.Id
+  LEFT JOIN LastEditorInfo h ON hp.PostId = h.PostId
+  LEFT JOIN PostLinksSub pc ON hp.PostId = pc.PostId
+  LEFT JOIN CommentCountSub cc ON hp.PostId = cc.PostId
+  LEFT JOIN TagAgg tg ON TRUE
+  LEFT JOIN (
+    SELECT b.PostId AS PostId, COUNT(*) AS NumBadges
+    FROM Badges b
+    GROUP BY b.PostId
+  ) bc ON hp.PostId = bc.PostId
+  ORDER BY hp.ViewCount DESC
+  LIMIT 100
+)
+SELECT
+  p.PostId,
+  p.Title,
+  p.ViewCount,
+  p.Score,
+  p.CreationDate,
+  p.OwnerReputation,
+  p.NumBadges,
+  p.LastEditorName,
+  p.LastEditDate,
+  p.LinkedCount,
+  p.DuplicateCount,
+  p.TotalComments,
+  p.LatestCommentDate,
+  p.TagUpvotes,
+  p.TagDownvotes,
+  p.TagAvgScore,
+  p.TagQuestionCount
+FROM PerformanceBenchmark p
+ORDER BY p.ViewCount DESC, p.Score DESC;

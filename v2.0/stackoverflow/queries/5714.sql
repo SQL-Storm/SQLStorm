@@ -1,0 +1,100 @@
+WITH recent_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.CommentCount,
+    p.AnswerCount,
+    p.LastActivityDate,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation,
+    CAST(NULL AS VARCHAR) AS Dummy
+  FROM Posts p
+  JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '180 days')
+),
+tag_stats AS (
+  SELECT
+    tag,
+    count(*) AS question_count,
+    avg(p.Score) AS avg_score,
+    max(p.ViewCount) AS max_views
+  FROM Posts p,
+    UNNEST(STRING_TO_ARRAY(SUBSTR(p.Tags, 2, CHAR_LENGTH(p.Tags)-2), '><')) AS tag
+  WHERE p.PostTypeId = 1
+  GROUP BY tag
+),
+top_tags AS (
+  SELECT tag, question_count, avg_score, max_views
+  FROM tag_stats
+  ORDER BY question_count DESC, avg_score DESC
+  LIMIT 10
+),
+complex_derived AS (
+  SELECT
+    q.PostId,
+    q.Title,
+    q.CreationDate,
+    q.ViewCount AS Views,
+    q.Score,
+    q.OwnerUserId,
+    q.OwnerDisplayName,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = q.PostId) AS CommentCountForPost,
+    ROW_NUMBER() OVER (PARTITION BY q.OwnerUserId ORDER BY q.CreationDate DESC) AS rn_by_author
+  FROM recent_questions q
+),
+mixed_aggregate AS (
+  SELECT
+    c.PostId,
+    c.Title,
+    c.CreationDate,
+    c.CommentCountForPost,
+    c.Score,
+    c.OwnerUserId,
+    c.OwnerDisplayName,
+    c.rn_by_author,
+    CASE
+      WHEN c.Score >= 10 THEN 'high'
+      WHEN c.Score >= 0 THEN 'medium'
+      ELSE 'low'
+    END AS score_tier,
+    ('[' || c.OwnerDisplayName || '] ' || c.Title) AS TitleWithOwner
+  FROM complex_derived c
+),
+final_result AS (
+  SELECT
+    m.PostId,
+    m.Title,
+    m.CreationDate,
+    m.CommentCountForPost,
+    m.Score,
+    m.OwnerUserId,
+    m.OwnerDisplayName,
+    m.score_tier,
+    m.TitleWithOwner,
+    t.tag AS top_tag,
+    t.question_count AS top_tag_question_count
+  FROM mixed_aggregate m
+  LEFT JOIN top_tags t ON POSITION(t.tag IN m.Title::VARCHAR) > 0
+  ORDER BY m.CreationDate DESC
+  LIMIT 100
+)
+SELECT
+  PostId,
+  Title,
+  CreationDate,
+  CommentCountForPost,
+  Score,
+  OwnerUserId,
+  OwnerDisplayName,
+  score_tier,
+  TitleWithOwner,
+  top_tag,
+  top_tag_question_count
+FROM final_result
+ORDER BY CreationDate DESC;

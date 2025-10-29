@@ -1,0 +1,148 @@
+-- {"query": "2225.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1445} 
+with RecursiveTagCounts as (
+    select
+        t.Id as TagId,
+        t.TagName,
+        t.Count,
+        case when t.IsModeratorOnly = 1 then 'ModeratorOnly' else 'UserTag' end as TagCategory,
+        1 as Level
+    from Tags t
+    where t.Id in (
+        select distinct unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><'))
+        from Posts p
+        where p.PostTypeId = 1 and p.Tags is not null
+    )
+    union all
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        rt.TagCategory,
+        rt.Level + 1
+    from Tags t2
+    join RecursiveTagCounts rt on t2.Id = rt.TagId + 1
+    where rt.Level < 3
+),
+UserBadgeSummary as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct b.Id) as TotalBadges,
+        count(distinct case when b.Class = 1 then b.Id end) as GoldBadges,
+        count(distinct case when b.Class = 2 then b.Id end) as SilverBadges,
+        count(distinct case when b.Class = 3 then b.Id end) as BronzeBadges,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostScoreRanks as (
+    select
+        p.Id as PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        dense_rank() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as ScoreRank,
+        row_number() over (partition by p.PostTypeId order by p.CreationDate desc) as RecentPostRank
+    from Posts p
+    where p.PostTypeId in (1,2)
+),
+AnswerCommentStats as (
+    select
+        a.Id as AnswerId,
+        count(distinct c.Id) as CommentCount,
+        avg(length(c.Text)) filter (where c.Text is not null) as AvgCommentLength,
+        sum(case when c.UserId is null then 1 else 0 end) as AnonymousCommentCount
+    from Posts a
+    left join Comments c on c.PostId = a.Id
+    where a.PostTypeId = 2
+    group by a.Id
+),
+UserActivityWindows as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct p.Id) filter (where p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days') as PostsLastYear,
+        count(distinct c.Id) filter (where c.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days') as CommentsLastYear,
+        count(distinct v.Id) filter (where v.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days') as VotesLastYear,
+        first_value(p.CreationDate) over (partition by u.Id order by p.CreationDate asc) as FirstPostDate,
+        last_value(p.LastActivityDate) over (partition by u.Id order by p.LastActivityDate asc rows between unbounded preceding and unbounded following) as LastPostActivityDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+),
+ClosedQuestionsWithReasons as (
+    select
+        p.Id as QuestionId,
+        p.Title,
+        p.CreationDate,
+        p.ClosedDate,
+        ph.Comment as CloseReasonCode,
+        crt.Name as CloseReasonName,
+        useDisplayName.DisplayName as CloserUserName,
+        count(pl.Id) filter (where pl.LinkTypeId = 3) as DuplicateCount,
+        exists (
+            select 1 from PostLinks pl2 where pl2.PostId = p.Id and pl2.LinkTypeId = 1
+        ) as HasLinkedPosts
+    from Posts p
+    join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 10 and ph.CreationDate = (
+        select max(ph2.CreationDate) from PostHistory ph2 where ph2.PostId = p.Id and ph2.PostHistoryTypeId = 10
+    )
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    left join Users useDisplayName on useDisplayName.Id = ph.UserId
+    left join PostLinks pl on pl.PostId = p.Id
+    where p.PostTypeId = 1 and p.ClosedDate is not null
+)
+select 
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.PostsLastYear,
+    ua.CommentsLastYear,
+    ua.VotesLastYear,
+    ubs.TotalBadges,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    ubs.LastBadgeDate,
+    ps.PostId,
+    ps.Title,
+    ps.Score,
+    ps.ViewCount,
+    ps.ScoreRank,
+    ps.RecentPostRank,
+    acs.CommentCount,
+    acs.AvgCommentLength,
+    acs.AnonymousCommentCount,
+    ct.TagName,
+    ct.Count as TagUsageCount,
+    ct.TagCategory,
+    cq.QuestionId,
+    cq.Title as ClosedQuestionTitle,
+    cq.ClosedDate,
+    cq.CloseReasonCode,
+    coalesce(cq.CloseReasonName, 'Unknown') as CloseReasonName,
+    cq.CloserUserName,
+    cq.DuplicateCount,
+    cq.HasLinkedPosts
+from UserActivityWindows ua
+left join UserBadgeSummary ubs on ubs.UserId = ua.UserId
+left join PostScoreRanks ps on ps.OwnerUserId = ua.UserId and ps.ScoreRank <= 5
+left join AnswerCommentStats acs on acs.AnswerId = ps.PostId and ps.PostTypeId = 2
+left join LATERAL (
+    select distinct tag.TagName, tag.Count, tag.TagCategory
+    from RecursiveTagCounts tag
+    join Posts p2 on p2.PostTypeId = 1 and p2.OwnerUserId = ua.UserId
+    where p2.Tags like '%' || tag.TagName || '%'
+    order by tag.Count desc
+    limit 1
+) ct on true
+left join ClosedQuestionsWithReasons cq on cq.CloserUserName = ua.DisplayName and cq.ClosedDate > cast('2024-10-01 12:34:56' as timestamp) - interval '1 year'
+where ua.PostsLastYear > 10
+order by ua.Reputation desc, ps.ScoreRank asc
+limit 100;

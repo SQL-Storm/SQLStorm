@@ -1,0 +1,190 @@
+WITH EnrichedUsers AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Views AS UserViews,
+        U.UpVotes AS UserUpVotesGiven,
+        U.DownVotes AS UserDownVotesGiven,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsOwned,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersOwned,
+        COALESCE(AVG(CASE WHEN P.PostTypeId IN (1, 2) THEN P.Score END), 0) AS AvgQAScoreOwned,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        MAX(CASE WHEN B.Class = 1 THEN B.Date END) AS LatestGoldBadgeDate,
+        COUNT(DISTINCT CASE WHEN B.Class = 1 THEN B.Id END) AS GoldBadgeCount
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    WHERE U.Reputation >= 10000
+      AND U.LastAccessDate >= (CAST('2024-10-01' AS date) - INTERVAL '1' YEAR)
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Views, U.UpVotes, U.DownVotes
+    HAVING COUNT(DISTINCT P.Id) > 50 OR COUNT(DISTINCT C.Id) > 100
+),
+QuestionEngagementMetrics AS (
+    SELECT
+        Q.Id AS QuestionId,
+        Q.OwnerUserId,
+        Q.CreationDate AS QuestionCreationDate,
+        Q.Score AS QuestionScore,
+        Q.ViewCount,
+        Q.AnswerCount,
+        Q.FavoriteCount,
+        Q.LastActivityDate,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+        SUM(CASE WHEN V.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoriteVoteTypeCount,
+        MAX(C.CreationDate) AS LatestCommentDate,
+        (CAST(SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS DECIMAL) * 2 + COUNT(DISTINCT C.Id) * 1.5 + Q.FavoriteCount * 3 + Q.ViewCount * 0.01)
+        / NULLIF(CAST(SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DECIMAL) + 1, 0) AS CalculatedEngagementFactor
+    FROM Posts Q
+    LEFT JOIN Comments C ON Q.Id = C.PostId
+    LEFT JOIN Votes V ON Q.Id = V.PostId
+    WHERE Q.PostTypeId = 1
+      AND Q.CreationDate BETWEEN DATE '2021-01-01' AND DATE '2023-12-31'
+    GROUP BY Q.Id, Q.OwnerUserId, Q.CreationDate, Q.Score, Q.ViewCount, Q.AnswerCount, Q.FavoriteCount, Q.LastActivityDate
+    HAVING (COUNT(DISTINCT C.Id) > 5 AND SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) > 10)
+        OR Q.ViewCount > 5000
+),
+PostContentEvolution AS (
+    SELECT
+        PH.PostId,
+        COUNT(PH.Id) AS TotalHistoryEntries,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 7) THEN 1 ELSE 0 END) AS TitleEditRollbackCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (5, 8) THEN 1 ELSE 0 END) AS BodyEditRollbackCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (6, 9) THEN 1 ELSE 0 END) AS TagsEditRollbackCount,
+        MAX(PH.CreationDate) AS LastContentEditDate,
+        MIN(PH.CreationDate) AS FirstContentEditDate
+    FROM PostHistory PH
+    WHERE PH.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9)
+    GROUP BY PH.PostId
+    HAVING COUNT(PH.Id) >= 2
+),
+RelatedPostsSummary AS (
+    SELECT
+        P.Id AS PostId,
+        STRING_AGG(DISTINCT CAST(PL.RelatedPostId AS VARCHAR), ',') AS LinkedRelatedPosts,
+        MAX(P.Score) AS MaxRelatedPostScore,
+        'LinkedOrDuplicate' AS RelationType
+    FROM Posts P
+    INNER JOIN PostLinks PL ON P.Id = PL.PostId
+    WHERE PL.LinkTypeId IN (1, 3)
+      AND P.Score > 10
+    GROUP BY P.Id
+    UNION ALL
+    SELECT
+        P.Id AS PostId,
+        'SelfReferenced' AS LinkedRelatedPosts,
+        P.Score AS MaxRelatedPostScore,
+        'SelfReferenced' AS RelationType
+    FROM Posts P
+    WHERE P.Body LIKE '%stackoverflow.com/questions/%'
+      AND P.PostTypeId = 1
+      AND P.Score > 20
+)
+SELECT
+    QEM.QuestionId,
+    Q.Title,
+    Q.Body AS QuestionBodySample,
+    Q.Tags,
+    QEM.QuestionCreationDate,
+    Q.LastActivityDate,
+    EU.DisplayName AS QuestionOwnerDisplayName,
+    EU.Reputation AS QuestionOwnerReputation,
+    EU.AvgQAScoreOwned AS OwnerAvgPostScore,
+    QEM.QuestionScore,
+    QEM.ViewCount,
+    QEM.AnswerCount,
+    QEM.TotalComments,
+    QEM.UpVoteCount,
+    QEM.DownVoteCount,
+    QEM.FavoriteVoteTypeCount AS ExplicitFavoriteVotes,
+    Q.FavoriteCount AS PostTableFavoriteCount,
+    PCE.TotalHistoryEntries AS ContentHistoryEntries,
+    PCE.TitleEditRollbackCount,
+    PCE.BodyEditRollbackCount,
+    PCE.TagsEditRollbackCount,
+    PCE.LastContentEditDate,
+    COALESCE(A.Id, -1) AS AcceptedAnswerId,
+    COALESCE(A.Score, 0) AS AcceptedAnswerScore,
+    COALESCE(AU.DisplayName, A.OwnerDisplayName, 'N/A') AS AcceptedAnswerOwnerDisplayName,
+    COALESCE(AU.Reputation, 0) AS AcceptedAnswerOwnerReputation,
+    CASE WHEN Q.AcceptedAnswerId IS NOT NULL THEN
+        (SELECT CASE WHEN AU_Inner.Reputation > EU.Reputation * 1.5 THEN 'Super-Expert Answer' ELSE 'Standard Answer' END
+         FROM Users AU_Inner WHERE AU_Inner.Id = A.OwnerUserId)
+    ELSE 'No Accepted Answer' END AS AcceptedAnswerExpertiseLevel,
+    (SELECT COALESCE(C_Owner.Text, 'No recent owner comment')
+     FROM Comments C_Owner
+     WHERE C_Owner.PostId = Q.Id AND C_Owner.UserId = Q.OwnerUserId
+       AND C_Owner.CreationDate = (
+           SELECT MAX(CX.CreationDate)
+           FROM Comments CX
+           WHERE CX.PostId = Q.Id AND CX.UserId = Q.OwnerUserId AND CHAR_LENGTH(CX.Text) > 50
+       )
+     LIMIT 1
+    ) AS OwnerLastSignificantComment,
+    RPS.LinkedRelatedPosts,
+    RPS.RelationType AS PostLinkRelationType,
+    RANK() OVER (PARTITION BY SUBSTRING(Q.Tags FROM 2 FOR POSITION('>' IN Q.Tags)-2) ORDER BY QEM.CalculatedEngagementFactor DESC, QEM.QuestionScore DESC) AS RankByEngagementInPrimaryTag,
+    AVG(QEM.QuestionScore) OVER (PARTITION BY EU.UserId ORDER BY QEM.QuestionCreationDate ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS OwnerTrailingAvgQuestionScore,
+    EXTRACT(DAY FROM (QEM.QuestionCreationDate - EU.LatestGoldBadgeDate)) AS DaysSinceOwnerGoldBadgeBeforePost,
+    QEM.CalculatedEngagementFactor,
+    TRIM(SUBSTRING(Q.Tags FROM 2 FOR POSITION('>' IN Q.Tags)-2)) AS PrimaryTagCleaned,
+    CASE
+        WHEN Q.Body LIKE '%benchmark%' AND Q.Body LIKE '%query%' THEN 'Benchmark-Oriented'
+        WHEN Q.Title LIKE '%performance%' OR Q.Title LIKE '%slow%' THEN 'Performance-Issue-Oriented'
+        ELSE 'General Technical'
+    END AS ContentTopicCategory,
+    COALESCE(CLT.Name, 'No explicit close reason') AS CloseReasonTypeName,
+    CASE
+        WHEN Q.ClosedDate IS NOT NULL AND Q.AcceptedAnswerId IS NULL THEN 'Closed Without Accepted Answer'
+        WHEN Q.ClosedDate IS NULL AND Q.AnswerCount = 0 AND QEM.TotalComments > 5 THEN 'Unanswered But Debated'
+        WHEN EU.GoldBadgeCount > 0 AND EU.GoldBadgeCount < 3 THEN 'Owner Developing'
+        ELSE 'Standard Status'
+    END AS QuestionDetailedStatus,
+    CHAR_LENGTH(Q.Body) AS QuestionBodyLengthCharacters,
+    NULLIF(Q.AnswerCount, 0) AS NonZeroAnswerCount
+FROM Posts Q
+INNER JOIN QuestionEngagementMetrics QEM ON Q.Id = QEM.QuestionId
+LEFT JOIN EnrichedUsers EU ON Q.OwnerUserId = EU.UserId
+LEFT JOIN Posts A ON Q.AcceptedAnswerId = A.Id AND A.PostTypeId = 2
+LEFT JOIN Users AU ON A.OwnerUserId = AU.Id
+LEFT JOIN PostContentEvolution PCE ON Q.Id = PCE.PostId
+LEFT JOIN RelatedPostsSummary RPS ON Q.Id = RPS.PostId
+LEFT JOIN PostHistory PHC ON Q.Id = PHC.PostId AND PHC.PostHistoryTypeId = 10 AND PHC.CreationDate = (
+    SELECT MAX(PHX.CreationDate) FROM PostHistory PHX WHERE PHX.PostId = Q.Id AND PHX.PostHistoryTypeId = 10
+)
+LEFT JOIN CloseReasonTypes CLT ON (PHC.Comment IS NOT NULL) AND CLT.Id = CAST(PHC.Comment AS SMALLINT)
+WHERE
+    Q.PostTypeId = 1
+    AND EU.UserId IS NOT NULL
+    AND QEM.CalculatedEngagementFactor > 100
+    AND (
+        (COALESCE(PCE.BodyEditRollbackCount, 0) >= 3 AND COALESCE(PCE.TagsEditRollbackCount, 0) >= 1)
+        OR (Q.FavoriteCount >= 15 AND QEM.UpVoteCount > QEM.DownVoteCount * 3)
+    )
+    AND (
+        (QEM.QuestionCreationDate BETWEEN EU.UserCreationDate AND (EU.UserCreationDate + INTERVAL '3' YEAR))
+        AND (Q.Tags LIKE '%<sql>%' OR Q.Tags LIKE '%<database>%' OR Q.Tags LIKE '%<optimization>%')
+        AND (Q.ClosedDate IS NULL OR (Q.ClosedDate IS NOT NULL AND QEM.LatestCommentDate > (Q.ClosedDate - INTERVAL '6' MONTH)))
+    )
+    AND EXISTS (
+        SELECT 1
+        FROM RelatedPostsSummary RPS_Inner
+        WHERE RPS_Inner.PostId = Q.Id AND RPS_Inner.MaxRelatedPostScore > QEM.QuestionScore / 2
+    )
+    AND NOT EXISTS (
+        SELECT 1
+        FROM PostHistory PH_Deleted
+        WHERE PH_Deleted.PostId = Q.Id AND PH_Deleted.PostHistoryTypeId = 12
+    )
+ORDER BY
+    QEM.CalculatedEngagementFactor DESC,
+    OwnerTrailingAvgQuestionScore DESC,
+    QuestionCreationDate DESC,
+    Q.ViewCount DESC
+LIMIT 5000;

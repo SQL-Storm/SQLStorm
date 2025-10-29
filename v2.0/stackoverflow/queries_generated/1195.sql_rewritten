@@ -1,0 +1,198 @@
+-- {"query": "1195.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3026} 
+WITH UserEngagementSummary AS (
+    -- CTE 1: Summarize user engagement metrics, including aggregated post, comment, and badge data.
+    -- Uses COALESCE to handle NULL values in activity dates and sums.
+    SELECT
+        u.Id AS UserId,
+        COALESCE(u.DisplayName, 'Unknown User') AS DisplayName,
+        u.CreationDate AS UserCreationDate,
+        u.Reputation,
+        u.UpVotes,
+        u.DownVotes,
+        MAX(GREATEST(u.LastAccessDate, COALESCE(p.LastActivityDate, '1900-01-01'), COALESCE(c.CreationDate, '1900-01-01'), COALESCE(b.Date, '1900-01-01'))) AS LastKnownActivity,
+        COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsOwned,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersOwned,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+        COALESCE(SUM(p.ViewCount), 0) AS TotalPostViews,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT b.Id) AS TotalBadgesEarned,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END) AS AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE NULL END) AS AvgAnswerScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.CreationDate, u.Reputation, u.UpVotes, u.DownVotes
+),
+PostHistoryTimeline AS (
+    -- CTE 2: Analyze post edit/status history using LAG window function to calculate time differences between events.
+    SELECT
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate AS HistoryDate,
+        ph.UserId AS EditorUserId,
+        ph.Comment,
+        ph.Text,
+        LAG(ph.CreationDate, 1, ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS PreviousHistoryDate,
+        (ph.CreationDate - LAG(ph.CreationDate, 1, ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate)) AS TimeSincePreviousEvent
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6, 10, 11, 12, 13) -- Edit Title, Edit Body, Edit Tags, Closed, Reopened, Deleted, Undeleted
+),
+QuestionTagAnalysis AS (
+    -- CTE 3: Extracts individual tags from question posts and associates them with post scores and view counts.
+    -- Uses string_to_array and unnest for string parsing.
+    SELECT
+        p.Id AS PostId,
+        unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS TagName,
+        p.Score AS PostScore,
+        p.ViewCount AS PostViewCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2 -- Ensure tags are present and not empty
+),
+ComplexPostCategorization AS (
+    -- CTE 4: Categorizes posts based on complex criteria using UNION ALL for combining distinct result sets.
+    -- Category 1: Questions marked as closed duplicates.
+    SELECT
+        p.Id AS PostId,
+        'Closed Duplicate Question' AS PostCategory,
+        p.CreationDate,
+        p.Score
+    FROM Posts p
+    WHERE
+        p.PostTypeId = 1
+        AND p.ClosedDate IS NOT NULL
+        AND EXISTS (
+            SELECT 1
+            FROM PostLinks pl
+            WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3
+        )
+    UNION ALL
+    -- Category 2: Low-score answers with no comments and no upvotes, indicating potential "unnoticed" content.
+    SELECT
+        p.Id AS PostId,
+        'Low Quality Unnoticed Answer' AS PostCategory,
+        p.CreationDate,
+        p.Score
+    FROM Posts p
+    WHERE
+        p.PostTypeId = 2
+        AND p.Score <= 0
+        AND p.CommentCount = 0
+        AND NOT EXISTS ( -- Correlated subquery for checking vote types
+            SELECT 1 FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2
+        )
+)
+SELECT
+    ues.UserId,
+    ues.DisplayName AS UserDisplayName,
+    ues.Reputation,
+    ues.TotalPostsOwned,
+    ues.TotalQuestionsOwned,
+    ues.TotalAnswersOwned,
+    ues.TotalCommentsMade,
+    ues.TotalBadgesEarned,
+    -- Complicated calculation for Up/Down Vote Ratio, handling division by zero with NULLIF.
+    ROUND(CAST(ues.UpVotes AS NUMERIC) / NULLIF(ues.DownVotes + ues.UpVotes, 0), 2) AS UpDownVoteRatio,
+    -- Complex CASE expression for categorizing users into reputation tiers.
+    CASE
+        WHEN ues.Reputation >= 100000 THEN 'Legendary'
+        WHEN ues.Reputation >= 20000 THEN 'Veteran'
+        WHEN ues.Reputation >= 5000 THEN 'Experienced'
+        WHEN ues.Reputation >= 1000 THEN 'Active'
+        ELSE 'Novice'
+    END AS UserReputationTier,
+    -- Window function: Average question score by the user.
+    AVG(p_q.Score) OVER (PARTITION BY ues.UserId) AS AvgQuestionScoreByThisUser,
+    -- Correlated subquery: Average score of answers posted by the user AFTER their first year of activity.
+    (
+        SELECT COALESCE(AVG(ans.Score), 0)
+        FROM Posts ans
+        WHERE
+            ans.OwnerUserId = ues.UserId
+            AND ans.PostTypeId = 2
+            AND ans.CreationDate > (ues.UserCreationDate + INTERVAL '1 year')
+            AND ans.Score IS NOT NULL
+    ) AS AvgAnswerScoreAfterFirstYear,
+    -- Window function: Rank users by reputation within their creation year.
+    RANK() OVER (PARTITION BY EXTRACT(YEAR FROM ues.UserCreationDate) ORDER BY ues.Reputation DESC) AS RankInCreationYear,
+    -- Window function: NTILE for overall activity, dividing users into 5 groups.
+    NTILE(5) OVER (ORDER BY ues.TotalPostsOwned + ues.TotalCommentsMade + ues.TotalBadgesEarned DESC) AS ActivityQuintile,
+    p_q.Id AS QuestionId,
+    p_q.Title AS QuestionTitle,
+    p_q.Score AS QuestionScore,
+    p_q.ViewCount AS QuestionViewCount,
+    p_q.AnswerCount AS QuestionAnswerCount,
+    COALESCE(p_q.FavoriteCount, 0) AS QuestionFavoriteCount, -- NULL logic with COALESCE
+    p_q.CreationDate AS QuestionCreationDate,
+    p_q.LastEditDate AS QuestionLastEditDate,
+    p_q.LastActivityDate AS QuestionLastActivityDate,
+    -- CASE expression for question status based on various fields.
+    CASE
+        WHEN p_q.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN p_q.AcceptedAnswerId IS NOT NULL THEN 'Answered & Accepted'
+        WHEN p_q.AnswerCount > 0 THEN 'Answered'
+        ELSE 'Open'
+    END AS QuestionStatus,
+    -- String expression: Calculate number of tags and check for specific tags.
+    ARRAY_LENGTH(string_to_array(substring(p_q.Tags, 2, length(p_q.Tags)-2), '><'), 1) AS NumberOfTags,
+    (p_q.Tags LIKE '%<sql>%' OR p_q.Tags LIKE '%<database>%') AS ContainsSQLOrDatabaseTag,
+    -- Complicated calculation for "Question Impact Score," handling division by zero.
+    (p_q.Score * p_q.ViewCount) / NULLIF(p_q.AnswerCount + COALESCE(p_q.CommentCount, 0) + 1, 0) AS QuestionImpactScore,
+    -- NULL logic and outer join for accepted answer details.
+    CASE
+        WHEN p_q.AcceptedAnswerId IS NOT NULL THEN 'YES'
+        ELSE 'NO'
+    END AS HasAcceptedAnswer,
+    pa.Score AS AcceptedAnswerScore,
+    pa.CreationDate AS AcceptedAnswerCreationDate,
+    -- Aggregated maximum time between sequential edit events for the question.
+    MAX(CASE WHEN pht.PostHistoryTypeId IN (4, 5, 6) THEN EXTRACT(EPOCH FROM pht.TimeSincePreviousEvent) / 3600 END) AS MaxHoursBetweenEdits, -- Convert interval to hours
+    MAX(CASE WHEN pht.PostHistoryTypeId = 10 THEN pht.HistoryDate ELSE NULL END) AS ClosureDateFromHistory,
+    cpc.PostCategory AS CategorizedAsProblematic,
+    -- A subquery to find the most popular tag for a specific question (based on average post score and count).
+    (
+        SELECT qta_inner.TagName
+        FROM QuestionTagAnalysis qta_inner
+        WHERE qta_inner.PostId = p_q.Id
+        GROUP BY qta_inner.TagName
+        ORDER BY AVG(qta_inner.PostScore) DESC, COUNT(qta_inner.TagName) DESC
+        LIMIT 1
+    ) AS MostPopularQuestionTag,
+    -- Another correlated subquery: Average score of comments on this question versus the global average comment score.
+    -- Demonstrates NULL logic for averages.
+    COALESCE(
+        (SELECT AVG(c.Score) FROM Comments c WHERE c.PostId = p_q.Id AND c.Score IS NOT NULL),
+        0
+    ) AS AvgCommentScoreForQuestion,
+    COALESCE(
+        (SELECT AVG(c_global.Score) FROM Comments c_global WHERE c_global.Score IS NOT NULL),
+        0
+    ) AS GlobalAvgCommentScore
+FROM Users u
+LEFT JOIN UserEngagementSummary ues ON u.Id = ues.UserId
+LEFT JOIN Posts p_q ON u.Id = p_q.OwnerUserId AND p_q.PostTypeId = 1 -- Only questions owned by the user
+LEFT JOIN Posts pa ON p_q.AcceptedAnswerId = pa.Id -- LEFT JOIN for accepted answer details (might be NULL)
+LEFT JOIN PostHistoryTimeline pht ON p_q.Id = pht.PostId
+LEFT JOIN ComplexPostCategorization cpc ON p_q.Id = cpc.PostId -- LEFT JOIN to categorize problematic posts
+WHERE
+    u.CreationDate >= '2015-01-01' -- Filter users created after a certain date
+    AND u.Reputation > 500 -- Only users with significant reputation
+    AND (u.Location IS NOT NULL AND TRIM(u.Location) != '') -- Users with a specified and non-empty location
+    AND (LENGTH(COALESCE(u.AboutMe, '')) > 50 OR u.AboutMe IS NULL) -- Users with a substantial "About Me" or no "About Me" at all
+    AND p_q.ViewCount > 500 -- Only questions with significant views
+GROUP BY -- Grouping for MAX aggregates in the SELECT list and distinct rows from previous joins/window functions
+    ues.UserId, ues.DisplayName, ues.Reputation, ues.TotalPostsOwned, ues.TotalQuestionsOwned,
+    ues.TotalAnswersOwned, ues.TotalCommentsMade, ues.TotalBadgesEarned, ues.UpVotes, ues.DownVotes,
+    ues.UserCreationDate, p_q.Id, p_q.Title, p_q.Score, p_q.ViewCount, p_q.AnswerCount,
+    p_q.FavoriteCount, p_q.CreationDate, p_q.LastEditDate, p_q.LastActivityDate,
+    p_q.ClosedDate, p_q.AcceptedAnswerId, p_q.Tags, pa.Score, pa.CreationDate, cpc.PostCategory,
+    u.CreationDate, u.Location, u.Reputation, u.AboutMe
+HAVING
+    COUNT(DISTINCT pht.PostId) > 0 -- Ensure there's at least one post history event considered for the question
+    AND AVG(p_q.Score) > 5 -- Only show results for users whose questions have an average score greater than 5
+ORDER BY
+    UserReputationTier DESC,
+    AvgQuestionScoreByThisUser DESC,
+    QuestionImpactScore DESC
+LIMIT 1000;

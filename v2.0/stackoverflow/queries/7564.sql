@@ -1,0 +1,133 @@
+WITH UserPostStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        SUM(p.Score) AS TotalScore,
+        AVG(p.Score) AS AvgScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        COUNT(DISTINCT p.Tags) AS UniqueTagCount,
+        STRING_AGG(DISTINCT p.Tags, '; ') AS AllTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE p.CreationDate >= DATE '2010-01-01' OR p.CreationDate IS NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+RankedUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        TotalPosts,
+        QuestionCount,
+        AnswerCount,
+        TotalScore,
+        AvgScore,
+        LastPostDate,
+        UniqueTagCount,
+        AllTags,
+        ROW_NUMBER() OVER (ORDER BY TotalScore DESC, Reputation DESC) AS RankByScore,
+        RANK() OVER (ORDER BY TotalPosts DESC) AS RankByPostCount,
+        DENSE_RANK() OVER (ORDER BY QuestionCount DESC) AS RankByQuestions
+    FROM UserPostStats
+),
+QuestionStats AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        u.DisplayName AS OwnerName,
+        p.Tags,
+        (SELECT COUNT(*) FROM Posts WHERE ParentId = p.Id AND PostTypeId = 2) AS ActualAnswerCount,
+        (SELECT COUNT(*) FROM Votes WHERE PostId = p.Id AND VoteTypeId = 2) AS UpVotes,
+        (SELECT COUNT(*) FROM Votes WHERE PostId = p.Id AND VoteTypeId = 3) AS DownVotes,
+        (SELECT COUNT(*) FROM Comments WHERE PostId = p.Id) AS CommentCountActual,
+        CASE 
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 1
+            WHEN p.AnswerCount > 0 AND (SELECT COUNT(*) FROM Posts WHERE ParentId = p.Id AND PostTypeId = 2 AND Score > 0) > 0 THEN 1
+            ELSE 0
+        END AS HasAcceptedOrHighScoringAnswer,
+        (CASE WHEN p.Score = 0 THEN NULL ELSE p.ViewCount / CAST(p.Score AS DOUBLE PRECISION) END) AS ViewScoreRatio,
+        EXTRACT(YEAR FROM p.CreationDate) AS PostYear,
+        CASE 
+            WHEN p.Tags LIKE '%<javascript>%' THEN 'JavaScript'
+            WHEN p.Tags LIKE '%<python>%' THEN 'Python'
+            WHEN p.Tags LIKE '%<java>%' THEN 'Java'
+            ELSE 'Other'
+        END AS PrimaryLanguage
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+),
+TopQuestions AS (
+    SELECT 
+        QuestionId,
+        Title,
+        Score,
+        ViewCount,
+        AnswerCount,
+        CommentCount,
+        CreationDate,
+        OwnerName,
+        Tags,
+        ActualAnswerCount,
+        UpVotes,
+        DownVotes,
+        CommentCountActual,
+        HasAcceptedOrHighScoringAnswer,
+        ViewScoreRatio,
+        PostYear,
+        PrimaryLanguage,
+        ROW_NUMBER() OVER (ORDER BY Score DESC, ViewCount DESC) AS ScoreRank,
+        RANK() OVER (PARTITION BY PostYear ORDER BY Score DESC) AS YearlyScoreRank,
+        DENSE_RANK() OVER (ORDER BY ViewCount DESC) AS ViewRank
+    FROM QuestionStats
+    WHERE Score > 10 AND ViewCount > 100
+)
+SELECT 
+    'Performance Benchmark Report' AS ReportTitle,
+    COUNT(*) AS TotalUsers,
+    COUNT(DISTINCT CASE WHEN TotalPosts > 0 THEN UserId END) AS ActiveUsers,
+    COUNT(DISTINCT CASE WHEN QuestionCount > 0 THEN UserId END) AS QuestionAuthors,
+    COUNT(DISTINCT CASE WHEN AnswerCount > 0 THEN UserId END) AS Answerers,
+    AVG(TotalPosts) AS AvgPostsPerUser,
+    AVG(QuestionCount) AS AvgQuestionsPerUser,
+    AVG(AnswerCount) AS AvgAnswersPerUser,
+    MAX(TotalScore) AS MaxTotalScore,
+    MIN(TotalScore) AS MinTotalScore,
+    (SELECT AVG(Score) FROM TopQuestions) AS AvgTopQuestionScore,
+    (SELECT COUNT(*) FROM TopQuestions WHERE HasAcceptedOrHighScoringAnswer = 1) AS QuestionsWithAnswers,
+    (SELECT COUNT(*) FROM TopQuestions WHERE Score > 50) AS HighlyRatedQuestions,
+    (SELECT COUNT(*) FROM TopQuestions WHERE ViewCount > 1000) AS HighlyViewedQuestions,
+    (SELECT COUNT(DISTINCT PrimaryLanguage) FROM TopQuestions) AS LanguageCategories,
+    (SELECT STRING_AGG(DISTINCT PrimaryLanguage, ', ') FROM TopQuestions) AS LanguagesFound,
+    (SELECT STRING_AGG(DISTINCT OwnerName, ', ') FROM (SELECT OwnerName, Score FROM TopQuestions WHERE Score > 50 ORDER BY Score DESC LIMIT 5) t) AS TopScoringAuthors,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND CreationDate >= DATE '2023-01-01' AND CreationDate <= DATE '2023-12-31') AS QuestionsIn2023,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 2 AND CreationDate >= DATE '2023-01-01' AND CreationDate <= DATE '2023-12-31') AS AnswersIn2023,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Score > 100 AND CreationDate >= DATE '2023-01-01' AND CreationDate <= DATE '2023-12-31') AS HighScoringQuestionsIn2023,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 2 AND Score > 50 AND CreationDate >= DATE '2023-01-01' AND CreationDate <= DATE '2023-12-31') AS HighScoringAnswersIn2023
+FROM RankedUsers
+WHERE RankByScore <= 50 AND RankByPostCount <= 50 AND RankByQuestions <= 50
+GROUP BY
+    RankedUsers.UserId,
+    RankedUsers.DisplayName,
+    RankedUsers.Reputation,
+    RankedUsers.TotalPosts,
+    RankedUsers.QuestionCount,
+    RankedUsers.AnswerCount,
+    RankedUsers.TotalScore,
+    RankedUsers.AvgScore,
+    RankedUsers.LastPostDate,
+    RankedUsers.UniqueTagCount,
+    RankedUsers.AllTags,
+    RankedUsers.RankByScore,
+    RankedUsers.RankByPostCount,
+    RankedUsers.RankByQuestions
+HAVING COUNT(*) > 0;

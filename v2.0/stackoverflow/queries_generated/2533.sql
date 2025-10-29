@@ -1,0 +1,164 @@
+-- {"query": "2533.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1575} 
+with recursive UserBadgeCounts as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        row_number() over (order by u.Reputation desc, u.CreationDate) as UserRank
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+QuestionStats as (
+    select
+        p.Id as QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        coalesce(p.ViewCount, 0) as Views,
+        p.AnswerCount,
+        p.FavoriteCount,
+        (select count(*) from Comments c where c.PostId = p.Id) as CommentsCount,
+        (select count(distinct ph.UserId) from PostHistory ph where ph.PostId = p.Id) as DistinctEditors,
+        -- latest edit date of the post
+        (select max(ph.CreationDate) from PostHistory ph where ph.PostId = p.Id) as LatestEditDate,
+        -- concat all tags cleaned up as comma separated
+        (select string_agg(trim(both ' ' from tag), ', ') from unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags) - 2), '><')) as tag) as CleanTags
+    from Posts p
+    where p.PostTypeId = 1
+),
+AnswerStats as (
+    select
+        p.ParentId as QuestionId,
+        count(*) as AnswerCountTotal,
+        avg(p.Score) as AverageAnswerScore,
+        max(p.Score) as MaxAnswerScore,
+        sum(case when p.OwnerUserId is null then 1 else 0 end) as AnonymousAnswerCount,
+        max(p.CreationDate) as LatestAnswerDate
+    from Posts p
+    where p.PostTypeId = 2
+    group by p.ParentId
+),
+QuestionLinks as (
+    select
+        pl.PostId as QuestionId,
+        count(distinct case when lt.Name = 'Duplicate' then pl.RelatedPostId end) as DuplicateLinks,
+        count(distinct case when lt.Name = 'Linked' then pl.RelatedPostId end) as LinkedPosts
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    group by pl.PostId
+),
+CloseReasonSummary as (
+    select
+        ph.PostId,
+        crt.Name as CloseReason,
+        count(*) as CloseCount
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    where ph.PostHistoryTypeId = 10
+    group by ph.PostId, crt.Name
+),
+UserRecentActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        max(p.CreationDate) as LastQuestionDate,
+        max(a.CreationDate) as LastAnswerDate,
+        max(coalesce(p.LastActivityDate, a.LastActivityDate)) as LastActivity
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 1
+    left join Posts a on a.OwnerUserId = u.Id and a.PostTypeId = 2
+    group by u.Id, u.DisplayName
+),
+TopUsersQuestions as (
+    select
+        q.QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.CreationDate,
+        q.Score,
+        q.Views,
+        q.AnswerCount,
+        q.CleanTags,
+        q.CommentsCount,
+        q.DistinctEditors,
+        q.LatestEditDate,
+        coalesce(a.AnswerCountTotal, 0) as AnswerCountTotal,
+        coalesce(a.AverageAnswerScore, 0) as AverageAnswerScore,
+        coalesce(a.MaxAnswerScore, 0) as MaxAnswerScore,
+        coalesce(a.AnonymousAnswerCount, 0) as AnonymousAnswerCount,
+        coalesce(a.LatestAnswerDate, null) as LatestAnswerDate,
+        coalesce(l.DuplicateLinks, 0) as DuplicateLinks,
+        coalesce(l.LinkedPosts, 0) as LinkedPosts,
+        coalesce(crs.CloseCount, 0) as CloseVotes,
+        crs.CloseReason,
+        ubc.GoldBadges,
+        ubc.SilverBadges,
+        ubc.BronzeBadges,
+        ubc.UserRank
+    from QuestionStats q
+    left join AnswerStats a on a.QuestionId = q.QuestionId
+    left join QuestionLinks l on l.QuestionId = q.QuestionId
+    left join CloseReasonSummary crs on crs.PostId = q.QuestionId
+    left join Users u on u.Id = q.OwnerUserId
+    left join UserBadgeCounts ubc on ubc.UserId = q.OwnerUserId
+    where q.CreationDate > current_date - interval '180 days'
+),
+RankedQuestions as (
+    select
+        *,
+        ntile(5) over (order by Score desc) as ScoreQuintile,
+        ntile(5) over (order by Views desc) as ViewsQuintile,
+        ntile(5) over (order by AnswerCount desc) as AnswersQuintile,
+        ntile(4) over (order by coalesce(CloseVotes,0) desc) as CloseVotesQuartile
+    from TopUsersQuestions
+)
+select
+    rq.QuestionId,
+    substring(rq.Title from 1 for 80) as ShortTitle,
+    rq.Score,
+    rq.Views,
+    rq.AnswerCount,
+    rq.CommentsCount,
+    rq.GoldBadges,
+    rq.SilverBadges,
+    rq.BronzeBadges,
+    rq.UserRank,
+    rq.CloseVotes,
+    rq.CloseReason,
+    rq.CleanTags,
+    rq.LatestEditDate,
+    rq.LatestAnswerDate,
+    rq.DuplicateLinks,
+    rq.LinkedPosts,
+    rq.AnonymousAnswerCount,
+    rq.AverageAnswerScore,
+    rq.MaxAnswerScore,
+    rq.ScoreQuintile,
+    rq.ViewsQuintile,
+    rq.AnswersQuintile,
+    rq.CloseVotesQuartile,
+    case
+        when rq.CloseVotes > 0 then 'At Risk'
+        when rq.ScoreQuintile = 5 and rq.ViewsQuintile = 5 then 'Hot Question'
+        when rq.AnswersQuintile >= 4 then 'Popular'
+        else 'Normal'
+    end as QuestionStatus,
+    -- Complex string expression mixing info for display
+    concat_ws(' | ',
+        'Score: ' || rq.Score,
+        'Views: ' || rq.Views,
+        'Answers: ' || rq.AnswerCount,
+        'Gold badges: ' || rq.GoldBadges,
+        'CloseVotes: ' || rq.CloseVotes,
+        'Tags: ' || coalesce(rq.CleanTags, 'none')
+    ) as SummaryInfo
+from RankedQuestions rq
+where (rq.GoldBadges + rq.SilverBadges + rq.BronzeBadges) > 0
+  and rq.UserRank <= 1000
+  and (rq.CloseVotes is null or rq.CloseVotes < 5)
+order by rq.Score desc, rq.Views desc
+limit 100;

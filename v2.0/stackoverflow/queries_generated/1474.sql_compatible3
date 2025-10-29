@@ -1,0 +1,221 @@
+WITH UserEngagementMetrics AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        COALESCE(U.Location, 'Unknown') AS UserLocation,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS UserTotalUpVotes,
+        U.DownVotes AS UserTotalDownVotes,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestionsOwned,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswersOwned,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT B.Id) AS TotalBadgesEarned,
+        SUM(COALESCE(P.Score, 0)) AS SumOfPostScoresOwned,
+        SUM(COALESCE(C.Score, 0)) AS SumOfCommentScoresMade,
+        (CAST(U.Reputation AS DOUBLE PRECISION) * 0.1
+         + COUNT(DISTINCT P.Id) * 0.5
+         + COUNT(DISTINCT C.Id) * 0.3
+         + U.UpVotes * 0.05
+         - U.DownVotes * 0.02
+         + COUNT(DISTINCT B.Id) * 2.0) AS UserActivityScore,
+        NTILE(4) OVER (ORDER BY U.Reputation DESC, U.CreationDate ASC) AS ReputationQuartile,
+        CASE
+            WHEN U.AboutMe IS NOT NULL AND LENGTH(U.AboutMe) > 250 THEN 'Highly Detailed Bio'
+            WHEN U.AboutMe IS NOT NULL AND LENGTH(U.AboutMe) > 50 THEN 'Moderate Bio'
+            WHEN U.AboutMe IS NOT NULL THEN 'Minimal Bio'
+            ELSE 'No Bio Provided'
+        END AS AboutMeCategory,
+        (SELECT CASE WHEN EXISTS (SELECT 1 FROM Posts A WHERE A.OwnerUserId = U.Id AND A.PostTypeId = 2 AND A.AcceptedAnswerId IS NOT NULL) THEN 1 ELSE 0 END) AS HasAcceptedAnswer
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Location,
+        U.Views, U.UpVotes, U.DownVotes, U.AboutMe
+),
+PostContentAnalysis AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.OwnerUserId,
+        P.Title,
+        P.Tags,
+        P.CreationDate AS PostCreationDate,
+        P.LastActivityDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount AS ActualCommentCount,
+        P.FavoriteCount,
+        P.ClosedDate,
+        LENGTH(P.Body) AS BodyCharacterCount,
+        CAST((EXTRACT(EPOCH FROM (CAST(P.LastActivityDate AS timestamp) - CAST(P.CreationDate AS timestamp)))/86400) AS INTEGER) AS DaysSinceCreationActivity,
+        -- emulate COUNT(DISTINCT PH.UserId) OVER (PARTITION BY P.Id) by aggregated subquery
+        (SELECT COUNT(DISTINCT ph2.UserId) FROM PostHistory ph2 WHERE ph2.PostId = P.Id AND ph2.PostHistoryTypeId IN (4,5,6) AND ph2.UserId IS NOT NULL) AS DistinctEditorsCount,
+        (
+            EXTRACT(EPOCH FROM (
+                CAST(
+                    (SELECT MAX(ph2.CreationDate) FROM PostHistory ph2 WHERE ph2.PostId = P.Id AND ph2.PostHistoryTypeId IN (4,5,6))
+                    AS timestamp)
+                - CAST(
+                    (SELECT MIN(ph2.CreationDate) FROM PostHistory ph2 WHERE ph2.PostId = P.Id AND ph2.PostHistoryTypeId IN (4,5,6))
+                    AS timestamp)
+            ))
+        ) / 3600.0 AS HoursBetweenFirstLastEdit,
+        ( (COALESCE(P.Score, 0) * 2.5 + COALESCE(P.ViewCount, 0) * 0.1 + COALESCE(P.AnswerCount, 0) * 1.5 + COALESCE(P.CommentCount, 0) * 0.75 + COALESCE(P.FavoriteCount, 0) * 3.0)
+        / (1.0 + (CAST((EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - CAST(P.CreationDate AS timestamp))) / 86400.0) AS DOUBLE PRECISION) / 365.0)) ) AS DynamicEngagementScore,
+        CASE
+            WHEN LOWER(P.Body) LIKE '%performance%' OR LOWER(P.Title) LIKE '%benchmark%' THEN 'PerformanceRelated'
+            WHEN LOWER(P.Body) LIKE '%security%' OR LOWER(P.Title) LIKE '%vulnerability%' THEN 'SecurityRelated'
+            WHEN LOWER(P.Body) LIKE '%database%' OR LOWER(P.Tags) LIKE '%<sql>%' THEN 'DatabaseSpecific'
+            ELSE 'General'
+        END AS ContentKeywordCategory,
+        COALESCE(P.AcceptedAnswerId, -1) AS AcceptedAnswerId,
+        (SELECT CASE WHEN EXISTS (SELECT 1 FROM Posts Q WHERE Q.Id = P.ParentId AND Q.AcceptedAnswerId = P.Id) THEN 1 ELSE 0 END) AS IsAcceptedAnswer
+    FROM Posts P
+    LEFT JOIN PostTypes PT ON P.PostTypeId = PT.Id
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId AND PH.PostHistoryTypeId IN (4, 5, 6)
+    GROUP BY
+        P.Id, P.PostTypeId, PT.Name, P.OwnerUserId, P.Title, P.Tags, P.CreationDate, P.LastActivityDate,
+        P.Score, P.ViewCount, P.AnswerCount, P.CommentCount, P.FavoriteCount, P.ClosedDate, P.Body, P.AcceptedAnswerId, P.ParentId
+),
+PostVoteHistory AS (
+    SELECT
+        V.PostId,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesFromVotes,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesFromVotes,
+        SUM(CASE WHEN V.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoriteVotesFromVotes,
+        SUM(CASE WHEN V.VoteTypeId IN (6, 10, 12) THEN 1 ELSE 0 END) AS ModerationVotesCount,
+        COUNT(DISTINCT V.UserId) AS DistinctVotersCount,
+        AVG(CASE WHEN V.VoteTypeId = 2 THEN 1 WHEN V.VoteTypeId = 3 THEN -1 ELSE 0 END) AS AvgVoteImpact,
+        MIN(V.CreationDate) AS FirstVoteDate
+    FROM Votes V
+    GROUP BY V.PostId
+),
+ModerationAndClosureEvents AS (
+    SELECT
+        PH.PostId,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.CreationDate END) AS LastClosedDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 11 THEN PH.CreationDate END) AS LastReopenedDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 12 THEN PH.CreationDate END) AS LastDeletedDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 13 THEN PH.CreationDate END) AS LastUndeletedDate,
+        CR.Name AS CloseReasonName,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.UserId END) AS DistinctClosersCount,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId = 12 THEN PH.UserId END) AS DistinctDeletersCount,
+        (
+            EXTRACT(EPOCH FROM (
+                MAX(CASE WHEN PH.PostHistoryTypeId = 11 THEN PH.CreationDate ELSE NULL END)
+                - LAG(MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.CreationDate ELSE NULL END)) OVER (PARTITION BY PH.PostId ORDER BY MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.CreationDate ELSE NULL END) ASC)
+            )) / 3600.0
+        ) AS HoursUntilReopened
+    FROM PostHistory PH
+    LEFT JOIN CloseReasonTypes CR ON PH.PostHistoryTypeId = 10 AND CAST(PH.Comment AS INTEGER) = CR.Id
+    WHERE PH.PostHistoryTypeId IN (10, 11, 12, 13)
+    GROUP BY PH.PostId, CR.Name
+),
+TagPerformance AS (
+    SELECT
+        T.TagName,
+        COUNT(DISTINCT P.Id) AS TaggedPostCount,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TaggedQuestionCount,
+        AVG(P.Score) AS AvgScoreInTag,
+        AVG(P.ViewCount) AS AvgViewCountInTag,
+        SUM(CASE WHEN P.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '1 year') THEN COALESCE(P.Score,0) ELSE 0 END) AS RecentTagVigor,
+        MAX(P.CreationDate) AS LatestPostInTag
+    FROM Tags T
+    JOIN Posts P ON P.Tags LIKE '%' || '<' || T.TagName || '>' || '%'
+    GROUP BY T.TagName
+)
+SELECT
+    UEM.DisplayName AS User_DisplayName,
+    UEM.Reputation AS User_Reputation,
+    UEM.ReputationQuartile AS User_ReputationQuartile,
+    UEM.TotalPostsOwned AS User_TotalPosts,
+    UEM.TotalQuestionsOwned AS User_TotalQuestions,
+    UEM.TotalAnswersOwned AS User_TotalAnswers,
+    UEM.UserActivityScore AS User_CalculatedActivityScore,
+    UEM.AboutMeCategory AS User_AboutMeDetail,
+    UEM.HasAcceptedAnswer AS User_HasAcceptedAnswer,
+    PCA.PostId AS Post_ID,
+    PCA.PostTypeName AS Post_Type,
+    PCA.Title AS Post_Title,
+    PCA.PostScore AS Post_Score,
+    PCA.ViewCount AS Post_ViewCount,
+    PCA.DynamicEngagementScore AS Post_EngagementScore,
+    PCA.DistinctEditorsCount AS Post_DistinctEditors,
+    PCA.ContentKeywordCategory AS Post_KeywordCategory,
+    PVA.UpVotesFromVotes AS Post_UpVotes,
+    PVA.DownVotesFromVotes AS Post_DownVotes,
+    PVA.ModerationVotesCount AS Post_ModerationVotes,
+    PVA.AvgVoteImpact AS Post_AvgVoteImpact,
+    MA.LastClosedDate AS Post_LastClosedDate,
+    MA.CloseReasonName AS Post_CloseReason,
+    MA.DistinctClosersCount AS Post_DistinctClosers,
+    MA.HoursUntilReopened AS Post_HoursToReopen,
+    TP.TagName AS Primary_Tag_Name,
+    TP.AvgScoreInTag AS Primary_Tag_AvgScore,
+    TP.RecentTagVigor AS Primary_Tag_RecentVigor,
+    ROUND(
+        (COALESCE(UEM.UserActivityScore, 0) * 0.3)
+        + (COALESCE(PCA.DynamicEngagementScore, 0) * 0.5)
+        + (COALESCE(PVA.AvgVoteImpact, 0) * 10.0)
+        - (COALESCE(MA.DistinctClosersCount, 0) * 5.0)
+        + (CASE WHEN UEM.HasAcceptedAnswer = 1 THEN 20 ELSE 0 END)
+        + (CASE WHEN PCA.IsAcceptedAnswer = 1 THEN 15 ELSE 0 END)
+        + (CASE WHEN PCA.ContentKeywordCategory = 'PerformanceRelated' THEN 10 ELSE 0 END)
+        + (CASE WHEN PCA.PostTypeName = 'Question' AND PCA.AnswerCount IS NOT NULL AND PCA.AnswerCount > 5 THEN 5 ELSE 0 END)
+        , 2
+    ) AS Overall_CombinedRankScore,
+    CASE
+        WHEN MA.LastClosedDate IS NOT NULL AND MA.LastReopenedDate IS NULL THEN 'ClosedPermanently'
+        WHEN MA.LastClosedDate IS NOT NULL AND MA.LastReopenedDate IS NOT NULL AND MA.LastReopenedDate > MA.LastClosedDate THEN 'ClosedThenReopened'
+        WHEN MA.LastDeletedDate IS NOT NULL THEN 'Deleted'
+        WHEN PCA.ClosedDate IS NOT NULL AND MA.LastClosedDate IS NULL THEN 'Closed_Legacy'
+        ELSE 'ActiveOrOpen'
+    END AS Post_ModerationStatus,
+    COALESCE(UEM.DisplayName, 'Community User') || ' posted on ' || COALESCE(TP.TagName, 'General') AS User_Tag_Summary
+FROM UserEngagementMetrics UEM
+INNER JOIN PostContentAnalysis PCA ON UEM.UserId = PCA.OwnerUserId
+LEFT JOIN PostVoteHistory PVA ON PCA.PostId = PVA.PostId
+LEFT JOIN ModerationAndClosureEvents MA ON PCA.PostId = MA.PostId
+LEFT JOIN Tags temp_tags ON PCA.Tags LIKE '%' || '<' || temp_tags.TagName || '>' || '%'
+LEFT JOIN TagPerformance TP ON temp_tags.TagName = TP.TagName
+WHERE
+    UEM.Reputation >= 5000
+    AND PCA.PostScore >= 10
+    AND PCA.PostTypeId IN (1, 2)
+    AND PCA.PostCreationDate BETWEEN DATE '2021-01-01' AND DATE '2023-12-31'
+    AND (
+        (PCA.ContentKeywordCategory = 'PerformanceRelated' AND PCA.DynamicEngagementScore > 50)
+        OR
+        (UEM.HasAcceptedAnswer = 1 AND PCA.IsAcceptedAnswer = 1)
+        OR
+        (MA.DistinctClosersCount > 0 AND MA.HoursUntilReopened IS NOT NULL AND MA.HoursUntilReopened < 72)
+    )
+    AND EXISTS (SELECT 1 FROM Badges B WHERE B.UserId = UEM.UserId AND B.Class = 1 AND B.Date >= UEM.UserCreationDate)
+GROUP BY
+    UEM.DisplayName, UEM.Reputation, UEM.ReputationQuartile, UEM.TotalPostsOwned, UEM.TotalQuestionsOwned,
+    UEM.TotalAnswersOwned, UEM.UserActivityScore, UEM.AboutMeCategory, UEM.HasAcceptedAnswer,
+    PCA.PostId, PCA.PostTypeName, PCA.Title, PCA.PostScore, PCA.ViewCount, PCA.DynamicEngagementScore,
+    PCA.DistinctEditorsCount, PCA.ContentKeywordCategory, PVA.UpVotesFromVotes, PVA.DownVotesFromVotes,
+    PVA.ModerationVotesCount, PVA.AvgVoteImpact, MA.LastClosedDate, MA.CloseReasonName,
+    MA.DistinctClosersCount, MA.HoursUntilReopened, TP.TagName, TP.AvgScoreInTag, TP.RecentTagVigor,
+    PCA.AnswerCount, MA.LastDeletedDate, PCA.ClosedDate, PCA.IsAcceptedAnswer, PCA.PostCreationDate, PCA.PostTypeId, PCA.PostTypeName, UEM.DisplayName, UEM.Reputation
+HAVING ROUND(
+        (COALESCE(UEM.UserActivityScore, 0) * 0.3)
+        + (COALESCE(PCA.DynamicEngagementScore, 0) * 0.5)
+        + (COALESCE(PVA.AvgVoteImpact, 0) * 10.0)
+        - (COALESCE(MA.DistinctClosersCount, 0) * 5.0)
+        + (CASE WHEN UEM.HasAcceptedAnswer = 1 THEN 20 ELSE 0 END)
+        + (CASE WHEN PCA.IsAcceptedAnswer = 1 THEN 15 ELSE 0 END)
+        + (CASE WHEN PCA.ContentKeywordCategory = 'PerformanceRelated' THEN 10 ELSE 0 END)
+        + (CASE WHEN PCA.PostTypeName = 'Question' AND PCA.AnswerCount IS NOT NULL AND PCA.AnswerCount > 5 THEN 5 ELSE 0 END)
+        , 2
+    ) > 100
+ORDER BY Overall_CombinedRankScore DESC, UEM.Reputation DESC, Post_ID ASC;

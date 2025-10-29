@@ -1,0 +1,247 @@
+-- {"query": "1895.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3113} 
+
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.UpVotes,
+        U.DownVotes,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COALESCE(AVG(P.Score), 0) AS AvgPostScore,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        -- Calculate Up/Down Vote Ratio, handle division by zero with NULLIF
+        CAST(U.UpVotes AS NUMERIC) / NULLIF(U.DownVotes, 0) AS UpDownVoteRatio,
+        -- Calculate days since user creation
+        EXTRACT(EPOCH FROM (NOW() - U.CreationDate)) / 86400.0 AS DaysSinceCreation,
+        -- Rank users by reputation
+        DENSE_RANK() OVER (ORDER BY U.Reputation DESC) AS ReputationRank
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.UpVotes, U.DownVotes
+    HAVING COUNT(DISTINCT P.Id) > 5 -- Filter for users with at least 5 posts
+),
+PostVoteCounts AS (
+    SELECT
+        PostId,
+        SUM(CASE WHEN VT.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN VT.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVoteCount,
+        SUM(CASE WHEN VT.Name = 'Favorite' THEN 1 ELSE 0 END) AS FavoriteCountFromVotes
+    FROM Votes V
+    JOIN VoteTypes VT ON V.VoteTypeId = VT.Id
+    GROUP BY PostId
+),
+PostEngagementMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score,
+        P.ViewCount,
+        COALESCE(P.FavoriteCount, 0) AS PostFavoriteCount, -- Use COALESCE for potential NULL FavoriteCount
+        P.CommentCount,
+        P.ClosedDate,
+        P.LastEditDate,
+        P.LastActivityDate,
+        P.Title,
+        P.Tags,
+        COALESCE(PVC.UpVoteCount, 0) AS TotalUpvotesOnPost,
+        COALESCE(PVC.DownVoteCount, 0) AS TotalDownvotesOnPost,
+        COALESCE(PVC.FavoriteCountFromVotes, 0) AS TotalFavoriteVotesOnPost,
+        -- Calculate score per day, handling division by zero
+        COALESCE(P.Score, 0) / NULLIF(EXTRACT(EPOCH FROM (NOW() - P.CreationDate)) / 86400.0, 0) AS ScorePerDay,
+        -- Categorize post status based on several conditions
+        CASE
+            WHEN P.ClosedDate IS NOT NULL AND P.PostTypeId = 1 THEN 'Closed Question'
+            WHEN P.AcceptedAnswerId IS NOT NULL AND P.PostTypeId = 1 THEN 'Answered Question'
+            WHEN P.AnswerCount = 0 AND P.PostTypeId = 1 THEN 'Unanswered Question'
+            WHEN P.PostTypeId = 2 THEN 'Answer Post'
+            ELSE 'Other Post Type'
+        END AS PostStatus,
+        -- Calculate number of tags per post, handling potential NULL Tags
+        ARRAY_LENGTH(string_to_array(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags) - 2), '><'), 1) AS TagCount
+    FROM Posts P
+    LEFT JOIN PostVoteCounts PVC ON P.Id = PVC.PostId
+    WHERE P.PostTypeId IN (1, 2) -- Focus on Questions and Answers
+),
+PostEditDetails AS (
+    SELECT
+        PH.PostId,
+        PH.CreationDate AS EditDate,
+        PH.UserId AS EditorUserId,
+        PH.PostHistoryTypeId,
+        -- Assign a row number to find the latest edit for each post
+        ROW_NUMBER() OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate DESC) AS rn
+    FROM PostHistory PH
+    WHERE PH.PostHistoryTypeId IN (4, 5, 6, 8, 9) -- Edit Title, Edit Body, Edit Tags, Rollback Body, Rollback Tags
+),
+RecentPostEdits AS (
+    SELECT
+        PED.PostId,
+        MAX(PED.EditDate) AS LastEditHistoryDate,
+        COUNT(*) AS TotalRevisions,
+        COUNT(DISTINCT PED.EditorUserId) AS UniqueEditors,
+        -- Correlated subquery to find the display name of the latest editor
+        (SELECT U.DisplayName FROM Users U WHERE U.Id = (SELECT EditorUserId FROM PostEditDetails WHERE PostId = PED.PostId AND rn = 1)) AS LatestEditorDisplayName,
+        -- Correlated subquery to find the name of the latest edit action type
+        (SELECT PHT.Name FROM PostHistoryTypes PHT WHERE PHT.Id = (SELECT PostHistoryTypeId FROM PostEditDetails WHERE PostId = PED.PostId AND rn = 1)) AS LatestEditAction
+    FROM PostEditDetails PED
+    WHERE PED.EditDate >= NOW() - INTERVAL '6 months' -- Filter for recent edits
+    GROUP BY PED.PostId
+),
+UserBadgesSummary AS (
+    SELECT
+        B.UserId,
+        COUNT(B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges B
+    GROUP BY B.UserId
+),
+HighImpactQuestionsBranch AS (
+    SELECT
+        PEM.PostId,
+        PEM.Title,
+        UAS.DisplayName AS QuestionOwner,
+        UAS.Reputation AS OwnerReputation,
+        PEM.PostCreationDate,
+        PEM.Score AS QuestionScore,
+        PEM.ViewCount,
+        PEM.PostFavoriteCount,
+        PEM.CommentCount,
+        PEM.PostStatus,
+        COALESCE(RPE.TotalRevisions, 0) AS TotalEditRevisions,
+        RPE.LatestEditorDisplayName,
+        RPE.LatestEditAction,
+        NULL::VARCHAR(300) AS RelatedPostTitle, -- Explicitly NULL and cast for UNION ALL compatibility
+        'HighViewFavorite' AS ImpactCategory,
+        -- Subquery to sum scores of all answers to this question
+        (SELECT COALESCE(SUM(Ans.Score), 0) FROM Posts Ans WHERE Ans.ParentId = PEM.PostId AND Ans.PostTypeId = 2) AS SumOfAnswerScores,
+        COALESCE(UAS.UpDownVoteRatio, 0.0) AS OwnerUpDownVoteRatio,
+        -- Nested correlated subquery: average score of questions asked by users with similar reputation range before this post
+        (SELECT AVG(SubQ.Score)
+         FROM Posts SubQ
+         WHERE SubQ.PostTypeId = 1
+           AND SubQ.OwnerUserId IN (
+               SELECT InnerU.Id
+               FROM Users InnerU
+               WHERE InnerU.Reputation BETWEEN UAS.Reputation - 1000 AND UAS.Reputation + 1000
+           )
+           AND SubQ.CreationDate < PEM.PostCreationDate
+           AND SubQ.Score IS NOT NULL
+        ) AS AvgSimilarRepUserQScore,
+        NULL::INT AS CountOfRelatedSpecificTags -- Explicitly NULL for UNION ALL compatibility
+    FROM PostEngagementMetrics PEM
+    JOIN UserActivitySummary UAS ON PEM.OwnerUserId = UAS.UserId
+    LEFT JOIN RecentPostEdits RPE ON PEM.PostId = RPE.PostId
+    LEFT JOIN UserBadgesSummary UBS ON UAS.UserId = UBS.UserId
+    WHERE PEM.PostTypeId = 1 -- Only questions
+      AND PEM.ViewCount > 50000 -- High view count
+      AND PEM.PostFavoriteCount > 100 -- Many favorites
+      AND UAS.Reputation > 20000 -- High reputation owner
+      AND PEM.PostStatus NOT LIKE '%Closed%' -- Not closed
+      AND EXISTS (SELECT 1 FROM Badges B WHERE B.UserId = UAS.UserId AND B.Class = 1) -- Owner has at least one Gold badge
+      AND PEM.Tags IS NOT NULL -- Tags must exist
+      AND PEM.Tags ILIKE '%<sql>%' -- Must contain 'sql' tag (case-insensitive)
+      AND PEM.CreationDate >= NOW() - INTERVAL '4 years' -- Created in last 4 years
+),
+ActiveCommunityContributionsBranch AS (
+    SELECT
+        PEM.PostId,
+        PEM.Title,
+        UAS.DisplayName AS QuestionOwner,
+        UAS.Reputation AS OwnerReputation,
+        PEM.PostCreationDate,
+        PEM.Score AS QuestionScore,
+        PEM.ViewCount,
+        PEM.PostFavoriteCount,
+        PEM.CommentCount,
+        PEM.PostStatus,
+        COALESCE(RPE.TotalRevisions, 0) AS TotalEditRevisions,
+        RPE.LatestEditorDisplayName,
+        RPE.LatestEditAction,
+        COALESCE(P_linked.Title, 'No Linked Title') AS RelatedPostTitle, -- Get title of linked post, with NULL handling
+        'ActiveCommunity' AS ImpactCategory,
+        -- Subquery to sum scores of all answers to this question
+        (SELECT COALESCE(SUM(Ans.Score), 0) FROM Posts Ans WHERE Ans.ParentId = PEM.PostId AND Ans.PostTypeId = 2) AS SumOfAnswerScores,
+        COALESCE(UAS.UpDownVoteRatio, 0.0) AS OwnerUpDownVoteRatio,
+        NULL::NUMERIC AS AvgSimilarRepUserQScore, -- Explicitly NULL for UNION ALL compatibility
+        -- Nested correlated subquery: count specific tags in related posts
+        (SELECT COUNT(DISTINCT T_rel.TagName)
+         FROM PostLinks PL_inner
+         JOIN Posts P_rel ON PL_inner.RelatedPostId = P_rel.Id
+         JOIN Tags T_rel ON P_rel.Tags LIKE '%<' || T_rel.TagName || '>%' -- String matching on tags
+         WHERE PL_inner.PostId = PEM.PostId
+           AND P_rel.Tags IS NOT NULL
+           AND P_rel.Tags ILIKE '%<database>%' -- Related post must contain 'database' tag (case-insensitive)
+           AND T_rel.TagName IN ('sql', 'postgresql', 'mysql') -- Specific tag names
+        ) AS CountOfRelatedSpecificTags
+    FROM PostEngagementMetrics PEM
+    JOIN UserActivitySummary UAS ON PEM.OwnerUserId = UAS.UserId
+    LEFT JOIN RecentPostEdits RPE ON PEM.PostId = RPE.PostId
+    LEFT JOIN PostLinks PL ON PEM.PostId = PL.PostId AND PL.LinkTypeId = 1 -- Linked posts
+    LEFT JOIN Posts P_linked ON PL.RelatedPostId = P_linked.Id -- Join to get title of linked post
+    WHERE PEM.PostTypeId = 1 -- Only questions
+      AND PEM.CommentCount > 50 -- Many comments
+      AND PEM.TotalUpvotesOnPost > 200 -- Many upvotes
+      AND COALESCE(RPE.TotalRevisions, 0) > 10 -- Many edits
+      AND PEM.CreationDate >= NOW() - INTERVAL '5 years' -- Created in last 5 years
+      AND PEM.ClosedDate IS NULL -- Not closed
+      AND PEM.OwnerUserId IS NOT NULL -- Must have an owner
+      AND (UAS.ReputationRank <= 1000 OR UAS.TotalQuestions > 50) -- Either top 1000 reputation or very prolific question asker
+)
+-- Final UNION ALL to combine results from both branches
+-- Using a WHERE NOT IN clause to ensure distinct PostIds across branches before the UNION ALL for a distinct set
+SELECT
+    PostId,
+    Title,
+    QuestionOwner,
+    OwnerReputation,
+    PostCreationDate,
+    QuestionScore,
+    ViewCount,
+    PostFavoriteCount,
+    CommentCount,
+    PostStatus,
+    TotalEditRevisions,
+    LatestEditorDisplayName,
+    LatestEditAction,
+    RelatedPostTitle,
+    ImpactCategory,
+    SumOfAnswerScores,
+    OwnerUpDownVoteRatio,
+    AvgSimilarRepUserQScore,
+    CountOfRelatedSpecificTags
+FROM HighImpactQuestionsBranch
+WHERE PostId NOT IN (SELECT PostId FROM ActiveCommunityContributionsBranch)
+UNION ALL
+SELECT
+    PostId,
+    Title,
+    QuestionOwner,
+    OwnerReputation,
+    PostCreationDate,
+    QuestionScore,
+    ViewCount,
+    PostFavoriteCount,
+    CommentCount,
+    PostStatus,
+    TotalEditRevisions,
+    LatestEditorDisplayName,
+    LatestEditAction,
+    RelatedPostTitle,
+    ImpactCategory,
+    SumOfAnswerScores,
+    OwnerUpDownVoteRatio,
+    AvgSimilarRepUserQScore,
+    CountOfRelatedSpecificTags
+FROM ActiveCommunityContributionsBranch
+ORDER BY PostCreationDate DESC, QuestionScore DESC
+LIMIT 1000;

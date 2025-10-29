@@ -1,0 +1,97 @@
+WITH UserStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.AboutMe, '') AS AboutMe,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadges,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS QuestionsPosted,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS AnswersPosted,
+        (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 2) AS UpVotesGiven,
+        (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 3) AS DownVotesGiven,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC,
+            (SELECT COUNT(*) FROM Badges b2 WHERE b2.UserId = u.Id AND b2.Class = 1) DESC
+        ) AS ReputationRank
+    FROM Users u
+    WHERE u.Reputation > 1000
+),
+TagStats AS (
+    SELECT
+        t.TagName,
+        t.Count AS TagUseCount,
+        COALESCE(e.Title, '') AS ExcerptTitle,
+        COALESCE(w.Title, '') AS WikiTitle,
+        (SELECT COUNT(*) FROM Posts p
+         WHERE p.Tags LIKE '%' || '<' || t.TagName || '>' || '%' AND p.PostTypeId = 1) AS QuestionCount,
+        (SELECT AVG(p.Score) FROM Posts p
+         WHERE p.Tags LIKE '%' || '<' || t.TagName || '>' || '%' AND p.PostTypeId = 1) AS AvgQuestionScore
+    FROM Tags t
+    LEFT JOIN Posts e ON e.Id = t.ExcerptPostId
+    LEFT JOIN Posts w ON w.Id = t.WikiPostId
+    WHERE t.IsModeratorOnly = FALSE
+),
+RecentActivity AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        MAX(p.LastActivityDate) AS LastActivity,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsLastMonth,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersLastMonth
+    FROM Posts p
+    WHERE p.CreationDate >= (DATE '2024-10-01' - INTERVAL '30' DAY)
+    GROUP BY p.OwnerUserId
+),
+PostTagMap AS (
+    SELECT
+        p.OwnerUserId,
+        tag_tag.tag AS TagName,
+        t.Count AS TagUseCount,
+        (SELECT COUNT(*) FROM Posts p2
+         WHERE p2.Tags LIKE '%' || '<' || tag_tag.tag || '>' || '%' AND p2.PostTypeId = 1) AS QuestionCount
+    FROM Posts p
+    JOIN LATERAL (
+      SELECT regexp_match AS tag FROM (SELECT regexp_split_to_table(p.Tags, '[><]') AS regexp_match) s
+    ) AS tag_tag(tag) ON TRUE
+    JOIN Tags t ON t.TagName = tag_tag.tag
+    WHERE p.PostTypeId = 1 AND p.OwnerUserId IS NOT NULL
+)
+SELECT
+    us.Id,
+    us.DisplayName,
+    us.Reputation,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    us.QuestionsPosted,
+    us.AnswersPosted,
+    us.UpVotesGiven,
+    us.DownVotesGiven,
+    us.ReputationRank,
+    COALESCE(ra.LastActivity, TIMESTAMP '1970-01-01 00:00:00') AS LastActivity,
+    COALESCE(ra.QuestionsLastMonth, 0) AS QsLast30d,
+    COALESCE(ra.AnswersLastMonth, 0) AS AsLast30d,
+    STRING_AGG(DISTINCT ptm.TagName, ', ') FILTER (WHERE ptm.QuestionCount > 0) AS ActiveTags,
+    MAX(ts.TagUseCount) OVER () AS MaxTagUseCount
+FROM UserStats us
+LEFT JOIN RecentActivity ra ON ra.UserId = us.Id
+LEFT JOIN PostTagMap ptm ON ptm.OwnerUserId = us.Id
+LEFT JOIN TagStats ts ON ts.TagName = ptm.TagName
+WHERE us.ReputationRank <= 100
+GROUP BY
+    us.Id,
+    us.DisplayName,
+    us.Reputation,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    us.QuestionsPosted,
+    us.AnswersPosted,
+    us.UpVotesGiven,
+    us.DownVotesGiven,
+    us.ReputationRank,
+    ra.LastActivity,
+    ra.QuestionsLastMonth,
+    ra.AnswersLastMonth
+ORDER BY us.ReputationRank
+LIMIT 100;

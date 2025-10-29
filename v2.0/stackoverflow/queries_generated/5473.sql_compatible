@@ -1,0 +1,181 @@
+WITH top_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ContentLicense,
+    ASQ.Cnt AS UndeletedAnswers
+  FROM Posts p
+  LEFT JOIN (
+    SELECT ParentId, COUNT(*) AS Cnt
+    FROM Posts
+    WHERE PostTypeId = 2
+      AND ClosedDate IS NULL
+    GROUP BY ParentId
+  ) AS ASQ ON ASQ.ParentId = p.Id
+  WHERE p.PostTypeId = 1
+    AND p.ClosedDate IS NULL
+),
+recent_comments AS (
+  SELECT
+    c.PostId,
+    c.Id AS CommentId,
+    c.Text,
+    c.CreationDate,
+    c.UserDisplayName,
+    c.UserId,
+    c.Score
+  FROM Comments c
+  WHERE c.CreationDate > (CAST('2024-10-01' AS date) - INTERVAL '30 days')
+),
+tag_expansion AS (
+  SELECT
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId,
+    t.WikiPostId,
+    t.IsModeratorOnly,
+    t.IsRequired
+  FROM Tags t
+),
+activity_per_post AS (
+  SELECT
+    tq.PostId,
+    tq.Title,
+    tq.Tags,
+    tq.Score,
+    tq.ViewCount,
+    tq.CreationDate,
+    tq.OwnerUserId,
+    tq.LastActivityDate,
+    tq.AnswerCount,
+    tq.CommentCount,
+    tq.FavoriteCount,
+    COALESCE(ch.CommentId, 0) AS DraftCommentId,
+    COALESCE(ch.Text, '') AS DraftCommentText,
+    ARRAY_AGG(DISTINCT vl.VoteTypeId) FILTER (WHERE vl.PostId = tq.PostId) AS VoteTypes
+  FROM (
+    SELECT
+      p.Id AS PostId,
+      p.Title,
+      p.Tags,
+      p.Score,
+      p.ViewCount,
+      p.CreationDate,
+      p.OwnerUserId,
+      p.LastActivityDate,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    WHERE p.PostTypeId = 1
+      AND p.ClosedDate IS NULL
+  ) AS tq
+  LEFT JOIN recent_comments ch ON ch.PostId = tq.PostId
+  LEFT JOIN Votes vl ON vl.PostId = tq.PostId
+  GROUP BY
+    tq.PostId, tq.Title, tq.Tags, tq.Score, tq.ViewCount, tq.CreationDate,
+    tq.OwnerUserId, tq.LastActivityDate, tq.AnswerCount, tq.CommentCount, tq.FavoriteCount, ch.CommentId, ch.Text
+),
+complex_benchmark AS (
+  SELECT
+    a.PostId,
+    a.Title,
+    a.Tags,
+    a.Score,
+    a.ViewCount,
+    a.CreationDate,
+    a.OwnerUserId,
+    a.LastActivityDate,
+    a.AnswerCount,
+    a.CommentCount,
+    a.FavoriteCount,
+    a.DraftCommentId,
+    a.DraftCommentText,
+    a.VoteTypes,
+    SUM(COALESCE(vl.BountyAmount, 0)) OVER (
+      PARTITION BY a.OwnerUserId
+      ORDER BY a.CreationDate
+      ROWS BETWEEN 29 PRECEDING AND CURRENT ROW
+    ) AS CumulativeBounty
+  FROM activity_per_post a
+  LEFT JOIN Votes vl ON vl.PostId = a.PostId
+),
+final_output AS (
+  SELECT
+    cb.PostId,
+    cb.Title,
+    -- produce top up to 6 tags as a comma-separated string then split in a portable way using standard functions where available
+    -- Implementation: take first 6 tags from the >< delimited Tags string by replacing borders and splitting, implemented via generic string functions
+    CASE
+      WHEN cb.Tags IS NULL OR cb.Tags = '' THEN NULL
+      ELSE
+        -- Replace leading '<' and trailing '>' characters, then split by '><' into elements and rejoin first up to 6 with comma
+        (
+          SELECT
+            CASE WHEN COUNT(1) = 0 THEN NULL
+                 ELSE STRING_AGG(elem, ',') END
+          FROM (
+            SELECT elem, rn
+            FROM (
+              SELECT
+                TRIM(BOTH '<>' FROM cb.Tags) AS inner_tags
+            ) t0,
+            -- split by '><' emulation: repeatedly parse using a numbers table derived from string functions
+            (
+              SELECT
+                SUBSTRING(
+                  t0.inner_tags,
+                  pos + 1,
+                  COALESCE(NULLIF(next_pos - pos - 1, -1), LENGTH(t0.inner_tags) - pos)
+                ) AS elem,
+                ROW_NUMBER() OVER (ORDER BY pos) AS rn
+              FROM (
+                -- generate positions of separators
+                SELECT
+                  0 AS pos
+                UNION ALL
+                SELECT
+                  POSITION('><' IN t0.inner_tags) AS pos
+              ) pos_tbl
+              CROSS JOIN LATERAL (
+                -- fallback single element extraction: for portability, use a simple approach: return the whole string as one element
+                SELECT t0.inner_tags AS elem, 1 AS rn
+              ) single
+            ) elems
+            WHERE elem IS NOT NULL
+            ORDER BY rn
+            LIMIT 6
+          ) limited
+        )
+    END AS TopTags,
+    cb.Score,
+    cb.ViewCount,
+    cb.CreationDate,
+    cb.OwnerUserId,
+    (SELECT DisplayName FROM Users u WHERE u.Id = cb.OwnerUserId) AS OwnerDisplayName,
+    cb.LastActivityDate,
+    cb.AnswerCount,
+    cb.CommentCount,
+    cb.FavoriteCount,
+    cb.DraftCommentId,
+    cb.DraftCommentText,
+    cb.VoteTypes,
+    cb.CumulativeBounty
+  FROM complex_benchmark cb
+  LEFT JOIN Posts p ON p.Id = cb.PostId
+  LEFT JOIN Tags t ON t.ExcerptPostId = p.Id OR t.WikiPostId = p.Id
+)
+SELECT *
+FROM final_output
+ORDER BY CreationDate DESC
+LIMIT 100;

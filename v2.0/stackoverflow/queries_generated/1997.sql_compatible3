@@ -1,0 +1,307 @@
+WITH RECURSIVE UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.WebsiteUrl,
+        u.AboutMe,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COALESCE(AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END), 0) AS AvgQuestionScore,
+        COALESCE(MAX(CASE WHEN p.PostTypeId = 2 THEN p.Score END), 0) AS MaxAnswerScore,
+        COALESCE(SUM(p.ViewCount), 0) AS TotalPostViews,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN c.UserId = u.Id THEN c.Score ELSE 0 END) AS TotalCommentScore,
+        MAX(p.LastActivityDate) AS LastPostActivity,
+        MIN(p.CreationDate) AS FirstPostDate,
+        (u.Reputation * 0.1) +
+        (COUNT(DISTINCT p.Id) * 0.5) +
+        (COUNT(DISTINCT c.Id) * 0.2) +
+        COALESCE(SUM(p.Score), 0) * 0.05 +
+        COALESCE(SUM(p.ViewCount), 0) * 0.001 +
+        (CASE WHEN u.AboutMe IS NOT NULL AND CHAR_LENGTH(u.AboutMe) > 100 THEN 10 ELSE 0 END)
+        AS EngagementScore,
+        EXISTS (
+            SELECT 1
+            FROM Posts own_q
+            INNER JOIN Posts accepted_a ON own_q.AcceptedAnswerId = accepted_a.Id
+            WHERE own_q.PostTypeId = 1
+              AND own_q.OwnerUserId = u.Id
+              AND accepted_a.OwnerUserId = u.Id
+            LIMIT 1
+        ) AS HasSelfAcceptedAnswer
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.WebsiteUrl, u.AboutMe
+),
+PostHistoryMetrics AS (
+    SELECT
+        ph.PostId,
+        COUNT(DISTINCT ph.Id) AS TotalHistoryEntries,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditCount,
+        MAX(ph.CreationDate) AS LastHistoryEventDate,
+        MIN(ph.CreationDate) AS FirstHistoryEventDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (10, 101, 102, 103, 104, 105) THEN 1 ELSE 0 END) AS HasBeenClosedViaHistory,
+        COALESCE(
+            (SELECT COALESCE(ph_latest.UserDisplayName, u_latest.DisplayName, 'Community')
+             FROM PostHistory ph_latest
+             LEFT JOIN Users u_latest ON ph_latest.UserId = u_latest.Id
+             WHERE ph_latest.PostId = ph.PostId
+             ORDER BY ph_latest.CreationDate DESC
+             LIMIT 1),
+            'Original Creator'
+        ) AS LatestEditorDisplayName,
+        EXTRACT(EPOCH FROM (MAX(ph.CreationDate) - MIN(ph.CreationDate))) / 60.0 AS TotalEditTimeMinutes
+    FROM
+        PostHistory ph
+    GROUP BY
+        ph.PostId
+),
+TagExplodedSeed AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        TRIM(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2)) AS TagsStr,
+        '' AS TagName,
+        1 AS part_index,
+        p.Id AS PostId
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND p.OwnerUserId IS NOT NULL
+),
+TagExploded AS (
+    SELECT UserId, TagsStr, TagName, part_index, PostId FROM TagExplodedSeed
+    UNION ALL
+    SELECT
+        te.UserId,
+        te.TagsStr,
+        TRIM(CASE
+            WHEN POSITION('><' IN te.TagsStr) > 0 THEN SUBSTRING(te.TagsStr FROM 1 FOR POSITION('><' IN te.TagsStr) - 1)
+            ELSE te.TagsStr
+        END) AS TagName,
+        te.part_index + 1,
+        te.PostId
+    FROM TagExploded te
+    WHERE te.TagsStr <> ''
+      AND POSITION('><' IN te.TagsStr) > 0
+
+    UNION ALL
+
+    SELECT
+        te.UserId,
+        CASE WHEN POSITION('><' IN te.TagsStr) > 0 THEN SUBSTRING(te.TagsStr FROM POSITION('><' IN te.TagsStr) + 2) ELSE '' END AS TagsStr,
+        TRIM(CASE
+            WHEN POSITION('><' IN te.TagsStr) > 0 THEN SUBSTRING(te.TagsStr FROM 1 FOR POSITION('><' IN te.TagsStr) - 1)
+            ELSE te.TagsStr
+        END) AS TagName,
+        te.part_index + 1,
+        te.PostId
+    FROM TagExploded te
+    WHERE te.TagsStr <> ''
+      AND POSITION('><' IN te.TagsStr) > 0
+),
+TagDominance AS (
+    SELECT
+        UserId,
+        STRING_AGG(TagName || ' (' || PostCount || ')', '; ') AS TopTagsSummary
+    FROM (
+        SELECT
+            te.UserId,
+            te.TagName,
+            COUNT(DISTINCT te.PostId) AS PostCount,
+            ROW_NUMBER() OVER (PARTITION BY te.UserId ORDER BY COUNT(DISTINCT te.PostId) DESC, te.TagName) AS rn
+        FROM (
+            SELECT DISTINCT UserId, PostId, TagName
+            FROM (
+                SELECT UserId, PostId,
+                       CASE WHEN TagName = '' THEN NULL ELSE TagName END AS TagName
+                FROM TagExploded
+            ) sub
+            WHERE TagName IS NOT NULL AND TagName <> ''
+        ) te
+        GROUP BY te.UserId, te.TagName
+    ) AS RankedTags
+    WHERE rn <= 3
+    GROUP BY UserId
+),
+VoteAnalysis AS (
+    SELECT
+        u.Id AS UserId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesGiven,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesGiven,
+        SUM(CASE WHEN v.VoteTypeId = 8 THEN COALESCE(v.BountyAmount, 0) ELSE 0 END) AS TotalBountyGiven,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 5 THEN v.PostId END) AS PostsFavorited
+    FROM
+        Users u
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId
+    GROUP BY
+        u.Id
+),
+PostDetailsExtended AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId AS PostOwnerId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate AS PostCreationDate,
+        p.ClosedDate,
+        p.Title,
+        p.Tags,
+        p.AcceptedAnswerId,
+        phm.HasBeenClosedViaHistory,
+        phm.EditCount,
+        phm.LatestEditorDisplayName,
+        phm.TotalEditTimeMinutes,
+        (p.Score * 5.0) +
+        (COALESCE(p.ViewCount, 0) * 0.1) +
+        (COALESCE(p.AnswerCount, 0) * 2.0) +
+        (COALESCE(p.CommentCount, 0) * 1.0) +
+        (COALESCE(p.FavoriteCount, 0) * 10.0) -
+        (CASE WHEN p.ClosedDate IS NOT NULL THEN 100 ELSE 0 END) -
+        (COALESCE(phm.EditCount, 0) * 0.5)
+        AS PostQualityScore,
+        (CASE
+            WHEN p.Tags IS NOT NULL AND POSITION('<' IN p.Tags) > 0 AND POSITION('>' IN p.Tags) > POSITION('<' IN p.Tags)
+            THEN SUBSTRING(p.Tags FROM POSITION('<' IN p.Tags) + 1 FOR POSITION('>' IN p.Tags) - POSITION('<' IN p.Tags) - 1)
+            ELSE 'no-tag'
+        END) AS FirstTag,
+        (CASE WHEN p.PostTypeId = 1 AND p.AnswerCount IS NULL AND p.AcceptedAnswerId IS NULL THEN TRUE ELSE FALSE END) AS IsUnansweredQuestion
+    FROM
+        Posts p
+    LEFT JOIN
+        PostHistoryMetrics phm ON p.Id = phm.PostId
+),
+QuestionCentricUsers AS (
+    SELECT
+        ue.UserId,
+        ue.DisplayName,
+        ue.Reputation,
+        ue.TotalQuestions,
+        ue.TotalAnswers,
+        ue.EngagementScore,
+        td.TopTagsSummary,
+        va.UpvotesGiven,
+        va.DownvotesGiven,
+        va.PostsFavorited,
+        'Question_Focused' AS UserCategory,
+        AVG(pde.PostQualityScore) AS AvgPostQualityForCategory,
+        COUNT(DISTINCT b.Id) AS TotalBadges
+    FROM
+        UserEngagement ue
+    LEFT JOIN
+        TagDominance td ON ue.UserId = td.UserId
+    LEFT JOIN
+        VoteAnalysis va ON ue.UserId = va.UserId
+    LEFT JOIN
+        PostDetailsExtended pde ON ue.UserId = pde.PostOwnerId AND pde.PostTypeId = 1
+    LEFT JOIN
+        Badges b ON ue.UserId = b.UserId
+    WHERE
+        ue.TotalQuestions > ue.TotalAnswers
+        AND ue.TotalQuestions > 0
+    GROUP BY
+        ue.UserId, ue.DisplayName, ue.Reputation, ue.TotalQuestions, ue.TotalAnswers, ue.EngagementScore,
+        td.TopTagsSummary, va.UpvotesGiven, va.DownvotesGiven, va.PostsFavorited
+),
+AnswerCentricUsers AS (
+    SELECT
+        ue.UserId,
+        ue.DisplayName,
+        ue.Reputation,
+        ue.TotalQuestions,
+        ue.TotalAnswers,
+        ue.EngagementScore,
+        td.TopTagsSummary,
+        va.UpvotesGiven,
+        va.DownvotesGiven,
+        va.PostsFavorited,
+        'Answer_Focused' AS UserCategory,
+        AVG(pde.PostQualityScore) AS AvgPostQualityForCategory,
+        COUNT(DISTINCT b.Id) AS TotalBadges
+    FROM
+        UserEngagement ue
+    LEFT JOIN
+        TagDominance td ON ue.UserId = td.UserId
+    LEFT JOIN
+        VoteAnalysis va ON ue.UserId = va.UserId
+    LEFT JOIN
+        PostDetailsExtended pde ON ue.UserId = pde.PostOwnerId AND pde.PostTypeId = 2
+    LEFT JOIN
+        Badges b ON ue.UserId = b.UserId
+    WHERE
+        ue.TotalAnswers >= ue.TotalQuestions
+        AND ue.TotalAnswers > 0
+    GROUP BY
+        ue.UserId, ue.DisplayName, ue.Reputation, ue.TotalQuestions, ue.TotalAnswers, ue.EngagementScore,
+        td.TopTagsSummary, va.UpvotesGiven, va.DownvotesGiven, va.PostsFavorited
+),
+FinalUsersUnion AS (
+    SELECT * FROM QuestionCentricUsers
+    UNION ALL
+    SELECT * FROM AnswerCentricUsers
+)
+SELECT
+    fu.UserId,
+    fu.DisplayName,
+    fu.Reputation,
+    fu.UserCategory,
+    fu.TotalQuestions,
+    fu.TotalAnswers,
+    fu.EngagementScore,
+    fu.TopTagsSummary,
+    fu.UpvotesGiven,
+    fu.DownvotesGiven,
+    fu.PostsFavorited,
+    fu.TotalBadges,
+    COALESCE(fu.AvgPostQualityForCategory, 0) AS AvgPostQualityForCategory,
+    RANK() OVER (PARTITION BY fu.UserCategory ORDER BY fu.EngagementScore DESC, fu.Reputation DESC) AS EngagementRankByCategory,
+    NTILE(10) OVER (ORDER BY fu.Reputation DESC) AS ReputationTier,
+    (ue.EngagementScore > (SELECT AVG(EngagementScore) * 1.2 FROM UserEngagement WHERE TotalQuestions > 0 OR TotalAnswers > 0)
+     AND fu.TotalBadges < 5
+     AND ue.HasSelfAcceptedAnswer = TRUE
+     AND ue.LastAccessDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '6 months')) AS IsRisingStarWithSelfSolve,
+    COALESCE(LOWER(TRIM(SUBSTRING(u.Location FROM 1 FOR 50))), 'Unknown') AS CleanedLocation,
+    (SELECT COUNT(DISTINCT pl.PostId)
+     FROM PostLinks pl
+     WHERE pl.RelatedPostId IN (SELECT p.Id FROM Posts p WHERE p.OwnerUserId = fu.UserId AND p.PostTypeId = 1)
+     GROUP BY pl.RelatedPostId
+     HAVING COUNT(DISTINCT pl.PostId) > 2
+    ) AS LinkedQuestionCountThreshold,
+    (SELECT COALESCE(AVG(ans.Score), 0)
+     FROM Posts q
+     INNER JOIN Posts ans ON q.Id = ans.ParentId
+     WHERE q.OwnerUserId = fu.UserId
+       AND q.PostTypeId = 1
+       AND ans.PostTypeId = 2
+    ) AS AvgAnswerScoreToOwnQuestions,
+    CASE
+        WHEN ue.WebsiteUrl IS NULL OR ue.WebsiteUrl = '' THEN 'No Website'
+        WHEN ue.WebsiteUrl LIKE '%linkedin.com%' THEN 'Professional Profile'
+        WHEN ue.WebsiteUrl LIKE '%github.com%' THEN 'Developer Portfolio'
+        ELSE 'Other Website'
+    END AS WebsiteStatus
+FROM
+    FinalUsersUnion fu
+INNER JOIN
+    UserEngagement ue ON fu.UserId = ue.UserId
+LEFT JOIN
+    Users u ON fu.UserId = u.Id
+WHERE
+    fu.Reputation > 100
+    AND (fu.TotalQuestions + fu.TotalAnswers) > 5
+    AND (u.LastAccessDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year') OR u.LastAccessDate IS NULL)
+    AND (fu.UserCategory = 'Question_Focused' OR fu.AvgPostQualityForCategory > (SELECT AVG(PostQualityScore) FROM PostDetailsExtended WHERE PostTypeId = 2) * 0.8)
+ORDER BY
+    EngagementRankByCategory ASC, fu.Reputation DESC, fu.UserId
+LIMIT 5000;

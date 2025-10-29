@@ -1,0 +1,148 @@
+WITH recent_user_activity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    u.LastAccessDate,
+    COALESCE(SUM(v.BountyAmount), 0) AS TotalBounties,
+    COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpvotesGiven,
+    COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownvotesGiven,
+    ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY MAX(v.CreationDate) DESC) AS rn
+  FROM Users u
+  LEFT JOIN Votes v ON v.UserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+tag_summary AS (
+  SELECT
+    t.TagName,
+    t.Count,
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.CreationDate,
+    p.OwnerUserId
+  FROM Tags t
+  JOIN Posts p ON p.Id = t.ExcerptPostId
+  WHERE COALESCE(CASE WHEN t.IsModeratorOnly IS TRUE THEN 1 WHEN t.IsModeratorOnly IS FALSE THEN 0 ELSE NULL END, 0) = 0
+),
+complex_post_aggregation AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.PostTypeId,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.CreationDate,
+    p.OwnerUserId,
+    COALESCE(p.AnswerCount, 0) AS AnswerCount,
+    COALESCE(p.CommentCount, 0) AS CommentCount,
+    p.LastActivityDate,
+    jsonb_build_object(
+      'Owner', COALESCE(uu.DisplayName, p.OwnerDisplayName),
+      'Reputation', COALESCE(uu.Reputation, 0)
+    ) AS OwnerInfo,
+    p.LastEditDate
+  FROM Posts p
+  LEFT JOIN Users uu ON p.OwnerUserId = uu.Id
+  WHERE p.PostTypeId IN (1, 2)
+),
+windowed_activity AS (
+  SELECT
+    cp.PostId,
+    cp.Title,
+    cp.PostTypeId,
+    cp.Score,
+    cp.ViewCount,
+    cp.Tags,
+    cp.CreationDate,
+    cp.OwnerUserId,
+    cp.AnswerCount,
+    cp.CommentCount,
+    cp.LastActivityDate,
+    cp.OwnerInfo,
+    cp.LastEditDate,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY cp.PostId) AS UpvotesForPost,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) OVER (PARTITION BY cp.PostId) AS DownvotesForPost,
+    ROW_NUMBER() OVER (PARTITION BY cp.PostId ORDER BY cp.LastEditDate DESC) AS rn_post
+  FROM complex_post_aggregation cp
+  LEFT JOIN Votes v ON v.PostId = cp.PostId
+  GROUP BY
+    cp.PostId,
+    cp.Title,
+    cp.PostTypeId,
+    cp.Score,
+    cp.ViewCount,
+    cp.Tags,
+    cp.CreationDate,
+    cp.OwnerUserId,
+    cp.AnswerCount,
+    cp.CommentCount,
+    cp.LastActivityDate,
+    cp.OwnerInfo,
+    cp.LastEditDate
+)
+SELECT
+  w.PostId,
+  w.Title,
+  w.PostTypeId,
+  w.Score,
+  w.ViewCount,
+  w.Tags,
+  w.CreationDate,
+  w.OwnerUserId,
+  w.AnswerCount,
+  w.CommentCount,
+  w.LastActivityDate,
+  w.OwnerInfo ->> 'Owner' AS OwnerDisplay,
+  w.OwnerInfo ->> 'Reputation' AS OwnerReputation,
+  ru.DisplayName AS ActiveFriend,
+  t.TagName,
+  t.Count AS TagCount,
+  (w.Score * 0.5 + w.ViewCount * 0.1 + COALESCE(up.UpvotesForPost, w.UpvotesForPost, 0) * 1.2 - COALESCE(dn.DownvotesForPost, w.DownvotesForPost, 0) * 0.5) AS PerformanceIndex
+FROM windowed_activity w
+LEFT JOIN LATERAL (
+  SELECT u.DisplayName
+  FROM Users u
+  WHERE u.Id = w.OwnerUserId
+  LIMIT 1
+) ru ON TRUE
+LEFT JOIN tag_summary t ON t.PostId = w.PostId
+LEFT JOIN LATERAL (
+  SELECT SUM(CASE WHEN v2.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesForPost
+  FROM Votes v2
+  WHERE v2.PostId = w.PostId
+) up ON TRUE
+LEFT JOIN LATERAL (
+  SELECT SUM(CASE WHEN v3.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesForPost
+  FROM Votes v3
+  WHERE v3.PostId = w.PostId
+) dn ON TRUE
+WHERE w.rn_post = 1
+  AND w.LastActivityDate IS NOT NULL
+GROUP BY
+  w.PostId,
+  w.Title,
+  w.PostTypeId,
+  w.Score,
+  w.ViewCount,
+  w.Tags,
+  w.CreationDate,
+  w.OwnerUserId,
+  w.AnswerCount,
+  w.CommentCount,
+  w.LastActivityDate,
+  w.OwnerInfo,
+  ru.DisplayName,
+  t.TagName,
+  t.Count,
+  up.UpvotesForPost,
+  dn.DownvotesForPost,
+  w.UpvotesForPost,
+  w.DownvotesForPost
+ORDER BY PerformanceIndex DESC
+LIMIT 100;

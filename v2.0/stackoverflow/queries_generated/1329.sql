@@ -1,0 +1,153 @@
+-- {"query": "1329.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2517} 
+
+WITH UserEngagementMetrics AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS UserTotalUpVotesCast,
+        U.DownVotes AS UserTotalDownVotesCast,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS QuestionsAsked,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS AnswersGiven,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN P.Score ELSE 0 END) AS TotalQuestionScore,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN P.Score ELSE 0 END) AS TotalAnswerScore,
+        COALESCE(AVG(CASE WHEN P.PostTypeId = 2 THEN P.Score END), 0.0) AS AvgAnswerScore,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 AND P.AcceptedAnswerId IS NOT NULL THEN P.Id END) AS AcceptedAnswersProvided,
+        COUNT(DISTINCT C.Id) AS CommentsMade,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        EXTRACT(EPOCH FROM (NOW() - U.CreationDate)) / (60 * 60 * 24 * 365.25) AS AccountAgeYears,
+        MAX(CASE WHEN VT_Up.Name = 'UpMod' THEN 1 ELSE 0 END) AS HasUpvoted,
+        MAX(CASE WHEN VT_Down.Name = 'DownMod' THEN 1 ELSE 0 END) AS HasDownvoted
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    LEFT JOIN Badges AS B ON U.Id = B.UserId
+    LEFT JOIN Votes AS V_Up ON U.Id = V_Up.UserId AND V_Up.VoteTypeId = 2 -- UpMod
+    LEFT JOIN VoteTypes AS VT_Up ON V_Up.VoteTypeId = VT_Up.Id
+    LEFT JOIN Votes AS V_Down ON U.Id = V_Down.UserId AND V_Down.VoteTypeId = 3 -- DownMod
+    LEFT JOIN VoteTypes AS VT_Down ON V_Down.VoteTypeId = VT_Down.Id
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.Views, U.UpVotes, U.DownVotes, U.CreationDate
+),
+PostHistorySummary AS (
+    SELECT
+        P.Id AS PostId,
+        MIN(PH.CreationDate) FILTER (WHERE PH.PostHistoryTypeId IN (4, 5, 6)) AS FirstEditDate,
+        MAX(PH.CreationDate) FILTER (WHERE PH.PostHistoryTypeId IN (4, 5, 6)) AS LastKnownEditDate,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.Id END) AS TotalEditEvents,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (7, 8, 9) THEN PH.Id END) AS TotalRollbackEvents,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS TotalCloseVotes,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS TotalReopenVotes,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.CreationDate END) AS LatestCloseEventDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 11 THEN PH.CreationDate END) AS LatestReopenEventDate,
+        -- Correlated subquery: Get the latest close reason name for the post
+        (SELECT CR.Name
+         FROM PostHistory PH_Sub
+         LEFT JOIN CloseReasonTypes CR ON PH_Sub.Comment::smallint = CR.Id
+         WHERE PH_Sub.PostId = P.Id AND PH_Sub.PostHistoryTypeId = 10 AND PH_Sub.Comment IS NOT NULL
+         ORDER BY PH_Sub.CreationDate DESC
+         LIMIT 1
+        ) AS LatestCloseReasonName,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 12 THEN 1 ELSE 0 END) AS WasEverDeleted,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 13 THEN 1 ELSE 0 END) AS WasEverUndeleted,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 35 THEN 1 ELSE 0 END) AS WasMigratedAway,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 36 THEN 1 ELSE 0 END) AS WasMigratedHere
+    FROM Posts AS P
+    LEFT JOIN PostHistory AS PH ON P.Id = PH.PostId
+    GROUP BY P.Id
+),
+PostDetailAggregates AS (
+    SELECT
+        P.Id AS PostId,
+        COALESCE(AVG(InnerA.Score) FILTER (WHERE InnerA.PostTypeId = 2), 0.0) AS AvgAnswerScoreToQuestion,
+        COUNT(DISTINCT InnerC.Id) AS TotalCommentsOnPost,
+        STRING_AGG(DISTINCT TaggedPosts.TagName, ', ' ORDER BY TaggedPosts.TagName) AS AllPostTags,
+        -- Correlated subquery: Determine a 'primary' tag for the post based on its global count, then alphabetically
+        (SELECT T.TagName FROM
+            (SELECT TRIM(UNNEST(string_to_array(SUBSTRING(P_sub.Tags, 2, LENGTH(P_sub.Tags) - 2), '><'))) AS TagName
+             FROM Posts AS P_sub WHERE P_sub.Id = P.Id AND P_sub.Tags IS NOT NULL AND LENGTH(P_sub.Tags) > 2
+            ) AS sub_tags
+            LEFT JOIN Tags T ON sub_tags.TagName = T.TagName
+            ORDER BY T.Count DESC, sub_tags.TagName
+            LIMIT 1
+        ) AS PrimaryTagName
+    FROM Posts AS P
+    LEFT JOIN Posts AS InnerA ON P.Id = InnerA.ParentId AND InnerA.PostTypeId = 2
+    LEFT JOIN Comments AS InnerC ON P.Id = InnerC.PostId
+    LEFT JOIN (SELECT Id, TRIM(UNNEST(string_to_array(SUBSTRING(Tags, 2, LENGTH(Tags) - 2), '><'))) AS TagName FROM Posts WHERE Tags IS NOT NULL AND LENGTH(Tags) > 2) AS TaggedPosts ON P.Id = TaggedPosts.Id
+    GROUP BY P.Id
+),
+TagPerformance AS (
+    SELECT
+        T.TagName,
+        COUNT(DISTINCT P.Id) AS TaggedPostsCount,
+        SUM(P.Score) AS TotalTagScore,
+        COALESCE(AVG(P.Score), 0.0) AS AvgTagPostScore,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS QuestionsInTag,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS AnswersInTag,
+        NTILE(10) OVER (ORDER BY COALESCE(AVG(P.Score), 0.0) DESC, COUNT(DISTINCT P.Id) DESC) AS AvgScoreDecile
+    FROM Tags AS T
+    JOIN (SELECT Id, TRIM(UNNEST(string_to_array(SUBSTRING(Tags, 2, LENGTH(Tags) - 2), '><'))) AS TagName FROM Posts WHERE Tags IS NOT NULL AND LENGTH(Tags) > 2) AS PostTagged ON T.TagName = PostTagged.TagName
+    JOIN Posts AS P ON PostTagged.Id = P.Id
+    WHERE P.PostTypeId IN (1, 2)
+    GROUP BY T.TagName
+)
+SELECT
+    UE.UserId,
+    UE.DisplayName,
+    UE.Reputation,
+    UE.AccountAgeYears,
+    UE.QuestionsAsked,
+    UE.AnswersGiven,
+    UE.TotalQuestionScore,
+    UE.TotalAnswerScore,
+    UE.AvgAnswerScore,
+    UE.AcceptedAnswersProvided,
+    UE.CommentsMade,
+    UE.GoldBadges,
+    UE.SilverBadges,
+    UE.BronzeBadges,
+    P.Id AS PostId,
+    P.Title,
+    PT.Name AS PostTypeName,
+    P.CreationDate AS PostCreationDate,
+    P.LastActivityDate,
+    P.LastEditDate,
+    P.Score AS PostScore,
+    P.ViewCount AS PostViewCount,
+    P.AnswerCount AS PostAnswerCount,
+    P.CommentCount AS PostCommentsFromPostsTable, -- Original comment count from Posts table
+    P.FavoriteCount,
+    PHA.TotalEditEvents,
+    PHA.TotalRollbackEvents,
+    PHA.LatestCloseEventDate,
+    PHA.LatestReopenEventDate,
+    PHA.LatestCloseReasonName,
+    PHA.WasEverDeleted,
+    PHA.WasEverUndeleted,
+    PHA.WasMigratedAway,
+    PHA.WasMigratedHere,
+    PDA.AvgAnswerScoreToQuestion,
+    PDA.TotalCommentsOnPost AS TotalCommentsOnPostAggregated, -- Comment count from aggregation of Comments table
+    PDA.AllPostTags,
+    TP.AvgTagPostScore AS PrimaryTagAvgScore,
+    TP.AvgScoreDecile AS PrimaryTagScoreDecile,
+    -- Complicated Calculation: User Post Impact Score
+    (
+        (COALESCE(UE.Reputation, 0) * 0.01) +
+        (COALESCE(P.Score, 0) * 0.5) +
+        (COALESCE(P.ViewCount, 0) * 0.001) +
+        (COALESCE(P.FavoriteCount, 0) * 2) +
+        (COALESCE(PDA.AvgAnswerScoreToQuestion, 0) * 1.5) -
+        (CASE WHEN PHA.LatestCloseEventDate IS NOT NULL AND P.ClosedDate IS NOT NULL THEN 10 ELSE 0 END) * COALESCE(PHA.TotalCloseVotes, 0) -
+        (CASE WHEN PHA.WasEverDeleted = 1 THEN 20 ELSE 0 END) +
+        (CASE WHEN P.CommunityOwnedDate IS NOT NULL THEN 5 ELSE 0 END) -- Bonus for community-owned posts
+    ) AS UserPostImpactScore,
+    -- String Expression with NULL Logic: Truncated Body Preview
+    COALESCE(SUBSTRING(P.Body, 1, 200) || '...', 'No Body Provided') AS BodyPreview,
+    -- NULL Logic with CASE and Conditional Checks
+    CASE
+        WHEN P.AcceptedAnswerId IS NOT NULL THEN

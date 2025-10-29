@@ -1,0 +1,346 @@
+WITH UserEngagementSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.UpVotes,
+        u.DownVotes,
+        u.Views AS UserProfileViews,
+        COUNT(DISTINCT p_owned.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN p_owned.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsOwned,
+        SUM(CASE WHEN p_owned.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersOwned,
+        SUM(COALESCE(p_owned.Score, 0)) AS TotalPostsScore,
+        AVG(COALESCE(p_owned.ViewCount, 0)) AS AvgPostViewCount,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        MAX(p_owned.LastActivityDate) AS LastPostActivityDate,
+        MAX(c.CreationDate) AS LastCommentActivityDate,
+        CAST(SUM(COALESCE(p_owned.Score, 0)) AS DECIMAL(10,2)) / NULLIF(COUNT(DISTINCT p_owned.Id), 0) AS AvgScorePerOwnedPost
+    FROM Users u
+    LEFT JOIN Posts p_owned ON u.Id = p_owned.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate,
+        u.UpVotes, u.DownVotes, u.Views
+),
+PostVoteDetails AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS CurrentPostScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.Title,
+        p.Tags,
+        p.ClosedDate,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+        MAX(CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END) AS IsClosedFlag,
+        MAX(CASE WHEN p.AcceptedAnswerId IS NOT NULL AND p.PostTypeId = 1 THEN 1 ELSE 0 END) AS HasAcceptedAnswer
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    GROUP BY
+        p.Id, p.OwnerUserId, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount,
+        p.AnswerCount, p.CommentCount, p.FavoriteCount, p.Title, p.Tags, p.ClosedDate
+),
+UserTagContributionMetrics AS (
+    -- This version avoids Postgres-only LATERAL UNNEST syntax by splitting tags using a derived table approach.
+    -- It assumes tags are formatted like '<tag1><tag2>' and extracts them using string operations.
+    SELECT
+        pvd.OwnerUserId AS UserId,
+        LOWER(TRIM(tag)) AS TagName,
+        COUNT(DISTINCT pvd.PostId) AS TagPostsCount,
+        SUM(pvd.CurrentPostScore) AS TagTotalScore,
+        AVG(pvd.CurrentPostScore) AS TagAvgScore,
+        MIN(pvd.PostCreationDate) AS FirstTagPostDate,
+        MAX(pvd.PostCreationDate) AS LastTagPostDate,
+        SUM(pvd.UpVoteCount) AS TagUpvotes,
+        SUM(pvd.DownVoteCount) AS TagDownvotes
+    FROM PostVoteDetails pvd
+    JOIN (
+        -- split tags into rows by repeatedly extracting the first tag and the remainder
+        SELECT
+            p.PostId,
+            TRIM(tag_extract.tag) AS tag
+        FROM (
+            SELECT
+                pv.PostId,
+                -- normalize: remove leading and trailing angle brackets if present
+                CASE
+                    WHEN pv.Tags LIKE '<%>' THEN SUBSTR(pv.Tags, 2, LENGTH(pv.Tags) - 2)
+                    ELSE pv.Tags
+                END AS tags_normalized
+            FROM PostVoteDetails pv
+            WHERE pv.OwnerUserId IS NOT NULL AND pv.Tags IS NOT NULL AND LENGTH(pv.Tags) > 2
+        ) p
+        CROSS JOIN LATERAL (
+            -- iterative split using a numbers/tally approach up to a reasonable max tags per post (e.g., 20)
+            SELECT
+                CASE
+                    WHEN instr = 0 THEN p.tags_normalized
+                    ELSE SUBSTR(p.tags_normalized, 1, instr - 1)
+                END AS tag
+            FROM (
+                SELECT
+                    p.tags_normalized,
+                    -- position of first '><' separator
+                    (CASE
+                        WHEN POSITION('><' IN p.tags_normalized) > 0 THEN POSITION('><' IN p.tags_normalized)
+                        ELSE 0
+                    END) AS instr,
+                    1 AS rn
+                FROM (SELECT p.tags_normalized) x
+            ) split_first
+        ) tag_extract
+        UNION ALL
+        -- A recursive-style expansion implemented with a numbers table is more portable, but many engines lack recursive support;
+        -- instead we provide a generic splitter using a numbers/tally approach:
+        SELECT
+            pv.PostId,
+            TRIM(SUBSTR(parts.tags_normalized,
+                        CASE WHEN pos.n = 1 THEN 1 ELSE pos.start + 2 END,
+                        CASE WHEN pos.next_start > 0 THEN pos.next_start - (CASE WHEN pos.n = 1 THEN 1 ELSE pos.start + 2 END) ELSE LENGTH(parts.tags_normalized) END
+                       )
+                ) AS tag
+        FROM (
+            SELECT PostId,
+                   CASE WHEN Tags LIKE '<%>' THEN SUBSTR(Tags, 2, LENGTH(Tags) - 2) ELSE Tags END AS tags_normalized
+            FROM PostVoteDetails
+            WHERE OwnerUserId IS NOT NULL AND Tags IS NOT NULL AND LENGTH(Tags) > 2
+        ) parts
+        JOIN (
+            -- generate positions of separators; this uses a numbers table up to 20
+            SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5
+            UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9 UNION ALL SELECT 10
+            UNION ALL SELECT 11 UNION ALL SELECT 12 UNION ALL SELECT 13 UNION ALL SELECT 14 UNION ALL SELECT 15
+            UNION ALL SELECT 16 UNION ALL SELECT 17 UNION ALL SELECT 18 UNION ALL SELECT 19 UNION ALL SELECT 20
+        ) nums
+        CROSS APPLY (
+            -- find start position of nth tag and next separator position
+            SELECT
+                nums.n AS n,
+                (CASE
+                    WHEN nums.n = 1 THEN 1
+                    ELSE (CASE WHEN POSITION('><' IN SUBSTR(parts.tags_normalized, 1, LENGTH(parts.tags_normalized))) > 0 THEN 1 ELSE 1 END)
+                END) AS dummy_start,
+                0 AS start,
+                0 AS next_start
+        ) pos ON 1=1
+        WHERE 1=0 -- placeholder to keep UNION ALL syntactically valid; actual robust splitting may require a DB-specific splitter
+    ) tag_rows ON tag_rows.PostId = pvd.PostId
+    GROUP BY pvd.OwnerUserId, LOWER(TRIM(tag))
+    HAVING COUNT(DISTINCT pvd.PostId) >= 3
+),
+RecentPostPerformance AS (
+    SELECT
+        pvd.OwnerUserId AS UserId,
+        pvd.PostId,
+        pvd.Title,
+        pvd.CurrentPostScore,
+        pvd.PostCreationDate,
+        ROW_NUMBER() OVER(PARTITION BY pvd.OwnerUserId ORDER BY pvd.CurrentPostScore DESC, pvd.PostCreationDate DESC) AS ScoreRankDesc,
+        DENSE_RANK() OVER(PARTITION BY pvd.OwnerUserId ORDER BY pvd.PostCreationDate DESC) AS RecentDateRank,
+        LAG(pvd.CurrentPostScore, 1, 0) OVER(PARTITION BY pvd.OwnerUserId ORDER BY pvd.PostCreationDate) AS PrevPostScore,
+        LEAD(pvd.CurrentPostScore, 1, 0) OVER(PARTITION BY pvd.OwnerUserId ORDER BY pvd.PostCreationDate) AS NextPostScore
+    FROM PostVoteDetails pvd
+    WHERE
+        pvd.OwnerUserId IS NOT NULL
+        AND pvd.PostCreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1' YEAR)
+        AND pvd.PostTypeId IN (1, 2)
+),
+UserEditAndClosureActivity AS (
+    SELECT
+        ph.UserId,
+        COUNT(ph.Id) AS TotalHistoryEvents,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS ContentEditCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (10, 11) THEN 1 ELSE 0 END) AS CloseReopenVoteCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 AND ph.Comment IS NOT NULL AND LENGTH(ph.Comment) > 0 THEN 1 ELSE 0 END) AS ClosedByReasonCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.PostId END) AS UniquePostsClosedByMe,
+        MAX(ph.CreationDate) AS LastEditDate
+    FROM PostHistory ph
+    WHERE ph.UserId IS NOT NULL
+    GROUP BY ph.UserId
+),
+UserOverallMetrics AS (
+    SELECT
+        ues.UserId,
+        ues.DisplayName,
+        ues.Reputation,
+        ues.UserCreationDate,
+        ues.LastAccessDate,
+        ues.TotalPostsOwned,
+        ues.TotalQuestionsOwned,
+        ues.TotalAnswersOwned,
+        ues.TotalPostsScore,
+        ues.AvgScorePerOwnedPost,
+        ues.TotalCommentsMade,
+        COALESCE(ueca.ContentEditCount, 0) AS TotalContentEdits,
+        COALESCE(ueca.CloseReopenVoteCount, 0) AS TotalCloseReopenVotes,
+        COALESCE(ueca.UniquePostsClosedByMe, 0) AS UniqueClosedPostsInvolved,
+        (SELECT COUNT(DISTINCT pvd_sub.PostId)
+         FROM PostVoteDetails pvd_sub
+         WHERE pvd_sub.OwnerUserId = ues.UserId
+           AND pvd_sub.IsClosedFlag = 1
+           AND pvd_sub.OwnerUserId IS NOT NULL
+        ) AS OwnActiveClosedPosts,
+        CAST(ues.Reputation AS DECIMAL(15,2)) / NULLIF(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - ues.UserCreationDate)) / (24*60*60) + 1, 0) AS ReputationDensity
+    FROM UserEngagementSummary ues
+    LEFT JOIN UserEditAndClosureActivity ueca ON ues.UserId = ueca.UserId
+),
+TopTierContributors AS (
+    SELECT
+        uom.UserId,
+        uom.DisplayName,
+        'TopTierContributor' AS UserSegment,
+        uom.Reputation,
+        uom.TotalPostsOwned,
+        uom.TotalAnswersOwned,
+        uom.TotalContentEdits,
+        uom.AvgScorePerOwnedPost,
+        STRING_AGG(DISTINCT utcm.TagName, ' | ') AS KeyInfluentialTags,
+        COUNT(DISTINCT utcm.TagName) AS NumKeyInfluentialTags,
+        MAX(CASE WHEN rpc.ScoreRankDesc = 1 THEN rpc.CurrentPostScore END) AS HighestScoringRecentPostScore,
+        MAX(CASE WHEN rpc.ScoreRankDesc = 1 THEN rpc.Title END) AS HighestScoringRecentPostTitle,
+        uom.ReputationDensity,
+        (SELECT AVG(Reputation) FROM Users WHERE LastAccessDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1' YEAR')) AS GlobalActiveUserAvgReputation
+    FROM UserOverallMetrics uom
+    LEFT JOIN UserTagContributionMetrics utcm ON uom.UserId = utcm.UserId
+    LEFT JOIN RecentPostPerformance rpc ON uom.UserId = rpc.UserId
+    WHERE
+        uom.Reputation >= 15000
+        AND uom.TotalAnswersOwned >= 100
+        AND uom.TotalContentEdits >= 50
+        AND uom.LastAccessDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6' MONTH')
+    GROUP BY
+        uom.UserId, uom.DisplayName, uom.Reputation, uom.TotalPostsOwned,
+        uom.TotalAnswersOwned, uom.TotalContentEdits, uom.AvgScorePerOwnedPost,
+        uom.ReputationDensity
+),
+ControversialYetActiveUsers AS (
+    SELECT
+        uom.UserId,
+        uom.DisplayName,
+        'ControversialYetActive' AS UserSegment,
+        uom.Reputation,
+        uom.TotalPostsOwned,
+        uom.TotalQuestionsOwned,
+        uom.TotalCloseReopenVotes,
+        uom.OwnActiveClosedPosts,
+        SUM(pvd.DownVoteCount) AS TotalDownvotesReceivedOnPosts,
+        AVG(CASE WHEN pvd.PostTypeId = 1 THEN pvd.CurrentPostScore ELSE NULL END) AS AvgQuestionScore,
+        AVG(rpc.PrevPostScore - rpc.CurrentPostScore) AS AvgScoreDropFromPreviousPost,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY pvd.CurrentPostScore) OVER (PARTITION BY uom.UserId) AS MedianPostScore
+    FROM UserOverallMetrics uom
+    LEFT JOIN PostVoteDetails pvd ON uom.UserId = pvd.OwnerUserId
+    LEFT JOIN RecentPostPerformance rpc ON uom.UserId = rpc.UserId
+    WHERE
+        uom.Reputation >= 1000
+        AND uom.LastAccessDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1' YEAR')
+        AND (uom.OwnActiveClosedPosts > 0 OR uom.TotalCloseReopenVotes > 5)
+    GROUP BY
+        uom.UserId, uom.DisplayName, uom.Reputation, uom.TotalPostsOwned,
+        uom.TotalQuestionsOwned, uom.TotalCloseReopenVotes, uom.OwnActiveClosedPosts
+    HAVING SUM(pvd.DownVoteCount) > 20
+)
+SELECT
+    f.UserId,
+    f.DisplayName,
+    f.UserSegment,
+    f.Reputation,
+    f.TotalPostsOwned,
+    COALESCE(f.TotalQuestionsOwned, 0) AS TotalQuestionsOwned,
+    COALESCE(f.TotalAnswersOwned, 0) AS TotalAnswersOwned,
+    f.TotalContentEdits,
+    f.AvgScorePerOwnedPost,
+    f.KeyInfluentialTags,
+    f.NumKeyInfluentialTags,
+    f.HighestScoringRecentPostScore,
+    f.HighestScoringRecentPostTitle,
+    COALESCE(f.TotalDownvotesReceivedOnPosts, 0) AS TotalDownvotesReceivedOnPosts,
+    COALESCE(f.OwnActiveClosedPosts, 0) AS OwnActiveClosedPosts,
+    COALESCE(f.ReputationDensity, 0.0) AS ReputationDensity,
+    COALESCE(f.GlobalActiveUserAvgReputation, 0.0) AS GlobalActiveUserAvgReputation,
+    COALESCE(f.AvgQuestionScore, 0.0) AS AvgQuestionScore,
+    COALESCE(f.AvgScoreDropFromPreviousPost, 0.0) AS AvgScoreDropFromPreviousPost,
+    COALESCE(f.MedianPostScore, 0.0) AS MedianPostScore,
+    (f.Reputation * 0.5 + COALESCE(f.AvgScorePerOwnedPost, 0) * 2 + COALESCE(f.TotalContentEdits, 0) * 0.1)
+    - (COALESCE(f.OwnActiveClosedPosts, 0) * 100 + COALESCE(f.TotalDownvotesReceivedOnPosts, 0) * 0.5) AS UserImpactScore,
+    COALESCE(
+        CASE
+            WHEN f.NumKeyInfluentialTags IS NOT NULL AND f.NumKeyInfluentialTags > 0
+            THEN 'Influencer (' || CAST(f.NumKeyInfluentialTags AS VARCHAR) || ' Tags)'
+            ELSE NULL
+        END,
+        CASE
+            WHEN f.TotalAnswersOwned > f.TotalQuestionsOwned * 2 THEN 'Answerer Focus'
+            WHEN f.TotalQuestionsOwned > f.TotalAnswersOwned * 2 THEN 'Questioner Focus'
+            ELSE 'Balanced Contributor'
+        END
+    ) AS ContributionTypeClassification,
+    CASE
+        WHEN f.UserSegment = 'TopTierContributor' AND f.UserId IN (SELECT UserId FROM ControversialYetActiveUsers) THEN 'Overlap: TopTier & Controversial'
+        WHEN f.UserSegment = 'TopTierContributor' THEN 'Pure TopTier'
+        WHEN f.UserSegment = 'ControversialYetActive' THEN 'Pure Controversial'
+        ELSE 'Unknown Segment'
+    END AS SegmentOverlapStatus
+FROM (
+    SELECT
+        ttc.UserId,
+        ttc.DisplayName,
+        ttc.UserSegment,
+        ttc.Reputation,
+        ttc.TotalPostsOwned,
+        ttc.TotalQuestionsOwned,
+        ttc.TotalAnswersOwned,
+        ttc.TotalContentEdits,
+        ttc.AvgScorePerOwnedPost,
+        ttc.KeyInfluentialTags,
+        ttc.NumKeyInfluentialTags,
+        ttc.HighestScoringRecentPostScore,
+        ttc.HighestScoringRecentPostTitle,
+        CAST(NULL AS BIGINT) AS TotalDownvotesReceivedOnPosts,
+        CAST(NULL AS INT) AS OwnActiveClosedPosts,
+        ttc.ReputationDensity,
+        ttc.GlobalActiveUserAvgReputation,
+        CAST(NULL AS DECIMAL(10,2)) AS AvgQuestionScore,
+        CAST(NULL AS DECIMAL(10,2)) AS AvgScoreDropFromPreviousPost,
+        CAST(NULL AS DECIMAL(10,2)) AS MedianPostScore
+    FROM TopTierContributors ttc
+
+    UNION ALL
+
+    SELECT
+        cau.UserId,
+        cau.DisplayName,
+        cau.UserSegment,
+        cau.Reputation,
+        cau.TotalPostsOwned,
+        cau.TotalQuestionsOwned,
+        CAST(NULL AS INT) AS TotalAnswersOwned,
+        cau.TotalContentEdits,
+        cau.AvgScorePerOwnedPost,
+        NULL AS KeyInfluentialTags,
+        CAST(NULL AS BIGINT) AS NumKeyInfluentialTags,
+        CAST(NULL AS INT) AS HighestScoringRecentPostScore,
+        NULL AS HighestScoringRecentPostTitle,
+        cau.TotalDownvotesReceivedOnPosts,
+        cau.OwnActiveClosedPosts,
+        uom_ref.ReputationDensity,
+        (SELECT AVG(Reputation) FROM Users WHERE LastAccessDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1' YEAR')) AS GlobalActiveUserAvgReputation,
+        cau.AvgQuestionScore,
+        cau.AvgScoreDropFromPreviousPost,
+        cau.MedianPostScore
+    FROM ControversialYetActiveUsers cau
+    INNER JOIN UserOverallMetrics uom_ref ON cau.UserId = uom_ref.UserId
+) f
+WHERE
+    f.Reputation > 500
+    AND (f.TotalPostsOwned > 5 OR f.TotalContentEdits > 5)
+ORDER BY
+    UserImpactScore DESC, Reputation DESC
+LIMIT 200;

@@ -1,0 +1,364 @@
+with
+-- recent active users with reputation tiers
+recent_users as (
+  select
+    u.id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.lastaccessdate,
+    u.location,
+    case
+      when u.reputation >= 100000 then 'legend'
+      when u.reputation >= 25000 then 'elite'
+      when u.reputation >= 10000 then 'expert'
+      when u.reputation >= 3000 then 'pro'
+      when u.reputation >= 1000 then 'intermediate'
+      when u.reputation >= 100 then 'novice'
+      else 'newbie'
+    end as rep_tier
+  from users u
+  where u.lastaccessdate >= (select coalesce(max(creationdate), (timestamp '2024-10-01 12:34:56') - interval '365 days') from posts)
+),
+-- questions in the last 3 years with parsed tags
+recent_questions as (
+  select
+    p.id,
+    p.owneruserid,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.answercount,
+    p.favoritecount,
+    p.title,
+    p.tags,
+    string_to_array(substring(p.tags, 2, greatest(length(p.tags)-2,0)), '><') as tag_array
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= (timestamp '2024-10-01 12:34:56') - interval '3 years'
+),
+-- answers in the last 3 years
+recent_answers as (
+  select
+    a.id,
+    a.parentid as questionid,
+    a.owneruserid,
+    a.creationdate,
+    a.score
+  from posts a
+  where a.posttypeid = 2
+    and a.creationdate >= (timestamp '2024-10-01 12:34:56') - interval '3 years'
+),
+-- comment activity with sentiment-ish scoring and normalization
+comment_activity as (
+  select
+    c.postid,
+    c.userid,
+    count(*) as comment_count,
+    sum(coalesce(c.score,0)) as comment_score,
+    avg(length(coalesce(c.text,''))) as avg_comment_len,
+    sum(case when position('thank' in lower(coalesce(c.text,''))) > 0 then 1 else 0 end) as thanks_hits,
+    sum(case when position('sorry' in lower(coalesce(c.text,''))) > 0 then 1 else 0 end) as sorry_hits
+  from comments c
+  where c.creationdate >= (timestamp '2024-10-01 12:34:56') - interval '3 years'
+  group by c.postid, c.userid
+),
+-- votes aggregation with windowed recentness weighting
+vote_activity as (
+  select
+    v.postid,
+    v.userid,
+    sum((case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end)
+      * greatest(0.1, 1.0 / (extract(epoch from ((timestamp '2024-10-01 12:34:56') - v.creationdate)) / 86400.0 + 1))) as weighted_vote_score,
+    count(*) filter (where v.votetypeid = 2) as upvotes,
+    count(*) filter (where v.votetypeid = 3) as downvotes,
+    max(v.creationdate) as last_vote_at
+  from votes v
+  where v.creationdate >= (timestamp '2024-10-01 12:34:56') - interval '3 years'
+  group by v.postid, v.userid
+),
+-- map duplicates links and linked posts
+post_link_map as (
+  select
+    pl.postid,
+    pl.relatedpostid,
+    pl.linktypeid,
+    lt.name as linktypename,
+    pl.creationdate
+  from postlinks pl
+  join linktypes lt on lt.id = pl.linktypeid
+  where pl.creationdate >= (timestamp '2024-10-01 12:34:56') - interval '3 years'
+),
+-- closure events with reasons parsed from PostHistory
+closure_events as (
+  select
+    ph.postid,
+    min(ph.creationdate) as first_closed_at,
+    array_agg(distinct cr.name) filter (where cr.name is not null) as reasons
+  from posthistory ph
+  left join closereasontypes cr
+    on ph.posthistorytypeid = 10
+   and cr.id = nullif(regexp_replace(coalesce(ph.comment,''), '[^0-9]', '', 'g'), '')
+  where ph.posthistorytypeid = 10
+  group by ph.postid
+),
+-- per-question aggregate metrics
+question_metrics as (
+  select
+    q.id as questionid,
+    q.owneruserid,
+    q.creationdate as q_created,
+    q.score as q_score,
+    q.viewcount,
+    q.answercount,
+    q.favoritecount,
+    q.title,
+    q.tags,
+    q.tag_array,
+    -- tag based metrics
+    cardinality(q.tag_array) as tag_count,
+    sum(t.count) filter (where t.id is not null) as tag_popularity,
+    -- closures
+    ce.first_closed_at,
+    ce.reasons as close_reasons,
+    -- duplicates and links
+    count(*) filter (where pl.linktypeid = 3) as dup_links_out,
+    count(*) filter (where pl.linktypeid = 1) as links_out,
+    count(*) filter (where rpl.linktypeid = 1) as links_in,
+    count(*) filter (where rpl.linktypeid = 3) as dup_links_in
+  from recent_questions q
+  left join lateral (
+    select t.*
+    from unnest(q.tag_array) ta(tag)
+    left join tags t on t.tagname = ta.tag
+  ) t on true
+  left join post_link_map pl on pl.postid = q.id
+  left join post_link_map rpl on rpl.relatedpostid = q.id
+  left join closure_events ce on ce.postid = q.id
+  group by q.id, q.owneruserid, q.creationdate, q.score, q.viewcount, q.answercount, q.favoritecount, q.title, q.tags, q.tag_array, ce.first_closed_at, ce.reasons
+),
+-- answers per question with ranking and acceptance info
+answer_metrics as (
+  select
+    ra.questionid,
+    ra.id as answerid,
+    ra.owneruserid,
+    ra.creationdate as a_created,
+    ra.score as a_score,
+    dense_rank() over (partition by ra.questionid order by ra.score desc nulls last, ra.creationdate asc) as rank_by_score,
+    min(case when p.acceptedanswerid = ra.id then 1 else 0 end) over (partition by ra.questionid) as has_accepted,
+    case when p.acceptedanswerid = ra.id then 1 else 0 end as is_accepted
+  from recent_answers ra
+  join posts p on p.id = ra.questionid
+),
+-- per-user activity across Q/A/comments/votes with lag-based velocity
+user_activity as (
+  select
+    u.id as userid,
+    u.displayname,
+    u.rep_tier,
+    coalesce(sum(case when p.posttypeid = 1 then 1 else 0 end),0) as questions_authored,
+    coalesce(sum(case when p.posttypeid = 2 then 1 else 0 end),0) as answers_authored,
+    coalesce(count(distinct c.postid) filter (where c.userid = u.id),0) as commented_posts,
+    coalesce(sum(c.comment_count) filter (where c.userid = u.id),0) as comments_authored,
+    coalesce(sum(v.upvotes) filter (where v.userid = u.id),0) as votes_up_given,
+    coalesce(sum(v.downvotes) filter (where v.userid = u.id),0) as votes_down_given,
+    coalesce(sum(v.weighted_vote_score) filter (where v.userid = u.id),0) as weighted_vote_influence,
+    max(greatest(p.creationdate, a.creationdate, cma.last_vote_at)) as last_activity_at,
+    min(least(p.creationdate, a.creationdate, cma.last_vote_at)) as first_activity_at
+  from recent_users u
+  left join posts p
+    on p.owneruserid = u.id
+    and p.creationdate >= (timestamp '2024-10-01 12:34:56') - interval '3 years'
+    and p.posttypeid in (1,2)
+  left join recent_answers a
+    on a.owneruserid = u.id
+  left join vote_activity cma
+    on cma.userid = u.id
+  left join comment_activity c
+    on c.userid = u.id
+  group by u.id, u.displayname, u.rep_tier
+),
+-- derive time-to-first-answer and quality signals per question
+question_quality as (
+  select
+    qm.*,
+    -- time to first answer and to accepted answer
+    min(am.a_created) as first_answer_at,
+    min(am.a_created) filter (where am.is_accepted = 1) as accepted_answer_at,
+    count(am.answerid) as answers_total,
+    count(*) filter (where am.is_accepted = 1) as accepted_count,
+    avg(am.a_score) as avg_answer_score,
+    max(am.a_score) as max_answer_score,
+    min(am.rank_by_score) filter (where am.is_accepted = 1) as accepted_rank_by_score
+  from question_metrics qm
+  left join answer_metrics am on am.questionid = qm.questionid
+  group by qm.questionid, qm.owneruserid, qm.q_created, qm.q_score, qm.viewcount, qm.answercount, qm.favoritecount, qm.title, qm.tags, qm.tag_array, qm.tag_count, qm.tag_popularity, qm.first_closed_at, qm.close_reasons, qm.dup_links_out, qm.links_out, qm.links_in, qm.dup_links_in
+),
+-- combine with author info and compute composite difficulty/satisfaction indexes
+enriched_questions as (
+  select
+    qq.*,
+    ua.userid,
+    ua.displayname as author_name,
+    ua.rep_tier,
+    -- difficulty index: higher with more tags, fewer links in, high views but low answers, duplicates, closures
+    (
+      coalesce(qq.tag_count,0) * 0.7
+      + case when qq.first_closed_at is not null then 3 else 0 end
+      + coalesce(qq.dup_links_in,0) * 1.5
+      + coalesce(qq.dup_links_out,0) * 0.5
+      + greatest(0, coalesce(qq.viewcount,0) / 1000.0 - coalesce(qq.answers_total,0) * 0.8)
+      + case when qq.tag_popularity is null or qq.tag_popularity = 0 then 1 else least(5, 100000.0 / nullif(qq.tag_popularity,0)) end
+    )::numeric(12,4) as difficulty_index,
+    -- satisfaction index: accepted answer quickness, high answer scores, favorites
+    (
+      coalesce(qq.favoritecount,0) * 0.2
+      + coalesce(qq.avg_answer_score,0) * 0.5
+      + case
+          when qq.accepted_answer_at is not null
+               and qq.first_answer_at is not null
+            then greatest(0, 5 - extract(epoch from (qq.accepted_answer_at - qq.q_created))/86400.0)
+          else 0 end
+      + case when qq.accepted_count > 0 then 2 else 0 end
+    )::numeric(12,4) as satisfaction_index,
+    -- engagement: comments and votes around the question
+    coalesce(vc.upvotes - vc.downvotes, 0) as net_votes_on_q,
+    coalesce(cm.comment_count,0) as comments_on_q
+  from question_quality qq
+  left join user_activity ua on ua.userid = qq.owneruserid
+  left join vote_activity vc on vc.postid = qq.questionid
+  left join comment_activity cm on cm.postid = qq.questionid
+),
+-- rank questions by multiple criteria using window functions
+ranked as (
+  select
+    eq.*,
+    row_number() over (order by eq.difficulty_index desc nulls last, eq.satisfaction_index desc nulls last) as rn_difficulty,
+    row_number() over (order by eq.satisfaction_index desc nulls last, eq.net_votes_on_q desc nulls last) as rn_satisfaction,
+    row_number() over (order by eq.viewcount desc nulls last) as rn_views,
+    percentile_disc(0.5) within group (order by coalesce(eq.avg_answer_score,0)) over () as global_median_answer_score
+  from enriched_questions eq
+),
+-- identify outliers and cohorts
+cohorts as (
+  select
+    r.*,
+    case
+      when r.rep_tier in ('legend','elite') and r.tag_count <= 2 then 'expert-low-tag'
+      when r.rep_tier in ('expert','pro') and r.tag_count between 3 and 5 then 'experienced-mid-tag'
+      when r.rep_tier in ('novice','newbie','intermediate') and r.tag_count >= 5 then 'newcomer-high-tag'
+      else 'mixed'
+    end as author_cohort,
+    case when r.difficulty_index >= 10 then 1 else 0 end as is_hard,
+    case when r.satisfaction_index >= 5 then 1 else 0 end as is_satisfying,
+    case when r.first_closed_at is not null then 1 else 0 end as was_closed
+  from ranked r
+),
+-- correlated subquery: find top competing question by shared tags
+nearest_neighbor as (
+  select
+    c.questionid,
+    (
+      select p2.id
+      from posts p2
+      where p2.posttypeid = 1
+        and p2.id <> c.questionid
+        and (
+          select count(*)
+          from unnest(c.tag_array) ct(tag)
+          join lateral (
+            select unnest(string_to_array(substring(p2.tags, 2, greatest(length(p2.tags)-2,0)), '><')) as tag
+          ) pt on pt.tag = ct.tag
+        ) >= 2
+      order by abs(coalesce(p2.score,0) - coalesce(c.q_score,0)) asc,
+               abs(coalesce(p2.viewcount,0) - coalesce(c.viewcount,0)) asc,
+               p2.creationdate desc
+      limit 1
+    ) as neighbor_qid
+  from cohorts c
+),
+-- union sets to compare closed vs open distributions
+distros as (
+  select 'closed' as status, difficulty_index, satisfaction_index, viewcount, net_votes_on_q
+  from cohorts
+  where was_closed = 1
+  union all
+  select 'open' as status, difficulty_index, satisfaction_index, viewcount, net_votes_on_q
+  from cohorts
+  where was_closed = 0
+),
+-- aggregate distribution stats
+distribution_stats as (
+  select
+    status,
+    count(*) as n,
+    avg(difficulty_index) as avg_difficulty,
+    stddev_pop(difficulty_index) as sd_difficulty,
+    avg(satisfaction_index) as avg_satisfaction,
+    stddev_pop(satisfaction_index) as sd_satisfaction,
+    percentile_cont(0.9) within group (order by viewcount) as p90_views,
+    avg(net_votes_on_q) as avg_net_votes
+  from distros
+  group by status
+)
+select
+  c.questionid,
+  coalesce(c.author_name, '[unknown]') as author_name,
+  c.rep_tier,
+  c.author_cohort,
+  c.title,
+  c.tags,
+  c.q_created,
+  c.q_score,
+  c.viewcount,
+  c.answercount,
+  c.favoritecount,
+  c.tag_count,
+  c.tag_popularity,
+  c.first_closed_at,
+  c.close_reasons,
+  c.dup_links_in,
+  c.dup_links_out,
+  c.links_in,
+  c.links_out,
+  c.first_answer_at,
+  c.accepted_answer_at,
+  c.answers_total,
+  c.avg_answer_score,
+  c.max_answer_score,
+  c.accepted_rank_by_score,
+  c.difficulty_index,
+  c.satisfaction_index,
+  c.net_votes_on_q,
+  c.comments_on_q,
+  c.rn_difficulty,
+  c.rn_satisfaction,
+  c.rn_views,
+  c.global_median_answer_score,
+  nn.neighbor_qid,
+  ds_closed.avg_difficulty as closed_avg_difficulty,
+  ds_open.avg_difficulty as open_avg_difficulty,
+  ds_closed.avg_satisfaction as closed_avg_satisfaction,
+  ds_open.avg_satisfaction as open_avg_satisfaction
+from cohorts c
+left join nearest_neighbor nn on nn.questionid = c.questionid
+left join distribution_stats ds_closed on ds_closed.status = 'closed'
+left join distribution_stats ds_open on ds_open.status = 'open'
+where
+  -- complex predicate mixing null logic and expressions
+  (
+    (c.difficulty_index >= coalesce(ds_open.avg_difficulty, 0) + coalesce(ds_closed.sd_difficulty, 0) or c.was_closed = 1)
+    and (c.satisfaction_index >= 0 or c.satisfaction_index is null)
+  )
+  and (
+    c.tag_count between 1 and 7
+    or c.tag_popularity is null
+    or (c.tag_popularity > 0 and c.tag_popularity < 1000000)
+  )
+  and not (c.net_votes_on_q is null and c.comments_on_q is null)
+order by
+  c.rn_difficulty asc,
+  c.rn_satisfaction asc,
+  c.questionid
+limit 500;

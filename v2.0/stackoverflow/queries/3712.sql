@@ -1,0 +1,121 @@
+WITH RecentPosts AS (
+    SELECT p.Id,
+           p.OwnerUserId,
+           p.PostTypeId,
+           p.Score,
+           p.CreationDate,
+           ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE p.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '180 days'
+),
+UserPostAgg AS (
+    SELECT u.Id AS UserId,
+           COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+           COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswerCount,
+           COALESCE(SUM(p.Score), 0) AS TotalScore,
+           MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id
+),
+UserBadgeAgg AS (
+    SELECT b.UserId,
+           COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+           COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+           COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+           MAX(b.Date) AS LastBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserVoteStats AS (
+    SELECT v.PostId,
+           SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+           SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+    FROM Votes v
+    GROUP BY v.PostId
+),
+UserTopTags AS (
+    SELECT u.Id AS UserId,
+           STRING_AGG(t.TagName, ', ') AS TopTags
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id
+    JOIN LATERAL (
+        SELECT UNNEST(STRING_TO_ARRAY(TRIM(BOTH '<>' FROM p.Tags), '><')) AS tag
+    ) pt ON TRUE
+    JOIN Tags t ON t.TagName = pt.tag
+    GROUP BY u.Id
+    HAVING COUNT(*) > 5
+),
+UserPostVoteAgg AS (
+    SELECT p.OwnerUserId,
+           SUM(COALESCE(vs.UpVotes, 0))   AS UpVotes,
+           SUM(COALESCE(vs.DownVotes, 0)) AS DownVotes
+    FROM Posts p
+    LEFT JOIN UserVoteStats vs ON vs.PostId = p.Id
+    GROUP BY p.OwnerUserId
+),
+MainRows AS (
+    SELECT u.Id,
+           u.DisplayName,
+           u.Reputation,
+           COALESCE(up.QuestionCount, 0)      AS QuestionsPosted,
+           COALESCE(up.AnswerCount,   0)      AS AnswersPosted,
+           up.TotalScore,
+           up.LastPostDate,
+           COALESCE(ub.GoldBadges,   0)       AS GoldBadgeCount,
+           COALESCE(ub.SilverBadges,0)        AS SilverBadgeCount,
+           COALESCE(ub.BronzeBadges,0)        AS BronzeBadgeCount,
+           ub.LastBadgeDate,
+           COALESCE(vs.UpVotes, 0) - COALESCE(vs.DownVotes, 0) AS NetPostVotes,
+           COALESCE(ut.TopTags, '')          AS FrequentTags,
+           CASE
+               WHEN u.Reputation >= 20000 THEN 'Legendary'
+               WHEN u.Reputation >= 10000 THEN 'Expert'
+               WHEN u.Reputation >= 5000  THEN 'Contributor'
+               ELSE 'Newbie'
+           END                               AS ReputationTier,
+           EXISTS (
+               SELECT 1
+               FROM Posts p2
+               WHERE p2.OwnerUserId = u.Id
+                 AND p2.AcceptedAnswerId IS NOT NULL
+                 AND p2.CreationDate > CAST('2024-10-01' AS DATE) - INTERVAL '30 days'
+           )                                 AS HasRecentAcceptedAnswer
+    FROM Users u
+    LEFT JOIN UserPostAgg up ON up.UserId = u.Id
+    LEFT JOIN UserBadgeAgg ub ON ub.UserId = u.Id
+    LEFT JOIN UserPostVoteAgg vs ON vs.OwnerUserId = u.Id
+    LEFT JOIN UserTopTags ut ON ut.UserId = u.Id
+    WHERE u.CreationDate < CAST('2024-10-01' AS DATE) - INTERVAL '365 days'
+      AND (u.Location IS NOT NULL AND u.Location <> '')
+)
+SELECT *
+FROM (
+    SELECT *
+    FROM MainRows
+    ORDER BY Reputation DESC
+    LIMIT 100
+) t
+
+UNION ALL
+
+SELECT
+    CAST(NULL AS BIGINT) AS Id,
+    'Aggregated Totals' AS DisplayName,
+    SUM(u.Reputation)                               AS Reputation,
+    SUM(COALESCE(up.QuestionCount, 0))               AS QuestionsPosted,
+    SUM(COALESCE(up.AnswerCount,   0))               AS AnswersPosted,
+    SUM(COALESCE(up.TotalScore, 0))                  AS TotalScore,
+    MAX(up.LastPostDate)                             AS LastPostDate,
+    SUM(COALESCE(ub.GoldBadges,   0))                AS GoldBadgeCount,
+    SUM(COALESCE(ub.SilverBadges,0))                 AS SilverBadgeCount,
+    SUM(COALESCE(ub.BronzeBadges,0))                 AS BronzeBadgeCount,
+    MAX(ub.LastBadgeDate)                            AS LastBadgeDate,
+    CAST(NULL AS INTEGER)                             AS NetPostVotes,
+    CAST(NULL AS VARCHAR)                             AS FrequentTags,
+    CAST(NULL AS VARCHAR)                             AS ReputationTier,
+    CAST(NULL AS BOOLEAN)                             AS HasRecentAcceptedAnswer
+FROM Users u
+LEFT JOIN UserPostAgg up ON up.UserId = u.Id
+LEFT JOIN UserBadgeAgg ub ON ub.UserId = u.Id
+WHERE u.CreationDate < CAST('2024-10-01' AS DATE) - INTERVAL '365 days';

@@ -1,0 +1,178 @@
+-- {"query": "3762.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2749} 
+WITH
+/* ---------- User‑level aggregates ---------- */
+usr AS (
+    SELECT
+        u.Id                                    AS usr_id,
+        COALESCE(u.DisplayName, 'Anonymous')    AS usr_name,
+        u.Reputation,
+        COALESCE(u.Location, '(no location)')   AS usr_location,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END)  AS question_cnt,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END)  AS answer_cnt,
+        COUNT(DISTINCT b.Id)                                   AS badge_cnt,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END)      AS upvote_given,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END)      AS downvote_given
+    FROM Users u
+    LEFT JOIN Posts      p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges     b ON b.UserId      = u.Id
+    LEFT JOIN Votes      v ON v.UserId      = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location
+),
+
+/* ---------- Rank users by reputation ---------- */
+top_usr AS (
+    SELECT
+        *,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC) AS rn
+    FROM usr
+    WHERE Reputation > 10000
+),
+
+/* ---------- Tag statistics (outer joins, aggregation) ---------- */
+tag_stats AS (
+    SELECT
+        t.TagName,
+        t.Count                      AS tag_use_cnt,
+        COALESCE(SUM(CASE WHEN ph.PostHistoryTypeId = 5 THEN 1 END),0) AS edit_cnt,
+        STRING_AGG(DISTINCT u.DisplayName, ', ') 
+            FILTER (WHERE u.Id IS NOT NULL)                     AS active_users
+    FROM Tags t
+    LEFT JOIN PostHistory ph ON ph.PostId = t.WikiPostId
+    LEFT JOIN Posts       p  ON p.Id    = ph.PostId
+    LEFT JOIN Users       u  ON u.Id    = p.OwnerUserId
+    WHERE t.IsModeratorOnly = 0
+    GROUP BY t.TagName, t.Count
+),
+
+/* ---------- Questions with windowed rank per owner ---------- */
+questions AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        COALESCE(p.Tags,'')                            AS raw_tags,
+        /* split <tag1><tag2> into array */
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags <> '' 
+            THEN string_to_array(substring(p.Tags,2,length(p.Tags)-2), '><')
+            ELSE ARRAY[]::text[]
+        END                                            AS tag_array,
+        ROW_NUMBER() OVER (
+            PARTITION BY p.OwnerUserId 
+            ORDER BY p.Score DESC, p.CreationDate DESC
+        )                                            AS q_rank_by_owner
+    FROM Posts p
+    WHERE p.PostTypeId = 1          -- only questions
+),
+
+/* ---------- Answers with correlation to their question ---------- */
+answers AS (
+    SELECT
+        a.Id,
+        a.ParentId                  AS question_id,
+        a.Score,
+        a.CreationDate,
+        CASE WHEN a.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END AS is_accepted,
+        ROW_NUMBER() OVER (
+            PARTITION BY a.ParentId 
+            ORDER BY a.Score DESC, a.CreationDate
+        ) AS ans_rank_for_q
+    FROM Posts a
+    JOIN Posts q ON q.Id = a.ParentId AND q.PostTypeId = 1
+    WHERE a.PostTypeId = 2          -- only answers
+),
+
+/* ---------- Users with their most valuable question ---------- */
+usr_best_q AS (
+    SELECT
+        tu.usr_id,
+        q.Id               AS best_q_id,
+        q.Title            AS best_q_title,
+        q.Score            AS best_q_score,
+        q.ViewCount        AS best_q_views,
+        q.AnswerCount      AS best_q_answers,
+        q.FavoriteCount    AS best_q_favs,
+        q.tag_array        AS best_q_tags,
+        q.q_rank_by_owner  AS best_q_owner_rank
+    FROM top_usr tu
+    LEFT JOIN LATERAL (
+        SELECT *
+        FROM questions q
+        WHERE q.OwnerUserId = tu.usr_id
+        ORDER BY q.Score DESC NULLS LAST
+        LIMIT 1
+    ) q ON TRUE
+    WHERE tu.rn <= 10
+)
+
+SELECT
+    ubq.usr_id,
+    ubq.best_q_id,
+    ubq.best_q_title,
+    ubq.best_q_score,
+    ubq.best_q_views,
+    ubq.best_q_answers,
+    ubq.best_q_favs,
+    ubq.best_q_owner_rank,
+    u.Reputation,
+    u.question_cnt,
+    u.answer_cnt,
+    u.badge_cnt,
+    u.upvote_given,
+    u.downvote_given,
+    ts.TagName,
+    ts.tag_use_cnt,
+    ts.edit_cnt,
+    ts.active_users,
+    a.is_accepted,
+    a.ans_rank_for_q
+FROM usr_best_q ubq
+JOIN usr u          ON u.usr_id = ubq.usr_id
+LEFT JOIN LATERAL (
+    SELECT *
+    FROM answers a
+    WHERE a.question_id = ubq.best_q_id
+    ORDER BY a.ans_rank_for_q
+    LIMIT 1
+) a ON TRUE
+LEFT JOIN LATERAL (
+    SELECT *
+    FROM tag_stats ts
+    WHERE ts.TagName = ANY (ubq.best_q_tags)
+    ORDER BY ts.tag_use_cnt DESC
+    LIMIT 1
+) ts ON TRUE
+
+/* ---------- Union with a secondary slice of mid‑range users ---------- */
+UNION ALL
+
+SELECT
+    u.Id                         AS usr_id,
+    NULL                         AS best_q_id,
+    NULL                         AS best_q_title,
+    NULL                         AS best_q_score,
+    NULL                         AS best_q_views,
+    NULL                         AS best_q_answers,
+    NULL                         AS best_q_favs,
+    NULL                         AS best_q_owner_rank,
+    u.Reputation,
+    0                            AS question_cnt,
+    0                            AS answer_cnt,
+    0                            AS badge_cnt,
+    0                            AS upvote_given,
+    0                            AS downvote_given,
+    NULL                         AS TagName,
+    NULL                         AS tag_use_cnt,
+    NULL                         AS edit_cnt,
+    NULL                         AS active_users,
+    NULL                         AS is_accepted,
+    NULL                         AS ans_rank_for_q
+FROM Users u
+WHERE u.Reputation BETWEEN 5000 AND 6000
+  AND NOT EXISTS (SELECT 1 FROM top_usr tu WHERE tu.usr_id = u.Id)
+
+ORDER BY Reputation DESC, usr_id;

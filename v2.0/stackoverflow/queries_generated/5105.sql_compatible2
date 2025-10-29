@@ -1,0 +1,132 @@
+WITH top_users AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.Id AS EmailHash,
+    u.AccountId,
+    COUNT(DISTINCT p.Id) AS PostCount,
+    AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS AvgQuestionScore,
+    AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) AS AvgAnswerScore,
+    MAX(p.LastActivityDate) AS LastActivityDate
+  FROM
+    Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY
+    u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate,
+    u.Location, u.Views, u.UpVotes, u.DownVotes, u.AccountId
+),
+recent_activity AS (
+  SELECT
+    p.Id AS PostId,
+    p.OwnerUserId,
+    p.PostTypeId,
+    p.CreationDate,
+    p.Title,
+    p.Tags,
+    p.ViewCount,
+    p.Score,
+    p.LastActivityDate,
+    COALESCE(p.AcceptedAnswerId, -1) AS AcceptedAnswerId,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate DESC) AS rn
+  FROM
+    Posts p
+  WHERE
+    p.LastActivityDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30' DAY)
+),
+edge_cases AS (
+  SELECT
+    v.UserId,
+    v.PostId,
+    vt.Name AS VoteType,
+    v.CreationDate AS VoteDate,
+    v.BountyAmount
+  FROM
+    Votes v
+    JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+  WHERE
+    v.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '7' DAY)
+),
+tag_cooccurrence AS (
+  SELECT
+    t1.TagName AS TagA,
+    t2.TagName AS TagB,
+    COUNT(*) AS Cooccurrence
+  FROM
+    Tags t1
+    JOIN Tags t2 ON t1.Id <> t2.Id
+  WHERE
+    t1.TagName IS NOT NULL AND t2.TagName IS NOT NULL
+  GROUP BY
+    t1.TagName, t2.TagName
+  HAVING
+    COUNT(*) > 5
+)
+SELECT
+  tu.UserId,
+  tu.DisplayName,
+  tu.Reputation,
+  tu.PostCount,
+  tu.AvgQuestionScore,
+  tu.AvgAnswerScore,
+  ra.PostId AS TopPostId,
+  ra.PostTypeId AS TopPostType,
+  ra.Title AS TopPostTitle,
+  ra.LastActivityDate AS TopPostDate,
+  ra.ViewCount AS TopPostViews,
+  ec.VoteDate AS RecentVoteDate,
+  ec.VoteType,
+  ec.BountyAmount,
+  ce.TagA,
+  ce.TagB,
+  ce.Cooccurrence AS TagCooccurrence,
+  COALESCE(
+    CAST(ARRAY_REMOVE(ARRAY_AGG(DISTINCT p2.Id), NULL) AS TEXT[]),
+    CAST(ARRAY[] AS TEXT[])
+  ) AS RelatedPostIds
+FROM
+  top_users tu
+  LEFT JOIN recent_activity ra ON ra.OwnerUserId = tu.UserId AND ra.rn = 1
+  LEFT JOIN edge_cases ec ON ec.UserId = tu.UserId
+  LEFT JOIN (
+    SELECT
+      p1.OwnerUserId,
+      p2.Id
+    FROM
+      Posts p1
+      JOIN Posts p2 ON p2.ParentId = p1.Id
+  ) p2 ON p2.OwnerUserId = tu.UserId
+  LEFT JOIN (
+    SELECT
+      t1.TagName AS TagA,
+      t2.TagName AS TagB,
+      COUNT(*) AS Cooccurrence
+    FROM
+      Tags t1
+      JOIN Tags t2 ON t1.Id <> t2.Id
+    GROUP BY t1.TagName, t2.TagName
+  ) ce ON TRUE
+GROUP BY
+  tu.UserId,
+  tu.DisplayName,
+  tu.Reputation,
+  tu.PostCount,
+  tu.AvgQuestionScore,
+  tu.AvgAnswerScore,
+  ra.PostId,
+  ra.PostTypeId,
+  ra.Title,
+  ra.LastActivityDate,
+  ra.ViewCount,
+  ec.VoteDate,
+  ec.VoteType,
+  ec.BountyAmount,
+  ce.TagA,
+  ce.TagB,
+  ce.Cooccurrence;

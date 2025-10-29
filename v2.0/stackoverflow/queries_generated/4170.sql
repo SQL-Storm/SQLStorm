@@ -1,0 +1,96 @@
+-- {"query": "4170.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1097} 
+WITH RankedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        pt.Name AS PostTypeName,
+        u.DisplayName AS OwnerDisplayName,
+        u.Reputation,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) AS rn_by_date,
+        AVG(CAST(p.Score AS FLOAT)) OVER (PARTITION BY p.PostTypeId) AS avg_score_by_type,
+        SUM(p.ViewCount) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cumulative_views_by_type
+    FROM Posts AS p
+    JOIN PostTypes AS pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Users AS u ON p.OwnerUserId = u.Id
+    WHERE p.OwnerUserId IS NOT NULL AND p.CreationDate >= '2023-01-01'
+),
+CommentAggregates AS (
+    SELECT
+        c.PostId,
+        COUNT(c.Id) AS CommentCount,
+        SUM(c.Score) AS TotalCommentScore,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM Comments AS c
+    GROUP BY c.PostId
+),
+PostLinkCounts AS (
+    SELECT
+        pl.PostId,
+        COUNT(pl.Id) AS OutgoingLinkCount,
+        SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicateLinkCount
+    FROM PostLinks AS pl
+    GROUP BY pl.PostId
+),
+UserPostActivity AS (
+    SELECT
+        ph.UserId,
+        COUNT(DISTINCT ph.PostId) AS DistinctPostsEdited,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditsMade,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseVotesCast,
+        MAX(ph.CreationDate) AS LastActivityDate
+    FROM PostHistory AS ph
+    WHERE ph.UserId IS NOT NULL
+    GROUP BY ph.UserId
+)
+SELECT
+    rp.PostId,
+    rp.PostTypeName,
+    rp.OwnerDisplayName,
+    rp.Reputation,
+    rp.Score,
+    rp.ViewCount,
+    rp.AnswerCount,
+    COALESCE(ca.CommentCount, 0) AS TotalComments,
+    COALESCE(ca.TotalCommentScore, 0) AS TotalCommentScore,
+    COALESCE(plc.OutgoingLinkCount, 0) AS OutgoingLinks,
+    CASE
+        WHEN rp.Score > rp.avg_score_by_type * 1.5 THEN 'High Scorer'
+        WHEN rp.Score < rp.avg_score_by_type * 0.5 THEN 'Low Scorer'
+        ELSE 'Average Scorer'
+    END AS ScoreCategory,
+    IIF(rp.ViewCount > rp.cumulative_views_by_type / rp.rn_by_date, 'Above Average Views for Rank', 'Below Average Views for Rank') AS ViewRankComparison,
+    upa.EditsMade,
+    upa.CloseVotesCast,
+    CASE
+        WHEN rp.OwnerUserId = -1 THEN 'Community User'
+        WHEN rp.OwnerUserId IS NULL THEN 'Unknown Owner'
+        ELSE 'Registered User'
+    END AS OwnerStatus,
+    rp.CreationDate,
+    ca.LastCommentDate,
+    plc.DuplicateLinkCount,
+    rp.rn_by_date,
+    SUBSTRING(rp.PostTypeName, 1, 3) AS PostTypePrefix,
+    UPPER(COALESCE(u.Location, 'No Location')) AS NormalizedLocation,
+    CASE
+        WHEN rp.FavoriteCount IS NULL THEN 0
+        WHEN rp.FavoriteCount = 0 THEN 0
+        WHEN rp.FavoriteCount > 100 THEN 10000
+        ELSE rp.FavoriteCount * 100
+    END AS WeightedFavoriteCount
+FROM RankedPosts AS rp
+LEFT JOIN CommentAggregates AS ca ON rp.PostId = ca.PostId
+LEFT JOIN PostLinkCounts AS plc ON rp.PostId = plc.PostId
+LEFT JOIN UserPostActivity AS upa ON rp.OwnerUserId = upa.UserId
+LEFT JOIN Users AS u ON rp.OwnerUserId = u.Id
+WHERE rp.rn_by_date <= 50
+AND rp.Score > 0
+AND rp.OwnerUserId <> -1
+ORDER BY rp.PostTypeId, rp.rn_by_date;

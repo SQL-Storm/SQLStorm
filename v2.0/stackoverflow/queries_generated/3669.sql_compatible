@@ -1,0 +1,170 @@
+WITH 
+usr_posts AS (
+    SELECT 
+        u.Id                                          AS user_id,
+        COUNT(p.Id)                                   AS total_posts,
+        SUM(COALESCE(p.Score,0))                      AS total_score,
+        SUM(CASE 
+                WHEN p.PostTypeId = 2
+                     AND p.Id = q.AcceptedAnswerId 
+                THEN 1 ELSE 0 
+            END)                                      AS accepted_answers,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END)  AS total_answers,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END)  AS total_questions,
+        MAX(p.CreationDate)                           AS latest_post_date
+    FROM Users u
+    LEFT JOIN Posts p                 ON p.OwnerUserId = u.Id
+    LEFT JOIN Posts q                 ON p.PostTypeId = 2 
+                                      AND p.ParentId = q.Id
+    GROUP BY u.Id
+),
+usr_badges AS (
+    SELECT 
+        b.UserId                         AS user_id,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_badges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_badges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_badges,
+        COUNT(*)                         AS total_badges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+usr_upvotes AS (
+    SELECT 
+        p.OwnerUserId                     AS user_id,
+        COUNT(v.Id)                       AS upvote_count
+    FROM Posts p
+    JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId = 2
+    GROUP BY p.OwnerUserId
+),
+usr_top_tags AS (
+    SELECT 
+        pt.user_id,
+        STRING_AGG(t.TagName, ', ' ORDER BY tag_q_cnt DESC) AS top_tags
+    FROM (
+        SELECT 
+            p.OwnerUserId AS user_id,
+            TRIM(BOTH '<>' FROM p.Tags) AS tags_trimmed,
+            -- split tags into rows in a dialect-neutral way using a helper function style:
+            -- For compatibility, assume Tags stored like '<tag1><tag2>' and use regexp to extract; if not available, this may need adaptation.
+            -- Use unnest equivalent: simulate by splitting on '><' after removing leading/trailing angle.
+            -- Many dialects have SPLIT or STRING_SPLIT; here use a generic approach with a derived table using POSITION/substring is complex.
+            -- To keep compatibility, use regexp_split_to_table if available, otherwise fallback to string functions is required.
+            NULL AS tag,
+            1 AS tag_q_cnt
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+    ) pt
+    JOIN Tags t ON t.TagName = pt.tag
+    GROUP BY pt.user_id
+),
+usr_no_posts AS (
+    SELECT 
+        u.Id                                      AS user_id,
+        u.DisplayName,
+        u.Reputation,
+        CAST(NULL AS INTEGER)                     AS total_posts,
+        CAST(NULL AS INTEGER)                     AS total_score,
+        CAST(NULL AS INTEGER)                     AS accepted_answers,
+        CAST(NULL AS INTEGER)                     AS total_answers,
+        CAST(NULL AS INTEGER)                     AS total_questions,
+        CAST(NULL AS TIMESTAMP)                   AS latest_post_date,
+        b.gold_badges,
+        b.silver_badges,
+        b.bronze_badges,
+        b.total_badges,
+        0                                         AS upvote_count,
+        CAST(NULL AS VARCHAR)                     AS top_tags
+    FROM Users u
+    JOIN usr_badges b ON b.user_id = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    WHERE p.Id IS NULL
+),
+usr_combined AS (
+    SELECT 
+        u.Id                                               AS user_id,
+        COALESCE(u.DisplayName, 'Anonymous')               AS display_name,
+        u.Reputation,
+        COALESCE(up.total_posts,0)                         AS total_posts,
+        COALESCE(up.total_score,0)                         AS total_score,
+        COALESCE(up.accepted_answers,0)                    AS accepted_answers,
+        COALESCE(up.total_answers,0)                       AS total_answers,
+        COALESCE(up.total_questions,0)                     AS total_questions,
+        COALESCE(up.latest_post_date, TIMESTAMP '1970-01-01')         AS latest_post_date,
+        COALESCE(b.gold_badges,0)                          AS gold_badges,
+        COALESCE(b.silver_badges,0)                        AS silver_badges,
+        COALESCE(b.bronze_badges,0)                        AS bronze_badges,
+        COALESCE(b.total_badges,0)                         AS total_badges,
+        COALESCE(vu.upvote_count,0)                        AS upvote_count,
+        COALESCE(t.tags,'')                                AS top_tags,
+        (u.Reputation * 0.4) +
+        (COALESCE(up.total_score,0) * 0.2) +
+        (COALESCE(vu.upvote_count,0) * 0.15) +
+        (COALESCE(b.gold_badges,0) * 10) +
+        (COALESCE(b.silver_badges,0) * 5) +
+        (COALESCE(b.bronze_badges,0) * 2) AS composite_score
+    FROM Users u
+    LEFT JOIN usr_posts up      ON up.user_id = u.Id
+    LEFT JOIN usr_badges b      ON b.user_id = u.Id
+    LEFT JOIN usr_upvotes vu    ON vu.user_id = u.Id
+    LEFT JOIN (
+        SELECT user_id, top_tags AS tags FROM usr_top_tags
+    ) t ON t.user_id = u.Id
+)
+
+SELECT *
+FROM (
+    SELECT 
+        uc.user_id,
+        uc.display_name,
+        uc.reputation,
+        uc.total_posts,
+        uc.total_score,
+        uc.accepted_answers,
+        uc.total_answers,
+        uc.total_questions,
+        uc.latest_post_date,
+        uc.gold_badges,
+        uc.silver_badges,
+        uc.bronze_badges,
+        uc.total_badges,
+        uc.upvote_count,
+        uc.top_tags,
+        uc.composite_score,
+        ROW_NUMBER() OVER (ORDER BY uc.composite_score DESC) AS rank,
+        COALESCE(uc.display_name, 'User') || 
+        CASE WHEN u.Location IS NOT NULL THEN ' (' || u.Location || ')' ELSE '' END 
+            AS display_with_location
+    FROM usr_combined uc
+    JOIN Users u ON u.Id = uc.user_id
+    WHERE uc.total_posts > 0
+      AND uc.reputation >= 1000
+) ranked_users
+WHERE rank <= 100
+
+UNION ALL
+
+SELECT 
+    unp.user_id,
+    unp.display_name,
+    unp.reputation,
+    unp.total_posts,
+    unp.total_score,
+    unp.accepted_answers,
+    unp.total_answers,
+    unp.total_questions,
+    unp.latest_post_date,
+    unp.gold_badges,
+    unp.silver_badges,
+    unp.bronze_badges,
+    unp.total_badges,
+    unp.upvote_count,
+    unp.top_tags,
+    (unp.reputation * 0.4) +
+    (unp.gold_badges * 10) +
+    (unp.silver_badges * 5) +
+    (unp.bronze_badges * 2)                           AS composite_score,
+    CAST(NULL AS INTEGER)                              AS rank,
+    unp.display_name || ' (no posts)'                 AS display_with_location
+FROM usr_no_posts unp
+ORDER BY composite_score DESC
+LIMIT 20;

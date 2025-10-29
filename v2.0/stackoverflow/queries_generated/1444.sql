@@ -1,0 +1,253 @@
+-- {"query": "1444.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3635} 
+
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesGiven, -- UpMod
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesGiven, -- DownMod
+        SUM(CASE WHEN V.VoteTypeId IN (1,2) THEN 1 ELSE 0 END) AS TotalUpVotesReceivedOnPosts, -- AcceptedByOriginator, UpMod
+        SUM(CASE WHEN P.Score IS NOT NULL THEN P.Score ELSE 0 END) AS TotalPostScoreAccumulated,
+        AVG(P.Score) FILTER (WHERE P.Score IS NOT NULL) AS AvgPostScoreOwned,
+        MAX(P.CreationDate) AS LastPostDate,
+        COUNT(DISTINCT P.PostTypeId) AS UniquePostTypesContributed
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN Votes V ON U.Id = V.UserId
+    WHERE U.CreationDate >= '2020-01-01' -- Focus on relatively recent users for activity
+    GROUP BY U.Id, U.Reputation, U.CreationDate
+),
+PostDetailsSummary AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.LastEditDate,
+        P.LastActivityDate,
+        P.ClosedDate,
+        P.AcceptedAnswerId,
+        (SELECT COUNT(DISTINCT PH.UserId)
+         FROM PostHistory PH
+         WHERE PH.PostId = P.Id
+           AND PH.PostHistoryTypeId IN (5, 6, 8, 9) -- Edit Body, Edit Tags, Rollback Body, Rollback Tags
+           AND PH.UserId IS NOT NULL) AS DistinctEditorsCount,
+        (SELECT MAX(PH.CreationDate)
+         FROM PostHistory PH
+         WHERE PH.PostId = P.Id
+           AND PH.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+        ) AS LastSignificantEditDate,
+        -- Calculate time difference between creation and last activity in hours
+        EXTRACT(EPOCH FROM (P.LastActivityDate - P.CreationDate)) / 3600.0 AS HoursToLastActivity,
+        -- Tags parsing and count
+        ARRAY_LENGTH(string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags)-2), '><'), 1) AS NumberOfTags,
+        -- Simple check for long body
+        CASE WHEN LENGTH(P.Body) > 1000 THEN TRUE ELSE FALSE END AS IsLongBody,
+        -- Window function: Rank posts by score within their type and creation year
+        RANK() OVER (PARTITION BY P.PostTypeId, EXTRACT(YEAR FROM P.CreationDate) ORDER BY P.Score DESC, P.CreationDate) AS RankInTypeByScore,
+        -- Window function: Calculate average score for posts by the same owner within a 30-day sliding window
+        AVG(P.Score) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate RANGE BETWEEN INTERVAL '30 days' PRECEDING AND CURRENT ROW) AS OwnerAvgScoreLast30Days
+    FROM Posts P
+    WHERE P.OwnerUserId IS NOT NULL
+),
+PostModerationEvents AS (
+    SELECT
+        PH.PostId,
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 END) AS CloseEvents, -- Post Closed
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 END) AS ReopenEvents, -- Post Reopened
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 12 THEN 1 END) AS DeleteEvents, -- Post Deleted
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN CRT.Name END) AS LastCloseReason,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.CreationDate END) AS LastCloseDate
+    FROM PostHistory PH
+    LEFT JOIN CloseReasonTypes CRT ON PH.Comment = CRT.Id::varchar(50) -- Cast Comment to match Id type
+    WHERE PH.PostHistoryTypeId IN (10, 11, 12)
+    GROUP BY PH.PostId
+),
+PostLinkSummary AS (
+    SELECT
+        PL.PostId,
+        SUM(CASE WHEN PL.LinkTypeId = 1 THEN 1 ELSE 0 END) AS LinkedPostsCount,
+        SUM(CASE WHEN PL.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicateOfCount,
+        STRING_AGG(CASE WHEN PL.LinkTypeId = 3 THEN PL.RelatedPostId::varchar ELSE NULL END, ',') FILTER (WHERE PL.LinkTypeId = 3) AS DuplicatesList
+    FROM PostLinks PL
+    GROUP BY PL.PostId
+),
+QuestionAnswerQuality AS (
+    -- Combine questions and their accepted answers for a unified view
+    SELECT
+        Q.Id AS PostId,
+        Q.OwnerUserId AS QuestionOwnerId,
+        Q.CreationDate AS QuestionCreationDate,
+        Q.Score AS QuestionScore,
+        Q.Title AS QuestionTitle,
+        AA.Id AS AcceptedAnswerId,
+        AA.OwnerUserId AS AcceptedAnswerOwnerId,
+        AA.CreationDate AS AcceptedAnswerCreationDate,
+        AA.Score AS AcceptedAnswerScore,
+        (EXTRACT(EPOCH FROM (AA.CreationDate - Q.CreationDate)) / 86400.0) AS DaysToAcceptedAnswer,
+        CASE
+            WHEN Q.OwnerUserId = AA.OwnerUserId THEN 'Self-Accepted'
+            WHEN AA.OwnerUserId IS NOT NULL THEN 'Other-Accepted'
+            ELSE 'No-Accepted-Answer'
+        END AS AcceptedAnswerType
+    FROM Posts Q
+    JOIN Posts AA ON Q.AcceptedAnswerId = AA.Id
+    WHERE Q.PostTypeId = 1
+    AND AA.PostTypeId = 2
+    AND Q.CreationDate >= '2020-01-01' -- Filter for recent questions
+    UNION ALL
+    -- Include questions without accepted answers
+    SELECT
+        Q.Id AS PostId,
+        Q.OwnerUserId AS QuestionOwnerId,
+        Q.CreationDate AS QuestionCreationDate,
+        Q.Score AS QuestionScore,
+        Q.Title AS QuestionTitle,
+        NULL AS AcceptedAnswerId,
+        NULL AS AcceptedAnswerOwnerId,
+        NULL AS AcceptedAnswerCreationDate,
+        NULL AS AcceptedAnswerScore,
+        NULL AS DaysToAcceptedAnswer,
+        'No-Accepted-Answer' AS AcceptedAnswerType
+    FROM Posts Q
+    WHERE Q.PostTypeId = 1
+    AND Q.AcceptedAnswerId IS NULL
+    AND Q.CreationDate >= '2020-01-01'
+)
+SELECT
+    UAS.UserId,
+    U.DisplayName,
+    UAS.Reputation,
+    UAS.TotalQuestions,
+    UAS.TotalAnswers,
+    UAS.TotalPosts,
+    UAS.TotalComments,
+    UAS.TotalBadges,
+    UAS.TotalPostScoreAccumulated,
+    UAS.AvgPostScoreOwned,
+    U.Views AS UserViews,
+    U.Location,
+    U.WebsiteUrl,
+    COALESCE(U.AboutMe, 'No "About Me" provided') AS AboutMeSummary,
+    PD.PostId,
+    PD.PostTypeId,
+    PT.Name AS PostTypeName,
+    PD.PostCreationDate,
+    PD.Score AS PostScore,
+    PD.ViewCount AS PostViewCount,
+    PD.CommentCount AS PostCommentCount,
+    PD.FavoriteCount AS PostFavoriteCount,
+    PD.DistinctEditorsCount,
+    PD.LastSignificantEditDate,
+    PD.HoursToLastActivity,
+    PD.NumberOfTags,
+    PD.IsLongBody,
+    PD.RankInTypeByScore,
+    PD.OwnerAvgScoreLast30Days,
+    PME.CloseEvents,
+    PME.ReopenEvents,
+    PME.DeleteEvents,
+    COALESCE(PME.LastCloseReason, 'N/A') AS LastModerationActionReason,
+    PLS.LinkedPostsCount,
+    PLS.DuplicateOfCount,
+    PLS.DuplicatesList,
+    QAQ.AcceptedAnswerType,
+    QAQ.DaysToAcceptedAnswer,
+    -- Correlated Subquery: Check if the user has ever received an accepted answer from another user to their question
+    EXISTS (
+        SELECT 1
+        FROM Posts QA
+        JOIN Posts QQ ON QA.ParentId = QQ.Id
+        WHERE QA.OwnerUserId = UAS.UserId
+          AND QA.Id = QQ.AcceptedAnswerId
+          AND QQ.OwnerUserId <> UAS.UserId -- Question owner is different from answer owner
+    ) AS HasReceivedAcceptedAnswerToOthersQuestion,
+    -- Non-correlated Subquery: Identify users' quartile rank for answer volume relative to upvotes received on answers
+    (
+        SELECT
+            NTILE(4) OVER (
+                ORDER BY
+                    SUM(CASE WHEN SubP.PostTypeId = 2 THEN 1 ELSE 0 END) DESC, -- high answer count
+                    SUM(CASE WHEN SubV.VoteTypeId = 2 AND SubV.PostId = SubP.Id THEN 1 ELSE 0 END) ASC -- low upvotes on answers
+            )
+        FROM Posts SubP
+        LEFT JOIN Votes SubV ON SubP.Id = SubV.PostId
+        WHERE SubP.OwnerUserId = UAS.UserId
+        GROUP BY SubP.OwnerUserId
+    ) AS AnswerVolumeUpvoteQuartile,
+    -- String expression: Concatenate post title and relevant tags (if available)
+    CONCAT(
+        COALESCE(P.Title, 'N/A Question Title'),
+        ' [',
+        COALESCE(REPLACE(REPLACE(P.Tags, '><', ', '), '<', ''), 'NoTags'),
+        ']'
+    ) AS PostTitleWithTags,
+    -- NULL logic: Display "No Body" if Body is NULL or empty
+    CASE
+        WHEN P.Body IS NULL OR LENGTH(TRIM(P.Body)) = 0 THEN 'No Body Content'
+        ELSE SUBSTRING(P.Body, 1, 100) || '...'
+    END AS BodyExcerpt,
+    -- More complex calculation: Ratio of score to view count, handling division by zero and NULLs
+    COALESCE(
+        CASE
+            WHEN PD.ViewCount > 0 THEN CAST(PD.Score AS DECIMAL) / PD.ViewCount
+            ELSE 0.0
+        END,
+        0.0
+    ) AS ScoreToViewRatio,
+    -- Check for specific badge (e.g., 'Analyst' - hypothetical example) for the user
+    MAX(CASE WHEN B_Analyst.Name = 'Analyst' THEN 1 ELSE 0 END) OVER (PARTITION BY UAS.UserId) AS HasAnalystBadge,
+    -- Window function: Get creation date of the previous post by the same owner, default to an old date
+    LAG(PD.PostCreationDate, 1, '1900-01-01'::timestamp) OVER (PARTITION BY PD.OwnerUserId ORDER BY PD.PostCreationDate) AS PreviousPostCreationDate,
+    -- Window function: Calculate hours since previous post by the same owner, handling initial posts
+    EXTRACT(EPOCH FROM (PD.PostCreationDate - LAG(PD.PostCreationDate, 1, '1900-01-01'::timestamp) OVER (PARTITION BY PD.OwnerUserId ORDER BY PD.PostCreationDate))) / 3600.0 AS HoursSincePreviousPost
+FROM UserActivitySummary UAS
+JOIN Users U ON UAS.UserId = U.Id
+JOIN Posts P ON UAS.UserId = P.OwnerUserId
+LEFT JOIN PostDetailsSummary PD ON P.Id = PD.PostId
+LEFT JOIN PostTypes PT ON P.PostTypeId = PT.Id
+LEFT JOIN PostModerationEvents PME ON P.Id = PME.PostId
+LEFT JOIN PostLinkSummary PLS ON P.Id = PLS.PostId
+LEFT JOIN QuestionAnswerQuality QAQ ON P.Id = QAQ.PostId
+LEFT JOIN Badges B_Analyst ON U.Id = B_Analyst.UserId AND B_Analyst.Name = 'Analyst' -- Specific join for the badge check
+WHERE
+    UAS.TotalQuestions > 0 -- Only users who asked at least one question
+    AND UAS.TotalPosts >= 5 -- Users with at least 5 posts total
+    AND P.PostTypeId IN (1, 2) -- Focus on Questions and Answers
+    AND P.CreationDate BETWEEN '2022-01-01' AND CURRENT_DATE -- Posts from last ~2 years
+    AND (
+        (PD.Score > 5 AND PD.ViewCount > 100) -- High-quality, visible posts
+        OR PME.CloseEvents > 0 -- Or posts that have been moderated
+        OR (PLS.DuplicateOfCount > 0 AND P.PostTypeId = 1) -- Or questions marked as duplicates
+    )
+    AND (P.Body LIKE '%code%' OR P.Body LIKE '%error%') -- Posts mentioning 'code' or 'error' in their body
+    AND LENGTH(COALESCE(P.Title, '')) > 10 -- Title is not too short
+    AND U.Reputation > (SELECT AVG(Reputation) FROM Users WHERE CreationDate >= '2020-01-01') -- Above average reputation for recent users
+GROUP BY
+    UAS.UserId, U.DisplayName, UAS.Reputation, UAS.TotalQuestions, UAS.TotalAnswers, UAS.TotalPosts,
+    UAS.TotalComments, UAS.TotalBadges, UAS.TotalPostScoreAccumulated, UAS.AvgPostScoreOwned, U.Views, U.Location,
+    U.WebsiteUrl, U.AboutMe, PD.PostId, PD.PostTypeId, PT.Name, PD.PostCreationDate, PD.Score,
+    PD.ViewCount, PD.CommentCount, PD.FavoriteCount, PD.DistinctEditorsCount, PD.LastSignificantEditDate,
+    PD.HoursToLastActivity, PD.NumberOfTags, PD.IsLongBody, PD.RankInTypeByScore, PD.OwnerAvgScoreLast30Days,
+    PME.CloseEvents, PME.ReopenEvents, PME.DeleteEvents, PME.LastCloseReason, PLS.LinkedPostsCount,
+    PLS.DuplicateOfCount, PLS.DuplicatesList, QAQ.AcceptedAnswerType, QAQ.DaysToAcceptedAnswer,
+    P.Title, P.Tags, P.Body, B_Analyst.Name -- Include B_Analyst.Name in GROUP BY for MAX aggregate to work properly in this context
+HAVING
+    COUNT(DISTINCT P.Id) >= 2 -- At least two posts per user matching the criteria in the selected period
+    AND SUM(CASE WHEN PD.IsLongBody THEN 1 ELSE 0 END) >= 1 -- At least one long post body from the user
+ORDER BY
+    UAS.Reputation DESC, PD.PostScore DESC, PME.CloseEvents DESC
+LIMIT 100;

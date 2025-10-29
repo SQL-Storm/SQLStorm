@@ -1,0 +1,216 @@
+with RecursiveTagHierarchy as (
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 as Level,
+        array[t.Id] as Ancestors
+    from Tags t
+    where t.IsRequired = true
+
+    union all
+
+    select 
+        child.Id,
+        child.TagName,
+        child.Count,
+        child.IsModeratorOnly,
+        child.IsRequired,
+        r.Level + 1,
+        r.Ancestors || child.Id
+    from Tags child
+    join Posts p on p.Tags like '%' || '<' || child.TagName || '>' || '%'
+    join RecursiveTagHierarchy r on p.OwnerUserId = (
+        select OwnerUserId 
+        from Posts 
+        where Tags like '%' || '<' || r.TagName || '>' || '%' 
+        limit 1
+    )
+    where child.Id <> all (r.Ancestors)
+),
+
+UserBadgeCounts as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct case when b.Class = 1 then b.Id end) as GoldBadges,
+        count(distinct case when b.Class = 2 then b.Id end) as SilverBadges,
+        count(distinct case when b.Class = 3 then b.Id end) as BronzeBadges,
+        coalesce(sum(v.UpVotes),0) as TotalUpVotes,
+        coalesce(sum(v.DownVotes),0) as TotalDownVotes
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+
+PostAggregates as (
+    select 
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        p.PostTypeId,
+        pt.Name as PostTypeName,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        coalesce(c.CommentCount,0) as CommentCount,
+        coalesce(a.AnswerCount,0) as AnswerCount,
+        coalesce(pa.AcceptedAnswerScore, -1) as AcceptedAnswerScore,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc) as OwnerPostRank
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    left join PostTypes pt on pt.Id = p.PostTypeId
+    left join (
+        select PostId, count(*) as CommentCount 
+        from Comments 
+        group by PostId
+    ) c on c.PostId = p.Id
+    left join (
+        select ParentId, count(*) as AnswerCount
+        from Posts
+        where PostTypeId = 2
+        group by ParentId
+    ) a on a.ParentId = p.Id
+    left join (
+        select p.Id, a.Score as AcceptedAnswerScore
+        from Posts p
+        left join Posts a on p.AcceptedAnswerId = a.Id
+        where p.PostTypeId = 1
+    ) pa on pa.Id = p.Id
+    where p.PostTypeId in (1,2)
+),
+
+TopUsersQuestions as (
+    select 
+        p.OwnerUserId,
+        count(*) filter (where p.PostTypeId=1) as QuestionCount,
+        count(*) filter (where p.PostTypeId=2) as AnswerCount,
+        avg(p.Score) filter (where p.PostTypeId=1) as AvgQuestionScore,
+        avg(p.Score) filter (where p.PostTypeId=2) as AvgAnswerScore
+    from Posts p
+    group by p.OwnerUserId
+),
+
+CloseReasonSummary as (
+    select
+        ch.PostId,
+        cr.Name as CloseReasonName,
+        count(*) as CloseVotesCount
+    from PostHistory ch
+    join CloseReasonTypes cr on cast(cr.Id as varchar) = ch.Comment
+    where ch.PostHistoryTypeId = 10
+    group by ch.PostId, cr.Name
+),
+
+HighScoringDupes as (
+    select 
+        p.Id as QuestionId,
+        p.OwnerUserId,
+        p.Title,
+        p.Score,
+        d.RelatedPostId as DuplicateOfId,
+        pl2.Title as DuplicateOfTitle,
+        coalesce(crs.CloseVotesCount,0) as CloseVotes,
+        case when crs.PostId is null then false else true end as IsClosed
+    from Posts p
+    join PostLinks d on d.PostId = p.Id and d.LinkTypeId = 3
+    left join Posts pl2 on pl2.Id = d.RelatedPostId
+    left join CloseReasonSummary crs on crs.PostId = p.Id
+    where p.PostTypeId = 1 and p.Score > 50
+),
+
+UserRankingWithWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        coalesce(tc.QuestionCount,0) as TotalQuestions,
+        coalesce(tc.AnswerCount,0) as TotalAnswers,
+        coalesce(ub.GoldBadges,0) as GoldBadges,
+        coalesce(ub.SilverBadges,0) as SilverBadges,
+        coalesce(ub.BronzeBadges,0) as BronzeBadges,
+        coalesce(tc.AvgQuestionScore,0) as AvgQuestionScore,
+        coalesce(tc.AvgAnswerScore,0) as AvgAnswerScore,
+        rank() over (order by coalesce(tc.QuestionCount,0) desc, coalesce(ub.GoldBadges,0) desc, coalesce(ub.SilverBadges,0) desc, coalesce(ub.BronzeBadges,0) desc) as UserRank
+    from Users u
+    left join TopUsersQuestions tc on tc.OwnerUserId = u.Id
+    left join UserBadgeCounts ub on ub.UserId = u.Id
+),
+
+UserLastPostActivity as (
+    select 
+        p.OwnerUserId as UserId,
+        max(p.LastActivityDate) as LastActivityDate,
+        max(p.CreationDate) filter (where p.PostTypeId=1) as LastQuestionDate,
+        max(p.CreationDate) filter (where p.PostTypeId=2) as LastAnswerDate
+    from Posts p
+    group by p.OwnerUserId
+),
+
+ActiveUsersDetails as (
+    select
+        u.UserId,
+        u.DisplayName,
+        u.UserRank,
+        u.TotalQuestions,
+        u.TotalAnswers,
+        u.GoldBadges,
+        u.SilverBadges,
+        u.BronzeBadges,
+        coalesce(a.LastActivityDate, u.CreationDate) as LastActive,
+        coalesce(a.LastQuestionDate, cast('1900-01-01' as timestamp)) as LastQuestion,
+        coalesce(a.LastAnswerDate, cast('1900-01-01' as timestamp)) as LastAnswer,
+        arc.CloseVotes,
+        arc.IsClosed,
+        arc.DuplicateOfTitle
+    from UserRankingWithWindow u
+    left join UserLastPostActivity a on a.UserId = u.UserId
+    left join HighScoringDupes arc on arc.OwnerUserId = u.UserId
+    where u.UserRank <= 100
+),
+
+FinalResult as (
+    select
+        aud.UserId,
+        aud.DisplayName,
+        aud.UserRank,
+        aud.TotalQuestions,
+        aud.TotalAnswers,
+        aud.GoldBadges,
+        aud.SilverBadges,
+        aud.BronzeBadges,
+        aud.LastActive,
+        aud.LastQuestion,
+        aud.LastAnswer,
+        aud.CloseVotes,
+        aud.IsClosed,
+        aud.DuplicateOfTitle,
+        p.Id as SamplePostId,
+        p.Title as SamplePostTitle,
+        p.Score as SamplePostScore,
+        p.ViewCount as SamplePostViews,
+        p.CommentCount as SamplePostComments,
+        p.AnswerCount as SamplePostAnswers,
+        coalesce(string_agg(distinct tag, ','), '') as SamplePostTags
+    from ActiveUsersDetails aud
+    left join Posts p on p.OwnerUserId = aud.UserId
+    left join lateral (
+        select unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')) as tag
+    ) tags on true
+    where p.PostTypeId = 1
+        and p.Score = (
+            select max(score) from Posts p2 where p2.OwnerUserId = aud.UserId and p2.PostTypeId = 1
+        )
+    group by aud.UserId, aud.DisplayName, aud.UserRank, aud.TotalQuestions, aud.TotalAnswers, aud.GoldBadges, aud.SilverBadges, aud.BronzeBadges,
+             aud.LastActive, aud.LastQuestion, aud.LastAnswer, aud.CloseVotes, aud.IsClosed, aud.DuplicateOfTitle,
+             p.Id, p.Title, p.Score, p.ViewCount, p.CommentCount, p.AnswerCount
+)
+
+select *
+from FinalResult 
+order by UserRank, SamplePostScore desc, SamplePostViews desc
+limit 50;

@@ -1,0 +1,119 @@
+WITH 
+UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.UpVotes,0)               AS UpVotes,
+        COALESCE(u.DownVotes,0)             AS DownVotes,
+        (COALESCE(u.UpVotes,0) - COALESCE(u.DownVotes,0)) AS VoteBalance,
+        CASE 
+            WHEN COALESCE(u.DownVotes,0)=0 THEN NULL 
+            ELSE CAST(COALESCE(u.UpVotes,0) AS FLOAT)/COALESCE(u.DownVotes,0) 
+        END                                 AS UpDownRatio,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadges,
+        (SELECT MAX(CreationDate) FROM Posts p WHERE p.OwnerUserId = u.Id) AS LastPostDate
+    FROM Users u
+),
+UserPostAgg AS (
+    SELECT 
+        p.OwnerUserId AS UserId,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS QuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS AnswerScore,
+        MAX(p.CreationDate) AS LatestPostDate
+    FROM Posts p
+    GROUP BY p.OwnerUserId
+),
+TopTags AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0
+),
+UserTopTag AS (
+    SELECT 
+        us.Id AS UserId,
+        tt.TagName,
+        tt.TagUseCount,
+        tt.TagRank
+    FROM UserStats us
+    LEFT JOIN (
+        SELECT
+            owner.UserId,
+            tg.TagName,
+            tg.Count AS TagUseCount,
+            ROW_NUMBER() OVER (PARTITION BY owner.UserId ORDER BY tg.Count DESC) AS rn
+        FROM (
+            SELECT p.OwnerUserId AS UserId,
+                   TRIM(tag) AS Tag
+            FROM Posts p,
+                 LATERAL (
+                    SELECT regexp_split_to_table(replace(replace(p.Tags, '<', ''), '>', '' ), ' ') AS tag
+                 ) s
+            WHERE p.PostTypeId = 1
+        ) owner
+        JOIN Tags tg ON tg.TagName = owner.Tag
+        GROUP BY owner.UserId, tg.TagName, tg.Count
+    ) tt ON tt.UserId = us.Id AND tt.rn = 1
+)
+SELECT 
+    us.Id,
+    us.DisplayName,
+    us.Reputation,
+    us.VoteBalance,
+    us.UpDownRatio,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    COALESCE(upa.QuestionCount,0)           AS QuestionsPosted,
+    COALESCE(upa.AnswerCount,0)            AS AnswersPosted,
+    COALESCE(upa.QuestionScore,0)          AS QuestionScore,
+    COALESCE(upa.AnswerScore,0)            AS AnswerScore,
+    us.LastPostDate,
+    CASE
+        WHEN us.LastPostDate IS NULL THEN 'Never'
+        WHEN us.LastPostDate < (CAST('2024-10-01' AS DATE) - INTERVAL '1 year') THEN 'Stale'
+        ELSE 'Active'
+    END                                      AS ActivityStatus,
+    ut.TagName,
+    ut.TagUseCount,
+    ut.TagRank
+FROM UserStats us
+LEFT JOIN UserPostAgg upa   ON upa.UserId = us.Id
+LEFT JOIN UserTopTag ut    ON ut.UserId = us.Id
+WHERE us.Reputation > 1000
+  AND (us.GoldBadges + us.SilverBadges + us.BronzeBadges) > 0
+
+UNION ALL
+
+SELECT 
+    NULL                                       AS Id,
+    'Aggregate'                                 AS DisplayName,
+    SUM(us.Reputation)                          AS Reputation,
+    SUM(us.VoteBalance)                         AS VoteBalance,
+    AVG(us.UpDownRatio)                         AS UpDownRatio,
+    SUM(us.GoldBadges)                          AS GoldBadges,
+    SUM(us.SilverBadges)                        AS SilverBadges,
+    SUM(us.BronzeBadges)                        AS BronzeBadges,
+    SUM(COALESCE(upa.QuestionCount,0))           AS QuestionsPosted,
+    SUM(COALESCE(upa.AnswerCount,0))            AS AnswersPosted,
+    SUM(COALESCE(upa.QuestionScore,0))          AS QuestionScore,
+    SUM(COALESCE(upa.AnswerScore,0))            AS AnswerScore,
+    NULL                                        AS LastPostDate,
+    NULL                                        AS ActivityStatus,
+    NULL                                        AS TagName,
+    NULL                                        AS TagUseCount,
+    NULL                                        AS TagRank
+FROM UserStats us
+LEFT JOIN UserPostAgg upa ON upa.UserId = us.Id
+WHERE us.Reputation > 1000
+  AND (us.GoldBadges + us.SilverBadges + us.BronzeBadges) > 0
+
+ORDER BY Reputation DESC
+LIMIT 100;

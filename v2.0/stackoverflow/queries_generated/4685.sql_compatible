@@ -1,0 +1,113 @@
+WITH
+  RankedPostEdits AS (
+    SELECT
+      ph.PostId,
+      ph.UserId,
+      ph.PostHistoryTypeId,
+      ph.CreationDate,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId, ph.PostHistoryTypeId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6)
+  ),
+  LatestPostEdits AS (
+    SELECT
+      rpe.PostId,
+      rpe.UserId,
+      rpe.PostHistoryTypeId,
+      rpe.CreationDate
+    FROM RankedPostEdits rpe
+    WHERE rpe.rn = 1
+  ),
+  UserContributions AS (
+    SELECT
+      p.OwnerUserId,
+      COUNT(DISTINCT p.Id) AS PostsOwned,
+      SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsAsked,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersGiven,
+      SUM(p.ViewCount) AS TotalViews,
+      SUM(p.Score) AS TotalScore
+    FROM Posts p
+    GROUP BY p.OwnerUserId
+  ),
+  RecentActivity AS (
+    SELECT
+      p.OwnerUserId,
+      COUNT(DISTINCT p.Id) AS RecentPosts,
+      SUM(p.AnswerCount) AS RecentAnswers,
+      SUM(p.CommentCount) AS RecentComments
+    FROM Posts p
+    WHERE p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 day'
+    GROUP BY p.OwnerUserId
+  )
+SELECT
+  u.DisplayName,
+  u.Reputation,
+  uc.PostsOwned,
+  uc.QuestionsAsked,
+  uc.AnswersGiven,
+  ra.RecentPosts,
+  ra.RecentAnswers,
+  ra.RecentComments,
+  COALESCE(lpe_body.UserId, lpe_title.UserId, lpe_tags.UserId) AS LastEditorUserId,
+  COALESCE(lpe_body.CreationDate, lpe_title.CreationDate, lpe_tags.CreationDate) AS LastEditDate,
+  CASE
+    WHEN u.WebsiteUrl IS NULL THEN 'No Website'
+    WHEN (POSITION('stack' IN u.WebsiteUrl) > 0) THEN 'StackExchange Site'
+    ELSE 'External Site'
+  END AS WebsiteType,
+  CASE
+    WHEN (COALESCE(u.AboutMe, '') LIKE '%SQL%') OR (COALESCE(u.AboutMe, '') LIKE '%database%') THEN 'SQL Enthusiast'
+    ELSE 'General User'
+  END AS UserInterest,
+  (
+    SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 2
+  ) AS UpVotesGiven,
+  (
+    SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 3
+  ) AS DownVotesGiven,
+  CASE
+    WHEN EXISTS (
+      SELECT 1 FROM Badges b WHERE b.UserId = u.Id AND b.Name LIKE '%Stack%' AND b.Class = 1
+    ) THEN 'Achieved Stack Master'
+    ELSE 'No Stack Master Badge'
+  END AS BadgeStatus
+FROM Users u
+LEFT JOIN UserContributions uc
+  ON u.Id = uc.OwnerUserId
+LEFT JOIN RecentActivity ra
+  ON u.Id = ra.OwnerUserId
+LEFT JOIN LatestPostEdits lpe_body
+  ON u.Id = lpe_body.UserId AND lpe_body.PostHistoryTypeId = 5
+LEFT JOIN LatestPostEdits lpe_title
+  ON u.Id = lpe_title.UserId AND lpe_title.PostHistoryTypeId = 4
+LEFT JOIN LatestPostEdits lpe_tags
+  ON u.Id = lpe_tags.UserId AND lpe_tags.PostHistoryTypeId = 6
+WHERE
+  u.Reputation > 1000
+  AND uc.PostsOwned > 5
+  AND u.CreationDate < (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year')
+GROUP BY
+  u.DisplayName,
+  u.Reputation,
+  uc.PostsOwned,
+  uc.QuestionsAsked,
+  uc.AnswersGiven,
+  uc.TotalViews,
+  uc.TotalScore,
+  ra.RecentPosts,
+  ra.RecentAnswers,
+  ra.RecentComments,
+  lpe_body.UserId,
+  lpe_body.CreationDate,
+  lpe_title.UserId,
+  lpe_title.CreationDate,
+  lpe_tags.UserId,
+  lpe_tags.CreationDate,
+  u.WebsiteUrl,
+  u.AboutMe,
+  u.Id,
+  u.CreationDate
+ORDER BY
+  u.Reputation DESC,
+  uc.TotalScore DESC
+LIMIT 100;

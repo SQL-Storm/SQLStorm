@@ -1,0 +1,176 @@
+-- {"query": "4881.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1585} 
+
+WITH
+  RankedPostEdits AS (
+    SELECT
+      ph.PostId,
+      ph.UserId,
+      ph.CreationDate,
+      ph.PostHistoryTypeId,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) as rn
+    FROM
+      PostHistory AS ph
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6)
+  ),
+  UserActivitySummary AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      COUNT(DISTINCT p.Id) AS TotalQuestions,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+      MAX(u.Reputation) AS MaxReputation,
+      AVG(p.Score) AS AveragePostScore,
+      CAST(SUM(CASE WHEN YEAR(p.CreationDate) = 2023 THEN 1 ELSE 0 END) AS REAL) / COUNT(DISTINCT p.Id) AS ProportionOf2023Posts
+    FROM
+      Users AS u
+      LEFT JOIN Posts AS p
+      ON u.Id = p.OwnerUserId
+    GROUP BY
+      u.Id,
+      u.DisplayName
+    HAVING
+      COUNT(DISTINCT p.Id) > 10
+  )
+SELECT
+  p.Id AS PostId,
+  p.Title,
+  pt.Name AS PostType,
+  u.DisplayName AS OwnerDisplayName,
+  u.Reputation AS OwnerReputation,
+  CASE
+    WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+    WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+    ELSE 'Active'
+  END AS PostStatus,
+  COALESCE(p.AnswerCount, 0) AS AnswerCount,
+  COALESCE(p.CommentCount, 0) AS CommentCount,
+  COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+  uas.TotalQuestions AS UserTotalQuestions,
+  uas.TotalAnswers AS UserTotalAnswers,
+  uas.MaxReputation AS UserMaxReputation,
+  uas.AveragePostScore AS UserAvgPostScore,
+  uas.ProportionOf2023Posts AS UserProportion2023Posts,
+  CASE
+    WHEN EXISTS (
+      SELECT
+        1
+      FROM
+        PostLinks AS pl
+      WHERE
+        pl.PostId = p.Id AND pl.LinkTypeId = 3
+    ) THEN 'Has Duplicate Link'
+    ELSE 'No Duplicate Link'
+  END AS DuplicateLinkStatus,
+  (
+    SELECT
+      COUNT(*)
+    FROM
+      Comments AS c
+    WHERE
+      c.PostId = p.Id AND c.Score > 5
+  ) AS HighScoringCommentCount,
+  (
+    SELECT
+      COUNT(*)
+    FROM
+      Votes AS v
+    WHERE
+      v.PostId = p.Id AND v.VoteTypeId = 2 -- UpVote
+  ) AS TotalUpvotes,
+  rpe.UserId AS LastEditorUserId,
+  rpe.CreationDate AS LastEditDate,
+  DATEDIFF(day, p.CreationDate, p.LastActivityDate) AS DaysSinceLastActivity,
+  LEN(p.Body) AS BodyLength,
+  UPPER(SUBSTRING(p.Title, 1, 3)) AS TitlePrefix
+FROM
+  Posts AS p
+  JOIN PostTypes AS pt
+  ON p.PostTypeId = pt.Id
+  LEFT JOIN Users AS u
+  ON p.OwnerUserId = u.Id
+  LEFT JOIN UserActivitySummary AS uas
+  ON u.Id = uas.UserId
+  LEFT JOIN RankedPostEdits AS rpe
+  ON p.Id = rpe.PostId AND rpe.rn = 1
+WHERE
+  p.Score > 10
+  AND p.CreationDate BETWEEN '2023-01-01' AND '2023-12-31'
+  AND (
+    uas.UserMaxReputation IS NULL OR uas.UserMaxReputation < 10000
+  )
+  AND pt.Name = 'Question'
+UNION
+SELECT
+  p.Id AS PostId,
+  p.Title,
+  pt.Name AS PostType,
+  u.DisplayName AS OwnerDisplayName,
+  u.Reputation AS OwnerReputation,
+  CASE
+    WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+    WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+    ELSE 'Active'
+  END AS PostStatus,
+  COALESCE(p.AnswerCount, 0) AS AnswerCount,
+  COALESCE(p.CommentCount, 0) AS CommentCount,
+  COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+  uas.TotalQuestions AS UserTotalQuestions,
+  uas.TotalAnswers AS UserTotalAnswers,
+  uas.MaxReputation AS UserMaxReputation,
+  uas.AveragePostScore AS UserAvgPostScore,
+  uas.ProportionOf2023Posts AS UserProportion2023Posts,
+  CASE
+    WHEN EXISTS (
+      SELECT
+        1
+      FROM
+        PostLinks AS pl
+      WHERE
+        pl.PostId = p.Id AND pl.LinkTypeId = 3
+    ) THEN 'Has Duplicate Link'
+    ELSE 'No Duplicate Link'
+  END AS DuplicateLinkStatus,
+  (
+    SELECT
+      COUNT(*)
+    FROM
+      Comments AS c
+    WHERE
+      c.PostId = p.Id AND c.Score > 5
+  ) AS HighScoringCommentCount,
+  (
+    SELECT
+      COUNT(*)
+    FROM
+      Votes AS v
+    WHERE
+      v.PostId = p.Id AND v.VoteTypeId = 2 -- UpVote
+  ) AS TotalUpvotes,
+  rpe.UserId AS LastEditorUserId,
+  rpe.CreationDate AS LastEditDate,
+  DATEDIFF(day, p.CreationDate, p.LastActivityDate) AS DaysSinceLastActivity,
+  LEN(p.Body) AS BodyLength,
+  UPPER(SUBSTRING(p.Title, 1, 3)) AS TitlePrefix
+FROM
+  Posts AS p
+  JOIN PostTypes AS pt
+  ON p.PostTypeId = pt.Id
+  LEFT JOIN Users AS u
+  ON p.OwnerUserId = u.Id
+  LEFT JOIN UserActivitySummary AS uas
+  ON u.Id = uas.UserId
+  LEFT JOIN RankedPostEdits AS rpe
+  ON p.Id = rpe.PostId AND rpe.rn = 1
+WHERE
+  p.Score < -5
+  AND pt.Name = 'Answer'
+  AND u.DownVotes > 100
+  AND EXISTS (
+    SELECT
+      1
+    FROM
+      Comments AS c
+    WHERE
+      c.PostId = p.Id AND c.Text LIKE '%performance%'
+  );

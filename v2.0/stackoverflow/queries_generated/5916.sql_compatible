@@ -1,0 +1,153 @@
+WITH
+RecentActivePosts AS (
+  SELECT
+    p.Id,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.CommentCount,
+    COALESCE(a.CountAnswers, 0) AS UndeletedAnswerCount
+  FROM Posts p
+  LEFT JOIN (
+    SELECT ParentId, COUNT(*) AS CountAnswers
+    FROM Posts
+    WHERE PostTypeId = 2
+      AND Deleted = 0
+    GROUP BY ParentId
+  ) a ON a.ParentId = p.Id
+  WHERE p.PostTypeId = 1
+    AND p.ClosedDate IS NULL
+),
+-- Split tags into rows using a standard-compatible approach (works in many dialects using recursive CTE)
+PostTags AS (
+  SELECT
+    p.Id AS PostId,
+    TRIM(SUBSTR(p.Tags, 2, LENGTH(p.Tags)-2)) AS TagsList -- remove leading/trailing angle brackets if present like '<tag1><tag2>'
+  FROM Posts p
+),
+ExplodedTags AS (
+  -- This recursive splitter expects tags formatted like '<tag1><tag2>' or comma-separated; it handles angle-bracket format first,
+  -- otherwise falls back to comma-separated split.
+  SELECT
+    PostId,
+    CASE
+      WHEN TagsList LIKE '%<%>%' THEN
+        SUBSTR(TagsList, 2, INSTR(TagsList, '><') - 2 + CASE WHEN INSTR(TagsList, '><') = 0 THEN LENGTH(TagsList)-1 ELSE 0 END)
+      WHEN TagsList LIKE '%,%' THEN
+        TRIM(SUBSTR(TagsList, 1, INSTR(TagsList, ',') - 1))
+      ELSE
+        TRIM(TagsList)
+    END AS Tag,
+    CASE
+      WHEN TagsList LIKE '%<%>%' THEN
+        CASE WHEN INSTR(TagsList, '><') > 0 THEN SUBSTR(TagsList, INSTR(TagsList, '><')+2) ELSE '' END
+      WHEN TagsList LIKE '%,%' THEN
+        SUBSTR(TagsList, INSTR(TagsList, ',')+1)
+      ELSE
+        ''
+    END AS Rest
+  FROM PostTags
+  UNION ALL
+  SELECT
+    PostId,
+    CASE
+      WHEN Rest LIKE '%<%>%' THEN SUBSTR(Rest, 2, INSTR(Rest, '><') - 2 + CASE WHEN INSTR(Rest, '><') = 0 THEN LENGTH(Rest)-1 ELSE 0 END)
+      WHEN Rest LIKE '%,%' THEN TRIM(SUBSTR(Rest, 1, INSTR(Rest, ',') - 1))
+      ELSE TRIM(Rest)
+    END AS Tag,
+    CASE
+      WHEN Rest LIKE '%<%>%' THEN CASE WHEN INSTR(Rest, '><') > 0 THEN SUBSTR(Rest, INSTR(Rest, '><')+2) ELSE '' END
+      WHEN Rest LIKE '%,%' THEN SUBSTR(Rest, INSTR(Rest, ',')+1)
+      ELSE ''
+    END AS Rest
+  FROM ExplodedTags
+  WHERE Rest IS NOT NULL AND Rest <> ''
+),
+TopTags AS (
+  SELECT
+    et.Tag AS TagName,
+    SUM(p.Score) AS ScoreSum,
+    AVG(p.ViewCount) AS AvgViews,
+    COUNT(*) AS PostCount
+  FROM ExplodedTags et
+  JOIN Posts p ON p.Id = et.PostId
+  GROUP BY et.Tag
+),
+UserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesGiven,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesGiven,
+    MAX(v.CreationDate) AS LastVoteDate,
+    u.Reputation
+  FROM Users u
+  LEFT JOIN Votes v ON v.UserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+CrossStats AS (
+  SELECT
+    r.Id,
+    r.PostTypeId,
+    r.OwnerUserId,
+    r.Title,
+    r.Tags,
+    r.CreationDate,
+    r.LastActivityDate,
+    r.Score,
+    r.ViewCount,
+    r.CommentCount,
+    ROW_NUMBER() OVER (PARTITION BY r.PostTypeId ORDER BY r.LastActivityDate DESC) AS rn
+  FROM Posts r
+  WHERE r.LastActivityDate > (CAST('2024-10-01' AS DATE) - INTERVAL '30 days')
+)
+SELECT
+  p.Id AS PostId,
+  p.Title,
+  p.Tags,
+  p.Score,
+  p.ViewCount,
+  p.CommentCount,
+  p.CreationDate,
+  p.LastActivityDate,
+  p.OwnerUserId,
+  u.DisplayName AS OwnerDisplayName,
+  COALESCE(p.UndeletedAnswerCount, 0) AS UndeletedAnswerCount,
+  tt.TagName,
+  tt.ScoreSum AS TagScoreSum,
+  tt.AvgViews AS TagAvgViews,
+  tt.PostCount AS TagPostCount,
+  up.UpvotesGiven,
+  up.DownvotesGiven,
+  up.LastVoteDate
+FROM RecentActivePosts p
+LEFT JOIN Users u ON u.Id = p.OwnerUserId
+LEFT JOIN (
+  SELECT
+    p2.Id AS PostId,
+    p2.Title,
+    p2.Tags,
+    p2.OwnerUserId
+  FROM Posts p2
+) q ON q.PostId = p.Id
+LEFT JOIN TopTags tt ON tt.TagName IN (
+  -- attempt to match any tag from the post by joining exploded tags for the specific post
+  SELECT Tag FROM ExplodedTags et2 WHERE et2.PostId = p.Id
+)
+LEFT JOIN (
+  SELECT
+    u.Id AS UserId,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesGiven,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesGiven,
+    MAX(v.CreationDate) AS LastVoteDate
+  FROM Users u
+  LEFT JOIN Votes v ON v.UserId = u.Id
+  GROUP BY u.Id
+) up ON up.UserId = p.OwnerUserId
+ORDER BY p.LastActivityDate DESC
+LIMIT 100;

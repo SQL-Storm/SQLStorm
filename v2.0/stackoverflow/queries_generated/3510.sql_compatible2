@@ -1,0 +1,143 @@
+WITH recent_posts AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.Tags,
+        regexp_split_to_table(p.Tags, '\\><') AS Tag
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '30 days'
+),
+tag_agg AS (
+    SELECT
+        rp.OwnerUserId,
+        COUNT(DISTINCT rp.Tag)           AS DistinctTagCount,
+        COUNT(rp.Tag)                    AS TagOccurrences
+    FROM recent_posts rp
+    GROUP BY rp.OwnerUserId
+),
+badge_counts AS (
+    SELECT
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        COUNT(*)                                  AS TotalBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+answer_stats AS (
+    SELECT
+        q.OwnerUserId,
+        COUNT(CASE WHEN a.Score > 0 THEN a.Id END)   AS PositiveAnswers,
+        COUNT(CASE WHEN a.Score <= 0 THEN a.Id END)  AS NonPositiveAnswers,
+        COUNT(a.Id)                                  AS TotalAnswers,
+        AVG(a.Score)                                 AS AvgAnswerScore
+    FROM Posts q
+    LEFT JOIN Posts a
+        ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+    GROUP BY q.OwnerUserId
+),
+user_activity AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(bc.GoldBadges,0)     AS GoldBadges,
+        COALESCE(bc.SilverBadges,0)   AS SilverBadges,
+        COALESCE(bc.BronzeBadges,0)   AS BronzeBadges,
+        COALESCE(bc.TotalBadges,0)    AS TotalBadges,
+        COALESCE(ta.DistinctTagCount,0) AS DistinctTagCount,
+        COALESCE(asr.PositiveAnswers,0) AS PositiveAnswers,
+        COALESCE(asr.TotalAnswers,0)    AS TotalAnswers,
+        COALESCE(asr.AvgAnswerScore,0)  AS AvgAnswerScore,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.CreationDate) AS ReputationRank,
+        RANK()      OVER (ORDER BY COALESCE(asr.AvgAnswerScore,0) DESC) AS AnswerScoreRank,
+        CASE
+            WHEN u.Location IS NULL OR u.Location = '' THEN 'unknown'
+            ELSE u.Location
+        END AS NormalizedLocation
+    FROM Users u
+    LEFT JOIN badge_counts bc   ON bc.UserId = u.Id
+    LEFT JOIN tag_agg ta        ON ta.OwnerUserId = u.Id
+    LEFT JOIN answer_stats asr  ON asr.OwnerUserId = u.Id
+),
+top_users AS (
+    SELECT *
+    FROM user_activity
+    WHERE ReputationRank <= 100
+      AND GoldBadges > 0
+      AND (CAST(PositiveAnswers AS DECIMAL) / NULLIF(CAST(TotalAnswers AS DECIMAL),0)) > 0.5
+),
+recent_voter_activity AS (
+    SELECT
+        v.UserId,
+        COUNT(CASE WHEN vt.Name = 'UpMod' THEN 1 END)      AS UpVotes,
+        COUNT(CASE WHEN vt.Name = 'DownMod' THEN 1 END)    AS DownVotes,
+        COUNT(CASE WHEN vt.Name = 'Favorite' THEN 1 END)   AS Favorites,
+        MAX(v.CreationDate)                               AS LastVoteDate
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE v.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '90 days'
+    GROUP BY v.UserId
+),
+combined AS (
+    SELECT
+        tu.Id,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.GoldBadges,
+        tu.SilverBadges,
+        tu.BronzeBadges,
+        tu.TotalBadges,
+        tu.DistinctTagCount,
+        tu.PositiveAnswers,
+        tu.TotalAnswers,
+        tu.AvgAnswerScore,
+        tu.ReputationRank,
+        tu.AnswerScoreRank,
+        tu.NormalizedLocation,
+        COALESCE(rva.UpVotes,0)   AS UpVotesLast90d,
+        COALESCE(rva.DownVotes,0) AS DownVotesLast90d,
+        COALESCE(rva.Favorites,0) AS FavoritesLast90d,
+        rva.LastVoteDate
+    FROM top_users tu
+    LEFT JOIN recent_voter_activity rva ON rva.UserId = tu.Id
+)
+SELECT *
+FROM combined
+WHERE (UpVotesLast90d + DownVotesLast90d) > 0
+
+UNION ALL
+
+SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    COALESCE(bc.GoldBadges,0),
+    COALESCE(bc.SilverBadges,0),
+    COALESCE(bc.BronzeBadges,0),
+    COALESCE(bc.TotalBadges,0),
+    0 AS DistinctTagCount,
+    0 AS PositiveAnswers,
+    0 AS TotalAnswers,
+    0 AS AvgAnswerScore,
+    CAST(NULL AS BIGINT) AS ReputationRank,
+    CAST(NULL AS BIGINT) AS AnswerScoreRank,
+    'inactive' AS NormalizedLocation,
+    0 AS UpVotesLast90d,
+    0 AS DownVotesLast90d,
+    0 AS FavoritesLast90d,
+    CAST(NULL AS TIMESTAMP) AS LastVoteDate
+FROM Users u
+LEFT JOIN badge_counts bc ON bc.UserId = u.Id
+WHERE u.Reputation < 100
+  AND NOT EXISTS (
+      SELECT 1 FROM Posts p
+      WHERE p.OwnerUserId = u.Id
+        AND p.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '180 days'
+  )
+ORDER BY Reputation DESC NULLS LAST, UpVotesLast90d DESC;

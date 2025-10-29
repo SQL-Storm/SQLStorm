@@ -1,0 +1,154 @@
+WITH UserActivity AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.CreationDate AS UserCreationDate,
+        U.Reputation,
+        U.UpVotes,
+        U.DownVotes,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsPosted,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersPosted,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        MAX(P.LastActivityDate) AS LastPostActivity,
+        MAX(C.CreationDate) AS LastCommentActivity,
+        LAG(U.Reputation, 1, 0) OVER (ORDER BY U.CreationDate, U.Id) AS PrevUserReputation,
+        AVG(CASE WHEN P.PostTypeId = 1 THEN P.Score END) AS AvgQuestionScore,
+        AVG(CASE WHEN P.PostTypeId = 2 THEN P.Score END) AS AvgAnswerScore
+    FROM
+        Users U
+    LEFT JOIN
+        Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN
+        Comments C ON U.Id = C.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.CreationDate, U.Reputation, U.UpVotes, U.DownVotes
+    HAVING
+        U.Reputation >= 1000
+        AND U.DisplayName IS NOT NULL
+),
+PostEditAnalysis AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.LastEditDate,
+        COUNT(PH.Id) AS EditCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS MajorEditCount,
+        EXTRACT(EPOCH FROM (COALESCE(P.LastEditDate, P.CreationDate) - P.CreationDate)) / 3600.0 AS HoursToFirstEdit
+    FROM
+        Posts P
+    LEFT JOIN
+        PostHistory PH ON P.Id = PH.PostId AND PH.PostHistoryTypeId IN (4, 5, 6)
+    GROUP BY
+        P.Id, P.PostTypeId, P.OwnerUserId, P.CreationDate, P.LastEditDate
+),
+QuestionTagMetrics AS (
+    SELECT
+        Q.Id AS QuestionId,
+        Q.OwnerUserId,
+        unnest(string_to_array(substring(Q.Tags, 2, length(Q.Tags) - 2), '><')) AS TagName,
+        Q.Score AS QuestionScore,
+        Q.ViewCount,
+        Q.AnswerCount,
+        Q.CreationDate
+    FROM
+        Posts Q
+    WHERE
+        Q.PostTypeId = 1 AND Q.Tags IS NOT NULL
+),
+TopTagsByScore AS (
+    SELECT
+        TagName,
+        COUNT(QuestionId) AS QuestionsInTag,
+        AVG(QuestionScore) AS AvgScoreInTag,
+        SUM(ViewCount) AS TotalViewsInTag,
+        RANK() OVER (ORDER BY AVG(QuestionScore) DESC, COUNT(QuestionId) DESC) AS TagRankByScore
+    FROM
+        QuestionTagMetrics
+    GROUP BY
+        TagName
+    ORDER BY
+        TagRankByScore
+    LIMIT 100
+)
+SELECT
+    UA.UserId,
+    UA.DisplayName,
+    UA.Reputation,
+    UA.QuestionsPosted,
+    UA.AnswersPosted,
+    UA.TotalComments,
+    UA.LastPostActivity,
+    UA.UserCreationDate,
+    COALESCE(U_main.Location, 'Earth') AS UserLocation,
+    U_main.Views AS UserProfileViews,
+    upper(substring(UA.DisplayName, 1, 5)) || '...' AS DisplayNameSnippet,
+    LEAD(UA.Reputation, 1, 0) OVER (ORDER BY UA.Reputation DESC, UA.UserId) - UA.Reputation AS ReputationGapToNextRank,
+    (SELECT COUNT(B.Id) FROM Badges B WHERE B.UserId = UA.UserId AND B.Class = 1 AND B.TagBased = FALSE) AS GoldNamedBadges,
+    (SELECT MAX(P_sub.Score) FROM Posts P_sub WHERE P_sub.OwnerUserId = UA.UserId AND P_sub.PostTypeId = 1) AS MaxQuestionScore,
+    ROUND(AVG(CAST(PEA.EditCount AS numeric)), 2) AS AvgPostEditCount,
+    MAX(PEA.MajorEditCount) AS MaxMajorEditsOnSinglePost,
+    SUM(CASE WHEN PEA.HoursToFirstEdit IS NOT NULL AND PEA.HoursToFirstEdit <= 24 THEN 1 ELSE 0 END) AS PostsEditedWithinFirstDay,
+    COUNT(DISTINCT QTM.QuestionId) FILTER (WHERE QTM.QuestionScore > 50 AND QTM.ViewCount > 5000) AS HighImpactQuestions,
+    (
+        SELECT TTB.TagName
+        FROM TopTagsByScore TTB
+        INNER JOIN QuestionTagMetrics QTM_user ON TTB.TagName = QTM_user.TagName
+        WHERE QTM_user.OwnerUserId = UA.UserId
+        GROUP BY TTB.TagName, TTB.TagRankByScore
+        ORDER BY COUNT(QTM_user.QuestionId) DESC, TTB.TagRankByScore ASC
+        LIMIT 1
+    ) AS UsersTopTag,
+    RANK() OVER (ORDER BY UA.Reputation DESC, UA.UpVotes DESC, UA.DownVotes ASC) AS GlobalUserRank,
+    NTILE(5) OVER (ORDER BY UA.Reputation DESC) AS ReputationQuintile,
+    CASE
+        WHEN UA.QuestionsPosted > 100 AND UA.AnswersPosted > 100 AND UA.Reputation > 10000 AND UA.AvgQuestionScore > 10 AND UA.AvgAnswerScore > 10
+             AND (SELECT COUNT(B_sub.Id) FROM Badges B_sub WHERE B_sub.UserId = UA.UserId AND B_sub.Class = 1) > 0 THEN 'Elite_Polymath_Legend'
+        WHEN UA.QuestionsPosted > 50 AND UA.AnswersPosted > 50 AND UA.Reputation > 5000 AND UA.TotalComments > 200 THEN 'Pro_Community_Influencer'
+        WHEN UA.QuestionsPosted > 20 AND UA.AnswersPosted = 0 AND UA.Reputation > 2000 THEN 'Question_Maven_Only'
+        WHEN UA.QuestionsPosted = 0 AND UA.AnswersPosted > 20 AND UA.Reputation > 2000 THEN 'Answer_Guru_Only'
+        ELSE 'Active_Contributor'
+    END AS UserProfileCategory,
+    CASE
+        WHEN lower(coalesce(U_main.AboutMe, '')) LIKE '%sql%' THEN TRUE
+        WHEN lower(coalesce(U_main.AboutMe, '')) LIKE '%database%' THEN TRUE
+        ELSE FALSE
+    END AS HasDBKeywordsInAboutMe,
+    (
+        SELECT
+            CASE WHEN EXISTS (
+                SELECT 1
+                FROM Badges B_check
+                WHERE B_check.UserId = UA.UserId AND B_check.Name = 'Disciplined'
+            ) AND NOT EXISTS (
+                SELECT 1
+                FROM PostHistory PH_check
+                WHERE PH_check.UserId = UA.UserId AND PH_check.PostHistoryTypeId IN (12, 13)
+                  AND PH_check.CreationDate > UA.UserCreationDate + INTERVAL '1 year'
+            ) THEN TRUE ELSE FALSE END
+    ) AS IsDisciplinedNoDeletionHistory
+FROM
+    UserActivity UA
+INNER JOIN
+    Users U_main ON UA.UserId = U_main.Id
+LEFT JOIN
+    PostEditAnalysis PEA ON UA.UserId = PEA.OwnerUserId
+LEFT JOIN
+    QuestionTagMetrics QTM ON UA.UserId = QTM.OwnerUserId
+WHERE
+    UA.Reputation > UA.PrevUserReputation
+    AND UA.QuestionsPosted >= 1
+    AND UA.AnswersPosted >= 1
+    AND UA.TotalComments > 5
+    AND UA.LastPostActivity > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '6 months'
+    AND U_main.LastAccessDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 months'
+    AND COALESCE(U_main.AboutMe, '') IS NOT NULL
+GROUP BY
+    UA.UserId, UA.DisplayName, UA.Reputation, UA.QuestionsPosted, UA.AnswersPosted, UA.TotalComments,
+    UA.LastPostActivity, UA.UserCreationDate, U_main.Location, U_main.Views, U_main.AboutMe,
+    UA.AvgQuestionScore, UA.AvgAnswerScore, UA.UpVotes, UA.DownVotes, UA.PrevUserReputation
+ORDER BY
+    UA.Reputation DESC, HighImpactQuestions DESC, PostsEditedWithinFirstDay DESC
+LIMIT 500;

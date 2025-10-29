@@ -1,0 +1,86 @@
+-- {"query": "5040.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 650} 
+WITH
+recent_questions AS (
+  SELECT p.Id AS PostId,
+         p.Title,
+         p.Tags,
+         p.CreationDate,
+         p.OwnerUserId,
+         p.ViewCount,
+         p.Score,
+         p.AnswerCount,
+         p.CommentCount,
+         p.FavoriteCount,
+         p.LastActivityDate,
+         p.LastEditorUserId,
+         p.LastEditDate
+  FROM Posts p
+  WHERE p.PostTypeId = 1 -- Questions
+    AND p.CreationDate >= NOW() - INTERVAL '30 days'
+),
+tag_activity AS (
+  SELECT unnest(string_to_array(substr(p.Tags, 2, length(p.Tags)-2), '><')) AS TagName,
+         COUNT(*) AS QuestionCount,
+         SUM(p.ViewCount) AS TotalViews,
+         SUM(p.Score) AS TotalScore
+  FROM Posts p
+  JOIN recent_questions rq ON rq.PostId = p.Id
+  GROUP BY 1
+),
+top_tags AS (
+  SELECT TagName,
+         QuestionCount,
+         TotalViews,
+         TotalScore,
+         RANK() OVER (ORDER BY TotalViews DESC, TotalScore DESC) AS tag_rank
+  FROM tag_activity
+)
+SELECT
+  rq.PostId,
+  rq.Title,
+  rq.CreationDate,
+  rq.OwnerUserId,
+  rq.ViewCount,
+  rq.Score,
+  rq.AnswerCount,
+  rq.CommentCount,
+  rq.FavoriteCount,
+  rq.LastActivityDate,
+  rq.LastEditDate,
+  tou.DisplayName AS OwnerDisplayName,
+  COALESCE(vt.UpModCount, 0) AS UpVotesOnQuestion,
+  COALESCE(vt.DownModCount, 0) AS DownVotesOnQuestion,
+  tb.BadgeCount AS GoldBadgesForOwner,
+  tt.tag_rank
+FROM recent_questions rq
+LEFT JOIN Users tou ON rq.OwnerUserId = tou.Id
+LEFT JOIN (
+  SELECT PostId, COUNT(*) AS UpModCount
+  FROM Votes v
+  JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+  WHERE vt.Name = 'UpMod' -- upvotes
+  GROUP BY PostId
+) vt ON rq.PostId = vt.PostId
+LEFT JOIN (
+  SELECT PostId, COUNT(*) AS DownModCount
+  FROM Votes v
+  JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+  WHERE vt.Name = 'DownMod' -- downvotes
+  GROUP BY PostId
+) vt2 ON rq.PostId = vt2.PostId
+LEFT JOIN Badges tb ON rq.OwnerUserId = tb.UserId
+  AND tb.Class = 1 -- Gold badges
+LEFT JOIN (
+  SELECT OwnerUserId, COUNT(*) AS BadgeCount
+  FROM Badges
+  GROUP BY OwnerUserId
+) tb2 ON rq.OwnerUserId = tb2.OwnerUserId
+LEFT JOIN (
+  SELECT TagName, tag_rank
+  FROM top_tags
+  ORDER BY tag_rank
+  LIMIT 10
+) tt ON 1=1
+WHERE tt.tag_rank = 1
+ORDER BY rq.CreationDate DESC
+LIMIT 100;

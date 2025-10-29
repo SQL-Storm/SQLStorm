@@ -1,0 +1,163 @@
+WITH UserStats AS (
+    SELECT
+        u.Id                         AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.UpVotes,0) - COALESCE(u.DownVotes,0) AS NetVotes,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS QuestionCount,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS AnswerCount
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes
+),
+
+TagPopularity AS (
+    SELECT
+        t.TagName,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS TotalQuestionScore,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 1)               AS QuestionCount,
+        ROW_NUMBER() OVER (ORDER BY
+            SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) DESC) AS RankByScore
+    FROM Tags t
+    JOIN Posts p
+      ON p.Tags LIKE ('%' || '<' || t.TagName || '>' || '%')
+    WHERE p.PostTypeId = 1
+    GROUP BY t.TagName
+    HAVING COUNT(*) > 50
+),
+
+TopLinks AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name                                     AS LinkType,
+        ROW_NUMBER() OVER (PARTITION BY pl.PostId ORDER BY pl.CreationDate DESC) AS rn
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    WHERE lt.Name IN ('Linked','Duplicate')
+),
+
+RecentVotes AS (
+    SELECT
+        v.PostId,
+        SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        MAX(v.CreationDate)                         AS LastVoteDate
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE v.CreationDate >= (DATE '2024-10-01' - INTERVAL '30' DAY)
+    GROUP BY v.PostId
+),
+
+MainSelection AS (
+SELECT
+    u.UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.NetVotes,
+    u.GoldBadges,
+    u.SilverBadges,
+    u.BronzeBadges,
+    u.QuestionCount,
+    u.AnswerCount,
+    COALESCE(rv.UpVotes,0)   AS RecentUpVotes,
+    COALESCE(rv.DownVotes,0) AS RecentDownVotes,
+    CASE
+        WHEN u.Reputation > 20000               THEN 'Elite'
+        WHEN u.Reputation BETWEEN 10000 AND 20000 THEN 'Veteran'
+        WHEN u.Reputation BETWEEN 1000  AND 9999  THEN 'Contributor'
+        ELSE 'Newbie'
+    END AS ReputationTier,
+    t.TagName,
+    t.TotalQuestionScore,
+    t.QuestionCount AS TagQuestionCount,
+    t.RankByScore,
+    CASE WHEN tl.rn = 1 THEN 'PrimaryLink' END AS PrimaryLinkType,
+    CASE
+        WHEN p.ClosedDate IS NOT NULL        THEN 'Closed'
+        WHEN p.CommunityOwnedDate IS NOT NULL THEN 'CommunityOwned'
+        ELSE 'Open'
+    END AS PostStatus,
+    COALESCE(NULLIF(p.FavoriteCount,0),0) AS FavoriteCountOrZero,
+    REPLACE(p.Title, '''', '''''')        AS EscapedTitle,
+    ('https://stackoverflow.com/q/' || CAST(p.Id AS VARCHAR)) AS PostUrl,
+    p.Score,
+    p.CreationDate
+FROM UserStats u
+LEFT JOIN Posts p
+       ON p.OwnerUserId = u.UserId AND p.PostTypeId = 1
+LEFT JOIN RecentVotes rv   ON rv.PostId = p.Id
+LEFT JOIN LATERAL (
+    SELECT
+        tp.TagName,
+        tp.TotalQuestionScore,
+        tp.QuestionCount,
+        tp.RankByScore
+    FROM TagPopularity tp
+    WHERE p.Tags LIKE ('%' || '<' || tp.TagName || '>' || '%')
+    ORDER BY tp.RankByScore
+    LIMIT 1
+) t ON TRUE
+LEFT JOIN TopLinks tl ON tl.PostId = p.Id AND tl.rn = 1
+WHERE (u.Reputation > 5000 OR u.GoldBadges > 0)
+  AND (p.Score IS NULL OR p.Score >= 0)
+  AND (p.CreationDate >= (DATE '2024-10-01' - INTERVAL '180' DAY) OR p.CreationDate IS NULL)
+)
+
+SELECT
+    UserId,
+    DisplayName,
+    Reputation,
+    NetVotes,
+    GoldBadges,
+    SilverBadges,
+    BronzeBadges,
+    QuestionCount,
+    AnswerCount,
+    RecentUpVotes,
+    RecentDownVotes,
+    ReputationTier,
+    TagName,
+    TotalQuestionScore,
+    TagQuestionCount,
+    RankByScore,
+    PrimaryLinkType,
+    PostStatus,
+    FavoriteCountOrZero,
+    EscapedTitle,
+    PostUrl
+FROM MainSelection
+ORDER BY Reputation DESC, RankByScore ASC
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    CAST(NULL AS BIGINT) AS UserId,
+    CAST(NULL AS TEXT)   AS DisplayName,
+    CAST(NULL AS INT)    AS Reputation,
+    CAST(NULL AS INT)    AS NetVotes,
+    CAST(NULL AS INT)    AS GoldBadges,
+    CAST(NULL AS INT)    AS SilverBadges,
+    CAST(NULL AS INT)    AS BronzeBadges,
+    CAST(NULL AS INT)    AS QuestionCount,
+    CAST(NULL AS INT)    AS AnswerCount,
+    CAST(NULL AS INT)    AS RecentUpVotes,
+    CAST(NULL AS INT)    AS RecentDownVotes,
+    'NoUser' AS ReputationTier,
+    t.TagName,
+    t.TotalQuestionScore,
+    t.QuestionCount AS TagQuestionCount,
+    t.RankByScore,
+    CAST(NULL AS TEXT) AS PrimaryLinkType,
+    'N/A' AS PostStatus,
+    0    AS FavoriteCountOrZero,
+    CAST(NULL AS TEXT) AS EscapedTitle,
+    CAST(NULL AS TEXT) AS PostUrl
+FROM TagPopularity t
+WHERE t.RankByScore > 50
+ORDER BY t.TotalQuestionScore DESC
+LIMIT 20;

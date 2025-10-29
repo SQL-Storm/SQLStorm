@@ -1,0 +1,195 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id, 
+        t.TagName, 
+        ARRAY[t.TagName] AS TagPath,
+        t.Count
+    FROM Tags t
+    WHERE t.IsModeratorOnly = FALSE AND t.IsRequired = FALSE
+
+    UNION ALL
+
+    SELECT 
+        child.Id,
+        child.TagName,
+        parent.TagPath || child.TagName,
+        child.Count
+    FROM Tags child
+    JOIN RecursiveTagHierarchy parent ON child.Id <> parent.Id
+    WHERE child.Count < parent.Count
+      AND NOT child.TagName = ANY(parent.TagPath)
+      AND char_length(child.TagName) > 2
+      AND char_length(parent.TagName) > 2
+),
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(*) AS TotalBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserActivityWindow AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        FIRST_VALUE(u.LastAccessDate) OVER (PARTITION BY u.Id ORDER BY u.LastAccessDate DESC) AS LastAccess,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) OVER (PARTITION BY u.Id) AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) OVER (PARTITION BY u.Id) AS AnswerCount,
+        COALESCE(ub.GoldBadges, 0) AS GoldBadges,
+        COALESCE(ub.SilverBadges, 0) AS SilverBadges,
+        COALESCE(ub.BronzeBadges, 0) AS BronzeBadges,
+        COALESCE(ub.TotalBadges, 0) AS TotalBadges
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.CreationDate > u.CreationDate
+    LEFT JOIN UserBadgeCounts ub ON u.Id = ub.UserId
+),
+FilteredPosts AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.ClosedDate,
+        p.FavoriteCount,
+        p.AnswerCount,
+        u.DisplayName AS OwnerDisplayName,
+        ph_latest.RevisionGUID AS LatestRevisionGUID,
+        ph_latest.PostHistoryTypeId AS LatestPostHistoryTypeId,
+        ph_latest.CreationDate AS LatestEditDate,
+        ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY p.CreationDate DESC) AS PostRank
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT ph.PostId, ph.PostHistoryTypeId, ph.RevisionGUID, ph.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+        FROM PostHistory ph
+    ) ph_latest ON ph_latest.PostId = p.Id AND ph_latest.rn = 1
+    WHERE p.PostTypeId IN (1,2) 
+      AND (p.Score IS NOT NULL AND p.Score >= 0)
+      AND p.Tags IS NOT NULL
+),
+PostLinkCounts AS (
+    SELECT
+        pl.PostId,
+        COUNT(*) AS LinkCount,
+        COUNT(DISTINCT CASE WHEN lt.Name = 'Duplicate' THEN pl.RelatedPostId ELSE NULL END) AS DuplicateLinks
+    FROM PostLinks pl
+    INNER JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    GROUP BY pl.PostId
+),
+AnswerQuality AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.Score,
+        a.CreationDate,
+        u.Reputation AS AnswererReputation,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank,
+        COUNT(c.Id) AS CommentCount
+    FROM Posts a
+    LEFT JOIN Users u ON a.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON a.Id = c.PostId
+    WHERE a.PostTypeId = 2
+    GROUP BY a.Id, a.ParentId, a.Score, a.CreationDate, u.Reputation
+),
+TopAnswers AS (
+    SELECT *
+    FROM AnswerQuality
+    WHERE AnswerRank = 1
+),
+QuestionStatistics AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.Tags,
+        q.CreationDate,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        q.FavoriteCount,
+        plc.LinkCount,
+        plc.DuplicateLinks,
+        COALESCE(ta.AnswerId, -1) AS TopAnswerId,
+        ta.Score AS TopAnswerScore,
+        ta.AnswererReputation,
+        ta.CommentCount AS TopAnswerCommentCount,
+        CASE 
+            WHEN q.ClosedDate IS NOT NULL THEN 1
+            ELSE 0
+        END AS IsClosed
+    FROM FilteredPosts q
+    LEFT JOIN PostLinkCounts plc ON q.Id = plc.PostId
+    LEFT JOIN TopAnswers ta ON q.Id = ta.QuestionId
+    WHERE q.PostTypeId = 1
+),
+UserEngagement AS (
+    SELECT
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.LastAccess,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.GoldBadges,
+        ua.SilverBadges,
+        ua.BronzeBadges,
+        ua.TotalBadges,
+        COALESCE(SUM(ps.QuestionScore),0) AS TotalQuestionScore,
+        COALESCE(SUM(ps.TopAnswerScore),0) AS TotalTopAnswerScore,
+        COALESCE(SUM(ps.FavoriteCount), 0) AS TotalFavoritesReceived,
+        COUNT(DISTINCT ps.QuestionId) AS QuestionsContributedTo,
+        COUNT(DISTINCT ans.AnswerId) AS AnswersProvided
+    FROM UserActivityWindow ua
+    LEFT JOIN Posts p ON ua.UserId = p.OwnerUserId AND p.PostTypeId = 1
+    LEFT JOIN QuestionStatistics ps ON ps.QuestionId = p.Id
+    LEFT JOIN AnswerQuality ans ON ans.AnswerId = p.Id
+    GROUP BY ua.UserId, ua.DisplayName, ua.Reputation, ua.LastAccess, ua.QuestionCount, ua.AnswerCount, ua.GoldBadges, ua.SilverBadges, ua.BronzeBadges, ua.TotalBadges
+)
+SELECT
+    q.QuestionId,
+    q.Title,
+    q.Tags,
+    q.CreationDate,
+    q.QuestionScore,
+    q.ViewCount,
+    q.AnswerCount,
+    q.FavoriteCount,
+    q.LinkCount,
+    q.DuplicateLinks,
+    q.TopAnswerId,
+    q.TopAnswerScore,
+    q.AnswererReputation,
+    q.TopAnswerCommentCount,
+    q.IsClosed,
+    u.UserId,
+    u.DisplayName AS QuestionOwnerDisplayName,
+    u.Reputation AS QuestionOwnerReputation,
+    u.GoldBadges,
+    u.SilverBadges,
+    u.BronzeBadges,
+    u.TotalBadges,
+    u.TotalQuestionScore,
+    u.TotalTopAnswerScore,
+    u.TotalFavoritesReceived,
+    u.QuestionsContributedTo,
+    u.AnswersProvided,
+    COALESCE(NULLIF(char_length(q.Title),0), 1) * (CASE WHEN q.Tags IS NULL THEN 1 ELSE array_length(string_to_array(substring(q.Tags from 2 for char_length(q.Tags)-2), '><'),1) END) * (q.QuestionScore + 1) * (q.FavoriteCount + 1) AS EngagementScore,
+    reverse(concat_ws(' - ', u.DisplayName, concat_ws('/', u.GoldBadges, u.SilverBadges, u.BronzeBadges))) AS OwnerBadgeSignature,
+    RANK() OVER (PARTITION BY CASE WHEN q.Tags ILIKE '%<sql>%' THEN 'sql' ELSE 'other' END ORDER BY COALESCE(NULLIF(char_length(q.Title),0), 1) * (CASE WHEN q.Tags IS NULL THEN 1 ELSE array_length(string_to_array(substring(q.Tags from 2 for char_length(q.Tags)-2), '><'),1) END) * (q.QuestionScore + 1) * (q.FavoriteCount + 1) DESC) AS EngagementRank
+FROM QuestionStatistics q
+LEFT JOIN UserEngagement u ON u.UserId = (
+    SELECT OwnerUserId FROM Posts WHERE Id = q.QuestionId
+)
+WHERE q.CreationDate > DATE '2015-01-01' AND q.IsClosed = 0
+ORDER BY EngagementScore DESC
+LIMIT 100;

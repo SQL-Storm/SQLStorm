@@ -1,0 +1,286 @@
+WITH UserEngagementMetrics AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Views AS ProfileViews,
+        U.UpVotes AS UserGivenUpVotes,
+        U.DownVotes AS UserGivenDownVotes,
+        COUNT(DISTINCT Q.Id) AS TotalQuestions,
+        COUNT(DISTINCT A.Id) AS TotalAnswers,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COALESCE(SUM(Q.Score), 0) AS TotalQuestionScore,
+        COALESCE(SUM(A.Score), 0) AS TotalAnswerScore,
+        COALESCE(SUM(C.Score), 0) AS TotalCommentScore,
+        COALESCE(SUM(CASE WHEN V_Received.VoteTypeId = 1 THEN 1 ELSE 0 END), 0) AS ReceivedAcceptedVotes,
+        COALESCE(SUM(CASE WHEN V_Received.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS ReceivedUpVotes,
+        COALESCE(SUM(CASE WHEN V_Received.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS ReceivedDownVotes
+    FROM
+        Users U
+    LEFT JOIN Posts Q ON U.Id = Q.OwnerUserId AND Q.PostTypeId = 1
+    LEFT JOIN Posts A ON U.Id = A.OwnerUserId AND A.PostTypeId = 2
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Votes V_Received ON (Q.Id = V_Received.PostId OR A.Id = V_Received.PostId) AND V_Received.VoteTypeId IN (1,2,3)
+    WHERE
+        U.Reputation >= 500
+        AND U.LastAccessDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2' YEAR)
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Views, U.UpVotes, U.DownVotes
+),
+UserBadgeSummary AS (
+    SELECT
+        B.UserId,
+        COUNT(CASE WHEN B.Class = 1 THEN 1 ELSE NULL END) AS GoldBadges,
+        COUNT(CASE WHEN B.Class = 2 THEN 1 ELSE NULL END) AS SilverBadges,
+        COUNT(CASE WHEN B.Class = 3 THEN 1 ELSE NULL END) AS BronzeBadges,
+        SUM(CASE WHEN B.TagBased = TRUE THEN 1 ELSE 0 END) AS TagBasedBadgesCount
+    FROM
+        Badges B
+    GROUP BY
+        B.UserId
+),
+PostLinkAnalytics AS (
+    PostsBase AS (
+        SELECT
+            P.OwnerUserId AS UserId,
+            P.Id AS PostId,
+            P.Score AS PostScore,
+            P.ViewCount,
+            COALESCE(P.Tags, '<unspecified>') AS Tags
+        FROM Posts P
+        WHERE P.PostTypeId = 1
+          AND P.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3' YEAR)
+    ),
+    RecursiveSplit AS (
+        SELECT
+            UserId,
+            PostId,
+            PostScore,
+            ViewCount,
+            TRIM(BOTH '<>' FROM SUBSTR(Tags, 2, CASE WHEN LENGTH(Tags) >= 2 THEN LENGTH(Tags) - 2 ELSE 0 END)) AS Remaining,
+            CAST(NULL AS VARCHAR(255)) AS TagName,
+            1 AS rn
+        FROM PostsBase
+        UNION ALL
+        SELECT
+            rs.UserId,
+            rs.PostId,
+            rs.PostScore,
+            rs.ViewCount,
+            CASE
+                WHEN INSTR(rs.Remaining, '><') > 0 THEN SUBSTR(rs.Remaining, INSTR(rs.Remaining, '><') + 2)
+                ELSE ''
+            END AS Remaining,
+            CASE
+                WHEN INSTR(rs.Remaining, '><') > 0 THEN TRIM(BOTH '<>' FROM SUBSTR(rs.Remaining, 1, INSTR(rs.Remaining, '><') - 1))
+                WHEN rs.Remaining <> '' THEN rs.Remaining
+                ELSE NULL
+            END AS TagName,
+            rs.rn + 1
+        FROM RecursiveSplit rs
+        WHERE rs.Remaining IS NOT NULL AND rs.Remaining <> ''
+    ),
+    ExplodedTags AS (
+        SELECT UserId, PostId, PostScore, ViewCount, TagName
+        FROM RecursiveSplit
+        WHERE TagName IS NOT NULL
+    ),
+    LinkCounts AS (
+        SELECT
+            P.Id AS PostId,
+            COUNT(DISTINCT PL_Linked.RelatedPostId) AS LinkedPostCount,
+            COUNT(DISTINCT PL_Dup.RelatedPostId) AS DuplicatePostCount
+        FROM Posts P
+        LEFT JOIN PostLinks PL_Linked ON P.Id = PL_Linked.PostId AND PL_Linked.LinkTypeId = 1
+        LEFT JOIN PostLinks PL_Dup ON P.Id = PL_Dup.PostId AND PL_Dup.LinkTypeId = 3
+        WHERE P.PostTypeId = 1
+        GROUP BY P.Id
+    )
+    SELECT
+        et.UserId,
+        et.PostId,
+        et.PostScore,
+        et.ViewCount,
+        et.TagName,
+        COALESCE(lc.LinkedPostCount, 0) AS LinkedPostCount,
+        COALESCE(lc.DuplicatePostCount, 0) AS DuplicatePostCount
+    FROM ExplodedTags et
+    LEFT JOIN LinkCounts lc ON et.PostId = lc.PostId
+),
+UserPostHistoryAnalysis AS (
+    SELECT
+        PH.UserId,
+        COUNT(CASE WHEN PH.PostHistoryTypeId IN (4,5,6) THEN 1 ELSE NULL END) AS TotalEditsMade,
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE NULL END) AS TotalPostsClosedByVote,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (4,5,6) THEN PH.PostId ELSE NULL END) AS DistinctPostsEdited,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (10,11) THEN 1 ELSE 0 END) AS InvolvedInCloseReopen
+    FROM
+        PostHistory PH
+    WHERE
+        PH.UserId IS NOT NULL
+        AND PH.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2' YEAR)
+    GROUP BY
+        PH.UserId
+),
+UserDetailedSnapshot AS (
+    SELECT
+        UEM.UserId,
+        UEM.DisplayName,
+        UEM.Reputation,
+        UEM.UserCreationDate,
+        UEM.LastAccessDate,
+        UEM.ProfileViews,
+        UEM.UserGivenUpVotes,
+        UEM.UserGivenDownVotes,
+        UEM.TotalQuestions,
+        UEM.TotalAnswers,
+        UEM.TotalComments,
+        UEM.TotalQuestionScore,
+        UEM.TotalAnswerScore,
+        UEM.TotalCommentScore,
+        UEM.ReceivedAcceptedVotes,
+        UEM.ReceivedUpVotes,
+        UEM.ReceivedDownVotes,
+        COALESCE(UBS.GoldBadges, 0) AS GoldBadges,
+        COALESCE(UBS.SilverBadges, 0) AS SilverBadges,
+        COALESCE(UBS.BronzeBadges, 0) AS BronzeBadges,
+        COALESCE(UBS.TagBasedBadgesCount, 0) AS TagBasedBadgesCount,
+        COALESCE(UPHA.TotalEditsMade, 0) AS TotalEditsMade,
+        COALESCE(UPHA.DistinctPostsEdited, 0) AS DistinctPostsEdited,
+        COALESCE(UPHA.InvolvedInCloseReopen, 0) AS InvolvedInCloseReopen,
+        COALESCE(AVG(PLA.PostScore * (1.0 + PLA.LinkedPostCount / 5.0 - PLA.DuplicatePostCount / 10.0)), 0.0) AS AvgWeightedQuestionScore,
+        (SELECT COUNT(DISTINCT A_Cor.Id)
+         FROM Posts A_Cor
+         WHERE A_Cor.OwnerUserId = UEM.UserId
+           AND A_Cor.PostTypeId = 2
+           AND EXISTS (SELECT 1 FROM Posts Q_Cor WHERE Q_Cor.AcceptedAnswerId = A_Cor.Id)
+        ) AS HasProvidedAcceptedAnswer,
+        EXISTS (
+            SELECT 1
+            FROM Comments C_Cor
+            JOIN Votes V_Cor ON C_Cor.Id = V_Cor.PostId
+            WHERE C_Cor.UserId = UEM.UserId
+              AND V_Cor.VoteTypeId IN (4, 12)
+              AND V_Cor.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1' YEAR)
+        ) AS HasRecentNegativeCommentVotes
+    FROM
+        UserEngagementMetrics UEM
+    LEFT JOIN UserBadgeSummary UBS ON UEM.UserId = UBS.UserId
+    LEFT JOIN PostLinkAnalytics PLA ON UEM.UserId = PLA.UserId
+    LEFT JOIN UserPostHistoryAnalysis UPHA ON UEM.UserId = UPHA.UserId
+    GROUP BY
+        UEM.UserId, UEM.DisplayName, UEM.Reputation, UEM.UserCreationDate, UEM.LastAccessDate, UEM.ProfileViews,
+        UEM.UserGivenUpVotes, UEM.UserGivenDownVotes, UEM.TotalQuestions, UEM.TotalAnswers, UEM.TotalComments,
+        UEM.TotalQuestionScore, UEM.TotalAnswerScore, UEM.TotalCommentScore, UEM.ReceivedAcceptedVotes,
+        UEM.ReceivedUpVotes, UEM.ReceivedDownVotes, UBS.GoldBadges, UBS.SilverBadges, UBS.BronzeBadges,
+        UBS.TagBasedBadgesCount, UPHA.TotalEditsMade, UPHA.DistinctPostsEdited, UPHA.InvolvedInCloseReopen
+)
+SELECT
+    UDS.UserId,
+    UDS.DisplayName,
+    UDS.Reputation,
+    UDS.TotalQuestions,
+    UDS.TotalAnswers,
+    UDS.TotalComments,
+    UDS.ReceivedUpVotes,
+    UDS.ReceivedDownVotes,
+    UDS.GoldBadges,
+    UDS.SilverBadges,
+    UDS.BronzeBadges,
+    UDS.AvgWeightedQuestionScore,
+    UDS.HasProvidedAcceptedAnswer,
+    UDS.HasRecentNegativeCommentVotes,
+    'HighImpactContributor' AS UserSegment,
+    ROW_NUMBER() OVER (PARTITION BY CAST(FLOOR(UDS.Reputation / 10000) AS BIGINT) ORDER BY (UDS.ReceivedUpVotes * 2 + UDS.TotalAnswerScore * 3 + UDS.GoldBadges * 10) DESC) AS RankInReputationBracket,
+    AVG(UDS.TotalEditsMade) OVER (ORDER BY UDS.UserCreationDate ASC ROWS BETWEEN 5 PRECEDING AND 5 FOLLOWING) AS RollingAvgEdits,
+    (UDS.ReceivedAcceptedVotes * 5 + UDS.ReceivedUpVotes * 2 + UDS.TotalAnswerScore * 1.5 + UDS.TotalQuestionScore * 0.5 + UDS.GoldBadges * 10 + UDS.SilverBadges * 5 + UDS.DistinctPostsEdited * 2)
+      / NULLIF(UDS.TotalQuestions + UDS.TotalAnswers + UDS.TotalComments + UDS.UserGivenUpVotes + UDS.UserGivenDownVotes + 1, 0) AS PrimaryScore,
+    COALESCE(
+        CASE
+            WHEN UDS.TotalQuestions > UDS.TotalAnswers * 2 THEN 'Question-focused'
+            WHEN UDS.TotalAnswers > UDS.TotalQuestions * 2 THEN 'Answer-focused'
+            ELSE 'Balanced Contributor'
+        END || ' (Badges: ' || UDS.GoldBadges || 'G/' || UDS.SilverBadges || 'S/' || UDS.BronzeBadges || 'B)',
+        'No clear focus'
+    ) AS ContributionProfile,
+    CASE
+        WHEN UDS.LastAccessDate IS NULL THEN 'Inactive (No Access Date)'
+        WHEN UDS.LastAccessDate < (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1' YEAR) THEN 'Dormant'
+        WHEN UDS.ProfileViews < 100 THEN 'Low Visibility'
+        ELSE 'Engaged'
+    END AS EngagementStatus
+FROM
+    UserDetailedSnapshot UDS
+WHERE
+    UDS.Reputation > 1000
+    AND UDS.TotalAnswers > 5
+    AND UDS.HasProvidedAcceptedAnswer > 0
+    AND NOT UDS.HasRecentNegativeCommentVotes
+    AND UDS.AvgWeightedQuestionScore > 5
+    AND EXISTS (
+        SELECT 1
+        FROM Badges B_Exists
+        WHERE B_Exists.UserId = UDS.UserId
+          AND (B_Exists.Class = 1 OR (B_Exists.Class = 2 AND UDS.SilverBadges >= 2))
+    )
+
+UNION ALL
+
+SELECT
+    UDS.UserId,
+    UDS.DisplayName,
+    UDS.Reputation,
+    UDS.TotalQuestions,
+    UDS.TotalAnswers,
+    UDS.TotalComments,
+    UDS.ReceivedUpVotes,
+    UDS.ReceivedDownVotes,
+    UDS.GoldBadges,
+    UDS.SilverBadges,
+    UDS.BronzeBadges,
+    UDS.AvgWeightedQuestionScore,
+    UDS.HasProvidedAcceptedAnswer,
+    UDS.HasRecentNegativeCommentVotes,
+    'CommunityEditor' AS UserSegment,
+    ROW_NUMBER() OVER (PARTITION BY UDS.InvolvedInCloseReopen ORDER BY (UDS.TotalEditsMade * 3 + UDS.DistinctPostsEdited * 5 + UDS.TotalComments * 0.5) DESC) AS RankInReputationBracket,
+    AVG(UDS.TotalComments) OVER (ORDER BY UDS.UserCreationDate DESC ROWS BETWEEN 10 PRECEDING AND 10 FOLLOWING) AS RollingAvgEdits,
+    (UDS.TotalEditsMade * 2 + UDS.DistinctPostsEdited * 3 + UDS.TotalComments * 1.2 + UDS.InvolvedInCloseReopen * 5 + UDS.TagBasedBadgesCount * 2)
+      / NULLIF(UDS.TotalQuestions + UDS.TotalAnswers + UDS.TotalComments + UDS.TotalEditsMade + 1, 0) AS PrimaryScore,
+    COALESCE(
+        REPLACE(
+            'Editor Role: ' ||
+            CASE
+                WHEN UDS.TotalEditsMade > 50 AND UDS.DistinctPostsEdited > 10 THEN 'Heavy Editor'
+                WHEN UDS.TotalEditsMade > 10 THEN 'Moderate Editor'
+                ELSE 'Occasional Editor'
+            END,
+            'Editor',
+            'Revisionist'
+        ),
+        'Unknown Edit Role'
+    ) AS ContributionProfile,
+    CASE
+        WHEN UDS.TotalEditsMade = 0 AND UDS.TotalComments = 0 THEN 'Passive'
+        WHEN UDS.InvolvedInCloseReopen = 1 AND UDS.TotalComments > 20 THEN 'Moderation-minded'
+        ELSE 'Supportive'
+    END AS EngagementStatus
+FROM
+    UserDetailedSnapshot UDS
+WHERE
+    UDS.Reputation BETWEEN 200 AND 5000
+    AND UDS.TotalEditsMade > 5
+    AND UDS.TotalComments > 10
+    AND UDS.HasProvidedAcceptedAnswer = 0
+    AND NOT UDS.HasRecentNegativeCommentVotes
+    AND NOT EXISTS (
+        SELECT 1
+        FROM PostHistory PH_Deleted
+        WHERE PH_Deleted.UserId = UDS.UserId
+          AND PH_Deleted.PostHistoryTypeId = 12
+          AND PH_Deleted.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1' YEAR)
+    )
+ORDER BY
+    UserSegment DESC, PrimaryScore DESC, Reputation DESC
+LIMIT 200;

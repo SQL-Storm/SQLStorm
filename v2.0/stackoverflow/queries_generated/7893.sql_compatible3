@@ -1,0 +1,175 @@
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+    COUNT(DISTINCT b.Id) AS Badges,
+    COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVotes,
+    COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownVotes,
+    COALESCE(SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END), 0) AS Favorites,
+    AVG(COALESCE(p.Score, 0)) AS AvgPostScore,
+    MAX(p.CreationDate) AS LatestPostDate,
+    STRING_AGG(DISTINCT t.TagName, ', ' ORDER BY t.TagName) AS TagList,
+    (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = u.Id AND PostTypeId = 1 AND Score > 100) AS HighScoringQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = u.Id AND PostTypeId = 2 AND Score > 100) AS HighScoringAnswers,
+    (SELECT COUNT(*) FROM Comments WHERE UserId = u.Id) AS TotalComments,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.UserId = u.Id AND ph.PostHistoryTypeId IN (1,2,3,4,5,6)) AS EditCount,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.UserId = u.Id AND ph.PostHistoryTypeId IN (10,11,12,13)) AS ModActionCount,
+    CASE WHEN COUNT(DISTINCT p.Id) > 0 THEN COALESCE(SUM(p.Score), 0) / COUNT(DISTINCT p.Id) ELSE 0 END AS ScorePerPost,
+    ROW_NUMBER() OVER (ORDER BY SUM(COALESCE(p.Score, 0)) DESC) AS RankByScore,
+    NTILE(100) OVER (ORDER BY SUM(COALESCE(p.Score, 0)) DESC) AS Percentile,
+    LAG(u.Reputation, 1, 0) OVER (ORDER BY u.Reputation DESC) - u.Reputation AS ReputationDelta,
+    DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS PostRank,
+    CASE WHEN EXISTS (
+        SELECT 1 FROM Posts p2
+        WHERE p2.OwnerUserId = u.Id
+          AND p2.CreationDate > u.CreationDate
+          AND p2.Score > 0
+    ) THEN 'Active' ELSE 'Inactive' END AS UserStatus,
+    CONCAT(
+        'User #',
+        u.Id,
+        ' (',
+        COALESCE(u.DisplayName, 'Anonymous'),
+        ') with ',
+        COUNT(DISTINCT p.Id),
+        ' posts, ',
+        COUNT(DISTINCT b.Id),
+        ' badges, and ',
+        COALESCE(SUM(p.Score), 0),
+        ' total score'
+    ) AS UserProfileSummary
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN Votes v ON u.Id = v.UserId
+LEFT JOIN (
+    SELECT p2.Id AS PostId, tag AS TagName
+    FROM Posts p2,
+         LATERAL (
+            SELECT regexp_split_to_table(
+                CASE
+                    WHEN p2.Tags IS NULL THEN ''
+                    ELSE substring(p2.Tags FROM 2 FOR (char_length(p2.Tags) - 2))
+                END,
+                '><'
+            ) AS tag
+         ) s
+    WHERE p2.Tags IS NOT NULL AND p2.Tags != ''
+) t ON t.PostId = p.Id
+LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+WHERE 
+    u.CreationDate >= DATE '2010-01-01'
+    AND u.CreationDate <= DATE '2023-12-31'
+    AND (
+        p.Id IS NULL OR p.PostTypeId IN (1, 2)
+    )
+    AND (
+        p.CreationDate IS NULL OR (p.CreationDate >= DATE '2020-01-01' AND p.CreationDate <= DATE '2023-12-31')
+    )
+GROUP BY 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate
+HAVING 
+    COUNT(DISTINCT p.Id) > 0
+    AND COALESCE(SUM(p.Score), 0) >= 0
+    AND COUNT(DISTINCT b.Id) >= 0
+    AND COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) >= 0
+    AND COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) >= 0
+ORDER BY 
+    SUM(COALESCE(p.Score, 0)) DESC,
+    COUNT(DISTINCT p.Id) DESC,
+    u.Reputation DESC
+LIMIT 1000
+EXCEPT
+SELECT 
+    u2.Id AS UserId,
+    u2.DisplayName,
+    u2.Reputation,
+    COUNT(DISTINCT p2.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p2.PostTypeId = 1 THEN p2.Id END) AS Questions,
+    COUNT(DISTINCT CASE WHEN p2.PostTypeId = 2 THEN p2.Id END) AS Answers,
+    COUNT(DISTINCT b2.Id) AS Badges,
+    COALESCE(SUM(CASE WHEN v2.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVotes,
+    COALESCE(SUM(CASE WHEN v2.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownVotes,
+    COALESCE(SUM(CASE WHEN v2.VoteTypeId = 5 THEN 1 ELSE 0 END), 0) AS Favorites,
+    AVG(COALESCE(p2.Score, 0)) AS AvgPostScore,
+    MAX(p2.CreationDate) AS LatestPostDate,
+    STRING_AGG(DISTINCT t2.TagName, ', ' ORDER BY t2.TagName) AS TagList,
+    (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = u2.Id AND PostTypeId = 1 AND Score > 100) AS HighScoringQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = u2.Id AND PostTypeId = 2 AND Score > 100) AS HighScoringAnswers,
+    (SELECT COUNT(*) FROM Comments WHERE UserId = u2.Id) AS TotalComments,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.UserId = u2.Id AND ph.PostHistoryTypeId IN (1,2,3,4,5,6)) AS EditCount,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.UserId = u2.Id AND ph.PostHistoryTypeId IN (10,11,12,13)) AS ModActionCount,
+    CASE WHEN COUNT(DISTINCT p2.Id) > 0 THEN COALESCE(SUM(p2.Score), 0) / COUNT(DISTINCT p2.Id) ELSE 0 END AS ScorePerPost,
+    ROW_NUMBER() OVER (ORDER BY SUM(COALESCE(p2.Score, 0)) DESC) AS RankByScore,
+    NTILE(100) OVER (ORDER BY SUM(COALESCE(p2.Score, 0)) DESC) AS Percentile,
+    LAG(u2.Reputation, 1, 0) OVER (ORDER BY u2.Reputation DESC) - u2.Reputation AS ReputationDelta,
+    DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT p2.Id) DESC) AS PostRank,
+    CASE WHEN EXISTS (
+        SELECT 1 FROM Posts p3
+        WHERE p3.OwnerUserId = u2.Id
+          AND p3.CreationDate > u2.CreationDate
+          AND p3.Score > 0
+    ) THEN 'Active' ELSE 'Inactive' END AS UserStatus,
+    CONCAT(
+        'User #',
+        u2.Id,
+        ' (',
+        COALESCE(u2.DisplayName, 'Anonymous'),
+        ') with ',
+        COUNT(DISTINCT p2.Id),
+        ' posts, ',
+        COUNT(DISTINCT b2.Id),
+        ' badges, and ',
+        COALESCE(SUM(p2.Score), 0),
+        ' total score'
+    ) AS UserProfileSummary
+FROM Users u2
+LEFT JOIN Posts p2 ON u2.Id = p2.OwnerUserId
+LEFT JOIN Badges b2 ON u2.Id = b2.UserId
+LEFT JOIN Votes v2 ON u2.Id = v2.UserId
+LEFT JOIN (
+    SELECT p4.Id AS PostId, tag AS TagName
+    FROM Posts p4,
+         LATERAL (
+            SELECT regexp_split_to_table(
+                CASE
+                    WHEN p4.Tags IS NULL THEN ''
+                    ELSE substring(p4.Tags FROM 2 FOR (char_length(p4.Tags) - 2))
+                END,
+                '><'
+            ) AS tag
+         ) s2
+    WHERE p4.Tags IS NOT NULL AND p4.Tags != ''
+) t2 ON t2.PostId = p2.Id
+LEFT JOIN PostHistory ph2 ON u2.Id = ph2.UserId
+WHERE 
+    u2.CreationDate >= DATE '2010-01-01'
+    AND u2.CreationDate <= DATE '2023-12-31'
+    AND (
+        p2.Id IS NULL OR p2.PostTypeId IN (1, 2)
+    )
+    AND (
+        p2.CreationDate IS NULL OR (p2.CreationDate >= DATE '2020-01-01' AND p2.CreationDate <= DATE '2023-12-31')
+    )
+GROUP BY 
+    u2.Id,
+    u2.DisplayName,
+    u2.Reputation,
+    u2.CreationDate
+HAVING 
+    COUNT(DISTINCT p2.Id) > 0
+    AND COALESCE(SUM(p2.Score), 0) >= 0
+    AND COUNT(DISTINCT b2.Id) >= 0
+    AND COUNT(DISTINCT CASE WHEN p2.PostTypeId = 1 THEN p2.Id END) >= 0
+    AND COUNT(DISTINCT CASE WHEN p2.PostTypeId = 2 THEN p2.Id END) >= 0
+ORDER BY 
+    SUM(COALESCE(p2.Score, 0)) DESC,
+    COUNT(DISTINCT p2.Id) DESC,
+    u2.Reputation DESC
+LIMIT 1000;

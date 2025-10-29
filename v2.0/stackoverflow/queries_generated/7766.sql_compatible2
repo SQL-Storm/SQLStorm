@@ -1,0 +1,247 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        CAST((EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - u.CreationDate)) / 86400) AS INTEGER) AS AccountAgeDays,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Elite'
+            WHEN u.Reputation >= 1000 THEN 'Advanced'
+            WHEN u.Reputation >= 100 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END AS ReputationTier,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 100 THEN 'Highly Active'
+            WHEN COUNT(DISTINCT p.Id) > 50 THEN 'Active'
+            WHEN COUNT(DISTINCT p.Id) > 10 THEN 'Moderately Active'
+            ELSE 'Occasional'
+        END AS ActivityLevel,
+        COALESCE(SUM(p.Score), 0) AS TotalScore,
+        COALESCE(AVG(p.Score), 0) AS AvgPostScore,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2), ', ') AS PostTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate
+),
+PostComplexityAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        CHAR_LENGTH(p.Body) AS BodyLength,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND CHAR_LENGTH(p.Tags) > 2 THEN 
+                (CHAR_LENGTH(p.Tags) - 2 - CHAR_LENGTH(REPLACE(p.Tags, '><', ''))) / 2 + 1
+            ELSE 0 
+        END AS TagCount,
+        CASE 
+            WHEN p.PostTypeId = 2 AND p.ParentId IS NOT NULL THEN 
+                (SELECT COUNT(*) FROM Posts WHERE ParentId = p.ParentId)
+            ELSE 0 
+        END AS ParentAnswerCount,
+        CAST((EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate)) / 86400) AS INTEGER) AS AgeInDays,
+        CASE 
+            WHEN p.Score > 100 THEN 'Popular'
+            WHEN p.Score > 50 THEN 'Moderately Popular'
+            WHEN p.Score > 10 THEN 'Average'
+            ELSE 'Low'
+        END AS PopularityLevel,
+        CASE 
+            WHEN p.AnswerCount > 10 THEN 'Highly Answered'
+            WHEN p.AnswerCount > 5 THEN 'Well Answered'
+            WHEN p.AnswerCount > 0 THEN 'Answered'
+            ELSE 'Unanswered'
+        END AS AnswerStatus,
+        CASE 
+            WHEN CAST(p.Body AS TEXT) LIKE '%<code>%' OR 
+                 CAST(p.Body AS TEXT) LIKE '%`%' 
+            THEN 'Code Containing'
+            ELSE 'Text Only'
+        END AS ContentCategory
+    FROM Posts p
+    WHERE p.Id IS NOT NULL
+),
+UserPostActivityComparison AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.TotalPosts,
+        uas.QuestionCount,
+        uas.AnswerCount,
+        uas.CommentCount,
+        uas.BadgeCount,
+        uas.AvgPostScore,
+        uas.TotalScore,
+        CASE 
+            WHEN uas.AnswerCount > 0 THEN 
+                CAST(uas.AnswerCount AS DOUBLE PRECISION) / NULLIF(uas.QuestionCount, 0)
+            ELSE 0 
+        END AS AnswerToQuestionRatio,
+        CASE 
+            WHEN uas.QuestionCount > 0 THEN 
+                CAST(uas.TotalScore AS DOUBLE PRECISION) / NULLIF(uas.QuestionCount, 0)
+            ELSE 0 
+        END AS AvgScorePerQuestion,
+        MAX(pca.AgeInDays) AS MaxPostAge,
+        MIN(pca.AgeInDays) AS MinPostAge,
+        AVG(pca.BodyLength) AS AvgBodyLength,
+        AVG(pca.TagCount) AS AvgTagCount,
+        COUNT(DISTINCT CASE WHEN pca.PopularityLevel = 'Popular' THEN pca.PostId END) AS PopularPostCount,
+        COUNT(DISTINCT CASE WHEN pca.AnswerStatus = 'Highly Answered' THEN pca.PostId END) AS HighlyAnsweredCount,
+        COUNT(DISTINCT CASE WHEN pca.ContentCategory = 'Code Containing' THEN pca.PostId END) AS CodeContainingCount
+    FROM UserActivityStats uas
+    LEFT JOIN PostComplexityAnalysis pca ON uas.UserId = pca.OwnerUserId
+    GROUP BY uas.UserId, uas.DisplayName, uas.Reputation, uas.TotalPosts, 
+             uas.QuestionCount, uas.AnswerCount, uas.CommentCount, 
+             uas.BadgeCount, uas.AvgPostScore, uas.TotalScore
+),
+RankedUsers AS (
+    SELECT 
+        upac.*,
+        ROW_NUMBER() OVER (ORDER BY TotalScore DESC, Reputation DESC) AS RankByScore,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, TotalPosts DESC) AS RankByReputation,
+        DENSE_RANK() OVER (ORDER BY AvgPostScore DESC) AS RankByAvgScore,
+        RANK() OVER (ORDER BY TotalPosts DESC) AS RankByActivity,
+        PERCENT_RANK() OVER (ORDER BY TotalScore) AS ScorePercentile,
+        NTILE(10) OVER (ORDER BY TotalScore DESC) AS ScoreQuintile
+    FROM UserPostActivityComparison upac
+),
+TopPerformers AS (
+    SELECT 
+        'Top Performers Analysis' AS ReportTitle,
+        ru.RankByScore,
+        ru.UserId,
+        ru.DisplayName,
+        ru.Reputation,
+        ru.TotalPosts,
+        ru.QuestionCount,
+        ru.AnswerCount,
+        ru.CommentCount,
+        ru.BadgeCount,
+        ru.TotalScore,
+        ru.AvgPostScore,
+        ru.AnswerToQuestionRatio,
+        ru.AvgScorePerQuestion,
+        ru.MaxPostAge,
+        ru.MinPostAge,
+        ru.AvgBodyLength,
+        ru.AvgTagCount,
+        ru.PopularPostCount,
+        ru.HighlyAnsweredCount,
+        ru.CodeContainingCount,
+        ru.ReputationTier,
+        ru.ActivityLevel,
+        CASE 
+            WHEN ru.ScorePercentile >= 0.9 THEN 'Exceptional'
+            WHEN ru.ScorePercentile >= 0.75 THEN 'Excellent'
+            WHEN ru.ScorePercentile >= 0.5 THEN 'Good'
+            WHEN ru.ScorePercentile >= 0.25 THEN 'Average'
+            ELSE 'Below Average'
+        END AS PerformanceCategory,
+        CASE 
+            WHEN ru.ScoreQuintile <= 2 THEN 'Top Quintile'
+            WHEN ru.ScoreQuintile <= 4 THEN 'Second Quintile'
+            WHEN ru.ScoreQuintile <= 6 THEN 'Third Quintile'
+            WHEN ru.ScoreQuintile <= 8 THEN 'Fourth Quintile'
+            ELSE 'Bottom Quintile'
+        END AS ScoreQuintileGroup,
+        COALESCE(
+            (CASE WHEN ru.QuestionCount > 0 THEN 
+                (SELECT COUNT(*) FROM Posts WHERE ParentId IS NULL AND OwnerUserId = ru.UserId)
+            END), 0) AS OriginalQuestions,
+        COALESCE(
+            (CASE WHEN ru.AnswerCount > 0 THEN 
+                (SELECT COUNT(*) FROM Posts WHERE ParentId IS NOT NULL AND OwnerUserId = ru.UserId AND Score > 0)
+            END), 0) AS ValuableAnswers,
+        (SELECT COUNT(*) FROM Votes v 
+         INNER JOIN Posts p ON v.PostId = p.Id 
+         WHERE p.OwnerUserId = ru.UserId AND v.VoteTypeId IN (2,3)
+        ) AS TotalVotesReceived,
+        (SELECT COUNT(*) FROM Votes v 
+         INNER JOIN Posts p ON v.PostId = p.Id 
+         WHERE p.OwnerUserId = ru.UserId AND v.VoteTypeId = 1
+        ) AS AcceptedAnswers,
+        CAST((EXTRACT(EPOCH FROM (
+            TIMESTAMP '2024-10-01 12:34:56' - 
+            COALESCE(
+                (SELECT MAX(CreationDate) FROM Posts WHERE OwnerUserId = ru.UserId),
+                (SELECT MAX(CreationDate) FROM Comments WHERE UserId = ru.UserId)
+            )
+        )) / 86400) AS INTEGER) AS DaysSinceLastActivity,
+        CASE 
+            WHEN ru.TotalPosts > 0 AND CAST((EXTRACT(EPOCH FROM (
+                TIMESTAMP '2024-10-01 12:34:56' - 
+                COALESCE((SELECT MAX(CreationDate) FROM Posts WHERE OwnerUserId = ru.UserId), 
+                         (SELECT MAX(CreationDate) FROM Comments WHERE UserId = ru.UserId))
+            )) / 86400) AS INTEGER) > 30 THEN 'Inactive'
+            WHEN ru.TotalPosts > 0 THEN 'Active'
+            ELSE 'New User'
+        END AS ActivityStatus
+    FROM RankedUsers ru
+    WHERE ru.TotalPosts >= 10
+),
+StatSummary AS (
+    SELECT 
+        'Statistical Summary' AS ReportTitle,
+        NULL AS RankByScore,
+        COUNT(*) AS UserId,
+        'STATISTICS' AS DisplayName,
+        SUM(Reputation) AS Reputation,
+        SUM(TotalPosts) AS TotalPosts,
+        SUM(QuestionCount) AS QuestionCount,
+        SUM(AnswerCount) AS AnswerCount,
+        SUM(CommentCount) AS CommentCount,
+        SUM(BadgeCount) AS BadgeCount,
+        SUM(TotalScore) AS TotalScore,
+        AVG(AvgPostScore) AS AvgPostScore,
+        AVG(AnswerToQuestionRatio) AS AvgAnswerToQuestionRatio,
+        AVG(AvgScorePerQuestion) AS AvgScorePerQuestion,
+        AVG(MaxPostAge) AS AvgMaxPostAge,
+        AVG(MinPostAge) AS AvgMinPostAge,
+        AVG(AvgBodyLength) AS AvgAvgBodyLength,
+        AVG(AvgTagCount) AS AvgAvgTagCount,
+        AVG(PopularPostCount) AS AvgPopularPostCount,
+        AVG(HighlyAnsweredCount) AS AvgHighlyAnsweredCount,
+        AVG(CodeContainingCount) AS AvgCodeContainingCount,
+        'Summary' AS ReputationTier,
+        'Summary' AS ActivityLevel,
+        'Summary' AS PerformanceCategory,
+        'Summary' AS ScoreQuintileGroup,
+        SUM(OriginalQuestions) AS OriginalQuestions,
+        SUM(ValuableAnswers) AS ValuableAnswers,
+        SUM(TotalVotesReceived) AS TotalVotesReceived,
+        SUM(AcceptedAnswers) AS AcceptedAnswers,
+        AVG(DaysSinceLastActivity) AS AvgDaysSinceLastActivity,
+        'Summary' AS ActivityStatus
+    FROM RankedUsers
+    WHERE TotalPosts >= 10
+)
+SELECT * FROM TopPerformers
+ORDER BY RankByScore, Reputation DESC, TotalScore DESC
+OFFSET 0 ROWS FETCH NEXT 500 ROWS ONLY
+
+UNION ALL
+
+SELECT * FROM StatSummary
+ORDER BY 1;

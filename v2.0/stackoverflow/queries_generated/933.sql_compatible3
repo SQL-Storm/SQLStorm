@@ -1,0 +1,308 @@
+with recent_users as (
+  select
+    u.id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    date_trunc('month', u.creationdate) as signup_month,
+    coalesce(nullif(trim(split_part(coalesce(u.location, ''), ',', 1)), ''), 'Unknown') as region_hint
+  from users u
+  where u.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+),
+questions as (
+  select
+    p.id as question_id,
+    p.owneruserid as asker_id,
+    p.creationdate as q_created,
+    p.score as q_score,
+    p.viewcount as q_views,
+    p.answercount,
+    p.title,
+    p.tags,
+    case when p.closeddate is not null then 1 else 0 end as is_closed
+  from posts p
+  where p.posttypeid = 1
+),
+answers as (
+  select
+    a.id as answer_id,
+    a.parentid as question_id,
+    a.owneruserid as answerer_id,
+    a.creationdate as a_created,
+    a.score as a_score
+  from posts a
+  where a.posttypeid = 2
+),
+votes_agg as (
+  select
+    v.postid,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+    sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_total
+  from votes v
+  where v.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+  group by v.postid
+),
+commenters as (
+  select
+    c.postid,
+    count(*) as comment_count,
+    count(distinct c.userid) filter (where c.userid is not null) as distinct_commenters,
+    max(c.creationdate) as last_comment_at
+  from comments c
+  group by c.postid
+),
+dup_links as (
+  select
+    pl.postid as dup_post_id,
+    pl.relatedpostid as canonical_post_id,
+    min(pl.creationdate) as first_link_date
+  from postlinks pl
+  where pl.linktypeid = 3
+  group by pl.postid, pl.relatedpostid
+),
+tag_split as (
+  select
+    q.question_id,
+    unnest(string_to_array(substring(q.tags, 2, greatest(length(q.tags)-2,0)), '><')) as tagname
+  from questions q
+  where q.tags is not null
+),
+top_tags as (
+  select ts.tagname, count(*) as tag_uses
+  from tag_split ts
+  group by ts.tagname
+  having count(*) >= 50
+),
+q_activity as (
+  select
+    q.question_id,
+    q.asker_id,
+    q.q_created,
+    q.q_score,
+    q.q_views,
+    q.answercount,
+    q.is_closed,
+    coalesce(vq.upvotes,0) as q_up,
+    coalesce(vq.downvotes,0) as q_down,
+    coalesce(vq.favorites,0) as q_fav,
+    coalesce(vq.bounty_total,0) as q_bounty,
+    coalesce(cm.comment_count,0) as q_comments,
+    cm.last_comment_at,
+    dl.canonical_post_id,
+    dl.first_link_date
+  from questions q
+  left join votes_agg vq on vq.postid = q.question_id
+  left join commenters cm on cm.postid = q.question_id
+  left join dup_links dl on dl.dup_post_id = q.question_id
+),
+first_answer as (
+  select
+    a.question_id,
+    a.answer_id,
+    a.answerer_id,
+    a.a_created,
+    a.a_score
+  from (
+    select
+      a.*,
+      row_number() over (partition by a.question_id order by a.a_created asc, a.a_score desc) as rn
+    from answers a
+  ) a
+  where a.rn = 1
+),
+answer_stats as (
+  select
+    a.question_id,
+    count(*) as total_answers,
+    avg(a.a_score) as avg_answer_score,
+    max(a.a_score) as max_answer_score
+  from answers a
+  group by a.question_id
+),
+user_badge_rollup as (
+  select
+    b.userid,
+    sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+    sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+    sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+    count(*) as total_badges,
+    min(b.date) as first_badge_at,
+    max(b.date) as last_badge_at
+  from badges b
+  where b.date >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+  group by b.userid
+),
+edits as (
+  select
+    ph.postid,
+    count(*) filter (where ph.posthistorytypeid in (4,5,6)) as edits_count,
+    min(ph.creationdate) filter (where ph.posthistorytypeid in (4,5,6)) as first_edit_at,
+    max(ph.creationdate) filter (where ph.posthistorytypeid in (4,5,6)) as last_edit_at,
+    count(*) filter (where ph.posthistorytypeid = 10) as close_votes_events,
+    count(*) filter (where ph.posthistorytypeid = 11) as reopen_events
+  from posthistory ph
+  group by ph.postid
+),
+user_activity as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    ru.signup_month,
+    ru.region_hint,
+    coalesce(ub.total_badges,0) as total_badges,
+    coalesce(ub.gold_badges,0) as gold_badges,
+    coalesce(ub.silver_badges,0) as silver_badges,
+    coalesce(ub.bronze_badges,0) as bronze_badges,
+    ub.first_badge_at,
+    ub.last_badge_at,
+    count(distinct q.id) as questions_asked,
+    count(distinct a.id) as answers_posted,
+    sum(coalesce(vq.upvotes,0) - coalesce(vq.downvotes,0)) as net_q_votes,
+    sum(coalesce(va.upvotes,0) - coalesce(va.downvotes,0)) as net_a_votes
+  from recent_users ru
+  join users u on u.id = ru.id
+  left join user_badge_rollup ub on ub.userid = u.id
+  left join posts q on q.posttypeid = 1 and q.owneruserid = u.id
+  left join posts a on a.posttypeid = 2 and a.owneruserid = u.id
+  left join votes_agg va on va.postid = a.id
+  left join votes_agg vq on vq.postid = q.id
+  group by u.id, u.displayname, u.reputation, ru.signup_month, ru.region_hint, ub.total_badges, ub.gold_badges, ub.silver_badges, ub.bronze_badges, ub.first_badge_at, ub.last_badge_at
+),
+q_enriched as (
+  select
+    qa.question_id,
+    qa.asker_id,
+    qa.q_created,
+    qa.q_score,
+    qa.q_views,
+    qa.answercount,
+    qa.is_closed,
+    qa.q_up, qa.q_down, qa.q_fav, qa.q_bounty,
+    qa.q_comments, qa.last_comment_at,
+    qa.canonical_post_id,
+    qa.first_link_date,
+    fa.answer_id as first_answer_id,
+    fa.answerer_id as first_answerer_id,
+    fa.a_created as first_answer_created,
+    fa.a_score as first_answer_score,
+    ast.total_answers,
+    ast.avg_answer_score,
+    ast.max_answer_score,
+    ed.edits_count,
+    ed.first_edit_at,
+    ed.last_edit_at,
+    ed.close_votes_events,
+    ed.reopen_events,
+    q.title,
+    q.tags
+  from q_activity qa
+  left join first_answer fa on fa.question_id = qa.question_id
+  left join answer_stats ast on ast.question_id = qa.question_id
+  left join edits ed on ed.postid = qa.question_id
+  left join questions q on q.question_id = qa.question_id
+),
+ranking as (
+  select
+    qe.*,
+    ua.displayname as asker_name,
+    ua.reputation as asker_rep,
+    ua.region_hint as asker_region,
+    row_number() over (partition by date_trunc('month', qe.q_created) order by coalesce(qe.q_up,0) - coalesce(qe.q_down,0) desc, coalesce(qe.q_views,0) desc, qe.q_created asc) as monthly_rank,
+    rank() over (order by (coalesce(qe.q_up,0) + coalesce(qe.q_fav,0) + coalesce(qe.q_bounty,0)/100.0 + greatest(qe.q_score,0)) desc) as global_rank,
+    sum(coalesce(qe.q_views,0)) over (order by qe.q_created rows between unbounded preceding and current row) as running_views,
+    avg(coalesce(qe.q_up,0) - coalesce(qe.q_down,0)) over (partition by ua.region_hint) as region_avg_net_votes
+  from q_enriched qe
+  left join user_activity ua on ua.user_id = qe.asker_id
+),
+filtered as (
+  select
+    r.*,
+    case
+      when r.is_closed = 1 and r.canonical_post_id is not null then 'Closed as Dup'
+      when r.is_closed = 1 then 'Closed'
+      when r.canonical_post_id is not null then 'Marked Dup'
+      else 'Open'
+    end as status_label,
+    case
+      when r.first_answer_created is null then null
+      else extract(epoch from (r.first_answer_created - r.q_created)) / 60.0
+    end as minutes_to_first_answer,
+    case
+      when r.q_fav is null or r.q_fav = 0 then null
+      else round( (coalesce(r.q_up,0) / nullif(r.q_fav,0)) , 3)
+    end as upvote_to_fav_ratio,
+    coalesce(r.q_up,0) - coalesce(r.q_down,0) as net_votes,
+    case
+      when r.tags is null then 0
+      when position('python' in lower(r.tags)) > 0 then 1
+      else 0
+    end as has_python_tag,
+    r.title,
+    r.tags
+  from ranking r
+)
+select
+  f.question_id,
+  coalesce(f.asker_name, '(unknown)') as asker_name,
+  f.asker_rep,
+  f.asker_region,
+  f.q_created,
+  f.q_score,
+  f.q_views,
+  f.answercount,
+  f.total_answers,
+  f.first_answer_id,
+  f.first_answerer_id,
+  f.first_answer_created,
+  f.first_answer_score,
+  f.minutes_to_first_answer,
+  f.edits_count,
+  f.close_votes_events,
+  f.reopen_events,
+  f.q_up,
+  f.q_down,
+  f.q_fav,
+  f.q_bounty,
+  f.net_votes,
+  f.upvote_to_fav_ratio,
+  f.status_label,
+  f.canonical_post_id,
+  f.monthly_rank,
+  f.global_rank,
+  f.running_views,
+  f.region_avg_net_votes,
+  (select count(*) from tag_split t where t.question_id = f.question_id) as tag_count,
+  (select string_agg(tt.tagname, ',' order by tt.tagname)
+     from tag_split tt
+     join top_tags tg on tg.tagname = tt.tagname
+     where tt.question_id = f.question_id) as popular_tags,
+  (select count(*) from comments c where c.postid = f.question_id and c.score > 0) as positive_comment_count,
+  (case when f.has_python_tag = 1 then 'yes' else 'no' end) as is_python_related,
+  coalesce(length(nullif(trim(f.title), '')), 0) as title_len,
+  coalesce(length(nullif(trim(regexp_replace(coalesce(f.tags,''), '[<>]', '', 'g')), '')), 0) as tags_len
+from filtered f
+where
+  f.q_created >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+  and coalesce(f.net_votes, 0) >= -5
+  and (
+    f.minutes_to_first_answer is null
+    or f.minutes_to_first_answer between 0 and 7*24*60
+  )
+  and (
+    f.popular_tags is not null
+    or f.q_views > 100
+  )
+  and not exists (
+    select 1
+    from posthistory ph
+    where ph.postid = f.question_id
+      and ph.posthistorytypeid = 14
+  )
+order by
+  f.global_rank asc nulls last,
+  f.monthly_rank asc,
+  f.q_views desc
+limit 500;

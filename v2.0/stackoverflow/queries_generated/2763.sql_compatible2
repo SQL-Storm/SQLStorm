@@ -1,0 +1,168 @@
+with UserBadgeCounts as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        coalesce(sum(case when b.Date >= cast(cast('2024-10-01' as date) - interval '1 year' as date) then 1 else 0 end), 0) as RecentBadgesCount
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+UserPostStats as (
+    select
+        u.Id as UserId,
+        count(p.Id) filter (where p.PostTypeId = 1) as QuestionsCount,
+        count(p.Id) filter (where p.PostTypeId = 2) as AnswersCount,
+        avg(p.Score) filter (where p.PostTypeId in (1, 2)) as AvgPostScore,
+        max(p.CreationDate) filter (where p.PostTypeId in (1, 2)) as LastPostDate,
+        sum(p.ViewCount) filter (where p.PostTypeId = 1) as TotalQuestionViews
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id
+),
+RankedPosts as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Tags,
+        p.Title,
+        row_number() over (
+            partition by p.OwnerUserId, p.PostTypeId
+            order by p.Score desc, p.ViewCount desc, p.CreationDate desc
+        ) as rn
+    from Posts p
+    where p.PostTypeId in (1, 2)
+),
+TopUserPosts as (
+    select
+        rp.OwnerUserId as UserId,
+        rp.PostTypeId,
+        rp.Id as PostId,
+        rp.Title,
+        rp.Score,
+        rp.ViewCount,
+        rp.CreationDate,
+        rp.Tags
+    from RankedPosts rp
+    where rp.rn <= 3
+),
+QuestionDuplicates as (
+    select
+        pl.PostId as DuplicateQuestionId,
+        pl.RelatedPostId as OriginalQuestionId,
+        dup.OwnerUserId as DuplicateOwner,
+        orig.OwnerUserId as OriginalOwner,
+        orig.Title as OriginalTitle,
+        dup.Title as DuplicateTitle,
+        pt.Name as LinkTypeName
+    from PostLinks pl
+    join Posts dup on dup.Id = pl.PostId and dup.PostTypeId = 1
+    join Posts orig on orig.Id = pl.RelatedPostId and orig.PostTypeId = 1
+    join LinkTypes pt on pt.Id = pl.LinkTypeId
+    where pl.LinkTypeId = 3
+),
+UserCommentActivity as (
+    select
+        c.UserId,
+        u.DisplayName,
+        count(c.Id) as CommentCount,
+        max(c.CreationDate) as LastCommentDate,
+        -- string_agg with DISTINCT and ORDER BY requires ordering expression to be in aggregate arguments in some dialects.
+        -- Use array_agg of distinct rows ordered by CreationDate descending then convert to string if supported.
+        -- Here build SampleComments by aggregating distinct pairs and then concatenating; for portability, aggregate distinct text with max creation date per text first.
+        string_agg(subs.Text, ', ') as SampleComments
+    from (
+        select distinct on (c.UserId, substr(c.Text,1,20)) c.UserId as uid, substr(c.Text,1,20) as Text, c.CreationDate
+        from Comments c
+        order by c.UserId, substr(c.Text,1,20), c.CreationDate desc
+    ) subs
+    join Users u on u.Id = subs.uid
+    group by subs.uid, u.DisplayName
+),
+UserActivitySummary as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ub.RecentBadgesCount,
+        ups.QuestionsCount,
+        ups.AnswersCount,
+        ups.AvgPostScore,
+        ups.LastPostDate,
+        ups.TotalQuestionViews,
+        uca.CommentCount,
+        uca.LastCommentDate
+    from Users u
+    left join UserBadgeCounts ub on ub.UserId = u.Id
+    left join UserPostStats ups on ups.UserId = u.Id
+    left join UserCommentActivity uca on uca.UserId = u.Id
+),
+RankedUsers as (
+    select
+        uas.*,
+        row_number() over (order by Reputation desc, QuestionsCount desc NULLS LAST, AnswersCount desc NULLS LAST) as UserRank
+    from UserActivitySummary uas
+)
+select 
+    ru.UserId,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.GoldBadges,
+    ru.SilverBadges,
+    ru.BronzeBadges,
+    ru.QuestionsCount,
+    ru.AnswersCount,
+    coalesce(ru.AvgPostScore, 0) as AvgPostScore,
+    ru.LastAccessDate,
+    ru.LastPostDate,
+    ru.LastCommentDate,
+    ru.TotalQuestionViews,
+    ru.CommentCount,
+    concat_ws(' | ',
+        concat('Gold:', ru.GoldBadges),
+        concat('Silver:', ru.SilverBadges),
+        concat('Bronze:', ru.BronzeBadges),
+        concat('Q:', ru.QuestionsCount),
+        concat('A:', ru.AnswersCount),
+        concat('C:', ru.CommentCount),
+        concat('Rep:', ru.Reputation)
+    ) as BadgeAndActivitySummary,
+    'Top Questions' as SamplePostType,
+    array_agg(distinct topq.Title order by topq.Score desc, topq.ViewCount desc) filter (where topq.PostTypeId = 1) as TopQuestionTitles,
+    'Top Answers' as SampleAnswerType,
+    array_agg(distinct topa.Title order by topa.Score desc, topa.ViewCount desc) filter (where topa.PostTypeId = 2) as TopAnswerTitles,
+    case when qd.DuplicateQuestionId is not null then 'Yes' else 'No' end as HasDuplicateQuestions,
+    count(qd.DuplicateQuestionId) filter (where qd.DuplicateQuestionId is not null) as DuplicateCount
+from RankedUsers ru
+left join TopUserPosts topq on topq.UserId = ru.UserId and topq.PostTypeId = 1
+left join TopUserPosts topa on topa.UserId = ru.UserId and topa.PostTypeId = 2
+left join QuestionDuplicates qd on qd.DuplicateOwner = ru.UserId
+where ru.Reputation > 10000
+group by 
+    ru.UserId,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.GoldBadges,
+    ru.SilverBadges,
+    ru.BronzeBadges,
+    ru.QuestionsCount,
+    ru.AnswersCount,
+    ru.AvgPostScore,
+    ru.LastAccessDate,
+    ru.LastPostDate,
+    ru.LastCommentDate,
+    ru.TotalQuestionViews,
+    ru.CommentCount
+order by ru.Reputation desc, DuplicateCount desc NULLS LAST
+limit 50;

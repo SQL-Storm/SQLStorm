@@ -1,0 +1,137 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        COALESCE(CASE WHEN t.IsModeratorOnly THEN 1 ELSE 0 END, 0) AS IsModeratorOnly,
+        COALESCE(CASE WHEN t.IsRequired THEN 1 ELSE 0 END, 0) AS IsRequired,
+        0 AS Level,
+        ARRAY[t.TagName] AS TagPath
+    FROM Tags t
+    WHERE COALESCE(CASE WHEN t.IsRequired THEN 1 ELSE 0 END, 0) = 1
+
+    UNION ALL
+
+    SELECT 
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        COALESCE(CASE WHEN t2.IsModeratorOnly THEN 1 ELSE 0 END, 0),
+        COALESCE(CASE WHEN t2.IsRequired THEN 1 ELSE 0 END, 0),
+        r.Level + 1,
+        r.TagPath || t2.TagName
+    FROM Tags t2
+    JOIN Posts p ON p.Tags LIKE '%' || '<' || t2.TagName || '>' || '%'
+    JOIN RecursiveTagHierarchy r ON r.TagName = ANY(string_to_array(p.Tags, '><'))
+    WHERE COALESCE(CASE WHEN t2.IsRequired THEN 1 ELSE 0 END, 0) = 0
+),
+UserPostStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsAsked,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersGiven,
+        COALESCE(SUM(v.VoteScore), 0) AS TotalVoteScore,
+        AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL) AS AvgPostScore,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS RankByPosts
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN LATERAL (
+        SELECT 
+            v2.PostId,
+            SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 WHEN vt.Name = 'DownMod' THEN -1 ELSE 0 END) AS VoteScore
+        FROM Votes v2
+        JOIN VoteTypes vt ON vt.Id = v2.VoteTypeId
+        WHERE v2.PostId = p.Id
+        GROUP BY v2.PostId
+    ) v ON v.PostId = p.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+AnswerTopComments AS (
+    SELECT 
+        c.PostId,
+        c.Id AS CommentId,
+        c.Text,
+        c.Score,
+        c.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY c.PostId ORDER BY c.Score DESC NULLS LAST, c.CreationDate DESC) AS rn
+    FROM Comments c
+    JOIN Posts p ON p.Id = c.PostId 
+    WHERE p.PostTypeId = 2
+),
+QuestionsWithDuplicateCounts AS (
+    SELECT 
+        q.Id,
+        q.Title,
+        q.CreationDate,
+        COUNT(pl.Id) FILTER (WHERE lt.Name = 'Duplicate') AS DuplicateCount,
+        COUNT(pl.Id) FILTER (WHERE lt.Name <> 'Duplicate') AS OtherLinkCount
+    FROM Posts q
+    LEFT JOIN PostLinks pl ON pl.PostId = q.Id
+    LEFT JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.Title, q.CreationDate
+),
+UserLatestActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        MAX(p.LastActivityDate) AS LastPostActivity,
+        MAX(c.CreationDate) AS LastCommentActivity,
+        GREATEST(
+          COALESCE(MAX(p.LastActivityDate), TIMESTAMP '1970-01-01'),
+          COALESCE(MAX(c.CreationDate), TIMESTAMP '1970-01-01')
+        ) AS LastActivity
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    GROUP BY u.Id
+)
+SELECT 
+    ups.UserId,
+    ups.DisplayName,
+    ups.QuestionsAsked,
+    ups.AnswersGiven,
+    ups.TotalVoteScore,
+    ups.AvgPostScore,
+    ups.GoldBadges,
+    ups.SilverBadges,
+    ups.BronzeBadges,
+    COALESCE(ula.LastActivity, TIMESTAMP '1970-01-01') AS LastActivity,
+    qwd.DuplicateCount,
+    qwd.OtherLinkCount,
+    att.Level AS TagLevel,
+    string_agg(DISTINCT att.TagName, ', ') OVER (PARTITION BY ups.UserId ORDER BY att.Level ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS RelatedTags,
+    atc.CommentId AS TopAnswerCommentId,
+    atc.Text AS TopAnswerCommentText,
+    CASE 
+        WHEN ups.TotalVoteScore > 100 AND ups.GoldBadges > 0 THEN 'Veteran'
+        WHEN ups.TotalVoteScore BETWEEN 10 AND 100 THEN 'Contributor'
+        ELSE 'Newbie'
+    END AS UserCategory,
+    ups.RankByPosts,
+    LEFT(ups.DisplayName || ' [' || COALESCE(ups.GoldBadges,0) || 'G,' || COALESCE(ups.SilverBadges,0) || 'S,' || COALESCE(ups.BronzeBadges,0) || 'B]', 50) AS DisplayNameSummary
+FROM UserPostStats ups
+LEFT JOIN UserLatestActivity ula ON ula.UserId = ups.UserId
+LEFT JOIN QuestionsWithDuplicateCounts qwd ON qwd.Id = (
+    SELECT p.Id FROM Posts p WHERE p.OwnerUserId = ups.UserId AND p.PostTypeId = 1 ORDER BY p.CreationDate DESC LIMIT 1
+)
+LEFT JOIN RecursiveTagHierarchy att ON att.TagName = ANY(
+    string_to_array(
+      (CASE WHEN qwd.DuplicateCount IS NOT NULL THEN 'true' ELSE 'false' END) || ',' || (CASE WHEN qwd.OtherLinkCount IS NOT NULL THEN 'true' ELSE 'false' END),
+      ','
+    )
+)
+LEFT JOIN AnswerTopComments atc ON atc.PostId = (
+    SELECT a.Id 
+    FROM Posts a 
+    WHERE a.OwnerUserId = ups.UserId AND a.PostTypeId = 2 
+    ORDER BY a.Score DESC NULLS LAST, a.CreationDate DESC
+    LIMIT 1
+)
+WHERE ups.QuestionsAsked > 0
+ORDER BY ups.TotalVoteScore DESC NULLS LAST, ups.QuestionsAsked DESC
+LIMIT 100;

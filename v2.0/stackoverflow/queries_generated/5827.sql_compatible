@@ -1,0 +1,169 @@
+WITH top_users AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.ProfileImageUrl,
+    u.Location,
+    u.AboutMe,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.EmailHash,
+    u.AccountId,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.CreationDate ASC) AS rn
+  FROM Users u
+),
+dead_users AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.LastAccessDate
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  WHERE u.LastAccessDate < CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+    AND u.Reputation < 100
+),
+popular_tags AS (
+  SELECT
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId,
+    t.WikiPostId,
+    ROW_NUMBER() OVER (ORDER BY t.Count DESC, t.TagName) AS rn
+  FROM Tags t
+  WHERE t.IsModeratorOnly = 0
+    AND t.IsRequired = 0
+),
+recent_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.ViewCount,
+    p.Score,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.Tags,
+    p.CommentCount,
+    p.AnswerCount
+  FROM Posts p
+  WHERE p.PostTypeId = 1 -- Questions
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days'
+),
+question_history AS (
+  SELECT
+    ph.Id,
+    ph.PostId,
+    ph.PostHistoryTypeId,
+    ph.CreationDate,
+    ph.RevisionGUID,
+    ph.UserId,
+    ph.Text,
+    ph.Comment
+  FROM PostHistory ph
+  JOIN (SELECT DISTINCT Id FROM PostHistory) ph2 ON ph.Id = ph2.Id
+  WHERE ph.PostHistoryTypeId IN (1,2,4,5,6,10,11,16,22,24,33,34)
+),
+complex_join AS (
+  SELECT
+    rq.PostId,
+    rq.Title,
+    rq.ViewCount,
+    rq.Score,
+    rq.CreationDate AS QuestionCreated,
+    rq.OwnerUserId,
+    rq.Tags,
+    rq.CommentCount,
+    rq.AnswerCount,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation,
+    COALESCE(a.TotalAccepted, 0) AS AcceptedAnswers,
+    COALESCE(v.UpVotes, 0) AS UpVotes,
+    COALESCE(vn.TotalDown, 0) AS DownVotes,
+    b.Name AS BadgeName,
+    bt.TagName
+  FROM recent_questions rq
+  LEFT JOIN Users u ON rq.OwnerUserId = u.Id
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS TotalAccepted
+    FROM Votes v
+    WHERE v.VoteTypeId = 1
+    GROUP BY PostId
+  ) a ON rq.PostId = a.PostId
+  LEFT JOIN (
+    SELECT PostId, SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes
+    FROM Votes
+    GROUP BY PostId
+  ) v ON rq.PostId = v.PostId
+  LEFT JOIN (
+    SELECT PostId, SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDown
+    FROM Votes
+    GROUP BY PostId
+  ) vn ON rq.PostId = vn.PostId
+  LEFT JOIN Badges b ON b.UserId = rq.OwnerUserId
+  LEFT JOIN (
+    SELECT t.ExcerptPostId AS PostId, t.TagName
+    FROM Tags t
+  ) bt ON rq.PostId = bt.PostId
+  WHERE rq.OwnerUserId IS NOT NULL
+),
+final_project AS (
+  SELECT
+    cq.PostId,
+    cq.Title,
+    cq.ViewCount,
+    cq.Score,
+    cq.QuestionCreated,
+    cq.OwnerUserId,
+    cq.OwnerDisplayName,
+    cq.Reputation,
+    cq.Tags,
+    cq.CommentCount,
+    cq.AnswerCount,
+    cq.AcceptedAnswers,
+    cq.UpVotes,
+    cq.DownVotes,
+    cq.BadgeName,
+    cq.TagName
+  FROM complex_join cq
+  ORDER BY cq.QuestionCreated DESC
+  LIMIT 100
+)
+SELECT
+  fp.PostId,
+  fp.Title,
+  fp.OwnerDisplayName,
+  fp.Reputation,
+  fp.ViewCount,
+  fp.Score,
+  fp.Tags,
+  fp.CommentCount,
+  fp.AnswerCount,
+  fp.AcceptedAnswers,
+  fp.UpVotes,
+  fp.DownVotes,
+  fp.BadgeName,
+  fp.TagName,
+  fp.QuestionCreated
+FROM final_project fp
+LEFT JOIN top_users tu ON fp.OwnerUserId = tu.UserId
+WHERE tu.rn <= 100
+GROUP BY
+  fp.PostId,
+  fp.Title,
+  fp.OwnerDisplayName,
+  fp.Reputation,
+  fp.ViewCount,
+  fp.Score,
+  fp.Tags,
+  fp.CommentCount,
+  fp.AnswerCount,
+  fp.AcceptedAnswers,
+  fp.UpVotes,
+  fp.DownVotes,
+  fp.BadgeName,
+  fp.TagName,
+  fp.QuestionCreated
+ORDER BY fp.QuestionCreated DESC, fp.Score DESC;

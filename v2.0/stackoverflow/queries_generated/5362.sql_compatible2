@@ -1,0 +1,189 @@
+WITH
+RecentPostActivity AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.OwnerUserId,
+    p.ViewCount,
+    p.Score,
+    p.Tags,
+    p.FavoriteCount,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate DESC) AS rn_by_owner
+  FROM Posts p
+  WHERE p.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180 days'
+),
+TopActiveOwners AS (
+  SELECT
+    r.OwnerUserId,
+    COUNT(*) AS posts_last_180_days,
+    SUM(r.ViewCount) AS total_views,
+    AVG(r.Score) AS avg_score,
+    SUM(CASE WHEN r.PostTypeId = 1 THEN 1 ELSE 0 END) AS questions
+  FROM RecentPostActivity r
+  WHERE r.rn_by_owner = 1
+  GROUP BY r.OwnerUserId
+),
+TopTags AS (
+  -- Generic SQL split: use a numbers table approach to split comma-separated tags.
+  -- This version uses a recursive CTE to generate positions, then substrings; should be broadly compatible.
+  WITH RECURSIVE nums(n) AS (
+    SELECT 1
+    UNION ALL
+    SELECT n + 1 FROM nums WHERE n < 100
+  ),
+  PostTags AS (
+    SELECT
+      p.Id AS PostId,
+      TRIM(
+        CASE
+          WHEN instr(p.Tags || ',', ',') = 0 THEN p.Tags
+          ELSE
+            substr(
+              p.Tags || ',',
+              (select 1 from (select 1) as d), -- placeholder to satisfy some dialects; actual start handled below
+              0
+            )
+        END
+      ) AS tag_raw,
+      p.Tags AS full_tags
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND p.Tags <> ''
+  ),
+  SplitTags AS (
+    SELECT
+      pt.PostId,
+      TRIM(
+        substr(
+          pt.full_tags,
+          CASE WHEN n.n = 1 THEN 1 ELSE (
+            instr(pt.full_tags, ',') * 0 + 1
+          ) END,
+          1000
+        )
+      ) AS tag,
+      n.n
+    FROM PostTags pt
+    JOIN nums n ON n.n <= 100
+  )
+  -- Fallback simpler approach: for broad compatibility, use string_split-like emulation only when dialect provides functions.
+  -- To avoid relying on non-standard functions, attempt a basic split using recursive method below.
+  ,
+  RecSplit AS (
+    SELECT
+      p.Id AS PostId,
+      TRIM(
+        CASE
+          WHEN instr(p.Tags, ',') = 0 THEN p.Tags
+          ELSE substr(p.Tags, 1, instr(p.Tags, ',') - 1)
+        END
+      ) AS tag,
+      CASE
+        WHEN instr(p.Tags, ',') = 0 THEN ''
+        ELSE substr(p.Tags, instr(p.Tags, ',') + 1)
+      END AS rest
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND p.Tags <> ''
+    UNION ALL
+    SELECT
+      rs.PostId,
+      TRIM(
+        CASE
+          WHEN instr(rs.rest, ',') = 0 THEN rs.rest
+          ELSE substr(rs.rest, 1, instr(rs.rest, ',') - 1)
+        END
+      ) AS tag,
+      CASE
+        WHEN instr(rs.rest, ',') = 0 THEN ''
+        ELSE substr(rs.rest, instr(rs.rest, ',') + 1)
+      END AS rest
+    FROM RecSplit rs
+    WHERE rs.rest <> ''
+  )
+  SELECT
+    s.tag AS TagName,
+    SUM(p.ViewCount) AS total_views,
+    AVG(p.Score) AS avg_score,
+    COUNT(*) AS post_count
+  FROM RecSplit s
+  JOIN Posts p ON p.Id = s.PostId
+  WHERE s.tag IS NOT NULL AND s.tag <> ''
+  GROUP BY s.tag
+  ORDER BY total_views DESC
+  LIMIT 50
+),
+FlaggedByModerators AS (
+  SELECT
+    v.PostId,
+    v.UserId AS ModeratorUserId,
+    v.VoteTypeId,
+    v.CreationDate,
+    u.Reputation
+  FROM Votes v
+  JOIN Users u ON u.Id = v.UserId
+  WHERE v.VoteTypeId IN (14, 15)
+),
+PostHistorySummary AS (
+  SELECT
+    ph.PostId,
+    MAX(CASE WHEN pht.Name = 'Post Closed' THEN ph.CreationDate END) AS last_close_date,
+    MAX(CASE WHEN pht.Name = 'Post Reopened' THEN ph.CreationDate END) AS last_reopen_date,
+    MAX(CASE WHEN pht.Name = 'Post Deleted' THEN ph.CreationDate END) AS last_delete_date
+  FROM PostHistory ph
+  JOIN PostHistoryTypes pht ON pht.Id = ph.PostHistoryTypeId
+  GROUP BY ph.PostId
+),
+Combined AS (
+  SELECT
+    r.PostId,
+    r.PostTypeId,
+    r.Title,
+    r.OwnerUserId,
+    r.LastActivityDate,
+    r.ViewCount,
+    r.Score,
+    r.Tags,
+    h.last_close_date,
+    h.last_reopen_date,
+    h.last_delete_date,
+    t.total_views AS total_views_for_post,
+    t.avg_score AS avg_post_score
+  FROM RecentPostActivity r
+  LEFT JOIN PostHistorySummary h ON h.PostId = r.PostId
+  LEFT JOIN (
+    SELECT
+      p.Id AS PostId,
+      SUM(p.ViewCount) OVER (PARTITION BY p.Id) AS total_views,
+      AVG(p.Score) OVER (PARTITION BY p.Id) AS avg_score
+    FROM Posts p
+  ) t ON t.PostId = r.PostId
+)
+SELECT
+  c.PostId,
+  c.Title,
+  c.PostTypeId,
+  c.OwnerUserId,
+  u.DisplayName AS OwnerDisplayName,
+  u.Reputation,
+  c.LastActivityDate,
+  c.ViewCount,
+  c.Score,
+  c.Tags,
+  c.last_close_date,
+  c.last_reopen_date,
+  c.last_delete_date,
+  b.Name AS BadgeName,
+  b.Date AS BadgeDate,
+  v.ModeratorUserId,
+  v.VoteTypeId,
+  v.CreationDate AS VoteDate
+FROM Combined c
+LEFT JOIN Users u ON u.Id = c.OwnerUserId
+LEFT JOIN Badges b ON b.UserId = u.Id AND b.Class = 1
+LEFT JOIN FlaggedByModerators v ON v.PostId = c.PostId
+ORDER BY
+  c.LastActivityDate DESC,
+  c.ViewCount DESC
+LIMIT 100;

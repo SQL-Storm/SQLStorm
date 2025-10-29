@@ -1,0 +1,52 @@
+select
+    re.owneruserid,
+    coalesce(re.displayname, '(unknown)') as owner_displayname,
+    coalesce(re.location, '(unspecified)') as owner_location,
+    coalesce(re.websiteurl, 'n/a') as owner_website,
+    re.question_id,
+    left(coalesce(re.tags_csv,''), 200) as tags_preview,
+    coalesce(re.title, (select p2.title from posts p2 where p2.id = re.question_id)) as title_fallback,
+    re.score,
+    re.viewcount,
+    re.answercount,
+    re.favoritecount,
+    re.upvotes,
+    re.downvotes,
+    re.favorite_votes,
+    re.bounty_total,
+    re.comment_count,
+    re.positive_comments,
+    re.engagement_per_1k_views,
+    re.upvotes_per_answer,
+    re.first_answer_at,
+    re.total_answers,
+    re.closed_at,
+    re.close_reason_name,
+    re.dup_count,
+    re.last_dup_link,
+    re.accepted_answer_id,
+    re.accepted_score,
+    re.reputation,
+    re.gold_badges,
+    re.silver_badges,
+    re.bronze_badges,
+    re.q_cnt,
+    re.a_cnt,
+    re.last_activity,
+    re.p50_score,
+    re.p90_score,
+    re.sample_count,
+    re.score_bucket,
+    re.composite_score,
+    dense_rank() over (order by re.composite_score desc, re.viewcount desc NULLS LAST, re.score desc NULLS LAST) as global_rank,
+    dense_rank() over (partition by re.owneruserid order by re.composite_score desc, re.viewcount desc NULLS LAST, re.score desc NULLS LAST) as user_rank
+from recent_edge re
+where (re.score_bucket in ('high','low') or (case
+                                                 when re.closed_at is not null then 0
+                                                 when coalesce(re.downvotes,0) > coalesce(re.upvotes,0) then 0.25
+                                                 when coalesce(re.dup_count,0) > 0 then 0.5
+                                                 else 1
+                                               end) < 1)
+  and (re.recency_rank <= 10 or coalesce(re.viewcount,0) > 50000)
+order by re.composite_score desc NULLS LAST, re.viewcount desc NULLS LAST, re.question_id
+limit 500;

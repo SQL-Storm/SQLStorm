@@ -1,0 +1,183 @@
+-- {"query": "2703.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1905} 
+with recursive RecursiveTagCounts as (
+    select
+        t.Id,
+        t.TagName,
+        coalesce(p.AnswerCount, 0) as AnswerCount,
+        coalesce(p.ViewCount, 0) as ViewCount,
+        1 as Level
+    from Tags t
+    left join Posts p on p.Id = t.ExcerptPostId and p.PostTypeId = 1
+    where t.TagName is not null
+    union all
+    select
+        rt.Id,
+        rt.TagName,
+        rt.AnswerCount + coalesce(p.AnswerCount, 0),
+        rt.ViewCount + coalesce(p.ViewCount, 0),
+        rt.Level + 1
+    from RecursiveTagCounts rt
+    join Posts p on p.Tags like concat('%<', rt.TagName, '>%') and p.PostTypeId = 1
+    where rt.Level < 3
+), TopContributors as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct b.Id) as BadgeCount,
+        sum(coalesce(b.Class,0)) as TotalBadgeClass,
+        row_number() over (order by count(distinct b.Id) desc, sum(coalesce(b.Class,0)) desc) as Rank
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    where u.Reputation > 1000 and u.Location is not null
+    group by u.Id, u.DisplayName
+    having count(distinct b.Id) > 5
+), QuestionAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        u.DisplayName as OwnerName,
+        q.Tags,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViews,
+        count(a.Id) filter (where a.PostTypeId = 2) as TotalAnswers,
+        max(a.Score) filter (where a.PostTypeId = 2) as MaxAnswerScore,
+        (select count(*) from Comments c where c.PostId = q.Id) as CommentCountOnQuestion,
+        (select avg(score) from Comments c where c.PostId = q.Id) as AvgCommentScoreOnQuestion,
+        (select count(*) from Comments c where c.PostId in (select a2.Id from Posts a2 where a2.ParentId = q.Id)) as CommentCountOnAnswers,
+        (select avg(score) from Comments c where c.PostId in (select a2.Id from Posts a2 where a2.ParentId = q.Id)) as AvgCommentScoreOnAnswers,
+        rank() over (partition by q.Tags order by q.ViewCount desc) as ViewRankWithinTag
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Users u on u.Id = q.OwnerUserId
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.OwnerUserId, u.DisplayName, q.Tags, q.Score, q.ViewCount
+), LinksAndDuplicates as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name as LinkTypeName,
+        p1.Title as PostTitle,
+        p2.Title as RelatedPostTitle,
+        case when lt.Name = 'Duplicate' then 1 else 0 end as IsDuplicate
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    join Posts p1 on p1.Id = pl.PostId
+    join Posts p2 on p2.Id = pl.RelatedPostId
+    where p1.PostTypeId = 1 and p2.PostTypeId = 1
+), CloseReopenCounts as (
+    select
+        ph.PostId,
+        sum(case when ph.PostHistoryTypeId = 10 then 1 else 0 end) as CloseCount,
+        sum(case when ph.PostHistoryTypeId = 11 then 1 else 0 end) as ReopenCount,
+        max(ph.CreationDate) as LastCloseDate
+    from PostHistory ph
+    group by ph.PostId
+), VotesBreakdown as (
+    select
+        v.PostId,
+        sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+        sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes,
+        sum(case when vt.Name = 'Favorite' then 1 else 0 end) as FavoriteVotes,
+        sum(case when vt.Name = 'Offensive' then 1 else 0 end) as OffensiveVotes
+    from Votes v
+    join VoteTypes vt on vt.Id = v.VoteTypeId
+    group by v.PostId
+), CommentersRanked as (
+    select
+        c.UserId,
+        u.DisplayName,
+        count(*) as CommentsCount,
+        rank() over (order by count(*) desc) as CommentRank
+    from Comments c
+    join Users u on u.Id = c.UserId
+    where c.UserId is not null
+    group by c.UserId, u.DisplayName
+), FinalResult as (
+    select
+        qas.QuestionId,
+        qas.Title as QuestionTitle,
+        qas.OwnerUserId,
+        coalesce(tc.DisplayName, qas.OwnerName) as OwnerDisplayName,
+        qas.Tags,
+        qas.QuestionScore,
+        qas.QuestionViews,
+        qas.TotalAnswers,
+        qas.MaxAnswerScore,
+        qas.CommentCountOnQuestion,
+        qas.AvgCommentScoreOnQuestion,
+        qas.CommentCountOnAnswers,
+        qas.AvgCommentScoreOnAnswers,
+        coalesce(lad.IsDuplicate, 0) as IsDuplicate,
+        coalesce(crc.CloseCount, 0) as CloseVotes,
+        coalesce(crc.ReopenCount, 0) as ReopenVotes,
+        coalesce(crc.LastCloseDate, timestamp '1900-01-01') as LastCloseDate,
+        coalesce(vb.UpVotes, 0) as UpVotes,
+        coalesce(vb.DownVotes, 0) as DownVotes,
+        coalesce(vb.FavoriteVotes, 0) as FavoriteVotes,
+        coalesce(vb.OffensiveVotes, 0) as OffensiveVotes,
+        ctr.CommentersCount,
+        ctr.TopCommenterDisplayName,
+        ctr.TopCommenterCommentsCount,
+        row_number() over (order by qas.QuestionViews desc, qas.QuestionScore desc) as GlobalQuestionRank
+    from QuestionAnswerStats qas
+    left join LinksAndDuplicates lad on lad.PostId = qas.QuestionId and lad.IsDuplicate = 1
+    left join CloseReopenCounts crc on crc.PostId = qas.QuestionId
+    left join VotesBreakdown vb on vb.PostId = qas.QuestionId
+    left join TopContributors tc on tc.UserId = qas.OwnerUserId
+    left join (
+        select
+            c.PostId,
+            count(distinct c.UserId) as CommentersCount,
+            max(cwt.DisplayName) as TopCommenterDisplayName,
+            max(cwt.CommentsCount) as TopCommenterCommentsCount
+        from Comments c
+        join (
+            select 
+                UserId, DisplayName, count(*) as CommentsCount
+            from Comments
+            group by UserId, DisplayName
+        ) cwt on c.UserId = cwt.UserId
+        group by c.PostId
+    ) ctr on ctr.PostId = qas.QuestionId
+    where qas.TotalAnswers > 0 and coalesce(crc.CloseCount, 0) < 3
+)
+select 
+    fr.QuestionId,
+    fr.QuestionTitle,
+    fr.OwnerUserId,
+    fr.OwnerDisplayName,
+    fr.Tags,
+    fr.QuestionScore,
+    fr.QuestionViews,
+    fr.TotalAnswers,
+    fr.MaxAnswerScore,
+    fr.CommentCountOnQuestion,
+    fr.AvgCommentScoreOnQuestion,
+    fr.CommentCountOnAnswers,
+    fr.AvgCommentScoreOnAnswers,
+    fr.IsDuplicate,
+    fr.CloseVotes,
+    fr.ReopenVotes,
+    fr.LastCloseDate,
+    fr.UpVotes,
+    fr.DownVotes,
+    fr.FavoriteVotes,
+    fr.OffensiveVotes,
+    fr.CommentersCount,
+    fr.TopCommenterDisplayName,
+    fr.TopCommenterCommentsCount,
+    fr.GlobalQuestionRank,
+    length(coalesce(fr.Tags, '')) as TagsLength,
+    -- String manipulation: concat first 10 chars of title + owner display name + '?' if closed more than 1 time
+    concat(
+        substring(fr.QuestionTitle from 1 for 10),
+        ' by ',
+        coalesce(fr.OwnerDisplayName, 'Unknown'),
+        case when fr.CloseVotes > 1 then '?' else '' end
+    ) as BriefTitle,
+    -- Window function: dense rank over tags length descending to find tag-rich questions
+    dense_rank() over (order by length(coalesce(fr.Tags, '')) desc) as TagRichnessRank
+from FinalResult fr
+where fr.GlobalQuestionRank <= 100
+order by fr.GlobalQuestionRank;

@@ -1,0 +1,178 @@
+WITH RECURSIVE RecursivePostTree AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        1 AS Level,
+        p.AcceptedAnswerId
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+
+    UNION ALL
+
+    SELECT 
+        c.Id,
+        c.PostTypeId,
+        c.ParentId,
+        c.CreationDate,
+        c.Score,
+        c.ViewCount,
+        c.Title,
+        c.Tags,
+        c.OwnerUserId,
+        rpt.Level + 1,
+        c.AcceptedAnswerId
+    FROM Posts c
+    INNER JOIN RecursivePostTree rpt ON c.ParentId = rpt.Id
+    WHERE c.PostTypeId = 2
+),
+BadgeCounts AS (
+    SELECT 
+        UserId,
+        SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadgeCount,
+        SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadgeCount,
+        SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadgeCount,
+        COUNT(*) AS TotalBadges
+    FROM Badges
+    GROUP BY UserId
+),
+UserPostStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COALESCE(bc.GoldBadgeCount, 0) AS GoldBadges,
+        COALESCE(bc.SilverBadgeCount, 0) AS SilverBadges,
+        COALESCE(bc.BronzeBadgeCount, 0) AS BronzeBadges,
+        COALESCE(bc.TotalBadges, 0) AS TotalBadges,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsPosted,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersPosted,
+        MAX(p.Score) FILTER (WHERE p.PostTypeId IN (1,2)) AS HighestPostScore,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId IN (1,2)) AS AvgPostScore
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN BadgeCounts bc ON bc.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location, u.Views, u.UpVotes, u.DownVotes, bc.GoldBadgeCount, bc.SilverBadgeCount, bc.BronzeBadgeCount, bc.TotalBadges
+),
+PostLinkDetails AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name AS LinkTypeName,
+        rpost.Score AS RelatedPostScore,
+        rpost.ViewCount AS RelatedPostViewCount
+    FROM PostLinks pl
+    INNER JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    INNER JOIN Posts rpost ON rpost.Id = pl.RelatedPostId
+),
+PostCloseReasonAggregated AS (
+    SELECT 
+        ph.PostId,
+        crt.Name AS CloseReasonName,
+        COUNT(*) AS CloseVoteCount
+    FROM PostHistory ph
+    INNER JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS integer)
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.PostId, crt.Name
+),
+RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.OwnerUserId,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC NULLS LAST, p.ViewCount DESC NULLS LAST) AS RowNumByType,
+        p.AcceptedAnswerId
+    FROM Posts p
+    WHERE p.PostTypeId IN (1,2)
+)
+SELECT
+    up.DisplayName,
+    up.Reputation,
+    up.Location,
+    up.TotalBadges,
+    up.GoldBadges,
+    up.SilverBadges,
+    up.BronzeBadges,
+    up.QuestionsPosted,
+    up.AnswersPosted,
+    up.HighestPostScore,
+    up.AvgPostScore,
+    rp.Id AS PostId,
+    COALESCE(rp.Title, '(no title)') AS PostTitle,
+    rp.PostTypeId,
+    rp.CreationDate AS PostCreated,
+    rp.Score AS PostScore,
+    rp.ViewCount AS PostViews,
+    rp.AnswerCount,
+    rp.FavoriteCount,
+    STRING_AGG(pl.LinkTypeName || '->' || COALESCE(CAST(pl.RelatedPostId AS varchar), 'NULL') || '(' || COALESCE(CAST(pl.RelatedPostScore AS varchar),'0') || ')', '; ') AS PostLinksSummary,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = rp.Id) AS CommentsCount,
+    pcr.CloseVoteCount,
+    pcr.CloseReasonName,
+    RANK() OVER (ORDER BY rp.Score DESC NULLS LAST) AS OverallPostScoreRank,
+    CASE 
+        WHEN rp.Tags IS NULL OR LENGTH(rp.Tags) < 5 THEN 'NoTags'
+        ELSE SUBSTRING(rp.Tags FROM 2 FOR LENGTH(rp.Tags)-2)
+    END AS ParsedTags,
+    (SELECT COUNT(*) FROM Posts ans WHERE ans.ParentId = rp.Id AND ans.PostTypeId = 2) AS ActualAnswersCount,
+    EXISTS (
+        SELECT 1 
+        FROM Posts aa 
+        WHERE aa.Id = rp.AcceptedAnswerId 
+          AND aa.PostTypeId = 2
+          AND aa.DeletionDate IS NULL
+    ) AS HasValidAcceptedAnswer,
+    (up.Views * 1.0) / NULLIF(NULLIF(rp.ViewCount, 0), 1) AS UserViewsOverPostViewsRatio
+FROM RankedPosts rp
+LEFT JOIN UserPostStats up ON up.UserId = rp.OwnerUserId
+LEFT JOIN PostLinkDetails pl ON pl.PostId = rp.Id
+LEFT JOIN PostLinkDetails lp ON lp.PostId = rp.Id
+LEFT JOIN PostCloseReasonAggregated pcr ON pcr.PostId = rp.Id
+WHERE rp.RowNumByType <= 100
+GROUP BY
+    up.DisplayName,
+    up.Reputation,
+    up.Location,
+    up.TotalBadges,
+    up.GoldBadges,
+    up.SilverBadges,
+    up.BronzeBadges,
+    up.QuestionsPosted,
+    up.AnswersPosted,
+    up.HighestPostScore,
+    up.AvgPostScore,
+    rp.Id,
+    rp.Title,
+    rp.PostTypeId,
+    rp.CreationDate,
+    rp.Score,
+    rp.ViewCount,
+    rp.AnswerCount,
+    rp.FavoriteCount,
+    pcr.CloseVoteCount,
+    pcr.CloseReasonName,
+    rp.Tags,
+    rp.AcceptedAnswerId,
+    up.Views,
+    rp.AcceptedAnswerId,
+    rp.RowNumByType
+ORDER BY up.TotalBadges DESC NULLS LAST, rp.Score DESC NULLS LAST, rp.ViewCount DESC NULLS LAST
+LIMIT 200;

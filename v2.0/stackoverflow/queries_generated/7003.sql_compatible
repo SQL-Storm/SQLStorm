@@ -1,0 +1,160 @@
+SELECT 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) as TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) as TotalQuestionScore,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) as TotalAnswerScore,
+    AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END) as AvgQuestionScore,
+    AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE NULL END) as AvgAnswerScore,
+    MAX(p.ViewCount) as MaxViewCount,
+    MIN(p.CreationDate) as FirstPostDate,
+    MAX(p.CreationDate) as LastPostDate,
+    COUNT(DISTINCT b.Id) as BadgesCount,
+    STRING_AGG(DISTINCT b.Name, ', ') as BadgeNames,
+    COUNT(DISTINCT c.Id) as CommentCount,
+    COUNT(DISTINCT ph.Id) as PostHistoryCount,
+    RANK() OVER (ORDER BY SUM(p.Score) DESC) as ScoreRank,
+    DENSE_RANK() OVER (ORDER BY u.Reputation DESC) as ReputationRank,
+    PERCENT_RANK() OVER (ORDER BY u.Reputation) as ReputationPercentile,
+    CASE 
+        WHEN COUNT(DISTINCT p.Id) > 100 THEN 'High Activity'
+        WHEN COUNT(DISTINCT p.Id) > 50 THEN 'Medium Activity'
+        WHEN COUNT(DISTINCT p.Id) > 10 THEN 'Low Activity'
+        ELSE 'Minimal Activity'
+    END as ActivityLevel,
+    COALESCE(
+        (SELECT COUNT(*) 
+         FROM Posts p2 
+         WHERE p2.OwnerUserId = u.Id 
+         AND p2.PostTypeId = 1 
+         AND p2.Score > 0), 0
+    ) as PositiveQuestions,
+    COALESCE(
+        (SELECT COUNT(*) 
+         FROM Posts p3 
+         WHERE p3.OwnerUserId = u.Id 
+         AND p3.PostTypeId = 2 
+         AND p3.Score > 0), 0
+    ) as PositiveAnswers,
+    CASE 
+        WHEN COUNT(DISTINCT p.Id) > 0 
+        THEN (COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) * 100.0 / COUNT(DISTINCT p.Id))
+        ELSE 0 
+    END as QuestionPercentage,
+    CASE 
+        WHEN COUNT(DISTINCT p.Id) > 0 
+        THEN (COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) * 100.0 / COUNT(DISTINCT p.Id))
+        ELSE 0 
+    END as AnswerPercentage,
+    (SELECT COUNT(*) 
+     FROM Posts p4 
+     WHERE p4.OwnerUserId = u.Id 
+     AND p4.PostTypeId = 1 
+     AND EXISTS (
+         SELECT 1 
+         FROM Posts p5 
+         WHERE p5.ParentId = p4.Id 
+         AND p5.PostTypeId = 2 
+         AND p5.Score >= 10
+     )) as QuestionsWithHighAnswerScore,
+    (SELECT STRING_AGG(SUBSTRING(Title FROM 1 FOR 50), ' | ')
+     FROM Posts p6 
+     WHERE p6.OwnerUserId = u.Id 
+     AND p6.PostTypeId = 1
+     ORDER BY Score DESC
+     LIMIT 5) as TopQuestionTitles,
+    (SELECT STRING_AGG(SUBSTRING(p7.Body FROM 1 FOR 100) || '...', ' | ')
+     FROM Posts p7 
+     WHERE p7.OwnerUserId = u.Id 
+     AND p7.PostTypeId = 2
+     ORDER BY p7.Score DESC
+     LIMIT 3) as TopAnswerBodies,
+    CASE 
+        WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+            ROUND(
+                (COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) * 100.0) / 
+                (COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) + 1),
+                2
+            )
+        ELSE 0 
+    END as AnswerToQuestionRatio,
+    (SELECT COUNT(*)
+     FROM Votes v
+     WHERE v.UserId = u.Id 
+     AND v.VoteTypeId IN (2, 3)) as TotalVotes,
+    (SELECT COUNT(*)
+     FROM Votes v
+     WHERE v.UserId = u.Id 
+     AND v.VoteTypeId = 2) as UpVotes,
+    (SELECT COUNT(*)
+     FROM Votes v
+     WHERE v.UserId = u.Id 
+     AND v.VoteTypeId = 3) as DownVotes,
+    CASE 
+        WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+            ROUND(AVG(p.Score), 2)
+        ELSE 0.0 
+    END as AveragePostScore,
+    CASE 
+        WHEN EXISTS(
+            SELECT 1 
+            FROM Badges b2 
+            WHERE b2.UserId = u.Id 
+            AND b2.Class = 1
+        ) THEN 'Gold'
+        WHEN EXISTS(
+            SELECT 1 
+            FROM Badges b3 
+            WHERE b3.UserId = u.Id 
+            AND b3.Class = 2
+        ) THEN 'Silver'
+        WHEN EXISTS(
+            SELECT 1 
+            FROM Badges b4 
+            WHERE b4.UserId = u.Id 
+            AND b4.Class = 3
+        ) THEN 'Bronze'
+        ELSE 'None'
+    END as HighestBadgeTier,
+    CASE 
+        WHEN u.Reputation > 10000 THEN 'Senior'
+        WHEN u.Reputation > 1000 THEN 'Intermediate'
+        WHEN u.Reputation > 100 THEN 'Beginner'
+        ELSE 'Newbie'
+    END as ReputationTier,
+    -- include SUM(p.Score) for ORDER BY TotalPostScore reference
+    SUM(p.Score) as TotalPostScore
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN Comments c ON u.Id = c.UserId
+LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+WHERE u.CreationDate >= DATE '2010-01-01' 
+    AND u.Id IN (
+        SELECT UserId
+        FROM (
+            SELECT UserId, COUNT(*) as PostCount
+            FROM Posts
+            WHERE PostTypeId = 1
+            GROUP BY UserId
+            HAVING COUNT(*) > 5
+        ) t
+        UNION
+        SELECT UserId
+        FROM (
+            SELECT UserId, COUNT(*) as AnswerCount
+            FROM Posts
+            WHERE PostTypeId = 2
+            GROUP BY UserId
+            HAVING COUNT(*) > 10
+        ) t2
+    )
+GROUP BY u.Id, u.DisplayName, u.Reputation
+HAVING COUNT(DISTINCT p.Id) >= 1
+    AND (COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 0 
+         OR COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) > 0)
+ORDER BY TotalPostScore DESC
+LIMIT 100;

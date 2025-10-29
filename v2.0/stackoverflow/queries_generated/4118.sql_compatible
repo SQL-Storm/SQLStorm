@@ -1,0 +1,127 @@
+WITH RankedPostEdits AS (
+    SELECT
+        ph.PostId,
+        ph.UserId,
+        u.DisplayName AS EditorDisplayName,
+        ph.CreationDate AS EditDate,
+        ROW_NUMBER() OVER(PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate DESC) as rn
+    FROM PostHistory ph
+    JOIN Users u ON ph.UserId = u.Id
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6)
+),
+PostEditCounts AS (
+    SELECT
+        PostId,
+        COUNT(DISTINCT UserId) AS DistinctEditors,
+        SUM(CASE WHEN rn = 1 THEN 1 ELSE 0 END) AS PrimaryEditors
+    FROM RankedPostEdits
+    GROUP BY PostId
+),
+UserContributionScore AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        (
+            SELECT COALESCE(SUM(p.Score), 0)
+            FROM Posts p
+            WHERE p.OwnerUserId = u.Id
+        ) + (
+            SELECT COALESCE(SUM(c.Score), 0)
+            FROM Comments c
+            WHERE c.UserId = u.Id
+        ) + (
+            SELECT COALESCE(COUNT(b.Id) * 5, 0)
+            FROM Badges b
+            WHERE b.UserId = u.Id AND b.Class = 1
+        ) - (
+            SELECT COALESCE(COUNT(v.Id) * 2, 0)
+            FROM Votes v
+            WHERE v.UserId = u.Id AND v.VoteTypeId = 3
+        ) AS ContributionScore
+    FROM Users u
+),
+RecentQuestions AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        p.AnswerCount,
+        p.ViewCount,
+        p.FavoriteCount,
+        p.Score AS QuestionScore,
+        DENSE_RANK() OVER (ORDER BY p.CreationDate DESC) AS QuestionRank
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days')
+),
+HighScoringAnswers AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.OwnerUserId,
+        a.Score AS AnswerScore,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRankForQuestion
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+      AND a.ParentId IN (SELECT QuestionId FROM RecentQuestions)
+      AND a.Score > 0
+),
+AcceptedAnswerInfo AS (
+    SELECT
+        rq.QuestionId,
+        COALESCE(COUNT(DISTINCT hsa.AnswerId), 0) AS NumberOfHighScoringAnswers,
+        MAX(hsa.AnswerScore) AS MaxAnswerScore,
+        SUM(CASE WHEN rq.AcceptedAnswerId = hsa.AnswerId THEN 1 ELSE 0 END) AS WasAnswerAccepted
+    FROM RecentQuestions rq
+    LEFT JOIN HighScoringAnswers hsa ON rq.QuestionId = hsa.QuestionId
+    GROUP BY rq.QuestionId
+)
+SELECT
+    rq.QuestionId,
+    rq.Title,
+    rq.CreationDate AS QuestionCreationDate,
+    rq.OwnerDisplayName AS QuestionOwner,
+    rq.AnswerCount,
+    rq.ViewCount,
+    rq.FavoriteCount,
+    rq.QuestionScore,
+    COALESCE(pec.DistinctEditors, 0) AS TotalDistinctPostEditors,
+    COALESCE(pec.PrimaryEditors, 0) AS PrimaryPostEditors,
+    COALESCE(ucs.ContributionScore, 0) AS QuestionOwnerContribution,
+    COALESCE(aai.NumberOfHighScoringAnswers, 0) AS NumAnswersWithScoreOverZero,
+    COALESCE(aai.MaxAnswerScore, 0) AS HighestAnswerScore,
+    CASE WHEN aai.WasAnswerAccepted = 1 THEN 'Yes' ELSE 'No' END AS IsAcceptedAnswerPresent,
+    (
+        SELECT COUNT(c.Id)
+        FROM Comments c
+        WHERE c.PostId = rq.QuestionId
+          AND c.CreationDate >= rq.CreationDate
+          AND c.UserId IS NOT NULL
+    ) AS QuestionCommentCount,
+    (
+        SELECT COUNT(pl.Id)
+        FROM PostLinks pl
+        WHERE pl.PostId = rq.QuestionId
+          AND pl.LinkTypeId = 3
+    ) AS DuplicateLinkCount,
+    SUBSTRING(rq.Title FROM 1 FOR 50) AS TitlePrefix,
+    UPPER(rq.OwnerDisplayName) AS OWNER_DISPLAY_NAME_UPPER,
+    CASE
+        WHEN rq.QuestionScore > 1000 THEN 'Very High'
+        WHEN rq.QuestionScore > 100 THEN 'High'
+        WHEN rq.QuestionScore > 10 THEN 'Medium'
+        ELSE 'Low'
+    END AS ScoreCategory,
+    CASE
+        WHEN rq.ViewCount IS NULL OR rq.ViewCount = 0 THEN 'No Views'
+        ELSE CAST(rq.ViewCount AS VARCHAR)
+    END AS FormattedViewCount
+FROM RecentQuestions rq
+LEFT JOIN PostEditCounts pec ON rq.QuestionId = pec.PostId
+LEFT JOIN UserContributionScore ucs ON rq.OwnerUserId = ucs.UserId
+LEFT JOIN AcceptedAnswerInfo aai ON rq.QuestionId = aai.QuestionId
+WHERE rq.QuestionRank <= 50
+ORDER BY rq.CreationDate DESC, rq.QuestionScore DESC;

@@ -1,0 +1,296 @@
+-- {"query": "729.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3282} 
+with params as (
+    select
+        date_trunc('month', cast('2024-10-01 12:34:56' as timestamp)) - interval '24 months' as start_month,
+        cast('2024-10-01 12:34:56' as timestamp) as asof
+),
+-- explode tags for questions
+question_tags as (
+    select
+        p.id as question_id,
+        lower(trim(tg)) as tag
+    from posts p
+    join params pr on true
+    where p.posttypeid = 1
+      and p.creationdate >= pr.start_month
+      and p.tags is not null
+    cross join lateral unnest(string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')) as tg
+),
+-- compute monthly activity per question with windowed ranks
+question_activity as (
+    select
+        p.id as question_id,
+        date_trunc('month', p.creationdate) as month_bucket,
+        coalesce(p.viewcount, 0) as views,
+        coalesce(p.score, 0) as q_score,
+        coalesce(p.answercount, 0) as answers,
+        coalesce(p.favoritecount, 0) as favorites,
+        p.owneruserid as asker_id,
+        p.acceptedanswerid,
+        p.closeddate,
+        p.title
+    from posts p
+    join params pr on p.creationdate >= pr.start_month
+    where p.posttypeid = 1
+),
+-- answers joined to questions with acceptance and scoring info
+answers_enriched as (
+    select
+        a.id as answer_id,
+        a.parentid as question_id,
+        coalesce(a.score, 0) as a_score,
+        a.owneruserid as answerer_id,
+        (a.id = q.acceptedanswerid) as is_accepted,
+        a.creationdate,
+        date_trunc('month', a.creationdate) as month_bucket
+    from posts a
+    join posts q on q.id = a.parentid and a.posttypeid = 2
+    join params pr on a.creationdate >= pr.start_month
+),
+-- votes aggregated per post and month with pivot-like sum
+votes_agg as (
+    select
+        v.postid,
+        date_trunc('month', v.creationdate) as month_bucket,
+        sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+        sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+        sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites_votes,
+        sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started,
+        sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded
+    from votes v
+    join params pr on v.creationdate >= pr.start_month
+    group by 1,2
+),
+-- comments per question per month with top commenters windowed
+comments_agg as (
+    select
+        c.postid as question_id,
+        date_trunc('month', c.creationdate) as month_bucket,
+        count(*) as comments_count,
+        count(distinct c.userid) filter (where c.userid is not null) as distinct_commenters,
+        max(c.score) as max_comment_score
+    from comments c
+    join params pr on c.creationdate >= pr.start_month
+    join posts p on p.id = c.postid and p.posttypeid = 1
+    group by 1,2
+),
+-- post history derived features (closures, migrations, edits)
+history_features as (
+    select
+        ph.postid as question_id,
+        date_trunc('month', ph.creationdate) as month_bucket,
+        sum(case when ph.posthistorytypeid = 10 then 1 else 0 end) as closures,
+        sum(case when ph.posthistorytypeid = 11 then 1 else 0 end) as reopens,
+        sum(case when ph.posthistorytypeid in (4,5,6,24) then 1 else 0 end) as edits,
+        count(*) filter (where ph.posthistorytypeid = 52) as became_hot,
+        count(*) filter (where ph.posthistorytypeid = 53) as removed_hot
+    from posthistory ph
+    join params pr on ph.creationdate >= pr.start_month
+    group by 1,2
+),
+-- link graph measures: duplicates and related links per question per month
+links_agg as (
+    select
+        pl.postid as question_id,
+        date_trunc('month', pl.creationdate) as month_bucket,
+        sum(case when pl.linktypeid = 3 then 1 else 0 end) as dup_links,
+        sum(case when pl.linktypeid = 1 then 1 else 0 end) as related_links
+    from postlinks pl
+    join params pr on pl.creationdate >= pr.start_month
+    group by 1,2
+),
+-- user reputation snapshot by month (using last value up to month end)
+user_rep_month as (
+    select
+        u.id as user_id,
+        m.month_end,
+        u.reputation,
+        row_number() over (partition by u.id, m.month_end order by u.lastaccessdate desc nulls last) as rn
+    from users u
+    cross join lateral (
+        select date_trunc('month', g)::timestamp + interval '1 month' - interval '1 second' as month_end
+        from generate_series((select start_month from params), (select asof from params), interval '1 month') g
+    ) m
+    where u.creationdate <= m.month_end
+),
+user_rep as (
+    select user_id, month_end, reputation
+    from user_rep_month
+    where rn = 1
+),
+-- per-question per-month rollup with window metrics
+q_monthly as (
+    select
+        qa.question_id,
+        qa.month_bucket,
+        qa.views,
+        qa.q_score,
+        qa.answers,
+        qa.favorites,
+        qa.asker_id,
+        qa.acceptedanswerid,
+        qa.closeddate,
+        qa.title,
+        -- join tag density
+        count(distinct qt.tag) as distinct_tags,
+        -- answer stats
+        coalesce(count(distinct ae.answer_id) filter (where ae.month_bucket = qa.month_bucket), 0) as answers_this_month,
+        coalesce(sum(ae.a_score) filter (where ae.month_bucket = qa.month_bucket), 0) as answer_scores_this_month,
+        coalesce(count(*) filter (where ae.is_accepted), 0) as accepted_answers_total,
+        -- vote stats for Q and A combined
+        coalesce(va_q.upvotes,0) - coalesce(va_q.downvotes,0)
+            + coalesce(sum(va_a.upvotes - va_a.downvotes),0) as net_votes_q_and_a,
+        -- comment stats
+        coalesce(ca.comments_count,0) as comments_count,
+        coalesce(ca.distinct_commenters,0) as distinct_commenters,
+        coalesce(ca.max_comment_score,0) as max_comment_score,
+        -- history stats
+        coalesce(hf.closures,0) as closures,
+        coalesce(hf.reopens,0) as reopens,
+        coalesce(hf.edits,0) as edits,
+        coalesce(hf.became_hot,0) as became_hot,
+        coalesce(hf.removed_hot,0) as removed_hot,
+        -- link stats
+        coalesce(la.dup_links,0) as dup_links,
+        coalesce(la.related_links,0) as related_links
+    from question_activity qa
+    left join question_tags qt on qt.question_id = qa.question_id
+    left join answers_enriched ae on ae.question_id = qa.question_id
+    left join votes_agg va_q on va_q.postid = qa.question_id and va_q.month_bucket = qa.month_bucket
+    left join votes_agg va_a on va_a.postid = ae.answer_id and va_a.month_bucket = qa.month_bucket
+    left join comments_agg ca on ca.question_id = qa.question_id and ca.month_bucket = qa.month_bucket
+    left join history_features hf on hf.question_id = qa.question_id and hf.month_bucket = qa.month_bucket
+    left join links_agg la on la.question_id = qa.question_id and la.month_bucket = qa.month_bucket
+    group by
+        qa.question_id, qa.month_bucket, qa.views, qa.q_score, qa.answers, qa.favorites,
+        qa.asker_id, qa.acceptedanswerid, qa.closeddate, qa.title,
+        va_q.upvotes, va_q.downvotes, ca.comments_count, ca.distinct_commenters, ca.max_comment_score,
+        hf.closures, hf.reopens, hf.edits, hf.became_hot, hf.removed_hot,
+        la.dup_links, la.related_links
+),
+-- compute rolling windows and ranks
+q_enriched as (
+    select
+        qm.*,
+        -- rolling 3-month sums
+        sum(net_votes_q_and_a) over (partition by question_id order by month_bucket rows between 2 preceding and current row) as roll3_net_votes,
+        sum(answers_this_month) over (partition by question_id order by month_bucket rows between 2 preceding and current row) as roll3_answers,
+        sum(comments_count) over (partition by question_id order by month_bucket rows between 2 preceding and current row) as roll3_comments,
+        -- rank of month by activity
+        dense_rank() over (partition by question_id order by (net_votes_q_and_a + answers_this_month*2 + comments_count) desc) as activity_rank,
+        -- null logic examples
+        case when closeddate is not null then 1 else 0 end as is_closed_anytime,
+        nullif(distinct_tags, 0) as tags_if_any
+    from q_monthly qm
+),
+-- join with user reputation snapshots for asker and for top answerer that month
+top_answerer_month as (
+    select
+        ae.question_id,
+        ae.month_bucket,
+        ae.answerer_id,
+        sum(ae.a_score) as sum_score,
+        count(*) filter (where ae.is_accepted) as accepted_count,
+        row_number() over (partition by ae.question_id, ae.month_bucket order by sum(ae.a_score) desc, accepted_count desc, min(ae.creationdate)) as rn
+    from answers_enriched ae
+    group by 1,2,3
+),
+qa_user_context as (
+    select
+        qe.*,
+        ur_ask.reputation as asker_rep_at_month_end,
+        coalesce(ta.answerer_id, -1) as top_answerer_id,
+        ur_ans.reputation as top_answerer_rep_at_month_end
+    from q_enriched qe
+    left join user_rep ur_ask on ur_ask.user_id = qe.asker_id and ur_ask.month_end >= qe.month_bucket and ur_ask.month_end < qe.month_bucket + interval '1 month'
+    left join top_answerer_month ta on ta.question_id = qe.question_id and ta.month_bucket = qe.month_bucket and ta.rn = 1
+    left join user_rep ur_ans on ur_ans.user_id = ta.answerer_id and ur_ans.month_end >= qe.month_bucket and ur_ans.month_end < qe.month_bucket + interval '1 month'
+),
+-- tag popularity by month
+tag_popularity as (
+    select
+        qt.tag,
+        qm.month_bucket,
+        count(distinct qm.question_id) as questions_with_tag,
+        sum(qm.net_votes_q_and_a) as tag_net_votes
+    from question_tags qt
+    join q_monthly qm on qm.question_id = qt.question_id and qm.month_bucket >= (select start_month from params)
+    group by 1,2
+),
+-- associate each question with its top tag in the month by aggregated net votes
+question_top_tag as (
+    select
+        qt.question_id,
+        qm.month_bucket,
+        qt.tag,
+        row_number() over (partition by qt.question_id, qm.month_bucket order by tp.tag_net_votes desc nulls last, qt.tag) as rn
+    from question_tags qt
+    join q_monthly qm on qm.question_id = qt.question_id
+    left join tag_popularity tp on tp.tag = qt.tag and tp.month_bucket = qm.month_bucket
+),
+finalized as (
+    select
+        qc.*,
+        qtt.tag as top_tag_that_month,
+        tp.questions_with_tag,
+        tp.tag_net_votes
+    from qa_user_context qc
+    left join question_top_tag qtt on qtt.question_id = qc.question_id and qtt.month_bucket = qc.month_bucket and qtt.rn = 1
+    left join tag_popularity tp on tp.tag = qtt.tag and tp.month_bucket = qc.month_bucket
+)
+select
+    f.month_bucket,
+    f.question_id,
+    coalesce(nullif(trim(both from regexp_replace(coalesce(f.title, ''), '\s+', ' ', 'g')), ''), '(no title)') as normalized_title,
+    f.distinct_tags,
+    f.tags_if_any,
+    f.answers,
+    f.answers_this_month,
+    f.roll3_answers,
+    f.q_score,
+    f.net_votes_q_and_a,
+    f.roll3_net_votes,
+    f.comments_count,
+    f.roll3_comments,
+    f.activity_rank,
+    f.is_closed_anytime,
+    f.closures,
+    f.reopens,
+    f.edits,
+    f.became_hot,
+    f.removed_hot,
+    f.dup_links,
+    f.related_links,
+    f.asker_id,
+    f.asker_rep_at_month_end,
+    f.top_answerer_id,
+    f.top_answerer_rep_at_month_end,
+    f.top_tag_that_month,
+    f.questions_with_tag,
+    f.tag_net_votes,
+    -- composite performance score with complicated predicate/expressions
+    (
+        coalesce(f.net_votes_q_and_a,0) * 1.0
+        + coalesce(f.answers_this_month,0) * 3.5
+        + least(coalesce(f.roll3_comments,0), 50) * 0.5
+        + case when f.is_closed_anytime = 1 then -10 else 0 end
+        + case when coalesce(f.dup_links,0) > 0 then -5 else 0 end
+        + case when coalesce(f.became_hot,0) > 0 then 15 else 0 end
+        - case when coalesce(f.removed_hot,0) > 0 then 8 else 0 end
+        + greatest(coalesce(f.asker_rep_at_month_end,0) / 100.0, 0)
+        + greatest(coalesce(f.top_answerer_rep_at_month_end,0) / 200.0, 0)
+        + coalesce(f.questions_with_tag,0) * 0.01
+    ) as perf_score,
+    -- correlated subquery: earliest duplicate target title (if any)
+    (
+        select min(p2.title)
+        from postlinks pl
+        join posts p2 on p2.id = pl.relatedpostid
+        where pl.postid = f.question_id
+          and pl.linktypeid = 3
+    ) as earliest_duplicate_target_title
+from finalized f
+where (f.roll3_net_votes is not null or f.roll3_answers is not null)
+  and coalesce(f.distinct_tags, 0) >= 1
+order by f.month_bucket desc, perf_score desc, f.question_id
+limit 500;

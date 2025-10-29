@@ -1,0 +1,194 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+                CASE WHEN COUNT(DISTINCT p.Id) > 100 THEN 'High'
+                     WHEN COUNT(DISTINCT p.Id) > 50 THEN 'Medium'
+                     ELSE 'Low' END
+            ELSE 'None'
+        END AS ActivityLevel,
+        STRING_AGG(DISTINCT RIGHT(p.Tags, 10), ', ') AS SampleTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= CAST('2010-01-01' AS timestamp)
+    GROUP BY u.Id, u.Reputation, u.DisplayName
+),
+QuestionStats AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        STRING_AGG(CASE WHEN v.VoteTypeId = 2 THEN '1' ELSE '0' END, '') AS UpVotes,
+        COUNT(DISTINCT v.Id) AS TotalVotes,
+        AVG(v.BountyAmount) AS AvgBounty,
+        MAX(CASE WHEN v.VoteTypeId = 8 THEN v.BountyAmount END) AS MaxBounty
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (2, 8)
+    WHERE p.PostTypeId = 1 
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.CreationDate, p.OwnerUserId, p.Tags
+),
+RecentActivity AS (
+    SELECT 
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.Title,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserPostRank,
+        CAST(EXTRACT(day FROM (CAST('2024-10-01 12:34:56' AS timestamp) - p.CreationDate)) AS integer) AS DaysOld
+    FROM Posts p
+    WHERE (p.PostTypeId = 1 OR p.PostTypeId = 2)
+    AND p.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days')
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagCount,
+        t.ExcerptPostId,
+        COALESCE(p.Title, 'No Excerpt') AS ExcerptTitle,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            WHEN t.Count > 10 THEN 'Niche'
+            ELSE 'Rare'
+        END AS TagPopularity,
+        RANK() OVER (ORDER BY t.Count DESC) AS PopularityRank
+    FROM Tags t
+    LEFT JOIN Posts p ON t.ExcerptPostId = p.Id
+    WHERE t.Count > 0
+)
+SELECT 
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.PostCount,
+    us.CommentCount,
+    us.BadgeCount,
+    us.AvgPostScore,
+    us.LastPostDate,
+    us.ActivityLevel,
+    us.SampleTags,
+    qs.QuestionId,
+    qs.Title,
+    qs.Score,
+    qs.ViewCount,
+    qs.AnswerCount,
+    qs.CommentCount,
+    qs.CreationDate,
+    qs.Tags,
+    qs.TotalVotes,
+    qs.AvgBounty,
+    qs.MaxBounty,
+    ra.PostId,
+    ra.PostTypeId,
+    ra.DaysOld,
+    ta.TagName,
+    ta.TagCount,
+    ta.TagPopularity,
+    ta.PopularityRank,
+    CASE 
+        WHEN qs.Score > 100 THEN 'Very High'
+        WHEN qs.Score > 50 THEN 'High'
+        WHEN qs.Score > 10 THEN 'Moderate'
+        WHEN qs.Score > 0 THEN 'Low'
+        ELSE 'No Score'
+    END AS ScoreCategory,
+    COALESCE((
+        SELECT STRING_AGG(vt.Name, ', ')
+        FROM PostHistory ph
+        JOIN VoteTypes vt ON ph.Comment = CAST(vt.Id AS varchar)
+        WHERE ph.PostId = qs.QuestionId AND ph.PostHistoryTypeId = 10
+        AND ph.Comment LIKE '%101%'
+        LIMIT 1
+    ), 'Not Closed') AS ClosureReasons,
+    ROW_NUMBER() OVER (
+        PARTITION BY us.UserId 
+        ORDER BY qs.Score DESC, qs.ViewCount DESC
+    ) AS QuestionRankWithinUser,
+    RANK() OVER (
+        ORDER BY 
+            COALESCE(qs.Score, 0) + 
+            COALESCE(qs.ViewCount, 0) * 0.1 + 
+            COALESCE(qs.AnswerCount, 0) * 2 + 
+            COALESCE(qs.CommentCount, 0) DESC
+    ) AS QuestionOverallRank,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p2 
+        WHERE p2.OwnerUserId = us.UserId 
+        AND p2.PostTypeId = 1
+        AND p2.CreationDate BETWEEN CAST('2020-01-01' AS timestamp) AND CAST('2024-12-31' AS timestamp)
+    ) AS Questions2020_2024,
+    CASE 
+        WHEN us.SampleTags IS NULL OR TRIM(us.SampleTags) = '' THEN 'No Tags'
+        ELSE UPPER(SUBSTRING(us.SampleTags FROM 1 FOR 20))
+    END AS TagSummary,
+    (
+        SELECT 'User Post Activity' 
+        UNION ALL 
+        SELECT 'Question Metrics' 
+        UNION ALL 
+        SELECT 'Popular Tags'
+        LIMIT 1
+    ) AS ActivityTypes,
+    ROUND(
+        CASE 
+            WHEN us.PostCount > 0 THEN 
+                (COALESCE(qs.ViewCount, 0) - COALESCE(qs.Score, 0)) / 
+                NULLIF(us.PostCount, 0)
+            ELSE 0 
+        END, 2
+    ) AS ViewScoreRatio,
+    COALESCE(
+        (SELECT COUNT(*) FROM Votes v WHERE v.UserId = us.UserId AND v.VoteTypeId = 2),
+        0
+    ) AS UserUpVotesReceived,
+    CASE 
+        WHEN EXISTS (
+            SELECT 1 
+            FROM Posts p3 
+            WHERE p3.OwnerUserId = us.UserId 
+            AND p3.PostTypeId = 1 
+            AND EXISTS (
+                SELECT 1 
+                FROM Votes v2 
+                WHERE v2.PostId = p3.Id 
+                AND v2.VoteTypeId = 2
+                AND v2.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '4 weeks')
+            )
+        ) THEN 'Active Recent Upvoter'
+        ELSE 'Inactive'
+    END AS RecentVoterStatus
+FROM UserStats us
+LEFT JOIN QuestionStats qs ON us.UserId = qs.OwnerUserId
+LEFT JOIN RecentActivity ra ON us.UserId = ra.OwnerUserId AND ra.UserPostRank <= 3
+LEFT JOIN TagAnalysis ta ON ta.TagPopularity IN ('Popular', 'Moderate')
+WHERE (
+    (us.PostCount > 10 AND us.Reputation > 1000) 
+    OR (us.BadgeCount > 5 AND us.ActivityLevel IN ('High', 'Medium'))
+)
+AND us.Reputation IS NOT NULL
+AND us.DisplayName IS NOT NULL
+ORDER BY 
+    us.Reputation DESC,
+    qs.Score DESC,
+    ta.TagCount DESC
+LIMIT 1000;

@@ -1,0 +1,169 @@
+-- {"query": "2170.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1433} 
+with RecursiveAdminUsers as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        row_number() over (order by u.Reputation desc) as Rank
+    from Users u
+    where u.Reputation > 20000
+    union all
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        ra.Rank + 1
+    from Users u
+    join RecursiveAdminUsers ra on u.Id = ra.Id
+    where u.Reputation > 50000 and ra.Rank < 10
+),
+LatestPostHistories as (
+    select
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        ph.UserId,
+        row_number() over (partition by ph.PostId order by ph.CreationDate desc) as rn
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (10, 11) -- Closed, Reopened
+),
+TopTags as (
+    select
+        t.TagName,
+        t.Count,
+        p.Id as QuestionId,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId
+    from Tags t
+    left join Posts p on p.Tags like concat('%<', t.TagName, '>%') and p.PostTypeId = 1
+    where t.Count > 1000
+),
+AnswerDetails as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerDate,
+        u.Id as OwnerUserId,
+        u.DisplayName,
+        u.Reputation,
+        row_number() over (partition by a.ParentId order by a.Score desc) as AnswerRank
+    from Posts a
+    left join Users u on u.Id = a.OwnerUserId
+    where a.PostTypeId = 2
+),
+BadgeCounts as (
+    select
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges
+    from Badges b
+    group by b.UserId
+),
+UserSummary as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        coalesce(bc.GoldBadges,0) as GoldBadges,
+        coalesce(bc.SilverBadges,0) as SilverBadges,
+        coalesce(bc.BronzeBadges,0) as BronzeBadges,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        case
+            when u.LastAccessDate > cast('2024-10-01' as date) - interval '30 day' then 'Active'
+            else 'Inactive'
+        end as ActivityStatus
+    from Users u
+    left join BadgeCounts bc on bc.UserId = u.Id
+),
+TopAnswersWithComments as (
+    select
+        a.AnswerId,
+        a.QuestionId,
+        a.AnswerScore,
+        a.AnswerDate,
+        a.DisplayName as AnswerOwner,
+        ccounts.CommentCount,
+        row_number() over (partition by a.QuestionId order by a.AnswerScore desc, ccounts.CommentCount desc) as RankByScoreAndComments
+    from AnswerDetails a
+    left join (
+        select PostId, count(*) as CommentCount
+        from Comments
+        group by PostId
+    ) ccounts on ccounts.PostId = a.AnswerId
+)
+select distinct
+    q.Id as QuestionId,
+    q.Title,
+    q.Score as QuestionScore,
+    q.ViewCount,
+    u.DisplayName as QuestionOwner,
+    u.Reputation as QuestionOwnerReputation,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    phc.PostHistoryTypeId as LatestCloseReopenType,
+    phc.CreationDate as LatestCloseReopenDate,
+    pc.LinkTypeId,
+    lt.Name as LinkTypeName,
+    t.TagName,
+    t.Count as TagPopularity,
+    ta.AnswerId,
+    ta.AnswerScore,
+    ta.AnswerOwner,
+    ta.CommentCount as AnswerCommentCount,
+    case
+        when ta.RankByScoreAndComments = 1 then 'Top Answer'
+        else 'Other Answer'
+    end as AnswerRankCategory,
+    us.ActivityStatus,
+    row_number() over (partition by q.Id order by ta.AnswerScore desc nulls last) as AnswersRank
+from Posts q
+join PostTypes pt on pt.Id = q.PostTypeId and pt.Name = 'Question'
+left join Users u on u.Id = q.OwnerUserId
+left join UserSummary us on us.Id = u.Id
+left join LatestPostHistories phc on phc.PostId = q.Id and phc.rn = 1
+left join PostLinks pc on pc.PostId = q.Id and pc.LinkTypeId in (1, 3)
+left join LinkTypes lt on lt.Id = pc.LinkTypeId
+left join TopTags t on q.Tags like concat('%<', t.TagName, '>%')
+left join TopAnswersWithComments ta on ta.QuestionId = q.Id
+where q.CreationDate >= cast('2024-10-01' as date) - interval '90 day'
+  and (phc.PostHistoryTypeId != 10 or phc.PostHistoryTypeId is null)
+  and us.Reputation > 1000
+union
+select
+    q.Id as QuestionId,
+    q.Title,
+    q.Score as QuestionScore,
+    q.ViewCount,
+    u.DisplayName as QuestionOwner,
+    u.Reputation as QuestionOwnerReputation,
+    0 as GoldBadges,
+    0 as SilverBadges,
+    0 as BronzeBadges,
+    null as LatestCloseReopenType,
+    null as LatestCloseReopenDate,
+    null as LinkTypeId,
+    null as LinkTypeName,
+    null as TagName,
+    null as TagPopularity,
+    null as AnswerId,
+    null as AnswerScore,
+    null as AnswerOwner,
+    null as AnswerCommentCount,
+    'No Answers' as AnswerRankCategory,
+    'Inactive' as ActivityStatus,
+    null as AnswersRank
+from Posts q
+join PostTypes pt on pt.Id = q.PostTypeId and pt.Name = 'Question'
+left join Users u on u.Id = q.OwnerUserId
+where q.CreationDate < cast('2024-10-01' as date) - interval '365 day'
+  and not exists (
+    select 1 from Posts a where a.ParentId = q.Id and a.PostTypeId = 2
+  )
+order by QuestionScore desc, ViewCount desc, LatestCloseReopenDate desc nulls last, TagPopularity desc nulls last, AnswerScore desc nulls last
+limit 100;

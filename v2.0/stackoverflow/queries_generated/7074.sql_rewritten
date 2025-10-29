@@ -1,0 +1,213 @@
+-- {"query": "7074.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1717} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        COUNT(DISTINCT c.Id) AS Comments,
+        COUNT(DISTINCT b.Id) AS Badges,
+        MAX(p.CreationDate) AS LastPostDate,
+        RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS PostRank,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS RepRank,
+        AVG(p.Score) AS AvgScore,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END) AS TotalViews
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopTags AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            ELSE 'Niche'
+        END AS TagCategory,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank
+    FROM Tags t
+    WHERE t.Count > 50
+),
+PostComplexity AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 
+                CASE 
+                    WHEN p.AnswerCount > 0 THEN 
+                        CASE 
+                            WHEN p.Score > 10 THEN 'Highly Engaged'
+                            WHEN p.Score > 5 THEN 'Engaged'
+                            ELSE 'Low Engagement'
+                        END
+                    ELSE 
+                        CASE 
+                            WHEN p.Score > 5 THEN 'Active Question'
+                            ELSE 'Inactive Question'
+                        END
+                END
+            WHEN p.PostTypeId = 2 THEN 
+                CASE 
+                    WHEN p.Score > 5 THEN 'High Quality Answer'
+                    ELSE 'Standard Answer'
+                END
+            ELSE 'Other'
+        END AS PostEngagement,
+        LENGTH(p.Body) AS BodyLength,
+        LENGTH(p.Title) AS TitleLength,
+        CHARINDEX('<code>', p.Body) AS CodeBlockCount,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags != '' THEN 
+                (SELECT COUNT(*) FROM unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS tag)
+            ELSE 0 
+        END AS TagCount,
+        CASE 
+            WHEN EXISTS (SELECT 1 FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (1, 2, 3)) 
+            THEN 'Edited'
+            ELSE 'Unedited'
+        END AS EditStatus
+    FROM Posts p
+    WHERE p.CreationDate >= '2020-01-01'
+),
+UserPostAnalysis AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.TotalPosts,
+        uas.Questions,
+        uas.Answers,
+        uas.Comments,
+        uas.Badges,
+        uas.LastPostDate,
+        uas.PostRank,
+        uas.RepRank,
+        uas.AvgScore,
+        uas.TotalViews,
+        CASE 
+            WHEN uas.TotalPosts > 100 THEN 'Active'
+            WHEN uas.TotalPosts > 50 THEN 'Moderately Active'
+            WHEN uas.TotalPosts > 10 THEN 'Occasional'
+            ELSE 'New'
+        END AS ActivityLevel,
+        PERCENT_RANK() OVER (ORDER BY uas.TotalPosts) AS ActivityPercentile
+    FROM UserActivityStats uas
+),
+RankedPosts AS (
+    SELECT 
+        pca.PostId,
+        pca.Title,
+        pca.Body,
+        pca.Score,
+        pca.ViewCount,
+        pca.AnswerCount,
+        pca.CommentCount,
+        pca.CreationDate,
+        pca.OwnerUserId,
+        pca.PostEngagement,
+        pca.BodyLength,
+        pca.TitleLength,
+        pca.CodeBlockCount,
+        pca.TagCount,
+        pca.EditStatus,
+        ROW_NUMBER() OVER (ORDER BY pca.Score DESC) AS ScoreRank,
+        DENSE_RANK() OVER (ORDER BY pca.ViewCount DESC) AS ViewRank,
+        NTILE(4) OVER (ORDER BY pca.Score DESC) AS ScoreQuartile
+    FROM PostComplexity pca
+)
+SELECT 
+    upa.UserId,
+    upa.DisplayName,
+    upa.Reputation,
+    upa.TotalPosts,
+    upa.Questions,
+    upa.Answers,
+    upa.Comments,
+    upa.Badges,
+    upa.LastPostDate,
+    upa.PostRank,
+    upa.RepRank,
+    upa.AvgScore,
+    upa.TotalViews,
+    upa.ActivityLevel,
+    upa.ActivityPercentile,
+    rp.PostId,
+    rp.Title,
+    rp.Body,
+    rp.Score,
+    rp.ViewCount,
+    rp.AnswerCount,
+    rp.CommentCount,
+    rp.CreationDate,
+    rp.PostEngagement,
+    rp.BodyLength,
+    rp.TitleLength,
+    rp.CodeBlockCount,
+    rp.TagCount,
+    rp.EditStatus,
+    rp.ScoreRank,
+    rp.ViewRank,
+    rp.ScoreQuartile,
+    tt.TagName,
+    tt.Count AS TagCount,
+    tt.TagCategory,
+    tt.TagRank,
+    CASE 
+        WHEN upa.Reputation > (SELECT AVG(Reputation) FROM Users) 
+        AND upa.TotalPosts > (SELECT AVG(TotalPosts) FROM UserActivityStats) 
+        THEN 'Above Average'
+        ELSE 'Below Average'
+    END AS PerformanceStatus,
+    COALESCE(upa.TotalViews, 0) + COALESCE(rp.ViewCount, 0) AS CombinedViews,
+    CASE 
+        WHEN rp.BodyLength > 1000 OR rp.TitleLength > 100 
+        THEN 'Detailed Content'
+        ELSE 'Brief Content'
+    END AS ContentDetail,
+    DATEDIFF(day, upa.LastPostDate, cast('2024-10-01 12:34:56' as timestamp)) AS DaysSinceLastPost,
+    CASE 
+        WHEN upa.Reputation >= 10000 THEN 'Elite'
+        WHEN upa.Reputation >= 1000 THEN 'Advanced'
+        WHEN upa.Reputation >= 100 THEN 'Intermediate'
+        ELSE 'Beginner'
+    END AS ReputationTier,
+    CASE 
+        WHEN EXISTS (
+            SELECT 1 
+            FROM Posts p 
+            WHERE p.OwnerUserId = upa.UserId 
+            AND p.Score > 10 
+            AND p.CreationDate >= '2022-01-01'
+        ) THEN 'High Performer'
+        ELSE 'Standard User'
+    END AS PerformanceCategory
+FROM UserPostAnalysis upa
+FULL OUTER JOIN RankedPosts rp ON upa.UserId = rp.OwnerUserId
+LEFT JOIN TopTags tt ON tt.TagRank = 1
+WHERE (upa.UserId IS NOT NULL OR rp.PostId IS NOT NULL)
+AND (
+    (upa.ActivityPercentile > 0.9 AND rp.ScoreQuartile = 1) 
+    OR (upa.TotalPosts > 50 AND rp.Score > 0)
+    OR (rp.EditStatus = 'Edited' AND tt.TagCategory = 'Popular')
+)
+ORDER BY 
+    COALESCE(upa.RepRank, 999999),
+    COALESCE(rp.ScoreRank, 999999),
+    COALESCE(tt.TagRank, 999999)
+LIMIT 1000;

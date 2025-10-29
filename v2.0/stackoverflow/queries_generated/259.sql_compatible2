@@ -1,0 +1,340 @@
+with params as (
+    select
+        date_trunc('month', cast('2024-10-01 12:34:56' as timestamp)) - interval '24 months' as start_month,
+        date_trunc('month', cast('2024-10-01 12:34:56' as timestamp)) as end_month
+),
+months as (
+    select generate_series(p.start_month, p.end_month, interval '1 month') as month_start
+    from params p
+),
+questions as (
+    select
+        q.Id as QuestionId,
+        q.OwnerUserId as AskerId,
+        cast(q.CreationDate as date) as QuestionDate,
+        coalesce(q.Score, 0) as QuestionScore,
+        coalesce(q.ViewCount, 0) as ViewCount,
+        q.Tags,
+        q.Title,
+        q.AcceptedAnswerId,
+        date_trunc('month', q.CreationDate) as month_start,
+        q.CreationDate,
+        q.Id
+    from Posts q
+    where q.PostTypeId = 1
+),
+answers as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId as AnswererId,
+        a.CreationDate as AnswerCreationDate,
+        coalesce(a.Score, 0) as AnswerScore,
+        case when a.Id = q.AcceptedAnswerId then 1 else 0 end as IsAccepted
+    from Posts a
+    join Posts q on q.Id = a.ParentId and q.PostTypeId = 1
+    where a.PostTypeId = 2
+),
+q_activity as (
+    select
+        q.QuestionId,
+        count(*) filter (where a.AnswerId is not null) as AnswerCount,
+        max(a.AnswerScore) as MaxAnswerScore,
+        sum(a.IsAccepted) as AcceptedCount,
+        min(a.AnswerCreationDate) as FirstAnswerDate,
+        max(a.AnswerCreationDate) as LastAnswerDate
+    from questions q
+    left join answers a on a.QuestionId = q.QuestionId
+    group by q.QuestionId
+),
+q_closures as (
+    select
+        ph.PostId as QuestionId,
+        min(ph.CreationDate) filter (where ph.PostHistoryTypeId = 10) as FirstClosedDate,
+        max(ph.CreationDate) filter (where ph.PostHistoryTypeId = 11) as LastReopenedDate,
+        count(*) filter (where ph.PostHistoryTypeId = 10) as CloseEvents,
+        count(*) filter (where ph.PostHistoryTypeId = 11) as ReopenEvents,
+        max(case when ph.PostHistoryTypeId = 10 then ph.Comment end) as AnyCloseReasonIdText
+    from PostHistory ph
+    join Posts q on q.Id = ph.PostId and q.PostTypeId = 1
+    where ph.PostHistoryTypeId in (10,11)
+    group by ph.PostId
+),
+q_votes as (
+    select
+        v.PostId as QuestionId,
+        count(*) filter (where v.VoteTypeId = 2) as UpVotes,
+        count(*) filter (where v.VoteTypeId = 3) as DownVotes,
+        count(*) filter (where v.VoteTypeId = 5) as Favorites,
+        sum(case when v.VoteTypeId in (8,9) then coalesce(v.BountyAmount,0) else 0 end) as BountyAmount,
+        min(v.CreationDate) as FirstVoteDate,
+        max(v.CreationDate) as LastVoteDate
+    from Votes v
+    join Posts q on q.Id = v.PostId and q.PostTypeId = 1
+    group by v.PostId
+),
+q_links as (
+    select
+        pl.PostId as QuestionId,
+        count(*) filter (where pl.LinkTypeId = 1) as LinkedOutCount,
+        count(*) filter (where pl.LinkTypeId = 3) as DuplicateOfCount,
+        count(*) as TotalLinks,
+        max(pl.CreationDate) as LastLinkDate
+    from PostLinks pl
+    group by pl.PostId
+),
+tag_expansion as (
+    select
+        q.QuestionId,
+        unnest(string_to_array(substring(q.Tags, 2, length(q.Tags)-2), '><')) as tag_name
+    from questions q
+    where q.Tags is not null and q.Tags like '<%>'
+),
+questioner as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.UpVotes,
+        u.DownVotes,
+        u.Views as ProfileViews,
+        u.CreationDate as UserCreationDate,
+        u.Location
+    from Users u
+),
+answerers as (
+    select
+        a.QuestionId,
+        a.AnswererId,
+        count(*) as AnswersByUser,
+        max(a.AnswerScore) as MaxAnswerScoreByUser,
+        sum(a.IsAccepted) as AcceptedCountByUser
+    from answers a
+    group by a.QuestionId, a.AnswererId
+),
+top_answerer as (
+    select distinct on (qa.QuestionId)
+        qa.QuestionId,
+        qa.AnswererId as TopAnswererId,
+        qa.AnswersByUser,
+        qa.MaxAnswerScoreByUser,
+        qa.AcceptedCountByUser
+    from answerers qa
+    order by qa.QuestionId, qa.AcceptedCountByUser desc, qa.MaxAnswerScoreByUser desc, qa.AnswersByUser desc, qa.AnswererId
+),
+question_windows as (
+    select
+        q.QuestionId,
+        q.AskerId,
+        q.QuestionDate,
+        q.QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        q.Title,
+        q.AcceptedAnswerId,
+        q.month_start as month_start,
+        q.CreationDate,
+        q.Id,
+        qa.AnswerCount,
+        qa.MaxAnswerScore,
+        qa.AcceptedCount,
+        qa.FirstAnswerDate,
+        qa.LastAnswerDate,
+        qv.UpVotes,
+        qv.DownVotes,
+        qv.Favorites,
+        qv.BountyAmount,
+        qv.FirstVoteDate,
+        qv.LastVoteDate,
+        ql.LinkedOutCount,
+        ql.DuplicateOfCount,
+        ql.TotalLinks,
+        ql.LastLinkDate,
+        qc.FirstClosedDate,
+        qc.LastReopenedDate,
+        qc.CloseEvents,
+        qc.ReopenEvents,
+        ta.TopAnswererId,
+        tawu.DisplayName as TopAnswererName,
+        tawu.Reputation as TopAnswererReputation,
+        qu.DisplayName as AskerName,
+        qu.Reputation as AskerReputation,
+        qu.Location as AskerLocation,
+        sum(coalesce(qv.UpVotes,0) - coalesce(qv.DownVotes,0)) over (partition by date_trunc('month', q.CreationDate)) as NetVotesPerMonth,
+        avg(coalesce(q.QuestionScore,0)) over (partition by date_trunc('month', q.CreationDate)) as AvgQuestionScorePerMonth,
+        rank() over (partition by date_trunc('month', q.CreationDate) order by coalesce(q.ViewCount,0) desc nulls last) as ViewRankInMonth,
+        dense_rank() over (order by coalesce(q.QuestionScore,0) desc, coalesce(q.ViewCount,0) desc, q.Id) as GlobalHotRank
+    from questions q
+    left join q_activity qa on qa.QuestionId = q.QuestionId
+    left join q_votes qv on qv.QuestionId = q.QuestionId
+    left join q_links ql on ql.QuestionId = q.QuestionId
+    left join q_closures qc on qc.QuestionId = q.QuestionId
+    left join top_answerer ta on ta.QuestionId = q.QuestionId
+    left join Users tawu on tawu.Id = ta.TopAnswererId
+    left join questioner qu on qu.UserId = q.AskerId
+),
+tag_stats as (
+    select
+        te.tag_name,
+        count(distinct te.QuestionId) as QuestionsWithTag,
+        sum(qw.ViewCount) as TotalViewsWithTag,
+        avg(qw.QuestionScore) as AvgScoreWithTag,
+        count(*) filter (where qw.AcceptedCount > 0) as QuestionsWithAcceptedAnswer,
+        count(*) filter (where qw.DuplicateOfCount > 0) as DuplicatesCount
+    from tag_expansion te
+    join question_windows qw on qw.QuestionId = te.QuestionId
+    group by te.tag_name
+),
+monthly as (
+    select
+        m.month_start,
+        count(qw.QuestionId) as QuestionsInMonth,
+        sum(qw.ViewCount) as ViewsInMonth,
+        avg(nullif(qw.AnswerCount,0)) as AvgAnswerCountNonZero,
+        count(qw.QuestionId) filter (where qw.FirstClosedDate is not null) as ClosedQuestions,
+        count(qw.QuestionId) filter (where qw.DuplicateOfCount > 0) as DuplicateLinkedQuestions,
+        percentile_cont(0.9) within group (order by coalesce(qw.ViewCount,0)) as P90Views,
+        percentile_cont(0.5) within group (order by coalesce(qw.QuestionScore,0)) as MedianScore
+    from months m
+    left join question_windows qw on qw.month_start = m.month_start
+    group by m.month_start
+),
+question_quality as (
+    select
+        qw.QuestionId,
+        qw.Title,
+        qw.Tags,
+        qw.AskerId,
+        qw.AskerName,
+        qw.AskerReputation,
+        qw.ViewCount,
+        qw.QuestionScore,
+        coalesce(qw.UpVotes,0) - coalesce(qw.DownVotes,0) as NetVotes,
+        coalesce(qw.AnswerCount,0) as AnswerCount,
+        case
+            when qw.AcceptedCount > 0 then 1
+            when qw.FirstClosedDate is not null then 0
+            when qw.DuplicateOfCount > 0 then 0
+            else null
+        end as HasGoodOutcome,
+        (
+            coalesce(qw.ViewCount,0) * 0.001
+            + coalesce(qw.QuestionScore,0) * 1.5
+            + greatest(coalesce(qw.UpVotes,0) - coalesce(qw.DownVotes,0), 0) * 0.8
+            + least(coalesce(qw.AnswerCount,0), 10) * 0.7
+            + case when qw.AcceptedCount > 0 then 3 else 0 end
+            - case when qw.FirstClosedDate is not null then 2 else 0 end
+            - case when qw.DuplicateOfCount > 0 then 1.5 else 0 end
+        ) as ComplexityScore
+    from question_windows qw
+),
+bench_source as (
+    select
+        qw.QuestionId,
+        qw.month_start,
+        qw.ViewCount,
+        qw.QuestionScore,
+        qw.NetVotesPerMonth,
+        qw.AvgQuestionScorePerMonth,
+        qw.ViewRankInMonth,
+        qw.GlobalHotRank,
+        qq.ComplexityScore,
+        qq.HasGoodOutcome,
+        coalesce(ts.QuestionsWithTag,0) as AnyTagQuestionCount,
+        coalesce(ts.AvgScoreWithTag,0) as AnyTagAvgScore,
+        coalesce(ts.DuplicatesCount,0) as AnyTagDupes
+    from question_windows qw
+    left join lateral (
+        select avg(ts.AvgScoreWithTag) as AvgScoreWithTag,
+               sum(ts.QuestionsWithTag) as QuestionsWithTag,
+               sum(ts.DuplicatesCount) as DuplicatesCount
+        from tag_expansion te
+        join tag_stats ts on ts.tag_name = te.tag_name
+        where te.QuestionId = qw.QuestionId
+    ) ts on true
+    join question_quality qq on qq.QuestionId = qw.QuestionId
+),
+per_user_activity as (
+    select
+        u.Id as UserId,
+        count(*) filter (where p.PostTypeId = 1) as QsAsked,
+        count(*) filter (where p.PostTypeId = 2) as AsAnswered,
+        sum(coalesce(p.Score,0)) as TotalPostScore,
+        max(p.LastActivityDate) as LastPostActivity
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id
+),
+dup_groups as (
+    select
+        q.QuestionId,
+        dense_rank() over (order by coalesce(ql.DuplicateOfCount,0) desc, q.QuestionId) as DuplicateGroupRank
+    from question_windows q
+    left join q_links ql on ql.QuestionId = q.QuestionId
+),
+final_ranked as (
+    select
+        b.*,
+        m.QuestionsInMonth,
+        m.ViewsInMonth,
+        m.P90Views,
+        m.MedianScore,
+        d.DuplicateGroupRank,
+        (
+            select extract(epoch from (min(a.AnswerCreationDate) - q.CreationDate))/86400.0
+            from Posts q
+            left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+            where q.Id = b.QuestionId
+            group by q.Id
+        ) as DaysToFirstAnswer,
+        upper(trim(regexp_replace(coalesce((select Title from Posts where Id = b.QuestionId), ''), '\s+', ' ', 'g'))) as NormalizedTitle
+    from bench_source b
+    left join monthly m on m.month_start = b.month_start
+    left join dup_groups d on d.QuestionId = b.QuestionId
+)
+select
+    fr.QuestionId,
+    fr.month_start,
+    fr.ViewCount,
+    fr.QuestionScore,
+    fr.NetVotesPerMonth,
+    fr.AvgQuestionScorePerMonth,
+    fr.ViewRankInMonth,
+    fr.GlobalHotRank,
+    fr.ComplexityScore,
+    fr.HasGoodOutcome,
+    fr.QuestionsInMonth,
+    fr.ViewsInMonth,
+    fr.P90Views,
+    fr.MedianScore,
+    fr.AnyTagQuestionCount,
+    fr.AnyTagAvgScore,
+    fr.AnyTagDupes,
+    fr.DuplicateGroupRank,
+    fr.DaysToFirstAnswer,
+    fr.NormalizedTitle,
+    cast(abs(mod(hashtext(coalesce(fr.NormalizedTitle,'')), 16)) as integer) as ShardBucket,
+    coalesce(
+        case when fr.HasGoodOutcome = 1 then 'Good'
+             when fr.QuestionScore >= 5 then 'Decent'
+             when fr.DuplicateGroupRank > 0 and fr.DuplicateGroupRank <= 10 then 'LikelyDuplicate'
+             when fr.ViewCount is null then 'Unknown'
+        end,
+        'Other'
+    ) as OutcomeLabel
+from final_ranked fr
+where
+    fr.month_start between (select start_month from params) and (select end_month from params)
+    and coalesce(fr.ViewCount, 0) >= coalesce(fr.P90Views, 0) / 3
+    and (
+        fr.ComplexityScore > 2
+        or (fr.HasGoodOutcome = 1 and fr.QuestionScore >= coalesce(fr.MedianScore, 0))
+        or (fr.ViewRankInMonth <= 50 and fr.GlobalHotRank <= 10000)
+    )
+    and not (fr.AnyTagDupes > 100 and fr.HasGoodOutcome = 0)
+order by
+    fr.month_start desc,
+    fr.ComplexityScore desc,
+    fr.ViewCount desc,
+    fr.QuestionId
+limit 1000;

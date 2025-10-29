@@ -1,0 +1,48 @@
+SELECT
+    u.Id AS UserId,
+    u.DisplayName AS UserName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS PostsCreated,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS Questions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS Answers,
+    AVG(p.Score) AS AvgPostScore,
+    MAX(p.LastActivityDate) AS LastActive,
+    STRING_AGG(DISTINCT t.Name, ',') FILTER (WHERE t.Name IS NOT NULL) AS TagsSubset,
+    COALESCE(b.TotalBadges, 0) AS TotalBadges,
+    COALESCE(v.Upvotes, 0) AS Upvotes,
+    COALESCE(v.Downvotes, 0) AS Downvotes
+FROM
+    Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN LATERAL (
+        SELECT STRING_AGG(tg.Name, ',') AS Name
+        FROM Tags tg
+        WHERE tg.Id IN (
+            SELECT CAST(x AS INTEGER)
+            FROM UNNEST(string_to_array(COALESCE(p.Tags, ''), ',')) AS x
+            WHERE COALESCE(x, '') <> ''
+        )
+    ) t ON TRUE
+    LEFT JOIN (
+        SELECT UserId, COUNT(*) AS TotalBadges
+        FROM Badges
+        GROUP BY UserId
+    ) b ON b.UserId = u.Id
+    LEFT JOIN (
+        SELECT
+            v.UserId,
+            SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS Upvotes,
+            SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS Downvotes
+        FROM Votes v
+        JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+        GROUP BY v.UserId
+    ) v ON v.UserId = u.Id
+WHERE
+    u.AccountId IS NOT NULL
+GROUP BY
+    u.Id, u.DisplayName, u.Reputation, u.AccountId, b.TotalBadges, v.Upvotes, v.Downvotes, u.Id, u.DisplayName, u.Reputation, u.AccountId
+HAVING
+    COUNT(p.Id) > 0
+ORDER BY
+    Upvotes DESC, LastActive DESC
+LIMIT 100;

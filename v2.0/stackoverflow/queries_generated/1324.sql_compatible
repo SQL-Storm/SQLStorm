@@ -1,0 +1,227 @@
+WITH UserPostStats AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostScore,
+        SUM(COALESCE(p.ViewCount, 0)) AS TotalPostViews,
+        AVG(COALESCE(p.Score, 0.0)) AS AvgPostScore,
+        AVG(COALESCE(p.ViewCount, 0.0)) AS AvgPostViews,
+        MAX(p.CreationDate) AS LatestPostDate,
+        MIN(p.CreationDate) AS EarliestPostDate
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+UserCommentStats AS (
+    SELECT
+        c.UserId,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        SUM(COALESCE(c.Score, 0)) AS TotalCommentScore,
+        AVG(COALESCE(c.Score, 0.0)) AS AvgCommentScore,
+        MAX(c.CreationDate) AS LatestCommentDate
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+    GROUP BY c.UserId
+),
+UserBadgeSummary AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        SUM(CASE WHEN b.TagBased = TRUE THEN 1 ELSE 0 END) AS TagBasedBadges,
+        COUNT(b.Id) AS TotalBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+PostEditAnalysis AS (
+    SELECT
+        ph.PostId,
+        ph.UserId AS EditorUserId,
+        ph.CreationDate AS EditDate,
+        ph.PostHistoryTypeId,
+        (ph.UserId IS NOT NULL AND ph.UserId <> (SELECT p.OwnerUserId FROM Posts p WHERE p.Id = ph.PostId LIMIT 1)) AS IsEditedByOtherUser
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6)
+),
+PostHistoryTimeline AS (
+    SELECT
+        ph.Id AS HistoryId,
+        ph.PostId,
+        ph.CreationDate AS EventDate,
+        ph.UserId AS ActorUserId,
+        ph.PostHistoryTypeId,
+        pht.Name AS HistoryTypeName,
+        CASE
+            WHEN ph.PostHistoryTypeId IN (1, 2, 3) THEN 'INITIAL_CONTENT'
+            WHEN ph.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9) THEN 'CONTENT_MODIFICATION'
+            WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20) THEN 'STATUS_CHANGE'
+            WHEN ph.PostHistoryTypeId IN (35, 36) THEN 'MIGRATION'
+            ELSE 'OTHER_ADMIN_EVENT'
+        END AS EventCategory,
+        LAG(ph.CreationDate, 1) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS PreviousEventDate,
+        LEAD(ph.CreationDate, 1) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS NextEventDate,
+        COALESCE(EXTRACT(EPOCH FROM (ph.CreationDate - LAG(ph.CreationDate, 1) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate))) / 3600, 0) AS HoursSincePreviousEvent
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+),
+PostInteractionMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.CommunityOwnedDate,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - p.CreationDate)) / (60 * 60 * 24) AS PostAgeDays,
+        COALESCE(NULLIF(p.AnswerCount, 0), 0) * 1.0 / COALESCE(NULLIF(p.ViewCount, 0), 1) AS AnswerToViewRatio,
+        COALESCE(NULLIF(p.FavoriteCount, 0), 0) * 1.0 / COALESCE(NULLIF(p.ViewCount, 0), 1) AS FavoriteToViewRatio,
+        COUNT(DISTINCT c.Id) AS TotalCommentsOnPost,
+        SUM(CASE WHEN c.UserId = p.OwnerUserId THEN 1 ELSE 0 END) AS OwnerCommentsOnPost,
+        (p.Tags LIKE '%<sql>%' OR p.Tags LIKE '%<database>%' OR p.Tags LIKE '%<postgresql>%') AS HasRelevantTag,
+        (SELECT COUNT(DISTINCT pea.EditorUserId)
+         FROM PostEditAnalysis pea
+         WHERE pea.PostId = p.Id AND pea.IsEditedByOtherUser = TRUE) AS OtherEditorsCount,
+        EXISTS (SELECT 1 FROM PostHistoryTimeline phtl WHERE phtl.PostId = p.Id AND phtl.EventCategory = 'STATUS_CHANGE' AND phtl.PostHistoryTypeId = 10) AS WasEverClosed,
+        (SELECT MAX(HoursSincePreviousEvent) FROM PostHistoryTimeline phtl WHERE phtl.PostId = p.Id) AS MaxHoursBetweenHistoryEvents
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= DATE '2020-01-01'
+      AND p.ViewCount > 500
+      AND p.AnswerCount > 2
+    GROUP BY p.Id, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.FavoriteCount, p.ClosedDate, p.CommunityOwnedDate, p.Tags
+),
+PostLinkSummary AS (
+    SELECT
+        pl.PostId,
+        SUM(CASE WHEN pl.LinkTypeId = 1 THEN 1 ELSE 0 END) AS LinkedFromCount,
+        SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicateOfCount,
+        COUNT(pl.RelatedPostId) AS TotalLinks
+    FROM PostLinks pl
+    GROUP BY pl.PostId
+),
+UserOverallEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.Views AS UserProfileViews,
+        u.UpVotes AS UserUpVotes,
+        u.DownVotes AS UserDownVotes,
+        COALESCE(ups.TotalPosts, 0) AS TotalPosts,
+        COALESCE(ups.TotalQuestions, 0) AS TotalQuestions,
+        COALESCE(ups.TotalAnswers, 0) AS TotalAnswers,
+        COALESCE(ucs.TotalComments, 0) AS TotalComments,
+        COALESCE(ubs.GoldBadges, 0) AS GoldBadges,
+        COALESCE(ubs.SilverBadges, 0) AS SilverBadges,
+        COALESCE(ubs.BronzeBadges, 0) AS BronzeBadges,
+        COALESCE(ubs.TotalBadges, 0) AS TotalBadges,
+        AVG(pim.PostScore) AS AvgEngagedQuestionScore,
+        AVG(pim.ViewCount) AS AvgEngagedQuestionViews,
+        AVG(pim.AnswerCount) AS AvgEngagedQuestionAnswers,
+        AVG(pim.AnswerToViewRatio) AS AvgEngagedQuestionAnswerToViewRatio,
+        AVG(pim.FavoriteToViewRatio) AS AvgEngagedQuestionFavoriteToViewRatio,
+        AVG(pim.OtherEditorsCount) AS AvgEngagedQuestionOtherEditors,
+        SUM(CASE WHEN pim.WasEverClosed THEN 1 ELSE 0 END) AS ClosedEngagedQuestionsCount,
+        COUNT(DISTINCT pim.PostId) AS TotalEngagedQuestions,
+        SUM(COALESCE(pls.LinkedFromCount, 0)) AS TotalLinkedQuestionsForUser,
+        SUM(COALESCE(pls.DuplicateOfCount, 0)) AS TotalDuplicateQuestionsForUser,
+        (u.Reputation * 0.4) + (COALESCE(ups.TotalPosts, 0) * 0.05) + (COALESCE(ucs.TotalComments, 0) * 0.05)
+        + (COALESCE(ubs.TotalBadges, 0) * 0.1) + (COALESCE(AVG(pim.PostScore), 0) * 0.1)
+        + (COALESCE(AVG(pim.AnswerToViewRatio), 0) * 100) + (COALESCE(SUM(ubs.GoldBadges), 0) * 0.2) AS CompositeActivityScore,
+        CASE
+            WHEN u.Reputation >= 200000 THEN 'Legend'
+            WHEN u.Reputation >= 75000 THEN 'Grandmaster'
+            WHEN u.Reputation >= 25000 THEN 'Master'
+            WHEN u.Reputation >= 5000 THEN 'Advanced'
+            WHEN u.Reputation >= 1000 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END AS ReputationTier,
+        (u.LastAccessDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '60 days' OR u.LastAccessDate IS NULL) AS IsRecentlyActive
+    FROM Users u
+    LEFT JOIN UserPostStats ups ON u.Id = ups.UserId
+    LEFT JOIN UserCommentStats ucs ON u.Id = ucs.UserId
+    LEFT JOIN UserBadgeSummary ubs ON u.Id = ubs.UserId
+    LEFT JOIN PostInteractionMetrics pim ON u.Id = pim.OwnerUserId
+    LEFT JOIN PostLinkSummary pls ON pim.PostId = pls.PostId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes,
+        ups.TotalPosts, ups.TotalQuestions, ups.TotalAnswers, ucs.TotalComments,
+        ubs.GoldBadges, ubs.SilverBadges, ubs.BronzeBadges, ubs.TotalBadges
+    HAVING COUNT(DISTINCT pim.PostId) >= 5
+),
+UserRankedActivity AS (
+    SELECT
+        UserId,
+        DisplayName,
+        Reputation,
+        ReputationTier,
+        TotalPosts,
+        TotalQuestions,
+        TotalAnswers,
+        TotalComments,
+        GoldBadges,
+        SilverBadges,
+        BronzeBadges,
+        TotalBadges,
+        AvgEngagedQuestionScore,
+        AvgEngagedQuestionViews,
+        CompositeActivityScore,
+        IsRecentlyActive,
+        RANK() OVER (ORDER BY CompositeActivityScore DESC) AS RankByCompositeScore,
+        NTILE(5) OVER (ORDER BY Reputation DESC) AS ReputationQuintile,
+        LAG(Reputation, 1, 0) OVER (ORDER BY CompositeActivityScore DESC) AS PrevRankReputation,
+        LEAD(DisplayName, 1) OVER (ORDER BY CompositeActivityScore DESC) AS NextRankDisplayName,
+        COALESCE((SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = uoe.UserId AND p.PostTypeId IN (1,2) GROUP BY p.OwnerUserId), 0.0) AS OverallAvgPostScore,
+        (SELECT COUNT(DISTINCT u2.Id) FROM UserOverallEngagement u2 WHERE u2.ReputationTier = uoe.ReputationTier) AS UsersInReputationTier
+    FROM UserOverallEngagement uoe
+),
+TopTagsForUsers AS (
+    SELECT
+        u.UserId,
+        tag AS Tag,
+        COUNT(*) AS TagCount
+    FROM UserOverallEngagement u
+    JOIN PostInteractionMetrics p ON p.OwnerUserId = u.UserId
+    CROSS JOIN LATERAL (
+        SELECT TRIM(both '<>' FROM tag_item) AS tag
+        FROM (
+            SELECT regexp_split_to_table(p.Tags, '><') AS tag_item
+        ) s
+    ) t
+    GROUP BY u.UserId, tag
+),
+TopTagRanked AS (
+    SELECT
+        UserId,
+        Tag,
+        TagCount,
+        RANK() OVER (PARTITION BY UserId ORDER BY TagCount DESC) AS TagRank
+    FROM TopTagsForUsers
+)
+SELECT
+    ura.UserId,
+    ura.DisplayName,
+    ura.Reputation,
+    ura.ReputationTier,
+    ura.CompositeActivityScore,
+    ura.RankByCompositeScore,
+    ura.ReputationQuintile,
+    ura.PrevRankReputation,
+    ura.NextRankDisplayName,
+    ura.OverallAvgPostScore,
+    ura.UsersInReputationTier,
+    tr.Tag AS TopTag,
+    tr.TagCount AS TopTagCount
+FROM UserRankedActivity ura
+LEFT JOIN TopTagRanked tr ON ura.UserId = tr.UserId AND tr.TagRank = 1
+ORDER BY ura.RankByCompositeScore
+;

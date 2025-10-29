@@ -1,0 +1,331 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        MAX(b.Date) AS LastBadgeDate,
+        MAX(v.CreationDate) AS LastVoteDate,
+        CASE WHEN COUNT(DISTINCT p.Id) > 0 THEN 1 ELSE 0 END AS HasPosts,
+        CASE WHEN COUNT(DISTINCT c.Id) > 0 THEN 1 ELSE 0 END AS HasComments,
+        CASE WHEN COUNT(DISTINCT b.Id) > 0 THEN 1 ELSE 0 END AS HasBadges,
+        CASE WHEN COUNT(DISTINCT v.Id) > 0 THEN 1 ELSE 0 END AS HasVotes
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    GROUP BY u.Id, u.Reputation, u.CreationDate, u.DisplayName
+),
+TopUsersByReputation AS (
+    SELECT 
+        UserId,
+        Reputation,
+        PostCount,
+        CommentCount,
+        BadgeCount,
+        VoteCount,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC) AS rn
+    FROM UserActivityStats
+    WHERE HasPosts = 1 AND HasComments = 1
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        p.ParentId,
+        p.AcceptedAnswerId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END AS PostType,
+        CASE 
+            WHEN p.Score >= 100 THEN 'High'
+            WHEN p.Score >= 50 THEN 'Medium'
+            ELSE 'Low'
+        END AS ScoreCategory,
+        CAST((JULIANDAY('2024-10-01 12:34:56') - JULIANDAY(p.CreationDate)) AS INTEGER) AS AgeInDays,
+        CASE 
+            WHEN p.AnswerCount = 0 AND p.PostTypeId = 1 THEN 'No Answers'
+            WHEN p.AnswerCount > 0 AND p.PostTypeId = 1 THEN 'Has Answers'
+            ELSE 'N/A'
+        END AS AnswerStatus,
+        COALESCE(p.Tags, '') AS TagsValue,
+        LENGTH(COALESCE(p.Tags, '')) AS TagsLength
+    FROM Posts p
+),
+ComplexAnalytics AS (
+    SELECT 
+        pa.PostId,
+        pa.PostTypeId,
+        pa.Score,
+        pa.ViewCount,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.FavoriteCount,
+        pa.CreationDate,
+        pa.Title,
+        pa.Tags,
+        pa.OwnerUserId,
+        pa.ParentId,
+        pa.AcceptedAnswerId,
+        pa.PostType,
+        pa.ScoreCategory,
+        pa.AgeInDays,
+        pa.AnswerStatus,
+        pa.TagsValue,
+        pa.TagsLength,
+        DENSE_RANK() OVER (ORDER BY pa.Score DESC) AS ScoreRank,
+        PERCENT_RANK() OVER (ORDER BY pa.ViewCount) AS ViewPercentile,
+        COALESCE(
+            (SELECT b.Name 
+             FROM Badges b 
+             WHERE b.UserId = pa.OwnerUserId 
+             ORDER BY b.Date DESC
+             LIMIT 1), 
+            'No Badge'
+        ) AS TopBadge,
+        COALESCE(
+            (SELECT COUNT(*) 
+             FROM Posts p2 
+             WHERE p2.OwnerUserId = pa.OwnerUserId 
+             AND p2.PostTypeId = 1), 
+            0
+        ) AS QuestionsPosted,
+        CASE 
+            WHEN pa.TagsValue LIKE '%<c>%<c>%' THEN 'Multiple C Tags'
+            WHEN pa.TagsValue LIKE '%<c>%' THEN 'Single C Tag'
+            WHEN pa.TagsValue LIKE '%<python>%<python>%' THEN 'Multiple Python Tags'
+            ELSE 'Other'
+        END AS TagPattern,
+        CASE 
+            WHEN pa.AnswerCount > 0 AND pa.Score >= 10 THEN 'High Engagement'
+            WHEN pa.AnswerCount > 0 AND pa.Score < 10 THEN 'Moderate Engagement'
+            WHEN pa.AnswerCount = 0 AND pa.Score >= 10 THEN 'Unanswered High Score'
+            ELSE 'Low Engagement'
+        END AS EngagementLevel
+    FROM PostAnalysis pa
+),
+UserPostSummary AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        SUM(p.Score) AS TotalScore,
+        AVG(p.Score) AS AvgScore,
+        MAX(p.CreationDate) AS LastActivity,
+        GROUP_CONCAT(COALESCE(p.Title, 'No Title') , ' | ') AS PostTitles,
+        GROUP_CONCAT(COALESCE(p.Tags, 'No Tags') , ' || ') AS PostTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+FinalReport AS (
+    SELECT 
+        t1.UserId,
+        t1.Reputation,
+        t1.PostCount,
+        t1.CommentCount,
+        t1.BadgeCount,
+        t1.VoteCount,
+        t2.PostId,
+        t2.PostTypeId,
+        t2.Score,
+        t2.ViewCount,
+        t2.AnswerCount,
+        t2.CommentCount,
+        t2.FavoriteCount,
+        t2.CreationDate,
+        t2.Title,
+        t2.Tags,
+        t2.PostType,
+        t2.ScoreCategory,
+        t2.AgeInDays,
+        t2.AnswerStatus,
+        t2.TagsValue,
+        t2.TagsLength,
+        t2.ScoreRank,
+        t2.ViewPercentile,
+        t2.TopBadge,
+        t2.QuestionsPosted,
+        t2.TagPattern,
+        t2.EngagementLevel,
+        uss.TotalPosts,
+        uss.Questions,
+        uss.Answers,
+        uss.TotalScore,
+        uss.AvgScore,
+        uss.LastActivity,
+        uss.PostTitles,
+        uss.PostTags,
+        CASE 
+            WHEN t1.PostCount > 50 THEN 'High Activity'
+            WHEN t1.PostCount > 20 THEN 'Medium Activity'
+            WHEN t1.PostCount > 5 THEN 'Low Activity'
+            ELSE 'Very Low Activity'
+        END AS ActivityLevel,
+        CASE 
+            WHEN t1.VoteCount > 100 THEN 'High Voter'
+            WHEN t1.VoteCount > 50 THEN 'Medium Voter'
+            WHEN t1.VoteCount > 10 THEN 'Low Voter'
+            ELSE 'Minimal Voter'
+        END AS VotingActivity,
+        ROW_NUMBER() OVER (PARTITION BY t1.UserId ORDER BY t2.CreationDate DESC) AS PostSequence,
+        LAG(t2.Score, 1) OVER (PARTITION BY t1.UserId ORDER BY t2.CreationDate) AS PreviousScore,
+        LEAD(t2.Score, 1) OVER (PARTITION BY t1.UserId ORDER BY t2.CreationDate) AS NextScore,
+        AVG(t2.Score) OVER (PARTITION BY t1.UserId) AS UserAvgScore,
+        MAX(t2.Score) OVER (PARTITION BY t1.UserId) AS UserMaxScore,
+        MIN(t2.Score) OVER (PARTITION BY t1.UserId) AS UserMinScore
+    FROM TopUsersByReputation t1
+    INNER JOIN ComplexAnalytics t2 ON t1.UserId = t2.OwnerUserId
+    LEFT JOIN UserPostSummary uss ON t1.UserId = uss.UserId
+)
+SELECT 
+    fr.UserId,
+    fr.Reputation,
+    fr.PostCount,
+    fr.CommentCount,
+    fr.BadgeCount,
+    fr.VoteCount,
+    fr.PostId,
+    fr.PostTypeId,
+    fr.Score,
+    fr.ViewCount,
+    fr.AnswerCount,
+    fr.CommentCount,
+    fr.FavoriteCount,
+    fr.CreationDate,
+    fr.Title,
+    fr.Tags,
+    fr.PostType,
+    fr.ScoreCategory,
+    fr.AgeInDays,
+    fr.AnswerStatus,
+    fr.TagsValue,
+    fr.TagsLength,
+    fr.ScoreRank,
+    fr.ViewPercentile,
+    fr.TopBadge,
+    fr.QuestionsPosted,
+    fr.TagPattern,
+    fr.EngagementLevel,
+    fr.TotalPosts,
+    fr.Questions,
+    fr.Answers,
+    fr.TotalScore,
+    fr.AvgScore,
+    fr.LastActivity,
+    fr.PostTitles,
+    fr.PostTags,
+    fr.ActivityLevel,
+    fr.VotingActivity,
+    fr.PostSequence,
+    fr.PreviousScore,
+    fr.NextScore,
+    fr.UserAvgScore,
+    fr.UserMaxScore,
+    fr.UserMinScore,
+    CASE 
+        WHEN fr.Score > fr.UserAvgScore THEN 'Above Average'
+        WHEN fr.Score < fr.UserAvgScore THEN 'Below Average'
+        ELSE 'Average'
+    END AS ScorePerformance,
+    CASE 
+        WHEN fr.ScoreRank <= 10 THEN 'Top 10'
+        WHEN fr.ScoreRank <= 50 THEN 'Top 50'
+        WHEN fr.ScoreRank <= 100 THEN 'Top 100'
+        ELSE 'Beyond Top 100'
+    END AS ScoreRanking,
+    CASE 
+        WHEN fr.ViewPercentile >= 0.9 THEN 'Top 10% Viewed'
+        WHEN fr.ViewPercentile >= 0.75 THEN 'Top 25% Viewed'
+        WHEN fr.ViewPercentile >= 0.5 THEN 'Top 50% Viewed'
+        ELSE 'Below 50% Viewed'
+    END AS ViewPerformance,
+    DATETIME(fr.CreationDate, '+30 days') AS ThirtyDayFuture,
+    CASE 
+        WHEN CAST((JULIANDAY('2024-10-01 12:34:56') - JULIANDAY(fr.CreationDate)) AS INTEGER) > 365 THEN 'Active Long-Term'
+        WHEN CAST((JULIANDAY('2024-10-01 12:34:56') - JULIANDAY(fr.CreationDate)) AS INTEGER) > 180 THEN 'Active Medium-Term'
+        WHEN CAST((JULIANDAY('2024-10-01 12:34:56') - JULIANDAY(fr.CreationDate)) AS INTEGER) > 30 THEN 'Active Short-Term'
+        ELSE 'New User'
+    END AS UserTenure,
+    CASE 
+        WHEN fr.AnswerStatus = 'Has Answers' AND fr.ScoreCategory = 'High' THEN 'Popular Question with Answers'
+        WHEN fr.AnswerStatus = 'No Answers' AND fr.ScoreCategory = 'High' THEN 'Popular Unanswered'
+        WHEN fr.AnswerStatus = 'Has Answers' AND fr.ScoreCategory = 'Low' THEN 'Low Score Question with Answers'
+        ELSE 'Other'
+    END AS PostClassification,
+    LENGTH(fr.PostTitles) AS PostTitlesLength,
+    REVERSE(fr.PostTitles) AS ReversePostTitles,
+    REPLACE(fr.PostTitles, ' ', '-') AS PostTitlesHyphenated,
+    CASE 
+        WHEN fr.TagsValue IS NOT NULL AND LENGTH(fr.TagsValue) > 0 THEN 
+            SUBSTR(fr.TagsValue, 2, LENGTH(fr.TagsValue) - 2)
+        ELSE NULL
+    END AS TagsArray,
+    SUBSTR(fr.TagsValue, 2, LENGTH(fr.TagsValue) - 2) AS ExtractedTags,
+    CASE 
+        WHEN COUNT(*) OVER (PARTITION BY fr.UserId) = 1 THEN 'Only Post'
+        WHEN COUNT(*) OVER (PARTITION BY fr.UserId) > 10 THEN 'Many Posts'
+        ELSE 'Few Posts'
+    END AS PostVolumeIndicator,
+    COALESCE(fr.PreviousScore, 0) - COALESCE(fr.NextScore, 0) AS ScoreDifference,
+    CASE 
+        WHEN fr.Score >= 100 THEN 'Hot'
+        WHEN fr.Score >= 50 THEN 'Warm'
+        WHEN fr.Score >= 10 THEN 'Cool'
+        ELSE 'Cold'
+    END AS PostTemperature,
+    ABS(fr.Score - fr.UserAvgScore) AS ScoreDeviationFromUserAvg,
+    CASE 
+        WHEN fr.AgeInDays > 0 THEN CAST(fr.Score AS REAL) / CAST(fr.AgeInDays AS REAL)
+        ELSE 0
+    END AS ScorePerDay,
+    CASE 
+        WHEN fr.TagsLength > 0 THEN 
+            ROUND(CAST(fr.TagsLength AS REAL) / CAST(COUNT(*) OVER (PARTITION BY fr.UserId) AS REAL), 2)
+        ELSE 0
+    END AS AvgTagsPerPost,
+    CASE 
+        WHEN fr.ViewCount > 0 THEN CAST(fr.Score AS REAL) / CAST(fr.ViewCount AS REAL)
+        ELSE 0
+    END AS ScoreToViewRatio,
+    CASE 
+        WHEN fr.Score > 0 AND fr.ViewCount > 0 THEN 
+            CASE 
+                WHEN CAST(fr.ViewCount AS REAL) / CAST(fr.Score AS REAL) >= 10 THEN 'High Views Per Score'
+                WHEN CAST(fr.ViewCount AS REAL) / CAST(fr.Score AS REAL) >= 5 THEN 'Medium Views Per Score'
+                ELSE 'Low Views Per Score'
+            END
+        ELSE 'No Views'
+    END AS ViewScoreRatioCategory
+FROM FinalReport fr
+WHERE fr.PostId IS NOT NULL
+    AND fr.UserId IN (
+        SELECT UserId FROM TopUsersByReputation WHERE rn <= 100
+    )
+    AND fr.CreationDate >= DATETIME('2024-10-01 12:34:56', '-2 years')
+    AND (fr.Score > 0 OR fr.ViewCount > 0)
+ORDER BY fr.UserId, fr.CreationDate DESC
+LIMIT 500 OFFSET 1000;

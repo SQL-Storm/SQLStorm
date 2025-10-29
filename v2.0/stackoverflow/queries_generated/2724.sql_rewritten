@@ -1,0 +1,148 @@
+-- {"query": "2724.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1270} 
+WITH RecursiveTagHierarchy AS (
+    -- Build a recursive tag hierarchy with parent tag counts summed up
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 AS Level,
+        ARRAY[t.TagName] AS TagPath
+    FROM Tags t
+    WHERE t.IsRequired = 0
+
+    UNION ALL
+
+    SELECT
+        c.Id,
+        c.TagName,
+        c.Count + p.Count AS Count,
+        p.Level + 1 AS Level,
+        p.TagPath || c.TagName
+    FROM Tags c
+    JOIN Tags p ON c.WikiPostId = p.ExcerptPostId
+    JOIN RecursiveTagHierarchy r ON p.Id = r.Id
+    WHERE c.IsModeratorOnly = 0
+),
+FilteredBadges AS (
+    -- Badges earned by high reputation users in last 3 years
+    SELECT
+        b.UserId,
+        b.Name AS BadgeName,
+        b.Class,
+        b.Date,
+        u.Reputation,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC) AS rn
+    FROM Badges b
+    JOIN Users u ON b.UserId = u.Id
+    WHERE u.Reputation > 10000
+      AND b.Date >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '3 year'
+),
+UserTopBadges AS (
+    -- Get most recent badge per high rep user
+    SELECT UserId, BadgeName, Class, Date
+    FROM FilteredBadges
+    WHERE rn = 1
+),
+RecentTopPosts AS (
+    -- Select recent questions with highest scores and complex tag logic
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        u.DisplayName AS OwnerName,
+        u.Reputation AS OwnerRep,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.Score DESC, p.ViewCount DESC) AS rn
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year'
+      AND p.Score > 10
+      AND p.Tags IS NOT NULL
+),
+PostCommentAggregates AS (
+    -- Aggregate comment scores and counts per post with correlating
+    SELECT
+        p.Id AS PostId,
+        COALESCE(SUM(c.Score),0) AS TotalCommentScore,
+        COUNT(c.Id) AS CommentCount,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM Posts p
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    GROUP BY p.Id
+),
+AcceptedAnswerInfo AS (
+    -- Fetch accepted answer info for questions including answer author reputation and score
+    SELECT
+        q.Id AS QuestionId,
+        q.AcceptedAnswerId,
+        a.OwnerUserId AS AnswerOwnerId,
+        u.Reputation AS AnswerOwnerRep,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerCreationDate
+    FROM Posts q
+    LEFT JOIN Posts a ON q.AcceptedAnswerId = a.Id
+    LEFT JOIN Users u ON a.OwnerUserId = u.Id
+    WHERE q.PostTypeId = 1
+),
+PostLinksAndDuplicates AS (
+    -- Fetch posts linked and duplicates count by link types with strings concatenation
+    SELECT
+        p.Id AS PostId,
+        COUNT(DISTINCT pl.Id) FILTER (WHERE lt.Name = 'Linked') AS LinkedCount,
+        COUNT(DISTINCT pl.Id) FILTER (WHERE lt.Name = 'Duplicate') AS DuplicateCount,
+        STRING_AGG(DISTINCT lt.Name, ',') AS LinkTypesInvolved
+    FROM Posts p
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id OR pl.RelatedPostId = p.Id
+    LEFT JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    GROUP BY p.Id
+)
+SELECT
+    rtp.PostId,
+    rtp.Title,
+    rtp.Score,
+    rtp.ViewCount,
+    rtp.Tags,
+    rtp.OwnerName,
+    rtp.OwnerRep,
+    ua.BadgeName AS OwnerTopBadge,
+    pca.TotalCommentScore,
+    pca.CommentCount,
+    pca.LastCommentDate,
+    aa.AnswerOwnerId,
+    aa.AnswerOwnerRep,
+    aa.AnswerScore,
+    aa.AnswerCreationDate,
+    pla.LinkedCount,
+    pla.DuplicateCount,
+    pla.LinkTypesInvolved,
+    CASE
+        WHEN rtp.ViewCount > 10000 THEN 'High View'
+        WHEN rtp.Score > 100 THEN 'High Score'
+        ELSE 'Normal'
+    END AS PostClassification,
+    -- Complex string manipulations and null logic combining badges and comments info
+    COALESCE(
+        'TopBadge: ' || COALESCE(ua.BadgeName, 'None') || ' / Comments: ' || COALESCE(pca.CommentCount::TEXT, '0'),
+        'NoData'
+    ) AS SummaryInfo,
+    -- Window function to rank posts by popularity within owner's badges
+    RANK() OVER (PARTITION BY ua.BadgeName ORDER BY rtp.Score DESC, pca.TotalCommentScore DESC) AS PopularityRank
+FROM RecentTopPosts rtp
+LEFT JOIN UserTopBadges ua ON rtp.OwnerUserId = ua.UserId
+LEFT JOIN PostCommentAggregates pca ON rtp.PostId = pca.PostId
+LEFT JOIN AcceptedAnswerInfo aa ON rtp.PostId = aa.QuestionId
+LEFT JOIN PostLinksAndDuplicates pla ON rtp.PostId = pla.PostId
+WHERE rtp.rn <= 5
+  AND (
+      EXISTS (
+          SELECT 1 FROM RecursiveTagHierarchy rth
+          WHERE rtp.Tags LIKE '%' || rth.TagName || '%'
+          AND rth.Level <= 3
+          AND (rth.Count > 5000 OR rtp.Score > 50)
+      )
+      OR pla.DuplicateCount > 0
+  )
+ORDER BY PopularityRank, rtp.Score DESC, pca.TotalCommentScore DESC
+LIMIT 50;

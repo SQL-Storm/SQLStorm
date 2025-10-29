@@ -1,0 +1,329 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.LastActivityDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as avg_score,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.Score > 10 THEN 'High_Question'
+            WHEN p.PostTypeId = 2 AND p.Score > 5 THEN 'High_Answer'
+            ELSE 'Normal'
+        END as post_category,
+        COALESCE(p.Tags, '') as clean_tags
+    FROM Posts p
+    WHERE p.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2' YEAR)
+),
+UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as total_posts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as question_count,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as answer_count,
+        SUM(COALESCE(p.Score, 0)) as total_score,
+        AVG(COALESCE(p.Score, 0)) as avg_score,
+        MAX(p.CreationDate) as last_post_date
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            ELSE 'Niche'
+        END as tag_popularity,
+        DENSE_RANK() OVER (ORDER BY t.Count DESC) as popularity_rank,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as rn
+    FROM Tags t
+    WHERE t.Count > 10
+),
+PostActivity AS (
+    SELECT 
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.UserId,
+        ph.CreationDate,
+        ph.Comment,
+        ph.Text,
+        CASE 
+            WHEN ph.PostHistoryTypeId IN (1, 4, 6) THEN 'Title/Tag Edit'
+            WHEN ph.PostHistoryTypeId IN (2, 5) THEN 'Content Edit'
+            WHEN ph.PostHistoryTypeId IN (10, 11) THEN 'Close/Reopen'
+            ELSE 'Other'
+        END as activity_type,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) as latest_activity,
+        CAST((CAST('2024-10-01 12:34:56' AS TIMESTAMP) - ph.CreationDate) AS INTERVAL) as interval_since_edit,
+        EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - ph.CreationDate))::INT as days_since_edit,
+        LAG(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) as prev_edit_date
+    FROM PostHistory ph
+    WHERE ph.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6' MONTH) AND ph.PostHistoryTypeId IN (1, 2, 4, 5, 6, 10, 11)
+),
+CombinedData AS (
+    SELECT 
+        rp.Id as PostId,
+        rp.OwnerUserId,
+        rp.Score,
+        rp.ViewCount,
+        rp.CreationDate,
+        rp.Title,
+        rp.Tags,
+        rp.AnswerCount,
+        rp.CommentCount,
+        rp.FavoriteCount,
+        rp.post_category,
+        rp.prev_score,
+        rp.avg_score,
+        us.Reputation,
+        us.DisplayName,
+        us.total_posts,
+        us.question_count,
+        us.answer_count,
+        us.total_score,
+        us.avg_score as user_avg_score,
+        ta.TagName,
+        ta.Count as tag_count,
+        ta.tag_popularity,
+        ta.popularity_rank,
+        pa.activity_type,
+        pa.days_since_edit,
+        pa.latest_activity,
+        CASE 
+            WHEN rp.Score > 0 AND rp.ViewCount > 0 THEN CAST(rp.Score AS DOUBLE PRECISION) / CAST(rp.ViewCount AS DOUBLE PRECISION)
+            ELSE 0
+        END as score_to_view_ratio,
+        CASE 
+            WHEN rp.Score > 0 AND rp.AnswerCount > 0 THEN CAST(rp.Score AS DOUBLE PRECISION) / CAST(rp.AnswerCount AS DOUBLE PRECISION)
+            ELSE 0
+        END as score_to_answer_ratio,
+        CASE 
+            WHEN rp.Tags IS NOT NULL AND CHAR_LENGTH(rp.Tags) > 0 THEN 
+                TRIM(BOTH ' ' FROM SUBSTRING(rp.Tags FROM 2 FOR CHAR_LENGTH(rp.Tags) - 2))
+            ELSE ''
+        END as parsed_tags,
+        CASE 
+            WHEN rp.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN rp.LastActivityDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '7' DAY) THEN 'Active'
+            ELSE 'Inactive'
+        END as post_status,
+        EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - rp.CreationDate))::INT as age_days,
+        COALESCE(rp.ClosedDate, rp.LastActivityDate) as last_event_date
+    FROM RankedPosts rp
+    INNER JOIN UserStats us ON rp.OwnerUserId = us.UserId
+    LEFT JOIN TagAnalysis ta ON EXISTS (
+        SELECT 1 FROM (
+            SELECT regexp_split_to_table(COALESCE(rp.Tags, ''), '>') as value
+        ) s 
+        WHERE s.value ILIKE '%' || ta.TagName || '%'
+    )
+    LEFT JOIN PostActivity pa ON rp.Id = pa.PostId AND pa.latest_activity = 1
+    WHERE rp.rn = 1
+),
+TopPerformers AS (
+    SELECT 
+        cd.PostId,
+        cd.OwnerUserId,
+        cd.Title,
+        cd.Score,
+        cd.ViewCount,
+        cd.Reputation,
+        cd.DisplayName,
+        cd.total_posts,
+        cd.question_count,
+        cd.answer_count,
+        cd.total_score,
+        cd.avg_score,
+        cd.tag_count,
+        cd.tag_popularity,
+        cd.score_to_view_ratio,
+        cd.score_to_answer_ratio,
+        cd.age_days,
+        cd.last_event_date,
+        cd.post_status,
+        cd.post_category,
+        ROW_NUMBER() OVER (ORDER BY cd.total_score DESC, cd.Score DESC) as rank_by_score
+    FROM CombinedData cd
+    WHERE cd.Score > 0 AND cd.ViewCount > 0
+),
+TopSet1 AS (
+    SELECT 
+        tp.PostId,
+        tp.OwnerUserId,
+        tp.Title,
+        tp.Score,
+        tp.ViewCount,
+        tp.Reputation,
+        tp.DisplayName,
+        tp.total_posts,
+        tp.question_count,
+        tp.answer_count,
+        tp.total_score,
+        tp.avg_score,
+        tp.tag_count,
+        tp.tag_popularity,
+        tp.score_to_view_ratio,
+        tp.score_to_answer_ratio,
+        tp.age_days,
+        tp.last_event_date,
+        tp.post_status,
+        tp.post_category,
+        CASE 
+            WHEN tp.rank_by_score <= 10 THEN 'Top 10'
+            WHEN tp.rank_by_score <= 50 THEN 'Top 50'
+            ELSE 'Other'
+        END as performance_category,
+        CASE 
+            WHEN tp.total_score > (SELECT AVG(total_score) FROM TopPerformers) * 1.5 THEN 'High Performer'
+            WHEN tp.total_score > (SELECT AVG(total_score) FROM TopPerformers) THEN 'Above Average'
+            ELSE 'Average or Below'
+        END as performance_level,
+        (SELECT COUNT(*) FROM TopPerformers tp2 WHERE tp2.OwnerUserId = tp.OwnerUserId) as user_post_count,
+        (SELECT string_agg(t.TagName, ', ') 
+         FROM Tags t 
+         WHERE EXISTS (
+             SELECT 1 FROM (
+                 SELECT regexp_split_to_table(tp.Title || ' ' || COALESCE(tp.Tags, ''), ' ') as value
+             ) s 
+             WHERE s.value ILIKE '%' || t.TagName || '%'
+         )
+        ) as related_tags,
+        'Score: ' || CAST(tp.Score AS VARCHAR(10)) || 
+        ' Views: ' || CAST(tp.ViewCount AS VARCHAR(10)) || 
+        ' Ratio: ' || CAST(tp.score_to_view_ratio AS VARCHAR(10)) || 'x' as summary_string,
+        tp.rank_by_score,
+        tp.total_score as tp_total_score,
+        tp.Score as tp_score
+    FROM TopPerformers tp
+    WHERE tp.rank_by_score <= 100
+),
+TopSet2 AS (
+    SELECT 
+        tp.PostId,
+        tp.OwnerUserId,
+        tp.Title,
+        tp.Score,
+        tp.ViewCount,
+        tp.Reputation,
+        tp.DisplayName,
+        tp.total_posts,
+        tp.question_count,
+        tp.answer_count,
+        tp.total_score,
+        tp.avg_score,
+        tp.tag_count,
+        tp.tag_popularity,
+        tp.score_to_view_ratio,
+        tp.score_to_answer_ratio,
+        tp.age_days,
+        tp.last_event_date,
+        tp.post_status,
+        tp.post_category,
+        CASE 
+            WHEN tp.rank_by_score <= 10 THEN 'Top 10'
+            WHEN tp.rank_by_score <= 50 THEN 'Top 50'
+            ELSE 'Other'
+        END as performance_category,
+        CASE 
+            WHEN tp.total_score > (SELECT AVG(total_score) FROM TopPerformers) * 1.5 THEN 'High Performer'
+            WHEN tp.total_score > (SELECT AVG(total_score) FROM TopPerformers) THEN 'Above Average'
+            ELSE 'Average or Below'
+        END as performance_level,
+        (SELECT COUNT(*) FROM TopPerformers tp2 WHERE tp2.OwnerUserId = tp.OwnerUserId) as user_post_count,
+        (SELECT string_agg(t.TagName, ', ') 
+         FROM Tags t 
+         WHERE EXISTS (
+             SELECT 1 FROM (
+                 SELECT regexp_split_to_table(tp.Title || ' ' || COALESCE(tp.Tags, ''), ' ') as value
+             ) s 
+             WHERE s.value ILIKE '%' || t.TagName || '%'
+         )
+        ) as related_tags,
+        'Score: ' || CAST(tp.Score AS VARCHAR(10)) || 
+        ' Views: ' || CAST(tp.ViewCount AS VARCHAR(10)) || 
+        ' Ratio: ' || CAST(tp.score_to_view_ratio AS VARCHAR(10)) || 'x' as summary_string,
+        tp.rank_by_score,
+        tp.total_score as tp_total_score,
+        tp.Score as tp_score
+    FROM TopPerformers tp
+    WHERE tp.rank_by_score BETWEEN 101 AND 200
+)
+SELECT 
+    PostId,
+    OwnerUserId,
+    Title,
+    Score,
+    ViewCount,
+    Reputation,
+    DisplayName,
+    total_posts,
+    question_count,
+    answer_count,
+    total_score,
+    avg_score,
+    tag_count,
+    tag_popularity,
+    score_to_view_ratio,
+    score_to_answer_ratio,
+    age_days,
+    last_event_date,
+    post_status,
+    post_category,
+    performance_category,
+    performance_level,
+    user_post_count,
+    related_tags,
+    summary_string
+FROM TopSet1
+UNION ALL
+SELECT 
+    PostId,
+    OwnerUserId,
+    Title,
+    Score,
+    ViewCount,
+    Reputation,
+    DisplayName,
+    total_posts,
+    question_count,
+    answer_count,
+    total_score,
+    avg_score,
+    tag_count,
+    tag_popularity,
+    score_to_view_ratio,
+    score_to_answer_ratio,
+    age_days,
+    last_event_date,
+    post_status,
+    post_category,
+    performance_category,
+    performance_level,
+    user_post_count,
+    related_tags,
+    summary_string
+FROM TopSet2
+ORDER BY rank_by_score, tp_total_score DESC, tp_score DESC
+OFFSET 0 ROW FETCH NEXT 100 ROW ONLY;

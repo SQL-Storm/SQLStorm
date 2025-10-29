@@ -1,0 +1,168 @@
+with RecursiveTagCounts as (
+    select
+        t.Id as TagId,
+        t.TagName,
+        t.Count,
+        p.Id as QuestionId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        u.Id as OwnerUserId,
+        u.Reputation,
+        row_number() over (partition by t.Id order by p.Score desc, p.ViewCount desc) as rn
+    from Tags t
+    inner join Posts p on p.PostTypeId = 1 and p.Tags like ('%<' || t.TagName || '>%')
+    left join Users u on u.Id = p.OwnerUserId
+    where t.Count > 1000
+),
+RankedAnswers as (
+    select
+        a.Id as AnswerId,
+        a.ParentId,
+        a.Score,
+        a.CreationDate,
+        u.Id as AnswererId,
+        u.Reputation as AnswererRep,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as answer_rank
+    from Posts a
+    left join Users u on u.Id = a.OwnerUserId
+    where a.PostTypeId = 2
+),
+AcceptedAnswers as (
+    select
+        p.Id as QuestionId,
+        p.AcceptedAnswerId,
+        aa.Score as AcceptedAnswerScore,
+        aa.CreationDate as AcceptedAnswerDate
+    from Posts p
+    left join Posts aa on p.AcceptedAnswerId = aa.Id
+    where p.PostTypeId = 1 and p.AcceptedAnswerId is not null
+),
+PostCloseReasonsCount as (
+    select
+        ph.PostId,
+        crt.Name as CloseReason,
+        count(*) as CloseVotesCount
+    from PostHistory ph
+    left join CloseReasonTypes crt on cast(ph.Comment as integer) = crt.Id and ph.PostHistoryTypeId = 10
+    where ph.PostHistoryTypeId = 10
+    group by ph.PostId, crt.Name
+),
+UserBadgeStats as (
+    select
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges
+    from Badges b
+    group by b.UserId
+),
+UserActivityRanks as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as NumQuestions,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as NumAnswers,
+        count(distinct c.Id) as NumComments,
+        rank() over (order by u.Reputation desc, count(distinct p.Id) filter (where p.PostTypeId = 2) desc, count(distinct p.Id) filter (where p.PostTypeId = 1) desc) as UserRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+),
+PostsWithParentsAndLinks as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        pl.LinkTypeId,
+        pl.RelatedPostId
+    from Posts p
+    left join PostLinks pl on pl.PostId = p.Id
+),
+DuplicateLinkedPairs as (
+    select distinct
+        p.Id as PostId,
+        p.Tags,
+        l.RelatedPostId,
+        lt.Name as LinkTypeName
+    from Posts p 
+    inner join PostLinks l on l.PostId = p.Id and l.LinkTypeId = 3
+    inner join LinkTypes lt on lt.Id = l.LinkTypeId
+    where p.PostTypeId = 1
+),
+TrendingTags as (
+    select
+        t.TagName,
+        count(*) as RecentQuestions,
+        avg(p.Score) as AvgScore,
+        avg(p.ViewCount) as AvgViews
+    from Tags t
+    inner join Posts p on p.PostTypeId = 1 and p.Tags like ('%<' || t.TagName || '>%') and p.CreationDate > cast(cast('2024-10-01' as date) - interval '30 day' as date)
+    group by t.TagName
+    having count(*) > 50
+),
+FinalSelect as (
+    select distinct
+        rtc.TagName,
+        rtc.Count as TagTotalCount,
+        rtc.QuestionId,
+        rtc.Score as QuestionScore,
+        rtc.ViewCount as QuestionViews,
+        u.DisplayName as QuestionOwner,
+        ua.NumAnswers,
+        ac.AnswerId,
+        ac.Score as TopAnswerScore,
+        ac.AnswererId,
+        ua.AnswererRep,
+        pcr.CloseReason,
+        pcr.CloseVotesCount,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        uar.UserRank,
+        dt.RelatedPostId as DuplicateOf,
+        dt.LinkTypeName as DuplicateLinkType,
+        tt.RecentQuestions as TagRecentQuestions,
+        tt.AvgScore as TagAvgScore,
+        tt.AvgViews as TagAvgViews,
+        upper(substring(rtc.TagName from 1 for 1)) || lower(substring(rtc.TagName from 2)) as FormattedTagName,
+        case when pcr.CloseVotesCount is null then false else true end as IsClosed,
+        case when rtc.Score > 50 and ua.NumAnswers > 5 then 'Hot Question' else 'Normal' end as QuestionHeat
+    from RecursiveTagCounts rtc
+    left join Posts p on p.Id = rtc.QuestionId
+    left join Users u on u.Id = p.OwnerUserId
+    left join RankedAnswers ac on ac.ParentId = p.Id and ac.answer_rank = 1
+    left join Users ua on ua.Id = ac.AnswererId
+    left join PostCloseReasonsCount pcr on pcr.PostId = p.Id
+    left join UserBadgeStats ub on ub.UserId = u.Id
+    left join UserActivityRanks uar on uar.UserId = u.Id
+    left join DuplicateLinkedPairs dt on dt.PostId = p.Id
+    left join TrendingTags tt on tt.TagName = rtc.TagName
+    where rtc.rn <= 10
+)
+select 
+    fs.FormattedTagName,
+    count(distinct fs.QuestionId) as QuestionCount,
+    avg(fs.QuestionScore) as AvgQuestionScore,
+    avg(fs.QuestionViews) as AvgQuestionViews,
+    count(distinct fs.AnswerId) filter (where fs.AnswerId is not null) as AnswerCount,
+    avg(fs.TopAnswerScore) filter (where fs.AnswerId is not null) as AvgTopAnswerScore,
+    sum(case when fs.IsClosed then 1 else 0 end) as ClosedQuestions,
+    max(fs.GoldBadges) as MaxGoldBadgesOfAsker,
+    min(fs.UserRank) as BestUserRank,
+    stddev(fs.QuestionScore) as StdDevQuestionScore,
+    string_agg(distinct fs.DuplicateLinkType || ':' || coalesce(cast(fs.DuplicateOf as varchar), 'None'), ', ') as DuplicateLinks,
+    max(fs.TagRecentQuestions) as MaxTagRecentQuestions,
+    round(avg(cast(fs.TagAvgScore as numeric)),2) as AvgTagScoreFormatted,
+    round(avg(cast(fs.TagAvgViews as numeric)),2) as AvgTagViewsFormatted,
+    max(fs.QuestionHeat) as MaxHeatLevel
+from FinalSelect fs
+group by fs.FormattedTagName
+having avg(fs.QuestionScore) > 10
+order by AvgQuestionScore desc, QuestionCount desc
+limit 50;

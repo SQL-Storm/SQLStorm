@@ -1,0 +1,144 @@
+-- {"query": "3595.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2474} 
+WITH 
+-- 1. Basic per‑user activity
+user_stats AS (
+    SELECT 
+        u.Id                     AS user_id,
+        u.DisplayName            AS display_name,
+        u.Reputation,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1)            AS q_cnt,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2)            AS a_cnt,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId IN (1,2))      AS avg_score,
+        MAX(p.CreationDate)                                   AS last_post_dt
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+-- 2. Latest badge per user
+badge_latest AS (
+    SELECT 
+        b.UserId,
+        b.Name                      AS badge_name,
+        b.Date                      AS badge_date,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC) AS rn
+    FROM Badges b
+),
+
+-- 3. Vote summary per post (up‑ vs down‑votes)
+vote_summary AS (
+    SELECT 
+        v.PostId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS up_votes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS down_votes
+    FROM Votes v
+    GROUP BY v.PostId
+),
+
+-- 4. Tag usage ranking per user (top tag)
+tag_activity AS (
+    SELECT 
+        u.Id                         AS user_id,
+        tag.TagName,
+        COUNT(*)                     AS tag_use_cnt,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY COUNT(*) DESC) AS rn
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+    CROSS JOIN LATERAL (
+        SELECT UNNEST(string_to_array(TRIM(BOTH '<>' FROM p.Tags), '><')) AS TagName
+    ) tag
+    GROUP BY u.Id, tag.TagName
+),
+
+-- 5. Closed questions per user
+closed_q AS (
+    SELECT 
+        p.OwnerUserId                AS user_id,
+        COUNT(*)                     AS closed_cnt
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+
+-- 6. Net votes on the most recent post of each user
+net_votes_latest_post AS (
+    SELECT 
+        p.OwnerUserId                AS user_id,
+        COALESCE(vs.up_votes,0) - COALESCE(vs.down_votes,0) AS net_votes
+    FROM Posts p
+    LEFT JOIN vote_summary vs ON vs.PostId = p.Id
+    WHERE p.CreationDate = (
+        SELECT MAX(p2.CreationDate)
+        FROM Posts p2
+        WHERE p2.OwnerUserId = p.OwnerUserId
+    )
+),
+
+-- 7. Global aggregates (used for UNION ALL branch)
+global_agg AS (
+    SELECT 
+        NULL::int               AS user_id,
+        'GLOBAL_STATS'          AS display_name,
+        NULL::int               AS reputation,
+        SUM(us.q_cnt)           AS q_cnt,
+        SUM(us.a_cnt)           AS a_cnt,
+        AVG(us.avg_score)       AS avg_score,
+        NULL::timestamp         AS last_post_dt,
+        NULL::varchar           AS badge_name,
+        NULL::timestamp         AS badge_date,
+        SUM(nv.net_votes)       AS net_votes,
+        SUM(cq.closed_cnt)      AS closed_cnt,
+        NULL::varchar           AS top_tag,
+        NULL::int               AS tag_use_cnt,
+        NULL::varchar           AS tier,
+        NULL::varchar           AS slug
+    FROM user_stats us
+    LEFT JOIN net_votes_latest_post nv ON nv.user_id = us.user_id
+    LEFT JOIN closed_q cq ON cq.user_id = us.user_id
+)
+
+SELECT
+    us.user_id,
+    us.display_name,
+    us.reputation,
+    us.q_cnt,
+    us.a_cnt,
+    COALESCE(us.avg_score,0)               AS avg_score,
+    us.last_post_dt,
+    bl.badge_name,
+    bl.badge_date,
+    COALESCE(nv.net_votes,0)               AS net_votes,
+    COALESCE(cq.closed_cnt,0)              AS closed_questions,
+    ta.TagName                             AS top_tag,
+    ta.tag_use_cnt,
+    CASE
+        WHEN us.reputation > 20000 THEN 'Elite'
+        WHEN us.reputation > 10000 THEN 'Veteran'
+        WHEN us.reputation > 1000  THEN 'Contributor'
+        ELSE 'Newbie'
+    END                                    AS tier,
+    CONCAT('user_', us.user_id, '_', REPLACE(COALESCE(us.display_name,''), ' ', '_')) AS slug
+FROM user_stats us
+LEFT JOIN (
+    SELECT UserId, badge_name, badge_date
+    FROM badge_latest
+    WHERE rn = 1
+) bl ON bl.UserId = us.user_id
+LEFT JOIN net_votes_latest_post nv ON nv.user_id = us.user_id
+LEFT JOIN closed_q cq ON cq.user_id = us.user_id
+LEFT JOIN (
+    SELECT user_id, TagName, tag_use_cnt
+    FROM tag_activity
+    WHERE rn = 1
+) ta ON ta.user_id = us.user_id
+WHERE us.reputation IS NOT NULL
+  AND us.user_id IS NOT NULL
+  AND us.last_post_dt < cast('2024-10-01' as date) - INTERVAL '1 year'
+ORDER BY us.reputation DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT *
+FROM global_agg
+ORDER BY reputation DESC NULLS LAST;

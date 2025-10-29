@@ -1,0 +1,106 @@
+-- {"query": "5555.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 903} 
+WITH
+-- recent posts per user with windowed sums
+RecentActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    p.Id AS PostId,
+    p.Title,
+    p.PostTypeId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.CreationDate DESC) AS rn
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  WHERE p.CreationDate > now() - interval '180 days'
+),
+-- aggregated metrics per user with correlated subqueries
+UserMetrics AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    -- total posts in last 6 months
+    (SELECT COUNT(*) FROM Posts p6 WHERE p6.OwnerUserId = u.Id AND p6.CreationDate > now() - interval '180 days') AS PostsLast6m,
+    -- sum of scores for those posts
+    (SELECT COALESCE(SUM(p6.Score),0) FROM Posts p6 WHERE p6.OwnerUserId = u.Id AND p6.CreationDate > now() - interval '180 days') AS ScoreLast6m,
+    -- maximum view count among their posts
+    (SELECT COALESCE(MAX(p6.ViewCount),0) FROM Posts p6 WHERE p6.OwnerUserId = u.Id) AS MaxViewsAllPosts,
+    -- count of badges for user
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id) AS BadgeCount,
+    -- total upvotes received by user across votes on their posts
+    (SELECT COALESCE(SUM(v.BountyAmount),0)
+       FROM Votes v
+       JOIN Posts p ON p.Id = v.PostId
+       WHERE p.OwnerUserId = u.Id AND v.VoteTypeId = 2) AS UpvotesReceived
+  FROM Users u
+  WHERE u.AccountId IS NOT NULL
+),
+-- identify hot questions by score and view rate using window
+HotQuestionScan AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.ViewCount,
+    p.Score,
+    p.CreationDate,
+    p.LastActivityDate,
+    -- simple hotness proxy
+    (p.Score * 1.0 / NULLIF(p.ViewCount,0)) AS ScorePerView,
+    ROW_NUMBER() OVER (ORDER BY (p.Score * 0.7 + p.ViewCount * 0.3) DESC) AS HotRank
+  FROM Posts p
+  WHERE p.PostTypeId = 1 -- questions
+    AND p.ClosedDate IS NULL
+    AND p.Tags IS NOT NULL
+),
+-- cross-join to generate a complex composite rowset with complex predicates
+Composite AS (
+  SELECT
+    u.UserId,
+    u.DisplayName,
+    mh.PostId,
+    mh.Title,
+    mh.ViewCount,
+    mh.Score,
+    mh.ScorePerView,
+    mh.HotRank,
+    um.PostsLast6m,
+    um.ScoreLast6m,
+    um.MaxViewsAllPosts,
+    um.BadgeCount,
+    CASE
+      WHEN mh.Score > 0 THEN 'Positive'
+      WHEN mh.Score < 0 THEN 'Negative'
+      ELSE 'Neutral'
+    END AS Sentiment,
+    CASE
+      WHEN mh.Tags ~ '\\b<' || 'java' || '>' THEN true ELSE false
+    END AS ContainsJavaTag
+  FROM HotQuestionScan mh
+  CROSS JOIN UserMetrics um
+  LEFT JOIN (
+    SELECT Id, DisplayName FROM Users
+  ) u ON u.Id = (SELECT OwnerUserId FROM Posts p WHERE p.Id = mh.PostId)
+  WHERE mh.HotRank <= 50
+    AND mh.Score IS NOT NULL
+)
+SELECT
+  c.UserId,
+  c.DisplayName,
+  c.PostId,
+  c.Title,
+  c.ViewCount,
+  c.Score,
+  c.ScorePerView,
+  c.HotRank,
+  c.PostsLast6m,
+  c.ScoreLast6m,
+  c.MaxViewsAllPosts,
+  c.BadgeCount,
+  c.Sentiment,
+  c.ContainsJavaTag
+FROM Composite c
+ORDER BY c.HotRank, c.Score DESC
+LIMIT 100;

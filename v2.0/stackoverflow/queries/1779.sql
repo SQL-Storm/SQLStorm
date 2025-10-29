@@ -1,0 +1,152 @@
+WITH UserGoldenBadges AS (
+    SELECT DISTINCT UserId
+    FROM Badges
+    WHERE Class = 1
+),
+UserPostEditSummary AS (
+    SELECT
+        ph.UserId,
+        COUNT(DISTINCT ph.PostId) AS SelfEditedPostsCount_180Days
+    FROM PostHistory ph
+    JOIN Posts p ON ph.PostId = p.Id AND ph.UserId = p.OwnerUserId
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6)
+      AND ph.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180 days')
+    GROUP BY ph.UserId
+    HAVING COUNT(DISTINCT ph.PostId) >= 3
+),
+UserAnswerStats AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(p.Id) AS TotalAnswers,
+        COALESCE(AVG(p.Score), 0) AS AverageAnswerScore,
+        SUM(CASE WHEN v.VoteTypeId = 1 THEN 1 ELSE 0 END) AS AcceptedAnswersCount
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId = 1
+    WHERE p.PostTypeId = 2
+      AND p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+    HAVING COUNT(p.Id) >= 10 AND COALESCE(AVG(p.Score), 0) >= 5
+),
+UserQuestionStats AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(p.Id) AS TotalQuestions,
+        COALESCE(AVG(p.Score), 0) AS AverageQuestionScore
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+    HAVING COUNT(p.Id) >= 5 AND COALESCE(AVG(p.Score), 0) >= 10
+),
+UserCommentActivity AS (
+    SELECT
+        c.UserId,
+        COUNT(DISTINCT c.PostId) AS DistinctCommentedPosts
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+    GROUP BY c.UserId
+    HAVING COUNT(DISTINCT c.PostId) >= 10
+),
+QuestionAnswerAverageScore AS (
+    SELECT
+        q.Id AS QuestionId,
+        COALESCE(AVG(a.Score), 0.0) AS AvgAnswerScore
+    FROM Posts q
+    JOIN Posts a ON q.Id = a.ParentId
+    WHERE q.PostTypeId = 1 AND a.PostTypeId = 2
+    GROUP BY q.Id
+),
+QuestionUpVoterCounts AS (
+    SELECT
+        q.Id AS QuestionId,
+        COUNT(DISTINCT v.UserId) AS UniqueUpVotersOnAnswers
+    FROM Posts q
+    JOIN Posts a ON q.Id = a.ParentId
+    JOIN Votes v ON a.Id = v.PostId
+    WHERE q.PostTypeId = 1 AND a.PostTypeId = 2 AND v.VoteTypeId = 2
+    GROUP BY q.Id
+),
+UsersWithProblematicPosts AS (
+    SELECT DISTINCT ph.UserId
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON ph.Comment = CAST(crt.Id AS varchar)
+    WHERE ph.PostHistoryTypeId = 10
+      AND crt.Id = 4
+      AND ph.UserId IS NOT NULL
+),
+UserEligibilityBase AS (
+    SELECT u.Id AS UserId
+    FROM Users u
+    JOIN UserGoldenBadges ugb ON u.Id = ugb.UserId
+    JOIN UserPostEditSummary upes ON u.Id = upes.UserId
+    JOIN UserAnswerStats uas ON u.Id = uas.UserId
+    JOIN UserQuestionStats uqs ON u.Id = uqs.UserId
+    JOIN UserCommentActivity uca ON u.Id = uca.UserId
+    WHERE u.CreationDate < DATE '2020-01-01'
+      AND u.LastAccessDate >= DATE '2023-01-01'
+      AND (u.Location IS NULL OR LOWER(u.Location) NOT LIKE '%anonymous%')
+      AND u.WebsiteUrl IS NOT NULL
+),
+UserEligibility AS (
+    SELECT UserId FROM UserEligibilityBase
+    EXCEPT
+    SELECT UserId FROM UsersWithProblematicPosts
+),
+UserQuestionsWithRank AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.OwnerUserId,
+        p.Title AS QuestionTitle,
+        p.Score AS QuestionScore,
+        p.ViewCount AS QuestionViewCount,
+        p.CreationDate AS QuestionCreationDate,
+        p.LastActivityDate AS QuestionLastActivityDate,
+        p.CommentCount AS QuestionCommentCount,
+        p.FavoriteCount AS QuestionFavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate DESC, p.Id DESC) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.OwnerUserId IS NOT NULL
+)
+SELECT
+    u.Id AS UserId,
+    u.DisplayName AS UserName,
+    u.Reputation,
+    CASE
+        WHEN u.Reputation >= 100000 THEN 'Legendary'
+        WHEN u.Reputation >= 50000 THEN 'Epic'
+        WHEN u.Reputation >= 20000 THEN 'Master'
+        WHEN u.Reputation >= 5000 THEN 'Expert'
+        WHEN u.Reputation >= 1000 THEN 'Advanced'
+        ELSE 'Contributor'
+    END AS ReputationTier,
+    COALESCE(uas.AverageAnswerScore, 0.0) AS UserOverallAvgAnswerScore,
+    COALESCE(uas.AcceptedAnswersCount, 0) AS UserAcceptedAnswerVotes,
+    SUBSTRING(
+        COALESCE(
+            REPLACE(REPLACE(REPLACE(u.AboutMe, '<p>', ''), '</p>', ' '), '<a>', ''),
+            '[No Bio]'
+        )
+        FROM 1 FOR 100
+    ) AS AboutMeSnippet,
+    uqr.QuestionId,
+    uqr.QuestionTitle,
+    uqr.QuestionScore,
+    uqr.QuestionViewCount,
+    uqr.QuestionCommentCount,
+    qaas.AvgAnswerScore AS QuestionAvgAnswerScore,
+    COALESCE(quvc.UniqueUpVotersOnAnswers, 0) AS QuestionUniqueUpVotersOnAnswers,
+    CAST(
+        (uqr.QuestionViewCount + (uqr.QuestionScore * 2) + uqr.QuestionCommentCount + (COALESCE(uqr.QuestionFavoriteCount, 0) * 3.0))
+        / NULLIF(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - uqr.QuestionCreationDate)) / (60 * 60 * 24.0), 0)
+    AS NUMERIC(10,4)) AS QuestionEngagementIndex,
+    uqr.QuestionLastActivityDate,
+    uqr.rn AS QuestionActivityRank
+FROM Users u
+JOIN UserEligibility ue ON u.Id = ue.UserId
+LEFT JOIN UserAnswerStats uas ON u.Id = uas.UserId
+JOIN UserQuestionsWithRank uqr ON u.Id = uqr.OwnerUserId
+LEFT JOIN QuestionAnswerAverageScore qaas ON uqr.QuestionId = qaas.QuestionId
+LEFT JOIN QuestionUpVoterCounts quvc ON uqr.QuestionId = quvc.QuestionId
+WHERE uqr.rn <= 3
+ORDER BY u.Id, uqr.rn;

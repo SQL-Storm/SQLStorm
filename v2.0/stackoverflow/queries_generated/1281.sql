@@ -1,0 +1,199 @@
+-- {"query": "1281.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2476} 
+
+WITH UserEngagementSummary AS (
+    -- Aggregates core user metrics, including reputation, post counts, and calculated averages.
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Views AS ProfileViews,
+        U.UpVotes AS TotalUpvotesGiven,
+        U.DownVotes AS TotalDownvotesGiven,
+        COUNT(DISTINCT P.Id) AS TotalPostsByOwner,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestionsByOwner,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswersByOwner,
+        COUNT(DISTINCT C.Id) AS TotalCommentsByOwner,
+        COUNT(DISTINCT B.Id) AS TotalBadgesAchieved,
+        COALESCE(SUM(P.Score), 0) AS SumPostScores,
+        CAST(COALESCE(SUM(P.Score), 0) AS DECIMAL) / NULLIF(COUNT(DISTINCT P.Id), 0) AS AvgPostScorePerUser,
+        MAX(P.CreationDate) AS LatestPostDate,
+        MIN(P.CreationDate) AS EarliestPostDate,
+        -- Calculate active days for the user
+        EXTRACT(EPOCH FROM (U.LastAccessDate - U.CreationDate)) / (24 * 3600) AS ActiveDaysLifetime,
+        -- Correlated subquery: Check if the user has ever had a post accepted by another user
+        EXISTS (
+            SELECT 1
+            FROM Posts AS AcceptedP
+            WHERE AcceptedP.AcceptedAnswerId = P.Id
+              AND AcceptedP.OwnerUserId <> U.Id
+            LIMIT 1
+        ) AS HasExternalAcceptedAnswer
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    LEFT JOIN Badges AS B ON U.Id = B.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Views, U.UpVotes, U.DownVotes
+    HAVING
+        U.Reputation > 500 AND COUNT(DISTINCT P.Id) > 10
+),
+PostDetailsWithHistoryAndLinks AS (
+    -- Enriches post data with last edit information, tag parsing, and linked post counts.
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.Title,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount AS PostCommentCount,
+        P.FavoriteCount,
+        P.LastEditDate,
+        P.LastEditorUserId,
+        P.ClosedDate,
+        P.AcceptedAnswerId,
+        -- Extract the first tag, handling potential NULL or empty tags gracefully
+        COALESCE(
+            TRIM(SUBSTRING(P.Tags, 2, POSITION('><' IN P.Tags) - 2)),
+            'untagged'
+        ) AS FirstTag,
+        -- Determine if the post body contains certain keywords that might indicate low quality
+        (LOWER(P.Body) LIKE '%urgent%' OR LOWER(P.Body) LIKE '%help me%' OR LOWER(P.Body) LIKE '%plz%') AS ContainsLowQualityKeywords,
+        -- Window function: Calculate the moving average score of the last 3 posts by the same owner
+        AVG(P.Score) OVER (
+            PARTITION BY P.OwnerUserId
+            ORDER BY P.CreationDate
+            ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+        ) AS MovingAvgScoreLast3Posts,
+        -- Retrieve the most recent post history comment related to an edit or close event
+        COALESCE(
+            (
+                SELECT PH.Comment
+                FROM PostHistory AS PH
+                WHERE PH.PostId = P.Id
+                  AND PH.PostHistoryTypeId IN (4, 5, 6, 10) -- Edit Title, Body, Tags, or Post Closed
+                ORDER BY PH.CreationDate DESC
+                LIMIT 1
+            ),
+            'No specific history comment'
+        ) AS LatestHistoryComment,
+        -- Count linked and duplicate posts using subqueries
+        (SELECT COUNT(PL.Id) FROM PostLinks AS PL WHERE PL.PostId = P.Id AND PL.LinkTypeId = 1) AS LinkedPostCount,
+        (SELECT COUNT(PL.Id) FROM PostLinks AS PL WHERE PL.PostId = P.Id AND PL.LinkTypeId = 3) AS DuplicatePostCount
+    FROM Posts AS P
+    WHERE P.OwnerUserId IS NOT NULL
+      AND P.CreationDate >= (CURRENT_DATE - INTERVAL '10 years') -- Focus on more recent posts
+      AND P.Score >= 0 -- Exclude severely downvoted posts at this stage
+),
+TagPerformanceMetrics AS (
+    -- Calculates various performance indicators for each tag, including ranking.
+    SELECT
+        TP.TagName,
+        COUNT(DISTINCT PD.PostId) AS TaggedPostCount,
+        COALESCE(SUM(PD.PostScore), 0) AS TotalTagScore,
+        COALESCE(SUM(PD.ViewCount), 0) AS TotalTagViews,
+        AVG(PD.PostScore) AS AverageTagScore,
+        -- Rank tags by their average score, handling potential ties
+        DENSE_RANK() OVER (ORDER BY AVG(PD.PostScore) DESC) AS AvgScoreRankByTag
+    FROM PostDetailsWithHistoryAndLinks AS PD
+    JOIN Tags AS TP ON PD.FirstTag = TP.TagName
+    GROUP BY TP.TagName
+    HAVING COUNT(DISTINCT PD.PostId) > 50
+),
+UserVoteBehavior AS (
+    -- Analyzes user voting patterns on their own posts and others' posts.
+    SELECT
+        V.UserId,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesGivenByThisUser,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesGivenByThisUser,
+        SUM(CASE WHEN V.VoteTypeId = 1 THEN 1 ELSE 0 END) AS TotalAcceptedAnswersByThisUser,
+        -- Correlated subquery: check if user has ever self-voted their own post up
+        EXISTS (
+            SELECT 1
+            FROM Votes AS SelfVote
+            JOIN Posts AS SelfPost ON SelfVote.PostId = SelfPost.Id
+            WHERE SelfVote.UserId = V.UserId
+              AND SelfPost.OwnerUserId = V.UserId
+              AND SelfVote.VoteTypeId = 2
+        ) AS HasSelfUpvotedOwnPost
+    FROM Votes AS V
+    WHERE V.UserId IS NOT NULL
+    GROUP BY V.UserId
+)
+-- Final selection combining all processed data for comprehensive user-post analysis.
+SELECT
+    UES.UserId,
+    UES.DisplayName,
+    UES.Reputation,
+    UES.TotalPostsByOwner,
+    PDHL.PostId,
+    PDHL.Title,
+    PDHL.PostCreationDate,
+    PDHL.PostScore,
+    PDHL.ViewCount,
+    PDHL.FirstTag,
+    PDHL.ContainsLowQualityKeywords,
+    PDHL.MovingAvgScoreLast3Posts,
+    PDHL.LinkedPostCount,
+    PDHL.DuplicatePostCount,
+    TPM.AverageTagScore,
+    TPM.AvgScoreRankByTag,
+    UVB.TotalUpvotesGivenByThisUser,
+    UVB.HasSelfUpvotedOwnPost,
+    -- Determine the 'engagement level' based on various factors using a CASE expression
+    CASE
+        WHEN UES.TotalQuestionsByOwner > 5 AND UES.TotalAnswersByOwner > 10 AND UES.AvgPostScorePerUser > 5 THEN 'Highly Engaged Contributor'
+        WHEN UES.TotalPostsByOwner > 20 AND UES.AvgPostScorePerUser > 2 THEN 'Active Participant'
+        WHEN UES.TotalBadgesAchieved >= 5 THEN 'Recognized User'
+        ELSE 'Casual User'
+    END AS UserEngagementLevel,
+    -- Calculate a weighted quality score for the post, incorporating NULL logic
+    COALESCE(
+        (PDHL.PostScore * 0.5) +
+        (PDHL.ViewCount * 0.01) +
+        (PDHL.PostCommentCount * 0.2) +
+        (PDHL.FavoriteCount * 0.3) -
+        (PDHL.DuplicatePostCount * 1.5),
+        0
+    ) AS WeightedPostQualityScore,
+    -- Check if the post was closed due to specific reasons (e.g., Off-topic or Duplicate)
+    EXISTS (
+        SELECT 1
+        FROM PostHistory AS PH
+        JOIN CloseReasonTypes AS CRT ON CAST(PH.Comment AS SMALLINT) = CRT.Id
+        WHERE PH.PostId = PDHL.PostId
+          AND PH.PostHistoryTypeId = 10 -- Post Closed
+          AND CRT.Name IN ('Off-topic', 'Duplicate')
+    ) AS WasClosedForSpecificReason,
+    -- NTILE window function to categorize posts into quintiles based on their weighted quality score
+    NTILE(5) OVER (
+        ORDER BY COALESCE(
+            (PDHL.PostScore * 0.5) +
+            (PDHL.ViewCount * 0.01) +
+            (PDHL.PostCommentCount * 0.2) +
+            (PDHL.FavoriteCount * 0.3) -
+            (PDHL.DuplicatePostCount * 1.5),
+            0
+        ) DESC
+    ) AS PostQualityQuintile,
+    PDHL.LatestHistoryComment
+FROM UserEngagementSummary AS UES
+JOIN PostDetailsWithHistoryAndLinks AS PDHL ON UES.UserId = PDHL.OwnerUserId
+LEFT JOIN TagPerformanceMetrics AS TPM ON PDHL.FirstTag = TPM.TagName
+LEFT JOIN UserVoteBehavior AS UVB ON UES.UserId = UVB.UserId
+WHERE
+    PDHL.PostTypeId IN (1, 2) -- Focus on Questions and Answers
+    AND PDHL.PostScore > 5
+    AND PDHL.ViewCount > 500
+    AND (PDHL.LastEditDate IS NOT NULL OR PDHL.ClosedDate IS NOT NULL) -- Only posts that have been edited or closed
+    AND NOT PDHL.ContainsLowQualityKeywords
+    AND UES.HasExternalAcceptedAnswer = TRUE -- Users who have had their answers accepted by others
+ORDER BY
+    WeightedPostQualityScore DESC,
+    UES.Reputation DESC,
+    PDHL.PostCreationDate DESC
+LIMIT 1000;

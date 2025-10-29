@@ -1,0 +1,157 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 AS Level,
+        ARRAY[t.TagName]::varchar[] AS Ancestors
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+
+    UNION ALL
+
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Level + 1 AS Level,
+        r.Ancestors || t.TagName
+    FROM Tags t
+    JOIN RecursiveTagHierarchy r
+      ON t.Id <> r.Id
+     AND NOT t.TagName = ANY(r.Ancestors)
+    WHERE t.IsModeratorOnly = FALSE
+), QuestionAnswerStats AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        u.DisplayName AS OwnerName,
+        p.CreationDate,
+        p.Score AS QuestionScore,
+        COALESCE(p.ViewCount, 0) AS ViewCount,
+        p.AnswerCount,
+        COALESCE(a.AnswerCount, 0) AS ActualAnswerCount,
+        COALESCE(a.MaxAnswerScore, 0) AS MaxAnswerScore,
+        COALESCE(a.AvgAnswerScore, 0) AS AvgAnswerScore,
+        p.Tags
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    LEFT JOIN (
+        SELECT
+            ParentId,
+            COUNT(*) AS AnswerCount,
+            MAX(Score) AS MaxAnswerScore,
+            AVG(Score) AS AvgAnswerScore
+        FROM Posts
+        WHERE PostTypeId = 2
+        GROUP BY ParentId
+    ) a ON a.ParentId = p.Id
+    WHERE p.PostTypeId = 1
+), PostVotesAgg AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS Favorites,
+        SUM(CASE WHEN v.VoteTypeId = 8 THEN COALESCE(v.BountyAmount,0) ELSE 0 END) AS TotalBountyGiven
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    GROUP BY p.Id, p.PostTypeId
+), LatestPostHistories AS (
+    SELECT DISTINCT ON (ph.PostId)
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.UserId,
+        ph.UserDisplayName,
+        ph.CreationDate,
+        ph.Comment
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (10,11,12,13,19,20)
+    ORDER BY ph.PostId, ph.CreationDate DESC
+), TopUsersByReputation AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RankByReputation
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(b.Id) > 0
+    ORDER BY u.Reputation DESC
+    LIMIT 100
+)
+SELECT 
+    q.QuestionId,
+    q.Title,
+    COALESCE(q.OwnerName, 'Unknown') AS OwnerName,
+    q.CreationDate,
+    q.QuestionScore,
+    q.ViewCount,
+    q.AnswerCount,
+    q.ActualAnswerCount,
+    ROUND(CAST(q.MaxAnswerScore AS numeric),2) AS MaxAnswerScore,
+    ROUND(CAST(q.AvgAnswerScore AS numeric),2) AS AvgAnswerScore,
+    v.UpVotes,
+    v.DownVotes,
+    v.Favorites,
+    v.TotalBountyGiven,
+    lh.PostHistoryTypeId AS LatestClosureOrProtection,
+    lh.Comment AS ClosureReasonOrComment,
+    array_to_string(array_agg(DISTINCT rt.TagName), ', ') AS RequiredTagsInHierarchy,
+    u.DisplayName AS TopUserDisplayName,
+    u.Reputation AS TopUserReputation,
+    u.GoldBadges,
+    u.SilverBadges,
+    u.BronzeBadges,
+    dense_rank() OVER (PARTITION BY q.OwnerName ORDER BY q.QuestionScore DESC) AS QuestionScoreRankWithinOwner,
+    CASE 
+        WHEN q.ViewCount > 10000 THEN 'High Views'
+        WHEN q.ViewCount BETWEEN 1000 AND 10000 THEN 'Medium Views'
+        ELSE 'Low Views'
+    END AS ViewCategory,
+    CASE 
+        WHEN q.AvgAnswerScore IS NULL THEN 'No Answers'
+        WHEN q.AvgAnswerScore > 5 THEN 'Highly Rated Answers'
+        WHEN q.AvgAnswerScore BETWEEN 1 AND 5 THEN 'Moderate Answers'
+        ELSE 'Low Rated Answers'
+    END AS AnswerQualityCategory,
+    length(q.Title) AS TitleLength,
+    strpos(lower(q.Title), 'sql') > 0 AS TitleContainsSQL,
+    COALESCE((SELECT COUNT(*) FROM Comments c WHERE c.PostId = q.QuestionId AND c.Score > 0),0) AS PositiveCommentsCount,
+    COALESCE((SELECT COUNT(*) FROM Comments c WHERE c.PostId = q.QuestionId AND c.Score < 0),0) AS NegativeCommentsCount
+FROM QuestionAnswerStats q
+LEFT JOIN PostVotesAgg v ON v.PostId = q.QuestionId
+LEFT JOIN LatestPostHistories lh ON lh.PostId = q.QuestionId
+LEFT JOIN RecursiveTagHierarchy rt ON rt.TagName = ANY(string_to_array(regexp_replace(q.Tags, '[<>]', ',', 'g'), ','))
+LEFT JOIN TopUsersByReputation u ON u.DisplayName = q.OwnerName
+WHERE q.QuestionScore > 500
+  AND (lh.PostHistoryTypeId IS NULL OR lh.PostHistoryTypeId IN (10,11))
+GROUP BY
+    q.QuestionId,
+    q.Title,
+    q.OwnerName,
+    q.CreationDate,
+    q.QuestionScore,
+    q.ViewCount,
+    q.AnswerCount,
+    q.ActualAnswerCount,
+    q.MaxAnswerScore,
+    q.AvgAnswerScore,
+    v.UpVotes,
+    v.DownVotes,
+    v.Favorites,
+    v.TotalBountyGiven,
+    lh.PostHistoryTypeId,
+    lh.Comment,
+    u.DisplayName,
+    u.Reputation,
+    u.GoldBadges,
+    u.SilverBadges,
+    u.BronzeBadges
+ORDER BY q.QuestionScore DESC, q.ViewCount DESC
+LIMIT 50;

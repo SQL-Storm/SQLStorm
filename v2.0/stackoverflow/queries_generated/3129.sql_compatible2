@@ -1,0 +1,118 @@
+WITH
+user_post_stats AS (
+    SELECT
+        u.Id                                   AS user_id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id)                             AS total_posts,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END)   AS total_answers,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END)   AS total_questions,
+        SUM(COALESCE(p.Score,0))                AS sum_score,
+        COALESCE(SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END),0) AS close_votes_received
+    FROM Users u
+    LEFT JOIN Posts p      ON p.OwnerUserId = u.Id
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+user_badge_stats AS (
+    SELECT
+        b.UserId                                    AS user_id,
+        COUNT(*)                                    AS total_badges,
+        SUM(CASE WHEN b.TagBased = TRUE THEN 1 ELSE 0 END)  AS tag_badges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END)     AS gold_badges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END)     AS silver_badges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END)     AS bronze_badges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+user_top_tags AS (
+    SELECT
+        q.OwnerUserId                                 AS user_id,
+        q.tag,
+        ROW_NUMBER() OVER (PARTITION BY q.OwnerUserId ORDER BY q.tag_cnt DESC) AS rn
+    FROM (
+        SELECT
+            p.OwnerUserId,
+            tag,
+            COUNT(*) AS tag_cnt
+        FROM Posts p,
+             LATERAL (
+               SELECT UNNEST(string_to_array(TRIM(BOTH '<>' FROM p.Tags), '><')) AS tag
+             ) t
+        WHERE p.PostTypeId = 1
+        GROUP BY p.OwnerUserId, tag
+    ) q
+),
+user_latest_activity AS (
+    SELECT
+        uid,
+        MAX(activity_dt) AS last_activity
+    FROM (
+        SELECT
+            p.OwnerUserId AS uid,
+            p.LastActivityDate AS activity_dt
+        FROM Posts p
+        WHERE p.OwnerUserId IS NOT NULL
+
+        UNION ALL
+
+        SELECT
+            c.UserId AS uid,
+            c.CreationDate AS activity_dt
+        FROM Comments c
+        WHERE c.UserId IS NOT NULL
+    ) a
+    GROUP BY uid
+),
+users_without_posts AS (
+    SELECT u.Id AS user_id
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    WHERE p.Id IS NULL
+)
+SELECT
+    up.user_id,
+    up.DisplayName,
+    up.Reputation,
+    up.total_posts,
+    up.total_answers,
+    up.total_questions,
+    up.sum_score,
+    up.close_votes_received,
+    COALESCE(ub.total_badges,0)          AS total_badges,
+    COALESCE(ub.tag_badges,0)            AS tag_badges,
+    COALESCE(ub.gold_badges,0)           AS gold_badges,
+    COALESCE(ub.silver_badges,0)         AS silver_badges,
+    COALESCE(ub.bronze_badges,0)         AS bronze_badges,
+    COALESCE(
+        STRING_AGG(ut.tag, ', ') FILTER (WHERE ut.rn <= 3),
+        'N/A'
+    )                                    AS top_3_tags,
+    ula.last_activity,
+    CASE
+        WHEN up.total_posts = 0 THEN 'Never posted'
+        ELSE 'Active'
+    END                                 AS posting_status,
+    CASE
+        WHEN up.total_answers = 0 THEN NULL
+        ELSE ROUND(
+            (SELECT CAST(COUNT(*) AS numeric)
+             FROM Posts a
+             WHERE a.PostTypeId = 2
+               AND a.OwnerUserId = up.user_id
+               AND a.Id IN (SELECT q.AcceptedAnswerId FROM Posts q WHERE q.AcceptedAnswerId = a.Id)
+            ) / NULLIF(CAST(up.total_answers AS numeric), 0), 3)
+    END                                 AS answer_acceptance_ratio
+FROM user_post_stats up
+LEFT JOIN user_badge_stats ub      ON ub.user_id = up.user_id
+LEFT JOIN user_top_tags ut        ON ut.user_id = up.user_id
+LEFT JOIN user_latest_activity ula ON ula.uid = up.user_id
+WHERE up.user_id NOT IN (SELECT user_id FROM users_without_posts)
+GROUP BY
+    up.user_id, up.DisplayName, up.Reputation, up.total_posts,
+    up.total_answers, up.total_questions, up.sum_score,
+    up.close_votes_received, ub.total_badges, ub.tag_badges,
+    ub.gold_badges, ub.silver_badges, ub.bronze_badges,
+    ula.last_activity
+ORDER BY up.Reputation DESC
+LIMIT 100;

@@ -1,0 +1,122 @@
+with recursive UserBadgeRanks as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class,
+        row_number() over (partition by u.Id order by b.Class, b.Date desc) as BadgeRank
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    where u.Reputation > 1000
+),
+TopBadges as (
+    select UserId, BadgeName, Class
+    from UserBadgeRanks
+    where BadgeRank <= 3
+),
+RecentActivePosts as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.LastActivityDate,
+        p.LastEditDate,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc) as UserTopPostRank
+    from Posts p
+    where p.PostTypeId in (1,2)
+      and p.CreationDate > (cast('2024-10-01 12:34:56' as timestamp) - interval '180 days')
+      and p.Score >= 0
+),
+TagCounts as (
+    select 
+        unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) as Tag,
+        count(*) as PostCount
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+    group by unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'))
+),
+AcceptedAnswerScores as (
+    select 
+        q.Id as QuestionId,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.OwnerUserId as AnswerOwnerUserId
+    from Posts q
+    left join Posts a on a.Id = q.AcceptedAnswerId and a.PostTypeId = 2
+    where q.PostTypeId = 1
+),
+UserAnswerStats as (
+    select 
+        u.Id as UserId,
+        count(distinct p.Id) as AnswerCount,
+        avg(p.Score) as AvgAnswerScore,
+        max(p.Score) as MaxAnswerScore
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 2
+    group by u.Id
+)
+select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    coalesce(tb.BadgeName, 'No Top Badge') as TopBadge,
+    coalesce(tb.Class, 4) as BadgeClass,
+    ra.PostTypeId,
+    ra.Id as PostId,
+    ra.Score as PostScore,
+    ra.ViewCount as PostViewCount,
+    ra.CreationDate as PostCreationDate,
+    -- aggregate top tags: include PostCount in the aggregation argument to satisfy DISTINCT + ORDER BY requirement
+    array_agg((tc.Tag, tc.PostCount) ORDER BY tc.PostCount DESC) FILTER (WHERE tc.Tag IS NOT NULL) as TopTagsWithCounts,
+    -- if only tags are desired without counts, they can be extracted from the composite values client-side
+    aas.AnswerCount,
+    aas.AvgAnswerScore,
+    aas.MaxAnswerScore,
+    (select count(*) from PostLinks pl where pl.PostId = ra.Id and pl.LinkTypeId = 1) as LinkedPostsCount,
+    (select count(*) from Comments c where c.PostId = ra.Id and (c.Text ilike '%performance%' or c.Text ilike '%optimization%')) as CommentsMentioningPerf,
+    dense_rank() over (partition by u.Id order by ra.Score desc) as RankByPostScore,
+    case 
+        when ra.ViewCount > 10000 then 'HighView'
+        when ra.ViewCount between 1000 and 10000 then 'MidView'
+        else 'LowView'
+    end as ViewCountCategory,
+    (select string_agg(distinct lh.Name, ', ') from PostHistory ph join PostHistoryTypes lh on lh.Id = ph.PostHistoryTypeId where ph.PostId = ra.Id) as HistoryTypes,
+    greatest(
+        coalesce((select max(ph.CreationDate) from PostHistory ph where ph.PostId = ra.Id), ra.CreationDate),
+        ra.LastActivityDate,
+        ra.LastEditDate
+    ) as LastRelevantActivity,
+    (select count(*) from Votes v where v.PostId = ra.Id and v.VoteTypeId = 2) as UpVotesCount,
+    (select count(*) from Votes v where v.PostId = ra.Id and v.VoteTypeId = 3) as DownVotesCount
+from Users u
+left join TopBadges tb on tb.UserId = u.Id
+inner join RecentActivePosts ra on ra.OwnerUserId = u.Id and ra.UserTopPostRank <= 5
+left join TagCounts tc on tc.Tag = any(string_to_array(substring(ra.Tags, 2, length(ra.Tags)-2), '><'))
+left join UserAnswerStats aas on aas.UserId = u.Id
+where u.Reputation > 1000
+  and ra.Score > 10
+group by
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    tb.BadgeName,
+    tb.Class,
+    ra.PostTypeId,
+    ra.Id,
+    ra.Score,
+    ra.ViewCount,
+    ra.CreationDate,
+    aas.AnswerCount,
+    aas.AvgAnswerScore,
+    aas.MaxAnswerScore,
+    ra.LastActivityDate,
+    ra.LastEditDate
+order by u.Reputation desc, ra.Score desc
+limit 100;

@@ -1,0 +1,173 @@
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.Views AS UserViews,
+        U.UpVotes AS UserTotalUpVotes,
+        U.DownVotes AS UserTotalDownVotes,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MIN(B.Date) AS FirstBadgeDate,
+        MAX(B.Date) AS LastBadgeDate,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS QuestionsAsked,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS AnswersGiven,
+        SUM(P.Score) AS TotalPostScore,
+        AVG(CASE WHEN P.PostTypeId IN (1, 2) THEN P.Score END) AS AvgPostScore,
+        COUNT(DISTINCT Tag.T) AS UniqueTagsUsedInPosts,
+        MAX(P.LastActivityDate) AS LastPostActivity,
+        MAX(C.CreationDate) AS LastCommentActivity
+    FROM Users AS U
+    LEFT JOIN Badges AS B ON U.Id = B.UserId
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    LEFT JOIN LATERAL (SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(P.Tags, 2, CHAR_LENGTH(P.Tags)-2), '><')) AS T) AS Tag ON P.Tags IS NOT NULL AND P.PostTypeId = 1
+    WHERE U.CreationDate >= TIMESTAMP '2020-01-01'
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.Views, U.UpVotes, U.DownVotes
+    HAVING COUNT(DISTINCT B.Id) > 5
+),
+HighImpactQuestions AS (
+    SELECT
+        P.Id AS PostId,
+        P.Title AS QuestionTitle,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.FavoriteCount,
+        P.AcceptedAnswerId,
+        STRING_TO_ARRAY(SUBSTRING(P.Tags, 2, CHAR_LENGTH(P.Tags) - 2), '><') AS TagArray,
+        CASE
+            WHEN P.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN P.CommunityOwnedDate IS NOT NULL THEN 'CommunityOwned'
+            ELSE 'Open'
+        END AS PostStatus,
+        DENSE_RANK() OVER (PARTITION BY P.OwnerUserId ORDER BY P.Score DESC, P.ViewCount DESC) AS RankByUserScore,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (10, 11) THEN 1 ELSE 0 END) OVER (PARTITION BY P.Id) AS CloseReopenEvents,
+        COALESCE(SUM(CASE WHEN C.Text ILIKE '%bug%' OR C.Text ILIKE '%error%' THEN 1 ELSE 0 END), 0) AS BugCommentCount
+    FROM Posts AS P
+    LEFT JOIN PostHistory AS PH ON P.Id = PH.PostId
+    LEFT JOIN Comments AS C ON P.Id = C.PostId
+    WHERE P.PostTypeId = 1
+      AND P.CreationDate BETWEEN TIMESTAMP '2021-01-01' AND TIMESTAMP '2023-12-31'
+      AND (P.ViewCount > 500 OR P.FavoriteCount > 10)
+    GROUP BY P.Id, P.Title, P.OwnerUserId, P.CreationDate, P.Score, P.ViewCount, P.AnswerCount, P.FavoriteCount, P.AcceptedAnswerId, P.Tags, P.ClosedDate, P.CommunityOwnedDate
+),
+DuplicatePostAnalysis AS (
+    SELECT
+        PL.PostId AS OriginalPostId,
+        PL.RelatedPostId AS DuplicatePostId,
+        P_Original.OwnerUserId AS OriginalOwnerUserId,
+        P_Duplicate.OwnerUserId AS DuplicateOwnerUserId,
+        P_Original.CreationDate AS OriginalCreationDate,
+        P_Duplicate.CreationDate AS DuplicateCreationDate,
+        PH_Close.CreationDate AS CloseDate,
+        COALESCE(CR.Name, 'Unknown') AS CloseReasonName
+    FROM PostLinks AS PL
+    JOIN Posts AS P_Original ON PL.PostId = P_Original.Id
+    JOIN Posts AS P_Duplicate ON PL.RelatedPostId = P_Duplicate.Id
+    LEFT JOIN PostHistory AS PH_Close
+        ON P_Original.Id = PH_Close.PostId
+       AND PH_Close.PostHistoryTypeId = 10
+       AND PH_Close.Comment IS NOT NULL
+       AND PH_Close.Comment ~ '^[0-9]+$'
+    LEFT JOIN CloseReasonTypes AS CR
+        ON CAST(PH_Close.Comment AS SMALLINT) = CR.Id
+    WHERE PL.LinkTypeId = 3
+      AND P_Original.CreationDate >= TIMESTAMP '2022-01-01'
+),
+HighReputationOrHighEngagementUsers AS (
+    SELECT U.Id AS UserId
+    FROM Users AS U
+    WHERE U.Reputation > 50000
+    UNION ALL
+    SELECT UE.UserId
+    FROM UserEngagement AS UE
+    JOIN HighImpactQuestions AS HIQ ON UE.UserId = HIQ.OwnerUserId
+    CROSS JOIN LATERAL (SELECT UNNEST(HIQ.TagArray) AS T) AS Tag
+    WHERE UE.GoldBadges >= 3 AND Tag.T IN ('performance', 'optimization')
+),
+UserTagPerformance AS (
+    SELECT
+        UE.UserId,
+        UE.DisplayName,
+        UE.Reputation,
+        UE.GoldBadges,
+        UE.SilverBadges,
+        UE.BronzeBadges,
+        UE.QuestionsAsked,
+        UE.AnswersGiven,
+        COALESCE(UE.AvgPostScore, 0) AS OverallAvgPostScore,
+        COALESCE(HIQ.AverageScoreForTaggedQuestions, 0) AS AvgScoreForPerformanceTags,
+        SUM(CASE WHEN DPA.OriginalOwnerUserId = UE.UserId THEN 1 ELSE 0 END) AS QuestionsMarkedAsDuplicate,
+        SUM(CASE WHEN DPA.DuplicateOwnerUserId = UE.UserId THEN 1 ELSE 0 END) AS AnswersOnDuplicateQuestions,
+        LAG(UE.LastPostActivity) OVER (PARTITION BY UE.UserId ORDER BY UE.LastPostActivity) AS PreviousActivityDate,
+        DATE_PART('day', (TIMESTAMP '2024-10-01 12:34:56') - UE.LastPostActivity) AS DaysSinceLastActivity,
+        (SELECT AVG(A.Score)
+         FROM Posts AS A
+         WHERE A.OwnerUserId = UE.UserId
+           AND A.PostTypeId = 2
+           AND EXISTS (
+               SELECT 1
+               FROM PostLinks AS PL_Inner
+               WHERE (PL_Inner.PostId = A.ParentId OR PL_Inner.RelatedPostId = A.ParentId)
+                 AND PL_Inner.LinkTypeId = 3
+           )
+           AND A.CreationDate < UE.LastPostActivity
+        ) AS AvgAnswerScoreOnDuplicateRelatedPosts
+    FROM UserEngagement AS UE
+    LEFT JOIN LATERAL (
+        SELECT
+            OwnerUserId,
+            AVG(PostScore) AS AverageScoreForTaggedQuestions,
+            COUNT(DISTINCT PostId) AS PerformanceTaggedQuestionsCount
+        FROM HighImpactQuestions
+        CROSS JOIN LATERAL (SELECT UNNEST(TagArray) AS T) AS Tag
+        WHERE OwnerUserId = UE.UserId
+          AND Tag.T IN ('performance', 'optimization', 'benchmark', 'scaling')
+        GROUP BY OwnerUserId
+    ) AS HIQ ON UE.UserId = HIQ.OwnerUserId
+    LEFT JOIN DuplicatePostAnalysis AS DPA ON UE.UserId = DPA.OriginalOwnerUserId OR UE.UserId = DPA.DuplicateOwnerUserId
+    GROUP BY UE.UserId, UE.DisplayName, UE.Reputation, UE.GoldBadges, UE.SilverBadges, UE.BronzeBadges, UE.QuestionsAsked, UE.AnswersGiven, UE.AvgPostScore, HIQ.AverageScoreForTaggedQuestions, UE.LastPostActivity
+)
+SELECT
+    UTP.UserId,
+    UTP.DisplayName,
+    UTP.Reputation,
+    UTP.GoldBadges,
+    UTP.SilverBadges,
+    UTP.BronzeBadges,
+    UTP.QuestionsAsked,
+    UTP.AnswersGiven,
+    UTP.OverallAvgPostScore,
+    UTP.AvgScoreForPerformanceTags,
+    UTP.QuestionsMarkedAsDuplicate,
+    UTP.AnswersOnDuplicateQuestions,
+    UTP.AvgAnswerScoreOnDuplicateRelatedPosts,
+    UTP.DaysSinceLastActivity,
+    (UTP.Reputation * 0.1)
+    + (UTP.GoldBadges * 5)
+    + (UTP.SilverBadges * 3)
+    + (UTP.BronzeBadges * 1)
+    + (COALESCE(UTP.OverallAvgPostScore, 0) * 0.5)
+    + (COALESCE(UTP.AvgAnswerScoreOnDuplicateRelatedPosts, 0) * 0.8) AS WeightedEngagementScore,
+    LOWER(SUBSTRING(UTP.DisplayName FROM 1 FOR 3)) || '_' || UPPER(SUBSTRING(UTP.DisplayName FROM GREATEST(CHAR_LENGTH(UTP.DisplayName) - 2, 1) FOR 3)) AS DisplayNameSignature,
+    MAX(CASE WHEN HIQ_Main.PostStatus = 'Closed' AND HIQ_Main.CloseReopenEvents > 0 THEN 'True' ELSE 'False' END) AS HasClosedReopenedQuestion,
+    MAX(CASE WHEN HIQ_Main.BugCommentCount > 0 THEN 'True' ELSE 'False' END) AS HasBugCommentedQuestion
+FROM UserTagPerformance AS UTP
+LEFT JOIN HighImpactQuestions AS HIQ_Main ON UTP.UserId = HIQ_Main.OwnerUserId
+WHERE UTP.Reputation > 1000
+  AND (UTP.QuestionsMarkedAsDuplicate > 0 OR UTP.AnswersOnDuplicateQuestions > 0)
+  AND UTP.DaysSinceLastActivity < 90
+  AND UTP.UserId IN (SELECT UserId FROM HighReputationOrHighEngagementUsers)
+GROUP BY
+    UTP.UserId, UTP.DisplayName, UTP.Reputation, UTP.GoldBadges, UTP.SilverBadges, UTP.BronzeBadges,
+    UTP.QuestionsAsked, UTP.AnswersGiven, UTP.OverallAvgPostScore, UTP.AvgScoreForPerformanceTags,
+    UTP.QuestionsMarkedAsDuplicate, UTP.AnswersOnDuplicateQuestions, UTP.AvgAnswerScoreOnDuplicateRelatedPosts,
+    UTP.DaysSinceLastActivity, WeightedEngagementScore, DisplayNameSignature
+ORDER BY WeightedEngagementScore DESC, UTP.Reputation DESC
+LIMIT 100;

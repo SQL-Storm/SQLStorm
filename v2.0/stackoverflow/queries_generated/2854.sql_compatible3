@@ -1,0 +1,147 @@
+with RecursivePosts as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        u.DisplayName as OwnerName,
+        row_number() over (partition by p.PostTypeId order by p.CreationDate desc) as rn
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId in (1, 2)
+),
+RankedAnswers as (
+    select
+        p.Id as AnswerId,
+        p.ParentId as QuestionId,
+        p.CreationDate,
+        p.Score,
+        u.Reputation as AnswererReputation,
+        dense_rank() over (partition by p.ParentId order by p.Score desc, p.CreationDate asc) as ScoreRank
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId = 2
+),
+QuestionAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        q.OwnerName,
+        count(a.AnswerId) as TotalAnswers,
+        max(a.Score) as MaxAnswerScore,
+        avg(a.Score) as AvgAnswerScore,
+        max(a.AnswererReputation) as MaxAnswererRep,
+        min(a.AnswererReputation) as MinAnswererRep
+    from RecursivePosts q
+    left join RankedAnswers a on q.Id = a.QuestionId
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount, q.Tags, q.OwnerName
+),
+ClosedQuestions as (
+    select
+        ph.PostId,
+        max(case when ph.PostHistoryTypeId = 10 then ph.Comment else null end) as CloseReason,
+        min(ph.CreationDate) as ClosedDate
+    from PostHistory ph
+    where ph.PostHistoryTypeId = 10
+    group by ph.PostId
+),
+CloseReasonCounts as (
+    select 
+        crt.Name as CloseReasonName,
+        count(distinct ph.PostId) as ClosedCount
+    from PostHistory ph
+    inner join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where ph.PostHistoryTypeId = 10
+    group by crt.Name
+),
+TopTags as (
+    select
+        t.TagName,
+        t.Count,
+        substring(t.TagName from 1 for 1) as TagInitial
+    from Tags t
+    where t.Count > 1000
+),
+TagUserBadgeRank as (
+    select
+        b.UserId,
+        t.TagName,
+        b.Class,
+        rank() over (partition by t.TagName order by b.Class) as BadgeRank
+    from Badges b
+    inner join Tags t on b.Name = t.TagName and (b.TagBased = true OR b.TagBased = 1)
+    where b.Class in (1,2,3)
+),
+UserActivityWindows as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(p.Id) filter (where p.PostTypeId = 1) over (partition by u.Id order by p.CreationDate range between interval '30 days' preceding and current row) as QuestionsInLast30Days,
+        count(p.Id) filter (where p.PostTypeId = 2) over (partition by u.Id order by p.CreationDate range between interval '30 days' preceding and current row) as AnswersInLast30Days,
+        u.Reputation
+    from Users u
+    left join Posts p on u.Id = p.OwnerUserId
+),
+CorrelatedSubqueryExample as (
+    select
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        (select count(1) from Comments c where c.PostId = p.Id and (c.Score > 5 or lower(c.Text) like '%great%')) as HighImpactComments,
+        (select count(distinct vh.Id) from Votes vh where vh.PostId = p.Id and vh.VoteTypeId = 2 and vh.CreationDate > p.CreationDate - interval '1 month') as UpVotesLastMonth
+    from Posts p
+    where p.PostTypeId = 1
+    order by p.Score desc
+    limit 100
+)
+select
+    qas.QuestionId,
+    qas.Title,
+    qas.CreationDate,
+    qas.QuestionScore,
+    qas.ViewCount,
+    coalesce(cr.ClosedDate, timestamp 'infinity') as ClosedDate,
+    coalesce(cr.CloseReason, 'Open') as CloseReason,
+    qas.TotalAnswers,
+    qas.MaxAnswerScore,
+    qas.AvgAnswerScore,
+    qas.MaxAnswererRep,
+    qas.MinAnswererRep,
+    string_agg(distinct tt.TagName, ',' order by tt.TagName) as PopularTags,
+    max(tub.BadgeRank) filter (where tub.UserId = post_owner.OwnerUserId) as UserBadgeRank,
+    ua.QuestionsInLast30Days,
+    ua.AnswersInLast30Days,
+    ua.Reputation as UserReputation,
+    cse.HighImpactComments,
+    cse.UpVotesLastMonth,
+    case 
+        when qas.QuestionScore > 10 and qas.TotalAnswers > 5 then 'Hot Question'
+        when coalesce(cr.CloseReason, '') <> '' then 'Closed Question'
+        else 'Normal Question'
+    end as QuestionStatus,
+    length(qas.Title) as TitleLength,
+    strpos(lower(qas.Title), 'sql') as SqlPositionInTitle,
+    length(regexp_replace(qas.Tags, '[<>]', '', 'g')) - length(replace(qas.Tags, '><', '')) + 1 as TagCountEstimate,
+    post_owner.OwnerUserId
+from QuestionAnswerStats qas
+left join ClosedQuestions cr on qas.QuestionId = cr.PostId
+left join TopTags tt on qas.Tags ilike '%' || tt.TagName || '%'
+left join (
+    select p.Id, p.OwnerUserId from Posts p
+) post_owner on post_owner.Id = qas.QuestionId
+left join TagUserBadgeRank tub on tub.TagName = tt.TagName and tub.UserId = post_owner.OwnerUserId
+left join UserActivityWindows ua on ua.UserId = post_owner.OwnerUserId
+left join CorrelatedSubqueryExample cse on cse.Id = qas.QuestionId
+where qas.QuestionScore > 0
+group by qas.QuestionId, qas.Title, qas.CreationDate, qas.QuestionScore, qas.ViewCount, cr.ClosedDate, cr.CloseReason, qas.TotalAnswers, qas.MaxAnswerScore, qas.AvgAnswerScore, qas.MaxAnswererRep, qas.MinAnswererRep, ua.QuestionsInLast30Days, ua.AnswersInLast30Days, ua.Reputation, cse.HighImpactComments, cse.UpVotesLastMonth, qas.Tags, post_owner.OwnerUserId
+order by qas.QuestionScore desc, qas.CreationDate desc
+limit 50;

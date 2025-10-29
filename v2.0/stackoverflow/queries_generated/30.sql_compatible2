@@ -1,0 +1,368 @@
+with params as (
+    select 
+        date_trunc('month', cast('2024-10-01 12:34:56' as timestamp)) - interval '24 months' as start_month,
+        date_trunc('month', cast('2024-10-01 12:34:56' as timestamp)) - interval '1 month'  as end_month
+),
+user_activity as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.location,
+        coalesce(nullif(trim(u.websiteurl), ''), 'n/a') as websiteurl,
+        date_trunc('month', u.creationdate) as user_cohort_month,
+        u.reputation,
+        u.upvotes,
+        u.downvotes,
+        sum(case when p.posttypeid in (1,2) then p.score else 0 end) as total_post_score,
+        sum(case when p.posttypeid = 1 then 1 else 0 end) as q_count,
+        sum(case when p.posttypeid = 2 then 1 else 0 end) as a_count,
+        count(distinct p.id) as post_count,
+        max(p.lastactivitydate) as last_post_activity
+    from users u
+    left join posts p
+      on p.owneruserid = u.id
+     and p.creationdate between (select start_month from params) and (select end_month from params) + interval '1 month' - interval '1 second'
+    group by u.id, u.displayname, u.location, u.websiteurl, date_trunc('month', u.creationdate), u.reputation, u.upvotes, u.downvotes
+),
+tagged_questions as (
+    select
+        q.id as question_id,
+        q.owneruserid as asker_id,
+        cast(q.creationdate as date) as q_date,
+        q.score as q_score,
+        q.viewcount,
+        q.favoritecount,
+        q.answercount,
+        q.tags,
+        exists (
+            select 1
+            from posthistory ph
+            where ph.postid = q.id
+              and ph.posthistorytypeid in (10,35) -- closed or migrated away
+        ) as was_closed_or_migrated
+    from posts q
+    where q.posttypeid = 1
+      and q.creationdate between (select start_month from params) and (select end_month from params) + interval '1 month' - interval '1 second'
+),
+answers as (
+    select
+        a.id as answer_id,
+        a.parentid as question_id,
+        a.owneruserid as answerer_id,
+        a.creationdate,
+        a.score as a_score,
+        case when a.communityowneddate is not null then true else false end as is_community_wiki
+    from posts a
+    where a.posttypeid = 2
+),
+first_answers as (
+    select
+        question_id,
+        answer_id,
+        answerer_id,
+        a_score,
+        creationdate,
+        row_number() over (partition by question_id order by creationdate asc, answer_id) as rn
+    from answers
+),
+accepted as (
+    select
+        q.id as question_id,
+        q.acceptedanswerid as accepted_answer_id
+    from posts q
+    where q.posttypeid = 1
+      and q.acceptedanswerid is not null
+),
+votes_by_post as (
+    select
+        v.postid,
+        sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+        sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+        sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+        sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_flow
+    from votes v
+    where v.creationdate between (select start_month from params) and (select end_month from params) + interval '1 month' - interval '1 second'
+    group by v.postid
+),
+dup_links as (
+    select
+        pl.postid as dup_question_id,
+        pl.relatedpostid as original_question_id
+    from postlinks pl
+    where pl.linktypeid = 3
+),
+tag_norm as (
+    select
+        tq.question_id,
+        unnest(string_to_array(substring(tq.tags, 2, length(tq.tags)-2), '><')) as tag_name
+    from tagged_questions tq
+    where tq.tags is not null and tq.tags like '<%>'
+),
+tag_meta as (
+    select
+        t.tagname,
+        t.count as tag_total_count,
+        cast(t.ismoderaToronly as int) as is_mod_only,
+        cast(t.isrequired as int) as is_required
+    from tags t
+),
+question_metrics as (
+    select
+        tq.question_id,
+        tq.asker_id,
+        tq.q_date,
+        tq.q_score,
+        tq.viewcount,
+        tq.favoritecount,
+        tq.answercount,
+        tq.was_closed_or_migrated,
+        vb.upvotes as q_up,
+        vb.downvotes as q_down,
+        vb.favorites as q_favs,
+        vb.bounty_flow as q_bounty_flow,
+        coalesce(sum(tm.is_mod_only) filter (where tn.tag_name = tm.tagname), 0) as mod_only_tag_hits,
+        coalesce(sum(tm.is_required) filter (where tn.tag_name = tm.tagname), 0) as required_tag_hits,
+        count(distinct tn.tag_name) as tag_count,
+        string_agg(distinct tn.tag_name, ',' order by tn.tag_name) as tag_list
+    from tagged_questions tq
+    left join votes_by_post vb on vb.postid = tq.question_id
+    left join tag_norm tn on tn.question_id = tq.question_id
+    left join tag_meta tm on tm.tagname = tn.tag_name
+    group by tq.question_id, tq.asker_id, tq.q_date, tq.q_score, tq.viewcount, tq.favoritecount, tq.answercount, tq.was_closed_or_migrated, vb.upvotes, vb.downvotes, vb.favorites, vb.bounty_flow
+),
+answer_metrics as (
+    select
+        a.question_id,
+        count(*) as answers_total,
+        sum(case when fa.rn = 1 then 1 else 0 end) as questions_with_fast_answer,
+        cast(avg(a.a_score) as numeric(12,4)) as avg_answer_score,
+        max(a.a_score) as max_answer_score,
+        sum(case when a.is_community_wiki then 1 else 0 end) as community_wiki_answers
+    from answers a
+    left join first_answers fa on fa.answer_id = a.answer_id
+    group by a.question_id
+),
+answerer_quality as (
+    select
+        a.answerer_id as user_id,
+        count(*) as answers_posted,
+        sum(case when a.a_score >= 0 then 1 else 0 end) as non_negative_answers,
+        cast(avg(a.a_score) as numeric(12,4)) as avg_a_score,
+        percentile_cont(0.5) within group (order by a.a_score) as median_a_score
+    from answers a
+    group by a.answerer_id
+),
+user_badges as (
+    select
+        b.userid as user_id,
+        sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+        sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+        sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+        sum(case when b.tagbased = 1 then 1 else 0 end) as tag_badges
+    from badges b
+    where b.date between (select start_month from params) and (select end_month from params) + interval '1 month' - interval '1 second'
+    group by b.userid
+),
+close_reasons as (
+    select
+        ph.postid as question_id,
+        max(case when ph.posthistorytypeid = 10 then ph.comment end) as close_reason_id_raw,
+        max(case when ph.posthistorytypeid = 11 then 1 else 0 end) as was_reopened
+    from posthistory ph
+    where ph.posthistorytypeid in (10,11)
+    group by ph.postid
+),
+close_reason_name as (
+    select
+        cr.question_id,
+        crt.name as close_reason_name
+    from close_reasons cr
+    left join closer reasontypes crt on cast(crt.id as varchar) = nullif(cr.close_reason_id_raw, '')
+),
+question_enriched as (
+    select
+        qm.*,
+        am.answers_total,
+        am.questions_with_fast_answer,
+        am.avg_answer_score,
+        am.max_answer_score,
+        am.community_wiki_answers,
+        crn.close_reason_name,
+        case when dl.original_question_id is not null then 1 else 0 end as is_marked_duplicate,
+        case when ac.accepted_answer_id is not null then 1 else 0 end as has_accepted_answer
+    from question_metrics qm
+    left join answer_metrics am on am.question_id = qm.question_id
+    left join dup_links dl on dl.dup_question_id = qm.question_id
+    left join accepted ac on ac.question_id = qm.question_id
+    left join close_reason_name crn on crn.question_id = qm.question_id
+),
+user_rollup as (
+    select
+        ua.user_id,
+        ua.displayname,
+        ua.location,
+        ua.websiteurl,
+        ua.user_cohort_month,
+        ua.reputation,
+        ua.upvotes,
+        ua.downvotes,
+        coalesce(ub.gold_badges,0) as gold_badges,
+        coalesce(ub.silver_badges,0) as silver_badges,
+        coalesce(ub.bronze_badges,0) as bronze_badges,
+        coalesce(ub.tag_badges,0) as tag_badges,
+        coalesce(aq.answers_posted,0) as answers_posted,
+        coalesce(aq.non_negative_answers,0) as non_negative_answers,
+        aq.avg_a_score,
+        aq.median_a_score,
+        ua.post_count,
+        ua.q_count,
+        ua.a_count,
+        ua.total_post_score,
+        ua.last_post_activity
+    from user_activity ua
+    left join user_badges ub on ub.user_id = ua.user_id
+    left join answerer_quality aq on aq.user_id = ua.user_id
+),
+engagement_buckets as (
+    select
+        ue.*,
+        case
+            when ue.viewcount >= 100000 then 'whale'
+            when ue.viewcount >= 10000 then 'high'
+            when ue.viewcount >= 1000 then 'medium'
+            when ue.viewcount is null then 'none'
+            else 'low'
+        end as view_bucket,
+        case
+            when coalesce(ue.q_up,0) - coalesce(ue.q_down,0) >= 50 then 'excellent'
+            when coalesce(ue.q_up,0) - coalesce(ue.q_down,0) >= 10 then 'good'
+            when coalesce(ue.q_up,0) - coalesce(ue.q_down,0) >= 0 then 'meh'
+            else 'poor'
+        end as sentiment_bucket
+    from question_enriched ue
+),
+per_user_question_agg as (
+    select
+        ur.user_id,
+        count(*) as questions_asked,
+        sum(case when eq.has_accepted_answer = 1 then 1 else 0 end) as questions_with_accepted,
+        cast(avg(eq.q_score) as numeric(12,4)) as avg_q_score,
+        sum(coalesce(eq.q_bounty_flow,0)) as total_bounty_flow,
+        sum(coalesce(eq.is_marked_duplicate,0)) as dup_count,
+        sum(case when eq.was_closed_or_migrated then 1 else 0 end) as closed_or_migrated_count,
+        sum(coalesce(eq.answers_total,0)) as answers_received,
+        sum(coalesce(eq.questions_with_fast_answer,0)) as fast_answers_count,
+        cast(avg(coalesce(eq.avg_answer_score,0)) as numeric(12,4)) as avg_of_avg_ans_score,
+        max(coalesce(eq.max_answer_score,0)) as peak_answer_score,
+        count(*) filter (where eq.view_bucket in ('high','whale')) as high_visibility_questions,
+        count(*) filter (where eq.sentiment_bucket in ('good','excellent')) as positive_questions
+    from user_rollup ur
+    left join engagement_buckets eq on eq.asker_id = ur.user_id
+    group by ur.user_id
+),
+final_users as (
+    select
+        ur.*,
+        puqa.questions_asked,
+        puqa.questions_with_accepted,
+        puqa.avg_q_score,
+        puqa.total_bounty_flow,
+        puqa.dup_count,
+        puqa.closed_or_migrated_count,
+        puqa.answers_received,
+        puqa.fast_answers_count,
+        puqa.avg_of_avg_ans_score,
+        puqa.peak_answer_score,
+        puqa.high_visibility_questions,
+        puqa.positive_questions,
+        row_number() over (
+            partition by date_trunc('month', coalesce(ur.last_post_activity, ur.user_cohort_month))
+            order by coalesce(ur.reputation,0) desc, coalesce(ur.total_post_score,0) desc, ur.user_id
+        ) as monthly_rank
+    from user_rollup ur
+    left join per_user_question_agg puqa on puqa.user_id = ur.user_id
+),
+time_series as (
+    select
+        generate_series((select start_month from params), (select end_month from params), interval '1 month') as month_start
+),
+monthly_stats as (
+    select
+        ts.month_start,
+        count(distinct fu.user_id) filter (where fu.last_post_activity >= ts.month_start and fu.last_post_activity < ts.month_start + interval '1 month') as active_users,
+        cast(avg(fu.reputation) as numeric(12,2)) as avg_reputation,
+        sum(coalesce(fu.post_count,0)) as total_posts,
+        sum(coalesce(fu.q_count,0)) as total_questions,
+        sum(coalesce(fu.a_count,0)) as total_answers,
+        percentile_cont(0.5) within group (order by coalesce(fu.total_post_score,0)) as median_user_post_score,
+        count(*) filter (where fu.monthly_rank <= 100) as top100_users,
+        sum(coalesce(fu.total_bounty_flow,0)) as bounty_flow_in_window
+    from time_series ts
+    left join final_users fu
+      on coalesce(date_trunc('month', fu.last_post_activity), fu.user_cohort_month) <= ts.month_start
+     and ts.month_start < (select end_month from params) + interval '1 month'
+    group by ts.month_start
+),
+all_content as (
+    select p.id as content_id, 'post' as content_type, p.owneruserid as user_id, p.creationdate as created_at
+    from posts p
+    union all
+    select c.id, 'comment', c.userid, c.creationdate
+    from comments c
+    union all
+    select b.id, 'badge', b.userid, b.date
+    from badges b
+),
+content_windows as (
+    select
+        ac.user_id,
+        ac.content_type,
+        cast(ac.created_at as date) as day,
+        count(*) as cnt,
+        sum(count(*)) over (partition by ac.user_id order by cast(ac.created_at as date) rows between unbounded preceding and current row) as running_total,
+        avg(count(*)) over (partition by ac.user_id, ac.content_type rows between 6 preceding and current row) as seven_day_avg
+    from all_content ac
+    group by ac.user_id, ac.content_type, cast(ac.created_at as date)
+)
+select
+    cast(ms.month_start as date) as month_start,
+    ms.active_users,
+    ms.avg_reputation,
+    ms.total_posts,
+    ms.total_questions,
+    ms.total_answers,
+    ms.median_user_post_score,
+    ms.top100_users,
+    ms.bounty_flow_in_window,
+    coalesce((
+        select cast(avg(qm.viewcount) as numeric(14,2))
+        from question_metrics qm
+        where qm.q_date >= ms.month_start
+          and qm.q_date < ms.month_start + interval '1 month'
+    ), 0) as avg_views_for_questions_month,
+    'M' || to_char(ms.month_start, 'YYYYMM') || '-U' || lpad(cast(ms.active_users as text), 5, '0') as month_key,
+    rank() over (order by ms.active_users desc, ms.total_posts desc, ms.month_start) as activity_rank_over_window,
+    '(' ||
+    coalesce(string_agg(distinct tn.tag_name, ',' order by tn.tag_name) filter (
+        where qm.q_date >= ms.month_start and qm.q_date < ms.month_start + interval '1 month'
+    ), '') || ')' as tags_seen_this_month,
+    coalesce(sum(case when cw.content_type = 'comment' then cw.cnt else 0 end),0) as comments_events_sample,
+    coalesce(sum(case when cw.content_type = 'post' then cw.cnt else 0 end),0) as posts_events_sample
+from monthly_stats ms
+left join question_metrics qm
+  on qm.q_date >= ms.month_start and qm.q_date < ms.month_start + interval '1 month'
+left join tag_norm tn on tn.question_id = qm.question_id
+left join content_windows cw
+  on cw.day >= cast(ms.month_start as date)
+ and cw.day < cast(ms.month_start + interval '1 month' as date)
+group by
+    ms.month_start,
+    ms.active_users,
+    ms.avg_reputation,
+    ms.total_posts,
+    ms.total_questions,
+    ms.total_answers,
+    ms.median_user_post_score,
+    ms.top100_users,
+    ms.bounty_flow_in_window
+order by ms.month_start asc;

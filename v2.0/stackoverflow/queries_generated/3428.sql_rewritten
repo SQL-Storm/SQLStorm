@@ -1,0 +1,137 @@
+-- {"query": "3428.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2330} 
+WITH UserStats AS (
+    SELECT u.Id,
+           u.DisplayName,
+           u.Reputation,
+           u.CreationDate,
+           COALESCE(u.Location, 'Unknown') AS Location,
+           (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id) AS TotalPosts,
+           (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS QuestionCount,
+           (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS AnswerCount,
+           (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id) AS BadgeCount,
+           (SELECT SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END)
+              FROM Votes v JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+              WHERE v.UserId = u.Id) AS UpVoteGiven,
+           (SELECT SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END)
+              FROM Votes v JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+              WHERE v.UserId = u.Id) AS DownVoteGiven
+    FROM Users u
+),
+TagUsage AS (
+    SELECT t.TagName,
+           COUNT(p.Id) AS QuestionUses,
+           SUM(p.Score) AS TotalScore,
+           ROW_NUMBER() OVER (ORDER BY COUNT(p.Id) DESC) AS TagRank
+    FROM Tags t
+    JOIN Posts p ON p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+    WHERE p.PostTypeId = 1
+    GROUP BY t.TagName
+),
+TopTags AS (
+    SELECT TagName, QuestionUses, TotalScore
+    FROM TagUsage
+    WHERE TagRank <= 10
+),
+PostActivity AS (
+    SELECT p.Id,
+           p.OwnerUserId,
+           p.PostTypeId,
+           p.CreationDate,
+           p.Score,
+           p.ViewCount,
+           p.FavoriteCount,
+           COALESCE(p.ClosedDate, p.CreationDate) AS EffectiveDate,
+           LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevScore,
+           CASE
+               WHEN p.Score > COALESCE(LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate),0) THEN 1
+               ELSE 0
+           END AS ScoreImproved
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+),
+UserRankings AS (
+    SELECT us.Id,
+           us.DisplayName,
+           us.Reputation,
+           us.TotalPosts,
+           us.QuestionCount,
+           us.AnswerCount,
+           us.BadgeCount,
+           us.UpVoteGiven,
+           us.DownVoteGiven,
+           RANK() OVER (ORDER BY us.Reputation DESC, us.TotalPosts DESC) AS ReputationRank,
+           ROW_NUMBER() OVER (ORDER BY (us.AnswerCount*2 + us.QuestionCount) DESC) AS ActivityRank
+    FROM UserStats us
+)
+SELECT ur.Id,
+       ur.DisplayName,
+       ur.Reputation,
+       ur.TotalPosts,
+       ur.QuestionCount,
+       ur.AnswerCount,
+       ur.BadgeCount,
+       ur.UpVoteGiven,
+       ur.DownVoteGiven,
+       ur.ReputationRank,
+       ur.ActivityRank,
+       COALESCE(tt.TagName,'None') AS TopTag,
+       COALESCE(tt.QuestionUses,0) AS TagQuestionUses,
+       COALESCE(tt.TotalScore,0) AS TagTotalScore,
+       pa.Score,
+       pa.ViewCount,
+       pa.FavoriteCount,
+       pa.ScoreImproved,
+       CASE WHEN pa.ScoreImproved = 1 THEN 'Improving' ELSE 'Stagnant' END AS ScoreTrend
+FROM UserRankings ur
+LEFT JOIN (
+    SELECT OwnerUserId, MAX(QuestionUses) AS MaxUses
+    FROM (
+        SELECT p.OwnerUserId,
+               t.TagName,
+               COUNT(*) AS QuestionUses
+        FROM Posts p
+        JOIN Tags t ON p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+        WHERE p.PostTypeId = 1 AND p.OwnerUserId IS NOT NULL
+        GROUP BY p.OwnerUserId, t.TagName
+    ) uq
+    GROUP BY OwnerUserId
+) mu ON mu.OwnerUserId = ur.Id
+LEFT JOIN TopTags tt ON tt.QuestionUses = mu.MaxUses
+LEFT JOIN LATERAL (
+    SELECT p.Score,
+           p.ViewCount,
+           p.FavoriteCount,
+           p.ScoreImproved
+    FROM PostActivity p
+    WHERE p.OwnerUserId = ur.Id
+    ORDER BY p.CreationDate DESC
+    LIMIT 1
+) pa ON TRUE
+WHERE ur.ReputationRank <= 100
+
+UNION ALL
+
+SELECT NULL,
+       'Aggregate',
+       NULL,
+       SUM(TotalPosts),
+       SUM(QuestionCount),
+       SUM(AnswerCount),
+       SUM(BadgeCount),
+       SUM(UpVoteGiven),
+       SUM(DownVoteGiven),
+       NULL,
+       NULL,
+       NULL,
+       NULL,
+       NULL,
+       NULL,
+       NULL,
+       NULL,
+       NULL,
+       NULL,
+       NULL
+FROM UserRankings
+
+ORDER BY ReputationRank ASC NULLS LAST
+LIMIT 200;

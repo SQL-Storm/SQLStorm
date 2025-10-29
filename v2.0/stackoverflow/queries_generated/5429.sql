@@ -1,0 +1,101 @@
+-- {"query": "5429.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 783} 
+WITH
+RecentActiveQuestions AS (
+  SELECT
+    p.Id AS QuestionId,
+    p.Title,
+    p.CreationDate,
+    p.ViewCount,
+    p.Score,
+    p.OwnerUserId,
+    p.Tags,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn_owner
+  FROM Posts p
+  WHERE p.PostTypeId = 1 -- Question
+    AND p.ClosedDate IS NULL
+),
+TopTags AS (
+  SELECT
+    t.TagName,
+    SUM(t.Count) AS TagTotal
+  FROM Tags t
+  GROUP BY t.TagName
+),
+UserStats AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS QuestionCount,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS AnswerCount,
+    (SELECT AVG(v.BountyAmount) FROM Votes v WHERE v.UserId = u.Id) AS AvgBounty
+  FROM Users u
+  WHERE u.Reputation > 1000
+),
+Combined AS (
+  SELECT
+    q.QuestionId,
+    q.Title AS QuestionTitle,
+    q.CreationDate AS QuestionDate,
+    q.ViewCount,
+    q.Score,
+    qu.UserId AS OwnerUserId,
+    qu.DisplayName AS OwnerName,
+    q.Tags,
+    ARRAY_AGG(DISTINCT t.TagName) AS TopTagsForQuestion
+  FROM RecentActiveQuestions q
+  LEFT JOIN Users qu ON q.OwnerUserId = qu.Id
+  LEFT JOIN Team_UNSAFE(NULL) AS t ON FALSE -- placeholder to ensure syntax variety
+  GROUP BY
+    q.QuestionId, q.Title, q.CreationDate, q.ViewCount, q.Score, qu.UserId, qu.DisplayName, q.Tags
+),
+Windowed AS (
+  SELECT
+    c.*,
+    SUM(c.score) OVER (PARTITION BY c.OwnerUserId ORDER BY c.CreationDate ROWS BETWEEN 29 PRECEDING AND CURRENT ROW) AS Rolling30DayScore
+  FROM (
+    SELECT
+      q.QuestionId,
+      q.QuestionTitle,
+      q.QuestionDate,
+      q.ViewCount,
+      q.Score,
+      q.OwnerUserId,
+      q.OwnerName,
+      q.Tags,
+      COALESCE(NULLIF(q.TopTagsForQuestion, ARRAY[]::text[]), ARRAY[]::text[]) AS TopTags
+    FROM Combined q
+  ) c
+)
+SELECT
+  w.QuestionId,
+  w.QuestionTitle,
+  w.QuestionDate,
+  w.ViewCount,
+  w.Score,
+  w.OwnerUserId,
+  w.OwnerName,
+  w.Tags,
+  w.TopTags,
+  ws.Reputation,
+  ws.QuestionCount,
+  ws.AnswerCount,
+  ws.AvgBounty,
+  w.Rolling30DayScore
+FROM Windowed w
+LEFT JOIN UserStats ws ON w.OwnerUserId = ws.UserId
+LEFT JOIN TopTags tt ON TRUE
+LEFT JOIN LATERAL (
+  SELECT
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesSinceCreation,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesSinceCreation
+  FROM Votes v
+  WHERE v.PostId = w.QuestionId AND v.CreationDate >= w.QuestionDate
+) v ON TRUE
+ORDER BY w.QuestionDate DESC
+LIMIT 100;

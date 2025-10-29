@@ -1,0 +1,121 @@
+-- {"query": "5505.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 929} 
+WITH ranked_posts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Body,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.ParentId,
+    p.PostTypeId,
+    p.CommentCount,
+    p.AcceptedAnswerId,
+    p.FavoriteCount,
+    p.ContentLicense,
+    COALESCE(u.Reputation, 0) AS OwnerReputation,
+    u.DisplayName AS OwnerDisplayName,
+    u.Location,
+    u.AccountId,
+    -- window function: time since creation and rank by score within 7-day sliding window
+    EXTRACT(epoch FROM (CURRENT_TIMESTAMP - p.CreationDate))/86400 AS AgeDays
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+),
+pdown AS (
+  SELECT
+    rp.*,
+    -- correlated subquery: total comments on posts by the same owner
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = rp.PostId) AS PostCommentCount,
+    -- correlated subquery: total score of owner's posts in last 30 days
+    (SELECT COALESCE(SUM(p2.Score),0)
+     FROM Posts p2
+     WHERE p2.OwnerUserId = rp.OwnerUserId
+       AND p2.CreationDate >= CURRENT_DATE - INTERVAL '30 days') AS OwnerLast30DayScore
+  FROM ranked_posts rp
+),
+joined AS (
+  SELECT
+    pdown.*,
+    -- left join to PostLinks to bring related posts
+    pl.RelatedPostId AS LinkedPostId,
+    pl.LinkTypeId,
+    -- join to Tags for tag-derived filtering
+    t.TagName
+  FROM pdown
+  LEFT JOIN PostLinks pl ON pl.PostId = pdown.PostId
+  LEFT JOIN Tags t ON t.ExcerptPostId = pdown.PostId
+),
+aggregates AS (
+  SELECT
+    j.PostId,
+    j.Title,
+    j.OwnerDisplayName,
+    j.OwnerReputation,
+    j.CreationDate,
+    j.LastActivityDate,
+    j.ViewCount,
+    j.Score,
+    j.CommentCount,
+    j.FavoriteCount,
+    j.PostTypeId,
+    j.LinkedPostId,
+    j.LinkTypeId,
+    j.TagName,
+    -- advanced calculations: string expression on Tags column to derive a synthetic tag score
+    (SELECT COUNT(*) FROM Unnest(string_to_array(REPLACE(REPLACE(j.Tags,'<',''),'>',''), '>') AS t WHERE t <> '') AS TagCount,
+    -- null-safe numeric expression
+    (CASE WHEN j.ViewCount IS NULL THEN 0 ELSE j.ViewCount END
+     + CASE WHEN j.Score IS NULL THEN 0 ELSE j.Score END
+     + CASE WHEN j.PostCommentCount IS NULL THEN 0 ELSE j.PostCommentCount END) AS EngagementScore,
+    -- ordering key using multiple predicates
+    ROW_NUMBER() OVER (
+      PARTITION BY j.PostTypeId
+      ORDER BY
+        j.Score DESC NULLS LAST,
+        j.ViewCount DESC NULLS LAST,
+        j.CreationDate DESC
+    ) AS RankInType
+  FROM joined j
+),
+filtered AS (
+  SELECT
+    a.*,
+    -- complicated predicate: include posts that are questions with high engagement and not older than 365 days,
+    (a.PostTypeId = 1 AND a.EngagementScore > 100)
+    OR
+    (a.PostTypeId = 2 AND a.EngagementScore > 50)
+    OR
+    (a.PostTypeId = 5) -- TagWiki related wikis allowed
+    AS IncludeFlag
+  FROM aggregates a
+)
+SELECT
+  IncludeFlag,
+  PostId,
+  Title,
+  OwnerDisplayName,
+  OwnerReputation,
+  CreationDate,
+  LastActivityDate,
+  ViewCount,
+  Score,
+  CommentCount,
+  FavoriteCount,
+  PostTypeId,
+  LinkedPostId,
+  LinkTypeId,
+  TagName,
+  TagCount,
+  EngagementScore,
+  RankInType
+FROM filtered
+WHERE IncludeFlag
+  -- outer filter to create a multi-join-heavy benchmark workload
+  AND (LinkedPostId IS NULL OR LinkedPostId IN (SELECT Id FROM Posts))
+  AND (TagName IS NULL OR TagName <> '')
+ORDER BY RankInType, CreationDate DESC
+LIMIT 100;

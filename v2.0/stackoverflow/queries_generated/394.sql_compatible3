@@ -1,0 +1,413 @@
+with recent_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.location,
+    coalesce(nullif(trim(u.websiteurl), ''), 'N/A') as website_norm,
+    dense_rank() over (order by u.creationdate desc) as dr_newest
+  from users u
+),
+user_activity as (
+  select
+    p.owneruserid as user_id,
+    count(*) filter (where p.posttypeid = 1) as q_count,
+    count(*) filter (where p.posttypeid = 2) as a_count,
+    sum(case when p.score > 0 then p.score else 0 end) as nonneg_score_sum,
+    sum(case when p.closeddate is not null then 1 else 0 end) as closed_count,
+    max(p.lastactivitydate) as last_post_activity
+  from posts p
+  where p.owneruserid is not null
+  group by p.owneruserid
+),
+badge_stats as (
+  select
+    b.userid as user_id,
+    count(*) as badge_count,
+    sum(case when b.class = 1 then 1 else 0 end) as gold_count,
+    sum(case when b.class = 2 then 1 else 0 end) as silver_count,
+    sum(case when b.class = 3 then 1 else 0 end) as bronze_count,
+    min(b.date) as first_badge_date,
+    max(b.date) as last_badge_date
+  from badges b
+  group by b.userid
+),
+commenter_heat as (
+  select
+    c.userid as user_id,
+    count(*) as comment_count,
+    sum(coalesce(c.score, 0)) as comment_score,
+    sum(case when lower(c.text) like any (array['%thank%','%great%','%nice%','%helpful%']) then 1 else 0 end) as pos_sentiment_hits,
+    sum(case when c.text ~ '\?$' then 1 else 0 end) as question_comments
+  from comments c
+  where c.userid is not null
+  group by c.userid
+),
+question_basics as (
+  select
+    p.id as question_id,
+    p.owneruserid as asker_id,
+    p.creationdate as question_created,
+    p.score as question_score,
+    p.viewcount as question_views,
+    p.tags,
+    p.acceptedanswerid,
+    p.title,
+    unnest(string_to_array(substring(p.tags from 2 for length(p.tags)-2), '><')) as tagname
+  from posts p
+  where p.posttypeid = 1
+),
+answerers as (
+  select
+    a.parentid as question_id,
+    a.owneruserid as answerer_id,
+    count(*) as answers_by_user,
+    sum(a.score) as answer_score_sum,
+    max(a.creationdate) as last_answer_date
+  from posts a
+  where a.posttypeid = 2
+  group by a.parentid, a.owneruserid
+),
+dupe_links as (
+  select
+    pl.relatedpostid as canonical_id,
+    count(*) filter (where pl.linktypeid = 3) as duplicate_count,
+    count(*) filter (where pl.linktypeid = 1) as linked_count,
+    min(pl.creationdate) as first_link_date
+  from postlinks pl
+  group by pl.relatedpostid
+),
+vote_agg as (
+  select
+    v.postid,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+    sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_total,
+    count(*) filter (where v.votetypeid in (1,10,11,12,14,15,16)) as other_votes
+  from votes v
+  group by v.postid
+),
+post_close_reasons as (
+  select
+    ph.postid,
+    max(ph.creationdate) filter (where ph.posthistorytypeid = 10) as last_close_date,
+    max(ph.creationdate) filter (where ph.posthistorytypeid = 11) as last_reopen_date,
+    max(case when ph.posthistorytypeid = 10 and ph.comment ~ '^[0-9]+' then cast(ph.comment as integer) end) as last_close_reason_id
+  from posthistory ph
+  where ph.posthistorytypeid in (10,11)
+  group by ph.postid
+),
+tag_popularity as (
+  select
+    qb.tagname,
+    count(*) as tag_q_count,
+    sum(coalesce(qb.question_views,0)) as tag_view_sum,
+    avg(coalesce(qb.question_score,0)) as tag_avg_score
+  from question_basics qb
+  group by qb.tagname
+),
+accepted_answer_latency as (
+  select
+    q.id as question_id,
+    q.owneruserid as asker_id,
+    q.creationdate as question_created,
+    a.id as accepted_answer_id,
+    a.owneruserid as accepted_by_user,
+    a.creationdate as accepted_created,
+    cast(extract(epoch from (a.creationdate - q.creationdate)) as bigint) as seconds_to_accept
+  from posts q
+  join posts a on a.id = q.acceptedanswerid
+  where q.posttypeid = 1
+),
+user_vote_influence as (
+  select
+    p.owneruserid as user_id,
+    sum(va.upvotes) as up_gained,
+    sum(va.downvotes) as down_gained,
+    sum(va.favorites) as favs_gained,
+    sum(va.bounty_total) as bounties_gained
+  from posts p
+  join vote_agg va on va.postid = p.id
+  group by p.owneruserid
+),
+user_ranks as (
+  select
+    u.id as user_id,
+    rank() over (order by u.reputation desc, u.upvotes desc) as r_reputation,
+    rank() over (order by coalesce(ua.q_count,0) desc) as r_questions,
+    rank() over (order by coalesce(ua.a_count,0) desc) as r_answers,
+    rank() over (order by coalesce(bs.badge_count,0) desc) as r_badges,
+    rank() over (order by coalesce(uv.up_gained,0) desc) as r_upvote_influence,
+    rank() over (order by coalesce(ch.comment_count,0) desc) as r_comments
+  from users u
+  left join user_activity ua on ua.user_id = u.id
+  left join badge_stats bs on bs.user_id = u.id
+  left join user_vote_influence uv on uv.user_id = u.id
+  left join commenter_heat ch on ch.user_id = u.id
+),
+question_enriched as (
+  select
+    qb.question_id,
+    qb.asker_id,
+    qb.title,
+    qb.tags,
+    qb.question_created,
+    qb.question_score,
+    qb.question_views,
+    qb.acceptedanswerid,
+    coalesce(dl.duplicate_count,0) as duplicate_count,
+    coalesce(dl.linked_count,0) as linked_count,
+    va.upvotes,
+    va.downvotes,
+    va.favorites,
+    va.bounty_total,
+    pcr.last_close_date,
+    pcr.last_reopen_date,
+    pcr.last_close_reason_id
+  from (
+    select distinct on (question_id) question_id, asker_id, title, tags, question_created, question_score, question_views, acceptedanswerid
+    from question_basics
+  ) qb
+  left join dupe_links dl on dl.canonical_id = qb.question_id
+  left join vote_agg va on va.postid = qb.question_id
+  left join post_close_reasons pcr on pcr.postid = qb.question_id
+),
+question_tag_metrics as (
+  select
+    qb.question_id,
+    count(*) as tag_count,
+    sum(tp.tag_q_count) as tag_total_qs,
+    sum(tp.tag_view_sum) as tag_total_views,
+    avg(tp.tag_avg_score) as tag_avg_score
+  from question_basics qb
+  join tag_popularity tp on tp.tagname = qb.tagname
+  group by qb.question_id
+),
+top_answerers as (
+  select
+    a.question_id,
+    a.answerer_id,
+    a.answers_by_user,
+    a.answer_score_sum,
+    row_number() over (partition by a.question_id order by a.answer_score_sum desc, a.answers_by_user desc, a.answerer_id) as rn
+  from answerers a
+),
+question_quality as (
+  select
+    qe.question_id,
+    qe.asker_id,
+    (coalesce(qe.upvotes,0) - coalesce(qe.downvotes,0)) * 1.0
+      + coalesce(qe.favorites,0) * 0.75
+      + coalesce(qe.bounty_total,0) * 0.05
+      + least(coalesce(qe.question_views,0) / nullif(cast(extract(epoch from (timestamp '2024-10-01 12:34:56' - qe.question_created)) as numeric),0), 10) * 3
+      - coalesce(qe.duplicate_count,0) * 2
+      - case when qe.last_close_date is not null and (qe.last_reopen_date is null or qe.last_close_date > qe.last_reopen_date) then 5 else 0 end
+      + coalesce(qtm.tag_avg_score,0) * 0.5
+      as quality_score
+  from question_enriched qe
+  left join question_tag_metrics qtm on qtm.question_id = qe.question_id
+),
+user_summary as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.location,
+    ru.dr_newest,
+    coalesce(ua.q_count,0) as questions,
+    coalesce(ua.a_count,0) as answers,
+    coalesce(ua.nonneg_score_sum,0) as post_score_sum,
+    coalesce(bs.badge_count,0) as badges,
+    coalesce(bs.gold_count,0) as gold,
+    coalesce(bs.silver_count,0) as silver,
+    coalesce(bs.bronze_count,0) as bronze,
+    coalesce(ch.comment_count,0) as comments,
+    coalesce(ch.comment_score,0) as comment_score,
+    coalesce(ch.pos_sentiment_hits,0) as pos_sentiment_hits,
+    coalesce(uv.up_gained,0) as upvote_influence,
+    coalesce(uv.down_gained,0) as downvote_influence,
+    coalesce(uv.favs_gained,0) as favorite_influence,
+    coalesce(uv.bounties_gained,0) as bounties_gained,
+    ua.last_post_activity
+  from users u
+  left join recent_users ru on ru.user_id = u.id
+  left join user_activity ua on ua.user_id = u.id
+  left join badge_stats bs on bs.user_id = u.id
+  left join commenter_heat ch on ch.user_id = u.id
+  left join user_vote_influence uv on uv.user_id = u.id
+),
+asker_quality as (
+  select
+    qq.asker_id as user_id,
+    count(*) as asked_count,
+    avg(qq.quality_score) as avg_question_quality,
+    sum(case when qq.quality_score >= 10 then 1 else 0 end) as high_quality_qs,
+    max(qq.quality_score) as max_quality_q
+  from question_quality qq
+  group by qq.asker_id
+),
+asker_accept_latency as (
+  select
+    aal.asker_id as user_id,
+    count(*) as accepted_questions,
+    percentile_cont(0.5) within group (order by aal.seconds_to_accept) as p50_seconds_to_accept,
+    percentile_cont(0.9) within group (order by aal.seconds_to_accept) as p90_seconds_to_accept,
+    avg(aal.seconds_to_accept) as avg_seconds_to_accept
+  from accepted_answer_latency aal
+  group by aal.asker_id
+),
+user_top_answer_flags as (
+  select
+    ta.answerer_id as user_id,
+    count(*) filter (where ta.rn = 1) as top_answered_questions,
+    count(*) as answered_questions_sample,
+    avg(coalesce(qa.quality_score,0)) as avg_quality_of_answered_questions
+  from top_answerers ta
+  left join question_quality qa on qa.question_id = ta.question_id
+  group by ta.answerer_id
+),
+user_final_score as (
+  select
+    us.user_id,
+    us.displayname,
+    us.reputation,
+    us.creationdate,
+    us.location,
+    us.questions,
+    us.answers,
+    us.badges,
+    us.gold,
+    us.silver,
+    us.bronze,
+    us.comments,
+    us.comment_score,
+    us.pos_sentiment_hits,
+    coalesce(aq.asked_count,0) as asked_count,
+    coalesce(aq.avg_question_quality,0) as avg_question_quality,
+    coalesce(aq.max_quality_q,0) as max_quality_q,
+    coalesce(aal.accepted_questions,0) as accepted_questions,
+    coalesce(aal.p50_seconds_to_accept,0) as p50_seconds_to_accept,
+    coalesce(aal.p90_seconds_to_accept,0) as p90_seconds_to_accept,
+    coalesce(aal.avg_seconds_to_accept,0) as avg_seconds_to_accept,
+    coalesce(ut.top_answered_questions,0) as top_answered_questions,
+    coalesce(ut.answered_questions_sample,0) as answered_questions_sample,
+    coalesce(ut.avg_quality_of_answered_questions,0) as avg_quality_of_answered_questions,
+    us.upvote_influence,
+    us.downvote_influence,
+    us.favorite_influence,
+    us.bounties_gained,
+    us.last_post_activity,
+    (
+      ln(1 + greatest(us.reputation,0)) * 3
+      + ln(1 + greatest(us.questions,0)) * 1.2
+      + ln(1 + greatest(us.answers,0)) * 2.0
+      + ln(1 + greatest(us.badges,0)) * 1.0
+      + coalesce(aq.avg_question_quality,0) * 0.8
+      + coalesce(ut.avg_quality_of_answered_questions,0) * 0.6
+      + ln(1 + greatest(us.upvote_influence,0)) * 1.5
+      - ln(1 + greatest(us.downvote_influence,0)) * 0.5
+      + ln(1 + greatest(us.favorite_influence,0)) * 0.7
+      + sqrt(greatest(us.bounties_gained,0)) * 0.9
+      + case when us.last_post_activity > (timestamp '2024-10-01 12:34:56' - interval '90 days') then 2 else 0 end
+      - case when coalesce(aal.p90_seconds_to_accept,0) > 86400 then 1 else 0 end
+      + case when coalesce(ut.top_answered_questions,0) >= 10 then 1 else 0 end
+    ) as final_score
+  from user_summary us
+  left join asker_quality aq on aq.user_id = us.user_id
+  left join asker_accept_latency aal on aal.user_id = us.user_id
+  left join user_top_answer_flags ut on ut.user_id = us.user_id
+),
+user_final_ranked as (
+  select
+    ufs.user_id,
+    ufs.displayname,
+    ufs.reputation,
+    ufs.creationdate,
+    ufs.location,
+    ufs.questions,
+    ufs.answers,
+    ufs.badges,
+    ufs.gold,
+    ufs.silver,
+    ufs.bronze,
+    ufs.comments,
+    ufs.comment_score,
+    ufs.pos_sentiment_hits,
+    ufs.asked_count,
+    ufs.avg_question_quality,
+    ufs.max_quality_q,
+    ufs.accepted_questions,
+    ufs.p50_seconds_to_accept,
+    ufs.p90_seconds_to_accept,
+    ufs.avg_seconds_to_accept,
+    ufs.top_answered_questions,
+    ufs.answered_questions_sample,
+    ufs.avg_quality_of_answered_questions,
+    ufs.upvote_influence,
+    ufs.downvote_influence,
+    ufs.favorite_influence,
+    ufs.bounties_gained,
+    ufs.last_post_activity,
+    ufs.final_score,
+    ur.r_reputation,
+    ur.r_questions,
+    ur.r_answers,
+    ur.r_badges,
+    ur.r_upvote_influence,
+    ur.r_comments,
+    row_number() over (
+      order by ufs.final_score desc,
+               ur.r_reputation,
+               ur.r_answers,
+               ur.r_questions,
+               ufs.reputation desc,
+               ufs.answers desc
+    ) as overall_rank
+  from user_final_score ufs
+  left join user_ranks ur on ur.user_id = ufs.user_id
+),
+candidate_users as (
+  select * from user_final_ranked
+  where (creationdate > (timestamp '2024-10-01 12:34:56' - interval '5 years') and answers >= 5)
+  union
+  select * from user_final_ranked
+  where final_score >= (select percentile_cont(0.95) within group (order by final_score) from user_final_ranked)
+),
+rendered as (
+  select
+    cu.overall_rank,
+    cu.user_id,
+    coalesce(nullif(cu.displayname, ''), '(anonymous)') as displayname,
+    cu.reputation,
+    cu.final_score,
+    cu.questions,
+    cu.answers,
+    cu.badges,
+    concat_ws(
+      ' | ',
+      concat('Gold:', cu.gold, ', Silver:', cu.silver, ', Bronze:', cu.bronze),
+      concat('Q:', cu.questions, ', A:', cu.answers),
+      concat('AskedQQualAvg:', round(cast(cu.avg_question_quality as numeric),2)),
+      concat('TopAnsQ:', cu.top_answered_questions),
+      concat('UpInf:', cu.upvote_influence, ', FavInf:', cu.favorite_influence),
+      concat('Bounties:', cu.bounties_gained),
+      concat('LastActivity:', to_char(cu.last_post_activity, 'YYYY-MM-DD'))
+    ) as summary_text
+  from candidate_users cu
+)
+select
+  r.overall_rank,
+  r.user_id,
+  r.displayname,
+  r.reputation,
+  round(cast(r.final_score as numeric), 3) as final_score,
+  r.questions,
+  r.answers,
+  r.badges,
+  r.summary_text
+from rendered r
+order by r.overall_rank
+limit 200;

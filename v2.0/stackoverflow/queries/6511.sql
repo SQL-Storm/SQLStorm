@@ -1,0 +1,67 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.Title,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.OwnerUserId,
+        U.DisplayName,
+        U.Reputation,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.ViewCount DESC) AS rank
+    FROM 
+        Posts P
+    JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId IN (1, 2) AND P.Score > 0
+),
+BadgeCounts AS (
+    SELECT 
+        U.Id,
+        U.DisplayName,
+        COUNT(B.Id) AS badge_count
+    FROM 
+        Users U
+    JOIN 
+        Badges B ON U.Id = B.UserId
+    WHERE 
+        B.Class = 1 AND B.TagBased = false
+    GROUP BY 
+        U.Id, U.DisplayName
+),
+CommentMetrics AS (
+    SELECT 
+        PC.Id AS PostId,
+        COUNT(C.Id) AS comment_count,
+        SUM(C.Score) AS total_comment_score
+    FROM 
+        Posts PC
+    LEFT JOIN 
+        Comments C ON PC.Id = C.PostId
+    GROUP BY 
+        PC.Id
+)
+SELECT 
+    RP.Id,
+    RP.Title,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.rank,
+    COALESCE(BC.badge_count, 0) AS badge_count,
+    COALESCE(CM.comment_count, 0) AS comment_count,
+    COALESCE(CM.total_comment_score, 0) AS total_comment_score,
+    CASE 
+        WHEN RP.rank <= 10 THEN 'Top'
+        WHEN RP.rank <= 100 THEN 'Middle'
+        ELSE 'Bottom'
+    END AS rank_group
+FROM 
+    RankedPosts RP
+LEFT JOIN 
+    BadgeCounts BC ON RP.OwnerUserId = BC.Id
+LEFT JOIN 
+    CommentMetrics CM ON RP.Id = CM.PostId
+ORDER BY 
+    RP.rank, RP.Score DESC;

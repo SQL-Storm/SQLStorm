@@ -1,0 +1,243 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.LastActivityDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+        LEAD(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as next_score,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as avg_score,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) as total_posts,
+        NTILE(4) OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score) as quartile
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.AccountId,
+        COUNT(DISTINCT p.Id) as total_posts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) as question_count,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) as answer_count,
+        SUM(p.Score) as total_score,
+        AVG(p.Score) as avg_score,
+        MAX(p.CreationDate) as last_activity
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes, u.AccountId
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE WHEN t.Count > (SELECT AVG(Count) FROM Tags) THEN 'High' 
+             WHEN t.Count > (SELECT AVG(Count)/2 FROM Tags) THEN 'Medium' 
+             ELSE 'Low' END as tag_level,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as rank_by_popularity
+    FROM Tags t
+    WHERE t.TagName IS NOT NULL AND t.TagName != ''
+),
+PostWithDetails AS (
+    SELECT 
+        rp.Id,
+        rp.PostTypeId,
+        rp.Score,
+        rp.ViewCount,
+        rp.CreationDate,
+        rp.OwnerUserId,
+        rp.Title,
+        rp.Tags,
+        rp.AnswerCount,
+        rp.CommentCount,
+        rp.FavoriteCount,
+        rp.LastActivityDate,
+        rp.rn,
+        rp.prev_score,
+        rp.next_score,
+        rp.avg_score,
+        rp.total_posts,
+        rp.quartile,
+        CASE WHEN rp.Score > rp.avg_score THEN 'Above Average' 
+             WHEN rp.Score < rp.avg_score THEN 'Below Average' 
+             ELSE 'Average' END as score_category,
+        CASE WHEN rp.AnswerCount > 0 THEN 'Has Answers' ELSE 'No Answers' END as answer_status,
+        u.DisplayName as owner_name,
+        u.Reputation as owner_reputation,
+        us.total_posts as owner_total_posts,
+        us.question_count as owner_questions,
+        us.answer_count as owner_answers
+    FROM RankedPosts rp
+    JOIN Users u ON rp.OwnerUserId = u.Id
+    LEFT JOIN UserStats us ON rp.OwnerUserId = us.UserId
+    WHERE rp.total_posts > 1
+),
+QuestionAnalysis AS (
+    SELECT 
+        pq.Id as QuestionId,
+        pq.Title,
+        pq.Score,
+        pq.ViewCount,
+        pq.AnswerCount,
+        pq.CommentCount,
+        pq.FavoriteCount,
+        pq.LastActivityDate,
+        pq.owner_name,
+        pq.owner_reputation,
+        pq.owner_total_posts,
+        pq.owner_questions,
+        pq.owner_answers,
+        pq.score_category,
+        pq.answer_status,
+        pq.rn as post_rank,
+        pq.prev_score,
+        pq.next_score,
+        pq.avg_score,
+        pq.quartile,
+        tag.tagname as TagName,
+        CASE WHEN LOWER(tag.tagname) LIKE '%sql%' THEN 1 ELSE 0 END as is_sql_related,
+        CASE WHEN LOWER(tag.tagname) LIKE '%java%' THEN 1 ELSE 0 END as is_java_related,
+        CASE WHEN LOWER(tag.tagname) LIKE '%python%' THEN 1 ELSE 0 END as is_python_related,
+        COALESCE(pq.prev_score, 0) - COALESCE(pq.next_score, 0) as score_difference,
+        ABS(pq.Score - pq.avg_score) as deviation_from_avg,
+        DATE_PART('day', CAST('2024-10-01 12:34:56' AS timestamp) - pq.CreationDate) as days_since_creation,
+        CASE WHEN pq.AnswerCount = 0 AND pq.Score < 0 THEN 'Unanswered Negative Score Question'
+             WHEN pq.AnswerCount > 0 AND pq.Score > 10 THEN 'Popular Answered Question'
+             WHEN pq.AnswerCount = 0 AND pq.Score > 10 THEN 'Popular Unanswered Question'
+             ELSE 'Standard Question' END as question_classification
+    FROM PostWithDetails pq
+    JOIN Posts p ON pq.Id = p.Id
+    -- split tags by removing leading '<' and trailing '>' and splitting on '><'
+    CROSS JOIN LATERAL (
+        SELECT regexp_split_to_table(
+            CASE 
+                WHEN p.Tags IS NULL THEN '' 
+                WHEN substring(p.Tags FROM 1 FOR 1) = '<' AND substring(p.Tags FROM char_length(p.Tags) FOR 1) = '>' 
+                    THEN substring(p.Tags FROM 2 FOR char_length(p.Tags)-2) 
+                ELSE p.Tags 
+            END,
+            '><'
+        ) AS tagname
+    ) tag
+    WHERE pq.PostTypeId = 1
+),
+AnswerAnalysis AS (
+    SELECT 
+        pa.Id as AnswerId,
+        pa.Score,
+        pa.ViewCount,
+        pa.CommentCount,
+        pa.FavoriteCount,
+        pa.LastActivityDate,
+        pa.owner_name,
+        pa.owner_reputation,
+        pa.owner_total_posts,
+        pa.owner_questions,
+        pa.owner_answers,
+        pa.score_category,
+        pa.answer_status,
+        pa.rn as post_rank,
+        pa.prev_score,
+        pa.next_score,
+        pa.avg_score,
+        pa.quartile,
+        CASE WHEN pa.Score > 0 THEN 'Positive Scoring' 
+             WHEN pa.Score < 0 THEN 'Negative Scoring' 
+             ELSE 'Neutral Scoring' END as scoring_status,
+        CASE WHEN pa.LastActivityDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days' THEN 'Recently Active' 
+             ELSE 'Inactive' END as activity_status,
+        ABS(pa.Score - pa.avg_score) as deviation_from_avg
+    FROM PostWithDetails pa
+    WHERE pa.PostTypeId = 2
+)
+SELECT 
+    'Questions' as record_type,
+    qa.QuestionId as Id,
+    qa.Title,
+    qa.Score,
+    qa.ViewCount,
+    qa.AnswerCount,
+    qa.CommentCount,
+    qa.FavoriteCount,
+    qa.LastActivityDate,
+    qa.owner_name,
+    qa.owner_reputation,
+    qa.owner_total_posts,
+    qa.owner_questions,
+    qa.owner_answers,
+    qa.score_category,
+    qa.answer_status,
+    qa.post_rank,
+    qa.prev_score,
+    qa.next_score,
+    qa.avg_score,
+    qa.quartile,
+    qa.TagName,
+    qa.is_sql_related,
+    qa.is_java_related,
+    qa.is_python_related,
+    qa.score_difference,
+    qa.deviation_from_avg,
+    qa.days_since_creation,
+    qa.question_classification
+FROM QuestionAnalysis qa
+WHERE qa.owner_reputation > 1000
+    AND qa.days_since_creation < 365
+    AND qa.AnswerCount >= 1
+    AND qa.Score >= -10
+
+UNION ALL
+
+SELECT 
+    'Answers' as record_type,
+    aa.AnswerId as Id,
+    NULL as Title,
+    aa.Score,
+    aa.ViewCount,
+    NULL as AnswerCount,
+    aa.CommentCount,
+    aa.FavoriteCount,
+    aa.LastActivityDate,
+    aa.owner_name,
+    aa.owner_reputation,
+    aa.owner_total_posts,
+    aa.owner_questions,
+    aa.owner_answers,
+    aa.score_category,
+    aa.answer_status,
+    aa.post_rank,
+    aa.prev_score,
+    aa.next_score,
+    aa.avg_score,
+    aa.quartile,
+    NULL as TagName,
+    NULL as is_sql_related,
+    NULL as is_java_related,
+    NULL as is_python_related,
+    NULL as score_difference,
+    aa.deviation_from_avg,
+    NULL as days_since_creation,
+    NULL as question_classification
+FROM AnswerAnalysis aa
+WHERE aa.owner_reputation > 500
+    AND aa.deviation_from_avg > 5
+    AND aa.score_category IN ('Above Average', 'Below Average')
+    AND aa.activity_status = 'Recently Active'
+
+ORDER BY record_type, Score DESC, LastActivityDate DESC
+LIMIT 1000;

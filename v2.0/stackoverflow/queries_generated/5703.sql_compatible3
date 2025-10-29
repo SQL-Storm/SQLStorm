@@ -1,0 +1,47 @@
+SELECT
+    u.Id AS UserId,
+    u.DisplayName AS UserName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS PostCount,
+    AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL) AS AvgPostScore,
+    MAX(p.CreationDate) AS LastPostDate,
+    COUNT(DISTINCT c.Id) AS CommentCount,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived,
+    STRING_AGG(DISTINCT t.Name, ',') AS TagsUsed,
+    CASE
+        WHEN u.AccountId IS NULL THEN 'Unknown'
+        WHEN u.Location IS NULL THEN 'Unspecified'
+        ELSE TRIM(u.Location)
+    END AS LocationTag
+FROM
+    Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN (
+        SELECT
+            v.PostId,
+            v.VoteTypeId,
+            v.UserId,
+            v.CreationDate,
+            v.BountyAmount
+        FROM Votes v
+        WHERE v.VoteTypeId IN (2, 3)
+    ) v ON v.PostId = p.Id
+    LEFT JOIN LATERAL (
+        SELECT regexp_split_to_table(COALESCE(p.Tags, ''), '><?') AS tag_token
+    ) ttok ON TRUE
+    LEFT JOIN Tags t ON t.TagName = REPLACE(REPLACE(REPLACE(ttok.tag_token, '<', ''), '>', ''), '', '')
+GROUP BY
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.AccountId,
+    u.Location,
+    LastPostDate
+HAVING
+    COUNT(DISTINCT p.Id) > 0
+ORDER BY
+    Reputation DESC,
+    LastPostDate DESC
+LIMIT 100;

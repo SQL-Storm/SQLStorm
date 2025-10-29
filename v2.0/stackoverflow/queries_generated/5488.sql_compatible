@@ -1,0 +1,118 @@
+WITH RankedPosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Body,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.Tags,
+    p.PostTypeId,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ContentLicense,
+    u.Reputation,
+    u.DisplayName,
+    u.Location,
+    u.CreationDate AS UserCreationDate,
+    u.LastAccessDate,
+    COALESCE(cb.Count, 0) AS BadgeCountForOwner,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate DESC) AS rn_owner
+  FROM Posts p
+  JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN (
+    SELECT UserId, COUNT(*) AS Count
+    FROM Badges
+    GROUP BY UserId
+  ) cb ON cb.UserId = u.Id
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+),
+CorrelatedStats AS (
+  SELECT
+    rp.PostId,
+    rp.Title,
+    rp.OwnerUserId,
+    rp.Reputation,
+    rp.DisplayName,
+    rp.LastActivityDate,
+    rp.ViewCount,
+    rp.Score,
+    rp.Tags,
+    rp.BadgeCountForOwner,
+    rp.UserCreationDate,
+    (SELECT AVG(p2.ViewCount) FROM Posts p2 WHERE p2.OwnerUserId = rp.OwnerUserId) AS AvgViewsByAuthor,
+    (SELECT COUNT(*) FROM Posts p3 WHERE p3.OwnerUserId = rp.OwnerUserId AND p3.LastActivityDate > rp.LastActivityDate) AS ActiveAfter
+  FROM RankedPosts rp
+  WHERE rp.rn_owner = 1
+),
+WindowAgg AS (
+  SELECT
+    ps.PostId,
+    ps.Title,
+    ps.OwnerUserId,
+    ps.Reputation,
+    ps.DisplayName,
+    ps.LastActivityDate,
+    ps.ViewCount,
+    ps.Score,
+    ps.Tags,
+    ps.BadgeCountForOwner,
+    ps.AvgViewsByAuthor,
+    ps.ActiveAfter,
+    ps.UserCreationDate,
+    SUM(ps.Score) OVER (
+      PARTITION BY ps.OwnerUserId
+      ORDER BY ps.LastActivityDate
+      ROWS BETWEEN 29 PRECEDING AND CURRENT ROW
+    ) AS SumScoreLast30
+  FROM CorrelatedStats ps
+),
+DetailedMatches AS (
+  SELECT
+    wa.PostId,
+    wa.Title,
+    wa.OwnerUserId,
+    wa.Reputation,
+    wa.DisplayName,
+    wa.LastActivityDate,
+    wa.ViewCount,
+    wa.Score,
+    wa.Tags,
+    wa.BadgeCountForOwner,
+    wa.AvgViewsByAuthor,
+    wa.ActiveAfter,
+    wa.SumScoreLast30,
+    wa.UserCreationDate,
+    CASE
+      WHEN wa.ViewCount > 1000 OR wa.SumScoreLast30 > 500 THEN TRUE
+      ELSE FALSE
+    END AS IsHot,
+    (SELECT STRING_AGG(t.TagName, ',') FROM unnest(string_to_array(wa.Tags, '|')) AS t(TagName)) AS TagList
+  FROM WindowAgg wa
+)
+SELECT
+  PostId,
+  Title,
+  OwnerUserId,
+  Reputation,
+  DisplayName,
+  LastActivityDate,
+  ViewCount,
+  Score,
+  Tags,
+  BadgeCountForOwner,
+  AvgViewsByAuthor,
+  ActiveAfter,
+  SumScoreLast30,
+  IsHot,
+  TagList,
+  UserCreationDate
+FROM DetailedMatches
+WHERE IsHot = TRUE
+ORDER BY LastActivityDate DESC
+LIMIT 100;

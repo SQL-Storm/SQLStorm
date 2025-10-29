@@ -1,0 +1,136 @@
+WITH usr_stats AS (
+    SELECT
+        u.id                               AS user_id,
+        u.displayname                      AS display_name,
+        u.reputation,
+        COUNT(p.id)                        AS total_posts,
+        SUM(CASE WHEN p.posttypeid = 1 THEN 1 ELSE 0 END) AS question_cnt,
+        SUM(CASE WHEN p.posttypeid = 2 THEN 1 ELSE 0 END) AS answer_cnt,
+        COALESCE(SUM(p.score),0)           AS total_score,
+        AVG(p.score) FILTER (WHERE p.score IS NOT NULL) AS avg_score,
+        MAX(p.creationdate)               AS last_post_dt
+    FROM users u
+    LEFT JOIN posts p
+           ON p.owneruserid = u.id
+    GROUP BY u.id, u.displayname, u.reputation
+),
+
+badge_agg AS (
+    SELECT
+        b.userid                         AS user_id,
+        COUNT(*)                         AS badge_cnt,
+        COUNT(*) FILTER (WHERE b.class = 1) AS gold_badge_cnt,
+        STRING_AGG(DISTINCT b.name, ',') AS badge_list
+    FROM badges b
+    GROUP BY b.userid
+),
+
+top_tags AS (
+    SELECT
+        t.tagname,
+        SUM(p.answercount)               AS total_answers,
+        COUNT(p.id)                      AS question_cnt,
+        ROW_NUMBER() OVER (ORDER BY SUM(p.answercount) DESC) AS tag_rank
+    FROM tags t
+    JOIN posts p
+      ON p.tags LIKE '%' || '<' || t.tagname || '>' || '%'
+    WHERE p.posttypeid = 1
+    GROUP BY t.tagname
+    HAVING COUNT(p.id) > 10
+),
+
+recent_activity AS (
+    SELECT
+        u.id                              AS user_id,
+        MAX(v.creationdate)               AS last_vote_dt,
+        MAX(c.creationdate)               AS last_comment_dt,
+        MAX(ph.creationdate)              AS last_history_dt
+    FROM users u
+    LEFT JOIN votes v      ON v.userid = u.id
+    LEFT JOIN comments c   ON c.userid = u.id
+    LEFT JOIN posthistory ph ON ph.userid = u.id
+    GROUP BY u.id
+),
+
+user_hot_tag AS (
+    SELECT
+        us.user_id,
+        (SELECT tt.tagname
+         FROM top_tags tt
+         WHERE tt.tag_rank <= 5
+         ORDER BY tt.tag_rank
+         FETCH FIRST 1 ROWS ONLY)                         AS trending_tag
+    FROM usr_stats us
+)
+
+SELECT
+    us.user_id,
+    us.display_name,
+    us.reputation,
+    us.total_posts,
+    us.question_cnt,
+    us.answer_cnt,
+    us.total_score,
+    ROUND(CAST(us.avg_score AS numeric),2)      AS avg_score,
+    us.last_post_dt,
+    COALESCE(ba.badge_cnt,0)           AS badge_cnt,
+    COALESCE(ba.gold_badge_cnt,0)      AS gold_badge_cnt,
+    ba.badge_list,
+    ra.last_vote_dt,
+    ra.last_comment_dt,
+    ra.last_history_dt,
+    CASE
+        WHEN us.reputation > 20000 THEN 'Legendary'
+        WHEN us.reputation > 10000 THEN 'Expert'
+        WHEN us.reputation > 5000  THEN 'Intermediate'
+        ELSE 'Novice'
+    END                                 AS reputation_tier,
+    (SELECT COUNT(*)
+     FROM posts p2
+     WHERE p2.owneruserid = us.user_id
+       AND p2.score > 0
+       AND p2.creationdate >= (CAST('2024-10-01' AS date) - INTERVAL '30' DAY)) AS recent_positive_posts,
+    uh.trending_tag
+FROM usr_stats us
+LEFT JOIN badge_agg ba          ON ba.user_id = us.user_id
+LEFT JOIN recent_activity ra    ON ra.user_id = us.user_id
+LEFT JOIN user_hot_tag uh       ON uh.user_id = us.user_id
+WHERE us.total_score IS NOT NULL
+  AND (us.last_post_dt IS NULL
+       OR us.last_post_dt > (CAST('2024-10-01' AS date) - INTERVAL '2' YEAR))
+  AND EXISTS (
+        SELECT 1
+        FROM posts p3
+        WHERE p3.owneruserid = us.user_id
+          AND p3.tags LIKE '%' || '<c#>' || '%'
+          AND p3.score > (
+                SELECT AVG(p4.score)
+                FROM posts p4
+                WHERE p4.posttypeid = 1
+          )
+  )
+ORDER BY us.reputation DESC
+FETCH FIRST 100 ROWS ONLY
+
+UNION ALL
+
+SELECT
+    NULL::bigint AS user_id,
+    NULL::text AS display_name,
+    NULL::integer AS reputation,
+    NULL::bigint AS total_posts,
+    NULL::bigint AS question_cnt,
+    NULL::bigint AS answer_cnt,
+    NULL::bigint AS total_score,
+    NULL::numeric AS avg_score,
+    NULL::timestamp AS last_post_dt,
+    NULL::bigint AS badge_cnt,
+    NULL::bigint AS gold_badge_cnt,
+    NULL::text AS badge_list,
+    NULL::timestamp AS last_vote_dt,
+    NULL::timestamp AS last_comment_dt,
+    NULL::timestamp AS last_history_dt,
+    NULL::text AS reputation_tier,
+    NULL::bigint AS recent_positive_posts,
+    NULL::text AS trending_tag
+WHERE FALSE;

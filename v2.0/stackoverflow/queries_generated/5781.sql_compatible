@@ -1,0 +1,105 @@
+WITH author_stats AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(p.Id) AS PostsCreated,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS Questions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS Answers,
+    AVG(p.Score) AS AvgPostScore,
+    MAX(p.LastActivityDate) AS LastActive
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+tag_insight AS (
+  SELECT
+    tg.TagName,
+    COUNT(p.Id) AS PostCount,
+    AVG(p.Score) AS AvgScoreForTag,
+    SUM(CASE WHEN p.ViewCount > 1000 THEN 1 ELSE 0 END) AS HighViewPosts
+  FROM Tags tg
+  JOIN Posts p ON p.Id = tg.ExcerptPostId OR p.Id = tg.WikiPostId
+  WHERE tg.IsModeratorOnly = false OR tg.IsModeratorOnly = 0
+  GROUP BY tg.TagName
+),
+recent_votes AS (
+  SELECT
+    v.PostId,
+    v.VoteTypeId,
+    v.UserId,
+    v.CreationDate,
+    ROW_NUMBER() OVER (PARTITION BY v.PostId ORDER BY v.CreationDate DESC) AS rn
+  FROM Votes v
+  WHERE v.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180 days')
+),
+top_hot_posts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.LastActivityDate,
+    COALESCE(v.Upstream, 0) AS HotFlag
+  FROM Posts p
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS Upstream
+    FROM Votes
+    WHERE VoteTypeId = 2
+    GROUP BY PostId
+  ) v ON v.PostId = p.Id
+  WHERE p.PostTypeId = 1
+),
+complex_filter AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.OwnerUserId,
+    p.Tags,
+    (CASE WHEN p.OwnerUserId IS NULL THEN 0 ELSE 1 END) * (p.Score + COALESCE(p.FavoriteCount,0)) AS ComplexMetric,
+    ROW_NUMBER() OVER (
+      PARTITION BY CAST(p.CreationDate AS date)
+      ORDER BY p.Score * 2 + p.ViewCount DESC
+    ) AS DayRank
+  FROM Posts p
+  LEFT JOIN (
+    SELECT PostId, SUM(BountyAmount) AS SumBounty
+    FROM Votes
+    WHERE BountyAmount IS NOT NULL
+    GROUP BY PostId
+  ) b ON b.PostId = p.Id
+  WHERE p.PostTypeId = 1
+    AND (p.Score > 0 OR p.ViewCount > 50)
+    AND (p.Tags ~* '(sql|performance|benchmark)')
+)
+SELECT
+  ua.DisplayName AS Author,
+  ua.Reputation,
+  ua.PostsCreated,
+  ua.Questions,
+  ua.Answers,
+  ua.AvgPostScore,
+  ua.LastActive,
+  ti.TagName,
+  ti.PostCount AS TagPostCount,
+  ti.AvgScoreForTag,
+  ti.HighViewPosts,
+  hsp.PostId,
+  hsp.Title AS PostTitle,
+  hsp.Score AS PostScore,
+  hsp.ViewCount AS PostViews,
+  hsp.CreationDate AS PostCreatedDate,
+  hsp.LastActivityDate AS PostLastActivity,
+  cf.DayRank
+FROM author_stats ua
+LEFT JOIN tag_insight ti ON 1=1
+LEFT JOIN top_hot_posts hsp ON 1=1
+LEFT JOIN recent_votes rv ON rv.PostId = hsp.PostId AND rv.rn = 1
+LEFT JOIN complex_filter cf ON cf.Id = hsp.PostId
+ORDER BY ua.Reputation DESC NULLS LAST, hsp.Score DESC NULLS LAST
+LIMIT 100;

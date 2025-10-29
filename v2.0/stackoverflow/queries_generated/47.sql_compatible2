@@ -1,0 +1,359 @@
+with recent_questions as (
+    select
+        p.id as question_id,
+        p.creationdate,
+        p.title,
+        p.tags,
+        p.owneruserid as owner_user_id,
+        p.score,
+        p.viewcount,
+        p.answercount,
+        p.acceptedanswerid,
+        coalesce(p.favoritecount, 0) as favoritecount
+    from posts p
+    where p.posttypeid = 1
+      and p.creationdate >= (select max(creationdate) - interval '365 days' from posts where posttypeid = 1)
+),
+answers as (
+    select
+        a.id as answer_id,
+        a.parentid as question_id,
+        a.owneruserid as answerer_id,
+        a.score as answer_score,
+        a.creationdate as answer_creationdate
+    from posts a
+    where a.posttypeid = 2
+),
+first_answer as (
+    select
+        a.question_id,
+        min(a.answer_creationdate) as first_answer_time
+    from answers a
+    group by a.question_id
+),
+user_activity as (
+    select
+        u.id as user_id,
+        u.reputation,
+        u.creationdate as user_created,
+        u.lastaccessdate as last_seen,
+        u.location,
+        u.displayname,
+        u.upvotes,
+        u.downvotes,
+        u.views as profile_views
+    from users u
+),
+question_votes as (
+    select
+        v.postid as question_id,
+        sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+        sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+        sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+        sum(case when v.votetypeid in (10,12) then 1 else 0 end) as deletions_spam
+    from votes v
+    group by v.postid
+),
+badge_counts as (
+    select
+        b.userid,
+        sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+        sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+        sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+        -- tagbased may be boolean in some schemas; compare to true for portability
+        sum(case when (b.tagbased = true OR b.tagbased = 1) then 1 else 0 end) as tag_badges
+    from badges b
+    group by b.userid
+),
+dup_links as (
+    select
+        pl.postid as question_id,
+        count(*) filter (where pl.linktypeid = 3) as duplicate_marks,
+        count(*) filter (where pl.linktypeid = 1) as linked_refs
+    from postlinks pl
+    group by pl.postid
+),
+close_events as (
+    select
+        ph.postid as question_id,
+        min(case when ph.posthistorytypeid = 10 then ph.creationdate end) as first_close_time,
+        max(case when ph.posthistorytypeid = 11 then ph.creationdate end) as last_reopen_time,
+        count(case when ph.posthistorytypeid = 10 then 1 end) as close_votes,
+        count(case when ph.posthistorytypeid = 11 then 1 end) as reopen_votes,
+        -- convert textual numeric-comment detection to boolean aggregated as max over booleans handled via CASE returning 1/0
+        max(case when ph.posthistorytypeid = 10 and ph.comment ~ '^[0-9]+$' then 1 else 0 end) as has_close_reason_comment_json
+    from posthistory ph
+    group by ph.postid
+),
+comment_stats as (
+    select
+        c.postid as question_id,
+        count(*) as comment_count,
+        max(c.score) as max_comment_score,
+        avg(c.score) as avg_comment_score,
+        max(c.creationdate) as last_comment_at
+    from comments c
+    group by c.postid
+),
+tag_unrolled as (
+    select
+        q.question_id,
+        unnest(string_to_array(substring(q.tags, 2, length(q.tags) - 2), '><')) as tag
+    from recent_questions q
+    where q.tags is not null
+),
+tag_quality as (
+    select
+        t.tag,
+        count(*) as tag_questions,
+        avg(rq.score) as avg_q_score,
+        avg(rq.viewcount) as avg_q_views,
+        sum(coalesce(qv.upvotes,0)) as total_upvotes
+    from tag_unrolled t
+    join recent_questions rq on rq.question_id = t.question_id
+    left join question_votes qv on qv.question_id = rq.question_id
+    group by t.tag
+),
+ranked_questions as (
+    select
+        rq.question_id,
+        rq.title,
+        rq.tags,
+        rq.creationdate,
+        rq.owner_user_id,
+        rq.score,
+        rq.viewcount,
+        rq.answercount,
+        rq.acceptedanswerid,
+        coalesce(qv.upvotes,0) as upvotes,
+        coalesce(qv.downvotes,0) as downvotes,
+        coalesce(qv.favorites,0) as votes_favorites,
+        coalesce(qv.deletions_spam,0) as deletions_spam,
+        coalesce(cs.comment_count,0) as comment_count,
+        coalesce(cs.max_comment_score,0) as max_comment_score,
+        cs.last_comment_at,
+        fl.first_answer_time,
+        ce.first_close_time,
+        ce.last_reopen_time,
+        coalesce(ce.close_votes,0) as close_votes,
+        coalesce(ce.reopen_votes,0) as reopen_votes,
+        coalesce(dl.duplicate_marks,0) as duplicate_marks,
+        coalesce(dl.linked_refs,0) as linked_refs,
+        case
+            when rq.acceptedanswerid is not null then 1
+            when rq.answercount > 0 then 0
+            else null
+        end as has_accept_binary,
+        extract(epoch from (coalesce(fl.first_answer_time, timestamp '2024-10-01 12:34:56') - rq.creationdate)) / 3600.0 as hours_to_first_answer,
+        extract(epoch from (coalesce(ce.first_close_time, timestamp '2024-10-01 12:34:56') - rq.creationdate)) / 3600.0 as hours_to_close,
+        row_number() over (order by rq.score desc, rq.viewcount desc, coalesce(qv.upvotes,0) desc) as rn_score_view,
+        dense_rank() over (order by coalesce(qv.favorites,0) desc) as dr_favs,
+        percent_rank() over (order by rq.viewcount) as pr_views,
+        ntile(10) over (order by coalesce(qv.upvotes,0) - coalesce(qv.downvotes,0)) as decile_net_votes
+    from recent_questions rq
+    left join question_votes qv on qv.question_id = rq.question_id
+    left join comment_stats cs on cs.question_id = rq.question_id
+    left join first_answer fl on fl.question_id = rq.question_id
+    left join close_events ce on ce.question_id = rq.question_id
+    left join dup_links dl on dl.question_id = rq.question_id
+),
+owner_augmented as (
+    select
+        rq.question_id,
+        rq.title,
+        rq.tags,
+        rq.creationdate,
+        rq.score,
+        rq.viewcount,
+        rq.answercount,
+        rq.acceptedanswerid,
+        rq.upvotes,
+        rq.downvotes,
+        rq.votes_favorites,
+        rq.deletions_spam,
+        rq.comment_count,
+        rq.max_comment_score,
+        rq.last_comment_at,
+        rq.first_answer_time,
+        rq.first_close_time,
+        rq.last_reopen_time,
+        rq.close_votes,
+        rq.reopen_votes,
+        rq.duplicate_marks,
+        rq.linked_refs,
+        rq.has_accept_binary,
+        rq.hours_to_first_answer,
+        rq.hours_to_close,
+        rq.rn_score_view,
+        rq.dr_favs,
+        rq.pr_views,
+        rq.decile_net_votes,
+        ua.user_id,
+        ua.displayname as owner_name,
+        ua.reputation as owner_rep,
+        ua.location as owner_location,
+        ua.upvotes as owner_upvotes,
+        ua.downvotes as owner_downvotes,
+        bc.gold_badges,
+        bc.silver_badges,
+        bc.bronze_badges,
+        bc.tag_badges
+    from ranked_questions rq
+    left join user_activity ua on ua.user_id = rq.owner_user_id
+    left join badge_counts bc on bc.userid = rq.owner_user_id
+),
+tag_focus as (
+    select
+        oa.question_id,
+        oa.title,
+        oa.owner_name,
+        oa.owner_rep,
+        oa.score,
+        oa.viewcount,
+        oa.answercount,
+        oa.upvotes,
+        oa.downvotes,
+        oa.votes_favorites,
+        oa.comment_count,
+        oa.first_answer_time,
+        oa.first_close_time,
+        oa.close_votes,
+        oa.duplicate_marks,
+        oa.has_accept_binary,
+        oa.hours_to_first_answer,
+        oa.hours_to_close,
+        oa.decile_net_votes,
+        lower(tf.tag) as tag,
+        tq.avg_q_score as tag_avg_score,
+        tq.avg_q_views as tag_avg_views,
+        tq.total_upvotes as tag_total_upvotes
+    from owner_augmented oa
+    left join tag_unrolled tf on tf.question_id = oa.question_id
+    left join tag_quality tq on tq.tag = tf.tag
+),
+aggregated as (
+    select
+        question_id,
+        max(title) as title,
+        max(owner_name) as owner_name,
+        max(owner_rep) as owner_rep,
+        max(score) as score,
+        max(viewcount) as viewcount,
+        max(answercount) as answercount,
+        max(upvotes) as upvotes,
+        max(downvotes) as downvotes,
+        max(votes_favorites) as favorites,
+        max(comment_count) as comment_count,
+        max(first_answer_time) as first_answer_time,
+        max(first_close_time) as first_close_time,
+        max(close_votes) as close_votes,
+        max(duplicate_marks) as duplicate_marks,
+        max(has_accept_binary) as has_accept_binary,
+        avg(hours_to_first_answer) as avg_hours_to_first_answer,
+        avg(hours_to_close) as avg_hours_to_close,
+        min(decile_net_votes) as decile_net_votes,
+        array_agg(distinct tag order by tag) filter (where tag is not null) as tags,
+        percentile_cont(0.5) within group (order by tag_avg_score) as p50_tag_avg_score,
+        percentile_cont(0.9) within group (order by tag_avg_views) as p90_tag_avg_views,
+        sum(tag_total_upvotes) as sum_tag_total_upvotes
+    from tag_focus
+    group by question_id
+),
+outliers as (
+    select
+        a.*,
+        case
+            when a.viewcount > (select avg(viewcount) + 3 * stddev_pop(viewcount) from aggregated) then 1
+            else 0
+        end as is_view_outlier,
+        case
+            when a.score < (select avg(score) - 2 * stddev_pop(score) from aggregated) then 1
+            else 0
+        end as is_low_score_outlier
+    from aggregated a
+),
+unioned as (
+    select
+        o.question_id,
+        'HIGH_ENGAGEMENT' as bucket,
+        o.title,
+        o.owner_name,
+        o.score,
+        o.viewcount,
+        o.answercount,
+        o.tags,
+        o.avg_hours_to_first_answer,
+        o.avg_hours_to_close,
+        o.decile_net_votes,
+        o.has_accept_binary
+    from outliers o
+    where o.viewcount >= (select percentile_cont(0.95) within group (order by viewcount) from aggregated)
+      and coalesce(o.has_accept_binary, 0) = 1
+
+    union all
+
+    select
+        o.question_id,
+        'LOW_SCORE' as bucket,
+        o.title,
+        o.owner_name,
+        o.score,
+        o.viewcount,
+        o.answercount,
+        o.tags,
+        o.avg_hours_to_first_answer,
+        o.avg_hours_to_close,
+        o.decile_net_votes,
+        o.has_accept_binary
+    from outliers o
+    where o.score <= (select percentile_cont(0.1) within group (order by score) from aggregated)
+),
+correlated_flags as (
+    select
+        u.question_id,
+        exists (
+            select 1
+            from comments c
+            where c.postid = u.question_id
+              and c.score > 5
+        ) as has_popular_comment,
+        exists (
+            select 1
+            from votes v
+            where v.postid = u.question_id
+              and v.votetypeid = 12
+        ) as has_spam_flag
+    from unioned u
+)
+select
+    u.bucket,
+    u.question_id,
+    u.title,
+    u.owner_name,
+    u.score,
+    u.viewcount,
+    u.answercount,
+    coalesce(string_agg(t.tag, ',' order by t.tag), '') as tag_list,
+    u.avg_hours_to_first_answer,
+    u.avg_hours_to_close,
+    u.decile_net_votes,
+    case when cf.has_popular_comment then 1 else 0 end as has_popular_comment,
+    case when cf.has_spam_flag then 1 else 0 end as has_spam_flag,
+    case
+        when cf.has_spam_flag and cf.has_popular_comment then 'review'
+        when cf.has_popular_comment then 'discuss'
+        when cf.has_spam_flag then 'moderate'
+        else 'normal'
+    end as action_hint
+from unioned u
+left join tag_unrolled t on t.question_id = u.question_id
+left join correlated_flags cf on cf.question_id = u.question_id
+group by
+    u.bucket, u.question_id, u.title, u.owner_name, u.score, u.viewcount, u.answercount,
+    u.avg_hours_to_first_answer, u.avg_hours_to_close, u.decile_net_votes, cf.has_popular_comment, cf.has_spam_flag
+order by
+    u.bucket,
+    u.decile_net_votes,
+    u.viewcount desc,
+    u.score desc
+limit 500;

@@ -1,0 +1,182 @@
+with recursive UserReputationRanks as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        dense_rank() over (order by u.Reputation desc) as ReputationRank
+    from Users u
+    where u.Reputation is not null
+),
+BadgeSummary as (
+    select
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        count(*) as TotalBadges
+    from Badges b
+    group by b.UserId
+),
+TopQuestionsWithAnswers as (
+    select
+        q.Id as QuestionId,
+        q.OwnerUserId,
+        q.Title,
+        q.CreationDate,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        coalesce(a.AnswerCount, 0) as AnswerCount,
+        coalesce(a.MaxAnswerScore, 0) as MaxAnswerScore,
+        coalesce(a.AnswerWithMostComments, -1) as AnswerWithMostComments,
+        coalesce(a.AnswerMostCommentsCount, 0) as AnswerMostCommentsCount
+    from Posts q
+    left join lateral (
+        select
+            count(*) as AnswerCount,
+            max(a.Score) as MaxAnswerScore,
+            max(c.CommentCount) as AnswerMostCommentsCount,
+            max(case when c.CommentCount = max(c.CommentCount) over () then a.Id else -1 end) as AnswerWithMostComments
+        from Posts a
+        left join (
+            select PostId, count(*) as CommentCount
+            from Comments
+            group by PostId
+        ) c on c.PostId = a.Id
+        where a.ParentId = q.Id and a.PostTypeId = 2
+    ) a on true
+    where q.PostTypeId = 1
+      and q.CreationDate >= timestamp '2024-10-01 12:34:56' - interval '5' year
+      and q.Score > 5
+),
+DuplicateQuestionPairs as (
+    select distinct
+        pl.PostId as DuplicateQuestionId,
+        pl.RelatedPostId as OriginalQuestionId
+    from PostLinks pl
+    join LinkTypes lt on pl.LinkTypeId = lt.Id
+    where lt.Name = 'Duplicate'
+),
+ClosedQuestionsWithReasons as (
+    select
+        ph.PostId,
+        max(case when ph.PostHistoryTypeId = 10 then cast(ph.Comment as integer) else null end) as CloseReasonId,
+        max(c.Reason) as CloseReasonName
+    from PostHistory ph
+    left join CloseReasonTypes c on cast(ph.Comment as integer) = c.Id
+    where ph.PostHistoryTypeId = 10
+    group by ph.PostId
+),
+UserActivityWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.CreationDate,
+        row_number() over (partition by u.Id order by p.CreationDate desc) as RecentPostRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    where p.CreationDate >= timestamp '2024-10-01 12:34:56' - interval '1' year
+),
+UserTopPosts as recursive (
+    select
+        ua.UserId,
+        ua.PostId,
+        ua.Score,
+        1 as Level
+    from UserActivityWindow ua
+    where ua.RecentPostRank = 1
+    union all
+    select
+        ua.UserId,
+        ua.PostId,
+        ua.Score,
+        utp.Level + 1
+    from UserActivityWindow ua
+    join UserTopPosts utp on utp.UserId = ua.UserId and utp.Level + 1 = ua.RecentPostRank
+),
+UserAverageTopPostScore as (
+    select
+        UserId,
+        avg(Score) as AvgTopPostScore
+    from UserTopPosts
+    where Level <= 5
+    group by UserId
+)
+select
+    uq.QuestionId,
+    uq.Title,
+    concat(
+        'Score: ', coalesce(cast(uq.QuestionScore as text), ''),
+        ' | Views: ', coalesce(cast(uq.ViewCount as text), ''),
+        ' | Answers: ', coalesce(cast(uq.AnswerCount as text), ''),
+        ' | MaxAnswerScore: ', coalesce(cast(uq.MaxAnswerScore as text), ''),
+        ' | TopCommentAnswerId: ', case when uq.AnswerWithMostComments = -1 then null else cast(uq.AnswerWithMostComments as text) end
+    ) as Summary,
+    coalesce(cqr.CloseReasonName, 'Open') as QuestionStatus,
+    dup.OriginalQuestionId,
+    ur.ReputationRank,
+    bs.GoldBadges,
+    bs.SilverBadges,
+    bs.BronzeBadges,
+    us.AvgTopPostScore,
+    string_agg(distinct t.TagName, ', ') filter (where t.TagName is not null) as Tags,
+    rank() over (
+        partition by regexp_split_to_array(uq.Tags, '><')[1]
+        order by uq.QuestionScore desc
+    ) as RankWithinPrimaryTag,
+    concat(
+        coalesce(u.DisplayName, 'Anonymous'), ': ',
+        left(uq.Title, 30),
+        case when char_length(uq.Title) > 30 then '...' else '' end
+    ) as OwnerAndShortTitle
+from TopQuestionsWithAnswers uq
+left join ClosedQuestionsWithReasons cqr on uq.QuestionId = cqr.PostId
+left join DuplicateQuestionPairs dup on uq.QuestionId = dup.DuplicateQuestionId
+left join Users u on u.Id = uq.OwnerUserId
+left join UserReputationRanks ur on ur.Id = uq.OwnerUserId
+left join BadgeSummary bs on bs.UserId = uq.OwnerUserId
+left join UserAverageTopPostScore us on us.UserId = uq.OwnerUserId
+left join Tags t on position('<' || t.TagName || '>' in uq.Tags) > 0
+where (uq.AnswerCount > 0 or uq.ViewCount > 1000)
+  and (ur.ReputationRank <= 100 or ur.ReputationRank is null)
+group by
+    uq.QuestionId,
+    uq.Title,
+    uq.QuestionScore,
+    uq.ViewCount,
+    uq.AnswerCount,
+    uq.MaxAnswerScore,
+    uq.AnswerWithMostComments,
+    cqr.CloseReasonName,
+    dup.OriginalQuestionId,
+    ur.ReputationRank,
+    bs.GoldBadges,
+    bs.SilverBadges,
+    bs.BronzeBadges,
+    us.AvgTopPostScore,
+    uq.Tags,
+    u.DisplayName
+union
+select
+    p.Id as QuestionId,
+    p.Title,
+    'Fallback union result' as Summary,
+    'Open' as QuestionStatus,
+    null as OriginalQuestionId,
+    null as ReputationRank,
+    0 as GoldBadges,
+    0 as SilverBadges,
+    0 as BronzeBadges,
+    null as AvgTopPostScore,
+    null as Tags,
+    null as RankWithinPrimaryTag,
+    'Unknown: ' || left(p.Title, 30) as OwnerAndShortTitle
+from Posts p
+where p.PostTypeId = 1
+  and p.Score = 0
+order by ReputationRank nulls last, QuestionScore desc nulls last, QuestionId
+limit 100;

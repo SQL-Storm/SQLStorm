@@ -1,0 +1,346 @@
+with
+params as (
+  select
+    coalesce(min(u.CreationDate), timestamp '1900-01-01') as min_user_date,
+    coalesce(max(u.CreationDate), cast('2024-10-01 12:34:56' as timestamp)) as max_user_date,
+    '%' as tag_like
+  from Users u
+),
+q_tags as (
+  select
+    p.Id as QuestionId,
+    lower(trim(t)) as tag
+  from Posts p,
+  lateral (
+    select unnest(
+      case
+        when p.PostTypeId = 1 and p.Tags is not null and length(p.Tags) >= 2
+          then string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><')
+        else array[]::text[]
+      end
+    ) as t
+  ) u
+  where p.PostTypeId = 1
+),
+q_votes as (
+  select
+    v.PostId as QuestionId,
+    sum(case when v.VoteTypeId = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.VoteTypeId = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.VoteTypeId = 5 then 1 else 0 end) as favorites,
+    sum(case when v.VoteTypeId = 8 then coalesce(v.BountyAmount,0) else 0 end) as bounty_started,
+    sum(case when v.VoteTypeId = 9 then coalesce(v.BountyAmount,0) else 0 end) as bounty_awarded,
+    count(*) as total_votes,
+    max(v.CreationDate) as last_vote_at
+  from Votes v
+  join Posts p on p.Id = v.PostId and p.PostTypeId = 1
+  group by v.PostId
+),
+q_answers as (
+  select
+    a.ParentId as QuestionId,
+    count(*) as answer_count,
+    max(a.Score) as max_answer_score,
+    avg(a.Score) as avg_answer_score,
+    max(a.CreationDate) as last_answer_at,
+    count(*) filter (where a.OwnerUserId is null) as anon_answers
+  from Posts a
+  where a.PostTypeId = 2
+  group by a.ParentId
+),
+q_duplicates as (
+  select pl.PostId as QuestionId,
+         count(*) filter (where pl.LinkTypeId = 3) as duplicate_links,
+         count(*) filter (where pl.LinkTypeId = 1) as linked_links,
+         max(pl.CreationDate) as last_link_at
+  from PostLinks pl
+  group by pl.PostId
+),
+q_close_events as (
+  select
+    ph.PostId as QuestionId,
+    sum(case when ph.PostHistoryTypeId = 10 then 1 else 0 end) as close_events,
+    sum(case when ph.PostHistoryTypeId = 11 then 1 else 0 end) as reopen_events,
+    max(case when ph.PostHistoryTypeId = 10 then ph.CreationDate end) as last_closed_at,
+    max(case when ph.PostHistoryTypeId = 11 then ph.CreationDate end) as last_reopened_at,
+    max(
+      case
+        when regexp_replace(ph.Comment, '[^0-9]', '', 'g') ~ '\d+' then
+          cast(regexp_replace(ph.Comment, '[^0-9]', '', 'g') as integer)
+        else null
+      end
+    ) as last_close_reason_id
+  from PostHistory ph
+  where ph.PostId is not null
+    and ph.PostHistoryTypeId in (10,11)
+  group by ph.PostId
+),
+q_comments as (
+  select
+    c.PostId as QuestionId,
+    count(*) as comment_count,
+    max(c.Score) as max_comment_score,
+    avg(coalesce(nullif(length(c.Text),0),0)) as avg_comment_length,
+    max(c.CreationDate) as last_comment_at
+  from Comments c
+  group by c.PostId
+),
+user_signals as (
+  select
+    u.Id as UserId,
+    u.Reputation,
+    u.UpVotes,
+    u.DownVotes,
+    u.Views,
+    u.CreationDate,
+    u.LastAccessDate,
+    coalesce(nullif(trim(lower(u.Location)), ''), 'unknown') as norm_location,
+    sum(case when b.Class = 1 then 1 else 0 end) as gold_badges,
+    sum(case when b.Class = 2 then 1 else 0 end) as silver_badges,
+    sum(case when b.Class = 3 then 1 else 0 end) as bronze_badges,
+    sum(case when b.TagBased = true then 1 else 0 end) as tag_badges,
+    count(b.Id) as total_badges,
+    max(b.Date) as last_badge_at
+  from Users u
+  left join Badges b on b.UserId = u.Id
+  group by u.Id, u.Reputation, u.UpVotes, u.DownVotes, u.Views, u.CreationDate, u.LastAccessDate, coalesce(nullif(trim(lower(u.Location)), ''), 'unknown')
+),
+tag_ranks as (
+  select
+    t.Id,
+    lower(t.TagName) as tag,
+    t.Count,
+    dense_rank() over (order by t.Count desc nulls last, lower(t.TagName)) as popularity_rank
+  from Tags t
+),
+questions as (
+  select
+    p.Id as QuestionId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.Title,
+    p.Tags,
+    p.AcceptedAnswerId,
+    p.ClosedDate,
+    p.LastActivityDate
+  from Posts p
+  where p.PostTypeId = 1
+),
+question_metrics as (
+  select
+    q.QuestionId,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    coalesce(qv.upvotes,0) as upvotes,
+    coalesce(qv.downvotes,0) as downvotes,
+    coalesce(qv.favorites,0) as favorites,
+    coalesce(qv.total_votes,0) as total_votes,
+    coalesce(qa.answer_count,0) as answer_count,
+    qa.max_answer_score,
+    qa.avg_answer_score,
+    q.AcceptedAnswerId,
+    q.ClosedDate,
+    q.LastActivityDate,
+    qv.last_vote_at,
+    qa.last_answer_at,
+    qc.comment_count,
+    qc.max_comment_score,
+    qc.avg_comment_length,
+    qc.last_comment_at,
+    qd.duplicate_links,
+    qd.linked_links,
+    qd.last_link_at,
+    qce.close_events,
+    qce.reopen_events,
+    qce.last_closed_at,
+    qce.last_reopened_at,
+    qce.last_close_reason_id
+  from questions q
+  left join q_votes qv on qv.QuestionId = q.QuestionId
+  left join q_answers qa on qa.QuestionId = q.QuestionId
+  left join q_comments qc on qc.QuestionId = q.QuestionId
+  left join q_duplicates qd on qd.QuestionId = q.QuestionId
+  left join q_close_events qce on qce.QuestionId = q.QuestionId
+),
+question_tag_features as (
+  select
+    qt.QuestionId,
+    count(distinct qt.tag) as tag_count,
+    min(tr.popularity_rank) as best_tag_rank,
+    max(tr.popularity_rank) as worst_tag_rank,
+    string_agg(distinct qt.tag, ',' order by qt.tag) as tag_list
+  from q_tags qt
+  left join tag_ranks tr on tr.tag = qt.tag
+  group by qt.QuestionId
+),
+user_post_agg as (
+  select
+    u.Id as UserId,
+    sum(case when p.PostTypeId = 1 then 1 else 0 end) as questions_authored,
+    sum(case when p.PostTypeId = 2 then 1 else 0 end) as answers_authored,
+    sum(coalesce(p.Score,0)) as total_post_score,
+    avg(nullif(p.Score,0)) as avg_nonzero_post_score,
+    max(p.CreationDate) as last_post_at
+  from Users u
+  left join Posts p on p.OwnerUserId = u.Id
+  group by u.Id
+),
+big_set as (
+  select qm.QuestionId, 'Q' as kind, qm.Score as metric from question_metrics qm
+  union all
+  select qa.QuestionId, 'A' , qa.max_answer_score from q_answers qa
+  union
+  select qv.QuestionId, 'V' , qv.total_votes from q_votes qv
+  except
+  select qd.QuestionId, 'Q' , 0 from q_duplicates qd where coalesce(qd.duplicate_links,0) > 10
+),
+first_comment as (
+  select c.PostId as QuestionId,
+         substring(c.Text from 1 for 80) as first_comment_snippet
+  from Comments c
+  where c.Id in (
+    select c2.Id
+    from Comments c2
+    where c2.PostId = c.PostId
+    order by c2.CreationDate asc, c2.Id asc
+    limit 1
+  )
+),
+hotness as (
+  select
+    qm.QuestionId,
+    (
+     coalesce(qm.upvotes,0)*2 - coalesce(qm.downvotes,0)
+     + coalesce(qm.favorites,0)
+     + coalesce(qm.answer_count,0)*1.5
+     + case when qm.AcceptedAnswerId is not null then 5 else 0 end
+     + least(greatest(extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - coalesce(qm.last_activitydate, qm.creationdate))) / 86400.0, 0), 30) * -0.2
+    ) as hot_score
+  from question_metrics qm
+),
+location_ranked as (
+  select
+    qm.QuestionId,
+    us.norm_location,
+    dense_rank() over (partition by us.norm_location order by coalesce(qm.Score,0) desc, qm.ViewCount desc, qm.CreationDate desc) as loc_rank
+  from question_metrics qm
+  left join Posts p on p.Id = qm.QuestionId
+  left join Users u on u.Id = p.OwnerUserId
+  left join user_signals us on us.UserId = u.Id
+),
+top_per_location as (
+  select lr.*
+  from location_ranked lr
+  where lr.loc_rank <= 5
+),
+final as (
+  select
+    qm.QuestionId,
+    coalesce(u.DisplayName, u2.DisplayName, 'anonymous') as owner_display_name,
+    us.Reputation,
+    us.total_badges,
+    upa.questions_authored,
+    upa.answers_authored,
+    qtf.tag_count,
+    coalesce(qtf.tag_list, '') as tag_list,
+    tr_best.popularity_rank as best_tag_rank,
+    tr_worst.popularity_rank as worst_tag_rank,
+    qm.Score,
+    qm.ViewCount,
+    qm.upvotes, qm.downvotes, qm.favorites, qm.total_votes,
+    qm.answer_count,
+    qm.max_answer_score,
+    qm.avg_answer_score,
+    (qm.AcceptedAnswerId is not null) as has_accepted,
+    qm.ClosedDate,
+    qm.LastActivityDate,
+    qm.last_vote_at,
+    qm.last_answer_at,
+    qm.comment_count,
+    qm.max_comment_score,
+    qm.avg_comment_length,
+    qm.last_comment_at,
+    qm.duplicate_links,
+    qm.linked_links,
+    qm.last_link_at,
+    qm.close_events,
+    qm.reopen_events,
+    qm.last_closed_at,
+    qm.last_reopened_at,
+    qm.last_close_reason_id,
+    fc.first_comment_snippet,
+    h.hot_score,
+    tpl.loc_rank,
+    case
+      when coalesce(qm.ViewCount,0) = 0 then null
+      else round((coalesce(qm.upvotes,0) - coalesce(qm.downvotes,0)) / nullif(qm.ViewCount,0), 6)
+    end as net_votes_per_view,
+    case
+      when qtf.tag_count >= 5 then 'broad'
+      when qtf.tag_count between 3 and 4 then 'medium'
+      when qtf.tag_count between 1 and 2 then 'narrow'
+      else 'untagged'
+    end as tag_breadth_bucket,
+    case
+      when coalesce(qm.close_events,0) > coalesce(qm.reopen_events,0) then 'more_closes'
+      when coalesce(qm.close_events,0) < coalesce(qm.reopen_events,0) then 'more_reopens'
+      when coalesce(qm.close_events,0) = 0 and coalesce(qm.reopen_events,0) = 0 then 'none'
+      else 'equal'
+    end as close_vs_reopen
+  from question_metrics qm
+  left join Posts pq on pq.Id = qm.QuestionId
+  left join Users u on u.Id = pq.OwnerUserId
+  left join Users u2 on u2.Id = (select p.OwnerUserId from Posts p where p.Id = qm.AcceptedAnswerId)
+  left join user_signals us on us.UserId = coalesce(pq.OwnerUserId, u2.Id)
+  left join user_post_agg upa on upa.UserId = coalesce(pq.OwnerUserId, u2.Id)
+  left join question_tag_features qtf on qtf.QuestionId = qm.QuestionId
+  left join tag_ranks tr_best on tr_best.popularity_rank = qtf.best_tag_rank
+  left join tag_ranks tr_worst on tr_worst.popularity_rank = qtf.worst_tag_rank
+  left join first_comment fc on fc.QuestionId = qm.QuestionId
+  left join hotness h on h.QuestionId = qm.QuestionId
+  left join top_per_location tpl on tpl.QuestionId = qm.QuestionId
+  join params pr on 1=1
+  where
+    (
+      (qm.LastActivityDate between pr.min_user_date and pr.max_user_date or qm.CreationDate >= pr.min_user_date)
+      and (
+        qtf.tag_list ilike pr.tag_like
+        or coalesce(qm.favorites,0) + coalesce(qm.upvotes,0) - coalesce(qm.downvotes,0) >= 5
+      )
+    )
+    and (
+      qm.answer_count >= 0
+      and (
+        qm.AcceptedAnswerId is null
+        or exists (
+          select 1
+          from Posts aa
+          where aa.Id = qm.AcceptedAnswerId
+            and aa.Score >= coalesce(qm.avg_answer_score, 0)
+        )
+      )
+    )
+    and (
+      (
+        qm.ClosedDate is null
+        or (qm.last_reopened_at is not null and qm.last_reopened_at > coalesce(qm.last_closed_at, qm.CreationDate))
+      )
+      or coalesce(qm.duplicate_links,0) <= 5
+    )
+)
+select
+  f.*,
+  row_number() over (order by f.hot_score desc nulls last, f.ViewCount desc nulls last, f.Score desc nulls last, f.QuestionId) as rownum,
+  rank() over (order by f.Score desc nulls last, f.ViewCount desc nulls last) as score_rank,
+  percent_rank() over (order by coalesce(f.net_votes_per_view, -1) asc nulls last) as net_votes_per_view_pct,
+  ntile(10) over (order by f.hot_score desc nulls last) as hot_decile
+from final f
+order by
+  f.hot_score desc nulls last,
+  f.ViewCount desc nulls last,
+  f.Score desc nulls last,
+  f.QuestionId
+limit 500;

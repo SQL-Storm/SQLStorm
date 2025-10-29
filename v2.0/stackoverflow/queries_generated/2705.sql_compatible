@@ -1,0 +1,202 @@
+with RecursiveUserBadgeCounts as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        row_number() over (partition by u.Id order by b.Date desc NULLS LAST) as RecentBadgeRank
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate
+), 
+QualifiedUsers as (
+    select * from RecursiveUserBadgeCounts
+    where GoldBadges > 10 or (SilverBadges > 20 and Reputation > 1000)
+), 
+PostsWithOwner as (
+    select
+        p.Id as PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.ParentId,
+        p.AcceptedAnswerId,
+        u.DisplayName as OwnerName,
+        case 
+            when p.Tags is not null then array_to_string(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><'), ', ')
+            else ''
+        end as TagList
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+), PostScoreRanks as (
+    select
+        PostId,
+        Score,
+        PostTypeId,
+        rank() over(partition by PostTypeId order by Score desc NULLS LAST) as ScoreRank
+    from Posts
+), QuestionAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionDate,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViewCount,
+        q.OwnerUserId as QuestionOwnerId,
+        qa.AnswerCount,
+        coalesce(a.TotalAnswerScore, 0) as TotalAnswerScore,
+        coalesce(a.MaxAnswerScore, 0) as MaxAnswerScore,
+        q.AcceptedAnswerId
+    from Posts q
+    left join (
+        select
+            ParentId,
+            count(*) as AnswerCount
+        from Posts
+        where PostTypeId = 2
+        group by ParentId
+    ) qa on qa.ParentId = q.Id
+    left join (
+        select
+            ParentId,
+            sum(Score) as TotalAnswerScore,
+            max(Score) as MaxAnswerScore
+        from Posts
+        where PostTypeId = 2
+        group by ParentId
+    ) a on a.ParentId = q.Id
+    where q.PostTypeId = 1
+),
+RecentCloseReasons as (
+    select distinct on (ph.PostId)
+        ph.PostId,
+        crt.Name as CloseReason,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    join CloseReasonTypes crt on CAST(ph.Comment AS integer) = crt.Id
+    where ph.PostHistoryTypeId = 10
+    order by ph.PostId, ph.CreationDate desc
+),
+HighImpactPosts as (
+    select
+        p.PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.TagList,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        qa.AnswerCount,
+        qa.TotalAnswerScore,
+        qa.MaxAnswerScore,
+        qa.AcceptedAnswerId,
+        rcr.CloseReason,
+        dense_rank() over (order by p.ViewCount desc, p.Score desc) as PopularityRank
+    from PostsWithOwner p
+    left join QuestionAnswerStats qa on qa.QuestionId = p.PostId
+    left join Users u on p.OwnerUserId = u.Id
+    left join RecentCloseReasons rcr on rcr.PostId = p.PostId
+    where p.PostTypeId = 1
+),
+VotesAggregated as (
+    select
+        v.PostId,
+        sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+        sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes,
+        sum(case when vt.Name = 'Favorite' then 1 else 0 end) as Favorites
+    from Votes v
+    join VoteTypes vt on v.VoteTypeId = vt.Id
+    group by v.PostId
+),
+UserParticipation as (
+    select
+        p.Id as PostId,
+        p.OwnerUserId,
+        count(distinct c.Id) as CommentCount,
+        count(distinct ph.Id) as HistoryCount,
+        count(distinct v.Id) as VoteCount
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+    left join PostHistory ph on ph.PostId = p.Id
+    left join Votes v on v.PostId = p.Id
+    group by p.Id, p.OwnerUserId
+),
+FinalSelection as (
+    select
+        hip.PostId,
+        hip.Title,
+        hip.CreationDate,
+        hip.Score,
+        hip.ViewCount,
+        hip.TagList,
+        hip.OwnerUserId,
+        hip.OwnerName,
+        hip.AnswerCount,
+        hip.TotalAnswerScore,
+        hip.MaxAnswerScore,
+        hip.AcceptedAnswerId,
+        hip.CloseReason,
+        va.UpVotes,
+        va.DownVotes,
+        va.Favorites,
+        up.CommentCount,
+        up.HistoryCount,
+        up.VoteCount,
+        qu.GoldBadges,
+        qu.SilverBadges,
+        qu.BronzeBadges,
+        qu.Reputation,
+        qu.CreationDate as UserCreationDate,
+        dense_rank() over (partition by hip.OwnerUserId order by hip.ViewCount desc) as OwnerPostRank
+    from HighImpactPosts hip
+    left join VotesAggregated va on va.PostId = hip.PostId
+    left join UserParticipation up on up.PostId = hip.PostId
+    left join QualifiedUsers qu on qu.UserId = hip.OwnerUserId
+    where hip.PopularityRank <= 1000
+)
+select
+    fs.PostId,
+    fs.Title,
+    fs.CreationDate,
+    fs.Score,
+    fs.ViewCount,
+    fs.TagList,
+    fs.OwnerUserId,
+    fs.OwnerName,
+    fs.AnswerCount,
+    fs.TotalAnswerScore,
+    fs.MaxAnswerScore,
+    fs.AcceptedAnswerId,
+    fs.CloseReason,
+    fs.UpVotes,
+    fs.DownVotes,
+    fs.Favorites,
+    fs.CommentCount,
+    fs.HistoryCount,
+    fs.VoteCount,
+    fs.GoldBadges,
+    fs.SilverBadges,
+    fs.BronzeBadges,
+    fs.Reputation,
+    fs.UserCreationDate,
+    fs.OwnerPostRank,
+    case 
+        when fs.AcceptedAnswerId is not null then 'Has Accepted Answer'
+        when fs.AnswerCount > 0 then 'Has Answers but No Accepted'
+        else 'No Answers'
+    end as AcceptanceStatus,
+    case 
+        when fs.CloseReason is not null then fs.CloseReason
+        else 'Open'
+    end as PostStatus
+from FinalSelection fs
+where ((fs.Reputation > 5000 and fs.GoldBadges > 5) or fs.ViewCount > 10000) 
+  and (fs.AcceptedAnswerId is not null or fs.AnswerCount > 3)
+order by fs.ViewCount desc, fs.Score desc, fs.Reputation desc
+limit 100;

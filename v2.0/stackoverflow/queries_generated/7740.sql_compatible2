@@ -1,0 +1,320 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.ViewCount,
+        u.UpVotes,
+        u.DownVotes,
+        u.CreationDate,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        MAX(p.Score) AS MaxPostScore,
+        AVG(p.Score) AS AvgPostScore,
+        STRING_AGG(DISTINCT p.Tags, ', ') AS AllTags,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        NTILE(100) OVER (ORDER BY u.Reputation) AS ReputationPercentile,
+        ROW_NUMBER() OVER (ORDER BY u.CreationDate) AS UserSequence,
+        LAG(u.Reputation, 1) OVER (ORDER BY u.CreationDate) AS PrevReputation,
+        LEAD(u.Reputation, 1) OVER (ORDER BY u.CreationDate) AS NextReputation
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.ViewCount, u.UpVotes, u.DownVotes, u.CreationDate
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.ParentId,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        COALESCE(p.CommentCount, 0) AS CommentCount,
+        COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+        p.Tags,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostTypeDesc,
+        CASE 
+            WHEN p.Score > 100 THEN 'Highly_Voted'
+            WHEN p.Score > 50 THEN 'Moderately_Voted'
+            WHEN p.Score > 0 THEN 'Slightly_Voted'
+            ELSE 'Negative_Or_Zero'
+        END AS VoteCategory,
+        LENGTH(p.Body) AS BodyLength,
+        COALESCE(LENGTH(p.Title), 0) AS TitleLength,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2 THEN 
+                SUBSTRING(p.Tags FROM 2 FOR (LENGTH(p.Tags) - 2))
+            ELSE NULL
+        END AS CleanTags,
+        REGEXP_REPLACE(p.Body, '<[^>]*>', '', 'g') AS TextOnlyBody,
+        EXTRACT(YEAR FROM p.CreationDate) AS CreationYear,
+        EXTRACT(MONTH FROM p.CreationDate) AS CreationMonth,
+        EXTRACT(DAY FROM p.CreationDate) AS CreationDay,
+        -- standard age calculation in days
+        (EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate)) / 86400)::NUMERIC AS DaysSinceCreation,
+        (EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate)) / 86400)::NUMERIC AS DaysToActivity
+    FROM Posts p
+    WHERE p.Id IS NOT NULL
+),
+DetailedUserAnalysis AS (
+    SELECT 
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.PostCount,
+        us.CommentCount,
+        us.BadgeCount,
+        us.QuestionCount,
+        us.AnswerCount,
+        us.MaxPostScore,
+        us.AvgPostScore,
+        us.AllTags,
+        us.ReputationRank,
+        us.ReputationPercentile,
+        us.UserSequence,
+        us.PrevReputation,
+        us.NextReputation,
+        CASE 
+            WHEN us.PostCount > 0 THEN CAST(us.BadgeCount AS DOUBLE PRECISION) / us.PostCount
+            ELSE 0
+        END AS BadgesPerPost,
+        CASE 
+            WHEN us.QuestionCount > 0 THEN CAST(us.AnswerCount AS DOUBLE PRECISION) / us.QuestionCount
+            ELSE 0
+        END AS AnswersPerQuestion,
+        CASE 
+            WHEN us.Reputation > 0 THEN (CAST(us.BadgeCount AS DOUBLE PRECISION) * 100) / us.Reputation
+            ELSE 0
+        END AS BadgeEfficiency,
+        COALESCE((SELECT AVG(AnswerCount) FROM Posts WHERE OwnerUserId = us.UserId), 0) AS AvgAnswersToOwnQuestions,
+        COALESCE((SELECT AVG(Score) FROM Posts WHERE OwnerUserId = us.UserId AND PostTypeId = 1), 0) AS AvgQuestionScore,
+        COALESCE((SELECT AVG(Score) FROM Posts WHERE OwnerUserId = us.UserId AND PostTypeId = 2), 0) AS AvgAnswerScore,
+        CASE 
+            WHEN us.Reputation >= 10000 THEN 'Elite'
+            WHEN us.Reputation >= 5000 THEN 'Veteran'
+            WHEN us.Reputation >= 1000 THEN 'Advanced'
+            WHEN us.Reputation >= 500 THEN 'Intermediate'
+            WHEN us.Reputation >= 100 THEN 'Beginner'
+            ELSE 'Newbie'
+        END AS ReputationLevel,
+        ROW_NUMBER() OVER (PARTITION BY us.ReputationRank ORDER BY us.CreationDate) AS RankWithinLevel,
+        RANK() OVER (ORDER BY us.Reputation DESC, us.PostCount DESC) AS OverallRank,
+        DENSE_RANK() OVER (ORDER BY us.Reputation DESC) AS DenseReputationRank,
+        us.CreationDate
+    FROM UserStats us
+),
+PostTrends AS (
+    SELECT 
+        pa.PostId,
+        pa.Title,
+        pa.Body,
+        pa.Score,
+        pa.ViewCount,
+        pa.CreationDate,
+        pa.OwnerUserId,
+        pa.PostTypeId,
+        pa.ParentId,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.FavoriteCount,
+        pa.Tags,
+        pa.PostTypeDesc,
+        pa.VoteCategory,
+        pa.BodyLength,
+        pa.TitleLength,
+        pa.CreationYear,
+        pa.CreationMonth,
+        pa.CreationDay,
+        pa.DaysSinceCreation,
+        pa.DaysToActivity,
+        LAG(pa.Score, 1) OVER (ORDER BY pa.CreationDate) AS PreviousScore,
+        LEAD(pa.Score, 1) OVER (ORDER BY pa.CreationDate) AS NextScore,
+        AVG(pa.Score) OVER (ORDER BY pa.CreationDate ROWS BETWEEN 10 PRECEDING AND CURRENT ROW) AS MovingAvgScore,
+        MAX(pa.ViewCount) OVER (ORDER BY pa.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS MaxViewsSoFar,
+        SUM(pa.Score) OVER (ORDER BY pa.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativeScore,
+        PERCENT_RANK() OVER (ORDER BY pa.Score) AS ScorePercentile,
+        NTILE(10) OVER (ORDER BY pa.Score) AS ScoreDecile,
+        CASE 
+            WHEN pa.Score > (SELECT COALESCE(AVG(Score),0) FROM Posts WHERE PostTypeId = 1) THEN 'Above_Avg_Question'
+            WHEN pa.Score < (SELECT COALESCE(AVG(Score),0) FROM Posts WHERE PostTypeId = 1) THEN 'Below_Avg_Question'
+            ELSE 'Avg_Question'
+        END AS ScoreStatus,
+        COALESCE((SELECT COUNT(*) FROM Comments c WHERE c.PostId = pa.PostId AND c.Score > 0 AND c.UserId IS NOT NULL), 0) AS PositiveComments,
+        CASE 
+            WHEN pa.DaysSinceCreation <= 30 THEN 'New'
+            WHEN pa.DaysSinceCreation <= 365 THEN 'Recent'
+            WHEN pa.DaysSinceCreation <= 365*2 THEN 'Active'
+            ELSE 'Legacy'
+        END AS PostAgeCategory
+    FROM PostAnalysis pa
+),
+CombinedAnalysis AS (
+    SELECT
+        dua.UserId,
+        dua.DisplayName,
+        dua.Reputation,
+        dua.PostCount,
+        dua.CommentCount,
+        dua.BadgeCount,
+        dua.QuestionCount,
+        dua.AnswerCount,
+        dua.MaxPostScore,
+        dua.AvgPostScore,
+        dua.AllTags,
+        dua.ReputationRank,
+        dua.ReputationPercentile,
+        dua.UserSequence,
+        dua.PrevReputation,
+        dua.NextReputation,
+        dua.BadgesPerPost,
+        dua.AnswersPerQuestion,
+        dua.BadgeEfficiency,
+        dua.AvgAnswersToOwnQuestions,
+        dua.AvgQuestionScore,
+        dua.AvgAnswerScore,
+        dua.ReputationLevel,
+        dua.RankWithinLevel,
+        dua.OverallRank,
+        dua.DenseReputationRank,
+        pt.PostId,
+        pt.Title,
+        pt.Body,
+        pt.Score,
+        pt.ViewCount,
+        pt.CreationDate,
+        pt.PostTypeId,
+        pt.ParentId,
+        pt.AnswerCount,
+        pt.CommentCount,
+        pt.FavoriteCount,
+        pt.Tags,
+        pt.PostTypeDesc,
+        pt.VoteCategory,
+        pt.BodyLength,
+        pt.TitleLength,
+        pt.CreationYear,
+        pt.CreationMonth,
+        pt.CreationDay,
+        pt.DaysSinceCreation,
+        pt.DaysToActivity,
+        pt.PreviousScore,
+        pt.NextScore,
+        pt.MovingAvgScore,
+        pt.MaxViewsSoFar,
+        pt.CumulativeScore,
+        pt.ScorePercentile,
+        pt.ScoreDecile,
+        pt.ScoreStatus,
+        pt.PositiveComments,
+        pt.PostAgeCategory,
+        dua.CreationDate AS UserCreationDate
+    FROM DetailedUserAnalysis dua
+    INNER JOIN PostTrends pt ON dua.UserId = pt.OwnerUserId
+    WHERE pt.Score IS NOT NULL AND pt.Score > 0
+)
+SELECT 
+    ca.UserId,
+    ca.DisplayName,
+    ca.Reputation,
+    ca.PostCount,
+    ca.CommentCount,
+    ca.BadgeCount,
+    ca.QuestionCount,
+    ca.AnswerCount,
+    ca.MaxPostScore,
+    ca.AvgPostScore,
+    ca.AllTags,
+    ca.ReputationRank,
+    ca.ReputationPercentile,
+    ca.UserSequence,
+    ca.PrevReputation,
+    ca.NextReputation,
+    ca.BadgesPerPost,
+    ca.AnswersPerQuestion,
+    ca.BadgeEfficiency,
+    ca.AvgAnswersToOwnQuestions,
+    ca.AvgQuestionScore,
+    ca.AvgAnswerScore,
+    ca.ReputationLevel,
+    ca.RankWithinLevel,
+    ca.OverallRank,
+    ca.DenseReputationRank,
+    ca.PostId,
+    ca.Title,
+    ca.Body,
+    ca.Score,
+    ca.ViewCount,
+    ca.CreationDate,
+    ca.PostTypeId,
+    ca.ParentId,
+    ca.AnswerCount,
+    ca.CommentCount,
+    ca.FavoriteCount,
+    ca.Tags,
+    ca.PostTypeDesc,
+    ca.VoteCategory,
+    ca.BodyLength,
+    ca.TitleLength,
+    ca.CreationYear,
+    ca.CreationMonth,
+    ca.CreationDay,
+    ca.DaysSinceCreation,
+    ca.DaysToActivity,
+    ca.PreviousScore,
+    ca.NextScore,
+    ca.MovingAvgScore,
+    ca.MaxViewsSoFar,
+    ca.CumulativeScore,
+    ca.ScorePercentile,
+    ca.ScoreDecile,
+    ca.ScoreStatus,
+    ca.PositiveComments,
+    ca.PostAgeCategory,
+    CONCAT(
+        'User Rank: ', 
+        CASE WHEN ca.ReputationRank <= 10 THEN 'Top 10' 
+             WHEN ca.ReputationRank <= 100 THEN 'Top 100'
+             ELSE CAST(ca.ReputationRank AS VARCHAR) END,
+        ' | Post Score:', 
+        CASE WHEN ca.Score > 1000 THEN 'Very High' 
+             WHEN ca.Score > 100 THEN 'High' 
+             WHEN ca.Score > 0 THEN 'Medium' 
+             ELSE 'Low' END,
+        ' | Post Age:', 
+        CASE WHEN ca.PostAgeCategory = 'New' THEN 'Fresh' 
+             WHEN ca.PostAgeCategory = 'Recent' THEN 'Recent' 
+             ELSE 'Established' END
+    ) AS PostUserProfileSummary,
+    CASE 
+        WHEN ca.Score > 100 AND ca.ViewCount > 100 THEN 'High Impact'
+        WHEN ca.Score > 50 AND ca.ViewCount > 50 THEN 'Good Impact'
+        WHEN ca.Score > 0 AND ca.ViewCount > 10 THEN 'Moderate Impact'
+        ELSE 'Low Impact'
+    END AS ImpactAssessment,
+    CASE 
+        WHEN ca.VoteCategory LIKE '%High%' THEN 'Highly Recognized'
+        WHEN ca.VoteCategory LIKE '%Moderately%' THEN 'Moderately Recognized'
+        WHEN ca.VoteCategory LIKE '%Slightly%' THEN 'Slightly Recognized'
+        ELSE 'Not Recognized'
+    END AS RecognitionStatus
+FROM CombinedAnalysis ca
+WHERE ca.PostAgeCategory IN ('Active', 'New', 'Recent')
+  AND (ca.Score > 10 OR ca.ViewCount > 10)
+  AND ca.Reputation > 100
+  AND ca.DisplayName IS NOT NULL
+ORDER BY ca.Reputation DESC, ca.Score DESC
+LIMIT 10000;

@@ -1,0 +1,96 @@
+WITH RecursiveClosedQuestions AS (
+    SELECT p.Id, p.Title, p.CreationDate, p.AcceptedAnswerId, p.OwnerUserId,
+           ph.Comment AS CloseReason,
+           ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY ph.CreationDate DESC) AS rn
+      FROM Posts p
+ LEFT JOIN PostHistory ph ON p.Id = ph.PostId 
+                         AND ph.PostHistoryTypeId = 10
+     WHERE p.PostTypeId = 1
+), LatestClosedQuestions AS (
+    SELECT Id, Title, CreationDate, AcceptedAnswerId, OwnerUserId, CloseReason
+      FROM RecursiveClosedQuestions
+     WHERE rn = 1
+), AnswersWithScore AS (
+    SELECT a.Id, a.ParentId, a.Score, a.CreationDate,
+           u.Reputation AS AnswererReputation,
+           CASE 
+             WHEN a.Body IS NULL OR LENGTH(a.Body) = 0 THEN 'No body'
+             ELSE SUBSTRING(a.Body FROM 1 FOR 50)
+           END AS BodyPreview
+      FROM Posts a
+ LEFT JOIN Users u ON a.OwnerUserId = u.Id
+     WHERE a.PostTypeId = 2
+), AnswerRanks AS (
+    SELECT aws.Id, aws.ParentId, aws.Score, aws.CreationDate, aws.AnswererReputation, aws.BodyPreview,
+           RANK() OVER (PARTITION BY aws.ParentId ORDER BY aws.Score DESC, aws.CreationDate ASC) AS ScoreRank
+      FROM AnswersWithScore aws
+), QuestionBadges AS (
+    SELECT b.UserId, COUNT(*) AS BadgeCount,
+           MAX(b.Date) AS LastBadgeDate,
+           STRING_AGG(b.Name, ',' ORDER BY b.Name) AS BadgesList
+      FROM Badges b
+     GROUP BY b.UserId
+), QuestionVoteStats AS (
+    SELECT v.PostId,
+           SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
+           SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes,
+           COUNT(*) AS TotalVotes
+      FROM Votes v
+ LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+     GROUP BY v.PostId
+), CloseReasonSummary AS (
+    SELECT crt.Id, crt.Name
+      FROM CloseReasonTypes crt
+), TagExploded AS (
+    SELECT p.Id AS PostId,
+           UNNEST(string_to_array(substring(p.Tags FROM 2 FOR LENGTH(p.Tags)-2), '><')) AS TagName
+      FROM Posts p
+     WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+), TagCounts AS (
+    SELECT te.TagName, COUNT(DISTINCT te.PostId) AS QuestionCount
+      FROM TagExploded te
+     GROUP BY te.TagName
+), TopTags AS (
+    SELECT TagName
+      FROM TagCounts
+     WHERE QuestionCount > 1000
+     ORDER BY QuestionCount DESC
+     LIMIT 10
+), CombinedQuestions AS (
+    SELECT q.Id, q.Title, q.CreationDate, q.AcceptedAnswerId, q.OwnerUserId,
+           lq.CloseReason,
+           vb.UpVotes, vb.DownVotes, vb.TotalVotes,
+           qb.BadgeCount, qb.LastBadgeDate, qb.BadgesList,
+           (SELECT ARRAY_AGG(te.TagName) FROM TagExploded te WHERE te.PostId = q.Id AND te.TagName IN (SELECT TagName FROM TopTags)) AS TopTagsArray
+      FROM LatestClosedQuestions q
+ LEFT JOIN QuestionVoteStats vb ON q.Id = vb.PostId
+ LEFT JOIN QuestionBadges qb ON q.OwnerUserId = qb.UserId
+ LEFT JOIN LatestClosedQuestions lq ON q.Id = lq.Id
+     WHERE vb.TotalVotes IS NOT NULL
+)
+SELECT cq.Id AS QuestionId,
+       cq.Title,
+       cq.CreationDate,
+       cq.CloseReason,
+       cq.UpVotes,
+       cq.DownVotes,
+       cq.TotalVotes,
+       cq.BadgeCount,
+       cq.LastBadgeDate,
+       cq.BadgesList,
+       cq.TopTagsArray,
+       ar.Id AS TopAnswerId,
+       ar.Score AS TopAnswerScore,
+       ar.AnswererReputation AS TopAnswererReputation,
+       ar.BodyPreview AS TopAnswerPreview,
+       (SELECT COUNT(*) FROM Comments c WHERE c.PostId = cq.Id) AS CommentCount,
+       (SELECT STRING_AGG(CAST(lnk.RelatedPostId AS VARCHAR), ',' ) 
+          FROM PostLinks lnk 
+         WHERE lnk.PostId = cq.Id
+           AND lnk.LinkTypeId = (SELECT Id FROM LinkTypes WHERE Name = 'Duplicate' LIMIT 1)
+        ) AS DuplicateQuestionIds
+  FROM CombinedQuestions cq
+  LEFT JOIN AnswerRanks ar ON cq.Id = ar.ParentId AND ar.ScoreRank = 1
+ WHERE (cq.TopTagsArray IS NOT NULL AND EXISTS (SELECT 1 FROM TopTags tt WHERE tt.TagName = ANY(cq.TopTagsArray)))
+ ORDER BY cq.TotalVotes DESC, cq.CreationDate DESC
+ LIMIT 50;

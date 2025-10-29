@@ -1,0 +1,374 @@
+with
+-- recent active users with engagement metrics
+active_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.lastaccessdate,
+    coalesce(nullif(trim(split_part(coalesce(u.location, ''), ',', 1)), ''), 'Unknown') as region_hint,
+    count(distinct p.id) filter (where p.owneruserid = u.id) as post_count,
+    count(distinct c.id) filter (where c.userid = u.id) as comment_count,
+    count(*) over () as total_users_window
+  from users u
+  left join posts p on p.owneruserid = u.id
+  left join comments c on c.userid = u.id
+  where u.creationdate >= (select min(creationdate) from users) -- anchor for planner
+    and u.lastaccessdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+  group by u.id, u.displayname, u.reputation, u.creationdate, u.lastaccessdate, region_hint
+),
+-- questions with tag parsing and quality signals
+questions as (
+  select
+    q.id as question_id,
+    q.owneruserid as asker_id,
+    q.creationdate as asked_at,
+    q.score,
+    q.viewcount,
+    q.answercount,
+    q.title,
+    q.tags,
+    q.acceptedanswerid,
+    string_to_array(substring(q.tags, 2, greatest(length(q.tags)-2,0)), '><') as tag_list,
+    case when q.closeddate is not null then 1 else 0 end as is_closed,
+    coalesce(q.favoritecount, 0) as favoritecount,
+    q.commentcount
+  from posts q
+  where q.posttypeid = 1
+),
+-- answers with responder and latency
+answers as (
+  select
+    a.id as answer_id,
+    a.parentid as question_id,
+    a.owneruserid as answerer_id,
+    a.creationdate as answered_at,
+    a.score as answer_score
+  from posts a
+  where a.posttypeid = 2
+),
+-- compute first answer latency per question
+first_answer as (
+  select
+    a.question_id,
+    min(a.answered_at) as first_answer_at,
+    -- use subquery to get first answer id to avoid nested aggregates in select
+    (select a2.answer_id
+     from answers a2
+     where a2.question_id = a.question_id
+     order by a2.answered_at
+     limit 1) as first_answer_id
+  from answers a
+  group by a.question_id
+),
+-- votes aggregates for posts
+post_votes as (
+  select
+    v.postid,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started,
+    sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded,
+    count(*) as total_votes
+  from votes v
+  group by v.postid
+),
+-- badge counts by class per user
+user_badges as (
+  select
+    b.userid,
+    sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+    sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+    sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+    sum(case when b.tagbased = true then 1 else 0 end) as tag_badges
+  from badges b
+  group by b.userid
+),
+-- detect duplicates and linked graph metrics
+dupe_links as (
+  select
+    pl.postid as question_id,
+    max(case when pl.linktypeid = 3 then 1 else 0 end) as is_marked_duplicate,
+    count(*) filter (where pl.linktypeid = 1) as linked_count,
+    count(*) filter (where pl.linktypeid = 3) as duplicate_count
+  from postlinks pl
+  group by pl.postid
+),
+-- closure reasons from post history with latest state
+closure as (
+  select
+    ph.postid as question_id,
+    max(case when ph.posthistorytypeid = 10 then ph.creationdate end) as closed_at,
+    max(case when ph.posthistorytypeid = 10 then cast(ph.comment as integer) end) as close_reason_id,
+    max(case when ph.posthistorytypeid = 11 then ph.creationdate end) as reopened_at
+  from posthistory ph
+  where ph.posthistorytypeid in (10,11)
+  group by ph.postid
+),
+-- compute rolling question quality score using window functions
+question_quality as (
+  select
+    q.question_id,
+    q.asker_id,
+    q.asked_at,
+    q.score,
+    q.viewcount,
+    q.answercount,
+    q.acceptedanswerid,
+    coalesce(pv.upvotes,0) as upvotes,
+    coalesce(pv.downvotes,0) as downvotes,
+    coalesce(pv.total_votes,0) as total_votes,
+    coalesce(pv.bounty_started,0) as bounty_started,
+    coalesce(pv.bounty_awarded,0) as bounty_awarded,
+    coalesce(dl.is_marked_duplicate,0) as is_marked_duplicate,
+    coalesce(dl.linked_count,0) as linked_count,
+    coalesce(dl.duplicate_count,0) as duplicate_count,
+    c.closed_at,
+    c.close_reason_id,
+    c.reopened_at,
+    extract(epoch from (fa.first_answer_at - q.asked_at)) as seconds_to_first_answer,
+    -- composite score mixing engagement and quality
+    cast(
+      (
+        coalesce(q.viewcount,0) * 0.001
+        + coalesce(pv.upvotes,0) * 2
+        - coalesce(pv.downvotes,0)
+        + coalesce(q.favoritecount,0) * 1.5
+        + case when q.acceptedanswerid is not null then 5 else 0 end
+        - case when coalesce(dl.is_marked_duplicate,0) = 1 then 3 else 0 end
+        - case when c.closed_at is not null then 2 else 0 end
+        + least(coalesce(q.answercount,0), 5) * 0.75
+      ) as numeric
+    ) as quality_score,
+    row_number() over (partition by date_trunc('month', q.asked_at) order by coalesce(pv.upvotes,0) desc, coalesce(q.viewcount,0) desc, q.question_id) as monthly_rank_by_votes,
+    -- replace ordered-set aggregate percentile_cont ... within group ... over (...) with a windowed percentile approximation:
+    -- use percent_rank applied to upvotes within month and then take value at 0.9 via percentile_disc-like expression not available across all dialects;
+    -- Instead compute p90_monthly_upvotes as the 90th percentile using a simple ordered aggregation via max(case when percent_rank >= 0.9 then upvotes end)
+    max(case when percent_rank() over (partition by date_trunc('month', q.asked_at) order by coalesce(pv.upvotes,0)) >= 0.9
+             then coalesce(pv.upvotes,0) end) over (partition by date_trunc('month', q.asked_at)) as p90_monthly_upvotes,
+    q.tag_list
+  from questions q
+  left join post_votes pv on pv.postid = q.question_id
+  left join dupe_links dl on dl.question_id = q.question_id
+  left join closure c on c.question_id = q.question_id
+  left join first_answer fa on fa.question_id = q.question_id
+  group by
+    q.question_id, q.asker_id, q.asked_at, q.score, q.viewcount, q.answercount,
+    q.acceptedanswerid, pv.upvotes, pv.downvotes, pv.total_votes,
+    pv.bounty_started, pv.bounty_awarded, dl.is_marked_duplicate, dl.linked_count,
+    dl.duplicate_count, c.closed_at, c.close_reason_id, c.reopened_at,
+    fa.first_answer_at, q.favoritecount, q.acceptedanswerid, q.answercount, q.tag_list
+),
+-- per-tag aggregates via unnested tag list
+tag_expanded as (
+  select
+    qq.question_id,
+    lower(trim(t)) as tag
+  from question_quality qq
+  cross join lateral unnest(coalesce(qq.tag_list, array[])) as t
+),
+tag_stats as (
+  select
+    te.tag,
+    count(distinct te.question_id) as question_cnt,
+    avg(qq.quality_score) as avg_quality_score,
+    avg(qq.seconds_to_first_answer) as avg_latency_sec,
+    sum(case when qq.acceptedanswerid is not null then 1 else 0 end) as accepted_count
+  from tag_expanded te
+  join question_quality qq on qq.question_id = te.question_id
+  group by te.tag
+),
+-- build a user-centric view combining badges and activity
+user_profile as (
+  select
+    au.user_id,
+    au.displayname,
+    au.reputation,
+    au.region_hint,
+    coalesce(ub.gold_badges,0) as gold_badges,
+    coalesce(ub.silver_badges,0) as silver_badges,
+    coalesce(ub.bronze_badges,0) as bronze_badges,
+    coalesce(ub.tag_badges,0) as tag_badges,
+    au.post_count,
+    au.comment_count,
+    dense_rank() over (order by coalesce(ub.gold_badges,0) desc, au.reputation desc, au.user_id) as rank_by_prestige
+  from active_users au
+  left join user_badges ub on ub.userid = au.user_id
+),
+-- per-user recent performance on questions and answers
+user_q_a as (
+  select
+    up.user_id,
+    count(distinct qq.question_id) filter (where qq.asker_id = up.user_id and qq.asked_at >= cast('2024-10-01 12:34:56' as timestamp) - interval '180 days') as recent_questions,
+    avg(qq.quality_score) filter (where qq.asker_id = up.user_id and qq.asked_at >= cast('2024-10-01 12:34:56' as timestamp) - interval '180 days') as avg_q_quality_recent,
+    count(distinct a.answer_id) filter (where a.answerer_id = up.user_id and a.answered_at >= cast('2024-10-01 12:34:56' as timestamp) - interval '180 days') as recent_answers,
+    avg(a.answer_score) filter (where a.answerer_id = up.user_id and a.answered_at >= cast('2024-10-01 12:34:56' as timestamp) - interval '180 days') as avg_a_score_recent
+  from user_profile up
+  left join question_quality qq on qq.asker_id = up.user_id
+  left join answers a on a.answerer_id = up.user_id
+  group by up.user_id
+),
+-- correlated subqueries for last activity by user on own posts
+user_last_post_activity as (
+  select
+    u.user_id,
+    (
+      select max(p.lastactivitydate)
+      from posts p
+      where p.owneruserid = u.user_id
+    ) as last_post_activity,
+    (
+      select count(*)
+      from posts p
+      where p.owneruserid = u.user_id
+        and p.posttypeid = 1
+        and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days'
+    ) as last_30d_questions
+  from user_profile u
+),
+-- derive cluster-ish buckets for segmentation
+segments as (
+  select
+    up.user_id,
+    case
+      when up.reputation >= 100000 or up.gold_badges >= 5 then 'Legend'
+      when up.reputation >= 10000 or up.gold_badges >= 1 then 'Veteran'
+      when up.reputation >= 1000 then 'Rising'
+      else 'Newcomer'
+    end as segment
+  from user_profile up
+),
+-- top tags per user by engagement
+user_top_tags as (
+  select
+    te2.asker_id as user_id,
+    lower(trim(t2)) as tag,
+    count(*) as q_count,
+    row_number() over (partition by te2.asker_id order by count(*) desc, lower(trim(t2))) as rn
+  from (
+    select q.question_id, q.asker_id, unnest(coalesce(q.tag_list, array[])) as t2
+    from questions q
+  ) te2
+  group by te2.asker_id, lower(trim(t2))
+),
+-- final assembly per question with enriched user and tag signals
+final_questions as (
+  select
+    qq.question_id,
+    qq.asker_id,
+    qq.asked_at,
+    qq.score,
+    qq.viewcount,
+    qq.answercount,
+    qq.acceptedanswerid,
+    qq.upvotes,
+    qq.downvotes,
+    qq.total_votes,
+    qq.bounty_started,
+    qq.bounty_awarded,
+    qq.is_marked_duplicate,
+    qq.linked_count,
+    qq.duplicate_count,
+    qq.closed_at,
+    qq.close_reason_id,
+    qq.reopened_at,
+    qq.seconds_to_first_answer,
+    qq.quality_score,
+    qq.monthly_rank_by_votes,
+    qq.p90_monthly_upvotes,
+    qq.tag_list,
+    up.displayname,
+    up.reputation,
+    up.region_hint,
+    up.gold_badges,
+    up.silver_badges,
+    up.bronze_badges,
+    up.tag_badges,
+    up.rank_by_prestige,
+    uq.recent_questions,
+    uq.avg_q_quality_recent,
+    uq.recent_answers,
+    uq.avg_a_score_recent,
+    ula.last_post_activity,
+    ula.last_30d_questions,
+    s.segment,
+    utt.tag as top_tag,
+    qq.asked_at as asked_at_for_grouping -- include asked_at for later grouping/windowing
+  from question_quality qq
+  left join user_profile up on up.user_id = qq.asker_id
+  left join user_q_a uq on uq.user_id = qq.asker_id
+  left join user_last_post_activity ula on ula.user_id = qq.asker_id
+  left join segments s on s.user_id = qq.asker_id
+  left join user_top_tags utt on utt.user_id = qq.asker_id and utt.rn = 1
+)
+-- produce an elaborate result set with ranking, window stats, and set logic
+select
+  fq.question_id,
+  coalesce(nullif(fq.title, ''), '[no title]') as title,
+  fq.displayname as asker,
+  fq.reputation,
+  fq.segment,
+  fq.top_tag,
+  fq.viewcount,
+  fq.score,
+  fq.upvotes,
+  fq.downvotes,
+  fq.total_votes,
+  fq.answercount,
+  fq.acceptedanswerid,
+  fq.is_marked_duplicate,
+  fq.closed_at,
+  fq.close_reason_id,
+  fq.reopened_at,
+  fq.seconds_to_first_answer,
+  fq.quality_score,
+  fq.monthly_rank_by_votes,
+  fq.p90_monthly_upvotes,
+  fq.rank_by_prestige,
+  fq.region_hint,
+  fq.last_post_activity,
+  fq.last_30d_questions,
+  fq.recent_questions,
+  fq.avg_q_quality_recent,
+  fq.recent_answers,
+  fq.avg_a_score_recent,
+  ts.avg_quality_score as tag_avg_quality,
+  ts.avg_latency_sec as tag_avg_latency_sec,
+  ts.accepted_count as tag_accepted_count,
+  case
+    when fq.quality_score >= coalesce(ts.avg_quality_score, fq.quality_score) then 'Above Tag Avg'
+    when fq.quality_score is null and ts.avg_quality_score is null then 'N/A'
+    else 'Below Tag Avg'
+  end as tag_relative_quality,
+  case when stddev_pop(coalesce(fq.viewcount,0)) over (partition by date_trunc('month', fq.asked_at_for_grouping)) > 0
+       then (coalesce(fq.viewcount,0) - avg(coalesce(fq.viewcount,0)) over (partition by date_trunc('month', fq.asked_at_for_grouping)))
+            / nullif(stddev_pop(coalesce(fq.viewcount,0)) over (partition by date_trunc('month', fq.asked_at_for_grouping)),0)
+       else null end as monthly_view_z,
+  case
+    when fq.acceptedanswerid is not null
+         and fq.upvotes >= 3
+         and coalesce(fq.downvotes,0) = 0
+         and (fq.closed_at is null or fq.reopened_at is not null)
+         and (fq.seconds_to_first_answer is null or fq.seconds_to_first_answer <= 3600)
+    then 1 else 0 end as fast_clean_accept
+from final_questions fq
+left join tag_stats ts
+  on ts.tag = lower(coalesce(fq.top_tag, ''))
+where (
+    fq.asked_at_for_grouping >= cast('2024-10-01 12:34:56' as timestamp) - interval '730 days'
+    and (fq.viewcount is null or fq.viewcount >= 50)
+    and (fq.total_votes is null or fq.total_votes >= 1)
+  )
+  and not exists (
+    select 1
+    from postlinks plx
+    where plx.postid = fq.question_id
+      and plx.linktypeid = 3
+      and plx.creationdate >= fq.asked_at_for_grouping + interval '30 days'
+  )
+order by
+  fq.quality_score desc nulls last,
+  fq.viewcount desc nulls last,
+  fq.question_id
+limit 500;

@@ -1,0 +1,332 @@
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        u.location,
+        u.websiteurl,
+        coalesce(nullif(trim(u.location), ''), 'Unknown') as norm_location,
+        case when u.websiteurl is null or u.websiteurl = '' then 0 else 1 end as has_website
+    from users u
+    where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+q_and_a as (
+    select
+        p.id,
+        p.posttypeid,
+        p.owneruserid,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        p.title,
+        p.tags,
+        p.acceptedanswerid,
+        p.parentid
+    from posts p
+    where p.posttypeid in (1,2)
+),
+user_posts as (
+    select
+        ru.user_id,
+        count(*) filter (where qa.posttypeid = 1) as question_count,
+        count(*) filter (where qa.posttypeid = 2) as answer_count,
+        sum(qa.score) as total_post_score,
+        avg(nullif(qa.viewcount,0)) as avg_viewcount_nonzero,
+        max(qa.creationdate) as last_posted_at
+    from recent_users ru
+    left join q_and_a qa
+      on qa.owneruserid = ru.user_id
+    group by ru.user_id
+),
+accepted_answer_latency as (
+    select
+        q.owneruserid as user_id,
+        percentile_cont(0.5) within group (order by (a.creationdate - q.creationdate)) as median_accept_latency,
+        avg((a.creationdate - q.creationdate)) as avg_accept_latency
+    from posts q
+    join posts a on a.id = q.acceptedanswerid
+    where q.posttypeid = 1
+      and q.acceptedanswerid is not null
+    group by q.owneruserid
+),
+vote_agg as (
+    select
+        p.owneruserid as user_id,
+        sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes_received,
+        sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes_received,
+        sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites_received,
+        sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded_total
+    from posts p
+    left join votes v on v.postid = p.id
+    where p.owneruserid is not null
+    group by p.owneruserid
+),
+comment_engagement as (
+    select
+        p.owneruserid as user_id,
+        count(c.id) as comments_on_posts,
+        avg(c.score) filter (where c.score is not null) as avg_comment_score,
+        max(c.creationdate) as last_comment_time
+    from posts p
+    left join comments c on c.postid = p.id
+    where p.owneruserid is not null
+    group by p.owneruserid
+),
+badges_agg as (
+    select
+        b.userid as user_id,
+        count(*) as badge_count,
+        count(*) filter (where b.class = 1) as gold_count,
+        count(*) filter (where b.class = 2) as silver_count,
+        count(*) filter (where b.class = 3) as bronze_count,
+        count(*) filter (where b.tagbased = true) as tag_badge_count,
+        min(b.date) as first_badge_date,
+        max(b.date) as last_badge_date
+    from badges b
+    group by b.userid
+),
+tag_extraction as (
+    select
+        p.owneruserid as user_id,
+        lower(trim(t)) as tagname
+    from posts p
+    cross join lateral unnest(
+        case
+            when p.tags is null then array[]::varchar[]
+            when length(p.tags) <= 2 then array[]::varchar[]
+            else string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')
+        end
+    ) as t
+    where p.posttypeid = 1
+      and p.owneruserid is not null
+),
+top_tags as (
+    select
+        tt.user_id,
+        string_agg(tt.tagname, ', ' order by tt.rn) as top3_tags
+    from (
+        select
+            te.user_id,
+            te.tagname,
+            row_number() over (partition by te.user_id order by count(*) desc, te.tagname) as rn
+        from tag_extraction te
+        group by te.user_id, te.tagname
+    ) tt
+    where tt.rn <= 3
+    group by tt.user_id
+),
+post_edits as (
+    select
+        ph.userid as editor_user_id,
+        count(*) filter (where ph.posthistorytypeid in (4,5,6)) as edits_count,
+        count(*) filter (where ph.posthistorytypeid = 24) as suggested_edits_applied,
+        count(*) filter (where ph.posthistorytypeid in (10,11,12,13,14,15,19,20,35)) as mod_state_changes
+    from posthistory ph
+    group by ph.userid
+),
+dup_links as (
+    select
+        pl.postid,
+        pl.relatedpostid,
+        pl.creationdate,
+        row_number() over (partition by pl.postid order by pl.creationdate) as rn
+    from postlinks pl
+    where pl.linktypeid = 3
+),
+first_duplicate_ref as (
+    select
+        p.owneruserid as user_id,
+        min(pl.creationdate) as first_duplicate_flag_time
+    from posts p
+    join dup_links pl on pl.postid = p.id and pl.rn = 1
+    group by p.owneruserid
+),
+quality_score as (
+    select
+        ru.user_id,
+        (coalesce(up.upvotes_received,0) - coalesce(up.downvotes_received,0))
+        + coalesce(up.favorites_received,0) * 0.5
+        + coalesce(ua.total_post_score,0) * 0.8
+        + coalesce(va.bounty_awarded_total,0) * 0.2
+        - case when ua.answer_count = 0 and ua.question_count = 0 then 5 else 0 end
+        + case when ru.has_website = 1 then 1 else 0 end
+        + case when ru.norm_location ilike '%usa%' or ru.norm_location ilike '%united states%' then 0.3 else 0 end
+        as composite_quality
+    from recent_users ru
+    join (select distinct user_id from recent_users) u on u.user_id = ru.user_id
+    left join user_posts ua on ua.user_id = u.user_id
+    left join vote_agg up on up.user_id = u.user_id
+    left join vote_agg va on va.user_id = u.user_id
+),
+user_activity as (
+    select
+        ru.user_id,
+        ru.displayname,
+        ru.reputation,
+        ru.creationdate as user_created_at,
+        ru.norm_location,
+        ua.question_count,
+        ua.answer_count,
+        ua.total_post_score,
+        ua.avg_viewcount_nonzero,
+        ua.last_posted_at,
+        va.upvotes_received,
+        va.downvotes_received,
+        va.favorites_received,
+        va.bounty_awarded_total,
+        ce.comments_on_posts,
+        ce.avg_comment_score,
+        ce.last_comment_time,
+        ba.badge_count,
+        ba.gold_count,
+        ba.silver_count,
+        ba.bronze_count,
+        ba.tag_badge_count,
+        ba.first_badge_date,
+        ba.last_badge_date,
+        tt.top3_tags,
+        al.median_accept_latency,
+        al.avg_accept_latency,
+        fd.first_duplicate_flag_time,
+        pe.edits_count,
+        pe.suggested_edits_applied,
+        pe.mod_state_changes,
+        qs.composite_quality
+    from recent_users ru
+    left join user_posts ua on ua.user_id = ru.user_id
+    left join vote_agg va on va.user_id = ru.user_id
+    left join comment_engagement ce on ce.user_id = ru.user_id
+    left join badges_agg ba on ba.user_id = ru.user_id
+    left join top_tags tt on tt.user_id = ru.user_id
+    left join accepted_answer_latency al on al.user_id = ru.user_id
+    left join first_duplicate_ref fd on fd.user_id = ru.user_id
+    left join post_edits pe on pe.editor_user_id = ru.user_id
+    left join quality_score qs on qs.user_id = ru.user_id
+),
+ranked as (
+    select
+        ua.*,
+        row_number() over (order by coalesce(ua.composite_quality, -1e9) desc, coalesce(ua.reputation,0) desc, ua.user_created_at asc) as overall_rank,
+        dense_rank() over (order by coalesce(ua.gold_count,0) desc, coalesce(ua.silver_count,0) desc) as medal_rank,
+        ntile(10) over (order by coalesce(ua.total_post_score,0) desc) as score_decile
+    from user_activity ua
+),
+activity_clusters as (
+    select
+        r.*,
+        case
+            when coalesce(r.answer_count,0) >= 20 and coalesce(r.question_count,0) <= 2 then 'Answer-heavy'
+            when coalesce(r.question_count,0) >= 10 and coalesce(r.answer_count,0) = 0 then 'Question-only'
+            when coalesce(r.gold_count,0) >= 1 then 'Decorated'
+            when coalesce(r.total_post_score,0) < 0 then 'Controversial'
+            when r.composite_quality is null then 'New/Inactive'
+            else 'Mixed'
+        end as activity_cluster
+    from ranked r
+),
+null_probe as (
+    select
+        a.user_id,
+        coalesce(a.top3_tags, 'no-tags') as safe_top_tags,
+        nullif(a.norm_location, 'Unknown') as nullable_location,
+        case when a.avg_viewcount_nonzero is distinct from null then 1 else 0 end as has_views_stat
+    from user_activity a
+)
+select
+    a.user_id,
+    a.displayname,
+    a.reputation,
+    a.user_created_at,
+    a.norm_location,
+    np.safe_top_tags,
+    coalesce(np.nullable_location, a.norm_location) as preferred_location,
+    a.question_count,
+    a.answer_count,
+    a.total_post_score,
+    a.avg_viewcount_nonzero,
+    a.upvotes_received,
+    a.downvotes_received,
+    a.favorites_received,
+    a.bounty_awarded_total,
+    a.badge_count,
+    a.gold_count,
+    a.silver_count,
+    a.bronze_count,
+    a.tag_badge_count,
+    a.median_accept_latency,
+    a.avg_accept_latency,
+    a.first_duplicate_flag_time,
+    a.edits_count,
+    a.suggested_edits_applied,
+    a.mod_state_changes,
+    a.composite_quality,
+    r.overall_rank,
+    r.medal_rank,
+    r.score_decile,
+    ac.activity_cluster,
+    np.has_views_stat,
+    (
+      select avg(cast(length(c2.text) as numeric))
+      from comments c2
+      where c2.postid in (select p2.id from posts p2 where p2.owneruserid = a.user_id)
+      order by c2.creationdate desc
+      limit 5
+    ) as avg_recent_comment_len_on_posts,
+    (
+      select count(*) from (
+        select distinct lower(trim(t1)) as t1
+        from (
+          select unnest(
+            case
+              when p.tags is null then array[]::varchar[]
+              when length(p.tags) <= 2 then array[]::varchar[]
+              else string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')
+            end
+          ) as t1
+          from posts p
+          where p.posttypeid = 1 and p.owneruserid = a.user_id
+        ) q1
+        union
+        select distinct lower(trim(t2)) as t2
+        from (
+          select unnest(
+            case
+              when p.tags is null then array[]::varchar[]
+              when length(p.tags) <= 2 then array[]::varchar[]
+              else string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')
+            end
+          ) as t2
+          from posts p
+          where p.posttypeid = 1 and p.owneruserid = a.user_id
+        ) q2
+      ) u
+    ) as distinct_tag_count_via_union,
+    (
+      'User ' || coalesce(a.displayname, 'Anonymous') ||
+      ' (' || coalesce(a.norm_location,'n/a') || ')' ||
+      ' has ' || coalesce(cast(a.answer_count as text),'0') || ' answers and ' || coalesce(cast(a.question_count as text),'0') || ' questions.'
+    ) as summary_blurb
+from user_activity a
+left join ranked r on r.user_id = a.user_id
+left join activity_clusters ac on ac.user_id = a.user_id
+left join null_probe np on np.user_id = a.user_id
+where
+    (
+      (r.overall_rank <= 100 or a.gold_count >= 1)
+      and coalesce(a.total_post_score, -1000) >= -100
+      and (
+        a.last_posted_at is null
+        or a.last_posted_at >= (select max(creationdate) - interval '180 days' from posts)
+      )
+    )
+    and not (
+      a.norm_location ilike '%test%'
+      and a.displayname ilike '%bot%'
+    )
+order by
+    r.overall_rank nulls last,
+    a.composite_quality desc nulls last,
+    a.reputation desc,
+    a.user_id
+limit 200;

@@ -1,0 +1,101 @@
+WITH RankedPosts AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.Tags,
+    p.PostTypeId,
+    COALESCE(p.AcceptedAnswerId, -1) AS AcceptedAnswerId,
+    ROW_NUMBER() OVER (
+      PARTITION BY p.PostTypeId
+      ORDER BY p.Score DESC, p.ViewCount DESC, p.CreationDate DESC
+    ) AS rn
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId IN (1,2)
+),
+TopPosts AS (
+  SELECT *
+  FROM RankedPosts
+  WHERE rn <= 5
+),
+RecentActivity AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.OwnerUserId,
+    p.Tags,
+    p.ViewCount,
+    p.Score,
+    p.PostTypeId
+  FROM Posts p
+  WHERE p.LastActivityDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30' DAY
+),
+TagAnalytics AS (
+  SELECT
+    unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS Tag,
+    COUNT(*) AS PostCount,
+    SUM(p.ViewCount) AS TotalViews,
+    AVG(p.Score) AS AvgScore
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+  GROUP BY unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'))
+)
+SELECT
+  tp.Id AS PostId,
+  tp.Title,
+  tp.PostTypeId,
+  tp.CreationDate,
+  tp.LastActivityDate,
+  tp.OwnerUserId,
+  u.DisplayName AS OwnerDisplayName,
+  tp.Score,
+  tp.ViewCount,
+  tp.Tags,
+  ra_posts.Title AS RecentSiblingTitle,
+  ra_posts.CreationDate AS RecentSiblingCreationDate,
+  ra_posts.Score AS RecentSiblingScore,
+  ta.Tag AS TopTag,
+  ta.PostCount AS TagPostCount,
+  ta.TotalViews AS TagTotalViews,
+  ta.AvgScore AS TagAvgScore,
+  CASE
+    WHEN EXISTS (
+      SELECT 1 FROM Votes v
+      WHERE v.PostId = tp.Id AND v.VoteTypeId = 2
+        AND v.UserId = (SELECT MAX(Id) FROM Users)
+    ) THEN TRUE
+    ELSE FALSE
+  END AS HasMostActiveVoter
+FROM TopPosts tp
+LEFT JOIN Users u ON tp.OwnerUserId = u.Id
+LEFT JOIN Posts ra_posts ON ra_posts.ParentId = tp.Id AND ra_posts.PostTypeId = 2
+LEFT JOIN RecentActivity ra_recent ON ra_recent.Id = tp.Id  -- no direct correlation provided; kept safe join condition
+LEFT JOIN TagAnalytics ta ON true
+WHERE tp.PostTypeId = 1
+GROUP BY
+  tp.Id,
+  tp.Title,
+  tp.PostTypeId,
+  tp.CreationDate,
+  tp.LastActivityDate,
+  tp.OwnerUserId,
+  u.DisplayName,
+  tp.Score,
+  tp.ViewCount,
+  tp.Tags,
+  ra_posts.Title,
+  ra_posts.CreationDate,
+  ra_posts.Score,
+  ta.Tag,
+  ta.PostCount,
+  ta.TotalViews,
+  ta.AvgScore
+ORDER BY tp.Score DESC, tp.ViewCount DESC
+LIMIT 100;

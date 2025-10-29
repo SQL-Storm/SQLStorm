@@ -1,0 +1,143 @@
+-- {"query": "1187.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2168} 
+
+WITH UserActivityMetrics AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.UpVotes AS TotalUpVotesGiven,
+        u.DownVotes AS TotalDownVotesGiven,
+        COUNT(DISTINCT p.Id) AS TotalPostsCreated,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestionsAsked,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswersProvided,
+        SUM(p.Score) AS TotalPostScore,
+        AVG(p.Score) AS AveragePostScore,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        MAX(b.Date) AS LastBadgeDate,
+        COUNT(DISTINCT ph.Id) AS TotalPostHistoryEntries,
+        SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS ReceivedUpVotes,
+        SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS ReceivedDownVotes
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (2, 3) -- UpMod, DownMod
+    LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes
+),
+PostEngagementSummary AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        SUM(COALESCE(c.Score, 0)) AS TotalCommentScore,
+        MAX(c.CreationDate) AS LastCommentDate,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS UpVotesReceived,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS DownVotesReceived,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.Id END) AS EditCount, -- Title, Body, Tags edits
+        MAX(ph.CreationDate) AS LastEditHistoryDate,
+        COUNT(DISTINCT pl.RelatedPostId) AS LinkedPostsCount,
+        COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN pl.RelatedPostId END) AS DuplicatePostsCount
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+    GROUP BY p.Id, p.PostTypeId
+),
+RecentPostActivity AS (
+    SELECT
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate AS ActivityDate,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn_latest_activity
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20) -- Closed, Reopened, Deleted, Undeleted, Locked, Unlocked, Protected, Unprotected
+),
+QuestionTagAnalysis AS (
+    SELECT
+        p.Id AS PostId,
+        TRIM(UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><'))) AS TagName
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+),
+HighlyEngagedPosts AS (
+    -- Branch 1: Analyze Questions
+    SELECT
+        q.Id AS PostId,
+        'Question' AS PostType,
+        q.Title AS PostTitle,
+        q.CreationDate AS PostCreationDate,
+        q.ViewCount,
+        q.Score AS PostScore,
+        q.AnswerCount AS RelatedPostCount, -- For questions, this is AnswerCount
+        ua.DisplayName AS PostOwnerDisplayName,
+        ua.Reputation AS PostOwnerReputation,
+        pes.CommentCount,
+        pes.TotalCommentScore,
+        pes.UpVotesReceived AS PostUpVotes,
+        pes.DownVotesReceived AS PostDownVotes,
+        pes.EditCount AS PostEditCount,
+        rta.ActivityDate AS LatestLifecycleActivityDate,
+        q.ClosedDate AS ActualClosedDate,
+        ph_closed.CreationDate AS ClosedDate_History,
+        ph_reopened.CreationDate AS ReopenedDate_History,
+        ph_deleted.CreationDate AS DeletedDate_History,
+        MAX(CASE WHEN qta.TagName = 'sql' THEN 1 ELSE 0 END) AS HasSQLTag,
+        MAX(CASE WHEN qta.TagName = 'performance' THEN 1 ELSE 0 END) AS HasPerformanceTag,
+        NTILE(5) OVER (ORDER BY q.ViewCount DESC, q.Score DESC) AS RankQuintile,
+        (SELECT COUNT(DISTINCT pl_sub.RelatedPostId)
+         FROM PostLinks pl_sub
+         WHERE pl_sub.PostId = q.Id
+           AND pl_sub.LinkTypeId = 3 -- Duplicate links
+           AND pl_sub.CreationDate > q.CreationDate - INTERVAL '1 year'
+        ) AS RecentLinkMetric, -- Specific for questions: duplicate links
+        COALESCE(NULLIF(q.Score, 0) * (q.ViewCount / NULLIF(q.AnswerCount, 0.5)), 0) AS CalculatedEngagementScore,
+        AVG(ans.Score) FILTER (WHERE ans.Id = q.AcceptedAnswerId) OVER (PARTITION BY q.OwnerUserId) AS AvgRelatedPostScoreMetric, -- Specific for questions: accepted answer score
+        CASE
+            WHEN LOWER(q.Body) LIKE '%index%' AND LOWER(q.Body) LIKE '%optimization%' THEN 'High Performance Focus'
+            WHEN LOWER(q.Body) LIKE '%deadlock%' OR LOWER(q.Body) LIKE '%concurrency%' THEN 'Concurrency Issue'
+            WHEN LOWER(q.Body) LIKE '%error%' OR LOWER(q.Body) LIKE '%bug%' THEN 'Bug Related'
+            ELSE 'General Query'
+        END AS BodyKeywordCategory,
+        ua.TotalPostsCreated AS OwnerTotalPosts,
+        ua.TotalQuestionsAsked AS OwnerTotalQuestions,
+        ua.TotalAnswersProvided AS OwnerTotalAnswers,
+        (ua.ReceivedUpVotes - ua.ReceivedDownVotes) AS OwnerNetReceivedVotes,
+        CASE
+            WHEN q.ClosedDate IS NOT NULL AND q.CommunityOwnedDate IS NULL THEN 'Closed'
+            WHEN q.CommunityOwnedDate IS NOT NULL AND q.ClosedDate IS NULL THEN 'Community Owned'
+            WHEN q.ClosedDate IS NOT NULL AND q.CommunityOwnedDate IS NOT NULL THEN 'Closed & Community Owned'
+            ELSE 'Open'
+        END AS PostStatusFlag,
+        CASE
+            WHEN q.LastActivityDate IS NULL THEN 'No Activity'
+            WHEN q.LastActivityDate > NOW() - INTERVAL '3 months' THEN 'Recently Active'
+            WHEN q.LastActivityDate > NOW() - INTERVAL '1 year' THEN 'Moderately Active'
+            ELSE 'Dormant'
+        END AS ActivityLevel,
+        (SELECT EXISTS (
+            SELECT 1
+            FROM Comments co
+            WHERE co.PostId = q.Id
+              AND co.UserId = q.OwnerUserId
+              AND LOWER(co.Text) LIKE '%clarification%'
+        )) AS OwnerInteractionFlag, -- Specific for questions: owner requested clarification
+        LAG(q.ViewCount, 1, 0) OVER (PARTITION BY q.OwnerUserId ORDER BY q.CreationDate) AS PrevOwnerPostMetric, -- Specific for questions: previous question's view count
+        RANK() OVER (PARTITION BY q.OwnerUserId ORDER BY q.CreationDate DESC) AS OwnerPostRecencyRank,
+        q.ParentId AS ParentPostId,
+        NULL AS IsAcceptedAnswer,
+        NULL AS ScoreRelativeToParent
+    FROM Posts q
+    INNER JOIN PostTypes pt ON q.PostTypeId = pt.Id AND pt.Name = 'Question'
+    LEFT JOIN Users u_owner ON q.OwnerUserId = u_owner.Id
+    LEFT JOIN UserActivityMetrics ua ON u_owner.Id = ua.UserId
+    LEFT JOIN PostEngagementSummary pes ON q.Id = pes.PostId
+    LEFT JOIN RecentPostActivity rta ON q.Id = rta.PostId AND rta.rn_latest_activity = 1
+    LEFT JOIN PostHistory ph_closed ON q.Id = ph_closed.PostId AND ph_closed.PostHistoryTypeId = 10
+    LEFT JOIN PostHistory ph_reopened ON q.Id = ph_reopened.PostId AND ph_reopened.PostHistoryTypeId = 11
+    LEFT JOIN PostHistory ph_deleted ON q.Id = ph_deleted.PostId AND ph_deleted.PostHistoryTypeId = 12
+    LEFT JOIN Posts ans ON q.Id = ans.ParentId AND ans.PostTypeId = 2 -- All answers to this question
+    LEFT JOIN QuestionTagAnalysis qta ON q.Id = qta.PostId
+    WHERE
+        q.CreationDate BETWEEN '2020-01-01' AND '

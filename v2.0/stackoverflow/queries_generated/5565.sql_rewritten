@@ -1,0 +1,95 @@
+-- {"query": "5565.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 630} 
+WITH recent_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.LastActivityDate,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    COALESCE(p.Body, '') AS Body
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '180 days'
+),
+top_tags AS (
+  SELECT
+    unnest(string_to_array(substring(p.Tags FROM 2 FOR length(p.Tags)-2), '><')) AS tag,
+    p.Id AS PostId,
+    p.Score
+  FROM recent_questions p
+),
+tag_score AS (
+  SELECT
+    tag,
+    AVG(Score) AS avg_post_score,
+    MIN(CreationDate) AS first_post_date,
+    MAX(LastActivityDate) AS last_activity
+  FROM (
+    SELECT
+      tag,
+      (SELECT Score FROM Posts WHERE Id = PostId) AS Score,
+      (SELECT CreationDate FROM Posts WHERE Id = PostId) AS CreationDate,
+      (SELECT LastActivityDate FROM Posts WHERE Id = PostId) AS LastActivityDate
+    FROM top_tags
+  ) t
+  GROUP BY tag
+),
+comments_per_post AS (
+  SELECT
+    c.PostId,
+    COUNT(*) AS comment_count,
+    AVG(LENGTH(c.Text)) AS avg_comment_len
+  FROM Comments c
+  GROUP BY c.PostId
+),
+top_users AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.AccountId,
+    u.LastAccessDate,
+    u.CreationDate
+  FROM Users u
+  WHERE u.Reputation > 10000
+),
+aggregate AS (
+  SELECT
+    rp.PostId,
+    rp.Title,
+    rp.CreationDate,
+    rp.OwnerUserId,
+    rp.Tags,
+    rp.ViewCount,
+    rp.Score,
+    COALESCE(c.comment_count, 0) AS comment_count,
+    COALESCE(tt.avg_post_score, 0) AS avg_tag_score,
+    COALESCE(tg.last_activity, rp.LastActivityDate) AS last_activity
+  FROM recent_questions rp
+  LEFT JOIN comments_per_post c ON c.PostId = rp.Id
+  LEFT JOIN tag_score tt ON true
+  LEFT JOIN top_tags tg ON tg.PostId = rp.Id
+)
+SELECT
+  a.PostId,
+  a.Title,
+  a.OwnerUserId,
+  a.CreateDDate,
+  a.Tags,
+  a.ViewCount,
+  a.Score,
+  a.comment_count,
+  a.avg_tag_score,
+  a.last_activity,
+  u.DisplayName AS OwnerDisplayName,
+  u.Reputation AS OwnerReputation
+FROM aggregate a
+LEFT JOIN top_users u ON u.UserId = a.OwnerUserId
+ORDER BY a.last_activity DESC, a.Score DESC
+LIMIT 200;

@@ -1,0 +1,325 @@
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        u.location,
+        coalesce(nullif(trim(split_part(coalesce(u.websiteurl, ''), '/', 3)), ''), 'no-domain') as website_domain,
+        row_number() over (order by u.creationdate desc, u.id desc) as rn
+    from users u
+    where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+user_activity as (
+    select
+        p.owneruserid as user_id,
+        count(*) filter (where p.posttypeid = 1) as question_count,
+        count(*) filter (where p.posttypeid = 2) as answer_count,
+        sum(coalesce(p.score,0)) as post_score_sum,
+        max(p.lastactivitydate) as last_post_activity,
+        count(*) filter (where p.closeddate is not null) as closed_questions
+    from posts p
+    where p.owneruserid is not null
+    group by p.owneruserid
+),
+user_votes as (
+    select
+        v.userid as user_id,
+        count(*) filter (where v.votetypeid = 2) as upvotes_cast,
+        count(*) filter (where v.votetypeid = 3) as downvotes_cast,
+        count(*) filter (where v.votetypeid = 5) as favorites_cast,
+        sum(coalesce(v.bountyamount,0)) filter (where v.votetypeid in (8,9)) as bounty_total
+    from votes v
+    where v.userid is not null
+    group by v.userid
+),
+user_badges as (
+    select
+        b.userid as user_id,
+        count(*) as total_badges,
+        count(*) filter (where b.class = 1) as gold_badges,
+        count(*) filter (where b.class = 2) as silver_badges,
+        count(*) filter (where b.class = 3) as bronze_badges,
+        min(b.date) as first_badge_date,
+        max(b.date) as last_badge_date
+    from badges b
+    group by b.userid
+),
+question_engagement as (
+    select
+        q.id as question_id,
+        q.owneruserid as owner_user_id,
+        q.score as q_score,
+        q.viewcount as q_views,
+        q.creationdate as q_created,
+        q.lastactivitydate as q_lastact,
+        q.answercount as q_answers,
+        cardinality(string_to_array(substring(coalesce(q.tags, ''), 2, greatest(length(coalesce(q.tags,'')) - 2, 0)), '><')) as tag_count,
+        exists (
+            select 1
+            from postlinks pl
+            where pl.postid = q.id and pl.linktypeid = 3
+        ) as is_marked_duplicate
+    from posts q
+    where q.posttypeid = 1
+),
+answer_metrics as (
+    select
+        a.parentid as question_id,
+        count(*) as a_count,
+        avg(a.score) as avg_answer_score,
+        max(a.creationdate) as last_answer_date,
+        count(*) filter (where a.score > 0) as positive_answers,
+        count(*) filter (where a.score <= 0 or a.score is null) as nonpositive_answers
+    from posts a
+    where a.posttypeid = 2
+    group by a.parentid
+),
+comment_stats as (
+    select
+        c.postid as post_id,
+        count(*) as comment_count,
+        avg(coalesce(c.score,0)) as avg_comment_score,
+        max(c.creationdate) as last_comment_date
+    from comments c
+    group by c.postid
+),
+duplicate_clusters as (
+    select
+        q.owner_user_id,
+        count(*) filter (where qe.is_marked_duplicate) as dup_questions,
+        count(*) filter (where not qe.is_marked_duplicate) as nondup_questions
+    from question_engagement qe
+    join posts q on q.id = qe.question_id
+    group by q.owner_user_id
+),
+posthistory_signals as (
+    select
+        ph.postid,
+        count(*) filter (where ph.posthistorytypeid in (4,5,6)) as edits_count,
+        count(*) filter (where ph.posthistorytypeid in (10)) as closes_count,
+        count(*) filter (where ph.posthistorytypeid in (11)) as reopens_count,
+        count(*) filter (where ph.posthistorytypeid in (12)) as deletions_count,
+        max(ph.creationdate) as last_history_activity,
+        max(case when ph.posthistorytypeid = 10 then (case when ph.comment ~ '^[0-9]+$' then cast(ph.comment as integer) else null end) end) as last_close_reason_id
+    from posthistory ph
+    group by ph.postid
+),
+question_enriched as (
+    select
+        qe.question_id,
+        qe.owner_user_id,
+        qe.q_score,
+        qe.q_views,
+        qe.q_created,
+        qe.q_lastact,
+        qe.q_answers,
+        qe.tag_count,
+        qe.is_marked_duplicate,
+        am.a_count,
+        am.avg_answer_score,
+        am.last_answer_date,
+        cs.comment_count,
+        cs.avg_comment_score,
+        cs.last_comment_date,
+        phs.edits_count,
+        phs.closes_count,
+        phs.reopens_count,
+        phs.deletions_count,
+        phs.last_history_activity,
+        phs.last_close_reason_id
+    from question_engagement qe
+    left join answer_metrics am on am.question_id = qe.question_id
+    left join comment_stats cs on cs.post_id = qe.question_id
+    left join posthistory_signals phs on phs.postid = qe.question_id
+),
+tag_exploded as (
+    select
+        q.id as question_id,
+        unnest(string_to_array(substring(q.tags, 2, greatest(length(q.tags) - 2, 0)), '><')) as tagname
+    from posts q
+    where q.posttypeid = 1
+      and q.tags is not null
+),
+top_tags as (
+    select
+        te.tagname,
+        count(distinct te.question_id) as q_count
+    from tag_exploded te
+    group by te.tagname
+    having count(distinct te.question_id) >= 10
+),
+user_top_tag_overlap as (
+    select
+        qe.owner_user_id as user_id,
+        count(distinct qe.question_id) filter (where te.tagname in (select tagname from top_tags)) as questions_in_top_tags
+    from question_enriched qe
+    left join tag_exploded te on te.question_id = qe.question_id
+    group by qe.owner_user_id
+),
+recent_hot_candidates as (
+    select
+        qe.*,
+        row_number() over (
+            partition by qe.owner_user_id
+            order by
+                coalesce(qe.q_views,0) desc,
+                coalesce(qe.q_score,0) desc,
+                qe.q_created desc
+        ) as rn_user_hot
+    from question_enriched qe
+    where qe.q_created >= (select max(creationdate) - interval '90 days' from posts)
+),
+user_quality_score as (
+    select
+        qe.owner_user_id as user_id,
+        avg(
+            coalesce(qe.q_score,0) * 0.6
+            + coalesce(qe.a_count,0) * 0.4
+            + case when qe.is_marked_duplicate then -2 else 0 end
+            + least(coalesce(qe.tag_count,0), 5) * 0.2
+            + coalesce(qe.edits_count,0) * 0.1
+            + coalesce(qe.comment_count,0) * 0.05
+            + case when qe.last_close_reason_id in (101,102,103,104,105) then -1 else 0 end
+        ) as quality_score
+    from question_enriched qe
+    group by qe.owner_user_id
+),
+domain_reliability as (
+    select
+        ru.website_domain,
+        count(*) as domain_users,
+        avg(least(greatest(cast(coalesce(ua.post_score_sum,0) as numeric), -1000), 1000)) as avg_user_post_score_clamped
+    from recent_users ru
+    left join user_activity ua on ua.user_id = ru.user_id
+    group by ru.website_domain
+),
+user_ranked as (
+    select
+        ru.user_id,
+        ru.displayname,
+        ru.reputation,
+        ru.creationdate,
+        ru.location,
+        ru.website_domain,
+        ua.question_count,
+        ua.answer_count,
+        ua.post_score_sum,
+        ua.last_post_activity,
+        ua.closed_questions,
+        uv.upvotes_cast,
+        uv.downvotes_cast,
+        uv.favorites_cast,
+        uv.bounty_total,
+        ub.total_badges,
+        ub.gold_badges,
+        ub.silver_badges,
+        ub.bronze_badges,
+        ub.first_badge_date,
+        ub.last_badge_date,
+        dt.dup_questions,
+        dt.nondup_questions,
+        ut.questions_in_top_tags,
+        uqs.quality_score,
+        dr.avg_user_post_score_clamped as domain_avg_post_score,
+        coalesce(uv.upvotes_cast,0) - coalesce(uv.downvotes_cast,0) as net_votes_cast,
+        coalesce(ua.post_score_sum,0) + coalesce(ub.gold_badges,0)*10 + coalesce(ub.silver_badges,0)*3 + coalesce(ub.bronze_badges,0) as combined_signal,
+        row_number() over (
+            order by
+                coalesce(uqs.quality_score, -999999) desc,
+                coalesce(ua.post_score_sum, -999999) desc,
+                coalesce(ub.total_badges, 0) desc,
+                ru.reputation desc,
+                ru.creationdate desc,
+                ru.user_id desc
+        ) as rk
+    from recent_users ru
+    left join user_activity ua on ua.user_id = ru.user_id
+    left join user_votes uv on uv.user_id = ru.user_id
+    left join user_badges ub on ub.user_id = ru.user_id
+    left join duplicate_clusters dt on dt.owner_user_id = ru.user_id
+    left join user_top_tag_overlap ut on ut.user_id = ru.user_id
+    left join user_quality_score uqs on uqs.user_id = ru.user_id
+    left join domain_reliability dr on dr.website_domain = ru.website_domain
+),
+cross_user_comp as (
+    select
+        a.user_id as user_a,
+        b.user_id as user_b,
+        a.reputation as rep_a,
+        b.reputation as rep_b,
+        a.combined_signal as cs_a,
+        b.combined_signal as cs_b,
+        case
+            when a.website_domain = b.website_domain then 1
+            when a.website_domain is null and b.website_domain is null then 1
+            else 0
+        end as same_domain_flag
+    from user_ranked a
+    join user_ranked b on b.rk <= a.rk and b.user_id <> a.user_id
+    where a.rk <= 50
+),
+pairwise_gap_stats as (
+    select
+        user_a,
+        count(*) as peers_compared,
+        avg(cast((cs_a - cs_b) as numeric)) as avg_combined_signal_gap,
+        avg(cast((rep_a - rep_b) as numeric)) as avg_reputation_gap,
+        sum(same_domain_flag) as same_domain_peers
+    from cross_user_comp
+    group by user_a
+)
+select
+    ur.user_id,
+    ur.displayname,
+    ur.reputation,
+    ur.creationdate,
+    coalesce(ur.location, 'unknown') as location,
+    ur.website_domain,
+    ur.question_count,
+    ur.answer_count,
+    ur.post_score_sum,
+    ur.closed_questions,
+    ur.upvotes_cast,
+    ur.downvotes_cast,
+    ur.net_votes_cast,
+    ur.favorites_cast,
+    ur.bounty_total,
+    ur.total_badges,
+    ur.gold_badges,
+    ur.silver_badges,
+    ur.bronze_badges,
+    ur.first_badge_date,
+    ur.last_badge_date,
+    ur.dup_questions,
+    ur.nondup_questions,
+    ur.questions_in_top_tags,
+    ur.quality_score,
+    ur.domain_avg_post_score,
+    ur.combined_signal,
+    ur.rk as user_rank,
+    coalesce(pgs.peers_compared,0) as peers_compared,
+    coalesce(pgs.avg_combined_signal_gap,0) as avg_combined_signal_gap,
+    coalesce(pgs.avg_reputation_gap,0) as avg_reputation_gap,
+    coalesce(pgs.same_domain_peers,0) as same_domain_peers,
+    (
+        select count(*)
+        from recent_hot_candidates rhc
+        where rhc.owner_user_id = ur.user_id
+          and rhc.rn_user_hot <= 3
+    ) as top3_recent_hot_qs,
+    (
+        select string_agg(tt.tagname, ', ' order by tt.q_count desc, tt.tagname)
+        from (
+            select te.tagname, count(*) as q_count
+            from tag_exploded te
+            join posts q on q.id = te.question_id and q.owneruserid = ur.user_id
+            group by te.tagname
+            order by count(*) desc, te.tagname
+            limit 5
+        ) tt
+    ) as top_tags_sample
+from user_ranked ur
+left join pairwise_gap_stats pgs on pgs.user_a = ur.user_id
+where ur.rk <= 50
+order by ur.rk;

@@ -1,0 +1,273 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.ViewCount,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT b.Id) as Badges,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        MAX(p.CreationDate) as LastPostDate,
+        STRING_AGG(DISTINCT COALESCE(p.Tags, ''), ', ') as AllTags
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.ViewCount, u.UpVotes, u.DownVotes
+),
+RankedUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        ViewCount,
+        UpVotes,
+        DownVotes,
+        TotalPosts,
+        Questions,
+        Answers,
+        Badges,
+        TotalScore,
+        LastPostDate,
+        AllTags,
+        ROW_NUMBER() OVER (ORDER BY TotalScore DESC, Reputation DESC) as RankByScore,
+        DENSE_RANK() OVER (ORDER BY Questions DESC, Answers DESC) as RankByActivity,
+        NTILE(10) OVER (ORDER BY Reputation DESC) as ReputationDecile
+    FROM UserStats
+),
+TopQuestions AS (
+    SELECT 
+        p.Id as QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) as RankByScore,
+        PERCENT_RANK() OVER (ORDER BY p.Score DESC) as ScorePercentile,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) as PrevScore
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Score > 100
+),
+UserPostActivity AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (1, 2, 3) THEN ph.Id END) as EditCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12) THEN ph.Id END) as StatusChangeCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 24 THEN ph.Id END) as SuggestedEditCount,
+        STRING_AGG(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (1, 2, 3, 10, 11, 12, 24) THEN CAST(ph.PostHistoryTypeId AS VARCHAR) END, ', ') as ActivityTypes
+    FROM Users u
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE WHEN t.Count > 100 THEN 'Popular' ELSE 'Common' END as TagCategory,
+        (LAG(t.Count, 1) OVER (ORDER BY t.Count DESC) - t.Count) as CountDiffFromPrev
+    FROM Tags t
+    WHERE t.Count > 10
+),
+QuestionWithBadges AS (
+    SELECT 
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.Score,
+        q.Tags,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = q.OwnerUserId AND b.Name IN ('Great Question', 'Good Question', 'Popular Question')) as BadgeCount,
+        CASE WHEN EXISTS(SELECT 1 FROM Badges b WHERE b.UserId = q.OwnerUserId AND b.Name = 'Great Question') THEN 1 ELSE 0 END as HasGreatQuestion,
+        CASE WHEN EXISTS(SELECT 1 FROM Badges b WHERE b.UserId = q.OwnerUserId AND b.Name = 'Good Question') THEN 1 ELSE 0 END as HasGoodQuestion,
+        CASE WHEN EXISTS(SELECT 1 FROM Badges b WHERE b.UserId = q.OwnerUserId AND b.Name = 'Popular Question') THEN 1 ELSE 0 END as HasPopularQuestion
+    FROM Posts q
+    WHERE q.PostTypeId = 1 AND q.Score > 50
+),
+ComplexMetrics AS (
+    SELECT 
+        ru.UserId,
+        ru.DisplayName,
+        ru.Reputation,
+        ru.TotalPosts,
+        ru.Questions,
+        ru.Answers,
+        ru.Badges,
+        ru.TotalScore,
+        ru.RankByScore,
+        ru.RankByActivity,
+        ru.ReputationDecile,
+        upa.EditCount,
+        upa.StatusChangeCount,
+        upa.SuggestedEditCount,
+        CASE 
+            WHEN ru.Answers > 0 AND ru.Questions > 0 THEN (ru.Answers * 1.0 / ru.Questions) 
+            ELSE NULL 
+        END as AnswerToQuestionRatio,
+        COALESCE((SELECT SUM(p2.Score) FROM Posts p2 WHERE p2.OwnerUserId = ru.UserId AND p2.PostTypeId = 1), 0) as QuestionScoreSum,
+        COALESCE((SELECT SUM(p3.Score) FROM Posts p3 WHERE p3.OwnerUserId = ru.UserId AND p3.PostTypeId = 2), 0) as AnswerScoreSum
+    FROM RankedUsers ru
+    LEFT JOIN UserPostActivity upa ON upa.UserId = ru.UserId
+    WHERE ru.Reputation > 10000
+),
+FinalAnalysis AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        TotalPosts,
+        Questions,
+        Answers,
+        Badges,
+        TotalScore,
+        RankByScore,
+        RankByActivity,
+        ReputationDecile,
+        EditCount,
+        StatusChangeCount,
+        SuggestedEditCount,
+        AnswerToQuestionRatio,
+        QuestionScoreSum,
+        AnswerScoreSum,
+        CASE 
+            WHEN Reputation > 100000 THEN 'Legend'
+            WHEN Reputation > 50000 THEN 'Master'
+            WHEN Reputation > 10000 THEN 'Expert'
+            ELSE 'User'
+        END as ReputationTier,
+        CASE 
+            WHEN QuestionScoreSum > 1000 THEN 'High Question Creator'
+            WHEN QuestionScoreSum > 500 THEN 'Medium Question Creator' 
+            ELSE 'Low Question Creator'
+        END as QuestionCreatorLevel,
+        CASE 
+            WHEN AnswerScoreSum > 2000 THEN 'High Answerer'
+            WHEN AnswerScoreSum > 1000 THEN 'Medium Answerer'
+            ELSE 'Low Answerer'
+        END as AnswererLevel,
+        CASE 
+            WHEN AnswerToQuestionRatio > 2 THEN 'Very Active Answerer'
+            WHEN AnswerToQuestionRatio > 1 THEN 'Active Answerer'
+            ELSE 'Passive Answerer'
+        END as AnsweringActivityLevel
+    FROM ComplexMetrics
+)
+SELECT 
+    fa.UserId,
+    fa.DisplayName,
+    fa.Reputation,
+    fa.TotalPosts,
+    fa.Questions,
+    fa.Answers,
+    fa.Badges,
+    fa.TotalScore,
+    fa.RankByScore,
+    fa.RankByActivity,
+    fa.ReputationDecile,
+    fa.EditCount,
+    fa.StatusChangeCount,
+    fa.SuggestedEditCount,
+    fa.AnswerToQuestionRatio,
+    fa.QuestionScoreSum,
+    fa.AnswerScoreSum,
+    fa.ReputationTier,
+    fa.QuestionCreatorLevel,
+    fa.AnswererLevel,
+    fa.AnsweringActivityLevel,
+    CASE 
+        WHEN fa.ReputationTier = 'Legend' AND (fa.QuestionCreatorLevel = 'High Question Creator' OR fa.AnswererLevel = 'High Answerer') THEN 'Elite Contributor'
+        WHEN fa.ReputationTier IN ('Master', 'Expert') AND (fa.QuestionCreatorLevel IN ('High Question Creator', 'Medium Question Creator') OR fa.AnswererLevel IN ('High Answerer', 'Medium Answerer')) THEN 'Top Contributor' 
+        ELSE 'Regular Contributor'
+    END as ContributionCategory,
+    (SELECT 
+        COUNT(*) 
+        FROM Posts p1 
+        JOIN Posts p2 ON p2.ParentId = p1.Id 
+        WHERE p1.OwnerUserId = fa.UserId 
+        AND p1.PostTypeId = 1 
+        AND p2.PostTypeId = 2 
+        AND p2.Score > 10 
+        AND p2.CreationDate > DATE '2022-01-01'
+    ) as HighScoreAnswers,
+    COALESCE(
+        (SELECT 
+            STRING_AGG(CAST(q1.AnswerCount as VARCHAR), ', ') 
+            FROM Posts q1 
+            WHERE q1.OwnerUserId = fa.UserId 
+            AND q1.PostTypeId = 1 
+            AND q1.AnswerCount > 5
+        ), 
+        '' 
+    ) as HighAnsweredQuestions,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = fa.UserId AND p.PostTypeId = 1 AND p.Tags LIKE '%javascript%') as JavaScriptQuestions,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = fa.UserId AND p.PostTypeId = 2 AND p.Score > 50) as HighScoringAnswers,
+    COALESCE(
+        (SELECT COUNT(*) 
+         FROM Posts p 
+         WHERE p.OwnerUserId = fa.UserId 
+         AND p.PostTypeId = 1 
+         AND p.Score > 100 
+         AND p.AnswerCount > 10
+        ), 
+        0
+    ) as PopularQuestions,
+    (SELECT STRING_AGG(DISTINCT t.TagName, ', ') 
+     FROM Posts p 
+     CROSS JOIN UNNEST(string_to_array(p.Tags, '>')) AS tag(tagname)
+     JOIN Tags t ON t.TagName = TRIM(tag.tagname)
+     WHERE p.OwnerUserId = fa.UserId 
+     AND p.PostTypeId = 1 
+     AND t.Count > 100) as HighVolumeTags,
+    (SELECT 
+        COUNT(*) 
+        FROM Votes v 
+        JOIN Posts p ON v.PostId = p.Id 
+        WHERE p.OwnerUserId = fa.UserId 
+        AND v.VoteTypeId IN (2, 3) 
+        AND v.CreationDate > DATE '2023-01-01'
+    ) as RecentVotesReceived
+FROM FinalAnalysis fa
+WHERE fa.Reputation > 50000
+GROUP BY
+    fa.UserId,
+    fa.DisplayName,
+    fa.Reputation,
+    fa.TotalPosts,
+    fa.Questions,
+    fa.Answers,
+    fa.Badges,
+    fa.TotalScore,
+    fa.RankByScore,
+    fa.RankByActivity,
+    fa.ReputationDecile,
+    fa.EditCount,
+    fa.StatusChangeCount,
+    fa.SuggestedEditCount,
+    fa.AnswerToQuestionRatio,
+    fa.QuestionScoreSum,
+    fa.AnswerScoreSum,
+    fa.ReputationTier,
+    fa.QuestionCreatorLevel,
+    fa.AnswererLevel,
+    fa.AnsweringActivityLevel,
+    fa.ContributionCategory,
+    fa.HighScoreAnswers,
+    fa.HighAnsweredQuestions,
+    fa.JavaScriptQuestions,
+    fa.HighScoringAnswers,
+    fa.PopularQuestions,
+    fa.HighVolumeTags,
+    fa.RecentVotesReceived
+HAVING 
+    (fa.QuestionScoreSum > 2000 OR fa.AnswerScoreSum > 5000 OR fa.Badges > 20)
+ORDER BY fa.Reputation DESC, fa.TotalScore DESC
+LIMIT 100;

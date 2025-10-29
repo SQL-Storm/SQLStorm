@@ -1,0 +1,252 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.LastActivityDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) as total_posts,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as avg_score,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+        CASE 
+            WHEN p.Score > 100 THEN 'High'
+            WHEN p.Score > 50 THEN 'Medium'
+            ELSE 'Low'
+        END as score_category,
+        COALESCE(p.Title, 'No Title') as title_or_default,
+        COALESCE(p.Tags, '') as cleaned_tags,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN 'Question with Answers'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            ELSE 'Other'
+        END as post_type_description,
+        ABS(p.Score - LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate)) as score_change,
+        EXTRACT(EPOCH FROM (COALESCE(p.LastActivityDate, TIMESTAMP '2024-10-01 12:34:56') - p.CreationDate)) / 86400.0 AS days_since_activity
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.CreationDate,
+        u.AccountId,
+        COUNT(DISTINCT p.Id) as total_posts,
+        SUM(COALESCE(p.Score, 0)) as total_score,
+        AVG(COALESCE(p.Score, 0)) as avg_post_score,
+        MAX(p.CreationDate) as last_post_date,
+        MAX(p.LastActivityDate) as last_activity_date,
+        STRING_AGG(DISTINCT p.Tags, '; ') as all_tags,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as question_count,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as answer_count,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN p.Id END) as questions_with_answers,
+        COUNT(*) as post_count,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 100 THEN 'Highly Active'
+            WHEN COUNT(DISTINCT p.Id) > 50 THEN 'Active'
+            WHEN COUNT(DISTINCT p.Id) > 10 THEN 'Moderately Active'
+            ELSE 'Inactive'
+        END as activity_level,
+        EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - u.CreationDate)) / 86400.0 AS days_since_registration,
+        CASE 
+            WHEN EXISTS(SELECT 1 FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) THEN 'Gold Badge Holder'
+            WHEN EXISTS(SELECT 1 FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) THEN 'Silver Badge Holder'
+            WHEN EXISTS(SELECT 1 FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) THEN 'Bronze Badge Holder'
+            ELSE 'No Badges'
+        END as badge_status
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate, u.AccountId
+),
+ComplexQuestionAnalysis AS (
+    SELECT 
+        q.Id as QuestionId,
+        q.Title,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.CommentCount,
+        q.FavoriteCount,
+        q.CreationDate,
+        q.LastActivityDate,
+        u.DisplayName as OwnerName,
+        u.Reputation as OwnerReputation,
+        q.Tags,
+        COALESCE(q.Tags, '') as cleaned_tags,
+        regexp_split_to_array(COALESCE(q.Tags, ''), '>') as tag_array,
+        array_length(regexp_split_to_array(COALESCE(q.Tags, ''), '>'), 1) as tag_count,
+        (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = q.Id AND a.PostTypeId = 2) as actual_answers,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = q.Id AND v.VoteTypeId = 2) as upvotes,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = q.Id AND v.VoteTypeId = 3) as downvotes,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = q.Id) as comment_count,
+        (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = q.Id AND ph.PostHistoryTypeId IN (33, 34)) as notice_count,
+        CASE 
+            WHEN (SELECT COUNT(*) FROM Votes v WHERE v.PostId = q.Id AND v.VoteTypeId = 2) > 10 THEN 'Popular Question'
+            WHEN (SELECT COUNT(*) FROM Votes v WHERE v.PostId = q.Id AND v.VoteTypeId = 2) > 5 THEN 'Moderately Popular'
+            ELSE 'Less Popular'
+        END as popularity_status,
+        COALESCE(
+            (SELECT p.Title FROM Posts p WHERE p.Id = q.AcceptedAnswerId),
+            'No Accepted Answer'
+        ) as accepted_answer_title,
+        EXTRACT(EPOCH FROM (COALESCE(q.LastActivityDate, TIMESTAMP '2024-10-01 12:34:56') - q.CreationDate)) / 86400.0 AS days_active,
+        CASE 
+            WHEN q.AnswerCount > 0 AND q.Score >= 5 THEN 'High Quality Question'
+            WHEN q.AnswerCount > 0 AND q.Score >= 0 THEN 'Moderate Quality Question'
+            ELSE 'Low Quality Question'
+        END as quality_status
+    FROM Posts q
+    JOIN Users u ON q.OwnerUserId = u.Id
+    WHERE q.PostTypeId = 1
+    AND EXISTS (
+        SELECT 1 FROM PostHistory ph 
+        WHERE ph.PostId = q.Id 
+        AND ph.CreationDate > q.CreationDate 
+        AND ph.PostHistoryTypeId IN (1, 2, 3)
+    )
+),
+ComprehensiveRanking AS (
+    SELECT 
+        rp.Id,
+        rp.PostTypeId,
+        rp.OwnerUserId,
+        rp.Score,
+        rp.ViewCount,
+        rp.CreationDate,
+        rp.Title,
+        rp.Tags,
+        rp.AnswerCount,
+        rp.CommentCount,
+        rp.FavoriteCount,
+        rp.avg_score,
+        rp.prev_score,
+        rp.score_category,
+        rp.title_or_default,
+        rp.post_type_description,
+        rp.score_change,
+        rp.days_since_activity,
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.total_posts,
+        uas.avg_post_score,
+        uas.last_post_date,
+        uas.question_count,
+        uas.answer_count,
+        uas.questions_with_answers,
+        uas.activity_level,
+        uas.badge_status,
+        qa.QuestionId,
+        qa.Score as question_score,
+        qa.ViewCount as question_viewcount,
+        qa.AnswerCount as question_answer_count,
+        qa.CommentCount as question_comment_count,
+        qa.FavoriteCount as question_favorite_count,
+        qa.popularity_status,
+        qa.quality_status,
+        qa.days_active,
+        (ROW_NUMBER() OVER (ORDER BY rp.Score DESC, uas.total_posts DESC)) as overall_rank,
+        NTILE(100) OVER (ORDER BY rp.Score DESC) as percentile_rank,
+        RANK() OVER (PARTITION BY uas.UserId ORDER BY rp.CreationDate DESC) as user_post_rank,
+        DENSE_RANK() OVER (ORDER BY uas.avg_post_score DESC) as avg_score_rank
+    FROM RankedPosts rp
+    JOIN UserActivityStats uas ON rp.OwnerUserId = uas.UserId
+    LEFT JOIN ComplexQuestionAnalysis qa ON rp.Id = qa.QuestionId 
+    WHERE rp.rn <= 5 
+    OR uas.total_posts > 50
+    OR uas.avg_post_score > 10
+)
+SELECT 
+    cr.Id,
+    cr.PostTypeId,
+    cr.OwnerUserId,
+    cr.Score,
+    cr.ViewCount,
+    cr.CreationDate,
+    cr.Title,
+    cr.Tags,
+    cr.AnswerCount,
+    cr.CommentCount,
+    cr.FavoriteCount,
+    cr.avg_score,
+    cr.prev_score,
+    cr.score_category,
+    cr.title_or_default,
+    cr.post_type_description,
+    cr.score_change,
+    cr.days_since_activity,
+    cr.UserId,
+    cr.DisplayName,
+    cr.Reputation,
+    cr.total_posts,
+    cr.avg_post_score,
+    cr.last_post_date,
+    cr.question_count,
+    cr.answer_count,
+    cr.questions_with_answers,
+    cr.activity_level,
+    cr.badge_status,
+    cr.QuestionId,
+    cr.question_score,
+    cr.question_viewcount,
+    cr.question_answer_count,
+    cr.question_comment_count,
+    cr.question_favorite_count,
+    cr.popularity_status,
+    cr.quality_status,
+    cr.days_active,
+    cr.overall_rank,
+    cr.percentile_rank,
+    cr.user_post_rank,
+    cr.avg_score_rank,
+    CASE 
+        WHEN cr.OwnerUserId IS NULL THEN 'Missing Author Data'
+        WHEN cr.DisplayName IS NULL THEN 'Unknown User'
+        ELSE 'Data Complete'
+    END as data_completeness_check,
+    CASE 
+        WHEN cr.total_posts > 1000 THEN 'Elite Contributor'
+        WHEN cr.total_posts > 500 THEN 'Professional Contributor'
+        WHEN cr.total_posts > 100 THEN 'Experienced Contributor'
+        WHEN cr.total_posts > 10 THEN 'Regular Contributor'
+        ELSE 'New Contributor'
+    END as contributor_level,
+    EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - cr.CreationDate)) / 86400.0 AS days_since_first_post,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = cr.OwnerUserId AND p.PostTypeId = 1) as questions_by_user,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = cr.OwnerUserId AND p.PostTypeId = 2) as answers_by_user,
+    CASE 
+        WHEN cr.QuestionId IS NOT NULL AND cr.question_answer_count > 0 THEN 
+            ROUND((cr.question_answer_count * 100.0 / NULLIF(cr.question_count, 0))::double precision, 2)
+        ELSE 0
+    END as answer_percentage,
+    CASE 
+        WHEN (cr.question_score IS NOT NULL AND cr.question_score > 0) THEN 
+            ROUND((cr.question_score / NULLIF(cr.total_posts, 0))::double precision, 2)
+        ELSE 0
+    END as avg_score_per_post,
+    CASE 
+        WHEN (cr.total_posts > 0 AND cr.avg_post_score > 0) THEN 
+            ROUND((cr.avg_post_score * 100.0 / NULLIF(cr.Reputation, 0))::double precision, 2)
+        ELSE 0
+    END as reputation_efficiency_ratio
+FROM ComprehensiveRanking cr
+WHERE cr.total_posts >= 1
+AND (cr.Score IS NOT NULL OR cr.question_score IS NOT NULL)
+ORDER BY cr.overall_rank ASC, cr.Score DESC, cr.Reputation DESC, cr.total_posts DESC
+LIMIT 1000 OFFSET 0;

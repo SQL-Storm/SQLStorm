@@ -1,0 +1,128 @@
+-- {"query": "5682.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1054} 
+WITH RecentActivePosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.PostTypeId,
+    p.LastActivityDate,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.LastEditDate
+  FROM Posts p
+  WHERE p.CreationDate >= NOW() - INTERVAL '90 days'
+),
+TopTags AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS PostCount,
+    AVG(p.Score) AS AvgScore,
+    MAX(p.LastActivityDate) AS LastActive
+  FROM Posts p
+  JOIN UNNEST(string_to_array(substr(p.Tags, 2, length(p.Tags)-2), '><')) AS t(TagName) ON true
+  GROUP BY t.TagName
+),
+UserEngagement AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    (SELECT COUNT(*) FROM Posts pr WHERE pr.OwnerUserId = u.Id) AS PostsCreated,
+    (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id) AS CommentsMade,
+    (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id) AS VotesCast
+  FROM Users u
+  WHERE u.Reputation > 1000
+),
+ActivityWindow AS (
+  SELECT
+    p.PostId,
+    p.Title,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.PostTypeId,
+    LEAD(p.LastActivityDate) OVER (PARTITION BY p.PostTypeId ORDER BY p.LastActivityDate) AS NextActivity
+  FROM RecentActivePosts p
+),
+CorrelatedVotes AS (
+  SELECT
+    a.PostId,
+    a.Title,
+    a.OwnerUserId,
+    a.LastActivityDate,
+    a.Score,
+    a.ViewCount,
+    a.Tags,
+    a.PostTypeId,
+    v.VoteTypeId,
+    v.UserId AS VoterId,
+    v.CreationDate AS VoteDate,
+    v.BountyAmount
+  FROM ActivityWindow a
+  LEFT JOIN Votes v ON v.PostId = a.PostId
+  WHERE v.VoteTypeId IN (2, 3) -- upvotes/downvotes
+),
+ComplexDerivation AS (
+  SELECT
+    ro.PostId,
+    ro.Title,
+    ro.OwnerUserId,
+    ro.LastActivityDate,
+    ro.Score,
+    ro.ViewCount,
+    ro.Tags,
+    ro.PostTypeId,
+    COALESCE(b.Name, 'Unknown') AS BadgeName,
+    b.Class,
+    b.Date AS BadgeDate,
+    kt.PostCount AS RelatedTagPostCount,
+    kt.AvgScore AS RelatedTagAvgScore,
+    kt.LastActive AS TagLastActive
+  FROM RecentActivePosts ro
+  LEFT JOIN Badges b ON b.UserId = ro.OwnerUserId
+  LEFT JOIN TopTags tt ON true
+  CROSS JOIN (SELECT 1 AS dummy) d
+  LEFT JOIN TopTags kt ON true
+  WHERE ro.PostTypeId = 1
+)
+SELECT
+  rp.PostId,
+  rp.Title,
+  rp.OwnerUserId,
+  rp.LastActivityDate,
+  rp.Score,
+  rp.ViewCount,
+  rp.Tags,
+  rp.PostTypeId,
+  ue.DisplayName AS OwnerDisplayName,
+  ue.Reputation AS OwnerReputation,
+  ARRAY_AGG(DISTINCT cv.VoteDate) FILTER (WHERE cv.VoteTypeId = 2) AS UpvoteDates,
+  ARRAY_AGG(DISTINCT cv.VoteDate) FILTER (WHERE cv.VoteTypeId = 3) AS DownvoteDates,
+  COALESCE(pf.AllTagNames, ARRAY[]::text[]) AS AllTagsFlattened,
+  cw.NextActivity AS NextPostActivityDate,
+  cf.RelatedTagPostCount,
+  cf.RelatedTagAvgScore
+FROM RecentActivePosts rp
+LEFT JOIN Users ue ON rp.OwnerUserId = ue.Id
+LEFT JOIN CorrelatedVotes cv ON cv.PostId = rp.PostId
+LEFT JOIN (SELECT unnest(string_to_array(substr(rp.Tags, 2, length(rp.Tags)-2), '><')) AS AllTagNames, rp.PostId
+           FROM RecentActivePosts rp) pf ON pf.PostId = rp.PostId
+LEFT JOIN ActivityWindow cw ON cw.PostId = rp.PostId
+LEFT JOIN ComplexDerivation cf ON cf.PostId = rp.PostId
+GROUP BY
+  rp.PostId, rp.Title, rp.OwnerUserId, rp.LastActivityDate, rp.Score, rp.ViewCount,
+  rp.Tags, rp.PostTypeId, ue.DisplayName, ue.Reputation, cw.NextActivity, cf.RelatedTagPostCount, cf.RelatedTagAvgScore
+ORDER BY rp.LastActivityDate DESC, rp.Score DESC
+LIMIT 200;

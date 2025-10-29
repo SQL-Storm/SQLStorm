@@ -1,0 +1,233 @@
+WITH UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        COALESCE(u.DisplayName, 'AnonymousUser') AS UserDisplayName,
+        u.Reputation,
+        u.UpVotes AS TotalUpVotesGiven,
+        u.DownVotes AS TotalDownVotesGiven,
+        u.Views AS ProfileViews,
+        COUNT(DISTINCT p.Id) AS TotalPostsCreated,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsAsked,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersGiven,
+        SUM(CASE WHEN p.PostTypeId IN (1, 2) THEN p.Score ELSE 0 END) AS TotalPostScore,
+        AVG(CASE WHEN p.PostTypeId IN (1, 2) THEN p.Score ELSE NULL END) AS AvgPostScore,
+        MAX(p.LastActivityDate) AS LastPostActivity,
+        DATE_PART('day', MAX(u.LastAccessDate) - u.CreationDate) AS DaysSinceCreation,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        DATE_PART('hour',
+            MAX(p.CreationDate)
+            - COALESCE(
+                LAG(MAX(p.CreationDate)) OVER (PARTITION BY u.Id ORDER BY MAX(p.CreationDate) DESC),
+                MAX(p.CreationDate)
+            )
+        ) AS HoursBetweenLastTwoPosts
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Badges b ON u.Id = b.UserId
+    WHERE
+        u.LastAccessDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes, u.Views, u.CreationDate, u.LastAccessDate
+),
+PostDetails AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.LastActivityDate,
+        p.Tags,
+        (SELECT COUNT(DISTINCT ph_sub.UserId)
+         FROM PostHistory ph_sub
+         WHERE ph_sub.PostId = p.Id AND ph_sub.PostHistoryTypeId IN (4, 5, 6)) AS UniqueEditors,
+        (SELECT c_sub.Text
+         FROM Comments c_sub
+         WHERE c_sub.PostId = p.Id
+         ORDER BY c_sub.CreationDate DESC
+         LIMIT 1) AS LatestCommentText,
+        AVG(c.Score) OVER (PARTITION BY p.Id) AS AvgCommentScore,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+        NULLIF(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) * 1.0 / NULLIF(COUNT(v.Id), 0) AS UpvoteRatio,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN 'Closed' ELSE 'Open' END) OVER (PARTITION BY p.Id) AS ClosureStatus,
+        (p.Score * 5 + p.ViewCount * 0.1 + p.CommentCount * 2 + COALESCE(p.FavoriteCount, 0) * 10) /
+        (1.0 + EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - p.LastActivityDate)) / 3600 / 24) AS HotnessScore
+    FROM
+        Posts p
+    LEFT JOIN
+        Comments c ON p.Id = c.PostId
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (2, 3)
+    LEFT JOIN
+        PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId IN (10, 11)
+    WHERE
+        p.PostTypeId IN (1, 2)
+    GROUP BY
+        p.Id, p.PostTypeId, p.Title, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount,
+        p.FavoriteCount, p.OwnerUserId, p.AcceptedAnswerId, p.ParentId, p.LastActivityDate, p.Tags
+),
+TagAnalysis AS (
+    SELECT
+        t.TagName,
+        t.Count AS TotalTagUseCount,
+        COUNT(DISTINCT p.Id) AS PostsWithThisTag,
+        AVG(p.Score) AS AvgPostScoreForTag,
+        MAX(CASE WHEN t.WikiPostId IS NOT NULL THEN 'Has Wiki' ELSE 'No Wiki' END) AS WikiStatus,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC, AVG(p.Score) DESC) AS TagPopularityRank
+    FROM
+        Tags t
+    INNER JOIN
+        Posts p ON p.PostTypeId = 1
+        AND p.Tags IS NOT NULL
+        AND LENGTH(p.Tags) > 2
+        AND EXISTS (
+            SELECT 1
+            FROM UNNEST(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS tag_arr
+            WHERE tag_arr = t.TagName
+        )
+    GROUP BY
+        t.TagName, t.Count
+),
+RecentlyClosedOrReopened AS (
+    SELECT
+        ph.PostId,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN crt.Name ELSE NULL END) AS LastCloseReason,
+        MAX(ph.CreationDate) AS LastHistoryDate,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY MAX(ph.CreationDate) DESC) AS rn
+    FROM
+        PostHistory ph
+    LEFT JOIN
+        CloseReasonTypes crt ON ph.Comment = CAST(crt.Id AS varchar)
+    WHERE
+        ph.PostHistoryTypeId IN (10, 11)
+        AND ph.CreationDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180 days')
+    GROUP BY
+        ph.PostId
+)
+(
+    SELECT
+        ue.UserId,
+        ue.UserDisplayName,
+        ue.Reputation,
+        ue.TotalPostsCreated,
+        pd.PostId,
+        COALESCE(pd.Title, 'No Title (e.g., Answer)') AS PostTitle,
+        pd.PostCreationDate,
+        pd.PostScore,
+        pd.ViewCount,
+        pd.FavoriteCount,
+        pd.UniqueEditors,
+        pd.LatestCommentText,
+        COALESCE(pd.AvgCommentScore, 0.0) AS AvgCommentScore,
+        pd.UpVoteCount,
+        pd.DownVoteCount,
+        pd.UpvoteRatio,
+        ta.TagName AS PrimaryTagName,
+        ta.TagPopularityRank,
+        rcr.LastCloseReason,
+        rcr.LastHistoryDate,
+        (ue.Reputation * 0.5 + ue.TotalPostScore * 0.2 + ue.ProfileViews * 0.01 + ue.GoldBadges * 10 + ue.SilverBadges * 5 + ue.BronzeBadges * 1) AS UserEngagementScore,
+        (pd.PostScore * 0.7 + COALESCE(pd.UpvoteRatio, 0) * 100 + pd.HotnessScore * 0.1 - COALESCE(pd.DownVoteCount, 0) * 0.5 + CASE WHEN pd.AcceptedAnswerId IS NOT NULL THEN 50 ELSE 0 END) AS PostQualityScore,
+        pd.HotnessScore,
+        CASE
+            WHEN pd.ClosureStatus = 'Closed' AND rcr.LastCloseReason IS NOT NULL THEN 'Recently Closed: ' || rcr.LastCloseReason
+            WHEN pd.PostTypeId = 1 AND pd.AcceptedAnswerId IS NOT NULL THEN 'Question with Accepted Answer'
+            WHEN pd.PostTypeId = 2 AND pd.ParentId IS NOT NULL THEN 'Answer to Question ' || CAST(pd.ParentId AS varchar)
+            WHEN ue.HoursBetweenLastTwoPosts IS NOT NULL AND ue.HoursBetweenLastTwoPosts < 24 AND ue.TotalPostsCreated > 1 THEN 'Frequent Poster'
+            ELSE 'General Activity - High Rep User'
+        END AS PostActivityStatus,
+        (SELECT AVG(sub_p.Score) FROM Posts sub_p WHERE sub_p.OwnerUserId = ue.UserId) AS OwnerAveragePostScore,
+        TRIM(BOTH '>' FROM SUBSTRING(COALESCE(pd.Title, 'N/A') || ' (' || COALESCE(pd_first_tag.first_tag_on_post, 'No Tags') || ')', 1, 100)) AS FormattedPostTitleAndTag
+    FROM
+        UserEngagement ue
+    INNER JOIN
+        PostDetails pd ON ue.UserId = pd.OwnerUserId
+    LEFT JOIN LATERAL (
+        SELECT
+            (string_to_array(substring(pd.Tags, 2, length(pd.Tags)-2), '><'))[1] AS first_tag_on_post
+        WHERE pd.Tags IS NOT NULL AND LENGTH(pd.Tags) > 2
+    ) AS pd_first_tag ON TRUE
+    LEFT JOIN
+        TagAnalysis ta ON pd_first_tag.first_tag_on_post = ta.TagName
+    LEFT JOIN
+        (SELECT PostId, LastCloseReason, LastHistoryDate FROM RecentlyClosedOrReopened WHERE rn = 1) rcr ON pd.PostId = rcr.PostId
+    WHERE
+        ue.Reputation > 5000
+        AND pd.PostScore > 10
+        AND pd.PostCreationDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '6 months')
+        AND COALESCE(pd.UpvoteRatio, 0) > 0.6
+        AND (pd.Title LIKE '%SQL%' OR pd.LatestCommentText LIKE '%database%')
+)
+UNION ALL
+(
+    SELECT
+        ue.UserId,
+        ue.UserDisplayName,
+        ue.Reputation,
+        ue.TotalPostsCreated,
+        pd.PostId,
+        COALESCE(pd.Title, 'No Title (e.g., Answer)') AS PostTitle,
+        pd.PostCreationDate,
+        pd.PostScore,
+        pd.ViewCount,
+        pd.FavoriteCount,
+        pd.UniqueEditors,
+        pd.LatestCommentText,
+        COALESCE(pd.AvgCommentScore, 0.0) AS AvgCommentScore,
+        pd.UpVoteCount,
+        pd.DownVoteCount,
+        pd.UpvoteRatio,
+        ta.TagName AS PrimaryTagName,
+        ta.TagPopularityRank,
+        rcr.LastCloseReason,
+        rcr.LastHistoryDate,
+        (ue.Reputation * 0.5 + ue.TotalPostScore * 0.2 + ue.ProfileViews * 0.01 + ue.GoldBadges * 10 + ue.SilverBadges * 5 + ue.BronzeBadges * 1) AS UserEngagementScore,
+        (pd.PostScore * 0.7 + COALESCE(pd.UpvoteRatio, 0) * 100 + pd.HotnessScore * 0.1 - COALESCE(pd.DownVoteCount, 0) * 0.5 + CASE WHEN pd.AcceptedAnswerId IS NOT NULL THEN 50 ELSE 0 END) AS PostQualityScore,
+        pd.HotnessScore,
+        CASE
+            WHEN pd.ClosureStatus = 'Closed' AND rcr.LastCloseReason IS NOT NULL THEN 'Recently Closed: ' || rcr.LastCloseReason
+            WHEN pd.PostTypeId = 1 AND pd.AcceptedAnswerId IS NOT NULL THEN 'Question with Accepted Answer'
+            WHEN pd.PostTypeId = 2 AND pd.ParentId IS NOT NULL THEN 'Answer to Question ' || CAST(pd.ParentId AS varchar)
+            WHEN ue.HoursBetweenLastTwoPosts IS NOT NULL AND ue.HoursBetweenLastTwoPosts < 24 AND ue.TotalPostsCreated > 1 THEN 'Frequent Poster'
+            ELSE 'General Activity - High Score Post'
+        END AS PostActivityStatus,
+        (SELECT AVG(sub_p.Score) FROM Posts sub_p WHERE sub_p.OwnerUserId = ue.UserId) AS OwnerAveragePostScore,
+        TRIM(BOTH '>' FROM SUBSTRING(COALESCE(pd.Title, 'N/A') || ' (' || COALESCE(pd_first_tag.first_tag_on_post, 'No Tags') || ')', 1, 100)) AS FormattedPostTitleAndTag
+    FROM
+        UserEngagement ue
+    INNER JOIN
+        PostDetails pd ON ue.UserId = pd.OwnerUserId
+    LEFT JOIN LATERAL (
+        SELECT
+            (string_to_array(substring(pd.Tags, 2, length(pd.Tags)-2), '><'))[1] AS first_tag_on_post
+        WHERE pd.Tags IS NOT NULL AND LENGTH(pd.Tags) > 2
+    ) AS pd_first_tag ON TRUE
+    LEFT JOIN
+        TagAnalysis ta ON pd_first_tag.first_tag_on_post = ta.TagName
+    LEFT JOIN
+        (SELECT PostId, LastCloseReason, LastHistoryDate FROM RecentlyClosedOrReopened WHERE rn = 1) rcr ON pd.PostId = rcr.PostId
+    WHERE
+        pd.PostScore > 100
+        AND pd.ViewCount > 5000
+        AND pd.AnswerCount > 5
+        AND pd.PostCreationDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 year')
+        AND COALESCE(pd.UpvoteRatio, 0) > 0.5
+        AND (pd.Title LIKE '%database%' OR pd.LatestCommentText LIKE '%performance%')
+)
+ORDER BY
+    UserEngagementScore DESC, PostQualityScore DESC, HotnessScore DESC
+LIMIT 500;

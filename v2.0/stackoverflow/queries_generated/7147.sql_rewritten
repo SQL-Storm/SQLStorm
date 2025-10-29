@@ -1,0 +1,327 @@
+-- {"query": "7147.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 3113} 
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) as QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) as AnswerCount,
+        MAX(p.CreationDate) as LatestPostDate,
+        MAX(c.CreationDate) as LatestCommentDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) as ReputationRank,
+        NTILE(100) OVER (ORDER BY u.Reputation) as ReputationPercentile,
+        CASE 
+            WHEN u.Reputation >= 1000000 THEN 'Legendary'
+            WHEN u.Reputation >= 100000 THEN 'Master'
+            WHEN u.Reputation >= 10000 THEN 'Grandmaster'
+            WHEN u.Reputation >= 1000 THEN 'Expert'
+            WHEN u.Reputation >= 100 THEN 'Novice'
+            ELSE 'Newbie'
+        END as ReputationTier,
+        AVG(p.Score) as AvgPostScore,
+        AVG(p.ViewCount) as AvgViewCount,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) / NULLIF(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END), 0), 0) as AvgQuestionScore,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) / NULLIF(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END), 0), 0) as AvgAnswerScore
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Reputation > 0
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes
+),
+TopUsers AS (
+    SELECT 
+        Id,
+        DisplayName,
+        Reputation,
+        PostCount,
+        CommentCount,
+        BadgeCount,
+        QuestionCount,
+        AnswerCount,
+        LatestPostDate,
+        LatestCommentDate,
+        ReputationRank,
+        ReputationPercentile,
+        ReputationTier,
+        AvgPostScore,
+        AvgViewCount,
+        AvgQuestionScore,
+        AvgAnswerScore,
+        DENSE_RANK() OVER (ORDER BY Reputation DESC) as RankByReputation,
+        RANK() OVER (ORDER BY PostCount DESC) as RankByPostCount,
+        ROW_NUMBER() OVER (ORDER BY (QuestionCount + AnswerCount) DESC) as RankByActivity
+    FROM UserStats
+    WHERE PostCount > 0
+),
+UserActivity AS (
+    SELECT 
+        tu.Id,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.PostCount,
+        tu.QuestionCount,
+        tu.AnswerCount,
+        tu.ReputationTier,
+        tu.RankByReputation,
+        tu.RankByPostCount,
+        tu.RankByActivity,
+        CASE 
+            WHEN tu.QuestionCount > 0 AND tu.AnswerCount > 0 THEN 'Active Contributor'
+            WHEN tu.QuestionCount > 0 THEN 'Questioner'
+            WHEN tu.AnswerCount > 0 THEN 'Answerer'
+            ELSE 'Inactive'
+        END as UserCategory,
+        ROUND((tu.QuestionCount * 100.0 / NULLIF(tu.PostCount, 0)), 2) as QuestionPercentage,
+        ROUND((tu.AnswerCount * 100.0 / NULLIF(tu.PostCount, 0)), 2) as AnswerPercentage,
+        ROUND((tu.Reputation * 1.0 / NULLIF(tu.PostCount, 0)), 2) as ReputationPerPost,
+        CASE 
+            WHEN tu.AnswerCount > 0 AND tu.QuestionCount > 0 THEN 
+                ROUND((tu.AnswerCount * 1.0 / NULLIF(tu.QuestionCount, 0)), 2)
+            ELSE NULL 
+        END as AnswerToQuestionRatio,
+        DATEDIFF(cast('2024-10-01' as date)(), tu.LatestPostDate) as DaysSinceLastPost,
+        DATEDIFF(cast('2024-10-01' as date)(), tu.LatestCommentDate) as DaysSinceLastComment
+    FROM TopUsers tu
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        p.ParentId,
+        u.DisplayName as OwnerName,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            WHEN p.PostTypeId = 4 THEN 'TagWikiExcerpt'
+            WHEN p.PostTypeId = 5 THEN 'TagWiki'
+            WHEN p.PostTypeId = 6 THEN 'ModeratorNomination'
+            WHEN p.PostTypeId = 7 THEN 'WikiPlaceholder'
+            WHEN p.PostTypeId = 8 THEN 'PrivilegeWiki'
+            ELSE 'Unknown'
+        END as PostTypeName,
+        COALESCE(p.Tags, '') as CleanTags,
+        REGEXP_REPLACE(p.Title, '[^a-zA-Z0-9 ]', '', 'g') as CleanTitle,
+        LENGTH(p.Title) as TitleLength,
+        LENGTH(p.Body) as BodyLength,
+        CASE 
+            WHEN p.Score >= 100 THEN 'Hot'
+            WHEN p.Score >= 50 THEN 'Popular'
+            WHEN p.Score >= 10 THEN 'Moderate'
+            WHEN p.Score >= 0 THEN 'Low'
+            ELSE 'Negative'
+        END as ScoreCategory,
+        CASE 
+            WHEN p.ViewCount >= 1000 THEN 'Viral'
+            WHEN p.ViewCount >= 500 THEN 'Trending'
+            WHEN p.ViewCount >= 100 THEN 'Popular'
+            WHEN p.ViewCount >= 10 THEN 'Moderate'
+            ELSE 'Low'
+        END as ViewCategory,
+        CASE 
+            WHEN p.AnswerCount >= 10 THEN 'Highly Answered'
+            WHEN p.AnswerCount >= 5 THEN 'Moderately Answered'
+            WHEN p.AnswerCount >= 1 THEN 'Answered'
+            ELSE 'Unanswered'
+        END as AnswerCategory,
+        CASE 
+            WHEN p.CommentCount >= 20 THEN 'Highly Commented'
+            WHEN p.CommentCount >= 10 THEN 'Moderately Commented'
+            WHEN p.CommentCount >= 1 THEN 'Commented'
+            ELSE 'No Comments'
+        END as CommentCategory
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId IN (1, 2) -- Questions and Answers only
+),
+TopPosts AS (
+    SELECT 
+        pa.PostId,
+        pa.Title,
+        pa.Score,
+        pa.ViewCount,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.CreationDate,
+        pa.OwnerUserId,
+        pa.OwnerName,
+        pa.PostTypeName,
+        pa.CleanTags,
+        pa.CleanTitle,
+        pa.TitleLength,
+        pa.BodyLength,
+        pa.ScoreCategory,
+        pa.ViewCategory,
+        pa.AnswerCategory,
+        pa.CommentCategory,
+        DENSE_RANK() OVER (ORDER BY pa.Score DESC) as ScoreRank,
+        DENSE_RANK() OVER (ORDER BY pa.ViewCount DESC) as ViewRank,
+        DENSE_RANK() OVER (ORDER BY pa.AnswerCount DESC) as AnswerRank,
+        DENSE_RANK() OVER (ORDER BY pa.CommentCount DESC) as CommentRank,
+        ROW_NUMBER() OVER (ORDER BY pa.CreationDate DESC) as NewestPost,
+        RANK() OVER (PARTITION BY pa.PostTypeName ORDER BY pa.Score DESC) as TypeScoreRank
+    FROM PostAnalysis pa
+    WHERE pa.Score >= 0 AND pa.ViewCount >= 0
+),
+ComplexAnalysis AS (
+    SELECT 
+        ua.Id,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.PostCount,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.ReputationTier,
+        ua.RankByReputation,
+        ua.RankByPostCount,
+        ua.RankByActivity,
+        ua.UserCategory,
+        ua.QuestionPercentage,
+        ua.AnswerPercentage,
+        ua.ReputationPerPost,
+        ua.AnswerToQuestionRatio,
+        ua.DaysSinceLastPost,
+        ua.DaysSinceLastComment,
+        CASE 
+            WHEN ua.DaysSinceLastPost > 30 AND ua.DaysSinceLastComment > 30 THEN 'Inactive'
+            WHEN ua.DaysSinceLastPost > 7 OR ua.DaysSinceLastComment > 7 THEN 'Semi-Active'
+            ELSE 'Active'
+        END as ActivityStatus,
+        CASE 
+            WHEN ua.QuestionPercentage > 80 THEN 'Question Focused'
+            WHEN ua.AnswerPercentage > 80 THEN 'Answer Focused'
+            WHEN ua.ReputationPerPost > 10 THEN 'High Value Contributor'
+            WHEN ua.Reputation > 50000 THEN 'Established Contributor'
+            ELSE 'General Contributor'
+        END as ContributionType,
+        (SELECT COUNT(*) 
+         FROM Posts p 
+         WHERE p.OwnerUserId = ua.Id 
+         AND p.PostTypeId = 1 
+         AND p.CreationDate >= DATEADD(YEAR, -1, cast('2024-10-01' as date)())) as RecentQuestions,
+        (SELECT COUNT(*) 
+         FROM Posts p 
+         WHERE p.OwnerUserId = ua.Id 
+         AND p.PostTypeId = 2 
+         AND p.CreationDate >= DATEADD(YEAR, -1, cast('2024-10-01' as date)())) as RecentAnswers,
+        (SELECT COUNT(*) 
+         FROM Comments c 
+         WHERE c.UserId = ua.Id 
+         AND c.CreationDate >= DATEADD(YEAR, -1, cast('2024-10-01' as date)())) as RecentComments,
+        (SELECT COUNT(*) 
+         FROM Badges b 
+         WHERE b.UserId = ua.Id 
+         AND b.Date >= DATEADD(YEAR, -1, cast('2024-10-01' as date)())) as RecentBadges,
+        CASE 
+            WHEN (ua.QuestionCount + ua.AnswerCount) > 1000 THEN 'Legend'
+            WHEN (ua.QuestionCount + ua.AnswerCount) > 500 THEN 'Veteran'
+            WHEN (ua.QuestionCount + ua.AnswerCount) > 100 THEN 'Experienced'
+            ELSE 'Beginner'
+        END as ExperienceLevel,
+        ROW_NUMBER() OVER (ORDER BY (ua.QuestionCount + ua.AnswerCount) DESC, ua.Reputation DESC) as OverallRank,
+        AVG(ua.PostCount) OVER (ORDER BY ua.Reputation ROWS BETWEEN 10 PRECEDING AND CURRENT ROW) as MovingAvgPostCount,
+        STDDEV(ua.Reputation) OVER (ORDER BY ua.Reputation ROWS BETWEEN 10 PRECEDING AND CURRENT ROW) as ReputationStdDev
+    FROM UserActivity ua
+)
+SELECT 
+    ca.Id as UserId,
+    ca.DisplayName,
+    ca.Reputation,
+    ca.PostCount,
+    ca.QuestionCount,
+    ca.AnswerCount,
+    ca.ReputationTier,
+    ca.RankByReputation,
+    ca.RankByPostCount,
+    ca.RankByActivity,
+    ca.UserCategory,
+    ca.QuestionPercentage,
+    ca.AnswerPercentage,
+    ca.ReputationPerPost,
+    ca.AnswerToQuestionRatio,
+    ca.DaysSinceLastPost,
+    ca.DaysSinceLastComment,
+    ca.ActivityStatus,
+    ca.ContributionType,
+    ca.RecentQuestions,
+    ca.RecentAnswers,
+    ca.RecentComments,
+    ca.RecentBadges,
+    ca.ExperienceLevel,
+    ca.OverallRank,
+    ca.MovingAvgPostCount,
+    ca.ReputationStdDev,
+    
+    -- Complex calculations and string manipulations
+    CASE 
+        WHEN ca.RecentQuestions > 0 AND ca.RecentAnswers > 0 THEN 
+            CONCAT('Active in both Q&A, ', ca.RecentQuestions, ' Q, ', ca.RecentAnswers, ' A')
+        WHEN ca.RecentQuestions > 0 THEN 
+            CONCAT('Question focused, ', ca.RecentQuestions, ' recent Q')
+        WHEN ca.RecentAnswers > 0 THEN 
+            CONCAT('Answer focused, ', ca.RecentAnswers, ' recent A')
+        ELSE 
+            'Inactive'
+    END as RecentActivitySummary,
+    
+    -- Set operator like logic
+    CASE 
+        WHEN EXISTS (SELECT 1 FROM TopPosts tp WHERE tp.OwnerUserId = ca.Id AND tp.ScoreRank <= 5) THEN
+            CONCAT('Top ', 
+                (SELECT COUNT(*) FROM TopPosts tp WHERE tp.OwnerUserId = ca.Id AND tp.ScoreRank <= 5),
+                ' scored posts')
+        ELSE 
+            'No top scoring posts'
+    END as TopScorePosts,
+    
+    -- Correlated subquery for user performance metrics
+    (SELECT AVG(tp.Score) 
+     FROM TopPosts tp 
+     WHERE tp.OwnerUserId = ca.Id 
+     AND tp.Score > 0) as AvgScoreOfUserPosts,
+    
+    -- Window function with complex partitioning
+    LAG(ca.Reputation) OVER (ORDER BY ca.Reputation DESC) - ca.Reputation as ReputationGap,
+    
+    -- NULL handling and conditional expressions
+    COALESCE(NULLIF(ca.ReputationPerPost, 0), 1) * 
+        (CASE WHEN ca.AnswerToQuestionRatio IS NOT NULL THEN ca.AnswerToQuestionRatio ELSE 1 END) as WeightedMetric,
+    
+    -- String operations and concatenation
+    UPPER(CONCAT(
+        SUBSTR(ca.DisplayName, 1, 1), 
+        ' - ', 
+        ca.ReputationTier,
+        ' - ', 
+        ca.ContributionType,
+        ' - ', 
+        ca.ActivityStatus
+    )) as DetailedUserProfile,
+    
+    -- Date arithmetic and complex filtering
+    CASE 
+        WHEN ca.DaysSinceLastPost <= 1 OR ca.DaysSinceLastComment <= 1 THEN 'Very Recent'
+        WHEN ca.DaysSinceLastPost <= 7 OR ca.DaysSinceLastComment <= 7 THEN 'Recently Active'
+        ELSE 'Inactive Period'
+    END as RecentActivityLevel
+FROM ComplexAnalysis ca
+WHERE ca.PostCount > 0
+    AND ca.Reputation > 0
+    AND (ca.RecentQuestions > 0 OR ca.RecentAnswers > 0 OR ca.RecentComments > 0)
+ORDER BY ca.Reputation DESC, ca.PostCount DESC
+LIMIT 1000;

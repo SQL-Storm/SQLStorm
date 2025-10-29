@@ -1,0 +1,197 @@
+WITH user_stats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id)                                            AS total_posts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END)      AS questions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END)      AS answers,
+        AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL)       AS avg_score,
+        MAX(p.CreationDate)                                    AS last_post_date,
+        MAX(v.CreationDate)                                    AS last_vote_date
+    FROM Users u
+    LEFT JOIN Posts p   ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v   ON v.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+badge_counts AS (
+    SELECT
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END)                AS gold_badges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END)                AS silver_badges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END)                AS bronze_badges,
+        STRING_AGG(DISTINCT b.Name, ', ')                      AS badge_names
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+-- Split Tags string without using UNNEST / string_to_array functions to keep compatibility.
+-- This approach uses a recursive CTE to split tags like '<tag1><tag2>' into rows.
+post_tags AS (
+    SELECT
+        p.OwnerUserId AS OwnerUserId,
+        NULL::text     AS TagName, -- placeholder; cast replaced below in a dialect-neutral way
+        p.Tags,
+        1 AS start_pos
+    FROM Posts p
+    WHERE p.Tags IS NOT NULL
+    UNION ALL
+    SELECT
+        pt.OwnerUserId,
+        NULL,
+        pt.Tags,
+        -- advance start_pos to next '><' occurrence +2, stop when no more
+        CASE
+            WHEN instr(pt.Tags, '><', pt.start_pos) > 0
+            THEN instr(pt.Tags, '><', pt.start_pos) + 2
+            ELSE 0
+        END
+    FROM post_tags pt
+    WHERE pt.start_pos > 0
+),
+-- Note: Not all SQL dialects support instr with 3 args. Provide a portable splitter below using standard functions.
+tag_splits AS (
+    SELECT
+        p.OwnerUserId,
+        TRIM(BOTH '<>' FROM SUBSTR(p.Tags,
+            pos+1,
+            CASE
+                WHEN next_pos > 0 THEN next_pos - pos - 1
+                ELSE LENGTH(p.Tags) - pos
+            END
+        )) AS TagName
+    FROM (
+        -- generate positions of '<' characters
+        SELECT
+            OwnerUserId,
+            Tags,
+            start_pos AS pos,
+            (CASE
+                WHEN INSTR(Tags, '><', start_pos) > 0 THEN INSTR(Tags, '><', start_pos) + 1
+                ELSE 0
+             END) AS next_pos
+        FROM (
+            SELECT
+                p.OwnerUserId,
+                p.Tags,
+                0 AS start_pos
+            FROM Posts p
+            WHERE p.Tags IS NOT NULL
+            UNION ALL
+            SELECT
+                p2.OwnerUserId,
+                p2.Tags,
+                INSTR(p2.Tags, '><', s.start_pos) + 2
+            FROM (
+                SELECT
+                    p.OwnerUserId,
+                    p.Tags
+                FROM Posts p
+                WHERE p.Tags IS NOT NULL
+            ) p2
+            JOIN (
+                -- generate sequence positions up to some reasonable max tags per post (e.g., 10)
+                SELECT 1 AS start_pos UNION ALL SELECT 3 UNION ALL SELECT 5 UNION ALL SELECT 7 UNION ALL SELECT 9
+                UNION ALL SELECT 11 UNION ALL SELECT 13 UNION ALL SELECT 15 UNION ALL SELECT 17 UNION ALL SELECT 19
+            ) s ON 1=1
+            WHERE INSTR(p2.Tags, '><', s.start_pos) > 0
+        )
+    ) p
+    WHERE pos > 0 OR pos = 0
+),
+
+-- Aggregate tag usage per user
+user_tag_usage AS (
+    SELECT
+        OwnerUserId AS UserId,
+        LOWER(REGEXP_REPLACE(TagName, '\s+', '')) AS TagName,
+        COUNT(*) AS tag_usage
+    FROM tag_splits
+    WHERE TagName IS NOT NULL AND TagName <> ''
+    GROUP BY OwnerUserId, LOWER(REGEXP_REPLACE(TagName, '\s+', ''))
+),
+
+top_tags AS (
+    SELECT
+        utu.UserId,
+        STRING_AGG(utu.TagName, ', ' ORDER BY utu.tag_usage DESC) AS top_5_tags
+    FROM user_tag_usage utu
+    GROUP BY utu.UserId
+),
+
+recent_activity AS (
+    SELECT
+        u.Id,
+        MAX(p.LastActivityDate)                            AS recent_post_activity,
+        MAX(c.CreationDate)                                 AS recent_comment_activity
+    FROM Users u
+    LEFT JOIN Posts    p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId      = u.Id
+    GROUP BY u.Id
+)
+
+SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    COALESCE(us.total_posts,0)                     AS total_posts,
+    COALESCE(us.questions,0)                       AS questions,
+    COALESCE(us.answers,0)                         AS answers,
+    ROUND(COALESCE(us.avg_score,0),2)              AS avg_score,
+    us.last_post_date,
+    us.last_vote_date,
+    COALESCE(bc.gold_badges,0)                      AS gold_badges,
+    COALESCE(bc.silver_badges,0)                    AS silver_badges,
+    COALESCE(bc.bronze_badges,0)                    AS bronze_badges,
+    bc.badge_names,
+    tt.top_5_tags,
+    ra.recent_post_activity,
+    ra.recent_comment_activity,
+    RANK() OVER (ORDER BY u.Reputation DESC)       AS reputation_rank,
+    CASE
+        WHEN u.Location IS NULL OR TRIM(u.Location) = '' THEN 'Unknown'
+        ELSE u.Location
+    END                                           AS user_location,
+    (SELECT COUNT(*)
+     FROM Votes v
+     WHERE v.UserId = u.Id
+       AND v.VoteTypeId = 2
+       AND v.CreationDate > CAST('2024-10-01' AS date) - INTERVAL '30' DAY) AS upvotes_last_30d
+FROM Users u
+LEFT JOIN user_stats     us ON us.Id = u.Id
+LEFT JOIN badge_counts   bc ON bc.UserId = u.Id
+LEFT JOIN top_tags       tt ON tt.UserId = u.Id
+LEFT JOIN recent_activity ra ON ra.Id = u.Id
+WHERE (u.Reputation > 1000 OR COALESCE(bc.gold_badges,0) > 0)
+
+UNION ALL
+
+SELECT
+    NULL                                          AS Id,
+    'TOTAL'                                       AS DisplayName,
+    SUM(u.Reputation)                             AS Reputation,
+    SUM(COALESCE(us.total_posts,0))               AS total_posts,
+    SUM(COALESCE(us.questions,0))                 AS questions,
+    SUM(COALESCE(us.answers,0))                   AS answers,
+    ROUND(AVG(COALESCE(us.avg_score,0)),2)        AS avg_score,
+    MAX(us.last_post_date)                        AS last_post_date,
+    MAX(us.last_vote_date)                        AS last_vote_date,
+    SUM(COALESCE(bc.gold_badges,0))               AS gold_badges,
+    SUM(COALESCE(bc.silver_badges,0))             AS silver_badges,
+    SUM(COALESCE(bc.bronze_badges,0))             AS bronze_badges,
+    NULL                                          AS badge_names,
+    NULL                                          AS top_5_tags,
+    MAX(ra.recent_post_activity)                 AS recent_post_activity,
+    MAX(ra.recent_comment_activity)              AS recent_comment_activity,
+    NULL                                          AS reputation_rank,
+    NULL                                          AS user_location,
+    NULL                                          AS upvotes_last_30d
+FROM Users u
+LEFT JOIN user_stats     us ON us.Id = u.Id
+LEFT JOIN badge_counts   bc ON bc.UserId = u.Id
+LEFT JOIN recent_activity ra ON ra.Id = u.Id
+HAVING COUNT(u.Id) > 0
+
+ORDER BY Reputation DESC NULLS LAST
+LIMIT 100;

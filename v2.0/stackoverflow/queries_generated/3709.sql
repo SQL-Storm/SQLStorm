@@ -1,0 +1,110 @@
+-- {"query": "3709.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2159} 
+
+WITH UserPostStats AS (
+    SELECT 
+        u.Id                                     AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1)          AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2)          AS AnswerCount,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 2)        AS AvgAnswerScore,
+        SUM(
+            CASE 
+                WHEN p.PostTypeId = 1 
+                     AND p.AcceptedAnswerId IS NOT NULL 
+                     AND EXISTS (
+                         SELECT 1 
+                         FROM Posts a 
+                         WHERE a.Id = p.AcceptedAnswerId 
+                           AND a.OwnerUserId = u.Id
+                     )
+                THEN 1 
+                ELSE 0 
+            END
+        )                                              AS AcceptedAnswerCount
+    FROM Users u
+    LEFT JOIN Posts p 
+           ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+UserBadgeStats AS (
+    SELECT 
+        b.UserId,
+        COUNT(*)                                          AS TotalBadges,
+        COUNT(*) FILTER (WHERE b.Class = 1)               AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2)               AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3)               AS BronzeBadges,
+        STRING_AGG(DISTINCT b.Name, ', ') FILTER (WHERE b.TagBased = 0) AS NamedBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+RecentActivity AS (
+    SELECT 
+        u.Id                                           AS UserId,
+        MAX(p.LastActivityDate)                        AS LastPostActivity,
+        MAX(c.CreationDate)                            AS LastCommentDate,
+        MAX(v.CreationDate)                            AS LastVoteDate
+    FROM Users u
+    LEFT JOIN Posts p 
+           ON p.OwnerUserId = u.Id 
+          AND p.CreationDate > CURRENT_TIMESTAMP - INTERVAL '30 days'
+    LEFT JOIN Comments c 
+           ON c.UserId = u.Id 
+          AND c.CreationDate > CURRENT_TIMESTAMP - INTERVAL '30 days'
+    LEFT JOIN Votes v 
+           ON v.UserId = u.Id 
+          AND v.CreationDate > CURRENT_TIMESTAMP - INTERVAL '30 days'
+    GROUP BY u.Id
+),
+TagUsage AS (
+    SELECT 
+        p.OwnerUserId                                 AS UserId,
+        UNNEST(string_to_array(TRIM(BOTH '<>' FROM p.Tags), '><')) AS Tag,
+        COUNT(*)                                      AS TagUseCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1 
+      AND p.Tags IS NOT NULL
+    GROUP BY p.OwnerUserId, Tag
+),
+AggregatedTags AS (
+    SELECT 
+        tu.UserId,
+        STRING_AGG(tu.Tag || ':' || tu.TagUseCount::text, ', ' ORDER BY tu.TagUseCount DESC) AS TagsUsed
+    FROM TagUsage tu
+    GROUP BY tu.UserId
+)
+SELECT 
+    up.UserId,
+    up.DisplayName,
+    up.Reputation,
+    up.QuestionCount,
+    up.AnswerCount,
+    up.AvgAnswerScore,
+    up.AcceptedAnswerCount,
+    COALESCE(ub.TotalBadges, 0)          AS TotalBadges,
+    COALESCE(ub.GoldBadges, 0)           AS GoldBadges,
+    COALESCE(ub.SilverBadges, 0)         AS SilverBadges,
+    COALESCE(ub.BronzeBadges, 0)         AS BronzeBadges,
+    COALESCE(ub.NamedBadges, '')         AS NamedBadges,
+    ra.LastPostActivity,
+    ra.LastCommentDate,
+    ra.LastVoteDate,
+    ag.TagsUsed,
+    (SELECT COUNT(*) FROM Votes v WHERE v.UserId = up.UserId) AS TotalVotes,
+    ROW_NUMBER() OVER (ORDER BY up.Reputation DESC, COALESCE(ub.TotalBadges,0) DESC) AS ReputationBadgeRank
+FROM UserPostStats up
+LEFT JOIN UserBadgeStats ub   ON ub.UserId = up.UserId
+LEFT JOIN RecentActivity ra  ON ra.UserId = up.UserId
+LEFT JOIN AggregatedTags ag   ON ag.UserId = up.UserId
+WHERE up.Reputation > 10000
+  AND (up.QuestionCount + up.AnswerCount) > 0
+  AND COALESCE(ra.LastPostActivity, ra.LastCommentDate, ra.LastVoteDate) IS NOT NULL
+ORDER BY ReputationBadgeRank
+LIMIT 100
+UNION ALL
+SELECT 
+    NULL,NULL,NULL,NULL,NULL,NULL,NULL,
+    NULL,NULL,NULL,NULL,
+    NULL,NULL,NULL,NULL,
+    NULL,NULL
+WHERE FALSE;

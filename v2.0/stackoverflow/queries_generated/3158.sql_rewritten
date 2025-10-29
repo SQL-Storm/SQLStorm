@@ -1,0 +1,151 @@
+-- {"query": "3158.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1645} 
+WITH
+    /*--------------------------------------------------------------
+      Base user metrics: reputation, total badges, gold/silver/bronze
+    --------------------------------------------------------------*/
+    UserStats AS (
+        SELECT
+            u.Id                                 AS UserId,
+            u.DisplayName,
+            u.Reputation,
+            COALESCE(u.CreationDate, TIMESTAMP '1970-01-01')   AS UserSince,
+            COALESCE(u.LastAccessDate, TIMESTAMP '1970-01-01') AS LastSeen,
+            COUNT(b.Id)                          AS TotalBadges,
+            SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+            SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+            SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+        FROM Users u
+        LEFT JOIN Badges b ON b.UserId = u.Id
+        GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+    ),
+
+    /*--------------------------------------------------------------
+      Post aggregates per user: counts, avg score, most recent activity
+    --------------------------------------------------------------*/
+    PostAgg AS (
+        SELECT
+            p.OwnerUserId                      AS UserId,
+            COUNT(*)                           AS TotalPosts,
+            COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS Questions,
+            COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS Answers,
+            AVG(COALESCE(p.Score,0))           AS AvgScore,
+            MAX(p.LastActivityDate)            AS LastPostActivity,
+            STRING_AGG(
+                DISTINCT CASE
+                    WHEN p.Tags IS NULL THEN NULL
+                    ELSE TRIM(BOTH '<>' FROM split_part(p.Tags, '><', 1))
+                END,
+                ';'
+            ) FILTER (WHERE p.Tags IS NOT NULL) AS PrimaryTagList
+        FROM Posts p
+        WHERE p.OwnerUserId IS NOT NULL
+        GROUP BY p.OwnerUserId
+    ),
+
+    /*--------------------------------------------------------------
+      Recent activity window: rank each user's recent posts
+    --------------------------------------------------------------*/
+    RecentPosts AS (
+        SELECT
+            p.OwnerUserId                                    AS UserId,
+            p.Id                                            AS PostId,
+            p.Title,
+            p.CreationDate,
+            ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId
+                               ORDER BY p.CreationDate DESC) AS RecencyRank
+        FROM Posts p
+        WHERE p.OwnerUserId IS NOT NULL
+          AND p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '30 days'
+    ),
+
+    /*--------------------------------------------------------------
+      Tag popularity across the whole site (used later for ranking)
+    --------------------------------------------------------------*/
+    TagStats AS (
+        SELECT
+            t.TagName,
+            t.Count                                         AS TagUseCount,
+            ROW_NUMBER() OVER (ORDER BY t.Count DESC)      AS TagRank
+        FROM Tags t
+        WHERE t.TagName IS NOT NULL
+    ),
+
+    /*--------------------------------------------------------------
+      Users with no posts – generated via a set operator to test UNION
+    --------------------------------------------------------------*/
+    UsersWithoutPosts AS (
+        SELECT
+            u.Id               AS UserId,
+            u.DisplayName,
+            NULL::int          AS TotalPosts,
+            NULL::int          AS Questions,
+            NULL::int          AS Answers,
+            NULL::numeric      AS AvgScore,
+            NULL::timestamp    AS LastPostActivity,
+            NULL::text         AS PrimaryTagList
+        FROM Users u
+        WHERE NOT EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id)
+    )
+
+/*================================================================
+  Final result set: combine users with posts and those without,
+  enrich with metrics, apply complex predicates and calculations.
+================================================================*/
+SELECT
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.TotalBadges,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    COALESCE(pa.TotalPosts, 0)                          AS TotalPosts,
+    COALESCE(pa.Questions, 0)                           AS QuestionCount,
+    COALESCE(pa.Answers, 0)                             AS AnswerCount,
+    ROUND(COALESCE(pa.AvgScore, 0)::numeric, 2)        AS AvgPostScore,
+    GREATEST(us.LastSeen, COALESCE(pa.LastPostActivity, TIMESTAMP '1970-01-01')) AS LastActivity,
+    /* Days since last activity (NULL safe) */
+    EXTRACT(DAY FROM (cast('2024-10-01 12:34:56' as timestamp) - 
+        GREATEST(us.LastSeen, COALESCE(pa.LastPostActivity, TIMESTAMP '1970-01-01')))) 
+        AS DaysSinceLastActivity,
+    pa.PrimaryTagList,
+    /* Top 3 recent post titles concatenated */
+    (SELECT STRING_AGG(rp.Title, ' | ')
+     FROM RecentPosts rp
+     WHERE rp.UserId = us.UserId
+       AND rp.RecencyRank <= 3)                         AS RecentTop3Titles,
+    /* Flag if user has any gold badge and avg score > 5 */
+    CASE 
+        WHEN us.GoldBadges > 0 AND COALESCE(pa.AvgScore,0) > 5 THEN 'Elite'
+        WHEN us.Reputation > 20000 THEN 'HighRep'
+        ELSE 'Standard'
+    END                                                AS UserTier,
+    /* Compute a synthetic “influence score” */
+    (us.Reputation * 0.6) +
+    (us.TotalBadges * 15) +
+    (COALESCE(pa.TotalPosts,0) * 2) +
+    (COALESCE(us.GoldBadges,0) * 100) AS InfluenceScore
+FROM UserStats us
+LEFT JOIN PostAgg pa ON pa.UserId = us.UserId
+UNION ALL
+SELECT
+    uwp.UserId,
+    uwp.DisplayName,
+    NULL::int          AS Reputation,
+    0                  AS TotalBadges,
+    0                  AS GoldBadges,
+    0                  AS SilverBadges,
+    0                  AS BronzeBadges,
+    0                  AS TotalPosts,
+    0                  AS QuestionCount,
+    0                  AS AnswerCount,
+    0                  AS AvgPostScore,
+    NULL::timestamp    AS LastActivity,
+    NULL::int          AS DaysSinceLastActivity,
+    NULL::text         AS PrimaryTagList,
+    NULL::text         AS RecentTop3Titles,
+    'Inactive'         AS UserTier,
+    0                  AS InfluenceScore
+FROM UsersWithoutPosts uwp
+ORDER BY InfluenceScore DESC NULLS LAST
+LIMIT 200;

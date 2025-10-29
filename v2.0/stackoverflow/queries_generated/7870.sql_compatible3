@@ -1,0 +1,230 @@
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END), 0) AS TotalQuestionScore,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END), 0) AS TotalAnswerScore,
+    COUNT(DISTINCT b.Id) AS BadgesReceived,
+    COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+    COUNT(DISTINCT c.Id) AS CommentsMade,
+    COUNT(DISTINCT ph.Id) AS PostHistoryEntries,
+    AVG(p.Score) AS AvgPostScore,
+    MAX(p.CreationDate) AS LastPostDate,
+    CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - MAX(p.CreationDate))) / 86400 AS INTEGER) AS DaysSinceLastPost,
+    STDDEV_SAMP(p.Score) AS ScoreStandardDeviation,
+    CASE 
+        WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+            ROUND(COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) * 100.0 / COUNT(DISTINCT p.Id), 2)
+        ELSE 0 
+    END AS AnswerPercentage,
+    STRING_AGG(DISTINCT t.TagName, ', ') AS TagsUsed,
+    COALESCE(
+        (SELECT p2.Title 
+         FROM Posts p2
+         WHERE p2.OwnerUserId = u.Id 
+         AND p2.PostTypeId = 1 
+         ORDER BY p2.Score DESC NULLS LAST 
+         LIMIT 1), 
+        'No Questions'
+    ) AS HighestScoringQuestion,
+    COALESCE(
+        (SELECT p3.Title 
+         FROM Posts p3
+         WHERE p3.OwnerUserId = u.Id 
+         AND p3.PostTypeId = 2 
+         ORDER BY p3.Score DESC NULLS LAST 
+         LIMIT 1), 
+        'No Answers'
+    ) AS HighestScoringAnswer,
+    CASE 
+        WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) = 0 THEN 'No Questions'
+        WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) = 0 THEN 'No Answers'
+        WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) > COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) THEN 'More Answers Than Questions'
+        ELSE 'More Questions Than Answers'
+    END AS PostingBalance,
+    COALESCE(
+        (SELECT p4.Title 
+         FROM Posts p4
+         WHERE p4.OwnerUserId = u.Id 
+         AND p4.PostTypeId = 1 
+         AND p4.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1)
+         ORDER BY p4.Score DESC 
+         LIMIT 1), 
+        'No High Score Questions'
+    ) AS AboveAverageQuestion,
+    COUNT(DISTINCT CASE 
+        WHEN p.PostTypeId = 1 AND p.Score > (
+            SELECT AVG(Score) 
+            FROM Posts 
+            WHERE PostTypeId = 1 
+            AND OwnerUserId IS NOT NULL
+        ) 
+        THEN p.Id 
+    END) AS AboveAverageQuestions,
+    COUNT(DISTINCT CASE 
+        WHEN p.PostTypeId = 2 AND p.Score > (
+            SELECT AVG(Score) 
+            FROM Posts 
+            WHERE PostTypeId = 2 
+            AND OwnerUserId IS NOT NULL
+        ) 
+        THEN p.Id 
+    END) AS AboveAverageAnswers,
+    (SELECT COUNT(*) 
+     FROM Votes v 
+     WHERE v.UserId = u.Id 
+     AND v.VoteTypeId = 2) AS UpvotesReceived,
+    (SELECT COUNT(*) 
+     FROM Votes v 
+     WHERE v.UserId = u.Id 
+     AND v.VoteTypeId = 3) AS DownvotesReceived,
+    COALESCE(
+        (SELECT vt.Name 
+         FROM VoteTypes vt 
+         JOIN Votes v2 ON vt.Id = v2.VoteTypeId 
+         WHERE v2.UserId = u.Id 
+         GROUP BY vt.Name 
+         ORDER BY COUNT(*) DESC
+         LIMIT 1), 
+        'No Votes'
+    ) AS MostVotedType,
+    (CASE 
+        WHEN COUNT(DISTINCT ph.PostId) > 0 THEN 
+            COUNT(DISTINCT ph.PostId) * 1.0 / NULLIF(COUNT(DISTINCT p.Id), 0)
+        ELSE 0 
+    END) AS HistoryPerPostRatio,
+    CASE 
+        WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+            ROUND(
+                (COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) * 100.0) / 
+                NULLIF(COUNT(DISTINCT p.Id), 0), 2
+            )
+        ELSE 0 
+    END AS QuestionPercentage,
+    COALESCE(
+        (SELECT STRING_AGG(Tags, ', ')
+         FROM Posts 
+         WHERE OwnerUserId = u.Id 
+         AND PostTypeId = 1 
+         AND Tags IS NOT NULL
+         GROUP BY OwnerUserId
+         ORDER BY COUNT(*) DESC 
+         LIMIT 1), 
+        'No Tags'
+    ) AS MostFrequentTags,
+    COALESCE(
+        (SELECT COUNT(*) 
+         FROM Posts p5 
+         WHERE p5.OwnerUserId = u.Id 
+         AND p5.PostTypeId = 1 
+         AND EXISTS (
+             SELECT 1 
+             FROM Comments c2 
+             WHERE c2.PostId = p5.Id 
+             AND c2.UserId = u.Id
+         )), 
+        0
+    ) AS QuestionsWithUserComments,
+    COALESCE(
+        (SELECT COUNT(DISTINCT p6.Id)
+         FROM Posts p6 
+         WHERE p6.OwnerUserId = u.Id 
+         AND p6.PostTypeId = 2 
+         AND EXISTS (
+             SELECT 1 
+             FROM Posts pa 
+             WHERE pa.ParentId = p6.Id 
+             AND pa.OwnerUserId = u.Id
+         )), 
+        0
+    ) AS AnswersToOwnQuestions,
+    ROUND(
+        COALESCE(
+            SUM(p.ViewCount) / NULLIF(COUNT(p.Id), 0), 0
+        ), 2
+    ) AS AvgViewsPerPost,
+    COUNT(DISTINCT p.Id) - COALESCE(
+        (SELECT COUNT(DISTINCT p2.Id)
+         FROM Posts p2 
+         WHERE p2.OwnerUserId = u.Id 
+         AND p2.ViewCount = 0), 
+        0
+    ) AS PostsWithViews,
+    CASE 
+        WHEN COUNT(DISTINCT p.Id) > 0 AND AVG(p.Score) > 0 THEN 
+            ROUND(
+                (COUNT(DISTINCT CASE WHEN p.Score > AVG(p.Score) OVER (PARTITION BY u.Id) THEN p.Id END) * 100.0) / 
+                NULLIF(COUNT(DISTINCT p.Id), 0), 2
+            )
+        ELSE 0 
+    END AS PostsAboveAvgScore,
+    COALESCE(
+        (SELECT COUNT(DISTINCT p7.Id)
+         FROM Posts p7 
+         WHERE p7.OwnerUserId = u.Id 
+         AND p7.Score > 0
+         AND EXISTS (
+             SELECT 1 
+             FROM Votes v3 
+             WHERE v3.PostId = p7.Id 
+             AND (v3.VoteTypeId = 2 OR v3.VoteTypeId = 3)
+         )), 
+        0
+    ) AS ScoredPosts,
+    (SELECT AVG(Score) 
+     FROM Posts p8 
+     WHERE p8.OwnerUserId = u.Id 
+     AND p8.PostTypeId = 1) AS AvgQuestionScore,
+    (SELECT AVG(Score) 
+     FROM Posts p9 
+     WHERE p9.OwnerUserId = u.Id 
+     AND p9.PostTypeId = 2) AS AvgAnswerScore,
+    COALESCE(
+        (SELECT p10.Title 
+         FROM Posts p10 
+         WHERE p10.OwnerUserId = u.Id 
+         AND p10.PostTypeId = 1 
+         AND p10.Score > (
+             SELECT AVG(Score) 
+             FROM Posts 
+             WHERE OwnerUserId = u.Id 
+             AND PostTypeId = 1
+         )
+         ORDER BY p10.Score DESC 
+         LIMIT 1), 
+        'No AboveAvg Questions'
+    ) AS AboveAvgQuestion
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN Comments c ON u.Id = c.UserId
+LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+LEFT JOIN Tags t ON t.Id IN (
+    SELECT Id 
+    FROM Tags t2
+    WHERE t2.TagName IN (
+        SELECT TRIM(SUBSTRING(p_tags.Tags FROM 2 FOR CHAR_LENGTH(p_tags.Tags) - 2)) 
+        FROM Posts p_tags 
+        WHERE p_tags.OwnerUserId = u.Id 
+        AND p_tags.Tags IS NOT NULL
+        AND p_tags.Tags <> ''
+    ) OR t2.TagName LIKE '%' || COALESCE(p.Title, '') || '%'
+)
+WHERE u.Reputation > 1000
+GROUP BY u.Id, u.DisplayName, u.Reputation
+HAVING COUNT(DISTINCT p.Id) > 0
+ORDER BY 
+    (CASE 
+        WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 0 THEN 
+            COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) * 1.0 / 
+            NULLIF(COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END), 0)
+        ELSE 0 
+    END) DESC,
+    AVG(p.Score) DESC,
+    COUNT(DISTINCT b.Id) DESC,
+    u.Reputation DESC;

@@ -1,0 +1,154 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        0 AS Level,
+        ARRAY[t.TagName] AS Ancestors
+    FROM Tags t
+    WHERE t.IsModeratorOnly = false AND t.IsRequired = false
+  UNION ALL
+    SELECT
+        t.Id,
+        t.TagName,
+        r.Level + 1,
+        r.Ancestors || t.TagName
+    FROM Tags t
+    JOIN RecursiveTagHierarchy r ON substring(t.TagName, 1, length(r.TagName)) = r.TagName
+    WHERE t.Id <> r.Id AND NOT t.TagName = ANY(r.Ancestors) AND r.Level < 3
+),
+UserPostAgg AS (
+    SELECT
+        p.OwnerUserId,
+        count(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+        count(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswerCount,
+        coalesce(sum(p.Score), 0) AS TotalScore,
+        coalesce(sum(p.ViewCount), 0) AS TotalViews,
+        max(p.CreationDate) AS LastPostDate
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL AND p.OwnerUserId > 0
+    GROUP BY p.OwnerUserId
+),
+UserBadgeCount AS (
+    SELECT
+        b.UserId,
+        count(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        count(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        count(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        count(DISTINCT CASE WHEN b.TagBased = 1 THEN b.Name ELSE NULL END) AS DistinctTagBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+TopPostsByTag AS (
+    SELECT
+        tag,
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        row_number() OVER (PARTITION BY tag ORDER BY p.Score DESC, p.ViewCount DESC) AS RankWithinTag
+    FROM Posts p,
+    unnest(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><')) AS tag
+    WHERE p.PostTypeId = 1
+),
+PostCloseReasonCount AS (
+    SELECT
+        ph.PostId,
+        crt.Name AS CloseReason,
+        count(*) AS CloseVotes
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = cast(ph.Comment AS integer)
+    WHERE ph.PostHistoryTypeId = 10 AND crt.Name IS NOT NULL
+    GROUP BY ph.PostId, crt.Name
+),
+PostVotesSum AS (
+    SELECT
+        v.PostId,
+        sum(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
+        sum(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes,
+        sum(CASE WHEN vt.Name = 'Favorite' THEN 1 ELSE 0 END) AS Favorites
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY v.PostId
+),
+UserActivityWindows AS (
+    SELECT
+        p.OwnerUserId,
+        p.Id AS PostId,
+        p.CreationDate,
+        p.Score,
+        lag(p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevPostDate,
+        lead(p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextPostDate,
+        count(*) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ROWS BETWEEN 10 PRECEDING AND CURRENT ROW) AS PostsLast10,
+        avg(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ROWS BETWEEN 5 PRECEDING AND 5 FOLLOWING) AS AvgScoreWindow
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL AND p.OwnerUserId > 0
+),
+UserEmailHashCheck AS (
+    SELECT
+        u.Id,
+        u.EmailHash,
+        CASE 
+            WHEN u.EmailHash ~ '^[0-9a-f]{32}$' THEN 'Valid MD5'
+            WHEN u.EmailHash IS NULL THEN 'Missing'
+            ELSE 'Invalid'
+        END AS EmailHashValidity
+    FROM Users u
+),
+HighlyActiveUsers AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        upa.QuestionCount + upa.AnswerCount AS TotalPosts,
+        ubc.GoldBadges,
+        ubc.SilverBadges,
+        ubc.BronzeBadges,
+        ua.PostsLast10,
+        ua.AvgScoreWindow,
+        u.EmailHash,
+        u.Location,
+        u.WebsiteUrl,
+        u.ProfileImageUrl,
+        u.AboutMe,
+        u.Id AS gid
+    FROM Users u
+    JOIN UserPostAgg upa ON upa.OwnerUserId = u.Id
+    LEFT JOIN UserBadgeCount ubc ON ubc.UserId = u.Id
+    LEFT JOIN UserActivityWindows ua ON ua.OwnerUserId = u.Id
+    WHERE (upa.QuestionCount + upa.AnswerCount) >= 100
+)
+SELECT 
+    hau.Id AS UserId,
+    coalesce(hau.DisplayName, '(unknown)') AS DisplayName,
+    hau.TotalPosts,
+    hau.GoldBadges,
+    hau.SilverBadges,
+    hau.BronzeBadges,
+    hau.PostsLast10,
+    hau.AvgScoreWindow,
+    ueh.EmailHashValidity,
+    coalesce(hau.Location, 'Unknown') AS Location,
+    coalesce(hau.WebsiteUrl, '') AS Website,
+    substring(replace(hau.AboutMe, '<', '&lt;') FROM 1 FOR 100) AS AboutMeSnippet,
+    tpt.PostId AS TopPostId,
+    tpt.Title AS TopPostTitle,
+    tpt.Score AS TopPostScore,
+    pc.CloseReason,
+    pc.CloseVotes,
+    pvs.UpVotes,
+    pvs.DownVotes,
+    pvs.Favorites
+FROM
+    HighlyActiveUsers hau
+    LEFT JOIN UserEmailHashCheck ueh ON ueh.Id = hau.Id
+    LEFT JOIN (SELECT OwnerUserId, max(Score) AS MaxScore FROM Posts WHERE PostTypeId = 1 GROUP BY OwnerUserId) ms ON ms.OwnerUserId = hau.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = hau.Id AND p.Score = ms.MaxScore AND p.PostTypeId = 1
+    LEFT JOIN TopPostsByTag tpt ON tpt.PostId = p.Id
+    LEFT JOIN PostCloseReasonCount pc ON pc.PostId = p.Id
+    LEFT JOIN PostVotesSum pvs ON pvs.PostId = p.Id
+ORDER BY
+    hau.GoldBadges DESC NULLS LAST,
+    hau.TotalPosts DESC NULLS LAST,
+    hau.DisplayName
+LIMIT 100;

@@ -1,0 +1,249 @@
+-- {"query": "7457.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2359} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT c.Id) as Comments,
+        COUNT(DISTINCT b.Id) as Badges,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        MAX(b.Date) as LastBadgeDate,
+        SUM(p.Score) as TotalScore,
+        AVG(p.Score) as AvgScore,
+        STRING_AGG(DISTINCT p.Tags, ', ') as AllTags,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+                (COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) * 100.0 / COUNT(DISTINCT p.Id))
+            ELSE 0 
+        END as QuestionPercentage,
+        ROW_NUMBER() OVER (ORDER BY SUM(p.Score) DESC) as ScoreRank,
+        DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) as PostCountRank,
+        NTILE(10) OVER (ORDER BY u.Reputation DESC) as RepDecile
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopUsers AS (
+    SELECT UserId, DisplayName, Reputation, TotalPosts, Questions, Answers, Comments, Badges
+    FROM UserActivityStats
+    WHERE ScoreRank <= 100
+),
+UserPostStats AS (
+    SELECT 
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.CreationDate,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.Title,
+        p.Tags,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 
+                (SELECT COUNT(*) FROM Posts WHERE ParentId = p.Id AND PostTypeId = 2)
+            ELSE 0 
+        END as AnswerCountWithNested,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) as Upvotes,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) as Downvotes,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) as CommentCountWithNested,
+        (CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) as HasAcceptedAnswer,
+        (CASE WHEN p.ParentId IS NOT NULL THEN 1 ELSE 0 END) as IsAnswer,
+        (CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END) as IsClosed,
+        (CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN 1 ELSE 0 END) as IsCommunityOwned,
+        DATEDIFF(day, p.CreationDate, COALESCE(p.ClosedDate, cast('2024-10-01 12:34:56' as timestamp))) as DaysOpen,
+        CASE 
+            WHEN p.Score >= 100 THEN 'Gold'
+            WHEN p.Score >= 50 THEN 'Silver'
+            WHEN p.Score >= 10 THEN 'Bronze'
+            ELSE 'None'
+        END as ScoreTier,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as PostRank,
+        RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) as ScoreRankPerUser,
+        PERCENT_RANK() OVER (ORDER BY p.Score) as ScorePercentile
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+),
+ComplexTagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        COALESCE((SELECT COUNT(*) FROM Posts p WHERE p.Tags LIKE '%' + t.TagName + '%'), 0) as TagUsageInPosts,
+        COALESCE((SELECT AVG(p.Score) FROM Posts p WHERE p.Tags LIKE '%' + t.TagName + '%'), 0) as AvgScoreForTag,
+        STRING_AGG(DISTINCT u.DisplayName, ', ') as UsersWithTag,
+        (SELECT COUNT(DISTINCT p.Id) FROM Posts p WHERE p.Tags LIKE '%' + t.TagName + '%') as PostsWithTag,
+        (SELECT COUNT(DISTINCT p.OwnerUserId) FROM Posts p WHERE p.Tags LIKE '%' + t.TagName + '%') as TagActiveUsers,
+        (SELECT COUNT(DISTINCT v.PostId) FROM Votes v JOIN Posts p ON v.PostId = p.Id WHERE p.Tags LIKE '%' + t.TagName + '%') as TotalVotesForTag,
+        CASE 
+            WHEN t.Count > (SELECT AVG(Count) FROM Tags) THEN 'Popular'
+            WHEN t.Count < (SELECT AVG(Count) FROM Tags) THEN 'Rare'
+            ELSE 'Average'
+        END as TagPopularity
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE '%' + t.TagName + '%'
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE t.TagName IS NOT NULL
+    GROUP BY t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId
+),
+FinalAnalysis AS (
+    SELECT 
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.TotalPosts,
+        ua.Questions,
+        ua.Answers,
+        ua.Comments,
+        ua.Badges,
+        ua.LastPostDate,
+        ua.LastCommentDate,
+        ua.LastBadgeDate,
+        ua.TotalScore,
+        ua.AvgScore,
+        ua.QuestionPercentage,
+        ua.ScoreRank,
+        ua.PostCountRank,
+        ua.RepDecile,
+        ups.PostTypeId,
+        ups.Score as PostScore,
+        ups.CreationDate as PostCreationDate,
+        ups.ViewCount,
+        ups.AnswerCount,
+        ups.CommentCount,
+        ups.Title,
+        ups.Tags,
+        ups.AnswerCountWithNested,
+        ups.Upvotes,
+        ups.Downvotes,
+        ups.CommentCountWithNested,
+        ups.HasAcceptedAnswer,
+        ups.IsAnswer,
+        ups.IsClosed,
+        ups.IsCommunityOwned,
+        ups.DaysOpen,
+        ups.ScoreTier,
+        ups.PostRank,
+        ups.ScoreRankPerUser,
+        ups.ScorePercentile,
+        cta.TagName,
+        cta.Count as TagCount,
+        cta.TagUsageInPosts,
+        cta.AvgScoreForTag,
+        cta.UsersWithTag,
+        cta.PostsWithTag,
+        cta.TagActiveUsers,
+        cta.TotalVotesForTag,
+        cta.TagPopularity,
+        CASE 
+            WHEN (ua.TotalScore > (SELECT AVG(TotalScore) FROM UserActivityStats)) AND
+                 (ua.Questions > (SELECT AVG(Questions) FROM UserActivityStats)) AND
+                 (ua.Answers > (SELECT AVG(Answers) FROM UserActivityStats)) THEN 'HighPerforming'
+            WHEN (ua.TotalScore < (SELECT AVG(TotalScore) FROM UserActivityStats) AND
+                  ua.Questions < (SELECT AVG(Questions) FROM UserActivityStats) AND
+                  ua.Answers < (SELECT AVG(Answers) FROM UserActivityStats)) THEN 'LowPerforming'
+            ELSE 'Average'
+        END as UserPerformanceCategory,
+        ISNULL(ups.Score - LAG(ups.Score) OVER (PARTITION BY ua.UserId ORDER BY ups.CreationDate), 0) as ScoreDeltaFromPreviousPost,
+        ROW_NUMBER() OVER (ORDER BY ua.TotalScore DESC, ups.Score DESC) as CombinedRank,
+        DENSE_RANK() OVER (ORDER BY ups.Score DESC) as ScoreRankOverall,
+        CASE 
+            WHEN ups.Score BETWEEN 0 AND 9 THEN 'Low'
+            WHEN ups.Score BETWEEN 10 AND 49 THEN 'Medium'
+            WHEN ups.Score BETWEEN 50 AND 99 THEN 'High'
+            WHEN ups.Score >= 100 THEN 'VeryHigh'
+            ELSE 'Unknown'
+        END as ScoreCategory,
+        COALESCE(ups.ViewCount, 0) - COALESCE(LAG(ups.ViewCount) OVER (PARTITION BY ua.UserId ORDER BY ups.CreationDate), 0) as ViewCountDelta,
+        COALESCE(ups.AnswerCount, 0) - COALESCE(LAG(ups.AnswerCount) OVER (PARTITION BY ua.UserId ORDER BY ups.CreationDate), 0) as AnswerCountDelta,
+        (ups.Views + ups.AnswerCount + ups.CommentCount) as EngagementMetric,
+        (CASE WHEN ups.PostTypeId = 1 THEN 1 ELSE 0 END) as IsQuestion
+    FROM UserActivityStats ua
+    INNER JOIN UserPostStats ups ON ua.UserId = ups.OwnerUserId
+    LEFT JOIN ComplexTagAnalysis cta ON ups.Tags LIKE '%' + cta.TagName + '%'
+    WHERE ua.UserId IN (SELECT UserId FROM TopUsers)
+)
+SELECT 
+    UserId,
+    DisplayName,
+    Reputation,
+    TotalPosts,
+    Questions,
+    Answers,
+    Comments,
+    Badges,
+    LastPostDate,
+    LastCommentDate,
+    LastBadgeDate,
+    TotalScore,
+    AvgScore,
+    QuestionPercentage,
+    ScoreRank,
+    PostCountRank,
+    RepDecile,
+    PostTypeId,
+    PostScore,
+    PostCreationDate,
+    ViewCount,
+    AnswerCount,
+    CommentCount,
+    Title,
+    Tags,
+    AnswerCountWithNested,
+    Upvotes,
+    Downvotes,
+    CommentCountWithNested,
+    HasAcceptedAnswer,
+    IsAnswer,
+    IsClosed,
+    IsCommunityOwned,
+    DaysOpen,
+    ScoreTier,
+    PostRank,
+    ScoreRankPerUser,
+    ScorePercentile,
+    TagName,
+    TagCount,
+    TagUsageInPosts,
+    AvgScoreForTag,
+    UsersWithTag,
+    PostsWithTag,
+    TagActiveUsers,
+    TotalVotesForTag,
+    TagPopularity,
+    UserPerformanceCategory,
+    ScoreDeltaFromPreviousPost,
+    CombinedRank,
+    ScoreRankOverall,
+    ScoreCategory,
+    ViewCountDelta,
+    AnswerCountDelta,
+    EngagementMetric,
+    IsQuestion,
+    CASE 
+        WHEN UserPerformanceCategory = 'HighPerforming' AND ScoreCategory IN ('VeryHigh', 'High') THEN 'EliteContributor'
+        WHEN UserPerformanceCategory = 'Average' AND ScoreCategory = 'Medium' THEN 'RegularContributor'
+        WHEN UserPerformanceCategory = 'LowPerforming' AND ScoreCategory = 'Low' THEN 'NewUser'
+        ELSE 'Other'
+    END as ContributorType
+FROM FinalAnalysis
+WHERE 
+    (PostScore >= 1 OR PostScore IS NULL)
+    AND 
+    (LastPostDate >= DATEADD(MONTH, -12, cast('2024-10-01 12:34:56' as timestamp)) OR LastPostDate IS NULL)
+    AND 
+    (TotalScore > 0 OR TotalScore IS NULL)
+ORDER BY 
+    CombinedRank ASC,
+    ScoreRankOverall ASC,
+    TotalScore DESC,
+    Reputation DESC,
+    LastPostDate DESC;

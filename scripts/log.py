@@ -92,6 +92,16 @@ class Log:
         """
         self.console.print(*info)
 
+    def print_verbose(self, *info: Any):
+        """
+        Prints a message to the console.
+
+        Args:
+            info (Any): The information to print.
+        """
+        if self.verbose:
+            self.print(*info)
+
     def log(self, message: Any, type: str, color: str, group: str = None):
         """
         Logs a message in a formatted table with a specific group and color.

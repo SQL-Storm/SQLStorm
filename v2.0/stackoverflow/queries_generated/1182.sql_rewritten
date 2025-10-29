@@ -1,0 +1,182 @@
+-- {"query": "1182.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2724} 
+WITH UserEngagement AS (
+    -- Aggregates user-specific activity metrics from Posts, Comments, and Badges
+    SELECT
+        U.Id AS UserId,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate AS UserLastAccessDate,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestionsOwned,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswersOwned,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        -- Find the absolute latest activity across posts, comments, or user's last access
+        MAX(GREATEST(COALESCE(P.LastActivityDate, '1900-01-01'::timestamp), COALESCE(C.CreationDate, '1900-01-01'::timestamp), U.LastAccessDate)) AS LatestActivityDate,
+        SUM(COALESCE(P.Score, 0)) AS TotalPostScoreOwned,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN COALESCE(P.ViewCount, 0) ELSE 0 END) AS TotalQuestionViewCount,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        COUNT(DISTINCT CASE WHEN B.Class = 1 THEN B.Id END) AS GoldBadges,
+        -- Calculate the reputation rank among users
+        RANK() OVER (ORDER BY U.Reputation DESC, U.CreationDate ASC) AS ReputationRank
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    LEFT JOIN Badges AS B ON U.Id = B.UserId
+    GROUP BY U.Id, U.CreationDate, U.LastAccessDate, U.Reputation
+),
+PostExtendedDetails AS (
+    -- Computes various derived metrics for posts, including vote counts and categorization
+    SELECT
+        PQ.Id AS PostId,
+        PQ.PostTypeId,
+        PQ.CreationDate AS PostCreationDate,
+        PQ.Score AS PostScore,
+        PQ.ViewCount AS PostViewCount,
+        PQ.OwnerUserId,
+        PQ.AcceptedAnswerId,
+        PQ.ParentId,
+        PQ.LastEditDate,
+        PQ.LastActivityDate,
+        PQ.Title,
+        PQ.Tags,
+        PQ.AnswerCount,
+        PQ.CommentCount,
+        PQ.FavoriteCount,
+        LENGTH(COALESCE(PQ.Body, '')) AS BodyLength,
+        CASE
+            WHEN PQ.AcceptedAnswerId IS NOT NULL THEN TRUE
+            ELSE FALSE
+        END AS HasAcceptedAnswer,
+        -- Correlated subquery to count up/down votes for the post
+        (SELECT COUNT(V.Id) FROM Votes AS V WHERE V.PostId = PQ.Id AND V.VoteTypeId IN (2,3)) AS UpDownVoteCount,
+        -- Find the latest significant content edit date
+        (SELECT MAX(PH.CreationDate) FROM PostHistory AS PH WHERE PH.PostId = PQ.Id AND PH.PostHistoryTypeId IN (4,5,6,8,9)) AS LastContentEditDate,
+        -- Categorize post status based on close date, community ownership, or recent activity
+        CASE
+            WHEN PQ.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN PQ.CommunityOwnedDate IS NOT NULL THEN 'CommunityOwned'
+            WHEN PQ.LastActivityDate IS NOT NULL AND PQ.LastActivityDate > (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '60 days') THEN 'Active'
+            ELSE 'Dormant'
+        END AS PostStatusCategory,
+        -- Identify the first tag for easier joining to tag analytics
+        (SELECT (regexp_split_to_array(TRIM(BOTH '<>' FROM COALESCE(PQ.Tags, '')), '><'))[1]
+         WHERE COALESCE(PQ.Tags, '') <> '') AS FirstTagName
+    FROM Posts AS PQ
+    WHERE PQ.PostTypeId IN (1, 2) -- Focus on Questions and Answers
+),
+TagPerformance AS (
+    -- Analyzes performance metrics for each tag, specifically for questions
+    SELECT
+        Tag.tag AS TagName,
+        COUNT(DISTINCT PED.PostId) AS TaggedQuestionCount,
+        AVG(PED.PostScore) AS AvgScoreForTag,
+        MAX(PED.PostViewCount) AS MaxViewCountForTag,
+        MIN(PED.PostCreationDate) AS FirstTagUseDate,
+        -- Rank tags by their total number of questions
+        DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT PED.PostId) DESC) AS GlobalTagRank
+    FROM PostExtendedDetails AS PED
+    -- Explode the tags string into individual rows using a LATERAL join
+    CROSS JOIN LATERAL regexp_split_to_table(TRIM(BOTH '<>' FROM COALESCE(PED.Tags, '')), '><') AS Tag(tag)
+    WHERE PED.PostTypeId = 1 AND COALESCE(PED.Tags, '') <> '' AND TRIM(Tag.tag) <> ''
+    GROUP BY Tag.tag
+)
+-- Main complex query selecting aggregated user data and detailed post data
+SELECT
+    U.Id AS UserId,
+    U.DisplayName,
+    U.Reputation,
+    U.CreationDate,
+    U.Location,
+    U.WebsiteUrl,
+    UE.TotalQuestionsOwned,
+    UE.TotalAnswersOwned,
+    UE.TotalCommentsMade,
+    UE.LatestActivityDate,
+    UE.GoldBadges,
+    UE.ReputationRank,
+    PED.PostId,
+    PT.Name AS PostTypeName,
+    PED.PostCreationDate,
+    PED.PostScore,
+    PED.PostViewCount,
+    PED.Title AS PostTitle,
+    PED.HasAcceptedAnswer,
+    PED.UpDownVoteCount,
+    PED.BodyLength,
+    PED.PostStatusCategory,
+    TP.TagName AS PrimaryTagForPost,
+    TP.TaggedQuestionCount AS PrimaryTagTotalQuestions,
+    TP.AvgScoreForTag AS PrimaryTagAvgQuestionScore,
+    TP.GlobalTagRank,
+    COALESCE(U_Owner.DisplayName, PED.OwnerDisplayName, 'Community User') AS PostOwnerDisplayName,
+    COALESCE(U_LastEditor.DisplayName, P_Full.LastEditorDisplayName, 'Unknown Editor') AS LastEditorDisplayName,
+    -- Calculate a custom weighted score, prioritizing up/down votes relative to views
+    (PED.PostScore * (1.0 + (COALESCE(PED.UpDownVoteCount, 0) / GREATEST(1.0, COALESCE(PED.PostViewCount, 0))))) AS WeightedPostScore,
+    -- Calculate days since last activity on the post
+    DATE_PART('day', cast('2024-10-01 12:34:56' as timestamp) - PED.LastActivityDate) AS DaysSinceLastPostActivity,
+    -- Categorize users based on reputation and badge count
+    CASE
+        WHEN U.Reputation >= 20000 AND UE.GoldBadges >= 10 AND U.AboutMe IS NOT NULL THEN 'Distinguished Expert'
+        WHEN U.Reputation >= 5000 OR UE.TotalQuestionsOwned >= 100 THEN 'Proactive Contributor'
+        WHEN UE.TotalPostsOwned > 0 THEN 'Engaged User'
+        ELSE 'Passive User'
+    END AS UserEngagementLevel,
+    -- Assign users to deciles based on their reputation and total posts
+    NTILE(10) OVER (ORDER BY U.Reputation DESC, UE.TotalPostsOwned DESC) AS ReputationPostDecile,
+    -- Rank posts within their primary tag by score and view count
+    RANK() OVER (PARTITION BY TP.TagName ORDER BY PED.PostScore DESC, PED.PostViewCount DESC) AS PostRankInPrimaryTag,
+    -- Calculate the average score for posts of the same type across all posts
+    AVG(PED.PostScore) OVER (PARTITION BY PED.PostTypeId) AS GlobalAvgScoreForPostType,
+    -- Get the creation date of the previous post by the same user
+    LAG(PED.PostCreationDate, 1, U.CreationDate) OVER (PARTITION BY U.Id ORDER BY PED.PostCreationDate) AS PrevPostByThisUserDate,
+    -- Check if the post was closed as a duplicate (using PostHistory and specific comment/text)
+    EXISTS (
+        SELECT 1
+        FROM PostHistory AS PH_dup
+        WHERE PH_dup.PostId = PED.PostId
+        AND PH_dup.PostHistoryTypeId = 10 -- Post Closed event
+        AND (PH_dup.Comment LIKE '101%' OR PH_dup.Text LIKE '%"OriginalQuestionIds":%') -- Duplicate close reason (101) or JSON indicating duplicate
+    ) AS WasClosedAsDuplicate,
+    -- Get the text of the highest-scoring comment on the post (correlated subquery)
+    (
+        SELECT C_top.Text
+        FROM Comments AS C_top
+        WHERE C_top.PostId = PED.PostId
+        ORDER BY C_top.Score DESC, C_top.CreationDate DESC
+        LIMIT 1
+    ) AS TopCommentText,
+    -- Information about linked posts (e.g., duplicates or related posts)
+    COALESCE(PL_LinkType.Name, 'N/A') AS RelatedLinkTypeName,
+    COALESCE(RelatedPost.Title, 'No Related Post Title') AS RelatedPostTitle,
+    -- Calculate the sum of bounty amounts awarded/started for this post (correlated subquery)
+    (
+        SELECT SUM(V.BountyAmount)
+        FROM Votes AS V
+        WHERE V.PostId = PED.PostId
+        AND V.VoteTypeId IN (8,9) -- BountyStart or BountyClose
+        AND V.CreationDate BETWEEN PED.PostCreationDate AND PED.LastActivityDate
+    ) AS TotalBountyAmount,
+    -- Determine if the post body contains specific keywords (case-insensitive)
+    LOWER(COALESCE(P_Full.Body, '')) LIKE '%performance%' OR LOWER(COALESCE(P_Full.Body, '')) LIKE '%optimization%' AS ContainsPerformanceKeywords
+FROM Users AS U
+JOIN UserEngagement AS UE ON U.Id = UE.UserId
+LEFT JOIN PostExtendedDetails AS PED ON U.Id = PED.OwnerUserId
+LEFT JOIN PostTypes AS PT ON PED.PostTypeId = PT.Id
+LEFT JOIN Users AS U_Owner ON PED.OwnerUserId = U_Owner.Id
+LEFT JOIN Posts AS P_Full ON PED.PostId = P_Full.Id -- Join back to original Posts for the full Body text and LastEditorUserId
+LEFT JOIN Users AS U_LastEditor ON P_Full.LastEditorUserId = U_LastEditor.Id
+LEFT JOIN TagPerformance AS TP ON PED.FirstTagName = TP.TagName
+LEFT JOIN PostLinks AS PL_Linked ON PED.PostId = PL_Linked.PostId AND PL_Linked.LinkTypeId = 1 -- LinkType 1: Linked
+LEFT JOIN Posts AS RelatedPost ON PL_Linked.RelatedPostId = RelatedPost.Id
+LEFT JOIN LinkTypes AS PL_LinkType ON PL_Linked.LinkTypeId = PL_LinkType.Id
+WHERE U.Reputation > 1000
+AND PED.PostId IS NOT NULL -- Exclude users who haven't owned any relevant posts after filters
+AND PED.PostScore > 10
+AND PED.PostCreationDate >= '2021-01-01' -- Focus on recent high-quality content
+AND (U.Location ILIKE '%usa%' OR U.Location ILIKE '%gb%' OR U.Location ILIKE '%ca%' OR U.Location ILIKE '%australia%') -- Broader geographic filter
+AND U.AboutMe IS NOT NULL
+AND LENGTH(COALESCE(U.AboutMe, '')) > 50 -- Ensure substantial "About Me"
+ORDER BY
+    U.Reputation DESC,
+    PED.WeightedPostScore DESC,
+    PED.PostCreationDate DESC
+LIMIT 5000;

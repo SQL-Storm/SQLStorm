@@ -1,0 +1,141 @@
+WITH 
+recent_activity AS (
+    SELECT 
+        p.OwnerUserId                         AS UserId,
+        MAX(p.CreationDate)                  AS LastPostDate,
+        MAX(CASE WHEN pt.Name = 'Question' THEN p.Id END) AS LastQuestionId,
+        MAX(CASE WHEN pt.Name = 'Answer'   THEN p.Id END) AS LastAnswerId
+    FROM Posts p
+    JOIN PostTypes pt ON pt.Id = p.PostTypeId
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+
+user_tag_stats AS (
+    SELECT 
+        p.OwnerUserId                                     AS UserId,
+        LOWER(TRIM(t.TagName))                            AS Tag,
+        COUNT(*)                                          AS TagUseCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY COUNT(*) DESC) AS rn
+    FROM Posts p
+    CROSS JOIN LATERAL (
+        SELECT regexp_split_to_table(
+                 substring(p.Tags FROM 2 FOR length(p.Tags)-2), 
+                 '><'
+               ) AS TagName
+    ) t
+    WHERE p.PostTypeId = 1
+      AND p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId, LOWER(TRIM(t.TagName))
+),
+
+badge_summary AS (
+    SELECT 
+        b.UserId,
+        COUNT(*)                                   AS BadgeCount,
+        MAX(b.Date)                                AS LastBadgeDate,
+        STRING_AGG(DISTINCT b.Name, '; ') FILTER (WHERE b.Class = 1) AS GoldBadges,
+        STRING_AGG(DISTINCT b.Name, '; ') FILTER (WHERE b.Class = 2) AS SilverBadges,
+        STRING_AGG(DISTINCT b.Name, '; ') FILTER (WHERE b.Class = 3) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+vote_metrics AS (
+    SELECT 
+        p.OwnerUserId                               AS UserId,
+        COUNT(v.Id)                                 AS TotalVotesReceived,
+        MAX(v.CreationDate)                         AS LastVoteDate,
+        SUM(CASE WHEN vt.Name = 'UpMod'   THEN 1 ELSE 0 END) -
+        SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS NetScore
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+
+recent_post_excerpts AS (
+    SELECT 
+        p.OwnerUserId                                 AS UserId,
+        p.Id                                          AS PostId,
+        p.Title,
+        COALESCE(NULLIF(substring(p.Body FROM 1 FOR 200), ''), '<no content>') AS BodyExcerpt,
+        p.CreationDate
+    FROM Posts p
+    JOIN recent_activity ra ON ra.UserId = p.OwnerUserId
+    WHERE p.CreationDate = ra.LastPostDate
+      AND p.OwnerUserId IS NOT NULL
+),
+
+post_counts AS (
+    SELECT 
+        u.Id                                         AS UserId,
+        SUM(CASE WHEN pt.Name = 'Question' THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN pt.Name = 'Answer'   THEN 1 ELSE 0 END) AS AnswerCount,
+        COUNT(p.Id)                                  AS TotalPosts
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN PostTypes pt ON pt.Id = p.PostTypeId
+    GROUP BY u.Id
+)
+
+SELECT 
+    u.Id                                         AS UserId,
+    u.DisplayName,
+    COALESCE(u.Reputation, 0)                    AS Reputation,
+    pc.QuestionCount,
+    pc.AnswerCount,
+    pc.TotalPosts,
+    vm.TotalVotesReceived,
+    vm.NetScore,
+    bm.BadgeCount,
+    bm.LastBadgeDate,
+    bm.GoldBadges,
+    bm.SilverBadges,
+    bm.BronzeBadges,
+    ra.LastPostDate,
+    rp.Title,
+    rp.BodyExcerpt,
+    COALESCE(uts.Tag, '<no tag>')                AS TopTag,
+    COALESCE(uts.TagUseCount, 0)                 AS TopTagUsage,
+    CASE 
+        WHEN u.Location IS NULL OR TRIM(u.Location) = '' THEN 'Location Unknown'
+        ELSE u.Location
+    END                                          AS UserLocation,
+    CASE 
+        WHEN u.WebsiteUrl LIKE '%.github.com%' THEN 'GitHub User'
+        WHEN u.WebsiteUrl LIKE '%.stackoverflow.com%' THEN 'StackOverflow Profile'
+        ELSE 'Other'
+    END                                          AS ProfileSource,
+    CASE 
+        WHEN (u.EmailHash IS NOT NULL) AND (u.EmailHash <> '') THEN 1
+        ELSE 0
+    END                                          AS HasEmailHash,
+    REVERSE(u.DisplayName)                       AS ReversedDisplayName,
+    (SELECT COUNT(DISTINCT t2.Tag)
+       FROM user_tag_stats t2
+      WHERE t2.UserId = u.Id)                    AS DistinctTagCount,
+    EXISTS (
+        SELECT 1
+        FROM badge_summary bs2
+        WHERE bs2.UserId = u.Id
+          AND bs2.GoldBadges IS NOT NULL
+          AND NOT EXISTS (
+                SELECT 1 FROM Users u2
+                WHERE u2.Id = u.Id AND u2.Reputation < 100
+          )
+    )                                            AS HasGoldBadgeAndNotLowRep
+FROM Users u
+LEFT JOIN post_counts pc          ON pc.UserId = u.Id
+LEFT JOIN vote_metrics vm         ON vm.UserId = u.Id
+LEFT JOIN badge_summary bm        ON bm.UserId = u.Id
+LEFT JOIN recent_activity ra      ON ra.UserId = u.Id
+LEFT JOIN recent_post_excerpts rp ON rp.UserId = u.Id
+LEFT JOIN (
+    SELECT UserId, Tag, TagUseCount
+    FROM user_tag_stats
+    WHERE rn = 1
+) uts                           ON uts.UserId = u.Id
+ORDER BY vm.NetScore DESC NULLS LAST
+OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY;

@@ -1,0 +1,187 @@
+WITH UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName AS UserName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COALESCE(u.Views, 0) AS UserTotalViews,
+        COALESCE(u.UpVotes, 0) AS TotalUpVotesGiven,
+        COALESCE(u.DownVotes, 0) AS TotalDownVotesGiven,
+        COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestionsAsked,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswersPosted,
+        SUM(CASE WHEN p.PostTypeId IN (1,2) THEN p.Score ELSE 0 END) AS SumOfPostScoresOwned,
+        AVG(CASE WHEN p.PostTypeId IN (1,2) THEN p.Score END) AS AvgPostScoreOwned,
+        MAX(p.LastActivityDate) AS LastOwnedPostActivityDate,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        COUNT(CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+        CASE
+            WHEN u.WebsiteUrl IS NOT NULL AND LENGTH(TRIM(u.WebsiteUrl)) > 5 THEN TRUE
+            ELSE FALSE
+        END AS HasWebsite,
+        COALESCE(LENGTH(u.AboutMe), 0) AS AboutMeLength,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - u.LastAccessDate)) / 3600 / 24 AS DaysSinceLastAccess
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes, u.WebsiteUrl, u.AboutMe
+    HAVING COUNT(DISTINCT p.Id) >= 5
+       AND u.Reputation > 1000
+       AND u.LastAccessDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 year')
+),
+PostDetails AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.CreationDate AS PostCreationDate,
+        p.OwnerUserId,
+        p.Score AS PostScore,
+        COALESCE(p.ViewCount, 0) AS ViewCount,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        COALESCE(p.CommentCount, 0) AS CommentCount,
+        COALESCE(p.FavoriteCount, 0) AS PostFavoriteCount,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.ClosedDate,
+        p.CommunityOwnedDate,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.Title,
+        p.Body,
+        ARRAY(
+            SELECT TRIM(UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags)-2), '><')))
+        ) AS ParsedTags,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteSumActual,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteSumActual,
+        SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoriteSumActual,
+        MAX(CASE WHEN v.VoteTypeId = 8 AND v.BountyAmount IS NOT NULL THEN v.BountyAmount ELSE 0 END) AS MaxBountyAmount,
+        COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 1 THEN pl.RelatedPostId END) AS LinkedPostsCount,
+        COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN pl.RelatedPostId END) AS DuplicatePostsCount,
+        (p.Title ILIKE '%performance%' OR p.Title ILIKE '%optimize%' OR p.Title ILIKE '%speed%') AS IsPerformanceRelatedTitle
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+    WHERE p.PostTypeId IN (1, 2)
+    GROUP BY p.Id, p.PostTypeId, pt.Name, p.CreationDate, p.OwnerUserId, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.LastEditDate, p.LastActivityDate, p.ClosedDate, p.CommunityOwnedDate, p.AcceptedAnswerId, p.ParentId, p.Title, p.Body, p.Tags
+),
+PostHistoryClosureAnalysis AS (
+    SELECT
+        ph.PostId,
+        ph.CreationDate AS HistoryEventDate,
+        ph.PostHistoryTypeId,
+        CASE
+            WHEN ph.PostHistoryTypeId = 10 AND ph.Comment ~ '^[0-9]+$' THEN CAST(ph.Comment AS SMALLINT)
+            ELSE NULL
+        END AS CloseReasonId,
+        crt.Name AS CloseReasonName,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC, ph.PostHistoryTypeId DESC) AS rn
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON
+        (CASE
+            WHEN ph.PostHistoryTypeId = 10 AND ph.Comment ~ '^[0-9]+$' THEN CAST(ph.Comment AS SMALLINT)
+            ELSE NULL
+        END) = crt.Id
+    WHERE ph.PostHistoryTypeId IN (10, 11)
+)
+SELECT
+    ue.UserId,
+    ue.UserName,
+    ue.Reputation,
+    ue.TotalPostsOwned,
+    ue.TotalQuestionsAsked,
+    ue.TotalAnswersPosted,
+    ue.GoldBadges,
+    ue.SilverBadges,
+    ue.BronzeBadges,
+    pd.PostId,
+    pd.PostTypeName,
+    pd.PostCreationDate,
+    pd.PostScore,
+    pd.ViewCount,
+    pd.AnswerCount,
+    pd.CommentCount,
+    pd.PostFavoriteCount AS ReportedFavoriteCount,
+    pd.FavoriteSumActual AS ActualFavoriteCount,
+    pd.MaxBountyAmount,
+    pd.LinkedPostsCount,
+    pd.DuplicatePostsCount,
+    pd.ParsedTags,
+    ph_latest.HistoryEventDate AS LatestClosureHistoryDate,
+    ph_latest.CloseReasonName AS LatestClosureReasonName,
+    (
+        SELECT EXISTS (
+            SELECT 1
+            FROM Posts accepted_ans
+            JOIN Users ans_owner ON accepted_ans.OwnerUserId = ans_owner.Id
+            WHERE accepted_ans.Id = pd.AcceptedAnswerId
+              AND accepted_ans.ParentId = pd.PostId
+              AND ans_owner.Reputation > 20000
+        )
+    ) AS AcceptedByHighRepUser,
+    (
+        SELECT EXISTS (
+            SELECT 1
+            FROM Comments c_owner
+            WHERE c_owner.PostId = pd.PostId
+              AND c_owner.UserId = ue.UserId
+              AND c_owner.Score > 2
+              AND LENGTH(c_owner.Text) > 75
+        )
+    ) AS OwnerHasEngagingComment,
+    RANK() OVER (PARTITION BY SUBSTRING(u_loc.Location FROM '^\w+') ORDER BY ue.SumOfPostScoresOwned DESC, ue.Reputation DESC) AS UserRegionalScoreRank,
+    AVG(pd.PostScore) OVER (PARTITION BY pd.PostTypeId ORDER BY pd.PostCreationDate ROWS BETWEEN 90 PRECEDING AND CURRENT ROW) AS RollingAvgPostScoreByPostType,
+    EXTRACT(DAY FROM (pd.PostCreationDate - LAG(pd.PostCreationDate, 1, ue.UserCreationDate) OVER (PARTITION BY ue.UserId ORDER BY pd.PostCreationDate))) AS DaysSincePreviousPostByUser,
+    ROUND(
+        (COALESCE(pd.PostScore, 0) * 0.7) +
+        (COALESCE(pd.ViewCount, 0) * 0.005) +
+        (COALESCE(pd.AnswerCount, 0) * 1.5) +
+        (COALESCE(pd.CommentCount, 0) * 0.5) +
+        (COALESCE(pd.PostFavoriteCount, 0) * 2) +
+        (COALESCE(pd.UpVoteSumActual, 0) * 0.3) -
+        (COALESCE(pd.DownVoteSumActual, 0) * 0.1) +
+        (COALESCE(pd.MaxBountyAmount, 0) * 0.05) +
+        (CASE WHEN pd.AcceptedAnswerId IS NOT NULL THEN 5 ELSE 0 END)
+    , 2) AS EngagementWeightedScore,
+    COALESCE(pd.Title, 'UNTITLED POST') || ' [' || COALESCE(pd.PostTypeName, 'UNKNOWN TYPE') || ' #' || pd.PostId || ']' AS FormattedPostIdentifier,
+    CASE
+        WHEN pd.ParsedTags IS NOT NULL AND 'sql-server' = ANY(pd.ParsedTags) AND ('performance' = ANY(pd.ParsedTags) OR pd.IsPerformanceRelatedTitle) THEN 'SQL Server Performance'
+        WHEN pd.ParsedTags IS NOT NULL AND ('c#' = ANY(pd.ParsedTags) OR 'java' = ANY(pd.ParsedTags)) AND ('multithreading' = ANY(pd.ParsedTags) OR 'concurrency' = ANY(pd.ParsedTags)) THEN 'High Concurrency Dev'
+        WHEN pd.ParsedTags IS NULL OR array_length(pd.ParsedTags, 1) = 0 THEN 'Untagged/Generic'
+        WHEN pd.IsPerformanceRelatedTitle THEN 'General Performance'
+        ELSE 'Other Technical'
+    END AS PostTopicCategory,
+    (pd.ClosedDate IS NOT NULL AND ph_latest.PostHistoryTypeId = 10) AS WasClosedWithoutReopen,
+    (pd.CommunityOwnedDate IS NOT NULL AND pd.LastEditDate IS NOT NULL AND pd.LastEditDate < pd.CommunityOwnedDate) AS EditedBeforeCommunityOwned,
+    (
+        SELECT AVG(c.Score)
+        FROM Comments c
+        WHERE c.PostId = pd.PostId
+          AND c.CreationDate BETWEEN pd.PostCreationDate AND pd.LastActivityDate
+          AND c.UserId IS NOT NULL
+          AND LENGTH(c.Text) > 15
+    ) AS AvgCommentScoreOnPost,
+    COALESCE(array_length(pd.ParsedTags, 1), 0) AS DistinctTagCount
+FROM UserEngagement ue
+INNER JOIN PostDetails pd ON ue.UserId = pd.OwnerUserId
+LEFT JOIN PostHistoryClosureAnalysis ph_latest ON pd.PostId = ph_latest.PostId AND ph_latest.rn = 1
+LEFT JOIN Users u_loc ON ue.UserId = u_loc.Id
+WHERE
+    pd.ViewCount > 5000
+    AND pd.PostScore > 20
+    AND pd.PostTypeId = 1
+    AND (pd.IsPerformanceRelatedTitle OR ('optimization' = ANY(pd.ParsedTags) OR 'benchmarking' = ANY(pd.ParsedTags)))
+    AND (
+        ph_latest.PostHistoryTypeId IS NULL
+        OR (ph_latest.PostHistoryTypeId = 11 AND ph_latest.HistoryEventDate > pd.PostCreationDate)
+    )
+    AND pd.OwnerUserId IS NOT NULL
+ORDER BY
+    EngagementWeightedScore DESC,
+    ue.Reputation DESC,
+    pd.PostCreationDate DESC
+LIMIT 1000;

@@ -1,0 +1,152 @@
+-- {"query": "2412.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1699} 
+with RecursiveTagHierarchy as (
+    select t.Id, t.TagName, t.ExcerptPostId, t.WikiPostId, 0 as Level
+    from Tags t
+    where t.IsRequired = 1
+    union all
+    select tg.Id, tg.TagName, tg.ExcerptPostId, tg.WikiPostId, rth.Level + 1
+    from Tags tg
+    inner join RecursiveTagHierarchy rth on tg.IsRequired = 1 and tg.Id <> rth.Id and tg.Id > rth.Id
+    where rth.Level < 3
+),
+RecentHighlyVotedAnswers as (
+    select p.Id, p.ParentId, p.Score, p.CreationDate, u.DisplayName as AnswerOwner, 
+        row_number() over (partition by p.ParentId order by p.Score desc, p.CreationDate asc) as rn
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId = 2
+      and p.Score > 10
+      and p.CreationDate >= current_date - interval '180' day
+),
+QuestionStats as (
+    select q.Id as QuestionId, q.Title, q.CreationDate, q.ViewCount, q.Score as QuestionScore, q.Tags,
+       coalesce(a.HighestAnswerScore, 0) as HighestAnswerScore,
+       coalesce(a.AnswerCount, 0) as TotalAnswers,
+       coalesce(c.CommentCount, 0) as TotalComments,
+       u.DisplayName as OwnerName,
+       case when q.AcceptedAnswerId is not null then 1 else 0 end as HasAcceptedAnswer,
+       case when q.ClosedDate is null then 0 else 1 end as IsClosed
+    from Posts q
+    left join (
+        select ParentId, max(Score) as HighestAnswerScore, count(*) as AnswerCount
+        from Posts
+        where PostTypeId = 2
+        group by ParentId
+    ) a on a.ParentId = q.Id
+    left join (
+        select PostId, count(*) as CommentCount
+        from Comments
+        group by PostId
+    ) c on c.PostId = q.Id
+    left join Users u on q.OwnerUserId = u.Id
+    where q.PostTypeId = 1
+      and q.CreationDate >= current_date - interval '365' day
+),
+UserBadgeRanks as (
+    select b.UserId,
+           sum(case when b.Class = 1 then 3 else 0 end) +
+           sum(case when b.Class = 2 then 2 else 0 end) +
+           sum(case when b.Class = 3 then 1 else 0 end) as BadgeScore
+    from Badges b
+    group by b.UserId
+),
+UserReputationRanks as (
+    select u.Id, u.DisplayName, u.Reputation,
+           rank() over (order by u.Reputation desc) as RepRank,
+           dense_rank() over (order by u.Reputation desc) as RepDenseRank,
+           ntile(10) over (order by u.Reputation desc) as RepDecile
+    from Users u
+),
+UserEngagement as (
+    select u.Id as UserId,
+           count(distinct p.Id) as PostCount,
+           count(distinct v.Id) as VoteCount,
+           count(distinct c.Id) as CommentCount,
+           coalesce(sum(v.BountyAmount),0) as TotalBounty,
+           min(u.CreationDate) as FirstActive,
+           max(u.LastAccessDate) as LastActive
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    group by u.Id
+),
+AnswerWithDups as (
+    select p.Id, p.ParentId, pl.LinkTypeId, pl.RelatedPostId
+    from Posts p
+    left join PostLinks pl on p.Id = pl.PostId and pl.LinkTypeId = 3 -- Duplicate link type
+    where p.PostTypeId = 2
+),
+QuestionsWithDuplicateCounts as (
+    select q.Id,
+           count(distinct ad.RelatedPostId) as DuplicateCount
+    from Posts q
+    left join AnswerWithDups ad on ad.ParentId = q.Id
+    where q.PostTypeId = 1
+    group by q.Id
+),
+PostHistoriesWithCloseReason as (
+    select ph.PostId, ph.PostHistoryTypeId, cr.Name as CloseReasonName, ph.CreationDate
+    from PostHistory ph
+    left join CloseReasonTypes cr on ph.Comment = cast(cr.Id as varchar) and ph.PostHistoryTypeId = 10
+),
+PopularTags as (
+    select t.TagName, t.Count,
+           coalesce(qcnt.QuestionCount, 0) as QuestionsCount,
+           coalesce(acnt.AnswerCount, 0) as AnswersCount,
+           coalesce(bcnt.BadgeCount, 0) as BadgeCount
+    from Tags t
+    left join (
+        select unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><')) as TagName,
+               count(*) as QuestionCount
+        from Posts p
+        where p.PostTypeId = 1
+        group by TagName
+    ) qcnt on qcnt.TagName = t.TagName
+    left join (
+        select unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><')) as TagName,
+               count(*) as AnswerCount
+        from Posts p
+        where p.PostTypeId = 2
+        group by TagName
+    ) acnt on acnt.TagName = t.TagName
+    left join (
+        select b.Name as BadgeName, count(*) as BadgeCount
+        from Badges b
+        group by b.Name
+    ) bcnt on bcnt.BadgeName = t.TagName
+),
+FinalResults AS (
+    select qs.QuestionId, qs.Title, qs.CreationDate as QuestionCreated, qs.ViewCount, qs.QuestionScore,
+           qs.HighestAnswerScore, qs.TotalAnswers, qs.TotalComments, qs.OwnerName, qs.HasAcceptedAnswer,
+           qs.IsClosed, qwd.DuplicateCount,
+           uer.RepRank, uer.Reputation, ubr.BadgeScore,
+           ue.PostCount, ue.VoteCount, ue.CommentCount, ue.TotalBounty,
+           phcr.CloseReasonName,
+           pt.TagName, pt.Count as TagPopularity, pt.QuestionsCount, pt.AnswersCount, pt.BadgeCount,
+           rth.Level as TagDepth
+    from QuestionStats qs
+    left join QuestionsWithDuplicateCounts qwd on qs.QuestionId = qwd.Id
+    left join Users u on u.DisplayName = qs.OwnerName
+    left join UserReputationRanks uer on uer.Id = u.Id
+    left join UserBadgeRanks ubr on ubr.UserId = u.Id
+    left join UserEngagement ue on ue.UserId = u.Id
+    left join (
+        select distinct on (ph.PostId) ph.PostId, ph.CloseReasonName
+        from PostHistoriesWithCloseReason ph
+        order by ph.PostId, ph.CreationDate desc
+    ) phcr on phcr.PostId = qs.QuestionId
+    left join lateral (
+        select pt.TagName, pt.Count, pt.QuestionsCount, pt.AnswersCount, pt.BadgeCount, rth.Level
+        from PopularTags pt
+        join RecursiveTagHierarchy rth on rth.TagName = pt.TagName
+        where qs.Tags like '%' || pt.TagName || '%'
+        order by pt.Count desc
+        limit 1
+    ) pt on true
+    left join RecursiveTagHierarchy rth on pt.TagName = rth.TagName
+    where qs.Score > 5 and qs.ViewCount > 1000
+)
+select * from FinalResults
+order by QuestionScore desc, HighestAnswerScore desc, TotalAnswers desc, TagPopularity desc
+limit 100;

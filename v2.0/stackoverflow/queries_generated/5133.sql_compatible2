@@ -1,0 +1,131 @@
+WITH RankedPosts AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.PostTypeId,
+    p.LastActivityDate,
+    p.FavoriteCount,
+    p.CommentCount,
+    p.AcceptedAnswerId,
+    p.ParentId,
+    p.Body,
+    p.LastEditorUserId,
+    p.LastEditDate,
+    p.ContentLicense,
+    u.Reputation,
+    u.DisplayName,
+    u.Location,
+    u.AccountId,
+    ROW_NUMBER() OVER (
+      PARTITION BY p.OwnerUserId
+      ORDER BY p.LastActivityDate DESC, p.Score DESC
+    ) AS rn_owner
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId = 1
+    AND p.LastActivityDate IS NOT NULL
+),
+TopActiveOwners AS (
+  SELECT
+    r.OwnerUserId,
+    r.DisplayName,
+    r.Reputation,
+    r.Location,
+    r.AccountId,
+    COUNT(*) AS QuestionsOpened,
+    AVG(r.Score) AS AvgScore,
+    SUM(r.ViewCount) AS TotalViews,
+    MAX(r.LastActivityDate) AS LastActiveQuestion
+  FROM RankedPosts r
+  WHERE r.rn_owner = 1
+  GROUP BY r.OwnerUserId, r.DisplayName, r.Reputation, r.Location, r.AccountId
+),
+PostTags AS (
+  SELECT
+    p.Id AS PostId,
+    TRIM(BOTH '<' FROM TRIM(BOTH '>' FROM p.Tags)) AS TagsNormalized
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+ExplodedTags AS (
+  SELECT
+    PostId,
+    CASE WHEN TagsNormalized = '' THEN NULL
+         ELSE TagsNormalized END AS rest,
+    NULL AS tag,
+    0 AS lvl
+  FROM PostTags
+  UNION ALL
+  SELECT
+    PostId,
+    CASE
+      WHEN POSITION('><' IN rest) = 0 THEN ''
+      ELSE SUBSTRING(rest FROM POSITION('><' IN rest) + 2)
+    END AS rest,
+    CASE
+      WHEN POSITION('><' IN rest) = 0 THEN rest
+      ELSE SUBSTRING(rest FROM 1 FOR POSITION('><' IN rest) - 1)
+    END AS tag,
+    lvl + 1
+  FROM ExplodedTags
+  WHERE rest IS NOT NULL AND rest <> ''
+),
+DistinctTags AS (
+  SELECT DISTINCT PostId, tag AS TagName
+  FROM ExplodedTags
+  WHERE tag IS NOT NULL AND tag <> ''
+),
+RecentTagInteractions AS (
+  SELECT
+    dt.TagName,
+    COUNT(DISTINCT p.Id) AS TagQuestionCount,
+    AVG(CASE WHEN v.VoteTypeId = 2 THEN 1.0 ELSE 0 END) AS AvgUpvotesPerQuestion,
+    MAX(p.LastActivityDate) AS LastQuestionActivity
+  FROM Posts p
+  JOIN DistinctTags dt ON dt.PostId = p.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  WHERE p.PostTypeId = 1
+  GROUP BY dt.TagName
+),
+CrossJoined AS (
+  SELECT
+    o.OwnerUserId,
+    o.DisplayName AS OwnerDisplayName,
+    o.Reputation,
+    o.Location,
+    o.TotalViews,
+    o.LastActiveQuestion,
+    t.TagQuestionCount,
+    t.AvgUpvotesPerQuestion,
+    t.LastQuestionActivity
+  FROM TopActiveOwners o
+  LEFT JOIN RecentTagInteractions t ON 1=1
+)
+SELECT
+  cu.OwnerUserId,
+  cu.OwnerDisplayName,
+  cu.Reputation,
+  cu.Location,
+  cu.TotalViews,
+  cu.LastActiveQuestion,
+  cu.TagQuestionCount,
+  cu.AvgUpvotesPerQuestion,
+  cu.LastQuestionActivity
+FROM CrossJoined cu
+GROUP BY
+  cu.OwnerUserId,
+  cu.OwnerDisplayName,
+  cu.Reputation,
+  cu.Location,
+  cu.TotalViews,
+  cu.LastActiveQuestion,
+  cu.TagQuestionCount,
+  cu.AvgUpvotesPerQuestion,
+  cu.LastQuestionActivity
+ORDER BY cu.Reputation DESC, cu.TotalViews DESC
+LIMIT 100;

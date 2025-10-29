@@ -1,0 +1,299 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT c.Id) as Comments,
+        COUNT(DISTINCT b.Id) as Badges,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END), 0) as TotalQuestionScore,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END), 0) as TotalAnswerScore,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= DATE '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        Views,
+        UpVotes,
+        DownVotes,
+        TotalPosts,
+        Questions,
+        Answers,
+        Comments,
+        Badges,
+        TotalQuestionScore,
+        TotalAnswerScore,
+        LastPostDate,
+        LastCommentDate,
+        ROW_NUMBER() OVER (ORDER BY TotalQuestionScore DESC, TotalAnswerScore DESC) as ScoreRank,
+        DENSE_RANK() OVER (ORDER BY Reputation DESC) as RepRank
+    FROM UserActivityStats
+    WHERE TotalPosts > 0
+),
+UserPerformance AS (
+    SELECT 
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.Views,
+        tu.UpVotes,
+        tu.DownVotes,
+        tu.TotalPosts,
+        tu.Questions,
+        tu.Answers,
+        tu.Comments,
+        tu.Badges,
+        tu.TotalQuestionScore,
+        tu.TotalAnswerScore,
+        tu.ScoreRank,
+        tu.RepRank,
+        CASE 
+            WHEN tu.Reputation > 100000 THEN 'Grandmaster'
+            WHEN tu.Reputation > 50000 THEN 'Master'
+            WHEN tu.Reputation > 10000 THEN 'Expert'
+            ELSE 'Regular'
+        END as ReputationTier,
+        CASE 
+            WHEN tu.TotalPosts >= 1000 THEN 'Veteran'
+            WHEN tu.TotalPosts >= 500 THEN 'Experienced'
+            WHEN tu.TotalPosts >= 100 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as ActivityLevel,
+        (tu.UpVotes - tu.DownVotes) as NetVotes,
+        COALESCE(NULLIF(tu.TotalAnswerScore, 0) / NULLIF(tu.Answers, 0), 0) as AvgAnswerScore,
+        COALESCE(NULLIF(tu.TotalQuestionScore, 0) / NULLIF(tu.Questions, 0), 0) as AvgQuestionScore,
+        CAST('2024-10-01' AS DATE) - tu.LastPostDate as DaysSinceLastPost,
+        CAST('2024-10-01' AS DATE) - tu.LastCommentDate as DaysSinceLastComment,
+        CASE WHEN tu.Badges > 0 THEN 'Badge Holder' ELSE 'No Badges' END as BadgeStatus
+    FROM TopUsers tu
+),
+PostComplexity AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        COALESCE(p.AnswerCount, 0) + COALESCE(p.CommentCount, 0) AS EngagementMetric,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND LENGTH(p.Tags) > 0 THEN 
+                LENGTH(p.Tags) - LENGTH(REPLACE(p.Tags, '>', '')) + 1
+            ELSE 0 
+        END AS TagCount,
+        CASE 
+            WHEN p.Score >= 100 THEN 'Highly Relevant'
+            WHEN p.Score >= 50 THEN 'Moderately Relevant'
+            WHEN p.Score >= 10 THEN 'Low Relevant'
+            ELSE 'Not Relevant'
+        END AS RelevanceLevel,
+        CASE 
+            WHEN p.AnswerCount > 5 THEN 'Well Answered'
+            WHEN p.AnswerCount > 0 THEN 'Partially Answered'
+            ELSE 'Unanswered'
+        END AS AnswerStatus
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.CreationDate >= DATE '2020-01-01'
+),
+ComplexUserAnalysis AS (
+    SELECT 
+        up.UserId,
+        up.DisplayName,
+        up.Reputation,
+        up.Views,
+        up.UpVotes,
+        up.DownVotes,
+        up.TotalPosts,
+        up.Questions,
+        up.Answers,
+        up.Comments,
+        up.Badges,
+        up.TotalQuestionScore,
+        up.TotalAnswerScore,
+        up.ScoreRank,
+        up.RepRank,
+        up.ReputationTier,
+        up.ActivityLevel,
+        up.NetVotes,
+        up.AvgAnswerScore,
+        up.AvgQuestionScore,
+        up.DaysSinceLastPost,
+        up.DaysSinceLastComment,
+        up.BadgeStatus,
+        CASE WHEN up.Reputation > 1000 AND up.Badges > 10 AND up.TotalPosts > 100 THEN 1 ELSE 0 END as EliteUserFlag,
+        RANK() OVER (ORDER BY up.Reputation DESC, up.TotalPosts DESC) as OverallRank
+    FROM UserPerformance up
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            ELSE 'Niche'
+        END AS PopularityLevel,
+        CASE 
+            WHEN t.IsRequired IS TRUE OR t.IsRequired = 1 THEN 'Required'
+            WHEN t.IsModeratorOnly IS TRUE OR t.IsModeratorOnly = 1 THEN 'Moderator Only'
+            ELSE 'Standard'
+        END AS TagType,
+        COALESCE((SELECT COUNT(*) FROM Posts WHERE Tags LIKE '%' || t.TagName || '%'), 0) as PostsUsingTag
+    FROM Tags t
+    WHERE t.Count > 0
+)
+SELECT 
+    CASE 
+        WHEN COUNT(*) = 0 THEN NULL
+        ELSE 
+            (SELECT COUNT(*) FROM (
+                SELECT DISTINCT u2.Id 
+                FROM Users u2 
+                INNER JOIN Posts p2 ON u2.Id = p2.OwnerUserId 
+                INNER JOIN PostHistory ph2 ON p2.Id = ph2.PostId 
+                INNER JOIN Badges b2 ON u2.Id = b2.UserId 
+                WHERE u2.Reputation > 1000 
+                AND p2.PostTypeId = 1 
+                AND ph2.PostHistoryTypeId = 1 
+                AND b2.Name IN ('Good Answer', 'Great Answer')
+                AND NOT EXISTS (
+                    SELECT 1 FROM Posts p22 
+                    WHERE p22.OwnerUserId = u2.Id 
+                    AND p22.PostTypeId = 2 
+                    AND COALESCE(p22.Score, 0) < 10
+                )
+            ) sub) 
+    END as ComplexAnalysisResult,
+    COUNT(DISTINCT CASE WHEN upa.EliteUserFlag = 1 THEN upa.UserId END) as EliteUserCount,
+    COUNT(DISTINCT CASE WHEN upa.ReputationTier = 'Grandmaster' THEN upa.UserId END) as GrandmasterCount,
+    AVG(upa.AvgQuestionScore) as AvgQuestionScore,
+    SUM(upa.Badges) as TotalBadges,
+    MAX(upa.NetVotes) as MaxNetVotes,
+    MIN(upa.DaysSinceLastPost) as MinDaysSinceLastPost,
+    AVG(upa.Reputation) as AvgReputation,
+    COUNT(DISTINCT CASE WHEN t.PopularityLevel = 'Popular' THEN t.TagName END) as PopularTagCount,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Id END) as ClosedPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+    AVG(CASE WHEN p.AnswerCount > 0 THEN p.AnswerCount ELSE NULL END) as AvgAnswerCount,
+    SUM(CASE WHEN p.Score >= 0 THEN p.Score ELSE 0 END) as PositiveScoreTotal,
+    COUNT(DISTINCT CASE WHEN p.CreationDate > (DATE '2024-10-01' - INTERVAL '1 year') THEN p.Id END) as RecentPosts,
+    COUNT(DISTINCT CASE WHEN u.CreationDate > (DATE '2024-10-01' - INTERVAL '2 year') THEN u.Id END) as RecentUsers,
+    (SELECT COUNT(*) FROM (
+        SELECT p3.Id, COUNT(*) as VoteCount
+        FROM Posts p3
+        INNER JOIN Votes v3 ON p3.Id = v3.PostId
+        WHERE v3.VoteTypeId IN (2, 3)
+        GROUP BY p3.Id
+        HAVING COUNT(*) >= 20
+    ) high_voted) as HighlyVotedPosts,
+    (SELECT COUNT(*) FROM (
+        SELECT u3.Id
+        FROM Users u3
+        INNER JOIN Badges b3 ON u3.Id = b3.UserId
+        WHERE b3.Date > (DATE '2024-10-01' - INTERVAL '6 month')
+        GROUP BY u3.Id
+        HAVING COUNT(*) >= 5
+    ) recent_badgeholders) as RecentBadgeholders,
+    (SELECT AVG(score) FROM (
+        SELECT p4.Score
+        FROM Posts p4
+        INNER JOIN Users u4 ON p4.OwnerUserId = u4.Id
+        WHERE u4.Reputation >= 1000
+        AND p4.PostTypeId = 2
+        AND p4.CreationDate > (DATE '2024-10-01' - INTERVAL '2 year')
+    ) recent_answers) as AvgRecentAnswerScore,
+    (SELECT COUNT(*) FROM Posts p5 WHERE p5.Tags LIKE '%<sql>%' AND p5.PostTypeId = 1) as SQLQuestions,
+    (SELECT COUNT(*) FROM Posts p6 WHERE p6.Tags LIKE '%<python>%' AND p6.PostTypeId = 1) as PythonQuestions,
+    (SELECT COUNT(*) FROM Posts p7 WHERE p7.Tags LIKE '%<javascript>%' AND p7.PostTypeId = 1) as JSQuestions,
+    (SELECT COUNT(*) FROM Posts p8 WHERE p8.Tags LIKE '%<java>%' AND p8.PostTypeId = 1) as JavaQuestions,
+    (SELECT COUNT(*) FROM Posts p9 WHERE p9.Tags LIKE '%<c#>%' AND p9.PostTypeId = 1) as CSharpQuestions,
+    (SELECT COUNT(*) FROM Posts p10 WHERE p10.Tags LIKE '%<php>%' AND p10.PostTypeId = 1) as PHPQuestions,
+    (SELECT COUNT(*) FROM Posts p11 WHERE p11.Tags LIKE '%<ruby>%' AND p11.PostTypeId = 1) as RubyQuestions,
+    (SELECT COUNT(*) FROM Posts p12 WHERE p12.Tags LIKE '%<go>%' AND p12.PostTypeId = 1) as GoQuestions,
+    (SELECT COUNT(*) FROM Posts p13 WHERE p13.Tags LIKE '%<rust>%' AND p13.PostTypeId = 1) as RustQuestions,
+    (SELECT COUNT(*) FROM Posts p14 WHERE p14.Tags LIKE '%<cpp>%' AND p14.PostTypeId = 1) as CPPQuestions,
+    (SELECT COUNT(*) FROM Posts p15 WHERE p15.Tags LIKE '%<c>%' AND p15.PostTypeId = 1) as CQuestions,
+    (SELECT COUNT(*) FROM Posts p16 WHERE p16.Tags LIKE '%<html>%' AND p16.PostTypeId = 1) as HTMLQuestions,
+    (SELECT COUNT(*) FROM Posts p17 WHERE p17.Tags LIKE '%<css>%' AND p17.PostTypeId = 1) as CSSQuestions
+FROM ComplexUserAnalysis upa
+CROSS JOIN Users u
+INNER JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN Tags t ON p.Tags LIKE '%' || t.TagName || '%'
+WHERE u.CreationDate >= DATE '2010-01-01'
+AND (p.PostTypeId = 1 OR p.PostTypeId = 2)
+AND NOT EXISTS (
+    SELECT 1 FROM PostHistory ph2 
+    WHERE ph2.PostId = p.Id 
+    AND ph2.PostHistoryTypeId IN (12, 13) 
+    AND ph2.CreationDate > (DATE '2024-10-01' - INTERVAL '3 month')
+)
+GROUP BY 
+    (SELECT COUNT(*) FROM (
+        SELECT DISTINCT u2.Id 
+        FROM Users u2 
+        INNER JOIN Posts p2 ON u2.Id = p2.OwnerUserId 
+        INNER JOIN PostHistory ph2 ON p2.Id = ph2.PostId 
+        INNER JOIN Badges b2 ON u2.Id = b2.UserId 
+        WHERE u2.Reputation > 1000 
+        AND p2.PostTypeId = 1 
+        AND ph2.PostHistoryTypeId = 1 
+        AND b2.Name IN ('Good Answer', 'Great Answer')
+        AND NOT EXISTS (
+            SELECT 1 FROM Posts p22 
+            WHERE p22.OwnerUserId = u2.Id 
+            AND p22.PostTypeId = 2 
+            AND COALESCE(p22.Score, 0) < 10
+        )
+    ) sub),
+    (SELECT COUNT(*) FROM (
+        SELECT p3.Id, COUNT(*) as VoteCount
+        FROM Posts p3
+        INNER JOIN Votes v3 ON p3.Id = v3.PostId
+        WHERE v3.VoteTypeId IN (2, 3)
+        GROUP BY p3.Id
+        HAVING COUNT(*) >= 20
+    ) high_voted),
+    (SELECT COUNT(*) FROM (
+        SELECT u3.Id
+        FROM Users u3
+        INNER JOIN Badges b3 ON u3.Id = b3.UserId
+        WHERE b3.Date > (DATE '2024-10-01' - INTERVAL '6 month')
+        GROUP BY u3.Id
+        HAVING COUNT(*) >= 5
+    ) recent_badgeholders),
+    (SELECT AVG(score) FROM (
+        SELECT p4.Score
+        FROM Posts p4
+        INNER JOIN Users u4 ON p4.OwnerUserId = u4.Id
+        WHERE u4.Reputation >= 1000
+        AND p4.PostTypeId = 2
+        AND p4.CreationDate > (DATE '2024-10-01' - INTERVAL '2 year')
+    ) recent_answers)
+HAVING 
+    COUNT(DISTINCT CASE WHEN upa.EliteUserFlag = 1 THEN upa.UserId END) > 0
+    OR COUNT(DISTINCT CASE WHEN upa.ReputationTier = 'Grandmaster' THEN upa.UserId END) > 0
+    OR COUNT(DISTINCT CASE WHEN t.PopularityLevel = 'Popular' THEN t.TagName END) > 0
+    OR COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Id END) > 0
+    OR COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 1000;

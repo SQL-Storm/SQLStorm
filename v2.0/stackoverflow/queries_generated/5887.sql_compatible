@@ -1,0 +1,145 @@
+WITH
+RecentActivePosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.OwnerUserId,
+    p.Title,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.PostTypeId,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.Body,
+    p.LastEditorUserId,
+    p.LastEditDate
+  FROM Posts p
+  WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30' DAY
+),
+TopTags AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS TagUsage
+  FROM Tags t
+  WHERE t.TagName IS NOT NULL
+  GROUP BY t.TagName
+  ORDER BY TagUsage DESC
+  LIMIT 50
+),
+UserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.ProfileImageUrl,
+    u.Location,
+    u.AboutMe,
+    u.EmailHash,
+    u.AccountId,
+    COALESCE(b.TotalBadges, 0) AS TotalBadges
+  FROM Users u
+  LEFT JOIN (
+    SELECT
+      UserId,
+      COUNT(*) AS TotalBadges
+    FROM Badges
+    GROUP BY UserId
+  ) b ON b.UserId = u.Id
+),
+LastEditor AS (
+  SELECT
+    p.Id AS PostId,
+    le.Id AS LastEditorId,
+    le.DisplayName AS LastEditorName,
+    p.LastEditDate,
+    p.LastActivityDate
+  FROM Posts p
+  LEFT JOIN Users le ON p.LastEditorUserId = le.Id
+)
+SELECT
+  rap.PostId,
+  rap.Title,
+  rap.CreationDate AS PostCreationDate,
+  rap.LastActivityDate,
+  rap.Score,
+  rap.ViewCount,
+  rap.Body,
+  rap.Tags,
+  rap.PostTypeId,
+  rap.AnswerCount,
+  rap.CommentCount,
+  rap.FavoriteCount,
+  ta.TagName,
+  ta.TagUsage,
+  le.LastEditorId,
+  le.LastEditorName,
+  ua.UserId,
+  ua.DisplayName AS OwnerDisplayName,
+  ua.Reputation,
+  ua.CreationDate AS OwnerCreationDate,
+  ua.LastAccessDate,
+  ua.Views AS OwnerViews,
+  ua.UpVotes,
+  ua.DownVotes,
+  ua.ProfileImageUrl,
+  ua.Location AS OwnerLocation,
+  ua.AboutMe,
+  ua.EmailHash,
+  ua.AccountId,
+  ua.TotalBadges
+FROM RecentActivePosts rap
+LEFT JOIN (
+  SELECT
+    p.Id AS PostId,
+    t.TagName,
+    COUNT(*) AS TagUsage
+  FROM Posts p
+  JOIN Tags t ON p.Id = t.ExcerptPostId OR p.Id = t.WikiPostId
+  WHERE t.TagName IS NOT NULL
+  GROUP BY p.Id, t.TagName
+) ta ON rap.PostId = ta.PostId
+LEFT JOIN TopTags tt ON ta.TagName = tt.TagName
+LEFT JOIN LastEditor le ON rap.PostId = le.PostId
+LEFT JOIN UserActivity ua ON rap.OwnerUserId = ua.UserId
+WHERE rap.PostTypeId IN (1, 2)
+GROUP BY
+  rap.PostId,
+  rap.Title,
+  rap.CreationDate,
+  rap.LastActivityDate,
+  rap.Score,
+  rap.ViewCount,
+  rap.Body,
+  rap.Tags,
+  rap.PostTypeId,
+  rap.AnswerCount,
+  rap.CommentCount,
+  rap.FavoriteCount,
+  ta.TagName,
+  ta.TagUsage,
+  le.LastEditorId,
+  le.LastEditorName,
+  ua.UserId,
+  ua.DisplayName,
+  ua.Reputation,
+  ua.CreationDate,
+  ua.LastAccessDate,
+  ua.Views,
+  ua.UpVotes,
+  ua.DownVotes,
+  ua.ProfileImageUrl,
+  ua.Location,
+  ua.AboutMe,
+  ua.EmailHash,
+  ua.AccountId,
+  ua.TotalBadges
+ORDER BY rap.LastActivityDate DESC
+LIMIT 100;

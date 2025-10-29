@@ -1,0 +1,90 @@
+WITH RecentActiveQuestions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.ViewCount,
+    p.Score,
+    p.OwnerUserId,
+    p.Tags,
+    p.LastActivityDate,
+    ROW_NUMBER() OVER (ORDER BY p.LastActivityDate DESC) AS rn
+  FROM Posts p
+  WHERE p.PostTypeId = 1 -- Question
+    AND p."DeletionDate" IS NULL
+),
+AuthorStats AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.AccountId,
+    (SELECT COUNT(*) FROM Posts t WHERE t.OwnerUserId = u.Id) AS PostCount,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id) AS BadgeCount
+  FROM Users u
+),
+TagPopularity AS (
+  SELECT
+    tag AS TagName,
+    SUM(p.ViewCount) AS TotalViewsForTag,
+    AVG(p.Score) AS AvgPostScore,
+    COUNT(*) AS QuestionCount
+  FROM Posts p,
+  LATERAL unnest(string_to_array(p.Tags, ',')) AS tag
+  WHERE p.PostTypeId = 1
+  GROUP BY tag
+),
+Combined AS (
+  SELECT
+    q.PostId,
+    q.Title AS QuestionTitle,
+    q.CreationDate AS QuestionDate,
+    q.ViewCount,
+    q.Score,
+    a.UserId AS AuthorId,
+    a.DisplayName AS AuthorName,
+    a.Reputation,
+    q.Tags,
+    q.LastActivityDate,
+    asv.PostCount,
+    asv.BadgeCount,
+    (q.ViewCount * 1.0 / NULLIF(q.Score, 0)) AS ViewsPerScore,
+    ROW_NUMBER() OVER (PARTITION BY a.UserId ORDER BY q.LastActivityDate DESC) AS RecencyRank,
+    tp.AvgPostScore
+  FROM RecentActiveQuestions q
+  LEFT JOIN AuthorStats a ON a.UserId = q.OwnerUserId
+  LEFT JOIN AuthorStats asv ON asv.UserId = q.OwnerUserId
+  LEFT JOIN TagPopularity tp
+    ON tp.TagName = (SELECT unnest(string_to_array(q.Tags, ',')) LIMIT 1)
+)
+SELECT
+  c.PostId,
+  c.QuestionTitle,
+  c.QuestionDate,
+  c.ViewCount,
+  c.Score,
+  c.AuthorName,
+  c.Tags,
+  c.LastActivityDate,
+  c.ViewsPerScore,
+  c.RecencyRank,
+  c.AvgPostScore
+FROM Combined c
+LEFT JOIN (
+  SELECT
+    tag AS TagName,
+    AVG(p.Score) AS AvgScoreForTag
+  FROM Posts p,
+  LATERAL unnest(string_to_array(p.Tags, ',')) AS tag
+  WHERE p.PostTypeId = 1
+  GROUP BY tag
+) AS tstats ON tstats.TagName = (SELECT unnest(string_to_array(c.Tags, ',')) LIMIT 1)
+WHERE c.RecencyRank = 1
+ORDER BY c.QuestionDate DESC
+LIMIT 100;

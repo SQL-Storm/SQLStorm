@@ -1,0 +1,84 @@
+-- {"query": "3912.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1718} 
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        COALESCE(u.Reputation, 0)                                     AS Reputation,
+        /* scalar correlated subqueries */
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS QuestionCount,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS AnswerCount,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1)        AS GoldBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2)        AS SilverBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3)        AS BronzeBadges,
+        /* vote score aggregation */
+        (SELECT COALESCE(SUM(CASE vt.Id WHEN 2 THEN 1 WHEN 3 THEN -1 ELSE 0 END),0)
+         FROM Votes v
+         JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+         WHERE v.UserId = u.Id)                                               AS VoteScore
+    FROM Users u
+),
+RankedUsers AS (
+    SELECT 
+        *,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, GoldBadges DESC, SilverBadges DESC) AS rn
+    FROM UserStats
+)
+SELECT 
+    r.rn,
+    r.Id,
+    r.DisplayName,
+    r.Reputation,
+    r.QuestionCount,
+    r.AnswerCount,
+    r.GoldBadges,
+    r.SilverBadges,
+    r.BronzeBadges,
+    r.VoteScore,
+    COALESCE(qs.TotalViews,0)                                 AS TotalQuestionViews,
+    COALESCE(av.AvgAnswerScore,0)                             AS AvgAnswerScore,
+    CASE 
+        WHEN r.QuestionCount = 0 THEN NULL 
+        ELSE r.AnswerCount * 1.0 / r.QuestionCount 
+    END                                                       AS AnswersPerQuestion,
+    CASE 
+        WHEN (r.GoldBadges + r.SilverBadges + r.BronzeBadges) = 0 THEN 'None' 
+        ELSE 'HasBadges' 
+    END                                                       AS BadgeStatus,
+    COALESCE(t.TagList,'')                                    AS TagList
+FROM RankedUsers r
+/* outer join to aggregate question view counts */
+LEFT JOIN (
+    SELECT p.OwnerUserId, SUM(p.ViewCount) AS TotalViews
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+    GROUP BY p.OwnerUserId
+) qs ON qs.OwnerUserId = r.Id
+/* outer join to compute average answer score */
+LEFT JOIN (
+    SELECT p.OwnerUserId, AVG(p.Score) AS AvgAnswerScore
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+    GROUP BY p.OwnerUserId
+) av ON av.OwnerUserId = r.Id
+/* outer join to collect a comma‑separated list of tags the user has used */
+LEFT JOIN (
+    SELECT 
+        p.OwnerUserId,
+        STRING_AGG(t.TagName, ', ') AS TagList
+    FROM Posts p
+    /* explode the <tag><tag> string */
+    JOIN LATERAL regexp_split_to_table(p.Tags, '><') AS split_tag(tag) ON TRUE
+    JOIN Tags t ON t.TagName = split_tag.tag
+    WHERE p.PostTypeId = 1
+    GROUP BY p.OwnerUserId
+) t ON t.OwnerUserId = r.Id
+WHERE r.rn <= 100
+
+UNION ALL
+
+/* a simple summary row using a set operator */
+SELECT 
+    NULL,NULL,'--- Summary ---',NULL,NULL,NULL,NULL,NULL,NULL,NULL,
+    NULL,NULL,NULL,NULL,NULL,NULL
+FROM (SELECT 1) dummy
+ORDER BY rn NULLS LAST, Reputation DESC;

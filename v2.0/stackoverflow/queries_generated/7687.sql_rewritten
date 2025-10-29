@@ -1,0 +1,365 @@
+-- {"query": "7687.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 3606} 
+WITH UserActivitySummary AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        COUNT(DISTINCT c.Id) AS Comments,
+        COUNT(DISTINCT b.Id) AS Badges,
+        MAX(p.CreationDate) AS LastPostDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.Views DESC) AS ReputationRank,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationDenseRank,
+        NTILE(100) OVER (ORDER BY u.Reputation DESC) AS ReputationDecile,
+        CAST(100.0 * ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) / COUNT(*) OVER () AS DECIMAL(5,2)) AS ReputationPercentile
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        p.Tags,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 
+                CASE 
+                    WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+                    WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+                    ELSE 'Open'
+                END
+            WHEN p.PostTypeId = 2 THEN 
+                CASE 
+                    WHEN p.ParentId IS NOT NULL THEN 'Answer'
+                    ELSE 'Orphaned'
+                END
+            ELSE 'Other'
+        END AS PostStatus,
+        COALESCE(p.Title, '') + ' ' + COALESCE(p.Body, '') AS TitleBodyConcat,
+        LEN(COALESCE(p.Title, '')) + LEN(COALESCE(p.Body, '')) AS TitleBodyLength,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND LEN(TRIM(p.Tags)) > 0 THEN 
+                (SELECT COUNT(*) FROM STRING_SPLIT(SUBSTRING(p.Tags, 2, LEN(p.Tags) - 2), '><'))
+            ELSE 0 
+        END AS TagCount,
+        DATEPART(YEAR, p.CreationDate) AS CreationYear,
+        DATEPART(MONTH, p.CreationDate) AS CreationMonth,
+        DATEPART(DAY, p.CreationDate) AS CreationDay
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.Id > 0
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE WHEN t.IsRequired = 1 THEN 'Required' ELSE 'Optional' END AS TagType,
+        CASE WHEN t.IsModeratorOnly = 1 THEN 'Moderator Only' ELSE 'Public' END AS AccessLevel,
+        DENSE_RANK() OVER (ORDER BY t.Count DESC) AS PopularityRank,
+        PERCENT_RANK() OVER (ORDER BY t.Count DESC) AS PopularityPercentile
+    FROM Tags t
+    WHERE t.TagName IS NOT NULL AND LEN(TRIM(t.TagName)) > 0
+),
+PostHistoryAnalysis AS (
+    SELECT 
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        ph.UserId,
+        ph.UserDisplayName,
+        ph.Text,
+        ph.Comment,
+        CASE 
+            WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15) THEN 'Moderation Event'
+            WHEN ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6) THEN 'Content Edit'
+            WHEN ph.PostHistoryTypeId IN (17, 18, 19, 20, 35, 36) THEN 'Migration/Transfer'
+            ELSE 'Other'
+        END AS EventType,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate ASC) AS EditSequence,
+        LAG(ph.CreationDate, 1) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate ASC) AS PreviousEditDate,
+        DATEDIFF(MINUTE, LAG(ph.CreationDate, 1) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate ASC), ph.CreationDate) AS MinutesSincePreviousEdit
+    FROM PostHistory ph
+    WHERE ph.Id > 0
+)
+SELECT 
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.Views,
+    uas.UpVotes,
+    uas.DownVotes,
+    uas.TotalPosts,
+    uas.Questions,
+    uas.Answers,
+    uas.Comments,
+    uas.Badges,
+    uas.LastPostDate,
+    uas.ReputationRank,
+    uas.ReputationDenseRank,
+    uas.ReputationDecile,
+    uas.ReputationPercentile,
+    pa.PostId,
+    pa.PostTypeId,
+    pa.Title,
+    pa.Score,
+    pa.ViewCount,
+    pa.AnswerCount,
+    pa.CommentCount,
+    pa.FavoriteCount,
+    pa.CreationDate AS PostCreationDate,
+    pa.OwnerDisplayName,
+    pa.Tags,
+    pa.PostStatus,
+    pa.TitleBodyConcat,
+    pa.TitleBodyLength,
+    pa.TagCount,
+    pa.CreationYear,
+    pa.CreationMonth,
+    pa.CreationDay,
+    ta.TagName,
+    ta.Count AS TagCountValue,
+    ta.ExcerptPostId,
+    ta.WikiPostId,
+    ta.TagType,
+    ta.AccessLevel,
+    ta.PopularityRank,
+    ta.PopularityPercentile,
+    pha.PostHistoryTypeId,
+    pha.EventType,
+    pha.EditSequence,
+    pha.PreviousEditDate,
+    pha.MinutesSincePreviousEdit,
+    CASE 
+        WHEN uas.Reputation >= 100000 AND uas.Badges >= 100 THEN 'Elite Contributor'
+        WHEN uas.Reputation >= 50000 AND uas.Badges >= 50 THEN 'Senior Contributor'
+        WHEN uas.Reputation >= 10000 AND uas.Badges >= 25 THEN 'Contributor'
+        ELSE 'Regular Member'
+    END AS ContributorTier,
+    CASE 
+        WHEN pa.Score >= 100 THEN 'Highly Rated'
+        WHEN pa.Score >= 50 THEN 'Moderately Rated'
+        WHEN pa.Score >= 10 THEN 'Low Rated'
+        ELSE 'Unrated'
+    END AS PostRating,
+    CASE 
+        WHEN pa.ViewCount > 1000 THEN 'Popular'
+        WHEN pa.ViewCount > 500 THEN 'Moderately Popular'
+        WHEN pa.ViewCount > 100 THEN 'Less Popular'
+        ELSE 'Rarely Viewed'
+    END AS PopularityLevel,
+    CASE 
+        WHEN pa.PostTypeId = 1 AND pa.AnswerCount > 5 AND pa.Score >= 20 THEN 'Highly Active Question'
+        WHEN pa.PostTypeId = 1 AND pa.AnswerCount = 0 THEN 'Unanswered Question'
+        WHEN pa.PostTypeId = 1 THEN 'Regular Question'
+        WHEN pa.PostTypeId = 2 THEN 'Answer'
+        ELSE 'Other Post Type'
+    END AS PostClassification,
+    CASE 
+        WHEN pha.MinutesSincePreviousEdit IS NOT NULL AND pha.MinutesSincePreviousEdit < 30 THEN 'Rapid Edit'
+        WHEN pha.MinutesSincePreviousEdit > 30 AND pha.MinutesSincePreviousEdit <= 1440 THEN 'Standard Edit'
+        WHEN pha.MinutesSincePreviousEdit > 1440 THEN 'Long Gap Edit'
+        ELSE 'Initial Edit'
+    END AS EditTiming,
+    CASE 
+        WHEN pa.TagCount > 3 THEN 'Multi-Tagged'
+        WHEN pa.TagCount = 0 THEN 'Untagged'
+        WHEN pa.TagCount = 1 THEN 'Single Tag'
+        ELSE 'Tagged'
+    END AS TaggingLevel,
+    CASE 
+        WHEN ta.PopularityPercentile > 0.9 THEN 'Trending'
+        WHEN ta.PopularityPercentile > 0.7 THEN 'Popular'
+        WHEN ta.PopularityPercentile > 0.5 THEN 'Moderately Popular'
+        ELSE 'Less Popular'
+    END AS TagPopularityStatus,
+    ROW_NUMBER() OVER (PARTITION BY uas.UserId ORDER BY pa.CreationDate DESC, pa.Score DESC) AS UserPostOrder,
+    RANK() OVER (ORDER BY (uas.Reputation + uas.Views + uas.UpVotes) DESC) AS CombinedScoreRank,
+    DENSE_RANK() OVER (ORDER BY uas.Reputation DESC, pa.CreationDate DESC) AS ReputationDateRank,
+    PERCENT_RANK() OVER (ORDER BY (uas.Reputation + uas.Views)) AS CombinedPopularityPercentile,
+    (
+        SELECT COUNT(*) 
+        FROM PostHistory ph2 
+        WHERE ph2.UserId = uas.UserId 
+        AND ph2.CreationDate >= DATEADD(DAY, -7, cast('2024-10-01 12:34:56' as timestamp))
+    ) AS RecentEditsInWeek,
+    (
+        SELECT COUNT(DISTINCT ph3.PostId)
+        FROM PostHistory ph3
+        WHERE ph3.UserId = uas.UserId
+        AND ph3.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)
+    ) AS ContentEditCount,
+    (
+        SELECT COUNT(DISTINCT ph4.PostId)
+        FROM PostHistory ph4
+        WHERE ph4.UserId = uas.UserId
+        AND ph4.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15)
+    ) AS ModerationEventCount,
+    (
+        SELECT AVG(pha5.MinutesSincePreviousEdit)
+        FROM PostHistoryAnalysis pha5
+        WHERE pha5.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = uas.UserId)
+        AND pha5.MinutesSincePreviousEdit IS NOT NULL
+    ) AS AvgMinutesBetweenEdits,
+    (
+        SELECT TOP 1 pha6.EventType
+        FROM PostHistoryAnalysis pha6
+        WHERE pha6.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = uas.UserId)
+        ORDER BY pha6.CreationDate DESC
+    ) AS LastEventType,
+    IIF(uas.TotalPosts > 0, 
+        COALESCE(CONVERT(DECIMAL(10,2), NULLIF(uas.Answers, 0) / NULLIF(uas.Questions, 0)), 0),
+        0) AS AnswerRate,
+    NULLIF(CONVERT(DECIMAL(10,2), (NULLIF(uas.UpVotes, 0) * 100.0) / NULLIF(uas.UpVotes + uas.DownVotes, 0)), 0) AS UpVotePercentage,
+    CAST(
+        COALESCE(
+            NULLIF(CONVERT(DECIMAL(10,2), (NULLIF(uas.Badges, 0) * 100.0) / NULLIF(uas.TotalPosts, 0)), 0), 
+            0
+        ) AS DECIMAL(10,2)
+    ) AS BadgeDensity,
+    COALESCE(
+        RIGHT('0000000000' + CAST(uas.UserId AS VARCHAR(10)), 10) + 
+        RIGHT('0000000000' + CAST(pa.PostId AS VARCHAR(10)), 10) +
+        RIGHT('0000000000' + CAST(pha.PostHistoryTypeId AS VARCHAR(10)), 10),
+        'UNKNOWN'
+    ) AS CompositeKey,
+    COALESCE(
+        REPLICATE('★', (uas.Reputation / 10000)),
+        '☆'
+    ) AS ReputationStars
+FROM UserActivitySummary uas
+FULL OUTER JOIN PostAnalysis pa ON uas.UserId = pa.OwnerUserId
+FULL OUTER JOIN TagAnalysis ta ON pa.Tags LIKE '%' + ta.TagName + '%'
+FULL OUTER JOIN PostHistoryAnalysis pha ON pa.PostId = pha.PostId
+WHERE 
+    (uas.UserId > 0 OR pa.PostId > 0 OR ta.TagName IS NOT NULL OR pha.PostId > 0)
+    AND 
+    (
+        uas.UserId IS NOT NULL OR 
+        pa.PostId IS NOT NULL OR 
+        ta.TagName IS NOT NULL OR 
+        pha.PostId IS NOT NULL OR 
+        (uas.UserId IS NULL AND pa.PostId IS NULL AND ta.TagName IS NULL AND pha.PostId IS NULL)
+    )
+    AND (
+        (
+            pa.PostId IS NOT NULL 
+            AND pa.CreationYear = DATEPART(YEAR, cast('2024-10-01 12:34:56' as timestamp))
+        ) OR 
+        (
+            uas.UserId IS NOT NULL 
+            AND uas.LastPostDate >= DATEADD(MONTH, -6, cast('2024-10-01 12:34:56' as timestamp))
+        ) OR 
+        (
+            ta.TagName IS NOT NULL 
+            AND ta.Count >= 100
+        ) OR 
+        (
+            pha.PostHistoryTypeId IS NOT NULL 
+            AND pha.CreationDate >= DATEADD(DAY, -30, cast('2024-10-01 12:34:56' as timestamp))
+        ) OR 
+        (
+            uas.UserId IS NULL AND pa.PostId IS NULL AND ta.TagName IS NULL AND pha.PostId IS NULL
+        )
+    )
+    AND ISNULL(pa.OwnerUserId, -1) = ISNULL(uas.UserId, -1)
+    AND (
+        pa.Score > 0 OR pa.AnswerCount > 0 OR ta.Count > 0 
+        OR pha.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15)
+    )
+UNION ALL
+SELECT 
+    CAST(-1 AS INT) AS UserId,
+    'All Users Aggregate' AS DisplayName,
+    NULL AS Reputation,
+    NULL AS Views,
+    NULL AS UpVotes,
+    NULL AS DownVotes,
+    COUNT(DISTINCT u.Id) AS TotalPosts,
+    NULL AS Questions,
+    NULL AS Answers,
+    NULL AS Comments,
+    NULL AS Badges,
+    NULL AS LastPostDate,
+    NULL AS ReputationRank,
+    NULL AS ReputationDenseRank,
+    NULL AS ReputationDecile,
+    NULL AS ReputationPercentile,
+    NULL AS PostId,
+    NULL AS PostTypeId,
+    NULL AS Title,
+    NULL AS Score,
+    NULL AS ViewCount,
+    NULL AS AnswerCount,
+    NULL AS CommentCount,
+    NULL AS FavoriteCount,
+    NULL AS PostCreationDate,
+    NULL AS OwnerDisplayName,
+    NULL AS Tags,
+    NULL AS PostStatus,
+    NULL AS TitleBodyConcat,
+    NULL AS TitleBodyLength,
+    NULL AS TagCount,
+    NULL AS CreationYear,
+    NULL AS CreationMonth,
+    NULL AS CreationDay,
+    NULL AS TagName,
+    NULL AS TagCountValue,
+    NULL AS ExcerptPostId,
+    NULL AS WikiPostId,
+    NULL AS TagType,
+    NULL AS AccessLevel,
+    NULL AS PopularityRank,
+    NULL AS PopularityPercentile,
+    NULL AS PostHistoryTypeId,
+    NULL AS EventType,
+    NULL AS EditSequence,
+    NULL AS PreviousEditDate,
+    NULL AS MinutesSincePreviousEdit,
+    'Aggregate View' AS ContributorTier,
+    NULL AS PostRating,
+    NULL AS PopularityLevel,
+    NULL AS PostClassification,
+    NULL AS EditTiming,
+    NULL AS TaggingLevel,
+    NULL AS TagPopularityStatus,
+    NULL AS UserPostOrder,
+    NULL AS CombinedScoreRank,
+    NULL AS ReputationDateRank,
+    NULL AS CombinedPopularityPercentile,
+    DISTINCT COUNT(*) AS RecentEditsInWeek,
+    NULL AS ContentEditCount,
+    NULL AS ModerationEventCount,
+    NULL AS AvgMinutesBetweenEdits,
+    NULL AS LastEventType,
+    NULL AS AnswerRate,
+    NULL AS UpVotePercentage,
+    NULL AS BadgeDensity,
+    'AGGREGATE' AS CompositeKey,
+    '★' AS ReputationStars
+FROM Users u
+WHERE u.Id > 0
+HAVING COUNT(DISTINCT u.Id) > 0
+ORDER BY 
+    ISNULL(uas.UserId, -1),
+    ISNULL(pa.PostId, -1),
+    ISNULL(ta.TagName, 'ZZZZ'),
+    ISNULL(pha.CreationDate, '1900-01-01') DESC;

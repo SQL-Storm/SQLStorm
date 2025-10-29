@@ -1,0 +1,91 @@
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+    COUNT(DISTINCT c.Id) AS Comments,
+    COALESCE(SUM(p.Score), 0) AS TotalScore,
+    COALESCE(AVG(p.Score), 0) AS AvgScore,
+    MAX(p.CreationDate) AS LastPostDate,
+    COUNT(DISTINCT b.Id) AS BadgesCount,
+    STRING_AGG(DISTINCT b.Name, ', ') AS BadgeNames,
+    STRING_AGG(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Title END, ' | ') AS QuestionTitles,
+    STRING_AGG(DISTINCT CASE WHEN p.PostTypeId = 2 THEN SUBSTRING(p.Body FROM 1 FOR 100) END, ' | ') AS AnswerSnippets,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.ViewCount > 1000 THEN p.Id END) AS HighViewQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.Score > 10 THEN p.Id END) AS HighScoreAnswers,
+    (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = u.Id AND p2.CreationDate > u.CreationDate + INTERVAL '1 year') AS PostsAfterOneYear,
+    CASE 
+        WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+            ROUND((COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) * 100.0 / COUNT(DISTINCT p.Id)), 2)
+        ELSE 0 
+    END AS AnswerPercentage,
+    ROW_NUMBER() OVER (ORDER BY COALESCE(SUM(p.Score), 0) DESC) AS RankByScore,
+    DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS RankByReputation,
+    NTILE(10) OVER (ORDER BY u.Reputation DESC) AS ReputationDecile,
+    LAG(u.Reputation, 1) OVER (ORDER BY u.Reputation DESC) AS PreviousReputation,
+    LEAD(u.Reputation, 1) OVER (ORDER BY u.Reputation DESC) AS NextReputation,
+    FIRST_VALUE(u.Reputation) OVER (ORDER BY u.Reputation DESC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS MaxReputation,
+    LAST_VALUE(u.Reputation) OVER (ORDER BY u.Reputation DESC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS MinReputation,
+    (SELECT COUNT(*) FROM Posts p3 WHERE p3.OwnerUserId = u.Id 
+     AND p3.CreationDate BETWEEN u.CreationDate AND u.CreationDate + INTERVAL '30 days') AS PostsInFirstMonth,
+    CASE 
+        WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+            ROUND((COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) * 1.0 / COUNT(DISTINCT p.Id)), 2)
+        ELSE 0 
+    END AS QuestionRatio,
+    (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId IN (2,3)) AS VoteCount,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END), 0) AS QuestionScore,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END), 0) AS AnswerScore,
+    (SELECT COUNT(DISTINCT ph.PostId) FROM PostHistory ph WHERE ph.UserId = u.Id) AS EditCount,
+    COALESCE(AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END), 0) AS AvgAnswerScore,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN p.Id END) AS QuestionsWithAnswers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.CommentCount > 0 THEN p.Id END) AS QuestionWithComments,
+    (SELECT COUNT(*) FROM Posts p4 WHERE p4.OwnerUserId = u.Id AND p4.ClosedDate IS NOT NULL) AS ClosedQuestions,
+    (SELECT COUNT(*) FROM Posts p5 WHERE p5.OwnerUserId = u.Id AND p5.CommunityOwnedDate IS NOT NULL) AS CommunityOwnedPosts,
+    (SELECT MIN(p6.CreationDate) FROM Posts p6 WHERE p6.OwnerUserId = u.Id) AS FirstPostDate,
+    (SELECT MAX(p7.CreationDate) FROM Posts p7 WHERE p7.OwnerUserId = u.Id) AS LatestPostDate,
+    ROUND(AVG(EXTRACT(DAY FROM (p8.LastEditDate - p8.CreationDate))), 2) AS AvgEditDurationDays,
+    CASE WHEN COUNT(DISTINCT b.Id) > 0 THEN 'Has Badges' ELSE 'No Badges' END AS BadgeStatus,
+    CASE 
+        WHEN u.Reputation > (SELECT AVG(Reputation) FROM Users) THEN 
+            (u.Reputation - (SELECT AVG(Reputation) FROM Users))
+        ELSE 0 
+    END AS RepAboveAvg,
+    ROUND(COUNT(DISTINCT p.Id) * 1.0 / NULLIF(COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END), 0), 2) AS AnswersPerQuestion,
+    (SELECT COUNT(*) FROM Posts p9 WHERE p9.OwnerUserId = u.Id AND p9.ViewCount >= 10000) AS HighlyViewedPosts,
+    CASE WHEN COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) > 0 THEN 'Gold' ELSE 'No Gold' END AS HasGold,
+    CASE WHEN COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) > 0 THEN 'Silver' ELSE 'No Silver' END AS HasSilver,
+    CASE WHEN COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) > 0 THEN 'Bronze' ELSE 'No Bronze' END AS HasBronze,
+    STRING_AGG(DISTINCT u.Location, ', ') AS Locations,
+    STRING_AGG(DISTINCT u.WebsiteUrl, ', ') AS Websites,
+    (SELECT COUNT(*) FROM PostHistory ph2 WHERE ph2.UserId = u.Id AND ph2.PostHistoryTypeId = 1) AS TitleEdits,
+    (SELECT COUNT(*) FROM PostHistory ph3 WHERE ph3.UserId = u.Id AND ph3.PostHistoryTypeId IN (5, 6, 8, 9)) AS BodyTagEdits,
+    (SELECT AVG(p10.Score) FROM Posts p10 WHERE p10.OwnerUserId = u.Id AND p10.PostTypeId = 1) AS AvgQuestionScore,
+    (SELECT AVG(p11.Score) FROM Posts p11 WHERE p11.OwnerUserId = u.Id AND p11.PostTypeId = 2) AS AvgAnswerScore,
+    (SELECT COUNT(*) FROM Comments c2 WHERE c2.UserId = u.Id AND c2.CreationDate > u.CreationDate + INTERVAL '1 day') AS CommentsInFirstDay,
+    (SELECT STRING_AGG(DISTINCT t.TagName, ', ') FROM Tags t 
+     INNER JOIN Posts p12 ON p12.Tags LIKE '%' || t.TagName || '%' 
+     WHERE p12.OwnerUserId = u.Id AND p12.PostTypeId = 1) AS TaggedTopics,
+    (SELECT COUNT(DISTINCT p13.Id) FROM Posts p13 
+     WHERE p13.OwnerUserId = u.Id AND p13.PostTypeId = 1 
+     AND EXISTS (SELECT 1 FROM Posts p14 WHERE p14.ParentId = p13.Id AND p14.Score > 10)) AS QuestionsWithHighScoreAnswers
+FROM Users u
+LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+LEFT JOIN Comments c ON c.UserId = u.Id
+LEFT JOIN Badges b ON b.UserId = u.Id
+LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+LEFT JOIN Tags t ON p.Tags LIKE '%' || t.TagName || '%'
+WHERE u.CreationDate > DATE '2010-01-01'
+GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+HAVING 
+    COUNT(DISTINCT p.Id) > 0 
+    AND 
+    (
+        (COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 0) 
+        OR 
+        (COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) > 0)
+    )
+ORDER BY TotalScore DESC, u.Reputation DESC
+LIMIT 100;

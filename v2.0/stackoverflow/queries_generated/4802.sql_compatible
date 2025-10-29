@@ -1,0 +1,148 @@
+WITH
+  QuestionAndAnswerCounts AS (
+    SELECT
+      p.Id AS QuestionId,
+      COUNT(a.Id) AS AnswerCount
+    FROM
+      Posts p
+      LEFT JOIN Posts a ON p.Id = a.ParentId
+    WHERE
+      p.PostTypeId = 1
+    GROUP BY
+      p.Id
+  ),
+  UserPostActivity AS (
+    SELECT
+      p.OwnerUserId,
+      COUNT(p.Id) AS PostCount,
+      SUM(p.Score) AS TotalScore,
+      MAX(p.CreationDate) AS LastPostDate
+    FROM
+      Posts p
+    WHERE
+      p.OwnerUserId IS NOT NULL
+    GROUP BY
+      p.OwnerUserId
+  ),
+  UserCommentActivity AS (
+    SELECT
+      c.UserId,
+      COUNT(c.Id) AS CommentCount,
+      SUM(c.Score) AS TotalCommentScore,
+      MAX(c.CreationDate) AS LastCommentDate
+    FROM
+      Comments c
+    WHERE
+      c.UserId IS NOT NULL
+    GROUP BY
+      c.UserId
+  ),
+  UserVoteActivity AS (
+    SELECT
+      v.UserId,
+      COUNT(CASE WHEN vt.Name = 'UpMod' THEN 1 END) AS UpVoteCount,
+      COUNT(CASE WHEN vt.Name = 'DownMod' THEN 1 END) AS DownVoteCount,
+      MAX(v.CreationDate) AS LastVoteDate
+    FROM
+      Votes v
+      JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    WHERE
+      v.UserId IS NOT NULL
+    GROUP BY
+      v.UserId
+  ),
+  FeaturedQuestions AS (
+    SELECT
+      p.Id,
+      p.Title,
+      p.OwnerUserId,
+      p.CreationDate,
+      ROW_NUMBER() OVER (
+        ORDER BY
+          p.FavoriteCount DESC,
+          p.ViewCount DESC
+      ) AS rn
+    FROM
+      Posts p
+    WHERE
+      p.PostTypeId = 1
+      AND p.FavoriteCount > 50
+      AND p.ViewCount > 10000
+      AND p.OwnerUserId IS NOT NULL
+  )
+SELECT
+  u.DisplayName,
+  u.Reputation,
+  u.CreationDate AS UserCreationDate,
+  COALESCE(upa.PostCount, 0) AS TotalPosts,
+  COALESCE(upa.TotalScore, 0) AS TotalPostScore,
+  COALESCE(uca.CommentCount, 0) AS TotalComments,
+  COALESCE(uca.TotalCommentScore, 0) AS TotalCommentScore,
+  COALESCE(uva.UpVoteCount, 0) AS TotalUpVotes,
+  COALESCE(uva.DownVoteCount, 0) AS TotalDownVotes,
+  -- Portable day difference: use DATE_PART of epoch if DB supports, otherwise fall back to simple subtraction for date types
+  CAST(
+    (EXTRACT(EPOCH FROM COALESCE(upa.LastPostDate, uca.LastCommentDate, uva.LastVoteDate)) -
+     EXTRACT(EPOCH FROM u.CreationDate)
+    ) / 86400
+    AS INTEGER
+  ) AS DaysSinceLastActivity,
+  CASE
+    WHEN fq.Id IS NOT NULL THEN 'Featured'
+    ELSE 'Regular'
+  END AS FeaturedStatus,
+  COALESCE(pht.PostCount, 0) AS PostHistoryCount,
+  COALESCE(ph.CommentCount, 0) AS PostHistoryComments,
+  LOWER(
+    SUBSTRING(u.AboutMe FROM 1 FOR 50)
+  ) AS AboutMeSnippet,
+  CASE
+    WHEN u.WebsiteUrl IS NULL THEN 'No Website'
+    WHEN u.WebsiteUrl LIKE '%stackoverflow.com%' THEN 'Stack Overflow Related'
+    ELSE 'External Website'
+  END AS WebsiteCategory,
+  CASE
+    WHEN u.LastAccessDate < (cast('2024-10-01' as date) - INTERVAL '1 year') THEN 'Inactive'
+    WHEN u.LastAccessDate < (cast('2024-10-01' as date) - INTERVAL '3 months') THEN 'Moderately Active'
+    ELSE 'Active'
+  END AS AccessStatus,
+  CASE
+    WHEN u.Views > 100000 THEN 'High Visitor'
+    WHEN u.Views > 10000 THEN 'Medium Visitor'
+    ELSE 'Low Visitor'
+  END AS VisitorTier
+FROM
+  Users u
+  LEFT JOIN UserPostActivity upa ON u.Id = upa.OwnerUserId
+  LEFT JOIN UserCommentActivity uca ON u.Id = uca.UserId
+  LEFT JOIN UserVoteActivity uva ON u.Id = uva.UserId
+  LEFT JOIN (
+    SELECT
+      ph.OwnerUserId,
+      COUNT(*) AS PostCount,
+      SUM(CASE WHEN ph.Comment IS NOT NULL THEN 1 ELSE 0 END) AS CommentCount
+    FROM
+      PostHistory ph
+    WHERE
+      ph.PostHistoryTypeId IN (2, 5) -- Edit Body, Initial Body
+    GROUP BY
+      ph.OwnerUserId
+  ) ph ON u.Id = ph.OwnerUserId
+  LEFT JOIN (
+    SELECT
+      ph2.UserId,
+      COUNT(*) AS PostCount
+    FROM
+      PostHistory ph2
+    GROUP BY
+      ph2.UserId
+  ) pht ON u.Id = pht.UserId
+  LEFT JOIN FeaturedQuestions fq ON u.Id = fq.OwnerUserId
+WHERE
+  u.Reputation > 1000
+  AND u.DisplayName IS NOT NULL
+  AND u.DisplayName <> ''
+ORDER BY
+  u.Reputation DESC,
+  DaysSinceLastActivity ASC,
+  FeaturedStatus DESC;

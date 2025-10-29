@@ -1,0 +1,34 @@
+SELECT 
+    u.DisplayName, 
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    MAX(p.Score) AS HighestScoredPost,
+    MIN(p.CreationDate) AS FirstPostDate,
+    MAX(p.LastActivityDate) AS LastActivityDate,
+    b.Name AS LatestBadge,
+    COUNT(DISTINCT v.PostId) AS TotalVotes,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Comment END) AS TotalClosedPosts,
+    AVG(p.Score) AS AvgScorePerPost
+FROM 
+    Users u
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+WHERE 
+    u.Reputation > 1000
+    AND p.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '5' YEAR)
+    AND (b.Date = (SELECT MAX(b2.Date) FROM Badges b2 WHERE b2.UserId = u.Id))
+GROUP BY 
+    u.DisplayName, u.Reputation, b.Name
+HAVING 
+    COUNT(DISTINCT p.Id) > 50
+ORDER BY 
+    AvgScorePerPost DESC, 
+    TotalPosts DESC;

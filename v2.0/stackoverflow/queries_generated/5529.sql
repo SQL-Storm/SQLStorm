@@ -1,0 +1,173 @@
+-- {"query": "5529.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1149} 
+WITH
+RecentActivePosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.Body,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ParentId,
+        p.PostTypeId,
+        p.AcceptedAnswerId
+    FROM Posts p
+    WHERE p.CreationDate >= NOW() - INTERVAL '30 days'
+),
+TopTags AS (
+    SELECT
+        t.TagName,
+        SUM(p.Score) AS ScoreSum,
+        SUM(p.ViewCount) AS ViewSum,
+        COUNT(*) AS PostCount
+    FROM Tags tg
+    JOIN Posts p ON p.Id = tg.ExcerptPostId
+    JOIN UNNEST(string_to_array(tg.TagName, '>')) AS t(TagName) -- crude normalization
+        ON TRUE
+    WHERE tg.IsModeratorOnly = 0
+    GROUP BY t.TagName
+),
+UserInfluence AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.AccountId,
+        ROW_NUMBER() OVER (
+            ORDER BY u.Reputation DESC,
+                     u.UpVotes - u.DownVotes DESC,
+                     u.CreationDate ASC
+        ) AS rn
+    FROM Users u
+),
+RecentVotes AS (
+    SELECT
+        v.PostId,
+        v.VoteTypeId,
+        v.UserId,
+        v.CreationDate,
+        v.BountyAmount,
+        CASE
+            WHEN v.VoteTypeId IN (2, 6, 10, 11, 12, 14, 15, 16) THEN 1
+            ELSE 0
+        END AS IsCriticalVote
+    FROM Votes v
+    WHERE v.CreationDate >= NOW() - INTERVAL '60 days'
+),
+CorrelatedComments AS (
+    SELECT
+        c.PostId,
+        c.Id AS CommentId,
+        c.UserId,
+        c.UserDisplayName,
+        c.Score AS CommentScore,
+        c.CreationDate,
+        c.Text,
+        c.ContentLicense
+    FROM Comments c
+    JOIN Posts p ON p.Id = c.PostId
+    WHERE p.PostTypeId = 1
+      AND c.CreationDate >= NOW() - INTERVAL '60 days'
+),
+BranchingCTE AS (
+    SELECT
+        rp.PostId,
+        rp.Title,
+        rp.LastActivityDate,
+        rp.OwnerUserId,
+        rp.Score,
+        rp.ViewCount,
+        rp.Tags,
+        p2.Title AS RelatedQuestionTitle,
+        p2.Id AS RelatedPostId
+    FROM RecentActivePosts rp
+    LEFT JOIN PostLinks pl ON pl.PostId = rp.PostId
+    LEFT JOIN Posts p2 ON p2.Id = pl.RelatedPostId
+    WHERE rp.PostTypeId = 1
+),
+AggMetrics AS (
+    SELECT
+        rp.PostId,
+        rp.Score,
+        rp.ViewCount,
+        rp.AnswerCount,
+        rp.CommentCount,
+        rp.FavoriteCount,
+        rb.RelatedPostId,
+        rb.RelatedQuestionTitle,
+        ROW_NUMBER() OVER (ORDER BY rp.Score DESC, rp.ViewCount DESC) AS rn
+    FROM RecentActivePosts rp
+    LEFT JOIN BranchingCTE rb ON rb.PostId = rp.PostId
+)
+SELECT
+    rp.PostId,
+    rp.Title,
+    rp.CreationDate,
+    rp.LastActivityDate,
+    rp.OwnerUserId,
+    ru.DisplayName AS OwnerDisplayName,
+    ru.Reputation,
+    ru.AccountId,
+    rp.Score,
+    rp.ViewCount,
+    rp.Tags,
+    rp.AnswerCount,
+    rp.CommentCount,
+    rp.FavoriteCount,
+    ARRAY_AGG(DISTINCT tb.TagName) AS TopRelatedTags,
+    COALESCE(p2.Title, '') AS RelatedQuestionTitle,
+    CASE
+        WHEN a.rn <= 10 THEN a.Score
+        ELSE NULL
+    END AS TopScoreWindow,
+    c.Text AS LatestComment,
+    c.CommentScore AS LatestCommentScore,
+    v.CreationDate AS RecentVoteDate,
+    v.VoteTypeId AS RecentVoteType,
+    v.IsCriticalVote
+FROM RecentActivePosts rp
+LEFT JOIN Users ru ON ru.Id = rp.OwnerUserId
+LEFT JOIN Votes v ON v.PostId = rp.PostId
+LEFT JOIN CorrelatedComments c ON c.PostId = rp.PostId
+LEFT JOIN AggMetrics a ON a.PostId = rp.PostId
+LEFT JOIN (
+    SELECT
+        tg.TagName
+    FROM Tags tg
+    WHERE tg.IsModeratorOnly = 0
+    LIMIT 5
+) tb ON TRUE
+LEFT JOIN Posts p2 ON p2.Id = a.RelatedPostId
+GROUP BY
+    rp.PostId,
+    rp.Title,
+    rp.CreationDate,
+    rp.LastActivityDate,
+    rp.OwnerUserId,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.AccountId,
+    rp.Score,
+    rp.ViewCount,
+    rp.Tags,
+    rp.AnswerCount,
+    rp.CommentCount,
+    rp.FavoriteCount,
+    p2.Title,
+    a.TopScoreWindow,
+    c.Text,
+    c.CommentScore,
+    v.CreationDate,
+    v.VoteTypeId,
+    v.IsCriticalVote
+ORDER BY rp.LastActivityDate DESC
+LIMIT 100;

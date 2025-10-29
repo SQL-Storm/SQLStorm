@@ -1,0 +1,198 @@
+with RecursiveUserBadges as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class,
+        row_number() over (partition by u.Id order by b.Date desc) as Rnk
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    where u.Reputation > 1000
+),
+TopUserBadges as (
+    select UserId, DisplayName, BadgeName, Class
+    from RecursiveUserBadges
+    where Rnk <= 3
+),
+QuestionStats as (
+    select 
+        p.Id as QuestionId,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        coalesce(p.AnswerCount,0) as AnswerCount,
+        coalesce(p.FavoriteCount,0) as FavoriteCount,
+        (select count(*) from Comments c where c.PostId = p.Id) as CommentCount,
+        (select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 2) as UpVotes,
+        (select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 3) as DownVotes,
+        case 
+            when (select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 3) = 0 then null
+            else cast(
+                (select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 2) as double precision) / 
+                (select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 3)
+        end as UpDownRatio
+    from Posts p
+    where p.PostTypeId = 1 and p.CreationDate >= cast('2024-10-01' as date) - interval '180 days'
+),
+AnswerRanks as (
+    select 
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId,
+        a.Score,
+        a.CreationDate,
+        rank() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts a
+    where a.PostTypeId = 2
+),
+TopAnswers as (
+    select AnswerId, QuestionId, OwnerUserId, Score, CreationDate, AnswerRank
+    from AnswerRanks
+    where AnswerRank <= 2
+),
+QuestionWithAnswers as (
+    select 
+        qs.QuestionId,
+        qs.Title,
+        qs.OwnerUserId,
+        qs.CreationDate as QuestionCreation,
+        qs.Score as QuestionScore,
+        qs.ViewCount,
+        qs.Tags,
+        qs.AnswerCount,
+        qs.FavoriteCount,
+        qs.CommentCount,
+        qs.UpVotes,
+        qs.DownVotes,
+        qs.UpDownRatio,
+        ta.AnswerId,
+        ta.OwnerUserId as AnswerOwner,
+        ta.Score as AnswerScore,
+        ta.CreationDate as AnswerCreation,
+        ta.AnswerRank
+    from QuestionStats qs
+    left join TopAnswers ta on qs.QuestionId = ta.QuestionId
+),
+PostLinkSummary as (
+    select 
+        pl.PostId,
+        sum(case when lt.Name = 'Duplicate' then 1 else 0 end) as DuplicateLinks,
+        sum(case when lt.Name = 'Linked' then 1 else 0 end) as LinkedPosts
+    from PostLinks pl
+    join LinkTypes lt on pl.LinkTypeId = lt.Id
+    group by pl.PostId
+),
+QuestionsEnriched as (
+    select 
+        qwa.QuestionId,
+        qwa.Title,
+        qwa.OwnerUserId,
+        qwa.QuestionCreation,
+        qwa.QuestionScore,
+        qwa.ViewCount,
+        qwa.Tags,
+        qwa.AnswerCount,
+        qwa.FavoriteCount,
+        qwa.CommentCount,
+        qwa.UpVotes,
+        qwa.DownVotes,
+        qwa.UpDownRatio,
+        qwa.AnswerId,
+        qwa.AnswerOwner,
+        qwa.AnswerScore,
+        qwa.AnswerCreation,
+        qwa.AnswerRank,
+        pls.DuplicateLinks,
+        pls.LinkedPosts,
+        substring(qwa.Tags from '<([^>]+)>') as FirstTag,
+        case 
+            when qwa.AnswerCreation is not null then 
+                extract(epoch from (qwa.AnswerCreation - qwa.QuestionCreation))/3600.0
+            else null
+        end as HoursToTopAnswer
+    from QuestionWithAnswers qwa
+    left join PostLinkSummary pls on qwa.QuestionId = pls.PostId
+),
+FilteredQuestions as (
+    select * from QuestionsEnriched
+    where (AnswerCount > 0 or FavoriteCount > 5) and 
+          (DuplicateLinks is null or DuplicateLinks < 3) and
+          (HoursToTopAnswer is null or HoursToTopAnswer < 72)
+),
+CloseVotesCounts as (
+    select 
+        ph.PostId,
+        count(case when ph.PostHistoryTypeId = 10 then 1 end) as CloseVotes,
+        count(case when ph.PostHistoryTypeId = 11 then 1 end) as ReopenVotes
+    from PostHistory ph
+    group by ph.PostId
+),
+FinalSelection as (
+    select 
+        fq.QuestionId,
+        fq.Title,
+        fq.OwnerUserId,
+        u.DisplayName as OwnerName,
+        fq.QuestionCreation,
+        fq.QuestionScore,
+        fq.ViewCount,
+        fq.FirstTag,
+        fq.AnswerCount,
+        fq.FavoriteCount,
+        fq.CommentCount,
+        fq.UpVotes,
+        fq.DownVotes,
+        fq.UpDownRatio,
+        fq.AnswerId,
+        fq.AnswerOwner,
+        aown.DisplayName as AnswerOwnerName,
+        fq.AnswerScore,
+        fq.AnswerCreation,
+        fq.AnswerRank,
+        fq.DuplicateLinks,
+        fq.LinkedPosts,
+        fq.HoursToTopAnswer,
+        coalesce(cv.CloseVotes,0) as CloseVotes,
+        coalesce(cv.ReopenVotes,0) as ReopenVotes,
+        (select count(*) from Badges b where b.UserId = fq.OwnerUserId and b.Class = 1) as OwnerGoldBadges,
+        ('Q:' || coalesce(fq.Title,'') || ' | Tag:' || coalesce(fq.FirstTag,'') || ' | Score:' || cast(fq.QuestionScore as varchar)) as Summary
+    from FilteredQuestions fq
+    left join Users u on fq.OwnerUserId = u.Id
+    left join Users aown on fq.AnswerOwner = aown.Id
+    left join CloseVotesCounts cv on fq.QuestionId = cv.PostId
+)
+select *
+from FinalSelection
+group by
+    QuestionId,
+    Title,
+    OwnerUserId,
+    OwnerName,
+    QuestionCreation,
+    QuestionScore,
+    ViewCount,
+    FirstTag,
+    AnswerCount,
+    FavoriteCount,
+    CommentCount,
+    UpVotes,
+    DownVotes,
+    UpDownRatio,
+    AnswerId,
+    AnswerOwner,
+    AnswerOwnerName,
+    AnswerScore,
+    AnswerCreation,
+    AnswerRank,
+    DuplicateLinks,
+    LinkedPosts,
+    HoursToTopAnswer,
+    CloseVotes,
+    ReopenVotes,
+    OwnerGoldBadges,
+    Summary
+order by CloseVotes desc, OwnerGoldBadges desc, QuestionScore desc, AnswerScore desc
+limit 50;

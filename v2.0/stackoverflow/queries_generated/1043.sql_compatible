@@ -1,0 +1,158 @@
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.Views AS UserProfileViews,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsOwned,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersOwned,
+        MAX(P.CreationDate) AS LatestPostCreationDate,
+        AVG(CASE WHEN P.Score IS NOT NULL AND P.OwnerUserId IS NOT NULL THEN P.Score END) AS AvgOwnPostScore,
+        COUNT(B.Id) AS TotalBadgesAwarded,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadgesCount,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadgesCount,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadgesCount
+    FROM
+        Users U
+    LEFT JOIN
+        Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN
+        Comments C ON U.Id = C.UserId
+    LEFT JOIN
+        Badges B ON U.Id = B.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.Views
+    HAVING
+        COUNT(DISTINCT P.Id) > 5 AND U.Reputation > 1000 AND U.Views > 50
+),
+PostHistoricalMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        P.PostTypeId,
+        P.CreationDate AS PostCreationDate,
+        P.LastEditDate,
+        P.LastActivityDate,
+        P.ClosedDate,
+        P.CommunityOwnedDate,
+        COUNT(PH.Id) AS TotalHistoryEvents,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) AND PH.UserId = P.OwnerUserId THEN 1 ELSE 0 END) AS OwnerEditCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (10, 101, 102, 103, 104, 105) THEN 1 ELSE 0 END) AS CloseEvents,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenEvents,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (35, 36) THEN 1 ELSE 0 END) AS MigrationEvents,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (4,5,6,7,8,9) THEN PH.CreationDate END) AS LastContentEditDate,
+        MIN(CASE WHEN PH.PostHistoryTypeId IN (10,101,102,103,104,105) THEN PH.CreationDate END) AS FirstClosedDate
+    FROM
+        Posts P
+    LEFT JOIN
+        PostHistory PH ON P.Id = PH.PostId
+    WHERE
+        P.PostTypeId IN (1, 2)
+    GROUP BY
+        P.Id, P.OwnerUserId, P.PostTypeId, P.CreationDate, P.LastEditDate, P.LastActivityDate, P.ClosedDate, P.CommunityOwnedDate
+    HAVING
+        COUNT(PH.Id) > 0
+),
+PostLinkagesAndVotes AS (
+    SELECT
+        PQ.Id AS PostId,
+        PQ.OwnerUserId,
+        PQ.PostTypeId,
+        PQ.Score AS PostScore,
+        PQ.ViewCount,
+        PQ.FavoriteCount,
+        PQ.AnswerCount,
+        PQ.Title,
+        PQ.Tags,
+        SUM(CASE WHEN PV.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+        SUM(CASE WHEN PV.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived,
+        COUNT(PL.Id) AS TotalLinks,
+        SUM(CASE WHEN PL.LinkTypeId = 1 THEN 1 ELSE 0 END) AS LinkedFromThisPost,
+        SUM(CASE WHEN PL.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicatedThisPost,
+        COALESCE(AVG(CASE WHEN PA.Score IS NOT NULL AND PA.PostTypeId = 2 THEN PA.Score END), 0) AS AvgAnswerScoreForQuestion,
+        COUNT(DISTINCT PA.Id) AS NumberOfAnswersForQuestion
+    FROM
+        Posts PQ
+    LEFT JOIN
+        Votes PV ON PQ.Id = PV.PostId
+    LEFT JOIN
+        PostLinks PL ON PQ.Id = PL.PostId
+    LEFT JOIN
+        Posts PA ON PQ.Id = PA.ParentId AND PA.PostTypeId = 2
+    WHERE
+        PQ.PostTypeId IN (1, 2)
+    GROUP BY
+        PQ.Id, PQ.OwnerUserId, PQ.PostTypeId, PQ.Score, PQ.ViewCount, PQ.FavoriteCount, PQ.AnswerCount, PQ.Title, PQ.Tags
+)
+SELECT
+    UE.UserId,
+    UE.DisplayName,
+    UE.Reputation,
+    UE.TotalQuestionsOwned,
+    UE.TotalAnswersOwned,
+    UE.GoldBadgesCount,
+    UE.SilverBadgesCount,
+    PHM.PostId,
+    PHM.PostTypeId,
+    PLV.Title,
+    PLV.PostScore,
+    PLV.ViewCount,
+    PLV.UpVotesReceived,
+    PLV.DownVotesReceived,
+    PLV.TotalLinks,
+    PLV.LinkedFromThisPost,
+    PLV.DuplicatedThisPost,
+    PHM.OwnerEditCount,
+    PHM.CloseEvents,
+    PHM.ReopenEvents,
+    PHM.MigrationEvents,
+    PLV.AvgAnswerScoreForQuestion,
+    PLV.NumberOfAnswersForQuestion,
+    (PLV.UpVotesReceived - PLV.DownVotesReceived) AS NetVotes,
+    (EXTRACT(EPOCH FROM (COALESCE(PHM.LastContentEditDate, PHM.PostCreationDate) - PHM.PostCreationDate)) / (3600 * 24)) AS DaysSinceCreationToLastEdit,
+    COALESCE(NULLIF(PLV.FavoriteCount, 0), 0) AS NonZeroFavoriteCount,
+    CASE
+        WHEN PHM.ClosedDate IS NOT NULL AND PHM.ReopenEvents > 0 THEN 'Closed and Reopened'
+        WHEN PHM.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN PHM.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        WHEN PHM.MigrationEvents > 0 THEN 'Migrated'
+        ELSE 'Active'
+    END AS PostLifecycleStatus,
+    LENGTH(PLV.Title) AS TitleLength,
+    TRIM(BOTH '<>' FROM PLV.Tags) AS CleanedTagsString,
+    RANK() OVER (PARTITION BY UE.UserId ORDER BY PLV.PostScore DESC, PLV.ViewCount DESC) AS RankByUserPostScore,
+    NTILE(100) OVER (ORDER BY UE.Reputation DESC, UE.TotalPostsOwned DESC, UE.GoldBadgesCount DESC) AS UserInfluencePercentile,
+    LAG(PHM.PostCreationDate, 1, TIMESTAMP '1970-01-01 00:00:00') OVER (PARTITION BY UE.UserId ORDER BY PHM.PostCreationDate) AS PreviousPostCreationDateOfUser,
+    (SELECT COALESCE(AVG(C.Score), 0) FROM Comments C WHERE C.PostId = PHM.PostId AND C.CreationDate BETWEEN PHM.PostCreationDate AND PHM.LastActivityDate) AS AvgRelevantCommentScore,
+    (SELECT COALESCE(AVG(SubQ.PostScore), 0)
+     FROM PostLinkagesAndVotes SubQ
+     JOIN UserEngagement SubUE ON SubQ.OwnerUserId = SubUE.UserId
+     WHERE SubUE.Reputation BETWEEN UE.Reputation - 2500 AND UE.Reputation + 2500
+       AND SubQ.PostTypeId = PHM.PostTypeId
+       AND SubUE.UserId <> UE.UserId
+    ) AS AvgPostScoreInSimilarRepRange
+FROM
+    UserEngagement UE
+JOIN
+    PostHistoricalMetrics PHM ON UE.UserId = PHM.OwnerUserId
+JOIN
+    PostLinkagesAndVotes PLV ON PHM.PostId = PLV.PostId AND PHM.OwnerUserId = PLV.OwnerUserId
+WHERE
+    (
+        (PLV.PostTypeId = 1 AND PLV.AnswerCount > 0 AND PLV.AvgAnswerScoreForQuestion > 10 AND PLV.ViewCount > 5000)
+        OR
+        (PLV.PostTypeId = 2 AND PLV.UpVotesReceived > (PLV.DownVotesReceived * 2) AND PLV.PostScore > 20)
+    )
+    AND
+    PHM.OwnerEditCount > 1
+    AND
+    (PLV.Tags LIKE '%<sql>%' OR PLV.Tags LIKE '%<database>%' OR PLV.Tags LIKE '%<performance>%')
+    AND
+    PHM.CloseEvents = 0
+    AND
+    NOT EXISTS (SELECT 1 FROM Badges B WHERE B.UserId = UE.UserId AND B.Name IN ('Copy Editor', 'Reviewer'))
+ORDER BY
+    UE.Reputation DESC, NetVotes DESC, PHM.OwnerEditCount DESC, PLV.ViewCount DESC
+LIMIT 7500;

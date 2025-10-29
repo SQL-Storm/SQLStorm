@@ -1,0 +1,189 @@
+WITH
+  QuestionStats AS (
+    SELECT
+      p.Id AS QuestionId,
+      p.Title,
+      p.OwnerUserId,
+      p.CreationDate AS QuestionCreationDate,
+      p.Score AS QuestionScore,
+      p.AnswerCount,
+      p.FavoriteCount,
+      p.ViewCount AS QuestionViewCount,
+      COUNT(DISTINCT c.Id) AS CommentCountOnQuestion,
+      CASE
+        WHEN p.AcceptedAnswerId IS NOT NULL THEN 1
+        ELSE 0
+      END AS HasAcceptedAnswer,
+      AVG(a.Score) AS AverageAnswerScore,
+      MAX(a.Score) AS MaxAnswerScore,
+      COUNT(DISTINCT CASE WHEN a.OwnerUserId = p.OwnerUserId THEN a.Id END) AS AnswersByQuestionOwner,
+      ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS QuestionNumberForUser
+    FROM
+      Posts p
+    LEFT JOIN
+      Posts a
+      ON p.Id = a.ParentId AND a.PostTypeId = 2
+    LEFT JOIN
+      Comments c
+      ON p.Id = c.PostId
+    WHERE
+      p.PostTypeId = 1
+    GROUP BY
+      p.Id,
+      p.Title,
+      p.OwnerUserId,
+      p.CreationDate,
+      p.Score,
+      p.AnswerCount,
+      p.FavoriteCount,
+      p.ViewCount,
+      p.AcceptedAnswerId
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate AS UserCreationDate,
+      u.Views AS UserViews,
+      u.UpVotes AS UserUpVotes,
+      u.DownVotes AS UserDownVotes,
+      COUNT(DISTINCT b.Id) AS BadgeCount,
+      COUNT(DISTINCT ph.Id) AS PostHistoryCount,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesReceived,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesReceived,
+      MAX(qs.QuestionNumberForUser) AS MaxQuestionNumberForUser,
+      SUM(qs.AnswerCount) AS TotalAnswersGiven,
+      SUM(qs.QuestionScore) AS TotalQuestionScore,
+      AVG(qs.AverageAnswerScore) AS AvgAnswerScoreOnUserQuestions
+    FROM
+      Users u
+    LEFT JOIN
+      Badges b
+      ON u.Id = b.UserId
+    LEFT JOIN
+      PostHistory ph
+      ON u.Id = ph.UserId
+    LEFT JOIN
+      Votes v
+      ON u.Id = v.UserId AND v.VoteTypeId IN (2, 3)
+    LEFT JOIN
+      QuestionStats qs
+      ON u.Id = qs.OwnerUserId
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate,
+      u.Views,
+      u.UpVotes,
+      u.DownVotes
+  )
+SELECT
+  qs.QuestionId,
+  qs.Title AS QuestionTitle,
+  qs.QuestionCreationDate,
+  qs.QuestionScore,
+  qs.QuestionViewCount,
+  qs.FavoriteCount AS QuestionFavoriteCount,
+  qs.CommentCountOnQuestion,
+  qs.HasAcceptedAnswer,
+  qs.AverageAnswerScore,
+  qs.MaxAnswerScore,
+  qs.AnswersByQuestionOwner,
+  qs.OwnerUserId,
+  ua.UserId,
+  ua.DisplayName AS OwnerDisplayName,
+  ua.Reputation AS OwnerReputation,
+  ua.UserCreationDate AS OwnerCreationDate,
+  ua.BadgeCount AS OwnerBadgeCount,
+  ua.PostHistoryCount AS OwnerPostHistoryCount,
+  ua.TotalUpvotesReceived AS OwnerTotalUpvotesReceived,
+  ua.TotalDownvotesReceived AS OwnerTotalDownvotesReceived,
+  ua.TotalAnswersGiven AS OwnerTotalAnswersGiven,
+  ua.TotalQuestionScore AS OwnerTotalQuestionScore,
+  ua.AvgAnswerScoreOnUserQuestions AS OwnerAvgAnswerScoreOnUserQuestions,
+  COALESCE(ua.DisplayName, 'Unknown User') AS DisplayNameOrDefault,
+  CASE
+    WHEN ua.Reputation > 100000 THEN 'Legendary'
+    WHEN ua.Reputation > 50000 THEN 'Expert'
+    WHEN ua.Reputation > 10000 THEN 'Experienced'
+    WHEN ua.Reputation > 1000 THEN 'Intermediate'
+    ELSE 'Novice'
+  END AS ReputationTier,
+  CASE
+    WHEN qs.QuestionScore > 0 AND qs.AnswerCount > 0 THEN CAST(qs.QuestionScore AS DOUBLE PRECISION) / qs.AnswerCount
+    ELSE NULL
+  END AS ScorePerAnswerRatio,
+  SUBSTRING(qs.Title FROM 1 FOR 50) AS First50CharsOfTitle,
+  CASE
+    WHEN (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - qs.QuestionCreationDate) > INTERVAL '365 days' THEN 'Old'
+    WHEN (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - qs.QuestionCreationDate) > INTERVAL '30 days' THEN 'Medium'
+    ELSE 'New'
+  END AS QuestionAgeGroup,
+  (
+    SELECT
+      COUNT(*)
+    FROM
+      PostLinks pl
+    WHERE
+      pl.PostId = qs.QuestionId AND pl.LinkTypeId = 3
+  ) AS DuplicateLinkCount,
+  COALESCE(qs.FavoriteCount, 0) AS NonNullFavoriteCount,
+  qs.QuestionNumberForUser
+FROM
+  QuestionStats qs
+LEFT OUTER JOIN
+  UserActivity ua
+  ON qs.OwnerUserId = ua.UserId
+WHERE
+  (
+    qs.QuestionScore > 10
+    AND ua.Reputation > 500
+    AND qs.QuestionCreationDate < (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year')
+  )
+  OR (qs.QuestionId % 10 = 0)
+UNION
+SELECT
+  NULL AS QuestionId,
+  NULL AS QuestionTitle,
+  NULL AS QuestionCreationDate,
+  NULL AS QuestionScore,
+  NULL AS QuestionViewCount,
+  NULL AS QuestionFavoriteCount,
+  NULL AS CommentCountOnQuestion,
+  NULL AS HasAcceptedAnswer,
+  NULL AS AverageAnswerScore,
+  NULL AS MaxAnswerScore,
+  NULL AS AnswersByQuestionOwner,
+  NULL AS OwnerUserId,
+  ua.UserId,
+  ua.DisplayName AS OwnerDisplayName,
+  ua.Reputation AS OwnerReputation,
+  ua.UserCreationDate AS OwnerCreationDate,
+  ua.BadgeCount AS OwnerBadgeCount,
+  ua.PostHistoryCount AS OwnerPostHistoryCount,
+  ua.TotalUpvotesReceived AS OwnerTotalUpvotesReceived,
+  ua.TotalDownvotesReceived AS OwnerTotalDownvotesReceived,
+  ua.TotalAnswersGiven AS OwnerTotalAnswersGiven,
+  ua.TotalQuestionScore AS OwnerTotalQuestionScore,
+  ua.AvgAnswerScoreOnUserQuestions AS OwnerAvgAnswerScoreOnUserQuestions,
+  COALESCE(ua.DisplayName, 'Unknown User') AS DisplayNameOrDefault,
+  CASE
+    WHEN ua.Reputation > 100000 THEN 'Legendary'
+    WHEN ua.Reputation > 50000 THEN 'Expert'
+    WHEN ua.Reputation > 10000 THEN 'Experienced'
+    WHEN ua.Reputation > 1000 THEN 'Intermediate'
+    ELSE 'Novice'
+  END AS ReputationTier,
+  NULL AS ScorePerAnswerRatio,
+  NULL AS First50CharsOfTitle,
+  NULL AS QuestionAgeGroup,
+  NULL AS DuplicateLinkCount,
+  0 AS NonNullFavoriteCount,
+  ua.MaxQuestionNumberForUser
+FROM
+  UserActivity ua
+WHERE
+  ua.Reputation < 100
+  AND ua.UserCreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6 months');

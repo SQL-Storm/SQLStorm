@@ -1,0 +1,115 @@
+with RecursiveTagCounts as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        coalesce(p.AnswerCount, 0) as AnswerCount,
+        coalesce(p.ViewCount, 0) as TotalViews,
+        row_number() over (order by t.Count desc, t.TagName) as RankByCount
+    from Tags t
+    left join Posts p on p.Id = t.ExcerptPostId and p.PostTypeId = 1
+),
+UserBadgeStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct b.Id) as BadgeCount,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+LatestAnswerStats as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.CreationDate as AnswerCreation,
+        a.OwnerUserId,
+        a.Score as AnswerScore,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as RankHighestScore
+    from Posts a
+    join Posts p on p.Id = a.ParentId and p.PostTypeId = 1
+    where a.PostTypeId = 2
+),
+QuestionActivityWindow as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score as QuestionScore,
+        count(distinct c.Id) as CommentCount,
+        coalesce(q.AnswerCount, 0) as AnswerCount,
+        sum(case when vt.Name = 'UpMod' then 1 when vt.Name = 'DownMod' then -1 else 0 end) over (partition by q.Id order by v.CreationDate rows between unbounded preceding and current row) as CumulativeVotes,
+        max(coalesce(v.CreationDate, q.CreationDate)) over (partition by q.Id) as LastVoteDate,
+        row_number() over (order by q.Score desc, q.ViewCount desc) as RowNum,
+        q.ViewCount
+    from Posts q
+    left join Comments c on c.PostId = q.Id
+    left join Votes v on v.PostId = q.Id
+    left join VoteTypes vt on vt.Id = v.VoteTypeId
+    where q.PostTypeId = 1 and q.ClosedDate is null
+    group by q.Id, q.Title, q.CreationDate, q.Score, q.AnswerCount, q.ViewCount
+)
+select
+    qaw.QuestionId,
+    qaw.Title,
+    ubs.DisplayName as QuestionOwner,
+    qaw.CreationDate as QuestionCreated,
+    qaw.QuestionScore,
+    qaw.ViewCount,
+    qaw.AnswerCount,
+    qaw.CommentCount,
+    qaw.CumulativeVotes,
+    rc.TagName,
+    rc.Count as TagGlobalCount,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    las.AnswerId as HighestScoreAnswerId,
+    las.AnswerScore,
+    ubla.DisplayName as HighestScoreAnswerOwner,
+    qb.CloseReason,
+    case
+        when qaw.AnswerCount = 0 then 'No Answers'
+        when qaw.AnswerCount > 0 and las.AnswerScore < 0 then 'Negative Scoring Top Answer'
+        else 'Healthy Engagement'
+    end as EngagementCategory
+from QuestionActivityWindow qaw
+left join Posts q on q.Id = qaw.QuestionId
+left join PostLinks pl on pl.PostId = q.Id and pl.LinkTypeId = 3
+left join CloseReasonTypes crt on crt.Id = (
+    select cast(ph.Comment as integer)
+    from PostHistory ph
+    where ph.PostId = q.Id and ph.PostHistoryTypeId = 10
+    order by ph.CreationDate desc
+    limit 1
+)
+left join RecursiveTagCounts rc on rc.Id = (
+    select min(tg.Id)
+    from Tags tg
+    where q.Tags is not null
+      and tg.TagName = any(string_to_array(substring(q.Tags,2,length(q.Tags)-2), '><'))
+)
+left join Users ubs on ubs.Id = q.OwnerUserId
+left join UserBadgeStats ubla on ubla.UserId = (
+    select aa.OwnerUserId
+    from LatestAnswerStats aa
+    where aa.QuestionId = q.Id and aa.RankHighestScore = 1
+    limit 1
+)
+left join LatestAnswerStats las on las.QuestionId = q.Id and las.RankHighestScore = 1
+left join (
+    select pl.RelatedPostId as QuestionId,
+           string_agg(distinct crt.Name, ', ') as CloseReason
+    from PostLinks pl
+    join Posts p2 on p2.Id = pl.PostId
+    join PostHistory ph on ph.PostId = pl.PostId and ph.PostHistoryTypeId = 10
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where p2.PostTypeId = 1
+    group by pl.RelatedPostId
+) qb on qb.QuestionId = q.Id
+where qaw.RowNum <= 100
+order by qaw.QuestionScore desc, qaw.CumulativeVotes desc;

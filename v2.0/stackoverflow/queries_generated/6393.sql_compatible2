@@ -1,0 +1,86 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.Title,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.LastActivityDate,
+        P.OwnerUserId,
+        U.DisplayName,
+        U.Reputation,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.ViewCount DESC) AS Rank
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId IN (1, 2) AND P.Score > 0
+),
+BadgeCounts AS (
+    SELECT 
+        U.Id AS UserId,
+        COUNT(DISTINCT B.Id) AS BadgeCount
+    FROM 
+        Users U
+    LEFT JOIN 
+        Badges B ON U.Id = B.UserId
+    GROUP BY 
+        U.Id
+)
+SELECT 
+    R.Id AS PostId,
+    R.Title,
+    R.Score,
+    R.ViewCount,
+    R.CreationDate,
+    R.LastActivityDate,
+    R.Rank,
+    R.OwnerUserId,
+    U.DisplayName,
+    U.Reputation,
+    COALESCE(B.BadgeCount, 0) AS BadgeCount,
+    SUM(V.Score) AS TotalVotes,
+    CASE 
+        WHEN P.ParentId IS NOT NULL THEN 'Answer'
+        ELSE 'Question'
+    END AS PostType,
+    CASE 
+        WHEN P.Score > 100 THEN 'High'
+        ELSE 'Low'
+    END AS ScoreTier,
+    CASE 
+        WHEN U.Reputation > 1000 THEN 'HighReputation'
+        ELSE 'LowReputation'
+    END AS ReputationTier
+FROM 
+    RankedPosts R
+LEFT JOIN 
+    Users U ON R.OwnerUserId = U.Id
+LEFT JOIN 
+    BadgeCounts B ON R.OwnerUserId = B.UserId
+LEFT JOIN 
+    Votes V ON R.Id = V.PostId
+LEFT JOIN 
+    Posts P ON R.Id = P.Id
+WHERE 
+    (R.Rank <= 10 OR R.Score > 1000)
+    AND U.Reputation IS NOT NULL
+GROUP BY 
+    R.Id,
+    R.Title,
+    R.Score,
+    R.ViewCount,
+    R.CreationDate,
+    R.LastActivityDate,
+    R.Rank,
+    R.OwnerUserId,
+    U.DisplayName,
+    U.Reputation,
+    B.BadgeCount,
+    P.ParentId,
+    P.Score
+HAVING 
+    COUNT(V.Id) > 5
+ORDER BY 
+    R.Score DESC, R.ViewCount DESC;

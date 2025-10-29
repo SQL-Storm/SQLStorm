@@ -1,0 +1,130 @@
+WITH 
+UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id)                                   AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END)      AS Questions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END)      AS Answers,
+        COALESCE(SUM(v.UpVotes),0) - COALESCE(SUM(v.DownVotes),0) AS NetScore,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Posts p               ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT 
+            v.PostId,
+            SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes v
+        JOIN VoteTypes vt            ON vt.Id = v.VoteTypeId
+        GROUP BY v.PostId
+    ) v                           ON v.PostId = p.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopTags AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS rn
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0
+),
+UserTagActivity AS (
+    SELECT 
+        us.Id                                            AS UserId,
+        STRING_AGG(DISTINCT tt.TagName, ',') 
+            FILTER (WHERE tt.rn <= 10)                  AS Top10Tags,
+        COUNT(DISTINCT ph.Id)                           AS TagEdits
+    FROM UserStats us
+    LEFT JOIN Posts p                                 ON p.OwnerUserId = us.Id
+    LEFT JOIN LATERAL (
+        SELECT UNNEST(STRING_TO_ARRAY(BTRIM(BOTH '<>' FROM p.Tags), '><')) AS Tag
+    ) pt                                            ON true
+    LEFT JOIN Tags t                                 ON t.TagName = pt.Tag
+    LEFT JOIN PostHistory ph 
+        ON ph.PostId = p.Id 
+       AND ph.PostHistoryTypeId = 6
+    LEFT JOIN TopTags tt                             ON tt.TagName = t.TagName
+    GROUP BY us.Id
+),
+RecentClosedQuestions AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        ph.CreationDate                                   AS ClosedDate,
+        CAST(ph.Comment AS INTEGER)                       AS CloseReasonId,
+        cr.Name                                           AS CloseReason,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId 
+                           ORDER BY ph.CreationDate DESC) AS rn,
+        p.OwnerUserId
+    FROM Posts p
+    JOIN PostHistory ph 
+        ON ph.PostId = p.Id 
+       AND ph.PostHistoryTypeId = 10
+    LEFT JOIN CloseReasonTypes cr 
+        ON cr.Id = CAST(ph.Comment AS INTEGER)
+    WHERE p.PostTypeId = 1
+),
+Combined AS (
+    SELECT
+        us.Id,
+        us.DisplayName,
+        us.Reputation,
+        us.TotalPosts,
+        us.Questions,
+        us.Answers,
+        us.NetScore,
+        us.GoldBadges,
+        us.SilverBadges,
+        us.BronzeBadges,
+        uta.Top10Tags,
+        uta.TagEdits,
+        rcq.Title            AS LastClosedQuestionTitle,
+        rcq.CloseReason,
+        rcq.ClosedDate
+    FROM UserStats us
+    LEFT JOIN UserTagActivity uta     ON uta.UserId = us.Id
+    LEFT JOIN RecentClosedQuestions rcq 
+        ON rcq.rn = 1 
+       AND rcq.OwnerUserId = us.Id
+)
+SELECT *
+FROM (
+    SELECT *
+    FROM Combined
+    WHERE 
+          Reputation > 10000
+       OR NetScore   > 5000
+       OR GoldBadges > 0
+       OR EXISTS (
+             SELECT 1 
+             FROM Posts p
+             WHERE p.OwnerUserId = Combined.Id
+               AND p.PostTypeId = 2
+               AND p.Score > 100
+           )
+    ORDER BY Reputation DESC, NetScore DESC
+    OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY
+) t
+UNION ALL
+SELECT 
+    NULL AS Id,
+    NULL AS DisplayName,
+    NULL AS Reputation,
+    NULL AS TotalPosts,
+    NULL AS Questions,
+    NULL AS Answers,
+    NULL AS NetScore,
+    NULL AS GoldBadges,
+    NULL AS SilverBadges,
+    NULL AS BronzeBadges,
+    NULL AS Top10Tags,
+    NULL AS TagEdits,
+    NULL AS LastClosedQuestionTitle,
+    NULL AS CloseReason,
+    NULL AS ClosedDate
+WHERE FALSE;

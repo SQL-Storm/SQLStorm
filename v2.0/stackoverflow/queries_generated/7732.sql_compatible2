@@ -1,0 +1,346 @@
+WITH PostStats AS (
+    SELECT 
+        p.Id as PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.Body,
+        p.LastActivityDate,
+        u.Reputation as OwnerReputation,
+        u.DisplayName as OwnerDisplayName,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            WHEN p.PostTypeId = 4 THEN 'TagWikiExcerpt'
+            WHEN p.PostTypeId = 5 THEN 'TagWiki'
+            WHEN p.PostTypeId = 6 THEN 'ModeratorNomination'
+            WHEN p.PostTypeId = 7 THEN 'WikiPlaceholder'
+            WHEN p.PostTypeId = 8 THEN 'PrivilegeWiki'
+            ELSE 'Unknown'
+        END as PostTypeName,
+        COALESCE(p.AcceptedAnswerId, 0) as AcceptedAnswerId,
+        COALESCE(p.ParentId, 0) as ParentId,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND LENGTH(TRIM(p.Tags)) > 0 
+            THEN CARDINALITY(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><')) 
+            ELSE 0 
+        END as TagCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as UserPostRank,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) as ScoreRank,
+        RANK() OVER (ORDER BY p.ViewCount DESC) as ViewRank,
+        PERCENT_RANK() OVER (ORDER BY p.CreationDate) as CreationPercentile,
+        LAG(p.Score, 1) OVER (ORDER BY p.CreationDate) as PrevScore,
+        LEAD(p.Score, 1) OVER (ORDER BY p.CreationDate) as NextScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING) as MovingAvgScore,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL 
+            THEN 1 
+            ELSE 0 
+        END as HasAcceptedAnswer,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 
+            THEN 1 
+            ELSE 0 
+        END as HasAnswers,
+        CASE 
+            WHEN p.CommentCount > 0 
+            THEN 1 
+            ELSE 0 
+        END as HasComments,
+        CASE 
+            WHEN p.FavoriteCount > 0 
+            THEN 1 
+            ELSE 0 
+        END as HasFavorites,
+        CASE 
+            WHEN p.Score > 0 AND p.ViewCount > 0 
+            THEN p.Score * 1.0 / p.ViewCount 
+            ELSE 0 
+        END as ScorePerView,
+        CASE 
+            WHEN p.PostTypeId = 1 
+            THEN EXTRACT(DAY FROM (COALESCE(p.ClosedDate, CAST('2024-10-01 12:34:56' AS timestamp)) - p.CreationDate)) 
+            ELSE 0 
+        END as DaysToCloseOrCurrent,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 
+            THEN 
+                (SELECT AVG(a.Score) 
+                 FROM Posts a 
+                 WHERE a.ParentId = p.Id 
+                 AND a.PostTypeId = 2 
+                 AND a.Score IS NOT NULL) 
+            ELSE NULL 
+        END as AvgAnswerScore,
+        CASE 
+            WHEN p.PostTypeId = 1 
+            THEN 
+                (SELECT COUNT(*) 
+                 FROM Votes v 
+                 WHERE v.PostId = p.Id 
+                 AND v.VoteTypeId = 5) 
+            ELSE 0 
+        END as FavoriteCountByVotes,
+        REGEXP_REPLACE(p.Title, '[^a-zA-Z0-9\\s]', '', 'g') as CleanTitle
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.CreationDate >= TIMESTAMP '2010-01-01' 
+    AND p.PostTypeId IN (1, 2) 
+    AND (p.Score >= 0 OR p.Score IS NULL)
+),
+RankedPosts AS (
+    SELECT 
+        ps.*,
+        CASE 
+            WHEN ScoreRank <= 100 THEN 'Top 100'
+            WHEN ScoreRank <= 1000 THEN 'Top 1000'
+            WHEN ScoreRank <= 10000 THEN 'Top 10000'
+            ELSE 'Below 10k'
+        END as ScoreTier,
+        CASE 
+            WHEN ViewRank <= 100 THEN 'Most Viewed Top 100'
+            WHEN ViewRank <= 1000 THEN 'Most Viewed Top 1000'
+            WHEN ViewRank <= 10000 THEN 'Most Viewed Top 10000'
+            ELSE 'Below 10k Viewed'
+        END as ViewTier,
+        CASE 
+            WHEN UserPostRank = 1 THEN 'Most Recent Post'
+            WHEN UserPostRank = 2 THEN 'Second Most Recent Post'
+            ELSE 'Other Post'
+        END as PostOrder,
+        COALESCE(
+            (SELECT COUNT(DISTINCT bh.UserId) 
+             FROM PostHistory bh 
+             WHERE bh.PostId = ps.PostId 
+             AND bh.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 7, 8, 9)
+            ), 0) as EditCount,
+        COALESCE(
+            (SELECT COUNT(*)
+             FROM Comments c
+             WHERE c.PostId = ps.PostId
+             AND c.Score > 0
+            ), 0) as PositiveComments,
+        CASE 
+            WHEN ABS(ps.Score - COALESCE(ps.PrevScore, ps.Score)) > 10 THEN 'High Score Change'
+            WHEN ABS(ps.Score - COALESCE(ps.NextScore, ps.Score)) > 10 THEN 'High Score Change'
+            ELSE 'Stable Score'
+        END as ScoreChangeType,
+        CASE 
+            WHEN (ps.Score - COALESCE(ps.MovingAvgScore, ps.Score)) > 50 THEN 'Above Moving Average'
+            WHEN (ps.Score - COALESCE(ps.MovingAvgScore, ps.Score)) < -50 THEN 'Below Moving Average'
+            ELSE 'Near Moving Average'
+        END as ScoreDeviation,
+        (SELECT COUNT(*) 
+         FROM Badges b 
+         WHERE b.UserId = ps.OwnerUserId 
+         AND b.Date >= TIMESTAMP '2010-01-01'
+         AND b.Class = 1) as GoldBadgesCount,
+        COALESCE(
+            (SELECT MIN(CreationDate)
+             FROM PostHistory ph
+             WHERE ph.PostId = ps.PostId 
+             AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)
+            ), ps.CreationDate) as FirstEditDate,
+        COALESCE(
+            (SELECT MAX(CreationDate)
+             FROM PostHistory ph
+             WHERE ph.PostId = ps.PostId 
+             AND ph.PostHistoryTypeId IN (10, 11, 12, 13)
+            ), TIMESTAMP '1900-01-01') as LastImportantActionDate
+    FROM PostStats ps
+),
+AggregatedResults AS (
+    SELECT 
+        rp.PostId,
+        rp.PostTypeName,
+        rp.OwnerUserId,
+        rp.OwnerReputation,
+        rp.OwnerDisplayName,
+        rp.Score,
+        rp.ViewCount,
+        rp.AnswerCount,
+        rp.CommentCount,
+        rp.FavoriteCount,
+        rp.Title,
+        rp.Tags,
+        rp.TagCount,
+        rp.ScorePerView,
+        rp.DaysToCloseOrCurrent,
+        rp.AvgAnswerScore,
+        rp.FavoriteCountByVotes,
+        rp.EditCount,
+        rp.PositiveComments,
+        rp.ScoreTier,
+        rp.ViewTier,
+        rp.PostOrder,
+        rp.ScoreChangeType,
+        rp.ScoreDeviation,
+        rp.GoldBadgesCount,
+        rp.FirstEditDate,
+        rp.LastImportantActionDate,
+        rp.CreationPercentile,
+        rp.UserPostRank,
+        rp.ScoreRank,
+        rp.ViewRank,
+        rp.MovingAvgScore,
+        rp.HasAcceptedAnswer,
+        rp.HasAnswers,
+        rp.HasComments,
+        rp.HasFavorites,
+        rp.CleanTitle,
+        CASE 
+            WHEN rp.OwnerReputation > 100000 THEN 'Legendary'
+            WHEN rp.OwnerReputation > 10000 THEN 'Master'
+            WHEN rp.OwnerReputation > 1000 THEN 'Expert'
+            WHEN rp.OwnerReputation > 100 THEN 'Novice'
+            ELSE 'Newbie'
+        END as UserReputationLevel,
+        CASE 
+            WHEN rp.TagCount > 5 THEN 'Rich Tagged'
+            WHEN rp.TagCount > 2 THEN 'Moderate Tagged'
+            WHEN rp.TagCount > 0 THEN 'Light Tagged'
+            ELSE 'Untagged'
+        END as TagLevel,
+        CASE 
+            WHEN rp.Score >= 1000 THEN 'Virtuoso'
+            WHEN rp.Score >= 100 THEN 'Expert'
+            WHEN rp.Score >= 10 THEN 'Intermediate'
+            WHEN rp.Score >= 1 THEN 'Novice'
+            ELSE 'Beginner'
+        END as PostScoreLevel,
+        CASE 
+            WHEN rp.ViewCount >= 10000 THEN 'Viral'
+            WHEN rp.ViewCount >= 1000 THEN 'Popular'
+            WHEN rp.ViewCount >= 100 THEN 'Notable'
+            WHEN rp.ViewCount >= 10 THEN 'Moderate'
+            ELSE 'Low'
+        END as ViewLevel,
+        CASE 
+            WHEN rp.CommentCount >= 50 THEN 'Very Active'
+            WHEN rp.CommentCount >= 20 THEN 'Active'
+            WHEN rp.CommentCount >= 10 THEN 'Moderate'
+            WHEN rp.CommentCount >= 5 THEN 'Low Activity'
+            ELSE 'Minimal'
+        END as CommentActivityLevel,
+        CASE 
+            WHEN rp.FavoriteCount >= 50 THEN 'Highly Favorited'
+            WHEN rp.FavoriteCount >= 20 THEN 'Favorited'
+            WHEN rp.FavoriteCount >= 10 THEN 'Moderately Favorited'
+            WHEN rp.FavoriteCount >= 5 THEN 'Slightly Favorited'
+            ELSE 'Not Favorited'
+        END as FavoriteLevel,
+        CASE 
+            WHEN ABS(rp.Score - rp.MovingAvgScore) >= 100 THEN 'Extreme Deviation'
+            WHEN ABS(rp.Score - rp.MovingAvgScore) >= 50 THEN 'Significant Deviation'
+            WHEN ABS(rp.Score - rp.MovingAvgScore) >= 10 THEN 'Minor Deviation'
+            ELSE 'Minimal Deviation'
+        END as DeviationLevel,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = rp.PostId AND v.VoteTypeId IN (2, 3)) as TotalVotes,
+        (SELECT MAX(bh.PostHistoryTypeId) FROM PostHistory bh 
+         WHERE bh.PostId = rp.PostId 
+         AND bh.PostHistoryTypeId IN (10, 11, 12, 13)) as LatestImportantAction,
+        EXTRACT(EPOCH FROM (rp.LastImportantActionDate - rp.FirstEditDate)) / 86400 as DaysBetweenFirstAndLastAction,
+        INITCAP(SUBSTRING(rp.Body FROM 1 FOR 50)) as BodyPreview,
+        CASE 
+            WHEN rp.Body LIKE '%<code>%'
+                 OR rp.Body LIKE '%</code>%' THEN 'ContainsCode'
+            WHEN rp.Body LIKE '%<pre>%' THEN 'ContainsPreformatted'
+            ELSE 'NoCode'
+        END as CodePresence,
+        COALESCE(rp.CleanTitle, 'No Title') as FinalTitle,
+        DENSE_RANK() OVER (ORDER BY rp.ScorePerView DESC, rp.ViewCount DESC) as CombinedRank,
+        rp.CreationDate
+    FROM RankedPosts rp
+)
+SELECT 
+    ar.PostId,
+    ar.PostTypeName,
+    ar.OwnerDisplayName,
+    ar.Score,
+    ar.ViewCount,
+    ar.AnswerCount,
+    ar.CommentCount,
+    ar.FavoriteCount,
+    ar.Title,
+    ar.Tags,
+    ar.TagCount,
+    ar.ScorePerView,
+    ar.DaysToCloseOrCurrent,
+    ar.AvgAnswerScore,
+    ar.FavoriteCountByVotes,
+    ar.EditCount,
+    ar.PositiveComments,
+    ar.ScoreTier,
+    ar.ViewTier,
+    ar.PostOrder,
+    ar.ScoreChangeType,
+    ar.ScoreDeviation,
+    ar.GoldBadgesCount,
+    ar.FirstEditDate,
+    ar.LastImportantActionDate,
+    ar.CreationPercentile,
+    ar.UserPostRank,
+    ar.ScoreRank,
+    ar.ViewRank,
+    ar.MovingAvgScore,
+    ar.HasAcceptedAnswer,
+    ar.HasAnswers,
+    ar.HasComments,
+    ar.HasFavorites,
+    ar.UserReputationLevel,
+    ar.TagLevel,
+    ar.PostScoreLevel,
+    ar.ViewLevel,
+    ar.CommentActivityLevel,
+    ar.FavoriteLevel,
+    ar.DeviationLevel,
+    ar.TotalVotes,
+    ar.LatestImportantAction,
+    ar.DaysBetweenFirstAndLastAction,
+    ar.BodyPreview,
+    ar.CodePresence,
+    ar.FinalTitle,
+    ar.CombinedRank,
+    (SELECT COUNT(*) FROM (VALUES (1), (2), (3)) AS t(n)) as DummyUnionCount,
+    CASE 
+        WHEN ar.Score IS NULL THEN 'NULL Score'
+        WHEN ar.Score = 0 THEN 'Zero Score'
+        WHEN ar.Score > 100 THEN 'High Score'
+        ELSE 'Regular Score'
+    END as ScoreClassification,
+    (SELECT COUNT(*) FROM (
+        SELECT 'test1' UNION SELECT 'test2' UNION SELECT 'test3'
+    ) t) as SetOperationCount,
+    (ar.Score * ar.ViewCount) / NULLIF(ar.AnswerCount + 1, 0) as ScoreViewAnswerRatio,
+    ROW_NUMBER() OVER (PARTITION BY ar.OwnerUserId ORDER BY ar.Score DESC, ar.CreationDate DESC) as RankPerUser,
+    AVG(ar.Score) OVER (ORDER BY ar.ViewCount ROWS BETWEEN 10 PRECEDING AND 10 FOLLOWING) as ScoreMovingAvgByViews,
+    CASE WHEN 
+        (ar.Score > 100 OR ar.ViewCount > 1000 OR ar.CommentCount > 10 OR ar.AnswerCount > 5)
+        AND ar.HasAnswers = 1
+        AND ar.PostTypeName = 'Question'
+    THEN 1 ELSE 0 END as HighImpactPost
+FROM AggregatedResults ar
+WHERE 
+    ar.OwnerReputation > 100 
+    AND (ar.Score IS NOT NULL OR ar.ViewCount IS NOT NULL)
+    AND ar.PostScoreLevel IN ('Virtuoso', 'Expert', 'Intermediate')
+    AND (ar.ViewLevel = 'Viral' OR ar.ViewLevel = 'Popular')
+    AND ar.TagLevel IN ('Rich Tagged', 'Moderate Tagged')
+    AND ar.FavoriteLevel IN ('Highly Favorited', 'Favorited')
+    AND ar.DeviationLevel IN ('Extreme Deviation', 'Significant Deviation')
+    AND ar.ScoreClassification IN ('High Score', 'Regular Score')
+    AND ar.LatestImportantAction IS NOT NULL
+    AND ar.HasAnswers = 1
+    AND ar.HasComments = 1
+    AND ar.HasAcceptedAnswer = 1
+    AND ar.HasFavorites = 1
+ORDER BY ar.Score DESC, ar.ViewCount DESC, ar.CreationPercentile DESC
+LIMIT 1000;

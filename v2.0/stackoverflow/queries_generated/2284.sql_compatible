@@ -1,0 +1,221 @@
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        array[t.Id] as PathIds
+    from Tags t
+    where t.IsModeratorOnly = false and t.IsRequired = false
+
+    union all
+
+    select
+        c.Id,
+        c.TagName,
+        c.Count,
+        r.PathIds || c.Id
+    from Tags c
+    join RecursiveTagHierarchy r on c.Id <> all(r.PathIds)
+    where c.IsModeratorOnly = false and c.IsRequired = false and c.Count < r.Count
+),
+
+LatestUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        max(ph.CreationDate) as LastEditDate,
+        max(c.CreationDate) as LastCommentDate,
+        max(v.CreationDate) as LastVoteDate
+    from Users u
+    left join PostHistory ph on ph.UserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+
+PostScoresWithRank as (
+    select
+        p.Id as PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        rank() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc) as PostRank,
+        dense_rank() over (order by p.PostTypeId) as PostTypeRank
+    from Posts p
+    where p.PostTypeId in (1, 2)
+),
+
+AnswersWithAcceptedFlag as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        case when q.AcceptedAnswerId = a.Id then 1 else 0 end as IsAccepted,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreationDate,
+        u.DisplayName as AnswerOwner,
+        p.Score as QuestionScore,
+        p.ViewCount as QuestionViews,
+        p.Tags
+    from Posts a
+    join Posts q on q.Id = a.ParentId and q.PostTypeId = 1
+    left join Users u on u.Id = a.OwnerUserId
+    left join Posts p on p.Id = q.Id
+    where a.PostTypeId = 2
+),
+
+UserBadgeCounts as (
+    select
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges
+    from Badges b
+    group by b.UserId
+),
+
+UserEngagementScores as (
+    select
+        u.Id as UserId,
+        coalesce(bc.GoldBadges,0) * 3 + coalesce(bc.SilverBadges,0) * 2 + coalesce(bc.BronzeBadges,0) as BadgeScore,
+        greatest(u.Reputation / nullif(u.Views,0), 0) as ReputationPerView,
+        greatest(u.UpVotes - u.DownVotes, 0) as NetVotes,
+        greatest(extract(epoch from (timestamp '2024-10-01 12:34:56' - u.CreationDate)) / 86400, 1) as DaysActive,
+        u.Reputation
+    from Users u
+    left join UserBadgeCounts bc on bc.UserId = u.Id
+),
+
+FilteredPosts as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Tags,
+        substring(p.Title from '([A-Za-z0-9 ]+)') as CleanTitle,
+        regexp_replace(p.Body, '<[^>]*>', '', 'g') as BodyText
+    from Posts p
+    where p.PostTypeId in (1, 2)
+      and p.Score > (select avg(Score) from Posts where PostTypeId = p.PostTypeId)
+),
+
+HighEngagementUsers as (
+    select
+        u.UserId,
+        u.BadgeScore,
+        u.ReputationPerView,
+        u.NetVotes,
+        u.DaysActive,
+        u.Reputation
+    from UserEngagementScores u
+    where u.BadgeScore > 10 and u.Reputation > 1000 and u.NetVotes > 0
+),
+
+UserRecentPosts as (
+    select distinct on (p.OwnerUserId)
+        p.OwnerUserId,
+        p.Id as RecentPostId,
+        p.CreationDate as RecentPostDate,
+        p.Score as RecentPostScore
+    from Posts p
+    join HighEngagementUsers h on h.UserId = p.OwnerUserId
+    order by p.OwnerUserId, p.CreationDate desc
+),
+
+QuestionAnswerSummary as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.CreationDate as QuestionDate,
+        count(a.Id) as AnswerCount,
+        avg(a.Score) filter (where a.Score is not null) as AvgAnswerScore,
+        max(a.Score) filter (where a.Score is not null) as MaxAnswerScore,
+        sum(case when a.Id = q.AcceptedAnswerId then 1 else 0 end) as HasAcceptedAnswer
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.Score, q.ViewCount, q.CreationDate
+),
+
+PostCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReason,
+        count(*) as CloseVotes
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where ph.PostHistoryTypeId = 10
+    group by ph.PostId, crt.Name
+),
+
+FinalAggregate as (
+    select
+        f.Id as PostId,
+        f.PostTypeId,
+        f.OwnerUserId,
+        f.Title,
+        f.Score,
+        f.ViewCount,
+        f.CreationDate,
+        u.DisplayName as OwnerName,
+        e.BadgeScore,
+        e.ReputationPerView,
+        coalesce(cs.CloseReason, 'Open') as CloseReason,
+        f.Tags,
+        left(f.Title, 30) || coalesce(' [' || cs.CloseReason || ']', '') as AnnotatedTitle,
+        dense_rank() over (partition by f.PostTypeId order by f.Score desc nulls last) as ScoreRank,
+        row_number() over (partition by f.OwnerUserId order by f.Score desc, f.ViewCount desc) as OwnerPostRank
+    from FilteredPosts f
+    left join Users u on u.Id = f.OwnerUserId
+    left join UserEngagementScores e on e.UserId = f.OwnerUserId
+    left join PostCloseReasons cs on cs.PostId = f.Id
+    where f.Tags is not null
+)
+
+select
+    f.PostId,
+    f.PostTypeId,
+    f.OwnerUserId,
+    concat_ws(' ', f.AnnotatedTitle, '(', coalesce(f.Tags, ''), ')') as PostSummary,
+    f.Score,
+    f.ViewCount,
+    f.CreationDate,
+    f.OwnerName,
+    f.BadgeScore,
+    f.ReputationPerView,
+    f.CloseReason,
+    f.ScoreRank,
+    f.OwnerPostRank,
+    rs.PostRank as UserPostScoreRank,
+    rs.PostTypeRank,
+    ph.TotalPostHistories,
+    ph.TotalCloseVotes,
+    ph.LastPostHistoryDate,
+    coalesce(a.AnswerCount,0) as AnswerCount,
+    coalesce(a.AvgAnswerScore,0) as AvgAnswerScore,
+    coalesce(a.MaxAnswerScore,0) as MaxAnswerScore,
+    coalesce(a.HasAcceptedAnswer,0) as HasAcceptedAnswer
+from FinalAggregate f
+left join PostScoresWithRank rs on rs.PostId = f.PostId
+left join (
+    select
+        ph.PostId,
+        count(*) as TotalPostHistories,
+        sum(case when ph.PostHistoryTypeId = 10 then 1 else 0 end) as TotalCloseVotes,
+        max(ph.CreationDate) as LastPostHistoryDate
+    from PostHistory ph
+    group by ph.PostId
+) ph on ph.PostId = f.PostId
+left join QuestionAnswerSummary a on a.QuestionId = f.PostId and f.PostTypeId = 1
+where
+    f.Score > 5
+    and (f.BadgeScore > 20 or f.ReputationPerView > 0.1)
+order by f.ScoreRank, f.OwnerPostRank
+limit 100;

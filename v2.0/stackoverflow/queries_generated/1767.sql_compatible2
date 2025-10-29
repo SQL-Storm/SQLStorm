@@ -1,0 +1,231 @@
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.WebsiteUrl,
+        U.Location,
+        U.AboutMe,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestionsOwned,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswersOwned,
+        SUM(COALESCE(P.Score, 0)) AS TotalPostScoreOwned,
+        AVG(COALESCE(P.ViewCount, 0)) AS AvgPostViewCountOwned,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        SUM(COALESCE(C.Score, 0)) AS TotalCommentScoreMade,
+        COUNT(DISTINCT AcceptedAnswers.Id) AS TotalAcceptedAnswersProvided,
+        (
+            SELECT AVG(ans.Score)
+            FROM Posts ans
+            WHERE ans.OwnerUserId = U.Id
+              AND ans.PostTypeId = 2
+              AND EXISTS (SELECT 1 FROM Posts q_inner WHERE q_inner.AcceptedAnswerId = ans.Id AND q_inner.PostTypeId = 1)
+        ) AS AvgAcceptedAnswerScore
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Posts AcceptedAnswers ON U.Id = AcceptedAnswers.OwnerUserId AND AcceptedAnswers.PostTypeId = 2 AND EXISTS (SELECT 1 FROM Posts q WHERE q.AcceptedAnswerId = AcceptedAnswers.Id)
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.WebsiteUrl, U.Location, U.AboutMe
+),
+PostHistoricalReview AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.CreationDate AS PostCreationDate,
+        P.LastEditDate AS PostLastEditDate,
+        P.LastActivityDate AS PostLastActivityDate,
+        P.ClosedDate,
+        P.CommunityOwnedDate,
+        COUNT(PH.Id) AS TotalHistoryEntries,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6, 8, 9) THEN 1 ELSE 0 END) AS EditCount,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS WasClosedAtSomePoint,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS WasReopenedAtSomePoint,
+        MIN(CASE WHEN PH.PostHistoryTypeId IN (4,5,6) THEN PH.CreationDate END) AS FirstEditDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (4,5,6) THEN PH.CreationDate END) AS LatestEditDate,
+        COALESCE(
+            (SELECT CR.Name FROM CloseReasonTypes CR WHERE CR.Id = CAST(PH_Close.Comment AS SMALLINT) LIMIT 1),
+            'N/A'
+        ) AS LastCloseReason
+    FROM Posts P
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    LEFT JOIN PostHistory PH_Close ON P.Id = PH_Close.PostId AND PH_Close.PostHistoryTypeId = 10
+        AND PH_Close.CreationDate = (SELECT MAX(ph_sub.CreationDate) FROM PostHistory ph_sub WHERE ph_sub.PostId = P.Id AND ph_sub.PostHistoryTypeId = 10)
+    GROUP BY
+        P.Id, P.PostTypeId, P.CreationDate, P.LastEditDate, P.LastActivityDate, P.ClosedDate, P.CommunityOwnedDate, PH_Close.Comment
+),
+TopTagsByPostInfluence AS (
+    SELECT
+        T.TagName,
+        SUM(P.Score) AS TotalTagScore,
+        COUNT(DISTINCT P.Id) AS TotalPostsWithTag,
+        AVG(P.ViewCount) AS AvgViewsForTag,
+        RANK() OVER (ORDER BY SUM(P.Score) DESC) AS TagScoreRank
+    FROM Posts P
+    LEFT JOIN (
+        SELECT
+            P_inner.Id AS post_id,
+            TRIM(BOTH ' ' FROM REPLACE(unnested_tag, '>', '')) AS tag_name
+        FROM Posts P_inner,
+        LATERAL (
+            SELECT UNNEST(string_to_array(TRIM(BOTH ',' FROM REPLACE(REPLACE(P_inner.Tags, '><', ','), '<', '')) , ',')) AS unnested_tag
+        ) s
+        WHERE TRIM(BOTH ' ' FROM REPLACE(unnested_tag, '>', '')) <> ''
+    ) TagSplitter ON TagSplitter.post_id = P.Id
+    LEFT JOIN Tags T ON TagSplitter.tag_name = T.TagName
+    WHERE P.PostTypeId = 1
+      AND P.CreationDate >= DATE '2020-01-01'
+      AND T.TagName IS NOT NULL
+    GROUP BY T.TagName
+    HAVING COUNT(DISTINCT P.Id) > 10
+),
+UserBadgeAchievements AS (
+    SELECT
+        B.UserId,
+        B.Name AS BadgeName,
+        B.Date AS BadgeDate,
+        B.Class AS BadgeClass,
+        ROW_NUMBER() OVER (PARTITION BY B.UserId ORDER BY B.Date DESC) AS rn
+    FROM Badges B
+    WHERE B.Class = 1
+),
+PostVoteSummary AS (
+    SELECT
+        PostId,
+        SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes,
+        SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS Downvotes,
+        SUM(CASE WHEN VoteTypeId = 5 THEN 1 ELSE 0 END) AS Favorites
+    FROM Votes
+    GROUP BY PostId
+)
+SELECT
+    UE.UserId,
+    UE.DisplayName AS UserDisplayName,
+    UE.Reputation,
+    UE.TotalPostsOwned,
+    UE.TotalQuestionsOwned,
+    UE.TotalAnswersOwned,
+    UE.TotalCommentsMade,
+    UE.AvgAcceptedAnswerScore,
+    EXTRACT(YEAR FROM (TIMESTAMP '2024-10-01 12:34:56' - UE.UserCreationDate)) AS UserAgeYears,
+    CASE
+        WHEN UE.Reputation > 50000 AND UE.TotalQuestionsOwned > 100 AND UE.TotalAnswersOwned > 200 THEN 'Legendary'
+        WHEN UE.Reputation > 10000 AND UE.TotalPostsOwned > 150 AND UE.AvgPostViewCountOwned > 1000 THEN 'Influencer'
+        WHEN UE.Reputation > 1000 OR UE.TotalPostsOwned > 50 THEN 'Contributor'
+        ELSE 'Novice'
+    END AS UserInfluenceTier,
+    UBA.BadgeName AS RecentGoldBadge,
+    UBA.BadgeDate AS RecentGoldBadgeDate,
+    P.Id AS PostId,
+    P.PostTypeId,
+    PT.Name AS PostTypeName,
+    P.Title AS PostTitle,
+    P.Score AS PostScore,
+    P.ViewCount AS PostViewCount,
+    P.AnswerCount AS QuestionAnswerCount,
+    PR.EditCount AS PostEditCount,
+    PR.WasClosedAtSomePoint,
+    PR.LastCloseReason,
+    ROW_NUMBER() OVER (PARTITION BY UE.UserId, P.PostTypeId ORDER BY P.Score DESC, P.CreationDate DESC) AS UserPostRank,
+    AVG(P.Score) OVER (PARTITION BY P.PostTypeId, EXTRACT(YEAR FROM P.CreationDate)) AS AvgPostScoreInTypePerYear,
+    COALESCE(UE.Location, 'Unknown Location') AS UserLocation,
+    COALESCE(SUBSTRING(UE.AboutMe FROM 1 FOR 100), 'No description provided') AS AboutMeExcerpt,
+    CAST(UE.TotalAcceptedAnswersProvided AS NUMERIC) / NULLIF(UE.TotalAnswersOwned, 0) AS AcceptedAnswerRatio,
+    TRIM(BOTH ',' FROM REPLACE(REPLACE(P.Tags, '><', ', '), '<', '')) AS ProcessedTags,
+    TTP.TotalTagScore,
+    TTP.TagScoreRank,
+    PVotes.Upvotes,
+    PVotes.Downvotes,
+    PVotes.Favorites,
+    LEAD(P.Score, 1, 0) OVER (PARTITION BY UE.UserId ORDER BY P.CreationDate) AS NextPostScoreBySameUser,
+    (PR.LatestEditDate IS NOT NULL AND PR.LatestEditDate - PR.PostCreationDate > INTERVAL '30 days') AS HasMajorLateEdit
+FROM UserEngagement UE
+INNER JOIN Posts P ON UE.UserId = P.OwnerUserId
+INNER JOIN PostTypes PT ON P.PostTypeId = PT.Id
+LEFT JOIN PostHistoricalReview PR ON P.Id = PR.PostId
+LEFT JOIN UserBadgeAchievements UBA ON UE.UserId = UBA.UserId AND UBA.rn = 1
+LEFT JOIN LATERAL (
+    SELECT TOP_TAGS.TagName, TOP_TAGS.TotalTagScore, TOP_TAGS.TagScoreRank
+    FROM TopTagsByPostInfluence TOP_TAGS
+    WHERE POSITION('<' || TOP_TAGS.TagName || '>' IN P.Tags) > 0
+    ORDER BY TOP_TAGS.TagScoreRank
+    LIMIT 1
+) TTP ON P.PostTypeId = 1
+LEFT JOIN PostVoteSummary PVotes ON P.Id = PVotes.PostId
+WHERE
+    UE.Reputation > 5000
+    AND P.CreationDate BETWEEN DATE '2021-01-01' AND DATE '2023-12-31'
+    AND P.Score >= 10
+    AND P.PostTypeId = 1
+    AND (
+        (UE.WebsiteUrl IS NOT NULL AND LOWER(UE.Location) LIKE '%usa%')
+        OR (UE.Location IS NOT NULL AND LOWER(UE.AboutMe) LIKE '%developer%')
+        OR (LOWER(P.Tags) LIKE '%<sql>%')
+    )
+    AND NOT (P.PostTypeId = 1 AND PR.WasClosedAtSomePoint = 1 AND PR.WasReopenedAtSomePoint = 0 AND P.ClosedDate IS NOT NULL AND P.CommunityOwnedDate IS NULL)
+
+UNION ALL
+
+SELECT
+    UE.UserId,
+    UE.DisplayName,
+    UE.Reputation,
+    UE.TotalPostsOwned,
+    UE.TotalQuestionsOwned,
+    UE.TotalAnswersOwned,
+    UE.TotalCommentsMade,
+    UE.AvgAcceptedAnswerScore,
+    EXTRACT(YEAR FROM (TIMESTAMP '2024-10-01 12:34:56' - UE.UserCreationDate)) AS UserAgeYears,
+    CASE
+        WHEN UE.Reputation > 50000 AND UE.TotalQuestionsOwned > 100 AND UE.TotalAnswersOwned > 200 THEN 'Legendary'
+        WHEN UE.Reputation > 10000 AND UE.TotalPostsOwned > 150 AND UE.AvgPostViewCountOwned > 1000 THEN 'Influencer'
+        WHEN UE.Reputation > 1000 OR UE.TotalPostsOwned > 50 THEN 'Contributor'
+        ELSE 'Novice'
+    END AS UserInfluenceTier,
+    UBA.BadgeName,
+    UBA.BadgeDate,
+    P.Id,
+    P.PostTypeId,
+    PT.Name,
+    P.Title,
+    P.Score,
+    P.ViewCount,
+    NULL AS QuestionAnswerCount,
+    PR.EditCount,
+    PR.WasClosedAtSomePoint,
+    PR.LastCloseReason,
+    ROW_NUMBER() OVER (PARTITION BY UE.UserId, P.PostTypeId ORDER BY P.Score DESC, P.CreationDate DESC) AS UserPostRank,
+    AVG(P.Score) OVER (PARTITION BY P.PostTypeId, EXTRACT(YEAR FROM P.CreationDate)) AS AvgPostScoreInTypePerYear,
+    COALESCE(UE.Location, 'Unknown Location') AS UserLocation,
+    COALESCE(SUBSTRING(UE.AboutMe FROM 1 FOR 100), 'No description provided') AS AboutMeExcerpt,
+    CAST(UE.TotalAcceptedAnswersProvided AS NUMERIC) / NULLIF(UE.TotalAnswersOwned, 0) AS AcceptedAnswerRatio,
+    TRIM(BOTH ',' FROM REPLACE(REPLACE(P.Tags, '><', ', '), '<', '')) AS ProcessedTags,
+    NULL AS TotalTagScore,
+    NULL AS TagScoreRank,
+    PVotes.Upvotes,
+    PVotes.Downvotes,
+    PVotes.Favorites,
+    LEAD(P.Score, 1, 0) OVER (PARTITION BY UE.UserId ORDER BY P.CreationDate) AS NextPostScoreBySameUser,
+    (PR.LatestEditDate IS NOT NULL AND PR.LatestEditDate - PR.PostCreationDate > INTERVAL '30 days') AS HasMajorLateEdit
+FROM UserEngagement UE
+INNER JOIN Posts P ON UE.UserId = P.OwnerUserId
+INNER JOIN PostTypes PT ON P.PostTypeId = PT.Id
+LEFT JOIN PostHistoricalReview PR ON P.Id = PR.PostId
+LEFT JOIN UserBadgeAchievements UBA ON UE.UserId = UBA.UserId AND UBA.rn = 1
+LEFT JOIN PostVoteSummary PVotes ON P.Id = PVotes.PostId
+WHERE
+    UE.Reputation > 2000
+    AND P.CreationDate BETWEEN DATE '2021-01-01' AND DATE '2023-12-31'
+    AND P.Score >= 5
+    AND P.PostTypeId = 2
+    AND P.ParentId IS NOT NULL
+    AND (
+        (UE.WebsiteUrl IS NOT NULL AND LOWER(UE.Location) LIKE '%europe%')
+        OR (UE.Location IS NOT NULL AND LOWER(UE.AboutMe) LIKE '%architect%')
+        OR (LOWER(P.Body) LIKE '%<code class="language-c#">%' OR LOWER(P.Body) LIKE '%<code class="language-java">%')
+    )
+ORDER BY
+    UserDisplayName, PostId
+LIMIT 2000;

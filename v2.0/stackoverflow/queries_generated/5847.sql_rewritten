@@ -1,0 +1,135 @@
+-- {"query": "5847.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 931} 
+WITH weekly_activity AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.CreationDate,
+    p.Title,
+    p.Tags,
+    p.OwnerUserId,
+    p.ViewCount,
+    p.Score,
+    p.CommentCount,
+    p.AnswerCount,
+    p.LastActivityDate,
+    (ARRAY_LENGTH(string_to_array(p.Tags, ''><''), 1) > 0) AS HasTags
+  FROM Posts p
+  WHERE p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '14 days'
+),
+recent_edits AS (
+  SELECT
+    ph.PostId,
+    ph.Id AS HistoryId,
+    ph.PostHistoryTypeId,
+    ph.UserId,
+    ph.CreationDate,
+    ph.Comment,
+    ph.Text
+  FROM PostHistory ph
+  WHERE ph.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '14 days'
+),
+tag_insights AS (
+  SELECT
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId,
+    t.WikiPostId,
+    CASE
+      WHEN t.IsModeratorOnly = 1 THEN 'ModeratorOnly'
+      WHEN t.IsRequired = 1 THEN 'Required'
+      ELSE 'Open'
+    END AS TagState
+  FROM Tags t
+),
+complex_training AS (
+  SELECT
+    w.PostId,
+    w.PostTypeId,
+    w.CreationDate,
+    w.Title,
+    w.Tags,
+    w.OwnerUserId,
+    w.ViewCount,
+    w.Score,
+    w.CommentCount,
+    w.AnswerCount,
+    w.LastActivityDate,
+    COALESCE(vt.Name, 'Unknown') AS VoteTypeName,
+    v.UserId AS VoterUserId,
+    v.CreationDate AS VoteDate,
+    v.BountyAmount,
+    u.Reputation,
+    u.DisplayName,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.AccountId
+  FROM weekly_activity w
+  LEFT JOIN Votes v ON v.PostId = w.PostId
+  LEFT JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+  LEFT JOIN Users u ON u.Id = w.OwnerUserId
+),
+stat_calculations AS (
+  SELECT
+    pt.Id AS PostTypeId,
+    pt.Name AS PostTypeName,
+    COUNT(*) FILTER (WHERE pt.Id = 1) AS Questions,
+    COUNT(*) FILTER (WHERE pt.Id = 2) AS Answers,
+    AVG(w.Score) AS AvgScore,
+    SUM(w.ViewCount) AS TotalViews,
+    SUM(w.AnswerCount) AS TotalAnswers,
+    MAX(w.LastActivityDate) AS LastActive
+  FROM Posts w
+  JOIN PostTypes pt ON pt.Id = w.PostTypeId
+  WHERE w.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days'
+  GROUP BY pt.Id, pt.Name
+),
+recent_connections AS (
+  SELECT
+    p.Id AS PostId,
+    cl.Id AS CommentId,
+    cl.UserId AS CommentUserId,
+    cl.Text,
+    cl.CreationDate AS CommentDate,
+    u.DisplayName AS CommentUser
+  FROM Posts p
+  LEFT JOIN Comments cl ON cl.PostId = p.Id
+  LEFT JOIN Users u ON u.Id = cl.UserId
+  WHERE cl.CreationDate IS NOT NULL
+)
+SELECT
+  ct.PostTypeName,
+  ct.Questions,
+  ct.Answers,
+  ct.AvgScore,
+  ct.TotalViews,
+  ct.TotalAnswers,
+  ca.PostTypeId,
+  ca.PostTypeName AS ChildPostType,
+  wa.PostId,
+  wa.Title,
+  wa.Tags,
+  wa.OwnerUserId,
+  wa.ViewCount,
+  wa.Score,
+  wa.CommentCount,
+  wa.AnswerCount,
+  wa.LastActivityDate,
+  wa.Reputation,
+  wa.DisplayName,
+  wa.Location,
+  wa.Views,
+  wa.UpVotes,
+  wa.DownVotes,
+  ra.LastActive AS LastQuestionActive,
+  rcl.CommentId,
+  rcl.CommentDate,
+  rcl.CommentUser
+FROM stat_calculations ct
+LEFT JOIN Posts wa ON wa.PostTypeId = 1 AND wa.Id = wa.PostTypeId -- placeholder to enforce join variety
+JOIN complex_training ca ON ca.PostId = wa.Id
+LEFT JOIN recent_edits re ON re.PostId = wa.Id
+LEFT JOIN recent_connections rcl ON rcl.PostId = wa.Id
+ORDER BY ct.LastActive DESC
+LIMIT 100;

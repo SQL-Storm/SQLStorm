@@ -1,0 +1,226 @@
+WITH UserPostStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS TotalQuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS TotalAnswerScore,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) AS AvgAnswerScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        COUNT(DISTINCT b.Id) AS BadgesReceived,
+        -- emulate FILTER by conditional aggregation inside STRING_AGG using DISTINCT and CASE
+        STRING_AGG(DISTINCT CASE WHEN b.Class = 1 THEN b.Name END, ', ') AS GoldBadges,
+        STRING_AGG(DISTINCT CASE WHEN b.Class = 2 THEN b.Name END, ', ') AS SilverBadges,
+        STRING_AGG(DISTINCT CASE WHEN b.Class = 3 THEN b.Name END, ', ') AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+PostComplexity AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        COALESCE(p.ParentId, p.Id) AS QuestionId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostType,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND CHAR_LENGTH(p.Tags) > 10 THEN 
+                CARDINALITY(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2), '><'))
+            ELSE 0
+        END AS TagCount,
+        CASE 
+            WHEN p.LastEditDate IS NOT NULL AND p.CreationDate IS NOT NULL 
+            THEN EXTRACT(EPOCH FROM (p.LastEditDate - p.CreationDate)) / 86400
+            ELSE 0
+        END AS DaysSinceCreation,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS RankByScore,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) AS RankOverall,
+        PERCENT_RANK() OVER (ORDER BY p.Score) AS PercentileRank,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousScore,
+        LAG(p.CreationDate, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostDate,
+        CASE 
+            WHEN LEAD(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) > p.Score THEN 'Improving'
+            WHEN LEAD(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) < p.Score THEN 'Declining'
+            ELSE 'Stable'
+        END AS PerformanceTrend,
+        (SELECT STRING_AGG(ctext, ' | ' ORDER BY CreationDate)
+         FROM (
+             SELECT DISTINCT c2.Text AS ctext, c2.CreationDate
+             FROM Comments c2
+             WHERE c2.PostId = p.Id
+         ) sub) AS CommentTexts,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Has Accepted Answer'
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NULL THEN 'No Accepted Answer'
+            ELSE 'Not a Question'
+        END AS AnswerStatus
+    FROM Posts p
+    WHERE p.CreationDate >= DATE '2020-01-01'
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.CreationDate, p.OwnerUserId, p.ParentId, p.PostTypeId, p.Tags, p.LastEditDate, p.AcceptedAnswerId
+),
+UserActivitySummary AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT ph.Id) AS EditCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6) THEN ph.Id END) AS EditOperations,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN ph.Id END) AS StateChangeOperations,
+        MIN(ph.CreationDate) AS FirstActivityDate,
+        MAX(ph.CreationDate) AS LastActivityDate,
+        COUNT(DISTINCT ph.PostId) AS PostsEdited,
+        STRING_AGG(ph.Comment, ', ') AS ActivityComments
+    FROM Users u
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    WHERE ph.CreationDate >= DATE '2020-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+QuestionAnalysis AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+            ELSE 'Open'
+        END AS QuestionStatus,
+        CASE 
+            WHEN p.AnswerCount > 0 THEN 
+                (SELECT AVG(Answer.Score) 
+                 FROM Posts Answer 
+                 WHERE Answer.ParentId = p.Id AND Answer.PostTypeId = 2)
+            ELSE NULL
+        END AS AvgAnswerScore,
+        CASE 
+            WHEN p.AnswerCount > 0 THEN 
+                (SELECT COUNT(*) 
+                 FROM Posts Answer 
+                 WHERE Answer.ParentId = p.Id AND Answer.PostTypeId = 2 AND Answer.Score > 0)
+            ELSE 0
+        END AS PositiveAnswers,
+        CASE 
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 
+                (SELECT Score FROM Posts WHERE Id = p.AcceptedAnswerId)
+            ELSE NULL
+        END AS AcceptedAnswerScore,
+        (SELECT COUNT(*) 
+         FROM Votes v 
+         WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS Upvotes,
+        (SELECT COUNT(*) 
+         FROM Votes v 
+         WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS Downvotes
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+TaggedQuestions AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.Title,
+        p.Tags,
+        unnest(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2), '><')) AS Tag,
+        p.Score AS Score
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND CHAR_LENGTH(p.Tags) > 10
+),
+UserTagPreferences AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        q.Tag,
+        COUNT(*) AS TagUsageCount,
+        AVG(q.Score) AS AvgScoreForTag,
+        MAX(q.Score) AS MaxScoreForTag,
+        MIN(q.Score) AS MinScoreForTag
+    FROM Users u
+    JOIN TaggedQuestions q ON u.Id = q.QuestionId
+    GROUP BY u.Id, u.DisplayName, q.Tag
+)
+SELECT 
+    ups.UserId,
+    ups.DisplayName,
+    ups.Reputation,
+    ups.TotalPosts,
+    ups.Questions,
+    ups.Answers,
+    ups.TotalQuestionScore,
+    ups.TotalAnswerScore,
+    ups.AvgQuestionScore,
+    ups.AvgAnswerScore,
+    ups.LastPostDate,
+    ups.BadgesReceived,
+    ups.GoldBadges,
+    ups.SilverBadges,
+    ups.BronzeBadges,
+    uas.EditCount,
+    uas.EditOperations,
+    uas.StateChangeOperations,
+    uas.FirstActivityDate,
+    uas.LastActivityDate,
+    uas.PostsEdited,
+    uas.ActivityComments,
+    SUM(CASE WHEN pa.PostType = 'Question' THEN pa.Score ELSE 0 END) AS TotalQuestionScoreAll,
+    SUM(CASE WHEN pa.PostType = 'Answer' THEN pa.Score ELSE 0 END) AS TotalAnswerScoreAll,
+    AVG(CASE WHEN pa.PostType = 'Question' THEN pa.Score END) AS AvgQuestionScoreAll,
+    AVG(CASE WHEN pa.PostType = 'Answer' THEN pa.Score END) AS AvgAnswerScoreAll,
+    COUNT(CASE WHEN pa.PostType = 'Question' THEN pa.PostId END) AS TotalQuestionsAll,
+    COUNT(CASE WHEN pa.PostType = 'Answer' THEN pa.PostId END) AS TotalAnswersAll,
+    COUNT(DISTINCT pa.QuestionId) AS DistinctQuestionCount,
+    STRING_AGG(DISTINCT pa.Title, ', ') AS PostTitles,
+    -- replace STRING_AGG(DISTINCT pa.Tags, ' | ') with aggregation of distinct tag strings: split tags and aggregate distinct elements
+    (SELECT STRING_AGG(DISTINCT t.tag, ' | ')
+     FROM (
+       SELECT TRIM(tag) AS tag
+       FROM PostComplexity p2,
+            UNNEST(STRING_TO_ARRAY(SUBSTRING(p2.Tags FROM 2 FOR CHAR_LENGTH(p2.Tags)-2), '><')) AS tag
+       WHERE p2.OwnerUserId = ups.UserId AND p2.Tags IS NOT NULL AND CHAR_LENGTH(p2.Tags) > 0
+     ) t
+    ) AS AllTags,
+    COUNT(DISTINCT CASE WHEN pa.Score > 0 THEN pa.PostId END) AS PositivePosts,
+    COUNT(DISTINCT CASE WHEN pa.Score < 0 THEN pa.PostId END) AS NegativePosts,
+    COUNT(DISTINCT CASE WHEN pa.Score = 0 THEN pa.PostId END) AS ZeroScorePosts,
+    STRING_AGG(DISTINCT CASE WHEN pa.PerformanceTrend = 'Improving' THEN pa.Title END, ' | ') AS ImprovingPosts,
+    STRING_AGG(DISTINCT CASE WHEN pa.PerformanceTrend = 'Declining' THEN pa.Title END, ' | ') AS DecliningPosts,
+    STRING_AGG(DISTINCT CASE WHEN pa.TagCount >= 3 THEN pa.Title END, ' | ') AS MultipleTagPosts,
+    STRING_AGG(DISTINCT CASE WHEN pa.ViewCount > 1000 THEN pa.Title END, ' | ') AS PopularPosts,
+    STRING_AGG(DISTINCT CASE WHEN pa.AnswerCount >= 5 THEN pa.Title END, ' | ') AS HighlyAnsweredPosts
+FROM UserPostStats ups
+LEFT JOIN UserActivitySummary uas ON ups.UserId = uas.UserId
+LEFT JOIN PostComplexity pa ON ups.UserId = pa.OwnerUserId
+GROUP BY 
+    ups.UserId, ups.DisplayName, ups.Reputation, ups.TotalPosts, ups.Questions, ups.Answers,
+    ups.TotalQuestionScore, ups.TotalAnswerScore, ups.AvgQuestionScore, ups.AvgAnswerScore,
+    ups.LastPostDate, ups.BadgesReceived, ups.GoldBadges, ups.SilverBadges, ups.BronzeBadges,
+    uas.EditCount, uas.EditOperations, uas.StateChangeOperations, uas.FirstActivityDate,
+    uas.LastActivityDate, uas.PostsEdited, uas.ActivityComments
+HAVING 
+    COUNT(pa.PostId) > 0
+    AND COUNT(DISTINCT CASE WHEN pa.Score > 0 THEN pa.PostId END) >= 1
+    AND COUNT(DISTINCT CASE WHEN pa.PostType = 'Question' THEN pa.PostId END) >= 1
+ORDER BY 
+    ups.TotalPosts DESC,
+    ups.Reputation DESC
+LIMIT 1000;

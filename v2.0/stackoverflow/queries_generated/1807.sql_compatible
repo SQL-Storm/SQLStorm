@@ -1,0 +1,208 @@
+WITH HotTags AS (
+    SELECT
+        T.TagName,
+        SUM(P.Score) AS TotalTagScore,
+        COUNT(DISTINCT P.Id) AS TotalTagPosts,
+        NTILE(5) OVER (ORDER BY SUM(P.Score) DESC, COUNT(DISTINCT P.Id) DESC) AS ScoreQuintile
+    FROM Tags T
+    JOIN Posts P ON P.Tags LIKE '%' || '<' || T.TagName || '>' || '%' 
+    WHERE P.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '180 days'
+      AND P.PostTypeId IN (1, 2)
+    GROUP BY T.TagName
+    HAVING SUM(P.Score) > 1000 AND COUNT(DISTINCT P.Id) > 50
+),
+RecentUserActivity AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS UserUpVotesGiven,
+        U.DownVotes AS UserDownVotesGiven,
+        COALESCE(SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END), 0) AS QuestionsPosted,
+        COALESCE(SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END), 0) AS AnswersPosted,
+        COALESCE(COUNT(DISTINCT P.Id), 0) AS TotalPosts,
+        COALESCE(SUM(P.Score), 0) AS TotalPostScore,
+        COALESCE(AVG(CASE WHEN P.PostTypeId = 1 THEN P.Score END), 0) AS AvgQuestionScore,
+        COALESCE(AVG(CASE WHEN P.PostTypeId = 1 THEN P.ViewCount END), 0) AS AvgQuestionViews,
+        COALESCE(COUNT(DISTINCT C.Id), 0) AS TotalComments,
+        COALESCE(AVG(LENGTH(C.Text)), 0) AS AvgCommentLength,
+        COALESCE(SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END), 0) AS TotalEditsMade,
+        COALESCE(SUM(CASE WHEN V.VoteTypeId = 2 AND V.PostId IN (SELECT p_sub.Id FROM Posts p_sub WHERE p_sub.OwnerUserId = U.Id) THEN 1 ELSE 0 END), 0) AS UpvotesReceivedOnPosts,
+        COALESCE(SUM(CASE WHEN V.VoteTypeId = 3 AND V.PostId IN (SELECT p_sub.Id FROM Posts p_sub WHERE p_sub.OwnerUserId = U.Id) THEN 1 ELSE 0 END), 0) AS DownvotesReceivedOnPosts,
+        MAX(GREATEST(COALESCE(P.LastActivityDate, TIMESTAMP '1900-01-01'),
+                     COALESCE(C.CreationDate, TIMESTAMP '1900-01-01'),
+                     COALESCE(PH.CreationDate, TIMESTAMP '1900-01-01'),
+                     COALESCE(V.CreationDate, TIMESTAMP '1900-01-01'))) AS LastUserActionDate
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN PostHistory PH ON U.Id = PH.UserId
+    LEFT JOIN Votes V ON U.Id = V.UserId OR V.PostId IN (SELECT p_sub.Id FROM Posts p_sub WHERE p_sub.OwnerUserId = U.Id)
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Views, U.UpVotes, U.DownVotes
+    HAVING U.Reputation > 500
+),
+UserTagContributions AS (
+    SELECT
+        RU.UserId,
+        STRING_AGG(DISTINCT HT.TagName, ', ' ORDER BY HT.TagName) AS TopHotTags,
+        COUNT(DISTINCT P.Id) AS HotTagPostsCount,
+        COALESCE(SUM(P.Score) / NULLIF(COUNT(DISTINCT P.Id), 0), 0) AS AvgHotTagPostScore
+    FROM RecentUserActivity RU
+    JOIN Posts P ON RU.UserId = P.OwnerUserId
+    JOIN (
+        SELECT TagName
+        FROM HotTags
+        WHERE ScoreQuintile <= 2
+    ) HT ON P.Tags LIKE '%' || '<' || HT.TagName || '>' || '%'
+    WHERE P.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '365 days'
+    GROUP BY RU.UserId
+),
+FinalUserEngagement AS (
+    SELECT
+        RUA.UserId,
+        RUA.DisplayName,
+        RUA.Reputation,
+        RUA.UserCreationDate,
+        RUA.LastAccessDate,
+        RUA.QuestionsPosted,
+        RUA.AnswersPosted,
+        RUA.TotalPosts,
+        RUA.TotalPostScore,
+        RUA.AvgQuestionScore,
+        RUA.AvgQuestionViews,
+        RUA.TotalComments,
+        RUA.AvgCommentLength,
+        RUA.TotalEditsMade,
+        RUA.UpvotesReceivedOnPosts,
+        RUA.DownvotesReceivedOnPosts,
+        RUA.UserUpVotesGiven,
+        RUA.UserDownVotesGiven,
+        RUA.LastUserActionDate,
+        UTC.TopHotTags,
+        UTC.HotTagPostsCount,
+        UTC.AvgHotTagPostScore,
+        (COALESCE(UTC.HotTagPostsCount, 0) * 1.5) +
+        (COALESCE(RUA.TotalPostScore, 0) * 0.5) +
+        (COALESCE(RUA.AvgQuestionScore, 0) * 2.0) +
+        (COALESCE(RUA.UpvotesReceivedOnPosts, 0) * 0.8) -
+        (COALESCE(RUA.DownvotesReceivedOnPosts, 0) * 0.3) +
+        (COALESCE(RUA.TotalEditsMade, 0) * 0.1) +
+        (COALESCE(RUA.TotalComments, 0) * 0.05) AS OverallEngagementScore,
+        RANK() OVER (ORDER BY RUA.Reputation DESC, COALESCE(UTC.HotTagPostsCount, 0) DESC) AS ReputationHotTagRank,
+        NTILE(10) OVER (ORDER BY COALESCE(RUA.TotalPostScore, 0) DESC, COALESCE(RUA.TotalEditsMade, 0) DESC) AS PostEditActivityDecile,
+        LAG(RUA.Reputation, 1, 0) OVER (ORDER BY RUA.Reputation DESC) AS PrevUserReputation,
+        LEAD(RUA.Reputation, 1, 0) OVER (ORDER BY RUA.Reputation DESC) AS NextUserReputation,
+        CASE
+            WHEN RUA.Reputation > 50000 AND COALESCE(UTC.HotTagPostsCount, 0) >= 10 THEN 'Guru Contributor'
+            WHEN RUA.Reputation > 10000 AND COALESCE(UTC.HotTagPostsCount, 0) >= 3 THEN 'Active Expert'
+            WHEN RUA.Reputation > 5000 THEN 'Experienced User'
+            ELSE 'Engaged Learner'
+        END AS UserLevelClassification,
+        NULLIF(CAST(COALESCE(RUA.UpvotesReceivedOnPosts, 0) AS NUMERIC), 0) / NULLIF(CAST(COALESCE(RUA.UserUpVotesGiven, 0) AS NUMERIC), 0) AS ReceivedGivenUpvoteRatio,
+        CASE
+            WHEN LENGTH(RUA.DisplayName) > 6 THEN SUBSTRING(RUA.DisplayName FROM 1 FOR 3) || '***' || RIGHT(RUA.DisplayName, 3)
+            ELSE RUA.DisplayName
+        END AS MaskedDisplayName,
+        (SELECT COUNT(DISTINCT B.Id) FROM Badges B WHERE B.UserId = RUA.UserId AND B.Class = 1) > 0 AS HasGoldBadge,
+        (SELECT COUNT(DISTINCT B.Id) FROM Badges B WHERE B.UserId = RUA.UserId AND B.Class = 2) > 0 AS HasSilverBadge
+    FROM RecentUserActivity RUA
+    LEFT JOIN UserTagContributions UTC ON RUA.UserId = UTC.UserId
+),
+TopEngagedUsers AS (
+    SELECT
+        FUE.UserId,
+        FUE.DisplayName,
+        FUE.Reputation,
+        FUE.UserCreationDate,
+        FUE.LastAccessDate,
+        FUE.QuestionsPosted,
+        FUE.AnswersPosted,
+        FUE.TotalPosts,
+        FUE.TotalPostScore,
+        FUE.AvgQuestionScore,
+        FUE.AvgQuestionViews,
+        FUE.TotalComments,
+        FUE.AvgCommentLength,
+        FUE.TotalEditsMade,
+        FUE.UpvotesReceivedOnPosts,
+        FUE.DownvotesReceivedOnPosts,
+        FUE.UserUpVotesGiven,
+        FUE.UserDownVotesGiven,
+        FUE.LastUserActionDate,
+        FUE.TopHotTags,
+        FUE.HotTagPostsCount,
+        FUE.AvgHotTagPostScore,
+        FUE.OverallEngagementScore,
+        FUE.ReputationHotTagRank,
+        FUE.PostEditActivityDecile,
+        FUE.PrevUserReputation,
+        FUE.NextUserReputation,
+        FUE.UserLevelClassification,
+        FUE.ReceivedGivenUpvoteRatio,
+        FUE.MaskedDisplayName,
+        FUE.HasGoldBadge,
+        FUE.HasSilverBadge,
+        CASE
+            WHEN FUE.LastAccessDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days' AND FUE.OverallEngagementScore > 1000 THEN 'Highly Active'
+            WHEN FUE.LastAccessDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '90 days' THEN 'Moderately Active'
+            ELSE 'Less Active'
+        END AS ActivityStatus
+    FROM FinalUserEngagement FUE
+    WHERE
+        FUE.OverallEngagementScore > (SELECT AVG(OverallEngagementScore) FROM FinalUserEngagement) 
+        AND FUE.AvgCommentLength IS NOT NULL
+        AND EXISTS (
+            SELECT 1
+            FROM Badges B
+            WHERE B.UserId = FUE.UserId
+              AND B.Class IN (1, 2)
+        )
+        AND NOT EXISTS (
+            SELECT 1
+            FROM PostHistory PH_sub
+            WHERE PH_sub.PostId IN (SELECT p_sub.Id FROM Posts p_sub WHERE p_sub.OwnerUserId = FUE.UserId)
+              AND PH_sub.PostHistoryTypeId = 12
+        )
+        AND LOWER(FUE.DisplayName) NOT LIKE '%deleted user%'
+        AND COALESCE(FUE.ReceivedGivenUpvoteRatio, 0) > 0.5
+)
+SELECT
+    TEU.UserId,
+    TEU.MaskedDisplayName,
+    TEU.Reputation,
+    TEU.UserLevelClassification,
+    TEU.OverallEngagementScore,
+    TEU.ReputationHotTagRank,
+    TEU.PostEditActivityDecile,
+    TEU.HotTagPostsCount,
+    TEU.AvgHotTagPostScore,
+    TEU.TopHotTags,
+    TEU.TotalComments,
+    TEU.AvgCommentLength,
+    TEU.TotalEditsMade,
+    TEU.UpvotesReceivedOnPosts,
+    TEU.DownvotesReceivedOnPosts,
+    TEU.ReceivedGivenUpvoteRatio,
+    TEU.PrevUserReputation,
+    TEU.NextUserReputation,
+    TEU.HasGoldBadge,
+    TEU.HasSilverBadge,
+    TEU.ActivityStatus,
+    (TEU.Reputation / 1000.0) * (TEU.OverallEngagementScore / 100.0) AS WeightedInfluenceScore,
+    COALESCE(TEU.UserUpVotesGiven, 0) - COALESCE(TEU.UserDownVotesGiven, 0) AS NetVotesGiven,
+    EXTRACT(YEAR FROM AGE(TEU.LastAccessDate, TEU.UserCreationDate)) AS YearsActive,
+    (
+        SELECT PT.Name
+        FROM Posts P_top
+        LEFT JOIN PostTypes PT ON P_top.PostTypeId = PT.Id
+        WHERE P_top.OwnerUserId = TEU.UserId
+        ORDER BY P_top.Score DESC, P_top.ViewCount DESC
+        LIMIT 1
+    ) AS TopPostType
+FROM TopEngagedUsers TEU
+WHERE (TEU.HotTagPostsCount > 0 OR TEU.TotalPosts > 10)
+ORDER BY TEU.OverallEngagementScore DESC, TEU.Reputation DESC
+LIMIT 500;

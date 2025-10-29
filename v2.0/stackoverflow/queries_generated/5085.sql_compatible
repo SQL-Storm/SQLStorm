@@ -1,0 +1,120 @@
+WITH
+RecentActivity AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Tags,
+    ROW_NUMBER() OVER (
+      PARTITION BY p.PostTypeId
+      ORDER BY p.LastActivityDate DESC, p.Score DESC, p.ViewCount DESC
+    ) AS rn
+  FROM Posts p
+  WHERE p.LastActivityDate IS NOT NULL
+),
+UserStats AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id) AS TotalPosts,
+    (SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = u.Id) AS AvgPostScore,
+    (SELECT MAX(p.LastActivityDate) FROM Posts p WHERE p.OwnerUserId = u.Id) AS LastActive
+  FROM Users u
+),
+TypeBreakdown AS (
+  SELECT
+    pt.Id AS PostTypeId,
+    pt.Name AS PostTypeName,
+    COUNT(p.Id) AS PostCount,
+    SUM(CASE WHEN p.Score > 0 THEN p.Score ELSE 0 END) AS PositiveScore,
+    SUM(CASE WHEN p.ViewCount > 1000 THEN 1 ELSE 0 END) AS HighViewPosts
+  FROM PostTypes pt
+  LEFT JOIN Posts p ON p.PostTypeId = pt.Id
+  GROUP BY pt.Id, pt.Name
+),
+ComplexFilter AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    CASE
+      WHEN p.Score IS NULL THEN 0
+      WHEN p.Score < 0 THEN -ABS(p.Score)
+      ELSE p.Score
+    END AS NormalizedScore,
+    CASE
+      WHEN p.Tags IS NULL THEN 'untagged'
+      ELSE TRIM(p.Tags)
+    END AS CleanTags,
+    CASE
+      WHEN p.Body IS NULL THEN CAST('' AS VARCHAR(1000))
+      WHEN LENGTH(p.Body) > 1000 THEN SUBSTRING(p.Body, 1, 1000)
+      ELSE p.Body
+    END AS Snippet
+  FROM Posts p
+  WHERE (p.PostTypeId = 1 OR p.PostTypeId = 2)
+    AND (p.LastActivityDate IS NOT NULL)
+    AND (p.ViewCount IS NULL OR p.ViewCount >= 0)
+),
+RecentOrPopular AS (
+  SELECT PostId, PostTypeId, LastActivityDate AS ActivityDate FROM RecentActivity WHERE rn <= 50
+  UNION ALL
+  SELECT p.Id AS PostId, p.PostTypeId, p.LastActivityDate AS ActivityDate
+  FROM Posts p
+  WHERE p.ViewCount >= 10000
+),
+AuthorActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    ROW_NUMBER() OVER (
+      ORDER BY COALESCE(u.Reputation,0) DESC, cnt DESC
+    ) AS Rank,
+    cnt
+  FROM Users u
+  LEFT JOIN (
+    SELECT OwnerUserId, COUNT(*) AS cnt
+    FROM Posts
+    GROUP BY OwnerUserId
+  ) pcount ON pcount.OwnerUserId = u.Id
+  GROUP BY u.Id, u.DisplayName, COALESCE(u.Reputation,0), cnt
+)
+SELECT
+  r.PostId,
+  p.Title AS PostTitle,
+  t.PostTypeName,
+  p.OwnerUserId,
+  u.DisplayName AS OwnerDisplayName,
+  p.LastActivityDate,
+  p.Score,
+  p.ViewCount,
+  c.Snippet AS BodySnippet,
+  c.CleanTags,
+  t2.PostCount AS TypePostCount,
+  b.BadgeCount
+FROM
+  RecentOrPopular r
+  LEFT JOIN Posts p ON p.Id = r.PostId
+  LEFT JOIN PostTypes t ON t.Id = r.PostTypeId
+  LEFT JOIN Users u ON u.Id = p.OwnerUserId
+  LEFT JOIN ComplexFilter c ON c.Id = p.Id
+  LEFT JOIN TypeBreakdown t2 ON t2.PostTypeId = r.PostTypeId
+  LEFT JOIN (
+    SELECT OwnerUserId, COUNT(*) AS BadgeCount
+    FROM Badges
+    GROUP BY OwnerUserId
+  ) b ON b.OwnerUserId = p.OwnerUserId
+WHERE
+  r.ActivityDate >= (DATE '2024-10-01' - INTERVAL '30' DAY)
+ORDER BY
+  r.ActivityDate DESC,
+  p.Score DESC
+LIMIT 200;

@@ -1,0 +1,152 @@
+-- {"query": "3625.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2622} 
+
+WITH
+/* 1. Count badges per user, split by class and tag‑based flag */
+UserBadgeCounts AS (
+    SELECT
+        u.Id                         AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(*) FILTER (WHERE b.Class = 1)      AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2)      AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3)      AS BronzeBadges,
+        COUNT(*) FILTER (WHERE b.TagBased = 1)   AS TagBasedBadges
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+/* 2. Recent posts per user (latest 3) */
+RecentPosts AS (
+    SELECT
+        p.OwnerUserId                AS UserId,
+        p.Id                         AS PostId,
+        p.PostTypeId,
+        p.Score,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+),
+TopRecentPosts AS (
+    SELECT *
+    FROM RecentPosts
+    WHERE rn <= 3
+),
+
+/* 3. Aggregate votes per post */
+PostVoteAgg AS (
+    SELECT
+        v.PostId,
+        SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        SUM(CASE WHEN vt.Id = 5 THEN 1 ELSE 0 END) AS Favorites
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY v.PostId
+),
+
+/* 4. Tag‑level score statistics */
+TagScore AS (
+    SELECT
+        t.TagName,
+        AVG(p.Score)               AS AvgScore,
+        COUNT(p.Id)                AS QuestionCount
+    FROM Posts p
+    JOIN LATERAL (
+        SELECT unnest(string_to_array(trim(both '<>' FROM p.Tags), '><')) AS Tag
+    ) AS tl ON TRUE
+    JOIN Tags t ON t.TagName = tl.Tag
+    WHERE p.PostTypeId = 1               -- only questions
+    GROUP BY t.TagName
+),
+TagRank AS (
+    SELECT
+        TagName,
+        AvgScore,
+        QuestionCount,
+        RANK() OVER (ORDER BY AvgScore DESC) AS ScoreRank
+    FROM TagScore
+),
+
+/* 5. Overall post counts per user */
+UserPostCounts AS (
+    SELECT
+        OwnerUserId                AS UserId,
+        COUNT(*) FILTER (WHERE PostTypeId = 1) AS QuestionCount,
+        COUNT(*) FILTER (WHERE PostTypeId = 2) AS AnswerCount,
+        COUNT(*) FILTER (WHERE AcceptedAnswerId IS NOT NULL) AS AcceptedAnswerCount
+    FROM Posts
+    GROUP BY OwnerUserId
+)
+
+SELECT
+    ub.UserId,
+    ub.DisplayName,
+    ub.Reputation,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ub.TagBasedBadges,
+    up.QuestionCount,
+    up.AnswerCount,
+    up.AcceptedAnswerCount,
+    COALESCE(pv.TotalUpVotes,0)      AS TotalUpVotes,
+    COALESCE(pv.TotalDownVotes,0)    AS TotalDownVotes,
+    COALESCE(pv.TotalFavorites,0)    AS TotalFavorites,
+    /* concatenate top‑5 tags by rank that the user has used */
+    STRING_AGG(DISTINCT tr.TagName || '(' || tr.ScoreRank || ')',
+               ', ') FILTER (WHERE tr.ScoreRank <= 5) AS TopTagRanks,
+    /* array of JSON objects describing the latest post per user */
+    ARRAY_AGG(
+        jsonb_build_object(
+            'PostId',   trp.PostId,
+            'Title',    trp.Title,
+            'Score',    trp.Score,
+            'UpVotes',  COALESCE(pva.UpVotes,0),
+            'DownVotes',COALESCE(pva.DownVotes,0)
+        )
+        ORDER BY trp.CreationDate DESC
+    ) FILTER (WHERE trp.rn = 1)   AS LatestPostDetails
+FROM UserBadgeCounts      ub
+LEFT JOIN UserPostCounts up
+       ON up.UserId = ub.UserId
+/* total votes across all of the user’s posts */
+LEFT JOIN (
+    SELECT
+        OwnerUserId                                   AS UserId,
+        SUM(pv.UpVotes)      AS TotalUpVotes,
+        SUM(pv.DownVotes)    AS TotalDownVotes,
+        SUM(pv.Favorites)    AS TotalFavorites
+    FROM Posts p
+    LEFT JOIN PostVoteAgg pv ON pv.PostId = p.Id
+    GROUP BY OwnerUserId
+) pv
+       ON pv.UserId = ub.UserId
+LEFT JOIN TopRecentPosts trp
+       ON trp.UserId = ub.UserId
+LEFT JOIN PostVoteAgg pva
+       ON pva.PostId = trp.PostId
+/* expand tags of the recent post to join with tag ranking */
+LEFT JOIN LATERAL (
+    SELECT unnest(string_to_array(trim(both '<>' FROM trp.Tags), '><')) AS Tag
+) AS tp ON TRUE
+LEFT JOIN TagRank tr
+       ON tr.TagName = tp.Tag
+GROUP BY
+    ub.UserId, ub.DisplayName, ub.Reputation,
+    ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges, ub.TagBasedBadges,
+    up.QuestionCount, up.AnswerCount, up.AcceptedAnswerCount,
+    pv.TotalUpVotes, pv.TotalDownVotes, pv.TotalFavorites
+HAVING COUNT(*) > 0
+ORDER BY ub.Reputation DESC
+LIMIT 100
+
+UNION ALL
+
+/* guarantee at least one empty row when the result set would be empty */
+SELECT
+    NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL
+WHERE NOT EXISTS (SELECT 1 FROM Users WHERE Reputation IS NOT NULL);

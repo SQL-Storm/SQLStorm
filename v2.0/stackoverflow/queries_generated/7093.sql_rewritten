@@ -1,0 +1,286 @@
+-- {"query": "7093.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 3035} 
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        DENSE_RANK() OVER (ORDER BY u.Views DESC) AS ViewRank,
+        NTILE(10) OVER (ORDER BY u.Reputation DESC) AS ReputationDecile
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.AccountId IS NOT NULL
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.ParentId,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Question with Accepted Answer'
+            WHEN p.PostTypeId = 1 THEN 'Question without Accepted Answer'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostCategory,
+        COALESCE(p.Tags, '') AS Tags,
+        LEN(p.Tags) AS TagLength,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND LEN(p.Tags) > 0 THEN SUBSTRING(p.Tags, 2, LEN(p.Tags) - 2)
+            ELSE ''
+        END AS CleanTags,
+        STRING_AGG(SUBSTRING(SUBSTRING(p.Tags, 2, LEN(p.Tags) - 2), 
+            PATINDEX('%>%)', SUBSTRING(p.Tags, 2, LEN(p.Tags) - 2)) + 1, 1000), ', ') AS TagList,
+        DENSE_RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS ScoreRank,
+        AVG(p.Score) OVER (PARTITION BY p.PostTypeId) AS AvgScoreByType,
+        ROW_NUMBER() OVER (ORDER BY p.CreationDate DESC) AS RecentPostRank,
+        CASE 
+            WHEN p.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = p.PostTypeId) 
+            THEN 'Above_Avg' 
+            ELSE 'Below_Avg' 
+        END AS ScoreComparison,
+        CASE 
+            WHEN ABS(p.Score) > 100 THEN 'Highly_Voted'
+            WHEN ABS(p.Score) > 50 THEN 'Moderately_Voted'
+            WHEN ABS(p.Score) > 0 THEN 'Low_Voted'
+            ELSE 'Unvoted'
+        END AS VotingLevel,
+        IIF(p.ClosedDate IS NOT NULL, 'Closed', 'Open') AS PostStatus,
+        IIF(p.CommunityOwnedDate IS NOT NULL, 'Community_Owned', 'Not_Community_Owned') AS OwnershipStatus,
+        DATEDIFF(DAY, p.CreationDate, cast('2024-10-01 12:34:56' as timestamp)) AS DaysOld,
+        CASE 
+            WHEN DATEDIFF(DAY, p.CreationDate, cast('2024-10-01 12:34:56' as timestamp)) > 30 THEN 'Old'
+            WHEN DATEDIFF(DAY, p.CreationDate, cast('2024-10-01 12:34:56' as timestamp)) > 7 THEN 'Medium'
+            ELSE 'New'
+        END AS AgeCategory
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+TagAnalysis AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            WHEN t.Count > 10 THEN 'Niche'
+            ELSE 'Rare'
+        END AS PopularityLevel,
+        RANK() OVER (ORDER BY t.Count DESC) AS PopularityRank,
+        PERCENT_RANK() OVER (ORDER BY t.Count) AS PopularityPercentile
+    FROM Tags t
+),
+UserActivityByMonth AS (
+    SELECT 
+        u.Id AS UserId,
+        YEAR(p.CreationDate) AS Year,
+        MONTH(p.CreationDate) AS Month,
+        COUNT(p.Id) AS PostsThisMonth,
+        SUM(p.Score) AS TotalScore,
+        AVG(p.Score) AS AvgScore,
+        MAX(p.CreationDate) AS LastActivity,
+        DATEDIFF(DAY, MIN(p.CreationDate), MAX(p.CreationDate)) AS ActivitySpanDays
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE p.CreationDate IS NOT NULL
+    GROUP BY u.Id, YEAR(p.CreationDate), MONTH(p.CreationDate)
+),
+ComplexMetrics AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        us.TotalPosts,
+        us.QuestionCount,
+        us.AnswerCount,
+        us.BadgeCount,
+        us.ReputationRank,
+        us.ReputationDecile,
+        us.ViewRank,
+        DENSE_RANK() OVER (ORDER BY (us.UpVotes - us.DownVotes)) AS NetVoteRank,
+        IIF(us.QuestionCount > 0 AND us.AnswerCount > 0, 
+            CAST(us.AnswerCount AS FLOAT) / us.QuestionCount, 0) AS AnswersPerQuestion,
+        IIF(us.TotalPosts > 0, 
+            CAST(us.BadgeCount AS FLOAT) / us.TotalPosts, 0) AS BadgesPerPost,
+        IIF(us.QuestionCount > 0, 
+            CAST(us.QuestionCount AS FLOAT) / DATEDIFF(DAY, u.CreationDate, cast('2024-10-01 12:34:56' as timestamp)), 0) AS QuestionsPerDay,
+        IIF(us.AnswerCount > 0, 
+            CAST(us.AnswerCount AS FLOAT) / DATEDIFF(DAY, u.CreationDate, cast('2024-10-01 12:34:56' as timestamp)), 0) AS AnswersPerDay,
+        IIF(us.ViewRank <= 100, 'Top_Viewed', 
+            IIF(us.ReputationRank <= 100, 'Top_Reputed', 
+                IIF(us.ReputationRank <= 500, 'High_Participant', 'Regular'))),
+        CASE 
+            WHEN us.BadgeCount > 50 THEN 'Badge_Addict'
+            WHEN us.BadgeCount > 20 THEN 'Badge_Hunter'
+            WHEN us.BadgeCount > 5 THEN 'Badge_Enthusiast'
+            ELSE 'Regular'
+        END AS BadgeEngagement,
+        IIF(us.Reputation > 10000, 'Expert', 
+            IIF(us.Reputation > 1000, 'Advanced', 'Beginner')) AS ReputationLevel,
+        CASE 
+            WHEN us.BadgeCount > 0 AND us.QuestionCount > 0 THEN 
+                IIF(us.QuestionCount > us.BadgeCount, 'Question_Oriented', 'Badge_Oriented')
+            ELSE 'Neutral'
+        END AS ActivityFocus
+    FROM Users u
+    JOIN UserStats us ON u.Id = us.UserId
+    WHERE u.Reputation > 0
+),
+PostComplexityMetrics AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.PostTypeId,
+        LEN(p.Body) AS BodyLength,
+        LEN(p.Title) AS TitleLength,
+        LEN(p.Title) + LEN(p.Body) AS ContentLength,
+        CASE 
+            WHEN LEN(p.Body) > 1000 THEN 'Long'
+            WHEN LEN(p.Body) > 500 THEN 'Medium'
+            WHEN LEN(p.Body) > 100 THEN 'Short'
+            ELSE 'Very_Short'
+        END AS BodySizeCategory,
+        CASE 
+            WHEN LEN(p.Title) > 50 THEN 'Long_Title'
+            WHEN LEN(p.Title) > 25 THEN 'Medium_Title'
+            ELSE 'Short_Title'
+        END AS TitleCategory,
+        IIF(LEN(p.Tags) > 0, 1, 0) AS HasTags,
+        IIF(p.Score > 0, 1, 0) AS HasPositiveScore,
+        IIF(p.CommentCount > 0, 1, 0) AS HasComments,
+        IIF(p.AnswerCount > 0, 1, 0) AS HasAnswers,
+        CASE 
+            WHEN p.ViewCount > 1000 THEN 'Viral'
+            WHEN p.ViewCount > 500 THEN 'Popular'
+            WHEN p.ViewCount > 100 THEN 'Notable'
+            ELSE 'Underground'
+        END AS PopularityTier,
+        IIF(p.CreationDate > DATEADD(MONTH, -6, cast('2024-10-01 12:34:56' as timestamp)), 'Recent', 'Archived') AS TemporalStatus,
+        IIF(p.PostTypeId = 1 AND p.AnswerCount > 0 AND p.Score > 5, 'High_Quality_Question', 'Standard_Question') AS QuestionQualityMetric,
+        IIF(p.PostTypeId = 2 AND p.Score > 2, 'Useful_Answer', 'Standard_Answer') AS AnswerQualityMetric
+    FROM Posts p
+    WHERE p.Body IS NOT NULL
+),
+FinalUserPostAnalysis AS (
+    SELECT 
+        cm.UserId,
+        cm.DisplayName,
+        cm.Reputation,
+        cm.Views,
+        cm.UpVotes,
+        cm.DownVotes,
+        cm.TotalPosts,
+        cm.QuestionCount,
+        cm.AnswerCount,
+        cm.BadgeCount,
+        cm.ReputationRank,
+        cm.ReputationDecile,
+        cm.ViewRank,
+        cm.NetVoteRank,
+        ROUND(cm.AnswersPerQuestion, 2) AS AnswersPerQuestion,
+        ROUND(cm.BadgesPerPost, 2) AS BadgesPerPost,
+        ROUND(cm.QuestionsPerDay, 4) AS QuestionsPerDay,
+        ROUND(cm.AnswersPerDay, 4) AS AnswersPerDay,
+        cm.ActivityFocus,
+        cm.ReputationLevel,
+        cm.BadgeEngagement,
+        cm.IF_Restored,
+        CASE 
+            WHEN cm.TotalPosts > 100 THEN 'Highly_Active'
+            WHEN cm.TotalPosts > 50 THEN 'Active'
+            WHEN cm.TotalPosts > 10 THEN 'Moderate'
+            ELSE 'Low'
+        END AS ActivityLevel,
+        CASE 
+            WHEN cm.Reputation > 500 AND cm.BadgeCount > 20 THEN 'Elite'
+            WHEN cm.Reputation > 200 AND cm.BadgeCount > 10 THEN 'Veteran'
+            WHEN cm.Reputation > 100 THEN 'Experienced'
+            ELSE 'Novice'
+        END AS ExpertiseLevel,
+        IIF(cm.Reputation > 10000, 
+            (SELECT TOP 1 t.TagName FROM Tags t WHERE t.Count = (SELECT MAX(Count) FROM Tags)), 
+            'No_Top_Tag') AS TopTag,
+        IIF(cm.Reputation > 5000, 'Senior_Member', 'Regular_Member') AS MembershipTier
+    FROM ComplexMetrics cm
+)
+SELECT 
+    fp.UserId,
+    fp.DisplayName,
+    fp.Reputation,
+    fp.Views,
+    fp.UpVotes,
+    fp.DownVotes,
+    fp.TotalPosts,
+    fp.QuestionCount,
+    fp.AnswerCount,
+    fp.BadgeCount,
+    fp.ReputationRank,
+    fp.ReputationDecile,
+    fp.ViewRank,
+    fp.NetVoteRank,
+    fp.AnswersPerQuestion,
+    fp.BadgesPerPost,
+    fp.QuestionsPerDay,
+    fp.AnswersPerDay,
+    fp.ActivityFocus,
+    fp.ReputationLevel,
+    fp.BadgeEngagement,
+    fp.ActivityLevel,
+    fp.ExpertiseLevel,
+    fp.TopTag,
+    fp.MembershipTier,
+    CASE 
+        WHEN fp.NetVoteRank <= 10 THEN 'Top_Voter'
+        WHEN fp.NetVoteRank <= 25 THEN 'High_Voter'
+        WHEN fp.NetVoteRank <= 50 THEN 'Moderate_Voter'
+        ELSE 'Low_Voter'
+    END AS VotingCategory,
+    IIF(fp.Reputation > 5000 AND fp.BadgeCount > 25, 
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = fp.UserId AND p.PostTypeId = 1 AND p.Score > 10), 
+        0) AS High_Voted_Questions,
+    IIF(fp.AnswerCount > 0, 
+        (SELECT AVG(AnswerCount) FROM Posts WHERE OwnerUserId = fp.UserId), 
+        0) AS Avg_Question_Ans,
+    IIF(fp.QuestionCount > 0, 
+        (SELECT SUM(AnswerCount) FROM Posts WHERE OwnerUserId = fp.UserId AND PostTypeId = 1), 
+        0) AS Total_Answers_to_Questions,
+    IIF(fp.QuestionCount > 20, 
+        (SELECT COUNT(*) FROM Comments c JOIN Posts p ON c.PostId = p.Id WHERE p.OwnerUserId = fp.UserId AND c.UserId = fp.UserId), 
+        0) AS Self_Comment_History,
+    IIF(fp.ViewRank <= 50, 
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = fp.UserId AND b.Class = 1), 
+        0) AS Gold_Badge_Count,
+    IIF(fp.ReputationRank <= 100, 
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = fp.UserId AND p.PostTypeId = 1 AND p.Score = (SELECT MAX(Score) FROM Posts p2 WHERE p2.OwnerUserId = fp.UserId AND p2.PostTypeId = 1)), 
+        0) AS Max_Score_Questions
+FROM FinalUserPostAnalysis fp
+WHERE fp.Reputation > 100
+ORDER BY fp.Reputation DESC, fp.TotalPosts DESC
+OFFSET 0 ROWS FETCH NEXT 500 ROWS ONLY;

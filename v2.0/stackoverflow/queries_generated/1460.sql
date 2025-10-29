@@ -1,0 +1,209 @@
+-- {"query": "1460.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2975} 
+
+WITH UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.Reputation,
+        u.Views AS UserViews,
+        u.UpVotes AS UserUpVotesGiven,
+        u.DownVotes AS UserDownVotesGiven,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(p.Score) AS TotalPostScoreReceived,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        SUM(COALESCE(c.Score, 0)) AS TotalCommentScoreMade,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        MAX(b.Date) AS LastBadgeDate,
+        -- Correlated subquery: Get the most recent PostHistory action for this user
+        (
+            SELECT MAX(ph_inner.CreationDate)
+            FROM PostHistory ph_inner
+            WHERE ph_inner.UserId = u.Id
+        ) AS LastPostHistoryActivityDate,
+        -- Another correlated subquery: Calculate user's average score per question type
+        (
+            SELECT AVG(p_inner.Score)
+            FROM Posts p_inner
+            WHERE p_inner.OwnerUserId = u.Id AND p_inner.PostTypeId = 1
+        ) AS AvgQuestionScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.CreationDate, u.LastAccessDate, u.Reputation,
+        u.Views, u.UpVotes, u.DownVotes
+),
+PostEngagementDetails AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.AcceptedAnswerId,
+        -- Extract and clean tags, then calculate tag count
+        CARDINALITY(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><')) AS TagCount,
+        -- String expression: Check if post title or body contains specific keywords
+        (CASE
+            WHEN p.Title ILIKE '%performance%' OR p.Body ILIKE '%benchmark%' OR p.Body ILIKE '%optimization%' THEN TRUE
+            ELSE FALSE
+        END) AS IsPerformanceRelated,
+        -- CTE-level correlated subquery to get the latest close reason (if closed)
+        (
+            SELECT crt.Name
+            FROM PostHistory ph_close
+            LEFT JOIN CloseReasonTypes crt ON CAST(ph_close.Comment AS smallint) = crt.Id -- Explicit cast for comment
+            WHERE ph_close.PostId = p.Id
+              AND ph_close.PostHistoryTypeId = 10 -- Post Closed
+            ORDER BY ph_close.CreationDate DESC
+            LIMIT 1
+        ) AS LatestCloseReason,
+        -- Window function: Calculate the difference in score from the previous post by the same user
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostScore,
+        -- Complex calculation: Post "engagement ratio"
+        CAST(COALESCE(p.FavoriteCount, 0) + COALESCE(p.AnswerCount, 0) + COALESCE(p.CommentCount, 0) AS NUMERIC) /
+        NULLIF(COALESCE(p.ViewCount, 1), 0) AS EngagementRatio
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) -- Focus on Questions and Answers
+),
+TopCommentsForPosts AS (
+    SELECT
+        c.PostId,
+        c.Text AS TopCommentText,
+        c.Score AS TopCommentScore,
+        ROW_NUMBER() OVER (PARTITION BY c.PostId ORDER BY COALESCE(c.Score, 0) DESC, c.CreationDate DESC) AS rn
+    FROM Comments c
+),
+TagFrequency AS (
+    SELECT
+        unnest(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><')) AS TagName,
+        p.OwnerUserId AS UserId,
+        COUNT(p.Id) AS PostsWithTag,
+        SUM(p.Score) AS TagScore
+    FROM Posts p
+    WHERE p.Tags IS NOT NULL AND LENGTH(TRIM(p.Tags)) > 2
+    GROUP BY 1, 2
+),
+UserTopTag AS (
+    SELECT
+        tf.UserId,
+        tf.TagName AS MostFrequentTagName,
+        tf.PostsWithTag AS PostsWithMostFrequentTag,
+        ROW_NUMBER() OVER (PARTITION BY tf.UserId ORDER BY tf.PostsWithTag DESC, tf.TagScore DESC, tf.TagName) AS rn
+    FROM TagFrequency tf
+),
+PotentialDuplicateQuestions AS (
+    SELECT DISTINCT p.Id AS QuestionId
+    FROM Posts p
+    JOIN PostLinks pl ON p.Id = pl.RelatedPostId AND pl.LinkTypeId = 3 -- This post is a duplicate target
+    WHERE p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL
+)
+-- Main query starts here
+SELECT
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.UserCreationDate,
+    uas.LastAccessDate,
+    uas.TotalPosts,
+    uas.TotalQuestions,
+    uas.TotalAnswers,
+    uas.TotalPostScoreReceived,
+    uas.TotalCommentsMade,
+    uas.TotalBadges,
+    utt.MostFrequentTagName,
+    utt.PostsWithMostFrequentTag,
+    -- Window function: Rank users by their total post score
+    DENSE_RANK() OVER (ORDER BY uas.TotalPostScoreReceived DESC) AS UserScoreRank,
+    -- Complex calculation: User activity score (combining various metrics)
+    (
+        uas.Reputation * 0.1 +
+        uas.TotalPosts * 0.5 +
+        uas.TotalCommentsMade * 0.2 +
+        uas.TotalBadges * 1 +
+        (EXTRACT(EPOCH FROM (NOW() - uas.LastAccessDate)) / 3600 / 24) * -0.01 -- Penalize for inactivity in days
+    ) AS OverallUserActivityScore,
+    -- Aggregate engagement for posts by this user
+    SUM(ped.EngagementRatio) AS SumPostEngagementRatio,
+    AVG(ped.PostScore) AS AvgPostScoreByUser,
+    SUM(CASE WHEN ped.IsPerformanceRelated THEN 1 ELSE 0 END) AS PerformanceRelatedPostsCount,
+    MAX(ped.PostCreationDate) AS LatestPostDate,
+    -- Conditional expression with NULL logic
+    COALESCE(
+        MAX(CASE WHEN ped.AcceptedAnswerId IS NOT NULL THEN ped.PostCreationDate ELSE NULL END),
+        MAX(ped.PostCreationDate)
+    ) AS LastAcceptedAnswerDateOrPostDate,
+    -- Correlated subquery in SELECT: Total number of links to this user's posts
+    (SELECT COUNT(*) FROM PostLinks pl_outer JOIN Posts p_outer ON pl_outer.RelatedPostId = p_outer.Id WHERE p_outer.OwnerUserId = uas.UserId AND pl_outer.LinkTypeId = 1) AS TotalIncomingLinksToUsersPosts,
+    -- Set Operator logic simulated by EXISTS/NOT EXISTS in a CASE statement
+    (CASE
+        WHEN EXISTS (SELECT 1 FROM Posts p_q WHERE p_q.OwnerUserId = uas.UserId AND p_q.PostTypeId = 1 AND p_q.AcceptedAnswerId IS NOT NULL)
+        AND NOT EXISTS (SELECT 1 FROM Posts p_a WHERE p_a.OwnerUserId = uas.UserId AND p_a.PostTypeId = 2)
+        THEN 'QuestionsWithAccepted_NoAnswers'
+        WHEN EXISTS (SELECT 1 FROM Posts p_a WHERE p_a.OwnerUserId = uas.UserId AND p_a.PostTypeId = 2)
+        AND NOT EXISTS (SELECT 1 FROM Posts p_q WHERE p_q.OwnerUserId = uas.UserId AND p_q.PostTypeId = 1 AND p_q.AcceptedAnswerId IS NOT NULL)
+        THEN 'AnswersOnly_NoAcceptedQuestions'
+        ELSE 'Mixed_Or_NoRelevantActivity'
+    END) AS UserActivityPattern,
+    -- Window function: NTILE to categorize users into "reputation tiers"
+    NTILE(5) OVER (ORDER BY uas.Reputation DESC) AS ReputationTier,
+    -- Complicated predicate within an aggregate
+    SUM(CASE WHEN ped.ClosedDate IS NOT NULL AND ped.LatestCloseReason IS NOT NULL AND ped.LatestCloseReason NOT ILIKE '%duplicate%' THEN 1 ELSE 0 END) AS NonDuplicateClosedPostsWithReason,
+    -- String expression: Concatenate display name and a derived reputation string
+    CONCAT(
+        UPPER(SUBSTRING(COALESCE(uas.DisplayName, 'Unknown User'), 1, 1)),
+        LOWER(SUBSTRING(COALESCE(uas.DisplayName, 'Unknown User'), 2, LENGTH(COALESCE(uas.DisplayName, 'Unknown User')) - 1)),
+        ' (Rep: ',
+        CAST(ROUND(uas.Reputation / 1000.0, 1) AS TEXT), 'k)'
+    ) AS FormattedDisplayNameAndReputation,
+    -- Calculate average time between a user's question and its accepted answer
+    (
+        SELECT AVG(EXTRACT(EPOCH FROM (pa.CreationDate - pq.CreationDate)) / 3600 / 24) -- in days
+        FROM Posts pq
+        JOIN Posts pa ON pq.AcceptedAnswerId = pa.Id
+        WHERE pq.OwnerUserId = uas.UserId AND pq.PostTypeId = 1 AND pa.PostTypeId = 2
+    ) AS AvgTimeToAcceptedAnswerDays,
+    MAX(tcf.TopCommentText) AS TopCommentOnAnyPostByUser,
+    MAX(tcf.TopCommentScore) AS TopCommentScoreOnAnyPostByUser
+FROM UserActivitySummary uas
+LEFT JOIN PostEngagementDetails ped ON uas.UserId = ped.OwnerUserId
+LEFT JOIN TopCommentsForPosts tcf ON ped.PostId = tcf.PostId AND tcf.rn = 1
+LEFT JOIN UserTopTag utt ON uas.UserId = utt.UserId AND utt.rn = 1
+WHERE
+    uas.TotalPosts > 5
+    AND uas.Reputation >= 1000
+    AND uas.LastAccessDate >= NOW() - INTERVAL '1 year' -- Active users
+    AND (ped.PostId IS NULL OR ped.ViewCount > 100 OR ped.PostScore > 5) -- Filter for meaningful posts or users with no posts
+    AND NOT EXISTS ( -- Correlated subquery in WHERE to exclude users who only posted wiki content
+        SELECT 1 FROM Posts p_wiki WHERE p_wiki.OwnerUserId = uas.UserId AND p_wiki.PostTypeId IN (3,4,5,7,8) AND uas.TotalPosts = (
+            SELECT COUNT(*) FROM Posts p_all_wiki WHERE p_all_wiki.OwnerUserId = uas.UserId AND p_all_wiki.PostTypeId IN (3,4,5,7,8)
+        )
+    )
+    AND NOT EXISTS ( -- Exclude users whose last post was a duplicate question
+        SELECT 1 FROM PotentialDuplicateQuestions pdq
+        WHERE pdq.QuestionId = ped.PostId
+          AND ped.PostCreationDate = (SELECT MAX(p_max.CreationDate) FROM Posts p_max WHERE p_max.OwnerUserId = uas.UserId)
+    )
+GROUP BY
+    uas.UserId, uas.DisplayName, uas.Reputation, uas.UserCreationDate, uas.LastAccessDate,
+    uas.TotalPosts, uas.TotalQuestions, uas.TotalAnswers, uas.TotalPostScoreReceived,
+    uas.TotalCommentsMade, uas.TotalBadges,
+    utt.MostFrequentTagName, utt.PostsWithMostFrequentTag
+HAVING
+    COUNT(DISTINCT ped.PostId) > 0 -- Ensure there's at least one relevant post contributing to aggregates
+    AND AVG(ped.EngagementRatio) IS NOT NULL -- Exclude users with no relevant posts to calculate ratio
+    AND SUM(CASE WHEN ped.IsPerformanceRelated THEN 1 ELSE 0 END) >= 0 -- Keep users regardless of performance posts count
+ORDER BY
+    OverallUserActivityScore DESC,
+    UserScoreRank ASC,
+    uas.DisplayName NULLS LAST;

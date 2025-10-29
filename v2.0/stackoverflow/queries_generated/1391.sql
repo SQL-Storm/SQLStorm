@@ -1,0 +1,196 @@
+-- {"query": "1391.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3310} 
+
+WITH PostEditCounts AS (
+    -- Calculate total edits, distinct close/reopen events, and relevant timestamps for each post.
+    -- This CTE identifies posts that have undergone significant modifications or status changes,
+    -- focusing on questions that have been edited at least twice.
+    SELECT
+        ph.PostId,
+        COUNT(DISTINCT ph.Id) AS TotalEditEvents,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS ClosedEvents, -- Post Closed (type 10)
+        SUM(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenedEvents, -- Post Reopened (type 11)
+        MAX(ph.CreationDate) AS LastContentEditTimestamp,
+        MIN(ph.CreationDate) AS FirstHistoryEventTimestamp
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (
+        4, 5, 6, -- Edit Title, Body, Tags
+        7, 8, 9, -- Rollback Title, Body, Tags
+        10, 11   -- Post Closed, Post Reopened
+    )
+    GROUP BY ph.PostId
+    HAVING COUNT(DISTINCT ph.Id) >= 2 -- Ensure the post has been edited/historified at least twice
+),
+UserPostCommentStats AS (
+    -- Aggregate comprehensive statistics for each user regarding their owned posts and commenting activity.
+    -- This includes total posts, questions, answers, scores, and detailed vote counts.
+    SELECT
+        u.Id AS UserId,
+        COUNT(DISTINCT p_own.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN p_own.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsOwned,
+        SUM(CASE WHEN p_own.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersOwned,
+        COALESCE(SUM(p_own.Score), 0) AS TotalOwnedPostsScore,
+        COUNT(DISTINCT c.PostId) AS DistinctPostsCommentedOn,
+        COUNT(c.Id) AS TotalCommentsMade,
+        -- Calculate total up/down votes received across ALL posts owned by this user
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesReceivedOnOwnedPosts,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesReceivedOnOwnedPosts,
+        -- Count distinct users who have upvoted this user's posts
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.UserId END) AS UniqueUpvotersForOwnedPosts
+    FROM Users u
+    LEFT JOIN Posts p_own ON u.Id = p_own.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON p_own.Id = v.PostId AND v.UserId IS NOT NULL -- Exclude potentially anonymous votes
+    GROUP BY u.Id
+),
+UserAcceptedAnswerStats AS (
+    -- Calculate the average score for answers by a user that were subsequently accepted on *any* question.
+    -- This metric reflects the quality and acceptance rate of a user's contributions as answers.
+    SELECT
+        a.OwnerUserId AS UserId,
+        AVG(CAST(a.Score AS NUMERIC)) AS AvgScoreOfAcceptedAnswers
+    FROM Posts q -- Refers to questions
+    JOIN Posts a ON q.AcceptedAnswerId = a.Id -- Refers to accepted answers
+    WHERE a.PostTypeId = 2 AND a.OwnerUserId IS NOT NULL
+    GROUP BY a.OwnerUserId
+),
+UserRecentGoldBadge AS (
+    -- Identify the most recently awarded gold badge for each user.
+    -- This uses a window function to rank badges by date within each user's history.
+    SELECT
+        b.UserId,
+        b.Name AS GoldBadgeName,
+        b.Date AS GoldBadgeAwardDate,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC) AS rn
+    FROM Badges b
+    WHERE b.Class = 1 -- Class 1 represents Gold badges
+),
+UserTopAnswer AS (
+    -- Determine the user's highest scored answer, along with an excerpt of its body and the parent question's title.
+    -- Another window function is used here to pick the best answer by score, then by recency.
+    SELECT
+        p_ans.OwnerUserId AS UserId,
+        p_ans.Id AS TopAnswerId,
+        p_ans.Score AS TopAnswerScore,
+        LEFT(REPLACE(p_ans.Body, E'\n', ' '), 250) AS TopAnswerBodyExcerpt, -- Sanitize and truncate body for display
+        p_ques.Title AS ParentQuestionTitle,
+        p_ques.Id AS ParentQuestionId,
+        ROW_NUMBER() OVER (PARTITION BY p_ans.OwnerUserId ORDER BY p_ans.Score DESC, p_ans.CreationDate DESC) AS rn
+    FROM Posts p_ans -- Refers to answers
+    JOIN Posts p_ques ON p_ans.ParentId = p_ques.Id -- Refers to the question the answer belongs to
+    WHERE p_ans.PostTypeId = 2 AND p_ans.OwnerUserId IS NOT NULL
+),
+HighlyEngagedQuestions AS (
+    -- Filter 'Question' posts that are highly engaged, based on specific content keywords,
+    -- recent activity, and meeting the edit count criteria from `PostEditCounts`.
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId AS PostOwnerUserId,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.FavoriteCount,
+        pec.TotalEditEvents,
+        pec.ClosedEvents,
+        pec.ReopenedEvents,
+        EXTRACT(EPOCH FROM (pec.LastContentEditTimestamp - p.CreationDate)) AS TimeToLastEditSeconds,
+        -- Correlated subquery to count distinct upvoters for each question
+        (SELECT COUNT(DISTINCT v.UserId) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS QuestionDistinctUpvotersCount,
+        COALESCE(p.Tags, '') AS PostTags,
+        p.CreationDate AS PostCreationDate
+    FROM Posts p
+    JOIN PostEditCounts pec ON p.Id = pec.PostId
+    WHERE p.PostTypeId = 1 -- Only consider Questions
+      AND (LOWER(p.Title) LIKE '%api%' OR LOWER(p.Body) LIKE '%api%' OR LOWER(p.Tags) LIKE '%<api%>%') -- Keyword match in title, body, or tags
+      AND p.OwnerUserId IS NOT NULL
+      AND p.CreationDate >= (NOW() - INTERVAL '4 years') -- Focus on questions from the last 4 years
+)
+-- Main Query: Identify and rank top users based on a complex engagement score.
+-- The score considers various aspects of user activity, post quality, and community interaction.
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    COALESCE(u.WebsiteUrl, 'N/A') AS UserWebsiteUrl, -- Handle NULL WebsiteUrl
+    COALESCE(u.Location, 'Unknown') AS UserLocation, -- Handle NULL Location
+    COALESCE(LEFT(u.AboutMe, 200), 'No detailed description available.') AS AboutMeExcerpt, -- Truncate AboutMe and handle NULL
+    ups.TotalPostsOwned,
+    ups.TotalQuestionsOwned,
+    ups.TotalAnswersOwned,
+    ups.TotalOwnedPostsScore,
+    ups.DistinctPostsCommentedOn,
+    ups.TotalCommentsMade,
+    ups.TotalUpvotesReceivedOnOwnedPosts,
+    ups.TotalDownvotesReceivedOnOwnedPosts,
+    ups.UniqueUpvotersForOwnedPosts,
+    COALESCE(uaas.AvgScoreOfAcceptedAnswers, 0.0) AS AverageAcceptedAnswerScore,
+    COALESCE(rgb.GoldBadgeName, 'No Gold Badges') AS MostRecentGoldBadge,
+    rgb.GoldBadgeAwardDate,
+    tpa.TopAnswerId,
+    tpa.TopAnswerScore,
+    tpa.TopAnswerBodyExcerpt,
+    tpa.ParentQuestionTitle,
+    -- Aggregate specific metrics from the highly engaged questions owned by the user
+    COUNT(heq.PostId) AS NumberOfHighlyEngagedQuestions,
+    COALESCE(SUM(heq.PostScore), 0) AS TotalScoreOfEngagedQuestions,
+    COALESCE(SUM(heq.ViewCount), 0) AS TotalViewCountOfEngagedQuestions,
+    COALESCE(SUM(heq.FavoriteCount), 0) AS TotalFavoriteCountOfEngagedQuestions,
+    COALESCE(AVG(heq.TimeToLastEditSeconds), 0) AS AvgTimeToLastEditSecondsForEngagedQuestions,
+    COALESCE(SUM(heq.ClosedEvents), 0) AS TotalClosedEventsOnEngagedQuestions,
+    COALESCE(SUM(heq.ReopenedEvents), 0) AS TotalReopenedEventsOnEngagedQuestions,
+    -- Complex Engagement Score Calculation: A weighted sum of various user performance indicators.
+    -- This calculation involves reputation, vote counts, comment activity, accepted answers,
+    -- highly engaged questions, and a bonus/penalty for profile completeness and post closure/reopening.
+    (
+        (u.Reputation * 0.05) + -- Base reputation contribution
+        (ups.TotalUpvotesReceivedOnOwnedPosts * 0.7) - -- Strong positive for upvotes
+        (ups.TotalDownvotesReceivedOnOwnedPosts * 0.3) + -- Moderate penalty for downvotes
+        (ups.TotalCommentsMade * 0.1) + -- Value for commenting activity
+        (ups.TotalQuestionsOwned * 0.8) + -- Encourage asking good questions
+        (ups.TotalAnswersOwned * 0.9) + -- Strong encouragement for providing answers
+        (COALESCE(uaas.AvgScoreOfAcceptedAnswers, 0.0) * 1.8) + -- Significant bonus for accepted answer quality
+        (COUNT(DISTINCT heq.PostId) * 2.5) + -- High value for relevant, highly engaged questions
+        (COALESCE(SUM(heq.PostScore), 0) * 0.15) + -- Score from engaged questions
+        (COALESCE(SUM(heq.FavoriteCount), 0) * 0.4) + -- Favorited engaged questions
+        -- Penalty for questions that were closed more often than reopened
+        (COALESCE(SUM(heq.ClosedEvents), 0) - COALESCE(SUM(heq.ReopenedEvents), 0)) * -1.0 +
+        -- Bonus for having a website URL and a substantial 'AboutMe' section
+        (CASE WHEN u.WebsiteUrl IS NOT NULL AND LENGTH(TRIM(u.WebsiteUrl)) > 10 THEN 75 ELSE 0 END) +
+        (CASE WHEN u.AboutMe IS NOT NULL AND LENGTH(TRIM(u.AboutMe)) > 100 THEN 30 ELSE 0 END)
+    )::NUMERIC AS EngagementScore,
+    -- Window function: Rank users by their calculated Engagement Score.
+    -- In case of ties, Reputation and then UserId are used as tie-breakers.
+    RANK() OVER (ORDER BY
+        (
+            (u.Reputation * 0.05) +
+            (ups.TotalUpvotesReceivedOnOwnedPosts * 0.7) -
+            (ups.TotalDownvotesReceivedOnOwnedPosts * 0.3) +
+            (ups.TotalCommentsMade * 0.1) +
+            (ups.TotalQuestionsOwned * 0.8) +
+            (ups.TotalAnswersOwned * 0.9) +
+            (COALESCE(uaas.AvgScoreOfAcceptedAnswers, 0.0) * 1.8) +
+            (COUNT(DISTINCT heq.PostId) * 2.5) +
+            (COALESCE(SUM(heq.PostScore), 0) * 0.15) +
+            (COALESCE(SUM(heq.FavoriteCount), 0) * 0.4) +
+            (COALESCE(SUM(heq.ClosedEvents), 0) - COALESCE(SUM(heq.ReopenedEvents), 0)) * -1.0 +
+            (CASE WHEN u.WebsiteUrl IS NOT NULL AND LENGTH(TRIM(u.WebsiteUrl)) > 10 THEN 75 ELSE 0 END) +
+            (CASE WHEN u.AboutMe IS NOT NULL AND LENGTH(TRIM(u.AboutMe)) > 100 THEN 30 ELSE 0 END)
+        ) DESC, u.Reputation DESC, u.Id ASC) AS EngagementRank
+FROM Users u
+LEFT JOIN UserPostCommentStats ups ON u.Id = ups.UserId
+LEFT JOIN UserAcceptedAnswerStats uaas ON u.Id = uaas.UserId
+LEFT JOIN UserRecentGoldBadge rgb ON u.Id = rgb.UserId AND rgb.rn = 1 -- Join for the most recent gold badge
+LEFT JOIN UserTopAnswer tpa ON u.Id = tpa.UserId AND tpa.rn = 1 -- Join for the highest scored answer
+LEFT JOIN HighlyEngagedQuestions heq ON u.Id = heq.PostOwnerUserId -- Join for questions matching the complex criteria
+WHERE u.Id IS NOT NULL
+  AND u.Reputation > 2500 -- Filter for highly reputed users
+  AND u.CreationDate >= (NOW() - INTERVAL '7 years') -- Consider users active in the last 7 years
+GROUP BY
+    u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.WebsiteUrl, u.Location, u.AboutMe,
+    ups.TotalPostsOwned, ups.TotalQuestionsOwned, ups.TotalAnswersOwned, ups.TotalOwnedPostsScore,
+    ups.DistinctPostsCommentedOn, ups.TotalCommentsMade,
+    ups.TotalUpvotesReceivedOnOwnedPosts, ups.TotalDownvotesReceivedOnOwnedPosts, ups.UniqueUpvotersForOwnedPosts,
+    uaas.AvgScoreOfAcceptedAnswers, rgb.GoldBadgeName, rgb.GoldBadgeAwardDate,
+    tpa.TopAnswerId, tpa.TopAnswerScore, tpa.TopAnswerBodyExcerpt, tpa.ParentQuestionTitle
+HAVING COUNT(heq.PostId) > 0 -- Ensure the user has at least one "highly engaged" question for inclusion
+ORDER BY EngagementScore DESC, u.Reputation DESC
+LIMIT 100;

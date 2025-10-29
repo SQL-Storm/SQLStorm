@@ -1,0 +1,162 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        MAX(b.Date) as LastBadgeDate,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Elite'
+            WHEN u.Reputation > 5000 THEN 'Veteran'
+            WHEN u.Reputation > 1000 THEN 'Seasoned'
+            ELSE 'Newbie'
+        END as ReputationTier
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.AccountId IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopAnswers AS (
+    SELECT 
+        p.Id as AnswerId,
+        p.ParentId,
+        p.OwnerUserId,
+        p.Score,
+        p.CreationDate,
+        p.Body,
+        ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) as rn
+    FROM Posts p
+    WHERE p.PostTypeId = 2 AND p.Score > 10
+),
+QuestionStats AS (
+    SELECT 
+        p.Id as QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community'
+            ELSE 'Open'
+        END as PostStatus,
+        (SELECT COUNT(*) FROM Posts WHERE ParentId = p.Id AND PostTypeId = 2 AND Score > 0) as PositiveAnswerCount,
+        (SELECT AVG(Score) FROM Posts WHERE ParentId = p.Id AND PostTypeId = 2) as AvgAnswerScore
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.ViewCount > 1000
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            ELSE 'Niche'
+        END as TagPopularity,
+        (SELECT COUNT(*) FROM Posts WHERE Tags LIKE '%' || t.TagName || '%') as QuestionCountWithTag,
+        (SELECT AVG(Score) FROM Posts WHERE Tags LIKE '%' || t.TagName || '%') as AvgScoreWithTag
+    FROM Tags t
+    WHERE t.Count > 50
+)
+SELECT 
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.ReputationTier,
+    us.PostCount,
+    us.CommentCount,
+    us.BadgeCount,
+    us.LastPostDate,
+    qs.Title as MostUpvotedQuestion,
+    qs.Score as QuestionScore,
+    qs.ViewCount as QuestionViews,
+    qs.AnswerCount as QuestionAnswers,
+    qs.CommentCount as QuestionComments,
+    qs.Tags as QuestionTags,
+    qs.PostStatus,
+    qs.PositiveAnswerCount,
+    qs.AvgAnswerScore,
+    ta.TagName as PopularTag,
+    ta.TagCount,
+    ta.TagPopularity,
+    ta.QuestionCountWithTag,
+    ta.AvgScoreWithTag,
+    CASE 
+        WHEN us.PostCount > 100 AND us.Reputation > 10000 THEN 'Power User'
+        WHEN us.PostCount > 50 AND us.Reputation > 5000 THEN 'Active User'
+        WHEN us.PostCount > 10 THEN 'Regular User'
+        ELSE 'Occasional User'
+    END as UserCategory,
+    COALESCE(ROUND(100.0 * (us.UpVotes - us.DownVotes) / NULLIF(us.UpVotes + us.DownVotes, 0), 2), 0) as UpvoteRatio,
+    CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - us.LastPostDate)) / 86400.0 AS INTEGER) as DaysSinceLastPost,
+    CASE 
+        WHEN EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = us.UserId AND b.Name = 'Great Answer') THEN 'Has Great Answer'
+        ELSE 'No Great Answer'
+    END as GreatAnswerStatus,
+    (SELECT STRING_AGG(SUBSTRING(p.Body FROM 1 FOR 100), ' || ') 
+     FROM Posts p 
+     WHERE p.OwnerUserId = us.UserId 
+     AND p.PostTypeId = 1 
+     AND p.Score > 50 
+     LIMIT 3) as SampleHighScorePosts
+FROM UserStats us
+LEFT JOIN QuestionStats qs ON us.UserId = qs.OwnerUserId
+LEFT JOIN TagAnalysis ta ON ta.TagName IN (
+    SELECT TRIM(SUBSTRING(t_elem FROM 1 FOR POSITION('>' IN t_elem) - 1)) 
+    FROM (
+        SELECT UNNEST(STRING_TO_ARRAY(COALESCE(qs.Tags, ''), '>')) AS t_elem
+    ) sub
+    WHERE POSITION('>' IN t_elem) > 0
+) OR ta.TagName IN (
+    SELECT t_elem 
+    FROM (
+        SELECT UNNEST(STRING_TO_ARRAY(COALESCE(qs.Tags, ''), '>')) AS t_elem
+    ) sub
+    WHERE LENGTH(t_elem) > 3
+)
+WHERE us.Reputation > 1000
+AND (qs.PostStatus = 'Open' OR qs.PostStatus IS NULL)
+AND (ta.TagName IS NULL OR ta.TagCount > 100)
+GROUP BY
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.ReputationTier,
+    us.PostCount,
+    us.CommentCount,
+    us.BadgeCount,
+    us.LastPostDate,
+    qs.Title,
+    qs.Score,
+    qs.ViewCount,
+    qs.AnswerCount,
+    qs.CommentCount,
+    qs.Tags,
+    qs.PostStatus,
+    qs.PositiveAnswerCount,
+    qs.AvgAnswerScore,
+    ta.TagName,
+    ta.TagCount,
+    ta.TagPopularity,
+    ta.QuestionCountWithTag,
+    ta.AvgScoreWithTag,
+    us.UpVotes,
+    us.DownVotes
+ORDER BY us.Reputation DESC, us.PostCount DESC
+LIMIT 500;

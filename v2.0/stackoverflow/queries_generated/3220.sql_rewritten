@@ -1,0 +1,173 @@
+-- {"query": "3220.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1741} 
+WITH
+    -- Basic user activity aggregates
+    user_stats AS (
+        SELECT
+            u.Id                           AS user_id,
+            u.DisplayName                  AS display_name,
+            u.Reputation,
+            u.CreationDate,
+            COUNT(p.Id)                    AS total_posts,
+            COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS question_count,
+            COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS answer_count,
+            SUM(COALESCE(p.Score,0))       AS total_score,
+            SUM(COALESCE(p.ViewCount,0))   AS total_views,
+            MAX(p.CreationDate)            AS last_post_date,
+            COUNT(DISTINCT v.VoteTypeId)   AS distinct_vote_types
+        FROM Users u
+        LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+        LEFT JOIN Votes v ON v.PostId = p.Id
+        GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+    ),
+
+    -- Badge aggregates with NULL handling for TagBased flag
+    badge_stats AS (
+        SELECT
+            b.UserId                      AS user_id,
+            COUNT(*)                      AS badge_total,
+            COUNT(*) FILTER (WHERE b.Class = 1) AS gold_badges,
+            COUNT(*) FILTER (WHERE b.Class = 2) AS silver_badges,
+            COUNT(*) FILTER (WHERE b.Class = 3) AS bronze_badges,
+            COUNT(*) FILTER (WHERE b.TagBased = 1) AS tag_based_badges
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+
+    -- Recent activity window for top contributing users
+    recent_activity AS (
+        SELECT
+            p.OwnerUserId                 AS user_id,
+            p.Id                          AS post_id,
+            p.PostTypeId,
+            p.CreationDate,
+            ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+        FROM Posts p
+        WHERE p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '30 days'
+    ),
+
+    -- Top tags by question count with string manipulation
+    top_tags AS (
+        SELECT
+            t.TagName,
+            t.Count,
+            COALESCE(t.ExcerptPostId,0)   AS excerpt_id,
+            COALESCE(t.WikiPostId,0)      AS wiki_id,
+            CASE
+                WHEN t.IsModeratorOnly = 1 THEN 'Moderator'
+                WHEN t.IsRequired = 1 THEN 'Required'
+                ELSE 'Normal'
+            END                           AS tag_category
+        FROM Tags t
+        ORDER BY t.Count DESC
+        LIMIT 20
+    ),
+
+    -- Posts with correlated subquery for duplicate detection
+    duplicate_posts AS (
+        SELECT
+            p.Id                         AS post_id,
+            p.Title,
+            p.CreationDate,
+            (SELECT COUNT(*) FROM PostLinks pl
+               WHERE pl.PostId = p.Id
+                 AND pl.LinkTypeId = 3) AS duplicate_count,
+            CASE
+                WHEN EXISTS (
+                    SELECT 1 FROM PostHistory ph
+                    WHERE ph.PostId = p.Id
+                      AND ph.PostHistoryTypeId = 10   -- Post Closed
+                      AND ph.Comment LIKE '%duplicate%'
+                ) THEN TRUE
+                ELSE FALSE
+            END                         AS is_closed_as_duplicate
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+          AND p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '180 days'
+    ),
+
+    -- Combine user stats with badges and recent activity
+    user_combined AS (
+        SELECT
+            us.user_id,
+            us.display_name,
+            us.reputation,
+            us.total_posts,
+            us.question_count,
+            us.answer_count,
+            us.total_score,
+            us.total_views,
+            us.last_post_date,
+            us.distinct_vote_types,
+            COALESCE(bs.badge_total,0)           AS badge_total,
+            COALESCE(bs.gold_badges,0)           AS gold_badges,
+            COALESCE(bs.silver_badges,0)         AS silver_badges,
+            COALESCE(bs.bronze_badges,0)         AS bronze_badges,
+            COALESCE(bs.tag_based_badges,0)      AS tag_based_badges,
+            ra.rn                                 AS recent_post_rank,
+            CASE
+                WHEN us.reputation > 20000 THEN 'Legendary'
+                WHEN us.reputation > 10000 THEN 'Expert'
+                WHEN us.reputation > 5000  THEN 'Advanced'
+                ELSE 'Intermediate'
+            END                                   AS reputation_tier,
+            (us.total_score::decimal / NULLIF(us.total_posts,0)) AS avg_score_per_post,
+            (us.total_views::decimal / NULLIF(us.total_posts,0)) AS avg_views_per_post
+        FROM user_stats us
+        LEFT JOIN badge_stats bs ON bs.user_id = us.user_id
+        LEFT JOIN recent_activity ra ON ra.user_id = us.user_id AND ra.rn = 1
+        WHERE us.reputation IS NOT NULL
+    ),
+
+    -- Union of high‑rep users and heavily badge‑laden users
+    high_impact_users AS (
+        SELECT * FROM user_combined
+        WHERE reputation_tier IN ('Legendary','Expert')
+        UNION ALL
+        SELECT * FROM user_combined
+        WHERE badge_total >= 50
+    )
+
+SELECT
+    hiu.user_id,
+    hiu.display_name,
+    hiu.reputation,
+    hiu.reputation_tier,
+    hiu.total_posts,
+    hiu.question_count,
+    hiu.answer_count,
+    hiu.avg_score_per_post,
+    hiu.avg_views_per_post,
+    hiu.badge_total,
+    hiu.gold_badges,
+    hiu.silver_badges,
+    hiu.bronze_badges,
+    hiu.tag_based_badges,
+    hiu.recent_post_rank,
+    tt.TagName,
+    tt.Count AS tag_question_count,
+    tt.tag_category,
+    dp.post_id        AS recent_duplicate_post_id,
+    dp.Title          AS recent_duplicate_title,
+    dp.duplicate_count,
+    dp.is_closed_as_duplicate
+FROM high_impact_users hiu
+LEFT JOIN top_tags tt
+       ON tt.TagName = ANY (string_to_array(
+                regexp_replace(hiu.display_name, '[^A-Za-z0-9]+', ' ', 'g'), ' '
+            ))
+LEFT JOIN LATERAL (
+    SELECT d.*
+    FROM duplicate_posts d
+    WHERE d.post_id = (
+        SELECT p.Id
+        FROM Posts p
+        WHERE p.OwnerUserId = hiu.user_id
+          AND p.PostTypeId = 1
+        ORDER BY p.CreationDate DESC
+        LIMIT 1
+    )
+    LIMIT 1
+) dp ON TRUE
+WHERE hiu.recent_post_rank IS NOT NULL
+ORDER BY hiu.reputation DESC, hiu.badge_total DESC
+LIMIT 100;

@@ -1,0 +1,108 @@
+-- {"query": "5685.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 788} 
+WITH recent_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.LastActivityDate,
+    p.AnswerCount,
+    p.CommentCount
+  FROM Posts p
+  WHERE p.PostTypeId = 1 -- Questions
+    AND p.CreationDate >= NOW() - INTERVAL '90 days'
+),
+recent_comments AS (
+  SELECT
+    c.PostId,
+    c.Id AS CommentId,
+    c.UserId,
+    c.UserDisplayName,
+    c.Text,
+    c.CreationDate,
+    c.Score AS CommentScore
+  FROM Comments c
+  JOIN Posts p ON p.Id = c.PostId
+  WHERE p.PostTypeId = 1
+    AND c.CreationDate >= NOW() - INTERVAL '90 days'
+),
+tag_wikis AS (
+  SELECT
+    t.TagName AS Tag,
+    t.Count AS TagCount,
+    t.WikiPostId,
+    t.IsModeratorOnly,
+    t.IsRequired
+  FROM Tags t
+  WHERE t.IsModeratorOnly = 0
+),
+top_users AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.UpVotes,
+    u.DownVotes,
+    u.Views,
+    u.ProfileImageUrl
+  FROM Users u
+  WHERE u.Reputation > 10000
+),
+complex_points AS (
+  SELECT
+    qp.PostId,
+    qp.Title,
+    qp.OwnerUserId,
+    qp.CreationDate,
+    qp.Score,
+    qp.ViewCount,
+    qp.Tags,
+    -- Derived metrics with NULL-safe expressions
+    (qp.Score * 1.0) / NULLIF(qp.ViewCount,0) AS score_per_view,
+    (SELECT AVG(Score) FROM Posts p2 WHERE p2.PostTypeId = 1) AS avg_post_score,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = qp.PostId) AS total_comments,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = qp.PostId AND v.VoteTypeId = 2) AS upvotes,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = qp.PostId AND v.VoteTypeId = 3) AS downvotes
+  FROM recent_questions qp
+),
+windowed AS (
+  SELECT
+    cp.*,
+    ROW_NUMBER() OVER (PARTITION BY cp.OwnerUserId ORDER BY cp.CreationDate DESC) AS rn_owner
+  FROM complex_points cp
+)
+SELECT
+  w.PostId,
+  w.Title,
+  w.OwnerUserId AS OwnerId,
+  w.CreationDate,
+  w.Score,
+  w.ViewCount,
+  w.Tags,
+  w.score_per_view,
+  w.avg_post_score,
+  w.total_comments,
+  w.upvotes,
+  w.downvotes,
+  u.DisplayName AS OwnerDisplayName,
+  u.Reputation AS OwnerReputation,
+  u.LastAccessDate,
+  v.Name AS LastVoteType
+FROM windowed w
+LEFT JOIN TopUsers AS u ON u.UserId = w.OwnerUserId
+LEFT JOIN (
+  SELECT p.Id AS PostId,
+         v.Name
+  FROM Posts p
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  WHERE v.VoteTypeId = 2
+  GROUP BY p.Id, v.Name
+) AS v ON v.PostId = w.PostId
+LEFT JOIN TagWikis TW ON TW.Tag = ANY(string_to_array(substr(w.Tags,2, length(w.Tags)-2), '><'))
+ORDER BY w.score_per_view DESC NULLS LAST
+LIMIT 100;

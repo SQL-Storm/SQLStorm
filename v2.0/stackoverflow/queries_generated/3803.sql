@@ -1,0 +1,150 @@
+-- {"query": "3803.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2461} 
+
+WITH
+    -- Basic user statistics
+    user_stats AS (
+        SELECT
+            u.Id                                      AS user_id,
+            u.DisplayName,
+            u.Reputation,
+            COALESCE(SUM(p.Score), 0)                 AS total_post_score,
+            COUNT(p.Id)                               AS total_posts,
+            COUNT(*) FILTER (WHERE p.PostTypeId = 2)  AS total_answers,
+            COUNT(DISTINCT p.Tags)                    AS distinct_tag_sets
+        FROM Users u
+        LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+        GROUP BY u.Id, u.DisplayName, u.Reputation
+    ),
+
+    -- Badge aggregation per user
+    badge_counts AS (
+        SELECT
+            b.UserId                                 AS user_id,
+            SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_badges,
+            SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_badges,
+            SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_badges
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+
+    -- Net vote score per user (derived from votes on their posts)
+    vote_score AS (
+        SELECT
+            p.OwnerUserId                            AS user_id,
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) -
+            SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS net_votes
+        FROM Posts p
+        LEFT JOIN Votes v ON v.PostId = p.Id
+        WHERE p.OwnerUserId IS NOT NULL
+        GROUP BY p.OwnerUserId
+    ),
+
+    -- Tag usage per user (exploding Tags column)
+    tag_usage AS (
+        SELECT
+            p.OwnerUserId                            AS user_id,
+            TRIM(BOTH '><' FROM tag)                AS tag_name,
+            COUNT(*)                                 AS tag_cnt,
+            ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId
+                               ORDER BY COUNT(*) DESC) AS rn
+        FROM Posts p
+        CROSS JOIN LATERAL regexp_split_to_table(p.Tags, '><') AS tag
+        WHERE p.PostTypeId = 1               -- only questions
+          AND p.Tags IS NOT NULL
+        GROUP BY p.OwnerUserId, tag_name
+    ),
+
+    -- Top 3 tags per user
+    top_tags AS (
+        SELECT
+            user_id,
+            STRING_AGG(tag_name, ', ') FILTER (WHERE rn <= 3) AS top_three_tags,
+            SUM(tag_cnt) FILTER (WHERE rn <= 3)                AS top_three_usage
+        FROM tag_usage
+        GROUP BY user_id
+    ),
+
+    -- Correlated sub‑query: total distinct tags ever used by a user
+    distinct_tags AS (
+        SELECT
+            u.Id                                      AS user_id,
+            (SELECT COUNT(DISTINCT t)
+             FROM Posts p
+             CROSS JOIN LATERAL regexp_split_to_table(p.Tags, '><') AS t
+             WHERE p.OwnerUserId = u.Id
+               AND p.Tags IS NOT NULL)               AS distinct_tag_count
+        FROM Users u
+    )
+
+-- Combine all pieces, apply filters, and use set operators for two different slices
+SELECT
+    us.user_id,
+    us.DisplayName,
+    us.Reputation,
+    us.total_post_score,
+    us.total_posts,
+    us.total_answers,
+    bc.gold_badges,
+    bc.silver_badges,
+    bc.bronze_badges,
+    vs.net_votes,
+    tt.top_three_tags,
+    dt.distinct_tag_count
+FROM user_stats us
+LEFT JOIN badge_counts bc   ON bc.user_id = us.user_id
+LEFT JOIN vote_score vs    ON vs.user_id = us.user_id
+LEFT JOIN top_tags tt      ON tt.user_id = us.user_id
+LEFT JOIN distinct_tags dt ON dt.user_id = us.user_id
+WHERE us.Reputation >= 2000
+  AND COALESCE(us.total_post_score,0) <> 0
+  AND (bc.gold_badges IS NULL OR bc.gold_badges > 0)
+
+UNION ALL
+
+SELECT
+    us.user_id,
+    us.DisplayName,
+    us.Reputation,
+    us.total_post_score,
+    us.total_posts,
+    us.total_answers,
+    bc.gold_badges,
+    bc.silver_badges,
+    bc.bronze_badges,
+    vs.net_votes,
+    tt.top_three_tags,
+    dt.distinct_tag_count
+FROM user_stats us
+LEFT JOIN badge_counts bc   ON bc.user_id = us.user_id
+LEFT JOIN vote_score vs    ON vs.user_id = us.user_id
+LEFT JOIN top_tags tt      ON tt.user_id = us.user_id
+LEFT JOIN distinct_tags dt ON dt.user_id = us.user_id
+WHERE us.Reputation < 2000
+  AND bc.gold_badges > 0
+  AND (tt.top_three_tags IS NOT NULL OR dt.distinct_tag_count > 5)
+
+EXCEPT
+
+SELECT
+    us.user_id,
+    us.DisplayName,
+    us.Reputation,
+    us.total_post_score,
+    us.total_posts,
+    us.total_answers,
+    bc.gold_badges,
+    bc.silver_badges,
+    bc.bronze_badges,
+    vs.net_votes,
+    tt.top_three_tags,
+    dt.distinct_tag_count
+FROM user_stats us
+LEFT JOIN badge_counts bc   ON bc.user_id = us.user_id
+LEFT JOIN vote_score vs    ON vs.user_id = us.user_id
+LEFT JOIN top_tags tt      ON tt.user_id = us.user_id
+LEFT JOIN distinct_tags dt ON dt.user_id = us.user_id
+WHERE us.Reputation BETWEEN 1500 AND 1800
+  AND COALESCE(us.total_answers,0) = 0
+  AND COALESCE(bc.silver_badges,0) = 0
+ORDER BY Reputation DESC, net_votes DESC
+LIMIT 200;

@@ -1,0 +1,179 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        DENSE_RANK() OVER (ORDER BY u.Views DESC) AS ViewRank,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Veteran'
+            WHEN u.Reputation >= 1000 THEN 'Expert'
+            WHEN u.Reputation >= 100 THEN 'Novice'
+            ELSE 'Newbie'
+        END AS UserTier
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 0
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes
+),
+TopPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END AS PostType,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS ScoreRank,
+        PERCENT_RANK() OVER (ORDER BY p.ViewCount) AS ViewPercentile,
+        DENSE_RANK() OVER (ORDER BY p.CreationDate) AS CreationRank
+    FROM Posts p
+    WHERE p.Score > 0 AND p.PostTypeId IN (1, 2)
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            WHEN t.Count > 10 THEN 'Niche'
+            ELSE 'Rare'
+        END AS TagPopularity,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS PopularityRank
+    FROM Tags t
+    WHERE t.Count > 0
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT ph.Id) AS HistoryCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (1, 2, 3) THEN ph.Id END) AS EditCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN ph.Id END) AS StatusChangeCount,
+        AVG(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - ph.CreationDate)) / 86400.0) AS AvgDaysSinceActivity
+    FROM Users u
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    WHERE ph.CreationDate > (CAST('2024-10-01 12:34:56' AS timestamp) AT TIME ZONE 'UTC' - INTERVAL '1' YEAR)
+    GROUP BY u.Id, u.DisplayName
+),
+PostStats AS (
+    SELECT 
+        p.PostTypeId,
+        COUNT(*) AS TotalPosts,
+        AVG(p.Score) AS AvgScore,
+        AVG(p.ViewCount) AS AvgViews,
+        MAX(p.Score) AS MaxScore,
+        MIN(p.ViewCount) AS MinViews,
+        COUNT(DISTINCT p.OwnerUserId) AS UniqueOwners,
+        COALESCE(SUM(CASE WHEN p.AnswerCount > 0 THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(*), 0), 0) AS QuestionWithAnswersRatio,
+        COALESCE(SUM(CASE WHEN p.CommentCount > 0 THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(*), 0), 0) AS QuestionWithCommentsRatio
+    FROM Posts p
+    GROUP BY p.PostTypeId
+)
+SELECT 
+    'Performance Benchmark Report' AS ReportTitle,
+    COUNT(*) AS TotalUsers,
+    SUM(CASE WHEN us.UserTier = 'Veteran' THEN 1 ELSE 0 END) AS VeteranCount,
+    SUM(CASE WHEN us.UserTier = 'Expert' THEN 1 ELSE 0 END) AS ExpertCount,
+    ROUND(AVG(us.Reputation), 2) AS AvgReputation,
+    ROUND(AVG(us.Views), 2) AS AvgViews,
+    ROUND(AVG(us.UpVotes), 2) AS AvgUpVotes,
+    ROUND(AVG(us.DownVotes), 2) AS AvgDownVotes,
+    (SELECT COUNT(*) FROM TopPosts WHERE ScoreRank <= 100) AS Top100Posts,
+    (SELECT MIN(Score) FROM TopPosts WHERE ScoreRank <= 100) AS MinScoreTop100,
+    (SELECT AVG(Score) FROM TopPosts WHERE ScoreRank <= 100) AS AvgScoreTop100,
+    (SELECT COUNT(*) FROM TagAnalysis WHERE TagPopularity = 'Popular') AS PopularTags,
+    (SELECT COUNT(*) FROM TagAnalysis WHERE TagPopularity = 'Moderate') AS ModerateTags,
+    (SELECT COUNT(*) FROM TagAnalysis WHERE TagPopularity = 'Niche') AS NicheTags,
+    (SELECT COUNT(*) FROM TagAnalysis WHERE TagPopularity = 'Rare') AS RareTags,
+    (SELECT MAX(AvgDaysSinceActivity) FROM UserActivity) AS MaxActivityDays,
+    (SELECT AVG(HistoryCount) FROM UserActivity) AS AvgUserHistoryCount,
+    (SELECT MAX(UniqueOwners) FROM PostStats) AS MaxOwnersPerPostType,
+    (SELECT MAX(QuestionWithAnswersRatio) FROM PostStats) AS MaxAnswerRatio,
+    'Generated on: ' || CAST(TIMESTAMP '2024-10-01 12:34:56' AS VARCHAR) AS GeneratedTimestamp,
+    (SELECT STRING_AGG(CONCAT(u2.DisplayName, ' (', u2.Reputation, ')'), '; ' ORDER BY u2.Reputation DESC) 
+     FROM Users u2 
+     WHERE (SELECT COUNT(*) FROM PostHistory ph2 WHERE ph2.UserId = u2.Id) > (SELECT AVG(ua.HistoryCount) FROM UserActivity ua)
+     LIMIT 5) AS HighActivityUsers,
+    (SELECT STRING_AGG(pt.PostType || ':' || pt.Count, '; ' ORDER BY pt.PostType) FROM (
+        SELECT 'Questions' AS PostType, COUNT(*) AS Count FROM Posts WHERE PostTypeId = 1
+        UNION ALL
+        SELECT 'Answers' AS PostType, COUNT(*) AS Count FROM Posts WHERE PostTypeId = 2
+        UNION ALL
+        SELECT 'WIKI' AS PostType, COUNT(*) AS Count FROM Posts WHERE PostTypeId = 3
+    ) pt) AS PostTypeBreakdown,
+    CONCAT('Reputation Score Range: ', 
+           (SELECT MIN(Reputation) FROM Users), ' - ', 
+           (SELECT MAX(Reputation) FROM Users), 
+           ' | Avg: ', 
+           ROUND((SELECT AVG(Reputation) FROM Users), 2)) AS ReputationAnalysis,
+    ROUND((SELECT AVG(AvgScore) FROM PostStats), 2) AS OverallAvgScore,
+    ROUND((SELECT MAX(MaxScore) FROM PostStats), 2) AS HighestScore,
+    COALESCE((SELECT AVG(AvgScore) FROM PostStats), 0) AS SafeAvgScore,
+    (SELECT COUNT(DISTINCT ph.PostId) 
+     FROM PostHistory ph 
+     LEFT JOIN Posts p ON ph.PostId = p.Id 
+     WHERE ph.PostHistoryTypeId = 1 AND p.PostTypeId = 1) AS TitleEditCount
+FROM UserStats us
+WHERE us.ReputationRank <= 1000
+GROUP BY 
+    us.ReputationRank,
+    'Performance Benchmark Report'
+HAVING COUNT(*) > 100
+
+UNION ALL
+
+SELECT 
+    'Extended Analysis' AS ReportTitle,
+    COUNT(DISTINCT u.Id) AS TotalUsers,
+    COUNT(DISTINCT CASE WHEN u.Reputation >= 10000 THEN u.Id END) AS EliteCount,
+    ROUND(AVG(CASE WHEN u.Reputation >= 1000 THEN u.Reputation END), 2) AS AvgExpertReputation,
+    COUNT(DISTINCT CASE WHEN u.Views > 1000 THEN u.Id END) AS ActiveUsers,
+    COUNT(DISTINCT CASE WHEN u.UpVotes > u.DownVotes THEN u.Id END) AS PositiveReputationUsers,
+    COUNT(DISTINCT CASE WHEN u.DownVotes > 0 THEN u.Id END) AS DownVoteUsers,
+    ROUND(AVG(CASE WHEN u.Reputation IS NOT NULL THEN u.Reputation END), 2) AS SafeAvgReputation,
+    ROUND(AVG(CASE WHEN u.Views IS NOT NULL THEN u.Views END), 2) AS SafeAvgViews,
+    ROUND(AVG(CASE WHEN u.UpVotes IS NOT NULL THEN u.UpVotes END), 2) AS SafeAvgUpVotes,
+    ROUND(AVG(CASE WHEN u.DownVotes IS NOT NULL THEN u.DownVotes END), 2) AS SafeAvgDownVotes,
+    COUNT(DISTINCT CASE WHEN c.Id IS NOT NULL THEN u.Id END) AS CommentingUsers,
+    COUNT(DISTINCT CASE WHEN b.Id IS NOT NULL THEN u.Id END) AS BadgeHolders,
+    CONCAT('Top User: ', 
+           (SELECT u3.DisplayName FROM Users u3 ORDER BY u3.Reputation DESC LIMIT 1)) AS TopUser,
+    'Extended Report' AS GeneratedTimestamp,
+    CASE 
+        WHEN (SELECT AVG(Reputation) FROM Users) > 5000 THEN 'High'
+        WHEN (SELECT AVG(Reputation) FROM Users) > 1000 THEN 'Medium'
+        ELSE 'Low'
+    END AS ReputationLevel,
+    ROUND(SUM(CASE WHEN u.Views > 1000 THEN u.Views ELSE 0 END) * 100.0 / NULLIF(SUM(u.Views), 0), 2) AS ActiveUsersShare,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1) * 100.0 / NULLIF((SELECT COUNT(*) FROM Posts), 0) AS QuestionPercentage,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 2) * 100.0 / NULLIF((SELECT COUNT(*) FROM Posts), 0) AS AnswerPercentage
+FROM Users u
+LEFT JOIN Comments c ON u.Id = c.UserId
+LEFT JOIN Badges b ON u.Id = b.UserId
+WHERE u.Reputation > 0
+GROUP BY u.Id
+HAVING COUNT(*) > 50;

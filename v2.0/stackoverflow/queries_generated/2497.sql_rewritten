@@ -1,0 +1,162 @@
+-- {"query": "2497.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1444} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 as Depth,
+        array[t.TagName] as TagPath
+    from Tags t
+    where t.IsRequired = 1
+
+    union all
+
+    select
+        child.Id,
+        child.TagName,
+        child.Count,
+        p.Depth + 1,
+        p.TagPath || child.TagName
+    from Tags child
+    join Posts pPosts on pPosts.Id = child.ExcerptPostId
+    join PostTags pt on pt.PostId = pPosts.Id
+    join RecursiveTagHierarchy p on p.TagName = pt.TagName
+    where child.Id <> p.Id and not child.TagName = any(p.TagPath)
+),
+UserActivityRankings as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        coalesce(q.QuestionCount,0) as QuestionCount,
+        coalesce(a.AnswerCount,0) as AnswerCount,
+        rank() over (order by u.Reputation desc, QuestionCount desc, AnswerCount desc) as UserRank
+    from Users u
+    left join (
+        select OwnerUserId, count(*) as QuestionCount
+        from Posts
+        where PostTypeId = 1
+        group by OwnerUserId
+    ) q on q.OwnerUserId = u.Id
+    left join (
+        select OwnerUserId, count(*) as AnswerCount
+        from Posts
+        where PostTypeId = 2
+        group by OwnerUserId
+    ) a on a.OwnerUserId = u.Id
+    where u.Reputation > 100
+),
+LatestPostScores as (
+    select
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        dense_rank() over (partition by p.OwnerUserId order by p.Score desc, p.CreationDate desc) as ScoreRank
+    from Posts p
+    where p.PostTypeId = 1 and p.Score is not null
+),
+CloseReasonCounts as (
+    select
+        cht.Name as CloseReasonName,
+        count(ph.Id) as TotalClosedPosts
+    from PostHistory ph
+    join PostHistoryTypes pht on ph.PostHistoryTypeId = pht.Id
+    left join CloseReasonTypes cht on cast(ph.Comment as int) = cht.Id
+    where ph.PostHistoryTypeId = 10 -- Post Closed
+    group by cht.Name
+),
+UserBadgeAggregates as (
+    select
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        count(distinct b.Name) as UniqueBadges
+    from Badges b
+    group by b.UserId
+),
+UserEngagement as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        uba.GoldBadges,
+        uba.SilverBadges,
+        uba.BronzeBadges,
+        uba.UniqueBadges,
+        qac.TotalAnswersAccepted,
+        coalesce(c1.CommentCount,0) as CommentsMade,
+        coalesce(vs.UpVotes,0) as TotalUpVotes,
+        coalesce(vs.DownVotes,0) as TotalDownVotes,
+        (qac.TotalAnswersAccepted * 3 + uba.GoldBadges * 5 + uba.SilverBadges * 3 + uba.BronzeBadges * 1 + coalesce(c1.CommentCount,0) * 2 + coalesce(vs.UpVotes,0) - coalesce(vs.DownVotes,0)) as EngagementScore
+    from Users u
+    left join UserBadgeAggregates uba on uba.UserId = u.Id
+    left join (
+        select OwnerUserId, count(*) as TotalAnswersAccepted
+        from Posts
+        where PostTypeId = 2 and Id in (
+            select AcceptedAnswerId from Posts where AcceptedAnswerId is not null
+        )
+        group by OwnerUserId
+    ) qac on qac.OwnerUserId = u.Id
+    left join (
+        select UserId, count(*) as CommentCount
+        from Comments
+        group by UserId
+    ) c1 on c1.UserId = u.Id
+    left join (
+        select
+            UserId,
+            sum(case when VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+            sum(case when VoteTypeId = 3 then 1 else 0 end) as DownVotes
+        from Votes
+        group by UserId
+    ) vs on vs.UserId = u.Id
+    where u.Reputation > 500
+)
+select 
+    ue.DisplayName,
+    ue.Reputation,
+    ue.GoldBadges,
+    ue.SilverBadges,
+    ue.BronzeBadges,
+    ue.UniqueBadges,
+    ue.TotalAnswersAccepted,
+    ue.CommentsMade,
+    ue.TotalUpVotes,
+    ue.TotalDownVotes,
+    ue.EngagementScore,
+    lps.Id as TopQuestionId,
+    lps.Title as TopQuestionTitle,
+    lps.Score as TopQuestionScore,
+    lps.ViewCount as TopQuestionViews,
+    lps.CreationDate as TopQuestionCreationDate,
+    cr.CloseReasonName,
+    cr.TotalClosedPosts,
+    string_agg(distinct rh.TagName, ' > ') over (partition by ue.Id) as TagsHierarchyPath
+from UserEngagement ue
+left join LatestPostScores lps on lps.OwnerUserId = ue.Id and lps.ScoreRank = 1
+left join (
+    select ph.PostId, cht.Name as CloseReasonName, count(*) as TotalClosedPosts
+    from PostHistory ph
+    left join CloseReasonTypes cht on cast(ph.Comment as int) = cht.Id
+    where ph.PostHistoryTypeId = 10
+    group by ph.PostId, cht.Name
+) cr on cr.PostId = lps.Id
+left join Posts p on p.OwnerUserId = ue.Id and p.PostTypeId = 1
+left join (
+    select
+        pt.PostId,
+        unnest(string_to_array(substring(pt.Tags from 2 for char_length(pt.Tags) - 2), '><')) as TagName
+    from Posts pt
+    where pt.PostTypeId = 1 and pt.Tags is not null
+) ptags on ptags.PostId = p.Id
+left join RecursiveTagHierarchy rh on rh.TagName = ptags.TagName
+where ue.EngagementScore > (
+    select avg(EngagementScore) from UserEngagement
+)
+order by ue.EngagementScore desc, ue.Reputation desc
+limit 50;

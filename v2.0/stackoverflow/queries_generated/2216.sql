@@ -1,0 +1,102 @@
+-- {"query": "2216.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1123} 
+with RecursiveTagCounts as (
+    select 
+        t.Id, 
+        t.TagName,
+        t.Count,
+        array_agg(distinct p.Id) filter (where p.Id is not null) as QuestionPostIds
+    from Tags t
+    left join Posts p on p.Tags like '%' || '<' || t.TagName || '>' || '%'
+    where p.PostTypeId = 1
+    group by t.Id, t.TagName, t.Count
+
+    union all
+
+    select 
+        t2.Id, 
+        t2.TagName, 
+        t2.Count,
+        rt.QuestionPostIds || array_agg(distinct p2.Id) filter (where p2.Id is not null)
+    from Tags t2
+    join RecursiveTagCounts rt on rt.Id <> t2.Id
+    left join Posts p2 on p2.Tags like '%' || '<' || t2.TagName || '>' || '%'
+    where p2.PostTypeId = 1
+    group by t2.Id, t2.TagName, t2.Count, rt.QuestionPostIds
+)
+, QuestionAnswerStats as (
+    select 
+        q.Id as QuestionId,
+        q.Title as QuestionTitle,
+        q.OwnerUserId,
+        u.DisplayName as OwnerDisplayName,
+        q.CreationDate as QuestionCreation,
+        count(a.Id) filter (where a.Id is not null) as AnswerCount,
+        coalesce(sum(a.Score), 0) as TotalAnswerScore,
+        max(a.CreationDate) as LastAnswerDate,
+        sum(case when a.OwnerUserId = q.OwnerUserId then 1 else 0 end) as OwnerAnswersCount
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Users u on u.Id = q.OwnerUserId
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.OwnerUserId, u.DisplayName, q.CreationDate
+)
+, HighActivityQuestions as (
+    select 
+        qas.*,
+        row_number() over (order by qas.AnswerCount desc, qas.TotalAnswerScore desc, qas.QuestionCreation desc) as RankByActivity
+    from QuestionAnswerStats qas
+    where qas.AnswerCount > 5 and qas.TotalAnswerScore > 10
+)
+, UserBadgeSummary as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct b.Id) as BadgeCount,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        max(b.Date) as MostRecentBadgeDate
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+)
+select distinct 
+    hq.RankByActivity,
+    hq.QuestionId,
+    hq.QuestionTitle,
+    coalesce(hq.OwnerDisplayName, 'unknown') as OwnerDisplayName,
+    hq.QuestionCreation,
+    hq.AnswerCount,
+    hq.TotalAnswerScore,
+    hq.LastAnswerDate,
+    hq.OwnerAnswersCount,
+    ubs.BadgeCount,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    ubs.MostRecentBadgeDate,
+    string_agg(distinct l.Name, ', ') filter (where l.Name is not null) as LinkedPostTypes,
+    (select count(ph.Id) from PostHistory ph where ph.PostId = hq.QuestionId and ph.PostHistoryTypeId in (10, 11, 12, 13)) as CloseReopenDeleteEvents,
+    case 
+        when age(current_date, ubs.MostRecentBadgeDate) < interval '365 day' then 'Active Badge Earner'
+        else 'Inactive Recent Badges'
+    end as BadgeActivityStatus,
+    case 
+        when hq.AnswerCount > 20 then 'Hot Topic'
+        when hq.AnswerCount between 10 and 20 then 'Popular Topic'
+        else 'Normal Topic'
+    end as TopicPopularity,
+    substring(hq.QuestionTitle from '(\w{3,})') as FirstLongWordInTitle
+from HighActivityQuestions hq
+left join UserBadgeSummary ubs on ubs.UserId = hq.OwnerUserId
+left join PostLinks pl on pl.PostId = hq.QuestionId
+left join LinkTypes l on l.Id = pl.LinkTypeId
+where 
+    (exists (select 1 from Votes v where v.PostId = hq.QuestionId and v.VoteTypeId = 2 and v.CreationDate > hq.QuestionCreation)) -- has upvotes after creation
+    and (
+      (hq.LastAnswerDate is not null and hq.LastAnswerDate > hq.QuestionCreation + interval '7 day')
+      or hq.AnswerCount > 10
+    )
+    and (ubs.BadgeCount is null or ubs.BadgeCount < 50) -- filter some badge conditions
+order by hq.RankByActivity asc
+limit 50;

@@ -1,0 +1,179 @@
+WITH RECURSIVE tag_hierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        0 AS depth
+    FROM Tags t
+    WHERE t.IsModeratorOnly = FALSE
+    UNION ALL
+    SELECT
+        t.Id,
+        th.TagName,
+        t.Count,
+        th.depth + 1
+    FROM Tags t
+    JOIN tag_hierarchy th ON t.TagName LIKE th.TagName || '-%'
+    WHERE th.depth < 3
+),
+user_activity AS (
+    SELECT
+        u.Id                                   AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        SUM(CASE WHEN p.PostTypeId = 2 AND p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS AcceptedAnswers,
+        MAX(p.CreationDate)                   AS LastPostDate,
+        COALESCE(SUM(b.Class), 0)              AS BadgeScore
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+post_metrics AS (
+    SELECT
+        p.Id                                 AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        COALESCE(p.FavoriteCount, 0)         AS Favorites,
+        COALESCE(p.AnswerCount, 0)           AS Answers,
+        COALESCE(p.CommentCount, 0)          AS Comments,
+        CASE
+            WHEN p.Tags IS NULL THEN NULL
+            ELSE regexp_replace(p.Tags, '[<>]', '', 'g')
+        END                                  AS CleanTags,
+        (CASE WHEN p.Tags IS NOT NULL THEN
+            split_part(regexp_replace(p.Tags, '[<>]', '', 'g'), ' ', 1)
+         END)                                 AS FirstTag,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId
+                           ORDER BY p.CreationDate DESC) AS PostRankByDate
+    FROM Posts p
+    WHERE p.PostTypeId IN (1,2)
+),
+tag_stats AS (
+    SELECT
+        th.TagName,
+        COUNT(DISTINCT pm.PostId)            AS PostsWithTag,
+        SUM(pm.Score)                        AS TotalScore,
+        AVG(pm.ViewCount)                    AS AvgViews,
+        MAX(pm.CreationDate)                 AS MostRecentPost,
+        ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT pm.PostId) DESC) AS TagRank
+    FROM tag_hierarchy th
+    LEFT JOIN post_metrics pm
+          ON pm.CleanTags IS NOT NULL
+         AND pm.CleanTags LIKE '%' || th.TagName || '%'
+    GROUP BY th.TagName
+),
+user_badge_summary AS (
+    SELECT
+        ub.Id AS UserId,
+        STRING_AGG(DISTINCT b.Name, ', ') FILTER (WHERE b.Class = 1) AS GoldBadges,
+        STRING_AGG(DISTINCT b.Name, ', ') FILTER (WHERE b.Class = 2) AS SilverBadges,
+        STRING_AGG(DISTINCT b.Name, ', ') FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COUNT(*)                               AS TotalBadges
+    FROM Badges b
+    JOIN Users ub ON ub.Id = b.UserId
+    GROUP BY ub.Id
+),
+recent_votes AS (
+    SELECT
+        v.PostId,
+        v.VoteTypeId,
+        v.CreationDate,
+        v.UserId,
+        CASE v.VoteTypeId
+            WHEN 2 THEN 1
+            WHEN 3 THEN -1
+            ELSE 0
+        END AS VoteValue
+    FROM Votes v
+    WHERE v.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '30 days'
+),
+post_vote_summary AS (
+    SELECT
+        rv.PostId,
+        SUM(rv.VoteValue)                         AS NetVotesLast30d,
+        COUNT(*) FILTER (WHERE rv.VoteTypeId = 2) AS UpVotesLast30d,
+        COUNT(*) FILTER (WHERE rv.VoteTypeId = 3) AS DownVotesLast30d
+    FROM recent_votes rv
+    GROUP BY rv.PostId
+),
+final_report AS (
+    SELECT
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.AcceptedAnswers,
+        COALESCE(ub.GoldBadges, '')               AS GoldBadges,
+        COALESCE(ub.SilverBadges, '')             AS SilverBadges,
+        COALESCE(ub.BronzeBadges, '')             AS BronzeBadges,
+        ub.TotalBadges,
+        pm.PostId,
+        pm.PostTypeId,
+        pm.Score,
+        pm.ViewCount,
+        pm.Favorites,
+        pm.Answers,
+        pm.Comments,
+        pm.FirstTag,
+        ts.TagName,
+        ts.PostsWithTag,
+        ts.TotalScore          AS TagTotalScore,
+        ts.AvgViews            AS TagAvgViews,
+        ts.TagRank,
+        pvs.NetVotesLast30d,
+        pvs.UpVotesLast30d,
+        pvs.DownVotesLast30d,
+        ROW_NUMBER() OVER (PARTITION BY ua.UserId ORDER BY pm.CreationDate DESC) AS RecentPostSeq
+    FROM user_activity ua
+    LEFT JOIN user_badge_summary ub ON ub.UserId = ua.UserId
+    LEFT JOIN post_metrics pm ON pm.OwnerUserId = ua.UserId AND pm.PostRankByDate = 1
+    LEFT JOIN tag_stats ts ON ts.TagName = pm.FirstTag
+    LEFT JOIN post_vote_summary pvs ON pvs.PostId = pm.PostId
+)
+SELECT *
+FROM final_report
+WHERE (Reputation > 10000 OR QuestionCount > 100)
+   AND (GoldBadges <> '' OR SilverBadges <> '' OR BronzeBadges <> '')
+   AND (NetVotesLast30d IS NOT NULL AND NetVotesLast30d > 0)
+UNION ALL
+SELECT
+    u.Id               AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    0                  AS QuestionCount,
+    0                  AS AnswerCount,
+    0                  AS AcceptedAnswers,
+    ''                 AS GoldBadges,
+    ''                 AS SilverBadges,
+    ''                 AS BronzeBadges,
+    0                  AS TotalBadges,
+    NULL               AS PostId,
+    NULL               AS PostTypeId,
+    NULL               AS Score,
+    NULL               AS ViewCount,
+    NULL               AS Favorites,
+    NULL               AS Answers,
+    NULL               AS Comments,
+    NULL               AS FirstTag,
+    NULL               AS TagName,
+    0                  AS PostsWithTag,
+    0                  AS TagTotalScore,
+    0                  AS TagAvgViews,
+    NULL               AS TagRank,
+    NULL               AS NetVotesLast30d,
+    NULL               AS UpVotesLast30d,
+    NULL               AS DownVotesLast30d,
+    NULL               AS RecentPostSeq
+FROM Users u
+WHERE NOT EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id)
+  AND u.Reputation < 500
+ORDER BY Reputation DESC, QuestionCount DESC, NetVotesLast30d DESC
+LIMIT 200;

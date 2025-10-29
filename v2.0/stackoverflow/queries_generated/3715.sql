@@ -1,0 +1,84 @@
+-- {"query": "3715.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2608} 
+
+WITH user_stats AS (
+    SELECT u.id,
+           u.displayname,
+           u.reputation,
+           COUNT(b.id) FILTER (WHERE b.class = 1)                     AS gold_badges,
+           COUNT(b.id) FILTER (WHERE b.class = 2)                     AS silver_badges,
+           COUNT(b.id) FILTER (WHERE b.class = 3)                     AS bronze_badges,
+           COALESCE(SUM(p.score),0)                                   AS total_post_score,
+           AVG(p.score) FILTER (WHERE p.score IS NOT NULL)           AS avg_post_score,
+           MAX(p.creationdate)                                        AS last_post_date,
+           COUNT(p.id) FILTER (WHERE p.posttypeid = 1)                AS question_count,
+           COUNT(p.id) FILTER (WHERE p.posttypeid = 2)                AS answer_count
+    FROM   users u
+    LEFT  JOIN badges b   ON b.userid   = u.id
+    LEFT  JOIN posts  p   ON p.owneruserid = u.id
+    GROUP BY u.id, u.displayname, u.reputation
+),
+latest_posts AS (
+    SELECT p.id,
+           p.owneruserid,
+           p.title,
+           p.creationdate,
+           ROW_NUMBER() OVER (PARTITION BY p.owneruserid ORDER BY p.creationdate DESC) AS rn
+    FROM   posts p
+    WHERE  p.posttypeid IN (1,2)
+),
+user_latest AS (
+    SELECT lp.owneruserid,
+           lp.id          AS post_id,
+           lp.title,
+           lp.creationdate
+    FROM   latest_posts lp
+    WHERE  lp.rn = 1
+),
+tag_counts AS (
+    SELECT t.tagname,
+           COUNT(*)                           AS tag_use_count,
+           SUM(p.score)                       AS tag_score_sum,
+           MAX(p.creationdate)                AS tag_last_used
+    FROM   posts p
+    JOIN   LATERAL regexp_split_to_table(substr(p.tags,2,length(p.tags)-2), '><')
+                         AS t(tagname) ON true
+    GROUP BY t.tagname
+),
+user_top_tag AS (
+    SELECT us.id,
+           t.tagname,
+           ROW_NUMBER() OVER (PARTITION BY us.id ORDER BY cnt.tag_use_count DESC) AS rn
+    FROM   user_stats us
+    JOIN   posts p          ON p.owneruserid = us.id
+    JOIN   LATERAL regexp_split_to_table(substr(p.tags,2,length(p.tags)-2), '><')
+                         AS t(tagname) ON true
+    JOIN   tag_counts cnt   ON cnt.tagname = t.tagname
+    GROUP BY us.id, t.tagname, cnt.tag_use_count
+),
+final AS (
+    SELECT us.id,
+           us.displayname,
+           us.reputation,
+           us.gold_badges,
+           us.silver_badges,
+           us.bronze_badges,
+           us.total_post_score,
+           us.avg_post_score,
+           ul.title               AS latest_post_title,
+           ul.creationdate        AS latest_post_date,
+           COALESCE(ut.tagname,'N/A') AS top_tag,
+           COALESCE(ut.rn,0)          AS top_tag_rank
+    FROM   user_stats us
+    LEFT   JOIN user_latest ul ON ul.owneruserid = us.id
+    LEFT   JOIN user_top_tag ut ON ut.id = us.id AND ut.rn = 1
+)
+SELECT *
+FROM   final
+WHERE  reputation > 20000
+    OR gold_badges >= 3
+    OR (avg_post_score IS NOT NULL AND avg_post_score > 15)
+ORDER BY reputation DESC, gold_badges DESC
+LIMIT 50
+UNION ALL
+SELECT NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL
+LIMIT 0;

@@ -1,0 +1,134 @@
+-- {"query": "7839.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1547} 
+SELECT 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) as TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+    COUNT(DISTINCT b.Id) as Badges,
+    COALESCE(SUM(p.Score), 0) as TotalScore,
+    COALESCE(AVG(p.Score), 0) as AverageScore,
+    MAX(p.CreationDate) as LastPostDate,
+    DATEDIFF(cast('2024-10-01 12:34:56' as timestamp), u.CreationDate) as AccountAgeDays,
+    CASE 
+        WHEN u.Reputation >= 10000 THEN 'Diamond'
+        WHEN u.Reputation >= 5000 THEN 'Platinum'
+        WHEN u.Reputation >= 1000 THEN 'Gold'
+        WHEN u.Reputation >= 500 THEN 'Silver'
+        WHEN u.Reputation >= 100 THEN 'Bronze'
+        ELSE 'Beginner'
+    END as ReputationTier,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p2 
+        WHERE p2.OwnerUserId = u.Id 
+        AND p2.PostTypeId = 1 
+        AND p2.CreationDate >= DATE_SUB(cast('2024-10-01 12:34:56' as timestamp), INTERVAL 30 DAY)
+    ) as RecentQuestions,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p3 
+        WHERE p3.OwnerUserId = u.Id 
+        AND p3.PostTypeId = 2 
+        AND p3.CreationDate >= DATE_SUB(cast('2024-10-01 12:34:56' as timestamp), INTERVAL 30 DAY)
+    ) as RecentAnswers,
+    (
+        SELECT COUNT(*) 
+        FROM Comments c 
+        WHERE c.UserId = u.Id 
+        AND c.CreationDate >= DATE_SUB(cast('2024-10-01 12:34:56' as timestamp), INTERVAL 30 DAY)
+    ) as RecentComments,
+    (
+        SELECT JSON_ARRAYAGG(
+            JSON_OBJECT(
+                'TagName', t.TagName,
+                'Count', t.Count,
+                'Excerpt', IFNULL(SUBSTRING(p4.Body, 1, 100), 'No excerpt'),
+                'Wiki', IFNULL(p5.Body, 'No wiki')
+            )
+        ) 
+        FROM Posts p4
+        JOIN Posts p5 ON p5.Id = t.WikiPostId
+        JOIN Tags t ON t.Id = (SELECT Id FROM Tags WHERE TagName = SUBSTRING(p4.Tags, 2, POSITION('>' IN p4.Tags) - 2))
+        WHERE p4.OwnerUserId = u.Id AND p4.PostTypeId = 1
+        GROUP BY t.TagName
+    ) as TagAnalysis,
+    (
+        SELECT STRING_AGG(
+            CASE 
+                WHEN ph.PostHistoryTypeId = 10 THEN CONCAT('Closed: ', COALESCE(ph.Comment, 'Unknown'))
+                WHEN ph.PostHistoryTypeId = 11 THEN 'Reopened'
+                WHEN ph.PostHistoryTypeId = 12 THEN 'Deleted'
+                WHEN ph.PostHistoryTypeId = 13 THEN 'Undeleted'
+                ELSE CONCAT('Action: ', COALESCE(pht.Name, 'Unknown'))
+            END,
+            ' | '
+        )
+        FROM PostHistory ph
+        LEFT JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+        WHERE ph.UserId = u.Id
+        AND ph.CreationDate BETWEEN DATE_SUB(cast('2024-10-01 12:34:56' as timestamp), INTERVAL 7 DAY) AND cast('2024-10-01 12:34:56' as timestamp)
+    ) as RecentActivitySummary,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, COUNT(DISTINCT p.Id) DESC) as ReputationRank,
+    RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC, u.Reputation DESC) as PostRank,
+    DENSE_RANK() OVER (ORDER BY u.Reputation DESC, COUNT(DISTINCT p.Id) DESC) as DenseReputationRank,
+    LAG(u.Reputation, 1, 0) OVER (ORDER BY u.Reputation DESC) as PreviousReputation,
+    LEAD(u.Reputation, 1, 0) OVER (ORDER BY u.Reputation DESC) as NextReputation,
+    CASE 
+        WHEN COUNT(DISTINCT p.Id) > 0 AND AVG(p.Score) > 5 THEN 'Highly Active'
+        WHEN COUNT(DISTINCT p.Id) > 0 AND AVG(p.Score) > 1 THEN 'Active'
+        ELSE 'Inactive'
+    END as PostingStatus,
+    (
+        SELECT (COUNT(*) * 100.0 / (SELECT COUNT(*) FROM Posts WHERE OwnerUserId IS NOT NULL)) 
+        FROM Posts p6 
+        WHERE p6.OwnerUserId = u.Id 
+        AND p6.PostTypeId = 1
+    ) as QuestionPercentageOfAllQuestions,
+    (
+        SELECT COALESCE(SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END), 0)
+        FROM PostHistory ph
+        WHERE ph.UserId = u.Id
+        AND ph.CreationDate >= DATE_SUB(cast('2024-10-01 12:34:56' as timestamp), INTERVAL 30 DAY)
+        AND ph.PostHistoryTypeId = 10
+    ) as RecentClosings,
+    (
+        SELECT COALESCE(SUM(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END), 0)
+        FROM PostHistory ph
+        WHERE ph.UserId = u.Id
+        AND ph.CreationDate >= DATE_SUB(cast('2024-10-01 12:34:56' as timestamp), INTERVAL 30 DAY)
+        AND ph.PostHistoryTypeId = 11
+    ) as RecentReopenings
+FROM Users u
+LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+LEFT JOIN Badges b ON b.UserId = u.Id
+LEFT JOIN PostHistory ph ON ph.UserId = u.Id AND ph.CreationDate >= DATE_SUB(cast('2024-10-01 12:34:56' as timestamp), INTERVAL 30 DAY)
+LEFT JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+WHERE u.Id IN (
+    SELECT u2.Id 
+    FROM Users u2 
+    WHERE u2.Reputation BETWEEN 100 AND 100000
+    AND u2.Id NOT IN (
+        SELECT UserId 
+        FROM Votes 
+        WHERE VoteTypeId IN (4, 12) 
+        AND CreationDate >= DATE_SUB(cast('2024-10-01 12:34:56' as timestamp), INTERVAL 30 DAY)
+    )
+)
+AND (
+    EXISTS (SELECT 1 FROM Posts p7 WHERE p7.OwnerUserId = u.Id AND p7.PostTypeId = 1 AND p7.Score > 100)
+    OR EXISTS (SELECT 1 FROM Posts p8 WHERE p8.OwnerUserId = u.Id AND p8.PostTypeId = 2 AND p8.Score > 100)
+    OR EXISTS (SELECT 1 FROM Badges b2 WHERE b2.UserId = u.Id AND b2.Class IN (1, 2))
+)
+GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+HAVING 
+    COUNT(DISTINCT p.Id) >= 1 
+    AND COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) >= 1
+    AND (COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) >= 1 OR COUNT(DISTINCT b.Id) >= 3)
+ORDER BY 
+    u.Reputation DESC,
+    TotalScore DESC,
+    RecentQuestions DESC
+LIMIT 1000
+OFFSET 0;

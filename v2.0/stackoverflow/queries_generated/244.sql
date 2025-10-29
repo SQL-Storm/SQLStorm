@@ -1,0 +1,315 @@
+-- {"query": "244.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3154} 
+with recent_users as (
+    select u.id as user_id,
+           u.displayname,
+           u.reputation,
+           u.creationdate,
+           coalesce(nullif(trim(u.location), ''), 'Unknown') as location_norm,
+           date_trunc('month', u.creationdate) as cohort_month
+    from users u
+    where u.creationdate >= now() - interval '3 years'
+),
+q_and_a as (
+    select p.id,
+           p.posttypeid,
+           p.owneruserid as user_id,
+           p.creationdate,
+           p.score,
+           p.viewcount,
+           p.parentid,
+           p.acceptedanswerid,
+           p.title,
+           p.tags,
+           case when p.posttypeid = 1 then 1 else 0 end as is_question,
+           case when p.posttypeid = 2 then 1 else 0 end as is_answer
+    from posts p
+    where p.posttypeid in (1,2)
+),
+user_activity as (
+    select ru.user_id,
+           count(*) filter (where qa.is_question = 1) as questions,
+           count(*) filter (where qa.is_answer = 1) as answers,
+           sum(qa.score) as post_score_sum,
+           avg(qa.score) as post_score_avg,
+           sum(coalesce(qa.viewcount,0)) filter (where qa.is_question = 1) as question_views,
+           max(qa.creationdate) as last_post_date
+    from recent_users ru
+    left join q_and_a qa
+      on qa.user_id = ru.user_id
+     and qa.creationdate >= ru.creationdate
+    group by ru.user_id
+),
+votes_agg as (
+    select v.postid,
+           sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+           sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+           sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+           sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started,
+           sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded
+    from votes v
+    group by v.postid
+),
+qa_with_votes as (
+    select qa.*,
+           coalesce(va.upvotes,0) as upvotes,
+           coalesce(va.downvotes,0) as downvotes,
+           coalesce(va.favorites,0) as favorites,
+           coalesce(va.bounty_started,0) as bounty_started,
+           coalesce(va.bounty_awarded,0) as bounty_awarded
+    from q_and_a qa
+    left join votes_agg va
+      on va.postid = qa.id
+),
+tag_expanded as (
+    select qa.id as post_id,
+           lower(trim(tg)) as tag
+    from qa_with_votes qa
+    cross join lateral unnest(
+        case
+            when qa.tags is null then array[]::varchar[]
+            when length(qa.tags) < 3 then array[]::varchar[]
+            else string_to_array(substring(qa.tags, 2, length(qa.tags)-2), '><')
+        end
+    ) as tg
+),
+user_badges as (
+    select b.userid as user_id,
+           count(*) as badge_count,
+           sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+           sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+           sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+           max(b.date) as last_badge_date
+    from badges b
+    group by b.userid
+),
+comments_agg as (
+    select c.postid,
+           count(*) as comment_count,
+           max(c.creationdate) as last_comment_date,
+           sum(coalesce(c.score,0)) as comment_score_sum
+    from comments c
+    group by c.postid
+),
+duplicates as (
+    select pl.postid as dup_post_id,
+           pl.relatedpostid as original_post_id,
+           min(pl.creationdate) as first_marked_duplicate_at
+    from postlinks pl
+    where pl.linktypeid = 3
+    group by pl.postid, pl.relatedpostid
+),
+close_events as (
+    select ph.postid,
+           min(ph.creationdate) as first_closed_at,
+           max(ph.creationdate) as last_closed_at,
+           count(*) as close_events,
+           max(case when ph.comment ~ '^\d+$' then ph.comment::int end) filter (where ph.posthistorytypeid = 10) as any_close_reason_id
+    from posthistory ph
+    where ph.posthistorytypeid = 10
+    group by ph.postid
+),
+post_quality as (
+    select qv.id,
+           qv.user_id,
+           qv.posttypeid,
+           qv.is_question,
+           qv.is_answer,
+           qv.score,
+           qv.viewcount,
+           qv.upvotes,
+           qv.downvotes,
+           qv.favorites,
+           qv.bounty_started,
+           qv.bounty_awarded,
+           ca.comment_count,
+           coalesce(qv.upvotes - qv.downvotes, 0) as net_votes,
+           case
+               when qv.is_question = 1 and coalesce(qv.viewcount,0) > 0
+                    then (qv.upvotes::numeric - qv.downvotes::numeric) / greatest(qv.viewcount::numeric, 1)
+               else null
+           end as vote_per_view,
+           case when qv.is_answer = 1 and exists (
+                    select 1
+                    from posts ch
+                    where ch.id = qv.parentid
+                      and ch.acceptedanswerid = qv.id
+                ) then 1 else 0 end as is_accepted_answer,
+           ce.first_closed_at,
+           d.first_marked_duplicate_at
+    from qa_with_votes qv
+    left join comments_agg ca on ca.postid = qv.id
+    left join close_events ce on ce.postid = qv.id
+    left join duplicates d on d.dup_post_id = qv.id
+),
+user_rollup as (
+    select ru.user_id,
+           ru.displayname,
+           ru.reputation,
+           ru.cohort_month,
+           ru.location_norm,
+           ua.questions,
+           ua.answers,
+           ua.post_score_sum,
+           ua.post_score_avg,
+           ua.question_views,
+           ub.badge_count,
+           ub.gold_badges,
+           ub.silver_badges,
+           ub.bronze_badges,
+           ub.last_badge_date,
+           sum(pq.net_votes) as net_votes_total,
+           avg(nullif(pq.vote_per_view,0)) as avg_vote_per_view_nonzero,
+           sum(case when pq.is_accepted_answer = 1 then 1 else 0 end) as accepted_answers,
+           sum(case when pq.first_closed_at is not null then 1 else 0 end) as closed_posts,
+           sum(case when pq.first_marked_duplicate_at is not null then 1 else 0 end) as duplicate_marked_posts,
+           count(*) filter (where pq.posttypeid = 1) as total_questions_considered,
+           count(*) filter (where pq.posttypeid = 2) as total_answers_considered,
+           max(pq.first_closed_at) as last_closed_post_at
+    from recent_users ru
+    left join user_activity ua on ua.user_id = ru.user_id
+    left join user_badges ub on ub.user_id = ru.user_id
+    left join post_quality pq on pq.user_id = ru.user_id
+    group by ru.user_id, ru.displayname, ru.reputation, ru.cohort_month, ru.location_norm,
+             ua.questions, ua.answers, ua.post_score_sum, ua.post_score_avg, ua.question_views,
+             ub.badge_count, ub.gold_badges, ub.silver_badges, ub.bronze_badges, ub.last_badge_date
+),
+user_ranked as (
+    select ur.*,
+           row_number() over (partition by ur.cohort_month order by coalesce(ur.net_votes_total, -2147483648) desc, ur.reputation desc, ur.user_id) as cohort_rank,
+           rank() over (order by coalesce(ur.accepted_answers,0) desc, coalesce(ur.net_votes_total,0) desc) as global_rank_by_accepts,
+           dense_rank() over (order by coalesce(ur.badge_count,0) desc, coalesce(ur.net_votes_total,0) desc) as dense_badge_rank,
+           percentile_disc(0.9) within group (order by coalesce(ur.net_votes_total,0)) over () as p90_net_votes
+    from user_rollup ur
+),
+power_taggers as (
+    select pq.user_id,
+           count(distinct te.tag) filter (where pq.is_question = 1) as distinct_tags_asked,
+           count(*) filter (where te.tag = 'sql' and pq.is_question = 1) as sql_questions,
+           count(*) filter (where te.tag in ('postgresql','sql-server','mysql') and pq.is_answer = 1) as db_answers
+    from post_quality pq
+    left join tag_expanded te on te.post_id = pq.id
+    group by pq.user_id
+),
+final_scores as (
+    select ur.user_id,
+           ur.displayname,
+           ur.reputation,
+           ur.cohort_month,
+           ur.location_norm,
+           coalesce(ur.questions,0) as questions,
+           coalesce(ur.answers,0) as answers,
+           coalesce(ur.net_votes_total,0) as net_votes_total,
+           coalesce(ur.accepted_answers,0) as accepted_answers,
+           coalesce(ur.badge_count,0) as badge_count,
+           ur.cohort_rank,
+           ur.global_rank_by_accepts,
+           ur.dense_badge_rank,
+           pt.distinct_tags_asked,
+           pt.sql_questions,
+           pt.db_answers,
+           -- composite score mixing activity, quality, and recognition
+           (
+               0.4 * coalesce(ur.answers,0) +
+               0.3 * coalesce(ur.questions,0) +
+               0.2 * coalesce(ur.accepted_answers,0) +
+               0.1 * greatest(coalesce(ur.net_votes_total,0), 0) +
+               0.05 * coalesce(ur.badge_count,0) +
+               0.05 * coalesce(pt.db_answers,0)
+           )::numeric(18,4) as engagement_score
+    from user_ranked ur
+    left join power_taggers pt on pt.user_id = ur.user_id
+),
+location_norm as (
+    select f.*,
+           case
+             when f.location_norm ilike any (array['%usa%','%united states%','%u.s.%','%u.s.a.%']) then 'US'
+             when f.location_norm ilike any (array['%uk%','%united kingdom%','%england%','%scotland%','%wales%','%northern ireland%']) then 'UK'
+             when f.location_norm ilike any (array['%india%']) then 'India'
+             when f.location_norm ilike any (array['%germany%','%deutschland%']) then 'Germany'
+             when f.location_norm = 'Unknown' then 'Unknown'
+             else 'Other'
+           end as country_bucket
+    from final_scores f
+),
+thresholds as (
+    select
+        percentile_disc(0.75) within group (order by engagement_score) as p75_engagement,
+        percentile_disc(0.90) within group (order by engagement_score) as p90_engagement
+    from location_norm
+),
+flagged_users as (
+    select ln.*,
+           t.p75_engagement,
+           t.p90_engagement,
+           case
+             when ln.engagement_score >= t.p90_engagement then 'Elite'
+             when ln.engagement_score >= t.p75_engagement then 'High'
+             else 'Normal'
+           end as tier,
+           case
+             when coalesce(ln.answers,0) = 0 and coalesce(ln.questions,0) = 0 then 1
+             when coalesce(ln.net_votes_total,0) < 0 then 1
+             else 0
+           end as anomaly_flag
+    from location_norm ln
+    cross join thresholds t
+),
+cohort_summary as (
+    select
+        ln.cohort_month,
+        ln.country_bucket,
+        count(*) as users_in_bucket,
+        avg(ln.engagement_score) as avg_engagement,
+        sum(case when ln.tier = 'Elite' then 1 else 0 end) as elite_users,
+        sum(ln.anomaly_flag) as anomalies
+    from flagged_users ln
+    group by ln.cohort_month, ln.country_bucket
+),
+user_top_posts as (
+    select pq.user_id,
+           pq.id as post_id,
+           pq.posttypeid,
+           pq.net_votes,
+           pq.vote_per_view,
+           row_number() over (partition by pq.user_id order by pq.net_votes desc nulls last, pq.id) as rn
+    from post_quality pq
+)
+select
+    fu.user_id,
+    fu.displayname,
+    fu.reputation,
+    to_char(fu.cohort_month, 'YYYY-MM') as cohort_month,
+    fu.country_bucket,
+    fu.tier,
+    fu.engagement_score,
+    fu.net_votes_total,
+    fu.accepted_answers,
+    fu.badge_count,
+    fu.cohort_rank,
+    fu.global_rank_by_accepts,
+    fu.dense_badge_rank,
+    fu.sql_questions,
+    fu.db_answers,
+    cs.users_in_bucket,
+    cs.avg_engagement,
+    cs.elite_users,
+    cs.anomalies,
+    up.post_id as top_post_id,
+    up.posttypeid as top_post_type,
+    up.net_votes as top_post_net_votes,
+    up.vote_per_view as top_post_vote_per_view
+from flagged_users fu
+left join lateral (
+    select post_id, posttypeid, net_votes, vote_per_view
+    from user_top_posts utp
+    where utp.user_id = fu.user_id
+      and utp.rn = 1
+) up on true
+left join cohort_summary cs
+  on cs.cohort_month = fu.cohort_month
+ and cs.country_bucket = fu.country_bucket
+where
+    (fu.tier in ('Elite','High') or fu.anomaly_flag = 1)
+  and coalesce(fu.engagement_score,0) >= 0
+order by fu.tier asc, fu.engagement_score desc, fu.user_id
+limit 500;

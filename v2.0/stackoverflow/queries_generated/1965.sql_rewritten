@@ -1,0 +1,272 @@
+-- {"query": "1965.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3944} 
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.Views AS UserViews,
+        U.CreationDate AS UserCreationDate,
+        U.UpVotes AS UserUpVotesGiven,
+        U.DownVotes AS UserDownVotesGiven,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        AVG(P.Score) FILTER (WHERE P.PostTypeId IN (1, 2)) AS AvgPostScore,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(P.LastActivityDate) AS LastPostActivity,
+        MAX(C.CreationDate) AS LastCommentActivity,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived
+    FROM
+        Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Votes V ON P.Id = V.PostId AND V.VoteTypeId IN (2, 3)
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.Views, U.CreationDate, U.UpVotes, U.DownVotes
+),
+PostHistoricalMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.LastActivityDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.Title,
+        P.Body, -- Include Body for potential string searches later
+        P.Tags,
+        P.ClosedDate,
+        PH_Close.CreationDate AS CloseDateHistory,
+        CRT.Name AS CloseReason,
+        COUNT(DISTINCT PH_Edit.UserId) AS UniqueEditors,
+        MAX(PH_Edit.CreationDate) AS LastEditDateHistory,
+        MAX(PH_Open.CreationDate) AS LastReopenDate,
+        MAX(PH_Delete.CreationDate) AS LastDeleteDate,
+        COALESCE(ARRAY_LENGTH(STRING_TO_ARRAY(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><'), 1), 0) AS TagCount,
+        SUM(CASE WHEN C.Score >= 5 THEN 1 ELSE 0 END) AS HighScoreCommentsCount,
+        AVG(C.Score) AS AvgCommentScore,
+        (SELECT Text FROM Comments WHERE PostId = P.Id ORDER BY CreationDate DESC LIMIT 1) AS LatestCommentText -- Correlated subquery for latest comment text
+    FROM
+        Posts P
+    LEFT JOIN PostHistory PH_Close ON P.Id = PH_Close.PostId AND PH_Close.PostHistoryTypeId = 10
+    LEFT JOIN CloseReasonTypes CRT ON PH_Close.Comment = CRT.Id::varchar(50)
+    LEFT JOIN PostHistory PH_Edit ON P.Id = PH_Edit.PostId AND PH_Edit.PostHistoryTypeId IN (4, 5, 6)
+    LEFT JOIN PostHistory PH_Open ON P.Id = PH_Open.PostId AND PH_Open.PostHistoryTypeId = 11
+    LEFT JOIN PostHistory PH_Delete ON P.Id = PH_Delete.PostId AND PH_Delete.PostHistoryTypeId = 12
+    LEFT JOIN Comments C ON P.Id = C.PostId
+    GROUP BY
+        P.Id, P.PostTypeId, P.OwnerUserId, P.CreationDate, P.LastActivityDate, P.Score, P.ViewCount, P.AnswerCount, P.CommentCount, P.FavoriteCount, P.Title, P.Body, P.Tags, P.ClosedDate, PH_Close.CreationDate, CRT.Name
+),
+RankedPosts AS (
+    SELECT
+        PHM.*,
+        ROW_NUMBER() OVER (PARTITION BY PHM.OwnerUserId ORDER BY PHM.PostScore DESC, PHM.ViewCount DESC) AS Rnk_UserTopPostScoreView,
+        RANK() OVER (PARTITION BY PHM.PostTypeId ORDER BY PHM.FavoriteCount DESC NULLS LAST, PHM.PostScore DESC) AS Rnk_PostTypeFavoriteScore,
+        SUM(PHM.PostScore) OVER (PARTITION BY PHM.OwnerUserId ORDER BY PHM.PostCreationDate) AS RunningUserScoreSum,
+        COUNT(PHM.PostId) OVER (PARTITION BY PHM.OwnerUserId) AS UserPostCount
+    FROM
+        PostHistoricalMetrics PHM
+),
+-- CTE demonstrating a set operator to categorize posts by recent activity types
+DistinctPostActivitySummary AS (
+    -- Posts that have been edited in the last year
+    SELECT DISTINCT
+        PH.PostId,
+        'RecentlyEdited' AS ActionType,
+        PH.CreationDate AS ActionDate
+    FROM
+        PostHistory PH
+    WHERE
+        PH.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Body, Tags
+        AND PH.CreationDate >= (cast('2024-10-01' as date) - INTERVAL '1 year')
+
+    UNION ALL
+
+    -- Posts that have received comments in the last 6 months with score > 0
+    SELECT DISTINCT
+        C.PostId,
+        'RecentlyCommented' AS ActionType,
+        C.CreationDate AS ActionDate
+    FROM
+        Comments C
+    WHERE
+        C.Score > 0
+        AND C.CreationDate >= (cast('2024-10-01' as date) - INTERVAL '6 months')
+)
+-- First branch of the UNION ALL: High-reputation users with significant posts
+SELECT
+    UE.UserId,
+    UE.DisplayName,
+    UE.Reputation,
+    UE.TotalQuestions,
+    UE.TotalAnswers,
+    COALESCE(UE.AvgPostScore, 0) AS AvgPostScore,
+    UE.GoldBadges,
+    UE.SilverBadges,
+    UE.BronzeBadges,
+    UE.UpVotesReceived,
+    UE.DownVotesReceived,
+    UE.LastPostActivity,
+    RP.PostId,
+    RP.Title AS PostTitle,
+    RP.PostScore,
+    RP.ViewCount,
+    RP.AnswerCount,
+    RP.CommentCount,
+    RP.TagCount,
+    RP.CloseReason,
+    RP.UniqueEditors,
+    RP.LastEditDateHistory,
+    RP.Rnk_UserTopPostScoreView,
+    RP.Rnk_PostTypeFavoriteScore,
+    RP.RunningUserScoreSum,
+    RP.LatestCommentText,
+    COALESCE(STRING_AGG(DISTINCT DPAS.ActionType, ', ') FILTER (WHERE DPAS.ActionType IS NOT NULL), 'NoRecentActivity') AS RecentActionTypes,
+    CASE
+        WHEN RP.PostTypeId = 1 AND RP.AnswerCount > 0 AND RP.ClosedDate IS NULL THEN 'Active Question with Answers'
+        WHEN RP.PostTypeId = 1 AND RP.ClosedDate IS NOT NULL THEN 'Closed Question'
+        WHEN RP.PostTypeId = 2 AND RP.PostScore >= 100 THEN 'Highly Scored Answer'
+        ELSE 'Other Post Type'
+    END AS PostStatusCategory,
+    PL.RelatedPostId AS LinkedPostId,
+    LT.Name AS LinkTypeName,
+    TG.TagName,
+    STRING_AGG(CASE WHEN V.VoteTypeId = 2 THEN 'UP' WHEN V.VoteTypeId = 3 THEN 'DOWN' ELSE NULL END, ', ') WITHIN GROUP (ORDER BY V.CreationDate DESC) AS RecentPostVoteTypes,
+    (SELECT COUNT(DISTINCT T.Id) FROM Tags T WHERE PTM.Tags LIKE '%' || T.TagName || '%') AS MatchedTagCountAgainstTagsTable,
+    SUM(CASE WHEN V.VoteTypeId = 2 AND V.CreationDate >= (cast('2024-10-01' as date) - INTERVAL '30 days') THEN 1 ELSE 0 END) OVER (PARTITION BY UE.UserId) AS RecentUpVotesByOwner,
+    NULLIF(UE.UpVotesReceived - UE.DownVotesReceived, 0) AS NetPostVotesForUser,
+    LENGTH(RP.Body) AS PostBodyLength,
+    LENGTH(RP.Title) AS PostTitleLength,
+    'HighReputationUserFilter' AS ResultSourceType,
+    UE.UserCreationDate AS UserCreationDate,
+    RP.Body AS PostBody
+FROM
+    UserEngagement UE
+INNER JOIN RankedPosts RP ON UE.UserId = RP.OwnerUserId
+LEFT JOIN PostLinks PL ON RP.PostId = PL.PostId
+LEFT JOIN LinkTypes LT ON PL.LinkTypeId = LT.Id
+LEFT JOIN Posts PTM ON RP.PostId = PTM.Id
+LEFT JOIN LATERAL (SELECT TagName FROM Tags WHERE PTM.Tags LIKE '%' || TagName || '%' LIMIT 1) TG ON TRUE
+LEFT JOIN Votes V ON RP.PostId = V.PostId AND V.CreationDate >= (cast('2024-10-01' as date) - INTERVAL '60 days') AND V.VoteTypeId IN (2,3)
+LEFT JOIN DistinctPostActivitySummary DPAS ON RP.PostId = DPAS.PostId
+WHERE
+    UE.Reputation >= 5000
+    AND RP.PostCreationDate >= (cast('2024-10-01' as date) - INTERVAL '5 year')
+    AND (RP.PostTypeId = 1 OR RP.PostTypeId = 2)
+    AND (RP.PostScore > 10 OR RP.ViewCount > 500)
+    AND (RP.LatestCommentText IS NOT NULL OR RP.HighScoreCommentsCount > 0)
+    AND NOT EXISTS (
+        SELECT 1
+        FROM PostHistory PH_Spam
+        WHERE PH_Spam.PostId = RP.PostId AND PH_Spam.PostHistoryTypeId = 12
+          AND PH_Spam.CreationDate > RP.PostCreationDate
+    )
+    AND (RP.Body LIKE '%solution%' OR RP.Title LIKE '%performance%') -- String search in body or title
+GROUP BY
+    UE.UserId, UE.DisplayName, UE.Reputation, UE.TotalQuestions, UE.TotalAnswers, UE.AvgPostScore,
+    UE.GoldBadges, UE.SilverBadges, UE.BronzeBadges, UE.UpVotesReceived, UE.DownVotesReceived,
+    UE.LastPostActivity, RP.PostId, RP.Title, RP.PostScore, RP.ViewCount, RP.AnswerCount,
+    RP.CommentCount, RP.TagCount, RP.CloseReason, RP.UniqueEditors, RP.LastEditDateHistory,
+    RP.Rnk_UserTopPostScoreView, RP.Rnk_PostTypeFavoriteScore, RP.RunningUserScoreSum,
+    RP.LatestCommentText, RP.PostTypeId, RP.ClosedDate, PL.RelatedPostId, LT.Name, TG.TagName, PTM.Tags,
+    RP.Body, UE.UserCreationDate
+HAVING
+    COUNT(DISTINCT V.VoteTypeId) > 0 OR SUM(UE.UpVotesReceived) > 1000
+
+UNION ALL
+
+-- Second branch of the UNION ALL: Highly viewed questions from any user, with complex filtering
+SELECT
+    UE.UserId,
+    UE.DisplayName,
+    UE.Reputation,
+    UE.TotalQuestions,
+    UE.TotalAnswers,
+    COALESCE(UE.AvgPostScore, 0) AS AvgPostScore,
+    UE.GoldBadges,
+    UE.SilverBadges,
+    UE.BronzeBadges,
+    UE.UpVotesReceived,
+    UE.DownVotesReceived,
+    UE.LastPostActivity,
+    RP.PostId,
+    RP.Title AS PostTitle,
+    RP.PostScore,
+    RP.ViewCount,
+    RP.AnswerCount,
+    RP.CommentCount,
+    RP.TagCount,
+    RP.CloseReason,
+    RP.UniqueEditors,
+    RP.LastEditDateHistory,
+    RP.Rnk_UserTopPostScoreView,
+    RP.Rnk_PostTypeFavoriteScore,
+    RP.RunningUserScoreSum,
+    RP.LatestCommentText,
+    COALESCE(STRING_AGG(DISTINCT DPAS.ActionType, ', ') FILTER (WHERE DPAS.ActionType IS NOT NULL), 'NoRecentActivity') AS RecentActionTypes,
+    CASE
+        WHEN RP.PostTypeId = 1 AND RP.AnswerCount > 0 AND RP.ClosedDate IS NULL THEN 'Active Question with Answers'
+        WHEN RP.PostTypeId = 1 AND RP.ClosedDate IS NOT NULL THEN 'Closed Question'
+        WHEN RP.PostTypeId = 2 AND RP.PostScore >= 100 THEN 'Highly Scored Answer'
+        ELSE 'Other Post Type'
+    END AS PostStatusCategory,
+    PL.RelatedPostId AS LinkedPostId,
+LT.Name AS LinkTypeName,
+    TG.TagName,
+    STRING_AGG(CASE WHEN V.VoteTypeId = 2 THEN 'UP' WHEN V.VoteTypeId = 3 THEN 'DOWN' ELSE NULL END, ', ') WITHIN GROUP (ORDER BY V.CreationDate DESC) AS RecentPostVoteTypes,
+    (SELECT COUNT(DISTINCT T.Id) FROM Tags T WHERE PTM.Tags LIKE '%' || T.TagName || '%') AS MatchedTagCountAgainstTagsTable,
+    SUM(CASE WHEN V.VoteTypeId = 2 AND V.CreationDate >= (cast('2024-10-01' as date) - INTERVAL '30 days') THEN 1 ELSE 0 END) OVER (PARTITION BY UE.UserId) AS RecentUpVotesByOwner,
+    NULLIF(UE.UpVotesReceived - UE.DownVotesReceived, 0) AS NetPostVotesForUser,
+    LENGTH(RP.Body) AS PostBodyLength,
+    LENGTH(RP.Title) AS PostTitleLength,
+    'HighlyViewedPostFilter' AS ResultSourceType,
+    UE.UserCreationDate AS UserCreationDate,
+    RP.Body AS PostBody
+FROM
+    UserEngagement UE
+INNER JOIN RankedPosts RP ON UE.UserId = RP.OwnerUserId
+LEFT JOIN PostLinks PL ON RP.PostId = PL.PostId
+LEFT JOIN LinkTypes LT ON PL.LinkTypeId = LT.Id
+LEFT JOIN Posts PTM ON RP.PostId = PTM.Id
+LEFT JOIN LATERAL (SELECT TagName FROM Tags WHERE PTM.Tags LIKE '%' || TagName || '%' LIMIT 1) TG ON TRUE
+LEFT JOIN Votes V ON RP.PostId = V.PostId AND V.CreationDate >= (cast('2024-10-01' as date) - INTERVAL '60 days') AND V.VoteTypeId IN (2,3)
+LEFT JOIN DistinctPostActivitySummary DPAS ON RP.PostId = DPAS.PostId
+WHERE
+    RP.ViewCount >= 50000
+    AND RP.PostCreationDate >= (cast('2024-10-01' as date) - INTERVAL '10 year')
+    AND RP.PostTypeId = 1
+    AND RP.AnswerCount >= 5
+    AND RP.LastActivityDate >= (cast('2024-10-01' as date) - INTERVAL '1 year')
+    AND (RP.Body LIKE '%question%' OR RP.Body LIKE '%example%') -- Another string search
+    AND NOT EXISTS (
+        SELECT 1
+        FROM PostHistory PH_Closed
+        WHERE PH_Closed.PostId = RP.PostId AND PH_Closed.PostHistoryTypeId = 10 AND PH_Closed.CreationDate > RP.PostCreationDate
+    )
+    AND EXISTS (
+        SELECT 1
+        FROM Tags T_Inner
+        WHERE PTM.Tags LIKE '%' || T_Inner.TagName || '%' AND T_Inner.Count > 100000
+    ) -- Subquery using Tags table
+GROUP BY
+    UE.UserId, UE.DisplayName, UE.Reputation, UE.TotalQuestions, UE.TotalAnswers, UE.AvgPostScore,
+    UE.GoldBadges, UE.SilverBadges, UE.BronzeBadges, UE.UpVotesReceived, UE.DownVotesReceived,
+    UE.LastPostActivity, RP.PostId, RP.Title, RP.PostScore, RP.ViewCount, RP.AnswerCount,
+    RP.CommentCount, RP.TagCount, RP.CloseReason, RP.UniqueEditors, RP.LastEditDateHistory,
+    RP.Rnk_UserTopPostScoreView, RP.Rnk_PostTypeFavoriteScore, RP.RunningUserScoreSum,
+    RP.LatestCommentText, RP.PostTypeId, RP.ClosedDate, PL.RelatedPostId, LT.Name, TG.TagName, PTM.Tags,
+    RP.Body, UE.UserCreationDate
+HAVING
+    SUM(RP.PostScore) > 200 OR COUNT(DISTINCT DPAS.PostId) > 1
+ORDER BY
+    Reputation DESC, PostScore DESC, LastActivityDate DESC
+LIMIT 1000;

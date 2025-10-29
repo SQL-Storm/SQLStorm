@@ -1,0 +1,157 @@
+-- {"query": "5069.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1265} 
+WITH
+-- 1) Rank users by activity and reputation with a windowed metric
+UserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.ProfileImageUrl,
+    COUNT(p.Id) AS PostCount,
+    COUNT(v.Id) AS VoteCount
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.UserId = u.Id
+  WHERE u.AccountId IS NOT NULL
+  GROUP BY
+    u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate,
+    u.Location, u.Views, u.UpVotes, u.DownVotes, u.ProfileImageUrl
+),
+-- 2) Complex time-bounded activity: posts created in the last 365 days with nested aggregates
+RecentActivity AS (
+  SELECT
+    p.OwnerUserId AS UserId,
+    COUNT(*) FILTER (WHERE p.PostTypeId = 1) AS QuestionsLastYear,
+    COUNT(*) FILTER (WHERE p.PostTypeId = 2) AS AnswersLastYear,
+    SUM(CASE WHEN p.ViewCount > 0 THEN p.ViewCount ELSE 0 END) AS ViewsLastYear,
+    MAX(p.LastActivityDate) AS LastActive
+  FROM Posts p
+  WHERE p.CreationDate >= NOW() - INTERVAL '365 days'
+  GROUP BY p.OwnerUserId
+),
+-- 3) Correlated subquery: for each user, determine the closest close reason value from PostHistory
+CloseReasonStats AS (
+  SELECT
+    u.Id AS UserId,
+    MAX(CASE
+          WHEN ph.PostHistoryTypeId = 10 THEN CAST((ph.Comment ->> 'CloseReasonId') AS int)
+          ELSE NULL
+        END) AS MostRecentCloseReasonId
+  FROM Users u
+  LEFT JOIN Posts po ON po.OwnerUserId = u.Id
+  LEFT JOIN PostHistory ph ON ph.PostId = po.Id
+  WHERE ph.PostHistoryTypeId = 10
+  GROUP BY u.Id
+),
+-- 4) A set operation: union of top badges and top tags interactions per user
+TopBadgesAndTags AS (
+  SELECT
+    b.UserId,
+    b.Name AS BadgeName,
+    NULL::text AS TagName,
+    b.Date AS EventDate,
+    1 AS Source
+  FROM Badges b
+  UNION ALL
+  SELECT
+    t.UserId,
+    NULL::text AS BadgeName,
+    t.TagName AS TagName,
+    t.CreationDate AS EventDate,
+    2 AS Source
+  FROM (
+    SELECT
+      v.UserId,
+      t.TagName,
+      MAX(v.CreationDate) AS CreationDate
+    FROM Votes v
+    JOIN Posts p ON p.Id = v.PostId
+    JOIN UNNEST(string_to_array(p.Tags, '>')) AS t(TagName) ON true
+    WHERE v.VoteTypeId IN (2, 6) -- upvotes / close votes as proxy activity
+    GROUP BY v.UserId, t.TagName
+  ) t
+),
+-- 5) Windowed ranking of posts by score per user
+RankedPosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.Title,
+    p.CreationDate,
+    ROW_NUMBER() OVER (
+      PARTITION BY p.OwnerUserId
+      ORDER BY p.Score DESC NULLS LAST, p.ViewCount DESC NULLS LAST, p.CreationDate ASC
+    ) AS PostRank
+  FROM Posts p
+  WHERE p.ParentId IS NULL -- top-level posts
+),
+-- 6) Cross join with a challenging predicate combining NULLs and expressions
+ComplexFilter AS (
+  SELECT
+    rp.PostId,
+    rp.OwnerUserId,
+    rp.Score,
+    rp.ViewCount,
+    rp.Title,
+    rp.CreationDate,
+    CASE
+      WHEN rp.Score IS NULL THEN 0
+      ELSE rp.Score
+    END +
+    COALESCE(NULLIF(RIGHT(rp.Title, 3), ''), 0) AS ScoreWithSuffix,
+    CASE
+      WHEN rp.ViewCount IS NULL THEN 0
+      ELSE rp.ViewCount
+    END *
+    CASE
+      WHEN EXTRACT(DAY FROM CURRENT_DATE - DATE(rp.CreationDate)) < 30 THEN 2
+      ELSE 1
+    END AS WeightedViews
+  FROM RankedPosts rp
+  WHERE rp.PostRank <= 100
+),
+-- 7) Nested CTE joins to create a wide benchmarking row per user
+BenchmarkRow AS (
+  SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ra.QuestionsLastYear,
+    ra.AnswersLastYear,
+    ra.ViewsLastYear,
+    crs.MostRecentCloseReasonId,
+    tbad.EventDate,
+    tbad.Source,
+    bp.PostId,
+    bp.ScoreWithSuffix,
+    bp.WeightedViews
+  FROM UserActivity ua
+  LEFT JOIN RecentActivity ra ON ra.UserId = ua.UserId
+  LEFT JOIN CloseReasonStats crs ON crs.UserId = ua.UserId
+  LEFT JOIN TopBadgesAndTags tbad ON tbad.UserId = ua.UserId
+  LEFT JOIN ComplexFilter bp ON bp.OwnerUserId = ua.UserId
+)
+SELECT
+  br.UserId,
+  br.DisplayName,
+  br.Reputation,
+  br.QuestionsLastYear,
+  br.AnswersLastYear,
+  br.ViewsLastYear,
+  br.MostRecentCloseReasonId,
+  br.EventDate,
+  br.Source,
+  br.PostId,
+  br.ScoreWithSuffix,
+  br.WeightedViews
+FROM BenchmarkRow br
+ORDER BY br.Reputation DESC NULLS LAST, br.QuestionsLastYear DESC NULLS LAST, br.EventDate DESC NULLS LAST
+LIMIT 100;

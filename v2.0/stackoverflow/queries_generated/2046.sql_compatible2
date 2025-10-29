@@ -1,0 +1,126 @@
+with RecursiveUserBadges as (
+  select u.Id as UserId, u.DisplayName,
+         b.Name as BadgeName, b.Class as BadgeClass,
+         row_number() over (partition by u.Id order by b.Date desc, b.Class) as BadgeRank
+  from Users u
+  left join Badges b
+    on b.UserId = u.Id
+  where u.Reputation > 1000
+),
+LatestPostEdits as (
+  select ph.PostId,
+         max(ph.CreationDate) as LastEditDate
+  from PostHistory ph
+  where ph.PostHistoryTypeId in (4,5,6)
+  group by ph.PostId
+),
+TopQuestionsWithAnswers as (
+  select p.Id as QuestionId,
+         p.Title,
+         p.OwnerUserId,
+         u.DisplayName as OwnerName,
+         p.ViewCount,
+         p.Score as QuestionScore,
+         p.AnswerCount,
+         (select count(*)
+          from Posts a
+          where a.ParentId = p.Id and a.Score > 0) as PositiveAnswerCount,
+         (select avg(a.Score * 1.0)
+          from Posts a
+          where a.ParentId = p.Id) as AvgAnswerScore,
+         LatestPostEdits.LastEditDate
+  from Posts p
+  join PostTypes pt on pt.Id = p.PostTypeId and pt.Name = 'Question'
+  left join Users u on u.Id = p.OwnerUserId
+  left join LatestPostEdits on LatestPostEdits.PostId = p.Id
+  where p.CreationDate > cast('2024-10-01' as date) - interval '1 year'
+    and p.Score > 5
+    and p.AnswerCount > 2
+),
+LinkStats as (
+  select pl.PostId,
+         count(distinct pl.RelatedPostId) as RelatedPostsCount,
+         sum(case when pl.LinkTypeId = 3 then 1 else 0 end) as DuplicateLinkCount
+  from PostLinks pl
+  group by pl.PostId
+),
+UserVoteSummary as (
+  select v.UserId,
+         count(case when vt.Name = 'UpMod' then 1 end) as UpVotesCast,
+         count(case when vt.Name = 'DownMod' then 1 end) as DownVotesCast,
+         count(distinct v.PostId) as PostsVotedOn
+  from Votes v
+  join VoteTypes vt on vt.Id = v.VoteTypeId
+  where v.UserId is not null
+  group by v.UserId
+)
+select 
+  tq.QuestionId,
+  tq.Title,
+  coalesce(tq.OwnerName, 'unknown') as OwnerName,
+  tq.ViewCount,
+  tq.QuestionScore,
+  tq.AnswerCount,
+  tq.PositiveAnswerCount,
+  round(tq.AvgAnswerScore, 2) as AvgAnswerScore,
+  coalesce(ls.RelatedPostsCount, 0) as RelatedPostsCount,
+  coalesce(ls.DuplicateLinkCount, 0) as DuplicateLinkCount,
+  r.UserId,
+  r.BadgeName,
+  case r.BadgeClass
+    when 1 then 'Gold'
+    when 2 then 'Silver'
+    when 3 then 'Bronze'
+    else 'Unknown'
+  end as BadgeClass,
+  uv.UpVotesCast,
+  uv.DownVotesCast,
+  uv.PostsVotedOn,
+  case
+    when tq.LastEditDate is null then 'No Edits'
+    else to_char(tq.LastEditDate, 'YYYY-MM-DD')
+  end as LastEditDate,
+  coalesce(u.Location, 'Unknown') as UserLocation,
+  case 
+    when strpos(coalesce(tq.Title, ''), 'SQL') > 0 then 'Contains SQL'
+    else 'No SQL Keyword'
+  end as TitleContainsSQL,
+  case when (coalesce(uv.UpVotesCast,0) - coalesce(uv.DownVotesCast,0)) > 100 then 'Positive Voting Bias'
+       when (coalesce(uv.UpVotesCast,0) - coalesce(uv.DownVotesCast,0)) < -50 then 'Negative Voting Bias'
+       else 'Neutral Voting Bias'
+  end as VotingBias,
+  coalesce(u.WebsiteUrl, 'No Website') as WebsiteUrl
+from TopQuestionsWithAnswers tq
+left join LinkStats ls on ls.PostId = tq.QuestionId
+left join RecursiveUserBadges r on r.UserId = tq.OwnerUserId and r.BadgeRank = 1
+left join UserVoteSummary uv on uv.UserId = tq.OwnerUserId
+left join Users u on u.Id = tq.OwnerUserId
+where (coalesce(ls.DuplicateLinkCount,0) > 0 or coalesce(tq.PositiveAnswerCount,0) > 3)
+  and (r.BadgeClass is null or r.BadgeClass <= 2)
+union
+select 
+  null as QuestionId,
+  'Aggregate Stats' as Title,
+  null as OwnerName,
+  null as ViewCount,
+  avg(p.Score) as QuestionScore,
+  avg(p.AnswerCount) as AnswerCount,
+  null as PositiveAnswerCount,
+  null as AvgAnswerScore,
+  null as RelatedPostsCount,
+  null as DuplicateLinkCount,
+  null as UserId,
+  null as BadgeName,
+  null as BadgeClass,
+  null as UpVotesCast,
+  null as DownVotesCast,
+  null as PostsVotedOn,
+  null as LastEditDate,
+  null as UserLocation,
+  null as TitleContainsSQL,
+  null as VotingBias,
+  null as WebsiteUrl
+from Posts p
+join PostTypes pt on pt.Id = p.PostTypeId and pt.Name = 'Question'
+where p.CreationDate > cast('2024-10-01' as date) - interval '1 year'
+;

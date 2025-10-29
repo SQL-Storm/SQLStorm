@@ -1,0 +1,160 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        ARRAY[t.Id] AS AncestorPath
+    FROM Tags t
+    WHERE t.IsModeratorOnly = FALSE AND t.IsRequired = FALSE
+
+    UNION ALL
+
+    SELECT 
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        r.AncestorPath || t2.Id
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r ON array_position(r.AncestorPath, t2.Id) IS NULL
+    WHERE t2.IsModeratorOnly = FALSE
+      AND t2.IsRequired = FALSE
+      AND t2.Count < r.Count
+),
+UserBadgeRanks AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        b.Class,
+        COUNT(*) AS BadgeCount
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId 
+    GROUP BY u.Id, u.DisplayName, u.Reputation, b.Class
+),
+UserPostScores AS (
+    SELECT 
+        p.OwnerUserId,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionsCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswersCount,
+        SUM(p.Score) AS TotalPostScore,
+        SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS QuestionsWithAcceptedAnswerCount,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) AS AvgAnswerScore
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL AND p.OwnerUserId <> -1
+    GROUP BY p.OwnerUserId
+),
+PostRankings AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.AnswerCount,
+        p.ViewCount,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS ScoreRank,
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.AnswerCount DESC) AS AnswerCountRank
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+CloseReasonCounts AS (
+    SELECT 
+        cht.Name AS CloseReasonName,
+        COUNT(ph.Id) AS CloseCount
+    FROM PostHistory ph
+    JOIN PostHistoryTypes cht_types ON ph.PostHistoryTypeId = cht_types.Id
+    JOIN CloseReasonTypes cht ON CAST(ph.Comment AS INTEGER) = cht.Id
+    WHERE ph.PostHistoryTypeId = 10 AND ph.Comment ~ '^\d+$'
+    GROUP BY cht.Name
+    ORDER BY CloseCount DESC
+),
+QualifiedPosts AS (
+    SELECT p.Id, p.Title, p.Tags, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount,
+        array_length(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><'), 1) AS TagCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Score > 10 AND p.ViewCount > 1000 AND p.Tags IS NOT NULL
+),
+RecentCommentsPerPost AS (
+    SELECT 
+        c.PostId,
+        c.Text,
+        c.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY c.PostId ORDER BY c.CreationDate DESC) AS rn
+    FROM Comments c
+),
+PostsWithLatestComment AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.Tags,
+        q.Score,
+        q.ViewCount,
+        rc.Text AS LatestCommentText,
+        rc.CreationDate AS LatestCommentDate
+    FROM QualifiedPosts q
+    LEFT JOIN RecentCommentsPerPost rc ON q.Id = rc.PostId AND rc.rn = 1
+),
+UserActivitySummary AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        COALESCE(SUM(vt_count.Upvotes),0) AS TotalUpvotesReceived,
+        COALESCE(SUM(vt_count.Downvotes),0) AS TotalDownvotesReceived
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN (
+        SELECT
+            p.OwnerUserId AS OwnerUserId,
+            SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS Upvotes,
+            SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS Downvotes
+        FROM Votes v
+        JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+        JOIN Posts p ON v.PostId = p.Id
+        GROUP BY p.OwnerUserId
+    ) vt_count ON vt_count.OwnerUserId = u.Id
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+)
+SELECT 
+    pas.DisplayName,
+    pas.Reputation,
+    pas.TotalPosts,
+    pas.Questions,
+    pas.Answers,
+    pas.CommentsMade,
+    pas.TotalUpvotesReceived,
+    pas.TotalDownvotesReceived,
+    COALESCE(ubr_badge_gold.BadgeCount,0) AS GoldBadges,
+    COALESCE(ubr_badge_silver.BadgeCount,0) AS SilverBadges,
+    COALESCE(ubr_badge_bronze.BadgeCount,0) AS BronzeBadges,
+    JSON_AGG(JSON_BUILD_OBJECT(
+        'PostId', pq.Id,
+        'Title', pq.Title,
+        'Score', pq.Score,
+        'ViewCount', pq.ViewCount,
+        'TagCount', pwlc.LatestCommentText IS NOT NULL OR pq.Id IS NOT NULL THEN pwlc.QuestionId END, -- placeholder to ensure grouping correctness
+        'LatestComment', pwlc.LatestCommentText
+    ) ORDER BY pq.Score DESC) FILTER (WHERE pq.Id IS NOT NULL) AS TopPosts
+FROM UserActivitySummary pas
+LEFT JOIN UserBadgeRanks ubr_badge_gold ON pas.Id = ubr_badge_gold.UserId AND ubr_badge_gold.Class = 1
+LEFT JOIN UserBadgeRanks ubr_badge_silver ON pas.Id = ubr_badge_silver.UserId AND ubr_badge_silver.Class = 2
+LEFT JOIN UserBadgeRanks ubr_badge_bronze ON pas.Id = ubr_badge_bronze.UserId AND ubr_badge_bronze.Class = 3
+LEFT JOIN LATERAL (
+    SELECT q.*
+    FROM Posts q
+    WHERE q.OwnerUserId = pas.Id AND q.Score > 50
+    ORDER BY q.Score DESC
+    LIMIT 5
+) pq ON TRUE
+LEFT JOIN PostsWithLatestComment pwlc ON pq.Id = pwlc.QuestionId
+WHERE pas.TotalPosts > 100
+GROUP BY pas.Id, pas.DisplayName, pas.Reputation, pas.TotalPosts, pas.Questions, pas.Answers, pas.CommentsMade, pas.TotalUpvotesReceived, pas.TotalDownvotesReceived, ubr_badge_gold.BadgeCount, ubr_badge_silver.BadgeCount, ubr_badge_bronze.BadgeCount
+ORDER BY pas.Reputation DESC
+LIMIT 20;

@@ -1,0 +1,67 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.Title,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.LastActivityDate,
+        U.DisplayName AS OwnerDisplayName,
+        U.Reputation,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.ViewCount DESC) AS Rank
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId = 1 AND P.Score > 0 AND P.ViewCount > 100
+),
+BadgeCounts AS (
+    SELECT 
+        B.UserId,
+        COUNT(B.Id) AS BadgeCount,
+        MAX(CASE WHEN B.TagBased = 1 THEN B.Date ELSE NULL END) AS LatestTagBadgeDate,
+        MAX(CASE WHEN B.TagBased = 0 THEN B.Date ELSE NULL END) AS LatestNamedBadgeDate
+    FROM 
+        Badges B
+    GROUP BY 
+        B.UserId
+)
+SELECT 
+    RP.Id,
+    RP.Title,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.LastActivityDate,
+    RP.Rank,
+    RP.OwnerDisplayName,
+    RP.Reputation,
+    BC.BadgeCount,
+    BC.LatestTagBadgeDate,
+    BC.LatestNamedBadgeDate,
+    SUM(V.BountyAmount) OVER (PARTITION BY RP.Id ORDER BY V.CreationDate
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativeBounty
+FROM 
+    RankedPosts RP
+LEFT JOIN 
+    BadgeCounts BC ON RP.OwnerDisplayName = BC.UserId
+LEFT JOIN 
+    Votes V ON RP.Id = V.PostId AND V.VoteTypeId = 8
+WHERE 
+    RP.Rank <= 10 AND (BC.LatestTagBadgeDate IS NOT NULL OR BC.LatestNamedBadgeDate IS NOT NULL)
+GROUP BY
+    RP.Id,
+    RP.Title,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.LastActivityDate,
+    RP.Rank,
+    RP.OwnerDisplayName,
+    RP.Reputation,
+    BC.BadgeCount,
+    BC.LatestTagBadgeDate,
+    BC.LatestNamedBadgeDate
+ORDER BY 
+    RP.Rank, RP.Score DESC;

@@ -1,0 +1,100 @@
+-- {"query": "4110.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1011} 
+WITH
+  UserPostEngagement AS (
+    SELECT
+      p.OwnerUserId,
+      COUNT(DISTINCT p.Id) AS PostCount,
+      COUNT(DISTINCT c.Id) AS CommentCount,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived,
+      AVG(p.Score) AS AvgPostScore,
+      MAX(p.CreationDate) AS LastPostDate
+    FROM
+      Posts AS p
+    LEFT JOIN
+      Comments AS c
+      ON p.Id = c.PostId
+    LEFT JOIN
+      Votes AS v
+      ON p.Id = v.PostId
+    WHERE
+      p.PostTypeId = 1 -- Questions only
+      AND p.OwnerUserId IS NOT NULL
+      AND p.OwnerUserId <> -1
+    GROUP BY
+      p.OwnerUserId
+  ),
+  UserBadgeSummary AS (
+    SELECT
+      UserId,
+      COUNT(CASE WHEN Class = 1 THEN 1 END) AS GoldBadges,
+      COUNT(CASE WHEN Class = 2 THEN 1 ELSE NULL END) AS SilverBadges,
+      COUNT(CASE WHEN Class = 3 THEN 1 ELSE NULL END) AS BronzeBadges,
+      MAX(Date) AS LastBadgeDate
+    FROM
+      Badges
+    GROUP BY
+      UserId
+  ),
+  UserActivityRank AS (
+    SELECT
+      Id,
+      Reputation,
+      CreationDate,
+      DisplayName,
+      LastAccessDate,
+      ROW_NUMBER() OVER (ORDER BY LastAccessDate DESC) AS ActivityRank,
+      CASE
+        WHEN Reputation BETWEEN 0 AND 1000 THEN 'Novice'
+        WHEN Reputation BETWEEN 1001 AND 10000 THEN 'Experienced'
+        WHEN Reputation > 10000 THEN 'Expert'
+        ELSE 'Unknown'
+      END AS ReputationLevel
+    FROM
+      Users
+    WHERE
+      Id IN (SELECT DISTINCT OwnerUserId FROM Posts WHERE OwnerUserId IS NOT NULL AND OwnerUserId <> -1)
+  )
+SELECT
+  uar.DisplayName,
+  uar.Reputation,
+  uar.ReputationLevel,
+  uar.ActivityRank,
+  COALESCE(upe.PostCount, 0) AS TotalQuestions,
+  COALESCE(upe.CommentCount, 0) AS TotalComments,
+  COALESCE(upe.UpVotesReceived, 0) AS TotalUpvotesOnQuestions,
+  COALESCE(upe.DownVotesReceived, 0) AS TotalDownvotesOnQuestions,
+  COALESCE(upe.AvgPostScore, 0) AS AverageQuestionScore,
+  COALESCE(ubs.GoldBadges, 0) AS GoldBadges,
+  COALESCE(ubs.SilverBadges, 0) AS SilverBadges,
+  COALESCE(ubs.BronzeBadges, 0) AS BronzeBadges,
+  CASE
+    WHEN uar.LastAccessDate > DATE('now', '-30 day') THEN 'Active Recently'
+    WHEN uar.LastAccessDate > DATE('now', '-180 day') THEN 'Moderately Active'
+    ELSE 'Lapsed'
+  END AS ActivityStatus,
+  CASE
+    WHEN ubs.LastBadgeDate > DATE('now', '-90 day') THEN 'Recently Awarded'
+    WHEN ubs.LastBadgeDate IS NULL THEN 'No Badges'
+    ELSE 'Inactive Badge Status'
+  END AS BadgeActivity,
+  UPPER(SUBSTRING(uar.DisplayName FROM 1 FOR 1)) || LOWER(SUBSTRING(uar.DisplayName FROM 2)) AS FormattedDisplayName
+FROM
+  UserActivityRank AS uar
+LEFT OUTER JOIN
+  UserPostEngagement AS upe
+  ON uar.Id = upe.OwnerUserId
+LEFT OUTER JOIN
+  UserBadgeSummary AS ubs
+  ON uar.Id = ubs.UserId
+WHERE
+  (
+    upe.PostCount > 10
+    OR ubs.GoldBadges > 0
+  )
+  AND uar.DisplayName NOT LIKE '%[^a-zA-Z0-9 ]%' -- Only include users with display names containing alphanumeric characters or spaces
+  AND uar.CreationDate < DATE('now', '-1 year') -- Users created at least a year ago
+ORDER BY
+  uar.ActivityRank,
+  uar.Reputation DESC
+LIMIT 100;

@@ -1,0 +1,293 @@
+-- {"query": "526.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3276} 
+with recent_active_users as (
+    select u.id as user_id,
+           u.displayname,
+           u.reputation,
+           u.location,
+           u.creationdate,
+           u.lastaccessdate,
+           coalesce(nullif(trim(split_part(coalesce(u.websiteurl, ''), '/', 3)), ''), 'none') as website_host,
+           count(*) filter (where b.class = 1) as gold_count,
+           count(*) filter (where b.class = 2) as silver_count,
+           count(*) filter (where b.class = 3) as bronze_count,
+           sum(case when b.tagbased = 1 then 1 else 0 end) as tag_badges
+    from users u
+    left join badges b
+      on b.userid = u.id
+     and b.date >= now() - interval '5 years'
+    where u.reputation >= 100
+      and u.lastaccessdate >= now() - interval '365 days'
+    group by u.id, u.displayname, u.reputation, u.location, u.creationdate, u.lastaccessdate, website_host
+),
+q_and_a as (
+    select p_owner.owneruserid as user_id,
+           count(*) filter (where p_owner.posttypeid = 1) as q_count,
+           count(*) filter (where p_owner.posttypeid = 2) as a_count,
+           sum(case when p_owner.posttypeid = 1 then coalesce(p_owner.score,0) else 0 end) as q_score,
+           sum(case when p_owner.posttypeid = 2 then coalesce(p_owner.score,0) else 0 end) as a_score,
+           avg(nullif(p_owner.viewcount,0)) filter (where p_owner.posttypeid = 1) as avg_q_views,
+           max(p_owner.viewcount) filter (where p_owner.posttypeid = 1) as max_q_views,
+           min(p_owner.creationdate) as first_post_date,
+           max(p_owner.lastactivitydate) as last_post_activity
+    from posts p_owner
+    where p_owner.owneruserid is not null
+    group by p_owner.owneruserid
+),
+tag_exploded as (
+    select p.id as post_id,
+           p.owneruserid as user_id,
+           lower(trim(tg)) as tag
+    from posts p
+    cross join lateral unnest(
+        case
+            when p.posttypeid = 1 and p.tags is not null and length(p.tags) > 2
+            then string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')
+            else array[]::varchar[]
+        end
+    ) as tg
+),
+user_top_tags as (
+    select te.user_id,
+           array_agg(tag order by cnt desc, tag asc)[1:3] as top3_tags,
+           sum(cnt) as total_tag_uses
+    from (
+        select user_id, tag, count(*) as cnt
+        from tag_exploded
+        group by user_id, tag
+    ) te
+    group by te.user_id
+),
+post_interactions as (
+    select u.id as user_id,
+           count(distinct c.id) as comment_count,
+           count(distinct v.id) filter (where v.votetypeid = 2) as upvotes_given,
+           count(distinct v.id) filter (where v.votetypeid = 3) as downvotes_given,
+           count(distinct v.id) filter (where v.votetypeid = 5) as favorites_given,
+           count(distinct case when v.votetypeid in (8,9) then v.id end) as bounties_events,
+           sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_amount_total
+    from users u
+    left join comments c on c.userid = u.id
+    left join votes v on v.userid = u.id
+    group by u.id
+),
+question_quality as (
+    select q.owneruserid as user_id,
+           count(*) as closed_count,
+           count(*) filter (where q.acceptedanswerid is not null) as accepted_q_count,
+           count(*) filter (where q.favoritecount is not null and q.favoritecount > 0) as faved_q_count,
+           sum(coalesce(q.answercount,0)) as total_answers_on_q,
+           avg(nullif(q.score,0)) as avg_q_nonzero_score
+    from posts q
+    where q.posttypeid = 1
+    group by q.owneruserid
+),
+last_close_reason as (
+    select ph.postid,
+           max(ph.creationdate) as last_close_dt
+    from posthistory ph
+    where ph.posthistorytypeid = 10
+    group by ph.postid
+),
+close_reason_breakdown as (
+    select p.owneruserid as user_id,
+           count(*) filter (where crt.name ilike '%duplicate%') as duplicate_closes,
+           count(*) filter (where crt.name ilike '%off-topic%') as offtopic_closes,
+           count(*) filter (where crt.name ilike '%needs%') as needs_detail_closes
+    from posts p
+    join last_close_reason lcr on lcr.postid = p.id
+    join posthistory ph on ph.postid = p.id and ph.posthistorytypeid = 10 and ph.creationdate = lcr.last_close_dt
+    left join closer reas on true
+    left join closereasontypes crt on crt.id = cast(nullif(ph.comment, '') as int)
+    group by p.owneruserid
+),
+dup_network as (
+    select pl.postid,
+           pl.relatedpostid,
+           pl.linktypeid,
+           case when pl.linktypeid = 3 then 1 else 0 end as is_duplicate
+    from postlinks pl
+),
+user_dup_stats as (
+    select p.owneruserid as user_id,
+           count(distinct dn.postid) filter (where dn.is_duplicate = 1) as dup_marked_posts,
+           count(distinct dn.relatedpostid) filter (where dn.is_duplicate = 1) as dup_targets
+    from posts p
+    left join dup_network dn on dn.postid = p.id
+    group by p.owneruserid
+),
+answer_accept_stats as (
+    select a.owneruserid as user_id,
+           count(*) as total_answers,
+           count(*) filter (where exists (
+               select 1
+               from posts q
+               where q.id = a.parentid
+                 and q.acceptedanswerid = a.id
+           )) as accepted_answers,
+           round(100.0 * count(*) filter (where exists (
+               select 1 from posts q where q.id = a.parentid and q.acceptedanswerid = a.id
+           )) / nullif(count(*),0), 2) as accepted_rate_pct
+    from posts a
+    where a.posttypeid = 2
+    group by a.owneruserid
+),
+recent_activity as (
+    select p.owneruserid as user_id,
+           max(p.lastactivitydate) as last_activity,
+           count(*) filter (where p.creationdate >= now() - interval '30 days') as posts_30d,
+           count(*) filter (where p.creationdate >= now() - interval '365 days') as posts_365d
+    from posts p
+    group by p.owneruserid
+),
+user_rank as (
+    select rau.user_id,
+           rank() over (order by coalesce(qa.a_score,0) + coalesce(qa.q_score,0) desc,
+                                 coalesce(pi.upvotes_given,0) desc,
+                                 coalesce(qa.a_count,0) desc) as engagement_rank
+    from recent_active_users rau
+    left join q_and_a qa on qa.user_id = rau.user_id
+    left join post_interactions pi on pi.user_id = rau.user_id
+),
+anomalies as (
+    select u.id as user_id,
+           case
+             when coalesce(qa.q_count,0) = 0 and coalesce(qa.a_count,0) = 0 and (u.reputation > 1000 or coalesce(u.views,0) > 10000)
+               then 'high_rep_no_posts'
+             when coalesce(qa.a_count,0) > 0 and coalesce(aas.accepted_rate_pct,0) = 0
+               then 'answers_never_accepted'
+             when coalesce(qq.closed_count,0) > 10 and coalesce(qq.avg_q_nonzero_score,0) < 0
+               then 'many_closed_and_negative'
+             else null
+           end as anomaly_flag
+    from users u
+    left join q_and_a qa on qa.user_id = u.id
+    left join answer_accept_stats aas on aas.user_id = u.id
+    left join question_quality qq on qq.user_id = u.id
+),
+user_summary as (
+    select
+        rau.user_id,
+        rau.displayname,
+        rau.reputation,
+        rau.location,
+        rau.website_host,
+        rau.gold_count,
+        rau.silver_count,
+        rau.bronze_count,
+        rau.tag_badges,
+        qa.q_count, qa.a_count, qa.q_score, qa.a_score, qa.avg_q_views, qa.max_q_views, qa.first_post_date, qa.last_post_activity,
+        ut.top3_tags,
+        ut.total_tag_uses,
+        pi.comment_count, pi.upvotes_given, pi.downvotes_given, pi.favorites_given, pi.bounties_events, pi.bounty_amount_total,
+        qq.closed_count, qq.accepted_q_count, qq.faved_q_count, qq.total_answers_on_q, qq.avg_q_nonzero_score,
+        crb.duplicate_closes, crb.offtopic_closes, crb.needs_detail_closes,
+        uds.dup_marked_posts, uds.dup_targets,
+        aas.total_answers, aas.accepted_answers, aas.accepted_rate_pct,
+        ra.last_activity, ra.posts_30d, ra.posts_365d,
+        ur.engagement_rank,
+        a.anomaly_flag
+    from recent_active_users rau
+    left join q_and_a qa on qa.user_id = rau.user_id
+    left join user_top_tags ut on ut.user_id = rau.user_id
+    left join post_interactions pi on pi.user_id = rau.user_id
+    left join question_quality qq on qq.user_id = rau.user_id
+    left join close_reason_breakdown crb on crb.user_id = rau.user_id
+    left join user_dup_stats uds on uds.user_id = rau.user_id
+    left join answer_accept_stats aas on aas.user_id = rau.user_id
+    left join recent_activity ra on ra.user_id = rau.user_id
+    left join user_rank ur on ur.user_id = rau.user_id
+    left join anomalies a on a.user_id = rau.user_id
+),
+bench_base as (
+    select
+        us.*,
+        coalesce(us.a_score,0) + coalesce(us.q_score,0) as total_post_score,
+        coalesce(us.gold_count,0)*100 + coalesce(us.silver_count,0)*10 + coalesce(us.bronze_count,0) as badge_weight,
+        case when coalesce(us.posts_365d,0) > 0 then round(us.posts_30d::numeric / nullif(us.posts_365d,0), 4) else 0 end as post_velocity_30d_ratio,
+        case when coalesce(us.total_answers,0) > 0 then round(us.accepted_answers::numeric / nullif(us.total_answers,0), 4) else null end as acceptance_ratio,
+        case when us.top3_tags is null or array_length(us.top3_tags,1) = 0 then 'none' else array_to_string(us.top3_tags, ',') end as top_tags_str
+    from user_summary us
+),
+scored as (
+    select
+        b.*,
+        -- composite score mixing activity, quality, and recognition
+        round(
+            (coalesce(b.total_post_score,0) * 1.0)
+          + (coalesce(b.badge_weight,0) * 0.75)
+          + (coalesce(b.accepted_rate_pct,0) * 0.5)
+          + (coalesce(b.posts_30d,0) * 2)
+          - (coalesce(b.closed_count,0) * 1.25)
+          - (coalesce(b.downvotes_given,0) * 0.1)
+        , 2) as composite_score
+    from bench_base b
+),
+dense_ranked as (
+    select s.*,
+           dense_rank() over (
+               order by coalesce(s.composite_score,0) desc,
+                        coalesce(s.reputation,0) desc,
+                        coalesce(s.engagement_rank, 1e9) asc
+           ) as dense_rnk
+    from scored s
+),
+percentiles as (
+    select dr.*,
+           ntile(100) over (order by coalesce(dr.composite_score,0)) as composite_percentile,
+           ntile(10) over (order by coalesce(dr.total_post_score,0)) as score_decile
+    from dense_ranked dr
+),
+stringy as (
+    select p.*,
+           concat_ws(' | ',
+             coalesce(p.displayname, 'user-'||p.user_id::text),
+             'rep='||coalesce(p.reputation,0)::text,
+             'score='||coalesce(p.total_post_score,0)::text,
+             'badges='||(coalesce(p.gold_count,0)::text || '/' || coalesce(p.silver_count,0)::text || '/' || coalesce(p.bronze_count,0)::text),
+             'tags='||coalesce(p.top_tags_str,'none'),
+             'loc='||coalesce(nullif(trim(p.location),''),'unknown')
+           ) as summary_line
+    from percentiles p
+)
+select
+    s.user_id,
+    s.displayname,
+    s.summary_line,
+    s.reputation,
+    s.website_host,
+    s.top_tags_str,
+    s.q_count, s.a_count,
+    s.accepted_rate_pct,
+    s.closed_count,
+    s.duplicate_closes,
+    s.dup_marked_posts,
+    s.total_post_score,
+    s.badge_weight,
+    s.composite_score,
+    s.dense_rnk,
+    s.composite_percentile,
+    s.score_decile,
+    s.anomaly_flag,
+    -- complicated predicate and null logic demo
+    case
+        when s.anomaly_flag is not null then 'check'
+        when s.accepted_rate_pct is null and coalesce(s.a_count,0) > 0 then 'calc-issue'
+        when (s.posts_30d > 0 and s.post_velocity_30d_ratio > 0.2) or (s.total_post_score > 1000 and s.closed_count = 0) then 'hot'
+        when s.avg_q_views is not null and s.avg_q_views > 10000 then 'popular'
+        else 'normal'
+    end as status_bucket
+from stringy s
+where (
+        s.composite_score > (
+            select avg(coalesce(comp.composite_score,0)) + stddev_pop(coalesce(comp.composite_score,0))
+            from scored comp
+        )
+      )
+   or (
+        s.anomaly_flag is not null
+      )
+   or (
+        s.accepted_rate_pct is not null and s.accepted_rate_pct >= 50 and s.a_count >= 10
+      )
+order by s.composite_score desc nulls last, s.reputation desc nulls last, s.user_id
+limit 500;

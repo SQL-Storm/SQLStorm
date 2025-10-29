@@ -1,0 +1,140 @@
+WITH RankedPostEdits AS (
+    SELECT
+        ph.PostId,
+        ph.UserId,
+        u.DisplayName AS EditorDisplayName,
+        ph.PostHistoryTypeId,
+        pht.Name AS HistoryTypeName,
+        ph.CreationDate AS EditDate,
+        ph.Comment,
+        ph.Id,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId, ph.PostHistoryTypeId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    LEFT JOIN Users u ON ph.UserId = u.Id
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9)
+),
+PostEditCounts AS (
+    SELECT
+        PostId,
+        COUNT(DISTINCT CASE WHEN PostHistoryTypeId IN (4, 5, 6) THEN Id END) AS EditCount,
+        COUNT(DISTINCT CASE WHEN PostHistoryTypeId IN (7, 8, 9) THEN Id END) AS RollbackCount,
+        SUM(CASE WHEN rn = 1 THEN 1 ELSE 0 END) AS LatestEditFlag
+    FROM RankedPostEdits
+    GROUP BY PostId
+),
+UserContributionSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(u.Reputation) AS MaxReputation,
+        MAX(u.Reputation) AS Reputation
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName
+),
+ComplexPostAnalysis AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        p.CreationDate AS PostCreationDate,
+        p.LastActivityDate,
+        p.Score,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL THEN CAST(EXTRACT(EPOCH FROM (p.ClosedDate - p.CreationDate)) / 86400 AS INTEGER)
+            ELSE NULL
+        END AS DaysToClose,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+        COALESCE(pec.EditCount, 0) AS TotalEdits,
+        COALESCE(pec.RollbackCount, 0) AS TotalRollbacks,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id AND c.Score < 0) AS NegativeScoreComments,
+        (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3) AS DuplicateLinks,
+        p.Tags
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN PostEditCounts pec ON p.Id = pec.PostId
+    WHERE p.Score > 10 AND p.CreationDate > DATE '2023-01-01' AND p.CommentCount > 5
+)
+SELECT
+    cpa.PostId,
+    cpa.Title,
+    cpa.PostTypeName,
+    cpa.OwnerDisplayName,
+    cpa.PostCreationDate,
+    cpa.LastActivityDate,
+    cpa.Score,
+    cpa.AnswerCount,
+    cpa.FavoriteCount,
+    cpa.IsClosed,
+    cpa.DaysToClose,
+    cpa.TotalEdits,
+    cpa.TotalRollbacks,
+    cpa.NegativeScoreComments,
+    cpa.DuplicateLinks,
+    (
+        SELECT STRING_AGG(TagName, ',') FROM (
+            SELECT DISTINCT SUBSTRING(value FROM 2 FOR CHAR_LENGTH(value) - 2) AS TagName
+            FROM (
+                -- Generic split placeholder: replace with dialect-specific string-split logic if available
+                SELECT TRIM(value) AS value FROM (SELECT NULL::text AS value) AS t WHERE FALSE
+            ) AS vals
+        ) AS SplitTags
+    ) AS FormattedTags,
+    ucs.TotalPostsOwned,
+    ucs.QuestionCount,
+    ucs.AnswerCount AS UserAnswerCount,
+    ucs.BadgeCount,
+    ucs.MaxReputation,
+    CASE
+        WHEN ucs.Reputation > 50000 THEN 'High Reputation'
+        WHEN ucs.Reputation BETWEEN 10000 AND 50000 THEN 'Medium Reputation'
+        ELSE 'Low Reputation'
+    END AS ReputationLevel,
+    COALESCE(AVG(cpa.Score) OVER (PARTITION BY cpa.PostTypeId, cpa.PostTypeName), 0) AS AvgScoreForPostType,
+    ROW_NUMBER() OVER (ORDER BY cpa.Score DESC, cpa.FavoriteCount DESC, cpa.PostId) AS RankByPopularity
+FROM ComplexPostAnalysis cpa
+JOIN UserContributionSummary ucs ON cpa.OwnerUserId = ucs.UserId
+WHERE cpa.PostCreationDate BETWEEN DATE '2023-01-01' AND DATE '2023-12-31'
+UNION ALL
+SELECT
+    NULL AS PostId,
+    'Total Posts' AS Title,
+    NULL AS PostTypeName,
+    NULL AS OwnerDisplayName,
+    NULL AS PostCreationDate,
+    NULL AS LastActivityDate,
+    NULL AS Score,
+    NULL AS AnswerCount,
+    NULL AS FavoriteCount,
+    NULL AS IsClosed,
+    NULL AS DaysToClose,
+    NULL AS TotalEdits,
+    NULL AS TotalRollbacks,
+    NULL AS NegativeScoreComments,
+    COUNT(DISTINCT cpa.PostId) AS DuplicateLinks,
+    NULL AS FormattedTags,
+    NULL AS TotalPostsOwned,
+    NULL AS QuestionCount,
+    NULL AS UserAnswerCount,
+    NULL AS BadgeCount,
+    NULL AS MaxReputation,
+    NULL AS ReputationLevel,
+    NULL AS AvgScoreForPostType,
+    NULL AS RankByPopularity
+FROM ComplexPostAnalysis cpa
+WHERE cpa.PostCreationDate BETWEEN DATE '2023-01-01' AND DATE '2023-12-31'
+ORDER BY PostId NULLS FIRST, RankByPopularity;

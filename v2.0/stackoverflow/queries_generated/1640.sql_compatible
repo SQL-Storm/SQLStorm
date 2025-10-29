@@ -1,0 +1,149 @@
+WITH UserEngagementSummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        COUNT(DISTINCT P.Id) AS TotalPostsCreated,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsAsked,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersProvided,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT B.Id) AS TotalBadgesEarned,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadgesCount,
+        SUM(CASE WHEN B.TagBased = TRUE THEN 1 ELSE 0 END) AS TagBasedBadgesCount,
+        MAX(COALESCE(P.LastActivityDate, C.CreationDate, U.LastAccessDate)) AS LastActivityTimestamp,
+        AVG(COALESCE(P.Score, 0.0)) FILTER (WHERE P.PostTypeId IN (1, 2)) AS AveragePostScore,
+        STRING_AGG(DISTINCT T.TagName, ';') FILTER (WHERE T.TagName IS NOT NULL AND B.TagBased = TRUE) AS DistinctTagBadges
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN Tags T ON B.TagBased = TRUE AND T.TagName = B.Name
+    WHERE U.CreationDate >= DATE '2019-01-01'
+      AND U.Reputation > 1000
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate
+    HAVING COUNT(DISTINCT P.Id) + COUNT(DISTINCT C.Id) > 5
+),
+PostRevisionMetrics AS (
+    SELECT
+        PH.PostId,
+        COUNT(PH.Id) AS TotalHistoryEntries,
+        COUNT(DISTINCT PH.UserId) AS UniqueEditorsForPost,
+        MAX(PH.CreationDate) AS LastHistoryDate,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (10, 11) THEN 1 ELSE 0 END) AS CloseReopenCount,
+        AVG(LENGTH(PH.Comment)) FILTER (WHERE PH.Comment IS NOT NULL) AS AvgEditCommentLength,
+        ROW_NUMBER() OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate DESC) AS rn_last_hist
+    FROM PostHistory PH
+    WHERE PH.CreationDate >= DATE '2020-01-01'
+      AND PH.PostHistoryTypeId IN (1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,19,20,35,36,50)
+    GROUP BY PH.PostId
+    HAVING COUNT(PH.Id) > 2
+),
+QuestionAnswerEngagement AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.Title,
+        P.Score AS PostScore,
+        P.ViewCount,
+        COALESCE(P.AnswerCount, 0) AS AnswerCount,
+        COALESCE(P.CommentCount, 0) AS CommentCount,
+        P.FavoriteCount,
+        P.CreationDate AS PostCreationDate,
+        P.LastActivityDate,
+        P.OwnerUserId,
+        P.Tags,
+        P.AcceptedAnswerId,
+        (P.Score * 0.7 + P.ViewCount * 0.05 + COALESCE(P.AnswerCount, 0) * 0.6 + COALESCE(P.CommentCount, 0) * 0.2 + COALESCE(P.FavoriteCount, 0) * 1.0) AS DynamicEngagementScore,
+        RANK() OVER (PARTITION BY P.PostTypeId ORDER BY (P.Score + COALESCE(P.FavoriteCount, 0)) DESC, P.LastActivityDate DESC) AS RankByPopularity,
+        LAG(P.CreationDate, 1, DATE '1970-01-01') OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate) AS PrevPostCreationDate
+    FROM Posts P
+    WHERE P.PostTypeId IN (1, 2)
+      AND P.CreationDate >= DATE '2021-01-01'
+      AND P.Score > 0
+      AND P.ViewCount > 50
+)
+SELECT
+    UES.UserId,
+    UES.DisplayName,
+    UES.Reputation,
+    UES.TotalPostsCreated,
+    UES.QuestionsAsked,
+    UES.AnswersProvided,
+    UES.TotalCommentsMade,
+    UES.TotalBadgesEarned,
+    UES.GoldBadgesCount,
+    UES.LastActivityTimestamp,
+    UES.AveragePostScore,
+    QAE.PostId,
+    QAE.Title,
+    QAE.PostTypeId,
+    QAE.PostScore,
+    QAE.DynamicEngagementScore,
+    QAE.RankByPopularity,
+    QAE.PostCreationDate,
+    QAE.LastActivityDate AS PostLastActivityTimestamp,
+    QAE.Tags,
+    QAE.AcceptedAnswerId,
+    PRM.TotalHistoryEntries,
+    PRM.UniqueEditorsForPost,
+    PRM.AvgEditCommentLength,
+    (SELECT COUNT(DISTINCT C.Id)
+     FROM Comments C
+     WHERE C.PostId = QAE.PostId
+       AND C.UserId = UES.UserId
+       AND C.CreationDate > (QAE.PostCreationDate + INTERVAL '1 month')
+       AND LENGTH(C.Text) > 50
+    ) AS UserCommentsAfterFirstMonthLengthy,
+    COALESCE(
+        (SELECT MIN(B.Date)
+         FROM Badges B
+         WHERE B.UserId = UES.UserId
+           AND B.Class = 1
+           AND B.Name ILIKE '%Pundit%'
+        ), UES.UserCreationDate
+    ) AS FirstGoldPunditBadgeDate,
+    CASE
+        WHEN UES.Reputation > 20000 AND UES.GoldBadgesCount >= 5 THEN 'Elite Contributor'
+        WHEN QAE.RankByPopularity <= 10 AND QAE.PostTypeId = 1 THEN 'Top Question Author'
+        WHEN QAE.AnswerCount > 0 AND QAE.AcceptedAnswerId IS NOT NULL THEN 'Problem Solver'
+        WHEN UES.TotalPostsCreated > 50 AND UES.TotalCommentsMade > 100 THEN 'Community Engager'
+        ELSE 'Active Participant'
+    END AS UserCategoryBasedOnActivity,
+    SUBSTRING(QAE.Tags FROM 2 FOR LENGTH(QAE.Tags) - 2) AS CleanedTagsString,
+    (SELECT
+        STRING_AGG(DISTINCT RelatedPost.Title, ' | ')
+     FROM PostLinks PL
+     JOIN Posts RelatedPost ON PL.RelatedPostId = RelatedPost.Id
+     WHERE PL.PostId = QAE.PostId AND PL.LinkTypeId = 3
+       AND RelatedPost.CreationDate > (QAE.PostCreationDate - INTERVAL '1 year')
+    ) AS RecentDuplicatePostTitles,
+    (SELECT
+        AVG(V.BountyAmount)
+     FROM Votes V
+     WHERE V.PostId = QAE.PostId AND V.VoteTypeId = 8
+       AND V.CreationDate BETWEEN QAE.PostCreationDate AND QAE.LastActivityDate
+       AND V.BountyAmount IS NOT NULL
+    ) AS AverageBountyOnPost,
+    QAE.LastActivityDate - QAE.PrevPostCreationDate AS TimeSincePreviousPost
+FROM UserEngagementSummary UES
+INNER JOIN QuestionAnswerEngagement QAE ON UES.UserId = QAE.OwnerUserId
+LEFT JOIN PostRevisionMetrics PRM ON QAE.PostId = PRM.PostId
+WHERE UES.LastActivityTimestamp >= (CAST('2024-10-01' AS DATE) - INTERVAL '1 year')
+  AND QAE.DynamicEngagementScore > 100
+  AND (QAE.Title ILIKE '%performance%' OR QAE.Title ILIKE '%optimization%' OR QAE.Tags ILIKE '%<sql>%')
+  AND NOT EXISTS (
+        SELECT 1
+        FROM Posts P_sub
+        WHERE P_sub.ParentId = QAE.PostId
+          AND P_sub.OwnerUserId = UES.UserId
+          AND P_sub.PostTypeId = 2
+          AND P_sub.CreationDate > (QAE.PostCreationDate - INTERVAL '6 months')
+          AND P_sub.Score < 0
+  )
+  AND (PRM.UniqueEditorsForPost IS NULL OR PRM.UniqueEditorsForPost >= 1)
+  AND COALESCE(UES.DistinctTagBadges, '') NOT LIKE '%[bug]%'
+ORDER BY UES.Reputation DESC, QAE.DynamicEngagementScore DESC, QAE.LastActivityDate DESC
+LIMIT 1000;

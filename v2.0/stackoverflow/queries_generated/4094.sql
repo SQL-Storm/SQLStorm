@@ -1,0 +1,177 @@
+-- {"query": "4094.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1727} 
+
+WITH
+  RankedPostHistory AS (
+    SELECT
+      ph.PostId,
+      ph.PostHistoryTypeId,
+      ph.UserId,
+      ph.CreationDate,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId, ph.PostHistoryTypeId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory AS ph
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+  ),
+  LatestEdits AS (
+    SELECT
+      rph.PostId,
+      MAX(CASE WHEN rph.PostHistoryTypeId = 4 THEN rph.UserId ELSE NULL END) AS LastEditorUserId_Title,
+      MAX(CASE WHEN rph.PostHistoryTypeId = 5 THEN rph.UserId ELSE NULL END) AS LastEditorUserId_Body,
+      MAX(CASE WHEN rph.PostHistoryTypeId = 6 THEN rph.UserId ELSE NULL END) AS LastEditorUserId_Tags,
+      MAX(CASE WHEN rph.PostHistoryTypeId = 4 THEN rph.CreationDate ELSE NULL END) AS LastEditDate_Title,
+      MAX(CASE WHEN rph.PostHistoryTypeId = 5 THEN rph.CreationDate ELSE NULL END) AS LastEditDate_Body,
+      MAX(CASE WHEN rph.PostHistoryTypeId = 6 THEN rph.CreationDate ELSE NULL END) AS LastEditDate_Tags
+    FROM RankedPostHistory AS rph
+    WHERE
+      rph.rn = 1
+    GROUP BY
+      rph.PostId
+  ),
+  QuestionStats AS (
+    SELECT
+      p.Id AS QuestionId,
+      p.Title,
+      p.Tags,
+      p.OwnerUserId,
+      p.CreationDate AS QuestionCreationDate,
+      p.Score AS QuestionScore,
+      p.AnswerCount,
+      p.FavoriteCount,
+      p.ViewCount AS QuestionViewCount,
+      p.ClosedDate AS QuestionClosedDate,
+      COUNT(DISTINCT CASE WHEN c.CreationDate > DATE_SUB(p.CreationDate, INTERVAL 1 DAY) THEN c.Id ELSE NULL END) AS CommentsInFirstDay,
+      SUM(CASE WHEN ph.PostHistoryTypeId = 5 THEN 1 ELSE 0 END) AS BodyEditCount,
+      AVG(CASE WHEN ph.PostHistoryTypeId = 5 THEN ph.CreationDate ELSE NULL END) AS AvgBodyEditDate
+    FROM Posts AS p
+    LEFT JOIN Comments AS c
+      ON p.Id = c.PostId
+    LEFT JOIN PostHistory AS ph
+      ON p.Id = ph.PostId AND ph.PostHistoryTypeId = 5 -- Body Edit
+    WHERE
+      p.PostTypeId = 1 -- Question
+    GROUP BY
+      p.Id,
+      p.Title,
+      p.Tags,
+      p.OwnerUserId,
+      p.CreationDate,
+      p.Score,
+      p.AnswerCount,
+      p.FavoriteCount,
+      p.ViewCount,
+      p.ClosedDate
+  )
+SELECT
+  qs.QuestionId,
+  qs.Title,
+  qs.Tags,
+  qs.OwnerUserId,
+  u.DisplayName AS OwnerDisplayName,
+  qs.QuestionCreationDate,
+  qs.QuestionScore,
+  qs.AnswerCount,
+  qs.FavoriteCount,
+  qs.QuestionViewCount,
+  qs.QuestionClosedDate,
+  qs.CommentsInFirstDay,
+  qs.BodyEditCount,
+  qs.AvgBodyEditDate,
+  le.LastEditorUserId_Title,
+  le.LastEditorUserId_Body,
+  le.LastEditorUserId_Tags,
+  le.LastEditDate_Title,
+  le.LastEditDate_Body,
+  le.LastEditDate_Tags,
+  (
+    SELECT
+      COUNT(a.Id)
+    FROM Posts AS a
+    WHERE
+      a.ParentId = qs.QuestionId AND a.PostTypeId = 2 AND a.Score > 0
+  ) AS PositiveAnswerCount,
+  (
+    SELECT
+      COUNT(ph.Id)
+    FROM PostHistory AS ph
+    WHERE
+      ph.PostId = qs.QuestionId AND ph.PostHistoryTypeId IN (10, 11) -- Post Closed, Post Reopened
+  ) AS CloseReopenHistoryCount,
+  CASE
+    WHEN qs.QuestionClosedDate IS NOT NULL AND qs.QuestionScore < 0
+    THEN 'High Risk'
+    WHEN qs.QuestionClosedDate IS NULL AND qs.QuestionScore >= 1000
+    THEN 'High Value'
+    WHEN qs.QuestionViewCount > 1000000 AND qs.AnswerCount < 10
+    THEN 'Popular but Unanswered'
+    ELSE 'Standard'
+  END AS QuestionRiskCategory,
+  CONCAT(
+    'Tags: ',
+    qs.Tags,
+    ' | Score: ',
+    CAST(qs.QuestionScore AS VARCHAR),
+    ' | Answers: ',
+    CAST(qs.AnswerCount AS VARCHAR)
+  ) AS QuestionSummary,
+  CASE
+    WHEN u.Id IS NULL THEN 'Unknown'
+    WHEN u.Reputation > 100000 THEN 'Expert'
+    WHEN u.Reputation > 10000 THEN 'Experienced'
+    WHEN u.Reputation > 1000 THEN 'Intermediate'
+    ELSE 'Beginner'
+  END AS OwnerReputationLevel,
+  COALESCE(u.Location, 'Not Specified') AS OwnerLocation,
+  CASE
+    WHEN EXISTS (
+      SELECT
+        1
+      FROM Badges AS b
+      WHERE
+        b.UserId = u.Id AND b.Name LIKE '%tacular'
+    )
+    THEN 'Has Special Badge'
+    ELSE 'No Special Badge'
+  END AS HasSpecialBadge
+FROM QuestionStats AS qs
+LEFT JOIN Users AS u
+  ON qs.OwnerUserId = u.Id
+LEFT JOIN LatestEdits AS le
+  ON qs.QuestionId = le.PostId
+WHERE
+  qs.QuestionScore > 50
+  AND qs.AnswerCount > 0
+  AND qs.QuestionCreationDate BETWEEN '2023-01-01' AND '2023-12-31'
+UNION ALL
+SELECT
+  NULL AS QuestionId,
+  NULL AS Title,
+  NULL AS Tags,
+  NULL AS OwnerUserId,
+  NULL AS OwnerDisplayName,
+  NULL AS QuestionCreationDate,
+  NULL AS QuestionScore,
+  NULL AS AnswerCount,
+  NULL AS FavoriteCount,
+  NULL AS QuestionViewCount,
+  NULL AS QuestionClosedDate,
+  NULL AS CommentsInFirstDay,
+  NULL AS BodyEditCount,
+  NULL AS AvgBodyEditDate,
+  NULL AS LastEditorUserId_Title,
+  NULL AS LastEditorUserId_Body,
+  NULL AS LastEditorUserId_Tags,
+  NULL AS LastEditDate_Title,
+  NULL AS LastEditDate_Body,
+  NULL AS LastEditDate_Tags,
+  NULL AS PositiveAnswerCount,
+  NULL AS CloseReopenHistoryCount,
+  'Summary Report' AS QuestionRiskCategory,
+  'Total Questions Analyzed: ' || CAST(COUNT(qs.QuestionId) AS VARCHAR) AS QuestionSummary,
+  NULL AS OwnerReputationLevel,
+  NULL AS OwnerLocation,
+  NULL AS HasSpecialBadge
+FROM QuestionStats AS qs
+WHERE
+  qs.QuestionScore > 50
+  AND qs.AnswerCount > 0
+  AND qs.QuestionCreationDate BETWEEN '2023-01-01' AND '2023-12-31';

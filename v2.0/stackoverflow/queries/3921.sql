@@ -1,0 +1,104 @@
+WITH 
+UserPostAgg AS (
+    SELECT 
+        u.Id                                 AS UserId,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        SUM(p.Score)                         AS TotalScore,
+        MAX(p.CreationDate)                  AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id
+),
+
+UserBadgeLatest AS (
+    SELECT 
+        b.UserId,
+        MAX(b.Date)                                           AS LatestBadgeDate,
+        STRING_AGG(DISTINCT b.Name, ', ') FILTER (WHERE b.Class = 1) AS GoldBadges,
+        STRING_AGG(DISTINCT b.Name, ', ') FILTER (WHERE b.Class = 2) AS SilverBadges,
+        STRING_AGG(DISTINCT b.Name, ', ') FILTER (WHERE b.Class = 3) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+TagUserStats AS (
+    SELECT 
+        u.Id                                     AS UserId,
+        t.TagName,
+        COUNT(*)                                 AS PostsWithTag,
+        RANK() OVER (PARTITION BY u.Id ORDER BY COUNT(*) DESC) AS TagRank
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id
+    JOIN LATERAL (
+        SELECT UNNEST(string_to_array(trim(both '<>' FROM p.Tags), '><')) AS TagName
+    ) AS taglist ON true
+    JOIN Tags t ON t.TagName = taglist.TagName
+    GROUP BY u.Id, t.TagName
+),
+
+PostVoteScore AS (
+    SELECT 
+        p.Id                                      AS PostId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1
+                 WHEN v.VoteTypeId = 3 THEN -1
+                 ELSE 0 END)                     AS NetVoteScore,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 5)  AS FavoriteCount
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    GROUP BY p.Id
+)
+
+SELECT
+    u.Id,
+    COALESCE(u.DisplayName, 'Anonymous')           AS DisplayName,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.TotalScore,
+    ua.LastPostDate,
+    COALESCE(ub.GoldBadges,   '')                  AS GoldBadges,
+    COALESCE(ub.SilverBadges, '')                  AS SilverBadges,
+    COALESCE(ub.BronzeBadges, '')                  AS BronzeBadges,
+    STRING_AGG(DISTINCT CASE WHEN tus.TagRank = 1 THEN tus.TagName END, ', ') 
+        FILTER (WHERE tus.TagRank = 1)            AS TopTag,
+    MAX(pvs.NetVoteScore) FILTER (WHERE pvs.NetVoteScore IS NOT NULL) AS HighestNetVoteScore,
+    COUNT(DISTINCT CASE WHEN pvs.FavoriteCount > 0 THEN p.Id END)        AS PostsFavorited,
+    (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id)              AS CommentCount
+FROM Users u
+LEFT JOIN UserPostAgg      ua ON ua.UserId = u.Id
+LEFT JOIN UserBadgeLatest  ub ON ub.UserId = u.Id
+LEFT JOIN TagUserStats    tus ON tus.UserId = u.Id
+LEFT JOIN Posts           p   ON p.OwnerUserId = u.Id
+LEFT JOIN PostVoteScore   pvs ON pvs.PostId = p.Id
+WHERE (u.Reputation > 1000 OR ub.GoldBadges IS NOT NULL)
+GROUP BY 
+    u.Id, u.DisplayName, ua.QuestionCount, ua.AnswerCount,
+    ua.TotalScore, ua.LastPostDate, ub.GoldBadges,
+    ub.SilverBadges, ub.BronzeBadges
+HAVING COUNT(*) > 0
+
+UNION ALL
+
+SELECT
+    NULL                                          AS Id,
+    'Aggregate Summary'                           AS DisplayName,
+    SUM(ua.QuestionCount)                         AS QuestionCount,
+    SUM(ua.AnswerCount)                           AS AnswerCount,
+    SUM(ua.TotalScore)                            AS TotalScore,
+    MAX(ua.LastPostDate)                          AS LastPostDate,
+    ''                                            AS GoldBadges,
+    ''                                            AS SilverBadges,
+    ''                                            AS BronzeBadges,
+    ''                                            AS TopTag,
+    MAX(pvs.NetVoteScore)                         AS HighestNetVoteScore,
+    COUNT(DISTINCT CASE WHEN pvs.FavoriteCount > 0 THEN pvs.PostId END) AS PostsFavorited,
+    SUM((SELECT COUNT(*) FROM Comments c WHERE c.UserId = ua.UserId)) AS CommentCount
+FROM UserPostAgg ua
+LEFT JOIN PostVoteScore pvs 
+       ON pvs.PostId = (
+            SELECT p2.Id 
+            FROM Posts p2 
+            WHERE p2.OwnerUserId = ua.UserId 
+            ORDER BY p2.CreationDate DESC 
+            LIMIT 1
+       );

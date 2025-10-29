@@ -1,0 +1,158 @@
+-- {"query": "3277.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1572} 
+WITH 
+/* 1. Base user aggregation */
+user_base AS (
+    SELECT 
+        u.Id                                     AS user_id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate                           AS user_created,
+        COALESCE(u.Location, 'UNKNOWN')           AS location,
+        COUNT(p.Id)                               AS total_posts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS total_questions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS total_answers,
+        MAX(p.CreationDate)                      AS last_post_date
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location
+),
+
+/* 2. Recent activity window (last 90 days) */
+recent_activity AS (
+    SELECT 
+        p.OwnerUserId                            AS user_id,
+        COUNT(*)                                 AS recent_posts,
+        SUM(p.Score)                             AS recent_score_sum,
+        MAX(p.LastActivityDate)                  AS recent_last_activity,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId 
+                           ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '90 DAY'
+      AND p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+
+/* 3. Tag contribution details (using tag string parsing) */
+tag_contrib AS (
+    SELECT 
+        p.OwnerUserId                            AS user_id,
+        UNNEST(STRING_TO_ARRAY(
+                REGEXP_REPLACE(p.Tags, '^<|>$', ''), '><')) AS tag,
+        COUNT(*)                                 AS tag_post_cnt,
+        SUM(p.Score)                             AS tag_score_sum
+    FROM Posts p
+    WHERE p.PostTypeId = 1                         -- only questions have tags
+      AND p.Tags IS NOT NULL
+    GROUP BY p.OwnerUserId, tag
+),
+
+/* 4. Top 3 tags per user (by post count) */
+top_tags AS (
+    SELECT 
+        user_id,
+        STRING_AGG(tag, ', ' ORDER BY tag_post_cnt DESC) 
+            FILTER (WHERE tag_rank <= 3)          AS top_three_tags
+    FROM (
+        SELECT 
+            user_id,
+            tag,
+            tag_post_cnt,
+            ROW_NUMBER() OVER (PARTITION BY user_id 
+                               ORDER BY tag_post_cnt DESC, tag_score_sum DESC) AS tag_rank
+        FROM tag_contrib
+    ) ranked_tags
+    GROUP BY user_id
+),
+
+/* 5. Vote summary (last year) with correlated subquery */
+vote_summary AS (
+    SELECT 
+        v.PostId,
+        p.OwnerUserId                            AS user_id,
+        COUNT(*)                                 AS votes_last_year,
+        SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS upvotes,
+        SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS downvotes
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    JOIN Posts p ON p.Id = v.PostId
+    WHERE v.CreationDate >= cast('2024-10-01' as date) - INTERVAL '365 DAY'
+    GROUP BY v.PostId, p.OwnerUserId
+),
+
+/* 6. Badge snapshots (most recent badge per user) */
+latest_badge AS (
+    SELECT DISTINCT ON (b.UserId) 
+        b.UserId                              AS user_id,
+        b.Name                                AS badge_name,
+        b.Class                               AS badge_class,
+        b.Date                                AS badge_awarded
+    FROM Badges b
+    ORDER BY b.UserId, b.Date DESC
+),
+
+/* 7. Union of question and answer score extremes */
+score_extremes AS (
+    SELECT 
+        OwnerUserId                    AS user_id,
+        MAX(Score)                     AS max_question_score,
+        MIN(Score)                     AS min_question_score,
+        NULL::INT                      AS max_answer_score,
+        NULL::INT                      AS min_answer_score
+    FROM Posts
+    WHERE PostTypeId = 1
+    GROUP BY OwnerUserId
+    UNION ALL
+    SELECT 
+        OwnerUserId                    AS user_id,
+        NULL::INT,
+        NULL::INT,
+        MAX(Score)                     AS max_answer_score,
+        MIN(Score)                     AS min_answer_score
+    FROM Posts
+    WHERE PostTypeId = 2
+    GROUP BY OwnerUserId
+),
+
+/* 8. Consolidated score extremes per user (pivot) */
+score_pivot AS (
+    SELECT 
+        user_id,
+        MAX(max_question_score)         AS max_q_score,
+        MIN(min_question_score)         AS min_q_score,
+        MAX(max_answer_score)           AS max_a_score,
+        MIN(min_answer_score)           AS min_a_score
+    FROM score_extremes
+    GROUP BY user_id
+)
+
+SELECT 
+    ub.user_id,
+    ub.DisplayName,
+    ub.Reputation,
+    ub.location,
+    ub.total_posts,
+    ub.total_questions,
+    ub.total_answers,
+    ub.last_post_date,
+    COALESCE(ra.recent_posts, 0)                         AS recent_posts_90d,
+    COALESCE(ra.recent_score_sum, 0)                     AS recent_score_90d,
+    ra.recent_last_activity,
+    tt.top_three_tags,
+    vs.votes_last_year,
+    vs.upvotes,
+    vs.downvotes,
+    lb.badge_name,
+    lb.badge_class,
+    lb.badge_awarded,
+    sp.max_q_score,
+    sp.min_q_score,
+    sp.max_a_score,
+    sp.min_a_score
+FROM user_base ub
+LEFT JOIN recent_activity ra       ON ra.user_id = ub.user_id AND ra.rn = 1
+LEFT JOIN top_tags tt              ON tt.user_id = ub.user_id
+LEFT JOIN vote_summary vs          ON vs.user_id = ub.user_id
+LEFT JOIN latest_badge lb          ON lb.user_id = ub.user_id
+LEFT JOIN score_pivot sp           ON sp.user_id = ub.user_id
+ORDER BY ub.Reputation DESC
+LIMIT 100;

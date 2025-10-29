@@ -1,0 +1,178 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ParentId,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING) as avg_score_5day,
+        CASE 
+            WHEN p.Score > 100 THEN 'High'
+            WHEN p.Score > 50 THEN 'Medium'
+            ELSE 'Low'
+        END as score_category,
+        COALESCE(p.Title, 'No Title') as title_or_default,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND CHAR_LENGTH(p.Tags) > 0 THEN 
+                (SELECT COUNT(*) FROM UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2), '><')) AS tag)
+            ELSE 0
+        END as tag_count
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) 
+      AND p.CreationDate >= DATE '2023-01-01'
+),
+UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as post_count,
+        SUM(p.Score) as total_score,
+        AVG(p.Score) as avg_score,
+        MAX(p.CreationDate) as last_post_date,
+        COUNT(DISTINCT c.Id) as comment_count,
+        COUNT(DISTINCT b.Id) as badge_count,
+        COUNT(DISTINCT v.Id) as vote_count,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Expert'
+            WHEN u.Reputation >= 1000 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as user_level,
+        CASE 
+            WHEN u.Views > 10000 THEN 'High View Count'
+            WHEN u.Views > 1000 THEN 'Medium View Count'
+            ELSE 'Low View Count'
+        END as view_category
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    WHERE u.CreationDate >= DATE '2023-01-01'
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes
+),
+PostAnalysis AS (
+    SELECT 
+        rp.Id,
+        rp.OwnerUserId,
+        rp.Score,
+        rp.ViewCount,
+        rp.CreationDate,
+        rp.Title,
+        rp.Tags,
+        rp.AnswerCount,
+        rp.CommentCount,
+        rp.FavoriteCount,
+        rp.prev_score,
+        rp.avg_score_5day,
+        rp.score_category,
+        rp.title_or_default,
+        rp.tag_count,
+        CASE 
+            WHEN rp.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1 AND CreationDate >= DATE '2023-01-01') THEN 'Above Average'
+            ELSE 'Below Average'
+        END as score_vs_avg,
+        CASE 
+            WHEN rp.AnswerCount IS NULL OR rp.AnswerCount = 0 THEN 'No Answers'
+            WHEN rp.AnswerCount < 3 THEN 'Few Answers'
+            ELSE 'Many Answers'
+        END as answer_category,
+        CASE 
+            WHEN rp.CommentCount > 0 THEN TRUE
+            ELSE FALSE
+        END as has_comments,
+        (SELECT COUNT(*) FROM Posts WHERE ParentId = rp.Id AND PostTypeId = 2) as answer_count_from_subquery
+    FROM RankedPosts rp
+    WHERE rp.rn = 1 
+),
+ComplexTagAnalysis AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            ELSE 'Niche'
+        END as popularity_level,
+        CASE 
+            WHEN t.IsRequired = TRUE OR t.IsRequired = 1 THEN 'Required Tag'
+            WHEN t.IsModeratorOnly = TRUE OR t.IsModeratorOnly = 1 THEN 'Moderator Only'
+            ELSE 'General Tag'
+        END as tag_type,
+        COALESCE((SELECT COUNT(DISTINCT p.Id) FROM Posts p WHERE p.Tags ILIKE '%' || t.TagName || '%'), 0) as usage_count,
+        ((SELECT COUNT(DISTINCT p.Id) FROM Posts p WHERE p.Tags ILIKE '%' || t.TagName || '%') * 100.0 / 
+         (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1)) as percent_of_questions
+    FROM Tags t
+    WHERE t.TagName IS NOT NULL AND CHAR_LENGTH(t.TagName) > 0
+)
+SELECT 
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.post_count,
+    uas.total_score,
+    uas.avg_score,
+    uas.last_post_date,
+    pa.Id as PostId,
+    pa.Score as PostScore,
+    pa.ViewCount,
+    pa.CreationDate as PostCreationDate,
+    pa.Title as PostTitle,
+    pa.Tags as PostTags,
+    pa.AnswerCount,
+    pa.CommentCount,
+    pa.FavoriteCount,
+    pa.score_vs_avg,
+    pa.answer_category,
+    pa.has_comments,
+    pa.answer_count_from_subquery,
+    CASE 
+        WHEN pa.Score > 100 THEN 'High Impact'
+        WHEN pa.Score > 50 THEN 'Medium Impact'
+        ELSE 'Low Impact'
+    END as impact_level,
+    cta.TagName,
+    cta.Count as TagCount,
+    cta.popularity_level,
+    cta.tag_type,
+    cta.usage_count,
+    cta.percent_of_questions,
+    CASE 
+        WHEN uas.user_level = 'Expert' AND pa.score_category = 'High' THEN 'Top Performer'
+        WHEN uas.user_level IN ('Intermediate', 'Beginner') AND pa.score_category = 'High' THEN 'Rising Star'
+        ELSE 'Regular Contributor'
+    END as contributor_status
+FROM UserActivityStats uas
+JOIN PostAnalysis pa ON uas.UserId = pa.OwnerUserId
+LEFT JOIN ComplexTagAnalysis cta ON pa.Tags IS NOT NULL 
+    AND cta.TagName IN (
+        SELECT TRIM(UNNEST(string_to_array(SUBSTRING(pa.Tags FROM 2 FOR CHAR_LENGTH(pa.Tags)-2), '><')))
+        FROM (SELECT pa.Tags) AS _t(pa_tags)
+        WHERE pa.Tags IS NOT NULL AND CHAR_LENGTH(pa.Tags) > 0
+    )
+WHERE uas.post_count > 0 
+    AND pa.Score IS NOT NULL
+    AND (pa.score_vs_avg = 'Above Average' OR cta.popularity_level = 'Popular')
+    AND (uas.Reputation >= 100 OR pa.Score >= 10)
+    AND NOT (uas.UserId = 1 AND pa.Id = 1)
+ORDER BY 
+    uas.total_score DESC,
+    pa.Score DESC,
+    cta.Count DESC,
+    pa.CreationDate ASC
+LIMIT 1000;

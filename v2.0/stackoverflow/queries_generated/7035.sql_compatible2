@@ -1,0 +1,245 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        MAX(p.CreationDate) as LastPostDate,
+        AVG(p.ViewCount) as AvgViewCount,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags)-2)), ', ') as AllTags,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+                (COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) * 100.0 / COUNT(DISTINCT p.Id))
+            ELSE 0 
+        END as QuestionPercentage
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        PostCount,
+        QuestionCount,
+        AnswerCount,
+        TotalScore,
+        AvgViewCount,
+        QuestionPercentage,
+        ROW_NUMBER() OVER (ORDER BY TotalScore DESC, Reputation DESC) as RankByScore,
+        DENSE_RANK() OVER (ORDER BY Reputation DESC) as RankByReputation,
+        NTILE(10) OVER (ORDER BY PostCount DESC) as PostCountDecile,
+        CASE 
+            WHEN Reputation > 10000 THEN 'Elite'
+            WHEN Reputation > 5000 THEN 'Veteran'
+            WHEN Reputation > 1000 THEN 'Regular'
+            ELSE 'Newbie'
+        END as ReputationTier,
+        (PostCount * 10 + QuestionCount * 5 + AnswerCount * 3 + TotalScore * 0.1 + 
+         CASE WHEN AvgViewCount > 100 THEN AvgViewCount * 0.01 ELSE 0 END) as BonusScore
+    FROM UserStats
+    WHERE PostCount > 0
+),
+UserPostAnalysis AS (
+    SELECT 
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        CAST(DATE_PART('day', (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate)) AS INTEGER) as DaysSinceCreation,
+        CASE 
+            WHEN DATE_PART('day', (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate)) < 30 THEN 'New'
+            WHEN DATE_PART('day', (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate)) < 90 THEN 'Recent'
+            WHEN DATE_PART('day', (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate)) < 365 THEN 'Active'
+            ELSE 'Stale'
+        END as PostAgeCategory,
+        DENSE_RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as PostRecencyRank,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as AvgUserScore,
+        LAG(p.CreationDate, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PreviousPostDate,
+        LEAD(p.CreationDate, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as NextPostDate
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        COUNT(DISTINCT p.Id) as AssociatedPostCount,
+        AVG(p.Score) as AvgScore,
+        STRING_AGG(DISTINCT u.DisplayName, ', ') as TopContributors,
+        (t.Count * 10 + AVG(p.Score) * 0.5) as TagPopularityScore,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            WHEN t.Count > 10 THEN 'Niche'
+            ELSE 'Rare'
+        END as PopularityLevel
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    GROUP BY t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId
+),
+UserTagValues AS (
+    -- split tags from concatenated tag strings into rows in a dialect-independent way
+    SELECT ut.OwnerUserId, TRIM(tag) AS value
+    FROM (
+      SELECT OwnerUserId, Tags
+      FROM Posts
+      WHERE Tags IS NOT NULL
+    ) ut_cross,
+    LATERAL (
+      SELECT TRIM(value) AS tag
+      FROM (
+        -- replace '><' with a chosen separator and then split by that separator using a simple recursive split
+        SELECT regexp_replace(ut_cross.Tags, '^<|>$', '') AS tags_trimmed
+      ) t0,
+      LATERAL (
+        SELECT SPLIT_TAG.value
+        FROM (
+          -- Use a string-splitting method compatible with many systems: split on '><' by iterative substring extraction.
+          -- For engines without a built-in split, emulate with recursive CTE below.
+          SELECT tags_trimmed AS all_tags
+        ) st,
+        LATERAL (
+          SELECT NULL AS value
+        ) SPLIT_TAG
+      )
+    )
+),
+-- If the engine supports UNNEST/SPLIT, prefer this implementation; otherwise fall back to a recursive splitter:
+PostTags AS (
+    -- Attempt to split tags by '><' producing rows like 'tagname'
+    -- This implementation uses a recursive CTE to be broadly compatible.
+    SELECT OwnerUserId, tag
+    FROM (
+      SELECT OwnerUserId, CASE WHEN Tags IS NULL THEN '' ELSE REGEXP_REPLACE(Tags, '^<|>$', '') END AS tags_clean
+      FROM Posts
+      WHERE OwnerUserId IS NOT NULL
+    ) p0
+    , LATERAL (
+      WITH RECURSIVE splitter(OwnerUserId, rest, tag) AS (
+        SELECT p0.OwnerUserId,
+               p0.tags_clean,
+               NULL::VARCHAR
+        UNION ALL
+        SELECT OwnerUserId,
+               CASE
+                 WHEN POSITION('><' IN rest) > 0 THEN SUBSTR(rest, POSITION('><' IN rest) + 2)
+                 ELSE ''
+               END,
+               CASE
+                 WHEN POSITION('><' IN rest) > 0 THEN SUBSTR(rest, 1, POSITION('><' IN rest) - 1)
+                 ELSE rest
+               END
+        FROM splitter
+        WHERE rest IS NOT NULL AND rest <> ''
+      )
+      SELECT OwnerUserId, tag FROM splitter WHERE tag IS NOT NULL AND tag <> ''
+    ) s
+),
+UserTopTags AS (
+    SELECT pt.OwnerUserId, TRIM(pt.tag) as TagName
+    FROM PostTags pt
+),
+TopTagsForUser AS (
+    SELECT tu.UserId, STRING_AGG(tt.TagName || ' (' || CAST(ta.TagCount AS VARCHAR(10)) || ')', ', ') AS TopTags
+    FROM TopUsers tu
+    LEFT JOIN (
+      SELECT ut.OwnerUserId, ut.TagName
+      FROM UserTopTags ut
+      GROUP BY ut.OwnerUserId, ut.TagName
+    ) ut2 ON ut2.OwnerUserId = tu.UserId
+    LEFT JOIN TagAnalysis ta ON ta.TagName = ut2.TagName
+    GROUP BY tu.UserId
+)
+SELECT 
+    tu.UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.PostCount,
+    tu.QuestionCount,
+    tu.AnswerCount,
+    tu.TotalScore,
+    tu.AvgViewCount,
+    tu.QuestionPercentage,
+    tu.RankByScore,
+    tu.RankByReputation,
+    tu.PostCountDecile,
+    tu.ReputationTier,
+    tu.BonusScore,
+    CASE 
+        WHEN tu.BonusScore > 1000 THEN 'Highly Active'
+        WHEN tu.BonusScore > 500 THEN 'Active'
+        WHEN tu.BonusScore > 100 THEN 'Regular'
+        ELSE 'Casual'
+    END as ActivityLevel,
+    (SELECT STRING_AGG(
+        CASE 
+            WHEN upa.PostTypeId = 1 THEN 'Question: ' || LEFT(COALESCE(upa.Title,''), 50) || ' (Score: ' || CAST(upa.Score AS VARCHAR(10)) || ')'
+            WHEN upa.PostTypeId = 2 THEN 'Answer: Score ' || CAST(upa.Score AS VARCHAR(10))
+            ELSE 'Post: Score ' || CAST(upa.Score AS VARCHAR(10))
+        END, '; '
+    ) 
+    FROM (
+      SELECT * FROM UserPostAnalysis upa2
+      WHERE upa2.OwnerUserId = tu.UserId 
+        AND upa2.Score >= (SELECT AVG(Score) FROM UserPostAnalysis WHERE OwnerUserId = tu.UserId) + 10
+      ORDER BY upa2.Score DESC
+      LIMIT 3
+    ) upa) as HighScoringPosts,
+    COALESCE(tt.TopTags, '') as TopTags,
+    (CASE 
+        WHEN tu.QuestionCount > 0 AND tu.AnswerCount > 0 THEN 
+            CAST(tu.AnswerCount AS DOUBLE PRECISION) / tu.QuestionCount
+        ELSE 0 
+    END) as AnswerToQuestionRatio,
+    (SELECT AVG(CAST(DATE_PART('day', (upa.CreationDate - upa.PreviousPostDate)) AS INTEGER))
+     FROM UserPostAnalysis upa 
+     WHERE upa.OwnerUserId = tu.UserId 
+     AND upa.PreviousPostDate IS NOT NULL) as AvgDaysBetweenPosts,
+    (SELECT MAX(upa.CreationDate) 
+     FROM UserPostAnalysis upa 
+     WHERE upa.OwnerUserId = tu.UserId) as LastActivePost,
+    (CASE 
+        WHEN tu.PostCount > 1 THEN 
+            (tu.PostCount - (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = tu.UserId AND CreationDate < (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year'))) * 100.0 / NULLIF((SELECT COUNT(*) FROM Posts WHERE OwnerUserId = tu.UserId AND CreationDate < (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year')), 0)
+        ELSE 0 
+    END) as AnnualGrowthRate,
+    CASE 
+        WHEN tu.PostCount >= 100 OR tu.Reputation >= 10000 OR tu.TotalScore >= 1000 
+        THEN 1
+        ELSE 0
+    END as HighAchievementFlag,
+    (tu.TotalScore * 1.2 + tu.Reputation * 0.001 + 
+     COALESCE((SELECT AVG(Score) FROM UserPostAnalysis WHERE OwnerUserId = tu.UserId) * 0.5, 0) +
+     COALESCE((SELECT AVG(ViewCount) FROM UserPostAnalysis WHERE OwnerUserId = tu.UserId) * 0.01, 0)) as FinalUserScore
+FROM TopUsers tu
+LEFT JOIN TopTagsForUser tt ON tt.UserId = tu.UserId
+WHERE tu.PostCount >= 10
+AND (
+    EXISTS (SELECT 1 FROM Posts WHERE OwnerUserId = tu.UserId AND PostTypeId = 1) 
+    OR EXISTS (SELECT 1 FROM Posts WHERE OwnerUserId = tu.UserId AND PostTypeId = 2)
+    OR EXISTS (SELECT 1 FROM Comments WHERE UserId = tu.UserId)
+    OR EXISTS (SELECT 1 FROM Badges WHERE UserId = tu.UserId)
+)
+ORDER BY tu.BonusScore DESC, tu.TotalScore DESC
+LIMIT 100;

@@ -1,0 +1,325 @@
+with recent_activity as (
+  select
+    p.id as post_id,
+    p.posttypeid,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.owneruserid,
+    p.title,
+    p.tags,
+    p.answercount,
+    p.lastactivitydate,
+    ph.posthistorytypeid,
+    ph.creationdate as ph_creationdate,
+    ph.comment as close_reason_id,
+    row_number() over (partition by p.id order by ph.creationdate desc) as rn_last_ph
+  from posts p
+  left join posthistory ph
+    on ph.postid = p.id
+   and ph.posthistorytypeid in (10,11,12,13,14,15,19,20,35,36,50,52,53)
+  where p.creationdate >= (select max(creationdate) - interval '365 days' from posts)
+),
+user_activity as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    coalesce(u.location, 'Unknown') as location,
+    count(distinct case when b.class = 1 then b.id end) as gold_badges,
+    count(distinct case when b.class = 2 then b.id end) as silver_badges,
+    count(distinct case when b.class = 3 then b.id end) as bronze_badges,
+    count(distinct p.id) as total_posts,
+    sum(coalesce(p.score,0)) as total_post_score,
+    max(u.lastaccessdate) as last_seen
+  from users u
+  left join badges b on b.userid = u.id
+  left join posts p on p.owneruserid = u.id
+  group by u.id, u.displayname, u.reputation, coalesce(u.location, 'Unknown')
+),
+tag_expansion as (
+  select
+    p.id as post_id,
+    unnest(string_to_array(substring(p.tags from 2 for char_length(p.tags)-2), '><')) as tag
+  from posts p
+  where p.posttypeid = 1
+    and p.tags is not null
+),
+tag_stats as (
+  select
+    te.tag,
+    count(*) as tag_q_count,
+    sum(p.viewcount) as tag_total_views,
+    avg(nullif(p.answercount,0)) as avg_answers_nonzero,
+    percentile_cont(0.9) within group (order by p.score) as p90_score
+  from tag_expansion te
+  join posts p on p.id = te.post_id
+  group by te.tag
+),
+dupe_clusters as (
+  select
+    pl.relatedpostid as canonical_id,
+    count(*) filter (where pl.linktypeid = 3) as dup_count,
+    count(*) filter (where pl.linktypeid = 1) as linked_count,
+    min(pl.creationdate) as first_link_date,
+    max(pl.creationdate) as last_link_date
+  from postlinks pl
+  group by pl.relatedpostid
+),
+post_vote_rollup as (
+  select
+    v.postid,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started,
+    sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded,
+    count(*) filter (where v.votetypeid in (10,12)) as mod_delete_spam_votes
+  from votes v
+  where v.creationdate >= (select max(creationdate) - interval '365 days' from votes)
+  group by v.postid
+),
+comment_sentiment as (
+  select
+    c.postid,
+    avg(c.score) as avg_comment_score,
+    count(*) as comment_count,
+    sum(case when position('thank' in lower(c.text)) > 0 then 1 else 0 end) as thanks_mentions,
+    sum(case when position('duplicate' in lower(c.text)) > 0 then 1 else 0 end) as duplicate_mentions,
+    max(c.creationdate) as last_comment_date
+  from comments c
+  group by c.postid
+),
+latest_ph as (
+  select
+    post_id,
+    max(ph_creationdate) as latest_ph_date,
+    max(posthistorytypeid) filter (where rn_last_ph = 1) as latest_ph_type,
+    max(close_reason_id) filter (where rn_last_ph = 1 and posthistorytypeid = 10) as latest_close_reason_id
+  from recent_activity
+  group by post_id
+),
+question_core as (
+  select
+    p.id,
+    p.title,
+    p.creationdate,
+    p.lastactivitydate,
+    p.score,
+    p.viewcount,
+    p.answercount,
+    p.owneruserid,
+    nullif(trim(both from p.ownerdisplayname), '') as owner_name_fuzzy,
+    case when p.closeddate is not null then 1 else 0 end as is_closed,
+    case when p.acceptedanswerid is not null then 1 else 0 end as has_accepted
+  from posts p
+  where p.posttypeid = 1
+),
+owner_resolved as (
+  select
+    qc.*,
+    u.displayname as owner_displayname,
+    ua.reputation as owner_reputation,
+    ua.location as owner_location,
+    ua.gold_badges,
+    ua.silver_badges,
+    ua.bronze_badges,
+    ua.total_posts as owner_total_posts,
+    ua.total_post_score as owner_total_post_score,
+    ua.last_seen as owner_last_seen
+  from question_core qc
+  left join users u on u.id = qc.owneruserid
+  left join user_activity ua on ua.user_id = qc.owneruserid
+),
+topic_enrichment as (
+  select
+    o.id as post_id,
+    array_agg(ts.tag order by ts.tag_q_count desc) as tags_by_popularity,
+    sum(ts.tag_total_views) as topic_total_views,
+    avg(ts.p90_score) as avg_tag_p90_score
+  from owner_resolved o
+  left join tag_expansion te on te.post_id = o.id
+  left join tag_stats ts on ts.tag = te.tag
+  group by o.id
+),
+post_quality as (
+  select
+    o.id,
+    coalesce(pvr.upvotes,0) as upvotes,
+    coalesce(pvr.downvotes,0) as downvotes,
+    coalesce(pvr.bounty_started,0) as bounty_started,
+    coalesce(pvr.bounty_awarded,0) as bounty_awarded,
+    coalesce(cs.avg_comment_score,0) as avg_comment_score,
+    coalesce(cs.comment_count,0) as comment_count,
+    coalesce(cs.thanks_mentions,0) as thanks_mentions,
+    coalesce(cs.duplicate_mentions,0) as duplicate_mentions,
+    case
+      when coalesce(pvr.upvotes,0) + coalesce(pvr.downvotes,0) = 0 then null
+      else round( (coalesce(pvr.upvotes,0) * 1.0 / nullif(coalesce(pvr.upvotes,0) + coalesce(pvr.downvotes,0),0)) * 100, 2)
+    end as upvote_ratio_pct,
+    cs.last_comment_date
+  from owner_resolved o
+  left join post_vote_rollup pvr on pvr.postid = o.id
+  left join comment_sentiment cs on cs.postid = o.id
+),
+age_buckets as (
+  select
+    o.id,
+    case
+      when o.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '7 days' then '0-7d'
+      when o.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days' then '8-30d'
+      when o.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '90 days' then '31-90d'
+      when o.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '180 days' then '91-180d'
+      else '180d+'
+    end as age_bucket
+  from owner_resolved o
+),
+closed_reasons as (
+  select
+    p.id as post_id,
+    crt.name as close_reason_name
+  from posts p
+  left join posthistory ph
+    on ph.postid = p.id
+   and ph.posthistorytypeid = 10
+  left join (select id, name from close_reason_types) crt
+    on cast(crt.id as varchar) = ph.comment
+  where p.posttypeid = 1
+),
+final_scores as (
+  select
+    o.id as post_id,
+    o.title,
+    o.creationdate,
+    o.lastactivitydate,
+    o.score as post_score,
+    o.viewcount,
+    o.answercount,
+    o.is_closed,
+    o.has_accepted,
+    o.owneruserid,
+    coalesce(o.owner_displayname, o.owner_name_fuzzy, 'Community/Deleted') as owner_displayname,
+    o.owner_reputation,
+    o.owner_location,
+    o.gold_badges, o.silver_badges, o.bronze_badges,
+    o.owner_total_posts, o.owner_total_post_score, o.owner_last_seen,
+    te.tags_by_popularity,
+    te.topic_total_views,
+    te.avg_tag_p90_score,
+    pq.upvotes, pq.downvotes, pq.bounty_started, pq.bounty_awarded,
+    pq.avg_comment_score, pq.comment_count, pq.thanks_mentions, pq.duplicate_mentions, pq.upvote_ratio_pct,
+    ab.age_bucket,
+    cr.close_reason_name,
+    lp.latest_ph_date,
+    lp.latest_ph_type,
+    dc.dup_count,
+    dc.linked_count,
+    case
+      when o.is_closed = 1 and coalesce(pq.duplicate_mentions,0) > 0 then 'Likely Duplicate'
+      when o.has_accepted = 1 and coalesce(pq.upvote_ratio_pct,0) >= 80 then 'High Quality Answered'
+      when coalesce(pq.upvotes,0) - coalesce(pq.downvotes,0) < 0 then 'Controversial/Negative'
+      when coalesce(te.topic_total_views,0) >= 100000 then 'High Traffic Topic'
+      else 'Standard'
+    end as category,
+    (
+      coalesce(o.score,0) * 2
+      + coalesce(pq.upvotes,0)
+      - coalesce(pq.downvotes,0) * 1.5
+      + least(coalesce(o.viewcount,0) / 1000.0, 100)
+      + coalesce(pq.avg_comment_score,0)
+      + case when o.has_accepted = 1 then 15 else 0 end
+      + case when o.is_closed = 1 then -20 else 0 end
+      + case when ab.age_bucket in ('0-7d','8-30d') then 5 else 0 end
+      + coalesce(log(nullif(greatest(o.owner_reputation,1),0)),0)
+    ) as ranking_score
+  from owner_resolved o
+  left join topic_enrichment te on te.post_id = o.id
+  left join post_quality pq on pq.id = o.id
+  left join age_buckets ab on ab.id = o.id
+  left join latest_ph lp on lp.post_id = o.id
+  left join dupe_clusters dc on dc.canonical_id = o.id
+  left join closed_reasons cr on cr.post_id = o.id
+),
+ranked as (
+  select
+    fs.post_id,
+    fs.title,
+    fs.creationdate,
+    fs.lastactivitydate,
+    fs.post_score,
+    fs.viewcount,
+    fs.answercount,
+    fs.is_closed,
+    fs.has_accepted,
+    fs.owneruserid,
+    fs.owner_displayname,
+    fs.owner_reputation,
+    fs.owner_location,
+    fs.gold_badges,
+    fs.silver_badges,
+    fs.bronze_badges,
+    fs.owner_total_posts,
+    fs.owner_total_post_score,
+    fs.owner_last_seen,
+    fs.tags_by_popularity,
+    fs.topic_total_views,
+    fs.avg_tag_p90_score,
+    fs.upvotes,
+    fs.downvotes,
+    fs.bounty_started,
+    fs.bounty_awarded,
+    fs.avg_comment_score,
+    fs.comment_count,
+    fs.thanks_mentions,
+    fs.duplicate_mentions,
+    fs.upvote_ratio_pct,
+    fs.age_bucket,
+    fs.close_reason_name,
+    fs.latest_ph_date,
+    fs.latest_ph_type,
+    fs.dup_count,
+    fs.linked_count,
+    fs.category,
+    fs.ranking_score,
+    row_number() over (order by fs.ranking_score desc, fs.creationdate desc) as rn_overall,
+    row_number() over (partition by fs.age_bucket order by fs.ranking_score desc) as rn_by_age,
+    dense_rank() over (partition by coalesce(fs.owner_location,'Unknown') order by fs.ranking_score desc) as dr_by_location,
+    avg(fs.ranking_score) over () as avg_global_score,
+    percentile_cont(0.5) within group (order by fs.ranking_score) over () as median_global_score
+  from final_scores fs
+)
+select
+  r.post_id,
+  r.title,
+  r.owner_displayname,
+  r.owner_reputation,
+  r.owner_location,
+  r.post_score,
+  r.viewcount,
+  r.answercount,
+  r.is_closed,
+  r.has_accepted,
+  r.tags_by_popularity,
+  r.category,
+  r.age_bucket,
+  r.close_reason_name,
+  r.upvotes, r.downvotes, r.upvote_ratio_pct,
+  r.bounty_started, r.bounty_awarded,
+  r.comment_count, r.avg_comment_score,
+  r.duplicate_mentions,
+  r.topic_total_views,
+  r.avg_tag_p90_score,
+  r.latest_ph_date as latest_posthistory_date,
+  r.latest_ph_type,
+  r.dup_count,
+  r.linked_count,
+  r.ranking_score,
+  r.rn_overall,
+  r.rn_by_age,
+  r.dr_by_location,
+  r.avg_global_score,
+  r.median_global_score
+from ranked r
+where r.rn_overall <= 500
+   or (r.age_bucket in ('0-7d','8-30d') and r.rn_by_age <= 100)
+   or (r.owner_location is distinct from 'Unknown' and r.dr_by_location <= 10)
+order by r.rn_overall, r.rn_by_age, r.post_id;

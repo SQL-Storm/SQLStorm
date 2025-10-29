@@ -1,0 +1,130 @@
+-- {"query": "3155.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2442} 
+
+WITH
+-- Basic per‑user aggregates
+usr_agg AS (
+    SELECT
+        u.Id                                   AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        SUM(p.Score) FILTER (WHERE p.PostTypeId = 2) AS TotalAnswerScore,
+        MAX(p.CreationDate)                     AS LastPostDate,
+        COALESCE(u.UpVotes - u.DownVotes, 0)    AS NetVotes
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes
+),
+
+-- Users that own at least one gold badge (correlated subquery style)
+gold_badge_users AS (
+    SELECT DISTINCT b.UserId
+    FROM Badges b
+    WHERE b.Class = 1
+),
+
+-- Tag usage per user (exploding the Tags column)
+user_tags AS (
+    SELECT
+        p.OwnerUserId                         AS UserId,
+        UNNEST(string_to_array(trim(both '><' FROM p.Tags), '><')) AS Tag,
+        COUNT(*)                              AS TagUsage
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.Tags IS NOT NULL
+    GROUP BY p.OwnerUserId, Tag
+),
+
+-- Top 10 tags overall (used later for a left join)
+top_tags AS (
+    SELECT t.TagName, t.Count
+    FROM Tags t
+    ORDER BY t.Count DESC
+    LIMIT 10
+),
+
+-- Recent activity: posts + comments (set operator)
+recent_activity AS (
+    SELECT
+        p.OwnerUserId   AS UserId,
+        p.CreationDate  AS ActivityDate,
+        'Post'          AS ActivityType,
+        p.Title         AS Detail
+    FROM Posts p
+    WHERE p.CreationDate > CURRENT_DATE - INTERVAL '30 days'
+
+    UNION ALL
+
+    SELECT
+        c.UserId        AS UserId,
+        c.CreationDate  AS ActivityDate,
+        'Comment'       AS ActivityType,
+        LEFT(c.Text, 100) AS Detail
+    FROM Comments c
+    WHERE c.CreationDate > CURRENT_DATE - INTERVAL '30 days'
+),
+
+-- Rank recent activity per user (window function)
+ranked_activity AS (
+    SELECT
+        ra.*,
+        ROW_NUMBER() OVER (PARTITION BY ra.UserId ORDER BY ra.ActivityDate DESC) AS rn
+    FROM recent_activity ra
+),
+
+-- Votes summary per post (outer join, aggregation)
+vote_summary AS (
+    SELECT
+        p.Id                                 AS PostId,
+        p.PostTypeId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        COUNT(v.Id)                         AS TotalVotes
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    GROUP BY p.Id, p.PostTypeId
+)
+
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.TotalAnswerScore,
+    ua.NetVotes,
+    CASE WHEN gb.UserId IS NOT NULL THEN 1 ELSE 0 END          AS HasGoldBadge,
+    COALESCE(ut.Tag, 'None')                                   AS TopTag,
+    ut.TagUsage,
+    ra.ActivityDate,
+    ra.ActivityType,
+    ra.Detail,
+    vs.UpVotes,
+    vs.DownVotes,
+    vs.TotalVotes,
+    COALESCE(tt.Count, 0)                                      AS TagGlobalCount
+FROM usr_agg ua
+LEFT JOIN gold_badge_users gb ON gb.UserId = ua.UserId
+LEFT JOIN (
+    SELECT
+        UserId,
+        Tag,
+        TagUsage,
+        ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY TagUsage DESC) AS rn
+    FROM user_tags
+) ut ON ut.UserId = ua.UserId AND ut.rn = 1
+LEFT JOIN ranked_activity ra ON ra.UserId = ua.UserId AND ra.rn = 1
+LEFT JOIN vote_summary vs ON vs.PostId = (
+    SELECT p2.Id
+    FROM Posts p2
+    WHERE p2.OwnerUserId = ua.UserId
+      AND p2.PostTypeId = 2
+    ORDER BY p2.Score DESC NULLS LAST
+    LIMIT 1
+)
+LEFT JOIN top_tags tt ON tt.TagName = ut.Tag
+WHERE ua.Reputation > 10000
+  AND (ua.LastPostDate IS NULL OR ua.LastPostDate < CURRENT_DATE - INTERVAL '365 days')
+ORDER BY ua.Reputation DESC, ua.AnswerCount DESC
+LIMIT 50;

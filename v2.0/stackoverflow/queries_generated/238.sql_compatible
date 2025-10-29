@@ -1,0 +1,403 @@
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        u.location,
+        coalesce(nullif(trim(u.websiteurl), ''), 'http://example.invalid/' || regexp_replace(coalesce(u.displayname, 'anon'), '[^a-zA-Z0-9]+', '-', 'g')) as canonical_url,
+        date_trunc('month', u.creationdate) as cohort_month
+    from users u
+    where u.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+),
+q_posts as (
+    select
+        p.id as qid,
+        p.owneruserid as asker_id,
+        p.creationdate as q_created,
+        p.score as q_score,
+        p.viewcount,
+        p.title,
+        p.tags,
+        p.acceptedanswerid,
+        p.closeddate,
+        p.communityowneddate
+    from posts p
+    where p.posttypeid = 1
+      and p.creationdate >= (select min(creationdate) from recent_users)
+),
+a_posts as (
+    select
+        a.id as aid,
+        a.parentid as qid,
+        a.owneruserid as answerer_id,
+        a.creationdate as a_created,
+        a.score as a_score
+    from posts a
+    where a.posttypeid = 2
+),
+user_badges as (
+    select
+        b.userid,
+        count(case when b.class = 1 then 1 end) as gold_badges,
+        count(case when b.class = 2 then 1 end) as silver_badges,
+        count(case when b.class = 3 then 1 end) as bronze_badges,
+        count(*) as total_badges,
+        min(b.date) as first_badge_date,
+        max(b.date) as last_badge_date
+    from badges b
+    group by b.userid
+),
+question_activity as (
+    select
+        q.qid,
+        count(distinct a.aid) as answer_count,
+        count(c.id) as comment_count,
+        sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+        sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+        sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+        min(a.a_created) as first_answer_time,
+        max(a.a_created) as last_answer_time
+    from q_posts q
+    left join a_posts a on a.qid = q.qid
+    left join comments c on c.postid = q.qid
+    left join votes v on v.postid = q.qid
+    group by q.qid
+),
+duplicate_groups as (
+    select
+        pl.relatedpostid as canonical_qid,
+        pl.postid as dup_qid,
+        min(pl.creationdate) as first_link_date,
+        count(*) as link_count
+    from postlinks pl
+    where pl.linktypeid = 3
+    group by pl.relatedpostid, pl.postid
+),
+post_close_reasons as (
+    select
+        ph.postid as qid,
+        max(case when ph.posthistorytypeid = 10 then ph.creationdate end) as most_recent_close_time,
+        max(case when ph.posthistorytypeid = 11 then ph.creationdate end) as most_recent_reopen_time,
+        max(case when ph.posthistorytypeid = 10 then nullif(ph.comment, '') end) as last_close_reason_code
+    from posthistory ph
+    where ph.postid in (select qid from q_posts)
+      and ph.posthistorytypeid in (10,11)
+    group by ph.postid
+),
+accepted_answer_latency as (
+    select
+        q.qid,
+        q.q_created,
+        q.acceptedanswerid,
+        a.creationdate as accepted_created,
+        extract(epoch from (a.creationdate - q.q_created)) / 3600.0 as hours_to_accept
+    from q_posts q
+    left join posts a on a.id = q.acceptedanswerid
+),
+user_cohorts as (
+    select
+        ru.user_id,
+        ru.displayname,
+        ru.reputation,
+        ru.cohort_month,
+        row_number() over (partition by ru.cohort_month order by ru.reputation desc nulls last, ru.user_id) as rep_rank_in_cohort
+    from recent_users ru
+),
+question_owner_enriched as (
+    select
+        q.qid,
+        q.asker_id,
+        ru.displayname as asker_name,
+        ru.reputation as asker_rep,
+        uc.cohort_month,
+        uc.rep_rank_in_cohort,
+        coalesce(ub.total_badges, 0) as asker_total_badges
+    from q_posts q
+    left join recent_users ru on ru.user_id = q.asker_id
+    left join user_cohorts uc on uc.user_id = q.asker_id
+    left join user_badges ub on ub.userid = q.asker_id
+),
+answerer_stats as (
+    select
+        a.qid,
+        count(distinct a.answerer_id) as distinct_answerers,
+        avg(a.a_score) as avg_answer_score,
+        percentile_cont(0.5) within group (order by a.a_score) as median_answer_score
+    from a_posts a
+    group by a.qid
+),
+tag_expansion as (
+    select
+        q.qid,
+        unnest(string_to_array(substring(q.tags, 2, greatest(length(q.tags)-2,0)), '><')) as tagname
+    from q_posts q
+    where q.tags is not null
+),
+tag_weights as (
+    select
+        te.qid,
+        te.tagname,
+        t.count as global_tag_count,
+        log(greatest(t.count,1) + 1) as tag_weight
+    from tag_expansion te
+    left join tags t on t.tagname = te.tagname
+),
+tag_agg as (
+    select
+        qid,
+        count(*) as tag_count,
+        sum(tag_weight) as sum_tag_weight,
+        avg(tag_weight) as avg_tag_weight,
+        max(tag_weight) as max_tag_weight
+    from tag_weights
+    group by qid
+),
+question_quality as (
+    select
+        q.qid,
+        qa.answer_count,
+        qa.comment_count,
+        qa.upvotes,
+        qa.downvotes,
+        qa.favorites,
+        coalesce(qa.upvotes,0) - coalesce(qa.downvotes,0) as net_votes,
+        case when qa.answer_count is null or qa.answer_count = 0 then 1 else 0 end as is_unanswered,
+        coalesce(al.hours_to_accept, 24*365*10) as hours_to_accept_censored,
+        greatest(0.0,
+            0.5 * coalesce(q.q_score,0)
+            + 0.3 * coalesce(qa.upvotes,0)
+            - 0.7 * coalesce(qa.downvotes,0)
+            + 0.15 * coalesce(qa.favorites,0)
+            + 0.05 * coalesce(qa.comment_count,0)
+            + 0.1 * coalesce(ta.sum_tag_weight,0)
+            - 0.02 * coalesce(qa.viewcount,0)
+        ) as quality_score
+    from q_posts q
+    left join question_activity qa on qa.qid = q.qid
+    left join accepted_answer_latency al on al.qid = q.qid
+    left join tag_agg ta on ta.qid = q.qid
+),
+rolling_metrics as (
+    select
+        qoe.asker_id,
+        date_trunc('month', q.q_created) as month,
+        count(*) as questions_in_month,
+        avg(qq.quality_score) as avg_quality,
+        sum(case when qq.is_unanswered = 1 then 1 else 0 end) as unanswered_count
+    from q_posts q
+    left join question_owner_enriched qoe on qoe.qid = q.qid
+    left join question_quality qq on qq.qid = q.qid
+    group by qoe.asker_id, date_trunc('month', q.q_created)
+),
+rolling_window as (
+    select
+        rm.asker_id,
+        rm.month,
+        sum(rm.questions_in_month) over (partition by rm.asker_id order by rm.month rows between 2 preceding and current row) as q_3m_count,
+        avg(rm.avg_quality) over (partition by rm.asker_id order by rm.month rows between 2 preceding and current row) as q_3m_avg_quality,
+        sum(rm.unanswered_count) over (partition by rm.asker_id order by rm.month rows between 2 preceding and current row) as q_3m_unanswered
+    from rolling_metrics rm
+),
+hard_posts as (
+    select
+        q.qid,
+        case
+            when coalesce(qq.hours_to_accept_censored, 24*365*10) > 72
+                 or coalesce(qa.answer_count,0) = 0
+                 or cr.most_recent_close_time is not null
+            then 1 else 0
+        end as is_hard
+    from q_posts q
+    left join question_activity qa on qa.qid = q.qid
+    left join accepted_answer_latency qq on qq.qid = q.qid
+    left join post_close_reasons cr on cr.qid = q.qid
+),
+normalized as (
+    select
+        q.qid,
+        q.q_created,
+        q.title,
+        q.tags,
+        q.viewcount,
+        q.q_score,
+        qa.answer_count,
+        coalesce(qa.upvotes,0) as upvotes,
+        coalesce(qa.downvotes,0) as downvotes,
+        coalesce(qa.favorites,0) as favorites,
+        coalesce(ta.avg_tag_weight, 0) as avg_tag_weight,
+        coalesce(ta.max_tag_weight, 0) as max_tag_weight,
+        coalesce(asx.avg_answer_score, 0) as avg_answer_score,
+        coalesce(asx.median_answer_score, 0) as median_answer_score,
+        coalesce(qq.quality_score, 0) as quality_score,
+        coalesce(cr.last_close_reason_code, '0') as last_close_reason_code,
+        case when cr.most_recent_close_time is not null and (cr.most_recent_reopen_time is null or cr.most_recent_close_time > cr.most_recent_reopen_time) then 1 else 0 end as is_closed_now,
+        coalesce(hp.is_hard,0) as is_hard,
+        coalesce(dg.link_count,0) as dup_link_count,
+        coalesce(aa.hours_to_accept_censored, 24*365*10) as hours_to_accept_censored
+    from q_posts q
+    left join question_activity qa on qa.qid = q.qid
+    left join tag_agg ta on ta.qid = q.qid
+    left join answerer_stats asx on asx.qid = q.qid
+    left join post_close_reasons cr on cr.qid = q.qid
+    left join accepted_answer_latency aa on aa.qid = q.qid
+    left join hard_posts hp on hp.qid = q.qid
+    left join duplicate_groups dg on dg.dup_qid = q.qid
+),
+ranked as (
+    select
+        n.qid,
+        n.q_created,
+        n.title,
+        n.tags,
+        n.viewcount,
+        n.q_score,
+        n.answer_count,
+        n.upvotes,
+        n.downvotes,
+        n.favorites,
+        n.avg_tag_weight,
+        n.max_tag_weight,
+        n.avg_answer_score,
+        n.median_answer_score,
+        n.quality_score,
+        n.last_close_reason_code,
+        n.is_closed_now,
+        n.is_hard,
+        n.dup_link_count,
+        n.hours_to_accept_censored,
+        row_number() over (order by n.quality_score desc nulls last, n.viewcount desc nulls last, n.qid) as rank_overall,
+        dense_rank() over (partition by date_trunc('month', n.q_created) order by n.quality_score desc nulls last) as rank_in_month,
+        ntile(10) over (order by n.quality_score) as decile_quality,
+        sum(case when n.is_closed_now = 1 then 1 else 0 end) over () as total_closed
+    from normalized n
+),
+filtered as (
+    select
+        r.qid,
+        r.q_created,
+        r.title,
+        r.tags,
+        r.viewcount,
+        r.q_score,
+        r.answer_count,
+        r.upvotes,
+        r.downvotes,
+        r.favorites,
+        r.avg_tag_weight,
+        r.max_tag_weight,
+        r.avg_answer_score,
+        r.median_answer_score,
+        r.quality_score,
+        r.rank_overall,
+        r.rank_in_month,
+        r.decile_quality,
+        r.is_closed_now,
+        r.last_close_reason_code,
+        r.is_hard,
+        r.dup_link_count,
+        r.hours_to_accept_censored
+    from ranked r
+    where (r.is_closed_now = 0 or r.last_close_reason_code not in ('101','102','103','104','105'))
+      and (r.dup_link_count = 0 or r.quality_score > 0)
+      and coalesce(r.answer_count,0) + coalesce(r.upvotes,0) + coalesce(r.downvotes,0) > 0
+),
+topk as (
+    select
+        f.qid,
+        f.q_created,
+        f.title,
+        f.tags,
+        f.viewcount,
+        f.q_score,
+        f.answer_count,
+        f.upvotes,
+        f.downvotes,
+        f.favorites,
+        f.avg_tag_weight,
+        f.max_tag_weight,
+        f.avg_answer_score,
+        f.median_answer_score,
+        f.quality_score,
+        f.rank_overall,
+        f.rank_in_month,
+        f.decile_quality,
+        f.is_closed_now,
+        f.last_close_reason_code,
+        f.is_hard,
+        f.dup_link_count,
+        f.hours_to_accept_censored,
+        qoe.asker_id,
+        qoe.asker_name,
+        qoe.asker_rep,
+        qoe.asker_total_badges,
+        uc.q_3m_count,
+        uc.q_3m_avg_quality,
+        uc.q_3m_unanswered
+    from filtered f
+    left join question_owner_enriched qoe on qoe.qid = f.qid
+    left join rolling_window uc on uc.asker_id = qoe.asker_id
+    where f.rank_overall <= 1000
+),
+set_ops as (
+    select qid, title, 'high_quality' as bucket from topk where quality_score >= (select percentile_cont(0.75) within group (order by quality_score) from topk)
+    union all
+    select qid, title, 'low_quality' as bucket from topk where quality_score <= (select percentile_cont(0.25) within group (order by quality_score) from topk)
+),
+correlated_flags as (
+    select
+        t.qid,
+        exists (
+            select 1
+            from comments c
+            where c.postid = t.qid
+              and c.score < 0
+              and c.creationdate >= t.q_created
+        ) as has_negative_comment_after_post,
+        exists (
+            select 1
+            from votes v
+            where v.postid = t.qid
+              and v.votetypeid = 3
+              and v.creationdate >= t.q_created + interval '1 day'
+        ) as has_downvote_after_1d
+    from topk t
+)
+select
+    t.qid,
+    t.q_created,
+    t.title,
+    coalesce(t.tags, '') as tags,
+    t.viewcount,
+    t.q_score,
+    t.answer_count,
+    t.upvotes,
+    t.downvotes,
+    t.favorites,
+    t.avg_tag_weight,
+    t.max_tag_weight,
+    t.avg_answer_score,
+    t.median_answer_score,
+    t.quality_score,
+    t.rank_overall,
+    t.rank_in_month,
+    t.decile_quality,
+    t.is_closed_now,
+    t.last_close_reason_code,
+    t.is_hard,
+    t.dup_link_count,
+    t.hours_to_accept_censored,
+    t.asker_id,
+    coalesce(t.asker_name, '[unknown]') as asker_name,
+    coalesce(t.asker_rep, 0) as asker_rep,
+    coalesce(t.asker_total_badges, 0) as asker_total_badges,
+    coalesce(t.q_3m_count, 0) as q_3m_count,
+    round(coalesce(t.q_3m_avg_quality, 0), 3) as q_3m_avg_quality,
+    coalesce(t.q_3m_unanswered, 0) as q_3m_unanswered,
+    s.bucket,
+    case when cf.has_negative_comment_after_post then 'Y' else 'N' end as has_negative_comment_after_post,
+    case when cf.has_downvote_after_1d then 'Y' else 'N' end as has_downvote_after_1d
+from topk t
+left join set_ops s on s.qid = t.qid
+left join correlated_flags cf on cf.qid = t.qid
+order by t.rank_overall, t.qid;

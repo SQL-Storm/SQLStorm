@@ -1,0 +1,172 @@
+-- {"query": "2581.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1629} 
+WITH RecursivePostTags AS (
+    SELECT
+        p.Id AS PostId,
+        unnest(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')) AS Tag
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6)) AS EditsCount,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotesGiven,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVotesGiven,
+        COUNT(DISTINCT b.Id) AS BadgesCount,
+        MAX(b.Class) AS HighestBadgeClass
+    FROM Users u
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopQuestions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.AcceptedAnswerId,
+        COUNT(c.Id) AS CommentCount,
+        COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId = 10) AS CloseVotes,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS rn
+    FROM Posts p
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+    WHERE p.PostTypeId = 1 AND p.OwnerUserId IS NOT NULL
+    GROUP BY p.Id, p.Title, p.OwnerUserId, p.Score, p.ViewCount, p.CreationDate, p.AcceptedAnswerId
+),
+AcceptedAnswersWithOwners AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.OwnerUserId AS AnswerOwnerId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerDate,
+        u.DisplayName AS AnswerOwnerName,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank
+    FROM Posts a
+    LEFT JOIN Users u ON u.Id = a.OwnerUserId
+    WHERE a.PostTypeId = 2
+),
+DuplicatesAndLinks AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name AS LinkTypeName,
+        p1.Title AS PostTitle,
+        p2.Title AS RelatedPostTitle
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    JOIN Posts p1 ON p1.Id = pl.PostId
+    JOIN Posts p2 ON p2.Id = pl.RelatedPostId
+),
+UserBadgeRanks AS (
+    SELECT
+        b.UserId,
+        b.Class,
+        COUNT(*) AS BadgeCount
+    FROM Badges b
+    GROUP BY b.UserId, b.Class
+),
+ScoreWin AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.Score,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS AvgUserScore,
+        RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS PostRank
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+),
+CorrelatedSubqueries AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.Score,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = q.Id AND c.Score > 0) AS PositiveCommentsCount,
+        (SELECT AVG(v.Score) FROM Posts v WHERE v.ParentId = q.Id AND v.PostTypeId = 2) AS AvgAnswerScore,
+        (SELECT MIN(ph.CreationDate) FROM PostHistory ph WHERE ph.PostId = q.Id AND ph.PostHistoryTypeId = 4) AS FirstTitleEditDate
+    FROM Posts q
+    WHERE q.PostTypeId = 1
+),
+FinalOutput AS (
+    SELECT
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.EditsCount,
+        ua.UpVotesGiven,
+        ua.DownVotesGiven,
+        ua.BadgesCount,
+        ua.HighestBadgeClass,
+        tq.Id AS TopQuestionId,
+        tq.Title AS TopQuestionTitle,
+        tq.Score AS TopQuestionScore,
+        aq.AnswerId,
+        aq.AnswerScore,
+        aq.AnswerOwnerName,
+        COALESCE(ds.CloseVotes, 0) AS CloseVotes,
+        COALESCE(cs.PositiveCommentsCount, 0) AS PositiveComments,
+        COALESCE(cs.AvgAnswerScore, 0) AS AverageAnswerScore,
+        COALESCE(cs.FirstTitleEditDate, '1970-01-01') AS FirstTitleEdit,
+        COALESCE(dt.LinkTypeName, 'None') AS LinkTypeToDuplicate,
+        COALESCE(dt.RelatedPostTitle, 'N/A') AS RelatedPostTitle
+    FROM UserActivity ua
+    LEFT JOIN TopQuestions tq ON tq.OwnerUserId = ua.UserId AND tq.rn = 1
+    LEFT JOIN AcceptedAnswersWithOwners aq ON aq.QuestionId = tq.Id AND aq.AnswerRank = 1
+    LEFT JOIN (
+        SELECT PostId, SUM(1) AS CloseVotes
+        FROM PostHistory
+        WHERE PostHistoryTypeId = 10
+        GROUP BY PostId
+    ) ds ON ds.PostId = tq.Id
+    LEFT JOIN CorrelatedSubqueries cs ON cs.QuestionId = tq.Id
+    LEFT JOIN DuplicatesAndLinks dt ON dt.PostId = tq.Id AND dt.LinkTypeName = 'Duplicate'
+)
+SELECT
+    DISTINCT
+    fo.UserId,
+    fo.DisplayName,
+    fo.Reputation,
+    fo.EditsCount,
+    fo.UpVotesGiven,
+    fo.DownVotesGiven,
+    fo.BadgesCount,
+    CASE fo.HighestBadgeClass
+        WHEN 1 THEN 'Gold'
+        WHEN 2 THEN 'Silver'
+        WHEN 3 THEN 'Bronze'
+        ELSE 'None'
+    END AS HighestBadge,
+    fo.TopQuestionId,
+    fo.TopQuestionTitle,
+    fo.TopQuestionScore,
+    fo.CloseVotes,
+    fo.PositiveComments,
+    fo.AverageAnswerScore,
+    to_char(fo.FirstTitleEdit, 'YYYY-MM-DD HH24:MI:SS') AS FirstTitleEditedAt,
+    fo.AnswerId,
+    fo.AnswerScore,
+    fo.AnswerOwnerName,
+    fo.LinkTypeToDuplicate,
+    fo.RelatedPostTitle,
+    LENGTH(fo.TopQuestionTitle) + COALESCE(array_length(string_to_array(fo.TopQuestionTitle, ' '), 1),0) * fo.TopQuestionScore AS ComplexScoreCalculation,
+    CASE
+        WHEN fo.EditsCount > 10 AND fo.Reputation > 1000 THEN 'Expert Editor'
+        WHEN fo.EditsCount BETWEEN 1 AND 10 THEN 'Intermediate Editor'
+        ELSE 'Novice Editor'
+    END AS EditorLevel,
+    CASE
+        WHEN fo.PositiveComments > fo.TopQuestionScore/2 THEN 'High Engagement'
+        ELSE 'Low Engagement'
+    END AS EngagementLevel
+FROM FinalOutput fo
+WHERE fo.TopQuestionScore IS NOT NULL
+ORDER BY fo.Reputation DESC NULLS LAST, fo.TopQuestionScore DESC NULLS LAST
+LIMIT 100;

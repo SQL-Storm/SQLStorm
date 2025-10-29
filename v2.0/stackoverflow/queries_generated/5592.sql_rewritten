@@ -1,0 +1,161 @@
+-- {"query": "5592.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1145} 
+WITH tier AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    COALESCE(u.Views,0) AS Views,
+    COALESCE(u.UpVotes,0) AS UpVotes,
+    COALESCE(u.DownVotes,0) AS DownVotes,
+    u.Location,
+    u.WebsiteUrl,
+    u.AboutMe,
+    u.EmailHash,
+    u.AccountId,
+    b.Id AS BadgeId,
+    b.Name AS BadgeName,
+    b.Date AS BadgeDate,
+    b.Class AS BadgeClass,
+    b.TagBased AS BadgeTagBased,
+    -- derived flags
+    CASE WHEN b.Class = 1 THEN 'Gold'
+         WHEN b.Class = 2 THEN 'Silver'
+         ELSE 'Bronze' END AS BadgeTier
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+),
+recent_activity AS (
+  SELECT
+    p.Id AS PostId,
+    p.OwnerUserId,
+    p.PostTypeId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.Title,
+    p.Tags,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.Body,
+    p.ClosedDate,
+    p.CommunityOwnedDate,
+    p.ContentLicense,
+    -- window: running counts of posts by owner up to current post date
+    COUNT(*) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS PostsSoFar
+  FROM Posts p
+  WHERE p.CreationDate >= DATEADD(year, -2, cast('2024-10-01 12:34:56' as timestamp))
+),
+correlated AS (
+  SELECT
+    ra.PostId,
+    ra.OwnerUserId,
+    ra.PostTypeId,
+    ra.CreationDate,
+    ra.LastActivityDate,
+    ra.Score,
+    ra.ViewCount,
+    ra.Title,
+    ra.Tags,
+    ra.AnswerCount,
+    ra.CommentCount,
+    ra.FavoriteCount,
+    ra.ParentId,
+    ra.AcceptedAnswerId,
+    ra.Body,
+    ra.ClosedDate,
+    ra.CommunityOwnedDate,
+    ra.ContentLicense,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation,
+    ROW_NUMBER() OVER (
+      PARTITION BY ra.OwnerUserId
+      ORDER BY ra.LastActivityDate DESC, ra.Score DESC, ra.ViewCount DESC
+    ) AS RnOwnerActivity
+  FROM recent_activity ra
+  JOIN Users u ON u.Id = ra.OwnerUserId
+),
+flagged AS (
+  SELECT
+    v.PostId,
+    v.VoteTypeId,
+    vt.Name AS VoteTypeName,
+    v.UserId,
+    vu.DisplayName AS VoterName,
+    v.CreationDate,
+    v.BountyAmount
+  FROM Votes v
+  JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+  LEFT JOIN Users vu ON vu.Id = v.UserId
+  WHERE v.VoteTypeId IN (2,3,10,11,12,14,15,16) -- representative variety
+),
+link_summary AS (
+  SELECT
+    pl.PostId,
+    pl.RelatedPostId,
+    lt.Name AS LinkTypeName,
+    pl.CreationDate,
+    p1.OwnerUserId AS PostOwner,
+    p2.OwnerUserId AS RelatedOwner
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+  JOIN Posts p1 ON p1.Id = pl.PostId
+  JOIN Posts p2 ON p2.Id = pl.RelatedPostId
+)
+SELECT
+  -- hierarchical, rich snapshot
+  c.UserId,
+  c.DisplayName,
+  c.Reputation,
+  c.CreationDate AS UserCreationDate,
+  c.LastAccessDate AS UserLastAccessDate,
+  c.Views,
+  c.UpVotes,
+  c.DownVotes,
+  c.Location,
+  c.WebsiteUrl,
+  c.AboutMe,
+  c.EmailHash,
+  c.AccountId,
+  b.BadgeId,
+  b.BadgeName,
+  b.BadgeDate,
+  b.BadgeClass,
+  b.BadgeTagBased,
+  b.BadgeTier,
+  ra.PostId,
+  ra.PostTypeId,
+  ra.Title,
+  ra.Tags,
+  ra.Body,
+  ra.ViewCount,
+  ra.Score,
+  ra.FavoriteCount,
+  ra.AnswerCount,
+  ra.CommentCount,
+  ra.ParentId,
+  ra.AcceptedAnswerId,
+  ra.ClosedDate,
+  ra.CommunityOwnedDate,
+  ra.ContentLicense,
+  ra.OwnerDisplayName,
+  ra.Reputation AS OwnerReputation,
+  ra.RnOwnerActivity,
+  f.VoteTypeName AS ReactionsType,
+  f.UploaderName,
+  f.CreationDate AS ReactionDate,
+  f.BountyAmount,
+  lnk.LinkTypeName,
+  lnk.CreationDate AS LinkDate
+FROM mapped_users c
+LEFT JOIN tier t ON t.UserId = c.UserId
+LEFT JOIN recent_activity ra ON ra.OwnerUserId = c.UserId
+LEFT JOIN flagged f ON f.PostId = ra.PostId
+LEFT JOIN link_summary lnk ON lnk.PostId = ra.PostId
+ORDER BY c.UserId, ra.LastActivityDate DESC
+LIMIT 100;

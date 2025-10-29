@@ -1,0 +1,340 @@
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        u.location,
+        coalesce(nullif(trim(u.websiteurl), ''), 'N/A') as websiteurl_clean,
+        date_trunc('month', u.creationdate) as cohort_month,
+        row_number() over (order by u.reputation desc, u.id) as rn_global
+    from users u
+),
+q_and_a as (
+    select
+        p.id,
+        p.posttypeid,
+        p.owneruserid,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        p.title,
+        p.tags,
+        p.acceptedanswerid,
+        p.parentid
+    from posts p
+    where p.posttypeid in (1,2)
+),
+user_posts as (
+    select
+        ru.user_id,
+        count(case when qa.posttypeid = 1 then 1 end) as questions,
+        count(case when qa.posttypeid = 2 then 1 end) as answers,
+        sum(qa.score) as total_post_score,
+        sum(case when qa.posttypeid = 1 then qa.viewcount else 0 end) as question_views,
+        max(qa.creationdate) as last_post_date
+    from recent_users ru
+    left join q_and_a qa
+      on qa.owneruserid = ru.user_id
+    group by ru.user_id
+),
+votes_agg as (
+    select
+        p.owneruserid as user_id,
+        count(case when v.votetypeid = 2 then 1 end) as upvotes_rcvd,
+        count(case when v.votetypeid = 3 then 1 end) as downvotes_rcvd,
+        count(case when v.votetypeid = 1 then 1 end) as accepts_rcvd,
+        sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_total
+    from posts p
+    left join votes v
+      on v.postid = p.id
+    where p.posttypeid in (1,2)
+    group by p.owneruserid
+),
+badges_agg as (
+    select
+        b.userid as user_id,
+        count(*) as badges_total,
+        count(case when b.class = 1 then 1 end) as badges_gold,
+        count(case when b.class = 2 then 1 end) as badges_silver,
+        count(case when b.class = 3 then 1 end) as badges_bronze,
+        count(case when b.tagbased = true then 1 end) as badges_tagbased,
+        max(b.date) as last_badge_date
+    from badges b
+    group by b.userid
+),
+comment_density as (
+    select
+        p.owneruserid as user_id,
+        avg(cast(p.commentcount as numeric)) as avg_comments_per_post,
+        percentile_cont(0.9) within group (order by p.commentcount) as p90_comments_per_post
+    from posts p
+    where p.owneruserid is not null
+    group by p.owneruserid
+),
+question_tag_stats as (
+    select
+        p.owneruserid as user_id,
+        count(*) as tagged_questions,
+        count(case
+                when p.tags is not null
+                  and position('><' in coalesce(p.tags,'')) > 0
+                then 1
+            end) as multi_tag_questions,
+        avg(coalesce(p.viewcount,0)) as avg_views_questions,
+        count(case when p.acceptedanswerid is not null then 1 end) as questions_with_accept,
+        count(case when p.closeddate is not null then 1 end) as questions_closed
+    from posts p
+    where p.posttypeid = 1
+    group by p.owneruserid
+),
+accepted_answer_latency as (
+    select
+        q.owneruserid as user_id,
+        avg(extract(epoch from (a.creationdate - q.creationdate)) / 3600.0) as avg_accept_hours
+    from posts q
+    join posts a
+      on a.id = q.acceptedanswerid
+    where q.posttypeid = 1
+    group by q.owneruserid
+),
+post_history_flags as (
+    select
+        ph.postid,
+        max(case when ph.posthistorytypeid in (10,11,12,13,14,15,19,20,35) then ph.creationdate end) as last_moderation_event,
+        count(case when ph.posthistorytypeid = 10 then 1 end) as closed_events,
+        count(case when ph.posthistorytypeid = 11 then 1 end) as reopened_events,
+        count(case when ph.posthistorytypeid in (12,13) then 1 end) as delete_or_undelete_events
+    from posthistory ph
+    group by ph.postid
+),
+user_moderation_profile as (
+    select
+        p.owneruserid as user_id,
+        count(*) as moderated_posts,
+        sum(phf.closed_events) as total_closed_events,
+        sum(phf.reopened_events) as total_reopened_events,
+        sum(phf.delete_or_undelete_events) as total_delete_undelete_events,
+        max(phf.last_moderation_event) as last_moderation_event
+    from posts p
+    join post_history_flags phf
+      on phf.postid = p.id
+    where p.owneruserid is not null
+    group by p.owneruserid
+),
+dupe_network as (
+    select
+        pl.postid,
+        count(case when pl.linktypeid = 3 then 1 end) as duplicate_links_out,
+        count(case when pl.linktypeid = 1 then 1 end) as linked_out
+    from postlinks pl
+    group by pl.postid
+),
+user_network_profile as (
+    select
+        p.owneruserid as user_id,
+        sum(coalesce(dn.duplicate_links_out,0)) as dupes_out,
+        sum(coalesce(dn.linked_out,0)) as links_out
+    from posts p
+    left join dupe_network dn
+      on dn.postid = p.id
+    where p.owneruserid is not null
+    group by p.owneruserid
+),
+question_to_answer_ratio as (
+    select
+        u.user_id,
+        case
+            when up.questions = 0 and up.answers = 0 then null
+            when up.questions = 0 then null
+            else cast(up.answers as numeric) / nullif(up.questions,0)
+        end as ans_per_question
+    from recent_users u
+    left join user_posts up on up.user_id = u.user_id
+),
+user_activity_windows as (
+    select
+        p.owneruserid as user_id,
+        count(case when p.creationdate >= timestamp '2024-10-01 12:34:56' - interval '30 days' then 1 end) as posts_30d,
+        count(case when p.creationdate >= timestamp '2024-10-01 12:34:56' - interval '365 days' then 1 end) as posts_365d,
+        avg(case when p.creationdate >= timestamp '2024-10-01 12:34:56' - interval '365 days' then p.score end) as avg_score_365d
+    from posts p
+    where p.owneruserid is not null
+    group by p.owneruserid
+),
+commenters as (
+    select
+        coalesce(c.userid, -1) as user_id,
+        count(*) as comments_made,
+        avg(coalesce(c.score,0)) as avg_comment_score,
+        max(c.creationdate) as last_comment_date
+    from comments c
+    group by coalesce(c.userid, -1)
+),
+user_rollup as (
+    select
+        ru.user_id,
+        ru.displayname,
+        ru.reputation,
+        ru.cohort_month,
+        up.questions,
+        up.answers,
+        up.total_post_score,
+        up.question_views,
+        up.last_post_date,
+        va.upvotes_rcvd,
+        va.downvotes_rcvd,
+        va.accepts_rcvd,
+        va.bounty_total,
+        ba.badges_total,
+        ba.badges_gold,
+        ba.badges_silver,
+        ba.badges_bronze,
+        ba.badges_tagbased,
+        ba.last_badge_date,
+        cd.avg_comments_per_post,
+        cd.p90_comments_per_post,
+        qts.tagged_questions,
+        qts.multi_tag_questions,
+        qts.avg_views_questions,
+        qts.questions_with_accept,
+        qts.questions_closed,
+        aal.avg_accept_hours,
+        ump.moderated_posts,
+        ump.total_closed_events,
+        ump.total_reopened_events,
+        ump.total_delete_undelete_events,
+        ump.last_moderation_event,
+        unp.dupes_out,
+        unp.links_out,
+        qar.ans_per_question,
+        uaw.posts_30d,
+        uaw.posts_365d,
+        uaw.avg_score_365d,
+        cm.comments_made,
+        cm.avg_comment_score,
+        cm.last_comment_date
+    from recent_users ru
+    left join user_posts up on up.user_id = ru.user_id
+    left join votes_agg va on va.user_id = ru.user_id
+    left join badges_agg ba on ba.user_id = ru.user_id
+    left join comment_density cd on cd.user_id = ru.user_id
+    left join question_tag_stats qts on qts.user_id = ru.user_id
+    left join accepted_answer_latency aal on aal.user_id = ru.user_id
+    left join user_moderation_profile ump on ump.user_id = ru.user_id
+    left join user_network_profile unp on unp.user_id = ru.user_id
+    left join question_to_answer_ratio qar on qar.user_id = ru.user_id
+    left join user_activity_windows uaw on uaw.user_id = ru.user_id
+    left join commenters cm on cm.user_id = ru.user_id
+),
+ranked as (
+    select
+        ur.*,
+        coalesce(upvotes_rcvd,0) - coalesce(downvotes_rcvd,0) as net_votes_rcvd,
+        coalesce(answers,0) + coalesce(questions,0) as total_posts,
+        coalesce(total_post_score,0) / nullif(coalesce(answers,0) + coalesce(questions,0),0) as avg_score_per_post,
+        case
+            when coalesce(tagged_questions,0) = 0 then 0.0
+            else coalesce(questions_with_accept,0) * 1.0 / nullif(tagged_questions,0)
+        end as accept_rate,
+        dense_rank() over (order by coalesce(reputation,0) desc) as dr_reputation,
+        ntile(10) over (order by coalesce(total_post_score,0) desc) as decile_total_post_score,
+        row_number() over (partition by cohort_month order by coalesce(reputation,0) desc, user_id) as cohort_rank
+    from user_rollup ur
+),
+filtered as (
+    select *
+    from ranked
+    where
+        coalesce(total_posts,0) > 0
+        and (
+            coalesce(answers,0) >= 5
+            or coalesce(questions,0) >= 3
+            or (coalesce(posts_365d,0) >= 10 and coalesce(avg_score_365d,0) > 0)
+        )
+),
+topk_prep as (
+    select
+        f.*,
+        row_number() over (
+            order by
+                dr_reputation asc,
+                decile_total_post_score asc,
+                net_votes_rcvd desc,
+                avg_score_per_post desc,
+                user_id asc
+        ) as rn_topk
+    from filtered f
+),
+stringy as (
+    select
+        t.*,
+        trim(both ' ' from coalesce(displayname, '[unknown]')) as displayname_trim,
+        case
+            when websiteurl_clean ilike 'http%' then websiteurl_clean
+            when websiteurl_clean = 'N/A' then null
+            else 'http://' || websiteurl_clean
+        end as websiteurl_norm,
+        case
+            when location is null or length(trim(location)) = 0 then 'Unspecified'
+            when position(',' in location) > 0 then split_part(location, ',', 1)
+            else location
+        end as country_guess
+    from topk_prep t
+    where t.rn_topk <= 500
+)
+select
+    s.user_id,
+    s.displayname_trim as displayname,
+    s.country_guess,
+    s.reputation,
+    s.cohort_month,
+    s.total_posts,
+    s.questions,
+    s.answers,
+    s.ans_per_question,
+    s.total_post_score,
+    s.avg_score_per_post,
+    s.net_votes_rcvd,
+    s.accept_rate,
+    s.avg_accept_hours,
+    s.badges_total,
+    s.badges_gold,
+    s.badges_silver,
+    s.badges_bronze,
+    s.badges_tagbased,
+    s.moderated_posts,
+    s.total_closed_events,
+    s.total_reopened_events,
+    s.total_delete_undelete_events,
+    s.dupes_out,
+    s.links_out,
+    s.posts_30d,
+    s.posts_365d,
+    s.avg_score_365d,
+    s.avg_comments_per_post,
+    s.p90_comments_per_post,
+    s.comments_made,
+    s.avg_comment_score,
+    s.last_post_date,
+    s.last_badge_date,
+    s.last_moderation_event,
+    s.last_comment_date,
+    s.dr_reputation,
+    s.decile_total_post_score,
+    s.cohort_rank,
+    s.websiteurl_norm
+from stringy s
+where
+    (
+        s.accept_rate is null
+        or s.accept_rate between 0.2 and 0.95
+        or (s.accept_rate > 0.95 and s.questions >= 10)
+    )
+    and coalesce(s.avg_score_per_post, 0) >= 0
+order by
+    s.dr_reputation,
+    s.decile_total_post_score,
+    s.net_votes_rcvd desc,
+    s.avg_score_per_post desc,
+    s.user_id;

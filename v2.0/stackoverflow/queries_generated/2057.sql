@@ -1,0 +1,185 @@
+-- {"query": "2057.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1741} 
+
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        ARRAY[t.TagName] AS TagPath,
+        1 AS Depth
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0
+
+    UNION ALL
+
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        rth.TagPath || t.TagName,
+        rth.Depth + 1
+    FROM Tags t
+    JOIN PostLinks pl ON pl.PostId = t.ExcerptPostId
+    JOIN Posts p ON p.Id = pl.RelatedPostId AND p.PostTypeId = 1
+    JOIN RecursiveTagHierarchy rth ON rth.Id = p.Id
+    WHERE rth.Depth < 3
+),
+UserQuestionStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT q.Id) AS QuestionCount,
+        COUNT(DISTINCT a.Id) AS AnswerCount,
+        AVG(COALESCE(a.Score,0)) AS AvgAnswerScore,
+        SUM(COALESCE(q.ViewCount,0)) AS TotalQuestionViews,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        MAX(ph.CreationDate) AS LastEditDate,
+        COALESCE(SUM(vb.BountyAmount),0) AS TotalBountyReceived
+    FROM Users u
+    LEFT JOIN Posts q ON q.OwnerUserId = u.Id AND q.PostTypeId = 1
+    LEFT JOIN Posts a ON a.OwnerUserId = u.Id AND a.PostTypeId = 2
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+    LEFT JOIN Votes vb ON vb.UserId = u.Id AND vb.VoteTypeId = 9 AND vb.PostId IN (
+        SELECT AcceptedAnswerId FROM Posts WHERE AcceptedAnswerId IS NOT NULL
+    )
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+PostEngagementWindow AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) rn,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) AS TotalPostsByUser,
+        MAX(p.Score) OVER (PARTITION BY p.OwnerUserId) AS MaxScoreByUser,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS AvgScoreByUser
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+),
+TagPopularity AS (
+    SELECT
+        unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) AS Tag,
+        COUNT(*) AS TagCount,
+        AVG(p.Score) AS AvgTagScore,
+        SUM(p.ViewCount) AS TotalViews
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+    GROUP BY Tag
+),
+ClosedQuestionsWithReason AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.ClosedDate,
+        crt.Name AS CloseReason,
+        ph.Comment AS CloseReasonCode
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+    LEFT JOIN CloseReasonTypes crt ON crt.Id::varchar = ph.Comment
+    WHERE p.ClosedDate IS NOT NULL
+),
+TopContributors AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        COALESCE(SUM(v.VoteTypeId = 2)::int,0) AS UpVotesGiven,
+        COALESCE(SUM(v.VoteTypeId = 3)::int,0) AS DownVotesGiven,
+        COALESCE(SUM(v.VoteTypeId = 5)::int,0) AS FavoritesGiven,
+        COUNT(DISTINCT b.Id) AS BadgeCount
+    FROM Users u
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+    HAVING COUNT(DISTINCT b.Id) >= 10
+),
+AnswerWithCorrelatedScoreStats AS (
+    SELECT
+        a.Id,
+        a.ParentId,
+        a.OwnerUserId,
+        a.Score,
+        a.CreationDate,
+        q.Score AS QuestionScore,
+        q.ViewCount AS QuestionViews,
+        -- Correlated subquery for average score of sibling answers
+        (
+            SELECT AVG(score) 
+            FROM Posts sa 
+            WHERE sa.ParentId = a.ParentId AND sa.Id <> a.Id
+        ) AS AvgSiblingAnswerScore,
+        -- Calculate a complex score based on scores, views, and time
+        CASE 
+            WHEN a.CreationDate < NOW() - interval '90 days' THEN a.Score * 0.7
+            ELSE a.Score * 1.3
+        END + COALESCE(a.Score,0) / NULLIF(q.ViewCount,1) * 100 AS WeightedScore
+    FROM Posts a
+    INNER JOIN Posts q ON q.Id = a.ParentId
+    WHERE a.PostTypeId = 2
+),
+FinalAggregatedStats AS (
+    SELECT
+        u.DisplayName,
+        us.QuestionCount,
+        us.AnswerCount,
+        us.Reputation,
+        us.GoldBadges,
+        us.SilverBadges,
+        us.BronzeBadges,
+        SUM(COALESCE(a.Score, 0)) AS TotalAnswerScore,
+        AVG(a.Score) FILTER (WHERE a.Score IS NOT NULL) AS AvgAnswerScore,
+        COUNT(DISTINCT pq.Id) FILTER (WHERE pq.Tags LIKE '%<sql>%') AS UserSQLTaggedQuestions,
+        MAX(pe.WeightedScore) AS MaxWeightedAnswerScore,
+        MAX(ce.ClosedDate) AS LatestClosedQuestion,
+        STRING_AGG(DISTINCT tth.TagName, ',' ORDER BY tth.TagName) AS RecursiveModeratedTags
+    FROM Users u
+    LEFT JOIN UserQuestionStats us ON us.UserId = u.Id
+    LEFT JOIN Posts pq ON pq.OwnerUserId = u.Id AND pq.PostTypeId = 1
+    LEFT JOIN AnswerWithCorrelatedScoreStats pe ON pe.OwnerUserId = u.Id
+    LEFT JOIN ClosedQuestionsWithReason ce ON ce.OwnerUserId = u.Id
+    LEFT JOIN RecursiveTagHierarchy tth ON tth.TagName IS NOT NULL
+    LEFT JOIN Posts a ON a.OwnerUserId = u.Id AND a.PostTypeId = 2
+    GROUP BY u.Id, u.DisplayName, us.QuestionCount, us.AnswerCount, us.Reputation, us.GoldBadges, us.SilverBadges, us.BronzeBadges
+    HAVING us.QuestionCount > 5 OR us.AnswerCount > 10
+)
+SELECT 
+    fas.DisplayName,
+    fas.Reputation,
+    fas.QuestionCount,
+    fas.AnswerCount,
+    fas.GoldBadges,
+    fas.SilverBadges,
+    fas.BronzeBadges,
+    fas.TotalAnswerScore,
+    fas.AvgAnswerScore,
+    fas.UserSQLTaggedQuestions,
+    fas.MaxWeightedAnswerScore,
+    COALESCE(fas.LatestClosedQuestion, TIMESTAMP '1970-01-01') AS LatestClosedQuestion,
+    COALESCE(fas.RecursiveModeratedTags, 'None') AS RecursiveModeratedTags
+FROM FinalAggregatedStats fas
+ORDER BY fas.Reputation DESC, fas.TotalAnswerScore DESC
+LIMIT 50
+UNION ALL
+SELECT 
+    'Anonymous or Special User',
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    TIMESTAMP '1970-01-01',
+    'N/A'
+ORDER BY 1 NULLS LAST
+;

@@ -1,0 +1,212 @@
+WITH UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.UpVotes AS UserUpVotesGiven,
+        u.DownVotes AS UserDownVotesGiven,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(CASE WHEN p.PostTypeId IN (1, 2, 4, 5) THEN p.Score ELSE 0 END) AS TotalPostScore,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        CAST(EXTRACT(EPOCH FROM (u.LastAccessDate - u.CreationDate)) / 86400 AS INTEGER) AS DaysSinceCreation,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE NULL END) AS AvgQuestionViewCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.AnswerCount ELSE 0 END) AS TotalQuestionAnswerCount
+    FROM
+        Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    WHERE
+        u.Reputation >= 1000
+        AND u.CreationDate >= TIMESTAMP '2018-01-01'
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.UpVotes, u.DownVotes
+    HAVING
+        COUNT(DISTINCT p.Id) > 5
+),
+PostDetailsExtended AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.CreationDate AS PostCreationDate,
+        p.OwnerUserId,
+        COALESCE(p.Title, SUBSTRING(p.Body FROM 1 FOR 100)) AS PostTitleSnippet,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        LENGTH(p.Body) AS BodyLength,
+        REPLACE(REPLACE(REPLACE(REPLACE(p.Tags, '>', ''), '<', ','), ',,', ','), '^,', '') AS CleanTagsString,
+        (SELECT COUNT(DISTINCT ph_edit.Id)
+         FROM PostHistory ph_edit
+         WHERE ph_edit.PostId = p.Id
+           AND ph_edit.PostHistoryTypeId IN (4, 5, 6, 8, 9, 24)
+        ) AS TotalEditCount,
+        (SELECT MAX(ph_date.CreationDate)
+         FROM PostHistory ph_date
+         WHERE ph_date.PostId = p.Id
+           AND ph_date.PostHistoryTypeId IN (4, 5, 6, 8, 9, 24)
+        ) AS LastEditHistoryDate,
+        (SELECT ph_closed.CreationDate
+         FROM PostHistory ph_closed
+         WHERE ph_closed.PostId = p.Id
+           AND ph_closed.PostHistoryTypeId = 10
+         ORDER BY ph_closed.CreationDate DESC
+         LIMIT 1
+        ) AS LastClosedHistoryDate,
+        (SELECT crt.Name
+         FROM PostHistory ph_closed_reason
+         LEFT JOIN CloseReasonTypes crt ON ph_closed_reason.Comment = CAST(crt.Id AS TEXT)
+         WHERE ph_closed_reason.PostId = p.Id
+           AND ph_closed_reason.PostHistoryTypeId = 10
+         ORDER BY ph_closed_reason.CreationDate DESC
+         LIMIT 1
+        ) AS LastCloseReason,
+        CASE
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN
+                (SELECT EXTRACT(EPOCH FROM (a.CreationDate - p.CreationDate)) / 3600
+                 FROM Posts a WHERE a.Id = p.AcceptedAnswerId)
+            ELSE NULL
+        END AS TimeToAcceptedAnswerHours,
+        (SELECT COUNT(pl.RelatedPostId)
+         FROM PostLinks pl
+         WHERE pl.PostId = p.Id AND pl.LinkTypeId = 1
+        ) AS LinkedPostCount,
+        (SELECT COUNT(pl.RelatedPostId)
+         FROM PostLinks pl
+         WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3
+        ) AS DuplicatePostCount,
+        p.AcceptedAnswerId
+    FROM
+        Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE
+        p.CreationDate >= TIMESTAMP '2020-01-01'
+),
+RankedPostsByScore AS (
+    SELECT
+        pde.PostId,
+        pde.PostTypeId,
+        pde.PostTypeName,
+        pde.PostCreationDate,
+        pde.OwnerUserId,
+        pde.PostTitleSnippet,
+        pde.PostScore,
+        pde.ViewCount,
+        pde.AnswerCount,
+        pde.CommentCount,
+        pde.FavoriteCount,
+        pde.BodyLength,
+        pde.CleanTagsString,
+        pde.TotalEditCount,
+        pde.LastEditHistoryDate,
+        pde.LastClosedHistoryDate,
+        pde.LastCloseReason,
+        pde.TimeToAcceptedAnswerHours,
+        pde.LinkedPostCount,
+        pde.DuplicatePostCount,
+        pde.AcceptedAnswerId,
+        ROW_NUMBER() OVER (PARTITION BY pde.OwnerUserId, pde.PostTypeId ORDER BY pde.PostScore DESC, pde.PostCreationDate DESC) AS PostScoreRankByUserType,
+        RANK() OVER (PARTITION BY pde.PostTypeId ORDER BY pde.PostScore DESC, pde.PostCreationDate DESC) AS GlobalPostScoreRankByType,
+        AVG(pde.PostScore) OVER (PARTITION BY pde.OwnerUserId) AS AvgScoreAcrossUserPosts,
+        LAG(pde.PostCreationDate, 1, pde.PostCreationDate) OVER (PARTITION BY pde.OwnerUserId ORDER BY pde.PostCreationDate) AS PreviousPostCreationDate,
+        CAST(EXTRACT(EPOCH FROM (pde.PostCreationDate - LAG(pde.PostCreationDate, 1, pde.PostCreationDate) OVER (PARTITION BY pde.OwnerUserId ORDER BY pde.PostCreationDate))) / 86400 AS INTEGER) AS DaysSincePreviousPost,
+        SUM(pde.FavoriteCount) OVER (PARTITION BY pde.PostTypeId ORDER BY pde.PostCreationDate) AS RunningFavoriteCountForPostType
+    FROM
+        PostDetailsExtended pde
+),
+BadgeSummary AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(DISTINCT b.Name) AS UniqueBadgeCount,
+        MAX(b.Date) AS LastBadgeAwardDate
+    FROM
+        Badges b
+    GROUP BY
+        b.UserId
+)
+SELECT
+    ue.UserId,
+    ue.DisplayName,
+    ue.Reputation,
+    ue.UserCreationDate,
+    ue.LastAccessDate,
+    ue.TotalQuestions,
+    ue.TotalAnswers,
+    ue.TotalPosts,
+    ue.TotalPostScore,
+    ue.TotalComments,
+    ue.DaysSinceCreation,
+    ue.AvgQuestionViewCount,
+    ue.TotalQuestionAnswerCount,
+    bs.GoldBadges,
+    bs.SilverBadges,
+    bs.BronzeBadges,
+    bs.UniqueBadgeCount,
+    bs.LastBadgeAwardDate,
+    rp.PostId,
+    rp.PostTypeName,
+    rp.PostTitleSnippet,
+    rp.PostCreationDate,
+    rp.PostScore,
+    rp.ViewCount,
+    rp.AnswerCount,
+    rp.CommentCount,
+    rp.FavoriteCount,
+    rp.BodyLength,
+    rp.CleanTagsString AS PostTags,
+    rp.TotalEditCount,
+    rp.LastEditHistoryDate,
+    rp.LastClosedHistoryDate,
+    rp.LastCloseReason,
+    rp.TimeToAcceptedAnswerHours,
+    rp.LinkedPostCount,
+    rp.DuplicatePostCount,
+    rp.PostScoreRankByUserType,
+    rp.GlobalPostScoreRankByType,
+    rp.AvgScoreAcrossUserPosts,
+    rp.DaysSincePreviousPost,
+    rp.RunningFavoriteCountForPostType,
+    CASE
+        WHEN rp.PostTypeId = 1 AND rp.AnswerCount > 0 AND rp.ViewCount > 0 THEN CAST(rp.AnswerCount AS NUMERIC) / rp.ViewCount
+        ELSE NULL
+    END AS AnswerToViewRatio,
+    (ue.UserUpVotesGiven - ue.UserDownVotesGiven) AS NetVotesGiven,
+    COALESCE(rp.PostScore, 0) + (COALESCE(rp.FavoriteCount, 0) * 2) + (COALESCE(rp.CommentCount, 0) * 0.5) AS EngagementMetricWeighted,
+    (SELECT COUNT(b.Id) > 0
+     FROM Badges b
+     WHERE b.UserId = ue.UserId
+       AND b.Name = 'Enlightened'
+       AND b.Date <= rp.PostCreationDate + INTERVAL '1 day'
+       AND rp.PostTypeId = 1
+       AND rp.TimeToAcceptedAnswerHours IS NOT NULL
+    ) AS HadEnlightenedBadgeByPostDate,
+    COALESCE(rp.FavoriteCount, 0) AS CoalescedFavoriteCount,
+    (rp.LastClosedHistoryDate IS NOT NULL
+     AND rp.LastEditHistoryDate IS NOT NULL
+     AND rp.LastEditHistoryDate > rp.LastClosedHistoryDate
+     AND ue.Reputation > 5000
+    ) AS ClosedThenEditedByHighRepUser,
+    (LOWER(rp.PostTitleSnippet) LIKE '%sql%' OR LOWER(rp.CleanTagsString) LIKE '%sql%'
+     OR LOWER(rp.PostTitleSnippet) LIKE '%performance%' OR LOWER(rp.CleanTagsString) LIKE '%performance%') AS ContainsSqlOrPerformanceKeywords,
+    (rp.ViewCount > 1000 AND rp.PostScore < 10 AND rp.PostCreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year' AND rp.CommentCount > 50) AS HighViewLowScoreControversialPost
+FROM
+    UserEngagement ue
+LEFT JOIN RankedPostsByScore rp ON ue.UserId = rp.OwnerUserId
+LEFT JOIN BadgeSummary bs ON ue.UserId = bs.UserId
+WHERE
+    (rp.PostScore >= 5 OR rp.ViewCount >= 100 OR rp.FavoriteCount >= 5)
+    AND ue.TotalPosts >= 10
+    AND ue.Reputation >= 2000
+    AND rp.PostTypeName IS NOT NULL
+ORDER BY
+    ue.Reputation DESC, EngagementMetricWeighted DESC, rp.PostCreationDate DESC
+LIMIT 1000;

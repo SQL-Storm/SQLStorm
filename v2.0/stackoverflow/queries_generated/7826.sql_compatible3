@@ -1,0 +1,581 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT c.Id) as Comments,
+        COUNT(DISTINCT b.Id) as Badges,
+        MAX(p.CreationDate) as LastPostDate,
+        CAST(EXTRACT(EPOCH FROM (COALESCE(MAX(p.CreationDate), u.CreationDate) - u.CreationDate)) / 86400 AS INTEGER) as DaysAsMember,
+        CASE 
+            WHEN COUNT(DISTINCT b.Id) > 0 THEN 
+                STRING_AGG(DISTINCT b.Name, ', ' ORDER BY b.Name)
+            ELSE 'No Badges'
+        END as BadgeNames,
+        ROW_NUMBER() OVER (PARTITION BY u.Reputation ORDER BY COUNT(DISTINCT p.Id) DESC) as ReputationRank,
+        RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC, u.Reputation DESC) as PostCountRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+PostComplexityMetrics AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        COALESCE(p.OwnerUserId, -1) as OwnerUserId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 
+                CASE 
+                    WHEN p.AnswerCount > 5 THEN 'High Engagement Question'
+                    WHEN p.AnswerCount > 2 THEN 'Medium Engagement Question'
+                    ELSE 'Low Engagement Question'
+                END
+            WHEN p.PostTypeId = 2 THEN 
+                CASE 
+                    WHEN p.Score > 10 THEN 'High Quality Answer'
+                    WHEN p.Score > 5 THEN 'Medium Quality Answer'
+                    ELSE 'Low Quality Answer'
+                END
+            ELSE 'Other Post Type'
+        END as PostQualityCategory,
+        CAST(EXTRACT(EPOCH FROM (COALESCE(p.LastActivityDate, p.CreationDate) - p.CreationDate)) / 86400 AS INTEGER) as DaysActive,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND LENGTH(p.Tags) > 10 THEN 
+                CARDINALITY(STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><'))
+            ELSE 0 
+        END as TagCount,
+        CASE WHEN p.AcceptedAnswerId IS NULL THEN 0 ELSE 1 END as HasAcceptedAnswer,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.PostTypeId = 1 AND p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+            WHEN p.PostTypeId = 1 AND p.AnswerCount = 0 THEN 'Unanswered'
+            ELSE 'Active'
+        END as PostStatus,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) as ScoreRank,
+        RANK() OVER (ORDER BY p.Score DESC, p.ViewCount DESC) as OverallPostRank
+    FROM Posts p
+    WHERE p.Id > 0
+    AND p.PostTypeId IN (1, 2)
+),
+UserPostEngagement AS (
+    SELECT 
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.TotalPosts,
+        ua.Questions,
+        ua.Answers,
+        ua.Comments,
+        ua.Badges,
+        ua.LastPostDate,
+        ua.DaysAsMember,
+        ua.ReputationRank,
+        ua.PostCountRank,
+        STRING_AGG(p.Title, ' | ' ORDER BY p.CreationDate DESC) as RecentPostTitles,
+        STRING_AGG(CASE WHEN p.PostTypeId = 1 THEN p.Title END, ' | ') as RecentQuestions,
+        STRING_AGG(CASE WHEN p.PostTypeId = 2 THEN p.Title END, ' | ') as RecentAnswers,
+        AVG(p.Score) as AvgScore,
+        MAX(p.ViewCount) as MaxViews,
+        AVG(p.AnswerCount) as AvgAnswers,
+        COUNT(p.Id) as RecentPostCount,
+        STRING_AGG(DISTINCT COALESCE(
+            CASE 
+                WHEN p.PostTypeId = 1 THEN 
+                    CASE 
+                        WHEN p.AnswerCount > 5 THEN 'High Engagement Question'
+                        WHEN p.AnswerCount > 2 THEN 'Medium Engagement Question'
+                        ELSE 'Low Engagement Question'
+                    END
+                WHEN p.PostTypeId = 2 THEN 
+                    CASE 
+                        WHEN p.Score > 10 THEN 'High Quality Answer'
+                        WHEN p.Score > 5 THEN 'Medium Quality Answer'
+                        ELSE 'Low Quality Answer'
+                    END
+                ELSE 'Other Post Type'
+            END, 'Other'), ', ') as EngagementQualities,
+        CASE 
+            WHEN COUNT(p.Id) > 0 THEN 
+                AVG(CAST(EXTRACT(EPOCH FROM (COALESCE(p.LastActivityDate, p.CreationDate) - p.CreationDate)) / 86400 AS INTEGER))
+            ELSE 0 
+        END as AvgDaysActive,
+        COALESCE(SUM(p.AnswerCount), 0) as TotalAnswersToQuestions
+    FROM UserActivityStats ua
+    LEFT JOIN Posts p ON ua.UserId = p.OwnerUserId
+    WHERE p.Id IS NOT NULL
+    GROUP BY ua.UserId, ua.DisplayName, ua.Reputation, ua.TotalPosts, ua.Questions, 
+             ua.Answers, ua.Comments, ua.Badges, ua.LastPostDate, ua.DaysAsMember, 
+             ua.ReputationRank, ua.PostCountRank
+),
+CombinedMetrics AS (
+    SELECT 
+        up.UserId,
+        up.DisplayName,
+        up.Reputation,
+        up.TotalPosts,
+        up.Questions,
+        up.Answers,
+        up.Comments,
+        up.Badges,
+        up.LastPostDate,
+        up.DaysAsMember,
+        up.ReputationRank,
+        up.PostCountRank,
+        up.RecentPostTitles,
+        up.RecentQuestions,
+        up.RecentAnswers,
+        up.AvgScore,
+        up.MaxViews,
+        up.AvgAnswers,
+        up.RecentPostCount,
+        up.EngagementQualities,
+        up.AvgDaysActive,
+        up.TotalAnswersToQuestions,
+        DENSE_RANK() OVER (ORDER BY up.Reputation DESC, up.TotalPosts DESC) as OverallUserRank,
+        DENSE_RANK() OVER (ORDER BY up.RecentPostCount DESC, up.AvgScore DESC) as RecentEngagementRank,
+        CASE 
+            WHEN up.Reputation > 10000 THEN 'Veteran'
+            WHEN up.Reputation > 5000 THEN 'Experienced'
+            WHEN up.Reputation > 1000 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as UserTier,
+        CASE 
+            WHEN up.Comments > 0 THEN (up.Comments * 100.0) / NULLIF(up.TotalPosts, 0)
+            ELSE 0 
+        END as CommentToPostRatio,
+        CASE 
+            WHEN up.Answers > 0 THEN (up.Answers * 100.0) / NULLIF(up.Questions, 0)
+            ELSE 0 
+        END as AnswerToQuestionRatio
+    FROM UserPostEngagement up
+),
+TopPerformers AS (
+    SELECT 
+        cm.*,
+        ROW_NUMBER() OVER (ORDER BY cm.TotalPosts DESC, cm.Reputation DESC) as TopPostsRank,
+        PERCENT_RANK() OVER (ORDER BY cm.Reputation) as ReputationPercentile,
+        NTH_VALUE(cm.Reputation, 10) OVER (ORDER BY cm.Reputation DESC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) as Top10Reputation
+    FROM CombinedMetrics cm
+),
+AggregatedUserStats AS (
+    SELECT 
+        'All Users' as Category,
+        COUNT(*) as TotalUsers,
+        AVG(Reputation) as AvgReputation,
+        MAX(Reputation) as MaxReputation,
+        MIN(Reputation) as MinReputation,
+        AVG(TotalPosts) as AvgTotalPosts,
+        MAX(TotalPosts) as MaxTotalPosts,
+        AVG(Comments) as AvgComments,
+        AVG(Badges) as AvgBadges,
+        AVG(DaysAsMember) as AvgMembershipDays
+    FROM TopPerformers
+),
+PostAnalysis AS (
+    SELECT
+        'All Posts' as Category,
+        COUNT(*) as TotalPosts,
+        AVG(Score) as AvgScore,
+        MAX(Score) as MaxScore,
+        MIN(Score) as MinScore,
+        AVG(ViewCount) as AvgViews,
+        MAX(ViewCount) as MaxViews,
+        AVG(AnswerCount) as AvgAnswers,
+        AVG(CommentCount) as AvgComments,
+        AVG(FavoriteCount) as AvgFavorites,
+        COUNT(DISTINCT ParentId) as TotalQuestionPosts,
+        COUNT(DISTINCT CASE WHEN PostTypeId = 1 THEN Id END) as TotalQuestions,
+        COUNT(DISTINCT CASE WHEN PostTypeId = 2 THEN Id END) as TotalAnswers,
+        COUNT(DISTINCT CASE WHEN CommunityOwnedDate IS NOT NULL THEN Id END) as CommunityOwnedPosts,
+        COUNT(DISTINCT CASE WHEN ClosedDate IS NOT NULL THEN Id END) as ClosedPosts
+    FROM Posts
+    WHERE Id > 0 AND PostTypeId IN (1, 2)
+),
+TagFrequencyAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.IsRequired = 1 THEN 'Required'
+            WHEN t.IsModeratorOnly = 1 THEN 'Moderator Only'
+            ELSE 'Regular'
+        END as TagType,
+        RANK() OVER (ORDER BY t.Count DESC) as TagRank,
+        PERCENT_RANK() OVER (ORDER BY t.Count DESC) as TagPercentile
+    FROM Tags t
+    WHERE t.Id > 0
+),
+FinalResults AS (
+    SELECT 
+        'User Performance Summary' as ResultType,
+        CAST(NULL AS INTEGER) as UserId,
+        CAST(NULL AS VARCHAR(4000)) as DisplayName,
+        CAST(NULL AS INTEGER) as Reputation,
+        CAST(NULL AS INTEGER) as TotalPosts,
+        CAST(NULL AS INTEGER) as Questions,
+        CAST(NULL AS INTEGER) as Answers,
+        CAST(NULL AS INTEGER) as Comments,
+        CAST(NULL AS INTEGER) as Badges,
+        CAST(NULL AS TIMESTAMP) as LastPostDate,
+        CAST(NULL AS INTEGER) as DaysAsMember,
+        CAST(NULL AS INTEGER) as ReputationRank,
+        CAST(NULL AS INTEGER) as PostCountRank,
+        CAST(NULL AS TEXT) as RecentPostTitles,
+        CAST(NULL AS TEXT) as RecentQuestions,
+        CAST(NULL AS TEXT) as RecentAnswers,
+        CAST(NULL AS NUMERIC) as AvgScore,
+        CAST(NULL AS INTEGER) as MaxViews,
+        CAST(NULL AS NUMERIC) as AvgAnswers,
+        CAST(NULL AS INTEGER) as RecentPostCount,
+        CAST(NULL AS TEXT) as EngagementQualities,
+        CAST(NULL AS NUMERIC) as AvgDaysActive,
+        CAST(NULL AS INTEGER) as TotalAnswersToQuestions,
+        CAST(NULL AS INTEGER) as OverallUserRank,
+        CAST(NULL AS INTEGER) as RecentEngagementRank,
+        CAST(NULL AS TEXT) as UserTier,
+        CAST(NULL AS NUMERIC) as CommentToPostRatio,
+        CAST(NULL AS NUMERIC) as AnswerToQuestionRatio,
+        CAST(NULL AS INTEGER) as TopPostsRank,
+        CAST(NULL AS NUMERIC) as ReputationPercentile,
+        CAST(NULL AS INTEGER) as Top10Reputation,
+        CAST(1 as INT) as SortOrder
+    FROM AggregatedUserStats
+    UNION ALL
+    SELECT 
+        'Post Analysis Summary' as ResultType,
+        CAST(NULL AS INTEGER) as UserId,
+        CAST(NULL AS VARCHAR(4000)) as DisplayName,
+        CAST(NULL AS INTEGER) as Reputation,
+        CAST(NULL AS INTEGER) as TotalPosts,
+        CAST(NULL AS INTEGER) as Questions,
+        CAST(NULL AS INTEGER) as Answers,
+        CAST(NULL AS INTEGER) as Comments,
+        CAST(NULL AS INTEGER) as Badges,
+        CAST(NULL AS TIMESTAMP) as LastPostDate,
+        CAST(NULL AS INTEGER) as DaysAsMember,
+        CAST(NULL AS INTEGER) as ReputationRank,
+        CAST(NULL AS INTEGER) as PostCountRank,
+        CAST(NULL AS TEXT) as RecentPostTitles,
+        CAST(NULL AS TEXT) as RecentQuestions,
+        CAST(NULL AS TEXT) as RecentAnswers,
+        CAST(NULL AS NUMERIC) as AvgScore,
+        CAST(NULL AS INTEGER) as MaxViews,
+        CAST(NULL AS NUMERIC) as AvgAnswers,
+        CAST(NULL AS INTEGER) as RecentPostCount,
+        CAST(NULL AS TEXT) as EngagementQualities,
+        CAST(NULL AS NUMERIC) as AvgDaysActive,
+        CAST(NULL AS INTEGER) as TotalAnswersToQuestions,
+        CAST(NULL AS INTEGER) as OverallUserRank,
+        CAST(NULL AS INTEGER) as RecentEngagementRank,
+        CAST(NULL AS TEXT) as UserTier,
+        CAST(NULL AS NUMERIC) as CommentToPostRatio,
+        CAST(NULL AS NUMERIC) as AnswerToQuestionRatio,
+        CAST(NULL AS INTEGER) as TopPostsRank,
+        CAST(NULL AS NUMERIC) as ReputationPercentile,
+        CAST(NULL AS INTEGER) as Top10Reputation,
+        CAST(2 as INT) as SortOrder
+    FROM PostAnalysis
+    UNION ALL
+    SELECT 
+        'User Performance Detail' as ResultType,
+        t.UserId,
+        t.DisplayName,
+        t.Reputation,
+        t.TotalPosts,
+        t.Questions,
+        t.Answers,
+        t.Comments,
+        t.Badges,
+        t.LastPostDate,
+        t.DaysAsMember,
+        t.ReputationRank,
+        t.PostCountRank,
+        t.RecentPostTitles,
+        t.RecentQuestions,
+        t.RecentAnswers,
+        t.AvgScore,
+        t.MaxViews,
+        t.AvgAnswers,
+        t.RecentPostCount,
+        t.EngagementQualities,
+        t.AvgDaysActive,
+        t.TotalAnswersToQuestions,
+        t.OverallUserRank,
+        t.RecentEngagementRank,
+        t.UserTier,
+        t.CommentToPostRatio,
+        t.AnswerToQuestionRatio,
+        t.TopPostsRank,
+        t.ReputationPercentile,
+        t.Top10Reputation,
+        CAST(3 as INT) as SortOrder
+    FROM TopPerformers t
+    WHERE t.Reputation >= (
+        SELECT AVG(Reputation) + STDDEV(Reputation) 
+        FROM TopPerformers
+    )
+    AND EXISTS (
+        SELECT 1 FROM Posts p 
+        WHERE p.OwnerUserId = t.UserId 
+        AND p.PostTypeId = 1
+        AND p.CreationDate >= TIMESTAMP '2020-01-01'
+    )
+    AND NOT EXISTS (
+        SELECT 1 FROM Badges b 
+        WHERE b.UserId = t.UserId 
+        AND b.Name LIKE '%Bounty%'
+    )
+)
+SELECT 
+    fr.ResultType,
+    fr.UserId,
+    fr.DisplayName,
+    CASE 
+        WHEN fr.Reputation IS NOT NULL THEN 
+            CAST(fr.Reputation as VARCHAR(20)) 
+        ELSE 'N/A' 
+    END as Reputation,
+    CASE 
+        WHEN fr.TotalPosts IS NOT NULL THEN 
+            CAST(fr.TotalPosts as VARCHAR(10)) 
+        ELSE 'N/A' 
+    END as TotalPosts,
+    CASE 
+        WHEN fr.Questions IS NOT NULL THEN 
+            CAST(fr.Questions as VARCHAR(10)) 
+        ELSE 'N/A' 
+    END as Questions,
+    CASE 
+        WHEN fr.Answers IS NOT NULL THEN 
+            CAST(fr.Answers as VARCHAR(10)) 
+        ELSE 'N/A' 
+    END as Answers,
+    CASE 
+        WHEN fr.Comments IS NOT NULL THEN 
+            CAST(fr.Comments as VARCHAR(10)) 
+        ELSE 'N/A' 
+    END as Comments,
+    CASE 
+        WHEN fr.Badges IS NOT NULL THEN 
+            CAST(fr.Badges as VARCHAR(10)) 
+        ELSE 'N/A' 
+    END as Badges,
+    CASE 
+        WHEN fr.LastPostDate IS NOT NULL THEN 
+            CAST(fr.LastPostDate as VARCHAR(20)) 
+        ELSE 'N/A' 
+    END as LastPostDate,
+    CASE 
+        WHEN fr.DaysAsMember IS NOT NULL THEN 
+            CAST(fr.DaysAsMember as VARCHAR(10)) 
+        ELSE 'N/A' 
+    END as DaysAsMember,
+    CASE 
+        WHEN fr.ReputationRank IS NOT NULL THEN 
+            CAST(fr.ReputationRank as VARCHAR(10)) 
+        ELSE 'N/A' 
+    END as ReputationRank,
+    CASE 
+        WHEN fr.PostCountRank IS NOT NULL THEN 
+            CAST(fr.PostCountRank as VARCHAR(10)) 
+        ELSE 'N/A' 
+    END as PostCountRank,
+    CASE 
+        WHEN fr.RecentPostTitles IS NOT NULL THEN 
+            CASE 
+                WHEN LENGTH(fr.RecentPostTitles) > 150 THEN 
+                    SUBSTRING(fr.RecentPostTitles, 1, 150) || '...'
+                ELSE fr.RecentPostTitles
+            END
+        ELSE 'N/A' 
+    END as RecentPostTitles,
+    CASE 
+        WHEN fr.RecentQuestions IS NOT NULL THEN 
+            CASE 
+                WHEN LENGTH(fr.RecentQuestions) > 100 THEN 
+                    SUBSTRING(fr.RecentQuestions, 1, 100) || '...'
+                ELSE fr.RecentQuestions
+            END
+        ELSE 'N/A' 
+    END as RecentQuestions,
+    CASE 
+        WHEN fr.RecentAnswers IS NOT NULL THEN 
+            CASE 
+                WHEN LENGTH(fr.RecentAnswers) > 100 THEN 
+                    SUBSTRING(fr.RecentAnswers, 1, 100) || '...'
+                ELSE fr.RecentAnswers
+            END
+        ELSE 'N/A' 
+    END as RecentAnswers,
+    CASE 
+        WHEN fr.AvgScore IS NOT NULL THEN 
+            CAST(fr.AvgScore as VARCHAR(10)) 
+        ELSE 'N/A' 
+    END as AvgScore,
+    CASE 
+        WHEN fr.MaxViews IS NOT NULL THEN 
+            CAST(fr.MaxViews as VARCHAR(10)) 
+        ELSE 'N/A' 
+    END as MaxViews,
+    CASE 
+        WHEN fr.AvgAnswers IS NOT NULL THEN 
+            CAST(fr.AvgAnswers as VARCHAR(10)) 
+        ELSE 'N/A' 
+    END as AvgAnswers,
+    CASE 
+        WHEN fr.RecentPostCount IS NOT NULL THEN 
+            CAST(fr.RecentPostCount as VARCHAR(10)) 
+        ELSE 'N/A' 
+    END as RecentPostCount,
+    CASE 
+        WHEN fr.EngagementQualities IS NOT NULL THEN 
+            CASE 
+                WHEN LENGTH(fr.EngagementQualities) > 100 THEN 
+                    SUBSTRING(fr.EngagementQualities, 1, 100) || '...'
+                ELSE fr.EngagementQualities
+            END
+        ELSE 'N/A' 
+    END as EngagementQualities,
+    CASE 
+        WHEN fr.AvgDaysActive IS NOT NULL THEN 
+            CAST(fr.AvgDaysActive as VARCHAR(10)) 
+        ELSE 'N/A' 
+    END as AvgDaysActive,
+    CASE 
+        WHEN fr.TotalAnswersToQuestions IS NOT NULL THEN 
+            CAST(fr.TotalAnswersToQuestions as VARCHAR(10)) 
+        ELSE 'N/A' 
+    END as TotalAnswersToQuestions,
+    CASE 
+        WHEN fr.OverallUserRank IS NOT NULL THEN 
+            CAST(fr.OverallUserRank as VARCHAR(10)) 
+        ELSE 'N/A' 
+    END as OverallUserRank,
+    CASE 
+        WHEN fr.RecentEngagementRank IS NOT NULL THEN 
+            CAST(fr.RecentEngagementRank as VARCHAR(10)) 
+        ELSE 'N/A' 
+    END as RecentEngagementRank,
+    CASE 
+        WHEN fr.UserTier IS NOT NULL THEN fr.UserTier 
+        ELSE 'N/A' 
+    END as UserTier,
+    CASE 
+        WHEN fr.CommentToPostRatio IS NOT NULL THEN 
+            CAST(fr.CommentToPostRatio as VARCHAR(10)) 
+        ELSE 'N/A' 
+    END as CommentToPostRatio,
+    CASE 
+        WHEN fr.AnswerToQuestionRatio IS NOT NULL THEN 
+            CAST(fr.AnswerToQuestionRatio as VARCHAR(10)) 
+        ELSE 'N/A' 
+    END as AnswerToQuestionRatio,
+    CASE 
+        WHEN fr.TopPostsRank IS NOT NULL THEN 
+            CAST(fr.TopPostsRank as VARCHAR(10)) 
+        ELSE 'N/A' 
+    END as TopPostsRank,
+    CASE 
+        WHEN fr.ReputationPercentile IS NOT NULL THEN 
+            CAST(fr.ReputationPercentile as VARCHAR(10)) 
+        ELSE 'N/A' 
+    END as ReputationPercentile,
+    CASE 
+        WHEN fr.Top10Reputation IS NOT NULL THEN 
+            CAST(fr.Top10Reputation as VARCHAR(10)) 
+        ELSE 'N/A' 
+    END as Top10Reputation,
+    fr.SortOrder
+FROM FinalResults fr
+WHERE (
+    fr.UserId IS NULL or 
+    fr.Reputation > (
+        SELECT AVG(Reputation) 
+        FROM TopPerformers
+        WHERE Reputation > 0
+    )
+) AND (
+    fr.ResultType = 'User Performance Summary' OR 
+    fr.ResultType = 'Post Analysis Summary' OR
+    (
+        fr.ResultType = 'User Performance Detail' AND 
+        fr.Reputation > (
+            SELECT AVG(Reputation) 
+            FROM TopPerformers 
+            WHERE Reputation > 0
+        )
+    )
+) 
+AND (
+    NOT EXISTS (
+        SELECT 1 FROM Posts p 
+        WHERE p.OwnerUserId = fr.UserId 
+        AND p.PostTypeId = 2 
+        AND p.Score > 0 
+        AND (
+            EXISTS (
+                SELECT 1 FROM PostHistory ph 
+                WHERE ph.PostId = p.Id 
+                AND ph.UserId = p.OwnerUserId 
+                AND ph.PostHistoryTypeId = 5
+            )
+        )
+    ) OR
+    EXISTS (
+        SELECT 1 FROM Users u 
+        WHERE u.Id = fr.UserId 
+        AND u.Reputation > (
+            SELECT AVG(Reputation) + (
+                SELECT STDDEV(Reputation) 
+                FROM TopPerformers
+            )
+            FROM Users
+        )
+        AND u.Id IN (
+            SELECT DISTINCT p.OwnerUserId 
+            FROM Posts p 
+            WHERE p.PostTypeId = 1
+        )
+    )
+)
+GROUP BY 
+    fr.ResultType, fr.UserId, fr.DisplayName, fr.Reputation, fr.TotalPosts, 
+    fr.Questions, fr.Answers, fr.Comments, fr.Badges, fr.LastPostDate, 
+    fr.DaysAsMember, fr.ReputationRank, fr.PostCountRank, fr.RecentPostTitles, 
+    fr.RecentQuestions, fr.RecentAnswers, fr.AvgScore, fr.MaxViews, fr.AvgAnswers, 
+    fr.RecentPostCount, fr.EngagementQualities, fr.AvgDaysActive, 
+    fr.TotalAnswersToQuestions, fr.OverallUserRank, fr.RecentEngagementRank, 
+    fr.UserTier, fr.CommentToPostRatio, fr.AnswerToQuestionRatio, fr.TopPostsRank, 
+    fr.ReputationPercentile, fr.Top10Reputation, fr.SortOrder
+HAVING 
+    (COUNT(*) >= (
+        SELECT COUNT(*) / 10 
+        FROM TopPerformers
+    ) OR 
+    fr.ResultType IN ('User Performance Summary', 'Post Analysis Summary'))
+ORDER BY 
+    fr.SortOrder,
+    CASE 
+        WHEN fr.ResultType = 'User Performance Summary' THEN 1
+        WHEN fr.ResultType = 'Post Analysis Summary' THEN 2
+        WHEN fr.ResultType = 'User Performance Detail' THEN 3
+        ELSE 4
+    END,
+    fr.Reputation DESC,
+    fr.TotalPosts DESC,
+    fr.MaxViews DESC,
+    fr.AvgScore DESC;

@@ -1,0 +1,171 @@
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(P.Score) AS TotalPostScore,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        SUM(C.Score) AS TotalCommentScore,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesGiven,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesGiven,
+        MAX(U.LastAccessDate) AS LastUserAccessDate
+    FROM
+        Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId AND P.CreationDate BETWEEN '2021-01-01' AND '2023-01-01'
+    LEFT JOIN Comments C ON U.Id = C.UserId AND C.CreationDate BETWEEN '2021-01-01' AND '2023-01-01'
+    LEFT JOIN Badges B ON U.Id = B.UserId AND B.Date BETWEEN '2021-01-01' AND '2023-01-01'
+    LEFT JOIN Votes V ON U.Id = V.UserId AND V.CreationDate BETWEEN '2021-01-01' AND '2023-01-01'
+    WHERE U.Reputation > 500
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate
+    HAVING
+        COUNT(DISTINCT P.Id) > 10 AND SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) >= 3
+),
+PostHistoricalAnalysis AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.CreationDate AS PostCreationDate,
+        P.OwnerUserId,
+        P.Score AS InitialScore,
+        P.ViewCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.ClosedDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.CreationDate ELSE NULL END) AS LastEditDate,
+        MIN(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.CreationDate ELSE NULL END) AS FirstEditDate,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.UserId ELSE NULL END) AS UniqueEditorCount,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.Id ELSE NULL END) AS CloseHistoryCount,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN CRT.Name ELSE NULL END) AS LatestCloseReason,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) = 1 AS WasClosed,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) = 1 AS WasReopened,
+        (SELECT COUNT(*) FROM PostHistory PH_sub WHERE PH_sub.PostId = P.Id AND PH_sub.UserId = P.OwnerUserId AND PH_sub.PostHistoryTypeId IN (4, 5, 6)) AS OwnerEditsOwnPostCount
+    FROM
+        Posts P
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    LEFT JOIN CloseReasonTypes CRT ON PH.PostHistoryTypeId = 10 AND CAST(PH.Comment AS INTEGER) = CRT.Id
+    WHERE P.PostTypeId IN (1, 2)
+    GROUP BY
+        P.Id, P.PostTypeId, P.CreationDate, P.OwnerUserId, P.Score, P.ViewCount, P.CommentCount, P.FavoriteCount, P.ClosedDate
+),
+NormalizedTags AS (
+    SELECT
+        P.Id AS PostId,
+        TRIM(value) AS TagName
+    FROM
+        Posts P,
+        UNNEST(string_to_array(SUBSTRING(P.Tags FROM 2 FOR (CHAR_LENGTH(P.Tags) - 2)), '><')) AS t(value)
+    WHERE
+        P.Tags IS NOT NULL AND CHAR_LENGTH(P.Tags) > 2 AND P.PostTypeId = 1
+),
+TagPerformance AS (
+    SELECT
+        NT.TagName,
+        COUNT(DISTINCT NT.PostId) AS TaggedPostCount,
+        AVG(P.Score) AS AvgTagScore,
+        AVG(P.ViewCount) AS AvgTagViewCount
+    FROM
+        NormalizedTags NT
+    JOIN Posts P ON NT.PostId = P.Id
+    GROUP BY
+        NT.TagName
+    HAVING
+        COUNT(DISTINCT NT.PostId) > 50
+)
+SELECT
+    UAS.UserId,
+    UAS.DisplayName,
+    UAS.Reputation,
+    PHA.PostId,
+    P.Title,
+    P.Body,
+    P.CreationDate AS PostCreationDate,
+    P.Score AS CurrentPostScore,
+    P.ViewCount,
+    PHA.InitialScore,
+    PHA.OwnerEditsOwnPostCount,
+    NT.TagName,
+    TP.AvgTagScore,
+    TP.TaggedPostCount,
+    CASE
+        WHEN PHA.PostCreationDate IS NOT NULL AND PHA.LastEditDate IS NOT NULL
+            THEN EXTRACT(EPOCH FROM (PHA.LastEditDate - PHA.PostCreationDate)) / 86400.0
+        ELSE NULL
+    END AS DaysToLastEdit,
+    COALESCE(PHA.LatestCloseReason, 'Not Closed') AS PostClosureStatus,
+    AcceptedAnswer.Id AS AcceptedAnswerId,
+    AcceptedAnswer.Score AS AcceptedAnswerScore,
+    AcceptedAnswerOwner.DisplayName AS AcceptedAnswerOwnerDisplayName,
+    RANK() OVER (PARTITION BY UAS.UserId ORDER BY P.Score DESC, P.ViewCount DESC) AS UserPostRank,
+    AVG(P.Score) OVER (PARTITION BY NT.TagName) AS TagSpecificAvgPostScore,
+    NTH_VALUE(P.Title, 1) OVER (PARTITION BY NT.TagName ORDER BY P.Score DESC) AS TopPostTitleForTag,
+    (P.Score * 1.0 / NULLIF(P.ViewCount, 0)) AS ScoreToViewRatio,
+    UPPER(SUBSTRING(COALESCE(P.Title, 'NO TITLE') FROM 1 FOR 1)) AS FirstLetterOfTitle,
+    CHAR_LENGTH(P.Body) AS BodyLength,
+    NOT EXISTS (
+        SELECT 1
+        FROM Comments C_sub
+        WHERE C_sub.PostId = P.Id
+          AND C_sub.CreationDate > (P.CreationDate + INTERVAL '30 days')
+          AND (C_sub.Text ILIKE '%bug%' OR C_sub.Text ILIKE '%error%')
+          AND C_sub.UserId IS NOT NULL
+          AND (SELECT U_sub.Reputation FROM Users U_sub WHERE U_sub.Id = C_sub.UserId) < 100
+    ) AS NoLowRepBugCommentsAfter30Days,
+    COALESCE(P.LastEditorDisplayName, 'Community') AS EditorOrCommunity,
+    (
+        SELECT
+            CASE
+                WHEN EXISTS (
+                    SELECT PH_q.PostHistoryTypeId FROM PostHistory PH_q WHERE PH_q.PostId = P.Id AND PH_q.PostHistoryTypeId IN (1,3,4,6)
+                    EXCEPT
+                    SELECT PH_a.PostHistoryTypeId FROM PostHistory PH_a WHERE PH_a.PostId = P.Id AND PH_a.PostHistoryTypeId IN (2,5,8)
+                )
+                THEN TRUE
+                ELSE FALSE
+            END
+    ) AS HasQuestionSpecificHistoryButNotAnswerSpecificHistory
+FROM
+    UserActivitySummary UAS
+INNER JOIN Posts P ON UAS.UserId = P.OwnerUserId
+INNER JOIN PostHistoricalAnalysis PHA ON P.Id = PHA.PostId
+LEFT JOIN Posts AcceptedAnswer ON P.AcceptedAnswerId = AcceptedAnswer.Id AND P.PostTypeId = 1
+LEFT JOIN Users AcceptedAnswerOwner ON AcceptedAnswer.OwnerUserId = AcceptedAnswerOwner.Id
+LEFT JOIN NormalizedTags NT ON P.Id = NT.PostId
+LEFT JOIN TagPerformance TP ON NT.TagName = TP.TagName
+WHERE
+    P.PostTypeId = 1
+    AND P.CreationDate BETWEEN '2021-01-01' AND '2023-01-01'
+    AND P.Score > 50
+    AND P.ViewCount > 1000
+    AND (PHA.WasClosed = FALSE OR PHA.PostCreationDate > (UAS.UserCreationDate + INTERVAL '1 year'))
+    AND (
+        NT.TagName IN ('sql', 'postgresql', 'database', 'performance')
+        OR
+        (CHAR_LENGTH(P.Body) > 1000 AND P.Title ILIKE '%optimize%')
+        OR
+        (PHA.FavoriteCount IS NOT NULL AND PHA.FavoriteCount > 10 AND P.AnswerCount > 2)
+    )
+    AND P.OwnerUserId IS NOT NULL
+    AND PHA.UniqueEditorCount >= 1
+    AND NOT EXISTS (
+        SELECT 1
+        FROM PostLinks PL_sub
+        WHERE PL_sub.PostId = P.Id AND PL_sub.LinkTypeId = 3
+          AND EXISTS (SELECT 1 FROM Posts P_dup WHERE P_dup.Id = PL_sub.RelatedPostId AND P_dup.Score < P.Score)
+    )
+GROUP BY
+    UAS.UserId, UAS.DisplayName, UAS.Reputation,
+    PHA.PostId, P.Title, P.Body, P.CreationDate, P.Score, P.ViewCount,
+    PHA.InitialScore, PHA.OwnerEditsOwnPostCount, NT.TagName, TP.AvgTagScore, TP.TaggedPostCount,
+    PHA.LastEditDate, PHA.PostCreationDate, PHA.LatestCloseReason,
+    AcceptedAnswer.Id, AcceptedAnswer.Score, AcceptedAnswerOwner.DisplayName,
+    P.LastEditorDisplayName, P.AnswerCount, PHA.FavoriteCount, UAS.UserCreationDate
+ORDER BY
+    UAS.Reputation DESC, P.Score DESC, P.CreationDate DESC
+LIMIT 500;

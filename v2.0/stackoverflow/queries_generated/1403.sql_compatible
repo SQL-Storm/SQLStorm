@@ -1,0 +1,197 @@
+WITH UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.WebsiteUrl,
+        u.Views AS UserViews,
+        u.UpVotes AS UserUpVotes,
+        u.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswers,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostScore,
+        SUM(COALESCE(p.ViewCount, 0)) AS TotalPostViews,
+        MAX(p.CreationDate) AS LatestPostDate,
+        MIN(p.CreationDate) AS EarliestPostDate,
+        CAST(u.Reputation AS numeric) / (EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - u.CreationDate)) / (3600 * 24 * 365.25) + 1) AS ReputationPerYear
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.WebsiteUrl, u.Views, u.UpVotes, u.DownVotes
+),
+PostHistoricalMetrics AS (
+    SELECT
+        ph.PostId,
+        COUNT(DISTINCT ph.UserId) AS DistinctEditors,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.Id END) AS EditCount,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate ELSE NULL END) AS LastClosedDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.CreationDate ELSE NULL END) AS LastReopenedDate,
+        MAX(ph.CreationDate) AS LastHistoryEventDate,
+        AVG(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN EXTRACT(EPOCH FROM (ph.CreationDate - p.CreationDate)) / 3600 ELSE NULL END) AS AvgTimeUntilFirstEditHours,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 AND ph.Comment IN ('1', '101') THEN 1 ELSE 0 END) AS DuplicateCloseVoteCount
+    FROM PostHistory ph
+    JOIN Posts p ON ph.PostId = p.Id
+    GROUP BY ph.PostId
+),
+PostTagAnalysis AS (
+    SELECT
+        p.Id AS PostId,
+        ARRAY_AGG(DISTINCT TRIM(REPLACE(REPLACE(t.TagName, '<', ''), '>', ''))) AS PostTags,
+        COUNT(DISTINCT t.TagName) AS TagCount,
+        MAX(t.Count) AS MaxTagGlobalCount
+    FROM Posts p
+    LEFT JOIN LATERAL (
+        SELECT UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><')) AS tn
+    ) tag_name ON p.Tags IS NOT NULL
+    LEFT JOIN Tags t ON t.TagName = tag_name.tn
+    GROUP BY p.Id
+),
+RecentVoteActivity AS (
+    SELECT
+        v.PostId,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS RecentUpVotes,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS RecentDownVotes,
+        COUNT(CASE WHEN v.VoteTypeId = 1 THEN v.Id END) AS RecentAcceptedVotes,
+        MAX(v.CreationDate) AS LatestVoteDate
+    FROM Votes v
+    WHERE v.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days'
+    GROUP BY v.PostId
+),
+PostTypeSpecificMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.OwnerUserId,
+        p.LastActivityDate,
+        COALESCE(p.AcceptedAnswerId, -1) AS AcceptedAnswerId,
+        LENGTH(p.Body) AS BodyLength,
+        LENGTH(p.Title) AS TitleLength,
+        (SELECT COUNT(*) FROM Comments pc WHERE pc.PostId = p.Id AND pc.UserId = p.OwnerUserId AND pc.CreationDate > p.CreationDate) AS OwnerCommentsOnOwnPostAfterCreation,
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostScore,
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS RankByScoreForType
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+),
+HighScoringQuestions AS (
+    SELECT
+        psm.PostId,
+        psm.PostTypeId,
+        psm.PostTypeName,
+        psm.Score,
+        psm.OwnerUserId,
+        'HighScoringQuestion' AS ActivityType
+    FROM PostTypeSpecificMetrics psm
+    WHERE psm.PostTypeId = 1
+    AND psm.Score >= 50
+),
+HighScoringAnswers AS (
+    SELECT
+        psm.PostId,
+        psm.PostTypeId,
+        psm.PostTypeName,
+        psm.Score,
+        psm.OwnerUserId,
+        'HighScoringAnswer' AS ActivityType
+    FROM PostTypeSpecificMetrics psm
+    WHERE psm.PostTypeId = 2
+    AND psm.Score >= 50
+),
+CombinedHighScoringPosts AS (
+    SELECT * FROM HighScoringQuestions
+    UNION ALL
+    SELECT * FROM HighScoringAnswers
+)
+SELECT
+    ue.UserId,
+    ue.DisplayName,
+    ue.Reputation,
+    ue.ReputationPerYear,
+    ue.TotalPosts,
+    ue.TotalQuestions,
+    ue.TotalAnswers,
+    ue.TotalComments,
+    ue.TotalBadges,
+    ue.TotalPostScore,
+    ue.TotalPostViews,
+    ue.LatestPostDate,
+    ue.EarliestPostDate,
+    p.PostId,
+    p.PostTypeName,
+    p.CreationDate AS PostCreationDate,
+    p.Score AS PostScore,
+    p.ViewCount AS PostViewCount,
+    p.AnswerCount,
+    p.CommentCount AS PostCommentCount,
+    p.FavoriteCount,
+    p.BodyLength,
+    p.TitleLength,
+    p.OwnerCommentsOnOwnPostAfterCreation,
+    p.PreviousPostScore,
+    p.RankByScoreForType,
+    phm.DistinctEditors,
+    phm.EditCount,
+    phm.LastClosedDate,
+    phm.LastReopenedDate,
+    phm.LastHistoryEventDate,
+    phm.AvgTimeUntilFirstEditHours,
+    phm.DuplicateCloseVoteCount,
+    pta.PostTags,
+    pta.TagCount,
+    pta.MaxTagGlobalCount,
+    rva.RecentUpVotes,
+    rva.RecentDownVotes,
+    rva.RecentAcceptedVotes,
+    rva.LatestVoteDate,
+    COALESCE(p.AcceptedAnswerId, -1) AS AcceptedAnswerId,
+    aa.Score AS AcceptedAnswerScore,
+    aa.OwnerUserId AS AcceptedAnswerOwnerId,
+    (SELECT u2.Reputation FROM Users u2 WHERE u2.Id = p.OwnerUserId) AS OwnerReputationAtPostTime,
+    pl.LinkTypeId,
+    lt.Name AS LinkTypeName,
+    pl.RelatedPostId,
+    chsp.ActivityType AS HighScoreActivityType,
+    CASE
+        WHEN p.PostTypeId = 1 AND p.PostId IN (SELECT ph.PostId FROM PostHistory ph WHERE ph.PostHistoryTypeId = 10 AND ph.Comment IN ('1', '101')) THEN 'ClosedAsDuplicate'
+        WHEN p.PostTypeId = 1 AND p.PostId IN (SELECT v.PostId FROM Votes v WHERE v.VoteTypeId = 6) THEN 'ClosedByVotes'
+        WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId > 0 THEN 'AnsweredQuestion'
+        WHEN p.PostTypeId = 2 AND p.PostId IS NOT NULL AND p.OwnerUserId = (SELECT q.OwnerUserId FROM Posts q WHERE q.Id = p.PostId) THEN 'SelfAcceptedAnswer'
+        ELSE 'OtherStatus'
+    END AS PostStatusDetail,
+    UPPER(LEFT(p.PostTypeName, 3)) || '-' || LPAD(CAST(p.PostId AS text), 10, '0') AS PostCodeIdentifier,
+    COALESCE(ue.WebsiteUrl, 'N/A') AS UserWebsiteUrl,
+    COALESCE(TO_CHAR(ue.LastAccessDate, 'YYYY-MM-DD HH24:MI:SS'), 'Never Accessed') AS LastAccessFormatted,
+    CASE
+        WHEN p.Body LIKE '%<pre><code>%' ESCAPE '\' THEN TRUE
+        ELSE FALSE
+    END AS ContainsCodeBlock,
+    (p.Score + p.FavoriteCount * 2 + p.CommentCount * 0.5) AS PostInfluenceScore
+FROM UserEngagement ue
+LEFT JOIN PostTypeSpecificMetrics p ON ue.UserId = p.OwnerUserId
+LEFT JOIN PostHistoricalMetrics phm ON p.PostId = phm.PostId
+LEFT JOIN PostTagAnalysis pta ON p.PostId = pta.PostId
+LEFT JOIN RecentVoteActivity rva ON p.PostId = rva.PostId
+LEFT JOIN PostTypeSpecificMetrics aa ON p.AcceptedAnswerId = aa.PostId
+LEFT JOIN PostLinks pl ON p.PostId = pl.PostId
+LEFT JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+LEFT JOIN CombinedHighScoringPosts chsp ON p.PostId = chsp.PostId
+WHERE ue.TotalPosts > 0
+  AND p.CreationDate IS NOT NULL
+  AND p.Score > -5
+  AND (p.PostTypeName ILIKE 'Question' OR p.PostTypeName ILIKE 'Answer')
+  AND (ue.Reputation > 1000 OR p.FavoriteCount > 10)
+  AND (NOT EXISTS (SELECT 1 FROM Badges b_sub WHERE b_sub.UserId = ue.UserId AND b_sub.Name = 'Disciplined'))
+ORDER BY ue.Reputation DESC, p.Score DESC, p.CreationDate DESC
+LIMIT 1000;

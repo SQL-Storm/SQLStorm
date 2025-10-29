@@ -1,0 +1,197 @@
+-- {"query": "1521.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3096} 
+
+WITH ContentActivityUnion AS (
+    -- Combine posts and comments into a single activity stream for user engagement metrics
+    SELECT
+        Id AS ActivityId,
+        OwnerUserId AS UserId,
+        CreationDate,
+        'Post' AS ActivityType,
+        Score
+    FROM Posts
+    WHERE OwnerUserId IS NOT NULL AND PostTypeId IN (1, 2) -- Only questions and answers
+    UNION ALL
+    SELECT
+        Id AS ActivityId,
+        UserId,
+        CreationDate,
+        'Comment' AS ActivityType,
+        Score
+    FROM Comments
+    WHERE UserId IS NOT NULL
+),
+UserActivitySummary AS (
+    -- Aggregate user-specific activity metrics from various tables and the ContentActivityUnion CTE
+    SELECT
+        U.Id AS UserId,
+        COUNT(DISTINCT P.Id) AS TotalPostsCreated,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestionsAsked,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswersPosted,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesGiven,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesGiven,
+        COALESCE(SUM(P.Score), 0) AS TotalPostScoreOwned,
+        COALESCE(AVG(P.Score), 0.0) AS AvgPostScoreOwned,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        COALESCE(SUM(CASE WHEN CA.ActivityType = 'Post' THEN CA.Score ELSE 0 END), 0) AS TotalPostContentScore,
+        COALESCE(SUM(CASE WHEN CA.ActivityType = 'Comment' THEN CA.Score ELSE 0 END), 0) AS TotalCommentContentScore
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Votes V ON U.Id = V.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN ContentActivityUnion CA ON U.Id = CA.UserId
+    GROUP BY U.Id
+),
+PostClosingHistory AS (
+    -- Identify the latest closing reason for each post
+    SELECT
+        PH.PostId,
+        CRT.Name AS CloseReasonName,
+        PH.CreationDate AS CloseDate,
+        ROW_NUMBER() OVER(PARTITION BY PH.PostId ORDER BY PH.CreationDate DESC) AS rn_latest_close
+    FROM PostHistory PH
+    JOIN PostHistoryTypes PHT ON PH.PostHistoryTypeId = PHT.Id
+    LEFT JOIN CloseReasonTypes CRT ON
+        PH.PostHistoryTypeId = 10 AND -- Only try to cast if it's a close event
+        PH.Comment ~ '^[0-9]+$' AND -- Ensure comment is numeric for casting
+        CAST(PH.Comment AS int) = CRT.Id
+    WHERE PH.PostHistoryTypeId = 10 -- Post Closed
+),
+PostTagAnalysis AS (
+    -- Parse tags from questions and rank them by score/views for each user
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        P.Score,
+        P.CreationDate,
+        P.LastActivityDate,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        STRING_TO_ARRAY(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><') AS TagArray,
+        ROW_NUMBER() OVER(PARTITION BY P.OwnerUserId ORDER BY P.Score DESC, P.ViewCount DESC, P.CreationDate DESC) AS rn_top_post_by_user
+    FROM Posts P
+    WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2 -- Only questions with tags
+),
+ExpandedPostTags AS (
+    -- Explode the tag array into individual rows for tag-level analysis
+    SELECT
+        PTA.PostId,
+        PTA.OwnerUserId,
+        UNNEST(PTA.TagArray) AS TagName, -- PostgreSQL specific UNNEST function
+        PTA.Score
+    FROM PostTagAnalysis PTA
+    WHERE PTA.OwnerUserId IS NOT NULL -- Ensure a valid owner for tagging analysis
+)
+-- Main query to gather comprehensive user and post statistics
+SELECT
+    U.Id AS UserId,
+    U.DisplayName,
+    U.Reputation,
+    U.CreationDate AS UserCreationDate,
+    U.LastAccessDate,
+    U.Location,
+    COALESCE(U.Views, 0) AS ProfileViews,
+    U.UpVotes AS UserUpVotesReceived,
+    U.DownVotes AS UserDownVotesReceived,
+    UAS.TotalPostsCreated,
+    UAS.TotalQuestionsAsked,
+    UAS.TotalAnswersPosted,
+    UAS.TotalCommentsMade,
+    UAS.TotalUpVotesGiven,
+    UAS.TotalDownVotesGiven,
+    UAS.TotalPostScoreOwned,
+    UAS.AvgPostScoreOwned,
+    UAS.TotalBadges,
+    UAS.TotalPostContentScore,
+    UAS.TotalCommentContentScore,
+    (SELECT COUNT(DISTINCT B.Name) FROM Badges B WHERE B.UserId = U.Id AND B.Class = 1) AS GoldBadgesCount, -- Correlated Subquery 1: Count of gold badges
+    COALESCE(AVG(P_location.Score) OVER (PARTITION BY U.Location), 0.0) AS AvgScoreInLocation, -- Window function: Average post score in user's location
+    COALESCE(SUM(U.Reputation) OVER (ORDER BY U.CreationDate RANGE BETWEEN INTERVAL '30 day' PRECEDING AND CURRENT ROW), 0) AS Rolling30DayReputationSum, -- Window function: Rolling sum of reputation over a 30-day window
+    COALESCE(LAG(U.Reputation, 1, 0) OVER (ORDER BY U.CreationDate), 0) AS PrevUserReputation, -- Window function: Reputation of the previous user by creation date
+    -- Correlated Subquery 2: Identify the most active tag for the user based on post count and score
+    (
+        SELECT EPT_inner.TagName
+        FROM ExpandedPostTags EPT_inner
+        WHERE EPT_inner.OwnerUserId = U.Id
+        GROUP BY EPT_inner.TagName
+        ORDER BY COUNT(EPT_inner.PostId) DESC, SUM(EPT_inner.Score) DESC
+        LIMIT 1
+    ) AS MostActiveTagName,
+    -- Correlated Subquery 3 (nested): Sum of scores for posts in the user's most active tag
+    COALESCE((
+        SELECT SUM(EPT_inner.Score)
+        FROM ExpandedPostTags EPT_inner
+        WHERE EPT_inner.OwnerUserId = U.Id
+          AND EPT_inner.TagName = (
+                SELECT EPT_sub.TagName
+                FROM ExpandedPostTags EPT_sub
+                WHERE EPT_sub.OwnerUserId = U.Id
+                GROUP BY EPT_sub.TagName
+                ORDER BY COUNT(EPT_sub.PostId) DESC, SUM(EPT_sub.Score) DESC
+                LIMIT 1
+              )
+    ), 0) AS ScoreInMostActiveTag,
+    PTA_top.PostId AS TopPostId,
+    P_top.Title AS TopPostTitle,
+    P_top.Score AS TopPostScore,
+    P_top.ViewCount AS TopPostViewCount,
+    P_top.CreationDate AS TopPostCreationDate,
+    P_top.LastActivityDate AS TopPostLastActivityDate,
+    PCH.CloseReasonName AS TopPostCloseReason,
+    PCH.CloseDate AS TopPostCloseDate,
+    -- Correlated Subquery 4: Count of linked posts for the user's top post
+    (
+        SELECT COUNT(DISTINCT PL.RelatedPostId)
+        FROM PostLinks PL
+        WHERE PL.PostId = PTA_top.PostId AND PL.LinkTypeId = 1
+    ) AS TopPostLinkedCount,
+    -- Correlated Subquery 5: Count of duplicate posts for the user's top post
+    (
+        SELECT COUNT(DISTINCT PL.RelatedPostId)
+        FROM PostLinks PL
+        WHERE PL.PostId = PTA_top.PostId AND PL.LinkTypeId = 3
+    ) AS TopPostDuplicateCount,
+    -- Complicated predicate/expression: Categorize users into tiers
+    CASE
+        WHEN U.Reputation > 10000 AND UAS.TotalBadges > 50 AND UAS.TotalQuestionsAsked > 100 THEN 'Veteran Power User'
+        WHEN U.Reputation > 5000 AND UAS.TotalBadges > 20 AND UAS.TotalAnswersPosted > 50 THEN 'Experienced Contributor'
+        WHEN U.Reputation > 1000 AND (UAS.TotalPostsCreated > 10 OR UAS.TotalCommentsMade > 50) THEN 'Active Member'
+        ELSE 'Novice'
+    END AS UserTier,
+    -- Correlated Subquery 6: Average score of comments made by the user
+    COALESCE((SELECT AVG(C_sub.Score) FROM Comments C_sub WHERE C_sub.UserId = U.Id), 0.0) AS AvgCommentScore,
+    (U.AboutMe IS NOT NULL AND TRIM(U.AboutMe) != '') AS HasAboutMe, -- NULL logic and string expression
+    COALESCE(LENGTH(U.AboutMe), 0) AS AboutMeLength, -- String expression: Length of AboutMe
+    (U.WebsiteUrl IS NOT NULL AND TRIM(U.WebsiteUrl) != '') AS HasWebsiteUrl, -- NULL logic and string expression
+    ABS(EXTRACT(DAY FROM (U.CreationDate - U.LastAccessDate))) AS DaysSinceLastAccess, -- Date calculation: Absolute difference in days
+    COALESCE(P_top.AnswerCount, 0) AS TopPostAnswerCount,
+    COALESCE(P_top.CommentCount, 0) AS TopPostCommentCount,
+    COALESCE(P_top.FavoriteCount, 0) AS TopPostFavoriteCount,
+    -- Correlated Subquery 7: Average view count of questions asked by this user
+    COALESCE((SELECT AVG(Q.ViewCount) FROM Posts Q WHERE Q.OwnerUserId = U.Id AND Q.PostTypeId = 1), 0.0) AS AvgQuestionViewsByUser,
+    RANK() OVER (ORDER BY U.Reputation DESC, U.CreationDate ASC) AS UserReputationRank, -- Window function: Rank users by reputation
+    DENSE_RANK() OVER (ORDER BY UAS.TotalPostsCreated DESC, U.Reputation DESC) AS UserActivityRank -- Window function: Dense rank users by activity
+FROM Users U
+LEFT JOIN UserActivitySummary UAS ON U.Id = UAS.UserId
+LEFT JOIN PostTagAnalysis PTA_top ON U.Id = PTA_top.OwnerUserId AND PTA_top.rn_top_post_by_user = 1 -- Get user's top post
+LEFT JOIN Posts P_top ON PTA_top.PostId = P_top.Id -- Actual post details for the identified top post
+LEFT JOIN PostClosingHistory PCH ON P_top.Id = PCH.PostId AND PCH.rn_latest_close = 1
+LEFT JOIN Posts P_location ON U.Id = P_location.OwnerUserId AND P_location.PostTypeId IN (1,2) -- Joined for AvgScoreInLocation window function calculation
+WHERE
+    U.CreationDate >= '2020-01-01' -- Filter for recent users to limit data
+    AND U.Reputation > 100
+    AND (U.Location IS NOT NULL AND U.Location != '' AND LOWER(U.Location) NOT LIKE '%united states%') -- Complicated predicate: Users outside USA with location data
+    AND EXISTS (SELECT 1 FROM Badges B_exists WHERE B_exists.UserId = U.Id AND B_exists.Class = 1 AND B_exists.Date >= U.CreationDate + INTERVAL '1 month') -- Exists subquery: Users with a gold badge earned after their first month
+    AND COALESCE(UAS.TotalPostsCreated, 0) + COALESCE(UAS.TotalCommentsMade, 0) > 5 -- Complicated predicate: Users with minimum combined post and comment activity
+GROUP BY
+    U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Location, U.Views, U.UpVotes, U.DownVotes, U.AboutMe, U.WebsiteUrl,
+    UAS.TotalPostsCreated, UAS.TotalQuestionsAsked, UAS.TotalAnswersPosted, UAS.TotalCommentsMade, UAS.TotalUpVotesGiven, UAS.TotalDownVotesGiven,
+    UAS.TotalPostScoreOwned, UAS.AvgPostScoreOwned, UAS.TotalBadges, UAS.TotalPostContentScore, UAS.TotalCommentContentScore,
+    PTA_top.PostId, P_top.Title, P_top.Score, P_top.ViewCount, P_top.CreationDate, P_top.LastActivityDate, P_top.AnswerCount, P_top.CommentCount, P_top.FavoriteCount,
+    PCH.CloseReasonName, PCH.CloseDate
+ORDER BY
+    UserReputationRank ASC, U.CreationDate DESC
+LIMIT 1000;

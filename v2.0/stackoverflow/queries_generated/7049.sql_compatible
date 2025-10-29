@@ -1,0 +1,301 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT c.Id) as TotalComments,
+        COUNT(DISTINCT b.Id) as TotalBadges,
+        SUM(COALESCE(p.Score, 0)) as TotalScore,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END), 0) as QuestionCount,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END), 0) as AnswerCount,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 3 THEN 1 ELSE 0 END), 0) as WikiCount,
+        AVG(COALESCE(p.ViewCount, 0)) as AvgViewCount,
+        STRING_AGG(DISTINCT CASE WHEN p.Tags IS NOT NULL THEN p.Tags ELSE '' END, ';') as AllTags,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY MAX(p.CreationDate) DESC) as PostRank,
+        RANK() OVER (ORDER BY SUM(COALESCE(p.Score, 0)) DESC) as ScoreRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+PostComplexityAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        CASE 
+            WHEN LENGTH(p.Body) > 1000 THEN 'Long'
+            WHEN LENGTH(p.Body) > 500 THEN 'Medium'
+            WHEN LENGTH(p.Body) > 100 THEN 'Short'
+            ELSE 'Very Short'
+        END as BodyLengthCategory,
+        CASE 
+            WHEN COALESCE(p.ViewCount, 0) > 1000 THEN 'High'
+            WHEN COALESCE(p.ViewCount, 0) > 100 THEN 'Medium'
+            ELSE 'Low'
+        END as ViewCategory,
+        COALESCE(p.CommentCount, 0) + COALESCE(p.FavoriteCount, 0) as EngagementScore,
+        ROW_NUMBER() OVER (ORDER BY p.Score DESC) as ScoreRank,
+        DENSE_RANK() OVER (ORDER BY p.CreationDate DESC) as RecentRank,
+        PERCENT_RANK() OVER (ORDER BY p.ViewCount DESC) as ViewPercentile,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END as PostType
+    FROM Posts p
+    WHERE p.CreationDate >= '2015-01-01'
+),
+AdvancedUserAnalysis AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.TotalPosts,
+        uas.TotalComments,
+        uas.TotalBadges,
+        uas.TotalScore,
+        uas.PostRank,
+        uas.ScoreRank,
+        uas.QuestionCount,
+        uas.AnswerCount,
+        uas.WikiCount,
+        uas.AvgViewCount,
+        uas.AllTags,
+        CASE 
+            WHEN uas.TotalPosts > 100 AND uas.TotalScore > 1000 THEN 'Elite Contributor'
+            WHEN uas.TotalPosts > 50 AND uas.TotalScore > 500 THEN 'Active Contributor'
+            WHEN uas.TotalPosts > 10 AND uas.TotalScore > 100 THEN 'Regular Contributor'
+            ELSE 'New Contributor'
+        END as ContributorLevel,
+        CASE 
+            WHEN uas.Reputation > 100000 THEN 'Super Expert'
+            WHEN uas.Reputation > 10000 THEN 'Expert'
+            WHEN uas.Reputation > 1000 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as ReputationLevel,
+        CASE 
+            WHEN uas.TotalBadges > 20 THEN 'Badge Collector'
+            WHEN uas.TotalBadges > 10 THEN 'Regular Badger'
+            WHEN uas.TotalBadges > 0 THEN 'First Badge User'
+            ELSE 'No Badges'
+        END as BadgeStatus
+    FROM UserActivityStats uas
+),
+FinalAnalysis AS (
+    SELECT 
+        aua.UserId,
+        aua.DisplayName,
+        aua.Reputation,
+        aua.TotalPosts,
+        aua.TotalComments,
+        aua.TotalBadges,
+        aua.TotalScore,
+        aua.ContributorLevel,
+        aua.ReputationLevel,
+        aua.BadgeStatus,
+        pca.PostId,
+        pca.Title,
+        pca.Score,
+        pca.ViewCount,
+        pca.CommentCount,
+        pca.FavoriteCount,
+        pca.CreationDate,
+        pca.PostType,
+        pca.BodyLengthCategory,
+        pca.ViewCategory,
+        pca.EngagementScore,
+        pca.ScoreRank,
+        pca.RecentRank,
+        pca.ViewPercentile,
+        CASE 
+            WHEN pca.ViewPercentile > 0.9 THEN 'Top 10% Viewership'
+            WHEN pca.ViewPercentile > 0.75 THEN 'Top 25% Viewership'
+            WHEN pca.ViewPercentile > 0.5 THEN 'Top 50% Viewership'
+            ELSE 'Below Average Viewership'
+        END as ViewPerformance,
+        CASE 
+            WHEN pca.EngagementScore > 50 THEN 'High Engagement'
+            WHEN pca.EngagementScore > 25 THEN 'Medium Engagement'
+            WHEN pca.EngagementScore > 0 THEN 'Low Engagement'
+            ELSE 'No Engagement'
+        END as EngagementLevel,
+        CASE 
+            WHEN pca.ScoreRank <= 50 THEN 'Top 50 Score'
+            WHEN pca.ScoreRank <= 100 THEN 'Top 100 Score'
+            ELSE 'Below Top 100 Score'
+        END as ScorePerformance,
+        COALESCE(pca.Tags, '') as PostTags
+    FROM AdvancedUserAnalysis aua
+    JOIN PostComplexityAnalysis pca ON aua.UserId = pca.OwnerUserId
+    WHERE aua.TotalPosts > 0
+),
+TagAnalysis AS (
+    SELECT 
+        fa.UserId,
+        fa.DisplayName,
+        fa.Reputation,
+        fa.ContributorLevel,
+        fa.ReputationLevel,
+        fa.BadgeStatus,
+        fa.PostId,
+        fa.Title,
+        fa.Score,
+        fa.ViewCount,
+        fa.CommentCount,
+        fa.FavoriteCount,
+        fa.ScorePerformance,
+        fa.ViewPerformance,
+        fa.EngagementLevel,
+        LOWER(fa.PostTags) as CleanTags,
+        CASE 
+            WHEN LOWER(fa.PostTags) LIKE '%sql%' OR LOWER(fa.PostTags) LIKE '%database%' THEN 'Database Related'
+            WHEN LOWER(fa.PostTags) LIKE '%java%' OR LOWER(fa.PostTags) LIKE '%spring%' OR LOWER(fa.PostTags) LIKE '%jvm%' THEN 'Java Related'
+            WHEN LOWER(fa.PostTags) LIKE '%python%' OR LOWER(fa.PostTags) LIKE '%django%' THEN 'Python Related'
+            WHEN LOWER(fa.PostTags) LIKE '%javascript%' OR LOWER(fa.PostTags) LIKE '%node%' OR LOWER(fa.PostTags) LIKE '%react%' THEN 'JavaScript Related'
+            WHEN LOWER(fa.PostTags) LIKE '%c++%' OR LOWER(fa.PostTags) LIKE '%cpp%' OR LOWER(fa.PostTags) LIKE '%cplusplus%' THEN 'C++ Related'
+            ELSE 'Other Technology'
+        END as TechCategory,
+        ROW_NUMBER() OVER (PARTITION BY fa.UserId ORDER BY fa.Score DESC) as UserTopPostRank,
+        RANK() OVER (PARTITION BY fa.UserId, fa.EngagementLevel ORDER BY fa.Score DESC) as UserEngagementRank
+    FROM FinalAnalysis fa
+),
+AggregateResults AS (
+    SELECT 
+        ta.UserId,
+        ta.DisplayName,
+        ta.Reputation,
+        ta.ContributorLevel,
+        ta.ReputationLevel,
+        ta.BadgeStatus,
+        ta.TechCategory,
+        COUNT(*) as TotalPosts,
+        SUM(ta.Score) as TotalScore,
+        AVG(ta.ViewCount) as AvgViewCount,
+        MAX(ta.Score) as MaxScore,
+        MIN(ta.FavoriteCount) as MinFavorites,
+        MAX(ta.CommentCount) as MaxComments,
+        COUNT(CASE WHEN ta.EngagementLevel = 'High Engagement' THEN 1 END) as HighEngagementPosts,
+        COUNT(CASE WHEN ta.ViewPerformance = 'Top 10% Viewership' THEN 1 END) as Top10ViewPosts,
+        STRING_AGG(DISTINCT CAST(ta.PostId AS varchar), ',') as PostIds,
+        STRING_AGG(DISTINCT ta.Title, ' | ') as PostTitles,
+        STRING_AGG(DISTINCT ta.TechCategory, ', ') as TechCategories,
+        CASE 
+            WHEN COUNT(*) > 0 THEN 
+                ROUND(SUM(CASE WHEN ta.Score > 0 THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2)
+            ELSE 0 
+        END as PositiveScorePercentage,
+        CASE 
+            WHEN COUNT(*) > 0 THEN 
+                ROUND(AVG(CASE WHEN ta.ViewCount > 0 THEN ta.ViewCount ELSE 1 END), 2)
+            ELSE 0 
+        END as AvgViewCountPerPost
+    FROM TagAnalysis ta
+    WHERE ta.PostId IS NOT NULL
+    GROUP BY 
+        ta.UserId, ta.DisplayName, ta.Reputation, ta.ContributorLevel, 
+        ta.ReputationLevel, ta.BadgeStatus, ta.TechCategory
+)
+SELECT 
+    ar.UserId,
+    ar.DisplayName,
+    ar.Reputation,
+    ar.ContributorLevel,
+    ar.ReputationLevel,
+    ar.BadgeStatus,
+    ar.TechCategory,
+    ar.TotalPosts,
+    ar.TotalScore,
+    ar.AvgViewCount,
+    ar.MaxScore,
+    ar.MinFavorites,
+    ar.MaxComments,
+    ar.HighEngagementPosts,
+    ar.Top10ViewPosts,
+    CASE 
+        WHEN ar.TotalPosts > 50 THEN 'High Activity'
+        WHEN ar.TotalPosts > 25 THEN 'Medium Activity'
+        WHEN ar.TotalPosts > 0 THEN 'Low Activity'
+        ELSE 'No Activity'
+    END as ActivityLevel,
+    CASE 
+        WHEN ar.AvgViewCount > 1000 THEN 'Popular Contributor'
+        WHEN ar.AvgViewCount > 500 THEN 'Moderate Contributor'
+        WHEN ar.AvgViewCount > 100 THEN 'Average Contributor'
+        ELSE 'Low Visibility Contributor'
+    END as VisibilityLevel,
+    CASE 
+        WHEN ar.PositiveScorePercentage > 80 THEN 'Very Positive'
+        WHEN ar.PositiveScorePercentage > 60 THEN 'Positive'
+        WHEN ar.PositiveScorePercentage > 40 THEN 'Neutral'
+        ELSE 'Negative'
+    END as ScoreTrend,
+    CASE 
+        WHEN ar.AvgViewCountPerPost > 1000 THEN 'High Interest'
+        WHEN ar.AvgViewCountPerPost > 500 THEN 'Moderate Interest'
+        WHEN ar.AvgViewCountPerPost > 100 THEN 'Low Interest'
+        ELSE 'Minimal Interest'
+    END as InterestLevel,
+    (COALESCE(ar.PostIds, '') || '|' || COALESCE(ar.PostTitles, '') || '|' || COALESCE(ar.TechCategories, '')) as CombinedData,
+    ROW_NUMBER() OVER (ORDER BY ar.TotalScore DESC, ar.TotalPosts DESC) as OverallRank,
+    DENSE_RANK() OVER (ORDER BY ar.Reputation DESC) as ReputationRank,
+    NTH_VALUE(ar.DisplayName, 1) OVER (ORDER BY ar.TotalScore DESC) as TopScorer,
+    LAG(ar.DisplayName) OVER (ORDER BY ar.TotalScore DESC) as PreviousTopScorer,
+    CASE 
+        WHEN ar.TotalPosts > 0 AND ar.MaxScore > 0 THEN 
+            ROUND((ar.MaxScore * 100.0) / (SELECT MAX(TotalScore) FROM AggregateResults), 2)
+        ELSE 0 
+    END as MaxScorePercentage,
+    COALESCE(ar.AvgViewCountPerPost, 0) as CleanAvgViewCount,
+    CASE 
+        WHEN ar.TotalPosts > 0 AND ar.TotalScore > 0 THEN 
+            ROUND(ar.TotalScore * 1.0 / ar.TotalPosts, 2)
+        ELSE 0 
+    END as AvgScorePerPost,
+    CASE 
+        WHEN ar.TotalPosts > 0 AND ar.TotalComments > 0 THEN 
+            ROUND(ar.TotalComments * 1.0 / ar.TotalPosts, 2)
+        ELSE 0 
+    END as AvgCommentsPerPost,
+    CASE 
+        WHEN ar.TotalPosts > 0 AND ar.TotalBadges > 0 THEN 
+            ROUND(ar.TotalBadges * 1.0 / ar.TotalPosts, 2)
+        ELSE 0 
+    END as AvgBadgesPerPost,
+    EXISTS(SELECT 1 FROM Users u WHERE u.Id = ar.UserId AND u.Views > 10000) as HasHighViews,
+    EXISTS(SELECT 1 FROM Badges b WHERE b.UserId = ar.UserId AND b.Class = 1) as HasGoldBadge,
+    EXISTS(SELECT 1 FROM Posts p WHERE p.OwnerUserId = ar.UserId AND p.PostTypeId = 1) as HasQuestions,
+    EXISTS(SELECT 1 FROM Posts p WHERE p.OwnerUserId = ar.UserId AND p.PostTypeId = 2) as HasAnswers,
+    NULLIF(SUBSTRING(ar.PostTitles FROM 1 FOR 255), '') as First255CharsOfTitles,
+    CASE 
+        WHEN ar.TotalPosts > 50 THEN 
+            (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = ar.UserId AND p.CreationDate >= '2020-01-01')
+        ELSE 0
+    END as RecentPostsCount,
+    CASE 
+        WHEN ar.TechCategories LIKE '%Database%' THEN 'Database Expert'
+        WHEN ar.TechCategories LIKE '%Java%' THEN 'Java Expert'
+        WHEN ar.TechCategories LIKE '%Python%' THEN 'Python Expert'
+        WHEN ar.TechCategories LIKE '%JavaScript%' THEN 'JavaScript Expert'
+        WHEN ar.TechCategories LIKE '%C++%' THEN 'C++ Expert'
+        ELSE 'Generalist'
+    END as ExpertiseArea
+FROM AggregateResults ar
+WHERE ar.TotalPosts > 0
+    AND (ar.TotalScore > 100 OR ar.TotalPosts > 5 OR ar.AvgViewCount > 100)
+    AND ar.DisplayName IS NOT NULL
+ORDER BY ar.TotalScore DESC, ar.TotalPosts DESC, ar.Reputation DESC
+LIMIT 1000;

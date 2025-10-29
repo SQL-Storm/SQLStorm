@@ -1,0 +1,111 @@
+WITH UserStats AS (
+    SELECT u.Id,
+           u.DisplayName,
+           COALESCE(u.Reputation, 0) AS Rep,
+           (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id) AS PostCnt,
+           (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldCnt,
+           (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverCnt,
+           (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeCnt,
+           (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 2) AS UpVotesGiven,
+           (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 3) AS DownVotesGiven
+    FROM Users u
+),
+PostMetrics AS (
+    SELECT p.OwnerUserId AS UserId,
+           SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS QScore,
+           SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS AScore,
+           COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QCount,
+           COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS ACount,
+           MAX(p.CreationDate) AS LastPostDate
+    FROM Posts p
+    GROUP BY p.OwnerUserId
+),
+TagInfo AS (
+    SELECT t.TagName,
+           t.Count AS TagUse,
+           COALESCE(e.Title, '') AS ExcerptTitle,
+           COALESCE(w.Title, '') AS WikiTitle
+    FROM Tags t
+    LEFT JOIN Posts e ON t.ExcerptPostId = e.Id
+    LEFT JOIN Posts w ON t.WikiPostId = w.Id
+    WHERE t.TagName IS NOT NULL
+),
+Combined AS (
+    SELECT u.Id,
+           u.DisplayName,
+           us.Rep,
+           us.PostCnt,
+           us.GoldCnt,
+           us.SilverCnt,
+           us.BronzeCnt,
+           pm.QScore,
+           pm.AScore,
+           pm.QCount,
+           pm.ACount,
+           pm.LastPostDate,
+           ROW_NUMBER() OVER (PARTITION BY us.Rep ORDER BY us.PostCnt DESC) AS RepRank,
+           RANK() OVER (ORDER BY us.GoldCnt DESC, us.SilverCnt DESC, us.BronzeCnt DESC) AS BadgeRank,
+           (
+             SELECT STRING_AGG(DISTINCT tg.TagName, ',')
+             FROM Posts q
+             CROSS JOIN LATERAL (
+                 SELECT TRIM(splitvals.value) AS tag
+                 FROM (
+                     SELECT regexp_replace(value, '^<|>$', '') AS value
+                     FROM UNNEST(string_to_array(TRIM(BOTH '<>' FROM q.Tags), '><')) AS t(value)
+                 ) AS splitvals
+             ) AS tg_raw
+             JOIN Tags tg ON tg.TagName = tg_raw.tag
+             WHERE q.OwnerUserId = u.Id AND q.PostTypeId = 1
+             LIMIT 5
+           ) AS TopTags
+    FROM Users u
+    LEFT JOIN UserStats us ON us.Id = u.Id
+    LEFT JOIN PostMetrics pm ON pm.UserId = u.Id
+    WHERE u.Reputation IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, us.Rep, us.PostCnt, us.GoldCnt, us.SilverCnt, us.BronzeCnt, pm.QScore, pm.AScore, pm.QCount, pm.ACount, pm.LastPostDate
+)
+SELECT c.Id,
+       c.DisplayName,
+       c.Rep,
+       c.PostCnt,
+       c.GoldCnt,
+       c.SilverCnt,
+       c.BronzeCnt,
+       c.QScore,
+       c.AScore,
+       c.QCount,
+       c.ACount,
+       COALESCE(c.LastPostDate, TIMESTAMP '1970-01-01') AS LastPostDate,
+       c.RepRank,
+       c.BadgeRank,
+       CASE
+           WHEN c.Rep > 100000 THEN 'Legendary'
+           WHEN c.Rep > 20000 THEN 'Expert'
+           WHEN c.Rep > 5000 THEN 'Contributor'
+           ELSE 'Newbie'
+       END AS RepTier,
+       c.TopTags
+FROM Combined c
+WHERE c.BadgeRank <= 100
+UNION ALL
+SELECT NULL AS Id,
+       '--- Summary ---' AS DisplayName,
+       NULL AS Rep,
+       NULL AS PostCnt,
+       NULL AS GoldCnt,
+       NULL AS SilverCnt,
+       NULL AS BronzeCnt,
+       SUM(c.QScore) AS QScore,
+       SUM(c.AScore) AS AScore,
+       SUM(c.QCount) AS QCount,
+       SUM(c.ACount) AS ACount,
+       NULL AS LastPostDate,
+       NULL AS RepRank,
+       NULL AS BadgeRank,
+       NULL AS RepTier,
+       NULL AS TopTags
+FROM Combined c
+GROUP BY NULL
+HAVING COUNT(*) > 0
+ORDER BY RepRank NULLS LAST, BadgeRank NULLS FIRST;

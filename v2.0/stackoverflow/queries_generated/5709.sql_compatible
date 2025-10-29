@@ -1,0 +1,106 @@
+WITH
+RecentTopPosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    u.DisplayName AS OwnerName,
+    COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVotes,
+    COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVotes
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  WHERE p.PostTypeId = 1 -- Questions
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '90' DAY
+  GROUP BY p.Id, p.Title, p.Tags, p.CreationDate, p.Score, p.ViewCount, p.OwnerUserId, u.DisplayName
+),
+TagCloud AS (
+  SELECT
+    t.TagName,
+    SUM(t.Count) AS TotalCount
+  FROM Tags t
+  GROUP BY t.TagName
+),
+ComplexFilters AS (
+  SELECT
+    pt.Id AS PostId,
+    pt.Title,
+    pt.Tags,
+    pt.CreationDate,
+    pt.Score,
+    pt.ViewCount,
+    pt.OwnerUserId,
+    br.Name AS CloseReason,
+    v2.VoteCount,
+    ROW_NUMBER() OVER (PARTITION BY pt.OwnerUserId ORDER BY pt.CreationDate DESC) AS rn_owner
+  FROM Posts pt
+  LEFT JOIN PostHistory ph ON ph.PostId = pt.Id
+  LEFT JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS VoteCount
+    FROM Votes
+    WHERE VoteTypeId IN (2, 3)
+    GROUP BY PostId
+  ) v2 ON v2.PostId = pt.Id
+  LEFT JOIN CloseReasonTypes br ON CAST(ph.Comment AS VARCHAR) LIKE '%' || CAST(br.Id AS VARCHAR) || '%'
+  WHERE pt.PostTypeId = 1
+    AND pt.LastActivityDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '60' DAY
+),
+Joined AS (
+  SELECT
+    r.PostId,
+    r.Title,
+    r.Tags,
+    r.CreationDate,
+    r.Score,
+    r.ViewCount,
+    r.OwnerUserId,
+    r.OwnerName,
+    tc.TotalCount AS TagTotal,
+    cf.CloseReason,
+    cf.VoteCount,
+    cf.rn_owner
+  FROM RecentTopPosts r
+  LEFT JOIN TagCloud tc ON true
+  LEFT JOIN ComplexFilters cf ON cf.PostId = r.PostId
+),
+Final AS (
+  SELECT
+    j.PostId,
+    j.Title,
+    j.Tags,
+    j.CreationDate,
+    j.Score,
+    j.ViewCount,
+    j.OwnerUserId,
+    j.OwnerName,
+    j.TagTotal,
+    j.CloseReason,
+    j.VoteCount,
+    COALESCE(j.VoteCount, 0) AS EngagementScore,
+    DENSE_RANK() OVER (ORDER BY j.Score DESC, j.ViewCount DESC, j.CreationDate DESC) AS RankScore
+  FROM Joined j
+  WHERE (j.Score > 0 OR j.ViewCount > 100)
+    AND (j.TagTotal IS NULL OR j.TagTotal > 1000)
+)
+SELECT
+  PostId,
+  Title,
+  Tags,
+  CreationDate,
+  Score,
+  ViewCount,
+  OwnerUserId,
+  OwnerName,
+  TagTotal,
+  CloseReason,
+  VoteCount,
+  EngagementScore,
+  RankScore
+FROM Final
+ORDER BY RankScore, CreationDate DESC
+LIMIT 100;

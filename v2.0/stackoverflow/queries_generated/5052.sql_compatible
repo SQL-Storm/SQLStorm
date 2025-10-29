@@ -1,0 +1,111 @@
+WITH quick_stats AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.OwnerDisplayName,
+    p.AcceptedAnswerId,
+    p.ParentId,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ContentLicense,
+    COALESCE(u.Reputation, 0) AS OwnerReputation,
+    COALESCE(vs.UpModCount, 0) AS UpModCount
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS UpModCount
+    FROM Votes
+    WHERE VoteTypeId = 2
+    GROUP BY PostId
+  ) vs ON p.Id = vs.PostId
+),
+correlated_comments AS (
+  SELECT
+    ps.Id AS PostId,
+    COUNT(c.Id) AS CommentCount,
+    AVG(CASE WHEN c.UserId IS NULL THEN 0 ELSE 1 END) * 1.0 AS HasCommentersRatio
+  FROM Posts ps
+  LEFT JOIN Comments c ON c.PostId = ps.Id
+  GROUP BY ps.Id
+),
+tag_scope AS (
+  SELECT
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId,
+    t.WikiPostId,
+    CASE
+      WHEN t.IsModeratorOnly = 1 THEN 'ModeratorOnly'
+      WHEN t.IsRequired = 1 THEN 'Required'
+      ELSE 'Open'
+    END AS TagState
+  FROM Tags t
+),
+ranked AS (
+  SELECT
+    qs.PostId,
+    qs.PostTypeId,
+    qs.Title,
+    qs.Tags,
+    qs.CreationDate,
+    qs.LastActivityDate,
+    qs.Score,
+    qs.ViewCount,
+    qs.OwnerUserId,
+    qs.OwnerDisplayName,
+    qs.AcceptedAnswerId,
+    qs.ParentId,
+    qs.CommentCount,
+    qs.FavoriteCount,
+    qs.ContentLicense,
+    qs.OwnerReputation,
+    qs.UpModCount,
+    cc.CommentCount AS DbCommentCount,
+    cc.HasCommentersRatio,
+    ROW_NUMBER() OVER (
+      PARTITION BY qs.PostTypeId
+      ORDER BY qs.Score DESC NULLS LAST,
+               qs.ViewCount DESC NULLS LAST,
+               qs.CreationDate ASC
+    ) AS rnk
+  FROM quick_stats qs
+  LEFT JOIN correlated_comments cc ON qs.PostId = cc.PostId
+)
+SELECT
+  r.PostId,
+  r.PostTypeId,
+  (SELECT Name FROM PostTypes WHERE Id = r.PostTypeId) AS PostTypeName,
+  r.Title,
+  r.Tags,
+  r.CreationDate,
+  r.LastActivityDate,
+  r.Score,
+  r.ViewCount,
+  r.OwnerUserId,
+  r.OwnerDisplayName,
+  r.AcceptedAnswerId,
+  r.ParentId,
+  r.CommentCount,
+  r.FavoriteCount,
+  r.ContentLicense,
+  r.OwnerReputation,
+  r.UpModCount,
+  r.DbCommentCount,
+  r.HasCommentersRatio
+FROM ranked r
+LEFT JOIN (
+  SELECT 1 AS dummy
+) AS d
+  ON r.rnk <= 100
+WHERE
+  r.PostTypeId IN (1, 2)
+  AND r.LastActivityDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180 days'
+ORDER BY r.rnk
+LIMIT 200;

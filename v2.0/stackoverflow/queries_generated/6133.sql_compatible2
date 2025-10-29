@@ -1,0 +1,44 @@
+SELECT 
+    u.DisplayName,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 1 THEN p.Id END) AS TotalTitleEdits,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 2 THEN p.Id END) AS TotalBodyEdits,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 10 THEN p.Id END) AS TotalCloseVotes,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 11 THEN p.Id END) AS TotalReopenVotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN p.Id END) AS TotalUpVotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN p.Id END) AS TotalDownVotes,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS TotalQuestionScore,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS TotalAnswerScore,
+    MAX(u.Reputation) AS MaxReputation,
+    MIN(u.CreationDate) AS EarliestAccountCreation,
+    AVG(EXTRACT(EPOCH FROM (u.LastAccessDate - u.CreationDate)) / 86400) AS AvgDaysBetweenAccesses,
+    STRING_AGG(DISTINCT t.TagName, ', ' ORDER BY t.TagName DESC) AS MostFrequentTags
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    PostLinks pl ON p.Id = pl.PostId
+LEFT JOIN 
+    LinkTypes lt ON pl.LinkTypeId = lt.Id
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+LEFT JOIN LATERAL (
+    SELECT trim(both '<>' FROM unnest(string_to_array(p.Tags, '><')))::text AS TagId
+) tag_ids ON p.Tags IS NOT NULL
+LEFT JOIN Tags t ON t.Id::text = tag_ids.TagId
+WHERE 
+    p.PostTypeId IN (1, 2)
+    AND u.Reputation > 100
+    AND u.Id NOT IN (SELECT Id FROM Users WHERE EmailHash IS NULL)
+GROUP BY 
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate
+ORDER BY 
+    TotalPosts DESC, 
+    TotalUpVotes DESC
+LIMIT 100;

@@ -1,0 +1,149 @@
+-- {"query": "2884.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1313} 
+with UserBadges as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(*) filter (where b.Class = 1) as GoldBadges,
+        count(*) filter (where b.Class = 2) as SilverBadges,
+        count(*) filter (where b.Class = 3) as BronzeBadges,
+        sum(case when b.TagBased = 1 then 1 else 0 end) as TagBasedBadges
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostScores as (
+    select 
+        p.Id as PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        COALESCE(p.Tags, '') as Tags,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc nulls last) as UserPostRank,
+        lead(p.CreationDate) over (partition by p.OwnerUserId order by p.CreationDate) as NextPostDate
+    from Posts p
+    where p.PostTypeId in (1, 2) -- questions and answers
+),
+PostLinksSummary as (
+    select
+        pl.PostId,
+        count(distinct case when pl.LinkTypeId = 1 then pl.RelatedPostId end) as LinkedPostsCount,
+        count(distinct case when pl.LinkTypeId = 3 then pl.RelatedPostId end) as DuplicatePostsCount
+    from PostLinks pl
+    group by pl.PostId
+),
+TopTagPosts as (
+    select
+        p.Id,
+        unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) as Tag
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+),
+TagUserActivity as (
+    select 
+        t.Tag,
+        p.OwnerUserId,
+        count(*) as QuestionsCount,
+        sum(p.Score) as TotalScore,
+        max(p.CreationDate) as LastAsked,
+        min(p.CreationDate) as FirstAsked
+    from TopTagPosts t
+    join Posts p on p.Id = t.Id
+    group by t.Tag, p.OwnerUserId
+),
+QuestionsWithCloseInfo as (
+    select
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.OwnerUserId,
+        ph.PostHistoryTypeId,
+        crt.Name as CloseReasonName,
+        ph.CreationDate as CloseDate
+    from Posts p
+    left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 10
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    where p.PostTypeId = 1
+),
+UserQuestionStats as (
+    select
+        u.Id as UserId,
+        count(distinct q.Id) as QuestionCount,
+        count(distinct case when q.CloseDate is not null then q.Id end) as ClosedQuestionCount,
+        count(distinct case when q.CloseDate is null then q.Id end) as OpenQuestionCount,
+        max(q.CreationDate) as LastQuestionDate,
+        coalesce(avg(q.Score), 0) as AverageQuestionScore
+    from Users u
+    left join QuestionsWithCloseInfo q on q.OwnerUserId = u.Id
+    group by u.Id
+),
+AnswerStats as (
+    select
+        p.ParentId as QuestionId,
+        count(*) as AnswerCount,
+        avg(p.Score) as AverageAnswerScore,
+        sum(case when v.VoteTypeId = 1 then 1 else 0 end) as AcceptedCount
+    from Posts p
+    left join Votes v on v.PostId = p.Id and v.VoteTypeId = 1
+    where p.PostTypeId = 2
+    group by p.ParentId
+)
+select
+    u.DisplayName,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ub.TagBasedBadges,
+    u.Reputation,
+    u.CreationDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.ProfileImageUrl,
+    u.WebsiteUrl,
+    u.EmailHash,
+    us.QuestionCount,
+    us.ClosedQuestionCount,
+    us.OpenQuestionCount,
+    us.AverageQuestionScore,
+    asks.Tag,
+    asks.QuestionsCount,
+    asks.TotalScore,
+    asks.LastAsked,
+    asks.FirstAsked,
+    ps.UserPostRank,
+    ps.Score as RecentPostScore,
+    pl.LinkedPostsCount,
+    pl.DuplicatePostsCount,
+    ans.AnswerCount,
+    ans.AverageAnswerScore,
+    ans.AcceptedCount,
+    case 
+        when us.LastQuestionDate > u.LastAccessDate then 'ActiveAfterLastAccess'
+        when us.LastQuestionDate is null then 'NoQuestions'
+        else 'Inactive'
+    end as UserActivityStatus,
+    coalesce(substring(ps.Title from 1 for 50) || '...', 'No Title') as ShortTitle,
+    case 
+        when ps.Tags like '%sql%' then 'SQL Lover'
+        when ps.Tags like '%java%' then 'Java Fan'
+        else 'Other'
+    end as PreferredTagCategory
+from Users u
+left join UserBadges ub on ub.UserId = u.Id
+left join UserQuestionStats us on us.UserId = u.Id
+left join TagUserActivity asks on asks.OwnerUserId = u.Id
+left join PostScores ps on ps.OwnerUserId = u.Id and ps.UserPostRank = 1
+left join PostLinksSummary pl on pl.PostId = ps.PostId
+left join AnswerStats ans on ans.QuestionId = ps.PostId
+where u.Reputation > 1000
+  and (ub.GoldBadges > 0 or ub.SilverBadges > 5)
+  and exists (
+    select 1 from Posts p2 
+    where p2.OwnerUserId = u.Id and p2.CreationDate > now() - interval '30 days'
+  )
+order by u.Reputation desc, asks.TotalScore desc, ub.GoldBadges desc
+limit 100;

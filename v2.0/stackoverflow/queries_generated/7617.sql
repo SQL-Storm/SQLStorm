@@ -1,0 +1,162 @@
+-- {"query": "7617.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1672} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY u.Reputation DESC) as ReputationRank,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Elite'
+            WHEN u.Reputation >= 5000 THEN 'Veteran'
+            WHEN u.Reputation >= 1000 THEN 'Expert'
+            ELSE 'Beginner'
+        END as ReputationTier,
+        DATEDIFF(CURRENT_TIMESTAMP, u.CreationDate) as AccountAgeDays
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate
+),
+PostAggregations AS (
+    SELECT 
+        p.Id as PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.ParentId,
+        p.AcceptedAnswerId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as PostType,
+        COALESCE(p.Title, 'No Title') as CleanTitle,
+        CASE WHEN p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2 THEN ARRAY_LENGTH(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><'), 1) ELSE 0 END as TagCount,
+        COALESCE(p.ViewCount, 0) + COALESCE(p.AnswerCount, 0) + COALESCE(p.CommentCount, 0) as ActivityScore,
+        CASE 
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 1
+            ELSE 0
+        END as HasAcceptedAnswer,
+        DATEDIFF(CURRENT_TIMESTAMP, p.CreationDate) as AgeInDays
+    FROM Posts p
+    WHERE p.Id IS NOT NULL
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagFrequency,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count >= 500 THEN 'Trending'
+            WHEN t.Count >= 100 THEN 'Popular'
+            WHEN t.Count >= 10 THEN 'Moderate'
+            ELSE 'Niche'
+        END as TagPopularity,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as PopularityRank
+    FROM Tags t
+    WHERE t.TagName IS NOT NULL
+),
+ComplexUserPerformance AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.ReputationTier,
+        uas.AccountAgeDays,
+        uas.PostCount,
+        uas.CommentCount,
+        uas.BadgeCount,
+        (uas.PostCount * 10) + (uas.CommentCount * 5) + (uas.BadgeCount * 20) as UserPerformanceScore,
+        CASE 
+            WHEN uas.PostCount > 100 THEN 'Highly Active'
+            WHEN uas.PostCount > 50 THEN 'Active'
+            WHEN uas.PostCount > 10 THEN 'Moderate'
+            ELSE 'Low Activity'
+        END as ActivityLevel,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.CreationDate > DATEADD('year', -1, CURRENT_TIMESTAMP)) as RecentPosts,
+        (SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.PostTypeId = 1) as AverageQuestionScore,
+        (SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.PostTypeId = 2) as AverageAnswerScore
+    FROM UserActivityStats uas
+    WHERE uas.Reputation > 0
+)
+SELECT 
+    cup.UserId,
+    cup.DisplayName,
+    cup.Reputation,
+    cup.ReputationTier,
+    cup.AccountAgeDays,
+    cup.PostCount,
+    cup.CommentCount,
+    cup.BadgeCount,
+    cup.UserPerformanceScore,
+    cup.ActivityLevel,
+    cup.RecentPosts,
+    cup.AverageQuestionScore,
+    cup.AverageAnswerScore,
+    COALESCE(pa.PostId, 0) as AssociatedPostId,
+    pa.PostType,
+    pa.Score as PostScore,
+    pa.ViewCount,
+    pa.AnswerCount,
+    pa.CommentCount,
+    pa.FavoriteCount,
+    pa.AgeInDays,
+    pa.CleanTitle,
+    pa.TagCount,
+    pa.ActivityScore,
+    pa.HasAcceptedAnswer,
+    COALESCE(ta.TagName, 'No Tag') as AssociatedTag,
+    ta.TagFrequency,
+    ta.TagPopularity,
+    CASE 
+        WHEN cup.UserPerformanceScore > 500 THEN 'Elite Performer'
+        WHEN cup.UserPerformanceScore > 300 THEN 'High Performer'
+        WHEN cup.UserPerformanceScore > 100 THEN 'Moderate Performer'
+        ELSE 'Basic Performer'
+    END as PerformanceCategory,
+    CASE 
+        WHEN cup.AverageQuestionScore > 10 THEN 'High Quality Questions'
+        WHEN cup.AverageQuestionScore > 5 THEN 'Moderate Quality Questions'
+        ELSE 'Low Quality Questions'
+    END as QuestionQuality,
+    CASE 
+        WHEN cup.AverageAnswerScore > 15 THEN 'High Quality Answers'
+        WHEN cup.AverageAnswerScore > 8 THEN 'Moderate Quality Answers'
+        ELSE 'Low Quality Answers'
+    END as AnswerQuality,
+    (cup.Reputation + cup.UserPerformanceScore + (cup.PostCount * 100) + (cup.CommentCount * 50)) as CompositeUserScore,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = cup.UserId AND p.PostTypeId = 1 AND p.Score > 0) as PositiveQuestionCount,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = cup.UserId AND p.PostTypeId = 2 AND p.Score > 0) as PositiveAnswerCount,
+    (SELECT COUNT(DISTINCT ph.PostId) FROM PostHistory ph WHERE ph.UserId = cup.UserId AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)) as EditCount,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = cup.UserId AND p.ParentId IS NULL AND p.PostTypeId = 1) as OriginalQuestionCount
+FROM ComplexUserPerformance cup
+LEFT JOIN PostAggregations pa ON (cup.UserId = pa.OwnerUserId OR (pa.ParentId IN (SELECT Id FROM Posts WHERE OwnerUserId = cup.UserId) AND pa.PostTypeId = 2))
+LEFT JOIN TagAnalysis ta ON (ta.TagName IN (
+    SELECT TRIM(tag) FROM (
+        SELECT UNNEST(string_to_array(SUBSTRING(pa.Tags, 2, LENGTH(pa.Tags)-2), '><')) AS tag
+    ) tags
+    WHERE tag IS NOT NULL AND LENGTH(tag) > 0
+))
+WHERE cup.Reputation > 0 
+    AND cup.PostCount > 0 
+    AND (pa.PostId IS NOT NULL OR cup.UserId IN (SELECT DISTINCT OwnerUserId FROM Posts WHERE OwnerUserId IS NOT NULL))
+ORDER BY cup.UserPerformanceScore DESC, cup.Reputation DESC
+LIMIT 5000;

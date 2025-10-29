@@ -1,0 +1,152 @@
+-- {"query": "2816.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1791} 
+with RecursivePosts as (
+    select p.Id, p.PostTypeId, p.ParentId, p.Score, p.ViewCount, p.OwnerUserId, p.CreationDate,
+        coalesce(p.Title, '') as Title, 
+        coalesce(p.Tags, '') as Tags,
+        1 as Depth
+    from Posts p
+    where p.PostTypeId = 1 -- questions only
+    union all
+    select p.Id, p.PostTypeId, p.ParentId, p.Score, p.ViewCount, p.OwnerUserId, p.CreationDate,
+        coalesce(p.Title, '') as Title,
+        coalesce(p.Tags, '') as Tags,
+        rp.Depth + 1
+    from Posts p
+    join RecursivePosts rp on p.ParentId = rp.Id
+    where p.PostTypeId = 2 -- answers and further
+),
+UserActivity as (
+    select u.Id as UserId, u.DisplayName,
+    count(distinct p.Id) as TotalPosts,
+    sum(case when p.PostTypeId = 1 then 1 else 0 end) as QuestionsAsked,
+    sum(case when p.PostTypeId = 2 then 1 else 0 end) as AnswersGiven,
+    count(distinct b.Id) as BadgeCount,
+    sum(b.Class) as BadgeClassSum,
+    max(p.CreationDate) as LastPostDate,
+    avg(p.Score) filter (where p.Score is not null) as AvgPostScore
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+LatestEdits as (
+    select ph.PostId,
+    ph.Id as EditId,
+    ph.PostHistoryTypeId,
+    ph.UserId,
+    u.DisplayName,
+    ph.CreationDate,
+    ph.Comment,
+    row_number() over (partition by ph.PostId order by ph.CreationDate desc) as rn
+    from PostHistory ph
+    left join Users u on u.Id = ph.UserId
+    where ph.PostHistoryTypeId in (4,5,6) -- title, body, tags edits
+),
+PostsWithLatestEdit as (
+    select p.Id, p.PostTypeId, p.ParentId, p.Score, p.ViewCount, p.OwnerUserId, p.CreationDate,
+        p.Title, p.Tags,
+        le.EditId, le.PostHistoryTypeId, le.UserId as EditorUserId, le.DisplayName as EditorDisplayName, le.CreationDate as EditDate, le.Comment
+    from Posts p
+    left join LatestEdits le on le.PostId = p.Id and le.rn = 1
+),
+TagSplit as (
+    select p.Id as PostId,
+    trim(tag) as TagName
+    from Posts p, unnest(string_to_array(
+        replace(replace(p.Tags,'><','|'),'<',''), '|'
+    )) as tag
+    where p.PostTypeId = 1 and p.Tags is not null and p.Tags <> ''
+),
+TagCounts as (
+    select TagName, count(*) as QuestionCount, avg(p.Score) as AvgScore
+    from TagSplit ts
+    join Posts p on p.Id = ts.PostId
+    group by TagName
+),
+UserTopTags as (
+    select ua.UserId, ts.TagName, count(*) as PostsWithTag
+    from UserActivity ua
+    join Posts p on p.OwnerUserId = ua.UserId and p.PostTypeId = 1
+    join TagSplit ts on ts.PostId = p.Id
+    group by ua.UserId, ts.TagName
+),
+UserTagRanks as (
+    select UserId, TagName, PostsWithTag,
+    rank() over (partition by UserId order by PostsWithTag desc) as TagRank
+    from UserTopTags
+),
+FilteredUserTopTags as (
+    select UserId, TagName, PostsWithTag from UserTagRanks where TagRank <= 3
+),
+ComplexUserMetrics as (
+    select
+    ua.UserId,
+    ua.DisplayName,
+    ua.TotalPosts,
+    ua.BadgeCount,
+    ua.BadgeClassSum,
+    count(distinct p.Id) filter (where p.Score > 10) as PopularPosts,
+    coalesce((select count(*) from Votes v where v.UserId = ua.UserId and v.VoteTypeId = 2),0) as UpVotesCast,
+    coalesce((select count(*) from Votes v where v.UserId = ua.UserId and v.VoteTypeId = 3),0) as DownVotesCast,
+    greatest(0, ua.AvgPostScore) as NormalizedAvgScore,
+    count(distinct pl.RelatedPostId) filter (where pl.LinkTypeId = 3) as DuplicateLinksMade,
+    string_agg(distinct f.TagName, ', ') as TopTags
+    from UserActivity ua
+    left join Posts p on p.OwnerUserId = ua.UserId
+    left join PostLinks pl on pl.PostId = p.Id
+    left join FilteredUserTopTags f on f.UserId = ua.UserId
+    group by ua.UserId, ua.DisplayName, ua.TotalPosts, ua.BadgeCount, ua.BadgeClassSum, ua.AvgPostScore
+),
+QuestionAnswerPairs as (
+    select q.Id as QuestionId, q.Title, q.CreationDate as QuestionCreation,
+    a.Id as AnswerId, a.CreationDate as AnswerCreation,
+    a.Score as AnswerScore,
+    row_number() over (partition by q.Id order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+),
+FilteredAnswerRanks as (
+    select *
+    from QuestionAnswerPairs
+    where AnswerRank <= 2 -- top 2 answers per question
+),
+CorrelationStats as (
+    select
+        q.Title,
+        q.QuestionCreation,
+        a.AnswerId,
+        a.AnswerCreation,
+        a.AnswerScore,
+        EXTRACT(EPOCH FROM (a.AnswerCreation - q.QuestionCreation))/3600.0 as HoursToAnswer,
+        row_number() over (order by a.AnswerScore desc) as GlobalAnswerRank
+    from QuestionAnswerPairs a
+    join Posts q on q.Id = a.QuestionId
+    where a.AnswerScore is not null
+)
+select 
+  cu.UserId,
+  cu.DisplayName,
+  cu.TotalPosts,
+  cu.BadgeCount,
+  cu.BadgeClassSum,
+  cu.PopularPosts,
+  cu.UpVotesCast,
+  cu.DownVotesCast,
+  cu.NormalizedAvgScore,
+  coalesce(cu.DuplicateLinksMade,0) as DuplicateLinksMade,
+  coalesce(cu.TopTags,'None') as TopTags,
+  min(case when ph.PostHistoryTypeId = 10 then cr.Name else null end) as FirstCloseReason, -- post closed reason if any
+  count(distinct ph.Id) filter (where ph.PostHistoryTypeId = 10) as CloseVotesMade,
+  (select sum(v.BountyAmount) from Votes v where v.UserId = cu.UserId and v.VoteTypeId in (8,9)) as TotalBountyGiven,
+  avg(c.HoursToAnswer) filter (where c.AnswerScore >= 10) as AvgHoursToGoodAnswer,
+  string_agg(distinct tc.TagName, ', ') filter (where tc.AvgScore > 5) as HighScoreTags
+from ComplexUserMetrics cu
+left join PostHistory ph on ph.UserId = cu.UserId
+left join CloseReasonTypes cr on cr.Id = ph.Comment::int -- assuming comment is close reason id for PostHistoryTypeId=10
+left join CorrelationStats c on c.AnswerId = ph.PostId
+left join TagCounts tc on tc.TagName = any(string_to_array(coalesce(cu.TopTags,''), ', '))
+group by cu.UserId, cu.DisplayName, cu.TotalPosts, cu.BadgeCount, cu.BadgeClassSum, cu.PopularPosts, cu.UpVotesCast, cu.DownVotesCast, cu.NormalizedAvgScore, cu.DuplicateLinksMade, cu.TopTags
+having count(distinct ph.Id) filter (where ph.PostHistoryTypeId = 10) > 0 or cu.BadgeCount > 5
+order by PopularPosts desc nulls last, BadgeCount desc nulls last
+limit 50;

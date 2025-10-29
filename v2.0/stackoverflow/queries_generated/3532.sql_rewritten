@@ -1,0 +1,193 @@
+-- {"query": "3532.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2015} 
+WITH
+/* ----------------------------------------------------------------------
+   1.  USER‑LEVEL AGGREGATES (reputation, badge counts, vote totals, etc.)
+   ---------------------------------------------------------------------- */
+user_agg AS (
+    SELECT
+        u.Id                                   AS user_id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.Views,0)                    AS total_views,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS question_cnt,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS answer_cnt,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 1)        AS avg_question_score,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 2)        AS avg_answer_score,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END)  AS upvote_cnt,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END)  AS downvote_cnt,
+        COUNT(*) FILTER (WHERE b.Class = 1)                AS gold_badge_cnt,
+        COUNT(*) FILTER (WHERE b.Class = 2)                AS silver_badge_cnt,
+        COUNT(*) FILTER (WHERE b.Class = 3)                AS bronze_badge_cnt,
+        MAX(p.CreationDate)                               AS last_post_date
+    FROM Users u
+    LEFT JOIN Posts p   ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v   ON v.PostId = p.Id
+    LEFT JOIN Badges b  ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views
+),
+
+/* ----------------------------------------------------------------------
+   2.  RECENT ACTIVITY WINDOW (last 30 days) – using a correlated sub‑query
+   ---------------------------------------------------------------------- */
+recent_activity AS (
+    SELECT
+        ua.user_id,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.question_cnt,
+        ua.answer_cnt,
+        ua.gold_badge_cnt,
+        ua.silver_badge_cnt,
+        ua.bronze_badge_cnt,
+        ua.upvote_cnt,
+        ua.downvote_cnt,
+        ua.last_post_date,
+        /* Composite score mixes reputation, post counts and badges */
+        (
+            0.5 * ua.Reputation
+          + 10  * ua.question_cnt
+          + 20  * ua.answer_cnt
+          + 50  * ua.gold_badge_cnt
+          + 30  * ua.silver_badge_cnt
+          + 10  * ua.bronze_badge_cnt
+          + 0.2 * ua.upvote_cnt
+          - 0.5 * ua.downvote_cnt
+        )                                            AS comp_score,
+        ROW_NUMBER() OVER (ORDER BY 
+            ( 
+                0.5 * ua.Reputation
+              + 10  * ua.question_cnt
+              + 20  * ua.answer_cnt
+              + 50  * ua.gold_badge_cnt
+              + 30  * ua.silver_badge_cnt
+              + 10  * ua.bronze_badge_cnt
+              + 0.2 * ua.upvote_cnt
+              - 0.5 * ua.downvote_cnt
+            ) DESC
+        )                                            AS rank_overall,
+        /* Determine if the user was active (posted/ voted) in the last 30 days */
+        CASE 
+            WHEN EXISTS (
+                SELECT 1 FROM Posts p2
+                WHERE p2.OwnerUserId = ua.user_id
+                  AND p2.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+            )
+            OR EXISTS (
+                SELECT 1 FROM Votes v2
+                WHERE v2.UserId = ua.user_id
+                  AND v2.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+            )
+            THEN 'Active' 
+            ELSE 'Dormant' 
+        END                                           AS activity_status
+    FROM user_agg ua
+),
+
+/* ----------------------------------------------------------------------
+   3.  USERS THAT HAVE NEVER RECEIVED A GOLD BADGE (but have high rep)
+   ---------------------------------------------------------------------- */
+high_rep_no_gold AS (
+    SELECT
+        r.user_id,
+        r.DisplayName,
+        r.Reputation,
+        r.comp_score,
+        r.rank_overall
+    FROM recent_activity r
+    WHERE r.gold_badge_cnt = 0
+      AND r.Reputation > 20000
+),
+
+/* ----------------------------------------------------------------------
+   4.  UNION ALL SET: GOLD BADGE HOLDERS VS HIGH‑REP NON‑GOLD HOLDERS
+   ---------------------------------------------------------------------- */
+combined_set AS (
+    SELECT
+        user_id,
+        DisplayName,
+        Reputation,
+        comp_score,
+        rank_overall,
+        'GoldBadgeHolder'        AS user_category,
+        activity_status
+    FROM recent_activity
+    WHERE gold_badge_cnt > 0
+
+    UNION ALL
+
+    SELECT
+        user_id,
+        DisplayName,
+        Reputation,
+        comp_score,
+        rank_overall,
+        'HighRepNoGold'          AS user_category,
+        activity_status
+    FROM high_rep_no_gold
+)
+
+/* ----------------------------------------------------------------------
+   5.  FINAL RESULT – top 20 users by composite score, with tag‑wise post breakdown
+   ---------------------------------------------------------------------- */
+SELECT
+    cs.user_id,
+    cs.DisplayName,
+    cs.Reputation,
+    cs.comp_score,
+    cs.rank_overall,
+    cs.user_category,
+    cs.activity_status,
+    /* Number of distinct tags the user has ever used in questions */
+    COALESCE(t.tag_cnt,0)                            AS distinct_tag_cnt,
+    /* Most common tag used by the user (if any) */
+    COALESCE(t.top_tag, 'N/A')                       AS top_tag,
+    /* Latest post title (or NULL) – showcase outer join & string handling */
+    COALESCE(lp.latest_title, '(no recent post)')    AS latest_post_title,
+    /* Concatenated badge list (first 3 badges) */
+    COALESCE(b.badge_list, '(none)')                AS badge_snapshot
+FROM combined_set cs
+
+LEFT JOIN LATERAL (
+    SELECT
+        COUNT(DISTINCT unnest(string_to_array(p.Tags, '><'))) AS tag_cnt,
+        (SELECT tag
+         FROM (
+               SELECT
+                   unnest(string_to_array(p.Tags, '><')) AS tag,
+                   COUNT(*) OVER (PARTITION BY unnest(string_to_array(p.Tags, '><'))) AS cnt
+               FROM Posts p2
+               WHERE p2.OwnerUserId = cs.user_id
+                 AND p2.PostTypeId = 1
+         ) sub
+         ORDER BY cnt DESC, tag
+         LIMIT 1) AS top_tag
+    FROM Posts p
+    WHERE p.OwnerUserId = cs.user_id
+      AND p.PostTypeId = 1
+) t ON TRUE
+
+LEFT JOIN LATERAL (
+    SELECT
+        p.Title AS latest_title
+    FROM Posts p
+    WHERE p.OwnerUserId = cs.user_id
+    ORDER BY p.CreationDate DESC
+    LIMIT 1
+) lp ON TRUE
+
+LEFT JOIN LATERAL (
+    SELECT
+        STRING_AGG(b.Name, ', ' ORDER BY b.Class ASC, b.Date DESC) FILTER (WHERE rn <= 3) AS badge_list
+    FROM (
+        SELECT
+            b.Name,
+            b.Class,
+            b.Date,
+            ROW_NUMBER() OVER (PARTITION BY b.Class ORDER BY b.Date DESC) AS rn
+        FROM Badges b
+        WHERE b.UserId = cs.user_id
+    ) b
+) b ON TRUE
+
+ORDER BY cs.comp_score DESC
+LIMIT 20;

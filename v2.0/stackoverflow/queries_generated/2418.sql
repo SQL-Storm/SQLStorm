@@ -1,0 +1,126 @@
+-- {"query": "2418.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1222} 
+
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        p.OwnerUserId,
+        p.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY t.Id ORDER BY p.CreationDate DESC) AS RecentPostRank
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+    WHERE t.Count > 1000
+      AND p.PostTypeId = 1
+),
+UserBadgesCounts AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        COALESCE(SUM(CASE WHEN b.Date >= CURRENT_DATE - INTERVAL '30 days' THEN 1 ELSE 0 END), 0) AS RecentBadges
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+PostScoreRanks AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.Title,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS ScoreRank,
+        RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS RecentPostRank
+    FROM Posts p
+    WHERE p.PostTypeId IN (1,2)
+),
+UserVoteActivity AS (
+    SELECT
+        v.UserId,
+        v.VoteTypeId,
+        COUNT(*) AS VoteCount,
+        MAX(v.CreationDate) AS LastVoteDate
+    FROM Votes v
+    WHERE v.CreationDate >= CURRENT_DATE - INTERVAL '90 days'
+    GROUP BY v.UserId, v.VoteTypeId
+),
+CloseReasonSummary AS (
+    SELECT
+        pht.Comment AS CloseReasonId,
+        cr.Name AS CloseReasonName,
+        COUNT(*) AS CloseCount,
+        AVG(EXTRACT(EPOCH FROM (ph.CreationDate - p.CreationDate))/3600) AS AvgHoursToClose
+    FROM PostHistory ph
+    INNER JOIN PostHistoryTypes phtype ON ph.PostHistoryTypeId = phtype.Id
+    INNER JOIN PostHistory pht ON ph.PostHistoryTypeId = 10 -- Post Closed
+    INNER JOIN CloseReasonTypes cr ON pht.Comment::int = cr.Id
+    INNER JOIN Posts p ON ph.PostId = p.Id
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY pht.Comment, cr.Name
+),
+CombinedUserStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        ubc.GoldBadges,
+        ubc.SilverBadges,
+        ubc.BronzeBadges,
+        COALESCE(SUM(COALESCE(ps.Score, 0)), 0) AS TotalPostScore,
+        COALESCE(MAX(ps.RecentPostRank), NULL) AS MostRecentPostRank,
+        COALESCE(SUM(COALESCE(voteSum.VoteCount, 0)), 0) AS TotalRecentVotes
+    FROM Users u
+    LEFT JOIN UserBadgesCounts ubc ON u.Id = ubc.UserId
+    LEFT JOIN PostScoreRanks ps ON u.Id = ps.OwnerUserId AND ps.ScoreRank <= 10
+    LEFT JOIN (
+        SELECT UserId, SUM(VoteCount) AS VoteCount
+        FROM UserVoteActivity
+        GROUP BY UserId
+    ) voteSum ON u.Id = voteSum.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, ubc.GoldBadges, ubc.SilverBadges, ubc.BronzeBadges
+)
+SELECT DISTINCT
+    u.DisplayName AS UserName,
+    u.Reputation,
+    u.GoldBadges,
+    u.SilverBadges,
+    u.BronzeBadges,
+    u.TotalPostScore,
+    COALESCE(t.TagName, 'No Popular Tag') AS PopularTag,
+    cr.CloseReasonName,
+    cr.CloseCount,
+    cr.AvgHoursToClose,
+    u.TotalRecentVotes,
+    CONCAT(
+        'User ', u.DisplayName, ' with reputation ', u.Reputation, 
+        ' has ', u.GoldBadges, ' gold, ', u.SilverBadges, ' silver, and ', u.BronzeBadges, 
+        ' bronze badges, total post score of ', u.TotalPostScore, ', and recent votes: ', u.TotalRecentVotes
+    ) AS SummaryInfo
+FROM CombinedUserStats u
+LEFT JOIN RecursiveTagHierarchy t ON t.OwnerUserId = u.UserId AND t.RecentPostRank = 1
+LEFT JOIN CloseReasonSummary cr ON TRUE
+WHERE u.Reputation > 10000
+  AND (u.GoldBadges > 2 OR u.SilverBadges > 5)
+  AND (
+      EXISTS(
+          SELECT 1 FROM Posts p2
+          WHERE p2.OwnerUserId = u.UserId
+            AND p2.PostTypeId = 1
+            AND p2.Score > (
+                SELECT AVG(score_avg.AvgScore)
+                FROM (
+                    SELECT AVG(p3.Score) AS AvgScore
+                    FROM Posts p3
+                    WHERE p3.PostTypeId = 1
+                    GROUP BY p3.OwnerUserId
+                ) AS score_avg
+            )
+      )
+      OR u.TotalPostScore >= 1000
+  )
+ORDER BY u.TotalPostScore DESC, u.Reputation DESC
+LIMIT 50;

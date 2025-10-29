@@ -1,0 +1,138 @@
+WITH RECURSIVE RecursiveTagTree AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        CAST(ARRAY[t.TagName] AS varchar[]) AS TagPath,
+        1 AS Depth
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+
+    UNION ALL
+
+    SELECT
+        child.Id,
+        child.TagName,
+        parent.TagPath || child.TagName,
+        parent.Depth + 1
+    FROM Tags child
+    JOIN RecursiveTagTree parent ON child.WikiPostId = parent.Id
+    WHERE child.Id <> parent.Id
+      AND NOT child.TagName = ANY(parent.TagPath)
+),
+UserPostsWithMetrics AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        p.CreationDate,
+        RANK() OVER (PARTITION BY u.Id ORDER BY p.Score DESC NULLS LAST, p.ViewCount DESC NULLS LAST) AS PostRank,
+        COUNT(*) OVER (PARTITION BY u.Id) AS TotalPosts,
+        SUM(p.Score) OVER (PARTITION BY u.Id) AS SumScore
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1, 2)
+),
+AcceptedAnswerStats AS (
+    SELECT
+        p.AcceptedAnswerId,
+        COUNT(*) AS NumQuestionsAccepted,
+        AVG(p.Score) AS AvgQuestionScore,
+        MAX(p.ViewCount) AS MaxQuestionViews
+    FROM Posts p
+    WHERE p.AcceptedAnswerId IS NOT NULL
+    GROUP BY p.AcceptedAnswerId
+),
+ComplexUserBadgeAggregation AS (
+    SELECT
+        b.UserId,
+        u.DisplayName,
+        STRING_AGG(DISTINCT CASE WHEN b.Class = 1 THEN b.Name END, ', ') FILTER (WHERE b.Class = 1) AS GoldBadges,
+        STRING_AGG(DISTINCT CASE WHEN b.Class = 2 THEN b.Name END, ', ') FILTER (WHERE b.Class = 2) AS SilverBadges,
+        STRING_AGG(DISTINCT CASE WHEN b.Class = 3 THEN b.Name END, ', ') FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        BOOL_OR(b.TagBased) AS HasTagBased,
+        MAX(b.Date) AS LastBadgeDate,
+        COUNT(DISTINCT CASE WHEN date_part('year', age(CAST('2024-10-01' AS date), b.Date)) <= 1 THEN b.Id END) AS BadgesLastYear
+    FROM Badges b
+    JOIN Users u ON u.Id = b.UserId
+    GROUP BY b.UserId, u.DisplayName
+)
+SELECT
+    u.DisplayName,
+    COALESCE(upwm.TotalPosts, 0) AS TotalPosts,
+    COALESCE(upwm.SumScore, 0) AS TotalScore,
+    COALESCE(badges.TotalBadges, 0) AS BadgeCount,
+    badges.GoldBadges,
+    badges.SilverBadges,
+    badges.BronzeBadges,
+    badges.HasTagBased,
+    badges.LastBadgeDate,
+    badges.BadgesLastYear,
+    aa.NumQuestionsAccepted,
+    aa.AvgQuestionScore,
+    aa.MaxQuestionViews,
+    rtt.Depth AS TagDepthSample,
+    rtt.TagPath AS SampleTagPath,
+    SUBSTRING(upwm.Tags FROM 1 FOR 100) AS SampleTags,
+    CASE
+        WHEN upwm.SumScore > 0 THEN ROUND( LN(ABS(upwm.SumScore) + 1) * CHAR_LENGTH(COALESCE(upwm.Tags, '')) / NULLIF(upwm.TotalPosts,0)::numeric, 3)
+        ELSE NULL
+    END AS ScoreTagMetric,
+    COALESCE(comm.PostsCommentedOn, 0) AS PostsCommentedOnCount,
+    COALESCE(comm.CommentsCount, 0) AS TotalCommentsMade,
+    EXTRACT(day FROM CAST('2024-10-01 12:34:56' AS timestamp) - COALESCE(u.LastAccessDate, u.CreationDate)) AS DaysSinceLastAccess,
+    (
+        SELECT p2.Title
+        FROM Posts p2
+        WHERE p2.OwnerUserId = u.Id
+          AND p2.PostTypeId = 1
+          AND p2.Score >= 50
+        ORDER BY p2.CreationDate DESC NULLS LAST
+        LIMIT 1
+    ) AS TopQuestionTitle,
+    interactions.InteractionCount,
+    interactions.TopInteractionType
+FROM Users u
+LEFT JOIN UserPostsWithMetrics upwm ON upwm.UserId = u.Id AND upwm.PostRank = 1
+LEFT JOIN ComplexUserBadgeAggregation badges ON badges.UserId = u.Id
+LEFT JOIN AcceptedAnswerStats aa ON aa.AcceptedAnswerId = upwm.PostId
+LEFT JOIN RecursiveTagTree rtt ON rtt.Id = (
+    SELECT COALESCE(
+        (SELECT p3.Id FROM Posts p3 WHERE p3.OwnerUserId = u.Id AND p3.PostTypeId = 1 ORDER BY p3.CreationDate DESC LIMIT 1),
+        (SELECT MIN(Id) FROM Tags WHERE IsRequired = TRUE)
+    )
+)
+LEFT JOIN (
+    SELECT
+        c.UserId,
+        COUNT(DISTINCT c.PostId) AS PostsCommentedOn,
+        COUNT(c.Id) AS CommentsCount
+    FROM Comments c
+    GROUP BY c.UserId
+) comm ON comm.UserId = u.Id
+LEFT JOIN LATERAL (
+    SELECT
+        SUM(cnt) AS InteractionCount,
+        MAX(InteractionType) AS TopInteractionType
+    FROM (
+        SELECT 'Votes' AS InteractionType, COUNT(*) AS cnt
+        FROM Votes v
+        WHERE v.UserId = u.Id
+        UNION ALL
+        SELECT 'Comments' AS InteractionType, COUNT(*) AS cnt
+        FROM Comments c2
+        WHERE c2.UserId = u.Id
+        UNION ALL
+        SELECT 'Badges' AS InteractionType, COUNT(*) AS cnt
+        FROM Badges b2
+        WHERE b2.UserId = u.Id
+    ) interaction_counts
+) interactions ON TRUE
+WHERE u.Reputation > 1000
+ORDER BY TotalScore DESC NULLS LAST, TotalPosts DESC NULLS LAST
+LIMIT 50;

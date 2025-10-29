@@ -1,0 +1,319 @@
+-- {"query": "179.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3244} 
+with recent_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.lastaccessdate,
+    date_trunc('month', u.creationdate) as cohort_month,
+    coalesce(nullif(trim(split_part(coalesce(u.location,''), ',', 1)), ''), 'Unknown') as country_guess
+  from users u
+  where u.creationdate >= now() - interval '5 years'
+),
+user_activity as (
+  select
+    p.owneruserid as user_id,
+    count(*) filter (where p.posttypeid = 1) as q_count,
+    count(*) filter (where p.posttypeid = 2) as a_count,
+    sum(coalesce(p.score,0)) as post_score,
+    sum(coalesce(p.viewcount,0)) as views,
+    max(p.lastactivitydate) as last_post_activity,
+    avg(nullif(p.answercount,0)) filter (where p.posttypeid = 1) as avg_answers_per_q
+  from posts p
+  where p.creationdate >= now() - interval '5 years'
+  group by p.owneruserid
+),
+comment_activity as (
+  select
+    c.userid as user_id,
+    count(*) as comment_count,
+    sum(coalesce(c.score,0)) as comment_score,
+    max(c.creationdate) as last_comment_date
+  from comments c
+  where c.creationdate >= now() - interval '5 years'
+  group by c.userid
+),
+badge_summaries as (
+  select
+    b.userid as user_id,
+    count(*) as total_badges,
+    count(*) filter (where b.class = 1) as gold_badges,
+    count(*) filter (where b.class = 2) as silver_badges,
+    count(*) filter (where b.class = 3) as bronze_badges,
+    count(*) filter (where b.tagbased = 1) as tag_badges,
+    max(b.date) as last_badge_date
+  from badges b
+  where b.date >= now() - interval '5 years'
+  group by b.userid
+),
+question_metrics as (
+  select
+    p.owneruserid as user_id,
+    count(*) as questions_asked,
+    avg(coalesce(p.viewcount,0)) as avg_q_views,
+    avg(coalesce(p.score,0)) as avg_q_score,
+    sum(case when p.acceptedanswerid is not null then 1 else 0 end) as accepted_q_count,
+    percentile_cont(0.9) within group (order by coalesce(p.viewcount,0)) as p90_q_views
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= now() - interval '5 years'
+  group by p.owneruserid
+),
+answer_metrics as (
+  select
+    p.owneruserid as user_id,
+    count(*) as answers_posted,
+    avg(coalesce(p.score,0)) as avg_a_score,
+    sum(coalesce(p.score,0)) filter (where p.score > 0) as pos_answer_score,
+    sum(coalesce(p.score,0)) filter (where p.score < 0) as neg_answer_score
+  from posts p
+  where p.posttypeid = 2
+    and p.creationdate >= now() - interval '5 years'
+  group by p.owneruserid
+),
+vote_metrics as (
+  select
+    v.userid as user_id,
+    count(*) filter (where v.votetypeid = 2) as upvotes_given,
+    count(*) filter (where v.votetypeid = 3) as downvotes_given,
+    count(*) filter (where v.votetypeid = 5) as favorites_given,
+    max(v.creationdate) as last_vote_date
+  from votes v
+  where v.creationdate >= now() - interval '5 years'
+  group by v.userid
+),
+post_votes_received as (
+  select
+    p.owneruserid as user_id,
+    count(*) filter (where v.votetypeid = 2) as upvotes_received,
+    count(*) filter (where v.votetypeid = 3) as downvotes_received
+  from posts p
+  left join votes v
+    on v.postid = p.id
+    and v.creationdate >= now() - interval '5 years'
+    and v.votetypeid in (2,3)
+  where p.creationdate >= now() - interval '5 years'
+  group by p.owneruserid
+),
+dup_closure as (
+  select
+    ph.postid,
+    min(ph.creationdate) as first_close_date,
+    count(*) as close_events,
+    sum(case when cast(ph.comment as int) in (1,101) then 1 else 0 end) as duplicate_closes
+  from posthistory ph
+  where ph.posthistorytypeid in (10) -- Post Closed
+    and ph.creationdate >= now() - interval '5 years'
+  group by ph.postid
+),
+linked_duplicates as (
+  select
+    l.postid,
+    count(*) filter (where l.linktypeid = 3) as dup_links,
+    count(*) filter (where l.linktypeid = 1) as linked_refs,
+    max(l.creationdate) as last_link_date
+  from postlinks l
+  where l.creationdate >= now() - interval '5 years'
+  group by l.postid
+),
+tag_exploded as (
+  select
+    p.id as post_id,
+    p.owneruserid as user_id,
+    unnest(string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')) as tagname
+  from posts p
+  where p.posttypeid = 1
+    and p.tags is not null
+    and p.creationdate >= now() - interval '5 years'
+),
+top_tags as (
+  select
+    t.user_id,
+    array_agg(t.tagname order by cnt desc nulls last)[1:3] as top3_tags
+  from (
+    select user_id, tagname, count(*) as cnt
+    from tag_exploded
+    group by user_id, tagname
+  ) t
+  group by t.user_id
+),
+activity_times as (
+  select
+    u.id as user_id,
+    min(p.creationdate) filter (where p.creationdate is not null) as first_post_date,
+    max(p.creationdate) filter (where p.creationdate is not null) as last_post_date,
+    min(c.creationdate) filter (where c.creationdate is not null) as first_comment_date,
+    max(c.creationdate) filter (where c.creationdate is not null) as last_comment_date
+  from users u
+  left join posts p on p.owneruserid = u.id
+  left join comments c on c.userid = u.id
+  where coalesce(p.creationdate, c.creationdate) >= now() - interval '5 years'
+  group by u.id
+),
+user_rollup as (
+  select
+    ru.user_id,
+    ru.displayname,
+    ru.reputation,
+    ru.cohort_month,
+    ru.country_guess,
+    ua.q_count,
+    ua.a_count,
+    ua.post_score,
+    ua.views,
+    ua.last_post_activity,
+    ua.avg_answers_per_q,
+    ca.comment_count,
+    ca.comment_score,
+    ca.last_comment_date,
+    bs.total_badges,
+    bs.gold_badges,
+    bs.silver_badges,
+    bs.bronze_badges,
+    bs.tag_badges,
+    bs.last_badge_date,
+    qm.questions_asked,
+    qm.avg_q_views,
+    qm.avg_q_score,
+    qm.accepted_q_count,
+    qm.p90_q_views,
+    am.answers_posted,
+    am.avg_a_score,
+    am.pos_answer_score,
+    am.neg_answer_score,
+    vm.upvotes_given,
+    vm.downvotes_given,
+    vm.favorites_given,
+    vm.last_vote_date,
+    pvr.upvotes_received,
+    pvr.downvotes_received,
+    tt.top3_tags,
+    at.first_post_date,
+    at.last_post_date,
+    at.first_comment_date,
+    at.last_comment_date
+  from recent_users ru
+  left join user_activity ua on ua.user_id = ru.user_id
+  left join comment_activity ca on ca.user_id = ru.user_id
+  left join badge_summaries bs on bs.user_id = ru.user_id
+  left join question_metrics qm on qm.user_id = ru.user_id
+  left join answer_metrics am on am.user_id = ru.user_id
+  left join vote_metrics vm on vm.user_id = ru.user_id
+  left join post_votes_received pvr on pvr.user_id = ru.user_id
+  left join top_tags tt on tt.user_id = ru.user_id
+  left join activity_times at on at.user_id = ru.user_id
+),
+scored as (
+  select
+    ur.*,
+    -- engagement score
+    (
+      coalesce(ur.q_count,0)*1.0
+      + coalesce(ur.a_count,0)*2.0
+      + coalesce(ur.comment_count,0)*0.2
+      + coalesce(ur.upvotes_given,0)*0.1
+      - coalesce(ur.downvotes_given,0)*0.05
+      + coalesce(ur.favorites_given,0)*0.15
+      + coalesce(ur.total_badges,0)*0.5
+      + coalesce(ur.upvotes_received,0)*0.8
+      - coalesce(ur.downvotes_received,0)*0.6
+      + least(coalesce(ur.post_score,0), 500)*0.4
+      + least(coalesce(ur.views,0), 100000)/500.0
+    ) as engagement_score,
+    -- quality score (bounded)
+    greatest(
+      -50,
+      least(
+        100,
+        coalesce(ur.avg_q_score,0)*10
+        + coalesce(ur.avg_a_score,0)*15
+        + coalesce(ur.accepted_q_count,0)*5
+        + (case when coalesce(ur.avg_answers_per_q,0) > 1 then 10 else 0 end)
+        + (case when coalesce(ur.p90_q_views,0) > 1000 then 8 else 0 end)
+      )
+    ) as quality_score
+  from user_rollup ur
+),
+ranked as (
+  select
+    s.*,
+    row_number() over (order by engagement_score desc nulls last, quality_score desc nulls last, reputation desc nulls last, user_id) as rn_global,
+    dense_rank() over (partition by date_trunc('year', cohort_month) order by engagement_score desc nulls last) as drank_by_cohort,
+    rank() over (partition by coalesce(country_guess,'Unknown') order by quality_score desc nulls last) as rnk_by_country
+  from scored s
+),
+dup_impact as (
+  select
+    p.owneruserid as user_id,
+    count(*) as dup_closed_questions,
+    avg(extract(epoch from (p.closeddate - p.creationdate))/3600.0) as avg_hours_to_close,
+    sum(ld.dup_links) as dup_links_count
+  from posts p
+  join dup_closure dc on dc.postid = p.id
+  left join linked_duplicates ld on ld.postid = p.id
+  where p.posttypeid = 1
+    and p.creationdate >= now() - interval '5 years'
+  group by p.owneruserid
+),
+final_agg as (
+  select
+    r.*,
+    di.dup_closed_questions,
+    di.avg_hours_to_close,
+    di.dup_links_count,
+    -- normalized scores
+    (engagement_score - avg(engagement_score) over ()) / nullif(stddev_pop(engagement_score) over (),0) as z_engagement,
+    (quality_score - avg(quality_score) over ()) / nullif(stddev_pop(quality_score) over (),0) as z_quality
+  from ranked r
+  left join dup_impact di on di.user_id = r.user_id
+)
+select
+  fa.user_id,
+  coalesce(fa.displayname, '(unknown)') as displayname,
+  fa.country_guess,
+  fa.cohort_month,
+  fa.reputation,
+  coalesce(fa.q_count,0) as q_count,
+  coalesce(fa.a_count,0) as a_count,
+  coalesce(fa.comment_count,0) as comment_count,
+  coalesce(fa.total_badges,0) as total_badges,
+  coalesce(fa.gold_badges,0) as gold_badges,
+  coalesce(fa.silver_badges,0) as silver_badges,
+  coalesce(fa.bronze_badges,0) as bronze_badges,
+  coalesce(fa.upvotes_given,0) as upvotes_given,
+  coalesce(fa.downvotes_given,0) as downvotes_given,
+  coalesce(fa.upvotes_received,0) as upvotes_received,
+  coalesce(fa.downvotes_received,0) as downvotes_received,
+  fa.engagement_score,
+  fa.quality_score,
+  round(coalesce(fa.z_engagement,0)::numeric, 3) as z_engagement,
+  round(coalesce(fa.z_quality,0)::numeric, 3) as z_quality,
+  fa.rn_global,
+  fa.drank_by_cohort,
+  fa.rnk_by_country,
+  coalesce(fa.top3_tags::text, '{}') as top3_tags,
+  coalesce(fa.dup_closed_questions,0) as dup_closed_questions,
+  round(coalesce(fa.avg_hours_to_close,0)::numeric, 2) as avg_hours_to_close,
+  coalesce(fa.dup_links_count,0) as dup_links_count,
+  -- activity recency buckets
+  case
+    when greatest(coalesce(fa.last_post_date, timestamp 'epoch'), coalesce(fa.last_comment_date, timestamp 'epoch')) >= now() - interval '30 days' then 'active_30d'
+    when greatest(coalesce(fa.last_post_date, timestamp 'epoch'), coalesce(fa.last_comment_date, timestamp 'epoch')) >= now() - interval '90 days' then 'active_90d'
+    when greatest(coalesce(fa.last_post_date, timestamp 'epoch'), coalesce(fa.last_comment_date, timestamp 'epoch')) >= now() - interval '180 days' then 'active_180d'
+    else 'stale'
+  end as recency_bucket
+from final_agg fa
+where
+  -- exclude users with zero observable activity in all joined measures
+  coalesce(q_count,0) + coalesce(a_count,0) + coalesce(comment_count,0)
+  + coalesce(total_badges,0) + coalesce(upvotes_given,0) + coalesce(upvotes_received,0) > 0
+  and (
+    -- example complicated predicate with string ops and NULL logic
+    position(lower('stackoverflow') in coalesce(lower(nullif((select string_agg(tn, ',')
+                                                              from unnest(coalesce(top3_tags, array[]::varchar[])) as tn), '')), '')) = 0
+    or coalesce(array_length(top3_tags,1),0) = 0
+  )
+order by
+  rn_global
+fetch first 200 rows only;

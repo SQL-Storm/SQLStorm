@@ -1,0 +1,154 @@
+-- {"query": "3953.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2411} 
+WITH
+/*---------------------------------------------------------
+  1. Aggregate per‑user post statistics (questions & answers)
+----------------------------------------------------------*/
+user_posts AS (
+    SELECT
+        u.id                                    AS user_id,
+        u.displayname,
+        COUNT(p.id) FILTER (WHERE p.posttypeid = 1) AS question_cnt,
+        COUNT(p.id) FILTER (WHERE p.posttypeid = 2) AS answer_cnt,
+        COALESCE(SUM(p.score),0)                AS total_score,
+        MAX(p.creationdate)                    AS last_post_dt
+    FROM users u
+    LEFT JOIN posts p ON p.owneruserid = u.id
+    GROUP BY u.id, u.displayname
+),
+
+/*---------------------------------------------------------
+  2. Badge summary per user (gold flag + counts)
+----------------------------------------------------------*/
+badge_summary AS (
+    SELECT
+        b.userid               AS user_id,
+        MAX(CASE WHEN b.class = 1 THEN 1 ELSE 0 END) AS has_gold,
+        COUNT(*) FILTER (WHERE b.class = 2)          AS silver_cnt,
+        COUNT(*) FILTER (WHERE b.class = 3)          AS bronze_cnt
+    FROM badges b
+    GROUP BY b.userid
+),
+
+/*---------------------------------------------------------
+  3. Votes received in the last 30 days per post
+----------------------------------------------------------*/
+recent_votes AS (
+    SELECT
+        v.postid,
+        SUM(CASE WHEN vt.id = 2 THEN 1 ELSE 0 END) AS up_votes,
+        SUM(CASE WHEN vt.id = 3 THEN 1 ELSE 0 END) AS down_votes,
+        MAX(v.creationdate)                         AS last_vote_dt
+    FROM votes v
+    JOIN votetypes vt ON vt.id = v.votetypeid
+    WHERE v.creationdate > cast('2024-10-01 12:34:56' as timestamp) - interval '30 days'
+    GROUP BY v.postid
+),
+
+/*---------------------------------------------------------
+  4. Top 5 tags overall (used for a string aggregation later)
+----------------------------------------------------------*/
+top_tags AS (
+    SELECT
+        t.tagname,
+        t.count,
+        ROW_NUMBER() OVER (ORDER BY t.count DESC) AS rn
+    FROM tags t
+    WHERE t.ismoderatoronly = 0
+),
+
+/*---------------------------------------------------------
+  5. Extract tags from a user's questions (correlated sub‑query)
+----------------------------------------------------------*/
+user_tag_matrix AS (
+    SELECT
+        p.owneruserid                                               AS user_id,
+        TRIM(BOTH '<>' FROM UNNEST(string_to_array(p.tags, '><'))) AS tag_name
+    FROM posts p
+    WHERE p.posttypeid = 1                      -- only questions
+      AND p.owneruserid IS NOT NULL
+      AND p.tags IS NOT NULL
+),
+
+/*---------------------------------------------------------
+  6. Rank tags per user (window function)
+----------------------------------------------------------*/
+user_tag_rank AS (
+    SELECT
+        utm.user_id,
+        utm.tag_name,
+        COUNT(*)                                    AS tag_use_cnt,
+        ROW_NUMBER() OVER (PARTITION BY utm.user_id
+                           ORDER BY COUNT(*) DESC) AS rn
+    FROM user_tag_matrix utm
+    GROUP BY utm.user_id, utm.tag_name
+)
+
+--================================================================
+-- Final result set: one row per user + a global aggregate row
+--================================================================
+SELECT
+    up.user_id,
+    up.displayname,
+    up.question_cnt,
+    up.answer_cnt,
+    up.total_score,
+    up.last_post_dt,
+    COALESCE(bs.has_gold,0)           AS has_gold,
+    COALESCE(bs.silver_cnt,0)         AS silver_cnt,
+    COALESCE(bs.bronze_cnt,0)         AS bronze_cnt,
+    COALESCE(rv.up_votes,0)           AS recent_up_votes,
+    COALESCE(rv.down_votes,0)         AS recent_down_votes,
+    CASE
+        WHEN up.total_score > 1000 THEN 'HighScore'
+        WHEN up.total_score BETWEEN 500 AND 1000 THEN 'MediumScore'
+        ELSE 'LowScore'
+    END                               AS score_tier,
+    /* concatenate the top‑5 tags for the user */
+    STRING_AGG(DISTINCT ut.tag_name, ', ') FILTER (WHERE ut.rn <= 5) AS top_5_tags
+FROM user_posts up
+LEFT JOIN badge_summary bs      ON bs.user_id = up.user_id
+LEFT JOIN LATERAL (
+        SELECT upost.id
+        FROM posts upost
+        WHERE upost.owneruserid = up.user_id
+        ORDER BY upost.creationdate DESC
+        LIMIT 1
+) latest_post ON TRUE
+LEFT JOIN recent_votes rv       ON rv.postid = latest_post.id
+LEFT JOIN user_tag_rank ut      ON ut.user_id = up.user_id
+WHERE up.question_cnt > 0
+GROUP BY
+    up.user_id, up.displayname, up.question_cnt, up.answer_cnt,
+    up.total_score, up.last_post_dt,
+    bs.has_gold, bs.silver_cnt, bs.bronze_cnt,
+    rv.up_votes, rv.down_votes
+
+UNION ALL
+
+/*---------------------------------------------------------
+  Global aggregate row (uses set operator UNION ALL)
+----------------------------------------------------------*/
+SELECT
+    NULL                              AS user_id,
+    'Overall'                         AS displayname,
+    SUM(up.question_cnt)              AS question_cnt,
+    SUM(up.answer_cnt)                AS answer_cnt,
+    SUM(up.total_score)               AS total_score,
+    MAX(up.last_post_dt)              AS last_post_dt,
+    MAX(bs.has_gold)                  AS has_gold,
+    SUM(bs.silver_cnt)                AS silver_cnt,
+    SUM(bs.bronze_cnt)                AS bronze_cnt,
+    SUM(rv.up_votes)                  AS recent_up_votes,
+    SUM(rv.down_votes)                AS recent_down_votes,
+    'Overall'                         AS score_tier,
+    NULL                              AS top_5_tags
+FROM user_posts up
+LEFT JOIN badge_summary bs      ON bs.user_id = up.user_id
+LEFT JOIN LATERAL (
+        SELECT upost.id
+        FROM posts upost
+        WHERE upost.owneruserid = up.user_id
+        ORDER BY upost.creationdate DESC
+        LIMIT 1
+) latest_post ON TRUE
+LEFT JOIN recent_votes rv       ON rv.postid = latest_post.id;

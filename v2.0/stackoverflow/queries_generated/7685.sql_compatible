@@ -1,0 +1,156 @@
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+    COUNT(DISTINCT b.Id) AS BadgesReceived,
+    (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = u.Id AND PostTypeId = 1 AND Score > 100) AS HighScoreQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = u.Id AND PostTypeId = 2 AND Score > 50) AS HighScoreAnswers,
+    STRING_AGG(DISTINCT t.TagName, ', ') AS TagInterests,
+    AVG(CAST(p.Score AS DOUBLE PRECISION)) AS AvgPostScore,
+    MAX(p.CreationDate) AS LastPostDate,
+    (EXTRACT(EPOCH FROM MAX(p.CreationDate)) - EXTRACT(EPOCH FROM u.CreationDate)) / 86400 AS DaysActive,
+    CASE 
+        WHEN COUNT(DISTINCT p.Id) > 100 THEN 'High Engagement'
+        WHEN COUNT(DISTINCT p.Id) > 50 THEN 'Medium Engagement'
+        ELSE 'Low Engagement'
+    END AS EngagementLevel,
+    COALESCE(
+        (SELECT q.Title
+         FROM Posts q
+         WHERE q.OwnerUserId = u.Id
+           AND q.PostTypeId = 1
+           AND q.Score = (SELECT MAX(Score) FROM Posts WHERE OwnerUserId = u.Id AND PostTypeId = 1)
+         ORDER BY q.Score DESC, q.CreationDate DESC
+         LIMIT 1
+        ),
+        'No Questions'
+    ) AS HighestRatedQuestion,
+    ROW_NUMBER() OVER (ORDER BY SUM(p.Score) DESC) AS ReputationRank,
+    PERCENT_RANK() OVER (ORDER BY u.Reputation) AS ReputationPercentile,
+    RANK() OVER (PARTITION BY CASE WHEN u.Reputation > 10000 THEN 'High' ELSE 'Low' END ORDER BY u.Reputation) AS ReputationByTierRank,
+    (
+        SELECT COUNT(*) 
+        FROM PostHistory ph 
+        WHERE ph.UserId = u.Id 
+        AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6) 
+        AND ph.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year')
+    ) AS RecentEdits,
+    (
+        SELECT COUNT(*) 
+        FROM Comments c 
+        WHERE c.UserId = u.Id 
+        AND c.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year')
+    ) AS RecentComments,
+    (
+        SELECT COUNT(*) 
+        FROM Votes v 
+        WHERE v.UserId = u.Id 
+        AND v.VoteTypeId IN (2, 3) 
+        AND v.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year')
+    ) AS RecentVotes,
+    (SELECT Name FROM Badges WHERE UserId = u.Id ORDER BY Date DESC LIMIT 1) AS LatestBadge,
+    (
+        SELECT COUNT(*) 
+        FROM PostLinks pl 
+        WHERE pl.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = u.Id) 
+        AND pl.LinkTypeId = 1
+    ) AS OutgoingLinks,
+    (
+        SELECT COUNT(*) 
+        FROM PostLinks pl 
+        WHERE pl.RelatedPostId IN (SELECT Id FROM Posts WHERE OwnerUserId = u.Id) 
+        AND pl.LinkTypeId = 1
+    ) AS IncomingLinks,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p2 
+        WHERE p2.OwnerUserId = u.Id 
+        AND p2.ParentId IS NOT NULL 
+        AND p2.Score > 0
+    ) AS HelpfulAnswers,
+    (
+        SELECT STRING_AGG(CAST(v.BountyAmount AS VARCHAR), ', ') 
+        FROM Votes v 
+        WHERE v.UserId = u.Id 
+        AND v.VoteTypeId = 8
+    ) AS BountyHistory,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p3 
+        WHERE p3.OwnerUserId = u.Id 
+        AND p3.PostTypeId = 1 
+        AND p3.ClosedDate IS NOT NULL
+    ) AS ClosedQuestions,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p4 
+        WHERE p4.OwnerUserId = u.Id 
+        AND p4.PostTypeId = 1 
+        AND p4.AcceptedAnswerId IS NOT NULL
+    ) AS QuestionsWithAcceptedAnswers,
+    (
+        SELECT AVG(CAST(p5.Score AS DOUBLE PRECISION))
+        FROM Posts p5 
+        WHERE p5.OwnerUserId = u.Id 
+        AND p5.PostTypeId = 1
+    ) AS AvgQuestionScore,
+    (
+        SELECT AVG(CAST(p6.Score AS DOUBLE PRECISION))
+        FROM Posts p6 
+        WHERE p6.OwnerUserId = u.Id 
+        AND p6.PostTypeId = 2
+    ) AS AvgAnswerScore,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p7 
+        WHERE p7.OwnerUserId = u.Id 
+        AND p7.PostTypeId = 1 
+        AND p7.ViewCount > 1000
+    ) AS PopularQuestions,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p8 
+        WHERE p8.OwnerUserId = u.Id 
+        AND p8.PostTypeId = 2 
+        AND p8.ViewCount > 500
+    ) AS PopularAnswers,
+    (
+        SELECT MAX(ph2.CreationDate) 
+        FROM PostHistory ph2 
+        WHERE ph2.UserId = u.Id 
+        AND ph2.PostHistoryTypeId IN (10, 11, 12, 13)
+    ) AS LastModerationActivity,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p9 
+        WHERE p9.OwnerUserId = u.Id 
+        AND p9.ParentId IS NULL 
+        AND p9.PostTypeId = 1 
+        AND p9.TagBased = 1
+    ) AS TagBasedQuestions
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId IN (1, 2)
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN (
+    SELECT p.OwnerUserId, t.TagName
+    FROM Posts p
+    CROSS JOIN LATERAL (
+        SELECT TRIM(BOTH '<>' FROM value) AS val
+        FROM regexp_split_to_table(p.Tags, '><') AS value
+    ) AS tag_parts
+    JOIN Tags t ON t.TagName = tag_parts.val
+    WHERE p.Tags IS NOT NULL AND p.Tags <> ''
+) AS tag_users ON u.Id = tag_users.OwnerUserId
+WHERE u.Reputation > 100
+    AND u.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 years')
+    AND u.AccountId IS NOT NULL
+GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+HAVING COUNT(DISTINCT p.Id) > 0
+    AND COUNT(DISTINCT b.Id) > 0
+    AND MAX(p.CreationDate) >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6 months')
+ORDER BY SUM(p.Score) DESC, COUNT(DISTINCT p.Id) DESC
+OFFSET 100 ROWS
+FETCH NEXT 100 ROWS ONLY;

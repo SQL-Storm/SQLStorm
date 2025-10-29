@@ -1,0 +1,175 @@
+-- {"query": "2189.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1450} 
+with RecursiveUserBadges as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        b.Name as BadgeName,
+        b.Class as BadgeClass,
+        dense_rank() over(partition by u.Id order by b.Class, b.Date) as BadgeRank
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    where b.Date < current_date - interval '30 days'
+), 
+UserBadgeSummary as (
+    select
+        UserId,
+        DisplayName,
+        count(*) filter (where BadgeClass = 1) as GoldBadges,
+        count(*) filter (where BadgeClass = 2) as SilverBadges,
+        count(*) filter (where BadgeClass = 3) as BronzeBadges,
+        max(BadgeRank) as MaxBadgeRank
+    from RecursiveUserBadges
+    group by UserId, DisplayName
+),
+TopUsersCTE as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        coalesce(ubs.GoldBadges, 0) as GoldBadges,
+        coalesce(ubs.SilverBadges, 0) as SilverBadges,
+        coalesce(ubs.BronzeBadges, 0) as BronzeBadges
+    from Users u
+    left join UserBadgeSummary ubs on u.Id = ubs.UserId
+    where u.Reputation > 1000
+),
+PostWithLinkInfo as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.CreationDate,
+        p.ViewCount,
+        p.AnswerCount,
+        p.Tags,
+        pl.RelatedPostId,
+        lt.Name as LinkTypeName
+    from Posts p
+    left join PostLinks pl on pl.PostId = p.Id
+    left join LinkTypes lt on lt.Id = pl.LinkTypeId
+    where p.PostTypeId in (1, 2)
+),
+QuestionAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.OwnerUserId as QuestionOwner,
+        q.CreationDate as QuestionCreationDate,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViews,
+        q.Tags as QuestionTags,
+        count(distinct a.Id) as NumberOfAnswers,
+        avg(a.Score) filter (where a.Score is not null) as AvgAnswerScore,
+        sum(case when a.OwnerUserId is not null then 1 else 0 end) as NumberAnswersWithUser,
+        sum(case when a.Score > 5 then 1 else 0 end) as HighlyScoredAnswers
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+    group by q.Id, q.OwnerUserId, q.CreationDate, q.Score, q.ViewCount, q.Tags
+),
+RankedQuestions as (
+    select
+        QuestionId,
+        QuestionOwner,
+        QuestionCreationDate,
+        QuestionScore,
+        QuestionViews,
+        QuestionTags,
+        NumberOfAnswers,
+        AvgAnswerScore,
+        NumberAnswersWithUser,
+        HighlyScoredAnswers,
+        row_number() over (partition by QuestionOwner order by QuestionScore desc, QuestionViews desc) as QuestionRank
+    from QuestionAnswerStats
+),
+TopQuestionsByUser as (
+    select *
+    from RankedQuestions
+    where QuestionRank <= 3
+),
+QuestionCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReasonName,
+        count(*) as CloseEventCount,
+        max(ph.CreationDate) as LastCloseDate
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id::text = ph.Comment
+    where ph.PostHistoryTypeId = 10 /* Post Closed */
+    group by ph.PostId, crt.Name
+),
+LatestComments as (
+    select
+        c.PostId,
+        c.Id as CommentId,
+        c.UserId as CommentUserId,
+        c.CreationDate as CommentDate,
+        c.Text,
+        row_number() over (partition by c.PostId order by c.CreationDate desc) as CommentRank
+    from Comments c
+),
+FilteredLatestComments as (
+    select
+        PostId,
+        CommentId,
+        CommentUserId,
+        CommentDate,
+        Text
+    from LatestComments
+    where CommentRank = 1
+),
+UserPostSummary as (
+    select
+        tu.Id as UserId,
+        tu.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as NumQuestions,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as NumAnswers,
+        max(p.Score) filter (where p.PostTypeId in (1, 2)) as MaxPostScore,
+        avg(p.Score) filter (where p.PostTypeId in (1, 2)) as AvgPostScore
+    from TopUsersCTE tu
+    left join Posts p on p.OwnerUserId = tu.Id
+    group by tu.Id, tu.DisplayName
+)
+select
+    tu.Id as UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.Location,
+    tu.GoldBadges,
+    tu.SilverBadges,
+    tu.BronzeBadges,
+    ups.NumQuestions,
+    ups.NumAnswers,
+    ups.MaxPostScore,
+    ups.AvgPostScore,
+    tq.QuestionId,
+    tq.QuestionScore,
+    tq.QuestionViews,
+    tq.NumberOfAnswers,
+    tq.AvgAnswerScore,
+    tq.HighlyScoredAnswers,
+    qcr.CloseReasonName,
+    qcr.CloseEventCount,
+    qcr.LastCloseDate,
+    flc.CommentId,
+    flc.CommentDate,
+    flc.Text as LatestCommentText,
+    concat('Tags: ', coalesce(tq.QuestionTags, 'No Tags')) as QuestionTagsInfo,
+    case
+        when tq.AvgAnswerScore > 5 then 'Well Answered'
+        when tq.NumberOfAnswers = 0 then 'Unanswered'
+        else 'Moderate'
+    end as QuestionAnswerStatus,
+    row_number() over (partition by tu.Id order by tq.QuestionScore desc nulls last) as QuestionRowNum
+from TopUsersCTE tu
+left join UserPostSummary ups on ups.UserId = tu.Id
+left join TopQuestionsByUser tq on tq.QuestionOwner = tu.Id
+left join QuestionCloseReasons qcr on qcr.PostId = tq.QuestionId
+left join FilteredLatestComments flc on flc.PostId = tq.QuestionId
+where tu.Reputation > 5000
+  and (qcr.CloseEventCount is null or qcr.CloseEventCount < 3)
+order by tu.Reputation desc, QuestionScore desc nulls last, flc.CommentDate desc nulls last
+limit 100;

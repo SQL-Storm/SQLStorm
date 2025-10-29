@@ -1,0 +1,233 @@
+-- {"query": "7157.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2592} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id ELSE NULL END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id ELSE NULL END) AS AnswerCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Elite'
+            WHEN u.Reputation > 1000 THEN 'Veteran'
+            WHEN u.Reputation > 100 THEN 'Regular'
+            ELSE 'Newbie'
+        END AS ReputationTier,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate > '2010-01-01' AND u.AccountId IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN 'Question with Answers'
+            WHEN p.PostTypeId = 1 AND p.AnswerCount = 0 THEN 'Unanswered Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostTypeCategory,
+        CASE 
+            WHEN p.Score > 100 THEN 'Highly Voted'
+            WHEN p.Score > 20 THEN 'Moderately Voted'
+            WHEN p.Score > 0 THEN 'Slightly Voted'
+            ELSE 'No Votes'
+        END AS VoteCategory,
+        DATEDIFF('day', p.CreationDate, cast('2024-10-01 12:34:56' as timestamp)) AS DaysSinceCreation,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS ScoreRankWithinType,
+        AVG(p.Score) OVER (PARTITION BY p.PostTypeId) AS AvgScorePerType,
+        PERCENT_RANK() OVER (ORDER BY p.Score) AS ScorePercentile,
+        NTILE(4) OVER (ORDER BY p.Score) AS ScoreQuartile
+    FROM Posts p
+    WHERE p.CreationDate > '2015-01-01' 
+      AND p.Score IS NOT NULL
+      AND p.PostTypeId IN (1, 2)
+),
+PostHistorySummary AS (
+    SELECT 
+        ph.PostId,
+        COUNT(*) AS EditCount,
+        MIN(ph.CreationDate) AS FirstEditDate,
+        MAX(ph.CreationDate) AS LastEditDate,
+        COUNT(DISTINCT ph.UserId) AS EditorsCount,
+        STRING_AGG(DISTINCT ph.PostHistoryTypeId, ', ') AS EditTypes,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (1, 4, 6) THEN 1 END) AS TitleOrTagEdits,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (2, 5) THEN 1 END) AS BodyEdits
+    FROM PostHistory ph
+    WHERE ph.CreationDate > '2018-01-01'
+    GROUP BY ph.PostId
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        pa.PostId,
+        pa.Title,
+        pa.Score,
+        pa.ViewCount,
+        pa.CreationDate,
+        pa.OwnerUserId,
+        pa.PostTypeCategory,
+        pa.VoteCategory,
+        pa.DaysSinceCreation,
+        pa.ScoreRankWithinType,
+        pa.AvgScorePerType,
+        pa.ScorePercentile,
+        pa.ScoreQuartile,
+        COALESCE(phs.EditCount, 0) AS TotalEdits,
+        COALESCE(phs.EditorsCount, 0) AS UniqueEditors,
+        COALESCE(phs.TitleOrTagEdits, 0) AS TitleTagEdits,
+        COALESCE(phs.BodyEdits, 0) AS BodyEdits,
+        CASE 
+            WHEN phs.EditCount > 0 AND phs.EditorsCount > 1 THEN 'Collaborative'
+            WHEN phs.EditCount > 0 THEN 'Single Editor'
+            ELSE 'Unedited'
+        END AS EditCollaborationStyle,
+        p.OwnerDisplayName,
+        COALESCE(p.Tags, 'No Tags') AS Tags,
+        CASE 
+            WHEN p.AnswerCount > 0 THEN 
+                ROUND((CAST(p.AnswerCount AS FLOAT) / NULLIF(p.AnswerCount + p.CommentCount, 0)) * 100, 2)
+            ELSE 0 
+        END AS AnswerPercentage,
+        CASE 
+            WHEN p.PostTypeId = 1 AND EXISTS (SELECT 1 FROM Posts a WHERE a.ParentId = p.Id AND a.Score > 0) THEN 'Has High Scoring Answers'
+            ELSE 'No High Scoring Answers'
+        END AS QuestionAnswerStatus,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCountFromCommentsTable
+    FROM PostAnalysis pa
+    JOIN Posts p ON pa.PostId = p.Id
+    LEFT JOIN PostHistorySummary phs ON pa.PostId = phs.PostId
+),
+UserPostPerformance AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.TotalPosts,
+        uas.QuestionCount,
+        uas.AnswerCount,
+        uas.CommentCount,
+        uas.BadgeCount,
+        uas.ReputationTier,
+        uas.ReputationRank,
+        PERCENT_RANK() OVER (ORDER BY uas.TotalPosts) AS PostsPercentile,
+        PERCENT_RANK() OVER (ORDER BY uas.QuestionCount) AS QuestionsPercentile,
+        PERCENT_RANK() OVER (ORDER BY uas.AnswerCount) AS AnswersPercentile,
+        AVG(uas.TotalPosts) OVER () AS AvgUserPosts,
+        AVG(uas.QuestionCount) OVER () AS AvgUserQuestions,
+        AVG(uas.AnswerCount) OVER () AS AvgUserAnswers,
+        CASE 
+            WHEN uas.TotalPosts > (SELECT AVG(TotalPosts) FROM UserActivityStats) THEN 'Above Average'
+            ELSE 'Below Average'
+        END AS PerformanceCategory,
+        DENSE_RANK() OVER (ORDER BY (uas.QuestionCount + uas.AnswerCount) DESC) AS EngagementRank
+    FROM UserActivityStats uas
+),
+FinalAggregateStats AS (
+    SELECT 
+        'Overall Statistics' AS StatisticType,
+        COUNT(*) AS TotalRecords,
+        COUNT(DISTINCT upp.UserId) AS ActiveUsers,
+        COUNT(DISTINCT CASE WHEN upp.QuestionCount > 0 THEN upp.UserId ELSE NULL END) AS QuestionAuthors,
+        COUNT(DISTINCT CASE WHEN upp.AnswerCount > 0 THEN upp.UserId ELSE NULL END) AS Answerers,
+        COUNT(DISTINCT CASE WHEN upp.CommentCount > 0 THEN upp.UserId ELSE NULL END) AS Commenters,
+        COUNT(DISTINCT CASE WHEN upp.BadgeCount > 0 THEN upp.UserId ELSE NULL END) AS BadgeRecipients,
+        AVG(upp.Reputation) AS AvgReputation,
+        MAX(upp.Reputation) AS MaxReputation,
+        MIN(upp.Reputation) AS MinReputation,
+        COUNT(DISTINCT CASE WHEN upp.ReputationTier = 'Elite' THEN upp.UserId ELSE NULL END) AS EliteUsers,
+        COUNT(DISTINCT CASE WHEN upp.ReputationTier = 'Veteran' THEN upp.UserId ELSE NULL END) AS VeteranUsers,
+        COUNT(DISTINCT CASE WHEN upp.ReputationTier = 'Regular' THEN upp.UserId ELSE NULL END) AS RegularUsers,
+        COUNT(DISTINCT CASE WHEN upp.ReputationTier = 'Newbie' THEN upp.UserId ELSE NULL END) AS NewbieUsers
+    FROM UserPostPerformance upp
+    UNION ALL
+    SELECT 
+        'Post Statistics' AS StatisticType,
+        COUNT(*) AS TotalRecords,
+        COUNT(DISTINCT CASE WHEN cpa.PostTypeId = 1 THEN cpa.OwnerUserId ELSE NULL END) AS QuestionAuthors,
+        COUNT(DISTINCT CASE WHEN cpa.PostTypeId = 2 THEN cpa.OwnerUserId ELSE NULL END) AS Answerers,
+        COUNT(*) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN cpa.PostTypeCategory = 'Question with Answers' THEN cpa.OwnerUserId ELSE NULL END) AS QuestionsWithAnswers,
+        COUNT(DISTINCT CASE WHEN cpa.PostTypeCategory = 'Unanswered Question' THEN cpa.OwnerUserId ELSE NULL END) AS UnansweredQuestions,
+        COUNT(DISTINCT CASE WHEN cpa.PostTypeCategory = 'Answer' THEN cpa.OwnerUserId ELSE NULL END) AS Answers,
+        AVG(cpa.Score) AS AvgPostScore,
+        MAX(cpa.Score) AS MaxPostScore,
+        MIN(cpa.Score) AS MinPostScore,
+        AVG(cpa.ViewCount) AS AvgViews,
+        AVG(cpa.CommentCount) AS AvgComments
+    FROM ComplexPostAnalysis cpa
+    UNION ALL
+    SELECT 
+        'Edit Statistics' AS StatisticType,
+        COUNT(*) AS TotalRecords,
+        COUNT(DISTINCT CASE WHEN cpa.UniqueEditors > 0 THEN cpa.OwnerUserId ELSE NULL END) AS EditedPostsAuthors,
+        COUNT(DISTINCT CASE WHEN cpa.EditCollaborationStyle = 'Collaborative' THEN cpa.OwnerUserId ELSE NULL END) AS CollaborativePostAuthors,
+        COUNT(DISTINCT CASE WHEN cpa.EditCollaborationStyle = 'Single Editor' THEN cpa.OwnerUserId ELSE NULL END) AS SingleEditorPostAuthors,
+        COUNT(DISTINCT CASE WHEN cpa.TotalEdits = 0 THEN cpa.OwnerUserId ELSE NULL END) AS UneditedPostAuthors,
+        AVG(cpa.TotalEdits) AS AvgEditsPerPost,
+        MAX(cpa.TotalEdits) AS MaxEditsInOnePost,
+        AVG(cpa.UniqueEditors) AS AvgUniqueEditors,
+        COUNT(DISTINCT CASE WHEN cpa.TitleTagEdits > 0 THEN cpa.OwnerUserId ELSE NULL END) AS TitleOrTagEditAuthors,
+        COUNT(DISTINCT CASE WHEN cpa.BodyEdits > 0 THEN cpa.OwnerUserId ELSE NULL END) AS BodyEditAuthors
+    FROM ComplexPostAnalysis cpa
+)
+SELECT 
+    f."StatisticType",
+    f."TotalRecords",
+    f."ActiveUsers",
+    f."QuestionAuthors",
+    f."Answerers",
+    f."Commenters",
+    f."BadgeRecipients",
+    f."AvgReputation",
+    f."MaxReputation",
+    f."MinReputation",
+    f."EliteUsers",
+    f."VeteranUsers",
+    f."RegularUsers",
+    f."NewbieUsers",
+    f."TotalPosts",
+    f."QuestionsWithAnswers",
+    f."UnansweredQuestions",
+    f."Answers",
+    f."AvgPostScore",
+    f."MaxPostScore",
+    f."MinPostScore",
+    f."AvgViews",
+    f."AvgComments",
+    f."EditedPostsAuthors",
+    f."CollaborativePostAuthors",
+    f."SingleEditorPostAuthors",
+    f."UneditedPostAuthors",
+    f."AvgEditsPerPost",
+    f."MaxEditsInOnePost",
+    f."AvgUniqueEditors",
+    f."TitleOrTagEditAuthors",
+    f."BodyEditAuthors",
+    CASE 
+        WHEN f."TotalRecords" > (SELECT AVG("TotalRecords") FROM FinalAggregateStats) THEN 'Above Average'
+        ELSE 'Below Average'
+    END AS OverallPerformanceCategory,
+    ROW_NUMBER() OVER (ORDER BY f."TotalRecords" DESC) AS PerformanceRank
+FROM FinalAggregateStats f
+WHERE f."TotalRecords" > 5
+ORDER BY f."TotalRecords" DESC, f."ActiveUsers" DESC
+LIMIT 1000;

@@ -1,0 +1,80 @@
+SELECT 
+    u.DisplayName, 
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    MAX(p.Score) AS HighestScoredPost,
+    MIN(p.CreationDate) AS FirstPost,
+    MAX(p.LastActivityDate) AS LastActivity,
+    b.Name AS LatestBadge,
+    ph.Comment AS LastEditComment,
+    (
+        SELECT STRING_AGG(t.TagName, ', ')
+        FROM Tags t
+        WHERE t.Id IN (
+            SELECT CAST(tag AS INTEGER)
+            FROM (
+                SELECT UNNEST(STRING_TO_ARRAY(p.Tags, '/><')) AS tag
+            ) sub
+        )
+    ) AS Tags,
+    v.VoteTypeId AS LastVoteType,
+    vl.BountyAmount AS LastBounty
+FROM 
+    Users u
+LEFT JOIN 
+    (
+        SELECT 
+            UserId, 
+            MAX(Date) AS MaxDate,
+            -- include Name to allow joining back to badge name (pick latest badge per user)
+            MAX(Name) AS Name
+        FROM 
+            Badges
+        GROUP BY 
+            UserId
+    ) b ON u.Id = b.UserId
+LEFT JOIN 
+    (
+        SELECT 
+            UserId, 
+            PostId, 
+            VoteTypeId, 
+            BountyAmount,
+            MAX(CreationDate) AS MaxCreationDate
+        FROM 
+            Votes
+        GROUP BY
+            UserId, PostId, VoteTypeId, BountyAmount
+    ) v ON u.Id = v.UserId
+LEFT JOIN 
+    (
+        SELECT 
+            PostId, 
+            MAX(CreationDate) AS MaxDate, 
+            UserId, 
+            Comment
+        FROM 
+            PostHistory
+        WHERE 
+            PostHistoryTypeId IN (2, 5, 6, 8, 10, 11, 12, 13, 14, 15, 19, 20, 35)
+        GROUP BY 
+            PostId, 
+            UserId,
+            Comment
+    ) ph ON u.Id = ph.UserId
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Votes vl ON p.Id = vl.PostId AND vl.VoteTypeId = 8
+WHERE 
+    u.Reputation > 1000
+    AND p.LastEditDate > p.CreationDate
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation, b.Name, ph.Comment, v.VoteTypeId, vl.BountyAmount, p.Tags
+HAVING 
+    COUNT(DISTINCT p.Id) > 50
+ORDER BY 
+    u.Reputation DESC, 
+    TotalPosts DESC;

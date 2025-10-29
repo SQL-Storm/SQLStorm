@@ -1,0 +1,258 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(p.Score) AS MaxPostScore,
+        AVG(p.Score) AS AvgPostScore,
+        STRING_AGG(DISTINCT u.Location, ', ') AS Locations,
+        STRING_AGG(DISTINCT CASE 
+            WHEN p.PostTypeId = 1 THEN p.Title 
+            WHEN p.PostTypeId = 2 THEN SUBSTRING(p.Body FROM 1 FOR 50)
+        END, ' | ') AS RecentActivity,
+        COUNT(DISTINCT CASE WHEN p.Score > 100 THEN p.Id END) AS HighScorePosts,
+        CAST((EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56') - u.CreationDate) / 86400) AS INTEGER) AS AccountAge,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) = 0 THEN 'Inactive'
+            WHEN COUNT(DISTINCT p.Id) > 1000 THEN 'Elite'
+            WHEN COUNT(DISTINCT p.Id) > 500 THEN 'Veteran'
+            WHEN COUNT(DISTINCT p.Id) > 100 THEN 'Regular'
+            ELSE 'Beginner'
+        END AS UserTier
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes, u.CreationDate, u.Location
+),
+TopTags AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        COUNT(p.Id) AS TaggedPosts,
+        AVG(p.Score) AS AvgScore,
+        MAX(p.CreationDate) AS LatestPostDate,
+        STRING_AGG(DISTINCT u.DisplayName, ', ') AS TopUsers,
+        RANK() OVER (ORDER BY t.Count DESC) AS TagRank
+    FROM Tags t
+    LEFT JOIN Posts p ON POSITION(t.TagName IN p.Tags) > 0
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE t.Count > 100
+    GROUP BY t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId
+),
+PostAnalytics AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        p.ParentId,
+        p.AcceptedAnswerId,
+        p.LastEditDate,
+        p.LastActivityDate,
+        CAST((EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate)) / 86400) AS INTEGER) AS DaysActive,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN 'QuestionwithAnswers'
+            WHEN p.PostTypeId = 1 AND p.AnswerCount = 0 THEN 'UnansweredQuestion'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostCategory,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS UserPostRank,
+        NTILE(4) OVER (ORDER BY p.Score DESC) AS ScoreQuartile,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousScore,
+        LEAD(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS UserAvgScore,
+        SUM(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS CumulativeScore,
+        (SELECT Score FROM Posts WHERE Id = p.ParentId LIMIT 1) AS ParentScore,
+        CASE 
+            WHEN EXISTS (SELECT 1 FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) THEN 'Upvoted'
+            WHEN EXISTS (SELECT 1 FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) THEN 'Downvoted'
+            ELSE 'NoVotes'
+        END AS VoteStatus,
+        CASE 
+            WHEN p.Tags LIKE '%<c>%' THEN 'C++Related'
+            WHEN p.Tags LIKE '%<python>%' THEN 'PythonRelated'
+            WHEN p.Tags LIKE '%<javascript>%' THEN 'JavaScriptRelated'
+            ELSE 'OtherLanguage'
+        END AS LanguageCategory
+    FROM Posts p
+),
+EngagementMetrics AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        CASE 
+            WHEN p.ViewCount > 0 THEN (p.Score::double precision / p.ViewCount)
+            ELSE 0 
+        END AS ScoreToViewRatio,
+        CASE 
+            WHEN p.AnswerCount > 0 THEN (p.Score::double precision / p.AnswerCount)
+            ELSE 0 
+        END AS ScoreToAnswerRatio,
+        CASE 
+            WHEN p.CommentCount > 0 THEN (p.Score::double precision / p.CommentCount)
+            ELSE 0 
+        END AS ScoreToCommentRatio,
+        CASE 
+            WHEN p.AnswerCount > 0 AND p.ViewCount > 0 THEN (p.AnswerCount::double precision / p.ViewCount)
+            ELSE 0 
+        END AS AnswerToViewRatio,
+        COALESCE(p.AcceptedAnswerId, 0) AS HasAcceptedAnswer,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+        CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN 1 ELSE 0 END AS IsCommunityOwned,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) AS RankByScore,
+        PERCENT_RANK() OVER (ORDER BY p.Score) AS PercentileRank,
+        p.ParentId AS AnswerParentId
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+ComplexJoinResults AS (
+    SELECT 
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.PostCount,
+        us.QuestionCount,
+        us.AnswerCount,
+        us.CommentCount,
+        us.BadgeCount,
+        us.MaxPostScore,
+        us.AvgPostScore,
+        us.UserTier,
+        tt.TagName,
+        tt.TaggedPosts,
+        tt.AvgScore,
+        tt.TopUsers,
+        pa.Id AS PostId,
+        pa.Title AS PostTitle,
+        pa.Score AS PostScore,
+        pa.ViewCount AS PostViewCount,
+        pa.AnswerCount AS PostAnswerCount,
+        pa.CommentCount AS PostCommentCount,
+        pa.DaysActive,
+        pa.PostCategory,
+        pa.UserPostRank,
+        pa.ScoreQuartile,
+        pa.ParentScore,
+        pa.VoteStatus,
+        pa.LanguageCategory,
+        em.ScoreToViewRatio,
+        em.ScoreToAnswerRatio,
+        em.ScoreToCommentRatio,
+        em.AnswerToViewRatio,
+        em.HasAcceptedAnswer,
+        em.IsClosed,
+        em.IsCommunityOwned,
+        em.RankByScore,
+        em.PercentileRank
+    FROM UserStats us
+    INNER JOIN TopTags tt ON tt.TagRank <= 5
+    INNER JOIN PostAnalytics pa ON us.UserId = pa.OwnerUserId
+    INNER JOIN EngagementMetrics em ON pa.Id = em.Id
+    WHERE pa.Score > 50 
+      AND pa.PostTypeId IN (1, 2)
+      AND pa.DaysActive >= 30
+)
+
+SELECT 
+    COUNT(*) AS TotalRecords,
+    COUNT(DISTINCT UserId) AS UniqueUsers,
+    COUNT(DISTINCT TagName) AS UniqueTags,
+    COUNT(DISTINCT PostId) AS UniquePosts,
+    AVG(Reputation) AS AvgReputation,
+    AVG(PostScore) AS AvgPostScore,
+    AVG(PostViewCount) AS AvgPostViewCount,
+    AVG(PostAnswerCount) AS AvgAnswerCount,
+    AVG(ScoreToViewRatio) AS AvgScoreToViewRatio,
+    AVG(ScoreToAnswerRatio) AS AvgScoreToAnswerRatio,
+    AVG(ScoreToCommentRatio) AS AvgScoreToCommentRatio,
+    SUM(CASE WHEN HasAcceptedAnswer > 0 THEN 1 ELSE 0 END) AS PostsWithAcceptedAnswer,
+    SUM(CASE WHEN IsClosed > 0 THEN 1 ELSE 0 END) AS ClosedPosts,
+    SUM(CASE WHEN IsCommunityOwned > 0 THEN 1 ELSE 0 END) AS CommunityOwnedPosts,
+    MAX(MaxPostScore) AS MaxUserPostScore,
+    MIN(PostScore) AS MinPostScore,
+    STRING_AGG(DisplayName || ' (' || Reputation || ')', '; ') AS TopUsers,
+    STRING_AGG(TagName || ' (' || TaggedPosts || ')', ', ') AS TopTagsWithCounts,
+    STRING_AGG(PostTitle || ' (' || PostScore || ')', ' | ') AS TopPosts,
+    STRING_AGG(TO_CHAR(COALESCE((SELECT p2.CreationDate FROM Posts p2 WHERE p2.Id = PostId), NULL), 'YYYY-MM-DD') || ': ' || PostCategory, '; ') AS RecentActivitySummary
+FROM ComplexJoinResults
+WHERE EXISTS (
+    SELECT 1 
+    FROM Posts p 
+    WHERE p.OwnerUserId = ComplexJoinResults.UserId 
+      AND p.Score > 1000
+)
+AND (
+    PostScore > (SELECT AVG(PostScore) FROM ComplexJoinResults)
+    OR PostViewCount > (SELECT AVG(PostViewCount) FROM ComplexJoinResults)
+)
+GROUP BY 
+    UserId,
+    DisplayName,
+    Reputation,
+    PostCount,
+    QuestionCount,
+    AnswerCount,
+    CommentCount,
+    BadgeCount,
+    MaxPostScore,
+    AvgPostScore,
+    UserTier,
+    TagName,
+    TaggedPosts,
+    AvgScore,
+    TopUsers,
+    PostId,
+    PostTitle,
+    PostScore,
+    PostViewCount,
+    PostAnswerCount,
+    PostCommentCount,
+    DaysActive,
+    PostCategory,
+    UserPostRank,
+    ScoreQuartile,
+    ParentScore,
+    VoteStatus,
+    LanguageCategory,
+    ScoreToViewRatio,
+    ScoreToAnswerRatio,
+    ScoreToCommentRatio,
+    AnswerToViewRatio,
+    HasAcceptedAnswer,
+    IsClosed,
+    IsCommunityOwned,
+    RankByScore,
+    PercentileRank
+HAVING 
+    COUNT(*) > 1
+    AND COUNT(DISTINCT PostId) > 2
+    AND AVG(PostScore) > 10
+    AND MAX(PostScore) > 1000
+    AND MIN(PostScore) > 0
+ORDER BY 
+    AvgPostScore DESC,
+    COUNT(*) DESC,
+    MAX(MaxPostScore) DESC,
+    SUM(PostScore) DESC
+OFFSET 10
+LIMIT 30;

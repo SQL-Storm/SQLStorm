@@ -1,0 +1,120 @@
+WITH
+recent_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.LastActivityDate,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.AcceptedAnswerId,
+    p.ParentId
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+tag_activity AS (
+  SELECT
+    unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS tag,
+    COUNT(*) AS qcount,
+    SUM(p.Score) AS total_score,
+    SUM(p.ViewCount) AS total_views
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+  GROUP BY unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'))
+),
+per_user_activity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT r.Id) AS recent_questions,
+    SUM(r.Score) AS recent_score,
+    AVG(r.ViewCount) AS avg_views
+  FROM Users u
+  LEFT JOIN Posts r ON r.OwnerUserId = u.Id AND r.PostTypeId = 1
+  WHERE u.AccountId IS NOT NULL
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+av_scores AS (
+  SELECT
+    tag,
+    SUM(q.Score) AS total_score
+  FROM Posts q
+  CROSS JOIN (
+    SELECT DISTINCT unnest(string_to_array(substring(Tags, 2, length(Tags)-2), '><')) AS tag
+    FROM Posts
+    WHERE PostTypeId = 1
+  ) ta
+  GROUP BY tag
+),
+complex_metrics AS (
+  SELECT
+    q.PostId,
+    q.Title,
+    q.CreationDate,
+    q.OwnerUserId,
+    q.Score AS question_score,
+    q.ViewCount AS question_views,
+    COALESCE(av.total_score, 0) AS avg_tag_score,
+    COALESCE(ta.total_views, 0) AS tag_total_views,
+    CASE WHEN q.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS has_accepted,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = q.PostId AND v.VoteTypeId = 2) AS upvotes,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = q.PostId AND v.VoteTypeId = 3) AS downvotes,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = q.PostId) AS comment_count
+  FROM recent_questions q
+  LEFT JOIN tag_activity ta ON true
+  LEFT JOIN av_scores av
+    ON av.tag = ANY(string_to_array(substring(q.Tags, 2, length(q.Tags)-2), '><'))
+)
+SELECT
+  cm.PostId,
+  cm.Title,
+  cm.CreationDate,
+  cm.OwnerUserId,
+  cm.question_score,
+  cm.question_views,
+  cm.avg_tag_score,
+  cm.tag_total_views,
+  cm.has_accepted,
+  cm.upvotes,
+  cm.downvotes,
+  cm.comment_count,
+  pu.UserId AS commenter_userid,
+  pu.DisplayName AS commenter_name,
+  pu.Reputation AS commenter_reputation
+FROM complex_metrics cm
+LEFT JOIN Posts p2 ON p2.Id = cm.PostId
+LEFT JOIN LATERAL (
+  SELECT
+    c.UserId,
+    u.DisplayName,
+    u.Reputation
+  FROM Comments c
+  JOIN Users u ON u.Id = c.UserId
+  WHERE c.PostId = cm.PostId
+  ORDER BY c.CreationDate DESC
+  LIMIT 1
+) pu ON true
+GROUP BY
+  cm.PostId,
+  cm.Title,
+  cm.CreationDate,
+  cm.OwnerUserId,
+  cm.question_score,
+  cm.question_views,
+  cm.avg_tag_score,
+  cm.tag_total_views,
+  cm.has_accepted,
+  cm.upvotes,
+  cm.downvotes,
+  cm.comment_count,
+  pu.UserId,
+  pu.DisplayName,
+  pu.Reputation,
+  p2.Id
+ORDER BY cm.question_views DESC, cm.question_score DESC
+LIMIT 100;

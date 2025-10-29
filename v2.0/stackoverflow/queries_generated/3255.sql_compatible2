@@ -1,0 +1,79 @@
+WITH 
+UserScores AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 5
+                         WHEN p.PostTypeId = 2 THEN 2
+                         ELSE 0 END), 0) AS PostScore,
+        COALESCE(SUM(COALESCE(v.UpVotes,0)) - SUM(COALESCE(v.DownVotes,0)), 0) AS VoteBalance,
+        COALESCE(COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END), 0) AS GoldBadges,
+        COALESCE(COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END), 0) AS SilverBadges,
+        COALESCE(COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END), 0) AS BronzeBadges,
+        COALESCE(AVG(p.ViewCount), 0) AS AvgViews,
+        COALESCE(MIN(p.CreationDate), TIMESTAMP '1970-01-01 00:00:00') AS FirstPostDate,
+        COALESCE(MAX(p.CreationDate), TIMESTAMP '1970-01-01 00:00:00') AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId = 2
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+UserActivityWindow AS (
+    SELECT 
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.PostScore,
+        us.VoteBalance,
+        us.GoldBadges,
+        us.SilverBadges,
+        us.BronzeBadges,
+        us.AvgViews,
+        us.FirstPostDate,
+        us.LastPostDate,
+        ROW_NUMBER() OVER (PARTITION BY us.UserId ORDER BY us.LastPostDate DESC) AS rn,
+        (SELECT COUNT(*) 
+         FROM Posts p2 
+         WHERE p2.OwnerUserId = us.UserId 
+           AND p2.CreationDate >= us.LastPostDate - INTERVAL '30' DAY) AS PostsLast30Days,
+        (SELECT COUNT(*) 
+         FROM Votes v2 
+         JOIN Posts p3 ON p3.Id = v2.PostId 
+         WHERE p3.OwnerUserId = us.UserId 
+           AND v2.VoteTypeId = 2 
+           AND v2.CreationDate >= us.LastPostDate - INTERVAL '30' DAY) AS UpVotesLast30Days
+    FROM UserScores us
+)
+SELECT 
+    a.UserId,
+    COALESCE(a.DisplayName, 'Anonymous') AS DisplayName,
+    a.Reputation,
+    a.PostScore,
+    a.VoteBalance,
+    a.GoldBadges,
+    a.SilverBadges,
+    a.BronzeBadges,
+    ROUND(a.AvgViews, 2) AS AvgViews,
+    a.FirstPostDate,
+    a.LastPostDate,
+    a.PostsLast30Days,
+    a.UpVotesLast30Days,
+    ROUND(
+        (a.Reputation * 0.0005) +
+        (a.PostScore * 2) +
+        (a.VoteBalance * 1.5) +
+        (a.GoldBadges * 50) +
+        (a.SilverBadges * 20) +
+        (a.BronzeBadges * 5) +
+        (a.AvgViews * 0.001) +
+        (a.PostsLast30Days * 3) +
+        (a.UpVotesLast30Days * 0.5)
+    , 2) AS CompositeScore
+FROM UserActivityWindow a
+WHERE a.rn = 1
+  AND a.Reputation > 1000
+  AND (a.GoldBadges + a.SilverBadges + a.BronzeBadges) >= 5
+ORDER BY CompositeScore DESC
+LIMIT 100;

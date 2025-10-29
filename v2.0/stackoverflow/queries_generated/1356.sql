@@ -1,0 +1,229 @@
+-- {"query": "1356.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3243} 
+
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Reputation,
+        U.Views AS UserViews,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswers,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesGiven,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesGiven,
+        SUM(CASE WHEN V.VoteTypeId = 5 THEN 1 ELSE 0 END) AS TotalFavoritesGiven, -- Note: This feature was removed after October 2022
+        SUM(COALESCE(P.Score, 0)) AS TotalPostScoreContribution,
+        MAX(COALESCE(P.LastActivityDate, C.CreationDate, U.CreationDate)) AS LastActivityDateFromContent
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Votes V ON U.Id = V.UserId
+    GROUP BY U.Id, U.DisplayName, U.CreationDate, U.LastAccessDate, U.Reputation, U.Views
+),
+PostHistoryAndLinks AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.CreationDate AS PostCreationDate,
+        P.Title,
+        P.Tags AS RawTags, -- Tags are stored as <tag1><tag2>
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.OwnerUserId,
+        P.LastEditDate,
+        P.ClosedDate,
+        COUNT(DISTINCT PH.Id) AS TotalHistoryEntries,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS TotalMinorEdits, -- Edit Title, Edit Body, Edit Tags
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (10, 12) THEN 1 ELSE 0 END) AS TotalCloseDeleteEvents, -- Post Closed, Post Deleted
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (11, 13) THEN 1 ELSE 0 END) AS TotalReopenUndeleteEvents, -- Post Reopened, Post Undeleted
+        -- Calculate time difference in hours between first post history event and last edit date
+        EXTRACT(EPOCH FROM (P.LastEditDate - MIN(PH.CreationDate) OVER (PARTITION BY P.Id))) / 3600 AS HoursToFirstEdit,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.CreationDate END) AS LatestEditHistoryDate,
+        COUNT(DISTINCT PL.RelatedPostId) AS TotalRelatedPosts,
+        SUM(CASE WHEN PL.LinkTypeId = 3 THEN 1 ELSE 0 END) AS TotalDuplicateLinks,
+        -- The 'Comment' field contains CloseReasonId if PostHistoryTypeId = 10
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 AND PH.Comment IS NOT NULL THEN PH.Comment ELSE NULL END) AS LastCloseReasonIdString
+    FROM Posts P
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    LEFT JOIN PostLinks PL ON P.Id = PL.PostId
+    LEFT JOIN PostTypes PT ON P.PostTypeId = PT.Id
+    GROUP BY P.Id, P.PostTypeId, PT.Name, P.CreationDate, P.Title, P.Tags, P.Score, P.ViewCount, P.OwnerUserId, P.LastEditDate, P.ClosedDate
+),
+BadgeSummary AS (
+    SELECT
+        B.UserId,
+        COUNT(B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MIN(B.Date) AS FirstBadgeDate,
+        MAX(B.Date) AS LastBadgeDate,
+        -- Correlated subquery: check if user has a specific silver badge
+        EXISTS (SELECT 1 FROM Badges B_inner WHERE B_inner.UserId = B.UserId AND B_inner.Name = 'Editor' AND B_inner.Class = 2) AS HasEditorSilverBadge
+    FROM Badges B
+    GROUP BY B.UserId
+),
+TopPostsCombined AS (
+    -- Set operator: UNION ALL to combine high-view questions and high-score answers
+    SELECT
+        P.Id AS PostId,
+        P.Title,
+        P.CreationDate,
+        P.PostTypeId,
+        P.Score,
+        P.ViewCount,
+        'HighViewQuestion' AS Reason
+    FROM Posts P
+    WHERE P.PostTypeId = 1 AND P.ViewCount > 50000 AND P.Score > 100
+    UNION ALL
+    SELECT
+        P.Id AS PostId,
+        -- Subquery to get parent question's title for answers
+        (SELECT Title FROM Posts WHERE Id = P.ParentId) AS Title,
+        P.CreationDate,
+        P.PostTypeId,
+        P.Score,
+        P.ViewCount,
+        'HighScoreAnswer' AS Reason
+    FROM Posts P
+    WHERE P.PostTypeId = 2 AND P.Score > 200 AND P.ParentId IS NOT NULL
+),
+FinalQueryStage AS (
+    SELECT
+        UAS.UserId,
+        UAS.DisplayName,
+        UAS.Reputation,
+        UAS.UserViews,
+        UAS.TotalPosts,
+        UAS.TotalQuestions,
+        UAS.TotalAnswers,
+        UAS.TotalComments,
+        UAS.TotalUpVotesGiven,
+        UAS.TotalDownVotesGiven,
+        BS.TotalBadges,
+        BS.GoldBadges,
+        BS.SilverBadges,
+        BS.BronzeBadges,
+        BS.HasEditorSilverBadge,
+        PHL.PostId,
+        PHL.PostTypeName,
+        PHL.PostCreationDate,
+        PHL.Title AS PostTitle,
+        PHL.PostScore,
+        PHL.ViewCount AS PostViewCount,
+        PHL.TotalMinorEdits,
+        PHL.TotalCloseDeleteEvents,
+        PHL.TotalDuplicateLinks,
+        CR.Name AS LastCloseReasonName, -- Joined close reason name
+        PHL.RawTags,
+        TPC.Reason AS TopPostReason,
+        -- Window functions for user ranking and post analysis
+        RANK() OVER (PARTITION BY EXTRACT(YEAR FROM UAS.UserCreationDate) ORDER BY UAS.Reputation DESC, UAS.TotalPosts DESC) AS UserReputationRankByYear,
+        NTILE(5) OVER (ORDER BY UAS.TotalPosts DESC) AS UserPostCountQuintile,
+        LAG(PHL.PostScore, 1, 0) OVER (PARTITION BY UAS.UserId ORDER BY PHL.PostCreationDate) AS PreviousPostScoreByAuthor,
+        AVG(PHL.PostScore) OVER (PARTITION BY UAS.UserId ORDER BY PHL.PostCreationDate ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) AS AvgPostScoreLast4ByAuthor,
+        -- Correlated subquery for average comment score for the post's owner's comments across all their posts
+        (SELECT AVG(C_sub.Score)
+         FROM Comments C_sub
+         WHERE C_sub.UserId = UAS.UserId
+           AND C_sub.CreationDate BETWEEN UAS.UserCreationDate AND UAS.LastAccessDate) AS AvgUserCommentScore,
+        -- Complex expressions and NULL logic
+        COALESCE(UAS.DisplayName, 'Anonymous User #' || UAS.UserId) AS EffectiveDisplayName,
+        NULLIF(UAS.TotalQuestions, 0) AS QuestionsPostedIfAny, -- Returns NULL if TotalQuestions is 0
+        (UAS.TotalUpVotesGiven * 0.8 + UAS.TotalDownVotesGiven * -0.3 + COALESCE(UAS.TotalFavoritesGiven, 0) * 0.5) AS DerivedVoteInteractionScore,
+        CASE
+            WHEN UAS.Reputation > 20000 AND BS.GoldBadges >= 10 AND BS.HasEditorSilverBadge THEN 'Legendary Editor'
+            WHEN UAS.Reputation > 5000 AND BS.SilverBadges >= 5 THEN 'Distinguished Contributor'
+            WHEN UAS.TotalPosts > 200 AND UAS.TotalComments > 100 THEN 'Proactive Community Voice'
+            ELSE 'Engaged User'
+        END AS UserEngagementTier,
+        EXTRACT(DAY FROM (UAS.LastAccessDate - UAS.UserCreationDate)) AS DaysSinceCreation,
+        AGE(CURRENT_TIMESTAMP, UAS.LastAccessDate) AS TimeSinceLastAccess,
+        -- String expressions
+        (POSITION('<sql>' IN LOWER(PHL.RawTags)) > 0 OR POSITION('<database>' IN LOWER(PHL.RawTags)) > 0 OR LOWER(PHL.Title) LIKE '%query%') AS IsSqlRelatedContent,
+        LEFT(TRIM(REPLACE(REPLACE(COALESCE(PHL.RawTags, ''), '<', ' '), '>', ' ')), 50) AS CleanedTagsSnippet,
+        PHL.ClosedDate IS NOT NULL AS IsPostClosed,
+        (PHL.TotalDuplicateLinks > 0 AND CR.Name = 'Duplicate') AS IsClosedAsActualDuplicate,
+        CASE WHEN UAS.TotalPosts = 0 THEN 0.0 ELSE CAST(UAS.TotalComments AS NUMERIC) / UAS.TotalPosts END AS CommentsPerPostRatio,
+        DATE_TRUNC('month', PHL.PostCreationDate) AS PostCreationMonth,
+        -- Additional window functions for filtering in the outer query
+        COUNT(PHL.PostId) OVER (PARTITION BY UAS.UserId) AS UserQualifyingPostsCount,
+        SUM(CASE WHEN PHL.PostScore > 0 THEN 1 ELSE 0 END) OVER (PARTITION BY UAS.UserId) AS UserPositiveScoredPostsCount
+    FROM UserActivitySummary UAS
+    LEFT JOIN BadgeSummary BS ON UAS.UserId = BS.UserId
+    LEFT JOIN PostHistoryAndLinks PHL ON UAS.UserId = PHL.OwnerUserId
+    LEFT JOIN CloseReasonTypes CR ON TRY_CAST(PHL.LastCloseReasonIdString AS SMALLINT) = CR.Id -- TRY_CAST handles potential non-numeric strings
+    LEFT JOIN TopPostsCombined TPC ON PHL.PostId = TPC.PostId
+    WHERE
+        UAS.TotalPosts > 10 -- Minimum activity threshold for users
+        AND UAS.UserCreationDate >= '2015-01-01' -- Focus on more recent user activity
+        AND PHL.PostCreationDate IS NOT NULL -- Ensure there's an associated post in PHL CTE
+        AND (
+            (PHL.PostTypeId = 1 AND PHL.ViewCount > 500 AND PHL.PostScore > 20 AND PHL.RawTags LIKE '%<programming>%') -- Popular programming questions
+            OR
+            (PHL.PostTypeId = 2 AND PHL.PostScore > 30 AND PHL.LastEditDate IS NOT NULL AND PHL.TotalMinorEdits >= 2) -- Well-scored and edited answers
+        )
+        -- Correlated subquery with NOT EXISTS
+        AND NOT EXISTS (SELECT 1 FROM Comments C_ne WHERE C_ne.PostId = PHL.PostId AND C_ne.Text LIKE '%spam%' AND C_ne.CreationDate > PHL.PostCreationDate)
+        AND (PHL.HoursToFirstEdit IS NULL OR PHL.HoursToFirstEdit BETWEEN 1 AND 72) -- Posts with first edit within 1 to 72 hours, or no edits
+        AND (TPC.Reason IS NULL OR TPC.Reason = 'HighViewQuestion' OR TPC.Reason = 'HighScoreAnswer') -- Only include posts that are NOT marked as TopPost for a different reason (if any)
+)
+SELECT
+    UserId,
+    DisplayName,
+    Reputation,
+    UserViews,
+    TotalPosts,
+    TotalQuestions,
+    TotalAnswers,
+    TotalComments,
+    TotalUpVotesGiven,
+    TotalDownVotesGiven,
+    TotalBadges,
+    GoldBadges,
+    SilverBadges,
+    BronzeBadges,
+    HasEditorSilverBadge,
+    PostId,
+    PostTypeName,
+    PostCreationDate,
+    PostTitle,
+    PostScore,
+    PostViewCount,
+    TotalMinorEdits,
+    TotalCloseDeleteEvents,
+    TotalDuplicateLinks,
+    LastCloseReasonName,
+    RawTags,
+    TopPostReason,
+    UserReputationRankByYear,
+    UserPostCountQuintile,
+    PreviousPostScoreByAuthor,
+    AvgPostScoreLast4ByAuthor,
+    AvgUserCommentScore,
+    EffectiveDisplayName,
+    QuestionsPostedIfAny,
+    DerivedVoteInteractionScore,
+    UserEngagementTier,
+    DaysSinceCreation,
+    TimeSinceLastAccess,
+    IsSqlRelatedContent,
+    CleanedTagsSnippet,
+    IsPostClosed,
+    IsClosedAsActualDuplicate,
+    CommentsPerPostRatio,
+    PostCreationMonth
+FROM FinalQueryStage
+WHERE
+    UserQualifyingPostsCount > 2 -- Filter for users with at least 3 posts matching the inner WHERE criteria
+    AND (UserPositiveScoredPostsCount > 0 OR TotalBadges > 0) -- User must have at least one positive-scored post OR at least one badge
+ORDER BY
+    Reputation DESC,
+    UserEngagementTier,
+    PostScore DESC,
+    PostCreationDate DESC NULLS LAST
+LIMIT 50000;

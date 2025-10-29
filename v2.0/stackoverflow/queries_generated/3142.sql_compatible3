@@ -1,0 +1,140 @@
+WITH
+    UserStats AS (
+        SELECT
+            u.Id,
+            u.DisplayName,
+            u.Reputation,
+            u.CreationDate,
+            COALESCE(u.Views, 0) AS Views,
+            COUNT(CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+            COUNT(CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+            COUNT(CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+            COUNT(CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+            COUNT(CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+            SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS QuestionScoreSum,
+            SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS AnswerScoreSum
+        FROM Users u
+        LEFT JOIN Badges b   ON b.UserId = u.Id
+        LEFT JOIN Posts p    ON p.OwnerUserId = u.Id
+        GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Views
+    ),
+
+    RecentActivity AS (
+        SELECT
+            u.Id AS UserId,
+            MAX(CASE WHEN p.PostTypeId = 1 THEN p.CreationDate END) AS LastQuestionDate,
+            MAX(CASE WHEN p.PostTypeId = 2 THEN p.CreationDate END) AS LastAnswerDate,
+            MAX(c.CreationDate) AS LastCommentDate,
+            MAX(v.CreationDate) AS LastVoteDate
+        FROM Users u
+        LEFT JOIN Posts    p ON p.OwnerUserId = u.Id
+        LEFT JOIN Comments c ON c.UserId = u.Id
+        LEFT JOIN Votes    v ON v.UserId = u.Id
+        GROUP BY u.Id
+    ),
+
+    UserTopPost AS (
+        SELECT
+            u.Id AS UserId,
+            (
+              SELECT p2.Id
+              FROM Posts p2
+              WHERE p2.OwnerUserId = u.Id
+                AND p2.PostTypeId IN (1, 2)
+              ORDER BY (
+                SELECT COUNT(*) FROM Votes v2 WHERE v2.PostId = p2.Id AND v2.VoteTypeId = 2
+              ) DESC
+              LIMIT 1
+            ) AS TopPostId
+        FROM Users u
+    ),
+
+    ReputationChanges AS (
+        SELECT
+            u.Id,
+            u.Reputation,
+            SUM(
+                CASE
+                    WHEN v.VoteTypeId = 2 THEN 10
+                    WHEN v.VoteTypeId = 3 THEN -2
+                    ELSE 0
+                END
+            ) OVER (
+                PARTITION BY u.Id
+                ORDER BY v.CreationDate
+                RANGE BETWEEN INTERVAL '30' DAY PRECEDING AND CURRENT ROW
+            ) AS RepLast30Days,
+            v.CreationDate AS vc
+        FROM Users u
+        LEFT JOIN Votes v
+               ON v.UserId = u.Id
+              AND v.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '30' DAY)
+        GROUP BY u.Id, u.Reputation, v.CreationDate
+    ),
+
+    MainResult AS (
+    SELECT
+        us.Id,
+        us.DisplayName,
+        us.Reputation,
+        us.Views,
+        us.GoldBadges,
+        us.SilverBadges,
+        us.BronzeBadges,
+        us.QuestionCount,
+        us.AnswerCount,
+        us.QuestionScoreSum,
+        us.AnswerScoreSum,
+        ra.LastQuestionDate,
+        ra.LastAnswerDate,
+        ra.LastCommentDate,
+        ra.LastVoteDate,
+        COALESCE(utp.TopPostId, -1) AS TopPostId,
+        rc.RepLast30Days,
+        CASE
+            WHEN us.Reputation > 20000 THEN 'Legendary'
+            WHEN us.Reputation > 10000 THEN 'Expert'
+            WHEN us.Reputation > 5000  THEN 'Experienced'
+            ELSE 'Novice'
+        END AS ReputationTier,
+        COALESCE(NULLIF(us.DisplayName, ''), 'Anonymous') AS SafeDisplayName,
+        ('User_' || us.Id) AS UserCode
+    FROM UserStats us
+    LEFT JOIN RecentActivity ra       ON ra.UserId = us.Id
+    LEFT JOIN UserTopPost utp         ON utp.UserId = us.Id
+    LEFT JOIN ReputationChanges rc    ON rc.Id = us.Id
+    WHERE (us.QuestionCount + us.AnswerCount) > 0
+      AND us.Reputation IS NOT NULL
+    )
+
+SELECT *
+FROM MainResult
+WHERE 1=1
+ORDER BY Reputation DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    -1 AS Id,
+    'Community' AS DisplayName,
+    SUM(us.Reputation) AS Reputation,
+    CAST(NULL AS INTEGER) AS Views,
+    SUM(us.GoldBadges) AS GoldBadges,
+    SUM(us.SilverBadges) AS SilverBadges,
+    SUM(us.BronzeBadges) AS BronzeBadges,
+    SUM(us.QuestionCount) AS QuestionCount,
+    SUM(us.AnswerCount) AS AnswerCount,
+    SUM(us.QuestionScoreSum) AS QuestionScoreSum,
+    SUM(us.AnswerScoreSum) AS AnswerScoreSum,
+    CAST(NULL AS TIMESTAMP) AS LastQuestionDate,
+    CAST(NULL AS TIMESTAMP) AS LastAnswerDate,
+    CAST(NULL AS TIMESTAMP) AS LastCommentDate,
+    CAST(NULL AS TIMESTAMP) AS LastVoteDate,
+    CAST(NULL AS BIGINT) AS TopPostId,
+    CAST(NULL AS NUMERIC) AS RepLast30Days,
+    'Aggregated' AS ReputationTier,
+    'Community' AS SafeDisplayName,
+    'User_-1' AS UserCode
+FROM UserStats us
+WHERE us.Reputation > 0;

@@ -1,0 +1,225 @@
+-- {"query": "1602.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3396} 
+WITH GoldBadgeUsers AS (
+    SELECT DISTINCT
+        b.UserId
+    FROM Badges b
+    WHERE b.Class = 1 -- Class 1 for Gold badges
+),
+TaggedQuestions AS (
+    SELECT
+        p.Id AS QuestionId,
+        LOWER(UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><'))) AS TagName
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.Tags IS NOT NULL
+      AND LENGTH(p.Tags) > 2
+),
+PopularQuestionsMetaData AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.CreationDate AS QuestionCreationDate,
+        q.Score AS QuestionScore,
+        q.ViewCount AS QuestionViewCount,
+        q.AnswerCount AS QuestionAnswerCount,
+        COALESCE(q.FavoriteCount, 0) AS QuestionFavoriteCount,
+        STRING_AGG(DISTINCT tq.TagName, ',') AS QuestionTagsListLower -- Aggregating parsed tags
+    FROM Posts q
+    LEFT JOIN TaggedQuestions tq ON q.Id = tq.QuestionId
+    WHERE q.PostTypeId = 1
+      AND q.ViewCount > 5000 -- Popularity threshold for views
+      AND q.Score > 25 -- Quality threshold for score
+      AND q.AnswerCount > 5 -- Indicates active discussion
+    GROUP BY q.Id, q.CreationDate, q.Score, q.ViewCount, q.AnswerCount, q.FavoriteCount
+),
+TopPerformingAnswers AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.OwnerUserId AS AnswerOwnerUserId,
+        a.Score AS AnswerScore,
+        a.CommentCount AS AnswerCommentCount,
+        a.CreationDate AS AnswerCreationDate,
+        RANK() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS RankInQuestion -- Rank answers within each question
+    FROM Posts a
+    WHERE a.PostTypeId = 2 -- Answer posts
+      AND a.OwnerUserId IS NOT NULL
+      AND a.Score > 0 -- Only positive scored answers
+),
+UserEngagementMetrics AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.Views AS UserProfileViews,
+        u.UpVotes AS UserReceivedUpVotes,
+        u.DownVotes AS UserReceivedDownVotes,
+        (SELECT COUNT(DISTINCT p.Id) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS QuestionsPosted, -- Correlated subquery for questions posted
+        (SELECT COUNT(DISTINCT p.Id) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS AnswersPosted, -- Correlated subquery for answers posted
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN 1 ELSE 0 END) AS TotalEdits, -- Edits (Title, Body, Tags)
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 AND ph.Comment IS NOT NULL THEN 1 ELSE 0 END) AS PostsClosedByVote, -- Post Closed by vote with reason
+        SUM(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS PostsReopened, -- Post Reopened
+        COUNT(DISTINCT pl.RelatedPostId) AS LinkedPostsCount, -- Number of distinct posts linked by user's posts
+        COUNT(DISTINCT v.PostId) AS TotalVotedPosts,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesGiven, -- Upvotes given by user
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesGiven, -- Downvotes given by user
+        SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoritesMade, -- Posts marked favorite by user
+        MAX(v.CreationDate) AS LastVoteDate
+    FROM Users u
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    LEFT JOIN PostLinks pl ON pl.PostId IN (SELECT p_link.Id FROM Posts p_link WHERE p_link.OwnerUserId = u.Id AND p_link.OwnerUserId IS NOT NULL) -- Correlated subquery in ON clause for links
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Views, u.UpVotes, u.DownVotes
+),
+ActiveContributionSummary AS (
+    SELECT
+        uem.UserId,
+        uem.DisplayName,
+        uem.Reputation,
+        uem.UserProfileViews,
+        uem.UserReceivedUpVotes,
+        uem.UserReceivedDownVotes,
+        uem.QuestionsPosted,
+        uem.AnswersPosted,
+        uem.TotalEdits,
+        uem.PostsClosedByVote,
+        uem.PostsReopened,
+        uem.LinkedPostsCount,
+        uem.UpVotesGiven,
+        uem.DownVotesGiven,
+        uem.FavoritesMade,
+        uem.LastVoteDate,
+        (gb.UserId IS NOT NULL) AS HasGoldBadge, -- NULL logic: check for existence of gold badge
+        COUNT(DISTINCT tpa.AnswerId) AS TopAnswersCount,
+        SUM(CASE WHEN tpa.RankInQuestion = 1 THEN 1 ELSE 0 END) AS BestAnswersCount,
+        COALESCE(AVG(tpa.AnswerScore), 0) AS AvgTopAnswerScore,
+        COALESCE(MAX(pq.QuestionScore), 0) AS MaxPopularQuestionScore,
+        COALESCE(SUM(pq.QuestionFavoriteCount), 0) AS TotalQuestionFavoritesForAnsweredQuestions,
+        SUM(CASE WHEN pq.QuestionTagsListLower LIKE '%sql%' OR pq.QuestionTagsListLower LIKE '%database%' THEN 1 ELSE 0 END) AS SqlRelatedActivity, -- String expression for tag filtering
+        (SELECT COALESCE(AVG(LENGTH(c.Text)), 0) -- Correlated subquery for average comment length
+         FROM Comments c
+         JOIN TopPerformingAnswers tpa_inner ON c.PostId = tpa_inner.AnswerId
+         JOIN PopularQuestionsMetaData pq_inner ON tpa_inner.QuestionId = pq_inner.QuestionId
+         WHERE tpa_inner.AnswerOwnerUserId = uem.UserId AND tpa_inner.RankInQuestion <= 3 AND c.Text IS NOT NULL) AS AvgCommentLengthOnTheirTopAnswers
+    FROM UserEngagementMetrics uem
+    LEFT JOIN GoldBadgeUsers gb ON uem.UserId = gb.UserId
+    LEFT JOIN TopPerformingAnswers tpa ON uem.UserId = tpa.AnswerOwnerUserId
+    LEFT JOIN PopularQuestionsMetaData pq ON tpa.QuestionId = pq.QuestionId
+    GROUP BY
+        uem.UserId, uem.DisplayName, uem.Reputation, uem.UserProfileViews, uem.UserReceivedUpVotes, uem.UserReceivedDownVotes,
+        uem.QuestionsPosted, uem.AnswersPosted, uem.TotalEdits, uem.PostsClosedByVote, uem.PostsReopened,
+        uem.LinkedPostsCount, uem.UpVotesGiven, uem.DownVotesGiven, uem.FavoritesMade, uem.LastVoteDate,
+        gb.UserId
+),
+HighPotentialUsers AS ( -- Set operators: UNION and EXCEPT
+    SELECT UserId FROM ActiveContributionSummary WHERE Reputation >= 5000 AND HasGoldBadge
+    UNION
+    SELECT UserId FROM ActiveContributionSummary WHERE BestAnswersCount >= 5 AND AvgTopAnswerScore >= 10
+    EXCEPT
+    SELECT UserId FROM ActiveContributionSummary WHERE UserProfileViews < 100 AND UserReceivedDownVotes > UserReceivedUpVotes * 0.5
+),
+FinalUserScores AS (
+    SELECT
+        acs.UserId,
+        acs.DisplayName,
+        acs.Reputation,
+        acs.UserProfileViews,
+        acs.QuestionsPosted,
+        acs.AnswersPosted,
+        acs.TotalEdits,
+        acs.PostsClosedByVote,
+        acs.PostsReopened,
+        acs.LinkedPostsCount,
+        acs.UpVotesGiven,
+        acs.DownVotesGiven,
+        acs.FavoritesMade,
+        acs.HasGoldBadge,
+        acs.TopAnswersCount,
+        acs.BestAnswersCount,
+        acs.AvgTopAnswerScore,
+        acs.MaxPopularQuestionScore,
+        acs.TotalQuestionFavoritesForAnsweredQuestions,
+        acs.SqlRelatedActivity,
+        acs.AvgCommentLengthOnTheirTopAnswers,
+        -- Complex Engagement Score Calculation with various weights and NULL logic
+        (
+            (CASE WHEN acs.HasGoldBadge THEN 100 ELSE 0 END) +
+            (COALESCE(acs.Reputation, 0) / 100.0) +
+            (COALESCE(acs.UserProfileViews, 0) / 50.0) +
+            (COALESCE(acs.UserReceivedUpVotes, 0) * 0.5) -
+            (COALESCE(acs.UserReceivedDownVotes, 0) * 0.7) + -- Penalty for received downvotes
+            (COALESCE(acs.QuestionsPosted, 0) * 5) +
+            (COALESCE(acs.AnswersPosted, 0) * 7) +
+            (COALESCE(acs.TotalEdits, 0) * 2) +
+            (COALESCE(acs.PostsClosedByVote, 0) * -10) + -- Negative for closing (interpretation dependent)
+            (COALESCE(acs.PostsReopened, 0) * 15) + -- Positive for reopening
+            (COALESCE(acs.LinkedPostsCount, 0) * 3) +
+            (COALESCE(acs.UpVotesGiven, 0) * 0.1) -
+            (COALESCE(acs.DownVotesGiven, 0) * 0.2) + -- Penalty for downvotes given
+            (COALESCE(acs.FavoritesMade, 0) * 2) +
+            (COALESCE(acs.BestAnswersCount, 0) * 25) +
+            (COALESCE(acs.AvgTopAnswerScore, 0) * 0.8) +
+            (COALESCE(acs.MaxPopularQuestionScore, 0) * 0.3) +
+            (COALESCE(acs.TotalQuestionFavoritesForAnsweredQuestions, 0) * 0.1) +
+            (CASE WHEN acs.LastVoteDate IS NOT NULL THEN (EXTRACT(EPOCH FROM (NOW() - acs.LastVoteDate)) / (3600 * 24)) * -0.1 ELSE 0 END) + -- Recency factor (more recent = higher score)
+            (COALESCE(acs.SqlRelatedActivity, 0) * 5) +
+            (COALESCE(acs.AvgCommentLengthOnTheirTopAnswers, 0) * 0.1) +
+            (CASE WHEN EXISTS (SELECT 1 FROM HighPotentialUsers hpu WHERE hpu.UserId = acs.UserId) THEN 50 ELSE 0 END) -- Bonus from set operator inclusion
+        )::NUMERIC(10,2) AS EngagementScore,
+        -- Window function: DENSE_RANK based on the complex engagement score
+        DENSE_RANK() OVER (ORDER BY (
+            (CASE WHEN acs.HasGoldBadge THEN 100 ELSE 0 END) +
+            (COALESCE(acs.Reputation, 0) / 100.0) +
+            (COALESCE(acs.UserProfileViews, 0) / 50.0) +
+            (COALESCE(acs.UserReceivedUpVotes, 0) * 0.5) -
+            (COALESCE(acs.UserReceivedDownVotes, 0) * 0.7) +
+            (COALESCE(acs.QuestionsPosted, 0) * 5) +
+            (COALESCE(acs.AnswersPosted, 0) * 7) +
+            (COALESCE(acs.TotalEdits, 0) * 2) +
+            (COALESCE(acs.PostsClosedByVote, 0) * -10) +
+            (COALESCE(acs.PostsReopened, 0) * 15) +
+            (COALESCE(acs.LinkedPostsCount, 0) * 3) +
+            (COALESCE(acs.UpVotesGiven, 0) * 0.1) -
+            (COALESCE(acs.DownVotesGiven, 0) * 0.2) +
+            (COALESCE(acs.FavoritesMade, 0) * 2) +
+            (COALESCE(acs.BestAnswersCount, 0) * 25) +
+            (COALESCE(acs.AvgTopAnswerScore, 0) * 0.8) +
+            (COALESCE(acs.MaxPopularQuestionScore, 0) * 0.3) +
+            (COALESCE(acs.TotalQuestionFavoritesForAnsweredQuestions, 0) * 0.1) +
+            (CASE WHEN acs.LastVoteDate IS NOT NULL THEN (EXTRACT(EPOCH FROM (NOW() - acs.LastVoteDate)) / (3600 * 24)) * -0.1 ELSE 0 END) +
+            (COALESCE(acs.SqlRelatedActivity, 0) * 5) +
+            (COALESCE(acs.AvgCommentLengthOnTheirTopAnswers, 0) * 0.1) +
+            (CASE WHEN EXISTS (SELECT 1 FROM HighPotentialUsers hpu WHERE hpu.UserId = acs.UserId) THEN 50 ELSE 0 END)
+        ) DESC) AS EngagementRank
+    FROM ActiveContributionSummary acs
+    WHERE acs.DisplayName IS NOT NULL AND acs.DisplayName <> '' -- NULL logic: Exclude users without a display name
+)
+SELECT
+    UserId,
+    DisplayName,
+    Reputation,
+    EngagementScore,
+    EngagementRank,
+    UserProfileViews,
+    QuestionsPosted,
+    AnswersPosted,
+    TotalEdits,
+    PostsClosedByVote,
+    PostsReopened,
+    LinkedPostsCount,
+    UpVotesGiven,
+    DownVotesGiven,
+    FavoritesMade,
+    HasGoldBadge,
+    TopAnswersCount,
+    BestAnswersCount,
+    AvgTopAnswerScore,
+    MaxPopularQuestionScore,
+    TotalQuestionFavoritesForAnsweredQuestions,
+    SqlRelatedActivity,
+    AvgCommentLengthOnTheirTopAnswers
+FROM FinalUserScores
+WHERE EngagementScore > 100 -- Filter out users with very low computed engagement
+ORDER BY EngagementRank ASC, UserId
+LIMIT 50; -- Limit to top 50 highly engaged users

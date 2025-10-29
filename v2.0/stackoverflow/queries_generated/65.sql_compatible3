@@ -1,0 +1,344 @@
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        date_trunc('month', u.creationdate) as cohort_month,
+        coalesce(nullif(trim(split_part(coalesce(u.location, ''), ',', 1)), ''), 'Unknown') as region
+    from users u
+    where u.creationdate >= timestamp '2024-10-01 12:34:56' - interval '3 years'
+),
+q_posts as (
+    select
+        p.id as post_id,
+        p.owneruserid as user_id,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        p.title,
+        p.tags,
+        p.acceptedanswerid,
+        p.closeddate,
+        p.commentcount,
+        p.favoritecount
+    from posts p
+    where p.posttypeid = 1
+),
+a_posts as (
+    select
+        p.id as answer_id,
+        p.parentid as question_id,
+        p.owneruserid as user_id,
+        p.creationdate,
+        p.score
+    from posts p
+    where p.posttypeid = 2
+),
+user_activity as (
+    select
+        ru.user_id,
+        count(distinct qp.post_id) filter (where qp.creationdate >= ru.creationdate) as questions_posted,
+        count(distinct ap.answer_id) filter (where ap.creationdate >= ru.creationdate) as answers_posted,
+        sum(greatest(qp.score, 0)) as q_up_score,
+        sum(least(qp.score, 0)) as q_down_score,
+        sum(greatest(ap.score, 0)) as a_up_score,
+        sum(least(ap.score, 0)) as a_down_score,
+        sum(qp.viewcount) as q_views,
+        sum(qp.favoritecount) as q_favs
+    from recent_users ru
+    left join q_posts qp on qp.user_id = ru.user_id
+    left join a_posts ap on ap.user_id = ru.user_id
+    group by ru.user_id
+),
+first_answer_latency as (
+    select
+        q.post_id,
+        min(ap.creationdate) as first_answer_date,
+        extract(epoch from min(ap.creationdate) - q.creationdate) / 3600.0 as hours_to_first_answer
+    from q_posts q
+    left join a_posts ap on ap.question_id = q.post_id
+    group by q.post_id, q.creationdate
+),
+votes_agg as (
+    select
+        v.postid,
+        sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+        sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+        sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+        sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started,
+        sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded,
+        min(v.creationdate) as first_vote_date,
+        max(v.creationdate) as last_vote_date
+    from votes v
+    where v.creationdate >= timestamp '2024-10-01 12:34:56' - interval '3 years'
+    group by v.postid
+),
+comments_agg as (
+    select
+        c.postid,
+        count(*) as comment_count,
+        max(c.score) as max_comment_score,
+        avg(nullif(c.score, 0)) as avg_nonzero_comment_score,
+        max(c.creationdate) as last_commented_at
+    from comments c
+    group by c.postid
+),
+postlinks_dupes as (
+    select
+        pl.postid,
+        count(*) filter (where pl.linktypeid = 3) as duplicate_links,
+        count(*) filter (where pl.linktypeid = 1) as related_links
+    from postlinks pl
+    group by pl.postid
+),
+closed_reasons as (
+    select
+        ph.postid,
+        max(ph.creationdate) as last_close_date,
+        max(ph.comment) filter (where ph.posthistorytypeid = 10) as last_close_reason_id,
+        max(ph.text) filter (where ph.posthistorytypeid = 10) as last_close_payload
+    from posthistory ph
+    where ph.posthistorytypeid in (10, 11)
+    group by ph.postid
+),
+tag_expansion as (
+    select
+        q.post_id,
+        unnest(string_to_array(substring(coalesce(q.tags,''), 2, greatest(char_length(coalesce(q.tags,'')) - 2, 0)), '><')) as tagname
+    from q_posts q
+),
+tag_quality as (
+    select
+        te.tagname,
+        count(*) as tag_questions,
+        avg(qp.score) as avg_q_score,
+        percentile_cont(0.5) within group (order by qp.score) as med_q_score,
+        avg(fal.hours_to_first_answer) as avg_hours_to_first_answer
+    from tag_expansion te
+    join q_posts qp on qp.post_id = te.post_id
+    left join first_answer_latency fal on fal.post_id = qp.post_id
+    group by te.tagname
+),
+per_user_badges as (
+    select
+        b.userid,
+        count(*) as total_badges,
+        sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+        sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+        sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+        count(*) filter (where b.tagbased = 1) as tag_badges,
+        min(b.date) as first_badge_date,
+        max(b.date) as last_badge_date
+    from badges b
+    group by b.userid
+),
+user_post_rollup as (
+    select
+        ru.user_id,
+        ru.displayname,
+        ru.reputation,
+        ru.cohort_month,
+        ru.region,
+        ua.questions_posted,
+        ua.answers_posted,
+        coalesce(ua.q_up_score,0) + coalesce(ua.a_up_score,0) as total_positive_score,
+        coalesce(ua.q_down_score,0) + coalesce(ua.a_down_score,0) as total_negative_score,
+        coalesce(ua.q_views,0) as question_views,
+        coalesce(ua.q_favs,0) as question_favorites,
+        pb.total_badges,
+        pb.gold_badges,
+        pb.silver_badges,
+        pb.bronze_badges,
+        pb.tag_badges
+    from recent_users ru
+    left join user_activity ua on ua.user_id = ru.user_id
+    left join per_user_badges pb on pb.userid = ru.user_id
+),
+question_metrics as (
+    select
+        q.post_id,
+        q.user_id,
+        q.creationdate,
+        q.score,
+        q.viewcount,
+        coalesce(v.upvotes,0) as upvotes,
+        coalesce(v.downvotes,0) as downvotes,
+        coalesce(v.favorites,0) as favorites,
+        coalesce(v.bounty_started,0) as bounty_started,
+        coalesce(v.bounty_awarded,0) as bounty_awarded,
+        coalesce(c.comment_count,0) as comment_count,
+        c.last_commented_at,
+        coalesce(pl.duplicate_links,0) as duplicate_links,
+        coalesce(pl.related_links,0) as related_links,
+        fal.hours_to_first_answer,
+        cr.last_close_date,
+        cr.last_close_reason_id
+    from q_posts q
+    left join votes_agg v on v.postid = q.post_id
+    left join comments_agg c on c.postid = q.post_id
+    left join postlinks_dupes pl on pl.postid = q.post_id
+    left join first_answer_latency fal on fal.post_id = q.post_id
+    left join closed_reasons cr on cr.postid = q.post_id
+),
+user_question_windows as (
+    select
+        qm.post_id,
+        qm.user_id,
+        qm.creationdate,
+        qm.score,
+        qm.viewcount,
+        qm.upvotes,
+        qm.downvotes,
+        qm.favorites,
+        qm.bounty_started,
+        qm.bounty_awarded,
+        qm.comment_count,
+        qm.last_commented_at,
+        qm.duplicate_links,
+        qm.related_links,
+        qm.hours_to_first_answer,
+        qm.last_close_date,
+        qm.last_close_reason_id,
+        row_number() over (partition by qm.user_id order by qm.creationdate) as rn_by_user,
+        avg(qm.score) over (partition by qm.user_id rows between 4 preceding and current row) as rolling_avg_score_5,
+        sum(qm.viewcount) over (partition by qm.user_id order by qm.creationdate rows between unbounded preceding and current row) as cum_views_by_user,
+        rank() over (partition by qm.user_id order by qm.score desc nulls last) as score_rank_by_user
+    from question_metrics qm
+),
+user_engagement as (
+    select
+        upr.user_id,
+        upr.displayname,
+        upr.reputation,
+        upr.cohort_month,
+        upr.region,
+        upr.questions_posted,
+        upr.answers_posted,
+        upr.total_positive_score,
+        upr.total_negative_score,
+        upr.question_views,
+        upr.question_favorites,
+        count(qw.post_id) as questions_considered,
+        avg(qw.rolling_avg_score_5) as avg_rolling_score,
+        percentile_cont(0.9) within group (order by qw.viewcount) as p90_views_per_question,
+        sum(case when qw.hours_to_first_answer is null then 1 else 0 end) as unanswered_questions,
+        avg(qw.hours_to_first_answer) as avg_hours_to_first_answer,
+        sum(case when qw.last_close_date is not null then 1 else 0 end) as closed_questions,
+        sum(qw.duplicate_links) as total_duplicate_links
+    from user_post_rollup upr
+    left join user_question_windows qw on qw.user_id = upr.user_id
+    group by upr.user_id, upr.displayname, upr.reputation, upr.cohort_month, upr.region, upr.questions_posted, upr.answers_posted, upr.total_positive_score, upr.total_negative_score, upr.question_views, upr.question_favorites
+),
+cohort_baselines as (
+    select
+        cohort_month,
+        avg(reputation) as avg_rep_cohort,
+        avg(questions_posted) as avg_q_cohort,
+        avg(answers_posted) as avg_a_cohort,
+        avg(total_positive_score + total_negative_score) as avg_net_score_cohort
+    from user_engagement
+    group by cohort_month
+),
+leaderboard as (
+    select
+        ue.*,
+        cb.avg_rep_cohort,
+        cb.avg_q_cohort,
+        cb.avg_a_cohort,
+        cb.avg_net_score_cohort,
+        (ue.reputation - cb.avg_rep_cohort) / nullif(cb.avg_rep_cohort,0) as rep_vs_cohort_pct,
+        (ue.questions_posted - cb.avg_q_cohort) / nullif(cb.avg_q_cohort,0) as q_vs_cohort_pct,
+        (ue.answers_posted - cb.avg_a_cohort) / nullif(cb.avg_a_cohort,0) as a_vs_cohort_pct,
+        (ue.total_positive_score + ue.total_negative_score - cb.avg_net_score_cohort) / nullif(cb.avg_net_score_cohort,0) as net_score_vs_cohort_pct
+    from user_engagement ue
+    left join cohort_baselines cb on cb.cohort_month = ue.cohort_month
+),
+tag_affinity as (
+    select
+        q.user_id,
+        te.tagname,
+        count(*) as tag_q_count,
+        avg(q.score) as tag_avg_score,
+        avg(q.viewcount) as tag_avg_views
+    from tag_expansion te
+    join q_posts q on q.post_id = te.post_id
+    group by q.user_id, te.tagname
+),
+tag_affinity_ranked as (
+    select
+        ta.user_id,
+        ta.tagname,
+        ta.tag_q_count,
+        ta.tag_avg_score,
+        ta.tag_avg_views,
+        dense_rank() over (partition by ta.user_id order by ta.tag_q_count desc, ta.tag_avg_score desc nulls last, ta.tagname) as tag_rank
+    from tag_affinity ta
+),
+top_tags as (
+    select user_id,
+           string_agg(tagname || ' (' || tag_q_count || ')', ', ' order by tag_rank, tagname) as top_tags
+    from tag_affinity_ranked
+    where tag_rank <= 5
+    group by user_id
+),
+string_summarized as (
+    select
+        l.user_id,
+        ('User: ' || coalesce(l.displayname, '<anonymous>')) ||
+        ' | Region: ' || coalesce(l.region, 'Unknown') ||
+        ' | Cohort: ' || to_char(l.cohort_month, 'YYYY-MM') ||
+        ' | Q/A: ' || coalesce(l.questions_posted,0) || '/' || coalesce(l.answers_posted,0) ||
+        ' | RepΔ% vs Cohort: ' || to_char(coalesce(l.rep_vs_cohort_pct,0)*100, 'FM990D00') || '%' ||
+        ' | NetScoreΔ%: ' || to_char(coalesce(l.net_score_vs_cohort_pct,0)*100, 'FM990D00') || '%' ||
+        ' | UnansweredQ: ' || coalesce(ue.unanswered_questions,0) ||
+        ' | ClosedQ: ' || coalesce(ue.closed_questions,0) as user_summary
+    from leaderboard l
+    join user_engagement ue on ue.user_id = l.user_id
+)
+select
+    l.user_id,
+    l.displayname,
+    l.region,
+    l.cohort_month,
+    l.reputation,
+    l.questions_posted,
+    l.answers_posted,
+    l.total_positive_score + l.total_negative_score as net_score,
+    l.avg_rolling_score,
+    l.p90_views_per_question,
+    l.unanswered_questions,
+    l.closed_questions,
+    l.total_duplicate_links,
+    tt.top_tags,
+    ss.user_summary,
+    case
+        when l.rep_vs_cohort_pct is null then 'N/A'
+        when l.rep_vs_cohort_pct >= 1.0 then 'Elite'
+        when l.rep_vs_cohort_pct >= 0.25 then 'Above Avg'
+        when l.rep_vs_cohort_pct >= -0.25 then 'Avg'
+        else 'Below Avg'
+    end as cohort_rep_tier,
+    row_number() over (
+        partition by date_trunc('quarter', l.cohort_month)
+        order by
+            coalesce(l.rep_vs_cohort_pct, -1) desc,
+            coalesce(l.net_score_vs_cohort_pct, -1) desc,
+            l.questions_posted desc,
+            l.answers_posted desc,
+            l.user_id
+    ) as cohort_quarter_rank
+from leaderboard l
+left join top_tags tt on tt.user_id = l.user_id
+left join string_summarized ss on ss.user_id = l.user_id
+where
+    (l.questions_posted + l.answers_posted) > 0
+    and (
+        l.rep_vs_cohort_pct is null
+        or abs(l.rep_vs_cohort_pct) < 100
+    )
+    and coalesce(l.p90_views_per_question, 0) >= 0
+order by
+    cohort_quarter_rank asc,
+    l.user_id
+limit 500;

@@ -1,0 +1,404 @@
+with params as (
+    select
+        cast(365 as int) as lookback_days,
+        cast(10 as int) as min_answers,
+        cast(50 as int) as min_views,
+        cast(100 as int) as min_rep
+),
+recent_questions as (
+    select
+        q.Id as QuestionId,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.OwnerUserId,
+        q.AcceptedAnswerId,
+        q.Title,
+        q.Tags,
+        coalesce(q.AnswerCount, 0) as AnswerCount,
+        q.LastActivityDate
+    from Posts q
+    cross join params p
+    where q.PostTypeId = 1
+      and q.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - (p.lookback_days || ' days')::interval
+      and coalesce(q.ViewCount, 0) >= p.min_views
+),
+answers as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerDate,
+        a.CommentCount as AnswerCommentCount
+    from Posts a
+    where a.PostTypeId = 2
+),
+q_answer_stats as (
+    select
+        r.QuestionId,
+        count(a.AnswerId) as total_answers,
+        sum(case when a.AnswerScore > 0 then 1 else 0 end) as pos_answers,
+        max(a.AnswerScore) as max_answer_score,
+        min(a.AnswerScore) as min_answer_score,
+        avg(cast(a.AnswerScore as numeric)) as avg_answer_score,
+        count(distinct a.OwnerUserId) filter (where a.OwnerUserId is not null) as distinct_answerers
+    from recent_questions r
+    left join answers a on a.QuestionId = r.QuestionId
+    group by r.QuestionId
+),
+accepted_answerers as (
+    select
+        r.QuestionId,
+        a.OwnerUserId as AcceptedOwnerUserId
+    from recent_questions r
+    left join Posts a on a.Id = r.AcceptedAnswerId
+),
+user_aug as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate as UserCreationDate,
+        u.UpVotes,
+        u.DownVotes,
+        (u.UpVotes - u.DownVotes) as NetVotes,
+        case
+            when u.Location is null or btrim(u.Location) = '' then '(unknown)'
+            else u.Location
+        end as NormLocation
+    from Users u
+),
+questioner as (
+    select
+        r.QuestionId,
+        u.UserId as QuestionOwnerId,
+        u.DisplayName as QuestionOwnerName,
+        u.Reputation as QuestionOwnerRep,
+        u.NormLocation as QuestionOwnerLocation,
+        u.NetVotes as QuestionOwnerNetVotes
+    from recent_questions r
+    left join user_aug u on u.UserId = r.OwnerUserId
+),
+answerer_agg as (
+    select
+        r.QuestionId,
+        count(distinct a.OwnerUserId) as distinct_answerers,
+        sum(u.Reputation) filter (where a.OwnerUserId = u.UserId) as sum_answerer_rep,
+        avg(cast(u.Reputation as numeric)) filter (where a.OwnerUserId = u.UserId) as avg_answerer_rep,
+        max(u.Reputation) filter (where a.OwnerUserId = u.UserId) as max_answerer_rep
+    from recent_questions r
+    left join answers a on a.QuestionId = r.QuestionId
+    left join user_aug u on u.UserId = a.OwnerUserId
+    group by r.QuestionId
+),
+comments_on_q as (
+    select
+        c.PostId as QuestionId,
+        count(*) as q_comment_count,
+        sum(c.Score) as q_comment_score_sum,
+        max(c.Score) as q_comment_score_max
+    from Comments c
+    join recent_questions r on r.QuestionId = c.PostId
+    group by c.PostId
+),
+votes_on_q as (
+    select
+        v.PostId as QuestionId,
+        count(*) filter (where v.VoteTypeId = 2) as upvotes,
+        count(*) filter (where v.VoteTypeId = 3) as downvotes,
+        count(*) filter (where v.VoteTypeId = 5) as favorites,
+        count(*) filter (where v.VoteTypeId in (8,9)) as bounty_votes,
+        sum(v.BountyAmount) filter (where v.VoteTypeId in (8,9)) as bounty_amount
+    from Votes v
+    join recent_questions r on r.QuestionId = v.PostId
+    group by v.PostId
+),
+closures as (
+    select
+        ph.PostId as QuestionId,
+        min(ph.CreationDate) as first_closed_at,
+        max(ph.CreationDate) as last_closed_at,
+        count(*) as close_events,
+        string_agg(distinct crt.Name, ',') as reasons
+    from PostHistory ph
+    left join CloseReasonTypes crt on cast(crt.Id as varchar) = ph.Comment
+    join recent_questions r on r.QuestionId = ph.PostId
+    where ph.PostHistoryTypeId = 10
+    group by ph.PostId
+),
+duplicates as (
+    select
+        pl.PostId as QuestionId,
+        count(*) filter (where pl.LinkTypeId = 3) as duplicate_links,
+        count(*) filter (where pl.LinkTypeId = 1) as linked_links
+    from PostLinks pl
+    join recent_questions r on r.QuestionId = pl.PostId
+    group by pl.PostId
+),
+tag_expansion as (
+    select
+        r.QuestionId,
+        unnest(string_to_array(substring(r.Tags, 2, greatest(length(r.Tags)-2,0)), '><')) as tagname
+    from recent_questions r
+    where r.Tags is not null and length(r.Tags) >= 2
+),
+tag_stats as (
+    select
+        te.QuestionId,
+        count(*) as tag_count,
+        sum(t.Count) as sum_tag_popularity,
+        max(t.Count) as max_tag_popularity,
+        count(*) filter (where t.IsModeratorOnly) as mod_only_tags
+    from tag_expansion te
+    left join Tags t on lower(t.TagName) = lower(te.tagname)
+    group by te.QuestionId
+),
+edits as (
+    select
+        ph.PostId as QuestionId,
+        count(*) filter (where ph.PostHistoryTypeId in (4,5,6)) as edit_events,
+        count(*) filter (where ph.PostHistoryTypeId = 24) as suggested_edits,
+        min(ph.CreationDate) filter (where ph.PostHistoryTypeId in (4,5,6)) as first_edit_at,
+        max(ph.CreationDate) filter (where ph.PostHistoryTypeId in (4,5,6)) as last_edit_at
+    from PostHistory ph
+    join recent_questions r on r.QuestionId = ph.PostId
+    group by ph.PostId
+),
+question_activity as (
+    select
+        r.QuestionId,
+        r.CreationDate,
+        r.LastActivityDate,
+        cast(extract(epoch from (coalesce(r.LastActivityDate, cast('2024-10-01 12:34:56' as timestamp)) - r.CreationDate)) as bigint) as lifetime_seconds
+    from recent_questions r
+),
+rankings as (
+    select
+        r.QuestionId,
+        row_number() over (order by r.Score desc nulls last, r.ViewCount desc nulls last, r.CreationDate desc) as rn_score_view,
+        row_number() over (order by coalesce(v.upvotes,0) - coalesce(v.downvotes,0) desc, r.CreationDate desc) as rn_vote_delta,
+        dense_rank() over (order by coalesce(qs.total_answers,0) desc, r.CreationDate desc) as dr_answers,
+        ntile(4) over (order by r.ViewCount desc) as view_quartile
+    from recent_questions r
+    left join votes_on_q v on v.QuestionId = r.QuestionId
+    left join q_answer_stats qs on qs.QuestionId = r.QuestionId
+    group by r.QuestionId, r.Score, r.ViewCount, r.CreationDate, v.upvotes, v.downvotes, qs.total_answers
+),
+user_quality as (
+    select
+        qa.QuestionId,
+        case when coalesce(qo.QuestionOwnerRep,0) >= p.min_rep then 1 else 0 end as high_rep_owner,
+        case when qo.QuestionOwnerNetVotes > 0 then 1 else 0 end as positive_owner_netvotes
+    from questioner qo
+    join q_answer_stats qa on qa.QuestionId = qo.QuestionId
+    cross join params p
+),
+filtered as (
+    select
+        r.QuestionId
+    from recent_questions r
+    left join q_answer_stats qa on qa.QuestionId = r.QuestionId
+    left join closures c on c.QuestionId = r.QuestionId
+    cross join params p
+    where coalesce(qa.total_answers,0) >= p.min_answers
+      and (c.first_closed_at is null or c.first_closed_at > r.CreationDate + interval '1 hour')
+    group by r.QuestionId
+),
+final as (
+    select
+        r.QuestionId,
+        r.Title,
+        r.Tags,
+        r.CreationDate,
+        r.Score,
+        r.ViewCount,
+        coalesce(qa.total_answers,0) as total_answers,
+        qa.pos_answers,
+        qa.max_answer_score,
+        qa.min_answer_score,
+        qa.avg_answer_score,
+        aa.distinct_answerers as distinct_answerers_count,
+        aa.sum_answerer_rep,
+        aa.avg_answerer_rep,
+        aa.max_answerer_rep,
+        v.upvotes,
+        v.downvotes,
+        v.favorites,
+        v.bounty_votes,
+        v.bounty_amount,
+        c.first_closed_at,
+        c.last_closed_at,
+        c.close_events,
+        c.reasons as close_reasons,
+        d.duplicate_links,
+        d.linked_links,
+        ts.tag_count,
+        ts.sum_tag_popularity,
+        ts.max_tag_popularity,
+        ts.mod_only_tags,
+        e.edit_events,
+        e.suggested_edits,
+        e.first_edit_at,
+        e.last_edit_at,
+        qa.distinct_answerers,
+        qact.lifetime_seconds,
+        qn.QuestionOwnerId,
+        qn.QuestionOwnerName,
+        qn.QuestionOwnerRep,
+        qn.QuestionOwnerLocation,
+        qn.QuestionOwnerNetVotes,
+        ua.AcceptedOwnerUserId,
+        rq.rn_score_view,
+        rq.rn_vote_delta,
+        rq.dr_answers,
+        rq.view_quartile,
+        uq.high_rep_owner,
+        uq.positive_owner_netvotes,
+        (coalesce(qa.total_answers,0) * greatest(1, coalesce(v.upvotes,0) - coalesce(v.downvotes,0))
+            + cast(coalesce(ts.sum_tag_popularity,0) as int) / greatest(1, coalesce(ts.tag_count,1))
+            + cast(coalesce(aa.avg_answerer_rep,0) as int) / 10
+            + case when ua.AcceptedOwnerUserId is not null then 25 else 0 end
+            - coalesce(d.duplicate_links,0) * 5
+            - case when c.first_closed_at is not null then 50 else 0 end
+        ) as perf_score
+    from filtered f
+    join recent_questions r on r.QuestionId = f.QuestionId
+    left join q_answer_stats qa on qa.QuestionId = r.QuestionId
+    left join votes_on_q v on v.QuestionId = r.QuestionId
+    left join closures c on c.QuestionId = r.QuestionId
+    left join duplicates d on d.QuestionId = r.QuestionId
+    left join tag_stats ts on ts.QuestionId = r.QuestionId
+    left join edits e on e.QuestionId = r.QuestionId
+    left join question_activity qact on qact.QuestionId = r.QuestionId
+    left join questioner qn on qn.QuestionId = r.QuestionId
+    left join accepted_answerers ua on ua.QuestionId = r.QuestionId
+    left join answerer_agg aa on aa.QuestionId = r.QuestionId
+    left join rankings rq on rq.QuestionId = r.QuestionId
+    left join user_quality uq on uq.QuestionId = r.QuestionId
+),
+dedup as (
+    select
+        f.QuestionId,
+        f.Title,
+        f.Tags,
+        f.CreationDate,
+        f.Score,
+        f.ViewCount,
+        f.total_answers,
+        f.pos_answers,
+        f.max_answer_score,
+        f.min_answer_score,
+        f.avg_answer_score,
+        f.distinct_answerers_count,
+        f.sum_answerer_rep,
+        f.avg_answerer_rep,
+        f.max_answerer_rep,
+        f.upvotes,
+        f.downvotes,
+        f.favorites,
+        f.bounty_votes,
+        f.bounty_amount,
+        f.first_closed_at,
+        f.last_closed_at,
+        f.close_events,
+        f.close_reasons,
+        f.duplicate_links,
+        f.linked_links,
+        f.tag_count,
+        f.sum_tag_popularity,
+        f.max_tag_popularity,
+        f.mod_only_tags,
+        f.edit_events,
+        f.suggested_edits,
+        f.first_edit_at,
+        f.last_edit_at,
+        f.distinct_answerers,
+        f.lifetime_seconds,
+        f.QuestionOwnerId,
+        f.QuestionOwnerName,
+        f.QuestionOwnerRep,
+        f.QuestionOwnerLocation,
+        f.QuestionOwnerNetVotes,
+        f.AcceptedOwnerUserId,
+        f.rn_score_view,
+        f.rn_vote_delta,
+        f.dr_answers,
+        f.view_quartile,
+        f.high_rep_owner,
+        f.positive_owner_netvotes,
+        f.perf_score,
+        row_number() over (partition by lower(coalesce(f.Title,'')) order by f.perf_score desc, f.CreationDate desc) as rn_title
+    from final f
+),
+topk as (
+    select *
+    from dedup
+    where rn_title = 1
+),
+ranked_topk as (
+    select
+        t.*,
+        row_number() over (
+            order by perf_score desc, (coalesce(t.upvotes,0) - coalesce(t.downvotes,0)) desc, total_answers desc, ViewCount desc, CreationDate desc
+        ) as overall_rank
+    from topk t
+)
+select
+    t.QuestionId,
+    t.Title,
+    t.Tags,
+    t.CreationDate,
+    t.Score,
+    t.ViewCount,
+    t.total_answers,
+    t.pos_answers,
+    t.max_answer_score,
+    t.min_answer_score,
+    round(cast(t.avg_answer_score as numeric), 2) as avg_answer_score,
+    t.distinct_answerers_count,
+    t.sum_answerer_rep,
+    t.avg_answerer_rep,
+    t.max_answerer_rep,
+    t.upvotes,
+    t.downvotes,
+    coalesce(t.upvotes,0) - coalesce(t.downvotes,0) as vote_delta,
+    t.favorites,
+    t.bounty_votes,
+    t.bounty_amount,
+    t.first_closed_at,
+    t.last_closed_at,
+    t.close_events,
+    t.close_reasons,
+    t.duplicate_links,
+    t.linked_links,
+    t.tag_count,
+    t.sum_tag_popularity,
+    t.max_tag_popularity,
+    t.mod_only_tags,
+    t.edit_events,
+    t.suggested_edits,
+    t.first_edit_at,
+    t.last_edit_at,
+    t.lifetime_seconds,
+    t.QuestionOwnerId,
+    t.QuestionOwnerName,
+    t.QuestionOwnerRep,
+    t.QuestionOwnerLocation,
+    t.QuestionOwnerNetVotes,
+    t.AcceptedOwnerUserId,
+    t.rn_score_view,
+    t.rn_vote_delta,
+    t.dr_answers,
+    t.view_quartile,
+    t.high_rep_owner,
+    t.positive_owner_netvotes,
+    t.perf_score,
+    case
+        when t.close_events > 0 then 'Closed'
+        when t.AcceptedOwnerUserId is not null then 'Accepted'
+        when t.bounty_amount > 0 then 'Bounty'
+        else 'Open'
+    end as status_bucket
+from ranked_topk t
+where overall_rank <= 200;

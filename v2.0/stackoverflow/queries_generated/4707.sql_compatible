@@ -1,0 +1,101 @@
+WITH RankedPostEdits AS (
+    SELECT
+        ph.PostId,
+        ph.UserId,
+        ph.CreationDate,
+        ph.PostHistoryTypeId,
+        ROW_NUMBER() OVER(PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate DESC) as rn
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6)
+),
+UserPostEngagement AS (
+    SELECT
+        p.OwnerUserId,
+        COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsOwned,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersOwned,
+        AVG(p.Score) AS AveragePostScore,
+        MAX(p.CreationDate) AS LatestPostCreationDate
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL AND p.OwnerUserId > 0
+    GROUP BY p.OwnerUserId
+),
+RecentTopEdits AS (
+    SELECT
+        rpe.PostId,
+        rpe.UserId,
+        rpe.CreationDate AS EditDate,
+        ROW_NUMBER() OVER(PARTITION BY rpe.PostId ORDER BY rpe.CreationDate DESC) as edit_rn
+    FROM RankedPostEdits rpe
+    WHERE rpe.rn = 1 AND rpe.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30' DAY)
+),
+PostsWithEngagement AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount AS PostViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        COALESCE(p.FavoriteCount, 0) AS PostFavoriteCount,
+        CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate)) / 86400 AS INTEGER) AS DaysSinceCreation,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+        COALESCE(ute.TotalPostsOwned, 0) AS OwnerTotalPosts,
+        COALESCE(ute.TotalQuestionsOwned, 0) AS OwnerTotalQuestions,
+        COALESCE(ute.TotalAnswersOwned, 0) AS OwnerTotalAnswers,
+        COALESCE(ute.AveragePostScore, 0.0) AS OwnerAveragePostScore,
+        COALESCE(u.Reputation, 0) AS OwnerReputation,
+        COUNT(c.Id) AS CommentCountOnPost,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+        CASE WHEN EXISTS (SELECT 1 FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3) THEN 1 ELSE 0 END AS IsDuplicateLink
+    FROM Posts p
+    LEFT JOIN UserPostEngagement ute ON p.OwnerUserId = ute.OwnerUserId
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE p.PostTypeId IN (1, 2)
+    GROUP BY
+        p.Id, p.Title, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.ClosedDate,
+        ute.TotalPostsOwned, ute.TotalQuestionsOwned, ute.TotalAnswersOwned, ute.AveragePostScore, u.Reputation
+)
+SELECT
+    pse.PostId,
+    pse.Title,
+    pt.Name AS PostTypeName,
+    pse.PostCreationDate,
+    pse.PostScore,
+    pse.PostViewCount,
+    pse.AnswerCount,
+    pse.CommentCount AS PostCommentCount,
+    pse.PostFavoriteCount,
+    pse.DaysSinceCreation,
+    pse.IsClosed,
+    pse.OwnerUserId,
+    u.DisplayName AS OwnerDisplayName,
+    pse.OwnerReputation,
+    pse.OwnerTotalPosts,
+    pse.OwnerTotalQuestions,
+    pse.OwnerTotalAnswers,
+    ROUND(pse.OwnerAveragePostScore, 2) AS OwnerAveragePostScore,
+    pse.CommentCountOnPost,
+    pse.UpVoteCount,
+    pse.DownVoteCount,
+    pse.IsDuplicateLink,
+    COALESCE(rt.UserId, -1) AS LastTopEditorUserId,
+    rt.EditDate AS LastTopEditDate,
+    CASE WHEN pse.OwnerTotalPosts > 1000 THEN 'Experienced' WHEN pse.OwnerTotalPosts > 100 THEN 'Intermediate' ELSE 'Novice' END AS OwnerExperienceLevel,
+    UPPER(SUBSTRING(COALESCE(pse.Title, ''), 1, 3)) AS TitlePrefix,
+    COALESCE(pse.PostViewCount, 0) + COALESCE(pse.PostFavoriteCount, 0) AS EngagementScore,
+    CASE WHEN pse.OwnerTotalPosts > 0 AND pse.OwnerAveragePostScore > 0 THEN pse.PostScore * (pse.OwnerAveragePostScore / pse.OwnerTotalPosts) ELSE pse.PostScore END AS WeightedScore
+FROM PostsWithEngagement pse
+LEFT JOIN Users u ON pse.OwnerUserId = u.Id
+LEFT JOIN PostTypes pt ON pse.PostTypeId = pt.Id
+LEFT JOIN RecentTopEdits rt ON pse.PostId = rt.PostId AND rt.edit_rn = 1
+WHERE pse.PostCreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1' YEAR)
+  AND pse.OwnerReputation > 500
+ORDER BY pse.PostScore DESC, pse.PostViewCount DESC
+LIMIT 100;

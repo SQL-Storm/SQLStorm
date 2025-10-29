@@ -1,0 +1,150 @@
+WITH RECURSIVE RecursiveBadgeStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        b.Class,
+        COUNT(*) AS BadgeCount,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY b.Class) AS rn
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, b.Class
+    UNION ALL
+    SELECT
+        rbs.UserId,
+        rbs.DisplayName,
+        rbs.Class,
+        rbs.BadgeCount,
+        rbs.rn + 1
+    FROM RecursiveBadgeStats rbs
+    WHERE rbs.rn < 3
+),
+PostEngagement AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        COALESCE(p.Title,'') AS Title,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id AND c.CreationDate > p.CreationDate) AS LaterComments,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpVotesCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS DownVotesCount,
+        CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS HasAcceptedAnswer,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS RankByScoreView
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) AND p.CreationDate > (CAST('2024-10-01' AS DATE) - INTERVAL '180 days')
+),
+LatestPostHistory AS (
+    SELECT
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate AS HistoryDate,
+        ph.Comment,
+        ph.UserId,
+        ph.UserDisplayName
+    FROM (
+        SELECT
+            ph.*,
+            ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+        FROM PostHistory ph
+        WHERE ph.PostHistoryTypeId IN (10, 11, 12, 13)
+    ) ph
+    WHERE ph.rn = 1
+),
+LinkedPostsAggregate AS (
+    SELECT
+        pl.PostId,
+        COUNT(*) AS LinkCount,
+        STRING_AGG(lt.Name, ', ') AS LinkTypes
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    GROUP BY pl.PostId
+),
+UserActivityWindow AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) OVER (PARTITION BY u.Id) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) OVER (PARTITION BY u.Id) AS AnswerCount,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.CreationDate DESC NULLS LAST) AS LastPostRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    WHERE u.Reputation > 5000
+),
+TopTagsFiltered AS (
+    SELECT
+        tag.TagName,
+        tag.Count,
+        p.Id AS PostId,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.CreationDate,
+        p.OwnerUserId
+    FROM Tags tag
+    JOIN Posts p ON p.Tags LIKE '%' || tag.TagName || '%'
+    WHERE tag.Count > 1000 AND p.PostTypeId = 1
+),
+ComplexUserStats AS (
+    SELECT
+        ua.Id AS UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        COALESCE(SUM(CASE WHEN pb.Class = 1 THEN pb.BadgeCount ELSE 0 END), 0) AS GoldBadges,
+        COALESCE(SUM(CASE WHEN pb.Class = 2 THEN pb.BadgeCount ELSE 0 END), 0) AS SilverBadges,
+        COALESCE(SUM(CASE WHEN pb.Class = 3 THEN pb.BadgeCount ELSE 0 END), 0) AS BronzeBadges,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.LastAccessDate,
+        CASE
+            WHEN ua.LastAccessDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days') THEN 'Active'
+            WHEN ua.LastAccessDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '180 days') THEN 'Inactive'
+            ELSE 'Dormant'
+        END AS UserStatus
+    FROM UserActivityWindow ua
+    LEFT JOIN RecursiveBadgeStats pb ON ua.Id = pb.UserId
+    GROUP BY ua.Id, ua.DisplayName, ua.Reputation, ua.QuestionCount, ua.AnswerCount, ua.LastAccessDate
+)
+SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    u.DisplayName AS OwnerName,
+    p.AcceptedAnswerId,
+    p.HasAcceptedAnswer,
+    p.RankByScoreView,
+    le.PostHistoryTypeId AS LastPostHistoryType,
+    le.HistoryDate AS LastPostHistoryDate,
+    le.Comment AS LastPostHistoryComment,
+    lpa.LinkCount,
+    lpa.LinkTypes,
+    cus.GoldBadges,
+    cus.SilverBadges,
+    cus.BronzeBadges,
+    cus.UserStatus,
+    tsf.TagName AS PopularTag,
+    tsf.Count AS TagUsageCount,
+    tsf.Score AS TagPostScore,
+    tsf.ViewCount AS TagPostViewCount
+FROM PostEngagement p
+LEFT JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN LatestPostHistory le ON p.Id = le.PostId
+LEFT JOIN LinkedPostsAggregate lpa ON p.Id = lpa.PostId
+LEFT JOIN ComplexUserStats cus ON p.OwnerUserId = cus.UserId
+LEFT JOIN TopTagsFiltered tsf ON tsf.PostId = p.Id
+WHERE p.Score > 10
+  AND (
+       LOWER(p.Tags) LIKE '%<sql>%'
+    OR LOWER(p.Tags) LIKE '%<postgresql>%'
+  )
+ORDER BY p.Score DESC, p.ViewCount DESC, le.HistoryDate DESC
+LIMIT 50;

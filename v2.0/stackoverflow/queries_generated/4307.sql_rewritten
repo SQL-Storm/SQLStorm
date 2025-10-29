@@ -1,0 +1,160 @@
+-- {"query": "4307.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1878} 
+WITH RECURSIVE PostHierarchy AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.Title,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.CommunityOwnedDate,
+        CAST(p.Id AS VARCHAR(500)) AS Path,
+        1 AS Level
+    FROM Posts p
+    WHERE p.PostTypeId = 1 -- Questions
+
+    UNION ALL
+
+    SELECT
+        a.Id,
+        a.PostTypeId,
+        a.ParentId,
+        a.OwnerUserId,
+        a.CreationDate,
+        a.Score,
+        a.Title,
+        a.AnswerCount,
+        a.CommentCount,
+        a.FavoriteCount,
+        a.ClosedDate,
+        a.CommunityOwnedDate,
+        CAST(ph.Path || '->' || a.Id AS VARCHAR(500)),
+        ph.Level + 1
+    FROM Posts a
+    JOIN PostHierarchy ph ON a.ParentId = ph.Id
+    WHERE a.PostTypeId = 2 -- Answers
+),
+UserPostStats AS (
+    SELECT
+        p.OwnerUserId,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        AVG(p.Score) AS AverageScore,
+        MAX(p.CreationDate) AS LatestPostDate,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS TotalUpvotes,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS TotalDownvotes
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE p.OwnerUserId IS NOT NULL AND p.OwnerUserId <> -1
+    GROUP BY p.OwnerUserId
+),
+TagPopularity AS (
+    SELECT
+        t.TagName,
+        t.Count AS TagCount,
+        SUM(p.Score) AS TotalScoreForTag,
+        AVG(p.Score) AS AverageScoreForTag,
+        COUNT(DISTINCT p.Id) AS PostsWithTag,
+        STRING_AGG(DISTINCT p.Title, ' | ' ORDER BY p.Title) AS SampleTitles
+    FROM Tags t
+    JOIN Posts p ON ',' || REPLACE(p.Tags, '><', ',') || ',' LIKE '%,' || t.TagName || ',%'
+    WHERE p.PostTypeId = 1 -- Only consider questions for tag popularity
+    GROUP BY t.TagName, t.Count
+),
+UserPerformance AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COALESCE(ups.TotalPosts, 0) AS TotalPosts,
+        COALESCE(ups.TotalQuestions, 0) AS TotalQuestions,
+        COALESCE(ups.TotalAnswers, 0) AS TotalAnswers,
+        COALESCE(ups.AverageScore, 0.0) AS AveragePostScore,
+        COALESCE(ups.LatestPostDate, u.CreationDate) AS LastActivityDate,
+        COALESCE(ups.TotalComments, 0) AS TotalCommentsOnPosts,
+        COALESCE(ups.TotalUpvotes, 0) AS TotalUpvotesReceived,
+        COALESCE(ups.TotalDownvotes, 0) AS TotalDownvotesReceived,
+        CASE
+            WHEN u.Views > 0 THEN CAST(u.UpVotes AS REAL) / u.Views
+            ELSE 0.0
+        END AS UpvoteRatio,
+        b.GoldBadges,
+        b.SilverBadges,
+        b.BronzeBadges
+    FROM Users u
+    LEFT JOIN UserPostStats ups ON u.Id = ups.OwnerUserId
+    LEFT JOIN (
+        SELECT
+            UserId,
+            SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+            SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+            SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+        FROM Badges
+        GROUP BY UserId
+    ) b ON u.Id = b.UserId
+    WHERE u.Id > 0 -- Exclude community user or system accounts
+)
+SELECT
+    ph.Id AS PostId,
+    pt.Name AS PostType,
+    ph.Title AS PostTitle,
+    ph.Path AS HierarchyPath,
+    ph.Level AS HierarchyLevel,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation AS OwnerReputation,
+    ph.Score,
+    ph.AnswerCount,
+    ph.CommentCount,
+    ph.FavoriteCount,
+    ph.ClosedDate,
+    ph.CommunityOwnedDate,
+    up.TotalPosts AS OwnerTotalPosts,
+    up.TotalQuestions AS OwnerTotalQuestions,
+    up.TotalAnswers AS OwnerTotalAnswers,
+    up.AveragePostScore AS OwnerAveragePostScore,
+    up.UpvoteRatio AS OwnerUpvoteRatio,
+    tp.TagName,
+    tp.TagCount,
+    tp.TotalScoreForTag AS TagTotalScore,
+    tp.AverageScoreForTag AS TagAverageScore,
+    tp.PostsWithTag AS TagPostsCount,
+    COALESCE(pl.LinkType, 'None') AS LinkedPostRelation,
+    COUNT(DISTINCT ph_related.Id) OVER (PARTITION BY ph.Id) AS RelatedPostCount
+FROM PostHierarchy ph
+JOIN PostTypes pt ON ph.PostTypeId = pt.Id
+LEFT JOIN Users u ON ph.OwnerUserId = u.Id
+LEFT JOIN UserPerformance up ON u.Id = up.UserId
+LEFT JOIN (
+    SELECT
+        p.Id AS PostId,
+        lt.Name AS LinkType,
+        rp.Title AS RelatedPostTitle,
+        ROW_NUMBER() OVER(PARTITION BY p.Id ORDER BY p.CreationDate DESC) as rn
+    FROM Posts p
+    JOIN PostLinks pl ON p.Id = pl.PostId
+    JOIN LinkTypes lt ON pl.LinkTypeid = lt.Id
+    LEFT JOIN Posts rp ON pl.RelatedPostId = rp.Id
+    WHERE lt.Id IN (1, 3) -- Linked or Duplicate
+) pl ON ph.Id = pl.PostId AND pl.rn = 1
+LEFT JOIN Tags tp ON tp.TagName IN (SELECT TAG FROM regexp_split_to_table(REPLACE(REPLACE(ph.Tags, '><', ','), '<', ''), '>'))
+LEFT JOIN PostLinks ph_related_links ON ph.Id = ph_related_links.PostId OR ph.Id = ph_related_links.RelatedPostId
+LEFT JOIN Posts ph_related ON (ph.Id = ph_related_links.PostId AND ph.Id <> ph_related.Id) OR (ph.Id = ph_related_links.RelatedPostId AND ph.Id <> ph_related.Id)
+WHERE ph.Level = 1 -- Only top-level questions for this analysis
+GROUP BY
+    ph.Id, pt.Name, ph.Title, ph.Path, ph.Level, u.DisplayName, u.Reputation,
+    ph.Score, ph.AnswerCount, ph.CommentCount, ph.FavoriteCount, ph.ClosedDate,
+    ph.CommunityOwnedDate, up.TotalPosts, up.TotalQuestions, up.TotalAnswers,
+    up.AveragePostScore, up.UpvoteRatio, tp.TagName, tp.TagCount, tp.TotalScoreForTag,
+    tp.AverageScoreForTag, tp.PostsWithTag, pl.LinkType
+HAVING COUNT(DISTINCT ph_related.Id) > 0 -- Ensure there's at least one related post
+ORDER BY ph.Score DESC, ph.CreationDate DESC
+LIMIT 1000;

@@ -1,0 +1,110 @@
+WITH 
+UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id)                                      AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        MAX(p.CreationDate)                              AS LastPostDate,
+        AVG(p.Score)                                      AS AvgScore,
+        COUNT(DISTINCT tag)                               AS DistinctTagUses
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN LATERAL (
+        SELECT trim(BOTH '<>' FROM(splitted)) AS tag
+        FROM (
+            SELECT UNNEST(
+                CASE 
+                    WHEN p.Tags IS NULL THEN ARRAY[]::text
+                    ELSE regexp_replace(p.Tags, '^<|>$', '') END
+                ) AS splitted
+        ) AS t
+    ) tag_split ON p.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+BadgeAgg AS (
+    SELECT 
+        b.UserId,
+        COUNT(*)                                           AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END)       AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END)       AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END)       AS BronzeBadges,
+        STRING_AGG(DISTINCT b.Name, ', ')                  AS BadgeNames
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+TopTagPerUser AS (
+    SELECT 
+        us.Id                                           AS UserId,
+        trim(BOTH '<>' FROM tag)                        AS TagName,
+        COUNT(*)                                        AS cnt,
+        ROW_NUMBER() OVER (PARTITION BY us.Id ORDER BY COUNT(*) DESC) AS rn
+    FROM UserStats us
+    JOIN Posts p ON p.OwnerUserId = us.Id
+    CROSS JOIN LATERAL (
+        SELECT unnest(
+            CASE 
+                WHEN p.Tags IS NULL THEN ARRAY[]::text
+                ELSE string_to_array(regexp_replace(p.Tags, '^<|>$', ''), '><') 
+            END
+        ) AS tag
+    ) AS tag_split
+    WHERE p.PostTypeId = 2
+    GROUP BY us.Id, trim(BOTH '<>' FROM tag)
+),
+
+LatestActivity AS (
+    SELECT 
+        u.Id,
+        COALESCE(
+            (SELECT MAX(v.CreationDate) FROM Votes v WHERE v.UserId = u.Id),
+            (SELECT MAX(c.CreationDate) FROM Comments c WHERE c.UserId = u.Id),
+            (SELECT MAX(p.LastEditDate) FROM Posts p WHERE p.OwnerUserId = u.Id),
+            u.LastAccessDate
+        ) AS LastActivity
+    FROM Users u
+),
+
+Combined AS (
+    SELECT 
+        us.Id,
+        us.DisplayName,
+        us.Reputation,
+        us.TotalPosts,
+        us.QuestionCount,
+        us.AnswerCount,
+        us.AvgScore,
+        ba.BadgeCount,
+        ba.GoldBadges,
+        ba.SilverBadges,
+        ba.BronzeBadges,
+        ba.BadgeNames,
+        la.LastActivity,
+        tt.TagName  AS TopTag,
+        tt.cnt      AS TopTagCount
+    FROM UserStats us
+    LEFT JOIN BadgeAgg      ba ON ba.UserId = us.Id
+    LEFT JOIN LatestActivity la ON la.Id = us.Id
+    LEFT JOIN TopTagPerUser tt ON tt.UserId = us.Id AND tt.rn = 1
+    WHERE ba.BadgeCount >= 5 OR ba.BadgeCount IS NULL
+)
+
+SELECT *
+FROM Combined
+WHERE (Reputation > 10000 AND COALESCE(BadgeCount,0) >= 10)
+   OR (Reputation BETWEEN 5000 AND 10000 AND COALESCE(GoldBadges,0) > 2)
+
+UNION ALL
+
+SELECT *
+FROM Combined
+WHERE BadgeCount IS NULL
+
+ORDER BY 
+    Reputation DESC,
+    BadgeCount DESC
+LIMIT 100;

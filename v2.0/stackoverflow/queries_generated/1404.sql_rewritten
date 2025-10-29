@@ -1,0 +1,210 @@
+-- {"query": "1404.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3673} 
+WITH UserActivityMetrics AS (
+    -- Aggregate user-level activity across posts, comments, and badges.
+    -- Includes pre-aggregated vote counts from Users table and user creation/access dates.
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.UpVotes AS UserUpVotesGiven,    -- Upvotes given by the user
+        U.DownVotes AS UserDownVotesGiven, -- Downvotes given by the user
+        COUNT(DISTINCT P_Owned.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT CASE WHEN P_Owned.PostTypeId = 1 THEN P_Owned.Id END) AS QuestionsOwned,
+        COUNT(DISTINCT CASE WHEN P_Owned.PostTypeId = 2 THEN P_Owned.Id END) AS AnswersOwned,
+        SUM(COALESCE(P_Owned.Score, 0)) AS TotalPostScoreOwned,
+        COUNT(DISTINCT C_Owned.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT B.Id) AS TotalBadges
+    FROM Users U
+    LEFT JOIN Posts P_Owned ON U.Id = P_Owned.OwnerUserId
+    LEFT JOIN Comments C_Owned ON U.Id = C_Owned.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.UpVotes, U.DownVotes
+),
+PostEngagementMetrics AS (
+    -- Detailed metrics for each post, including true last activity, received votes, and closure info.
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.Title,
+        P.Tags,
+        P.ParentId,
+        P.AcceptedAnswerId,
+        P.ClosedDate,
+        -- Determine the true last activity date using GREATEST and correlated subqueries
+        GREATEST(
+            P.LastActivityDate,
+            P.LastEditDate,
+            (SELECT MAX(CreationDate) FROM Comments WHERE PostId = P.Id), -- Correlated subquery for comment activity
+            (SELECT MAX(CreationDate) FROM PostHistory WHERE PostId = P.Id) -- Correlated subquery for post history activity
+        ) AS TrueLastActivityDate,
+        COUNT(DISTINCT CASE WHEN V.VoteTypeId = 2 THEN V.Id END) AS ReceivedUpVotes,
+        COUNT(DISTINCT CASE WHEN V.VoteTypeId = 3 THEN V.Id END) AS ReceivedDownVotes,
+        COUNT(DISTINCT PH_Editor.UserId) AS UniqueEditors,
+        MAX(CASE WHEN PH_Closed.PostHistoryTypeId = 10 THEN PH_Closed.CreationDate END) AS ClosureDate,
+        MAX(CRT.Name) AS CloseReasonName,
+        -- Classify post popularity status based on view count, score, and recent comments
+        CASE
+            WHEN P.ViewCount > (SELECT AVG(ViewCount) * 2 FROM Posts WHERE PostTypeId = P.PostTypeId AND ViewCount IS NOT NULL)
+                 AND P.Score > (SELECT AVG(Score) * 1.5 FROM Posts WHERE PostTypeId = P.PostTypeId AND Score IS NOT NULL)
+                 AND EXISTS (SELECT 1 FROM Comments WHERE PostId = P.Id AND CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days') -- Correlated subquery for recent activity
+            THEN 'Trending Hot'
+            WHEN P.ViewCount > (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = P.PostTypeId AND ViewCount IS NOT NULL)
+                 AND P.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = P.PostTypeId AND Score IS NOT NULL)
+            THEN 'Popular'
+            ELSE 'Standard'
+        END AS PostPopularityStatus,
+        DENSE_RANK() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.ViewCount DESC, P.CreationDate DESC) AS PostRankByScoreViews
+    FROM Posts P
+    LEFT JOIN Votes V ON P.Id = V.PostId
+    LEFT JOIN PostHistory PH_Editor ON P.Id = PH_Editor.PostId AND PH_Editor.PostHistoryTypeId IN (4, 5, 6, 24) -- Edits
+    LEFT JOIN PostHistory PH_Closed ON P.Id = PH_Closed.PostId AND PH_Closed.PostHistoryTypeId = 10 -- Post closed event
+    LEFT JOIN CloseReasonTypes CRT ON CAST(PH_Closed.Comment AS SMALLINT) = CRT.Id -- CloseReasonId is in Comment field
+    GROUP BY
+        P.Id, P.PostTypeId, P.OwnerUserId, P.CreationDate, P.Score, P.ViewCount,
+        P.AnswerCount, P.CommentCount, P.FavoriteCount, P.Title, P.Tags, P.ParentId,
+        P.AcceptedAnswerId, P.ClosedDate, P.LastActivityDate, P.LastEditDate
+),
+AggregatedPostMetricsForUsers AS (
+    -- Aggregate post metrics for each user based on posts they own.
+    SELECT
+        PEM.OwnerUserId AS UserId,
+        AVG(PEM.PostScore) AS AvgOwnedPostScore,
+        SUM(PEM.ViewCount) AS TotalOwnedPostViews,
+        -- Count answers authored by this user that were accepted by others
+        COUNT(CASE WHEN PEM.PostTypeId = 2 AND ParentPost.AcceptedAnswerId = PEM.PostId THEN 1 END) AS AcceptedAnswersByOwner,
+        -- Count questions authored by this user that received an accepted answer
+        COUNT(DISTINCT CASE WHEN PEM.PostTypeId = 1 AND PEM.AcceptedAnswerId IS NOT NULL THEN PEM.PostId END) AS QuestionsOwnedWithAcceptedAnswer,
+        -- Calculate median time in minutes from post creation to closure for owned questions
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (PEM.ClosureDate - PEM.PostCreationDate))/60) FILTER (WHERE PEM.ClosureDate IS NOT NULL) AS MedianTimeToCloseMinutes,
+        -- Percentage of owned questions that are closed, handling division by zero with NULLIF
+        CAST(COUNT(CASE WHEN PEM.ClosedDate IS NOT NULL THEN 1 END) AS DECIMAL) / NULLIF(COUNT(CASE WHEN PEM.PostTypeId = 1 THEN 1 END), 0) AS PctClosedQuestions,
+        MAX(PEM.TrueLastActivityDate) AS LastOwnedPostActivity,
+        COUNT(DISTINCT CASE WHEN PEM.PostPopularityStatus = 'Trending Hot' THEN PEM.PostId END) AS HotPostsOwnedCount,
+        SUM(CASE WHEN PEM.PostTypeId = 1 THEN PEM.AnswerCount ELSE 0 END) AS TotalAnswersToOwnedQuestions
+    FROM PostEngagementMetrics PEM
+    LEFT JOIN Posts ParentPost ON PEM.PostTypeId = 2 AND PEM.ParentId = ParentPost.Id -- For checking if an answer was accepted by a question
+    WHERE PEM.OwnerUserId IS NOT NULL
+    GROUP BY PEM.OwnerUserId
+),
+TopUserTag AS (
+    -- Identifies the top tag by question count for each user.
+    -- Uses string_to_array and CROSS JOIN LATERAL for tag parsing.
+    SELECT
+        T.OwnerUserId AS UserId,
+        T.TagName,
+        T.QuestionsCount,
+        T.AverageTagScore,
+        -- Assigns a rank to each tag for a user based on frequency and score
+        ROW_NUMBER() OVER (PARTITION BY T.OwnerUserId ORDER BY T.QuestionsCount DESC, T.AverageTagScore DESC, T.TagName ASC) AS rn
+    FROM (
+        SELECT
+            PEM.OwnerUserId,
+            TRIM(unnested_tag) AS TagName, -- Clean up whitespace from tags
+            COUNT(*) AS QuestionsCount,
+            AVG(PEM.PostScore) AS AverageTagScore
+        FROM PostEngagementMetrics PEM
+        -- Parses the '<tag1><tag2>' string into individual rows for each tag
+        CROSS JOIN LATERAL UNNEST(string_to_array(SUBSTRING(PEM.Tags, 2, LENGTH(PEM.Tags) - 2), '><')) AS unnested_tag
+        WHERE PEM.PostTypeId = 1 AND PEM.OwnerUserId IS NOT NULL AND PEM.Tags IS NOT NULL AND LENGTH(PEM.Tags) > 2
+        GROUP BY PEM.OwnerUserId, TRIM(unnested_tag)
+    ) T
+)
+-- Main Query: Combines user activity, post metrics, and tag performance to profile users.
+SELECT
+    UAM.UserId,
+    UAM.DisplayName,
+    UAM.Reputation,
+    UAM.UserCreationDate,
+    UAM.LastAccessDate,
+    UAM.TotalPostsOwned,
+    UAM.QuestionsOwned,
+    UAM.AnswersOwned,
+    UAM.TotalPostScoreOwned,
+    UAM.TotalCommentsMade,
+    UAM.TotalBadges,
+    UAM.UserUpVotesGiven,
+    UAM.UserDownVotesGiven,
+    APM.AvgOwnedPostScore,
+    APM.TotalOwnedPostViews,
+    APM.AcceptedAnswersByOwner,
+    APM.QuestionsOwnedWithAcceptedAnswer,
+    APM.MedianTimeToCloseMinutes,
+    COALESCE(APM.PctClosedQuestions, 0) AS PctClosedQuestions, -- Use COALESCE for NULL percentage
+    APM.LastOwnedPostActivity,
+    APM.HotPostsOwnedCount,
+    APM.TotalAnswersToOwnedQuestions,
+    TUT.TagName AS TopAuthoredTag,
+    TUT.QuestionsCount AS TopAuthoredTagUsage,
+    TUT.AverageTagScore AS TopAuthoredTagAvgScore,
+    -- Calculate a comprehensive user influence score using various weighted metrics.
+    CAST(
+        (UAM.Reputation * 0.05) +
+        (UAM.TotalPostsOwned * 0.2) +
+        (UAM.TotalCommentsMade * 0.1) +
+        (UAM.TotalBadges * 0.5) +
+        (COALESCE(APM.AvgOwnedPostScore, 0) * 0.15) +
+        (COALESCE(APM.AcceptedAnswersByOwner, 0) * 2) +
+        (COALESCE(APM.QuestionsOwnedWithAcceptedAnswer, 0) * 3) +
+        (COALESCE(APM.TotalOwnedPostViews, 0) * 0.001) +
+        (COALESCE(APM.HotPostsOwnedCount, 0) * 10) -
+        (UAM.UserDownVotesGiven * 0.05) -
+        (COALESCE(APM.PctClosedQuestions, 0) * 20) -- Penalize for closed questions
+    AS NUMERIC(18, 2)) AS UserInfluenceScore,
+    -- Rank users based on their calculated influence score using a window function.
+    RANK() OVER (ORDER BY (
+        (UAM.Reputation * 0.05) + (UAM.TotalPostsOwned * 0.2) + (UAM.TotalCommentsMade * 0.1) +
+        (UAM.TotalBadges * 0.5) + (COALESCE(APM.AvgOwnedPostScore, 0) * 0.15) +
+        (COALESCE(APM.AcceptedAnswersByOwner, 0) * 2) +
+        (COALESCE(APM.QuestionsOwnedWithAcceptedAnswer, 0) * 3) +
+        (COALESCE(APM.TotalOwnedPostViews, 0) * 0.001) +
+        (COALESCE(APM.HotPostsOwnedCount, 0) * 10) -
+        (UAM.UserDownVotesGiven * 0.05) -
+        (COALESCE(APM.PctClosedQuestions, 0) * 20)
+    ) DESC) AS OverallUserRank,
+    -- Categorize users into distinct profiles based on multiple activity metrics and thresholds.
+    CASE
+        WHEN UAM.Reputation >= 10000 AND UAM.QuestionsOwned > 50 AND UAM.AnswersOwned > 100 AND COALESCE(APM.AcceptedAnswersByOwner, 0) > 50 THEN 'Veteran Expert'
+        WHEN UAM.Reputation >= 5000 AND COALESCE(APM.PctClosedQuestions, 0) < 0.2 AND COALESCE(APM.HotPostsOwnedCount, 0) >= 1 THEN 'High-Impact Contributor'
+        WHEN UAM.TotalPostsOwned = 0 AND UAM.TotalCommentsMade > 100 AND UAM.UserCreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year' THEN 'Recent Commenter'
+        WHEN UAM.QuestionsOwned > 0 AND UAM.AnswersOwned = 0 AND UAM.TotalBadges = 0 THEN 'Questioner Only, Novice'
+        WHEN UAM.AnswersOwned > 0 AND COALESCE(APM.AcceptedAnswersByOwner, 0) = 0 AND UAM.TotalPostsOwned < 10 THEN 'Aspiring Answerer'
+        WHEN UAM.Reputation <= 100 AND UAM.TotalPostsOwned = 0 AND UAM.TotalCommentsMade = 0 THEN 'New & Inactive User'
+        ELSE 'General Participant'
+    END AS UserContributionProfile,
+    -- Generate complex string expressions for unique identifiers and clean location data.
+    TRIM(BOTH '>' FROM SUBSTRING(REPLACE(REPLACE(COALESCE(UAM.DisplayName, 'N/A'), ' ', ''), '.', ''), 1, 10)) ||
+    TO_CHAR(UAM.UserCreationDate, 'YYYYMMDD') AS UserIdentifierHash,
+    NULLIF(LOWER(U.Location), '') AS CleanedUserLocation, -- Converts empty strings or ' ' to NULL
+    -- Correlated subquery to calculate the average class of badges for each user.
+    (SELECT AVG(B.Class) FROM Badges B WHERE B.UserId = UAM.UserId) AS AverageBadgeClass,
+    -- Analyze question acceptance behavior for users who ask questions.
+    CASE
+        WHEN UAM.QuestionsOwned > 0 AND COALESCE(APM.QuestionsOwnedWithAcceptedAnswer, 0) = 0
+             AND AGE(cast('2024-10-01 12:34:56' as timestamp), UAM.LastAccessDate) < INTERVAL '90 days' THEN 'Unresolved Questioner' -- Active, but no accepted answers
+        WHEN UAM.QuestionsOwned > 0 AND COALESCE(APM.QuestionsOwnedWithAcceptedAnswer, 0) > 0
+             AND AGE(cast('2024-10-01 12:34:56' as timestamp), UAM.LastAccessDate) < INTERVAL '90 days' THEN 'Resolved Questioner'   -- Active, with accepted answers
+        ELSE 'Unknown Questioner Status' -- Not a questioner or inactive
+    END AS QuestionAcceptanceStatus
+FROM UserActivityMetrics UAM
+LEFT JOIN Users U ON UAM.UserId = U.Id -- Join back to Users for additional profile info like Location
+LEFT JOIN AggregatedPostMetricsForUsers APM ON UAM.UserId = APM.UserId
+LEFT JOIN TopUserTag TUT ON UAM.UserId = TUT.UserId AND TUT.rn = 1 -- Join only the top tag for each user
+WHERE
+    UAM.Reputation >= 500 -- Filter for users with a minimum reputation
+    AND UAM.LastAccessDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year' -- Focus on relatively active users within the last year
+    AND (
+        UAM.QuestionsOwned > 0 OR UAM.AnswersOwned > 0 OR UAM.TotalCommentsMade > 10 -- Ensure significant activity
+    )
+    AND (U.WebsiteUrl IS NOT NULL OR U.AboutMe IS NOT NULL) -- Filter for users with some profile details
+    AND COALESCE(UAM.DisplayName, '') <> '' -- Exclude users with empty or NULL display names
+ORDER BY UserInfluenceScore DESC, UAM.Reputation DESC, UAM.LastAccessDate DESC
+LIMIT 100;

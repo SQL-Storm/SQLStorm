@@ -1,0 +1,131 @@
+-- {"query": "3761.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2657} 
+
+WITH UserPostAgg AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        SUM(p.Score) FILTER (WHERE p.PostTypeId = 1) AS QuestionScoreSum,
+        SUM(p.Score) FILTER (WHERE p.PostTypeId = 2) AS AnswerScoreSum,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 2) AS AvgAnswerScore,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) FILTER (WHERE p.PostTypeId = 2) AS MedianAnswerScore,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+UserBadgeAgg AS (
+    SELECT
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadgeCount,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadgeCount,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadgeCount,
+        COUNT(*) FILTER (WHERE b.TagBased = 1) AS TagBasedBadgeCount
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserVoteAgg AS (
+    SELECT
+        v.UserId,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS UpVoteGiven,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS DownVoteGiven,
+        MAX(v.CreationDate) AS LastVoteDate
+    FROM Votes v
+    GROUP BY v.UserId
+),
+UserTagUsage AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        unnest(string_to_array(trim(both '<>' FROM p.Tags), '><')) AS Tag,
+        COUNT(*) AS TagUseCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+    GROUP BY p.OwnerUserId, Tag
+),
+TopTagPerUser AS (
+    SELECT
+        UserId,
+        Tag,
+        TagUseCount,
+        ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY TagUseCount DESC, Tag) AS rn
+    FROM UserTagUsage
+)
+SELECT
+    upa.UserId,
+    upa.DisplayName,
+    upa.Reputation,
+    upa.QuestionCount,
+    upa.AnswerCount,
+    upa.QuestionScoreSum,
+    upa.AnswerScoreSum,
+    upa.AvgAnswerScore,
+    upa.MedianAnswerScore,
+    ub.GoldBadgeCount,
+    ub.SilverBadgeCount,
+    ub.BronzeBadgeCount,
+    ub.TagBasedBadgeCount,
+    uv.UpVoteGiven,
+    uv.DownVoteGiven,
+    COALESCE(uv.LastVoteDate, upa.LastPostDate) AS LastActivityDate,
+    ttp.Tag AS MostUsedTag,
+    ttp.TagUseCount AS MostUsedTagCount,
+    CASE
+        WHEN upa.Reputation > 20000 THEN 'Elite'
+        WHEN upa.Reputation BETWEEN 10000 AND 20000 THEN 'Pro'
+        WHEN upa.Reputation BETWEEN 5000 AND 9999 THEN 'Experienced'
+        ELSE 'Rising'
+    END AS ReputationTier,
+    CASE
+        WHEN EXISTS (
+            SELECT 1
+            FROM PostHistory ph
+            WHERE ph.PostId = (
+                SELECT p.Id
+                FROM Posts p
+                WHERE p.OwnerUserId = upa.UserId
+                ORDER BY p.CreationDate DESC
+                LIMIT 1
+            )
+            AND ph.PostHistoryTypeId = 10        -- Post Closed
+            AND ph.Comment IS NOT NULL
+        ) THEN 1
+        ELSE 0
+    END AS HasRecentlyClosedPost
+FROM UserPostAgg upa
+LEFT JOIN UserBadgeAgg ub ON ub.UserId = upa.UserId
+LEFT JOIN UserVoteAgg uv ON uv.UserId = upa.UserId
+LEFT JOIN (
+    SELECT UserId, Tag, TagUseCount
+    FROM TopTagPerUser
+    WHERE rn = 1
+) ttp ON ttp.UserId = upa.UserId
+WHERE upa.Reputation IS NOT NULL
+
+UNION ALL
+
+SELECT
+    NULL AS UserId,
+    'TOTAL' AS DisplayName,
+    SUM(upa.Reputation) AS Reputation,
+    SUM(upa.QuestionCount) AS QuestionCount,
+    SUM(upa.AnswerCount) AS AnswerCount,
+    SUM(upa.QuestionScoreSum) AS QuestionScoreSum,
+    SUM(upa.AnswerScoreSum) AS AnswerScoreSum,
+    AVG(upa.AvgAnswerScore) AS AvgAnswerScore,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY upa.MedianAnswerScore) AS MedianAnswerScore,
+    SUM(ub.GoldBadgeCount) AS GoldBadgeCount,
+    SUM(ub.SilverBadgeCount) AS SilverBadgeCount,
+    SUM(ub.BronzeBadgeCount) AS BronzeBadgeCount,
+    SUM(ub.TagBasedBadgeCount) AS TagBasedBadgeCount,
+    SUM(uv.UpVoteGiven) AS UpVoteGiven,
+    SUM(uv.DownVoteGiven) AS DownVoteGiven,
+    NULL AS LastActivityDate,
+    NULL AS MostUsedTag,
+    NULL AS MostUsedTagCount,
+    NULL AS ReputationTier,
+    NULL AS HasRecentlyClosedPost
+FROM UserPostAgg upa
+LEFT JOIN UserBadgeAgg ub ON ub.UserId = upa.UserId
+LEFT JOIN UserVoteAgg uv ON uv.UserId = upa.UserId;

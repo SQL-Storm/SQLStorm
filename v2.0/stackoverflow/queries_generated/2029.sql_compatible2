@@ -1,0 +1,187 @@
+WITH RECURSIVE Recursive_TagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        ARRAY[t.TagName] AS TagPath,
+        1 AS Level
+    FROM Tags t
+    WHERE t.IsModeratorOnly = false AND t.IsRequired = false
+
+    UNION ALL
+
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        h.TagPath || t2.TagName,
+        h.Level + 1
+    FROM Tags t2
+    JOIN Recursive_TagHierarchy h
+      ON h.Id <> t2.Id
+     AND NOT t2.TagName = ANY(h.TagPath)
+     AND array_length(h.TagPath, 1) < 3
+),
+Top_Users_Badges AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COUNT(b.Id) AS TotalBadges,
+        row_number() OVER (ORDER BY u.Reputation DESC, u.Id) AS UserRank
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(b.Id) > 0
+),
+Questions_With_Stats AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        COALESCE(ps.CommentCount, 0) AS CommentCount,
+        COALESCE(vup.UpVotes, 0) AS UpVotes,
+        COALESCE(vdown.DownVotes, 0) AS DownVotes
+    FROM Posts p
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS CommentCount
+        FROM Comments
+        GROUP BY PostId
+    ) ps ON ps.PostId = p.Id
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS UpVotes
+        FROM Votes
+        WHERE VoteTypeId = 2
+        GROUP BY PostId
+    ) vup ON vup.PostId = p.Id
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS DownVotes
+        FROM Votes
+        WHERE VoteTypeId = 3
+        GROUP BY PostId
+    ) vdown ON vdown.PostId = p.Id
+    WHERE p.PostTypeId = 1
+),
+Answers_By_Question AS (
+    SELECT
+        a.ParentId AS QuestionId,
+        COUNT(a.Id) AS TotalAnswers,
+        MAX(a.Score) AS MaxAnswerScore,
+        AVG(a.Score) AS AvgAnswerScore,
+        COUNT(CASE WHEN a.OwnerUserId IS NOT NULL THEN 1 END) AS AnswersWithOwner,
+        COUNT(CASE WHEN a.AcceptedAnswerId = a.Id THEN 1 ELSE NULL END) AS AcceptedAnswerCount
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+    GROUP BY a.ParentId
+),
+User_Badge_Activity AS (
+    SELECT
+        b.UserId,
+        b.Class,
+        CAST(b.Date AS date) AS BadgeDate,
+        COUNT(*) AS BadgesEarned
+    FROM Badges b
+    GROUP BY b.UserId, b.Class, CAST(b.Date AS date)
+),
+CloseReasons_Count AS (
+    SELECT cht.Name AS CloseReason, COUNT(*) AS CloseCount
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id AND pht.Id = 10
+    LEFT JOIN CloseReasonTypes cht ON CAST(ph.Comment AS integer) = cht.Id
+    GROUP BY cht.Name
+),
+Tag_Question_Mapping AS (
+    SELECT
+        p.Id AS QuestionId,
+        trim(tg) AS TagName
+    FROM Posts p,
+    LATERAL unnest(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><')) AS tg
+    WHERE p.PostTypeId = 1
+),
+Tag_Answer_Mapping AS (
+    SELECT
+        a.Id AS AnswerId,
+        tq.TagName
+    FROM Posts a
+    JOIN Posts tq_p ON tq_p.Id = a.ParentId AND tq_p.PostTypeId = 1
+    JOIN Tag_Question_Mapping tq ON tq.QuestionId = tq_p.Id
+    WHERE a.PostTypeId = 2
+),
+Top_Tags_Activity AS (
+    SELECT
+        tq.TagName,
+        COUNT(DISTINCT tq.QuestionId) AS QuestionCount,
+        COUNT(DISTINCT ta.AnswerId) AS AnswerCount,
+        AVG(q.Score) AS AvgQuestionScore,
+        AVG(a.Score) AS AvgAnswerScore,
+        MAX(q.Score) AS MaxQuestionScore,
+        MAX(a.Score) AS MaxAnswerScore,
+        SUM(q.ViewCount) AS TotalQuestionViews
+    FROM Tag_Question_Mapping tq
+    LEFT JOIN Posts q ON q.Id = tq.QuestionId
+    LEFT JOIN Tag_Answer_Mapping ta ON ta.TagName = tq.TagName
+    LEFT JOIN Posts a ON a.Id = ta.AnswerId
+    GROUP BY tq.TagName
+    ORDER BY QuestionCount DESC
+    LIMIT 50
+)
+SELECT
+    tu.UserRank,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.GoldBadges,
+    tu.SilverBadges,
+    tu.BronzeBadges,
+    tu.TotalBadges,
+    AVG(qws.Score) OVER (PARTITION BY qws.OwnerUserId) AS AvgUserQuestionScore,
+    SUM(qws.ViewCount) OVER (PARTITION BY qws.OwnerUserId) AS TotalUserQuestionViews,
+    COALESCE(abq.TotalAnswers, 0) AS UserTotalAnswers,
+    COALESCE(abq.MaxAnswerScore, 0) AS MaxAnswerScoreForUserQuestions,
+    COALESCE(abq.AvgAnswerScore, 0) AS AvgAnswerScoreForUserQuestions,
+    CASE
+        WHEN qws.ClosedDate IS NULL THEN 'Open'
+        ELSE 'Closed'
+    END AS QuestionStatus,
+    qws.Tags,
+    string_agg(DISTINCT rht.TagName, ',' ORDER BY rht.Level) AS RelatedTags,
+    cr.CloseReason,
+    cr.CloseCount,
+    tbact.QuestionCount,
+    tbact.AnswerCount,
+    tbact.AvgQuestionScore,
+    tbact.AvgAnswerScore,
+    tbact.TotalQuestionViews,
+    COALESCE(uba.BadgesEarned, 0) AS RecentBadgesEarned
+FROM Top_Users_Badges tu
+LEFT JOIN Questions_With_Stats qws ON qws.OwnerUserId = tu.UserId
+LEFT JOIN Answers_By_Question abq ON abq.QuestionId = qws.Id
+LEFT JOIN Recursive_TagHierarchy rht
+    ON rht.TagName = ANY(string_to_array(COALESCE(qws.Tags, ''), '><'))
+LEFT JOIN CloseReasons_Count cr ON cr.CloseReason = 'Duplicate'
+LEFT JOIN Top_Tags_Activity tbact ON tbact.TagName = rht.TagName
+LEFT JOIN LATERAL (
+    SELECT SUM(BadgesEarned) AS BadgesEarned
+    FROM User_Badge_Activity uba2
+    WHERE uba2.UserId = tu.UserId AND uba2.BadgeDate > (CAST('2024-10-01' AS date) - INTERVAL '30 day')
+) uba ON true
+WHERE tu.UserRank <= 100
+GROUP BY
+    tu.UserRank, tu.DisplayName, tu.Reputation,
+    tu.GoldBadges, tu.SilverBadges, tu.BronzeBadges, tu.TotalBadges,
+    qws.OwnerUserId, qws.Score, qws.ViewCount, qws.ClosedDate, qws.Tags,
+    abq.TotalAnswers, abq.MaxAnswerScore, abq.AvgAnswerScore,
+    cr.CloseReason, cr.CloseCount,
+    tbact.QuestionCount, tbact.AnswerCount, tbact.AvgQuestionScore, tbact.AvgAnswerScore, tbact.TotalQuestionViews,
+    uba.BadgesEarned
+ORDER BY tu.UserRank
+LIMIT 50;

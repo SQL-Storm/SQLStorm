@@ -1,0 +1,169 @@
+-- {"query": "2684.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1492} 
+with RecursivePopularTags as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        p.Score,
+        row_number() over (partition by t.Id order by p.Score desc nulls last) as rn
+    from Tags t
+    left join Posts p on p.Id = t.ExcerptPostId and p.PostTypeId = 1 -- question excerpt posts
+    where t.Count > 1000
+),
+UserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        sum(vt2.VoteCount) as TotalVotesReceived,
+        max(u.Reputation) as MaxReputation,
+        min(u.CreationDate) as FirstSeen,
+        max(u.LastAccessDate) as LastSeen,
+        coalesce(string_agg(distinct b.Name, ', ' order by b.Date desc), '') as RecentBadges
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join (
+        select
+            p.OwnerUserId,
+            v.VoteTypeId,
+            count(*) as VoteCount
+        from Votes v
+        join Posts p on p.Id = v.PostId
+        group by p.OwnerUserId, v.VoteTypeId
+    ) vt2 on vt2.OwnerUserId = u.Id
+    left join Badges b on b.UserId = u.Id and b.Date > cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+    where u.Reputation > 1000
+    group by u.Id, u.DisplayName
+),
+PostAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.Score as QuestionScore,
+        coalesce(a.TotalAnswers, 0) as TotalAnswers,
+        coalesce(a.AvgScore, 0) as AvgAnswerScore,
+        coalesce(a.MaxAnswerScore, 0) as MaxAnswerScore,
+        coalesce(a.AnswerWithMaxScoreId, null) as TopAnswerId
+    from Posts q
+    left join lateral (
+        select
+            count(*) as TotalAnswers,
+            avg(p.Score) as AvgScore,
+            max(p.Score) as MaxAnswerScore,
+            max(p.Id) filter (where p.Score = max(p.Score) over ()) as AnswerWithMaxScoreId
+        from Posts p
+        where p.ParentId = q.Id and p.PostTypeId = 2
+    ) a on true
+    where q.PostTypeId = 1
+      and q.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '1 year'
+),
+CloseCountCTE as (
+    select
+        ph.PostId,
+        count(*) as CloseVotesCount
+    from PostHistory ph
+    where ph.PostHistoryTypeId = 10 -- Post Closed
+    group by ph.PostId
+),
+CombinedStats as (
+    select
+        ps.QuestionId,
+        ps.Title,
+        ps.OwnerUserId,
+        ua.DisplayName as OwnerName,
+        ps.QuestionScore,
+        ps.TotalAnswers,
+        ps.AvgAnswerScore,
+        ps.MaxAnswerScore,
+        ps.TopAnswerId,
+        cc.CloseVotesCount,
+        -- String manipulation: create a summary tag string
+        coalesce(
+            substring(
+                (select string_agg(regexp_replace(t.TagName, '[^a-zA-Z0-9]', '', 'g'), ', ' order by t.Count desc)
+                 from Tags t
+                 join Posts p2 on p2.Tags like '%' || t.TagName || '%'
+                 where p2.Id = ps.QuestionId
+                ),
+                1,
+                40
+            ), '(none)') as TopTagsSample
+    from PostAnswerStats ps
+    left join Users ua on ua.Id = ps.OwnerUserId
+    left join CloseCountCTE cc on cc.PostId = ps.QuestionId
+),
+RankedQuestions as (
+    select
+        *,
+        rank() over (
+            partition by case when CloseVotesCount is null then 0 else 1 end
+            order by QuestionScore desc, TotalAnswers desc, AvgAnswerScore desc, MaxAnswerScore desc
+        ) as RankByPopularity
+    from CombinedStats
+),
+Duplicates as (
+    select
+        pl.PostId as DuplicateQuestionId,
+        pl.RelatedPostId as OriginalQuestionId,
+        p1.Title as DuplicateTitle,
+        p2.Title as OriginalTitle
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId and lt.Name = 'Duplicate'
+    join Posts p1 on p1.Id = pl.PostId and p1.PostTypeId = 1
+    join Posts p2 on p2.Id = pl.RelatedPostId and p2.PostTypeId = 1
+),
+UsersWithBadgeStats as (
+    select
+        u.Id,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        rank() over (order by u.Reputation desc) as ReputationRank
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    where u.Reputation > 10000
+    group by u.Id, u.DisplayName
+)
+select
+    rq.QuestionId,
+    rq.Title,
+    rq.OwnerName,
+    rq.QuestionScore,
+    rq.TotalAnswers,
+    rq.AvgAnswerScore,
+    rq.MaxAnswerScore,
+    rq.CloseVotesCount,
+    rq.TopTagsSample,
+    coalesce(d.OriginalQuestionId, -1) as OriginalQuestionIdForDuplicate,
+    coalesce(d.OriginalTitle, '(no duplicate)') as OriginalQuestionTitle,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    ubs.ReputationRank,
+    string_agg(distinct bs.Name || ':' || cast(bs.Class as varchar), ',' order by bs.Date desc) as RecentBadgeClasses
+from RankedQuestions rq
+left join Duplicates d on d.DuplicateQuestionId = rq.QuestionId
+left join UsersWithBadgeStats ubs on ubs.Id = rq.OwnerUserId
+left join Badges bs on bs.UserId = rq.OwnerUserId and bs.Date > cast('2024-10-01 12:34:56' as timestamp) - interval '30 days'
+where rq.RankByPopularity <= 50
+group by
+    rq.QuestionId,
+    rq.Title,
+    rq.OwnerName,
+    rq.QuestionScore,
+    rq.TotalAnswers,
+    rq.AvgAnswerScore,
+    rq.MaxAnswerScore,
+    rq.CloseVotesCount,
+    rq.TopTagsSample,
+    d.OriginalQuestionId,
+    d.OriginalTitle,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    ubs.ReputationRank
+order by rq.RankByPopularity, rq.QuestionScore desc
+limit 100;

@@ -1,0 +1,128 @@
+WITH UserStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1)               AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2)               AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3)               AS BronzeBadges,
+        COALESCE(SUM(p.Score), 0)                            AS TotalPostScore,
+        COUNT(p.Id)                                          AS PostCount,
+        MAX(p.CreationDate)                                  AS LastPostDate
+    FROM Users u
+    LEFT JOIN Badges b   ON b.UserId = u.Id
+    LEFT JOIN Posts  p   ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopUsers AS (
+    SELECT
+        us.Id,
+        us.DisplayName,
+        us.Reputation,
+        us.GoldBadges,
+        us.SilverBadges,
+        us.BronzeBadges,
+        us.TotalPostScore,
+        us.PostCount,
+        us.LastPostDate,
+        RANK() OVER (ORDER BY us.Reputation DESC, us.GoldBadges DESC, us.TotalPostScore DESC) AS RepRank
+    FROM UserStats us
+    WHERE us.Reputation > 10000
+),
+RecentActivity AS (
+    SELECT
+        u.Id,
+        MAX(v.CreationDate) AS LastVoteDate,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM Users u
+    LEFT JOIN Votes    v ON v.UserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    GROUP BY u.Id
+),
+TagStats AS (
+    SELECT
+        t.TagName,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1)                                   AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2)                                   AS AnswerCount,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 1)                                  AS AvgQuestionScore,
+        STRING_AGG(DISTINCT u.DisplayName, ', ') FILTER (WHERE u.Id IS NOT NULL)      AS TopContributors
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    GROUP BY t.TagName
+    HAVING COUNT(p.Id) > 100
+),
+Combined AS (
+    SELECT
+        tu.Id,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.GoldBadges,
+        tu.SilverBadges,
+        tu.BronzeBadges,
+        tu.TotalPostScore,
+        tu.PostCount,
+        tu.LastPostDate,
+        ra.LastVoteDate,
+        ra.LastCommentDate,
+        ROW_NUMBER() OVER (PARTITION BY tu.Reputation ORDER BY tu.TotalPostScore DESC) AS RowInRepGroup,
+        CASE
+            WHEN tu.LastPostDate IS NULL THEN 0
+            ELSE EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - tu.LastPostDate)) / 86400
+        END AS DaysSinceLastPost,
+        tu.RepRank
+    FROM TopUsers tu
+    LEFT JOIN RecentActivity ra ON ra.Id = tu.Id
+)
+SELECT
+    c.Id,
+    c.DisplayName,
+    c.Reputation,
+    c.GoldBadges,
+    c.SilverBadges,
+    c.BronzeBadges,
+    c.TotalPostScore,
+    c.PostCount,
+    ROUND(c.DaysSinceLastPost, 1)           AS DaysSinceLastPost,
+    c.RowInRepGroup,
+    ts.TagName,
+    ts.QuestionCount,
+    ts.AnswerCount,
+    ROUND(ts.AvgQuestionScore, 2)           AS AvgQuestionScore,
+    ts.TopContributors
+FROM Combined c
+LEFT JOIN LATERAL (
+    SELECT
+        t.TagName,
+        t.QuestionCount,
+        t.AnswerCount,
+        t.AvgQuestionScore,
+        t.TopContributors
+    FROM TagStats t
+    WHERE POSITION(',' || c.DisplayName || ',' IN ',' || t.TopContributors || ',') > 0
+    ORDER BY t.QuestionCount DESC
+    LIMIT 1
+) ts ON TRUE
+WHERE c.RepRank <= 10
+ORDER BY c.Reputation DESC, c.GoldBadges DESC, c.TotalPostScore DESC
+
+UNION ALL
+
+SELECT
+    CAST(NULL AS bigint) AS Id,
+    '---'                 AS DisplayName,
+    CAST(NULL AS integer) AS Reputation,
+    CAST(NULL AS integer) AS GoldBadges,
+    CAST(NULL AS integer) AS SilverBadges,
+    CAST(NULL AS integer) AS BronzeBadges,
+    CAST(NULL AS numeric) AS TotalPostScore,
+    CAST(NULL AS integer) AS PostCount,
+    CAST(NULL AS numeric) AS DaysSinceLastPost,
+    CAST(NULL AS integer) AS RowInRepGroup,
+    CAST(NULL AS text)    AS TagName,
+    CAST(NULL AS bigint)  AS QuestionCount,
+    CAST(NULL AS bigint)  AS AnswerCount,
+    CAST(NULL AS numeric) AS AvgQuestionScore,
+    CAST(NULL AS text)    AS TopContributors
+
+LIMIT 100;

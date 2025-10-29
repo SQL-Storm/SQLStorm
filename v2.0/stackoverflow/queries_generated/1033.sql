@@ -1,0 +1,196 @@
+-- {"query": "1033.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3391} 
+
+WITH PostTagSplitter AS (
+    -- CTE 1: Parses 'Tags' string into individual tags for Question posts.
+    -- Also calculates a simplified tag hash for potential partitioning.
+    SELECT
+        p.Id AS PostId,
+        TRIM(UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><'))) AS TagName,
+        p.CreationDate AS PostCreationDate,
+        p.OwnerUserId,
+        p.Score AS PostScore,
+        p.ViewCount AS PostViewCount,
+        MD5(TRIM(UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><')))) AS TagHash
+    FROM Posts AS p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2
+),
+UserActivitySummary AS (
+    -- CTE 2: Summarizes user activity, contributions, and badge counts.
+    -- Includes a window function to rank users by reputation within their creation year.
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COALESCE(u.Views, 0) AS TotalProfileViews,
+        COALESCE(u.UpVotes, 0) AS TotalUpVotesGiven,
+        COALESCE(u.DownVotes, 0) AS TotalDownVotesGiven,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        SUM(CASE WHEN p.PostTypeId IN (1, 2) THEN p.Score ELSE 0 END) AS TotalPostScore,
+        MAX(p.LastActivityDate) AS LastPostActivityDate,
+        COUNT(DISTINCT c.Id) AS TotalCommentCountMade,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        DATE_PART('day', u.LastAccessDate - u.CreationDate) AS DaysSinceCreation,
+        RANK() OVER (PARTITION BY EXTRACT(YEAR FROM u.CreationDate) ORDER BY u.Reputation DESC) AS RepRankInCreationYear
+    FROM Users AS u
+    LEFT JOIN Posts AS p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments AS c ON u.Id = c.UserId
+    LEFT JOIN Badges AS b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes
+),
+PostEngagementMetrics AS (
+    -- CTE 3: Calculates detailed engagement metrics for each post, including a 'HotnessScore'.
+    -- Uses conditional aggregation for vote types and counts unique editors from post history.
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        COALESCE(p.ViewCount, 0) AS PostViewCount,
+        COALESCE(p.CommentCount, 0) AS PostCommentCount,
+        COALESCE(p.FavoriteCount, 0) AS PostFavoriteCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived,
+        COUNT(DISTINCT v.Id) AS TotalVotesReceived,
+        (
+            SELECT COUNT(DISTINCT ph_sub.UserId)
+            FROM PostHistory AS ph_sub
+            WHERE ph_sub.PostId = p.Id AND ph_sub.PostHistoryTypeId IN (4, 5, 6)
+        ) AS UniqueEditorsCount, -- Correlated subquery for unique editors
+        CASE
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN TRUE
+            ELSE FALSE
+        END AS HasAcceptedAnswer,
+        (CAST(p.Score AS NUMERIC) * 0.7)
+        + (CAST(COALESCE(p.ViewCount, 0) AS NUMERIC) * 0.05)
+        + (CAST(COALESCE(p.CommentCount, 0) AS NUMERIC) * 0.3)
+        + (CAST(COALESCE(p.FavoriteCount, 0) AS NUMERIC) * 1.5) AS HotnessScore
+    FROM Posts AS p
+    LEFT JOIN Votes AS v ON p.Id = v.PostId
+    GROUP BY p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.CommentCount, p.FavoriteCount, p.AcceptedAnswerId
+),
+PostHistoryTimeline AS (
+    -- CTE 4: Analyzes post history for key events and their timing.
+    -- Uses LAG() window function to calculate time differences between events.
+    SELECT
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate AS EventDate,
+        ph.UserId AS EventTriggeredByUserId,
+        LAG(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS PreviousEventDate,
+        COALESCE(EXTRACT(EPOCH FROM (ph.CreationDate - LAG(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate))) / 3600, 0) AS HoursSincePreviousEvent,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) OVER (PARTITION BY ph.PostId) AS WasClosedEver,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) OVER (PARTITION BY ph.PostId) AS WasReopenedEver
+    FROM PostHistory AS ph
+    WHERE ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 10, 11, 12, 13) -- Initial, Edits, Close, Reopen, Delete, Undelete
+),
+TagPerformanceSummary AS (
+    -- CTE 5: Aggregates performance metrics per tag.
+    -- Combines information from PostTagSplitter and PostEngagementMetrics.
+    SELECT
+        pts.TagName,
+        COUNT(DISTINCT pts.PostId) AS TagQuestionCount,
+        AVG(pem.PostScore) AS AvgTagScore,
+        AVG(pem.PostViewCount) AS AvgTagViewCount,
+        SUM(pem.HotnessScore) AS TotalTagHotness,
+        CAST(SUM(CASE WHEN pem.HasAcceptedAnswer THEN 1 ELSE 0 END) AS NUMERIC) / NULLIF(COUNT(DISTINCT pts.PostId), 0) AS TagAcceptanceRate,
+        RANK() OVER (ORDER BY COUNT(DISTINCT pts.PostId) DESC, AVG(pem.HotnessScore) DESC) AS TagPopularityRank
+    FROM PostTagSplitter AS pts
+    INNER JOIN PostEngagementMetrics AS pem ON pts.PostId = pem.PostId
+    GROUP BY pts.TagName
+)
+-- Main Query: Joins various CTEs and original tables to analyze high-impact users
+-- and their associated posts and tags, incorporating complex logic, NULL handling,
+-- string manipulation, and diverse analytical constructs.
+SELECT
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.QuestionCount,
+    uas.AnswerCount,
+    uas.TotalPostScore,
+    uas.GoldBadges,
+    uas.SilverBadges,
+    uas.BronzeBadges,
+    COALESCE(uas.TotalProfileViews, 0) AS ProfileViews,
+    COALESCE(CAST(uas.TotalPostScore AS NUMERIC) / NULLIF(uas.Reputation, 0), 0.0) AS ScoreToReputationRatio,
+    COALESCE(CAST(uas.QuestionCount AS NUMERIC) / NULLIF(uas.DaysSinceCreation, 0), 0.0) AS QuestionsPerDay,
+    COALESCE(CAST(uas.AnswerCount AS NUMERIC) / NULLIF(uas.DaysSinceCreation, 0), 0.0) AS AnswersPerDay,
+    COALESCE(CAST(uas.TotalUpVotesGiven AS NUMERIC) / NULLIF(uas.TotalDownVotesGiven, 0), 0.0) AS UpDownVoteRatioGiven,
+    pem_top.PostId AS TopPostId,
+    pem_top.PostScore AS TopPostScore,
+    pem_top.PostViewCount AS TopPostViewCount,
+    pem_top.PostCommentCount AS TopPostCommentCount,
+    pem_top.HotnessScore AS TopPostHotnessScore,
+    COALESCE(pht_top.HoursSincePreviousEvent, 0.0) AS TopPostHoursSinceLastSignificantEvent,
+    COALESCE(pht_top.WasClosedEver, 0) AS TopPostWasClosed,
+    pem_top.UniqueEditorsCount AS TopPostDistinctEditors,
+    tps.TagName AS MostPopularTag,
+    tps.TagQuestionCount,
+    tps.AvgTagScore,
+    tps.TagAcceptanceRate,
+    (
+        SELECT COUNT(DISTINCT sub_p.OwnerUserId)
+        FROM Posts AS sub_p
+        WHERE sub_p.ParentId = pem_top.PostId AND sub_p.PostTypeId = 2
+    ) AS UniqueAnswerersForTopPost, -- Another correlated subquery
+    EXISTS (
+        SELECT 1 FROM Badges b_sub WHERE b_sub.UserId = uas.UserId AND b_sub.Name ILIKE '%suffragist%' AND b_sub.Class = 2
+    ) AS HasSilverSuffragistBadge, -- Correlated EXISTS subquery for a specific badge
+    CASE
+        WHEN uas.Reputation > 10000 AND uas.GoldBadges > 2 THEN 'Elite Contributor'
+        WHEN uas.Reputation > 2000 AND (uas.SilverBadges > 1 OR uas.GoldBadges > 0) THEN 'Highly Influential'
+        WHEN uas.Reputation > 500 AND (uas.QuestionCount > 10 OR uas.AnswerCount > 20) THEN 'Active Participant'
+        ELSE 'Emerging User'
+    END AS UserEngagementTier,
+    LOWER(TRIM(u.Location)) AS UserLocationLower,
+    SUBSTRING(LOWER(u.AboutMe), 1, 100) AS AboutMeExcerpt, -- String manipulation
+    REPLACE(REPLACE(LOWER(u.DisplayName), ' ', '_'), '.', '') AS CleanedDisplayName -- More string manipulation
+FROM UserActivitySummary AS uas
+INNER JOIN Users AS u ON uas.UserId = u.Id -- Inner join to ensure user exists
+LEFT JOIN (
+    -- Subquery to find the single top-performing post (by HotnessScore) for each user.
+    -- Uses ROW_NUMBER() for ranking.
+    SELECT
+        pem_inner.*,
+        ROW_NUMBER() OVER (PARTITION BY pem_inner.OwnerUserId ORDER BY pem_inner.HotnessScore DESC, pem_inner.PostCreationDate DESC) AS rn
+    FROM PostEngagementMetrics AS pem_inner
+    WHERE pem_inner.PostTypeId IN (1, 2)
+) AS pem_top ON uas.UserId = pem_top.OwnerUserId AND pem_top.rn = 1
+LEFT JOIN PostHistoryTimeline AS pht_top ON pem_top.PostId = pht_top.PostId
+    AND pht_top.PostHistoryTypeId IN (4, 5, 6, 10, 11) -- Focus on specific significant history events
+LEFT JOIN (
+    -- Subquery to find the most popular tag associated with the user's questions.
+    -- Joins back to PostTagSplitter to link tags to owner, then aggregates.
+    SELECT
+        OwnerUserId,
+        MAX(TagName) KEEP (DENSE_RANK FIRST ORDER BY TotalTagHotness DESC, TagQuestionCount DESC) AS MostPopularTagAssociated,
+        MAX(TagQuestionCount) KEEP (DENSE_RANK FIRST ORDER BY TotalTagHotness DESC, TagQuestionCount DESC) AS MostPopularTagQuestionCount,
+        MAX(AvgTagScore) KEEP (DENSE_RANK FIRST ORDER BY TotalTagHotness DESC, TagQuestionCount DESC) AS MostPopularTagAvgScore,
+        MAX(TagAcceptanceRate) KEEP (DENSE_RANK FIRST ORDER BY TotalTagHotness DESC, TagQuestionCount DESC) AS MostPopularTagAcceptanceRate
+    FROM PostTagSplitter AS pts_sub
+    INNER JOIN TagPerformanceSummary AS tps_sub ON pts_sub.TagName = tps_sub.TagName
+    GROUP BY OwnerUserId
+) AS tps ON uas.UserId = tps.OwnerUserId
+WHERE
+    uas.Reputation >= 1000 -- Filter for users with substantial reputation
+    AND uas.DaysSinceCreation >= 90 -- User account must be at least 3 months old
+    AND (uas.QuestionCount + uas.AnswerCount) >= 10 -- User must have at least 10 posts
+    AND pem_top.PostId IS NOT NULL -- Ensures that the user has at least one post with engagement metrics
+    AND (LOWER(u.Location) IS NOT NULL AND LOWER(u.Location) NOT LIKE '%unknown%' AND LOWER(u.Location) NOT LIKE '%earth%') -- Complex NULL and string predicate
+    AND u.AboutMe IS NOT NULL AND LENGTH(u.AboutMe) > 50 -- Users with meaningful "About Me" sections
+    AND COALESCE(pem_top.HotnessScore, 0) > 20 -- Top post must have a decent hotness score
+    AND (pht_top.WasClosedEver = 0 OR pht_top.WasReopenedEver = 1) -- Only consider posts that were never closed or were re-opened
+    -- Further complex boolean logic with date comparisons
+    AND (EXTRACT(MONTH FROM uas.LastAccessDate) != EXTRACT(MONTH FROM CURRENT_DATE) OR uas.TotalProfileViews > 1000)
+    AND uas.RepRankInCreationYear <= 50 -- Only top 50 in their creation year
+ORDER BY
+    uas.Reputation DESC,
+    pem_top.HotnessScore DESC,
+    uas.DaysSinceCreation DESC
+LIMIT 1000;

@@ -1,0 +1,191 @@
+WITH UserEngagementSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.Views AS UserProfileViews,
+        u.UpVotes AS UserUpVotesGiven,
+        u.DownVotes AS UserDownVotesGiven,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestions,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswers,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END) AS TotalQuestionViews,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        MAX(b.Date) AS LatestBadgeDate,
+        EXISTS (
+            SELECT 1
+            FROM Badges gold_b
+            WHERE gold_b.UserId = u.Id AND gold_b.Class = 1
+        ) AS HasGoldBadge,
+        AVG(LENGTH(c.Text)) AS AvgCommentLength,
+        (u.Reputation * 0.5) + (COUNT(DISTINCT p.Id) * 0.2) + (COUNT(DISTINCT c.Id) * 0.1) + (COALESCE(SUM(p.Score), 0) * 0.2) AS UserEngagementScore
+    FROM
+        Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes
+),
+PostHistoricalMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.AcceptedAnswerId,
+        p.ClosedDate,
+        EXTRACT(EPOCH FROM (MAX(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN ph.CreationDate END) - MIN(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN ph.CreationDate END))) / 3600 AS HoursBetweenFirstAndLastEdit,
+        COUNT(DISTINCT ph.UserId) AS DistinctEditorCount,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS WasReopened,
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (17, 35, 36) THEN 1 ELSE 0 END) AS WasMigrated,
+        AVG(LENGTH(pc.Text)) AS AvgPostCommentLength,
+        CASE
+            WHEN p.PostTypeId = 1 AND p.ViewCount > 5000 AND p.Score > 50 THEN 'Hot'
+            WHEN p.PostTypeId = 1 AND p.ViewCount > 1000 AND p.Score > 10 THEN 'Warm'
+            ELSE 'Normal'
+        END AS PostPopularityCategory
+    FROM
+        Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    LEFT JOIN Comments pc ON p.Id = pc.PostId
+    GROUP BY
+        p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.LastEditDate, p.LastActivityDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.AcceptedAnswerId, p.ClosedDate
+),
+QuestionTagAnalysis AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.OwnerUserId,
+        p.CreationDate,
+        unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS TagName
+    FROM
+        Posts p
+    WHERE
+        p.PostTypeId = 1 AND p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2
+),
+TagPerformance AS (
+    SELECT
+        qta.TagName,
+        COUNT(DISTINCT qta.QuestionId) AS TotalQuestionsWithTag,
+        AVG(pm.PostScore) AS AvgScoreForTag,
+        SUM(pm.ViewCount) AS TotalViewsForTag,
+        AVG(pm.AnswerCount) AS AvgAnswersForTag,
+        RANK() OVER (ORDER BY AVG(pm.PostScore) DESC NULLS LAST) AS TagScoreRank
+    FROM
+        QuestionTagAnalysis qta
+    JOIN PostHistoricalMetrics pm ON qta.QuestionId = pm.PostId
+    GROUP BY
+        qta.TagName
+),
+UserPostInteraction AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Score AS PostScore,
+        p.CreationDate AS PostCreationDate,
+        p.LastActivityDate,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId, DATE_TRUNC('month', p.CreationDate)) AS AvgMonthlyUserPostScore,
+        p.Score - LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS ScoreChangeFromPreviousPost,
+        EXISTS (
+            SELECT 1
+            FROM PostLinks pl_inner
+            WHERE pl_inner.PostId = p.Id AND pl_inner.LinkTypeId = 3
+        ) AS HasDuplicateLink,
+        CASE WHEN p.PostTypeId = 1 THEN (
+            SELECT AVG(ans.Score)
+            FROM Posts ans
+            WHERE ans.ParentId = p.Id AND ans.PostTypeId = 2
+        ) ELSE NULL END AS AvgAnswerScoreForQuestion,
+        p.LastActivityDate AS LastActivityDate_for_grouping
+    FROM
+        Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+)
+SELECT
+    ues.UserId,
+    ues.DisplayName,
+    ues.Reputation,
+    ues.UserCreationDate,
+    ues.LastAccessDate,
+    ues.TotalPosts,
+    ues.TotalQuestions,
+    ues.TotalAnswers,
+    ues.TotalPostScore,
+    ues.TotalBadges,
+    ues.HasGoldBadge,
+    ues.UserEngagementScore,
+    RANK() OVER (PARTITION BY EXTRACT(YEAR FROM ues.UserCreationDate) ORDER BY ues.UserEngagementScore DESC) AS UserEngagementRankByCreationYear,
+    AVG(ues.Reputation) OVER (PARTITION BY u.Location) AS AvgReputationInLocation,
+    CAST(ues.TotalAnswers AS NUMERIC) / NULLIF(ues.TotalPosts, 0) AS AnswerPostRatio,
+    CAST(SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END) AS NUMERIC) / NULLIF(COUNT(CASE WHEN p.PostTypeId = 1 THEN p.Id END), 0) AS AvgQuestionViewsByUser,
+    SUBSTRING(u.WebsiteUrl FROM '://([^/]+)') AS WebsiteDomain,
+    COALESCE(u.Location, 'Unknown Location') AS UserLocation,
+    COUNT(CASE WHEN pm.PostPopularityCategory = 'Hot' THEN 1 END) AS HotPostsCount,
+    COUNT(CASE WHEN pm.PostPopularityCategory = 'Warm' THEN 1 END) AS WarmPostsCount,
+    AVG(pm.DistinctEditorCount) AS AvgDistinctEditorCountAcrossPosts,
+    AVG(pm.HoursBetweenFirstAndLastEdit) AS AvgPostEditDurationHours,
+    MAX(upi.AvgMonthlyUserPostScore) AS MaxAvgMonthlyPostScore,
+    MAX(upi.ScoreChangeFromPreviousPost) AS MaxScoreChangeFromPrevPost,
+    BOOL_OR(upi.HasDuplicateLink) AS HasUserPostsWithDuplicates,
+    AVG(upi.AvgAnswerScoreForQuestion) AS AvgAnswerScoreForUserQuestions,
+    (SELECT AVG(Score) FROM Posts WHERE Score IS NOT NULL AND Score > 0) AS OverallAvgPositivePostScore,
+    (SELECT tp_inner.TagName
+     FROM QuestionTagAnalysis qta_inner
+     JOIN TagPerformance tp_inner ON qta_inner.TagName = tp_inner.TagName
+     WHERE qta_inner.OwnerUserId = u.Id
+     ORDER BY tp_inner.AvgScoreForTag DESC NULLS LAST
+     LIMIT 1) AS TopPerformingTag,
+    (SELECT tp_inner.AvgScoreForTag
+     FROM QuestionTagAnalysis qta_inner
+     JOIN TagPerformance tp_inner ON qta_inner.TagName = tp_inner.TagName
+     WHERE qta_inner.OwnerUserId = u.Id
+     ORDER BY tp_inner.AvgScoreForTag DESC NULLS LAST
+     LIMIT 1) AS TopPerformingTagAvgScore,
+    CASE
+        WHEN (LOWER(ues.DisplayName) LIKE '%dev%' OR LOWER(ues.DisplayName) LIKE '%prog%')
+             AND EXTRACT(YEAR FROM ues.UserCreationDate) >= 2010
+             AND ues.TotalPosts > 50
+        THEN TRUE
+        ELSE FALSE
+    END AS IsHighEngagementExperiencedDeveloper,
+    CAST(SUM(CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS NUMERIC)
+    / NULLIF(SUM(CASE WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN p.AnswerCount ELSE 0 END), 0)
+    AS UserAcceptedAnswerRatio,
+    EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS timestamp) - MAX(upi.LastActivityDate))) AS DaysSinceLastUserPostActivity,
+    CASE WHEN u.AboutMe IS NOT NULL AND LENGTH(u.AboutMe) > 100 AND u.AboutMe ILIKE '%sql%'
+         THEN 'SQL Enthusiast with Detailed Profile'
+         WHEN u.AboutMe IS NOT NULL AND LENGTH(u.AboutMe) > 0
+         THEN 'User with Basic Profile'
+         ELSE 'No AboutMe Description'
+    END AS AboutMeStatus,
+    SUM(CASE WHEN ph_closed.PostHistoryTypeId = 10 AND ph_closed.Comment = '101' THEN 1 ELSE 0 END) AS TotalDuplicateClosuresOnOwnedPosts,
+    COUNT(DISTINCT pl_linked.PostId) AS TotalLinkedPostsByOthers,
+    COUNT(DISTINCT pl_duplicate.RelatedPostId) AS TotalOwnedPostsMarkedAsDuplicates
+FROM
+    Users u
+JOIN UserEngagementSummary ues ON u.Id = ues.UserId
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN PostHistoricalMetrics pm ON p.Id = pm.PostId
+LEFT JOIN UserPostInteraction upi ON u.Id = upi.UserId AND p.Id = upi.PostId
+LEFT JOIN PostHistory ph_closed ON p.Id = ph_closed.PostId AND ph_closed.PostHistoryTypeId = 10
+LEFT JOIN PostLinks pl_linked ON p.Id = pl_linked.RelatedPostId AND pl_linked.LinkTypeId = 1
+LEFT JOIN PostLinks pl_duplicate ON p.Id = pl_duplicate.PostId AND pl_duplicate.LinkTypeId = 3
+GROUP BY
+    ues.UserId, ues.DisplayName, ues.Reputation, ues.UserCreationDate, ues.LastAccessDate, ues.TotalPosts, ues.TotalQuestions,
+    ues.TotalAnswers, ues.TotalPostScore, ues.TotalBadges, ues.HasGoldBadge, ues.UserEngagementScore, u.Location, u.WebsiteUrl,
+    u.AboutMe, u.Id
+ORDER BY
+    ues.UserEngagementScore DESC, ues.Reputation DESC
+LIMIT 100;

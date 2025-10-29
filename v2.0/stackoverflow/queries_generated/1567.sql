@@ -1,0 +1,229 @@
+-- {"query": "1567.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3538} 
+
+WITH UserSummary AS (
+    -- CTE 1: Aggregates user-specific data including post counts, comment counts, vote counts, and badge breakdown.
+    -- Uses LEFT JOINs to ensure all users are included, even those without posts, comments, or badges.
+    -- Conditional aggregation (SUM(CASE WHEN ...)) is used to count specific post types or badge classes.
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.OwnerUserId = u.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN p.PostTypeId = 1 AND p.OwnerUserId = u.Id THEN 1 ELSE 0 END) AS TotalQuestionsOwned,
+        SUM(CASE WHEN p.PostTypeId = 2 AND p.OwnerUserId = u.Id THEN 1 ELSE 0 END) AS TotalAnswersOwned,
+        COUNT(DISTINCT c.Id) FILTER (WHERE c.UserId = u.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.UserId = u.Id AND v.VoteTypeId = 2) AS TotalUpVotesGiven,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.UserId = u.Id AND v.VoteTypeId = 3) AS TotalDownVotesGiven,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+PostMetricsAndHistory AS (
+    -- CTE 2: Gathers core post metrics (score, views, answers, comments, favorites) and extracts
+    -- specific history details like the latest editor's name and comment using a correlated subquery.
+    -- Calculates time differences for activity and closure.
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.CreationDate AS PostCreationDate,
+        p.LastActivityDate,
+        p.ClosedDate,
+        p.Score AS PostScore,
+        p.ViewCount AS PostViewCount,
+        p.AnswerCount,
+        p.CommentCount AS PostCommentCount,
+        p.FavoriteCount,
+        p.Title,
+        p.Tags,
+        LENGTH(p.Body) AS BodyLength,
+        DATEDIFF('hour', p.CreationDate, p.LastActivityDate) AS HoursUntilLastActivity,
+        DATEDIFF('day', p.CreationDate, p.ClosedDate) AS DaysUntilClosed,
+        -- Correlated Subquery 1: Retrieves the DisplayName of the latest editor from PostHistory
+        COALESCE(
+            (SELECT ph_inner.UserDisplayName
+             FROM PostHistory ph_inner
+             WHERE ph_inner.PostId = p.Id
+               AND ph_inner.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Body, Tags
+             ORDER BY ph_inner.CreationDate DESC
+             LIMIT 1),
+            p.LastEditorDisplayName, -- Fallback to Posts.LastEditorDisplayName
+            'Community' -- Default value if all are NULL
+        ) AS LastEditorDisplayNameFromHistory,
+        -- Correlated Subquery 2: Retrieves the comment of the latest edit
+        COALESCE(
+            (SELECT ph_inner.Comment
+             FROM PostHistory ph_inner
+             WHERE ph_inner.PostId = p.Id
+               AND ph_inner.PostHistoryTypeId IN (4, 5, 6)
+             ORDER BY ph_inner.CreationDate DESC
+             LIMIT 1),
+            'No explicit edit comment'
+        ) AS LatestEditComment,
+        COUNT(DISTINCT v.Id) AS TotalVotesReceived,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS UpVotesReceived,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS DownVotesReceived
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE p.PostTypeId = 1 -- Focus primarily on Questions
+    GROUP BY
+        p.Id, p.PostTypeId, p.OwnerUserId, p.AcceptedAnswerId, p.CreationDate, p.LastActivityDate,
+        p.ClosedDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount,
+        p.Title, p.Tags, p.Body, p.LastEditorDisplayName
+),
+TagAggregates AS (
+    -- CTE 3: Calculates aggregate statistics for each unique tag found in questions.
+    -- Uses string manipulation (SUBSTRING, string_to_array, UNNEST) to parse tags.
+    SELECT
+        LOWER(TRIM(SUBSTRING(UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><')), 1, 35))) AS TagName,
+        AVG(pmh.PostScore) AS AvgScoreForTag,
+        AVG(pmh.PostViewCount) AS AvgViewsForTag,
+        COUNT(DISTINCT pmh.PostId) AS QuestionsWithTag
+    FROM Posts p
+    JOIN PostMetricsAndHistory pmh ON p.Id = pmh.PostId -- Join to get scores/views for tags
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2
+    GROUP BY TagName
+),
+RelatedPosts AS (
+    -- CTE 4: Identifies linked and duplicate posts using PostLinks, aggregating related PostIds into strings.
+    SELECT
+        pl.PostId,
+        STRING_AGG(CASE WHEN pl.LinkTypeId = 1 THEN CAST(pl.RelatedPostId AS VARCHAR) ELSE NULL END, ', ' ORDER BY pl.RelatedPostId) AS LinkedPostIds,
+        STRING_AGG(CASE WHEN pl.LinkTypeId = 3 THEN CAST(pl.RelatedPostId AS VARCHAR) ELSE NULL END, ', ' ORDER BY pl.RelatedPostId) AS DuplicateOfPostIds,
+        SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicateLinkCount
+    FROM PostLinks pl
+    GROUP BY pl.PostId
+)
+-- Main Query: Joins all CTEs and adds further complex calculations, window functions, and filtering.
+SELECT
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.TotalQuestionsOwned,
+    us.TotalAnswersOwned,
+    us.TotalCommentsMade,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    pmh.PostId AS QuestionId,
+    pmh.Title,
+    pmh.Tags,
+    pmh.PostScore AS QuestionScore,
+    pmh.PostViewCount AS QuestionViews,
+    pmh.AnswerCount AS QuestionAnswers,
+    pmh.PostCommentCount AS QuestionComments,
+    pmh.FavoriteCount AS QuestionFavorites,
+    pmh.PostCreationDate,
+    pmh.LastActivityDate,
+    pmh.ClosedDate,
+    pmh.BodyLength AS QuestionBodyLength,
+    pmh.HoursUntilLastActivity,
+    pmh.DaysUntilClosed,
+    pmh.LastEditorDisplayNameFromHistory,
+    pmh.LatestEditComment,
+    rp.LinkedPostIds,
+    rp.DuplicateOfPostIds,
+    rp.DuplicateLinkCount,
+    -- Correlated Subquery 3: Fetches the DisplayName of the owner of the accepted answer
+    (
+        SELECT ans_u.DisplayName
+        FROM Posts pa
+        JOIN Users ans_u ON pa.OwnerUserId = ans_u.Id
+        WHERE pa.Id = pmh.AcceptedAnswerId
+        LIMIT 1
+    ) AS AcceptedAnswerOwnerDisplayName,
+    -- Window Function 1: Ranks questions by their score and view count within their creation month and year.
+    RANK() OVER (
+        PARTITION BY EXTRACT(YEAR FROM pmh.PostCreationDate), EXTRACT(MONTH FROM pmh.PostCreationDate)
+        ORDER BY pmh.PostScore DESC, pmh.PostViewCount DESC
+    ) AS QuestionScoreRankMonthly,
+    -- Window Function 2: Calculates the average score of all other questions by the same user.
+    AVG(CASE WHEN p_other.PostTypeId = 1 AND p_other.Id != pmh.PostId THEN p_other.Score ELSE NULL END)
+        OVER (PARTITION BY pmh.OwnerUserId) AS AvgOtherQuestionScoreByUser,
+    -- Complex Predicate / CASE Statement for categorizing questions based on multiple metrics.
+    CASE
+        WHEN pmh.ClosedDate IS NOT NULL AND pmh.DaysUntilClosed <= 7 THEN 'Quickly Closed'
+        WHEN pmh.PostScore >= 10 AND pmh.AnswerCount >= 3 THEN 'High Engagement'
+        WHEN pmh.PostViewCount > 5000 AND pmh.FavoriteCount >= 50 THEN 'Viral'
+        WHEN pmh.PostScore < 0 AND pmh.PostViewCount > 1000 THEN 'Controversial'
+        WHEN pmh.AcceptedAnswerId IS NULL AND pmh.PostScore > 5 AND pmh.AnswerCount = 0 THEN 'Unanswered Valuable'
+        ELSE 'Standard'
+    END AS QuestionCategory,
+    -- String Expression: Cleans up the tags string by removing angle brackets and replacing the separator.
+    COALESCE(
+        REPLACE(REPLACE(pmh.Tags, '><', ', '), '<', ''),
+        'No Tags'
+    ) AS CleanTagsString,
+    -- Correlated Subquery 4: Calculates the average comment score for the current question.
+    (
+        SELECT AVG(c_q.Score)
+        FROM Comments c_q
+        WHERE c_q.PostId = pmh.PostId
+    ) AS AvgCommentScoreForQuestion,
+    -- NULL Logic: Boolean flag indicating whether the question has an accepted answer.
+    pmh.AcceptedAnswerId IS NOT NULL AS HasAcceptedAnswer,
+    -- Correlated Subquery 5: Checks if the question has the 'sql' tag.
+    (SELECT EXISTS (SELECT 1 FROM TagAggregates ta_sub WHERE pmh.Tags LIKE '%' || '<' || ta_sub.TagName || '>' || '%' AND ta_sub.TagName = 'sql')) AS HasSqlTag,
+    ta_joined.AvgScoreForQuestionTags AS OverallAvgScoreForQuestionTags,
+    ta_joined.AvgViewsForQuestionTags AS OverallAvgViewsForQuestionTags,
+    -- Window Function 3: Finds the maximum reputation among users who commented on the current post.
+    MAX(u_commenter.Reputation) OVER (PARTITION BY pmh.PostId) AS MaxCommenterReputation,
+    -- Correlated Subquery 6: Checks if the post was closed recently (within 30 days of creation).
+    (SELECT EXISTS (SELECT 1 FROM PostHistory ph_check WHERE ph_check.PostId = pmh.PostId AND ph_check.PostHistoryTypeId = 10 AND ph_check.CreationDate >= pmh.PostCreationDate - INTERVAL '30 days')) AS WasClosedRecently
+FROM UserSummary us
+JOIN PostMetricsAndHistory pmh ON us.UserId = pmh.OwnerUserId
+LEFT JOIN RelatedPosts rp ON pmh.PostId = rp.PostId
+LEFT JOIN Posts p_other ON pmh.OwnerUserId = p_other.OwnerUserId -- For AvgOtherQuestionScoreByUser window function
+LEFT JOIN Comments c_main ON pmh.PostId = c_main.PostId -- Joined for MaxCommenterReputation window function
+LEFT JOIN Users u_commenter ON c_main.UserId = u_commenter.Id -- Joined for MaxCommenterReputation window function
+LEFT JOIN (
+    -- Subquery for complex tag aggregate joining: Averages the aggregate scores/views for all tags associated with a specific question.
+    SELECT
+        pmh_sub.PostId,
+        AVG(ta_sub.AvgScoreForTag) AS AvgScoreForQuestionTags,
+        AVG(ta_sub.AvgViewsForTag) AS AvgViewsForQuestionTags
+    FROM PostMetricsAndHistory pmh_sub
+    JOIN (
+        SELECT PostId, LOWER(TRIM(SUBSTRING(UNNEST(string_to_array(SUBSTRING(Tags, 2, LENGTH(Tags)-2), '><')), 1, 35))) AS TagName
+        FROM Posts WHERE PostTypeId = 1 AND Tags IS NOT NULL AND LENGTH(Tags) > 2
+    ) AS PostTags ON pmh_sub.PostId = PostTags.PostId
+    JOIN TagAggregates ta_sub ON PostTags.TagName = ta_sub.TagName
+    GROUP BY pmh_sub.PostId
+) ta_joined ON pmh.PostId = ta_joined.PostId
+WHERE
+    us.Reputation >= 5000 -- Filter for highly reputable users
+    AND pmh.PostCreationDate >= '2023-01-01' -- Focus on recent questions
+    AND pmh.BodyLength > 100 -- Minimum body length for detailed questions
+    AND (pmh.PostViewCount > 1000 OR pmh.PostScore > 5) -- Only moderately engaged or high-score questions
+    AND pmh.AnswerCount >= 1 -- Questions with at least one answer
+    AND (LOWER(pmh.Title) LIKE '%performance%' OR LOWER(pmh.Title) LIKE '%optimization%') -- Specific keywords in title
+    AND pmh.PostId NOT IN (
+        -- Subquery for filtering: Excludes questions that have been deleted recently.
+        SELECT ph.PostId
+        FROM PostHistory ph
+        WHERE ph.PostHistoryTypeId = 12 -- Post Deleted
+          AND ph.CreationDate > '2023-01-01' -- Deleted recently
+    )
+GROUP BY
+    us.UserId, us.DisplayName, us.Reputation, us.TotalQuestionsOwned, us.TotalAnswersOwned,
+    us.TotalCommentsMade, us.GoldBadges, us.SilverBadges, us.BronzeBadges,
+    pmh.PostId, pmh.Title, pmh.Tags, pmh.PostScore, pmh.PostViewCount, pmh.AnswerCount,
+    pmh.PostCommentCount, pmh.FavoriteCount, pmh.PostCreationDate, pmh.LastActivityDate,
+    pmh.ClosedDate, pmh.BodyLength, pmh.HoursUntilLastActivity, pmh.DaysUntilClosed,
+    pmh.LastEditorDisplayNameFromHistory, pmh.LatestEditComment, pmh.AcceptedAnswerId, pmh.OwnerUserId,
+    rp.LinkedPostIds, rp.DuplicateOfPostIds, rp.DuplicateLinkCount,
+    ta_joined.AvgScoreForQuestionTags, ta_joined.AvgViewsForQuestionTags
+ORDER BY
+    us.Reputation DESC,
+    pmh.PostScore DESC,
+    QuestionScoreRankMonthly ASC
+LIMIT 1000;

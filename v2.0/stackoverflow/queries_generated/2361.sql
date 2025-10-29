@@ -1,0 +1,132 @@
+-- {"query": "2361.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1418} 
+with recursive RecentActiveUsers as (
+    select u.Id, u.DisplayName, u.Reputation,
+      dense_rank() over (order by u.Reputation desc, u.CreationDate) as RepRank
+    from Users u
+    where u.LastAccessDate > now() - interval '90 days'
+),
+UserBadgeStats as (
+    select b.UserId,
+      count(*) as TotalBadges,
+      count(case when b.Class = 1 then 1 end) as GoldBadges,
+      count(case when b.Class = 2 then 1 end) as SilverBadges,
+      count(case when b.Class = 3 then 1 end) as BronzeBadges,
+      max(b.Date) as LatestBadgeDate
+    from Badges b
+    group by b.UserId
+),
+TopQuestions as (
+    select p.Id, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount,
+      coalesce(p.Title, '') as Title,
+      coalesce(p.Tags, '') as Tags,
+      (select count(*) from Comments c where c.PostId = p.Id) as CommentCount,
+      row_number() over (partition by p.OwnerUserId order by p.Score desc, p.CreationDate desc) as rn
+    from Posts p
+    where p.PostTypeId = 1 -- questions only
+      and p.CreationDate > now() - interval '1 year'
+),
+TopAnswersWithParent as (
+    select a.Id, a.ParentId, a.OwnerUserId, a.CreationDate, a.Score,
+        q.Score as QuestionScore,
+        q.OwnerUserId as QuestionOwnerUserId,
+        q.Title as QuestionTitle
+    from Posts a
+    left join Posts q on a.ParentId = q.Id
+    where a.PostTypeId = 2 -- answers only
+      and a.CreationDate > now() - interval '1 year'
+),
+UserActivitySummary as (
+    select u.Id as UserId,
+      count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsCount,
+      count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersCount,
+      count(distinct c.Id) as CommentsCount,
+      coalesce(sum(vtUp.VotesCount),0) as TotalUpVotes,
+      coalesce(sum(vtDown.VotesCount),0) as TotalDownVotes
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join (
+        select v.PostId, count(*) as VotesCount
+        from Votes v
+        where v.VoteTypeId = 2 -- UpMod
+        group by v.PostId
+    ) vtUp on vtUp.PostId = p.Id
+    left join (
+        select v.PostId, count(*) as VotesCount
+        from Votes v
+        where v.VoteTypeId = 3 -- DownMod
+        group by v.PostId
+    ) vtDown on vtDown.PostId = p.Id
+    group by u.Id
+),
+PostCloseStats as (
+    select ph.PostId,
+      count(case when ph.PostHistoryTypeId = 10 then 1 end) as CloseVotes,
+      count(case when ph.PostHistoryTypeId = 11 then 1 end) as ReopenVotes,
+      max(case when ph.PostHistoryTypeId = 10 then ph.CreationDate end) as LastCloseDate
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (10,11)
+    group by ph.PostId
+),
+QuestionLinkSummary as (
+    select pl.PostId, pl.RelatedPostId, lt.Name as LinkTypeName,
+      count(*) over (partition by pl.PostId) as TotalLinksFromPost
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+),
+UserRecentActivity as (
+    select ph.UserId,
+      max(ph.CreationDate) filter (where ph.PostHistoryTypeId = 1) as LastTitleChange,
+      max(ph.CreationDate) filter (where ph.PostHistoryTypeId = 5) as LastBodyEdit,
+      max(ph.CreationDate) filter (where ph.PostHistoryTypeId = 6) as LastTagEdit
+    from PostHistory ph
+    group by ph.UserId
+)
+select
+  rau.Id as UserId,
+  rau.DisplayName,
+  rau.Reputation,
+  ubs.TotalBadges,
+  ubs.GoldBadges,
+  ubs.SilverBadges,
+  ubs.BronzeBadges,
+  uas.QuestionsCount,
+  uas.AnswersCount,
+  uas.CommentsCount,
+  uas.TotalUpVotes,
+  uas.TotalDownVotes,
+  topq.Title as TopQuestionTitle,
+  topq.Score as TopQuestionScore,
+  topq.ViewCount as TopQuestionViews,
+  topq.CommentCount as TopQuestionComments,
+  ta.Score as TopAnswerScore,
+  ta.QuestionTitle as TopAnswerQuestionTitle,
+  pc.CloseVotes,
+  pc.ReopenVotes,
+  pc.LastCloseDate,
+  qls.LinkTypeName as RecentQuestionLinkType,
+  qls.TotalLinksFromPost as QuestionTotalLinks,
+  ura.LastTitleChange,
+  ura.LastBodyEdit,
+  ura.LastTagEdit,
+  -- complex string processing example
+  concat_ws(' | ',
+    left(rau.DisplayName, 10),
+    coalesce(nullif(rau.Location, ''), 'Unknown'),
+    'RepRank: ' || cast(rau.RepRank as varchar),
+    'Badges(G/S/B): ' || cast(ubs.GoldBadges as varchar) || '/' || cast(ubs.SilverBadges as varchar) || '/' || cast(ubs.BronzeBadges as varchar)) as SummaryInfo
+from RecentActiveUsers rau
+left join UserBadgeStats ubs on ubs.UserId = rau.Id
+left join UserActivitySummary uas on uas.UserId = rau.Id
+left join TopQuestions topq on topq.OwnerUserId = rau.Id and topq.rn = 1
+left join (
+    select distinct on (OwnerUserId) Id, OwnerUserId, Score, ParentId, QuestionTitle
+    from TopAnswersWithParent
+    order by OwnerUserId, Score desc, CreationDate desc
+) ta on ta.OwnerUserId = rau.Id
+left join PostCloseStats pc on pc.PostId = coalesce(topq.Id, ta.ParentId)
+left join QuestionLinkSummary qls on qls.PostId = coalesce(topq.Id, ta.ParentId)
+left join UserRecentActivity ura on ura.UserId = rau.Id
+where rau.RepRank <= 100
+order by rau.RepRank
+limit 50;

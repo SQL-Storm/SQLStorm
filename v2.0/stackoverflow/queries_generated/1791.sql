@@ -1,0 +1,169 @@
+-- {"query": "1791.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2568} 
+
+WITH UserEngagementMetrics AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.Views AS UserViews,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(P.Score) AS TotalPostScore,
+        AVG(P.Score * 1.0) FILTER (WHERE P.PostTypeId IN (1, 2)) AS AverageValidPostScore,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        EXTRACT(DAY FROM (NOW() - MAX(P.LastActivityDate))) AS DaysSinceLastPostActivity,
+        EXTRACT(DAY FROM (NOW() - MAX(C.CreationDate))) AS DaysSinceLastCommentActivity
+    FROM
+        Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.Views
+),
+UserPostQualitySummary AS (
+    SELECT
+        PQ.OwnerUserId AS UserId,
+        COUNT(DISTINCT PQ.PostId) FILTER (WHERE PQ.PostTypeId = 1 AND PQ.IsDuplicateQuestion) AS DuplicateQuestionCount,
+        SUM(PQ.UniqueTagCount) AS TotalUniqueTagsAcrossQuestions,
+        AVG(PQ.PostScore) FILTER (WHERE PQ.PostTypeId = 1) AS AvgQuestionScore,
+        AVG(PQ.ViewCount) FILTER (WHERE PQ.PostTypeId = 1) AS AvgQuestionViews,
+        SUM(PQ.EditCount) AS TotalEditsMadeByOwner,
+        SUM(
+            CASE
+                WHEN PQ.PostTypeId = 1 THEN PQ.PostScore * EXP(-EXTRACT(EPOCH FROM (NOW() - PQ.PostCreationDate)) / (365.25 * 24 * 60 * 60 * 0.75))
+                WHEN PQ.PostTypeId = 2 THEN PQ.PostScore * EXP(-EXTRACT(EPOCH FROM (NOW() - PQ.PostCreationDate)) / (365.25 * 24 * 60 * 60 * 1.0))
+                ELSE 0
+            END
+        ) AS TimeDecayedWeightedScoreSum,
+        COUNT(DISTINCT PL.RelatedPostId) FILTER (WHERE PL.LinkTypeId = 1) AS LinkedPostsCount
+    FROM (
+        SELECT
+            P.Id AS PostId,
+            P.PostTypeId,
+            P.OwnerUserId,
+            P.CreationDate AS PostCreationDate,
+            P.ViewCount,
+            P.Score AS PostScore,
+            (SELECT COUNT(PH_Inner.Id) FROM PostHistory PH_Inner WHERE PH_Inner.PostId = P.Id AND PH_Inner.PostHistoryTypeId IN (4, 5, 6)) AS EditCount,
+            (SELECT COUNT(DISTINCT TRIM(unnest(string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><'))))
+             WHERE P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2 AND P.PostTypeId = 1
+            ) AS UniqueTagCount,
+            EXISTS (
+                SELECT 1 FROM PostHistory PH
+                WHERE PH.PostId = P.Id
+                AND PH.PostHistoryTypeId = 10
+                AND PH.Comment ~ '^(101|1)$'
+            ) OR EXISTS (
+                SELECT 1 FROM PostLinks PL_Inner
+                WHERE PL_Inner.PostId = P.Id AND PL_Inner.LinkTypeId = 3
+            ) AS IsDuplicateQuestion
+        FROM Posts P
+        WHERE P.OwnerUserId IS NOT NULL
+    ) AS PQ
+    LEFT JOIN PostLinks PL ON PQ.PostId = PL.PostId
+    GROUP BY PQ.OwnerUserId
+),
+UserBadgeSummary AS (
+    SELECT
+        B.UserId,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(B.Id) AS TotalBadges
+    FROM
+        Badges B
+    GROUP BY
+        B.UserId
+),
+TopTagsByUsers AS (
+    SELECT
+        U.Id AS UserId,
+        T.TagName,
+        ROW_NUMBER() OVER (PARTITION BY U.Id ORDER BY COUNT(P.Id) DESC, T.TagName) as TagRank
+    FROM Users U
+    JOIN Posts P ON U.Id = P.OwnerUserId
+    JOIN LATERAL unnest(string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags)-2), '><')) AS PostTag(TagName) ON TRUE
+    JOIN Tags T ON PostTag.TagName = T.TagName
+    WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2
+    GROUP BY U.Id, T.TagName
+)
+SELECT
+    U.Id AS UserId,
+    U.DisplayName,
+    U.Reputation,
+    U.CreationDate AS UserCreationDate,
+    COALESCE(UEM.TotalPosts, 0) AS TotalPostsByOwner,
+    COALESCE(UEM.TotalQuestions, 0) AS TotalQuestionsByOwner,
+    COALESCE(UEM.TotalAnswers, 0) AS TotalAnswersByOwner,
+    COALESCE(UEM.AverageValidPostScore, 0.0) AS OverallAvgPostScore,
+    COALESCE(UPS.AvgQuestionScore, 0.0) AS AvgQuestionScore,
+    COALESCE(UBS.GoldBadges, 0) AS GoldBadges,
+    COALESCE(UBS.SilverBadges, 0) AS SilverBadges,
+    COALESCE(UBS.BronzeBadges, 0) AS BronzeBadges,
+    COALESCE(UPS.DuplicateQuestionCount, 0) AS DuplicateQuestionCount,
+    COALESCE(UPS.TotalUniqueTagsAcrossQuestions, 0) AS TotalUniqueTagsForQuestions,
+    COALESCE(UPS.TotalEditsMadeByOwner, 0) AS TotalEditsMade,
+    COALESCE(UPS.LinkedPostsCount, 0) AS LinkedPostsFromUsersPosts,
+    CASE
+        WHEN COALESCE(UEM.DaysSinceLastPostActivity, 9999) <= 7 AND COALESCE(UEM.DaysSinceLastCommentActivity, 9999) <= 7 THEN 'Highly Active'
+        WHEN COALESCE(UEM.DaysSinceLastPostActivity, 9999) <= 30 OR COALESCE(UEM.DaysSinceLastCommentActivity, 9999) <= 30 THEN 'Moderately Active'
+        WHEN COALESCE(UEM.DaysSinceLastPostActivity, 9999) <= 90 OR COALESCE(UEM.DaysSinceLastCommentActivity, 9999) <= 90 THEN 'Slightly Active'
+        ELSE 'Inactive'
+    END AS ActivityStatus,
+    (
+        U.Reputation * 0.01 +
+        COALESCE(UEM.AverageValidPostScore, 0) * 0.5 +
+        COALESCE(UPS.AvgQuestionScore, 0) * 0.7 +
+        COALESCE(UBS.GoldBadges, 0) * 10 +
+        COALESCE(UBS.SilverBadges, 0) * 5 +
+        COALESCE(UBS.BronzeBadges, 0) * 1 +
+        COALESCE(UPS.TotalUniqueTagsAcrossQuestions, 0) * 0.1 +
+        COALESCE(UPS.TotalEditsMadeByOwner, 0) * 0.05 +
+        COALESCE(UPS.LinkedPostsCount, 0) * 0.2 +
+        COALESCE(UPS.TimeDecayedWeightedScoreSum, 0) * 0.005 -
+        COALESCE(UEM.DaysSinceLastPostActivity, 365) * 0.01 -
+        COALESCE(UEM.DaysSinceLastCommentActivity, 365) * 0.005 -
+        COALESCE(UPS.DuplicateQuestionCount, 0) * 20
+    ) AS CompositePerformanceScore,
+    UPPER(COALESCE(U.Location, 'Unknown')) AS UserLocationUpper,
+    LEFT(COALESCE(U.AboutMe, 'No description'), 50) AS AboutMeExcerpt,
+    RANK() OVER (ORDER BY (
+        U.Reputation * 0.01 +
+        COALESCE(UEM.AverageValidPostScore, 0) * 0.5 +
+        COALESCE(UPS.AvgQuestionScore, 0) * 0.7 +
+        COALESCE(UBS.GoldBadges, 0) * 10 +
+        COALESCE(UBS.SilverBadges, 0) * 5 +
+        COALESCE(UBS.BronzeBadges, 0) * 1 +
+        COALESCE(UPS.TotalUniqueTagsAcrossQuestions, 0) * 0.1 +
+        COALESCE(UPS.TotalEditsMadeByOwner, 0) * 0.05 +
+        COALESCE(UPS.LinkedPostsCount, 0) * 0.2 +
+        COALESCE(UPS.TimeDecayedWeightedScoreSum, 0) * 0.005 -
+        COALESCE(UEM.DaysSinceLastPostActivity, 365) * 0.01 -
+        COALESCE(UEM.DaysSinceLastCommentActivity, 365) * 0.005 -
+        COALESCE(UPS.DuplicateQuestionCount, 0) * 20
+    ) DESC) AS PerformanceRank,
+    EXISTS (
+        SELECT 1 FROM Comments C_Inner
+        WHERE C_Inner.UserId = U.Id
+        AND C_Inner.Score <= -5
+    ) AS HasLowScoringComments,
+    (SELECT TagName FROM TopTagsByUsers TTB WHERE TTB.UserId = U.Id AND TTB.TagRank = 1) AS MostFrequentTag
+FROM
+    Users U
+LEFT JOIN UserEngagementMetrics UEM ON U.Id = UEM.UserId
+LEFT JOIN UserPostQualitySummary UPS ON U.Id = UPS.UserId
+LEFT JOIN UserBadgeSummary UBS ON U.Id = UBS.UserId
+WHERE
+    U.Reputation > 100
+    AND U.DisplayName IS NOT NULL
+    AND NOT EXISTS (
+        SELECT 1
+        FROM Comments C_Bad
+        WHERE C_Bad.UserId = U.Id
+        AND C_Bad.Score <= -10
+    )
+    AND U.Views IS NOT NULL AND U.Views > 0
+ORDER BY
+    PerformanceRank
+LIMIT 100;

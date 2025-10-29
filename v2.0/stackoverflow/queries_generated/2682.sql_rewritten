@@ -1,0 +1,187 @@
+-- {"query": "2682.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1758} 
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        1 AS Level
+    FROM Tags t
+    WHERE t.IsRequired = 1
+
+    UNION ALL
+
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        r.Level + 1
+    FROM Tags t2
+    INNER JOIN PostLinks pl ON pl.PostId = t2.ExcerptPostId
+    INNER JOIN RecursiveTagHierarchy r ON pl.RelatedPostId = r.ExcerptPostId
+    WHERE t2.IsModeratorOnly = 0 AND r.Level < 3
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.Score) AS MaxPostScore,
+        AVG(p.ViewCount) FILTER (WHERE p.ViewCount IS NOT NULL) AS AvgPostViews,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVotesReceived
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Votes v ON v.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = u.Id)
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopUnderDiscussedQuestions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.Tags,
+        u.DisplayName AS OwnerName,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.ViewCount DESC, p.Score DESC NULLS LAST) AS rn
+    FROM Posts p
+    INNER JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1
+      AND p.AnswerCount < 3
+      AND p.ViewCount > 1000
+      AND p.FavoriteCount IS NOT NULL
+      AND (p.Tags IS NOT NULL AND p.Tags LIKE '%<sql>%') -- example tag filter
+),
+ClosedQuestionsWithDuplicateDetails AS (
+    SELECT
+        ph.PostId,
+        p.Title,
+        ph.CreationDate,
+        crt.Name AS CloseReason,
+        pl2.RelatedPostId AS DuplicateOfPostId,
+        p2.Title AS DuplicateOfTitle
+    FROM PostHistory ph
+    INNER JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS INT)
+    LEFT JOIN Posts p ON p.Id = ph.PostId
+    LEFT JOIN PostLinks pl2 ON pl2.PostId = ph.PostId AND pl2.LinkTypeId = 3
+    LEFT JOIN Posts p2 ON p2.Id = pl2.RelatedPostId
+    WHERE ph.PostHistoryTypeId = 10
+      AND ph.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year'
+),
+AnswerRanks AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.Score,
+        u.Id AS UserId,
+        u.DisplayName,
+        RANK() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank
+    FROM Posts a
+    INNER JOIN Users u ON u.Id = a.OwnerUserId
+    WHERE a.PostTypeId = 2
+),
+UserBadgeSummary AS (
+    SELECT
+        b.UserId,
+        COUNT(*) AS TotalBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+        STRING_AGG(DISTINCT b.Name, ', ') FILTER (WHERE b.Class = 1) AS GoldBadgeNames
+    FROM Badges b
+    GROUP BY b.UserId
+),
+RecentActivePostsWithEdits AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        ph_latest.CreationDate AS LastEditDate,
+        COALESCE(ph_latest.UserDisplayName, u.DisplayName) AS LastEditorName,
+        p.Tags,
+        REGEXP_REPLACE(p.Tags, '[<>]', '', 'g') AS CleanTags,
+        LENGTH(p.Body) AS BodyLength
+    FROM Posts p
+    LEFT JOIN (
+        SELECT DISTINCT ON (ph.PostId) ph.PostId, ph.CreationDate, ph.UserDisplayName
+        FROM PostHistory ph
+        WHERE ph.PostHistoryTypeId IN (4,5,6) -- edit title/body/tags
+        ORDER BY ph.PostId, ph.CreationDate DESC
+    ) ph_latest ON ph_latest.PostId = p.Id
+    LEFT JOIN Users u ON u.Id = p.LastEditorUserId
+    WHERE p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+),
+FinalResult AS (
+    SELECT
+        ua.UserId,
+        ua.DisplayName AS UserDisplayName,
+        ua.Reputation,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.CommentCount,
+        ua.BadgeCount,
+        ua.MaxPostScore,
+        COALESCE(ua.AvgPostViews, 0)::INT AS AveragePostViews,
+        ua.UpVotesReceived,
+        ubs.GoldBadges,
+        ubs.SilverBadges,
+        ubs.BronzeBadges,
+        COALESCE(ubs.GoldBadgeNames, '') AS GoldBadgeNames,
+        COALESCE(tuq.Title, 'N/A') AS TopQuestionTitle,
+        COALESCE(tuq.ViewCount, 0) AS TopQuestionViewCount,
+        COALESCE(cq.CloseReason, 'None') AS LastCloseReason,
+        COALESCE(cq.DuplicateOfTitle, 'N/A') AS DuplicateOriginalQuestionTitle,
+        COALESCE(ar.AnswerRank, 0) AS TopAnswerRank,
+        COALESCE(rap.LastEditDate, NULL) AS RecentPostLastEditDate,
+        COALESCE(rap.LastEditorName, 'Unknown') AS RecentPostLastEditor,
+        rap.BodyLength
+    FROM UserActivity ua
+    LEFT JOIN UserBadgeSummary ubs ON ubs.UserId = ua.UserId
+    LEFT JOIN TopUnderDiscussedQuestions tuq ON tuq.rn = 1 AND tuq.OwnerName = ua.DisplayName
+    LEFT JOIN ClosedQuestionsWithDuplicateDetails cq ON cq.PostId IN (
+        SELECT Id FROM Posts WHERE OwnerUserId = ua.UserId AND PostTypeId = 1
+    )
+    LEFT JOIN AnswerRanks ar ON ar.UserId = ua.UserId AND ar.AnswerRank = 1
+    LEFT JOIN RecentActivePostsWithEdits rap ON rap.OwnerUserId = ua.UserId
+)
+SELECT
+    fr.UserId,
+    fr.UserDisplayName,
+    fr.Reputation,
+    fr.QuestionCount,
+    fr.AnswerCount,
+    fr.CommentCount,
+    fr.BadgeCount,
+    fr.GoldBadges,
+    fr.SilverBadges,
+    fr.BronzeBadges,
+    fr.GoldBadgeNames,
+    fr.MaxPostScore,
+    fr.AveragePostViews,
+    fr.UpVotesReceived,
+    fr.TopQuestionTitle,
+    fr.TopQuestionViewCount,
+    fr.LastCloseReason,
+    fr.DuplicateOriginalQuestionTitle,
+    fr.TopAnswerRank,
+    fr.RecentPostLastEditDate,
+    fr.RecentPostLastEditor,
+    fr.BodyLength
+FROM FinalResult fr
+WHERE fr.Reputation > 1000
+  AND fr.AnswerCount > 10
+  AND fr.BadgeCount >= 5
+ORDER BY fr.Reputation DESC, fr.UpVotesReceived DESC
+LIMIT 100;

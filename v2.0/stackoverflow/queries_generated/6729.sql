@@ -1,0 +1,55 @@
+-- {"query": "6729.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-micro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 735} 
+
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN pt.Name = 'Question' THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN pt.Name = 'Answer' THEN 1 ELSE 0 END) AS TotalAnswers,
+    SUM(CASE WHEN pv.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotes,
+    SUM(CASE WHEN pv.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotes,
+    MAX(u.LastAccessDate) AS LastAccess,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) AS LastClosedPost,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.CreationDate END) AS LastReopenedPost,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 12 THEN ph.CreationDate END) AS LastDeletedPost,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 13 THEN ph.CreationDate END) AS LastUndeletedPost,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 14 THEN ph.CreationDate END) AS LastLockedPost,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 15 THEN ph.CreationDate END) AS LastUnlockedPost,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 33 THEN ph.CreationDate END) AS LastPostNoticeAdded,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 34 THEN ph.CreationDate END) AS LastPostNoticeRemoved,
+    MAX(p.LastActivityDate) AS LastPostActivity,
+    COUNT(DISTINCT b.Id) AS TotalBadges,
+    SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+    SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+    SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+    MAX(c.CreationDate) AS LastComment,
+    MAX(pl.CreationDate) AS LastLinkedPost,
+    MAX(v.BountyAmount) AS HighestBounty
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    PostTypes pt ON p.PostTypeId = pt.Id
+LEFT JOIN 
+    Votes pv ON p.Id = pv.PostId
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN 
+    Comments c ON p.Id = c.PostId
+LEFT JOIN 
+    PostLinks pl ON p.Id = pl.PostId
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId AND v.VoteTypeId = 8
+WHERE 
+    p.LastActivityDate > DATE_SUB(CURRENT_TIMESTAMP, INTERVAL 1 YEAR)
+    AND u.Reputation > 100
+GROUP BY 
+    u.Id
+HAVING 
+    COUNT(DISTINCT p.Id) > 50
+ORDER BY 
+    u.Reputation DESC, 
+    TotalQuestions DESC;

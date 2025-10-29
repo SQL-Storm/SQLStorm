@@ -1,0 +1,117 @@
+-- {"query": "5810.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 814} 
+WITH
+RecentActivePosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.PostTypeId,
+    p.AcceptedAnswerId,
+    p.ParentId,
+    p.Body,
+    p.LastEditorUserId,
+    p.LastEditDate
+  FROM Posts p
+  WHERE p.CreationDate >= NOW() - INTERVAL '90 days'
+),
+TopUsers AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.LastAccessDate DESC) AS rn
+  FROM Users u
+  WHERE u.AccountId IS NOT NULL
+),
+PopularTagWikis AS (
+  SELECT
+    t.Id AS TagWikiId,
+    t.TagName,
+    t.Count,
+    t.WikiPostId
+  FROM Tags t
+  WHERE t.IsModeratorOnly = 0 AND t.IsRequired = 0
+),
+PostTagActivity AS (
+  SELECT
+    p.Id AS PostId,
+    t.TagName,
+    COUNT(*) AS TagUsage
+  FROM Posts p
+  CROSS APPLY (SELECT unnest(string_to_array(substr(p.Tags, 2, length(p.Tags)-2), ''><'')) AS TagName) AS x
+  GROUP BY p.Id, t.TagName
+),
+CorrelatedStats AS (
+  SELECT
+    r.PostId,
+    r.Title,
+    r.OwnerUserId,
+    r.CreationDate AS PostCreationDate,
+    r.LastActivityDate,
+    r.Score,
+    r.ViewCount,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation,
+    pv.TagName,
+    pv.TagUsage
+  FROM RecentActivePosts r
+  LEFT JOIN TopUsers u ON r.OwnerUserId = u.UserId
+  LEFT JOIN (
+    SELECT
+      p.Id AS PostId,
+      t.TagName,
+      COUNT(*) AS TagUsage
+    FROM Posts p
+    CROSS APPLY (SELECT unnest(string_to_array(substr(p.Tags, 2, length(p.Tags)-2), ''><'')) AS TagName) AS t1
+    GROUP BY p.Id, t.TagName
+  ) pv ON r.Id = pv.PostId
+),
+WindowedStats AS (
+  SELECT
+    PostId,
+    Title,
+    OwnerUserId,
+    PostCreationDate,
+    LastActivityDate,
+    Score,
+    ViewCount,
+    OwnerDisplayName,
+    Reputation,
+    TagName,
+    TagUsage,
+    ROW_NUMBER() OVER (PARTITION BY TagName ORDER BY Score DESC, LastActivityDate DESC) AS rn_by_tag
+  FROM CorrelatedStats
+  WHERE TagName IS NOT NULL
+),
+FinalAgg AS (
+  SELECT
+    ws.TagName,
+    MAX(ws.Score) AS MaxScoreForTag,
+    AVG(ws.Reputation) AS AvgAuthorReputation,
+    SUM(ws.TagUsage) AS TotalTagAssociations,
+    COUNT(*) AS PostsConsidered
+  FROM WindowedStats ws
+  GROUP BY ws.TagName
+)
+SELECT
+  fa.TagName,
+  fa.MaxScoreForTag,
+  fa.AvgAuthorReputation,
+  fa.TotalTagAssociations,
+  fa.PostsConsidered,
+  (SELECT COUNT(*) FROM Posts p WHERE p.PostTypeId = 1) AS TotalQuestions,
+  (SELECT COUNT(*) FROM Votes v WHERE v.VoteTypeId = 2) AS TotalUpvotes,
+  (SELECT COUNT(*) FROM Votes v WHERE v.VoteTypeId = 3) AS TotalDownvotes
+FROM FinalAgg fa
+ORDER BY fa.TotalTagAssociations DESC, fa.MaxScoreForTag DESC
+LIMIT 100;

@@ -1,0 +1,35 @@
+SELECT 
+    u.DisplayName, 
+    COUNT(DISTINCT p.Id) AS TotalPosts, 
+    MAX(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END) AS HighestScoredQuestion,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotes,
+    SUM(CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END) AS TotalClosedPosts,
+    MAX(p.LastActivityDate) AS LastActivity,
+    (
+        SELECT STRING_AGG(t.TagName, ', ')
+        FROM Tags t
+        WHERE t.Id IN (
+            SELECT CAST(REGEXP_REPLACE(tag, '</?([^>]+)>', '\1') AS INTEGER)
+            FROM (
+                SELECT TRIM(value) AS tag
+                FROM UNNEST(string_to_array(MAX(p.Tags), '<')) AS unnested(value)
+            ) sub
+            WHERE tag LIKE '%</%' AND tag NOT LIKE '%(%'
+        )
+    ) AS MostFrequentTags
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+WHERE 
+    u.Reputation > 100
+    AND (p.CreationDate IS NULL OR p.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '1' YEAR))
+GROUP BY 
+    u.DisplayName
+HAVING 
+    COUNT(DISTINCT p.Id) > 10
+ORDER BY 
+    TotalPosts DESC, 
+    HighestScoredQuestion DESC;

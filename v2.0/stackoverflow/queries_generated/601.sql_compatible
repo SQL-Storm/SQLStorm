@@ -1,0 +1,312 @@
+with recent_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.location,
+    coalesce(nullif(trim(u.websiteurl), ''), 'n/a') as websiteurl_norm,
+    date_trunc('month', u.creationdate) as cohort_month,
+    row_number() over (order by u.creationdate desc, u.id desc) as rn_recent
+  from users u
+  where u.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+),
+user_activity as (
+  select
+    p.owneruserid as user_id,
+    count(*) filter (where p.posttypeid = 1) as q_count,
+    count(*) filter (where p.posttypeid = 2) as a_count,
+    sum(greatest(p.score, 0)) as nonneg_score_sum,
+    sum(coalesce(p.viewcount, 0)) as views_sum,
+    max(p.lastactivitydate) as last_post_activity,
+    count(*) filter (where p.closeddate is not null) as closed_posts,
+    avg(nullif(p.answercount, 0)) as avg_answers_when_nonzero
+  from posts p
+  where p.owneruserid is not null
+  group by p.owneruserid
+),
+user_votes as (
+  select
+    v.userid as user_id,
+    count(*) filter (where v.votetypeid = 2) as upvotes_cast,
+    count(*) filter (where v.votetypeid = 3) as downvotes_cast,
+    count(*) filter (where v.votetypeid = 5) as favorites_cast,
+    count(*) filter (where v.votetypeid in (8,9)) as bounties_touch,
+    sum(coalesce(v.bountyamount, 0)) as bounty_amount_sum
+  from votes v
+  where v.userid is not null
+  group by v.userid
+),
+post_engagement as (
+  select
+    p.owneruserid as user_id,
+    count(distinct c.id) as comments_received,
+    count(distinct v2.id) filter (where v2.votetypeid = 2) as upmods_received,
+    count(distinct v2.id) filter (where v2.votetypeid = 3) as downmods_received
+  from posts p
+  left join comments c on c.postid = p.id
+  left join votes v2 on v2.postid = p.id
+  where p.owneruserid is not null
+  group by p.owneruserid
+),
+badges_rollup as (
+  select
+    b.userid as user_id,
+    count(*) as badge_count,
+    count(*) filter (where b.class = 1) as gold_badges,
+    count(*) filter (where b.class = 2) as silver_badges,
+    count(*) filter (where b.class = 3) as bronze_badges,
+    min(b.date) as first_badge_date,
+    max(b.date) as last_badge_date
+  from badges b
+  group by b.userid
+),
+question_closure_reasons as (
+  select
+    ph.postid,
+    max(ph.creationdate) as last_close_date,
+    max(case when ph.posthistorytypeid = 10 then cast(ph.comment as integer) end) as last_close_reason_id
+  from posthistory ph
+  where ph.posthistorytypeid = 10
+  group by ph.postid
+),
+user_close_behavior as (
+  select
+    p.owneruserid as user_id,
+    count(*) as closes_total,
+    count(*) filter (where crt.name ilike '%duplicate%') as closes_duplicate,
+    count(*) filter (where crt.name ilike '%off-topic%') as closes_offtopic
+  from posts p
+  join question_closure_reasons qcr on qcr.postid = p.id
+  left join closereasontypes crt on crt.id = qcr.last_close_reason_id
+  where p.owneruserid is not null
+  group by p.owneruserid
+),
+tag_extraction as (
+  select
+    p.id as post_id,
+    p.owneruserid as user_id,
+    unnest(string_to_array(substring(p.tags from 2 for length(p.tags)-2), '><')) as tagname
+  from posts p
+  where p.posttypeid = 1 and p.tags is not null and length(p.tags) > 2
+),
+top_tags_per_user as (
+  select
+    te.user_id,
+    te.tagname,
+    count(*) as tag_count,
+    row_number() over (partition by te.user_id order by count(*) desc, te.tagname) as rn_tag
+  from tag_extraction te
+  group by te.user_id, te.tagname
+),
+user_link_graph as (
+  select
+    p.owneruserid as user_id,
+    count(*) filter (where pl.linktypeid = 3) as duplicate_links_out,
+    count(*) filter (where pl.linktypeid = 1) as linked_links_out
+  from postlinks pl
+  join posts p on p.id = pl.postid
+  where p.owneruserid is not null
+  group by p.owneruserid
+),
+answer_accepts as (
+  select
+    a.owneruserid as user_id,
+    count(*) as accepted_answers
+  from posts q
+  join posts a on a.id = q.acceptedanswerid
+  where q.posttypeid = 1 and a.posttypeid = 2 and a.owneruserid is not null
+  group by a.owneruserid
+),
+activity_density as (
+  select
+    ra.user_id,
+    count(*) as edits_count,
+    sum(case when ph.posthistorytypeid in (4,5,6,7,8,9,24) then 1 else 0 end) as content_edits,
+    sum(case when ph.posthistorytypeid in (10,11,12,13,14,15,19,20,35,36) then 1 else 0 end) as state_changes
+  from (
+    select distinct p.owneruserid as user_id, p.id as post_id
+    from posts p
+    where p.owneruserid is not null
+  ) ra
+  left join posthistory ph on ph.postid = ra.post_id
+  group by ra.user_id
+),
+recent_activity_window as (
+  select
+    p.owneruserid as user_id,
+    count(*) filter (where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '90 days') as posts_last_90d,
+    count(*) filter (where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days') as posts_last_30d,
+    max(p.creationdate) as last_post_created
+  from posts p
+  where p.owneruserid is not null
+  group by p.owneruserid
+),
+normalized_scores as (
+  select
+    ua.user_id,
+    ua.nonneg_score_sum,
+    ua.views_sum,
+    nullif(ua.q_count + ua.a_count, 0) as total_posts,
+    case
+      when ua.q_count + ua.a_count > 0
+        then cast(ua.nonneg_score_sum as numeric) / (ua.q_count + ua.a_count)
+      else null
+    end as avg_score_per_post
+  from user_activity ua
+),
+user_rankings as (
+  select
+    ru.user_id,
+    rank() over (order by coalesce(ns.avg_score_per_post, 0) desc, coalesce(pe.upmods_received, 0) desc) as r_by_quality,
+    rank() over (order by coalesce(ua.q_count + ua.a_count, 0) desc) as r_by_volume,
+    rank() over (order by coalesce(br.badge_count, 0) desc) as r_by_badges,
+    dense_rank() over (order by coalesce(al.accepted_answers, 0) desc) as r_by_accepts
+  from recent_users ru
+  left join normalized_scores ns on ns.user_id = ru.user_id
+  left join user_activity ua on ua.user_id = ru.user_id
+  left join post_engagement pe on pe.user_id = ru.user_id
+  left join badges_rollup br on br.user_id = ru.user_id
+  left join answer_accepts al on al.user_id = ru.user_id
+),
+cohort_stats as (
+  select
+    ru.cohort_month,
+    count(*) as cohort_users,
+    avg(ru.reputation) as avg_rep,
+    percentile_disc(0.9) within group (order by ru.reputation) as p90_rep
+  from recent_users ru
+  group by ru.cohort_month
+),
+final_set as (
+  select
+    ru.user_id,
+    ru.displayname,
+    ru.reputation,
+    ru.cohort_month,
+    cs.cohort_users,
+    ua.q_count,
+    ua.a_count,
+    ns.total_posts,
+    ns.avg_score_per_post,
+    ua.views_sum,
+    pe.upmods_received,
+    pe.downmods_received,
+    pe.comments_received,
+    uv.upvotes_cast,
+    uv.downvotes_cast,
+    uv.favorites_cast,
+    uv.bounty_amount_sum,
+    br.badge_count,
+    br.gold_badges,
+    br.silver_badges,
+    br.bronze_badges,
+    al.accepted_answers,
+    coalesce(ucb.closes_total, 0) as closes_total,
+    coalesce(ucb.closes_duplicate, 0) as closes_duplicate,
+    coalesce(ucb.closes_offtopic, 0) as closes_offtopic,
+    ulg.duplicate_links_out,
+    ulg.linked_links_out,
+    ad.content_edits,
+    ad.state_changes,
+    raw.posts_last_90d,
+    raw.posts_last_30d,
+    ru.websiteurl_norm,
+    ru.location,
+    ru.rn_recent,
+    ur.r_by_quality,
+    ur.r_by_volume,
+    ur.r_by_badges,
+    ur.r_by_accepts,
+    tt.tagname as top_tag_1,
+    case when ru.reputation > cs.p90_rep then 'top10pct' else 'other' end as rep_bucket
+  from recent_users ru
+  left join cohort_stats cs on cs.cohort_month = ru.cohort_month
+  left join user_activity ua on ua.user_id = ru.user_id
+  left join normalized_scores ns on ns.user_id = ru.user_id
+  left join post_engagement pe on pe.user_id = ru.user_id
+  left join user_votes uv on uv.user_id = ru.user_id
+  left join badges_rollup br on br.user_id = ru.user_id
+  left join answer_accepts al on al.user_id = ru.user_id
+  left join user_close_behavior ucb on ucb.user_id = ru.user_id
+  left join user_link_graph ulg on ulg.user_id = ru.user_id
+  left join activity_density ad on ad.user_id = ru.user_id
+  left join recent_activity_window raw on raw.user_id = ru.user_id
+  left join user_rankings ur on ur.user_id = ru.user_id
+  left join top_tags_per_user tt on tt.user_id = ru.user_id and tt.rn_tag = 1
+),
+dup_check as (
+  select user_id
+  from final_set
+  group by user_id
+  having count(*) > 1
+),
+filtered_final as (
+  select f.*
+  from final_set f
+  left join dup_check d on d.user_id = f.user_id
+  where d.user_id is null
+)
+select
+  f.user_id,
+  coalesce(nullif(f.displayname, ''), concat('user#', cast(f.user_id as text))) as displayname,
+  f.reputation,
+  f.cohort_month,
+  f.cohort_users,
+  f.q_count,
+  f.a_count,
+  f.total_posts,
+  round(coalesce(f.avg_score_per_post, 0), 3) as avg_score_per_post,
+  f.views_sum,
+  f.upmods_received,
+  f.downmods_received,
+  f.comments_received,
+  f.upvotes_cast,
+  f.downvotes_cast,
+  f.favorites_cast,
+  f.bounty_amount_sum,
+  f.badge_count,
+  f.gold_badges,
+  f.silver_badges,
+  f.bronze_badges,
+  f.accepted_answers,
+  f.closes_total,
+  f.closes_duplicate,
+  f.closes_offtopic,
+  f.duplicate_links_out,
+  f.linked_links_out,
+  f.content_edits,
+  f.state_changes,
+  f.posts_last_90d,
+  f.posts_last_30d,
+  f.websiteurl_norm,
+  f.location,
+  f.rn_recent,
+  f.r_by_quality,
+  f.r_by_volume,
+  f.r_by_badges,
+  f.r_by_accepts,
+  f.top_tag_1,
+  f.rep_bucket,
+  case
+    when coalesce(f.total_posts, 0) = 0 then null
+    when f.accepted_answers is null then 0
+    else round((cast(f.accepted_answers as numeric) / nullif(f.a_count, 0)) * 100, 2)
+  end as accept_rate_pct,
+  case
+    when coalesce(f.upmods_received, 0) + coalesce(f.downmods_received, 0) = 0 then null
+    else round((cast(f.upmods_received as numeric) / (f.upmods_received + f.downmods_received)) * 100, 2)
+  end as upvote_ratio_pct
+from filtered_final f
+where
+  coalesce(f.q_count, 0) + coalesce(f.a_count, 0) >= 5
+  and (
+    f.posts_last_90d >= 1
+    or (f.badge_count >= 10 and f.views_sum >= 1000)
+    or (f.r_by_quality <= 100 and f.avg_score_per_post is not null)
+  )
+order by
+  f.r_by_quality nulls last,
+  f.r_by_volume nulls last,
+  f.user_id
+limit 500;

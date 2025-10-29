@@ -1,0 +1,94 @@
+-- {"query": "4501.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 903} 
+WITH RankedPostEdits AS (
+    SELECT
+        ph.PostId,
+        ph.UserId,
+        ph.CreationDate,
+        ph.PostHistoryTypeId,
+        ROW_NUMBER() OVER(PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate DESC) as rn
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6)
+),
+UserPostCounts AS (
+    SELECT
+        p.OwnerUserId,
+        COUNT(p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+PostLaggedScore AS (
+    SELECT
+        p.Id,
+        p.Score,
+        LAG(p.Score, 1, 0) OVER (ORDER BY p.CreationDate) AS PreviousDayScore
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+RecentQuestions AS (
+    SELECT
+        Id,
+        Title,
+        OwnerUserId,
+        CreationDate
+    FROM Posts
+    WHERE PostTypeId = 1
+    AND CreationDate >= DATE('now', '-30 day')
+),
+TopUsersByQuestions AS (
+    SELECT
+        upc.OwnerUserId,
+        u.DisplayName,
+        upc.QuestionCount,
+        ROW_NUMBER() OVER (ORDER BY upc.QuestionCount DESC, u.Reputation DESC) AS UserRank
+    FROM UserPostCounts upc
+    JOIN Users u ON upc.OwnerUserId = u.Id
+    WHERE upc.QuestionCount > 100
+),
+PostScoreChange AS (
+    SELECT
+        pls.Id,
+        (pls.Score - pls.PreviousDayScore) AS ScoreChange
+    FROM PostLaggedScore pls
+    WHERE (pls.Score - pls.PreviousDayScore) > 10
+)
+SELECT
+    rq.Title AS QuestionTitle,
+    tuq.DisplayName AS TopUserDisplayName,
+    tuq.UserRank,
+    COALESCE(psc.ScoreChange, 0) AS SignificantScoreIncrease,
+    CASE
+        WHEN rq.CreationDate < DATE('now', '-7 day') THEN 'OlderThanAWeek'
+        WHEN rq.CreationDate < DATE('now', '-1 day') THEN 'BetweenADayAndAWeek'
+        ELSE 'WithinTheLastDay'
+    END AS AgeCategory,
+    COUNT(c.Id) AS CommentCountOnQuestion,
+    SUM(v.VoteTypeId = 2) AS UpVoteCount, -- UpMod
+    SUM(v.VoteTypeId = 3) AS DownVoteCount -- DownMod
+FROM RecentQuestions rq
+LEFT JOIN TopUsersByQuestions tuq ON rq.OwnerUserId = tuq.OwnerUserId
+LEFT JOIN PostScoreChange psc ON rq.Id = psc.Id
+LEFT JOIN Comments c ON rq.Id = c.PostId
+LEFT JOIN Votes v ON rq.Id = v.PostId
+WHERE tuq.UserRank <= 50 -- Consider top 50 users by questions
+AND EXISTS (
+    SELECT 1
+    FROM RankedPostEdits rpe
+    WHERE rpe.PostId = rq.Id
+    AND rpe.rn = 1
+    AND rpe.UserId <> rq.OwnerUserId
+) -- Check if there's at least one edit by a different user
+GROUP BY
+    rq.Id,
+    rq.Title,
+    tuq.DisplayName,
+    tuq.UserRank,
+    SignificantScoreIncrease,
+    AgeCategory
+HAVING COUNT(c.Id) > 5 OR SUM(v.VoteTypeId = 2) > 20 -- Filter for questions with many comments or upvotes
+ORDER BY
+    tuq.UserRank ASC,
+    SignificantScoreIncrease DESC,
+    AgeCategory;

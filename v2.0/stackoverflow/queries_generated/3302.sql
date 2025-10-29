@@ -1,0 +1,118 @@
+-- {"query": "3302.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2466} 
+
+WITH UserStats AS (
+    SELECT u.Id,
+           u.DisplayName,
+           u.Reputation,
+           COALESCE(u.UpVotes,0) - COALESCE(u.DownVotes,0) AS VoteBalance,
+           COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+           COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+           COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+           MAX(p.CreationDate) AS LastPostDate,
+           MAX(v.CreationDate) AS LastVoteDate
+    FROM Users u
+    LEFT JOIN Badges b   ON b.UserId = u.Id
+    LEFT JOIN Posts  p   ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes  v   ON v.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes
+),
+
+AnswerStats AS (
+    SELECT a.OwnerUserId AS UserId,
+           PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY a.Score) OVER (PARTITION BY a.OwnerUserId) AS MedianAnswerScore,
+           COUNT(*) FILTER (WHERE a.Score >= 10) AS HighScoringAnswers,
+           COUNT(*)                                 AS TotalAnswers
+    FROM Posts a
+    WHERE a.PostTypeId = 2               -- Answer
+      AND a.OwnerUserId IS NOT NULL
+    GROUP BY a.OwnerUserId
+),
+
+TagInfo AS (
+    SELECT t.TagName,
+           t.Count                AS TagUseCount,
+           COALESCE(w.Title,'')   AS WikiTitle,
+           COALESCE(e.Title,'')   AS ExcerptTitle
+    FROM Tags t
+    LEFT JOIN Posts w ON w.Id = t.WikiPostId
+    LEFT JOIN Posts e ON e.Id = t.ExcerptPostId
+),
+
+RecentClosedDuplicates AS (
+    SELECT ph.PostId,
+           ph.CreationDate                AS ClosedDate,
+           ph.Comment::int                AS DuplicateOfPostId,
+           p.Title                        AS OriginalTitle,
+           COALESCE(p2.Title,'')          AS DuplicateTitle
+    FROM PostHistory ph
+    JOIN Posts p  ON p.Id = CAST(ph.Comment AS int)               -- original question id stored in Comment
+    LEFT JOIN Posts p2 ON p2.Id = ph.PostId
+    WHERE ph.PostHistoryTypeId = 10                              -- Post Closed
+      AND ph.Comment ~ '^\d+$'                                   -- only duplicate close reasons with numeric id
+      AND EXISTS (SELECT 1 FROM PostHistory ph2
+                  WHERE ph2.PostId = ph.PostId
+                    AND ph2.PostHistoryTypeId = 33)             -- Post Notice Added (duplicate)
+),
+
+Combined AS (
+    SELECT us.Id,
+           us.DisplayName,
+           us.Reputation,
+           us.VoteBalance,
+           us.GoldBadges,
+           us.SilverBadges,
+           us.BronzeBadges,
+           us.LastPostDate,
+           us.LastVoteDate,
+           COALESCE(asr.MedianAnswerScore,0)      AS MedianAnswerScore,
+           COALESCE(asr.HighScoringAnswers,0)    AS HighScoringAnswers,
+           COALESCE(asr.TotalAnswers,0)          AS TotalAnswers,
+           CASE WHEN us.LastPostDate IS NULL THEN NULL
+                ELSE DATE_PART('day', NOW() - us.LastPostDate)
+           END                                   AS DaysSinceLastPost,
+           CASE WHEN us.LastVoteDate IS NULL THEN NULL
+                ELSE DATE_PART('day', NOW() - us.LastVoteDate)
+           END                                   AS DaysSinceLastVote
+    FROM UserStats us
+    LEFT JOIN AnswerStats asr ON asr.UserId = us.Id
+)
+
+SELECT c.Id,
+       c.DisplayName,
+       c.Reputation,
+       c.VoteBalance,
+       c.GoldBadges,
+       c.SilverBadges,
+       c.BronzeBadges,
+       c.MedianAnswerScore,
+       c.HighScoringAnswers,
+       c.TotalAnswers,
+       c.DaysSinceLastPost,
+       c.DaysSinceLastVote,
+       STRING_AGG(DISTINCT ti.TagName, ', ') 
+           FILTER (WHERE ti.TagUseCount > 5000) AS PopularTags,
+       COUNT(DISTINCT rcd.PostId)               AS RecentDuplicateClosures
+FROM Combined c
+LEFT JOIN PostLinks pl 
+       ON pl.PostId = c.Id OR pl.RelatedPostId = c.Id
+LEFT JOIN Tags ti 
+       ON ti.Id = ANY(
+            SELECT UNNEST(
+                string_to_array(
+                    substring(p.Tags,2,length(p.Tags)-2),'><')
+                )::int
+            FROM Posts p
+            WHERE p.OwnerUserId = c.Id
+          )
+LEFT JOIN RecentClosedDuplicates rcd 
+       ON rcd.DuplicateOfPostId = c.Id
+WHERE c.Reputation > 10000
+  AND (c.GoldBadges > 5 OR c.MedianAnswerScore >= 5)
+  AND (c.DaysSinceLastPost IS NULL OR c.DaysSinceLastPost <= 365)
+GROUP BY c.Id, c.DisplayName, c.Reputation, c.VoteBalance,
+         c.GoldBadges, c.SilverBadges, c.BronzeBadges,
+         c.MedianAnswerScore, c.HighScoringAnswers, c.TotalAnswers,
+         c.DaysSinceLastPost, c.DaysSinceLastVote
+HAVING COUNT(DISTINCT rcd.PostId) > 0
+ORDER BY c.Reputation DESC
+LIMIT 50 OFFSET 0;

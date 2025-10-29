@@ -1,0 +1,268 @@
+-- {"query": "1903.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3402} 
+WITH UserBaseMetrics AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.UpVotes,
+        u.DownVotes,
+        u.Views AS UserProfileViews,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        (SELECT SUM(v.BountyAmount) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 8 AND v.BountyAmount > 0) AS TotalBountyGiven,
+        (SELECT COUNT(DISTINCT v.PostId) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 5) AS FavoritePostsMarked,
+        EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - u.CreationDate)) / (3600 * 24 * 365.25) AS YearsOnPlatform
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.UpVotes, u.DownVotes, u.Views
+    HAVING u.Reputation >= 1000
+      AND u.LastAccessDate >= cast('2024-10-01' as date) - INTERVAL '1 year'
+),
+PostBaseMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount AS DirectCommentCount,
+        COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.Title,
+        p.Tags,
+        p.ClosedDate,
+        LENGTH(p.Body) AS BodyLength,
+        REPLACE(REPLACE(p.Title, ' ', '_'), '-', '_') AS NormalizedTitle,
+        EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate)) / 3600.0 AS HoursSinceCreation,
+        (p.Score * 1.0 / NULLIF(p.ViewCount, 0)) AS ScoreToViewRatio,
+        (SELECT COUNT(DISTINCT UserId) FROM Comments c WHERE c.PostId = p.Id AND c.CreationDate > p.CreationDate + INTERVAL '1 hour') AS DistinctCommentersPostHour1,
+        (SELECT SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 WHEN v.VoteTypeId = 3 THEN -1 ELSE 0 END) FROM Votes v WHERE v.PostId = p.Id AND v.CreationDate BETWEEN p.CreationDate AND COALESCE(p.LastActivityDate, p.CreationDate + INTERVAL '1 month')) AS NetVotesDuringActivePeriod
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) -- Questions and Answers
+      AND p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '3 years'
+      AND p.Body IS NOT NULL AND LENGTH(p.Body) > 100
+),
+PostTagExpansion AS (
+    SELECT
+        pbm.PostId,
+        pbm.PostTypeId,
+        TRIM(UNNEST(string_to_array(SUBSTRING(pbm.Tags FROM 2 FOR LENGTH(pbm.Tags) - 2), '><'))) AS TagName
+    FROM PostBaseMetrics pbm
+    WHERE pbm.Tags IS NOT NULL AND LENGTH(pbm.Tags) > 2
+),
+AggregatedTagStats AS (
+    SELECT
+        pte.TagName,
+        COUNT(DISTINCT pte.PostId) AS TotalPostsInTag,
+        SUM(pbm.Score) AS SumScoreInTag,
+        AVG(pbm.Score) AS AvgScoreInTag,
+        MAX(pbm.ViewCount) AS MaxViewCountInTag,
+        COUNT(DISTINCT pbm.OwnerUserId) AS UniqueAuthorsInTag
+    FROM PostTagExpansion pte
+    INNER JOIN PostBaseMetrics pbm ON pte.PostId = pbm.PostId
+    GROUP BY pte.TagName
+    HAVING COUNT(DISTINCT pte.PostId) > 50
+),
+PostLinkAggregates AS (
+    SELECT
+        pl.PostId,
+        COUNT(DISTINCT pl.RelatedPostId) AS LinkedPostCount,
+        COUNT(DISTINCT pl.RelatedPostId) FILTER (WHERE pl.LinkTypeId = 3) AS DuplicateLinkCount,
+        ARRAY_AGG(DISTINCT pl.RelatedPostId) FILTER (WHERE pl.LinkTypeId = 3) AS DuplicatePostIds
+    FROM PostLinks pl
+    GROUP BY pl.PostId
+),
+PostHistoryAggregates AS (
+    SELECT
+        ph.PostId,
+        COUNT(ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (4, 5, 6)) AS EditCount,
+        MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId = 10) AS LatestCloseDateHistory,
+        MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId = 11) AS LatestReopenDateHistory,
+        STRING_AGG(DISTINCT crt.Name, '; ') FILTER (WHERE ph.PostHistoryTypeId = 10 AND ph.Comment ~ '^[0-9]+$') AS CloseReasonNames
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON ph.PostHistoryTypeId = 10 AND ph.Comment ~ '^[0-9]+$' AND crt.Id = CAST(ph.Comment AS SMALLINT)
+    GROUP BY ph.PostId
+),
+QuestionEnhanced AS (
+    SELECT
+        ubm.UserId,
+        ubm.DisplayName,
+        ubm.Reputation,
+        ubm.GoldBadges,
+        pbm.PostId,
+        pbm.Title,
+        pbm.PostCreationDate,
+        pbm.Score,
+        pbm.ViewCount,
+        pbm.AnswerCount,
+        pbm.FavoriteCount,
+        pbm.BodyLength,
+        pbm.HoursSinceCreation,
+        pbm.ScoreToViewRatio,
+        pbm.DistinctCommentersPostHour1,
+        pbm.NetVotesDuringActivePeriod,
+        pte_main.PrimaryTagName,
+        ats.SumScoreInTag,
+        ats.AvgScoreInTag,
+        pla.LinkedPostCount,
+        pla.DuplicateLinkCount,
+        pha.EditCount AS QuestionEditCount,
+        pha.LatestCloseDateHistory,
+        pha.LatestReopenDateHistory,
+        pha.CloseReasonNames,
+        DENSE_RANK() OVER (PARTITION BY ubm.UserId ORDER BY pbm.Score DESC, pbm.ViewCount DESC) AS UserQuestionRank,
+        AVG(pbm.Score) OVER (PARTITION BY ubm.UserId) AS AvgUserQuestionScore,
+        COUNT(pbm.PostId) OVER (PARTITION BY ubm.UserId) AS TotalUserQuestions,
+        COALESCE(pbm.ClosedDate, pha.LatestCloseDateHistory) IS NOT NULL AS IsQuestionClosed,
+        EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = ubm.UserId AND b.Name = 'Disciplined') AS HasDisciplinedBadge
+    FROM UserBaseMetrics ubm
+    INNER JOIN PostBaseMetrics pbm ON ubm.UserId = pbm.OwnerUserId
+    LEFT JOIN (SELECT PostId, MIN(TagName) AS PrimaryTagName FROM PostTagExpansion WHERE PostTypeId = 1 GROUP BY PostId) pte_main ON pbm.PostId = pte_main.PostId
+    LEFT JOIN AggregatedTagStats ats ON pte_main.PrimaryTagName = ats.TagName
+    LEFT JOIN PostLinkAggregates pla ON pbm.PostId = pla.PostId
+    LEFT JOIN PostHistoryAggregates pha ON pbm.PostId = pha.PostId
+    WHERE pbm.PostTypeId = 1
+      AND pbm.Score >= 20
+      AND pbm.ViewCount >= 500
+      AND pbm.AnswerCount > 0
+      AND pbm.Title ILIKE '%query%'
+      AND pbm.FavoriteCount > 0
+      AND (pbm.ClosedDate IS NULL OR pbm.ClosedDate > pbm.PostCreationDate + INTERVAL '1 week')
+),
+AnswerEnhanced AS (
+    SELECT
+        ubm.UserId,
+        ubm.DisplayName,
+        ubm.Reputation,
+        ubm.GoldBadges,
+        pbm.PostId,
+        pbm.Title,
+        pbm.PostCreationDate,
+        pbm.Score,
+        pbm.ViewCount,
+        NULL::INT AS AnswerCount, -- Not applicable for answers
+        pbm.FavoriteCount,
+        pbm.BodyLength,
+        pbm.HoursSinceCreation,
+        pbm.ScoreToViewRatio,
+        pbm.DistinctCommentersPostHour1,
+        pbm.NetVotesDuringActivePeriod,
+        pte_main.PrimaryTagName,
+        ats.SumScoreInTag,
+        ats.AvgScoreInTag,
+        pla.LinkedPostCount,
+        pla.DuplicateLinkCount,
+        pha.EditCount AS AnswerEditCount,
+        pha.LatestCloseDateHistory,
+        pha.LatestReopenDateHistory,
+        pha.CloseReasonNames,
+        ROW_NUMBER() OVER (PARTITION BY ubm.UserId ORDER BY pbm.Score DESC, pbm.PostCreationDate DESC) AS UserAnswerRank,
+        AVG(pbm.Score) OVER (PARTITION BY ubm.UserId) AS AvgUserAnswerScore,
+        COUNT(pbm.PostId) OVER (PARTITION BY ubm.UserId) AS TotalUserAnswers,
+        (pbm.AcceptedAnswerId IS NOT NULL AND pbm.PostId = pbm.AcceptedAnswerId) AS IsAcceptedAnswer,
+        LAG(pbm.Score) OVER (PARTITION BY pbm.OwnerUserId ORDER BY pbm.PostCreationDate) AS PrevAnswerScore
+    FROM UserBaseMetrics ubm
+    INNER JOIN PostBaseMetrics pbm ON ubm.UserId = pbm.OwnerUserId
+    LEFT JOIN (SELECT PostId, MIN(TagName) AS PrimaryTagName FROM PostTagExpansion WHERE PostTypeId = 2 GROUP BY PostId) pte_main ON pbm.PostId = pte_main.PostId
+    LEFT JOIN AggregatedTagStats ats ON pte_main.PrimaryTagName = ats.TagName
+    LEFT JOIN PostLinkAggregates pla ON pbm.PostId = pla.PostId
+    LEFT JOIN PostHistoryAggregates pha ON pbm.PostId = pha.PostId
+    WHERE pbm.PostTypeId = 2
+      AND pbm.Score >= 10
+      AND pbm.BodyLength > 200
+      AND pbm.LastEditDate IS NOT NULL
+      AND pbm.NetVotesDuringActivePeriod > 0
+)
+SELECT
+    'Question' AS PostCategory,
+    qe.DisplayName,
+    qe.Reputation,
+    qe.GoldBadges,
+    qe.PostId,
+    qe.Title,
+    qe.PostCreationDate,
+    qe.Score,
+    qe.ViewCount,
+    qe.AnswerCount,
+    qe.FavoriteCount,
+    qe.BodyLength,
+    qe.HoursSinceCreation,
+    qe.ScoreToViewRatio,
+    qe.DistinctCommentersPostHour1,
+    qe.NetVotesDuringActivePeriod,
+    qe.PrimaryTagName,
+    qe.SumScoreInTag,
+    qe.AvgScoreInTag,
+    qe.LinkedPostCount,
+    qe.DuplicateLinkCount,
+    qe.QuestionEditCount AS EditCount,
+    qe.LatestCloseDateHistory,
+    qe.LatestReopenDateHistory,
+    qe.CloseReasonNames,
+    qe.UserQuestionRank AS UserPostRank,
+    qe.AvgUserQuestionScore AS AvgUserPostScore,
+    qe.TotalUserQuestions AS TotalUserPosts,
+    qe.IsQuestionClosed AS IsClosedOrAccepted,
+    qe.HasDisciplinedBadge AS UserSpecificFlag,
+    NULL::INT AS PreviousScoreFromSameType
+FROM QuestionEnhanced qe
+WHERE qe.ScoreToViewRatio > 0.01
+  AND qe.QuestionEditCount >= 1
+  AND qe.HasDisciplinedBadge
+  AND (qe.LatestReopenDateHistory IS NULL OR qe.LatestReopenDateHistory > qe.LatestCloseDateHistory)
+  AND qe.NetVotesDuringActivePeriod >= 5
+  AND qe.PrimaryTagName IN (SELECT TagName FROM AggregatedTagStats WHERE AvgScoreInTag > 50 AND TotalPostsInTag > 500)
+
+UNION ALL
+
+SELECT
+    'Answer' AS PostCategory,
+    ae.DisplayName,
+    ae.Reputation,
+    ae.GoldBadges,
+    ae.PostId,
+    ae.Title,
+    ae.PostCreationDate,
+    ae.Score,
+    ae.ViewCount,
+    ae.AnswerCount,
+    ae.FavoriteCount,
+    ae.BodyLength,
+    ae.HoursSinceCreation,
+    ae.ScoreToViewRatio,
+    ae.DistinctCommentersPostHour1,
+    ae.NetVotesDuringActivePeriod,
+    ae.PrimaryTagName,
+    ae.SumScoreInTag,
+    ae.AvgScoreInTag,
+    ae.LinkedPostCount,
+    ae.DuplicateLinkCount,
+    ae.AnswerEditCount AS EditCount,
+    ae.LatestCloseDateHistory,
+    ae.LatestReopenDateHistory,
+    ae.CloseReasonNames,
+    ae.UserAnswerRank AS UserPostRank,
+    ae.AvgUserAnswerScore AS AvgUserPostScore,
+    ae.TotalUserAnswers AS TotalUserPosts,
+    ae.IsAcceptedAnswer AS IsClosedOrAccepted,
+    FALSE AS UserSpecificFlag, -- Not applicable for answers
+    ae.PrevAnswerScore AS PreviousScoreFromSameType
+FROM AnswerEnhanced ae
+WHERE ae.ScoreToViewRatio > 0.05
+  AND ae.IsAcceptedAnswer
+  AND ae.PrevAnswerScore IS NOT NULL AND ae.Score > ae.PrevAnswerScore * 1.5
+  AND ae.DuplicateLinkCount = 0
+  AND ae.NetVotesDuringActivePeriod >= 10
+  AND ae.PrimaryTagName NOT LIKE '%legacy%'
+  AND ae.PrimaryTagName IN (SELECT TagName FROM AggregatedTagStats WHERE UniqueAuthorsInTag > 1000)
+
+ORDER BY Reputation DESC, PostCreationDate DESC
+LIMIT 2000;

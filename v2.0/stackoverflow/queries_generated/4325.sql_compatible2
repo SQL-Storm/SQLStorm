@@ -1,0 +1,156 @@
+WITH RankedUserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        ROW_NUMBER() OVER(PARTITION BY u.Id ORDER BY ph.CreationDate DESC) AS rn
+    FROM Users u
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    WHERE ph.PostHistoryTypeId IN (2, 5)
+),
+FrequentPosters AS (
+    SELECT
+        UserId,
+        COUNT(Id) AS PostCount
+    FROM Posts
+    WHERE PostTypeId IN (1, 2)
+    GROUP BY UserId
+    HAVING COUNT(Id) > 100
+),
+HighReputationUsers AS (
+    SELECT
+        Id,
+        DisplayName,
+        Reputation
+    FROM Users
+    WHERE Reputation > 10000
+),
+PostEditDetails AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        COUNT(ph.Id) AS EditCount,
+        MAX(ph.CreationDate) AS LastEditDate,
+        CAST(
+            (JULIANDAY(MAX(ph.CreationDate)) - JULIANDAY(p.CreationDate)) AS INTEGER
+        ) AS DaysToFirstEdit,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId IN (4, 5, 7, 8)
+    GROUP BY p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.ClosedDate
+),
+UserPostStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id, u.DisplayName
+),
+TagSpecificQuestionCounts AS (
+    SELECT
+        t.TagName,
+        COUNT(p.Id) AS TagQuestionCount
+    FROM Tags t
+    JOIN Posts p ON p.PostTypeId = 1 AND p.Tags LIKE '%' || t.TagName || '%'
+    GROUP BY t.TagName
+    HAVING COUNT(p.Id) > 500
+)
+SELECT
+    ped.PostId,
+    ped.Title,
+    u.DisplayName AS OwnerDisplayName,
+    ped.PostCreationDate,
+    ped.EditCount,
+    ped.LastEditDate,
+    ped.DaysToFirstEdit,
+    ped.IsClosed,
+    ('User ' ||
+        COALESCE(rua.DisplayName, 'Anonymous') ||
+        ' (Rep: ' || COALESCE(CAST(u.Reputation AS VARCHAR), 'N/A') || ')' ||
+        CASE WHEN fp.UserId IS NOT NULL THEN ' - Frequent Poster' ELSE '' END
+    ) AS OwnerInfo,
+    CASE
+        WHEN hru.Id IS NOT NULL THEN 'High Rep User'
+        WHEN ped.EditCount > 10 THEN 'Highly Edited'
+        WHEN ped.DaysToFirstEdit < 1 AND ped.EditCount > 0 THEN 'Quickly Edited'
+        ELSE 'Standard Post'
+    END AS PostCategorization,
+    COALESCE(ups.AnswerCount, 0) AS UserAnswerCount,
+    tsqc.TagQuestionCount
+FROM PostEditDetails ped
+JOIN Users u ON ped.OwnerUserId = u.Id
+LEFT JOIN RankedUserActivity rua ON u.Id = rua.UserId AND rua.rn = 1
+LEFT JOIN FrequentPosters fp ON u.Id = fp.UserId
+LEFT JOIN HighReputationUsers hru ON u.Id = hru.Id
+LEFT JOIN UserPostStats ups ON u.Id = ups.UserId
+LEFT JOIN Posts p_tag ON p_tag.Id = ped.PostId AND p_tag.PostTypeId = 1
+LEFT JOIN (
+    SELECT p_inner.Id AS post_id, tsqc_inner.TagName, tsqc_inner.TagQuestionCount
+    FROM Posts p_inner
+    JOIN (
+        SELECT TagName, TagQuestionCount FROM TagSpecificQuestionCounts
+    ) tsqc_inner ON p_inner.Tags LIKE '%' || tsqc_inner.TagName || '%'
+) tsqc_match ON tsqc_match.post_id = p_tag.Id
+LEFT JOIN (
+    SELECT post_id, TagName, TagQuestionCount FROM (
+        SELECT p_inner.Id AS post_id, tsqc_inner.TagName, tsqc_inner.TagQuestionCount,
+               ROW_NUMBER() OVER (PARTITION BY p_inner.Id ORDER BY tsqc_inner.TagQuestionCount DESC) rn
+        FROM Posts p_inner
+        JOIN TagSpecificQuestionCounts tsqc_inner ON p_inner.Tags LIKE '%' || tsqc_inner.TagName || '%'
+        WHERE p_inner.PostTypeId = 1
+    ) sub WHERE rn = 1
+) tsqc ON tsqc.post_id = p_tag.Id
+WHERE u.Location IS NOT NULL
+  AND u.WebsiteUrl IS NOT NULL
+  AND ped.EditCount > 0
+  AND ped.PostCreationDate < DATE '2023-01-01'
+UNION
+SELECT
+    p.Id,
+    p.Title,
+    u.DisplayName AS OwnerDisplayName,
+    p.CreationDate,
+    0 AS EditCount,
+    NULL AS LastEditDate,
+    NULL AS DaysToFirstEdit,
+    CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+    ('User ' ||
+        COALESCE(rua.DisplayName, 'Anonymous') ||
+        ' (Rep: ' || COALESCE(CAST(u.Reputation AS VARCHAR), 'N/A') || ')' ||
+        CASE WHEN fp.UserId IS NOT NULL THEN ' - Frequent Poster' ELSE '' END
+    ) AS OwnerInfo,
+    CASE
+        WHEN hru.Id IS NOT NULL THEN 'High Rep User'
+        ELSE 'No Edits'
+    END AS PostCategorization,
+    COALESCE(ups.AnswerCount, 0) AS UserAnswerCount,
+    tsqc.TagQuestionCount
+FROM Posts p
+JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN RankedUserActivity rua ON u.Id = rua.UserId AND rua.rn = 1
+LEFT JOIN FrequentPosters fp ON u.Id = fp.UserId
+LEFT JOIN HighReputationUsers hru ON u.Id = hru.Id
+LEFT JOIN UserPostStats ups ON u.Id = ups.UserId
+LEFT JOIN (
+    SELECT post_id, TagName, TagQuestionCount FROM (
+        SELECT p_inner.Id AS post_id, tsqc_inner.TagName, tsqc_inner.TagQuestionCount,
+               ROW_NUMBER() OVER (PARTITION BY p_inner.Id ORDER BY tsqc_inner.TagQuestionCount DESC) rn
+        FROM Posts p_inner
+        JOIN TagSpecificQuestionCounts tsqc_inner ON p_inner.Tags LIKE '%' || tsqc_inner.TagName || '%'
+        WHERE p_inner.PostTypeId = 1
+    ) sub WHERE rn = 1
+) tsqc ON tsqc.post_id = p.Id AND p.PostTypeId = 1
+WHERE p.PostTypeId = 1
+  AND p.Id NOT IN (SELECT PostId FROM PostEditDetails WHERE EditCount > 0)
+  AND u.Location IS NOT NULL
+  AND u.WebsiteUrl IS NOT NULL
+  AND p.CreationDate < DATE '2023-01-01'
+ORDER BY LastEditDate DESC NULLS LAST
+LIMIT 100;

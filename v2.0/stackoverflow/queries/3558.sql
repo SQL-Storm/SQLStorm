@@ -1,0 +1,143 @@
+WITH UserStats AS (
+  SELECT
+    u.Id                                   AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+    AVG(CASE WHEN p.PostTypeId IN (1,2) THEN p.Score END)
+        FILTER (WHERE p.Score IS NOT NULL)                     AS AvgPostScore,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END)    AS TotalAnswerScore,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC)            AS RepRank
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+BadgeCounts AS (
+  SELECT
+    b.UserId,
+    SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+    SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+    SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+  FROM Badges b
+  GROUP BY b.UserId
+),
+
+TopTagAnswers AS (
+  SELECT
+    u.Id                                 AS UserId,
+    LOWER(TRIM(t.TagName))               AS Tag,
+    COUNT(*)                             AS AnswersInTag,
+    AVG(p.Score)                         AS AvgScoreInTag,
+    MAX(p.CreationDate)                  AS LastAnswerDate
+  FROM Users u
+  JOIN Posts p
+    ON p.OwnerUserId = u.Id
+   AND p.PostTypeId = 2
+  JOIN LATERAL (
+    SELECT unnest(string_to_array(TRIM(BOTH '<>' FROM p.Tags), '><')) AS TagName
+  ) t ON true
+  WHERE p.Tags IS NOT NULL
+  GROUP BY u.Id, LOWER(TRIM(t.TagName))
+  HAVING COUNT(*) >= 5
+),
+
+LatestPostComments AS (
+  SELECT
+    p.Id                                          AS PostId,
+    (SELECT MAX(c.CreationDate)
+       FROM Comments c
+      WHERE c.PostId = p.Id)                      AS LastCommentDate,
+    COALESCE(
+      (SELECT c.UserId
+         FROM Comments c
+        WHERE c.PostId = p.Id
+        ORDER BY c.CreationDate DESC
+        LIMIT 1), -1)                             AS LastCommentUserId
+  FROM Posts p
+),
+
+Aggregated AS (
+  SELECT
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.AnswerCount,
+    us.QuestionCount,
+    us.AvgPostScore,
+    bc.GoldBadges,
+    bc.SilverBadges,
+    bc.BronzeBadges,
+    COALESCE(t.Tag, 'none')                      AS TopTag,
+    COALESCE(t.AnswersInTag, 0)                  AS AnswersInTopTag,
+    t.AvgScoreInTag,
+    t.LastAnswerDate,
+    lp.LastCommentDate,
+    CASE
+      WHEN lp.LastCommentUserId = us.UserId THEN 'Self'
+      WHEN lp.LastCommentUserId = -1           THEN 'NoComments'
+      ELSE 'Other'
+    END                                          AS CommentOrigin,
+    us.RepRank
+  FROM UserStats us
+  LEFT JOIN BadgeCounts bc
+    ON bc.UserId = us.UserId
+  LEFT JOIN (
+    SELECT DISTINCT ON (UserId) *
+    FROM TopTagAnswers
+    ORDER BY UserId, AnswersInTag DESC, AvgScoreInTag DESC
+  ) t
+    ON t.UserId = us.UserId
+  LEFT JOIN LatestPostComments lp
+    ON lp.PostId = (
+      SELECT Id
+      FROM Posts p
+      WHERE p.OwnerUserId = us.UserId
+      ORDER BY p.CreationDate DESC
+      LIMIT 1
+    )
+  WHERE us.RepRank <= 100
+    AND (us.AnswerCount > 0 OR us.QuestionCount > 0)
+)
+
+SELECT
+  a.UserId,
+  a.DisplayName,
+  a.Reputation,
+  a.RepRank,
+  a.AnswerCount,
+  a.QuestionCount,
+  a.AvgPostScore,
+  a.GoldBadges,
+  a.SilverBadges,
+  a.BronzeBadges,
+  a.TopTag,
+  a.AnswersInTopTag,
+  ROUND(CAST(a.AvgScoreInTag AS DECIMAL), 2) AS AvgScoreInTopTag,
+  a.LastAnswerDate,
+  a.LastCommentDate,
+  a.CommentOrigin
+FROM Aggregated a
+WHERE a.GoldBadges IS NOT NULL
+
+UNION ALL
+
+SELECT
+  NULL AS UserId,
+  'TOTAL' AS DisplayName,
+  NULL AS Reputation,
+  NULL AS RepRank,
+  SUM(a.AnswerCount)          AS AnswerCount,
+  SUM(a.QuestionCount)        AS QuestionCount,
+  AVG(a.AvgPostScore)         AS AvgPostScore,
+  SUM(a.GoldBadges)           AS GoldBadges,
+  SUM(a.SilverBadges)         AS SilverBadges,
+  SUM(a.BronzeBadges)         AS BronzeBadges,
+  NULL AS TopTag,
+  NULL AS AnswersInTopTag,
+  NULL AS AvgScoreInTopTag,
+  NULL AS LastAnswerDate,
+  NULL AS LastCommentDate,
+  NULL AS CommentOrigin
+FROM Aggregated a;

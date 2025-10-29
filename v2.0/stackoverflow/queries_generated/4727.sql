@@ -1,0 +1,166 @@
+-- {"query": "4727.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1688} 
+
+WITH
+  RankedUserPosts AS (
+    SELECT
+      p.Id AS PostId,
+      p.OwnerUserId,
+      p.PostTypeId,
+      p.Score,
+      p.AnswerCount,
+      ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn,
+      COUNT(c.Id) OVER (PARTITION BY p.OwnerUserId) AS UserCommentCount
+    FROM Posts AS p
+    LEFT JOIN Comments AS c
+      ON p.Id = c.PostId
+    WHERE
+      p.OwnerUserId IS NOT NULL
+    GROUP BY
+      p.Id,
+      p.OwnerUserId,
+      p.PostTypeId,
+      p.Score,
+      p.AnswerCount,
+      p.CreationDate
+  ),
+  UserPostStats AS (
+    SELECT
+      OwnerUserId,
+      COUNT(CASE WHEN PostTypeId = 1 THEN 1 END) AS QuestionCount,
+      COUNT(CASE WHEN PostTypeId = 2 THEN 1 END) AS AnswerCount,
+      SUM(CASE WHEN PostTypeId = 1 THEN Score ELSE 0 END) AS TotalQuestionScore,
+      SUM(CASE WHEN PostTypeId = 2 THEN Score ELSE 0 END) AS TotalAnswerScore,
+      AVG(Score) AS AvgPostScore,
+      MAX(UserCommentCount) AS MaxUserCommentCount
+    FROM RankedUserPosts
+    WHERE
+      rn <= 100 -- Consider only the 100 most recent posts per user
+    GROUP BY
+      OwnerUserId
+  ),
+  UserBadgeCounts AS (
+    SELECT
+      UserId,
+      COUNT(CASE WHEN Class = 1 THEN 1 END) AS GoldBadgeCount,
+      COUNT(CASE WHEN Class = 2 THEN 1 END) AS SilverBadgeCount,
+      COUNT(CASE WHEN Class = 3 THEN 1 END) AS BronzeBadgeCount
+    FROM Badges
+    GROUP BY
+      UserId
+  ),
+  UserVoteActivity AS (
+    SELECT
+      v.UserId,
+      COUNT(CASE WHEN vt.Name = 'UpMod' THEN 1 END) AS UpVoteCount,
+      COUNT(CASE WHEN vt.Name = 'DownMod' THEN 1 END) AS DownVoteCount,
+      COUNT(CASE WHEN vt.Name = 'AcceptedByOriginator' THEN 1 END) AS AcceptedVoteCount
+    FROM Votes AS v
+    JOIN VoteTypes AS vt
+      ON v.VoteTypeId = vt.Id
+    WHERE
+      v.UserId IS NOT NULL
+    GROUP BY
+      v.UserId
+  ),
+  PostHistoryAggregates AS (
+    SELECT
+      ph.PostId,
+      MAX(CASE WHEN ph.PostHistoryTypeId = 4 THEN ph.CreationDate END) AS LatestTitleEditDate,
+      COUNT(CASE WHEN ph.PostHistoryTypeId IN (5, 8) THEN 1 END) AS BodyEditCount,
+      COUNT(CASE WHEN ph.PostHistoryTypeId = 6 THEN 1 END) AS TagEditCount,
+      MIN(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) AS FirstCloseDate
+    FROM PostHistory AS ph
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 8, 6, 10)
+    GROUP BY
+      ph.PostId
+  )
+SELECT
+  u.Id AS UserId,
+  u.DisplayName,
+  u.Reputation,
+  u.Views AS UserViews,
+  u.UpVotes AS UserUpVotesGiven,
+  u.DownVotes AS UserDownVotesGiven,
+  COALESCE(ups.QuestionCount, 0) AS TotalQuestions,
+  COALESCE(ups.AnswerCount, 0) AS TotalAnswers,
+  COALESCE(ups.TotalQuestionScore, 0) AS TotalScoreFromQuestions,
+  COALESCE(ups.TotalAnswerScore, 0) AS TotalScoreFromAnswers,
+  COALESCE(ups.AvgPostScore, 0.0) AS AveragePostScore,
+  COALESCE(ubc.GoldBadgeCount, 0) AS GoldBadges,
+  COALESCE(ubc.SilverBadgeCount, 0) AS SilverBadges,
+  COALESCE(ubc.BronzeBadgeCount, 0) AS BronzeBadges,
+  COALESCE(uva.UpVoteCount, 0) AS UpVotesReceived,
+  COALESCE(uva.DownVoteCount, 0) AS DownVotesReceived,
+  COALESCE(uva.AcceptedVoteCount, 0) AS AcceptedVotesReceived,
+  COALESCE(pha.BodyEditCount, 0) AS NumberOfBodyEdits,
+  COALESCE(pha.TagEditCount, 0) AS NumberOfTagEdits,
+  CASE
+    WHEN pha.FirstCloseDate IS NOT NULL THEN 'Closed'
+    WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+    ELSE 'Open'
+  END AS PostStatus,
+  DATEDIFF(day, u.CreationDate, GETDATE()) AS AccountAgeInDays,
+  COALESCE(ups.MaxUserCommentCount, 0) AS MaxCommentsOnAUsersPost,
+  CASE
+    WHEN INSTR(LOWER(u.AboutMe), 'sql') > 0 THEN 'Contains SQL keyword'
+    WHEN u.WebsiteUrl IS NULL THEN 'No Website'
+    ELSE 'Has Website'
+  END AS UserProfileCategory,
+  CASE
+    WHEN p.Title LIKE '%?' THEN 'Ends with question mark'
+    ELSE 'Does not end with question mark'
+  END AS TitleSuffixCheck
+FROM Users AS u
+LEFT JOIN UserPostStats AS ups
+  ON u.Id = ups.OwnerUserId
+LEFT JOIN UserBadgeCounts AS ubc
+  ON u.Id = ubc.UserId
+LEFT JOIN UserVoteActivity AS uva
+  ON u.Id = uva.UserId
+LEFT JOIN Posts AS p
+  ON u.Id = p.OwnerUserId AND p.PostTypeId = 1 -- Focusing on questions for status
+LEFT JOIN PostHistoryAggregates AS pha
+  ON p.Id = pha.PostId
+WHERE
+  u.Reputation > 1000
+  AND u.AccountAgeInDays BETWEEN 365 AND 3650
+  AND u.EmailHash IS NOT NULL
+  AND u.DisplayName NOT LIKE '%[bot]%'
+  AND EXISTS (
+    SELECT
+      1
+    FROM Comments AS c
+    WHERE
+      c.UserId = u.Id
+      AND c.Score > 5
+  )
+GROUP BY
+  u.Id,
+  u.DisplayName,
+  u.Reputation,
+  u.Views,
+  u.UpVotes,
+  u.DownVotes,
+  ups.QuestionCount,
+  ups.AnswerCount,
+  ups.TotalQuestionScore,
+  ups.TotalAnswerScore,
+  ups.AvgPostScore,
+  ubc.GoldBadgeCount,
+  ubc.SilverBadgeCount,
+  ubc.BronzeBadgeCount,
+  uva.UpVoteCount,
+  uva.DownVoteCount,
+  uva.AcceptedVoteCount,
+  pha.BodyEditCount,
+  pha.TagEditCount,
+  p.ClosedDate,
+  pha.FirstCloseDate,
+  u.CreationDate,
+  ups.MaxUserCommentCount,
+  u.AboutMe,
+  u.WebsiteUrl,
+  p.Title
+HAVING
+  SUM(p.Score) > 0 OR COUNT(p.Id) > 0;

@@ -1,0 +1,144 @@
+-- {"query": "2638.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1569} 
+with recursive tag_hierarchy as (
+    select t.Id, t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId, 1 as level, array[t.Id] as path
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+  union all
+    select t.Id, t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId, th.level + 1, path || t.Id
+    from Tags t
+    join tag_hierarchy th on t.Count < th.Count and not t.Id = any(path)
+    where th.level < 3
+),
+latest_user_activity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Location,
+        case when u.AboutMe is null or length(trim(u.AboutMe)) = 0 then 'No bio' else substring(u.AboutMe from 1 for 60) end as BioPreview,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        coalesce(badge_counts.GoldBadges,0) as GoldBadges,
+        coalesce(badge_counts.SilverBadges,0) as SilverBadges,
+        coalesce(badge_counts.BronzeBadges,0) as BronzeBadges,
+        row_number() over (order by u.Reputation desc, u.LastAccessDate desc) as UserRank
+    from Users u
+    left join (
+        select UserId,
+               sum(case when Class = 1 then 1 else 0 end) as GoldBadges,
+               sum(case when Class = 2 then 1 else 0 end) as SilverBadges,
+               sum(case when Class = 3 then 1 else 0 end) as BronzeBadges
+        from Badges
+        group by UserId
+    ) badge_counts on badge_counts.UserId = u.Id
+    where u.LastAccessDate > cast('2024-10-01 12:34:56' as timestamp) - interval '1 year'
+),
+top_questions as (
+    select p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Tags,
+      dense_rank() over (order by p.Score desc, p.ViewCount desc) as ScoreRank,
+      count(distinct a.Id) as AnswerCount,
+      sum(vc.UpVotes) as TotalUpVotesOnAnswers
+    from Posts p
+    left join Posts a on a.ParentId = p.Id and a.PostTypeId = 2
+    left join Votes v on v.PostId = a.Id and v.VoteTypeId = 2
+    left join (
+      select PostId, count(*) as UpVotes
+      from Votes
+      where VoteTypeId = 2
+      group by PostId
+    ) vc on vc.PostId = a.Id
+    where p.PostTypeId = 1
+    group by p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Tags
+    having p.ViewCount > 1000
+),
+questions_with_duplicates as (
+    select pq.*, pl.RelatedPostId as DuplicateOfPostId
+    from top_questions pq
+    left join PostLinks pl on pl.PostId = pq.Id and pl.LinkTypeId = 3
+),
+user_comment_agg as (
+    select c.UserId,
+           count(*) as TotalComments,
+           count(distinct c.PostId) as DistinctPostsCommented,
+           max(c.CreationDate) as LastCommentDate,
+           bool_or(c.Text is null or length(trim(c.Text)) = 0) as HasEmptyComments
+    from Comments c
+    group by c.UserId
+),
+user_badge_lag as (
+    select
+        b.UserId,
+        b.Date,
+        b.Name,
+        lag(b.Name) over (partition by b.UserId order by b.Date) as PreviousBadge,
+        lead(b.Name) over (partition by b.UserId order by b.Date) as NextBadge
+    from Badges b
+    where b.Date > cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+),
+score_window as (
+    select p.Id, p.OwnerUserId,
+        p.Score,
+        avg(p.Score) over (partition by p.OwnerUserId) as AvgUserScore,
+        max(p.Score) over (partition by p.OwnerUserId) as MaxUserScore,
+        min(p.Score) over (partition by p.OwnerUserId) as MinUserScore,
+        rank() over (order by p.Score desc) as GlobalScoreRank
+    from Posts p
+    where p.PostTypeId in (1, 2)
+),
+tag_questions_count as (
+    select t.TagName,
+           count(q.Id) as QuestionCount,
+           avg(q.Score) as AvgQuestionScore,
+           sum(q.ViewCount) as TotalViews,
+           max(q.CreationDate) as MostRecentQuestion
+    from Tags t
+    join Posts q on q.PostTypeId = 1 and q.Tags like concat('%<', t.TagName, '>%')
+    group by t.TagName
+    having count(q.Id) > 50
+)
+select
+  u.UserId,
+  u.DisplayName,
+  u.Reputation,
+  u.LastAccessDate,
+  u.GoldBadges,
+  u.SilverBadges,
+  u.BronzeBadges,
+  coalesce(uca.TotalComments,0) as TotalComments,
+  coalesce(uca.DistinctPostsCommented,0) as DistinctPostsCommented,
+  u.BioPreview,
+  q.Id as TopQuestionId,
+  q.Title as TopQuestionTitle,
+  q.Score as TopQuestionScore,
+  q.ViewCount as TopQuestionViews,
+  q.DuplicateOfPostId,
+  q.AnswerCount,
+  q.TotalUpVotesOnAnswers,
+  sq.AvgUserScore,
+  sq.MaxUserScore,
+  sq.MinUserScore,
+  sq.GlobalScoreRank,
+  string_agg(distinct th.TagName, ',') as RelatedTags,
+  coalesce(tqc.QuestionCount,0) as TagQuestionCount,
+  coalesce(tqc.AvgQuestionScore,0) as TagAvgScore,
+  coalesce(tqc.TotalViews,0) as TagTotalViews
+from latest_user_activity u
+left join user_comment_agg uca on uca.UserId = u.UserId
+left join top_questions q on q.OwnerUserId = u.UserId
+left join score_window sq on sq.OwnerUserId = u.UserId and sq.Id = q.Id
+left join tag_hierarchy th on q.Tags like concat('%<', th.TagName, '>%')
+left join tag_questions_count tqc on tqc.TagName = th.TagName
+where u.UserRank <= 100
+group by
+  u.UserId, u.DisplayName, u.Reputation, u.LastAccessDate,
+  u.GoldBadges, u.SilverBadges, u.BronzeBadges,
+  uca.TotalComments, uca.DistinctPostsCommented,
+  u.BioPreview,
+  q.Id, q.Title, q.Score, q.ViewCount, q.DuplicateOfPostId, q.AnswerCount, q.TotalUpVotesOnAnswers,
+  sq.AvgUserScore, sq.MaxUserScore, sq.MinUserScore, sq.GlobalScoreRank,
+  tqc.QuestionCount, tqc.AvgQuestionScore, tqc.TotalViews
+order by u.Reputation desc, q.Score desc
+limit 50;

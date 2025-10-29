@@ -1,0 +1,346 @@
+with params as (
+    select 
+        cast(365 as integer) as days_back,
+        cast(10 as integer) as min_answers,
+        cast(3 as integer) as top_n_per_user
+),
+recent_questions as (
+    select p.Id as QuestionId,
+           p.OwnerUserId as AskerId,
+           p.CreationDate,
+           p.Score as QuestionScore,
+           p.ViewCount,
+           p.Tags,
+           coalesce(p.AnswerCount, 0) as AnswerCount,
+           case when p.ClosedDate is not null then 1 else 0 end as IsClosed
+    from Posts p
+    join PostTypes pt on pt.Id = p.PostTypeId and pt.Name = 'Question'
+    cross join params
+    where p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - make_interval(days => params.days_back)
+      and coalesce(p.AnswerCount, 0) >= params.min_answers
+),
+answers as (
+    select a.Id as AnswerId,
+           a.ParentId as QuestionId,
+           a.OwnerUserId as AnswererId,
+           a.Score as AnswerScore,
+           a.CreationDate as AnswerCreationDate
+    from Posts a
+    join PostTypes pt on pt.Id = a.PostTypeId and pt.Name = 'Answer'
+),
+accepted as (
+    select q.QuestionId,
+           q.AskerId,
+           pa.Id as AcceptedAnswerId,
+           pa.OwnerUserId as AcceptedByUserId,
+           pa.Score as AcceptedAnswerScore,
+           pa.CreationDate as AcceptedAnswerCreationDate
+    from recent_questions q
+    join Posts pq on pq.Id = q.QuestionId
+    left join Posts pa on pa.Id = pq.AcceptedAnswerId
+),
+votes_agg as (
+    select v.PostId,
+           sum(case when vt.Name = 'UpMod' then 1 when vt.Name = 'DownMod' then -1 else 0 end) as NetVotes,
+           sum(case when vt.Name = 'Favorite' then 1 else 0 end) as Favorites,
+           sum(case when vt.Name = 'BountyStart' then coalesce(v.BountyAmount,0) else 0 end) as BountyStarted,
+           sum(case when vt.Name = 'BountyClose' then coalesce(v.BountyAmount,0) else 0 end) as BountyAwarded,
+           count(*) filter (where vt.Name in ('UpMod','DownMod')) as TotalVotes
+    from Votes v
+    join VoteTypes vt on vt.Id = v.VoteTypeId
+    group by v.PostId
+),
+comments_agg as (
+    select c.PostId,
+           count(*) as CommentCount,
+           sum(coalesce(c.Score,0)) as CommentScoreSum,
+           max(c.CreationDate) as LastCommentDate
+    from Comments c
+    group by c.PostId
+),
+postlinks_dupe as (
+    select pl.PostId,
+           count(*) filter (where lt.Name = 'Duplicate') as DuplicateLinks,
+           count(*) filter (where lt.Name = 'Linked') as LinkedLinks
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    group by pl.PostId
+),
+tag_expanded as (
+    select q.QuestionId,
+           unnest(string_to_array(substring(q.Tags, 2, greatest(length(q.Tags)-2,0)), '><')) as TagName
+    from recent_questions q
+    where q.Tags is not null and q.Tags like '<%>'
+),
+user_badges as (
+    select b.UserId,
+           sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+           sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+           sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+           count(*) as TotalBadges,
+           count(*) filter (where b.TagBased = true) as TagBadges
+    from Badges b
+    group by b.UserId
+),
+user_activity as (
+    select u.Id as UserId,
+           u.Reputation,
+           u.UpVotes,
+           u.DownVotes,
+           u.Views as ProfileViews,
+           u.CreationDate as UserCreationDate,
+           u.LastAccessDate,
+           nullif(trim(coalesce(u.Location,'')), '') as CleanLocation,
+           case when u.WebsiteUrl is null or u.WebsiteUrl ~* '^(https?://)?$' then null else u.WebsiteUrl end as WebsiteUrl
+    from Users u
+),
+question_quality as (
+    select q.QuestionId,
+           q.AskerId,
+           q.CreationDate,
+           q.QuestionScore,
+           q.ViewCount,
+           q.AnswerCount,
+           q.IsClosed,
+           coalesce(vq.NetVotes,0) as QNetVotes,
+           coalesce(vq.Favorites,0) as QFavorites,
+           coalesce(vq.TotalVotes,0) as QTotalVotes,
+           coalesce(cq.CommentCount,0) as QCommentCount,
+           coalesce(cq.CommentScoreSum,0) as QCommentScoreSum,
+           cq.LastCommentDate as QLastCommentDate,
+           coalesce(pl.DuplicateLinks,0) as DuplicateLinks,
+           coalesce(pl.LinkedLinks,0) as LinkedLinks,
+           case when q.IsClosed = 1 then 'Closed'
+                when coalesce(pl.DuplicateLinks,0) > 0 then 'HasDuplicateLink'
+                else 'Open' end as StatusBucket
+    from recent_questions q
+    left join votes_agg vq on vq.PostId = q.QuestionId
+    left join comments_agg cq on cq.PostId = q.QuestionId
+    left join postlinks_dupe pl on pl.PostId = q.QuestionId
+),
+answer_stats as (
+    select a.QuestionId,
+           count(*) as AnswersTotal,
+           avg(cast(a.AnswerScore as numeric)) as AvgAnswerScore,
+           max(a.AnswerScore) as MaxAnswerScore,
+           min(a.AnswerScore) as MinAnswerScore,
+           sum(case when a.AnswerScore > 0 then 1 else 0 end) as PositiveAnswers,
+           sum(case when a.AnswerScore < 0 then 1 else 0 end) as NegativeAnswers
+    from answers a
+    group by a.QuestionId
+),
+accepted_enriched as (
+    select ac.QuestionId,
+           ac.AcceptedAnswerId,
+           ac.AcceptedByUserId,
+           ac.AcceptedAnswerScore,
+           ac.AcceptedAnswerCreationDate,
+           coalesce(va.NetVotes,0) as AcceptedNetVotes,
+           coalesce(ca.CommentCount,0) as AcceptedCommentCount
+    from accepted ac
+    left join votes_agg va on va.PostId = ac.AcceptedAnswerId
+    left join comments_agg ca on ca.PostId = ac.AcceptedAnswerId
+),
+ranked_questions as (
+    select qq.*,
+           asg.AnswersTotal,
+           asg.AvgAnswerScore,
+           asg.MaxAnswerScore,
+           asg.MinAnswerScore,
+           asg.PositiveAnswers,
+           asg.NegativeAnswers,
+           ae.AcceptedAnswerId,
+           ae.AcceptedByUserId,
+           ae.AcceptedAnswerScore,
+           ae.AcceptedAnswerCreationDate,
+           ae.AcceptedNetVotes,
+           ae.AcceptedCommentCount,
+           row_number() over (
+               partition by qq.AskerId 
+               order by 
+                   (coalesce(qq.QNetVotes,0) + coalesce(qq.QFavorites,0) + coalesce(ae.AcceptedNetVotes,0)) desc,
+                   qq.ViewCount desc,
+                   qq.CreationDate desc
+           ) as rn
+    from question_quality qq
+    left join answer_stats asg on asg.QuestionId = qq.QuestionId
+    left join accepted_enriched ae on ae.QuestionId = qq.QuestionId
+),
+asker_enriched as (
+    select rq.*,
+           ua.Reputation as AskerReputation,
+           ua.UpVotes as AskerUpVotes,
+           ua.DownVotes as AskerDownVotes,
+           ua.ProfileViews as AskerProfileViews,
+           ua.UserCreationDate as AskerCreationDate,
+           ua.LastAccessDate as AskerLastAccess,
+           ua.CleanLocation as AskerLocation,
+           ua.WebsiteUrl as AskerWebsiteUrl,
+           ub.TotalBadges as AskerBadges,
+           ub.GoldBadges as AskerGold,
+           ub.SilverBadges as AskerSilver,
+           ub.BronzeBadges as AskerBronze,
+           ub.TagBadges as AskerTagBadges
+    from ranked_questions rq
+    left join user_activity ua on ua.UserId = rq.AskerId
+    left join user_badges ub on ub.UserId = rq.AskerId
+),
+accepted_owner_enriched as (
+    select ae.QuestionId,
+           ua.UserId as AcceptedOwnerId,
+           ua.Reputation as AcceptedOwnerReputation,
+           ub.TotalBadges as AcceptedOwnerBadges,
+           ub.GoldBadges as AcceptedOwnerGold,
+           ub.SilverBadges as AcceptedOwnerSilver,
+           ub.BronzeBadges as AcceptedOwnerBronze
+    from accepted_enriched ae
+    left join user_activity ua on ua.UserId = ae.AcceptedByUserId
+    left join user_badges ub on ub.UserId = ae.AcceptedByUserId
+),
+tag_rank as (
+    select te.QuestionId,
+           te.TagName,
+           dense_rank() over (partition by te.QuestionId order by length(te.TagName) desc, te.TagName) as TagLenRank,
+           row_number() over (partition by te.QuestionId order by te.TagName) as TagAlphaRank
+    from tag_expanded te
+),
+stringified as (
+    select ae.QuestionId,
+           ae.AskerId,
+           ae.CreationDate,
+           ae.QuestionScore,
+           ae.ViewCount,
+           ae.AnswerCount,
+           ae.IsClosed,
+           ae.QNetVotes,
+           ae.QFavorites,
+           ae.QTotalVotes,
+           ae.QCommentCount,
+           ae.QCommentScoreSum,
+           ae.QLastCommentDate,
+           ae.DuplicateLinks,
+           ae.LinkedLinks,
+           ae.StatusBucket,
+           ae.AnswersTotal,
+           ae.AvgAnswerScore,
+           ae.MaxAnswerScore,
+           ae.MinAnswerScore,
+           ae.PositiveAnswers,
+           ae.NegativeAnswers,
+           ae.AcceptedAnswerId,
+           ae.AcceptedByUserId,
+           ae.AcceptedAnswerScore,
+           ae.AcceptedAnswerCreationDate,
+           ae.AcceptedNetVotes,
+           ae.AcceptedCommentCount,
+           ae.rn,
+           ae.AskerReputation,
+           ae.AskerUpVotes,
+           ae.AskerDownVotes,
+           ae.AskerProfileViews,
+           ae.AskerCreationDate,
+           ae.AskerLastAccess,
+           ae.AskerLocation,
+           ae.AskerWebsiteUrl,
+           ae.AskerBadges,
+           ae.AskerGold,
+           ae.AskerSilver,
+           ae.AskerBronze,
+           ae.AskerTagBadges,
+           coalesce(string_agg(distinct tr.TagName::text order by tr.TagAlphaRank), '') as TagsAlpha,
+           coalesce(string_agg(distinct tr2.TagName::text order by tr2.TagLenRank), '') as TagsByLen,
+           coalesce(
+                string_agg(
+                    case 
+                        when tr.TagAlphaRank = 1 then upper(tr.TagName)
+                        when tr.TagAlphaRank = 2 then initcap(tr.TagName)
+                        else lower(tr.TagName)
+                    end
+                    , ' | '
+                )
+           , '') as FancyTags
+    from asker_enriched ae
+    left join tag_rank tr on tr.QuestionId = ae.QuestionId and tr.TagAlphaRank <= 5
+    left join tag_rank tr2 on tr2.QuestionId = ae.QuestionId and tr2.TagLenRank <= 5
+    group by ae.QuestionId, ae.AskerId, ae.CreationDate, ae.QuestionScore, ae.ViewCount, ae.AnswerCount, ae.IsClosed,
+             ae.QNetVotes, ae.QFavorites, ae.QTotalVotes, ae.QCommentCount, ae.QCommentScoreSum, ae.QLastCommentDate,
+             ae.DuplicateLinks, ae.LinkedLinks, ae.StatusBucket, ae.AnswersTotal, ae.AvgAnswerScore, ae.MaxAnswerScore, ae.MinAnswerScore,
+             ae.PositiveAnswers, ae.NegativeAnswers, ae.AcceptedAnswerId, ae.AcceptedByUserId, ae.AcceptedAnswerScore,
+             ae.AcceptedAnswerCreationDate, ae.AcceptedNetVotes, ae.AcceptedCommentCount, ae.rn,
+             ae.AskerReputation, ae.AskerUpVotes, ae.AskerDownVotes, ae.AskerProfileViews, ae.AskerCreationDate,
+             ae.AskerLastAccess, ae.AskerLocation, ae.AskerWebsiteUrl, ae.AskerBadges, ae.AskerGold, ae.AskerSilver, ae.AskerBronze, ae.AskerTagBadges
+),
+normalized_scores as (
+    select s.*,
+           (s.QNetVotes - avg(s.QNetVotes) over ()) / nullif(stddev_pop(s.QNetVotes) over (),0) as Z_QNetVotes,
+           (s.ViewCount - avg(s.ViewCount) over ()) / nullif(stddev_pop(s.ViewCount) over (),0) as Z_Views,
+           (coalesce(s.AcceptedNetVotes,0) - avg(coalesce(s.AcceptedNetVotes,0)) over ()) / nullif(stddev_pop(coalesce(s.AcceptedNetVotes,0)) over (),0) as Z_AcceptedVotes,
+           (coalesce(s.AvgAnswerScore,0) - avg(coalesce(s.AvgAnswerScore,0)) over ()) / nullif(stddev_pop(coalesce(s.AvgAnswerScore,0)) over (),0) as Z_AvgAnswerScore
+    from stringified s
+),
+scored as (
+    select ns.*,
+           (0.4 * coalesce(ns.Z_QNetVotes,0) +
+            0.3 * coalesce(ns.Z_Views,0) +
+            0.2 * coalesce(ns.Z_AcceptedVotes,0) +
+            0.1 * coalesce(ns.Z_AvgAnswerScore,0) -
+            case when ns.StatusBucket = 'Closed' then 0.75 when ns.StatusBucket = 'HasDuplicateLink' then 0.35 else 0 end
+           ) as CompositeScore
+    from normalized_scores ns
+),
+final_rank as (
+    select s.*,
+           row_number() over (
+               partition by s.AskerId
+               order by s.CompositeScore desc, s.ViewCount desc, s.CreationDate desc
+           ) as final_rn
+    from scored s
+),
+top_per_user as (
+    select fr.*
+    from final_rank fr
+    cross join params
+    where fr.rn <= params.top_n_per_user
+      and fr.final_rn <= params.top_n_per_user
+)
+select 
+    tpu.AskerId,
+    u.DisplayName as AskerDisplayName,
+    tpu.QuestionId,
+    p.Title,
+    tpu.CreationDate as QuestionCreationDate,
+    tpu.StatusBucket,
+    tpu.ViewCount,
+    tpu.QNetVotes,
+    tpu.QFavorites,
+    tpu.AnswerCount,
+    tpu.AnswersTotal,
+    tpu.AcceptedAnswerId,
+    tpu.AcceptedByUserId,
+    tpu.AcceptedAnswerScore,
+    tpu.AcceptedNetVotes,
+    coalesce(tpu.TagsAlpha, '') as TagsAlpha,
+    coalesce(tpu.FancyTags, '') as FancyTags,
+    tpu.AskerReputation,
+    tpu.AskerBadges,
+    tpu.AskerGold,
+    tpu.AskerSilver,
+    tpu.AskerBronze,
+    tpu.AskerTagBadges,
+    aoe.AcceptedOwnerId,
+    aoe.AcceptedOwnerReputation,
+    aoe.AcceptedOwnerBadges,
+    case 
+        when tpu.AskerReputation >= 20000 and tpu.AskerGold >= 5 then 'Elite'
+        when tpu.AskerReputation >= 10000 and tpu.AskerGold >= 1 then 'Veteran'
+        when tpu.AskerReputation is null then 'Anonymous'
+        else 'Regular'
+    end as AskerTier,
+    lower(regexp_replace(coalesce(p.Title,''), '\s+', '-', 'g')) || '-' || cast(tpu.QuestionId as text) as Slug,
+    percent_rank() over (order by tpu.CompositeScore) as PctRank,
+    dense_rank() over (partition by tpu.StatusBucket order by tpu.CompositeScore desc) as RankWithinStatus
+from top_per_user tpu
+left join Posts p on p.Id = tpu.QuestionId
+left join Users u on u.Id = tpu.AskerId
+left join accepted_owner_enriched aoe on aoe.QuestionId = tpu.QuestionId
+order by tpu.AskerId, tpu.CompositeScore desc, tpu.QuestionId;

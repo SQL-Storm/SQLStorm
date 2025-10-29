@@ -1,0 +1,137 @@
+-- {"query": "4199.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1254} 
+
+WITH
+  UserEngagement AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      COUNT(DISTINCT p.Id) AS TotalPosts,
+      SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+      COUNT(DISTINCT c.Id) AS CommentCount,
+      COUNT(DISTINCT v.Id) AS VoteCount,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+      COUNT(DISTINCT b.Id) AS BadgeCount,
+      DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT b.Id) DESC) AS BadgeRank,
+      AVG(p.Score) OVER (PARTITION BY u.Id) AS AveragePostScore,
+      ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.CreationDate DESC) AS PostSequence
+    FROM Users AS u
+    LEFT JOIN Posts AS p
+      ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments AS c
+      ON u.Id = c.UserId
+    LEFT JOIN Votes AS v
+      ON u.Id = v.UserId
+    LEFT JOIN Badges AS b
+      ON u.Id = b.UserId
+    WHERE
+      u.Reputation > 1000 AND u.CreationDate < '2023-01-01'
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation
+  ),
+  HotQuestions AS (
+    SELECT
+      p.Id AS PostId,
+      p.Title,
+      p.Score,
+      p.ViewCount,
+      p.AnswerCount,
+      p.CreationDate,
+      ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.ViewCount DESC) AS HotRank
+    FROM Posts AS p
+    WHERE
+      p.PostTypeId = 1 AND p.Score > 50 AND p.AnswerCount > 10 AND p.CreationDate > '2022-01-01'
+  ),
+  TagPopularity AS (
+    SELECT
+      t.TagName,
+      COUNT(DISTINCT p.Id) AS TaggedPostCount,
+      SUM(p.Score) AS TotalTagScore,
+      AVG(CAST(p.AnswerCount AS FLOAT)) AS AverageTagAnswerCount
+    FROM Tags AS t
+    JOIN Posts AS p
+      ON CHARINDEX('>' + t.TagName + '<', '>' + p.Tags + '<') > 0
+    WHERE
+      p.PostTypeId = 1 AND p.Tags IS NOT NULL
+    GROUP BY
+      t.TagName
+    HAVING
+      COUNT(DISTINCT p.Id) > 100
+  ),
+  TopUsersWithBadges AS (
+    SELECT
+      ue.UserId,
+      ue.DisplayName,
+      ue.TotalPosts,
+      ue.BadgeCount,
+      ue.BadgeRank
+    FROM UserEngagement AS ue
+    WHERE
+      ue.BadgeRank <= 50
+  ),
+  QuestionAnswerRatio AS (
+    SELECT
+      ue.UserId,
+      ue.DisplayName,
+      CASE
+        WHEN ue.QuestionCount = 0 THEN NULL
+        ELSE CAST(ue.AnswerCount AS FLOAT) / ue.QuestionCount
+      END AS AnswerToQuestionRatio
+    FROM UserEngagement AS ue
+    WHERE
+      ue.QuestionCount > 0
+  )
+SELECT
+  t.TagName,
+  tp.TaggedPostCount,
+  tp.TotalTagScore,
+  tp.AverageTagAnswerCount,
+  hq.Title AS HottestQuestion,
+  hq.Score AS HottestQuestionScore,
+  hq.ViewCount AS HottestQuestionViews,
+  tbu.DisplayName AS TopBadgeUser,
+  tbu.TotalPosts AS TopBadgeUserPosts,
+  qav.DisplayName AS HighAnswerRatioUser,
+  qav.AnswerToQuestionRatio
+FROM TagPopularity AS tp
+LEFT JOIN Tags AS t
+  ON tp.TagName = t.TagName
+LEFT JOIN (
+  SELECT
+    *
+  FROM HotQuestions
+  WHERE
+    HotRank = 1
+) AS hq
+  ON 1 = 1
+LEFT JOIN TopUsersWithBadges AS tbu
+  ON tbu.BadgeRank = 1
+LEFT JOIN QuestionAnswerRatio AS qav
+  ON qav.AnswerToQuestionRatio > 3.0
+WHERE
+  tp.TagName IN ('sql', 'performance', 'query-optimization', 'postgresql', 'mysql')
+UNION ALL
+SELECT
+  NULL AS TagName,
+  NULL AS TaggedPostCount,
+  NULL AS TotalTagScore,
+  NULL AS AverageTagAnswerCount,
+  hq.Title,
+  hq.Score,
+  hq.ViewCount,
+  tbu.DisplayName AS TopBadgeUser,
+  tbu.TotalPosts,
+  qav.DisplayName AS HighAnswerRatioUser,
+  qav.AnswerToQuestionRatio
+FROM HotQuestions AS hq
+JOIN UserEngagement AS ue
+  ON hq.HotRank = 1
+LEFT JOIN TopUsersWithBadges AS tbu
+  ON ue.UserId = tbu.UserId
+LEFT JOIN QuestionAnswerRatio AS qav
+  ON ue.UserId = qav.UserId
+WHERE
+  hq.HotRank = 1 AND hq.ViewCount > 10000;

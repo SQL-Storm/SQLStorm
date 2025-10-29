@@ -1,0 +1,195 @@
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS TotalUpVotesGiven,
+        U.DownVotes AS TotalDownVotesGiven,
+        U.CreationDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT Q.Id) FILTER (WHERE Q.PostTypeId = 1) AS TotalQuestions,
+        COUNT(DISTINCT A.Id) FILTER (WHERE A.PostTypeId = 2) AS TotalAnswers,
+        COALESCE(SUM(P.Score), 0) AS TotalPostScore,
+        COALESCE(SUM(P.ViewCount), 0) AS TotalPostViews,
+        COALESCE(SUM(P.FavoriteCount), 0) AS TotalPostFavorites,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        CAST(U.Reputation AS numeric) / NULLIF(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - U.CreationDate)) / (60 * 60 * 24), 0) AS ReputationPerDay,
+        MAX(CASE WHEN PH_User.PostHistoryTypeId IN (4,5,6) THEN 1 ELSE 0 END) AS HasEditedPosts,
+        MAX(CASE WHEN PH_User.PostHistoryTypeId IN (10,12) THEN 1 ELSE 0 END) AS HasClosedOrDeletedOwnPost
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Posts Q ON U.Id = Q.OwnerUserId AND Q.PostTypeId = 1
+    LEFT JOIN Posts A ON U.Id = A.OwnerUserId AND A.PostTypeId = 2
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN PostHistory PH_User ON U.Id = PH_User.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.Views, U.UpVotes, U.DownVotes, U.CreationDate
+),
+UserBadgeCounts AS (
+    SELECT
+        B.UserId,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadgesCount,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadgesCount,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadgesCount
+    FROM Badges B
+    GROUP BY B.UserId
+),
+RelevantTags AS (
+    SELECT DISTINCT TagName
+    FROM Tags
+    WHERE TagName ILIKE '%sql%'
+       OR TagName ILIKE '%python%'
+       OR TagName ILIKE '%java%'
+       OR TagName ILIKE '%javascript%'
+       OR TagName ILIKE '%c#%'
+       OR TagName ILIKE '%azure%'
+       OR TagName ILIKE '%aws%'
+       OR TagName ILIKE '%docker%'
+       OR TagName ILIKE '%kubernetes%'
+       OR TagName ILIKE '%react%'
+       OR TagName ILIKE '%angular%'
+       OR TagName ILIKE '%linux%'
+       OR TagName ILIKE '%windows-server%'
+       OR TagName ILIKE '%database%'
+),
+PostQualityMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount AS PostViewCount,
+        P.AnswerCount AS PostAnswerCount,
+        P.FavoriteCount AS PostFavoriteCount,
+        P.ParentId,
+        P.AcceptedAnswerId,
+        P.Tags,
+        P.Title,
+        P.ClosedDate,
+        P.Body,
+        P.LastEditorUserId,
+        COUNT(DISTINCT CO.Id) AS CommentCountOnPost,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesOnPost,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesOnPost,
+        MAX(CASE WHEN PH_Post.PostHistoryTypeId IN (4,5,6) THEN 1 ELSE 0 END) AS WasEdited,
+        MAX(CASE WHEN PH_Post.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS WasClosed,
+        MAX(CASE WHEN PH_Post.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS WasReopened,
+        MAX(CASE WHEN PH_Post.PostHistoryTypeId = 10 AND CR.Name = 'Duplicate' THEN 1 ELSE 0 END) AS WasClosedAsDuplicate,
+        ROW_NUMBER() OVER (PARTITION BY P.ParentId ORDER BY P.Score DESC, P.CreationDate ASC) AS AnswerScoreRank,
+        EXISTS (SELECT 1 FROM Badges B WHERE B.UserId = P.OwnerUserId AND B.Class = 1) AS OwnerHasGoldBadge,
+        (SELECT U.Reputation FROM Users U WHERE U.Id = P.LastEditorUserId) AS LastEditorReputation,
+        CAST(LENGTH(P.Body) - LENGTH(REPLACE(LOWER(P.Body), 'code', '')) AS NUMERIC) / NULLIF(LENGTH('code'),0) / NULLIF(LENGTH(P.Body), 0) AS CodeKeywordDensity
+    FROM Posts P
+    LEFT JOIN Comments CO ON P.Id = CO.PostId
+    LEFT JOIN Votes V ON P.Id = V.PostId
+    LEFT JOIN PostHistory PH_Post ON P.Id = PH_Post.PostId
+    LEFT JOIN CloseReasonTypes CR ON PH_Post.PostHistoryTypeId = 10 AND PH_Post.Comment = CAST(CR.Id AS varchar)
+    GROUP BY P.Id, P.PostTypeId, P.OwnerUserId, P.CreationDate, P.Score, P.ViewCount, P.AnswerCount, P.FavoriteCount, P.ParentId, P.AcceptedAnswerId, P.Tags, P.Title, P.ClosedDate, P.Body, P.LastEditorUserId
+),
+CommunityImpact AS (
+    SELECT
+        Q.PostId AS QuestionId,
+        Q.OwnerUserId AS QuestionOwnerId,
+        Q.PostCreationDate AS QuestionCreationDate,
+        Q.PostScore AS QuestionScore,
+        Q.PostViewCount AS QuestionViewCount,
+        Q.PostAnswerCount AS QuestionAnswerCount,
+        Q.CommentCountOnPost AS QuestionCommentCount,
+        Q.Tags AS QuestionTags,
+        Q.Title AS QuestionTitle,
+        A.PostId AS AnswerId,
+        A.OwnerUserId AS AnswerOwnerId,
+        A.PostCreationDate AS AnswerCreationDate,
+        A.PostScore AS AnswerScore,
+        A.CommentCountOnPost AS AnswerCommentCount,
+        A.UpVotesOnPost AS AnswerUpVotes,
+        A.DownVotesOnPost AS AnswerDownVotes,
+        A.AnswerScoreRank,
+        (Q.AcceptedAnswerId = A.PostId) AS IsAcceptedAnswer,
+        (A.PostScore * 10 + A.CommentCountOnPost * 5 - A.DownVotesOnPost * 2 + (CASE WHEN Q.AcceptedAnswerId = A.PostId THEN 50 ELSE 0 END)) AS AnswerEngagementScore,
+        COALESCE(A.LastEditorReputation, 0) AS AnswerLastEditorReputation,
+        (CASE WHEN Q.Title ILIKE '%issue%' OR Q.Title ILIKE '%problem%' THEN 1 ELSE 0 END) AS IsProblemQuestion,
+        EXISTS (SELECT 1 FROM PostLinks PL WHERE PL.PostId = Q.PostId AND PL.LinkTypeId = 3) AS HasDuplicateLink
+    FROM PostQualityMetrics Q
+    INNER JOIN PostQualityMetrics A ON Q.PostId = A.ParentId
+    WHERE Q.PostTypeId = 1 AND A.PostTypeId = 2
+      AND Q.PostScore > 0
+      AND A.PostScore >= 0
+      AND Q.PostViewCount > 100
+      AND Q.PostAnswerCount > 0
+)
+SELECT
+    UE.UserId,
+    UE.DisplayName,
+    UE.Reputation,
+    UE.ReputationPerDay,
+    COALESCE(UBC.GoldBadgesCount, 0) AS GoldBadgesCount,
+    COALESCE(UBC.SilverBadgesCount, 0) AS SilverBadgesCount,
+    COALESCE(UBC.BronzeBadgesCount, 0) AS BronzeBadgesCount,
+    UE.TotalQuestions,
+    UE.TotalAnswers,
+    UE.TotalPostScore,
+    UE.HasEditedPosts,
+    UE.HasClosedOrDeletedOwnPost,
+    CI.QuestionId,
+    CI.QuestionTitle,
+    CI.QuestionScore,
+    CI.QuestionViewCount,
+    CI.QuestionCommentCount,
+    CI.QuestionTags,
+    CI.AnswerId,
+    CI.AnswerScore,
+    CI.AnswerCommentCount,
+    CI.AnswerUpVotes,
+    CI.AnswerDownVotes,
+    CI.IsAcceptedAnswer,
+    CI.AnswerEngagementScore,
+    CI.AnswerLastEditorReputation,
+    CI.IsProblemQuestion,
+    CI.HasDuplicateLink,
+    PQM.CodeKeywordDensity AS QuestionCodeKeywordDensity,
+    RANK() OVER (PARTITION BY EXTRACT(YEAR FROM UE.CreationDate) ORDER BY AVG(CI.AnswerEngagementScore) DESC NULLS LAST) AS UserAvgAnswerEngagementRank
+FROM UserEngagement UE
+LEFT JOIN UserBadgeCounts UBC ON UE.UserId = UBC.UserId
+INNER JOIN CommunityImpact CI ON UE.UserId = CI.AnswerOwnerId
+INNER JOIN PostQualityMetrics PQM ON CI.QuestionId = PQM.PostId
+WHERE
+    CI.QuestionCreationDate BETWEEN DATE '2022-01-01' AND DATE '2023-12-31'
+    AND CI.IsAcceptedAnswer = TRUE
+    AND UE.UserProfileViews > 100
+    AND NOT EXISTS (
+        SELECT 1
+        FROM Votes V_inner
+        WHERE V_inner.PostId = CI.AnswerId
+          AND V_inner.VoteTypeId = 4
+          AND V_inner.UserId IS NOT NULL
+    )
+    AND (UE.TotalPosts > 50 AND (UE.TotalPostScore > 500 OR EXISTS (SELECT 1 FROM Posts P_inner WHERE P_inner.OwnerUserId = UE.UserId AND P_inner.Id = P_inner.AcceptedAnswerId)))
+    AND UE.ReputationPerDay > 0.5
+    AND UE.HasEditedPosts = 1
+    AND EXISTS (
+        SELECT 1
+        FROM UNNEST(STRING_TO_ARRAY(SUBSTRING(CI.QuestionTags, 2, LENGTH(CI.QuestionTags)-2), '><')) AS tag_name(tag)
+        JOIN RelevantTags RT ON LOWER(tag_name.tag) LIKE '%' || LOWER(RT.TagName) || '%'
+    )
+    AND CI.AnswerScoreRank = 1
+    AND CI.AnswerEngagementScore > 100
+    AND PQM.CodeKeywordDensity IS NOT NULL AND PQM.CodeKeywordDensity > 0.001
+    AND NOT PQM.WasClosed
+    AND PQM.WasClosedAsDuplicate = 0
+GROUP BY
+    UE.UserId, UE.DisplayName, UE.Reputation, UE.ReputationPerDay, UBC.GoldBadgesCount, UBC.SilverBadgesCount, UBC.BronzeBadgesCount,
+    UE.TotalQuestions, UE.TotalAnswers, UE.TotalPostScore, UE.HasEditedPosts, UE.HasClosedOrDeletedOwnPost, UE.CreationDate,
+    CI.QuestionId, CI.QuestionTitle, CI.QuestionScore, CI.QuestionViewCount, CI.QuestionCommentCount,
+    CI.QuestionTags, CI.AnswerId, CI.AnswerScore, CI.AnswerCommentCount, CI.AnswerUpVotes,
+    CI.AnswerDownVotes, CI.IsAcceptedAnswer, CI.AnswerEngagementScore, CI.AnswerLastEditorReputation,
+    CI.IsProblemQuestion, CI.HasDuplicateLink, PQM.CodeKeywordDensity, PQM.WasClosedAsDuplicate
+HAVING
+    COUNT(DISTINCT CI.AnswerId) > 1
+    AND AVG(CI.AnswerEngagementScore) > 150
+ORDER BY
+    UserAvgAnswerEngagementRank ASC,
+    UE.Reputation DESC,
+    AVG(CI.AnswerEngagementScore) DESC
+LIMIT 100;

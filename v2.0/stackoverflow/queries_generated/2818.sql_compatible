@@ -1,0 +1,199 @@
+with recursive RecursiveCTE as (
+    select
+        p.Id as PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.CreationDate,
+        p.LastActivityDate,
+        1 as Level,
+        cast(p.Id as varchar(255)) as Path
+    from Posts p
+    where p.PostTypeId = 1
+    
+    union all
+    
+    select
+        c.Id as PostId,
+        c.PostTypeId,
+        c.OwnerUserId,
+        c.Score,
+        c.ViewCount,
+        c.Title,
+        c.Tags,
+        c.AcceptedAnswerId,
+        c.CreationDate,
+        c.LastActivityDate,
+        r.Level + 1 as Level,
+        r.Path || '->' || cast(c.Id as varchar(255)) as Path
+    from Posts c
+    inner join RecursiveCTE r on c.ParentId = r.PostId and c.PostTypeId = 2
+    where r.Level < 3
+),
+
+UserBadgeCounts as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(case when b.Class = 1 then 1 end) as GoldBadges,
+        count(case when b.Class = 2 then 1 end) as SilverBadges,
+        count(case when b.Class = 3 then 1 end) as BronzeBadges,
+        coalesce(max(b.Date), timestamp '1970-01-01') as LastBadgeDate
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    group by u.Id, u.DisplayName
+),
+
+PostScoresAndVotes as (
+    select
+        p.Id as PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        coalesce(sum(case when v.VoteTypeId = 2 then 1 else 0 end),0) as UpVotesCount,
+        coalesce(sum(case when v.VoteTypeId = 3 then 1 else 0 end),0) as DownVotesCount,
+        coalesce(sum(v.BountyAmount),0) as TotalBounty,
+        p.Tags
+    from Posts p
+    left join Votes v on p.Id = v.PostId
+    group by p.Id, p.PostTypeId, p.OwnerUserId, p.Title, p.Score, p.ViewCount, p.Tags
+),
+
+QuestionsWithDupes as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.Tags,
+        dupe.PostId as DuplicatePostId,
+        dupe.RelatedPostId as DuplicateOf,
+        dupe.CreationDate as DupeLinkDate
+    from Posts q
+    left join PostLinks dupe on q.Id = dupe.PostId and dupe.LinkTypeId = 3
+    where q.PostTypeId = 1
+),
+
+RankedAnswers as (
+    select 
+        p.Id,
+        p.ParentId,
+        p.Score,
+        p.CreationDate,
+        row_number() over (partition by p.ParentId order by p.Score desc, p.CreationDate asc) as AnswerRank
+    from Posts p
+    where p.PostTypeId = 2
+),
+
+FilteredPostHistory as (
+    select
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        pht.Name as HistoryTypeName,
+        ph.CreationDate,
+        ph.UserId,
+        ph.UserDisplayName,
+        ph.Text,
+        ph.Comment
+    from PostHistory ph
+    inner join PostHistoryTypes pht on ph.PostHistoryTypeId = pht.Id
+    where ph.PostHistoryTypeId in (10, 11, 12, 13)
+),
+
+CloseEventsCount as (
+    select
+        ph.PostId,
+        sum(case when ph.PostHistoryTypeId = 10 then 1 else 0 end) as CloseCount,
+        sum(case when ph.PostHistoryTypeId = 11 then 1 else 0 end) as ReopenCount,
+        sum(case when ph.PostHistoryTypeId = 12 then 1 else 0 end) as DeleteCount,
+        sum(case when ph.PostHistoryTypeId = 13 then 1 else 0 end) as UndeleteCount
+    from PostHistory ph
+    group by ph.PostId
+),
+
+HighScoreAnswers as (
+    select
+        a.ParentId as QuestionId,
+        count(*) as HighScoreAnswerCount
+    from Posts a
+    where a.PostTypeId = 2 and a.Score > 10
+    group by a.ParentId
+),
+
+UserActivitySummary as (
+    select
+        u.Id,
+        u.DisplayName,
+        sum(case when p.PostTypeId = 1 then 1 else 0 end) as QuestionCount,
+        sum(case when p.PostTypeId = 2 then 1 else 0 end) as AnswerCount,
+        count(distinct c.Id) as CommentCount,
+        max(p.CreationDate) as LastPostDate,
+        max(c.CreationDate) as LastCommentDate,
+        sum(p.Score) as TotalPostScore,
+        sum(coalesce(v.UpVotes,0)) as TotalUpVotes,
+        sum(coalesce(v.DownVotes,0)) as TotalDownVotes
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join (
+        select 
+            p.OwnerUserId,
+            sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+            sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes
+        from Posts p
+        left join Votes v on p.Id = v.PostId
+        group by p.OwnerUserId
+    ) v on v.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName
+)
+
+select
+    q.Id as QuestionId,
+    q.Title,
+    q.Tags,
+    us.DisplayName as QuestionOwner,
+    us.QuestionCount,
+    us.AnswerCount,
+    us.CommentCount,
+    us.TotalPostScore,
+    bcs.GoldBadges,
+    bcs.SilverBadges,
+    bcs.BronzeBadges,
+    bcs.LastBadgeDate,
+    psav.UpVotesCount,
+    psav.DownVotesCount,
+    psav.TotalBounty,
+    dup.DuplicateOf,
+    coalesce(close.CloseCount, 0) as TimesClosed,
+    coalesce(close.ReopenCount, 0) as TimesReopened,
+    coalesce(close.DeleteCount, 0) as TimesDeleted,
+    coalesce(close.UndeleteCount, 0) as TimesUndeleted,
+    ha.HighScoreAnswerCount,
+    ra.AnswerRank,
+    ra.Score as AnswerScore,
+    ra.Id as AnswerId,
+    case 
+        when q.Tags is null or q.Tags = '' then 'NoTags' 
+        else regexp_replace(q.Tags, '[<>\s]', '', 'g') 
+    end as CleanTags,
+    rank() over (order by q.Score desc NULLS LAST) as QuestionScoreRank,
+    (select count(distinct a.OwnerUserId) 
+        from Posts a 
+        where a.ParentId = q.Id and a.PostTypeId = 2 and a.OwnerUserId is not null
+    ) as UniqueAnswerersCount
+from Posts q
+inner join Users us on q.OwnerUserId = us.Id
+left join UserBadgeCounts bcs on us.Id = bcs.UserId
+left join PostScoresAndVotes psav on q.Id = psav.PostId
+left join QuestionsWithDupes dup on q.Id = dup.QuestionId
+left join CloseEventsCount close on q.Id = close.PostId
+left join HighScoreAnswers ha on q.Id = ha.QuestionId
+left join RankedAnswers ra on ra.ParentId = q.Id and ra.AnswerRank = 1
+where q.PostTypeId = 1
+  and (q.Score > 5 or q.ViewCount > 1000)
+order by q.Score desc, q.ViewCount desc
+limit 100;

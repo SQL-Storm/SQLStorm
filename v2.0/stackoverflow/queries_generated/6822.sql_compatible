@@ -1,0 +1,55 @@
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    MAX(u.CreationDate) AS LatestAccountActivity,
+    MAX(p.LastActivityDate) AS LatestPostActivity,
+    b.Class AS BadgeClass,
+    t.TagName
+FROM 
+    Users u
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    (SELECT 
+         p.OwnerUserId, 
+         STRING_AGG(t.TagName, ', ') AS TagNames
+     FROM 
+         Posts p
+     JOIN 
+         Tags t ON t.ExcerptPostId = p.Id
+     GROUP BY 
+         p.OwnerUserId) t ON u.Id = t.OwnerUserId
+JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    (SELECT 
+         ph.PostId, 
+         ph.PostHistoryTypeId,
+         ph.RevisionGUID,
+         ph.CreationDate,
+         CASE 
+             WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20) THEN
+               -- Replace JSON_EXTRACT(text, path) with standard JSON functions.
+               -- Try JSON_VALUE for SQL Server / use ->> for Postgres; here use JSON_VALUE which is common in many RDBMSs.
+               JSON_VALUE(ph.Text, '$[0].UserId')
+             ELSE NULL 
+         END AS CloseReasonUserId
+     FROM 
+         PostHistory ph
+     WHERE 
+         ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20)
+    ) cp ON p.Id = cp.PostId
+WHERE 
+    u.Reputation > 1000
+    AND (u.LastAccessDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30' DAY) OR u.LastAccessDate IS NULL)
+    AND (p.Score > 0 OR p.PostTypeId IN (1, 2))
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, b.Class, t.TagNames
+HAVING 
+    AVG(p.Score) > 10
+ORDER BY 
+    u.Reputation DESC, 
+    TotalPosts DESC;

@@ -1,0 +1,123 @@
+-- {"query": "3107.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1952} 
+
+/*  Comprehensive benchmark query for the StackOverflow schema  */
+WITH UserPostStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id)                                          AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END)    AS Questions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END)    AS Answers,
+        AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL)     AS AvgScore,
+        MAX(p.CreationDate)                                 AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p
+        ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1)                 AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2)                 AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3)                 AS BronzeBadges,
+        COUNT(*) FILTER (WHERE b.TagBased = 1)              AS TagBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+UserTagActivity AS (
+    SELECT
+        up.Id                                            AS UserId,
+        STRING_AGG(DISTINCT t.TagName, ',')              AS TagsUsed,
+        COUNT(DISTINCT t.Id)                             AS DistinctTags
+    FROM UserPostStats up
+    JOIN Posts p
+        ON p.OwnerUserId = up.Id
+        AND p.PostTypeId = 1               -- only questions
+        AND p.Tags IS NOT NULL
+    CROSS JOIN LATERAL regexp_split_to_table(p.Tags, '[><]+') AS tag_raw
+    JOIN Tags t
+        ON t.TagName = trim(both '<>' FROM tag_raw)
+    GROUP BY up.Id
+),
+
+UserRankings AS (
+    SELECT
+        up.Id,
+        up.DisplayName,
+        up.Reputation,
+        up.TotalPosts,
+        up.AvgScore,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ub.TagBadges,
+        uta.TagsUsed,
+        ROW_NUMBER() OVER (ORDER BY up.Reputation DESC, up.TotalPosts DESC) AS ReputationRank,
+        RANK()        OVER (ORDER BY
+            (COALESCE(up.AvgScore,0) *
+                (COALESCE(ub.GoldBadges,0)*5 +
+                 COALESCE(ub.SilverBadges,0)*2 +
+                 COALESCE(ub.BronzeBadges,0))) DESC)                     AS ContributionRank
+    FROM UserPostStats up
+    LEFT JOIN UserBadgeCounts ub   ON ub.UserId   = up.Id
+    LEFT JOIN UserTagActivity uta  ON uta.UserId  = up.Id
+)
+
+SELECT
+    ur.Id,
+    ur.DisplayName,
+    ur.Reputation,
+    ur.TotalPosts,
+    ur.AvgScore,
+    ur.GoldBadges,
+    ur.SilverBadges,
+    ur.BronzeBadges,
+    ur.TagBadges,
+    ur.TagsUsed,
+    ur.ReputationRank,
+    ur.ContributionRank,
+    /* Correlated sub‑query: latest comment text by the user (if any) */
+    (SELECT c.Text
+       FROM Comments c
+      WHERE c.UserId = ur.Id
+      ORDER BY c.CreationDate DESC
+      LIMIT 1)                                            AS LatestComment,
+    /* Correlated sub‑query: most recent vote type on any of the user’s posts */
+    (SELECT vt.Name
+       FROM Votes v
+       JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+       JOIN Posts p ON p.Id = v.PostId
+      WHERE p.OwnerUserId = ur.Id
+      ORDER BY v.CreationDate DESC
+      LIMIT 1)                                            AS LatestVoteType
+FROM UserRankings ur
+WHERE ur.ReputationRank <= 100
+   OR ur.ContributionRank <= 50
+
+UNION ALL
+
+/*  Users without posts but with a respectable reputation – demonstrates outer joins & set operator  */
+SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    0                                    AS TotalPosts,
+    NULL                                 AS AvgScore,
+    0                                    AS GoldBadges,
+    0                                    AS SilverBadges,
+    0                                    AS BronzeBadges,
+    0                                    AS TagBadges,
+    NULL                                 AS TagsUsed,
+    NULL                                 AS ReputationRank,
+    NULL                                 AS ContributionRank,
+    NULL                                 AS LatestComment,
+    NULL                                 AS LatestVoteType
+FROM Users u
+WHERE NOT EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id)
+  AND u.Reputation > 1000
+ORDER BY Reputation DESC
+LIMIT 200;

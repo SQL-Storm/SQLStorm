@@ -1,0 +1,247 @@
+WITH UserStats AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName AS UserDisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - U.CreationDate)) / (60*60*24) AS UserAgeDays,
+        COALESCE(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - U.LastAccessDate)) / (60*60*24), 0) AS DaysSinceLastAccess,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsOwned,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersOwned,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(CASE WHEN V_Rec.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesReceivedOnPosts,
+        SUM(CASE WHEN V_Rec.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesReceivedOnPosts
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    LEFT JOIN Badges AS B ON U.Id = B.UserId
+    LEFT JOIN Votes AS V_Rec ON P.Id = V_Rec.PostId AND V_Rec.VoteTypeId IN (2, 3)
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate
+),
+PostCoreMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.Title,
+        P.Body,
+        P.CreationDate AS PostCreationDate,
+        P.LastActivityDate,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.OwnerUserId,
+        P.AcceptedAnswerId,
+        P.ParentId,
+        (P.AcceptedAnswerId IS NOT NULL) AS HasAcceptedAnswer,
+        COALESCE(P.ClosedDate IS NOT NULL, FALSE) AS IsClosed,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - P.CreationDate)) / (60*60*24) AS PostAgeDays,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - P.LastActivityDate)) / (60*60) AS TimeSinceLastActivityHours,
+        COALESCE(string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><'), CAST(ARRAY[] AS text[])) AS TagArray,
+        CASE
+            WHEN LENGTH(P.Title) > 100 THEN LEFT(P.Title, 97) || '...'
+            ELSE P.Title
+        END AS ShortTitlePreview
+    FROM Posts AS P
+    INNER JOIN PostTypes AS PT ON P.PostTypeId = PT.Id
+    WHERE P.PostTypeId IN (1, 2)
+    AND P.OwnerUserId IS NOT NULL
+),
+PostEditAnalysis AS (
+    SELECT
+        PostId,
+        COUNT(Id) AS TotalEditHistoryEntries,
+        COUNT(DISTINCT UserId) AS UniqueEditors,
+        MAX(CreationDate) AS LatestEditDate,
+        MIN(CreationDate) AS EarliestEditDate,
+        AVG(CASE WHEN prev_user_id = UserId THEN edit_diff_seconds ELSE NULL END) / (60*60) AS AvgTimeBetweenUserEditsHours,
+        MAX(CASE WHEN edit_diff_seconds IS NOT NULL AND edit_diff_seconds < 300 AND prev_user_id = UserId THEN 1 ELSE 0 END) AS HasRapidSelfEdit
+    FROM (
+        SELECT
+            PH.PostId,
+            PH.Id,
+            PH.UserId,
+            PH.CreationDate,
+            LAG(PH.CreationDate) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) AS prev_edit_date,
+            LAG(PH.UserId) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) AS prev_user_id,
+            EXTRACT(EPOCH FROM (PH.CreationDate - LAG(PH.CreationDate) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate))) AS edit_diff_seconds
+        FROM PostHistory AS PH
+        WHERE PH.PostHistoryTypeId IN (4, 5, 6)
+    ) AS EditDifferences
+    GROUP BY PostId
+),
+QuestionAnswerContext AS (
+    SELECT
+        PCM.PostId,
+        PCM.PostTypeId,
+        PCM.AcceptedAnswerId,
+        PCM.ParentId,
+        (SELECT A.Score FROM Posts AS A WHERE A.Id = PCM.AcceptedAnswerId) AS AcceptedAnswerScore,
+        (SELECT UA.Reputation FROM Posts AS A JOIN Users AS UA ON A.OwnerUserId = UA.Id WHERE A.Id = PCM.AcceptedAnswerId) AS AcceptedAnswerOwnerReputation,
+        (SELECT Q.Score FROM Posts AS Q WHERE Q.Id = PCM.ParentId) AS ParentQuestionScore,
+        (SELECT Q.ViewCount FROM Posts AS Q WHERE Q.Id = PCM.ParentId) AS ParentQuestionViewCount,
+        (SELECT CASE WHEN Q.OwnerUserId IS NOT NULL AND A.OwnerUserId IS NOT NULL THEN (Q.OwnerUserId <> A.OwnerUserId) ELSE NULL END
+         FROM Posts AS Q JOIN Posts AS A ON Q.AcceptedAnswerId = A.Id
+         WHERE Q.Id = PCM.PostId AND Q.AcceptedAnswerId IS NOT NULL
+        ) AS IsAcceptedAnswerByDifferentUser
+    FROM PostCoreMetrics AS PCM
+),
+WeightedTagMetrics AS (
+    SELECT
+        TagName,
+        COUNT(DISTINCT PostId) AS TaggedPostCount,
+        AVG(Score) AS AvgScoreForTag,
+        AVG(ViewCount) AS AvgViewCountForTag,
+        AVG(CommentCount) AS AvgCommentCountForTag,
+        (AVG(Score) * 0.7 + AVG(ViewCount) * 0.3) * LOG(COUNT(DISTINCT PostId) + 1) AS WeightedTagScore,
+        RANK() OVER (ORDER BY (AVG(Score) * 0.7 + AVG(ViewCount) * 0.3) * LOG(COUNT(DISTINCT PostId) + 1) DESC) AS TagRankByWeightedScore
+    FROM PostCoreMetrics
+    CROSS JOIN LATERAL UNNEST(TagArray) AS t(TagName)
+    WHERE TagArray IS NOT NULL AND array_length(TagArray, 1) > 0
+    GROUP BY TagName
+),
+HighImpactPosts AS (
+    SELECT
+        PCM.PostId,
+        PCM.OwnerUserId,
+        PCM.PostTypeName,
+        PCM.ShortTitlePreview,
+        PCM.Score,
+        PCM.ViewCount,
+        PCM.CommentCount,
+        US.Reputation AS OwnerReputation,
+        US.TotalPostsOwned,
+        US.DaysSinceLastAccess,
+        PEA.TotalEditHistoryEntries,
+        PEA.UniqueEditors,
+        PEA.AvgTimeBetweenUserEditsHours,
+        PEA.HasRapidSelfEdit,
+        QAC.AcceptedAnswerScore,
+        QAC.AcceptedAnswerOwnerReputation,
+        QAC.ParentQuestionScore,
+        QAC.ParentQuestionViewCount,
+        QAC.IsAcceptedAnswerByDifferentUser,
+        COALESCE(SUM(WTM.WeightedTagScore), 0.0) AS TotalWeightedTagInfluence,
+        COUNT(DISTINCT WTM.TagName) AS NumTagsOnPost,
+        (PCM.Score * 0.5 + PCM.ViewCount * 0.3 + PCM.CommentCount * 0.2) AS PostEngagementIndex,
+        COALESCE(US.UserDisplayName, 'Community User') AS EffectiveOwnerDisplayName,
+        RANK() OVER (PARTITION BY PCM.PostTypeId ORDER BY (PCM.Score * 0.5 + PCM.ViewCount * 0.3 + PCM.CommentCount * 0.2) DESC) AS RankWithinPostType,
+        AVG(PCM.Score * 0.5 + PCM.ViewCount * 0.3 + PCM.CommentCount * 0.2) OVER (PARTITION BY PCM.OwnerUserId) AS AvgOwnerPostEngagement,
+        PCM.PostAgeDays,
+        PCM.TagArray,
+        PCM.PostCreationDate,
+        PCM.LastActivityDate,
+        US.DaysSinceLastAccess AS HIP_DaysSinceLastAccess
+    FROM PostCoreMetrics AS PCM
+    INNER JOIN UserStats AS US ON PCM.OwnerUserId = US.UserId
+    LEFT JOIN PostEditAnalysis AS PEA ON PCM.PostId = PEA.PostId
+    LEFT JOIN QuestionAnswerContext AS QAC ON PCM.PostId = QAC.PostId
+    LEFT JOIN LATERAL UNNEST(PCM.TagArray) AS PostTag(TagName) ON TRUE
+    LEFT JOIN WeightedTagMetrics AS WTM ON PostTag.TagName = WTM.TagName
+    GROUP BY
+        PCM.PostId, PCM.OwnerUserId, PCM.PostTypeName, PCM.ShortTitlePreview, PCM.Score, PCM.ViewCount, PCM.CommentCount,
+        US.Reputation, US.TotalPostsOwned, US.DaysSinceLastAccess, US.UserDisplayName,
+        PEA.TotalEditHistoryEntries, PEA.UniqueEditors, PEA.AvgTimeBetweenUserEditsHours, PEA.HasRapidSelfEdit,
+        QAC.AcceptedAnswerScore, QAC.AcceptedAnswerOwnerReputation, QAC.ParentQuestionScore, QAC.ParentQuestionViewCount, QAC.IsAcceptedAnswerByDifferentUser,
+        PCM.PostAgeDays, PCM.TagArray, PCM.PostCreationDate, PCM.LastActivityDate, US.DaysSinceLastAccess
+    HAVING (PCM.Score > 100 OR PCM.ViewCount > 5000)
+    AND US.Reputation > 500
+)
+SELECT
+    'Top Engaged Questions' AS AnalysisCategory,
+    HIP.PostId,
+    HIP.PostTypeName,
+    HIP.ShortTitlePreview,
+    HIP.Score,
+    HIP.ViewCount,
+    HIP.CommentCount,
+    HIP.OwnerReputation,
+    HIP.EffectiveOwnerDisplayName,
+    HIP.TotalWeightedTagInfluence,
+    HIP.NumTagsOnPost,
+    HIP.PostEngagementIndex,
+    HIP.RankWithinPostType,
+    HIP.AvgOwnerPostEngagement,
+    HIP.TotalEditHistoryEntries,
+    HIP.UniqueEditors,
+    HIP.HasRapidSelfEdit,
+    HIP.IsAcceptedAnswerByDifferentUser,
+    COALESCE(
+        NULLIF(HIP.AcceptedAnswerOwnerReputation, 0) / NULLIF(HIP.OwnerReputation, 0),
+        0.0
+    ) AS AcceptedAnswerOwnerReputationRatio,
+    (SELECT COUNT(DISTINCT V.UserId) FROM Votes V WHERE V.PostId = HIP.PostId AND V.VoteTypeId = 5) AS TotalFavoritesLegacy,
+    HIP.HIP_DaysSinceLastAccess AS DaysSinceLastAccess,
+    HIP.AcceptedAnswerScore,
+    HIP.AvgTimeBetweenUserEditsHours,
+    HIP.PostAgeDays,
+    HIP.PostCreationDate,
+    HIP.LastActivityDate
+FROM HighImpactPosts AS HIP
+WHERE HIP.PostTypeName = 'Question'
+AND HIP.PostEngagementIndex > 500
+AND HIP.RankWithinPostType <= 100
+AND HIP.HIP_DaysSinceLastAccess < 365
+AND HIP.TotalWeightedTagInfluence > 1000
+AND (HIP.UniqueEditors > 1 OR HIP.HasRapidSelfEdit = 1)
+AND NOT EXISTS (
+    SELECT 1 FROM PostLinks PL
+    WHERE PL.PostId = HIP.PostId
+    AND PL.LinkTypeId = 3
+)
+AND (HIP.ShortTitlePreview LIKE '%data%' OR HIP.ShortTitlePreview ILIKE '%sql%')
+AND HIP.AcceptedAnswerScore IS NOT NULL
+AND HIP.AvgTimeBetweenUserEditsHours IS NOT NULL
+AND HIP.AcceptedAnswerOwnerReputation IS NOT NULL
+AND HIP.OwnerReputation IS NOT NULL
+AND NOT (HIP.Score < -10 AND HIP.ViewCount > 10000)
+
+UNION ALL
+
+SELECT
+    'Highly Scored Answers by Active Users' AS AnalysisCategory,
+    HIP.PostId,
+    HIP.PostTypeName,
+    HIP.ShortTitlePreview,
+    HIP.Score,
+    HIP.ViewCount,
+    HIP.CommentCount,
+    HIP.OwnerReputation,
+    HIP.EffectiveOwnerDisplayName,
+    HIP.TotalWeightedTagInfluence,
+    HIP.NumTagsOnPost,
+    HIP.PostEngagementIndex,
+    HIP.RankWithinPostType,
+    HIP.AvgOwnerPostEngagement,
+    HIP.TotalEditHistoryEntries,
+    HIP.UniqueEditors,
+    HIP.HasRapidSelfEdit,
+    HIP.IsAcceptedAnswerByDifferentUser,
+    COALESCE(
+        NULLIF(HIP.Score, 0) / NULLIF(HIP.ParentQuestionScore, 0),
+        0.0
+    ) AS AnswerScoreToQuestionScoreRatio,
+    (SELECT COUNT(DISTINCT V.UserId) FROM Votes V WHERE V.PostId = HIP.PostId AND V.VoteTypeId = 5) AS TotalFavoritesLegacy,
+    HIP.HIP_DaysSinceLastAccess AS DaysSinceLastAccess,
+    HIP.ParentQuestionScore,
+    HIP.ParentQuestionViewCount,
+    HIP.PostAgeDays,
+    HIP.PostCreationDate,
+    HIP.LastActivityDate
+FROM HighImpactPosts AS HIP
+WHERE HIP.PostTypeName = 'Answer'
+AND HIP.Score > 50
+AND HIP.OwnerReputation > 10000
+AND HIP.HIP_DaysSinceLastAccess < 180
+AND HIP.ParentQuestionScore IS NOT NULL
+AND HIP.ParentQuestionViewCount IS NOT NULL
+AND HIP.PostAgeDays < 730
+AND HIP.TotalEditHistoryEntries > 0
+AND NOT (HIP.PostEngagementIndex < HIP.AvgOwnerPostEngagement * 0.5 AND HIP.Score < 100)
+ORDER BY PostEngagementIndex DESC, AnalysisCategory, PostId
+LIMIT 200;

@@ -1,0 +1,141 @@
+WITH PostScores AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        SUM(COALESCE(c.Score, 0)) AS TotalCommentScore,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        AVG(COALESCE(c.Score, 0)) AS AvgCommentScore,
+        ROW_NUMBER() OVER(ORDER BY p.Score DESC, p.CreationDate DESC) AS ScoreRank,
+        RANK() OVER(PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS PostTypeScoreRank
+    FROM Posts p
+    LEFT JOIN Comments c
+        ON p.Id = c.PostId
+    WHERE p.PostTypeId IN (1, 2) AND p.Score > 10
+    GROUP BY
+        p.Id,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate,
+        p.Score
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT ph.Id) AS PostHistoryCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 5 THEN 1 ELSE 0 END) AS BodyEditCount,
+        MAX(ph.CreationDate) AS LastPostHistoryDate
+    FROM Users u
+    INNER JOIN PostHistory ph
+        ON u.Id = ph.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate
+),
+PostDetails AS (
+    SELECT
+        ps.PostId,
+        ps.Title,
+        ps.OwnerUserId,
+        ps.Score,
+        ps.TotalCommentScore,
+        ps.CommentCount,
+        ps.AvgCommentScore,
+        u.DisplayName AS OwnerDisplayName,
+        u.Reputation AS OwnerReputation,
+        CAST((EXTRACT(EPOCH FROM (ps.CreationDate - u.CreationDate)) / 86400) AS INTEGER) AS DaysSinceUserCreation,
+        CASE WHEN ps.Title LIKE '%[Ss]tack[Oo]verflow%' THEN 'SO_Related' ELSE 'Other' END AS TitleCategory,
+        CASE WHEN ps.Score > 50 OR ps.TotalCommentScore > 100 THEN 'HighEngagement' ELSE 'Standard' END AS EngagementLevel
+    FROM PostScores ps
+    LEFT JOIN Users u
+        ON ps.OwnerUserId = u.Id
+    WHERE ps.ScoreRank <= 100
+    GROUP BY
+        ps.PostId,
+        ps.Title,
+        ps.OwnerUserId,
+        ps.Score,
+        ps.TotalCommentScore,
+        ps.CommentCount,
+        ps.AvgCommentScore,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        ps.CreationDate
+)
+SELECT
+    pd.PostId,
+    pd.Title,
+    pd.OwnerUserId,
+    pd.OwnerDisplayName,
+    pd.OwnerReputation,
+    pd.Score,
+    pd.TotalCommentScore,
+    pd.CommentCount,
+    pd.AvgCommentScore,
+    pd.DaysSinceUserCreation,
+    pd.TitleCategory,
+    pd.EngagementLevel,
+    COALESCE(ua.PostHistoryCount, 0) AS UserPostHistoryCount,
+    COALESCE(ua.BodyEditCount, 0) AS UserBodyEditCount,
+    ua.LastPostHistoryDate,
+    CASE
+        WHEN pd.Score > 100 AND pd.AvgCommentScore > 5 AND pd.CommentCount > 10 THEN 'Very Popular'
+        WHEN pd.Score > 50 AND pd.TotalCommentScore > 50 THEN 'Popular'
+        ELSE 'Standard'
+    END AS PostPopularity,
+    CASE
+        WHEN pd.OwnerReputation >= 10000 AND ua.PostHistoryCount > 50 THEN 'Experienced High Rep'
+        WHEN pd.OwnerReputation >= 1000 THEN 'Moderately Experienced'
+        ELSE 'Newer User'
+    END AS UserExperienceTier,
+    CAST(SUBSTRING(pd.Title FROM 1 FOR 10) AS VARCHAR(10)) AS TitlePrefix,
+    CASE
+        WHEN LOG(pd.Score + 1) > 2 THEN 'High Log Score'
+        ELSE 'Low Log Score'
+    END AS LogScoreCategory,
+    (ua.UserId IS NOT NULL) AS HasUserActivityEntry
+FROM PostDetails pd
+LEFT JOIN UserActivity ua
+    ON pd.OwnerUserId = ua.UserId
+WHERE
+    (
+      (pd.Score > 20 OR pd.TotalCommentScore > 30)
+      AND COALESCE(ua.PostHistoryCount,0) < 200
+      AND ua.LastPostHistoryDate > (cast('2024-10-01 12:34:56' as timestamp) AT TIME ZONE 'UTC') - INTERVAL '12 months'
+    )
+    OR pd.OwnerReputation > 50000
+UNION
+SELECT
+    pd.PostId,
+    pd.Title,
+    pd.OwnerUserId,
+    pd.OwnerDisplayName,
+    pd.OwnerReputation,
+    pd.Score,
+    pd.TotalCommentScore,
+    pd.CommentCount,
+    pd.AvgCommentScore,
+    pd.DaysSinceUserCreation,
+    pd.TitleCategory,
+    pd.EngagementLevel,
+    COALESCE(ua.PostHistoryCount, 0) AS UserPostHistoryCount,
+    COALESCE(ua.BodyEditCount, 0) AS UserBodyEditCount,
+    ua.LastPostHistoryDate,
+    'Standard' AS PostPopularity,
+    'Any' AS UserExperienceTier,
+    CAST(SUBSTRING(pd.Title FROM 1 FOR 10) AS VARCHAR(10)) AS TitlePrefix,
+    'Any Log Score' AS LogScoreCategory,
+    (ua.UserId IS NOT NULL) AS HasUserActivityEntry
+FROM PostDetails pd
+LEFT JOIN UserActivity ua
+    ON pd.OwnerUserId = ua.UserId
+WHERE pd.Score < 5 AND pd.TotalCommentScore < 10 AND COALESCE(ua.PostHistoryCount,0) > 100;

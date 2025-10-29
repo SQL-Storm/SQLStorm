@@ -1,0 +1,144 @@
+WITH UserPostStats AS (
+    SELECT 
+        u.Id                              AS UserId,
+        u.DisplayName,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN p.Id END)   AS QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN p.Id END)   AS AnswerCount,
+        SUM(COALESCE(p.Score,0))                          AS TotalPostScore,
+        MAX(p.CreationDate)                               AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+UserBadgeStats AS (
+    SELECT 
+        b.UserId,
+        COUNT(*)                                          AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END)      AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END)      AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END)      AS BronzeBadges,
+        STRING_AGG(DISTINCT b.Name, ',')                  AS BadgeList
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserVoteStats AS (
+    SELECT 
+        p.OwnerUserId                                    AS UserId,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END)     AS UpVotesReceived,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END)     AS DownVotesReceived,
+        COUNT(CASE WHEN v.VoteTypeId = 5 THEN 1 END)     AS FavoritesReceived
+    FROM Votes v
+    JOIN Posts p ON p.Id = v.PostId
+    GROUP BY p.OwnerUserId
+),
+UserCommentStats AS (
+    SELECT 
+        COALESCE(c.UserId, -1)                           AS UserId,
+        COUNT(*)                                         AS CommentCount,
+        MAX(c.CreationDate)                              AS LastCommentDate
+    FROM Comments c
+    GROUP BY COALESCE(c.UserId, -1)
+),
+Aggregated AS (
+    SELECT 
+        up.UserId,
+        up.DisplayName,
+        up.QuestionCount,
+        up.AnswerCount,
+        up.TotalPostScore,
+        up.LastPostDate,
+        COALESCE(ub.BadgeCount,0)                         AS BadgeCount,
+        COALESCE(ub.GoldBadges,0)                         AS GoldBadges,
+        COALESCE(ub.SilverBadges,0)                       AS SilverBadges,
+        COALESCE(ub.BronzeBadges,0)                       AS BronzeBadges,
+        ub.BadgeList,
+        COALESCE(uv.UpVotesReceived,0)                    AS UpVotesReceived,
+        COALESCE(uv.DownVotesReceived,0)                  AS DownVotesReceived,
+        COALESCE(uv.FavoritesReceived,0)                  AS FavoritesReceived,
+        COALESCE(uc.CommentCount,0)                       AS CommentCount,
+        uc.LastCommentDate
+    FROM UserPostStats up
+    LEFT JOIN UserBadgeStats ub   ON ub.UserId = up.UserId
+    LEFT JOIN UserVoteStats uv    ON uv.UserId = up.UserId
+    LEFT JOIN UserCommentStats uc ON uc.UserId = up.UserId
+),
+Ranked AS (
+    SELECT 
+        a.UserId,
+        a.DisplayName,
+        a.QuestionCount,
+        a.AnswerCount,
+        a.TotalPostScore,
+        a.LastPostDate,
+        a.BadgeCount,
+        a.GoldBadges,
+        a.SilverBadges,
+        a.BronzeBadges,
+        a.BadgeList,
+        a.UpVotesReceived,
+        a.DownVotesReceived,
+        a.FavoritesReceived,
+        a.CommentCount,
+        a.LastCommentDate,
+        RANK() OVER (ORDER BY a.TotalPostScore DESC, a.BadgeCount DESC) AS ScoreRank,
+        ROW_NUMBER() OVER (
+            PARTITION BY CASE WHEN a.QuestionCount > 0 THEN 'Q' ELSE 'A' END
+            ORDER BY a.UpVotesReceived DESC
+        ) AS TopContributorRank
+    FROM Aggregated a
+)
+SELECT 
+    r.UserId,
+    r.DisplayName,
+    r.QuestionCount,
+    r.AnswerCount,
+    r.TotalPostScore,
+    r.BadgeCount,
+    r.GoldBadges,
+    r.SilverBadges,
+    r.BronzeBadges,
+    r.BadgeList,
+    r.UpVotesReceived,
+    r.DownVotesReceived,
+    r.FavoritesReceived,
+    r.CommentCount,
+    COALESCE(r.LastPostDate, r.LastCommentDate)          AS LastActivityDate,
+    r.ScoreRank,
+    r.TopContributorRank,
+    (SELECT AVG(p2.Score)
+     FROM Posts p2
+     WHERE p2.OwnerUserId = r.UserId AND p2.PostTypeId = 2) AS AvgAnswerScore
+FROM Ranked r
+WHERE 
+    (r.QuestionCount > 10 OR r.AnswerCount > 50)
+    AND r.TotalPostScore IS NOT NULL AND r.TotalPostScore > 1000
+    AND (r.BadgeCount = 0 OR r.GoldBadges > 0)
+ORDER BY r.ScoreRank
+LIMIT 100
+
+UNION ALL
+
+SELECT 
+    NULL                                               AS UserId,
+    'Summary'                                          AS DisplayName,
+    SUM(r.QuestionCount)                               AS QuestionCount,
+    SUM(r.AnswerCount)                                 AS AnswerCount,
+    SUM(r.TotalPostScore)                              AS TotalPostScore,
+    SUM(r.BadgeCount)                                  AS BadgeCount,
+    SUM(r.GoldBadges)                                  AS GoldBadges,
+    SUM(r.SilverBadges)                                AS SilverBadges,
+    SUM(r.BronzeBadges)                                AS BronzeBadges,
+    NULL                                               AS BadgeList,
+    SUM(r.UpVotesReceived)                             AS UpVotesReceived,
+    SUM(r.DownVotesReceived)                           AS DownVotesReceived,
+    SUM(r.FavoritesReceived)                           AS FavoritesReceived,
+    SUM(r.CommentCount)                                AS CommentCount,
+    MAX(COALESCE(r.LastPostDate, r.LastCommentDate))   AS LastActivityDate,
+    NULL                                               AS ScoreRank,
+    NULL                                               AS TopContributorRank,
+    NULL                                               AS AvgAnswerScore
+FROM Ranked r
+WHERE 
+    (r.QuestionCount > 10 OR r.AnswerCount > 50)
+    AND r.TotalPostScore IS NOT NULL AND r.TotalPostScore > 1000
+    AND (r.BadgeCount = 0 OR r.GoldBadges > 0);

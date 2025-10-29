@@ -1,0 +1,151 @@
+-- {"query": "3450.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1507} 
+
+/*  Comprehensive benchmark query on the StackOverflow schema  */
+WITH
+/* 1️⃣  Users enriched with badge aggregates */
+usr_badges AS (
+    SELECT
+        u.Id                                                   AS user_id,
+        u.DisplayName                                          AS display_name,
+        u.Reputation                                           AS reputation,
+        COUNT(b.Id)                                            AS total_badges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END)           AS gold_badges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END)           AS silver_badges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END)           AS bronze_badges,
+        COUNT(DISTINCT CASE WHEN b.TagBased = 1 THEN b.Name END) AS tag_badge_names
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+/* 2️⃣  Questions with their answer statistics */
+question_stats AS (
+    SELECT
+        q.Id                                   AS q_id,
+        q.Title                                AS q_title,
+        q.CreationDate                         AS q_created,
+        q.Score                                AS q_score,
+        q.ViewCount                            AS q_views,
+        q.FavoriteCount                        AS q_fav,
+        q.Tags                                 AS q_tags,
+        COALESCE(q.AcceptedAnswerId, -1)       AS accepted_aid,
+        COUNT(a.Id) FILTER (WHERE a.Id IS NOT NULL)               AS answer_cnt,
+        AVG(EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))/60) 
+                                              AS avg_answer_minutes,
+        MIN(EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))/60) 
+                                              AS min_answer_minutes,
+        MAX(EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))/60) 
+                                              AS max_answer_minutes,
+        SUM(CASE WHEN a.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END) AS accepted_flag_sum
+    FROM Posts q
+    LEFT JOIN Posts a
+        ON a.ParentId = q.Id AND a.PostTypeId = 2       -- answers
+    WHERE q.PostTypeId = 1                               -- questions
+      AND q.ClosedDate IS NULL
+    GROUP BY q.Id, q.Title, q.CreationDate, q.Score,
+             q.ViewCount, q.FavoriteCount, q.Tags,
+             q.AcceptedAnswerId
+),
+
+/* 3️⃣  Daily vote breakdown per post (windowed) */
+post_votes AS (
+    SELECT
+        v.PostId                               AS post_id,
+        vt.Name                                 AS vote_type,
+        COUNT(v.Id) OVER (PARTITION BY v.PostId, v.VoteTypeId) AS vote_cnt,
+        ROW_NUMBER() OVER (PARTITION BY v.PostId ORDER BY v.CreationDate DESC) AS rn_latest_vote
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE vt.Name IN ('UpMod','DownMod','Favorite')
+),
+
+/* 4️⃣  Tag parsing – explode Tags column into rows */
+tag_explode AS (
+    SELECT
+        qs.q_id,
+        TRIM(BOTH '<>' FROM UNNEST(string_to_array(qs.q_tags, '><'))) AS tag_name
+    FROM question_stats qs
+    WHERE qs.q_tags IS NOT NULL
+),
+
+/* 5️⃣  Tag popularity by combining with Tags table */
+tag_pop AS (
+    SELECT
+        t.TagName                              AS tag,
+        t.Count                                AS tag_total_posts,
+        COUNT(te.q_id)                         AS tag_used_in_questions,
+        ROUND( (COUNT(te.q_id)::numeric / NULLIF(t.Count,0)) * 100, 2) AS usage_percent
+    FROM Tags t
+    LEFT JOIN tag_explode te ON te.tag_name = t.TagName
+    GROUP BY t.TagName, t.Count
+),
+
+/* 6️⃣  Correlated subquery – latest close reason per closed question */
+latest_close_reason AS (
+    SELECT
+        ph.PostId                                    AS q_id,
+        ph.Text                                      AS close_json,
+        ph.CreationDate                              AS closed_on,
+        (ph.Comment)::int                            AS close_reason_id
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10                 -- Post Closed
+      AND ph.CreationDate = (
+            SELECT MAX(ph2.CreationDate)
+            FROM PostHistory ph2
+            WHERE ph2.PostId = ph.PostId
+              AND ph2.PostHistoryTypeId = 10
+      )
+),
+
+/* 7️⃣  Union all – user‑centric and tag‑centric slices for set‑operator stress */
+user_slice AS (
+    SELECT
+        ub.user_id           AS entity_id,
+        ub.display_name      AS entity_name,
+        ub.reputation        AS metric_a,
+        ub.total_badges      AS metric_b,
+        NULL::text           AS extra_info,
+        'user'               AS slice_type
+    FROM usr_badges ub
+    WHERE ub.reputation > 50000
+),
+tag_slice AS (
+    SELECT
+        tp.tag               AS entity_id,
+        tp.tag               AS entity_name,
+        tp.tag_total_posts  AS metric_a,
+        tp.tag_used_in_questions AS metric_b,
+        tp.usage_percent || '%' AS extra_info,
+        'tag'                AS slice_type
+    FROM tag_pop tp
+    WHERE tp.usage_percent > 10
+),
+
+combined_slices AS (
+    SELECT * FROM user_slice
+    UNION ALL
+    SELECT * FROM tag_slice
+)
+
+SELECT
+    cs.entity_id,
+    cs.entity_name,
+    cs.slice_type,
+    cs.metric_a,
+    cs.metric_b,
+    cs.extra_info,
+    /* Additional calculated column: ranking within its slice */
+    RANK() OVER (PARTITION BY cs.slice_type ORDER BY cs.metric_a DESC) AS rank_in_slice,
+    /* Show top‑5 recent votes for each post (if slice = user, display nothing) */
+    CASE
+        WHEN cs.slice_type = 'user' THEN NULL
+        ELSE (
+            SELECT STRING_AGG(pv.vote_type || ':' || pv.vote_cnt, ', ')
+            FROM post_votes pv
+            WHERE pv.post_id = cs.entity_id
+              AND pv.rn_latest_vote = 1
+        )
+    END AS latest_vote_summary
+FROM combined_slices cs
+ORDER BY cs.slice_type, rank_in_slice
+LIMIT 200;

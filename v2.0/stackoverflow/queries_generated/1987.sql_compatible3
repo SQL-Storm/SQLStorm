@@ -1,0 +1,283 @@
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.Views AS UserViews,
+        U.UpVotes AS UserUpVotes,
+        U.DownVotes AS UserDownVotes,
+        MAX(U.LastAccessDate) AS LastUserAccessDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsAsked,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersProvided,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        AVG(COALESCE(P.Score, 0)) AS AvgPostScore,
+        SUM(COALESCE(P.FavoriteCount, 0)) AS TotalFavoritesReceived,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        DENSE_RANK() OVER (ORDER BY U.Reputation DESC, COUNT(DISTINCT P.Id) DESC, MAX(U.LastAccessDate) DESC) AS UserEngagementRank
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.Views, U.UpVotes, U.DownVotes
+),
+QuestionDetails AS (
+    SELECT
+        Q.Id AS QuestionId,
+        Q.OwnerUserId,
+        Q.Title,
+        Q.CreationDate AS QuestionCreationDate,
+        Q.Score AS QuestionScore,
+        Q.ViewCount AS QuestionViewCount,
+        Q.AnswerCount AS QuestionAnswerCount,
+        Q.FavoriteCount AS QuestionFavoriteCount,
+        Q.AcceptedAnswerId,
+        EXTRACT(EPOCH FROM (COALESCE(Q.ClosedDate, TIMESTAMP '2024-10-01 12:34:56') - Q.CreationDate)) / 86400.0 AS QuestionAgeDays,
+        COALESCE(Q.Tags, '<unspecified>') AS QuestionTagsRaw,
+        (SELECT AVG(A.Score)
+         FROM Posts A
+         WHERE A.ParentId = Q.Id AND A.PostTypeId = 2) AS AvgAnswerScore,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesOnQuestion,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesOnQuestion,
+        LAG(Q.CreationDate, 1, TIMESTAMP '1900-01-01') OVER (PARTITION BY Q.OwnerUserId ORDER BY Q.CreationDate) AS PreviousQuestionDate,
+        ROW_NUMBER() OVER (PARTITION BY Q.OwnerUserId ORDER BY Q.CreationDate DESC) AS QuestionSequenceNumDesc
+    FROM Posts Q
+    LEFT JOIN Votes V ON Q.Id = V.PostId AND V.VoteTypeId IN (2, 3)
+    WHERE Q.PostTypeId = 1
+    GROUP BY Q.Id, Q.OwnerUserId, Q.Title, Q.CreationDate, Q.Score, Q.ViewCount, Q.AnswerCount, Q.FavoriteCount, Q.AcceptedAnswerId, Q.ClosedDate, Q.Tags
+),
+PostHistoryEvents AS (
+    SELECT
+        PH.PostId,
+        PH.PostHistoryTypeId,
+        PHT.Name AS HistoryTypeName,
+        PH.CreationDate AS HistoryDate,
+        PH.UserId AS HistoryUserId,
+        PH.Comment AS HistoryComment,
+        PH.Text AS HistoryText,
+        ROW_NUMBER() OVER (PARTITION BY PH.PostId, PH.PostHistoryTypeId ORDER BY PH.CreationDate DESC) AS rn
+    FROM PostHistory PH
+    JOIN PostHistoryTypes PHT ON PH.PostHistoryTypeId = PHT.Id
+    WHERE PH.PostHistoryTypeId IN (10, 11, 5, 6, 12, 13)
+),
+DuplicateQuestionLinks AS (
+    SELECT
+        PL.PostId AS SourceQuestionId,
+        PL.RelatedPostId AS DuplicateOfQuestionId,
+        Q_DUP.Title AS DuplicateOfQuestionTitle,
+        COUNT(PL.Id) OVER (PARTITION BY PL.PostId) AS TotalDuplicateLinksFromSource
+    FROM PostLinks PL
+    JOIN Posts Q_DUP ON PL.RelatedPostId = Q_DUP.Id
+    WHERE PL.LinkTypeId = 3
+    GROUP BY PL.PostId, PL.RelatedPostId, Q_DUP.Title, PL.Id
+),
+SelectedUserQuestions AS (
+    SELECT
+        UAS.UserId,
+        UAS.DisplayName,
+        UAS.Reputation,
+        UAS.LastUserAccessDate,
+        UAS.TotalPosts,
+        UAS.QuestionsAsked,
+        UAS.AnswersProvided,
+        UAS.TotalComments,
+        UAS.AvgPostScore,
+        UAS.TotalFavoritesReceived,
+        UAS.GoldBadges,
+        UAS.SilverBadges,
+        UAS.BronzeBadges,
+        UAS.UserEngagementRank,
+        QD.QuestionId,
+        QD.Title AS QuestionTitle,
+        QD.QuestionCreationDate,
+        QD.QuestionScore,
+        QD.QuestionViewCount,
+        QD.QuestionAnswerCount,
+        QD.QuestionFavoriteCount,
+        QD.QuestionAgeDays,
+        QD.AvgAnswerScore,
+        QD.UpVotesOnQuestion,
+        QD.DownVotesOnQuestion,
+        EXTRACT(DAY FROM (QD.QuestionCreationDate - QD.PreviousQuestionDate)) AS DaysSincePreviousQuestion,
+        PHE_Closed.HistoryDate AS ClosedDate,
+        PHE_Closed.HistoryComment AS ClosedReason,
+        PHE_EditBody.HistoryDate AS LastBodyEditDate,
+        PHE_EditTags.HistoryDate AS LastTagsEditDate,
+        PHE_Deleted.HistoryDate AS DeletedDate,
+        PHE_Undeleted.HistoryDate AS UndeletedDate,
+        DQL.DuplicateOfQuestionId,
+        DQL.DuplicateOfQuestionTitle,
+        COALESCE(DQL.TotalDuplicateLinksFromSource, 0) AS NumberOfDuplicatesMarked,
+        NULLIF(QD.QuestionViewCount, 0) / NULLIF(QD.QuestionAnswerCount, 0) AS ViewsPerAnswerRatio,
+        CARDINALITY(STRING_TO_ARRAY(SUBSTRING(QD.QuestionTagsRaw FROM 2 FOR (CHAR_LENGTH(QD.QuestionTagsRaw) - 2)), '><')) AS NumberOfTags,
+        CASE
+            WHEN QD.QuestionScore > 100 AND QD.QuestionViewCount > 10000 THEN 'High Impact Question'
+            WHEN QD.QuestionScore > 50 AND QD.QuestionViewCount > 5000 THEN 'Medium Impact Question'
+            ELSE 'Low Impact Question'
+        END AS ImpactCategory,
+        (PHE_Closed.HistoryDate IS NOT NULL AND PHE_Closed.HistoryComment IS NOT NULL) AS IsClosed,
+        (PHE_Deleted.HistoryDate IS NOT NULL AND PHE_Undeleted.HistoryDate IS NULL) AS IsCurrentlyDeleted,
+        (QD.QuestionTagsRaw LIKE '%<sql>%' OR QD.QuestionTagsRaw LIKE '%<database>%') AS ContainsRelevantTag
+    FROM UserActivitySummary UAS
+    LEFT JOIN QuestionDetails QD ON UAS.UserId = QD.OwnerUserId AND QD.QuestionSequenceNumDesc = 1
+    LEFT JOIN PostHistoryEvents PHE_Closed ON QD.QuestionId = PHE_Closed.PostId AND PHE_Closed.PostHistoryTypeId = 10 AND PHE_Closed.rn = 1
+    LEFT JOIN PostHistoryEvents PHE_EditBody ON QD.QuestionId = PHE_EditBody.PostId AND PHE_EditBody.PostHistoryTypeId = 5 AND PHE_EditBody.rn = 1
+    LEFT JOIN PostHistoryEvents PHE_EditTags ON QD.QuestionId = PHE_EditTags.PostId AND PHE_EditTags.PostHistoryTypeId = 6 AND PHE_EditTags.rn = 1
+    LEFT JOIN PostHistoryEvents PHE_Deleted ON QD.QuestionId = PHE_Deleted.PostId AND PHE_Deleted.PostHistoryTypeId = 12 AND PHE_Deleted.rn = 1
+    LEFT JOIN PostHistoryEvents PHE_Undeleted ON QD.QuestionId = PHE_Undeleted.PostId AND PHE_Undeleted.PostHistoryTypeId = 13 AND PHE_Undeleted.rn = 1
+    LEFT JOIN DuplicateQuestionLinks DQL ON QD.QuestionId = DQL.SourceQuestionId
+    WHERE
+        UAS.Reputation > 5000 AND UAS.QuestionsAsked > 10 AND UAS.UserEngagementRank <= 500
+        AND (
+            QD.QuestionScore > 25
+            OR QD.QuestionViewCount > 7500
+            OR QD.AvgAnswerScore > 7
+        )
+        AND (
+            PHE_Closed.HistoryDate IS NULL
+            OR PHE_Closed.HistoryComment LIKE '10[123]%'
+        )
+        AND (
+            QD.Title IS NOT NULL
+            AND CHAR_LENGTH(TRIM(QD.Title)) BETWEEN 15 AND 150
+            AND LOWER(QD.Title) NOT LIKE '%deprecated%'
+        )
+        AND (UAS.GoldBadges > 0 OR UAS.SilverBadges >= 2)
+),
+ProlificAnswerers AS (
+    SELECT
+        UAS.UserId,
+        UAS.DisplayName,
+        UAS.Reputation,
+        UAS.LastUserAccessDate,
+        UAS.TotalPosts,
+        UAS.QuestionsAsked,
+        UAS.AnswersProvided,
+        UAS.TotalComments,
+        UAS.AvgPostScore,
+        UAS.TotalFavoritesReceived,
+        UAS.GoldBadges,
+        UAS.SilverBadges,
+        UAS.BronzeBadges,
+        UAS.UserEngagementRank,
+        P.Id AS AnswerId,
+        P.ParentId AS QuestionAnsweredId,
+        P.Score AS AnswerScore,
+        P.CreationDate AS AnswerCreationDate,
+        P.LastEditDate AS AnswerLastEditDate,
+        P.CommentCount AS AnswerCommentCount,
+        EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - P.CreationDate)) / 86400.0 AS AnswerAgeDays,
+        NULLIF(P.Score, 0) / NULLIF(P.CommentCount, 0) AS ScorePerCommentRatio,
+        RANK() OVER (PARTITION BY UAS.UserId ORDER BY P.Score DESC, P.CreationDate DESC) AS AnswerRankByUser
+    FROM UserActivitySummary UAS
+    JOIN Posts P ON UAS.UserId = P.OwnerUserId
+    WHERE P.PostTypeId = 2
+      AND UAS.AnswersProvided >= 20
+      AND UAS.AvgPostScore >= 10
+      AND UAS.UserEngagementRank <= 750
+      AND P.Score > 15
+      AND P.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2' YEAR)
+)
+SELECT
+    SUQ.UserId,
+    SUQ.DisplayName,
+    SUQ.Reputation,
+    SUQ.LastUserAccessDate,
+    SUQ.TotalPosts,
+    SUQ.QuestionsAsked,
+    SUQ.AnswersProvided,
+    SUQ.TotalComments,
+    SUQ.AvgPostScore,
+    SUQ.TotalFavoritesReceived,
+    SUQ.GoldBadges,
+    SUQ.SilverBadges,
+    SUQ.BronzeBadges,
+    SUQ.UserEngagementRank,
+    SUQ.QuestionId AS PostId,
+    SUQ.QuestionTitle AS PostTitle,
+    SUQ.QuestionCreationDate AS PostCreationDate,
+    SUQ.QuestionScore AS PostScore,
+    SUQ.QuestionViewCount AS PostViewCount,
+    SUQ.QuestionAnswerCount AS PostAnswerCount,
+    SUQ.QuestionFavoriteCount AS PostFavoriteCount,
+    SUQ.QuestionAgeDays AS PostAgeDays,
+    SUQ.AvgAnswerScore,
+    SUQ.UpVotesOnQuestion AS PostUpVotes,
+    SUQ.DownVotesOnQuestion AS PostDownVotes,
+    SUQ.DaysSincePreviousQuestion,
+    SUQ.ClosedDate,
+    SUQ.ClosedReason,
+    SUQ.LastBodyEditDate,
+    SUQ.LastTagsEditDate,
+    SUQ.DeletedDate,
+    SUQ.UndeletedDate,
+    SUQ.DuplicateOfQuestionId,
+    SUQ.DuplicateOfQuestionTitle,
+    SUQ.NumberOfDuplicatesMarked,
+    SUQ.ViewsPerAnswerRatio,
+    SUQ.NumberOfTags,
+    SUQ.ImpactCategory,
+    SUQ.IsClosed,
+    SUQ.IsCurrentlyDeleted,
+    SUQ.ContainsRelevantTag,
+    'Question' AS PostType
+FROM SelectedUserQuestions SUQ
+WHERE SUQ.NumberOfTags > 2
+  AND SUQ.ViewsPerAnswerRatio IS NOT NULL AND SUQ.ViewsPerAnswerRatio > 5
+  AND SUQ.QuestionAgeDays > 30
+UNION ALL
+SELECT
+    PA.UserId,
+    PA.DisplayName,
+    PA.Reputation,
+    PA.LastUserAccessDate,
+    PA.TotalPosts,
+    PA.QuestionsAsked,
+    PA.AnswersProvided,
+    PA.TotalComments,
+    PA.AvgPostScore,
+    PA.TotalFavoritesReceived,
+    PA.GoldBadges,
+    PA.SilverBadges,
+    PA.BronzeBadges,
+    PA.UserEngagementRank,
+    PA.AnswerId AS PostId,
+    NULL AS PostTitle,
+    PA.AnswerCreationDate AS PostCreationDate,
+    PA.AnswerScore AS PostScore,
+    NULL AS PostViewCount,
+    NULL AS PostAnswerCount,
+    NULL AS PostFavoriteCount,
+    PA.AnswerAgeDays AS PostAgeDays,
+    NULL AS AvgAnswerScore,
+    NULL AS PostUpVotes,
+    NULL AS PostDownVotes,
+    NULL AS DaysSincePreviousQuestion,
+    NULL AS ClosedDate,
+    NULL AS ClosedReason,
+    PA.AnswerLastEditDate AS LastBodyEditDate,
+    NULL AS LastTagsEditDate,
+    NULL AS DeletedDate,
+    NULL AS UndeletedDate,
+    NULL AS DuplicateOfQuestionId,
+    NULL AS DuplicateOfQuestionTitle,
+    0 AS NumberOfDuplicatesMarked,
+    PA.ScorePerCommentRatio AS ViewsPerAnswerRatio,
+    NULL AS NumberOfTags,
+    CASE
+        WHEN PA.AnswerScore > 50 THEN 'High Impact Answer'
+        WHEN PA.AnswerScore > 20 THEN 'Medium Impact Answer'
+        ELSE 'Low Impact Answer'
+    END AS ImpactCategory,
+    FALSE AS IsClosed,
+    FALSE AS IsCurrentlyDeleted,
+    FALSE AS ContainsRelevantTag,
+    'Answer' AS PostType
+FROM ProlificAnswerers PA
+WHERE PA.AnswerRankByUser <= 5
+  AND PA.AnswerScore >= 20
+  AND PA.ScorePerCommentRatio IS NOT NULL AND PA.ScorePerCommentRatio > 2
+ORDER BY UserEngagementRank ASC, PostScore DESC, PostCreationDate DESC
+LIMIT 2000;

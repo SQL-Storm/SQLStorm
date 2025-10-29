@@ -1,0 +1,44 @@
+-- {"query": "6721.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-micro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 519} 
+
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN pt.Name = 'Question' THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN pt.Name = 'Answer' THEN 1 ELSE 0 END) AS TotalAnswers,
+    SUM(CASE WHEN p.Score > 0 THEN 1 ELSE 0 END) AS TotalPositiveScorePosts,
+    MAX(p.LastActivityDate) AS LastActivePost,
+    MAX(CASE WHEN p.ClosedDate IS NOT NULL THEN p.ClosedDate ELSE p.LastActivityDate END) AS LastClosedOrActive,
+    MAX(CASE WHEN pl.LinkTypeId = 3 THEN pl.CreationDate ELSE NULL END) AS LastDuplicateLinked,
+    MIN(ph.CreationDate) AS FirstPostEdit,
+    MAX(ph.CreationDate) AS LastPostEdit,
+    MAX(CASE WHEN b.Id IS NOT NULL THEN b.Date ELSE NULL END) AS LastBadgeEarned,
+    STRING_AGG(DISTINCT t.TagName, ', ') WITHIN GROUP AS SEPARATOR ' | ' AS MostFrequentTags,
+    AVG(p.ViewCount) AS AvgViewCount
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    PostTypes pt ON p.PostTypeId = pt.Id
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    PostLinks pl ON p.Id = pl.PostId
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN 
+    Tags t ON p.Tags IS NOT NULL AND t.Id = ANY(STRING_TO_ARRAY(p.Tags, '/><')::int[])
+LEFT JOIN 
+    PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+WHERE 
+    u.Reputation > 1000
+    AND p.LastEditDate > (CURRENT_DATE - INTERVAL '1 year')
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation
+HAVING 
+    COUNT(DISTINCT p.Id) > 50
+ORDER BY 
+    AvgViewCount DESC, 
+    TotalPositiveScorePosts DESC
+LIMIT 100;

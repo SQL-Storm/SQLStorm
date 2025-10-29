@@ -1,0 +1,122 @@
+WITH
+    recent_questions AS (
+        SELECT
+            p.Id AS PostId,
+            p.Title,
+            p.Tags,
+            p.CreationDate,
+            p.Score,
+            p.ViewCount,
+            p.OwnerUserId,
+            u.DisplayName AS OwnerName,
+            p.LastActivityDate
+        FROM Posts p
+        LEFT JOIN Users u ON p.OwnerUserId = u.Id
+        WHERE p.PostTypeId = 1
+          AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '90 days'
+    ),
+    popular_tags AS (
+        SELECT
+            t.TagName,
+            COUNT(*) AS QuestionCount,
+            AVG(p.Score) AS AvgScore
+        FROM Tags t
+        JOIN Posts p ON p.Id = t.WikiPostId OR p.Id = t.ExcerptPostId
+        WHERE t.IsModeratorOnly = FALSE
+        GROUP BY t.TagName
+    ),
+    last_edits AS (
+        SELECT
+            ph.PostId,
+            ph.CreationDate AS EditDate,
+            ph.UserId,
+            ph.Text AS EditContent
+        FROM PostHistory ph
+        WHERE ph.PostHistoryTypeId IN (4,5,6)
+    ),
+    forged AS (
+        SELECT
+            rq.PostId,
+            rq.Title,
+            rq.Tags,
+            rq.CreationDate,
+            rq.ViewCount,
+            rq.Score,
+            rq.OwnerUserId,
+            rq.OwnerName,
+            rq.LastActivityDate,
+            lp.RelatedPostId
+        FROM recent_questions rq
+        LEFT JOIN (
+            SELECT
+                pl.PostId,
+                pl.RelatedPostId
+            FROM PostLinks pl
+            WHERE pl.LinkTypeId = 1
+        ) lp ON rq.PostId = lp.PostId
+        WHERE (
+            rq.Title ILIKE '%benchmark%'
+            OR rq.Title ILIKE '%performance%'
+            OR rq.Title ILIKE '%stress%'
+            OR rq.Title ILIKE '%load%'
+        )
+    ),
+    enriched AS (
+        SELECT
+            f.PostId,
+            f.Title,
+            f.Tags,
+            f.CreationDate,
+            f.ViewCount,
+            f.Score,
+            f.OwnerUserId,
+            f.OwnerName,
+            f.LastActivityDate,
+            rl.EditDate,
+            rl.EditContent,
+            pp.QuestionCount,
+            pp.AvgScore
+        FROM forged f
+        LEFT JOIN last_edits rl ON f.PostId = rl.PostId
+        LEFT JOIN popular_tags pp ON f.Tags LIKE '%' || pp.TagName || '%'
+    ),
+    windowed AS (
+        SELECT
+            e.PostId,
+            e.Title,
+            e.Tags,
+            e.CreationDate,
+            e.ViewCount,
+            e.Score,
+            e.OwnerUserId,
+            e.OwnerName,
+            e.LastActivityDate,
+            e.EditDate,
+            e.EditContent,
+            e.QuestionCount,
+            e.AvgScore,
+            ROW_NUMBER() OVER (PARTITION BY e.OwnerUserId ORDER BY e.LastActivityDate DESC) AS rn_by_owner,
+            RANK() OVER (ORDER BY e.Score DESC, e.ViewCount DESC) AS r_overall
+        FROM enriched e
+    )
+SELECT
+    w.PostId,
+    w.Title,
+    w.Tags,
+    w.CreationDate,
+    w.ViewCount,
+    w.Score,
+    w.OwnerUserId,
+    w.OwnerName,
+    w.LastActivityDate,
+    w.EditDate,
+    w.EditContent,
+    w.QuestionCount,
+    w.AvgScore,
+    w.rn_by_owner,
+    w.r_overall
+FROM windowed w
+WHERE w.r_overall <= 50
+  AND w.rn_by_owner = 1
+ORDER BY w.r_overall, w.CreationDate DESC
+LIMIT 100;

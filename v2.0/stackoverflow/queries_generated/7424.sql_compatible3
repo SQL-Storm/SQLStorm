@@ -1,0 +1,262 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+        LAG(p.ViewCount) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_views,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) as avg_score_3_posts,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) as total_posts_by_user,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AnswerCount = 0 THEN 'Unanswered Question'
+            WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN 'Answered Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as post_category,
+        COALESCE(p.Title, '') || ' - ' || COALESCE(p.Tags, '') as title_tag_combined,
+        CASE 
+            WHEN p.Score > 100 THEN 'Highly Voted'
+            WHEN p.Score > 50 THEN 'Moderately Voted'
+            WHEN p.Score > 0 THEN 'Low Voted'
+            ELSE 'No Votes'
+        END as voting_status
+    FROM Posts p
+    WHERE p.CreationDate >= CAST('2020-01-01' AS timestamp)
+),
+UserActivityStats AS (
+    SELECT 
+        u.Id as user_id,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.AccountId,
+        COUNT(DISTINCT p.Id) as posts_count,
+        COUNT(DISTINCT c.Id) as comments_count,
+        COUNT(DISTINCT b.Id) as badges_count,
+        SUM(COALESCE(p.Score, 0)) as total_score,
+        AVG(COALESCE(p.Score, 0)) as avg_score,
+        SUM(COALESCE(p.ViewCount, 0)) as total_views,
+        MAX(p.CreationDate) as last_post_date,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 100 THEN 'High Activity'
+            WHEN COUNT(DISTINCT p.Id) > 50 THEN 'Medium Activity'
+            WHEN COUNT(DISTINCT p.Id) > 10 THEN 'Low Activity'
+            ELSE 'Inactive'
+        END as activity_level,
+        STRING_AGG(DISTINCT p.Tags, '; ') as user_tags,
+        (
+            SELECT ARRAY_AGG(DISTINCT t) FROM (
+                SELECT p2.PostTypeId as t
+                FROM Posts p2
+                WHERE p2.OwnerUserId = u.Id
+                AND p2.PostTypeId IN (1, 2)
+            ) s
+        ) as user_post_types
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.AccountId
+),
+PostPerformance AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        CASE 
+            WHEN p.Score >= 1000 THEN 'Legend'
+            WHEN p.Score >= 500 THEN 'Veteran'
+            WHEN p.Score >= 100 THEN 'Regular'
+            WHEN p.Score >= 10 THEN 'Newbie'
+            ELSE 'Beginner'
+        END as score_tier,
+        CASE 
+            WHEN p.ViewCount >= 10000 THEN 'Popular'
+            WHEN p.ViewCount >= 5000 THEN 'Well Known'
+            WHEN p.ViewCount >= 1000 THEN 'Noticeable'
+            WHEN p.ViewCount >= 100 THEN 'Known'
+            ELSE 'Unknown'
+        END as popularity_level,
+        ROW_NUMBER() OVER (ORDER BY p.ViewCount DESC) as view_rank,
+        PERCENT_RANK() OVER (ORDER BY p.ViewCount) as view_percentile,
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) as score_rank_by_type,
+        DENSE_RANK() OVER (ORDER BY p.CreationDate) as temporal_rank,
+        CASE 
+            WHEN p.Score > 0 AND p.ViewCount > 0 THEN 
+                ROUND((CAST(p.Score AS numeric) / NULLIF(p.ViewCount, 0)) * CAST(100 AS numeric), 2)
+            ELSE 0
+        END as score_to_view_ratio,
+        CASE 
+            WHEN p.CommentCount > 0 THEN 
+                ROUND((CAST(p.CommentCount AS numeric) / NULLIF(p.Score, 0)) * CAST(100 AS numeric), 2)
+            ELSE 0
+        END as comment_to_score_ratio
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserPostRelationship AS (
+    SELECT 
+        u.Id as user_id,
+        u.DisplayName,
+        u.Reputation,
+        p.Id as post_id,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        CASE 
+            WHEN u.Id = p.OwnerUserId THEN 'Own Post'
+            WHEN u.Id IN (
+                SELECT DISTINCT v.UserId 
+                FROM Votes v 
+                WHERE v.PostId = p.Id AND v.VoteTypeId = 2
+            ) THEN 'Upvoted'
+            WHEN EXISTS (
+                SELECT 1 FROM Comments c 
+                WHERE c.PostId = p.Id AND c.UserId = u.Id
+            ) THEN 'Commented'
+            ELSE 'Indifferent'
+        END as user_post_relation,
+        EXISTS (
+            SELECT 1 FROM Votes v 
+            WHERE v.PostId = p.Id AND v.UserId = u.Id AND v.VoteTypeId = 5
+        ) as has_favorite,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        COALESCE(p.Tags, '') as tags,
+        CASE
+            WHEN u.Reputation >= 10000 THEN 'Moderator'
+            WHEN u.Reputation >= 5000 THEN 'Expert'
+            WHEN u.Reputation >= 1000 THEN 'Advanced'
+            WHEN u.Reputation >= 500 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as user_level,
+        COALESCE(
+            (SELECT COUNT(*) 
+             FROM Posts p2 
+             WHERE p2.ParentId = p.Id 
+             AND p2.PostTypeId = 2 
+             AND p2.OwnerUserId IS NOT NULL), 
+            0
+        ) as answer_count_with_owner
+    FROM Users u
+    CROSS JOIN Posts p
+    WHERE p.OwnerUserId IS NOT NULL 
+    AND p.PostTypeId IN (1, 2)
+    AND u.Id IS NOT NULL
+)
+SELECT 
+    COUNT(*) as total_records,
+    COUNT(DISTINCT ps.user_id) as unique_users,
+    COUNT(DISTINCT ps.post_id) as unique_posts,
+    AVG(COALESCE(ps.Score, 0)) as avg_score,
+    AVG(COALESCE(ps.ViewCount, 0)) as avg_views,
+    AVG(COALESCE(ps.CommentCount, 0)) as avg_comments,
+    COUNT(CASE WHEN ps.user_post_relation = 'Own Post' THEN 1 END) as own_posts,
+    COUNT(CASE WHEN ps.user_post_relation = 'Upvoted' THEN 1 END) as upvoted_posts,
+    COUNT(CASE WHEN ps.user_post_relation = 'Commented' THEN 1 END) as commented_posts,
+    COUNT(CASE WHEN ps.has_favorite = TRUE THEN 1 END) as favorite_posts,
+    COUNT(CASE WHEN ps.user_level = 'Moderator' THEN 1 END) as moderators,
+    COUNT(CASE WHEN ps.user_level = 'Expert' THEN 1 END) as experts,
+    COUNT(CASE WHEN ps.user_level = 'Advanced' THEN 1 END) as advanced_users,
+    COUNT(CASE WHEN ps.user_level = 'Intermediate' THEN 1 END) as intermediate_users,
+    COUNT(CASE WHEN ps.user_level = 'Beginner' THEN 1 END) as beginners,
+    COUNT(CASE WHEN pp.score_tier = 'Legend' THEN 1 END) as legend_posts,
+    COUNT(CASE WHEN pp.score_tier = 'Veteran' THEN 1 END) as veteran_posts,
+    COUNT(CASE WHEN pp.score_tier = 'Regular' THEN 1 END) as regular_posts,
+    COUNT(CASE WHEN pp.score_tier = 'Newbie' THEN 1 END) as newbie_posts,
+    COUNT(CASE WHEN pp.score_tier = 'Beginner' THEN 1 END) as beginner_posts,
+    COUNT(CASE WHEN pp.popularity_level = 'Popular' THEN 1 END) as popular_posts,
+    COUNT(CASE WHEN pp.popularity_level = 'Well Known' THEN 1 END) as well_known_posts,
+    ROUND(
+        AVG(
+            CASE 
+                WHEN ps.ViewCount > 0 THEN 
+                    COALESCE(ps.Score, 0) / CAST(ps.ViewCount AS numeric)
+                ELSE 0 
+            END
+        ), 4
+    ) as avg_score_per_view,
+    STRING_AGG(DISTINCT ps.user_post_relation, ', ') as relation_types,
+    MAX(ps.CreationDate) as latest_activity,
+    MIN(ps.CreationDate) as earliest_activity,
+    STRING_AGG(
+        CASE 
+            WHEN ps.PostTypeId = 1 THEN 'Question' 
+            WHEN ps.PostTypeId = 2 THEN 'Answer' 
+            ELSE 'Other' 
+        END, 
+        ', '
+    ) as post_types,
+    ROUND(
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY ps.ViewCount), 
+        2
+    ) as median_views,
+    STRING_AGG(
+        DISTINCT CASE 
+            WHEN ps.user_level IN ('Moderator', 'Expert') THEN 
+                SUBSTRING(ps.DisplayName FROM 1 FOR 20) || ' (' || ps.user_level || ')' 
+            ELSE ps.DisplayName 
+        END, 
+        '; '
+    ) as notable_users
+FROM UserPostRelationship ps
+JOIN UserActivityStats uas ON ps.user_id = uas.user_id
+JOIN PostPerformance pp ON ps.post_id = pp.Id
+LEFT JOIN (
+    SELECT 
+        OwnerUserId, 
+        AVG(COALESCE(Score, 0)) as avg_user_score,
+        COUNT(*) as user_post_count
+    FROM Posts
+    WHERE OwnerUserId IS NOT NULL
+    GROUP BY OwnerUserId
+) user_avg ON ps.user_id = user_avg.OwnerUserId
+WHERE ps.CreationDate >= CAST('2020-01-01' AS timestamp)
+AND ps.Score IS NOT NULL
+AND ps.ViewCount IS NOT NULL
+AND (
+    ps.user_level IN ('Moderator', 'Expert', 'Advanced')
+    OR pp.score_tier IN ('Legend', 'Veteran')
+    OR pp.popularity_level IN ('Popular', 'Well Known')
+)
+GROUP BY
+    ps.user_id,
+    ps.DisplayName,
+    ps.Reputation,
+    ps.post_id,
+    ps.PostTypeId,
+    ps.Score,
+    ps.ViewCount,
+    ps.CreationDate,
+    ps.Title,
+    ps.user_post_relation,
+    ps.has_favorite,
+    ps.AnswerCount,
+    ps.CommentCount,
+    ps.FavoriteCount,
+    ps.tags,
+    ps.user_level,
+    pp.score_tier,
+    pp.popularity_level
+ORDER BY ps.ViewCount DESC
+LIMIT 10000;

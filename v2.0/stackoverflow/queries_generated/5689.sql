@@ -1,0 +1,162 @@
+-- {"query": "5689.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1146} 
+WITH ranked_users AS (
+  SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.AccountId,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.ProfileImageUrl,
+    u.EmailHash,
+    u.WebsiteUrl,
+    u.AboutMe,
+    ROW_NUMBER() OVER (
+      PARTITION BY
+        CASE
+          WHEN u.Reputation >= 10000 THEN 'high'
+          WHEN u.Reputation >= 1000 THEN 'mid'
+          ELSE 'low'
+        END
+      ORDER BY u.LastAccessDate DESC, u.Reputation DESC, u.Id ASC
+    ) AS rn
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  WHERE u.AccountId IS NOT NULL
+),
+top_groups AS (
+  SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    CASE
+      WHEN u.Reputation >= 10000 THEN 'platinum'
+      WHEN u.Reputation >= 5000 THEN 'diamond'
+      WHEN u.Reputation >= 1000 THEN 'gold'
+      ELSE 'silver'
+    END AS RankGroup,
+    COUNT(b.Id) AS BadgeCount
+  FROM ranked_users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  WHERE rn = 1
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+recent_posts AS (
+  SELECT
+    p.Id AS PostId,
+    p.OwnerUserId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.PostTypeId,
+    p.Tags,
+    p.AcceptedAnswerId,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ParentId,
+    p.Body
+  FROM Posts p
+  WHERE p.CreationDate >= (CURRENT_TIMESTAMP - INTERVAL '90 days')
+),
+post_stats AS (
+  SELECT
+    rp.PostId,
+    rp.OwnerUserId,
+    rp.Title,
+    rp.Score,
+    rp.ViewCount,
+    rp.CreationDate,
+    rp.LastActivityDate,
+    rp.PostTypeId,
+    rp.Tags,
+    rp.AcceptedAnswerId,
+    rp.CommentCount,
+    rp.FavoriteCount,
+    rp.ParentId,
+    rp.Body,
+    COUNT(*) OVER (PARTITION BY rp.OwnerUserId) AS PostsByOwner
+  FROM recent_posts rp
+),
+correlated_votes AS (
+  SELECT
+    ps.*,
+    v.VoteTypeId,
+    v.UserId AS VoterUserId,
+    v.CreationDate AS VoteDate,
+    vt.Name AS VoteTypeName,
+    1 AS IsUpvote
+  FROM post_stats ps
+  LEFT JOIN Votes v ON v.PostId = ps.PostId
+  LEFT JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+  WHERE v.VoteTypeId IN (2, 3) -- UpMod / DownMod
+),
+windowed AS (
+  SELECT
+    ps.PostId,
+    ps.OwnerUserId,
+    ps.Title,
+    ps.Score,
+    ps.ViewCount,
+    ps.CreationDate,
+    ps.LastActivityDate,
+    ps.PostTypeId,
+    ps.Tags,
+    ps.AcceptedAnswerId,
+    ps.CommentCount,
+    ps.FavoriteCount,
+    ps.ParentId,
+    ps.Body,
+    AVG(ps.Score) OVER (PARTITION BY ps.OwnerUserId) AS AvgScoreByOwner,
+    MAX(ps.LastActivityDate) OVER (PARTITION BY ps.OwnerUserId) AS LastActiveByOwner,
+    SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) OVER (PARTITION BY ps.OwnerUserId) AS UpvotesByOwner
+  FROM post_stats ps
+  LEFT JOIN correlated_votes cv ON cv.PostId = ps.PostId
+  LEFT JOIN Votes v ON v.PostId = ps.PostId
+  LEFT JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+),
+filter_and_join AS (
+  SELECT
+    w.*,
+    bu.Id AS BadgeId,
+    bu.Name AS BadgeName,
+    bu.Class AS BadgeClass,
+    bu.Date AS BadgeDate,
+    bu.TagBased AS BadgeTagBased
+  FROM windowed w
+  LEFT JOIN Badges bu ON bu.UserId = w.OwnerUserId
+  WHERE w.PostTypeId = 1 -- Questions
+    AND w.Score > 0
+    AND w.CommentCount > 2
+)
+SELECT
+  fu.Id AS UserId,
+  fu.DisplayName,
+  fu.Reputation,
+  tg.RankGroup,
+  tg.BadgeCount,
+  fu.PostsByOwner AS TotalPostsByOwner,
+  fu.Title AS RecentQuestionTitle,
+  fu.Score AS RecentQuestionScore,
+  fu.Views AS TotalViews,
+  fu.LastActivityDate,
+  fu.Tags,
+  fu.AcceptedAnswerId,
+  fu.ParentId,
+  fu.Body AS QuestionBody,
+  fu.VoteTypeName AS LastVoteType,
+  fu.VoteDate AS LastVoteDate,
+  fu.AvgScoreByOwner,
+  fu.LastActiveByOwner,
+  fu.UpvotesByOwner
+FROM top_groups tg
+JOIN Users fu ON fu.Id = fu.Id
+LEFT JOIN filter_and_join faj ON faj.OwnerUserId = fu.Id
+WHERE fu.Reputation IS NOT NULL
+ORDER BY fu.Reputation DESC, fu.Id ASC
+LIMIT 100;

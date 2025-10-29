@@ -1,0 +1,172 @@
+WITH QuestionStats AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title AS QuestionTitle,
+        p.OwnerUserId,
+        p.CreationDate AS QuestionCreationDate,
+        COUNT(a.Id) AS AnswerCount,
+        SUM(CASE WHEN a."IsAccepted" = 1 THEN 1 ELSE 0 END) AS AcceptedAnswerCount,
+        AVG(a.Score) AS AverageAnswerScore,
+        MAX(a.Score) AS MaxAnswerScore,
+        MIN(a.Score) AS MinAnswerScore,
+        CAST((EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate)) / 86400) AS INTEGER) AS DaysToLastActivity,
+        ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.ViewCount DESC) AS RankByScoreAndViews
+    FROM Posts p
+    LEFT JOIN Posts a ON p.Id = a.ParentId AND a.PostTypeId = 2
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.LastActivityDate
+),
+UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT ph.PostId) AS PostsEdited,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        COUNT(DISTINCT b.Id) AS BadgesEarned,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesGiven,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesGiven,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId AND v.VoteTypeId IN (2, 3)
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+ComplexPostMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.CommunityOwnedDate,
+        CASE
+            WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 AND p.AcceptedAnswerId IS NOT NULL THEN 'HasAcceptedAnswer'
+            WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN 'HasAnswers'
+            WHEN p.PostTypeId = 1 AND p.AnswerCount = 0 THEN 'NoAnswers'
+            ELSE 'Other'
+        END AS QuestionStatus,
+        COALESCE(u.DisplayName, p.OwnerDisplayName) AS PostOwnerDisplayName,
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostScore,
+        LEAD(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextPostScore,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS PostSequenceForUser,
+        SUM(c.Score) OVER (PARTITION BY p.OwnerUserId) AS TotalCommentScoreByUser,
+        STRING_AGG(COALESCE(pt.Name, 'Unknown Post Type'), ' | ' ORDER BY p.Id) AS PostTypesByOwner,
+        SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicateLinkCount
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+    LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.CreationDate > TIMESTAMP '2023-01-01'
+    GROUP BY p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.CommentCount, p.FavoriteCount, p.ClosedDate, p.CommunityOwnedDate, u.DisplayName, p.OwnerDisplayName, p.AnswerCount, p.AcceptedAnswerId
+)
+SELECT
+    qs.QuestionId,
+    qs.QuestionTitle,
+    qs.RankByScoreAndViews,
+    ue.DisplayName AS UserDisplayName,
+    ue.Reputation,
+    ue.ReputationRank,
+    qs.AnswerCount,
+    qs.AverageAnswerScore,
+    qs.DaysToLastActivity,
+    cpm.QuestionStatus,
+    cpm.PostOwnerDisplayName,
+    cpm.PreviousPostScore,
+    cpm.NextPostScore,
+    cpm.PostSequenceForUser,
+    cpm.TotalCommentScoreByUser,
+    cpm.PostTypesByOwner,
+    cpm.DuplicateLinkCount,
+    CASE
+        WHEN qs.QuestionCreationDate < (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year') THEN 'Old'
+        WHEN qs.QuestionCreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year') AND qs.QuestionCreationDate < (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 month') THEN 'Recent'
+        ELSE 'VeryRecent'
+    END AS QuestionAgeGroup,
+    CASE WHEN cpm.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS PostStatus,
+    COALESCE(ue.UpvotesGiven, 0) + COALESCE(ue.DownvotesGiven, 0) AS TotalVotesGivenByUser,
+    REPLACE(REPLACE(REPLACE(qs.QuestionTitle, '?', '!'), '[', '('), ']', ')') AS ModifiedQuestionTitle,
+    CASE
+        WHEN qs.OwnerUserId IS NULL THEN 'CommunityOwned'
+        WHEN ue.BadgesEarned > 100 THEN 'HighlyAwarded'
+        WHEN ue.PostsEdited > 500 THEN 'ProlificEditor'
+        ELSE 'StandardUser'
+    END AS UserEngagementLevel,
+    (SELECT json_build_object(
+        'RecordType', 'Answer',
+        'PostId', a.Id,
+        'Score', a.Score,
+        'CreationDate', a.CreationDate,
+        'QuestionId', a.ParentId,
+        'QuestionTitle', NULL,
+        'RankByScoreAndViews', NULL,
+        'UserDisplayName', ue_ans.DisplayName,
+        'Reputation', ue_ans.Reputation,
+        'ReputationRank', (SELECT DENSE_RANK() OVER (ORDER BY u2.Reputation DESC) FROM Users u2 WHERE u2.Id = ue_ans.Id),
+        'AnswerCount', NULL,
+        'AverageAnswerScore', NULL,
+        'DaysToLastActivity', NULL,
+        'QuestionStatus', NULL,
+        'PostOwnerDisplayName', COALESCE(u_ans.DisplayName, a.OwnerDisplayName),
+        'PreviousPostScore', NULL,
+        'NextPostScore', NULL,
+        'PostSequenceForUser', NULL,
+        'TotalCommentScoreByUser', NULL,
+        'PostTypesByOwner', NULL,
+        'DuplicateLinkCount', NULL,
+        'QuestionAgeGroup', NULL,
+        'PostStatus', CASE WHEN a.Id = (SELECT AcceptedAnswerId FROM Posts WHERE Id = a.ParentId) THEN 'Accepted' ELSE 'NotAccepted' END,
+        'TotalVotesGivenByUser', NULL,
+        'ModifiedQuestionTitle', NULL,
+        'UserEngagementLevel', NULL
+    )
+    FROM Posts a
+    JOIN Users ue_ans ON a.OwnerUserId = ue_ans.Id
+    LEFT JOIN Users u_ans ON a.OwnerUserId = u_ans.Id
+    WHERE a.PostTypeId = 2 AND a.ParentId = qs.QuestionId
+    ORDER BY a.Score DESC
+    LIMIT 1)
+FROM QuestionStats qs
+LEFT JOIN UserEngagement ue ON qs.OwnerUserId = ue.UserId
+LEFT JOIN ComplexPostMetrics cpm ON qs.QuestionId = cpm.PostId
+WHERE qs.AnswerCount > 0 OR qs.RankByScoreAndViews <= 100
+
+UNION ALL
+
+SELECT
+    CAST(NULL AS INTEGER) AS QuestionId,
+    CAST(NULL AS TEXT) AS QuestionTitle,
+    CAST(NULL AS INTEGER) AS RankByScoreAndViews,
+    ue.DisplayName AS UserDisplayName,
+    ue.Reputation,
+    ue.ReputationRank,
+    CAST(NULL AS INTEGER) AS AnswerCount,
+    CAST(NULL AS NUMERIC) AS AverageAnswerScore,
+    CAST(NULL AS INTEGER) AS DaysToLastActivity,
+    CAST(NULL AS TEXT) AS QuestionStatus,
+    CAST(NULL AS TEXT) AS PostOwnerDisplayName,
+    CAST(NULL AS INTEGER) AS PreviousPostScore,
+    CAST(NULL AS INTEGER) AS NextPostScore,
+    CAST(NULL AS INTEGER) AS PostSequenceForUser,
+    CAST(NULL AS INTEGER) AS TotalCommentScoreByUser,
+    CAST(NULL AS TEXT) AS PostTypesByOwner,
+    CAST(NULL AS INTEGER) AS DuplicateLinkCount,
+    CAST(NULL AS TEXT) AS QuestionAgeGroup,
+    CASE WHEN ph.PostHistoryTypeId = 12 THEN 'Deleted' WHEN ph.PostHistoryTypeId = 14 THEN 'Locked' ELSE 'Active' END AS PostStatus,
+    CAST(NULL AS INTEGER) AS TotalVotesGivenByUser,
+    'User History Analysis' AS ModifiedQuestionTitle,
+    'Historical User Activity' AS UserEngagementLevel
+FROM UserEngagement ue
+LEFT JOIN PostHistory ph ON ue.UserId = ph.UserId
+WHERE ph.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '7 days') AND ue.Reputation > 10000
+GROUP BY ue.UserId, ue.DisplayName, ue.Reputation, ue.ReputationRank, ph.PostHistoryTypeId, ph.CreationDate
+HAVING COUNT(DISTINCT ph.PostId) > 5
+ORDER BY RankByScoreAndViews NULLS LAST, ue.Reputation DESC;

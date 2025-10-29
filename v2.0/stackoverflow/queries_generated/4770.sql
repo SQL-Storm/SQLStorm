@@ -1,0 +1,132 @@
+-- {"query": "4770.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1314} 
+
+WITH
+  RankedPostEdits AS (
+    SELECT
+      ph.PostId,
+      ph.UserId,
+      ph.CreationDate,
+      pht.Name AS HistoryTypeName,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory AS ph
+    JOIN PostHistoryTypes AS pht
+      ON ph.PostHistoryTypeId = pht.Id
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+  ),
+  UserActivitySummary AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+      SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+      COUNT(DISTINCT c.Id) AS CommentCount,
+      COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVoteCount,
+      COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVoteCount,
+      MAX(p.CreationDate) AS LastPostCreationDate,
+      COALESCE(SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END), 0) AS GoldBadges,
+      COALESCE(SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END), 0) AS SilverBadges,
+      COALESCE(SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END), 0) AS BronzeBadges
+    FROM Users AS u
+    LEFT JOIN Posts AS p
+      ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments AS c
+      ON u.Id = c.UserId
+    LEFT JOIN Votes AS v
+      ON u.Id = v.UserId
+    LEFT JOIN Badges AS b
+      ON u.Id = b.UserId
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation
+  ),
+  FrequentEditors AS (
+    SELECT
+      rpe.UserId,
+      COUNT(DISTINCT rpe.PostId) AS EditedPostCount,
+      MAX(rpe.CreationDate) AS LastEditDate
+    FROM RankedPostEdits AS rpe
+    WHERE
+      rpe.rn = 1 -- Considering the latest edit for each post by a user
+    GROUP BY
+      rpe.UserId
+    HAVING
+      COUNT(DISTINCT rpe.PostId) > 10 -- Users who have edited more than 10 posts
+  )
+SELECT
+  uas.DisplayName AS UserName,
+  uas.Reputation,
+  uas.TotalPostsOwned,
+  uas.QuestionCount,
+  uas.AnswerCount,
+  uas.CommentCount,
+  uas.UpVoteCount,
+  uas.DownVoteCount,
+  uas.LastPostCreationDate,
+  (uas.GoldBadges * 100) + (uas.SilverBadges * 10) + uas.BronzeBadges AS TotalBadgeScore,
+  COALESCE(fe.EditedPostCount, 0) AS PostsEdited,
+  CASE
+    WHEN uas.Reputation > 10000 THEN 'High Reputation'
+    WHEN uas.Reputation BETWEEN 1000 AND 10000 THEN 'Medium Reputation'
+    ELSE 'Low Reputation'
+  END AS ReputationLevel,
+  CASE
+    WHEN JULIANDAY(uas.LastPostCreationDate) < JULIANDAY('now', '-1 year') THEN 'Inactive'
+    ELSE 'Active'
+  END AS ActivityStatus,
+  CASE
+    WHEN fe.UserId IS NOT NULL THEN 'Frequent Editor'
+    ELSE 'Infrequent Editor'
+  END AS EditingFrequency,
+  (
+    SELECT
+      COUNT(*)
+    FROM Posts AS p_inner
+    WHERE
+      p_inner.OwnerUserId = uas.UserId AND p_inner.ClosedDate IS NOT NULL
+  ) AS ClosedPostsCount,
+  (
+    SELECT
+      COUNT(*)
+    FROM Comments AS c_inner
+    WHERE
+      c_inner.UserId = uas.UserId AND c_inner.Score < 0
+  ) AS NegativeScoreComments,
+  'Contribution Metrics' AS QueryCategory,
+  CAST(strftime('%Y-%m-%d', uas.LastPostCreationDate) AS TEXT) AS LastPostDateString,
+  CASE
+    WHEN uas.DisplayName LIKE '%[^a-zA-Z0-9 ]%' THEN 'Contains Special Characters'
+    ELSE 'Alphanumeric Only'
+  END AS DisplayNameFormat
+FROM UserActivitySummary AS uas
+LEFT JOIN FrequentEditors AS fe
+  ON uas.UserId = fe.UserId
+WHERE
+  uas.Reputation >= 50 AND uas.TotalPostsOwned >= 5
+  AND uas.LastPostCreationDate >= DATE('now', '-2 years')
+UNION
+SELECT
+  NULL AS UserName,
+  NULL AS Reputation,
+  NULL AS TotalPostsOwned,
+  NULL AS QuestionCount,
+  NULL AS AnswerCount,
+  NULL AS CommentCount,
+  NULL AS UpVoteCount,
+  NULL AS DownVoteCount,
+  NULL AS LastPostCreationDate,
+  NULL AS TotalBadgeScore,
+  NULL AS PostsEdited,
+  NULL AS ReputationLevel,
+  NULL AS ActivityStatus,
+  NULL AS EditingFrequency,
+  NULL AS ClosedPostsCount,
+  NULL AS NegativeScoreComments,
+  'Summary Statistics' AS QueryCategory,
+  NULL AS LastPostDateString,
+  NULL AS DisplayNameFormat
+FROM Users
+LIMIT 1;

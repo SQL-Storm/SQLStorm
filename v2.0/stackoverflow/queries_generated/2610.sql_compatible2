@@ -1,0 +1,151 @@
+with RecursiveUserBadges as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class,
+        row_number() over(partition by u.Id order by b.Class, b.Date desc) as BadgeRank
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    where (b.TagBased = false) or (b.TagBased is null)
+),
+TopBadgesPerUser as (
+    select 
+        UserId,
+        DisplayName,
+        BadgeName,
+        Class,
+        BadgeRank
+    from RecursiveUserBadges
+    where BadgeRank <= 3
+),
+PostWithAnswerStats as (
+    select 
+        p.Id as QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        count(a.Id) filter (where a.Score > 0) as PositiveAnswerCount,
+        coalesce(
+            (select max(a2.score) from Posts a2 where a2.ParentId = p.Id), 0
+        ) as MaxAnswerScore,
+        (select count(*) from Comments c where c.PostId = p.Id) as CommentCount
+    from Posts p
+    left join Posts a on a.ParentId = p.Id and a.PostTypeId = 2
+    where p.PostTypeId = 1
+    group by p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount
+),
+LatestPostHistoryEdits as (
+    select 
+        ph.PostId, 
+        ph.UserId, 
+        ph.CreationDate,
+        ph.UserDisplayName,
+        ph.Comment,
+        ph.Text,
+        row_number() over(partition by ph.PostId order by ph.CreationDate desc) as rn
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (4,5,6)
+),
+FilteredLatestEdits as (
+    select 
+        PostId, 
+        UserId, 
+        CreationDate, 
+        UserDisplayName,
+        Comment,
+        Text
+    from LatestPostHistoryEdits 
+    where rn = 1
+),
+DuplicateLinks as (
+    select 
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate,
+        p1.Score as PostScore,
+        p2.Score as RelatedPostScore,
+        case when p1.Score > p2.Score then 1 else 0 end as IsPostHigherScore
+    from PostLinks pl
+    join Posts p1 on pl.PostId = p1.Id
+    join Posts p2 on pl.RelatedPostId = p2.Id
+    where pl.LinkTypeId = 3
+),
+TopBadgesAgg as (
+    select
+        tb.UserId,
+        string_agg(tb.BadgeName || ' (' || case tb.Class when 1 then 'Gold' when 2 then 'Silver' when 3 then 'Bronze' else 'Unknown' end || ')', ', ') as TopBadges
+    from TopBadgesPerUser tb
+    where tb.BadgeName is not null
+    group by tb.UserId
+),
+CombinedResult as (
+    select 
+        q.QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        u.DisplayName as OwnerName,
+        q.CreationDate,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.PositiveAnswerCount,
+        q.MaxAnswerScore,
+        q.CommentCount,
+        e.UserDisplayName as LastEditor,
+        e.CreationDate as LastEditDate,
+        tba.TopBadges,
+        dl.RelatedPostId as DuplicateOf,
+        dl.PostScore,
+        dl.RelatedPostScore,
+        dl.IsPostHigherScore,
+        case 
+            when q.ViewCount is null or q.ViewCount = 0 then null
+            else round(100.0 * q.PositiveAnswerCount / q.ViewCount, 2)
+        end as PositiveAnswersPerViewPercent,
+        case 
+            when q.Score is null or q.Score = 0 then null
+            else round(100.0 * q.MaxAnswerScore / q.Score, 2)
+        end as MaxAnswerScoreToQuestionScorePercent
+    from PostWithAnswerStats q
+    left join Users u on q.OwnerUserId = u.Id
+    left join FilteredLatestEdits e on e.PostId = q.QuestionId
+    left join DuplicateLinks dl on dl.PostId = q.QuestionId
+    left join TopBadgesAgg tba on tba.UserId = q.OwnerUserId
+)
+select distinct 
+    cr.QuestionId,
+    cr.Title,
+    cr.OwnerUserId,
+    coalesce(cr.OwnerName, 'Unknown') as OwnerName,
+    cr.CreationDate,
+    cr.QuestionScore,
+    cr.ViewCount,
+    cr.PositiveAnswerCount,
+    cr.MaxAnswerScore,
+    cr.CommentCount,
+    cr.LastEditor,
+    cr.LastEditDate,
+    coalesce(cr.TopBadges, 'No badges') as TopBadges,
+    cr.DuplicateOf,
+    cr.PostScore,
+    cr.RelatedPostScore,
+    cr.IsPostHigherScore,
+    coalesce(cr.PositiveAnswersPerViewPercent, 0) as PositiveAnswersPerViewPercent,
+    coalesce(cr.MaxAnswerScoreToQuestionScorePercent, 0) as MaxAnswerScoreToQuestionScorePercent
+from CombinedResult cr
+where 
+    (cr.PositiveAnswerCount > 0 or cr.TopBadges is not null)
+    and 
+    (
+        (exists (
+            select 1 from Users u2 where u2.Id = cr.OwnerUserId and lower(coalesce(u2.Location, '')) like '%us%'
+        ) or
+        exists (
+            select 1 from Users u2 where u2.Id = cr.OwnerUserId and coalesce(u2.Reputation, 0) > 10000
+        ))
+        or cr.DuplicateOf is not null
+    )
+order by cr.PositiveAnswersPerViewPercent desc, cr.MaxAnswerScoreToQuestionScorePercent desc, cr.ViewCount desc
+limit 100;

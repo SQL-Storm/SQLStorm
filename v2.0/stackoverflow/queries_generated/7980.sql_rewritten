@@ -1,0 +1,212 @@
+-- {"query": "7980.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1877} 
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.ViewCount,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        COUNT(DISTINCT b.Id) AS Badges,
+        COALESCE(SUM(p.Score), 0) AS TotalScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        ROW_NUMBER() OVER (ORDER BY SUM(p.Score) DESC, COUNT(DISTINCT p.Id) DESC) AS RankByScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId IN (1, 2)
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.ViewCount, u.UpVotes, u.DownVotes
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        TotalPosts,
+        Questions,
+        Answers,
+        Badges,
+        TotalScore,
+        RankByScore
+    FROM UserStats
+    WHERE RankByScore <= 100
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostType,
+        p.Tags,
+        NULLIF(p.Tags, '') AS CleanTags,
+        CASE 
+            WHEN LENGTH(p.Tags) > 100 THEN 'Long Tags'
+            WHEN LENGTH(p.Tags) BETWEEN 50 AND 100 THEN 'Medium Tags'
+            WHEN LENGTH(p.Tags) < 50 THEN 'Short Tags'
+            ELSE 'No Tags'
+        END AS TagLengthCategory,
+        CASE 
+            WHEN p.Score > 100 THEN 'Highly Rated'
+            WHEN p.Score BETWEEN 10 AND 100 THEN 'Moderately Rated'
+            WHEN p.Score < 10 THEN 'Low Rated'
+            ELSE 'No Rating'
+        END AS RatingCategory,
+        COALESCE(LEFT(p.Title, 50), 'No Title') AS ShortTitle,
+        COALESCE(LEFT(p.Body, 100), 'No Body') AS ShortBody,
+        COALESCE(LENGTH(p.Body), 0) AS BodyLength,
+        CASE 
+            WHEN p.CommentCount > 10 THEN 'High Comment Count'
+            WHEN p.CommentCount BETWEEN 1 AND 10 THEN 'Low Comment Count'
+            ELSE 'No Comments'
+        END AS CommentCategory,
+        CASE 
+            WHEN p.ViewCount > 1000 THEN 'High Views'
+            WHEN p.ViewCount BETWEEN 100 AND 1000 THEN 'Medium Views'
+            WHEN p.ViewCount < 100 THEN 'Low Views'
+            ELSE 'No Views'
+        END AS ViewCategory,
+        p.ViewCount - COALESCE(p.AnswerCount, 0) AS NetViews,
+        (p.Score + COALESCE(p.ViewCount, 0) + COALESCE(p.AnswerCount, 0)) AS CompositeScore
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserPostAnalysis AS (
+    SELECT 
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.TotalPosts,
+        tu.Questions,
+        tu.Answers,
+        tu.Badges,
+        tu.TotalScore,
+        tu.RankByScore,
+        pa.PostId,
+        pa.Title,
+        pa.Body,
+        pa.Score,
+        pa.CompositeScore,
+        pa.NetViews,
+        pa.ViewCategory,
+        pa.TagLengthCategory,
+        pa.RatingCategory,
+        pa.CreationDate AS PostCreationDate,
+        DATEDIFF(DAY, pa.CreationDate, cast('2024-10-01 12:34:56' as timestamp)) AS AgeInDays,
+        DATEDIFF(DAY, tu.LastPostDate, cast('2024-10-01 12:34:56' as timestamp)) AS UserInactiveDays
+    FROM TopUsers tu
+    JOIN PostAnalysis pa ON tu.UserId = pa.OwnerUserId
+),
+CombinedAnalysis AS (
+    SELECT 
+       upa.UserId,
+        upa.DisplayName,
+        upa.Reputation,
+        upa.TotalPosts,
+        upa.Questions,
+        upa.Answers,
+        upa.Badges,
+        upa.TotalScore,
+        upa.RankByScore,
+        upa.PostId,
+        upa.Title,
+        upa.Body,
+        upa.Score,
+        upa.CompositeScore,
+        upa.NetViews,
+        upa.ViewCategory,
+        upa.TagLengthCategory,
+        upa.RatingCategory,
+        upa.PostCreationDate,
+        upa.AgeInDays,
+        upa.UserInactiveDays,
+        CASE 
+            WHEN upa.Score > 50 THEN 'Excellent Post'
+            WHEN upa.Score > 20 THEN 'Good Post'
+            WHEN upa.Score <= 20 THEN 'Average Post'
+            ELSE 'Poor Post'
+        END AS QualityCategory,
+        CASE 
+            WHEN upa.CompositeScore > 1000 THEN 'Top Performer'
+            WHEN upa.CompositeScore > 500 THEN 'High Performer'
+            WHEN upa.CompositeScore <= 500 THEN 'Standard Performer'
+            ELSE 'Low Performer'
+        END AS PerformanceCategory,
+        NTILE(4) OVER (ORDER BY upa.CompositeScore DESC) AS ScoreQuartile,
+        ROW_NUMBER() OVER (PARTITION BY upa.UserId ORDER BY upa.CompositeScore DESC) AS UserPostRank,
+        LAG(upa.CompositeScore, 1) OVER (PARTITION BY upa.UserId ORDER BY upa.CompositeScore DESC) AS PrevScore,
+        LEAD(upa.CompositeScore, 1) OVER (PARTITION BY upa.UserId ORDER BY upa.CompositeScore DESC) AS NextScore,
+        AVG(upa.CompositeScore) OVER (PARTITION BY upa.UserId) AS AvgUserScore,
+        MAX(upa.CompositeScore) OVER (PARTITION BY upa.UserId) AS MaxUserScore,
+        MIN(upa.CompositeScore) OVER (PARTITION BY upa.UserId) AS MinUserScore,
+        COUNT(*) OVER (PARTITION BY upa.UserId) AS TotalUserPosts,
+        upa.AgeInDays - upa.UserInactiveDays AS ActiveAgeInDays,
+        CASE 
+            WHEN upa.ViewCategory = 'High Views' AND upa.RatingCategory IN ('Highly Rated', 'Moderately Rated') THEN 'Popular High Quality'
+            WHEN upa.ViewCategory = 'Low Views' AND upa.RatingCategory = 'Low Rated' THEN 'Low Impact'
+            ELSE 'Standard Impact'
+        END AS ImpactCategory
+    FROM UserPostAnalysis upa
+)
+SELECT 
+    ca.UserId,
+    ca.DisplayName,
+    ca.Reputation,
+    ca.TotalPosts,
+    ca.Questions,
+    ca.Answers,
+    ca.Badges,
+    ca.TotalScore,
+    ca.RankByScore,
+    ca.PostId,
+    ca.Title,
+    ca.Body,
+    ca.Score,
+    ca.CompositeScore,
+    ca.NetViews,
+    ca.ViewCategory,
+    ca.TagLengthCategory,
+    ca.RatingCategory,
+    ca.PostCreationDate,
+    ca.AgeInDays,
+    ca.UserInactiveDays,
+    ca.QualityCategory,
+    ca.PerformanceCategory,
+    ca.ScoreQuartile,
+    ca.UserPostRank,
+    ca.PrevScore,
+    ca.NextScore,
+    ca.AvgUserScore,
+    ca.MaxUserScore,
+    ca.MinUserScore,
+    ca.TotalUserPosts,
+    ca.ActiveAgeInDays,
+    ca.ImpactCategory,
+    CASE 
+        WHEN ca.CompositeScore > (SELECT AVG(CompositeScore) * 1.5 FROM CombinedAnalysis) THEN 'Above Average'
+        WHEN ca.CompositeScore < (SELECT AVG(CompositeScore) * 0.8 FROM CombinedAnalysis) THEN 'Below Average'
+        ELSE 'Average'
+    END AS CompositeScoreStatus,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = ca.UserId AND p.PostTypeId = 1) AS UserQuestions,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = ca.UserId AND p.PostTypeId = 2) AS UserAnswers
+FROM CombinedAnalysis ca
+WHERE ca.UserId IN (
+    SELECT UserId FROM TopUsers 
+    WHERE TotalScore > (
+        SELECT AVG(TotalScore) * 1.2 FROM TopUsers
+    )
+)
+AND ca.AgeInDays < 365
+ORDER BY ca.CompositeScore DESC, ca.UserId
+LIMIT 1000;

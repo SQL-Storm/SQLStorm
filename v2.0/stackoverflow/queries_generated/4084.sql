@@ -1,0 +1,200 @@
+-- {"query": "4084.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2381} 
+
+WITH RankedAnswers AS (
+    SELECT
+        p.Id AS PostId,
+        p.ParentId AS QuestionId,
+        p.OwnerUserId,
+        p.CreationDate AS AnswerCreationDate,
+        ROW_NUMBER() OVER(PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 2 AND p.ParentId IS NOT NULL
+),
+QuestionStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.OwnerUserId AS QuestionOwnerUserId,
+        q.CreationDate AS QuestionCreationDate,
+        q.Title AS QuestionTitle,
+        q.Score AS QuestionScore,
+        q.AnswerCount,
+        q.FavoriteCount,
+        q.ClosedDate,
+        q.CommunityOwnedDate,
+        pt.Name AS PostTypeName,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS IsClosedHisotory,
+        COUNT(DISTINCT c.Id) AS CommentCountOnQuestion,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCountOnQuestion,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCountOnQuestion,
+        STRING_AGG(DISTINCT COALESCE(t.TagName, 'NoTag'), ' | ') AS TagsList
+    FROM Posts q
+    JOIN PostTypes pt ON q.PostTypeId = pt.Id
+    LEFT JOIN PostHistory ph ON q.Id = ph.PostId AND ph.PostHistoryTypeId = 10
+    LEFT JOIN Comments c ON q.Id = c.PostId
+    LEFT JOIN Votes v ON q.Id = v.PostId AND v.VoteTypeId IN (2, 3)
+    LEFT JOIN (
+        SELECT DISTINCT PostId, TRIM(REPLACE(REPLACE(value, '<', ''), '>', '')) AS TagName
+        FROM Posts, json_array_elements_text(json_parse(REPLACE(REPLACE(Tags, '<', '","'), '>', ''))) AS value
+        WHERE Tags IS NOT NULL AND PostTypeId = 1
+    ) AS t ON q.Id = t.PostId
+    WHERE q.PostTypeId = 1 AND q.OwnerUserId IS NOT NULL
+    GROUP BY
+        q.Id,
+        q.OwnerUserId,
+        q.CreationDate,
+        q.Title,
+        q.Score,
+        q.AnswerCount,
+        q.FavoriteCount,
+        q.ClosedDate,
+        q.CommunityOwnedDate,
+        pt.Name
+),
+UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate
+),
+TopAnswerDetails AS (
+    SELECT
+        qs.QuestionId,
+        qs.QuestionTitle,
+        qs.QuestionOwnerUserId,
+        qs.QuestionCreationDate,
+        qs.QuestionScore,
+        qs.AnswerCount AS TotalAnswers,
+        qs.FavoriteCount AS TotalFavorites,
+        qs.PostTypeName,
+        qs.IsClosedHisotory,
+        qs.CommentCountOnQuestion,
+        qs.UpVoteCountOnQuestion,
+        qs.DownVoteCountOnQuestion,
+        qs.TagsList,
+        ra.PostId AS TopAnswerId,
+        ra.OwnerUserId AS TopAnswerOwnerUserId,
+        ra.AnswerCreationDate AS TopAnswerCreationDate,
+        ra.rn AS RankOfTopAnswer,
+        ue.DisplayName AS QuestionOwnerDisplayName,
+        ue.Reputation AS QuestionOwnerReputation,
+        COALESCE(ue.UserCreationDate, '1900-01-01') AS UserRegisteredDate,
+        CASE WHEN qs.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS QuestionStatus,
+        CASE WHEN qs.CommunityOwnedDate IS NOT NULL THEN 'Community Owned' ELSE 'User Owned' END AS OwnershipStatus,
+        ABS(DATEDIFF(day, qs.QuestionCreationDate, GETDATE())) AS QuestionAgeDays,
+        CASE
+            WHEN qs.QuestionScore > 100 THEN 'High Score'
+            WHEN qs.QuestionScore BETWEEN 10 AND 100 THEN 'Medium Score'
+            ELSE 'Low Score'
+        END AS ScoreCategory,
+        CASE
+            WHEN qs.FavoriteCount > 10 THEN 'Highly Favorited'
+            WHEN qs.FavoriteCount BETWEEN 2 AND 10 THEN 'Moderately Favorited'
+            ELSE 'Infrequently Favorited'
+        END AS FavoriteCategory,
+        CASE
+            WHEN ra.OwnerUserId = qs.QuestionOwnerUserId THEN 'Same Owner'
+            ELSE 'Different Owner'
+        END AS AnswerOwnerMatch,
+        CASE
+            WHEN qs.ClosedDate IS NULL AND ra.rn = 1 THEN 'Active and Answered'
+            WHEN qs.ClosedDate IS NOT NULL THEN 'Closed Question'
+            ELSE 'Inactive or Unanswered'
+        END AS ActivityStatus,
+        DATEDIFF(minute, qs.QuestionCreationDate, ra.AnswerCreationDate) AS TimeToFirstAnswerMinutes,
+        CASE
+            WHEN qs.TagsList LIKE '%[sql]%' OR qs.TagsList LIKE '%[database]%' THEN 'Database Related'
+            WHEN qs.TagsList LIKE '%[java]%' OR qs.TagsList LIKE '%[python]%' THEN 'Programming Language Related'
+            ELSE 'Other'
+        END AS TagDomain,
+        CASE
+            WHEN CHARINDEX('important', qs.QuestionTitle) > 0 OR CHARINDEX('critical', qs.QuestionTitle) > 0 THEN 'Urgent Topic'
+            WHEN CHARINDEX('how to', qs.QuestionTitle) > 0 THEN 'How-to Question'
+            ELSE 'General Inquiry'
+        END AS TitleTopicType,
+        LEN(qs.QuestionTitle) AS TitleLength,
+        SUM(CASE WHEN ra.rn = 1 THEN 1 ELSE 0 END) OVER (PARTITION BY qs.QuestionOwnerUserId) AS UserTopAnswerCount
+    FROM QuestionStats qs
+    LEFT JOIN RankedAnswers ra ON qs.QuestionId = ra.QuestionId AND ra.rn = 1
+    LEFT JOIN UserEngagement ue ON qs.QuestionOwnerUserId = ue.UserId
+    WHERE qs.QuestionId IS NOT NULL
+)
+SELECT
+    tad.QuestionId,
+    tad.QuestionTitle,
+    tad.QuestionOwnerUserId,
+    tad.QuestionCreationDate,
+    tad.QuestionScore,
+    tad.TotalAnswers,
+    tad.TotalFavorites,
+    tad.PostTypeName,
+    tad.IsClosedHisotory,
+    tad.CommentCountOnQuestion,
+    tad.UpVoteCountOnQuestion,
+    tad.DownVoteCountOnQuestion,
+    tad.TagsList,
+    tad.TopAnswerId,
+    tad.TopAnswerOwnerUserId,
+    tad.TopAnswerCreationDate,
+    tad.RankOfTopAnswer,
+    tad.QuestionOwnerDisplayName,
+    tad.QuestionOwnerReputation,
+    tad.UserRegisteredDate,
+    tad.QuestionStatus,
+    tad.OwnershipStatus,
+    tad.QuestionAgeDays,
+    tad.ScoreCategory,
+    tad.FavoriteCategory,
+    tad.AnswerOwnerMatch,
+    tad.ActivityStatus,
+    tad.TimeToFirstAnswerMinutes,
+    tad.TagDomain,
+    tad.TitleTopicType,
+    tad.TitleLength,
+    tad.UserTopAnswerCount,
+    ue_answer.DisplayName AS TopAnswerOwnerDisplayName,
+    ue_answer.Reputation AS TopAnswerOwnerReputation,
+    ue_answer.UserCreationDate AS TopAnswerOwnerCreationDate,
+    (SELECT COUNT(*) FROM Comments WHERE PostId = tad.TopAnswerId) AS CommentsOnTopAnswer,
+    (SELECT COUNT(*) FROM Votes WHERE PostId = tad.TopAnswerId AND VoteTypeId = 2) AS UpVotesOnTopAnswer,
+    (SELECT COUNT(*) FROM Votes WHERE PostId = tad.TopAnswerId AND VoteTypeId = 3) AS DownVotesOnTopAnswer,
+    CASE
+        WHEN tad.QuestionOwnerReputation > 50000 THEN 'High Rep User'
+        WHEN tad.QuestionOwnerReputation BETWEEN 1000 AND 50000 THEN 'Medium Rep User'
+        ELSE 'Low Rep User'
+    END AS QuestionOwnerReputationTier,
+    CASE
+        WHEN (tad.QuestionScore + tad.FavoriteCount) > 100 THEN 'High Engagement Question'
+        WHEN (tad.QuestionScore + tad.FavoriteCount) BETWEEN 20 AND 100 THEN 'Medium Engagement Question'
+        ELSE 'Low Engagement Question'
+    END AS QuestionEngagementLevel,
+    CASE
+        WHEN tad.TopAnswerOwnerUserId IS NULL THEN 'No Top Answer Found'
+        WHEN tad.QuestionOwnerUserId IS NULL THEN 'Unknown Answer Owner'
+        WHEN tad.TopAnswerOwnerUserId = tad.QuestionOwnerUserId THEN 'Owner Answered Own Question'
+        WHEN (SELECT COUNT(*) FROM Votes WHERE PostId = tad.TopAnswerId AND VoteTypeId = 2) > (SELECT COUNT(*) FROM Votes WHERE PostId = tad.TopAnswerId AND VoteTypeId = 3) THEN 'Net Positive Votes on Top Answer'
+        ELSE 'Net Neutral or Negative Votes on Top Answer'
+    END AS TopAnswerVoteSummary,
+    CASE
+        WHEN tad.QuestionAgeDays > 365 THEN 'Over a Year Old'
+        WHEN tad.QuestionAgeDays > 90 THEN 'Quarterly Old'
+        WHEN tad.QuestionAgeDays > 30 THEN 'Monthly Old'
+        ELSE 'Recent'
+    END AS QuestionAgeGroup,
+    COALESCE(tad.TagsList, 'UNT tagged') AS ProcessedTagsList
+FROM TopAnswerDetails tad
+LEFT JOIN UserEngagement ue_answer ON tad.TopAnswerOwnerUserId = ue_answer.UserId
+ORDER BY tad.QuestionScore DESC, tad.QuestionCreationDate DESC
+LIMIT 1000;

@@ -1,0 +1,183 @@
+-- {"query": "7556.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2529} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END), 0) as TotalQuestionViews,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.ViewCount ELSE 0 END), 0) as TotalAnswerViews,
+        MAX(p.CreationDate) as LastPostDate,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) as GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) as SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) as BronzeBadges,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT v.Id) as VoteCount,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+                CAST(SUM(p.ViewCount) AS FLOAT) / NULLIF(COUNT(DISTINCT p.Id), 0)
+            ELSE 0 
+        END as AvgViewsPerPost,
+        ROW_NUMBER() OVER (ORDER BY COALESCE(SUM(p.Score), 0) DESC) as RankByScore,
+        NTILE(100) OVER (ORDER BY COALESCE(SUM(p.Score), 0) DESC) as PercentileRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    GROUP BY u.Id, u.Reputation, u.DisplayName
+),
+PostPerformance AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        u.Id as OwnerUserId,
+        u.DisplayName as OwnerDisplayName,
+        p.PostTypeId,
+        pt.Name as PostTypeName,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 
+                COALESCE(p.AnswerCount, 0) * 100.0 / NULLIF(p.ViewCount, 0)
+            WHEN p.PostTypeId = 2 THEN 
+                p.ViewCount * 1.0 / NULLIF(p.Score + 1, 0)
+            ELSE 0 
+        END as EngagementRatio,
+        DATEDIFF(day, p.CreationDate, GETDATE()) as AgeInDays,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+            WHEN DATEDIFF(day, p.CreationDate, GETDATE()) > 365 THEN 'Old'
+            ELSE 'Active'
+        END as PostStatus,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) as RankByScoreWithinType,
+        RANK() OVER (ORDER BY p.Score DESC) as OverallRank
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.PostTypeId IN (1, 2) -- Only questions and answers
+),
+TaggedPosts AS (
+    SELECT 
+        t.Id as TagId,
+        t.TagName,
+        t.Count as TagCount,
+        p.Id as PostId,
+        p.Title as PostTitle,
+        p.Score as PostScore,
+        COALESCE(p.AnswerCount, 0) as AnswerCount,
+        COALESCE(p.ViewCount, 0) as ViewCount,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question' 
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as PostType,
+        ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY p.Score DESC) as ScoreRankPerPost
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE '%' + t.TagName + '%'
+    WHERE t.TagName IS NOT NULL AND t.TagName != ''
+),
+UserTagInterests AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        t.TagName,
+        COUNT(DISTINCT p.Id) as PostsCount,
+        SUM(p.Score) as TotalScore,
+        AVG(p.ViewCount) as AvgViews,
+        MAX(p.CreationDate) as LastActivity,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) >= 10 THEN 'High Interest'
+            WHEN COUNT(DISTINCT p.Id) >= 5 THEN 'Medium Interest'
+            ELSE 'Low Interest'
+        END as InterestLevel,
+        DENSE_RANK() OVER (PARTITION BY u.Id ORDER BY COUNT(DISTINCT p.Id) DESC) as TagRank
+    FROM Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+    JOIN Tags t ON p.Tags LIKE '%' + t.TagName + '%'
+    WHERE t.TagName IS NOT NULL AND t.TagName != ''
+    GROUP BY u.Id, u.DisplayName, t.TagName
+)
+SELECT 
+    'Performance Summary' as ReportType,
+    COUNT(DISTINCT uas.UserId) as TotalUsers,
+    COUNT(DISTINCT pp.PostId) as TotalPosts,
+    (SELECT COUNT(*) FROM Badges) as TotalBadges,
+    (SELECT COUNT(*) FROM Comments) as TotalComments,
+    (SELECT COUNT(*) FROM Votes) as TotalVotes,
+    (SELECT COUNT(DISTINCT PostId) FROM PostLinks) as TotalPostLinks,
+    (SELECT COUNT(*) FROM Tags) as TotalTags,
+    ROUND(AVG(uas.TotalScore), 2) as AvgUserScore,
+    ROUND(AVG(uas.TotalQuestionViews), 2) as AvgQuestionViews,
+    ROUND(AVG(pp.Score), 2) as AvgPostScore,
+    ROUND(AVG(pp.ViewCount), 2) as AvgPostViews,
+    COUNT(DISTINCT CASE WHEN uas.BadgeCount > 0 THEN uas.UserId END) as UsersWithBadges,
+    COUNT(DISTINCT CASE WHEN uas.TotalPosts > 0 THEN uas.UserId END) as UsersWithPosts,
+    COUNT(DISTINCT CASE WHEN uas.CommentCount > 0 THEN uas.UserId END) as UsersWithComments,
+    COUNT(DISTINCT CASE WHEN uas.VoteCount > 0 THEN uas.UserId END) as UsersWithVotes,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1) as TotalQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 2) as TotalAnswers,
+    ROUND(AVG(CASE WHEN pp.PostType = 'Question' THEN pp.Score ELSE NULL END), 2) as AvgQuestionScore,
+    ROUND(AVG(CASE WHEN pp.PostType = 'Answer' THEN pp.Score ELSE NULL END), 2) as AvgAnswerScore,
+    ROUND(AVG(CASE WHEN pp.PostType = 'Question' THEN pp.ViewCount ELSE NULL END), 2) as AvgQuestionViews,
+    ROUND(AVG(CASE WHEN pp.PostType = 'Answer' THEN pp.ViewCount ELSE NULL END), 2) as AvgAnswerViews,
+    COUNT(DISTINCT CASE WHEN pp.PostStatus = 'Closed' THEN pp.PostId END) as ClosedPosts,
+    COUNT(DISTINCT CASE WHEN pp.PostStatus = 'Community Owned' THEN pp.PostId END) as CommunityOwnedPosts,
+    COUNT(DISTINCT CASE WHEN pp.PostStatus = 'Old' THEN pp.PostId END) as OldPosts,
+    COUNT(DISTINCT CASE WHEN pp.PostStatus = 'Active' THEN pp.PostId END) as ActivePosts,
+    (SELECT COUNT(*) FROM Posts WHERE Score > 100) as HighlyScoredPosts,
+    (SELECT COUNT(*) FROM Posts WHERE ViewCount > 1000) as HighlyViewedPosts,
+    (SELECT COUNT(*) FROM Posts WHERE AnswerCount > 10) as HighlyAnsweredPosts,
+    (SELECT COUNT(*) FROM Posts WHERE CommentCount > 5) as HighlyCommentedPosts
+FROM UserActivityStats uas
+FULL OUTER JOIN PostPerformance pp ON 1 = 1
+WHERE uas.UserId IS NOT NULL OR pp.PostId IS NOT NULL
+GROUP BY
+    'Performance Summary'
+HAVING 
+    COUNT(DISTINCT uas.UserId) > 0 OR COUNT(DISTINCT pp.PostId) > 0
+UNION ALL
+SELECT 
+    'Tag Analysis' as ReportType,
+    COUNT(DISTINCT tpi.UserId) as TotalUsers,
+    COUNT(DISTINCT tpi.PostId) as TotalPosts,
+    (SELECT COUNT(*) FROM Badges) as TotalBadges,
+    (SELECT COUNT(*) FROM Comments) as TotalComments,
+    (SELECT COUNT(*) FROM Votes) as TotalVotes,
+    (SELECT COUNT(DISTINCT PostId) FROM PostLinks) as TotalPostLinks,
+    (SELECT COUNT(*) FROM Tags) as TotalTags,
+    ROUND(AVG(tpi.TotalScore), 2) as AvgUserScore,
+    ROUND(AVG(tpi.AvgViews), 2) as AvgTagViews,
+    ROUND(AVG(tpi.PostScore), 2) as AvgPostScore,
+    ROUND(AVG(tpi.ViewCount), 2) as AvgPostViews,
+    COUNT(DISTINCT CASE WHEN tpi.PostsCount > 0 THEN tpi.UserId END) as UsersWithTagPosts,
+    COUNT(DISTINCT CASE WHEN tpi.PostsCount > 0 THEN tpi.UserId END) as UsersWithTagPosts,
+    COUNT(DISTINCT CASE WHEN tpi.PostsCount > 0 THEN tpi.UserId END) as UsersWithTagPosts,
+    COUNT(DISTINCT CASE WHEN tpi.PostsCount > 0 THEN tpi.UserId END) as UsersWithTagPosts,
+    COUNT(DISTINCT CASE WHEN tpi.PostsCount > 0 THEN tpi.UserId END) as UsersWithTagPosts,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1) as TotalQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 2) as TotalAnswers,
+    ROUND(AVG(CASE WHEN tpi.PostType = 'Question' THEN tpi.PostScore ELSE NULL END), 2) as AvgQuestionScore,
+    ROUND(AVG(CASE WHEN tpi.PostType = 'Answer' THEN tpi.PostScore ELSE NULL END), 2) as AvgAnswerScore,
+    ROUND(AVG(CASE WHEN tpi.PostType = 'Question' THEN tpi.ViewCount ELSE NULL END), 2) as AvgQuestionViews,
+    ROUND(AVG(CASE WHEN tpi.PostType = 'Answer' THEN tpi.ViewCount ELSE NULL END), 2) as AvgAnswerViews,
+    COUNT(DISTINCT CASE WHEN tpi.PostsCount > 0 THEN tpi.UserId END) as UsersWithTagPosts,
+    COUNT(DISTINCT CASE WHEN tpi.PostsCount > 0 THEN tpi.UserId END) as UsersWithTagPosts,
+    COUNT(DISTINCT CASE WHEN tpi.PostsCount > 0 THEN tpi.UserId END) as UsersWithTagPosts,
+    COUNT(DISTINCT CASE WHEN tpi.PostsCount > 0 THEN tpi.UserId END) as UsersWithTagPosts,
+    COUNT(DISTINCT CASE WHEN tpi.PostsCount > 0 THEN tpi.UserId END) as UsersWithTagPosts,
+    COUNT(DISTINCT CASE WHEN tpi.PostsCount > 0 THEN tpi.UserId END) as UsersWithTagPosts
+FROM UserTagInterests tpi
+WHERE tpi.UserId IS NOT NULL
+GROUP BY
+    'Tag Analysis'
+HAVING 
+    COUNT(DISTINCT tpi.UserId) > 0;

@@ -1,0 +1,103 @@
+WITH
+UserStats AS (
+    SELECT u.Id,
+           u.DisplayName,
+           u.Reputation,
+           COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1)               AS GoldBadgeCnt,
+           COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1)          AS QCnt,
+           COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2)          AS ACnt,
+           COALESCE(AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END),0) AS AvgQScore,
+           COALESCE(AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END),0) AS AvgAScore,
+           MAX(p.CreationDate)                                          AS LastPostDt
+    FROM   Users   u
+    LEFT   JOIN Badges    b ON b.UserId = u.Id
+    LEFT   JOIN Posts     p ON p.OwnerUserId = u.Id
+    GROUP  BY u.Id, u.DisplayName, u.Reputation
+),
+TagStats AS (
+    SELECT t.TagName,
+           COUNT(p.Id)                                   AS TagQCnt,
+           SUM(p.Score)                                  AS TagTotScore,
+           AVG(p.Score)                                  AS TagAvgScore,
+           STRING_AGG(DISTINCT CAST(u.Id AS TEXT), ',' ORDER BY u.Reputation DESC) AS UserIdList
+    FROM   Tags   t
+    JOIN   Posts  p ON p.Tags LIKE '%' || t.TagName || '>%' AND p.PostTypeId = 1
+    JOIN   Users  u ON u.Id = p.OwnerUserId
+    GROUP  BY t.TagName
+),
+RecentVotes AS (
+    SELECT v.PostId,
+           SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS UpV,
+           SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS DownV,
+           MAX(v.CreationDate)                         AS LastVoteDt
+    FROM   Votes     v
+    JOIN   VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE  v.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '30 days'
+    GROUP  BY v.PostId
+),
+RankedUsers AS (
+    SELECT us.Id,
+           us.DisplayName,
+           us.Reputation,
+           us.GoldBadgeCnt,
+           us.QCnt,
+           us.ACnt,
+           us.AvgQScore,
+           us.AvgAScore,
+           us.LastPostDt,
+           ROW_NUMBER() OVER (ORDER BY us.Reputation DESC, us.GoldBadgeCnt DESC) AS RepRank,
+           PERCENT_RANK() OVER (ORDER BY us.AvgAScore DESC) AS AnswerScorePct
+    FROM   UserStats us
+    WHERE  us.GoldBadgeCnt > 0
+)
+SELECT
+    ru.Id,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.GoldBadgeCnt,
+    ru.QCnt,
+    ru.ACnt,
+    ru.AvgQScore,
+    ru.AvgAScore,
+    ru.LastPostDt,
+    ru.RepRank,
+    ru.AnswerScorePct,
+    COALESCE(t.TagName, 'NULL')                     AS SampleTag,
+    COALESCE(t.TagQCnt,0)                           AS TagQCnt,
+    COALESCE(t.TagAvgScore,0)                       AS TagAvgScore,
+    COALESCE(rv.UpV,0)                              AS RecentUpVotes,
+    COALESCE(rv.DownV,0)                            AS RecentDownVotes,
+    CASE
+        WHEN ru.LastPostDt IS NULL THEN 'NeverPosted'
+        WHEN ru.LastPostDt < CAST('2024-10-01' AS date) - INTERVAL '2 years' THEN 'Dormant'
+        ELSE 'Active'
+    END                                             AS ActivityStatus
+FROM   RankedUsers ru
+LEFT   JOIN LATERAL (
+        SELECT ts.TagName, ts.TagQCnt, ts.TagTotScore, ts.TagAvgScore, ts.UserIdList
+        FROM   TagStats ts
+        WHERE  ts.UserIdList LIKE '%' || CAST(ru.Id AS TEXT) || '%'
+        ORDER  BY ts.TagQCnt DESC
+        LIMIT  1
+) t ON TRUE
+LEFT   JOIN RecentVotes rv
+       ON rv.PostId = (
+           SELECT p.Id
+           FROM   Posts p
+           WHERE  p.OwnerUserId = ru.Id
+                  AND p.PostTypeId = 2
+           ORDER  BY p.CreationDate DESC
+           LIMIT  1
+       )
+WHERE  ru.RepRank <= 100
+ORDER  BY ru.RepRank
+LIMIT  100
+
+UNION ALL
+
+SELECT
+    NULL::bigint, NULL::text, NULL::integer, NULL::integer, NULL::integer,
+    NULL::integer, NULL::numeric, NULL::numeric, NULL::timestamp, NULL::bigint,
+    NULL::double precision, NULL::text, NULL::integer, NULL::numeric, NULL::integer,
+    NULL::integer, NULL::text, NULL::text, NULL::text, NULL::text
+LIMIT 1;

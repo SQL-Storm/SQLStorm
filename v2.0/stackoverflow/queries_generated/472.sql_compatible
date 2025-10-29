@@ -1,0 +1,274 @@
+with recent_questions as (
+    select
+        p.Id as QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        coalesce(p.AnswerCount, 0) as AnswerCount,
+        case when p.ClosedDate is not null then 1 else 0 end as IsClosed
+    from Posts p
+    where p.PostTypeId = 1
+      and p.CreationDate >= (select max(CreationDate) - interval '365 days' from Posts where PostTypeId = 1)
+),
+answers as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId as AnswerOwnerId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreationDate,
+        case when a.Id = q.AcceptedAnswerId then 1 else 0 end as IsAccepted
+    from Posts a
+    join Posts q on q.Id = a.ParentId and a.PostTypeId = 2
+),
+user_activity as (
+    select
+        u.Id as UserId,
+        u.Reputation,
+        u.UpVotes,
+        u.DownVotes,
+        u.Views as ProfileViews,
+        u.CreationDate as UserCreationDate,
+        coalesce(sum(case when b.Class = 1 then 1 else 0 end), 0) as GoldBadges,
+        coalesce(sum(case when b.Class = 2 then 1 else 0 end), 0) as SilverBadges,
+        coalesce(sum(case when b.Class = 3 then 1 else 0 end), 0) as BronzeBadges
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.Reputation, u.UpVotes, u.DownVotes, u.Views, u.CreationDate
+),
+votes_agg as (
+    select
+        v.PostId,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+        sum(case when v.VoteTypeId = 8 then coalesce(v.BountyAmount, 0) else 0 end) as BountyStarted,
+        sum(case when v.VoteTypeId = 9 then coalesce(v.BountyAmount, 0) else 0 end) as BountyAwarded,
+        count(*) as TotalVotes
+    from Votes v
+    group by v.PostId
+),
+recent_edits as (
+    select
+        ph.PostId,
+        max(ph.CreationDate) as LastEditDate,
+        sum(case when ph.PostHistoryTypeId in (4,5,6) then 1 else 0 end) as EditCount,
+        sum(case when ph.PostHistoryTypeId = 10 then 1 else 0 end) as CloseEvents,
+        max(case when ph.PostHistoryTypeId = 10 then (case when ph.Comment ~ '^[0-9]+$' then cast(ph.Comment as integer) else null end) end) as LastCloseReasonId
+    from PostHistory ph
+    group by ph.PostId
+),
+tag_expanded as (
+    select
+        q.QuestionId,
+        unnest(string_to_array(substring(q.Tags, 2, greatest(length(q.Tags)-2,0)), '><')) as Tag
+    from recent_questions q
+    where q.Tags is not null and q.Tags like '<%>'
+),
+tag_stats as (
+    select
+        te.Tag,
+        count(distinct te.QuestionId) as QuestionsWithTag,
+        sum(rq.ViewCount) as TotalViewsWithTag,
+        avg(cast(rq.Score as numeric)) as AvgScoreWithTag
+    from tag_expanded te
+    join recent_questions rq on rq.QuestionId = te.QuestionId
+    group by te.Tag
+),
+dup_links as (
+    select
+        pl.PostId as DuplicateId,
+        pl.RelatedPostId as OriginalId,
+        pl.CreationDate as LinkCreated
+    from PostLinks pl
+    where pl.LinkTypeId = 3
+),
+question_metrics as (
+    select
+        rq.QuestionId,
+        rq.Title,
+        rq.OwnerUserId,
+        rq.CreationDate,
+        rq.Score,
+        rq.ViewCount,
+        rq.AnswerCount,
+        rq.IsClosed,
+        va.UpVotes as QUpVotes,
+        va.DownVotes as QDownVotes,
+        va.TotalVotes as QTotalVotes,
+        coalesce(va.BountyAwarded,0) as QBountyAwarded,
+        re.LastEditDate,
+        re.EditCount,
+        re.CloseEvents,
+        re.LastCloseReasonId,
+        dl.OriginalId as DuplicateOfId,
+        case when dl.OriginalId is not null then 1 else 0 end as IsMarkedDuplicate
+    from recent_questions rq
+    left join votes_agg va on va.PostId = rq.QuestionId
+    left join recent_edits re on re.PostId = rq.QuestionId
+    left join dup_links dl on dl.DuplicateId = rq.QuestionId
+),
+answer_metrics as (
+    select
+        a.QuestionId,
+        count(*) as AnswerCountAll,
+        sum(case when a.IsAccepted = 1 then 1 else 0 end) as AcceptedAnswers,
+        coalesce(max(a.AnswerScore), 0) as TopAnswerScore,
+        min(a.AnswerCreationDate) as FirstAnswerDate
+    from answers a
+    group by a.QuestionId
+),
+owner_enriched as (
+    select
+        qm.*,
+        ua.Reputation as OwnerReputation,
+        ua.UpVotes as OwnerUpVotes,
+        ua.DownVotes as OwnerDownVotes,
+        ua.ProfileViews as OwnerProfileViews,
+        ua.GoldBadges,
+        ua.SilverBadges,
+        ua.BronzeBadges
+    from question_metrics qm
+    left join user_activity ua on ua.UserId = qm.OwnerUserId
+),
+ranked as (
+    select
+        oe.*,
+        am.AnswerCountAll,
+        am.AcceptedAnswers,
+        am.TopAnswerScore,
+        am.FirstAnswerDate,
+        sum(coalesce(oe.QUpVotes,0) - coalesce(oe.QDownVotes,0)) over (order by oe.CreationDate rows between unbounded preceding and current row) as RunningNetVotes,
+        rank() over (order by coalesce(oe.QBountyAwarded,0) desc, coalesce(oe.ViewCount,0) desc) as BountyViewRank,
+        dense_rank() over (order by coalesce(oe.Score,0) desc) as ScoreRank
+    from owner_enriched oe
+    left join answer_metrics am on am.QuestionId = oe.QuestionId
+),
+complex_filter as (
+    select
+        r.*,
+        case
+            when r.IsMarkedDuplicate = 1 and r.IsClosed = 1 then 'DuplicateClosed'
+            when r.IsClosed = 1 and coalesce(r.CloseEvents,0) > 0 then 'ClosedOther'
+            when r.IsMarkedDuplicate = 1 then 'DuplicateOpen'
+            else 'Normal'
+        end as CloseStatus,
+        case
+            when r.OwnerReputation is null then 'Anonymous'
+            when r.OwnerReputation >= 100000 then 'Legend'
+            when r.OwnerReputation >= 10000 then 'HighRep'
+            when r.OwnerReputation >= 1000 then 'MidRep'
+            else 'LowRep'
+        end as RepBucket,
+        case
+            when r.Tags is null then 0
+            else array_length(string_to_array(substring(r.Tags, 2, greatest(length(r.Tags)-2,0)), '><'), 1)
+        end as TagCount
+    from ranked r
+),
+tag_impact as (
+    select
+        cf.QuestionId,
+        avg(ts.AvgScoreWithTag) as AvgTagScore,
+        sum(ts.QuestionsWithTag) as TagGlobalQuestions,
+        sum(ts.TotalViewsWithTag) as TagGlobalViews
+    from complex_filter cf
+    left join tag_expanded te on te.QuestionId = cf.QuestionId
+    left join tag_stats ts on ts.Tag = te.Tag
+    group by cf.QuestionId
+),
+final_scores as (
+    select
+        cf.*,
+        ti.AvgTagScore,
+        ti.TagGlobalQuestions,
+        ti.TagGlobalViews,
+        coalesce(cf.Score,0)
+            + coalesce(cf.QUpVotes,0) * 0.5
+            - coalesce(cf.QDownVotes,0) * 0.7
+            + coalesce(cf.TopAnswerScore,0) * 0.3
+            + case when cf.AcceptedAnswers > 0 then 2 else 0 end
+            + least(coalesce(cf.TagCount,0), 5) * 0.2
+            + coalesce(cf.GoldBadges,0) * 0.05
+            + coalesce(cf.SilverBadges,0) * 0.02
+            + coalesce(cf.BronzeBadges,0) * 0.01
+            + coalesce(cf.AvgTagScore,0) * 0.4
+            + case when cf.IsMarkedDuplicate = 1 then -1 else 0 end
+            + case when cf.IsClosed = 1 then -0.5 else 0 end
+        as CompositeScore
+    from complex_filter cf
+    left join tag_impact ti on ti.QuestionId = cf.QuestionId
+)
+select
+    fs.QuestionId,
+    coalesce(nullif(trim(fs.Title), ''), '(no title)') as Title,
+    fs.OwnerUserId,
+    fs.CreationDate,
+    fs.Score,
+    fs.ViewCount,
+    fs.AnswerCount,
+    fs.AnswerCountAll,
+    fs.AcceptedAnswers,
+    fs.TopAnswerScore,
+    fs.FirstAnswerDate,
+    fs.QUpVotes,
+    fs.QDownVotes,
+    fs.QTotalVotes,
+    fs.QBountyAwarded,
+    fs.LastEditDate,
+    fs.EditCount,
+    fs.CloseEvents,
+    fs.LastCloseReasonId,
+    fs.DuplicateOfId,
+    fs.IsMarkedDuplicate,
+    fs.IsClosed,
+    fs.OwnerReputation,
+    fs.OwnerUpVotes,
+    fs.OwnerDownVotes,
+    fs.OwnerProfileViews,
+    fs.GoldBadges,
+    fs.SilverBadges,
+    fs.BronzeBadges,
+    fs.RunningNetVotes,
+    fs.BountyViewRank,
+    fs.ScoreRank,
+    fs.CloseStatus,
+    fs.RepBucket,
+    fs.TagCount,
+    fs.AvgTagScore,
+    fs.TagGlobalQuestions,
+    fs.TagGlobalViews,
+    round(cast(fs.CompositeScore as numeric), 3) as CompositeScoreRounded,
+    case
+        when fs.CompositeScore >= percentile_disc(0.95) within group (order by fs.CompositeScore) over ()
+            then 'P95+'
+        when fs.CompositeScore >= percentile_disc(0.75) within group (order by fs.CompositeScore) over ()
+            then 'P75-95'
+        when fs.CompositeScore >= percentile_disc(0.5) within group (order by fs.CompositeScore) over ()
+            then 'P50-75'
+        else 'Below P50'
+    end as CompositeTier,
+    case
+        when fs.Tags is null then array[]::varchar[]
+        else string_to_array(substring(fs.Tags, 2, greatest(length(fs.Tags)-2,0)), '><')
+    end as TagArray
+from final_scores fs
+where (
+        fs.IsClosed = 0
+        or fs.CloseStatus in ('DuplicateOpen', 'DuplicateClosed')
+      )
+  and coalesce(fs.OwnerReputation, 0) >= 0
+  and (
+        fs.ViewCount is null
+        or fs.ViewCount >= 0
+      )
+  and (
+        fs.Title is null
+        or length(fs.Title) = 0
+        or position('?' in fs.Title) > 0
+        or fs.ScoreRank <= 100
+      )
+order by fs.CompositeScore desc nulls last, fs.ViewCount desc nulls last
+limit 500;

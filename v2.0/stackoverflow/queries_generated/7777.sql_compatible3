@@ -1,0 +1,237 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS prev_score,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS avg_score_3,
+        CASE 
+            WHEN p.Score > 100 THEN 'High'
+            WHEN p.Score > 50 THEN 'Medium'
+            ELSE 'Low'
+        END AS score_category,
+        COALESCE(p.Tags, '') AS normalized_tags,
+        CASE WHEN p.PostTypeId = 1 AND p.AnswerCount IS NOT NULL THEN p.AnswerCount ELSE 0 END AS answer_count_or_zero
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserStats AS (
+    SELECT 
+        u.Id AS user_id,
+        u.DisplayName,
+        u.Reputation,
+        u.ViewCount,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT r.Id) AS reputation_changes_count,
+        COUNT(DISTINCT p.Id) AS post_count,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS question_count,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS answer_count,
+        MAX(p.CreationDate) AS latest_activity,
+        STRING_AGG(DISTINCT p.Title, '; ') AS recent_titles,
+        CASE 
+            WHEN u.ViewCount > 10000 THEN 'Popular'
+            WHEN u.Reputation > 10000 THEN 'Reputable'
+            WHEN u.UpVotes > 1000 THEN 'Active'
+            ELSE 'Regular'
+        END AS user_category
+    FROM Users u
+    LEFT JOIN PostHistory r ON u.Id = r.UserId
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.ViewCount, u.UpVotes, u.DownVotes
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        COALESCE(p.Title, 'No Title') AS tag_title,
+        CASE 
+            WHEN t.Count > 100 THEN 'Trending'
+            WHEN t.Count > 50 THEN 'Popular'
+            WHEN t.Count > 10 THEN 'Common'
+            ELSE 'Rare'
+        END AS tag_category,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS popularity_rank
+    FROM Tags t
+    LEFT JOIN Posts p ON t.WikiPostId = p.Id
+),
+ComplexJoin AS (
+    SELECT 
+        rp.Id AS post_id,
+        rp.Score,
+        rp.ViewCount,
+        rp.CreationDate,
+        rp.OwnerUserId,
+        rp.Title,
+        rp.Tags,
+        rp.score_category,
+        us.DisplayName AS owner_name,
+        us.Reputation AS owner_reputation,
+        us.user_category,
+        t.TagName,
+        ta.tag_category,
+        ta.popularity_rank,
+        CASE 
+            WHEN rp.prev_score IS NOT NULL AND rp.prev_score > 0 
+            THEN (rp.Score - rp.prev_score) * 100.0 / rp.prev_score 
+            ELSE NULL 
+        END AS score_change_percent,
+        CASE WHEN rp.avg_score_3 IS NOT NULL THEN rp.avg_score_3 ELSE 0 END AS rolling_avg_score,
+        CASE WHEN rp.answer_count_or_zero > 0 
+            THEN CAST(rp.AnswerCount AS DOUBLE PRECISION) / CAST(rp.answer_count_or_zero AS DOUBLE PRECISION) 
+            ELSE 0 END AS answer_ratio,
+        CASE 
+            WHEN rp.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN rp.Score >= 10 THEN 'High Score'
+            WHEN rp.Score > 0 THEN 'Positive Score'
+            ELSE 'Low Score'
+        END AS post_status,
+        (rp.Title || ' (' ||
+               CASE WHEN rp.Tags IS NOT NULL AND rp.Tags <> '' 
+                    THEN rp.Tags 
+                    ELSE 'No Tags' END
+               || ')') AS enhanced_title,
+        CASE 
+            WHEN rp.Score > 0 AND rp.Score < 10 THEN 'Low to Medium'
+            WHEN rp.Score >= 10 AND rp.Score < 100 THEN 'Medium to High'
+            WHEN rp.Score >= 100 THEN 'Very High'
+            ELSE 'No Score' END AS score_band,
+        CASE WHEN rp.PostTypeId = 1 THEN 'Question' ELSE 'Answer' END AS post_type_desc,
+        rp.prev_score,
+        rp.avg_score_3,
+        rp.AnswerCount,
+        rp.answer_count_or_zero,
+        rp.ClosedDate,
+        rp.PostTypeId
+    FROM RankedPosts rp
+    LEFT JOIN UserStats us ON rp.OwnerUserId = us.user_id
+    LEFT JOIN Tags t ON rp.Tags LIKE '%' || t.TagName || '%'
+    LEFT JOIN TagAnalysis ta ON t.TagName = ta.TagName
+    WHERE rp.rn = 1
+      AND rp.Score IS NOT NULL
+      AND us.user_id IS NOT NULL
+      AND (
+          (rp.PostTypeId = 1 AND rp.AnswerCount >= 0) OR
+          (rp.PostTypeId = 2 AND rp.AnswerCount IS NULL)
+      )
+)
+SELECT 
+    cj.post_id,
+    cj.Score,
+    cj.ViewCount,
+    cj.CreationDate,
+    cj.owner_name,
+    cj.owner_reputation,
+    cj.user_category,
+    cj.TagName,
+    cj.tag_category,
+    cj.popularity_rank,
+    cj.score_change_percent,
+    cj.rolling_avg_score,
+    cj.answer_ratio,
+    cj.post_status,
+    cj.enhanced_title,
+    cj.score_band,
+    cj.post_type_desc,
+    COUNT(*) OVER() AS total_posts_processed,
+    RANK() OVER (ORDER BY cj.Score DESC) AS score_rank,
+    DENSE_RANK() OVER (ORDER BY cj.owner_reputation DESC) AS reputation_rank,
+    ROW_NUMBER() OVER (ORDER BY cj.CreationDate DESC) AS chronological_order,
+    NTILE(4) OVER (ORDER BY cj.Score) AS score_quartile,
+    LAG(cj.Score) OVER (ORDER BY cj.CreationDate) AS prior_score,
+    LEAD(cj.Score) OVER (ORDER BY cj.CreationDate) AS next_score,
+    CASE 
+        WHEN cj.Score > (
+            SELECT AVG(p2.Score) 
+            FROM Posts p2
+            WHERE p2.PostTypeId = 1 
+              AND p2.Score > 0
+        ) THEN 'Above Average' 
+        ELSE 'Below Average' 
+    END AS avg_performance,
+    CASE WHEN cj.Score > 50 
+        THEN (SELECT COUNT(*) FROM Posts p WHERE p.Score > cj.Score) 
+        ELSE 0 END AS higher_than_count,
+    CASE WHEN cj.Score > 0 AND cj.ViewCount > 0 
+        THEN CAST(cj.Score AS DOUBLE PRECISION) / CAST(cj.ViewCount AS DOUBLE PRECISION) 
+        ELSE 0 END AS score_to_view_ratio,
+    COALESCE(cj.enhanced_title, 'No title available') AS final_title,
+    CASE 
+        WHEN cj.post_type_desc = 'Question' AND cj.answer_count_or_zero > 0 THEN 
+            CAST(cj.AnswerCount AS DOUBLE PRECISION) / CAST(cj.answer_count_or_zero AS DOUBLE PRECISION)
+        ELSE 0 
+    END AS question_answer_ratio,
+    COALESCE(cj.TagName, 'Uncategorized') AS tag_classification,
+    COALESCE(CAST(cj.popularity_rank AS TEXT), 'Unknown') AS rank_info,
+    CASE 
+        WHEN cj.user_category = 'Popular' THEN 'High Engagement'
+        WHEN cj.user_category = 'Reputable' THEN 'Moderate Engagement'
+        WHEN cj.user_category = 'Active' THEN 'Regular Engagement'
+        WHEN cj.user_category = 'Regular' THEN 'Low Engagement'
+        ELSE 'Unknown'
+    END AS engagement_level,
+    CASE 
+        WHEN cj.post_status IN ('Closed', 'High Score') THEN 'Status Alert'
+        WHEN cj.post_status = 'Positive Score' THEN 'Positive Activity'
+        ELSE 'Standard Activity'
+    END AS activity_status,
+    CASE WHEN cj.score_band IN ('High', 'Medium to High', 'Very High') 
+        THEN 'Important Post' 
+        ELSE 'Routine Post' END AS priority_classification,
+    CASE WHEN cj.Score > 0 THEN (
+         SELECT p3.Score 
+         FROM Posts p3 
+         WHERE p3.OwnerUserId = cj.OwnerUserId 
+         ORDER BY p3.CreationDate DESC
+         LIMIT 1
+    ) ELSE 0 END AS latest_user_score
+FROM ComplexJoin cj
+WHERE cj.Score > 0
+  AND cj.ViewCount > 0
+  AND cj.owner_name IS NOT NULL
+  AND cj.TagName IS NOT NULL
+  AND cj.enhanced_title IS NOT NULL
+GROUP BY 
+    cj.post_id,
+    cj.Score,
+    cj.ViewCount,
+    cj.CreationDate,
+    cj.owner_name,
+    cj.owner_reputation,
+    cj.user_category,
+    cj.TagName,
+    cj.tag_category,
+    cj.popularity_rank,
+    cj.score_change_percent,
+    cj.rolling_avg_score,
+    cj.answer_ratio,
+    cj.post_status,
+    cj.enhanced_title,
+    cj.score_band,
+    cj.post_type_desc,
+    cj.answer_count_or_zero,
+    cj.AnswerCount,
+    cj.OwnerUserId
+HAVING 
+    (cj.score_change_percent IS NULL OR cj.score_change_percent > -100)
+    AND (cj.rolling_avg_score IS NULL OR cj.rolling_avg_score > 0)
+    AND cj.answer_ratio > -1
+    AND cj.answer_ratio < 10
+ORDER BY 
+    cj.CreationDate DESC,
+    cj.Score DESC,
+    cj.ViewCount DESC
+OFFSET 0
+LIMIT 1000;

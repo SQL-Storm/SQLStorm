@@ -1,0 +1,126 @@
+-- {"query": "4140.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1498} 
+
+WITH RankedPosts AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.AnswerCount,
+        pt.Name AS PostTypeName,
+        ROW_NUMBER() OVER(PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) as rn_desc,
+        ROW_NUMBER() OVER(PARTITION BY p.PostTypeId ORDER BY p.Score DESC) as rn_score,
+        LAG(p.Score, 1, 0) OVER(PARTITION BY p.PostTypeId ORDER BY p.CreationDate) as previous_score
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.OwnerUserId IS NOT NULL AND p.OwnerUserId <> -1
+),
+UserPostSummary AS (
+    SELECT
+        up.OwnerUserId,
+        COUNT(up.Id) AS TotalPosts,
+        SUM(CASE WHEN up.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN up.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        AVG(CAST(up.Score AS DECIMAL(10,2))) AS AverageScore,
+        MAX(up.CreationDate) AS LatestPostDate
+    FROM Posts up
+    WHERE up.OwnerUserId IS NOT NULL AND up.OwnerUserId <> -1
+    GROUP BY up.OwnerUserId
+),
+PostCommentAggregates AS (
+    SELECT
+        pc.PostId,
+        COUNT(pc.Id) AS CommentCount,
+        SUM(CASE WHEN pc.Score > 0 THEN 1 ELSE 0 END) AS PositiveCommentCount,
+        AVG(CAST(pc.Score AS DECIMAL(10,2))) AS AverageCommentScore,
+        MAX(pc.CreationDate) AS LatestCommentDate
+    FROM Comments pc
+    GROUP BY pc.PostId
+),
+HighReputationUsers AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(ups.TotalPosts, 0) AS TotalPostsByUser,
+        COALESCE(ups.QuestionCount, 0) AS QuestionsAsked,
+        COALESCE(ups.AnswerCount, 0) AS AnswersGiven,
+        COALESCE(ups.AverageScore, 0.0) AS AvgPostScore,
+        CASE
+            WHEN u.LastAccessDate < DATE('now', '-1 year') THEN 'Inactive'
+            WHEN u.LastAccessDate < DATE('now', '-3 months') THEN 'Moderately Active'
+            ELSE 'Active'
+        END AS UserActivityStatus
+    FROM Users u
+    LEFT JOIN UserPostSummary ups ON u.Id = ups.OwnerUserId
+    WHERE u.Reputation >= 5000
+)
+SELECT
+    rp.Id AS PostId,
+    rp.PostTypeName,
+    rp.CreationDate,
+    rp.Score,
+    rp.AnswerCount,
+    rp.rn_desc,
+    rp.rn_score,
+    rp.previous_score,
+    CASE
+        WHEN rp.Score > rp.previous_score THEN 'Increased'
+        WHEN rp.Score < rp.previous_score THEN 'Decreased'
+        ELSE 'Unchanged'
+    END AS ScoreTrend,
+    hru.DisplayName AS OwnerDisplayName,
+    hru.Reputation AS OwnerReputation,
+    hru.UserActivityStatus,
+    COALESCE(pca.CommentCount, 0) AS TotalComments,
+    COALESCE(pca.PositiveCommentCount, 0) AS PositiveComments,
+    COALESCE(pca.AverageCommentScore, 0.0) AS AvgCommentScore,
+    CASE
+        WHEN rp.PostTypeId = 1 AND rp.AnswerCount > 0 THEN CAST(rp.Score AS FLOAT) / rp.AnswerCount
+        ELSE 0.0
+    END AS ScorePerAnswer,
+    UPPER(SUBSTRING(rp.PostTypeName, 1, 3)) AS TypeAbbreviation,
+    IIF(rp.Score > 100 AND rp.AnswerCount > 5, 'Popular', 'Standard') AS PostPopularity,
+    rp.Score + COALESCE(pca.CommentCount, 0) AS CombinedScore,
+    rp.rn_score * 1000 + rp.rn_desc AS CompositeRank,
+    rp.Id || '-' || rp.OwnerUserId AS PostOwnerKey
+FROM RankedPosts rp
+LEFT JOIN HighReputationUsers hru ON rp.OwnerUserId = hru.Id
+LEFT JOIN PostCommentAggregates pca ON rp.Id = pca.PostId
+WHERE rp.rn_desc <= 50
+UNION ALL
+SELECT
+    rp.Id AS PostId,
+    rp.PostTypeName,
+    rp.CreationDate,
+    rp.Score,
+    rp.AnswerCount,
+    rp.rn_desc,
+    rp.rn_score,
+    rp.previous_score,
+    CASE
+        WHEN rp.Score > rp.previous_score THEN 'Increased'
+        WHEN rp.Score < rp.previous_score THEN 'Decreased'
+        ELSE 'Unchanged'
+    END AS ScoreTrend,
+    hru.DisplayName AS OwnerDisplayName,
+    hru.Reputation AS OwnerReputation,
+    hru.UserActivityStatus,
+    COALESCE(pca.CommentCount, 0) AS TotalComments,
+    COALESCE(pca.PositiveCommentCount, 0) AS PositiveComments,
+    COALESCE(pca.AverageCommentScore, 0.0) AS AvgCommentScore,
+    CASE
+        WHEN rp.PostTypeId = 1 AND rp.AnswerCount > 0 THEN CAST(rp.Score AS FLOAT) / rp.AnswerCount
+        ELSE 0.0
+    END AS ScorePerAnswer,
+    UPPER(SUBSTRING(rp.PostTypeName, 1, 3)) AS TypeAbbreviation,
+    IIF(rp.Score > 100 AND rp.AnswerCount > 5, 'Popular', 'Standard') AS PostPopularity,
+    rp.Score + COALESCE(pca.CommentCount, 0) AS CombinedScore,
+    rp.rn_score * 1000 + rp.rn_desc AS CompositeRank,
+    rp.Id || '-' || rp.OwnerUserId AS PostOwnerKey
+FROM RankedPosts rp
+JOIN HighReputationUsers hru ON rp.OwnerUserId = hru.Id
+LEFT JOIN PostCommentAggregates pca ON rp.Id = pca.PostId
+WHERE rp.rn_score <= 50
+ORDER BY CompositeRank DESC;

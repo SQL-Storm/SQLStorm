@@ -1,0 +1,43 @@
+SELECT
+  u.Id AS UserId,
+  u.DisplayName AS UserName,
+  u.Reputation,
+  COUNT(DISTINCT p.Id) AS PostCount,
+  SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS Questions,
+  SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS Answers,
+  COUNT(DISTINCT v.Id) AS VoteCount,
+  MAX(p.CreationDate) AS LastPostDate,
+  AVG(p.Score) AS AvgPostScore,
+  STRING_AGG(DISTINCT t_top.Name, ',') AS TopTags
+FROM
+  Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN LATERAL (
+    SELECT
+      t.TagName AS Name
+    FROM
+      regexp_split_to_table(COALESCE(p.Tags, ''), '(><|>|<)') AS tag_raw
+      -- normalize tag text: remove angle brackets if any
+      JOIN Tags t ON t.TagName = replace(replace(tag_raw, '<', ''), '>', '')
+    WHERE
+      p.Tags IS NOT NULL AND p.Tags <> ''
+    GROUP BY t.TagName
+    ORDER BY COUNT(*) DESC
+    LIMIT 3
+  ) AS t_top ON true
+  LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+  LEFT JOIN Posts rp ON rp.Id = pl.RelatedPostId
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  LEFT JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+  LEFT JOIN PostTypes pt ON pt.Id = p.PostTypeId
+WHERE
+  u.Id IS NOT NULL
+  AND (
+    p.Id IS NULL
+    OR p.PostTypeId IN (1, 2)
+  )
+GROUP BY
+  u.Id, u.DisplayName, u.Reputation
+ORDER BY
+  u.Reputation DESC, u.DisplayName
+LIMIT 100;

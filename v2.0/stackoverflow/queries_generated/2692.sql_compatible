@@ -1,0 +1,138 @@
+with recursive RecursiveRelatedQuestions as (
+    select p.Id, p.Title, p.Tags, 1 as Level
+    from Posts p
+    where p.PostTypeId = 1
+      and p.CreationDate >= timestamp '2023-01-01'
+      and p.Tags is not null
+    union all
+    select pl.RelatedPostId as Id, p.Title, p.Tags, rrq.Level + 1
+    from PostLinks pl
+    join RecursiveRelatedQuestions rrq on rrq.Id = pl.PostId
+    join Posts p on p.Id = pl.RelatedPostId and p.PostTypeId = 1
+    where rrq.Level < 3
+), LatestPostHistories as (
+    select ph.PostId, ph.PostHistoryTypeId, ph.CreationDate,
+        row_number() over (partition by ph.PostId order by ph.CreationDate desc) as rn
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (10, 11, 12)
+), UserBadgeCounts as (
+    select b.UserId,
+        count(case when b.Class = 1 then 1 end) as GoldBadges,
+        count(case when b.Class = 2 then 1 end) as SilverBadges,
+        count(case when b.Class = 3 then 1 end) as BronzeBadges
+    from Badges b
+    group by b.UserId
+), QuestionStats as (
+    select q.Id as QuestionId,
+        q.OwnerUserId,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.FavoriteCount,
+        q.Tags,
+        coalesce(ubc.GoldBadges, 0) as OwnerGoldBadges,
+        coalesce(ubc.SilverBadges, 0) as OwnerSilverBadges,
+        coalesce(ubc.BronzeBadges, 0) as OwnerBronzeBadges,
+        (select count(*) 
+         from Posts a 
+         where a.ParentId = q.Id and a.Score > 0) as PositiveAnswers,
+        (select count(*) from Comments c where c.PostId = q.Id) as CommentCount,
+        (select ph.CreationDate 
+         from PostHistory ph 
+         where ph.PostId = q.Id and ph.PostHistoryTypeId = 10 
+         order by ph.CreationDate desc
+         limit 1) as LastClosedDate,
+        exists (
+            select 1 from PostLinks pl where pl.PostId = q.Id and pl.LinkTypeId = 3
+        ) as HasDuplicates,
+        (select max(v.CreationDate)
+         from Votes v 
+         where v.PostId = q.Id and v.VoteTypeId = 8) as LastBountyStartDate
+    from Posts q
+    left join UserBadgeCounts ubc on ubc.UserId = q.OwnerUserId
+    where q.PostTypeId = 1
+), SelectedAnswers AS (
+    select a.Id, a.ParentId, a.CreationDate, a.Score, a.OwnerUserId,
+           row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts a
+    where a.PostTypeId = 2
+), StringifiedTags AS (
+    select QuestionId,
+        array_to_string(array_agg(distinct t.TagName order by t.TagName), ', ') as TagList
+    from (
+        select qs.QuestionId, unnest(string_to_array(substring(qs.Tags from 2 for char_length(qs.Tags) - 2), '><')) as Tag
+        from QuestionStats qs
+    ) a
+    join Tags t on t.TagName = a.Tag
+    group by QuestionId
+), FinalResults AS (
+    select qs.QuestionId, qs.Title,
+        qs.CreationDate,
+        qs.Score,
+        qs.ViewCount,
+        qs.AnswerCount,
+        qs.FavoriteCount,
+        coalesce(st.TagList, substring(qs.Tags from 2 for char_length(qs.Tags) - 2)) as Tags,
+        qs.OwnerGoldBadges, qs.OwnerSilverBadges, qs.OwnerBronzeBadges,
+        qs.PositiveAnswers, qs.CommentCount,
+        qs.LastClosedDate,
+        qs.HasDuplicates,
+        qs.LastBountyStartDate,
+        sa.Id as TopAnswerId,
+        sa.CreationDate as TopAnswerCreationDate,
+        sa.Score as TopAnswerScore,
+        sa.OwnerUserId as TopAnswerOwnerUserId,
+        ubc.GoldBadges as TopAnswerOwnerGoldBadges,
+        ubc.SilverBadges as TopAnswerOwnerSilverBadges,
+        ubc.BronzeBadges as TopAnswerOwnerBronzeBadges
+    from QuestionStats qs
+    left join SelectedAnswers sa on sa.ParentId = qs.QuestionId and sa.AnswerRank = 1
+    left join UserBadgeCounts ubc on ubc.UserId = sa.OwnerUserId
+    left join StringifiedTags st on st.QuestionId = qs.QuestionId
+    where (qs.Score > 10 or qs.AnswerCount > 5)
+      and (qs.LastClosedDate is null or qs.LastClosedDate > (timestamp '2024-10-01 12:34:56' - interval '30 days'))
+)
+select fr.QuestionId, fr.Title, fr.CreationDate,
+       fr.Score, fr.ViewCount, fr.AnswerCount, fr.FavoriteCount, fr.Tags,
+       fr.OwnerGoldBadges, fr.OwnerSilverBadges, fr.OwnerBronzeBadges,
+       fr.PositiveAnswers, fr.CommentCount,
+       coalesce(cast(fr.LastClosedDate as text), 'Open') as LastClosedDateText,
+       case when fr.HasDuplicates then 'Yes' else 'No' end as HasDuplicates,
+       coalesce(cast(fr.LastBountyStartDate as text), 'NoBounty') as LastBountyStartDate,
+       fr.TopAnswerId, fr.TopAnswerCreationDate, fr.TopAnswerScore,
+       fr.TopAnswerOwnerUserId,
+       coalesce(fr.TopAnswerOwnerGoldBadges, 0) as TopAnswerOwnerGoldBadges,
+       coalesce(fr.TopAnswerOwnerSilverBadges,0) as TopAnswerOwnerSilverBadges,
+       coalesce(fr.TopAnswerOwnerBronzeBadges,0) as TopAnswerOwnerBronzeBadges,
+       rank() over (partition by extract(year from fr.CreationDate), (case when fr.Tags is null or fr.Tags = '' then 0 else 1 end)
+                    order by fr.Score desc) as ScoreRankByYearAndTag,
+       case 
+          when fr.Tags is null or fr.Tags = '' then 'Untagged'
+          when lower(fr.Tags) like '%sql%' and fr.Score > 50 then 'Popular SQL Question'
+          else 'Other'
+       end as QuestionCategory
+from FinalResults fr
+where fr.FavoriteCount + coalesce(fr.AnswerCount,0) > 
+    (select avg(FavoriteCount + coalesce(AnswerCount,0)) from Posts where PostTypeId = 1)
+union
+select p.Id as QuestionId, '(Deleted or Unknown Title)' as Title, p.CreationDate,
+       0 as Score, 0 as ViewCount, 0 as AnswerCount, 0 as FavoriteCount, '' as Tags,
+       0 as OwnerGoldBadges, 0 as OwnerSilverBadges, 0 as OwnerBronzeBadges,
+       0 as PositiveAnswers, 0 as CommentCount,
+       'Open' as LastClosedDateText,
+       'No' as HasDuplicates,
+       'NoBounty' as LastBountyStartDate,
+       null as TopAnswerId, null as TopAnswerCreationDate, null as TopAnswerScore,
+       null as TopAnswerOwnerUserId,
+       0 as TopAnswerOwnerGoldBadges,
+       0 as TopAnswerOwnerSilverBadges,
+       0 as TopAnswerOwnerBronzeBadges,
+       rank() over () as ScoreRankByYearAndTag,
+       'Orphaned Question' as QuestionCategory
+from Posts p
+where p.PostTypeId = 1
+  and p.OwnerUserId is null
+order by ScoreRankByYearAndTag asc, Score desc
+limit 100;

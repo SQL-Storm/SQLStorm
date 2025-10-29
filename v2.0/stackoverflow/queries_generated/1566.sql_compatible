@@ -1,0 +1,230 @@
+WITH UserBaseMetrics AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate,
+        U.LastAccessDate,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS UserUpVotes,
+        U.DownVotes AS UserDownVotes,
+        U.Location,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestionsOwned,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswersOwned,
+        SUM(P.Score) AS TotalPostScoreOwned,
+        AVG(P.Score) AS AvgPostScoreOwned,
+        COUNT(DISTINCT B.Name) AS DistinctBadgeTypes,
+        EXTRACT(EPOCH FROM (U.LastAccessDate - U.CreationDate))/86400 AS AccountAgeDays,
+        SUM(COALESCE(P.FavoriteCount, 0)) AS TotalFavoriteCountOnPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN COALESCE(P.ViewCount,0) ELSE 0 END) AS TotalViewCountOnQuestions,
+        COUNT(DISTINCT PH_SelfEdit.PostId) AS TotalSelfEditedPosts,
+        COUNT(DISTINCT PH_AnyEdit.PostId) AS TotalPostsWithAnyEdit
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN PostHistory PH_SelfEdit ON P.Id = PH_SelfEdit.PostId AND U.Id = PH_SelfEdit.UserId AND PH_SelfEdit.PostHistoryTypeId IN (4,5,6)
+    LEFT JOIN PostHistory PH_AnyEdit ON P.Id = PH_AnyEdit.PostId AND PH_AnyEdit.PostHistoryTypeId IN (4,5,6)
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Views, U.UpVotes, U.DownVotes, U.Location
+),
+PostDetailedMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.ClosedDate,
+        P.LastEditDate,
+        P.LastActivityDate,
+        P.Title,
+        P.Tags,
+        COUNT(DISTINCT PH.UserId) AS UniqueEditors,
+        MAX(PH.CreationDate) AS LastHistoryActivity,
+        AVG(C.Score) AS AvgCommentScore,
+        COUNT(DISTINCT PL_Linked.RelatedPostId) AS LinkedPostsCount,
+        COUNT(DISTINCT PL_Duplicate.RelatedPostId) AS DuplicateOfCount,
+        MAX(CASE WHEN PH_Reopen.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS WasReopened,
+        MAX(CASE WHEN PH_Close.PostHistoryTypeId = 10 AND PH_Close.Comment = '101' THEN 1 ELSE 0 END) AS ClosedAsDuplicateByReason,
+        CASE WHEN EXISTS (SELECT 1 FROM Votes V WHERE V.PostId = P.Id AND V.VoteTypeId = 4) THEN 1 ELSE 0 END AS HasOffensiveVotes
+    FROM Posts P
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    LEFT JOIN Comments C ON P.Id = C.PostId
+    LEFT JOIN PostLinks PL_Linked ON P.Id = PL_Linked.PostId AND PL_Linked.LinkTypeId = 1
+    LEFT JOIN PostLinks PL_Duplicate ON P.Id = PL_Duplicate.PostId AND PL_Duplicate.LinkTypeId = 3
+    LEFT JOIN PostHistory PH_Reopen ON P.Id = PH_Reopen.PostId AND PH_Reopen.PostHistoryTypeId = 11
+    LEFT JOIN PostHistory PH_Close ON P.Id = PH_Close.PostId AND PH_Close.PostHistoryTypeId = 10
+    GROUP BY
+        P.Id, P.PostTypeId, P.OwnerUserId, P.CreationDate, P.Score, P.ViewCount,
+        P.AnswerCount, P.CommentCount, P.FavoriteCount, P.ClosedDate, P.LastEditDate,
+        P.LastActivityDate, P.Title, P.Tags
+),
+UserPostInteractionSummary AS (
+    SELECT
+        UBM.UserId,
+        UBM.DisplayName,
+        UBM.Reputation,
+        UBM.AccountAgeDays,
+        UBM.UserProfileViews,
+        UBM.UserUpVotes,
+        UBM.UserDownVotes,
+        UBM.Location,
+        UBM.TotalQuestionsOwned,
+        UBM.TotalAnswersOwned,
+        UBM.AvgPostScoreOwned,
+        UBM.DistinctBadgeTypes,
+        UBM.TotalFavoriteCountOnPosts,
+        UBM.TotalViewCountOnQuestions,
+        UBM.TotalSelfEditedPosts,
+        UBM.TotalPostsWithAnyEdit,
+        SUM(CASE WHEN PDM.PostTypeId = 1 THEN PDM.UniqueEditors ELSE 0 END) AS TotalUniqueEditorsOnQuestions,
+        AVG(CASE WHEN PDM.PostTypeId = 1 THEN PDM.AvgCommentScore END) AS AvgCommentScoreOnQuestions,
+        SUM(CASE WHEN PDM.PostTypeId = 1 THEN PDM.LinkedPostsCount ELSE 0 END) AS TotalLinkedQuestions,
+        SUM(CASE WHEN PDM.PostTypeId = 1 THEN PDM.DuplicateOfCount ELSE 0 END) AS TotalDuplicateQuestions,
+        SUM(CASE WHEN PDM.PostTypeId = 1 AND PDM.ClosedDate IS NOT NULL THEN 1 ELSE 0 END) AS ClosedQuestionCount,
+        SUM(CASE WHEN PDM.PostTypeId = 1 AND PDM.WasReopened = 1 THEN 1 ELSE 0 END) AS ReopenedQuestionCount,
+        SUM(CASE WHEN PDM.PostTypeId = 1 AND PDM.ClosedAsDuplicateByReason = 1 THEN 1 ELSE 0 END) AS ClosedAsDuplicateCount,
+        SUM(CASE WHEN PDM.PostTypeId = 1 AND PDM.HasOffensiveVotes = 1 THEN 1 ELSE 0 END) AS QuestionsWithOffensiveVotes,
+        AVG(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - PDM.PostCreationDate))/86400) FILTER (WHERE PDM.PostTypeId = 1) AS AvgQuestionAgeDays,
+        AVG(EXTRACT(EPOCH FROM (PDM.LastActivityDate - PDM.PostCreationDate))/86400) AS AvgDaysToLastActivity,
+        SUM((LENGTH(COALESCE(PDM.Tags,'')) - LENGTH(REPLACE(COALESCE(PDM.Tags,''), '<sql>', '')))/GREATEST(LENGTH('sql'),1)) FILTER (WHERE PDM.PostTypeId = 1 AND PDM.Tags LIKE '%<sql>%') AS SqlTagUsageCount
+    FROM UserBaseMetrics UBM
+    LEFT JOIN PostDetailedMetrics PDM ON UBM.UserId = PDM.OwnerUserId
+    GROUP BY
+        UBM.UserId, UBM.DisplayName, UBM.Reputation, UBM.AccountAgeDays, UBM.UserProfileViews,
+        UBM.UserUpVotes, UBM.UserDownVotes, UBM.Location, UBM.TotalQuestionsOwned,
+        UBM.TotalAnswersOwned, UBM.AvgPostScoreOwned, UBM.DistinctBadgeTypes,
+        UBM.TotalFavoriteCountOnPosts, UBM.TotalViewCountOnQuestions, UBM.TotalSelfEditedPosts,
+        UBM.TotalPostsWithAnyEdit
+),
+RankedUsers AS (
+    SELECT
+        UPS.UserId,
+        UPS.DisplayName,
+        UPS.Reputation,
+        UPS.AccountAgeDays,
+        UPS.UserProfileViews,
+        UPS.TotalQuestionsOwned,
+        UPS.TotalAnswersOwned,
+        UPS.AvgPostScoreOwned,
+        UPS.DistinctBadgeTypes,
+        UPS.TotalFavoriteCountOnPosts,
+        UPS.TotalViewCountOnQuestions,
+        UPS.TotalSelfEditedPosts,
+        UPS.TotalPostsWithAnyEdit,
+        UPS.TotalUniqueEditorsOnQuestions,
+        UPS.AvgCommentScoreOnQuestions,
+        UPS.TotalLinkedQuestions,
+        UPS.TotalDuplicateQuestions,
+        UPS.ClosedQuestionCount,
+        UPS.ReopenedQuestionCount,
+        UPS.ClosedAsDuplicateCount,
+        UPS.QuestionsWithOffensiveVotes,
+        UPS.AvgQuestionAgeDays,
+        UPS.AvgDaysToLastActivity,
+        UPS.SqlTagUsageCount,
+        RANK() OVER (ORDER BY UPS.Reputation DESC, UPS.TotalQuestionsOwned DESC) AS ReputationRank,
+        NTILE(5) OVER (ORDER BY UPS.TotalViewCountOnQuestions DESC) AS TopViewedQuestionsTier,
+        LAG(UPS.Reputation, 1, 0) OVER (ORDER BY UPS.Reputation DESC) AS PrevReputation,
+        COALESCE(CAST(UPS.TotalSelfEditedPosts AS NUMERIC) / NULLIF(UPS.TotalPostsWithAnyEdit, 0), 0) AS SelfEditContributionRatio,
+        (COALESCE(UPS.AvgCommentScoreOnQuestions, 0) * 10) + (COALESCE(UPS.TotalViewCountOnQuestions, 0) / 1000.0) AS EngagementScore,
+        CASE
+            WHEN UPS.Reputation >= 10000 AND UPS.TotalQuestionsOwned >= 50 AND UPS.DistinctBadgeTypes >= 15 THEN 'Guru Contributor'
+            WHEN UPS.Reputation >= 2000 AND UPS.TotalQuestionsOwned >= 10 AND UPS.DistinctBadgeTypes >= 5 THEN 'Experienced Contributor'
+            WHEN UPS.TotalQuestionsOwned > 0 OR UPS.TotalAnswersOwned > 0 THEN 'Active Contributor'
+            ELSE 'Passive User'
+        END AS UserImpactCategory,
+        COALESCE(SUBSTRING(UPS.Location FROM 1 FOR NULLIF(POSITION(',' IN UPS.Location),0)-1), UPS.Location, 'Unknown') AS PrimaryLocationArea,
+        SUM(CASE WHEN PDM_All.PostTypeId = 1 THEN COALESCE(PDM_All.Score,0) ELSE 0 END) OVER (PARTITION BY UPS.UserId) AS TotalQuestionScore
+    FROM UserPostInteractionSummary UPS
+    LEFT JOIN PostDetailedMetrics PDM_All ON UPS.UserId = PDM_All.OwnerUserId
+    WHERE UPS.TotalQuestionsOwned > 0 OR UPS.TotalAnswersOwned > 0 OR UPS.Reputation > 1
+    GROUP BY
+        UPS.UserId, UPS.DisplayName, UPS.Reputation, UPS.AccountAgeDays, UPS.UserProfileViews,
+        UPS.TotalQuestionsOwned, UPS.TotalAnswersOwned, UPS.AvgPostScoreOwned,
+        UPS.DistinctBadgeTypes, UPS.TotalFavoriteCountOnPosts, UPS.TotalViewCountOnQuestions,
+        UPS.TotalSelfEditedPosts, UPS.TotalPostsWithAnyEdit, UPS.TotalUniqueEditorsOnQuestions,
+        UPS.AvgCommentScoreOnQuestions, UPS.TotalLinkedQuestions, UPS.TotalDuplicateQuestions,
+        UPS.ClosedQuestionCount, UPS.ReopenedQuestionCount, UPS.ClosedAsDuplicateCount,
+        UPS.QuestionsWithOffensiveVotes, UPS.AvgQuestionAgeDays, UPS.AvgDaysToLastActivity,
+        UPS.SqlTagUsageCount, UPS.Location
+),
+InfluentialCandidates AS (
+    SELECT
+        RU.UserId,
+        RU.DisplayName,
+        RU.Reputation,
+        RU.UserImpactCategory,
+        RU.ReputationRank,
+        RU.TopViewedQuestionsTier,
+        RU.TotalQuestionsOwned,
+        RU.AvgPostScoreOwned,
+        RU.DistinctBadgeTypes,
+        RU.SelfEditContributionRatio,
+        RU.EngagementScore,
+        RU.PrimaryLocationArea,
+        (RU.Reputation * 0.5 + RU.TotalViewCountOnQuestions * 0.01 + RU.EngagementScore * 0.1 + RU.SelfEditContributionRatio * 100) AS WeightedInfluenceScore,
+        (SELECT COUNT(DISTINCT B.Name) FROM Badges B WHERE B.UserId = RU.UserId AND B.Class = 1 AND B.Date >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year') AS GoldBadgesLastYearCount,
+        COALESCE(CAST(RU.AvgCommentScoreOnQuestions AS VARCHAR), 'N/A') AS FormattedAvgCommentScore,
+        NULLIF(RU.ClosedQuestionCount, RU.ClosedAsDuplicateCount) AS NonDuplicateClosedQuestions,
+        (SELECT COUNT(*) FROM PostHistory PH WHERE PH.UserId = RU.UserId AND PH.PostHistoryTypeId = 12) AS TotalDeletionVotesCast,
+        RU.QuestionsWithOffensiveVotes,
+        RU.TotalViewCountOnQuestions,
+        RU.AccountAgeDays,
+        RU.Location
+    FROM RankedUsers RU
+    WHERE
+        RU.ReputationRank <= 1000
+        AND RU.TopViewedQuestionsTier = 1
+        AND RU.SelfEditContributionRatio > 0.5
+        AND RU.EngagementScore > 100
+        AND RU.UserImpactCategory IN ('Guru Contributor', 'Experienced Contributor')
+        AND EXISTS (
+            SELECT 1
+            FROM Posts P_sub
+            WHERE P_sub.OwnerUserId = RU.UserId
+              AND P_sub.PostTypeId = 1
+              AND P_sub.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1 AND Score IS NOT NULL)
+        )
+        AND (
+            (RU.AccountAgeDays > 365 * 5 AND RU.TotalQuestionsOwned >= 20)
+            OR (RU.Reputation > 5000 AND RU.Location IS NOT NULL AND RU.PrimaryLocationArea LIKE 'New%')
+        )
+        AND RU.QuestionsWithOffensiveVotes = 0
+),
+ProblematicUsers AS (
+    SELECT
+        RU.UserId
+    FROM RankedUsers RU
+    WHERE
+        RU.ClosedAsDuplicateCount >= 5
+        OR RU.QuestionsWithOffensiveVotes > 0
+        OR (SELECT COUNT(*) FROM PostHistory PH WHERE PH.UserId = RU.UserId AND PH.PostHistoryTypeId = 12) > 10
+)
+SELECT
+    IC.UserId,
+    IC.DisplayName,
+    IC.Reputation,
+    IC.UserImpactCategory,
+    IC.ReputationRank,
+    IC.TopViewedQuestionsTier,
+    IC.TotalQuestionsOwned,
+    IC.AvgPostScoreOwned,
+    IC.DistinctBadgeTypes,
+    IC.SelfEditContributionRatio,
+    IC.EngagementScore,
+    IC.PrimaryLocationArea,
+    IC.WeightedInfluenceScore,
+    IC.GoldBadgesLastYearCount,
+    IC.FormattedAvgCommentScore,
+    IC.NonDuplicateClosedQuestions,
+    IC.TotalDeletionVotesCast
+FROM InfluentialCandidates IC
+LEFT JOIN ProblematicUsers PU ON IC.UserId = PU.UserId
+WHERE PU.UserId IS NULL
+ORDER BY IC.WeightedInfluenceScore DESC, IC.Reputation DESC
+LIMIT 500;

@@ -1,0 +1,152 @@
+-- {"query": "4555.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1381} 
+
+WITH
+  RankedPostEdits AS (
+    SELECT
+      ph.PostId,
+      ph.PostHistoryTypeId,
+      ph.UserId,
+      ph.CreationDate,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId, ph.PostHistoryTypeId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory AS ph
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+  ),
+  LatestEdits AS (
+    SELECT
+      rpe.PostId,
+      rpe.UserId AS LastEditorUserId,
+      rpe.CreationDate AS LastEditDate
+    FROM RankedPostEdits AS rpe
+    WHERE
+      rpe.rn = 1
+  ),
+  UserPostCounts AS (
+    SELECT
+      p.OwnerUserId,
+      COUNT(p.Id) AS TotalPostsOwned,
+      SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsOwned,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersOwned
+    FROM Posts AS p
+    WHERE
+      p.OwnerUserId IS NOT NULL AND p.OwnerUserId > 0
+    GROUP BY
+      p.OwnerUserId
+  ),
+  PostVoteAnalysis AS (
+    SELECT
+      p.Id AS PostId,
+      COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVoteCount,
+      COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVoteCount,
+      COUNT(CASE WHEN v.VoteTypeId = 5 THEN 1 END) AS FavoriteCount
+    FROM Posts AS p
+    LEFT JOIN Votes AS v
+      ON p.Id = v.PostId
+    GROUP BY
+      p.Id
+  ),
+  CommunityContent AS (
+    SELECT
+      p.Id AS PostId,
+      p.CommunityOwnedDate
+    FROM Posts AS p
+    WHERE
+      p.CommunityOwnedDate IS NOT NULL
+  )
+SELECT
+  COALESCE(p.Id, cc.PostId) AS PostIdentifier,
+  pt.Name AS PostTypeName,
+  u.DisplayName AS OwnerDisplayName,
+  le.LastEditorDisplayName,
+  le.LastEditDate,
+  p.Title,
+  p.Tags,
+  p.Score,
+  pva.UpVoteCount,
+  pva.DownVoteCount,
+  pva.FavoriteCount,
+  upc.TotalPostsOwned,
+  upc.QuestionsOwned,
+  upc.AnswersOwned,
+  CASE
+    WHEN cc.PostId IS NOT NULL THEN 'Community Owned'
+    WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+    WHEN p.ParentId IS NOT NULL THEN 'Answer'
+    ELSE 'Question'
+  END AS PostStatusCategory,
+  CASE
+    WHEN p.OwnerUserId IS NOT NULL THEN u.Reputation
+    ELSE 0
+  END AS OwnerReputation,
+  CASE
+    WHEN p.OwnerUserId IS NOT NULL THEN u.CreationDate
+    ELSE '1970-01-01'::timestamp
+  END AS OwnerCreationDate,
+  (
+    SELECT
+      COUNT(*)
+    FROM Comments AS c
+    WHERE
+      c.PostId = COALESCE(p.Id, cc.PostId) AND c.CreationDate > COALESCE(p.LastActivityDate, cc.CommunityOwnedDate)
+  ) AS CommentsAfterLastActivity,
+  COALESCE(p.AnswerCount, 0) AS AnswerCount,
+  COALESCE(p.CommentCount, 0) AS CommentCount,
+  COALESCE(p.FavoriteCount, 0) AS PostFavoriteCount, -- Renamed to avoid conflict with vote analysis
+  COALESCE(p.ViewCount, 0) AS PostViewCount,
+  'Post Performance Metric' AS MetricType
+FROM Posts AS p
+FULL OUTER JOIN CommunityContent AS cc
+  ON p.Id = cc.PostId
+LEFT JOIN PostTypes AS pt
+  ON p.PostTypeId = pt.Id
+LEFT JOIN Users AS u
+  ON p.OwnerUserId = u.Id
+LEFT JOIN LatestEdits AS le
+  ON COALESCE(p.Id, cc.PostId) = le.PostId
+LEFT JOIN UserPostCounts AS upc
+  ON COALESCE(p.OwnerUserId, u.Id) = upc.OwnerUserId
+LEFT JOIN PostVoteAnalysis AS pva
+  ON COALESCE(p.Id, cc.PostId) = pva.PostId
+WHERE
+  pt.Name IN ('Question', 'Answer') AND COALESCE(p.Score, 0) > 0
+UNION
+SELECT
+  NULL AS PostIdentifier,
+  'Tag Wiki Excerpt' AS PostTypeName,
+  NULL AS OwnerDisplayName,
+  NULL AS LastEditorDisplayName,
+  NULL AS LastEditDate,
+  t.TagName AS Title,
+  t.TagName AS Tags,
+  p.Score,
+  pva.UpVoteCount,
+  pva.DownVoteCount,
+  pva.FavoriteCount,
+  NULL AS TotalPostsOwned,
+  NULL AS QuestionsOwned,
+  NULL AS AnswersOwned,
+  'Tag Information' AS PostStatusCategory,
+  NULL AS OwnerReputation,
+  NULL AS OwnerCreationDate,
+  (
+    SELECT
+      COUNT(*)
+    FROM Comments AS c
+    WHERE
+      c.PostId = p.Id AND c.CreationDate > p.LastActivityDate
+  ) AS CommentsAfterLastActivity,
+  NULL AS AnswerCount,
+  p.CommentCount,
+  NULL AS PostFavoriteCount,
+  p.ViewCount AS PostViewCount,
+  'Tag Performance Metric' AS MetricType
+FROM Posts AS p
+JOIN Tags AS t
+  ON p.Id = t.ExcerptPostId
+LEFT JOIN PostVoteAnalysis AS pva
+  ON p.Id = pva.PostId
+WHERE
+  t.ExcerptPostId IS NOT NULL AND p.Score > 0
+ORDER BY
+  PostIdentifier NULLS LAST,
+  MetricType;

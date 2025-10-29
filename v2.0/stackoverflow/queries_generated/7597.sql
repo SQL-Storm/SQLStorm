@@ -1,0 +1,278 @@
+-- {"query": "7597.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2359} 
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT v.Id) as VoteCount,
+        MAX(p.CreationDate) as LastPostDate,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Elite'
+            WHEN u.Reputation > 5000 THEN 'Veteran'
+            WHEN u.Reputation > 1000 THEN 'Active'
+            ELSE 'Newbie'
+        END as ReputationTier,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 100 THEN 'HighlyActive'
+            WHEN COUNT(DISTINCT p.Id) > 50 THEN 'Active'
+            WHEN COUNT(DISTINCT p.Id) > 10 THEN 'Regular'
+            ELSE 'Occasional'
+        END as ActivityLevel,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        COALESCE(SUM(p.ViewCount), 0) as TotalViews,
+        COALESCE(SUM(p.FavoriteCount), 0) as TotalFavorites
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        PostCount,
+        BadgeCount,
+        CommentCount,
+        VoteCount,
+        LastPostDate,
+        ReputationTier,
+        ActivityLevel,
+        TotalScore,
+        TotalViews,
+        TotalFavorites,
+        ROW_NUMBER() OVER (ORDER BY TotalScore DESC, PostCount DESC) as RankByScore,
+        ROW_NUMBER() OVER (ORDER BY TotalViews DESC, PostCount DESC) as RankByViews,
+        ROW_NUMBER() OVER (ORDER BY BadgeCount DESC, PostCount DESC) as RankByBadges
+    FROM UserStats
+),
+QuestionPerformance AS (
+    SELECT 
+        p.Id as QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        p.Tags,
+        STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><') as TagArray,
+        CASE 
+            WHEN p.AnswerCount = 0 THEN 'No Answers'
+            WHEN p.AnswerCount = 1 THEN 'One Answer'
+            WHEN p.AnswerCount > 1 AND p.AnswerCount <= 5 THEN 'Few Answers'
+            ELSE 'Many Answers'
+        END as AnswerCategory,
+        CASE 
+            WHEN p.ViewCount > 1000 THEN 'High Traffic'
+            WHEN p.ViewCount > 500 THEN 'Medium Traffic'
+            WHEN p.ViewCount > 100 THEN 'Low Traffic'
+            ELSE 'Very Low Traffic'
+        END as TrafficLevel,
+        DATEDIFF('DAY', p.CreationDate, CURRENT_TIMESTAMP) as AgeInDays,
+        CASE 
+            WHEN DATEDIFF('DAY', p.CreationDate, CURRENT_TIMESTAMP) < 30 THEN 'Recent'
+            WHEN DATEDIFF('DAY', p.CreationDate, CURRENT_TIMESTAMP) < 365 THEN 'Medium Age'
+            ELSE 'Old'
+        END as AgeCategory,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as QuestionRank,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as AvgScorePerUser,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) as QuestionsPerUser
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1  -- Only questions
+    AND p.Score > 0
+),
+BestAnswers AS (
+    SELECT 
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.Score,
+        a.CreationDate,
+        a.OwnerUserId,
+        u.DisplayName as AnswererName,
+        CASE 
+            WHEN a.OwnerUserId IS NULL THEN 'Deleted User'
+            ELSE 'Active User'
+        END as UserStatus,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC) as BestAnswerRank,
+        NTILE(4) OVER (ORDER BY a.Score DESC) as ScoreQuartile,
+        RANK() OVER (ORDER BY a.CreationDate) as ChronologicalRank
+    FROM Posts a
+    LEFT JOIN Users u ON a.OwnerUserId = u.Id
+    WHERE a.PostTypeId = 2  -- Answers only
+    AND a.Score > 0
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 500 THEN 'Moderately Popular'
+            WHEN t.Count > 100 THEN 'Niche'
+            ELSE 'Rare'
+        END as PopularityLevel,
+        DENSE_RANK() OVER (ORDER BY t.Count DESC) as PopularityRank,
+        AVG(t.Count) OVER () as AvgTagCount,
+        CASE 
+            WHEN t.Count > (SELECT AVG(Count) FROM Tags) THEN 1
+            ELSE 0
+        END as IsAboveAverage
+    FROM Tags t
+),
+ComplexQueryResult AS (
+    SELECT 
+        QU.UserId,
+        QU.DisplayName,
+        QU.Reputation,
+        QU.PostCount,
+        QU.BadgeCount,
+        QU.CommentCount,
+        QU.VoteCount,
+        QU.ReputationTier,
+        QU.ActivityLevel,
+        QU.TotalScore,
+        QU.TotalViews,
+        QU.TotalFavorites,
+        QP.QuestionId,
+        QP.Title,
+        QP.Score as QuestionScore,
+        QP.ViewCount as QuestionViews,
+        QP.AnswerCount,
+        QP.CommentCount as QuestionComments,
+        QP.FavoriteCount as QuestionFavorites,
+        QP.CreationDate as QuestionCreation,
+        QP.AnswerCategory,
+        QP.TrafficLevel,
+        QP.AgeInDays,
+        QP.AgeCategory,
+        QP.QuestionRank,
+        QP.AvgScorePerUser,
+        QP.QuestionsPerUser,
+        BA.AnswerId,
+        BA.AnswerScore,
+        BA.AnswerCreationDate,
+        BA.AnswererName,
+        BA.UserStatus,
+        BA.BestAnswerRank,
+        BA.ScoreQuartile,
+        BA.ChronologicalRank,
+        TA.TagName,
+        TA.Count as TagCount,
+        TA.PopularityLevel,
+        TA.PopularityRank,
+        TA.IsAboveAverage,
+        CASE 
+            WHEN QU.TotalScore > 0 AND QP.Score > 0 THEN (QU.TotalScore * 1.0 / QP.Score)
+            ELSE NULL
+        END as ScoreRatio,
+        CASE 
+            WHEN QU.TotalViews > 0 AND QP.ViewCount > 0 THEN (QU.TotalViews / QP.ViewCount)
+            ELSE NULL
+        END as ViewRatio,
+        CASE 
+            WHEN QP.CreationDate IS NOT NULL AND BA.AnswerCreationDate IS NOT NULL THEN DATEDIFF('MINUTE', QP.CreationDate, BA.AnswerCreationDate)
+            ELSE NULL
+        END as AnswerTimeInMinutes,
+        CASE 
+            WHEN QU.TotalFavorites = 0 OR QP.FavoriteCount = 0 THEN NULL
+            ELSE (QU.TotalFavorites * 1.0 / QP.FavoriteCount)
+        END as FavoriteRatio,
+        COALESCE(QU.TotalViews, 0) + COALESCE(QP.ViewCount, 0) as CombinedViews,
+        COALESCE(QU.TotalScore, 0) + COALESCE(QP.Score, 0) as CombinedScore
+    FROM TopUsers QU
+    LEFT JOIN QuestionPerformance QP ON QU.UserId = QP.OwnerUserId
+    LEFT JOIN BestAnswers BA ON QP.QuestionId = BA.QuestionId AND BA.BestAnswerRank = 1
+    LEFT JOIN TagAnalysis TA ON TA.TagName IN (
+        SELECT unnest(QP.TagArray) 
+        WHERE QP.TagArray IS NOT NULL 
+        AND QP.TagArray != '{}'
+    )
+    WHERE QU.RankByScore <= 50  -- Top 50 users
+    AND QP.QuestionId IS NOT NULL
+    ORDER BY QU.TotalScore DESC, QP.Score DESC
+)
+SELECT * FROM ComplexQueryResult
+WHERE CombinedViews > 100
+AND CombinedScore > 50
+AND (AnswerTimeInMinutes IS NULL OR AnswerTimeInMinutes < 1440)  -- Less than 24 hours
+AND (ScoreRatio IS NULL OR ScoreRatio > 0.1)
+AND (ViewRatio IS NULL OR ViewRatio > 0.5)
+AND EXISTS (
+    SELECT 1 FROM Posts p 
+    JOIN Votes v ON p.Id = v.PostId 
+    WHERE p.OwnerUserId = ComplexQueryResult.UserId 
+    AND v.VoteTypeId IN (2, 3)  -- UpVotes and DownVotes
+)
+UNION ALL
+SELECT 
+    QU.UserId,
+    QU.DisplayName,
+    QU.Reputation,
+    QU.PostCount,
+    QU.BadgeCount,
+    QU.CommentCount,
+    QU.VoteCount,
+    QU.ReputationTier,
+    QU.ActivityLevel,
+    QU.TotalScore,
+    QU.TotalViews,
+    QU.TotalFavorites,
+    NULL as QuestionId,
+    NULL as Title,
+    NULL as QuestionScore,
+    NULL as QuestionViews,
+    NULL as AnswerCount,
+    NULL as QuestionComments,
+    NULL as QuestionFavorites,
+    NULL as QuestionCreation,
+    NULL as AnswerCategory,
+    NULL as TrafficLevel,
+    NULL as AgeInDays,
+    NULL as AgeCategory,
+    NULL as QuestionRank,
+    NULL as AvgScorePerUser,
+    NULL as QuestionsPerUser,
+    NULL as AnswerId,
+    NULL as AnswerScore,
+    NULL as AnswerCreationDate,
+    NULL as AnswererName,
+    NULL as UserStatus,
+    NULL as BestAnswerRank,
+    NULL as ScoreQuartile,
+    NULL as ChronologicalRank,
+    TA.TagName,
+    TA.Count as TagCount,
+    TA.PopularityLevel,
+    TA.PopularityRank,
+    TA.IsAboveAverage,
+    NULL as ScoreRatio,
+    NULL as ViewRatio,
+    NULL as AnswerTimeInMinutes,
+    NULL as FavoriteRatio,
+    NULL as CombinedViews,
+    NULL as CombinedScore
+FROM TopUsers QU
+JOIN TagAnalysis TA ON TA.IsAboveAverage = 1
+WHERE QU.RankByViews <= 100
+AND EXISTS (
+    SELECT 1 FROM Posts p 
+    WHERE p.OwnerUserId = QU.UserId 
+    AND p.PostTypeId = 1
+)
+ORDER BY CombinedScore DESC, TagCount DESC
+LIMIT 1000;

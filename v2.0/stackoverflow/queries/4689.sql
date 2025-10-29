@@ -1,0 +1,129 @@
+WITH RankedUserPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.CreationDate AS PostCreationDate,
+        ROW_NUMBER() OVER(PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn_user_post_desc,
+        ROW_NUMBER() OVER(PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS rn_user_post_score,
+        RANK() OVER(PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ASC) AS rnk_user_post_asc_date,
+        SUM(p.Score) OVER(PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cumulative_score
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+),
+HighScoringQuestions AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.Title,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        u.Reputation,
+        u.DisplayName,
+        u.Views AS UserViews,
+        COUNT(c.Id) AS CommentCountOnQuestion,
+        (SELECT COUNT(ph.Id) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4, 5)) AS EditCount,
+        p.Score
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    WHERE p.PostTypeId = 1 -- Question
+      AND p.Score > 100 -- High scoring questions
+      AND p.AnswerCount > 0
+      AND u.Reputation > 5000
+    GROUP BY p.Id, p.OwnerUserId, p.Title, p.AnswerCount, p.FavoriteCount, p.CreationDate, u.Reputation, u.DisplayName, u.Views, p.Score
+    HAVING AVG(p.Score) > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1)
+),
+UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(p.LastActivityDate) AS LastActivity,
+        CASE
+            WHEN u.Reputation > 50000 THEN 'Expert'
+            WHEN u.Reputation > 10000 THEN 'Experienced'
+            WHEN u.Reputation > 1000 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END AS ReputationLevel,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadges,
+        COALESCE(u.WebsiteUrl, 'No Website') AS UserWebsite,
+        LENGTH(COALESCE(u.AboutMe, '')) AS AboutMeLength,
+        CASE WHEN u.Location IS NULL OR u.Location = '' THEN 'Unknown' ELSE u.Location END AS UserLocation,
+        u.Reputation
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.WebsiteUrl, u.AboutMe, u.Location
+    HAVING COUNT(DISTINCT p.Id) > 10 -- Users with more than 10 posts
+)
+SELECT
+    hq.Id AS QuestionId,
+    hq.Title AS QuestionTitle,
+    hq.CreationDate AS QuestionCreationDate,
+    hq.Reputation AS OwnerReputation,
+    hq.DisplayName AS OwnerDisplayName,
+    hq.AnswerCount AS QuestionAnswerCount,
+    hq.FavoriteCount AS QuestionFavoriteCount,
+    hq.CommentCountOnQuestion,
+    hq.EditCount,
+    uas.TotalPosts AS OwnerTotalPosts,
+    uas.QuestionCount AS OwnerQuestionCount,
+    uas.AnswerCount AS OwnerAnswerCount,
+    uas.AvgPostScore AS OwnerAvgPostScore,
+    uas.ReputationLevel AS OwnerReputationLevel,
+    uas.GoldBadges,
+    uas.SilverBadges,
+    uas.BronzeBadges,
+    uas.UserWebsite,
+    uas.AboutMeLength,
+    uas.UserLocation,
+    CASE
+        WHEN hq.CreationDate < (cast('2024-10-01' as date) - INTERVAL '1 year') AND hq.AnswerCount < 5 THEN 'Aging Question, Low Engagement'
+        WHEN hq.CreationDate >= (cast('2024-10-01' as date) - INTERVAL '1 month') AND hq.Score > 50 THEN 'Recent Popular Question'
+        WHEN hq.FavoriteCount > 10 AND hq.AnswerCount > 15 THEN 'Highly Favorited & Answered'
+        ELSE 'Standard Activity'
+    END AS QuestionStatus,
+    UPPER(SUBSTRING(hq.Title FROM 1 FOR 3)) || '-' || LOWER(REPLACE(hq.DisplayName, ' ', '_')) AS DerivedIdentifier,
+    COALESCE(CAST(hq.UserViews AS VARCHAR), 'N/A') AS FormattedUserViews,
+    (SELECT COUNT(*) FROM Votes v WHERE v.UserId = hq.OwnerUserId AND v.VoteTypeId = 2) AS OwnerUpvotes,
+    (SELECT COUNT(*) FROM Votes v WHERE v.UserId = hq.OwnerUserId AND v.VoteTypeId = 3) AS OwnerDownvotes
+FROM HighScoringQuestions hq
+LEFT JOIN UserActivitySummary uas ON hq.OwnerUserId = uas.UserId
+WHERE hq.CreationDate > (cast('2024-10-01' as date) - INTERVAL '5 years')
+UNION
+SELECT
+    NULL AS QuestionId,
+    NULL AS QuestionTitle,
+    NULL AS QuestionCreationDate,
+    NULL AS OwnerReputation,
+    NULL AS OwnerDisplayName,
+    NULL AS QuestionAnswerCount,
+    NULL AS QuestionFavoriteCount,
+    NULL AS CommentCountOnQuestion,
+    NULL AS EditCount,
+    NULL AS OwnerTotalPosts,
+    NULL AS OwnerQuestionCount,
+    NULL AS OwnerAnswerCount,
+    NULL AS OwnerAvgPostScore,
+    NULL AS OwnerReputationLevel,
+    NULL AS GoldBadges,
+    NULL AS SilverBadges,
+    NULL AS BronzeBadges,
+    NULL AS UserWebsite,
+    NULL AS AboutMeLength,
+    NULL AS UserLocation,
+    NULL AS QuestionStatus,
+    NULL AS DerivedIdentifier,
+    NULL AS FormattedUserViews,
+    NULL AS OwnerUpvotes,
+    NULL AS OwnerDownvotes
+FROM Users u
+WHERE NOT EXISTS (SELECT 1 FROM HighScoringQuestions hq WHERE hq.OwnerUserId = u.Id)
+  AND u.Reputation > 100000;

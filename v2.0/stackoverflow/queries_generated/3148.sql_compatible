@@ -1,0 +1,120 @@
+WITH
+UserStats AS (
+    SELECT
+        u.Id                                            AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT b.Id)                             AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END)    AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END)    AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END)    AS BronzeBadges,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId IN (1,2))   AS AvgPostScore,
+        MAX(p.CreationDate)                                 AS LastPostDate
+    FROM Users u
+    LEFT JOIN Badges b  ON b.UserId = u.Id
+    LEFT JOIN Posts  p  ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+RecentVotes AS (
+    SELECT
+        v.UserId,
+        COUNT(*)                                            AS VotesLast30Days,
+        SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END)         AS UpVotes,
+        SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END)         AS DownVotes
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE v.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '30' DAY)
+    GROUP BY v.UserId
+),
+TagActivity AS (
+    SELECT
+        p.OwnerUserId                                   AS UserId,
+        tags.tag                                       AS TagName,
+        COUNT(*)                                        AS TagPostCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId
+                           ORDER BY COUNT(*) DESC)      AS rn
+    FROM Posts p
+    JOIN LATERAL (
+        SELECT unnest(string_to_array(
+                 substring(p.Tags, 2, length(p.Tags)-2), '><')) AS tag
+    ) AS tags ON TRUE
+    JOIN Tags t ON t.TagName = tags.tag
+    WHERE p.PostTypeId = 1
+      AND p.Tags IS NOT NULL
+    GROUP BY p.OwnerUserId, tags.tag
+),
+TopTagPerUser AS (
+    SELECT UserId, TagName, TagPostCount
+    FROM TagActivity
+    WHERE rn = 1
+),
+FriendCounts AS (
+    SELECT
+        u.Id                                          AS UserId,
+        (SELECT COUNT(*)
+         FROM Users f
+         WHERE f.Id <> u.Id
+           AND ABS(f.Reputation - u.Reputation) <= 1000) AS SimilarReputationFriends
+    FROM Users u
+)
+SELECT
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.BadgeCount,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    us.QuestionCount,
+    us.AnswerCount,
+    COALESCE(us.AvgPostScore,0)                AS AvgPostScore,
+    us.LastPostDate,
+    COALESCE(rv.VotesLast30Days,0)             AS VotesLast30Days,
+    COALESCE(rv.UpVotes,0) - COALESCE(rv.DownVotes,0) AS NetVoteScore,
+    COALESCE(tp.TagName,'N/A')                 AS TopTag,
+    COALESCE(tp.TagPostCount,0)                AS TopTagPostCount,
+    fc.SimilarReputationFriends,
+    CASE
+        WHEN us.Reputation > 20000                     THEN 'Elite'
+        WHEN us.Reputation BETWEEN 10000 AND 19999     THEN 'PowerUser'
+        WHEN us.Reputation BETWEEN 5000  AND 9999      THEN 'Experienced'
+        ELSE                                             'Novice'
+    END                                          AS ReputationTier
+FROM UserStats     us
+LEFT JOIN RecentVotes   rv ON rv.UserId = us.UserId
+LEFT JOIN TopTagPerUser tp ON tp.UserId = us.UserId
+LEFT JOIN FriendCounts  fc ON fc.UserId = us.UserId
+WHERE us.BadgeCount   >= 10
+   OR us.QuestionCount > 50
+   OR us.AnswerCount   > 100
+
+UNION ALL
+
+SELECT
+    NULL AS UserId,
+    'SUMMARY' AS DisplayName,
+    AVG(us.Reputation)                              AS Reputation,
+    SUM(us.BadgeCount)                              AS BadgeCount,
+    SUM(us.GoldBadges)                              AS GoldBadges,
+    SUM(us.SilverBadges)                            AS SilverBadges,
+    SUM(us.BronzeBadges)                            AS BronzeBadges,
+    SUM(us.QuestionCount)                           AS QuestionCount,
+    SUM(us.AnswerCount)                             AS AnswerCount,
+    AVG(us.AvgPostScore)                            AS AvgPostScore,
+    MAX(us.LastPostDate)                            AS LastPostDate,
+    SUM(COALESCE(rv.VotesLast30Days,0))             AS VotesLast30Days,
+    SUM(COALESCE(rv.UpVotes,0) - COALESCE(rv.DownVotes,0))
+                                                    AS NetVoteScore,
+    NULL                                            AS TopTag,
+    NULL                                            AS TopTagPostCount,
+    NULL                                            AS SimilarReputationFriends,
+    NULL                                            AS ReputationTier
+FROM UserStats us
+LEFT JOIN RecentVotes rv ON rv.UserId = us.UserId
+WHERE us.BadgeCount   >= 10
+   OR us.QuestionCount > 50
+   OR us.AnswerCount   > 100
+ORDER BY Reputation DESC NULLS LAST
+LIMIT 100;

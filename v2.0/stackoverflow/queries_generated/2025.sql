@@ -1,0 +1,201 @@
+-- {"query": "2025.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2023} 
+
+WITH 
+UserBadges AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COUNT(DISTINCT b.Name) AS DistinctBadges
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Reputation > 1000 -- moderately active users
+    GROUP BY u.Id, u.DisplayName
+),
+TopTags AS (
+    SELECT 
+        t.TagName,
+        COALESCE(SUM(p.ViewCount),0) AS TotalViews,
+        COALESCE(SUM(p.Score),0) AS TotalScore,
+        COUNT(p.Id) AS PostsCount
+    FROM Tags t
+    LEFT JOIN Posts p ON p.PostTypeId = 1 -- questions only
+        AND POSITION(CONCAT('<', t.TagName, '>') IN p.Tags) > 0
+    GROUP BY t.TagName
+    ORDER BY TotalViews DESC
+    LIMIT 15
+),
+UserRecentActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        MAX(p.LastActivityDate) AS LastPostActivity,
+        MAX(c.CreationDate) AS LastCommentActivity,
+        MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId IN (10,11)) AS LastCloseReopenActivity
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+    GROUP BY u.Id
+),
+RankedAnswers AS (
+    SELECT 
+        a.Id, a.ParentId, a.OwnerUserId, a.Score,
+        RANK() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank,
+        ROW_NUMBER() OVER (PARTITION BY a.OwnerUserId ORDER BY a.Score DESC) AS UserTopAnswerRank
+    FROM Posts a
+    WHERE a.PostTypeId = 2 -- answers
+),
+QuestionAnswerStats AS (
+    SELECT 
+        q.Id AS QuestionId, 
+        q.Title, 
+        q.OwnerUserId,
+        COUNT(a.Id) AS AnswersCount,
+        COALESCE(SUM(a.Score),0) AS AnswersScoreSum,
+        MAX(a.Score) AS MaxAnswerScore,
+        MIN(a.Score) FILTER (WHERE a.Score IS NOT NULL) AS MinAnswerScore
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.Title, q.OwnerUserId
+),
+DuplicateQuestions AS (
+    SELECT DISTINCT pl.PostId AS DuplicateQuestionId, pl.RelatedPostId AS OriginalQuestionId
+    FROM PostLinks pl
+    INNER JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId AND lt.Name = 'Duplicate'
+),
+QuestionCloseReasons AS (
+    SELECT ph.PostId, crt.Name AS CloseReason, ph.CreationDate
+    FROM PostHistory ph
+    INNER JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id AND pht.Name = 'Post Closed'
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS INTEGER)
+),
+ComplexUserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges, ub.DistinctBadges,
+        urs.LastPostActivity, urs.LastCommentActivity, urs.LastCloseReopenActivity,
+        SUM(CASE WHEN v.VoteTypeId=2 THEN 1 ELSE 0 END) AS UpVotesCount,
+        SUM(CASE WHEN v.VoteTypeId=3 THEN 1 ELSE 0 END) AS DownVotesCount,
+        AVG(COALESCE(p.Score,0)) AS AvgPostScore,
+        COUNT(DISTINCT qas.QuestionId) AS QuestionsAsked,
+        COUNT(DISTINCT ra.Id) AS AnswersProvided,
+        MIN(COALESCE(qas.MaxAnswerScore,0)) AS LowestTopAnswerScore
+    FROM Users u
+    LEFT JOIN UserBadges ub ON ub.UserId = u.Id
+    LEFT JOIN UserRecentActivity urs ON urs.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId IN (1,2) -- questions or answers
+    LEFT JOIN QuestionAnswerStats qas ON qas.OwnerUserId = u.Id
+    LEFT JOIN RankedAnswers ra ON ra.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges, ub.DistinctBadges,
+             urs.LastPostActivity, urs.LastCommentActivity, urs.LastCloseReopenActivity
+),
+FinalSelectedQuestions AS (
+    SELECT 
+        q.Id,
+        q.Title,
+        q.Tags,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.FavoriteCount,
+        q.ClosedDate,
+        q.CommunityOwnedDate,
+        q.OwnerUserId,
+        du.OriginalQuestionId,
+        qc.CloseReason,
+        qas.AnswersCount,
+        qas.AnswersScoreSum,
+        qas.MaxAnswerScore,
+        qas.MinAnswerScore,
+        RANK() OVER (ORDER BY q.ViewCount DESC, q.Score DESC) AS PopRank
+    FROM Posts q
+    LEFT JOIN DuplicateQuestions du ON du.DuplicateQuestionId = q.Id
+    LEFT JOIN QuestionCloseReasons qc ON qc.PostId = q.Id
+    LEFT JOIN QuestionAnswerStats qas ON qas.QuestionId = q.Id
+    WHERE q.PostTypeId = 1
+      AND (q.ClosedDate IS NULL OR q.ClosedDate > '2023-01-01')
+),
+UserTopAnswersWithText AS (
+    SELECT 
+        ra.Id AS AnswerId,
+        ra.ParentId AS QuestionId,
+        ra.OwnerUserId,
+        ra.Score,
+        p.Body,
+        p.Title,
+        ROW_NUMBER() OVER (PARTITION BY ra.OwnerUserId ORDER BY ra.Score DESC, ra.CreationDate ASC) AS AnswerSeq
+    FROM RankedAnswers ra
+    JOIN Posts p ON p.Id = ra.Id
+    WHERE ra.AnswerRank = 1
+),
+FinalOutput AS (
+    SELECT DISTINCT
+        fq.Id AS QuestionID,
+        fq.Title AS QuestionTitle,
+        fq.Tags,
+        fq.ViewCount,
+        fq.Score AS QuestionScore,
+        fq.AnswerCount,
+        fq.FavoriteCount,
+        fq.ClosedDate,
+        fq.CloseReason,
+        fq.CommunityOwnedDate,
+        fq.OriginalQuestionId,
+        uba.UserId,
+        uba.DisplayName AS UserDisplayName,
+        uba.GoldBadges,
+        uba.SilverBadges,
+        uba.BronzeBadges,
+        uba.DistinctBadges,
+        uba.LastPostActivity,
+        uba.LastCommentActivity,
+        uba.LastCloseReopenActivity,
+        uba.UpVotesCount,
+        uba.DownVotesCount,
+        uba.AvgPostScore,
+        uba.QuestionsAsked,
+        uba.AnswersProvided,
+        uba.LowestTopAnswerScore,
+        uta.Score AS TopAnswerScore,
+        uta.Body AS TopAnswerBody,
+        COALESCE(tt.TotalViews, 0) AS TagTotalViews,
+        COALESCE(tt.TotalScore, 0) AS TagTotalScore,
+        COALESCE(tt.PostsCount, 0) AS TagPostsCount,
+        NTILE(4) OVER (ORDER BY fq.ViewCount DESC) AS QuartileViewCount,
+        NTILE(4) OVER (ORDER BY uba.Reputation DESC NULLS LAST) AS QuartileUserReputation,
+        CASE 
+            WHEN fq.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN fq.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+            ELSE 'Open'
+        END AS PostStatus,
+        LENGTH(fq.Title) AS TitleLength,
+        LENGTH(COALESCE(uta.Body,'')) AS TopAnswerBodyLength,
+        POSITION('error' IN LOWER(COALESCE(uta.Body,''))) > 0 AS HasErrorInAnswerText,
+        COALESCE(u.Location, 'Unknown') AS UserLocation,
+        CASE WHEN uba.GoldBadges > 5 THEN 1 ELSE 0 END AS HighGoldBadgeUser
+    FROM FinalSelectedQuestions fq
+    LEFT JOIN ComplexUserActivity uba ON uba.UserId = fq.OwnerUserId
+    LEFT JOIN UserTopAnswersWithText uta ON uta.OwnerUserId = fq.OwnerUserId AND uta.AnswerSeq = 1
+    LEFT JOIN Posts p ON p.Id = fq.Id
+    LEFT JOIN LATERAL (
+        SELECT tt.*
+        FROM TopTags tt
+        WHERE POSITION(CONCAT('<', tt.TagName, '>') IN p.Tags) > 0
+        ORDER BY tt.TotalViews DESC
+        LIMIT 1
+    ) tt ON TRUE
+    LEFT JOIN Users u ON u.Id = uba.UserId
+    WHERE fq.AnswerCount > 3
+)
+SELECT *
+FROM FinalOutput
+WHERE (PostStatus = 'Open' OR (PostStatus = 'Closed' AND CloseReason LIKE '%duplicate%'))
+  AND (GoldBadges + SilverBadges + BronzeBadges) > 10
+ORDER BY ViewCount DESC, QuestionScore DESC
+LIMIT 100;

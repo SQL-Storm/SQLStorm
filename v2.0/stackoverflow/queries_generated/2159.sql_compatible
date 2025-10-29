@@ -1,0 +1,131 @@
+with RecursiveUserActivity as (
+    select u.Id as UserId, u.DisplayName, u.CreationDate, u.Reputation, u.Location,
+           count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsAsked,
+           count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersGiven,
+           count(distinct c.Id) as CommentsMade,
+           count(distinct b.Id) filter (where b.Class = 1) as GoldBadges,
+           count(distinct b.Id) filter (where b.Class = 2) as SilverBadges,
+           count(distinct b.Id) filter (where b.Class = 3) as BronzeBadges,
+           row_number() over (partition by u.Location order by u.Reputation desc) as LocationRepRank
+      from Users u
+      left join Posts p on p.OwnerUserId = u.Id
+      left join Comments c on c.UserId = u.Id
+      left join Badges b on b.UserId = u.Id
+     group by u.Id, u.DisplayName, u.CreationDate, u.Reputation, u.Location
+),
+TopLocations as (
+    select Location
+      from Users
+     where Location is not null
+     group by Location
+    having count(*) > 100
+),
+TopUserActivities as (
+    select rua.*
+      from RecursiveUserActivity rua
+      join TopLocations tl on rua.Location = tl.Location
+     where rua.LocationRepRank <= 5
+),
+PostAnswerRanks as (
+    select p.Id as AnswerId, p.ParentId as QuestionId, p.Score, p.CreationDate,
+           row_number() over (partition by p.ParentId order by p.Score desc, p.CreationDate asc) as AnswerRank,
+           p.OwnerUserId
+      from Posts p
+     where p.PostTypeId = 2
+),
+QuestionStats as (
+    select q.Id as QuestionId, q.Title, q.CreationDate, q.Score, q.ViewCount,
+           count(distinct p.Id) as TotalAnswers,
+           sum(case when p.Score > 5 then 1 else 0 end) as HighlyScoredAnswers,
+           max(p.Score) as MaxAnswerScore
+      from Posts q
+      left join Posts p on p.ParentId = q.Id and p.PostTypeId = 2
+     where q.PostTypeId = 1
+     group by q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount
+),
+DuplicateLinkCounts as (
+    select pl.PostId, count(*) as DuplicateCount
+      from PostLinks pl
+     where pl.LinkTypeId = 3
+     group by pl.PostId
+),
+UserReputationRollingAvg as (
+    select UserId, CreationDate, Reputation,
+           avg(Reputation) over (partition by UserId order by CreationDate rows between 29 preceding and current row) as AvgReputationLast30Days
+      from (
+        select u.Id as UserId, u.CreationDate, u.Reputation
+          from Users u
+         union all
+        select ph.UserId, ph.CreationDate, ph.Id
+          from PostHistory ph
+         where ph.UserId is not null
+      ) combined
+),
+StringManipulations as (
+    select p.Id, p.Title,
+           trim(both ' ' from regexp_replace(lower(p.Title), '[^a-z0-9 ]', '', 'g')) as CleanTitle,
+           array_length(regexp_split_to_array(trim(both ' ' from regexp_replace(lower(p.Title), '[^a-z0-9 ]', '', 'g')), '\s+'), 1) as TitleWordCount,
+           position('error' in lower(p.Body)) as ErrorKeywordPos
+      from Posts p
+     where p.PostTypeId = 1
+),
+FinalResult as (
+    select t.Location,
+           t.DisplayName,
+           t.Reputation,
+           t.QuestionsAsked,
+           t.AnswersGiven,
+           t.CommentsMade,
+           t.GoldBadges,
+           t.SilverBadges,
+           t.BronzeBadges,
+           qs.QuestionId,
+           qs.Title as QuestionTitle,
+           qs.ViewCount,
+           qs.TotalAnswers,
+           qs.HighlyScoredAnswers,
+           d.DuplicateCount,
+           par.AnswerId,
+           par.Score as AnswerScore,
+           par.AnswerRank,
+           ura.AvgReputationLast30Days,
+           sm.CleanTitle,
+           sm.TitleWordCount,
+           coalesce(sm.ErrorKeywordPos, -1) as ErrorKeywordPosition,
+           p.CreationDate as PostCreationDate
+      from TopUserActivities t
+      left join Posts p on p.OwnerUserId = t.UserId and p.PostTypeId = 1
+      left join QuestionStats qs on qs.QuestionId = p.Id
+      left join DuplicateLinkCounts d on d.PostId = p.Id
+      left join PostAnswerRanks par on par.QuestionId = p.Id and par.AnswerRank = 1
+      left join UserReputationRollingAvg ura on ura.UserId = t.UserId
+      left join StringManipulations sm on sm.Id = p.Id
+     where p.CreationDate > cast('2024-10-01' as date) - interval '365 days'
+)
+select distinct Location, DisplayName, Reputation, QuestionsAsked, AnswersGiven, CommentsMade,
+       GoldBadges, SilverBadges, BronzeBadges,
+       QuestionId, QuestionTitle,
+       ViewCount, TotalAnswers, HighlyScoredAnswers, DuplicateCount,
+       AnswerId, AnswerScore, AnswerRank,
+       AvgReputationLast30Days, TitleWordCount, ErrorKeywordPosition,
+       case
+         when DuplicateCount is null then 'No duplicates'
+         when DuplicateCount > 3 then 'Highly duplicated'
+         else 'Moderate duplicates'
+       end as DuplicationStatus,
+       case
+         when AnswerScore is null then 'No answers'
+         when AnswerScore > 10 then 'Top answer'
+         when AnswerScore between 5 and 10 then 'Good answer'
+         else 'Other answer'
+       end as AnswerQuality,
+       case
+         when ErrorKeywordPosition > 0 then 'Contains error keyword'
+         when ErrorKeywordPosition = 0 then 'Error keyword at start'
+         else 'No error keyword'
+       end as ErrorKeywordFlag
+  from FinalResult
+ where Reputation > 500
+   and Location is not null
+ order by Location, Reputation desc, QuestionsAsked desc
+ limit 100;

@@ -1,0 +1,213 @@
+-- {"query": "1624.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3402} 
+
+WITH UserEngagementSummary AS (
+    -- Aggregates user-specific metrics: post counts, comment counts, badges, and initial post/comment scores.
+    -- Includes various NULL handling with COALESCE and conditional aggregations.
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Views AS ProfileViews,
+        U.UpVotes AS UserUpVotesGiven, -- These are votes given by the user, as recorded in the Users table.
+        U.DownVotes AS UserDownVotesGiven, -- Similarly, downvotes given by the user.
+        COUNT(DISTINCT P_Owned.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT CASE WHEN P_Owned.PostTypeId = 1 THEN P_Owned.Id END) AS TotalQuestionsOwned,
+        COUNT(DISTINCT CASE WHEN P_Owned.PostTypeId = 2 THEN P_Owned.Id END) AS TotalAnswersOwned,
+        COUNT(DISTINCT C_Made.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COALESCE(SUM(P_Owned.Score), 0) AS InitialTotalPostScoreOwned,
+        COALESCE(SUM(P_Owned.ViewCount), 0) AS InitialTotalPostViewsOwned,
+        COALESCE(SUM(P_Owned.FavoriteCount), 0) AS InitialTotalPostFavoritesOwned,
+        MIN(COALESCE(P_Owned.CreationDate, C_Made.CreationDate, B.Date, '9999-12-31'::timestamp)) AS FirstEngagementDate,
+        MAX(COALESCE(P_Owned.CreationDate, C_Made.CreationDate, B.Date, '0001-01-01'::timestamp)) AS LastEngagementDate,
+        -- String expression: Count unique tags contributed by the user, handling NULLs and parsing.
+        COUNT(DISTINCT LOWER(TRIM(UNNEST(string_to_array(SUBSTRING(P_Owned.Tags, 2, LENGTH(P_Owned.Tags) - 2), '><'))))) FILTER (WHERE P_Owned.Tags IS NOT NULL) AS UniqueTagsContributedCount
+    FROM Users U
+    LEFT JOIN Posts P_Owned ON U.Id = P_Owned.OwnerUserId
+    LEFT JOIN Comments C_Made ON U.Id = C_Made.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Views, U.UpVotes, U.DownVotes
+),
+PostVoteAggregates AS (
+    -- Calculates total upvotes, downvotes, and favorite votes received for each post.
+    SELECT
+        P.Id AS PostId,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS PostUpVotesReceived,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS PostDownVotesReceived,
+        SUM(CASE WHEN V.VoteTypeId = 5 THEN 1 ELSE 0 END) AS PostFavoriteVotesReceived -- Favorite votes are stored here too.
+    FROM Posts P
+    JOIN Votes V ON P.Id = V.PostId
+    GROUP BY P.Id
+),
+PostDetailedMetrics AS (
+    -- Provides detailed metrics for posts, including correlated subqueries for owner context,
+    -- complex calculations for 'influence score', and string manipulations.
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.LastEditDate,
+        P.LastActivityDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount AS PostCommentCount,
+        P.FavoriteCount AS PostFavoriteCount,
+        P.ClosedDate,
+        P.CommunityOwnedDate,
+        P.Title,
+        P.Tags,
+        -- Correlated Subquery 1: Get owner's reputation at post creation.
+        (SELECT U.Reputation FROM Users U WHERE U.Id = P.OwnerUserId) AS OwnerReputationAtPost,
+        -- Correlated Subquery 2: Check if owner had at least one gold badge before posting.
+        EXISTS (
+            SELECT 1 FROM Badges B
+            WHERE B.UserId = P.OwnerUserId
+            AND B.Class = 1
+            AND B.Date <= P.CreationDate
+        ) AS OwnerHadGoldBadgeAtCreation,
+        -- Complicated Predicate/Expression: A weighted influence score for posts.
+        (COALESCE(P.Score, 0) * 0.4) + (COALESCE(P.ViewCount, 0) * 0.01) + (COALESCE(P.AnswerCount, 0) * 0.3) + (COALESCE(P.FavoriteCount, 0) * 0.2) + (COALESCE(PVA.PostUpVotesReceived, 0) * 0.1) AS CalculatedPostInfluenceScore,
+        -- String expression: Extract the primary tag, or label as 'untagged'.
+        COALESCE(LOWER(SUBSTRING(P.Tags FROM 2 FOR POSITION('><' IN P.Tags) - 2)), 'untagged') AS PrimaryTag,
+        -- NULL logic: Provide a default title if NULL.
+        COALESCE(P.Title, 'Untitled Post (' || P.Id || ')') AS DisplayTitle
+    FROM Posts P
+    JOIN PostTypes PT ON P.PostTypeId = PT.Id
+    LEFT JOIN PostVoteAggregates PVA ON P.Id = PVA.PostId -- Outer join to include posts with no votes
+    WHERE P.PostTypeId IN (1, 2) -- Focus on Questions (1) and Answers (2)
+),
+PostHistoryAggregates AS (
+    -- Summarizes post history, including edit counts, close/reopen events,
+    -- and uses window functions for temporal analysis of edits.
+    SELECT
+        PH.PostId,
+        COUNT(PH.Id) AS TotalHistoryEvents,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.Id END) AS TotalEditEvents,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.Id END) AS TotalCloseEvents,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId = 11 THEN PH.Id END) AS TotalReopenEvents,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.CreationDate ELSE NULL END) AS LatestEditHistoryDate,
+        MIN(PH.CreationDate) AS EarliestHistoryDate,
+        -- Window function: Calculate average time in seconds between consecutive edits by the same user on a post.
+        AVG(EXTRACT(EPOCH FROM (LEAD(PH.CreationDate) OVER (PARTITION BY PH.PostId, PH.UserId ORDER BY PH.CreationDate) - PH.CreationDate))) FILTER (WHERE PH.PostHistoryTypeId IN (4,5,6) AND PH.UserId IS NOT NULL) AS AvgTimeBetweenUserEditsSeconds,
+        -- Complicated expression: Aggregates distinct close reasons, handling potential non-integer 'Comment' values (PostgreSQL specific regex).
+        STRING_AGG(DISTINCT CLR.Name, '; ') FILTER (WHERE PH.PostHistoryTypeId = 10 AND PH.Comment IS NOT NULL AND PH.Comment ~ '^[0-9]+$') AS DistinctCloseReasons
+    FROM PostHistory PH
+    LEFT JOIN CloseReasonTypes CLR ON PH.PostHistoryTypeId = 10 AND PH.Comment ~ '^[0-9]+$' AND CLR.Id = CAST(PH.Comment AS SMALLINT)
+    GROUP BY PH.PostId
+),
+TagSpecificMetrics AS (
+    -- Analyzes posts within their primary tags, using window functions for ranking and average scores.
+    SELECT
+        PostId,
+        PostCreationDate,
+        CalculatedPostInfluenceScore,
+        PrimaryTag,
+        -- Window function: Rank posts by influence score within their primary tag.
+        RANK() OVER (PARTITION BY PrimaryTag ORDER BY CalculatedPostInfluenceScore DESC, PostCreationDate DESC) AS RankInPrimaryTag,
+        -- Window function: Average influence score for the primary tag.
+        AVG(CalculatedPostInfluenceScore) OVER (PARTITION BY PrimaryTag) AS AvgPrimaryTagInfluenceScore,
+        -- Window function: Cumulative distribution of influence score within tag.
+        CUME_DIST() OVER (PARTITION BY PrimaryTag ORDER BY CalculatedPostInfluenceScore) AS InfluenceScoreCumeDist
+    FROM PostDetailedMetrics
+    WHERE PrimaryTag != 'untagged'
+),
+CombinedActivityStream AS (
+    -- Set operator: Combines monthly activity for posts and comments by user,
+    -- allowing for a unified view of user contribution over time.
+    SELECT
+        OwnerUserId AS ActorId,
+        DATE_TRUNC('month', CreationDate) AS ActivityMonth,
+        'Post' AS ActivityType,
+        COUNT(Id) AS EventCount,
+        SUM(Score) AS TotalScoreImpact -- Post score
+    FROM Posts
+    WHERE OwnerUserId IS NOT NULL
+    GROUP BY OwnerUserId, DATE_TRUNC('month', CreationDate)
+    UNION ALL
+    SELECT
+        UserId AS ActorId,
+        DATE_TRUNC('month', CreationDate) AS ActivityMonth,
+        'Comment' AS ActivityType,
+        COUNT(Id) AS EventCount,
+        SUM(Score) AS TotalScoreImpact -- Comment score
+    FROM Comments
+    WHERE UserId IS NOT NULL
+    GROUP BY UserId, DATE_TRUNC('month', CreationDate)
+)
+-- Main Query: Joins all CTEs to generate a comprehensive report on user performance and content engagement.
+-- Includes various aggregations, conditional logic, and subqueries for elaborate analysis.
+SELECT
+    UES.UserId,
+    UES.DisplayName,
+    UES.Reputation,
+    UES.UserCreationDate,
+    UES.LastAccessDate,
+    UES.ProfileViews,
+    UES.UserUpVotesGiven,
+    UES.UserDownVotesGiven,
+    UES.TotalPostsOwned,
+    UES.TotalQuestionsOwned,
+    UES.TotalAnswersOwned,
+    UES.TotalCommentsMade,
+    UES.TotalBadges,
+    UES.GoldBadges,
+    UES.SilverBadges,
+    UES.BronzeBadges,
+    UES.InitialTotalPostScoreOwned,
+    UES.InitialTotalPostViewsOwned,
+    UES.InitialTotalPostFavoritesOwned,
+    UES.UniqueTagsContributedCount,
+    -- Aggregate total votes received across all posts owned by the user.
+    COALESCE(SUM(PVA.PostUpVotesReceived), 0) AS TotalUpVotesReceivedOverall,
+    COALESCE(SUM(PVA.PostDownVotesReceived), 0) AS TotalDownVotesReceivedOverall,
+    COALESCE(SUM(PVA.PostFavoriteVotesReceived), 0) AS TotalFavoriteVotesReceivedOverall,
+    COUNT(DISTINCT PDM.PostId) AS TotalPostsWithDetailedMetrics,
+    SUM(PDM.CalculatedPostInfluenceScore) AS TotalCalculatedInfluenceScore,
+    AVG(PDM.CalculatedPostInfluenceScore) AS AvgCalculatedInfluenceScore,
+    MAX(PDM.CalculatedPostInfluenceScore) AS MaxCalculatedInfluenceScore,
+    -- Conditional counting for posts with specific history events.
+    COUNT(DISTINCT PH.PostId) FILTER (WHERE PH.TotalEditEvents > 0) AS PostsWithEdits,
+    COUNT(DISTINCT PH.PostId) FILTER (WHERE PH.TotalCloseEvents > 0 AND PH.TotalReopenEvents = 0) AS PostsClosedWithoutReopen,
+    -- Average monthly activity based on the CombinedActivityStream CTE.
+    COALESCE(AVG(CASE WHEN CAS.ActivityType = 'Post' THEN CAS.EventCount ELSE NULL END), 0) AS AvgMonthlyPosts,
+    COALESCE(AVG(CASE WHEN CAS.ActivityType = 'Comment' THEN CAS.EventCount ELSE NULL END), 0) AS AvgMonthlyComments,
+    COALESCE(SUM(CAS.TotalScoreImpact), 0) AS OverallMonthlyScoreImpact,
+    -- Complex conditional logic with NULL handling to categorize users.
+    CASE
+        WHEN UES.TotalPostsOwned = 0 AND UES.TotalCommentsMade = 0 THEN 'Inactive User'
+        WHEN UES.Reputation < 100 AND UES.GoldBadges = 0 AND UES.TotalPostsOwned < 5 THEN 'Novice Contributor'
+        WHEN UES.TotalQuestionsOwned > UES.TotalAnswersOwned * 2 AND UES.TotalPostsOwned > 10 AND UES.InitialTotalPostScoreOwned > 500 THEN 'Question Maven'
+        WHEN UES.TotalAnswersOwned > UES.TotalQuestionsOwned * 2 AND UES.TotalPostsOwned > 10 AND UES.InitialTotalPostScoreOwned > 500 THEN 'Answer Expert'
+        WHEN UES.GoldBadges > 0 AND UES.Reputation >= 10000 THEN 'Influential Veteran'
+        ELSE COALESCE(UES.DisplayName, 'Anonymous User') || ' (' || UES.UserId || ')'
+    END AS UserCategory,
+    -- Correlated Subquery: Find the user's top 3 tags based on total influence score contributed.
+    (
+        SELECT STRING_AGG(TSM_sub.PrimaryTag, ', ' ORDER BY TSM_sub.TagInfluence DESC)
+        FROM (
+            SELECT TSM.PrimaryTag, SUM(TSM.CalculatedPostInfluenceScore) AS TagInfluence
+            FROM TagSpecificMetrics TSM
+            WHERE TSM.PostId IN (SELECT PDM_sub.PostId FROM PostDetailedMetrics PDM_sub WHERE PDM_sub.OwnerUserId = UES.UserId)
+            GROUP BY TSM.PrimaryTag
+            ORDER BY TagInfluence DESC
+            LIMIT 3
+        ) AS TSM_sub
+    ) AS Top3InfluenceTags,
+    -- Correlated Subquery: Get the title of the user's highest scored question (if any).
+    (
+        SELECT PDM_q.DisplayTitle
+        FROM PostDetailedMetrics PDM_q
+        WHERE PDM_q.OwnerUserId = UES.UserId
+        AND PDM_q.PostTypeId = 1
+        ORDER BY PDM_q.PostScore DESC, PDM_q.PostCreationDate DESC
+        LIMIT 1
+    ) AS HighestScoredQuestionTitle,
+    -- More complex string manipulation/aggregation for a summary string, including NULL logic

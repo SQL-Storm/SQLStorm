@@ -1,0 +1,188 @@
+WITH InterestingQuestions AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title AS QuestionTitle,
+        p.OwnerUserId,
+        p.CreationDate AS QuestionCreationDate,
+        p.Score AS QuestionScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.Tags,
+        p.AcceptedAnswerId,
+        (SELECT COUNT(v.Id) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS QuestionUpvotes,
+        (SELECT COUNT(v.Id) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS QuestionDownvotes,
+        CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN TRUE ELSE FALSE END AS HasAcceptedAnswer
+    FROM Posts p
+    WHERE
+        p.PostTypeId = 1
+        AND p.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '3' YEAR)
+        AND p.ViewCount >= 1000
+        AND p.Score >= 5
+        AND p.Tags IS NOT NULL
+        AND p.AnswerCount > 0
+),
+PostVoteAggregates AS (
+    SELECT
+        v.PostId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotes,
+        SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS TotalFavorites
+    FROM Votes v
+    WHERE v.VoteTypeId IN (2, 3, 5)
+    GROUP BY v.PostId
+),
+ControversialPostHistoryEvents AS (
+    SELECT
+        ph.PostId,
+        ph.CreationDate AS EventDate,
+        ph.UserId AS EventUserId,
+        ph.PostHistoryTypeId,
+        ph.Comment,
+        cr.Name AS CloseReasonTypeName,
+        CASE
+            WHEN ph.PostHistoryTypeId IN (10, 101, 102, 103, 104, 105) THEN 'Closed'
+            WHEN ph.PostHistoryTypeId = 11 THEN 'Reopened'
+            WHEN ph.PostHistoryTypeId = 12 THEN 'Deleted'
+            WHEN ph.PostHistoryTypeId = 13 THEN 'Undeleted'
+            WHEN ph.PostHistoryTypeId = 19 THEN 'Protected'
+            WHEN ph.PostHistoryTypeId = 20 THEN 'Unprotected'
+            WHEN ph.PostHistoryTypeId IN (35, 36) THEN 'Migrated'
+            ELSE 'Other_Controversy'
+        END AS EventCategory
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes cr ON ph.PostHistoryTypeId = 10 AND ph.Comment = CAST(cr.Id AS VARCHAR(400))
+    WHERE
+        ph.PostHistoryTypeId IN (10, 11, 12, 13, 19, 20, 35, 36, 101, 102, 103, 104, 105)
+        AND ph.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2' YEAR)
+),
+HighlyEngagingPosts AS (
+    SELECT
+        iq.QuestionId AS PostId,
+        iq.QuestionTitle AS PostTitle,
+        iq.QuestionCreationDate AS CreationDate,
+        iq.OwnerUserId AS OriginalOwnerUserId,
+        COALESCE(pva.TotalUpvotes, 0) AS TotalUpvotes,
+        COALESCE(pva.TotalDownvotes, 0) AS TotalDownvotes,
+        COALESCE(pva.TotalFavorites, 0) AS TotalFavorites,
+        'Question_Controversial_History' AS PostCategory,
+        1 AS PostTypeIdIdentifier,
+        iq.Tags,
+        iq.HasAcceptedAnswer,
+        (
+            SELECT cr_sub.Name
+            FROM ControversialPostHistoryEvents cph_sub
+            JOIN CloseReasonTypes cr_sub ON cph_sub.Comment = CAST(cr_sub.Id AS VARCHAR(400))
+            WHERE cph_sub.PostId = iq.QuestionId
+              AND cph_sub.EventCategory = 'Closed'
+            GROUP BY cr_sub.Name
+            ORDER BY COUNT(*) DESC
+            LIMIT 1
+        ) AS MostFrequentCloseReason
+    FROM InterestingQuestions iq
+    LEFT JOIN PostVoteAggregates pva ON iq.QuestionId = pva.PostId
+    WHERE EXISTS (
+        SELECT 1
+        FROM ControversialPostHistoryEvents cpe
+        WHERE cpe.PostId = iq.QuestionId
+          AND cpe.EventCategory IN ('Closed', 'Deleted', 'Reopened', 'Protected', 'Migrated')
+    )
+
+    UNION ALL
+
+    SELECT
+        ans.Id AS PostId,
+        COALESCE(ans.Title, 'Answer to: ' || SUBSTRING(pq.Title FROM 1 FOR 40) || '...') AS PostTitle,
+        ans.CreationDate,
+        ans.OwnerUserId AS OriginalOwnerUserId,
+        COALESCE(pva.TotalUpvotes, 0) AS TotalUpvotes,
+        COALESCE(pva.TotalDownvotes, 0) AS TotalDownvotes,
+        COALESCE(pva.TotalFavorites, 0) AS TotalFavorites,
+        'Answer_High_Downvote_Ratio' AS PostCategory,
+        2 AS PostTypeIdIdentifier,
+        NULL AS Tags,
+        FALSE AS HasAcceptedAnswer,
+        NULL AS MostFrequentCloseReason
+    FROM Posts ans
+    JOIN Posts pq ON ans.ParentId = pq.Id
+    LEFT JOIN PostVoteAggregates pva ON ans.Id = pva.PostId
+    WHERE
+        ans.PostTypeId = 2
+        AND ans.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2' YEAR)
+        AND COALESCE(pva.TotalDownvotes, 0) >= 5
+        AND COALESCE(pva.TotalUpvotes, 0) > 0
+        AND (CAST(COALESCE(pva.TotalDownvotes, 0) AS DECIMAL) / CAST(COALESCE(pva.TotalUpvotes, 1) AS DECIMAL)) >= 2
+),
+FinalAggregates AS (
+    SELECT
+        hep.PostId,
+        hep.PostTitle,
+        hep.CreationDate,
+        hep.OriginalOwnerUserId,
+        hep.TotalUpvotes,
+        hep.TotalDownvotes,
+        hep.TotalFavorites,
+        hep.PostCategory,
+        hep.PostTypeIdIdentifier,
+        hep.Tags,
+        hep.HasAcceptedAnswer,
+        hep.MostFrequentCloseReason,
+        ph_events.EventDate,
+        ph_events.EventUserId,
+        ph_events.PostHistoryTypeId,
+        ph_events.Comment,
+        ph_events.CloseReasonTypeName,
+        ph_events.EventCategory,
+        u.DisplayName AS OwnerDisplayName,
+        u.Reputation AS OwnerReputation
+    FROM HighlyEngagingPosts hep
+    LEFT JOIN ControversialPostHistoryEvents ph_events ON hep.PostId = ph_events.PostId
+    LEFT JOIN Users u ON hep.OriginalOwnerUserId = u.Id
+)
+SELECT
+    PostId,
+    PostTitle,
+    CreationDate,
+    OriginalOwnerUserId,
+    OwnerDisplayName,
+    OwnerReputation,
+    TotalUpvotes,
+    TotalDownvotes,
+    TotalFavorites,
+    PostCategory,
+    PostTypeIdIdentifier,
+    Tags,
+    HasAcceptedAnswer,
+    MostFrequentCloseReason,
+    EventDate,
+    EventUserId,
+    PostHistoryTypeId,
+    Comment,
+    CloseReasonTypeName,
+    EventCategory
+FROM FinalAggregates
+WHERE
+    (TotalDownvotes >= 3 OR TotalFavorites >= 10)
+    AND (EventDate IS NULL OR EventDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1' YEAR))
+GROUP BY
+    PostId,
+    PostTitle,
+    CreationDate,
+    OriginalOwnerUserId,
+    OwnerDisplayName,
+    OwnerReputation,
+    TotalUpvotes,
+    TotalDownvotes,
+    TotalFavorites,
+    PostCategory,
+    PostTypeIdIdentifier,
+    Tags,
+    HasAcceptedAnswer,
+    MostFrequentCloseReason,
+    EventDate,
+    EventUserId,
+    PostHistoryTypeId,
+    Comment,
+    CloseReasonTypeName,
+    EventCategory
+ORDER BY TotalDownvotes DESC, TotalUpvotes ASC;

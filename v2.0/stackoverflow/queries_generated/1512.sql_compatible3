@@ -1,0 +1,200 @@
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.Views AS UserViews,
+        U.UpVotes AS UserUpVotesGiven,
+        U.DownVotes AS UserDownVotesGiven,
+        MAX(U.LastAccessDate) AS LastUserAccess,
+        COUNT(DISTINCT P.Id) FILTER (WHERE P.PostTypeId = 1) AS TotalQuestions,
+        COUNT(DISTINCT P.Id) FILTER (WHERE P.PostTypeId = 2) AS TotalAnswers,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS TotalEditsMade,
+        COALESCE(SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS TotalUpvotesReceived,
+        COALESCE(SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS TotalDownvotesReceived
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN PostHistory PH ON U.Id = PH.UserId AND PH.PostHistoryTypeId IN (4, 5, 6)
+    LEFT JOIN Votes V ON P.Id = V.PostId AND V.VoteTypeId IN (2, 3)
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.Views, U.UpVotes, U.DownVotes
+),
+PostDetailsBase AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount AS PostCommentCount,
+        P.FavoriteCount,
+        P.ClosedDate,
+        P.LastEditDate,
+        P.LastActivityDate,
+        P.Tags,
+        COALESCE(P.Title, SUBSTRING(P.Body FROM 1 FOR 50) || '...') AS PostTitlePreview,
+        CHAR_LENGTH(P.Body) AS BodyLength,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.Score DESC, P.CreationDate DESC) AS UserPostRank,
+        AVG(P.Score) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS RollingAvgUserPostScore,
+        (
+            SELECT MIN(A.CreationDate)
+            FROM Posts A
+            WHERE A.ParentId = P.Id
+            AND A.PostTypeId = 2
+        ) AS FirstAnswerDate,
+        (
+            SELECT COUNT(DISTINCT ph_inner.UserId)
+            FROM PostHistory ph_inner
+            WHERE ph_inner.PostId = P.Id
+            AND ph_inner.PostHistoryTypeId IN (4, 5, 6)
+            AND ph_inner.UserId IS NOT NULL
+            AND ph_inner.UserId != P.OwnerUserId
+        ) AS DistinctEditorCount
+    FROM Posts P
+    WHERE P.PostTypeId IN (1, 2)
+),
+PostProblematicFlags AS (
+    SELECT PostId
+    FROM PostHistory
+    WHERE PostHistoryTypeId = 12
+    UNION ALL
+    SELECT PostId
+    FROM PostLinks
+    WHERE LinkTypeId = 3
+),
+PostClosureDetails AS (
+    SELECT
+        PH.PostId,
+        COUNT(PH.Id) AS TotalCloseEvents,
+        SUM(CASE WHEN COALESCE(PH.Comment, '') LIKE '%102%' THEN 1 ELSE 0 END) AS OffTopicCloseCount,
+        MAX(PH.CreationDate) AS LastCloseDate
+    FROM PostHistory PH
+    WHERE PH.PostHistoryTypeId IN (10, 101, 102, 103, 104, 105)
+    GROUP BY PH.PostId
+),
+FrequentBadgesPerUser AS (
+    SELECT
+        B.UserId,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(B.Id) AS TotalBadges
+    FROM Badges B
+    GROUP BY B.UserId
+),
+UserPostAggregates AS (
+    SELECT
+        PDB.OwnerUserId AS UserId,
+        COUNT(PDB.PostId) AS TotalUserPosts,
+        COUNT(PDB.PostId) FILTER (WHERE PDB.PostTypeId = 1) AS UserQuestions,
+        COUNT(PDB.PostId) FILTER (WHERE PDB.PostTypeId = 2) AS UserAnswers,
+        COUNT(PDB.PostId) FILTER (WHERE PDB.PostTypeId = 1 AND PDB.ClosedDate IS NOT NULL) AS UserClosedQuestions,
+        COUNT(DISTINCT PPF.PostId) AS UserProblematicPosts,
+        COALESCE(AVG(PDB.PostScore) FILTER (WHERE PDB.PostTypeId = 1), 0) AS AvgUserQuestionScore,
+        COALESCE(AVG(PDB.PostScore) FILTER (WHERE PDB.PostTypeId = 2), 0) AS AvgUserAnswerScore,
+        COALESCE(AVG(PDB.DistinctEditorCount) FILTER (WHERE PDB.PostTypeId IN (1,2)), 0) AS AvgDistinctEditorsPerPost,
+        COALESCE(AVG(EXTRACT(EPOCH FROM (PDB.FirstAnswerDate - PDB.PostCreationDate))) / (60 * 60 * 24), 0) AS AvgDaysToFirstAnswerForQuestions,
+        COALESCE(AVG(EXTRACT(EPOCH FROM (PDB.LastEditDate - PDB.PostCreationDate))) / (60 * 60 * 24), 0) AS AvgDaysToLastEdit,
+        MAX(PDB.RollingAvgUserPostScore) AS MaxRollingAvgPostScore,
+        STRING_AGG(
+            CASE WHEN PDB.UserPostRank <= 3
+                 THEN PDB.PostTitlePreview || ' [S:' || PDB.PostScore || ' V:' || PDB.ViewCount || ']'
+                 ELSE NULL
+            END, '; ' ORDER BY PDB.UserPostRank) FILTER (WHERE PDB.UserPostRank <= 3) AS Top3PostsSummary,
+        SUM(COALESCE(PCD.OffTopicCloseCount, 0)) AS TotalOffTopicClosures
+    FROM PostDetailsBase PDB
+    LEFT JOIN PostProblematicFlags PPF ON PDB.PostId = PPF.PostId
+    LEFT JOIN PostClosureDetails PCD ON PDB.PostId = PCD.PostId
+    GROUP BY PDB.OwnerUserId
+)
+SELECT
+    UAS.UserId,
+    COALESCE(UAS.DisplayName, 'Unknown User (' || SUBSTRING(U.EmailHash FROM 1 FOR 8) || ')') AS UserDisplayIdentifier,
+    UAS.Reputation,
+    U.CreationDate AS UserRegistrationDate,
+    UAS.LastUserAccess,
+    UAS.TotalQuestions,
+    UAS.TotalAnswers,
+    UAS.TotalCommentsMade,
+    UAS.TotalEditsMade,
+    UAS.TotalUpvotesReceived,
+    UAS.TotalDownvotesReceived,
+    FBP.GoldBadges,
+    FBP.SilverBadges,
+    FBP.BronzeBadges,
+    FBP.TotalBadges,
+    UPA.TotalUserPosts,
+    UPA.UserClosedQuestions,
+    UPA.UserProblematicPosts,
+    UPA.AvgUserQuestionScore,
+    UPA.AvgUserAnswerScore,
+    UPA.AvgDistinctEditorsPerPost,
+    UPA.AvgDaysToFirstAnswerForQuestions,
+    UPA.AvgDaysToLastEdit,
+    UPA.Top3PostsSummary,
+    UPA.TotalOffTopicClosures,
+    CASE
+        WHEN U.AboutMe IS NOT NULL AND CHAR_LENGTH(U.AboutMe) > 500 THEN 'Verbose'
+        WHEN U.AboutMe IS NOT NULL AND CHAR_LENGTH(U.AboutMe) BETWEEN 100 AND 500 THEN 'Moderate'
+        WHEN U.AboutMe IS NOT NULL THEN 'Brief'
+        ELSE 'None Provided'
+    END AS AboutMeLengthCategory,
+    LOWER(TRIM(REPLACE(COALESCE(U.Location, 'Unspecified Location'), ',', ''))) AS NormalizedUserLocation,
+    (COALESCE(UPA.TotalUserPosts,0) > 10 AND (COALESCE(UPA.UserProblematicPosts,0) * 100.0) / NULLIF(COALESCE(UPA.TotalUserPosts,0), 0) > 20) AS HasHighProblematicPostRate,
+    ROUND(
+        (COALESCE(UPA.UserClosedQuestions,0) * 100.0) / NULLIF(COALESCE(UPA.UserQuestions,0), 0),
+        2
+    ) AS QuestionClosureRatePercentage,
+    CASE
+        WHEN UAS.Reputation >= 10000 AND COALESCE(UPA.UserQuestions,0) >= 50 AND COALESCE(UPA.UserAnswers,0) >= 100 THEN 'Veteran Expert'
+        WHEN UAS.Reputation >= 5000 AND COALESCE(UPA.UserQuestions,0) >= 20 AND COALESCE(UPA.UserAnswers,0) >= 50 THEN 'Experienced'
+        WHEN UAS.Reputation >= 1000 THEN 'Active'
+        WHEN UAS.Reputation >= 100 THEN 'Occasional'
+        ELSE 'Newbie'
+    END AS UserEngagementCategory,
+    COALESCE(FBP.GoldBadges, 0) AS GoldBadgeCountCoalesced,
+    COALESCE(FBP.SilverBadges, 0) AS SilverBadgeCountCoalesced,
+    COALESCE(FBP.BronzeBadges, 0) AS BronzeBadgeCountCoalesced
+FROM UserActivitySummary UAS
+LEFT JOIN Users U ON UAS.UserId = U.Id
+LEFT JOIN UserPostAggregates UPA ON UAS.UserId = UPA.UserId
+LEFT JOIN FrequentBadgesPerUser FBP ON UAS.UserId = FBP.UserId
+GROUP BY
+    UAS.UserId,
+    UAS.DisplayName,
+    UAS.Reputation,
+    U.CreationDate,
+    UAS.LastUserAccess,
+    UAS.TotalQuestions,
+    UAS.TotalAnswers,
+    UAS.TotalCommentsMade,
+    UAS.TotalEditsMade,
+    UAS.TotalUpvotesReceived,
+    UAS.TotalDownvotesReceived,
+    FBP.GoldBadges,
+    FBP.SilverBadges,
+    FBP.BronzeBadges,
+    FBP.TotalBadges,
+    UPA.TotalUserPosts,
+    UPA.UserClosedQuestions,
+    UPA.UserProblematicPosts,
+    UPA.AvgUserQuestionScore,
+    UPA.AvgUserAnswerScore,
+    UPA.AvgDistinctEditorsPerPost,
+    UPA.AvgDaysToFirstAnswerForQuestions,
+    UPA.AvgDaysToLastEdit,
+    UPA.Top3PostsSummary,
+    UPA.TotalOffTopicClosures,
+    U.AboutMe,
+    U.Location,
+    U.EmailHash,
+    U.Id,
+    UAS.UserUpVotesGiven,
+    UAS.UserDownVotesGiven,
+    UAS.UserViews,
+    UAS.UserCreationDate,
+    UAS.UserId;

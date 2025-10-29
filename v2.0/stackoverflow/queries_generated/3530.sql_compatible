@@ -1,0 +1,124 @@
+WITH
+TagList AS (
+    SELECT
+        t.Id                         AS TagId,
+        t.TagName,
+        t.Count                      AS TagUseCount,
+        NULLIF(SUBSTRING(t.TagName FROM 1 FOR 5), '') AS TagPrefix
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0
+),
+QuestionAgg AS (
+    SELECT
+        p.Id                         AS QuestionId,
+        p.Score,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.FavoriteCount,
+        p.ViewCount,
+        p.AnswerCount,
+        p.ClosedDate,
+        UNNEST(STRING_TO_ARRAY(TRIM(BOTH '<>' FROM p.Tags), '><')) AS SingleTag
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+TagQuestionStats AS (
+    SELECT
+        tl.TagId,
+        tl.TagName,
+        COUNT(q.QuestionId)                         AS QuestionCount,
+        CAST(AVG(q.Score) AS DECIMAL(10,2))         AS AvgScore,
+        SUM(q.ViewCount)                             AS TotalViews,
+        SUM(q.FavoriteCount)                         AS TotalFavorites,
+        MAX(q.CreationDate)                          AS LatestQuestionDate,
+        COUNT(CASE WHEN q.ClosedDate IS NOT NULL THEN 1 END) AS ClosedCount
+    FROM TagList tl
+    LEFT JOIN QuestionAgg q
+           ON q.SingleTag = tl.TagName
+    GROUP BY tl.TagId, tl.TagName
+),
+AnswerAgg AS (
+    SELECT
+        p.Id                         AS AnswerId,
+        p.ParentId                   AS QuestionId,
+        p.Score,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.CommentCount,
+        (SELECT COUNT(*) FROM Votes v
+            WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpVoteCount,
+        (SELECT MAX(ph.CreationDate) FROM PostHistory ph
+            WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4,5,6)) AS LastEditDate
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+),
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+TopContributors AS (
+    SELECT
+        u.Id                         AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(ub.GoldBadges,   0) AS GoldBadges,
+        COALESCE(ub.SilverBadges, 0) AS SilverBadges,
+        COALESCE(ub.BronzeBadges, 0) AS BronzeBadges,
+        q.SingleTag                  AS TagName,
+        ROW_NUMBER() OVER (PARTITION BY q.SingleTag
+                           ORDER BY u.Reputation DESC) AS RankPerTag
+    FROM Users u
+    JOIN AnswerAgg a      ON a.OwnerUserId = u.Id
+    JOIN QuestionAgg q    ON q.QuestionId = a.QuestionId
+    JOIN TagList tl       ON tl.TagName = q.SingleTag
+    LEFT JOIN UserBadgeCounts ub ON ub.UserId = u.Id
+),
+AllTagStats AS (
+    SELECT * FROM TagQuestionStats
+    UNION ALL
+    SELECT
+        tl.TagId,
+        tl.TagName,
+        0 AS QuestionCount,
+        0 AS AvgScore,
+        0 AS TotalViews,
+        0 AS TotalFavorites,
+        NULL AS LatestQuestionDate,
+        0 AS ClosedCount
+    FROM TagList tl
+    WHERE NOT EXISTS (SELECT 1 FROM TagQuestionStats s WHERE s.TagId = tl.TagId)
+)
+SELECT
+    t.TagId,
+    t.TagName,
+    t.TagUseCount,
+    s.QuestionCount,
+    s.AvgScore,
+    s.TotalViews,
+    s.TotalFavorites,
+    s.ClosedCount,
+    tc.UserId,
+    tc.DisplayName,
+    tc.Reputation,
+    tc.GoldBadges,
+    tc.SilverBadges,
+    tc.BronzeBadges,
+    tc.RankPerTag
+FROM TagList t
+LEFT JOIN AllTagStats s
+       ON s.TagId = t.TagId
+LEFT JOIN (
+    SELECT *
+    FROM TopContributors
+    WHERE RankPerTag <= 3
+) tc
+       ON tc.TagName = t.TagName
+WHERE t.TagUseCount > 1000
+ORDER BY t.TagUseCount DESC,
+         s.QuestionCount DESC,
+         tc.RankPerTag;

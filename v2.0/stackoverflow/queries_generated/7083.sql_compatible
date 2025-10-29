@@ -1,0 +1,200 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.Views DESC) AS ReputationRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000 AND u.Views > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        Views,
+        PostCount,
+        CommentCount,
+        BadgeCount,
+        ReputationRank,
+        CASE 
+            WHEN Reputation > 100000 THEN 'Elite'
+            WHEN Reputation > 50000 THEN 'Expert'
+            WHEN Reputation > 10000 THEN 'Advanced'
+            WHEN Reputation > 1000 THEN 'Beginner'
+            ELSE 'Newbie'
+        END AS ReputationLevel
+    FROM UserStats
+    WHERE ReputationRank <= 100
+),
+QuestionStats AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        CASE 
+            WHEN p.Score > 10 THEN 'HighlyVoted'
+            WHEN p.Score > 5 THEN 'ModeratelyVoted'
+            WHEN p.Score > 0 THEN 'LowVoted'
+            ELSE 'NoVotes'
+        END AS VoteCategory,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS UserQuestionRank
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.ViewCount > 100
+),
+AnswerStats AS (
+    SELECT 
+        p.Id AS AnswerId,
+        p.ParentId AS QuestionId,
+        p.Score,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Body,
+        CASE 
+            WHEN p.Score > 10 THEN 'ExcellentAnswer'
+            WHEN p.Score > 5 THEN 'GoodAnswer'
+            WHEN p.Score > 0 THEN 'BasicAnswer'
+            ELSE 'LowValueAnswer'
+        END AS AnswerQuality,
+        ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC) AS QuestionAnswerRank
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'PopularTag'
+            WHEN t.Count > 100 THEN 'ModerateTag'
+            WHEN t.Count > 10 THEN 'NicheTag'
+            ELSE 'RareTag'
+        END AS TagPopularity
+    FROM Tags t
+    WHERE t.Count > 0
+)
+SELECT 
+    tu.ReputationLevel,
+    COUNT(DISTINCT tu.UserId) AS UserCount,
+    COUNT(DISTINCT qs.QuestionId) AS QuestionCount,
+    COUNT(DISTINCT asa.AnswerId) AS AnswerCount,
+    COUNT(DISTINCT ta.TagName) AS TagCount,
+    AVG(tu.Reputation) AS AvgReputation,
+    AVG(qs.ViewCount) AS AvgQuestionViews,
+    AVG(qs.Score) AS AvgQuestionScore,
+    AVG(asa.Score) AS AvgAnswerScore,
+    STRING_AGG(CONCAT(tu.DisplayName, ' (', tu.Reputation, ')'), ', ') AS TopUsers,
+    STRING_AGG(CONCAT(qs.Title, ' (', qs.ViewCount, ')'), '; ') AS TopQuestions,
+    STRING_AGG(CONCAT(ta.TagName, ' (', ta.TagCount, ')'), ', ') AS PopularTags,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.PostTypeId = 1 
+          AND p.CreationDate > DATE '2020-01-01' 
+          AND p.Score > 10
+          AND EXISTS (
+              SELECT 1 
+              FROM Posts p2 
+              WHERE p2.ParentId = p.Id 
+                AND p2.PostTypeId = 2 
+                AND p2.Score > 5
+          )
+    ) AS RecentHighQualityQuestions,
+    (
+        SELECT STRING_AGG(detail, ' | ')
+        FROM (
+            SELECT p.Id,
+                   CONCAT(p.Title, ' - ',
+                       CASE 
+                           WHEN EXISTS (SELECT 1 FROM Posts p2 WHERE p2.ParentId = p.Id AND p2.Score > 10) THEN 'HasExcellentAnswers'
+                           WHEN EXISTS (SELECT 1 FROM Posts p2 WHERE p2.ParentId = p.Id AND p2.Score > 5) THEN 'HasGoodAnswers'
+                           ELSE 'NoHighScoringAnswers'
+                       END
+                   ) AS detail
+            FROM Posts p
+            WHERE p.PostTypeId = 1 
+              AND p.CreationDate > DATE '2020-01-01' 
+              AND p.Score > 5
+        ) sub
+    ) AS QualityQuestionAnalysis,
+    (
+        SELECT 
+            CASE 
+                WHEN COUNT(*) > 0 THEN 
+                    CONCAT('Avg Score: ', CAST(AVG(p.Score) AS VARCHAR(50)), ', Count: ', COUNT(*))
+                ELSE 'No Records'
+            END
+        FROM Posts p
+        WHERE p.PostTypeId = 1 
+          AND p.CreationDate > DATE '2020-01-01' 
+          AND p.ViewCount > 1000
+    ) AS HighViewQuestions,
+    (
+        SELECT STRING_AGG(CONCAT('Answer Quality: ', AnswerQuality, ' - ', cnt, ' answers'), '; ')
+        FROM (
+            SELECT asa.AnswerQuality, COUNT(*) AS cnt
+            FROM AnswerStats asa
+            WHERE asa.CreationDate > DATE '2020-01-01'
+            GROUP BY asa.AnswerQuality
+        ) q
+    ) AS AnswerQualityDistribution,
+    (
+        SELECT 
+            CASE 
+                WHEN COUNT(*) > 0 THEN 
+                    CONCAT('Avg Score per Tag: ', CAST(AVG(ta.TagCount) AS VARCHAR(50)), ', TotalTags: ', COUNT(*))
+                ELSE 'No Tags'
+            END
+        FROM TagAnalysis ta
+        WHERE ta.TagCount > 100
+    ) AS PopularTagAnalysis,
+    (
+        SELECT STRING_AGG(CONCAT('User: ', tu2.DisplayName, ' (Reputation: ', tu2.Reputation, ') - Questions: ', tu2.PostCount), ' | ')
+        FROM TopUsers tu2
+        WHERE EXISTS (
+            SELECT 1 
+            FROM Posts p 
+            WHERE p.OwnerUserId = tu2.UserId 
+              AND p.PostTypeId = 1 
+              AND p.Score > 10
+        )
+    ) AS TopScoringAuthors,
+    (
+        SELECT STRING_AGG(CONCAT('Question: ', qs2.Title, ' - Answers: ', qs2.AnswerCount), ' | ')
+        FROM QuestionStats qs2
+        WHERE qs2.AnswerCount > 10
+    ) AS QuestionWithManyAnswers
+FROM TopUsers tu
+LEFT JOIN QuestionStats qs ON tu.UserId = qs.OwnerUserId
+LEFT JOIN AnswerStats asa ON tu.UserId = asa.OwnerUserId
+LEFT JOIN TagAnalysis ta ON ta.TagCount > 100
+GROUP BY tu.ReputationLevel
+HAVING COUNT(DISTINCT tu.UserId) > 0
+ORDER BY 
+    CASE tu.ReputationLevel 
+        WHEN 'Elite' THEN 1
+        WHEN 'Expert' THEN 2
+        WHEN 'Advanced' THEN 3
+        WHEN 'Beginner' THEN 4
+        ELSE 5
+    END
+LIMIT 10;

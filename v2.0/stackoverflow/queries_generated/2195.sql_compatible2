@@ -1,0 +1,180 @@
+WITH RECURSIVE RecursiveTagPaths AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        ARRAY[t.TagName] AS TagPath,
+        1 AS Depth
+    FROM Tags t
+    WHERE t.IsModeratorOnly = false AND t.IsRequired = false
+
+    UNION ALL
+
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        rtp.TagPath || t2.TagName,
+        rtp.Depth + 1
+    FROM Tags t2
+    JOIN Posts p ON p.Tags LIKE ('%<' || t2.TagName || '>%')
+    JOIN RecursiveTagPaths rtp ON array_position(rtp.TagPath, t2.TagName) IS NULL AND p.Id = rtp.Id
+    WHERE rtp.Depth < 3
+),
+UserAnswerStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        count(a.Id) FILTER (WHERE a.Score > 10) AS HighScoreAnswers,
+        count(a.Id) AS TotalAnswers,
+        coalesce(avg(a.Score), 0) AS AvgAnswerScore,
+        sum(CASE WHEN a.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END) OVER (PARTITION BY u.Id) AS AcceptedAnswersCount,
+        max(p.Score) FILTER (WHERE p.PostTypeId = 1) AS MaxQuestionScore,
+        min(p.Score) FILTER (WHERE p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL) AS MinClosedQuestionScore
+    FROM Users u
+    LEFT JOIN Posts a ON a.PostTypeId = 2 AND a.OwnerUserId = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+    GROUP BY u.Id, u.DisplayName
+),
+RecentPostEdits AS (
+    SELECT
+        ph.PostId,
+        ph.CreationDate,
+        ph.UserId,
+        ph.PostHistoryTypeId,
+        ph.Comment,
+        row_number() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4,5,6)
+),
+AggregatedVotes AS (
+    SELECT
+        p.Id AS PostId,
+        sum(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        sum(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        count(DISTINCT v.UserId) AS UniqueVoters
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    GROUP BY p.Id
+),
+UserBadgeSummary AS (
+    SELECT
+        b.UserId,
+        sum(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        sum(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        sum(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        count(b.Id) AS TotalBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+DuplicatedPosts AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate,
+        lt.Name AS LinkTypeName
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    WHERE pl.LinkTypeId = 3
+),
+UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        (u.UpVotes + u.DownVotes) AS TotalVotes,
+        count(DISTINCT co.Id) AS CommentsMade,
+        count(DISTINCT p.Id) AS PostsMade,
+        extract(epoch FROM (max(u.LastAccessDate) - min(u.CreationDate)))/86400.0 AS DaysActive
+    FROM Users u
+    LEFT JOIN Comments co ON co.UserId = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.UpVotes, u.DownVotes, u.LastAccessDate, u.CreationDate
+),
+TopTagsPerUser AS (
+    SELECT
+        u.Id AS UserId,
+        unnest(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><')) AS Tag,
+        count(*) AS PostsCount
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id AND p.Tags IS NOT NULL
+    GROUP BY u.Id, Tag
+),
+UserTopTagRanks AS (
+    SELECT
+        Tag,
+        UserId,
+        PostsCount,
+        row_number() OVER (PARTITION BY Tag ORDER BY PostsCount DESC, UserId) AS RankInTag
+    FROM TopTagsPerUser
+),
+FinalUserStats AS (
+    SELECT
+        uas.UserId,
+        uas.DisplayName,
+        uas.HighScoreAnswers,
+        uas.TotalAnswers,
+        round(uas.AvgAnswerScore::numeric, 2) AS AvgAnswerScore,
+        coalesce(uas.AcceptedAnswersCount, 0) AS AcceptedAnswersCount,
+        coalesce(ubs.GoldBadges, 0) AS GoldBadges,
+        coalesce(ubs.SilverBadges, 0) AS SilverBadges,
+        coalesce(ubs.BronzeBadges, 0) AS BronzeBadges,
+        coalesce(ue.TotalVotes, 0) AS TotalVotes,
+        coalesce(ue.CommentsMade, 0) AS CommentsMade,
+        coalesce(ue.PostsMade, 0) AS PostsMade,
+        coalesce(round(ue.DaysActive, 1), 0) AS DaysActive,
+        min(uttr.RankInTag) FILTER (WHERE rt.Depth = 1) AS BestTagRank,
+        max(rt.Depth) AS MaxTagDepth
+    FROM UserAnswerStats uas
+    LEFT JOIN UserBadgeSummary ubs ON ubs.UserId = uas.UserId
+    LEFT JOIN UserEngagement ue ON ue.UserId = uas.UserId
+    LEFT JOIN UserTopTagRanks uttr ON uttr.UserId = uas.UserId
+    LEFT JOIN RecursiveTagPaths rt ON rt.TagName = uttr.Tag
+    GROUP BY uas.UserId, uas.DisplayName, uas.HighScoreAnswers, uas.TotalAnswers, round(uas.AvgAnswerScore::numeric, 2),
+             uas.AcceptedAnswersCount, ubs.GoldBadges, ubs.SilverBadges, ubs.BronzeBadges, ue.TotalVotes, ue.CommentsMade, ue.PostsMade, ue.DaysActive
+)
+SELECT
+    fus.UserId,
+    fus.DisplayName,
+    fus.HighScoreAnswers,
+    fus.TotalAnswers,
+    fus.AvgAnswerScore,
+    fus.AcceptedAnswersCount,
+    fus.GoldBadges,
+    fus.SilverBadges,
+    fus.BronzeBadges,
+    fus.TotalVotes,
+    fus.CommentsMade,
+    fus.PostsMade,
+    fus.DaysActive,
+    coalesce(fus.BestTagRank, 9999) AS BestTagRank,
+    fus.MaxTagDepth,
+    coalesce(dp.DupCount, 0) AS DuplicateQuestionsCount,
+    (
+        SELECT count(*)
+        FROM Posts p2
+        WHERE p2.PostTypeId = 1 AND p2.OwnerUserId = fus.UserId AND p2.ClosedDate IS NOT NULL AND p2.Score < 0
+    ) AS NegativelyScoredClosedQuestions,
+    (
+        SELECT string_agg(distinct trim(b.Name) || ':' || cast(count(b.Id) AS text), ', ' ORDER BY b.Class DESC)
+        FROM Badges b
+        WHERE b.UserId = fus.UserId AND b.Date > (cast('2024-10-01' AS date) - interval '1 year')
+        GROUP BY b.UserId
+    ) AS RecentBadges,
+    (
+        SELECT array_agg(distinct substr(c.Text, 1, 30) || '...')
+        FROM Comments c
+        WHERE c.UserId = fus.UserId
+          AND c.CreationDate > (cast('2024-10-01' AS date) - interval '30 days')
+        ORDER BY c.CreationDate DESC
+        LIMIT 5
+    ) AS RecentCommentSnippets
+FROM FinalUserStats fus
+LEFT JOIN (
+    SELECT p.OwnerUserId, count(DISTINCT p.Id) AS DupCount
+    FROM Posts p
+    JOIN DuplicatedPosts dp ON dp.PostId = p.Id
+    WHERE p.PostTypeId = 1
+    GROUP BY p.OwnerUserId
+) dp ON dp.OwnerUserId = fus.UserId
+WHERE fus.TotalAnswers > 10 AND fus.AvgAnswerScore > 2.5
+ORDER BY fus.GoldBadges DESC NULLS LAST, fus.AvgAnswerScore DESC, fus.TotalVotes DESC
+LIMIT 100;

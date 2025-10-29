@@ -1,0 +1,282 @@
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        u.upvotes,
+        u.downvotes,
+        coalesce(nullif(trim(split_part(coalesce(u.location, ''), ',', 1)), ''), 'Unknown') as region_hint,
+        row_number() over (order by u.creationdate desc, u.id desc) as rn
+    from users u
+    where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+user_activity as (
+    select
+        p.owneruserid as user_id,
+        count(*) filter (where p.posttypeid = 1) as q_cnt,
+        count(*) filter (where p.posttypeid = 2) as a_cnt,
+        sum(coalesce(p.score,0)) as post_score_sum,
+        avg(nullif(p.viewcount,0)) as avg_viewcount_nonzero,
+        max(p.lastactivitydate) as last_post_activity
+    from posts p
+    where p.owneruserid is not null
+    group by p.owneruserid
+),
+accepted_ratio as (
+    select
+        a.owneruserid as user_id,
+        sum(case when q.acceptedanswerid = a.id then 1 else 0 end) * 1.0 as accepted_answers,
+        count(*) * 1.0 as total_answers,
+        case when count(*) = 0 then null else (sum(case when q.acceptedanswerid = a.id then 1 else 0 end) * 1.0) / count(*) end as accept_rate
+    from posts a
+    join posts q on q.id = a.parentid and q.posttypeid = 1
+    where a.posttypeid = 2
+    group by a.owneruserid
+),
+comment_agg as (
+    select
+        c.userid as user_id,
+        count(*) as comment_cnt,
+        sum(coalesce(c.score,0)) as comment_score_sum,
+        max(c.creationdate) as last_comment_date
+    from comments c
+    where c.userid is not null
+    group by c.userid
+),
+badge_agg as (
+    select
+        b.userid as user_id,
+        count(*) filter (where b.class = 1) as gold_badges,
+        count(*) filter (where b.class = 2) as silver_badges,
+        count(*) filter (where b.class = 3) as bronze_badges,
+        count(*) filter (where b.tagbased = true) as tag_badges,
+        max(b.date) as last_badge_date
+    from badges b
+    group by b.userid
+),
+tag_exposure as (
+    select
+        p.owneruserid as user_id,
+        unnest(string_to_array(substring(coalesce(p.tags,''), 2, greatest(length(coalesce(p.tags,'')) - 2, 0)), '><')) as tagname
+    from posts p
+    where p.posttypeid = 1
+      and p.owneruserid is not null
+),
+top_tags as (
+    select
+        tt.user_id,
+        string_agg(tt.tagname, ', ' order by tt.rnk) as top3_tags
+    from (
+        select
+            te.user_id,
+            te.tagname,
+            row_number() over (partition by te.user_id order by count(*) desc, min(te.tagname)) as rnk
+        from tag_exposure te
+        group by te.user_id, te.tagname
+    ) tt
+    where tt.rnk <= 3
+    group by tt.user_id
+),
+duplicate_events as (
+    select
+        ph.postid,
+        min(ph.creationdate) as first_dup_vote_date,
+        count(*) as dup_vote_events
+    from posthistory ph
+    where ph.posthistorytypeid in (10,35)
+      and (
+        ph.text like '%"OriginalQuestionIds"%' or
+        ph.comment in ('1','101') or
+        ph.text ilike '%duplicate%'
+      )
+    group by ph.postid
+),
+link_dup_rel as (
+    select
+        pl.postid,
+        count(*) filter (where pl.linktypeid = 3) as duplicate_links,
+        count(*) filter (where pl.linktypeid = 1) as linked_links
+    from postlinks pl
+    group by pl.postid
+),
+vote_agg as (
+    select
+        v.postid,
+        count(*) filter (where v.votetypeid = 2) as upvotes,
+        count(*) filter (where v.votetypeid = 3) as downvotes,
+        count(*) filter (where v.votetypeid = 8) as bounties_started,
+        sum(coalesce(v.bountyamount,0)) filter (where v.votetypeid in (8,9)) as bounty_total
+    from votes v
+    group by v.postid
+),
+question_metrics as (
+    select
+        q.id as question_id,
+        q.owneruserid as user_id,
+        q.creationdate,
+        q.score,
+        q.viewcount,
+        q.answercount,
+        q.closeddate,
+        vd.upvotes,
+        vd.downvotes,
+        vd.bounty_total,
+        coalesce(ld.duplicate_links,0) as dup_links,
+        coalesce(ld.linked_links,0) as linked_links,
+        coalesce(de.dup_vote_events,0) as dup_vote_events,
+        case when q.closeddate is not null then 1 else 0 end as is_closed
+    from posts q
+    left join vote_agg vd on vd.postid = q.id
+    left join link_dup_rel ld on ld.postid = q.id
+    left join duplicate_events de on de.postid = q.id
+    where q.posttypeid = 1
+      and q.owneruserid is not null
+),
+user_scoring as (
+    select
+        qm.user_id,
+        count(*) as q_count,
+        avg(coalesce(qm.score,0)) as avg_q_score,
+        avg(coalesce(qm.viewcount,0)) as avg_q_views,
+        avg(coalesce(qm.upvotes,0) - coalesce(qm.downvotes,0)) as avg_q_net_votes,
+        sum(case when qm.answercount >= 1 then 1 else 0 end) * 1.0 / nullif(count(*),0) as pct_answered,
+        sum(qm.dup_vote_events) as total_dup_events,
+        sum(qm.dup_links) as total_dup_links,
+        sum(qm.is_closed) as closed_qs,
+        max(qm.creationdate) as last_q_date
+    from question_metrics qm
+    group by qm.user_id
+),
+activity_ranked as (
+    select
+        ru.user_id,
+        ru.displayname,
+        ru.reputation,
+        ru.region_hint,
+        ua.q_cnt,
+        ua.a_cnt,
+        ua.post_score_sum,
+        ua.avg_viewcount_nonzero,
+        ua.last_post_activity,
+        ar.accept_rate,
+        co.comment_cnt,
+        co.comment_score_sum,
+        co.last_comment_date,
+        ba.gold_badges,
+        ba.silver_badges,
+        ba.bronze_badges,
+        ba.tag_badges,
+        ba.last_badge_date,
+        us.q_count,
+        us.avg_q_score,
+        us.avg_q_views,
+        us.avg_q_net_votes,
+        us.pct_answered,
+        us.total_dup_events,
+        us.total_dup_links,
+        us.closed_qs,
+        us.last_q_date,
+        tt.top3_tags,
+        (
+            coalesce(ua.a_cnt,0) * 2
+            + coalesce(ua.q_cnt,0) * 1
+            + coalesce(ba.gold_badges,0) * 5
+            + coalesce(ba.silver_badges,0) * 3
+            + coalesce(ba.bronze_badges,0) * 1
+            + coalesce(ar.accept_rate,0) * 20
+            + greatest(coalesce(us.avg_q_net_votes,0), 0) * 2
+            - least(coalesce(us.total_dup_events,0), 50) * 0.5
+            - least(coalesce(us.closed_qs,0), 50) * 0.25
+            + case when ru.reputation >= 20000 then 10 when ru.reputation >= 5000 then 5 else 0 end
+        ) as perf_score,
+        row_number() over (
+            order by
+                (
+                    coalesce(ua.a_cnt,0) * 2
+                    + coalesce(ua.q_cnt,0)
+                    + coalesce(ba.gold_badges,0) * 5
+                    + coalesce(ba.silver_badges,0) * 3
+                    + coalesce(ba.bronze_badges,0)
+                    + coalesce(ar.accept_rate,0) * 20
+                    + greatest(coalesce(us.avg_q_net_votes,0), 0) * 2
+                    - least(coalesce(us.total_dup_events,0), 50) * 0.5
+                    - least(coalesce(us.closed_qs,0), 50) * 0.25
+                    + case when ru.reputation >= 20000 then 10 when ru.reputation >= 5000 then 5 else 0 end
+                ) desc,
+                ru.reputation desc,
+                ru.user_id desc
+        ) as perf_rank
+    from recent_users ru
+    left join user_activity ua on ua.user_id = ru.user_id
+    left join accepted_ratio ar on ar.user_id = ru.user_id
+    left join comment_agg co on co.user_id = ru.user_id
+    left join badge_agg ba on ba.user_id = ru.user_id
+    left join user_scoring us on us.user_id = ru.user_id
+    left join top_tags tt on tt.user_id = ru.user_id
+),
+cross_vs_global as (
+    select
+        a.*,
+        percentile_cont(0.5) within group (order by coalesce(a.a_cnt,0)) over () as med_answers,
+        avg(coalesce(a.a_cnt,0)) over () as avg_answers,
+        percentile_cont(0.5) within group (order by coalesce(a.q_cnt,0)) over () as med_questions,
+        avg(coalesce(a.q_cnt,0)) over () as avg_questions,
+        percentile_cont(0.5) within group (order by coalesce(a.accept_rate,0)) over () as med_accept_rate,
+        avg(coalesce(a.accept_rate,0)) over () as avg_accept_rate,
+        percentile_cont(0.5) within group (order by coalesce(a.perf_score,0)) over () as med_perf,
+        avg(coalesce(a.perf_score,0)) over () as avg_perf
+    from activity_ranked a
+),
+dense_segments as (
+    select
+        c.*,
+        ntile(10) over (order by coalesce(c.perf_score,0) desc) as decile,
+        dense_rank() over (order by coalesce(c.accept_rate,0) desc) as accept_dr,
+        dense_rank() over (order by coalesce(c.q_cnt,0) desc) as q_dr
+    from cross_vs_global c
+)
+select
+    ds.user_id,
+    ds.displayname,
+    ds.region_hint,
+    ds.reputation,
+    ds.perf_rank,
+    round(cast(ds.perf_score as numeric), 2) as perf_score,
+    ds.q_cnt,
+    ds.a_cnt,
+    ds.accept_rate,
+    ds.avg_q_score,
+    ds.avg_q_views,
+    ds.avg_q_net_votes,
+    ds.pct_answered,
+    ds.gold_badges,
+    ds.silver_badges,
+    ds.bronze_badges,
+    coalesce(ds.top3_tags, '(none)') as top3_tags,
+    ds.last_post_activity,
+    ds.last_q_date,
+    ds.last_comment_date,
+    case when ds.a_cnt is null then 'No posts'
+         when ds.a_cnt >= ds.med_answers then '>= median'
+         else '< median'
+    end as answers_vs_median,
+    case when ds.perf_score is null then 'N/A'
+         when ds.perf_score >= ds.med_perf then 'TopHalf' else 'BottomHalf' end as perf_half,
+    ds.decile,
+    ds.accept_dr,
+    ds.q_dr
+from dense_segments ds
+where
+    (
+        ds.perf_rank <= 100
+        or (ds.decile <= 2 and coalesce(ds.accept_rate,0) >= coalesce(ds.avg_accept_rate,0))
+        or (coalesce(ds.gold_badges,0) >= 1 and coalesce(ds.a_cnt,0) >= coalesce(ds.med_answers,0))
+    )
+  and (
+        ds.last_post_activity >= (cast('2024-10-01 12:34:56' as timestamp) - interval '365 days')
+        or ds.last_q_date >= (cast('2024-10-01 12:34:56' as timestamp) - interval '365 days')
+        or ds.last_comment_date >= (cast('2024-10-01 12:34:56' as timestamp) - interval '365 days')
+      )
+order by ds.perf_rank, ds.user_id
+limit 200;

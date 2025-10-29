@@ -1,0 +1,205 @@
+with RecursiveUserBadges as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        b.Class,
+        b.Name as BadgeName,
+        b.Date,
+        row_number() over (partition by u.Id order by b.Date desc, b.Class) as rn
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    where u.Reputation > 100 and b.TagBased = false
+),
+TopBadges as (
+    select UserId, DisplayName, Class, BadgeName, Date from RecursiveUserBadges where rn <= 5
+),
+UserPostStats as (
+    select
+        p.OwnerUserId as UserId,
+        count(distinct p.Id) as TotalPosts,
+        sum(case when p.PostTypeId = 1 then 1 else 0 end) as Questions,
+        sum(case when p.PostTypeId = 2 then 1 else 0 end) as Answers,
+        avg(p.Score) as AvgPostScore,
+        max(p.ViewCount) as MaxViews,
+        sum(coalesce(p.FavoriteCount,0)) as TotalFavorites
+    from Posts p
+    where p.OwnerUserId is not null
+    group by p.OwnerUserId
+),
+RecentQuestionActivity as (
+    select
+        q.Id as QuestionId,
+        q.OwnerUserId as QuestionOwnerId,
+        q.CreationDate,
+        q.Title,
+        q.Tags,
+        a.Id as AnswerId,
+        a.OwnerUserId as AnswerOwnerId,
+        a.Score as AnswerScore,
+        dense_rank() over (partition by q.Id order by a.Score desc, a.CreationDate) as AnswerRank
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1 and q.CreationDate > (cast('2024-10-01 12:34:56' as timestamp) - interval '90 days')
+),
+BestAnswers as (
+    select
+        QuestionId, AnswerId, AnswerOwnerId, AnswerScore
+    from RecentQuestionActivity
+    where AnswerRank = 1
+),
+UserVoteSummary as (
+    select
+        p.OwnerUserId as UserId,
+        vt.Name as VoteType,
+        count(v.Id) as VoteCount,
+        sum(coalesce(v.BountyAmount, 0)) as TotalBountyAmount
+    from Votes v
+    join VoteTypes vt on v.VoteTypeId = vt.Id
+    join Posts p on v.PostId = p.Id
+    where p.OwnerUserId is not null
+    group by p.OwnerUserId, vt.Name
+),
+UserTagEngagement as (
+    select
+        u.Id as UserId,
+        lower(t.TagName) as TagName,
+        count(distinct p.Id) as PostsCount,
+        sum(coalesce(p.Score,0)) as ScoreSum,
+        avg(coalesce(p.Score,0)) as AvgScore
+    from Users u
+    join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 1
+    cross join lateral (
+        select unnest(string_to_array(substring(p.Tags,2,length(p.Tags)-2), '><')) as TagName
+    ) t
+    group by u.Id, lower(t.TagName)
+),
+HighlyEngagedTags as (
+    select
+        TagName,
+        count(distinct UserId) as UniqueUsers,
+        sum(PostsCount) as TotalPosts,
+        avg(AvgScore) as AvgTagScore
+    from UserTagEngagement
+    group by TagName
+    having count(distinct UserId) > 10 and avg(AvgScore) > 2
+),
+CombinedUserStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        coalesce(ps.TotalPosts, 0) as TotalPosts,
+        coalesce(ps.Questions, 0) as TotalQuestions,
+        coalesce(ps.Answers, 0) as TotalAnswers,
+        coalesce(ps.AvgPostScore, 0) as AvgPostScore,
+        max(case when uvs.VoteType = 'UpMod' then uvs.VoteCount else 0 end) as UpVotesCount,
+        max(case when uvs.VoteType = 'DownMod' then uvs.VoteCount else 0 end) as DownVotesCount,
+        coalesce(sum(uvs.TotalBountyAmount), 0) as TotalBountyReceived,
+        max(tb.Class) as HighestBadgeClass,
+        string_agg(distinct tb.BadgeName, ', ') as Badges
+    from Users u
+    left join UserPostStats ps on u.Id = ps.UserId
+    left join UserVoteSummary uvs on u.Id = uvs.UserId
+    left join TopBadges tb on u.Id = tb.UserId
+    group by u.Id, u.DisplayName, ps.TotalPosts, ps.Questions, ps.Answers, ps.AvgPostScore
+),
+MostActiveUserTags as (
+    select
+        ute.UserId,
+        ute.TagName,
+        ute.PostsCount,
+        ute.ScoreSum,
+        row_number() over (partition by ute.UserId order by ute.PostsCount desc, ute.ScoreSum desc) as TagRank
+    from UserTagEngagement ute
+),
+FinalSelection as (
+    select
+        cus.UserId,
+        cus.DisplayName,
+        cus.TotalPosts,
+        cus.TotalQuestions,
+        cus.TotalAnswers,
+        cus.AvgPostScore,
+        cus.UpVotesCount,
+        cus.DownVotesCount,
+        cus.TotalBountyReceived,
+        cus.HighestBadgeClass,
+        cus.Badges,
+        mat.TagName as TopTag,
+        mat.PostsCount as TopTagPostCount,
+        mat.ScoreSum as TopTagScoreSum
+    from CombinedUserStats cus
+    left join MostActiveUserTags mat on cus.UserId = mat.UserId and mat.TagRank = 1
+    where cus.TotalPosts > 50 and (cus.UpVotesCount - coalesce(cus.DownVotesCount,0)) > 20
+    order by cus.TotalPosts desc, cus.AvgPostScore desc
+    limit 100
+)
+select
+    fs.UserId,
+    fs.DisplayName,
+    fs.TotalPosts,
+    fs.TotalQuestions,
+    fs.TotalAnswers,
+    fs.AvgPostScore,
+    fs.UpVotesCount,
+    fs.DownVotesCount,
+    fs.TotalBountyReceived,
+    case fs.HighestBadgeClass
+        when 1 then 'Gold'
+        when 2 then 'Silver'
+        when 3 then 'Bronze'
+        else 'None' end as HighestBadge,
+    fs.Badges,
+    coalesce(htg.TotalPosts,0) as HighlyEngagedTagCount,
+    coalesce(htg.AvgTagScore,0) as AvgHighlyEngagedTagScore,
+    fs.TopTag,
+    fs.TopTagPostCount,
+    fs.TopTagScoreSum,
+    (
+        select string_agg(
+            coalesce(p.Title, '[no title]') || ' (' || to_char(p.CreationDate, 'YYYY-MM-DD') || ' | score: ' || coalesce(cast(p.Score as text), '0') || ')',
+            ' || '
+            order by p.CreationDate desc
+        )
+        from (
+          select p_inner.*
+          from Posts p_inner
+          where p_inner.OwnerUserId = fs.UserId
+            and p_inner.PostTypeId in (1,2)
+          order by p_inner.CreationDate desc
+          fetch first 5 rows only
+        ) p
+    ) as RecentPostSummaries,
+    rank() over (order by fs.TotalPosts desc) as UserRankByPosts
+from FinalSelection fs
+left join (
+    select
+        ute.UserId,
+        count(distinct ute.TagName) as TotalPosts,
+        avg(utetq.AvgTagScore) as AvgTagScore
+    from UserTagEngagement ute
+    join HighlyEngagedTags utetq on ute.TagName = utetq.TagName
+    group by ute.UserId
+) htg on fs.UserId = htg.UserId
+union
+select
+    u.Id as UserId,
+    u.DisplayName,
+    0 as TotalPosts,
+    0 as TotalQuestions,
+    0 as TotalAnswers,
+    0.0 as AvgPostScore,
+    0 as UpVotesCount,
+    0 as DownVotesCount,
+    0 as TotalBountyReceived,
+    'None' as HighestBadge,
+    NULL as Badges,
+    0 as HighlyEngagedTagCount,
+    0.0 as AvgHighlyEngagedTagScore,
+    NULL as TopTag,
+    0 as TopTagPostCount,
+    0 as TopTagScoreSum,
+    NULL as RecentPostSummaries,
+    NULL as UserRankByPosts
+from Users u
+where u.Id not in (select UserId from FinalSelection)
+order by UserRankByPosts nulls last, TotalPosts desc;

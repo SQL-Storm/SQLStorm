@@ -1,0 +1,327 @@
+with params as (
+    select
+        date_trunc('month', cast('2024-10-01 12:34:56' as timestamp)) - interval '24 months' as start_utc,
+        cast('2024-10-01 12:34:56' as timestamp) as end_utc
+),
+active_questions as (
+    select
+        p.Id as QuestionId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.Tags,
+        coalesce(p.AnswerCount, 0) as AnswerCount,
+        case when p.ClosedDate is not null then 1 else 0 end as IsClosed
+    from Posts p
+    where p.PostTypeId = 1
+      and p.CreationDate between (select start_utc from params) and (select end_utc from params)
+),
+accepted_answers as (
+    select
+        q.Id as QuestionId,
+        a.Id as AcceptedAnswerId,
+        a.Score as AcceptedScore,
+        a.OwnerUserId as AcceptedOwnerUserId
+    from Posts q
+    left join Posts a
+      on a.Id = q.AcceptedAnswerId
+    where q.PostTypeId = 1
+),
+first_comment_per_user as (
+    select
+        c.UserId,
+        min(c.CreationDate) as FirstCommentDate
+    from Comments c
+    where c.UserId is not null
+    group by c.UserId
+),
+votes_agg as (
+    select
+        v.PostId,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+        sum(case when v.VoteTypeId in (2,3) then 1 else 0 end) as TotalVotes,
+        sum(case when v.VoteTypeId in (8,9) then coalesce(v.BountyAmount,0) else 0 end) as BountyTotal
+    from Votes v
+    group by v.PostId
+),
+comment_engagement as (
+    select
+        c.PostId,
+        count(*) as CommentCount,
+        sum(case when c.Score > 0 then 1 else 0 end) as PositiveComments,
+        max(c.CreationDate) as LastCommentDate
+    from Comments c
+    group by c.PostId
+),
+edit_events as (
+    select
+        ph.PostId,
+        count(case when ph.PostHistoryTypeId in (4,5,6,7,8,9,24) then 1 end) as EditCount,
+        max(case when ph.PostHistoryTypeId in (4,5,6,7,8,9,24) then ph.CreationDate end) as LastEditDate,
+        count(case when ph.PostHistoryTypeId in (10,11,12,13,14,15,19,20,35,36) then 1 end) as ModEventCount
+    from PostHistory ph
+    group by ph.PostId
+),
+dup_links as (
+    select
+        pl.PostId as DuplicateOfId,
+        pl.RelatedPostId as CanonicalId,
+        count(*) as DupCount
+    from PostLinks pl
+    where pl.LinkTypeId = 3
+    group by pl.PostId, pl.RelatedPostId
+),
+tag_expansion as (
+    select
+        p.Id as PostId,
+        unnest(string_to_array(substring(p.Tags, 2, greatest(length(p.Tags)-2,0)), '><')) as TagName
+    from Posts p
+    where p.PostTypeId = 1
+      and p.Tags is not null
+),
+tag_rank as (
+    select
+        te.TagName,
+        count(*) as QCount,
+        dense_rank() over (order by count(*) desc) as TagDenseRank
+    from tag_expansion te
+    group by te.TagName
+),
+user_stats as (
+    select
+        u.Id as UserId,
+        u.Reputation,
+        u.CreationDate as UserCreated,
+        u.LastAccessDate,
+        u.UpVotes as UserUpVotes,
+        u.DownVotes as UserDownVotes,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.Reputation, u.CreationDate, u.LastAccessDate, u.UpVotes, u.DownVotes
+),
+question_activity as (
+    select
+        q.QuestionId,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.OwnerUserId,
+        q.Tags,
+        q.AnswerCount,
+        q.IsClosed,
+        va.UpVotes,
+        va.DownVotes,
+        va.TotalVotes,
+        va.BountyTotal,
+        ce.CommentCount,
+        ce.PositiveComments,
+        ce.LastCommentDate,
+        ee.EditCount,
+        ee.LastEditDate,
+        ee.ModEventCount
+    from active_questions q
+    left join votes_agg va on va.PostId = q.QuestionId
+    left join comment_engagement ce on ce.PostId = q.QuestionId
+    left join edit_events ee on ee.PostId = q.QuestionId
+),
+answerer_quality as (
+    select
+        a.ParentId as QuestionId,
+        count(*) as AnswerCountTotal,
+        avg(a.Score) as AvgAnswerScore,
+        max(a.Score) as MaxAnswerScore,
+        count(case when a.Score > 0 then 1 end) as PosAnswerCount,
+        count(case when a.Score < 0 then 1 end) as NegAnswerCount
+    from Posts a
+    where a.PostTypeId = 2
+    group by a.ParentId
+),
+interactions as (
+    select
+        qa.QuestionId,
+        qa.CreationDate,
+        qa.Score,
+        qa.ViewCount,
+        qa.AnswerCount as DeclaredAnswerCount,
+        coalesce(aq.AnswerCountTotal, 0) as ActualAnswerCount,
+        qa.IsClosed,
+        qa.UpVotes,
+        qa.DownVotes,
+        qa.TotalVotes,
+        qa.BountyTotal,
+        qa.CommentCount,
+        qa.PositiveComments,
+        qa.LastCommentDate,
+        qa.EditCount,
+        qa.LastEditDate,
+        qa.ModEventCount,
+        aa.AcceptedAnswerId,
+        aa.AcceptedScore,
+        aa.AcceptedOwnerUserId,
+        aq.AvgAnswerScore,
+        aq.MaxAnswerScore,
+        aq.PosAnswerCount,
+        aq.NegAnswerCount
+    from question_activity qa
+    left join answerer_quality aq on aq.QuestionId = qa.QuestionId
+    left join accepted_answers aa on aa.QuestionId = qa.QuestionId
+),
+owner_enriched as (
+    select
+        i.*,
+        us.Reputation as OwnerReputation,
+        us.GoldBadges,
+        us.SilverBadges,
+        us.BronzeBadges,
+        fa.FirstCommentDate as OwnerFirstCommentDate
+    from interactions i
+    left join user_stats us on us.UserId = i.OwnerUserId
+    left join first_comment_per_user fa on fa.UserId = i.OwnerUserId
+),
+monthly as (
+    select
+        date_trunc('month', i.CreationDate) as month_bucket,
+        count(*) as questions,
+        avg(i.Score) as avg_q_score,
+        percentile_cont(0.5) within group (order by i.Score) as p50_q_score,
+        avg(i.ViewCount) as avg_views,
+        avg(coalesce(i.TotalVotes,0)) as avg_votes,
+        avg(coalesce(i.CommentCount,0)) as avg_comments,
+        avg(coalesce(i.EditCount,0)) as avg_edits,
+        sum(case when i.IsClosed = 1 then 1 else 0 end) as closed_count,
+        sum(case when i.AcceptedAnswerId is not null then 1 else 0 end) as accepted_count,
+        avg(coalesce(i.AvgAnswerScore,0)) as avg_answer_score,
+        max(coalesce(i.MaxAnswerScore,0)) as max_answer_score,
+        avg(coalesce(i.BountyTotal,0)) as avg_bounty
+    from interactions i
+    group by date_trunc('month', i.CreationDate)
+),
+question_rank as (
+    select
+        i.*,
+        row_number() over (
+            partition by date_trunc('month', i.CreationDate)
+            order by
+                coalesce(i.Score,0) * 0.5
+              + coalesce(i.UpVotes,0) * 0.3
+              - coalesce(i.DownVotes,0) * 0.7
+              + ln(greatest(i.ViewCount,1)) * 0.6
+              + case when i.AcceptedAnswerId is not null then 2 else 0 end
+              + least(coalesce(i.EditCount,0), 5) * 0.2
+              + case when i.IsClosed = 1 then -1 else 0 end
+              desc,
+            i.QuestionId
+        ) as rank_in_month
+    from interactions i
+),
+canonical_map as (
+    select
+        dl.DuplicateOfId as QuestionId,
+        dl.CanonicalId,
+        t.TagName as CanonicalTag,
+        tr.TagDenseRank as CanonicalTagRank
+    from dup_links dl
+    left join tag_expansion t on t.PostId = dl.CanonicalId
+    left join tag_rank tr on tr.TagName = t.TagName
+),
+final_tags as (
+    select
+        i.QuestionId,
+        string_agg(distinct te.TagName, ',') as TagsCsv,
+        max(tr.TagDenseRank) as MaxTagRank
+    from interactions i
+    left join tag_expansion te on te.PostId = i.QuestionId
+    left join tag_rank tr on tr.TagName = te.TagName
+    group by i.QuestionId
+),
+normalized as (
+    select
+        qr.*,
+        ft.TagsCsv,
+        ft.MaxTagRank,
+        cm.CanonicalId,
+        cm.CanonicalTag,
+        cm.CanonicalTagRank,
+        case
+            when qr.AcceptedAnswerId is null and qr.ActualAnswerCount > 0 then 'Unaccepted'
+            when qr.AcceptedAnswerId is not null then 'Accepted'
+            else 'NoAnswers'
+        end as AnswerState,
+        case
+            when qr.CommentCount is null then 'NoComments'
+            when qr.CommentCount = 0 then 'NoComments'
+            when qr.PositiveComments > (qr.CommentCount/2) then 'MostlyPositive'
+            when qr.PositiveComments = 0 then 'NeutralOrNegative'
+            else 'Mixed'
+        end as CommentSentimentClass
+    from question_rank qr
+    left join final_tags ft on ft.QuestionId = qr.QuestionId
+    left join canonical_map cm on cm.QuestionId = qr.QuestionId
+),
+null_sentinel as (
+    select
+        n.*,
+        coalesce(n.UpVotes, 0) as UpVotes0,
+        coalesce(n.DownVotes, 0) as DownVotes0,
+        coalesce(n.TotalVotes, 0) as TotalVotes0,
+        coalesce(n.CommentCount, 0) as CommentCount0,
+        coalesce(n.EditCount, 0) as EditCount0,
+        coalesce(n.BountyTotal, 0) as BountyTotal0
+    from normalized n
+)
+select
+    ns.QuestionId,
+    date_trunc('month', ns.CreationDate) as Month,
+    ns.rank_in_month,
+    ns.Score,
+    ns.ViewCount,
+    ns.UpVotes0 as UpVotes,
+    ns.DownVotes0 as DownVotes,
+    ns.TotalVotes0 as TotalVotes,
+    ns.CommentCount0 as Comments,
+    ns.EditCount0 as Edits,
+    ns.BountyTotal0 as Bounty,
+    ns.AcceptedAnswerId,
+    ns.AcceptedScore,
+    ns.DeclaredAnswerCount,
+    ns.ActualAnswerCount,
+    ns.AvgAnswerScore,
+    ns.MaxAnswerScore,
+    ns.OwnerReputation,
+    ns.GoldBadges,
+    ns.SilverBadges,
+    ns.BronzeBadges,
+    ns.AnswerState,
+    ns.CommentSentimentClass,
+    ns.CanonicalId,
+    ns.CanonicalTag,
+    ns.CanonicalTagRank,
+    ns.TagsCsv,
+    ns.MaxTagRank,
+    m.questions as MonthQuestions,
+    m.avg_q_score as MonthAvgScore,
+    m.p50_q_score as MonthMedianScore,
+    m.avg_views as MonthAvgViews,
+    m.avg_votes as MonthAvgVotes,
+    m.avg_comments as MonthAvgComments,
+    m.avg_edits as MonthAvgEdits,
+    m.closed_count as MonthClosedCount,
+    m.accepted_count as MonthAcceptedCount,
+    m.avg_bounty as MonthAvgBounty
+from null_sentinel ns
+left join monthly m
+  on m.month_bucket = date_trunc('month', ns.CreationDate)
+where ns.rank_in_month <= 50
+   or (
+        ns.Score >= (
+            select avg(i2.Score) + stddev_pop(i2.Score)
+            from interactions i2
+            where date_trunc('month', i2.CreationDate) = date_trunc('month', ns.CreationDate)
+        )
+      )
+order by date_trunc('month', ns.CreationDate) desc, ns.rank_in_month, ns.Score desc, ns.QuestionId;

@@ -1,0 +1,200 @@
+with recursive RecursiveTagHierarchy as (
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        array[t.Id] as Path
+    from Tags t
+    where not exists (
+        select 1 from Posts p 
+        where p.PostTypeId = 1 and p.Tags like '%' || '<' || t.TagName || '>' || '%'
+        limit 1
+    )
+    union all
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Path || t.Id
+    from Tags t
+    join Posts p on p.PostTypeId = 1 and p.Tags like '%' || '<' || t.TagName || '>' || '%'
+    join RecursiveTagHierarchy r on r.Id = p.OwnerUserId
+    where not t.Id = any(r.Path)
+), UserBadgeCounts as (
+    select 
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+), UserAggregates as (
+    select 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        coalesce(sum(case when v.VoteTypeId = 2 then 1 else 0 end), 0) as TotalUpVotes,
+        coalesce(sum(case when v.VoteTypeId = 3 then 1 else 0 end), 0) as TotalDownVotes,
+        coalesce(inv.BadgeGold, 0) as GoldBadges,
+        coalesce(inv.BadgeSilver, 0) as SilverBadges,
+        coalesce(inv.BadgeBronze, 0) as BronzeBadges
+    from Users u
+    left join Votes v on v.UserId = u.Id
+    left join (
+        select 
+            UserId,
+            max(case when Class = 1 then BadgeCount else 0 end) as BadgeGold,
+            max(case when Class = 2 then BadgeCount else 0 end) as BadgeSilver,
+            max(case when Class = 3 then BadgeCount else 0 end) as BadgeBronze
+        from UserBadgeCounts
+        group by UserId
+    ) inv on inv.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, inv.BadgeGold, inv.BadgeSilver, inv.BadgeBronze
+), PostScoresWindow as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.OwnerUserId,
+        rank() over (partition by p.PostTypeId order by p.Score desc) as ScoreRank,
+        lag(p.Score) over (partition by p.PostTypeId order by p.CreationDate) as PrevScore,
+        lead(p.Score) over (partition by p.PostTypeId order by p.CreationDate) as NextScore
+    from Posts p
+), QuestionAnswerCount as (
+    select 
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.ViewCount,
+        q.CreationDate,
+        q.Score,
+        coalesce(a.AnswerCount, 0) as AnswerCount
+    from Posts q
+    left join (
+        select ParentId, count(*) as AnswerCount
+        from Posts
+        where PostTypeId = 2
+        group by ParentId
+    ) a on a.ParentId = q.Id
+    where q.PostTypeId = 1
+), DuplicateRelations as (
+    select 
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.LinkTypeId,
+        p1.Score as PostScore,
+        p2.Score as RelatedPostScore
+    from PostLinks pl
+    join Posts p1 on p1.Id = pl.PostId
+    join Posts p2 on p2.Id = pl.RelatedPostId
+), UserActivitySummary as (
+    select 
+        u.Id,
+        u.DisplayName,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionsCount,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswersCount,
+        count(distinct c.Id) as CommentsCount,
+        count(distinct ph.Id) as PostEditsCount,
+        max(case when p.PostTypeId = 1 then p.Score end) as MaxQuestionScore,
+        max(case when p.PostTypeId = 2 then p.Score end) as MaxAnswerScore
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join PostHistory ph on ph.UserId = u.Id and ph.PostId = p.Id
+    group by u.Id, u.DisplayName
+), PostsWithDuplicateInfo as (
+    select 
+        q.Id,
+        q.Title,
+        q.Score,
+        q.OwnerUserId,
+        dup.RelatedPostId,
+        dup.PostScore,
+        dup.RelatedPostScore,
+        dup.LinkTypeId
+    from Posts q
+    left join DuplicateRelations dup on dup.PostId = q.Id and dup.LinkTypeId = 3
+    where q.PostTypeId = 1
+)
+select 
+    uas.DisplayName as UserName,
+    uas.QuestionsCount,
+    uas.AnswersCount,
+    uas.CommentsCount,
+    uas.PostEditsCount,
+    ua.Reputation,
+    ua.GoldBadges,
+    ua.SilverBadges,
+    ua.BronzeBadges,
+    qac.QuestionId,
+    qac.Title as QuestionTitle,
+    qac.ViewCount,
+    qac.AnswerCount,
+    qac.Score as QuestionScore,
+    pws.RelatedPostId as DuplicateOfQuestionId,
+    pws.RelatedPostScore as DuplicateOfQuestionScore,
+    coalesce(phc.ClosedReason, 'OPEN') as ClosedReason,
+    concat_ws(' | ', 
+        'Rank in Questions by Score: ' || psw.ScoreRank, 
+        'Prev Score: ' || coalesce(CAST(psw.PrevScore AS varchar), 'NULL'), 
+        'Next Score: ' || coalesce(CAST(psw.NextScore AS varchar), 'NULL')) as ScoreRankDetails,
+    case 
+        when ua.Reputation > 10000 then 'HighRep' 
+        when ua.Reputation > 1000 then 'MedRep' 
+        else 'LowRep' 
+    end as ReputationBucket,
+    count(distinct case when c.CreationDate > (DATE '2024-10-01' - INTERVAL '30' DAY) then c.Id end) as RecentComments,
+    case when exists (
+        select 1 
+        from Votes v
+        where v.PostId = qac.QuestionId
+        and v.VoteTypeId = 5
+    ) then true else false end as HasFavorites,
+    string_agg(distinct bt.Name, ', ') as PostHistoryTypesEdited,
+    case 
+        when qac.Title is null or length(trim(qac.Title)) = 0 then 'No Title' 
+        when lower(qac.Title) like '%error%' then 'ErrorMentioned' 
+        else 'NormalTitle' 
+    end as TitleFlag,
+    (
+        select coalesce(u2.DisplayName, ph2.UserDisplayName, 'Unknown') 
+        from PostHistory ph2
+        left join Users u2 on u2.Id = ph2.UserId 
+        where ph2.PostId = qac.QuestionId 
+        order by ph2.CreationDate desc limit 1
+    ) as LastEditorName
+from UserActivitySummary uas
+join UserAggregates ua on ua.Id = uas.Id
+join QuestionAnswerCount qac on qac.OwnerUserId = uas.Id
+left join PostsWithDuplicateInfo pws on pws.Id = qac.QuestionId
+left join PostHistory ph on ph.PostId = qac.QuestionId and ph.PostHistoryTypeId = 10
+left join CloseReasonTypes phc on CAST(phc.Id AS varchar) = ph.Comment
+join PostScoresWindow psw on psw.Id = qac.QuestionId
+left join PostHistoryTypes bt on bt.Id = ph.PostHistoryTypeId
+left join Comments c on c.PostId = qac.QuestionId
+where uas.QuestionsCount > 5
+group by
+    uas.DisplayName,
+    uas.QuestionsCount,
+    uas.AnswersCount,
+    uas.CommentsCount,
+    uas.PostEditsCount,
+    ua.Reputation,
+    ua.GoldBadges,
+    ua.SilverBadges,
+    ua.BronzeBadges,
+    qac.QuestionId,
+    qac.Title,
+    qac.ViewCount,
+    qac.AnswerCount,
+    qac.Score,
+    pws.RelatedPostId,
+    pws.RelatedPostScore,
+    phc.ClosedReason,
+    psw.ScoreRank,
+    psw.PrevScore,
+    psw.NextScore
+order by ua.Reputation desc, qac.Score desc
+limit 100;

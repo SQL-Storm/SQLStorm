@@ -1,0 +1,170 @@
+-- {"query": "1771.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2681} 
+WITH UserEngagementSummary AS (
+    -- CTE 1: Summarizes user activity, calculates total scores, and ranks users by reputation.
+    SELECT
+        U.Id AS UserId,
+        COALESCE(U.DisplayName, 'Anonymous User') AS UserDisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsAsked,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersProvided,
+        COALESCE(SUM(P.Score), 0) AS TotalPostScore,
+        COALESCE(SUM(C.Score), 0) AS TotalCommentScore,
+        RANK() OVER (ORDER BY U.Reputation DESC, U.CreationDate ASC) AS ReputationRank,
+        NTILE(10) OVER (ORDER BY U.Reputation DESC) AS ReputationDecile
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    WHERE U.LastAccessDate >= (NOW() - INTERVAL '1 year')
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate
+),
+PostEditHistory AS (
+    -- CTE 2: Calculates edit counts for posts and identifies specific edit types.
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.LastEditDate,
+        P.LastActivityDate,
+        P.Title,
+        P.Tags,
+        P.Score,
+        P.ViewCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS TotalEditCount, -- Edit Title, Body, Tags
+        SUM(CASE WHEN PH.PostHistoryTypeId = 5 THEN 1 ELSE 0 END) AS BodyEditCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 6 THEN 1 ELSE 0 END) AS TagEditCount,
+        (SELECT MAX(PH_inner.CreationDate) FROM PostHistory AS PH_inner WHERE PH_inner.PostId = P.Id AND PH_inner.PostHistoryTypeId IN (4, 5, 6)) AS LatestEditHistoryDate,
+        LAG(P.LastEditDate, 1, P.CreationDate) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate) AS PreviousPostLastEditDate
+    FROM Posts AS P
+    LEFT JOIN PostHistory AS PH ON P.Id = PH.PostId
+    WHERE P.PostTypeId IN (1, 2) -- Questions and Answers
+    GROUP BY P.Id, P.OwnerUserId, P.CreationDate, P.LastEditDate, P.LastActivityDate, P.Title, P.Tags, P.Score, P.ViewCount, P.CommentCount, P.FavoriteCount
+),
+ModerationTrail AS (
+    -- CTE 3: Tracks moderation actions (close, reopen, delete) for posts.
+    SELECT
+        PH.PostId,
+        MAX(CASE WHEN PHT.Id = 10 THEN 1 ELSE 0 END) AS WasClosed,
+        MAX(CASE WHEN PHT.Id = 11 THEN 1 ELSE 0 END) AS WasReopened,
+        MAX(CASE WHEN PHT.Id = 12 THEN 1 ELSE 0 END) AS WasDeleted,
+        MIN(CASE WHEN PHT.Id = 10 THEN PH.CreationDate ELSE NULL END) AS FirstClosedDate,
+        MAX(CASE WHEN PHT.Id = 11 THEN PH.CreationDate ELSE NULL END) AS LatestReopenedDate,
+        COUNT(DISTINCT PH.Id) FILTER (WHERE PHT.Id IN (10, 11, 12, 13, 14, 15, 19, 20)) AS ModerationActionCount,
+        LEAD(PH.CreationDate, 1) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) AS NextHistoryEventDate,
+        NULLIF(SUBSTRING(PH.Comment FROM 1 FOR 50), '') AS CloseReasonSnippet
+    FROM PostHistory AS PH
+    JOIN PostHistoryTypes AS PHT ON PH.PostHistoryTypeId = PHT.Id
+    WHERE PHT.Id IN (10, 11, 12, 13, 14, 15, 19, 20) -- Close, Reopen, Delete, Undelete, Lock, Unlock, Protect, Unprotect
+    GROUP BY PH.PostId, PH.CreationDate, PH.Comment -- Grouping by CreationDate for LEAD to work correctly, but we need overall max/min for other aggregates
+),
+TagPerformance AS (
+    -- CTE 4: Analyzes tag performance, particularly for questions.
+    SELECT
+        T.TagName,
+        T.Id AS TagId,
+        COUNT(DISTINCT P.Id) AS PostsWithTag,
+        AVG(P.Score) AS AveragePostScoreForTag,
+        AVG(P.ViewCount) AS AverageViewCountForTag,
+        (SELECT COUNT(DISTINCT PH.PostId) FROM PostHistory AS PH WHERE PH.PostHistoryTypeId IN (10, 11) AND PH.PostId IN (
+            SELECT P_inner.Id FROM Posts AS P_inner WHERE P_inner.PostTypeId = 1 AND P_inner.Tags LIKE '%' || T.TagName || '%'
+        )) AS ClosedReopenedQuestionsWithTag,
+        SUM(T.Count) OVER (ORDER BY T.Count DESC) AS RunningTotalTagCount
+    FROM Tags AS T
+    LEFT JOIN Posts AS P ON P.Tags ILIKE '%' || T.TagName || '%' AND P.PostTypeId = 1 -- Only considering questions for tag performance
+    GROUP BY T.TagName, T.Id
+    HAVING COUNT(DISTINCT P.Id) > 100
+),
+LinkedPostsSummary AS (
+    -- CTE 5: Summarizes linked and duplicate posts.
+    SELECT
+        PL.PostId,
+        COUNT(DISTINCT CASE WHEN PL.LinkTypeId = 1 THEN PL.RelatedPostId ELSE NULL END) AS LinkedToCount,
+        COUNT(DISTINCT CASE WHEN PL.LinkTypeId = 3 THEN PL.RelatedPostId ELSE NULL END) AS DuplicateOfCount,
+        MAX(CASE WHEN PL.LinkTypeId = 3 THEN 1 ELSE 0 END) AS IsSourceOfDuplicate,
+        MIN(PL.CreationDate) AS FirstLinkDate
+    FROM PostLinks AS PL
+    GROUP BY PL.PostId
+),
+QuestionAnswerHierarchy AS (
+    -- CTE 6: Establishes question-answer relationships and calculates answer metrics.
+    SELECT
+        Q.Id AS QuestionId,
+        Q.Title AS QuestionTitle,
+        Q.OwnerUserId AS QuestionOwnerUserId,
+        Q.AcceptedAnswerId,
+        A.Id AS AnswerId,
+        A.OwnerUserId AS AnswerOwnerUserId,
+        A.Score AS AnswerScore,
+        A.CreationDate AS AnswerCreationDate,
+        AGE(Q.AcceptedAnswerId, Q.CreationDate) AS TimeToAcceptedAnswer, -- PostgreSQL specific date difference
+        (SELECT COUNT(DISTINCT C_q.Id) FROM Comments AS C_q WHERE C_q.PostId = Q.Id) AS QuestionCommentCount,
+        (SELECT COUNT(DISTINCT C_a.Id) FROM Comments AS C_a WHERE C_a.PostId = A.Id) AS AnswerCommentCount
+    FROM Posts AS Q
+    LEFT JOIN Posts AS A ON Q.AcceptedAnswerId = A.Id AND A.PostTypeId = 2 -- Assuming AcceptedAnswerId refers to an Answer post
+    WHERE Q.PostTypeId = 1
+)
+SELECT
+    UES.UserId,
+    UES.UserDisplayName,
+    UES.Reputation,
+    UES.ReputationRank,
+    PH.PostId,
+    PH.PostCreationDate,
+    PH.Title AS PostTitle,
+    PH.Score AS PostScore,
+    PH.TotalEditCount,
+    PH.BodyEditCount,
+    PH.TagEditCount,
+    TP.TagName AS PrimaryTag,
+    TP.AveragePostScoreForTag,
+    MT.WasClosed,
+    MT.WasReopened,
+    MT.ModerationActionCount,
+    LPS.LinkedToCount,
+    LPS.DuplicateOfCount,
+    QAH.QuestionTitle,
+    QAH.AnswerId,
+    QAH.AnswerScore,
+    QAH.TimeToAcceptedAnswer,
+    EXTRACT(EPOCH FROM (PH.LastActivityDate - PH.CreationDate)) / 3600 AS HoursSinceCreationToLastActivity, -- Duration in hours
+    CASE
+        WHEN PH.TotalEditCount > 5 AND PH.Score > 50 THEN 'Highly Iterated & Valued'
+        WHEN MT.ModerationActionCount > 0 AND PH.Score < 0 THEN 'Contentious & Low Score'
+        WHEN LPS.DuplicateOfCount > 0 AND PH.PostCreationDate > (NOW() - INTERVAL '6 months') THEN 'Recent Duplicate Target'
+        ELSE 'Standard Activity'
+    END AS PostLifecycleCategory,
+    COALESCE(MT.CloseReasonSnippet, 'N/A') AS LastCloseReasonFragment,
+    UPPER(SUBSTRING(UES.UserDisplayName FROM 1 FOR 1)) AS UserInitial,
+    SUM(PH.Score) OVER (PARTITION BY UES.UserId ORDER BY PH.PostCreationDate) AS RunningUserPostScore,
+    (SELECT AVG(C_sub.Score) FROM Comments AS C_sub WHERE C_sub.PostId = PH.PostId AND C_sub.UserId = UES.UserId) AS AvgUserCommentScoreOnPost
+FROM UserEngagementSummary AS UES
+JOIN PostEditHistory AS PH ON UES.UserId = PH.OwnerUserId
+LEFT JOIN ModerationTrail AS MT ON PH.PostId = MT.PostId
+LEFT JOIN (
+    SELECT PostId,
+           (string_to_array(substring(Tags, 2, length(Tags) - 2), '><'))[1] AS TagName -- Extract first tag
+    FROM Posts WHERE Tags IS NOT NULL AND Tags != ''
+) AS FirstTag ON PH.PostId = FirstTag.PostId
+LEFT JOIN TagPerformance AS TP ON FirstTag.TagName = TP.TagName
+LEFT JOIN LinkedPostsSummary AS LPS ON PH.PostId = LPS.PostId
+LEFT JOIN QuestionAnswerHierarchy AS QAH ON PH.PostId = QAH.QuestionId
+WHERE
+    UES.ReputationRank <= 1000 -- Focus on top users
+    AND PH.TotalEditCount >= 2 -- Posts with at least two edits
+    AND PH.Score > 0 -- Only positive scored posts
+    AND PH.PostCreationDate >= (NOW() - INTERVAL '5 years') -- Posts within the last 5 years
+    AND (
+        (TP.AveragePostScoreForTag > 20 AND TP.PostsWithTag > 500)
+        OR (PH.Tags ILIKE '%<sql>%' OR PH.Tags ILIKE '%<performance>%')
+    )
+    AND (
+        (MT.WasClosed = 1 AND MT.WasReopened = 1) -- Posts that were closed and then reopened
+        OR (LPS.DuplicateOfCount > 0) -- Or posts that are duplicates
+        OR (QAH.AcceptedAnswerId IS NOT NULL AND QAH.AnswerScore >= 50) -- Or questions with a highly upvoted accepted answer
+    )
+ORDER BY UES.Reputation DESC, PH.TotalEditCount DESC, PH.Score DESC
+LIMIT 500;

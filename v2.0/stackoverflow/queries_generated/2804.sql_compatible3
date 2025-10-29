@@ -1,0 +1,176 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id, 
+        t.TagName, 
+        t.Count, 
+        t.ExcerptPostId,
+        1 AS Depth,
+        CAST(ARRAY[t.TagName] AS text[]) AS TagPath
+    FROM Tags t
+    WHERE t.IsModeratorOnly = FALSE
+
+    UNION ALL
+
+    SELECT 
+        t2.Id, 
+        t2.TagName, 
+        t2.Count, 
+        t2.ExcerptPostId,
+        r.Depth + 1,
+        r.TagPath || t2.TagName
+    FROM Tags t2
+    JOIN PostLinks pl ON pl.PostId = t2.ExcerptPostId
+    JOIN RecursiveTagHierarchy r ON r.ExcerptPostId = pl.RelatedPostId
+    WHERE r.Depth < 3
+),
+RecentActiveUsers AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsPosted,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersPosted,
+        COUNT(b.Id) AS BadgesCount,
+        SUM(COALESCE(vt2.UpVotes,0)) AS TotalUpVotes,
+        SUM(COALESCE(vt2.DownVotes,0)) AS TotalDownVotes,
+        MAX(p.LastActivityDate) AS LastActivity
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+    LEFT JOIN Badges b ON b.UserId = u.Id AND b.Date >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+    LEFT JOIN (
+        SELECT 
+            p.OwnerUserId,
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Posts p
+        LEFT JOIN Votes v ON v.PostId = p.Id
+        WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+        GROUP BY p.OwnerUserId
+    ) vt2 ON vt2.OwnerUserId = u.Id
+    WHERE u.LastAccessDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '6 months'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+TopQuestions AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.AcceptedAnswerId,
+        u.DisplayName AS OwnerName,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC, p.ViewCount DESC) AS ScoreRank,
+        COUNT(DISTINCT c.Id) AS CommentsCount,
+        COALESCE(at.AverageAnswerScore, 0) AS AverageAnswerScore
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN (
+        SELECT 
+            ParentId,
+            AVG(Score) AS AverageAnswerScore
+        FROM Posts
+        WHERE PostTypeId = 2
+        GROUP BY ParentId
+    ) at ON at.ParentId = p.Id
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate BETWEEN CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 months' AND CAST('2024-10-01 12:34:56' AS timestamp)
+    GROUP BY p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.Tags, p.AcceptedAnswerId, u.DisplayName, at.AverageAnswerScore
+),
+AnswerCorrelations AS (
+    SELECT DISTINCT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        u.DisplayName AS AnswerOwner,
+        a.Score AS AnswerScore,
+        CASE WHEN a.Id = tqa.AcceptedAnswerId THEN TRUE ELSE FALSE END AS IsAccepted,
+        AVG(v.Score) OVER (PARTITION BY a.ParentId) AS AvgAnswerScoreForQuestion,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC) AS AnswerRankByScore
+    FROM Posts a
+    JOIN Posts tqa ON tqa.Id = a.ParentId
+    LEFT JOIN Users u ON u.Id = a.OwnerUserId
+    LEFT JOIN Votes v ON v.PostId = a.Id AND v.VoteTypeId IN (2,3)
+    WHERE a.PostTypeId = 2
+),
+FilteredVotes AS (
+    SELECT
+        v.PostId,
+        v.VoteTypeId,
+        COUNT(*) AS VoteCount,
+        SUM(CASE WHEN v.UserId IS NOT NULL THEN 1 ELSE 0 END) AS UserVotes,
+        MIN(v.CreationDate) AS FirstVoteDate,
+        MAX(v.CreationDate) AS LastVoteDate
+    FROM Votes v
+    WHERE v.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+    GROUP BY v.PostId, v.VoteTypeId
+),
+CombinedActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT ph.Id) AS TotalEdits,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS UpVotesCast,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS DownVotesCast,
+        MAX(p.LastActivityDate) AS LastActivityDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    WHERE u.CreationDate < CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+    GROUP BY u.Id, u.DisplayName
+)
+SELECT
+    tu.Id AS QuestionId,
+    tu.Title,
+    tu.CreationDate,
+    tu.Score,
+    tu.ViewCount,
+    tu.Tags,
+    tu.OwnerName,
+    tu.CommentsCount,
+    tu.AverageAnswerScore,
+    ans.AnswerId,
+    ans.AnswerOwner,
+    ans.AnswerScore,
+    ans.IsAccepted,
+    ans.AvgAnswerScoreForQuestion,
+    ans.AnswerRankByScore,
+    fv.VoteCount AS TotalVotes,
+    fv.UserVotes,
+    fv.FirstVoteDate,
+    fv.LastVoteDate,
+    ra.UserId AS ActiveUserId,
+    ra.DisplayName AS ActiveUserName,
+    ra.Reputation,
+    ra.QuestionsPosted,
+    ra.AnswersPosted,
+    ra.BadgesCount,
+    ra.TotalUpVotes,
+    ra.TotalDownVotes,
+    ra.LastActivity AS ActiveUserLastActivity,
+    ca.TotalPosts,
+    ca.TotalEdits,
+    ca.TotalComments,
+    ca.UpVotesCast,
+    ca.DownVotesCast,
+    ca.LastActivityDate,
+    rh.Depth,
+    rh.TagPath,
+    rh.Count AS TagPopularity
+FROM TopQuestions tu
+LEFT JOIN AnswerCorrelations ans ON ans.QuestionId = tu.Id
+LEFT JOIN FilteredVotes fv ON fv.PostId = tu.Id
+LEFT JOIN RecentActiveUsers ra ON ra.UserId = (CASE WHEN NULLIF(tu.OwnerName, '') ~ '^\d+$' THEN CAST(NULLIF(tu.OwnerName, '') AS integer) ELSE NULL END)
+LEFT JOIN CombinedActivity ca ON ca.UserId = (CASE WHEN NULLIF(tu.OwnerName, '') ~ '^\d+$' THEN CAST(NULLIF(tu.OwnerName, '') AS integer) ELSE NULL END)
+LEFT JOIN RecursiveTagHierarchy rh ON rh.TagName = ANY(string_to_array(tu.Tags, '><'))
+WHERE 
+    (ans.AnswerScore > tu.AverageAnswerScore OR ans.IsAccepted = TRUE)
+    AND (fv.VoteCount > 10 OR fv.VoteCount IS NULL)
+    AND rh.Depth BETWEEN 1 AND 3
+ORDER BY tu.ScoreRank, ans.AnswerRankByScore
+LIMIT 100;

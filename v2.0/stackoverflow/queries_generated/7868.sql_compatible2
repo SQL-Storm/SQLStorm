@@ -1,0 +1,310 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        COUNT(DISTINCT b.Id) AS Badges,
+        COUNT(DISTINCT c.Id) AS Comments,
+        COUNT(DISTINCT ph.Id) AS PostHistoryEntries,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(u.LastAccessDate) AS LastAccessDate,
+        CAST((JULIANDAY(u.LastAccessDate) - JULIANDAY(u.CreationDate)) AS INTEGER) AS DaysSinceRegistration,
+        CASE 
+            WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 0 
+            THEN CAST(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS REAL) / COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END)
+            ELSE 0 
+        END AS AvgQuestionScore,
+        CASE 
+            WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) > 0 
+            THEN CAST(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS REAL) / COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END)
+            ELSE 0 
+        END AS AvgAnswerScore,
+        (SELECT STRING_AGG(tag, ';') FROM (
+            SELECT DISTINCT trim(tag) AS tag
+            FROM (
+                SELECT regexp_replace(regexp_replace(p2.Tags, '^<|>$', ''), '><', ',') AS taglist, p2.Id
+                FROM Posts p2
+                WHERE p2.OwnerUserId = u.Id OR p2.LastEditorUserId = u.Id
+            ) t1,
+            JSON_TABLE(CONCAT('["', REPLACE(t1.taglist, ',', '","'), '"]'),
+                       '$[*]' COLUMNS(tag VARCHAR(4000) PATH '$')) jt
+        ) x
+        ) AS AllTags,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END), 0) AS TotalQuestionViews,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.ViewCount ELSE 0 END), 0) AS TotalAnswerViews,
+        (SELECT STRING_AGG(t, ' | ' ORDER BY tdate DESC) FROM (
+             SELECT DISTINCT p2.Title AS t, p2.CreationDate AS tdate
+             FROM Posts p2
+             WHERE p2.OwnerUserId = u.Id OR p2.LastEditorUserId = u.Id
+         ) s
+        ) AS RecentTitles,
+        (SELECT STRING_AGG(bdy, ' | ' ORDER BY bdate DESC) FROM (
+             SELECT DISTINCT p2.Body AS bdy, p2.CreationDate AS bdate
+             FROM Posts p2
+             WHERE p2.OwnerUserId = u.Id OR p2.LastEditorUserId = u.Id
+         ) s2
+        ) AS RecentBodies
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId OR u.Id = p.LastEditorUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate, u.LastAccessDate
+),
+RankedUsers AS (
+    SELECT 
+        uas.*,
+        RANK() OVER (ORDER BY Reputation DESC, TotalPosts DESC) AS RankByReputation,
+        NTILE(100) OVER (ORDER BY Reputation) AS Quintile,
+        DENSE_RANK() OVER (ORDER BY LastPostDate DESC) AS RecentPostRank,
+        ROW_NUMBER() OVER (ORDER BY Views DESC, UpVotes DESC) AS ViewUpVoteRank,
+        AVG(Reputation) OVER (PARTITION BY CAST(strftime('%Y-%W', LastAccessDate) AS TEXT)) AS WeeklyAvgReputation,
+        LAG(Reputation, 1) OVER (ORDER BY Reputation) AS PreviousReputation,
+        LEAD(Reputation, 1) OVER (ORDER BY Reputation) AS NextReputation,
+        COALESCE(UpVotes, 0) - COALESCE(DownVotes, 0) AS NetVotes
+    FROM UserActivityStats uas
+),
+TagStats AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.IsRequired = 1 THEN 'Required'
+            WHEN t.IsModeratorOnly = 1 THEN 'Moderator Only'
+            ELSE 'Regular'
+        END AS TagType,
+        COALESCE(
+            (SELECT COUNT(*) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%'), 
+            0
+        ) AS RelatedPostsCount,
+        (SELECT STRING_AGG(DISTINCT r.TagName, '; ') 
+         FROM Tags r
+         WHERE r.Id IN (
+            SELECT DISTINCT t2.Id
+            FROM Posts p1
+            JOIN (
+                SELECT DISTINCT p2.Id, p2.Tags
+                FROM Posts p2
+                WHERE p2.Tags LIKE '%' || t.TagName || '%'
+            ) p2 ON p2.Id = p1.Id
+            JOIN Posts p3 ON p1.OwnerUserId = p3.OwnerUserId
+            JOIN Tags t2 ON ',' || REPLACE(REPLACE(p2.Tags, '><', ','), '<', '') || ',' LIKE '%,' || t2.TagName || ',%'
+            WHERE p3.Tags LIKE '%' || r.TagName || '%' 
+              AND p2.Tags LIKE '%' || t.TagName || '%'
+         )
+        ) AS RelatedTags
+    FROM Tags t
+    GROUP BY t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId, t.IsRequired, t.IsModeratorOnly
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.ParentId,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.AcceptedAnswerId,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN 
+                (SELECT COUNT(*) 
+                 FROM Posts ap 
+                 WHERE ap.ParentId = p.Id AND ap.Score > 0)
+            ELSE 0
+        END AS PositiveAnswers,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 
+                (SELECT COUNT(*) 
+                 FROM Posts ap 
+                 WHERE ap.ParentId = p.Id AND ap.AcceptedAnswerId IS NOT NULL)
+            ELSE 0
+        END AS AcceptedAnswers,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 
+                (SELECT COUNT(*) 
+                 FROM Posts ap 
+                 WHERE ap.ParentId = p.Id AND ap.LastActivityDate > p.CreationDate AND ap.Score > 5)
+            ELSE 0
+        END AS ActiveUnacceptedAnswers,
+        CASE 
+            WHEN p.LastActivityDate IS NOT NULL THEN 
+                CAST((JULIANDAY(p.LastActivityDate) - JULIANDAY(p.CreationDate)) AS INTEGER)
+            ELSE 
+                CAST((JULIANDAY('2024-10-01 12:34:56') - JULIANDAY(p.CreationDate)) AS INTEGER)
+        END AS DaysSinceLastActivity,
+        COALESCE(
+            (SELECT COUNT(*) 
+             FROM Comments c WHERE c.PostId = p.Id AND c.Score > 0), 
+            0
+        ) AS PositiveComments,
+        COALESCE(
+            (SELECT COUNT(*) 
+             FROM Votes v 
+             WHERE v.PostId = p.Id AND v.VoteTypeId IN (2,3) AND v.CreationDate > p.CreationDate), 
+            0
+        ) AS PostVotes,
+        CASE 
+            WHEN p.PostTypeId = 1 AND (p.ViewCount * 100) > p.Score THEN 'Viral'
+            WHEN p.PostTypeId = 1 AND p.ViewCount < 10 THEN 'Obscure'
+            WHEN p.Score > 100 THEN 'HighlyRated'
+            ELSE 'Normal'
+        END AS PostCategory,
+        (SELECT STRING_AGG(commenter, '; ' ORDER BY cdate) FROM (
+             SELECT 
+                CASE 
+                    WHEN c.UserId IS NOT NULL THEN COALESCE(u.DisplayName, 'User-' || CAST(c.UserId AS TEXT))
+                    ELSE 'Anonymous'
+                END AS commenter,
+                c.CreationDate AS cdate
+             FROM Comments c
+             LEFT JOIN Users u ON c.UserId = u.Id
+             WHERE c.PostId = p.Id
+         ) ct
+        ) AS Commenters,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND LENGTH(p.Tags) > 0 THEN  
+                (SELECT COUNT(*) 
+                 FROM (
+                    SELECT TRIM(value) AS value
+                    FROM (
+                        SELECT REPLACE(SUBSTR(p.Tags, 2, LENGTH(p.Tags) - 2), '><', ',') AS taglist
+                    ) tl, 
+                    JSON_TABLE(CONCAT('["', REPLACE(tl.taglist, ',', '","'), '"]'),
+                               '$[*]' COLUMNS(value VARCHAR(4000) PATH '$')) jt
+                 ) tv
+                 WHERE tv.value IS NOT NULL AND LENGTH(tv.value) > 0
+                )
+            ELSE 0 
+        END AS TagCountInPost,
+        DENSE_RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS ScoreRankByType,
+        ROW_NUMBER() OVER (ORDER BY p.ViewCount DESC, p.Score DESC) AS PopularityRank,
+        LAG(p.Score, 1) OVER (ORDER BY p.CreationDate) AS PreviousScore,
+        LEAD(p.Score, 1) OVER (ORDER BY p.CreationDate) AS NextScore,
+        COUNT(DISTINCT c.Id) AS _CommentCountForGrouping
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Users u ON c.UserId = u.Id
+    WHERE p.Id > 0
+    GROUP BY 
+        p.Id, p.Title, p.Body, p.Score, p.ViewCount, p.CreationDate, 
+        p.LastActivityDate, p.OwnerUserId, p.PostTypeId, p.ParentId, 
+        p.Tags, p.AnswerCount, p.CommentCount, p.FavoriteCount, 
+        p.AcceptedAnswerId
+)
+SELECT 
+    ru.UserId,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.Views,
+    ru.UpVotes,
+    ru.DownVotes,
+    ru.TotalPosts,
+    ru.Questions,
+    ru.Answers,
+    ru.Badges,
+    ru.Comments,
+    ru.PostHistoryEntries,
+    ru.LastPostDate,
+    ru.LastAccessDate,
+    ru.DaysSinceRegistration,
+    ru.AvgQuestionScore,
+    ru.AvgAnswerScore,
+    ru.AllTags,
+    ru.TotalQuestionViews,
+    ru.TotalAnswerViews,
+    ru.RecentTitles,
+    ru.RecentBodies,
+    ru.RankByReputation,
+    ru.Quintile,
+    ru.RecentPostRank,
+    ru.ViewUpVoteRank,
+    ru.WeeklyAvgReputation,
+    ru.PreviousReputation,
+    ru.NextReputation,
+    ru.NetVotes,
+    ts.TagName,
+    ts.TagCount,
+    ts.TagType,
+    ts.RelatedPostsCount,
+    ts.RelatedTags,
+    cpa.PostId,
+    cpa.Title,
+    cpa.Body,
+    cpa.Score,
+    cpa.ViewCount,
+    cpa.CreationDate,
+    cpa.LastActivityDate,
+    cpa.OwnerUserId,
+    cpa.PostTypeId,
+    cpa.ParentId,
+    cpa.Tags,
+    cpa.AnswerCount,
+    cpa.CommentCount,
+    cpa.FavoriteCount,
+    cpa.AcceptedAnswerId,
+    cpa.PositiveAnswers,
+    cpa.AcceptedAnswers,
+    cpa.ActiveUnacceptedAnswers,
+    cpa.DaysSinceLastActivity,
+    cpa.PositiveComments,
+    cpa.PostVotes,
+    cpa.PostCategory,
+    cpa.Commenters,
+    cpa.TagCountInPost,
+    cpa.ScoreRankByType,
+    cpa.PopularityRank,
+    cpa.PreviousScore,
+    cpa.NextScore
+FROM RankedUsers ru
+FULL OUTER JOIN TagStats ts ON (ru.UserId % 1000) = ts.WikiPostId
+FULL OUTER JOIN ComplexPostAnalysis cpa ON (ru.UserId % 500) = cpa.OwnerUserId
+WHERE 
+    (ru.UserId IS NOT NULL OR ts.TagName IS NOT NULL OR cpa.PostId IS NOT NULL)
+    AND (
+        (ru.Reputation > 1000 AND ru.Questions >= 50)
+        OR (ru.Answers >= 100 AND ru.Badges >= 20)
+        OR (ts.TagCount >= 1000 AND ts.RelatedPostsCount >= 100)
+        OR (cpa.Score >= 100 AND cpa.ViewCount >= 10000)
+    )
+    AND (cpa.DaysSinceLastActivity IS NULL OR cpa.DaysSinceLastActivity < 365)
+    AND (ru.DaysSinceRegistration IS NULL OR ru.DaysSinceRegistration > 100)
+    AND (
+        (ts.RelatedTags IS NOT NULL AND ts.RelatedTags != '')
+        OR (ru.AllTags IS NOT NULL AND ru.AllTags != '')
+    )
+    AND (
+        (cpa.CommentCount >= 10 AND cpa.PositiveComments >= 5)
+        OR (cpa.PostVotes > 0)
+        OR (ru.Comments > 100 AND ru.Badges > 50)
+        OR (ru.PostHistoryEntries > 1000)
+    )
+ORDER BY 
+    CASE 
+        WHEN ru.Reputation > 10000 THEN 1 
+        WHEN ts.TagCount > 10000 THEN 2
+        WHEN cpa.ViewCount > 100000 THEN 3
+        ELSE 4 
+    END,
+    ru.Reputation DESC,
+    ts.TagCount DESC,
+    cpa.ViewCount DESC,
+    ru.Views DESC,
+    ru.UpVotes DESC,
+    ru.NetVotes DESC;

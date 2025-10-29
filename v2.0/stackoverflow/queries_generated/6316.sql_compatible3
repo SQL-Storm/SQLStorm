@@ -1,0 +1,81 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.Title,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.LastActivityDate,
+        P.OwnerUserId,
+        U.DisplayName,
+        U.Reputation,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.ViewCount DESC) AS Rank
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId IN (1, 2) AND P.Score > 0
+),
+BadgeCounts AS (
+    SELECT 
+        U.Id AS UserId,
+        COUNT(DISTINCT B.Id) AS BadgeCount
+    FROM 
+        Users U
+    LEFT JOIN 
+        Badges B ON U.Id = B.UserId
+    WHERE 
+        B.Class = 1 AND (B.TagBased = FALSE OR B.TagBased = 0 OR B.TagBased IS NULL)
+    GROUP BY 
+        U.Id
+)
+SELECT 
+    RP.Id,
+    RP.Title,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.LastActivityDate,
+    RP.Rank,
+    RP.OwnerUserId,
+    U.DisplayName,
+    U.Reputation,
+    COALESCE(BC.BadgeCount, 0) AS BadgeCount,
+    SUM(V.BountyAmount) OVER (PARTITION BY RP.Id ORDER BY V.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativeBounty,
+    CASE 
+        WHEN RP.Score > 100 THEN 'High'
+        WHEN RP.Score > 50 THEN 'Medium'
+        ELSE 'Low'
+    END AS ScoreTier,
+    CASE 
+        WHEN RP.ViewCount > 1000 THEN 'Popular'
+        WHEN RP.ViewCount > 100 THEN 'Moderate'
+        ELSE 'Less Popular'
+    END AS ViewTier
+FROM 
+    RankedPosts RP
+LEFT JOIN 
+    Users U ON RP.OwnerUserId = U.Id
+LEFT JOIN 
+    BadgeCounts BC ON RP.OwnerUserId = BC.UserId
+LEFT JOIN 
+    Votes V ON RP.Id = V.PostId AND V.VoteTypeId = 8
+WHERE 
+    RP.Rank <= 10
+GROUP BY
+    RP.Id,
+    RP.Title,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.LastActivityDate,
+    RP.Rank,
+    RP.OwnerUserId,
+    U.DisplayName,
+    U.Reputation,
+    BC.BadgeCount,
+    V.BountyAmount,
+    V.CreationDate
+ORDER BY 
+    RP.Score DESC, RP.ViewCount DESC;

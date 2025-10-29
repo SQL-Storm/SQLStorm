@@ -1,0 +1,237 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        COUNT(DISTINCT c.Id) AS Comments,
+        COUNT(DISTINCT b.Id) AS Badges,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId IN (2,3) THEN v.Id END) AS VoteCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS PostRank,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS RepRank,
+        DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) DESC) AS QuestionRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    WHERE u.CreationDate >= DATE '2010-01-01'
+      AND u.AccountId IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views
+),
+TopUsers AS (
+    SELECT UserId, DisplayName, Reputation, TotalPosts, Questions, Answers, Comments, Badges, VoteCount, PostRank, RepRank, QuestionRank
+    FROM UserActivityStats
+    WHERE PostRank <= 50 AND RepRank <= 50
+),
+PostComplexity AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        CASE WHEN COALESCE(p.AnswerCount,0) > 0 THEN 'HasAnswers' ELSE 'NoAnswers' END AS AnswerStatus,
+        CASE 
+            WHEN p.Score > 100 THEN 'HighlyVoted'
+            WHEN p.Score > 50 THEN 'ModeratelyVoted'
+            WHEN p.Score > 0 THEN 'LowVoted'
+            ELSE 'Unvoted'
+        END AS VoteCategory,
+        LENGTH(p.Body) AS BodyLength,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        COALESCE(p.CommentCount, 0) AS CommentCount,
+        COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+        CAST(EXTRACT(EPOCH FROM (CAST(p.CreationDate AS date) - DATE '2010-01-01')) / 86400 AS INTEGER) AS DaysSince2010,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserPostRank,
+        RANK() OVER (ORDER BY p.Score DESC) AS ScoreRank,
+        PERCENT_RANK() OVER (ORDER BY p.Score) AS ScorePercentile,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS AvgUserScore,
+        CASE 
+            WHEN p.ParentId IS NOT NULL THEN (SELECT COUNT(*) FROM Posts WHERE ParentId = p.Id)
+            ELSE 0
+        END AS NestedReplies
+    FROM Posts p
+    WHERE p.PostTypeId IN (1,2) AND p.CreationDate >= DATE '2010-01-01'
+),
+PostTagAnalysis AS (
+    SELECT 
+        pc.PostId,
+        pc.Title,
+        pc.Score,
+        pc.ViewCount,
+        pc.CreationDate,
+        pc.OwnerUserId,
+        COALESCE(REGEXP_REPLACE(REGEXP_REPLACE(pc.Tags, '<', ''), '>', ''), '') AS CleanTags,
+        CASE 
+            WHEN COALESCE(REGEXP_REPLACE(REGEXP_REPLACE(pc.Tags, '<', ''), '>', ''), '') = '' THEN ARRAY[]::text
+            ELSE string_to_array(COALESCE(REGEXP_REPLACE(REGEXP_REPLACE(pc.Tags, '<', ''), '>', ''), ''), '>') 
+        END AS TagArray,
+        CASE 
+            WHEN pc.Tags LIKE '%<%' AND pc.Tags LIKE '%>%' THEN 
+                (SELECT COUNT(*) FROM UNNEST(string_to_array(COALESCE(REGEXP_REPLACE(REGEXP_REPLACE(pc.Tags, '<', ''), '>', ''), ''), '>')) AS t(x))
+            ELSE 0 
+        END AS TagCount,
+        (SELECT COUNT(*) FROM Posts WHERE ParentId = pc.PostId AND PostTypeId = 2) AS AnswerCount,
+        (SELECT STRING_AGG(CAST(UserId AS VARCHAR), ',') FROM Votes v WHERE v.PostId = pc.PostId AND v.VoteTypeId = 2) AS UpVoterIds,
+        (SELECT STRING_AGG(CAST(UserId AS VARCHAR), ',') FROM Votes v WHERE v.PostId = pc.PostId AND v.VoteTypeId = 3) AS DownVoterIds
+    FROM PostComplexity pc
+),
+EngagementMetrics AS (
+    SELECT 
+        pca.PostId,
+        pca.Title,
+        pca.Score,
+        pca.ViewCount,
+        pca.CreationDate,
+        pca.OwnerUserId,
+        pca.CleanTags,
+        pca.TagCount,
+        pca.AnswerCount,
+        pca.UpVoterIds,
+        pca.DownVoterIds,
+        CASE 
+            WHEN pca.TagCount > 5 THEN 'HighTagDensity'
+            WHEN pca.TagCount > 3 THEN 'MediumTagDensity'
+            ELSE 'LowTagDensity' 
+        END AS TagDensity,
+        CASE 
+            WHEN pca.AnswerCount > 0 AND pca.AnswerCount < 3 THEN 'FewAnswers'
+            WHEN pca.AnswerCount >= 3 AND pca.AnswerCount < 10 THEN 'ModerateAnswers'
+            WHEN pca.AnswerCount >= 10 THEN 'ManyAnswers'
+            ELSE 'NoAnswers' 
+        END AS AnswerDensity,
+        (CASE WHEN pca.TagCount > 0 THEN (CAST(pca.AnswerCount AS DOUBLE PRECISION) / pca.TagCount) ELSE 0 END) AS AnswersPerTag,
+        ROW_NUMBER() OVER (ORDER BY pca.Score DESC) AS OverallScoreRank,
+        RANK() OVER (PARTITION BY pca.OwnerUserId ORDER BY pca.Score DESC) AS UserScoreRank
+    FROM PostTagAnalysis pca
+),
+FinalResult AS (
+    SELECT 
+        em.PostId,
+        em.Title,
+        em.Score,
+        em.ViewCount,
+        em.CreationDate,
+        em.OwnerUserId,
+        em.CleanTags,
+        em.TagCount,
+        em.AnswerCount,
+        em.TagDensity,
+        em.AnswerDensity,
+        em.AnswersPerTag,
+        em.OverallScoreRank,
+        em.UserScoreRank,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.TotalPosts,
+        tu.Questions,
+        tu.Answers,
+        tu.Comments,
+        tu.Badges,
+        tu.VoteCount,
+        tu.PostRank,
+        tu.RepRank,
+        tu.QuestionRank,
+        CASE 
+            WHEN em.OverallScoreRank <= 100 THEN 'TopScoring'
+            WHEN em.OverallScoreRank <= 500 THEN 'HighScoring'
+            WHEN em.OverallScoreRank <= 1000 THEN 'MediumScoring'
+            ELSE 'LowScoring'
+        END AS ScoreTier,
+        CASE 
+            WHEN em.AnswersPerTag >= 2 THEN 'HighEngagement'
+            WHEN em.AnswersPerTag >= 1 THEN 'ModerateEngagement'
+            ELSE 'LowEngagement'
+        END AS EngagementLevel,
+        COALESCE(
+            CASE 
+                WHEN em.AnswersPerTag >= 2 THEN 'High'
+                WHEN em.AnswersPerTag >= 1 THEN 'Medium' 
+                ELSE 'Low'
+            END, 
+            'None'
+        ) AS ResponseQuality,
+        CONCAT(
+            'Post: ', em.Title, 
+            ' | Tags: ', em.CleanTags, 
+            ' | Owner: ', COALESCE(tu.DisplayName, 'Unknown'),
+            ' | Score: ', em.Score::text,
+            ' | Views: ', em.ViewCount::text,
+            ' | Answers: ', em.AnswerCount::text,
+            ' | Tags: ', em.TagCount::text
+        ) AS DetailedSummary
+    FROM EngagementMetrics em
+    INNER JOIN TopUsers tu ON em.OwnerUserId = tu.UserId
+    WHERE em.CreationDate >= DATE '2010-01-01'
+      AND em.CreationDate <= DATE '2022-12-31'
+      AND em.Score > 0
+      AND em.ViewCount > 0
+)
+SELECT 
+    PostId,
+    Title,
+    Score,
+    ViewCount,
+    CreationDate,
+    OwnerUserId,
+    CleanTags,
+    TagCount,
+    AnswerCount,
+    TagDensity,
+    AnswerDensity,
+    AnswersPerTag,
+    OverallScoreRank,
+    UserScoreRank,
+    DisplayName,
+    Reputation,
+    TotalPosts,
+    Questions,
+    Answers,
+    Comments,
+    Badges,
+    VoteCount,
+    PostRank,
+    RepRank,
+    QuestionRank,
+    ScoreTier,
+    EngagementLevel,
+    ResponseQuality,
+    DetailedSummary,
+    COUNT(*) OVER() AS TotalResults,
+    AVG(Score) OVER() AS AvgScore,
+    MAX(ViewCount) OVER() AS MaxViews,
+    MIN(CreationDate) OVER() AS EarliestPostDate,
+    MAX(CreationDate) OVER() AS LatestPostDate,
+    RANK() OVER (ORDER BY Score DESC) AS GlobalScoreRank,
+    DENSE_RANK() OVER (ORDER BY ViewCount DESC) AS GlobalViewRank,
+    NTILE(4) OVER (ORDER BY Score DESC) AS Quartile,
+    LAG(Title, 1) OVER (ORDER BY OverallScoreRank) AS PreviousTitle,
+    LEAD(Title, 1) OVER (ORDER BY OverallScoreRank) AS NextTitle,
+    SUM(Score) OVER (ORDER BY CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativeScore,
+    CASE 
+        WHEN Score > (SELECT AVG(Score) FROM FinalResult) THEN 'AboveAverage'
+        WHEN Score = (SELECT AVG(Score) FROM FinalResult) THEN 'Average'
+        ELSE 'BelowAverage'
+    END AS ScoreCategory,
+    CASE 
+        WHEN ViewCount > 500 THEN 'HighTraffic'
+        WHEN ViewCount >= 100 THEN 'ModerateTraffic'
+        WHEN ViewCount > 0 THEN 'LowTraffic'
+        ELSE 'NoTraffic'
+    END AS TrafficLevel,
+    ROW_NUMBER() OVER (ORDER BY CreationDate DESC) AS ChronologicalRank,
+    PERCENT_RANK() OVER (ORDER BY Score DESC) AS ScorePercentile,
+    CUME_DIST() OVER (ORDER BY Score DESC) AS CumulativeDistribution
+FROM FinalResult
+WHERE ScoreTier IN ('TopScoring', 'HighScoring')
+  AND AnswerDensity IN ('FewAnswers', 'ModerateAnswers', 'ManyAnswers')
+  AND EngagementLevel IN ('HighEngagement', 'ModerateEngagement')
+ORDER BY OverallScoreRank ASC
+LIMIT 1000;

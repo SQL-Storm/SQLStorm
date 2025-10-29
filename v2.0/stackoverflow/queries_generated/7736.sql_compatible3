@@ -1,0 +1,187 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS prev_score,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS avg_score_3posts,
+        CASE 
+            WHEN p.Score > 100 THEN 'High'
+            WHEN p.Score > 50 THEN 'Medium'
+            ELSE 'Low'
+        END AS score_category,
+        COALESCE(p.Title, 'No Title') AS safe_title,
+        CASE 
+            WHEN p.Tags IS NULL OR p.Tags = '' THEN 0
+            ELSE (CHAR_LENGTH(p.Tags) - CHAR_LENGTH(REPLACE(p.Tags, '>', '')) + 1)
+        END AS tag_count,
+        CAST(
+            (EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56') - p.CreationDate) / 86400)
+            AS INTEGER
+        ) AS days_since_post
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS total_posts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS question_count,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS answer_count,
+        SUM(p.Score) AS total_score,
+        AVG(p.Score) AS avg_score,
+        MAX(p.CreationDate) AS last_activity,
+        MAX(CASE WHEN p.PostTypeId = 1 THEN p.CreationDate END) AS last_question,
+        MAX(CASE WHEN p.PostTypeId = 2 THEN p.CreationDate END) AS last_answer,
+        STRING_AGG(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Title END, '; ') AS recent_questions,
+        STRING_AGG(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Title END, '; ') AS recent_answers
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+    HAVING COUNT(p.Id) > 0
+),
+PostAnalysis AS (
+    SELECT 
+        rp.Id,
+        rp.PostTypeId,
+        rp.OwnerUserId,
+        rp.Score,
+        rp.ViewCount,
+        rp.CreationDate,
+        rp.Title,
+        rp.Tags,
+        rp.AnswerCount,
+        rp.CommentCount,
+        rp.FavoriteCount,
+        rp.rn,
+        rp.prev_score,
+        rp.avg_score_3posts,
+        rp.score_category,
+        rp.safe_title,
+        rp.tag_count,
+        rp.days_since_post,
+        CASE 
+            WHEN rp.prev_score IS NULL OR rp.prev_score = 0 THEN 0
+            ELSE ((rp.Score - rp.prev_score) * 100.0 / rp.prev_score)
+        END AS score_change_percent,
+        CASE 
+            WHEN rp.days_since_post > 30 AND rp.Score < 10 THEN 'Low Engagement'
+            WHEN rp.days_since_post > 30 AND rp.Score >= 10 AND rp.Score < 50 THEN 'Moderate Engagement'
+            WHEN rp.days_since_post <= 30 AND rp.Score >= 50 THEN 'High Engagement'
+            ELSE 'Other'
+        END AS engagement_level,
+        CASE 
+            WHEN rp.AnswerCount > 0 AND rp.Score > 0 THEN 
+                (rp.CommentCount * 1.0) / (rp.AnswerCount + 1)
+            ELSE 0
+        END AS avg_comments_per_answer
+    FROM RankedPosts rp
+    WHERE rp.rn <= 5
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE WHEN t.IsRequired = TRUE OR t.IsRequired = 1 THEN 'Required' ELSE 'Optional' END AS tag_type,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            ELSE 'Rare'
+        END AS popularity_level,
+        DENSE_RANK() OVER (ORDER BY t.Count DESC) AS rank_by_popularity
+    FROM Tags t
+    WHERE t.TagName IS NOT NULL AND t.TagName != ''
+)
+SELECT 
+    'Performance Benchmark Report' AS report_title,
+    COUNT(DISTINCT ua.UserId) AS total_active_users,
+    COUNT(pa.Id) AS total_analyzed_posts,
+    COUNT(DISTINCT CASE WHEN pa.score_category = 'High' THEN pa.Id END) AS high_score_posts,
+    COUNT(DISTINCT CASE WHEN pa.engagement_level = 'High Engagement' THEN pa.Id END) AS high_engagement_posts,
+    AVG(pa.score_change_percent) AS avg_score_change_percent,
+    AVG(pa.avg_comments_per_answer) AS avg_comments_per_answer,
+    COUNT(DISTINCT CASE WHEN ta.popularity_level = 'Popular' THEN ta.TagName END) AS popular_tags_count,
+    COUNT(DISTINCT CASE WHEN ta.popularity_level = 'Rare' THEN ta.TagName END) AS rare_tags_count,
+    STRING_AGG(DISTINCT ta.TagName, ', ') AS all_tags,
+    COUNT(*) OVER() AS total_records
+FROM UserStats ua
+FULL OUTER JOIN PostAnalysis pa ON ua.UserId = pa.OwnerUserId
+FULL OUTER JOIN TagAnalysis ta ON 1 = 1
+WHERE (ua.UserId IS NOT NULL OR pa.Id IS NOT NULL OR ta.TagName IS NOT NULL)
+    AND (ua.UserId IS NULL OR ua.total_posts > 1)
+    AND (pa.Id IS NULL OR pa.Score >= 0)
+    AND (ta.TagName IS NULL OR ta.Count > 0)
+    AND NOT (
+        (pa.Id IS NOT NULL AND pa.Score < 0) 
+        OR (ua.UserId IS NOT NULL AND ua.Reputation < 0)
+        OR (ta.TagName IS NOT NULL AND ta.Count < 0)
+    )
+    AND (
+        (pa.Id IS NOT NULL AND pa.Score BETWEEN -100 AND 10000)
+        OR pa.Id IS NULL
+    )
+    AND (
+        (ua.UserId IS NOT NULL AND ua.Reputation BETWEEN 1 AND 1000000)
+        OR ua.UserId IS NULL
+    )
+    AND (
+        (ta.TagName IS NOT NULL AND CHAR_LENGTH(ta.TagName) BETWEEN 1 AND 35)
+        OR ta.TagName IS NULL
+    )
+    AND (
+        (pa.Id IS NOT NULL AND pa.days_since_post BETWEEN 0 AND 365)
+        OR pa.Id IS NULL
+    )
+GROUP BY
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.Views,
+    ua.UpVotes,
+    ua.DownVotes,
+    ua.total_posts,
+    pa.Id,
+    pa.PostTypeId,
+    pa.OwnerUserId,
+    pa.Score,
+    pa.ViewCount,
+    pa.CreationDate,
+    pa.Title,
+    pa.Tags,
+    pa.AnswerCount,
+    pa.CommentCount,
+    pa.FavoriteCount,
+    pa.rn,
+    pa.prev_score,
+    pa.avg_score_3posts,
+    pa.score_category,
+    pa.safe_title,
+    pa.tag_count,
+    pa.days_since_post,
+    pa.score_change_percent,
+    pa.engagement_level,
+    pa.avg_comments_per_answer,
+    ta.TagName,
+    ta.Count,
+    ta.ExcerptPostId,
+    ta.WikiPostId,
+    ta.tag_type,
+    ta.popularity_level,
+    ta.rank_by_popularity;

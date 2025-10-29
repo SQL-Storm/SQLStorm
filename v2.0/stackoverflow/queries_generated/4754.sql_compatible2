@@ -1,0 +1,160 @@
+WITH
+  RankedPostEdits AS (
+    SELECT
+      ph.PostId,
+      ph.UserId,
+      ph.CreationDate,
+      ph.PostHistoryTypeId,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM
+      PostHistory ph
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6)
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate,
+      u.LastAccessDate,
+      COUNT(DISTINCT p.Id) AS QuestionCount,
+      COUNT(DISTINCT a.Id) AS AnswerCount,
+      SUM(a.Score) AS TotalAnswerScore,
+      AVG(p.ViewCount) AS AvgQuestionViewCount,
+      MAX(p.CreationDate) AS LastQuestionDate,
+      COUNT(c.Id) AS CommentCount,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount
+    FROM
+      Users u
+      LEFT JOIN Posts p
+        ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+      LEFT JOIN Posts a
+        ON u.Id = a.OwnerUserId AND a.PostTypeId = 2
+      LEFT JOIN Comments c
+        ON u.Id = c.UserId
+      LEFT JOIN Votes v
+        ON u.Id = v.UserId
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate,
+      u.LastAccessDate
+  ),
+  TagPopularity AS (
+    SELECT
+      t.TagName,
+      COUNT(p.Id) AS QuestionCount,
+      SUM(p.FavoriteCount) AS TotalFavorites,
+      AVG(p.AnswerCount) AS AvgAnswerCount,
+      MAX(p.CreationDate) AS LastQuestionDate
+    FROM
+      Tags t
+      JOIN Posts p
+        ON p.PostTypeId = 1
+    WHERE
+      t.TagName IN (
+        SELECT TRIM(unnested)
+        FROM (
+          SELECT unnest(string_to_array(substring(p2.Tags FROM 2 FOR char_length(p2.Tags) - 2), '><')) AS unnested
+          FROM Posts p2
+          WHERE p2.PostTypeId = 1
+        ) sub
+      )
+    GROUP BY
+      t.TagName
+    HAVING
+      COUNT(p.Id) > 100
+  ),
+  RecentEditImpact AS (
+    SELECT
+      rpe.PostId,
+      u.DisplayName AS LastEditorDisplayName,
+      rpe.CreationDate AS LastEditDate,
+      p.Title AS QuestionTitle,
+      (rpe.CreationDate - p.CreationDate) AS TimeSinceCreation,
+      CASE
+        WHEN rpe.PostHistoryTypeId = 4 THEN 'Title Edit'
+        WHEN rpe.PostHistoryTypeId = 5 THEN 'Body Edit'
+        WHEN rpe.PostHistoryTypeId = 6 THEN 'Tags Edit'
+        ELSE 'Other Edit'
+      END AS EditType
+    FROM
+      RankedPostEdits rpe
+      JOIN Posts p
+        ON rpe.PostId = p.Id
+      JOIN Users u
+        ON rpe.UserId = u.Id
+    WHERE
+      rpe.rn = 1
+      AND p.PostTypeId = 1
+  )
+SELECT
+  ua.DisplayName AS UserDisplayName,
+  ua.Reputation,
+  ua.CreationDate AS UserCreationDate,
+  ua.LastAccessDate AS UserLastAccessDate,
+  ua.QuestionCount,
+  ua.AnswerCount,
+  ua.TotalAnswerScore,
+  ua.AvgQuestionViewCount,
+  ua.CommentCount,
+  ua.UpVoteCount,
+  ua.DownVoteCount,
+  rei.QuestionTitle,
+  rei.LastEditDate,
+  rei.LastEditorDisplayName,
+  rei.TimeSinceCreation,
+  rei.EditType,
+  tp.TagName,
+  tp.QuestionCount AS TagQuestionCount,
+  tp.TotalFavorites AS TagTotalFavorites,
+  tp.AvgAnswerCount AS TagAvgAnswerCount,
+  COALESCE(p.Score, 0) AS QuestionScore,
+  COALESCE(p.ViewCount, 0) AS QuestionViewCount,
+  COALESCE(p.AnswerCount, 0) AS QuestionAnswerCount,
+  CASE WHEN p.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS PostStatus,
+  p.CommunityOwnedDate,
+  ('User: ' ||
+    COALESCE(ua.DisplayName, 'Anonymous') ||
+    ', Reputation: ' || CAST(ua.Reputation AS VARCHAR) ||
+    ', Question: ' || SUBSTRING(COALESCE(rei.QuestionTitle, 'N/A') FROM 1 FOR 50) ||
+    ', Edit Type: ' || COALESCE(rei.EditType, 'No Recent Edit') ||
+    CASE WHEN p.ClosedDate IS NOT NULL THEN ', Status: Closed' ELSE ', Status: Open' END
+  ) AS ComprehensiveInfo
+FROM
+  UserActivity ua
+  LEFT JOIN RecentEditImpact rei
+    ON EXISTS (
+      SELECT 1
+      FROM RankedPostEdits rpe2
+      JOIN Posts post2 ON post2.Id = rpe2.PostId
+      WHERE rpe2.UserId = ua.UserId
+        AND post2.OwnerUserId = ua.UserId
+        AND rpe2.rn = 1
+    ) AND rei.UserId = ua.UserId
+  LEFT JOIN Posts p
+    ON p.Id = rei.PostId
+  LEFT JOIN TagPopularity tp
+    ON tp.TagName = (
+      SELECT t.TagName
+      FROM Tags t
+      WHERE t.TagName IN (
+        SELECT TRIM(unnested)
+        FROM (
+          SELECT unnest(string_to_array(substring(p2.Tags FROM 2 FOR char_length(p2.Tags) - 2), '><')) AS unnested
+          FROM Posts p2
+          WHERE p2.Id = p.Id
+        ) sub
+      )
+      ORDER BY t.TagName
+      LIMIT 1
+    )
+WHERE
+  ua.Reputation > 500
+  AND ua.QuestionCount > 5
+ORDER BY
+  ua.Reputation DESC,
+  ua.LastAccessDate DESC;

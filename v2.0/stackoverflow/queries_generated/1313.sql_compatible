@@ -1,0 +1,135 @@
+WITH UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.CreationDate AS UserCreationDate,
+        u.Reputation,
+        u.Views AS UserViews,
+        u.UpVotes AS UserUpVotes,
+        u.DownVotes AS UserDownVotes,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(p.Score) AS TotalPostScore,
+        AVG(p.Score) AS AvgOverallPostScore,
+        AVG(CASE WHEN p.PostTypeId IN (1,2) THEN p.Score END) AS AvgRelevantPostScore,
+        MAX(p.ViewCount) AS MaxPostViewCount,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT v.Id) AS TotalVotesGiven,
+        MAX(CASE WHEN b.Class = 1 THEN b.Date END) AS LatestGoldBadgeDate,
+        MIN(CASE WHEN b.Class = 1 THEN b.Date END) AS FirstGoldBadgeDate,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadgesCount,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadgesCount,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadgesCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId AND v.VoteTypeId IN (2, 3)
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.CreationDate, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.LastAccessDate
+),
+UserOverallRank AS (
+    SELECT
+        uas.UserId,
+        uas.Reputation,
+        uas.TotalPosts,
+        uas.TotalPostScore,
+        uas.AvgOverallPostScore,
+        uas.UserCreationDate,
+        RANK() OVER (ORDER BY uas.Reputation DESC, uas.TotalPostScore DESC) AS GlobalRepRank,
+        NTILE(10) OVER (ORDER BY uas.TotalPosts DESC) AS PostVolumeDecile
+    FROM UserActivitySummary uas
+    WHERE uas.TotalPosts > 0
+),
+UserNeighboringActivity AS (
+    SELECT
+        uor.UserId,
+        uor.GlobalRepRank,
+        uor.PostVolumeDecile,
+        uor.AvgOverallPostScore,
+        uor.UserCreationDate,
+        AVG(uor.AvgOverallPostScore) OVER (ORDER BY uor.UserCreationDate ROWS BETWEEN 10 PRECEDING AND 10 FOLLOWING) AS AvgScoreNeighboringUsers
+    FROM UserOverallRank uor
+),
+PostTagAnalysis AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount AS PostViewCount,
+        p.FavoriteCount,
+        p.Title,
+        p.Body,
+        p.Tags,
+        p.LastEditDate,
+        p.LastActivityDate,
+        CASE WHEN p.Tags IS NOT NULL THEN array_length(string_to_array(substring(p.Tags FROM 2 FOR (char_length(p.Tags) - 2)), '><'), 1) ELSE 0 END AS TagCount,
+        CASE WHEN p.Tags IS NOT NULL THEN string_to_array(substring(p.Tags FROM 2 FOR (char_length(p.Tags) - 2)), '><') END AS TagArray,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn_latest_post_by_user,
+        SUM(p.Score) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS RunningPostTypeScore,
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostScore
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL AND p.PostTypeId IN (1, 2)
+      AND p.Tags IS NOT NULL AND char_length(p.Tags) > 2
+),
+RecentPostHistoryDetails AS (
+    SELECT
+        ph.PostId,
+        ph.UserId AS HistoryUserId,
+        ph.CreationDate AS HistoryDate,
+        ph.PostHistoryTypeId,
+        ph.Text AS HistoryText,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId, ph.PostHistoryTypeId ORDER BY ph.CreationDate DESC) AS rn_latest_history_type,
+        LEAD(ph.CreationDate, 1) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS NextHistoryDate
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (2, 5, 8, 10, 11)
+      AND ph.UserId IS NOT NULL
+),
+HighReputationGoldUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        uas.TotalQuestions,
+        uas.TotalAnswers,
+        uas.AvgRelevantPostScore,
+        uas.GoldBadgesCount,
+        uas.FirstGoldBadgeDate,
+        pta.PostId AS LatestPostId,
+        pta.Title AS LatestPostTitle,
+        pta.PostCreationDate AS LatestPostCreationDate,
+        pta.PostScore AS LatestPostScore,
+        pta.TagCount AS LatestPostTagCount
+    FROM Users u
+    LEFT JOIN UserActivitySummary uas ON u.Id = uas.UserId
+    LEFT JOIN PostTagAnalysis pta ON u.Id = pta.OwnerUserId AND pta.rn_latest_post_by_user = 1
+    WHERE uas.GoldBadgesCount >= 1
+      AND u.Reputation > 10000
+)
+SELECT
+    hrgu.UserId,
+    hrgu.DisplayName,
+    hrgu.Reputation,
+    hrgu.TotalQuestions,
+    hrgu.TotalAnswers,
+    hrgu.AvgRelevantPostScore,
+    hrgu.GoldBadgesCount,
+    hrgu.FirstGoldBadgeDate,
+    hrgu.LatestPostId,
+    hrgu.LatestPostTitle,
+    hrgu.LatestPostCreationDate,
+    hrgu.LatestPostScore,
+    hrgu.LatestPostTagCount,
+    uas.UserViews,
+    uas.UserUpVotes,
+    uas.UserDownVotes,
+    uas.LastAccessDate,
+    uor.GlobalRepRank,
+    uor.PostVolumeDecile,
+    una.AvgScoreNeighboringUsers
+FROM HighReputationGoldUsers hrgu
+LEFT JOIN UserActivitySummary uas ON hrgu.UserId = uas.UserId
+LEFT JOIN UserOverallRank uor ON hrgu.UserId = uor.UserId
+LEFT JOIN UserNeighboringActivity una ON hrgu.UserId = una.UserId
+ORDER BY hrgu.Reputation DESC, hrgu.GoldBadgesCount DESC;

@@ -1,0 +1,439 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        MAX(b.Date) AS LastBadgeDate,
+        MAX(v.CreationDate) AS LastVoteDate,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Elite'
+            WHEN u.Reputation > 5000 THEN 'Veteran'
+            WHEN u.Reputation > 1000 THEN 'Member'
+            ELSE 'Newbie'
+        END AS ReputationTier,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END), 0) AS QuestionScore,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END), 0) AS AnswerScore,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END), 0) AS TotalQuestionViews,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.ViewCount ELSE 0 END), 0) AS TotalAnswerViews,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) AS AvgAnswerScore,
+        STRING_AGG(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Title END, '; ') AS QuestionTitles
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    WHERE u.AccountId IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopPerformers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        PostCount,
+        CommentCount,
+        BadgeCount,
+        VoteCount,
+        QuestionScore,
+        AnswerScore,
+        TotalQuestionViews,
+        TotalAnswerViews,
+        QuestionCount,
+        AnswerCount,
+        AvgQuestionScore,
+        AvgAnswerScore,
+        ReputationTier,
+        RANK() OVER (ORDER BY PostCount DESC, Reputation DESC) AS ActivityRank,
+        ROW_NUMBER() OVER (ORDER BY QuestionScore DESC, AnswerScore DESC) AS ScoringRank,
+        DENSE_RANK() OVER (ORDER BY BadgeCount DESC) AS BadgeRank,
+        NTILE(10) OVER (ORDER BY Reputation DESC) AS ReputationQuartile,
+        PERCENT_RANK() OVER (ORDER BY Reputation DESC) AS ReputationPercentile
+    FROM UserActivityStats
+),
+PostComplexity AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.CommentCount,
+        p.AnswerCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END AS PostType,
+        COALESCE(p.AcceptedAnswerId, 0) AS HasAcceptedAnswer,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2 THEN 
+                (LENGTH(p.Tags) - LENGTH(REPLACE(p.Tags, '><', '')) + 1)
+            ELSE 0
+        END AS TagCount,
+        CASE 
+            WHEN p.Body IS NOT NULL THEN 
+                LENGTH(p.Body)
+            ELSE 0
+        END AS BodyLength,
+        CASE 
+            WHEN p.Body IS NOT NULL THEN 
+                LENGTH(p.Body) - LENGTH(REPLACE(UPPER(p.Body), 'SELECT', ''))
+            ELSE 0
+        END AS SqlKeywordCount,
+        CASE 
+            WHEN p.Body IS NOT NULL AND p.Body LIKE '%<code>%' THEN 1
+            ELSE 0
+        END AS ContainsCodeBlock,
+        CASE 
+            WHEN p.Body IS NOT NULL AND p.Body LIKE '%[code]%' THEN 1
+            ELSE 0
+        END AS ContainsMarkdownCode,
+        LEAD(p.Score, 1, 0) OVER (ORDER BY p.Score DESC) AS NextHigherScore,
+        LAG(p.Score, 1, 0) OVER (ORDER BY p.Score DESC) AS NextLowerScore,
+        AVG(p.Score) OVER (PARTITION BY p.PostTypeId) AS AvgScoreByType,
+        MAX(p.Score) OVER (PARTITION BY p.PostTypeId) AS MaxScoreByType,
+        MIN(p.Score) OVER (PARTITION BY p.PostTypeId) AS MinScoreByType
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+QuestionAnalysis AS (
+    SELECT 
+        pc.PostId,
+        pc.Title,
+        pc.Score,
+        pc.ViewCount,
+        pc.CommentCount,
+        pc.AnswerCount,
+        pc.CreationDate,
+        pc.OwnerUserId,
+        pc.PostType,
+        pc.TagCount,
+        pc.BodyLength,
+        pc.SqlKeywordCount,
+        pc.ContainsCodeBlock,
+        pc.ContainsMarkdownCode,
+        pc.NextHigherScore,
+        pc.NextLowerScore,
+        pc.AvgScoreByType,
+        pc.MaxScoreByType,
+        pc.MinScoreByType,
+        CASE 
+            WHEN pc.Score > pc.AvgScoreByType THEN 'Above Average'
+            WHEN pc.Score < pc.AvgScoreByType THEN 'Below Average'
+            ELSE 'Average'
+        END AS ScorePerformance,
+        CASE 
+            WHEN pc.AnswerCount > 0 AND pc.Score > 0 THEN 
+                CAST(pc.Score AS DECIMAL) / CAST(pc.AnswerCount AS DECIMAL)
+            ELSE 0
+        END AS ScorePerAnswer,
+        CASE 
+            WHEN pc.ViewCount > 0 THEN 
+                CAST(pc.Score AS DECIMAL) / CAST(pc.ViewCount AS DECIMAL)
+            ELSE 0
+        END AS ScorePerView,
+        CASE 
+            WHEN pc.CommentCount > 0 THEN 
+                CAST(pc.Score AS DECIMAL) / CAST(pc.CommentCount AS DECIMAL)
+            ELSE 0
+        END AS ScorePerComment,
+        ROW_NUMBER() OVER (PARTITION BY pc.OwnerUserId ORDER BY pc.Score DESC) AS UserQuestionRank,
+        COUNT(*) OVER (PARTITION BY pc.OwnerUserId) AS TotalQuestionsByUser,
+        pc.PostTypeId
+    FROM PostComplexity pc
+    WHERE pc.PostType = 'Question'
+),
+AnswerAnalysis AS (
+    SELECT 
+        pc.PostId,
+        pc.Title,
+        pc.Score,
+        pc.ViewCount,
+        pc.CommentCount,
+        pc.AnswerCount,
+        pc.CreationDate,
+        pc.OwnerUserId,
+        pc.PostType,
+        pc.TagCount,
+        pc.BodyLength,
+        pc.SqlKeywordCount,
+        pc.ContainsCodeBlock,
+        pc.ContainsMarkdownCode,
+        pc.NextHigherScore,
+        pc.NextLowerScore,
+        pc.AvgScoreByType,
+        pc.MaxScoreByType,
+        pc.MinScoreByType,
+        CASE 
+            WHEN pc.Score > pc.AvgScoreByType THEN 'Above Average'
+            WHEN pc.Score < pc.AvgScoreByType THEN 'Below Average'
+            ELSE 'Average'
+        END AS ScorePerformance,
+        CASE 
+            WHEN pc.BodyLength > 0 THEN 
+                CAST(pc.SqlKeywordCount AS DECIMAL) / CAST(pc.BodyLength AS DECIMAL)
+            ELSE 0
+        END AS SqlKeywordDensity,
+        CASE 
+            WHEN pc.ContainsCodeBlock = 1 THEN 'Has Code'
+            WHEN pc.ContainsMarkdownCode = 1 THEN 'Has Markdown Code'
+            ELSE 'No Code'
+        END AS CodePresence,
+        ROW_NUMBER() OVER (PARTITION BY pc.OwnerUserId ORDER BY pc.Score DESC) AS UserAnswerRank,
+        COUNT(*) OVER (PARTITION BY pc.OwnerUserId) AS TotalAnswersByUser,
+        pc.PostTypeId
+    FROM PostComplexity pc
+    WHERE pc.PostType = 'Answer'
+),
+UserSummary AS (
+    SELECT 
+        tp.UserId,
+        tp.DisplayName,
+        tp.Reputation,
+        tp.PostCount,
+        tp.CommentCount,
+        tp.BadgeCount,
+        tp.VoteCount,
+        tp.QuestionScore,
+        tp.AnswerScore,
+        tp.TotalQuestionViews,
+        tp.TotalAnswerViews,
+        tp.QuestionCount,
+        tp.AnswerCount,
+        tp.AvgQuestionScore,
+        tp.AvgAnswerScore,
+        tp.ReputationTier,
+        tp.ActivityRank,
+        tp.ScoringRank,
+        tp.BadgeRank,
+        tp.ReputationQuartile,
+        tp.ReputationPercentile,
+        CASE 
+            WHEN tp.QuestionCount > 0 THEN 
+                CAST(tp.QuestionScore AS DECIMAL) / CAST(tp.QuestionCount AS DECIMAL)
+            ELSE 0
+        END AS AvgQuestionScorePerQuestion,
+        CASE 
+            WHEN tp.AnswerCount > 0 THEN 
+                CAST(tp.AnswerScore AS DECIMAL) / CAST(tp.AnswerCount AS DECIMAL)
+            ELSE 0
+        END AS AvgAnswerScorePerAnswer,
+        CASE 
+            WHEN tp.QuestionCount + tp.AnswerCount > 0 THEN 
+                CAST(tp.QuestionScore + tp.AnswerScore AS DECIMAL) / 
+                CAST(tp.QuestionCount + tp.AnswerCount AS DECIMAL)
+            ELSE 0
+        END AS AvgScorePerPost,
+        CASE 
+            WHEN tp.TotalQuestionViews > 0 THEN 
+                CAST(tp.QuestionScore AS DECIMAL) / CAST(tp.TotalQuestionViews AS DECIMAL)
+            ELSE 0
+        END AS QuestionScorePerView,
+        CASE 
+            WHEN tp.TotalAnswerViews > 0 THEN 
+                CAST(tp.AnswerScore AS DECIMAL) / CAST(tp.TotalAnswerViews AS DECIMAL)
+            ELSE 0
+        END AS AnswerScorePerView
+    FROM TopPerformers tp
+),
+DetailedAnalysis AS (
+    SELECT 
+        'Question' AS AnalysisType,
+        qa.PostId,
+        qa.Title,
+        qa.Score,
+        qa.ViewCount,
+        qa.CommentCount,
+        qa.AnswerCount,
+        qa.ScorePerformance,
+        qa.ScorePerAnswer,
+        qa.ScorePerView,
+        qa.ScorePerComment,
+        ta.UserId,
+        ta.Reputation,
+        ta.QuestionScore,
+        ta.AnswerScore,
+        ta.ReputationTier,
+        ta.ActivityRank,
+        ta.ScoringRank,
+        ta.BadgeRank,
+        qa.OwnerUserId,
+        qa.AvgScoreByType,
+        qa.MaxScoreByType,
+        qa.MinScoreByType
+    FROM QuestionAnalysis qa
+    JOIN UserSummary ta ON qa.OwnerUserId = ta.UserId
+    WHERE ta.Reputation > 1000
+    UNION ALL
+    SELECT 
+        'Answer' AS AnalysisType,
+        aa.PostId,
+        aa.Title,
+        aa.Score,
+        aa.ViewCount,
+        aa.CommentCount,
+        aa.AnswerCount,
+        aa.ScorePerformance,
+        NULL AS ScorePerAnswer,
+        NULL AS ScorePerView,
+        NULL AS ScorePerComment,
+        ta.UserId,
+        ta.Reputation,
+        ta.QuestionScore,
+        ta.AnswerScore,
+        ta.ReputationTier,
+        ta.ActivityRank,
+        ta.ScoringRank,
+        ta.BadgeRank,
+        aa.OwnerUserId,
+        aa.AvgScoreByType,
+        aa.MaxScoreByType,
+        aa.MinScoreByType
+    FROM AnswerAnalysis aa
+    JOIN UserSummary ta ON aa.OwnerUserId = ta.UserId
+    WHERE ta.Reputation > 1000
+),
+ComplexMetrics AS (
+    SELECT 
+        da.AnalysisType,
+        da.PostId,
+        da.Title,
+        da.Score,
+        da.ViewCount,
+        da.CommentCount,
+        da.AnswerCount,
+        da.ScorePerformance,
+        da.ScorePerAnswer,
+        da.ScorePerView,
+        da.ScorePerComment,
+        da.UserId,
+        da.Reputation,
+        da.QuestionScore,
+        da.AnswerScore,
+        da.ReputationTier,
+        da.ActivityRank,
+        da.ScoringRank,
+        da.BadgeRank,
+        RANK() OVER (ORDER BY da.Score DESC) AS OverallScoreRank,
+        ROW_NUMBER() OVER (ORDER BY da.Reputation DESC, da.Score DESC) AS ReputationScoreRank,
+        DENSE_RANK() OVER (ORDER BY da.AnalysisType, da.UserId) AS TypeUserRank,
+        COUNT(*) OVER () AS TotalRecords,
+        COUNT(*) OVER (PARTITION BY da.AnalysisType) AS TypeCount,
+        AVG(da.Score) OVER (PARTITION BY da.AnalysisType) AS TypeAvgScore,
+        MAX(da.Score) OVER (PARTITION BY da.AnalysisType) AS TypeMaxScore,
+        MIN(da.Score) OVER (PARTITION BY da.AnalysisType) AS TypeMinScore,
+        STDDEV(da.Score) OVER (PARTITION BY da.AnalysisType) AS TypeScoreStdDev,
+        CASE 
+            WHEN da.Score > (SELECT AVG(Score) FROM DetailedAnalysis) THEN 'Above Average Score'
+            WHEN da.Score < (SELECT AVG(Score) FROM DetailedAnalysis) THEN 'Below Average Score'
+            ELSE 'Average Score'
+        END AS ScoreCategory
+    FROM DetailedAnalysis da
+)
+SELECT 
+    cm.AnalysisType,
+    cm.PostId,
+    cm.Title,
+    cm.Score,
+    cm.ViewCount,
+    cm.CommentCount,
+    cm.AnswerCount,
+    cm.ScorePerformance,
+    cm.ScorePerAnswer,
+    cm.ScorePerView,
+    cm.ScorePerComment,
+    cm.UserId,
+    cm.Reputation,
+    cm.QuestionScore,
+    cm.AnswerScore,
+    cm.ReputationTier,
+    cm.ActivityRank,
+    cm.ScoringRank,
+    cm.BadgeRank,
+    cm.OverallScoreRank,
+    cm.ReputationScoreRank,
+    cm.TypeUserRank,
+    cm.TotalRecords,
+    cm.TypeCount,
+    cm.TypeAvgScore,
+    cm.TypeMaxScore,
+    cm.TypeMinScore,
+    cm.TypeScoreStdDev,
+    cm.ScoreCategory,
+    CASE WHEN cm.UserId = (SELECT UserId FROM TopPerformers WHERE ActivityRank = 1 FETCH FIRST 1 ROWS ONLY) THEN 1 ELSE 0 END AS IsTopPerformer,
+    CASE 
+        WHEN cm.Score > 50 AND cm.AnswerCount > 10 THEN 'Highly Engaged'
+        WHEN cm.Score > 20 AND cm.AnswerCount > 5 THEN 'Engaged'
+        ELSE 'Regular'
+    END AS UserEngagementLevel,
+    (cm.ViewCount + cm.CommentCount + cm.AnswerCount) AS TotalEngagement,
+    ABS(cm.Score - cm.TypeAvgScore) AS ScoreDeviationFromTypeAvg,
+    CASE 
+        WHEN cm.TypeAvgScore > 0 THEN 
+            CAST(cm.Score AS DECIMAL) / CAST(cm.TypeAvgScore AS DECIMAL) 
+        ELSE 0 
+    END AS ScoreToTypeAvgRatio,
+    (cm.Title || ' - ' || cm.ScoreCategory) AS TitleWithCategory,
+    -- Replace invalid interval arithmetic: EstimatedFutureScore uses ScorePerView (numeric). To produce a future estimate, add 30 (days) scaled value instead of adding interval.
+    (cm.ScorePerView + 30) AS EstimatedFutureScore,
+    CASE 
+        WHEN cm.AnalysisType = 'Question' AND cm.ReputationTier = 'Elite' THEN 'Elite Question'
+        WHEN cm.AnalysisType = 'Answer' AND cm.ReputationTier = 'Elite' THEN 'Elite Answer'
+        ELSE 'Regular Post'
+    END AS PostClassification,
+    CASE 
+        WHEN cm.ActivityRank <= 5 THEN 'Top 5 Active'
+        WHEN cm.ActivityRank <= 10 THEN 'Top 10 Active'
+        ELSE 'Regular Active'
+    END AS ActivityStatus,
+    CASE 
+        WHEN cm.ScoringRank <= 5 THEN 'Top 5 Scoring'
+        WHEN cm.ScoringRank <= 10 THEN 'Top 10 Scoring'
+        ELSE 'Regular Scoring'
+    END AS ScoringStatus,
+    CASE 
+        WHEN cm.BadgeRank <= 3 THEN 'Top 3 Badge Holder'
+        WHEN cm.BadgeRank <= 10 THEN 'Top 10 Badge Holder'
+        ELSE 'Regular Badge Holder'
+    END AS BadgeStatus
+FROM ComplexMetrics cm
+WHERE cm.Reputation >= 1000
+  AND cm.Score BETWEEN 0 AND 100
+  AND cm.ViewCount >= 0
+  AND cm.CommentCount >= 0
+  AND cm.AnswerCount >= 0
+  AND cm.TypeCount > 1
+GROUP BY 
+    cm.AnalysisType, cm.PostId, cm.Title, cm.Score, cm.ViewCount, 
+    cm.CommentCount, cm.AnswerCount, cm.ScorePerformance, cm.ScorePerAnswer, 
+    cm.ScorePerView, cm.ScorePerComment, cm.UserId, cm.Reputation, 
+    cm.QuestionScore, cm.AnswerScore, cm.ReputationTier, cm.ActivityRank, 
+    cm.ScoringRank, cm.BadgeRank, cm.OverallScoreRank, cm.ReputationScoreRank, 
+    cm.TypeUserRank, cm.TotalRecords, cm.TypeCount, cm.TypeAvgScore, 
+    cm.TypeMaxScore, cm.TypeMinScore, cm.TypeScoreStdDev, cm.ScoreCategory
+HAVING 
+    COUNT(*) > 0
+    AND MAX(cm.Score) > MIN(cm.Score)
+    AND SUM(cm.Score) > 0
+ORDER BY 
+    cm.ReputationScoreRank,
+    cm.Score DESC,
+    cm.TypeUserRank,
+    cm.OverallScoreRank;

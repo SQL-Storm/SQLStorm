@@ -1,0 +1,62 @@
+SELECT
+            AVG(A.Score)
+        FROM
+            Posts A
+        INNER JOIN Users AU ON A.OwnerUserId = AU.Id
+        WHERE
+            A.PostTypeId = 2
+            AND A.ParentId = PDA_Q.PostId
+            AND AU.Reputation > 1000
+            AND A.CreationDate > PDA_Q.PostCreationDate
+    ) AS AvgScoreOfHighReputationAnswers,
+    CASE
+        WHEN UE.Reputation > 5000 AND UE.TotalQuestionsWithAcceptedAnswer > 5 THEN 'Veteran Contributor'
+        WHEN UE.TotalBadgesEarned >= 10 AND UE.TotalPostsScore > 100 THEN 'Active Community Member'
+        WHEN UE.TotalCommentsMade > 50 AND UE.TotalPostsOwned = 0 THEN 'Dedicated Commenter'
+        ELSE 'Casual User'
+    END AS UserCategory,
+    RANK() OVER (ORDER BY UE.Reputation DESC, UE.TotalPostsScore DESC, UE.TotalAnswersAccepted DESC) AS GlobalUserRank,
+    AVG(UE.TotalPostsScore) OVER (PARTITION BY UE.UserLocation) AS AvgPostsScoreInLocation,
+    LAG(UE.LastPostActivityDate, 1, UE.UserCreationDate) OVER (PARTITION BY UE.UserId ORDER BY UE.LastPostActivityDate) AS PrevPostActivityDate,
+    EXISTS (SELECT 1 FROM HighlyVotedQuestionsWithAcceptedAnswers HVQ WHERE HVQ.UserId = UE.UserId) AS HasHighlyRatedQuestions,
+    EXISTS (SELECT 1 FROM UsersWhoOnlyAnsweredRecently UWAR WHERE UWAR.UserId = UE.UserId) AS IsRecentAnswerOnlyUser
+FROM
+    UserEngagement UE
+LEFT JOIN LATERAL (
+    SELECT PDA.*
+    FROM PostDetailedAnalytics PDA
+    WHERE PDA.OwnerUserId = UE.UserId AND PDA.PostTypeId = 1
+    ORDER BY PDA.PostCreationDate DESC
+    LIMIT 1
+) AS PDA_Q ON TRUE
+LEFT JOIN LATERAL (
+    SELECT TagName, COUNT(PDA_Tag.PostId) AS cnt, SUM(PDA_Tag.ViewCount) AS vsum
+    FROM PostDetailedAnalytics PDA_Tag,
+    LATERAL (
+        SELECT UNNEST(string_to_array(SUBSTRING(PDA_Tag.Tags FROM 2 FOR LENGTH(PDA_Tag.Tags)-2), '><')) AS TagName
+    ) AS TagArr
+    WHERE PDA_Tag.OwnerUserId = UE.UserId AND PDA_Tag.PostTypeId = 1 AND PDA_Tag.Tags IS NOT NULL
+    GROUP BY TagArr.TagName
+    ORDER BY cnt DESC, vsum DESC
+    LIMIT 1
+) AS TopTag ON TRUE
+LEFT JOIN TagPerformance TP ON TopTag.TagName = TP.TagName
+LEFT JOIN QuestionAnswerLinkAnalysis QALA ON PDA_Q.PostId = QALA.QuestionId
+LEFT JOIN LATERAL (
+    SELECT UNNEST(UE.UserBadgeNames) AS bname
+) AS UB ON TRUE
+WHERE
+    UE.Reputation > 500
+    AND UE.TotalPostsOwned > 0
+    AND UE.TotalBadgesEarned > 0
+    AND (PDA_Q.Body LIKE '%sql%' OR PDA_Q.Body LIKE '%database%')
+    AND UE.LastPostActivityDate IS NOT NULL AND UE.LastPostActivityDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+GROUP BY
+    UE.UserId, UE.DisplayName, UE.Reputation, UE.UserLocation, UE.TotalPostsOwned, UE.TotalPostsScore, UE.TotalBadgesEarned,
+    UE.TotalQuestionsWithAcceptedAnswer, UE.TotalAnswersAccepted, TP.TagName, TP.AverageTagQuestionScore,
+    PDA_Q.PostId, PDA_Q.Title, PDA_Q.Score, PDA_Q.ViewCount, PDA_Q.AnswerCount, PDA_Q.FavoriteCount, PDA_Q.NumDistinctEditors,
+    PDA_Q.ReopenCount, PDA_Q.SignificantBodyEditCount, PDA_Q.SecondsToFirstEdit, QALA.LinkedPostsCount, QALA.DuplicatePostsCount,
+    PDA_Q.PostCreationDate, UE.TotalCommentsMade, UE.UserCreationDate, UE.LastPostActivityDate, UB.bname
+ORDER BY
+    GlobalUserRank ASC, UE.UserId
+LIMIT 1000;

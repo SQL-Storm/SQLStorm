@@ -1,0 +1,235 @@
+-- {"query": "1558.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3381} 
+
+WITH UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        EXTRACT(DAY FROM AGE(CURRENT_TIMESTAMP, u.CreationDate)) AS UserAgeDays,
+        u.Views AS UserProfileViews,
+        u.UpVotes AS UserTotalUpVotesReceived, -- UpVotes received by the user on their posts/comments
+        u.DownVotes AS UserTotalDownVotesReceived, -- DownVotes received by the user on their posts/comments
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COALESCE(AVG(CASE WHEN v.VoteTypeId = 2 THEN 1.0 WHEN v.VoteTypeId = 3 THEN -1.0 ELSE 0.0 END), 0.0) AS AvgVoteImpactByMe, -- Avg score of votes cast by this user (UpMod=1, DownMod=-1)
+        NTILE(5) OVER (ORDER BY u.Reputation DESC, u.CreationDate ASC) AS ReputationQuintile,
+        RANK() OVER (ORDER BY u.Views DESC, u.Reputation DESC) AS UserViewRank
+    FROM
+        Users u
+    LEFT JOIN
+        Badges b ON u.Id = b.UserId
+    LEFT JOIN
+        Votes v ON u.Id = v.UserId AND v.VoteTypeId IN (2, 3) -- Only considering up/down votes cast by the user
+    WHERE
+        u.Reputation > 750
+        AND u.LastAccessDate >= CURRENT_TIMESTAMP - INTERVAL '9 months'
+        AND u.Location IS NOT NULL
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Views, u.UpVotes, u.DownVotes
+),
+PostActivityMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount, -- AnswerCount is NULL for non-questions
+        p.CommentCount,
+        COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+        p.Title,
+        p.Tags,
+        p.LastActivityDate,
+        EXTRACT(HOUR FROM AGE(CURRENT_TIMESTAMP, p.LastActivityDate)) AS LastActivityAgoHours,
+        p.ClosedDate,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.Body, -- Include for string analysis
+        (SELECT COUNT(DISTINCT ph_sub.UserId)
+         FROM PostHistory ph_sub
+         WHERE ph_sub.PostId = p.Id
+           AND ph_sub.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+        ) AS UniqueEditorsCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseEvents, -- Post Closed
+        SUM(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenEvents, -- Post Reopened
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS TotalEditHistoryEvents,
+        COALESCE(AVG(c.Score), 0.0) AS AvgCommentScore,
+        COUNT(c.Id) AS TotalCommentsOnPost,
+        STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><') AS TagArray,
+        CASE
+            WHEN p.Score > 200 AND p.ViewCount > 50000 THEN 'Mega_Popular'
+            WHEN p.Score BETWEEN 50 AND 200 AND p.ViewCount BETWEEN 5000 AND 50000 THEN 'Highly_Engaged'
+            WHEN p.Score BETWEEN 10 AND 49 AND p.ViewCount BETWEEN 500 AND 4999 THEN 'Active'
+            ELSE 'Moderate_Engagement'
+        END AS PostEngagementTier,
+        COUNT(DISTINCT pl.RelatedPostId) FILTER (WHERE pl.LinkTypeId = 1) AS LinkedFromPosts,
+        COUNT(DISTINCT pl.RelatedPostId) FILTER (WHERE pl.LinkTypeId = 3) AS DuplicateOfPosts
+    FROM
+        Posts p
+    JOIN
+        PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN
+        PostHistory ph ON p.Id = ph.PostId
+    LEFT JOIN
+        Comments c ON p.Id = c.PostId
+    LEFT JOIN
+        PostLinks pl ON p.Id = pl.PostId
+    WHERE
+        p.CreationDate >= CURRENT_TIMESTAMP - INTERVAL '3 year'
+        AND p.PostTypeId IN (1, 2) -- Questions (1) and Answers (2) only
+        AND p.Score >= 5
+    GROUP BY
+        p.Id, p.PostTypeId, pt.Name, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount,
+        p.AnswerCount, p.CommentCount, p.FavoriteCount, p.Title, p.Tags, p.LastActivityDate,
+        p.ClosedDate, p.AcceptedAnswerId, p.ParentId, p.Body
+),
+RankedActivity AS (
+    SELECT
+        pam.*,
+        ROW_NUMBER() OVER (PARTITION BY pam.OwnerUserId ORDER BY pam.Score DESC, pam.LastActivityDate DESC) AS UserPostRank,
+        RANK() OVER (ORDER BY pam.Score DESC, pam.ViewCount DESC, pam.FavoriteCount DESC) AS OverallPostRank,
+        AVG(pam.Score) OVER (PARTITION BY DATE_TRUNC('month', pam.PostCreationDate)) AS MonthlyAvgPostScore,
+        SUM(CASE WHEN pam.PostTypeId = 1 THEN pam.Score ELSE 0 END) OVER (PARTITION BY pam.OwnerUserId) AS OwnerQuestionScoreSum,
+        SUM(CASE WHEN pam.PostTypeId = 2 THEN pam.Score ELSE 0 END) OVER (PARTITION BY pam.OwnerUserId) AS OwnerAnswerScoreSum,
+        COUNT(pam.PostId) OVER (PARTITION BY pam.OwnerUserId) AS OwnerTotalPostsContribution,
+        (pam.Score * 0.7 + pam.ViewCount * 0.05 + pam.CommentCount * 0.15 + pam.FavoriteCount * 0.1) AS WeightedEngagementScore,
+        FIRST_VALUE(pam.Title) OVER (PARTITION BY pam.OwnerUserId ORDER BY pam.Score DESC) AS TopScoringPostTitleByOwner
+    FROM
+        PostActivityMetrics pam
+),
+ComplexUserPostInteraction AS (
+    SELECT
+        ue.UserId,
+        ue.DisplayName AS UserDisplayName,
+        ue.Reputation,
+        ue.GoldBadges,
+        ue.UserAgeDays,
+        ue.ReputationQuintile,
+        ra.PostId,
+        ra.PostTypeName,
+        ra.Title AS PostTitle,
+        ra.Score AS PostScore,
+        ra.ViewCount AS PostViewCount,
+        ra.FavoriteCount AS PostFavoriteCount,
+        ra.PostEngagementTier,
+        ra.UniqueEditorsCount,
+        ra.CloseEvents,
+        ra.ReopenEvents,
+        ra.AvgCommentScore,
+        ra.TotalCommentsOnPost,
+        ra.LastActivityAgoHours,
+        ra.WeightedEngagementScore,
+        ra.OverallPostRank,
+        (ra.OwnerQuestionScoreSum + ra.OwnerAnswerScoreSum) AS OwnerTotalContentScore,
+        (SELECT COUNT(DISTINCT c_sub.UserId) FROM Comments c_sub WHERE c_sub.PostId = ra.PostId AND c_sub.UserId IS NOT NULL AND c_sub.UserId != ue.UserId) AS OtherCommentersCount,
+        COALESCE(
+            NULLIF(
+                REPLACE(
+                    SUBSTRING(ra.Body, POSITION('<p>', ra.Body) + 3, LENGTH(ra.Body) - POSITION('<p>', ra.Body) - 3), -- Extract text between first <p> tags
+                    '&amp;', '&'
+                ),
+                ''
+            ),
+            'No valid HTML paragraph found in body'
+        ) AS CleanedInitialBodySnippet -- Elaborate string operations, NULLIF, COALESCE
+    FROM
+        UserEngagement ue
+    INNER JOIN
+        RankedActivity ra ON ue.UserId = ra.OwnerUserId
+    WHERE
+        ra.UserPostRank <= 3 -- Consider only top 3 posts (by score) per user
+        AND ra.OverallPostRank <= 2000 -- Global ranking constraint for performance
+        AND (ue.ReputationQuintile = 1 OR ue.GoldBadges >= 1) -- High reputation quintile or at least one gold badge
+        AND ra.LastActivityAgoHours < 1440 -- Active within the last 60 days
+        AND NOT (ra.PostTypeId = 1 AND ra.ClosedDate IS NOT NULL AND ra.CloseEvents = 1 AND ra.ReopenEvents = 0) -- Exclude questions that were closed and never reopened (simple close)
+        AND (ra.Title ILIKE '%sql%' OR ra.Body ILIKE '%database%' OR ra.Title ILIKE '%performance%' OR ra.Body ILIKE '%optimization%') -- String search for keywords
+        AND (
+                'sql' = ANY(ra.TagArray)
+                OR 'database' = ANY(ra.TagArray)
+                OR 'postgresql' = ANY(ra.TagArray)
+                OR 'mysql' = ANY(ra.TagArray)
+                OR 'performance' = ANY(ra.TagArray)
+            )
+        AND ra.AvgCommentScore > (SELECT AVG(c2.Score) FROM Comments c2 JOIN Posts p2 ON c2.PostId = p2.Id WHERE p2.PostTypeId = ra.PostTypeId AND p2.CreationDate >= CURRENT_TIMESTAMP - INTERVAL '1 year') -- Correlated subquery for comment score vs. recent average
+        AND ue.UserId IN (SELECT DISTINCT v_sub.UserId FROM Votes v_sub WHERE v_sub.PostId = ra.PostId AND v_sub.VoteTypeId = 5) -- User has favorited this post (UserId will also be populated for VoteTypeId=5)
+)
+-- Main query using UNION ALL for different perspectives on highly engaged content/users
+SELECT
+    'Top_Question_Engager_Analysis' AS AnalysisCategory,
+    cu.UserDisplayName,
+    cu.Reputation,
+    cu.GoldBadges,
+    cu.PostTitle,
+    cu.PostTypeName,
+    cu.PostScore,
+    cu.PostViewCount,
+    cu.PostFavoriteCount,
+    cu.AvgCommentScore,
+    cu.LastActivityAgoHours,
+    cu.WeightedEngagementScore,
+    cu.UniqueEditorsCount,
+    cu.CloseEvents,
+    cu.ReopenEvents,
+    cu.CleanedInitialBodySnippet,
+    cu.OtherCommentersCount
+FROM
+    ComplexUserPostInteraction cu
+WHERE
+    cu.PostTypeName = 'Question'
+    AND cu.WeightedEngagementScore >= 150 -- Threshold for high engagement on questions
+    AND cu.PostId NOT IN (SELECT pl_sub.RelatedPostId FROM PostLinks pl_sub WHERE pl_sub.PostId = cu.PostId AND pl_sub.LinkTypeId = 3) -- Not a duplicate of another post (correlated NOT IN)
+    AND cu.GoldBadges > 0 -- Only users with Gold Badges for this question category
+    AND cu.OtherCommentersCount > 2
+    AND cu.UserAgeDays > 730 -- Active users over 2 years old
+    AND cu.ReopenEvents > 0 -- Question has been reopened at least once (indicating controversy/high interest)
+    AND cu.PostViewCount > cu.PostScore * 100 -- View count is significantly higher than score
+    AND LEFT(cu.PostTitle, 1) = UPPER(LEFT(cu.PostTitle, 1)) -- Title starts with an uppercase letter
+UNION ALL
+SELECT
+    'Top_Answer_Contributor_Analysis' AS AnalysisCategory,
+    cu.UserDisplayName,
+    cu.Reputation,
+    cu.GoldBadges,
+    cu.PostTitle,
+    cu.PostTypeName,
+    cu.PostScore,
+    cu.PostViewCount,
+    cu.PostFavoriteCount,
+    cu.AvgCommentScore,
+    cu.LastActivityAgoHours,
+    cu.WeightedEngagementScore,
+    cu.UniqueEditorsCount,
+    cu.CloseEvents,
+    cu.ReopenEvents,
+    cu.CleanedInitialBodySnippet,
+    cu.OtherCommentersCount
+FROM
+    ComplexUserPostInteraction cu
+WHERE
+    cu.PostTypeName = 'Answer'
+    AND cu.PostScore >= 75
+    AND cu.AcceptedAnswerId IS NOT NULL AND cu.AcceptedAnswerId = cu.PostId -- This answer was accepted for its parent question
+    AND cu.UniqueEditorsCount >= 2 -- Answer has been edited by multiple people (indicating community input/refinement)
+    AND cu.UserAgeDays > 1095 -- Highly experienced users (over 3 years old)
+    AND (
+            SELECT SUM(p_q.Score)
+            FROM Posts p_q
+            WHERE p_q.Id = cu.ParentId AND p_q.PostTypeId = 1 AND p_q.CreationDate >= CURRENT_TIMESTAMP - INTERVAL '2 year'
+        ) > 150 -- Parent question is highly scored and relatively recent (correlated subquery)
+    AND EXISTS (
+            SELECT 1
+            FROM Comments c_ans
+            WHERE c_ans.PostId = cu.PostId
+            AND c_ans.UserId = cu.UserId
+            AND c_ans.CreationDate >= CURRENT_TIMESTAMP - INTERVAL '6 months'
+            AND c_ans.Score >= 1
+        ) -- The user has recently commented positively on their own highly-scored, accepted answer (correlated EXISTS)
+    AND cu.PostId IN (SELECT p_q_sub.AcceptedAnswerId FROM Posts p_q_sub WHERE p_q_sub.Id = cu.ParentId AND p_q_sub.ClosedDate IS NULL) -- Double-check: ensure this is an accepted answer for an *open* parent question (correlated IN)
+ORDER BY
+    WeightedEngagementScore DESC, Reputation DESC
+LIMIT 500;

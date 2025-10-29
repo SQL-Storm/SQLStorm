@@ -1,0 +1,343 @@
+-- {"query": "1477.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 4847} 
+WITH UserBaseMetrics AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Views,
+        u.UpVotes AS UserUpVotesGiven,
+        u.DownVotes AS UserDownVotesGiven,
+        COALESCE(SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END), 0) AS GoldBadges,
+        COALESCE(SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END), 0) AS SilverBadges,
+        COALESCE(SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END), 0) AS BronzeBadges,
+        EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - u.CreationDate)) / (60 * 60 * 24) AS AccountAgeDays
+    FROM Users AS u
+    LEFT JOIN Badges AS b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes
+),
+PostTagProcessing AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.CreationDate AS PostCreatedDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount AS PostCommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.Title,
+        p.Body,
+        p.Tags,
+        -- Elaborate string parsing for tags based on schema hint: '<tag1><tag2>' -> ['tag1', 'tag2']
+        ARRAY(
+            SELECT TRIM(t_arr)
+            FROM UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><')) AS t_arr
+            WHERE TRIM(t_arr) <> ''
+        ) AS TagArray
+    FROM Posts AS p
+    LEFT JOIN PostTypes AS pt ON p.PostTypeId = pt.Id
+    WHERE p.PostTypeId IN (1, 2) -- Focus on Questions and Answers
+    AND p.OwnerUserId IS NOT NULL -- Exclude community owned posts without specific user for this analysis
+),
+PostHistoryAggregates AS (
+    SELECT
+        ph.PostId,
+        COUNT(DISTINCT ph.Id) AS TotalHistoryEvents,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS TotalEdits, -- Actual edits (Title, Body, Tags)
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS TotalCloses,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS TotalReopens,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate ELSE NULL END) AS LastClosedDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.CreationDate ELSE NULL END) AS LastReopenedDate,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4,5,6) AND ph.UserId IS NOT NULL THEN ph.UserId ELSE NULL END) AS DistinctEditorCount,
+        -- Correlated subquery example: Find the display name of the last non-owner editor for a post
+        (
+            SELECT sub_u.DisplayName
+            FROM PostHistory AS sub_ph
+            JOIN Users AS sub_u ON sub_ph.UserId = sub_u.Id
+            WHERE sub_ph.PostId = ph.PostId
+            AND sub_ph.PostHistoryTypeId IN (4, 5, 6) -- Edit events
+            AND sub_ph.UserId IS NOT NULL
+            AND sub_ph.UserId <> (SELECT p.OwnerUserId FROM Posts AS p WHERE p.Id = sub_ph.PostId) -- Exclude post owner
+            ORDER BY sub_ph.CreationDate DESC
+            LIMIT 1
+        ) AS LastNonOwnerEditorDisplayName
+    FROM PostHistory AS ph
+    GROUP BY ph.PostId
+),
+PostEngagementMetrics AS (
+    SELECT
+        p.PostId,
+        p.PostCreatedDate,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.PostScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.PostCommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.Title,
+        p.Body,
+        p.Tags,
+        p.TagArray,
+        pha.TotalEdits,
+        pha.TotalCloses,
+        pha.TotalReopens,
+        pha.LastClosedDate,
+        pha.LastReopenedDate,
+        pha.DistinctEditorCount,
+        pha.LastNonOwnerEditorDisplayName,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS TotalUpVotesReceived,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS TotalDownVotesReceived,
+        -- Non-correlated subquery for existence check: Has this post ever been accepted as an answer (if it's an answer)?
+        EXISTS (SELECT 1 FROM Posts AS qa WHERE p.PostTypeId = 2 AND qa.AcceptedAnswerId = p.PostId) AS IsAcceptedAnswer
+    FROM PostTagProcessing AS p
+    LEFT JOIN PostHistoryAggregates AS pha ON p.PostId = pha.PostId
+    LEFT JOIN Votes AS v ON p.PostId = v.PostId
+    GROUP BY
+        p.PostId, p.PostCreatedDate, p.PostTypeId, p.OwnerUserId, p.PostScore, p.ViewCount,
+        p.AnswerCount, p.PostCommentCount, p.FavoriteCount, p.ClosedDate, p.LastEditDate, p.LastActivityDate, p.Title,
+        p.Body, p.Tags, p.TagArray, pha.TotalEdits, pha.TotalCloses, pha.TotalReopens, pha.LastClosedDate, pha.LastReopenedDate,
+        pha.DistinctEditorCount, pha.LastNonOwnerEditorDisplayName
+),
+UserTagContributions AS (
+    SELECT
+        pem.OwnerUserId AS UserId,
+        tag.TagName,
+        COUNT(DISTINCT pem.PostId) AS PostsInTag,
+        SUM(pem.PostScore) AS TagScoreSum,
+        AVG(pem.PostScore) AS AvgTagPostScore,
+        COUNT(DISTINCT CASE WHEN pem.PostTypeId = 1 THEN pem.PostId ELSE NULL END) AS QuestionsInTag,
+        COUNT(DISTINCT CASE WHEN pem.PostTypeId = 2 THEN pem.PostId ELSE NULL END) AS AnswersInTag,
+        SUM(CASE WHEN pem.PostTypeId = 1 AND pem.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS AcceptedAnswersToQuestionsInTag,
+        SUM(CASE WHEN pem.PostTypeId = 2 AND p_q.AcceptedAnswerId = pem.PostId THEN 1 ELSE 0 END) AS AcceptedAnswersFromAnswersInTag
+    FROM PostEngagementMetrics AS pem
+    CROSS JOIN UNNEST(pem.TagArray) AS tag(TagName)
+    LEFT JOIN Posts AS p_q ON pem.PostTypeId = 2 AND pem.ParentId = p_q.Id -- Join to get question for an answer to check acceptance
+    WHERE tag.TagName IS NOT NULL
+    GROUP BY pem.OwnerUserId, tag.TagName
+),
+UserOverallMetrics AS (
+    SELECT
+        ubm.UserId,
+        ubm.DisplayName,
+        ubm.Reputation,
+        ubm.CreationDate,
+        ubm.LastAccessDate,
+        ubm.Views,
+        ubm.UserUpVotesGiven,
+        ubm.DownVotes AS UserDownVotesGiven,
+        ubm.GoldBadges,
+        ubm.SilverBadges,
+        ubm.BronzeBadges,
+        ubm.AccountAgeDays,
+        COALESCE(SUM(pem.PostScore), 0) AS TotalPostsScore,
+        COALESCE(COUNT(DISTINCT pem.PostId), 0) AS TotalPostsByOwner,
+        COALESCE(COUNT(DISTINCT CASE WHEN pem.PostTypeId = 1 THEN pem.PostId ELSE NULL END), 0) AS TotalQuestions,
+        COALESCE(COUNT(DISTINCT CASE WHEN pem.PostTypeId = 2 THEN pem.PostId ELSE NULL END), 0) AS TotalAnswers,
+        COALESCE(SUM(pem.TotalUpVotesReceived), 0) AS TotalUpVotesOnPosts,
+        COALESCE(SUM(pem.TotalDownVotesReceived), 0) AS TotalDownVotesOnPosts,
+        COALESCE(SUM(pem.TotalEdits), 0) AS TotalEditsByOwnerOnPosts,
+        COALESCE(SUM(pem.TotalCloses), 0) AS TotalClosesOnPosts,
+        COALESCE(COUNT(DISTINCT c.Id), 0) AS TotalCommentsMade
+    FROM UserBaseMetrics AS ubm
+    LEFT JOIN PostEngagementMetrics AS pem ON ubm.UserId = pem.OwnerUserId
+    LEFT JOIN Comments AS c ON ubm.UserId = c.UserId
+    GROUP BY
+        ubm.UserId, ubm.DisplayName, ubm.Reputation, ubm.CreationDate, ubm.LastAccessDate, ubm.Views,
+        ubm.UserUpVotesGiven, ubm.UserDownVotesGiven, ubm.GoldBadges, ubm.SilverBadges, ubm.BronzeBadges, ubm.AccountAgeDays
+),
+RecentActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(DISTINCT p.Id) AS PostsInLast90Days,
+        COUNT(DISTINCT c.Id) AS CommentsInLast90Days,
+        SUM(CASE WHEN v.VoteTypeId IN (2, 8) THEN 1 ELSE 0 END) AS UpVotesGivenInLast90Days,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesGivenInLast90Days,
+        MAX(p.CreationDate) AS LastPostCreated,
+        MAX(c.CreationDate) AS LastCommentCreated,
+        MAX(v.CreationDate) AS LastVoteCast
+    FROM Users AS u
+    LEFT JOIN Posts AS p ON u.Id = p.OwnerUserId AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '90 days'
+    LEFT JOIN Comments AS c ON u.Id = c.UserId AND c.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '90 days'
+    LEFT JOIN Votes AS v ON u.Id = v.UserId AND v.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '90 days'
+    GROUP BY u.Id
+),
+UserPerformanceData AS (
+    SELECT
+        uom.UserId,
+        uom.DisplayName,
+        uom.Reputation,
+        uom.CreationDate,
+        uom.AccountAgeDays,
+        uom.TotalPostsByOwner,
+        uom.TotalQuestions,
+        uom.TotalAnswers,
+        uom.TotalPostsScore,
+        uom.TotalUpVotesOnPosts,
+        uom.TotalDownVotesOnPosts,
+        uom.TotalEditsByOwnerOnPosts,
+        uom.TotalClosesOnPosts,
+        uom.GoldBadges,
+        uom.SilverBadges,
+        uom.BronzeBadges,
+        ras.PostsInLast90Days,
+        ras.CommentsInLast90Days,
+        ras.UpVotesGivenInLast90Days,
+        ras.DownVotesGivenInLast90Days,
+        COALESCE(ras.LastPostCreated, ras.LastCommentCreated, ras.LastVoteCast, uom.LastAccessDate) AS LastActivityDateTime,
+        -- Calculate ratio of recent activity to overall activity (NULL-safe division)
+        CASE
+            WHEN uom.TotalPostsByOwner > 0 THEN CAST(ras.PostsInLast90Days AS NUMERIC) / uom.TotalPostsByOwner
+            ELSE 0
+        END AS RecentPostActivityRatio,
+        -- Correlated subquery example: Find user's top contributing tag by total score
+        (
+            SELECT utc_sub.TagName
+            FROM UserTagContributions AS utc_sub
+            WHERE utc_sub.UserId = uom.UserId
+            ORDER BY utc_sub.TagScoreSum DESC NULLS LAST, utc_sub.PostsInTag DESC
+            LIMIT 1
+        ) AS TopContributingTagByScore,
+        -- Another correlated subquery example: Average score of posts by this user that contain their top tag.
+        (
+            SELECT AVG(pem_sub.PostScore)
+            FROM PostEngagementMetrics AS pem_sub
+            CROSS JOIN UNNEST(pem_sub.TagArray) AS sub_tag(TagName)
+            WHERE pem_sub.OwnerUserId = uom.UserId
+            AND sub_tag.TagName = (
+                SELECT utc_nested.TagName
+                FROM UserTagContributions AS utc_nested
+                WHERE utc_nested.UserId = uom.UserId
+                ORDER BY utc_nested.TagScoreSum DESC NULLS LAST, utc_nested.PostsInTag DESC
+                LIMIT 1
+            )
+        ) AS AvgScoreOfTopTagPosts
+    FROM UserOverallMetrics AS uom
+    LEFT JOIN RecentActivitySummary AS ras ON uom.UserId = ras.UserId
+)
+SELECT
+    upd.UserId,
+    upd.DisplayName,
+    upd.Reputation,
+    upd.AccountAgeDays,
+    upd.TotalPostsByOwner,
+    upd.TotalQuestions,
+    upd.TotalAnswers,
+    upd.TotalPostsScore,
+    upd.TotalUpVotesOnPosts,
+    upd.TotalDownVotesOnPosts,
+    upd.TotalEditsByOwnerOnPosts,
+    upd.TotalClosesOnPosts,
+    upd.GoldBadges,
+    upd.SilverBadges,
+    upd.BronzeBadges,
+    upd.PostsInLast90Days,
+    upd.CommentsInLast90Days,
+    upd.UpVotesGivenInLast90Days,
+    upd.DownVotesGivenInLast90Days,
+    upd.LastActivityDateTime,
+    upd.RecentPostActivityRatio,
+    upd.TopContributingTagByScore,
+    upd.AvgScoreOfTopTagPosts,
+    -- Window functions: Rank users by reputation and total post score globally
+    RANK() OVER (ORDER BY upd.Reputation DESC, upd.TotalPostsByOwner DESC) AS GlobalReputationRank,
+    DENSE_RANK() OVER (ORDER BY upd.TotalPostsScore DESC NULLS LAST) AS GlobalPostScoreRank,
+    -- Window function: Calculate average reputation in a dynamic "tier" defined by a range
+    AVG(upd.Reputation) OVER (ORDER BY upd.Reputation DESC RANGE BETWEEN 1000 PRECEDING AND 1000 FOLLOWING) AS AvgReputationInCloseRange,
+    -- Window function: Rolling sum of posts for the last 50 users based on their creation date
+    SUM(upd.TotalPostsByOwner) OVER (ORDER BY upd.CreationDate ASC ROWS BETWEEN 50 PRECEDING AND CURRENT ROW) AS RollingPostsSumLast50Users,
+    -- Complex calculation: User Engagement Index, considering upvotes, edits, recent comments relative to account age
+    CAST(upd.TotalUpVotesOnPosts + upd.TotalEditsByOwnerOnPosts + upd.CommentsInLast90Days AS NUMERIC) / (upd.AccountAgeDays + 1) AS UserEngagementIndex,
+    -- String expressions and NULL logic for Display Name categorization
+    COALESCE(
+        CASE
+            WHEN LENGTH(upd.DisplayName) < 3 THEN 'Short Name'
+            WHEN LENGTH(upd.DisplayName) > 30 THEN 'Very Long Name'
+            WHEN upd.DisplayName ILIKE '%guest%' OR upd.DisplayName ILIKE '%user%' THEN 'Generic/Default Name'
+            WHEN POSITION(' ' IN upd.DisplayName) = 0 AND LENGTH(upd.DisplayName) > 10 THEN 'Single Long Word Name'
+            ELSE 'Normal Name'
+        END,
+        'Anonymous/Missing Name'
+    ) AS DisplayNameCategory,
+    -- Lateral join to find one "interesting" post for each user, prioritizing specific criteria
+    pem_filtered.Title AS ExamplePostTitle,
+    pem_filtered.PostScore AS ExamplePostScore,
+    pem_filtered.TotalCloses AS ExamplePostCloses,
+    pem_filtered.LastNonOwnerEditorDisplayName AS ExampleLastNonOwnerEditor,
+    COALESCE(pem_filtered.IsAcceptedAnswer, FALSE) AS ExamplePostIsAcceptedAnswer,
+    -- String expression from post body for first 100 chars (if exists)
+    SUBSTRING(pem_filtered.Body, 1, 100) AS ExamplePostBodySnippet,
+    -- Correlated subquery: Get the actual close reason comment from PostHistory
+    (
+        SELECT
+            ph_inner.Comment
+        FROM PostHistory AS ph_inner
+        WHERE ph_inner.PostId = pem_filtered.PostId
+        AND ph_inner.PostHistoryTypeId = 10 -- Post Closed event
+        AND ph_inner.Comment IS NOT NULL -- Ensure comment exists for close reason
+        ORDER BY ph_inner.CreationDate DESC
+        LIMIT 1
+    ) AS LastCloseReasonComment,
+    -- Complex calculation for a post's controversy score (avoid division by zero)
+    CAST(ABS(pem_filtered.TotalUpVotesReceived - pem_filtered.TotalDownVotesReceived) AS NUMERIC) / NULLIF(pem_filtered.TotalUpVotesReceived + pem_filtered.TotalDownVotesReceived, 0) AS PostControversyScore,
+    COALESCE(t.Count, 0) AS TagTotalCount,
+    COALESCE(t.IsModeratorOnly, FALSE) AS TagIsModeratorOnly,
+    COALESCE(t.IsRequired, FALSE) AS TagIsRequired
+FROM UserPerformanceData AS upd
+LEFT JOIN LATERAL ( -- Lateral join to pick one "interesting" post per user
+    SELECT
+        pem.PostId,
+        pem.Title,
+        pem.PostScore,
+        pem.TotalCloses,
+        pem.LastNonOwnerEditorDisplayName,
+        pem.IsAcceptedAnswer,
+        pem.PostCreatedDate,
+        pem.Body,
+        pem.TotalUpVotesReceived,
+        pem.TotalDownVotesReceived
+    FROM PostEngagementMetrics AS pem
+    WHERE pem.OwnerUserId = upd.UserId
+    AND (
+        (pem.TotalCloses > 0 AND pem.TotalReopens > 0) -- Post was closed and later reopened
+        OR pem.TotalEdits > 5 -- Post has been edited many times
+        OR (pem.PostTypeId = 1 AND pem.AnswerCount > 10 AND pem.PostScore < 0) -- A question with many answers but negative score (potentially controversial)
+        OR (pem.PostTypeId = 2 AND pem.IsAcceptedAnswer AND pem.TotalEdits > 2) -- An accepted answer that was heavily edited
+    )
+    ORDER BY pem.TotalCloses DESC, pem.TotalEdits DESC, pem.PostScore DESC, pem.PostCreatedDate DESC
+    LIMIT 1
+) AS pem_filtered ON TRUE
+LEFT JOIN Tags AS t ON upd.TopContributingTagByScore = t.TagName
+WHERE
+    upd.AccountAgeDays > 365 -- Filter for users active for at least a year
+    AND upd.TotalPostsByOwner > 5 -- Users with at least 5 posts
+    AND upd.Reputation > 100 -- Users with a minimum reputation
+    AND (upd.PostsInLast90Days > 0 OR upd.CommentsInLast90Days > 0 OR upd.UpVotesGivenInLast90Days > 0) -- Recently active users
+    AND (
+        upd.TopContributingTagByScore IS NOT NULL AND upd.TopContributingTagByScore ILIKE '%sql%' -- Focus on SQL-related contributors
+        OR upd.TopContributingTagByScore ILIKE '%database%'
+    )
+    AND (
+        pem_filtered.PostId IS NOT NULL -- User has at least one "interesting" post
+        OR upd.TotalClosesOnPosts > 0 -- Or at least one post by the user has been closed
+    )
+    -- Additional complex predicate involving NULL logic and string patterns
+    AND (upd.DisplayName IS NOT NULL AND upd.DisplayName NOT ILIKE 'user%' AND upd.DisplayName NOT ILIKE 'guest%' OR upd.GoldBadges > 0)
+ORDER BY
+    upd.Reputation DESC,
+    upd.PostsInLast90Days DESC,
+    upd.TotalPostsScore DESC NULLS LAST,
+    upd.LastActivityDateTime DESC NULLS LAST
+LIMIT 100;

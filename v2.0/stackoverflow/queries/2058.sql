@@ -1,0 +1,193 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        1 AS Level
+    FROM Tags t
+    WHERE t.IsModeratorOnly = FALSE AND t.IsRequired = FALSE
+    UNION ALL
+    SELECT 
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        r.Level + 1
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r ON t2.WikiPostId = r.ExcerptPostId
+    WHERE r.Level < 3
+),
+PostsWithBadgeCount AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.PostTypeId,
+        p.CreationDate,
+        p.OwnerUserId,
+        COALESCE(b.BadgeCount, 0) AS UserBadgeCount,
+        COALESCE(p.Score, 0) AS Score,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.CreationDate DESC) AS RankWithinType
+    FROM Posts p
+    LEFT JOIN (
+        SELECT UserId, COUNT(*) AS BadgeCount
+        FROM Badges
+        WHERE Class = 1
+        GROUP BY UserId
+    ) b ON p.OwnerUserId = b.UserId
+    WHERE p.CreationDate >= DATE '2024-10-01' - INTERVAL '365' DAY
+),
+TopPostsWithComments AS (
+    SELECT
+        pwb.PostId,
+        pwb.Title,
+        pwb.PostTypeId,
+        pwb.CreationDate,
+        pwb.OwnerUserId,
+        pwb.UserBadgeCount,
+        COALESCE(c.CommentCount, 0) AS CommentCount,
+        pwb.Score,
+        pwb.RankWithinType
+    FROM PostsWithBadgeCount pwb
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS CommentCount
+        FROM Comments
+        WHERE CreationDate >= DATE '2024-10-01' - INTERVAL '365' DAY
+        GROUP BY PostId
+    ) c ON pwb.PostId = c.PostId
+    WHERE pwb.RankWithinType <= 100
+),
+AnswerStats AS (
+    SELECT
+        p.ParentId AS QuestionId,
+        COUNT(*) AS TotalAnswers,
+        AVG(p.Score) AS AvgAnswerScore,
+        MAX(p.Score) AS MaxAnswerScore,
+        SUM(CASE WHEN p.OwnerUserId IS NULL THEN 1 ELSE 0 END) AS OrphanAnswers
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+      AND p.CreationDate >= DATE '2024-10-01' - INTERVAL '365' DAY
+    GROUP BY p.ParentId
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT ph.PostId) AS EditedPostsCount,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.PostId END) AS UpVotesGiven,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.PostId END) AS DownVotesGiven,
+        COUNT(DISTINCT p.Id) AS PostsCount
+    FROM Users u
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id AND ph.CreationDate >= DATE '2024-10-01' - INTERVAL '365' DAY
+    LEFT JOIN Votes v ON v.UserId = u.Id AND v.CreationDate >= DATE '2024-10-01' - INTERVAL '365' DAY
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.CreationDate >= DATE '2024-10-01' - INTERVAL '365' DAY
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+HighImpactPosts AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        pt.Name AS PostType,
+        ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.ViewCount DESC) AS GlobalRank,
+        COALESCE(ans.TotalAnswers, 0) AS AnswerCount,
+        COALESCE(ans.AvgAnswerScore, 0) AS AvgAnswerScore
+    FROM Posts p
+    INNER JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN AnswerStats ans ON p.Id = ans.QuestionId
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= DATE '2024-10-01' - INTERVAL '365' DAY
+      AND p.Score > 10
+),
+DuplicatesAndLinked AS (
+    SELECT pl.PostId, pl.RelatedPostId, lt.Name AS LinkTypeName
+    FROM PostLinks pl
+    INNER JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    WHERE lt.Name IN ('Duplicate', 'Linked')
+),
+BadgeUserRanks AS (
+    SELECT
+        b.UserId,
+        ROW_NUMBER() OVER (ORDER BY COUNT(*) DESC) AS BadgeRank,
+        COUNT(*) AS BadgeCount,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+)
+SELECT
+    h.GlobalRank,
+    h.Id AS QuestionId,
+    COALESCE(h.Title, '(No Title)') AS QuestionTitle,
+    h.CreationDate AS QuestionCreated,
+    h.Score AS QuestionScore,
+    h.ViewCount,
+    h.AnswerCount,
+    ROUND(CAST(h.AvgAnswerScore AS numeric), 2) AS AvgAnswerScore,
+    u.DisplayName AS OwnerName,
+    u.Reputation AS OwnerReputation,
+    ua.PostsCount AS OwnerPosts,
+    ua.EditedPostsCount,
+    ua.UpVotesGiven,
+    ua.DownVotesGiven,
+    b.BadgeCount AS OwnerGoldBadges,
+    b.LastBadgeDate,
+    STRING_AGG(DISTINCT dt.Tags, ', ') FILTER (WHERE dt.Tags IS NOT NULL) AS RelatedTags,
+    STRING_AGG(DISTINCT 
+        CASE 
+            WHEN dal.LinkTypeName = 'Duplicate' THEN 'Duplicate of PostID ' || CAST(dal.RelatedPostId AS varchar)
+            WHEN dal.LinkTypeName = 'Linked' THEN 'Linked with PostID ' || CAST(dal.RelatedPostId AS varchar)
+            ELSE NULL
+        END, '; ') AS DuplicateOrLinks,
+    COUNT(DISTINCT c.Id) AS CommentCount,
+    MAX(ph_creation.CreationDate) AS LastPostHistoryEdit,
+    MIN(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) AS FirstCloseDate,
+    MAX(v_up.CreationDate) AS LastUpvoteDate,
+    MAX(v_down.CreationDate) AS LastDownvoteDate,
+    AVG(COALESCE(v_up2.BountyAmount, 0)) AS AvgBountyUp
+FROM HighImpactPosts h
+LEFT JOIN Users u ON u.Id = h.OwnerUserId
+LEFT JOIN UserActivity ua ON ua.UserId = u.Id
+LEFT JOIN BadgeUserRanks b ON b.UserId = u.Id
+LEFT JOIN LATERAL (
+    SELECT unnest(string_to_array(substr(p2.Tags, 2, length(p2.Tags) - 2), '><')) AS Tags
+    FROM Posts p2 WHERE p2.Id = h.Id
+) dt ON TRUE
+LEFT JOIN DuplicatesAndLinked dal ON dal.PostId = h.Id
+LEFT JOIN Comments c ON c.PostId = h.Id
+LEFT JOIN PostHistory ph ON ph.PostId = h.Id
+LEFT JOIN LATERAL (
+    SELECT CreationDate
+    FROM PostHistory ph2
+    WHERE ph2.PostId = h.Id AND ph2.PostHistoryTypeId IN (4,5,6)
+    ORDER BY CreationDate DESC
+    LIMIT 1
+) ph_creation ON TRUE
+LEFT JOIN Votes v_up ON v_up.PostId = h.Id AND v_up.VoteTypeId = 2
+LEFT JOIN Votes v_down ON v_down.PostId = h.Id AND v_down.VoteTypeId = 3
+LEFT JOIN Votes v_up2 ON v_up2.PostId = h.Id AND v_up2.VoteTypeId = 8
+WHERE (COALESCE(u.Reputation, 0) > 1000 OR COALESCE(b.BadgeCount, 0) >= 1)
+GROUP BY 
+    h.GlobalRank,
+    h.Id,
+    h.Title,
+    h.CreationDate,
+    h.Score,
+    h.ViewCount,
+    h.AnswerCount,
+    h.AvgAnswerScore,
+    u.DisplayName,
+    u.Reputation,
+    ua.PostsCount,
+    ua.EditedPostsCount,
+    ua.UpVotesGiven,
+    ua.DownVotesGiven,
+    b.BadgeCount,
+    b.LastBadgeDate
+ORDER BY h.GlobalRank ASC
+LIMIT 50;

@@ -1,0 +1,336 @@
+with recent_posts as (
+    select
+        p.id,
+        p.posttypeid,
+        p.creationdate,
+        p.owneruserid,
+        p.score,
+        p.viewcount,
+        p.title,
+        p.tags,
+        p.answercount,
+        p.commentcount,
+        p.closeddate,
+        coalesce(nullif(trim(p.ownerdisplayname), ''), u.displayname, '(anonymous)') as owner_name,
+        u.reputation,
+        u.location
+    from posts p
+    left join users u on u.id = p.owneruserid
+    where p.creationdate >= (select max(creationdate) - interval '90 days' from posts)
+),
+activity as (
+    select
+        ph.postid,
+        count(*) filter (where ph.posthistorytypeid in (4,5,6,7,8,9,24)) as edit_events,
+        count(*) filter (where ph.posthistorytypeid in (10,35)) as close_events,
+        count(*) filter (where ph.posthistorytypeid in (11)) as reopen_events,
+        min(ph.creationdate) filter (where ph.posthistorytypeid in (10,35)) as first_close_at,
+        max(ph.creationdate) as last_history_at
+    from posthistory ph
+    where ph.creationdate >= (select max(creationdate) - interval '90 days' from posts)
+    group by ph.postid
+),
+vote_rollup as (
+    select
+        v.postid,
+        sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+        sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+        sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started,
+        sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded,
+        min(v.creationdate) as first_vote_at,
+        max(v.creationdate) as last_vote_at
+    from votes v
+    where v.creationdate >= (select max(creationdate) - interval '90 days' from posts)
+    group by v.postid
+),
+comment_rollup as (
+    select
+        c.postid,
+        count(*) as comments,
+        max(c.score) as max_comment_score,
+        avg(c.score) filter (where c.score is not null) as avg_comment_score,
+        max(length(c.text)) as longest_comment_len
+    from comments c
+    where c.creationdate >= (select max(creationdate) - interval '90 days' from posts)
+    group by c.postid
+),
+linkage as (
+    select
+        pl.postid,
+        count(*) filter (where pl.linktypeid = 1) as linked_count,
+        count(*) filter (where pl.linktypeid = 3) as duplicate_count,
+        max(pl.creationdate) as last_link_at
+    from postlinks pl
+    group by pl.postid
+),
+tag_expansion as (
+    select
+        rp.id as postid,
+        unnest(string_to_array(substring(rp.tags, 2, length(rp.tags)-2), '><')) as tagname
+    from recent_posts rp
+    where rp.posttypeid = 1
+      and rp.tags is not null
+      and length(rp.tags) > 2
+),
+tag_stats as (
+    select
+        te.postid,
+        count(*) as tag_count,
+        string_agg(te.tagname, '|') as tag_list,
+        sum(case when t.ismoderatoronly then 1 else 0 end) as mod_only_tags,
+        sum(case when t.isrequired then 1 else 0 end) as required_tags,
+        max(t.count) as max_tag_global_count
+    from tag_expansion te
+    left join tags t on lower(t.tagname) = lower(te.tagname)
+    group by te.postid
+),
+user_badge_heat as (
+    select
+        b.userid,
+        sum(case when b.class = 1 then 5 when b.class = 2 then 2 else 1 end) as badge_weight,
+        count(*) filter (where b.tagbased = 1) as tag_badges,
+        max(b.date) as last_badge_at
+    from badges b
+    group by b.userid
+),
+question_answer_perf as (
+    select
+        q.id as question_id,
+        q.creationdate as question_created,
+        a.id as answer_id,
+        a.creationdate as answer_created,
+        extract(epoch from (a.creationdate - q.creationdate)) as secs_to_answer,
+        row_number() over (partition by q.id order by a.creationdate asc nulls last) as rn_first_answer,
+        row_number() over (partition by q.id order by a.score desc nulls last) as rn_top_scored_answer
+    from posts q
+    left join posts a on a.parentid = q.id and a.posttypeid = 2
+    where q.posttypeid = 1
+      and q.creationdate >= (select max(creationdate) - interval '90 days' from posts)
+),
+first_answer as (
+    select question_id, min(secs_to_answer) as secs_to_first_answer
+    from question_answer_perf
+    where rn_first_answer = 1
+    group by question_id
+),
+top_scored_answer as (
+    select question_id, min(answer_id) as top_answer_id
+    from question_answer_perf
+    where rn_top_scored_answer = 1
+    group by question_id
+),
+owner_activity_rank as (
+    select
+        rp.owneruserid,
+        count(*) as posts_last_90d,
+        sum(rp.score) as total_score,
+        avg(coalesce(vr.upvotes,0) - coalesce(vr.downvotes,0)) as avg_net_votes,
+        dense_rank() over (order by count(*) desc, sum(rp.score) desc) as activity_rank
+    from recent_posts rp
+    left join vote_rollup vr on vr.postid = rp.id
+    where rp.owneruserid is not null
+    group by rp.owneruserid
+),
+post_quality as (
+    select
+        rp.id,
+        rp.posttypeid,
+        coalesce(vr.upvotes,0) as upvotes,
+        coalesce(vr.downvotes,0) as downvotes,
+        coalesce(cr.comments,0) as comments,
+        coalesce(lnk.linked_count,0) as linked_count,
+        coalesce(lnk.duplicate_count,0) as duplicate_count,
+        coalesce(ts.tag_count,0) as tag_count,
+        coalesce(ts.mod_only_tags,0) as mod_only_tags,
+        coalesce(ts.required_tags,0) as required_tags,
+        case
+            when rp.viewcount is null or rp.viewcount = 0 then null
+            else cast((coalesce(vr.upvotes,0) - coalesce(vr.downvotes,0)) as numeric) / nullif(rp.viewcount,0)
+        end as net_votes_per_view,
+        case
+            when rp.posttypeid = 1 then
+                0.5 * coalesce(vr.upvotes,0)
+                - 0.7 * coalesce(vr.downvotes,0)
+                + 0.3 * coalesce(cr.comments,0)
+                + 0.2 * coalesce(lnk.linked_count,0)
+                - 1.0 * coalesce(lnk.duplicate_count,0)
+                + 0.1 * coalesce(ts.tag_count,0)
+            when rp.posttypeid = 2 then
+                0.6 * coalesce(vr.upvotes,0)
+                - 0.8 * coalesce(vr.downvotes,0)
+                + 0.1 * coalesce(cr.comments,0)
+            else
+                0.3 * coalesce(vr.upvotes,0) - 0.5 * coalesce(vr.downvotes,0)
+        end as quality_score
+    from recent_posts rp
+    left join vote_rollup vr on vr.postid = rp.id
+    left join comment_rollup cr on cr.postid = rp.id
+    left join linkage lnk on lnk.postid = rp.id
+    left join tag_stats ts on ts.postid = rp.id
+),
+dupe_clusters as (
+    select
+        rp.id as postid,
+        case
+            when lnk.duplicate_count > 0 then 'DUPLICATE'
+            when rp.closeddate is not null then 'CLOSED'
+            else 'NORMAL'
+        end as status
+    from recent_posts rp
+    left join linkage lnk on lnk.postid = rp.id
+),
+owner_enriched as (
+    select
+        rp.id,
+        rp.owneruserid,
+        rp.owner_name,
+        rp.reputation,
+        rp.location,
+        coalesce(ua.activity_rank, dense_rank() over (order by rp.reputation desc nulls last)) as owner_rank,
+        coalesce(ubh.badge_weight,0) as badge_weight,
+        coalesce(ubh.tag_badges,0) as tag_badges
+    from recent_posts rp
+    left join owner_activity_rank ua on ua.owneruserid = rp.owneruserid
+    left join user_badge_heat ubh on ubh.userid = rp.owneruserid
+),
+post_with_latency as (
+    select
+        rp.*,
+        fa.secs_to_first_answer,
+        case
+            when rp.posttypeid = 1 and rp.acceptedanswerid is not null then 1
+            when rp.posttypeid = 1 and rp.acceptedanswerid is null then 0
+            else null
+        end as has_accepted_answer_flag
+    from posts rp
+    left join first_answer fa on fa.question_id = rp.id
+),
+ranked_posts as (
+    select
+        rp.id,
+        rp.posttypeid,
+        rp.creationdate,
+        rp.title,
+        coalesce(pq.quality_score, 0) as quality_score,
+        pq.net_votes_per_view,
+        oe.owner_name,
+        oe.owner_rank,
+        oe.badge_weight,
+        oe.tag_badges,
+        dq.status,
+        ac.edit_events,
+        ac.close_events,
+        ac.reopen_events,
+        ac.first_close_at,
+        vr.first_vote_at,
+        vr.last_vote_at,
+        cr.avg_comment_score,
+        cr.longest_comment_len,
+        ts.tag_list,
+        pwl.secs_to_first_answer,
+        case
+            when pq.quality_score is null then null
+            else sum(pq.quality_score) over (order by rp.creationdate rows between unbounded preceding and current row)
+        end as running_quality_sum,
+        row_number() over (
+            partition by dq.status
+            order by pq.quality_score desc nulls last, rp.creationdate desc
+        ) as status_rank,
+        percent_rank() over (order by pq.quality_score nulls first) as quality_percentile
+    from recent_posts rp
+    left join post_quality pq on pq.id = rp.id
+    left join owner_enriched oe on oe.id = rp.id
+    left join dupe_clusters dq on dq.postid = rp.id
+    left join activity ac on ac.postid = rp.id
+    left join vote_rollup vr on vr.postid = rp.id
+    left join comment_rollup cr on cr.postid = rp.id
+    left join tag_stats ts on ts.postid = rp.id
+    left join post_with_latency pwl on pwl.id = rp.id
+),
+top_and_bottom as (
+    select id, 'TOP' as bucket from ranked_posts where quality_percentile >= 0.95
+    union all
+    select id, 'BOTTOM' as bucket from ranked_posts where quality_percentile <= 0.05
+),
+bench_base as (
+    select
+        rp.id,
+        rp.posttypeid,
+        rp.title,
+        rp.creationdate,
+        rp.owner_name,
+        rp.owner_rank,
+        rp.badge_weight,
+        rp.quality_score,
+        rp.net_votes_per_view,
+        rp.status,
+        rp.status_rank,
+        rp.edit_events,
+        rp.close_events,
+        rp.reopen_events,
+        rp.first_close_at,
+        rp.first_vote_at,
+        rp.last_vote_at,
+        rp.avg_comment_score,
+        rp.longest_comment_len,
+        rp.tag_list,
+        rp.secs_to_first_answer,
+        tb.bucket
+    from ranked_posts rp
+    left join top_and_bottom tb on tb.id = rp.id
+)
+select
+    bb.id,
+    bb.posttypeid,
+    coalesce(nullif(bb.title, ''), concat('post-', cast(bb.id as varchar))) as title_fallback,
+    bb.creationdate,
+    bb.owner_name,
+    bb.owner_rank,
+    bb.badge_weight,
+    round(cast(bb.quality_score as numeric), 3) as quality_score,
+    round(cast(coalesce(bb.net_votes_per_view,0) as numeric), 6) as net_votes_per_view,
+    bb.status,
+    bb.status_rank,
+    bb.edit_events,
+    bb.close_events,
+    bb.reopen_events,
+    bb.first_close_at,
+    bb.first_vote_at,
+    bb.last_vote_at,
+    round(cast(coalesce(bb.avg_comment_score,0) as numeric), 3) as avg_comment_score,
+    bb.longest_comment_len,
+    coalesce(bb.tag_list, '') as tag_list,
+    bb.secs_to_first_answer,
+    coalesce(bb.bucket, case when bb.status = 'DUPLICATE' then 'BOTTOM' else 'MIDDLE' end) as bucket,
+    case
+        when bb.posttypeid = 1 and bb.secs_to_first_answer is not null then
+            case
+                when bb.secs_to_first_answer <= 3600 then 'FAST'
+                when bb.secs_to_first_answer <= 86400 then 'MEDIUM'
+                else 'SLOW'
+            end
+        else 'N/A'
+    end as answer_latency_bucket
+from bench_base bb
+where (
+        bb.status <> 'CLOSED'
+        or not exists (
+            select 1
+            from posthistory ph
+            where ph.postid = bb.id
+              and ph.posthistorytypeid in (11) -- reopened
+        )
+      )
+  and (
+        bb.posttypeid in (1,2)
+        or bb.badge_weight > (
+            select avg(coalesce(ubh.badge_weight,0))
+            from user_badge_heat ubh
+        )
+      )
+order by
+    coalesce(bb.bucket, 'MIDDLE') asc,
+    bb.status_rank asc nulls last,
+    bb.quality_score desc nulls last,
+    bb.creationdate desc
+limit 500;

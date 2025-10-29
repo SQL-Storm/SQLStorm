@@ -1,0 +1,45 @@
+-- {"query": "6759.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-micro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 618} 
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id ELSE NULL END) AS TotalQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id ELSE NULL END) AS TotalAnswers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 4 THEN p.Id ELSE NULL END) AS TotalTagWikiExcerpts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 5 THEN p.Id ELSE NULL END) AS TotalTagWikis,
+    MAX(p.Score) AS HighestScoredPost,
+    MIN(p.Score) AS LowestScoredPost,
+    AVG(p.Score) AS AverageScore,
+    SUM(p.ViewCount) AS TotalViews,
+    SUM(p.AnswerCount) AS TotalAnswersGiven,
+    SUM(v.BountyAmount) AS TotalBountyAmount,
+    SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS TotalClosedPosts,
+    SUM(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS TotalReopenedPosts,
+    SUM(CASE WHEN ph.PostHistoryTypeId = 12 THEN 1 ELSE 0 END) AS TotalDeletedPosts,
+    SUBSTRING_INDEX(GROUP_CONCAT(DISTINCT CASE WHEN t.TagName IS NOT NULL THEN t.TagName ELSE 'NoTag' END ORDER BY t.TagName ASC SEPARATOR ', '), ',', 10) AS TopTenTags,
+    STRING_AGG(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN p.Title ELSE NULL END, ', ') AS DuplicatePosts,
+    STRING_AGG(DISTINCT CASE WHEN pl.LinkTypeId = 1 THEN p.Title ELSE NULL END, ', ') AS LinkedPosts
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId AND v.VoteTypeId = 8
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN 
+    Tags t ON p.Id = t.ExcerptPostId
+LEFT JOIN 
+    PostLinks pl ON p.Id = pl.PostId
+LEFT JOIN 
+    PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+WHERE 
+    u.Reputation > 1000
+    AND p.CreationDate >= DATE_SUB(cast('2024-10-01 12:34:56' as timestamp), INTERVAL 1 YEAR)
+GROUP BY 
+    u.Id
+HAVING 
+    COUNT(DISTINCT p.Id) > 5
+ORDER BY 
+    TotalViews DESC, 
+    HighestScoredPost DESC;

@@ -1,0 +1,227 @@
+-- {"query": "2902.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1794} 
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.CreationDate,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsAsked,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersGiven,
+        coalesce(sum(p.Score), 0) as TotalPostScore,
+        count(distinct c.Id) as CommentsMade,
+        row_number() over (partition by u.Id order by p.CreationDate desc nulls last) as LastActivityRank
+    from
+        Users u
+        left join Posts p on p.OwnerUserId = u.Id
+        left join Comments c on c.UserId = u.Id
+    group by
+        u.Id, u.DisplayName, u.CreationDate
+),
+ActiveBadges as (
+    select
+        b.UserId,
+        b.Name as BadgeName,
+        b.Class,
+        rank() over (partition by b.UserId order by b.Date desc) as BadgeRank
+    from
+        Badges b
+    where
+        b.Class in (1, 2) -- gold or silver badges only
+),
+TopBadgesPerUser as (
+    select
+        UserId,
+        BadgeName,
+        Class
+    from
+        ActiveBadges
+    where
+        BadgeRank = 1
+),
+DuplicateLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate,
+        p1.Title as PostTitle,
+        p2.Title as RelatedPostTitle,
+        u.DisplayName as OwnerDisplayName
+    from
+        PostLinks pl
+        inner join Posts p1 on p1.Id = pl.PostId
+        inner join Posts p2 on p2.Id = pl.RelatedPostId
+        left join Users u on u.Id = p1.OwnerUserId
+    where
+        pl.LinkTypeId = 3 -- duplicates only
+),
+TaggedQuestions as (
+    select
+        p.Id as QuestionId,
+        p.Title,
+        p.Tags,
+        unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) as SingleTag,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.CreationDate
+    from
+        Posts p
+    where
+        p.PostTypeId = 1
+),
+TagPopularity as (
+    select
+        tq.SingleTag,
+        count(1) as QuestionsCount,
+        avg(tq.Score) as AvgScore,
+        sum(tq.ViewCount) as TotalViews,
+        percent_rank() over (order by count(1) desc) as PopularityRank
+    from
+        TaggedQuestions tq
+    group by
+        tq.SingleTag
+),
+TopTags as (
+    select
+        SingleTag
+    from
+        TagPopularity
+    where
+        PopularityRank > 0.75
+),
+TopTagQuestions as (
+    select
+        tq.QuestionId,
+        tq.Title,
+        tq.SingleTag,
+        tq.Score,
+        tq.ViewCount,
+        tq.AnswerCount,
+        row_number() over (partition by tq.SingleTag order by tq.Score desc, tq.ViewCount desc) as TagTopRank
+    from
+        TaggedQuestions tq
+        join TopTags t on t.SingleTag = tq.SingleTag
+),
+RecentEdits as (
+    select
+        ph.PostId,
+        ph.UserId,
+        u.DisplayName,
+        ph.PostHistoryTypeId,
+        pht.Name as EditType,
+        ph.CreationDate,
+        ph.Comment,
+        lag(ph.CreationDate) over (partition by ph.PostId order by ph.CreationDate) as PreviousEditDate,
+        coalesce(extract(epoch from ph.CreationDate - lag(ph.CreationDate) over (partition by ph.PostId order by ph.CreationDate)), 0) as EditIntervalSeconds
+    from
+        PostHistory ph
+        join PostHistoryTypes pht on pht.Id = ph.PostHistoryTypeId
+        left join Users u on u.Id = ph.UserId
+    where
+        ph.PostHistoryTypeId in (4,5,6) -- edits of Title, Body or Tags
+),
+FrequentEditors as (
+    select
+        UserId,
+        count(distinct PostId) as PostsEdited,
+        count(1) as TotalEdits,
+        avg(EditIntervalSeconds) as AvgEditIntervalSeconds
+    from
+        RecentEdits
+    group by
+        UserId
+    having
+        count(1) > 10
+),
+UserActivitySummary as (
+    select
+        rua.UserId,
+        rua.DisplayName,
+        rua.CreationDate,
+        rua.QuestionsAsked,
+        rua.AnswersGiven,
+        rua.TotalPostScore,
+        rua.CommentsMade,
+        fb.PostsEdited,
+        fb.TotalEdits,
+        fb.AvgEditIntervalSeconds,
+        tb.BadgeName as LatestBadgeName,
+        tb.Class as LatestBadgeClass
+    from
+        RecursiveUserActivity rua
+        left join FrequentEditors fb on fb.UserId = rua.UserId
+        left join TopBadgesPerUser tb on tb.UserId = rua.UserId
+),
+HighImpactAnswers as (
+    select
+        p.Id as AnswerId,
+        p.ParentId as QuestionId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        u.DisplayName as OwnerName,
+        rank() over (partition by p.ParentId order by p.Score desc, p.CreationDate asc) as AnswerRankByScore
+    from
+        Posts p
+        left join Users u on u.Id = p.OwnerUserId
+    where
+        p.PostTypeId = 2
+),
+AcceptedAnswersInfo as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.AcceptedAnswerId,
+        a.Score as AcceptedAnswerScore,
+        a.ViewCount as AcceptedAnswerViewCount,
+        a.OwnerName as AcceptedAnswerOwner,
+        a.CreationDate as AcceptedAnswerCreationDate
+    from
+        Posts q
+        left join HighImpactAnswers a on a.AnswerId = q.AcceptedAnswerId
+    where
+        q.PostTypeId = 1
+        and q.AcceptedAnswerId is not null
+)
+select
+    uas.UserId,
+    uas.DisplayName,
+    uas.CreationDate,
+    coalesce(uas.QuestionsAsked, 0) as QuestionsAsked,
+    coalesce(uas.AnswersGiven, 0) as AnswersGiven,
+    coalesce(uas.TotalPostScore, 0) as TotalPostScore,
+    coalesce(uas.CommentsMade, 0) as CommentsMade,
+    coalesce(uas.PostsEdited, 0) as PostsEdited,
+    coalesce(uas.TotalEdits, 0) as TotalEdits,
+    round(uas.AvgEditIntervalSeconds,2) as AvgEditIntervalSeconds,
+    uas.LatestBadgeName,
+    uas.LatestBadgeClass,
+    count(distinct dl.PostId) as DuplicateLinksCount,
+    max(dl.CreationDate) as LastDuplicateLinkDate,
+    string_agg(distinct dl.PostTitle || ' -> ' || dl.RelatedPostTitle, '; ') as DuplicatePostPairs,
+    json_agg(json_build_object(
+        'Tag', tt.SingleTag,
+        'TopQuestionTitle', tqs.Title,
+        'Score', tqs.Score,
+        'Views', tqs.ViewCount
+    )) filter (where tt.SingleTag is not null) as TopTagQuestions,
+    (select count(1)
+     from AcceptedAnswersInfo aai
+     where aai.AcceptedAnswerOwner = uas.DisplayName
+       and aai.AcceptedAnswerScore > 10
+    ) as HighScoringAcceptedAnswers
+from
+    UserActivitySummary uas
+    left join DuplicateLinks dl on dl.OwnerDisplayName = uas.DisplayName
+    left join TopTags tt on true
+    left join TopTagQuestions tqs on tqs.SingleTag = tt.SingleTag
+group by
+    uas.UserId, uas.DisplayName, uas.CreationDate,
+    uas.QuestionsAsked, uas.AnswersGiven, uas.TotalPostScore, uas.CommentsMade,
+    uas.PostsEdited, uas.TotalEdits, uas.AvgEditIntervalSeconds,
+    uas.LatestBadgeName, uas.LatestBadgeClass
+order by
+    HighScoringAcceptedAnswers desc nulls last,
+    DuplicateLinksCount desc nulls last,
+    uas.TotalPostScore desc
+limit 100;

@@ -1,0 +1,130 @@
+-- {"query": "3342.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2360} 
+WITH recent_posts AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.CreationDate,
+        COALESCE(p.Tags,'') AS Tags
+    FROM Posts p
+    WHERE p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '365 days'
+),
+post_tags AS (
+    SELECT
+        rp.OwnerUserId,
+        UNNEST(
+            STRING_TO_ARRAY(
+                TRIM(BOTH '<>' FROM rp.Tags),
+                '><'
+            )
+        ) AS Tag
+    FROM recent_posts rp
+    WHERE rp.Tags <> ''
+),
+user_agg AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1)          AS QuestionCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2)          AS AnswerCount,
+        COALESCE(SUM(p.Score),0)                                      AS TotalScore,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 2)                  AS AvgAnswerScore,
+        MAX(p.CreationDate)                                           AS LastPostDate,
+        COUNT(DISTINCT c.Id)                                          AS CommentCount,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2)          AS UpVoteCount,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1)               AS GoldBadgeCount,
+        MAX(b.Date)                                                   AS LatestBadgeDate,
+        COALESCE((
+            SELECT MAX(ph.CreationDate)
+            FROM PostHistory ph
+            WHERE ph.PostId IN (
+                SELECT Id FROM Posts WHERE OwnerUserId = u.Id
+            )
+            AND ph.PostHistoryTypeId = 10
+        ), NULL)                                                      AS LastCloseDate
+    FROM Users u
+    LEFT JOIN Posts   p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes    v ON v.UserId = u.Id
+    LEFT JOIN Badges   b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+tag_agg AS (
+    SELECT
+        pt.OwnerUserId,
+        pt.Tag,
+        COUNT(*)                                           AS TagUseCount,
+        ROW_NUMBER() OVER (PARTITION BY pt.OwnerUserId
+                           ORDER BY COUNT(*) DESC)        AS TagRank
+    FROM post_tags pt
+    GROUP BY pt.OwnerUserId, pt.Tag
+),
+top_user_tags AS (
+    SELECT
+        ua.UserId,
+        ua.DisplayName,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.TotalScore,
+        ua.CommentCount,
+        ua.GoldBadgeCount,
+        ua.LastPostDate,
+        ua.LastCloseDate,
+        STRING_AGG(t.Tag, ', ') FILTER (WHERE t.TagRank <= 3) AS Top3Tags
+    FROM user_agg ua
+    LEFT JOIN tag_agg t ON t.OwnerUserId = ua.UserId
+    GROUP BY
+        ua.UserId, ua.DisplayName, ua.QuestionCount, ua.AnswerCount,
+        ua.TotalScore, ua.CommentCount, ua.GoldBadgeCount,
+        ua.LastPostDate, ua.LastCloseDate
+),
+top_commenters AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(c.Id)                                              AS TotalComments,
+        MAX(c.CreationDate)                                      AS LastCommentDate,
+        SUM(COALESCE(c.Score,0))                                 AS CommentScoreSum
+    FROM Users u
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+    HAVING COUNT(c.Id) > 0
+)
+SELECT
+    UserId,
+    DisplayName,
+    QuestionCount,
+    AnswerCount,
+    TotalScore,
+    CommentCount,
+    GoldBadgeCount,
+    LastPostDate,
+    LastCloseDate,
+    Top3Tags
+FROM top_user_tags
+WHERE (TotalScore > 0 OR GoldBadgeCount > 0)
+
+UNION ALL
+
+SELECT
+    UserId,
+    DisplayName,
+    NULL               AS QuestionCount,
+    NULL               AS AnswerCount,
+    NULL               AS TotalScore,
+    TotalComments      AS CommentCount,
+    NULL               AS GoldBadgeCount,
+    LastCommentDate    AS LastPostDate,
+    NULL               AS LastCloseDate,
+    NULL               AS Top3Tags
+FROM top_commenters
+WHERE TotalComments > (
+    SELECT PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY TotalComments)
+    FROM top_commenters
+)
+
+ORDER BY
+    TotalScore DESC NULLS LAST,
+    CommentCount DESC NULLS LAST
+LIMIT 100;

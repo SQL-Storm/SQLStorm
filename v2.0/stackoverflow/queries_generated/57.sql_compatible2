@@ -1,0 +1,219 @@
+select
+    ur.user_id,
+    ur.displayname,
+    ur.reputation,
+    ur.cohort_month,
+    ur.q_count,
+    ur.a_count,
+    ur.total_post_score,
+    ur.total_views,
+    ur.closed_q_count,
+    ur.up_all,
+    ur.down_all,
+    ur.fav_all,
+    ur.bounty_all,
+    ur.up_on_answers,
+    ur.up_on_questions,
+    ur.comment_count,
+    ur.comment_score,
+    ur.badge_count,
+    ur.gold_count,
+    ur.silver_count,
+    ur.bronze_count,
+    ur.latest_post_date,
+    ur.earliest_post_date,
+    ur.posts_30d,
+    ur.posts_90d,
+    ur.answers_given,
+    ur.answers_accepted,
+    ur.acceptance_ratio,
+    ur.next_rep,
+    ur.prev_rep,
+    coalesce(uqs.avg_q_score,0) as avg_q_score,
+    coalesce(uqs.avg_q_vpd,0) as avg_q_vpd,
+    coalesce(uqs.avg_q_spd,0) as avg_q_spd,
+    coalesce(uqs.acceptance_rate,0) as q_acceptance_rate,
+    coalesce(uqs.avg_title_penalty,0) as avg_title_penalty,
+    coalesce(uqs.dup_q_count,0) as dup_q_count,
+    case
+      when coalesce(ur.a_count,0) + coalesce(ur.q_count,0) = 0 then 0
+      else round(
+        0.30 * ln(1 + greatest(0, ur.total_post_score))
+        + 0.20 * ln(1 + greatest(0, ur.total_views))
+        + 0.15 * ln(1 + greatest(0, ur.up_all - ur.down_all))
+        + 0.10 * ln(1 + greatest(0, ur.badge_count * 10 + ur.gold_count * 50 + ur.silver_count * 20 + ur.bronze_count * 5))
+        + 0.10 * ln(1 + greatest(0, ur.comment_score + ur.comment_count))
+        + 0.05 * ln(1 + greatest(0, ur.answers_accepted))
+        + 0.05 * ln(1 + greatest(0, coalesce(uqs.avg_q_score,0) * 10))
+        - 0.05 * greatest(0, coalesce(uqs.avg_title_penalty,0))
+      , 6)
+    end as engagement_score
+  from user_ranked ur
+  left join user_quality_score uqs on uqs.user_id = ur.user_id
+),
+ranked as (
+  select
+    rc.user_id,
+    rc.displayname,
+    rc.reputation,
+    rc.cohort_month,
+    rc.q_count,
+    rc.a_count,
+    rc.total_post_score,
+    rc.total_views,
+    rc.closed_q_count,
+    rc.up_all,
+    rc.down_all,
+    rc.fav_all,
+    rc.bounty_all,
+    rc.up_on_answers,
+    rc.up_on_questions,
+    rc.comment_count,
+    rc.comment_score,
+    rc.badge_count,
+    rc.gold_count,
+    rc.silver_count,
+    rc.bronze_count,
+    rc.latest_post_date,
+    rc.earliest_post_date,
+    rc.posts_30d,
+    rc.posts_90d,
+    rc.answers_given,
+    rc.answers_accepted,
+    rc.acceptance_ratio,
+    rc.next_rep,
+    rc.prev_rep,
+    rc.avg_q_score,
+    rc.avg_q_vpd,
+    rc.avg_q_spd,
+    rc.q_acceptance_rate,
+    rc.avg_title_penalty,
+    rc.dup_q_count,
+    rc.engagement_score,
+    dense_rank() over (order by rc.engagement_score desc, rc.reputation desc, rc.up_all desc) as rank_dense,
+    percent_rank() over (order by rc.engagement_score) as pr_engagement,
+    ntile(20) over (order by rc.engagement_score desc) as ventile
+  from rank_calc rc
+),
+saves as (
+  select
+    v.userid as user_id,
+    count(*) filter (where v.votetypeid = 5) as saves_count
+  from votes v
+  group by v.userid
+),
+finalized as (
+  select
+    r.user_id,
+    r.displayname,
+    r.reputation,
+    r.cohort_month,
+    r.q_count,
+    r.a_count,
+    r.total_post_score,
+    r.total_views,
+    r.closed_q_count,
+    r.up_all,
+    r.down_all,
+    r.fav_all,
+    r.bounty_all,
+    r.up_on_answers,
+    r.up_on_questions,
+    r.comment_count,
+    r.comment_score,
+    r.badge_count,
+    r.gold_count,
+    r.silver_count,
+    r.bronze_count,
+    r.latest_post_date,
+    r.earliest_post_date,
+    r.posts_30d,
+    r.posts_90d,
+    r.answers_given,
+    r.answers_accepted,
+    r.acceptance_ratio,
+    r.avg_q_score,
+    r.avg_q_vpd,
+    r.avg_q_spd,
+    r.q_acceptance_rate,
+    r.avg_title_penalty,
+    r.dup_q_count,
+    r.engagement_score,
+    r.rank_dense,
+    r.pr_engagement,
+    r.ventile,
+    coalesce(s.saves_count,0) as saves_count,
+    case
+      when r.next_rep is null then null
+      else r.reputation - r.next_rep
+    end as gap_to_next,
+    case
+      when r.prev_rep is null then null
+      else r.prev_rep - r.reputation
+    end as gap_to_prev
+  from ranked r
+  left join saves s on s.user_id = r.user_id
+)
+select
+  f.user_id,
+  f.displayname,
+  f.reputation,
+  f.cohort_month,
+  f.rank_dense as engagement_rank,
+  f.engagement_score,
+  f.pr_engagement,
+  f.ventile,
+  f.q_count,
+  f.a_count,
+  f.total_post_score,
+  f.total_views,
+  f.up_all,
+  f.down_all,
+  f.fav_all,
+  f.saves_count,
+  f.bounty_all,
+  f.badge_count,
+  f.gold_count,
+  f.silver_count,
+  f.bronze_count,
+  f.answers_given,
+  f.answers_accepted,
+  round(cast(f.acceptance_ratio as numeric), 4) as acceptance_ratio,
+  round(cast(f.q_acceptance_rate as numeric), 4) as q_acceptance_rate,
+  round(cast(f.avg_q_score as numeric), 4) as avg_q_score,
+  round(cast(f.avg_q_vpd as numeric), 4) as avg_q_views_per_day,
+  round(cast(f.avg_q_spd as numeric), 4) as avg_q_score_per_day,
+  f.avg_title_penalty,
+  f.dup_q_count,
+  f.posts_30d,
+  f.posts_90d,
+  f.latest_post_date,
+  f.earliest_post_date,
+  f.gap_to_next,
+  f.gap_to_prev,
+  case
+    when f.engagement_score >= percentile_disc(0.90) within group (order by f.engagement_score) over ()
+      then 'Top 10%'
+    when f.engagement_score >= percentile_disc(0.75) within group (order by f.engagement_score) over ()
+      then 'Top 25%'
+    when f.engagement_score >= percentile_disc(0.50) within group (order by f.engagement_score) over ()
+      then 'Top 50%'
+    else 'Lower 50%'
+  end as percentile_bucket
+from finalized f
+where (
+    f.engagement_score >= (
+      select avg(engagement_score) + stddev_pop(engagement_score)
+      from finalized
+    )
+    or (f.q_count + f.a_count) >= (
+      select percentile_disc(0.9) within group (order by (q_count + a_count))
+      from finalized
+    )
+)
+and (
+  f.latest_post_date is null
+  or f.latest_post_date >= (timestamp '2024-10-01 12:34:56') - interval '365 days'
+)
+order by f.engagement_score desc, f.reputation desc, f.user_id
+limit 500;

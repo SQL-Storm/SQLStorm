@@ -1,0 +1,227 @@
+-- {"query": "1053.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3580} 
+
+WITH HotQuestionsByActivity AS (
+    -- Select questions created in the last 6 months with high views, score, and answer count.
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.AcceptedAnswerId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.Body,
+        p.OwnerUserId,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+        p.ClosedDate,
+        'Activity' AS SourceType -- Differentiate source for UNION ALL
+    FROM Posts p
+    WHERE p.PostTypeId = 1 -- Only questions
+      AND p.CreationDate >= NOW() - INTERVAL '6 months'
+      AND p.ViewCount > 5000
+      AND p.Score > 20
+      AND p.AnswerCount > 5
+),
+HotQuestionsByUserEngagement AS (
+    -- Select questions owned by users with high reputation and many recent upvotes, regardless of post's own view/score.
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.AcceptedAnswerId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.Body,
+        p.OwnerUserId,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+        p.ClosedDate,
+        'Engagement' AS SourceType
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= NOW() - INTERVAL '1 year' -- Broader date range for user-centric view
+      AND u.Reputation > 50000
+      AND u.UpVotes > 10000
+      -- Correlated subquery: check if the user has at least 3 gold badges
+      AND EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1 HAVING COUNT(b.Id) >= 3)
+),
+CombinedHotQuestions AS (
+    -- Combine questions from both criteria using UNION ALL
+    SELECT * FROM HotQuestionsByActivity
+    UNION ALL
+    SELECT * FROM HotQuestionsByUserEngagement
+),
+DistinctCombinedHotQuestions AS (
+    -- Remove potential duplicates resulting from UNION ALL
+    SELECT DISTINCT
+        PostId, PostTypeId, AcceptedAnswerId, PostCreationDate, PostScore, ViewCount, Body, OwnerUserId,
+        LastEditDate, LastActivityDate, Title, Tags, AnswerCount, CommentCount, FavoriteCount, ClosedDate
+    FROM CombinedHotQuestions
+),
+UserMetrics AS (
+    -- Calculate detailed user metrics for owners of the combined hot questions.
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.DisplayName,
+        u.LastAccessDate,
+        u.WebsiteUrl,
+        u.Location,
+        u.UpVotes,
+        u.DownVotes,
+        u.Views AS UserProfileViews,
+        COUNT(b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        COUNT(p_owned_by_u.Id) AS TotalPostsOwned, -- Total posts (questions/answers) owned by this user
+        -- Correlated subquery to find the average score of answers posted by this user related to hot questions.
+        (SELECT AVG(ans.Score)
+         FROM Posts ans
+         WHERE ans.ParentId IN (SELECT dhq.PostId FROM DistinctCombinedHotQuestions dhq WHERE dhq.OwnerUserId = u.Id)
+           AND ans.PostTypeId = 2
+           AND ans.OwnerUserId = u.Id
+        ) AS AvgAnswerScoreForHotQuestions
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Posts p_owned_by_u ON u.Id = p_owned_by_u.OwnerUserId
+    WHERE u.Id IN (SELECT DISTINCT OwnerUserId FROM DistinctCombinedHotQuestions)
+    GROUP BY u.Id, u.Reputation, u.CreationDate, u.DisplayName, u.LastAccessDate, u.WebsiteUrl, u.Location, u.UpVotes, u.DownVotes, u.Views
+    HAVING u.Reputation > 1000 -- Filter for sufficiently experienced users
+),
+PostHistoryDetails AS (
+    -- Aggregate post history details and identify the last body editor for each post.
+    SELECT
+        ph.PostId,
+        COUNT(ph.Id) AS TotalHistoryEvents,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS TotalEdits,
+        MAX(ph.CreationDate) AS LastHistoryEventDate,
+        -- Correlated subquery to find the UserId of the most recent body editor.
+        (SELECT ph_inner.UserId
+         FROM PostHistory ph_inner
+         WHERE ph_inner.PostId = ph.PostId
+           AND ph_inner.PostHistoryTypeId = 5 -- Body Edit
+         ORDER BY ph_inner.CreationDate DESC
+         LIMIT 1
+        ) AS LastBodyEditorUserId
+    FROM PostHistory ph
+    WHERE ph.PostId IN (SELECT PostId FROM DistinctCombinedHotQuestions)
+    GROUP BY ph.PostId
+),
+PostAverageEventInterval AS (
+    -- Calculate the average time interval (in seconds) between consecutive post history events for each post.
+    SELECT
+        ph.PostId,
+        AVG(EXTRACT(EPOCH FROM (ph.CreationDate - LAG(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate)))) AS AvgEventIntervalSeconds
+    FROM PostHistory ph
+    WHERE ph.PostId IN (SELECT PostId FROM DistinctCombinedHotQuestions)
+    GROUP BY ph.PostId
+),
+PostTagStats AS (
+    -- Analyze tag-specific metrics for the distinct combined hot questions.
+    SELECT
+        dhq.PostId,
+        tag_unnested.tag_name_raw AS TagName,
+        t.Count AS GlobalTagCount,
+        t.IsModeratorOnly,
+        -- Correlated subquery to count other hot questions sharing the same tag.
+        (SELECT COUNT(DISTINCT other_dhq.PostId)
+         FROM DistinctCombinedHotQuestions other_dhq
+         CROSS JOIN LATERAL UNNEST(string_to_array(SUBSTRING(other_dhq.Tags, 2, LENGTH(other_dhq.Tags) - 2), '><')) AS other_tags(tag_name_raw)
+         WHERE LOWER(other_tags.tag_name_raw) = LOWER(tag_unnested.tag_name_raw)
+           AND other_dhq.PostId <> dhq.PostId
+        ) AS HotQuestionsWithTagCount
+    FROM DistinctCombinedHotQuestions dhq
+    CROSS JOIN LATERAL UNNEST(string_to_array(SUBSTRING(dhq.Tags, 2, LENGTH(dhq.Tags) - 2), '><')) AS tag_unnested(tag_name_raw)
+    JOIN Tags t ON LOWER(t.TagName) = LOWER(tag_unnested.tag_name_raw)
+)
+-- Final SELECT statement combining all CTEs and applying complex logic.
+SELECT
+    dhq.PostId,
+    dhq.Title,
+    dhq.PostCreationDate,
+    dhq.PostScore,
+    dhq.ViewCount,
+    um.DisplayName AS OwnerDisplayName,
+    um.Reputation AS OwnerReputation,
+    um.TotalBadges AS OwnerTotalBadges,
+    COALESCE(um.AvgAnswerScoreForHotQuestions, 0) AS AvgOwnerAnswerScoreForHotQuestions, -- NULL logic
+    phd.TotalEdits,
+    phd.LastHistoryEventDate,
+    -- Correlated subquery to count initial creation events only.
+    (SELECT COUNT(ph_init.Id)
+     FROM PostHistory ph_init
+     WHERE ph_init.PostId = dhq.PostId
+       AND ph_init.PostHistoryTypeId IN (1, 2, 3)
+    ) AS InitialCreationEventsCount,
+    pts.TagName AS PrimaryTag,
+    pts.GlobalTagCount,
+    pts.HotQuestionsWithTagCount,
+    -- Complex calculated metric: "Engagement Index" for overall post relevance.
+    (dhq.PostScore * 0.75 + dhq.ViewCount / 1000.0 + dhq.AnswerCount * 2.0 + dhq.FavoriteCount * 1.5
+     + (EXTRACT(EPOCH FROM (NOW() - dhq.PostCreationDate)) / 86400.0) * 0.1 -- Age factor
+     + (SELECT COALESCE(SUM(v.BountyAmount), 0) FROM Votes v WHERE v.PostId = dhq.PostId AND v.VoteTypeId = 8) * 5 -- Bounty factor
+    ) AS EngagementIndex,
+    -- String expression: Extract first 100 characters of the body, or 'N/A' if null/empty, then concatenate with tag info.
+    COALESCE(SUBSTRING(dhq.Body, 1, 100), 'N/A') || ' ... [Tags: ' || dhq.Tags || ']' AS BodyPreviewWithTags,
+    -- NULL logic and conditional expression for accepted answer status.
+    CASE
+        WHEN dhq.AcceptedAnswerId IS NOT NULL THEN
+            (SELECT CASE WHEN p_acc.Score > COALESCE(um.AvgAnswerScoreForHotQuestions, 0) THEN 'HighScoreAccepted' ELSE 'Accepted' END
+             FROM Posts p_acc WHERE p_acc.Id = dhq.AcceptedAnswerId)
+        ELSE 'NoAcceptedAnswer'
+    END AS AcceptedAnswerStatus,
+    -- Window function: NTILE to categorize questions into 5 tiers based on EngagementIndex within their primary tag.
+    NTILE(5) OVER (PARTITION BY pts.TagName ORDER BY (dhq.PostScore * 0.75 + dhq.ViewCount / 1000.0 + dhq.AnswerCount * 2.0 + dhq.FavoriteCount * 1.5 + (EXTRACT(EPOCH FROM (NOW() - dhq.PostCreationDate)) / 86400.0) * 0.1 + (SELECT COALESCE(SUM(v.BountyAmount), 0) FROM Votes v WHERE v.PostId = dhq.PostId AND v.VoteTypeId = 8) * 5) DESC) AS EngagementTierByTag,
+    -- Join result from PostAverageEventInterval CTE for average event interval.
+    COALESCE(paei.AvgEventIntervalSeconds, 0) AS AvgEventIntervalSeconds,
+    -- Complex NULL handling for editor information, displaying 'Community/Unknown' if no editor.
+    COALESCE(ume.DisplayName, 'Community/Unknown') AS LastBodyEditorName,
+    NULLIF(ume.Reputation, 0) AS LastBodyEditorReputation,
+    -- Boolean check for specific body content (e.g., containing 'json' keyword case-insensitively).
+    (dhq.Body ILIKE '%json%') AS ContainsJsonBody,
+    -- Correlated subquery to get the total comment count for the post.
+    (SELECT COUNT(c.Id) FROM Comments c WHERE c.PostId = dhq.PostId) AS TotalCommentCount,
+    -- Boolean flag for posts that are closed and also have duplicate links.
+    dhq.ClosedDate IS NOT NULL AND EXISTS (SELECT 1 FROM PostLinks pl_check WHERE pl_check.PostId = dhq.PostId AND pl_check.LinkTypeId = 3) AS IsClosedDuplicate,
+    -- Window function: Calculate the difference in days between the post's creation and owner's creation date.
+    EXTRACT(DAY FROM (dhq.PostCreationDate - um.UserCreationDate)) AS PostOwnerAgeAtCreationDays,
+    -- String expression: Cleaned and truncated location of the owner, defaulting to 'Earth' if null.
+    TRIM(SUBSTRING(COALESCE(um.Location, 'Earth'), 1, 20)) AS OwnerLocationSnippet,
+    -- Complex NULL logic and type casting for score to view ratio, avoiding division by zero.
+    NULLIF(dhq.PostScore, 0)::numeric / NULLIF(dhq.ViewCount, 0)::numeric AS ScorePerViewRatio
+FROM DistinctCombinedHotQuestions dhq
+JOIN UserMetrics um ON dhq.OwnerUserId = um.UserId
+LEFT JOIN PostHistoryDetails phd ON dhq.PostId = phd.PostId
+LEFT JOIN PostAverageEventInterval paei ON dhq.PostId = paei.PostId
+LEFT JOIN PostTagStats pts ON dhq.PostId = pts.PostId
+LEFT JOIN Users ume ON ume.Id = phd.LastBodyEditorUserId -- Join to get info about the last body editor
+WHERE um.UserProfileViews > 1000 -- Filter for users whose profile has been viewed a lot
+  AND um.UpVotes / NULLIF(um.DownVotes, 0)::numeric > 5.0 -- Filter for users with a high upvote to downvote ratio
+  -- Correlated subquery: Post score is 20% higher than the owner's average question score.
+  AND dhq.PostScore > (SELECT AVG(p_other.Score) FROM Posts p_other WHERE p_other.OwnerUserId = dhq.OwnerUserId AND p_other.PostTypeId = 1) * 1.2
+  AND pts.TagName IS NOT NULL -- Ensure a primary tag is associated
+  AND dhq.LastEditDate IS NOT NULL AND dhq.LastEditDate >= NOW() - INTERVAL '3 months' -- Post must be recently edited
+  AND dhq.ViewCount >= dhq.AnswerCount * 10 -- ViewCount is significantly higher than AnswerCount
+  AND (dhq.Title ILIKE '%sql%' OR dhq.Title ILIKE '%database%' OR dhq.Tags ILIKE '%<sql>%') -- Filter for specific keywords in title or tags
+  -- Correlated Subquery in WHERE: Check if the post has more comments than 20% of the owner's total posts.
+  AND (SELECT COUNT(c_count.Id) FROM Comments c_count WHERE c_count.PostId = dhq.PostId) > um.TotalPostsOwned / 5
+GROUP BY
+    dhq.PostId, dhq.Title, dhq.PostCreationDate, dhq.PostScore, dhq.ViewCount, um.DisplayName, um.Reputation,
+    um.TotalBadges, um.AvgAnswerScoreForHotQuestions, phd.TotalEdits, phd.LastHistoryEventDate,
+    pts.TagName, pts.GlobalTagCount, pts.HotQuestionsWithTagCount, dhq.Body, dhq.Tags, dhq.AcceptedAnswerId, dhq.ClosedDate,
+    um.UpVotes, um.DownVotes, um.UserProfileViews, um.UserId, dhq.FavoriteCount, dhq.AnswerCount, dhq.LastEditDate,
+    ume.DisplayName, ume.Reputation, paei.AvgEventIntervalSeconds, um.UserCreationDate, um.Location
+ORDER BY
+    EngagementIndex DESC, dhq.LastActivityDate DESC
+LIMIT 5000;

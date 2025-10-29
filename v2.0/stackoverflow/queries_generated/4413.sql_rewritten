@@ -1,0 +1,101 @@
+-- {"query": "4413.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 815} 
+WITH
+  RankedUserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      COUNT(p.Id) AS PostCount,
+      ROW_NUMBER() OVER (
+        ORDER BY
+          u.Reputation DESC,
+          u.CreationDate ASC
+      ) AS ReputationRank,
+      AVG(p.Score) OVER (PARTITION BY u.Id) AS AvgPostScore,
+      SUM(CASE WHEN ph.PostHistoryTypeId IN (2, 5) THEN 1 ELSE 0 END) AS EditCount,
+      MAX(p.LastActivityDate) OVER (PARTITION BY u.Id) AS LastActivity
+    FROM
+      Users AS u
+    LEFT JOIN
+      Posts AS p
+      ON u.Id = p.OwnerUserId
+    LEFT JOIN
+      PostHistory AS ph
+      ON p.Id = ph.PostId
+    WHERE
+      u.CreationDate >= '2010-01-01' AND u.DisplayName IS NOT NULL
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate
+    HAVING
+      COUNT(p.Id) > 10
+  ),
+  HotQuestions AS (
+    SELECT
+      p.Id AS QuestionId,
+      p.Title,
+      p.AnswerCount,
+      p.FavoriteCount,
+      p.Score,
+      p.CreationDate,
+      ROW_NUMBER() OVER (
+        ORDER BY
+          p.Score DESC,
+          p.AnswerCount DESC,
+          p.FavoriteCount DESC
+      ) AS HotnessRank
+    FROM
+      Posts AS p
+    WHERE
+      p.PostTypeId = 1 AND p.ClosedDate IS NULL AND p.CommunityOwnedDate IS NULL
+      AND p.CreationDate BETWEEN '2023-01-01' AND '2023-12-31'
+  )
+SELECT
+  q.Title AS QuestionTitle,
+  q.HotnessRank,
+  rua.DisplayName AS TopUserDisplayName,
+  rua.Reputation AS TopUserReputation,
+  rua.ReputationRank AS TopUserRank,
+  rua.AvgPostScore AS TopUserAvgScore,
+  rua.EditCount AS TopUserEditCount,
+  DATEDIFF(
+    day,
+    rua.LastActivity,
+    cast('2024-10-01 12:34:56' as timestamp)
+  ) AS DaysSinceLastActivity,
+  (
+    SELECT
+      COUNT(c.Id)
+    FROM
+      Comments AS c
+    WHERE
+      c.PostId = q.QuestionId AND c.Score > 5
+  ) AS HighScoreCommentCount,
+  CASE
+    WHEN q.FavoriteCount > 100 THEN 'Very Popular'
+    WHEN q.FavoriteCount > 50 THEN 'Popular'
+    ELSE 'Standard'
+  END AS PopularityBucket,
+  CASE
+    WHEN EXISTS (
+      SELECT
+        1
+      FROM
+        PostLinks AS pl
+      WHERE
+        pl.PostId = q.QuestionId AND pl.LinkTypeId = 3
+    ) THEN 'Has Duplicate Link'
+    ELSE 'No Duplicate Link'
+  END AS DuplicateStatus
+FROM
+  HotQuestions AS q
+JOIN
+  RankedUserActivity AS rua
+  ON q.HotnessRank BETWEEN 1 AND 10 AND rua.ReputationRank BETWEEN 1 AND 50
+WHERE
+  q.Score > 0 AND q.AnswerCount > 0
+ORDER BY
+  q.HotnessRank,
+  rua.ReputationRank;

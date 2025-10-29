@@ -1,0 +1,120 @@
+-- {"query": "3251.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2228} 
+
+WITH
+-- Aggregate per‑user statistics
+UserStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1)                     AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2)                     AS AnswerCount,
+        COALESCE(SUM(
+            CASE
+                WHEN v.VoteTypeId = 2 THEN  1   -- upvote
+                WHEN v.VoteTypeId = 3 THEN -1   -- downvote
+                ELSE 0
+            END),0)                                                    AS NetVoteScore,
+        COUNT(DISTINCT b.Name) FILTER (WHERE b.Class = 1)              AS GoldBadgeCount,
+        COUNT(DISTINCT b.Name) FILTER (WHERE b.Class = 2)              AS SilverBadgeCount,
+        COUNT(DISTINCT b.Name) FILTER (WHERE b.Class = 3)              AS BronzeBadgeCount,
+        MAX(p.CreationDate)                                            AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts   p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes   v ON v.PostId = p.Id
+    LEFT JOIN Badges  b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+-- Tag‑level metrics (using the delimited tag string)
+TagMetrics AS (
+    SELECT
+        t.TagName,
+        COUNT(p.Id)                                 AS TagPostCount,
+        SUM(p.Score)                                AS TagScoreSum,
+        AVG(p.ViewCount)                            AS AvgViews,
+        ROW_NUMBER() OVER (PARTITION BY t.TagName
+                           ORDER BY SUM(p.Score) DESC) AS RankByScore
+    FROM Tags t
+    JOIN Posts p
+      ON p.Tags IS NOT NULL
+     AND t.TagName = ANY(
+            string_to_array(
+                substring(p.Tags, 2, length(p.Tags)-2), -- strip surrounding <> brackets
+                '><'
+            )
+        )
+   WHERE p.PostTypeId = 1               -- only questions
+   GROUP BY t.TagName
+),
+
+-- Recent high‑scoring questions
+TopQuestions AS (
+    SELECT
+        q.Id,
+        q.Title,
+        q.Score,
+        q.ViewCount,
+        q.FavoriteCount,
+        q.AnswerCount,
+        q.CreationDate,
+        COALESCE(u.DisplayName,'[deleted]')                               AS OwnerName,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = q.Id)           AS CommentCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = q.Id
+                                     AND v.VoteTypeId = 2)               AS UpVoteCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = q.Id
+                                     AND v.VoteTypeId = 3)               AS DownVoteCount,
+        (SELECT ARRAY_AGG(DISTINCT b.Name)
+           FROM Badges b
+          WHERE b.UserId = q.OwnerUserId AND b.Class = 1)                 AS GoldBadgesOwned
+    FROM Posts q
+    LEFT JOIN Users u ON q.OwnerUserId = u.Id
+    WHERE q.PostTypeId = 1                                 -- questions only
+      AND q.CreationDate >= CURRENT_DATE - INTERVAL '180 days'
+    ORDER BY q.Score DESC NULLS LAST
+    LIMIT 100
+)
+
+SELECT
+    us.Id,
+    us.DisplayName,
+    us.Reputation,
+    us.QuestionCount,
+    us.AnswerCount,
+    us.NetVoteScore,
+    us.GoldBadgeCount,
+    us.SilverBadgeCount,
+    us.BronzeBadgeCount,
+    COALESCE(us.LastPostDate, TIMESTAMP '1970-01-01')      AS LastPostDate,
+    tm.TagName,
+    tm.TagPostCount,
+    tm.TagScoreSum,
+    tm.AvgViews,
+    tq.Id               AS TopQ_Id,
+    tq.Title            AS TopQ_Title,
+    tq.Score            AS TopQ_Score,
+    tq.ViewCount        AS TopQ_Views,
+    tq.FavoriteCount   AS TopQ_Favorites,
+    tq.AnswerCount     AS TopQ_Answers,
+    tq.CommentCount    AS TopQ_Comments,
+    tq.UpVoteCount,
+    tq.DownVoteCount,
+    tq.GoldBadgesOwned
+FROM UserStats us
+LEFT JOIN (SELECT * FROM TagMetrics WHERE RankByScore <= 5) tm ON TRUE
+LEFT JOIN LATERAL (
+    SELECT *
+    FROM TopQuestions tq
+    WHERE tq.OwnerName = us.DisplayName
+    ORDER BY tq.Score DESC
+    LIMIT 1
+) tq ON TRUE
+WHERE us.Reputation > 10000
+  AND (us.GoldBadgeCount > 0 OR us.SilverBadgeCount > 5)
+ORDER BY us.Reputation DESC, us.NetVoteScore DESC
+
+UNION ALL
+
+-- Dummy rows to stress the UNION operator and test optimizer handling of set operators
+SELECT NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL
+FROM generate_series(1,5) gs;

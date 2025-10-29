@@ -1,0 +1,227 @@
+-- {"query": "1334.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3505} 
+
+WITH UserActivitySummary AS (
+    -- CTE 1: Summarizes user activity, combining data from Users, Posts, and Comments.
+    -- Calculates various user-level metrics and introduces NTILE for reputation tiers.
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COALESCE(u.Location, 'Unknown Location') AS UserLocation, -- NULL logic with COALESCE
+        u.Views AS UserProfileViews,
+        u.UpVotes AS UserUpVotes,
+        u.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsOwned,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersOwned,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostScoreOwned,
+        SUM(COALESCE(p.ViewCount, 0)) AS TotalPostViewsOwned,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        SUM(COALESCE(c.Score, 0)) AS TotalCommentScoreMade,
+        -- Elaborate activity score calculation based on multiple factors
+        (u.Reputation * 0.1) + (COUNT(DISTINCT p.Id) * 0.5) + (COUNT(DISTINCT c.Id) * 0.2) + (u.UpVotes - u.DownVotes) + (u.Views * 0.01) AS ActivityScore,
+        -- Window function: Divide users into 4 reputation tiers
+        NTILE(4) OVER (ORDER BY u.Reputation DESC, u.CreationDate ASC) AS ReputationTier
+    FROM
+        Users AS u
+    LEFT JOIN
+        Posts AS p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Comments AS c ON u.Id = c.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Location, u.Views, u.UpVotes, u.DownVotes
+),
+PostTagAnalysis AS (
+    -- CTE 2: Processes post details, extracts tags, and performs subqueries for related metrics.
+    -- Uses string manipulation for tags and correlated subqueries for editor count and latest comment score.
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.AcceptedAnswerId,
+        p.ClosedDate,
+        p.Title,
+        -- String expression: Extract individual tags from the 'Tags' string using string_to_array and UNNEST
+        TRIM(UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><'))) AS TagName,
+        -- Correlated subquery: Count distinct users who edited this specific post (excluding owner)
+        (SELECT COUNT(DISTINCT ph.UserId)
+         FROM PostHistory AS ph
+         WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4, 5, 6) AND ph.UserId IS NOT NULL AND ph.UserId != p.OwnerUserId
+        ) AS DistinctNonOwnerEditorCount,
+        -- Correlated subquery: Get the score of the most recent comment on this post
+        (SELECT COALESCE(MAX(c_inner.Score), 0)
+         FROM Comments AS c_inner
+         WHERE c_inner.PostId = p.Id
+         AND c_inner.CreationDate = (SELECT MAX(c_sub.CreationDate) FROM Comments AS c_sub WHERE c_sub.PostId = p.Id)
+        ) AS LatestCommentScore,
+        -- Complex calculation: Post engagement ratio, handling division by zero with NULLIF
+        CAST(COALESCE(p.FavoriteCount, 0) + COALESCE(p.CommentCount, 0) AS NUMERIC) / NULLIF(p.ViewCount, 0) AS EngagementRatio
+    FROM
+        Posts AS p
+    WHERE
+        p.PostTypeId IN (1, 2) -- Focus on Questions (1) and Answers (2)
+        AND p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2 -- Ensure tags exist for splitting
+),
+RankedUserPosts AS (
+    -- CTE 3: Ranks posts for each user based on score and view count within their owned posts.
+    -- Uses ROW_NUMBER and DENSE_RANK window functions.
+    SELECT
+        pta.PostId,
+        pta.PostTypeId,
+        pta.OwnerUserId,
+        pta.PostScore,
+        pta.ViewCount,
+        pta.TagName,
+        pta.LatestCommentScore,
+        pta.DistinctNonOwnerEditorCount,
+        -- Window function: Rank user's posts by score (highest first)
+        ROW_NUMBER() OVER (PARTITION BY pta.OwnerUserId, pta.PostTypeId ORDER BY pta.PostScore DESC, pta.PostCreationDate DESC) AS rn_score,
+        -- Window function: Rank posts by view count within each TagName
+        DENSE_RANK() OVER (PARTITION BY pta.TagName ORDER BY pta.ViewCount DESC) AS TagViewRank
+    FROM
+        PostTagAnalysis AS pta
+),
+BadgeAwardsSummary AS (
+    -- CTE 4: Summarizes badge counts per user, categorizing by class and type.
+    SELECT
+        b.UserId,
+        COUNT(b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(CASE WHEN b.TagBased = TRUE THEN 1 ELSE 0 END) AS HasTagBadges, -- Boolean representation
+        MAX(CASE WHEN b.TagBased = FALSE THEN 1 ELSE 0 END) AS HasNamedBadges
+    FROM
+        Badges AS b
+    GROUP BY
+        b.UserId
+),
+QuestionAnswerAcceptedStatus AS (
+    -- CTE 5: Identifies questions with accepted answers and tracks owners of both question and answer.
+    SELECT
+        q.Id AS QuestionId,
+        q.OwnerUserId AS QuestionOwnerId,
+        q.AcceptedAnswerId,
+        a.OwnerUserId AS AcceptedAnswerOwnerId,
+        a.Score AS AcceptedAnswerScore,
+        AGE(q.LastActivityDate, q.CreationDate) AS QuestionLifespan -- Date expression
+    FROM
+        Posts AS q
+    INNER JOIN
+        Posts AS a ON q.AcceptedAnswerId = a.Id -- INNER JOIN as AcceptedAnswerId is always valid if present
+    WHERE
+        q.PostTypeId = 1 AND a.PostTypeId = 2 -- Ensure it's a question with an accepted answer
+),
+ModeratorActionSummary AS (
+    -- CTE 6: Summarizes moderation actions on posts, linking to close reasons.
+    SELECT
+        ph.PostId,
+        ph.UserId AS ModeratorActorId, -- User who performed the moderation (if applicable)
+        ph.PostHistoryTypeId,
+        ph.CreationDate AS ModerationDate,
+        cr.Name AS CloseReasonName -- LEFT JOIN for close reasons (can be NULL if not a close action)
+    FROM
+        PostHistory AS ph
+    LEFT JOIN
+        CloseReasonTypes AS cr ON ph.Comment = cr.Id::text -- Assuming Comment stores CloseReasonId as string for type 10
+    WHERE
+        ph.PostHistoryTypeId IN (10, 12, 14, 19) -- Post Closed, Post Deleted, Post Locked, Question Protected
+)
+-- Main Query: Combines all CTEs to find and analyze "Power Users" with specific characteristics.
+SELECT
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.TotalPostsOwned,
+    uas.TotalQuestionsOwned,
+    uas.TotalAnswersOwned,
+    uas.ActivityScore,
+    uas.ReputationTier,
+    COALESCE(bas.TotalBadges, 0) AS UserTotalBadges,
+    COALESCE(bas.GoldBadges, 0) AS UserGoldBadges,
+    CASE WHEN bas.HasTagBadges = 1 THEN 'Yes' ELSE 'No' END AS HasTagSpecificBadges, -- CASE statement with boolean logic
+    -- Details of the user's highest-scored question
+    COALESCE(hsq.PostId, -1) AS TopQuestionId,
+    COALESCE(hsq.PostScore, 0) AS TopQuestionScore,
+    COALESCE(hsq.TagName, 'No Top Q Tag') AS TopQuestionMainTag,
+    -- Details of the user's highest-scored answer
+    COALESCE(hsa.PostId, -1) AS TopAnswerId,
+    COALESCE(hsa.PostScore, 0) AS TopAnswerScore,
+    -- Aggregate count of distinct questions where this user provided the accepted answer
+    COUNT(DISTINCT qas_a.QuestionId) AS AcceptedAnswersProvidedCount,
+    -- Aggregate count of distinct questions owned by this user that have an accepted answer
+    COUNT(DISTINCT qas_q.QuestionId) AS QuestionsWithAcceptedAnswerCount,
+    -- Average score of accepted answers for questions owned by this user
+    CAST(AVG(COALESCE(qas_q.AcceptedAnswerScore, 0)) AS DECIMAL(10, 2)) AS AvgAcceptedAnswerScoreForOwnedQuestions,
+    -- User's ratio of upvotes to downvotes, handling potential division by zero
+    CAST(uas.UserUpVotes AS NUMERIC) / NULLIF(uas.UserDownVotes, 0) AS UpvoteToDownvoteRatio,
+    -- String expression and date logic for user activity status
+    CASE
+        WHEN uas.LastAccessDate >= NOW() - INTERVAL '6 months' AND uas.UserCreationDate <= NOW() - INTERVAL '3 years' THEN 'Veteran_Highly_Active'
+        WHEN uas.LastAccessDate >= NOW() - INTERVAL '1 year' THEN 'Recently_Active'
+        WHEN uas.LastAccessDate < NOW() - INTERVAL '2 years' OR uas.LastAccessDate IS NULL THEN 'Dormant_Or_New' -- NULL logic
+        ELSE 'Active'
+    END AS ActivityStatusCategory,
+    -- Count of posts where this user contributed as a non-owner editor
+    SUM(DISTINCT hsq.DistinctNonOwnerEditorCount) + SUM(DISTINCT hsa.DistinctNonOwnerEditorCount) AS TotalNonOwnerEdits,
+    -- Max LatestCommentScore from any owned post
+    MAX(rup.LatestCommentScore) OVER (PARTITION BY uas.UserId) AS MaxCommentScoreOnAnyOwnedPost, -- Window function
+    -- A very complex calculated 'OverallInfluenceScore' combining various metrics
+    (uas.Reputation / 1000.0) +
+    (uas.ActivityScore / 100.0) +
+    (COALESCE(bas.GoldBadges, 0) * 7.5) +
+    (COALESCE(hsq.PostScore, 0) / 15.0) +
+    (COALESCE(hsa.PostScore, 0) / 15.0) +
+    (COUNT(DISTINCT qas_a.QuestionId) * 3.0) +
+    (COUNT(DISTINCT qas_q.QuestionId) * 2.5) +
+    (COALESCE(SUM(DISTINCT hsq.DistinctNonOwnerEditorCount), 0) * 1.0) +
+    (COALESCE(SUM(DISTINCT hsa.DistinctNonOwnerEditorCount), 0) * 1.0) +
+    (COALESCE(MAX(rup.LatestCommentScore) OVER (PARTITION BY uas.UserId), 0) * 0.5)
+    AS OverallInfluenceScore
+FROM
+    UserActivitySummary AS uas
+LEFT JOIN
+    BadgeAwardsSummary AS bas ON uas.UserId = bas.UserId
+LEFT JOIN
+    RankedUserPosts AS hsq ON uas.UserId = hsq.OwnerUserId AND hsq.PostTypeId = 1 AND hsq.rn_score = 1 -- Highest scored Question
+LEFT JOIN
+    RankedUserPosts AS hsa ON uas.UserId = hsa.OwnerUserId AND hsa.PostTypeId = 2 AND hsa.rn_score = 1 -- Highest scored Answer
+LEFT JOIN
+    QuestionAnswerAcceptedStatus AS qas_a ON uas.UserId = qas_a.AcceptedAnswerOwnerId -- User provided an accepted answer
+LEFT JOIN
+    QuestionAnswerAcceptedStatus AS qas_q ON uas.UserId = qas_q.QuestionOwnerId -- User's question has an accepted answer
+LEFT JOIN
+    RankedUserPosts AS rup ON uas.UserId = rup.OwnerUserId -- For MaxCommentScoreOnAnyOwnedPost
+WHERE
+    uas.Reputation >= 5000 -- Filter for users with significant reputation
+    AND uas.TotalPostsOwned > 10 -- At least some minimum post count
+    AND (LOWER(uas.UserLocation) LIKE '%india%' OR LOWER(uas.UserLocation) LIKE '%usa%' OR uas.UserLocation = 'Unknown Location') -- Complex string predicate with NULL logic
+    AND uas.LastAccessDate > NOW() - INTERVAL '6 months' -- Recently active users
+    AND NOT EXISTS ( -- Correlated subquery for exclusion: Exclude users whose posts were closed/deleted recently
+        SELECT 1
+        FROM Posts p_moderated
+        JOIN ModeratorActionSummary mas ON p_moderated.Id = mas.PostId
+        WHERE p_moderated.OwnerUserId = uas.UserId
+          AND mas.ModerationDate > NOW() - INTERVAL '1 year'
+          AND mas.PostHistoryTypeId IN (10, 12) -- Post Closed or Post Deleted
+    )
+GROUP BY
+    uas.UserId, uas.DisplayName, uas.Reputation, uas.TotalPostsOwned, uas.TotalQuestionsOwned, uas.TotalAnswersOwned,
+    uas.TotalPostScoreOwned, uas.ActivityScore, uas.ReputationTier, bas.TotalBadges, bas.GoldBadges, bas.HasTagBadges,
+    hsq.PostId, hsq.PostScore, hsq.TagName, hsa.PostId, hsa.PostScore,
+    uas.UserUpVotes, uas.UserDownVotes, uas.LastAccessDate, uas.UserCreationDate
+HAVING
+    (COUNT(DISTINCT qas_a.QuestionId) >= 2 OR COUNT(DISTINCT qas_q.QuestionId) >= 2) -- Users who either gave or received at least 2 accepted answers
+    AND MAX(COALESCE(rup.LatestCommentScore, 0)) > 0 -- At least one owned post has a commented score greater than 0
+ORDER BY
+    OverallInfluenceScore DESC, uas.Reputation DESC, uas.LastAccessDate DESC
+LIMIT 50;

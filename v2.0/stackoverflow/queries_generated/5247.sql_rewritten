@@ -1,0 +1,130 @@
+-- {"query": "5247.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 955} 
+WITH
+RecentActivePosts AS (
+  SELECT
+    p.Id,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.ViewCount,
+    p.Score,
+    p.CommentCount,
+    p.AnswerCount,
+    COALESCE(p.FavoriteCount, 0) AS FavoriteCount
+  FROM Posts p
+  WHERE p.LastActivityDate > cast('2024-10-01 12:34:56' as timestamp) - interval '30 days'
+),
+TopTags AS (
+  SELECT
+    t.TagName,
+    SUM(p.Score) AS TagScore
+  FROM Posts p
+  JOIN LATERAL unnest(string_to_array(coalesce(p.Tags, ''), '><')) AS t(TagName)
+    ON true
+  GROUP BY t.TagName
+  HAVING SUM(p.Score) > 0
+),
+TagSummary AS (
+  SELECT
+    tt.TagName,
+    tt.TagScore,
+    ct.CleanupCount,
+    cr.Name AS CloseReason,
+    vt.Name AS VoteTypeName
+  FROM TopTags tt
+  LEFT JOIN (
+    SELECT
+      unnest(string_to_array(coalesce(t.Tags, ''), '><')) AS TagName,
+      COUNT(*) AS CleanupCount
+    FROM Posts t
+    GROUP BY TagName
+  ) ct ON ct.TagName = tt.TagName
+  LEFT JOIN PostHistory ph ON ph.PostId = (SELECT p.Id FROM Posts p WHERE p.Tags LIKE '%' || tt.TagName || '%' LIMIT 1)
+  LEFT JOIN CloseReasonTypes cr ON cr.Id = CAST(ph.Comment AS int)
+  LEFT JOIN Votes v ON v.PathId = 0
+  LEFT JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+  GROUP BY tt.TagName, tt.TagScore, ct.CleanupCount, cr.Name, vt.Name
+),
+BenchmarkQuery AS (
+  SELECT
+    rp.Id AS PostId,
+    rp.PostTypeId,
+    rp.OwnerUserId,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation,
+    u.CreationDate AS OwnerCreationDate,
+    u.LastAccessDate AS OwnerLastAccessDate,
+    COALESCE(b.OnlineBadge, false) AS HasBadge,
+    b.Class AS BadgeClass,
+    COALESCE(b.Name, '') AS BadgeName,
+    rp.Title,
+    rp.Tags,
+    rp.ViewCount,
+    rp.Score,
+    rp.FavoriteCount,
+    rp.CommentCount,
+    rp.AnswerCount,
+    rp.CreationDate,
+    rp.LastActivityDate,
+    phs.Changes AS HistoryChanges
+  FROM RecentActivePosts rp
+  LEFT JOIN Users u ON rp.OwnerUserId = u.Id
+  LEFT JOIN Badges b ON b.UserId = u.Id AND b.Date = (SELECT MAX(Date) FROM Badges bb WHERE bb.UserId = u.Id)
+  LEFT JOIN (
+    SELECT
+      PostId,
+      COUNT(*) AS Changes
+    FROM PostHistory
+    WHERE PostHistoryTypeId IN (4,5,6,10,11)
+    GROUP BY PostId
+  ) phs ON phs.PostId = rp.Id
+  WHERE rp.ViewCount > 1000 OR rp.Score > 10
+  UNION ALL
+  SELECT
+    rp.Id,
+    rp.PostTypeId,
+    rp.OwnerUserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    false,
+    NULL,
+    NULL,
+    NULL,
+    rp.Title,
+    rp.Tags,
+    rp.ViewCount,
+    rp.Score,
+    0,
+    rp.CommentCount,
+    rp.AnswerCount,
+    rp.CreationDate,
+    rp.LastActivityDate,
+    NULL
+  FROM RecentActivePosts rp
+  LEFT JOIN Users u ON rp.OwnerUserId = u.Id
+  WHERE rp.PostTypeId = 1
+)
+SELECT
+  bq.PostId,
+  bq.OwnerDisplayName,
+  bq.Reputation,
+  bq.Title,
+  bq.Tags,
+  bq.ViewCount,
+  bq.Score,
+  bq.FavoriteCount,
+  bq.CommentCount,
+  bq.AnswerCount,
+  bq.LastActivityDate,
+  bq.HistoryChanges,
+  ct.TagName,
+  ct.TagScore
+FROM BenchmarkQuery bq
+LEFT JOIN TagSummary ct ON ct.TagName ILIKE '%' || ANY (STRING_TO_ARRAY(REGEXP_REPLACE(bq.Tags, '[<>]', ' ', 'g'), ' ')) 
+ORDER BY bq.LastActivityDate DESC, bq.Score DESC
+LIMIT 100;

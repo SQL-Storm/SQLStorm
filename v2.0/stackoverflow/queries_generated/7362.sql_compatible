@@ -1,0 +1,189 @@
+WITH UserStats AS (
+  SELECT 
+    u.Id as UserId,
+    u.Reputation,
+    u.DisplayName,
+    COUNT(DISTINCT p.Id) as PostCount,
+    COUNT(DISTINCT c.Id) as CommentCount,
+    COUNT(DISTINCT b.Id) as BadgeCount,
+    MAX(p.CreationDate) as LastPostDate,
+    AVG(p.Score) as AvgPostScore,
+    STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags)-2)), ', ') as AllTags
+  FROM Users u
+  LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+  LEFT JOIN Comments c ON u.Id = c.UserId
+  LEFT JOIN Badges b ON u.Id = b.UserId
+  WHERE u.CreationDate >= TIMESTAMP '2010-01-01'
+  GROUP BY u.Id, u.Reputation, u.DisplayName
+),
+PostAnalysis AS (
+  SELECT 
+    p.Id as PostId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.Tags,
+    CASE 
+      WHEN p.PostTypeId = 1 THEN 'Question'
+      WHEN p.PostTypeId = 2 THEN 'Answer'
+      ELSE 'Other'
+    END as PostType,
+    COALESCE(p.AcceptedAnswerId, 0) as HasAcceptedAnswer,
+    CASE 
+      WHEN p.ClosedDate IS NOT NULL THEN 1
+      ELSE 0
+    END as IsClosed,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as PostRank,
+    LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PrevScore,
+    LAG(p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PrevPostDate,
+    EXTRACT(EPOCH FROM (p.CreationDate - LAG(p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate)))/86400.0 as DaysSinceLastPost,
+    SUM(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ROWS UNBOUNDED PRECEDING) as CumulativeScore
+  FROM Posts p
+  WHERE p.CreationDate >= TIMESTAMP '2015-01-01'
+    AND p.PostTypeId IN (1, 2) 
+    AND p.Score > 0
+),
+TagAnalysis AS (
+  SELECT 
+    t.TagName,
+    t.Count as TagCount,
+    t.ExcerptPostId,
+    t.WikiPostId,
+    CASE 
+      WHEN t.IsRequired = 1 THEN 'Required'
+      WHEN t.IsModeratorOnly = 1 THEN 'Moderator Only'
+      ELSE 'Regular'
+    END as TagType,
+    ROW_NUMBER() OVER (ORDER BY t.Count DESC) as RankByPopularity,
+    PERCENT_RANK() OVER (ORDER BY t.Count) as PopularityPercentile,
+    AVG(t.Count) OVER () as AvgTagCount
+  FROM Tags t
+  WHERE t.Count > 0
+),
+UserPerformance AS (
+  SELECT 
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.PostCount,
+    us.CommentCount,
+    us.BadgeCount,
+    us.AvgPostScore,
+    CASE 
+      WHEN us.PostCount > 0 THEN us.BadgeCount * 100.0 / us.PostCount
+      ELSE NULL
+    END as BadgeEfficiency,
+    CASE 
+      WHEN us.PostCount > 0 THEN us.CommentCount * 1.0 / us.PostCount
+      ELSE NULL
+    END as CommentPerPost,
+    CASE 
+      WHEN us.Reputation > 10000 THEN 'Elite'
+      WHEN us.Reputation > 1000 THEN 'Expert'
+      WHEN us.Reputation > 100 THEN 'Intermediate'
+      ELSE 'Newbie'
+    END as ReputationTier,
+    us.LastPostDate
+  FROM UserStats us
+  WHERE us.PostCount > 0
+)
+SELECT 
+  up.DisplayName,
+  up.Reputation,
+  up.PostCount,
+  up.BadgeEfficiency,
+  up.CommentPerPost,
+  up.ReputationTier,
+  pa.Title,
+  pa.Score,
+  pa.ViewCount,
+  pa.AnswerCount,
+  pa.CommentCount,
+  pa.DaysSinceLastPost,
+  pa.CumulativeScore,
+  ta.TagName,
+  ta.TagCount,
+  ta.RankByPopularity,
+  CASE 
+    WHEN ta.TagCount > ta.AvgTagCount * 1.5 THEN 'Highly Popular'
+    WHEN ta.TagCount > ta.AvgTagCount THEN 'Above Average'
+    WHEN ta.TagCount > ta.AvgTagCount * 0.5 THEN 'Below Average'
+    ELSE 'Low'
+  END as PopularityLevel,
+  CASE 
+    WHEN pa.PostRank > 1 THEN 
+      'Multiple Posts' 
+    WHEN pa.HasAcceptedAnswer > 0 THEN 
+      'Answer with Acceptance' 
+    ELSE 
+      'Single Post'
+  END as PostEngagement,
+  CASE 
+    WHEN up.PostCount > 10 AND up.BadgeCount > 5 THEN 'Active Contributor'
+    WHEN up.PostCount > 5 AND up.BadgeCount > 2 THEN 'Regular Poster'
+    WHEN up.PostCount > 1 THEN 'Occasional Poster'
+    ELSE 'New User'
+  END as UserStatus,
+  CASE 
+    WHEN up.Reputation > 10000 THEN 1
+    WHEN up.Reputation > 1000 THEN 2
+    WHEN up.Reputation > 100 THEN 3
+    ELSE 4
+  END as ReputationCategory,
+  CASE 
+    WHEN ta.TagType = 'Required' THEN 'Essential Tags'
+    WHEN ta.TagType = 'Moderator Only' THEN 'Moderator Tags'
+    ELSE 'Community Tags'
+  END as TagCategory,
+  CASE 
+    WHEN pa.Score > 100 THEN 'Highly Voted'
+    WHEN pa.Score > 10 THEN 'Moderately Voted'
+    WHEN pa.Score > 0 THEN 'Low Voted'
+    ELSE 'No Votes'
+  END as VotingStatus,
+  EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - up.LastPostDate))/ (86400.0*30.0) as MonthsSinceLastPost,
+  CASE 
+    WHEN pa.DaysSinceLastPost IS NOT NULL AND pa.DaysSinceLastPost > 30 THEN 'Inactive'
+    WHEN pa.DaysSinceLastPost IS NOT NULL AND pa.DaysSinceLastPost BETWEEN 7 AND 30 THEN 'Occasional'
+    WHEN pa.DaysSinceLastPost IS NOT NULL AND pa.DaysSinceLastPost < 7 THEN 'Active'
+    ELSE 'Unknown'
+  END as ActivityLevel,
+  CASE 
+    WHEN pa.ViewCount > 1000 THEN 'High Traffic'
+    WHEN pa.ViewCount > 100 THEN 'Moderate Traffic'
+    WHEN pa.ViewCount > 10 THEN 'Low Traffic'
+    ELSE 'Minimal Traffic'
+  END as TrafficLevel,
+  CASE 
+    WHEN CHAR_LENGTH(pa.Tags) > 50 THEN 'Multiple Tags'
+    WHEN CHAR_LENGTH(pa.Tags) > 10 THEN 'Single Tag'
+    ELSE 'No Tags'
+  END as TaggingPattern,
+  CASE 
+    WHEN pa.AnswerCount > 5 THEN 'High Answer Volume'
+    WHEN pa.AnswerCount > 1 THEN 'Moderate Answer Volume'
+    WHEN pa.AnswerCount = 1 THEN 'Single Answer'
+    ELSE 'No Answers'
+  END as AnswerStatus,
+  CASE 
+    WHEN pa.CommentCount > 10 THEN 'High Comment Volume'
+    WHEN pa.CommentCount > 1 THEN 'Moderate Comment Volume'
+    WHEN pa.CommentCount = 1 THEN 'Single Comment'
+    ELSE 'No Comments'
+  END as CommentStatus,
+  CASE 
+    WHEN pa.IsClosed = 1 THEN 'Closed'
+    ELSE 'Open'
+  END as PostStatus
+FROM UserPerformance up
+INNER JOIN PostAnalysis pa ON up.UserId = pa.OwnerUserId
+LEFT JOIN TagAnalysis ta ON pa.Tags LIKE '%' || ta.TagName || '%'
+WHERE up.Reputation > 100
+  AND pa.CreationDate >= TIMESTAMP '2015-01-01'
+  AND ta.TagCount > 10
+ORDER BY up.Reputation DESC, pa.Score DESC, ta.TagCount DESC
+LIMIT 1000;

@@ -1,0 +1,128 @@
+with recursive RecursiveUserBadgeCounts as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+
+    union all
+
+    select
+        r.UserId,
+        r.Class,
+        r.BadgeCount
+    from RecursiveUserBadgeCounts r
+    where r.BadgeCount > 5
+),
+TopUsersWithBadges as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        max(case when b.Class = 1 then b.BadgeCount else 0 end) as GoldBadges,
+        max(case when b.Class = 2 then b.BadgeCount else 0 end) as SilverBadges,
+        max(case when b.Class = 3 then b.BadgeCount else 0 end) as BronzeBadges,
+        row_number() over (order by u.Reputation desc, u.CreationDate) as UserRank
+    from Users u
+    left join RecursiveUserBadgeCounts b on u.Id = b.UserId
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate
+    having count(b.UserId) > 0
+),
+QuestionAnswerAggregates as (
+    select
+        p.OwnerUserId,
+        count(case when p.PostTypeId = 1 then 1 end) as QuestionsCount,
+        count(case when p.PostTypeId = 2 then 1 end) as AnswersCount,
+        avg(case when p.PostTypeId = 2 then p.Score end) as AvgAnswerScore,
+        max(case when p.PostTypeId = 1 then p.ViewCount end) as MaxQuestionViews
+    from Posts p
+    where p.OwnerUserId is not null and p.OwnerUserId != -1
+    group by p.OwnerUserId
+),
+LatestCommentsWithVotes as (
+    select
+        c.PostId,
+        c.UserId,
+        c.CreationDate,
+        c.Text,
+        v.VoteTypeId,
+        v.CreationDate as VoteDate,
+        row_number() over (partition by c.PostId order by c.CreationDate desc) as CommentRank
+    from Comments c
+    left join Votes v on v.PostId = c.PostId and v.UserId = c.UserId and v.VoteTypeId = 2
+),
+PostsWithLinks as (
+    select
+        p.Id,
+        p.Title,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        coalesce(pl.LinkCount, 0) as OutboundLinksCount
+    from Posts p
+    left join (
+        select PostId, count(*) as LinkCount
+        from PostLinks
+        group by PostId
+    ) pl on p.Id = pl.PostId
+),
+DuplicatePosts as (
+    select
+        pl.PostId as OriginalPostId,
+        pl.RelatedPostId as DuplicateOfPostId,
+        p.Title as OriginalTitle,
+        p2.Title as DuplicateTitle
+    from PostLinks pl
+    join Posts p on pl.PostId = p.Id
+    join Posts p2 on pl.RelatedPostId = p2.Id
+    where pl.LinkTypeId = 3
+),
+UserActivityRanks as (
+    select
+        u.Id,
+        u.DisplayName,
+        count(distinct p.Id) as PostsCount,
+        count(distinct c.Id) as CommentsCount,
+        dense_rank() over (order by count(distinct p.Id) desc) as PostsRank,
+        dense_rank() over (order by count(distinct c.Id) desc) as CommentsRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    group by u.Id, u.DisplayName
+)
+select
+    tu.UserRank,
+    tu.Id as UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.GoldBadges,
+    tu.SilverBadges,
+    tu.BronzeBadges,
+    qa.QuestionsCount,
+    qa.AnswersCount,
+    round(cast(qa.AvgAnswerScore as numeric), 2) as AvgAnswerScore,
+    qa.MaxQuestionViews,
+    ps.OutboundLinksCount,
+    dc.OriginalTitle,
+    dc.DuplicateTitle,
+    coalesce(latestComments.Text, 'No recent comment') as LatestCommentText,
+    coalesce(latestComments.VoteDate, timestamp '1970-01-01') as LatestCommentUpvoteDate,
+    ua.PostsCount,
+    ua.CommentsCount,
+    ua.PostsRank,
+    ua.CommentsRank
+from TopUsersWithBadges tu
+inner join QuestionAnswerAggregates qa on qa.OwnerUserId = tu.Id
+left join PostsWithLinks ps on ps.OwnerUserId = tu.Id
+left join DuplicatePosts dc on dc.OriginalPostId = ps.Id
+left join lateral (
+    select c.Text, c.VoteDate
+    from LatestCommentsWithVotes c
+    where c.PostId = ps.Id and c.CommentRank = 1
+    limit 1
+) latestComments on true
+left join UserActivityRanks ua on ua.Id = tu.Id
+where tu.UserRank <= 100
+order by tu.Reputation desc, qa.QuestionsCount desc, ua.PostsRank asc;

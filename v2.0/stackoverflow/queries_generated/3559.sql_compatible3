@@ -1,0 +1,140 @@
+WITH user_stats AS (
+    SELECT
+        u.Id                                   AS user_id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.UpVotes,0) - COALESCE(u.DownVotes,0) AS net_votes,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS question_cnt,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS answer_cnt,
+        COUNT(CASE WHEN b.Class = 1 THEN b.Id END)     AS gold_badges,
+        COUNT(CASE WHEN b.Class = 2 THEN b.Id END)     AS silver_badges,
+        COUNT(CASE WHEN b.Class = 3 THEN b.Id END)     AS bronze_badges,
+        MAX(p.CreationDate)                            AS last_post_dt
+    FROM Users u
+    LEFT JOIN Posts   p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges  b ON b.UserId      = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes
+),
+top_tags AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS rn
+    FROM Tags t
+    WHERE COALESCE(t.IsModeratorOnly, FALSE) = FALSE
+),
+recent_votes AS (
+    SELECT
+        v.PostId,
+        SUM(CASE WHEN vt.Id = 2 THEN 1
+                 WHEN vt.Id = 3 THEN -1
+                 ELSE 0 END)                      AS vote_score,
+        MAX(v.CreationDate)                       AS last_vote_dt
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE vt.Id IN (2,3)
+    GROUP BY v.PostId
+),
+question_closure AS (
+    SELECT
+        ph.PostId,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) AS closed_on,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.CreationDate END) AS reopened_on,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Comment END)      AS close_reason_id
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (10,11)
+    GROUP BY ph.PostId
+),
+latest_question AS (
+    SELECT p_outer.OwnerUserId AS user_id, p_outer.Id, p_outer.CreationDate
+    FROM Posts p_outer
+    JOIN (
+        SELECT OwnerUserId, MAX(CreationDate) AS max_dt
+        FROM Posts
+        WHERE PostTypeId = 1
+        GROUP BY OwnerUserId
+    ) latest ON latest.OwnerUserId = p_outer.OwnerUserId AND latest.max_dt = p_outer.CreationDate
+    WHERE p_outer.PostTypeId = 1
+),
+post_tags AS (
+    SELECT p.Id AS post_id,
+           TRIM(BOTH '<>' FROM tag) AS tag_name
+    FROM Posts p
+    CROSS JOIN LATERAL (
+        SELECT regexp_split_to_table(p.Tags, '><') AS tag
+    ) s
+    WHERE p.Tags IS NOT NULL
+),
+latest_q_tags AS (
+    SELECT lq.user_id, pt.tag_name
+    FROM latest_question lq
+    LEFT JOIN post_tags pt ON pt.post_id = lq.Id
+),
+top_5_tags_per_user AS (
+    SELECT lq.user_id,
+           STRING_AGG(DISTINCT tt.TagName, ', ') AS top_5_tags
+    FROM latest_question lq
+    LEFT JOIN post_tags pt ON pt.post_id = lq.Id
+    LEFT JOIN Tags t ON t.TagName = pt.tag_name
+    LEFT JOIN top_tags tt ON tt.TagName = t.TagName AND tt.rn <= 5
+    GROUP BY lq.user_id
+)
+SELECT
+    us.user_id,
+    us.DisplayName,
+    us.Reputation,
+    us.net_votes,
+    us.question_cnt,
+    us.answer_cnt,
+    us.gold_badges,
+    us.silver_badges,
+    us.bronze_badges,
+    us.last_post_dt,
+    COALESCE(rv.vote_score,0)           AS recent_vote_score,
+    rv.last_vote_dt,
+    qc.closed_on,
+    qc.reopened_on,
+    crt.Name                           AS close_reason,
+    t5.top_5_tags
+FROM user_stats us
+LEFT JOIN latest_question latest_q ON latest_q.user_id = us.user_id
+LEFT JOIN recent_votes rv        ON rv.PostId = latest_q.Id
+LEFT JOIN question_closure qc    ON qc.PostId = latest_q.Id
+LEFT JOIN CloseReasonTypes crt   ON crt.Id = qc.close_reason_id -- assume compatible types or crt.Id is text
+LEFT JOIN top_5_tags_per_user t5 ON t5.user_id = us.user_id
+GROUP BY
+    us.user_id, us.DisplayName, us.Reputation, us.net_votes,
+    us.question_cnt, us.answer_cnt, us.gold_badges, us.silver_badges,
+    us.bronze_badges, us.last_post_dt, rv.vote_score, rv.last_vote_dt,
+    qc.closed_on, qc.reopened_on, crt.Name, t5.top_5_tags
+HAVING COUNT(*) FILTER (WHERE us.Reputation > 1000) > 0
+
+UNION ALL
+
+SELECT
+    -1                                    AS user_id,
+    'Aggregate'                           AS DisplayName,
+    SUM(us.Reputation)                    AS Reputation,
+    SUM(us.net_votes)                     AS net_votes,
+    SUM(us.question_cnt)                  AS question_cnt,
+    SUM(us.answer_cnt)                    AS answer_cnt,
+    SUM(us.gold_badges)                   AS gold_badges,
+    SUM(us.silver_badges)                 AS silver_badges,
+    SUM(us.bronze_badges)                 AS bronze_badges,
+    MAX(us.last_post_dt)                  AS last_post_dt,
+    SUM(COALESCE(rv.vote_score,0))        AS recent_vote_score,
+    MAX(rv.last_vote_dt)                  AS last_vote_dt,
+    CAST(NULL AS TIMESTAMP)               AS closed_on,
+    CAST(NULL AS TIMESTAMP)               AS reopened_on,
+    CAST(NULL AS VARCHAR)                 AS close_reason,
+    CAST(NULL AS VARCHAR)                 AS top_5_tags
+FROM user_stats us
+LEFT JOIN recent_votes rv ON rv.PostId IN (
+    SELECT p.Id
+    FROM Posts p
+    WHERE p.OwnerUserId = us.user_id AND p.PostTypeId = 1
+)
+WHERE us.Reputation IS NOT NULL
+GROUP BY 1,2
+ORDER BY Reputation DESC
+LIMIT 100;

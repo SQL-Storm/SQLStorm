@@ -1,0 +1,79 @@
+-- {"query": "5564.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 647} 
+WITH ranked_posts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.Tags,
+    p.PostTypeId,
+    p.CommentCount,
+    p.FavoriteCount,
+    pc.Name AS ClosedReason,
+    u.Reputation,
+    u.DisplayName AS OwnerDisplayName,
+    v1.Name AS VoteTypeName,
+    ROW_NUMBER() OVER (
+      PARTITION BY p.PostTypeId
+      ORDER BY
+        p.Score DESC,
+        p.ViewCount DESC,
+        p.CreationDate ASC
+    ) AS rn
+  FROM Posts p
+  LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+  LEFT JOIN PostHistoryTypes pht ON pht.Id = ph.PostHistoryTypeId
+  LEFT JOIN CloseReasonTypes pc ON ph.Comment LIKE CONCAT('%', pc.Id, '%')
+  INNER JOIN Users u ON u.Id = p.OwnerUserId
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  LEFT JOIN VoteTypes v1 ON v.VoteTypeId = v1.Id
+  WHERE p.PostTypeId IN (1, 2) -- Questions and Answers
+    AND p.CreationDate >= NOW() - INTERVAL '365 days'
+    AND (p.OwnerUserId IS NOT NULL OR p.OwnerDisplayName IS NOT NULL)
+),
+aggregated AS (
+  SELECT
+    rp.PostId,
+    rp.Title,
+    rp.CreationDate,
+    rp.Score,
+    rp.ViewCount,
+    rp.OwnerUserId,
+    rp.OwnerDisplayName,
+    rp.Reputation,
+    rp.ClosedReason,
+    rp.PostTypeId,
+    COUNT(*) FILTER (WHERE rp.rn = 1) OVER () AS total_top_per_type,
+    SUM(rp.ViewCount) OVER (PARTITION BY rp.PostTypeId) AS sum_views_by_type,
+    AVG(rp.Score) OVER (PARTITION BY rp.PostTypeId) AS avg_score_by_type,
+    MIN(rp.CreationDate) OVER () AS earliest_post,
+    MAX(rp.LastActivityDate) OVER () AS latest_activity,
+    STRING_AGG(DISTINCT rp.Tags, ',') OVER () AS all_tags
+  FROM ranked_posts rp
+  WHERE rp.rn = 1
+)
+SELECT
+  ptype.Name AS PostCategory,
+  a.PostId,
+  a.Title,
+  a.CreationDate,
+  a.Reputation,
+  a.OwnerDisplayName,
+  a.Score,
+  a.ViewCount,
+  a.ClosedReason,
+  a.sum_views_by_type AS SumViewsForType,
+  a.avg_score_by_type AS AvgScoreForType,
+  a.earliest_post AS FirstPostDate,
+  a.latest_activity AS LastActivityDate,
+  a.all_tags AS TagsSummary
+FROM aggregated a
+JOIN PostTypes ptype ON ptype.Id = a.PostTypeId
+ORDER BY
+  a.PostTypeId,
+  a.Score DESC NULLS LAST,
+  a.ViewCount DESC NULLS LAST
+LIMIT 100;

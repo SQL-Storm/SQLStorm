@@ -1,0 +1,179 @@
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 as Level,
+        array[t.Id] as Path
+    from Tags t
+    where not t.IsModeratorOnly
+
+    union all
+
+    select
+        child.Id,
+        child.TagName,
+        child.Count,
+        child.IsModeratorOnly,
+        child.IsRequired,
+        r.Level + 1,
+        r.Path || child.Id
+    from Tags child
+    join RecursiveTagHierarchy r on child.Id <> all(r.Path) and child.Count > r.Count * 0.5
+    where not child.IsModeratorOnly
+),
+UserBadgeSummary as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+QuestionStats as (
+    select
+        p.Id as QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.Tags,
+        case when p.AcceptedAnswerId is not null then 1 else 0 end as HasAcceptedAnswer,
+        (select count(*) from Comments c where c.PostId = p.Id and c.Score > 0) as PositiveCommentsCount,
+        (select count(distinct ph.PostId) from PostHistory ph where ph.PostId = p.Id and ph.PostHistoryTypeId in (10, 12)) as CloseOrDeleteEvents
+    from Posts p
+    where p.PostTypeId = 1
+),
+TopAnswersWindowed as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId,
+        a.Score,
+        a.CreationDate,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts a
+    where a.PostTypeId = 2
+),
+PostsWithVotes as (
+    select 
+        p.Id as PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        coalesce(sum(case when v.VoteTypeId = 2 then 1 else 0 end), 0) as UpVotes,
+        coalesce(sum(case when v.VoteTypeId = 3 then 1 else 0 end), 0) as DownVotes,
+        coalesce(sum(case when v.VoteTypeId = 5 then 1 else 0 end), 0) as FavoriteVotes
+    from Posts p
+    left join Votes v on v.PostId = p.Id
+    group by p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate
+),
+ComplexUserActivity as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.CreationDate,
+        count(distinct ph.PostId) filter (where ph.PostHistoryTypeId = 1) as PostsCreated,
+        count(distinct ph.PostId) filter (where ph.PostHistoryTypeId in (4,5,6)) as EditsMade,
+        count(distinct v.Id) filter (where v.VoteTypeId in (2,3) and v.UserId = u.Id) as VotesCast,
+        coalesce(sum(case when p.PostTypeId = 1 then p.Score else 0 end), 0) as UserQuestionScoreSum,
+        coalesce(sum(case when p.PostTypeId = 2 then p.Score else 0 end), 0) as UserAnswerScoreSum
+    from Users u
+    left join PostHistory ph on ph.UserId = u.Id
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName, u.CreationDate
+),
+UserRankings AS (
+    select
+        cua.Id,
+        cua.DisplayName,
+        cua.CreationDate,
+        cua.PostsCreated,
+        cua.EditsMade,
+        cua.VotesCast,
+        cua.UserQuestionScoreSum,
+        cua.UserAnswerScoreSum,
+        rank() over (order by cua.PostsCreated desc, cua.EditsMade desc, cua.VotesCast desc) as ActivityRank
+    from ComplexUserActivity cua
+),
+FinalData AS (
+    select
+        q.QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        u.DisplayName as OwnerName,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.HasAcceptedAnswer,
+        q.PositiveCommentsCount,
+        q.CloseOrDeleteEvents,
+        pwv.UpVotes as QuestionUpVotes,
+        pwv.DownVotes as QuestionDownVotes,
+        pwv.FavoriteVotes as QuestionFavorites,
+        a.AnswerId,
+        a.Score as TopAnswerScore,
+        a.CreationDate as TopAnswerCreationDate,
+        ua.DisplayName as TopAnswerOwnerName,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        rs.Level as TagHierarchyLevel,
+        rs.TagName,
+        ur.ActivityRank
+    from QuestionStats q
+    left join PostsWithVotes pwv on pwv.PostId = q.QuestionId
+    left join TopAnswersWindowed a on a.QuestionId = q.QuestionId and a.AnswerRank = 1
+    left join Users ua on ua.Id = a.OwnerUserId
+    left join UserBadgeSummary ub on ub.UserId = q.OwnerUserId
+    left join RecursiveTagHierarchy rs on rs.TagName = any(string_to_array(substring(q.Tags from 2 for char_length(q.Tags) - 2), '><'))
+    left join Users u on u.Id = q.OwnerUserId
+    left join UserRankings ur on ur.Id = q.OwnerUserId
+    where q.Score > 0 and q.AnswerCount > 0
+)
+select distinct
+    QuestionId,
+    Title,
+    OwnerUserId,
+    OwnerName,
+    CreationDate,
+    Score,
+    ViewCount,
+    AnswerCount,
+    HasAcceptedAnswer,
+    PositiveCommentsCount,
+    CloseOrDeleteEvents,
+    QuestionUpVotes,
+    QuestionDownVotes,
+    QuestionFavorites,
+    AnswerId,
+    TopAnswerScore,
+    TopAnswerCreationDate,
+    TopAnswerOwnerName,
+    GoldBadges,
+    SilverBadges,
+    BronzeBadges,
+    TagHierarchyLevel,
+    TagName,
+    ActivityRank,
+    case 
+        when HasAcceptedAnswer = 1 then 'Accepted'
+        when Score > 50 then 'Hot'
+        when CloseOrDeleteEvents > 0 then 'Reviewed'
+        else 'Normal'
+    end as Status,
+    ('Tags: ' || coalesce(TagName, 'None') || '; Owner Activity Rank: ' || cast(ActivityRank as varchar)) as Summary
+from FinalData
+where TagHierarchyLevel is not null and ActivityRank <= 100
+order by Score desc, ViewCount desc, AnswerCount desc
+limit 50;

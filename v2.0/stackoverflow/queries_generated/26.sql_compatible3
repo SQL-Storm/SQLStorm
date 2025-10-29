@@ -1,0 +1,360 @@
+with
+-- Top active users by recent activity, including null-safe string cleanup
+recent_users as (
+  select
+    u.id as user_id,
+    coalesce(nullif(trim(u.displayname), ''), concat('user-', cast(u.id as varchar))) as display_name,
+    u.reputation,
+    u.creationdate,
+    u.lastaccessdate,
+    u.upvotes,
+    u.downvotes,
+    u.views,
+    row_number() over (order by greatest(u.lastaccessdate, u.creationdate) desc, u.reputation desc, u.id) as rn
+  from users u
+  where u.creationdate >= (select date_trunc('year', max(creationdate)) - interval '5 years' from users)
+),
+top_users as (
+  select * from recent_users where rn <= 500
+),
+-- Aggregate post activity per user with window stats
+user_post_activity as (
+  select
+    p.owneruserid as user_id,
+    count(*) filter (where p.posttypeid = 1) as q_count,
+    count(*) filter (where p.posttypeid = 2) as a_count,
+    count(*) filter (where p.posttypeid not in (1,2) or p.posttypeid is null) as other_count,
+    coalesce(sum(nullif(p.score, 0)), 0) as total_post_score,
+    avg(nullif(p.score, 0)) as avg_nonzero_score,
+    max(p.viewcount) as max_views,
+    min(p.creationdate) as first_post_at,
+    max(p.lastactivitydate) as last_activity_at,
+    percentile_cont(0.5) within group (order by coalesce(p.score,0)) as p50_score,
+    count(distinct p.parentid) filter (where p.posttypeid = 2 and p.parentid is not null) as distinct_answered_questions
+  from posts p
+  group by p.owneruserid
+),
+-- Votes summary per user with window stats
+user_vote_activity as (
+  select
+    p.owneruserid as user_id,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes_rcvd,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes_rcvd,
+    sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites_rcvd,
+    sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_flow,
+    count(*) filter (where v.votetypeid in (10,11,12)) as mod_actions
+  from posts p
+  left join votes v on v.postid = p.id
+  group by p.owneruserid
+),
+-- Badge rollups with pivot-ish aggregates
+user_badges as (
+  select
+    b.userid as user_id,
+    count(*) as badge_count,
+    sum(case when b.class = 1 then 1 else 0 end) as gold_count,
+    sum(case when b.class = 2 then 1 else 0 end) as silver_count,
+    sum(case when b.class = 3 then 1 else 0 end) as bronze_count,
+    sum(case when b.tagbased = true then 1 else 0 end) as tag_badges,
+    min(b.date) as first_badge_at,
+    max(b.date) as last_badge_at
+  from badges b
+  group by b.userid
+),
+-- Comment engagement by user on their posts and on others' posts
+user_comments as (
+  select
+    u.id as user_id,
+    count(c.id) filter (where c.userid = u.id) as comments_made,
+    sum(c.score) filter (where c.userid = u.id) as comment_score_made,
+    count(c2.id) as comments_on_their_posts,
+    sum(c2.score) as comment_score_on_their_posts
+  from users u
+  left join comments c on c.userid = u.id
+  left join posts p_own on p_own.owneruserid = u.id
+  left join comments c2 on c2.postid = p_own.id
+  group by u.id
+),
+-- Closing and duplicate history signals per question owner
+owner_close_events as (
+  select
+    p.owneruserid as user_id,
+    count(*) filter (where ph.posthistorytypeid = 10) as closes,
+    count(*) filter (where ph.posthistorytypeid = 11) as reopens,
+    count(*) filter (where ph.posthistorytypeid in (35,36)) as migrations,
+    count(*) filter (where ph.posthistorytypeid in (52,53)) as hot_events
+  from posts p
+  left join posthistory ph on ph.postid = p.id
+  where p.posttypeid = 1
+  group by p.owneruserid
+),
+-- Duplicate linkage graph degrees
+dup_graph as (
+  select
+    p.owneruserid as user_id,
+    count(*) filter (where pl.linktypeid = 3) as dup_outbound,
+    count(*) filter (where pl2.linktypeid = 3) as dup_inbound
+  from posts p
+  left join postlinks pl on pl.postid = p.id
+  left join postlinks pl2 on pl2.relatedpostid = p.id
+  group by p.owneruserid
+),
+-- Tag diversity for question askers using string processing
+user_tag_diversity as (
+  select
+    p.owneruserid as user_id,
+    count(*) filter (where p.posttypeid = 1) as questions_asked,
+    count(distinct lower(trim(tags_tag))) as distinct_tags
+  from (
+    select
+      p.id,
+      p.owneruserid,
+      p.posttypeid,
+      unnest(
+        case
+          when p.tags is null then cast(array[] as text[])
+          else string_to_array(substring(p.tags, 2, greatest(length(p.tags)-2,0)), '><')
+        end
+      ) as tags_tag
+    from posts p
+    where p.posttypeid = 1
+  ) p
+  group by p.owneruserid
+),
+-- Compute recent velocity metrics using sliding windows
+recent_post_velocity as (
+  select
+    p.owneruserid as user_id,
+    count(*) filter (where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days') as posts_30d,
+    count(*) filter (where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '90 days') as posts_90d,
+    count(*) filter (where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days') as posts_365d,
+    avg(extract(epoch from (p.lastactivitydate - p.creationdate))) as avg_time_to_activity_sec
+  from posts p
+  group by p.owneruserid
+),
+-- Rank users by a composite score using window functions
+user_composite as (
+  select
+    u.user_id,
+    u.display_name,
+    u.reputation,
+    coalesce(upa.q_count,0) as q_count,
+    coalesce(upa.a_count,0) as a_count,
+    coalesce(upa.total_post_score,0) as total_post_score,
+    coalesce(uva.upvotes_rcvd,0) as upvotes_rcvd,
+    coalesce(uva.downvotes_rcvd,0) as downvotes_rcvd,
+    coalesce(ub.badge_count,0) as badge_count,
+    coalesce(ub.gold_count,0) as gold_count,
+    coalesce(ub.silver_count,0) as silver_count,
+    coalesce(ub.bronze_count,0) as bronze_count,
+    coalesce(uc.comments_made,0) as comments_made,
+    coalesce(uc.comments_on_their_posts,0) as comments_on_their_posts,
+    coalesce(oc.closes,0) as closes,
+    coalesce(oc.reopens,0) as reopens,
+    coalesce(dg.dup_inbound,0) as dup_inbound,
+    coalesce(dg.dup_outbound,0) as dup_outbound,
+    coalesce(td.distinct_tags,0) as distinct_tags,
+    coalesce(td.questions_asked,0) as questions_asked,
+    coalesce(rv.posts_30d,0) as posts_30d,
+    coalesce(rv.posts_90d,0) as posts_90d,
+    coalesce(rv.posts_365d,0) as posts_365d,
+    coalesce(rv.avg_time_to_activity_sec,0) as avg_time_to_activity_sec,
+    (
+      0.35 * ln(greatest(coalesce(upa.total_post_score,0) + 1, 1)) +
+      0.25 * ln(greatest(coalesce(u.reputation,0) + 1, 1)) +
+      0.15 * ln(greatest(coalesce(ub.badge_count,0) + 1, 1)) +
+      0.10 * ln(greatest(coalesce(uva.upvotes_rcvd,0) - coalesce(uva.downvotes_rcvd,0) + 1, 1)) +
+      0.08 * ln(greatest(coalesce(td.distinct_tags,0) + 1, 1)) +
+      0.07 * ln(greatest(coalesce(rv.posts_90d,0) + 1, 1)) -
+      0.05 * ln(greatest(coalesce(oc.closes,0) + coalesce(dg.dup_inbound,0) + 1, 1))
+    ) as composite_score
+  from top_users u
+  left join user_post_activity upa on upa.user_id = u.user_id
+  left join user_vote_activity uva on uva.user_id = u.user_id
+  left join user_badges ub on ub.user_id = u.user_id
+  left join user_comments uc on uc.user_id = u.user_id
+  left join owner_close_events oc on oc.user_id = u.user_id
+  left join dup_graph dg on dg.user_id = u.user_id
+  left join user_tag_diversity td on td.user_id = u.user_id
+  left join recent_post_velocity rv on rv.user_id = u.user_id
+),
+-- Derive percentiles and rankings
+ranked as (
+  select
+    uc.user_id,
+    uc.display_name,
+    uc.reputation,
+    uc.q_count,
+    uc.a_count,
+    uc.total_post_score,
+    uc.upvotes_rcvd,
+    uc.downvotes_rcvd,
+    uc.badge_count,
+    uc.gold_count,
+    uc.silver_count,
+    uc.bronze_count,
+    uc.comments_made,
+    uc.comments_on_their_posts,
+    uc.closes,
+    uc.reopens,
+    uc.dup_inbound,
+    uc.dup_outbound,
+    uc.distinct_tags,
+    uc.questions_asked,
+    uc.posts_30d,
+    uc.posts_90d,
+    uc.posts_365d,
+    uc.avg_time_to_activity_sec,
+    uc.composite_score,
+    dense_rank() over (order by uc.composite_score desc, uc.reputation desc, uc.user_id asc) as rnk,
+    ntile(10) over (order by uc.composite_score desc) as decile,
+    percentile_disc(0.95) within group (order by uc.composite_score) over () as p95_score_window
+  from user_composite uc
+),
+-- Pull a diverse set: top N, mid deciles, and random-ish via hash
+diverse_pick as (
+  select r.* from ranked r
+  where r.rnk <= 50
+  union all
+  select r.* from ranked r
+  where r.decile in (5,6) and (r.user_id % 7 = 0)
+  union all
+  select r.* from ranked r
+  where mod(abs(hashtext(coalesce(r.display_name, cast(r.user_id as varchar)))), 13) = 0
+),
+-- Enrich with last accepted answers and last edited posts via correlated subqueries
+enriched as (
+  select
+    d.*,
+    (
+      select count(*)
+      from posts pa
+      where pa.posttypeid = 2
+        and pa.owneruserid = d.user_id
+        and exists (
+          select 1
+          from posts pq
+          where pq.id = pa.parentid
+            and pq.acceptedanswerid = pa.id
+        )
+    ) as accepted_answers_authored,
+    (
+      select p.title
+      from posts p
+      where p.owneruserid = d.user_id
+      order by p.lasteditdate desc nulls last, p.lastactivitydate desc nulls last, p.id desc
+      limit 1
+    ) as last_edited_post_title,
+    (
+      select count(*)
+      from comments c
+      where c.userid = d.user_id
+        and c.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days'
+    ) as comments_30d
+  from diverse_pick d
+),
+-- Outer join with optional profile info and website TLD parsing
+profile_enriched as (
+  select
+    e.*,
+    u.location,
+    u.websiteurl,
+    nullif(split_part(coalesce(u.websiteurl,''), '.', array_length(regexp_split_to_array(coalesce(u.websiteurl,''), '\.'),1)), '') as tld_guess,
+    case when coalesce(u.aboutme,'') ilike '%sql%' then 1 else 0 end as mentions_sql_in_bio
+  from enriched e
+  left join users u on u.id = e.user_id
+),
+-- Final window stats per decile
+finalized as (
+  select
+    p.user_id,
+    p.display_name,
+    p.reputation,
+    p.rnk,
+    p.decile,
+    p.p95_score_window as p95_score,
+    p.q_count,
+    p.a_count,
+    p.total_post_score,
+    p.upvotes_rcvd,
+    p.downvotes_rcvd,
+    p.badge_count,
+    p.gold_count,
+    p.silver_count,
+    p.bronze_count,
+    p.comments_made,
+    p.comments_on_their_posts,
+    p.accepted_answers_authored,
+    p.closes,
+    p.reopens,
+    p.dup_inbound,
+    p.dup_outbound,
+    p.questions_asked,
+    p.distinct_tags,
+    p.posts_30d,
+    p.posts_90d,
+    p.posts_365d,
+    p.avg_time_to_activity_sec,
+    p.comments_30d,
+    p.last_edited_post_title,
+    p.location,
+    p.websiteurl,
+    p.tld_guess,
+    p.mentions_sql_in_bio,
+    p.composite_score,
+    avg(p.composite_score) over (partition by p.decile) as decile_avg_score,
+    stddev_pop(p.composite_score) over (partition by p.decile) as decile_stddev_score,
+    rank() over (partition by p.decile order by p.composite_score desc, p.reputation desc) as rank_in_decile
+  from profile_enriched p
+)
+select
+  f.user_id,
+  f.display_name,
+  f.reputation,
+  f.rnk as global_rank,
+  f.rank_in_decile,
+  f.decile,
+  round(cast(f.composite_score as numeric), 4) as composite_score,
+  f.p95_score,
+  f.q_count,
+  f.a_count,
+  f.total_post_score,
+  f.upvotes_rcvd,
+  f.downvotes_rcvd,
+  f.badge_count,
+  f.gold_count,
+  f.silver_count,
+  f.bronze_count,
+  f.comments_made,
+  f.comments_on_their_posts,
+  f.accepted_answers_authored,
+  f.closes,
+  f.reopens,
+  f.dup_inbound,
+  f.dup_outbound,
+  f.questions_asked,
+  f.distinct_tags,
+  f.posts_30d,
+  f.posts_90d,
+  f.posts_365d,
+  round(cast(f.avg_time_to_activity_sec as numeric), 2) as avg_time_to_activity_sec,
+  f.comments_30d,
+  coalesce(nullif(trim(f.last_edited_post_title), ''), '(none)') as last_edited_post_title,
+  coalesce(nullif(trim(f.location), ''), '(unknown)') as location,
+  coalesce(nullif(trim(f.websiteurl), ''), '(none)') as websiteurl,
+  f.tld_guess,
+  f.decile_avg_score,
+  f.decile_stddev_score
+from finalized f
+where
+  (
+    (f.decile in (1,2) and f.rank_in_decile <= 25)
+    or
+    (f.decile in (5,6) and (f.dup_inbound + f.closes) > 0)
+    or
+    (f.decile = 10 and f.questions_asked > 0 and f.distinct_tags >= 5)
+  )
+  and coalesce(f.mentions_sql_in_bio,0) in (0,1)
+  and (f.reputation > 0 or f.badge_count is not null)
+order by f.decile asc, f.rank_in_decile asc, f.user_id asc
+limit 500;

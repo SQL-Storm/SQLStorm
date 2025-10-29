@@ -1,0 +1,119 @@
+-- {"query": "5525.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 994} 
+WITH
+RecentHot AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.OwnerDisplayName,
+    p.LastActivityDate,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.PostTypeId,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.LastEditorUserId,
+    p.LastEditorDisplayName,
+    p.LastEditDate,
+    p.ClosedDate,
+    p.CommunityOwnedDate,
+    p.ContentLicense,
+    p.Body,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentTotal,
+    (SELECT AVG(v.BountyAmount) FROM Votes v WHERE v.PostId = p.Id) AS AvgBounty,
+    ROW_NUMBER() OVER (ORDER BY p.LastActivityDate DESC, p.Score DESC) AS rn
+  FROM Posts p
+  WHERE p.PostTypeId = 1 -- questions
+    AND p.ClosedDate IS NULL
+    AND p.LastActivityDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+),
+TagActivity AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS TagQuestions,
+    SUM(p.Score) AS ScoreSum,
+    AVG(p.ViewCount) AS AvgViews
+  FROM Posts p
+  JOIN UNNEST(string_to_array(REPLACE(p.Tags, '><', ','), ',')) AS t(TagName) ON TRUE
+  WHERE p.PostTypeId = 1
+  GROUP BY t.TagName
+  ORDER BY TagQuestions DESC
+  LIMIT 50
+),
+TopTagWikis AS (
+  SELECT
+    t.TagName,
+    t.Count AS TagCount,
+    tp.ParentId AS ParentQuestionId,
+    tp.Title AS ParentTitle,
+    tp.ViewCount AS Views,
+    tp.Score AS Score
+  FROM Tags t
+  JOIN Posts tp ON tp.Id = t.WikiPostId
+  WHERE t.IsModeratorOnly = 0
+  ORDER BY t.Count DESC
+  LIMIT 20
+),
+CrossLinks AS (
+  SELECT
+    pl.PostId,
+    pl.RelatedPostId,
+    pl.LinkTypeId,
+    lt.Name AS LinkTypeName,
+    p1.Title AS PostTitle,
+    p2.Title AS RelatedPostTitle,
+    p1.LastActivityDate AS PostActivity,
+    p2.LastActivityDate AS RelatedActivity
+  FROM PostLinks pl
+  JOIN Posts p1 ON p1.Id = pl.PostId
+  JOIN Posts p2 ON p2.Id = pl.RelatedPostId
+  JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+  WHERE pl.LinkTypeId IN (1,3)
+),
+RankedPosts AS (
+  SELECT
+    rh.*,
+    ROW_NUMBER() OVER (PARTITION BY rh.OwnerUserId ORDER BY rh.LastActivityDate DESC, rh.Score DESC) AS user_rank
+  FROM RecentHot rh
+)
+SELECT
+  rp.Id AS PostId,
+  rp.Title,
+  rp.Tags,
+  rp.CreationDate,
+  rp.Score,
+  rp.ViewCount,
+  rp.OwnerDisplayName,
+  rp.LastActivityDate,
+  rp.CommentTotal,
+  rp.AvgBounty,
+  rt.Name AS PostType,
+  CASE
+    WHEN rp.LastEditDate IS NULL THEN rp.CreationDate
+    ELSE rp.LastEditDate
+  END AS LastEditOrCreate,
+  ARRAY_AGG(DISTINCT cl.TagName) FILTER (WHERE cl.TagName IS NOT NULL) AS TagWordCloud,
+  (SELECT COUNT(*) FROM Votes v WHERE v.PostId = rp.Id AND v.VoteTypeId = 2) AS UpModCount,
+  (SELECT COUNT(*) FROM Votes v WHERE v.PostId = rp.Id AND v.VoteTypeId = 3) AS DownModCount,
+  CASE
+    WHEN rp.CommunityOwnedDate IS NOT NULL THEN 'Community'
+    ELSE 'User'
+  END AS Ownership,
+  (SELECT vl.TagName FROM Tags vl WHERE vl.TagName = ANY(string_to_array(rp.Tags, '>')) LIMIT 1) AS PrimaryTag,
+  (SELECT COUNT(*) FROM PostLinks pl2 WHERE pl2.PostId = rp.Id) AS RelatedLinks
+FROM RankedPosts rp
+JOIN PostTypes rt ON rt.Id = rp.PostTypeId
+LEFT JOIN LATERAL (
+  SELECT unnest(string_to_array(REPLACE(rp.Tags, '<', ''), '>')) AS TagName
+) AS ct ON TRUE
+LEFT JOIN Tags t ON t.TagName = ct.TagName
+LEFT JOIN (
+  SELECT DISTINCT TagName FROM Tags
+) AS cl ON cl.TagName = ct.TagName
+ORDER BY rp.LastActivityDate DESC, rp.Score DESC
+LIMIT 100;

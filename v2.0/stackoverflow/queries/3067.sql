@@ -1,0 +1,161 @@
+WITH top_users AS (
+    SELECT 
+        u.Id                           AS user_id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(b.Id)                    AS total_badges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_badges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_badges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_badges,
+        MAX(u.CreationDate)           AS first_seen,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.Id) AS rn
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Reputation >= 10000
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+recent_questions AS (
+    SELECT
+        p.Id                                 AS q_id,
+        p.Title,
+        p.CreationDate,
+        p.Score                              AS q_score,
+        p.ViewCount,
+        p.FavoriteCount,
+        COALESCE(p.Tags, '')                 AS raw_tags,
+        regexp_split_to_array(
+            regexp_replace(COALESCE(p.Tags, ''), '^<|>$', '', 'g'), 
+            '><'
+        )                                    AS tag_array,
+        (SELECT CAST(AVG(a.Score) AS DECIMAL(10,2))
+         FROM Posts a
+         WHERE a.PostTypeId = 2
+           AND a.ParentId = p.Id)            AS avg_answer_score,
+        (SELECT COUNT(*)
+         FROM Posts a
+         WHERE a.PostTypeId = 2
+           AND a.ParentId = p.Id
+           AND a.CreationDate > p.CreationDate) AS later_answers,
+        ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY p.CreationDate DESC) AS rn_q
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '30 days')
+),
+
+tag_stats AS (
+    SELECT
+        t.TagName,
+        COUNT(DISTINCT rq.q_id)                         AS questions_asked,
+        SUM(rq.q_score)                                 AS total_question_score,
+        AVG(rq.avg_answer_score)                        AS avg_answer_score_per_question,
+        PERCENT_RANK() OVER (ORDER BY COUNT(DISTINCT rq.q_id) DESC) AS popularity_rank,
+        MAX(rq.CreationDate)                            AS last_question_date,
+        COALESCE(t.Count, 0)                            AS tag_global_count
+    FROM Tags t
+    LEFT JOIN LATERAL (
+        SELECT *
+        FROM recent_questions rq
+        WHERE rq.raw_tags LIKE ('%' || '<' || t.TagName || '>' || '%')
+    ) rq ON TRUE
+    GROUP BY t.TagName, t.Count
+),
+
+closed_questions AS (
+    SELECT 
+        p.Id          AS q_id,
+        p.Title,
+        p.CreationDate,
+        p.ClosedDate,
+        1 AS is_closed
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.ClosedDate IS NOT NULL
+),
+open_questions AS (
+    SELECT 
+        p.Id          AS q_id,
+        p.Title,
+        p.CreationDate,
+        CAST(NULL AS TIMESTAMP)          AS ClosedDate,
+        0 AS is_closed
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.ClosedDate IS NULL
+),
+
+question_user_activity AS (
+    SELECT 
+        q.q_id,
+        q.Title,
+        q.CreationDate,
+        q.is_closed,
+        q.ClosedDate,
+        COALESCE(u.DisplayName, p.OwnerDisplayName, 'Anonymous') AS owner_name,
+        (SELECT COUNT(*)
+         FROM Votes v
+         WHERE v.PostId = q.q_id)                           AS total_votes,
+        (SELECT COUNT(*)
+         FROM Comments c
+         WHERE c.PostId = q.q_id)                           AS comment_count,
+        (SELECT MAX(ph.CreationDate)
+         FROM PostHistory ph
+         WHERE ph.PostId = q.q_id
+           AND ph.PostHistoryTypeId IN (4,5,6))              AS last_edit_date
+    FROM (
+        SELECT * FROM closed_questions
+        UNION ALL
+        SELECT * FROM open_questions
+    ) q
+    LEFT JOIN Posts p ON p.Id = q.q_id
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+)
+
+SELECT
+    qa.q_id,
+    qa.Title,
+    qa.CreationDate,
+    CASE 
+        WHEN qa.is_closed = 1 THEN 'Closed'
+        ELSE 'Open'
+    END                                    AS status,
+    qa.owner_name,
+    qa.total_votes,
+    qa.comment_count,
+    COALESCE(qa.last_edit_date, qa.CreationDate) AS last_activity,
+    ts.Reputation,
+    ts.total_badges,
+    ts.gold_badges,
+    ts.silver_badges,
+    ts.bronze_badges,
+    tg.popularity_rank,
+    tg.questions_asked,
+    tg.avg_answer_score_per_question,
+    CASE 
+        WHEN qa.total_votes > 100 AND tg.popularity_rank <= 0.1 THEN 'Hot'
+        WHEN qa.is_closed = 1 THEN 'Needs Review'
+        ELSE NULL
+    END                                    AS flag
+FROM question_user_activity qa
+LEFT JOIN top_users ts ON ts.user_id = (
+    SELECT OwnerUserId FROM Posts WHERE Id = qa.q_id
+)
+LEFT JOIN LATERAL (
+    SELECT ts2.*
+    FROM tag_stats ts2
+    WHERE ts2.TagName = ANY (
+        SELECT unnest(
+            regexp_split_to_array(
+                regexp_replace(COALESCE((SELECT Tags FROM Posts WHERE Id = qa.q_id), ''), '^<|>$', '', 'g'),
+                '><'
+            )
+        )
+    )
+    ORDER BY ts2.popularity_rank ASC
+    LIMIT 1
+) tg ON TRUE
+ORDER BY 
+    CASE WHEN qa.is_closed = 0 THEN 0 ELSE 1 END,
+    qa.total_votes DESC,
+    COALESCE(qa.last_edit_date, qa.CreationDate) DESC
+LIMIT 200;

@@ -1,0 +1,99 @@
+-- {"query": "4868.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1020} 
+WITH
+  RankedPostEdits AS (
+    SELECT
+      ph.PostId,
+      ph.UserId,
+      ph.CreationDate,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate DESC) as rn
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      COUNT(DISTINCT p.Id) AS QuestionCount,
+      COUNT(DISTINCT a.Id) AS AnswerCount,
+      SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL AND p.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END) AS AcceptedAnswerCount,
+      MAX(p.CreationDate) AS LastQuestionDate,
+      MAX(a.CreationDate) AS LastAnswerDate
+    FROM Users u
+    LEFT JOIN Posts p
+      ON u.Id = p.OwnerUserId AND p.PostTypeId = 1 -- Questions
+    LEFT JOIN Posts a
+      ON u.Id = a.OwnerUserId AND a.PostTypeId = 2 -- Answers
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation
+  ),
+  PostEngagement AS (
+    SELECT
+      p.Id AS PostId,
+      p.OwnerUserId,
+      p.CreationDate,
+      p.Score,
+      p.ViewCount,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id AND c.Score > 0) AS PositiveCommentCount,
+      (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpVoteCount,
+      (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS DownVoteCount,
+      CASE
+        WHEN EXISTS (SELECT 1 FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3) THEN 'Duplicate'
+        ELSE 'Not Duplicate'
+      END AS DuplicateStatus
+    FROM Posts p
+    WHERE
+      p.PostTypeId = 1 -- Only consider questions for this analysis
+  )
+SELECT
+  ua.DisplayName,
+  ua.Reputation,
+  ua.QuestionCount,
+  ua.AnswerCount,
+  ua.AcceptedAnswerCount,
+  pe.PostId,
+  pe.CreationDate AS PostCreationDate,
+  pe.Score,
+  pe.ViewCount,
+  pe.AnswerCount AS PostAnswerCount,
+  pe.CommentCount AS PostCommentCount,
+  pe.FavoriteCount AS PostFavoriteCount,
+  pe.PositiveCommentCount,
+  pe.UpVoteCount,
+  pe.DownVoteCount,
+  pe.DuplicateStatus,
+  rpe.CreationDate AS LastEditDate,
+  DATEDIFF(day, ua.LastQuestionDate, cast('2024-10-01 12:34:56' as timestamp)) AS DaysSinceLastQuestion,
+  DATEDIFF(day, ua.LastAnswerDate, cast('2024-10-01 12:34:56' as timestamp)) AS DaysSinceLastAnswer,
+  LEN(COALESCE(u.AboutMe, '')) AS AboutMeLength,
+  CASE
+    WHEN u.WebsiteUrl IS NULL OR u.WebsiteUrl = '' THEN 'No Website'
+    ELSE 'Has Website'
+  END AS WebsitePresence,
+  u.Views AS UserTotalViews,
+  CASE
+    WHEN u.DownVotes > 0 THEN 'HasDownVotes'
+    ELSE 'NoDownVotes'
+  END AS UserVoteStatus
+FROM UserActivity ua
+LEFT JOIN PostEngagement pe
+  ON ua.UserId = pe.OwnerUserId
+LEFT JOIN RankedPostEdits rpe
+  ON pe.PostId = rpe.PostId AND rpe.rn = 1
+LEFT JOIN Users u
+  ON ua.UserId = u.Id
+WHERE
+  ua.QuestionCount > 5 -- Users with at least 5 questions
+  AND pe.Score > 0 -- Posts with positive score
+  AND pe.ViewCount > 100 -- Posts with more than 100 views
+  AND pe.PostCreationDate < DATEADD(month, -6, cast('2024-10-01 12:34:56' as timestamp)) -- Posts older than 6 months
+ORDER BY
+  ua.Reputation DESC,
+  pe.Score DESC,
+  pe.ViewCount DESC
+LIMIT 100;

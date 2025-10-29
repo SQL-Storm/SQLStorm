@@ -1,0 +1,280 @@
+-- {"query": "680.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2842} 
+with recent_users as (
+  select u.id as user_id,
+         u.displayname,
+         u.reputation,
+         u.creationdate,
+         u.location,
+         row_number() over (order by u.creationdate desc, u.id desc) as rn
+  from users u
+),
+active_posts as (
+  select p.id,
+         p.posttypeid,
+         p.creationdate,
+         p.score,
+         p.viewcount,
+         p.owneruserid,
+         p.title,
+         p.tags,
+         p.answercount,
+         p.commentcount,
+         p.closeddate,
+         p.lastactivitydate,
+         coalesce(nullif(trim(p.ownerdisplayname), ''), 'anon') as owner_display_name
+  from posts p
+  where p.creationdate >= (select min(creationdate) from users) -- arbitrary anchor to keep optimizer busy
+),
+post_engagements as (
+  select v.postid,
+         sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+         sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+         sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+         sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_sum,
+         count(*) as total_votes,
+         max(v.creationdate) as last_vote_at
+  from votes v
+  where v.creationdate is not null
+  group by v.postid
+),
+comment_activity as (
+  select c.postid,
+         count(*) as comment_count,
+         max(c.creationdate) as last_comment_at,
+         sum(case when c.score > 0 then 1 else 0 end) as positive_comments
+  from comments c
+  group by c.postid
+),
+tag_explode as (
+  select p.id as post_id,
+         unnest(string_to_array(substring(p.tags, 2, greatest(length(p.tags)-2,0)), '><')) as tag
+  from active_posts p
+  where p.posttypeid = 1
+    and p.tags is not null
+),
+top_tags as (
+  select t.tag,
+         count(*) as tag_post_count,
+         dense_rank() over (order by count(*) desc, min(post_id)) as tag_rank
+  from tag_explode t
+  group by t.tag
+),
+user_badge_stats as (
+  select b.userid,
+         sum(case when b.class = 1 then 1 else 0 end) as gold,
+         sum(case when b.class = 2 then 1 else 0 end) as silver,
+         sum(case when b.class = 3 then 1 else 0 end) as bronze,
+         count(*) as total_badges,
+         max(b.date) as last_badge_at,
+         sum(case when b.tagbased = 1 then 1 else 0 end) as tag_badges
+  from badges b
+  group by b.userid
+),
+question_answer_links as (
+  select q.id as question_id,
+         a.id as answer_id,
+         a.owneruserid as answer_user_id,
+         a.score as answer_score,
+         row_number() over (partition by q.id order by a.score desc nulls last, a.creationdate asc) as ans_rank
+  from posts q
+  left join posts a
+    on a.parentid = q.id and a.posttypeid = 2
+  where q.posttypeid = 1
+),
+dedup_links as (
+  select pl.postid as duplicate_id,
+         pl.relatedpostid as original_id,
+         pl.creationdate as dup_marked_at,
+         row_number() over (partition by pl.postid order by pl.creationdate desc, pl.id desc) as dup_rank
+  from postlinks pl
+  where pl.linktypeid = 3
+),
+close_events as (
+  select ph.postid,
+         min(ph.creationdate) filter (where ph.posthistorytypeid = 10) as first_close_at,
+         max(ph.creationdate) filter (where ph.posthistorytypeid = 10) as last_close_at,
+         count(*) filter (where ph.posthistorytypeid = 10) as close_votes,
+         max((regexp_match(ph.comment, '([0-9]+)'))[1])::int filter (where ph.posthistorytypeid = 10 and ph.comment ~ '^[0-9]+$') as last_close_reason_id
+  from posthistory ph
+  group by ph.postid
+),
+close_reasons as (
+  select crt.id as close_reason_id,
+         crt.name as close_reason_name
+  from closereasontypes crt
+),
+hotness as (
+  select p.id as post_id,
+         p.score,
+         p.viewcount,
+         p.answercount,
+         p.creationdate,
+         extract(epoch from (now() - p.creationdate))/3600.0 as age_hours,
+         (coalesce(pe.upvotes,0) - coalesce(pe.downvotes,0))::numeric as net_votes,
+         ln(greatest(1, p.viewcount)) + coalesce(pe.upvotes,0)*0.5 + coalesce(pe.downvotes,0)*(-0.3) + coalesce(ca.comment_count,0)*0.1
+           - greatest(0, extract(epoch from (now() - p.lastactivitydate))/86400.0)*0.05 as engagement_score
+  from active_posts p
+  left join post_engagements pe on pe.postid = p.id
+  left join comment_activity ca on ca.postid = p.id
+),
+user_activity as (
+  select u.id as user_id,
+         u.reputation,
+         u.displayname,
+         u.location,
+         u.creationdate,
+         coalesce(ub.total_badges,0) as total_badges,
+         coalesce(ub.gold,0) as gold,
+         coalesce(ub.silver,0) as silver,
+         coalesce(ub.bronze,0) as bronze,
+         coalesce(ub.tag_badges,0) as tag_badges,
+         sum(case when p.posttypeid = 1 then 1 else 0 end) as questions,
+         sum(case when p.posttypeid = 2 then 1 else 0 end) as answers,
+         count(p.id) as total_posts,
+         max(p.creationdate) as last_post_at
+  from users u
+  left join posts p on p.owneruserid = u.id
+  left join user_badge_stats ub on ub.userid = u.id
+  group by u.id, u.reputation, u.displayname, u.location, u.creationdate, ub.total_badges, ub.gold, ub.silver, ub.bronze, ub.tag_badges
+),
+ranked_questions as (
+  select q.id as question_id,
+         q.owneruserid as ask_user_id,
+         q.creationdate as asked_at,
+         q.score as q_score,
+         q.viewcount as q_views,
+         q.title,
+         q.tags,
+         q.acceptedanswerid,
+         pe.upvotes,
+         pe.downvotes,
+         pe.favorites,
+         pe.bounty_sum,
+         pe.total_votes,
+         coalesce(ca.comment_count, 0) as q_comment_count,
+         coalesce(h.engagement_score, 0) as engagement_score,
+         coalesce(cr.first_close_at, q.closeddate) as first_close_at,
+         cr.last_close_at,
+         cr.close_votes,
+         cr.last_close_reason_id,
+         dense_rank() over (order by coalesce(h.engagement_score,0) desc, q.viewcount desc, q.score desc, q.id) as hot_rank
+  from posts q
+  left join post_engagements pe on pe.postid = q.id
+  left join comment_activity ca on ca.postid = q.id
+  left join hotness h on h.post_id = q.id
+  left join close_events cr on cr.postid = q.id
+  where q.posttypeid = 1
+),
+accepted_answerers as (
+  select qa.question_id,
+         a.owneruserid as accepted_user_id,
+         a.score as accepted_score
+  from posts a
+  join posts q on q.acceptedanswerid = a.id and q.id = a.parentid
+  join question_answer_links qa on qa.question_id = q.id and qa.answer_id = a.id
+),
+user_quality as (
+  select ua.user_id,
+         (ua.reputation + ua.gold*100 + ua.silver*25 + ua.bronze*10 + ua.tag_badges*5)::numeric
+           / nullif(greatest(1, ua.total_posts),0) as quality_score,
+         ua.total_posts,
+         ua.answers,
+         ua.questions,
+         ua.total_badges,
+         ua.gold, ua.silver, ua.bronze
+  from user_activity ua
+),
+tag_focus as (
+  select te.tag,
+         count(distinct te.post_id) as q_count,
+         sum(rq.q_views) as total_views,
+         avg(rq.q_score) as avg_score,
+         percentile_cont(0.5) within group (order by rq.engagement_score) as p50_engagement
+  from tag_explode te
+  join ranked_questions rq on rq.question_id = te.post_id
+  group by te.tag
+),
+final_candidates as (
+  select rq.question_id,
+         rq.title,
+         rq.tags,
+         rq.q_views,
+         rq.q_score,
+         rq.engagement_score,
+         rq.hot_rank,
+         rq.upvotes, rq.downvotes, rq.favorites, rq.bounty_sum,
+         rq.q_comment_count,
+         rq.acceptedanswerid,
+         rq.first_close_at, rq.last_close_at, rq.close_votes, rq.last_close_reason_id,
+         du.original_id as duplicate_of_id,
+         du.dup_marked_at,
+         tu.tag,
+         tf.avg_score as tag_avg_score,
+         tf.p50_engagement as tag_p50_engagement,
+         ua.displayname as asker_name,
+         ua.reputation as asker_rep,
+         uq.quality_score as asker_quality
+  from ranked_questions rq
+  left join dedup_links du on du.duplicate_id = rq.question_id and du.dup_rank = 1
+  left join tag_explode te on te.post_id = rq.question_id
+  left join top_tags tu on tu.tag = te.tag and tu.tag_rank <= 50
+  left join tag_focus tf on tf.tag = te.tag
+  left join users ua on ua.id = rq.ask_user_id
+  left join user_quality uq on uq.user_id = rq.ask_user_id
+)
+select
+  fc.question_id,
+  substring(coalesce(fc.title, ''), 1, 200) as title_sample,
+  coalesce(fc.tags, '[]') as tags,
+  fc.q_views,
+  fc.q_score,
+  round(fc.engagement_score::numeric, 4) as engagement_score,
+  fc.hot_rank,
+  coalesce(fc.upvotes,0) as upvotes,
+  coalesce(fc.downvotes,0) as downvotes,
+  coalesce(fc.favorites,0) as favorites,
+  coalesce(fc.bounty_sum,0) as bounty_sum,
+  coalesce(fc.q_comment_count,0) as comment_count,
+  case when fc.acceptedanswerid is not null then 'Y' else 'N' end as has_accepted_answer,
+  case when fc.first_close_at is not null then 'Y' else 'N' end as was_closed,
+  coalesce(crt.name, 'Unknown') as last_close_reason,
+  coalesce(fc.duplicate_of_id, 0) as duplicate_of_id,
+  fc.dup_marked_at,
+  coalesce(fc.tag, '(other)') as sample_tag,
+  round(coalesce(fc.tag_avg_score, 0), 3) as tag_avg_score,
+  round(coalesce(fc.tag_p50_engagement, 0), 3) as tag_p50_engagement,
+  coalesce(fc.asker_name, '(unknown)') as asker_name,
+  coalesce(fc.asker_rep, 0) as asker_rep,
+  round(coalesce(fc.asker_quality, 0), 3) as asker_quality,
+  coalesce(
+    nullif(trim(regexp_replace(fc.title, '\s+', ' ', 'g')), ''),
+    coalesce(fc.asker_name, '(unknown)') || ' asked'
+  ) as normalized_title,
+  count(*) over () as total_returned_rows,
+  row_number() over (order by fc.hot_rank, fc.q_views desc, fc.q_score desc) as row_num
+from final_candidates fc
+left join close_reasons crt on crt.close_reason_id = fc.last_close_reason_id
+where
+  (
+    fc.engagement_score > 0
+    and (fc.q_views > 100 or fc.q_score >= 5)
+    and (fc.upvotes - fc.downvotes) >= 0
+    and (fc.duplicate_of_id is null or fc.q_score >= 0)
+  )
+  or
+  (
+    fc.engagement_score <= 0
+    and fc.q_views > 1000
+    and fc.hot_rank <= 5000
+  )
+  or
+  (
+    fc.last_close_reason_id in (101,102,103,104,105)
+    and fc.close_votes >= 1
+  )
+order by
+  fc.hot_rank,
+  coalesce(fc.tag_p50_engagement, 0) desc,
+  fc.q_views desc,
+  fc.q_score desc
+limit 500;

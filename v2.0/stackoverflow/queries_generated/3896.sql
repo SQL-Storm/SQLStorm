@@ -1,0 +1,174 @@
+-- {"query": "3896.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 3160} 
+
+WITH UserBadgeCounts AS (
+    SELECT
+        u.Id                                   AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(*) FILTER (WHERE b.Class = 1)    AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2)    AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3)    AS BronzeBadges,
+        SUM(CASE WHEN b.TagBased = 1 THEN 1 ELSE 0 END) AS TagBasedBadgeCount
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+UserPostStats AS (
+    SELECT
+        p.OwnerUserId                         AS UserId,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        SUM(p.Score) FILTER (WHERE p.PostTypeId = 1) AS QuestionScoreSum,
+        SUM(p.Score) FILTER (WHERE p.PostTypeId = 2) AS AnswerScoreSum,
+        MAX(p.CreationDate)                  AS LastPostDate,
+        MIN(p.CreationDate)                  AS FirstPostDate
+    FROM Posts p
+    GROUP BY p.OwnerUserId
+),
+
+UserVoteAggregate AS (
+    SELECT
+        v.PostId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+    FROM Votes v
+    GROUP BY v.PostId
+),
+
+RecentPosts AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.OwnerUserId,
+        COALESCE(u.DisplayName, p.OwnerDisplayName) AS OwnerName,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.CreationDate > NOW() - INTERVAL '30 days'
+),
+
+TagUsage AS (
+    SELECT
+        t.TagName,
+        COUNT(*)                                   AS TagPostCount,
+        SUM(p.Score)                               AS TagScoreSum,
+        STRING_AGG(DISTINCT CAST(p.Id AS varchar), ',' ORDER BY p.CreationDate DESC) AS RecentPostIds
+    FROM Tags t
+    JOIN Posts p ON p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+    GROUP BY t.TagName
+),
+
+Combined AS (
+    SELECT
+        ub.UserId,
+        ub.DisplayName,
+        ub.Reputation,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ub.TagBasedBadgeCount,
+        COALESCE(us.QuestionCount,0)               AS QuestionCount,
+        COALESCE(us.AnswerCount,0)                 AS AnswerCount,
+        COALESCE(us.QuestionScoreSum,0)            AS QuestionScoreSum,
+        COALESCE(us.AnswerScoreSum,0)              AS AnswerScoreSum,
+        COALESCE(vua.TotalUpVotes,0)               AS TotalUpVotes,
+        COALESCE(vua.TotalDownVotes,0)             AS TotalDownVotes,
+        us.LastPostDate,
+        us.FirstPostDate,
+        CASE
+            WHEN ub.Reputation > 20000 THEN 'Legendary'
+            WHEN ub.Reputation BETWEEN 10000 AND 20000 THEN 'Experienced'
+            WHEN ub.Reputation BETWEEN 2000 AND 9999 THEN 'Intermediate'
+            ELSE 'Newbie'
+        END                                        AS ReputationTier,
+        ROW_NUMBER() OVER (ORDER BY ub.Reputation DESC, ub.GoldBadges DESC) AS ReputationRank
+    FROM UserBadgeCounts ub
+    LEFT JOIN UserPostStats us      ON us.UserId = ub.UserId
+    LEFT JOIN (
+        SELECT
+            p.OwnerUserId                                               AS UserId,
+            SUM(va.UpVotes)   AS TotalUpVotes,
+            SUM(va.DownVotes) AS TotalDownVotes
+        FROM Posts p
+        LEFT JOIN UserVoteAggregate va ON va.PostId = p.Id
+        GROUP BY p.OwnerUserId
+    ) vua ON vua.UserId = ub.UserId
+)
+
+SELECT
+    c.UserId,
+    c.DisplayName,
+    c.Reputation,
+    c.GoldBadges,
+    c.SilverBadges,
+    c.BronzeBadges,
+    c.TagBasedBadgeCount,
+    c.QuestionCount,
+    c.AnswerCount,
+    c.QuestionScoreSum,
+    c.AnswerScoreSum,
+    c.TotalUpVotes,
+    c.TotalDownVotes,
+    c.ReputationTier,
+    c.ReputationRank,
+    COALESCE(rp.Title, 'No Recent Post')   AS LatestPostTitle,
+    rp.Score                               AS LatestPostScore,
+    rp.CreationDate                        AS LatestPostDate,
+    tg.TagName,
+    tg.TagPostCount,
+    tg.TagScoreSum,
+    tg.RecentPostIds
+FROM Combined c
+LEFT JOIN LATERAL (
+    SELECT Title, Score, CreationDate
+    FROM RecentPosts rp
+    WHERE rp.OwnerUserId = c.UserId AND rp.rn = 1
+    ORDER BY rp.CreationDate DESC
+    LIMIT 1
+) rp ON TRUE
+LEFT JOIN LATERAL (
+    SELECT t.TagName, t.TagPostCount, t.TagScoreSum, t.RecentPostIds
+    FROM TagUsage t
+    WHERE t.TagName = ANY (
+        SELECT UNNEST(string_to_array(p.Tags, '><'))
+        FROM Posts p
+        WHERE p.OwnerUserId = c.UserId
+        LIMIT 5
+    )
+    ORDER BY t.TagPostCount DESC
+    LIMIT 1
+) tg ON TRUE
+WHERE c.ReputationRank <= 100
+
+UNION ALL
+
+SELECT
+    NULL                                    AS UserId,
+    'Aggregated Summary'                    AS DisplayName,
+    SUM(c.Reputation)                       AS Reputation,
+    SUM(c.GoldBadges)                       AS GoldBadges,
+    SUM(c.SilverBadges)                     AS SilverBadges,
+    SUM(c.BronzeBadges)                     AS BronzeBadges,
+    SUM(c.TagBasedBadgeCount)               AS TagBasedBadgeCount,
+    SUM(c.QuestionCount)                    AS QuestionCount,
+    SUM(c.AnswerCount)                      AS AnswerCount,
+    SUM(c.QuestionScoreSum)                 AS QuestionScoreSum,
+    SUM(c.AnswerScoreSum)                   AS AnswerScoreSum,
+    SUM(c.TotalUpVotes)                     AS TotalUpVotes,
+    SUM(c.TotalDownVotes)                   AS TotalDownVotes,
+    NULL                                    AS ReputationTier,
+    NULL                                    AS ReputationRank,
+    NULL                                    AS LatestPostTitle,
+    NULL                                    AS LatestPostScore,
+    NULL                                    AS LatestPostDate,
+    NULL                                    AS TagName,
+    NULL                                    AS TagPostCount,
+    NULL                                    AS TagScoreSum,
+    NULL                                    AS RecentPostIds
+FROM Combined c
+WHERE c.ReputationRank <= 100
+ORDER BY ReputationRank NULLS LAST, Reputation DESC;

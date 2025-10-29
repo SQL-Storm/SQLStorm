@@ -1,0 +1,240 @@
+-- {"query": "2126.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1979} 
+WITH RecursiveTagCounts AS (
+    -- Recursively count tags used in questions and their linked duplicates
+    SELECT
+        t.Id AS TagId,
+        t.TagName,
+        1 AS Depth,
+        p.Id AS PostId
+    FROM Tags t
+    INNER JOIN Posts p ON p.PostTypeId = 1 AND p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    WHERE t.IsModeratorOnly = 0 AND t.IsRequired = 0
+    UNION ALL
+    SELECT
+        rtc.TagId,
+        rtc.TagName,
+        rtc.Depth + 1,
+        pl.RelatedPostId
+    FROM RecursiveTagCounts rtc
+    JOIN PostLinks pl ON pl.PostId = rtc.PostId AND pl.LinkTypeId = 3 /* Duplicate */
+    WHERE rtc.Depth < 3
+),
+TagAggregate AS (
+    SELECT
+        TagId,
+        TagName,
+        COUNT(DISTINCT PostId) AS QuestionCount
+    FROM RecursiveTagCounts
+    GROUP BY TagId, TagName
+),
+TopUsers AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COALESCE(badge_stats.GoldBadges,0) AS GoldBadges,
+        COALESCE(badge_stats.SilverBadges,0) AS SilverBadges,
+        COALESCE(badge_stats.BronzeBadges,0) AS BronzeBadges,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.Views DESC) AS Rank
+    FROM Users u
+    LEFT JOIN (
+        SELECT 
+            UserId,
+            SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+            SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+            SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+        FROM Badges
+        GROUP BY UserId
+    ) badge_stats ON badge_stats.UserId = u.Id
+    WHERE u.Reputation > 10000 -- Filter for active users with reasonable rep
+),
+UserPostStats AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        AVG(COALESCE(p.Score, 0)) AS AverageScore,
+        SUM(COALESCE(p.FavoriteCount,0)) AS TotalFavorites,
+        MAX(p.Score) FILTER (WHERE p.PostTypeId = 1) AS MaxQuestionScore,
+        MAX(p.Score) FILTER (WHERE p.PostTypeId = 2) AS MaxAnswerScore,
+        SUM(CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END) AS ClosedPosts
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id
+),
+TopUserComments AS (
+    -- Correlated subquery to get top comment for each top user by score and recency
+    SELECT
+        c.UserId,
+        c.PostId,
+        c.Text,
+        c.Score,
+        c.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY c.UserId ORDER BY c.Score DESC, c.CreationDate DESC) AS CommentRank
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+),
+RankedUserComments AS (
+    SELECT *
+    FROM TopUserComments
+    WHERE CommentRank = 1
+),
+PostHistoriesSummary AS (
+    SELECT
+        ph.PostId,
+        COUNT(*) AS EditCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (10,12) THEN 1 ELSE 0 END) AS CloseOrDeleteCount,
+        MAX(ph.CreationDate) AS LastEditDate
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+),
+HighActivityPosts AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.AcceptedAnswerId,
+        COALESCE(phs.EditCount, 0) AS EditCount,
+        COALESCE(phs.CloseOrDeleteCount, 0) AS CloseOrDeleteCount,
+        phs.LastEditDate
+    FROM Posts p
+    LEFT JOIN PostHistoriesSummary phs ON phs.PostId = p.Id
+    WHERE p.Score > 10 OR p.ViewCount > 1000
+),
+AnswerRanks AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.Score,
+        a.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS RankByScore
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+),
+TopAnswersPerQuestion AS (
+    SELECT *
+    FROM AnswerRanks
+    WHERE RankByScore = 1
+),
+UserActivityWindow AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        DATE_TRUNC('month', p.CreationDate) AS ActivityMonth,
+        COUNT(p.Id) AS PostsCount,
+        SUM(COALESCE(p.Score,0)) AS PostsScoreSum,
+        AVG(COALESCE(p.Score,0)) AS PostsScoreAvg
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.CreationDate >= u.CreationDate
+    GROUP BY u.Id, u.DisplayName, DATE_TRUNC('month', p.CreationDate)
+),
+ActiveMonthsPerUser AS (
+    SELECT
+        UserId,
+        COUNT(DISTINCT ActivityMonth) AS ActiveMonths
+    FROM UserActivityWindow
+    GROUP BY UserId
+)
+SELECT 
+    tu.Rank,
+    tu.Id AS UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.Views,
+    tu.UpVotes,
+    tu.DownVotes,
+    us.Questions,
+    us.Answers,
+    us.AverageScore,
+    us.TotalFavorites,
+    us.MaxQuestionScore,
+    us.MaxAnswerScore,
+    us.ClosedPosts,
+    tu.GoldBadges,
+    tu.SilverBadges,
+    tu.BronzeBadges,
+    rac.CommentRank AS TopCommentRank,
+    ruc.Text AS TopCommentText,
+    ruc.Score AS TopCommentScore,
+    agg.QuestionCount AS PopularTagQuestions,
+    amp.ActiveMonths,
+    COALESCE(HAP.Title, '(No High Activity Post)') AS SampleHighActivityPost,
+    HAP.Score AS SamplePostScore,
+    HAP.ViewCount AS SampleViewCount,
+    HAP.EditCount AS SampleEditCount,
+    TA.AnswerId AS TopAnswerId,
+    TA.Score AS TopAnswerScore,
+    EXISTS(
+        SELECT 1
+        FROM Votes v
+        WHERE v.PostId = TA.AnswerId AND v.VoteTypeId = 2 AND v.UserId = tu.Id
+    ) AS UpvotedTopAnswerByUser,
+    CASE
+        WHEN tu.Location IS NOT NULL THEN UPPER(tu.Location)
+        ELSE 'UNKNOWN'
+    END AS LocationUpper,
+    CASE 
+        WHEN tu.WebsiteUrl LIKE '%stackoverflow%' THEN 'StackOverflow Related'
+        ELSE 'Other'
+    END AS WebsiteCategory
+FROM TopUsers tu
+JOIN UserPostStats us ON us.UserId = tu.Id
+LEFT JOIN RankedUserComments ruc ON ruc.UserId = tu.Id
+LEFT JOIN TagAggregate agg ON agg.TagName = (
+    SELECT TagName FROM TagAggregate ORDER BY QuestionCount DESC LIMIT 1
+)
+LEFT JOIN ActiveMonthsPerUser amp ON amp.UserId = tu.Id
+LEFT JOIN HighActivityPosts HAP ON HAP.OwnerUserId = tu.Id
+LEFT JOIN TopAnswersPerQuestion TA ON TA.QuestionId = HAP.Id
+LEFT JOIN TopUserComments rac ON rac.UserId = tu.Id
+WHERE us.TotalPosts > 50
+ORDER BY tu.Reputation DESC, us.TotalFavorites DESC
+LIMIT 20
+
+UNION
+
+SELECT 
+    NULL AS Rank,
+    NULL AS UserId,
+    'Aggregate Totals' AS DisplayName,
+    SUM(tu.Reputation) AS Reputation,
+    SUM(tu.Views) AS Views,
+    SUM(tu.UpVotes) AS UpVotes,
+    SUM(tu.DownVotes) AS DownVotes,
+    SUM(us.Questions) AS Questions,
+    SUM(us.Answers) AS Answers,
+    AVG(us.AverageScore) AS AverageScore,
+    SUM(us.TotalFavorites) AS TotalFavorites,
+    MAX(us.MaxQuestionScore) AS MaxQuestionScore,
+    MAX(us.MaxAnswerScore) AS MaxAnswerScore,
+    SUM(us.ClosedPosts) AS ClosedPosts,
+    SUM(tu.GoldBadges) AS GoldBadges,
+    SUM(tu.SilverBadges) AS SilverBadges,
+    SUM(tu.BronzeBadges) AS BronzeBadges,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL
+FROM TopUsers tu
+JOIN UserPostStats us ON us.UserId = tu.Id;

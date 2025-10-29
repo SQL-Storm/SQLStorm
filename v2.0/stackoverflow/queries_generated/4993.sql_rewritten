@@ -1,0 +1,159 @@
+-- {"query": "4993.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1272} 
+WITH
+  RankedAnswers AS (
+    SELECT
+      p.Id AS PostId,
+      p.ParentId AS QuestionId,
+      p.OwnerUserId,
+      p.Score,
+      p.CreationDate,
+      ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS AnswerRank
+    FROM
+      Posts AS p
+    WHERE
+      p.PostTypeId = 2
+  ),
+  QuestionStats AS (
+    SELECT
+      p.Id AS QuestionId,
+      p.OwnerUserId AS QuestionOwnerUserId,
+      p.CreationDate AS QuestionCreationDate,
+      p.AnswerCount,
+      p.FavoriteCount,
+      (
+        SELECT
+          COUNT(*)
+        FROM
+          Comments AS c
+        WHERE
+          c.PostId = p.Id AND c.Score > 0
+      ) AS PositiveCommentCount,
+      (
+        SELECT
+          SUM(v.VoteTypeId = 2)
+        FROM
+          Votes AS v
+        WHERE
+          v.PostId = p.Id
+      ) AS UpVoteCount
+    FROM
+      Posts AS p
+    WHERE
+      p.PostTypeId = 1
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate AS UserCreationDate,
+      (
+        SELECT
+          COUNT(*)
+        FROM
+          Badges AS b
+        WHERE
+          b.UserId = u.Id AND b.Class = 1
+      ) AS GoldBadges,
+      (
+        SELECT
+          COUNT(*)
+        FROM
+          Badges AS b
+        WHERE
+          b.UserId = u.Id AND b.Class = 2
+      ) AS SilverBadges,
+      (
+        SELECT
+          COUNT(*)
+        FROM
+          Badges AS b
+        WHERE
+          b.UserId = u.Id AND b.Class = 3
+      ) AS BronzeBadges
+    FROM
+      Users AS u
+  ),
+  HotQuestions AS (
+    SELECT
+      qs.QuestionId,
+      qs.QuestionOwnerUserId,
+      qs.QuestionCreationDate,
+      qs.AnswerCount,
+      qs.FavoriteCount,
+      qs.PositiveCommentCount,
+      qs.UpVoteCount,
+      ua.DisplayName AS QuestionOwnerDisplayName,
+      ua.Reputation AS QuestionOwnerReputation,
+      ua.GoldBadges AS QuestionOwnerGoldBadges,
+      ua.SilverBadges AS QuestionOwnerSilverBadges,
+      ua.BronzeBadges AS QuestionOwnerBronzeBadges,
+      ra.Score AS BestAnswerScore,
+      ra.CreationDate AS BestAnswerCreationDate,
+      ra.OwnerUserId AS BestAnswerOwnerUserId,
+      ua_ba.DisplayName AS BestAnswerOwnerDisplayName,
+      ua_ba.Reputation AS BestAnswerOwnerReputation
+    FROM
+      QuestionStats AS qs
+      JOIN UserActivity AS ua ON qs.QuestionOwnerUserId = ua.UserId
+      LEFT JOIN RankedAnswers AS ra ON qs.QuestionId = ra.QuestionId AND ra.AnswerRank = 1
+      LEFT JOIN UserActivity AS ua_ba ON ra.OwnerUserId = ua_ba.UserId
+    WHERE
+      qs.QuestionCreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 day'
+      AND qs.AnswerCount > 5
+      AND qs.FavoriteCount > 10
+      AND qs.UpVoteCount > 50
+      AND qs.PositiveCommentCount > 3
+      AND (
+        ra.Score IS NULL OR ra.Score > 100
+      )
+  )
+SELECT
+  hq.QuestionId,
+  hq.QuestionOwnerDisplayName,
+  hq.QuestionOwnerReputation,
+  hq.QuestionOwnerGoldBadges,
+  hq.QuestionOwnerSilverBadges,
+  hq.QuestionOwnerBronzeBadges,
+  hq.QuestionCreationDate,
+  hq.AnswerCount,
+  hq.FavoriteCount,
+  hq.PositiveCommentCount,
+  hq.UpVoteCount,
+  hq.BestAnswerScore,
+  hq.BestAnswerCreationDate,
+  hq.BestAnswerOwnerDisplayName,
+  hq.BestAnswerOwnerReputation,
+  'ScoreDelta: ' || CAST(hq.BestAnswerScore - hq.UpVoteCount AS VARCHAR) AS ScoreDifference,
+  CASE
+    WHEN hq.BestAnswerScore IS NULL THEN 'No Answers'
+    WHEN hq.BestAnswerScore > 1000 THEN 'Highly Scored Answer'
+    WHEN hq.BestAnswerScore > 500 THEN 'Well Scored Answer'
+    ELSE 'Moderately Scored Answer'
+  END AS AnswerQualityCategory,
+  COALESCE(ua.DisplayName, 'Community User') AS QuestionOwnerOrCommunity
+FROM
+  HotQuestions AS hq
+  LEFT JOIN Users AS ua ON hq.QuestionOwnerUserId = ua.Id
+UNION
+SELECT
+  NULL AS QuestionId,
+  NULL AS QuestionOwnerDisplayName,
+  NULL AS QuestionOwnerReputation,
+  NULL AS QuestionOwnerGoldBadges,
+  NULL AS QuestionOwnerSilverBadges,
+  NULL AS QuestionOwnerBronzeBadges,
+  NULL AS QuestionCreationDate,
+  NULL AS AnswerCount,
+  NULL AS FavoriteCount,
+  NULL AS PositiveCommentCount,
+  NULL AS UpVoteCount,
+  NULL AS BestAnswerScore,
+  NULL AS BestAnswerCreationDate,
+  NULL AS BestAnswerOwnerDisplayName,
+  NULL AS BestAnswerOwnerReputation,
+  NULL AS ScoreDifference,
+  NULL AS AnswerQualityCategory,
+  'Total Hot Questions: ' || CAST(COUNT(*) AS VARCHAR) AS QuestionOwnerOrCommunity
+FROM
+  HotQuestions;

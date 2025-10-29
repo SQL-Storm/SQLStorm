@@ -1,0 +1,174 @@
+-- {"query": "1467.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2951} 
+
+WITH UserEngagement AS (
+    -- CTE 1: Summarize user activity and categorize users by reputation and creation date quartiles.
+    -- This CTE gathers general user statistics, including post/comment counts and vote activity.
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesGiven,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesGiven,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank, -- Window function: Rank users by reputation
+        NTILE(4) OVER (ORDER BY u.CreationDate) AS CreationDateQuartile, -- Window function: Divide users into quartiles by creation date
+        CASE -- Complex expression: Categorize users based on reputation thresholds
+            WHEN u.Reputation >= 20000 THEN 'Legendary'
+            WHEN u.Reputation >= 5000 THEN 'Veteran'
+            WHEN u.Reputation >= 1000 THEN 'Experienced'
+            WHEN u.Reputation >= 100 THEN 'Contributor'
+            ELSE 'Novice'
+        END AS ReputationTier
+    FROM Users AS u
+    LEFT JOIN Posts AS p ON u.Id = p.OwnerUserId -- Outer join to include users without posts
+    LEFT JOIN Comments AS c ON u.Id = c.UserId   -- Outer join to include users without comments
+    LEFT JOIN Votes AS v ON u.Id = v.UserId     -- Outer join to include users who haven't voted
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+QuestionMeta AS (
+    -- CTE 2: Aggregate metadata for questions, including related post counts, closure reasons, and calculated scores.
+    -- This CTE processes questions, their accepted answers, and historical closure details.
+    SELECT
+        q.Id AS QuestionId,
+        q.OwnerUserId,
+        q.Title,
+        q.CreationDate AS QuestionCreationDate,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        q.CommentCount,
+        q.FavoriteCount,
+        q.Tags,
+        q.ClosedDate,
+        q.AcceptedAnswerId,
+        -- Correlated subquery 1: Count duplicate links for the question
+        (SELECT COUNT(DISTINCT pl.RelatedPostId) FROM PostLinks pl WHERE pl.PostId = q.Id AND pl.LinkTypeId = 3) AS DuplicateCount,
+        -- Correlated subquery 2: Count general linked posts for the question
+        (SELECT COUNT(DISTINCT pl.RelatedPostId) FROM PostLinks pl WHERE pl.PostId = q.Id AND pl.LinkTypeId = 1) AS LinkedCount,
+        -- Correlated subquery 3: Retrieve the latest close reason name, handling NULLs
+        (SELECT crt.Name FROM PostHistory ph INNER JOIN CloseReasonTypes crt ON CAST(ph.Comment AS smallint) = crt.Id WHERE ph.PostId = q.Id AND ph.PostHistoryTypeId = 10 ORDER BY ph.CreationDate DESC LIMIT 1) AS CloseReason,
+        a.OwnerUserId AS AcceptedAnswerOwnerId,
+        a.Score AS AcceptedAnswerScore,
+        a.CreationDate AS AcceptedAnswerCreationDate,
+        -- Complex calculation: Time taken to accept an answer in hours (NULL if no accepted answer)
+        EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate)) / 3600.0 AS TimeToAcceptAnswerHours,
+        -- Complex expression/calculation: A weighted engagement score for the question
+        COALESCE(q.FavoriteCount, 0) + (COALESCE(q.Score, 0) * 2) + (COALESCE(q.AnswerCount, 0) * 3) + (COALESCE(q.ViewCount, 0) / 100.0) AS WeightedQuestionEngagementScore,
+        LENGTH(q.Body) AS QuestionBodyLength -- String expression: Length of the question body
+    FROM Posts AS q
+    LEFT JOIN Posts AS a ON q.AcceptedAnswerId = a.Id -- Outer join to get details of the accepted answer
+    WHERE q.PostTypeId = 1 -- Filter for questions only
+),
+RecentPostActivity AS (
+    -- CTE 3: Identifies the latest significant activity (edit, closure, etc.) for each post using a window function.
+    SELECT
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate AS HistoryDate,
+        ph.UserId AS HistoryUserId,
+        ph.UserDisplayName AS HistoryUserDisplayName,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC, ph.Id DESC) AS rn_latest_history -- Window function: Get the most recent history entry per post
+    FROM PostHistory AS ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6, 10, 11, 12, 13, 16, 19, 20, 35) -- Filter for specific, "significant" history types
+),
+TagAnalysis AS (
+    -- CTE 4: Parses the 'Tags' string into individual tags and joins with the Tags table for metadata.
+    -- Utilizes string functions and `LATERAL UNNEST` for complex string parsing.
+    SELECT
+        qm.QuestionId,
+        TRIM(tag_val) AS ParsedTag, -- String expression: Clean up parsed tag
+        t.Id AS TagId,
+        t.Count AS TagUseCount,
+        t.IsModeratorOnly
+    FROM QuestionMeta AS qm
+    CROSS JOIN LATERAL UNNEST(string_to_array(SUBSTRING(qm.Tags, 2, LENGTH(qm.Tags)-2), '><')) AS tag_val -- String functions: Extract and split tags
+    INNER JOIN Tags AS t ON TRIM(tag_val) = t.TagName -- Join to Tags table to enrich tag data
+    WHERE qm.Tags IS NOT NULL AND LENGTH(qm.Tags) > 2 -- Predicate: Ensure tags exist and are properly formatted
+)
+-- Main query: Joins all CTEs and performs final aggregations and filtering
+SELECT
+    ue.UserId,
+    ue.DisplayName,
+    ue.Reputation,
+    ue.ReputationTier,
+    ue.TotalPosts,
+    ue.TotalComments,
+    qm.QuestionId,
+    qm.Title,
+    qm.QuestionCreationDate,
+    qm.QuestionScore,
+    qm.ViewCount,
+    qm.AnswerCount,
+    qm.WeightedQuestionEngagementScore,
+    qm.QuestionBodyLength,
+    qm.TimeToAcceptAnswerHours,
+    qm.CloseReason,
+    rp.HistoryDate AS LatestActivityDate,
+    rp.PostHistoryTypeId AS LatestActivityType,
+    ph_type.Name AS LatestActivityTypeName,
+    COALESCE(b.GoldBadgeCount, 0) AS GoldBadges, -- NULL Logic: Replace NULL badge counts with 0
+    COALESCE(b.SilverBadgeCount, 0) AS SilverBadges,
+    COALESCE(b.BronzeBadgeCount, 0) AS BronzeBadges,
+    -- Correlated subquery 4: Count comments made by users within the first day of the question
+    (SELECT COUNT(DISTINCT c2.Id) FROM Comments AS c2 WHERE c2.PostId = qm.QuestionId AND c2.CreationDate > qm.QuestionCreationDate + INTERVAL '1 day' AND c2.UserId IS NOT NULL) AS CommentsAfterFirstDayByUsers,
+    -- Correlated subquery 5: Count upvotes made by users within the first week of the question
+    (SELECT COUNT(DISTINCT v2.Id) FROM Votes AS v2 WHERE v2.PostId = qm.QuestionId AND v2.VoteTypeId = 2 AND v2.CreationDate > qm.QuestionCreationDate + INTERVAL '7 days' AND v2.UserId IS NOT NULL) AS UpvotesAfterFirstWeekByUsers,
+    CASE -- Complex expression: Categorize question status based on closure and accepted answer
+        WHEN qm.ClosedDate IS NOT NULL AND qm.AcceptedAnswerId IS NULL THEN 'Closed_NoAcceptedAnswer'
+        WHEN qm.ClosedDate IS NOT NULL AND qm.AcceptedAnswerId IS NOT NULL THEN 'Closed_AcceptedAnswer'
+        WHEN qm.ClosedDate IS NULL AND qm.AcceptedAnswerId IS NOT NULL THEN 'Open_AcceptedAnswer'
+        ELSE 'Open_NoAcceptedAnswer'
+    END AS QuestionStatusCategory,
+    STRING_AGG(DISTINCT ta.ParsedTag ORDER BY ta.ParsedTag, ta.TagUseCount DESC, ta.IsModeratorOnly DESC, ta.TagId DESC, '; ') AS CombinedTagsInfo, -- String aggregation: Combine parsed tags with complex ordering
+    MAX(ta.TagUseCount) AS MaxTagUseCountInQuestion, -- Aggregate: Max usage count of any tag on the question
+    BOOL_OR(ta.IsModeratorOnly) AS ContainsModeratorOnlyTag -- Aggregate: Check if any tag on the question is moderator-only
+FROM UserEngagement AS ue
+INNER JOIN QuestionMeta AS qm ON ue.UserId = qm.OwnerUserId
+LEFT JOIN RecentPostActivity AS rp ON qm.QuestionId = rp.PostId AND rp.rn_latest_history = 1 -- Outer join for latest post activity
+LEFT JOIN PostHistoryTypes AS ph_type ON rp.PostHistoryTypeId = ph_type.Id -- Outer join to get history type name
+LEFT JOIN (
+    -- Non-correlated subquery (derived table): Summarizes badge counts for each user
+    SELECT
+        UserId,
+        SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadgeCount,
+        SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadgeCount,
+        SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadgeCount
+    FROM Badges
+    GROUP BY UserId
+) AS b ON ue.UserId = b.UserId
+LEFT JOIN TagAnalysis AS ta ON qm.QuestionId = ta.QuestionId -- Outer join to include tag analysis data
+WHERE
+    ue.ReputationTier IN ('Veteran', 'Experienced') -- Predicate: Filter for specific reputation tiers
+    AND qm.QuestionScore >= 5 -- Predicate: Minimum question score
+    AND qm.QuestionBodyLength > 80 -- Predicate: Minimum question body length (string function result)
+    AND (qm.Tags LIKE '%<sql>%' OR qm.Tags LIKE '%<database>%' OR qm.Tags LIKE '%<performance>%') -- String expression: Filter by tag patterns
+    AND qm.QuestionCreationDate >= ue.LastAccessDate - INTERVAL '2 year' -- Correlated predicate: Question created within 2 years of user's last access
+    AND qm.TimeToAcceptAnswerHours BETWEEN 0.1 AND 72 -- Predicate: Accepted answer received between 6 minutes and 3 days (on a calculated field)
+    AND NOT EXISTS (
+        -- Correlated subquery 6: Exclude questions deleted and then quickly undeleted by the same user
+        SELECT 1 FROM PostHistory ph_del
+        WHERE ph_del.PostId = qm.QuestionId
+          AND ph_del.PostHistoryTypeId = 12 -- Post Deleted
+          AND EXISTS (
+              SELECT 1 FROM PostHistory ph_undel
+              WHERE ph_undel.PostId = qm.QuestionId
+                AND ph_undel.PostHistoryTypeId = 13 -- Post Undeleted
+                AND ph_undel.UserId = ph_del.UserId
+                AND ph_undel.CreationDate < ph_del.CreationDate + INTERVAL '1 hour' -- Date arithmetic
+          )
+    )
+GROUP BY
+    ue.UserId, ue.DisplayName, ue.Reputation, ue.ReputationTier, ue.TotalPosts, ue.TotalComments,
+    qm.QuestionId, qm.Title, qm.QuestionCreationDate, qm.QuestionScore, qm.ViewCount, qm.AnswerCount,
+    qm.WeightedQuestionEngagementScore, qm.QuestionBodyLength, qm.TimeToAcceptAnswerHours,
+    qm.CloseReason, rp.HistoryDate, rp.PostHistoryTypeId, ph_type.Name,
+    b.GoldBadgeCount, b.SilverBadgeCount, b.BronzeBadgeCount, qm.ClosedDate, qm.AcceptedAnswerId
+ORDER BY
+    ue.Reputation DESC, qm.WeightedQuestionEngagementScore DESC, qm.QuestionCreationDate DESC
+LIMIT 500; -- Limit the final result set for performance or specific reporting needs

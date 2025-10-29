@@ -1,0 +1,36 @@
+-- {"query": "6934.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-micro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 387} 
+
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.ParentId END) AS TotalAnswers,
+    COUNT(DISTINCT b.Id) AS TotalBadges,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 1 THEN ph.CreationDate END) AS FirstPostDate,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN p.ClosedDate END) AS FirstClosedPostDate,
+    STRING_AGG(DISTINCT t.TagName, ', ') AS MostCommonTags,
+    MAX(v.BountyAmount) AS HighestBounty
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN 
+    Tags t ON p.Id = t.ExcerptPostId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+WHERE 
+    u.Reputation > 10000
+    AND p.CreationDate >= DATEADD(year, -5, CURRENT_TIMESTAMP)
+    AND (u.Location IS NOT NULL OR u.AboutMe IS NOT NULL)
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation
+HAVING 
+    COUNT(DISTINCT p.Id) > 100
+    AND AVG(p.Score) > 10
+ORDER BY 
+    TotalPosts DESC, HighestBounty DESC;

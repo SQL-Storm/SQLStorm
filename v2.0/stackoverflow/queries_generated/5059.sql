@@ -1,0 +1,122 @@
+-- {"query": "5059.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 965} 
+WITH FilteredPosts AS (
+  SELECT
+    p.Id,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.ParentId,
+    p.AcceptedAnswerId
+  FROM Posts p
+  WHERE p.PostTypeId IN (1,2) -- Questions and Answers
+),
+QWithStats AS (
+  SELECT
+    fp.*,
+    u.Reputation,
+    u.DisplayName AS OwnerDisplayName,
+    u.CreationDate AS OwnerCreationDate,
+    u.LastAccessDate AS OwnerLastAccessDate,
+    COALESCE(vv.UpModCount,0) AS UpModCount
+  FROM FilteredPosts fp
+  LEFT JOIN Users u ON u.Id = fp.OwnerUserId
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS UpModCount
+    FROM Votes
+    WHERE VoteTypeId = 2
+    GROUP BY PostId
+  ) vv ON vv.PostId = fp.Id
+),
+RecentActivity AS (
+  SELECT
+    q.Id,
+    q.Title,
+    q.Tags,
+    q.CreationDate,
+    q.LastActivityDate,
+    q.Score,
+    q.ViewCount,
+    q.AnswerCount,
+    q.FavoriteCount,
+    q.OwnerUserId,
+    q.OwnerDisplayName,
+    q.Reputation,
+    q.UpModCount,
+    ROW_NUMBER() OVER (
+      PARTITION BY q.OwnerUserId
+      ORDER BY q.LastActivityDate DESC, q.Score DESC
+    ) AS rn_by_owner
+  FROM QWithStats q
+),
+JoinedMetrics AS (
+  SELECT
+    ra1.Id AS QuestionId,
+    ra1.Title,
+    ra1.Tags,
+    ra1.CreationDate,
+    ra1.LastActivityDate,
+    ra1.Score,
+    ra1.ViewCount,
+    ra1.AnswerCount,
+    ra1.FavoriteCount,
+    ra1.OwnerUserId,
+    ra1.OwnerDisplayName,
+    ra1.Reputation,
+    ra1.UpModCount,
+    COUNT(DISTINCT cl.Id) FILTER (WHERE clIdIsNotNull) AS CommentCountInLast30,
+    MAX(c.CreationDate) AS LastCommentDate
+  FROM RecentActivity ra1
+  LEFT JOIN Comments c ON c.PostId = ra1.Id
+  LEFT JOIN (
+      SELECT 1 AS clIdIsNotNull
+  ) t ON TRUE
+  LEFT JOIN LATERAL (
+      SELECT c2.Id, c2.CreationDate
+      FROM Comments c2
+      WHERE c2.PostId = ra1.Id
+        AND c2.CreationDate > NOW() - INTERVAL '30 days'
+      ORDER BY c2.CreationDate DESC
+      LIMIT 1
+  ) cl ON TRUE
+  GROUP BY ra1.Id, ra1.Title, ra1.Tags, ra1.CreationDate, ra1.LastActivityDate, ra1.Score, ra1.ViewCount, ra1.AnswerCount, ra1.FavoriteCount, ra1.OwnerUserId, ra1.OwnerDisplayName, ra1.Reputation, ra1.UpModCount
+),
+FinalSelection AS (
+  SELECT
+    j.QuestionId,
+    j.Title,
+    j.Tags,
+    j.CreationDate,
+    j.LastActivityDate,
+    j.Score,
+    j.ViewCount,
+    j.AnswerCount,
+    j.FavoriteCount,
+    j.OwnerUserId,
+    j.OwnerDisplayName,
+    j.Reputation,
+    j.UpModCount,
+    j.CommentCountInLast30,
+    j.LastCommentDate,
+    -- Complex computed field: activity score using multiple factors
+    (j.Score * 1.5
+     + j.ViewCount * 0.05
+     + COALESCE(j.CommentCountInLast30,0) * 2
+     + CASE WHEN j.LastCommentDate IS NULL THEN 0 ELSE 1 END
+    ) AS ActivityScore,
+    -- Window function to rank by ActivityScore within top owners
+    DENSE_RANK() OVER (ORDER BY (CASE WHEN j.LastCommentDate IS NULL THEN 0 ELSE 1 END) DESC, j.ActivityScore DESC) AS GlobalRank
+  FROM JoinedMetrics j
+  QUALIFY ( ROW_NUMBER() OVER (ORDER BY (CASE WHEN j.LastCommentDate IS NULL THEN 0 ELSE 1 END) DESC, j.ActivityScore DESC) <= 100 )
+)
+SELECT *
+FROM FinalSelection
+ORDER BY GlobalRank, ActivityScore DESC
+;

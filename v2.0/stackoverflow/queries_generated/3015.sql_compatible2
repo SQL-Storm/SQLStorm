@@ -1,0 +1,128 @@
+WITH 
+BadgeAgg AS (
+    SELECT 
+        UserId,
+        SUM(CASE WHEN "Class" = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN "Class" = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN "Class" = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges
+    GROUP BY UserId
+),
+UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(b.GoldBadges,0)   AS GoldBadges,
+        COALESCE(b.SilverBadges,0) AS SilverBadges,
+        COALESCE(b.BronzeBadges,0) AS BronzeBadges,
+        qcnt.QCount,
+        acnt.ACount,
+        qcnt.QScoreAvg,
+        acnt.AScoreAvg,
+        u.CreationDate,
+        u.LastAccessDate,
+        (SELECT MAX(p.CreationDate) FROM Posts p WHERE p.OwnerUserId = u.Id) AS LastPostDate
+    FROM Users u
+    LEFT JOIN BadgeAgg b ON b.UserId = u.Id
+    LEFT JOIN (
+        SELECT 
+            OwnerUserId,
+            COUNT(*)                                   AS QCount,
+            CAST(AVG(Score) AS NUMERIC(10,2))          AS QScoreAvg
+        FROM Posts
+        WHERE PostTypeId = 1
+        GROUP BY OwnerUserId
+    ) qcnt ON qcnt.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT 
+            OwnerUserId,
+            COUNT(*)                                   AS ACount,
+            CAST(AVG(Score) AS NUMERIC(10,2))          AS AScoreAvg
+        FROM Posts
+        WHERE PostTypeId = 2
+        GROUP BY OwnerUserId
+    ) acnt ON acnt.OwnerUserId = u.Id
+),
+RecentVotes AS (
+    SELECT 
+        v.PostId,
+        COUNT(CASE WHEN vt.Name = 'UpMod' THEN 1 END)       AS UpVotes,
+        COUNT(CASE WHEN vt.Name = 'DownMod' THEN 1 END)     AS DownVotes,
+        COUNT(CASE WHEN vt.Name = 'Favorite' THEN 1 END)    AS Favorites,
+        MAX(v.CreationDate)                                 AS LastVoteDate
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE v.CreationDate >= (DATE '2024-10-01' - INTERVAL '30' DAY)
+    GROUP BY v.PostId
+),
+TopUserTags AS (
+    SELECT 
+        p.OwnerUserId,
+        tag_raw AS TagName,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY t.Count DESC NULLS LAST) AS rn
+    FROM Posts p,
+         regexp_split_to_table(p.Tags, '[><]') AS tag_raw
+    LEFT JOIN Tags t ON t.TagName = tag_raw
+    WHERE p.PostTypeId = 1
+),
+RankedUsers AS (
+    SELECT 
+        us.*,
+        ROW_NUMBER() OVER (ORDER BY us.Reputation DESC) AS RepRank
+    FROM UserStats us
+    WHERE us.Reputation > 10000
+      AND us.LastPostDate IS NOT NULL
+      AND us.LastPostDate >= (DATE '2024-10-01' - INTERVAL '1' YEAR)
+)
+SELECT 
+    ru.Id,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.GoldBadges,
+    ru.SilverBadges,
+    ru.BronzeBadges,
+    ru.QCount,
+    ru.ACount,
+    ru.QScoreAvg,
+    ru.AScoreAvg,
+    ru.LastPostDate,
+    COALESCE(rv.UpVotes,0)      AS RecentUpVotes,
+    COALESCE(rv.DownVotes,0)    AS RecentDownVotes,
+    COALESCE(rv.Favorites,0)    AS RecentFavorites,
+    STRING_AGG(t.TagName, ', ') FILTER (WHERE t.rn <= 5) AS Top5Tags
+FROM RankedUsers ru
+LEFT JOIN RecentVotes rv ON rv.PostId = (
+    SELECT p.Id 
+    FROM Posts p 
+    WHERE p.OwnerUserId = ru.Id 
+    ORDER BY p.CreationDate DESC 
+    LIMIT 1
+)
+LEFT JOIN TopUserTags t ON t.OwnerUserId = ru.Id
+GROUP BY 
+    ru.Id, ru.DisplayName, ru.Reputation, ru.GoldBadges, ru.SilverBadges, ru.BronzeBadges,
+    ru.QCount, ru.ACount, ru.QScoreAvg, ru.AScoreAvg, ru.LastPostDate, rv.UpVotes,
+    rv.DownVotes, rv.Favorites
+HAVING SUM(CASE WHEN ru.ACount > 0 THEN 1 ELSE 0 END) > 0
+ORDER BY ru.Reputation DESC
+LIMIT 50
+
+UNION ALL
+
+SELECT 
+    NULL::BIGINT AS Id,
+    '--- End of Report ---' AS DisplayName,
+    NULL::INTEGER AS Reputation,
+    NULL::INTEGER AS GoldBadges,
+    NULL::INTEGER AS SilverBadges,
+    NULL::INTEGER AS BronzeBadges,
+    NULL::INTEGER AS QCount,
+    NULL::INTEGER AS ACount,
+    NULL::NUMERIC AS QScoreAvg,
+    NULL::NUMERIC AS AScoreAvg,
+    NULL::TIMESTAMP AS LastPostDate,
+    NULL::INTEGER AS RecentUpVotes,
+    NULL::INTEGER AS RecentDownVotes,
+    NULL::INTEGER AS RecentFavorites,
+    NULL::TEXT AS Top5Tags;

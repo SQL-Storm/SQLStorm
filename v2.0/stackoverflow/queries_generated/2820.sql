@@ -1,0 +1,201 @@
+-- {"query": "2820.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1651} 
+
+WITH RecursiveUserTags AS (
+    SELECT
+        u.Id AS UserId,
+        t.TagName,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY COUNT(p.Id) DESC) AS TagRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1 AND p.Tags IS NOT NULL
+    LEFT JOIN LATERAL (
+        SELECT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS TagName
+    ) t ON TRUE
+    GROUP BY u.Id, t.TagName
+    HAVING t.TagName IS NOT NULL
+),
+TopUserTags AS (
+    SELECT UserId, TagName
+    FROM RecursiveUserTags
+    WHERE TagRank = 1
+),
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        b.Class,
+        COUNT(*) AS BadgeCount
+    FROM Badges b
+    GROUP BY b.UserId, b.Class
+),
+UserReputationBuckets AS (
+    SELECT
+        Id AS UserId,
+        Reputation,
+        CASE 
+            WHEN Reputation >= 100000 THEN 'Legendary'
+            WHEN Reputation >= 10000 THEN 'Expert'
+            WHEN Reputation >= 1000 THEN 'Intermediate'
+            WHEN Reputation >= 100 THEN 'Beginner'
+            ELSE 'Newbie'
+        END AS ReputationLevel
+    FROM Users
+),
+QuestionAnswers AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate AS QuestionDate,
+        q.Score AS QuestionScore,
+        a.Id AS AnswerId,
+        a.CreationDate AS AnswerDate,
+        a.Score AS AnswerScore,
+        a.OwnerUserId AS AnswerOwnerUserId,
+        a.ParentId,
+        a.Body AS AnswerBody
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+),
+AnswerVoteStats AS (
+    SELECT
+        a.Id AS AnswerId,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVotes,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVotes,
+        COUNT(CASE WHEN v.VoteTypeId = 14 THEN 1 END) AS ModeratorNominations
+    FROM Posts a
+    LEFT JOIN Votes v ON v.PostId = a.Id
+    WHERE a.PostTypeId = 2
+    GROUP BY a.Id
+),
+AnswerDetailsWithVotes AS (
+    SELECT
+        q.QuestionId,
+        q.Title,
+        q.QuestionDate,
+        q.QuestionScore,
+        a.AnswerId,
+        a.AnswerDate,
+        a.AnswerScore,
+        av.UpVotes,
+        av.DownVotes,
+        av.ModeratorNominations,
+        u.DisplayName AS Answerer,
+        ut.TagName AS TopTagOfAnswerer,
+        ub.ReputationLevel,
+        COALESCE(ubc_badge.GoldCount, 0) AS GoldBadges,
+        COALESCE(ubc_badge.SilverCount, 0) AS SilverBadges,
+        COALESCE(ubc_badge.BronzeCount, 0) AS BronzeBadges,
+        LENGTH(a.AnswerBody) AS AnswerBodyLength,
+        CASE 
+            WHEN a.AnswerScore IS NULL THEN 0
+            ELSE a.AnswerScore
+        END * 3 + COALESCE(av.UpVotes,0) * 2 - COALESCE(av.DownVotes,0) AS WeightedScore
+    FROM QuestionAnswers q
+    LEFT JOIN AnswerVoteStats av ON av.AnswerId = q.AnswerId
+    LEFT JOIN Users u ON u.Id = q.AnswerOwnerUserId
+    LEFT JOIN TopUserTags ut ON ut.UserId = u.Id
+    LEFT JOIN UserReputationBuckets ub ON ub.UserId = u.Id
+    LEFT JOIN (
+        SELECT 
+            UserId,
+            SUM(CASE WHEN Class = 1 THEN BadgeCount ELSE 0 END) AS GoldCount,
+            SUM(CASE WHEN Class = 2 THEN BadgeCount ELSE 0 END) AS SilverCount,
+            SUM(CASE WHEN Class = 3 THEN BadgeCount ELSE 0 END) AS BronzeCount
+        FROM UserBadgeCounts
+        GROUP BY UserId
+    ) ubc_badge ON ubc_badge.UserId = u.Id
+    WHERE q.AnswerId IS NOT NULL
+),
+RankedAnswers AS (
+    SELECT
+        *,
+        ROW_NUMBER() OVER (PARTITION BY QuestionId ORDER BY WeightedScore DESC, AnswerDate ASC) AS AnswerRank
+    FROM AnswerDetailsWithVotes
+),
+ClosedQuestions AS (
+    SELECT
+        ph.PostId AS QuestionId,
+        crt.Name AS CloseReason,
+        ph.CreationDate AS ClosedOn,
+        u.DisplayName AS ClosedByUser,
+        ph.Comment AS CloseReasonId
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht ON pht.Id = ph.PostHistoryTypeId
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS int)
+    LEFT JOIN Users u ON u.Id = ph.UserId
+    WHERE pht.Name = 'Post Closed'
+),
+FinalSelected AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate AS AskedOn,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        u.DisplayName AS Asker,
+        r.AnswerId,
+        r.AnswerDate,
+        r.AnswerScore,
+        r.UpVotes,
+        r.DownVotes,
+        r.ModeratorNominations,
+        r.Answerer,
+        r.TopTagOfAnswerer,
+        r.ReputationLevel,
+        r.GoldBadges,
+        r.SilverBadges,
+        r.BronzeBadges,
+        r.AnswerBodyLength,
+        c.CloseReason,
+        c.ClosedOn,
+        c.ClosedByUser,
+        LENGTH(q.Title) AS TitleLength,
+        LENGTH(q.Tags) AS TagsLength,
+        CASE 
+            WHEN q.ClosedDate IS NOT NULL THEN 'Closed'
+            ELSE 'Open'
+        END AS QuestionStatus,
+        COALESCE(
+            (
+                SELECT COUNT(*)
+                FROM Comments cm
+                WHERE cm.PostId = q.Id AND cm.CreationDate > q.CreationDate AND cm.UserId IS NOT NULL
+            ), 0) AS CommentsAfterQuestion,
+        COALESCE(
+            (
+                SELECT AVG(Score)
+                FROM Posts ans
+                WHERE ans.ParentId = q.Id AND ans.PostTypeId = 2
+            ), 0) AS AvgAnswerScore,
+        r.WeightedScore
+    FROM Posts q
+    LEFT JOIN Users u ON u.Id = q.OwnerUserId
+    LEFT JOIN RankedAnswers r ON r.QuestionId = q.Id AND r.AnswerRank = 1
+    LEFT JOIN ClosedQuestions c ON c.QuestionId = q.Id
+    WHERE q.PostTypeId = 1
+      AND q.CreationDate > current_date - interval '1 year'
+      AND q.Score >= 5
+      AND (q.Tags LIKE '%<sql-%' OR q.Tags LIKE '%<performance-%')
+)
+SELECT 
+    * 
+FROM FinalSelected
+ORDER BY WeightedScore DESC NULLS LAST, QuestionScore DESC, AskedOn DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    u.Id AS UserId,
+    u.DisplayName AS UserName,
+    u.CreationDate,
+    b.Name AS BadgeName,
+    b.Date AS BadgeDate,
+    b.Class AS BadgeClass,
+    'UserBadges' AS SourceTable,
+    NULL::text AS ExtraInfo
+FROM Users u
+JOIN Badges b ON b.UserId = u.Id
+WHERE b.Class = 1 -- gold badges only
+  AND b.Date > current_date - interval '6 months'
+ORDER BY BadgeDate DESC
+LIMIT 50;

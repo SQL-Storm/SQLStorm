@@ -1,0 +1,129 @@
+-- {"query": "3971.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2011} 
+
+WITH top_users AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS rn,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS QuestionCount
+    FROM Users u
+    WHERE u.Reputation IS NOT NULL
+),
+tag_stats AS (
+    SELECT 
+        t.TagName,
+        COUNT(p.Id) AS PostCnt,
+        SUM(CASE WHEN p.Score > 0 THEN p.Score ELSE 0 END) AS TotalScore,
+        MAX(p.CreationDate) AS LatestPostDate
+    FROM Tags t
+    LEFT JOIN Posts p 
+        ON p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+    GROUP BY t.TagName
+),
+recent_closed AS (
+    SELECT 
+        ph.PostId,
+        ph.CreationDate AS CloseDate,
+        CAST(ph.Comment AS INT) AS CloseReasonId
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10
+),
+user_activity AS (
+    SELECT 
+        u.Id AS UserId,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT v.Id) AS TotalVotes,
+        COALESCE(SUM(v.BountyAmount),0) AS TotalBountyGiven,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    GROUP BY u.Id
+),
+combined AS (
+    SELECT 
+        tu.Id,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.GoldBadges,
+        tu.QuestionCount,
+        ua.TotalPosts,
+        ua.TotalVotes,
+        ua.TotalBountyGiven,
+        CASE
+            WHEN tu.Reputation > 20000 THEN 'Elite'
+            WHEN tu.Reputation > 10000 THEN 'Pro'
+            ELSE 'Member'
+        END AS Tier,
+        ROW_NUMBER() OVER (
+            PARTITION BY CASE WHEN tu.Reputation > 10000 THEN 'High' ELSE 'Low' END
+            ORDER BY tu.Reputation DESC
+        ) AS RankWithinTier
+    FROM top_users tu
+    LEFT JOIN user_activity ua ON ua.UserId = tu.Id
+    WHERE tu.rn <= 500
+)
+SELECT 
+    c.Id,
+    c.DisplayName,
+    c.Reputation,
+    c.GoldBadges,
+    c.QuestionCount,
+    c.TotalPosts,
+    c.TotalVotes,
+    c.TotalBountyGiven,
+    c.Tier,
+    c.RankWithinTier,
+    COALESCE(ts.PostCnt,0)            AS TagPostCount,
+    COALESCE(ts.TotalScore,0)         AS TagScore,
+    rc.CloseDate,
+    cr.Name                           AS CloseReasonName
+FROM combined c
+LEFT JOIN tag_stats ts 
+    ON ts.TagName = (
+        SELECT SUBSTRING_INDEX(
+                   SUBSTRING_INDEX(p.Tags, '><', 1), 
+                   '<', -1
+               )
+        FROM Posts p
+        WHERE p.OwnerUserId = c.Id
+        ORDER BY p.CreationDate DESC
+        LIMIT 1
+    )
+LEFT JOIN recent_closed rc 
+    ON rc.PostId = (
+        SELECT p.Id
+        FROM Posts p
+        WHERE p.OwnerUserId = c.Id
+        ORDER BY p.CreationDate DESC
+        LIMIT 1
+    )
+LEFT JOIN CloseReasonTypes cr 
+    ON cr.Id = rc.CloseReasonId
+WHERE c.Tier <> 'Member'
+
+UNION ALL
+
+SELECT 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    0          AS GoldBadges,
+    0          AS QuestionCount,
+    0          AS TotalPosts,
+    0          AS TotalVotes,
+    0          AS TotalBountyGiven,
+    'Newbie'   AS Tier,
+    NULL       AS RankWithinTier,
+    NULL       AS TagPostCount,
+    NULL       AS TagScore,
+    NULL       AS CloseDate,
+    NULL       AS CloseReasonName
+FROM Users u
+WHERE u.CreationDate > DATEADD(day, -30, CURRENT_TIMESTAMP)
+  AND NOT EXISTS (
+        SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id
+    )
+ORDER BY Reputation DESC, Tier ASC;

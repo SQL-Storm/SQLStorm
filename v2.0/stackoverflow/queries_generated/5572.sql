@@ -1,0 +1,147 @@
+-- {"query": "5572.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1069} 
+WITH recent_user_activity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName AS UserName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.Location,
+    u.AboutMe,
+    u.ProfileImageUrl,
+    u.EmailHash,
+    u.AccountId,
+    COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+    COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+    MAX(p.LastActivityDate) AS LastActivity
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY
+    u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate,
+    u.Views, u.UpVotes, u.DownVotes, u.Location, u.AboutMe,
+    u.ProfileImageUrl, u.EmailHash, u.AccountId
+),
+tagged_posts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.PostTypeId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.FavoriteCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.LastActivityDate,
+    p.ClosedDate,
+    p.ContentLicense,
+    t.TagName
+  FROM Posts p
+  LEFT JOIN LATERAL (
+    SELECT unnest(string_to_array(substr(p.Tags, 2, length(p.Tags)-2), '><')) AS TagName
+  ) t ON TRUE
+  WHERE p.PostTypeId = 1
+),
+complex_filter AS (
+  SELECT
+    rp.UserId AS RUserId,
+    rp.UserName AS RUserName,
+    rp.Reputation,
+    rp.LastAccessDate
+  FROM recent_user_activity rp
+  WHERE rp.LastActivity >= now() - interval '90 days'
+    AND (rp.Reputation > 1000 OR rp.Views > 1000)
+),
+performance_benchmark AS (
+  SELECT
+    u.UserId,
+    u.UserName,
+    p.PostId,
+    p.Title,
+    p.Tags,
+    p.PostTypeId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.FavoriteCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.LastActivityDate,
+    p.ClosedDate,
+    p.ContentLicense,
+    LAST_VALUE(p.LastActivityDate) OVER (
+      PARTITION BY u.UserId
+      ORDER BY p.LastActivityDate
+      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS LastVisibleActivity,
+    ROW_NUMBER() OVER (
+      PARTITION BY u.UserId
+      ORDER BY p.LastActivityDate DESC, p.Score DESC NULLS LAST
+    ) AS RankByActivity,
+    SUM(p.Score) OVER (PARTITION BY u.UserId) AS TotalScoreByUser
+  FROM complex_filter u
+  LEFT JOIN tagged_posts p ON p.OwnerUserId = u.RUserId
+  WHERE p.PostTypeId = 1
+    AND p.LastActivityDate >= now() - interval '180 days'
+),
+outer_join_sequence AS (
+  SELECT
+    b.RUserId,
+    b.RUserName,
+    b.TotalScoreByUser,
+    b.LastVisibleActivity,
+    a.PostId,
+    a.Title AS PostTitle,
+    a.TagName,
+    a.Score AS PostScore,
+    a.Views AS PostViews
+  FROM performance_benchmark b
+  LEFT JOIN (
+    SELECT
+      p.PostId,
+      p.Title,
+      p.TagName,
+      p.Score,
+      p.ViewCount AS Views
+    FROM performance_benchmark p
+    ORDER BY p.LastActivityDate DESC
+    LIMIT 200
+  ) a ON a.RUserId = b.RUserId
+),
+windowed AS (
+  SELECT
+    o.RUserId,
+    o.RUserName,
+    o.TotalScoreByUser,
+    o.LastVisibleActivity,
+    o.PostId,
+    o.PostTitle,
+    o.TagName,
+    o.PostScore,
+    o.PostViews,
+    ROW_NUMBER() OVER (PARTITION BY o.RUserId ORDER BY o.PostScore DESC NULLS LAST, o.PostViews DESC NULLS LAST) AS WRank
+  FROM outer_join_sequence o
+)
+SELECT
+  w.RUserId AS user_id,
+  w.RUserName AS user_name,
+  w.TotalScoreByUser AS total_score_by_user,
+  w.LastVisibleActivity AS last_activity,
+  w.PostId AS post_id,
+  w.PostTitle AS post_title,
+  w.TagName AS tag_name,
+  w.PostScore AS post_score,
+  w.PostViews AS post_views,
+  w.WRank AS rank_within_user,
+  CASE
+    WHEN w.RankWithinaUser IS NULL THEN NULL
+    ELSE w.RankWithinaUser * 0.0
+  END AS placeholder_calc
+FROM windowed w
+ORDER BY w.RUserId, w.WRank
+LIMIT 100;

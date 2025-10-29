@@ -1,0 +1,188 @@
+WITH
+UserStats AS (
+    SELECT
+        u.Id                                    AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.Views, 0)                    AS TotalViews,
+        COUNT(DISTINCT b.Id)                    AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2)      AS UpVotesGiven,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 3)      AS DownVotesGiven,
+        MAX(u.CreationDate)                     AS AccountCreated,
+        MAX(u.LastAccessDate)                   AS LastSeen
+    FROM Users u
+    LEFT JOIN Badges b      ON b.UserId = u.Id
+    LEFT JOIN Votes  v      ON v.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views
+),
+LatestPost AS (
+    SELECT
+        p.OwnerUserId                              AS UserId,
+        p.Id                                       AS PostId,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId
+                           ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+),
+TagStats AS (
+    SELECT
+        TRIM(BOTH '><' FROM UNNEST(string_to_array(p.Tags, '><'))) AS Tag,
+        COUNT(*)                                                         AS Uses,
+        COUNT(DISTINCT p.OwnerUserId)                                    AS DistinctContributors
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.Tags IS NOT NULL
+    GROUP BY Tag
+),
+PostVotes AS (
+    SELECT
+        p.Id                                    AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id),0) AS UpVotes,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id),0) AS DownVotes,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id),0) AS Favorites,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId
+                           ORDER BY p.Score DESC, p.CreationDate)               AS ScoreRank
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+),
+QuestionMetrics AS (
+    SELECT
+        pv.PostId,
+        pv.OwnerUserId,
+        pv.CreationDate,
+        pv.Score,
+        pv.UpVotes,
+        pv.DownVotes,
+        pv.Favorites,
+        pv.ScoreRank,
+        'Question' AS ObjType,
+        p.Title,
+        p.Tags
+    FROM PostVotes pv
+    JOIN Posts p ON p.Id = pv.PostId
+    WHERE pv.PostTypeId = 1
+),
+AnswerMetrics AS (
+    SELECT
+        pv.PostId,
+        pv.OwnerUserId,
+        pv.CreationDate,
+        pv.Score,
+        pv.UpVotes,
+        pv.DownVotes,
+        pv.Favorites,
+        pv.ScoreRank,
+        'Answer'   AS ObjType,
+        ''         AS Title,
+        ''         AS Tags
+    FROM PostVotes pv
+    WHERE pv.PostTypeId = 2
+),
+CombinedPosts AS (
+    SELECT * FROM QuestionMetrics
+    UNION ALL
+    SELECT * FROM AnswerMetrics
+),
+UserTopPost AS (
+    SELECT
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.TotalViews,
+        us.BadgeCount,
+        us.GoldBadges,
+        us.SilverBadges,
+        us.BronzeBadges,
+        us.UpVotesGiven,
+        us.DownVotesGiven,
+        us.AccountCreated,
+        us.LastSeen,
+        lp.PostId,
+        lp.Title,
+        lp.CreationDate   AS PostDate,
+        lp.Score,
+        COALESCE(lp.Tags, '') AS TagList,
+        ROW_NUMBER() OVER (ORDER BY us.Reputation DESC, us.TotalViews DESC) AS UserRank
+    FROM UserStats us
+    LEFT JOIN LatestPost lp
+           ON lp.UserId = us.UserId AND lp.rn = 1
+),
+TagSignal AS (
+    SELECT
+        ts.Tag,
+        ts.Uses,
+        ts.DistinctContributors,
+        (ts.Uses * LOG(1 + ts.DistinctContributors))          AS SignalScore,
+        CASE
+            WHEN ts.Uses > 1000 THEN 'High'
+            WHEN ts.Uses > 500  THEN 'Medium'
+            ELSE 'Low'
+        END                                                   AS PopularityBand
+    FROM TagStats ts
+    WHERE ts.Tag IS NOT NULL
+),
+UserWithPosts AS (
+    SELECT
+        utp.UserId,
+        utp.DisplayName,
+        utp.Reputation,
+        utp.UserRank,
+        utp.BadgeCount,
+        utp.GoldBadges,
+        utp.SilverBadges,
+        utp.BronzeBadges,
+        utp.UpVotesGiven,
+        utp.DownVotesGiven,
+        utp.TotalViews,
+        utp.AccountCreated,
+        utp.LastSeen,
+        utp.PostId,
+        utp.Title,
+        utp.PostDate,
+        utp.Score,
+        COALESCE(utp.TagList, '')                        AS TagList,
+        NULLIF(split_part(utp.TagList, '><', 1), '')      AS FirstTag
+    FROM UserTopPost utp
+)
+SELECT
+    u.UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.UserRank,
+    u.BadgeCount,
+    u.GoldBadges,
+    u.SilverBadges,
+    u.BronzeBadges,
+    u.UpVotesGiven,
+    u.DownVotesGiven,
+    u.TotalViews,
+    u.AccountCreated,
+    u.LastSeen,
+    u.PostId,
+    u.Title,
+    u.PostDate,
+    u.Score,
+    u.TagList,
+    ts.SignalScore,
+    ts.PopularityBand,
+    (u.DisplayName || ' (' || u.Reputation || ') - ' ||
+     'Rank:' || u.UserRank || ' | ' ||
+     'Top ' || u.Title || ' (Score ' || COALESCE(u.Score,0) || ')'
+    )                                                AS Summary
+FROM UserWithPosts u
+LEFT JOIN TagSignal ts
+       ON ts.Tag = u.FirstTag
+WHERE u.UserRank <= 100
+AND u.PostId IS NOT NULL
+ORDER BY u.UserRank;

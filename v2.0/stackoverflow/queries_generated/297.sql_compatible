@@ -1,0 +1,287 @@
+WITH recent_questions AS (
+  SELECT
+    p.Id AS QuestionId,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.Title,
+    p.Tags,
+    p.ClosedDate,
+    COALESCE(p.AnswerCount, 0) AS AnswerCount
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= (SELECT MAX(CreationDate) - INTERVAL '365 days' FROM Posts WHERE PostTypeId = 1)
+),
+user_activity AS (
+  SELECT
+    u.Id AS UserId,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    u.LastAccessDate,
+    COALESCE(u.Location, '') AS Location,
+    COALESCE(u.WebsiteUrl, '') AS WebsiteUrl,
+    u.UpVotes,
+    u.DownVotes,
+    u.Views,
+    COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+    COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+    COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+    SUM(CASE WHEN b.TagBased = true THEN 1 ELSE 0 END) AS TagBadges
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  GROUP BY u.Id, u.Reputation, u.CreationDate, u.LastAccessDate, u.Location, u.WebsiteUrl, u.UpVotes, u.DownVotes, u.Views
+),
+question_votes AS (
+  SELECT
+    v.PostId AS QuestionId,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 WHEN v.VoteTypeId = 3 THEN -1 ELSE 0 END) AS NetVotes,
+    SUM(CASE WHEN v.VoteTypeId = 8 THEN COALESCE(v.BountyAmount, 0) ELSE 0 END) AS BountyStarted,
+    SUM(CASE WHEN v.VoteTypeId = 9 THEN COALESCE(v.BountyAmount, 0) ELSE 0 END) AS BountyAwarded,
+    COUNT(*) FILTER (WHERE v.VoteTypeId = 5) AS FavoritesCount
+  FROM Votes v
+  GROUP BY v.PostId
+),
+first_answer_time AS (
+  SELECT
+    q.Id AS QuestionId,
+    MIN(a.CreationDate) AS FirstAnswerDate,
+    COUNT(a.Id) AS AnswerRows
+  FROM Posts q
+  LEFT JOIN Posts a
+    ON a.ParentId = q.Id
+   AND a.PostTypeId = 2
+  WHERE q.PostTypeId = 1
+  GROUP BY q.Id
+),
+close_events AS (
+  SELECT
+    ph.PostId AS QuestionId,
+    MIN(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) AS FirstClosed,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.CreationDate END) AS LastReopened,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN NULLIF(ph.Comment, '') END) AS LastCloseReasonId
+  FROM PostHistory ph
+  WHERE ph.PostHistoryTypeId IN (10,11)
+  GROUP BY ph.PostId
+),
+duplicate_links AS (
+  SELECT
+    pl.PostId AS QuestionId,
+    COUNT(*) FILTER (WHERE pl.LinkTypeId = 3) AS DuplicateCount,
+    COUNT(*) FILTER (WHERE pl.LinkTypeId = 1) AS LinkedCount,
+    SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DupSum
+  FROM PostLinks pl
+  GROUP BY pl.PostId
+),
+tag_stats AS (
+  SELECT
+    q.QuestionId,
+    qt.TagName,
+    t.Count AS TagGlobalCount
+  FROM recent_questions q
+  LEFT JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(q.Tags, 2, length(q.Tags)-2), '><')) AS TagName
+  ) qt ON true
+  LEFT JOIN Tags t ON t.TagName = qt.TagName
+),
+tag_agg AS (
+  SELECT
+    QuestionId,
+    COUNT(*) AS TagCount,
+    COALESCE(SUM(TagGlobalCount), 0) AS TagPopularitySum,
+    MAX(TagGlobalCount) AS MaxTagPopularity,
+    MIN(TagGlobalCount) AS MinTagPopularity,
+    STRING_AGG(TagName, '|') AS TagList
+  FROM tag_stats
+  GROUP BY QuestionId
+),
+comment_stats AS (
+  SELECT
+    c.PostId AS QuestionId,
+    COUNT(*) AS CommentCount,
+    SUM(CASE WHEN c.Score > 0 THEN 1 ELSE 0 END) AS PosComments,
+    MAX(c.CreationDate) AS LastCommentDate,
+    COUNT(*) FILTER (WHERE c.UserId IS NULL) AS AnonymousComments
+  FROM Comments c
+  GROUP BY c.PostId
+),
+question_edits AS (
+  SELECT
+    ph.PostId AS QuestionId,
+    COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6)) AS EditCount,
+    MIN(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6)) AS FirstEditDate,
+    MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6)) AS LastEditDate
+  FROM PostHistory ph
+  GROUP BY ph.PostId
+),
+recent_hot_candidates AS (
+  SELECT
+    q.QuestionId,
+    q.Score,
+    q.ViewCount,
+    qa.NetVotes,
+    COALESCE(qa.FavoritesCount, 0) AS FavoritesCount,
+    ROW_NUMBER() OVER (ORDER BY (COALESCE(qa.NetVotes,0) + q.Score) DESC, q.ViewCount DESC) AS rn
+  FROM recent_questions q
+  LEFT JOIN question_votes qa ON qa.QuestionId = q.QuestionId
+),
+question_quality AS (
+  SELECT
+    q.QuestionId,
+    LEAST(1000, GREATEST(0, COALESCE(q.Score,0))) AS ScoreClamped,
+    CASE WHEN q.ViewCount IS NULL THEN 0 ELSE LOG(LEAST(1 + q.ViewCount, 100000)) END AS LogViews,
+    COALESCE(qa.NetVotes, 0) AS NetVotes,
+    COALESCE(qc.CommentCount, 0) AS CommentCount,
+    COALESCE(ta.TagPopularitySum, 0) AS TagPop,
+    COALESCE(ta.TagCount, 0) AS TagCount,
+    COALESCE(fe.AnswerRows, 0) AS AnswerRows,
+    EXTRACT(EPOCH FROM (fe.FirstAnswerDate - q.CreationDate)) / 3600.0 AS HoursToFirstAnswer,
+    CASE WHEN q.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed
+  FROM recent_questions q
+  LEFT JOIN question_votes qa ON qa.QuestionId = q.QuestionId
+  LEFT JOIN comment_stats qc ON qc.QuestionId = q.QuestionId
+  LEFT JOIN tag_agg ta ON ta.QuestionId = q.QuestionId
+  LEFT JOIN first_answer_time fe ON fe.QuestionId = q.QuestionId
+),
+user_joined AS (
+  SELECT
+    q.QuestionId,
+    ua.UserId,
+    ua.Reputation,
+    ua.UpVotes,
+    ua.DownVotes,
+    ua.Views AS ProfileViews,
+    ua.GoldBadges,
+    ua.SilverBadges,
+    ua.BronzeBadges,
+    ua.TagBadges,
+    EXTRACT(EPOCH FROM (q.CreationDate - ua.UserCreationDate)) / 86400.0 AS UserAgeDaysAtPost
+  FROM recent_questions q
+  LEFT JOIN user_activity ua ON ua.UserId = q.OwnerUserId
+),
+normalized AS (
+  SELECT
+    qq.QuestionId,
+    qq.ScoreClamped,
+    qq.LogViews,
+    qq.NetVotes,
+    qq.CommentCount,
+    qq.TagPop,
+    qq.TagCount,
+    COALESCE(qq.HoursToFirstAnswer, 24*365) AS HoursToFirstAnswerSafe,
+    qq.IsClosed,
+    uj.Reputation,
+    uj.UpVotes,
+    uj.DownVotes,
+    uj.ProfileViews,
+    COALESCE(uj.GoldBadges,0) AS GoldBadges,
+    COALESCE(uj.SilverBadges,0) AS SilverBadges,
+    COALESCE(uj.BronzeBadges,0) AS BronzeBadges,
+    COALESCE(uj.TagBadges,0) AS TagBadges,
+    COALESCE(uj.UserAgeDaysAtPost, 0) AS UserAgeDaysAtPost
+  FROM question_quality qq
+  LEFT JOIN user_joined uj ON uj.QuestionId = qq.QuestionId
+),
+score_calc AS (
+  SELECT
+    n.*,
+    (
+      0.4 * n.ScoreClamped
+      + 3.0 * n.LogViews
+      + 2.0 * n.NetVotes
+      + 0.5 * n.CommentCount
+      + 0.001 * n.TagPop
+      + 1.5 * n.TagCount
+      + CASE WHEN n.IsClosed = 1 THEN -50 ELSE 0 END
+      + 0.01 * n.Reputation
+      + 0.05 * n.GoldBadges
+      + 0.02 * n.SilverBadges
+      + 0.01 * n.BronzeBadges
+      - 0.2 * LEAST(720.0, n.HoursToFirstAnswerSafe)
+      - 0.1 * GREATEST(0, n.DownVotes - n.UpVotes)
+    ) AS QualityScore
+  FROM normalized n
+),
+ranked AS (
+  SELECT
+    sc.*,
+    DENSE_RANK() OVER (ORDER BY sc.QualityScore DESC NULLS LAST) AS QualityRank,
+    NTILE(10) OVER (ORDER BY sc.QualityScore DESC NULLS LAST) AS Decile
+  FROM score_calc sc
+),
+final_flags AS (
+  SELECT
+    r.QuestionId,
+    r.QualityScore,
+    r.QualityRank,
+    r.Decile,
+    CASE
+      WHEN r.QualityScore IS NULL THEN 'N/A'
+      WHEN r.QualityScore >= PERCENTILE_CONT(0.90) WITHIN GROUP (ORDER BY r.QualityScore) OVER () THEN 'Top 10%'
+      WHEN r.QualityScore <= PERCENTILE_CONT(0.10) WITHIN GROUP (ORDER BY r.QualityScore) OVER () THEN 'Bottom 10%'
+      ELSE 'Middle'
+    END AS ScoreBand
+  FROM ranked r
+),
+close_reason_lookup AS (
+  SELECT
+    ce.QuestionId,
+    ce.LastCloseReasonId,
+    crt.Name AS CloseReasonName
+  FROM close_events ce
+  LEFT JOIN CloseReasonTypes crt ON crt.Id = ce.LastCloseReasonId
+)
+SELECT
+  q.QuestionId,
+  q.Title,
+  COALESCE(ta.TagList, '') AS Tags,
+  r.QualityScore,
+  r.QualityRank,
+  r.Decile,
+  ff.ScoreBand,
+  COALESCE(qv.NetVotes, 0) AS NetVotes,
+  COALESCE(qv.FavoritesCount, 0) AS Favorites,
+  COALESCE(qv.BountyStarted, 0) AS BountyStarted,
+  COALESCE(qv.BountyAwarded, 0) AS BountyAwarded,
+  COALESCE(ds.DuplicateCount, 0) AS DuplicateLinks,
+  COALESCE(ds.LinkedCount, 0) AS LinkedPosts,
+  COALESCE(qe.EditCount, 0) AS EditCount,
+  qe.FirstEditDate,
+  qe.LastEditDate,
+  cs.CommentCount,
+  cs.PosComments,
+  cs.AnonymousComments,
+  fe.FirstAnswerDate,
+  cr.CloseReasonName,
+  cr.LastCloseReasonId,
+  rq.rn AS HotCandidateRank,
+  uj.Reputation AS OwnerReputation,
+  uj.UserAgeDaysAtPost
+FROM recent_questions q
+LEFT JOIN tag_agg ta ON ta.QuestionId = q.QuestionId
+LEFT JOIN ranked r ON r.QuestionId = q.QuestionId
+LEFT JOIN final_flags ff ON ff.QuestionId = q.QuestionId
+LEFT JOIN question_votes qv ON qv.QuestionId = q.QuestionId
+LEFT JOIN duplicate_links ds ON ds.QuestionId = q.QuestionId
+LEFT JOIN question_edits qe ON qe.QuestionId = q.QuestionId
+LEFT JOIN comment_stats cs ON cs.QuestionId = q.QuestionId
+LEFT JOIN first_answer_time fe ON fe.QuestionId = q.QuestionId
+LEFT JOIN close_reason_lookup cr ON cr.QuestionId = q.QuestionId
+LEFT JOIN recent_hot_candidates rq ON rq.QuestionId = q.QuestionId
+LEFT JOIN user_joined uj ON uj.QuestionId = q.QuestionId
+WHERE (
+    q.Score >= 0
+    OR EXISTS (
+      SELECT 1
+      FROM Comments c
+      WHERE c.PostId = q.QuestionId
+        AND c.Score >= 5
+    )
+  )
+  AND COALESCE(q.Title, '') <> ''
+  AND (
+    ta.TagCount IS NULL
+    OR ta.TagCount BETWEEN 1 AND 5
+  )
+ORDER BY r.QualityScore DESC NULLS LAST, q.ViewCount DESC, q.CreationDate DESC
+LIMIT 500;

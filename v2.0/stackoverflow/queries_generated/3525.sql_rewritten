@@ -1,0 +1,122 @@
+-- {"query": "3525.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2661} 
+WITH UserStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.CreationDate, TIMESTAMP '1970-01-01')          AS UserCreated,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id)    AS BadgeCount,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS QuestionCount,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS AnswerCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 2)      AS UpVoteGiven,
+        (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 3)      AS DownVoteGiven,
+        (SELECT MAX(p.CreationDate) FROM Posts p WHERE p.OwnerUserId = u.Id)          AS LastPostDate
+    FROM Users u
+),
+QuestionMetrics AS (
+    SELECT
+        q.Id                                   AS QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.FavoriteCount,
+        q.Tags,
+        COALESCE(q.AcceptedAnswerId, 0)        AS HasAccepted,
+        (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = q.Id AND a.PostTypeId = 2) AS AnswerCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = q.Id AND v.VoteTypeId = 2)   AS UpVotes,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = q.Id AND v.VoteTypeId = 3)   AS DownVotes,
+        ROW_NUMBER() OVER (PARTITION BY q.Tags ORDER BY q.ViewCount DESC)          AS TagRank
+    FROM Posts q
+    WHERE q.PostTypeId = 1
+      AND q.CreationDate >= DATE '2023-01-01'
+),
+TagPopularity AS (
+    SELECT
+        unnest(string_to_array(trim(both '<>' FROM t.Tags), '><')) AS Tag,
+        COUNT(*)                                                   AS TagUseCount
+    FROM QuestionMetrics t
+    GROUP BY 1
+),
+TopTags AS (
+    SELECT Tag
+    FROM TagPopularity
+    WHERE TagUseCount >= 100
+    ORDER BY TagUseCount DESC
+    LIMIT 10
+)
+SELECT
+    us.Id,
+    us.DisplayName,
+    us.Reputation,
+    us.BadgeCount,
+    us.QuestionCount,
+    us.AnswerCount,
+    us.UpVoteGiven,
+    us.DownVoteGiven,
+    us.LastPostDate,
+    q.QuestionId,
+    q.Title,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    q.FavoriteCount,
+    q.AnswerCount           AS Q_AnswerCount,
+    q.UpVotes,
+    q.DownVotes,
+    CASE
+        WHEN q.HasAccepted <> 0 THEN 'Accepted'
+        WHEN q.AnswerCount = 0    THEN 'NoAnswers'
+        ELSE                          'Pending'
+    END                     AS AnswerStatus,
+    COALESCE(NULLIF(q.Tags, ''), '<none>')                     AS TagString,
+    array_agg(DISTINCT tt.Tag) FILTER (WHERE tt.Tag IS NOT NULL) AS TopTagList
+FROM UserStats us
+LEFT JOIN Posts p
+       ON p.OwnerUserId = us.Id AND p.PostTypeId = 1
+LEFT JOIN QuestionMetrics q
+       ON q.QuestionId = p.Id
+      AND (q.Tags && (SELECT array_agg('<' || Tag || '>') FROM TopTags))
+LEFT JOIN TopTags tt
+       ON tt.Tag = ANY (string_to_array(trim(both '<>' FROM q.Tags), '><'))
+WHERE (us.Reputation > 10000 OR us.BadgeCount >= 5)
+  AND (q.AnswerCount IS NULL OR q.AnswerCount > 0)
+GROUP BY
+    us.Id, us.DisplayName, us.Reputation, us.BadgeCount,
+    us.QuestionCount, us.AnswerCount, us.UpVoteGiven, us.DownVoteGiven,
+    us.LastPostDate,
+    q.QuestionId, q.Title, q.CreationDate, q.Score, q.ViewCount,
+    q.FavoriteCount, q.AnswerCount, q.UpVotes, q.DownVotes, q.HasAccepted, q.Tags
+
+UNION ALL
+
+SELECT
+    us.Id,
+    us.DisplayName,
+    us.Reputation,
+    us.BadgeCount,
+    us.QuestionCount,
+    us.AnswerCount,
+    us.UpVoteGiven,
+    us.DownVoteGiven,
+    us.LastPostDate,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    'NoQuestion',
+    COALESCE(NULLIF(p.Tags, ''), '<none>'),
+    ARRAY[]::varchar[]
+FROM UserStats us
+LEFT JOIN Posts p
+       ON p.OwnerUserId = us.Id AND p.PostTypeId = 1
+WHERE NOT EXISTS (
+        SELECT 1 FROM QuestionMetrics qm WHERE qm.QuestionId = p.Id
+      )
+  AND us.Reputation BETWEEN 5000 AND 10000
+ORDER BY Reputation DESC, BadgeCount DESC, QuestionId NULLS LAST;

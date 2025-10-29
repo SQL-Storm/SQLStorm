@@ -1,0 +1,244 @@
+-- {"query": "1684.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3739} 
+
+WITH UserContributionDetails AS (
+    -- Combines posts and comments into a single stream of contributions for detailed user activity analysis.
+    -- Uses UNION ALL to avoid overhead of distinct sorting, assuming overlapping contribution IDs are not a concern here.
+    SELECT
+        P.OwnerUserId AS ContributorId,
+        P.Id AS ContributionId,
+        'Post' AS ContributionType,
+        P.CreationDate AS ContributionDate,
+        P.Score AS ContributionScore,
+        P.ViewCount AS ContributionViews,
+        P.CommentCount AS ContributionCommentCount,
+        LENGTH(P.Body) AS ContentLength,
+        P.PostTypeId,
+        P.ParentId, -- For answers, refers to the question
+        P.AcceptedAnswerId AS PostAcceptedAnswerId
+    FROM Posts P
+    WHERE P.OwnerUserId IS NOT NULL -- Exclude posts without an owner (e.g., community owned, deleted users)
+    UNION ALL
+    SELECT
+        C.UserId AS ContributorId,
+        C.Id AS ContributionId,
+        'Comment' AS ContributionType,
+        C.CreationDate AS ContributionDate,
+        C.Score AS ContributionScore,
+        NULL AS ContributionViews, -- Comments do not have view counts
+        NULL AS ContributionCommentCount, -- Comments do not have nested comments in this schema
+        LENGTH(C.Text) AS ContentLength,
+        NULL AS PostTypeId, -- Comments do not have a PostTypeId
+        C.PostId AS ParentId, -- For comments, ParentId refers to the Post they are on
+        NULL AS PostAcceptedAnswerId
+    FROM Comments C
+    WHERE C.UserId IS NOT NULL -- Exclude comments without an owner
+),
+UserActivityMetrics AS (
+    -- Aggregates comprehensive metrics for each user based on their contributions and user profile data.
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS TotalUpVotesGiven, -- Votes *given* by the user
+        U.DownVotes AS TotalDownVotesGiven, -- Votes *given* by the user
+        COUNT(DISTINCT UCD.ContributionId) AS TotalContributions,
+        COUNT(DISTINCT CASE WHEN UCD.ContributionType = 'Post' THEN UCD.ContributionId END) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN UCD.ContributionType = 'Post' AND UCD.PostTypeId = 1 THEN UCD.ContributionId END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN UCD.ContributionType = 'Post' AND UCD.PostTypeId = 2 THEN UCD.ContributionId END) AS TotalAnswers,
+        COUNT(DISTINCT CASE WHEN UCD.ContributionType = 'Comment' THEN UCD.ContributionId END) AS TotalCommentsMade,
+        SUM(CASE WHEN UCD.ContributionType = 'Post' THEN UCD.ContributionScore ELSE 0 END) AS SumPostScores,
+        SUM(CASE WHEN UCD.ContributionType = 'Comment' THEN UCD.ContributionScore ELSE 0 END) AS SumCommentScores,
+        SUM(COALESCE(UCD.ContributionViews, 0)) AS TotalContributionViews,
+        SUM(COALESCE(UCD.ContributionCommentCount, 0)) AS TotalContributionCommentCounts,
+        SUM(CASE WHEN UCD.ContributionType = 'Post' AND UCD.PostAcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS AcceptedAnswersGiven,
+        -- Correlated subquery: count questions where user answered their own question and accepted it.
+        (SELECT COUNT(DISTINCT P_inner.Id)
+         FROM Posts P_inner
+         WHERE P_inner.OwnerUserId = U.Id
+           AND P_inner.AcceptedAnswerId IS NOT NULL
+           AND (SELECT A_inner.OwnerUserId FROM Posts A_inner WHERE A_inner.Id = P_inner.AcceptedAnswerId) = U.Id
+        ) AS AcceptedAnswersOnOwnQuestions,
+        MAX(UCD.ContributionDate) AS LastContributionDate,
+        AVG(CAST(UCD.ContentLength AS numeric)) AS AvgContributionContentLength
+    FROM Users U
+    LEFT JOIN UserContributionDetails UCD ON U.Id = UCD.ContributorId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Views, U.UpVotes, U.DownVotes
+),
+PostTagStats AS (
+    -- Extracts post-specific details including individual vote counts and temporal analysis.
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount AS PostViewCount,
+        P.FavoriteCount AS PostFavoriteCount,
+        P.Title,
+        P.Tags,
+        -- Correlated subqueries for specific vote types on each post
+        (SELECT COUNT(V.Id) FROM Votes V WHERE V.PostId = P.Id AND V.VoteTypeId = 2) AS UpVotesReceived,
+        (SELECT COUNT(V.Id) FROM Votes V WHERE V.PostId = P.Id AND V.VoteTypeId = 3) AS DownVotesReceived,
+        (SELECT COUNT(V.Id) FROM Votes V WHERE V.PostId = P.Id AND V.VoteTypeId = 5) AS FavoriteVotesReceived,
+        -- Correlated subquery for the date of the first body edit
+        (SELECT PH.CreationDate FROM PostHistory PH WHERE PH.PostId = P.Id AND PH.PostHistoryTypeId = 5 ORDER BY PH.CreationDate LIMIT 1) AS FirstBodyEditDate,
+        -- Window function: find the LastEditDate of the previous post by the same owner
+        LAG(P.LastEditDate, 1, P.CreationDate) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate) AS PreviousPostEditDate
+    FROM Posts P
+    WHERE P.PostTypeId IN (1, 2) -- Focus on Questions and Answers
+    AND P.OwnerUserId IS NOT NULL
+),
+DetailedPostAnalysis AS (
+    -- Further processes post data, including tag parsing and post link counts.
+    SELECT
+        PTS.PostId,
+        PTS.OwnerUserId,
+        PTS.PostCreationDate,
+        PTS.PostScore,
+        PTS.PostViewCount,
+        PTS.PostFavoriteCount,
+        PTS.Title,
+        PTS.Tags,
+        PTS.UpVotesReceived,
+        PTS.DownVotesReceived,
+        PTS.FavoriteVotesReceived,
+        PTS.FirstBodyEditDate,
+        PTS.PreviousPostEditDate,
+        -- String expression: parse tags into an array
+        STRING_TO_ARRAY(SUBSTRING(PTS.Tags, 2, LENGTH(PTS.Tags) - 2), '><') AS TagArray,
+        COALESCE(PTS.UpVotesReceived, 0) - COALESCE(PTS.DownVotesReceived, 0) AS NetPostVotes,
+        -- Correlated subqueries for linked and duplicate posts
+        (SELECT COUNT(PL.RelatedPostId) FROM PostLinks PL WHERE PL.PostId = PTS.PostId AND PL.LinkTypeId = 1) AS LinkedPostsCount,
+        (SELECT COUNT(PL.RelatedPostId) FROM PostLinks PL WHERE PL.PostId = PTS.PostId AND PL.LinkTypeId = 3) AS DuplicatePostsCount
+    FROM PostTagStats PTS
+),
+UserPostAggregates AS (
+    -- Aggregates post-level metrics per user to avoid Cartesian products in the final join.
+    SELECT
+        OwnerUserId AS UserId,
+        AVG(CAST(NetPostVotes AS numeric)) AS UserAvgNetPostVotes,
+        MAX(PostViewCount) AS UserMaxPostViews,
+        COUNT(DISTINCT PostId) AS PostsAnalyzed
+    FROM DetailedPostAnalysis
+    GROUP BY OwnerUserId
+),
+UserBadgeHistory AS (
+    -- Summarizes badge information for each user, including most recent Gold badge.
+    SELECT
+        B.UserId,
+        COUNT(B.Id) AS TotalBadges,
+        COUNT(CASE WHEN B.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN B.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN B.Class = 3 THEN 1 END) AS BronzeBadges,
+        MAX(CASE WHEN B.Class = 1 THEN B.Date ELSE NULL END) AS LastGoldBadgeDate,
+        -- Correlated subquery: find the name of the user's most recent Gold badge
+        (SELECT b2.Name FROM Badges b2 WHERE b2.UserId = B.UserId AND b2.Class = 1 ORDER BY b2.Date DESC LIMIT 1) AS MostRecentGoldBadgeName
+    FROM Badges B
+    GROUP BY B.UserId
+),
+UserPostHistorySummary AS (
+    -- Summarizes post history events for each user.
+    SELECT
+        PH.UserId,
+        COUNT(PH.Id) AS TotalHistoryEvents,
+        COUNT(DISTINCT PH.PostId) AS UniquePostsWithHistory,
+        COUNT(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 END) AS ContentEditHistoryCount, -- Title, Body, Tags edits
+        COUNT(CASE WHEN PH.PostHistoryTypeId IN (10, 12) THEN 1 END) AS CloseDeleteHistoryCount, -- Post Closed, Post Deleted
+        MAX(PH.CreationDate) AS LastHistoryEventDate
+    FROM PostHistory PH
+    WHERE PH.UserId IS NOT NULL
+    GROUP BY PH.UserId
+)
+SELECT
+    UAM.UserId,
+    COALESCE(UAM.DisplayName, 'Anonymous User') AS DisplayName, -- NULL logic: Provide default for NULL DisplayName
+    UAM.Reputation,
+    UAM.UserProfileViews,
+    UAM.TotalContributions,
+    UAM.TotalPosts,
+    UAM.TotalQuestions,
+    UAM.TotalAnswers,
+    UAM.TotalCommentsMade,
+    UAM.SumPostScores,
+    UAM.SumCommentScores,
+    UBH.TotalBadges,
+    UBH.GoldBadges,
+    UBH.MostRecentGoldBadgeName,
+    UHS.ContentEditHistoryCount,
+    UHS.CloseDeleteHistoryCount,
+    UPA.UserAvgNetPostVotes,
+    UPA.UserMaxPostViews,
+    -- Complex calculation: Reputation normalized by total contributions (posts + comments), handling division by zero
+    CAST(UAM.Reputation AS numeric) / (NULLIF(UAM.TotalPosts, 0) + NULLIF(UAM.TotalCommentsMade, 0) + 1) AS ReputationPerContribution,
+    -- Complicated expression: Weighted sum for an "Engagement Score"
+    (
+        (COALESCE(UAM.SumPostScores, 0) * 0.4) +
+        (COALESCE(UAM.SumCommentScores, 0) * 0.2) +
+        (COALESCE(UAM.TotalContributionViews, 0) * 0.1) +
+        (COALESCE(UAM.AcceptedAnswersGiven, 0) * 0.15) +
+        (COALESCE(UAM.AcceptedAnswersOnOwnQuestions, 0) * 0.15)
+    ) AS WeightedEngagementScore,
+    -- String expression: Format user location with initial cap, defaulting if NULL
+    UPPER(SUBSTRING(COALESCE(U.Location, 'Earth'), 1, 1)) || LOWER(SUBSTRING(COALESCE(U.Location, 'Earth'), 2)) AS FormattedUserLocation,
+    COALESCE(U.WebsiteUrl, 'N/A') AS UserWebsite, -- NULL logic: default for missing website
+    COALESCE(SUBSTRING(U.AboutMe, 1, 100) || '...', 'No "About Me" description available.') AS AboutMeSnippet, -- String expression for snippet, NULL logic
+    AGE(UAM.LastAccessDate, UAM.UserCreationDate) AS UserAccountAge, -- Date/time calculation
+    -- Window functions: Rank users globally and categorize into deciles
+    RANK() OVER (ORDER BY UAM.Reputation DESC, WeightedEngagementScore DESC, UAM.TotalContributions DESC) AS GlobalUserRank,
+    NTILE(5) OVER (ORDER BY UAM.Reputation DESC) AS ReputationQuintile,
+    -- Correlated subquery: Average score of questions owned by the user and tagged with 'sql'
+    (
+        SELECT AVG(P_tag.Score)
+        FROM Posts P_tag
+        WHERE P_tag.OwnerUserId = UAM.UserId
+          AND P_tag.Tags LIKE '%<sql>%'
+          AND P_tag.PostTypeId = 1
+    ) AS AvgSqlQuestionScore,
+    -- Complicated predicate/expression: Categorize users based on multiple metrics using CASE WHEN
+    CASE
+        WHEN UAM.Reputation > 20000 AND UBH.GoldBadges >= 3 AND UHS.ContentEditHistoryCount > 50 THEN 'Super Star Contributor'
+        WHEN UAM.Reputation > 5000 AND UAM.TotalPosts > 20 AND (
+            (COALESCE(UAM.SumPostScores, 0) * 0.4) +
+            (COALESCE(UAM.SumCommentScores, 0) * 0.2) +
+            (COALESCE(UAM.TotalContributionViews, 0) * 0.1)
+        ) > 500 THEN 'High Impact User'
+        WHEN UAM.Reputation > 1000 THEN 'Established Contributor'
+        ELSE 'Developing User'
+    END AS UserInfluenceLevel,
+    -- Correlated subquery within a scalar expression for unique tags used in last year, leveraging UNNEST
+    (SELECT COUNT(DISTINCT T.TagName) FROM Tags T WHERE T.Id IN (
+        SELECT UNNEST(DPA_inner.TagArray)::int FROM DetailedPostAnalysis DPA_inner WHERE DPA_inner.OwnerUserId = UAM.UserId AND DPA_inner.PostCreationDate > (NOW() - INTERVAL '1 year')
+    )) AS UniqueTagsUsedInLastYear,
+    -- EXISTS clause for a boolean flag: checks if user has a specific silver badge
+    EXISTS (
+        SELECT 1
+        FROM Badges B
+        WHERE B.UserId = UAM.UserId
+          AND B.Name LIKE '%Editor%'
+          AND B.Class = 2
+    ) AS HasSilverEditorBadge
+FROM
+    UserActivityMetrics UAM
+JOIN Users U ON UAM.UserId = U.Id -- Ensures only users with existing User records are considered
+LEFT JOIN UserBadgeHistory UBH ON UAM.UserId = UBH.UserId
+LEFT JOIN UserPostHistorySummary UHS ON UAM.UserId = UHS.UserId
+LEFT JOIN UserPostAggregates UPA ON UAM.UserId = UPA.UserId
+WHERE
+    UAM.Reputation > 500 -- Filters for users with minimum reputation
+    AND UAM.TotalPosts > 5 -- Filters for users with a minimum number of posts
+    AND UAM.UserCreationDate < NOW() - INTERVAL '6 months' -- Filters for accounts older than 6 months
+    AND U.DisplayName IS NOT NULL -- Excludes users potentially deleted or without a display name
+    AND (U.WebsiteUrl IS NOT NULL OR U.Location IS NOT NULL) -- Ensures some profile information is present
+    AND UPA.PostsAnalyzed IS NOT NULL -- Ensures that the user has at least one post analyzed in DetailedPostAnalysis CTE
+GROUP BY
+    UAM.UserId, UAM.DisplayName, UAM.Reputation, UAM.UserProfileViews, UAM.TotalContributions,
+    UAM.TotalPosts, UAM.TotalQuestions, UAM.TotalAnswers, UAM.SumPostScores, UAM.SumCommentScores,
+    UBH.TotalBadges, UBH.GoldBadges, UBH.MostRecentGoldBadgeName, UHS.ContentEditHistoryCount,
+    UHS.CloseDeleteHistoryCount, U.Location, U.WebsiteUrl, U.AboutMe,
+    UAM.LastAccessDate, UAM.UserCreationDate, UAM.TotalCommentsMade, UAM.AcceptedAnswersGiven, UAM.AcceptedAnswersOnOwnQuestions,
+    U.Id, UPA.UserAvgNetPostVotes, UPA.UserMaxPostViews -- All non-aggregated columns must be in GROUP BY
+ORDER BY
+    GlobalUserRank ASC, UAM.Reputation DESC
+LIMIT 50;

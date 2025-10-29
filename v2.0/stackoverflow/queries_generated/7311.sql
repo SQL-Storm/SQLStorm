@@ -1,0 +1,282 @@
+-- {"query": "7311.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 3261} 
+WITH UserActivitySummary AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.CreationDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        COUNT(DISTINCT v.Id) AS TotalVotes,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        MAX(b.Date) AS LastBadgeDate,
+        MAX(v.CreationDate) AS LastVoteDate,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN AVG(p.Score) 
+            ELSE 0 
+        END AS AvgPostScore,
+        CASE 
+            WHEN COUNT(DISTINCT c.Id) > 0 THEN AVG(c.Score) 
+            ELSE 0 
+        END AS AvgCommentScore,
+        STRING_AGG(DISTINCT p.Title, ', ') AS PostTitles,
+        STRING_AGG(DISTINCT b.Name, ', ') AS BadgeNames,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 3 THEN p.Id END) AS WikiCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 4 THEN p.Id END) AS TagWikiExcerptCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 5 THEN p.Id END) AS TagWikiCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 6 THEN p.Id END) AS ModeratorNominationCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 7 THEN p.Id END) AS WikiPlaceholderCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 8 THEN p.Id END) AS PrivilegeWikiCount,
+        COUNT(DISTINCT CASE WHEN p.ViewCount > 100 THEN p.Id END) AS HighViewCountPosts,
+        COUNT(DISTINCT CASE WHEN p.Score > 10 THEN p.Id END) AS HighScorePosts,
+        COUNT(DISTINCT CASE WHEN p.CommentCount > 5 THEN p.Id END) AS HighCommentCountPosts,
+        COUNT(DISTINCT CASE WHEN p.FavoriteCount > 2 THEN p.Id END) AS HighFavoriteCountPosts
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.CreationDate
+),
+PostComplexityAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        CASE 
+            WHEN p.Score IS NULL OR p.Score = 0 THEN 0
+            WHEN p.Score > 100 THEN 3
+            WHEN p.Score > 50 THEN 2
+            WHEN p.Score > 10 THEN 1
+            ELSE 0
+        END AS ScoreCategory,
+        CASE 
+            WHEN p.ViewCount IS NULL OR p.ViewCount = 0 THEN 0
+            WHEN p.ViewCount > 1000 THEN 3
+            WHEN p.ViewCount > 500 THEN 2
+            WHEN p.ViewCount > 100 THEN 1
+            ELSE 0
+        END AS ViewCategory,
+        CASE 
+            WHEN p.CommentCount IS NULL OR p.CommentCount = 0 THEN 0
+            WHEN p.CommentCount > 20 THEN 3
+            WHEN p.CommentCount > 10 THEN 2
+            WHEN p.CommentCount > 5 THEN 1
+            ELSE 0
+        END AS CommentCategory,
+        CASE 
+            WHEN p.FavoriteCount IS NULL OR p.FavoriteCount = 0 THEN 0
+            WHEN p.FavoriteCount > 10 THEN 3
+            WHEN p.FavoriteCount > 5 THEN 2
+            WHEN p.FavoriteCount > 2 THEN 1
+            ELSE 0
+        END AS FavoriteCategory,
+        CASE 
+            WHEN LENGTH(p.Body) > 1000 THEN 3
+            WHEN LENGTH(p.Body) > 500 THEN 2
+            WHEN LENGTH(p.Body) > 100 THEN 1
+            ELSE 0
+        END AS BodyComplexity,
+        STRING_AGG(t.TagName, ', ') AS Tags,
+        COUNT(DISTINCT pl.Id) AS LinkCount,
+        COUNT(DISTINCT ph.Id) AS HistoryCount,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserPostRank,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) AS GlobalScoreRank,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS AvgUserScore,
+        MAX(p.CreationDate) OVER (PARTITION BY p.OwnerUserId) AS LastUserPost,
+        MIN(p.CreationDate) OVER (PARTITION BY p.OwnerUserId) AS FirstUserPost,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousScore,
+        LAG(p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostDate,
+        CASE WHEN p.Score > LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) THEN 1 ELSE 0 END AS ScoreImprovement,
+        CASE WHEN p.ViewCount > LAG(p.ViewCount) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) THEN 1 ELSE 0 END AS ViewImprovement
+    FROM Posts p
+    LEFT JOIN Tags t ON p.Id = t.Id
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE p.Id IS NOT NULL
+    GROUP BY p.Id, p.Title, p.Body, p.Score, p.ViewCount, p.CommentCount, p.FavoriteCount, p.CreationDate, p.OwnerUserId, p.PostTypeId
+    HAVING p.Id IS NOT NULL
+),
+UserPostPerformance AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.TotalPosts,
+        uas.TotalComments,
+        uas.TotalBadges,
+        uas.TotalVotes,
+        uas.AvgPostScore,
+        uas.AvgCommentScore,
+        COUNT(DISTINCT CASE WHEN pca.PostTypeId = 1 THEN pca.PostId END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN pca.PostTypeId = 2 THEN pca.PostId END) AS AnswerCount,
+        COUNT(DISTINCT CASE WHEN pca.PostTypeId = 3 THEN pca.PostId END) AS WikiCount,
+        COUNT(DISTINCT CASE WHEN pca.PostTypeId = 4 THEN pca.PostId END) AS TagWikiExcerptCount,
+        COUNT(DISTINCT CASE WHEN pca.PostTypeId = 5 THEN pca.PostId END) AS TagWikiCount,
+        COUNT(DISTINCT CASE WHEN pca.PostTypeId = 6 THEN pca.PostId END) AS ModeratorNominationCount,
+        COUNT(DISTINCT CASE WHEN pca.PostTypeId = 7 THEN pca.PostId END) AS WikiPlaceholderCount,
+        COUNT(DISTINCT CASE WHEN pca.PostTypeId = 8 THEN pca.PostId END) AS PrivilegeWikiCount,
+        COUNT(DISTINCT CASE WHEN pca.ScoreCategory > 0 THEN pca.PostId END) AS HighScorePosts,
+        COUNT(DISTINCT CASE WHEN pca.ViewCategory > 0 THEN pca.PostId END) AS HighViewPosts,
+        COUNT(DISTINCT CASE WHEN pca.CommentCategory > 0 THEN pca.PostId END) AS HighCommentPosts,
+        COUNT(DISTINCT CASE WHEN pca.FavoriteCategory > 0 THEN pca.PostId END) AS HighFavoritePosts,
+        COUNT(DISTINCT CASE WHEN pca.BodyComplexity > 0 THEN pca.PostId END) AS ComplexPosts,
+        AVG(pca.Score) AS AvgScore,
+        AVG(pca.ViewCount) AS AvgViewCount,
+        AVG(pca.CommentCount) AS AvgCommentCount,
+        AVG(pca.FavoriteCount) AS AvgFavoriteCount,
+        MAX(pca.Score) AS MaxScore,
+        MAX(pca.ViewCount) AS MaxViewCount,
+        MAX(pca.CommentCount) AS MaxCommentCount,
+        MAX(pca.FavoriteCount) AS MaxFavoriteCount,
+        MAX(pca.BodyComplexity) AS MaxBodyComplexity,
+        STRING_AGG(pca.Title, '; ') AS AllTitles,
+        STRING_AGG(pca.Tags, '; ') AS AllTags,
+        COUNT(DISTINCT CASE WHEN pca.GlobalScoreRank <= 100 THEN pca.PostId END) AS Top100ScorePosts
+    FROM UserActivitySummary uas
+    LEFT JOIN PostComplexityAnalysis pca ON uas.UserId = pca.OwnerUserId
+    WHERE uas.UserId IS NOT NULL
+    GROUP BY uas.UserId, uas.DisplayName, uas.Reputation, uas.TotalPosts, uas.TotalComments, uas.TotalBadges, uas.TotalVotes, uas.AvgPostScore, uas.AvgCommentScore
+),
+PerformanceMetrics AS (
+    SELECT 
+        upp.UserId,
+        upp.DisplayName,
+        upp.Reputation,
+        upp.TotalPosts,
+        upp.TotalComments,
+        upp.TotalBadges,
+        upp.TotalVotes,
+        upp.AvgPostScore,
+        upp.AvgCommentScore,
+        upp.QuestionCount,
+        upp.AnswerCount,
+        upp.WikiCount,
+        upp.TagWikiExcerptCount,
+        upp.TagWikiCount,
+        upp.ModeratorNominationCount,
+        upp.WikiPlaceholderCount,
+        upp.PrivilegeWikiCount,
+        upp.HighScorePosts,
+        upp.HighViewPosts,
+        upp.HighCommentPosts,
+        upp.HighFavoritePosts,
+        upp.ComplexPosts,
+        upp.AvgScore,
+        upp.AvgViewCount,
+        upp.AvgCommentCount,
+        upp.AvgFavoriteCount,
+        upp.MaxScore,
+        upp.MaxViewCount,
+        upp.MaxCommentCount,
+        upp.MaxFavoriteCount,
+        upp.MaxBodyComplexity,
+        upp.AllTitles,
+        upp.AllTags,
+        upp.Top100ScorePosts,
+        (upp.QuestionCount * 1.0 / NULLIF(upp.AnswerCount, 0)) AS QtoA,
+        (upp.TotalPosts * 1.0 / NULLIF(upp.TotalComments, 0)) AS PostToComment,
+        (upp.TotalVotes * 1.0 / NULLIF(upp.TotalPosts, 0)) AS VotePerPost,
+        (upp.TotalBadges * 1.0 / NULLIF(upp.Reputation, 0)) AS BadgesPerRep,
+        CASE WHEN upp.MaxScore > 100 THEN 1 ELSE 0 END AS HasHighScorePosts,
+        CASE WHEN upp.MaxViewCount > 1000 THEN 1 ELSE 0 END AS HasHighViewPosts,
+        CASE WHEN upp.Top100ScorePosts > 0 THEN 1 ELSE 0 END AS HasTopScorePosts,
+        ROW_NUMBER() OVER (ORDER BY upp.Reputation DESC, upp.TotalPosts DESC) AS UserRank,
+        DENSE_RANK() OVER (ORDER BY upp.AvgScore DESC) AS AvgScoreRank,
+        RANK() OVER (ORDER BY upp.TotalVotes DESC) AS VoteRank,
+        PERCENT_RANK() OVER (ORDER BY upp.TotalPosts) AS PostPercentile,
+        CUME_DIST() OVER (ORDER BY upp.Reputation) AS RepCumulative,
+        LAG(upp.Reputation) OVER (ORDER BY upp.Reputation) AS PrevRep,
+        LAG(upp.TotalPosts) OVER (ORDER BY upp.Reputation) AS PrevPosts,
+        LEAD(upp.Reputation) OVER (ORDER BY upp.Reputation) AS NextRep,
+        LEAD(upp.TotalPosts) OVER (ORDER BY upp.Reputation) AS NextPosts
+    FROM UserPostPerformance upp
+)
+SELECT 
+    pm.UserId,
+    pm.DisplayName,
+    pm.Reputation,
+    pm.TotalPosts,
+    pm.TotalComments,
+    pm.TotalBadges,
+    pm.TotalVotes,
+    pm.AvgPostScore,
+    pm.AvgCommentScore,
+    pm.QuestionCount,
+    pm.AnswerCount,
+    pm.WikiCount,
+    pm.TagWikiExcerptCount,
+    pm.TagWikiCount,
+    pm.ModeratorNominationCount,
+    pm.WikiPlaceholderCount,
+    pm.PrivilegeWikiCount,
+    pm.HighScorePosts,
+    pm.HighViewPosts,
+    pm.HighCommentPosts,
+    pm.HighFavoritePosts,
+    pm.ComplexPosts,
+    pm.AvgScore,
+    pm.AvgViewCount,
+    pm.AvgCommentCount,
+    pm.AvgFavoriteCount,
+    pm.MaxScore,
+    pm.MaxViewCount,
+    pm.MaxCommentCount,
+    pm.MaxFavoriteCount,
+    pm.MaxBodyComplexity,
+    pm.UserRank,
+    pm.AvgScoreRank,
+    pm.VoteRank,
+    pm.PostPercentile,
+    pm.RepCumulative,
+    CASE WHEN pm.Reputation > 10000 THEN 'Elite' 
+         WHEN pm.Reputation > 5000 THEN 'Advanced' 
+         WHEN pm.Reputation > 1000 THEN 'Intermediate' 
+         ELSE 'Beginner' END AS RepTier,
+    CASE WHEN pm.TotalPosts > 500 THEN 'Veteran'
+         WHEN pm.TotalPosts > 100 THEN 'Experienced' 
+         WHEN pm.TotalPosts > 50 THEN 'Intermediate' 
+         ELSE 'New' END AS PostExperience,
+    CASE WHEN pm.TotalBadges >= 100 THEN 'Badge Master'
+         WHEN pm.TotalBadges >= 50 THEN 'Badge Collector'
+         WHEN pm.TotalBadges >= 10 THEN 'Badge Enthusiast' 
+         ELSE 'Badge Beginner' END AS BadgeStatus,
+    CASE WHEN pm.VoteRank = 1 THEN 'Top Voter'
+         WHEN pm.VoteRank <= 10 THEN 'Top 10 Voter' 
+         WHEN pm.VoteRank <= 50 THEN 'Top 50 Voter' 
+         ELSE 'Regular Voter' END AS VoteStatus,
+    pm.QtoA,
+    pm.PostToComment,
+    pm.VotePerPost,
+    pm.BadgesPerRep,
+    pm.HasHighScorePosts,
+    pm.HasHighViewPosts,
+    pm.HasTopScorePosts,
+    COALESCE(pm.AllTitles, 'No Titles') AS Titles,
+    COALESCE(pm.AllTags, 'No Tags') AS Tags
+FROM PerformanceMetrics pm
+WHERE pm.UserId IS NOT NULL
+  AND pm.Reputation > 0
+  AND pm.TotalPosts >= 0
+  AND pm.TotalComments >= 0
+  AND pm.TotalBadges >= 0
+  AND pm.TotalVotes >= 0
+HAVING pm.Reputation IS NOT NULL
+   AND pm.TotalPosts IS NOT NULL
+   AND pm.UserId IS NOT NULL
+ORDER BY pm.Reputation DESC, pm.TotalPosts DESC, pm.UserRank ASC
+LIMIT 1000;

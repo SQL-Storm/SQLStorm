@@ -1,0 +1,122 @@
+WITH
+ActiveUsers AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    COUNT(DISTINCT b.Id) AS BadgeCount,
+    MAX(p.LastActivityDate) AS LastActivity
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Location
+),
+PostActivity AS (
+  SELECT
+    p.Id AS PostId,
+    p.OwnerUserId,
+    p.PostTypeId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.CommentCount,
+    p.Title,
+    p.Tags,
+    p.AcceptedAnswerId,
+    p.ParentId,
+    p.OwnerDisplayName,
+    ROW_NUMBER() OVER (
+      PARTITION BY CAST(p.CreationDate AS DATE)
+      ORDER BY p.Score DESC, p.ViewCount DESC
+    ) AS DayRank,
+    (
+      SELECT COUNT(*) FROM PostLinks pl
+      WHERE pl.PostId = p.Id OR pl.RelatedPostId = p.Id
+    ) AS RelatedCount
+  FROM Posts p
+  WHERE p.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '365' DAY)
+),
+AvgAcceptedPerQuestion AS (
+  SELECT
+    q.Id AS QuestionId,
+    AVG(a.Score) AS AvgAcceptedScore
+  FROM Posts q
+  LEFT JOIN Posts a
+    ON a.ParentId = q.Id
+   AND a.PostTypeId = 2
+  WHERE q.PostTypeId = 1
+  GROUP BY q.Id
+),
+TagMetrics AS (
+  SELECT
+    t.TagName,
+    COALESCE(t.Count, 0) AS TagCount,
+    CASE
+      WHEN t.IsModeratorOnly IS NULL THEN 0
+      WHEN t.IsModeratorOnly = TRUE THEN 1
+      WHEN t.IsModeratorOnly = FALSE THEN 0
+      ELSE 0
+    END AS IsModeratorOnlyFlag,
+    CASE
+      WHEN COALESCE(CASE WHEN t.IsRequired = TRUE THEN 1 WHEN t.IsRequired = FALSE THEN 0 ELSE NULL END, 0) = 1 THEN 'Required'
+      ELSE 'Optional'
+    END AS Requirement,
+    '[' || t.TagName || ']' AS BracketedTag
+  FROM Tags t
+  WHERE t.IsModeratorOnly = 0 OR t.IsModeratorOnly IS NULL OR t.IsModeratorOnly = FALSE
+)
+SELECT
+  AU.UserId,
+  AU.DisplayName AS UserName,
+  AU.Reputation,
+  AU.LastActivity,
+  AU.BadgeCount,
+  PA.PostId,
+  PA.DayRank,
+  PA.Title,
+  PA.Tags,
+  PA.Score AS PostScore,
+  PA.ViewCount,
+  PA.CommentCount,
+  AA.AvgAcceptedScore,
+  TM.TagName,
+  TM.TagCount,
+  TM.Requirement
+FROM ActiveUsers AU
+LEFT JOIN PostActivity PA
+  ON PA.OwnerUserId = AU.UserId
+LEFT JOIN AvgAcceptedPerQuestion AA
+  ON AA.QuestionId = PA.PostId
+LEFT JOIN TagMetrics TM
+  ON TM.TagName = ANY(
+    string_to_array(
+      REPLACE(REPLACE(COALESCE(PA.Tags, ''), '<', ''), '>', ''),
+      '><'
+    )
+  )
+WHERE
+  AU.Reputation > 1000
+  AND PA.DayRank <= 3
+GROUP BY
+  AU.UserId,
+  AU.DisplayName,
+  AU.Reputation,
+  AU.LastActivity,
+  AU.BadgeCount,
+  PA.PostId,
+  PA.DayRank,
+  PA.Title,
+  PA.Tags,
+  PA.Score,
+  PA.ViewCount,
+  PA.CommentCount,
+  AA.AvgAcceptedScore,
+  TM.TagName,
+  TM.TagCount,
+  TM.Requirement
+ORDER BY AU.Reputation DESC, AU.LastActivity DESC
+FETCH FIRST 100 ROWS ONLY;

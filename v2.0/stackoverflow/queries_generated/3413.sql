@@ -1,0 +1,191 @@
+-- {"query": "3413.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1840} 
+
+/*  Benchmark Query – mixes CTEs, window functions, outer joins, correlated subqueries,
+    set operators, complex expressions, string handling and NULL logic               */
+
+WITH
+/* ----------------------------------------------------------------------
+   1. Base user metrics: reputation, account age, total up/down votes, …
+   ---------------------------------------------------------------------- */
+UserBase AS (
+    SELECT
+        u.Id                                   AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        DATE_PART('day', CURRENT_TIMESTAMP - u.CreationDate)          AS AccountAgeDays,
+        COALESCE(u.UpVotes,0) - COALESCE(u.DownVotes,0)                AS NetVotes,
+        CASE
+            WHEN u.Location IS NULL THEN 'Unknown'
+            ELSE u.Location
+        END                                                          AS LocationLabel,
+        /* Concatenate first three tags the user has ever answered */
+        (SELECT STRING_AGG(t.TagName, ', ')
+         FROM   Posts p
+                JOIN PostHistory ph ON ph.PostId = p.Id
+                JOIN Tags t ON t.Id = ANY(STRING_TO_ARRAY(p.Tags,''><'')::int[])
+         WHERE  p.PostTypeId = 2               -- answers
+                AND p.OwnerUserId = u.Id
+         ORDER BY p.CreationDate
+         LIMIT 3)                                                    AS SampleTags
+    FROM Users u
+),
+
+/* ----------------------------------------------------------------------
+   2. Badge aggregation per user, distinguishing tag‑based vs named badges
+   ---------------------------------------------------------------------- */
+BadgeAgg AS (
+    SELECT
+        b.UserId,
+        COUNT(*)                                    AS TotalBadges,
+        SUM(CASE WHEN b.TagBased = 1 THEN 1 ELSE 0 END) AS TagBadges,
+        SUM(CASE WHEN b.TagBased = 0 THEN 1 ELSE 0 END) AS NamedBadges,
+        MAX(CASE WHEN b.Class = 1 THEN b.Date END)      AS LastGoldBadgeDate,
+        STRING_AGG(DISTINCT b.Name, '; ') FILTER (WHERE b.Class = 1) AS GoldBadgeList
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+/* ----------------------------------------------------------------------
+   3. Recent activity snapshot: last post, last comment, vote breakdown
+   ---------------------------------------------------------------------- */
+RecentActivity AS (
+    SELECT
+        u.Id                                          AS UserId,
+        /* latest post (question or answer) */
+        (SELECT p.Id
+         FROM   Posts p
+         WHERE  p.OwnerUserId = u.Id
+         ORDER  BY p.CreationDate DESC
+         LIMIT  1)                                    AS LastPostId,
+        /* latest comment authored by the user */
+        (SELECT c.Id
+         FROM   Comments c
+         WHERE  c.UserId = u.Id
+         ORDER  BY c.CreationDate DESC
+         LIMIT  1)                                    AS LastCommentId,
+        /* voting summary – correlated sub‑query for speed testing */
+        (SELECT COUNT(*)
+         FROM   Votes v
+         WHERE  v.UserId = u.Id
+                AND v.VoteTypeId = 2)               AS UpVotesCast,
+        (SELECT COUNT(*)
+         FROM   Votes v
+         WHERE  v.UserId = u.Id
+                AND v.VoteTypeId = 3)               AS DownVotesCast
+    FROM Users u
+),
+
+/* ----------------------------------------------------------------------
+   4. Post‑level window metrics (score rank, cumulative view count)
+   ---------------------------------------------------------------------- */
+PostMetrics AS (
+    SELECT
+        p.Id                                     AS PostId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId
+                           ORDER BY p.Score DESC,
+                                    p.CreationDate ASC) AS ScoreRank,
+        SUM(p.ViewCount) OVER (PARTITION BY p.OwnerUserId
+                               ORDER BY p.CreationDate
+                               ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumViews
+    FROM Posts p
+    WHERE p.PostTypeId IN (1,2)                -- questions & answers only
+),
+
+/* ----------------------------------------------------------------------
+   5. Users with at least one badge UNION ALL users with none
+   ---------------------------------------------------------------------- */
+AllUsers AS (
+    SELECT ub.UserId
+    FROM   BadgeAgg ub
+    UNION ALL
+    SELECT u.Id
+    FROM   Users u
+    WHERE  NOT EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = u.Id)
+),
+
+/* ----------------------------------------------------------------------
+   6. Final ranking: combine everything, apply windowed percentiles,
+      and filter with a complex predicate
+   ---------------------------------------------------------------------- */
+FinalRanking AS (
+    SELECT
+        ub.UserId,
+        ub.DisplayName,
+        ub.Reputation,
+        ub.AccountAgeDays,
+        ub.NetVotes,
+        ub.LocationLabel,
+        ub.SampleTags,
+        ba.TotalBadges,
+        ba.TagBadges,
+        ba.NamedBadges,
+        ba.LastGoldBadgeDate,
+        ba.GoldBadgeList,
+        ra.LastPostId,
+        ra.LastCommentId,
+        ra.UpVotesCast,
+        ra.DownVotesCast,
+        /* Percentile of reputation within the whole site */
+        PERCENT_RANK() OVER (ORDER BY ub.Reputation)          AS RepPercentile,
+        /* Flag users who are “power users” */
+        CASE
+            WHEN ub.Reputation > 10000
+                 AND COALESCE(ba.TotalBadges,0) >= 5
+                 AND ra.UpVotesCast > ra.DownVotesCast
+                 THEN 1
+            ELSE 0
+        END                                                   AS IsPowerUser
+    FROM   UserBase ub
+    LEFT   JOIN BadgeAgg ba   ON ba.UserId = ub.UserId
+    LEFT   JOIN RecentActivity ra ON ra.UserId = ub.UserId
+    WHERE  (ub.Reputation > 5000 OR ba.TotalBadges IS NOT NULL)
+           AND (ub.LocationLabel <> 'Unknown' OR ub.NetVotes <> 0)
+)
+
+SELECT
+    fr.UserId,
+    fr.DisplayName,
+    fr.Reputation,
+    fr.AccountAgeDays,
+    fr.NetVotes,
+    fr.LocationLabel,
+    fr.SampleTags,
+    fr.TotalBadges,
+    fr.TagBadges,
+    fr.NamedBadges,
+    fr.LastGoldBadgeDate,
+    fr.GoldBadgeList,
+    fr.LastPostId,
+    fr.LastCommentId,
+    fr.UpVotesCast,
+    fr.DownVotesCast,
+    fr.RepPercentile,
+    fr.IsPowerUser,
+    /* Highest‑scoring post per user (correlated sub‑query) */
+    (SELECT p.Title
+     FROM   Posts p
+     WHERE  p.OwnerUserId = fr.UserId
+            AND p.PostTypeId = 1               -- only questions
+     ORDER  BY p.Score DESC, p.CreationDate ASC
+     LIMIT  1)                                    AS TopQuestionTitle,
+    /* Total cumulative views up to the most recent post (window join) */
+    COALESCE(pm.CumViews,0)                      AS CumulativeViews,
+    /* Show if the user has ever been involved in a duplicate link */
+    CASE
+        WHEN EXISTS (
+            SELECT 1
+            FROM   PostLinks pl
+            WHERE  pl.PostId = fr.LastPostId
+                   AND pl.LinkTypeId = 3          -- Duplicate
+        ) THEN 'Yes' ELSE 'No'
+    END                                         AS HasDuplicateLink
+FROM   FinalRanking fr
+LEFT   JOIN PostMetrics pm
+       ON pm.PostId = fr.LastPostId
+ORDER  BY fr.RepPercentile DESC,
+          fr.IsPowerUser DESC,
+          fr.Reputation DESC
+LIMIT  100;

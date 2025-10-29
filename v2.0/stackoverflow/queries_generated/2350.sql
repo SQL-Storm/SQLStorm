@@ -1,0 +1,171 @@
+-- {"query": "2350.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1440} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        0 as Level,
+        cast(t.TagName as varchar(1000)) as FullPath
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+    union all
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Level + 1,
+        r.FullPath || ' > ' || t.TagName
+    from Tags t
+    join RecursiveTagHierarchy r on r.Id <> t.Id and position(r.TagName in t.TagName) = 1
+    where r.Level < 2
+),
+HighRepUsers as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        count(distinct b.Id) as BadgeCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        sum(v.BountyAmount) as TotalBountyEarned
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId in (1, 2)
+    left join Votes v on v.UserId = u.Id and v.VoteTypeId in (8, 9)
+    where u.Reputation > 5000 and u.Location is not null
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+UserActivityRank as (
+    select
+        h.Id,
+        h.DisplayName,
+        h.Reputation,
+        h.QuestionCount,
+        h.AnswerCount,
+        h.BadgeCount,
+        h.TotalBountyEarned,
+        row_number() over (order by h.Reputation desc, h.BadgeCount desc) as UserRank
+    from HighRepUsers h
+),
+TopQuestions as (
+    select
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        (select count(*) from Comments c where c.PostId = p.Id) as CommentCount,
+        (select count(distinct ph.Id) from PostHistory ph where ph.PostId = p.Id and ph.PostHistoryTypeId in (4,5,6)) as EditCount,
+        case 
+            when p.ClosedDate is not null then 1
+            else 0
+        end as IsClosed
+    from Posts p
+    where p.PostTypeId = 1 and p.Score > 10 and p.ViewCount > 1000
+),
+TopAnswers as (
+    select
+        a.Id,
+        a.ParentId,
+        a.OwnerUserId,
+        a.Score,
+        a.CreationDate,
+        a.Body,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts a
+    where a.PostTypeId = 2 and a.Score > 5
+),
+AnswerVoteStats as (
+    select
+        a.Id,
+        count(v.Id) filter (where v.VoteTypeId = 2) as UpVotes,
+        count(v.Id) filter (where v.VoteTypeId = 3) as DownVotes,
+        sum(case when v.VoteTypeId = 8 then v.BountyAmount else 0 end) as TotalBounty
+    from Posts a
+    left join Votes v on v.PostId = a.Id
+    where a.PostTypeId = 2
+    group by a.Id
+),
+UserTagParticipation as (
+    select
+        u.Id as UserId,
+        trim(tag) as Tag,
+        count(*) as PostCount
+    from Users u
+    join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 1
+    cross join lateral unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')) as tag
+    where u.Reputation > 1000
+    group by u.Id, tag
+),
+TopUserTags as (
+    select
+        utp.UserId,
+        utp.Tag,
+        utp.PostCount,
+        row_number() over (partition by utp.UserId order by utp.PostCount desc) as TagRank
+    from UserTagParticipation utp
+),
+UserTopTagsCTE as (
+    select
+        ut.UserId,
+        string_agg(ut.Tag || '(' || ut.PostCount || ')', ', ') as TagSummary
+    from TopUserTags ut
+    where ut.TagRank <= 3
+    group by ut.UserId
+),
+QuestionsWithLinks as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionCreated,
+        l.RelatedPostId,
+        l.LinkTypeId,
+        lt.Name as LinkTypeName,
+        rp.PostTypeId as RelatedPostType,
+        rp.Score as RelatedPostScore,
+        rp.CreationDate as RelatedPostCreated
+    from Posts q
+    left join PostLinks l on l.PostId = q.Id
+    left join LinkTypes lt on lt.Id = l.LinkTypeId
+    left join Posts rp on rp.Id = l.RelatedPostId
+    where q.PostTypeId = 1 and q.Score > 15
+),
+FilteredQuestions as (
+    select q.*
+    from TopQuestions q
+    where q.CommentCount > 2 or q.EditCount > 1
+),
+FinalOutput as (
+    select
+        ua.UserRank,
+        ua.DisplayName as UserName,
+        ua.Reputation,
+        ua.BadgeCount,
+        ua.TotalBountyEarned,
+        ut.Tags as TopTags,
+        fq.Id as QuestionId,
+        fq.Title as QuestionTitle,
+        fq.Score as QuestionScore,
+        fq.ViewCount,
+        fq.CommentCount,
+        fq.EditCount,
+        fq.IsClosed,
+        al.RelatedPostId,
+        al.LinkTypeName,
+        al.RelatedPostType,
+        al.RelatedPostScore,
+        al.RelatedPostCreated,
+        rank() over (partition by ua.Id order by fq.Score desc) as QuestionRank
+    from UserActivityRank ua
+    left join UserTopTagsCTE ut on ut.UserId = ua.Id
+    left join Posts fq on fq.OwnerUserId = ua.Id and fq.PostTypeId = 1
+    left join QuestionsWithLinks al on al.QuestionId = fq.Id
+    where ua.UserRank <= 100
+)
+select *
+from FinalOutput
+where (QuestionRank between 1 and 3) and (IsClosed = 0 or IsClosed is null)
+order by UserRank, QuestionScore desc, RelatedPostScore desc;

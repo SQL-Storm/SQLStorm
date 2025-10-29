@@ -1,0 +1,379 @@
+-- {"query": "7970.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 3247} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT b.Id) as Badges,
+        COUNT(DISTINCT c.Id) as Comments,
+        COUNT(DISTINCT v.Id) as Votes,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        MAX(v.CreationDate) as LastVoteDate,
+        CASE WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+            DATEDIFF(DAY, MIN(p.CreationDate), MAX(p.CreationDate)) 
+        ELSE 0 END as DaysActive,
+        AVG(p.Score) as AvgPostScore,
+        SUM(p.ViewCount) as TotalViews,
+        STRING_AGG(DISTINCT p.Tags, '; ') as AllTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views
+),
+TopUsersByReputation AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        TotalPosts,
+        Questions,
+        Answers,
+        Badges,
+        Comments,
+        Votes,
+        LastPostDate,
+        LastCommentDate,
+        LastVoteDate,
+        DaysActive,
+        AvgPostScore,
+        TotalViews,
+        AllTags,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC) as RankByReputation,
+        RANK() OVER (ORDER BY TotalPosts DESC) as RankByPosts,
+        DENSE_RANK() OVER (ORDER BY Badges DESC) as RankByBadges
+    FROM UserActivityStats
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        COALESCE(p.AcceptedAnswerId, 0) as AcceptanceFlag,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END as IsClosed,
+        CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN 1 ELSE 0 END as IsCommunityOwned,
+        CASE WHEN p.ParentId IS NOT NULL THEN 'Answer' ELSE 'Question' END as PostType,
+        DATEDIFF(DAY, p.CreationDate, COALESCE(p.ClosedDate, CURRENT_TIMESTAMP)) as DaysOpen,
+        IIF(p.Score > 0, 
+            ROUND((p.ViewCount * 1.0 / p.Score), 2), 
+            0) as ViewsPerScore,
+        CASE 
+            WHEN p.Score < 0 THEN 'Negative'
+            WHEN p.Score BETWEEN 0 AND 5 THEN 'Neutral'
+            WHEN p.Score BETWEEN 6 AND 20 THEN 'Positive'
+            ELSE 'VeryPositive'
+        END as ScoreCategory,
+        LTRIM(RTRIM(SUBSTRING(p.Body, 1, 150))) as BodySnippet,
+        LEN(p.Body) as BodyLength,
+        COALESCE(p.OwnerDisplayName, 'Anonymous') as OwnerDisplayName
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) -- Only Questions and Answers
+),
+FilteredPosts AS (
+    SELECT *
+    FROM PostAnalysis
+    WHERE Score >= 0 
+      AND ViewCount >= 10
+      AND DaysOpen BETWEEN 1 AND 365
+      AND (TagBased = 0 OR Tags LIKE '%sql%')
+),
+CombinedMetrics AS (
+    SELECT 
+        pu.UserId,
+        pu.DisplayName,
+        pu.Reputation,
+        pu.TotalPosts,
+        pu.Questions,
+        pu.Answers,
+        pu.Badges,
+        pu.Comments,
+        pu.Votes,
+        pu.DaysActive,
+        pu.AvgPostScore,
+        pu.TotalViews,
+        pu.AllTags,
+        pu.RankByReputation,
+        pu.RankByPosts,
+        pu.RankByBadges,
+        fp.PostId,
+        fp.Title,
+        fp.Body,
+        fp.Score,
+        fp.ViewCount,
+        fp.CreationDate,
+        fp.PostTypeId,
+        fp.Tags,
+        fp.AnswerCount,
+        fp.CommentCount,
+        fp.FavoriteCount,
+        fp.AcceptanceFlag,
+        fp.IsClosed,
+        fp.IsCommunityOwned,
+        fp.PostType,
+        fp.DaysOpen,
+        fp.ViewsPerScore,
+        fp.ScoreCategory,
+        fp.BodySnippet,
+        fp.BodyLength,
+        fp.OwnerDisplayName,
+        CASE 
+            WHEN pu.TotalPosts > 10 AND pu.Reputation > 1000 THEN 'Active'
+            WHEN pu.TotalPosts BETWEEN 5 AND 10 THEN 'Moderate'
+            WHEN pu.TotalPosts < 5 THEN 'Beginner'
+            ELSE 'Unknown'
+        END as UserActivityLevel,
+        CASE 
+            WHEN fu.RankByPosts <= 10 THEN 'Top'
+            WHEN fu.RankByPosts <= 50 THEN 'High'
+            WHEN fu.RankByPosts <= 100 THEN 'Medium'
+            ELSE 'Low'
+        END as PostRankLevel,
+        CASE 
+            WHEN fu.Badges > 5 THEN 'BadgeMaster'
+            WHEN fu.Badges > 2 THEN 'BadgeEnthusiast'
+            ELSE 'BadgeBeginner'
+        END as BadgeLevel,
+        ROW_NUMBER() OVER (PARTITION BY pu.UserId ORDER BY fp.Score DESC) as PostRankByScore,
+        ROW_NUMBER() OVER (PARTITION BY pu.UserId ORDER BY fp.CreationDate DESC) as RecentPostRank,
+        DENSE_RANK() OVER (ORDER BY fp.Score ASC) as ScoreRank,
+        RANK() OVER (ORDER BY fp.ViewCount DESC) as ViewRank,
+        NTILE(4) OVER (ORDER BY fp.Score DESC) as ScoreQuartile
+    FROM TopUsersByReputation pu
+    INNER JOIN Posts p ON pu.UserId = p.OwnerUserId
+    INNER JOIN PostAnalysis fp ON p.Id = fp.PostId
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) as CommentCount
+        FROM Comments
+        GROUP BY PostId
+    ) c ON fp.PostId = c.PostId
+    WHERE p.PostTypeId IN (1, 2)
+),
+AggregatedPostStats AS (
+    SELECT 
+        PostId,
+        Title,
+        Body,
+        Score,
+        ViewCount,
+        CreationDate,
+        PostTypeId,
+        Tags,
+        AnswerCount,
+        CommentCount,
+        FavoriteCount,
+        AcceptanceFlag,
+        IsClosed,
+        IsCommunityOwned,
+        PostType,
+        DaysOpen,
+        ViewsPerScore,
+        ScoreCategory,
+        BodySnippet,
+        BodyLength,
+        OwnerDisplayName,
+        UserActivityLevel,
+        PostRankLevel,
+        BadgeLevel,
+        PostRankByScore,
+        RecentPostRank,
+        ScoreRank,
+        ViewRank,
+        ScoreQuartile,
+        AVG(Score) OVER (PARTITION BY PostTypeId) as AvgScoreByType,
+        MAX(ViewCount) OVER (PARTITION BY PostTypeId) as MaxViewsByType,
+        MIN(DaysOpen) OVER (PARTITION BY PostTypeId) as MinDaysOpenByType,
+        STDDEV(Score) OVER (PARTITION BY PostTypeId) as StdDevScoreByType,
+        COUNT(*) OVER (PARTITION BY PostTypeId) as TotalPostsByType,
+        NTILE(10) OVER (ORDER BY ViewCount) as ViewDecile,
+        CASE 
+            WHEN DaysOpen > 30 THEN 'LongTerm'
+            WHEN DaysOpen BETWEEN 7 AND 30 THEN 'MediumTerm'
+            WHEN DaysOpen < 7 THEN 'ShortTerm'
+            ELSE 'Unknown'
+        END as TimeFrame,
+        LAG(Score, 1) OVER (ORDER BY CreationDate) as PrevScore,
+        LEAD(Score, 1) OVER (ORDER BY CreationDate) as NextScore,
+        LAG(OwnerDisplayName, 1) OVER (ORDER BY CreationDate) as PrevOwner,
+        IIF(Score > LAG(Score, 1) OVER (ORDER BY CreationDate), 
+            'Increased', 
+            IIF(Score < LAG(Score, 1) OVER (ORDER BY CreationDate), 
+                'Decreased', 
+                'Stable')) as ScoreChange
+    FROM CombinedMetrics
+),
+ComplexPostFilter AS (
+    SELECT *,
+        CASE 
+            WHEN Score > (SELECT AVG(Score) FROM AggregatedPostStats) THEN 1
+            ELSE 0 
+        END as AboveAverageScore,
+        CASE 
+            WHEN ViewCount > (SELECT AVG(ViewCount) FROM AggregatedPostStats) THEN 1
+            ELSE 0 
+        END as AboveAverageViews,
+        CASE 
+            WHEN Tags LIKE '%[sql%' THEN 1
+            WHEN Tags LIKE '%[mysql%' THEN 1
+            WHEN Tags LIKE '%[postgresql%' THEN 1
+            ELSE 0
+        END as HasDatabaseTag,
+        CASE 
+            WHEN BodyLength > 500 THEN 'LongBody'
+            WHEN BodyLength BETWEEN 200 AND 500 THEN 'MediumBody'
+            WHEN BodyLength < 200 THEN 'ShortBody'
+            ELSE 'UnknownBody'
+        END as BodyLengthCategory,
+        CASE 
+            WHEN Tags IS NOT NULL AND LENGTH(TRIM(Tags)) > 0 THEN
+                (SELECT COUNT(*) FROM UNNEST(STRING_TO_ARRAY(TRIM(Tags), '><')) AS tag WHERE tag != '')
+            ELSE 0
+        END as TagCount,
+        DATEDIFF(DAY, CreationDate, CURRENT_TIMESTAMP) as DaysSincePost
+    FROM AggregatedPostStats
+),
+FinalAggregation AS (
+    SELECT 
+        PostId,
+        Title,
+        Body,
+        Score,
+        ViewCount,
+        CreationDate,
+        PostTypeId,
+        Tags,
+        AnswerCount,
+        CommentCount,
+        FavoriteCount,
+        AcceptanceFlag,
+        IsClosed,
+        IsCommunityOwned,
+        PostType,
+        DaysOpen,
+        ViewsPerScore,
+        ScoreCategory,
+        BodySnippet,
+        BodyLength,
+        OwnerDisplayName,
+        UserActivityLevel,
+        PostRankLevel,
+        BadgeLevel,
+        PostRankByScore,
+        RecentPostRank,
+        ScoreRank,
+        ViewRank,
+        ScoreQuartile,
+        AvgScoreByType,
+        MaxViewsByType,
+        MinDaysOpenByType,
+        StdDevScoreByType,
+        TotalPostsByType,
+        ViewDecile,
+        TimeFrame,
+        PrevScore,
+        NextScore,
+        PrevOwner,
+        ScoreChange,
+        AboveAverageScore,
+        AboveAverageViews,
+        HasDatabaseTag,
+        BodyLengthCategory,
+        TagCount,
+        DaysSincePost,
+        ROW_NUMBER() OVER (ORDER BY DaysSincePost DESC, Score DESC) as FreshnessScore,
+        RANK() OVER (PARTITION BY Tags ORDER BY Score DESC) as TagRank,
+        DENSE_RANK() OVER (ORDER BY ViewCount DESC, Score DESC) as PopularityRank,
+        NTH_VALUE(PostId, 3) OVER (ORDER BY Score DESC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) as ThirdHighestScoringPost,
+        PERCENT_RANK() OVER (ORDER BY Score) as ScorePercentile,
+        CUME_DIST() OVER (ORDER BY ViewCount) as ViewDistribution,
+        NTILE(5) OVER (ORDER BY Score) as ScoreTier
+    FROM ComplexPostFilter
+),
+FinalComparison AS (
+    SELECT 
+        f1.PostId as PostId1,
+        f2.PostId as PostId2,
+        f1.Title as Title1,
+        f2.Title as Title2,
+        f1.Score as Score1,
+        f2.Score as Score2,
+        f1.ViewCount as ViewCount1,
+        f2.ViewCount as ViewCount2,
+        f1.DaysSincePost as Days1,
+        f2.DaysSincePost as Days2,
+        CASE 
+            WHEN f1.Score > f2.Score THEN 'Post1 Higher'
+            WHEN f1.Score < f2.Score THEN 'Post2 Higher'
+            ELSE 'Equal Scores'
+        END as ScoreComparison,
+        ABS(f1.Score - f2.Score) as ScoreDifference,
+        CASE 
+            WHEN ABS(f1.Score - f2.Score) > 10 THEN 'High Difference'
+            WHEN ABS(f1.Score - f2.Score) BETWEEN 1 AND 10 THEN 'Medium Difference'
+            WHEN ABS(f1.Score - f2.Score) < 1 THEN 'Low Difference'
+            ELSE 'Unknown'
+        END as DifferenceCategory,
+        DATEDIFF(DAY, f1.CreationDate, f2.CreationDate) as DateDifference,
+        ABS(DATEDIFF(DAY, f1.CreationDate, f2.CreationDate)) as AbsoluteDateDiff,
+        CASE 
+            WHEN f1.Tags LIKE '%' || f2.Tags || '%' OR f2.Tags LIKE '%' || f1.Tags || '%' THEN 1
+            ELSE 0
+        END as TagSimilarity,
+        CASE 
+            WHEN f1.OwnerDisplayName = f2.OwnerDisplayName THEN 1
+            ELSE 0
+        END as AuthorSimilarity
+    FROM FinalAggregation f1
+    CROSS JOIN FinalAggregation f2
+    WHERE f1.PostId <> f2.PostId
+      AND f1.CreatedDate > '2022-01-01'
+      AND f2.CreatedDate > '2022-01-01'
+)
+SELECT 
+    fc.PostId1,
+    fc.PostId2,
+    fc.Title1,
+    fc.Title2,
+    fc.Score1,
+    fc.Score2,
+    fc.ViewCount1,
+    fc.ViewCount2,
+    fc.ScoreComparison,
+    fc.ScoreDifference,
+    fc.DifferenceCategory,
+    fc.DateDifference,
+    fc.AbsoluteDateDiff,
+    fc.TagSimilarity,
+    fc.AuthorSimilarity,
+    COUNT(*) OVER () as TotalComparisons,
+    RANK() OVER (ORDER BY fc.ScoreDifference DESC) as DiffRank,
+    ROW_NUMBER() OVER (ORDER BY fc.ScoreDifference DESC) as DiffRowNumber,
+    SUM(fc.ScoreDifference) OVER () as TotalScoreDifference,
+    AVG(fc.ScoreDifference) OVER () as AvgScoreDifference,
+    STDDEV(fc.ScoreDifference) OVER () as StdDevScoreDifference,
+    DENSE_RANK() OVER (ORDER BY fc.TagSimilarity DESC) as TagSimilarityRank,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY fc.ScoreDifference) as MedianScoreDifference,
+    LAG(fc.PostId1, 1) OVER (ORDER BY fc.ScoreDifference DESC) as PrevPostId,
+    LEAD(fc.PostId2, 1) OVER (ORDER BY fc.ScoreDifference DESC) as NextPostId
+FROM FinalComparison fc
+WHERE fc.ScoreDifference > 5
+  AND fc.Days1 < 365
+  AND fc.Days2 < 365
+  AND fc.TagSimilarity = 1
+ORDER BY fc.ScoreDifference DESC
+LIMIT 100;

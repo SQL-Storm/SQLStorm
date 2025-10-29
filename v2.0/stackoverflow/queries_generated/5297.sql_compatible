@@ -1,0 +1,30 @@
+SELECT
+    u.Id AS UserId,
+    u.DisplayName AS UserName,
+    COUNT(DISTINCT p.Id) AS PostCount,
+    AVG(p.Score) AS AvgPostScore,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived,
+    MAX(p.CreationDate) AS LastPostDate,
+    STRING_AGG(DISTINCT t.Name, ',') FILTER (WHERE t.Name IS NOT NULL) AS PostTags,
+    SUM(CASE WHEN c.Id IS NOT NULL THEN 1 ELSE 0 END) AS CommentCountOnUserPosts,
+    SUM(CASE WHEN bh.PostHistoryTypeId IN (10, 11, 12, 13) THEN 1 ELSE 0 END) AS AdminModerationVotes
+FROM
+    Users u
+LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+LEFT JOIN Votes v ON v.PostId = p.Id
+LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+-- assume Posts.Tags contains a delimited tag name list; join via a tag mapping table if available.
+LEFT JOIN Tags t ON POSITION(t.Name IN COALESCE(p.Tags, '')) > 0
+LEFT JOIN Comments c ON c.PostId = p.Id
+LEFT JOIN PostHistory bh ON bh.PostId = p.Id
+WHERE
+    u.Reputation > 1000
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+GROUP BY
+    u.Id, u.DisplayName
+HAVING
+    COUNT(DISTINCT p.Id) > 0
+ORDER BY
+    PostCount DESC, LastPostDate DESC
+LIMIT 100;

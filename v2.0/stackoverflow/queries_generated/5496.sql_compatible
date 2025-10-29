@@ -1,0 +1,162 @@
+WITH
+RecentActivity AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.OwnerUserId,
+    p.ViewCount,
+    p.Score,
+    p.AnswerCount,
+    p.CommentCount,
+    p.Tags,
+    COALESCE(v.CntUp,0) AS UpVotes,
+    COALESCE(v.CntDown,0) AS DownVotes,
+    COALESCE(lk.CountLinks,0) AS LinkedPosts,
+    COALESCE(pv.BountyTotal,0) AS BountyTotal,
+    u.Reputation,
+    u.DisplayName
+  FROM
+    Posts p
+    LEFT JOIN (
+      SELECT PostId,
+             SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS CntUp,
+             SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS CntDown
+      FROM Votes
+      GROUP BY PostId
+    ) v ON p.Id = v.PostId
+    LEFT JOIN (
+      SELECT PostId, COUNT(*) AS CountLinks
+      FROM PostLinks
+      GROUP BY PostId
+    ) lk ON p.Id = lk.PostId
+    LEFT JOIN (
+      SELECT PostId, SUM(BountyAmount) AS BountyTotal
+      FROM Votes
+      WHERE VoteTypeId = 8 OR VoteTypeId = 9
+      GROUP BY PostId
+    ) pv ON p.Id = pv.PostId
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE
+    p.PostTypeId IN (1,2)
+),
+Filtered AS (
+  SELECT
+    ra.PostId,
+    ra.PostTypeId,
+    ra.Title,
+    ra.CreationDate,
+    ra.LastActivityDate,
+    ra.OwnerUserId,
+    ra.ViewCount,
+    ra.Score,
+    ra.AnswerCount,
+    ra.CommentCount,
+    ra.Tags,
+    ra.UpVotes,
+    ra.DownVotes,
+    ra.LinkedPosts,
+    ra.BountyTotal,
+    ra.Reputation,
+    ra.DisplayName,
+    -- compute Desirability without dialect-specific casts
+    (CASE WHEN ra.ViewCount > 0 THEN (ra.Score * 1.0 / NULLIF(ra.ViewCount,0)) ELSE 0 END) +
+    (CASE WHEN ra.Reputation IS NOT NULL THEN LOG(1 + ra.Reputation) ELSE 0 END) AS Desirability
+  FROM RecentActivity ra
+  WHERE
+    ra.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180 days')
+    AND ra.LastActivityDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '60 days')
+    AND (ra.BountyTotal IS NULL OR ra.BountyTotal < 1000)
+),
+Ranked AS (
+  SELECT
+    f.PostId,
+    f.PostTypeId,
+    f.Title,
+    f.CreationDate,
+    f.LastActivityDate,
+    f.OwnerUserId,
+    f.ViewCount,
+    f.Score,
+    f.AnswerCount,
+    f.CommentCount,
+    f.Tags,
+    f.UpVotes,
+    f.DownVotes,
+    f.LinkedPosts,
+    f.BountyTotal,
+    f.Reputation,
+    f.DisplayName,
+    f.Desirability,
+    ROW_NUMBER() OVER (PARTITION BY f.PostTypeId ORDER BY f.Desirability DESC, f.LastActivityDate DESC) AS RankWithinType
+  FROM Filtered f
+),
+-- Build TagContext by extracting tags per post; ensure grouped columns are listed
+TagContext AS (
+  SELECT
+    r.PostId,
+    r.PostTypeId,
+    r.Title,
+    r.CreationDate,
+    r.LastActivityDate,
+    r.OwnerUserId,
+    r.ViewCount,
+    r.Score,
+    r.AnswerCount,
+    r.CommentCount,
+    r.Tags,
+    r.UpVotes,
+    r.DownVotes,
+    r.LinkedPosts,
+    r.BountyTotal,
+    r.Reputation,
+    r.DisplayName,
+    r.Desirability,
+    r.RankWithinType,
+    tex.TagName,
+    COUNT(*) OVER (PARTITION BY r.PostId, tex.TagName) AS TagCount,
+    CASE WHEN tg.IsModeratorOnly = 1 THEN 'MOD_ONLY' ELSE 'OPEN' END AS TagAccessibility
+  FROM Ranked r
+  LEFT JOIN LATERAL (
+    SELECT TRIM(both '<>' FROM tag) AS TagName
+    FROM unnest(
+      CASE
+        WHEN r.Tags IS NULL OR r.Tags = '' THEN ARRAY[]::text[]
+        ELSE regexp_split_to_array(regexp_replace(r.Tags, '^<|>$', ''), '><')
+      END
+    ) AS t(tag)
+  ) tex ON TRUE
+  LEFT JOIN Tags tg ON tg.Name = tex.TagName
+)
+SELECT
+  rc.PostId,
+  rc.Title,
+  rc.PostTypeId,
+  rc.CreationDate,
+  rc.LastActivityDate,
+  rc.OwnerUserId,
+  rc.ViewCount,
+  rc.Score,
+  rc.AnswerCount,
+  rc.CommentCount,
+  rc.Tags,
+  rc.UpVotes,
+  rc.DownVotes,
+  rc.LinkedPosts,
+  rc.BountyTotal,
+  rc.Reputation,
+  rc.DisplayName,
+  rc.Desirability,
+  rc.RankWithinType,
+  rc.TagName,
+  rc.TagCount,
+  rc.TagAccessibility
+FROM TagContext rc
+LEFT JOIN PostLinks pl ON rc.PostId = pl.PostId
+LEFT JOIN (
+  SELECT Id, Name AS TagName FROM Tags WHERE IsModeratorOnly = 0
+) t ON TRUE
+ORDER BY rc.RankWithinType ASC, rc.LastActivityDate DESC
+LIMIT 500;

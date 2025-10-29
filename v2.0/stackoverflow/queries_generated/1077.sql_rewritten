@@ -1,0 +1,320 @@
+-- {"query": "1077.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 4095} 
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(P.Score) AS TotalPostScore,
+        AVG(CASE WHEN P.PostTypeId IN (1,2) THEN P.Score ELSE NULL END) AS AvgQuestionAnswerScore,
+        MAX(P.CreationDate) AS LastPostDate,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        MAX(CASE WHEN B.Class = 1 THEN B.Date ELSE NULL END) AS LastGoldBadgeDate,
+        -- Calculate average comment score, handling potential NULLs
+        COALESCE(AVG(Comm.Score), 0) AS AvgCommentScore,
+        -- User's content quality score (weighted sum)
+        (
+            (COALESCE(SUM(P.Score), 0) * 0.5) +
+            (COALESCE(SUM(P.ViewCount), 0) * 0.01) +
+            (COALESCE(SUM(P.AnswerCount), 0) * 0.1) +
+            (COALESCE(SUM(P.FavoriteCount), 0) * 0.2)
+        ) AS UserContentQualityScore
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments AS Comm ON U.Id = Comm.UserId
+    LEFT JOIN Badges AS B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate
+),
+PostDetailsAggregated AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.ClosedDate,
+        P.LastActivityDate,
+        P.LastEditDate,
+        P.AcceptedAnswerId,
+        P.ParentId,
+        STRING_AGG(DISTINCT T.TagName, ', ') FILTER (WHERE T.TagName IS NOT NULL) AS AssociatedTags,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived,
+        (
+            SELECT COUNT(DISTINCT PH.Id)
+            FROM PostHistory AS PH
+            WHERE PH.PostId = P.Id
+              AND PH.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+              AND PH.CreationDate > P.CreationDate -- Only consider edits after initial creation
+        ) AS TotalEditCount,
+        (
+            SELECT MAX(PH.CreationDate)
+            FROM PostHistory AS PH
+            WHERE PH.PostId = P.Id
+              AND PH.PostHistoryTypeId IN (4, 5, 6)
+        ) AS LastEditHistoryDate,
+        -- Check if post has a 'duplicate' link
+        EXISTS (
+            SELECT 1 FROM PostLinks PL WHERE PL.PostId = P.Id AND PL.LinkTypeId = 3
+        ) AS HasDuplicateLink
+    FROM Posts AS P
+    LEFT JOIN Tags AS T ON P.Tags LIKE '%' || T.TagName || '%' -- Potentially slow, but demonstrates pattern matching
+    LEFT JOIN Votes AS V ON P.Id = V.PostId
+    GROUP BY
+        P.Id, P.PostTypeId, P.OwnerUserId, P.CreationDate, P.Score, P.ViewCount, P.AnswerCount,
+        P.CommentCount, P.FavoriteCount, P.ClosedDate, P.LastActivityDate, P.LastEditDate,
+        P.AcceptedAnswerId, P.ParentId
+),
+PostQualityMetrics AS (
+    SELECT
+        PDA.PostId,
+        PDA.PostTypeId,
+        PDA.OwnerUserId,
+        PDA.PostCreationDate,
+        PDA.PostScore,
+        PDA.ViewCount,
+        PDA.AnswerCount,
+        PDA.CommentCount,
+        PDA.FavoriteCount,
+        PDA.ClosedDate,
+        PDA.LastActivityDate,
+        PDA.LastEditDate,
+        PDA.AcceptedAnswerId,
+        PDA.AssociatedTags,
+        PDA.UpVotesReceived,
+        PDA.DownVotesReceived,
+        PDA.TotalEditCount,
+        PDA.LastEditHistoryDate,
+        PDA.HasDuplicateLink,
+        -- Calculate the "freshness score" for posts
+        CASE
+            WHEN PDA.LastActivityDate IS NULL THEN 0
+            ELSE EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - PDA.LastActivityDate)) / 3600.0 -- hours since last activity
+        END AS HoursSinceLastActivity,
+        -- Ratio of UpVotes to DownVotes, handling division by zero
+        COALESCE(CAST(PDA.UpVotesReceived AS NUMERIC) / NULLIF(PDA.DownVotesReceived, 0), PDA.UpVotesReceived) AS UpDownVoteRatio,
+        -- Is this post "well-received"? (Score > Avg Post Score AND ViewCount > 1000 AND has an accepted answer or many favorites)
+        CASE
+            WHEN PDA.PostScore > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = PDA.PostTypeId)
+                 AND PDA.ViewCount > 1000
+                 AND (PDA.AcceptedAnswerId IS NOT NULL OR PDA.FavoriteCount > 50)
+            THEN 'High Quality'
+            WHEN PDA.ClosedDate IS NOT NULL AND PDA.PostScore < 0
+            THEN 'Low Quality - Closed'
+            ELSE 'Moderate Quality'
+        END AS PostQualityCategory,
+        -- Rank posts by score within their PostTypeId
+        RANK() OVER (PARTITION BY PDA.PostTypeId ORDER BY PDA.PostScore DESC, PDA.CreationDate DESC) AS RankByScore
+    FROM PostDetailsAggregated AS PDA
+    WHERE PDA.PostTypeId IN (1, 2) -- Only consider Questions and Answers for this analysis
+),
+ModeratorActivityMonitor AS (
+    SELECT
+        PH.PostId,
+        PH.UserId AS ModeratorUserId,
+        U.DisplayName AS ModeratorDisplayName,
+        PH.CreationDate AS EventDate,
+        PHT.Name AS HistoryTypeName,
+        PH.Comment,
+        -- Identify posts that were closed and then reopened within a short period (e.g., 7 days)
+        CASE
+            WHEN PHT.Id = 10 AND
+                 LAG(PHT.Id, 1) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) = 11 AND
+                 (PH.CreationDate - LAG(PH.CreationDate, 1) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate)) < INTERVAL '7 days'
+            THEN TRUE
+            ELSE FALSE
+        END AS QuickReopenAfterClose,
+        -- Count how many times a moderator changed the Post History Type for a given post
+        COUNT(PH.Id) OVER (PARTITION BY PH.PostId, PH.UserId, PHT.Id) AS TypeSpecificModActionCount
+    FROM PostHistory AS PH
+    JOIN PostHistoryTypes AS PHT ON PH.PostHistoryTypeId = PHT.Id
+    LEFT JOIN Users AS U ON PH.UserId = U.Id
+    WHERE PH.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20) -- Closed, Reopened, Deleted, Undeleted, Locked, Unlocked, Protected, Unprotected
+)
+-- Main Query: Combine user, post, and moderation insights
+SELECT
+    UAS.UserId,
+    UAS.DisplayName AS UserName,
+    UAS.Reputation,
+    UAS.UserCreationDate,
+    UAS.TotalPosts,
+    UAS.TotalQuestions,
+    UAS.TotalAnswers,
+    UAS.AvgQuestionAnswerScore,
+    UAS.LastPostDate,
+    UAS.TotalBadges,
+    UAS.LastGoldBadgeDate,
+    UAS.AvgCommentScore,
+    UAS.UserContentQualityScore,
+    PQM.PostId,
+    PQM.PostCreationDate,
+    PQM.PostScore,
+    PQM.ViewCount,
+    PQM.AnswerCount,
+    PQM.CommentCount,
+    PQM.FavoriteCount,
+    PQM.ClosedDate,
+    PQM.LastActivityDate,
+    PQM.LastEditDate,
+    PQM.AssociatedTags,
+    PQM.UpVotesReceived,
+    PQM.DownVotesReceived,
+    PQM.TotalEditCount,
+    PQM.LastEditHistoryDate,
+    PQM.HasDuplicateLink,
+    PQM.HoursSinceLastActivity,
+    PQM.UpDownVoteRatio,
+    PQM.PostQualityCategory,
+    PQM.RankByScore,
+    -- Check if the user has a post with a very high view count and no accepted answer, potentially indicating an unanswered popular question
+    CASE
+        WHEN PQM.PostTypeId = 1
+             AND PQM.ViewCount > 50000
+             AND PQM.AcceptedAnswerId IS NULL
+             AND PQM.AnswerCount > 0 -- Has answers, but none accepted
+             AND EXISTS (
+                SELECT 1
+                FROM Comments C_inner
+                WHERE C_inner.PostId = PQM.PostId
+                  AND C_inner.CreationDate > PQM.LastActivityDate - INTERVAL '30 days'
+                  AND C_inner.Score > 5
+             )
+        THEN 'Popular Unanswered - With Recent High-Score Comments'
+        WHEN PQM.PostTypeId = 1
+             AND PQM.ViewCount > 20000
+             AND PQM.AcceptedAnswerId IS NULL
+        THEN 'Popular Unanswered'
+        ELSE NULL
+    END AS UnansweredPopularityStatus,
+    -- Correlated subquery: Check if this post (if an answer) was accepted within 24 hours of its creation
+    (
+        SELECT CASE WHEN V.CreationDate IS NOT NULL AND (V.CreationDate - PQM.PostCreationDate) < INTERVAL '24 hours' THEN TRUE ELSE FALSE END
+        FROM Votes V
+        WHERE V.PostId = PQM.AcceptedAnswerId AND V.VoteTypeId = 1 -- AcceptedByOriginator on the *answer*
+        LIMIT 1
+    ) AS AcceptedQuickly,
+    -- Correlated subquery: Find if any moderation action (close/delete/lock) happened within 7 days of creation
+    (
+        SELECT MIN(MAM.EventDate)
+        FROM ModeratorActivityMonitor MAM
+        WHERE MAM.PostId = PQM.PostId
+          AND MAM.EventDate BETWEEN PQM.PostCreationDate AND PQM.PostCreationDate + INTERVAL '7 days'
+          AND MAM.HistoryTypeName IN ('Post Closed', 'Post Deleted', 'Post Locked')
+    ) AS EarlyModerationActionDate,
+    -- Window function: Average score of the user's posts in the last 30 days, ordered by creation date
+    AVG(PQM.PostScore) OVER (
+        PARTITION BY UAS.UserId
+        ORDER BY PQM.PostCreationDate
+        RANGE BETWEEN INTERVAL '30 days' PRECEDING AND CURRENT ROW
+    ) AS AvgScoreLast30DaysForUser,
+    -- Window function: Percentile rank of user's reputation among all users
+    NTILE(10) OVER (ORDER BY UAS.Reputation DESC) AS ReputationDecile,
+    -- String operations and NULL handling
+    COALESCE(UAS.DisplayName, 'Deleted User') || ' (Rep: ' || UAS.Reputation || ')' AS UserSummary,
+    CASE
+        WHEN PQM.PostTypeId = 1 THEN 'Question: ' || SUBSTRING(P.Title, 1, 50) || '...'
+        WHEN PQM.PostTypeId = 2 THEN 'Answer to Post ' || COALESCE(CAST(PQM.ParentId AS VARCHAR), 'N/A')
+        ELSE 'Other Post Type'
+    END AS PostTitleSummary,
+    -- Add a complex calculation: "Engagement Index"
+    (
+        (UAS.Reputation * 0.1) +
+        (PQM.UpVotesReceived * 0.5) +
+        (PQM.ViewCount * 0.001) +
+        (UAS.TotalComments * 0.2) +
+        (PQM.CommentCount * 0.3) +
+        (CASE WHEN PQM.AcceptedAnswerId IS NOT NULL THEN 100 ELSE 0 END) -
+        (PQM.DownVotesReceived * 0.8) -
+        (CASE WHEN PQM.ClosedDate IS NOT NULL THEN 50 ELSE 0 END)
+    ) AS EngagementIndex
+FROM UserActivitySummary AS UAS
+JOIN PostQualityMetrics AS PQM ON UAS.UserId = PQM.OwnerUserId
+JOIN Posts AS P ON PQM.PostId = P.Id -- Join back to original Posts for Title and Body
+WHERE
+    UAS.Reputation > 1000 -- Focus on more established users
+    AND PQM.PostCreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '5 year' -- Recent posts
+    AND PQM.PostScore > 0 -- Only positive scored posts
+    AND (
+        (PQM.PostTypeId = 1 AND PQM.ViewCount > 1000 AND PQM.AnswerCount >= 1) OR
+        (PQM.PostTypeId = 2 AND PQM.UpVotesReceived > 50)
+    )
+    AND (UAS.DisplayName IS NOT NULL AND UAS.DisplayName NOT LIKE '%anon%') -- Exclude anonymous-like users
+    AND P.Body IS NOT NULL
+    AND CHAR_LENGTH(P.Body) > 100 -- Ensure substantial content
+    AND (LOWER(U.Location) LIKE '%london%' OR LOWER(U.Location) IS NULL) -- Demonstrates NULL and string ops
+
+UNION ALL -- Use UNION ALL to combine with a different set of criteria for comparison
+
+-- Second part of the query: Analyze posts with significant moderation activity or rapid status changes
+SELECT
+    UAS.UserId,
+    UAS.DisplayName AS UserName,
+    UAS.Reputation,
+    UAS.UserCreationDate,
+    UAS.TotalPosts,
+    UAS.TotalQuestions,
+    UAS.TotalAnswers,
+    UAS.AvgQuestionAnswerScore,
+    UAS.LastPostDate,
+    UAS.TotalBadges,
+    UAS.LastGoldBadgeDate,
+    UAS.AvgCommentScore,
+    UAS.UserContentQualityScore,
+    PQM.PostId,
+    PQM.PostCreationDate,
+    PQM.PostScore,
+    PQM.ViewCount,
+    PQM.AnswerCount,
+    PQM.CommentCount,
+    PQM.FavoriteCount,
+    PQM.ClosedDate,
+    PQM.LastActivityDate,
+    PQM.LastEditDate,
+    PQM.AssociatedTags,
+    PQM.UpVotesReceived,
+    PQM.DownVotesReceived,
+    PQM.TotalEditCount,
+    PQM.LastEditHistoryDate,
+    PQM.HasDuplicateLink,
+    PQM.HoursSinceLastActivity,
+    PQM.UpDownVoteRatio,
+    PQM.PostQualityCategory,
+    PQM.RankByScore,
+    'Moderation Flagged' AS UnansweredPopularityStatus, -- Using this column for a different flag in UNION
+    FALSE AS AcceptedQuickly, -- Default for this part of UNION
+    MAM.EventDate AS EarlyModerationActionDate, -- Directly use moderation event date
+    NULL AS AvgScoreLast30DaysForUser, -- Not relevant for this part
+    NULL AS ReputationDecile, -- Not relevant for this part
+    COALESCE(UAS.DisplayName, 'Deleted User') || ' (Mod Action)' AS UserSummary,
+    CASE
+        WHEN PQM.PostTypeId = 1 THEN 'Moderated Question: ' || SUBSTRING(P.Title, 1, 50) || '...'
+        WHEN PQM.PostTypeId = 2 THEN 'Moderated Answer to Post ' || COALESCE(CAST(PQM.ParentId AS VARCHAR), 'N/A')
+        ELSE 'Moderated Other Post Type'
+    END AS PostTitleSummary,
+    -- A different engagement index calculation for moderated posts
+    (
+        (UAS.Reputation * 0.05) +
+        (PQM.UpVotesReceived * 0.3) -
+        (PQM.DownVotesReceived * 1.5) -
+        (CASE WHEN PQM.ClosedDate IS NOT NULL THEN 100 ELSE 0 END) +
+        (CASE WHEN MAM.QuickReopenAfterClose THEN 20 ELSE 0 END) -- Bonus for quick reopen
+    ) AS EngagementIndex
+FROM UserActivitySummary AS UAS
+JOIN PostQualityMetrics AS PQM ON UAS.UserId = PQM.OwnerUserId
+JOIN Posts AS P ON PQM.PostId = P.Id
+JOIN ModeratorActivityMonitor AS MAM ON PQM.PostId = MAM.PostId
+WHERE
+    (MAM.QuickReopenAfterClose = TRUE OR MAM.TypeSpecificModActionCount > 3) -- Highly moderated posts or rapid reopen
+    AND PQM.PostCreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '3 year' -- More recent moderation
+    AND PQM.PostTypeId IN (1,2)
+    AND (
+        P.Body LIKE '%bug%' OR P.Body LIKE '%error%' OR P.Body LIKE '%issue%' -- Posts potentially describing problems
+    );

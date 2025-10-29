@@ -1,0 +1,296 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT c.Id) as Comments,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        MAX(p.CreationDate) as LastPostDate,
+        EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - MAX(p.CreationDate))) / 86400.0 as DaysSinceLastPost,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+                CASE 
+                    WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 0 
+                    THEN (COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) * 100.0 / COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END))
+                    ELSE 0 
+                END
+            ELSE 0 
+        END as AnswerToQuestionRatio
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+RankedUsers AS (
+    SELECT 
+        uas.*,
+        ROW_NUMBER() OVER (ORDER BY TotalScore DESC) as ScoreRank,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC) as RepRank,
+        DENSE_RANK() OVER (ORDER BY TotalPosts DESC) as PostRank,
+        NTILE(4) OVER (ORDER BY TotalScore DESC) as ScoreQuartile
+    FROM UserActivityStats uas
+),
+QuestionAnalysis AS (
+    SELECT 
+        q.Id as QuestionId,
+        q.Title,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.CommentCount,
+        q.CreationDate,
+        u.DisplayName as AuthorName,
+        u.Reputation as AuthorReputation,
+        CASE 
+            WHEN q.AcceptedAnswerId IS NOT NULL THEN 'Yes' 
+            ELSE 'No' 
+        END as HasAcceptedAnswer,
+        (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = q.Id AND a.PostTypeId = 2) as TotalAnswers,
+        (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = q.Id AND a.PostTypeId = 2 AND a.Score > 0) as PositiveAnswers,
+        COALESCE(q.Tags, '') as Tags,
+        (SELECT array_agg(tag) FROM unnest(string_to_array(substring(q.Tags FROM 2 FOR char_length(q.Tags)-2), '><')) AS tag) as TagArray,
+        CASE 
+            WHEN q.ViewCount > 0 THEN (q.Score * 100.0 / q.ViewCount) 
+            ELSE 0 
+        END as ScorePerView,
+        EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - q.CreationDate)) / 86400.0 as DaysOld
+    FROM Posts q
+    INNER JOIN Users u ON q.OwnerUserId = u.Id
+    WHERE q.PostTypeId = 1 
+    AND q.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '365 days')
+),
+TagFrequency AS (
+    SELECT 
+        tag,
+        COUNT(*) as Frequency,
+        AVG(1.0 * Score) as AvgScorePerTag,
+        COUNT(DISTINCT QuestionId) as QuestionCount,
+        AVG(ViewCount) as AvgViewsPerTag,
+        COUNT(DISTINCT AuthorName) as AuthorCount,
+        STRING_AGG(DISTINCT AuthorName, ', ') as TagAuthors
+    FROM (
+        SELECT 
+            q.Id as QuestionId,
+            q.Score,
+            q.ViewCount,
+            q.OwnerUserId,
+            u.DisplayName as AuthorName,
+            tag
+        FROM Posts q
+        INNER JOIN Users u ON q.OwnerUserId = u.Id
+        CROSS JOIN LATERAL unnest(string_to_array(substring(q.Tags FROM 2 FOR char_length(q.Tags)-2), '><')) AS tag
+        WHERE q.PostTypeId = 1 
+        AND q.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '365 days')
+    ) t
+    GROUP BY tag
+    HAVING COUNT(*) > 1
+),
+UserBadges AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) as TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) as GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) as SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) as BronzeBadges,
+        STRING_AGG(b.Name, ', ') as BadgeList,
+        MAX(b.Date) as LastBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+)
+SELECT 
+    'Performance Benchmark Report' as ReportTitle,
+    COUNT(*) as TotalUsers,
+    COUNT(DISTINCT CASE WHEN ru.ScoreRank <= 10 THEN ru.UserId END) as Top10ScoreUsers,
+    COUNT(DISTINCT CASE WHEN ru.RepRank <= 10 THEN ru.UserId END) as Top10RepUsers,
+    AVG(ru.TotalScore) as AvgScore,
+    AVG(ru.TotalPosts) as AvgPosts,
+    AVG(ru.Reputation) as AvgReputation,
+    COUNT(DISTINCT CASE WHEN qa.HasAcceptedAnswer = 'Yes' THEN qa.QuestionId END) as QuestionsWithAnswers,
+    COUNT(DISTINCT CASE WHEN qa.ScorePerView > 10 THEN qa.QuestionId END) as HighValueQuestions,
+    (SELECT COUNT(*) FROM TagFrequency) as TagCount,
+    (SELECT COUNT(*) FROM UserBadges) as UserWithBadges,
+    (SELECT AVG(TotalBadges) FROM UserBadges) as AvgBadgesPerUser,
+    (SELECT AVG(GoldBadges) FROM UserBadges) as AvgGoldBadges,
+    (SELECT AVG(SilverBadges) FROM UserBadges) as AvgSilverBadges,
+    (SELECT AVG(BronzeBadges) FROM UserBadges) as AvgBronzeBadges,
+    (SELECT COUNT(DISTINCT QuestionId) FROM QuestionAnalysis WHERE DaysOld <= 7) as RecentQuestions,
+    (SELECT COUNT(DISTINCT QuestionId) FROM QuestionAnalysis WHERE DaysOld > 7 AND DaysOld <= 30) as RecentMonthlyQuestions,
+    (SELECT COUNT(DISTINCT QuestionId) FROM QuestionAnalysis WHERE DaysOld > 30) as OlderQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND ParentId IS NOT NULL) as AnsweredQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 2 AND ParentId IS NOT NULL) as TotalAnswers,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND AnswerCount = 0) as UnansweredQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 2 AND Score < 0) as NegativeScoreAnswers,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Score < 0) as NegativeScoreQuestions,
+    (SELECT COUNT(DISTINCT OwnerUserId) FROM Posts WHERE PostTypeId = 1 AND OwnerUserId IS NOT NULL) as ActiveQuestionAuthors,
+    (SELECT COUNT(DISTINCT OwnerUserId) FROM Posts WHERE PostTypeId = 2 AND OwnerUserId IS NOT NULL) as ActiveAnswerAuthors,
+    (SELECT COUNT(DISTINCT UserId) FROM Votes WHERE VoteTypeId IN (1,2,3)) as ActiveVoters,
+    (SELECT COUNT(DISTINCT PostId) FROM Comments) as CommentedPosts,
+    (SELECT COUNT(*) FROM Comments WHERE Text LIKE '%help%') as HelpRequestComments,
+    (SELECT COUNT(*) FROM Posts WHERE ContentLicense NOT IN ('CC BY-SA 2.5', 'CC BY-SA 3.0', 'CC BY-SA 4.0', 'Public Domain')) as NonStandardLicensePosts,
+    (SELECT COUNT(*)
+     FROM Posts p1
+     INNER JOIN Posts p2 ON p1.ParentId = p2.Id
+     WHERE p1.PostTypeId = 2 AND p2.PostTypeId = 1 AND p2.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30 days')
+    ) as RecentAnsweredQuestions,
+    (SELECT COUNT(DISTINCT (TagArray[1])) FROM QuestionAnalysis WHERE cardinality(TagArray) > 0) as UniqueTags,
+    (SELECT COUNT(DISTINCT u.Id) 
+     FROM Users u 
+     LEFT JOIN Posts p ON u.Id = p.OwnerUserId 
+     WHERE p.Id IS NULL
+    ) as NonActiveUsers,
+    (SELECT AVG(AnswerToQuestionRatio) FROM RankedUsers) as AvgAnswerToQuestionRatio,
+    (SELECT COUNT(*) 
+     FROM Posts p1 
+     INNER JOIN Posts p2 ON p1.Id = p2.AcceptedAnswerId 
+     WHERE p2.PostTypeId = 2 AND p1.PostTypeId = 1
+    ) as AcceptedAnswers,
+    (SELECT COUNT(*) 
+     FROM Posts p1 
+     INNER JOIN Posts p2 ON p1.Id = p2.ParentId 
+     WHERE p2.PostTypeId = 2 AND p1.PostTypeId = 1 AND p2.Score > 0
+    ) as PositiveScoreAnswers,
+    (SELECT COUNT(*) 
+     FROM Posts p 
+     WHERE p.PostTypeId = 1 AND p.AnswerCount > 0
+    ) as QuestionsWithAnswersCount,
+    (SELECT COUNT(*) 
+     FROM Posts p 
+     WHERE p.PostTypeId = 1 AND p.FavoriteCount > 0
+    ) as FavoritedQuestions,
+    (SELECT COUNT(DISTINCT v.UserId) 
+     FROM Votes v 
+     INNER JOIN Posts p ON v.PostId = p.Id 
+     WHERE v.VoteTypeId IN (2,3) AND p.PostTypeId = 1
+    ) as VotedQuestions,
+    (SELECT COUNT(*) 
+     FROM Posts p 
+     WHERE p.PostTypeId = 2 AND p.ViewCount > 1000
+    ) as PopularAnswers,
+    (SELECT COUNT(DISTINCT OwnerUserId) 
+     FROM Posts 
+     WHERE PostTypeId = 1 AND Score > 50
+    ) as HighScoreQuestionAuthors,
+    (SELECT COUNT(*) 
+     FROM Posts p 
+     WHERE p.PostTypeId = 2 AND Score > 100
+    ) as HighScoreAnswers,
+    (SELECT COUNT(*) 
+     FROM Posts p 
+     WHERE p.PostTypeId = 1 AND ViewCount > 10000
+    ) as HighlyViewedQuestions,
+    (SELECT COUNT(*) 
+     FROM Posts p1 
+     INNER JOIN Posts p2 ON p1.Id = p2.AcceptedAnswerId 
+     WHERE p2.PostTypeId = 2 AND p2.Score > 10
+    ) as GoodAcceptedAnswers,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%java%') as JavaQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 2 AND Body LIKE '%code%') as CodeAnswers,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%python%') as PythonQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%javascript%') as JavaScriptQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%c%') as CQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%python%' AND Tags LIKE '%django%') as DjangoQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%php%') as PHPQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%sql%') as SQLQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%html%') as HTMLQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%css%') as CSSQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%react%') as ReactQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%angular%') as AngularQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%vue%') as VueQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%node%') as NodeQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%spring%') as SpringQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%django%') as DjangoQuestions2,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%flask%') as FlaskQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%laravel%') as LaravelQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%rails%') as RailsQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%express%') as ExpressQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%asp%') as ASPQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%net%') as NetQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%go%') as GoQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%rust%') as RustQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%swift%') as SwiftQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%kotlin%') as KotlinQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%r%') as RQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%scala%') as ScalaQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%perl%') as PerlQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%ruby%') as RubyQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%groovy%') as GroovyQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%dart%') as DartQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%haskell%') as HaskellQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%lua%') as LuaQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%matlab%') as MATLABQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%php%' AND Tags LIKE '%wordpress%') as WordPressQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%c%' AND Tags LIKE '%linux%') as CLinuxQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%java%' AND Tags LIKE '%android%') as AndroidQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%python%' AND Tags LIKE '%pandas%') as PandasQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%python%' AND Tags LIKE '%numpy%') as NumPyQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%javascript%' AND Tags LIKE '%react%') as ReactJSQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%javascript%' AND Tags LIKE '%node%') as NodeJSQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%python%' AND Tags LIKE '%django%') as DjangoPythonQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%java%' AND Tags LIKE '%spring%') as SpringJavaQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%php%' AND Tags LIKE '%laravel%') as LaravelPHPQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%ruby%' AND Tags LIKE '%rails%') as RailsRubyQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%go%' AND Tags LIKE '%golang%') as GolangQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%c%' AND Tags LIKE '%cplusplus%') as CPlusPlusQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%rust%' AND Tags LIKE '%webassembly%') as WebAssemblyRustQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%swift%' AND Tags LIKE '%apple%') as AppleSwiftQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%kotlin%' AND Tags LIKE '%android%') as AndroidKotlinQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%r%' AND Tags LIKE '%machine-learning%') as RMLQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%scala%' AND Tags LIKE '%spark%') as SparkScalaQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%perl%' AND Tags LIKE '%web%') as WebPerlQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%ruby%' AND Tags LIKE '%sinatra%') as SinatraRubyQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%dart%' AND Tags LIKE '%flutter%') as FlutterDartQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%haskell%' AND Tags LIKE '%functional%') as FunctionalHaskellQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%lua%' AND Tags LIKE '%game%') as GameLuaQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags LIKE '%matlab%' AND Tags LIKE '%signal-processing%') as SignalProcessingMATLABQuestions
+FROM RankedUsers ru
+CROSS JOIN QuestionAnalysis qa
+LEFT JOIN TagFrequency tf ON 1 = 1
+LEFT JOIN UserBadges ub ON ru.UserId = ub.UserId
+WHERE ru.UserId IS NOT NULL
+AND qa.QuestionId IS NOT NULL
+AND (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND OwnerUserId = ru.UserId) > 0
+GROUP BY 
+    ReportTitle,
+    ru.UserId,
+    ru.ScoreRank,
+    ru.RepRank,
+    ru.PostRank,
+    ru.ScoreQuartile,
+    ru.TotalScore,
+    ru.TotalPosts,
+    ru.Reputation,
+    ru.AnswerToQuestionRatio,
+    qa.QuestionId,
+    qa.Title,
+    qa.Score,
+    qa.ViewCount,
+    qa.AnswerCount,
+    qa.CommentCount,
+    qa.CreationDate,
+    qa.AuthorName,
+    qa.AuthorReputation,
+    qa.HasAcceptedAnswer,
+    qa.TotalAnswers,
+    qa.PositiveAnswers,
+    qa.Tags,
+    qa.TagArray,
+    qa.ScorePerView,
+    qa.DaysOld,
+    tf.tag,
+    tf.Frequency,
+    tf.AvgScorePerTag,
+    tf.QuestionCount,
+    tf.AvgViewsPerTag,
+    tf.AuthorCount,
+    tf.TagAuthors,
+    ub.UserId,
+    ub.TotalBadges,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ub.BadgeList,
+    ub.LastBadgeDate;

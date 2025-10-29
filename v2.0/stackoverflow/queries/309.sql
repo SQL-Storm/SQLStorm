@@ -1,0 +1,425 @@
+with recent_users as (
+    select u.id as user_id,
+           u.displayname,
+           u.reputation,
+           u.location,
+           u.creationdate,
+           date_trunc('month', u.creationdate) as signup_month,
+           row_number() over (partition by coalesce(nullif(trim(lower(u.location)), ''), 'unknown') order by u.reputation desc, u.id) as rn_loc_rep
+    from users u
+    where u.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+),
+user_activity as (
+    select u.id as user_id,
+           coalesce(sum(case when p.posttypeid = 1 then 1 else 0 end), 0) as q_count,
+           coalesce(sum(case when p.posttypeid = 2 then 1 else 0 end), 0) as a_count,
+           coalesce(sum(p.score), 0) as total_post_score,
+           coalesce(sum(p.viewcount), 0) as total_views,
+           count(distinct p.id) as total_posts
+    from users u
+    left join posts p
+      on p.owneruserid = u.id
+     and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+    group by u.id
+),
+tagged_questions as (
+    select p.id as question_id,
+           p.owneruserid as owner_user_id,
+           p.creationdate,
+           p.score,
+           p.viewcount,
+           p.answercount,
+           p.title,
+           p.tags,
+           string_to_array(substring(p.tags, 2, length(p.tags)-2), '><') as tag_array
+    from posts p
+    where p.posttypeid = 1
+      and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+),
+question_tag_expansion as (
+    select tq.question_id,
+           tq.owner_user_id,
+           unnest(tq.tag_array) as tagname
+    from tagged_questions tq
+),
+top_tags as (
+    select qte.tagname,
+           count(*) as tag_q_count,
+           sum(case when p.score >= 5 then 1 else 0 end) as tag_hot_q,
+           sum(coalesce(p.viewcount, 0)) as tag_views
+    from question_tag_expansion qte
+    join posts p on p.id = qte.question_id
+    group by qte.tagname
+    having count(*) >= 10
+),
+accepted_answerers as (
+    select q.owneruserid as question_owner_id,
+           a.owneruserid as answer_owner_id,
+           a.id as answer_id,
+           q.id as question_id,
+           a.score as answer_score,
+           q.acceptedanswerid,
+           case when q.acceptedanswerid = a.id then 1 else 0 end as is_accepted
+    from posts q
+    join posts a on a.parentid = q.id
+    where q.posttypeid = 1
+      and a.posttypeid = 2
+      and q.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+),
+user_badge_summaries as (
+    select b.userid,
+           count(*) as badges_total,
+           sum(case when b.class = 1 then 1 else 0 end) as gold_cnt,
+           sum(case when b.class = 2 then 1 else 0 end) as silver_cnt,
+           sum(case when b.class = 3 then 1 else 0 end) as bronze_cnt,
+           sum(case when b.tagbased = true then 1 else 0 end) as tag_badges
+    from badges b
+    where b.date >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+    group by b.userid
+),
+votes_agg as (
+    select v.postid,
+           sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+           sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+           sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started,
+           sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded
+    from votes v
+    where v.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+    group by v.postid
+),
+dupe_links as (
+    select pl.postid as duplicate_of_id,
+           pl.relatedpostid as original_id,
+           count(*) as dupe_count
+    from postlinks pl
+    where pl.linktypeid = 3
+      and pl.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+    group by pl.postid, pl.relatedpostid
+),
+close_events as (
+    select ph.postid,
+           count(*) filter (where ph.posthistorytypeid = 10) as close_events,
+           count(*) filter (where ph.posthistorytypeid = 11) as reopen_events,
+           cast(max(case
+                 when ph.posthistorytypeid = 10 then
+                   nullif(regexp_replace(ph.comment, '[^0-9]', '', 'g'), '')
+               end) as integer) as last_close_reason
+    from posthistory ph
+    where ph.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+      and ph.posthistorytypeid in (10,11)
+    group by ph.postid
+),
+commenter_stats as (
+    select c.userid,
+           count(*) as comments_made,
+           sum(case when c.score > 0 then 1 else 0 end) as pos_comments,
+           avg(nullif(length(c.text),0)) as avg_comment_len
+    from comments c
+    where c.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+    group by c.userid
+),
+question_quality as (
+    select q.id as question_id,
+           q.owneruserid as owner_user_id,
+           q.score,
+           q.viewcount,
+           q.answercount,
+           coalesce(va.upvotes,0) - coalesce(va.downvotes,0) as net_votes,
+           coalesce(va.bounty_started,0) as bounty_started,
+           coalesce(va.bounty_awarded,0) as bounty_awarded,
+           coalesce(ce.close_events,0) as close_events,
+           coalesce(ce.reopen_events,0) as reopen_events,
+           ce.last_close_reason,
+           case
+             when q.answercount >= 5 and q.score >= 10 then 'hot'
+             when q.answercount >= 1 and q.score >= 0 then 'warm'
+             when q.answercount is null then 'unknown'
+             else 'cold'
+           end as heat_bucket
+    from posts q
+    left join votes_agg va on va.postid = q.id
+    left join close_events ce on ce.postid = q.id
+    where q.posttypeid = 1
+      and q.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+),
+ranked_users as (
+    select ru.user_id,
+           ru.displayname,
+           ru.reputation,
+           ru.location,
+           ua.q_count,
+           ua.a_count,
+           ua.total_post_score,
+           ua.total_views,
+           coalesce(ubs.badges_total,0) as badges_total,
+           coalesce(ubs.gold_cnt,0) as gold_cnt,
+           coalesce(ubs.silver_cnt,0) as silver_cnt,
+           coalesce(ubs.bronze_cnt,0) as bronze_cnt,
+           coalesce(ubs.tag_badges,0) as tag_badges,
+           coalesce(cs.comments_made,0) as comments_made,
+           coalesce(cs.pos_comments,0) as pos_comments,
+           cs.avg_comment_len,
+           ru.signup_month,
+           ru.rn_loc_rep,
+           dense_rank() over (order by ua.q_count desc, ua.a_count desc, ru.reputation desc) as global_rank
+    from recent_users ru
+    left join user_activity ua on ua.user_id = ru.user_id
+    left join user_badge_summaries ubs on ubs.userid = ru.user_id
+    left join commenter_stats cs on cs.userid = ru.user_id
+),
+per_tag_user_perf as (
+    select qte.tagname,
+           q.owneruserid as user_id,
+           count(*) as questions_in_tag,
+           sum(q.score) as sum_score_in_tag,
+           avg(q.score) as avg_score_in_tag,
+           percentile_cont(0.5) within group (order by q.score) as median_score_in_tag
+    from question_tag_expansion qte
+    join posts q on q.id = qte.question_id
+    group by qte.tagname, q.owneruserid
+),
+tag_leaders as (
+    select pt.tagname,
+           pt.user_id,
+           pt.questions_in_tag,
+           pt.sum_score_in_tag,
+           row_number() over (partition by pt.tagname order by pt.sum_score_in_tag desc, pt.questions_in_tag desc, pt.user_id) as rn_tag_leader
+    from per_tag_user_perf pt
+),
+cross_user_influence as (
+    select aa.answer_owner_id as user_id,
+           count(*) filter (where aa.is_accepted = 1) as accepted_answers,
+           count(*) as answers_on_recent_q,
+           avg(aa.answer_score) as avg_answer_score_on_recent_q
+    from accepted_answerers aa
+    group by aa.answer_owner_id
+),
+heavy_interactions as (
+    select a.owneruserid as answerer_id,
+           q.owneruserid as asker_id,
+           count(*) as interactions,
+           sum(case when q.acceptedanswerid = a.id then 1 else 0 end) as accepted_between_pair
+    from posts q
+    join posts a on a.parentid = q.id and a.posttypeid = 2
+    where q.posttypeid = 1
+      and q.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+    group by a.owneruserid, q.owneruserid
+),
+null_sentinel as (
+    select -1 as user_id
+),
+final_users as (
+    select u.user_id,
+           u.displayname,
+           coalesce(nullif(trim(u.location), ''), 'Unknown') as location,
+           u.reputation,
+           u.q_count,
+           u.a_count,
+           u.total_post_score,
+           u.total_views,
+           u.badges_total,
+           u.gold_cnt,
+           u.silver_cnt,
+           u.bronze_cnt,
+           u.tag_badges,
+           u.comments_made,
+           u.pos_comments,
+           u.avg_comment_len,
+           u.signup_month,
+           u.rn_loc_rep,
+           u.global_rank
+    from ranked_users u
+    union all
+    select ns.user_id,
+           'Community/Deleted' as displayname,
+           'Unknown' as location,
+           0 as reputation,
+           0 as q_count,
+           0 as a_count,
+           0 as total_post_score,
+           0 as total_views,
+           0 as badges_total,
+           0 as gold_cnt,
+           0 as silver_cnt,
+           0 as bronze_cnt,
+           0 as tag_badges,
+           0 as comments_made,
+           0 as pos_comments,
+           null as avg_comment_len,
+           date_trunc('month', cast('2024-10-01 12:34:56' as timestamp)) as signup_month,
+           0 as rn_loc_rep,
+           null as global_rank
+    from null_sentinel ns
+),
+questions_enriched as (
+    select qq.question_id,
+           qq.owner_user_id,
+           qq.score,
+           qq.viewcount,
+           qq.answercount,
+           qq.net_votes,
+           qq.bounty_started,
+           qq.bounty_awarded,
+           qq.close_events,
+           qq.reopen_events,
+           qq.last_close_reason,
+           qq.heat_bucket,
+           coalesce(dl.dupe_count, 0) as dupe_links_count
+    from question_quality qq
+    left join dupe_links dl on dl.duplicate_of_id = qq.question_id
+),
+user_question_rollup as (
+    select qe.owner_user_id as user_id,
+           count(*) as questions_total,
+           sum(case when qe.heat_bucket = 'hot' then 1 else 0 end) as hot_q,
+           sum(case when qe.close_events > 0 then 1 else 0 end) as closed_q,
+           sum(qe.viewcount) as sum_views_q,
+           sum(qe.net_votes) as sum_net_votes_q,
+           sum(qe.bounty_awarded) as sum_bounty_awarded_q,
+           avg(qe.score) as avg_q_score
+    from questions_enriched qe
+    group by qe.owner_user_id
+),
+user_answer_rollup as (
+    select a.owneruserid as user_id,
+           count(*) as answers_total,
+           sum(a.score) as sum_answer_scores,
+           avg(a.score) as avg_answer_score,
+           sum(case when a.score >= 10 then 1 else 0 end) as high_score_answers
+    from posts a
+    where a.posttypeid = 2
+      and a.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+    group by a.owneruserid
+),
+user_final_rollup as (
+    select fu.user_id,
+           fu.displayname,
+           fu.location,
+           fu.reputation,
+           fu.q_count,
+           fu.a_count,
+           fu.total_post_score,
+           fu.total_views,
+           coalesce(uqr.questions_total, 0) as questions_total,
+           coalesce(uqr.hot_q, 0) as hot_q,
+           coalesce(uqr.closed_q, 0) as closed_q,
+           coalesce(uqr.sum_views_q, 0) as sum_views_q,
+           coalesce(uqr.sum_net_votes_q, 0) as sum_net_votes_q,
+           coalesce(uqr.sum_bounty_awarded_q, 0) as sum_bounty_awarded_q,
+           coalesce(uqr.avg_q_score, 0) as avg_q_score,
+           coalesce(uar.answers_total, 0) as answers_total,
+           coalesce(uar.sum_answer_scores, 0) as sum_answer_scores,
+           coalesce(uar.avg_answer_score, 0) as avg_answer_score,
+           coalesce(uar.high_score_answers, 0) as high_score_answers,
+           fu.badges_total,
+           fu.gold_cnt,
+           fu.silver_cnt,
+           fu.bronze_cnt,
+           fu.tag_badges,
+           fu.comments_made,
+           fu.pos_comments,
+           fu.avg_comment_len,
+           fu.signup_month,
+           fu.rn_loc_rep,
+           fu.global_rank
+    from final_users fu
+    left join user_question_rollup uqr on uqr.user_id = fu.user_id
+    left join user_answer_rollup uar on uar.user_id = fu.user_id
+),
+scored_user as (
+    select ufr.*,
+           (
+             0.30 * ln(1 + coalesce(ufr.questions_total,0) + coalesce(ufr.answers_total,0)) +
+             0.25 * ln(1 + greatest(0, coalesce(ufr.sum_net_votes_q,0) + coalesce(ufr.sum_answer_scores,0))) +
+             0.15 * ln(1 + coalesce(ufr.sum_views_q,0)) +
+             0.10 * (coalesce(ufr.gold_cnt,0) * 5 + coalesce(ufr.silver_cnt,0) * 2 + coalesce(ufr.bronze_cnt,0)) +
+             0.10 * coalesce(ufr.hot_q,0) +
+             0.05 * coalesce(ufr.high_score_answers,0) -
+             0.05 * coalesce(ufr.closed_q,0)
+           ) as engagement_score,
+           sum(coalesce(ufr.sum_answer_scores,0)) over () as total_answer_scores_all_users
+    from user_final_rollup ufr
+),
+best_tag_per_user as (
+    select tl.user_id,
+           tl.tagname,
+           tl.sum_score_in_tag,
+           row_number() over (partition by tl.user_id order by tl.sum_score_in_tag desc, tl.tagname) as rn_best_tag
+    from tag_leaders tl
+    where tl.rn_tag_leader <= 25
+),
+user_with_best_tag as (
+    select su.*,
+           btp.tagname as best_tag,
+           btp.sum_score_in_tag as best_tag_score
+    from scored_user su
+    left join best_tag_per_user btp
+      on btp.user_id = su.user_id
+     and btp.rn_best_tag = 1
+),
+location_peers as (
+    select uwbt.location,
+           percentile_cont(0.5) within group (order by uwbt.engagement_score) as median_engagement_in_location,
+           avg(uwbt.engagement_score) as avg_engagement_in_location
+    from user_with_best_tag uwbt
+    group by uwbt.location
+)
+select
+    uwbt.user_id,
+    uwbt.displayname,
+    uwbt.location,
+    uwbt.reputation,
+    uwbt.signup_month,
+    uwbt.global_rank,
+    uwbt.rn_loc_rep,
+    uwbt.questions_total,
+    uwbt.answers_total,
+    uwbt.hot_q,
+    uwbt.high_score_answers,
+    uwbt.closed_q,
+    uwbt.sum_net_votes_q,
+    uwbt.sum_views_q,
+    uwbt.sum_bounty_awarded_q,
+    uwbt.avg_q_score,
+    uwbt.avg_answer_score,
+    uwbt.gold_cnt,
+    uwbt.silver_cnt,
+    uwbt.bronze_cnt,
+    uwbt.tag_badges,
+    coalesce(uwbt.best_tag, 'n/a') as best_tag,
+    coalesce(uwbt.best_tag_score, 0) as best_tag_score,
+    cast(round(cast(uwbt.engagement_score as numeric), 3) as double precision) as engagement_score,
+    lp.median_engagement_in_location,
+    lp.avg_engagement_in_location,
+    case
+      when uwbt.engagement_score >= lp.avg_engagement_in_location then 'above_location_avg'
+      when uwbt.engagement_score >= lp.median_engagement_in_location then 'between_median_and_avg'
+      else 'below_location_median'
+    end as location_engagement_band,
+    coalesce(nullif(trim(u.websiteurl), ''), 'no-site') as website_url_or_default,
+    substring(coalesce(u.displayname, ''), 1, 10) || '...' as displayname_short,
+    (
+      select max(p2.lastactivitydate)
+      from posts p2
+      where p2.owneruserid = uwbt.user_id
+    ) as last_post_activity,
+    case when (coalesce(uwbt.questions_total,0) + coalesce(uwbt.answers_total,0)) > 0 then true else false end as has_activity_last5y,
+    case when csi.user_id is not null then csi.accepted_answers else 0 end as accepted_answers_on_recent_q,
+    case when csi.user_id is not null then csi.answers_on_recent_q else 0 end as answers_on_recent_q,
+    cast(round(coalesce(csi.avg_answer_score_on_recent_q,0)::numeric, 2) as double precision) as avg_answer_score_on_recent_q
+from user_with_best_tag uwbt
+left join users u on u.id = uwbt.user_id
+left join cross_user_influence csi on csi.user_id = uwbt.user_id
+left join location_peers lp on lp.location = uwbt.location
+where
+    (
+      coalesce(uwbt.engagement_score, 0) > 0
+      or (coalesce(u.location, '') ilike '%remote%' and coalesce(uwbt.reputation,0) >= 1000)
+      or (coalesce(uwbt.gold_cnt,0) + coalesce(uwbt.silver_cnt,0) + coalesce(uwbt.bronze_cnt,0)) >= 10
+    )
+  and not (coalesce(u.displayname, '') = '' and coalesce(uwbt.questions_total,0) = 0 and coalesce(uwbt.answers_total,0) = 0)
+order by
+    uwbt.engagement_score desc nulls last,
+    uwbt.global_rank asc,
+    uwbt.user_id
+limit 250;

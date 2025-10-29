@@ -1,0 +1,103 @@
+WITH UserPostStats AS (
+    SELECT
+        u.Id                                    AS UserId,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1)                AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2)                AS AnswerCount,
+        COALESCE(SUM(p.Score), 0)                                 AS TotalScore,
+        CAST(AVG(p.Score) AS NUMERIC(10,2))                        AS AvgScore,
+        MAX(p.CreationDate)                                       AS MostRecentPost,
+        COALESCE(t.DistinctTagCount, 0)                            AS DistinctTagCount
+    FROM Users u
+    LEFT JOIN Posts p
+           ON p.OwnerUserId = u.Id
+          AND p.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '180 days')
+    LEFT JOIN LATERAL (
+        SELECT COUNT(DISTINCT tag) AS DistinctTagCount
+        FROM regexp_split_to_table(p.Tags, '<>') AS tag
+        WHERE p.PostTypeId = 1
+    ) t ON TRUE
+    GROUP BY u.Id, t.DistinctTagCount
+),
+UserBadgeAgg AS (
+    SELECT
+        b.UserId,
+        COUNT(*)                                                   AS BadgeTotal,
+        COUNT(*) FILTER (WHERE b.Class = 1)                        AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2)                        AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3)                        AS BronzeBadges,
+        STRING_AGG(DISTINCT b.Name, ', ')                         AS BadgeNames
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserVoteAgg AS (
+    SELECT
+        v.PostId,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS UpVotes,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS DownVotes,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 5) AS Favorites
+    FROM Votes v
+    GROUP BY v.PostId
+),
+TopUsers AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(ubs.BadgeTotal, 0)                 AS BadgeTotal,
+        COALESCE(up.TotalScore, 0)                  AS TotalScore,
+        COALESCE(up.AnswerCount, 0)                 AS AnswerCount,
+        COALESCE(up.QuestionCount, 0)               AS QuestionCount,
+        COALESCE(up.DistinctTagCount, 0)            AS DistinctTagCount,
+        ROW_NUMBER() OVER (
+            ORDER BY (u.Reputation 
+                      + COALESCE(up.TotalScore,0) 
+                      + COALESCE(ubs.BadgeTotal*100,0)) DESC
+        )                                          AS RankScore
+    FROM Users u
+    LEFT JOIN UserBadgeAgg ubs ON ubs.UserId = u.Id
+    LEFT JOIN UserPostStats up ON up.UserId = u.Id
+    WHERE u.Reputation > 1000
+)
+SELECT
+    t.RankScore,
+    t.DisplayName,
+    t.Reputation,
+    t.BadgeTotal,
+    t.TotalScore,
+    t.AnswerCount,
+    t.QuestionCount,
+    t.DistinctTagCount,
+    CASE
+        WHEN t.AnswerCount = 0 THEN NULL
+        ELSE ROUND(CAST(t.TotalScore AS NUMERIC) / t.AnswerCount, 2)
+    END                                            AS AvgScorePerAnswer,
+    CONCAT('User_', COALESCE(CAST(t.Id AS VARCHAR), 'NA'))    AS UserCode,
+    CASE
+        WHEN t.BadgeTotal = 0      THEN 'No Badges'
+        WHEN t.BadgeTotal < 5      THEN 'Rising Star'
+        ELSE                           'Veteran'
+    END                                            AS BadgeTier,
+    (SELECT COUNT(*)
+       FROM Posts p2
+      WHERE p2.OwnerUserId = t.Id
+        AND p2.PostTypeId = 1
+        AND p2.ClosedDate IS NOT NULL)            AS ClosedQuestionCount
+FROM TopUsers t
+WHERE t.RankScore <= 50
+
+UNION ALL
+
+SELECT
+    NULL     AS RankScore,
+    '---'    AS DisplayName,
+    NULL     AS Reputation,
+    NULL     AS BadgeTotal,
+    NULL     AS TotalScore,
+    NULL     AS AnswerCount,
+    NULL     AS QuestionCount,
+    NULL     AS DistinctTagCount,
+    NULL     AS AvgScorePerAnswer,
+    NULL     AS UserCode,
+    NULL     AS BadgeTier,
+    NULL     AS ClosedQuestionCount
+ORDER BY RankScore NULLS LAST;

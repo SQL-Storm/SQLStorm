@@ -1,0 +1,305 @@
+-- {"query": "7009.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 3609} 
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) as TotalQuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) as TotalAnswerScore,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END) as AverageQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE NULL END) as AverageAnswerScore,
+        MAX(p.CreationDate) as LastPostDate,
+        MIN(p.CreationDate) as FirstPostDate,
+        DATEDIFF(day, MIN(p.CreationDate), MAX(p.CreationDate)) as ActiveDays,
+        ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) as PostRank,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) as ReputationRank,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 100 AND u.Reputation > 10000 THEN 'Veteran'
+            WHEN COUNT(DISTINCT p.Id) > 50 AND u.Reputation > 5000 THEN 'Experienced'
+            WHEN COUNT(DISTINCT p.Id) > 10 AND u.Reputation > 1000 THEN 'Active'
+            ELSE 'Beginner'
+        END as UserType,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) * 1.0 / NULLIF(COUNT(DISTINCT p.Id), 0), 0) as QuestionRatio,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) * 1.0 / NULLIF(COUNT(DISTINCT p.Id), 0), 0) as AnswerRatio
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopQuestions AS (
+    SELECT 
+        p.Id as QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        u.DisplayName as OwnerDisplayName,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC, p.ViewCount DESC) as PopularityRank,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) as UserQuestionRank,
+        p.Score - LAG(p.Score) OVER (ORDER BY p.Score DESC) as ScoreDifference,
+        CASE 
+            WHEN p.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'Above Average'
+            WHEN p.Score < (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'Below Average'
+            ELSE 'Average'
+        END as ScoreCategory,
+        CONCAT('Tags: ', COALESCE(p.Tags, '')) as TagDescription,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END as Status,
+        IIF(p.AnswerCount > 0, 
+            (SELECT TOP 1 a.Score FROM Posts a WHERE a.ParentId = p.Id ORDER BY a.Score DESC),
+            0) as BestAnswerScore,
+        COALESCE((SELECT COUNT(*) FROM Posts a WHERE a.ParentId = p.Id AND a.Score > 0), 0) as PositiveAnswerCount
+    FROM Posts p
+    INNER JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1 AND p.CreationDate >= DATEADD(YEAR, -2, GETDATE()) 
+),
+QuestionWithStats AS (
+    SELECT 
+        q.QuestionId,
+        q.Title,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.CommentCount,
+        q.CreationDate,
+        q.OwnerUserId,
+        q.OwnerDisplayName,
+        q.PopularityRank,
+        q.UserQuestionRank,
+        q.ScoreDifference,
+        q.ScoreCategory,
+        q.TagDescription,
+        q.Status,
+        q.BestAnswerScore,
+        q.PositiveAnswerCount,
+        q.Score * 0.3 + q.ViewCount * 0.1 + q.AnswerCount * 0.2 + q.CommentCount * 0.4 as CombinedScore,
+        NTILE(4) OVER (ORDER BY q.Score DESC) as ScoreQuartile,
+        PERCENT_RANK() OVER (ORDER BY q.Score) as ScorePercentile,
+        CASE 
+            WHEN q.Status = 'Open' AND q.AnswerCount = 0 THEN 'Unanswered'
+            WHEN q.Status = 'Open' AND q.AnswerCount > 0 THEN 'Answered'
+            WHEN q.Status = 'Closed' THEN 'Closed'
+            ELSE 'Unknown'
+        END as QuestionStatus,
+        DATEDIFF(day, q.CreationDate, GETDATE()) as AgeInDays,
+        CASE 
+            WHEN DATEDIFF(day, q.CreationDate, GETDATE()) > 30 THEN 'Old'
+            WHEN DATEDIFF(day, q.CreationDate, GETDATE()) > 7 THEN 'Recent'
+            ELSE 'New'
+        END as AgeCategory,
+        CASE 
+            WHEN q.AnswerCount = 0 THEN 'No Answers'
+            WHEN q.AnswerCount = 1 THEN 'One Answer'
+            WHEN q.AnswerCount > 1 THEN 'Multiple Answers'
+            ELSE 'Unknown'
+        END as AnswerCategory
+    FROM TopQuestions q
+),
+UserPerformanceReport AS (
+    SELECT 
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.Views,
+        us.UpVotes,
+        us.DownVotes,
+        us.PostCount,
+        us.CommentCount,
+        us.BadgeCount,
+        us.QuestionCount,
+        us.AnswerCount,
+        us.TotalQuestionScore,
+        us.TotalAnswerScore,
+        us.AverageQuestionScore,
+        us.AverageAnswerScore,
+        us.LastPostDate,
+        us.FirstPostDate,
+        us.ActiveDays,
+        us.PostRank,
+        us.ReputationRank,
+        us.UserType,
+        us.QuestionRatio,
+        us.AnswerRatio,
+        ROW_NUMBER() OVER (ORDER BY us.Reputation DESC, us.PostCount DESC) as OverallRank,
+        DENSE_RANK() OVER (ORDER BY us.UserType, us.Reputation DESC) as UserTypeRank
+    FROM UserStats us
+),
+ComplexAnalysis AS (
+    SELECT 
+        upr.UserId,
+        upr.DisplayName,
+        upr.Reputation,
+        upr.Views,
+        upr.UpVotes,
+        upr.DownVotes,
+        upr.PostCount,
+        upr.CommentCount,
+        upr.BadgeCount,
+        upr.QuestionCount,
+        upr.AnswerCount,
+        upr.TotalQuestionScore,
+        upr.TotalAnswerScore,
+        upr.AverageQuestionScore,
+        upr.AverageAnswerScore,
+        upr.LastPostDate,
+        upr.FirstPostDate,
+        upr.ActiveDays,
+        upr.PostRank,
+        upr.ReputationRank,
+        upr.UserType,
+        upr.QuestionRatio,
+        upr.AnswerRatio,
+        upr.OverallRank,
+        upr.UserTypeRank,
+        CASE 
+            WHEN (upr.QuestionCount * 1.0 / NULLIF(upr.PostCount, 0)) > 0.5 THEN 'Question Focused'
+            WHEN (upr.AnswerCount * 1.0 / NULLIF(upr.PostCount, 0)) > 0.5 THEN 'Answer Focused'
+            ELSE 'Balanced'
+        END as ContributionFocus,
+        COALESCE(ROUND((upr.TotalQuestionScore * 1.0 / NULLIF(upr.QuestionCount, 0)), 2), 0) as AvgQuestionScorePerPost,
+        COALESCE(ROUND((upr.TotalAnswerScore * 1.0 / NULLIF(upr.AnswerCount, 0)), 2), 0) as AvgAnswerScorePerPost,
+        (upr.Reputation * 1.0 / NULLIF(upr.ActiveDays, 0)) as ReputationPerDay,
+        (upr.PostCount * 1.0 / NULLIF(upr.ActiveDays, 0)) as PostsPerDay,
+        IIF(upr.BadgeCount > 0, 
+            (SELECT TOP 1 b.Name FROM Badges b WHERE b.UserId = upr.UserId ORDER BY b.Date DESC), 
+            'No Badge') as RecentBadge,
+        IIF(upr.CommentCount > 0, 
+            (SELECT TOP 1 c.Text FROM Comments c WHERE c.UserId = upr.UserId ORDER BY c.CreationDate DESC), 
+            'No Comments') as RecentComment,
+        COALESCE(
+            (SELECT COUNT(*) FROM Posts p 
+             INNER JOIN VoteTypes v ON v.Id = 5 
+             INNER JOIN Votes vo ON vo.PostId = p.Id AND vo.VoteTypeId = v.Id
+             WHERE p.OwnerUserId = upr.UserId AND vo.CreationDate > DATEADD(MONTH, -6, GETDATE())), 
+            0) as FavoriteCountInLast6Months,
+        CASE 
+            WHEN upr.Reputation >= 10000 AND upr.QuestionCount >= 50 THEN 'Elite Contributor'
+            WHEN upr.Reputation >= 1000 AND upr.PostCount >= 25 THEN 'Active Contributor'
+            ELSE 'Regular Contributor'
+        END as ContributionLevel
+    FROM UserPerformanceReport upr
+)
+SELECT 
+    c.QuestionId,
+    c.Title,
+    c.Score,
+    c.ViewCount,
+    c.AnswerCount,
+    c.QuestionStatus,
+    c.AgeCategory,
+    c.AnswerCategory,
+    c.CombinedScore,
+    c.ScoreQuartile,
+    c.ScorePercentile,
+    c.AgeInDays,
+    iif(c.QuestionStatus = 'Answered', 1, 0) as AnsweredFlag,
+    iif(c.AgeCategory = 'New', 1, 0) as NewFlag,
+    iif(c.BestAnswerScore > 10, 1, 0) as HighScoreAnswerFlag,
+    CASE 
+        WHEN c.CombinedScore > (SELECT AVG(CombinedScore) FROM QuestionWithStats) THEN 'High'
+        WHEN c.CombinedScore < (SELECT AVG(CombinedScore) FROM QuestionWithStats) THEN 'Low'
+        ELSE 'Average'
+    END as CombinedScoreCategory,
+    DENSE_RANK() OVER (ORDER BY c.CombinedScore DESC) as CombinedScoreRank,
+    LAG(c.CombinedScore, 1) OVER (ORDER BY c.CombinedScore DESC) - c.CombinedScore as ScoreGapToNext,
+    ROW_NUMBER() OVER (ORDER BY c.CombinedScore DESC) as RankInCategory,
+    RANK() OVER (ORDER BY c.AnswerCount DESC) as AnswerCountRank,
+    CASE 
+        WHEN c.PopularityRank <= 10 THEN 'Top 10'
+        WHEN c.PopularityRank <= 50 THEN 'Top 50'
+        WHEN c.PopularityRank <= 100 THEN 'Top 100'
+        ELSE 'Beyond Top 100'
+    END as PopularityCategory,
+    (SELECT COUNT(*) FROM ComplexAnalysis ca WHERE ca.ContributionLevel = 'Elite Contributor') as EliteContributorCount,
+    (SELECT COUNT(*) FROM ComplexAnalysis ca WHERE ca.ContributionLevel = 'Active Contributor') as ActiveContributorCount,
+    (SELECT COUNT(*) FROM ComplexAnalysis ca WHERE ca.ContributionLevel = 'Regular Contributor') as RegularContributorCount,
+    CASE 
+        WHEN c.Score > 50 AND c.ViewCount > 100 THEN 'High Engagement'
+        WHEN c.Score > 25 AND c.ViewCount > 50 THEN 'Medium Engagement'
+        WHEN c.Score > 10 AND c.ViewCount > 25 THEN 'Low Engagement'
+        ELSE 'Minimal Engagement'
+    END as EngagementLevel,
+    COALESCE(
+        (SELECT TOP 1 u.DisplayName FROM Users u WHERE u.Id = c.OwnerUserId),
+        'Unknown User'
+    ) as OwnerDisplayName,
+    c.OwnerUserId,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = c.OwnerUserId) as TotalPostsByOwner,
+    (SELECT AVG(Score) FROM Posts p WHERE p.OwnerUserId = c.OwnerUserId AND p.PostTypeId = 1) as AvgQuestionScoreByOwner,
+    (SELECT AVG(Score) FROM Posts p WHERE p.OwnerUserId = c.OwnerUserId AND p.PostTypeId = 2) as AvgAnswerScoreByOwner,
+    COALESCE(
+        (SELECT COUNT(*) FROM Votes v 
+         INNER JOIN VoteTypes vt ON vt.Id = v.VoteTypeId 
+         WHERE v.PostId = c.QuestionId AND vt.Name = 'UpMod'),
+        0
+    ) as UpVoteCount,
+    COALESCE(
+        (SELECT COUNT(*) FROM Votes v 
+         INNER JOIN VoteTypes vt ON vt.Id = v.VoteTypeId 
+         WHERE v.PostId = c.QuestionId AND vt.Name = 'DownMod'),
+        0
+    ) as DownVoteCount,
+    (SELECT STRING_AGG(Tags, ', ') FROM Posts p WHERE p.Id = c.QuestionId GROUP BY p.Id) as AllTagString,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = c.QuestionId) as LinkCount,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.RelatedPostId = c.QuestionId) as RelatedLinkCount,
+    CASE 
+        WHEN (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = c.QuestionId AND pl.LinkTypeId = 3) > 0 THEN 'Duplicate'
+        ELSE 'Original'
+    END as DuplicateStatus,
+    ABS(c.Score - (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1 AND OwnerUserId = c.OwnerUserId)) as ScoreDeviationFromUserAverage,
+    IIF(c.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1), 1, 0) as AboveAverageFlag,
+    (SELECT COUNT(*) FROM ComplexAnalysis ca WHERE ca.UserId = (SELECT OwnerUserId FROM Posts WHERE Id = c.QuestionId)) as UserPostsCount,
+    (SELECT AVG(Score) FROM Posts WHERE OwnerUserId = (SELECT OwnerUserId FROM Posts WHERE Id = c.QuestionId) AND PostTypeId = 1) as UserAvgQuestionScore,
+    (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = 1 AND OwnerUserId = (SELECT OwnerUserId FROM Posts WHERE Id = c.QuestionId)) as UserAvgQuestionViews,
+    (SELECT COUNT(*) FROM Comments cm WHERE cm.PostId = c.QuestionId) as CommentCount,
+    (SELECT MAX(CreationDate) FROM Comments cm WHERE cm.PostId = c.QuestionId) as LastCommentDate,
+    (SELECT MIN(CreationDate) FROM Comments cm WHERE cm.PostId = c.QuestionId) as FirstCommentDate,
+    (DATEDIFF(day, c.CreationDate, GETDATE()) * 
+     (CASE WHEN c.AnswerCount > 0 THEN 1.0 ELSE 0.5 END) * 
+     (CASE WHEN c.Score > 10 THEN 1.5 ELSE 1.0 END)) as EngagementMultiplier,
+    CONCAT('Q', c.QuestionId, '-',
+            CASE WHEN c.QuestionStatus = 'Answered' THEN 'A' ELSE 'U' END,
+            CASE WHEN c.AgeCategory = 'New' THEN 'N' ELSE 'O' END,
+            '-S', CAST(c.Score AS VARCHAR(10))) as QuestionIdentifier,
+    'Performance Benchmark SQL' as SourceQueryName,
+    GETDATE() as BenchmarkTimestamp
+FROM QuestionWithStats c
+WHERE 
+    c.QuestionId IN (
+        SELECT QuestionId FROM QuestionWithStats 
+        WHERE PopularityRank <= 1000
+        AND AgeInDays <= 365
+        AND Score >= 10
+        AND AnswerCount >= 0
+    )
+    AND (
+        EXISTS (
+            SELECT 1 FROM ComplexAnalysis ca 
+            WHERE ca.UserId = (SELECT OwnerUserId FROM Posts WHERE Id = c.QuestionId)
+            AND ca.ContributionLevel IN ('Elite Contributor', 'Active Contributor')
+        )
+        OR 
+        EXISTS (
+            SELECT 1 FROM Posts p 
+            WHERE p.ParentId = c.QuestionId 
+            AND p.Score > 5
+        )
+    )
+ORDER BY 
+    c.CombinedScore DESC,
+    c.Score DESC,
+    c.ViewCount DESC
+OFFSET 0 ROWS
+FETCH NEXT 1000 ROWS ONLY;

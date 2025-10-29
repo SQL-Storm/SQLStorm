@@ -1,0 +1,85 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.Title,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.LastActivityDate,
+        U.DisplayName,
+        U.Reputation,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.ViewCount DESC) AS Rank
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId = 1 AND P.Score > 0 AND P.ViewCount > 100
+),
+BadgeCounts AS (
+    SELECT 
+        U.Id AS UserId,
+        COUNT(B.Id) AS BadgeCount
+    FROM 
+        Users U
+    LEFT JOIN 
+        Badges B ON U.Id = B.UserId
+    GROUP BY 
+        U.Id
+),
+VoteAgg AS (
+    SELECT
+        V.PostId,
+        COUNT(*) AS TotalVotes,
+        AVG(V.BountyAmount) AS AvgBounty
+    FROM
+        Votes V
+    WHERE
+        V.VoteTypeId = 8
+    GROUP BY
+        V.PostId
+)
+SELECT 
+    RP.Rank,
+    RP.Id,
+    RP.Title,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.LastActivityDate,
+    RP.DisplayName,
+    RP.Reputation,
+    BC.BadgeCount,
+    CASE 
+        WHEN RP.Score > 100 THEN 'High Scoring'
+        WHEN RP.ViewCount > 1000 THEN 'High Viewed'
+        ELSE 'Regular'
+    END AS Popularity,
+    COALESCE(VA.TotalVotes, 0) AS TotalVotes,
+    VA.AvgBounty
+FROM 
+    RankedPosts RP
+LEFT JOIN 
+    BadgeCounts BC ON RP.DisplayName = CAST(BC.UserId AS VARCHAR)
+LEFT JOIN 
+    VoteAgg VA ON RP.Id = VA.PostId
+GROUP BY
+    RP.Rank,
+    RP.Id,
+    RP.Title,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.LastActivityDate,
+    RP.DisplayName,
+    RP.Reputation,
+    BC.BadgeCount,
+    CASE 
+        WHEN RP.Score > 100 THEN 'High Scoring'
+        WHEN RP.ViewCount > 1000 THEN 'High Viewed'
+        ELSE 'Regular'
+    END,
+    VA.TotalVotes,
+    VA.AvgBounty
+ORDER BY 
+    RP.Rank;

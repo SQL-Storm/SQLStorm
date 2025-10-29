@@ -1,0 +1,312 @@
+-- {"query": "319.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2982} 
+with recent_users as (
+    select u.id as user_id,
+           u.displayname,
+           u.reputation,
+           u.creationdate,
+           u.location,
+           coalesce(nullif(trim(u.websiteurl), ''), 'n/a') as websiteurl_norm,
+           date_trunc('month', u.creationdate) as cohort_month
+    from users u
+    where u.creationdate >= (select max(p.creationdate) - interval '365 days' from posts p)
+),
+q_and_a as (
+    select p.id,
+           p.posttypeid,
+           p.owneruserid,
+           p.creationdate,
+           p.score,
+           p.viewcount,
+           p.answercount,
+           p.title,
+           p.tags,
+           p.parentid,
+           p.acceptedanswerid
+    from posts p
+    where p.posttypeid in (1,2)
+),
+user_activity as (
+    select ru.user_id,
+           count(*) filter (where qa.posttypeid = 1) as questions,
+           count(*) filter (where qa.posttypeid = 2) as answers,
+           sum(qa.score) filter (where qa.posttypeid = 1) as q_score,
+           sum(qa.score) filter (where qa.posttypeid = 2) as a_score,
+           count(distinct qa.id) filter (where qa.posttypeid = 1 and qa.acceptedanswerid is not null) as q_with_accept,
+           min(qa.creationdate) as first_post_at,
+           max(qa.creationdate) as last_post_at
+    from recent_users ru
+    left join q_and_a qa
+      on qa.owneruserid = ru.user_id
+    group by ru.user_id
+),
+vote_agg as (
+    select v.postid,
+           sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+           sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+           sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+           sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started,
+           sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded
+    from votes v
+    group by v.postid
+),
+comment_agg as (
+    select c.postid,
+           count(*) as comment_count,
+           max(c.score) as max_comment_score,
+           max(c.creationdate) as last_comment_at
+    from comments c
+    group by c.postid
+),
+post_enriched as (
+    select qa.*,
+           coalesce(va.upvotes,0) as upvotes,
+           coalesce(va.downvotes,0) as downvotes,
+           coalesce(va.favorites,0) as favorites,
+           coalesce(va.bounty_started,0) as bounty_started,
+           coalesce(va.bounty_awarded,0) as bounty_awarded,
+           coalesce(ca.comment_count,0) as comment_count,
+           ca.max_comment_score,
+           ca.last_comment_at
+    from q_and_a qa
+    left join vote_agg va on va.postid = qa.id
+    left join comment_agg ca on ca.postid = qa.id
+),
+tag_expanded as (
+    select p.id as post_id,
+           unnest(string_to_array(substring(p.tags, 2, greatest(length(p.tags)-2,0)), '><')) as tag
+    from posts p
+    where p.posttypeid = 1
+      and p.tags is not null
+),
+user_badges as (
+    select b.userid,
+           count(*) as badge_count,
+           sum(case when b.class = 1 then 1 else 0 end) as gold,
+           sum(case when b.class = 2 then 1 else 0 end) as silver,
+           sum(case when b.class = 3 then 1 else 0 end) as bronze,
+           max(b.date) as last_badge_at
+    from badges b
+    group by b.userid
+),
+closed_reasons as (
+    select ph.postid,
+           max(ph.creationdate) filter (where ph.posthistorytypeid = 10) as closed_at,
+           max(case
+                 when ph.posthistorytypeid = 10 then
+                   nullif(split_part(ph.comment, ' ', 1), '')
+                 else null
+               end) as close_reason_code
+    from posthistory ph
+    where ph.posthistorytypeid in (10,11)
+    group by ph.postid
+),
+dup_links as (
+    select pl.postid,
+           count(*) filter (where pl.linktypeid = 3) as duplicate_marks,
+           count(*) filter (where pl.linktypeid = 1) as linked_count
+    from postlinks pl
+    group by pl.postid
+),
+post_quality as (
+    select pe.id,
+           pe.posttypeid,
+           pe.owneruserid,
+           pe.creationdate,
+           pe.score,
+           pe.viewcount,
+           pe.answercount,
+           pe.title,
+           pe.tags,
+           pe.parentid,
+           pe.acceptedanswerid,
+           pe.upvotes,
+           pe.downvotes,
+           pe.favorites,
+           pe.comment_count,
+           pe.max_comment_score,
+           pe.last_comment_at,
+           coalesce(dl.duplicate_marks,0) as duplicate_marks,
+           coalesce(dl.linked_count,0) as linked_count,
+           cr.closed_at,
+           cr.close_reason_code,
+           case
+             when pe.posttypeid = 1 then
+               (pe.upvotes - pe.downvotes) * 2
+               + pe.favorites
+               + least(coalesce(pe.viewcount,0) / 100, 50)
+               + coalesce(pe.comment_count,0)
+               - (case when cr.closed_at is not null then 25 else 0 end)
+               - (coalesce(dl.duplicate_marks,0) * 10)
+             else
+               (pe.upvotes - pe.downvotes) * 2
+               + greatest(coalesce(pe.score,0),0)
+               + coalesce(pe.comment_count,0)
+           end as quality_score
+    from post_enriched pe
+    left join dup_links dl on dl.postid = pe.id
+    left join closed_reasons cr on cr.postid = pe.id
+),
+user_rollup as (
+    select ru.user_id,
+           ru.displayname,
+           ru.reputation,
+           ru.cohort_month,
+           ru.location,
+           ru.websiteurl_norm,
+           ua.questions,
+           ua.answers,
+           coalesce(ua.q_score,0) as q_score,
+           coalesce(ua.a_score,0) as a_score,
+           ua.first_post_at,
+           ua.last_post_at,
+           coalesce(ub.badge_count,0) as badges,
+           coalesce(ub.gold,0) as gold,
+           coalesce(ub.silver,0) as silver,
+           coalesce(ub.bronze,0) as bronze,
+           ub.last_badge_at
+    from recent_users ru
+    left join user_activity ua on ua.user_id = ru.user_id
+    left join user_badges ub on ub.userid = ru.user_id
+),
+user_tag_pref as (
+    select p.owneruserid as user_id,
+           te.tag,
+           count(*) as tag_posts,
+           sum(case when p.posttypeid = 1 then 1 else 0 end) as q_tag_posts
+    from posts p
+    join tag_expanded te on te.post_id = p.id
+    group by p.owneruserid, te.tag
+),
+user_top_tag as (
+    select user_id,
+           tag as top_tag,
+           tag_posts,
+           row_number() over (partition by user_id order by tag_posts desc, tag asc) as rn
+    from user_tag_pref
+),
+user_quality as (
+    select pq.owneruserid as user_id,
+           count(*) filter (where pq.posttypeid = 1) as q_count,
+           count(*) filter (where pq.posttypeid = 2) as a_count,
+           avg(pq.quality_score) as avg_quality,
+           percentile_disc(0.9) within group (order by pq.quality_score) as p90_quality,
+           sum(case when pq.quality_score >= 50 then 1 else 0 end) as high_quality_posts,
+           sum(case when pq.close_reason_code in ('101','1') then 1 else 0 end) as dup_closures
+    from post_quality pq
+    group by pq.owneruserid
+),
+active_windows as (
+    select ur.user_id,
+           count(*) filter (where pq.posttypeid = 1 and pq.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days') as q_30d,
+           count(*) filter (where pq.posttypeid = 2 and pq.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days') as a_30d,
+           count(*) filter (where pq.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '7 days') as posts_7d,
+           max(pq.creationdate) as last_post_at
+    from user_rollup ur
+    left join post_quality pq on pq.owneruserid = ur.user_id
+    group by ur.user_id
+),
+ranked_users as (
+    select
+        ur.*,
+        ut.top_tag,
+        ut.tag_posts as top_tag_posts,
+        uq.q_count,
+        uq.a_count,
+        uq.avg_quality,
+        uq.p90_quality,
+        uq.high_quality_posts,
+        uq.dup_closures,
+        aw.q_30d,
+        aw.a_30d,
+        aw.posts_7d,
+        aw.last_post_at as last_post_ts,
+        coalesce(uq.avg_quality,0)
+          + least(coalesce(uq.q_count,0), 50)
+          + least(coalesce(uq.a_count,0), 100) * 0.5
+          + coalesce(uq.high_quality_posts,0) * 1.5
+          - coalesce(uq.dup_closures,0) * 2
+          + case when aw.posts_7d >= 3 then 5 else 0 end
+          + case when ur.gold > 0 then 3 when ur.silver > 2 then 2 when ur.bronze > 5 then 1 else 0 end
+          + case when ur.reputation >= 10000 then 5 when ur.reputation >= 1000 then 2 else 0 end
+          as engagement_score
+    from user_rollup ur
+    left join lateral (
+        select top_tag, tag_posts
+        from user_top_tag utt
+        where utt.user_id = ur.user_id and utt.rn = 1
+    ) ut on true
+    left join user_quality uq on uq.user_id = ur.user_id
+    left join active_windows aw on aw.user_id = ur.user_id
+),
+cohort_stats as (
+    select cohort_month,
+           count(*) as users_in_cohort,
+           avg(engagement_score) as avg_engagement,
+           percentile_disc(0.5) within group (order by engagement_score) as p50_engagement,
+           percentile_disc(0.9) within group (order by engagement_score) as p90_engagement
+    from ranked_users
+    group by cohort_month
+),
+final_rank as (
+    select
+        ru.*,
+        cs.users_in_cohort,
+        cs.avg_engagement,
+        cs.p50_engagement,
+        cs.p90_engagement,
+        dense_rank() over (order by engagement_score desc nulls last) as global_rank,
+        dense_rank() over (partition by ru.cohort_month order by engagement_score desc nulls last) as cohort_rank,
+        row_number() over (partition by coalesce(ru.top_tag,'(none)') order by engagement_score desc nulls last, ru.user_id) as tag_rownum
+    from ranked_users ru
+    left join cohort_stats cs on cs.cohort_month = ru.cohort_month
+)
+select
+    fr.global_rank,
+    fr.cohort_rank,
+    fr.tag_rownum,
+    fr.user_id,
+    coalesce(fr.displayname, concat('user_', fr.user_id::varchar)) as displayname,
+    fr.reputation,
+    fr.location,
+    fr.websiteurl_norm,
+    fr.cohort_month,
+    fr.questions,
+    fr.answers,
+    fr.q_score,
+    fr.a_score,
+    fr.badges,
+    fr.gold,
+    fr.silver,
+    fr.bronze,
+    fr.first_post_at,
+    fr.last_post_at,
+    coalesce(fr.top_tag, '(none)') as top_tag,
+    coalesce(fr.top_tag_posts, 0) as top_tag_posts,
+    fr.q_count,
+    fr.a_count,
+    round(fr.avg_quality::numeric, 2) as avg_quality,
+    fr.p90_quality,
+    fr.high_quality_posts,
+    fr.dup_closures,
+    fr.q_30d,
+    fr.a_30d,
+    fr.posts_7d,
+    fr.last_post_ts,
+    round(fr.engagement_score::numeric, 2) as engagement_score,
+    fr.users_in_cohort,
+    round(fr.avg_engagement::numeric, 2) as cohort_avg_engagement,
+    fr.p50_engagement as cohort_p50_engagement,
+    fr.p90_engagement as cohort_p90_engagement
+from final_rank fr
+where coalesce(fr.top_tag, '(none)') is not null
+  and (fr.engagement_score is not null or fr.reputation >= 100)
+  and (fr.q_30d + fr.a_30d >= 0) -- noop predicate to keep plan shape stable
+  and (fr.q_count is not null or fr.a_count is not null)
+  and (fr.gold > 0 or fr.silver > 0 or fr.bronze >= 0)
+  and (
+    (fr.location is null and fr.websiteurl_norm = 'n/a')
+    or
+    (fr.location is not null and fr.websiteurl_norm is not null)
+  )
+order by fr.global_rank nulls last, fr.user_id
+limit 500;

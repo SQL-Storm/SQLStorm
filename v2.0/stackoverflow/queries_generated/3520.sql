@@ -1,0 +1,144 @@
+-- {"query": "3520.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2294} 
+
+/*  Complex benchmark query for the StackOverflow schema  */
+WITH 
+/* 1️⃣ User‑level aggregates */
+user_stats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        /* total posts (question + answer + others) */
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id)                                   AS total_posts,
+        /* only questions */
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1)            AS question_cnt,
+        /* only answers */
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2)            AS answer_cnt,
+        /* up‑votes cast by the user */
+        (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 2)                AS up_votes,
+        /* down‑votes cast by the user */
+        (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 3)                AS down_votes,
+        /* number of distinct badge classes (gold/silver/bronze) earned */
+        (SELECT COUNT(DISTINCT b.Class) FROM Badges b WHERE b.UserId = u.Id)                     AS badge_classes,
+        /* total badge count */
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id)                                    AS badge_cnt
+    FROM Users u
+),
+
+/* 2️⃣ Ranking with window functions */
+ranked_users AS (
+    SELECT 
+        us.*,
+        ROW_NUMBER() OVER (ORDER BY us.Reputation DESC, us.total_posts DESC)                  AS rep_rank,
+        RANK()      OVER (PARTITION BY 
+                            CASE 
+                                WHEN us.Reputation >= 20000 THEN 'high' 
+                                WHEN us.Reputation >= 5000  THEN 'mid' 
+                                ELSE 'low' 
+                            END 
+                         ORDER BY us.Reputation DESC)                                      AS tier_rank,
+        /* ratio handling NULL/0 safely */
+        CASE 
+            WHEN us.down_votes = 0 THEN NULL 
+            ELSE CAST(us.up_votes AS FLOAT) / us.down_votes 
+        END                                                                               AS up_down_ratio
+    FROM user_stats us
+),
+
+/* 3️⃣ Tag usage per user – uses LATERAL split & string aggregation */
+tag_usage AS (
+    SELECT 
+        p.OwnerUserId                           AS user_id,
+        tg.tag                                  AS tag_name,
+        COUNT(*)                                 AS tag_cnt,
+        STRING_AGG(tg.tag, ',') OVER (PARTITION BY p.OwnerUserId) AS all_tags_per_user
+    FROM Posts p
+    /* split the Tags column like '<tag1><tag2>' into rows */
+    LEFT JOIN LATERAL regexp_split_to_table(p.Tags, '<|>') AS tg(tag) ON tg.tag <> ''
+    LEFT JOIN Tags t ON t.TagName = tg.tag
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId, tg.tag
+),
+
+/* 4️⃣ Most recent activity (posts, comments, profile access) */
+last_activity AS (
+    SELECT 
+        u.Id,
+        GREATEST(
+            COALESCE(u.LastAccessDate, TIMESTAMP '1970‑01‑01'),
+            COALESCE((SELECT MAX(p.LastActivityDate) FROM Posts p WHERE p.OwnerUserId = u.Id), TIMESTAMP '1970‑01‑01'),
+            COALESCE((SELECT MAX(c.CreationDate)    FROM Comments c WHERE c.UserId = u.Id), TIMESTAMP '1970‑01‑01')
+        ) AS last_seen
+    FROM Users u
+),
+
+/* 5️⃣ Users that have at least one negatively scored post – correlated EXISTS */
+neg_score_flag AS (
+    SELECT 
+        u.Id,
+        CASE WHEN EXISTS (
+               SELECT 1 FROM Posts p 
+               WHERE p.OwnerUserId = u.Id AND p.Score < 0
+             )
+             THEN 1 ELSE 0 END                                            AS has_negative_posts
+    FROM Users u
+)
+
+/* ------------------------------------------------------------------- */
+/*  Final result: user detail rows UNIONed with an aggregate summary   */
+/* ------------------------------------------------------------------- */
+SELECT
+    ru.Id,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.total_posts,
+    ru.question_cnt,
+    ru.answer_cnt,
+    ru.badge_cnt,
+    ru.up_down_ratio,
+    la.last_seen,
+    COALESCE(tu.all_tags_per_user, '')                                 AS tag_list,
+    CASE 
+        WHEN ru.rep_rank <= 10  THEN 'Top 10'
+        WHEN ru.rep_rank <= 100 THEN 'Top 100'
+        ELSE 'Other' 
+    END                                                               AS rank_group,
+    nf.has_negative_posts,
+    /* comma‑separated list of vote types the user ever used */
+    (SELECT STRING_AGG(DISTINCT vt.Name, ',')
+       FROM VoteTypes vt
+       JOIN Votes v ON v.VoteTypeId = vt.Id
+       WHERE v.UserId = ru.Id)                                        AS vote_types_used
+FROM ranked_users ru
+LEFT JOIN last_activity   la ON la.Id = ru.Id
+LEFT JOIN (
+    SELECT user_id, STRING_AGG(tag_name, ',') AS all_tags_per_user
+    FROM tag_usage
+    GROUP BY user_id
+) tu ON tu.user_id = ru.Id
+LEFT JOIN neg_score_flag nf ON nf.Id = ru.Id
+WHERE ru.tier_rank <= 5                         /* keep only top users of each tier */
+UNION ALL
+/* ------------------------------------------------------------------- */
+/*  Aggregate row – useful for overall‑scale benchmarking               */
+/* ------------------------------------------------------------------- */
+SELECT
+    NULL,
+    'Overall Summary'                                    AS display_name,
+    NULL,
+    SUM(total_posts),
+    SUM(question_cnt),
+    SUM(answer_cnt),
+    SUM(badge_cnt),
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL
+FROM ranked_users
+ORDER BY 
+    Reputation DESC NULLS LAST,
+    Id ASC;

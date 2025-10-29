@@ -1,0 +1,218 @@
+WITH UserPostStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views AS UserViews,
+        u.UpVotes AS UserUpVotes,
+        u.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswers,
+        SUM(CASE WHEN p.PostTypeId IN (1, 2) THEN COALESCE(p.Score, 0) ELSE 0 END) AS TotalPostScore,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN COALESCE(p.ViewCount, 0) ELSE 0 END) AS TotalQuestionViews,
+        AVG(CASE WHEN p.PostTypeId IN (1, 2) THEN COALESCE(p.Score, 0) END) AS AvgPostScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        MIN(p.CreationDate) AS FirstPostDate,
+        COUNT(CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN p.AcceptedAnswerId END) AS AcceptedAnswerCountForQuestions,
+        COUNT(CASE WHEN p_ans.AcceptedAnswerId IS NOT NULL AND p_ans.OwnerUserId = u.Id AND p_ans.PostTypeId = 2 THEN p_ans.Id END) AS AcceptedAnswersProvided
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Posts p_ans ON p.Id = p_ans.AcceptedAnswerId AND p_ans.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+UserEditActivity AS (
+    SELECT
+        ph.UserId,
+        COUNT(DISTINCT ph.PostId) AS PostsEdited,
+        COUNT(ph.Id) AS TotalEdits,
+        MAX(ph.CreationDate) AS LastEditDate,
+        MIN(ph.CreationDate) AS FirstEditDate,
+        AVG(EXTRACT(EPOCH FROM (ph.CreationDate - LAG(ph.CreationDate) OVER (PARTITION BY ph.UserId ORDER BY ph.CreationDate)))) FILTER (WHERE LAG(ph.CreationDate) OVER (PARTITION BY ph.UserId ORDER BY ph.CreationDate) IS NOT NULL) AS AvgTimeBetweenEditsSeconds
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6, 8)
+    GROUP BY ph.UserId
+),
+UserCommentEngagement AS (
+    SELECT
+        c.UserId,
+        COUNT(c.Id) AS TotalComments,
+        SUM(COALESCE(c.Score, 0)) AS TotalCommentScore,
+        AVG(COALESCE(c.Score, 0)) AS AvgCommentScore,
+        COUNT(CASE WHEN LOWER(c.Text) LIKE '%thanks%' THEN 1 END) AS ThanksComments,
+        COUNT(CASE WHEN LOWER(c.Text) LIKE '%duplicate%' THEN 1 END) AS DuplicateComments
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+    GROUP BY c.UserId
+),
+UserBadgeSummary AS (
+    SELECT
+        b.UserId,
+        COUNT(b.Id) AS TotalBadges,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        COUNT(CASE WHEN b.TagBased = TRUE THEN 1 END) AS TagBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+QuestionTagUsage AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        TRIM(BOTH '<>' FROM SPLIT_PART(p.Tags, '>', 1)) AS FirstTag,
+        CARDINALITY(string_to_array(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2), '><')) AS NumberOfTags
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+),
+UserDuplicatePostCounts AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(pl.Id) AS DuplicatedQuestionsCount
+    FROM Posts p
+    JOIN PostLinks pl ON p.Id = pl.PostId
+    WHERE p.PostTypeId = 1
+      AND pl.LinkTypeId = 3
+    GROUP BY p.OwnerUserId
+),
+UserContributionMetrics AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Location,
+        u.CreationDate AS UserCreationDate,
+        u.AboutMe,
+        u.WebsiteUrl,
+        u.LastAccessDate,
+        EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - u.CreationDate)) AS UserAgeInDays,
+        COALESCE(ups.TotalQuestions, 0) AS TotalQuestions,
+        COALESCE(ups.TotalAnswers, 0) AS TotalAnswers,
+        COALESCE(ups.TotalPostScore, 0) AS TotalPostScore,
+        COALESCE(ups.TotalQuestionViews, 0) AS TotalQuestionViews,
+        COALESCE(ups.AvgPostScore, 0) AS AvgPostScore,
+        COALESCE(uea.TotalEdits, 0) AS UserTotalEdits,
+        COALESCE(uce.TotalComments, 0) AS UserTotalComments,
+        COALESCE(ubs.GoldBadges, 0) AS UserGoldBadges,
+        COALESCE(ubs.SilverBadges, 0) AS UserSilverBadges,
+        COALESCE(ubs.BronzeBadges, 0) AS UserBronzeBadges,
+        COALESCE(uea.AvgTimeBetweenEditsSeconds, 0) AS AvgEditInterval,
+        COALESCE(udpc.DuplicatedQuestionsCount, 0) AS DuplicatedQuestionsCount,
+        RANK() OVER (ORDER BY u.Reputation DESC, COALESCE(ups.TotalPostScore, 0) DESC) AS GlobalReputationRank,
+        NTILE(10) OVER (ORDER BY COALESCE(ups.TotalQuestions, 0) DESC, COALESCE(ups.TotalAnswers, 0) DESC) AS TopActivityDecile,
+        AVG(COALESCE(ups.AvgPostScore, 0)) OVER (PARTITION BY u.Location) AS AvgPostScoreInLocation,
+        (
+            SELECT COUNT(p_sub.Id)
+            FROM Posts p_sub
+            WHERE p_sub.OwnerUserId = u.Id
+              AND p_sub.PostTypeId = 1
+              AND p_sub.ViewCount > 10000
+        ) AS HighViewQuestionCount,
+        (
+            SELECT qtu_sub.FirstTag
+            FROM QuestionTagUsage qtu_sub
+            WHERE qtu_sub.OwnerUserId = u.Id
+            GROUP BY qtu_sub.FirstTag
+            ORDER BY COUNT(qtu_sub.FirstTag) DESC, MAX(qtu_sub.Score) DESC
+            LIMIT 1
+        ) AS MostCommonQuestionTag,
+        (
+            (u.Reputation / 1000.0) * 0.4 +
+            (COALESCE(uea.TotalEdits, 0) / 100.0) * 0.2 +
+            (COALESCE(uce.TotalComments, 0) / 50.0) * 0.2 +
+            (COALESCE(ubs.GoldBadges, 0) * 5 + COALESCE(ubs.SilverBadges, 0) * 2 + COALESCE(ubs.BronzeBadges, 0)) * 0.1 +
+            (COALESCE(ups.TotalPostScore, 0) / 100.0) * 0.1
+        ) AS UserEngagementScore,
+        COALESCE(u.DisplayName, 'Anonymous') || ' (' || COALESCE(u.Location, 'Unknown') || ')' AS UserLocationInfo,
+        CASE
+            WHEN u.AboutMe IS NOT NULL AND CHAR_LENGTH(u.AboutMe) > 100 THEN 'Has Detailed AboutMe'
+            WHEN u.AboutMe IS NOT NULL AND CHAR_LENGTH(u.AboutMe) <= 100 THEN 'Has Short AboutMe'
+            ELSE 'No AboutMe'
+        END AS AboutMeStatus,
+        CASE
+            WHEN u.Reputation >= 10000 AND COALESCE(ubs.GoldBadges, 0) >= 3 THEN 'Elite Contributor'
+            WHEN COALESCE(ups.TotalQuestions, 0) >= 50 AND COALESCE(ups.AvgPostScore, 0) >= 10 THEN 'High Impact Questioner'
+            WHEN COALESCE(uea.TotalEdits, 0) >= 100 THEN 'Proactive Editor'
+            WHEN COALESCE(uce.TotalComments, 0) >= 200 AND COALESCE(uce.AvgCommentScore, 0) >= 5 THEN 'Engaged Commenter'
+            ELSE 'General Participant'
+        END AS UserCategory,
+        AVG(qtu.NumberOfTags) AS AverageTagsPerQuestionOwned
+    FROM Users u
+    LEFT JOIN UserPostStats ups ON u.Id = ups.UserId
+    LEFT JOIN UserEditActivity uea ON u.Id = uea.UserId
+    LEFT JOIN UserCommentEngagement uce ON u.Id = uce.UserId
+    LEFT JOIN UserBadgeSummary ubs ON u.Id = ubs.UserId
+    LEFT JOIN UserDuplicatePostCounts udpc ON u.Id = udpc.UserId
+    LEFT JOIN QuestionTagUsage qtu ON qtu.OwnerUserId = u.Id
+    WHERE u.LastAccessDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year')
+      AND u.Reputation > 100
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.Location, u.CreationDate,
+        u.AboutMe, u.WebsiteUrl, u.LastAccessDate,
+        ups.TotalQuestions, ups.TotalAnswers, ups.TotalPostScore, ups.TotalQuestionViews, ups.AvgPostScore,
+        uea.TotalEdits, uce.TotalComments, ubs.GoldBadges, ubs.SilverBadges, ubs.BronzeBadges,
+        uea.AvgTimeBetweenEditsSeconds, udpc.DuplicatedQuestionsCount, u.WebsiteUrl, u.DisplayName, u.Location, u.AboutMe
+)
+
+SELECT *
+FROM (
+    SELECT
+        ucm.UserId,
+        ucm.DisplayName,
+        ucm.Reputation,
+        ucm.UserCategory,
+        ucm.UserEngagementScore,
+        ucm.GlobalReputationRank,
+        ucm.MostCommonQuestionTag,
+        ucm.UserLocationInfo,
+        ucm.AboutMeStatus,
+        'High-Tier Contributor' AS SegmentType,
+        ucm.TotalQuestions,
+        ucm.TotalAnswers,
+        ucm.UserTotalEdits,
+        ucm.UserTotalComments,
+        1 AS sort_grp,
+        ucm.UserEngagementScore AS sort1,
+        ucm.GlobalReputationRank AS sort2,
+        NULL::numeric AS sort3
+    FROM UserContributionMetrics ucm
+    WHERE ucm.UserEngagementScore > 100
+      AND ucm.GlobalReputationRank <= 5000
+      AND ucm.UserGoldBadges >= 1
+      AND (LOWER(ucm.Location) LIKE '%london%' OR LOWER(ucm.Location) LIKE '%paris%' OR ucm.Location IS NULL)
+      AND ucm.HighViewQuestionCount >= 5
+    UNION ALL
+    SELECT
+        ucm.UserId,
+        ucm.DisplayName,
+        ucm.Reputation,
+        ucm.UserCategory,
+        ucm.UserEngagementScore,
+        ucm.GlobalReputationRank,
+        ucm.MostCommonQuestionTag,
+        ucm.UserLocationInfo,
+        ucm.AboutMeStatus,
+        'Active Community Member' AS SegmentType,
+        ucm.TotalQuestions,
+        ucm.TotalAnswers,
+        ucm.UserTotalEdits,
+        ucm.UserTotalComments,
+        2 AS sort_grp,
+        ucm.UserEngagementScore AS sort1,
+        NULL::numeric AS sort2,
+        ucm.UserTotalEdits AS sort3
+    FROM UserContributionMetrics ucm
+    WHERE ucm.UserTotalEdits >= 50
+      AND ucm.UserTotalComments >= 100
+      AND ucm.AvgEditInterval < 86400 * 7
+      AND ucm.Reputation BETWEEN 500 AND 9999
+      AND (COALESCE(ucm.TotalQuestions,0) + COALESCE(ucm.TotalAnswers,0)) >= 20
+      AND (ucm.WebsiteUrl IS NOT NULL OR ucm.AboutMe IS NOT NULL)
+) t
+ORDER BY sort_grp, sort1 DESC, sort2 ASC NULLS LAST, sort3 DESC NULLS LAST
+LIMIT 200;

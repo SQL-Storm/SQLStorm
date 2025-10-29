@@ -1,0 +1,162 @@
+-- {"query": "4666.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1719} 
+WITH PostEngagement AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        COUNT(DISTINCT c.Id) AS CommentCountWithScore,
+        SUM(CASE WHEN c.Score > 0 THEN 1 ELSE 0 END) AS PositiveComments,
+        AVG(c.Score) AS AverageCommentScore,
+        (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 1) AS LinkedPosts,
+        (SELECT COUNT(*) FROM PostLinks pl WHERE pl.RelatedPostId = p.Id AND pl.LinkTypeId = 3) AS DuplicateOfPosts,
+        (
+            SELECT COUNT(DISTINCT v.UserId)
+            FROM Votes v
+            WHERE v.PostId = p.Id
+            AND v.VoteTypeId = 2 -- UpVote
+        ) AS UpVoteCount,
+        (
+            SELECT COUNT(DISTINCT v.UserId)
+            FROM Votes v
+            WHERE v.PostId = p.Id
+            AND v.VoteTypeId = 3 -- DownVote
+        ) AS DownVoteCount,
+        (
+            SELECT COUNT(*)
+            FROM PostHistory ph
+            WHERE ph.PostId = p.Id
+            AND ph.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+        ) AS EditCount
+    FROM Posts p
+    LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    WHERE p.PostTypeId IN (1, 2) -- Questions and Answers
+    GROUP BY
+        p.Id,
+        p.PostTypeId,
+        pt.Name,
+        p.OwnerUserId,
+        u.DisplayName,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.Views AS UserViews,
+        u.UpVotes AS UserUpVotes,
+        u.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(DISTINCT ph.Id) AS PostHistoryCount,
+        MAX(ph.CreationDate) AS LastPostHistoryDate
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    GROUP BY
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes
+),
+RankedPosts AS (
+    SELECT
+        pe.*,
+        ROW_NUMBER() OVER (ORDER BY pe.Score DESC, pe.ViewCount DESC, pe.PostCreationDate ASC) AS ScoreRank,
+        ROW_NUMBER() OVER (PARTITION BY pe.PostTypeId ORDER BY pe.ViewCount DESC) AS ViewRankByType
+    FROM PostEngagement pe
+    WHERE pe.OwnerUserId IS NOT NULL
+),
+HighEngagementQuestions AS (
+    SELECT
+        rp.PostId,
+        rp.PostTypeName,
+        rp.OwnerUserId,
+        rp.OwnerDisplayName,
+        rp.Score,
+        rp.ViewCount,
+        rp.AnswerCount,
+        rp.EditCount,
+        rp.UpVoteCount,
+        ua.Reputation AS OwnerReputation,
+        ua.UserCreationDate AS OwnerCreationDate,
+        CAST(rp.PostCreationDate AS DATE) AS PostDateOnly,
+        DATEDIFF(day, rp.PostCreationDate, cast('2024-10-01 12:34:56' as timestamp)) AS DaysSinceCreation,
+        CASE
+            WHEN rp.Score > 100 THEN 'Very High Score'
+            WHEN rp.Score > 20 THEN 'High Score'
+            WHEN rp.Score > 0 THEN 'Positive Score'
+            ELSE 'Zero or Negative Score'
+        END AS ScoreCategory,
+        CASE
+            WHEN rp.ClosedDate IS NOT NULL THEN 'Closed'
+            ELSE 'Open'
+        END AS PostStatus,
+        COALESCE(ua.GoldBadges, 0) + COALESCE(ua.SilverBadges, 0) + COALESCE(ua.BronzeBadges, 0) AS TotalBadgesForOwner
+    FROM RankedPosts rp
+    JOIN UserActivity ua ON rp.OwnerUserId = ua.UserId
+    WHERE rp.PostTypeId = 1 -- Questions only
+    AND rp.Score > 10
+    AND rp.ViewCount > 1000
+    AND rp.EditCount > 0
+    AND rp.UpVoteCount > 5
+    AND ua.Reputation > 5000
+)
+SELECT
+    hq.PostId,
+    hq.PostTypeName,
+    hq.OwnerDisplayName,
+    hq.Score,
+    hq.ViewCount,
+    hq.AnswerCount,
+    hq.EditCount,
+    hq.UpVoteCount,
+    hq.OwnerReputation,
+    hq.OwnerCreationDate,
+    hq.PostDateOnly,
+    hq.DaysSinceCreation,
+    hq.ScoreCategory,
+    hq.PostStatus,
+    hq.TotalBadgesForOwner,
+    CASE
+        WHEN hq.DaysSinceCreation > 365 THEN 'Veteran Post'
+        WHEN hq.DaysSinceCreation > 90 THEN 'Mature Post'
+        ELSE 'Recent Post'
+    END AS PostAgeCategory,
+    LOWER(REPLACE(REPLACE(REPLACE(hq.OwnerDisplayName, ' ', '-'), '''', ''), '.', '')) AS NormalizedOwnerName,
+    CASE
+        WHEN hq.OwnerReputation > 100000 THEN 'Guru'
+        WHEN hq.OwnerReputation > 25000 THEN 'Expert'
+        ELSE 'Skilled'
+    END AS OwnerExpertiseLevel,
+    (SELECT COUNT(*) FROM Comments WHERE PostId = hq.PostId AND Score > 5) AS HighlyRatedCommentCount,
+    CASE WHEN hq.AnswerCount * 1.0 / NULLIF(hq.ViewCount, 0) > 0.1 THEN 'High Engagement Ratio' ELSE 'Standard Engagement Ratio' END AS EngagementRatioIndicator,
+    CONCAT(hq.OwnerDisplayName, ' posted a ', LOWER(hq.PostTypeName), ' with score ', hq.Score, ' on ', hq.PostDateOnly) AS SummaryString
+FROM HighEngagementQuestions hq
+WHERE hq.OwnerReputation > 1000 -- Further filter by owner reputation
+ORDER BY hq.Score DESC, hq.ViewCount DESC;

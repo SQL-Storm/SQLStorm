@@ -1,0 +1,234 @@
+with recursive RecursivePostTree as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.OwnerUserId,
+        p.Score,
+        p.CreationDate,
+        p.Tags,
+        1 as Depth,
+        array[p.Id] as Path
+    from Posts p
+    where p.PostTypeId = 1
+
+    union all
+
+    select
+        c.Id,
+        c.PostTypeId,
+        c.ParentId,
+        c.OwnerUserId,
+        c.Score,
+        c.CreationDate,
+        c.Tags,
+        rpt.Depth + 1,
+        rpt.Path || c.Id
+    from Posts c
+    join RecursivePostTree rpt on c.ParentId = rpt.Id
+    where c.PostTypeId = 2
+),
+UserBadgeStats as (
+    select
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        count(*) as TotalBadges,
+        max(b.Date) as LatestBadgeDate
+    from Badges b
+    group by b.UserId
+),
+UserPostAggregates as (
+    select 
+        u.Id as UserId,
+        count(distinct p.Id) as TotalPosts,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as Questions,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as Answers,
+        avg(p.Score) filter(where p.Score is not null) as AvgPostScore,
+        max(p.CreationDate) as LastPostDate,
+        sum(coalesce(p.ViewCount,0)) as TotalViews,
+        sum(coalesce(p.FavoriteCount,0)) as TotalFavorites,
+        sum(coalesce(p.AnswerCount,0)) as TotalAnswersReceived
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id
+),
+PostCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReason,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    join CloseReasonTypes crt on cast(ph.Comment as integer) = crt.Id
+    where ph.PostHistoryTypeId = 10
+),
+PostCommentsCount as (
+    select 
+        p.Id as PostId,
+        count(c.Id) as CommentCount
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+    group by p.Id
+),
+RankedPosts as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Tags,
+        pc.CloseReason,
+        pc.CloseDate,
+        p.CommunityOwnedDate,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc nulls last, p.CreationDate desc) as UserPostRank,
+        dense_rank() over (order by p.Score desc nulls last) as GlobalScoreRank,
+        count(*) over () as TotalPosts
+    from Posts p
+    left join PostCloseReasons pc on pc.PostId = p.Id
+),
+HighScoreQuestionsWithAnswers as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.OwnerUserId,
+        count(a.Id) as AnswerCount,
+        coalesce(sum(a.Score),0) as TotalAnswerScore,
+        avg(a.Score) as AvgAnswerScore,
+        max(a.Score) as MaxAnswerScore,
+        bool_or(a.Score > q.Score) as AnyAnswerBetterThanQuestion,
+        bool_or(a.CreationDate < q.CreationDate) as HasEarlierAnswer,
+        count(distinct case when v.VoteTypeId = 2 then v.Id end) as UpVotesCount,
+        count(distinct case when v.VoteTypeId = 3 then v.Id end) as DownVotesCount,
+        count(distinct case when l.LinkTypeId = 3 then l.Id end) as DuplicateLinksCount,
+        string_agg( (lt.Name || ':' || cast(l.RelatedPostId as varchar)), ',' ) as LinkTypeDetails
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Votes v on v.PostId = q.Id
+    left join PostLinks l on l.PostId = q.Id
+    left join LinkTypes lt on lt.Id = l.LinkTypeId
+    where q.PostTypeId = 1 and q.Score > 10 and q.ViewCount > 1000
+    group by q.Id, q.Title, q.Score, q.ViewCount, q.OwnerUserId
+),
+UsersActivityWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        count(distinct p.Id) as PostsCount,
+        sum(coalesce(p.Score,0)) as TotalPostScore,
+        count(distinct c.Id) as CommentsCount,
+        count(distinct b.Id) as BadgesCount,
+        avg(p.Score) filter (where p.Score is not null) as AvgPostScore,
+        max(p.Score) as MaxPostScore,
+        min(p.Score) as MinPostScore,
+        first_value(p.Title) over (partition by u.Id order by p.CreationDate asc) as FirstPostTitle,
+        last_value(p.Title) over (partition by u.Id order by p.CreationDate asc rows between unbounded preceding and unbounded following) as LastPostTitle
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+PostsWithTextAnalysis as (
+    select
+        p.Id,
+        p.Title,
+        p.Body,
+        length(coalesce(p.Body,'')) as BodyLength,
+        length(regexp_replace(coalesce(p.Body,''), '<[^>]+>', '', 'g')) as BodyTextLength,
+        length(regexp_replace(coalesce(p.Title,''), '[^A-Za-z0-9_]+', '', 'g')) as TitleAlphaLength,
+        strpos(lower(coalesce(p.Body,'')), 'sql') as SqlKeywordPos,
+        (regexp_matches(coalesce(p.Tags,''), '<(sql|database|query)>')) is not null as ContainsSQLTag,
+        case 
+            when p.Score > 0 then 'Positive'
+            when p.Score < 0 then 'Negative'
+            else 'Neutral'
+        end as ScorePolarity,
+        coalesce(p.FavoriteCount,0) as Favorites,
+        coalesce(p.AnswerCount,0) as Answers,
+        coalesce(pc.CloseReason, 'Open') as CloseStatus,
+        pc.CloseDate
+    from Posts p
+    left join PostCloseReasons pc on pc.PostId = p.Id
+    where p.PostTypeId = 1
+),
+FinalAggregatedResults as (
+    select
+        u.UserId,
+        u.DisplayName,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        urs.TotalPosts,
+        urs.Questions,
+        urs.Answers,
+        urs.AvgPostScore,
+        q.QuestionId,
+        q.Title as QuestionTitle,
+        q.QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        q.TotalAnswerScore,
+        q.AvgAnswerScore,
+        q.MaxAnswerScore,
+        q.AnyAnswerBetterThanQuestion,
+        q.DuplicateLinksCount,
+        wap.BodyLength,
+        wap.BodyTextLength,
+        wap.ContainsSQLTag,
+        wap.ScorePolarity,
+        wap.CloseStatus,
+        wap.CloseDate,
+        was.PostsCount as UserPostsCount,
+        was.TotalPostScore as UserTotalPostScore,
+        was.CommentsCount as UserCommentsCount,
+        was.BadgesCount as UserBadgesCount
+    from Users u
+    left join UserBadgeStats ub on ub.UserId = u.Id
+    left join UserPostAggregates urs on urs.UserId = u.Id
+    left join HighScoreQuestionsWithAnswers q on q.OwnerUserId = u.Id
+    left join PostsWithTextAnalysis wap on wap.Id = q.QuestionId
+    left join UsersActivityWindow was on was.UserId = u.Id
+    where u.Reputation > 1000 and urs.TotalPosts > 5
+)
+select 
+    far.UserId,
+    far.DisplayName,
+    coalesce(far.GoldBadges,0) as GoldBadges,
+    coalesce(far.SilverBadges,0) as SilverBadges,
+    coalesce(far.BronzeBadges,0) as BronzeBadges,
+    far.TotalPosts,
+    far.Questions,
+    far.Answers,
+    round(cast(far.AvgPostScore as numeric),2) as AvgPostScore,
+    far.QuestionId,
+    far.QuestionTitle,
+    far.QuestionScore,
+    far.ViewCount,
+    far.AnswerCount,
+    far.TotalAnswerScore,
+    round(cast(far.AvgAnswerScore as numeric),2) as AvgAnswerScore,
+    far.MaxAnswerScore,
+    far.AnyAnswerBetterThanQuestion,
+    far.DuplicateLinksCount,
+    far.BodyLength,
+    far.BodyTextLength,
+    far.ContainsSQLTag,
+    far.ScorePolarity,
+    far.CloseStatus,
+    far.CloseDate,
+    far.UserPostsCount,
+    far.UserTotalPostScore,
+    far.UserCommentsCount,
+    far.UserBadgesCount
+from FinalAggregatedResults far
+where (far.QuestionScore > 20) or (coalesce(far.GoldBadges,0) > 0)
+order by far.GoldBadges desc nulls last, far.QuestionScore desc nulls last, far.UserPostsCount desc nulls last
+limit 100;

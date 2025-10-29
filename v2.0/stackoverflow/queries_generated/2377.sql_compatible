@@ -1,0 +1,112 @@
+with RecursiveTaggedPosts as (
+    select p.Id, p.Title, p.Tags, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.OwnerUserId,
+           array_remove(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><'), '') as TagArray
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+),
+TagHierarchy as (
+    select t.Id, t.TagName, t.Count, t.IsModeratorOnly, t.IsRequired,
+           coalesce(t.ExcerptPostId, 0) as ExcerptPostId,
+           coalesce(t.WikiPostId, 0) as WikiPostId
+    from Tags t
+),
+UserBadgeCounts as (
+    select u.Id as UserId, 
+           coalesce(sum(case when b.Class = 1 then 1 else 0 end),0) as GoldBadges,
+           coalesce(sum(case when b.Class = 2 then 1 else 0 end),0) as SilverBadges,
+           coalesce(sum(case when b.Class = 3 then 1 else 0 end),0) as BronzeBadges
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id
+),
+AnswerStats as (
+    select a.ParentId as QuestionId,
+           count(*) filter (where a.Score > 0) as PositiveAnswerCount,
+           count(*) filter (where a.Score <= 0) as NonPositiveAnswerCount,
+           max(a.Score) as MaxAnswerScore,
+           avg(a.Score) as AvgAnswerScore,
+           bool_or(a.OwnerUserId is null) as HasAnonymousAnswer
+    from Posts a
+    where a.PostTypeId = 2
+    group by a.ParentId
+),
+QuestionCommentsAgg as (
+    select c.PostId,
+           count(c.Id) as TotalComments,
+           sum(coalesce(c.Score,0)) as CommentsScoreSum,
+           string_agg(distinct coalesce(c.UserDisplayName, 'Anonymous') within group (order by coalesce(c.UserDisplayName, 'Anonymous')), ', ') as Commenters
+    from Comments c
+    group by c.PostId
+),
+RecursivePostLinks as (
+    select pl.PostId, pl.RelatedPostId, pl.LinkTypeId, 1 as Depth
+    from PostLinks pl
+    where pl.LinkTypeId = 1
+    union all
+    select pl.PostId, pl.RelatedPostId, pl.LinkTypeId, rpl.Depth + 1
+    from PostLinks pl
+    join RecursivePostLinks rpl on pl.PostId = rpl.RelatedPostId
+    where pl.LinkTypeId = 1 and rpl.Depth < 3
+),
+QuestionPostWithMetadata as (
+    select q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount, q.Tags, q.OwnerUserId,
+           ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges,
+           asv.PositiveAnswerCount, asv.NonPositiveAnswerCount, asv.MaxAnswerScore, asv.AvgAnswerScore, asv.HasAnonymousAnswer,
+           qca.TotalComments, qca.CommentsScoreSum, qca.Commenters,
+           row_number() over (partition by q.OwnerUserId order by q.CreationDate desc) as UserLatestQuestionRank
+    from Posts q
+    left join UserBadgeCounts ub on ub.UserId = q.OwnerUserId
+    left join AnswerStats asv on asv.QuestionId = q.Id
+    left join QuestionCommentsAgg qca on qca.PostId = q.Id
+    where q.PostTypeId = 1
+),
+TaggedQuestionDetails as (
+    select q.Id as QuestionId, q.Title, q.CreationDate, q.Score, q.ViewCount, unnest(array_remove(string_to_array(substring(q.Tags from 2 for length(q.Tags)-2), '><'), '')) as Tag,
+           q.GoldBadges, q.SilverBadges, q.BronzeBadges,
+           q.PositiveAnswerCount, q.NonPositiveAnswerCount, q.MaxAnswerScore, q.AvgAnswerScore, q.HasAnonymousAnswer,
+           q.TotalComments, q.CommentsScoreSum, q.Commenters,
+           q.UserLatestQuestionRank
+    from QuestionPostWithMetadata q
+    where q.UserLatestQuestionRank <= 5
+),
+TagAggregates as (
+    select t.TagName,
+           count(distinct tq.QuestionId) as QuestionCount,
+           avg(tq.Score) as AvgQuestionScore,
+           avg(tq.ViewCount) as AvgQuestionViews,
+           avg(tq.PositiveAnswerCount) as AvgPositiveAnswers,
+           avg(tq.NonPositiveAnswerCount) as AvgNonPositiveAnswers,
+           sum(coalesce(tq.GoldBadges,0)) as TotalGoldBadgesOfAskers,
+           sum(coalesce(tq.SilverBadges,0)) as TotalSilverBadgesOfAskers,
+           sum(coalesce(tq.BronzeBadges,0)) as TotalBronzeBadgesOfAskers,
+           avg(coalesce(tq.AvgAnswerScore,0)) as AvgAnswerScorePerQuestion
+    from TaggedQuestionDetails tq
+    join Tags t on t.TagName = tq.Tag
+    group by t.TagName
+),
+DuplicatedLinkedQuestions as (
+    select distinct pl.PostId as QuestionId, pl.RelatedPostId as DuplicateOfQuestionId
+    from PostLinks pl
+    where pl.LinkTypeId = 3
+      and exists(select 1 from Posts p where p.Id = pl.PostId and p.PostTypeId = 1)
+      and exists(select 1 from Posts p2 where p2.Id = pl.RelatedPostId and p2.PostTypeId = 1)
+)
+select t.TagName, t.QuestionCount, t.AvgQuestionScore, t.AvgQuestionViews, 
+       t.AvgPositiveAnswers, t.AvgNonPositiveAnswers, t.TotalGoldBadgesOfAskers, t.TotalSilverBadgesOfAskers, t.TotalBronzeBadgesOfAskers, t.AvgAnswerScorePerQuestion,
+       coalesce(dq.DuplicateOfQuestionId, -1) as SampleDuplicateQuestionId,
+       coalesce(q.Title, '(no duplicate question found)') as SampleDuplicateTitle,
+       substr(coalesce(q.Body,''), 1, 100) as DuplicateExcerpt,
+       case when tq.HasAnonymousAnswer then 'Yes' else 'No' end as HasAnonymousAnswersInSample,
+       tq.UserLatestQuestionRank
+from TagAggregates t
+left join DuplicatedLinkedQuestions dq on dq.QuestionId = (
+    select QuestionId from TaggedQuestionDetails
+    where Tag = t.TagName
+    order by CreationDate desc, QuestionId desc
+    limit 1
+)
+left join Posts q on q.Id = dq.DuplicateOfQuestionId
+left join TaggedQuestionDetails tq on tq.QuestionId = dq.QuestionId
+where t.QuestionCount > 50
+order by t.QuestionCount desc, t.AvgQuestionScore desc
+limit 50;

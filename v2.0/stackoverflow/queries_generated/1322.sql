@@ -1,0 +1,165 @@
+-- {"query": "1322.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2462} 
+
+WITH UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views AS UserViews,
+        u.UpVotes AS UserUpVotes,
+        u.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsAsked,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersProvided,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId IN (1, 2)) AS AvgPostScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        MIN(p.CreationDate) AS FirstPostDate,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.CreationDate >= '2020-01-01'
+    LEFT JOIN Comments c ON u.Id = c.UserId AND c.CreationDate >= '2020-01-01'
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= '2019-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+    HAVING COUNT(DISTINCT p.Id) > 3 OR COUNT(DISTINCT c.Id) > 5
+),
+PostEditEvolution AS (
+    SELECT
+        ph.PostId,
+        ph.CreationDate AS EditDate,
+        ph.PostHistoryTypeId,
+        pht.Name AS HistoryTypeName,
+        ph.Text AS CurrentText,
+        LAG(ph.Text, 1, '') OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate ASC) AS PreviousText,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId, ph.PostHistoryTypeId ORDER BY ph.CreationDate DESC) AS rn_latest_edit
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    WHERE ph.PostHistoryTypeId IN (2, 5) -- Initial Body (2) and Edit Body (5)
+),
+PostEditAggregations AS (
+    SELECT
+        pee.PostId,
+        MAX(CASE WHEN pee.PostHistoryTypeId = 2 THEN LENGTH(pee.CurrentText) ELSE 0 END) AS InitialBodyLength,
+        MAX(CASE WHEN pee.PostHistoryTypeId = 5 THEN LENGTH(pee.CurrentText) ELSE 0 END) AS LatestBodyLength,
+        COUNT(DISTINCT pee.EditDate) FILTER (WHERE pee.PostHistoryTypeId = 5) AS TotalBodyEdits,
+        MAX(ABS(LENGTH(pee.CurrentText) - LENGTH(pee.PreviousText))) FILTER (WHERE pee.PostHistoryTypeId = 5 AND LENGTH(pee.PreviousText) > 0) AS MaxAbsBodyLengthChange,
+        MAX(
+            CASE
+                WHEN pee.PostHistoryTypeId = 5 AND LENGTH(pee.PreviousText) > 0 THEN ABS(CAST(LENGTH(pee.CurrentText) AS DECIMAL) - LENGTH(pee.PreviousText)) / LENGTH(pee.PreviousText)
+                ELSE 0
+            END
+        ) AS MaxRelativeBodyChange
+    FROM PostEditEvolution pee
+    WHERE pee.rn_latest_edit = 1
+    GROUP BY pee.PostId
+),
+BasePostMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.Title,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        COALESCE(p.ViewCount, 0) AS ViewCount,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+        p.OwnerUserId,
+        p.LastActivityDate,
+        p.ClosedDate,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVoteCount,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownVoteCount,
+        (SELECT COUNT(pl.RelatedPostId) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 1) AS LinkedPostsCount,
+        (SELECT COUNT(pl.RelatedPostId) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3) AS DuplicatePostsCount,
+        p.Tags
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Votes v ON p.Id = v.PostId AND v.CreationDate >= '2020-01-01'
+    WHERE p.CreationDate >= '2021-01-01'
+    GROUP BY
+        p.Id, p.PostTypeId, pt.Name, p.Title, p.CreationDate, p.Score, p.ViewCount,
+        p.AnswerCount, p.FavoriteCount, p.OwnerUserId, p.LastActivityDate, p.ClosedDate, p.Tags
+),
+HighValueQuestions AS (
+    SELECT
+        bpm.*,
+        'High-Value Question' AS PostCategory,
+        uas.DisplayName AS OwnerDisplayName,
+        uas.Reputation AS OwnerReputation,
+        uas.GoldBadges AS OwnerGoldBadges,
+        EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = bpm.OwnerUserId AND b.Class = 1 AND b.Date >= bpm.PostCreationDate AND b.Date <= bpm.PostCreationDate + INTERVAL '120 days') AS OwnerGotGoldBadgeAfterPost
+    FROM BasePostMetrics bpm
+    LEFT JOIN UserActivitySummary uas ON bpm.OwnerUserId = uas.UserId
+    WHERE bpm.PostTypeId = 1
+      AND bpm.ViewCount > 500
+      AND bpm.AnswerCount >= 2
+      AND (bpm.UpVoteCount - bpm.DownVoteCount) > 10
+      AND (bpm.Tags ILIKE '%<sql>%' OR bpm.Tags ILIKE '%<database>%' OR bpm.Tags ILIKE '%<performance>%')
+),
+HighValueAnswers AS (
+    SELECT
+        bpm.*,
+        'High-Value Answer' AS PostCategory,
+        uas.DisplayName AS OwnerDisplayName,
+        uas.Reputation AS OwnerReputation,
+        uas.GoldBadges AS OwnerGoldBadges,
+        EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = bpm.OwnerUserId AND b.Class = 1 AND b.Date >= bpm.PostCreationDate AND b.Date <= bpm.PostCreationDate + INTERVAL '120 days') AS OwnerGotGoldBadgeAfterPost
+    FROM BasePostMetrics bpm
+    LEFT JOIN UserActivitySummary uas ON bpm.OwnerUserId = uas.UserId
+    WHERE bpm.PostTypeId = 2
+      AND bpm.PostScore > 50
+      AND (bpm.Tags ILIKE '%<sql>%' OR bpm.Tags ILIKE '%<database>%' OR bpm.Tags ILIKE '%<performance>%')
+),
+CombinedHighValuePosts AS (
+    SELECT * FROM HighValueQuestions
+    UNION ALL
+    SELECT * FROM HighValueAnswers
+)
+SELECT
+    chvp.PostId,
+    chvp.PostTypeName,
+    chvp.PostCategory,
+    chvp.Title,
+    chvp.PostCreationDate,
+    chvp.OwnerDisplayName,
+    chvp.OwnerReputation,
+    chvp.OwnerGoldBadges,
+    chvp.OwnerGotGoldBadgeAfterPost,
+    chvp.PostScore,
+    chvp.ViewCount,
+    chvp.AnswerCount,
+    chvp.FavoriteCount,
+    chvp.UpVoteCount,
+    chvp.DownVoteCount,
+    (chvp.UpVoteCount - chvp.DownVoteCount) AS NetVotes,
+    (CASE
+        WHEN chvp.ViewCount > 0 THEN CAST(chvp.AnswerCount AS DECIMAL) / chvp.ViewCount
+        ELSE 0
+    END) AS AnswerToViewRatio,
+    COALESCE(DATE_PART('day', chvp.LastActivityDate - chvp.PostCreationDate), 0) AS DaysActiveSinceCreation,
+    COALESCE(pea.InitialBodyLength, 0) AS InitialBodyLength,
+    COALESCE(pea.LatestBodyLength, 0) AS LatestBodyLength,
+    COALESCE(pea.TotalBodyEdits, 0) AS TotalBodyEdits,
+    COALESCE(pea.MaxRelativeBodyChange, 0) AS MaxBodyEditRelativeChange,
+    DENSE_RANK() OVER (PARTITION BY chvp.PostTypeId ORDER BY chvp.PostScore DESC, chvp.FavoriteCount DESC) AS RankByScoreAndFavorites,
+    NTILE(100) OVER (ORDER BY (chvp.UpVoteCount - chvp.DownVoteCount) DESC, chvp.PostScore DESC) AS NetVotePercentile,
+    AVG(chvp.PostScore) OVER (PARTITION BY chvp.OwnerUserId ORDER BY chvp.PostCreationDate ASC ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) AS OwnerAvgScoreLastFourPosts,
+    COALESCE(chvp.Tags, '') AS RawTags,
+    CASE
+        WHEN chvp.ClosedDate IS NOT NULL AND chvp.PostTypeId = 1 THEN 'Closed'
+        WHEN chvp.OwnerReputation < 1000 AND chvp.OwnerUserId IS NOT NULL THEN 'Low-Rep Owner'
+        WHEN chvp.OwnerUserId IS NULL THEN 'Community Owned'
+        ELSE 'Active'
+    END AS PostStatusFlag
+FROM CombinedHighValuePosts chvp
+LEFT JOIN PostEditAggregations pea ON chvp.PostId = pea.PostId
+WHERE
+    chvp.OwnerUserId IS NOT NULL
+    AND chvp.OwnerReputation IS NOT NULL AND chvp.OwnerReputation > 100
+    AND (chvp.LinkedPostsCount > 0 OR chvp.DuplicatePostsCount > 0 OR chvp.FavoriteCount > 0)
+ORDER BY
+    NetVotePercentile ASC, chvp.PostCreationDate DESC
+LIMIT 500;

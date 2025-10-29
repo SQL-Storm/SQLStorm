@@ -1,0 +1,251 @@
+-- {"query": "7734.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2573} 
+WITH UserPostStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS TotalQuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS TotalAnswerScore,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) AS AvgAnswerScore,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        TotalPosts,
+        Questions,
+        Answers,
+        TotalQuestionScore,
+        TotalAnswerScore,
+        AvgQuestionScore,
+        AvgAnswerScore,
+        LastPostDate,
+        ROW_NUMBER() OVER (ORDER BY TotalQuestionScore DESC) AS QScoreRank,
+        ROW_NUMBER() OVER (ORDER BY TotalAnswerScore DESC) AS AScoreRank
+    FROM UserPostStats
+),
+PostStats AS (
+    SELECT 
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.ParentId,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        COALESCE(LENGTH(p.Body) - LENGTH(REPLACE(p.Body, '<p>', '')), 0) AS ParagraphCount,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags != '' THEN 
+                ARRAY_LENGTH(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><'), 1)
+            ELSE 0 
+        END AS TagCount,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags != '' THEN 
+                LOWER(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2))
+            ELSE ''
+        END AS LowerTags,
+        DATEDIFF('day', p.CreationDate, NOW()) AS DaysSinceCreation,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NULL AND p.AnswerCount > 0 THEN 'Unanswered'
+            ELSE 'Question'
+        END AS QuestionStatus
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) AND p.CreationDate >= '2020-01-01'
+),
+TopPosts AS (
+    SELECT 
+        ps.PostId,
+        ps.Title,
+        ps.Score,
+        ps.ViewCount,
+        ps.CreationDate,
+        ps.OwnerUserId,
+        ps.AnswerCount,
+        ps.CommentCount,
+        ps.FavoriteCount,
+        ps.ParagraphCount,
+        ps.TagCount,
+        ps.LowerTags,
+        ps.DaysSinceCreation,
+        ps.QuestionStatus,
+        ROW_NUMBER() OVER (ORDER BY ps.Score DESC) AS ScoreRank,
+        ROW_NUMBER() OVER (ORDER BY ps.ViewCount DESC) AS ViewRank
+    FROM PostStats ps
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        COUNT(DISTINCT ph.Id) AS HistoryCount,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS UpvoteCount,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS DownvoteCount,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 5 THEN v.Id END) AS BookmarkCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesReceived,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesReceived,
+        AVG(CASE WHEN v.VoteTypeId IN (2,3) THEN COALESCE(v.BountyAmount, 0) ELSE 0 END) AS AvgBountyAmount,
+        (COUNT(DISTINCT c.Id) + COUNT(DISTINCT v.Id)) AS TotalActivity,
+        CASE 
+            WHEN COUNT(DISTINCT v.Id) > 0 THEN 
+                (COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) * 100.0 / COUNT(DISTINCT v.Id))
+            ELSE 0 
+        END AS UpvotePercentage
+    FROM Users u
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    WHERE u.Id IS NOT NULL AND u.CreationDate >= '2019-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(DISTINCT v.Id) > 0 OR COUNT(DISTINCT c.Id) > 0
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        CASE 
+            WHEN t.Count > 100 THEN 'Popular'
+            WHEN t.Count > 50 THEN 'Moderate'
+            ELSE 'Rare'
+        END AS PopularityLevel,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS PopularityRank
+    FROM Tags t
+    WHERE t.Count > 0
+)
+SELECT 
+    CONCAT('Top User: ', tu.DisplayName, ' (Rank: ', tu.QScoreRank, ')') AS TopUser,
+    CONCAT('Top Post: ', tp.Title, ' (Score: ', tp.Score, ')') AS TopPostInfo,
+    CONCAT('User Activity: ', ua.DisplayName, ' (Activity: ', ua.TotalActivity, ')') AS UserActivityInfo,
+    ta.TagName,
+    ta.Count AS TagCount,
+    CASE 
+        WHEN ua.UpvotePercentage > 80 THEN 'High Upvote Ratio'
+        WHEN ua.UpvotePercentage > 60 THEN 'Moderate Upvote Ratio'
+        ELSE 'Low Upvote Ratio'
+    END AS UpvoteRatioCategory,
+    CASE 
+        WHEN tu.TotalQuestionScore / NULLIF(tu.TotalAnswerScore, 0) > 2 THEN 'Question Focused'
+        WHEN tu.TotalAnswerScore / NULLIF(tu.TotalQuestionScore, 0) > 2 THEN 'Answer Focused'
+        ELSE 'Balanced'
+    END AS UserFocus,
+    CASE 
+        WHEN tp.DaysSinceCreation < 30 THEN 'New'
+        WHEN tp.DaysSinceCreation < 90 THEN 'Recent'
+        WHEN tp.DaysSinceCreation < 365 THEN 'Old'
+        ELSE 'Very Old'
+    END AS PostAgeGroup,
+    CASE 
+        WHEN tp.Score > 100 THEN 'Highly Ranked'
+        WHEN tp.Score > 50 THEN 'Moderately Ranked'
+        ELSE 'Lower Ranked'
+    END AS PostRanking,
+    CASE 
+        WHEN tp.ViewCount > 1000 THEN 'High View Count'
+        WHEN tp.ViewCount > 500 THEN 'Moderate View Count'
+        ELSE 'Low View Count'
+    END AS ViewCategory,
+    CASE 
+        WHEN LENGTH(tp.Body) > 2000 THEN 'Long Post'
+        WHEN LENGTH(tp.Body) > 1000 THEN 'Medium Post'
+        ELSE 'Short Post'
+    END AS PostLength,
+    CASE 
+        WHEN tp.TagCount > 5 THEN 'Tag Rich'
+        WHEN tp.TagCount > 2 THEN 'Tag Moderate'
+        ELSE 'Tag Sparse'
+    END AS TagDensity,
+    CASE 
+        WHEN tp.QuestionStatus = 'Answered' THEN 'Answered Question'
+        WHEN tp.QuestionStatus = 'Unanswered' THEN 'Unanswered Question'
+        ELSE 'Other Post Type'
+    END AS QuestionFocus,
+    CASE 
+        WHEN ua.VoteCount > 500 THEN 'Very Active'
+        WHEN ua.VoteCount > 200 THEN 'Active'
+        WHEN ua.VoteCount > 50 THEN 'Moderately Active'
+        ELSE 'Inactive'
+    END AS UserActivityLevel,
+    CASE 
+        WHEN tu.Reputation > 50000 THEN 'Elite'
+        WHEN tu.Reputation > 10000 THEN 'Advanced'
+        WHEN tu.Reputation > 1000 THEN 'Intermediate'
+        ELSE 'Beginner'
+    END AS UserReputationLevel,
+    CASE 
+        WHEN ta.PopularityLevel = 'Popular' THEN 'Highly Popular'
+        WHEN ta.PopularityLevel = 'Moderate' THEN 'Moderately Popular'
+        ELSE 'Rare'
+    END AS TagPopularityStatus,
+    CASE 
+        WHEN tp.AnswerCount > 10 THEN 'Highly Answered'
+        WHEN tp.AnswerCount > 5 THEN 'Moderately Answered'
+        WHEN tp.AnswerCount > 0 THEN 'Slightly Answered'
+        ELSE 'No Answers'
+    END AS AnswerStatus,
+    CASE 
+        WHEN tp.CommentCount > 50 THEN 'Highly Commented'
+        WHEN tp.CommentCount > 20 THEN 'Moderately Commented'
+        WHEN tp.CommentCount > 5 THEN 'Slightly Commented'
+        ELSE 'No Comments'
+    END AS CommentStatus,
+    CASE 
+        WHEN tp.FavoriteCount > 100 THEN 'Highly Favorited'
+        WHEN tp.FavoriteCount > 50 THEN 'Moderately Favorited'
+        WHEN tp.FavoriteCount > 10 THEN 'Slightly Favorited'
+        ELSE 'No Favorites'
+    END AS FavoriteStatus,
+    CASE 
+        WHEN tp.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'Above Average'
+        WHEN tp.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) * 0.8 THEN 'Below Average'
+        ELSE 'Below Average'
+    END AS ScoreComparison,
+    CASE 
+        WHEN tp.ViewCount > (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = 1) THEN 'Above Average Views'
+        WHEN tp.ViewCount > (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = 1) * 0.8 THEN 'Below Average Views'
+        ELSE 'Below Average Views'
+    END AS ViewComparison,
+    CASE 
+        WHEN ua.CommentCount > (SELECT AVG(CommentCount) FROM (SELECT COUNT(*) AS CommentCount FROM Comments GROUP BY UserId) c) THEN 'Above Average Commenter'
+        ELSE 'Below Average Commenter'
+    END AS CommentComparison,
+    CASE 
+        WHEN tu.TotalPosts > (SELECT AVG(TotalPosts) FROM (SELECT COUNT(*) AS TotalPosts FROM Posts GROUP BY OwnerUserId) p) THEN 'Above Average Post Creator'
+        ELSE 'Below Average Post Creator'
+    END AS PostCreationComparison
+FROM TopUsers tu
+JOIN TopPosts tp ON tp.ScoreRank <= 5
+JOIN UserActivity ua ON ua.UserId = tu.UserId
+JOIN TagAnalysis ta ON ta.PopularityRank <= 10
+WHERE tu.QScoreRank <= 5
+  AND tp.ViewRank <= 5
+  AND ua.TotalActivity > 100
+  AND ta.Count > 50
+  AND tp.QuestionStatus IN ('Answered', 'Unanswered')
+  AND tu.Reputation > 1000
+  AND tp.Score > 0
+  AND tp.ViewCount > 0
+  AND tp.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1)
+ORDER BY tu.QScoreRank, tp.Score DESC, ua.TotalActivity DESC
+LIMIT 100;

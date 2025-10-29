@@ -1,0 +1,138 @@
+-- {"query": "3180.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2325} 
+
+WITH
+    -- User aggregated statistics
+    user_stats AS (
+        SELECT
+            u.Id                                 AS user_id,
+            u.DisplayName,
+            u.Reputation,
+            COALESCE(SUM(CASE
+                WHEN v.VoteTypeId = 2 THEN 1          -- UpMod
+                WHEN v.VoteTypeId = 3 THEN -1         -- DownMod
+                ELSE 0
+            END), 0)                              AS net_vote_score,
+            COUNT(DISTINCT b.Id)                AS badge_count,
+            MAX(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS has_gold_badge,
+            ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS reputation_rank
+        FROM Users u
+        LEFT JOIN Votes v   ON v.UserId   = u.Id
+        LEFT JOIN Badges b  ON b.UserId   = u.Id
+        GROUP BY u.Id, u.DisplayName, u.Reputation
+    ),
+
+    -- Question level details with windowed ranking per owner
+    question_details AS (
+        SELECT
+            p.Id                                 AS question_id,
+            p.Title,
+            p.CreationDate,
+            p.Score,
+            p.ViewCount,
+            p.OwnerUserId,
+            p.Tags,
+            /* correlated subqueries for counts */
+            (SELECT COUNT(*) FROM Posts a
+                WHERE a.ParentId = p.Id AND a.PostTypeId = 2) AS answer_count,
+            (SELECT COUNT(*) FROM Comments c
+                WHERE c.PostId = p.Id)               AS comment_count,
+            ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId
+                               ORDER BY p.Score DESC) AS owner_question_rank,
+            ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.ViewCount DESC) AS global_question_rank
+        FROM Posts p
+        WHERE p.PostTypeId = 1      -- only questions
+    ),
+
+    -- Tag statistics using string parsing
+    tag_stats AS (
+        SELECT
+            t.TagName,
+            COUNT(p.Id)                                        AS question_using_tag,
+            SUM(p.Score)                                       AS total_score,
+            PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) OVER (PARTITION BY t.TagName) AS median_score,
+            ROW_NUMBER() OVER (ORDER BY COUNT(p.Id) DESC)      AS tag_popularity_rank
+        FROM Tags t
+        JOIN Posts p
+          ON p.Tags LIKE CONCAT('%', t.TagName, '%')
+         AND p.PostTypeId = 1
+        GROUP BY t.TagName
+    ),
+
+    -- Extract the most frequent tag per question (LATERAL join)
+    top_tag_per_question AS (
+        SELECT
+            q.question_id,
+            tt.tagname
+        FROM question_details q
+        LEFT JOIN LATERAL (
+            SELECT
+                t.TagName AS tagname,
+                ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS rn
+            FROM regexp_split_to_table(q.Tags, '[><]+') AS split(tag)
+            JOIN Tags t ON t.TagName = split.tag
+            ORDER BY t.Count DESC
+            LIMIT 1
+        ) tt ON true
+    )
+
+-- Final composition with UNION ALL to also include hot unanswered questions
+SELECT
+    q.question_id,
+    q.Title,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    q.answer_count,
+    q.comment_count,
+    u.DisplayName,
+    u.Reputation,
+    u.net_vote_score,
+    u.badge_count,
+    u.has_gold_badge,
+    t.tagname                           AS top_tag,
+    ts.question_using_tag,
+    ts.total_score,
+    ts.median_score,
+    CASE
+        WHEN q.Score IS NULL       THEN 'NoScore'
+        WHEN q.Score < 0           THEN 'Negative'
+        ELSE                           'Positive'
+    END                                 AS score_sign,
+    COALESCE(NULLIF(q.answer_count,0), -1) AS answer_count_or_minus_one,
+    q.global_question_rank
+FROM question_details q
+LEFT JOIN user_stats u        ON u.user_id = q.OwnerUserId
+LEFT JOIN top_tag_per_question t ON t.question_id = q.question_id
+LEFT JOIN tag_stats ts        ON ts.TagName = t.tagname
+WHERE q.owner_question_rank <= 3
+
+UNION ALL
+
+SELECT
+    p.Id                                 AS question_id,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    NULL                                 AS answer_count,
+    NULL                                 AS comment_count,
+    NULL                                 AS DisplayName,
+    NULL                                 AS Reputation,
+    NULL                                 AS net_vote_score,
+    NULL                                 AS badge_count,
+    NULL                                 AS has_gold_badge,
+    NULL                                 AS top_tag,
+    NULL                                 AS question_using_tag,
+    NULL                                 AS total_score,
+    NULL                                 AS median_score,
+    'Unanswered'                         AS score_sign,
+    NULL                                 AS answer_count_or_minus_one,
+    ROW_NUMBER() OVER (ORDER BY p.ViewCount DESC) AS global_question_rank
+FROM Posts p
+WHERE p.PostTypeId = 1
+  AND NOT EXISTS (SELECT 1 FROM Posts a WHERE a.ParentId = p.Id AND a.PostTypeId = 2)
+  AND p.Score > 0
+  AND p.CreationDate > CURRENT_DATE - INTERVAL '30 days'
+
+ORDER BY global_question_rank
+LIMIT 100;

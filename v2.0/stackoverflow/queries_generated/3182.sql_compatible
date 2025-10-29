@@ -1,0 +1,151 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT b.Id)                         AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(u.LastAccessDate)                        AS LastSeen,
+        COALESCE(u.Location, 'Unknown')               AS Location
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.LastAccessDate, u.Location
+),
+
+PostMetrics AS (
+    SELECT 
+        p.OwnerUserId                                   AS UserId,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END)    AS QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END)    AS AnswerCount,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) AS AvgAnswerScore,
+        MAX(p.CreationDate)                            AS LastPostDate,
+        -- standard SQL: split tags by '><' into individual tags, remove angle brackets and aggregate distinct
+        LISTAGG(DISTINCT TRIM(BOTH '<' FROM TRIM(BOTH '>' FROM tag)), ',') WITHIN GROUP (ORDER BY tag) AS AllTags
+    FROM (
+        SELECT p.*,
+               REGEXP_SUBSTR(p.Tags, '[^><]+', 1, seq) AS tag
+        FROM Posts p
+        JOIN (
+            SELECT LEVEL AS seq FROM (SELECT 1 FROM DUAL) CONNECT BY LEVEL <= 100
+        ) seqs ON REGEXP_SUBSTR(p.Tags, '[^><]+', 1, seqs.seq) IS NOT NULL
+    ) p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+
+TagInfo AS (
+    SELECT 
+        t.TagName,
+        t.Count       AS TagUsage,
+        COALESCE(e.Title, w.Title) AS TagTitle
+    FROM Tags t
+    LEFT JOIN Posts e ON e.Id = t.ExcerptPostId
+    LEFT JOIN Posts w ON w.Id = t.WikiPostId
+    WHERE COALESCE(t.IsModeratorOnly, 0) = 0
+),
+
+UserTagCross AS (
+    SELECT 
+        us.Id        AS UserId,
+        us.DisplayName,
+        tag.tag AS TagName,
+        ROW_NUMBER() OVER (PARTITION BY us.Id ORDER BY pm.AnswerCount DESC) AS TagRank
+    FROM UserStats us
+    JOIN PostMetrics pm ON pm.UserId = us.Id
+    JOIN (
+        SELECT UserId, TRIM(tag) AS tag
+        FROM (
+            SELECT UserId, REGEXP_SUBSTR(AllTags, '[^,]+', 1, seq) AS tag
+            FROM (
+                SELECT UserId, AllTags FROM PostMetrics
+            ) t
+            JOIN (
+                SELECT LEVEL AS seq FROM (SELECT 1 FROM DUAL) CONNECT BY LEVEL <= 100
+            ) seqs ON REGEXP_SUBSTR(AllTags, '[^,]+', 1, seqs.seq) IS NOT NULL
+        )
+    ) tag ON tag.UserId = pm.UserId
+    WHERE pm.AllTags IS NOT NULL
+),
+
+RecentVotes AS (
+    SELECT 
+        v.PostId,
+        v.VoteTypeId,
+        COUNT(*)               AS VoteCount,
+        MAX(v.CreationDate)    AS LastVoteDate
+    FROM Votes v
+    WHERE v.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '30' DAY
+    GROUP BY v.PostId, v.VoteTypeId
+),
+
+CombinedVotes AS (
+    SELECT 
+        v.PostId,
+        SUM(v.VoteCount)      AS TotalVotes,
+        MAX(v.LastVoteDate)   AS LastVoteDate
+    FROM RecentVotes v
+    GROUP BY v.PostId
+),
+
+Combined AS (
+    SELECT 
+        us.Id,
+        us.DisplayName,
+        us.Reputation,
+        us.BadgeCount,
+        us.GoldBadges,
+        us.SilverBadges,
+        us.BronzeBadges,
+        us.Location,
+        COALESCE(pm.QuestionCount,0)               AS QuestionCount,
+        COALESCE(pm.AnswerCount,0)                 AS AnswerCount,
+        ROUND(COALESCE(pm.AvgQuestionScore,0),2)   AS AvgQuestionScore,
+        ROUND(COALESCE(pm.AvgAnswerScore,0),2)     AS AvgAnswerScore,
+        pm.LastPostDate,
+        us.LastSeen,
+        CASE
+            WHEN us.Reputation > 20000 THEN 'Legendary'
+            WHEN us.Reputation > 10000 THEN 'Expert'
+            WHEN us.Reputation > 2000  THEN 'Contributor'
+            ELSE 'Novice'
+        END                                        AS ReputationTier,
+        cv.TotalVotes,
+        cv.LastVoteDate
+    FROM UserStats us
+    LEFT JOIN PostMetrics pm ON pm.UserId = us.Id
+    LEFT JOIN CombinedVotes cv ON cv.PostId = pm.UserId
+)
+
+SELECT *
+FROM Combined
+WHERE ReputationTier <> 'Novice'
+  AND (QuestionCount + AnswerCount) > 10
+  AND COALESCE(BadgeCount,0) >= 1
+ORDER BY Reputation DESC NULLS LAST, BadgeCount DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT 
+    CAST(NULL AS INTEGER) AS Id,
+    'Aggregates' AS DisplayName,
+    CAST(NULL AS INTEGER) AS Reputation,
+    SUM(BadgeCount)               AS BadgeCount,
+    CAST(NULL AS INTEGER) AS GoldBadges,
+    CAST(NULL AS INTEGER) AS SilverBadges,
+    CAST(NULL AS INTEGER) AS BronzeBadges,
+    CAST(NULL AS VARCHAR(4000)) AS Location,
+    SUM(QuestionCount)            AS QuestionCount,
+    SUM(AnswerCount)              AS AnswerCount,
+    CAST(NULL AS NUMERIC) AS AvgQuestionScore,
+    CAST(NULL AS NUMERIC) AS AvgAnswerScore,
+    MAX(LastPostDate)             AS LastPostDate,
+    MAX(LastSeen)                 AS LastSeen,
+    CAST(NULL AS VARCHAR(50)) AS ReputationTier,
+    CAST(NULL AS INTEGER) AS TotalVotes,
+    CAST(NULL AS TIMESTAMP) AS LastVoteDate
+FROM Combined
+WHERE ReputationTier <> 'Novice';

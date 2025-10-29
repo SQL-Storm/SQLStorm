@@ -1,0 +1,227 @@
+WITH RelevantPosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.Title,
+    p.Tags,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.AcceptedAnswerId,
+    p.ParentId,
+    p.Body,
+    p.LastEditorUserId,
+    p.LastEditDate,
+    p.ContentLicense,
+    p.OwnerDisplayName,
+    p.LastEditorDisplayName
+  FROM Posts p
+  WHERE p.PostTypeId IN (1, 2)
+),
+UserStats AS (
+  SELECT
+    u.Id AS UserId,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.DisplayName,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.ProfileImageUrl,
+    u.AccountId,
+    COALESCE(bc.CountBadges,0) AS BadgeCount
+  FROM Users u
+  LEFT JOIN (
+    SELECT UserId, COUNT(*) AS CountBadges
+    FROM Badges
+    GROUP BY UserId
+  ) bc ON bc.UserId = u.Id
+),
+ActivityWindow AS (
+  SELECT
+    rp.PostId,
+    rp.OwnerUserId,
+    rp.Title,
+    rp.Tags,
+    rp.Score,
+    rp.ViewCount,
+    rp.CreationDate,
+    rp.LastActivityDate,
+    rp.CommentCount,
+    rp.FavoriteCount,
+    rp.AcceptedAnswerId,
+    rp.ParentId,
+    rp.Body,
+    rp.LastEditorUserId,
+    rp.LastEditDate,
+    rp.ContentLicense,
+    rp.OwnerDisplayName,
+    rp.LastEditorDisplayName,
+    vr.UserId AS VoterUserId,
+    vt.Name AS VoteTypeName,
+    vt.Id AS VoteTypeId,
+    v.CreationDate AS VoteDate,
+    v.BountyAmount
+  FROM RelevantPosts rp
+  LEFT JOIN Votes v
+    ON v.PostId = rp.PostId
+  LEFT JOIN VoteTypes vt
+    ON v.VoteTypeId = vt.Id
+  LEFT JOIN (
+    SELECT DISTINCT UserId, PostId
+    FROM Votes
+  ) vr ON vr.PostId = rp.PostId
+),
+PostVoteTotals AS (
+  SELECT
+    p.PostId,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesOnPost,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesOnPost
+  FROM RelevantPosts p
+  LEFT JOIN Votes v ON v.PostId = p.PostId
+  GROUP BY p.PostId
+),
+ComplexAggregates AS (
+  SELECT
+    p.PostId,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.Title,
+    p.Tags,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.AcceptedAnswerId,
+    p.ParentId,
+    p.Body,
+    p.LastEditorUserId,
+    p.LastEditDate,
+    p.ContentLicense,
+    p.OwnerDisplayName,
+    p.LastEditorDisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    u.LastAccessDate,
+    u.DisplayName AS UserDisplayName,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.ProfileImageUrl,
+    u.AccountId,
+    COALESCE(b.CountBadges,0) AS BadgeCount,
+    COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVotesGiven,
+    COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVotesGiven,
+    MIN(CASE WHEN v.VoteTypeId = 2 THEN v.CreationDate END) AS FirstUpVoteDate,
+    MAX(p.LastActivityDate) AS LastActive
+  FROM RelevantPosts p
+  LEFT JOIN UserStats u ON u.UserId = COALESCE(p.OwnerUserId, -1)
+  LEFT JOIN Votes v ON v.PostId = p.PostId
+  LEFT JOIN (
+    SELECT UserId, COUNT(*) AS CountBadges
+    FROM Badges
+    GROUP BY UserId
+  ) b ON b.UserId = p.OwnerUserId
+  GROUP BY
+    p.PostId, p.PostTypeId, p.OwnerUserId, p.Title, p.Tags, p.Score, p.ViewCount, p.CreationDate,
+    p.LastActivityDate, p.CommentCount, p.FavoriteCount, p.AcceptedAnswerId, p.ParentId, p.Body,
+    p.LastEditorUserId, p.LastEditDate, p.ContentLicense, p.OwnerDisplayName, p.LastEditorDisplayName,
+    u.Reputation, u.CreationDate, u.LastAccessDate, u.DisplayName, u.Location, u.Views, u.UpVotes, u.DownVotes,
+    u.ProfileImageUrl, u.AccountId, b.CountBadges
+),
+FinalSelect AS (
+  SELECT
+    ca.PostId,
+    ca.PostTypeId,
+    ca.OwnerUserId,
+    ca.Title,
+    ca.Tags,
+    ca.Score,
+    ca.ViewCount,
+    ca.CreationDate,
+    ca.LastActivityDate,
+    ca.CommentCount,
+    ca.FavoriteCount,
+    ca.AcceptedAnswerId,
+    ca.ParentId,
+    ca.Body,
+    ca.LastEditorUserId,
+    ca.LastEditDate,
+    ca.ContentLicense,
+    ca.OwnerDisplayName,
+    ca.LastEditorDisplayName,
+    ca.Reputation,
+    ca.UserCreationDate,
+    ca.LastAccessDate,
+    ca.UserDisplayName,
+    ca.Location,
+    ca.Views,
+    ca.UpVotes,
+    ca.DownVotes,
+    ca.ProfileImageUrl,
+    ca.AccountId,
+    ca.BadgeCount,
+    COALESCE(pt.TotalUpvotesOnPost, 0) AS TotalUpvotesOnPost,
+    COALESCE(pt.TotalDownvotesOnPost, 0) AS TotalDownvotesOnPost,
+    (CASE
+       WHEN ca.PostTypeId = 1 THEN ca.Title
+       ELSE NULL
+     END) AS TitleForIndex,
+    ROW_NUMBER() OVER (
+      PARTITION BY ca.OwnerUserId
+      ORDER BY ca.LastActivityDate DESC, ca.Score DESC
+    ) AS RN
+  FROM ComplexAggregates ca
+  LEFT JOIN PostVoteTotals pt ON pt.PostId = ca.PostId
+)
+SELECT
+  PostId,
+  PostTypeId,
+  OwnerUserId,
+  Title,
+  Tags,
+  Score,
+  ViewCount,
+  CreationDate,
+  LastActivityDate,
+  CommentCount,
+  FavoriteCount,
+  AcceptedAnswerId,
+  ParentId,
+  Body,
+  LastEditorUserId,
+  LastEditDate,
+  ContentLicense,
+  OwnerDisplayName,
+  LastEditorDisplayName,
+  Reputation,
+  UserCreationDate,
+  LastAccessDate,
+  UserDisplayName,
+  Location,
+  Views,
+  UpVotes,
+  DownVotes,
+  ProfileImageUrl,
+  AccountId,
+  BadgeCount,
+  TotalUpvotesOnPost,
+  TotalDownvotesOnPost,
+  TitleForIndex,
+  RN
+FROM FinalSelect
+WHERE RN = 1
+  AND LastActivityDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180 days')
+  AND COALESCE(Body, '') NOT LIKE '%password%'
+  AND (Score > 0 OR ViewCount > 100)
+ORDER BY LastActivityDate DESC, Score DESC
+LIMIT 100;

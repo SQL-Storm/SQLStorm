@@ -1,0 +1,287 @@
+-- {"query": "978.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3013} 
+with
+-- recent timeframe
+params as (
+  select
+    now() - interval '3 years' as since_dt,
+    now() - interval '6 months' as recent_dt
+),
+-- normalize tags into arrays and tag count
+q as (
+  select
+    p.Id,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.FavoriteCount,
+    p.AnswerCount,
+    p.Title,
+    p.Tags,
+    string_to_array(substring(p.Tags, 2, greatest(length(p.Tags)-2,0)), '><') as tag_arr
+  from Posts p
+  join PostTypes pt on pt.Id = p.PostTypeId and pt.Name = 'Question'
+),
+-- explode tags
+q_tags as (
+  select q.Id as QuestionId, lower(trim(t)) as tag
+  from q
+  left join lateral unnest(q.tag_arr) as t on true
+),
+-- compute per-question engagement metrics using window functions and NULL handling
+q_metrics as (
+  select
+    q.Id,
+    q.OwnerUserId,
+    q.CreationDate,
+    coalesce(q.Score,0) as Score,
+    coalesce(q.ViewCount,0) as ViewCount,
+    coalesce(q.FavoriteCount,0) as FavoriteCount,
+    coalesce(q.AnswerCount,0) as AnswerCount,
+    -- comment score sum and count
+    coalesce(sum(case when c.Id is not null then coalesce(c.Score,0) end),0) as CommentScoreSum,
+    count(c.Id) as CommentCount,
+    -- votes breakdown via filtered aggregates
+    coalesce(sum(case when v.VoteTypeId = 2 then 1 else 0 end),0) as UpVotesCount,
+    coalesce(sum(case when v.VoteTypeId = 3 then 1 else 0 end),0) as DownVotesCount,
+    -- last activity windows
+    max(coalesce(q.CreationDate, now())) as MaxCreate,
+    max(coalesce(c.CreationDate, q.CreationDate)) as LastCommentAt,
+    max(coalesce(v.CreationDate, q.CreationDate)) as LastVoteAt
+  from q
+  left join Comments c on c.PostId = q.Id
+  left join Votes v on v.PostId = q.Id
+  group by q.Id, q.OwnerUserId, q.CreationDate, q.Score, q.ViewCount, q.FavoriteCount, q.AnswerCount
+),
+-- derive a composite engagement score with non-linear weights and normalization, protect against division by zero
+q_engagement as (
+  select
+    m.*,
+    case
+      when (coalesce(ViewCount,0) + coalesce(Score,0) + coalesce(AnswerCount,0) + coalesce(CommentCount,0)) = 0 then 0.0
+      else
+        -- log-scaled views, weighted votes, answers, comments
+        ln(1 + greatest(ViewCount,0)) * 0.35
+        + (UpVotesCount - DownVotesCount) * 0.5
+        + AnswerCount * 0.7
+        + CommentCount * 0.15
+        + FavoriteCount * 0.25
+        + CommentScoreSum * 0.1
+    end as EngagementScore
+  from q_metrics m
+),
+-- tag popularity baseline
+tag_baseline as (
+  select
+    qt.tag,
+    count(distinct qt.QuestionId) as TagQuestionCount,
+    avg(e.EngagementScore) as AvgTagEngagement,
+    percentile_cont(0.9) within group (order by e.EngagementScore) as P90TagEngagement
+  from q_tags qt
+  join q_engagement e on e.Id = qt.QuestionId
+  group by qt.tag
+),
+-- user stats with window functions and correlated subqueries
+user_stats as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate as UserCreated,
+    u.LastAccessDate,
+    coalesce(u.UpVotes,0) as UpVotes,
+    coalesce(u.DownVotes,0) as DownVotes,
+    coalesce(u.Views,0) as ProfileViews,
+    -- badges by class via filtered counts
+    sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+    sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+    sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+    count(b.Id) as TotalBadges,
+    max(b.Date) as LastBadgeAt,
+    -- recent posting activity using correlated subqueries
+    (select count(*) from Posts p where p.OwnerUserId = u.Id and p.CreationDate >= (select recent_dt from params)) as RecentPosts,
+    (select count(*) from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 1) as TotalQuestions,
+    (select count(*) from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 2) as TotalAnswers
+  from Users u
+  left join Badges b on b.UserId = u.Id
+  group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.UpVotes, u.DownVotes, u.Views
+),
+-- questions possibly closed or duplicated
+q_status as (
+  select
+    p.Id,
+    max(case when ph.PostHistoryTypeId = 10 then 1 else 0 end) as WasClosed,
+    max(case when ph.PostHistoryTypeId = 11 then 1 else 0 end) as WasReopened,
+    max(case when pl.LinkTypeId = 3 then 1 else 0 end) as IsDuplicateLink
+  from Posts p
+  left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId in (10,11)
+  left join PostLinks pl on pl.PostId = p.Id and pl.LinkTypeId = 3
+  where p.PostTypeId = 1
+  group by p.Id
+),
+-- rolling rank across time buckets
+bucketed as (
+  select
+    e.Id as QuestionId,
+    date_trunc('month', e.CreationDate) as month_bucket,
+    e.EngagementScore,
+    e.ViewCount,
+    e.Score,
+    e.AnswerCount,
+    e.CommentCount,
+    row_number() over (partition by date_trunc('month', e.CreationDate) order by e.EngagementScore desc nulls last) as RankInMonth,
+    ntile(10) over (partition by date_trunc('month', e.CreationDate) order by e.EngagementScore desc nulls last) as DecileInMonth
+  from q_engagement e
+),
+-- join everything and compute tag-adjusted z-like score
+q_tag_adjusted as (
+  select
+    e.Id as QuestionId,
+    e.OwnerUserId,
+    e.CreationDate,
+    e.EngagementScore,
+    coalesce(avg(tb.AvgTagEngagement), 0) as AvgTagEngagement,
+    coalesce(avg(tb.P90TagEngagement), 1) as P90TagEngagement,
+    -- adjust engagement by tag difficulty: higher than tag avg gets boost, above P90 capped
+    case
+      when e.EngagementScore is null then 0
+      when avg(tb.P90TagEngagement) filter (where tb.P90TagEngagement > 0) is null then e.EngagementScore
+      else (e.EngagementScore - coalesce(avg(tb.AvgTagEngagement),0)) / nullif(avg(tb.P90TagEngagement),0)
+    end as TagAdjustedScore
+  from q_engagement e
+  left join q_tags qt on qt.QuestionId = e.Id
+  left join tag_baseline tb on tb.tag = qt.tag
+  group by e.Id, e.OwnerUserId, e.CreationDate, e.EngagementScore
+),
+-- compute final rank with windowing, include status, and user stats
+final_scored as (
+  select
+    qta.QuestionId,
+    qta.OwnerUserId,
+    u.DisplayName,
+    u.Reputation,
+    u.TotalBadges,
+    u.GoldBadges,
+    u.SilverBadges,
+    u.BronzeBadges,
+    qta.CreationDate,
+    qta.EngagementScore,
+    qta.TagAdjustedScore,
+    bs.month_bucket,
+    bs.RankInMonth,
+    bs.DecileInMonth,
+    qs.WasClosed,
+    qs.WasReopened,
+    qs.IsDuplicateLink,
+    -- penalty for closure/duplication, bonus for reputation and gold badges (clamped)
+    greatest(qta.TagAdjustedScore, 0) * 0.7
+      + least(u.Reputation, 10000) / 10000.0 * 0.2
+      + least(u.GoldBadges, 5) * 0.02
+      - (case when qs.WasClosed = 1 then 0.15 else 0 end)
+      - (case when qs.IsDuplicateLink = 1 then 0.1 else 0 end) as CompositeScore
+  from q_tag_adjusted qta
+  left join bucketed bs on bs.QuestionId = qta.QuestionId
+  left join q_status qs on qs.Id = qta.QuestionId
+  left join user_stats u on u.UserId = qta.OwnerUserId
+),
+-- create benchmarks of top-N per month and overall
+benchmarks as (
+  select
+    fs.*,
+    dense_rank() over (partition by fs.month_bucket order by fs.CompositeScore desc nulls last) as DenseRankInMonth,
+    rank() over (order by fs.CompositeScore desc nulls last) as GlobalRank,
+    avg(fs.CompositeScore) over (partition by fs.OwnerUserId) as UserAvgComposite,
+    stddev_pop(fs.CompositeScore) over (partition by fs.OwnerUserId) as UserStdComposite
+  from final_scored fs
+),
+-- filter to timeframe and produce union of top performers and interesting edge cases
+selected as (
+  select *
+  from benchmarks b
+  where b.CreationDate >= (select since_dt from params)
+    and (
+      b.DenseRankInMonth <= 50
+      or b.DecileInMonth in (1,10)
+      or (b.WasClosed = 1 and b.CompositeScore > 0)
+      or (b.IsDuplicateLink = 1 and b.CompositeScore > 0)
+    )
+),
+-- produce a summary per tag of selected questions using set operators
+tagged_selected as (
+  select qt.tag, s.*
+  from selected s
+  join q_tags qt on qt.QuestionId = s.QuestionId
+),
+tag_summary as (
+  select
+    tag,
+    count(distinct QuestionId) as SelectedQuestions,
+    avg(CompositeScore) as AvgComposite,
+    percentile_cont(0.5) within group (order by CompositeScore) as MedianComposite,
+    max(CompositeScore) as MaxComposite
+  from tagged_selected
+  group by tag
+),
+-- combine high-level outputs
+report as (
+  -- top questions
+  select
+    'top_questions' as section,
+    b.QuestionId::text as key,
+    json_build_object(
+      'questionId', b.QuestionId,
+      'ownerUserId', b.OwnerUserId,
+      'displayName', coalesce(b.DisplayName, 'unknown'),
+      'reputation', coalesce(b.Reputation,0),
+      'badges', json_build_object('gold', coalesce(b.GoldBadges,0), 'silver', coalesce(b.SilverBadges,0), 'bronze', coalesce(b.BronzeBadges,0)),
+      'created', b.CreationDate,
+      'month', b.month_bucket,
+      'scores', json_build_object('engagement', b.EngagementScore, 'tagAdjusted', b.TagAdjustedScore, 'composite', b.CompositeScore),
+      'ranks', json_build_object('monthRank', b.DenseRankInMonth, 'globalRank', b.GlobalRank, 'decile', b.DecileInMonth),
+      'status', json_build_object('closed', b.WasClosed = 1, 'reopened', b.WasReopened = 1, 'duplicate', b.IsDuplicateLink = 1),
+      'userStats', json_build_object('userAvgComposite', b.UserAvgComposite, 'userStdComposite', b.UserStdComposite)
+    ) as payload
+  from benchmarks b
+  where b.GlobalRank <= 500
+
+  union all
+
+  -- per-tag summaries for selected set
+  select
+    'tag_summary' as section,
+    ts.tag as key,
+    json_build_object(
+      'tag', ts.tag,
+      'selectedQuestions', ts.SelectedQuestions,
+      'avgComposite', ts.AvgComposite,
+      'medianComposite', ts.MedianComposite,
+      'maxComposite', ts.MaxComposite
+    ) as payload
+  from tag_summary ts
+
+  union all
+
+  -- user outliers: users whose best question is 2 SD above their mean in the period
+  select
+    'user_outliers' as section,
+    b.OwnerUserId::text as key,
+    json_build_object(
+      'ownerUserId', b.OwnerUserId,
+      'displayName', coalesce(b.DisplayName,'unknown'),
+      'bestQuestionId', b.QuestionId,
+      'bestComposite', b.CompositeScore,
+      'userAvg', b.UserAvgComposite,
+      'userStd', b.UserStdComposite
+    ) as payload
+  from (
+    select b.*, row_number() over (partition by b.OwnerUserId order by b.CompositeScore desc nulls last) as rn
+    from benchmarks b
+    where b.CreationDate >= (select since_dt from params)
+  ) b
+  where b.rn = 1
+    and b.UserStdComposite is not null
+    and b.CompositeScore >= b.UserAvgComposite + 2 * b.UserStdComposite
+)
+select section, key, payload
+from report
+order by section, key;

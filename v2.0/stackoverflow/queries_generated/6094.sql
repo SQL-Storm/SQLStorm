@@ -1,0 +1,35 @@
+-- {"query": "6094.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-micro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 344} 
+
+SELECT 
+    u.DisplayName,
+    COUNT(DISTINCT v.PostId) AS TotalVotes,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) AS LastClosedDate,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.CreationDate END) AS LastReopenedDate,
+    STRING_AGG(DISTINCT t.TagName, ', ') AS Tags
+FROM 
+    Users u
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    Votes v ON u.Id = v.UserId
+LEFT JOIN 
+    PostHistory ph ON u.Id = ph.UserId
+LEFT JOIN 
+    Posts p ON v.PostId = p.Id
+LEFT JOIN 
+    Tags t ON p.Id = t.ExcerptPostId
+LEFT JOIN 
+    PostLinks pl ON p.Id = pl.PostId
+WHERE 
+    u.Reputation > 1000
+    AND p.PostTypeId = 1
+    AND p.ViewCount > 1000
+GROUP BY 
+    u.DisplayName
+HAVING 
+    COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN pl.RelatedPostId END) > 0
+ORDER BY 
+    TotalVotes DESC, 
+    UpVotes DESC;

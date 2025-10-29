@@ -1,0 +1,139 @@
+WITH 
+    user_agg AS (
+        SELECT 
+            u.Id                                   AS user_id,
+            u.DisplayName,
+            u.Reputation,
+            COUNT(p.Id)                            AS total_posts,
+            COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS question_count,
+            COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS answer_count,
+            COALESCE(SUM(p.Score),0)               AS sum_score,
+            COALESCE(AVG(p.Score),0)               AS avg_score,
+            MAX(p.CreationDate)                    AS last_post_date,
+            MAX(COALESCE(p.LastActivityDate, p.CreationDate)) AS last_activity,
+            (SELECT MAX(CreationDate) 
+               FROM Posts p2 
+              WHERE p2.OwnerUserId = u.Id)        AS latest_post_ts
+        FROM Users u
+        LEFT JOIN Posts p 
+               ON p.OwnerUserId = u.Id
+        GROUP BY u.Id, u.DisplayName, u.Reputation
+    ),
+
+    badge_agg AS (
+        SELECT 
+            b.UserId                              AS user_id,
+            COUNT(*)                              AS badge_total,
+            SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_badges,
+            SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_badges,
+            SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_badges,
+            STRING_AGG(DISTINCT b.Name, ', ')     AS badge_list
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+
+    recent_votes AS (
+        SELECT 
+            v.UserId                              AS voter_id,
+            vt.Name                               AS vote_type,
+            v.CreationDate,
+            ROW_NUMBER() OVER (PARTITION BY v.UserId ORDER BY v.CreationDate DESC) AS rn
+        FROM Votes v
+        JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+        WHERE v.CreationDate >= (DATE '2024-10-01' - INTERVAL '30 days')
+    ),
+
+    tag_usage AS (
+        SELECT 
+            p.OwnerUserId                         AS user_id,
+            UNNEST(string_to_array(REGEXP_REPLACE(p.Tags, '^<|>$', ''), '><')) AS tag
+        FROM Posts p
+        WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+    ),
+
+    user_tags AS (
+        SELECT 
+            user_id,
+            COUNT(DISTINCT tag)                  AS distinct_tag_count,
+            STRING_AGG(DISTINCT tag, ', ')       AS tag_list
+        FROM tag_usage
+        GROUP BY user_id
+    ),
+
+    combined AS (
+        SELECT 
+            ua.user_id,
+            ua.DisplayName,
+            ua.Reputation,
+            ua.total_posts,
+            ua.question_count,
+            ua.answer_count,
+            ua.sum_score,
+            ua.avg_score,
+            ua.last_post_date,
+            ua.last_activity,
+            COALESCE(bag.badge_total,0)           AS badge_total,
+            COALESCE(bag.gold_badges,0)           AS gold_badges,
+            COALESCE(bag.silver_badges,0)         AS silver_badges,
+            COALESCE(bag.bronze_badges,0)         AS bronze_badges,
+            COALESCE(bag.badge_list,'')           AS badge_list,
+            COALESCE(ut.distinct_tag_count,0)     AS distinct_tag_count,
+            COALESCE(ut.tag_list,'')              AS tag_list,
+            CASE 
+                WHEN ua.total_posts = 0 THEN NULL
+                ELSE ROUND((ua.sum_score::double precision)/ua.total_posts,2)
+            END                                   AS avg_score_per_post,
+            CASE 
+                WHEN ua.last_activity IS NULL THEN 'Never'
+                ELSE TO_CHAR(ua.last_activity,'YYYY-MM-DD')
+            END                                   AS last_activity_date,
+            rv.vote_type
+        FROM user_agg ua
+        LEFT JOIN badge_agg bag   ON bag.user_id = ua.user_id
+        LEFT JOIN user_tags ut    ON ut.user_id = ua.user_id
+        LEFT JOIN (
+            SELECT DISTINCT ON (voter_id) voter_id, vote_type, CreationDate
+            FROM recent_votes
+            WHERE rn = 1
+            ORDER BY voter_id, CreationDate DESC
+        ) rv ON rv.voter_id = ua.user_id
+    )
+
+SELECT 
+    c.user_id,
+    c.DisplayName,
+    c.Reputation,
+    c.total_posts,
+    c.question_count,
+    c.answer_count,
+    c.badge_total,
+    c.gold_badges,
+    c.silver_badges,
+    c.bronze_badges,
+    c.distinct_tag_count,
+    c.avg_score,
+    c.avg_score_per_post,
+    c.last_activity_date,
+    COALESCE(NULLIF(c.badge_list,''), 'No badges')                AS badges,
+    COALESCE(NULLIF(c.tag_list,''), 'No tags used')               AS tags_used,
+    COALESCE(c.vote_type,'No recent vote')                         AS recent_vote_type,
+    (c.gold_badges*100 + c.silver_badges*10 + c.bronze_badges) 
+        * COALESCE(NULLIF(c.Reputation,0),1) 
+        / NULLIF(c.total_posts,0)                                   AS weighted_score
+FROM combined c
+WHERE 
+    (c.Reputation > 20000 AND c.gold_badges >= 5)
+    OR (c.question_count > 100 AND c.distinct_tag_count >= 10)
+    OR (c.last_activity_date <> 'Never' AND c.last_activity_date >= TO_CHAR(DATE '2024-10-01' - INTERVAL '365 days','YYYY-MM-DD'))
+ORDER BY weighted_score DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT 
+    NULL::bigint AS user_id,
+    '---' AS DisplayName,
+    NULL::int AS Reputation,
+    NULL::int, NULL::int, NULL::int, NULL::int, NULL::numeric, NULL::numeric, NULL::timestamp,
+    NULL::int, NULL::numeric, NULL::numeric, NULL::text, NULL::text, NULL::text,
+    NULL::text, NULL::numeric, NULL::text, NULL::numeric;

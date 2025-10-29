@@ -1,0 +1,134 @@
+-- {"query": "7456.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1360} 
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        MAX(p.CreationDate) AS LatestPostDate,
+        MIN(p.CreationDate) AS FirstPostDate,
+        DATEDIFF(CURRENT_TIMESTAMP, u.CreationDate) AS AccountAgeDays
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+RankedUsers AS (
+    SELECT 
+        *,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, PostCount DESC) AS RankByReputation,
+        ROW_NUMBER() OVER (ORDER BY PostCount DESC, Reputation DESC) AS RankByPostCount,
+        RANK() OVER (ORDER BY Views DESC) AS RankByViews,
+        DENSE_RANK() OVER (ORDER BY UpVotes DESC) AS RankByUpVotes
+    FROM UserStats
+),
+TopUsers AS (
+    SELECT * FROM RankedUsers WHERE RankByReputation <= 100
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(p.Id) AS TotalPosts,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS Questions,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS Answers,
+        COUNT(p.Id) * 100.0 / (SELECT COUNT(*) FROM Posts) AS PostPercentage,
+        AVG(p.Score) AS AvgScore,
+        MAX(p.Score) AS MaxScore,
+        MAX(p.ViewCount) AS MaxViews,
+        COUNT(p.Id) * 1.0 / NULLIF(DATEDIFF(CURRENT_TIMESTAMP, u.CreationDate), 0) AS PostsPerDay,
+        (CASE 
+            WHEN COUNT(p.Id) >= 1000 THEN 'Active'
+            WHEN COUNT(p.Id) >= 500 THEN 'Moderately Active'
+            WHEN COUNT(p.Id) >= 100 THEN 'Occasional'
+            ELSE 'New User'
+        END) AS ActivityLevel
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.CreationDate >= '2010-01-01' AND u.CreationDate <= '2020-12-31'
+    GROUP BY u.Id, u.DisplayName, u.CreationDate
+),
+TagActivity AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        COUNT(p.Id) AS PostsWithTag,
+        AVG(p.Score) AS AvgScoreForTag,
+        MAX(p.Score) AS MaxScoreForTag,
+        STRING_AGG(p.Title, '; ') AS SampleTitles
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    WHERE t.Count > 100
+    GROUP BY t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId
+),
+ComplexCalculations AS (
+    SELECT 
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.PostCount,
+        tu.QuestionCount,
+        tu.AnswerCount,
+        tu.BadgeCount,
+        tu.CommentCount,
+        tu.VoteCount,
+        tu.RankByReputation,
+        tu.RankByPostCount,
+        tu.RankByViews,
+        tu.RankByUpVotes,
+        tu.AccountAgeDays,
+        (tu.Reputation * 1.0 / NULLIF(tu.PostCount, 0)) AS RepPerPost,
+        (CASE 
+            WHEN tu.QuestionCount = 0 THEN 0
+            ELSE (tu.AnswerCount * 100.0 / tu.QuestionCount)
+        END) AS AnswerRate,
+        CASE 
+            WHEN tu.BadgeCount BETWEEN 1 AND 10 THEN 'Bronze'
+            WHEN tu.BadgeCount BETWEEN 11 AND 50 THEN 'Silver'
+            WHEN tu.BadgeCount > 50 THEN 'Gold'
+            ELSE 'None'
+        END AS BadgeTier,
+        (CASE 
+            WHEN tu.Reputation > 100000 THEN 'Legendary'
+            WHEN tu.Reputation > 10000 THEN 'Master'
+            WHEN tu.Reputation > 1000 THEN 'Expert'
+            ELSE 'Member'
+        END) AS ReputationTier
+    FROM TopUsers tu
+)
+SELECT 
+    'User Statistics Report' AS ReportTitle,
+    COUNT(*) AS TotalUsers,
+    AVG(Reputation) AS AvgReputation,
+    MAX(Reputation) AS MaxReputation,
+    AVG(PostCount) AS AvgPosts,
+    AVG(QuestionCount) AS AvgQuestions,
+    AVG(AnswerCount) AS AvgAnswers,
+    AVG(BadgeCount) AS AvgBadges,
+    AVG(CommentCount) AS AvgComments,
+    AVG(VoteCount) AS AvgVotes,
+    AVG(AccountAgeDays) AS AvgAccountAge,
+    STRING_AGG(DisplayName, ', ') AS AllUserNames,
+    STRING_AGG(CAST(Reputation AS VARCHAR), ', ') AS AllReputations,
+    STRING_AGG(CAST(PostCount AS VARCHAR), ', ') AS AllPostCounts,
+    STRING_AGG(CAST(QuestionCount AS VARCHAR), ', ') AS AllQuestionCounts,
+    STRING_AGG(CAST(AnswerCount AS VARCHAR), ', ') AS AllAnswerCounts,
+    STRING_AGG(CAST(BadgeCount AS VARCHAR), ', ') AS AllBadgeCounts,
+    STRING_AGG(CAST(CommentCount AS VARCHAR), ', ') AS AllCommentCounts,
+    STRING_AGG(CAST(VoteCount AS VARCHAR), ', ') AS AllVoteCounts
+    
+FROM ComplexCalculations
+HAVING COUNT(*) > 0;

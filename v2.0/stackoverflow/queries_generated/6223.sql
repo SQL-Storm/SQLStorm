@@ -1,0 +1,55 @@
+-- {"query": "6223.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-micro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 527} 
+
+SELECT 
+    u.DisplayName, 
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(p.Score) AS TotalScore,
+    MAX(p.LastActivityDate) AS LastActive,
+    b.Name AS LatestBadge,
+    v.Name AS LatestBadgeType,
+    AVG(ph.Score) AS AvgCommentScore,
+    COUNT(DISTINCT pl.RelatedPostId) AS TotalLinkedPosts,
+    MAX(p.CreationDate) AS FirstPost,
+    MIN(p.CreationDate) AS LastPost,
+    CASE 
+        WHEN u.UpVotes > u.DownVotes THEN 'NetPositive'
+        WHEN u.UpVotes < u.DownVotes THEN 'NetNegative'
+        ELSE 'NetNeutral'
+    END AS VoteNet
+FROM 
+    Users u
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    (SELECT UserId, MAX(Date) AS MaxBadgeDate 
+     FROM Badges 
+     GROUP BY UserId) bb ON u.Id = bb.UserId AND b.Date = bb.MaxBadgeDate
+LEFT JOIN 
+    (SELECT UserId, MAX(Score) AS MaxCommentScore 
+     FROM Comments 
+     GROUP BY UserId) c ON u.Id = c.UserId
+LEFT JOIN 
+    (SELECT PostId, AVG(Score) AS AvgScore 
+     FROM Comments 
+     GROUP BY PostId) ph ON u.Id = ph.PostId
+LEFT JOIN 
+    Votes v ON u.Id = v.UserId
+LEFT JOIN 
+    (SELECT UserId, MAX(CreationDate) AS MaxVoteDate 
+     FROM Votes 
+     GROUP BY UserId) vv ON u.Id = vv.UserId AND v.CreationDate = vv.MaxVoteDate
+LEFT JOIN 
+    PostLinks pl ON u.Id = pl.UserId
+LEFT JOIN 
+    Posts p ON pl.PostId = p.Id
+WHERE 
+    u.Reputation > 1000
+    AND p.CreationDate BETWEEN DATEADD(year, -1, GETDATE()) AND GETDATE()
+GROUP BY 
+    u.DisplayName, b.Name, v.Name
+HAVING 
+    COUNT(DISTINCT p.Id) > 50
+ORDER BY 
+    TotalScore DESC, 
+    TotalPosts DESC;

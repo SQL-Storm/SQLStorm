@@ -1,0 +1,183 @@
+-- {"query": "1018.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3333} 
+
+WITH UserEngagement AS (
+    -- Aggregates user-level metrics including post counts, comment counts, vote counts, and badge distribution.
+    -- Uses LEFT JOIN to ensure all users are considered, even those without posts, comments, or votes.
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.Views AS UserProfileViews,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsAsked,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersProvided,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+        COALESCE(SUM(CASE WHEN v_up.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS TotalUpVotesGiven,
+        COALESCE(SUM(CASE WHEN v_down.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS TotalDownVotesGiven,
+        MAX(p.CreationDate) AS LastPostDate,
+        MIN(p.CreationDate) AS FirstPostDate,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE NULL END) AS AvgQuestionViewCount,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges
+    FROM Users AS u
+    LEFT JOIN Posts AS p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments AS c ON u.Id = c.UserId
+    LEFT JOIN Votes AS v_up ON u.Id = v_up.UserId AND v_up.VoteTypeId = 2 -- UpMod (upvote)
+    LEFT JOIN Votes AS v_down ON u.Id = v_down.UserId AND v_down.VoteTypeId = 3 -- DownMod (downvote)
+    LEFT JOIN Badges AS b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Views
+),
+PostHistoricalAnalysis AS (
+    -- Analyzes post history for specific events like edits, closes, reopens, and extracts the latest body version using a correlated subquery.
+    SELECT
+        ph.PostId,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 5 THEN 1 ELSE NULL END) AS BodyEditCount, -- Edit Body
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 6 THEN 1 ELSE NULL END) AS TagsEditCount, -- Edit Tags
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE NULL END) AS CloseEvents, -- Post Closed
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE NULL END) AS ReopenEvents, -- Post Reopened
+        MIN(CASE WHEN ph.PostHistoryTypeId = 2 THEN ph.CreationDate ELSE NULL END) AS InitialBodyDate,
+        MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId IN (4, 5, 6)) AS LastEditHistoryDate,
+        COALESCE(MIN(NULLIF(ph.Comment, '')), 'No initial comment') AS FirstHistoryComment, -- Picks the first non-empty comment
+        (SELECT ph_latest.Text FROM PostHistory ph_latest WHERE ph_latest.PostId = ph.PostId AND ph_latest.PostHistoryTypeId = 5 ORDER BY ph_latest.CreationDate DESC LIMIT 1) AS LatestBodyVersion, -- Correlated subquery for latest body content
+        (SELECT COUNT(DISTINCT pl.RelatedPostId) FROM PostLinks pl WHERE pl.PostId = ph.PostId AND pl.LinkTypeId = 3) AS DuplicateLinkCount -- Correlated subquery for linked duplicates
+    FROM PostHistory AS ph
+    WHERE ph.PostHistoryTypeId IN (2, 4, 5, 6, 10, 11) -- Initial Body, Edit Title, Edit Body, Edit Tags, Post Closed, Post Reopened
+    GROUP BY ph.PostId
+),
+QuestionTagStats AS (
+    -- Extracts individual tags from question posts and associates them with post metadata.
+    -- Uses string_to_array and unnest to normalize tags.
+    SELECT
+        p.Id AS PostId,
+        p.CreationDate,
+        unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS TagName, -- Splits tags string into individual tags
+        p.Score AS PostScore,
+        p.ViewCount
+    FROM Posts AS p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND length(p.Tags) > 2
+),
+TagPerformance AS (
+    -- Calculates performance metrics for tags based on associated questions, ranks them.
+    SELECT
+        ts.TagName,
+        COUNT(DISTINCT ts.PostId) AS TaggedQuestionCount,
+        AVG(ts.PostScore) AS AvgTagScore,
+        SUM(ts.ViewCount) AS TotalTagViews,
+        DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT ts.PostId) DESC, AVG(ts.PostScore) DESC) AS TagRankByQuestions
+    FROM QuestionTagStats AS ts
+    GROUP BY ts.TagName
+    HAVING COUNT(DISTINCT ts.PostId) > 5 -- Only consider tags with a reasonable number of questions
+),
+PostCommentAggregates AS (
+    -- Aggregates comment statistics and a snippet of recent comments for each post.
+    -- Uses STRING_AGG for concatenation of comment text.
+    SELECT
+        c.PostId,
+        COUNT(c.Id) AS TotalCommentCount,
+        MAX(c.CreationDate) AS LastCommentDate,
+        AVG(c.Score) AS AvgCommentScore,
+        STRING_AGG(SUBSTRING(c.Text, 1, 50), ' | ' ORDER BY c.CreationDate DESC) AS RecentCommentsSnippet -- Concatenates first 50 chars of recent comments
+    FROM Comments AS c
+    GROUP BY c.PostId
+)
+-- Main query combining all CTEs and adding more complex logic, window functions, and subqueries.
+SELECT
+    p.Id AS PostID,
+    pt.Name AS PostTypeName,
+    ue.DisplayName AS OwnerDisplayName,
+    ue.Reputation AS OwnerReputation,
+    ue.UserProfileViews AS OwnerProfileViews,
+    p.CreationDate AS PostCreationDate,
+    p.Score AS PostScore,
+    p.ViewCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.CommentCount AS DirectCommentCount, -- Comment count directly from Posts table
+    pca.TotalCommentCount AS AggregatedCommentCount, -- Comment count from Comments table aggregation
+    p.LastEditDate,
+    p.LastActivityDate,
+    p.Title,
+    ph_an.BodyEditCount,
+    ph_an.TagsEditCount,
+    ph_an.CloseEvents,
+    ph_an.ReopenEvents,
+    ph_an.DuplicateLinkCount,
+    ph_an.FirstHistoryComment,
+    ph_an.LatestBodyVersion,
+    tp_ranked.TagName AS DominantTagName, -- The highest ranked tag associated with the post
+    tp_ranked.AvgTagScore,
+    tp_ranked.TaggedQuestionCount,
+    CASE
+        WHEN p.AcceptedAnswerId IS NOT NULL AND p.OwnerUserId IS NOT NULL THEN 'Answered & Accepted'
+        WHEN p.AcceptedAnswerId IS NULL AND p.AnswerCount > 0 THEN 'Answered, Not Accepted'
+        WHEN p.AcceptedAnswerId IS NULL AND p.AnswerCount = 0 THEN 'Unanswered'
+        WHEN p.PostTypeId = 2 THEN 'Is An Answer' -- For answers
+        ELSE 'N/A'
+    END AS QuestionOrAnswerStatus,
+    COALESCE(EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate)) / 3600, 0) AS ActivityDurationHours, -- Time difference in hours
+    LENGTH(p.Body) AS BodyLengthChars,
+    -- Window function: total bounty amount for each post (summing across multiple bounty votes for the same post)
+    SUM(v_bounty.BountyAmount) OVER (PARTITION BY p.Id) AS TotalBountyAmount,
+    -- Window function: ranks posts by score within each PostType
+    RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.CreationDate DESC) AS PostScoreRankByType,
+    -- Window function: finds the creation date of the previous post by the same owner, defaulting to a very old date if none.
+    LAG(p.CreationDate, 1, '1900-01-01'::timestamp) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostDateByUser,
+    CASE
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        WHEN p.LastActivityDate > NOW() - INTERVAL '30 days' THEN 'Recently Active'
+        ELSE 'Stale'
+    END AS PostLifecycleStage,
+    -- Correlated subquery: counts users created after and with higher reputation than the post's owner.
+    (SELECT COUNT(DISTINCT u2.Id) FROM Users u2 WHERE u2.CreationDate > ue.UserCreationDate AND u2.Reputation > ue.Reputation) AS MoreRecentHigherRepUsers,
+    -- Correlated subquery: calculates the average score of posts of the same type created after the current post.
+    (SELECT AVG(p_sub.Score) FROM Posts p_sub WHERE p_sub.PostTypeId = p.PostTypeId AND p_sub.CreationDate > p.CreationDate) AS AvgScoreOfLaterPostsOfType,
+    -- EXISTS clause: checks if the post owner has any badges with 'great' (case-insensitive) in their name.
+    EXISTS (SELECT 1 FROM Badges b_sub WHERE b_sub.UserId = ue.UserId AND b_sub.Name ILIKE '%great%') AS HasGreatBadge,
+    tp_ranked.TagRankByQuestions,
+    GREATEST(COALESCE(p.FavoriteCount, 0), COALESCE(p.AnswerCount, 0), COALESCE(p.CommentCount, 0), COALESCE(ph_an.DuplicateLinkCount, 0)) AS MaxEngagementMetric -- Uses COALESCE and GREATEST
+FROM Posts AS p
+INNER JOIN PostTypes AS pt ON p.PostTypeId = pt.Id
+LEFT JOIN UserEngagement AS ue ON p.OwnerUserId = ue.UserId
+LEFT JOIN PostHistoricalAnalysis AS ph_an ON p.Id = ph_an.PostId
+LEFT JOIN PostCommentAggregates AS pca ON p.Id = pca.PostId
+LEFT JOIN (
+    -- Subquery to select the single highest-ranking tag for each post based on TagPerformance CTE.
+    -- Uses ARRAY_AGG to get all tags and then picks the first one after ordering.
+    SELECT
+        sqts.PostId,
+        (ARRAY_AGG(tp.TagName ORDER BY tp.TagRankByQuestions ASC, tp.AvgTagScore DESC))[1] AS TagName,
+        (ARRAY_AGG(tp.AvgTagScore ORDER BY tp.TagRankByQuestions ASC, tp.AvgTagScore DESC))[1] AS AvgTagScore,
+        (ARRAY_AGG(tp.TaggedQuestionCount ORDER BY tp.TagRankByQuestions ASC, tp.AvgTagScore DESC))[1] AS TaggedQuestionCount,
+        (ARRAY_AGG(tp.TagRankByQuestions ORDER BY tp.TagRankByQuestions ASC, tp.AvgTagScore DESC))[1] AS TagRankByQuestions
+    FROM QuestionTagStats AS sqts
+    INNER JOIN TagPerformance AS tp ON sqts.TagName = tp.TagName
+    GROUP BY sqts.PostId
+) AS tp_ranked ON p.Id = tp_ranked.PostId
+LEFT JOIN Votes AS v_bounty ON p.Id = v_bounty.PostId AND v_bounty.VoteTypeId = 8 -- BountyStart votes
+WHERE
+    p.PostTypeId IN (1, 2) -- Focuses on questions (1) and answers (2)
+    AND p.CreationDate BETWEEN '2020-01-01' AND '2023-12-31'
+    AND (ue.Reputation > 1500 OR ue.Reputation IS NULL) -- Filters by owner reputation or includes posts without a linked owner
+    AND (p.ViewCount > 1000 OR p.Score > 50 OR p.FavoriteCount > 5) -- Filters for "popular" posts
+    AND (p.Title ILIKE '%SQL%' OR p.Title ILIKE '%database%' OR p.Tags ILIKE '%<sql>%' OR p.Tags ILIKE '%<database>%') -- Complex predicate with string matching for relevant topics
+    AND p.OwnerUserId IS NOT NULL -- Exclude posts owned by community user (-1) or deleted users
+    AND p.LastActivityDate IS NOT NULL -- Ensure there's an activity date
+GROUP BY
+    p.Id, pt.Name, ue.DisplayName, ue.Reputation, ue.UserProfileViews, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount,
+    p.FavoriteCount, p.CommentCount, p.LastEditDate, p.LastActivityDate, p.Title, ph_an.BodyEditCount,
+    ph_an.TagsEditCount, ph_an.CloseEvents, ph_an.ReopenEvents, ph_an.DuplicateLinkCount,
+    ph_an.FirstHistoryComment, ph_an.LatestBodyVersion, tp_ranked.TagName, tp_ranked.AvgTagScore,
+    tp_ranked.TaggedQuestionCount, p.AcceptedAnswerId, p.OwnerUserId, p.ClosedDate,
+    p.CommunityOwnedDate, ue.UserId, ue.UserCreationDate, tp_ranked.TagRankByQuestions, pca.TotalCommentCount
+HAVING
+    COUNT(DISTINCT v_bounty.Id) <= 5 -- Posts with at most 5 bounty starts
+    AND AVG(p.Score) > 0 -- Exclude posts with average score of zero (after considering potential aggregation effects if PostId wasn't in GROUP BY)
+ORDER BY
+    PostScoreRankByType ASC,
+    OwnerReputation DESC,
+    PostCreationDate DESC
+LIMIT 500;

@@ -1,0 +1,146 @@
+-- {"query": "3432.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2387} 
+
+/*  Comprehensive benchmark query using CTEs, window functions, outer joins,
+    correlated sub‑queries, string ops, NULL logic, and a UNION ALL set operator   */
+WITH user_stats AS (
+    SELECT
+        u.id                                            AS user_id,
+        u.displayname                                   AS display_name,
+        u.reputation,
+        COALESCE(u.upvotes,0) - COALESCE(u.downvotes,0) AS net_votes,
+        /*  badge counts per class – correlated sub‑queries  */
+        (SELECT COUNT(*) FROM badges b WHERE b.userid = u.id AND b.class = 1) AS gold_badges,
+        (SELECT COUNT(*) FROM badges b WHERE b.userid = u.id AND b.class = 2) AS silver_badges,
+        (SELECT COUNT(*) FROM badges b WHERE b.userid = u.id AND b.class = 3) AS bronze_badges,
+        /*  post counts – correlated sub‑queries  */
+        (SELECT COUNT(*) FROM posts p WHERE p.owneruserid = u.id AND p.posttypeid = 1) AS question_cnt,
+        (SELECT COUNT(*) FROM posts p WHERE p.owneruserid = u.id AND p.posttypeid = 2) AS answer_cnt,
+        /*  votes cast by the user  */
+        (SELECT COUNT(*) FROM votes v WHERE v.userid = u.id AND v.votetypeid = 2) AS upvote_given,
+        (SELECT COUNT(*) FROM votes v WHERE v.userid = u.id AND v.votetypeid = 3) AS downvote_given,
+        /*  most recent activity dates  */
+        MAX(p.creationdate) FILTER (WHERE p.owneruserid = u.id) AS last_post_dt,
+        MAX(v.creationdate) FILTER (WHERE v.userid = u.id)      AS last_vote_dt,
+        u.creationdate
+    FROM users u
+    GROUP BY u.id, u.displayname, u.reputation, u.upvotes, u.downvotes, u.creationdate
+),
+
+top_tags AS (
+    /*  tags ordered by how many questions use them  */
+    SELECT
+        t.tagname,
+        COUNT(p.id)                                   AS question_uses,
+        ROW_NUMBER() OVER (ORDER BY COUNT(p.id) DESC) AS tag_rank
+    FROM tags t
+    JOIN posts p
+      ON p.posttypeid = 1
+     AND p.tags LIKE concat('%<', t.tagname, '>%')
+    GROUP BY t.tagname
+    HAVING COUNT(p.id) > 1000
+),
+
+user_recent_activity AS (
+    SELECT
+        us.user_id,
+        us.display_name,
+        COALESCE(us.last_post_dt, us.creationdate)                AS recent_activity,
+        CASE
+            WHEN us.last_post_dt IS NULL               THEN 'NeverPosted'
+            WHEN us.last_post_dt > current_date - interval '30 day' THEN 'ActivePoster'
+            ELSE 'DormantPoster'
+        END                                                    AS poster_status
+    FROM user_stats us
+),
+
+badge_summary AS (
+    SELECT
+        b.userid,
+        STRING_AGG(DISTINCT b.name, ', ')                AS badge_list,
+        MAX(CASE WHEN b.class = 1 THEN b.name END)       AS top_gold_badge,
+        MAX(CASE WHEN b.class = 2 THEN b.name END)       AS top_silver_badge
+    FROM badges b
+    GROUP BY b.userid
+),
+
+/*  pick the highest‑rank tag a user has ever used in a question  */
+user_top_tag AS (
+    SELECT
+        ura.user_id,
+        tt.tagname,
+        tt.question_uses,
+        tt.tag_rank
+    FROM user_recent_activity ura
+    CROSS JOIN LATERAL (
+        SELECT
+            tg.tagname,
+            tg.question_uses,
+            tg.tag_rank
+        FROM top_tags tg
+        WHERE EXISTS (
+            SELECT 1
+            FROM posts p
+            WHERE p.owneruserid = ura.user_id
+              AND p.posttypeid = 1
+              AND p.tags LIKE concat('%<', tg.tagname, '>%')
+        )
+        ORDER BY tg.tag_rank
+        LIMIT 1
+    ) tt
+),
+
+/*  determine if the user's most recent question is closed as duplicate  */
+user_dup_status AS (
+    SELECT
+        u.id                                        AS user_id,
+        CASE
+            WHEN EXISTS (
+                SELECT 1
+                FROM posthistory ph
+                WHERE ph.postid = (
+                        SELECT p.id
+                        FROM posts p
+                        WHERE p.owneruserid = u.id
+                          AND p.posttypeid = 1
+                        ORDER BY p.creationdate DESC
+                        LIMIT 1
+                    )
+                  AND ph.posthistorytypeid = 10               -- Post Closed
+                  AND ph.comment IS NOT NULL
+                  AND ph.comment::int = 101                    -- Duplicate
+            ) THEN 'ClosedAsDuplicate'
+            ELSE 'Open'
+        END                                        AS closure_status
+    FROM users u
+)
+
+SELECT
+    ura.user_id,
+    ura.display_name,
+    us.reputation,
+    us.net_votes,
+    us.question_cnt,
+    us.answer_cnt,
+    COALESCE(bs.badge_list, 'None')               AS badges,
+    bs.top_gold_badge,
+    bs.top_silver_badge,
+    ura.poster_status,
+    utt.tagname                                   AS top_tag,
+    utt.question_uses,
+    uds.closure_status
+FROM user_recent_activity ura
+JOIN user_stats us               ON us.user_id = ura.user_id
+LEFT JOIN badge_summary bs       ON bs.userid = ura.user_id
+LEFT JOIN user_top_tag utt       ON utt.user_id = ura.user_id
+LEFT JOIN user_dup_status uds    ON uds.user_id = ura.user_id
+ORDER BY us.reputation DESC
+LIMIT 100
+
+UNION ALL
+
+/*  dummy row to force a full scan and test UNION handling  */
+SELECT
+    NULL, NULL, NULL, NULL, NULL, NULL,
+    '---', NULL, NULL, NULL, NULL, NULL
+FROM (SELECT 1) dummy
+ORDER BY 2 NULLS LAST;

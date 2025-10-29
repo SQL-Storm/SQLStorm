@@ -1,0 +1,173 @@
+WITH RECURSIVE RecursivePosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Title,
+        COALESCE(p.Tags, '') AS Tags,
+        1 AS Depth,
+        CAST(ARRAY[p.Id] AS JSON) AS Path
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+
+    UNION ALL
+
+    SELECT 
+        c.Id,
+        c.PostTypeId,
+        c.ParentId,
+        c.Score,
+        c.ViewCount,
+        c.OwnerUserId,
+        c.CreationDate,
+        c.Title,
+        COALESCE(c.Tags, '') AS Tags,
+        rp.Depth + 1,
+        -- append c.Id to JSON array path
+        (CASE
+            WHEN json_typeof(rp.Path) = 'array' THEN rp.Path || to_json(c.Id)
+            ELSE json_build_array(rp.Path, to_json(c.Id))
+         END)
+    FROM Posts c
+    JOIN RecursivePosts rp ON c.ParentId = rp.Id
+    WHERE c.PostTypeId IN (2, 7)
+),
+UserBadgeCounts AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        SUM(CASE WHEN b.TagBased = true THEN 1 ELSE 0 END) AS TagBasedBadges,
+        u.Reputation
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+PostMaxScoreRanks AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC NULLS LAST) AS ScoreRank
+    FROM Posts p
+    WHERE p.PostTypeId IN (1,2)
+),
+TopUserPosts AS (
+    SELECT 
+        p.Id,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags
+    FROM Posts p
+    JOIN PostMaxScoreRanks pm ON pm.Id = p.Id AND pm.ScoreRank = 1
+),
+ClosedQuestionsWithReason AS (
+    SELECT
+        ph.PostId,
+        p.Title,
+        crt.Name AS CloseReason,
+        ph.CreationDate AS CloseDate,
+        ph.UserId AS CloserUserId,
+        u.DisplayName AS CloserUserName
+    FROM PostHistory ph
+    JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS INTEGER)
+    JOIN Posts p ON p.Id = ph.PostId AND p.PostTypeId = 1
+    LEFT JOIN Users u ON u.Id = ph.UserId
+    WHERE ph.PostHistoryTypeId = 10
+),
+RecentCommentStats AS (
+    SELECT 
+        c.PostId,
+        COUNT(c.Id) AS RecentCommentCount,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM Comments c
+    WHERE c.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days')
+    GROUP BY c.PostId
+)
+SELECT 
+    rp.Id AS PostId,
+    rp.Title,
+    rp.PostTypeId,
+    rp.Score,
+    rp.ViewCount,
+    rp.Tags,
+    rp.Depth,
+    -- convert JSON array to string like "1->2->3"
+    (SELECT string_agg(val::TEXT, '->') FROM json_each_text(rp.Path) ORDER BY (row_number() OVER ())) AS PostHierarchyPath,
+    ub.DisplayName AS OwnerName,
+    ub.Reputation AS OwnerReputation,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ub.TagBasedBadges,
+    tc.Score AS TopUserPostScore,
+    tc.ViewCount AS TopUserPostViews,
+    tc.Title AS TopUserPostTitle,
+    COALESCE(cq.CloseReason, 'Open') AS CloseStatus,
+    cq.CloseDate,
+    cq.CloserUserName,
+    rc.RecentCommentCount,
+    rc.LastCommentDate,
+    CASE 
+        WHEN rp.Score > 0 THEN LOG(rp.Score + 1)
+        ELSE 0
+    END AS ScoreLog,
+    LENGTH(COALESCE(rp.Title, '')) AS TitleLength,
+    CASE
+        WHEN rp.Tags = '' THEN 'NoTags'
+        ELSE SUBSTRING(rp.Tags FROM 2 FOR CHAR_LENGTH(rp.Tags) - 2)
+    END AS TagsTrimmed,
+    RANK() OVER (PARTITION BY rp.OwnerUserId ORDER BY rp.Score DESC NULLS LAST) AS OwnerScoreRank,
+    COALESCE(NULLIF(rp.Title, ''), 'No Title') || ' [Score:' || COALESCE(CAST(rp.Score AS VARCHAR), '0') || ']' AS DisplayTitle,
+    rp.OwnerUserId,
+    rp.CreationDate
+FROM RecursivePosts rp
+LEFT JOIN UserBadgeCounts ub ON ub.UserId = rp.OwnerUserId
+LEFT JOIN TopUserPosts tc ON tc.OwnerUserId = rp.OwnerUserId
+LEFT JOIN ClosedQuestionsWithReason cq ON cq.PostId = rp.Id
+LEFT JOIN RecentCommentStats rc ON rc.PostId = rp.Id
+WHERE rp.Depth <= 3
+  AND (
+    rp.Score IS NOT NULL AND rp.Score >= 0
+    OR rp.ViewCount > 1000
+  )
+GROUP BY
+    rp.Id,
+    rp.Title,
+    rp.PostTypeId,
+    rp.Score,
+    rp.ViewCount,
+    rp.Tags,
+    rp.Depth,
+    rp.Path,
+    ub.DisplayName,
+    ub.Reputation,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ub.TagBasedBadges,
+    tc.Score,
+    tc.ViewCount,
+    tc.Title,
+    cq.CloseReason,
+    cq.CloseDate,
+    cq.CloserUserName,
+    rc.RecentCommentCount,
+    rc.LastCommentDate,
+    rp.OwnerUserId,
+    rp.CreationDate
+ORDER BY 
+    ub.Reputation DESC NULLS LAST,
+    rp.Score DESC NULLS LAST,
+    rp.CreationDate DESC
+LIMIT 100;

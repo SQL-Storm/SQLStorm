@@ -1,0 +1,212 @@
+with 
+UserPostCounts as (
+  select 
+    u.Id as UserId,
+    u.DisplayName,
+    count(distinct p.Id) as TotalPosts,
+    count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionCount,
+    count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswerCount,
+    coalesce(sum(p.Score),0) as TotalPostScore,
+    max(p.Score) as MaxPostScore,
+    sum(case when p.ViewCount is null then 0 else p.ViewCount end) as TotalViews,
+    avg(case when p.Score is null then 0 else p.Score end) as AvgScore
+  from 
+    Users u
+    left join Posts p on p.OwnerUserId = u.Id
+  group by u.Id, u.DisplayName
+),
+UserBadgeRanks as (
+  select 
+    UserId,
+    sum(case when BadgeClass = 1 then 3 when BadgeClass = 2 then 2 when BadgeClass = 3 then 1 else 0 end) as BadgeScore,
+    count(*) as BadgeCount,
+    count(distinct case when coalesce(TagBased, false) = true then Id end) as TagBasedBadges
+  from 
+    (select 
+       Id, UserId, Class as BadgeClass, TagBased 
+     from Badges) b
+  group by UserId
+),
+RecentUserEdits as (
+  select distinct
+    ph.UserId,
+    count(*) over (partition by ph.UserId) as EditCount,
+    max(ph.CreationDate) over (partition by ph.UserId) as LastEditDate
+  from PostHistory ph
+  where ph.PostHistoryTypeId in (4,5,6,14)
+),
+QuestionsWithDuplicates as (
+  select 
+    p.Id,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    pl.RelatedPostId as DuplicateOfId,
+    p.OwnerUserId
+  from Posts p
+  left join PostLinks pl on pl.PostId = p.Id and pl.LinkTypeId = 3
+  where p.PostTypeId = 1
+),
+RankedAnswers as (
+  select 
+    p.Id,
+    p.ParentId,
+    p.Score,
+    row_number() over (partition by p.ParentId order by p.Score desc, p.CreationDate) as AnswerRank,
+    p.CreationDate,
+    p.OwnerUserId
+  from Posts p
+  where p.PostTypeId = 2
+),
+TopTags as (
+  select 
+    t.TagName, 
+    t.Count, 
+    p.Id as PostId,
+    p.Tags,
+    p.OwnerUserId
+  from Tags t
+  join Posts p on p.Id = t.ExcerptPostId
+  where t.Count > 1000
+),
+-- Split tags without using UNNEST / string_to_array to remain dialect-agnostic.
+-- This implementation assumes tags are like '<tag1><tag2>' and uses a numbers/tally approach.
+Numbers as (
+  select 1 as n union all select 2 union all select 3 union all select 4 union all select 5 union all select 6 union all select 7 union all select 8 union all select 9 union all select 10
+),
+UserTagAffinity as (
+  select 
+    upc.UserId,
+    trim(both ' ' from nullif(substring(t.tagstr from 1 for char_length(t.tagstr)),'')) as Tag,
+    count(*) as TagPostCount
+  from Users u
+  join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 1
+  join UserPostCounts upc on upc.UserId = u.Id
+  -- build tag string by extracting nth occurrence between '<' and '>'
+  join (
+    select p2.Id as PostId,
+           n.n,
+           regexp_match(p2.Tags, '<([^>]*)>', 'g') as gm -- placeholder to show intent; will not be used directly
+    from Posts p2
+    cross join Numbers n
+  ) seq on seq.PostId = p.Id and seq.n <= 10
+  cross join lateral (
+    select
+      -- Extract the nth tag using a repeated regex approach: find the n-th '<...>' occurrence.
+      -- Different SQL engines have different regex functions; emulate by nested substring operations.
+      -- Use a generic approach: remove leading parts up to (n-1)-th '>' then extract next '<...>'
+      -- For dialects that support regexp_substr, replace this with regexp_substr(p.Tags, '<([^>]*)>', 1, seq.n, 1).
+      case 
+        when position('<' in p.Tags) = 0 then ''
+        else
+          -- remove first (n-1) tags
+          coalesce(
+            nullif(
+              regexp_replace(p.Tags, '^((?:<[^>]*>){' || (seq.n - 1) || '}).*$', '\1'), -- best-effort placeholder
+              ''
+            ),
+            ''
+          )
+      end as dummy,
+      -- Fallback tag extraction using more portable functions:
+      -- remove up to the (n-1)th '>' then take text between next '<' and '>'
+      substring(
+        substring(p.Tags from ( 
+          case 
+            when seq.n = 1 then 1
+            else
+              -- find position after (n-1)-th '>'
+              (length(split_part(p.Tags, '>', seq.n - 1)) + 1)
+          end
+        )),
+        '<' || '(.*?)' || '>'  -- placeholder pattern
+      ) as tagstr
+  ) t
+  where p.Tags is not null
+  group by upc.UserId, Tag
+),
+UserTopTags as (
+  select UserId, Tag as TopTag, TagPostCount
+  from (
+    select uta.UserId, uta.Tag, uta.TagPostCount,
+      row_number() over (partition by uta.UserId order by uta.TagPostCount desc, uta.Tag) as rn
+    from UserTagAffinity uta
+  ) x
+  where rn = 1
+)
+select 
+  u.Id as UserId,
+  u.DisplayName,
+  upc.TotalPosts,
+  upc.QuestionCount,
+  upc.AnswerCount,
+  upc.TotalPostScore,
+  ubr.BadgeScore,
+  ubr.BadgeCount,
+  ubr.TagBasedBadges,
+  coalesce(re.Edits,0) as TotalEdits,
+  re.LastEditDate,
+  coalesce(favq.FavoriteCount,0) as FavoriteQuestions,
+  coalesce(topTags.TopTag, 'no tag') as FavoriteTag,
+  coalesce(topTags.TagPostCount,0) as TagPostCount,
+  dupq.DuplicateQuestions,
+  bestAns.BestAnswerId,
+  bestAns.BestAnswerScore,
+  bestAns.BestAnswerAgeDays,
+  case 
+    when upc.AvgScore > 5 and ubr.BadgeScore > 5 then 'Elite'
+    when upc.AvgScore > 2 then 'Contributor'
+    else 'Newbie'
+  end as UserTier
+from Users u
+left join UserPostCounts upc on upc.UserId = u.Id
+left join UserBadgeRanks ubr on ubr.UserId = u.Id
+left join (
+  select UserId, count(*) as Edits, max(CreationDate) as LastEditDate
+  from PostHistory
+  where UserId is not null and PostHistoryTypeId in (4,5,6,14)
+  group by UserId
+) re on re.UserId = u.Id
+left join (
+  select p.OwnerUserId, count(*) as FavoriteCount
+  from Posts p
+  where p.FavoriteCount is not null
+  group by p.OwnerUserId
+) favq on favq.OwnerUserId = u.Id
+left join (
+  select UserId, TopTag, TagPostCount
+  from UserTopTags
+) topTags on topTags.UserId = u.Id
+left join (
+  select 
+    p.OwnerUserId,
+    sum(case when pl.Id is not null then 1 else 0 end) as DuplicateQuestions
+  from Posts p
+  left join PostLinks pl on pl.PostId = p.Id and pl.LinkTypeId = 3
+  where p.PostTypeId = 1
+  group by p.OwnerUserId
+) dupq on dupq.OwnerUserId = u.Id
+left join (
+  select 
+    ra.OwnerUserId,
+    ra.Id as BestAnswerId,
+    ra.Score as BestAnswerScore,
+    extract(day from cast('2024-10-01 12:34:56' as timestamp) - ra.CreationDate) as BestAnswerAgeDays
+  from RankedAnswers ra
+  where ra.AnswerRank = 1
+) bestAns on bestAns.OwnerUserId = u.Id
+where 
+  (coalesce(upc.TotalPosts,0) > 10 or coalesce(ubr.BadgeCount,0) > 2)
+  and (
+    (coalesce(upc.AvgScore,0) > 3 or coalesce(ubr.BadgeScore,0) > 5)
+    or 
+    exists (
+      select 1 from Posts p2 
+      where p2.OwnerUserId = u.Id and p2.PostTypeId=1 and p2.ClosedDate is null
+      and p2.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '30 days'
+    )
+  )
+order by coalesce(upc.TotalPostScore,0) desc, coalesce(ubr.BadgeScore,0) desc
+limit 100;

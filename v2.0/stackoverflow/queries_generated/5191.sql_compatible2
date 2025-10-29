@@ -1,0 +1,140 @@
+WITH
+RecentActivePosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.Title,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Tags,
+    p.ViewCount,
+    p.Score,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount
+  FROM Posts p
+  WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days'
+),
+TopUsers AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.ProfileImageUrl,
+    u.Location,
+    u.WebsiteUrl,
+    u.EmailHash,
+    u.AccountId,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, (u.UpVotes - u.DownVotes) DESC, u.CreationDate DESC) AS rn
+  FROM Users u
+),
+TagPopularity AS (
+  SELECT
+    tag_text.TagName,
+    COUNT(*) AS TagCount,
+    AVG(p.Score) AS AvgScore,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesOnTag,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesOnTag
+  FROM Tags tg
+  JOIN Posts p ON p.Id = tg.WikiPostId OR p.Id = tg.ExcerptPostId
+  LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  JOIN (
+    SELECT
+      p2.Id AS PostId,
+      regexp_split_to_table(substring(p2.Tags FROM 2 FOR char_length(p2.Tags) - 2), '><') AS TagName
+    FROM Posts p2
+    WHERE p2.Tags IS NOT NULL
+  ) AS tag_text ON tag_text.PostId = p.Id
+  GROUP BY tag_text.TagName
+),
+ComplexAggregates AS (
+  SELECT
+    ph.Id AS PostHistoryId,
+    ph.PostId,
+    ph.PostHistoryTypeId,
+    ph.RevisionGUID,
+    ph.CreationDate AS RevisionDate,
+    ph.UserId AS EditorUserId,
+    ph.Comment,
+    ph.Text,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.LastActivityDate,
+    p.Title,
+    p.Tags,
+    u.DisplayName AS EditorDisplayName
+  FROM PostHistory ph
+  LEFT JOIN Posts p ON p.Id = ph.PostId
+  LEFT JOIN Users u ON u.Id = ph.UserId
+  WHERE ph.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '60 days'
+)
+SELECT
+  r.PostId,
+  r.Title,
+  r.PostTypeId,
+  r.OwnerUserId,
+  o.DisplayName AS OwnerDisplayName,
+  r.CreationDate AS PostCreated,
+  r.LastActivityDate,
+  r.Tags,
+  r.ViewCount,
+  r.Score,
+  r.CommentCount,
+  r.AnswerCount,
+  ROW_NUMBER() OVER (PARTITION BY r.PostTypeId ORDER BY r.Score DESC, r.LastActivityDate DESC) AS TypeRank,
+  (SELECT COUNT(*) FROM PostHistory ph2 WHERE ph2.PostId = r.PostId) AS EditCount,
+  t.TagName,
+  t.TagCount,
+  t.AvgScore,
+  t.UpvotesOnTag,
+  t.DownvotesOnTag
+FROM RecentActivePosts r
+LEFT JOIN Users o ON o.Id = r.OwnerUserId
+LEFT JOIN TopUsers tu ON tu.UserId = o.Id
+LEFT JOIN (
+  SELECT TagName, TagCount, AvgScore, UpvotesOnTag, DownvotesOnTag
+  FROM (
+    SELECT
+      TagName,
+      TagCount,
+      AvgScore,
+      UpvotesOnTag,
+      DownvotesOnTag,
+      ROW_NUMBER() OVER (PARTITION BY TagName ORDER BY TagCount DESC) AS rn
+    FROM TagPopularity
+  ) sub
+  WHERE rn = 1
+) t ON TRUE
+UNION ALL
+SELECT
+  NULL::bigint AS PostId,
+  NULL::text AS Title,
+  NULL::integer AS PostTypeId,
+  NULL::bigint AS OwnerUserId,
+  NULL::text AS OwnerDisplayName,
+  NULL::timestamp AS PostCreated,
+  NULL::timestamp AS LastActivityDate,
+  NULL::text AS Tags,
+  NULL::integer AS ViewCount,
+  NULL::integer AS Score,
+  NULL::integer AS CommentCount,
+  NULL::integer AS AnswerCount,
+  NULL::bigint AS TypeRank,
+  NULL::bigint AS EditCount,
+  tg.TagName,
+  tg.TagCount,
+  tg.AvgScore,
+  tg.UpvotesOnTag,
+  tg.DownvotesOnTag
+FROM TagPopularity tg
+ORDER BY PostCreated NULLS LAST, TypeRank NULLS LAST
+LIMIT 200;

@@ -1,0 +1,100 @@
+-- {"query": "5315.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 808} 
+WITH
+RecentBestPosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.ViewCount,
+    p.Score,
+    p.OwnerUserId,
+    u.DisplayName AS OwnerName,
+    COUNT(DISTINCT c.Id) AS CommentCount,
+    ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC, p.LastActivityDate DESC) AS rn
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Comments c ON c.PostId = p.Id
+  WHERE p.PostTypeId = 1 -- Questions
+    AND p.CreationDate >= DATEADD(day, -30, cast('2024-10-01' as date))
+    AND (p.ViewCount > 0 OR p.Score IS NOT NULL)
+  GROUP BY p.Id, p.Title, p.Tags, p.CreationDate, p.ViewCount, p.Score, p.OwnerUserId, u.DisplayName
+),
+TopTags AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS TagCount,
+    SUM(CASE WHEN p.Score > 0 THEN 1 ELSE 0 END) AS PositiveScoreCount,
+    AVG(p.Score) AS AvgScore
+  FROM Posts p
+  CROSS APPLY (SELECT value AS TagName
+               FROM string_split(REPLACE(p.Tags, '<', ' '), '>')) s
+  RIGHT JOIN Tags t ON t.Id = (
+      SELECT Id FROM Tags WHERE TagName = s.TagName
+  )
+  WHERE p.PostTypeId = 1
+  GROUP BY t.TagName
+),
+TagEngagement AS (
+  SELECT
+    t.TagName,
+    MIN(p.CreationDate) AS FirstQuestionDate,
+    MAX(p.LastActivityDate) AS LastActivityDate,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS Downvotes,
+    COUNT(DISTINCT p.Id) AS QuestionCount
+  FROM Posts p
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  LEFT JOIN Tags t ON p.Tags LIKE '%' + t.TagName + '%'
+  WHERE p.PostTypeId = 1
+  GROUP BY t.TagName
+),
+CorrelatedSummary AS (
+  SELECT
+    rb.PostId,
+    rb.Title,
+    rb.Tags,
+    rb.CreationDate,
+    rb.ViewCount,
+    rb.Score,
+    rb.OwnerUserId,
+    rb.OwnerName,
+    rb.CommentCount,
+    tt.TagName,
+    tt.TagCount,
+    tt.PositiveScoreCount,
+    tt.AvgScore,
+    te.FirstQuestionDate,
+    te.LastActivityDate,
+    te.Upvotes,
+    te.Downvotes,
+    te.QuestionCount
+  FROM RecentBestPosts rb
+  LEFT JOIN TopTags tt ON rb.Tags LIKE '%' + tt.TagName + '%'
+  LEFT JOIN TagEngagement te ON te.TagName = tt.TagName
+  WHERE rb.rn = 1
+)
+SELECT
+  cs.PostId,
+  cs.Title,
+  cs.Tags,
+  cs.CreationDate,
+  cs.ViewCount,
+  cs.Score,
+  cs.OwnerUserId,
+  cs.OwnerName,
+  cs.CommentCount,
+  cs.TagName,
+  cs.TagCount,
+  cs.PositiveScoreCount,
+  cs.AvgScore,
+  cs.FirstQuestionDate,
+  cs.LastActivityDate,
+  cs.Upvotes,
+  cs.Downvotes,
+  cs.QuestionCount
+FROM CorrelatedSummary cs
+LEFT JOIN Posts p2 ON p2.Id = cs.PostId
+LEFT JOIN Votes v2 ON v2.PostId = p2.Id AND v2.VoteTypeId = 2
+ORDER BY cs.Score DESC, cs.ViewCount DESC
+LIMIT 100;

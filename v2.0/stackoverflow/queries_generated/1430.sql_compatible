@@ -1,0 +1,280 @@
+WITH UserActivityStats AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesGiven,
+        SUM(CASE WHEN VP.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesReceived,
+        AVG(CASE WHEN P.Score IS NOT NULL THEN P.Score ELSE 0 END) AS AveragePostScore,
+        MAX(P.CreationDate) AS LastPostCreationDate,
+        MIN(P.CreationDate) AS FirstPostCreationDate
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Votes V ON U.Id = V.UserId
+    LEFT JOIN Posts P_Received ON U.Id = P_Received.OwnerUserId
+    LEFT JOIN Votes VP ON P_Received.Id = VP.PostId
+    GROUP BY U.Id, U.DisplayName
+),
+PostEditHistory AS (
+    SELECT
+        PH.PostId,
+        MAX(PH.CreationDate) AS LastEditDate,
+        MIN(PH.CreationDate) AS FirstEditDate,
+        COUNT(PH.Id) AS TotalRevisions,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS ContentEditCount,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS WasClosed,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS WasReopened,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.CreationDate ELSE NULL END) AS ClosedTimestamp,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 11 THEN PH.CreationDate ELSE NULL END) AS ReopenedTimestamp,
+        COALESCE(MAX(CASE WHEN PH.PostHistoryTypeId IN (4,5,6,7,8,9) THEN PH.UserId END), P.OwnerUserId) AS LastEffectiveEditorId
+    FROM PostHistory PH
+    JOIN Posts P ON PH.PostId = P.Id
+    WHERE PH.PostHistoryTypeId IN (1,2,3,4,5,6,7,8,9,10,11)
+    GROUP BY PH.PostId, P.OwnerUserId
+),
+UserBadgeAwards AS (
+    SELECT
+        B.UserId,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(B.Id) AS TotalBadges
+    FROM Badges B
+    GROUP BY B.UserId
+),
+PopularTagsContribution AS (
+    SELECT
+        U.Id AS UserId,
+        TRIM(unnested_tag) AS TagName,
+        COUNT(P.Id) AS PostsWithTag,
+        AVG(P.Score) AS AverageScoreWithTag
+    FROM Users U
+    JOIN Posts P ON U.Id = P.OwnerUserId
+    CROSS JOIN LATERAL (
+        SELECT UNNEST(string_to_array(substring(P.Tags, 2, length(P.Tags)-2), '><')) AS unnested_tag
+    ) t_unnest
+    WHERE P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2 AND P.PostTypeId = 1
+    GROUP BY U.Id, TRIM(unnested_tag)
+    HAVING COUNT(P.Id) > 2
+),
+AnswerChainMetrics AS (
+    SELECT
+        P.ParentId AS QuestionId,
+        COUNT(P.Id) AS AnswerCount,
+        AVG(P.Score) AS AverageAnswerScore,
+        MAX(P.CreationDate) AS LatestAnswerDate
+    FROM Posts P
+    WHERE P.PostTypeId = 2
+    GROUP BY P.ParentId
+),
+ProblematicCommenters AS (
+    SELECT DISTINCT UserId
+    FROM Comments
+    WHERE (LOWER(Text) LIKE '%spam%' OR LOWER(Text) LIKE '%promotion%' OR LOWER(Text) LIKE '%unrelated%')
+      AND CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year')
+)
+SELECT *
+FROM (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Location,
+        U.Views AS UserProfileViews,
+        UAS.TotalPosts,
+        UAS.TotalAnswers,
+        UAS.TotalComments,
+        UAS.TotalUpvotesReceived,
+        UBA.GoldBadges,
+        UBA.SilverBadges,
+        UBA.BronzeBadges,
+        UBA.TotalBadges,
+        COALESCE(UAS.AveragePostScore, 0.0) AS UserAveragePostScore,
+        EXTRACT(EPOCH FROM (U.LastAccessDate - U.CreationDate)) / 86400 AS DaysSinceCreation,
+        (SELECT COUNT(DISTINCT P_Inner.Id)
+         FROM Posts P_Inner
+         WHERE P_Inner.OwnerUserId = U.Id
+           AND P_Inner.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year')
+           AND P_Inner.ViewCount > 100
+        ) AS RecentHighViewPosts,
+        (SELECT COALESCE(SUM(P_Sub.Score), 0)
+         FROM Posts P_Sub
+         WHERE P_Sub.OwnerUserId = U.Id
+           AND P_Sub.PostTypeId = 1
+           AND P_Sub.AnswerCount IS NOT NULL
+           AND P_Sub.AnswerCount > (SELECT AVG(AnswerCount) FROM Posts WHERE PostTypeId = 1 AND AnswerCount IS NOT NULL)
+        ) AS ScoreFromHighAnswerQuestions,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 AND P.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS AcceptedAnswers,
+        SUM(CASE WHEN PL.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicatePostLinksMade,
+        AVG(PH.ContentEditCount) OVER (PARTITION BY U.Location) AS AvgContentEditsInLocation,
+        RANK() OVER (PARTITION BY DATE_TRUNC('month', U.CreationDate) ORDER BY U.Reputation DESC) AS RankByReputationInJoinMonth,
+        NTILE(10) OVER (ORDER BY UAS.TotalPosts DESC, UAS.TotalComments DESC) AS ActivityDecile,
+        LAG(U.Reputation, 1, 0) OVER (ORDER BY U.CreationDate) AS PrevUserReputation,
+        MAX(CASE WHEN PTC.TagName = 'sql' THEN PTC.AverageScoreWithTag ELSE 0.0 END) AS AvgSqlTagScore,
+        NULLIF(U.UpVotes, 0) / NULLIF(U.DownVotes, 0) AS UpDownVoteRatio,
+        COALESCE(U.AboutMe, 'No "About Me" provided') AS AboutMeSummary,
+        CASE
+            WHEN U.Reputation >= 10000 AND COALESCE(UBA.GoldBadges, 0) >= 3 THEN 'Guru'
+            WHEN U.Reputation >= 5000 AND COALESCE(UBA.SilverBadges, 0) >= 5 THEN 'Expert'
+            WHEN U.Reputation >= 1000 AND COALESCE(UBA.BronzeBadges, 0) >= 10 THEN 'Contributor'
+            ELSE 'Novice'
+        END AS UserCategory,
+        P.Title AS LatestPostTitle,
+        P.CreationDate AS LatestPostCreationDate,
+        PH.WasClosed,
+        PH.WasReopened,
+        PH.TotalRevisions AS LatestPostRevisions,
+        (PH.ReopenedTimestamp - PH.ClosedTimestamp) AS TimeToReopen,
+        AC.AnswerCount AS LatestPostAnswerCount,
+        AC.AverageAnswerScore AS LatestPostAvgAnswerScore,
+        LPE.DisplayName AS LastEditorDisplayName,
+        (
+            SELECT STRING_AGG(t.TagName, ', ')
+            FROM (
+                SELECT DISTINCT TRIM(unnested_tag_inner) AS TagName, P_Tags.CreationDate
+                FROM Posts P_Tags
+                CROSS JOIN LATERAL (
+                    SELECT UNNEST(string_to_array(substring(P_Tags.Tags, 2, length(P_Tags.Tags)-2), '><')) AS unnested_tag_inner
+                ) ut
+                JOIN Tags T ON T.TagName = TRIM(unnested_tag_inner)
+                WHERE P_Tags.OwnerUserId = U.Id
+                  AND P_Tags.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6 month')
+                  AND T.TagName IS NOT NULL AND LENGTH(T.TagName) > 0
+                ORDER BY P_Tags.CreationDate DESC
+                LIMIT 5
+            ) t
+        ) AS RecentTagsString
+    FROM Users U
+    LEFT JOIN UserActivityStats UAS ON U.Id = UAS.UserId
+    LEFT JOIN UserBadgeAwards UBA ON U.Id = UBA.UserId
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId AND P.Id = (SELECT Id FROM Posts WHERE OwnerUserId = U.Id ORDER BY CreationDate DESC LIMIT 1)
+    LEFT JOIN PostEditHistory PH ON P.Id = PH.PostId
+    LEFT JOIN PostLinks PL ON P.Id = PL.PostId
+    LEFT JOIN AnswerChainMetrics AC ON P.Id = AC.QuestionId
+    LEFT JOIN Users LPE ON PH.LastEffectiveEditorId = LPE.Id
+    LEFT JOIN PopularTagsContribution PTC ON U.Id = PTC.UserId AND PTC.TagName = 'sql'
+    WHERE
+        U.Reputation > 500
+        AND U.DisplayName IS NOT NULL
+        AND U.Location IS NOT NULL
+        AND (LOWER(U.AboutMe) LIKE '%developer%' OR LOWER(U.AboutMe) LIKE '%programmer%' OR U.AboutMe IS NULL)
+        AND U.LastAccessDate >= U.CreationDate + INTERVAL '3 months'
+        AND EXISTS (
+            SELECT 1
+            FROM Badges B_Exist
+            WHERE B_Exist.UserId = U.Id
+              AND B_Exist.Class = 1
+        )
+        AND (U.WebsiteUrl IS DISTINCT FROM 'http://example.com')
+        AND (PH.WasClosed IS NULL OR PH.WasClosed = 0 OR (PH.WasClosed = 1 AND PH.WasReopened = 1 AND PH.ReopenedTimestamp > PH.ClosedTimestamp))
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Location, U.Views,
+        UAS.TotalPosts, UAS.TotalAnswers, UAS.TotalComments, UAS.TotalUpvotesReceived, UAS.AveragePostScore,
+        UBA.GoldBadges, UBA.SilverBadges, UBA.BronzeBadges, UBA.TotalBadges,
+        P.Title, P.CreationDate, PH.WasClosed, PH.WasReopened, PH.TotalRevisions, PH.ClosedTimestamp, PH.ReopenedTimestamp,
+        AC.AnswerCount, AC.AverageAnswerScore, LPE.DisplayName, U.UpVotes, U.DownVotes, U.AboutMe, PTC.AverageScoreWithTag
+    HAVING
+        COUNT(CASE WHEN P.PostTypeId = 1 THEN 1 END) > 2
+        AND SUM(CASE WHEN P.Score > 50 THEN 1 ELSE 0 END) > 1
+) AS QualifiedUsers
+EXCEPT
+SELECT *
+FROM (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Location,
+        U.Views AS UserProfileViews,
+        UAS.TotalPosts,
+        UAS.TotalAnswers,
+        UAS.TotalComments,
+        UAS.TotalUpvotesReceived,
+        UBA.GoldBadges,
+        UBA.SilverBadges,
+        UBA.BronzeBadges,
+        UBA.TotalBadges,
+        COALESCE(UAS.AveragePostScore, 0.0) AS UserAveragePostScore,
+        EXTRACT(EPOCH FROM (U.LastAccessDate - U.CreationDate)) / 86400 AS DaysSinceCreation,
+        (SELECT COUNT(DISTINCT P_Inner.Id)
+         FROM Posts P_Inner
+         WHERE P_Inner.OwnerUserId = U.Id
+           AND P_Inner.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year')
+           AND P_Inner.ViewCount > 100
+        ) AS RecentHighViewPosts,
+        (SELECT COALESCE(SUM(P_Sub.Score), 0)
+         FROM Posts P_Sub
+         WHERE P_Sub.OwnerUserId = U.Id
+           AND P_Sub.PostTypeId = 1
+           AND P_Sub.AnswerCount IS NOT NULL
+           AND P_Sub.AnswerCount > (SELECT AVG(AnswerCount) FROM Posts WHERE PostTypeId = 1 AND AnswerCount IS NOT NULL)
+        ) AS ScoreFromHighAnswerQuestions,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 AND P.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS AcceptedAnswers,
+        SUM(CASE WHEN PL.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicatePostLinksMade,
+        AVG(PH.ContentEditCount) OVER (PARTITION BY U.Location) AS AvgContentEditsInLocation,
+        RANK() OVER (PARTITION BY DATE_TRUNC('month', U.CreationDate) ORDER BY U.Reputation DESC) AS RankByReputationInJoinMonth,
+        NTILE(10) OVER (ORDER BY UAS.TotalPosts DESC, UAS.TotalComments DESC) AS ActivityDecile,
+        LAG(U.Reputation, 1, 0) OVER (ORDER BY U.CreationDate) AS PrevUserReputation,
+        MAX(CASE WHEN PTC.TagName = 'sql' THEN PTC.AverageScoreWithTag ELSE 0.0 END) AS AvgSqlTagScore,
+        NULLIF(U.UpVotes, 0) / NULLIF(U.DownVotes, 0) AS UpDownVoteRatio,
+        COALESCE(U.AboutMe, 'No "About Me" provided') AS AboutMeSummary,
+        CASE
+            WHEN U.Reputation >= 10000 AND COALESCE(UBA.GoldBadges, 0) >= 3 THEN 'Guru'
+            WHEN U.Reputation >= 5000 AND COALESCE(UBA.SilverBadges, 0) >= 5 THEN 'Expert'
+            WHEN U.Reputation >= 1000 AND COALESCE(UBA.BronzeBadges, 0) >= 10 THEN 'Contributor'
+            ELSE 'Novice'
+        END AS UserCategory,
+        P.Title AS LatestPostTitle,
+        P.CreationDate AS LatestPostCreationDate,
+        PH.WasClosed,
+        PH.WasReopened,
+        PH.TotalRevisions AS LatestPostRevisions,
+        (PH.ReopenedTimestamp - PH.ClosedTimestamp) AS TimeToReopen,
+        AC.AnswerCount AS LatestPostAnswerCount,
+        AC.AverageAnswerScore AS LatestPostAvgAnswerScore,
+        LPE.DisplayName AS LastEditorDisplayName,
+        (
+            SELECT STRING_AGG(t.TagName, ', ')
+            FROM (
+                SELECT DISTINCT TRIM(unnested_tag_inner) AS TagName, P_Tags.CreationDate
+                FROM Posts P_Tags
+                CROSS JOIN LATERAL (
+                    SELECT UNNEST(string_to_array(substring(P_Tags.Tags, 2, length(P_Tags.Tags)-2), '><')) AS unnested_tag_inner
+                ) ut
+                JOIN Tags T ON T.TagName = TRIM(unnested_tag_inner)
+                WHERE P_Tags.OwnerUserId = U.Id
+                  AND P_Tags.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6 month')
+                  AND T.TagName IS NOT NULL AND LENGTH(T.TagName) > 0
+                ORDER BY P_Tags.CreationDate DESC
+                LIMIT 5
+            ) t
+        ) AS RecentTagsString
+    FROM Users U
+    LEFT JOIN UserActivityStats UAS ON U.Id = UAS.UserId
+    LEFT JOIN UserBadgeAwards UBA ON U.Id = UBA.UserId
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId AND P.Id = (SELECT Id FROM Posts WHERE OwnerUserId = U.Id ORDER BY CreationDate DESC LIMIT 1)
+    LEFT JOIN PostEditHistory PH ON P.Id = PH.PostId
+    LEFT JOIN PostLinks PL ON P.Id = PL.PostId
+    LEFT JOIN AnswerChainMetrics AC ON P.Id = AC.QuestionId
+    LEFT JOIN Users LPE ON PH.LastEffectiveEditorId = LPE.Id
+    LEFT JOIN PopularTagsContribution PTC ON U.Id = PTC.UserId AND PTC.TagName = 'sql'
+    WHERE U.Id IN (SELECT UserId FROM ProblematicCommenters)
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Location, U.Views,
+        UAS.TotalPosts, UAS.TotalAnswers, UAS.TotalComments, UAS.TotalUpvotesReceived, UAS.AveragePostScore,
+        UBA.GoldBadges, UBA.SilverBadges, UBA.BronzeBadges, UBA.TotalBadges,
+        P.Title, P.CreationDate, PH.WasClosed, PH.WasReopened, PH.TotalRevisions, PH.ClosedTimestamp, PH.ReopenedTimestamp,
+        AC.AnswerCount, AC.AverageAnswerScore, LPE.DisplayName, U.UpVotes, U.DownVotes, U.AboutMe, PTC.AverageScoreWithTag
+) AS ProblematicUsers
+ORDER BY
+    UserCategory DESC, Reputation DESC, DaysSinceCreation DESC
+LIMIT 1000;

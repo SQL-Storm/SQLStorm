@@ -1,0 +1,365 @@
+WITH UserBaseInfo AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.Views AS UserProfileViews,
+        u.UpVotes AS UserGivenUpvotes,
+        u.DownVotes AS UserGivenDownvotes,
+        u.Location,
+        u.AboutMe
+    FROM Users u
+    WHERE u.CreationDate >= DATE '2008-01-01'
+      AND u.Reputation > 500
+      AND u.LastAccessDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '5 year'
+),
+PostHistoryAndEditMetrics AS (
+    SELECT
+        ph.PostId,
+        COUNT(DISTINCT ph.Id) AS RevisionCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS MajorEditCount,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) = 1 AS WasClosed,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) = 1 AS WasReopened,
+        MAX(ph.CreationDate) AS LastHistoryDate
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 10, 11, 12, 13)
+    GROUP BY ph.PostId
+),
+PostLinkMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        COUNT(pl.Id) AS LinkedPostsCount,
+        SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicatePostsCount,
+        MAX(pl.CreationDate) AS LastLinkDate
+    FROM Posts p
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId OR p.Id = pl.RelatedPostId
+    GROUP BY p.Id
+),
+CommentAndVoteMetrics AS (
+    SELECT
+        p_inner.Id AS PostId,
+        COUNT(c.Id) AS TotalComments,
+        SUM(CASE WHEN c.Score IS NOT NULL THEN c.Score ELSE 0 END) AS TotalCommentScore,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS PostUpvotesReceived,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS PostDownvotesReceived,
+        SUM(CASE WHEN v.VoteTypeId = 1 THEN 1 ELSE 0 END) AS PostAcceptedVotesOnAnswer,
+        SUM(CASE WHEN v.VoteTypeId = 5 AND v.UserId IS NOT NULL THEN 1 ELSE 0 END) AS PostFavoriteVotes
+    FROM Posts p_inner
+    LEFT JOIN Comments c ON p_inner.Id = c.PostId
+    LEFT JOIN Votes v ON p_inner.Id = v.PostId
+    GROUP BY p_inner.Id
+),
+PostAggregatesCombined AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount AS PostViewCount,
+        p.AcceptedAnswerId,
+        p.FavoriteCount AS PostBookmarkCount,
+        p.LastActivityDate,
+        p.Title,
+        p.Tags,
+        COALESCE(phem.RevisionCount, 0) AS RevisionCount,
+        COALESCE(phem.MajorEditCount, 0) AS MajorEditCount,
+        COALESCE(phem.WasClosed, FALSE) AS WasClosed,
+        COALESCE(phem.WasReopened, FALSE) AS WasReopened,
+        COALESCE(phem.LastHistoryDate, p.CreationDate) AS LastPostModificationDate,
+        COALESCE(plm.LinkedPostsCount, 0) AS LinkedPostsCount,
+        COALESCE(plm.DuplicatePostsCount, 0) AS DuplicatePostsCount,
+        COALESCE(plm.LastLinkDate, p.CreationDate) AS LastLinkChangeDate,
+        COALESCE(cvm.TotalComments, 0) AS TotalComments,
+        COALESCE(cvm.TotalCommentScore, 0) AS TotalCommentScore,
+        COALESCE(cvm.PostUpvotesReceived, 0) AS PostUpvotesReceived,
+        COALESCE(cvm.PostDownvotesReceived, 0) AS PostDownvotesReceived,
+        COALESCE(cvm.PostAcceptedVotesOnAnswer, 0) AS PostAcceptedVotesOnAnswer,
+        COALESCE(cvm.PostFavoriteVotes, 0) AS PostFavoriteVotesReceived,
+        'HighViews' AS PostCategory
+    FROM Posts p
+    LEFT JOIN PostHistoryAndEditMetrics phem ON p.Id = phem.PostId
+    LEFT JOIN PostLinkMetrics plm ON p.Id = plm.PostId
+    LEFT JOIN CommentAndVoteMetrics cvm ON p.Id = cvm.PostId
+    WHERE p.PostTypeId IN (1, 2)
+      AND p.CreationDate >= DATE '2008-01-01'
+      AND p.ViewCount > 50000
+      AND p.LastActivityDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '3 year'
+
+    UNION ALL
+
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount AS PostViewCount,
+        p.AcceptedAnswerId,
+        p.FavoriteCount AS PostBookmarkCount,
+        p.LastActivityDate,
+        p.Title,
+        p.Tags,
+        COALESCE(phem.RevisionCount, 0) AS RevisionCount,
+        COALESCE(phem.MajorEditCount, 0) AS MajorEditCount,
+        COALESCE(phem.WasClosed, FALSE) AS WasClosed,
+        COALESCE(phem.WasReopened, FALSE) AS WasReopened,
+        COALESCE(phem.LastHistoryDate, p.CreationDate) AS LastPostModificationDate,
+        COALESCE(plm.LinkedPostsCount, 0) AS LinkedPostsCount,
+        COALESCE(plm.DuplicatePostsCount, 0) AS DuplicatePostsCount,
+        COALESCE(plm.LastLinkDate, p.CreationDate) AS LastLinkChangeDate,
+        COALESCE(cvm.TotalComments, 0) AS TotalComments,
+        COALESCE(cvm.TotalCommentScore, 0) AS TotalCommentScore,
+        COALESCE(cvm.PostUpvotesReceived, 0) AS PostUpvotesReceived,
+        COALESCE(cvm.PostDownvotesReceived, 0) AS PostDownvotesReceived,
+        COALESCE(cvm.PostAcceptedVotesOnAnswer, 0) AS PostAcceptedVotesOnAnswer,
+        COALESCE(cvm.PostFavoriteVotes, 0) AS PostFavoriteVotesReceived,
+        'HighScore' AS PostCategory
+    FROM Posts p
+    LEFT JOIN PostHistoryAndEditMetrics phem ON p.Id = phem.PostId
+    LEFT JOIN PostLinkMetrics plm ON p.Id = plm.PostId
+    LEFT JOIN CommentAndVoteMetrics cvm ON p.Id = cvm.PostId
+    WHERE p.PostTypeId IN (1, 2)
+      AND p.CreationDate >= DATE '2008-01-01'
+      AND p.Score > 1000
+      AND p.LastActivityDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '3 year'
+      AND NOT (p.ViewCount > 50000)
+),
+UserPostPerformance AS (
+    SELECT
+        pac.OwnerUserId AS UserId,
+        COUNT(pac.PostId) AS UserTotalPosts,
+        SUM(CASE WHEN pac.PostTypeId = 1 THEN 1 ELSE 0 END) AS UserTotalQuestions,
+        SUM(CASE WHEN pac.PostTypeId = 2 THEN 1 ELSE 0 END) AS UserTotalAnswers,
+        SUM(pac.PostScore) AS UserTotalPostScore,
+        SUM(pac.PostViewCount) AS UserTotalPostViews,
+        SUM(pac.PostBookmarkCount) AS UserTotalBookmarkCount,
+        SUM(pac.RevisionCount) AS UserTotalRevisions,
+        SUM(pac.MajorEditCount) AS UserTotalMajorEdits,
+        SUM(CASE WHEN pac.WasClosed THEN 1 ELSE 0 END) AS UserPostsClosedCount,
+        SUM(CASE WHEN pac.WasReopened THEN 1 ELSE 0 END) AS UserPostsReopenedCount,
+        SUM(pac.LinkedPostsCount) AS UserTotalLinkedPosts,
+        SUM(pac.DuplicatePostsCount) AS UserTotalDuplicatePosts,
+        SUM(pac.TotalComments) AS UserTotalComments,
+        SUM(pac.TotalCommentScore) AS UserTotalCommentScore,
+        SUM(pac.PostUpvotesReceived) AS UserTotalUpvotes,
+        SUM(pac.PostDownvotesReceived) AS UserTotalDownvotes,
+        SUM(pac.PostAcceptedVotesOnAnswer) AS UserTotalAcceptedAnswers,
+        SUM(pac.PostFavoriteVotesReceived) AS UserTotalFavoriteVotesFromOthers,
+        MAX(pac.LastActivityDate) AS LastPostActivityByUser,
+        ARRAY_AGG(DISTINCT pac.PostCategory ORDER BY pac.PostCategory) AS PostCategoriesContributedTo
+    FROM PostAggregatesCombined pac
+    GROUP BY pac.OwnerUserId
+),
+UserBadgeStats AS (
+    SELECT
+        b.UserId,
+        COUNT(b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        -- Emulate "top 5 distinct badge names" using ARRAY_AGG over a subquery with LIMIT where supported.
+        (SELECT ARRAY_AGG(t.name) FROM (
+            SELECT DISTINCT b2.Name AS name
+            FROM Badges b2
+            WHERE b2.UserId = b.UserId
+            ORDER BY b2.Name
+            LIMIT 5
+        ) t) AS TopBadgeNames
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserComprehensiveStats AS (
+    SELECT
+        ubi.UserId,
+        ubi.DisplayName,
+        ubi.Reputation,
+        ubi.UserCreationDate,
+        ubi.LastAccessDate,
+        ubi.UserProfileViews,
+        ubi.UserGivenUpvotes,
+        ubi.UserGivenDownvotes,
+        ubi.Location,
+        ubi.AboutMe,
+        upp.UserTotalPosts,
+        upp.UserTotalQuestions,
+        upp.UserTotalAnswers,
+        upp.UserTotalPostScore,
+        upp.UserTotalPostViews,
+        upp.UserTotalBookmarkCount,
+        upp.UserTotalRevisions,
+        upp.UserTotalMajorEdits,
+        upp.UserPostsClosedCount,
+        upp.UserPostsReopenedCount,
+        upp.UserTotalLinkedPosts,
+        upp.UserTotalDuplicatePosts,
+        upp.UserTotalComments,
+        upp.UserTotalCommentScore,
+        upp.UserTotalUpvotes,
+        upp.UserTotalDownvotes,
+        upp.UserTotalAcceptedAnswers,
+        upp.UserTotalFavoriteVotesFromOthers,
+        upp.LastPostActivityByUser,
+        upp.PostCategoriesContributedTo,
+        COALESCE(ubs.TotalBadges, 0) AS TotalBadges,
+        COALESCE(ubs.GoldBadges, 0) AS GoldBadges,
+        COALESCE(ubs.SilverBadges, 0) AS SilverBadges,
+        COALESCE(ubs.BronzeBadges, 0) AS BronzeBadges,
+        ubs.TopBadgeNames
+    FROM UserBaseInfo ubi
+    INNER JOIN UserPostPerformance upp ON ubi.UserId = upp.UserId
+    LEFT JOIN UserBadgeStats ubs ON ubi.UserId = ubs.UserId
+),
+RankedUsers AS (
+    SELECT
+        ucs.UserId,
+        ucs.DisplayName,
+        ucs.Reputation,
+        ucs.UserCreationDate,
+        ucs.LastAccessDate,
+        ucs.UserProfileViews,
+        ucs.UserGivenUpvotes,
+        ucs.UserGivenDownvotes,
+        ucs.Location,
+        ucs.AboutMe,
+        ucs.UserTotalPosts,
+        ucs.UserTotalQuestions,
+        ucs.UserTotalAnswers,
+        ucs.UserTotalPostScore,
+        ucs.UserTotalPostViews,
+        ucs.UserTotalBookmarkCount,
+        ucs.UserTotalRevisions,
+        ucs.UserTotalMajorEdits,
+        ucs.UserPostsClosedCount,
+        ucs.UserPostsReopenedCount,
+        ucs.UserTotalLinkedPosts,
+        ucs.UserTotalDuplicatePosts,
+        ucs.UserTotalComments,
+        ucs.UserTotalCommentScore,
+        ucs.UserTotalUpvotes,
+        ucs.UserTotalDownvotes,
+        ucs.UserTotalAcceptedAnswers,
+        ucs.UserTotalFavoriteVotesFromOthers,
+        ucs.LastPostActivityByUser,
+        ucs.PostCategoriesContributedTo,
+        ucs.TotalBadges,
+        ucs.GoldBadges,
+        ucs.SilverBadges,
+        ucs.BronzeBadges,
+        ucs.TopBadgeNames,
+        (CAST(ucs.UserTotalUpvotes AS NUMERIC) - CAST(ucs.UserTotalDownvotes AS NUMERIC)) AS NetReceivedVotes,
+        CAST(ucs.UserTotalPostScore AS NUMERIC) / NULLIF(ucs.UserTotalPosts, 0) AS AvgScorePerUserPost,
+        ucs.UserTotalPosts + ucs.UserTotalComments + ucs.UserTotalMajorEdits AS UserActivityScore,
+        DENSE_RANK() OVER (ORDER BY ucs.Reputation DESC, ucs.UserId) AS ReputationRank,
+        NTILE(10) OVER (ORDER BY ucs.UserTotalUpvotes DESC) AS UpvoteDecile,
+        AVG(ucs.UserProfileViews) OVER (PARTITION BY ucs.Location) AS AvgProfileViewsInLocation,
+        SUM(ucs.UserTotalRevisions) OVER (PARTITION BY EXTRACT(YEAR FROM ucs.UserCreationDate)) AS TotalRevisionsByCreationYear,
+        LAG(ucs.Reputation, 1, 0) OVER (ORDER BY ucs.Reputation DESC, ucs.UserId) AS PrevRankedUserReputation,
+        LEAD(ucs.Reputation, 1, 0) OVER (ORDER BY ucs.Reputation DESC, ucs.UserId) AS NextRankedUserReputation
+    FROM UserComprehensiveStats ucs
+    WHERE ucs.UserTotalPosts > 100
+      AND ucs.UserTotalUpvotes > 2000
+      AND ucs.AboutMe IS NOT NULL AND LENGTH(TRIM(ucs.AboutMe)) > 50
+),
+FinalSelection AS (
+    SELECT
+        ru.UserId,
+        ru.DisplayName,
+        ru.Reputation,
+        ru.ReputationRank,
+        ru.NetReceivedVotes,
+        ru.AvgScorePerUserPost,
+        ru.TotalBadges,
+        ru.GoldBadges,
+        ru.TopBadgeNames,
+        ru.UserTotalQuestions,
+        ru.UserTotalAnswers,
+        ru.UserTotalAcceptedAnswers,
+        ru.UserPostsClosedCount,
+        ru.UserTotalMajorEdits,
+        ru.PostCategoriesContributedTo,
+        ru.UserCreationDate,
+        ru.LastPostActivityByUser,
+        ru.UserProfileViews,
+        ru.UserTotalPostScore,
+        ru.UserActivityScore,
+        ru.PrevRankedUserReputation,
+        ru.NextRankedUserReputation
+    FROM RankedUsers ru
+    WHERE ru.NetReceivedVotes IS NOT NULL
+)
+SELECT
+    fs.UserId,
+    fs.DisplayName,
+    fs.Reputation,
+    fs.ReputationRank,
+    fs.NetReceivedVotes,
+    fs.AvgScorePerUserPost,
+    fs.TotalBadges,
+    fs.GoldBadges,
+    fs.TopBadgeNames,
+    fs.UserTotalQuestions,
+    fs.UserTotalAnswers,
+    fs.UserTotalAcceptedAnswers,
+    fs.UserPostsClosedCount,
+    fs.UserTotalMajorEdits,
+    fs.PostCategoriesContributedTo,
+    (
+        SELECT tg.TagName
+        FROM (
+            SELECT pac_inner.OwnerUserId,
+                   pac_inner.Tags,
+                   pac_inner.PostTypeId,
+                   pac_inner.PostCreationDate
+            FROM PostAggregatesCombined pac_inner
+            WHERE pac_inner.OwnerUserId = fs.UserId
+              AND pac_inner.PostTypeId = 1
+              AND pac_inner.Tags IS NOT NULL
+              AND pac_inner.PostCreationDate BETWEEN fs.UserCreationDate AND fs.LastPostActivityByUser + INTERVAL '6 months'
+        ) sub
+        CROSS JOIN LATERAL (
+            SELECT tag_name AS tag_name_un
+            FROM UNNEST(string_to_array(SUBSTRING(sub.Tags FROM 2 FOR LENGTH(sub.Tags)-2), '><')) AS tag_name
+        ) tag_unnest
+        JOIN Tags tg ON LOWER(tg.TagName) = LOWER(tag_unnest.tag_name_un)
+        GROUP BY tg.TagName
+        ORDER BY COUNT(*) DESC, tg.TagName ASC
+        LIMIT 1
+    ) AS MostFrequentQuestionTag,
+    COALESCE((
+        SELECT AVG(pac_linked.PostScore)
+        FROM PostAggregatesCombined pac_linked
+        WHERE pac_linked.OwnerUserId = fs.UserId
+          AND pac_linked.LinkedPostsCount > 1
+          AND pac_linked.PostScore > 0
+          AND pac_linked.PostCreationDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '4 years'
+    ), 0.0) AS AvgScoreOfHighlyLinkedPosts,
+    CONCAT(
+        UPPER(SUBSTRING(fs.DisplayName FROM 1 FOR 1)),
+        LOWER(SUBSTRING(fs.DisplayName FROM 2)),
+        ' (Rep:',
+        LPAD(CAST(fs.Reputation AS TEXT), 7, '0'),
+        ', Views:',
+        LPAD(CAST(fs.UserProfileViews AS TEXT), 7, '0'),
+        ', Loc:',
+        COALESCE(REPLACE(fs.Location, ' ', '_'), 'UNKNOWN_LOCATION'),
+        ', Created:',
+        TO_CHAR(fs.UserCreationDate, 'YYYY-MM-DD'),
+        ') Post Score Diff: ',
+        CAST( (fs.UserTotalPostScore - COALESCE((
+            SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = fs.UserId AND p.PostTypeId = 1
+        ), 0)) AS TEXT)
+    ) AS UserSummaryComplexString,
+    CASE
+        WHEN fs.NetReceivedVotes > 10000 AND fs.GoldBadges >= 5 AND fs.UserTotalMajorEdits > 100 THEN 'Elite Contributor (Gold Tier)'
+        WHEN fs.NetReceivedVotes > 5000 AND fs.UserTotalAcceptedAnswers >= 20 AND fs.TotalBadges >= 100 THEN 'Valued Expert (Silver Tier)'
+        WHEN fs.UserTotalQuestions > 100 AND fs.UserTotalUpvotes > 1000 AND fs.UserTotalComments > 200 THEN 'Active Community Member (Bronze Tier)'
+        WHEN fs.UserProfileViews IS NULL OR fs.UserProfileViews < 100 THEN 'Shadow Member (Low Visibility)'
+        ELSE 'General Participant (Engaged)'
+    END AS UserEngagementSegment,
+    CAST(fs.UserActivityScore AS NUMERIC) / NULLIF(EXTRACT(EPOCH FROM (fs.LastAccessDate - fs.UserCreationDate)) / 86400.0, 0) AS AvgDailyActivityScore,
+    fs.PrevRankedUserReputation,
+    fs.NextRankedUserReputation
+FROM FinalSelection fs;

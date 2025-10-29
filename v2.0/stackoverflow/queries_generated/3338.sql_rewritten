@@ -1,0 +1,130 @@
+-- {"query": "3338.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 3181} 
+WITH UserBadgeCounts AS (
+    SELECT u.Id AS UserId,
+           COUNT(*) FILTER (WHERE b.Class = 1)               AS GoldBadges,
+           COUNT(*) FILTER (WHERE b.Class = 2)               AS SilverBadges,
+           COUNT(*) FILTER (WHERE b.Class = 3)               AS BronzeBadges,
+           SUM(CASE WHEN b.TagBased = 1 THEN 1 ELSE 0 END)   AS TagBasedBadgeCount
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id
+),
+PostVoteStats AS (
+    SELECT p.Id                                          AS PostId,
+           SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+           SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+           COUNT(v.Id)                                    AS TotalVotes,
+           MAX(v.CreationDate) FILTER (WHERE v.VoteTypeId IN (2,3)) AS LastVoteDate
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    GROUP BY p.Id
+),
+LatestEdit AS (
+    SELECT ph.PostId,
+           ph.CreationDate   AS LastEditDate,
+           ph.UserId         AS LastEditorUserId,
+           ph.Text           AS EditSummary
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4,5,6)                     -- edit title/body/tags
+      AND ph.CreationDate = (
+          SELECT MAX(ph2.CreationDate)
+          FROM PostHistory ph2
+          WHERE ph2.PostId = ph.PostId
+            AND ph2.PostHistoryTypeId IN (4,5,6)
+      )
+),
+TagExploded AS (
+    SELECT p.Id                                              AS PostId,
+           regexp_split_to_table(p.Tags, '[><]')             AS Tag
+    FROM Posts p
+    WHERE p.PostTypeId = 1                                   -- only questions
+),
+DuplicateLinks AS (
+    SELECT pl.PostId,
+           COUNT(*)                                          AS DuplicateCount
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 3                                  -- duplicate link
+    GROUP BY pl.PostId
+)
+SELECT
+    q.Id                                                                          AS QuestionId,
+    q.Title,
+    q.CreationDate,
+    q.Score                                                                       AS QuestionScore,
+    q.ViewCount,
+    COALESCE(dup.DuplicateCount,0)                                                AS DuplicateLinkCount,
+    COALESCE(vs.UpVotes,0)                                                        AS UpVotes,
+    COALESCE(vs.DownVotes,0)                                                      AS DownVotes,
+    COALESCE(vs.TotalVotes,0)                                                     AS TotalVotes,
+    CASE WHEN COALESCE(vs.TotalVotes,0)=0 THEN NULL
+         ELSE ROUND(100.0 * COALESCE(vs.UpVotes,0) / vs.TotalVotes,2)
+    END                                                                           AS UpVotePercentage,
+    le.LastEditDate,
+    le.EditSummary,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ub.TagBasedBadgeCount,
+    ROW_NUMBER() OVER (PARTITION BY q.OwnerUserId ORDER BY q.Score DESC, q.CreationDate ASC) AS OwnerQuestionRank,
+    STRING_AGG(DISTINCT tg.Tag, ', ')                                            AS TagList,
+    CASE WHEN q.ClosedDate IS NOT NULL THEN 1 ELSE 0 END                         AS IsClosed,
+    CASE
+        WHEN ph.Comment IS NOT NULL AND ph.PostHistoryTypeId = 10 THEN CAST(ph.Comment AS INT)
+        ELSE NULL
+    END                                                                           AS CloseReasonId,
+    CASE WHEN q.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END                    AS HasAcceptedAnswer
+FROM Posts q
+LEFT JOIN PostVoteStats       vs   ON vs.PostId   = q.Id
+LEFT JOIN LatestEdit          le   ON le.PostId   = q.Id
+LEFT JOIN UserBadgeCounts    ub   ON ub.UserId   = q.OwnerUserId
+LEFT JOIN DuplicateLinks      dup  ON dup.PostId  = q.Id
+LEFT JOIN TagExploded         tg   ON tg.PostId   = q.Id
+LEFT JOIN PostHistory         ph   ON ph.PostId = q.Id
+                                             AND ph.PostHistoryTypeId = 10
+                                             AND ph.CreationDate = (
+                                                 SELECT MAX(ph2.CreationDate)
+                                                 FROM PostHistory ph2
+                                                 WHERE ph2.PostId = q.Id
+                                                   AND ph2.PostHistoryTypeId = 10
+                                             )
+WHERE q.PostTypeId = 1                -- only questions
+GROUP BY
+    q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount,
+    dup.DuplicateCount, vs.UpVotes, vs.DownVotes, vs.TotalVotes,
+    le.LastEditDate, le.EditSummary,
+    ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges, ub.TagBasedBadgeCount,
+    ph.Comment, q.ClosedDate, q.AcceptedAnswerId
+
+UNION ALL
+
+SELECT
+    a.ParentId                                                                    AS QuestionId,
+    NULL                                                                          AS Title,
+    a.CreationDate,
+    a.Score                                                                       AS QuestionScore,
+    NULL                                                                          AS ViewCount,
+    0                                                                             AS DuplicateLinkCount,
+    COALESCE(vs_up.UpVotes,0)                                                     AS UpVotes,
+    COALESCE(vs_dn.DownVotes,0)                                                   AS DownVotes,
+    COALESCE(vs_up.UpVotes,0) + COALESCE(vs_dn.DownVotes,0)                       AS TotalVotes,
+    CASE WHEN (COALESCE(vs_up.UpVotes,0)+COALESCE(vs_dn.DownVotes,0))=0 THEN NULL
+         ELSE ROUND(100.0 * COALESCE(vs_up.UpVotes,0) / (vs_up.UpVotes + vs_dn.DownVotes),2)
+    END                                                                           AS UpVotePercentage,
+    le.LastEditDate,
+    le.EditSummary,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ub.TagBasedBadgeCount,
+    ROW_NUMBER() OVER (PARTITION BY a.OwnerUserId ORDER BY a.Score DESC, a.CreationDate ASC) AS OwnerQuestionRank,
+    NULL                                                                          AS TagList,
+    CASE WHEN a.ClosedDate IS NOT NULL THEN 1 ELSE 0 END                         AS IsClosed,
+    NULL                                                                          AS CloseReasonId,
+    CASE WHEN a.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END                    AS HasAcceptedAnswer
+FROM Posts a
+LEFT JOIN PostVoteStats vs_up ON vs_up.PostId = a.Id AND vs_up.UpVotes   IS NOT NULL
+LEFT JOIN PostVoteStats vs_dn ON vs_dn.PostId = a.Id AND vs_dn.DownVotes IS NOT NULL
+LEFT JOIN LatestEdit    le    ON le.PostId   = a.Id
+LEFT JOIN UserBadgeCounts ub ON ub.UserId   = a.OwnerUserId
+WHERE a.PostTypeId = 2                -- only answers
+ORDER BY QuestionId, UpVotePercentage DESC NULLS LAST;

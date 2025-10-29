@@ -1,0 +1,183 @@
+WITH TopGoldUsers AS (
+    SELECT u.Id,
+           u.DisplayName,
+           u.Reputation,
+           ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS rn
+    FROM Users u
+    WHERE EXISTS (
+        SELECT 1
+        FROM Badges b
+        WHERE b.UserId = u.Id
+          AND b.Class = 1
+    )
+),
+RecentPosts AS (
+    SELECT p.Id,
+           p.OwnerUserId,
+           p.PostTypeId,
+           p.Score,
+           p.CreationDate,
+           p.AcceptedAnswerId,
+           p.Tags,
+           v.UpVotes,
+           v.DownVotes
+    FROM Posts p
+    LEFT JOIN (
+        SELECT PostId,
+               SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+               SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes
+        WHERE CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '365' DAY)
+        GROUP BY PostId
+    ) v ON v.PostId = p.Id
+    WHERE p.OwnerUserId IS NOT NULL
+      AND p.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '365' DAY)
+),
+-- Split tags into rows using a generic recursive approach relying on POSITION and SUBSTR.
+UserTagStats AS (
+    -- initial row: find first occurrence of '><' and treat positions relative to tags_blob||'>'
+    SELECT rp.OwnerUserId AS UserId,
+           CASE
+             WHEN pos = 0 THEN NULL
+             ELSE SUBSTR(tags_blob, pos + 1, next_pos - pos - 1)
+           END AS Tag,
+           1 AS cnt,
+           tags_blob,
+           pos,
+           next_pos
+    FROM (
+        SELECT rp.OwnerUserId,
+               rp.Tags AS tags_blob,
+               0 AS pos,
+               POSITION('><' IN (rp.Tags || '>')) AS next_pos
+        FROM RecentPosts rp
+        WHERE rp.Tags IS NOT NULL
+    ) first_tags
+    WHERE tags_blob IS NOT NULL AND tags_blob <> ''
+    UNION ALL
+    -- recursive: find subsequent occurrences by searching after previous next_pos
+    SELECT ut.UserId,
+           CASE
+             WHEN pos = 0 THEN NULL
+             ELSE SUBSTR(tags_blob, pos + 1, next_pos - pos - 1)
+           END AS Tag,
+           1 AS cnt,
+           tags_blob,
+           pos,
+           next_pos
+    FROM (
+        SELECT rp.OwnerUserId AS UserId,
+               rp.Tags AS tags_blob,
+               POSITION('><' IN (SUBSTR(rp.Tags || '>', occ_start))) AS rel_pos,
+               occ_start
+        FROM RecentPosts rp
+        JOIN (
+            -- generate starting offsets; recursive CTE needs a seed. Use numbers via VALUES to allow repeated scans.
+            SELECT 2 AS occ_start UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6
+            UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9 UNION ALL SELECT 10
+        ) offs ON true
+        WHERE rp.Tags IS NOT NULL
+    ) calc
+    -- convert relative positions to absolute positions and compute next_pos
+    CROSS JOIN LATERAL (
+        SELECT
+            CASE WHEN calc.rel_pos > 0 THEN calc.rel_pos + calc.occ_start - 1 ELSE 0 END AS pos,
+            POSITION('><' IN (SUBSTR(calc.tags_blob || '>', CASE WHEN calc.rel_pos > 0 THEN calc.rel_pos + calc.occ_start ELSE 1 END))) +
+                CASE WHEN calc.rel_pos > 0 THEN calc.occ_start - 1 ELSE 0 END AS next_pos,
+            calc.tags_blob
+    ) ut
+    WHERE ut.tags_blob IS NOT NULL AND ut.tags_blob <> ''
+),
+UserTagCounts AS (
+    SELECT UserId,
+           Tag,
+           COUNT(*) AS TagUseCount
+    FROM UserTagStats
+    WHERE Tag IS NOT NULL AND Tag <> ''
+    GROUP BY UserId, Tag
+),
+RankedUserTags AS (
+    SELECT utc.UserId,
+           utc.Tag,
+           utc.TagUseCount,
+           ROW_NUMBER() OVER (PARTITION BY utc.UserId ORDER BY utc.TagUseCount DESC) AS TagRank
+    FROM UserTagCounts utc
+),
+UserPostAggregates AS (
+    SELECT tg.Id AS UserId,
+           COUNT(CASE WHEN rp.PostTypeId = 1 THEN 1 END)                       AS QuestionCount,
+           COUNT(CASE WHEN rp.PostTypeId = 2 THEN 1 END)                       AS AnswerCount,
+           AVG(CASE WHEN rp.PostTypeId = 1 THEN rp.Score END)                 AS AvgQuestionScore,
+           PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY rp.Score)
+               FILTER (WHERE rp.PostTypeId = 1)                               AS MedianQuestionScore,
+           SUM(COALESCE(rp.UpVotes, 0))                                      AS TotalUpVotes,
+           SUM(COALESCE(rp.DownVotes, 0))                                    AS TotalDownVotes,
+           COUNT(CASE WHEN rp.PostTypeId = 1 AND rp.AcceptedAnswerId IS NOT NULL THEN 1 END)
+                                                                          AS QuestionsWithAccepted,
+           MAX(rp.CreationDate)                                              AS LastPostDate
+    FROM TopGoldUsers tg
+    LEFT JOIN RecentPosts rp ON rp.OwnerUserId = tg.Id
+    GROUP BY tg.Id
+),
+FinalResult AS (
+    SELECT tgu.Id,
+           tgu.DisplayName,
+           tgu.Reputation,
+           upa.QuestionCount,
+           upa.AnswerCount,
+           upa.AvgQuestionScore,
+           upa.MedianQuestionScore,
+           upa.TotalUpVotes,
+           upa.TotalDownVotes,
+           upa.QuestionsWithAccepted,
+           upa.LastPostDate,
+           CASE 
+               WHEN upa.QuestionCount = 0 THEN NULL
+               ELSE ROUND(CAST(upa.QuestionsWithAccepted AS NUMERIC) / upa.QuestionCount, 2)
+           END AS AcceptedAnswerRatio,
+           STRING_AGG(rut.Tag, ', ') FILTER (WHERE rut.TagRank <= 3)         AS TopThreeTags,
+           tgu.rn
+    FROM TopGoldUsers tgu
+    LEFT JOIN UserPostAggregates upa ON upa.UserId = tgu.Id
+    LEFT JOIN RankedUserTags rut   ON rut.UserId = tgu.Id
+    GROUP BY tgu.Id, tgu.DisplayName, tgu.Reputation, tgu.rn,
+             upa.QuestionCount, upa.AnswerCount, upa.AvgQuestionScore,
+             upa.MedianQuestionScore, upa.TotalUpVotes, upa.TotalDownVotes,
+             upa.QuestionsWithAccepted, upa.LastPostDate
+)
+SELECT Id,
+       DisplayName,
+       Reputation,
+       QuestionCount,
+       AnswerCount,
+       AvgQuestionScore,
+       MedianQuestionScore,
+       TotalUpVotes,
+       TotalDownVotes,
+       QuestionsWithAccepted,
+       LastPostDate,
+       AcceptedAnswerRatio,
+       TopThreeTags
+FROM FinalResult
+WHERE rn <= 10
+
+UNION ALL
+
+SELECT u.Id,
+       u.DisplayName,
+       u.Reputation,
+       0                                 AS QuestionCount,
+       0                                 AS AnswerCount,
+       NULL                              AS AvgQuestionScore,
+       NULL                              AS MedianQuestionScore,
+       0                                 AS TotalUpVotes,
+       0                                 AS TotalDownVotes,
+       0                                 AS QuestionsWithAccepted,
+       NULL                              AS LastPostDate,
+       NULL                              AS AcceptedAnswerRatio,
+       NULL                              AS TopThreeTags
+FROM Users u
+WHERE NOT EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1)
+  AND u.Reputation > (SELECT COALESCE(MAX(Reputation), 0) FROM TopGoldUsers)
+ORDER BY Reputation DESC
+LIMIT 10;

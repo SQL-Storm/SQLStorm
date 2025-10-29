@@ -1,0 +1,197 @@
+-- {"query": "1307.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3205} 
+WITH UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.Views AS UserViews,
+        u.UpVotes AS UserUpVotesGiven,
+        u.DownVotes AS UserDownVotesGiven,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswers,
+        SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL AND p.OwnerUserId = u.Id THEN 1 ELSE 0 END) AS AcceptedAnswersGiven,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        SUM(v.BountyAmount) AS TotalBountyGiven,
+        SUM(CASE WHEN vt.Name = 'UpMod' AND v.UserId IS NULL THEN 1 ELSE 0 END) AS UpVotesReceivedByCommunityPosts, -- Upvotes on community-owned posts
+        SUM(CASE WHEN vt.Name = 'UpMod' AND v.UserId = u.Id THEN 1 ELSE 0 END) AS SelfUpVotes, -- User upvoting their own content (unlikely, but possible)
+        MAX(ph.CreationDate) AS LastContentEditDate,
+        MAX(p.LastActivityDate) AS LastPostActivityDate,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges
+    FROM Users AS u
+    LEFT JOIN Posts AS p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments AS c ON u.Id = c.UserId
+    LEFT JOIN Votes AS v ON u.Id = v.UserId
+    LEFT JOIN VoteTypes AS vt ON v.VoteTypeId = vt.Id
+    LEFT JOIN Badges AS b ON u.Id = b.UserId
+    LEFT JOIN PostHistory AS ph ON u.Id = ph.UserId AND ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Body, Tags
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes
+),
+PostEngagementMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.CommunityOwnedDate,
+        ARRAY_LENGTH(STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><'), 1) AS TagCount,
+        COUNT(DISTINCT pl_linked.RelatedPostId) AS LinkedFromCount, -- How many posts link TO THIS post
+        COUNT(DISTINCT pl_duplicate.RelatedPostId) AS DuplicatedFromCount, -- How many posts consider THIS post a duplicate
+        COUNT(DISTINCT ph_all.Id) AS TotalHistoryEvents,
+        COUNT(DISTINCT CASE WHEN ph_edit.PostHistoryTypeId IN (4, 5, 6) THEN ph_edit.UserId END) AS UniqueEditorCount,
+        AVG(EXTRACT(EPOCH FROM (ph_edit_next.CreationDate - ph_edit.CreationDate))) FILTER (WHERE ph_edit_next.CreationDate IS NOT NULL) AS AvgTimeBetweenEditsSeconds,
+        (SELECT COUNT(DISTINCT c.UserId) FROM Comments c WHERE c.PostId = p.Id) AS UniqueCommenters,
+        (SELECT SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) FROM Votes v WHERE v.PostId = p.Id) AS TotalUpvotesOnPost,
+        (SELECT SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) FROM Votes v WHERE v.PostId = p.Id) AS TotalDownvotesOnPost,
+        MAX(LENGTH(REPLACE(REPLACE(REPLACE(c_max_len.Text, '<p>', ''), '</p>', ''), '&nbsp;', ' '))) AS MaxCommentTextLength
+    FROM Posts AS p
+    LEFT JOIN PostLinks AS pl_linked ON p.Id = pl_linked.RelatedPostId AND pl_linked.LinkTypeId = 1 -- Linked to this post
+    LEFT JOIN PostLinks AS pl_duplicate ON p.Id = pl_duplicate.RelatedPostId AND pl_duplicate.LinkTypeId = 3 -- Duplicated by this post
+    LEFT JOIN PostHistory AS ph_all ON p.Id = ph_all.PostId
+    LEFT JOIN PostHistory AS ph_edit ON p.Id = ph_edit.PostId AND ph_edit.PostHistoryTypeId IN (4, 5, 6) -- Only edits for time diff
+    LEFT JOIN LATERAL (
+        SELECT ph_inner.CreationDate
+        FROM PostHistory ph_inner
+        WHERE ph_inner.PostId = ph_edit.PostId
+          AND ph_inner.CreationDate > ph_edit.CreationDate
+          AND ph_inner.PostHistoryTypeId IN (4, 5, 6)
+        ORDER BY ph_inner.CreationDate
+        LIMIT 1
+    ) AS ph_edit_next ON TRUE
+    LEFT JOIN Comments AS c_max_len ON p.Id = c_max_len.PostId
+    GROUP BY
+        p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.LastEditDate, p.LastActivityDate,
+        p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.ClosedDate, p.CommunityOwnedDate, p.Tags
+),
+RankedTagContributions AS (
+    SELECT
+        t.Id AS TagId,
+        t.TagName,
+        COUNT(DISTINCT p_q.Id) AS QuestionsWithTag,
+        SUM(p_q.ViewCount) AS TotalTagViews,
+        AVG(p_q.Score) AS AvgTagQuestionScore,
+        COUNT(DISTINCT b.UserId) AS UniqueBadgeEarnersForTag,
+        RANK() OVER (PARTITION BY t.Id ORDER BY COUNT(DISTINCT p_q.OwnerUserId) DESC, SUM(p_q.Score) DESC) AS TopUserRankForTag
+    FROM Tags AS t
+    JOIN Posts AS p_q ON p_q.PostTypeId = 1 AND p_q.Tags LIKE '%<' || t.TagName || '>%'
+    LEFT JOIN Badges AS b ON b.Name = t.TagName AND b.TagBased = TRUE
+    GROUP BY t.Id, t.TagName
+),
+UserPostAggregation AS (
+    SELECT
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.UserCreationDate,
+        ua.LastAccessDate,
+        ua.TotalQuestions,
+        ua.TotalAnswers,
+        ua.AcceptedAnswersGiven,
+        ua.TotalCommentsMade,
+        ua.GoldBadges,
+        ua.SilverBadges,
+        ua.BronzeBadges,
+        SUM(pem.Score) AS TotalPostScore,
+        SUM(pem.ViewCount) AS TotalPostViewCount,
+        SUM(pem.FavoriteCount) AS TotalFavoriteCount,
+        AVG(pem.Score) AS AvgPostScore,
+        AVG(EXTRACT(EPOCH FROM (pem.LastActivityDate - pem.PostCreationDate))) AS AvgPostLifespanSeconds,
+        AVG(pem.TotalHistoryEvents) AS AvgPostHistoryEvents,
+        AVG(pem.UniqueEditorCount) AS AvgPostUniqueEditors,
+        MAX(pem.MaxCommentTextLength) AS MaxCommentTextLengthAcrossPosts,
+        AVG(pem.AvgTimeBetweenEditsSeconds) AS AvgPostEditInterval,
+        (SELECT COUNT(DISTINCT pl.RelatedPostId) FROM Posts p_inner JOIN PostLinks pl ON p_inner.Id = pl.PostId WHERE p_inner.OwnerUserId = ua.UserId AND pl.LinkTypeId = 1) AS LinksCreatedByUser,
+        (SELECT p_top.Title
+         FROM Posts p_top
+         WHERE p_top.OwnerUserId = ua.UserId
+           AND p_top.PostTypeId = 1
+           AND p_top.AcceptedAnswerId IS NOT NULL
+           AND p_top.Title IS NOT NULL
+         ORDER BY p_top.Score DESC, p_top.ViewCount DESC
+         LIMIT 1) AS TopAcceptedQuestionTitle,
+        (SELECT p_top_answer.Body
+         FROM Posts p_top_answer
+         WHERE p_top_answer.OwnerUserId = ua.UserId
+           AND p_top_answer.PostTypeId = 2
+           AND p_top_answer.Score = (SELECT MAX(p_sub.Score) FROM Posts p_sub WHERE p_sub.OwnerUserId = ua.UserId AND p_sub.PostTypeId = 2)
+           AND p_top_answer.Body IS NOT NULL
+         ORDER BY p_top_answer.CreationDate DESC
+         LIMIT 1) AS HighestScoreAnswerBodySnippet
+    FROM UserActivitySummary AS ua
+    LEFT JOIN PostEngagementMetrics AS pem ON ua.UserId = pem.OwnerUserId
+    GROUP BY
+        ua.UserId, ua.DisplayName, ua.Reputation, ua.UserCreationDate, ua.LastAccessDate,
+        ua.TotalQuestions, ua.TotalAnswers, ua.AcceptedAnswersGiven, ua.TotalCommentsMade,
+        ua.GoldBadges, ua.SilverBadges, ua.BronzeBadges
+)
+SELECT
+    upa.UserId,
+    upa.DisplayName,
+    upa.Reputation,
+    upa.TotalQuestions,
+    upa.TotalAnswers,
+    upa.AcceptedAnswersGiven,
+    upa.GoldBadges,
+    upa.SilverBadges,
+    upa.BronzeBadges,
+    upa.TotalPostScore,
+    upa.TotalPostViewCount,
+    upa.TotalFavoriteCount,
+    upa.AvgPostScore,
+    upa.AvgPostLifespanSeconds,
+    upa.AvgPostHistoryEvents,
+    upa.AvgPostUniqueEditors,
+    upa.MaxCommentTextLengthAcrossPosts,
+    upa.AvgPostEditInterval,
+    upa.LinksCreatedByUser,
+    upa.TopAcceptedQuestionTitle,
+    SUBSTRING(upa.HighestScoreAnswerBodySnippet, 1, 150) AS HighestScoreAnswerBodyPreview, -- String expression
+    COALESCE(u.Location, 'N/A') AS UserLocation, -- NULL Logic
+    EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - upa.UserCreationDate)) / (3600 * 24 * 365.25) AS YearsOnPlatform, -- Complicated calculation
+    (upa.Reputation / (EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - upa.UserCreationDate)) / (3600 * 24 * 30.44) + 1)) AS ReputationPerMonth, -- Reputation growth rate
+    CASE
+        WHEN upa.Reputation > 50000 AND upa.GoldBadges >= 5 THEN 'Legendary Contributor'
+        WHEN upa.Reputation > 10000 AND upa.AcceptedAnswersGiven > 50 THEN 'Highly Influential'
+        WHEN upa.Reputation > 1000 THEN 'Active Contributor'
+        ELSE 'Aspiring User'
+    END AS UserInfluenceTier, -- Complex CASE expression
+    rtc.TagName AS TopContributingTag,
+    rtc.QuestionsWithTag AS QuestionsInTopTag,
+    rtc.AvgTagQuestionScore AS AvgScoreInTopTag,
+    (SELECT COUNT(DISTINCT v_down.Id) FROM Votes v_down WHERE v_down.PostId IN (SELECT p_id.Id FROM Posts p_id WHERE p_id.OwnerUserId = upa.UserId) AND v_down.VoteTypeId = 3) AS TotalDownvotesReceived, -- Non-correlated subquery
+    SUM(CASE WHEN pem.PostTypeId = 1 AND pem.ClosedDate IS NOT NULL THEN 1 ELSE 0 END) OVER (PARTITION BY upa.UserId) AS ClosedQuestionsByOwner, -- Window function
+    RANK() OVER (ORDER BY upa.Reputation DESC, upa.TotalPostScore DESC) AS GlobalReputationRank, -- Window function
+    LAG(upa.LastAccessDate, 1, '1970-01-01 00:00:00'::timestamp) OVER (ORDER BY upa.UserId, upa.UserCreationDate) AS PreviousUserLastAccessDate -- Window function with LAG for hypothetical comparison
+FROM UserPostAggregation AS upa
+INNER JOIN Users AS u ON upa.UserId = u.Id
+LEFT JOIN RankedTagContributions AS rtc ON rtc.TopUserRankForTag = 1 AND rtc.TagId IN (
+    SELECT t.Id
+    FROM Posts p
+    JOIN Tags t ON p.Tags LIKE '%<' || t.TagName || '>%'
+    WHERE p.OwnerUserId = upa.UserId
+    GROUP BY t.Id
+    ORDER BY COUNT(p.Id) DESC, SUM(p.Score) DESC
+    LIMIT 1
+)
+WHERE
+    upa.TotalPosts > 5
+    AND upa.Reputation > 100
+    AND upa.AvgPostLifespanSeconds IS NOT NULL -- Filtering for meaningful posts
+    AND (u.Location IS NULL OR u.Location NOT LIKE '%earth%' AND u.Location <> 'Online') -- Complex predicate with NULL logic
+ORDER BY
+    GlobalReputationRank ASC,
+    upa.ReputationPerMonth DESC
+LIMIT 1000; -- Limit for practical benchmarking

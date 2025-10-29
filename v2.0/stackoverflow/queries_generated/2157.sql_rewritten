@@ -1,0 +1,155 @@
+-- {"query": "2157.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1504} 
+with RecursiveTagCounts as (
+    select
+        t.Id,
+        t.TagName,
+        coalesce(q.AnswerCount, 0) as AnswersCount,
+        q.ViewCount,
+        q.Score,
+        q.CreationDate,
+        row_number() over (partition by t.TagName order by q.CreationDate desc) as rn
+    from Tags t
+    left join Posts q on q.PostTypeId = 1 and q.Tags like '%<' || t.TagName || '>%'
+),
+LatestQuestions as (
+    select * from RecursiveTagCounts where rn = 1
+),
+UserPostScores as (
+    select
+        p.OwnerUserId,
+        count(*) as PostCount,
+        sum(p.Score) as TotalScore,
+        avg(p.Score) as AvgScore,
+        max(p.Score) as MaxScore
+    from Posts p
+    where p.OwnerUserId is not null
+    group by p.OwnerUserId
+),
+UserBadges as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserBadgeSummary as (
+    select
+        ub.UserId,
+        max(case when ub.Class = 1 then ub.BadgeCount else 0 end) as GoldBadges,
+        max(case when ub.Class = 2 then ub.BadgeCount else 0 end) as SilverBadges,
+        max(case when ub.Class = 3 then ub.BadgeCount else 0 end) as BronzeBadges
+    from UserBadges ub
+    group by ub.UserId
+),
+TopCommenters as (
+    select
+        c.UserId,
+        u.DisplayName,
+        count(*) as CommentCount,
+        sum(c.Score) as TotalCommentScore,
+        row_number() over (order by count(*) desc) as rn
+    from Comments c
+    join Users u on u.Id = c.UserId
+    where c.UserId is not null
+    group by c.UserId, u.DisplayName
+),
+PostLinkStats as (
+    select
+        p.Id as PostId,
+        count(distinct pl.Id) as LinkCount,
+        sum(case when lt.Name = 'Duplicate' then 1 else 0 end) as DuplicateLinks,
+        sum(case when lt.Name = 'Linked' then 1 else 0 end) as LinkedLinks
+    from Posts p
+    left join PostLinks pl on pl.PostId = p.Id
+    left join LinkTypes lt on lt.Id = pl.LinkTypeId
+    group by p.Id
+),
+PostVoteAggregates as (
+    select
+        p.Id as PostId,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+        count(distinct v.UserId) filter (where v.UserId is not null) as VotingUsers
+    from Posts p
+    left join Votes v on v.PostId = p.Id
+    group by p.Id
+),
+QuestionDetails as (
+    select
+        q.Id, q.Title, q.CreationDate, q.ViewCount, q.Score,
+        u.DisplayName as OwnerName,
+        ups.PostCount, ups.TotalScore, ups.AvgScore, ups.MaxScore,
+        ubs.GoldBadges, ubs.SilverBadges, ubs.BronzeBadges,
+        pls.LinkCount, pls.DuplicateLinks, pls.LinkedLinks,
+        pva.UpVotes, pva.DownVotes, pva.VotingUsers,
+        (select count(*) from Posts a where a.ParentId = q.Id and a.Score > 0) as PositiveAnswersCount,
+        (select count(*) from Comments c where c.PostId = q.Id) as CommentsCount,
+        case when q.ClosedDate is not null then 'Closed' else 'Open' end as Status
+    from Posts q
+    left join Users u on u.Id = q.OwnerUserId
+    left join UserPostScores ups on ups.OwnerUserId = u.Id
+    left join UserBadgeSummary ubs on ubs.UserId = u.Id
+    left join PostLinkStats pls on pls.PostId = q.Id
+    left join PostVoteAggregates pva on pva.PostId = q.Id
+    where q.PostTypeId = 1
+),
+FinalResult as (
+    select
+        q.Id,
+        q.Title,
+        q.CreationDate,
+        q.ViewCount,
+        q.Score,
+        q.OwnerName,
+        coalesce(q.GoldBadges,0) as GoldBadges,
+        coalesce(q.SilverBadges,0) as SilverBadges,
+        coalesce(q.BronzeBadges,0) as BronzeBadges,
+        q.PostCount, q.TotalScore, q.AvgScore, q.MaxScore,
+        q.LinkCount, q.DuplicateLinks, q.LinkedLinks,
+        q.UpVotes, q.DownVotes, q.VotingUsers,
+        q.PositiveAnswersCount,
+        q.CommentsCount,
+        q.Status,
+        row_number() over (partition by q.Status order by q.Score desc, q.ViewCount desc) as RankWithinStatus
+    from QuestionDetails q
+    where q.CreationDate > cast('2024-10-01' as date) - interval '1 year'
+)
+select
+    f.Id,
+    f.Title,
+    f.CreationDate,
+    f.ViewCount,
+    f.Score,
+    f.OwnerName,
+    f.GoldBadges,
+    f.SilverBadges,
+    f.BronzeBadges,
+    f.PostCount,
+    f.TotalScore,
+    f.AvgScore,
+    f.MaxScore,
+    f.LinkCount,
+    f.DuplicateLinks,
+    f.LinkedLinks,
+    f.UpVotes,
+    f.DownVotes,
+    f.VotingUsers,
+    f.PositiveAnswersCount,
+    f.CommentsCount,
+    f.Status,
+    case 
+        when GoldBadges + SilverBadges + BronzeBadges > 10 then 'Veteran Contributor'
+        when GoldBadges + SilverBadges + BronzeBadges between 1 and 10 then 'Contributor'
+        else 'Newbie'
+    end as UserExperienceLevel,
+    -- Complex string operation: concatenated Tags strings from Posts table (top 3 tags by question count)
+    string_agg(distinct substring(p.Tags from '<([^>]+)>'), ', ' order by length(substring(p.Tags from '<([^>]+)>')) desc) as ExampleTags
+from FinalResult f
+left join Posts p on p.Id = f.Id
+where f.RankWithinStatus <= 10
+group by 
+    f.Id, f.Title, f.CreationDate, f.ViewCount, f.Score, f.OwnerName, f.GoldBadges, f.SilverBadges, f.BronzeBadges,
+    f.PostCount, f.TotalScore, f.AvgScore, f.MaxScore, f.LinkCount, f.DuplicateLinks, f.LinkedLinks, f.UpVotes, f.DownVotes, f.VotingUsers,
+    f.PositiveAnswersCount, f.CommentsCount, f.Status, UserExperienceLevel
+order by Status, f.Score desc, f.ViewCount desc;

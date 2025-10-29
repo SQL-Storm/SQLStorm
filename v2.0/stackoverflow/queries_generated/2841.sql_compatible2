@@ -1,0 +1,248 @@
+with recursive RecursivePostHierarchy as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        0 as Level,
+        cast(p.Id as varchar) as Path
+    from Posts p
+    where p.ParentId is null
+
+    union all
+
+    select
+        c.Id,
+        c.PostTypeId,
+        c.AcceptedAnswerId,
+        c.ParentId,
+        c.OwnerUserId,
+        c.CreationDate,
+        c.Score,
+        c.ViewCount,
+        c.Title,
+        r.Level + 1,
+        r.Path || '->' || cast(c.Id as varchar)
+    from Posts c
+    inner join RecursivePostHierarchy r on c.ParentId = r.Id
+),
+UserBadgesAndVotes as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct case when b.Class = 1 then b.Id end) as GoldBadges,
+        count(distinct case when b.Class = 2 then b.Id end) as SilverBadges,
+        count(distinct case when b.Class = 3 then b.Id end) as BronzeBadges,
+        coalesce(sum(vtUp.VoteCount),0) as TotalUpVotes,
+        coalesce(sum(vtDown.VoteCount),0) as TotalDownVotes,
+        coalesce(sum(vtFav.VoteCount),0) as TotalFavorites
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    left join (
+        select PostId, count(*) as VoteCount, UserId 
+        from Votes 
+        where VoteTypeId = 2 
+        group by PostId, UserId
+    ) vtUp on vtUp.UserId = u.Id
+    left join (
+        select PostId, count(*) as VoteCount, UserId 
+        from Votes 
+        where VoteTypeId = 3 
+        group by PostId, UserId
+    ) vtDown on vtDown.UserId = u.Id
+    left join (
+        select PostId, count(*) as VoteCount, UserId 
+        from Votes 
+        where VoteTypeId = 5 
+        group by PostId, UserId
+    ) vtFav on vtFav.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+),
+AnswerStats as (
+    select
+        a.ParentId as QuestionId,
+        count(a.Id) as AnswerCount,
+        avg(a.Score) as AvgAnswerScore,
+        max(a.CreationDate) as LastAnswerDate,
+        sum(case when a.Score >= 10 then 1 else 0 end) as HighScoringAnswers
+    from Posts a
+    where a.PostTypeId = 2
+    group by a.ParentId
+),
+QuestionCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReasonName,
+        max(ph.CreationDate) as LastCloseDate
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where ph.PostHistoryTypeId = 10
+    group by ph.PostId, crt.Name
+),
+RankedComments as (
+    select
+        c.*,
+        row_number() over (partition by c.PostId order by c.Score desc NULLS LAST, c.CreationDate) as CommentRank
+    from Comments c
+),
+HighImpactQuestions as (
+    select
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.ViewCount,
+        p.Score,
+        p.CreationDate,
+        u.DisplayName as OwnerName,
+        as_.AnswerCount,
+        as_.AvgAnswerScore,
+        as_.HighScoringAnswers,
+        sum(case when vt.VoteTypeId = 2 then 1 else 0 end) as UpVotesCount,
+        sum(case when vt.VoteTypeId = 3 then 1 else 0 end) as DownVotesCount,
+        qcr.CloseReasonName
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    left join AnswerStats as_ on as_.QuestionId = p.Id
+    left join Votes vt on vt.PostId = p.Id
+    left join QuestionCloseReasons qcr on qcr.PostId = p.Id
+    where p.PostTypeId = 1
+      and p.Score > 10
+      and p.ViewCount > 1000
+    group by p.Id, p.Title, p.Tags, p.ViewCount, p.Score, p.CreationDate, u.DisplayName, as_.AnswerCount, as_.AvgAnswerScore, as_.HighScoringAnswers, qcr.CloseReasonName
+),
+FilteredTagPosts as (
+    select distinct
+        p.Id,
+        p.Tags,
+        -- replace Postgres regexp_split_to_table with a standard-safe split using a lateral join if available;
+        -- emulate by splitting on '><' after trimming outer <> characters
+        trim(both '<>' from p.Tags) as TagsTrimmed
+    from Posts p
+    where p.Tags is not null and p.PostTypeId = 1
+),
+TagSplit as (
+    select
+        f.Id,
+        f.Tags,
+        -- split TagsTrimmed by '><' into rows using a generic approach: use a recursive splitter
+        case when pos = 0 then TagsTrimmed else substring(TagsTrimmed from pos+1 for next_pos - pos - 1) end as SingleTag,
+        rn
+    from (
+        select
+            Id,
+            Tags,
+            TagsTrimmed,
+            -- generate positions of separators
+            0 as pos,
+            (CASE WHEN position('><' IN TagsTrimmed) = 0 THEN char_length(TagsTrimmed)+1 ELSE position('><' IN TagsTrimmed) END) as next_pos,
+            1 as rn
+        from FilteredTagPosts
+        union all
+        select
+            t.Id,
+            t.Tags,
+            t.TagsTrimmed,
+            s.next_pos as pos,
+            (CASE WHEN position('><' IN substring(t.TagsTrimmed from s.next_pos+1)) = 0 THEN char_length(t.TagsTrimmed)+1 ELSE s.next_pos + position('><' IN substring(t.TagsTrimmed from s.next_pos+1)) END) as next_pos,
+            s.rn + 1
+        from FilteredTagPosts t
+        join (
+            select
+                Id,
+                Tags,
+                TagsTrimmed,
+                0 as pos,
+                (CASE WHEN position('><' IN TagsTrimmed) = 0 THEN char_length(TagsTrimmed)+1 ELSE position('><' IN TagsTrimmed) END) as next_pos,
+                1 as rn
+            from FilteredTagPosts
+        ) s on s.Id = t.Id
+        where s.next_pos < char_length(t.TagsTrimmed)+1
+    ) x
+),
+-- The above TagSplit may be complex; if the SQL engine supports a string-split table-valued function, replace TagSplit with that.
+TagPopularity as (
+    select
+        ts.SingleTag,
+        count(ts.Id) as QuestionCount,
+        avg(p.ViewCount) as AvgTagViewCount,
+        sum(case when p.Score > 5 then 1 else 0 end) as HighlyScoredQuestions
+    from TagSplit ts
+    join Posts p on p.Id = ts.Id
+    group by ts.SingleTag
+    having count(ts.Id) > 50
+),
+DuplicateAnswers as (
+    select
+        pl.PostId as DuplicateAnswerId,
+        pl.RelatedPostId as OriginalAnswerId,
+        p1.CreationDate as DuplicateCreationDate,
+        p2.CreationDate as OriginalCreationDate,
+        p1.Score as DuplicateScore,
+        p2.Score as OriginalScore
+    from PostLinks pl
+    join Posts p1 on p1.Id = pl.PostId and p1.PostTypeId = 2
+    join Posts p2 on p2.Id = pl.RelatedPostId and p2.PostTypeId = 2
+    where pl.LinkTypeId = 3
+),
+MergedResults as (
+    select
+        hp.Id as QuestionId,
+        hp.Title,
+        hp.OwnerName,
+        hp.Score,
+        hp.ViewCount,
+        hp.AnswerCount,
+        hp.AvgAnswerScore,
+        hp.HighScoringAnswers,
+        coalesce(tb.GoldBadges,0) as OwnerGoldBadges,
+        qb.CloseReasonName,
+        row_number() over (partition by hp.OwnerName order by hp.Score desc) as OwnerQuestionRank
+    from HighImpactQuestions hp
+    left join UserBadgesAndVotes tb on tb.UserId = (
+        select u2.Id from Users u2 where u2.DisplayName = hp.OwnerName limit 1
+    )
+    left join QuestionCloseReasons qb on qb.PostId = hp.Id
+)
+select
+    mr.QuestionId,
+    mr.Title,
+    mr.OwnerName,
+    mr.Score,
+    mr.ViewCount,
+    mr.AnswerCount,
+    round(cast(mr.AvgAnswerScore as numeric),2) as AvgAnswerScore,
+    mr.HighScoringAnswers,
+    mr.OwnerGoldBadges,
+    mr.CloseReasonName,
+    mr.OwnerQuestionRank,
+    ft.SingleTag,
+    tp.QuestionCount as TagQuestionCount,
+    round(cast(tp.AvgTagViewCount as numeric),2) as TagAvgViewCount,
+    tp.HighlyScoredQuestions as TagHighScoreQuestionCount,
+    da.DuplicateAnswerId,
+    da.OriginalAnswerId,
+    da.DuplicateCreationDate,
+    da.OriginalCreationDate,
+    da.DuplicateScore,
+    da.OriginalScore,
+    case 
+      when da.DuplicateScore > da.OriginalScore then 'Duplicate Higher Score'
+      when da.DuplicateScore = da.OriginalScore then 'Duplicate Equal Score'
+      when da.DuplicateScore < da.OriginalScore then 'Original Higher Score'
+      else 'Unknown'
+    end as ScoreComparison
+from MergedResults mr
+left join FilteredTagPosts ft on ft.Id = mr.QuestionId
+left join TagPopularity tp on tp.SingleTag = ft.TagsTrimmed -- if TagSplit used, adjust join accordingly
+left join DuplicateAnswers da on da.DuplicateAnswerId in (
+    select p.Id from Posts p where p.ParentId = mr.QuestionId and p.PostTypeId = 2
+)
+where mr.OwnerQuestionRank <= 5
+order by mr.OwnerName, mr.Score desc, tp.QuestionCount desc
+limit 100;

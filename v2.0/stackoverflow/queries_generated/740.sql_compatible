@@ -1,0 +1,271 @@
+with
+recent_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.location,
+    coalesce(nullif(trim(lower(u.websiteurl)), ''), 'n/a') as website_norm,
+    u.upvotes,
+    u.downvotes,
+    u.views,
+    count(distinct b.id) filter (where b.class = 1) as gold_badges,
+    count(distinct b.id) filter (where b.class = 2) as silver_badges,
+    count(distinct b.id) filter (where b.class = 3) as bronze_badges,
+    max(b.date) as last_badge_date,
+    row_number() over (order by u.reputation desc, u.id) as rn_rep,
+    dense_rank() over (order by date_trunc('month', u.creationdate)) as cohort_rank
+  from users u
+  left join badges b
+    on b.userid = u.id
+  where u.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '10 years'
+  group by u.id, u.displayname, u.reputation, u.creationdate, u.location, u.websiteurl, u.upvotes, u.downvotes, u.views
+),
+q as (
+  select
+    p.id as post_id,
+    p.owneruserid as user_id,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.title,
+    p.tags,
+    p.answercount,
+    p.acceptedanswerid,
+    array_length(string_to_array(coalesce(substring(p.tags, 2, greatest(length(p.tags)-2,0)), ''), '><'), 1) as tag_count,
+    string_to_array(coalesce(substring(p.tags, 2, greatest(length(p.tags)-2,0)), ''), '><') as tag_array,
+    lead(p.creationdate) over (partition by p.owneruserid order by p.creationdate) as next_q_date,
+    lag(p.creationdate)  over (partition by p.owneruserid order by p.creationdate) as prev_q_date,
+    row_number() over (partition by p.owneruserid order by p.viewcount desc nulls last, p.id) as rn_views_within_author
+  from posts p
+  where p.posttypeid = 1
+),
+a as (
+  select
+    p.id as answer_id,
+    p.parentid as question_id,
+    p.owneruserid as user_id,
+    p.creationdate,
+    p.score,
+    row_number() over (partition by p.parentid order by p.score desc nulls last, p.id) as rn_top_for_q
+  from posts p
+  where p.posttypeid = 2
+),
+vote_agg as (
+  select
+    v.postid,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started,
+    sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded,
+    min(v.creationdate) filter (where v.votetypeid in (2,3)) as first_vote_at
+  from votes v
+  group by v.postid
+),
+ph as (
+  select
+    ph.postid,
+    count(*) filter (where ph.posthistorytypeid = 10) as close_events,
+    max(case when ph.posthistorytypeid = 10 then ph.creationdate end) as last_closed_at,
+    count(*) filter (where ph.posthistorytypeid in (35,36)) as migrate_events
+  from posthistory ph
+  group by ph.postid
+),
+dup as (
+  select
+    pl.postid,
+    count(*) filter (where pl.linktypeid = 3) as duplicate_of_count,
+    count(*) filter (where pl.linktypeid = 1) as linked_count,
+    min(pl.creationdate) as first_link_at
+  from postlinks pl
+  group by pl.postid
+),
+tag_pop as (
+  select
+    t.tagname,
+    t.count as usage_count,
+    coalesce(nullif(lower(t.tagname), ''), '_unknown_') as tag_key
+  from tags t
+),
+q_tags as (
+  select
+    q.post_id,
+    lower(trim(tag)) as tag,
+    row_number() over (partition by q.post_id order by lower(trim(tag))) as rn_tag
+  from q
+  left join lateral unnest(q.tag_array) as tag on true
+),
+q_tag_stats as (
+  select
+    qt.post_id,
+    count(*) as tag_ct,
+    sum(coalesce(tp.usage_count, 0)) as total_tag_usage,
+    avg(nullif(tp.usage_count,0)) as avg_tag_usage_nonzero,
+    max(tp.usage_count) as max_tag_usage,
+    min(tp.usage_count) as min_tag_usage
+  from q_tags qt
+  left join tag_pop tp
+    on tp.tag_key = qt.tag
+  group by qt.post_id
+),
+q_metrics as (
+  select
+    q.post_id,
+    q.user_id,
+    q.creationdate,
+    q.score,
+    q.viewcount,
+    q.title,
+    q.answercount,
+    q.acceptedanswerid,
+    qa.tag_ct,
+    qa.total_tag_usage,
+    qa.avg_tag_usage_nonzero,
+    qa.max_tag_usage,
+    qa.min_tag_usage,
+    coalesce(v.upvotes,0) as v_up,
+    coalesce(v.downvotes,0) as v_down,
+    coalesce(v.bounty_started,0) as bounty_started,
+    coalesce(v.bounty_awarded,0) as bounty_awarded,
+    v.first_vote_at,
+    coalesce(ph.close_events,0) as close_events,
+    ph.last_closed_at,
+    coalesce(d.duplicate_of_count,0) as duplicate_of_count,
+    coalesce(d.linked_count,0) as linked_count,
+    d.first_link_at,
+    q.next_q_date,
+    q.prev_q_date,
+    q.rn_views_within_author
+  from q
+  left join vote_agg v on v.postid = q.post_id
+  left join ph on ph.postid = q.post_id
+  left join dup d on d.postid = q.post_id
+  left join q_tag_stats qa on qa.post_id = q.post_id
+),
+user_summary as (
+  select
+    u.user_id,
+    count(distinct qm.post_id) as questions,
+    sum(coalesce(qm.viewcount,0)) as views_total,
+    avg(nullif(qm.viewcount,0)) as views_avg_nonzero,
+    sum(coalesce(qm.score,0)) as q_score_sum,
+    sum(coalesce(qm.answercount,0)) as answers_received,
+    sum(case when qm.acceptedanswerid is not null then 1 else 0 end) as with_accepted,
+    count(distinct a.answer_id) as answers_authored,
+    sum(case when a.rn_top_for_q = 1 then 1 else 0 end) as top_answers,
+    max(qm.creationdate) as last_question_at,
+    min(qm.creationdate) as first_question_at
+  from recent_users u
+  left join q_metrics qm on qm.user_id = u.user_id
+  left join a on a.user_id = u.user_id
+  group by u.user_id
+),
+ranked as (
+  select
+    ru.user_id,
+    ru.displayname,
+    ru.reputation,
+    ru.location,
+    ru.website_norm,
+    ru.gold_badges, ru.silver_badges, ru.bronze_badges,
+    us.questions,
+    us.answers_authored,
+    us.top_answers,
+    coalesce(us.q_score_sum,0) as q_score_sum,
+    coalesce(us.views_total,0) as views_total,
+    coalesce(us.views_avg_nonzero,0) as views_avg_nonzero,
+    coalesce(us.with_accepted,0) as with_accepted,
+    extract(epoch from coalesce(us.last_question_at, ru.creationdate) - ru.creationdate) / 86400.0 as days_active_est,
+    case
+      when (ru.upvotes + ru.downvotes) > 0
+        then (cast(ru.upvotes as numeric) - cast(ru.downvotes as numeric)) / nullif(cast((ru.upvotes + ru.downvotes) as numeric),0)
+      else 0
+    end as vote_ratio,
+    (
+      least(ru.reputation, 100000) / 1000.0
+      + coalesce(us.questions,0) * 0.5
+      + coalesce(us.answers_authored,0) * 0.3
+      + coalesce(us.top_answers,0) * 1.5
+      + coalesce(us.with_accepted,0) * 0.8
+      + ru.gold_badges * 5 + ru.silver_badges * 2 + ru.bronze_badges * 0.5
+      + least(coalesce(us.views_total,0) / 1000.0, 200)
+      + greatest(coalesce(us.views_avg_nonzero,0) / 200.0, 0)
+      + case when ru.website_norm like '%github%' then 3 else 0 end
+      + case when coalesce(ru.location,'') ~* '(remote|world|anywhere)' then 1 else 0 end
+      + case when ru.displayname ilike any (array['%sql%','%data%','%db%']) then 1 else 0 end
+    ) as composite_score
+  from recent_users ru
+  left join user_summary us on us.user_id = ru.user_id
+),
+top_cohort as (
+  select *
+  from (
+    select r.*, row_number() over (order by r.composite_score desc, r.reputation desc, r.user_id) as rn
+    from ranked r
+  ) t
+  where t.rn <= 200
+),
+exceptional as (
+  select user_id from ranked where vote_ratio >= 0.9 and (coalesce(questions,0) + coalesce(answers_authored,0)) >= 10
+  union
+  select user_id from ranked where vote_ratio <= -0.5 and (coalesce(questions,0) + coalesce(answers_authored,0)) >= 20
+),
+best_question_per_user as (
+  select qm.user_id, qm.post_id
+  from q_metrics qm
+  where qm.user_id in (select user_id from top_cohort)
+    and qm.post_id = (
+      select qmi.post_id
+      from q_metrics qmi
+      where qmi.user_id = qm.user_id
+      order by
+        coalesce(qmi.score,0) * 3
+        + coalesce(qmi.viewcount,0) / 50.0
+        + coalesce(qmi.v_up - qmi.v_down,0) * 2
+        + coalesce(qmi.answercount,0) * 1.0
+        + case when qmi.acceptedanswerid is not null then 5 else 0 end
+        + coalesce(10 - least(qmi.close_events,10), 0)
+        + coalesce(qmi.linked_count,0) * 0.1
+        - coalesce(qmi.duplicate_of_count,0) * 2
+        desc,
+        qmi.post_id
+      limit 1
+    )
+),
+final_rows as (
+  select
+    r.user_id,
+    r.displayname,
+    r.reputation,
+    r.location,
+    r.website_norm,
+    r.gold_badges, r.silver_badges, r.bronze_badges,
+    r.questions, r.answers_authored, r.top_answers,
+    r.q_score_sum, r.views_total, r.views_avg_nonzero, r.with_accepted,
+    round(cast(r.days_active_est as numeric), 1) as days_active_est,
+    round(cast(r.vote_ratio as numeric), 3) as vote_ratio,
+    round(cast(r.composite_score as numeric), 2) as composite_score,
+    case when e.user_id is not null then 'Y' else 'N' end as exceptional_flag,
+    bq.post_id as best_question_id,
+    qm.title as best_question_title,
+    qm.viewcount as best_question_views,
+    qm.score as best_question_score,
+    coalesce(qm.v_up,0) as best_q_upvotes,
+    coalesce(qm.v_down,0) as best_q_downvotes,
+    coalesce(qm.answercount,0) as best_q_answercount,
+    coalesce(qm.close_events,0) as best_q_close_events,
+    coalesce(qm.duplicate_of_count,0) as best_q_duplicates,
+    coalesce(qm.tag_ct,0) as best_q_tag_ct,
+    coalesce(qm.total_tag_usage,0) as best_q_total_tag_usage,
+    coalesce(date_part('day', cast('2024-10-01 12:34:56' as timestamp) - qm.creationdate), 0)::int as best_q_age_days
+  from ranked r
+  join top_cohort tc on tc.user_id = r.user_id
+  left join exceptional e on e.user_id = r.user_id
+  left join best_question_per_user bq on bq.user_id = r.user_id
+  left join q_metrics qm on qm.post_id = bq.post_id
+)
+select *
+from final_rows
+order by composite_score desc, reputation desc, user_id
+limit 200;

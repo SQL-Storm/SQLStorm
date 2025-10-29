@@ -1,0 +1,131 @@
+WITH
+RecentActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.Location,
+    u.AboutMe,
+    u.ProfileImageUrl,
+    COALESCE(b.TotalBadges, 0) AS BadgeCount,
+    COUNT(p.Id) FILTER (WHERE p.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days') AS PostsLast30d
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes, u.Location, u.AboutMe, u.ProfileImageUrl, b.TotalBadges
+),
+PostAnalytics AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.FavoriteCount,
+    p.OwnerUserId,
+    p.Title,
+    p.Tags,
+    CASE
+      WHEN p.PostTypeId = 1 THEN (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id)
+      ELSE 0
+    END AS CommentCount,
+    CASE
+      WHEN p.ClosedDate IS NOT NULL THEN TRUE
+      ELSE FALSE
+    END AS IsClosed,
+    CASE
+      WHEN p.AnswerCount > 0 THEN p.AnswerCount
+      ELSE (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = p.Id AND a.PostTypeId = 2)
+    END AS AnswerCountDerived,
+    (SELECT MAX(ph.CreationDate)
+     FROM PostHistory ph
+     WHERE ph.PostId = p.Id AND ph.UserId IS NOT NULL) AS LastRevisionDate
+  FROM Posts p
+),
+UserScoreWindow AS (
+  SELECT
+    p.OwnerUserId,
+    p.Id AS PostId,
+    p.Score,
+    p.CreationDate,
+    SUM(p.Score) OVER (
+      PARTITION BY p.OwnerUserId
+      ORDER BY p.CreationDate
+      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS CumulativeScore
+  FROM Posts p
+  WHERE p.OwnerUserId IS NOT NULL
+),
+TagRelations AS (
+  SELECT
+    t.TagName,
+    tl.TagName AS RelatedTagName,
+    COUNT(*) AS CoOccurrence
+  FROM Tags t
+  JOIN PostLinks pl ON pl.PostId = t.WikiPostId OR pl.RelatedPostId = t.WikiPostId
+  -- replace PostId::text unnest trick with safer join assumption: PostLinks has RelatedPostId linking to Tags.WikiPostId
+  JOIN Tags tl ON tl.WikiPostId = pl.RelatedPostId
+  GROUP BY t.TagName, tl.TagName
+),
+FilteredPosts AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    -- ensure CommentCount available: compute here
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCount
+  FROM Posts p
+  WHERE
+    (p.PostTypeId = 1 OR p.PostTypeId = 2)
+    AND (p.ViewCount > 1000 OR p.Score > 5)
+    AND EXISTS (
+      SELECT 1
+      FROM Votes v
+      WHERE v.PostId = p.Id AND v.VoteTypeId = 2
+      AND v.CreationDate > p.CreationDate - INTERVAL '180 days'
+    )
+    AND NOT EXISTS (
+      SELECT 1
+      FROM PostHistory ph
+      WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+      AND ph.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '365 days'
+    )
+)
+SELECT
+  ua.UserId,
+  ua.DisplayName,
+  ua.Reputation,
+  ua.BadgeCount,
+  ua.PostsLast30d,
+  pa.PostId,
+  pa.PostTypeId,
+  pa.Title,
+  pa.Tags,
+  pa.Score,
+  pa.ViewCount,
+  pa.CommentCount,
+  pa.IsClosed,
+  pa.LastRevisionDate,
+  uw.CumulativeScore AS UserCumulativeScore,
+  tr.TagName,
+  tr.RelatedTagName,
+  tr.CoOccurrence
+FROM RecentActivity ua
+LEFT JOIN PostAnalytics pa ON pa.OwnerUserId = ua.UserId
+LEFT JOIN UserScoreWindow uw ON uw.OwnerUserId = ua.UserId AND uw.PostId = pa.PostId
+LEFT JOIN TagRelations tr ON TRUE
+LEFT JOIN FilteredPosts fp ON fp.OwnerUserId = ua.UserId AND fp.Id = pa.PostId
+ORDER BY ua.Reputation DESC, pa.Score DESC
+LIMIT 200;

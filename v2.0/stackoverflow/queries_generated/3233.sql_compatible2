@@ -1,0 +1,185 @@
+WITH 
+user_base AS (
+    SELECT 
+        u.Id                                   AS user_id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate                         AS user_since,
+        COALESCE(u.Views,0)                    AS total_views,
+        COALESCE(u.UpVotes,0) - COALESCE(u.DownVotes,0) AS net_votes,
+        COUNT(b.Id)                            AS badge_count,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_badges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_badges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_badges
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Views, u.UpVotes, u.DownVotes
+),
+recent_activity AS (
+    SELECT 
+        u.Id                                      AS user_id,
+        (SELECT p.Id
+         FROM Posts p
+         WHERE p.OwnerUserId = u.Id
+           AND p.PostTypeId IN (1,2)
+         ORDER BY p.CreationDate DESC
+         FETCH FIRST 1 ROW ONLY)                  AS latest_post_id,
+        (SELECT p.CreationDate
+         FROM Posts p
+         WHERE p.OwnerUserId = u.Id
+           AND p.PostTypeId IN (1,2)
+         ORDER BY p.CreationDate DESC
+         FETCH FIRST 1 ROW ONLY)                  AS latest_post_date,
+        (SELECT v.VoteTypeId
+         FROM Votes v
+         WHERE v.UserId = u.Id
+         ORDER BY v.CreationDate DESC
+         FETCH FIRST 1 ROW ONLY)                  AS latest_vote_type,
+        (SELECT v.CreationDate
+         FROM Votes v
+         WHERE v.UserId = u.Id
+         ORDER BY v.CreationDate DESC
+         FETCH FIRST 1 ROW ONLY)                  AS latest_vote_date
+    FROM Users u
+),
+user_tag_stats AS (
+    SELECT 
+        p.OwnerUserId                                 AS user_id,
+        u_tags.tag,
+        COUNT(*)                                      AS q_per_tag,
+        AVG(p.Score)                                  AS avg_score_per_tag,
+        MAX(p.ViewCount)                              AS max_views_per_tag
+    FROM (
+        SELECT
+            OwnerUserId,
+            Score,
+            ViewCount,
+            TRIM(BOTH '<>' FROM COALESCE(Tags,'')) AS tags_trimmed
+        FROM Posts
+        WHERE PostTypeId = 1
+          AND OwnerUserId IS NOT NULL
+          AND Tags IS NOT NULL
+    ) p0
+    CROSS JOIN LATERAL (
+        SELECT value AS tag
+        FROM UNNEST(string_to_array(p0.tags_trimmed, '><')) AS t(value)
+    ) u_tags
+    JOIN Posts p ON p.OwnerUserId = p0.OwnerUserId AND p.Score = p0.Score AND p.ViewCount = p0.ViewCount
+    GROUP BY p.OwnerUserId, u_tags.tag
+),
+ranked_users AS (
+    SELECT 
+        ub.user_id,
+        ub.DisplayName,
+        ub.Reputation,
+        ub.user_since,
+        ub.total_views,
+        ub.net_votes,
+        ub.badge_count,
+        ub.gold_badges,
+        ub.silver_badges,
+        ub.bronze_badges,
+        RANK() OVER (ORDER BY ub.Reputation DESC)   AS reputation_rank,
+        ROW_NUMBER() OVER (PARTITION BY ub.user_id ORDER BY ub.user_since DESC) AS rn
+    FROM user_base ub
+),
+combined AS (
+    SELECT 
+        ru.user_id,
+        ru.DisplayName,
+        ru.Reputation,
+        ru.reputation_rank,
+        ru.total_views,
+        ru.net_votes,
+        ru.badge_count,
+        ru.gold_badges,
+        ru.silver_badges,
+        ru.bronze_badges,
+        ra.latest_post_id,
+        ra.latest_post_date,
+        ra.latest_vote_type,
+        ra.latest_vote_date,
+        COALESCE(uts.q_per_tag,0)                      AS questions_per_tag,
+        COALESCE(uts.avg_score_per_tag,0)             AS avg_score_per_tag,
+        COALESCE(uts.max_views_per_tag,0)             AS max_views_per_tag,
+        CASE 
+            WHEN uts.tag IS NULL THEN ''
+            ELSE ('Tag:' || uts.tag || 
+                        ' (Q:' || COALESCE(CAST(uts.q_per_tag AS VARCHAR), '0') || 
+                        ', AvgScore:' || COALESCE(CAST(ROUND(uts.avg_score_per_tag::numeric,2) AS VARCHAR), '0') || 
+                        ', MaxViews:' || COALESCE(CAST(uts.max_views_per_tag AS VARCHAR), '0') || ')')
+        END                                          AS tag_summary
+    FROM ranked_users ru
+    LEFT JOIN recent_activity ra   ON ra.user_id = ru.user_id
+    FULL OUTER JOIN user_tag_stats uts ON uts.user_id = ru.user_id
+),
+inactive_users AS (
+    SELECT 
+        u.Id                      AS user_id,
+        u.DisplayName,
+        u.Reputation,
+        NULL                      AS reputation_rank,
+        COALESCE(u.Views,0)       AS total_views,
+        COALESCE(u.UpVotes,0)-COALESCE(u.DownVotes,0) AS net_votes,
+        0                         AS badge_count,
+        0                         AS gold_badges,
+        0                         AS silver_badges,
+        0                         AS bronze_badges,
+        NULL                      AS latest_post_id,
+        NULL                      AS latest_post_date,
+        NULL                      AS latest_vote_type,
+        NULL                      AS latest_vote_date,
+        0                         AS questions_per_tag,
+        0                         AS avg_score_per_tag,
+        0                         AS max_views_per_tag,
+        ''                        AS tag_summary
+    FROM Users u
+    WHERE NOT EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id)
+      AND NOT EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = u.Id)
+      AND NOT EXISTS (SELECT 1 FROM Votes v WHERE v.UserId = u.Id)
+)
+SELECT 
+    user_id,
+    DisplayName,
+    Reputation,
+    reputation_rank,
+    total_views,
+    net_votes,
+    badge_count,
+    gold_badges,
+    silver_badges,
+    bronze_badges,
+    latest_post_id,
+    latest_post_date,
+    latest_vote_type,
+    latest_vote_date,
+    questions_per_tag,
+    avg_score_per_tag,
+    max_views_per_tag,
+    tag_summary
+FROM combined
+WHERE (reputation_rank IS NOT NULL AND reputation_rank <= 100)
+   OR (tag_summary <> '' AND questions_per_tag >= 5)
+UNION ALL
+SELECT 
+    user_id,
+    DisplayName,
+    Reputation,
+    reputation_rank,
+    total_views,
+    net_votes,
+    badge_count,
+    gold_badges,
+    silver_badges,
+    bronze_badges,
+    latest_post_id,
+    latest_post_date,
+    latest_vote_type,
+    latest_vote_date,
+    questions_per_tag,
+    avg_score_per_tag,
+    max_views_per_tag,
+    tag_summary
+FROM inactive_users
+WHERE Reputation < 10
+ORDER BY reputation_rank NULLS LAST, user_id;

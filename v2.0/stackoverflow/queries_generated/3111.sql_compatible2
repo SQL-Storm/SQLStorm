@@ -1,0 +1,125 @@
+WITH user_badge_counts AS (
+    SELECT 
+        u.Id AS user_id,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_badges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_badges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_badges
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id
+),
+
+user_post_stats AS (
+    SELECT 
+        u.Id AS user_id,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS question_cnt,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS answer_cnt,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS avg_q_score,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) AS avg_a_score,
+        MAX(p.LastActivityDate) AS last_post_activity
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id
+),
+
+user_vote_stats AS (
+    SELECT 
+        u.Id AS user_id,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS up_votes_received,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS down_votes_received,
+        COUNT(CASE WHEN v.VoteTypeId = 5 THEN v.Id END) AS favorites_received
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    GROUP BY u.Id
+),
+
+user_top_tag AS (
+    SELECT 
+        u.Id AS user_id,
+        t.TagName,
+        tg.cnt
+    FROM Users u
+    LEFT JOIN LATERAL (
+        SELECT 
+            REPLACE(REPLACE(tag, '<', ''), '>', '') AS clean_tag,
+            COUNT(*) AS cnt
+        FROM (
+            SELECT UNNEST(string_to_array(p.Tags, '><')) AS tag
+            FROM Posts p
+            WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1
+        ) sub
+        GROUP BY clean_tag
+        ORDER BY cnt DESC
+        LIMIT 1
+    ) AS tg ON true
+    LEFT JOIN Tags t ON t.TagName = tg.clean_tag
+),
+
+combined AS (
+    SELECT
+        u.Id                            AS user_id,
+        COALESCE(u.DisplayName,'Anonymous') AS display_name,
+        u.Reputation,
+        ub.gold_badges,
+        ub.silver_badges,
+        ub.bronze_badges,
+        ups.question_cnt,
+        ups.answer_cnt,
+        ROUND(CAST(ups.avg_q_score AS numeric),2) AS avg_q_score,
+        ROUND(CAST(ups.avg_a_score AS numeric),2) AS avg_a_score,
+        COALESCE(uv.up_votes_received,0) - COALESCE(uv.down_votes_received,0) AS net_votes,
+        COALESCE(uv.favorites_received,0) AS favorites,
+        EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS timestamp) - 
+               COALESCE(ups.last_post_activity, u.CreationDate))) AS days_since_last_activity,
+        COALESCE(ut.TagName,'<none>')    AS top_tag,
+        ROW_NUMBER() OVER (
+            ORDER BY (
+                u.Reputation * 0.4
+                + COALESCE(ub.gold_badges,0)   * 100
+                + COALESCE(ub.silver_badges,0) * 50
+                + COALESCE(ub.bronze_badges,0) * 10
+                + COALESCE(uv.favorites_received,0) * 5
+                + COALESCE(uv.up_votes_received,0) * 0.1
+            ) DESC
+        )                               AS rank
+    FROM Users u
+    LEFT JOIN user_badge_counts ub ON ub.user_id = u.Id
+    LEFT JOIN user_post_stats ups  ON ups.user_id = u.Id
+    LEFT JOIN user_vote_stats uv   ON uv.user_id = u.Id
+    LEFT JOIN user_top_tag ut      ON ut.user_id = u.Id
+    WHERE u.Reputation IS NOT NULL AND u.Reputation > 0
+),
+
+final_set AS (
+    SELECT * FROM combined WHERE rank <= 20
+
+    UNION ALL
+
+    SELECT
+        u.Id                             AS user_id,
+        COALESCE(u.DisplayName,'Anonymous') AS display_name,
+        u.Reputation,
+        ub.gold_badges,
+        ub.silver_badges,
+        ub.bronze_badges,
+        0                                AS question_cnt,
+        0                                AS answer_cnt,
+        CAST(NULL AS numeric)            AS avg_q_score,
+        CAST(NULL AS numeric)            AS avg_a_score,
+        0                                AS net_votes,
+        0                                AS favorites,
+        NULL                             AS days_since_last_activity,
+        '<none>'                         AS top_tag,
+        CAST(NULL AS integer)            AS rank
+    FROM Users u
+    LEFT JOIN user_badge_counts ub ON ub.user_id = u.Id
+    WHERE (COALESCE(ub.gold_badges,0) + COALESCE(ub.silver_badges,0) + COALESCE(ub.bronze_badges,0)) > 0
+      AND NOT EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id)
+    ORDER BY (COALESCE(ub.gold_badges,0)*100 + COALESCE(ub.silver_badges,0)*50 + COALESCE(ub.bronze_badges,0)*10) DESC
+    LIMIT 5
+)
+
+SELECT *
+FROM final_set
+ORDER BY rank NULLS LAST, reputation DESC;

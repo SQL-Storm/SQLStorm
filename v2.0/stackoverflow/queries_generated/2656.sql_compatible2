@@ -1,0 +1,155 @@
+with recursive TagHierarchy (Id, TagName, Count, IsModeratorOnly, FullPath, Level) as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.IsModeratorOnly,
+        cast(t.TagName as varchar(255)) as FullPath,
+        1 as Level
+    from Tags t
+    where t.IsRequired = true
+
+    union all
+
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.IsModeratorOnly,
+        concat(th.FullPath, ' > ', t.TagName) as FullPath,
+        th.Level + 1
+    from Tags t
+    join TagHierarchy th on t.Id <> th.Id and th.FullPath like concat('%', t.TagName, '%')
+    where t.IsRequired = true and th.Level < 3
+),
+UserPostStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionCount,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswerCount,
+        coalesce(avg(p.Score),0) as AvgScore,
+        max(p.Score) as MaxScore,
+        min(p.Score) as MinScore,
+        sum(coalesce(p.ViewCount,0)) as TotalViews,
+        rank() over (order by count(distinct case when p.PostTypeId = 1 then p.Id end) desc) as QuestionRank,
+        dense_rank() over (order by sum(coalesce(p.ViewCount,0)) desc) as ViewRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName
+),
+BadgesRecent as (
+    select
+        b.UserId,
+        b.Name,
+        b.Class,
+        row_number() over (partition by b.UserId order by b.Date desc) as rn,
+        b.Date
+    from Badges b
+    where b.Date > cast('2024-10-01' as date) - interval '1 year'
+),
+PostWithLatestComment as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        c.Text as LatestCommentText,
+        c.CreationDate as LatestCommentDate,
+        u.DisplayName as OwnerName
+    from Posts p
+    left join lateral (
+        select c1.Text, c1.CreationDate
+        from Comments c1
+        where c1.PostId = p.Id
+        order by c1.CreationDate desc
+        limit 1
+    ) c on true
+    left join Users u on u.Id = p.OwnerUserId
+),
+DuplicatePairs as (
+    select
+        pl.PostId as DuplicatePostId,
+        pl.RelatedPostId as OriginalPostId,
+        pdu.Title as DuplicateTitle,
+        por.Title as OriginalTitle
+    from PostLinks pl
+    join Posts pdu on pdu.Id = pl.PostId
+    join Posts por on por.Id = pl.RelatedPostId
+    where pl.LinkTypeId = 3
+),
+VoteScoreSummaries as (
+    select
+        p.Id as PostId,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+        sum(case when v.VoteTypeId = 5 then 1 else 0 end) as FavoriteVotes,
+        sum(case when v.VoteTypeId in (8,9) then coalesce(v.BountyAmount,0) else 0 end) as TotalBounty
+    from Posts p
+    left join Votes v on v.PostId = p.Id
+    group by p.Id
+),
+ClosingStats as (
+    select
+        ph.PostId,
+        max(case when ph.PostHistoryTypeId = 10 then ph.Comment else null end) as CloseReasonCode,
+        count(case when ph.PostHistoryTypeId = 10 then 1 end) as CloseCount,
+        count(case when ph.PostHistoryTypeId = 11 then 1 end) as ReopenCount
+    from PostHistory ph
+    group by ph.PostId
+)
+select
+    ups.UserId,
+    ups.DisplayName,
+    ups.QuestionCount,
+    ups.AnswerCount,
+    ups.AvgScore,
+    ups.MaxScore,
+    ups.MinScore,
+    ups.TotalViews,
+    br.Name as RecentBronzeBadge,
+    br.Date as BronzeBadgeDate,
+    pwlc.Id as PostId,
+    pwlc.Title as PostTitle,
+    pwlc.Tags,
+    pwlc.Score as PostScore,
+    pwlc.ViewCount as PostViews,
+    pwlc.LatestCommentText,
+    pwlc.LatestCommentDate,
+    dup.DuplicatePostId,
+    dup.OriginalPostId,
+    dup.DuplicateTitle,
+    dup.OriginalTitle,
+    vss.UpVotes,
+    vss.DownVotes,
+    vss.FavoriteVotes,
+    vss.TotalBounty,
+    cs.CloseReasonCode,
+    cs.CloseCount,
+    cs.ReopenCount,
+    case
+        when ups.QuestionCount > 10 and vss.UpVotes > 50 then 'Active_Contributor'
+        when ups.QuestionCount > 0 and vss.UpVotes between 10 and 50 then 'Contributor'
+        else 'Novice'
+    end as ContributorLevel,
+    lag(pwlc.Score) over (partition by pwlc.OwnerUserId order by pwlc.CreationDate) as PreviousPostScore,
+    lead(pwlc.Score) over (partition by pwlc.OwnerUserId order by pwlc.CreationDate) as NextPostScore,
+    substring(pwlc.Tags from 2 for 100) as TrimmedTags,
+    length(coalesce(pwlc.LatestCommentText, '')) as LatestCommentLength,
+    coalesce(th.FullPath, 'No Required Tag') as TagFullPath
+from UserPostStats ups
+left join BadgesRecent br on br.UserId = ups.UserId and br.Class = 3 and br.rn = 1
+left join Posts pwlc on pwlc.OwnerUserId = ups.UserId and pwlc.PostTypeId = 1
+left join DuplicatePairs dup on dup.DuplicatePostId = pwlc.Id
+left join VoteScoreSummaries vss on vss.PostId = pwlc.Id
+left join ClosingStats cs on cs.PostId = pwlc.Id
+left join TagHierarchy th on th.TagName = (
+    select unnest(string_to_array(substring(pwlc.Tags from 2 for greatest(length(pwlc.Tags)-2,0)), '><'))
+)
+where ups.TotalViews is not null
+order by ups.TotalViews desc
+limit 100;

@@ -1,0 +1,416 @@
+-- {"query": "716.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 4174} 
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        u.location,
+        count(b.id) as badge_count,
+        sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+        sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+        sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+        row_number() over (order by u.creationdate desc, u.id) as rn_newest
+    from users u
+    left join badges b on b.userid = u.id
+    where u.creationdate >= (select date_trunc('month', max(creationdate)) - interval '12 months' from users)
+    group by u.id, u.displayname, u.reputation, u.creationdate, u.location
+),
+q_and_a as (
+    -- Aggregate per user across questions and answers
+    select
+        u.id as user_id,
+        sum(case when p.posttypeid = 1 then 1 else 0 end) as questions,
+        sum(case when p.posttypeid = 2 then 1 else 0 end) as answers,
+        sum(coalesce(p.score,0)) as total_post_score,
+        sum(coalesce(p.viewcount,0)) filter (where p.posttypeid = 1) as question_views,
+        max(p.creationdate) as last_post_date,
+        count(distinct p.parentid) filter (where p.posttypeid = 2) as distinct_answered_questions
+    from users u
+    left join posts p on p.owneruserid = u.id
+    group by u.id
+),
+post_activity as (
+    -- Compute per-post activity metrics and dense ranks by tag popularity and recentness
+    select
+        p.id as post_id,
+        p.owneruserid as user_id,
+        p.posttypeid,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        p.answercount,
+        p.title,
+        p.tags,
+        sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+        sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+        sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+        count(c.id) as comments,
+        dense_rank() over (order by coalesce(p.viewcount,0) desc nulls last, coalesce(p.score,0) desc nulls last, p.id) as popularity_rank,
+        row_number() over (partition by p.owneruserid order by p.lastactivitydate desc nulls last, p.id desc) as rn_last_by_user
+    from posts p
+    left join votes v on v.postid = p.id
+    left join comments c on c.postid = p.id
+    where p.posttypeid in (1,2)
+    group by p.id, p.owneruserid, p.posttypeid, p.creationdate, p.score, p.viewcount, p.answercount, p.title, p.tags
+),
+closed_reasons as (
+    -- Extract last close reason per question using PostHistory
+    select distinct on (ph.postid)
+        ph.postid,
+        max(ph.creationdate) over (partition by ph.postid) as last_closed_at,
+        ph.comment as close_reason_id_text,
+        cast(nullif(regexp_replace(coalesce(ph.comment,''), '[^0-9]+', '', 'g'), '') as int) as close_reason_id
+    from posthistory ph
+    where ph.posthistorytypeid = 10
+),
+dup_links as (
+    -- Map duplicates via PostLinks
+    select
+        pl.postid as duplicate_post_id,
+        pl.relatedpostid as original_post_id,
+        pl.creationdate as dup_link_date
+    from postlinks pl
+    where pl.linktypeid = 3
+),
+tag_expansion as (
+    -- Expand tags for questions
+    select
+        p.id as post_id,
+        unnest(string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')) as tagname
+    from posts p
+    where p.posttypeid = 1
+      and p.tags is not null
+      and length(p.tags) > 2
+),
+tag_stats as (
+    -- Per-user tag mix and concentration metrics
+    select
+        p.owneruserid as user_id,
+        te.tagname,
+        count(*) as tag_posts,
+        sum(coalesce(p.score,0)) as tag_score,
+        avg(coalesce(p.score,0)) as avg_tag_score,
+        count(*) filter (where p.posttypeid = 1) as q_tag_posts,
+        count(*) filter (where p.posttypeid = 2) as a_tag_posts -- will be 0 for answers; kept for uniformity
+    from posts p
+    join tag_expansion te on te.post_id = p.id
+    group by p.owneruserid, te.tagname
+),
+tag_concentration as (
+    select
+        user_id,
+        max(tag_posts) as max_tag_posts,
+        sum(tag_posts) as total_tag_posts,
+        count(*) as distinct_tags,
+        sum(pow(tag_posts::numeric / nullif(sum(tag_posts) over (partition by user_id),0), 2)) as hhi
+    from tag_stats
+    group by user_id
+),
+hot_network as (
+    -- Identify posts ever featured as hot questions and their durations
+    select
+        ph.postid,
+        min(ph.creationdate) filter (where ph.posthistorytypeid = 52) as first_hot_at,
+        max(ph.creationdate) filter (where ph.posthistorytypeid = 53) as last_removed_hot_at,
+        count(*) filter (where ph.posthistorytypeid = 52) as times_hot
+    from posthistory ph
+    where ph.posthistorytypeid in (52,53)
+    group by ph.postid
+),
+bounties as (
+    -- Aggregate bounties per user
+    select
+        p.owneruserid as user_id,
+        sum(coalesce(v.bountyamount,0)) filter (where v.votetypeid in (8,9)) as total_bounty_amount,
+        count(*) filter (where v.votetypeid = 8) as bounty_started,
+        count(*) filter (where v.votetypeid = 9) as bounty_awarded
+    from posts p
+    left join votes v on v.postid = p.id
+    group by p.owneruserid
+),
+quality_flags as (
+    -- Derive per-user quality signals combining multiple sources
+    select
+        qa.user_id,
+        max(case when pa.rn_last_by_user = 1 and pa.score >= 5 then 1 else 0 end) as recent_good_post,
+        max(case when pa.popularity_rank <= 100 then 1 else 0 end) as top_100_popularity,
+        sum(case when cr.close_reason_id is not null then 1 else 0 end) as closed_posts,
+        sum(case when cr.close_reason_id = 101 then 1 else 0 end) as closed_as_duplicate,
+        sum(case when dl.duplicate_post_id is not null then 1 else 0 end) as duplicate_links_out,
+        sum(case when pa.upvotes > pa.downvotes then 1 else 0 end) as more_up_than_down_posts
+    from q_and_a qa
+    left join post_activity pa on pa.user_id = qa.user_id
+    left join closed_reasons cr on cr.postid = pa.post_id
+    left join dup_links dl on dl.duplicate_post_id = pa.post_id
+    group by qa.user_id
+),
+user_post_mix as (
+    select
+        qa.user_id,
+        qa.questions,
+        qa.answers,
+        qa.total_post_score,
+        qa.question_views,
+        qa.last_post_date,
+        qa.distinct_answered_questions,
+        case
+            when qa.answers is null or qa.questions is null then null
+            when qa.questions = 0 and qa.answers = 0 then null
+            else qa.answers::numeric / nullif(qa.answers + qa.questions, 0)
+        end as answer_ratio
+    from q_and_a qa
+),
+recent_commenters as (
+    -- Most active recent commenters per post with tie-breaking by score then recency
+    select
+        c.postid,
+        c.userid,
+        count(*) as comment_count,
+        sum(coalesce(c.score,0)) as comment_score,
+        row_number() over (partition by c.postid order by count(*) desc, sum(coalesce(c.score,0)) desc, max(c.creationdate) desc, min(c.id)) as rn_commenter
+    from comments c
+    where c.creationdate >= (select coalesce(max(creationdate), now()) - interval '90 days' from comments)
+    group by c.postid, c.userid
+),
+recent_comment_influence as (
+    select
+        pa.user_id,
+        sum(rc.comment_count) as comments_on_my_posts_recent,
+        sum(rc.comment_score) as comment_score_on_my_posts_recent
+    from post_activity pa
+    join recent_commenters rc on rc.postid = pa.post_id and rc.rn_commenter = 1
+    group by pa.user_id
+),
+user_rankings as (
+    select
+        ru.user_id,
+        dense_rank() over (order by coalesce(upm.total_post_score,0) desc, ru.reputation desc, ru.badge_count desc, ru.user_id) as dr_overall_score,
+        dense_rank() over (order by coalesce(upm.answer_ratio,0) desc nulls last) as dr_answer_ratio,
+        dense_rank() over (order by coalesce(tc.hhi,0) asc nulls last) as dr_tag_diversity,
+        dense_rank() over (order by coalesce(b.total_bounty_amount,0) desc nulls last) as dr_bounties
+    from recent_users ru
+    left join user_post_mix upm on upm.user_id = ru.user_id
+    left join tag_concentration tc on tc.user_id = ru.user_id
+    left join bounties b on b.user_id = ru.user_id
+),
+acceptance as (
+    -- Compute acceptance rate on answers by checking if user's answers are accepted
+    select
+        a.owneruserid as user_id,
+        count(*) as answers_total,
+        count(*) filter (
+            where exists (
+                select 1
+                from posts q
+                where q.id = a.parentid
+                  and q.acceptedanswerid = a.id
+            )
+        ) as answers_accepted
+    from posts a
+    where a.posttypeid = 2
+    group by a.owneruserid
+),
+final_users as (
+    select
+        ru.user_id,
+        ru.displayname,
+        ru.reputation,
+        ru.creationdate,
+        coalesce(ru.location, 'Unknown') as location,
+        ru.badge_count,
+        ru.gold_badges,
+        ru.silver_badges,
+        ru.bronze_badges,
+        ru.rn_newest,
+        upm.questions,
+        upm.answers,
+        upm.total_post_score,
+        upm.question_views,
+        upm.last_post_date,
+        upm.distinct_answered_questions,
+        upm.answer_ratio,
+        tc.max_tag_posts,
+        tc.total_tag_posts,
+        tc.distinct_tags,
+        tc.hhi,
+        bn.total_bounty_amount,
+        bn.bounty_started,
+        bn.bounty_awarded,
+        hc.times_hot as hot_times,
+        case when hc.first_hot_at is not null then 1 else 0 end as ever_hot,
+        qf.recent_good_post,
+        qf.top_100_popularity,
+        qf.closed_posts,
+        qf.closed_as_duplicate,
+        qf.duplicate_links_out,
+        qf.more_up_than_down_posts,
+        rci.comments_on_my_posts_recent,
+        rci.comment_score_on_my_posts_recent,
+        ur.dr_overall_score,
+        ur.dr_answer_ratio,
+        ur.dr_tag_diversity,
+        ur.dr_bounties,
+        ac.answers_total,
+        ac.answers_accepted,
+        case when ac.answers_total > 0 then ac.answers_accepted::numeric / ac.answers_total else null end as acceptance_rate
+    from recent_users ru
+    left join user_post_mix upm on upm.user_id = ru.user_id
+    left join tag_concentration tc on tc.user_id = ru.user_id
+    left join bounties bn on bn.user_id = ru.user_id
+    left join hot_network hc on hc.postid in (
+        select p.id from posts p where p.owneruserid = ru.user_id and p.posttypeid = 1
+    )
+    left join quality_flags qf on qf.user_id = ru.user_id
+    left join recent_comment_influence rci on rci.user_id = ru.user_id
+    left join user_rankings ur on ur.user_id = ru.user_id
+    left join acceptance ac on ac.user_id = ru.user_id
+),
+normalized as (
+    -- Normalize some metrics for benchmarking
+    select
+        fu.*,
+        case when max(reputation) over () > 0 then fu.reputation::numeric / max(reputation) over () else null end as norm_reputation,
+        case when max(total_post_score) over () is not null and max(total_post_score) over () <> 0
+             then coalesce(fu.total_post_score,0)::numeric / nullif(max(total_post_score) over (),0)
+             else null end as norm_total_post_score,
+        case when max(question_views) over () is not null and max(question_views) over () <> 0
+             then coalesce(fu.question_views,0)::numeric / nullif(max(question_views) over (),0)
+             else null end as norm_question_views
+    from final_users fu
+),
+synth_score as (
+    select
+        n.*,
+        -- Weighted composite score with null-safe handling
+        (
+            0.30 * coalesce(n.norm_reputation, 0) +
+            0.25 * coalesce(n.norm_total_post_score, 0) +
+            0.10 * coalesce(n.norm_question_views, 0) +
+            0.10 * coalesce(n.acceptance_rate, 0) +
+            0.10 * coalesce(1 - least(n.hhi,1), 0) +
+            0.05 * coalesce(n.recent_good_post, 0) +
+            0.05 * coalesce(case when n.ever_hot = 1 then 1 else 0 end, 0) +
+            0.05 * coalesce(least(n.dr_overall_score, 1000)::numeric, 0) / 1000.0
+        ) as composite_score
+    from normalized n
+),
+bucketed as (
+    select
+        s.*,
+        width_bucket(s.composite_score, 0.0, 1.0, 10) as perf_bucket
+    from synth_score s
+),
+null_edge_cases as (
+    -- Force inclusion of users with no posts or unusual null combinations to stress NULL logic
+    select
+        u.id as user_id,
+        u.displayname,
+        null::text as reason
+    from users u
+    where not exists (select 1 from posts p where p.owneruserid = u.id)
+      or (u.location is null and u.websiteurl is null and u.aboutme is null)
+),
+top_posts as (
+    -- Top posts per user using multiple criteria and correlated subquery for ties
+    select
+        pa.user_id,
+        pa.post_id,
+        pa.posttypeid,
+        pa.title,
+        pa.score,
+        pa.viewcount,
+        pa.upvotes,
+        pa.downvotes,
+        pa.favorites,
+        pa.comments,
+        pa.popularity_rank
+    from post_activity pa
+    where pa.rn_last_by_user <= 3
+      and pa.score >= coalesce((
+          select avg(score) + stddev_pop(score)
+          from posts p2
+          where p2.posttypeid = pa.posttypeid
+        ), 0)
+)
+select
+    b.user_id,
+    coalesce(b.displayname, concat('user-', b.user_id::text)) as displayname,
+    b.location,
+    b.reputation,
+    b.badge_count,
+    b.gold_badges,
+    b.silver_badges,
+    b.bronze_badges,
+    b.questions,
+    b.answers,
+    b.total_post_score,
+    b.question_views,
+    b.distinct_answered_questions,
+    round(100 * coalesce(b.answer_ratio,0), 2) as answer_ratio_pct,
+    b.max_tag_posts,
+    b.total_tag_posts,
+    b.distinct_tags,
+    round(coalesce(b.hhi,0)::numeric, 4) as tag_hhi,
+    b.total_bounty_amount,
+    b.bounty_started,
+    b.bounty_awarded,
+    b.hot_times,
+    b.ever_hot,
+    b.recent_good_post,
+    b.top_100_popularity,
+    b.closed_posts,
+    b.closed_as_duplicate,
+    b.duplicate_links_out,
+    b.more_up_than_down_posts,
+    b.comments_on_my_posts_recent,
+    b.comment_score_on_my_posts_recent,
+    b.dr_overall_score,
+    b.dr_answer_ratio,
+    b.dr_tag_diversity,
+    b.dr_bounties,
+    round(100 * coalesce(b.acceptance_rate,0), 2) as acceptance_rate_pct,
+    round(100 * s.composite_score, 2) as composite_score_pct,
+    s.perf_bucket,
+    -- String expressions and NULL logic
+    trim(both from coalesce(nullif(split_part(b.displayname, ' ', 1), ''), 'Anon')) as first_token_name,
+    upper(coalesce(substring(b.displayname from 1 for 1), 'X')) as display_initial,
+    case
+        when b.location ilike '%remote%' then 'Remote'
+        when b.location is null then 'Unknown'
+        when b.location ~* '(usa|united states|us|u\.s\.)' then 'USA'
+        else 'Other'
+    end as location_bucket,
+    -- Bring in some top posts via lateral-like aggregation
+    coalesce((
+        select string_agg(concat(tp.post_id, ':', coalesce(tp.title,'[no title]')), ' | ' order by tp.popularity_rank)
+        from top_posts tp
+        where tp.user_id = b.user_id
+    ), '[no top posts]') as top_posts_preview,
+    -- Edge case marker from null_edge_cases
+    case when exists (select 1 from null_edge_cases nec where nec.user_id = b.user_id) then 1 else 0 end as is_edge_case_user
+from bucketed s
+join final_users b on b.user_id = s.user_id
+where
+    -- Complex predicate combining multiple signals
+    (
+        b.reputation >= coalesce((select percentile_disc(0.5) within group (order by reputation) from users), 0)
+        or b.badge_count >= 5
+        or b.answers >= 10
+    )
+    and coalesce(b.closed_posts,0) < coalesce(b.answers,0) + coalesce(b.questions,0)
+    and (
+        b.acceptance_rate is null
+        or b.acceptance_rate >= 0.1
+        or b.answers < 5
+    )
+    and (
+        s.perf_bucket between 3 and 10
+        or (b.ever_hot = 1 and s.composite_score > 0.15)
+    )
+order by
+    s.perf_bucket desc,
+    s.composite_score desc,
+    b.dr_overall_score,
+    b.user_id
+limit 500;

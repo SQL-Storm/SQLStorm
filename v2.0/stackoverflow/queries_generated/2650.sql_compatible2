@@ -1,0 +1,147 @@
+WITH RECURSIVE RecursivePostHierarchy AS (
+    SELECT 
+        p.Id, p.PostTypeId, p.ParentId, p.CreationDate, p.Score, p.ViewCount, p.OwnerUserId,
+        1 AS Level,
+        CAST(p.Id AS VARCHAR(1000)) AS Path
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+    UNION ALL
+    SELECT 
+        c.Id, c.PostTypeId, c.ParentId, c.CreationDate, c.Score, c.ViewCount, c.OwnerUserId,
+        r.Level + 1,
+        r.Path || '->' || CAST(c.Id AS VARCHAR(1000))
+    FROM Posts c
+    JOIN RecursivePostHierarchy r ON c.ParentId = r.Id
+    WHERE c.PostTypeId = 2
+      AND r.Level < 5
+),
+AggregatedVotes AS (
+    SELECT 
+        v.PostId,
+        COUNT(CASE WHEN vt.Name = 'UpMod' THEN 1 END) AS UpVotes,
+        COUNT(CASE WHEN vt.Name = 'DownMod' THEN 1 END) AS DownVotes,
+        SUM(CASE WHEN vt.Name = 'BountyStart' THEN COALESCE(v.BountyAmount, 0) ELSE 0 END) AS TotalBountyStarted,
+        MAX(CASE WHEN vt.Name = 'Close' THEN v.CreationDate END) AS LastCloseVoteDate
+    FROM Votes v
+    JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    GROUP BY v.PostId
+),
+LatestPostHistory AS (
+    SELECT ph.PostId, ph.PostHistoryTypeId, ph.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn,
+        ph.UserId, ph.UserDisplayName, ph.Comment
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (10, 11)
+),
+UserBadgesRanked AS (
+    SELECT 
+        b.UserId, b.Name, b.Class,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC) AS rn
+    FROM Badges b
+),
+UserActivityWindow AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.Location,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        MIN(p.CreationDate) AS FirstPostDate,
+        COUNT(DISTINCT ph.Id) AS TotalEdits,
+        MAX(ph.CreationDate) AS LastEditDate,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId IN (4,5,6)
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location
+),
+TagUsage AS (
+    SELECT 
+        tag,
+        COUNT(*) AS UsageCount,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(p.ViewCount) AS MaxViewCount
+    FROM Posts p,
+    LATERAL unnest(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><')) AS tag
+    WHERE p.Tags IS NOT NULL AND p.PostTypeId = 1
+    GROUP BY tag
+),
+DuplicateLinks AS (
+    SELECT pl.PostId, pl.RelatedPostId, p1.Title AS PostTitle, p2.Title AS RelatedPostTitle
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id AND lt.Name = 'Duplicate'
+    JOIN Posts p1 ON pl.PostId = p1.Id
+    JOIN Posts p2 ON pl.RelatedPostId = p2.Id
+),
+ComplexUserStats AS (
+    SELECT
+        ua.Id,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.Location,
+        ua.QuestionsCount,
+        ua.AnswersCount,
+        ua.TotalEdits,
+        ua.GoldBadges,
+        ua.SilverBadges,
+        ua.BronzeBadges,
+        CASE 
+            WHEN ua.AnswersCount = 0 THEN NULL
+            ELSE ROUND(CAST(ua.QuestionsCount AS NUMERIC) / ua.AnswersCount, 2)
+        END AS QtoARatio,
+        ROW_NUMBER() OVER (ORDER BY ua.Reputation DESC, ua.AnswersCount DESC) AS UserRank,
+        ts.UsageCount AS FavoriteTagCount,
+        ts.AvgPostScore AS FavoriteTagAvgScore,
+        ts.MaxViewCount AS FavoriteTagMaxView
+    FROM UserActivityWindow ua
+    LEFT JOIN LATERAL (
+        SELECT tag AS fav_tag
+        FROM Posts p2
+        CROSS JOIN LATERAL unnest(string_to_array(substring(p2.Tags FROM 2 FOR char_length(p2.Tags) - 2), '><')) AS tag
+        WHERE p2.OwnerUserId = ua.Id
+        GROUP BY tag
+        ORDER BY COUNT(*) DESC
+        LIMIT 1
+    ) fav ON TRUE
+    LEFT JOIN TagUsage ts ON ts.tag = fav.fav_tag
+)
+SELECT
+    c.UserRank,
+    c.DisplayName,
+    c.Reputation,
+    c.Location,
+    c.QuestionsCount,
+    c.AnswersCount,
+    c.TotalEdits,
+    c.GoldBadges,
+    c.SilverBadges,
+    c.BronzeBadges,
+    COALESCE(c.QtoARatio, 0) AS QtoARatio,
+    COALESCE(c.FavoriteTagCount, 0) AS FavoriteTagCount,
+    COALESCE(c.FavoriteTagAvgScore, 0) AS FavoriteTagAvgScore,
+    COALESCE(c.FavoriteTagMaxView, 0) AS FavoriteTagMaxView,
+    phh.Comment AS LastCloseReason,
+    alv.UpVotes,
+    alv.DownVotes,
+    alv.TotalBountyStarted,
+    alv.LastCloseVoteDate,
+    STRING_AGG(DISTINCT (lt.Name || '=' || pl.RelatedPostId::TEXT), ', ' ORDER BY lt.Name) AS DuplicateLinksSummary
+FROM ComplexUserStats c
+LEFT JOIN Posts p ON p.OwnerUserId = c.Id AND p.PostTypeId = 1
+LEFT JOIN LatestPostHistory phh ON phh.PostId = p.Id AND phh.rn = 1 AND phh.PostHistoryTypeId = 10
+LEFT JOIN AggregatedVotes alv ON alv.PostId = p.Id
+LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+LEFT JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+WHERE c.Reputation > 1000
+  AND (c.GoldBadges + c.SilverBadges + c.BronzeBadges) >= 3
+GROUP BY 
+  c.UserRank, c.DisplayName, c.Reputation, c.Location, c.QuestionsCount, c.AnswersCount, c.TotalEdits, 
+  c.GoldBadges, c.SilverBadges, c.BronzeBadges, c.QtoARatio, c.FavoriteTagCount, c.FavoriteTagAvgScore, c.FavoriteTagMaxView,
+  phh.Comment, alv.UpVotes, alv.DownVotes, alv.TotalBountyStarted, alv.LastCloseVoteDate
+ORDER BY c.UserRank
+LIMIT 50;

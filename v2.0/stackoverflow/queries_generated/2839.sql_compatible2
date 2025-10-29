@@ -1,0 +1,198 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        0 AS Level,
+        CAST(t.TagName AS VARCHAR(3500)) AS Path
+    FROM Tags t
+    WHERE NOT EXISTS (
+        SELECT 1 FROM Tags t2 WHERE t2.TagName < t.TagName
+    )
+    UNION ALL
+    SELECT
+        t.Id,
+        t.TagName,
+        r.Level + 1,
+        CAST(r.Path || '->' || t.TagName AS VARCHAR(3500))
+    FROM Tags t
+    INNER JOIN RecursiveTagHierarchy r ON t.TagName > r.TagName
+    WHERE r.Level < 3
+),
+UserBadges AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        b.Class,
+        COUNT(*) AS BadgeCount
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, b.Class
+),
+PostAnswerRanks AS (
+    SELECT 
+        a.Id,
+        a.ParentId,
+        a.Score,
+        a.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+),
+QuestionStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.CreationDate,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        COALESCE(pa.AnswerRank, 0) AS TopAnswerRank,
+        pa.Id AS TopAnswerId,
+        pa.Score AS TopAnswerScore,
+        u.DisplayName AS QuestionOwnerName,
+        ub.BadgeCount AS OwnerBadgeCount,
+        ub.Class AS BadgeClass
+    FROM Posts q
+    LEFT JOIN PostAnswerRanks pa ON pa.ParentId = q.Id AND pa.AnswerRank = 1
+    LEFT JOIN Users u ON u.Id = q.OwnerUserId
+    LEFT JOIN UserBadges ub ON ub.UserId = q.OwnerUserId AND ub.Class = 1
+    WHERE q.PostTypeId = 1
+),
+TopCommentersPerQuestion AS (
+    SELECT
+        p.Id AS QuestionId,
+        c.UserId,
+        u.DisplayName AS CommenterName,
+        COUNT(*) AS CommentsCount,
+        ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY COUNT(*) DESC, MIN(c.CreationDate) ASC) AS RankInComments
+    FROM Posts p
+    INNER JOIN Comments c ON c.PostId = p.Id
+    INNER JOIN Users u ON u.Id = c.UserId
+    WHERE p.PostTypeId = 1 AND c.UserId IS NOT NULL
+    GROUP BY p.Id, c.UserId, u.DisplayName
+),
+LatestEditPerPost AS (
+    SELECT
+        ph.PostId,
+        ph.UserId AS EditorUserId,
+        ph.UserDisplayName AS EditorName,
+        ph.CreationDate AS EditDate,
+        ph.PostHistoryTypeId,
+        ph.Comment,
+        ph.Id AS PostHistoryId
+    FROM PostHistory ph
+    JOIN (
+        SELECT ph2.PostId, MAX(ph2.CreationDate) AS MaxEditDate
+        FROM PostHistory ph2
+        GROUP BY ph2.PostId
+    ) latest ON latest.PostId = ph.PostId AND latest.MaxEditDate = ph.CreationDate
+),
+QuestionsWithLinkedDuplicates AS (
+    SELECT DISTINCT
+        q.Id AS QuestionId,
+        q.Title,
+        linked.RelatedPostId AS DuplicateId,
+        dup.Title AS DuplicateTitle
+    FROM Posts q
+    INNER JOIN PostLinks linked ON linked.PostId = q.Id AND linked.LinkTypeId = 3
+    INNER JOIN Posts dup ON dup.Id = linked.RelatedPostId
+    WHERE q.PostTypeId = 1 AND dup.PostTypeId = 1
+),
+FlaggedPosts AS (
+    SELECT
+        v.PostId,
+        SUM(CASE WHEN vt.Name = 'Offensive' THEN 1 ELSE 0 END) AS OffensiveFlags,
+        SUM(CASE WHEN vt.Name = 'Spam' THEN 1 ELSE 0 END) AS SpamFlags,
+        COUNT(*) AS TotalFlags
+    FROM Votes v
+    INNER JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE v.VoteTypeId IN (4, 12)
+    GROUP BY v.PostId
+),
+QuestionActivitySummary AS (
+    SELECT
+        q.Id AS QuestionId,
+        COUNT(DISTINCT a.Id) AS AnswerCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        MAX(latest.EditDate) AS LastEditDate,
+        MAX(q.LastActivityDate) AS LastActivityDate,
+        COALESCE(fp.OffensiveFlags,0) AS OffensiveFlags,
+        COALESCE(fp.SpamFlags,0) AS SpamFlags,
+        COALESCE(fp.TotalFlags,0) AS TotalFlags
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    LEFT JOIN Comments c ON c.PostId = q.Id
+    LEFT JOIN LatestEditPerPost latest ON latest.PostId = q.Id
+    LEFT JOIN FlaggedPosts fp ON fp.PostId = q.Id
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, fp.OffensiveFlags, fp.SpamFlags, fp.TotalFlags
+)
+SELECT
+    qs.QuestionId,
+    qs.Title,
+    qs.QuestionOwnerName,
+    qs.QuestionScore,
+    qs.ViewCount,
+    COALESCE(qs.OwnerBadgeCount,0) AS GoldBadgesOwnedByOwner,
+    qs.TopAnswerId,
+    qs.TopAnswerScore,
+    tc.CommenterName AS TopCommenterName,
+    tc.CommentsCount AS TopCommenterComments,
+    qds.DuplicateId,
+    qds.DuplicateTitle,
+    qa.AnswerCount,
+    qa.CommentCount,
+    qa.LastEditDate,
+    qa.LastActivityDate,
+    qa.OffensiveFlags,
+    qa.SpamFlags,
+    qa.TotalFlags,
+    STRING_AGG(DISTINCT rth.TagName, ', ') FILTER (WHERE rth.Level = 1) AS Level1Tags,
+    STRING_AGG(DISTINCT rth.Path, '; ' ORDER BY rth.Level DESC) AS TagHierarchyPaths,
+    (qs.QuestionScore * 2 + COALESCE(qs.TopAnswerScore,0) * 3 + qa.AnswerCount * 1.5 + qa.CommentCount * 1.2 - qa.OffensiveFlags * 5 - qa.SpamFlags * 10)
+        / NULLIF((EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - qs.CreationDate)) / 86400) + 1, 0) AS WeightedEngagementScore,
+    CASE 
+        WHEN qs.ViewCount > 10000 AND qa.AnswerCount > 10 THEN 'High Traffic & Active' 
+        WHEN qs.ViewCount > 10000 THEN 'High Traffic'
+        WHEN qa.AnswerCount > 10 THEN 'Active Question'
+        ELSE 'Normal'
+    END AS QuestionStatus,
+    CASE 
+        WHEN qa.TotalFlags > 0 THEN 'Flagged'
+        ELSE 'Clean'
+    END AS ModerationStatus,
+    COALESCE(TRIM(qs.Title), '[No Title]') || 
+        ' [' || COALESCE(qs.QuestionOwnerName, 'Anonymous') || ']' AS DisplayTitleWithOwner
+FROM QuestionStats qs
+LEFT JOIN TopCommentersPerQuestion tc ON tc.QuestionId = qs.QuestionId AND tc.RankInComments = 1
+LEFT JOIN QuestionsWithLinkedDuplicates qds ON qds.QuestionId = qs.QuestionId
+LEFT JOIN QuestionActivitySummary qa ON qa.QuestionId = qs.QuestionId
+LEFT JOIN RecursiveTagHierarchy rth ON POSITION(rth.TagName IN COALESCE(qs.Tags, '')) > 0
+WHERE qs.QuestionScore >= (
+    SELECT PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY Score) FROM Posts WHERE PostTypeId = 1
+)
+AND (COALESCE(qa.OffensiveFlags,0) + COALESCE(qa.SpamFlags,0)) < 3
+GROUP BY
+    qs.QuestionId,
+    qs.Title,
+    qs.QuestionOwnerName,
+    qs.QuestionScore,
+    qs.ViewCount,
+    qs.OwnerBadgeCount,
+    qs.TopAnswerId,
+    qs.TopAnswerScore,
+    tc.CommenterName,
+    tc.CommentsCount,
+    qds.DuplicateId,
+    qds.DuplicateTitle,
+    qa.AnswerCount,
+    qa.CommentCount,
+    qa.LastEditDate,
+    qa.LastActivityDate,
+    qa.OffensiveFlags,
+    qa.SpamFlags,
+    qa.TotalFlags,
+    qs.CreationDate
+ORDER BY WeightedEngagementScore DESC NULLS LAST, qa.AnswerCount DESC
+LIMIT 50;

@@ -1,0 +1,200 @@
+-- {"query": "7604.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1890} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        COUNT(DISTINCT c.Id) AS Comments,
+        COUNT(DISTINCT b.Id) AS Badges,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        DATEDIFF(CURRENT_DATE, MAX(p.CreationDate)) AS DaysSinceLastPost,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        AVG(p.Score) AS AvgPostScore,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2) || ' ', ', ') AS AllTags,
+        CASE 
+            WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 0 
+            THEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) * 100.0 / COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END)
+            ELSE 0 
+        END AS AnswerToQuestionRatio
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        TotalPosts,
+        Questions,
+        Answers,
+        Comments,
+        Badges,
+        LastPostDate,
+        ReputationRank,
+        AvgPostScore,
+        AnswerToQuestionRatio,
+        CASE 
+            WHEN LastPostDate >= DATEADD(DAY, -30, CURRENT_DATE) THEN 'Active'
+            WHEN LastPostDate >= DATEADD(DAY, -90, CURRENT_DATE) THEN 'Moderately Active'
+            WHEN LastPostDate >= DATEADD(DAY, -365, CURRENT_DATE) THEN 'Inactive'
+            ELSE 'Very Inactive'
+        END AS ActivityLevel
+    FROM UserActivityStats
+    WHERE Reputation > 1000
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS HasAcceptedAnswer,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+        DATEDIFF(p.ClosedDate, p.CreationDate) AS DaysToClose,
+        DATEDIFF(p.LastEditDate, p.CreationDate) AS DaysToEdit,
+        CASE 
+            WHEN p.ViewCount > 1000 THEN 'High Traffic'
+            WHEN p.ViewCount > 100 THEN 'Medium Traffic'
+            ELSE 'Low Traffic'
+        END AS TrafficLevel,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS ScoreRank,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        AVG(v.BountyAmount) AS AvgBounty,
+        STRING_AGG(DISTINCT u.DisplayName, ', ') AS PostAuthors
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (2, 3)
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1, 2) AND p.CreationDate >= DATEADD(YEAR, -2, CURRENT_DATE)
+    GROUP BY 
+        p.Id, p.Title, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount,
+        p.CreationDate, p.OwnerUserId, p.PostTypeId, p.Tags, p.AcceptedAnswerId,
+        p.ClosedDate, p.LastEditDate
+),
+TagUsage AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Very Popular'
+            WHEN t.Count > 100 THEN 'Popular'
+            WHEN t.Count > 10 THEN 'Moderate'
+            ELSE 'Rare'
+        END AS PopularityLevel,
+        DENSE_RANK() OVER (ORDER BY t.Count DESC) AS PopularityRank
+    FROM Tags t
+    WHERE t.Count > 10
+),
+UserPostPerformance AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        COUNT(p.Id) AS PostCount,
+        AVG(p.Score) AS AvgScore,
+        MAX(p.Score) AS MaxScore,
+        STDEV(p.Score) AS ScoreStdDev,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        SUM(p.Score) AS TotalScore,
+        RANK() OVER (ORDER BY SUM(p.Score) DESC) AS ScoreRank,
+        STRING_AGG(DISTINCT p.Title, '; ') AS PostTitles,
+        LAG(SUM(p.Score)) OVER (ORDER BY u.Reputation DESC) AS PrevReputationScore,
+        CASE 
+            WHEN LAG(SUM(p.Score)) OVER (ORDER BY u.Reputation DESC) IS NOT NULL 
+            THEN (SUM(p.Score) - LAG(SUM(p.Score)) OVER (ORDER BY u.Reputation DESC)) * 100.0 / LAG(SUM(p.Score)) OVER (ORDER BY u.Reputation DESC)
+            ELSE 0 
+        END AS ScoreChangePercent
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId IN (1, 2) 
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views
+    HAVING (COUNT(p.Id) > 0 OR COUNT(p.Id) IS NOT NULL)
+)
+SELECT 
+    tu.UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.TotalPosts,
+    tu.Questions,
+    tu.Answers,
+    tu.Comments,
+    tu.Badges,
+    tu.LastPostDate,
+    tu.ReputationRank,
+    tu.AvgPostScore,
+    tu.AnswerToQuestionRatio,
+    tu.ActivityLevel,
+    pa.PostId,
+    pa.Title,
+    pa.Score,
+    pa.ViewCount,
+    pa.AnswerCount,
+    pa.CommentCount,
+    pa.CreationDate,
+    pa.HasAcceptedAnswer,
+    pa.IsClosed,
+    pa.DaysToClose,
+    pa.DaysToEdit,
+    pa.TrafficLevel,
+    pa.ScoreRank,
+    pa.VoteCount,
+    pa.AvgBounty,
+    pa.PostAuthors,
+    tuu.TagName,
+    tuu.Count,
+    tuu.PopularityLevel,
+    tuu.PopularityRank,
+    upp.PostCount,
+    upp.AvgScore,
+    upp.MaxScore,
+    upp.ScoreStdDev,
+    upp.QuestionCount,
+    upp.AnswerCount,
+    upp.TotalScore,
+    upp.ScoreRank AS UserScoreRank,
+    upp.PostTitles,
+    upp.ScoreChangePercent
+FROM TopUsers tu
+LEFT JOIN PostAnalysis pa ON tu.UserId = pa.OwnerUserId
+LEFT JOIN TagUsage tuu ON EXISTS (
+    SELECT 1 
+    FROM (
+        SELECT TRIM(SUBSTRING(pa.Tags, n.n, POSITION('>' IN SUBSTRING(pa.Tags, n.n)) - 1)) AS tag
+        FROM (
+            SELECT 1 n UNION SELECT 2 UNION SELECT 3 UNION SELECT 4 UNION SELECT 5 
+            UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9 UNION SELECT 10
+            UNION SELECT 11 UNION SELECT 12 UNION SELECT 13 UNION SELECT 14 UNION SELECT 15
+        ) n 
+        WHERE n.n <= LENGTH(pa.Tags) AND SUBSTRING(pa.Tags, n.n, 1) = '<'
+    ) tag_list
+    WHERE tag_list.tag = tuu.TagName
+)
+LEFT JOIN UserPostPerformance upp ON tu.UserId = upp.UserId
+WHERE 
+    (tu.Reputation > 10000 OR tu.Answers > 50)
+    AND (pa.Score > 10 OR pa.ViewCount > 100)
+    AND (tuu.Count > 50 OR tuu.Count IS NULL)
+ORDER BY 
+    tu.Reputation DESC, 
+    pa.Score DESC, 
+    tuu.Count DESC
+LIMIT 1000;

@@ -1,0 +1,159 @@
+with RecursiveTagHierarchy as (
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        0 as Level,
+        array[t.Id] as Path
+    from Tags t
+    where t.IsRequired = true
+
+    union all
+
+    select 
+        child.Id,
+        child.TagName,
+        child.Count,
+        child.IsModeratorOnly,
+        child.IsRequired,
+        r.Level + 1,
+        r.Path || child.Id
+    from Tags child
+    join PostLinks pl on pl.PostId = child.ExcerptPostId
+    join RecursiveTagHierarchy r on r.Id = pl.RelatedPostId
+    where child.Id != any(r.Path)
+),
+UserActivityStats as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsAsked,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersGiven,
+        coalesce(sum(case when v.VoteTypeId = 2 then 1 else 0 end),0) as UpVotesReceived,
+        coalesce(sum(case when v.VoteTypeId = 3 then 1 else 0 end),0) as DownVotesReceived,
+        count(distinct b.Id) as BadgesCount,
+        max(p.Score) filter (where p.PostTypeId = 1 or p.PostTypeId = 2) as MaxPostScore,
+        avg(p.Score) filter (where p.PostTypeId = 1 or p.PostTypeId = 2) as AvgPostScore,
+        max(ph.CreationDate) as LastEditDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Votes v on v.PostId = p.Id
+    left join Badges b on b.UserId = u.Id
+    left join PostHistory ph on ph.UserId = u.Id and ph.PostHistoryTypeId in (4,5,6)
+    group by u.Id, u.DisplayName
+),
+TopPostsWithComplexScore as (
+    select
+        p.Id,
+        p.Title,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.Tags,
+        u.DisplayName as OwnerName,
+        dense_rank() over (partition by p.PostTypeId order by (p.Score * 1.0 / nullif(p.ViewCount,0) + coalesce(p.FavoriteCount,0) * 0.5) desc) as ScoreRank,
+        row_number() over (partition by p.PostTypeId order by p.CreationDate desc) as RecentRank
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId in (1,2) and p.CreationDate >= cast('2024-10-01' as date) - interval '1 year'
+),
+ClosedDuplicatesWithComments as (
+    select distinct 
+        ph.PostId,
+        ph.CreationDate as CloseDate,
+        ph.Comment as CloseReasonId,
+        ct.Name as CloseReasonName,
+        pl.RelatedPostId as DuplicateOfPostId,
+        dup.Title as DuplicateOfTitle,
+        c.Id as CommentId,
+        c.Text as CommentText,
+        c.CreationDate as CommentDate,
+        c.UserDisplayName as CommentUser,
+        c.UserId as CommentUserId
+    from PostHistory ph
+    join CloseReasonTypes ct on ct.Id = ph.Comment
+    left join PostLinks pl on pl.PostId = ph.PostId and pl.LinkTypeId = 3
+    left join Posts dup on dup.Id = pl.RelatedPostId
+    left join Comments c on c.PostId = ph.PostId 
+    where ph.PostHistoryTypeId = 10 
+),
+UserBadgeRanks as (
+    select 
+        b.UserId,
+        b.Name,
+        dense_rank() over (partition by b.UserId order by b.Class) as BadgeRank,
+        count(*) over (partition by b.UserId) as TotalBadges,
+        b.Class,
+        b.Date
+    from Badges b
+),
+UserRanks as (
+    select
+        uas.UserId,
+        uas.DisplayName,
+        row_number() over (order by uas.Reputation desc nulls last, uas.QuestionsAsked desc) as OverallRank
+    from (
+        select
+            u.Id,
+            u.DisplayName,
+            u.Reputation,
+            coalesce(ua.QuestionsAsked,0) as QuestionsAsked
+        from Users u
+        left join UserActivityStats ua on ua.UserId = u.Id
+    ) uas
+)
+select 
+    tps.Id as PostID,
+    tps.Title,
+    tps.PostTypeId,
+    tps.CreationDate,
+    tps.Score,
+    tps.ViewCount,
+    tps.AnswerCount,
+    tps.Tags,
+    tps.OwnerName,
+    round((tps.Score::numeric / nullif(tps.ViewCount,0)) * 100,2) as ScorePer100Views,
+    ua.QuestionsAsked,
+    ua.AnswersGiven,
+    ua.UpVotesReceived,
+    ua.DownVotesReceived,
+    ua.BadgesCount,
+    ua.MaxPostScore,
+    ua.AvgPostScore,
+    ua.LastEditDate,
+    cd.CloseDate,
+    cd.CloseReasonName,
+    cd.DuplicateOfTitle,
+    cd.CommentUser,
+    cd.CommentText,
+    ub.BadgeRank,
+    ub.TotalBadges,
+    ur.OverallRank,
+    (select string_agg(distinct ph2.UserDisplayName, ', ' order by ph2.CreationDate desc)
+     from PostHistory ph2
+     where ph2.PostId = tps.Id and ph2.PostHistoryTypeId in (4,5) and ph2.UserDisplayName is not null
+     limit 3) as RecentEditors,
+    c_rnk.CommentText as TopCommentText,
+    c_rnk.CommentUser as TopCommentUser,
+    c_rnk.CommentDate as TopCommentDate
+from TopPostsWithComplexScore tps
+left join UserActivityStats ua on ua.UserId = (select OwnerUserId from Posts where Id = tps.Id)
+left join ClosedDuplicatesWithComments cd on cd.PostId = tps.Id
+left join (
+    select 
+        c.PostId,
+        c.Text as CommentText,
+        c.UserDisplayName as CommentUser,
+        c.CreationDate as CommentDate,
+        row_number() over (partition by c.PostId order by c.Score desc nulls last, c.CreationDate desc) as CommentRank
+    from Comments c
+) c_rnk on c_rnk.PostId = tps.Id and c_rnk.CommentRank = 1
+left join UserBadgeRanks ub on ub.UserId = ua.UserId and ub.BadgeRank = 1
+left join UserRanks ur on ur.UserId = ua.UserId
+where tps.ScoreRank <= 10
+order by tps.PostTypeId, tps.ScoreRank, tps.CreationDate desc
+limit 50;

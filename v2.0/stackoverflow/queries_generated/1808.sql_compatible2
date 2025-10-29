@@ -1,0 +1,229 @@
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.Views AS UserViews,
+        U.UpVotes,
+        U.DownVotes,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate AS UserLastAccessDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        AVG(CAST(P.Score AS NUMERIC)) AS AvgPostScore,
+        AVG(CAST(P.ViewCount AS NUMERIC)) AS AvgPostViewCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (5, 6, 8, 9) AND PH.UserId = U.Id THEN 1 ELSE 0 END) AS SelfEditCount,
+        CASE
+            WHEN U.Reputation >= 50000 THEN 'Legend'
+            WHEN U.Reputation >= 10000 THEN 'Guru'
+            WHEN U.Reputation >= 5000 THEN 'Expert'
+            WHEN U.Reputation >= 1000 THEN 'Journeyman'
+            WHEN U.Reputation >= 100 THEN 'Apprentice'
+            ELSE 'Novice'
+        END AS ReputationTier,
+        COUNT(DISTINCT CASE WHEN P.AcceptedAnswerId IS NOT NULL THEN P.Id ELSE NULL END) AS QuestionsWithAcceptedAnswer,
+        U.Location
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId AND U.Id = PH.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.Views, U.UpVotes, U.DownVotes, U.CreationDate, U.LastAccessDate, U.Location
+),
+PostDetailsExtended AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount AS PostViewCount,
+        P.AnswerCount,
+        P.CommentCount AS PostCommentCount,
+        P.FavoriteCount,
+        P.Title,
+        P.Tags,
+        P.Body,
+        P.LastEditDate,
+        P.LastActivityDate,
+        P.ClosedDate,
+        P.AcceptedAnswerId,
+        (SELECT AVG(CAST(S.Score AS NUMERIC)) FROM Comments S WHERE S.PostId = P.Id) AS AvgCommentScore,
+        (SELECT COUNT(DISTINCT V.UserId) FROM Votes V WHERE V.PostId = P.Id AND V.VoteTypeId = 5) AS TotalBookmarks,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - P.CreationDate)) / 86400 AS PostAgeDays,
+        COALESCE(
+            (SELECT regexp_match FROM (
+                SELECT (regexp_matches(P.Tags, '<([^>]+)>'))[1] AS regexp_match
+            ) t WHERE regexp_match IS NOT NULL LIMIT 1),
+            'no-tag'
+        ) AS PrimaryTag,
+        LENGTH(P.Body) AS BodyLength,
+        LENGTH(P.Title) AS TitleLength,
+        P.ContentLicense
+    FROM Posts P
+    INNER JOIN PostTypes PT ON P.PostTypeId = PT.Id
+    WHERE P.PostTypeId IN (1, 2)
+      AND P.CreationDate BETWEEN TIMESTAMP '2019-01-01' AND TIMESTAMP '2023-12-31'
+),
+RankedPostsByActivity AS (
+    SELECT
+        PDE.PostId,
+        PDE.PostTypeId,
+        PDE.PostTypeName,
+        PDE.OwnerUserId,
+        PDE.PostCreationDate,
+        PDE.PostScore,
+        PDE.PostViewCount,
+        PDE.AnswerCount,
+        PDE.PostCommentCount,
+        PDE.FavoriteCount,
+        PDE.Title,
+        PDE.Tags,
+        PDE.Body,
+        PDE.LastEditDate,
+        PDE.LastActivityDate,
+        PDE.ClosedDate,
+        PDE.AcceptedAnswerId,
+        PDE.AvgCommentScore,
+        PDE.TotalBookmarks,
+        PDE.PostAgeDays,
+        PDE.PrimaryTag,
+        PDE.BodyLength,
+        PDE.TitleLength,
+        PDE.ContentLicense,
+        ROW_NUMBER() OVER (PARTITION BY PDE.OwnerUserId ORDER BY PDE.PostScore DESC, PDE.PostViewCount DESC, PDE.PostCommentCount DESC) AS Rn_UserTopPost,
+        RANK() OVER (PARTITION BY PDE.PrimaryTag ORDER BY PDE.PostScore DESC, PDE.PostViewCount DESC) AS Rank_TagTopPost,
+        SUM(PDE.PostScore) OVER (PARTITION BY PDE.OwnerUserId ORDER BY PDE.PostCreationDate) AS RunningUserScore,
+        LAG(PDE.PostCreationDate, 1, PDE.PostCreationDate) OVER (PARTITION BY PDE.OwnerUserId ORDER BY PDE.PostCreationDate) AS PreviousPostDate,
+        (SELECT EXISTS(SELECT 1 FROM PostLinks PL WHERE PL.PostId = PDE.PostId AND PL.LinkTypeId = 3)) AS IsDuplicateSource
+    FROM PostDetailsExtended PDE
+    WHERE PDE.PostScore > 0 OR PDE.PostViewCount > 500
+),
+TagPerformance AS (
+    SELECT
+        PrimaryTag,
+        COUNT(PostId) AS TagPostCount,
+        AVG(PostScore) AS AvgTagScore,
+        AVG(PostViewCount) AS AvgTagViewCount,
+        MAX(PostScore) AS MaxTagScore,
+        MIN(PostCreationDate) AS FirstTagPostDate
+    FROM PostDetailsExtended
+    WHERE PrimaryTag IS NOT NULL AND PrimaryTag != 'no-tag'
+    GROUP BY PrimaryTag
+    HAVING COUNT(PostId) > 500 AND AVG(PostScore) > 10
+)
+SELECT
+    UAS.DisplayName,
+    UAS.Reputation,
+    UAS.ReputationTier,
+    UAS.TotalPosts,
+    UAS.TotalQuestions,
+    UAS.TotalAnswers,
+    UAS.AvgPostScore,
+    UAS.SelfEditCount,
+    RPBA.PostId,
+    RPBA.PostTypeName,
+    RPBA.Title,
+    RPBA.PrimaryTag,
+    RPBA.PostScore,
+    RPBA.PostViewCount,
+    RPBA.PostCommentCount,
+    RPBA.TotalBookmarks,
+    RPBA.PostAgeDays,
+    RPBA.AvgCommentScore,
+    RPBA.Rn_UserTopPost,
+    RPBA.Rank_TagTopPost,
+    RPBA.RunningUserScore,
+    EXTRACT(EPOCH FROM (RPBA.PostCreationDate - RPBA.PreviousPostDate)) / 3600 AS TimeSincePreviousPostHours,
+    TP.TagPostCount,
+    TP.AvgTagScore,
+    TP.MaxTagScore,
+    TP.FirstTagPostDate,
+    CASE
+        WHEN RPBA.PostScore > TP.AvgTagScore * 1.5 AND RPBA.PostAgeDays < 90 THEN 'High Impact Recent Post'
+        WHEN RPBA.IsDuplicateSource THEN 'Duplicate Source Identified'
+        WHEN RPBA.ClosedDate IS NOT NULL THEN 'Closed Post'
+        WHEN RPBA.AcceptedAnswerId IS NOT NULL THEN 'Answered Question'
+        ELSE 'Standard Post'
+    END AS PostStatusFlag,
+    (SELECT COUNT(DISTINCT PH.Id) FROM PostHistory PH WHERE PH.PostId = RPBA.PostId AND PH.PostHistoryTypeId IN (10, 11)) AS CloseReopenHistoryCount,
+    RPBA.BodyLength,
+    RPBA.TitleLength,
+    UAS.QuestionsWithAcceptedAnswer,
+    (UAS.UserViews + UAS.UpVotes - UAS.DownVotes) * (UAS.TotalPosts + UAS.TotalComments) AS UserEngagementMetric,
+    COALESCE(UAS.Location, 'Unknown Location') AS UserLocation,
+    RPBA.ContentLicense
+FROM UserActivitySummary UAS
+INNER JOIN RankedPostsByActivity RPBA ON UAS.UserId = RPBA.OwnerUserId
+LEFT JOIN TagPerformance TP ON RPBA.PrimaryTag = TP.PrimaryTag
+WHERE
+    UAS.Reputation >= 1000
+    AND UAS.SelfEditCount >= 3
+    AND RPBA.Rn_UserTopPost <= 3
+    AND (RPBA.PostScore > 20 OR RPBA.PostViewCount > 1000)
+    AND RPBA.Body LIKE '%sql query%' ESCAPE '\'
+    AND RPBA.PostTypeName NOT IN ('Wiki', 'TagWiki')
+    AND NOT EXISTS (
+        SELECT 1
+        FROM Comments C
+        WHERE C.PostId = RPBA.PostId
+          AND C.Text ILIKE '%spam%'
+    )
+    AND (RPBA.AvgCommentScore IS NULL OR RPBA.AvgCommentScore >= 1)
+    AND RPBA.TotalBookmarks > 0
+    AND RPBA.PostCreationDate >= UAS.UserCreationDate
+    AND RPBA.LastEditDate IS NOT NULL
+    AND RPBA.LastActivityDate > RPBA.PostCreationDate
+    AND (RPBA.ClosedDate IS NULL OR RPBA.ClosedDate > RPBA.LastActivityDate)
+UNION ALL
+SELECT
+    UAS.DisplayName,
+    UAS.Reputation,
+    UAS.ReputationTier,
+    UAS.TotalPosts,
+    UAS.TotalQuestions,
+    UAS.TotalAnswers,
+    UAS.AvgPostScore,
+    UAS.SelfEditCount,
+    NULL AS PostId,
+    'Aggregated Tag Summary (Gurus)' AS PostTypeName,
+    'High-level performance metrics for tag: ' || TP.PrimaryTag AS Title,
+    TP.PrimaryTag,
+    TP.AvgTagScore AS PostScore,
+    TP.AvgTagViewCount AS PostViewCount,
+    NULL AS PostCommentCount,
+    NULL AS TotalBookmarks,
+    NULL AS PostAgeDays,
+    NULL AS AvgCommentScore,
+    NULL AS Rn_UserTopPost,
+    NULL AS Rank_TagTopPost,
+    NULL AS RunningUserScore,
+    NULL AS TimeSincePreviousPostHours,
+    TP.TagPostCount,
+    TP.AvgTagScore,
+    TP.MaxTagScore,
+    TP.FirstTagPostDate,
+    'Tag Summary by Guru' AS PostStatusFlag,
+    NULL AS CloseReopenHistoryCount,
+    NULL AS BodyLength,
+    NULL AS TitleLength,
+    UAS.QuestionsWithAcceptedAnswer,
+    (UAS.UserViews + UAS.UpVotes - UAS.DownVotes) * (UAS.TotalPosts + UAS.TotalComments) AS UserEngagementMetric,
+    COALESCE(UAS.Location, 'Unknown Location') AS UserLocation,
+    NULL AS ContentLicense
+FROM UserActivitySummary UAS
+INNER JOIN TagPerformance TP ON UAS.ReputationTier = 'Guru'
+WHERE
+    UAS.Reputation >= 10000
+    AND UAS.TotalBadges > 100
+    AND NOT EXISTS (
+        SELECT 1
+        FROM Badges B
+        WHERE B.UserId = UAS.UserId
+          AND B.Name ILIKE '%suffering%'
+    )
+ORDER BY Reputation DESC, UserEngagementMetric DESC, PostScore DESC NULLS LAST, PostId NULLS LAST;

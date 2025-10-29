@@ -1,0 +1,195 @@
+-- {"query": "1343.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2848} 
+
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Views AS UserViews,
+        U.UpVotes,
+        U.DownVotes,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsOwned,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersOwned,
+        SUM(COALESCE(P.Score, 0)) AS TotalPostScoreOwned,
+        SUM(COALESCE(P.ViewCount, 0)) AS TotalPostViewCountOwned,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        SUM(COALESCE(C.Score, 0)) AS TotalCommentScoreMade,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        (CAST(U.UpVotes AS NUMERIC) / NULLIF(U.UpVotes + U.DownVotes, 0)) AS UpVoteRatio,
+        MAX(P.LastActivityDate) AS LastPostActivityDate
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    LEFT JOIN Badges AS B ON U.Id = B.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Views, U.UpVotes, U.DownVotes
+),
+PostHistoricalState AS (
+    SELECT
+        PH.PostId,
+        PH.PostHistoryTypeId,
+        PH.CreationDate AS HistoryCreationDate,
+        PH.UserId AS HistoryUserId,
+        PH.Comment AS HistoryComment,
+        ROW_NUMBER() OVER(PARTITION BY PH.PostId, PH.PostHistoryTypeId ORDER BY PH.CreationDate DESC, PH.Id DESC) AS rn_type
+    FROM PostHistory AS PH
+    WHERE PH.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20)
+),
+LatestCommentPerPost AS (
+    SELECT
+        C.PostId,
+        C.Id AS LatestCommentId,
+        C.Text AS LatestCommentText,
+        C.CreationDate AS LatestCommentDate,
+        C.UserId AS LatestCommentUserId,
+        ROW_NUMBER() OVER(PARTITION BY C.PostId ORDER BY C.CreationDate DESC, C.Id DESC) AS rn
+    FROM Comments AS C
+),
+PostTagAnalysis AS (
+    SELECT
+        P.Id AS PostId,
+        ARRAY_AGG(T.TagName) AS TagNamesArray,
+        COUNT(DISTINCT T.Id) AS TagCount,
+        MAX(CASE WHEN T.IsModeratorOnly THEN 1 ELSE 0 END) AS HasModeratorOnlyTag,
+        MAX(CASE WHEN T.IsRequired THEN 1 ELSE 0 END) AS HasRequiredTag
+    FROM Posts AS P
+    JOIN LATERAL UNNEST(
+        string_to_array(
+            TRIM(BOTH '<>' FROM P.Tags),
+            '><'
+        )
+    ) AS TagArray ON TRUE
+    JOIN Tags AS T ON TagArray = T.TagName
+    WHERE P.Tags IS NOT NULL AND P.Tags != ''
+    GROUP BY P.Id
+),
+PostLinkSummary AS (
+    SELECT
+        PL.PostId,
+        SUM(CASE WHEN PL.LinkTypeId = 1 THEN 1 ELSE 0 END) AS LinkedPostsCount,
+        SUM(CASE WHEN PL.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicatePostsCount,
+        COUNT(DISTINCT PL.RelatedPostId) AS TotalRelatedPosts
+    FROM PostLinks AS PL
+    GROUP BY PL.PostId
+),
+PostsWithBadgeEarningCommenters AS (
+    SELECT P_sub.Id AS PostId
+    FROM Posts AS P_sub
+    JOIN Comments AS C_sub ON P_sub.Id = C_sub.PostId
+    JOIN Users AS U_sub ON C_sub.UserId = U_sub.Id
+    JOIN Badges AS B_sub ON U_sub.Id = B_sub.UserId
+    WHERE U_sub.Id != P_sub.OwnerUserId
+    GROUP BY P_sub.Id
+    HAVING COUNT(DISTINCT U_sub.Id) >= 2
+)
+SELECT
+    P.Id AS PostId,
+    P.Title,
+    PT.Name AS PostTypeName,
+    P.CreationDate AS PostCreationDate,
+    P.LastActivityDate,
+    P.Score AS PostScore,
+    P.ViewCount AS PostViewCount,
+    P.AnswerCount,
+    P.CommentCount,
+    P.FavoriteCount,
+    P.ClosedDate,
+    P.CommunityOwnedDate,
+    UA_Owner.DisplayName AS OwnerDisplayName,
+    UA_Owner.Reputation AS OwnerReputation,
+    UA_Owner.UpVoteRatio AS OwnerUpVoteRatio,
+    UA_Editor.DisplayName AS LastEditorDisplayName,
+    UA_Editor.Reputation AS LastEditorReputation,
+    LCP.LatestCommentText,
+    LCP.LatestCommentDate,
+    COALESCE(PH_Closed.HistoryCreationDate, P.ClosedDate) AS ActualClosedDate,
+    CASE
+        WHEN PH_Deleted.PostId IS NOT NULL THEN 'DELETED'
+        WHEN PH_Closed.PostId IS NOT NULL THEN 'CLOSED'
+        WHEN PH_Reopened.PostId IS NOT NULL THEN 'REOPENED'
+        WHEN P.CommunityOwnedDate IS NOT NULL THEN 'COMMUNITY_OWNED'
+        ELSE 'ACTIVE'
+    END AS PostStatus,
+    COALESCE(PLS.LinkedPostsCount, 0) AS NumberOfLinkedPosts,
+    COALESCE(PLS.DuplicatePostsCount, 0) AS NumberOfDuplicatePosts,
+    COALESCE(PTA.TagCount, 0) AS UniqueTagCount,
+    PTA.TagNamesArray,
+    PTA.HasModeratorOnlyTag,
+    PTA.HasRequiredTag,
+    V.UpVoteCount AS TotalUpVotesOnPost,
+    V.DownVoteCount AS TotalDownVotesOnPost,
+    V.FavoriteCount AS TotalFavoritesOnPost,
+    (CAST(P.Score AS NUMERIC) / NULLIF(P.ViewCount, 0)) AS ScoreToViewRatio,
+    (DATE_PART('day', NOW() - P.CreationDate) * 24 + DATE_PART('hour', NOW() - P.CreationDate)) AS HoursSinceCreation,
+    (
+        SELECT AVG(C_sub.Score)
+        FROM Comments AS C_sub
+        WHERE C_sub.PostId = P.Id
+    ) AS AverageCommentScore,
+    (
+        SELECT SUM(CASE WHEN PH_sub.PostHistoryTypeId = 5 THEN 1 ELSE 0 END)
+        FROM PostHistory AS PH_sub
+        WHERE PH_sub.PostId = P.Id
+          AND PH_sub.UserId = P.OwnerUserId
+          AND PH_sub.CreationDate > P.CreationDate
+    ) AS OwnerEditCount,
+    LAG(P.Score, 1, 0) OVER(PARTITION BY P.OwnerUserId ORDER BY P.CreationDate) AS PreviousPostScoreByOwner,
+    RANK() OVER(PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.ViewCount DESC) AS RankWithinPostType,
+    AVG(P.Score) OVER(PARTITION BY DATE_TRUNC('month', P.CreationDate)) AS AvgScoreInCreationMonth,
+    PERCENT_RANK() OVER(ORDER BY P.Score DESC) AS GlobalScorePercentRank,
+    COALESCE(LENGTH(P.Title), 0) + COALESCE(LENGTH(P.Body), 0) AS TotalPostTextLength
+FROM Posts AS P
+JOIN PostTypes AS PT ON P.PostTypeId = PT.Id
+LEFT JOIN UserActivitySummary AS UA_Owner ON P.OwnerUserId = UA_Owner.UserId
+LEFT JOIN UserActivitySummary AS UA_Editor ON P.LastEditorUserId = UA_Editor.UserId
+LEFT JOIN LatestCommentPerPost AS LCP ON P.Id = LCP.PostId AND LCP.rn = 1
+LEFT JOIN PostHistoricalState AS PH_Closed ON P.Id = PH_Closed.PostId AND PH_Closed.PostHistoryTypeId = 10 AND PH_Closed.rn_type = 1
+LEFT JOIN PostHistoricalState AS PH_Reopened ON P.Id = PH_Reopened.PostId AND PH_Reopened.PostHistoryTypeId = 11 AND PH_Reopened.rn_type = 1
+LEFT JOIN PostHistoricalState AS PH_Deleted ON P.Id = PH_Deleted.PostId AND PH_Deleted.PostHistoryTypeId = 12 AND PH_Deleted.rn_type = 1
+LEFT JOIN PostLinkSummary AS PLS ON P.Id = PLS.PostId
+LEFT JOIN PostTagAnalysis AS PTA ON P.Id = PTA.PostId
+LEFT JOIN (
+    SELECT
+        V.PostId,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+        SUM(CASE WHEN V.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoriteCount
+    FROM Votes AS V
+    GROUP BY V.PostId
+) AS V ON P.Id = V.PostId
+WHERE
+    P.CreationDate >= '2020-01-01'
+    AND P.PostTypeId IN (1, 2)
+    AND (
+        (P.Score > 50 AND P.ViewCount > 1000)
+        OR (P.AnswerCount IS NOT NULL AND P.AnswerCount > 5 AND P.CreationDate BETWEEN '2021-01-01' AND '2022-12-31')
+    )
+    AND P.Title IS NOT NULL
+    AND (P.Body LIKE '%code%' OR P.Body LIKE '%solution%' OR P.Body LIKE '%problem%')
+    AND UA_Owner.Reputation > 10000
+    AND (PH_Closed.PostId IS NULL OR PH_Reopened.PostId IS NOT NULL)
+    AND NOT EXISTS (
+        SELECT 1
+        FROM Comments AS C_exists
+        WHERE C_exists.PostId = P.Id
+          AND C_exists.CreationDate < P.CreationDate
+          AND C_exists.Text LIKE '%spam%'
+    )
+    AND P.Id IN (SELECT PostId FROM PostsWithBadgeEarningCommenters)
+GROUP BY
+    P.Id, P.Title, PT.Name, P.CreationDate, P.LastActivityDate, P.Score, P.ViewCount, P.AnswerCount, P.CommentCount, P.FavoriteCount, P.ClosedDate, P.CommunityOwnedDate,
+    UA_Owner.DisplayName, UA_Owner.Reputation, UA_Owner.UpVoteRatio, UA_Editor.DisplayName, UA_Editor.Reputation, LCP.LatestCommentText, LCP.LatestCommentDate,
+    PH_Closed.HistoryCreationDate, PH_Closed.PostId, PH_Reopened.PostId, PH_Reopened.HistoryCreationDate, PH_Deleted.PostId, PLS.LinkedPostsCount, PLS.DuplicatePostsCount,
+    PTA.TagCount, PTA.TagNamesArray, PTA.HasModeratorOnlyTag, PTA.HasRequiredTag, V.UpVoteCount, V.DownVoteCount, V.FavoriteCount, P.OwnerUserId, P.PostTypeId, P.Body
+HAVING
+    COUNT(DISTINCT P.Id) = 1
+    AND COALESCE(V.UpVoteCount, 0) > COALESCE(V.DownVoteCount, 0) * 2
+ORDER BY
+    P.LastActivityDate DESC, P.Score DESC
+LIMIT 100;

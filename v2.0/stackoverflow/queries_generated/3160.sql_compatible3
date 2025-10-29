@@ -1,0 +1,145 @@
+WITH
+    UserReputation AS (
+        SELECT
+            u.Id                                      AS UserId,
+            u.Reputation,
+            COALESCE(SUM(CASE v.VoteTypeId
+                           WHEN 2 THEN 1
+                           WHEN 3 THEN -1
+                           ELSE 0
+                       END), 0)                           AS VoteScore,
+            COUNT(b.Id) FILTER (WHERE b.Class = 1)   AS GoldBadges,
+            COUNT(b.Id) FILTER (WHERE b.Class = 2)   AS SilverBadges,
+            COUNT(b.Id) FILTER (WHERE b.Class = 3)   AS BronzeBadges
+        FROM Users u
+        LEFT JOIN Votes   v ON v.UserId = u.Id
+        LEFT JOIN Badges  b ON b.UserId = u.Id
+        GROUP BY u.Id, u.Reputation
+    ),
+    TagUsage AS (
+        -- Split tags like '<tag1><tag2>' into rows in a dialect-agnostic way using a recursive CTE
+        SELECT
+            p.OwnerUserId                AS UserId,
+            tag_value                    AS Tag,
+            COUNT(*)                     AS PostsWithTag
+        FROM Posts p
+        CROSS JOIN LATERAL (
+            SELECT TRIM(BOTH '<>' FROM p.Tags) AS trimmed
+        ) t
+        CROSS JOIN LATERAL (
+            SELECT NULL::text AS tag_value -- placeholder for union compatibility; will be replaced by recursive results
+        ) placeholder
+        JOIN (
+            WITH RECURSIVE split(post_id, rest, tag_value) AS (
+                SELECT p.Id,
+                       t.trimmed,
+                       NULL::text
+                UNION ALL
+                SELECT
+                    post_id,
+                    CASE
+                        WHEN POSITION('><' IN rest) > 0 THEN SUBSTR(rest, POSITION('><' IN rest) + 2)
+                        ELSE ''
+                    END,
+                    CASE
+                        WHEN POSITION('><' IN rest) > 0 THEN SUBSTR(rest, 1, POSITION('><' IN rest) - 1)
+                        ELSE rest
+                    END
+                FROM split
+                WHERE rest <> ''
+            )
+            SELECT post_id, tag_value
+            FROM split
+            WHERE tag_value IS NOT NULL AND tag_value <> ''
+        ) tags ON tags.post_id = p.Id
+        WHERE p.PostTypeId = 1
+          AND p.Tags IS NOT NULL
+        GROUP BY p.OwnerUserId, tag_value
+    ),
+    RecentComment AS (
+        SELECT
+            c.PostId,
+            c.Id       AS CommentId,
+            c.Text,
+            c.CreationDate,
+            ROW_NUMBER() OVER (PARTITION BY c.PostId ORDER BY c.CreationDate DESC) AS rn
+        FROM Comments c
+    ),
+    LatestPostLink AS (
+        SELECT
+            pl.PostId,
+            pl.RelatedPostId,
+            lt.Name    AS LinkType,
+            pl.CreationDate,
+            ROW_NUMBER() OVER (PARTITION BY pl.PostId ORDER BY pl.CreationDate DESC) AS rn
+        FROM PostLinks pl
+        JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    ),
+    Aggregated AS (
+        SELECT
+            u.Id                                   AS UserId,
+            u.DisplayName,
+            ur.Reputation,
+            ur.VoteScore,
+            ur.GoldBadges,
+            ur.SilverBadges,
+            ur.BronzeBadges,
+            COALESCE(tu.Tag, 'no-tag')             AS Tag,
+            tu.PostsWithTag,
+            p.Id                                   AS PostId,
+            p.Title,
+            p.Score,
+            p.ViewCount,
+            CASE
+                WHEN p.ClosedDate IS NOT NULL          THEN 'closed'
+                WHEN p.CommunityOwnedDate IS NOT NULL  THEN 'community'
+                ELSE 'open'
+            END                                    AS Status,
+            rc.Text                                 AS LatestCommentText,
+            pl.LinkType,
+            ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.CreationDate DESC) AS PostRank
+        FROM Users u
+        LEFT JOIN UserReputation ur ON ur.UserId = u.Id
+        LEFT JOIN TagUsage       tu ON tu.UserId = u.Id
+        LEFT JOIN Posts          p  ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+        LEFT JOIN RecentComment  rc ON rc.PostId = p.Id AND rc.rn = 1
+        LEFT JOIN LatestPostLink pl ON pl.PostId = p.Id AND pl.rn = 1
+        WHERE (u.Reputation > 1000 OR ur.VoteScore > 50)
+          AND (p.Score IS NULL OR p.Score >= 0)
+          AND (p.Title IS NOT NULL AND TRIM(p.Title) <> '')
+        GROUP BY
+            u.Id, u.DisplayName, ur.Reputation, ur.VoteScore, ur.GoldBadges, ur.SilverBadges, ur.BronzeBadges,
+            COALESCE(tu.Tag, 'no-tag'), tu.PostsWithTag,
+            p.Id, p.Title, p.Score, p.ViewCount, p.ClosedDate, p.CommunityOwnedDate,
+            rc.Text, pl.LinkType, p.CreationDate
+    )
+
+SELECT *
+FROM Aggregated
+WHERE PostRank <= 5
+UNION ALL
+SELECT
+    u.Id,
+    u.DisplayName,
+    ur.Reputation,
+    ur.VoteScore,
+    ur.GoldBadges,
+    ur.SilverBadges,
+    ur.BronzeBadges,
+    COALESCE(tu.Tag, 'no-tag')          AS Tag,
+    tu.PostsWithTag,
+    NULL                               AS PostId,
+    NULL                               AS Title,
+    NULL                               AS Score,
+    NULL                               AS ViewCount,
+    CASE WHEN u.Id IS NULL THEN 'ghost' ELSE 'active' END AS Status,
+    NULL                               AS LatestCommentText,
+    NULL                               AS LinkType,
+    NULL                               AS PostRank
+FROM Users u
+LEFT JOIN UserReputation ur ON ur.UserId = u.Id
+LEFT JOIN TagUsage       tu ON tu.UserId = u.Id
+WHERE u.Id NOT IN (SELECT UserId FROM Aggregated)
+  AND (ur.GoldBadges > 0 OR ur.SilverBadges > 0)
+ORDER BY Reputation DESC NULLS LAST, PostRank ASC NULLS LAST
+LIMIT 100;

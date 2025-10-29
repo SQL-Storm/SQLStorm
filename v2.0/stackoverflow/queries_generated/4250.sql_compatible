@@ -1,0 +1,92 @@
+WITH
+  RecentQuestions AS (
+    SELECT
+      Id,
+      OwnerUserId,
+      CreationDate,
+      Title,
+      Score,
+      FavoriteCount,
+      AnswerCount,
+      ROW_NUMBER() OVER (PARTITION BY OwnerUserId ORDER BY CreationDate DESC) AS rn
+    FROM Posts
+    WHERE
+      PostTypeId = 1
+      AND CreationDate > (cast('2024-10-01' as date) - INTERVAL '365 day')
+  ),
+  UserEngagement AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      COUNT(DISTINCT c.Id) AS CommentCount,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+      MAX(CASE WHEN b.Name LIKE '%Gold%' THEN 1 ELSE 0 END) AS HasGoldBadge
+    FROM Users AS u
+    LEFT JOIN Comments AS c
+      ON u.Id = c.UserId
+    LEFT JOIN Votes AS v
+      ON u.Id = v.UserId
+    LEFT JOIN Badges AS b
+      ON u.Id = b.UserId
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation
+  )
+SELECT
+  rq.Title AS QuestionTitle,
+  ue.DisplayName AS UserDisplayName,
+  ue.Reputation,
+  ue.CommentCount,
+  ue.UpVoteCount,
+  ue.DownVoteCount,
+  ue.HasGoldBadge,
+  CASE
+    WHEN rq.Score > 100 THEN 'High Score'
+    WHEN rq.Score > 20 THEN 'Medium Score'
+    ELSE 'Low Score'
+  END AS ScoreCategory,
+  CASE
+    WHEN rq.AnswerCount IS NULL THEN 'No Answers'
+    WHEN rq.AnswerCount = 0 THEN 'Zero Answers'
+    WHEN rq.AnswerCount > 10 THEN 'Many Answers'
+    ELSE CAST(rq.AnswerCount AS VARCHAR) || ' Answers'
+  END AS AnswerCountDescription,
+  CASE
+    WHEN EXISTS (
+      SELECT 1
+      FROM PostLinks AS pl
+      WHERE pl.PostId = rq.Id AND pl.LinkTypeId = 3
+    ) THEN 'Is Duplicate'
+    ELSE 'Not a Duplicate'
+  END AS DuplicateStatus,
+  COALESCE(ue.DisplayName, 'Anonymous') AS DisplayNameOrAnonymous
+FROM RecentQuestions AS rq
+JOIN UserEngagement AS ue
+  ON rq.OwnerUserId = ue.UserId
+WHERE
+  rq.rn <= 5 AND ue.Reputation > 1000 AND ue.CommentCount > 0
+
+UNION
+
+SELECT
+  'No Matching Data' AS QuestionTitle,
+  NULL AS UserDisplayName,
+  NULL::INTEGER AS Reputation,
+  NULL::INTEGER AS CommentCount,
+  NULL::INTEGER AS UpVoteCount,
+  NULL::INTEGER AS DownVoteCount,
+  NULL::INTEGER AS HasGoldBadge,
+  NULL::TEXT AS ScoreCategory,
+  NULL::TEXT AS AnswerCountDescription,
+  NULL::TEXT AS DuplicateStatus,
+  'Anonymous' AS DisplayNameOrAnonymous
+WHERE NOT EXISTS (
+  SELECT 1
+  FROM RecentQuestions AS rq
+  JOIN UserEngagement AS ue
+    ON rq.OwnerUserId = ue.UserId
+  WHERE rq.rn <= 5 AND ue.Reputation > 1000 AND ue.CommentCount > 0
+);

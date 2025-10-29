@@ -1,0 +1,110 @@
+WITH RankedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount AS PostViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        pt.Name AS PostTypeName,
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate) AS PreviousPostScore,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserPostRank,
+        SUM(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS UserTotalScore,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosedFlag
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.OwnerUserId IS NOT NULL AND p.OwnerUserId > 0
+),
+UserBadgeStats AS (
+    SELECT
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+),
+RecentComments AS (
+    SELECT
+        c.PostId,
+        COUNT(c.Id) AS RecentCommentCount,
+        SUM(CASE WHEN c.Score > 0 THEN 1 ELSE 0 END) AS PositiveCommentCount
+    FROM Comments c
+    WHERE c.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days')
+    GROUP BY c.PostId
+),
+PostLinkAnalysis AS (
+    SELECT
+        pl.PostId,
+        COUNT(DISTINCT pl.RelatedPostId) AS LinkedPostCount,
+        SUM(CASE WHEN lt.Name = 'Duplicate' THEN 1 ELSE 0 END) AS DuplicateLinkCount
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    GROUP BY pl.PostId
+)
+SELECT
+    rp.PostId,
+    rp.PostTypeName,
+    rp.PostCreationDate,
+    rp.PostScore,
+    rp.PostViewCount,
+    rp.AnswerCount,
+    rp.CommentCount,
+    rp.FavoriteCount,
+    rp.IsClosedFlag,
+    rp.PreviousPostScore,
+    rp.UserPostRank,
+    rp.UserTotalScore,
+    COALESCE(ubs.GoldBadges, 0) AS UserGoldBadges,
+    COALESCE(ubs.SilverBadges, 0) AS UserSilverBadges,
+    COALESCE(ubs.BronzeBadges, 0) AS UserBronzeBadges,
+    COALESCE(rc.RecentCommentCount, 0) AS PostRecentComments,
+    COALESCE(rc.PositiveCommentCount, 0) AS PostPositiveComments,
+    COALESCE(pla.LinkedPostCount, 0) AS TotalLinkedPosts,
+    COALESCE(pla.DuplicateLinkCount, 0) AS TotalDuplicateLinks,
+    rp.PostScore + (rp.UserPostRank * 5) - (rp.IsClosedFlag * 100) AS CalculatedMetric,
+    CASE
+        WHEN rp.PostScore > 100 AND rp.AnswerCount > 5 THEN 'High Engagement Question'
+        WHEN rp.PostViewCount > 5000 AND rp.FavoriteCount > 10 THEN 'Popular Question'
+        WHEN rp.PostScore < 0 THEN 'Potentially Poor Quality'
+        ELSE 'Standard Post'
+    END AS PostCategory,
+    CASE
+        WHEN rp.ClosedDate IS NOT NULL THEN TO_CHAR(rp.ClosedDate, 'YYYY-MM-DD')
+        ELSE 'Not Closed'
+    END AS CloseDateFormatted,
+    UPPER(SUBSTR(rp.PostTypeName, 1, 1)) || LOWER(SUBSTR(rp.PostTypeName, 2)) AS FormattedPostTypeName,
+    rp.ClosedDate
+FROM RankedPosts rp
+LEFT JOIN UserBadgeStats ubs ON rp.OwnerUserId = ubs.UserId
+LEFT JOIN RecentComments rc ON rp.PostId = rc.PostId
+LEFT JOIN PostLinkAnalysis pla ON rp.PostId = pla.PostId
+WHERE rp.UserPostRank <= 10
+GROUP BY
+    rp.PostId,
+    rp.PostTypeName,
+    rp.PostCreationDate,
+    rp.PostScore,
+    rp.PostViewCount,
+    rp.AnswerCount,
+    rp.CommentCount,
+    rp.FavoriteCount,
+    rp.IsClosedFlag,
+    rp.PreviousPostScore,
+    rp.UserPostRank,
+    rp.UserTotalScore,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    rc.RecentCommentCount,
+    rc.PositiveCommentCount,
+    pla.LinkedPostCount,
+    pla.DuplicateLinkCount,
+    rp.ClosedDate
+ORDER BY rp.UserTotalScore DESC, rp.PostScore DESC
+LIMIT 1000;

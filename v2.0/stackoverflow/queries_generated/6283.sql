@@ -1,0 +1,47 @@
+-- {"query": "6283.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-micro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 456} 
+
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id ELSE NULL END) AS TotalQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id ELSE NULL END) AS TotalAnswers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 3 THEN p.Id ELSE NULL END) AS TotalWikis,
+    SUM(p.Score) AS TotalScore,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN p.AnswerCount ELSE 0 END) AS TotalAnswersToQuestions,
+    MAX(u.LastAccessDate) AS LastAccess,
+    MAX(p.LastActivityDate) AS LastPostActivity,
+    b.Class,
+    b.TagBased,
+    ph.RevisionGUID,
+    ph.Comment,
+    ph.CreationDate,
+    CASE 
+        WHEN ph.PostHistoryTypeId = 10 THEN cr.Name
+        WHEN ph.PostHistoryTypeId = 11 THEN 'Reopened'
+        WHEN ph.PostHistoryTypeId = 12 THEN 'Deleted'
+        WHEN ph.PostHistoryTypeId = 13 THEN 'Undeleted'
+        ELSE NULL
+    END AS HistoryAction
+FROM 
+    Users u
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN 
+    CloseReasonTypes cr ON ph.Comment = cr.Id
+WHERE 
+    u.Reputation > 10000
+    AND p.Score > 0
+    AND p.LastActivityDate > DATE_SUB(CURRENT_TIMESTAMP, INTERVAL 1 YEAR)
+GROUP BY 
+    u.Id, b.Id, ph.Id
+HAVING 
+    AVG(p.Score) > 100
+ORDER BY 
+    u.Reputation DESC, 
+    TotalPosts DESC
+LIMIT 100;

@@ -1,0 +1,194 @@
+-- {"query": "1201.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2933} 
+
+WITH UserEngagement AS (
+    -- CTE 1: Aggregate user-level post and comment statistics
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostScore,
+        SUM(COALESCE(p.ViewCount, 0)) AS TotalViewCount,
+        SUM(COALESCE(p.AnswerCount, 0)) AS TotalAnswersGivenByOthers, -- For questions, this is count of answers *to* the question
+        SUM(COALESCE(p.CommentCount, 0)) AS TotalPostCommentCount,
+        SUM(COALESCE(p.FavoriteCount, 0)) AS TotalFavoriteCount,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMadeByThisUser,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6, 8, 9) THEN 1 ELSE 0 END) AS TotalSignificantEditsMadeByThisUser
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId AND p.OwnerUserId = c.UserId -- Comments made *by the post owner on their own posts*
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND p.OwnerUserId = ph.UserId -- History of their own posts edited by them
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+PostLinkInfluence AS (
+    -- CTE 2: Analyze post linking and duplication influence per post
+    SELECT
+        pl.PostId,
+        COUNT(CASE WHEN pl.LinkTypeId = 1 THEN 1 ELSE NULL END) AS LinkedFromCount,
+        COUNT(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE NULL END) AS DuplicateCount
+    FROM PostLinks pl
+    GROUP BY pl.PostId
+),
+UserPostDetails AS (
+    -- CTE 3: Detailed post metrics per user, including calculated engagement and edit rates
+    SELECT
+        p.OwnerUserId AS UserId,
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount AS PostViewCount,
+        p.CommentCount AS PostCommentCount,
+        p.FavoriteCount AS PostFavoriteCount,
+        p.LastEditDate,
+        p.ClosedDate,
+        COALESCE(pli.LinkedFromCount, 0) AS PostLinkedFromCount,
+        COALESCE(pli.DuplicateCount, 0) AS PostDuplicateCount,
+        (
+            SELECT COUNT(ph_sub.Id)
+            FROM PostHistory ph_sub
+            WHERE ph_sub.PostId = p.Id
+              AND ph_sub.PostHistoryTypeId IN (4, 5, 6, 8, 9) -- Significant edit types
+        ) AS PostSignificantEditCount,
+        (
+            SELECT AVG(v_sub.BountyAmount)
+            FROM Votes v_sub
+            WHERE v_sub.PostId = p.Id AND v_sub.VoteTypeId IN (8, 9)
+              AND v_sub.BountyAmount IS NOT NULL
+        ) AS AvgBountyAmount,
+        -- Calculate a complex post "impact score"
+        (p.Score * 0.5 + COALESCE(p.ViewCount, 0) * 0.05 + COALESCE(p.FavoriteCount, 0) * 0.2 + COALESCE(p.CommentCount, 0) * 0.25) AS PostImpactScore
+    FROM Posts p
+    LEFT JOIN PostLinkInfluence pli ON p.Id = pli.PostId
+    WHERE p.OwnerUserId IS NOT NULL
+      AND p.PostTypeId IN (1, 2) -- Only consider Questions and Answers for this detail
+),
+UserRankedActivity AS (
+    -- CTE 4: Rank user's posts and calculate rolling averages
+    SELECT
+        upd.*,
+        ROW_NUMBER() OVER (PARTITION BY upd.UserId, upd.PostTypeId ORDER BY upd.PostScore DESC, upd.PostViewCount DESC) AS PostRankWithinType,
+        AVG(upd.PostScore) OVER (PARTITION BY upd.UserId ORDER BY upd.PostCreationDate ASC ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS RollingAvgPostScore,
+        LAG(upd.PostCreationDate, 1) OVER (PARTITION BY upd.UserId ORDER BY upd.PostCreationDate) AS PreviousPostDate,
+        CASE WHEN upd.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS PostStatusClassification
+    FROM UserPostDetails upd
+),
+UserBadgeSummary AS (
+    -- CTE 5: Summarize user badges and assign a "badge class" score
+    SELECT
+        b.UserId,
+        COUNT(b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 3 WHEN b.Class = 2 THEN 2 WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BadgeClassScore,
+        MAX(CASE WHEN b.TagBased THEN 1 ELSE 0 END) AS HasTagBasedBadge
+    FROM Badges b
+    GROUP BY b.UserId
+)
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    u.LastAccessDate,
+    COALESCE(u.Location, 'Unknown Location') AS UserLocation,
+    u.Views AS UserProfileViews,
+    ue.TotalPosts,
+    ue.TotalQuestions,
+    ue.TotalAnswers,
+    ue.TotalPostScore,
+    ue.TotalViewCount,
+    ue.TotalCommentsMadeByThisUser,
+    COALESCE(ubs.TotalBadges, 0) AS TotalBadges,
+    COALESCE(ubs.BadgeClassScore, 0) AS UserBadgeClassScore,
+    -- Calculate a sophisticated 'Overall User Engagement Score' using multiple factors
+    (
+        u.Reputation * 0.1
+        + COALESCE(ue.TotalPostScore, 0) * 0.05
+        + COALESCE(ue.TotalViewCount, 0) * 0.01
+        + COALESCE(ue.TotalCommentsMadeByThisUser, 0) * 0.15
+        + COALESCE(ubs.BadgeClassScore, 0) * 0.2
+        + (SELECT COALESCE(SUM(ura_sub.PostImpactScore), 0) FROM UserRankedActivity ura_sub WHERE ura_sub.UserId = u.Id) * 0.1
+    ) AS OverallUserEngagementScore,
+    -- Window function: Rank users by their calculated engagement score globally
+    RANK() OVER (ORDER BY (
+        u.Reputation * 0.1
+        + COALESCE(ue.TotalPostScore, 0) * 0.05
+        + COALESCE(ue.TotalViewCount, 0) * 0.01
+        + COALESCE(ue.TotalCommentsMadeByThisUser, 0) * 0.15
+        + COALESCE(ubs.BadgeClassScore, 0) * 0.2
+        + (SELECT COALESCE(SUM(ura_sub.PostImpactScore), 0) FROM UserRankedActivity ura_sub WHERE ura_sub.UserId = u.Id) * 0.1
+    ) DESC) AS GlobalEngagementRank,
+    -- Conditional expression for user type based on reputation and post activity
+    CASE
+        WHEN u.Reputation >= 5000 AND COALESCE(ue.TotalQuestions, 0) > 10 AND COALESCE(ue.TotalAnswers, 0) > 50 THEN 'High_Rep_Contributor'
+        WHEN u.Reputation >= 1000 AND COALESCE(ue.TotalPosts, 0) > 20 THEN 'Active_Contributor'
+        WHEN u.Reputation < 1000 AND COALESCE(ue.TotalPosts, 0) > 5 AND COALESCE(ue.TotalPosts, 0) <= 20 THEN 'Emerging_Contributor'
+        WHEN u.Reputation < 100 AND COALESCE(ue.TotalPosts, 0) > 0 THEN 'Novice_Poster'
+        ELSE 'Casual_User'
+    END AS UserContributionTier,
+    -- String operations and NULL logic on user metadata
+    UPPER(LEFT(COALESCE(u.DisplayName, 'UNKNOWN USER'), 1)) AS FirstLetterOfDisplayName,
+    SUBSTRING(u.WebsiteUrl FROM '://([^/]+)') AS WebsiteDomain,
+    (u.LastAccessDate - u.CreationDate) AS UserAccountAgeInterval, -- Date interval calculation
+    -- Correlated Subquery: Find the average score of answers by this user,
+    -- that were posted after their *highest voted* question, and have at least 5 comments.
+    (
+        SELECT COALESCE(AVG(p_ans.Score), 0)
+        FROM Posts p_ans
+        WHERE p_ans.OwnerUserId = u.Id
+          AND p_ans.PostTypeId = 2 -- Only answers
+          AND p_ans.CommentCount >= 5
+          AND p_ans.CreationDate > COALESCE((
+              SELECT p_ques.CreationDate
+              FROM Posts p_ques
+              WHERE p_ques.OwnerUserId = u.Id
+                AND p_ques.PostTypeId = 1 -- Only questions
+              ORDER BY p_ques.Score DESC, p_ques.CreationDate DESC
+              LIMIT 1
+          ), '1900-01-01 00:00:00') -- Default to a very old date if no questions
+    ) AS AvgAnswerScoreAfterTopQuestion,
+    -- Another correlated subquery: Count of their comments on posts where the owner is *not* themselves
+    (
+        SELECT COUNT(c_out.Id)
+        FROM Comments c_out
+        WHERE c_out.UserId = u.Id
+          AND c_out.PostId IN (SELECT p_out.Id FROM Posts p_out WHERE p_out.OwnerUserId IS NOT NULL AND p_out.OwnerUserId <> u.Id)
+    ) AS CommentsOnOthersPosts,
+    -- Set operator (INTERSECT) usage through subquery: Count posts that a user has both initially created AND later edited
+    (
+        SELECT COUNT(DISTINCT InitialAndEditedPosts.PostId)
+        FROM (
+            SELECT p_hist.PostId
+            FROM PostHistory p_hist
+            WHERE p_hist.UserId = u.Id
+              AND p_hist.PostHistoryTypeId IN (1, 2, 3) -- Initial content types
+            INTERSECT
+            SELECT p_hist_edit.PostId
+            FROM PostHistory p_hist_edit
+            WHERE p_hist_edit.UserId = u.Id
+              AND p_hist_edit.PostHistoryTypeId IN (4, 5, 6) -- Edit content types
+        ) AS InitialAndEditedPosts
+    ) AS PostsBothInitialAndEditedCount,
+    -- Example of complex expression with NULL handling and date difference for edit frequency
+    COALESCE(
+        ROUND(
+            CAST(ue.TotalSignificantEditsMadeByThisUser AS NUMERIC) / NULLIF(EXTRACT(EPOCH FROM (u.LastAccessDate - u.CreationDate)) / (60*60*24), 0),
+            2
+        ),
+        0.00
+    ) AS EditsPerDaySinceCreation,
+    -- NTILE window function to categorize users into 5 tiers based on their total reputation
+    NTILE(5) OVER (ORDER BY u.Reputation DESC) AS ReputationTier,
+    -- Check for presence of "developer" or "engineer" in AboutMe using string functions and NULL handling
+    CASE
+        WHEN u.AboutMe IS NOT NULL AND (LOWER(u.AboutMe) LIKE '%developer%' OR LOWER(u.AboutMe) LIKE '%engineer%')
+        THEN 'Dev_Engineer_In_AboutMe'
+        ELSE 'Other_AboutMe_Description'
+    END AS AboutMeKeywordFlag
+FROM Users u
+LEFT JOIN UserEngagement ue ON u.Id = ue.UserId
+LEFT JOIN UserBadgeSummary ubs ON u.Id = ubs.UserId
+WHERE u.Id IS NOT NULL -- Ensures only valid user IDs are processed
+  AND u.Reputation > 0 -- Focus on users with some earned reputation
+  AND u.CreationDate >= '2010-01-01' -- Limit to more recent users for potentially better data quality
+ORDER BY OverallUserEngagementScore DESC, u.Reputation DESC
+LIMIT 1000;

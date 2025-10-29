@@ -1,0 +1,174 @@
+-- {"query": "7589.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2594} 
+SELECT 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) as TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 3 THEN p.Id END) as Wikis,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END), 0) as TotalQuestionScore,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END), 0) as TotalAnswerScore,
+    AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END) as AvgQuestionScore,
+    AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE NULL END) as AvgAnswerScore,
+    COUNT(DISTINCT b.Id) as BadgesReceived,
+    COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) as GoldBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) as SilverBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) as BronzeBadges,
+    COUNT(DISTINCT c.Id) as CommentsMade,
+    COUNT(DISTINCT ph.Id) as PostHistoryEntries,
+    MAX(p.CreationDate) as LastActivityDate,
+    COUNT(DISTINCT CASE WHEN p.OwnerUserId IS NULL AND p.PostTypeId = 1 THEN p.Id END) as CommunityQuestions,
+    COUNT(DISTINCT CASE WHEN p.OwnerUserId IS NULL AND p.PostTypeId = 2 THEN p.Id END) as CommunityAnswers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN p.Id END) as QuestionsWithAcceptedAnswers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN p.Id END) as QuestionsWithAnswers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.ViewCount > 1000 THEN p.Id END) as HighlyViewedQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.Score < 0 THEN p.Id END) as NegativeScoreQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.Score < 0 THEN p.Id END) as NegativeScoreAnswers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.Tags IS NOT NULL AND p.Tags != '' THEN p.Id END) as TaggedQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.ParentId IS NOT NULL THEN p.Id END) as AnsweredByOthers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL THEN p.Id END) as ClosedQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.FavoriteCount > 0 THEN p.Id END) as FavoriteQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.LastEditDate IS NOT NULL THEN p.Id END) as EditedAnswers,
+    COALESCE(SUM(CASE WHEN p.PostTypeId IN (1,2) THEN p.ViewCount ELSE 0 END), 0) as TotalViews,
+    STRING_AGG(DISTINCT p.Tags, ';' ORDER BY p.Tags) as AllTags,
+    CASE 
+        WHEN COUNT(DISTINCT p.Id) > 100 THEN 'HighlyActive'
+        WHEN COUNT(DISTINCT p.Id) > 50 THEN 'Active'
+        WHEN COUNT(DISTINCT p.Id) > 10 THEN 'Moderate'
+        ELSE 'Beginner'
+    END as ActivityLevel,
+    COALESCE(
+        (SELECT AVG(usr.Reputation) 
+         FROM Users usr 
+         WHERE usr.Id IN (
+             SELECT DISTINCT ph.UserId 
+             FROM PostHistory ph 
+             WHERE ph.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = u.Id) 
+             AND ph.UserId IS NOT NULL
+         )), 0) as AvgReputationOfEditors,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AnswerCount = 0 THEN p.Id END) as UnansweredQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN p.Id END) as AnsweredQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.OwnerUserId = u.Id THEN p.Id END) as OwnAnswers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.OwnerUserId != u.Id THEN p.Id END) as OtherUsersAnswers,
+    LAG(COUNT(DISTINCT p.Id), 1, 0) OVER (ORDER BY u.CreationDate) as PreviousUserActivity,
+    ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) as ActivityRank,
+    RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) as ActivityRankWithTies,
+    DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) as ActivityDenseRank,
+    NTILE(4) OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) as ActivityQuartile,
+    PERCENT_RANK() OVER (ORDER BY COUNT(DISTINCT p.Id)) as ActivityPercentile,
+    CUME_DIST() OVER (ORDER BY COUNT(DISTINCT p.Id)) as ActivityCumulativeDistribution,
+    FIRST_VALUE(u.Reputation) OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) as HighestReputation,
+    NTH_VALUE(u.Reputation, 2) OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) as SecondHighestReputation,
+    LAG(u.Reputation, 1, 0) OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) as PreviousReputation,
+    LEAD(u.Reputation, 1, 0) OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) as NextReputation,
+    CASE WHEN EXISTS (
+        SELECT 1 FROM Posts p2 
+        WHERE p2.OwnerUserId = u.Id 
+        AND p2.PostTypeId = 1 
+        AND p2.Score > 100
+    ) THEN 1 ELSE 0 END as HasHighScoreQuestion,
+    CASE WHEN EXISTS (
+        SELECT 1 FROM Comments c2 
+        WHERE c2.UserId = u.Id 
+        AND c2.Score > 10
+    ) THEN 1 ELSE 0 END as HasHighScoreComment,
+    CASE WHEN EXISTS (
+        SELECT 1 FROM Votes v2 
+        WHERE v2.UserId = u.Id 
+        AND v2.VoteTypeId IN (2,3)
+        AND v2.CreationDate >= (CURRENT_TIMESTAMP - INTERVAL '30 DAYS')
+    ) THEN 1 ELSE 0 END as RecentVoter,
+    CASE WHEN EXISTS (
+        SELECT 1 FROM Badges b2 
+        WHERE b2.UserId = u.Id 
+        AND b2.Date >= (CURRENT_TIMESTAMP - INTERVAL '30 DAYS')
+        AND b2.Class = 1
+    ) THEN 1 ELSE 0 END as RecentGoldBadge,
+    CASE 
+        WHEN COUNT(DISTINCT p.Id) > 0 AND 
+             COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 0 AND
+             COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) > 0
+        THEN 'BothQuestionAnswer'
+        WHEN COUNT(DISTINCT p.Id) > 0 AND 
+             COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 0
+        THEN 'QuestionOnly'
+        WHEN COUNT(DISTINCT p.Id) > 0 AND 
+             COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) > 0
+        THEN 'AnswerOnly'
+        ELSE 'Neither'
+    END as PostTypeCategory,
+    CASE 
+        WHEN COUNT(DISTINCT b.Id) > 50 THEN 'Veteran'
+        WHEN COUNT(DISTINCT b.Id) > 25 THEN 'Experienced'
+        WHEN COUNT(DISTINCT b.Id) > 10 THEN 'Intermediate'
+        WHEN COUNT(DISTINCT b.Id) > 5 THEN 'Beginner'
+        ELSE 'New'
+    END as BadgeLevel,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = u.Id) AND pl.LinkTypeId = 3) as DuplicateLinks,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.RelatedPostId IN (SELECT Id FROM Posts WHERE OwnerUserId = u.Id) AND pl.LinkTypeId = 3) as DuplicateOfLinks,
+    COALESCE(
+        (SELECT AVG(p2.Score) 
+         FROM Posts p2 
+         WHERE p2.OwnerUserId = u.Id 
+         AND p2.PostTypeId = 1
+        ), 0) as AverageQuestionScore,
+    COALESCE(
+        (SELECT AVG(p3.Score) 
+         FROM Posts p3 
+         WHERE p3.OwnerUserId = u.Id 
+         AND p3.PostTypeId = 2
+        ), 0) as AverageAnswerScore,
+    CASE 
+        WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 0 THEN 
+            (COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END), 0) * 100.0 / 
+             NULLIF(COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END), 0))
+        ELSE 0 
+    END as ScorePercentage,
+    COALESCE(
+        (SELECT COUNT(*) FROM Posts p4 
+         WHERE p4.OwnerUserId = u.Id 
+         AND (p4.PostTypeId = 1 OR p4.PostTypeId = 2)
+         AND p4.Score = 0
+        ), 0) as ZeroScorePosts,
+    COALESCE(
+        (SELECT COUNT(*) FROM Posts p5 
+         WHERE p5.OwnerUserId = u.Id 
+         AND p5.FavoriteCount > 30
+        ), 0) as HighlyFavoritedPosts,
+    COALESCE(
+        (SELECT COUNT(*) FROM Comments c3 
+         WHERE c3.UserId = u.Id 
+         AND c3.CreationDate >= (CURRENT_TIMESTAMP - INTERVAL '30 DAYS')
+        ), 0) as RecentComments,
+    COALESCE(
+        (SELECT COUNT(*) FROM Posts p6 
+         WHERE p6.OwnerUserId = u.Id 
+         AND p6.LastEditDate IS NOT NULL 
+         AND p6.LastEditDate >= (CURRENT_TIMESTAMP - INTERVAL '30 DAYS')
+        ), 0) as RecentEditedPosts,
+    COALESCE(
+        (SELECT COUNT(*) FROM PostHistory ph2 
+         WHERE ph2.UserId = u.Id 
+         AND ph2.CreationDate >= (CURRENT_TIMESTAMP - INTERVAL '30 DAYS')
+        ), 0) as RecentPostHistory,
+    (SELECT STRING_AGG(ROW_NUMBER() OVER(ORDER BY p7.CreationDate DESC) || ': ' || p7.Title, ' | ' ORDER BY p7.CreationDate DESC)
+     FROM Posts p7 
+     WHERE p7.OwnerUserId = u.Id 
+     AND p7.PostTypeId = 1 
+     LIMIT 5) as RecentQuestions,
+    (SELECT STRING_AGG(ROW_NUMBER() OVER(ORDER BY p8.CreationDate DESC) || ': ' || p8.Title, ' | ' ORDER BY p8.CreationDate DESC)
+     FROM Posts p8 
+     WHERE p8.OwnerUserId = u.Id 
+     AND p8.PostTypeId = 2 
+     LIMIT 5) as RecentAnswers
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN Comments c ON u.Id = c.UserId
+LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+WHERE u.Id IS NOT NULL
+GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+HAVING COUNT(DISTINCT p.Id) > 0
+ORDER BY COUNT(DISTINCT p.Id) DESC
+LIMIT 1000;

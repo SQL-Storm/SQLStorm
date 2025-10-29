@@ -1,0 +1,124 @@
+WITH UserMetrics AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.UpVotes,0) - COALESCE(u.DownVotes,0) AS NetVotes,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadges,
+        (SELECT COUNT(DISTINCT p.Tags)
+         FROM Posts p
+         WHERE p.OwnerUserId = u.Id AND p.Tags IS NOT NULL) AS DistinctTagGroups,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+    WHERE u.CreationDate < (CAST('2024-10-01' AS date) - INTERVAL '1 year')
+),
+
+PostAggregates AS (
+    SELECT
+        p.OwnerUserId,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswerCount,
+        SUM(COALESCE(p.Score,0)) AS TotalScore,
+        AVG(COALESCE(p.ViewCount,0)) AS AvgViews,
+        MAX(p.CreationDate) AS LatestPostDate,
+        -- normalize tags by removing leading '<' and trailing '>' and aggregate distinct
+        STRING_AGG(DISTINCT TRIM(BOTH '<>' FROM p.Tags), ',') AS AllTags
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+
+TagPopularity AS (
+    SELECT
+        t.TagName,
+        t.Count AS TagUseCount,
+        COALESCE(SUM(p.Score),0) AS CumulativeScore,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    GROUP BY t.TagName, t.Count
+    HAVING t.Count > 1000
+),
+
+Combined AS (
+    SELECT
+        um.Id,
+        um.DisplayName,
+        um.Reputation,
+        um.NetVotes,
+        um.GoldBadges,
+        um.SilverBadges,
+        um.BronzeBadges,
+        um.DistinctTagGroups,
+        pa.QuestionCount,
+        pa.AnswerCount,
+        pa.TotalScore,
+        pa.AvgViews,
+        pa.LatestPostDate,
+        pa.AllTags,
+        tp.TagName,
+        tp.TagUseCount,
+        tp.CumulativeScore,
+        ROW_NUMBER() OVER (PARTITION BY um.Id ORDER BY tp.TagRank) AS UserTagRank,
+        um.ReputationRank
+    FROM UserMetrics um
+    LEFT JOIN PostAggregates pa ON pa.OwnerUserId = um.Id
+    LEFT JOIN LATERAL (
+        SELECT tpp.TagName, tpp.TagUseCount, tpp.CumulativeScore, tpp.TagRank
+        FROM TagPopularity tpp
+        WHERE POSITION(tpp.TagName IN COALESCE(pa.AllTags,'')) > 0
+        ORDER BY tpp.TagRank
+        LIMIT 3
+    ) tp ON TRUE
+)
+
+SELECT
+    c.Id,
+    COALESCE(c.DisplayName,'[deleted]') AS DisplayName,
+    c.Reputation,
+    c.NetVotes,
+    (COALESCE(c.GoldBadges,0)*100 + COALESCE(c.SilverBadges,0)*10 + COALESCE(c.BronzeBadges,0)) AS BadgeScore,
+    c.QuestionCount,
+    c.AnswerCount,
+    c.TotalScore,
+    ROUND(CAST(c.AvgViews AS numeric),2) AS AvgViews,
+    c.LatestPostDate,
+    CASE
+        WHEN c.QuestionCount IS NULL THEN 'NoQuestions'
+        WHEN c.AnswerCount = 0 THEN 'Unanswered'
+        ELSE 'Active'
+    END AS ActivityStatus,
+    COALESCE(c.TagName,'None') AS TopTag,
+    c.TagUseCount,
+    c.CumulativeScore,
+    c.UserTagRank,
+    c.ReputationRank
+FROM Combined c
+WHERE (c.Reputation > 5000 OR (COALESCE(c.GoldBadges,0)*100 + COALESCE(c.SilverBadges,0)*10 + COALESCE(c.BronzeBadges,0)) > 500)
+  AND (c.TotalScore IS NULL OR c.TotalScore > 0)
+ORDER BY BadgeScore DESC, ReputationRank
+LIMIT 200
+
+UNION ALL
+
+SELECT
+    NULL::bigint AS Id,
+    'Aggregated Summary' AS DisplayName,
+    NULL::integer AS Reputation,
+    NULL::integer AS NetVotes,
+    SUM(COALESCE(GoldBadges,0)*100 + COALESCE(SilverBadges,0)*10 + COALESCE(BronzeBadges,0)) AS BadgeScore,
+    SUM(COALESCE(QuestionCount,0)) AS QuestionCount,
+    SUM(COALESCE(AnswerCount,0)) AS AnswerCount,
+    SUM(COALESCE(TotalScore,0)) AS TotalScore,
+    AVG(AvgViews) AS AvgViews,
+    MAX(LatestPostDate) AS LatestPostDate,
+    NULL::text AS ActivityStatus,
+    NULL::text AS TopTag,
+    NULL::bigint AS TagUseCount,
+    NULL::bigint AS CumulativeScore,
+    NULL::integer AS UserTagRank,
+    NULL::integer AS ReputationRank
+FROM Combined
+WHERE Reputation > 0;

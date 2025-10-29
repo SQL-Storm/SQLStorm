@@ -1,0 +1,283 @@
+WITH recent_users AS (
+  SELECT u.id AS user_id,
+         u.displayname,
+         u.reputation,
+         u.creationdate,
+         u.location,
+         COALESCE(NULLIF(TRIM(SPLIT_PART(COALESCE(u.websiteurl, ''), '/', 3)), ''), 'unknown') AS website_host,
+         ROW_NUMBER() OVER (ORDER BY u.creationdate DESC, u.id DESC) AS rn
+  FROM users u
+  WHERE u.creationdate >= (SELECT DATE_TRUNC('year', MAX(creationdate)) - INTERVAL '2 years' FROM users)
+),
+user_activity AS (
+  SELECT p.owneruserid AS user_id,
+         COUNT(*) FILTER (WHERE p.posttypeid = 1) AS q_count,
+         COUNT(*) FILTER (WHERE p.posttypeid = 2) AS a_count,
+         SUM(GREATEST(COALESCE(p.score,0),0)) AS nonneg_post_score,
+         SUM(COALESCE(p.viewcount,0)) AS total_views,
+         MAX(p.lastactivitydate) AS last_post_activity
+  FROM posts p
+  WHERE p.owneruserid IS NOT NULL
+  GROUP BY p.owneruserid
+),
+comment_activity AS (
+  SELECT c.userid AS user_id,
+         COUNT(*) AS c_count,
+         SUM(COALESCE(c.score,0)) AS c_score,
+         MAX(c.creationdate) AS last_comment_activity
+  FROM comments c
+  WHERE c.userid IS NOT NULL
+  GROUP BY c.userid
+),
+badge_rollup AS (
+  SELECT b.userid AS user_id,
+         COUNT(*) AS badge_count,
+         COUNT(*) FILTER (WHERE b.class = 1) AS gold_count,
+         COUNT(*) FILTER (WHERE b.class = 2) AS silver_count,
+         COUNT(*) FILTER (WHERE b.class = 3) AS bronze_count,
+         MAX(b.date) AS last_badge_date
+  FROM badges b
+  GROUP BY b.userid
+),
+question_metrics AS (
+  SELECT p.owneruserid AS user_id,
+         COUNT(*) AS questions_total,
+         COUNT(*) FILTER (WHERE p.acceptedanswerid IS NOT NULL) AS accepted_qs,
+         AVG(NULLIF(p.answercount,0)) AS avg_answers_per_q,
+         AVG(NULLIF(p.viewcount,0)) AS avg_views_per_q,
+         PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY COALESCE(p.viewcount,0)) AS p90_views_per_q
+  FROM posts p
+  WHERE p.posttypeid = 1 AND p.owneruserid IS NOT NULL
+  GROUP BY p.owneruserid
+),
+answer_metrics AS (
+  SELECT p.owneruserid AS user_id,
+         COUNT(*) AS answers_total,
+         SUM(CASE WHEN pa.id IS NOT NULL AND q.acceptedanswerid = p.id THEN 1 ELSE 0 END) AS answers_accepted_as_owner,
+         AVG(GREATEST(COALESCE(p.score,0),0)) AS avg_nonneg_answer_score
+  FROM posts p
+  LEFT JOIN posts q ON q.id = p.parentid AND q.posttypeid = 1
+  LEFT JOIN posts pa ON pa.id = q.acceptedanswerid
+  WHERE p.posttypeid = 2 AND p.owneruserid IS NOT NULL
+  GROUP BY p.owneruserid
+),
+vote_rollup AS (
+  SELECT v.userid AS user_id,
+         COUNT(*) FILTER (WHERE v.votetypeid = 2) AS upvotes_cast,
+         COUNT(*) FILTER (WHERE v.votetypeid = 3) AS downvotes_cast,
+         COUNT(*) FILTER (WHERE v.votetypeid = 5) AS favorites_cast,
+         SUM(COALESCE(v.bountyamount,0)) FILTER (WHERE v.votetypeid IN (8,9)) AS bounty_flow
+  FROM votes v
+  WHERE v.userid IS NOT NULL
+  GROUP BY v.userid
+),
+closed_events AS (
+  SELECT ph.postid,
+         ph.userid,
+         ph.creationdate,
+         CASE
+           WHEN ph.comment ~ '^[0-9]+$' THEN CAST(ph.comment AS INTEGER)
+           ELSE NULL
+         END AS close_reason_id
+  FROM posthistory ph
+  WHERE ph.posthistorytypeid = 10
+),
+user_close_behavior AS (
+  SELECT ce.userid AS user_id,
+         COUNT(*) AS closes_initiated,
+         COUNT(*) FILTER (WHERE ce.close_reason_id IN (101,102,103,104,105)) AS closes_current_reasons,
+         MIN(ce.creationdate) AS first_close_date,
+         MAX(ce.creationdate) AS last_close_date
+  FROM closed_events ce
+  WHERE ce.userid IS NOT NULL
+  GROUP BY ce.userid
+),
+tag_usage AS (
+  SELECT p.owneruserid AS user_id,
+         UNNEST(STRING_TO_ARRAY(SUBSTRING(p.tags, 2, GREATEST(LENGTH(p.tags)-2,0)), '><')) AS tagname
+  FROM posts p
+  WHERE p.posttypeid = 1 AND p.tags IS NOT NULL AND p.owneruserid IS NOT NULL
+),
+top_tags AS (
+  SELECT tu.user_id,
+         t.tagname,
+         COUNT(*) AS tag_count,
+         ROW_NUMBER() OVER (PARTITION BY tu.user_id ORDER BY COUNT(*) DESC, t.tagname) AS tag_rank
+  FROM tag_usage tu
+  JOIN tags t ON LOWER(t.tagname) = LOWER(tu.tagname)
+  GROUP BY tu.user_id, t.tagname
+),
+hot_posts AS (
+  SELECT p.id,
+         p.owneruserid AS user_id,
+         p.posttypeid,
+         p.score,
+         p.viewcount,
+         p.creationdate,
+         DENSE_RANK() OVER (PARTITION BY p.owneruserid ORDER BY COALESCE(p.score,0) DESC, COALESCE(p.viewcount,0) DESC, p.id) AS popularity_rank
+  FROM posts p
+  WHERE p.owneruserid IS NOT NULL
+),
+dupe_graph AS (
+  SELECT pl.postid,
+         pl.relatedpostid,
+         pl.creationdate,
+         pl.linktypeid,
+         CASE WHEN pl.linktypeid = 3 THEN 1 ELSE 0 END AS is_duplicate
+  FROM postlinks pl
+),
+user_dupe_stats AS (
+  SELECT p.owneruserid AS user_id,
+         COUNT(*) FILTER (WHERE dg.is_duplicate = 1) AS dup_links_from_posts,
+         COUNT(*) FILTER (WHERE dg.is_duplicate = 0) AS nondup_links_from_posts
+  FROM posts p
+  LEFT JOIN dupe_graph dg ON dg.postid = p.id
+  WHERE p.owneruserid IS NOT NULL
+  GROUP BY p.owneruserid
+),
+activity_calendar AS (
+  SELECT COALESCE(ua.user_id, ca.user_id) AS user_id,
+         DATE_TRUNC('month', COALESCE(ua.last_post_activity, ca.last_comment_activity)) AS last_active_month
+  FROM user_activity ua
+  FULL JOIN comment_activity ca ON ca.user_id = ua.user_id
+),
+recency_rank AS (
+  SELECT user_id,
+         last_active_month,
+         NTILE(10) OVER (ORDER BY last_active_month NULLS FIRST) AS recency_decile
+  FROM activity_calendar
+),
+norm_scales AS (
+  SELECT
+    MAX(COALESCE(ua.q_count,0)) AS max_q,
+    MAX(COALESCE(ua.a_count,0)) AS max_a,
+    MAX(COALESCE(ua.nonneg_post_score,0)) AS max_post_score,
+    MAX(COALESCE(ua.total_views,0)) AS max_views,
+    MAX(COALESCE(cm.c_count,0)) AS max_c,
+    MAX(COALESCE(vr.upvotes_cast,0)) AS max_uv_cast
+  FROM user_activity ua
+  FULL JOIN comment_activity cm ON cm.user_id = ua.user_id
+  FULL JOIN vote_rollup vr ON vr.user_id = COALESCE(ua.user_id, cm.user_id)
+),
+user_summary AS (
+  SELECT
+    ru.user_id,
+    ru.displayname,
+    ru.reputation,
+    ru.creationdate,
+    ru.location,
+    ru.website_host,
+    COALESCE(ua.q_count,0) AS q_count,
+    COALESCE(ua.a_count,0) AS a_count,
+    COALESCE(ua.nonneg_post_score,0) AS post_score,
+    COALESCE(ua.total_views,0) AS views,
+    COALESCE(cm.c_count,0) AS comments,
+    COALESCE(cm.c_score,0) AS comment_score,
+    COALESCE(br.badge_count,0) AS badges,
+    COALESCE(br.gold_count,0) AS gold,
+    COALESCE(br.silver_count,0) AS silver,
+    COALESCE(br.bronze_count,0) AS bronze,
+    COALESCE(qm.questions_total,0) AS questions_total,
+    COALESCE(qm.accepted_qs,0) AS accepted_qs,
+    CAST(COALESCE(qm.avg_answers_per_q,0) AS NUMERIC(12,4)) AS avg_answers_per_q,
+    CAST(COALESCE(qm.avg_views_per_q,0) AS NUMERIC(12,4)) AS avg_views_per_q,
+    CAST(qm.p90_views_per_q AS NUMERIC(12,2)) AS p90_views_per_q,
+    COALESCE(am.answers_total,0) AS answers_total,
+    COALESCE(am.answers_accepted_as_owner,0) AS answers_accepted_as_owner,
+    CAST(COALESCE(am.avg_nonneg_answer_score,0) AS NUMERIC(12,4)) AS avg_nonneg_answer_score,
+    COALESCE(vr.upvotes_cast,0) AS upvotes_cast,
+    COALESCE(vr.downvotes_cast,0) AS downvotes_cast,
+    COALESCE(vr.favorites_cast,0) AS favorites_cast,
+    COALESCE(vr.bounty_flow,0) AS bounty_flow,
+    COALESCE(ucb.closes_initiated,0) AS closes_initiated,
+    COALESCE(ucb.closes_current_reasons,0) AS closes_current_reasons,
+    ucb.first_close_date,
+    ucb.last_close_date,
+    COALESCE(uds.dup_links_from_posts,0) AS dup_links_from_posts,
+    COALESCE(uds.nondup_links_from_posts,0) AS nondup_links_from_posts,
+    MAX(CASE WHEN hp.popularity_rank = 1 THEN hp.id END) AS top_post_id,
+    MAX(CASE WHEN hp.popularity_rank = 1 THEN hp.score END) AS top_post_score,
+    MAX(CASE WHEN hp.popularity_rank = 1 THEN hp.viewcount END) AS top_post_views,
+    MAX(CASE WHEN hp.popularity_rank = 1 THEN hp.creationdate END) AS top_post_date,
+    STRING_AGG(tt.tagname, ', ' ORDER BY tt.tagname) FILTER (WHERE tt.tag_rank <= 3) AS top_3_tags,
+    rr.recency_decile,
+    CASE
+      WHEN COALESCE(ua.q_count,0) + COALESCE(ua.a_count,0) = 0 THEN 'lurker'
+      WHEN COALESCE(ua.q_count,0) >= 5 AND COALESCE(ua.a_count,0) = 0 THEN 'questioner'
+      WHEN COALESCE(ua.a_count,0) >= 5 AND COALESCE(ua.q_count,0) = 0 THEN 'answerer'
+      WHEN COALESCE(ua.a_count,0) > COALESCE(ua.q_count,0) THEN 'lean_answerer'
+      WHEN COALESCE(ua.q_count,0) > COALESCE(ua.a_count,0) THEN 'lean_questioner'
+      ELSE 'balanced'
+    END AS activity_archetype
+  FROM recent_users ru
+  LEFT JOIN user_activity ua ON ua.user_id = ru.user_id
+  LEFT JOIN comment_activity cm ON cm.user_id = ru.user_id
+  LEFT JOIN badge_rollup br ON br.user_id = ru.user_id
+  LEFT JOIN question_metrics qm ON qm.user_id = ru.user_id
+  LEFT JOIN answer_metrics am ON am.user_id = ru.user_id
+  LEFT JOIN vote_rollup vr ON vr.user_id = ru.user_id
+  LEFT JOIN user_close_behavior ucb ON ucb.user_id = ru.user_id
+  LEFT JOIN user_dupe_stats uds ON uds.user_id = ru.user_id
+  LEFT JOIN hot_posts hp ON hp.user_id = ru.user_id AND hp.popularity_rank = 1
+  LEFT JOIN (SELECT user_id, tagname, tag_rank FROM top_tags WHERE tag_rank <= 3) tt ON tt.user_id = ru.user_id
+  LEFT JOIN recency_rank rr ON rr.user_id = ru.user_id
+  GROUP BY
+    ru.user_id, ru.displayname, ru.reputation, ru.creationdate, ru.location, ru.website_host,
+    ua.q_count, ua.a_count, ua.nonneg_post_score, ua.total_views,
+    cm.c_count, cm.c_score,
+    br.badge_count, br.gold_count, br.silver_count, br.bronze_count,
+    qm.questions_total, qm.accepted_qs, qm.avg_answers_per_q, qm.avg_views_per_q, qm.p90_views_per_q,
+    am.answers_total, am.answers_accepted_as_owner, am.avg_nonneg_answer_score,
+    vr.upvotes_cast, vr.downvotes_cast, vr.favorites_cast, vr.bounty_flow,
+    ucb.closes_initiated, ucb.closes_current_reasons, ucb.first_close_date, ucb.last_close_date,
+    uds.dup_links_from_posts, uds.nondup_links_from_posts,
+    rr.recency_decile
+),
+scored AS (
+  SELECT us.*,
+         ns.max_q, ns.max_a, ns.max_post_score, ns.max_views, ns.max_c, ns.max_uv_cast,
+         COALESCE(CAST(us.q_count AS NUMERIC) / NULLIF(ns.max_q,0), 0) * 0.15 +
+         COALESCE(CAST(us.a_count AS NUMERIC) / NULLIF(ns.max_a,0), 0) * 0.25 +
+         COALESCE(CAST(us.post_score AS NUMERIC) / NULLIF(ns.max_post_score,0), 0) * 0.20 +
+         COALESCE(CAST(us.views AS NUMERIC) / NULLIF(ns.max_views,0), 0) * 0.15 +
+         COALESCE(CAST(us.comments AS NUMERIC) / NULLIF(ns.max_c,0), 0) * 0.10 +
+         COALESCE(CAST(us.upvotes_cast AS NUMERIC) / NULLIF(ns.max_uv_cast,0), 0) * 0.15
+         AS engagement_score
+  FROM user_summary us
+  CROSS JOIN norm_scales ns
+),
+ranked AS (
+  SELECT s.*,
+         DENSE_RANK() OVER (ORDER BY s.engagement_score DESC, s.reputation DESC, s.user_id) AS overall_rank,
+         ROW_NUMBER() OVER (PARTITION BY s.activity_archetype ORDER BY s.engagement_score DESC, s.user_id) AS archetype_rank
+  FROM scored s
+)
+SELECT
+  r.user_id,
+  r.displayname,
+  r.reputation,
+  r.creationdate,
+  r.location,
+  r.website_host,
+  r.q_count, r.a_count, r.post_score, r.views, r.comments, r.comment_score,
+  r.badges, r.gold, r.silver, r.bronze,
+  r.questions_total, r.accepted_qs, r.avg_answers_per_q, r.avg_views_per_q, r.p90_views_per_q,
+  r.answers_total, r.answers_accepted_as_owner, r.avg_nonneg_answer_score,
+  r.upvotes_cast, r.downvotes_cast, r.favorites_cast, r.bounty_flow,
+  r.closes_initiated, r.closes_current_reasons, r.first_close_date, r.last_close_date,
+  r.dup_links_from_posts, r.nondup_links_from_posts,
+  r.top_post_id, r.top_post_score, r.top_post_views, r.top_post_date,
+  COALESCE(r.top_3_tags, '(none)') AS top_3_tags,
+  r.recency_decile,
+  r.activity_archetype,
+  CAST(r.engagement_score AS NUMERIC(12,6)) AS engagement_score,
+  r.overall_rank,
+  r.archetype_rank,
+  r.rn
+FROM ranked r
+JOIN recent_users ru ON ru.user_id = r.user_id
+WHERE (r.rn <= 500 OR r.overall_rank <= 200)
+  AND COALESCE(r.top_post_score, 0) >= 0
+  AND (r.website_host NOT LIKE '%stackexchange%' OR r.website_host IS NULL)
+  AND NOT (r.location ILIKE '%test%' AND r.reputation < 10)
+ORDER BY r.overall_rank, r.user_id;

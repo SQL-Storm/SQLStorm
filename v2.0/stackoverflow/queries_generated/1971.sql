@@ -1,0 +1,219 @@
+-- {"query": "1971.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3261} 
+
+WITH UserEngagementSummary AS (
+    -- CTE 1: Aggregates user-level metrics including post counts, comment counts, and last activity.
+    -- It also calculates a 'UserActivityScore' based on reputation, posts, and recent activity.
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName AS UserName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate AS UserLastAccessDate,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS UserUpVotesGiven,
+        U.DownVotes AS UserDownVotesGiven,
+        COUNT(DISTINCT P.Id) AS TotalPostsContributed,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsAsked,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersProvided,
+        COALESCE(SUM(P.Score), 0) AS TotalPostScoreReceived,
+        COALESCE(SUM(P.ViewCount), 0) AS TotalPostViewsReceived,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        -- Calculate the latest activity considering posts, comments, and user's last access
+        MAX(COALESCE(P.LastActivityDate, C.CreationDate, U.LastAccessDate)) AS LatestOverallActivity,
+        -- Average score for answers provided by the user, NULL if no answers
+        AVG(CASE WHEN P.PostTypeId = 2 THEN P.Score ELSE NULL END) AS AvgAnswerScore,
+        -- A composite activity score for ranking
+        (U.Reputation * 0.4 + COUNT(DISTINCT P.Id) * 0.1 + COUNT(DISTINCT C.Id) * 0.05 + COALESCE(SUM(P.Score), 0) * 0.01) AS UserActivityScore
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate,
+        U.Views, U.UpVotes, U.DownVotes
+),
+PostHistoricalMetrics AS (
+    -- CTE 2: Gathers detailed post metrics including edit history, close/reopen events, and duplicate links.
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.ParentId,
+        P.AcceptedAnswerId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.CommentCount AS PostDirectCommentCount, -- Actual comment count from Posts table
+        P.FavoriteCount,
+        P.ClosedDate,
+        P.LastActivityDate,
+        P.Title,
+        P.Tags,
+        P.AnswerCount,
+        -- Calculate total history entries and distinct editors
+        COUNT(PH.Id) AS TotalHistoryEvents,
+        COUNT(DISTINCT PH.UserId) AS DistinctEditorsCount,
+        -- Count specific edit history types for content changes
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS ContentEditCount,
+        -- Count close/reopen events
+        SUM(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseVoteCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenVoteCount,
+        -- Count duplicate links to and from this post
+        SUM(CASE WHEN PL.LinkTypeId = 3 AND PL.PostId = P.Id THEN 1 ELSE 0 END) AS DuplicatedByOtherPosts,
+        SUM(CASE WHEN PL.LinkTypeId = 3 AND PL.RelatedPostId = P.Id THEN 1 ELSE 0 END) AS DuplicatesOtherPosts,
+        -- Correlated subquery to get actual comment count from Comments table
+        (SELECT COUNT(DISTINCT C.Id) FROM Comments AS C WHERE C.PostId = P.Id) AS ActualTotalComments
+    FROM Posts AS P
+    LEFT JOIN PostHistory AS PH ON P.Id = PH.PostId
+    LEFT JOIN PostLinks AS PL ON P.Id = PL.PostId OR P.Id = PL.RelatedPostId
+    GROUP BY
+        P.Id, P.PostTypeId, P.ParentId, P.AcceptedAnswerId, P.OwnerUserId, P.CreationDate, P.Score,
+        P.ViewCount, P.CommentCount, P.FavoriteCount, P.ClosedDate, P.LastActivityDate, P.Title, P.Tags, P.AnswerCount
+),
+BadgeAchievement AS (
+    -- CTE 3: Summarizes badge achievements for each user, categorizing by class.
+    SELECT
+        B.UserId,
+        COUNT(B.Id) AS TotalBadgesAwarded,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(B.Date) AS LastBadgeEarnedDate,
+        -- Boolean flag for having at least one gold badge
+        (SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) > 0) AS HasGoldBadge
+    FROM Badges AS B
+    GROUP BY B.UserId
+),
+RankedUsers AS (
+    -- CTE 4: Ranks users based on their overall activity score, with additional metrics.
+    SELECT
+        UES.UserId,
+        UES.UserName,
+        UES.Reputation,
+        UES.TotalQuestionsAsked,
+        UES.TotalAnswersProvided,
+        UES.TotalPostScoreReceived,
+        UES.LatestOverallActivity,
+        COALESCE(BA.GoldBadges, 0) AS UserGoldBadges,
+        UES.UserActivityScore,
+        -- Rank users by their activity score
+        RANK() OVER (ORDER BY UES.UserActivityScore DESC, UES.Reputation DESC) AS OverallUserRank,
+        -- Assign users to deciles based on their reputation
+        NTILE(10) OVER (ORDER BY UES.Reputation DESC) AS ReputationDecile
+    FROM UserEngagementSummary AS UES
+    LEFT JOIN BadgeAchievement AS BA ON UES.UserId = BA.UserId
+    WHERE UES.Reputation >= 1000 -- Filter out very low reputation users
+),
+PostTagAnalysis AS (
+    -- CTE 5: Extracts and processes tags for posts, especially for questions.
+    SELECT
+        PHM.PostId,
+        PHM.OwnerUserId,
+        PHM.PostCreationDate,
+        -- Convert Tags string into an array, handling the '><' delimiters
+        CASE
+            WHEN PHM.Tags IS NOT NULL AND LENGTH(PHM.Tags) > 2 THEN STRING_TO_ARRAY(SUBSTRING(PHM.Tags, 2, LENGTH(PHM.Tags) - 2), '><')
+            ELSE NULL
+        END AS TagArray
+    FROM PostHistoricalMetrics AS PHM
+    WHERE PHM.PostTypeId = 1 AND PHM.Tags IS NOT NULL
+)
+-- Main Query: Joins all CTEs to identify influential users and their notable posts,
+-- incorporating complex logic, window functions, and subqueries.
+SELECT
+    RU.UserName,
+    RU.Reputation,
+    RU.OverallUserRank,
+    RU.ReputationDecile,
+    RU.UserGoldBadges,
+    PHM.PostId,
+    PHM.PostTypeId,
+    CASE PHM.PostTypeId
+        WHEN 1 THEN 'Question'
+        WHEN 2 THEN 'Answer'
+        WHEN 4 THEN 'TagWikiExcerpt'
+        WHEN 5 THEN 'TagWiki'
+        ELSE PT.Name -- Fallback to PostTypes table for other types
+    END AS PostTypeName,
+    PHM.PostScore,
+    PHM.ViewCount,
+    PHM.Title,
+    PHM.PostCreationDate,
+    PHM.LastActivityDate,
+    PHM.ActualTotalComments,
+    PHM.ContentEditCount,
+    PHM.DistinctEditorsCount,
+    PHM.CloseVoteCount,
+    PHM.ReopenVoteCount,
+    PHM.DuplicatedByOtherPosts,
+    PHM.DuplicatesOtherPosts,
+    -- Determine the 'controversy' level of a post using complex CASE logic
+    CASE
+        WHEN PHM.CloseVoteCount > 0 AND PHM.ReopenVoteCount > 0 THEN 'Closed & Reopened'
+        WHEN PHM.DuplicatedByOtherPosts > 0 THEN 'Has Duplicates Referring To It'
+        WHEN PHM.DuplicatesOtherPosts > 0 THEN 'Refers To Duplicates'
+        WHEN PHM.ContentEditCount >= 5 AND PHM.DistinctEditorsCount >= 2 THEN 'Heavily Edited by Multiple Authors'
+        WHEN PHM.ActualTotalComments >= 25 AND PHM.PostScore < 0 THEN 'High Comments, Low Score'
+        ELSE 'Standard Engagement'
+    END AS PostControversyStatus,
+    -- Check if the current post is an accepted answer for its parent question, and by whom
+    CASE
+        WHEN PHM.PostTypeId = 2 AND PHM.AcceptedAnswerId IS NOT NULL AND PHM.ParentId IS NOT NULL
+             AND PHM.Id = (SELECT AcceptedAnswerId FROM Posts WHERE Id = PHM.ParentId)
+             AND (SELECT OwnerUserId FROM Posts WHERE Id = PHM.ParentId) = PHM.OwnerUserId
+             THEN 'Self-Accepted Answer'
+        WHEN PHM.PostTypeId = 2 AND PHM.AcceptedAnswerId IS NOT NULL AND PHM.ParentId IS NOT NULL
+             AND PHM.Id = (SELECT AcceptedAnswerId FROM Posts WHERE Id = PHM.ParentId)
+             THEN 'Accepted Answer (Other User)'
+        ELSE 'Not Accepted Answer'
+    END AS AnswerAcceptanceStatus,
+    -- Calculate days since post creation, handling potential future dates if data is inconsistent (though unlikely)
+    GREATEST(0, FLOOR(EXTRACT(EPOCH FROM (NOW() - PHM.PostCreationDate)) / (60 * 60 * 24))) AS DaysSinceCreation,
+    -- Extract the first tag from the array, or 'N/A' if none
+    COALESCE(PTA.TagArray[1], 'N/A') AS PrimaryTag,
+    -- Calculate the ratio of downvotes to upvotes received for this specific post
+    CAST(COALESCE(SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS NUMERIC) /
+    NULLIF(COALESCE(SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END), 0), 0) AS DownvoteUpvoteRatio,
+    -- Identify posts related to "performance" or "benchmark" using string matching
+    CASE
+        WHEN LOWER(PHM.Title) LIKE '%performance%' OR LOWER(PHM.Title) LIKE '%benchmark%'
+             THEN 'Title Keyword Match'
+        WHEN EXISTS (
+            SELECT 1
+            FROM PostTagAnalysis AS InnerPTA
+            WHERE InnerPTA.PostId = PHM.PostId
+              AND InnerPTA.TagArray IS NOT NULL
+              AND (
+                  'performance' = ANY(InnerPTA.TagArray)
+                  OR 'benchmark' = ANY(InnerPTA.TagArray)
+                  OR 'optimization' = ANY(InnerPTA.TagArray)
+              )
+        ) THEN 'Tag Keyword Match'
+        ELSE 'Other Topic'
+    END AS PostTopicCategory,
+    -- Window function: Calculate the average score of all posts by this user
+    AVG(PHM.PostScore) OVER (PARTITION BY RU.UserId) AS UserAveragePostScore,
+    -- Window function: Find the difference in days between this post's creation and the user's previous post
+    EXTRACT(EPOCH FROM (PHM.PostCreationDate - LAG(PHM.PostCreationDate, 1, PHM.PostCreationDate) OVER (PARTITION BY RU.UserId ORDER BY PHM.PostCreationDate))) / (60 * 60 * 24) AS DaysSincePreviousPost
+FROM RankedUsers AS RU
+INNER JOIN PostHistoricalMetrics AS PHM ON RU.UserId = PHM.OwnerUserId
+LEFT JOIN PostTagAnalysis AS PTA ON PHM.PostId = PTA.PostId
+LEFT JOIN Votes AS V ON PHM.PostId = V.PostId
+LEFT JOIN PostTypes AS PT ON PHM.PostTypeId = PT.Id -- For PostTypeName
+WHERE
+    RU.OverallUserRank <= 500 -- Focus on top 500 ranked users
+    AND PHM.PostScore >= 5 -- Only consider posts with a minimum positive score
+    AND PHM.PostTypeId IN (1, 2) -- Focus on Questions (1) and Answers (2)
+    AND (
+        PHM.ActualTotalComments > 10 OR PHM.ContentEditCount > 3 OR PHM.CloseVoteCount > 0 OR PHM.ReopenVoteCount > 0
+        OR PHM.FavoriteCount > 5 OR RU.UserGoldBadges > 0
+    ) -- Filter for posts/users with significant activity or recognition
+GROUP BY
+    RU.UserId, RU.UserName, RU.Reputation, RU.OverallUserRank, RU.ReputationDecile, RU.UserGoldBadges,
+    PHM.PostId, PHM.PostTypeId, PHM.PostScore, PHM.ViewCount, PHM.Title, PHM.PostCreationDate,
+    PHM.LastActivityDate, PHM.ActualTotalComments, PHM.ContentEditCount, PHM.DistinctEditorsCount,
+    PHM.CloseVoteCount, PHM.ReopenVoteCount, PHM.DuplicatedByOtherPosts, PHM.DuplicatesOtherPosts,
+    PHM.AcceptedAnswerId, PHM.ParentId, PTA.TagArray, PT.Name, PHM.OwnerUserId
+ORDER BY
+    RU.OverallUserRank ASC,
+    PHM.PostScore DESC,
+    PHM.LastActivityDate DESC;

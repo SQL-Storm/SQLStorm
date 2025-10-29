@@ -1,0 +1,171 @@
+-- {"query": "2492.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1827} 
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        0 as Level,
+        ARRAY[t.TagName] AS Path
+    FROM Tags t
+    WHERE t.IsRequired = 1
+    UNION ALL
+    SELECT
+        t.Id,
+        t.TagName,
+        r.Level + 1,
+        r.Path || t.TagName
+    FROM Tags t
+    JOIN PostLinks pl ON pl.PostId = t.ExcerptPostId
+    JOIN RecursiveTagHierarchy r ON pl.RelatedPostId = r.Id
+    WHERE NOT t.TagName = ANY(r.Path)
+      AND r.Level < 3
+),
+BadgedUsers AS (
+    SELECT b.UserId, 
+           COUNT(DISTINCT b.Id) AS BadgeCount,
+           MAX(b.Class) AS HighestBadgeClass,
+           STRING_AGG(b.Name, ', ' ORDER BY b.Date DESC) AS BadgesList
+    FROM Badges b
+    WHERE b.Date >= current_date - interval '365 days'
+    GROUP BY b.UserId
+),
+QuestionStats AS (
+    SELECT p.Id,
+           p.OwnerUserId,
+           p.Title,
+           COALESCE(p.Tags,'') AS Tags,
+           p.CreationDate,
+           p.Score,
+           p.ViewCount,
+           p.AnswerCount,
+           p.CommentCount,
+           COALESCE(u.Reputation,0) AS OwnerReputation,
+           ROW_NUMBER() OVER(PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate DESC) AS OwnerTopQuestionRank,
+           COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotesOnPost,
+           COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVotesOnPost,
+           CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS HasAcceptedAnswer,
+           pl.LinkTypeId,
+           pl.RelatedPostId
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id AND pl.LinkTypeId IN (1,3)
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= current_date - interval '2 years'
+),
+AcceptedAnswerDetails AS (
+    SELECT a.Id AS AnswerId,
+           a.ParentId AS QuestionId,
+           a.OwnerUserId AS AnswerOwnerId,
+           a.Score AS AnswerScore,
+           u.Reputation AS AnswerOwnerReputation,
+           ROW_NUMBER() OVER(PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank
+    FROM Posts a
+    LEFT JOIN Users u ON a.OwnerUserId = u.Id
+    WHERE a.PostTypeId = 2
+),
+AnswerVotesAggregated AS (
+    SELECT a.ParentId AS QuestionId,
+           COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS TotalUpVotesOnAnswers,
+           COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS TotalDownVotesOnAnswers
+    FROM Posts a
+    LEFT JOIN Votes v ON a.Id = v.PostId
+    WHERE a.PostTypeId = 2
+    GROUP BY a.ParentId
+),
+UserActivityWindows AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersCount,
+        COUNT(DISTINCT c.Id) AS CommentsCount,
+        SUM(COALESCE(vote_agg.UpVotes,0)) AS TotalUpVotes,
+        SUM(COALESCE(vote_agg.DownVotes,0)) AS TotalDownVotes,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        MAX(b.BadgeCount) AS UserBadgeCount,
+        MAX(b.HighestBadgeClass) AS UserHighestBadgeClass
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.CreationDate >= current_date - interval '1 year'
+    LEFT JOIN Comments c ON c.UserId = u.Id AND c.CreationDate >= current_date - interval '1 year'
+    LEFT JOIN (
+        SELECT UserId,
+               COUNT(*) FILTER (WHERE VoteTypeId=2) AS UpVotes,
+               COUNT(*) FILTER (WHERE VoteTypeId=3) AS DownVotes
+        FROM Votes
+        WHERE CreationDate >= current_date - interval '1 year'
+        GROUP BY UserId
+    ) vote_agg ON vote_agg.UserId = u.Id
+    LEFT JOIN BadgedUsers b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+RecentEdits AS (
+    SELECT ph.PostId,
+           ph.PostHistoryTypeId,
+           ph.CreationDate,
+           ph.UserId,
+           ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS RecentEditRank
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4,5,6) -- Edit Title, Edit Body, Edit Tags
+      AND ph.CreationDate >= current_date - interval '6 months'
+),
+CombinedQuestions AS (
+    SELECT q.*, 
+           a.AnswerId, a.AnswerOwnerId, a.AnswerScore, a.AnswerOwnerReputation, a.AnswerRank,
+           av.TotalUpVotesOnAnswers, av.TotalDownVotesOnAnswers,
+           r.RecentEditRank,
+           r.CreationDate AS LastEditDate,
+           bt.BadgeCount, bt.HighestBadgeClass, bt.BadgesList
+    FROM QuestionStats q
+    LEFT JOIN AcceptedAnswerDetails a ON q.AcceptedAnswerId = a.AnswerId
+    LEFT JOIN AnswerVotesAggregated av ON av.QuestionId = q.Id
+    LEFT JOIN RecentEdits r ON r.PostId = q.Id AND r.RecentEditRank = 1
+    LEFT JOIN BadgedUsers bt ON bt.UserId = q.OwnerUserId
+    WHERE q.Score > 5
+)
+SELECT 
+    cq.Id AS QuestionId,
+    cq.Title,
+    cq.OwnerUserId,
+    u.DisplayName AS OwnerName,
+    u.Reputation AS OwnerReputation,
+    cq.Score AS QuestionScore,
+    cq.ViewCount,
+    cq.AnswerCount,
+    cq.CommentCount,
+    cq.HasAcceptedAnswer,
+    cq.AnswerScore,
+    cq.AnswerOwnerReputation,
+    cq.TotalUpVotesOnAnswers,
+    cq.TotalDownVotesOnAnswers,
+    cq.LastEditDate,
+    cq.BadgeCount,
+    cq.HighestBadgeClass,
+    cq.BadgesList,
+    STRING_AGG(DISTINCT rt.Path[1], ',' ORDER BY rt.Path[1]) AS RootTags,
+    STRING_AGG(DISTINCT rt.Path[array_length(rt.Path,1)], ',' ORDER BY rt.Path[array_length(rt.Path,1)]) AS LeafTags,
+    UPPER(SUBSTRING(cq.Title FROM 1 FOR 1)) || LOWER(SUBSTRING(cq.Title FROM 2)) AS TitleFormatted,
+    CASE 
+        WHEN cq.BadgeCount >= 10 THEN 'High'
+        WHEN cq.BadgeCount BETWEEN 3 AND 9 THEN 'Medium'
+        ELSE 'Low'
+    END AS BadgeDensity,
+    CASE
+        WHEN u.LastAccessDate < current_date - interval '30 days' THEN 'Inactive'
+        WHEN u.Reputation < 100 THEN 'Beginner'
+        ELSE 'Active'
+    END AS UserStatus
+FROM CombinedQuestions cq
+LEFT JOIN Users u ON u.Id = cq.OwnerUserId
+LEFT JOIN RecursiveTagHierarchy rt ON rt.TagName = ANY(string_to_array(COALESCE(cq.Tags, ''), '><'))
+GROUP BY 
+    cq.Id, cq.Title, cq.OwnerUserId, u.DisplayName, u.Reputation, 
+    cq.Score, cq.ViewCount, cq.AnswerCount, cq.CommentCount, 
+    cq.HasAcceptedAnswer, cq.AnswerScore, cq.AnswerOwnerReputation, 
+    cq.TotalUpVotesOnAnswers, cq.TotalDownVotesOnAnswers, cq.LastEditDate, 
+    cq.BadgeCount, cq.HighestBadgeClass, cq.BadgesList, u.LastAccessDate
+HAVING AVG(cq.Score) OVER () > 0 -- trivial window function usage for workload
+ORDER BY cq.Score DESC NULLS LAST, cq.ViewCount DESC
+LIMIT 100;

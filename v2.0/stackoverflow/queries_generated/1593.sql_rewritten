@@ -1,0 +1,215 @@
+-- {"query": "1593.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3481} 
+WITH UserParsedTags AS (
+    -- Extract and unnest individual tags from the 'Tags' string in Posts,
+    -- linking them to the post owner. This helps in analyzing user-specific tag contributions.
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId AS UserId,
+        -- Remove leading/trailing '>' and '<', then split by '><'
+        -- Use TRIM to clean up any potential whitespace around tag names.
+        TRIM(UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags)-2), '><'))) AS TagName
+    FROM Posts p
+    WHERE
+        p.Tags IS NOT NULL
+        AND LENGTH(p.Tags) > 2 -- Ensure the tags string is not empty or just "<>"
+        AND p.OwnerUserId IS NOT NULL
+),
+UserTagUsage AS (
+    -- Aggregate the count of each tag used by individual users.
+    SELECT
+        upt.UserId,
+        upt.TagName,
+        COUNT(upt.TagName) AS TagCount
+    FROM UserParsedTags upt
+    GROUP BY upt.UserId, upt.TagName
+),
+UserTopTags AS (
+    -- Identify the top 5 most frequently used tags for each user.
+    -- This uses a window function to rank tags by count and then STRING_AGG to combine them.
+    SELECT
+        utu.UserId,
+        STRING_AGG(utu.TagName, ', ' ORDER BY utu.TagCount DESC, utu.TagName ASC) AS Top5Tags
+    FROM (
+        SELECT
+            utu_inner.UserId,
+            utu_inner.TagName,
+            utu_inner.TagCount,
+            -- Rank tags within each user's contributions to pick the top ones
+            ROW_NUMBER() OVER (PARTITION BY utu_inner.UserId ORDER BY utu_inner.TagCount DESC, utu_inner.TagName ASC) AS rn
+        FROM UserTagUsage utu_inner
+    ) AS ranked_tags
+    WHERE ranked_tags.rn <= 5 -- Select only the top 5 tags
+    GROUP BY ranked_tags.UserId
+),
+UserActivitySummary AS (
+    -- Consolidate a wide range of user-specific metrics, including post counts, scores, badges,
+    -- editing activity, voting behavior, and profile information.
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.Views AS ProfileViews,
+        u.UpVotes AS TotalUpvotesReceived, -- Upvotes received on user's posts
+        u.DownVotes AS TotalDownvotesReceived, -- Downvotes received on user's posts
+        COALESCE(COUNT(DISTINCT p.Id), 0) AS TotalPostsOwned,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END), 0) AS QuestionsAsked,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END), 0) AS AnswersProvided,
+        COALESCE(SUM(CASE WHEN p.PostTypeId IN (1, 2) THEN p.Score ELSE 0 END), 0) AS TotalPostScore,
+        COALESCE(COUNT(DISTINCT c.Id), 0) AS TotalCommentsMade,
+        COALESCE(COUNT(DISTINCT b.Id), 0) AS TotalBadgesEarned,
+        COALESCE(SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END), 0) AS GoldBadges,
+        -- Count edits made by the user to their own posts
+        COALESCE(SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) AND ph.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = u.Id) THEN 1 ELSE 0 END), 0) AS TotalEditsToOwnPosts,
+        -- Count votes given by the user
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpvotesGiven,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownvotesGiven,
+        COALESCE(utt.Top5Tags, 'N/A') AS TopContributedTags,
+        EXTRACT(DAY FROM (cast('2024-10-01 12:34:56' as timestamp) - u.CreationDate)) AS DaysSinceUserCreation,
+        u.Location,
+        u.AboutMe
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN UserTopTags utt ON u.Id = utt.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Views, u.UpVotes, u.DownVotes, u.Location, utt.Top5Tags, u.AboutMe
+),
+PostExtendedMetrics AS (
+    -- Calculate detailed metrics for individual posts (questions and answers),
+    -- including link counts, bounty amounts, and time-based metrics.
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.Title,
+        p.Tags,
+        p.LastActivityDate,
+        p.Body,
+        p.ClosedDate,
+        COALESCE(LENGTH(p.Body), 0) AS BodyLength,
+        COALESCE(LENGTH(p.Title), 0) AS TitleLength,
+        -- Calculate the number of tags associated with the post, handling NULL tags
+        ARRAY_LENGTH(STRING_TO_ARRAY(SUBSTRING(COALESCE(p.Tags, '<>'), 2, LENGTH(COALESCE(p.Tags, '<>'))-2), '><'), 1) AS TagCount,
+        -- Use LEFT JOIN with PostHistory and CloseReasonTypes to get the close reason, if applicable
+        COALESCE(cr.Name, 'Not Closed') AS CloseReason,
+        -- Correlated subquery to count outgoing linked posts
+        (SELECT COUNT(DISTINCT pl.RelatedPostId) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 1) AS OutgoingLinksCount,
+        -- Correlated subquery to count incoming linked posts
+        (SELECT COUNT(DISTINCT pl.PostId) FROM PostLinks pl WHERE pl.RelatedPostId = p.Id AND pl.LinkTypeId = 1) AS IncomingLinksCount,
+        -- Correlated subquery to sum bounty amounts for the post
+        COALESCE((SELECT SUM(v.BountyAmount) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 8), 0) AS TotalBountyAmount,
+        -- Correlated subquery to calculate the average score of answers to a question
+        COALESCE((SELECT AVG(ans.Score) FROM Posts ans WHERE ans.ParentId = p.Id AND ans.PostTypeId = 2), 0.0) AS AvgAnswerScoreForQuestion,
+        -- Calculate hours since last activity for the post
+        EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - p.LastActivityDate)) / 3600.0 AS HoursSinceLastActivity,
+        -- Window function to rank posts by engagement (score, then view count) within each PostType
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS PostRankByEngagement,
+        -- Window function to divide posts into 4 quartiles based on their creation date
+        NTILE(4) OVER (ORDER BY p.CreationDate) AS CreationDateQuartile,
+        -- Window function to get the creation date of the owner's previous post
+        LAG(p.CreationDate, 1, p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostByOwnerDate,
+        -- Calculate the time difference (in hours) between the current post and the owner's previous post
+        EXTRACT(EPOCH FROM (p.CreationDate - LAG(p.CreationDate, 1, p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate))) / 3600.0 AS HoursSincePreviousPost
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId = 10 AND ph.Comment ~ '^[0-9]+$' -- Filter for close events with numeric comment (CloseReasonId)
+    LEFT JOIN CloseReasonTypes cr ON ph.Comment::smallint = cr.Id
+    WHERE p.PostTypeId IN (1, 2) -- Focus on Questions (1) and Answers (2)
+)
+-- Final selection combining user and post metrics with additional window functions and complex logic
+SELECT
+    uas.UserId,
+    -- Format DisplayName with initial capital and rest lowercase
+    UPPER(SUBSTRING(uas.DisplayName FROM 1 FOR 1)) || LOWER(SUBSTRING(uas.DisplayName FROM 2)) AS FormattedDisplayName,
+    uas.Reputation,
+    uas.DaysSinceUserCreation,
+    uas.TopContributedTags,
+    -- Categorize users based on multiple activity metrics
+    CASE
+        WHEN uas.Reputation >= 10000 AND uas.QuestionsAsked >= 50 AND uas.AnswersProvided >= 100 AND uas.GoldBadges >= 5 THEN 'StackOverflow Guru'
+        WHEN uas.Reputation >= 5000 AND uas.QuestionsAsked >= 20 AND uas.AnswersProvided >= 50 AND uas.GoldBadges >= 1 THEN 'Senior Contributor'
+        WHEN uas.Reputation >= 1000 AND uas.QuestionsAsked >= 10 AND uas.AnswersProvided >= 20 THEN 'Active Contributor'
+        WHEN uas.Reputation > 100 THEN 'Engaged User'
+        ELSE 'Casual User'
+    END AS UserCategory,
+    COALESCE(uas.Location, 'Unspecified') AS UserLocation,
+    uas.ProfileViews,
+    uas.TotalPostsOwned,
+    uas.TotalPostScore,
+    uas.TotalBadgesEarned,
+    uas.GoldBadges,
+    uas.TotalCommentsMade,
+    uas.TotalEditsToOwnPosts,
+    uas.UpvotesGiven AS UserUpvotesGivenOverall,
+    uas.DownvotesGiven AS UserDownvotesGivenOverall,
+    pem.PostId,
+    COALESCE(pem.Title, 'Untitled Post') AS PostTitle, -- Handle NULL post titles
+    CASE pem.PostTypeId
+        WHEN 1 THEN 'Question'
+        WHEN 2 THEN 'Answer'
+        ELSE 'Other' -- Should not be reached due to CTE filtering
+    END AS PostTypeName,
+    pem.Score AS PostScore,
+    pem.ViewCount,
+    pem.CommentCount,
+    pem.FavoriteCount,
+    pem.PostRankByEngagement,
+    pem.CreationDateQuartile,
+    -- Format post creation date for better readability
+    'Posted on ' || TO_CHAR(pem.PostCreationDate, 'YYYY-MM-DD HH24:MI:SS') AS FormattedPostCreationDate,
+    pem.HoursSinceLastActivity,
+    pem.BodyLength,
+    pem.TitleLength,
+    pem.TagCount,
+    pem.OutgoingLinksCount,
+    pem.IncomingLinksCount,
+    pem.CloseReason,
+    pem.TotalBountyAmount,
+    pem.AvgAnswerScoreForQuestion,
+    COALESCE(pem.HoursSincePreviousPost, 0.0) AS HoursBetweenPosts,
+    -- Global rank of users by reputation and total post score
+    RANK() OVER (ORDER BY uas.Reputation DESC, uas.TotalPostScore DESC) AS GlobalReputationRank,
+    -- Rank of users within their specific location
+    DENSE_RANK() OVER (PARTITION BY uas.Location ORDER BY uas.Reputation DESC) AS RankInLocation,
+    -- Average post score for each individual user
+    AVG(pem.Score) OVER (PARTITION BY uas.UserId) AS AvgPostScoreByThisUser,
+    -- Cumulative sum of post scores within each user category, ordered by reputation
+    SUM(pem.Score) OVER (PARTITION BY (CASE
+        WHEN uas.Reputation >= 10000 AND uas.QuestionsAsked >= 50 AND uas.AnswersProvided >= 100 AND uas.GoldBadges >= 5 THEN 'StackOverflow Guru'
+        WHEN uas.Reputation >= 5000 AND uas.QuestionsAsked >= 20 AND uas.AnswersProvided >= 50 AND uas.GoldBadges >= 1 THEN 'Senior Contributor'
+        WHEN uas.Reputation >= 1000 AND uas.QuestionsAsked >= 10 AND uas.AnswersProvided >= 20 THEN 'Active Contributor'
+        WHEN uas.Reputation > 100 THEN 'Engaged User'
+        ELSE 'Casual User'
+    END) ORDER BY uas.Reputation) AS CumulativeScoreInUserCategory,
+    -- First post date for each user
+    MIN(pem.PostCreationDate) OVER (PARTITION BY uas.UserId) AS UsersFirstPostDate,
+    -- Latest post date for each user
+    MAX(pem.PostCreationDate) OVER (PARTITION BY uas.UserId) AS UsersLatestPostDate,
+    -- Change in score from the user's previous post (NULL if it's their first post)
+    pem.Score - COALESCE(LAG(pem.Score, 1, 0) OVER (PARTITION BY uas.UserId ORDER BY pem.PostCreationDate), 0) AS ScoreChangeFromPreviousPost
+FROM UserActivitySummary uas
+INNER JOIN PostExtendedMetrics pem ON uas.UserId = pem.OwnerUserId
+WHERE
+    uas.Reputation > 500 -- Filter for users with a minimum reputation
+    AND pem.Score > 5 -- Filter for posts with a minimum score
+    AND pem.PostCreationDate >= '2023-01-01' -- Only consider posts from a specific date range
+    AND pem.HoursSinceLastActivity < 720 -- Posts with activity in the last month (720 hours)
+    AND uas.TotalBadgesEarned >= 2 -- Users with at least two badges
+    AND uas.DisplayName IS NOT NULL AND uas.DisplayName != '' -- Ensure user has a valid display name
+    -- Complex predicate: either it's a question, or an answer to a question with good average answer score
+    AND (pem.PostTypeId = 1 OR (pem.PostTypeId = 2 AND pem.AvgAnswerScoreForQuestion > 10.0))
+    AND uas.AboutMe IS NOT NULL AND LENGTH(uas.AboutMe) > 50 -- Users with substantial 'AboutMe' descriptions
+ORDER BY
+    uas.Reputation DESC,
+    pem.PostCreationDate DESC,
+    pem.PostRankByEngagement ASC
+LIMIT 1000;

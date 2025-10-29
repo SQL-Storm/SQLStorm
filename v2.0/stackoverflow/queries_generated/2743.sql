@@ -1,0 +1,155 @@
+-- {"query": "2743.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1443} 
+with RecursiveTagPaths as (
+    select 
+        t.Id,
+        t.TagName,
+        array[t.TagName] as Path,
+        1 as Depth
+    from Tags t
+    where t.IsRequired = 1
+
+    union all
+
+    select
+        t.Id,
+        t.TagName,
+        p.Path || t.TagName,
+        p.Depth + 1
+    from Tags t
+    join RecursiveTagPaths p on substring(t.TagName, 1, 1) = substring(p.TagName, 1, 1)
+    where p.Depth < 3
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgesPerClass
+    from Badges b
+    where b.Date >= current_date - interval '1 year'
+    group by b.UserId, b.Class
+),
+TopUsers as (
+    select 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        coalesce(bc_gold.BadgesPerClass, 0) as GoldCount,
+        coalesce(bc_silver.BadgesPerClass, 0) as SilverCount,
+        coalesce(bc_bronze.BadgesPerClass, 0) as BronzeCount,
+        row_number() over (order by u.Reputation desc, u.Id) as rn
+    from Users u
+    left join UserBadgeCounts bc_gold on u.Id = bc_gold.UserId and bc_gold.Class = 1
+    left join UserBadgeCounts bc_silver on u.Id = bc_silver.UserId and bc_silver.Class = 2
+    left join UserBadgeCounts bc_bronze on u.Id = bc_bronze.UserId and bc_bronze.Class = 3
+    where u.Reputation > 1000
+),
+PostAnswerStats as (
+    select 
+        p.ParentId as QuestionId,
+        count(*) filter (where po.Score >= 10) as HighScoreAnswerCount,
+        avg(po.Score) as AvgAnswerScore,
+        max(po.Score) as MaxAnswerScore,
+        sum(case when po.OwnerUserId is null then 1 else 0 end) as AnonymousAnswers
+    from Posts p
+    join Posts po on p.ParentId = po.Id and po.PostTypeId = 1
+    where p.PostTypeId = 2
+    group by p.ParentId
+),
+QuestionWithStats as (
+    select 
+        q.Id,
+        q.Title,
+        q.CreationDate,
+        q.OwnerUserId,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        pas.HighScoreAnswerCount,
+        pas.AvgAnswerScore,
+        pas.MaxAnswerScore,
+        pas.AnonymousAnswers,
+        row_number() over (partition by q.OwnerUserId order by q.Score desc) as UserTopQuestionRank,
+        count(*) over (partition by q.OwnerUserId) as UserTotalQuestions
+    from Posts q
+    left join PostAnswerStats pas on q.Id = pas.QuestionId
+    where q.PostTypeId = 1
+),
+LatestComments as (
+    select distinct on (c.PostId)
+        c.PostId,
+        c.Id as CommentId,
+        c.Text as CommentText,
+        c.CreationDate as CommentDate,
+        coalesce(u.DisplayName, c.UserDisplayName) as CommentOwnerDisplayName
+    from Comments c
+    left join Users u on c.UserId = u.Id
+    order by c.PostId, c.CreationDate desc
+),
+LinkedDuplicateCounts as (
+    select 
+        pl.PostId,
+        count(distinct pl.RelatedPostId) filter (where lt.Name = 'Duplicate') as DuplicateCount,
+        count(distinct pl.RelatedPostId) filter (where lt.Name = 'Linked') as LinkedCount
+    from PostLinks pl
+    join LinkTypes lt on pl.LinkTypeId = lt.Id
+    group by pl.PostId
+)
+select 
+    qu.Id as QuestionId,
+    qu.Title,
+    qu.CreationDate,
+    coalesce(u.DisplayName, 'Unknown') as QuestionOwner,
+    qu.Score,
+    qu.ViewCount,
+    qu.AnswerCount,
+    qu.HighScoreAnswerCount,
+    round(qu.AvgAnswerScore::numeric, 2) as AvgAnswerScore,
+    qu.MaxAnswerScore,
+    qu.AnonymousAnswers,
+    qu.UserTopQuestionRank,
+    qu.UserTotalQuestions,
+    tc.CommentOwnerDisplayName as LatestCommentOwner,
+    tc.CommentText as LatestComment,
+    dup.DuplicateCount,
+    dup.LinkedCount,
+    case 
+        when qu.ViewCount > 1000 then 'High Views'
+        when qu.ViewCount between 100 and 1000 then 'Medium Views'
+        else 'Low Views'
+    end as ViewCategory,
+    substring(qu.Title from '([A-Za-z]+)') as FirstWordInTitle,
+    coalesce(u.Reputation, 0) as OwnerReputation,
+    (select count(*) from Votes v where v.PostId = qu.Id and v.VoteTypeId = 2) as UpVotesCount,
+    (select count(*) from Votes v where v.PostId = qu.Id and v.VoteTypeId = 3) as DownVotesCount,
+    case
+        when qu.Score < 0 then 'Negative Score'
+        when qu.Score = 0 then 'Zero Score'
+        else 'Positive Score'
+    end as ScoreCategory,
+    lag(qu.Score) over (partition by qu.OwnerUserId order by qu.CreationDate) as PreviousQuestionScore,
+    lead(qu.Score) over (partition by qu.OwnerUserId order by qu.CreationDate) as NextQuestionScore,
+    tp.GoldCount,
+    tp.SilverCount,
+    tp.BronzeCount,
+    case 
+        when qu.AnswerCount = 0 then null
+        else qu.Score::float / qu.AnswerCount
+    end as ScorePerAnswerRatio,
+    case 
+        when qu.AnswerCount > 0 then (select count(*) from Comments c where c.PostId = qu.Id) * 1.0 / qu.AnswerCount
+        else null
+    end as CommentsPerAnswer,
+    case 
+        when dup.DuplicateCount > 0 then 'Has Duplicates'
+        else 'Original Question'
+    end as DuplicateStatus
+from QuestionWithStats qu
+left join Users u on qu.OwnerUserId = u.Id
+left join LatestComments tc on qu.Id = tc.PostId
+left join LinkedDuplicateCounts dup on qu.Id = dup.PostId
+left join TopUsers tp on qu.OwnerUserId = tp.Id
+where 
+    (qu.HighScoreAnswerCount > 0 or qu.Score > 50 or qu.ViewCount > 1000)
+    and (qu.UserTopQuestionRank <= 5 or qu.UserTotalQuestions >= 10)
+order by qu.Score desc NULLS LAST, qu.ViewCount desc NULLS LAST, qu.CreationDate desc
+limit 50;

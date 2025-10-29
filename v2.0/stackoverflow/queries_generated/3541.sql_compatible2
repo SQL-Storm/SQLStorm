@@ -1,0 +1,201 @@
+WITH UserStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.UpVotes,0) - COALESCE(u.DownVotes,0)                         AS NetVotes,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1)                                 AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2)                                 AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3)                                 AS BronzeBadges,
+        MAX(p.CreationDate) FILTER (WHERE p.PostTypeId = 1)                    AS LastQuestionDate,
+        MAX(p.CreationDate) FILTER (WHERE p.PostTypeId = 2)                    AS LastAnswerDate,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1)                            AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2)                            AS AnswerCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END)                     AS UpVoteGiven,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END)                     AS DownVoteGiven
+    FROM Users u
+    LEFT JOIN Badges       b ON b.UserId = u.Id
+    LEFT JOIN Posts        p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes        v ON v.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes
+),
+
+TopUsers AS (
+    SELECT
+        *,
+        RANK()    OVER (ORDER BY Reputation DESC, NetVotes DESC)           AS RepRank,
+        ROW_NUMBER() OVER (ORDER BY (GoldBadges*100 + SilverBadges*10 + BronzeBadges) DESC) AS BadgeScoreRank
+    FROM UserStats
+    WHERE Reputation IS NOT NULL
+),
+
+TagStats AS (
+    SELECT
+        t.TagName,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1)                         AS QuestionsWithTag,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2)                         AS AnswersWithTag,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 1)                        AS AvgQuestionScore,
+        MAX(p.CreationDate)                                                AS LatestActivity
+    FROM Tags t
+    LEFT JOIN Posts p
+           ON p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+    GROUP BY t.TagName
+    HAVING COUNT(p.Id) > 0
+),
+
+RecentCloseReasons AS (
+    SELECT
+        ph.PostId,
+        ph.CreationDate,
+        CAST(ph.Comment AS integer)                                            AS CloseReasonId,
+        COALESCE(crt.Name, 'Unknown')                                      AS CloseReasonName
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS integer)
+    WHERE ph.PostHistoryTypeId = 10
+      AND ph.Comment ~ '^\d+$'
+),
+
+UserCloseStats AS (
+    SELECT
+        u.Id,
+        COUNT(*)                                                          AS ClosedPosts,
+        COUNT(DISTINCT rc.CloseReasonId)                                 AS DistinctCloseReasons,
+        STRING_AGG(DISTINCT rc.CloseReasonName, '; ')                    AS ReasonList
+    FROM Users u
+    JOIN Posts p           ON p.OwnerUserId = u.Id
+    JOIN RecentCloseReasons rc ON rc.PostId = p.Id
+    GROUP BY u.Id
+),
+
+CombinedMain AS (
+    SELECT
+        tu.Id,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.NetVotes,
+        tu.GoldBadges,
+        tu.SilverBadges,
+        tu.BronzeBadges,
+        tu.QuestionCount,
+        tu.AnswerCount,
+        tu.UpVoteGiven,
+        tu.DownVoteGiven,
+        tu.RepRank,
+        tu.BadgeScoreRank,
+        COALESCE(ucs.ClosedPosts,0)                                           AS ClosedPosts,
+        COALESCE(ucs.DistinctCloseReasons,0)                                 AS DistinctCloseReasons,
+        COALESCE(ucs.ReasonList,'')                                          AS CloseReasonList,
+        CASE
+            WHEN tu.QuestionCount = 0 THEN NULL
+            ELSE ROUND(CAST(tu.AnswerCount AS numeric) / tu.QuestionCount, 2)
+        END                                                                 AS AnswerToQuestionRatio,
+        CASE
+            WHEN tu.LastQuestionDate IS NULL THEN NULL
+            ELSE DATE_PART('day', CAST('2024-10-01 12:34:56' AS timestamp) - tu.LastQuestionDate)
+        END                                                                 AS DaysSinceLastQuestion,
+        CASE
+            WHEN tu.LastAnswerDate IS NULL THEN NULL
+            ELSE DATE_PART('day', CAST('2024-10-01 12:34:56' AS timestamp) - tu.LastAnswerDate)
+        END                                                                 AS DaysSinceLastAnswer,
+        CAST(NULL AS text)                                                   AS TagName,
+        CAST(NULL AS integer)                                                AS QuestionsWithTag,
+        CAST(NULL AS integer)                                                AS AnswersWithTag,
+        CAST(NULL AS numeric)                                                AS AvgQuestionScore,
+        CAST(NULL AS timestamp)                                              AS LatestActivity,
+        'user'                                                              AS row_type
+    FROM TopUsers tu
+    LEFT JOIN UserCloseStats ucs ON ucs.Id = tu.Id
+    WHERE tu.RepRank <= 100
+
+    UNION ALL
+
+    SELECT
+        CAST(NULL AS bigint) AS Id,
+        '--- Tag Summary ---' AS DisplayName,
+        CAST(NULL AS numeric) AS Reputation,
+        CAST(NULL AS numeric) AS NetVotes,
+        CAST(NULL AS integer) AS GoldBadges,
+        CAST(NULL AS integer) AS SilverBadges,
+        CAST(NULL AS integer) AS BronzeBadges,
+        CAST(NULL AS integer) AS QuestionCount,
+        CAST(NULL AS integer) AS AnswerCount,
+        CAST(NULL AS integer) AS UpVoteGiven,
+        CAST(NULL AS integer) AS DownVoteGiven,
+        CAST(NULL AS integer) AS RepRank,
+        CAST(NULL AS integer) AS BadgeScoreRank,
+        CAST(NULL AS integer) AS ClosedPosts,
+        CAST(NULL AS integer) AS DistinctCloseReasons,
+        CAST(NULL AS text) AS CloseReasonList,
+        CAST(NULL AS numeric) AS AnswerToQuestionRatio,
+        CAST(NULL AS numeric) AS DaysSinceLastQuestion,
+        CAST(NULL AS numeric) AS DaysSinceLastAnswer,
+        CAST(NULL AS text) AS TagName,
+        CAST(NULL AS integer) AS QuestionsWithTag,
+        CAST(NULL AS integer) AS AnswersWithTag,
+        CAST(NULL AS numeric) AS AvgQuestionScore,
+        CAST(NULL AS timestamp) AS LatestActivity,
+        'separator' AS row_type
+
+    UNION ALL
+
+    SELECT
+        CAST(NULL AS bigint) AS Id,
+        t.TagName AS DisplayName,
+        CAST(NULL AS numeric) AS Reputation,
+        CAST(NULL AS numeric) AS NetVotes,
+        CAST(NULL AS integer) AS GoldBadges,
+        CAST(NULL AS integer) AS SilverBadges,
+        CAST(NULL AS integer) AS BronzeBadges,
+        t.QuestionsWithTag AS QuestionCount,
+        t.AnswersWithTag AS AnswerCount,
+        CAST(NULL AS integer) AS UpVoteGiven,
+        CAST(NULL AS integer) AS DownVoteGiven,
+        CAST(NULL AS integer) AS RepRank,
+        CAST(NULL AS integer) AS BadgeScoreRank,
+        CAST(NULL AS integer) AS ClosedPosts,
+        CAST(NULL AS integer) AS DistinctCloseReasons,
+        CAST(NULL AS text) AS CloseReasonList,
+        ROUND(CAST(t.AvgQuestionScore AS numeric),2)                           AS AnswerToQuestionRatio,
+        DATE_PART('day', CAST('2024-10-01 12:34:56' AS timestamp) - t.LatestActivity) AS DaysSinceLastQuestion,
+        CAST(NULL AS numeric)                                                 AS DaysSinceLastAnswer,
+        t.TagName                                                             AS TagName,
+        t.QuestionsWithTag                                                    AS QuestionsWithTag,
+        t.AnswersWithTag                                                      AS AnswersWithTag,
+        t.AvgQuestionScore                                                    AS AvgQuestionScore,
+        t.LatestActivity                                                      AS LatestActivity,
+        'tag' AS row_type
+    FROM TagStats t
+)
+
+SELECT
+    Id,
+    DisplayName,
+    Reputation,
+    NetVotes,
+    GoldBadges,
+    SilverBadges,
+    BronzeBadges,
+    QuestionCount,
+    AnswerCount,
+    UpVoteGiven,
+    DownVoteGiven,
+    RepRank,
+    BadgeScoreRank,
+    ClosedPosts,
+    DistinctCloseReasons,
+    CloseReasonList,
+    AnswerToQuestionRatio,
+    DaysSinceLastQuestion,
+    DaysSinceLastAnswer,
+    TagName,
+    QuestionsWithTag,
+    AnswersWithTag,
+    AvgQuestionScore,
+    LatestActivity,
+    row_type
+FROM CombinedMain
+ORDER BY
+    CASE WHEN row_type = 'user' THEN 0 WHEN row_type = 'separator' THEN 1 ELSE 2 END,
+    RepRank,
+    QuestionsWithTag DESC
+LIMIT 150;

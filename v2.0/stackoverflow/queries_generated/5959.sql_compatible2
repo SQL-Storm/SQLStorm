@@ -1,0 +1,237 @@
+WITH
+  RecentActivePosts AS (
+    SELECT
+      p.Id,
+      p.PostTypeId,
+      p.OwnerUserId,
+      p.Title,
+      p.Tags,
+      p.CreationDate,
+      p.LastActivityDate,
+      p.ViewCount,
+      p.Score,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      p.ParentId,
+      p.AcceptedAnswerId
+    FROM Posts p
+    WHERE p.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days')
+  ),
+  UserRank AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.UpVotes,
+      u.DownVotes,
+      ROW_NUMBER() OVER (
+        ORDER BY u.Reputation DESC,
+                 u.UpVotes DESC,
+                 u.LastAccessDate DESC
+      ) AS rk
+    FROM Users u
+  ),
+  TagPairs AS (
+    SELECT
+      p.Id AS PostId,
+      p.Tags,
+      CASE
+        WHEN p.Tags LIKE '<%>' THEN SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2)
+        ELSE p.Tags
+      END AS TagsInner
+    FROM Posts p
+  ),
+  -- Note: portable recursive splitter building tag tokens one-at-a-time.
+  TagSplit AS (
+    SELECT
+      PostId,
+      NULLIF(TRIM(Tok), '') AS TagName,
+      1 AS ord,
+      TagsInner
+    FROM (
+      SELECT
+        PostId,
+        CASE
+          WHEN TagsInner IS NULL OR TagsInner = '' THEN NULL
+          ELSE TagsInner
+        END AS Tok,
+        TagsInner
+      FROM TagPairs
+    ) t
+    WHERE Tok IS NOT NULL
+
+    UNION ALL
+
+    SELECT
+      ts.PostId,
+      NULLIF(TRIM(SUBSTRING(ts.TagsInner FROM next_pos FOR
+        CASE
+          WHEN next_delim_pos > 0 THEN next_delim_pos - next_pos
+          WHEN CHAR_LENGTH(ts.TagsInner) - next_pos + 1 > 0 THEN CHAR_LENGTH(ts.TagsInner) - next_pos + 1
+          ELSE 0
+        END
+      )), '') AS TagName,
+      ts.ord + 1,
+      ts.TagsInner
+    FROM (
+      SELECT
+        p.PostId,
+        p.TagsInner,
+        -- position of the delimiter sequence "><" after a given pos
+        1 AS pos,
+        2 AS ord,
+        -- compute first delimiter position
+        POSITION('><' IN p.TagsInner) AS first_pos
+      FROM TagPairs p
+      WHERE p.TagsInner IS NOT NULL
+    ) base
+    JOIN LATERAL (
+      -- generate successive positions using a simple iterative approach:
+      SELECT
+        base.PostId,
+        base.TagsInner,
+        base.ord AS ord,
+        -- next_pos: start after the first delimiter (first_pos + 2) and trim angle if present
+        CASE
+          WHEN base.first_pos > 0 THEN base.first_pos + 2
+          ELSE 1
+        END AS next_pos,
+        CASE
+          WHEN POSITION('><' IN SUBSTRING(base.TagsInner FROM CASE WHEN base.first_pos > 0 THEN base.first_pos + 2 ELSE 1 END)) > 0
+            THEN POSITION('><' IN SUBSTRING(base.TagsInner FROM CASE WHEN base.first_pos > 0 THEN base.first_pos + 2 ELSE 1 END)) + CASE WHEN base.first_pos > 0 THEN base.first_pos + 1 ELSE 0 END
+          ELSE 0
+        END AS next_delim_pos
+    ) ts ON true
+    WHERE ts.next_pos IS NOT NULL AND ts.next_pos > 0
+  ),
+  TagInvolvement AS (
+    SELECT
+      COALESCE(t.TagName, p.Tags) AS TagName,
+      COUNT(DISTINCT p.Id) AS PostCount,
+      AVG(p.Score) AS AvgScore,
+      MAX(p.LastActivityDate) AS LastActive
+    FROM Posts p
+    LEFT JOIN (
+      SELECT DISTINCT
+        Id AS PostId,
+        CASE
+          WHEN Tags LIKE '<%>' THEN TRIM(SUBSTRING(Tags FROM 2 FOR CHAR_LENGTH(Tags)-2))
+          ELSE Tags
+        END AS TagName
+      FROM Posts
+    ) t ON t.PostId = p.Id
+    GROUP BY COALESCE(t.TagName, p.Tags)
+  ),
+  Edits AS (
+    SELECT
+      ph.PostId,
+      ph.PostHistoryTypeId,
+      ph.CreationDate,
+      ph.UserId,
+      ph.UserDisplayName,
+      ph.Text,
+      ph.Comment
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4,5,6,8,9,10,11,14,15,16,17,18,19,20,24,33,34,36,37,38)
+  ),
+  Activity AS (
+    SELECT
+      p.Id AS PostId,
+      p.PostTypeId,
+      p.OwnerUserId,
+      p.LastActivityDate,
+      p.ViewCount,
+      p.Score,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      CASE
+        WHEN p.OwnerUserId IS NULL THEN 'Anonymous'
+        ELSE COALESCE(uu.DisplayName, p.OwnerDisplayName)
+      END AS EffectiveOwner,
+      COALESCE(uu.Reputation, 0) AS OwnerReputation,
+      p.Title,
+      p.Tags
+    FROM RecentActivePosts p
+    LEFT JOIN Users uu ON p.OwnerUserId = uu.Id
+  ),
+  ComplexQuery AS (
+    SELECT
+      a.PostId,
+      a.PostTypeId,
+      a.OwnerUserId,
+      a.EffectiveOwner,
+      a.OwnerReputation,
+      a.LastActivityDate,
+      a.ViewCount,
+      a.Score,
+      a.AnswerCount,
+      a.CommentCount,
+      a.FavoriteCount,
+      a.Title,
+      a.Tags,
+      (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = a.PostId) AS LinkCount,
+      ROW_NUMBER() OVER (PARTITION BY a.PostTypeId ORDER BY a.LastActivityDate DESC) AS TypeRank,
+      CASE WHEN a.ViewCount = 0 THEN NULL ELSE CAST(a.Score AS NUMERIC(10,2)) / a.ViewCount END AS ScorePerView,
+      CASE WHEN a.Title IS NULL THEN 0 ELSE CHAR_LENGTH(a.Title) END AS TitleLength
+    FROM Activity a
+  )
+SELECT
+  c.PostId,
+  c.PostTypeId,
+  pt.Name AS PostTypeName,
+  c.OwnerUserId,
+  c.EffectiveOwner,
+  c.OwnerReputation,
+  c.LastActivityDate,
+  c.ViewCount,
+  c.Score,
+  c.AnswerCount,
+  c.CommentCount,
+  c.FavoriteCount,
+  c.Title,
+  c.Tags,
+  c.LinkCount,
+  c.TypeRank,
+  c.ScorePerView,
+  c.TitleLength,
+  ru.rk AS UserRank,
+  ru.DisplayName AS UserDisplayName,
+  ru.Reputation AS UserReputation,
+  bh.Date AS BadgeDate,
+  bh.Name AS BadgeName
+FROM ComplexQuery c
+LEFT JOIN PostTypes pt ON c.PostTypeId = pt.Id
+LEFT JOIN UserRank ru ON c.OwnerUserId = ru.UserId
+LEFT JOIN Badges bh ON bh.UserId = c.OwnerUserId
+WHERE
+  (c.Score > 0 OR c.ViewCount > 100)
+  AND (c.LastActivityDate IS NOT NULL)
+  AND (c.TypeRank <= 50)
+GROUP BY
+  c.PostId,
+  c.PostTypeId,
+  pt.Name,
+  c.OwnerUserId,
+  c.EffectiveOwner,
+  c.OwnerReputation,
+  c.LastActivityDate,
+  c.ViewCount,
+  c.Score,
+  c.AnswerCount,
+  c.CommentCount,
+  c.FavoriteCount,
+  c.Title,
+  c.Tags,
+  c.LinkCount,
+  c.TypeRank,
+  c.ScorePerView,
+  c.TitleLength,
+  ru.rk,
+  ru.DisplayName,
+  ru.Reputation,
+  bh.Date,
+  bh.Name
+ORDER BY c.LastActivityDate DESC, c.Score DESC
+LIMIT 200;

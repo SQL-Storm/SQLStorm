@@ -1,0 +1,157 @@
+-- {"query": "5671.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1270} 
+WITH recent_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ContentLicense,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate DESC) AS rn_owner
+  FROM Posts p
+  WHERE p.PostTypeId = 1 -- Question
+    AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '180 days'
+),
+top_authors AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.ProfileImageUrl,
+    u.AccountId,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.UpVotes DESC) AS rn_user
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  WHERE u.Reputation IS NOT NULL
+),
+popular_tags AS (
+  SELECT
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId,
+    t.WikiPostId,
+    ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS rn_tag
+  FROM Tags t
+  WHERE t.IsModeratorOnly = 0
+),
+post_links AS (
+  SELECT
+    pl.Id,
+    pl.PostId,
+    pl.RelatedPostId,
+    pl.LinkTypeId,
+    lt.Name AS LinkTypeName
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+  WHERE pl.LinkTypeId IN (1,3) -- Linked or Duplicate
+),
+recent_votes AS (
+  SELECT
+    v.PostId,
+    v.VoteTypeId,
+    v.UserId,
+    v.CreationDate,
+    v.BountyAmount
+  FROM Votes v
+  WHERE v.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '60 days'
+),
+annotated AS (
+  SELECT
+    rq.PostId,
+    rq.Title,
+    rq.CreationDate,
+    rq.Score,
+    rq.ViewCount,
+    rq.Tags,
+    rq.OwnerUserId,
+    rq.LastActivityDate,
+    rq.AnswerCount,
+    rq.CommentCount,
+    rq.FavoriteCount,
+    rq.ContentLicense,
+    tu.DisplayName AS OwnerDisplayName,
+    u.Reputation AS OwnerReputation,
+    vt.Name AS PrimaryVoteType
+  FROM recent_questions rq
+  LEFT JOIN Users tu ON tu.Id = rq.OwnerUserId
+  LEFT JOIN (
+    SELECT PostId, MAX(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS HasUpvote
+    FROM Votes
+    GROUP BY PostId
+  ) vu ON vu.PostId = rq.PostId
+  LEFT JOIN VoteTypes vt ON vt.Id = 2
+),
+complex_agg AS (
+  SELECT
+    a.PostId,
+    a.Title,
+    a.CreationDate,
+    a.LastActivityDate,
+    a.OwnerDisplayName,
+    a.OwnerReputation,
+    a.Score,
+    a.ViewCount,
+    a.AnswerCount,
+    a.CommentCount,
+    a.FavoriteCount,
+    a.Tags,
+    a.ContentLicense,
+    ex.TagName AS TopTag,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = a.PostId) AS LinkCount,
+    (SELECT STRING_AGG(lt.Name, ',') FROM PostLinks pl JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId WHERE pl.PostId = a.PostId) AS LinkTypes,
+    (SELECT MAX(CASE WHEN pv.VoteTypeId = 2 THEN pv.CreationDate END)
+     FROM Votes pv WHERE pv.PostId = a.PostId) AS LastUpvoteDate,
+    (SELECT COUNT(*) FROM Votes v2 WHERE v2.PostId = a.PostId AND v2.VoteTypeId = 2) AS UpvoteCount,
+    (SELECT COUNT(*) FROM Votes v2 WHERE v2.PostId = a.PostId AND v2.VoteTypeId = 3) AS DownvoteCount,
+    (SELECT MAX(p.LastEditDate) FROM Posts p WHERE p.Id = a.PostId) AS LastEditDate,
+    (SELECT JSON_ARRAYAGG(JSON_OBJECT('user', u2.DisplayName, 'change', vh.Comment))
+     FROM PostHistory vh
+     JOIN Users u2 ON u2.Id = vh.UserId
+     WHERE vh.PostId = a.PostId AND vh.PostHistoryTypeId IN (4,5,6)) AS RevisionSummaries
+  FROM annotated a
+  LEFT JOIN popular_tags ex ON ex.TagName = (SELECT json_array_elements_text(a.Tags::json) LIMIT 1)
+  GROUP BY
+    a.PostId, a.Title, a.CreationDate, a.LastActivityDate, a.OwnerDisplayName,
+    a.OwnerReputation, a.Score, a.ViewCount, a.AnswerCount, a.CommentCount,
+    a.FavoriteCount, a.Tags, a.ContentLicense, ex.TagName
+)
+SELECT
+  ca.PostId,
+  ca.Title,
+  ca.CreationDate,
+  ca.LastActivityDate,
+  ca.OwnerDisplayName,
+  ca.OwnerReputation,
+  ca.Score,
+  ca.ViewCount,
+  ca.AnswerCount,
+  ca.CommentCount,
+  ca.FavoriteCount,
+  ca.Tags,
+  ca.ContentLicense,
+  ca.TopTag,
+  ca.LinkCount,
+  ca.LinkTypes,
+  ca.LastUpvoteDate,
+  ca.UpvoteCount,
+  ca.DownvoteCount,
+  ca.LastEditDate,
+  ca.RevisionSummaries
+FROM complex_agg ca
+WHERE ca.UpvoteCount > 5
+  AND ca.DownvoteCount < ca.UpvoteCount
+  AND ca.LastActivityDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+ORDER BY ca.LastActivityDate DESC, ca.UpvoteCount DESC
+LIMIT 100;

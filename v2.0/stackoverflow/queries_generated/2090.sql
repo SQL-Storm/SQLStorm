@@ -1,0 +1,180 @@
+-- {"query": "2090.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1664} 
+WITH UserBadgeStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+TopQuestions AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1 -- Questions only
+      AND p.Score > 0
+),
+QuestionsWithAcceptedAnswer AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.CreationDate AS QuestionCreation,
+        a.Id AS AcceptedAnswerId,
+        a.Score AS AcceptedAnswerScore,
+        a.OwnerUserId AS AcceptedAnswerOwnerId,
+        a.CreationDate AS AnswerCreation,
+        a.Body AS AnswerBody,
+        a.Tags AS AnswerTags
+    FROM Posts q
+    LEFT JOIN Posts a ON q.AcceptedAnswerId = a.Id
+    WHERE q.PostTypeId = 1
+),
+AnswerRankings AS (
+    SELECT
+        a.ParentId AS QuestionId,
+        a.Id AS AnswerId,
+        a.Score,
+        a.CreationDate,
+        RANK() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+),
+HighRankAnswers AS (
+    SELECT
+        ar.QuestionId,
+        ar.AnswerId,
+        ar.Score,
+        ar.CreationDate,
+        u.DisplayName AS AnswerOwner,
+        COALESCE(usrbs.TotalBadges,0) AS AnswererBadgeCount,
+        COALESCE(usrbs.GoldBadges,0) AS AnswererGoldBadges,
+        COALESCE(usrbs.SilverBadges,0) AS AnswererSilverBadges,
+        COALESCE(usrbs.BronzeBadges,0) AS AnswererBronzeBadges
+    FROM AnswerRankings ar
+    LEFT JOIN Users u ON u.Id = (SELECT OwnerUserId FROM Posts WHERE Id = ar.AnswerId)
+    LEFT JOIN UserBadgeStats usrbs ON usrbs.UserId = u.Id
+    WHERE ar.AnswerRank <= 3
+),
+DuplicateQuestions AS (
+    SELECT DISTINCT
+        pl.PostId AS DuplicateQuestionId,
+        pl.RelatedPostId AS OriginalQuestionId,
+        pq.Title AS DuplicateTitle,
+        po.Title AS OriginalTitle
+    FROM PostLinks pl
+    INNER JOIN Posts pq ON pq.Id = pl.PostId AND pq.PostTypeId = 1
+    INNER JOIN Posts po ON po.Id = pl.RelatedPostId AND po.PostTypeId = 1
+    WHERE pl.LinkTypeId = 3 -- Duplicate
+),
+RecentCommentStats AS (
+    SELECT
+        c.PostId,
+        COUNT(*) FILTER (WHERE c.CreationDate > CURRENT_DATE - INTERVAL '30 days') AS RecentCommentsLast30D,
+        COUNT(*) FILTER (WHERE c.CreationDate BETWEEN CURRENT_DATE - INTERVAL '180 days' AND CURRENT_DATE - INTERVAL '150 days') AS Comments150_180D
+    FROM Comments c
+    GROUP BY c.PostId
+),
+PostEditStats AS (
+    SELECT 
+        ph.PostId,
+        COUNT(*) AS EditCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN 1 ELSE 0 END) AS TitleBodyTagEdits,
+        MAX(ph.CreationDate) AS LastEditDate
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+),
+AggregatedStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        ub.TotalBadges,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        q.Score,
+        q.ViewCount,
+        COALESCE(rcs.RecentCommentsLast30D,0) AS RecentComments,
+        COALESCE(rcs.Comments150_180D,0) AS Comments150_180DaysAgo,
+        pes.EditCount,
+        pes.TitleBodyTagEdits,
+        pes.LastEditDate,
+        q.CreationDate AS QuestionCreationDate,
+        dup.OriginalQuestionId,
+        dup.OriginalTitle,
+        ha.AnswerId,
+        ha.AnswerOwner,
+        ha.Score AS AnswerScore,
+        ha.AnswererBadgeCount
+    FROM Posts q
+    LEFT JOIN UserBadgeStats ub ON ub.UserId = q.OwnerUserId
+    LEFT JOIN RecentCommentStats rcs ON rcs.PostId = q.Id
+    LEFT JOIN PostEditStats pes ON pes.PostId = q.Id
+    LEFT JOIN DuplicateQuestions dup ON dup.DuplicateQuestionId = q.Id
+    LEFT JOIN HighRankAnswers ha ON ha.QuestionId = q.Id
+    WHERE q.PostTypeId = 1 -- Questions only
+      AND q.Score > 10
+      AND (q.ViewCount > 1000 OR EXISTS (
+          SELECT 1 FROM Votes v WHERE v.PostId = q.Id AND v.VoteTypeId = 2 AND v.CreationDate > CURRENT_DATE - INTERVAL '90 days' LIMIT 1
+      ))
+)
+SELECT
+    a.QuestionId,
+    a.Title,
+    a.OwnerUserId,
+    a.TotalBadges,
+    a.GoldBadges,
+    a.SilverBadges,
+    a.BronzeBadges,
+    a.Score,
+    a.ViewCount,
+    a.RecentComments,
+    a.Comments150_180DaysAgo,
+    a.EditCount,
+    a.TitleBodyTagEdits,
+    a.LastEditDate,
+    a.QuestionCreationDate,
+    a.OriginalQuestionId,
+    a.OriginalTitle,
+    a.AnswerId,
+    a.AnswerOwner,
+    a.AnswerScore,
+    a.AnswererBadgeCount,
+    STRING_AGG(DISTINCT COALESCE(phtypes.Name, 'Unknown'), ', ') OVER (PARTITION BY a.QuestionId ORDER BY phtypes.Name) AS EditTypesEncountered,
+    CASE 
+        WHEN a.OriginalQuestionId IS NOT NULL THEN 'Duplicate'
+        WHEN a.Score > 50 AND a.ViewCount > 10000 THEN 'HighImpact'
+        ELSE 'Normal'
+    END AS QuestionCategory,
+    LENGTH(a.Title) AS TitleLength,
+    -- Complex NULL logic and string expression combining tags and titles, safe from NULLs
+    COALESCE(
+        (SELECT STRING_AGG(t.TagName, ', ')
+         FROM Tags t
+         WHERE EXISTS (
+             SELECT 1 FROM Posts p WHERE p.Id = a.QuestionId AND p.Tags LIKE '%' || t.TagName || '%'
+         )
+        ), 'NoTags') AS TagsList,
+    CASE WHEN a.RecentComments > a.Comments150_180DaysAgo THEN 'Increasing Comments' ELSE 'Stable/Declining Comments' END AS CommentTrend
+FROM AggregatedStats a
+LEFT JOIN PostHistoryTypes phtypes ON phtypes.Id IN (
+    SELECT DISTINCT ph.PostHistoryTypeId FROM PostHistory ph WHERE ph.PostId = a.QuestionId
+)
+WHERE a.TotalBadges IS NOT NULL OR a.AnswererBadgeCount IS NOT NULL
+ORDER BY a.Score DESC, a.ViewCount DESC
+LIMIT 100;

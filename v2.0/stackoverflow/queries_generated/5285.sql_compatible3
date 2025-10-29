@@ -1,0 +1,114 @@
+WITH top_posts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Tags,
+    p.OwnerUserId,
+    p.OwnerDisplayName,
+    p.PostTypeId,
+    p.ParentId,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ContentLicense
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+recent_user_activity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.Location,
+    u.WebsiteUrl,
+    u.AboutMe,
+    COALESCE(b.TotalBadges, 0) AS BadgeCount
+  FROM Users u
+  LEFT JOIN (
+    SELECT UserId, COUNT(*) AS TotalBadges
+    FROM Badges
+    GROUP BY UserId
+  ) b ON b.UserId = u.Id
+),
+complex_joins AS (
+  SELECT
+    tp.PostId,
+    tp.Title,
+    tp.Score,
+    tp.ViewCount,
+    tp.Tags,
+    tp.OwnerUserId,
+    tp.OwnerDisplayName,
+    vt.Upvotes,
+    vt.Downvotes,
+    vt.Deletions,
+    cl.Name AS CloseReason,
+    lf.RelatedPostId AS LinkedWith,
+    ln.Title AS LinkedType,
+    tp.CreationDate,
+    tp.LastActivityDate
+  FROM top_posts tp
+  LEFT JOIN (
+    SELECT PostId,
+           SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes,
+           SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS Downvotes,
+           SUM(CASE WHEN VoteTypeId = 10 THEN 1 ELSE 0 END) AS Deletions
+    FROM Votes
+    GROUP BY PostId
+  ) vt ON vt.PostId = tp.PostId
+  LEFT JOIN PostHistory ph ON ph.PostId = tp.PostId AND ph.PostHistoryTypeId = 10
+  LEFT JOIN CloseReasonTypes cl ON cl.Id = NULLIF(ph.Comment, '')
+  LEFT JOIN PostLinks lf ON lf.PostId = tp.PostId
+  LEFT JOIN Posts ln ON ln.Id = lf.RelatedPostId
+  WHERE tp.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '90 days')
+)
+SELECT
+  rp.PostId,
+  rp.Title,
+  rp.Score,
+  rp.ViewCount,
+  rp.Tags,
+  rp.OwnerUserId,
+  rp.OwnerDisplayName,
+  fu.DisplayName AS LastEditor,
+  fu.Reputation AS EditorReputation,
+  fu.LastAccessDate AS EditorLastActivity,
+  rp.CloseReason,
+  (CAST(rp.Score AS DOUBLE PRECISION) / NULLIF(rp.ViewCount, 0)) AS ScorePerView,
+  -- build LinkedTypes and LinkTypesUsed without ARRAY_REMOVE (use ARRAY_AGG then filter NULLs out with array functions compatible with many dialects)
+  (SELECT array_agg(x) FROM (SELECT DISTINCT ln2.LinkedType AS x FROM complex_joins ln2 WHERE ln2.PostId = rp.PostId AND ln2.LinkedType IS NOT NULL) t) AS LinkedTypes,
+  (SELECT array_agg(x) FROM (SELECT DISTINCT ltype2.Name AS x FROM PostLinks l2 JOIN LinkTypes ltype2 ON ltype2.Id = l2.LinkTypeId WHERE l2.PostId = rp.PostId AND ltype2.Name IS NOT NULL) t) AS LinkTypesUsed,
+  cu.BadgeCount AS OwnerBadgeCount,
+  ROW_NUMBER() OVER (PARTITION BY rp.OwnerUserId ORDER BY rp.LastActivityDate DESC, rp.Score DESC) AS rn
+FROM complex_joins rp
+LEFT JOIN Votes v ON v.PostId = rp.PostId AND v.VoteTypeId = 2
+LEFT JOIN Users fu ON fu.Id = rp.OwnerUserId
+LEFT JOIN recent_user_activity cu ON cu.UserId = rp.OwnerUserId
+LEFT JOIN PostLinks l ON l.PostId = rp.PostId
+LEFT JOIN LinkTypes ltype ON ltype.Id = l.LinkTypeId
+LEFT JOIN complex_joins ln ON ln.PostId = l.RelatedPostId
+GROUP BY
+  rp.PostId,
+  rp.Title,
+  rp.Score,
+  rp.ViewCount,
+  rp.Tags,
+  rp.OwnerUserId,
+  rp.OwnerDisplayName,
+  fu.DisplayName,
+  fu.Reputation,
+  fu.LastAccessDate,
+  rp.CloseReason,
+  cu.BadgeCount,
+  rp.LastActivityDate
+ORDER BY rp.LastActivityDate DESC, rp.Score DESC
+LIMIT 100;

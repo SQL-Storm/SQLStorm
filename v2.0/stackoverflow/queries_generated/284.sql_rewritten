@@ -1,0 +1,351 @@
+-- {"query": "284.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3808} 
+with recent_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.location,
+    coalesce(nullif(trim(u.websiteurl), ''), 'n/a') as websiteurl,
+    u.upvotes,
+    u.downvotes,
+    u.views,
+    row_number() over (order by u.creationdate desc, u.id desc) as rn
+  from users u
+),
+top_recent_users as (
+  select *
+  from recent_users
+  where rn <= 500
+),
+user_activity as (
+  select
+    p.owneruserid as user_id,
+    count(*) filter (where p.posttypeid = 1) as q_count,
+    count(*) filter (where p.posttypeid = 2) as a_count,
+    sum(greatest(p.score, 0)) as nonneg_post_score,
+    avg(nullif(p.viewcount, 0)) as avg_viewcount_nonzero,
+    max(p.creationdate) as last_post_date
+  from posts p
+  group by p.owneruserid
+),
+tag_splits as (
+  select
+    p.id as post_id,
+    p.owneruserid as user_id,
+    unnest(string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')) as tagname
+  from posts p
+  where p.posttypeid = 1
+    and p.tags is not null
+    and length(p.tags) > 2
+),
+user_top_tags as (
+  select
+    ts.user_id,
+    t.tagname,
+    count(*) as tag_q_count,
+    row_number() over (partition by ts.user_id order by count(*) desc, min(ts.post_id)) as tag_rank
+  from tag_splits ts
+  join tags t on t.tagname = ts.tagname
+  group by ts.user_id, t.tagname
+),
+user_badges as (
+  select
+    b.userid as user_id,
+    count(*) as total_badges,
+    count(*) filter (where b.class = 1) as gold_badges,
+    count(*) filter (where b.class = 2) as silver_badges,
+    count(*) filter (where b.class = 3) as bronze_badges,
+    min(b.date) as first_badge_date,
+    max(b.date) as last_badge_date
+  from badges b
+  group by b.userid
+),
+accepted_answers as (
+  select
+    a.owneruserid as user_id,
+    count(*) as accepted_count,
+    sum(a.score) as accepted_score_sum
+  from posts q
+  join posts a on a.id = q.acceptedanswerid
+  where q.posttypeid = 1
+  group by a.owneruserid
+),
+vote_agg as (
+  select
+    p.owneruserid as user_id,
+    count(*) filter (where v.votetypeid = 2) as upvotes_received,
+    count(*) filter (where v.votetypeid = 3) as downvotes_received,
+    count(*) filter (where v.votetypeid = 8) as bounties_started,
+    sum(v.bountyamount) filter (where v.votetypeid in (8,9)) as bounty_amount_total
+  from posts p
+  left join votes v on v.postid = p.id
+  group by p.owneruserid
+),
+comment_stats as (
+  select
+    p.owneruserid as user_id,
+    count(c.id) as comments_on_user_posts,
+    avg(c.score) as avg_comment_score,
+    max(c.creationdate) as last_comment_date
+  from posts p
+  left join comments c on c.postid = p.id
+  group by p.owneruserid
+),
+close_events as (
+  select
+    ph.postid,
+    ph.userid as closer_user_id,
+    ph.creationdate as closed_at,
+    coalesce(crt.name, 'Unknown') as close_reason_name
+  from posthistory ph
+  left join closer eas on true -- harmless cartesian noop for planner variance
+  left join closereasontypes crt on crt.id = try_cast(ph.comment as smallint)
+  where ph.posthistorytypeid = 10
+),
+user_close_interactions as (
+  select
+    coalesce(p.owneruserid, ce.closer_user_id) as user_id,
+    count(*) filter (where p.owneruserid is not null) as times_user_had_posts_closed,
+    count(*) filter (where ce.closer_user_id is not null) as times_user_participated_closing,
+    count(*) filter (where ce.close_reason_name ilike '%duplicate%') as dup_related_closes
+  from close_events ce
+  left join posts p on p.id = ce.postid
+  group by coalesce(p.owneruserid, ce.closer_user_id)
+),
+cross_links as (
+  select
+    pl.postid,
+    pl.relatedpostid,
+    pl.linktypeid,
+    case when pl.linktypeid = 3 then 1 else 0 end as is_duplicate
+  from postlinks pl
+),
+user_link_network as (
+  select
+    p.owneruserid as user_id,
+    count(distinct cl.relatedpostid) filter (where cl.linktypeid = 1) as linked_posts_out,
+    count(distinct cl.postid) filter (where cl.linktypeid = 1) as linked_posts_in_proxy,
+    count(*) filter (where cl.is_duplicate = 1) as dup_links_count
+  from cross_links cl
+  join posts p on p.id = cl.postid
+  group by p.owneruserid
+),
+post_edit_activity as (
+  select
+    ph.userid as editor_user_id,
+    count(*) filter (where ph.posthistorytypeid in (4,5,6)) as edits_made,
+    count(*) filter (where ph.posthistorytypeid in (24)) as suggedits_applied,
+    max(ph.creationdate) as last_edit_date
+  from posthistory ph
+  group by ph.userid
+),
+user_quality_score as (
+  select
+    u.user_id,
+    coalesce(ua.q_count,0) as q_count,
+    coalesce(ua.a_count,0) as a_count,
+    coalesce(aa.accepted_count,0) as accepted_count,
+    coalesce(va.upvotes_received,0) as up_rcv,
+    coalesce(va.downvotes_received,0) as dn_rcv,
+    coalesce(ua.nonneg_post_score,0) as post_score_pos,
+    coalesce(va.bounty_amount_total,0) as bounty_amt,
+    coalesce(ub.gold_badges,0) as g,
+    coalesce(ub.silver_badges,0) as s,
+    coalesce(ub.bronze_badges,0) as b,
+    coalesce(uln.dup_links_count,0) as dup_links,
+    coalesce(uci.times_user_had_posts_closed,0) as closed_on_user,
+    coalesce(ua.avg_viewcount_nonzero,0) as avg_views_nonzero
+  from top_recent_users u
+  left join user_activity ua on ua.user_id = u.user_id
+  left join accepted_answers aa on aa.user_id = u.user_id
+  left join vote_agg va on va.user_id = u.user_id
+  left join user_badges ub on ub.user_id = u.user_id
+  left join user_link_network uln on uln.user_id = u.user_id
+  left join user_close_interactions uci on uci.user_id = u.user_id
+),
+score_calc as (
+  select
+    uq.user_id,
+    (
+      0.2 * ln(1 + uq.q_count) +
+      0.4 * ln(1 + uq.a_count) +
+      0.6 * ln(1 + uq.accepted_count) +
+      0.3 * ln(1 + uq.up_rcv) -
+      0.2 * ln(1 + uq.dn_rcv) +
+      0.15 * ln(1 + uq.post_score_pos) +
+      0.05 * ln(1 + abs(uq.bounty_amt)) +
+      0.5 * (uq.g * 3 + uq.s * 1.5 + uq.b * 0.5) / nullif(uq.g + uq.s + uq.b, 0) +
+      0.05 * ln(1 + uq.avg_views_nonzero) -
+      0.1 * ln(1 + uq.dup_links) -
+      0.1 * ln(1 + uq.closed_on_user)
+    ) as quality_score
+  from user_quality_score uq
+),
+user_rollups as (
+  select
+    tru.user_id,
+    tru.displayname,
+    tru.reputation,
+    tru.creationdate,
+    tru.location,
+    tru.websiteurl,
+    tru.upvotes,
+    tru.downvotes,
+    tru.views,
+    coalesce(ua.q_count, 0) as q_count,
+    coalesce(ua.a_count, 0) as a_count,
+    coalesce(ua.last_post_date, tru.creationdate) as last_post_date,
+    coalesce(cs.comments_on_user_posts, 0) as comments_on_user_posts,
+    coalesce(cs.avg_comment_score, 0) as avg_comment_score,
+    coalesce(cs.last_comment_date, tru.creationdate) as last_comment_date,
+    coalesce(ub.total_badges, 0) as total_badges,
+    coalesce(ub.first_badge_date, tru.creationdate) as first_badge_date,
+    coalesce(ub.last_badge_date, tru.creationdate) as last_badge_date,
+    coalesce(aa.accepted_count, 0) as accepted_answers,
+    coalesce(va.upvotes_received, 0) as upvotes_received,
+    coalesce(va.downvotes_received, 0) as downvotes_received,
+    coalesce(va.bounties_started, 0) as bounties_started,
+    coalesce(va.bounty_amount_total, 0) as bounty_amount_total,
+    coalesce(uli.linked_posts_out, 0) as linked_posts_out,
+    coalesce(uli.linked_posts_in_proxy, 0) as linked_posts_in_proxy,
+    coalesce(uli.dup_links_count, 0) as dup_links_count,
+    coalesce(uci.times_user_had_posts_closed, 0) as times_user_had_posts_closed,
+    coalesce(uci.times_user_participated_closing, 0) as times_user_participated_closing,
+    coalesce(uci.dup_related_closes, 0) as dup_related_closes,
+    coalesce(pe.edits_made, 0) as edits_made,
+    coalesce(pe.suggedits_applied, 0) as suggedits_applied,
+    coalesce(pe.last_edit_date, tru.creationdate) as last_edit_date
+  from top_recent_users tru
+  left join user_activity ua on ua.user_id = tru.user_id
+  left join comment_stats cs on cs.user_id = tru.user_id
+  left join user_badges ub on ub.user_id = tru.user_id
+  left join accepted_answers aa on aa.user_id = tru.user_id
+  left join vote_agg va on va.user_id = tru.user_id
+  left join user_link_network uli on uli.user_id = tru.user_id
+  left join user_close_interactions uci on uci.user_id = tru.user_id
+  left join post_edit_activity pe on pe.editor_user_id = tru.user_id
+),
+user_ranked as (
+  select
+    ur.*,
+    sc.quality_score,
+    dense_rank() over (order by coalesce(sc.quality_score, -1e9) desc, ur.reputation desc, ur.user_id) as dr_quality,
+    row_number() over (order by ur.reputation desc, ur.user_id) as rn_reputation,
+    percent_rank() over (order by coalesce(sc.quality_score, -1e9)) as pct_quality_low_to_high,
+    ntile(10) over (order by coalesce(sc.quality_score, -1e9) desc) as decile_quality
+  from user_rollups ur
+  left join score_calc sc on sc.user_id = ur.user_id
+),
+user_tag_pivot as (
+  select
+    utt.user_id,
+    string_agg(case when utt.tag_rank = 1 then utt.tagname end, ',' order by utt.tag_rank) as top_tag,
+    string_agg(case when utt.tag_rank = 2 then utt.tagname end, ',' order by utt.tag_rank) as second_tag,
+    sum(case when utt.tag_rank <= 3 then utt.tag_q_count else 0 end) as top3_tag_qs
+  from user_top_tags utt
+  where utt.tag_rank <= 10
+  group by utt.user_id
+),
+activity_windows as (
+  select
+    p.owneruserid as user_id,
+    count(*) filter (where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days') as posts_30d,
+    count(*) filter (where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '90 days') as posts_90d,
+    count(*) filter (where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days') as posts_365d
+  from posts p
+  group by p.owneruserid
+),
+posttype_mix as (
+  select
+    p.owneruserid as user_id,
+    1.0 * sum(case when p.posttypeid = 1 then 1 else 0 end) / nullif(count(*),0) as frac_questions,
+    1.0 * sum(case when p.posttypeid = 2 then 1 else 0 end) / nullif(count(*),0) as frac_answers
+  from posts p
+  group by p.owneruserid
+),
+question_answer_balance as (
+  select
+    ur.user_id,
+    (coalesce(ua.q_count,0) - coalesce(ua.a_count,0)) as q_minus_a,
+    case
+      when coalesce(ua.q_count,0) + coalesce(ua.a_count,0) = 0 then null
+      else 1.0 * coalesce(ua.q_count,0) / nullif(coalesce(ua.q_count,0) + coalesce(ua.a_count,0),0)
+    end as question_ratio
+  from user_rollups ur
+  left join user_activity ua on ua.user_id = ur.user_id
+),
+stringy as (
+  select
+    ur.user_id,
+    trim(both ' ' from coalesce(ur.displayname, '')) as displayname_trim,
+    left(coalesce(ur.location, ''), 30) as location_short,
+    lower(coalesce(nullif(ur.websiteurl,'n/a'), '')) as websiteurl_lower,
+    regexp_replace(coalesce(ur.displayname,''), '\s+', '_', 'g') as displayname_token
+  from user_rollups ur
+)
+select
+  ur.user_id,
+  s.displayname_trim as displayname,
+  ur.reputation,
+  to_char(ur.creationdate, 'YYYY-MM-DD') as created,
+  s.location_short as location,
+  s.websiteurl_lower as website,
+  coalesce(utp.top_tag, '(none)') as top_tag,
+  coalesce(utp.second_tag, '(none)') as second_tag,
+  coalesce(utp.top3_tag_qs, 0) as top3_tag_qs,
+  ur.q_count,
+  ur.a_count,
+  ur.accepted_answers,
+  ur.upvotes_received,
+  ur.downvotes_received,
+  ur.comments_on_user_posts,
+  ur.total_badges,
+  ur.last_post_date,
+  ur.last_comment_date,
+  ur.last_edit_date,
+  coalesce(aw.posts_30d,0) as posts_30d,
+  coalesce(aw.posts_90d,0) as posts_90d,
+  coalesce(aw.posts_365d,0) as posts_365d,
+  coalesce(pm.frac_questions,0.0) as frac_questions,
+  coalesce(pm.frac_answers,0.0) as frac_answers,
+  qab.q_minus_a,
+  qab.question_ratio,
+  ur.linked_posts_out,
+  ur.linked_posts_in_proxy,
+  ur.dup_links_count,
+  ur.times_user_had_posts_closed,
+  ur.times_user_participated_closing,
+  ur.dup_related_closes,
+  ur.edits_made,
+  ur.suggedits_applied,
+  round(coalesce(ur.avg_comment_score,0)::numeric, 3) as avg_comment_score,
+  round(coalesce(ur.bounty_amount_total,0)::numeric, 0) as bounty_amount_total,
+  round(coalesce(ur.upvotes,0)::numeric, 0) as upvotes_given,
+  round(coalesce(ur.downvotes,0)::numeric, 0) as downvotes_given,
+  round(coalesce(ur.views,0)::numeric, 0) as profile_views,
+  ur.dr_quality,
+  ur.rn_reputation,
+  ur.decile_quality,
+  round(coalesce(ur.quality_score, -1e9)::numeric, 4) as quality_score,
+  s.displayname_token as display_token
+from user_ranked ur
+left join user_tag_pivot utp on utp.user_id = ur.user_id
+left join activity_windows aw on aw.user_id = ur.user_id
+left join posttype_mix pm on pm.user_id = ur.user_id
+left join question_answer_balance qab on qab.user_id = ur.user_id
+left join stringy s on s.user_id = ur.user_id
+where
+  (
+    ur.reputation > 0
+    or coalesce(ur.quality_score, -1e9) > -1e8
+    or coalesce(aw.posts_90d,0) > 0
+  )
+  and (
+    s.websiteurl_lower is null
+    or s.websiteurl_lower not ilike '%spam%'
+  )
+order by
+  ur.dr_quality,
+  ur.rn_reputation
+limit 200;

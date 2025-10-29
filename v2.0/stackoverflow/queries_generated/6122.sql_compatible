@@ -1,0 +1,62 @@
+SELECT 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    MAX(u.CreationDate) AS LatestAccountActivity,
+    MAX(p.LastActivityDate) AS LastPostActivity,
+    b.Name AS LatestBadge,
+    ph.Comment AS LatestPostHistory,
+    v.VoteTypeId AS LatestVoteType
+FROM 
+    Users u
+LEFT JOIN 
+    (SELECT 
+         UserId, 
+         MAX(Date) AS MaxBadgeDate,
+         -- keep Name and correlate later via join to get the badge with MaxBadgeDate
+         NULL::text AS NamePlaceholder
+     FROM 
+         Badges
+     GROUP BY 
+         UserId) bidx ON u.Id = bidx.UserId
+LEFT JOIN Badges b ON b.UserId = u.Id AND b.Date = bidx.MaxBadgeDate
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    (SELECT 
+         PostId, 
+         MAX(CreationDate) AS MaxPostHistoryDate
+     FROM 
+         PostHistory
+     GROUP BY 
+         PostId) phidx ON p.Id = phidx.PostId
+LEFT JOIN PostHistory ph ON ph.PostId = phidx.PostId AND ph.CreationDate = phidx.MaxPostHistoryDate
+LEFT JOIN 
+    (SELECT 
+         PostId, 
+         MAX(CreationDate) AS MaxVoteDate
+     FROM 
+         Votes
+     GROUP BY 
+         PostId) vidx ON p.Id = vidx.PostId
+LEFT JOIN Votes v ON v.PostId = vidx.PostId AND v.CreationDate = vidx.MaxVoteDate
+WHERE 
+    u.Reputation > 1000
+    AND p.LastActivityDate > (CAST('2024-10-01' AS date) - INTERVAL '1 year')
+    AND EXISTS (
+        SELECT 1 
+        FROM Comments c 
+        WHERE c.PostId = p.Id 
+        AND c.Score > 0
+    )
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation, b.Name, ph.Comment, v.VoteTypeId
+HAVING 
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id ELSE NULL END) > 5
+ORDER BY 
+    u.Reputation DESC, 
+    TotalPosts DESC
+LIMIT 100;

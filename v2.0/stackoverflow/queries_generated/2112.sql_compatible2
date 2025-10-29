@@ -1,0 +1,167 @@
+with RecursiveUserBadges as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        b.Class,
+        b.Name as BadgeName,
+        row_number() over (partition by u.Id order by b.Date desc, b.Class) as BadgeRank
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    where b.Class in (1, 2, 3) or b.Class is null
+),
+PostScoresByUser as (
+    select
+        p.OwnerUserId,
+        p.PostTypeId,
+        count(*) as PostsCount,
+        sum(p.Score) as TotalScore,
+        avg(p.ViewCount) as AvgViews,
+        max(p.CreationDate) as LastPostDate
+    from Posts p
+    where p.OwnerUserId is not null and p.OwnerUserId <> -1
+    group by p.OwnerUserId, p.PostTypeId
+),
+UserCommentActivity as (
+    select
+        c.UserId,
+        count(*) as TotalComments,
+        sum(c.Score) as SumCommentScore,
+        max(c.CreationDate) as LastCommentDate
+    from Comments c
+    where c.UserId is not null
+    group by c.UserId
+),
+UserCloseVoteHistory as (
+    select
+        ph.UserId,
+        crt.Name as CloseReasonName,
+        count(*) as CloseVotesCount,
+        min(ph.CreationDate) as FirstClosedDate,
+        max(ph.CreationDate) as LastClosedDate
+    from PostHistory ph
+    join CloseReasonTypes crt on cast(ph.Comment as integer) = crt.Id
+    where ph.PostHistoryTypeId = 10 and ph.UserId is not null
+    group by ph.UserId, crt.Name
+),
+DuplicateLinkCounts as (
+    select
+        pl.PostId,
+        count(case when lt.Name = 'Duplicate' then 1 end) as DuplicateCount,
+        count(distinct case when lt.Name = 'Duplicate' then pl.RelatedPostId end) as DistinctDuplicatePosts
+    from PostLinks pl
+    join LinkTypes lt on pl.LinkTypeId = lt.Id
+    group by pl.PostId
+),
+UserPerformanceMetrics as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        coalesce(psq.PostsCount,0) as QuestionCount,
+        coalesce(psa.PostsCount,0) as AnswerCount,
+        coalesce(psq.TotalScore,0) as QuestionScore,
+        coalesce(psa.TotalScore,0) as AnswerScore,
+        u.Reputation,
+        u.CreationDate,
+        coalesce(uca.TotalComments,0) as CommentsCount,
+        coalesce(uca.SumCommentScore,0) as CommentScoreSum,
+        coalesce(ucv.CloseVotesCount,0) as CloseVotesCount,
+        coalesce(ulb.BadgesSummary, '') as BadgesSummary,
+        (coalesce(psq.TotalScore,0)*1.5 + coalesce(psa.TotalScore,0) * 2 + coalesce(uca.SumCommentScore,0) * 0.5 + coalesce(ucv.CloseVotesCount,0) * 3) as WeightedActivityScore
+    from Users u
+    left join (
+        select OwnerUserId, PostsCount, TotalScore, PostTypeId
+        from PostScoresByUser
+        where PostTypeId = 1
+    ) psq on u.Id = psq.OwnerUserId
+    left join (
+        select OwnerUserId, PostsCount, TotalScore, PostTypeId
+        from PostScoresByUser
+        where PostTypeId = 2
+    ) psa on u.Id = psa.OwnerUserId
+    left join UserCommentActivity uca on u.Id = uca.UserId
+    left join (
+        select UserId, sum(CloseVotesCount) as CloseVotesCount
+        from UserCloseVoteHistory
+        group by UserId
+    ) ucv on u.Id = ucv.UserId
+    left join (
+        select UserId,
+            string_agg(format('%s(%s)', Name, cast(Class as text)), '; ' ORDER BY Class) as BadgesSummary
+        from Badges
+        group by UserId
+    ) ulb on u.Id = ulb.UserId
+),
+LatestAcceptedAnswers as (
+    select
+        a.ParentId as QuestionId,
+        a.Id as AnswerId,
+        a.OwnerUserId as AnswerUserId,
+        a.CreationDate as AnswerDate,
+        q.OwnerUserId as QuestionUserId,
+        q.CreationDate as QuestionDate,
+        a.Score as AnswerScore,
+        q.Score as QuestionScore
+    from Posts a
+    join Posts q on q.Id = a.ParentId and q.PostTypeId = 1
+    where a.PostTypeId = 2 and q.AcceptedAnswerId = a.Id
+),
+AnswerDelays as (
+    select
+        laa.QuestionUserId,
+        laa.AnswerUserId,
+        laa.QuestionId,
+        laa.AnswerId,
+        extract(epoch from (laa.AnswerDate - laa.QuestionDate))/3600 as HoursToAnswer,
+        laa.AnswerScore,
+        laa.QuestionScore
+    from LatestAcceptedAnswers laa
+    where laa.AnswerDate is not null and laa.QuestionDate is not null
+),
+RankedUsers as (
+    select
+        upm.UserId,
+        upm.DisplayName,
+        upm.QuestionCount,
+        upm.AnswerCount,
+        upm.QuestionScore,
+        upm.AnswerScore,
+        upm.Reputation,
+        upm.CreationDate,
+        upm.CommentsCount,
+        upm.CommentScoreSum,
+        upm.CloseVotesCount,
+        upm.BadgesSummary,
+        upm.WeightedActivityScore,
+        row_number() over (order by upm.WeightedActivityScore desc, upm.Reputation desc) as ActivityRank,
+        percentile_cont(0.9) within group (order by upm.WeightedActivityScore) over () as Score90Percentile
+    from UserPerformanceMetrics upm
+)
+select
+    ru.UserId,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.QuestionCount,
+    ru.AnswerCount,
+    ru.CommentScoreSum,
+    ru.CloseVotesCount,
+    ru.BadgesSummary,
+    ru.WeightedActivityScore,
+    ru.ActivityRank,
+    ad.HoursToAnswer,
+    ad.AnswerScore,
+    ad.QuestionScore,
+    case
+        when ru.WeightedActivityScore >= ru.Score90Percentile then 'Top 10%'
+        else 'Others'
+    end as UserSegment,
+    coalesce(nullif(ru.BadgesSummary, ''), 'No badges') || ' | Joined: ' || to_char(ru.CreationDate, 'YYYY-MM-DD') as ProfileSummary
+from RankedUsers ru
+left join AnswerDelays ad on ad.AnswerUserId = ru.UserId
+where ru.Reputation > 1000
+  and (ru.QuestionCount + ru.AnswerCount) > 10
+  and (
+      ru.BadgesSummary is not null
+      or ru.CloseVotesCount > 0
+  )
+order by ru.ActivityRank, ad.HoursToAnswer nulls last
+limit 100;

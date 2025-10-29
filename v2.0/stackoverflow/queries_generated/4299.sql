@@ -1,0 +1,112 @@
+-- {"query": "4299.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1001} 
+
+WITH
+  RankedPostEdits AS (
+    SELECT
+      ph.PostId,
+      ph.UserId,
+      ph.CreationDate,
+      ph.PostHistoryTypeId,
+      ph.Comment,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) as rn
+    FROM PostHistory AS ph
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6) AND ph.UserId IS NOT NULL
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      COUNT(DISTINCT p.Id) AS QuestionCount,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+      COUNT(DISTINCT b.Id) AS BadgeCount,
+      MAX(p.CreationDate) AS LastPostDate
+    FROM Users AS u
+    LEFT JOIN Posts AS p
+      ON u.Id = p.OwnerUserId
+    LEFT JOIN Votes AS v
+      ON u.Id = v.UserId
+    LEFT JOIN Badges AS b
+      ON u.Id = b.UserId
+    WHERE
+      u.Id > 0
+    GROUP BY
+      u.Id,
+      u.DisplayName
+  ),
+  HotQuestions AS (
+    SELECT
+      p.Id,
+      p.Title,
+      p.Score,
+      p.AnswerCount,
+      p.FavoriteCount,
+      p.CreationDate,
+      ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.FavoriteCount DESC, p.CreationDate DESC) as RankNumber
+    FROM Posts AS p
+    WHERE
+      p.PostTypeId = 1
+      AND p.ClosedDate IS NULL
+      AND p.Score > 10
+      AND p.AnswerCount > 0
+  ),
+  CommunityResponses AS (
+    SELECT
+      p.Id AS PostId,
+      COUNT(DISTINCT c.Id) AS CommentCount,
+      AVG(CAST(c.Score AS REAL)) AS AvgCommentScore
+    FROM Posts AS p
+    JOIN Comments AS c
+      ON p.Id = c.PostId
+    WHERE
+      p.PostTypeId = 1
+      AND c.CreationDate BETWEEN p.CreationDate AND DATE_ADD(p.CreationDate, INTERVAL 7 DAY)
+    GROUP BY
+      p.Id
+  )
+SELECT
+  hq.Title AS QuestionTitle,
+  ua.DisplayName AS OwnerDisplayName,
+  hq.Score AS QuestionScore,
+  hq.AnswerCount AS QuestionAnswerCount,
+  hq.FavoriteCount AS QuestionFavoriteCount,
+  ua.UpVoteCount AS OwnerUpVotes,
+  ua.DownVoteCount AS OwnerDownVotes,
+  ua.BadgeCount AS OwnerBadgeCount,
+  cr.CommentCount AS RecentCommentCount,
+  cr.AvgCommentScore AS AverageCommentScore,
+  rpe.CreationDate AS LastEditDate,
+  rpe.Comment AS LastEditComment,
+  CASE
+    WHEN hq.RankNumber <= 50 THEN 'Top 50 Hot Question'
+    WHEN hq.RankNumber <= 200 THEN 'Top 200 Hot Question'
+    ELSE 'Other Hot Question'
+  END AS HotCategory,
+  CONCAT(
+    ua.DisplayName,
+    ' (',
+    ua.QuestionCount,
+    ' Qs, ',
+    ua.AnswerCount,
+    ' As, ',
+    ua.UpVoteCount,
+    ' Ups)'
+  ) AS UserActivitySummary
+FROM HotQuestions AS hq
+JOIN Posts AS p_owner
+  ON hq.Id = p_owner.Id
+JOIN UserActivity AS ua
+  ON p_owner.OwnerUserId = ua.UserId
+LEFT JOIN CommunityResponses AS cr
+  ON hq.Id = cr.PostId
+LEFT JOIN RankedPostEdits AS rpe
+  ON hq.Id = rpe.PostId AND rpe.rn = 1
+WHERE
+  hq.RankNumber <= 200
+  AND ua.Reputation > 10000
+  AND cr.CommentCount > 5
+ORDER BY
+  hq.RankNumber,
+  ua.Reputation DESC;

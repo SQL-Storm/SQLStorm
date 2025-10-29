@@ -1,0 +1,159 @@
+-- {"query": "3346.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1748} 
+
+/*  Benchmark query: complex mix of CTEs, window functions, outer joins,
+    correlated subqueries, set operators, string manipulation and NULL logic */
+
+WITH RECURSIVE TagHierarchy AS (
+    /* Simulate a simple hierarchy: treat tags that share a common prefix as parent/child */
+    SELECT t.TagName,
+           NULL::varchar(35) AS ParentTag,
+           t.Count
+    FROM   Tags t
+    WHERE  POSITION('-' IN t.TagName) = 0
+
+    UNION ALL
+
+    SELECT child.TagName,
+           parent.TagName,
+           child.Count
+    FROM   Tags child
+    JOIN   TagHierarchy parent
+           ON LEFT(child.TagName, POSITION('-' IN child.TagName)-1) = parent.TagName
+    WHERE  POSITION('-' IN child.TagName) > 0
+),
+
+TopTags AS (
+    /* Top‑10 tags by total question count (including their children) */
+    SELECT th.ParentTag   AS Tag,
+           SUM(th.Count)  AS TotalCount,
+           ROW_NUMBER() OVER (ORDER BY SUM(th.Count) DESC) AS rn
+    FROM   TagHierarchy th
+    WHERE  th.ParentTag IS NOT NULL
+    GROUP  BY th.ParentTag
+    HAVING SUM(th.Count) > 0
+),
+
+QuestionInfo AS (
+    /* Core question data enriched with tag list and latest activity */
+    SELECT p.Id                         AS QuestionId,
+           p.Title,
+           p.OwnerUserId,
+           p.CreationDate,
+           p.Score                      AS QuestionScore,
+           p.ViewCount,
+           p.Tags,
+           COALESCE(p.FavoriteCount,0)  AS FavoriteCount,
+           /* extract first tag (used for join to TopTags) */
+           (regexp_split_to_array(p.Tags, '[><]'))[2] AS PrimaryTag,
+           /* latest activity = max of last edit, last comment, or last vote */
+           GREATEST(
+               COALESCE(p.LastEditDate, p.CreationDate),
+               COALESCE(
+                   (SELECT MAX(c.CreationDate) FROM Comments c WHERE c.PostId = p.Id),
+                   p.CreationDate),
+               COALESCE(
+                   (SELECT MAX(v.CreationDate) FROM Votes v WHERE v.PostId = p.Id),
+                   p.CreationDate)
+           ) AS LatestActivity
+    FROM   Posts p
+    WHERE  p.PostTypeId = 1                -- only questions
+),
+
+AnswerStats AS (
+    /* Per‑question answer aggregates */
+    SELECT a.ParentId                             AS QuestionId,
+           COUNT(*)                               AS AnswerCount,
+           AVG(a.Score)                           AS AvgAnswerScore,
+           SUM(CASE WHEN a.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END) AS AcceptedAnswerFlag,
+           MAX(a.CreationDate)                    AS LatestAnswerDate
+    FROM   Posts a
+    JOIN   QuestionInfo q ON q.QuestionId = a.ParentId
+    WHERE  a.PostTypeId = 2                      -- only answers
+    GROUP  BY a.ParentId
+),
+
+UserActivity AS (
+    /* Latest activity per user across questions, answers and comments */
+    SELECT u.Id                            AS UserId,
+           u.DisplayName,
+           u.Reputation,
+           MAX(q.LatestActivity)           AS LastQuestionActivity,
+           MAX(a.LatestAnswerDate)         AS LastAnswerActivity,
+           MAX(c.CreationDate)             AS LastCommentActivity
+    FROM   Users u
+    LEFT JOIN QuestionInfo q   ON q.OwnerUserId = u.Id
+    LEFT JOIN AnswerStats a   ON a.QuestionId IN (SELECT Id FROM Posts WHERE OwnerUserId = u.Id)
+    LEFT JOIN Comments c       ON c.UserId = u.Id
+    GROUP  BY u.Id, u.DisplayName, u.Reputation
+),
+
+BadgeSummary AS (
+    /* Count of each badge class per user, with NULL‑safe handling */
+    SELECT b.UserId,
+           SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldCount,
+           SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverCount,
+           SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeCount,
+           COUNT(*)                                      AS TotalBadges
+    FROM   Badges b
+    GROUP  BY b.UserId
+),
+
+UserScore AS (
+    /* Combine activity, reputation and badge info into a composite score */
+    SELECT ua.UserId,
+           ua.DisplayName,
+           ua.Reputation,
+           COALESCE(bs.GoldCount,0)   * 100 +
+           COALESCE(bs.SilverCount,0) * 50 +
+           COALESCE(bs.BronzeCount,0) * 10
+               AS BadgePoints,
+           COALESCE(ua.LastQuestionActivity, '1970-01-01') AS LQA,
+           COALESCE(ua.LastAnswerActivity,   '1970-01-01') AS LAA,
+           COALESCE(ua.LastCommentActivity,  '1970-01-01') AS LCA,
+           (EXTRACT(EPOCH FROM GREATEST(
+                COALESCE(ua.LastQuestionActivity,'1970-01-01'),
+                COALESCE(ua.LastAnswerActivity,'1970-01-01'),
+                COALESCE(ua.LastCommentActivity,'1970-01-01')
+           )) / 86400) AS DaysSinceLastActivity,
+           /* Composite score: weighted reputation + badge points - decay */
+           (ua.Reputation * 0.4) + (BadgePoints * 0.5) - (DaysSinceLastActivity * 0.1) AS CompositeScore
+    FROM   UserActivity ua
+    LEFT JOIN BadgeSummary bs ON bs.UserId = ua.UserId
+),
+
+TagQuestionSet AS (
+    /* Set of questions belonging to top tags (union of parent and child tags) */
+    SELECT q.QuestionId,
+           q.Title,
+           q.PrimaryTag,
+           th.ParentTag AS TopTag
+    FROM   QuestionInfo q
+    JOIN   TopTags tt          ON tt.rn <= 10
+    JOIN   TagHierarchy th
+           ON (th.TagName = q.PrimaryTag OR th.TagName = ANY(string_to_array(q.Tags,'><')))
+          AND th.ParentTag = tt.Tag
+),
+
+AggregatedResults AS (
+    /* Final aggregation: per top‑tag statistics */
+    SELECT tqs.TopTag,
+           COUNT(DISTINCT tqs.QuestionId)                                     AS TotalQuestions,
+           AVG(q.QuestionScore)                                                AS AvgQuestionScore,
+           AVG(COALESCE(a.AnswerCount,0))                                      AS AvgAnswersPerQuestion,
+           SUM(CASE WHEN a.AcceptedAnswerFlag > 0 THEN 1 ELSE 0 END)           AS QuestionsWithAccepted,
+           MAX(q.ViewCount)                                                    AS MaxViews,
+           STRING_AGG(DISTINCT u.DisplayName, ', ' ORDER BY u.CompositeScore DESC LIMIT 5) AS TopUsers
+    FROM   TagQuestionSet tqs
+    JOIN   QuestionInfo q      ON q.QuestionId = tqs.QuestionId
+    LEFT JOIN AnswerStats a   ON a.QuestionId = q.QuestionId
+    LEFT JOIN Posts p          ON p.Id = q.QuestionId
+    LEFT JOIN Users u
+           ON u.Id = p.OwnerUserId
+    LEFT JOIN UserScore us    ON us.UserId = u.Id
+    GROUP  BY tqs.TopTag
+)
+
+SELECT *
+FROM   AggregatedResults
+ORDER  BY TotalQuestions DESC
+LIMIT  20;

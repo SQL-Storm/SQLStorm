@@ -1,0 +1,319 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY MAX(p.CreationDate) DESC) as rn
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+    HAVING COUNT(DISTINCT p.Id) > 0 OR COUNT(DISTINCT c.Id) > 0 OR COUNT(DISTINCT b.Id) > 0
+),
+TopPosts AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.PostTypeId,
+        p.ParentId,
+        COALESCE(p.AcceptedAnswerId, 0) as AcceptedAnswerId,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN 'Question with Answers'
+            WHEN p.PostTypeId = 2 AND p.Score > 0 THEN 'Answer with Upvotes'
+            WHEN p.PostTypeId = 1 AND p.AnswerCount = 0 THEN 'Question without Answers'
+            ELSE 'Other'
+        END as PostCategory
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+PostWithVotes AS (
+    SELECT 
+        pp.PostId,
+        pp.Title,
+        pp.Score,
+        pp.ViewCount,
+        pp.CreationDate,
+        pp.OwnerUserId,
+        pp.Tags,
+        pp.AnswerCount,
+        pp.CommentCount,
+        pp.FavoriteCount,
+        pp.PostTypeId,
+        pp.ParentId,
+        pp.AcceptedAnswerId,
+        pp.PostCategory,
+        COUNT(v.Id) as TotalVotes,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) as UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) as DownVotes,
+        SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) as FavoriteVotes,
+        AVG(v.CreationDate) as AvgVoteDate
+    FROM TopPosts pp
+    LEFT JOIN Votes v ON pp.PostId = v.PostId
+    GROUP BY pp.PostId, pp.Title, pp.Score, pp.ViewCount, pp.CreationDate, pp.OwnerUserId, pp.Tags, pp.AnswerCount, pp.CommentCount, pp.FavoriteCount, pp.PostTypeId, pp.ParentId, pp.AcceptedAnswerId, pp.PostCategory
+),
+UserPerformance AS (
+    SELECT 
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.Views,
+        us.UpVotes,
+        us.DownVotes,
+        us.PostCount,
+        us.CommentCount,
+        us.BadgeCount,
+        us.LastPostDate,
+        ROW_NUMBER() OVER (ORDER BY us.Reputation DESC, us.PostCount DESC) as ReputationRank,
+        RANK() OVER (ORDER BY us.PostCount DESC) as PostRank,
+        DENSE_RANK() OVER (ORDER BY us.BadgeCount DESC) as BadgeRank
+    FROM UserStats us
+    WHERE us.PostCount > 0
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.IsRequired,
+        t.IsModeratorOnly,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as TagPopularityRank,
+        CASE 
+            WHEN t.Count > 100 THEN 'Highly Popular'
+            WHEN t.Count > 50 THEN 'Popular'
+            WHEN t.Count > 10 THEN 'Medium'
+            ELSE 'Low'
+        END as PopularityLevel,
+        CASE 
+            WHEN t.Count / (SELECT AVG("Count") FROM Tags) > 2 THEN 'Above Average'
+            WHEN t.Count / (SELECT AVG("Count") FROM Tags) > 1 THEN 'Average'
+            ELSE 'Below Average'
+        END as RelativePopularity
+    FROM Tags t
+    WHERE t.Count > 0
+),
+ComprehensivePostAnalysis AS (
+    SELECT 
+        pp.PostId,
+        pp.Title,
+        pp.Score,
+        pp.ViewCount,
+        pp.CreationDate,
+        pp.OwnerUserId,
+        pp.Tags,
+        pp.AnswerCount,
+        pp.CommentCount,
+        pp.FavoriteCount,
+        pp.PostTypeId,
+        pp.ParentId,
+        pp.AcceptedAnswerId,
+        pp.PostCategory,
+        pp.TotalVotes,
+        pp.UpVotes,
+        pp.DownVotes,
+        pp.FavoriteVotes,
+        pp.AvgVoteDate,
+        CASE 
+            WHEN pp.Score > 100 THEN 'Very High Score'
+            WHEN pp.Score > 50 THEN 'High Score'
+            WHEN pp.Score > 10 THEN 'Medium Score'
+            WHEN pp.Score > 0 THEN 'Low Score'
+            ELSE 'Negative Score'
+        END as ScoreTier,
+        CASE 
+            WHEN pp.ViewCount > 1000 THEN 'Very High Views'
+            WHEN pp.ViewCount > 500 THEN 'High Views'
+            WHEN pp.ViewCount > 100 THEN 'Medium Views'
+            WHEN pp.ViewCount > 10 THEN 'Low Views'
+            ELSE 'Minimal Views'
+        END as ViewTier,
+        CASE 
+            WHEN pp.TotalVotes > 100 THEN 'Very High Votes'
+            WHEN pp.TotalVotes > 50 THEN 'High Votes'
+            WHEN pp.TotalVotes > 10 THEN 'Medium Votes'
+            WHEN pp.TotalVotes > 0 THEN 'Low Votes'
+            ELSE 'No Votes'
+        END as VoteTier,
+        CASE 
+            WHEN pp.PostCategory = 'Question with Answers' AND pp.Score > 10 THEN 'High Engagement Question'
+            WHEN pp.PostCategory = 'Answer with Upvotes' AND pp.Score > 10 THEN 'High Engagement Answer'
+            ELSE 'Standard Post'
+        END as EngagementLevel,
+        (
+            pp.Score * 0.4 + 
+            pp.ViewCount * 0.3 + 
+            pp.TotalVotes * 0.2 + 
+            (CASE WHEN pp.AcceptedAnswerId > 0 THEN 10 ELSE 0 END) * 0.1
+        ) as WeightedScore,
+        EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - pp.CreationDate)) / 86400 as DaysSinceCreation,
+        (
+            SELECT COUNT(*) 
+            FROM UNNEST(string_to_array(pp.Tags, '><')) AS tag
+            WHERE tag != '' AND tag IS NOT NULL
+        ) as TagCount,
+        (SELECT COUNT(*) FROM UserPerformance up WHERE up.UserId = pp.OwnerUserId) as UserPerformanceRank,
+        CASE 
+            WHEN pp.TotalVotes > 0 THEN ROUND((CAST(pp.UpVotes AS FLOAT) / CAST(pp.TotalVotes AS FLOAT)) * 100, 2)
+            ELSE 0.00
+        END as UpVoteRatio,
+        (TIMESTAMP '2024-10-01 12:34:56' - pp.CreationDate) as TimeSinceCreation,
+        CASE WHEN (TIMESTAMP '2024-10-01 12:34:56' - pp.CreationDate) < INTERVAL '30 days' THEN 'Recent' ELSE 'Old' END as Recency
+    FROM PostWithVotes pp
+    WHERE pp.PostId IS NOT NULL AND pp.Title IS NOT NULL
+),
+FinalAnalysis AS (
+    SELECT 
+        cpa.PostId,
+        cpa.Title,
+        cpa.Score,
+        cpa.ViewCount,
+        cpa.CreationDate,
+        cpa.OwnerUserId,
+        cpa.Tags,
+        cpa.AnswerCount,
+        cpa.CommentCount,
+        cpa.FavoriteCount,
+        cpa.PostTypeId,
+        cpa.ParentId,
+        cpa.AcceptedAnswerId,
+        cpa.PostCategory,
+        cpa.TotalVotes,
+        cpa.UpVotes,
+        cpa.DownVotes,
+        cpa.FavoriteVotes,
+        cpa.AvgVoteDate,
+        cpa.ScoreTier,
+        cpa.ViewTier,
+        cpa.VoteTier,
+        cpa.EngagementLevel,
+        cpa.WeightedScore,
+        cpa.DaysSinceCreation,
+        cpa.TagCount,
+        cpa.UserPerformanceRank,
+        cpa.UpVoteRatio,
+        cpa.TimeSinceCreation,
+        cpa.Recency,
+        CONCAT(
+            'Post:', 
+            cpa.PostId::text,
+            ' Score:', 
+            cpa.Score::text, 
+            ' ViewCount:', 
+            cpa.ViewCount::text,
+            ' Tags:', 
+            cpa.TagCount::text,
+            ' Ratio:', 
+            CASE WHEN cpa.UpVoteRatio > 60 THEN 'High' ELSE 'Low' END
+        ) as ComplexIdentifier,
+        (SELECT COALESCE(SUM(b.Value), 0) FROM (
+            SELECT 1 as Value 
+            FROM Badges b 
+            WHERE b.UserId = cpa.OwnerUserId 
+            AND b.Date >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year')
+            UNION ALL
+            SELECT 1 as Value 
+            FROM Posts p 
+            WHERE p.OwnerUserId = cpa.OwnerUserId 
+            AND p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '3 month')
+        ) b) as RecentActivityScore,
+        (
+            SELECT COUNT(*) 
+            FROM PostHistory ph 
+            WHERE ph.PostId = cpa.PostId 
+            AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)
+            AND ph.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6 month')
+        ) as RecentEdits,
+        CASE 
+            WHEN cpa.Score > 50 AND cpa.ViewCount > 100 AND cpa.TotalVotes > 10 THEN 'High Impact'
+            WHEN cpa.Score > 25 OR cpa.ViewCount > 50 THEN 'Medium Impact'
+            ELSE 'Low Impact'
+        END as ImpactLevel,
+        ROW_NUMBER() OVER (ORDER BY cpa.WeightedScore DESC) as WeightedRank,
+        RANK() OVER (ORDER BY cpa.Score DESC) as ScoreRank,
+        DENSE_RANK() OVER (ORDER BY cpa.ViewCount DESC) as ViewRank,
+        COALESCE(cpa.Tags, '<No Tags>') as SafeTags,
+        COALESCE(cpa.Title, '<No Title>') as SafeTitle,
+        LENGTH(COALESCE(cpa.Tags, '')) as TagLength,
+        POSITION('python' IN LOWER(COALESCE(cpa.Tags, ''))) as PythonTagPosition,
+        EXTRACT(YEAR FROM cpa.CreationDate) as CreationYear,
+        EXTRACT(MONTH FROM cpa.CreationDate) as CreationMonth,
+        CASE 
+            WHEN (cpa.UpVotes - cpa.DownVotes) > 10 AND cpa.ViewCount > 100 THEN TRUE
+            ELSE FALSE
+        END as HighQualityIndicator,
+        (SELECT COUNT(*) FROM (
+            SELECT p1.Id as PostId FROM Posts p1 WHERE p1.OwnerUserId = cpa.OwnerUserId
+            UNION
+            SELECT p2.Id as PostId FROM Posts p2 WHERE p2.OwnerUserId = cpa.OwnerUserId AND p2.Score > 0
+        ) u) as CombinedPostCount
+    FROM ComprehensivePostAnalysis cpa
+    WHERE cpa.PostId IS NOT NULL
+)
+SELECT 
+    fa.PostId,
+    fa.Title,
+    fa.Score,
+    fa.ViewCount,
+    fa.CreationDate,
+    fa.OwnerUserId,
+    fa.Tags,
+    fa.AnswerCount,
+    fa.CommentCount,
+    fa.FavoriteCount,
+    fa.PostTypeId,
+    fa.ParentId,
+    fa.AcceptedAnswerId,
+    fa.PostCategory,
+    fa.TotalVotes,
+    fa.UpVotes,
+    fa.DownVotes,
+    fa.FavoriteVotes,
+    fa.AvgVoteDate,
+    fa.ScoreTier,
+    fa.ViewTier,
+    fa.VoteTier,
+    fa.EngagementLevel,
+    fa.WeightedScore,
+    fa.DaysSinceCreation,
+    fa.TagCount,
+    fa.UserPerformanceRank,
+    fa.UpVoteRatio,
+    fa.TimeSinceCreation,
+    fa.Recency,
+    fa.ComplexIdentifier,
+    fa.RecentActivityScore,
+    fa.RecentEdits,
+    fa.ImpactLevel,
+    fa.WeightedRank,
+    fa.ScoreRank,
+    fa.ViewRank,
+    fa.SafeTags,
+    fa.SafeTitle,
+    fa.TagLength,
+    fa.PythonTagPosition,
+    fa.CreationYear,
+    fa.CreationMonth,
+    fa.HighQualityIndicator,
+    fa.CombinedPostCount
+FROM FinalAnalysis fa
+WHERE fa.PostId IS NOT NULL
+    AND fa.ScoreTier IN ('High Score', 'Very High Score')
+    AND fa.ViewTier IN ('High Views', 'Very High Views')
+    AND fa.VoteTier IN ('High Votes', 'Very High Votes')
+ORDER BY fa.WeightedScore DESC, fa.CreationDate DESC
+LIMIT 1000;

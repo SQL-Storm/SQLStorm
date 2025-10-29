@@ -1,0 +1,153 @@
+WITH flagged_inactive_users AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.ProfileImageUrl,
+    u.EmailHash,
+    u.AccountId,
+    ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY u.LastAccessDate DESC) AS rn
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.UserId = u.Id
+  LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+  WHERE u.LastAccessDate < CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180 days'
+    OR (u.Views < 10 AND u.Reputation < 100)
+),
+recent_high_activity AS (
+  SELECT
+    u.Id AS UserId,
+    COUNT(p.Id) AS post_count,
+    MAX(p.CreationDate) AS last_post_date
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id
+  HAVING COUNT(p.Id) >= 5
+),
+top_tags AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS tag_count
+  FROM Tags t
+  WHERE t.TagName IS NOT NULL
+  GROUP BY t.TagName
+  ORDER BY COUNT(*) DESC
+  LIMIT 5
+),
+complex_post_insight AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.PostTypeId,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.OwnerUserId,
+    COALESCE(p.AcceptedAnswerId, -1) AS AcceptedAnswerId,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCount,
+    (SELECT COUNT(*) FROM Votes v2 WHERE v2.PostId = p.Id AND v2.VoteTypeId = 2) AS UpVotesForPost,
+    (SELECT COUNT(*) FROM Votes v3 WHERE v3.PostId = p.Id AND v3.VoteTypeId = 3) AS DownVotesForPost,
+    STRING_AGG(DISTINCT CAST(tt.Id AS varchar) || ':' || tt.Name, ',') AS VoteTypesAvailable
+  FROM Posts p
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  LEFT JOIN VoteTypes tt ON v.VoteTypeId = tt.Id
+  GROUP BY p.Id, p.Title, p.PostTypeId, p.Score, p.ViewCount, p.CreationDate, p.LastActivityDate, p.OwnerUserId, p.AcceptedAnswerId
+),
+joined_activity AS (
+  SELECT
+    c.PostId,
+    c.Title,
+    c.PostTypeId,
+    c.Score,
+    c.ViewCount,
+    c.CreationDate,
+    c.LastActivityDate,
+    c.OwnerUserId,
+    c.AcceptedAnswerId,
+    c.CommentCount,
+    c.UpVotesForPost,
+    c.DownVotesForPost,
+    c.VoteTypesAvailable,
+    l.RelatedPostId,
+    lt.Name AS LinkTypeName
+  FROM complex_post_insight c
+  LEFT JOIN PostLinks l ON l.PostId = c.PostId
+  LEFT JOIN LinkTypes lt ON l.LinkTypeId = lt.Id
+),
+windowed AS (
+  SELECT
+    ja.PostId,
+    ja.Title,
+    ja.PostTypeId,
+    ja.Score,
+    ja.ViewCount,
+    ja.CreationDate,
+    ja.LastActivityDate,
+    ja.OwnerUserId,
+    ja.AcceptedAnswerId,
+    ja.CommentCount,
+    ja.UpVotesForPost,
+    ja.DownVotesForPost,
+    ja.VoteTypesAvailable,
+    ja.RelatedPostId,
+    ja.LinkTypeName,
+    ROW_NUMBER() OVER (
+      PARTITION BY ja.OwnerUserId
+      ORDER BY ja.LastActivityDate DESC, ja.Score DESC
+    ) AS rn_user
+  FROM joined_activity ja
+),
+final AS (
+  SELECT
+    w.PostId,
+    w.Title,
+    w.PostTypeId,
+    w.Score,
+    w.ViewCount,
+    w.CreationDate,
+    w.LastActivityDate,
+    w.OwnerUserId,
+    w.AcceptedAnswerId,
+    w.CommentCount,
+    w.UpVotesForPost,
+    w.DownVotesForPost,
+    w.VoteTypesAvailable,
+    w.RelatedPostId,
+    w.LinkTypeName,
+    ph.PostHistoryTypeId AS HistoryTypeId,
+    ph.Text AS HistoryText,
+    ph.CreationDate AS HistoryDate,
+    ph.UserId AS HistoryUser
+  FROM windowed w
+  LEFT JOIN PostHistory ph ON ph.PostId = w.PostId
+  WHERE w.rn_user <= 3
+)
+SELECT
+  f.PostId,
+  f.Title,
+  f.PostTypeId,
+  f.Score,
+  f.ViewCount,
+  f.CreationDate,
+  f.LastActivityDate,
+  f.OwnerUserId,
+  f.AcceptedAnswerId,
+  f.CommentCount,
+  f.UpVotesForPost,
+  f.DownVotesForPost,
+  f.VoteTypesAvailable,
+  f.RelatedPostId,
+  f.LinkTypeName,
+  f.HistoryTypeId,
+  f.HistoryText,
+  f.HistoryDate,
+  f.HistoryUser
+FROM final f
+ORDER BY f.LastActivityDate DESC, f.Score DESC
+LIMIT 100;

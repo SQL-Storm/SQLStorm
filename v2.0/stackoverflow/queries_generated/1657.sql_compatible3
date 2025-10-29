@@ -1,0 +1,166 @@
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.DisplayName,
+        U.Location,
+        U.AboutMe,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS UserTotalUpVotes,
+        U.DownVotes AS UserTotalDownVotes,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestionsOwned,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswersOwned,
+        COALESCE(SUM(P.Score), 0) AS TotalPostsScore,
+        COALESCE(AVG(P.Score), 0.0) AS AvgPostsScore,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        (SELECT COUNT(DISTINCT TagName)
+         FROM (
+             SELECT TRIM(t) AS TagName
+             FROM Posts P_inner,
+             UNNEST(STRING_TO_ARRAY(SUBSTRING(P_inner.Tags FROM 2 FOR CHAR_LENGTH(P_inner.Tags) - 2), '><')) AS t
+             WHERE P_inner.OwnerUserId = U.Id
+               AND P_inner.PostTypeId = 1
+               AND P_inner.Tags IS NOT NULL
+         ) sub
+        ) AS UniqueQuestionTagsUsed,
+        COUNT(DISTINCT B.Id) AS TotalBadgesEarned,
+        MAX(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) = 1 AS HasGoldBadge
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.Reputation, U.CreationDate, U.LastAccessDate, U.DisplayName, U.Location, U.AboutMe, U.Views, U.UpVotes, U.DownVotes
+),
+PostEngagementAndHistory AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount AS PostViewCount,
+        COALESCE(P.AnswerCount, 0) AS PostAnswerCount,
+        P.CommentCount AS PostCommentCount,
+        COALESCE(P.FavoriteCount, 0) AS PostFavoriteCount,
+        P.LastActivityDate,
+        P.ClosedDate,
+        COALESCE(P.Title, 'No Title - ' || SUBSTRING(P.Body FROM 1 FOR 50)) AS PostTitleSnippet,
+        CASE WHEN P.Tags IS NOT NULL AND CHAR_LENGTH(P.Tags) > 2 THEN STRING_TO_ARRAY(SUBSTRING(P.Tags FROM 2 FOR CHAR_LENGTH(P.Tags) - 2), '><') ELSE ARRAY[]::text[] END AS ParsedTags,
+        COALESCE(
+            (SELECT COUNT(DISTINCT PH.Id)
+             FROM PostHistory PH
+             WHERE PH.PostId = P.Id
+               AND PH.PostHistoryTypeId IN (4, 5, 6)), 0
+        ) AS TotalEditHistoryEvents,
+        COALESCE(
+            (SELECT COUNT(DISTINCT PH.Id)
+             FROM PostHistory PH
+             WHERE PH.PostId = P.Id
+               AND PH.PostHistoryTypeId = 10), 0
+        ) AS CloseEventsCount,
+        COALESCE(
+            (SELECT COUNT(DISTINCT PH.Id)
+             FROM PostHistory PH
+             WHERE PH.PostId = P.Id
+               AND PH.PostHistoryTypeId = 11), 0
+        ) AS ReopenEventsCount,
+        COALESCE(
+            (SELECT COUNT(DISTINCT PL.RelatedPostId)
+             FROM PostLinks PL
+             WHERE PL.PostId = P.Id AND PL.LinkTypeId = 1), 0
+        ) AS LinkedQuestionsCount,
+        COALESCE(
+            (SELECT COUNT(DISTINCT PL.RelatedPostId)
+             FROM PostLinks PL
+             WHERE PL.PostId = P.Id AND PL.LinkTypeId = 3), 0
+        ) AS DuplicateQuestionsCount,
+        MAX(CASE WHEN V.VoteTypeId = 2 THEN V.CreationDate ELSE NULL END) AS LastUpVoteDate,
+        MIN(CASE WHEN V.VoteTypeId = 3 THEN V.CreationDate ELSE NULL END) AS FirstDownVoteDate
+    FROM Posts P
+    LEFT JOIN Votes V ON P.Id = V.PostId
+    WHERE P.PostTypeId = 1
+    GROUP BY P.Id, P.PostTypeId, P.OwnerUserId, P.CreationDate, P.Score, P.ViewCount, P.AnswerCount,
+             P.CommentCount, P.FavoriteCount, P.LastActivityDate, P.ClosedDate, P.Title, P.Body, P.Tags
+),
+RankedQuestions AS (
+    SELECT
+        PEH.PostId,
+        PEH.OwnerUserId,
+        PEH.PostScore,
+        PEH.PostViewCount,
+        PEH.PostFavoriteCount,
+        PEH.PostAnswerCount,
+        PEH.PostCommentCount,
+        PEH.PostCreationDate,
+        PEH.TotalEditHistoryEvents,
+        PEH.CloseEventsCount,
+        PEH.ReopenEventsCount,
+        PEH.LastActivityDate,
+        PEH.PostTitleSnippet,
+        COALESCE(PEH.ParsedTags[1], 'no-primary-tag') AS PrimaryTag,
+        DENSE_RANK() OVER (PARTITION BY PEH.OwnerUserId ORDER BY PEH.PostScore DESC, PEH.PostViewCount DESC) AS UserQuestionRankByScore,
+        NTILE(4) OVER (ORDER BY PEH.PostScore DESC, PEH.PostViewCount DESC) AS PostScoreViewQuartile
+    FROM PostEngagementAndHistory PEH
+    WHERE PEH.PostScore > 50 AND PEH.PostViewCount > 1000
+      AND PEH.TotalEditHistoryEvents >= 3
+      AND COALESCE(array_length(PEH.ParsedTags, 1), 0) > 0
+),
+PopularTagStats AS (
+    SELECT
+        T.TagName,
+        T.Count AS TagGlobalUseCount,
+        T.IsModeratorOnly,
+        T.IsRequired,
+        COALESCE(AVG(RQ.PostScore), 0.0) AS AvgRankedQuestionScore,
+        COALESCE(AVG(RQ.PostViewCount), 0.0) AS AvgRankedQuestionViewCount,
+        COUNT(RQ.PostId) AS RankedQuestionCount
+    FROM RankedQuestions RQ
+    JOIN Tags T ON RQ.PrimaryTag = T.TagName
+    GROUP BY T.TagName, T.Count, T.IsModeratorOnly, T.IsRequired
+    HAVING COUNT(RQ.PostId) >= 5
+)
+SELECT
+    UAS.UserId,
+    UAS.Reputation,
+    UAS.UserCreationDate,
+    UAS.DisplayName,
+    UAS.TotalQuestionsOwned,
+    UAS.TotalAnswersOwned,
+    UAS.TotalBadgesEarned,
+    UAS.HasGoldBadge,
+    RQ.PostId,
+    RQ.PostTitleSnippet,
+    RQ.PostScore,
+    RQ.PostViewCount,
+    RQ.PostFavoriteCount,
+    RQ.PrimaryTag,
+    PTS.TagGlobalUseCount,
+    PTS.AvgRankedQuestionScore AS PrimaryTagAvgRankedQScore,
+    PTS.RankedQuestionCount AS PrimaryTagRankedQCount,
+    RQ.TotalEditHistoryEvents,
+    RQ.CloseEventsCount,
+    RQ.ReopenEventsCount,
+    RQ.UserQuestionRankByScore,
+    RQ.PostScoreViewQuartile,
+    CASE
+        WHEN (RQ.CloseEventsCount > 0 AND RQ.ReopenEventsCount > 0) THEN 'Closed and Reopened'
+        WHEN RQ.CloseEventsCount > 0 THEN 'Closed'
+        WHEN RQ.ReopenEventsCount > 0 THEN 'Reopened'
+        ELSE 'Never Closed/Reopened'
+    END AS ClosureStatus,
+    EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - RQ.PostCreationDate)) / (60.0 * 60 * 24 * 365.25) AS PostAgeYears,
+    COALESCE(UAS.Location, 'Unknown') AS UserLocation,
+    NULLIF(CHAR_LENGTH(UAS.AboutMe), 0) AS AboutMeLength,
+    (SELECT MAX(B2.Date) FROM Badges B2 WHERE B2.UserId = UAS.UserId AND B2.Class = 1) AS LatestGoldBadgeDate
+FROM UserActivitySummary UAS
+JOIN RankedQuestions RQ ON UAS.UserId = RQ.OwnerUserId
+LEFT JOIN PopularTagStats PTS ON RQ.PrimaryTag = PTS.TagName
+WHERE UAS.Reputation >= 1000
+  AND RQ.UserQuestionRankByScore <= 5
+  AND EXISTS (SELECT 1 FROM Badges B WHERE B.UserId = UAS.UserId AND B.Class IN (1, 2))
+  AND NOT COALESCE(PTS.IsModeratorOnly, FALSE)
+ORDER BY UAS.Reputation DESC, RQ.PostScore DESC, RQ.PostViewCount DESC
+LIMIT 500;

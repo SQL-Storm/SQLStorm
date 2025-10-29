@@ -1,0 +1,130 @@
+WITH latest_posts AS (
+    SELECT 
+        p.OwnerUserId,
+        p.Id AS PostId,
+        p.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+),
+user_badge_summary AS (
+    SELECT 
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS gold_cnt,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS silver_cnt,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS bronze_cnt,
+        STRING_AGG(DISTINCT b.Name, ', ') AS badge_names
+    FROM Badges b
+    GROUP BY b.UserId
+),
+user_vote_summary AS (
+    SELECT 
+        v.PostId,
+        SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS up_votes,
+        SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS down_votes
+    FROM Votes v
+    JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    GROUP BY v.PostId
+),
+-- Split tags without UNNEST: use a recursive CTE to split string by '><' delimiter and trim < and >
+split_tags AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        TRIM(BOTH '<>' FROM p.Tags) AS tags_trimmed
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+),
+recursive_split AS (
+    SELECT
+        PostId,
+        OwnerUserId,
+        CASE
+            WHEN tags_trimmed = '' THEN NULL
+            WHEN INSTR(tags_trimmed, '><') = 0 THEN tags_trimmed
+            ELSE SUBSTR(tags_trimmed, 1, CASE WHEN INSTR(tags_trimmed, '><') = 0 THEN LENGTH(tags_trimmed) ELSE INSTR(tags_trimmed, '><') - 1 END)
+        END AS tag,
+        CASE
+            WHEN tags_trimmed = '' THEN ''
+            WHEN INSTR(tags_trimmed, '><') = 0 THEN ''
+            ELSE SUBSTR(tags_trimmed, INSTR(tags_trimmed, '><') + 2)
+        END AS rest
+    FROM split_tags
+    UNION ALL
+    SELECT
+        rs.PostId,
+        rs.OwnerUserId,
+        CASE
+            WHEN rs.rest = '' THEN NULL
+            WHEN INSTR(rs.rest, '><') = 0 THEN rs.rest
+            ELSE SUBSTR(rs.rest, 1, INSTR(rs.rest, '><') - 1)
+        END AS tag,
+        CASE
+            WHEN rs.rest = '' THEN ''
+            WHEN INSTR(rs.rest, '><') = 0 THEN ''
+            ELSE SUBSTR(rs.rest, INSTR(rs.rest, '><') + 2)
+        END AS rest
+    FROM recursive_split rs
+    WHERE rs.rest <> ''
+),
+question_tag_stats AS (
+    SELECT 
+        OwnerUserId,
+        tag,
+        COUNT(*) AS question_cnt
+    FROM recursive_split
+    WHERE tag IS NOT NULL AND tag <> ''
+    GROUP BY OwnerUserId, tag
+),
+top_tags_per_user AS (
+    SELECT 
+        qts.OwnerUserId,
+        STRING_AGG(qts.tag || ':' || CAST(qts.question_cnt AS VARCHAR), ', ') AS tag_summary
+    FROM (
+        SELECT *,
+               ROW_NUMBER() OVER (PARTITION BY OwnerUserId ORDER BY question_cnt DESC, tag) AS rn
+        FROM question_tag_stats
+    ) qts
+    WHERE qts.rn <= 5
+    GROUP BY qts.OwnerUserId
+)
+
+SELECT 
+    u.Id                                   AS UserId,
+    u.DisplayName,
+    COALESCE(ubs.gold_cnt, 0)               AS GoldBadges,
+    COALESCE(ubs.silver_cnt, 0)             AS SilverBadges,
+    COALESCE(ubs.bronze_cnt, 0)             AS BronzeBadges,
+    COALESCE(ubs.badge_names, '')           AS BadgeList,
+    lp.PostId                               AS LatestPostId,
+    lp.CreationDate                         AS LatestPostDate,
+    COALESCE(vs.up_votes, 0)                AS LatestPostUpVotes,
+    COALESCE(vs.down_votes, 0)              AS LatestPostDownVotes,
+    COALESCE(tt.tag_summary, '')            AS TopTags,
+    RANK() OVER (ORDER BY COALESCE(ubs.gold_cnt,0) DESC,
+                            COALESCE(ubs.silver_cnt,0) DESC) AS ReputationRank
+FROM Users u
+LEFT JOIN user_badge_summary ubs ON u.Id = ubs.UserId
+LEFT JOIN latest_posts lp       ON u.Id = lp.OwnerUserId AND lp.rn = 1
+LEFT JOIN user_vote_summary vs ON lp.PostId = vs.PostId
+LEFT JOIN top_tags_per_user tt ON u.Id = tt.OwnerUserId
+WHERE u.Reputation > 10000
+
+UNION ALL
+
+SELECT 
+    NULL                                    AS UserId,
+    'Aggregate'                             AS DisplayName,
+    SUM(COALESCE(ubs.gold_cnt,0))            AS GoldBadges,
+    SUM(COALESCE(ubs.silver_cnt,0))          AS SilverBadges,
+    SUM(COALESCE(ubs.bronze_cnt,0))          AS BronzeBadges,
+    NULL                                     AS BadgeList,
+    NULL                                     AS LatestPostId,
+    NULL                                     AS LatestPostDate,
+    NULL                                     AS LatestPostUpVotes,
+    NULL                                     AS LatestPostDownVotes,
+    NULL                                     AS TopTags,
+    NULL                                     AS ReputationRank
+FROM Users u
+LEFT JOIN user_badge_summary ubs ON u.Id = ubs.UserId
+WHERE u.Reputation > 10000;

@@ -1,0 +1,271 @@
+-- {"query": "7173.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2439} 
+WITH UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.CreationDate,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        MAX(b.Date) AS LastBadgeDate,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+                DATEDIFF(cast('2024-10-01 12:34:56' as timestamp), MAX(p.CreationDate)) 
+            ELSE NULL 
+        END AS DaysSinceLastPost,
+        CASE 
+            WHEN COUNT(DISTINCT b.Id) > 0 THEN 
+                DATEDIFF(cast('2024-10-01 12:34:56' as timestamp), MAX(b.Date)) 
+            ELSE NULL 
+        END AS DaysSinceLastBadge
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.AccountId IS NOT NULL
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.CreationDate
+),
+RankedUsers AS (
+    SELECT 
+        *,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, PostCount DESC) AS RankByRepAndPosts,
+        DENSE_RANK() OVER (ORDER BY Reputation DESC) AS RankByRep,
+        NTILE(100) OVER (ORDER BY Reputation) AS PercentileRank
+    FROM UserActivity
+),
+PostStats AS (
+    SELECT 
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ParentId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 
+                (SELECT COUNT(*) FROM Posts WHERE ParentId = p.Id AND PostTypeId = 2 AND Score > 0)
+            ELSE NULL 
+        END AS PositiveAnswerCount,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 
+                (SELECT COUNT(*) FROM Posts WHERE ParentId = p.Id AND PostTypeId = 2) 
+            ELSE NULL 
+        END AS TotalAnswerCount,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 
+                (SELECT AVG(Score) FROM Posts WHERE ParentId = p.Id AND PostTypeId = 2)
+            ELSE NULL 
+        END AS AvgAnswerScore,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 
+                (SELECT COUNT(*) FROM Comments WHERE PostId = p.Id)
+            ELSE NULL 
+        END AS CommentCountOnQuestion,
+        DATEDIFF(cast('2024-10-01 12:34:56' as timestamp), p.CreationDate) AS AgeDays,
+        CASE 
+            WHEN p.Score > 10 THEN 'HighlyVoted'
+            WHEN p.Score > 5 THEN 'ModeratelyVoted'
+            WHEN p.Score > 0 THEN 'LowVoted'
+            ELSE 'NoVotes'
+        END AS VoteCategory
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+CombinedAnalysis AS (
+    SELECT 
+        ru.UserId,
+        ru.DisplayName,
+        ru.Reputation,
+        ru.PostCount,
+        ru.CommentCount,
+        ru.BadgeCount,
+        ru.DaysSinceLastPost,
+        ru.DaysSinceLastBadge,
+        ru.RankByRep,
+        ru.RankByRepAndPosts,
+        ru.PercentileRank,
+        ps.PostId,
+        ps.PostTypeId,
+        ps.Score,
+        ps.ViewCount,
+        ps.Title,
+        ps.Tags,
+        ps.AnswerCount,
+        ps.CommentCountOnQuestion,
+        ps.PositiveAnswerCount,
+        ps.TotalAnswerCount,
+        ps.AvgAnswerScore,
+        ps.AgeDays,
+        ps.VoteCategory,
+        ROW_NUMBER() OVER (PARTITION BY ru.UserId ORDER BY ps.CreationDate DESC) AS RecentPostRank,
+        CASE 
+            WHEN ps.PostTypeId = 1 AND ps.AnswerCount > 0 THEN 
+                (ps.Score * 1.0) / (ps.AnswerCount + 1)
+            ELSE NULL 
+        END AS ScorePerAnswer,
+        CASE 
+            WHEN ps.PostTypeId = 1 AND ps.CommentCountOnQuestion > 0 THEN 
+                (ps.Score * 1.0) / (ps.CommentCountOnQuestion + 1)
+            ELSE NULL 
+        END AS ScorePerComment
+    FROM RankedUsers ru
+    INNER JOIN PostStats ps ON ru.UserId = ps.OwnerUserId
+    WHERE ps.AgeDays <= 365
+),
+ComplexAggregations AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        PostCount,
+        CommentCount,
+        BadgeCount,
+        DaysSinceLastPost,
+        DaysSinceLastBadge,
+        RankByRep,
+        RankByRepAndPosts,
+        PercentileRank,
+        AVG(Score) AS AvgPostScore,
+        AVG(ViewCount) AS AvgViewCount,
+        AVG(AgeDays) AS AvgPostAge,
+        SUM(PostCount) OVER (ORDER BY Reputation DESC) AS CumulativePostCount,
+        COUNT(*) OVER () AS TotalUsers,
+        COUNT(DISTINCT PostId) AS DistinctPosts,
+        MAX(Score) AS MaxScore,
+        MIN(ViewCount) AS MinViews,
+        COUNT(CASE WHEN VoteCategory = 'HighlyVoted' THEN 1 END) AS HighlyVotedPosts,
+        COUNT(CASE WHEN VoteCategory = 'ModeratelyVoted' THEN 1 END) AS ModeratelyVotedPosts,
+        COUNT(CASE WHEN VoteCategory = 'LowVoted' THEN 1 END) AS LowVotedPosts,
+        COUNT(CASE WHEN VoteCategory = 'NoVotes' THEN 1 END) AS NoVotedPosts,
+        COUNT(CASE WHEN PositiveAnswerCount IS NOT NULL AND PositiveAnswerCount > 0 THEN 1 END) AS QuestionsWithPositiveAnswers,
+        AVG(AvgAnswerScore) AS AvgAnswerScoreAcrossQuestions,
+        COUNT(CASE WHEN ScorePerAnswer > 10 THEN 1 END) AS HighScorePerAnswerQuestions,
+        COUNT(CASE WHEN ScorePerComment > 5 THEN 1 END) AS HighScorePerCommentQuestions
+    FROM CombinedAnalysis
+    WHERE PostTypeId IN (1, 2)
+    GROUP BY UserId, DisplayName, Reputation, PostCount, CommentCount, BadgeCount, DaysSinceLastPost, DaysSinceLastBadge,
+             RankByRep, RankByRepAndPosts, PercentileRank
+),
+UserWithPosts AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate AS PostCreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 
+                (SELECT COUNT(*) FROM Posts WHERE ParentId = p.Id)
+            ELSE 0 
+        END AS TotalAnswersToPost,
+        DENSE_RANK() OVER (PARTITION BY u.Id ORDER BY p.CreationDate DESC) AS RecentPostNumber
+    FROM Users u
+    INNER JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Id IN (SELECT UserId FROM ComplexAggregations WHERE Reputation > 5000)
+),
+FinalResults AS (
+    SELECT 
+        ca.UserId,
+        ca.DisplayName,
+        ca.Reputation,
+        ca.PostCount,
+        ca.CommentCount,
+        ca.BadgeCount,
+        ca.DaysSinceLastPost,
+        ca.DaysSinceLastBadge,
+        ca.RankByRep,
+        ca.RankByRepAndPosts,
+        ca.PercentileRank,
+        ca.PostId,
+        ca.PostTypeId,
+        ca.Score,
+        ca.ViewCount,
+        ca.Title,
+        ca.Tags,
+        ca.AnswerCount,
+        ca.CommentCountOnQuestion,
+        ca.PositiveAnswerCount,
+        ca.TotalAnswerCount,
+        ca.AvgAnswerScore,
+        ca.AgeDays,
+        ca.VoteCategory,
+        ca.ScorePerAnswer,
+        ca.ScorePerComment,
+        (SELECT AVG(Score) FROM Posts WHERE OwnerUserId = ca.UserId) AS UserAvgScore,
+        (SELECT AVG(ViewCount) FROM Posts WHERE OwnerUserId = ca.UserId) AS UserAvgViews,
+        CASE 
+            WHEN ca.Score > (SELECT AVG(Score) FROM Posts WHERE OwnerUserId = ca.UserId) * 1.5 THEN 'AboveAverage'
+            WHEN ca.Score > (SELECT AVG(Score) FROM Posts WHERE OwnerUserId = ca.UserId) THEN 'Average'
+            ELSE 'BelowAverage'
+        END AS ScoreTier,
+        LAG(ca.Score, 1) OVER (PARTITION BY ca.UserId ORDER BY ca.CreationDate) AS PreviousPostScore,
+        LAG(ca.Title, 1) OVER (PARTITION BY ca.UserId ORDER BY ca.CreationDate) AS PreviousPostTitle,
+        (
+            SELECT COUNT(*) FROM Posts p2 
+            WHERE p2.OwnerUserId = ca.UserId 
+            AND p2.CreationDate BETWEEN ca.CreationDate AND DATE_ADD(ca.CreationDate, INTERVAL 30 DAY)
+        ) AS PostsInPeriod,
+        CASE 
+            WHEN ca.CommentCountOnQuestion IS NOT NULL AND ca.CommentCountOnQuestion > 0 THEN 
+                ca.CommentCountOnQuestion * 1.0 / NULLIF(ca.ViewCount, 0)
+            ELSE NULL 
+        END AS CommentToViewRatio
+    FROM CombinedAnalysis ca
+    WHERE ca.PostTypeId = 1
+)
+SELECT 
+    UserId,
+    DisplayName,
+    Reputation,
+    PostCount,
+    CommentCount,
+    BadgeCount,
+    DaysSinceLastPost,
+    DaysSinceLastBadge,
+    RankByRep,
+    RankByRepAndPosts,
+    PercentileRank,
+    AVG(Score) AS AvgPostScore,
+    AVG(ViewCount) AS AvgViewCount,
+    AVG(AgeDays) AS AvgPostAge,
+    SUM(PostCount) OVER (ORDER BY Reputation DESC) AS CumulativePostCount,
+    COUNT(*) OVER () AS TotalUsers,
+    COUNT(DISTINCT PostId) AS DistinctPosts,
+    MAX(Score) AS MaxScore,
+    MIN(ViewCount) AS MinViews,
+    COUNT(CASE WHEN VoteCategory = 'HighlyVoted' THEN 1 END) AS HighlyVotedPosts,
+    COUNT(CASE WHEN VoteCategory = 'ModeratelyVoted' THEN 1 END) AS ModeratelyVotedPosts,
+    COUNT(CASE WHEN VoteCategory = 'LowVoted' THEN 1 END) AS LowVotedPosts,
+    COUNT(CASE WHEN VoteCategory = 'NoVotes' THEN 1 END) AS NoVotedPosts,
+    COUNT(CASE WHEN PositiveAnswerCount IS NOT NULL AND PositiveAnswerCount > 0 THEN 1 END) AS QuestionsWithPositiveAnswers,
+    AVG(AvgAnswerScore) AS AvgAnswerScoreAcrossQuestions,
+    COUNT(CASE WHEN ScorePerAnswer > 10 THEN 1 END) AS HighScorePerAnswerQuestions,
+    COUNT(CASE WHEN ScorePerComment > 5 THEN 1 END) AS HighScorePerCommentQuestions
+FROM FinalResults
+GROUP BY 
+    UserId, DisplayName, Reputation, PostCount, CommentCount, BadgeCount, DaysSinceLastPost, DaysSinceLastBadge,
+    RankByRep, RankByRepAndPosts, PercentileRank
+HAVING 
+    COUNT(DISTINCT PostId) > 0
+    AND Reputation BETWEEN 1000 AND 100000
+ORDER BY 
+    Reputation DESC, PostCount DESC
+LIMIT 1000;

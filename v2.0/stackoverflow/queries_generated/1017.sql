@@ -1,0 +1,169 @@
+-- {"query": "1017.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2493} 
+
+WITH UserEngagement AS (
+    -- Aggregates various metrics for each user, including post counts, comment counts, and average scores on their posts.
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT PA.Id) AS TotalAnswersOwned,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN V.VoteTypeId = 2 AND P.OwnerUserId = U.Id THEN 1 ELSE 0 END) AS TotalUpvotesOnOwnPosts,
+        AVG(P.Score) AS AvgScoreOfOwnedPosts,
+        DATE_PART('day', CURRENT_TIMESTAMP - U.CreationDate) AS DaysSinceUserCreation
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Posts PA ON U.Id = PA.OwnerUserId AND PA.PostTypeId = 2
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Votes V ON P.Id = V.PostId AND V.VoteTypeId = 2 -- Only consider upvotes for posts owned by the user
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate
+),
+PostHistoryAgg AS (
+    -- Summarizes historical revision data for each post, including edit counts and initial body length.
+    SELECT
+        PH.PostId,
+        COUNT(PH.Id) AS TotalHistoryEvents,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9) THEN PH.Id END) AS EditRevisionCount, -- Title, Body, Tags edits/rollbacks
+        COUNT(DISTINCT PH.UserId) AS UniqueHistoryContributors,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN 'Closed' ELSE NULL END) AS IsClosedViaHistory, -- Check if any close event exists
+        MIN(CASE WHEN PH.PostHistoryTypeId = 2 THEN LENGTH(PH.Text) END) AS InitialBodyCharCount, -- Length of initial body
+        MAX(PH.CreationDate) AS LastHistoryDate
+    FROM PostHistory PH
+    GROUP BY PH.PostId
+),
+PostRelationshipsAgg AS (
+    -- Combines all outgoing and incoming post links (linked and duplicate) using UNION ALL to analyze overall relationship density.
+    SELECT
+        PostId,
+        SUM(CASE WHEN LinkTypeId = 1 THEN 1 ELSE 0 END) AS OutgoingLinkedCount,
+        SUM(CASE WHEN LinkTypeId = 3 THEN 1 ELSE 0 END) AS OutgoingDuplicateCount,
+        SUM(CASE WHEN LinkTypeId IN (1, 3) THEN 1 ELSE 0 END) AS TotalOutgoingLinks,
+        0 AS IncomingLinkedCount,
+        0 AS IncomingDuplicateCount,
+        0 AS TotalIncomingLinks
+    FROM PostLinks
+    GROUP BY PostId
+
+    UNION ALL -- Set operator to combine outgoing and incoming link information
+
+    SELECT
+        RelatedPostId AS PostId,
+        0 AS OutgoingLinkedCount,
+        0 AS OutgoingDuplicateCount,
+        0 AS TotalOutgoingLinks,
+        SUM(CASE WHEN LinkTypeId = 1 THEN 1 ELSE 0 END) AS IncomingLinkedCount,
+        SUM(CASE WHEN LinkTypeId = 3 THEN 1 ELSE 0 END) AS IncomingDuplicateCount,
+        SUM(CASE WHEN LinkTypeId IN (1, 3) THEN 1 ELSE 0 END) AS TotalIncomingLinks
+    FROM PostLinks
+    GROUP BY RelatedPostId
+),
+CombinedPostLinkSummary AS (
+    -- Provides a consolidated summary of all link types (incoming/outgoing, linked/duplicate) for each post.
+    SELECT
+        PostId,
+        SUM(OutgoingLinkedCount) AS TotalOutgoingLinked,
+        SUM(OutgoingDuplicateCount) AS TotalOutgoingDuplicate,
+        SUM(TotalOutgoingLinks) AS TotalOutgoing,
+        SUM(IncomingLinkedCount) AS TotalIncomingLinked,
+        SUM(IncomingDuplicateCount) AS TotalIncomingDuplicate,
+        SUM(TotalIncomingLinks) AS TotalIncoming
+    FROM PostRelationshipsAgg
+    GROUP BY PostId
+),
+QuestionAnalysis AS (
+    -- Core analysis for questions, incorporating window functions, correlated subqueries for bounty data, and keyword checks.
+    SELECT
+        P.Id AS QuestionId,
+        P.Title AS QuestionTitle,
+        P.OwnerUserId,
+        P.CreationDate AS QuestionCreationDate,
+        P.Score AS QuestionScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.AcceptedAnswerId,
+        P.LastActivityDate,
+        P.LastEditDate,
+        P.ClosedDate,
+        P.Body AS QuestionBody,
+        STRING_TO_ARRAY(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><') AS TagArray, -- String function for tags
+        CASE
+            WHEN P.Body ILIKE '%performance%' OR P.Body ILIKE '%optimization%' OR P.Title ILIKE '%slow query%' THEN TRUE
+            ELSE FALSE
+        END AS ContainsPerformanceKeywords, -- Complicated predicate/string expression
+        (SELECT AVG(CAST(V_Sub.BountyAmount AS NUMERIC))
+         FROM Votes V_Sub WHERE V_Sub.PostId = P.Id AND V_Sub.VoteTypeId = 8) AS AverageBountyAmount, -- Correlated subquery for average bounty
+        ROW_NUMBER() OVER(PARTITION BY P.OwnerUserId ORDER BY P.CreationDate DESC) AS UserQuestionRank, -- Window function
+        LAG(P.Score, 1, 0) OVER(PARTITION BY P.OwnerUserId ORDER BY P.CreationDate) AS PreviousQuestionScore, -- Window function: LAG
+        SUM(P.Score) OVER(PARTITION BY P.OwnerUserId ORDER BY P.CreationDate) AS CumulativeUserQuestionScore, -- Window function: Cumulative SUM
+        NTILE(4) OVER (ORDER BY P.Score DESC) AS ScoreQuartile -- Window function: NTILE
+    FROM Posts P
+    WHERE P.PostTypeId = 1 -- Only questions
+)
+SELECT
+    QA.QuestionId,
+    QA.QuestionTitle,
+    U_Owner.DisplayName AS QuestionOwnerDisplayName,
+    U_Owner.Reputation AS QuestionOwnerReputation,
+    QA.QuestionScore,
+    QA.ViewCount,
+    QA.AnswerCount,
+    QA.CommentCount,
+    QA.FavoriteCount,
+    QA.ContainsPerformanceKeywords,
+    QA.AverageBountyAmount,
+    QA.UserQuestionRank,
+    QA.PreviousQuestionScore,
+    QA.CumulativeUserQuestionScore,
+    QA.ScoreQuartile,
+    UE.TotalPostsOwned,
+    UE.TotalCommentsMade,
+    UE.AvgScoreOfOwnedPosts,
+    PHA.EditRevisionCount,
+    PHA.UniqueHistoryContributors,
+    PHA.IsClosedViaHistory,
+    PHA.InitialBodyCharCount,
+    LENGTH(QA.QuestionBody) AS CurrentBodyCharCount,
+    DATE_PART('hour', CURRENT_TIMESTAMP - QA.LastActivityDate) AS HoursSinceLastActivity, -- Complicated date calculation
+    (QA.QuestionScore - QA.PreviousQuestionScore) AS ScoreDifferenceFromPrevious, -- Complex expression
+    ARRAY_TO_STRING(QA.TagArray, ', ') AS TagsList, -- String function for tags
+    COALESCE(CPLS.TotalOutgoingLinked, 0) AS TotalOutgoingLinkedQuestions, -- NULL logic
+    COALESCE(CPLS.TotalIncomingDuplicate, 0) AS TotalIncomingDuplicateQuestions, -- NULL logic
+    COALESCE(AA.Score, 0) AS AcceptedAnswerScore, -- NULL logic
+    COALESCE(AA_Owner.DisplayName, 'N/A') AS AcceptedAnswerOwnerDisplayName, -- NULL logic
+    COALESCE(AA_Owner.Reputation, 0) AS AcceptedAnswerOwnerReputation, -- NULL logic
+    (SELECT COUNT(DISTINCT B.Name) FROM Badges B WHERE B.UserId = QA.OwnerUserId AND B.Class = 1) AS OwnerGoldBadges, -- Correlated subquery for user badges
+    (SELECT SUM(V.BountyAmount) FROM Votes V WHERE V.PostId = QA.QuestionId AND V.VoteTypeId = 9) AS TotalBountyCollected, -- Correlated subquery for bounty collection
+    CASE
+        WHEN QA.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN QA.AnswerCount = 0 AND QA.QuestionCreationDate < (CURRENT_TIMESTAMP - INTERVAL '30 days') THEN 'Stale No Answers'
+        WHEN QA.Score < 0 THEN 'Downvoted Low Score'
+        ELSE 'Active/Open'
+    END AS QuestionStatus -- NULL logic and complicated conditional expression
+FROM QuestionAnalysis QA
+LEFT JOIN Users U_Owner ON QA.OwnerUserId = U_Owner.Id
+LEFT JOIN UserEngagement UE ON QA.OwnerUserId = UE.UserId
+LEFT JOIN PostHistoryAgg PHA ON QA.QuestionId = PHA.PostId
+LEFT JOIN CombinedPostLinkSummary CPLS ON QA.QuestionId = CPLS.PostId
+LEFT JOIN Posts AA ON QA.AcceptedAnswerId = AA.Id -- Outer join for accepted answer details
+LEFT JOIN Users AA_Owner ON AA.OwnerUserId = AA_Owner.Id -- Outer join for accepted answer owner details
+WHERE
+    QA.QuestionScore > (SELECT AVG(P_Inner.Score) FROM Posts P_Inner WHERE P_Inner.PostTypeId = 1 AND P_Inner.CreationDate > (CURRENT_TIMESTAMP - INTERVAL '1 year')) -- Correlated subquery for recent average score benchmark
+    AND QA.ViewCount > 1000 -- Complex predicate
+    AND (QA.TagArray @> ARRAY['sql'] OR QA.TagArray @> ARRAY['database'] OR QA.TagArray @> ARRAY['postgresql'] OR QA.TagArray @> ARRAY['mysql']) -- String array/tag filtering
+    AND QA.QuestionCreationDate BETWEEN (CURRENT_TIMESTAMP - INTERVAL '5 years') AND (CURRENT_TIMESTAMP - INTERVAL '1 month') -- Date range filtering
+    AND (PHA.EditRevisionCount IS NULL OR PHA.EditRevisionCount >= 2) -- NULL logic and predicate on edit count
+    AND NOT EXISTS (
+        SELECT 1
+        FROM Comments C_Sub
+        WHERE C_Sub.PostId = QA.QuestionId
+          AND (C_Sub.Text ILIKE '%duplicate%' OR C_Sub.Text ILIKE '%off-topic%')
+          AND C_Sub.CreationDate > (CURRENT_TIMESTAMP - INTERVAL '1 year')
+    ) -- Another correlated subquery: no recent "duplicate" or "off-topic" comments
+ORDER BY
+    (QA.QuestionScore * POWER(QA.FavoriteCount + 1, 0.5) * (1 + QA.AnswerCount / 10.0) / (DATE_PART('day', CURRENT_TIMESTAMP - QA.QuestionCreationDate) + 1)) DESC, -- Super complicated calculation for relevancy ranking
+    QA.LastActivityDate DESC
+LIMIT 500;

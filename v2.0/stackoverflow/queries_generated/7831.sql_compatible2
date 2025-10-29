@@ -1,0 +1,278 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.CreationDate,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT b.Id) as Badges,
+        COUNT(DISTINCT c.Id) as Comments,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        MAX(p.CreationDate) as LastPostDate,
+        ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) as PostRank,
+        NTILE(100) OVER (ORDER BY u.Reputation DESC) as RepPercentile,
+        CASE 
+            WHEN COUNT(DISTINCT b.Id) > 0 THEN 'Badge Holder' 
+            ELSE 'No Badges' 
+        END as BadgeStatus,
+        LAG(u.Reputation) OVER (ORDER BY u.Reputation DESC) - u.Reputation as RepDifferenceFromNext
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    WHERE u.Reputation > 100
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.CreationDate
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as PostType,
+        CHARACTER_LENGTH(p.Title) as TitleLength,
+        CHARACTER_LENGTH(p.Body) as BodyLength,
+        CASE 
+            WHEN p.Score > 100 THEN 'Highly Voted'
+            WHEN p.Score > 10 THEN 'Moderately Voted'
+            ELSE 'Low Voted'
+        END as VotingLevel,
+        COALESCE(p.AnswerCount, 0) * 100.0 / NULLIF(p.ViewCount, 0) as AnswerToViewRatio,
+        (EXTRACT(epoch FROM (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate)) / 86400.0) as DaysSinceCreation,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) as Upvotes,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) as Downvotes,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) as UserPostRank
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+DetailedBadges AS (
+    SELECT 
+        b.Id,
+        b.UserId,
+        b.Name,
+        b.Date,
+        b.Class,
+        CASE 
+            WHEN b.Class = 1 THEN 'Gold'
+            WHEN b.Class = 2 THEN 'Silver'
+            ELSE 'Bronze'
+        END as BadgeTier,
+        DENSE_RANK() OVER (PARTITION BY b.UserId ORDER BY b.Date) as BadgeSequence,
+        LAG(b.Date) OVER (PARTITION BY b.UserId ORDER BY b.Date) as PreviousBadgeDate,
+        (EXTRACT(epoch FROM (b.Date - LAG(b.Date) OVER (PARTITION BY b.UserId ORDER BY b.Date))) / 86400.0) as DaysBetweenBadges
+    FROM Badges b
+),
+TagAnalysis AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            ELSE 'Niche'
+        END as PopularityLevel,
+        RANK() OVER (ORDER BY t.Count DESC) as PopularityRank,
+        AVG(t.Count) OVER () as AvgTagCount,
+        t.Count - AVG(t.Count) OVER () as CountDeviation
+    FROM Tags t
+),
+ComplexJoin AS (
+    SELECT 
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.TotalPosts,
+        us.Questions,
+        us.Answers,
+        us.Badges,
+        us.Comments,
+        us.TotalScore,
+        us.PostRank,
+        us.RepPercentile,
+        pa.PostId,
+        pa.Title,
+        pa.Body,
+        pa.Score,
+        pa.ViewCount,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.TitleLength,
+        pa.BodyLength,
+        pa.VotingLevel,
+        pa.AnswerToViewRatio,
+        pa.DaysSinceCreation,
+        pa.Upvotes,
+        pa.Downvotes,
+        pa.UserPostRank,
+        db.Id as BadgeId,
+        db.Name as BadgeName,
+        db.Date as BadgeDate,
+        db.BadgeTier,
+        ta.TagName,
+        ta.Count as TagCount,
+        ta.PopularityLevel,
+        ta.PopularityRank
+    FROM UserStats us
+    FULL OUTER JOIN PostAnalysis pa ON us.UserId = pa.OwnerUserId
+    FULL OUTER JOIN DetailedBadges db ON us.UserId = db.UserId
+    FULL OUTER JOIN TagAnalysis ta ON us.UserId = pa.OwnerUserId
+    WHERE 
+        (us.UserId IS NOT NULL OR pa.PostId IS NOT NULL OR db.Id IS NOT NULL OR ta.Id IS NOT NULL)
+        AND 
+        (
+            (pa.PostId IS NOT NULL AND pa.Score > 0 AND pa.Score / NULLIF(pa.ViewCount, 0) > 0.01)
+            OR (db.Id IS NOT NULL AND db.BadgeTier IN ('Gold', 'Silver'))
+            OR (ta.Id IS NOT NULL AND ta.Count > 50)
+            OR (us.UserId IS NOT NULL AND us.Reputation > 5000)
+        )
+)
+SELECT * FROM (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        TotalPosts,
+        Questions,
+        Answers,
+        Badges,
+        Comments,
+        TotalScore,
+        PostRank,
+        RepPercentile,
+        PostId,
+        Title,
+        Body,
+        Score,
+        ViewCount,
+        AnswerCount,
+        CommentCount,
+        TitleLength,
+        BodyLength,
+        VotingLevel,
+        AnswerToViewRatio,
+        DaysSinceCreation,
+        Upvotes,
+        Downvotes,
+        UserPostRank,
+        BadgeId,
+        BadgeName,
+        BadgeDate,
+        BadgeTier,
+        TagName,
+        TagCount,
+        PopularityLevel,
+        PopularityRank,
+        CASE 
+            WHEN COUNT(*) OVER (PARTITION BY UserId) > 1 THEN 'Multiple Records'
+            ELSE 'Single Record'
+        END as RecordType,
+        (SELECT COUNT(*) FROM ComplexJoin cj2 WHERE cj2.UserId = ComplexJoin.UserId AND cj2.PostId = ComplexJoin.PostId) as PostUserCount,
+        RANK() OVER (ORDER BY CASE 
+            WHEN UserId IS NOT NULL THEN TotalPosts 
+            WHEN PostId IS NOT NULL THEN Score 
+            ELSE 0 
+        END DESC) as OverallRank,
+        CASE 
+            WHEN RepPercentile <= 10 THEN 'Top 10%'
+            WHEN RepPercentile <= 25 THEN 'Top 25%'
+            WHEN RepPercentile <= 50 THEN 'Top 50%'
+            ELSE 'Below 50%'
+        END as ReputationBucket,
+        ABS(TotalScore - AVG(TotalScore) OVER ()) as ScoreDeviation,
+        COALESCE(CHARACTER_LENGTH(Title), 0) + COALESCE(CHARACTER_LENGTH(Body), 0) as TotalTextLength,
+        CASE 
+            WHEN Reputation > 10000 AND TotalPosts > 50 THEN 'Veteran Contributor'
+            WHEN Reputation > 5000 AND TotalPosts > 25 THEN 'Experienced Contributor'
+            WHEN Reputation > 1000 AND TotalPosts > 10 THEN 'Active Contributor'
+            ELSE 'New Contributor'
+        END as ContributionLevel
+    FROM ComplexJoin
+    WHERE 
+        UserId IS NOT NULL 
+        AND (PostId IS NOT NULL OR BadgeId IS NOT NULL OR TagName IS NOT NULL)
+        AND (Title IS NOT NULL OR BadgeName IS NOT NULL OR TagName IS NOT NULL)
+    UNION ALL
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        TotalPosts,
+        Questions,
+        Answers,
+        Badges,
+        Comments,
+        TotalScore,
+        PostRank,
+        RepPercentile,
+        PostId,
+        Title,
+        Body,
+        Score,
+        ViewCount,
+        AnswerCount,
+        CommentCount,
+        TitleLength,
+        BodyLength,
+        VotingLevel,
+        AnswerToViewRatio,
+        DaysSinceCreation,
+        Upvotes,
+        Downvotes,
+        UserPostRank,
+        BadgeId,
+        BadgeName,
+        BadgeDate,
+        BadgeTier,
+        TagName,
+        TagCount,
+        PopularityLevel,
+        PopularityRank,
+        CASE 
+            WHEN COUNT(*) OVER (PARTITION BY UserId) > 1 THEN 'Multiple Records'
+            ELSE 'Single Record'
+        END as RecordType,
+        (SELECT COUNT(*) FROM ComplexJoin cj2 WHERE cj2.UserId = ComplexJoin.UserId AND cj2.PostId = ComplexJoin.PostId) as PostUserCount,
+        RANK() OVER (ORDER BY CASE 
+            WHEN UserId IS NOT NULL THEN TotalPosts 
+            WHEN PostId IS NOT NULL THEN Score 
+            ELSE 0 
+        END DESC) as OverallRank,
+        CASE 
+            WHEN RepPercentile <= 10 THEN 'Top 10%'
+            WHEN RepPercentile <= 25 THEN 'Top 25%'
+            WHEN RepPercentile <= 50 THEN 'Top 50%'
+            ELSE 'Below 50%'
+        END as ReputationBucket,
+        ABS(TotalScore - AVG(TotalScore) OVER ()) as ScoreDeviation,
+        COALESCE(CHARACTER_LENGTH(Title), 0) + COALESCE(CHARACTER_LENGTH(Body), 0) as TotalTextLength,
+        CASE 
+            WHEN Reputation > 10000 AND TotalPosts > 50 THEN 'Veteran Contributor'
+            WHEN Reputation > 5000 AND TotalPosts > 25 THEN 'Experienced Contributor'
+            WHEN Reputation > 1000 AND TotalPosts > 10 THEN 'Active Contributor'
+            ELSE 'New Contributor'
+        END as ContributionLevel
+    FROM ComplexJoin
+    WHERE 
+        UserId IS NOT NULL 
+        AND (TotalPosts > 100 AND Reputation > 1000)
+) AS unified_results
+ORDER BY 
+    CASE WHEN UserId IS NOT NULL THEN 1 ELSE 2 END,
+    CASE WHEN TotalScore IS NULL THEN 0 ELSE TotalScore END DESC,
+    PostRank ASC,
+    PopularityRank ASC,
+    Reputation DESC;

@@ -1,0 +1,355 @@
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        cast(u.creationdate as date) as user_created_date,
+        coalesce(nullif(trim(u.location), ''), 'Unknown') as location_norm,
+        extract(year from u.creationdate) as user_create_year,
+        row_number() over (partition by coalesce(nullif(trim(u.location), ''), 'Unknown') order by u.reputation desc, u.id) as rn_loc
+    from users u
+    where u.creationdate >= (select date_trunc('year', max(creationdate)) - interval '3 years' from users)
+),
+posts_cte as (
+    select
+        p.id,
+        p.posttypeid,
+        p.owneruserid,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        p.answercount,
+        p.favoritecount,
+        p.commentcount,
+        p.closeddate,
+        p.title,
+        p.tags,
+        case when p.posttypeid = 1 then 1 else 0 end as is_question,
+        case when p.posttypeid = 2 then 1 else 0 end as is_answer
+    from posts p
+    where p.creationdate is not null
+),
+tag_expand as (
+    select
+        pc.id as post_id,
+        lower(trim(tg)) as tag
+    from posts_cte pc
+    cross join lateral unnest(
+        case
+            when pc.tags is not null and length(pc.tags) >= 2
+            then string_to_array(substring(pc.tags, 2, length(pc.tags)-2), '><')
+            else array[]::varchar[]
+        end
+    ) as tg
+),
+top_tags as (
+    select tag, count(*) as tag_post_count
+    from tag_expand
+    group by tag
+    having count(*) > 50
+),
+user_post_activity as (
+    select
+        ru.user_id,
+        ru.location_norm,
+        count(*) filter (where pc.is_question=1) as q_count,
+        count(*) filter (where pc.is_answer=1) as a_count,
+        sum(pc.score) as total_post_score,
+        avg(nullif(pc.viewcount,0)) as avg_views_nonzero,
+        max(pc.creationdate) as last_post_date
+    from recent_users ru
+    left join posts_cte pc on pc.owneruserid = ru.user_id
+    group by ru.user_id, ru.location_norm
+),
+post_interactions as (
+    select
+        pc.id as post_id,
+        count(distinct c.id) as comments_cnt,
+        coalesce(sum(vote_case.upvotes),0) as upvotes,
+        coalesce(sum(vote_case.downvotes),0) as downvotes,
+        coalesce(sum(vote_case.favorites),0) as favorites,
+        coalesce(sum(vote_case.spamflags),0) as spamflags
+    from posts_cte pc
+    left join comments c on c.postid = pc.id
+    left join lateral (
+        select
+            sum(case when vt.votetypeid = 2 then 1 else 0 end) as upvotes,
+            sum(case when vt.votetypeid = 3 then 1 else 0 end) as downvotes,
+            sum(case when vt.votetypeid = 5 then 1 else 0 end) as favorites,
+            sum(case when vt.votetypeid = 12 then 1 else 0 end) as spamflags
+        from votes vt
+        where vt.postid = pc.id
+    ) as vote_case on true
+    group by pc.id
+),
+duplicate_links as (
+    select
+        pl.postid as dup_post_id,
+        pl.relatedpostid as original_post_id,
+        min(pl.creationdate) as first_dup_link_date,
+        count(*) as link_count
+    from postlinks pl
+    where pl.linktypeid = 3
+    group by pl.postid, pl.relatedpostid
+),
+post_closure as (
+    select
+        ph.postid,
+        min(ph.creationdate) filter (where ph.posthistorytypeid = 10) as first_closed,
+        min(ph.creationdate) filter (where ph.posthistorytypeid = 11) as first_reopened,
+        count(*) filter (where ph.posthistorytypeid = 10) as close_events,
+        count(*) filter (where ph.posthistorytypeid = 11) as reopen_events,
+        max(case when ph.posthistorytypeid = 10 then nullif(ph.comment, '') end) as last_close_reason_raw
+    from posthistory ph
+    where ph.posthistorytypeid in (10,11)
+    group by ph.postid
+),
+accepted_links as (
+    select
+        q.id as question_id,
+        q.acceptedanswerid as accepted_answer_id,
+        a.owneruserid as accepted_answerer_id
+    from posts q
+    join posts a on a.id = q.acceptedanswerid
+    where q.posttypeid = 1 and q.acceptedanswerid is not null
+),
+badge_rollup as (
+    select
+        b.userid,
+        sum(case when b.class = 1 then 1 else 0 end) as golds,
+        sum(case when b.class = 2 then 1 else 0 end) as silvers,
+        sum(case when b.class = 3 then 1 else 0 end) as bronzes,
+        sum(case when b.tagbased = true then 1 else 0 end) as tag_badges
+    from badges b
+    where b.date >= (select date_trunc('year', max(date)) - interval '5 years' from badges)
+    group by b.userid
+),
+location_quality as (
+    select
+        upa.location_norm,
+        percentile_cont(0.5) within group (order by coalesce(upa.total_post_score,0)) as median_score,
+        percentile_cont(0.9) within group (order by coalesce(upa.total_post_score,0)) as p90_score,
+        avg(upa.q_count + upa.a_count) as avg_posts
+    from user_post_activity upa
+    group by upa.location_norm
+),
+recent_hot_candidates as (
+    select
+        pc.id,
+        pc.owneruserid,
+        cast(pc.creationdate as date) as created_day,
+        pi.upvotes - pi.downvotes as net_votes,
+        pi.comments_cnt,
+        pi.favorites,
+        pc.viewcount,
+        row_number() over (partition by pc.owneruserid order by (pi.upvotes - pi.downvotes) desc, pc.viewcount desc, pc.id) as rn_by_user
+    from posts_cte pc
+    join post_interactions pi on pi.post_id = pc.id
+    where pc.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '180 days'
+      and pc.posttypeid in (1,2)
+),
+tag_engagement as (
+    select
+        te.tag,
+        count(*) as posts_with_tag,
+        sum(pi.upvotes) as upvotes_with_tag,
+        sum(pi.downvotes) as downvotes_with_tag,
+        avg(pc.score) as avg_score_with_tag
+    from tag_expand te
+    join posts_cte pc on pc.id = te.post_id
+    join post_interactions pi on pi.post_id = pc.id
+    group by te.tag
+),
+user_rank AS (
+    select
+        ru.user_id,
+        ru.displayname,
+        ru.location_norm,
+        ru.reputation,
+        coalesce(upa.q_count,0) as q_count,
+        coalesce(upa.a_count,0) as a_count,
+        coalesce(upa.total_post_score,0) as total_post_score,
+        coalesce(br.golds,0) as golds,
+        coalesce(br.silvers,0) as silvers,
+        coalesce(br.bronzes,0) as bronzes,
+        coalesce(br.tag_badges,0) as tag_badges,
+        dense_rank() over (
+            order by
+                coalesce(upa.total_post_score,0) desc,
+                coalesce(upa.a_count,0) desc,
+                coalesce(br.golds,0) desc,
+                ru.reputation desc
+        ) as dense_rank_global
+    from recent_users ru
+    left join user_post_activity upa on upa.user_id = ru.user_id
+    left join badge_rollup br on br.userid = ru.user_id
+),
+question_audit as (
+    select
+        q.id as question_id,
+        q.owneruserid,
+        q.creationdate,
+        q.score,
+        q.viewcount,
+        pc.first_closed,
+        pc.first_reopened,
+        pc.close_events,
+        pc.reopen_events,
+        dl.original_post_id,
+        dl.link_count,
+        case
+            when pc.first_closed is not null and pc.first_reopened is not null and pc.first_reopened > pc.first_closed then 'closed_then_reopened'
+            when dl.original_post_id is not null then 'duplicate_linked'
+            when pc.first_closed is not null then 'closed_only'
+            else 'open'
+        end as review_state
+    from posts q
+    left join post_closure pc on pc.postid = q.id
+    left join duplicate_links dl on dl.dup_post_id = q.id
+    where q.posttypeid = 1
+),
+complex_predicate_posts as (
+    select
+        p.id,
+        p.owneruserid,
+        p.title,
+        p.tags,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        pi.upvotes,
+        pi.downvotes,
+        pi.favorites,
+        qi.review_state,
+        case
+            when p.title ilike '%how to%' and (p.score >= 0 or p.viewcount > 1000) then 1
+            when p.title ilike '%why %' and p.score < 0 then 1
+            when p.title ~* '^\s*(is|are|can|should)\b' and (pi.upvotes - pi.downvotes) >= 5 then 1
+            else 0
+        end as heuristic_flag
+    from posts_cte p
+    join post_interactions pi on pi.post_id = p.id
+    left join question_audit qi on qi.question_id = p.id
+    where p.posttypeid = 1
+      and (
+            (p.closeddate is null and (pi.upvotes - pi.downvotes) >= 3)
+         or (p.closeddate is not null and coalesce(p.score,0) >= 0 and pi.favorites >= 1)
+         or (p.viewcount between 100 and 100000 and p.score between -5 and 50)
+      )
+),
+answerer_quality as (
+    select
+        al.accepted_answerer_id as user_id,
+        count(*) as accepted_count,
+        avg(a.score) as avg_accepted_answer_score,
+        max(a.creationdate) as last_accepted_answer_date
+    from accepted_links al
+    join posts a on a.id = al.accepted_answer_id
+    group by al.accepted_answerer_id
+),
+post_tag_quality as (
+    select
+        te.post_id,
+        sum( case when tt.tag is not null then 1 else 0 end ) as hot_tag_hits,
+        sum( coalesce(te_weight.weight, 0) ) as tag_weight_sum
+    from tag_expand te
+    left join top_tags tt on tt.tag = te.tag
+    left join lateral (
+        select
+            1.0 / nullif(ln(1 + tg.count), 0) as weight
+        from tags tg
+        where lower(tg.tagname) = te.tag
+    ) te_weight on true
+    group by te.post_id
+),
+final_set as (
+    select
+        cp.id as question_id,
+        cp.owneruserid as owner_user_id,
+        coalesce(ur.displayname, '(unknown)') as owner_display_name,
+        ur.reputation,
+        ur.dense_rank_global,
+        aq.accepted_count,
+        aq.avg_accepted_answer_score,
+        br.golds, br.silvers, br.bronzes,
+        cp.creationdate,
+        cp.score,
+        cp.viewcount,
+        cp.upvotes, cp.downvotes, cp.favorites,
+        cp.review_state,
+        cp.heuristic_flag,
+        ptq.hot_tag_hits,
+        ptq.tag_weight_sum,
+        row_number() over (order by
+            cp.heuristic_flag desc,
+            coalesce(ptq.hot_tag_hits,0) desc,
+            (cp.upvotes - cp.downvotes) desc,
+            cp.viewcount desc,
+            cp.score desc
+        ) as rownum_global
+    from complex_predicate_posts cp
+    left join user_rank ur on ur.user_id = cp.owneruserid
+    left join answerer_quality aq on aq.user_id = cp.owneruserid
+    left join badge_rollup br on br.userid = cp.owneruserid
+    left join post_tag_quality ptq on ptq.post_id = cp.id
+),
+variance_candidates as (
+    select question_id from final_set where heuristic_flag = 1
+    union
+    select cp.id
+    from posts_cte cp
+    join post_interactions pi on pi.post_id = cp.id
+    where cp.posttypeid = 1
+      and (pi.upvotes + pi.downvotes) >= 50
+    except
+    select question_id from final_set where (upvotes - downvotes) >= 10
+)
+select
+    fs.question_id,
+    fs.owner_user_id,
+    fs.owner_display_name,
+    fs.reputation,
+    fs.dense_rank_global,
+    coalesce(fs.accepted_count,0) as accepted_count,
+    round(coalesce(fs.avg_accepted_answer_score,0), 2) as avg_accepted_answer_score,
+    coalesce(fs.golds,0) as gold_badges,
+    coalesce(fs.silvers,0) as silver_badges,
+    coalesce(fs.bronzes,0) as bronze_badges,
+    fs.creationdate,
+    fs.score,
+    fs.viewcount,
+    fs.upvotes,
+    fs.downvotes,
+    fs.favorites,
+    fs.review_state,
+    fs.heuristic_flag,
+    fs.hot_tag_hits,
+    round(coalesce(fs.tag_weight_sum,0), 4) as tag_weight_sum,
+    fs.rownum_global,
+    (
+        select count(*)
+        from comments c
+        where c.postid = fs.question_id
+          and c.score > 0
+    ) as pos_comment_count,
+    (
+        select count(*)
+        from votes v
+        where v.postid = fs.question_id
+          and v.votetypeid in (8,9)
+    ) as bounty_events,
+    coalesce(nullif(trim(substring(fs.owner_display_name from 1 for 30)), ''), '[anon]') || ' #' || cast(fs.owner_user_id as text) as owner_label,
+    case
+        when fs.review_state = 'closed_only' and fs.score >= 0 then 'controversial_close'
+        when fs.review_state = 'duplicate_linked' and coalesce(fs.hot_tag_hits,0) >= 1 then 'popular_duplicate'
+        when fs.heuristic_flag = 1 and (fs.upvotes - fs.downvotes) >= 5 then 'likely_hot'
+        else 'normal'
+    end as classification,
+    avg(fs.viewcount) over () as avg_views_global,
+    percentile_cont(0.95) within group (order by fs.viewcount) over () as p95_views_global,
+    rank() over (partition by fs.review_state order by (fs.upvotes - fs.downvotes) desc, fs.viewcount desc) as rank_within_state,
+    sum(case when fs.heuristic_flag=1 then 1 else 0 end) over (rows between unbounded preceding and unbounded following) as heuristic_total
+from final_set fs
+where fs.question_id in (select question_id from variance_candidates)
+order by classification, rank_within_state, fs.rownum_global
+limit 500;

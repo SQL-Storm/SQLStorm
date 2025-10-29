@@ -1,0 +1,267 @@
+-- {"query": "1072.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 4034} 
+
+WITH UserEngagementMetrics AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS UserUpVotes,
+        U.DownVotes AS UserDownVotes,
+        U.WebsiteUrl,
+        U.Location,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        SUM(COALESCE(P.Score, 0)) AS TotalPostScore,
+        SUM(COALESCE(P.FavoriteCount, 0)) AS TotalFavoritesReceived,
+        -- Count accepted answers *written by this user* using EXISTS (correlated subquery logic)
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 AND EXISTS (SELECT 1 FROM Posts Q WHERE Q.Id = P.ParentId AND Q.AcceptedAnswerId = P.Id) THEN P.Id ELSE NULL END) AS TotalAcceptedAnswersWritten,
+        -- Composite Karma Score based on reputation, comment scores, badges, and average post score
+        CAST(U.Reputation AS NUMERIC) +
+        COALESCE(SUM(C.Score), 0) * 0.5 +
+        COALESCE(COUNT(DISTINCT B.Id), 0) * 10 +
+        (SELECT COALESCE(AVG(S.Score), 0) FROM Posts S WHERE S.OwnerUserId = U.Id AND S.PostTypeId IN (1,2)) * 2 AS KarmaScore,
+        -- Count distinct tags associated with user's posts (using string_to_array and unnest)
+        COUNT(DISTINCT Tag.TagName) AS DistinctTagsContributed,
+        AVG(CASE WHEN P.PostTypeId = 1 THEN P.ViewCount ELSE NULL END) AS AvgQuestionViewCount,
+        MAX(P.CreationDate) AS LastPostDate,
+        MIN(P.CreationDate) AS FirstPostDate
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN (
+        -- Subquery to extract distinct tags per user
+        SELECT DISTINCT OwnerUserId, TRIM(unnest(string_to_array(SUBSTRING(Tags, 2, LENGTH(Tags) - 2), '><'))) AS TagName
+        FROM Posts
+        WHERE Tags IS NOT NULL AND Tags != '<>' AND OwnerUserId IS NOT NULL
+    ) AS Tag ON U.Id = Tag.OwnerUserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Views, U.UpVotes, U.DownVotes, U.WebsiteUrl, U.Location
+),
+PostQualityMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.CreationDate AS PostCreationDate,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.ClosedDate,
+        P.CommunityOwnedDate,
+        P.OwnerUserId,
+        P.Title,
+        P.Body,
+        -- Number of distinct edits (excluding initial creation, and certain revision types)
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6, 8) THEN PH.Id ELSE NULL END) AS EditCount,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6, 8) THEN PH.CreationDate ELSE NULL END) AS LastEditRevisionDate,
+        -- Correlated Subquery: Find time from question creation to first answer
+        (SELECT MIN(A.CreationDate - P.CreationDate) FROM Posts A WHERE A.ParentId = P.Id AND A.PostTypeId = 2) AS TimeToFirstAnswer,
+        -- Correlated Subquery: Find time from question creation to accepted answer
+        (SELECT MIN(A.CreationDate - P.CreationDate) FROM Posts A WHERE A.Id = P.AcceptedAnswerId) AS TimeToAcceptedAnswer,
+        -- Aggregate Upvotes and Downvotes from Votes table
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS ActualUpVoteCount,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS ActualDownVoteCount,
+        -- Number of Tags (using string_to_array and CARDINALITY for array length)
+        CARDINALITY(string_to_array(SUBSTRING(COALESCE(P.Tags, '<>'), 2, LENGTH(COALESCE(P.Tags, '<>')) - 2), '><')) AS NumberOfTags,
+        -- Title length, handling NULLs
+        COALESCE(LENGTH(P.Title), 0) AS TitleLength,
+        -- Check for specific keywords in body or title (case-insensitive)
+        CASE WHEN LOWER(P.Body) LIKE '%performance%' OR LOWER(P.Body) LIKE '%optimization%' OR LOWER(P.Title) LIKE '%benchmark%' THEN TRUE ELSE FALSE END AS ContainsPerfKeyword,
+        -- Calculate 'Engagement Score' based on various factors, handling NULLs
+        (COALESCE(P.Score, 0) * 1.0 + COALESCE(P.ViewCount, 0) * 0.01 + COALESCE(P.AnswerCount, 0) * 5.0 + COALESCE(P.CommentCount, 0) * 0.5 + COALESCE(P.FavoriteCount, 0) * 2.0) AS EngagementScore,
+        -- Categorize post title based on keywords (string expressions)
+        CASE
+            WHEN LOWER(P.Title) LIKE '%how to%' THEN 'How-to'
+            WHEN LOWER(P.Title) LIKE '%best practice%' THEN 'Best Practice'
+            WHEN LOWER(P.Title) LIKE '%error%' THEN 'Error Troubleshooting'
+            WHEN P.Title IS NULL THEN 'No Title'
+            ELSE 'General'
+        END AS TitleCategory
+    FROM Posts P
+    LEFT JOIN PostTypes PT ON P.PostTypeId = PT.Id
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    LEFT JOIN Votes V ON P.Id = V.PostId
+    GROUP BY P.Id, P.PostTypeId, PT.Name, P.CreationDate, P.Score, P.ViewCount, P.AnswerCount, P.CommentCount, P.FavoriteCount, P.ClosedDate, P.CommunityOwnedDate, P.OwnerUserId, P.Title, P.Body, P.AcceptedAnswerId, P.Tags
+),
+TagPerformance AS (
+    SELECT
+        TRIM(unnest(string_to_array(SUBSTRING(COALESCE(P.Tags, '<>'), 2, LENGTH(COALESCE(P.Tags, '<>')) - 2), '><'))) AS TagName,
+        COUNT(DISTINCT P.Id) AS TotalTaggedPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalTaggedQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalTaggedAnswers,
+        SUM(COALESCE(P.Score, 0)) AS TotalTagScore,
+        AVG(COALESCE(P.Score, 0)) AS AvgTagScore,
+        MAX(P.CreationDate) AS LatestTagUsageDate,
+        MIN(P.CreationDate) AS EarliestTagUsageDate,
+        COUNT(DISTINCT P.OwnerUserId) AS UniqueTagContributors
+    FROM Posts P
+    WHERE P.Tags IS NOT NULL AND P.Tags != '<>'
+    GROUP BY TRIM(unnest(string_to_array(SUBSTRING(COALESCE(P.Tags, '<>'), 2, LENGTH(COALESCE(P.Tags, '<>')) - 2), '><')))
+    HAVING COUNT(DISTINCT P.Id) > 50 -- Filter out very rare tags for more relevant performance analysis
+),
+AggregatedData AS (
+    SELECT
+        UEM.UserId,
+        UEM.DisplayName,
+        UEM.Reputation,
+        UEM.UserCreationDate,
+        UEM.LastAccessDate,
+        UEM.UserProfileViews,
+        UEM.TotalPosts,
+        UEM.TotalQuestions,
+        UEM.TotalAnswers,
+        UEM.TotalComments,
+        UEM.TotalPostScore,
+        UEM.TotalFavoritesReceived,
+        UEM.TotalAcceptedAnswersWritten,
+        UEM.KarmaScore,
+        UEM.DistinctTagsContributed,
+        UEM.AvgQuestionViewCount,
+        UEM.LastPostDate,
+        UEM.FirstPostDate,
+        PQM.PostId,
+        PQM.PostTypeName,
+        PQM.PostCreationDate,
+        PQM.Score AS PostScore,
+        PQM.ViewCount AS PostViewCount,
+        PQM.AnswerCount,
+        PQM.CommentCount AS PostCommentCount,
+        PQM.FavoriteCount AS PostFavoriteCount,
+        PQM.ClosedDate,
+        PQM.CommunityOwnedDate,
+        PQM.EditCount,
+        PQM.LastEditRevisionDate,
+        PQM.TimeToFirstAnswer,
+        PQM.TimeToAcceptedAnswer,
+        PQM.ActualUpVoteCount,
+        PQM.ActualDownVoteCount,
+        PQM.NumberOfTags,
+        PQM.TitleLength,
+        PQM.ContainsPerfKeyword,
+        PQM.EngagementScore,
+        PQM.TitleCategory,
+        TP.TagName,
+        TP.TotalTaggedPosts,
+        TP.TotalTaggedQuestions,
+        TP.TotalTaggedAnswers,
+        TP.TotalTagScore,
+        TP.AvgTagScore,
+        TP.LatestTagUsageDate,
+        TP.UniqueTagContributors,
+        -- Window function: Rank users by KarmaScore
+        RANK() OVER (ORDER BY UEM.KarmaScore DESC, UEM.Reputation DESC, UEM.TotalPosts DESC) AS UserKarmaRank,
+        -- Window function: Calculate moving average of post scores for a user over time (3 most recent posts)
+        AVG(PQM.Score) OVER (PARTITION BY UEM.UserId ORDER BY PQM.PostCreationDate ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS UserMovingAvgPostScore,
+        -- Window function: Get the previous post's score for the same user, default to 0 if no previous post
+        LAG(PQM.Score, 1, 0) OVER (PARTITION BY UEM.UserId ORDER BY PQM.PostCreationDate) AS PreviousPostScore,
+        -- Calculate a User Activity Score (normalized time since last access)
+        (UEM.TotalPosts * 1.0 + UEM.TotalComments * 0.5 + UEM.TotalAcceptedAnswersWritten * 2.0 + (EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - UEM.LastAccessDate)) / 86400.0) * -0.01) AS UserActivityScore
+    FROM UserEngagementMetrics UEM
+    LEFT JOIN PostQualityMetrics PQM ON UEM.UserId = PQM.OwnerUserId
+    LEFT JOIN (
+        -- Subquery to link posts to individual tags for joining with TagPerformance
+        SELECT P.Id, TRIM(unnest(string_to_array(SUBSTRING(COALESCE(P.Tags, '<>'), 2, LENGTH(COALESCE(P.Tags, '<>')) - 2), '><'))) AS TagName
+        FROM Posts P
+        WHERE P.Tags IS NOT NULL AND P.Tags != '<>'
+    ) AS PostTag ON PQM.PostId = PostTag.Id
+    LEFT JOIN TagPerformance TP ON PostTag.TagName = TP.TagName
+    WHERE UEM.Reputation > 100 -- Filter for more established users
+    AND PQM.PostId IS NOT NULL -- Only include users who own posts
+),
+-- Set operator (UNION ALL) combining "problematic" questions and "exemplary" answers
+ProblematicQuestionsAndExemplaryAnswers AS (
+    SELECT
+        P.Id AS PostId,
+        PT.Name AS PostTypeName,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount AS PostViewCount,
+        P.OwnerUserId AS AffectedUserId,
+        'Problematic Question' AS PostCategory,
+        -- Correlated subquery to find approximate closure time
+        (SELECT MAX(PH.CreationDate) FROM PostHistory PH WHERE PH.PostId = P.Id AND PH.PostHistoryTypeId = 10) AS EventTime,
+        'Views: ' || COALESCE(P.ViewCount, 0) || ', Score: ' || COALESCE(P.Score, 0) || ', Closed: ' || CASE WHEN P.ClosedDate IS NOT NULL THEN 'Yes' ELSE 'No' END AS Insights
+    FROM Posts P
+    JOIN PostTypes PT ON P.PostTypeId = PT.Id
+    WHERE P.PostTypeId = 1 -- Question
+      AND COALESCE(P.ViewCount, 0) > 5000 -- High views
+      AND COALESCE(P.Score, 0) < 5 -- Low score
+      AND P.ClosedDate IS NOT NULL -- Post must be closed
+    UNION ALL
+    SELECT
+        P.Id AS PostId,
+        PT.Name AS PostTypeName,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount AS PostViewCount,
+        P.OwnerUserId AS AffectedUserId,
+        'Exemplary Answer' AS PostCategory,
+        P.CreationDate AS EventTime,
+        'Accepted: Yes, Score: ' || COALESCE(P.Score, 0) AS Insights
+    FROM Posts P
+    JOIN PostTypes PT ON P.PostTypeId = PT.Id
+    WHERE P.PostTypeId = 2 -- Answer
+      AND P.Score > 20 -- High score
+      AND EXISTS (SELECT 1 FROM Posts Q WHERE Q.Id = P.ParentId AND Q.AcceptedAnswerId = P.Id) -- Is accepted answer (correlated subquery)
+)
+SELECT
+    AD.UserId,
+    AD.DisplayName,
+    AD.Reputation,
+    AD.UserKarmaRank,
+    AD.UserActivityScore,
+    AD.TotalPosts,
+    AD.TotalQuestions,
+    AD.TotalAnswers,
+    AD.TotalAcceptedAnswersWritten,
+    AD.DistinctTagsContributed,
+    AD.PostId,
+    AD.PostTypeName,
+    AD.PostCreationDate,
+    AD.PostScore,
+    AD.PostViewCount,
+    AD.EngagementScore,
+    AD.ContainsPerfKeyword,
+    AD.TitleCategory,
+    AD.TagName,
+    AD.AvgTagScore,
+    AD.UserMovingAvgPostScore,
+    AD.PreviousPostScore,
+    -- NULL logic with COALESCE for default interval, and NULLIF to prevent division by zero
+    COALESCE(AD.TimeToFirstAnswer, INTERVAL '9999 year') AS ResolvedTimeToFirstAnswer, -- If no answer, assume a very long time
+    NULLIF(AD.ActualUpVoteCount, 0) / NULLIF(AD.ActualDownVoteCount, 0) AS UpDownVoteRatio,
+    -- String manipulations: uppercase first 3 chars of display name + padded User ID
+    UPPER(SUBSTRING(AD.DisplayName, 1, 3)) || LPAD(CAST(AD.UserId AS VARCHAR), 5, '0') AS UserCustomCode,
+    -- Date difference in days
+    (AD.PostCreationDate::date - AD.UserCreationDate::date) AS DaysSinceUserCreationToPost,
+    CASE WHEN AD.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS PostLifecycleStatus,
+    PQA.PostCategory,
+    PQA.Insights,
+    -- Correlated subquery: Count new comments after the last edit of a post
+    (SELECT COUNT(DISTINCT C.Id) FROM Comments C WHERE C.PostId = AD.PostId AND C.CreationDate > COALESCE(AD.LastEditRevisionDate, AD.PostCreationDate)) AS NewCommentsAfterLastEdit,
+    -- Complicated calculation: engagement per view (NULL-safe)
+    COALESCE(AD.EngagementScore / NULLIF(AD.PostViewCount, 0), 0.0) AS EngagementPerViewRatio,
+    -- String expression from user location
+    COALESCE(TRIM(SUBSTRING(AD.Location, 1, 20)), 'Unknown Location') AS UserLocationSnippet
+FROM AggregatedData AD
+LEFT JOIN ProblematicQuestionsAndExemplaryAnswers PQA ON AD.PostId = PQA.PostId
+WHERE
+    AD.TotalPosts > 5
+    AND AD.Reputation > 500
+    AND AD.TagName IS NOT NULL
+    AND AD.AvgTagScore > 0
+    AND AD.ContainsPerfKeyword = TRUE -- Focusing analysis on performance-related content
+    AND AD.UserProfileViews > 100 -- Ensure users have some profile visibility
+    AND AD.PostCreationDate BETWEEN AD.UserCreationDate AND CURRENT_TIMESTAMP -- Valid post dates
+ORDER BY
+    AD.UserKarmaRank ASC,
+    AD.EngagementScore DESC,
+    AD.PostCreationDate DESC
+LIMIT 10000;

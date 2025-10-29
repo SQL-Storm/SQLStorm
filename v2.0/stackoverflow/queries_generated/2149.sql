@@ -1,0 +1,183 @@
+-- {"query": "2149.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1613} 
+with RecursiveTagHierarchy as (
+    -- Recursive CTE to find tags related by parent-child chains through Posts with Tag matching
+    select 
+        t.Id as TagId,
+        t.TagName,
+        1 as Level,
+        array[t.TagName] as Path
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+
+    union all
+
+    select 
+        t.Id,
+        t.TagName,
+        r.Level + 1,
+        r.Path || t.TagName
+    from Tags t
+    join Posts p on p.Tags like concat('%<', t.TagName, '>%')
+    join RecursiveTagHierarchy r on r.TagName = (select unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')) limit 1 offset 0)
+    where t.Id <> r.TagId and r.Level < 3
+),
+UserBadgesAgg as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        coalesce(count(b.Id), 0) as BadgeCount,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostActivityWindow as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.AcceptedAnswerId,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as UserPostRowNum,
+        count(*) over (partition by p.OwnerUserId) as UserPostCount
+    from Posts p
+    where p.PostTypeId in (1, 2) and p.Score is not null
+),
+PostCloseCounts as (
+    select 
+        ph.PostId,
+        count(case when ph.PostHistoryTypeId = 10 then 1 end) as CloseVotes,
+        count(case when ph.PostHistoryTypeId = 11 then 1 end) as ReopenVotes,
+        max(case when ph.PostHistoryTypeId = 10 then ph.CreationDate end) as LastCloseDate
+    from PostHistory ph
+    group by ph.PostId
+),
+UserVotesAgg as (
+    select
+        v.UserId,
+        sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotesGiven,
+        sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotesGiven
+    from Votes v
+    join VoteTypes vt on vt.Id = v.VoteTypeId
+    where v.UserId is not null
+    group by v.UserId
+),
+RecentActiveQuestions as (
+    select 
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.Tags
+    from Posts p
+    where p.PostTypeId = 1 and p.CreationDate > now() - interval '90 day' and p.Score >= 0 and p.ViewCount > 10
+),
+TopCommenters as (
+    select 
+        c.UserId,
+        u.DisplayName,
+        count(c.Id) as CommentCount,
+        avg(length(c.Text)) as AvgCommentLength,
+        max(c.CreationDate) as LastCommentDate
+    from Comments c
+    join Users u on u.Id = c.UserId
+    group by c.UserId, u.DisplayName
+    having count(c.Id) > 20
+),
+QuestionAnswersRanked as (
+    select 
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId,
+        a.CreationDate,
+        a.Score,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as RankByScoreAscDate
+    from Posts a
+    where a.PostTypeId = 2
+),
+FinalResult as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        u.DisplayName as QuestionOwner,
+        q.CreationDate as QuestionCreated,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViews,
+        q.AnswerCount,
+        q.Tags,
+        pc.CloseVotes,
+        pc.ReopenVotes,
+        ub.BadgeCount,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ub.LastBadgeDate,
+        uv.UpVotesGiven,
+        uv.DownVotesGiven,
+        tc.CommentCount as OwnerCommentCount,
+        tc.AvgCommentLength,
+        tc.LastCommentDate,
+        ans_r.AnswerId,
+        ans_r.Score as TopAnswerScore,
+        ans_owner.DisplayName as TopAnswerOwner,
+        ans_r.CreationDate as TopAnswerCreated
+    from RecentActiveQuestions q
+    left join PostCloseCounts pc on pc.PostId = q.Id
+    left join UserBadgesAgg ub on ub.UserId = q.OwnerUserId
+    left join UserVotesAgg uv on uv.UserId = q.OwnerUserId
+    left join TopCommenters tc on tc.UserId = q.OwnerUserId
+    left join QuestionAnswersRanked ans_r on ans_r.QuestionId = q.Id and ans_r.RankByScoreAscDate = 1
+    left join Users ans_owner on ans_owner.Id = ans_r.OwnerUserId
+    left join Users u on u.Id = q.OwnerUserId
+    where q.Tags is not null and q.Tags <> ''
+)
+select 
+    fr.QuestionId,
+    fr.Title,
+    fr.QuestionOwner,
+    fr.QuestionCreated,
+    fr.QuestionScore,
+    fr.QuestionViews,
+    fr.AnswerCount,
+    regexp_replace(fr.Tags, '><', ', ') as ParsedTags,
+    fr.CloseVotes,
+    fr.ReopenVotes,
+    fr.BadgeCount,
+    fr.GoldBadges,
+    fr.SilverBadges,
+    fr.BronzeBadges,
+    fr.LastBadgeDate,
+    fr.UpVotesGiven,
+    fr.DownVotesGiven,
+    fr.OwnerCommentCount,
+    round(fr.AvgCommentLength,2) as AvgCommentLength,
+    fr.LastCommentDate,
+    fr.AnswerId as TopAnswerId,
+    fr.TopAnswerScore,
+    fr.TopAnswerOwner,
+    fr.TopAnswerCreated,
+    case 
+        when fr.CloseVotes is null or fr.CloseVotes = 0 then 'Open'
+        when fr.ReopenVotes > fr.CloseVotes then 'Likely Reopened'
+        else 'Closed'
+    end as CurrentState,
+    length(fr.Title) as TitleLength,
+    (fr.QuestionScore::float / nullif(fr.AnswerCount, 0)) as ScorePerAnswer,
+    greatest(fr.QuestionViews, 1) as SafeViewCount,
+    (fr.QuestionScore * 1.0 / greatest(fr.QuestionViews,1))::numeric(10,4) as ScoreViewRatio,
+    (fr.UpVotesGiven - fr.DownVotesGiven) as NetVotesGiven,
+    (rank() over (partition by null order by fr.QuestionScore desc, fr.QuestionViews desc)) as QuestionRank
+from FinalResult fr
+order by fr.TopAnswerScore desc nulls last, fr.QuestionScore desc, fr.QuestionCreated desc
+limit 50;

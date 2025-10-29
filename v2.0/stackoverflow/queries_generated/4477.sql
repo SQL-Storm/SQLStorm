@@ -1,0 +1,130 @@
+-- {"query": "4477.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1194} 
+
+WITH
+  HighActivityUsers AS (
+    SELECT
+      UserId,
+      COUNT(Id) AS CommentCount
+    FROM Comments
+    GROUP BY
+      UserId
+    HAVING
+      COUNT(Id) > 100
+  ),
+  PostsWithAuthor AS (
+    SELECT
+      p.Id AS PostId,
+      p.PostTypeId,
+      p.OwnerUserId,
+      p.Title,
+      p.CreationDate,
+      p.Score,
+      p.ViewCount,
+      u.DisplayName AS OwnerDisplayName,
+      u.Reputation,
+      ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS ScoreRank,
+      CASE WHEN p.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS PostStatus
+    FROM Posts AS p
+    LEFT JOIN Users AS u
+      ON p.OwnerUserId = u.Id
+    WHERE
+      p.OwnerUserId IS NOT NULL
+  ),
+  RecentEdits AS (
+    SELECT
+      ph.PostId,
+      ph.UserId AS EditorUserId,
+      u.DisplayName AS EditorDisplayName,
+      ph.CreationDate AS EditDate,
+      ph.Comment AS EditComment,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS EditRank
+    FROM PostHistory AS ph
+    LEFT JOIN Users AS u
+      ON ph.UserId = u.Id
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6) AND ph.UserId IS NOT NULL
+  ),
+  UserPostInteraction AS (
+    SELECT
+      p.PostId,
+      p.Title,
+      p.OwnerDisplayName,
+      p.Reputation AS OwnerReputation,
+      p.Score,
+      p.ViewCount,
+      p.PostStatus,
+      re.EditorDisplayName,
+      re.EditDate,
+      re.EditComment,
+      CASE
+        WHEN COALESCE(p.OwnerDisplayName, 'Anonymous') = COALESCE(re.EditorDisplayName, 'Anonymous') THEN 'Self-Edit'
+        ELSE 'External-Edit'
+      END AS EditType
+    FROM PostsWithAuthor AS p
+    LEFT JOIN RecentEdits AS re
+      ON p.PostId = re.PostId AND re.EditRank = 1
+    WHERE
+      p.PostTypeId = 1 /* Questions only */
+  )
+SELECT
+  upi.PostId,
+  upi.Title,
+  upi.OwnerDisplayName,
+  upi.OwnerReputation,
+  upi.Score,
+  upi.ViewCount,
+  upi.PostStatus,
+  upi.EditorDisplayName,
+  upi.EditDate,
+  upi.EditComment,
+  upi.EditType,
+  COUNT(c.Id) AS CommentCountOnPost,
+  SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+  SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+  AVG(pwa_answers.Score) AS AvgAnswerScore,
+  hau.CommentCount AS UserTotalComments,
+  CASE
+    WHEN upi.OwnerReputation > 100000 THEN 'High Reputation'
+    WHEN upi.OwnerReputation BETWEEN 10000 AND 100000 THEN 'Medium Reputation'
+    ELSE 'Low Reputation'
+  END AS ReputationBracket,
+  CASE
+    WHEN upi.EditDate IS NULL THEN 'No Recent Edit'
+    WHEN upi.EditDate < DATE('now', '-30 day') THEN 'Old Edit'
+    ELSE 'Recent Edit'
+  END AS EditRecency,
+  UPPER(SUBSTRING(upi.Title, 1, 3)) AS TitlePrefix,
+  CASE
+    WHEN upi.OwnerDisplayName IS NULL THEN 'Guest'
+    ELSE 'Registered User'
+  END AS UserStatus,
+  COALESCE(upi.EditorDisplayName, 'N/A') AS DisplayEditorName
+FROM UserPostInteraction AS upi
+LEFT JOIN Comments AS c
+  ON upi.PostId = c.PostId
+LEFT JOIN Votes AS v
+  ON upi.PostId = v.PostId
+LEFT JOIN PostsWithAuthor AS pwa_answers
+  ON upi.PostId = pwa_answers.ParentId AND pwa_answers.PostTypeId = 2 /* Answers */
+LEFT JOIN HighActivityUsers AS hau
+  ON upi.OwnerUserId = hau.UserId
+GROUP BY
+  upi.PostId,
+  upi.Title,
+  upi.OwnerDisplayName,
+  upi.OwnerReputation,
+  upi.Score,
+  upi.ViewCount,
+  upi.PostStatus,
+  upi.EditorDisplayName,
+  upi.EditDate,
+  upi.EditComment,
+  upi.EditType,
+  hau.CommentCount,
+  upi.OwnerUserId
+HAVING
+  COUNT(c.Id) > 5 OR SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) > 10 OR COUNT(DISTINCT v.UserId) > 3 /* Filter for posts with significant interaction */
+ORDER BY
+  upi.Score DESC,
+  upi.ViewCount DESC
+LIMIT 100;

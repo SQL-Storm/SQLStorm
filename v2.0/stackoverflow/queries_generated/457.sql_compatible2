@@ -1,0 +1,282 @@
+with
+active_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.location,
+    width_bucket(u.reputation, 0, 100000, 10) as rep_bucket,
+    coalesce(nullif(trim(u.location), ''), 'Unknown') as norm_location
+  from users u
+  where u.lastaccessdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+),
+recent_questions as (
+  select
+    p.id as question_id,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.owneruserid as owner_user_id,
+    case when p.owneruserid is null or p.owneruserid = -1 then null else p.owneruserid end as safe_owner_user_id,
+    p.title,
+    p.tags,
+    p.answercount,
+    (p.closeddate is not null) as is_closed,
+    coalesce(p.favoritecount, 0) as favoritecount,
+    cast(floor(extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - coalesce(p.lastactivitydate, p.creationdate)))) as bigint) as age_seconds
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+),
+question_tags as (
+  select
+    q.question_id,
+    lower(t) as tag
+  from recent_questions q
+  cross join lateral unnest(
+    case
+      when q.tags is null or length(q.tags) < 3 then array[]::text[]
+      else string_to_array(substring(q.tags, 2, length(q.tags)-2), '><')
+    end
+  ) as t
+),
+vote_aggs as (
+  select
+    v.postid as post_id,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+    sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started,
+    sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded,
+    count(*) as total_votes,
+    max(v.creationdate) as last_vote_at
+  from votes v
+  group by v.postid
+),
+answers as (
+  select
+    a.id as answer_id,
+    a.parentid as question_id,
+    a.owneruserid as answer_owner_id,
+    a.score as answer_score,
+    a.creationdate as answer_created,
+    (q.acceptedanswerid = a.id) as is_accepted
+  from posts a
+  join posts q on q.id = a.parentid and q.posttypeid = 1
+  where a.posttypeid = 2
+),
+answer_stats as (
+  select
+    question_id,
+    count(*) as answer_count_actual,
+    sum(case when is_accepted then 1 else 0 end) as accepted_count,
+    max(answer_score) as max_answer_score,
+    percentile_cont(0.5) within group (order by answer_score) as median_answer_score
+  from answers
+  group by question_id
+),
+history_flags as (
+  select
+    q.question_id,
+    exists (
+      select 1
+      from posthistory ph
+      where ph.postid = q.question_id and ph.posthistorytypeid = 10
+    ) as had_close_votes,
+    exists (
+      select 1
+      from posthistory ph
+      where ph.postid = q.question_id and ph.posthistorytypeid = 11
+    ) as had_reopen_votes,
+    exists (
+      select 1
+      from posthistory ph
+      where ph.postid = q.question_id and ph.posthistorytypeid = 19
+    ) as was_protected,
+    exists (
+      select 1
+      from posthistory ph
+      where ph.postid = q.question_id and ph.posthistorytypeid in (35,36,17)
+    ) as was_migrated
+  from recent_questions q
+),
+user_badges as (
+  select
+    u.id as user_id,
+    sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+    sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+    sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+    count(*) as total_badges,
+    max(b.date) as last_badge_at
+  from users u
+  left join badges b on b.userid = u.id
+  group by u.id
+),
+link_rel as (
+  select
+    pl.postid as post_id,
+    sum(case when pl.linktypeid = 3 then 1 else 0 end) as dupe_links,
+    sum(case when pl.linktypeid = 1 then 1 else 0 end) as linked_links,
+    count(*) as all_links
+  from postlinks pl
+  group by pl.postid
+),
+ranked_questions as (
+  select
+    q.question_id,
+    q.creationdate,
+    q.score,
+    q.viewcount,
+    q.safe_owner_user_id,
+    row_number() over (order by q.viewcount desc) as rn_by_views,
+    dense_rank() over (order by q.score desc) as dr_by_score,
+    ntile(10) over (order by q.creationdate asc) as age_tile
+  from recent_questions q
+),
+features as (
+  select
+    rq.question_id,
+    rq.creationdate,
+    rq.score,
+    rq.viewcount,
+    rq.safe_owner_user_id,
+    au.displayname as owner_name,
+    au.reputation as owner_rep,
+    ub.total_badges,
+    ub.gold_badges,
+    ub.silver_badges,
+    ub.bronze_badges,
+    coalesce(va.upvotes,0) as upvotes,
+    coalesce(va.downvotes,0) as downvotes,
+    coalesce(va.favorites,0) as favorites_votes,
+    coalesce(va.bounty_started,0) as bounty_started,
+    coalesce(va.bounty_awarded,0) as bounty_awarded,
+    coalesce(asx.answer_count_actual,0) as answer_count,
+    coalesce(asx.accepted_count,0) as accepted_answers,
+    asx.max_answer_score,
+    asx.median_answer_score,
+    hf.had_close_votes,
+    hf.had_reopen_votes,
+    hf.was_protected,
+    hf.was_migrated,
+    coalesce(lr.dupe_links,0) as dupes,
+    coalesce(lr.linked_links,0) as links,
+    rq.rn_by_views,
+    rq.dr_by_score,
+    rq.age_tile,
+    case
+      when coalesce(va.upvotes,0) + coalesce(va.downvotes,0) = 0 then null
+      else round( (cast(coalesce(va.upvotes,0) as numeric)) / nullif(coalesce(va.upvotes,0) + coalesce(va.downvotes,0),0) * 100, 2)
+    end as upvote_ratio_pct,
+    greatest(0, rq.viewcount - coalesce(va.total_votes,0)*10) as adjusted_views,
+    case
+      when coalesce(asx.accepted_count,0) = 0 then 'Unaccepted'
+      when coalesce(asx.accepted_count,0) >= 1 then 'HasAccepted'
+      else 'Unknown'
+    end as acceptance_flag,
+    substring(coalesce(rq.title,'') from 1 for 120) as title_snippet,
+    lower(coalesce(au.location, 'unknown')) like '%united%' as loc_like_united,
+    regexp_replace(coalesce(rq.title,''), '\s+', ' ', 'g') as title_compact
+  from ranked_questions rq
+  left join vote_aggs va on va.post_id = rq.question_id
+  left join answer_stats asx on asx.question_id = rq.question_id
+  left join history_flags hf on hf.question_id = rq.question_id
+  left join link_rel lr on lr.post_id = rq.question_id
+  left join users au on au.id = rq.safe_owner_user_id
+  left join user_badges ub on ub.user_id = rq.safe_owner_user_id
+),
+tag_rollups as (
+  select
+    qt.tag,
+    f.question_id,
+    f.score,
+    f.viewcount,
+    f.upvotes,
+    f.downvotes,
+    f.accepted_answers,
+    f.dupes
+  from question_tags qt
+  join features f on f.question_id = qt.question_id
+),
+tag_stats as (
+  select
+    tag,
+    count(*) as q_count,
+    avg(score) as avg_score,
+    avg(viewcount) as avg_views,
+    sum(accepted_answers) as total_accepted,
+    sum(dupes) as total_dupes,
+    stddev_pop(score) as stddev_score
+  from tag_rollups
+  group by tag
+),
+tag_universe as (
+  select lower(t.tagname) as tag from tags t
+  union
+  select distinct tag from question_tags
+),
+filtered as (
+  select
+    f.*,
+    array_agg(distinct qt.tag) filter (where qt.tag is not null) as tags_array
+  from features f
+  left join question_tags qt on qt.question_id = f.question_id
+  where
+    (
+      (f.score >= 5 and f.viewcount >= 1000)
+      or (f.upvotes - f.downvotes >= 10)
+      or (f.was_protected is true)
+    )
+    and not (f.had_close_votes is true and f.had_reopen_votes is false)
+    and coalesce(f.owner_rep, 0) >= 50
+  group by
+    f.question_id, f.creationdate, f.score, f.viewcount, f.safe_owner_user_id, f.owner_name,
+    f.owner_rep, f.total_badges, f.gold_badges, f.silver_badges, f.bronze_badges,
+    f.upvotes, f.downvotes, f.favorites_votes, f.bounty_started, f.bounty_awarded,
+    f.answer_count, f.accepted_answers, f.max_answer_score, f.median_answer_score,
+    f.had_close_votes, f.had_reopen_votes, f.was_protected, f.was_migrated,
+    f.dupes, f.links, f.rn_by_views, f.dr_by_score, f.age_tile,
+    f.upvote_ratio_pct, f.adjusted_views, f.acceptance_flag, f.title_snippet, f.loc_like_united, f.title_compact
+)
+select
+  f.question_id,
+  f.creationdate,
+  f.title_snippet,
+  coalesce(array_to_string(f.tags_array, ','), '') as tags_csv,
+  f.owner_name,
+  f.owner_rep,
+  f.total_badges,
+  f.score,
+  f.viewcount,
+  f.upvotes,
+  f.downvotes,
+  f.upvote_ratio_pct,
+  f.favorites_votes,
+  f.answer_count,
+  f.accepted_answers,
+  f.max_answer_score,
+  f.median_answer_score,
+  f.dupes,
+  f.links,
+  f.rn_by_views,
+  f.dr_by_score,
+  f.age_tile,
+  f.was_protected,
+  f.was_migrated,
+  tt.tag as top_tag,
+  ts.q_count as top_tag_q_count,
+  ts.avg_score as top_tag_avg_score,
+  ts.avg_views as top_tag_avg_views,
+  ts.stddev_score as top_tag_score_stddev
+from filtered f
+left join lateral (
+  select qt.tag
+  from question_tags qt
+  where qt.question_id = f.question_id
+  order by qt.tag asc
+  limit 1
+) tt on true
+left join tag_stats ts on ts.tag = tt.tag
+order by f.dr_by_score asc, f.rn_by_views asc
+limit 500;

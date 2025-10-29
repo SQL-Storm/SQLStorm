@@ -1,0 +1,273 @@
+WITH UserActivity AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.CreationDate,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COUNT(DISTINCT v.Id) as VoteCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        MAX(b.Date) as LastBadgeDate,
+        MAX(v.CreationDate) as LastVoteDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.CreationDate
+),
+RankedUsers AS (
+    SELECT 
+        ua.*,
+        ROW_NUMBER() OVER (ORDER BY ua.PostCount DESC, ua.Reputation DESC) as PostRank,
+        DENSE_RANK() OVER (ORDER BY ua.Reputation DESC) as RepRank,
+        RANK() OVER (ORDER BY ua.CommentCount DESC, ua.VoteCount DESC) as EngagementRank
+    FROM UserActivity ua
+),
+TopPosts AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ParentId,
+        p.AcceptedAnswerId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END as PostType,
+        CASE 
+            WHEN p.Score >= 100 THEN 'HighlyVoted'
+            WHEN p.Score >= 50 THEN 'ModeratelyVoted'
+            WHEN p.Score >= 10 THEN 'LowVoted'
+            ELSE 'Unpopular'
+        END as VoteCategory,
+        CASE 
+            WHEN p.ViewCount >= 1000 THEN 'HighTraffic'
+            WHEN p.ViewCount >= 100 THEN 'ModerateTraffic'
+            ELSE 'LowTraffic'
+        END as TrafficCategory,
+        COALESCE(p.Tags, '') as CleanTags,
+        STRING_AGG(
+            CASE 
+                WHEN p.Tags IS NOT NULL AND p.Tags != '' THEN 
+                    TRIM(BOTH '<>' FROM SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags) - 2)))
+                ELSE ''
+            END,
+            ', '
+        ) OVER (PARTITION BY p.OwnerUserId) as UserTagList
+    FROM Posts p
+    WHERE p.Score > 0 
+      AND p.PostTypeId IN (1, 2) 
+      AND p.CreationDate >= TIMESTAMP '2020-01-01'
+),
+PostWithHistory AS (
+    SELECT 
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate as HistoryDate,
+        ph.UserId,
+        ph.Text,
+        ph.Comment,
+        pt.Name as HistoryTypeName,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) as RecentHistoryRank,
+        LAG(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) as PreviousHistoryDate,
+        CAST(
+            EXTRACT(EPOCH FROM (ph.CreationDate - LAG(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate))) 
+            / 86400
+            AS INTEGER
+        ) as DaysSincePrevious,
+        CASE 
+            WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20) THEN 1
+            ELSE 0
+        END as SignificantEvent
+    FROM PostHistory ph
+    LEFT JOIN PostHistoryTypes pt ON ph.PostHistoryTypeId = pt.Id
+    WHERE ph.CreationDate >= TIMESTAMP '2020-01-01'
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'PopularTag'
+            WHEN t.Count > 100 THEN 'ModerateTag'
+            ELSE 'NicheTag'
+        END as TagPopularity,
+        CASE WHEN EXISTS(SELECT 1 FROM Posts p WHERE p.Tags LIKE CONCAT('%', t.TagName, '%')) THEN 1 ELSE 0 END as HasPosts
+    FROM Tags t
+    WHERE t.Count > 0
+),
+QuestionAnalysis AS (
+    SELECT 
+        q.Id as QuestionId,
+        q.Title,
+        q.Score,
+        q.ViewCount,
+        q.CreationDate,
+        q.OwnerUserId,
+        q.AnswerCount,
+        q.CommentCount,
+        q.FavoriteCount,
+        q.Tags,
+        q.ClosedDate,
+        CASE 
+            WHEN q.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN q.AnswerCount > 0 THEN 'Answered'
+            ELSE 'Unanswered'
+        END as QuestionStatus,
+        (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = q.Id AND a.PostTypeId = 2 AND a.Score >= 0) as ValidAnswers,
+        (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = q.Id AND a.PostTypeId = 2 AND a.Score < 0) as InvalidAnswers,
+        CASE 
+            WHEN (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = q.Id AND a.PostTypeId = 2 AND a.Score >= 0) > 0 
+                 AND q.AcceptedAnswerId IS NOT NULL THEN 'HasAcceptedAnswer'
+            WHEN (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = q.Id AND a.PostTypeId = 2 AND a.Score >= 0) > 0 THEN 'HasAnswersNoAccept'
+            ELSE 'NoAnswers'
+        END as AnswerStatus,
+        COALESCE(
+            (SELECT AVG(p.Score) FROM Posts p WHERE p.ParentId = q.Id AND p.PostTypeId = 2), 
+            0
+        ) as AvgAnswerScore
+    FROM Posts q
+    WHERE q.PostTypeId = 1
+),
+AnswerAnalysis AS (
+    SELECT 
+        a.Id as AnswerId,
+        a.ParentId,
+        a.Score,
+        a.CreationDate,
+        a.OwnerUserId,
+        a.LastEditDate,
+        a.LastEditorUserId,
+        CASE 
+            WHEN a.Score >= 50 THEN 'HighScore'
+            WHEN a.Score >= 10 THEN 'ModerateScore'
+            WHEN a.Score >= 1 THEN 'LowScore'
+            ELSE 'NegativeScore'
+        END as ScoreCategory,
+        CASE 
+            WHEN a.OwnerUserId IS NOT NULL THEN 'UserAnswer'
+            ELSE 'CommunityAnswer'
+        END as AnswerType,
+        CAST(
+            EXTRACT(EPOCH FROM (COALESCE(a.LastEditDate, a.CreationDate) - a.CreationDate)) / 86400
+            AS INTEGER
+        ) as DaysToEdit
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+),
+PostAnalysis AS (
+    SELECT 
+        p.PostId,
+        p.PostType,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.VoteCategory,
+        p.TrafficCategory,
+        p.CreationDate,
+        CASE 
+            WHEN p.PostType = 'Question' THEN 'QuestionPost'
+            WHEN p.PostType = 'Answer' THEN 'AnswerPost'
+            ELSE 'OtherPost'
+        END as PostClassification,
+        CASE 
+            WHEN p.Score >= 100 AND p.ViewCount >= 1000 THEN 'HighImpact'
+            WHEN p.Score >= 50 AND p.ViewCount >= 100 THEN 'MediumImpact'
+            WHEN p.Score >= 10 THEN 'LowImpact'
+            ELSE 'MinimalImpact'
+        END as ImpactLevel,
+        EXTRACT(YEAR FROM p.CreationDate) as PostYear,
+        EXTRACT(MONTH FROM p.CreationDate) as PostMonth,
+        EXTRACT(DAY FROM p.CreationDate) as PostDay,
+        RANK() OVER (PARTITION BY EXTRACT(YEAR FROM p.CreationDate), EXTRACT(MONTH FROM p.CreationDate) ORDER BY p.Score DESC) as MonthlyScoreRank,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) as GlobalScoreRank
+    FROM TopPosts p
+)
+SELECT 
+    COUNT(DISTINCT u.UserId) as ActiveUsers,
+    COUNT(DISTINCT p.PostId) as PostCount,
+    COUNT(DISTINCT r.PostId) as RecentPostCount,
+    SUM(CASE WHEN u.PostRank <= 10 THEN 1 ELSE 0 END) as Top10PostUsers,
+    SUM(CASE WHEN u.RepRank <= 50 THEN 1 ELSE 0 END) as Top50RepUsers,
+    AVG(CAST(u.PostCount AS DOUBLE PRECISION)) as AvgPostsPerUser,
+    AVG(CAST(u.CommentCount AS DOUBLE PRECISION)) as AvgCommentsPerUser,
+    AVG(CAST(u.VoteCount AS DOUBLE PRECISION)) as AvgVotesPerUser,
+    MAX(u.Reputation) as MaxReputation,
+    MIN(u.Reputation) as MinReputation,
+    COUNT(DISTINCT CASE WHEN p.VoteCategory = 'HighlyVoted' THEN p.PostId END) as HighlyVotedPosts,
+    COUNT(DISTINCT CASE WHEN p.TrafficCategory = 'HighTraffic' THEN p.PostId END) as HighTrafficPosts,
+    AVG(CAST(p.Score AS DOUBLE PRECISION)) as AvgPostScore,
+    AVG(CAST(p.ViewCount AS DOUBLE PRECISION)) as AvgPostViews,
+    COUNT(DISTINCT CASE WHEN p.PostType = 'Question' THEN p.PostId END) as QuestionCount,
+    COUNT(DISTINCT CASE WHEN p.PostType = 'Answer' THEN p.PostId END) as AnswerCount,
+    COUNT(DISTINCT CASE WHEN p.PostType = 'Question' AND ra.QuestionStatus = 'Closed' THEN p.PostId END) as ClosedQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostType = 'Question' AND ra.QuestionStatus = 'Answered' THEN p.PostId END) as AnsweredQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostType = 'Question' AND ra.QuestionStatus = 'Unanswered' THEN p.PostId END) as UnansweredQuestions,
+    COUNT(DISTINCT CASE WHEN ra.AnswerStatus = 'HasAcceptedAnswer' THEN ra.QuestionId END) as QuestionsWithAcceptedAnswer,
+    COUNT(DISTINCT CASE WHEN ra.AnswerStatus = 'HasAnswersNoAccept' THEN ra.QuestionId END) as QuestionsWithAnswersNoAccept,
+    COUNT(DISTINCT CASE WHEN ra.AnswerStatus = 'NoAnswers' THEN ra.QuestionId END) as QuestionsWithNoAnswers,
+    AVG(CAST(ra.AvgAnswerScore AS DOUBLE PRECISION)) as AvgAnswerScore,
+    COUNT(DISTINCT CASE WHEN pa.ImpactLevel = 'HighImpact' THEN pa.PostId END) as HighImpactPosts,
+    COUNT(DISTINCT CASE WHEN pa.ImpactLevel = 'MediumImpact' THEN pa.PostId END) as MediumImpactPosts,
+    COUNT(DISTINCT CASE WHEN pa.ImpactLevel = 'LowImpact' THEN pa.PostId END) as LowImpactPosts,
+    COUNT(DISTINCT CASE WHEN pa.ImpactLevel = 'MinimalImpact' THEN pa.PostId END) as MinimalImpactPosts,
+    COUNT(DISTINCT CASE WHEN pa.PostClassification = 'QuestionPost' THEN pa.PostId END) as TotalQuestions,
+    COUNT(DISTINCT CASE WHEN pa.PostClassification = 'AnswerPost' THEN pa.PostId END) as TotalAnswers,
+    COUNT(DISTINCT ta.TagName) as TotalTags,
+    COUNT(DISTINCT CASE WHEN ta.TagPopularity = 'PopularTag' THEN ta.TagName END) as PopularTags,
+    COUNT(DISTINCT CASE WHEN ta.TagPopularity = 'ModerateTag' THEN ta.TagName END) as ModerateTags,
+    COUNT(DISTINCT CASE WHEN ta.TagPopularity = 'NicheTag' THEN ta.TagName END) as NicheTags,
+    AVG(CAST(pa.MonthlyScoreRank AS DOUBLE PRECISION)) as AvgMonthlyScoreRank,
+    AVG(CAST(pa.GlobalScoreRank AS DOUBLE PRECISION)) as AvgGlobalScoreRank,
+    COUNT(DISTINCT CASE WHEN pa.PostYear = 2020 THEN pa.PostId END) as Posts2020,
+    COUNT(DISTINCT CASE WHEN pa.PostYear = 2021 THEN pa.PostId END) as Posts2021,
+    COUNT(DISTINCT CASE WHEN pa.PostYear = 2022 THEN pa.PostId END) as Posts2022,
+    COUNT(DISTINCT CASE WHEN pa.PostYear = 2023 THEN pa.PostId END) as Posts2023,
+    COUNT(DISTINCT CASE WHEN pa.PostYear = 2024 THEN pa.PostId END) as Posts2024,
+    COUNT(DISTINCT CASE WHEN pa.PostMonth = 1 THEN pa.PostId END) as PostsJanuary,
+    COUNT(DISTINCT CASE WHEN pa.PostMonth = 2 THEN pa.PostId END) as PostsFebruary,
+    COUNT(DISTINCT CASE WHEN pa.PostMonth = 3 THEN pa.PostId END) as PostsMarch,
+    COUNT(DISTINCT CASE WHEN pa.PostMonth = 4 THEN pa.PostId END) as PostsApril,
+    COUNT(DISTINCT CASE WHEN pa.PostMonth = 5 THEN pa.PostId END) as PostsMay,
+    COUNT(DISTINCT CASE WHEN pa.PostMonth = 6 THEN pa.PostId END) as PostsJune,
+    COUNT(DISTINCT CASE WHEN pa.PostMonth = 7 THEN pa.PostId END) as PostsJuly,
+    COUNT(DISTINCT CASE WHEN pa.PostMonth = 8 THEN pa.PostId END) as PostsAugust,
+    COUNT(DISTINCT CASE WHEN pa.PostMonth = 9 THEN pa.PostId END) as PostsSeptember,
+    COUNT(DISTINCT CASE WHEN pa.PostMonth = 10 THEN pa.PostId END) as PostsOctober,
+    COUNT(DISTINCT CASE WHEN pa.PostMonth = 11 THEN pa.PostId END) as PostsNovember,
+    COUNT(DISTINCT CASE WHEN pa.PostMonth = 12 THEN pa.PostId END) as PostsDecember
+FROM RankedUsers u
+FULL OUTER JOIN TopPosts p ON u.UserId = p.OwnerUserId
+FULL OUTER JOIN PostWithHistory r ON p.PostId = r.PostId
+FULL OUTER JOIN QuestionAnalysis ra ON p.PostId = ra.QuestionId
+FULL OUTER JOIN PostAnalysis pa ON p.PostId = pa.PostId
+FULL OUTER JOIN TagAnalysis ta ON ta.HasPosts = 1
+WHERE u.Reputation > 1000
+  AND (p.CreationDate IS NULL OR p.CreationDate >= TIMESTAMP '2020-01-01')
+  AND (r.RecentHistoryRank <= 5 OR r.RecentHistoryRank IS NULL)
+  AND ra.QuestionId IS NOT NULL
+  AND pa.PostId IS NOT NULL
+  AND ta.TagName IS NOT NULL
+GROUP BY u.UserId, p.PostId, r.PostId, ra.QuestionId, pa.PostId, ta.TagName, u.PostRank, u.RepRank, u.PostCount, u.CommentCount, u.VoteCount, u.Reputation
+HAVING COUNT(*) > 0
+ORDER BY ActiveUsers DESC, PostCount DESC
+LIMIT 1000;

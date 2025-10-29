@@ -1,0 +1,220 @@
+-- {"query": "1864.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3495} 
+
+WITH UserActivitySummary AS (
+    -- CTE 1: Gathers comprehensive activity metrics for each user, handling NULLs for non-existent activities.
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Location,
+        U.AboutMe,
+        U.WebsiteUrl,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS UserUpVotesGiven,
+        U.DownVotes AS UserDownVotesGiven,
+        COALESCE(COUNT(DISTINCT P.Id), 0) AS TotalPosts,
+        COALESCE(COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END), 0) AS TotalQuestions,
+        COALESCE(COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END), 0) AS TotalAnswers,
+        COALESCE(COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 AND P.AcceptedAnswerId IS NOT NULL THEN P.Id END), 0) AS QuestionsWithAcceptedAnswer,
+        COALESCE(COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 AND ParentQ.AcceptedAnswerId = P.Id THEN P.Id END), 0) AS AcceptedAnswersCount,
+        COALESCE(SUM(P.Score), 0) AS TotalPostScoreSum,
+        COALESCE(SUM(CASE WHEN V_Received.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS TotalUpVotesReceived, -- VoteTypeId 2 = UpMod
+        COALESCE(SUM(CASE WHEN V_Received.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS TotalDownVotesReceived, -- VoteTypeId 3 = DownMod
+        COALESCE(SUM(CASE WHEN V_Received.VoteTypeId = 12 THEN 1 ELSE 0 END), 0) AS TotalSpamVotesReceived, -- VoteTypeId 12 = Spam
+        COALESCE(SUM(CASE WHEN V_Given.VoteTypeId = 12 THEN 1 ELSE 0 END), 0) AS TotalSpamVotesGiven, -- VoteTypeId 12 = Spam given by user
+        COALESCE(COUNT(DISTINCT B.Id), 0) AS TotalBadges,
+        MAX(CASE WHEN B.Class = 1 THEN B.Date END) AS LastGoldBadgeDate, -- Date of the most recent Gold badge
+        COALESCE(AVG(C.Score), 0.0) AS AverageCommentScore, -- Average score of comments made by the user
+        COALESCE(COUNT(DISTINCT PH.Id), 0) AS TotalPostHistoryEvents,
+        COALESCE(SUM(CASE WHEN PH.PostHistoryTypeId IN (10, 12, 14, 19) THEN 1 ELSE 0 END), 0) AS ModerationActionImpactCount -- Post Closed, Deleted, Locked, Protected
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Posts ParentQ ON P.ParentId = ParentQ.Id AND P.PostTypeId = 2 -- Link answers to their parent questions
+    LEFT JOIN Votes V_Received ON P.Id = V_Received.PostId -- Votes received on user's posts
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN PostHistory PH ON U.Id = PH.UserId -- PostHistory initiated by the user
+    LEFT JOIN Votes V_Given ON U.Id = V_Given.UserId AND V_Given.VoteTypeId = 12 -- Spam votes given by the user
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Location, U.AboutMe, U.WebsiteUrl, U.Views, U.UpVotes, U.DownVotes
+),
+UserMonthlyAnswerContributions AS (
+    -- CTE 2: Identifies the month with the highest number of answers from each user.
+    SELECT
+        P.OwnerUserId AS UserId,
+        DATE_TRUNC('month', P.CreationDate) AS BusiestActivityMonth,
+        COUNT(P.Id) AS AnswersInMonthCount,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY COUNT(P.Id) DESC, DATE_TRUNC('month', P.CreationDate) DESC) AS rn
+    FROM Posts P
+    WHERE P.PostTypeId = 2 AND P.OwnerUserId IS NOT NULL -- Only answers with a valid owner
+    GROUP BY P.OwnerUserId, DATE_TRUNC('month', P.CreationDate)
+),
+TopUserQuestions AS (
+    -- CTE 3: Ranks each user's questions by ViewCount, focusing on questions with an accepted answer.
+    SELECT
+        Q.OwnerUserId AS UserId,
+        Q.Id AS QuestionId,
+        Q.Title AS QuestionTitle,
+        Q.ViewCount,
+        Q.Score AS QuestionScore,
+        Q.CreationDate AS QuestionCreationDate,
+        ROW_NUMBER() OVER (PARTITION BY Q.OwnerUserId ORDER BY Q.ViewCount DESC, Q.CreationDate DESC) AS rn
+    FROM Posts Q
+    WHERE Q.PostTypeId = 1 -- Questions
+      AND Q.AcceptedAnswerId IS NOT NULL -- Must have an accepted answer
+      AND Q.ViewCount IS NOT NULL AND Q.ViewCount > 0
+      AND Q.OwnerUserId IS NOT NULL
+),
+UserTagFrequency AS (
+    -- CTE 4: Extracts and counts tags used by each user in their questions, identifying the most frequent ones.
+    SELECT
+        P.OwnerUserId AS UserId,
+        TRIM(LOWER(Tag.Value)) AS TagName,
+        COUNT(*) AS TagCount,
+        RANK() OVER (PARTITION BY P.OwnerUserId ORDER BY COUNT(*) DESC, TRIM(LOWER(Tag.Value))) AS TagRank
+    FROM Posts P
+    -- Use string_to_array as hinted in schema for tags, UNNEST to expand array into rows
+    JOIN LATERAL UNNEST(string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><')) AS Tag(Value) ON TRUE
+    WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL AND P.OwnerUserId IS NOT NULL
+    GROUP BY P.OwnerUserId, TRIM(LOWER(Tag.Value))
+),
+RecentEngagementAnalysis AS (
+    -- CTE 5: Combines distinct users who have been active recently either by posting or voting, using UNION ALL.
+    SELECT DISTINCT U.Id AS UserId, 'RecentPostActivity' AS EngagementType
+    FROM Users U
+    JOIN Posts P ON U.Id = P.OwnerUserId
+    WHERE P.CreationDate >= NOW() - INTERVAL '6 months'
+    UNION ALL
+    SELECT DISTINCT U.Id AS UserId, 'RecentVoteActivity' AS EngagementType
+    FROM Users U
+    JOIN Votes V ON U.Id = V.UserId
+    WHERE V.CreationDate >= NOW() - INTERVAL '3 months'
+),
+UserReputationTrend AS (
+    -- CTE 6: Calculates the average score change for posts edited by a user, indicating reputation 'momentum'.
+    SELECT
+        PH.UserId,
+        AVG(P.Score - LAG(P.Score, 1, P.Score) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate)) AS AvgScoreChangeOnEditedPosts
+    FROM PostHistory PH
+    JOIN Posts P ON PH.PostId = P.Id
+    WHERE PH.PostHistoryTypeId IN (4, 5, 6, 8) -- Edit Title, Edit Body, Edit Tags, Rollback Body (activities that change post content/metadata)
+      AND PH.UserId IS NOT NULL
+      AND P.Score IS NOT NULL
+    GROUP BY PH.UserId
+),
+FinalUserRanking AS (
+    -- CTE 7: Calculates a composite influence score and applies a ranking based on multiple criteria.
+    SELECT
+        UAS.UserId,
+        UAS.DisplayName,
+        UAS.Reputation,
+        UAS.UserCreationDate,
+        UAS.LastAccessDate,
+        UAS.Location,
+        UAS.AboutMe,
+        UAS.WebsiteUrl,
+        UAS.TotalQuestions,
+        UAS.TotalAnswers,
+        UAS.AcceptedAnswersCount,
+        UAS.TotalPostScoreSum,
+        UAS.TotalUpVotesReceived,
+        UAS.TotalDownVotesReceived,
+        UAS.TotalBadges,
+        UAS.UserProfileViews,
+        UAS.UserUpVotesGiven,
+        UAS.UserDownVotesGiven,
+        UAS.AverageCommentScore,
+        UAS.TotalSpamVotesReceived,
+        UAS.TotalSpamVotesGiven,
+        UAS.LastGoldBadgeDate,
+        (EXTRACT(EPOCH FROM (NOW() - UAS.UserCreationDate)) / 86400.0) AS UserAgeDays, -- User age in days
+        -- Composite Influence Score: a weighted sum of various metrics, with NULL handling.
+        (
+            (UAS.Reputation * 0.4) +
+            (UAS.TotalUpVotesReceived * 0.2) +
+            (UAS.AcceptedAnswersCount * 10.0) + -- High weight for accepted answers
+            (UAS.TotalPostScoreSum * 0.1) +
+            (UAS.TotalBadges * 0.75) +
+            (UAS.UserProfileViews * 0.0005) +
+            (UAS.AverageCommentScore * 0.15) -
+            (UAS.TotalDownVotesReceived * 0.1) -
+            (UAS.TotalSpamVotesReceived * 50.0) - -- Significant penalty for receiving spam votes
+            (UAS.TotalSpamVotesGiven * 25.0) +    -- Penalty for giving spam votes
+            (COALESCE(URT.AvgScoreChangeOnEditedPosts, 0) * 2.0) + -- Boost for positive score momentum
+            (CASE WHEN REA.UserId IS NOT NULL THEN 5.0 ELSE 0.0 END) -- Boost for recent engagement
+        ) AS CompositeScore,
+        NTILE(10) OVER (ORDER BY UAS.Reputation DESC, UAS.TotalUpVotesReceived DESC) AS ReputationRankTile, -- Divides users into 10 groups by reputation/upvotes
+        RANK() OVER (ORDER BY UAS.Reputation DESC, UAS.TotalUpVotesReceived DESC, UAS.AcceptedAnswersCount DESC) AS GlobalRank
+    FROM UserActivitySummary UAS
+    LEFT JOIN UserReputationTrend URT ON UAS.UserId = URT.UserId
+    LEFT JOIN (SELECT DISTINCT UserId FROM RecentEngagementAnalysis) REA ON UAS.UserId = REA.UserId -- Join to check for recent engagement
+    WHERE UAS.Reputation > 500 -- Minimum reputation for consideration
+      AND UAS.LastAccessDate >= NOW() - INTERVAL '1 year' -- Must be active within the last year
+)
+-- Main query to select the top influential users and their detailed profile.
+SELECT
+    FUR.UserId,
+    FUR.DisplayName,
+    FUR.Reputation,
+    FUR.CompositeScore,
+    FUR.GlobalRank,
+    FUR.UserAgeDays,
+    -- Complex string manipulation: format DisplayName, handle NULL Location
+    CONCAT(
+        UPPER(SUBSTRING(FUR.DisplayName, 1, 1)),
+        COALESCE(LOWER(SUBSTRING(FUR.DisplayName, 2, LENGTH(FUR.DisplayName) - 1)), ''),
+        ' (', COALESCE(FUR.Location, 'Unknown City'), ')'
+    ) AS FormattedUserLocation,
+    -- Complicated CASE expression with string matching and NULL logic for AboutMe
+    CASE
+        WHEN FUR.AboutMe IS NULL OR LENGTH(TRIM(FUR.AboutMe)) = 0 THEN 'No Bio Provided'
+        WHEN FUR.AboutMe ILIKE '%engineer%' OR FUR.AboutMe ILIKE '%developer%' THEN 'Tech Professional'
+        WHEN FUR.AboutMe ILIKE '%student%' OR FUR.AboutMe ILIKE '%learner%' THEN 'Student/Learner'
+        ELSE 'General Contributor'
+    END AS ProfileCategory,
+    FUR.TotalQuestions,
+    FUR.TotalAnswers,
+    FUR.AcceptedAnswersCount,
+    (FUR.AcceptedAnswersCount * 100.0 / NULLIF(FUR.TotalAnswers, 0)) AS AcceptedAnswerRate, -- Division by zero handling
+    FUR.TotalUpVotesReceived,
+    FUR.TotalDownVotesReceived,
+    (FUR.TotalUpVotesReceived * 100.0 / NULLIF(FUR.TotalUpVotesReceived + FUR.TotalDownVotesReceived, 0)) AS UpvotePercentage,
+    FUR.TotalBadges,
+    T1.QuestionTitle AS TopQuestion1Title,
+    T1.ViewCount AS TopQuestion1Views,
+    T1.QuestionScore AS TopQuestion1Score,
+    T2.QuestionTitle AS TopQuestion2Title,
+    T2.ViewCount AS TopQuestion2Views,
+    T2.QuestionScore AS TopQuestion2Score,
+    UMA.BusiestActivityMonth AS BusiestAnswerPostingMonth,
+    UMA.AnswersInMonthCount AS AnswersInBusiestMonth,
+    STF.Top5TagsSummary, -- String aggregated list of top 5 tags
+    (SELECT TagName FROM UserTagFrequency WHERE UserId = FUR.UserId AND TagRank = 1) AS MostFrequentTag, -- Correlated subquery for single value
+    FUR.AverageCommentScore,
+    COALESCE(FUR.LastGoldBadgeDate::TEXT, 'No Gold Badges') AS MostRecentGoldBadge, -- NULL handling for date
+    -- Nested CASE for spam activity status
+    CASE
+        WHEN FUR.TotalSpamVotesReceived > 0 AND FUR.TotalSpamVotesGiven > 0 THEN 'Both Received & Given Spam Votes'
+        WHEN FUR.TotalSpamVotesReceived > 0 THEN 'Received Spam Votes'
+        WHEN FUR.TotalSpamVotesGiven > 0 THEN 'Given Spam Votes'
+        ELSE 'No Recorded Spam Activity'
+    END AS SpamActivityDetails,
+    COALESCE(NULLIF(FUR.WebsiteUrl, ''), 'Website Not Provided') AS UserWebsite, -- NULLIF to treat empty string as NULL
+    DATE_TRUNC('quarter', FUR.LastAccessDate) AS LastAccessQuarter
+FROM FinalUserRanking FUR
+LEFT JOIN TopUserQuestions T1 ON FUR.UserId = T1.UserId AND T1.rn = 1
+LEFT JOIN TopUserQuestions T2 ON FUR.UserId = T2.UserId AND T2.rn = 2
+LEFT JOIN UserMonthlyAnswerContributions UMA ON FUR.UserId = UMA.UserId AND UMA.rn = 1
+LEFT JOIN (
+    SELECT
+        UserId,
+        STRING_AGG(TagName || ' (' || TagCount || ')', '; ') WITHIN GROUP (ORDER BY TagRank) AS Top5TagsSummary
+    FROM UserTagFrequency
+    WHERE TagRank <= 5
+    GROUP BY UserId
+) AS STF ON FUR.UserId = STF.UserId
+WHERE FUR.ReputationRankTile = 1 -- Select users in the top 10% by reputation/upvotes
+  AND FUR.GlobalRank <= 100 -- Further restrict to top 100 globally
+ORDER BY FUR.CompositeScore DESC, FUR.Reputation DESC
+LIMIT 50;

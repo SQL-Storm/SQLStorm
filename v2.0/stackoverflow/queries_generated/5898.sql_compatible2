@@ -1,0 +1,123 @@
+WITH RankedPosts AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.PostTypeId,
+    p.Tags,
+    p.Score,
+    p.ViewCount,
+    p.CommentCount,
+    p.AnswerCount,
+    p.LastActivityDate,
+    p.LastEditDate,
+    p.FavoriteCount,
+    p.ContentLicense,
+    u.Reputation,
+    u.DisplayName,
+    u.Location,
+    u.AccountId,
+    SUM(CASE WHEN p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '7 days' THEN 1 ELSE 0 END) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS SevenDayPostCount
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+),
+TagStats AS (
+  SELECT
+    t.TagName,
+    t.Count,
+    CASE
+      WHEN t.Count > 1000 THEN 'hot'
+      WHEN t.Count > 100 THEN 'warm'
+      ELSE 'cold'
+    END AS TagPopularity
+  FROM Tags t
+  WHERE t.IsModeratorOnly = FALSE
+),
+FullPostLinks AS (
+  SELECT
+    pl.Id AS LinkId,
+    pl.PostId,
+    pl.RelatedPostId,
+    lt.Name AS LinkTypeName,
+    pl.CreationDate
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+),
+ComplexVotes AS (
+  SELECT
+    v.PostId,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+    SUM(CASE WHEN v.VoteTypeId = 8 THEN 1 ELSE 0 END) AS BountyStarts,
+    SUM(CASE WHEN v.VoteTypeId = 10 THEN 1 ELSE 0 END) AS Deletions,
+    MAX(v.CreationDate) AS LastVoteDate
+  FROM Votes v
+  GROUP BY v.PostId
+),
+CorrelatedHistory AS (
+  SELECT
+    ph.PostId,
+    MAX(CASE WHEN pht.Id = 10 THEN ph.CreationDate END) AS LastCloseVoteDate,
+    MAX(CASE WHEN pht.Id = 16 THEN ph.CreationDate END) AS CommunityOwnedDate
+  FROM PostHistory ph
+  JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+  GROUP BY ph.PostId
+)
+SELECT
+  rp.Id AS PostId,
+  rp.Title,
+  rp.CreationDate,
+  rp.OwnerUserId,
+  rp.DisplayName AS OwnerDisplayName,
+  rp.Reputation,
+  rp.Tags,
+  rp.PostTypeId,
+  pt.Name AS PostTypeName,
+  rp.SevenDayPostCount,
+  COALESCE(ts.TagPopularity, 'unknown') AS TagPopularity,
+  fs.UpVotes,
+  fs.DownVotes,
+  fs.BountyStarts,
+  fs.Deletions,
+  fs.LastVoteDate,
+  cl.LastCloseVoteDate,
+  cu.CommunityOwnedDate,
+  bl.LinkId AS RelatedLinkId,
+  bl.RelatedPostId,
+  bl.LinkTypeName,
+  rp.Score,
+  rp.ViewCount,
+  rp.CommentCount,
+  rp.AnswerCount,
+  rp.LastActivityDate,
+  rp.LastEditDate
+FROM RankedPosts rp
+LEFT JOIN PostTypes pt ON rp.PostTypeId = pt.Id
+LEFT JOIN (
+  SELECT
+    p.OwnerUserId,
+    MAX(CASE WHEN p.OwnerUserId IS NOT NULL THEN p.Id END) AS dummy
+  FROM Posts p
+  GROUP BY p.OwnerUserId
+) d ON rp.OwnerUserId = d.OwnerUserId
+LEFT JOIN (
+  SELECT TagName, TagName AS Placeholder
+  FROM Tags
+) t ON 1=1
+LEFT JOIN TagStats ts ON ts.TagName = (
+  CASE
+    WHEN rp.Tags IS NOT NULL THEN (
+      (string_to_array(substr(rp.Tags, 2, length(rp.Tags)-2), '><'))[1]
+    )
+    ELSE NULL
+  END
+)
+LEFT JOIN ComplexVotes fs ON rp.Id = fs.PostId
+LEFT JOIN CorrelatedHistory cu ON rp.Id = cu.PostId
+LEFT JOIN CorrelatedHistory cl ON rp.Id = cl.PostId
+LEFT JOIN FullPostLinks bl ON rp.Id = bl.PostId
+WHERE rp.PostTypeId IN (1,2)
+  AND (rp.Score IS NOT NULL OR rp.ViewCount IS NOT NULL)
+ORDER BY rp.LastActivityDate DESC, rp.Id
+FETCH FIRST 100 ROWS ONLY;

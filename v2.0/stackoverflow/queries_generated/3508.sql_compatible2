@@ -1,0 +1,159 @@
+WITH 
+TopTags AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS rn
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0
+),
+UserScores AS (
+    SELECT 
+        u.Id                     AS UserId,
+        u.DisplayName,
+        COALESCE(SUM(p.Score),0) +
+        COALESCE(SUM(
+            CASE 
+                WHEN v.VoteTypeId = 2 THEN 1
+                WHEN v.VoteTypeId = 3 THEN -1
+                ELSE 0
+            END),0)               AS TotalScore
+    FROM Users u
+    LEFT JOIN Posts p   ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v   ON v.PostId = p.Id
+    GROUP BY u.Id, u.DisplayName
+),
+QuestionMetrics AS (
+    SELECT 
+        q.Id                                   AS QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score                                 AS QScore,
+        q.ViewCount,
+        q.FavoriteCount,
+        q.Tags,
+        q.OwnerUserId,
+        (SELECT COUNT(*) 
+         FROM Posts a 
+         WHERE a.ParentId = q.Id AND a.PostTypeId = 2) AS AnswerCount,
+        (SELECT MAX(a.CreationDate) 
+         FROM Posts a 
+         WHERE a.ParentId = q.Id AND a.PostTypeId = 2) AS LastAnswerDate,
+        ROW_NUMBER() OVER (PARTITION BY q.OwnerUserId 
+                           ORDER BY q.Score DESC, q.CreationDate DESC) AS RankByOwner
+    FROM Posts q
+    WHERE q.PostTypeId = 1
+),
+RecentCloseReasons AS (
+    SELECT 
+        ph.PostId,
+        CAST(ph.Comment AS SMALLINT)        AS CloseReasonId,
+        ph.CreationDate                         AS CloseDate,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId 
+                           ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10
+),
+ExplodedTags AS (
+    SELECT 
+        qm.QuestionId,
+        TRIM(BOTH '<>' FROM 
+            (CASE 
+               WHEN qm.Tags IS NULL THEN NULL
+               ELSE SPLIT_PART(qm.Tags, '><', gs.n)
+             END))    AS TagName
+    FROM QuestionMetrics qm
+    CROSS JOIN (
+        SELECT level AS n FROM (
+            SELECT 1 AS level
+            UNION ALL SELECT 2
+            UNION ALL SELECT 3
+            UNION ALL SELECT 4
+            UNION ALL SELECT 5
+            UNION ALL SELECT 6
+            UNION ALL SELECT 7
+            UNION ALL SELECT 8
+            UNION ALL SELECT 9
+            UNION ALL SELECT 10
+            UNION ALL SELECT 11
+            UNION ALL SELECT 12
+            UNION ALL SELECT 13
+            UNION ALL SELECT 14
+            UNION ALL SELECT 15
+        ) nums
+    ) gs
+    WHERE qm.Tags IS NOT NULL
+      AND gs.n <= (COALESCE(NULLIF((LENGTH(qm.Tags) - LENGTH(REPLACE(qm.Tags, '><', '')))/LENGTH('><'), 0), 0) + 1)
+),
+Aggregated AS (
+    SELECT 
+        qm.QuestionId,
+        qm.Title,
+        qm.CreationDate,
+        qm.QScore,
+        qm.ViewCount,
+        qm.FavoriteCount,
+        qm.Tags,
+        qm.AnswerCount,
+        qm.LastAnswerDate,
+        qm.RankByOwner,
+        us.TotalScore,
+        us.DisplayName,
+        rcr.CloseReasonId,
+        rcr.CloseDate,
+        et.TagName,
+        tt.Count                              AS TagGlobalCount,
+        ROW_NUMBER() OVER (ORDER BY qm.QScore DESC, qm.ViewCount DESC) AS OverallRank
+    FROM QuestionMetrics qm
+    LEFT JOIN UserScores us
+           ON us.UserId = qm.OwnerUserId
+    LEFT JOIN RecentCloseReasons rcr
+           ON rcr.PostId = qm.QuestionId AND rcr.rn = 1
+    LEFT JOIN ExplodedTags et
+           ON et.QuestionId = qm.QuestionId
+    LEFT JOIN TopTags tt
+           ON tt.TagName = et.TagName
+)
+SELECT 
+    a.QuestionId,
+    a.Title,
+    a.CreationDate,
+    a.QScore,
+    a.ViewCount,
+    a.FavoriteCount,
+    a.Tags,
+    a.AnswerCount,
+    a.LastAnswerDate,
+    a.TotalScore,
+    a.DisplayName,
+    a.CloseReasonId,
+    a.CloseDate,
+    a.TagName,
+    a.TagGlobalCount,
+    a.OverallRank
+FROM Aggregated a
+WHERE a.OverallRank <= 100
+  AND (a.TagGlobalCount IS NULL OR a.TagGlobalCount > 20)
+  AND (a.CloseReasonId IS NULL OR a.CloseReasonId NOT IN (1,2,3,101,102))
+ORDER BY a.OverallRank, a.TagGlobalCount DESC
+
+UNION ALL
+
+SELECT 
+    CAST(NULL AS BIGINT) AS QuestionId,
+    CAST(NULL AS VARCHAR(4000)) AS Title,
+    CAST(NULL AS TIMESTAMP) AS CreationDate,
+    CAST(NULL AS INTEGER) AS QScore,
+    CAST(NULL AS INTEGER) AS ViewCount,
+    CAST(NULL AS INTEGER) AS FavoriteCount,
+    CAST(NULL AS VARCHAR(4000)) AS Tags,
+    CAST(NULL AS INTEGER) AS AnswerCount,
+    CAST(NULL AS TIMESTAMP) AS LastAnswerDate,
+    CAST(NULL AS INTEGER) AS TotalScore,
+    CAST(NULL AS VARCHAR(4000)) AS DisplayName,
+    CAST(NULL AS SMALLINT) AS CloseReasonId,
+    CAST(NULL AS TIMESTAMP) AS CloseDate,
+    CAST(NULL AS VARCHAR(255)) AS TagName,
+    CAST(NULL AS INTEGER) AS TagGlobalCount,
+    CAST(NULL AS INTEGER) AS OverallRank
+WHERE NOT EXISTS (SELECT 1 FROM Aggregated);

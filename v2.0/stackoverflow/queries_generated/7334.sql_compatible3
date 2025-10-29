@@ -1,0 +1,311 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS PostActivityRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    WHERE u.CreationDate >= TIMESTAMP '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        PostCount,
+        QuestionCount,
+        AnswerCount,
+        BadgeCount,
+        VoteCount,
+        AvgPostScore,
+        LastPostDate,
+        ReputationRank,
+        PostActivityRank,
+        CASE 
+            WHEN Reputation > 100000 THEN 'Elite'
+            WHEN Reputation > 50000 THEN 'Advanced'
+            WHEN Reputation > 10000 THEN 'Intermediate'
+            ELSE 'Novice'
+        END AS ReputationTier,
+        CASE 
+            WHEN PostCount > 1000 THEN 'Legendary'
+            WHEN PostCount > 500 THEN 'Veteran'
+            WHEN PostCount > 100 THEN 'Experienced'
+            ELSE 'Regular'
+        END AS ActivityTier
+    FROM UserStats
+    WHERE PostCount > 10
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        p.ParentId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END AS PostTypeDesc,
+        COALESCE(p.Title, 'No Title') AS CleanTitle,
+        COALESCE(p.Tags, '') AS CleanTags,
+        CAST( (EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - CAST(p.CreationDate AS TIMESTAMP))) / 86400) AS INTEGER) AS AgeInDays,
+        CASE 
+            WHEN p.Score > 100 THEN 'Highly Voted'
+            WHEN p.Score > 50 THEN 'Moderately Voted'
+            WHEN p.Score > 0 THEN 'Low Voted'
+            ELSE 'Unvoted'
+        END AS VoteCategory,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserPostRank,
+        RANK() OVER (ORDER BY p.Score DESC) AS GlobalScoreRank,
+        DENSE_RANK() OVER (ORDER BY p.CreationDate DESC) AS RecentRank,
+        LAG(p.Score, 1) OVER (ORDER BY p.CreationDate) AS PrevScore,
+        LEAD(p.Score, 1) OVER (ORDER BY p.CreationDate) AS NextScore
+    FROM Posts p
+    WHERE p.CreationDate >= TIMESTAMP '2015-01-01'
+      AND p.Score IS NOT NULL
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        pa.PostId,
+        pa.Title,
+        pa.Score,
+        pa.ViewCount,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.CreationDate,
+        pa.OwnerUserId,
+        pa.PostTypeId,
+        pa.Tags,
+        pa.ParentId,
+        pa.PostTypeDesc,
+        pa.CleanTitle,
+        pa.CleanTags,
+        pa.AgeInDays,
+        pa.VoteCategory,
+        pa.UserPostRank,
+        pa.GlobalScoreRank,
+        pa.RecentRank,
+        pa.PrevScore,
+        pa.NextScore,
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.ReputationTier,
+        tu.ActivityTier,
+        CASE 
+            WHEN pa.AgeInDays < 30 THEN 'New'
+            WHEN pa.AgeInDays < 365 THEN 'Recent'
+            WHEN pa.AgeInDays < 1095 THEN 'Established'
+            ELSE 'Legacy'
+        END AS PostAgeCategory,
+        CASE 
+            WHEN pa.Score > (SELECT AVG(p2.Score) FROM Posts p2 WHERE p2.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year')) THEN 'Above Average'
+            WHEN pa.Score > (SELECT AVG(p2.Score) FROM Posts p2 WHERE p2.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year')) * 0.75 THEN 'Average'
+            ELSE 'Below Average'
+        END AS ScorePerformance,
+        CASE 
+            WHEN pa.AnswerCount > 10 THEN 'Highly Answered'
+            WHEN pa.AnswerCount > 5 THEN 'Moderately Answered'
+            WHEN pa.AnswerCount > 0 THEN 'Answered'
+            ELSE 'Unanswered'
+        END AS AnswerStatus,
+        COALESCE(
+            (SELECT b.Name 
+             FROM Badges b 
+             WHERE b.UserId = pa.OwnerUserId 
+               AND b.Date >= pa.CreationDate 
+             ORDER BY b.Date DESC
+             LIMIT 1), 
+            'No Recent Badges'
+        ) AS RecentBadge,
+        COALESCE(
+            (SELECT q.Title 
+             FROM Posts q 
+             WHERE q.Id = pa.ParentId 
+               AND q.PostTypeId = 1
+             LIMIT 1),
+            'No Parent Question'
+        ) AS ParentQuestionTitle,
+        SUBSTR(pa.Tags, 1, 10) AS TagPreview,
+        LENGTH(COALESCE(pa.Tags, '')) AS TagLength,
+        NULLIF(TRIM(SUBSTR(pa.Tags, (CASE WHEN POSITION('<' IN pa.Tags) > 0 THEN POSITION('<' IN pa.Tags) ELSE 0 END) + 1, 
+                    (CASE WHEN POSITION('>' IN pa.Tags) > 0 THEN POSITION('>' IN pa.Tags) ELSE 0 END) - (CASE WHEN POSITION('<' IN pa.Tags) > 0 THEN POSITION('<' IN pa.Tags) ELSE 0 END) - 1)), '') AS ExtractedTagName,
+        NULL AS FirstTag,
+        NULL AS SecondTag,
+        COALESCE(
+            (CASE WHEN pa.PrevScore IS NOT NULL THEN ABS(pa.Score - pa.PrevScore) ELSE ABS(pa.Score - 0) END),
+            0
+        ) AS ScoreDeltaFromPrevious,
+        COALESCE(
+            (CASE WHEN pa.NextScore IS NOT NULL THEN ABS(pa.Score - pa.NextScore) ELSE ABS(pa.Score - 0) END),
+            0
+        ) AS ScoreDeltaToNext
+    FROM PostAnalysis pa
+    INNER JOIN TopUsers tu ON pa.OwnerUserId = tu.UserId
+    GROUP BY
+        pa.PostId,
+        pa.Title,
+        pa.Score,
+        pa.ViewCount,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.CreationDate,
+        pa.OwnerUserId,
+        pa.PostTypeId,
+        pa.Tags,
+        pa.ParentId,
+        pa.PostTypeDesc,
+        pa.CleanTitle,
+        pa.CleanTags,
+        pa.AgeInDays,
+        pa.VoteCategory,
+        pa.UserPostRank,
+        pa.GlobalScoreRank,
+        pa.RecentRank,
+        pa.PrevScore,
+        pa.NextScore,
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.ReputationTier,
+        tu.ActivityTier
+),
+FilteredPostAnalysis AS (
+    SELECT 
+        cpa.*,
+        ROW_NUMBER() OVER (ORDER BY cpa.Score DESC, cpa.CreationDate DESC) AS RowNum
+    FROM ComplexPostAnalysis cpa
+    WHERE 
+        cpa.Score > 0 
+        AND cpa.ViewCount > 100 
+        AND cpa.AnswerCount >= 0
+        AND (
+            (cpa.Tags IS NOT NULL AND LOWER(cpa.Tags) LIKE '%sql%')
+            OR (cpa.Tags IS NOT NULL AND LOWER(cpa.Tags) LIKE '%sql%')
+        )
+        AND cpa.ReputationTier IN ('Elite', 'Advanced')
+        AND cpa.ScorePerformance IN ('Above Average', 'Average')
+        AND cpa.AnswerStatus IN ('Highly Answered', 'Moderately Answered')
+)
+
+SELECT 
+    fpa.PostId,
+    fpa.Title,
+    fpa.CleanTitle,
+    fpa.Score,
+    fpa.ViewCount,
+    fpa.AnswerCount,
+    fpa.CommentCount,
+    fpa.OwnerUserId,
+    fpa.DisplayName,
+    fpa.Reputation,
+    fpa.ReputationTier,
+    fpa.ActivityTier,
+    fpa.PostTypeDesc,
+    fpa.AgeInDays,
+    fpa.PostAgeCategory,
+    fpa.VoteCategory,
+    fpa.ScorePerformance,
+    fpa.AnswerStatus,
+    fpa.RecentBadge,
+    fpa.ParentQuestionTitle,
+    fpa.TagPreview,
+    fpa.TagLength,
+    fpa.FirstTag,
+    fpa.SecondTag,
+    fpa.ExtractedTagName,
+    fpa.ScoreDeltaFromPrevious,
+    fpa.ScoreDeltaToNext,
+    fpa.GlobalScoreRank,
+    fpa.RecentRank,
+    CASE 
+        WHEN fpa.AnswerCount > 0 AND fpa.AnswerCount < 5 THEN 'Few Answers'
+        WHEN fpa.AnswerCount >= 5 AND fpa.AnswerCount < 10 THEN 'Some Answers'
+        WHEN fpa.AnswerCount >= 10 THEN 'Many Answers'
+        ELSE 'No Answers'
+    END AS AnswerQuantity,
+    CASE 
+        WHEN fpa.ViewCount > 1000 THEN 'Viral'
+        WHEN fpa.ViewCount > 500 THEN 'Popular'
+        WHEN fpa.ViewCount > 100 THEN 'Noticeable'
+        ELSE 'Obscure'
+    END AS PopularityLevel,
+    fpa.CreationDate,
+    CAST( (EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - CAST(fpa.CreationDate AS TIMESTAMP))) / 86400) AS INTEGER) AS DaysSinceCreation,
+    fpa.RowNum,
+    CASE 
+        WHEN fpa.GlobalScoreRank <= 10 THEN 'Top 10'
+        WHEN fpa.GlobalScoreRank <= 50 THEN 'Top 50'
+        WHEN fpa.GlobalScoreRank <= 100 THEN 'Top 100'
+        ELSE 'Below Top 100'
+    END AS ScoreRankingTier
+FROM FilteredPostAnalysis fpa
+WHERE 
+    fpa.RowNum BETWEEN 1 AND 20000
+    AND fpa.Score > (SELECT AVG(fp.Score) FROM FilteredPostAnalysis fp WHERE fp.RowNum BETWEEN 1 AND 10000)
+
+UNION ALL
+
+SELECT 
+    NULL AS PostId,
+    'Aggregate Summary' AS Title,
+    'N/A' AS CleanTitle,
+    SUM(Score) AS Score,
+    SUM(ViewCount) AS ViewCount,
+    SUM(AnswerCount) AS AnswerCount,
+    SUM(CommentCount) AS CommentCount,
+    NULL AS OwnerUserId,
+    'Overall Stats' AS DisplayName,
+    NULL AS Reputation,
+    'N/A' AS ReputationTier,
+    'N/A' AS ActivityTier,
+    'Summary' AS PostTypeDesc,
+    NULL AS AgeInDays,
+    NULL AS PostAgeCategory,
+    'N/A' AS VoteCategory,
+    'N/A' AS ScorePerformance,
+    'N/A' AS AnswerStatus,
+    'N/A' AS RecentBadge,
+    'N/A' AS ParentQuestionTitle,
+    'N/A' AS TagPreview,
+    NULL AS TagLength,
+    NULL AS FirstTag,
+    NULL AS SecondTag,
+    'N/A' AS ExtractedTagName,
+    NULL AS ScoreDeltaFromPrevious,
+    NULL AS ScoreDeltaToNext,
+    NULL AS GlobalScoreRank,
+    NULL AS RecentRank,
+    'Summary' AS AnswerQuantity,
+    'Summary' AS PopularityLevel,
+    NULL AS CreationDate,
+    NULL AS DaysSinceCreation,
+    0 AS RowNum,
+    'Summary' AS ScoreRankingTier
+FROM FilteredPostAnalysis
+
+ORDER BY CASE WHEN PostId IS NULL THEN 1 ELSE 0 END, Score DESC, CreationDate DESC;

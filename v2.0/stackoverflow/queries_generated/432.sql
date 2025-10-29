@@ -1,0 +1,381 @@
+-- {"query": "432.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3440} 
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        u.location,
+        date_trunc('month', u.creationdate) as signup_month,
+        row_number() over (partition by coalesce(nullif(trim(lower(u.location)), ''), 'unknown') order by u.reputation desc, u.id) as loc_rank
+    from users u
+    where u.creationdate >= (select max(creationdate) - interval '365 day' from users)
+),
+user_badge_agg as (
+    select
+        b.userid,
+        count(*) as total_badges,
+        sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+        sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+        sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+        count(*) filter (where b.tagbased = 1) as tag_badges,
+        min(b.date) as first_badge_date,
+        max(b.date) as last_badge_date
+    from badges b
+    group by b.userid
+),
+question_posts as (
+    select
+        p.id as question_id,
+        p.owneruserid as asker_id,
+        p.creationdate as question_date,
+        p.score as question_score,
+        p.viewcount,
+        p.title,
+        p.tags,
+        p.acceptedanswerid,
+        array_length(string_to_array(substring(p.tags, 2, greatest(length(p.tags)-2,0)), '><'), 1) as tag_count
+    from posts p
+    where p.posttypeid = 1
+),
+answer_posts as (
+    select
+        a.id as answer_id,
+        a.parentid as question_id,
+        a.owneruserid as answerer_id,
+        a.creationdate as answer_date,
+        a.score as answer_score
+    from posts a
+    where a.posttypeid = 2
+),
+question_stats as (
+    select
+        q.question_id,
+        q.asker_id,
+        q.question_date,
+        q.question_score,
+        q.viewcount,
+        q.title,
+        q.tags,
+        q.tag_count,
+        q.acceptedanswerid,
+        count(ans.answer_id) as answer_count,
+        max(ans.answer_score) as max_answer_score,
+        min(ans.answer_date) as first_answer_date,
+        max(ans.answer_date) as last_answer_date,
+        count(*) filter (where ans.answer_id = q.acceptedanswerid) as has_accepted
+    from question_posts q
+    left join answer_posts ans on ans.question_id = q.question_id
+    group by q.question_id, q.asker_id, q.question_date, q.question_score, q.viewcount, q.title, q.tags, q.tag_count, q.acceptedanswerid
+),
+vote_agg as (
+    select
+        v.postid,
+        sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+        sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+        sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+        sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_total
+    from votes v
+    group by v.postid
+),
+comment_agg as (
+    select
+        c.postid,
+        count(*) as comment_count,
+        max(c.score) as max_comment_score,
+        max(c.creationdate) as last_comment_date
+    from comments c
+    group by c.postid
+),
+post_link_agg as (
+    select
+        pl.postid,
+        sum(case when pl.linktypeid = 1 then 1 else 0 end) as linked_count,
+        sum(case when pl.linktypeid = 3 then 1 else 0 end) as duplicate_count
+    from postlinks pl
+    group by pl.postid
+),
+posthistory_close as (
+    select
+        ph.postid,
+        count(*) filter (where ph.posthistorytypeid = 10) as close_events,
+        count(*) filter (where ph.posthistorytypeid = 11) as reopen_events,
+        max(ph.creationdate) filter (where ph.posthistorytypeid in (10,11)) as last_close_or_reopen,
+        max(case
+            when ph.posthistorytypeid = 10 then nullif(ph.comment, '')
+            else null
+        end) as last_close_reason_id_raw
+    from posthistory ph
+    where ph.posthistorytypeid in (10,11)
+    group by ph.postid
+),
+close_reason_resolved as (
+    select
+        pc.postid,
+        pc.close_events,
+        pc.reopen_events,
+        pc.last_close_or_reopen,
+        cr.name as last_close_reason_name
+    from posthistory_close pc
+    left join closer reas on false
+    left join closereasontypes cr
+      on cr.id = try_cast(pc.last_close_reason_id_raw as smallint)
+),
+questions_with_metrics as (
+    select
+        qs.question_id,
+        qs.asker_id,
+        qs.question_date,
+        qs.question_score,
+        qs.viewcount,
+        qs.title,
+        qs.tags,
+        qs.tag_count,
+        qs.answer_count,
+        qs.max_answer_score,
+        qs.first_answer_date,
+        qs.last_answer_date,
+        qs.has_accepted,
+        coalesce(va.upvotes,0) as upvotes,
+        coalesce(va.downvotes,0) as downvotes,
+        coalesce(va.favorites,0) as favorites,
+        coalesce(va.bounty_total,0) as bounty_total,
+        coalesce(ca.comment_count,0) as comment_count,
+        coalesce(ca.max_comment_score,0) as max_comment_score,
+        ca.last_comment_date,
+        coalesce(pla.linked_count,0) as linked_count,
+        coalesce(pla.duplicate_count,0) as duplicate_count,
+        coalesce(phc.close_events,0) as close_events,
+        coalesce(phc.reopen_events,0) as reopen_events,
+        phc.last_close_or_reopen,
+        phc.last_close_reason_name
+    from question_stats qs
+    left join vote_agg va on va.postid = qs.question_id
+    left join comment_agg ca on ca.postid = qs.question_id
+    left join post_link_agg pla on pla.postid = qs.question_id
+    left join close_reason_resolved phc on phc.postid = qs.question_id
+),
+tag_expansion as (
+    select
+        qwm.question_id,
+        unnest(string_to_array(substring(qwm.tags, 2, greatest(length(qwm.tags)-2,0)), '><')) as tagname
+    from questions_with_metrics qwm
+),
+tag_rank as (
+    select
+        te.tagname,
+        count(*) as q_count,
+        sum(case when qwm.has_accepted = 1 then 1 else 0 end) as accepted_q,
+        avg(qwm.question_score)::numeric as avg_q_score,
+        percentile_cont(0.5) within group (order by qwm.viewcount) as median_views
+    from tag_expansion te
+    join questions_with_metrics qwm on qwm.question_id = te.question_id
+    group by te.tagname
+),
+user_activity as (
+    select
+        u.id as user_id,
+        sum(case when p.posttypeid = 1 then 1 else 0 end) as questions_posted,
+        sum(case when p.posttypeid = 2 then 1 else 0 end) as answers_posted,
+        sum(case when p.posttypeid = 1 then coalesce(p.score,0) else 0 end) as q_score_sum,
+        sum(case when p.posttypeid = 2 then coalesce(p.score,0) else 0 end) as a_score_sum,
+        max(p.lastactivitydate) as last_post_activity
+    from users u
+    left join posts p on p.owneruserid = u.id
+    group by u.id
+),
+accepted_answer_latency as (
+    select
+        q.question_id,
+        case
+            when q.acceptedanswerid is not null then
+                (select a.creationdate - q.question_date
+                 from posts a
+                 where a.id = q.acceptedanswerid)
+            else null
+        end as time_to_accept
+    from questions_with_metrics q
+),
+question_quality_score as (
+    select
+        qwm.question_id,
+        qwm.asker_id,
+        qwm.title,
+        qwm.question_date,
+        qwm.viewcount,
+        qwm.question_score,
+        qwm.answer_count,
+        qwm.favorites,
+        qwm.upvotes,
+        qwm.downvotes,
+        qwm.bounty_total,
+        qwm.comment_count,
+        qwm.duplicate_count,
+        qwm.tag_count,
+        qwm.has_accepted,
+        coalesce(extract(epoch from aaf.time_to_accept)/3600.0, 0.0) as hours_to_accept,
+        -- composite score with mixed signals and null handling
+        (
+          coalesce(qwm.viewcount,0) * 0.001
+          + coalesce(qwm.question_score,0) * 2.0
+          + coalesce(qwm.upvotes - qwm.downvotes,0) * 1.5
+          + coalesce(qwm.favorites,0) * 0.75
+          + coalesce(qwm.answer_count,0) * 0.5
+          + case when qwm.has_accepted = 1 then 5 else 0 end
+          - coalesce(qwm.duplicate_count,0) * 3
+          - least(coalesce(extract(epoch from aaf.time_to_accept)/3600.0, 0.0), 72) * 0.05
+          + ln(greatest(coalesce(qwm.tag_count,1),1)) * 0.8
+        ) as quality_score
+    from questions_with_metrics qwm
+    left join accepted_answer_latency aaf on aaf.question_id = qwm.question_id
+),
+location_norm as (
+    select
+        u.id as user_id,
+        case
+            when u.location is null or trim(u.location) = '' then 'unknown'
+            else lower(regexp_replace(u.location, '\s+', ' ', 'g'))
+        end as norm_location
+    from users u
+),
+final_user_set as (
+    select
+        ru.user_id,
+        ru.displayname,
+        ru.reputation,
+        ru.creationdate,
+        ru.signup_month,
+        ln.norm_location,
+        ru.loc_rank,
+        ua.questions_posted,
+        ua.answers_posted,
+        ua.q_score_sum,
+        ua.a_score_sum,
+        ub.total_badges,
+        ub.gold_badges,
+        ub.silver_badges,
+        ub.bronze_badges,
+        ub.tag_badges,
+        ub.last_badge_date
+    from recent_users ru
+    left join location_norm ln on ln.user_id = ru.user_id
+    left join user_activity ua on ua.user_id = ru.user_id
+    left join user_badge_agg ub on ub.userid = ru.user_id
+),
+user_question_join as (
+    select
+        fus.*,
+        qqs.question_id,
+        qqs.quality_score,
+        qqs.title as question_title,
+        qqs.question_date as q_date
+    from final_user_set fus
+    left join question_quality_score qqs
+      on qqs.asker_id = fus.user_id
+),
+ranked_questions as (
+    select
+        uqj.*,
+        row_number() over (partition by uqj.user_id order by coalesce(uqj.quality_score, -1e9) desc, uqj.q_date desc nulls last) as q_rank_desc,
+        dense_rank() over (order by date_trunc('month', uqj.q_date) nulls last) as global_month_bucket
+    from user_question_join uqj
+),
+top_questions_per_user as (
+    select *
+    from ranked_questions
+    where q_rank_desc <= 3
+),
+location_baseline as (
+    select
+        norm_location,
+        avg(quality_score) as loc_avg_quality,
+        stddev_pop(quality_score) as loc_std_quality,
+        count(*) as loc_q_count
+    from ranked_questions
+    where quality_score is not null
+    group by norm_location
+),
+final as (
+    select
+        t.user_id,
+        t.displayname,
+        t.reputation,
+        t.signup_month,
+        t.norm_location,
+        t.questions_posted,
+        t.answers_posted,
+        t.total_badges,
+        t.gold_badges,
+        t.silver_badges,
+        t.bronze_badges,
+        t.tag_badges,
+        t.last_badge_date,
+        t.question_id,
+        t.question_title,
+        t.q_date,
+        t.quality_score,
+        t.q_rank_desc,
+        lb.loc_avg_quality,
+        lb.loc_std_quality,
+        case
+            when lb.loc_std_quality is null or lb.loc_std_quality = 0 then null
+            else (t.quality_score - lb.loc_avg_quality) / lb.loc_std_quality
+        end as quality_zscore_vs_location,
+        sum(case when t.quality_score >= lb.loc_avg_quality then 1 else 0 end) over (partition by t.user_id) as count_above_loc_avg,
+        count(*) over (partition by t.user_id) as total_top_q,
+        string_agg(distinct coalesce(nullif(split_part(replace(replace(replace(t.question_title, E'\n',' '), E'\r',' '), E'\t',' '),' ',1),''),'(no-title)'), ', ') over (partition by t.user_id) as title_snippets
+    from top_questions_per_user t
+    left join location_baseline lb
+      on lb.norm_location = t.norm_location
+)
+select
+    f.user_id,
+    f.displayname,
+    f.reputation,
+    f.signup_month,
+    f.norm_location,
+    f.questions_posted,
+    f.answers_posted,
+    f.total_badges,
+    f.gold_badges,
+    f.silver_badges,
+    f.bronze_badges,
+    f.tag_badges,
+    f.last_badge_date,
+    f.question_id,
+    coalesce(f.question_title, '(no title)') as question_title,
+    f.q_date,
+    round(coalesce(f.quality_score, 0.0)::numeric, 3) as quality_score,
+    f.q_rank_desc as question_rank_for_user,
+    round(coalesce(f.quality_zscore_vs_location, 0.0)::numeric, 3) as quality_zscore_vs_location,
+    f.count_above_loc_avg,
+    f.total_top_q,
+    f.title_snippets,
+    case
+        when f.reputation >= 100000 then 'legend'
+        when f.reputation >= 50000 then 'elite'
+        when f.reputation >= 10000 then 'veteran'
+        when f.reputation >= 1000 then 'regular'
+        when f.reputation is null then 'unknown'
+        else 'newbie'
+    end as rep_bucket,
+    case
+        when f.questions_posted = 0 and f.answers_posted > 0 then 'answerer'
+        when f.answers_posted = 0 and f.questions_posted > 0 then 'asker'
+        when coalesce(f.answers_posted,0) > coalesce(f.questions_posted,0) then 'more answers'
+        when coalesce(f.questions_posted,0) > coalesce(f.answers_posted,0) then 'more questions'
+        else 'balanced'
+    end as activity_profile
+from final f
+where
+    (
+      f.q_date is null
+      or f.q_date >= (select max(creationdate) - interval '180 day' from posts where posttypeid = 1)
+    )
+  and (f.total_badges is null or f.total_badges >= 0)
+order by
+    f.rep_bucket desc,
+    f.quality_zscore_vs_location desc nulls last,
+    f.quality_score desc nulls last,
+    f.user_id,
+    f.q_rank_desc;

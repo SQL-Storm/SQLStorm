@@ -1,0 +1,172 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 AS Level,
+        ARRAY[t.Id] AS AncestorPath
+    FROM Tags t
+    WHERE (t.IsRequired IS DISTINCT FROM TRUE)
+    UNION ALL
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        r.Level + 1,
+        r.AncestorPath || t2.Id
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r ON t2.IsRequired = TRUE AND t2.Id <> ALL (r.AncestorPath)
+    WHERE array_length(r.AncestorPath, 1) < 5
+),
+QuestionStats AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        u.Reputation,
+        u.DisplayName,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        row_number() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS rn
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '1 year'
+),
+UserBadgeSummary AS (
+    SELECT
+        b.UserId,
+        count(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        count(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        count(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        count(DISTINCT b.Name) AS DistinctBadges,
+        max(b.Date) AS LastBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+),
+AnswerDetails AS (
+    SELECT
+        a.Id,
+        a.ParentId AS QuestionId,
+        a.Score,
+        a.CreationDate,
+        a.OwnerUserId,
+        rank() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS ScoreRank
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+),
+LatestPostHistoryEdits AS (
+    SELECT ph.PostId,
+        ph.Id AS EdtId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        ph.UserId,
+        ph.UserDisplayName,
+        ph.Comment
+    FROM (
+      SELECT ph.*,
+             row_number() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+      FROM PostHistory ph
+      WHERE ph.PostHistoryTypeId IN (4,5,6,10,11)
+    ) ph
+    WHERE ph.rn = 1
+),
+DuplicateLinks AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        p.Title AS RelatedQuestionTitle,
+        u.DisplayName AS RelatedQuestionOwner,
+        row_number() OVER (PARTITION BY pl.PostId ORDER BY p.CreationDate DESC) AS DupRank
+    FROM PostLinks pl
+    JOIN Posts p ON pl.RelatedPostId = p.Id AND p.PostTypeId = 1
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE pl.LinkTypeId = 3
+),
+ComplexUserInfo AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Location,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        COALESCE(ub.DistinctBadges, 0) AS DistinctBadges,
+        (SELECT count(*) FROM Posts p2 WHERE p2.OwnerUserId = u.Id AND p2.Score > 10) AS HighScorePosts,
+        (SELECT count(*) FROM Comments c WHERE c.UserId = u.Id AND c.Score > 5) AS HighScoreComments
+    FROM Users u
+    LEFT JOIN UserBadgeSummary ub ON u.Id = ub.UserId
+    WHERE u.Reputation > 1000
+),
+FinalResult AS (
+    SELECT 
+        qs.Id AS QuestionId,
+        qs.Title,
+        qs.CreationDate,
+        qs.Score AS QuestionScore,
+        qs.ViewCount,
+        qs.AnswerCount,
+        qs.DisplayName AS QuestionOwner,
+        qs.Reputation AS OwnerReputation,
+        COALESCE(ud.GoldBadges, 0) AS OwnerGoldBadges,
+        COALESCE(ud.SilverBadges, 0) AS OwnerSilverBadges,
+        COALESCE(ud.BronzeBadges, 0) AS OwnerBronzeBadges,
+        ad.Id AS TopAnswerId,
+        ad.Score AS TopAnswerScore,
+        ad.CreationDate AS TopAnswerCreationDate,
+        uad.DisplayName AS TopAnswerOwner,
+        EXTRACT(EPOCH FROM (ad.CreationDate - qs.CreationDate)) / 3600 AS HoursToTopAnswer,
+        lph.PostHistoryTypeId AS LastEditType,
+        CASE 
+          WHEN lph.PostHistoryTypeId = 10 THEN 'Closed'
+          WHEN lph.PostHistoryTypeId = 11 THEN 'Reopened'
+          WHEN lph.PostHistoryTypeId IN (4,5,6) THEN 'Edited'
+          ELSE 'Other'
+        END AS LastEditStatus,
+        dup.RelatedPostId AS DuplicateOf,
+        dup.RelatedQuestionTitle,
+        dup.RelatedQuestionOwner,
+        concat(substring(qs.Title FROM 1 FOR 30), CASE WHEN length(qs.Title) > 30 THEN '...' ELSE '' END) AS ShortTitle,
+        CASE 
+            WHEN qs.Score > 100 THEN 'Popular'
+            WHEN qs.AnswerCount = 0 THEN 'Unanswered'
+            ELSE 'Normal'
+        END AS QuestionCategory
+    FROM QuestionStats qs
+    LEFT JOIN ComplexUserInfo ud ON qs.OwnerUserId = ud.UserId
+    LEFT JOIN AnswerDetails ad ON ad.QuestionId = qs.Id AND ad.ScoreRank = 1
+    LEFT JOIN Users uad ON ad.OwnerUserId = uad.Id
+    LEFT JOIN LatestPostHistoryEdits lph ON lph.PostId = qs.Id
+    LEFT JOIN DuplicateLinks dup ON dup.PostId = qs.Id AND dup.DupRank = 1
+    WHERE qs.rn = 1
+)
+SELECT 
+    fr.QuestionId,
+    fr.ShortTitle,
+    fr.QuestionCategory,
+    fr.QuestionScore,
+    fr.ViewCount,
+    fr.AnswerCount,
+    fr.QuestionOwner,
+    fr.OwnerReputation,
+    fr.OwnerGoldBadges,
+    fr.OwnerSilverBadges,
+    fr.OwnerBronzeBadges,
+    fr.TopAnswerId,
+    fr.TopAnswerScore,
+    fr.HoursToTopAnswer,
+    fr.LastEditStatus,
+    fr.DuplicateOf AS DuplicateOfPostId,
+    fr.RelatedQuestionTitle,
+    fr.RelatedQuestionOwner
+FROM FinalResult fr
+ORDER BY fr.QuestionScore DESC, fr.ViewCount DESC
+LIMIT 100;

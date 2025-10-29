@@ -1,0 +1,180 @@
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.Reputation,
+        U.CreationDate,
+        U.LastAccessDate,
+        COALESCE(SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END), 0) AS QuestionCount,
+        COALESCE(SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END), 0) AS AnswerCount,
+        COALESCE(SUM(P.Score), 0) AS TotalPostScore,
+        COALESCE(SUM(P.ViewCount), 0) AS TotalPostViews,
+        COALESCE(SUM(C.Score), 0) AS TotalCommentScore,
+        COUNT(DISTINCT C.Id) AS CommentCount,
+        COUNT(DISTINCT PH.Id) AS EditHistoryCount,
+        AVG(CASE WHEN P.PostTypeId = 1 THEN P.Score ELSE NULL END) AS AvgQuestionScore
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN PostHistory PH ON U.Id = PH.UserId AND PH.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9, 24)
+    GROUP BY U.Id, U.Reputation, U.CreationDate, U.LastAccessDate
+),
+UserBadgeStats AS (
+    SELECT
+        UserId,
+        COUNT(CASE WHEN Class = 1 THEN 1 ELSE NULL END) AS GoldBadges,
+        COUNT(CASE WHEN Class = 2 THEN 1 ELSE NULL END) AS SilverBadges,
+        COUNT(CASE WHEN Class = 3 THEN 1 ELSE NULL END) AS BronzeBadges,
+        COUNT(CASE WHEN Name = 'Disciplined' THEN 1 ELSE NULL END) AS HasDisciplinedBadge,
+        MAX(CASE WHEN Name LIKE '%Editor%' THEN 1 ELSE 0 END) AS HasEditorBadge,
+        COUNT(CASE WHEN TagBased = TRUE THEN 1 ELSE NULL END) AS TotalTagBadges
+    FROM Badges
+    GROUP BY UserId
+),
+PostTagAnalysis AS (
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        P.Title,
+        P.Tags,
+        P.Score AS PostScore,
+        P.ViewCount AS PostViewCount,
+        P.CreationDate AS PostCreationDate,
+        P.ClosedDate AS PostClosedDate,
+        P.PostTypeId,
+        P.AcceptedAnswerId,
+        (SELECT COUNT(DISTINCT A_ans.OwnerUserId) FROM Posts A_ans WHERE A_ans.ParentId = P.Id AND A_ans.OwnerUserId IS NOT NULL) AS DistinctAnswerersCount,
+        (SELECT AVG(A_score.Score) FROM Posts A_score WHERE A_score.ParentId = P.Id AND A_score.Score > 0) AS AvgPositiveAnswerScore
+    FROM Posts P
+    WHERE P.PostTypeId IN (1, 2)
+),
+RelevantPostLinkSummary AS (
+    SELECT
+        PL.PostId,
+        COUNT(DISTINCT CASE WHEN PL.LinkTypeId = 1 THEN PL.RelatedPostId ELSE NULL END) AS LinkedPostCount,
+        COUNT(DISTINCT CASE WHEN PL.LinkTypeId = 3 THEN PL.RelatedPostId ELSE NULL END) AS DuplicatePostCount
+    FROM PostLinks PL
+    GROUP BY PL.PostId
+),
+UserEngagementRank AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.Location,
+        UAS.QuestionCount,
+        UAS.AnswerCount,
+        UAS.TotalPostScore,
+        UAS.TotalPostViews,
+        UAS.CommentCount,
+        UAS.EditHistoryCount,
+        UBS.GoldBadges,
+        UBS.SilverBadges,
+        UBS.BronzeBadges,
+        UBS.HasDisciplinedBadge,
+        UBS.HasEditorBadge,
+        UBS.TotalTagBadges,
+        DENSE_RANK() OVER (ORDER BY U.Reputation DESC, UAS.QuestionCount DESC, UAS.AnswerCount DESC) AS OverallUserRank,
+        NTILE(10) OVER (ORDER BY UAS.TotalPostScore DESC) AS PostScoreDecile,
+        ROW_NUMBER() OVER (PARTITION BY U.Location ORDER BY U.Reputation DESC, UAS.QuestionCount DESC) AS RankInLocation,
+        (U.Reputation * 0.6 + UAS.TotalPostScore * 0.2 + UAS.CommentCount * 0.1 + COALESCE(UBS.GoldBadges, 0) * 50 + COALESCE(UBS.SilverBadges, 0) * 10) AS CustomEngagementScore,
+        COALESCE(U.WebsiteUrl, 'N/A') AS UserWebsiteUrl,
+        (
+            SELECT COUNT(DISTINCT PL_sub.PostId)
+            FROM PostLinks PL_sub
+            JOIN Posts P_sub ON PL_sub.PostId = P_sub.Id
+            WHERE P_sub.OwnerUserId = U.Id
+              AND PL_sub.LinkTypeId = 3
+        ) AS OwnDuplicatePostsCount
+    FROM Users U
+    LEFT JOIN UserActivitySummary UAS ON U.Id = UAS.UserId
+    LEFT JOIN UserBadgeStats UBS ON U.Id = UBS.UserId
+    WHERE U.LastAccessDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '1' YEAR)
+      AND U.Reputation > 1000
+)
+SELECT
+    'High_Reputation_Contributor' AS UserCohort,
+    UER.UserId,
+    COALESCE(UER.DisplayName, 'Unknown User') AS DisplayName,
+    UER.Reputation,
+    COALESCE(UER.Location, 'Unspecified') AS Location,
+    UER.QuestionCount,
+    UER.AnswerCount,
+    UER.TotalPostScore,
+    UER.TotalPostViews,
+    UER.CommentCount,
+    UER.GoldBadges,
+    UER.SilverBadges,
+    UER.BronzeBadges,
+    UER.OverallUserRank,
+    UER.PostScoreDecile,
+    UER.RankInLocation,
+    UER.CustomEngagementScore,
+    UER.UserWebsiteUrl,
+    UER.OwnDuplicatePostsCount,
+    'N/A' AS FirstContributingTag,
+    'N/A' AS ContributorCategory,
+    'N/A' AS PostTitleSample,
+    CAST(NULL AS INTEGER) AS RelatedPostAnalysisScore,
+    CAST(NULL AS VARCHAR(4000)) AS LastPostTypeActivity
+FROM UserEngagementRank UER
+WHERE UER.QuestionCount >= 50
+  AND UER.AnswerCount >= 100
+  AND UER.GoldBadges >= 1
+  AND UER.HasDisciplinedBadge = 1
+  AND UER.OwnDuplicatePostsCount <= 5
+  AND (UER.UserWebsiteUrl LIKE 'http%://github.com/%' OR UER.UserWebsiteUrl LIKE '%stackoverflow.blog%')
+  AND UER.Location IS NOT NULL
+  AND CHAR_LENGTH(UER.DisplayName) BETWEEN 5 AND 30
+  AND UER.TotalTagBadges > 3
+  AND UER.EditHistoryCount > 20
+UNION ALL
+SELECT
+    'Contentious_Post_Contributor' AS UserCohort,
+    UER.UserId,
+    COALESCE(UER.DisplayName, 'Unknown User') AS DisplayName,
+    UER.Reputation,
+    COALESCE(UER.Location, 'Unspecified') AS Location,
+    UER.QuestionCount,
+    UER.AnswerCount,
+    UER.TotalPostScore,
+    UER.TotalPostViews,
+    UER.CommentCount,
+    UER.GoldBadges,
+    UER.SilverBadges,
+    UER.BronzeBadges,
+    UER.OverallUserRank,
+    UER.PostScoreDecile,
+    UER.RankInLocation,
+    UER.CustomEngagementScore,
+    UER.UserWebsiteUrl,
+    UER.OwnDuplicatePostsCount,
+    COALESCE(
+      FIRST_VALUE(TRIM(SPLIT_PART(SUBSTRING(PTA.Tags FROM 2 FOR CHAR_LENGTH(PTA.Tags)-2), '><', 1))) OVER (PARTITION BY UER.UserId ORDER BY PTA.PostCreationDate),
+      'No Tag'
+    ) AS FirstContributingTag,
+    CASE
+        WHEN PTA.PostClosedDate IS NOT NULL AND RPS.DuplicatePostCount > 0 THEN 'Closed_Duplicate_Posts'
+        WHEN PTA.DistinctAnswerersCount > 10 AND PTA.AvgPositiveAnswerScore IS NOT NULL AND PTA.AvgPositiveAnswerScore < 5 THEN 'Low_Quality_High_Engagement'
+        WHEN UER.HasEditorBadge = 1 AND UER.OwnDuplicatePostsCount > 0 THEN 'Duplicate_Editor'
+        WHEN UER.EditHistoryCount > 50 AND PTA.PostClosedDate IS NOT NULL THEN 'High_Edit_Closed_Post'
+        ELSE 'Other_Contentious'
+    END AS ContributorCategory,
+    COALESCE(SUBSTRING(PTA.Title, 1, 50) || CASE WHEN CHAR_LENGTH(PTA.Title) > 50 THEN '...' ELSE '' END, 'No Post Title Sample') AS PostTitleSample,
+    (COALESCE(RPS.LinkedPostCount, 0) * 2 + COALESCE(RPS.DuplicatePostCount, 0) * 5) AS RelatedPostAnalysisScore,
+    COALESCE(PT.Name, 'Unknown') AS LastPostTypeActivity
+FROM UserEngagementRank UER
+JOIN PostTagAnalysis PTA ON UER.UserId = PTA.OwnerUserId
+LEFT JOIN RelevantPostLinkSummary RPS ON PTA.PostId = RPS.PostId
+LEFT JOIN PostTypes PT ON PTA.PostTypeId = PT.Id
+WHERE UER.Reputation > 500
+  AND UER.CommentCount > 20
+  AND (
+        PTA.PostClosedDate IS NOT NULL
+        OR EXISTS (SELECT 1 FROM RelevantPostLinkSummary RPS_sub WHERE RPS_sub.PostId = PTA.PostId AND RPS_sub.DuplicatePostCount > 0)
+        OR (PTA.PostTypeId = 1 AND PTA.DistinctAnswerersCount > 5 AND PTA.AvgPositiveAnswerScore IS NOT NULL AND PTA.AvgPositiveAnswerScore < 2)
+      )
+  AND LOWER(UER.Location) LIKE LOWER('United States%')
+  AND COALESCE(PTA.Title, '') <> ''
+  AND COALESCE(PTA.Tags, '') LIKE '%<sql>%'
+ORDER BY CustomEngagementScore DESC, OverallUserRank ASC, DisplayName NULLS LAST
+LIMIT 1000;

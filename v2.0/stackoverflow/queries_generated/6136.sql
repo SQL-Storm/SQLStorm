@@ -1,0 +1,76 @@
+-- {"query": "6136.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-micro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 585} 
+
+SELECT 
+    u.DisplayName,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    MAX(u.Reputation) AS MaxReputation,
+    MIN(u.CreationDate) AS EarliestUser,
+    AVG(p.Score) AS AvgPostScore,
+    SUM(v.BountyAmount) AS TotalBountyAmount,
+    b.Name AS TopBadge,
+    t.TagName AS MostUsedTag
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    (SELECT 
+         UserId, 
+         MAX(Date) AS MaxDate 
+     FROM 
+         Badges 
+     GROUP BY 
+         UserId) bb ON u.Id = bb.UserId
+LEFT JOIN 
+    (SELECT 
+         UserId, 
+         Name 
+     FROM 
+         Badges 
+     WHERE 
+         Date = (SELECT MaxDate FROM Badges WHERE UserId = b.UserId)) b ON u.Id = b.UserId
+LEFT JOIN 
+    Votes v ON u.Id = v.UserId AND v.VoteTypeId = 8
+LEFT JOIN 
+    (SELECT 
+         p.OwnerUserId, 
+         COUNT(DISTINCT t.Id) AS TagCount 
+     FROM 
+         Posts p
+     JOIN 
+         Tags t ON string_to_array(p.Tags, '<', '>')[2] = t.Id::text
+     GROUP BY 
+         p.OwnerUserId) tt ON u.Id = tt.OwnerUserId
+LEFT JOIN 
+    (SELECT 
+         UserId, 
+         TagName 
+     FROM 
+         Tags 
+     WHERE 
+         Id = (SELECT MAX(t.Id) 
+               FROM 
+                   Tags t
+               JOIN 
+                   (SELECT 
+                       UserId, 
+                       MAX(Count) AS MaxCount 
+                   FROM 
+                       Tags 
+                   GROUP BY 
+                       UserId) tc ON t.Id = tc.Id)) t ON u.Id = t.UserId
+WHERE 
+    u.Reputation > 1000
+    AND p.LastActivityDate > NOW() - INTERVAL '1 year'
+    AND v.BountyAmount > 0
+GROUP BY 
+    u.DisplayName
+HAVING 
+    COUNT(DISTINCT p.Id) > 50
+ORDER BY 
+    AvgPostScore DESC, 
+    TotalPosts DESC;

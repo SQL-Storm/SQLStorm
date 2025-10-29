@@ -1,0 +1,159 @@
+-- {"query": "4647.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1331} 
+
+WITH
+  RankedUserPosts AS (
+    SELECT
+      p.Id AS PostId,
+      p.OwnerUserId,
+      p.PostTypeId,
+      p.CreationDate,
+      p.Score,
+      ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PostSequence,
+      SUM(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS RunningScoreSum
+    FROM Posts AS p
+    WHERE
+      p.OwnerUserId IS NOT NULL
+      AND p.PostTypeId IN (1, 2) -- Questions and Answers
+  ),
+  UserPostStats AS (
+    SELECT
+      rup.OwnerUserId,
+      COUNT(DISTINCT rup.PostId) AS TotalPosts,
+      MAX(rup.PostSequence) AS MaxPostSequence,
+      AVG(CAST(rup.Score AS DECIMAL(10, 2))) AS AverageScore,
+      SUM(CASE WHEN rup.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+      SUM(CASE WHEN rup.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+      MAX(rup.RunningScoreSum) AS MaxRunningScoreSum
+    FROM RankedUserPosts AS rup
+    GROUP BY
+      rup.OwnerUserId
+  ),
+  RecentPostHistory AS (
+    SELECT
+      ph.PostId,
+      ph.UserId,
+      ph.CreationDate,
+      ph.PostHistoryTypeId,
+      ph.Comment
+    FROM PostHistory AS ph
+    WHERE
+      ph.CreationDate >= DATE('now', '-1 year')
+  ),
+  PostWithCommentDetails AS (
+    SELECT
+      p.Id AS PostId,
+      p.Title,
+      p.PostTypeId,
+      pt.Name AS PostTypeName,
+      u.DisplayName AS OwnerDisplayName,
+      u.Reputation,
+      COALESCE(p.AnswerCount, 0) AS AnswerCount,
+      COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+      p.Score,
+      p.ViewCount,
+      p.CreationDate,
+      p.LastActivityDate,
+      p.ClosedDate,
+      CASE
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+        ELSE 'Open'
+      END AS PostStatus,
+      rph.UserId AS LastCommenterUserId,
+      rph.CreationDate AS LastCommentDate,
+      rph.Comment AS LastCommentText,
+      CASE
+        WHEN ph.PostHistoryTypeId = 10 THEN crt.Name
+        ELSE NULL
+      END AS CloseReason
+    FROM Posts AS p
+    JOIN PostTypes AS pt
+      ON p.PostTypeId = pt.Id
+    LEFT JOIN Users AS u
+      ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+      SELECT
+        PostId,
+        UserId,
+        MAX(CreationDate) AS MaxCreationDate
+      FROM RecentPostHistory
+      WHERE
+        PostHistoryTypeId = 10 -- Post Closed event
+      GROUP BY
+        PostId,
+        UserId
+    ) AS latest_close_event
+      ON p.Id = latest_close_event.PostId
+    LEFT JOIN RecentPostHistory AS rph
+      ON p.Id = rph.PostId
+      AND rph.CreationDate = latest_close_event.MaxCreationDate
+    LEFT JOIN CloseReasonTypes AS crt
+      ON CAST(rph.Comment AS INT) = crt.Id
+    WHERE
+      p.CreationDate >= DATE('now', '-2 years')
+      AND p.Score > 10
+  )
+SELECT
+  CONCAT(
+    pcd.PostTypeName,
+    ' - ',
+    pcd.Title
+  ) AS PostIdentifier,
+  pcd.OwnerDisplayName,
+  pcd.Reputation,
+  pcd.Score,
+  pcd.ViewCount,
+  pcd.AnswerCount,
+  pcd.FavoriteCount,
+  pcd.PostStatus,
+  pcd.LastActivityDate,
+  COALESCE(ups.TotalPosts, 0) AS UserTotalPosts,
+  COALESCE(ups.AverageScore, 0.0) AS UserAverageScore,
+  COALESCE(ups.QuestionCount, 0) AS UserQuestionCount,
+  COALESCE(ups.AnswerCount, 0) AS UserAnswerCount,
+  COALESCE(ups.MaxRunningScoreSum, 0) AS UserMaxRunningScoreSum,
+  pcd.LastCommentDate,
+  pcd.LastCommentText,
+  pcd.CloseReason,
+  CASE
+    WHEN EXISTS (
+      SELECT
+        1
+      FROM PostLinks AS pl
+      WHERE
+        pl.PostId = pcd.PostId
+        AND pl.LinkTypeId = 3 -- Duplicate link
+    ) THEN 'Is Duplicate Of'
+    ELSE 'Not Marked As Duplicate'
+  END AS DuplicateStatus
+FROM PostWithCommentDetails AS pcd
+LEFT JOIN UserPostStats AS ups
+  ON pcd.OwnerUserId = ups.OwnerUserId
+WHERE
+  pcd.Reputation > 1000
+  AND pcd.LastActivityDate >= DATE('now', '-6 months')
+UNION ALL
+SELECT
+  'User Summary: ' || ups.OwnerUserId,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  ups.TotalPosts,
+  ups.AverageScore,
+  ups.QuestionCount,
+  ups.AnswerCount,
+  ups.MaxRunningScoreSum,
+  NULL,
+  NULL,
+  NULL,
+  'User Aggregate'
+FROM UserPostStats AS ups
+WHERE
+  ups.TotalPosts > 50
+ORDER BY
+  UserTotalPosts DESC,
+  Score DESC;

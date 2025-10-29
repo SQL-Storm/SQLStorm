@@ -1,0 +1,151 @@
+WITH top_users AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.AboutMe,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.ProfileImageUrl,
+    u.AccountId,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.Views DESC, u.Id) AS rn
+  FROM Users u
+),
+recent_questions AS (
+  SELECT
+    p.Id AS QuestionId,
+    p.OwnerUserId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.CommentCount,
+    p.AnswerCount,
+    p.LastActivityDate,
+    p.FavoriteCount,
+    p.Body,
+    p.ParentId,
+    p.AcceptedAnswerId
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180' DAY
+),
+hot_tags AS (
+  SELECT
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId,
+    t.WikiPostId,
+    t.IsModeratorOnly,
+    t.IsRequired
+  FROM Tags t
+  WHERE t.Count > 50
+),
+recent_votes AS (
+  SELECT
+    v.PostId,
+    v.VoteTypeId,
+    v.UserId,
+    v.CreationDate,
+    v.BountyAmount
+  FROM Votes v
+  WHERE v.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90' DAY
+),
+complex_post_activity AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastEditDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    COALESCE(p.Tags, '') AS Tags,
+    COALESCE(p.Body, '') AS Body,
+    CASE
+      WHEN p.AcceptedAnswerId IS NOT NULL THEN 1
+      ELSE 0
+    END AS HasAcceptedAnswer
+  FROM Posts p
+  LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+  LEFT JOIN Tags t ON t.WikiPostId = p.Id OR t.ExcerptPostId = p.Id
+  WHERE p.PostTypeId IN (1,2)
+    AND p.LastActivityDate IS NOT NULL
+),
+aggregated AS (
+  SELECT
+    cu.UserId,
+    cu.DisplayName,
+    cu.Reputation,
+    cu.Location,
+    cu.AboutMe,
+    cu.AccountId,
+    cu.CreationDate AS UserCreation,
+    cu.LastAccessDate,
+    COUNT(DISTINCT rp.PostId) AS RecentPosts,
+    AVG(cpa.Score) FILTER (WHERE cpa.PostId IS NOT NULL) AS AvgPostScore,
+    MAX(cpa.LastActivityDate) AS LastPostActivity
+  FROM top_users cu
+  LEFT JOIN (
+    SELECT OwnerUserId AS UserId, Id AS PostId
+    FROM recent_questions
+  ) rp ON rp.UserId = cu.UserId
+  LEFT JOIN complex_post_activity cpa ON cpa.PostId = rp.PostId
+  GROUP BY cu.UserId, cu.DisplayName, cu.Reputation, cu.Location, cu.AboutMe, cu.AccountId, cu.CreationDate, cu.LastAccessDate
+),
+final_output AS (
+  SELECT
+    a.UserId,
+    a.DisplayName,
+    a.Reputation,
+    a.Location,
+    a.AboutMe,
+    a.AccountId,
+    a.UserCreation,
+    a.LastAccessDate,
+    a.RecentPosts,
+    a.AvgPostScore,
+    a.LastPostActivity,
+    (SELECT STRING_AGG(DISTINCT t.TagName, ',')
+     FROM Posts p2
+     JOIN Tags t ON t.WikiPostId = p2.Id OR t.ExcerptPostId = p2.Id
+     WHERE p2.OwnerUserId = a.UserId
+     LIMIT 5) AS TopTags,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = a.UserId) AS BadgeCount,
+    (SELECT COUNT(*) FROM Votes v WHERE v.UserId = a.UserId AND v.VoteTypeId IN (2,3)) AS VoteCount
+  FROM aggregated a
+)
+SELECT
+  fo.UserId,
+  fo.DisplayName,
+  fo.Reputation,
+  fo.Location,
+  fo.AboutMe,
+  fo.AccountId,
+  fo.UserCreation,
+  fo.LastAccessDate,
+  fo.RecentPosts,
+  fo.AvgPostScore,
+  fo.LastPostActivity,
+  fo.TopTags,
+  fo.BadgeCount,
+  fo.VoteCount,
+  ARRAY_AGG(DISTINCT po.Title) FILTER (WHERE po.Title IS NOT NULL) AS SampleQuestionTitles
+FROM final_output fo
+LEFT JOIN recent_questions rq ON rq.OwnerUserId = fo.UserId
+LEFT JOIN Posts po ON po.Id = rq.QuestionId
+GROUP BY
+  fo.UserId, fo.DisplayName, fo.Reputation, fo.Location, fo.AboutMe, fo.AccountId,
+  fo.UserCreation, fo.LastAccessDate, fo.RecentPosts, fo.AvgPostScore, fo.LastPostActivity,
+  fo.TopTags, fo.BadgeCount, fo.VoteCount
+ORDER BY fo.Reputation DESC, fo.LastPostActivity DESC
+LIMIT 100;

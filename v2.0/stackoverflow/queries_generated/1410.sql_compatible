@@ -1,0 +1,187 @@
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Reputation,
+        U.UpVotes,
+        U.DownVotes,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswers,
+        SUM(COALESCE(P.Score, 0)) AS TotalPostScore,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        MAX(COALESCE(P.LastActivityDate, C.CreationDate, U.LastAccessDate)) AS LastUserActivityDate,
+        AVG(
+            CASE WHEN P.LastActivityDate IS NOT NULL
+                 THEN EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - P.LastActivityDate))/86400
+                 ELSE NULL END
+        ) AS AvgDaysSincePostActivity
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    WHERE U.CreationDate >= '2010-01-01'
+    GROUP BY U.Id, U.DisplayName, U.CreationDate, U.LastAccessDate, U.Reputation, U.UpVotes, U.DownVotes
+),
+PostQualityMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.FavoriteCount,
+        P.CreationDate AS PostCreationDate,
+        P.LastActivityDate AS PostLastActivityDate,
+        P.ClosedDate,
+        P.ParentId,
+        P.AcceptedAnswerId,
+        LENGTH(P.Body) AS BodyLength,
+        LENGTH(P.Title) AS TitleLength,
+        P.Tags,
+        (COALESCE(P.Score, 0) * 5) +
+        (CASE WHEN P.ViewCount IS NOT NULL THEN P.ViewCount / 100.0 ELSE 0 END) +
+        (CASE WHEN P.AnswerCount IS NOT NULL THEN P.AnswerCount * 2 ELSE 0 END) +
+        (CASE WHEN P.FavoriteCount IS NOT NULL THEN P.FavoriteCount * 3 ELSE 0 END) +
+        (CASE WHEN P.AcceptedAnswerId IS NOT NULL THEN 10 ELSE 0 END)
+        AS CompositeQualityScore,
+        RANK() OVER (PARTITION BY P.PostTypeId ORDER BY COALESCE(P.Score, 0) DESC, P.CreationDate DESC) AS PostTypeScoreRank,
+        AVG(CASE WHEN P.Score > 0 THEN P.Score ELSE NULL END) OVER (PARTITION BY P.OwnerUserId) AS AvgOwnerPositivePostScore,
+        EXISTS (SELECT 1 FROM PostHistory PH WHERE PH.PostId = P.Id AND PH.PostHistoryTypeId = 10 AND PH.CreationDate > P.CreationDate) AS WasEverClosed,
+        EXISTS (SELECT 1 FROM PostLinks PL WHERE PL.PostId = P.Id AND PL.LinkTypeId = 3) AS HasDuplicatesLinked
+    FROM Posts P
+    WHERE P.CreationDate >= '2010-01-01' AND P.OwnerUserId IS NOT NULL
+),
+TopTagsByActivity AS (
+    SELECT
+        Tag,
+        COUNT(DISTINCT PostId) AS TagPostCount,
+        SUM(COALESCE(PostScore, 0)) AS TagTotalScore,
+        AVG(COALESCE(PostScore, 0)) AS TagAvgScore,
+        RANK() OVER (ORDER BY COUNT(DISTINCT PostId) DESC, SUM(COALESCE(PostScore, 0)) DESC) AS TagPopularityRank
+    FROM PostQualityMetrics,
+    LATERAL (SELECT TRIM(t) AS Tag FROM UNNEST(string_to_array(REPLACE(REPLACE(Tags, '<', ''), '>', ''), ',')) AS t) AS tag_table
+    WHERE Tags IS NOT NULL AND Tags != '' AND PostTypeId = 1
+    GROUP BY Tag
+    HAVING COUNT(DISTINCT PostId) > 50 AND AVG(COALESCE(PostScore, 0)) > 5
+),
+BadgeAchievementSummary AS (
+    SELECT
+        B.UserId,
+        COUNT(B.Id) AS TotalBadges,
+        COUNT(CASE WHEN B.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN B.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN B.Class = 3 THEN 1 END) AS BronzeBadges,
+        MAX(B.Date) AS LastBadgeDate,
+        NTILE(100) OVER (ORDER BY COUNT(CASE WHEN B.Class = 1 THEN 1 END) DESC) AS GoldBadgePercentileRank
+    FROM Badges B
+    GROUP BY B.UserId
+),
+CommentSentimentProxy AS (
+    SELECT
+        C.PostId,
+        AVG(COALESCE(C.Score, 0)) AS AvgCommentScore,
+        SUM(CASE
+                WHEN LOWER(C.Text) LIKE '%thank%' OR LOWER(C.Text) LIKE '%great%' OR C.Score > 0 THEN 1
+                WHEN LOWER(C.Text) LIKE '%bug%' OR LOWER(C.Text) LIKE '%issue%' OR LOWER(C.Text) LIKE '%error%' OR C.Score < 0 THEN -1
+                WHEN LENGTH(C.Text) < 10 THEN 0.5
+                ELSE 0
+            END) AS SentimentScoreSum,
+        COUNT(C.Id) AS CommentCountForPost
+    FROM Comments C
+    GROUP BY C.PostId
+)
+SELECT
+    UE.UserId,
+    COALESCE(UE.DisplayName, 'Unknown User ' || UE.UserId) AS UserDisplayName,
+    UE.Reputation,
+    UE.TotalPosts,
+    UE.TotalQuestions,
+    UE.TotalAnswers,
+    UE.TotalPostScore,
+    BAS.TotalBadges,
+    BAS.GoldBadges,
+    BAS.SilverBadges,
+    BAS.GoldBadgePercentileRank,
+    PQM.PostId AS TopPostId,
+    PQM.PostTypeId AS TopPostType,
+    PQM.PostScore AS TopPostScore,
+    PQM.ViewCount AS TopPostViewCount,
+    PQM.CompositeQualityScore AS TopPostQualityScore,
+    PQM.WasEverClosed,
+    PQM.HasDuplicatesLinked,
+    COALESCE(CSP.AvgCommentScore, 0) AS TopPostAvgCommentScore,
+    COALESCE(CSP.SentimentScoreSum, 0) AS TopPostCommentSentiment,
+    TTS.TagPopularityRank AS TopPostPrimaryTagPopularityRank,
+    CAST(UE.TotalPostScore AS NUMERIC) / NULLIF(UE.TotalPosts, 0) *
+    (1 + CAST(UE.Reputation AS NUMERIC) / 100000.0) *
+    (1 + CAST(BAS.GoldBadges AS NUMERIC) / NULLIF(BAS.TotalBadges, 0.001)) AS WeightedUserQualityMetric,
+    (SELECT COUNT(DISTINCT A.Id)
+     FROM Posts Q
+     INNER JOIN Posts A ON Q.AcceptedAnswerId = A.Id AND A.OwnerUserId = UE.UserId AND Q.Id = A.ParentId
+     INNER JOIN TopTagsByActivity TTS_sub ON TTS_sub.TagPopularityRank <= 10
+        AND Q.Tags LIKE ('%<' || TTS_sub.Tag || '>%')
+     WHERE Q.OwnerUserId = UE.UserId
+       AND Q.PostTypeId = 1
+       AND Q.CreationDate >= UE.UserCreationDate
+       AND Q.Score >= 50
+    ) AS AcceptedAnswersInTopTagsCount,
+    CASE
+        WHEN UE.Reputation > 75000 AND BAS.GoldBadges >= 10 AND PQM.CompositeQualityScore > 100 THEN 'Legendary Trailblazer'
+        WHEN UE.TotalAnswers > 200 AND UE.TotalPostScore > 2500 AND PQM.CompositeQualityScore > 75 AND PQM.AcceptedAnswerId IS NOT NULL THEN 'Elite Answer Architect'
+        WHEN UE.TotalQuestions > 75 AND PQM.CompositeQualityScore > 120 AND PQM.ViewCount > 50000 AND PQM.WasEverClosed = FALSE THEN 'Profound Question Setter'
+        WHEN UE.LastUserActivityDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '6 months' AND UE.TotalPosts > 20 AND BAS.SilverBadges >= 5 THEN 'Highly Engaged Contributor'
+        WHEN UE.DisplayName IS NULL OR UE.DisplayName = '' OR LOWER(UE.DisplayName) LIKE '%guest%' THEN 'Unattributed Contributor'
+        ELSE 'Active Community Member'
+    END AS UserImpactCategory,
+    COALESCE(NULLIF(
+        CASE
+            WHEN PQM.Tags IS NOT NULL AND PQM.Tags != '' AND POSITION('<' IN PQM.Tags) > 0 AND POSITION('>' IN PQM.Tags) > POSITION('<' IN PQM.Tags)
+            THEN SUBSTRING(PQM.Tags FROM POSITION('<' IN PQM.Tags) + 1 FOR POSITION('>' IN PQM.Tags) - POSITION('<' IN PQM.Tags) - 1)
+            ELSE NULL
+        END
+    , ''), 'NO_TAG_SPECIFIED') AS TopPostPrimaryTag,
+    AVG(PQM.CompositeQualityScore) OVER (PARTITION BY
+        CASE
+            WHEN UE.Reputation > 75000 AND BAS.GoldBadges >= 10 AND PQM.CompositeQualityScore > 100 THEN 'Legendary Trailblazer'
+            WHEN UE.TotalAnswers > 200 AND UE.TotalPostScore > 2500 AND PQM.CompositeQualityScore > 75 AND PQM.AcceptedAnswerId IS NOT NULL THEN 'Elite Answer Architect'
+            WHEN UE.TotalQuestions > 75 AND PQM.CompositeQualityScore > 120 AND PQM.ViewCount > 50000 AND PQM.WasEverClosed = FALSE THEN 'Profound Question Setter'
+            WHEN UE.LastUserActivityDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '6 months' AND UE.TotalPosts > 20 AND BAS.SilverBadges >= 5 THEN 'Highly Engaged Contributor'
+            WHEN UE.DisplayName IS NULL OR UE.DisplayName = '' OR LOWER(UE.DisplayName) LIKE '%guest%' THEN 'Unattributed Contributor'
+            ELSE 'Active Community Member'
+        END
+    ) AS AvgQualityScorePerCategory
+FROM UserEngagement UE
+INNER JOIN BadgeAchievementSummary BAS ON UE.UserId = BAS.UserId
+INNER JOIN PostQualityMetrics PQM ON UE.UserId = PQM.OwnerUserId
+LEFT JOIN CommentSentimentProxy CSP ON PQM.PostId = CSP.PostId
+LEFT JOIN TopTagsByActivity TTS ON (
+    CASE
+        WHEN PQM.Tags IS NOT NULL AND PQM.Tags != '' AND POSITION('<' IN PQM.Tags) > 0 AND POSITION('>' IN PQM.Tags) > POSITION('<' IN PQM.Tags)
+        THEN SUBSTRING(PQM.Tags FROM POSITION('<' IN PQM.Tags) + 1 FOR POSITION('>' IN PQM.Tags) - POSITION('<' IN PQM.Tags) - 1)
+        ELSE NULL
+    END
+) = TTS.Tag
+WHERE
+    UE.Reputation >= 2000
+    AND UE.TotalPosts > 10
+    AND PQM.PostTypeScoreRank = 1
+    AND PQM.PostTypeId IN (1, 2)
+    AND PQM.CompositeQualityScore > 40
+    AND UE.LastUserActivityDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 year'
+    AND (
+        (UE.TotalQuestions >= 15 AND PQM.PostTypeId = 1 AND PQM.AnswerCount >= 3)
+        OR (UE.TotalAnswers >= 20 AND PQM.PostTypeId = 2 AND PQM.AcceptedAnswerId IS NOT NULL AND PQM.PostScore >= 10)
+    )
+    AND PQM.WasEverClosed = FALSE
+    AND PQM.HasDuplicatesLinked = FALSE
+    AND (LOWER(UE.DisplayName) NOT LIKE '%deleted user%' OR UE.DisplayName IS NULL)
+    AND BAS.TotalBadges >= 5
+ORDER BY
+    WeightedUserQualityMetric DESC,
+    UE.Reputation DESC,
+    BAS.GoldBadges DESC,
+    PQM.CompositeQualityScore DESC
+LIMIT 5000;

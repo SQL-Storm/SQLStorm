@@ -1,0 +1,209 @@
+WITH
+user_base AS (
+    SELECT
+        u.Id                         AS user_id,
+        u.DisplayName                AS user_name,
+        u.Reputation,
+        u.CreationDate               AS user_created,
+        COALESCE(u.LastAccessDate, u.CreationDate) AS last_access,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id)                AS total_posts,
+        (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id)                AS total_comments,
+        (SELECT MAX(p.CreationDate) FROM Posts p WHERE p.OwnerUserId = u.Id)   AS last_post_date
+    FROM Users u
+),
+
+post_agg AS (
+    SELECT
+        p.OwnerUserId                                   AS user_id,
+        COUNT(*)                                        AS question_count,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END)   AS question_score_sum,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END)          AS question_score_avg,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END)         AS answer_count,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END)   AS answer_score_sum,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END)          AS answer_score_avg,
+        COUNT(DISTINCT t.tag) AS distinct_tag_count
+    FROM Posts p
+    LEFT JOIN LATERAL (
+        SELECT tag
+        FROM (
+            SELECT
+                -- strip leading '<' and trailing '>' then split on '><' using standard SQL functions
+                regexp_replace(p.Tags, '^<|>$', '') AS stripped_tags
+        ) s
+        CROSS JOIN LATERAL (
+            -- split the stripped_tags into rows using a recursive CTE compatible style
+            SELECT NULL::text AS tag
+        ) dummy ON true
+    ) ignore_me ON true
+    /* Because not all SQL dialects support set-returning functions in SELECT/CASE,
+       we parse tags using a derived table approach where possible.
+       For portability, extract distinct tags using a simple string-search approximation:
+       count distinct tag-like tokens by splitting on '><' via replace + regexp_split_to_array where supported.
+       Here we attempt a more portable approach using string_to_array if available; if not,
+       replace this block with a dialect-specific splitter.
+    */
+    /* Fallback: treat the whole Tags string as a single tag when splitting isn't available */
+    LEFT JOIN (
+        SELECT Id, CASE WHEN Tags IS NOT NULL AND PostTypeId = 1 THEN regexp_replace(Tags, '^<|>$', '') ELSE NULL END AS tag
+        FROM Posts
+    ) t ON t.Id = p.Id AND t.tag IS NOT NULL
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+
+badge_agg AS (
+    SELECT
+        b.UserId                                       AS user_id,
+        COUNT(*)                                       AS total_badges,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END)        AS gold_badges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END)        AS silver_badges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END)        AS bronze_badges,
+        COUNT(CASE WHEN b.TagBased = 1 THEN 1 END)     AS tag_badges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+vote_agg AS (
+    SELECT
+        v.PostId                                       AS post_id,
+        p.OwnerUserId                                  AS user_id,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END)  AS up_votes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END)  AS down_votes,
+        SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END)  AS favorite_votes
+    FROM Votes v
+    JOIN Posts p ON p.Id = v.PostId
+    GROUP BY v.PostId, p.OwnerUserId
+),
+
+recent_activity AS (
+    SELECT
+        p.OwnerUserId                                   AS user_id,
+        p.Id                                            AS post_id,
+        p.CreationDate                                  AS activity_date,
+        p.PostTypeId                                    AS activity_type,
+        ROW_NUMBER() OVER (
+            PARTITION BY p.OwnerUserId
+            ORDER BY p.CreationDate DESC
+        )                                               AS rn_recent_30d
+    FROM Posts p
+    WHERE p.CreationDate >= (DATE '2024-10-01' - INTERVAL '30' DAY)
+),
+
+users_with_badges AS (
+    SELECT
+        ubh.user_id,
+        COALESCE(ub.total_badges, 0)           AS total_badges,
+        COALESCE(ub.gold_badges, 0)            AS gold_badges,
+        COALESCE(ub.silver_badges, 0)          AS silver_badges,
+        COALESCE(ub.bronze_badges, 0)          AS bronze_badges,
+        COALESCE(ub.tag_badges, 0)             AS tag_badges
+    FROM badge_agg ub
+    RIGHT JOIN user_base ubh ON ubh.user_id = ub.user_id
+),
+
+active_users AS (
+    SELECT
+        ub.user_id,
+        ub.user_name,
+        ub.Reputation                                  AS reputation,
+        ub.total_posts,
+        ub.last_access,
+        COALESCE(pa.question_count,0)                  AS question_count,
+        COALESCE(pa.answer_count,0)                    AS answer_count,
+        COALESCE(pa.distinct_tag_count,0)              AS distinct_tag_count,
+        ub.last_post_date,
+        COALESCE(wb.total_badges,0)                    AS total_badges,
+        COALESCE(wb.gold_badges,0)                     AS gold_badges,
+        COALESCE(wb.silver_badges,0)                   AS silver_badges,
+        COALESCE(wb.bronze_badges,0)                   AS bronze_badges,
+        COALESCE(wb.tag_badges,0)                      AS tag_badges,
+        COALESCE(va.up_votes,0)                        AS up_votes,
+        COALESCE(va.down_votes,0)                      AS down_votes,
+        COALESCE(va.favorite_votes,0)                  AS favorite_votes
+    FROM user_base ub
+    LEFT JOIN post_agg pa   ON pa.user_id = ub.user_id
+    LEFT JOIN users_with_badges wb ON wb.user_id = ub.user_id
+    LEFT JOIN vote_agg va   ON va.user_id = ub.user_id
+    WHERE ub.Reputation > 1000
+),
+inactive_users AS (
+    SELECT
+        ub.user_id,
+        ub.user_name,
+        ub.Reputation                                  AS reputation,
+        ub.total_posts,
+        ub.last_access,
+        COALESCE(pa.question_count,0)                  AS question_count,
+        COALESCE(pa.answer_count,0)                    AS answer_count,
+        COALESCE(pa.distinct_tag_count,0)              AS distinct_tag_count,
+        ub.last_post_date,
+        COALESCE(wb.total_badges,0)                    AS total_badges,
+        COALESCE(wb.gold_badges,0)                     AS gold_badges,
+        COALESCE(wb.silver_badges,0)                   AS silver_badges,
+        COALESCE(wb.bronze_badges,0)                   AS bronze_badges,
+        COALESCE(wb.tag_badges,0)                      AS tag_badges,
+        COALESCE(va.up_votes,0)                        AS up_votes,
+        COALESCE(va.down_votes,0)                      AS down_votes,
+        COALESCE(va.favorite_votes,0)                  AS favorite_votes
+    FROM user_base ub
+    LEFT JOIN post_agg pa   ON pa.user_id = ub.user_id
+    LEFT JOIN users_with_badges wb ON wb.user_id = ub.user_id
+    LEFT JOIN vote_agg va   ON va.user_id = ub.user_id
+    WHERE ub.Reputation <= 1000
+)
+
+SELECT
+    u.user_id,
+    u.user_name,
+    u.reputation,
+    u.total_posts,
+    COALESCE(u.question_count, 0)                           AS question_count,
+    COALESCE(u.answer_count, 0)                             AS answer_count,
+    COALESCE(u.distinct_tag_count, 0)                       AS distinct_tags_used,
+    COALESCE(u.total_badges, 0)                             AS total_badges,
+    COALESCE(u.gold_badges, 0)                              AS gold_badges,
+    COALESCE(u.silver_badges, 0)                            AS silver_badges,
+    COALESCE(u.bronze_badges, 0)                            AS bronze_badges,
+    COALESCE(u.tag_badges, 0)                               AS tag_badges,
+    COALESCE(u.up_votes, 0)                                 AS total_up_votes_on_posts,
+    COALESCE(u.down_votes, 0)                               AS total_down_votes_on_posts,
+    COALESCE(u.favorite_votes, 0)                           AS total_favorites,
+    u.last_access,
+    u.last_post_date,
+    CASE
+        WHEN u.reputation IS NULL THEN 0
+        ELSE
+            (u.reputation * 0.4) +
+            (COALESCE(u.question_count,0) * 1.5) +
+            (COALESCE(u.answer_count,0) * 2.0) +
+            (COALESCE(u.gold_badges,0) * 10) +
+            (COALESCE(u.silver_badges,0) * 5) +
+            (COALESCE(u.bronze_badges,0) * 2) +
+            (COALESCE(u.up_votes,0) * 0.1) -
+            (COALESCE(u.down_votes,0) * 0.2)
+    END                                                    AS activity_score,
+    ROW_NUMBER() OVER (ORDER BY
+        CASE
+            WHEN u.reputation IS NULL THEN -1
+            ELSE
+                (u.reputation * 0.4) +
+                (COALESCE(u.question_count,0) * 1.5) +
+                (COALESCE(u.answer_count,0) * 2.0) +
+                (COALESCE(u.gold_badges,0) * 10) +
+                (COALESCE(u.silver_badges,0) * 5) +
+                (COALESCE(u.bronze_badges,0) * 2) +
+                (COALESCE(u.up_votes,0) * 0.1) -
+                (COALESCE(u.down_votes,0) * 0.2)
+        END DESC,
+        u.user_id ASC
+    )                                                     AS activity_rank
+FROM (
+    SELECT * FROM active_users
+    UNION ALL
+    SELECT * FROM inactive_users
+) u
+ORDER BY activity_rank
+LIMIT 100;

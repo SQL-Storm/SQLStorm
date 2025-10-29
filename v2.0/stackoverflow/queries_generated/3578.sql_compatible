@@ -1,0 +1,136 @@
+WITH RECURSIVE
+    exploded_answers AS (
+        SELECT
+            a.Id               AS AnswerId,
+            a.OwnerUserId      AS UserId,
+            a.CreationDate,
+            a.Score            AS AnswerScore,
+            COALESCE(
+                regexp_split_to_table(substr(a.Tags, 2, length(a.Tags)-2), '><'),
+                NULL
+            )                  AS Tag
+        FROM Posts a
+        WHERE a.PostTypeId = 2
+    ),
+
+    user_tag_stats AS (
+        SELECT
+            ua.UserId,
+            ua.Tag,
+            COUNT(*)                           AS AnswersPerTag,
+            SUM(ua.AnswerScore)                AS TotalScorePerTag,
+            AVG(ua.AnswerScore)                AS AvgScorePerTag,
+            ROW_NUMBER() OVER (
+                PARTITION BY ua.UserId
+                ORDER BY COUNT(*) DESC, SUM(ua.AnswerScore) DESC
+            )                                  AS TagRank
+        FROM exploded_answers ua
+        GROUP BY ua.UserId, ua.Tag
+    ),
+
+    badge_counts AS (
+        SELECT
+            b.UserId,
+            SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+            SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+            SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+            COUNT(*)                                        AS TotalBadges
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+
+    latest_activity AS (
+        SELECT
+            u.Id                                       AS UserId,
+            GREATEST(
+                COALESCE(p.LastActivityDate, TIMESTAMP '1970-01-01'),
+                COALESCE(c.CreationDate,    TIMESTAMP '1970-01-01'),
+                COALESCE(v.CreationDate,    TIMESTAMP '1970-01-01')
+            )                                          AS LastActivity
+        FROM Users u
+        LEFT JOIN (
+            SELECT OwnerUserId, MAX(LastActivityDate) AS LastActivityDate
+            FROM Posts
+            GROUP BY OwnerUserId
+        ) p ON p.OwnerUserId = u.Id
+        LEFT JOIN (
+            SELECT UserId, MAX(CreationDate) AS CreationDate
+            FROM Comments
+            GROUP BY UserId
+        ) c ON c.UserId = u.Id
+        LEFT JOIN (
+            SELECT UserId, MAX(CreationDate) AS CreationDate
+            FROM Votes
+            GROUP BY UserId
+        ) v ON v.UserId = u.Id
+    ),
+
+    active_users AS (
+        SELECT DISTINCT u.Id AS UserId
+        FROM Users u
+        LEFT JOIN Posts p   ON p.OwnerUserId = u.Id
+        LEFT JOIN Comments c ON c.UserId = u.Id
+        LEFT JOIN Votes v    ON v.UserId = u.Id
+        LEFT JOIN Badges b   ON b.UserId = u.Id
+        WHERE p.Id IS NOT NULL
+           OR c.Id IS NOT NULL
+           OR v.Id IS NOT NULL
+           OR b.Id IS NOT NULL
+    ),
+
+    badge_only_users AS (
+        SELECT u.Id AS UserId
+        FROM Users u
+        JOIN Badges b ON b.UserId = u.Id
+        LEFT JOIN Posts p   ON p.OwnerUserId = u.Id
+        LEFT JOIN Comments c ON c.UserId = u.Id
+        LEFT JOIN Votes v    ON v.UserId = u.Id
+        WHERE p.Id IS NULL AND c.Id IS NULL AND v.Id IS NULL
+    ),
+
+    all_considered_users AS (
+        SELECT UserId FROM active_users
+        UNION
+        SELECT UserId FROM badge_only_users
+    )
+
+SELECT
+    u.Id                                    AS UserId,
+    COALESCE(u.DisplayName, '[deleted]')    AS DisplayName,
+    u.Reputation,
+    bc.GoldBadges,
+    bc.SilverBadges,
+    bc.BronzeBadges,
+    bc.TotalBadges,
+    ut.Tag                                   AS TopTag,
+    ut.AnswersPerTag                         AS AnswersOnTopTag,
+    ROUND(CAST(ut.AvgScorePerTag AS DECIMAL), 2) AS AvgScoreOnTopTag,
+    la.LastActivity,
+    (SELECT COUNT(DISTINCT DATE(a.CreationDate))
+     FROM Posts a
+     WHERE a.PostTypeId = 2
+       AND a.OwnerUserId = u.Id)            AS DistinctAnswerDays,
+    RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+FROM all_considered_users acu
+JOIN Users u          ON u.Id = acu.UserId
+LEFT JOIN badge_counts bc   ON bc.UserId = u.Id
+LEFT JOIN latest_activity la ON la.UserId = u.Id
+LEFT JOIN (
+    SELECT UserId, Tag, AnswersPerTag, AvgScorePerTag
+    FROM user_tag_stats
+    WHERE TagRank = 1
+) ut ON ut.UserId = u.Id
+GROUP BY
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    bc.GoldBadges,
+    bc.SilverBadges,
+    bc.BronzeBadges,
+    bc.TotalBadges,
+    ut.Tag,
+    ut.AnswersPerTag,
+    ut.AvgScorePerTag,
+    la.LastActivity
+ORDER BY u.Reputation DESC
+LIMIT 100;

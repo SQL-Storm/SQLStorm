@@ -1,0 +1,203 @@
+-- {"query": "1510.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3046} 
+
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        COALESCE(SUM(P.Score) FILTER (WHERE P.PostTypeId IN (1,2)), 0) AS TotalPostScoreReceived,
+        COUNT(DISTINCT P.Id) AS TotalPostsCreated,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT B.Id) AS TotalBadgesEarned,
+        -- Calculate the latest activity date for the user across multiple tables, handling potential NULLs with GREATEST and COALESCE
+        MAX(GREATEST(
+            COALESCE(P.LastActivityDate, '1900-01-01'::timestamp),
+            COALESCE(C.CreationDate, '1900-01-01'::timestamp),
+            COALESCE(B.Date, '1900-01-01'::timestamp),
+            U.LastAccessDate
+        )) AS LastUserActivityDate,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesGiven, -- VoteType 2 is UpMod
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesGiven, -- VoteType 3 is DownMod
+        COALESCE(AVG(P.Score) FILTER (WHERE P.PostTypeId IN (1,2)), 0) AS AvgPostScore,
+        COALESCE(AVG(C.Score), 0) AS AvgCommentScore,
+        COUNT(DISTINCT PH.PostId) FILTER (WHERE PH.PostHistoryTypeId IN (4,5,6) AND PH.UserId = U.Id) AS SelfEditCount, -- User editing their own posts
+        COUNT(DISTINCT PH.PostId) FILTER (WHERE PH.PostHistoryTypeId IN (24) AND PH.UserId = U.Id) AS AppliedSuggestedEditCount -- User applying suggested edits
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN Votes V ON U.Id = V.UserId
+    LEFT JOIN PostHistory PH ON U.Id = PH.UserId -- For tracking edits made by the user
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate
+),
+PostDetailsWithTags AS (
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        P.PostTypeId,
+        P.CreationDate AS PostCreationDate,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.LastEditDate,
+        P.ClosedDate,
+        P.Title,
+        P.Body,
+        P.Tags,
+        LENGTH(P.Body) AS BodyLength,
+        LENGTH(P.Title) AS TitleLength,
+        -- String expressions and NULL logic for tags: extract primary and secondary tags
+        SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags)-2) AS RawTagsString,
+        COALESCE(NULLIF(SPLIT_PART(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags)-2), '><', 1), ''), 'untagged') AS PrimaryTag,
+        CASE
+            WHEN P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2 AND ARRAY_LENGTH(string_to_array(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags)-2), '><'), 1) >= 2
+            THEN SPLIT_PART(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags)-2), '><', 2)
+            ELSE NULL
+        END AS SecondaryTag,
+        -- Complex calculations
+        (P.Score * 1.0 / NULLIF(P.ViewCount, 0)) AS ScoreToViewRatio,
+        COALESCE(P.AnswerCount, 0) + COALESCE(P.CommentCount, 0) + COALESCE(P.FavoriteCount, 0) AS EngagementCount,
+        EXTRACT(EPOCH FROM (NOW() - P.CreationDate)) / (3600 * 24) AS DaysSinceCreation -- Days since post creation
+    FROM Posts P
+    WHERE P.PostTypeId IN (1, 2) -- Only Questions and Answers
+),
+PostHistoryAggregates AS (
+    SELECT
+        PH.PostId,
+        COUNT(PH.Id) AS TotalHistoryEntries,
+        COUNT(PH.Id) FILTER (WHERE PH.PostHistoryTypeId IN (4,5,6)) AS EditCountPost, -- Title, Body, Tags edits on this post
+        COUNT(PH.Id) FILTER (WHERE PH.PostHistoryTypeId IN (10,35)) AS CloseOrMigrationCount, -- Post Closed or Migrated Away history
+        MAX(PH.CreationDate) AS LastHistoryEventDate,
+        MIN(PH.CreationDate) AS FirstHistoryEventDate,
+        -- Correlated subquery: get the ID of the user who made the most recent non-owner edit (excluding post owner)
+        (SELECT PH2.UserId
+         FROM PostHistory PH2
+         WHERE PH2.PostId = PH.PostId
+           AND PH2.UserId IS NOT NULL
+           AND PH2.UserId <> PD.OwnerUserId
+           AND PH2.PostHistoryTypeId IN (4,5,6,24) -- Edits or suggested edit applied
+         ORDER BY PH2.CreationDate DESC
+         LIMIT 1
+        ) AS LastNonOwnerEditorUserId
+    FROM PostHistory PH
+    JOIN PostDetailsWithTags PD ON PH.PostId = PD.PostId
+    GROUP BY PH.PostId, PD.OwnerUserId
+),
+PostLinkAnalysis AS (
+    SELECT
+        P.PostId,
+        COUNT(DISTINCT PL.Id) AS TotalLinkedPostsOut,
+        COUNT(DISTINCT PL.Id) FILTER (WHERE PL.LinkTypeId = 3) AS DuplicateLinksOutCount, -- Duplicate (PostId is a duplicate of RelatedPostId)
+        COUNT(DISTINCT PL_REV.Id) AS TotalLinkedPostsIn,
+        COUNT(DISTINCT PL_REV.Id) FILTER (WHERE PL_REV.LinkTypeId = 3) AS DuplicateLinksInCount,
+        MAX(CASE WHEN PL.LinkTypeId = 3 THEN 1 ELSE 0 END) AS HasOutboundDuplicate,
+        MAX(CASE WHEN PL_REV.LinkTypeId = 3 THEN 1 ELSE 0 END) AS HasInboundDuplicate
+    FROM PostDetailsWithTags P
+    LEFT JOIN PostLinks PL ON P.PostId = PL.PostId -- Links FROM this post
+    LEFT JOIN PostLinks PL_REV ON P.PostId = PL_REV.RelatedPostId -- Links TO this post
+    GROUP BY P.PostId
+),
+AggregatedTagMetrics AS (
+    SELECT
+        Tag.TagName,
+        COUNT(PD.PostId) AS TaggedPostCount,
+        SUM(PD.Score) AS TotalTagScore,
+        COALESCE(AVG(PD.Score), 0) AS AvgTagScore,
+        MAX(PD.CreationDate) AS LatestTagPostDate,
+        COUNT(DISTINCT PD.OwnerUserId) AS UniqueTagContributors,
+        -- Window function: Rank tags by popularity (post count, then total score)
+        RANK() OVER (ORDER BY COUNT(PD.PostId) DESC, SUM(PD.Score) DESC) AS TagPopularityRank,
+        -- Another window function: Row number for recent popularity
+        ROW_NUMBER() OVER (ORDER BY COUNT(PD.PostId) DESC, MAX(PD.CreationDate) DESC) AS TagRowNum
+    FROM PostDetailsWithTags PD
+    JOIN LATERAL ( -- Lateral join to expand the tags string into individual rows
+        SELECT UNNEST(string_to_array(substring(PD.Tags FROM 2 FOR LENGTH(PD.Tags)-2), '><')) AS TagName
+    ) AS Tag ON PD.Tags IS NOT NULL AND LENGTH(PD.Tags) > 2
+    GROUP BY Tag.TagName
+),
+-- Set Operator: Identify "Hot Topics" (top 10 tags by posts) and "Rising Topics" (top 10 tags by recent posts and score)
+HotAndRisingTopics AS (
+    (SELECT TagName, 'Hot' AS TopicCategory FROM AggregatedTagMetrics WHERE TagPopularityRank <= 10)
+    UNION ALL -- Using UNION ALL to include tags that might be both hot and rising
+    (SELECT TagName, 'Rising' AS TopicCategory FROM AggregatedTagMetrics WHERE TagRowNum <= 10 AND LatestTagPostDate > NOW() - INTERVAL '6 months')
+)
+-- Main Query to combine user and post insights, with advanced filtering and calculations
+SELECT
+    UAS.UserId,
+    UAS.DisplayName,
+    UAS.Reputation,
+    UAS.TotalPostsCreated,
+    UAS.TotalBadgesEarned,
+    UAS.LastUserActivityDate,
+    PDT.PostId,
+    PDT.PostCreationDate,
+    PDT.Title,
+    PDT.Score,
+    PDT.ViewCount,
+    PDT.PrimaryTag,
+    PDT.SecondaryTag,
+    PHA.EditCountPost,
+    PHA.LastHistoryEventDate,
+    PLA.TotalLinkedPostsOut,
+    PLA.DuplicateLinksInCount,
+    COALESCE(HT.TopicCategory, 'General') AS TopicCategory, -- From set operator, with NULL logic
+    -- Complex Calculation with NULL handling and explicit casting
+    ROUND(CAST(PDT.EngagementCount * 1.0 / NULLIF(PDT.ViewCount, 0) AS numeric), 4) AS EngagementRatio,
+    -- Window Function: Rank user's posts by score (within their own posts)
+    RANK() OVER (PARTITION BY UAS.UserId ORDER BY PDT.Score DESC, PDT.ViewCount DESC) AS UserPostScoreRank,
+    -- Window Function: Calculate average score of user's posts over time (last 30 days rolling)
+    AVG(PDT.Score) OVER (PARTITION BY UAS.UserId ORDER BY PDT.PostCreationDate ROWS BETWEEN 30 PRECEDING AND CURRENT ROW) AS RollingAvgPostScore30Days,
+    -- Case statement and string expressions for post technology classification
+    CASE
+        WHEN PDT.Body LIKE '%javascript%' OR PDT.Title ILIKE '%js%' THEN 'JavaScript Related'
+        WHEN PDT.Body LIKE '%python%' OR PDT.Title ILIKE '%python%' THEN 'Python Related'
+        WHEN PDT.PrimaryTag = 'sql' OR PDT.SecondaryTag = 'database' THEN 'SQL/DB Related'
+        WHEN PDT.Body LIKE '%c#%' OR PDT.Title ILIKE '%c#%' THEN 'C# Related'
+        ELSE 'Other Tech'
+    END AS PostTechnologyCategory,
+    -- NULL logic: Get reputation of the last non-owner editor, defaulting to -1 if no such editor or user not found
+    COALESCE(
+        (SELECT U_EDITOR.Reputation
+         FROM Users U_EDITOR
+         WHERE U_EDITOR.Id = PHA.LastNonOwnerEditorUserId),
+        -1
+    ) AS LastNonOwnerEditorReputation,
+    -- Complex CASE statement with multiple conditions
+    CASE
+        WHEN PDT.ClosedDate IS NOT NULL AND PHA.CloseOrMigrationCount > 0
+            THEN 'Closed & History Tracked'
+        WHEN PDT.ClosedDate IS NOT NULL AND PHA.CloseOrMigrationCount = 0
+            THEN 'Closed No History'
+        WHEN PHA.CloseOrMigrationCount > 0 AND PDT.ClosedDate IS NULL
+            THEN 'Migrated But Not Closed' -- Could happen if migrated away
+        ELSE 'Open And Active'
+    END AS PostStatusDetail
+FROM UserActivitySummary UAS
+JOIN PostDetailsWithTags PDT ON UAS.UserId = PDT.OwnerUserId
+LEFT JOIN PostHistoryAggregates PHA ON PDT.PostId = PHA.PostId
+LEFT JOIN PostLinkAnalysis PLA ON PDT.PostId = PLA.PostId
+LEFT JOIN HotAndRisingTopics HT ON PDT.PrimaryTag = HT.TagName
+WHERE
+    UAS.Reputation > 5000 -- Filter for more established users
+    AND PDT.Score > 10 -- Filter for reasonably popular posts
+    AND PDT.ViewCount > 100 -- Filter for visible posts
+    AND PDT.PostCreationDate > NOW() - INTERVAL '2 year' -- Recent posts (within last 2 years)
+    AND (PDT.Title IS NOT NULL AND LENGTH(PDT.Title) > 10) -- Valid titles
+    -- Correlated Subquery in WHERE clause: ensure post has at least one associated comment from an existing user
+    AND EXISTS (
+        SELECT 1
+        FROM Comments C
+        WHERE C.PostId = PDT.PostId AND C.UserId IS NOT NULL
+    )
+    -- Additional filter for specific tag or content
+    AND (PDT.PrimaryTag IN ('sql', 'javascript', 'python', 'c#') OR PDT.Body ILIKE '%performance%')
+ORDER BY
+    UAS.Reputation DESC,
+    PDT.PostCreationDate DESC,
+    PDT.Score DESC,
+    PHA.LastHistoryEventDate DESC
+LIMIT 1000;

@@ -1,0 +1,261 @@
+-- {"query": "1097.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 4159} 
+WITH UserReputationTiers AS (
+    -- Classifies users into reputation tiers and filters for active users
+    SELECT
+        Id AS UserId,
+        DisplayName,
+        Reputation,
+        CASE
+            WHEN Reputation >= 50000 THEN 'Elite'
+            WHEN Reputation >= 10000 THEN 'Expert'
+            WHEN Reputation >= 2000 THEN 'Advanced'
+            WHEN Reputation >= 500 THEN 'Journeyman'
+            ELSE 'Novice'
+        END AS ReputationTier,
+        CreationDate AS UserCreationDate,
+        LastAccessDate
+    FROM Users
+    WHERE LastAccessDate >= '2023-01-01' -- Active users
+),
+PostHistoryMetrics AS (
+    -- Aggregates various post history details including edit counts, close/reopen history, and time since last event
+    SELECT
+        PH.PostId,
+        MIN(PH.CreationDate) AS FirstHistoryEventDate,
+        MAX(PH.CreationDate) AS LastHistoryEventDate,
+        COUNT(DISTINCT PH.Id) AS TotalHistoryEntries,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS TotalEditCount,
+        -- Calculates days since the last history event, NULL if no history events
+        EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - MAX(PH.CreationDate))) / (60 * 60 * 24) AS DaysSinceLastHistoryEvent,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN 'Closed' ELSE NULL END) AS HasClosedHistory,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 11 THEN 'Reopened' ELSE NULL END) AS HasReopenedHistory,
+        -- Extracts the last close reason ID if a post was closed
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.Comment ELSE NULL END) AS LastCloseReasonId
+    FROM PostHistory PH
+    WHERE PH.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 10, 11, 12, 13, 16, 35) -- Initial, Edits, Close/Reopen/Delete, Community Owned, Migrated Away
+    GROUP BY PH.PostId
+),
+TagPerformance AS (
+    -- Analyzes performance of primary tags based on questions posted under them
+    SELECT
+        TRIM(SUBSTRING(P.Tags, 2, POSITION('>' IN P.Tags) - 2)) AS PrimaryTag,
+        COUNT(P.Id) AS TagQuestionCount,
+        AVG(P.Score) AS AvgQuestionScore,
+        SUM(COALESCE(P.AnswerCount, 0)) AS TotalAnswersUnderTag,
+        SUM(CASE WHEN P.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS TagAcceptedAnswerCount,
+        MAX(P.CreationDate) AS LatestQuestionInTag
+    FROM Posts P
+    WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL
+    GROUP BY TRIM(SUBSTRING(P.Tags, 2, POSITION('>' IN P.Tags) - 2))
+    HAVING COUNT(P.Id) > 100 -- Only consider tags with a significant number of questions
+),
+UserEngagementSummary AS (
+    -- Summarizes user-level post, comment, and vote activity
+    SELECT
+        URT.UserId,
+        URT.ReputationTier,
+        COUNT(DISTINCT P.Id) AS UserPostsCount,
+        SUM(P.Score) AS UserTotalPostScore,
+        AVG(P.Score) AS UserAvgPostScore,
+        COUNT(DISTINCT C.Id) AS UserCommentCount,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UserTotalUpvotesGiven,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS UserTotalDownvotesGiven,
+        MAX(CASE WHEN P.PostTypeId = 1 THEN P.CreationDate ELSE NULL END) AS LatestQuestionDate,
+        MAX(CASE WHEN P.PostTypeId = 2 THEN P.CreationDate ELSE NULL END) AS LatestAnswerDate
+    FROM UserReputationTiers URT
+    LEFT JOIN Posts P ON URT.UserId = P.OwnerUserId
+    LEFT JOIN Comments C ON URT.UserId = C.UserId
+    LEFT JOIN Votes V ON URT.UserId = V.UserId
+    GROUP BY URT.UserId, URT.ReputationTier
+),
+PostWithDetailedStats AS (
+    -- Combines core post data with user demographics, history metrics, and calculated performance indicators
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.Title,
+        P.CreationDate AS PostCreationDate,
+        P.LastActivityDate,
+        P.Score,
+        P.ViewCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.OwnerUserId,
+        URT.DisplayName AS OwnerDisplayName,
+        URT.Reputation AS OwnerReputation,
+        URT.ReputationTier AS OwnerReputationTier,
+        UES.UserPostsCount AS OwnerTotalPosts,
+        UES.UserAvgPostScore AS OwnerAvgPostScore,
+        PHM.TotalEditCount,
+        PHM.DaysSinceLastHistoryEvent,
+        PHM.HasClosedHistory,
+        PHM.HasReopenedHistory,
+        PHM.LastCloseReasonId,
+        COALESCE(P.Tags, '<no-tags>') AS Tags,
+        TRIM(SUBSTRING(P.Tags, 2, POSITION('>' IN P.Tags) - 2)) AS PrimaryTag,
+        -- Complex calculation for an 'Engagement Ratio', handling division by zero
+        (P.Score + COALESCE(P.FavoriteCount, 0) * 2.5) / NULLIF(P.ViewCount + P.CommentCount * 0.75 + P.AnswerCount * 1.5, 0) AS EngagementRatio,
+        -- Window function: Ranks posts by engagement ratio within their type and owner
+        DENSE_RANK() OVER (PARTITION BY P.PostTypeId, P.OwnerUserId ORDER BY (P.Score + COALESCE(P.FavoriteCount, 0) * 2.5) / NULLIF(P.ViewCount + P.CommentCount * 0.75 + P.AnswerCount * 1.5, 0) DESC, P.CreationDate DESC) AS OwnerPostEngagementRank,
+        -- Window function: Gets the score of the owner's previous post
+        LAG(P.Score, 1, 0) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate) AS PreviousPostScore,
+        -- Correlated subquery: Counts answers for questions or related questions/answers
+        (SELECT COUNT(A.Id) FROM Posts A WHERE A.ParentId = P.Id AND A.PostTypeId = 2) AS QuestionAnswerCount,
+        -- Correlated subquery: Checks if the owner has a specific (Gold) badge for questions
+        EXISTS (
+            SELECT 1 FROM Badges B
+            WHERE B.UserId = P.OwnerUserId
+              AND B.Name = 'Fanatic' -- Example: Visited the site 100 consecutive days
+              AND B.Class = 1 -- Gold badge
+              AND P.PostTypeId = 1 -- Only for questions
+        ) AS HasFanaticBadgeAndIsQuestion,
+        -- Calculates duration between creation and last activity in minutes, defaults to 0 if null
+        COALESCE(EXTRACT(EPOCH FROM (COALESCE(P.LastActivityDate, P.CreationDate) - P.CreationDate)) / 60, 0) AS ActivityDurationMinutes
+    FROM Posts P
+    INNER JOIN PostTypes PT ON P.PostTypeId = PT.Id
+    LEFT JOIN UserReputationTiers URT ON P.OwnerUserId = URT.UserId
+    LEFT JOIN UserEngagementSummary UES ON P.OwnerUserId = UES.UserId
+    LEFT JOIN PostHistoryMetrics PHM ON P.Id = PHM.PostId
+    WHERE P.PostTypeId IN (1, 2) -- Focus on Questions (1) and Answers (2)
+    AND P.CreationDate >= '2022-06-01' -- Filter for recent posts
+    AND P.OwnerUserId IS NOT NULL -- Exclude posts without an identifiable owner
+    AND P.Body IS NOT NULL -- Ensure content exists
+    AND P.Score > 0 -- Only positive-scored posts
+),
+HighlyInteractedPosts AS (
+    -- Filters posts based on high engagement, reputable owners, and high-performing tags
+    SELECT
+        PDS.PostId,
+        PDS.Title,
+        PDS.PostTypeName,
+        PDS.PostCreationDate,
+        PDS.Score,
+        PDS.ViewCount,
+        PDS.CommentCount,
+        PDS.FavoriteCount,
+        PDS.OwnerDisplayName,
+        PDS.OwnerReputation,
+        PDS.PrimaryTag,
+        PDS.EngagementRatio,
+        PDS.TotalEditCount,
+        PDS.HasClosedHistory,
+        PDS.HasReopenedHistory,
+        CR.Name AS CloseReasonName,
+        PDS.QuestionAnswerCount,
+        PDS.HasFanaticBadgeAndIsQuestion,
+        PDS.ActivityDurationMinutes,
+        PL.RelatedPostId,
+        LOWER(LT.Name) AS LinkTypeName,
+        -- String expression: Concatenates key statistics into a single summary string
+        'Score: ' || PDS.Score || ' | Views: ' || COALESCE(PDS.ViewCount, 0) || ' | Comments: ' || PDS.CommentCount AS StatsSummary,
+        -- NULL logic: Provides a default value for the last editor's display name if not found
+        COALESCE((SELECT U.DisplayName FROM Users U WHERE U.Id = P_orig.LastEditorUserId), 'Community Editor') AS LastEditorDisplayName
+    FROM PostWithDetailedStats PDS
+    LEFT JOIN PostLinks PL ON PDS.PostId = PL.PostId
+    LEFT JOIN LinkTypes LT ON PL.LinkTypeId = LT.Id
+    LEFT JOIN Posts P_orig ON PDS.PostId = P_orig.Id -- Re-join to original Posts table for LastEditorUserId
+    LEFT JOIN CloseReasonTypes CR ON PDS.LastCloseReasonId = CR.Id::varchar -- Assuming CloseReasonId is in PH.Comment field as a string
+    WHERE PDS.Score > 75
+    AND PDS.ViewCount > 5000
+    AND PDS.EngagementRatio > 0.15
+    AND PDS.OwnerReputationTier IN ('Expert', 'Elite')
+    AND PDS.PrimaryTag IN (SELECT PrimaryTag FROM TagPerformance WHERE AvgQuestionScore > 100 AND TagQuestionCount > 500)
+    AND PDS.HasClosedHistory IS NULL -- Only consider open posts
+    AND NOT EXISTS ( -- Correlated subquery: Excludes posts linked as duplicates (LinkTypeId = 3)
+        SELECT 1 FROM PostLinks PL_dup WHERE PL_dup.RelatedPostId = PDS.PostId AND PL_dup.LinkTypeId = 3
+    )
+)
+-- Main Query Section: Combines data from HighlyInteractedPosts with additional calculations and joins
+SELECT
+    HIP.PostId,
+    HIP.Title,
+    HIP.PostTypeName,
+    HIP.PostCreationDate,
+    HIP.OwnerDisplayName,
+    HIP.OwnerReputation,
+    HIP.PrimaryTag,
+    HIP.EngagementRatio,
+    HIP.TotalEditCount,
+    HIP.HasClosedHistory,
+    HIP.LinkTypeName,
+    HIP.StatsSummary,
+    HIP.LastEditorDisplayName,
+    HIP.QuestionAnswerCount,
+    HIP.HasFanaticBadgeAndIsQuestion,
+    HIP.ActivityDurationMinutes,
+    -- Correlated Subquery: Counts upvotes from users with reputation > 2000
+    (SELECT COUNT(V.Id) FROM Votes V INNER JOIN Users U_v ON V.UserId = U_v.Id WHERE V.PostId = HIP.PostId AND V.VoteTypeId = 2 AND U_v.Reputation > 2000) AS HighRepUpvotes,
+    -- Correlated Subquery: Checks if any comment on the post contains the word "clarification" (case-insensitive)
+    EXISTS (SELECT 1 FROM Comments C WHERE C.PostId = HIP.PostId AND LOWER(C.Text) LIKE '%clarification%') AS HasClarificationComment,
+    -- NULL logic: Calculates days since creation, defaulting to 0 if creation date is unexpectedly null
+    COALESCE(EXTRACT(DAY FROM (cast('2024-10-01 12:34:56' as timestamp) - HIP.PostCreationDate)), 0) AS DaysSinceCreation,
+    -- Complex calculation: Ratio of total edits to comment count, handling division by zero
+    HIP.TotalEditCount / NULLIF(HIP.CommentCount, 0) AS EditToCommentRatio,
+    -- Window function: Calculates a 5-post rolling average of the owner's score for questions
+    AVG(P_full.Score) OVER (PARTITION BY P_full.OwnerUserId ORDER BY P_full.CreationDate ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS RollingAvgOwnerScoreQuestions,
+    -- Another window function: Ranks users globally by their total upvotes given
+    DENSE_RANK() OVER (ORDER BY UES.UserTotalUpvotesGiven DESC) AS GlobalUserUpvoteRank,
+    -- Conditional expression: Labels questions based on the 'Fanatic' badge status
+    CASE
+        WHEN HIP.HasFanaticBadgeAndIsQuestion THEN 'Fanatic Question'
+        WHEN HIP.PostTypeName = 'Question' THEN 'Standard Question'
+        ELSE 'N/A'
+    END AS QuestionBadgeStatusLabel,
+    -- Left join to get the title of any related posts, handling potential NULLs
+    P_Related.Title AS RelatedPostTitle
+FROM HighlyInteractedPosts HIP
+LEFT JOIN UserEngagementSummary UES ON HIP.OwnerDisplayName = UES.DisplayName
+LEFT JOIN Posts P_full ON HIP.PostId = P_full.Id AND P_full.PostTypeId = 1 -- Used for rolling average on questions
+LEFT JOIN Posts P_Related ON HIP.RelatedPostId = P_Related.Id
+WHERE HIP.PostTypeName = 'Question' -- Focusing on questions for this part of the UNION
+AND HIP.ActivityDurationMinutes > 120 -- Posts active for at least 2 hours
+AND NOT EXISTS ( -- Correlated subquery: Excludes posts with 'Offensive' votes
+    SELECT 1 FROM Votes V_offensive WHERE V_offensive.PostId = HIP.PostId AND V_offensive.VoteTypeId = 4
+)
+
+-- Set Operator: UNION ALL to combine with a different set of posts (answers) with distinct filtering and aggregations
+UNION ALL
+
+SELECT
+    PDS.PostId,
+    PDS.Title,
+    PDS.PostTypeName,
+    PDS.PostCreationDate,
+    PDS.OwnerDisplayName,
+    PDS.OwnerReputation,
+    PDS.PrimaryTag,
+    PDS.EngagementRatio,
+    PDS.TotalEditCount,
+    PDS.HasClosedHistory,
+    LOWER(LT.Name) AS LinkTypeName,
+    'Score: ' || PDS.Score || ' | Comments: ' || PDS.CommentCount AS StatsSummary, -- Simpler summary for answers
+    COALESCE((SELECT U.DisplayName FROM Users U WHERE U.Id = P_orig_answer.LastEditorUserId), 'System') AS LastEditorDisplayName,
+    PDS.QuestionAnswerCount,
+    PDS.HasFanaticBadgeAndIsQuestion, -- Will be false for answers, but included for consistent columns
+    PDS.ActivityDurationMinutes,
+    -- Correlated Subquery: Counts upvotes from users with reputation <= 500
+    (SELECT COUNT(V.Id) FROM Votes V INNER JOIN Users U_v ON V.UserId = U_v.Id WHERE V.PostId = PDS.PostId AND V.VoteTypeId = 2 AND U_v.Reputation <= 500) AS LowRepUpvotes,
+    FALSE AS HasClarificationComment, -- Assumed false for this answer set
+    COALESCE(EXTRACT(DAY FROM (cast('2024-10-01 12:34:56' as timestamp) - PDS.PostCreationDate)), 0) AS DaysSinceCreation,
+    PDS.TotalEditCount / NULLIF(PDS.CommentCount, 0) AS EditToCommentRatio,
+    -- Window function: Rolling average of owner's answer scores, 3 preceding
+    AVG(P_orig_answer.Score) OVER (PARTITION BY P_orig_answer.OwnerUserId ORDER BY P_orig_answer.CreationDate ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS RollingAvgOwnerScoreAnswers,
+    DENSE_RANK() OVER (ORDER BY UES.UserTotalDownvotesGiven DESC) AS GlobalUserDownvoteRank, -- Ranks users by downvotes given
+    'Answer Post' AS QuestionBadgeStatusLabel, -- Generic label for answers
+    NULL AS RelatedPostTitle -- Related post titles not fetched for answers in this branch
+FROM PostWithDetailedStats PDS
+INNER JOIN Posts P_orig_answer ON PDS.PostId = P_orig_answer.Id -- Need original Posts for LastEditorUserId
+LEFT JOIN UserEngagementSummary UES ON PDS.OwnerDisplayName = UES.DisplayName
+LEFT JOIN PostLinks PL ON PDS.PostId = PL.PostId
+LEFT JOIN LinkTypes LT ON PL.LinkTypeId = LT.Id
+WHERE PDS.PostTypeId = 2 -- Only answers for this part
+AND PDS.Score >= 20
+AND PDS.OwnerReputationTier IN ('Novice', 'Journeyman') -- Less reputable owners
+AND PDS.PostCreationDate BETWEEN '2023-01-01' AND '2023-09-30' -- Specific time frame
+AND PDS.TotalEditCount < 5 -- Answers with few edits
+AND NOT EXISTS ( -- Correlated subquery: Excludes answers by users who have a 'Critic' badge (given for casting many downvotes)
+    SELECT 1 FROM Badges B WHERE B.UserId = PDS.OwnerUserId AND B.Name = 'Critic'
+)
+ORDER BY PostCreationDate DESC, EngagementRatio DESC
+LIMIT 7500;

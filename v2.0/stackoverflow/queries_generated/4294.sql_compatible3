@@ -1,0 +1,173 @@
+WITH
+  PostScoreDistribution AS (
+    SELECT
+      p.Id AS PostId,
+      p.OwnerUserId,
+      p.PostTypeId,
+      p.CreationDate,
+      p.Score,
+      CASE
+        WHEN p.Score > 100 THEN 'High'
+        WHEN p.Score > 10 THEN 'Medium'
+        ELSE 'Low'
+      END AS ScoreBracket,
+      ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate DESC) AS rn
+    FROM Posts AS p
+    WHERE
+      p.PostTypeId IN (1, 2) AND p.OwnerUserId IS NOT NULL
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate AS UserCreationDate,
+      COUNT(DISTINCT ph.Id) AS PostHistoryCount,
+      COUNT(DISTINCT c.Id) AS CommentCount,
+      MAX(CASE WHEN v.VoteTypeId = 2 THEN v.CreationDate ELSE NULL END) AS LastUpVoteDate,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotes,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotes,
+      COUNT(DISTINCT b.Id) AS BadgeCount,
+      u.Location
+    FROM Users AS u
+    LEFT JOIN PostHistory AS ph
+      ON u.Id = ph.UserId
+    LEFT JOIN Comments AS c
+      ON u.Id = c.UserId
+    LEFT JOIN Votes AS v
+      ON u.Id = v.UserId
+    LEFT JOIN Badges AS b
+      ON u.Id = b.UserId
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate,
+      u.Location
+  ),
+  TopQuestions AS (
+    SELECT
+      Id,
+      OwnerUserId,
+      Title,
+      Tags,
+      AnswerCount,
+      FavoriteCount,
+      ViewCount,
+      Score,
+      CreationDate,
+      ClosedDate,
+      CommunityOwnedDate
+    FROM Posts
+    WHERE
+      PostTypeId = 1
+  ),
+  TopAnswers AS (
+    SELECT
+      p.Id,
+      p.ParentId AS QuestionId,
+      p.OwnerUserId,
+      p.Score,
+      p.CreationDate,
+      ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS rn
+    FROM Posts AS p
+    WHERE
+      p.PostTypeId = 2
+  ),
+  QuestionAnswerAnalysis AS (
+    SELECT
+      tq.Id AS QuestionId,
+      tq.Title,
+      tq.Tags,
+      tq.OwnerUserId AS QuestionOwnerUserId,
+      uaq.Reputation AS QuestionOwnerReputation,
+      tq.Score AS QuestionScore,
+      tq.AnswerCount,
+      tq.FavoriteCount,
+      tq.ViewCount,
+      ta.Id AS BestAnswerId,
+      ta.OwnerUserId AS BestAnswerOwnerUserId,
+      uab.Reputation AS BestAnswerOwnerReputation,
+      ta.Score AS BestAnswerScore,
+      tq.CreationDate AS QuestionCreationDate,
+      tq.ClosedDate AS QuestionClosedDate,
+      tq.CommunityOwnedDate,
+      (
+        tq.AnswerCount * 1.0 / (COALESCE(uaq.PostHistoryCount,0) + 1)
+      ) AS AnswersPerHistory,
+      (
+        ta.Score * 1.0 / (COALESCE(uab.TotalUpVotes,0) + 1)
+      ) AS BestAnswerScoreToUpVoteRatio,
+      CASE
+        WHEN tq.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN tq.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        ELSE 'Open'
+      END AS QuestionStatus
+    FROM TopQuestions AS tq
+    LEFT JOIN TopAnswers AS ta
+      ON tq.Id = ta.QuestionId AND ta.rn = 1
+    LEFT JOIN UserActivity AS uaq
+      ON tq.OwnerUserId = uaq.UserId
+    LEFT JOIN UserActivity AS uab
+      ON ta.OwnerUserId = uab.UserId
+    WHERE
+      tq.CreationDate >= DATE '2023-01-01'
+  )
+SELECT
+  qa.QuestionId,
+  qa.Title,
+  qa.Tags,
+  qa.QuestionOwnerUserId,
+  qa.QuestionOwnerReputation,
+  qa.QuestionScore,
+  qa.AnswerCount,
+  qa.FavoriteCount,
+  qa.ViewCount,
+  qa.BestAnswerId,
+  qa.BestAnswerOwnerUserId,
+  qa.BestAnswerOwnerReputation,
+  qa.BestAnswerScore,
+  qa.AnswersPerHistory,
+  qa.BestAnswerScoreToUpVoteRatio,
+  qa.QuestionStatus,
+  CASE
+    WHEN qa.QuestionStatus = 'Closed' THEN
+      CASE
+        WHEN qa.QuestionClosedDate IS NOT NULL AND qa.QuestionCreationDate IS NOT NULL THEN
+          EXTRACT(EPOCH FROM (CAST(qa.QuestionClosedDate AS TIMESTAMP) - CAST(qa.QuestionCreationDate AS TIMESTAMP)))/86400
+        ELSE NULL
+      END
+    ELSE NULL
+  END AS DaysToClose,
+  CASE
+    WHEN qa.BestAnswerId IS NOT NULL THEN
+      (
+        SELECT
+          CAST(MIN(CreationDate) AS DATE)
+        FROM Comments
+        WHERE
+          PostId = qa.QuestionId AND UserId = qa.QuestionOwnerUserId
+      )
+  END AS FirstCommentDateByOwner,
+  ua_q.DisplayName AS QuestionOwnerDisplayName,
+  ua_b.DisplayName AS BestAnswerOwnerDisplayName,
+  CASE
+    WHEN qa.QuestionScore > 500 AND qa.BestAnswerScore > 200 AND qa.AnswerCount > 10 THEN 'High Engagement Question'
+    WHEN qa.BestAnswerScore > 100 THEN 'High Performing Answer'
+    WHEN qa.QuestionStatus = 'Closed' AND qa.QuestionScore < 10 THEN 'Low Score Closed Question'
+    WHEN qa.AnswersPerHistory > 5 THEN 'Prolific Answerer Question'
+    ELSE 'Standard'
+  END AS PerformanceCategory,
+  COALESCE(ua_q.Location, 'Unknown') AS QuestionOwnerLocation,
+  COALESCE(ua_b.Location, 'Unknown') AS BestAnswerOwnerLocation
+FROM QuestionAnswerAnalysis AS qa
+LEFT JOIN UserActivity AS ua_q
+  ON qa.QuestionOwnerUserId = ua_q.UserId
+LEFT JOIN UserActivity AS ua_b
+  ON qa.BestAnswerOwnerUserId = ua_b.UserId
+WHERE
+  qa.QuestionScore > 0 OR qa.BestAnswerScore > 0
+ORDER BY
+  qa.QuestionScore DESC,
+  qa.BestAnswerScore DESC
+LIMIT 1000;

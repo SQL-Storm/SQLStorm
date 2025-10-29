@@ -1,0 +1,215 @@
+-- {"query": "1276.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3276} 
+
+WITH UserMetrics AS (
+    -- Gathers core user statistics, including reputation, vote counts, account age, and various activity counts.
+    -- Includes a correlated subquery to fetch the last badge date.
+    SELECT
+        U.Id AS UserId,
+        COALESCE(U.DisplayName, 'Anonymous') AS DisplayName,
+        U.Reputation,
+        U.UpVotes AS TotalUpVotesGiven,
+        U.DownVotes AS TotalDownVotesGiven,
+        EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - U.CreationDate)) / (60*60*24) AS AccountAgeDays,
+        (SELECT MAX(B2.Date) FROM Badges B2 WHERE B2.UserId = U.Id) AS LastBadgeDate,
+        COUNT(DISTINCT P.Id) AS TotalPostsCreated,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestionsAsked,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswersGiven,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        MAX(U.LastAccessDate) AS LastUserAccess,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        -- Calculate an 'Engagement Span' from first post to last activity, if available
+        EXTRACT(EPOCH FROM (MAX(P.LastActivityDate) - MIN(P.CreationDate))) / (60*60*24) AS PostActivitySpanDays
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    WHERE U.Location IS NOT NULL -- Filter for users with known locations
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.UpVotes, U.DownVotes, U.CreationDate, U.LastAccessDate
+),
+PostTaggingAnalysis AS (
+    -- Processes post tags, counts them, and identifies posts with self-accepted answers.
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.LastActivityDate,
+        P.AcceptedAnswerId,
+        -- Check if the accepted answer for a question was posted by the question's owner
+        (P.OwnerUserId = (SELECT OwnerUserId FROM Posts WHERE Id = P.AcceptedAnswerId AND PostTypeId = 2) AND P.AcceptedAnswerId IS NOT NULL) AS IsSelfAcceptedAnswer,
+        CASE
+            WHEN P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2
+            THEN array_length(string_to_array(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags)-2), '><'), 1)
+            ELSE 0
+        END AS TagCount,
+        string_to_array(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags)-2), '><') AS TagsArray,
+        -- Calculate time difference to the previous post by the same user, using LAG window function.
+        EXTRACT(EPOCH FROM (P.CreationDate - LAG(P.CreationDate, 1, P.CreationDate) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate))) / (60*60*24) AS DaysSincePrevPost
+    FROM Posts P
+    WHERE P.PostTypeId IN (1, 2) -- Focus on Questions and Answers
+    AND P.OwnerUserId IS NOT NULL
+    AND P.CreationDate >= '2020-01-01' -- Filter for more recent posts
+),
+PostHistoryAndLinks AS (
+    -- Aggregates post history events (edits, closes) and related links.
+    SELECT
+        PTA.PostId,
+        PTA.OwnerUserId,
+        PTA.PostTypeId,
+        PTA.CreationDate,
+        PTA.Score AS PostScore,
+        PTA.ViewCount,
+        PTA.AnswerCount,
+        PTA.FavoriteCount,
+        PTA.TagCount,
+        PTA.IsSelfAcceptedAnswer,
+        PTA.LastActivityDate,
+        PTA.DaysSincePrevPost,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9) THEN 1 ELSE 0 END) AS NumEdits, -- Count of specific edit types
+        SUM(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS NumTimesClosed, -- Count of close events
+        MAX(PH.CreationDate) AS LastEditOrCloseDate,
+        COUNT(DISTINCT C.Id) AS NumComments,
+        SUM(COALESCE(C.Score, 0)) AS TotalCommentScore,
+        -- Correlated subquery for average score of answers to this specific question
+        COALESCE(
+            (SELECT AVG(A.Score)
+             FROM Posts A
+             WHERE A.ParentId = PTA.PostId AND A.PostTypeId = 2 AND A.Score > 0),
+            0.0
+        ) AS AvgAcceptedAnswerScore,
+        COUNT(DISTINCT PL.RelatedPostId) AS NumRelatedPosts, -- Count of linked/duplicate posts
+        SUM(CASE WHEN PL.LinkTypeId = 3 THEN 1 ELSE 0 END) AS NumDuplicates
+    FROM PostTaggingAnalysis PTA
+    LEFT JOIN PostHistory PH ON PTA.PostId = PH.PostId
+    LEFT JOIN Comments C ON PTA.PostId = C.PostId
+    LEFT JOIN PostLinks PL ON PTA.PostId = PL.PostId
+    GROUP BY PTA.PostId, PTA.OwnerUserId, PTA.PostTypeId, PTA.CreationDate, PTA.Score, PTA.ViewCount, PTA.AnswerCount, PTA.FavoriteCount, PTA.TagCount, PTA.IsSelfAcceptedAnswer, PTA.LastActivityDate, PTA.DaysSincePrevPost
+),
+UserTagAggregates AS (
+    -- Aggregates tag usage per user, calculating diversity and most frequent tag.
+    SELECT
+        PTA.OwnerUserId AS UserId,
+        UNNEST(PTA.TagsArray) AS TagName,
+        COUNT(PTA.PostId) AS PostsWithTag
+    FROM PostTaggingAnalysis PTA
+    WHERE PTA.TagsArray IS NOT NULL AND array_length(PTA.TagsArray, 1) > 0
+    GROUP BY PTA.OwnerUserId, UNNEST(PTA.TagsArray)
+),
+UserTagDiversity AS (
+    -- Calculates diversity metrics for tags per user.
+    SELECT
+        UTA.UserId,
+        COUNT(DISTINCT UTA.TagName) AS DistinctTagsUsed,
+        SUM(UTA.PostsWithTag) AS TotalTagMentions,
+        -- Find the most frequent tag for each user using a subquery
+        (SELECT TagName FROM UserTagAggregates
+         WHERE UserId = UTA.UserId
+         GROUP BY TagName
+         ORDER BY SUM(PostsWithTag) DESC
+         LIMIT 1) AS MostFrequentTag,
+        CAST(COUNT(DISTINCT UTA.TagName) AS DECIMAL) / NULLIF(SUM(UTA.PostsWithTag), 0) AS TagDiversityRatio
+    FROM UserTagAggregates UTA
+    GROUP BY UTA.UserId
+),
+UserEngagementScores AS (
+    -- Combines all user and post data, computes various ratios and preliminary scores.
+    SELECT
+        UM.UserId,
+        UM.DisplayName,
+        UM.Reputation,
+        UM.TotalPostsCreated,
+        UM.TotalAnswersGiven,
+        UM.TotalCommentsMade,
+        UM.AccountAgeDays,
+        UM.PostActivitySpanDays,
+        UM.LastBadgeDate,
+        UTD.DistinctTagsUsed,
+        UTD.TagDiversityRatio,
+        UTD.MostFrequentTag,
+        SUM(PHAL.PostScore) AS TotalPostsScore,
+        AVG(PHAL.PostScore) AS AvgPostScore,
+        AVG(PHAL.ViewCount) AS AvgPostViewCount,
+        SUM(PHAL.NumEdits) AS TotalEditsMadeOnPosts,
+        SUM(PHAL.NumComments) AS TotalCommentsReceivedOnPosts,
+        MAX(PHAL.LastActivityDate) AS LastPostActivity,
+        AVG(PHAL.AvgAcceptedAnswerScore) AS AvgScoreOfAssociatedAnswers,
+        COUNT(CASE WHEN PHAL.IsSelfAcceptedAnswer THEN 1 END) AS SelfAcceptedAnswersCount,
+        -- Ratio of total edits to total posts created, handling division by zero.
+        CAST(SUM(PHAL.NumEdits) AS DECIMAL) / NULLIF(UM.TotalPostsCreated, 0) AS EditFrequencyRatio,
+        -- Average days between consecutive posts, excluding NULLs.
+        AVG(PHAL.DaysSincePrevPost) FILTER (WHERE PHAL.DaysSincePrevPost IS NOT NULL) AS AvgDaysBetweenPosts,
+        -- Reputation gain per day of account age
+        UM.Reputation / NULLIF(UM.AccountAgeDays, 0) AS ReputationPerDay
+    FROM UserMetrics UM
+    JOIN PostHistoryAndLinks PHAL ON UM.UserId = PHAL.OwnerUserId
+    LEFT JOIN UserTagDiversity UTD ON UM.UserId = UTD.UserId
+    WHERE UM.Reputation > 500 AND UM.TotalPostsCreated > 3
+    GROUP BY UM.UserId, UM.DisplayName, UM.Reputation, UM.TotalPostsCreated, UM.TotalAnswersGiven, UM.TotalCommentsMade, UM.AccountAgeDays, UM.PostActivitySpanDays, UM.LastBadgeDate, UTD.DistinctTagsUsed, UTD.TagDiversityRatio, UTD.MostFrequentTag
+)
+-- Final Selection, Ranking, and Categorization based on complex criteria.
+SELECT
+    UES.UserId,
+    UES.DisplayName,
+    UES.Reputation,
+    UES.TotalPostsCreated,
+    UES.TotalAnswersGiven,
+    UES.TotalCommentsMade,
+    UES.TotalPostsScore,
+    UES.AvgPostScore,
+    UES.AvgPostViewCount,
+    UES.TotalEditsMadeOnPosts,
+    UES.EditFrequencyRatio,
+    UES.AvgDaysBetweenPosts,
+    UES.ReputationPerDay,
+    UES.DistinctTagsUsed,
+    UES.TagDiversityRatio,
+    UES.MostFrequentTag,
+    UES.SelfAcceptedAnswersCount,
+    -- Calculate a sophisticated 'User Influence Score'
+    (UES.Reputation * 0.05) +
+    (COALESCE(UES.AvgPostScore, 0) * 0.5) +
+    (COALESCE(UES.AvgPostViewCount, 0) * 0.0005) +
+    (COALESCE(UES.TotalEditsMadeOnPosts, 0) * 0.1) +
+    (COALESCE(UES.TagDiversityRatio, 0) * 200) +
+    (COALESCE(UES.SelfAcceptedAnswersCount, 0) * 5) +
+    (COALESCE(UES.PostActivitySpanDays, 0) * 0.01) +
+    (CASE WHEN UES.LastBadgeDate IS NOT NULL THEN 100 ELSE 0 END)
+    AS UserInfluenceScore,
+    -- Rank users by their calculated influence score using RANK window function.
+    RANK() OVER (ORDER BY (
+        (UES.Reputation * 0.05) +
+        (COALESCE(UES.AvgPostScore, 0) * 0.5) +
+        (COALESCE(UES.AvgPostViewCount, 0) * 0.0005) +
+        (COALESCE(UES.TotalEditsMadeOnPosts, 0) * 0.1) +
+        (COALESCE(UES.TagDiversityRatio, 0) * 200) +
+        (COALESCE(UES.SelfAcceptedAnswersCount, 0) * 5) +
+        (COALESCE(UES.PostActivitySpanDays, 0) * 0.01) +
+        (CASE WHEN UES.LastBadgeDate IS NOT NULL THEN 100 ELSE 0 END)
+    ) DESC) AS InfluenceRank,
+    -- Categorize users based on their edit frequency relative to all users, using PERCENTILE_CONT.
+    CASE
+        WHEN UES.TotalEditsMadeOnPosts > 0 AND UES.EditFrequencyRatio >= PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY UES.EditFrequencyRatio) OVER () THEN 'Top 5% Editor'
+        WHEN UES.TotalEditsMadeOnPosts > 0 AND UES.EditFrequencyRatio >= PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY UES.EditFrequencyRatio) OVER () THEN 'High Frequency Editor'
+        WHEN UES.TotalEditsMadeOnPosts > 0 THEN 'Regular Editor'
+        ELSE 'Non-Editor'
+    END AS EditorCategory,
+    -- Determine if a user has highly consistent posting behavior (low variance in days between posts).
+    CASE
+        WHEN UES.AvgDaysBetweenPosts IS NOT NULL AND UES.AvgDaysBetweenPosts < 7 THEN 'Frequent Poster'
+        WHEN UES.AvgDaysBetweenPosts IS NOT NULL AND UES.AvgDaysBetweenPosts BETWEEN 7 AND 30 THEN 'Regular Poster'
+        ELSE 'Infrequent Poster'
+    END AS PostingFrequencyPattern,
+    -- Concatenate a summary string of their top metrics.
+    'Reputation: ' || UES.Reputation || ', Posts: ' || UES.TotalPostsCreated || ', Tags: ' || COALESCE(UES.MostFrequentTag, 'N/A') || ', Edits: ' || UES.TotalEditsMadeOnPosts AS UserSummaryString
+FROM UserEngagementScores UES
+WHERE UES.AvgDaysBetweenPosts IS NOT NULL OR UES.TotalPostsCreated = 1 -- Include users with only one post (no avg days between posts)
+ORDER BY InfluenceRank ASC, UES.Reputation DESC
+LIMIT 200;

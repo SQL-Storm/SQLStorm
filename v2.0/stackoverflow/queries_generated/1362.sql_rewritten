@@ -1,0 +1,222 @@
+-- {"query": "1362.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3508} 
+WITH UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswers,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostScore,
+        MAX(p.LastActivityDate) AS LastPostActivity,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMadeByAuthor,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesGiven,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesGiven
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    WHERE u.Reputation >= 1000
+      AND u.LastAccessDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+PostDetailedMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.Body,
+        -- String Expression: Calculate a hash-like value from the post body, combined with its title.
+        MD5(COALESCE(p.Title, '') || COALESCE(p.Body, '')) AS BodyTitleHash,
+        -- Complicated Calculation: Engagement Ratio, handles division by zero with NULLIF
+        CAST(COALESCE(p.CommentCount, 0) + COALESCE(p.FavoriteCount, 0) + COALESCE(p.AnswerCount, 0) * 2 AS DECIMAL(10,2)) / NULLIF(p.ViewCount, 0) AS EngagementRatio,
+        -- Correlated Subquery: Count of distinct users who have edited the post
+        (SELECT COUNT(DISTINCT ph.UserId)
+         FROM PostHistory ph
+         WHERE ph.PostId = p.Id
+           AND ph.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+        ) AS DistinctEditorsCount,
+        -- Correlated Subquery: Total number of edit/rollback history entries for the post
+        (SELECT COUNT(ph.Id)
+         FROM PostHistory ph
+         WHERE ph.PostId = p.Id
+           AND ph.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9) -- Edits and Rollbacks
+        ) AS TotalEditHistoryCount,
+        -- Correlated Subquery: Check if the post is a source of a duplicate link
+        EXISTS (SELECT 1 FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3) AS IsDuplicateSource,
+        -- Correlated Subquery: Check if the post is a target of a duplicate link
+        EXISTS (SELECT 1 FROM PostLinks pl WHERE pl.RelatedPostId = p.Id AND pl.LinkTypeId = 3) AS IsDuplicateTarget,
+        -- Correlated Subquery: Average score of all comments on this post, NULL if no comments
+        (SELECT AVG(c.Score) FROM Comments c WHERE c.PostId = p.Id) AS AvgCommentScore,
+        -- String Expression and NULL Logic: Extract first tag, default to 'no-tag' if NULL or empty
+        LOWER(COALESCE(
+            SUBSTRING(p.Tags FROM 2 FOR POSITION('><' IN p.Tags) - 2),
+            CASE WHEN p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2 THEN SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2) END,
+            'no-tag'
+        )) AS FirstTag,
+        -- NULL Logic: DisplayTitle using COALESCE
+        COALESCE(p.Title, 'Untitled Post (' || p.Id || ')') AS DisplayTitle,
+        -- String expression: extract a small excerpt from body
+        SUBSTRING(p.Body, 1, 100) AS BodyExcerpt
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+      AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '2 year'
+      AND p.OwnerUserId IS NOT NULL
+),
+RankedAndAggregatedPosts AS (
+    SELECT
+        pdm.*,
+        uas.DisplayName AS OwnerDisplayName,
+        uas.Reputation AS OwnerReputation,
+        uas.TotalPosts AS OwnerTotalPosts,
+        uas.TotalQuestions AS OwnerTotalQuestions,
+        uas.TotalAnswers AS OwnerTotalAnswers,
+        uas.TotalPostScore AS OwnerTotalPostScore,
+        uas.TotalCommentsMadeByAuthor,
+        uas.TotalUpVotesGiven AS OwnerTotalUpVotesGiven,
+        uas.TotalDownVotesGiven AS OwnerTotalDownVotesGiven,
+        -- Window Function: Rank posts by score within each user's contributions
+        RANK() OVER (PARTITION BY pdm.OwnerUserId ORDER BY pdm.PostScore DESC, pdm.PostCreationDate DESC) AS UserPostScoreRank,
+        -- Window Function: Average score of all posts by the user
+        AVG(pdm.PostScore) OVER (PARTITION BY pdm.OwnerUserId) AS AvgOwnerPostScore,
+        -- Window Function: Count of posts by the user in a 90-day sliding window
+        COUNT(pdm.PostId) OVER (PARTITION BY pdm.OwnerUserId ORDER BY pdm.PostCreationDate RANGE BETWEEN INTERVAL '90 days' PRECEDING AND CURRENT ROW) AS OwnerPostsInLast90Days,
+        -- Window Function: Running total of post scores for the user
+        SUM(pdm.PostScore) OVER (PARTITION BY pdm.OwnerUserId ORDER BY pdm.PostCreationDate) AS OwnerRunningTotalPostScore,
+        -- Complicated Calculation: Age of post in days
+        EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - pdm.PostCreationDate)) / (60 * 60 * 24) AS AgeOfPostInDays,
+        -- Correlated Subquery: Get the score of the accepted answer, if applicable
+        (SELECT p_ans.Score FROM Posts p_ans WHERE p_ans.Id = pdm.AcceptedAnswerId AND p_ans.PostTypeId = 2) AS AcceptedAnswerScore
+    FROM PostDetailedMetrics pdm
+    JOIN UserActivitySummary uas ON pdm.OwnerUserId = uas.UserId
+),
+PostHistoryModeration AS (
+    SELECT
+        ph.PostId,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 END) AS CloseCount,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 END) AS ReopenCount,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 12 THEN 1 END) AS DeleteCount,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 13 THEN 1 END) AS UndeleteCount,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate ELSE NULL END) AS LastClosedDate,
+        -- String Aggregation: All unique close reasons, handling potential NULLs
+        STRING_AGG(DISTINCT COALESCE(crt.Name, 'Unknown Reason'), '; ') FILTER (WHERE ph.PostHistoryTypeId = 10 AND ph.Comment IS NOT NULL) AS AllCloseReasons,
+        -- Complex Predicate: Check if a moderator (UserId is NULL for community or system actions) was involved
+        MAX(CASE WHEN ph.UserId IS NULL AND ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20) THEN 1 ELSE 0 END) AS ModeratorInterventionFlag
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON ph.PostHistoryTypeId = 10 AND CAST(ph.Comment AS SMALLINT) = crt.Id
+    WHERE ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20)
+    GROUP BY ph.PostId
+)
+-- Set Operator: UNION ALL to combine results for 'High Quality Questions' and 'Active Answer Posts'
+SELECT
+    'HighQualityQuestion' AS PostCategory,
+    rp.PostId,
+    rp.PostTypeId,
+    rp.DisplayTitle,
+    rp.PostScore,
+    rp.ViewCount,
+    rp.EngagementRatio,
+    rp.OwnerDisplayName,
+    rp.OwnerReputation,
+    rp.AgeOfPostInDays,
+    rp.AcceptedAnswerId,
+    rp.AcceptedAnswerScore,
+    rp.FirstTag,
+    rp.UserPostScoreRank,
+    rp.AvgOwnerPostScore,
+    rp.TotalEditHistoryCount,
+    phm.CloseCount,
+    phm.ReopenCount,
+    phm.AllCloseReasons,
+    t.TagName AS MatchedTagName,
+    t.IsModeratorOnly AS MatchedTagModeratorOnly,
+    b.Name AS LatestBadgeName,
+    b.Class AS LatestBadgeClass,
+    -- Complicated Calculation: Weighted Quality Score for Questions
+    (rp.PostScore * 0.4) + (COALESCE(rp.AcceptedAnswerScore, 0) * 0.3) + (COALESCE(rp.EngagementRatio, 0) * 10) - (COALESCE(phm.CloseCount, 0) * 20) AS WeightedQualityScore,
+    -- Conditional Expression: Complex status indicator for questions
+    CASE
+        WHEN rp.AcceptedAnswerId IS NOT NULL AND rp.PostScore >= 20 AND rp.AgeOfPostInDays < 365 THEN 'Solved & Popular Recent Question'
+        WHEN rp.AcceptedAnswerId IS NOT NULL AND rp.PostScore < 20 THEN 'Solved but Less Popular'
+        WHEN rp.IsDuplicateSource THEN 'Marked As Duplicate Source'
+        WHEN rp.TotalEditHistoryCount > 5 AND rp.DistinctEditorsCount > 1 THEN 'Highly Collaborative Question'
+        ELSE 'General Question'
+    END AS PostSpecificStatus,
+    -- String Expression: Combined string for filtering/analysis with NULL logic
+    LOWER(rp.BodyTitleHash || ' | ' || rp.FirstTag || ' | ' || COALESCE(phm.AllCloseReasons, '')) AS PostMetaSignature,
+    -- NULL Logic: Display a specific message if no badges
+    COALESCE(b.Name, 'No Recent Badges') AS UserBadgeStatus
+FROM RankedAndAggregatedPosts rp
+LEFT JOIN PostHistoryModeration phm ON rp.PostId = phm.PostId
+LEFT JOIN Tags t ON rp.FirstTag = t.TagName
+LEFT JOIN Badges b ON rp.OwnerUserId = b.UserId AND b.Date = (SELECT MAX(b2.Date) FROM Badges b2 WHERE b2.UserId = rp.OwnerUserId)
+WHERE rp.PostTypeId = 1
+  AND rp.PostScore >= 10
+  AND COALESCE(rp.EngagementRatio, 0) > 0.1
+  AND rp.UserPostScoreRank <= 10
+  AND rp.TotalEditHistoryCount >= 1
+  AND (rp.DisplayTitle ILIKE '%performance%' OR rp.Tags ILIKE '%<optimization%>%' OR rp.Tags ILIKE '%<tuning>%')
+  AND rp.AcceptedAnswerId IS NOT NULL
+  AND COALESCE(phm.ModeratorInterventionFlag, 0) = 0
+UNION ALL
+SELECT
+    'ActiveAnswerPost' AS PostCategory,
+    rp.PostId,
+    rp.PostTypeId,
+    rp.DisplayTitle,
+    rp.PostScore,
+    rp.ViewCount,
+    rp.EngagementRatio,
+    rp.OwnerDisplayName,
+    rp.OwnerReputation,
+    rp.AgeOfPostInDays,
+    NULL AS AcceptedAnswerId, -- Answers don't have AcceptedAnswerId, align columns for UNION
+    NULL AS AcceptedAnswerScore, -- Align columns for UNION
+    rp.FirstTag,
+    rp.UserPostScoreRank,
+    rp.AvgOwnerPostScore,
+    rp.TotalEditHistoryCount,
+    phm.CloseCount,
+    phm.ReopenCount,
+    phm.AllCloseReasons,
+    t.TagName AS MatchedTagName,
+    t.IsModeratorOnly AS MatchedTagModeratorOnly,
+    b.Name AS LatestBadgeName,
+    b.Class AS LatestBadgeClass,
+    -- Complicated Calculation: Weighted Quality Score for Answers
+    (rp.PostScore * 0.6) + (COALESCE(rp.EngagementRatio, 0) * 15) - (rp.TotalEditHistoryCount * 2) AS WeightedQualityScore,
+    -- Conditional Expression: Complex status indicator for answers
+    CASE
+        WHEN rp.PostId = (SELECT AcceptedAnswerId FROM Posts WHERE Id = rp.ParentId AND PostTypeId = 1) AND rp.PostScore >= 50 THEN 'Accepted & Highly Voted Answer'
+        WHEN rp.PostId = (SELECT AcceptedAnswerId FROM Posts WHERE Id = rp.ParentId AND PostTypeId = 1) THEN 'Accepted Answer'
+        WHEN rp.PostScore >= 20 AND rp.TotalCommentsMadeByAuthor >= 3 THEN 'Highly Engaged Answer'
+        WHEN rp.LastEditDate IS NOT NULL AND rp.LastEditDate > rp.PostCreationDate THEN 'Recently Refined Answer'
+        ELSE 'General Answer'
+    END AS PostSpecificStatus,
+    LOWER(rp.BodyTitleHash || ' | ' || rp.FirstTag || ' | ' || COALESCE(phm.AllCloseReasons, '')) AS PostMetaSignature,
+    COALESCE(b.Name, 'No Recent Badges') AS UserBadgeStatus
+FROM RankedAndAggregatedPosts rp
+LEFT JOIN PostHistoryModeration phm ON rp.PostId = phm.PostId
+LEFT JOIN Tags t ON rp.FirstTag = t.TagName
+LEFT JOIN Badges b ON rp.OwnerUserId = b.UserId AND b.Date = (SELECT MAX(b2.Date) FROM Badges b2 WHERE b2.UserId = rp.OwnerUserId)
+WHERE rp.PostTypeId = 2
+  AND rp.PostScore >= 5
+  AND rp.LastActivityDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '6 months'
+  AND rp.TotalCommentsMadeByAuthor >= 1
+  AND (rp.BodyExcerpt ILIKE '%example%' OR rp.BodyExcerpt ILIKE '%code%' OR rp.BodyExcerpt ILIKE '%solution%')
+  AND rp.OwnerReputation > 2000
+ORDER BY WeightedQualityScore DESC, AgeOfPostInDays ASC
+LIMIT 1000;

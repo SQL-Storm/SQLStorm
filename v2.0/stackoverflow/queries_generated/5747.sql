@@ -1,0 +1,140 @@
+-- {"query": "5747.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1021} 
+WITH UserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreated,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.AboMe AS AboutMe
+  FROM Users u
+),
+RecentBadges AS (
+  SELECT
+    b.UserId,
+    b.Name AS BadgeName,
+    b.Date AS EarnedDate,
+    b.Class,
+    b.TagBased
+  FROM Badges b
+  WHERE b.Date >= NOW() - INTERVAL '180 days'
+),
+PostStats AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.Title,
+    p.Tags,
+    p.ViewCount,
+    p.Score,
+    p.CommentCount,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.LastEditorUserId,
+    p.LastEditDate,
+    p.ClosedDate,
+    p.ContentLicense,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentTotal,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpVotesForPost
+  FROM Posts p
+  WHERE p.PostTypeId IN (1, 2)
+),
+LinkSummary AS (
+  SELECT
+    pl.PostId,
+    pl.RelatedPostId,
+    lt.Name AS LinkTypeName,
+    pl.CreationDate
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+),
+TagInfo AS (
+  SELECT
+    t.Id AS TagId,
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId,
+    t.WikiPostId,
+    t.IsModeratorOnly,
+    t.IsRequired
+  FROM Tags t
+),
+WindowedPostRanks AS (
+  SELECT
+    ps.PostId,
+    ps.PostTypeId,
+    ps.OwnerUserId,
+    ps.Title,
+    ps.Tags,
+    ps.ViewCount,
+    ps.Score,
+    ps.CommentCount,
+    ps.CreationDate,
+    ps.LastActivityDate,
+    ROW_NUMBER() OVER (
+      PARTITION BY ps.PostTypeId
+      ORDER BY ps.Score DESC NULLS LAST, ps.ViewCount DESC NULLS LAST, ps.CreationDate DESC
+    ) AS RankWithinType,
+    AVG(ps.Score) OVER (PARTITION BY ps.PostTypeId) AS AvgScorePerType
+  FROM PostStats ps
+),
+CorrelatedSubq AS (
+  SELECT
+    wpr.PostId,
+    wpr.PostTypeId,
+    wpr.OwnerUserId,
+    wpr.Title,
+    wpr.Tags,
+    wpr.ViewCount,
+    wpr.Score,
+    wpr.CommentCount,
+    wpr.CreationDate,
+    wpr.LastActivityDate,
+    wpr.RankWithinType,
+    wpr.AvgScorePerType,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = wpr.PostId AND v.VoteTypeId = 2) AS UpVotes,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = wpr.PostId AND v.VoteTypeId = 3) AS DownVotes,
+    (SELECT STRING_AGG(CONCAT('(', v2.UserId, ':', v2.VoteTypeId, ')'), ',') 
+       FROM Votes v2 WHERE v2.PostId = wpr.PostId) AS AllVotes
+  FROM WindowedPostRanks wpr
+)
+SELECT
+  cu.UserId,
+  cu.DisplayName AS UserDisplayName,
+  cu.Reputation,
+  ra.BadgeName AS RecentBadge,
+  ra.EarnedDate AS BadgeEarnedAt,
+  ps.PostId,
+  ps.Title,
+  ps.Tags,
+  ps.ViewCount,
+  ps.Score,
+  ps.CommentCount,
+  ps.CreationDate AS PostCreated,
+  ps.LastActivityDate AS PostLastActivity,
+  ps.ParentId,
+  ps.AcceptedAnswerId,
+  ps.ClosedDate,
+  ps.ContentLicense,
+  ls.LinkTypeName,
+  ls.RelatedPostId,
+  bs.BonusScore
+FROM CorrelatedSubq cs
+LEFT JOIN RecentBadges ra ON ra.UserId = cs.OwnerUserId
+LEFT JOIN UserActivity cu ON cu.UserId = cs.OwnerUserId
+LEFT JOIN LinkSummary ls ON ls.PostId = cs.PostId
+LEFT JOIN (
+  SELECT 1 AS BonusScore
+) bs ON 1=1
+WHERE cs.RankWithinType <= 100
+  AND cs.UpVotes > 0
+  AND (cs.Tags IS NULL OR LENGTH(cs.Tags) > 0)
+ORDER BY cs.AvgScorePerType DESC, cs.Score DESC, cs.CreationDate DESC
+LIMIT 100;

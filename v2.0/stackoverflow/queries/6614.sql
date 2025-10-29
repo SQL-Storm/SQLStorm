@@ -1,0 +1,36 @@
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id ELSE NULL END) AS TotalQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id ELSE NULL END) AS TotalAnswers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 3 THEN p.Id ELSE NULL END) AS TotalWikis,
+    COUNT(DISTINCT CASE WHEN p.Score > 0 THEN p.Id ELSE NULL END) AS TotalPositiveScorePosts,
+    MAX(p.Score) AS HighestScore,
+    MIN(p.Score) AS LowestScore,
+    SUM(p.ViewCount) AS TotalViews,
+    AVG(p.ViewCount) AS AvgViews,
+    MAX(p.LastActivityDate) AS LastActivityDate,
+    b.Class,
+    CASE 
+        WHEN b.Class = 1 THEN 'Gold'
+        WHEN b.Class = 2 THEN 'Silver'
+        ELSE 'Bronze'
+    END AS BadgeClass,
+    STRING_AGG(DISTINCT b.Name, ', ') AS Badges
+FROM 
+    Users u
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+WHERE 
+    u.Reputation > 1000
+    AND p.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1' YEAR)
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation, b.Class
+HAVING 
+    COUNT(DISTINCT p.Id) > 10
+ORDER BY 
+    u.Reputation DESC, 
+    HighestScore DESC;

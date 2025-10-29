@@ -1,0 +1,548 @@
+-- {"query": "7608.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 6453} 
+WITH PostStats AS (
+  SELECT 
+    p.Id,
+    p.PostTypeId,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.ParentId,
+    p.Title,
+    p.Tags,
+    p.Body,
+    p.LastEditDate,
+    p.LastActivityDate,
+    p.ClosedDate,
+    DATEDIFF(day, p.CreationDate, COALESCE(p.LastActivityDate, p.CreationDate)) AS DaysActive,
+    CASE WHEN p.Score > 0 THEN p.Score ELSE 0 END AS PositiveScore,
+    CASE WHEN p.Score < 0 THEN ABS(p.Score) ELSE 0 END AS NegativeScore,
+    COALESCE(p.AnswerCount, 0) + COALESCE(p.CommentCount, 0) AS EngagementCount,
+    CASE 
+      WHEN p.PostTypeId = 1 THEN 'Question'
+      WHEN p.PostTypeId = 2 THEN 'Answer'
+      ELSE 'Other'
+    END AS PostTypeDesc,
+    CASE 
+      WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+      WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+      ELSE 'Open'
+    END AS PostStatus,
+    COUNT(v.Id) OVER (PARTITION BY p.Id) AS VoteCount,
+    SUM(CASE WHEN v.VoteTypeId IN (2,3) THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id) AS VoteActivity,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserPostRank,
+    ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.ViewCount DESC) AS GlobalRank,
+    LAG(p.Score) OVER (ORDER BY p.CreationDate) AS PrevScore,
+    LEAD(p.Score) OVER (ORDER BY p.CreationDate) AS NextScore,
+    AVG(p.Score) OVER (ORDER BY p.CreationDate ROWS BETWEEN 5 PRECEDING AND 5 FOLLOWING) AS MovingAverageScore,
+    NTILE(100) OVER (ORDER BY p.Score DESC) AS ScorePercentile,
+    RANK() OVER (ORDER BY p.Score DESC) AS ScoreRank,
+    DENSE_RANK() OVER (ORDER BY p.Score DESC) AS DenseScoreRank,
+    DATEDIFF(day, p.CreationDate, p.LastEditDate) AS DaysSinceLastEdit,
+    CASE 
+      WHEN p.Tags IS NOT NULL AND LENGTH(p.Tags) > 0 THEN 
+        (ARRAY_LENGTH(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><'), 1) - 1) 
+      ELSE 0 
+    END AS TagCount,
+    CASE 
+      WHEN p.OwnerUserId IS NOT NULL AND p.OwnerUserId > 0 THEN u.Reputation * 10 
+      ELSE 0 
+    END AS OwnerReputationWeighted,
+    CASE 
+      WHEN p.OwnerUserId IS NULL OR p.OwnerUserId <= 0 THEN 'Deleted User'
+      ELSE COALESCE(u.DisplayName, 'Unknown')
+    END AS OwnerDisplayName,
+    CASE 
+      WHEN p.ParentId IS NOT NULL THEN 'Answer'
+      ELSE 'Question'
+    END AS IsAnswer,
+    CASE 
+      WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN TRUE
+      ELSE FALSE 
+    END AS HasAnswers,
+    COALESCE(u.UpVotes, 0) - COALESCE(u.DownVotes, 0) AS NetUserReputation,
+    CASE 
+      WHEN p.Title IS NOT NULL AND LENGTH(p.Title) > 0 THEN LENGTH(p.Title) 
+      ELSE 0 
+    END AS TitleLength,
+    CASE 
+      WHEN p.Body IS NOT NULL AND LENGTH(p.Body) > 0 THEN LENGTH(p.Body) 
+      ELSE 0 
+    END AS BodyLength,
+    CASE 
+      WHEN p.Tags IS NOT NULL AND LENGTH(p.Tags) > 0 THEN 
+        SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2)
+      ELSE '' 
+    END AS CleanTags,
+    CASE 
+      WHEN p.Tags IS NOT NULL AND LENGTH(p.Tags) > 0 AND p.PostTypeId = 1 THEN 
+        string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><')
+      ELSE ARRAY[]::TEXT[] 
+    END AS TagArray,
+    CASE 
+      WHEN p.PostTypeId = 1 THEN 
+        (SELECT COUNT(*) FROM Posts WHERE ParentId = p.Id AND PostTypeId = 2)
+      ELSE 0
+    END AS AnswerCountForQuestion,
+    CASE 
+      WHEN p.PostTypeId = 1 THEN 
+        (SELECT COUNT(*) FROM Comments WHERE PostId = p.Id)
+      ELSE 0
+    END AS CommentCountForQuestion,
+    CASE 
+      WHEN p.PostTypeId = 2 THEN 
+        (SELECT Title FROM Posts WHERE Id = p.ParentId)
+      ELSE NULL
+    END AS ParentQuestionTitle,
+    CASE 
+      WHEN p.PostTypeId = 1 THEN 
+        (SELECT TOP 1 UserId FROM Posts WHERE ParentId = p.Id AND PostTypeId = 2 ORDER BY Score DESC)
+      ELSE NULL
+    END AS TopAnswerUserId,
+    CASE 
+      WHEN p.PostTypeId = 1 THEN 
+        (SELECT MAX(Score) FROM Posts WHERE ParentId = p.Id AND PostTypeId = 2)
+      ELSE NULL
+    END AS MaxAnswerScore,
+    CASE 
+      WHEN p.PostTypeId = 1 THEN 
+        (SELECT AVG(Score) FROM Posts WHERE ParentId = p.Id AND PostTypeId = 2)
+      ELSE NULL
+    END AS AvgAnswerScore,
+    CASE 
+      WHEN p.PostTypeId = 1 THEN 
+        (SELECT COUNT(*) FROM Votes WHERE PostId = p.Id AND VoteTypeId IN (2,3))
+      ELSE NULL
+    END AS UpVotesForQuestion,
+    CASE 
+      WHEN p.PostTypeId = 1 THEN 
+        (SELECT COUNT(*) FROM Votes WHERE PostId = p.Id AND VoteTypeId = 1) 
+      ELSE NULL
+    END AS AcceptedAnswerCount,
+    CASE 
+      WHEN p.CreationDate > DATEADD(day, -7, cast('2024-10-01 12:34:56' as timestamp)) THEN 'Recent'
+      WHEN p.CreationDate > DATEADD(day, -30, cast('2024-10-01 12:34:56' as timestamp)) THEN 'Last Month'
+      WHEN p.CreationDate > DATEADD(day, -90, cast('2024-10-01 12:34:56' as timestamp)) THEN 'Last Quarter'
+      ELSE 'Older'
+    END AS TemporalCategory,
+    COALESCE(u.ViewCount, 0) AS UserViewCount,
+    CASE 
+      WHEN p.OwnerUserId IS NOT NULL AND p.OwnerUserId > 0 THEN 
+        (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = p.OwnerUserId AND PostTypeId IN (1,2) AND CreationDate >= DATEADD(year, -1, cast('2024-10-01 12:34:56' as timestamp)))
+      ELSE 0 
+    END AS PostsInLastYear,
+    CASE 
+      WHEN p.OwnerUserId IS NOT NULL AND p.OwnerUserId > 0 THEN 
+        (SELECT COUNT(*) FROM Comments WHERE UserId = p.OwnerUserId AND CreationDate >= DATEADD(year, -1, cast('2024-10-01 12:34:56' as timestamp)))
+      ELSE 0 
+    END AS CommentsInLastYear,
+    CASE 
+      WHEN p.OwnerUserId IS NOT NULL AND p.OwnerUserId > 0 THEN 
+        (SELECT COUNT(*) FROM Votes WHERE UserId = p.OwnerUserId AND VoteTypeId IN (2,3) AND CreationDate >= DATEADD(year, -1, cast('2024-10-01 12:34:56' as timestamp)))
+      ELSE 0 
+    END AS VotesInLastYear,
+    CASE 
+      WHEN p.PostTypeId = 1 THEN 
+        (SELECT COUNT(*) FROM PostHistory WHERE PostId = p.Id AND PostHistoryTypeId IN (4,5,6) AND CreationDate >= DATEADD(year, -1, cast('2024-10-01 12:34:56' as timestamp)))
+      ELSE 0
+    END AS EditsInLastYear,
+    CASE 
+      WHEN p.PostTypeId = 1 THEN 
+        (SELECT COUNT(DISTINCT UserId) FROM Votes WHERE PostId = p.Id AND VoteTypeId IN (2,3) AND UserId IS NOT NULL)
+      ELSE 0
+    END AS VotersCount,
+    CASE 
+      WHEN p.PostTypeId = 1 THEN 
+        (SELECT COUNT(*) FROM PostHistory WHERE PostId = p.Id AND PostHistoryTypeId = 10 AND CreationDate >= DATEADD(year, -1, cast('2024-10-01 12:34:56' as timestamp)))
+      ELSE 0
+    END AS CloseVotesInLastYear,
+    CASE 
+      WHEN p.PostTypeId = 1 THEN 
+        (SELECT COUNT(*) FROM PostHistory WHERE PostId = p.Id AND PostHistoryTypeId = 35 AND CreationDate >= DATEADD(year, -1, cast('2024-10-01 12:34:56' as timestamp)))
+      ELSE 0
+    END AS MigrationsInLastYear,
+    CASE 
+      WHEN p.PostTypeId = 1 THEN 
+        (SELECT COUNT(*) FROM PostLinks WHERE PostId = p.Id AND LinkTypeId = 3)
+      ELSE 0
+    END AS DuplicateCount,
+    CASE 
+      WHEN p.PostTypeId = 1 THEN 
+        (SELECT COUNT(*) FROM PostLinks WHERE RelatedPostId = p.Id AND LinkTypeId = 3)
+      ELSE 0
+    END AS DuplicatedCount,
+    CASE 
+      WHEN p.PostTypeId = 1 THEN 
+        (SELECT COUNT(*) FROM Badges WHERE UserId = p.OwnerUserId AND Name IN ('Great Question', 'Good Question') AND Date >= DATEADD(year, -1, cast('2024-10-01 12:34:56' as timestamp)))
+      ELSE 0
+    END AS GreatBadgesInLastYear,
+    CASE 
+      WHEN p.PostTypeId = 1 THEN 
+        (SELECT COUNT(*) FROM Badges WHERE UserId = p.OwnerUserId AND Name IN ('Great Answer', 'Good Answer') AND Date >= DATEADD(year, -1, cast('2024-10-01 12:34:56' as timestamp)))
+      ELSE 0
+    END AS GreatAnswerBadgesInLastYear,
+    CASE 
+      WHEN p.PostTypeId = 1 THEN 
+        (SELECT COUNT(*) FROM Badges WHERE UserId = p.OwnerUserId AND Name = 'Answerer' AND Date >= DATEADD(year, -1, cast('2024-10-01 12:34:56' as timestamp)))
+      ELSE 0
+    END AS AnswererBadgesInLastYear,
+    CASE 
+      WHEN p.PostTypeId = 1 THEN 
+        (SELECT COUNT(*) FROM Badges WHERE UserId = p.OwnerUserId AND Name = 'Question Answerer' AND Date >= DATEADD(year, -1, cast('2024-10-01 12:34:56' as timestamp)))
+      ELSE 0
+    END AS QuestionAnswererBadgesInLastYear,
+    CASE 
+      WHEN p.PostTypeId = 1 THEN 
+        (SELECT COUNT(*) FROM Badges WHERE UserId = p.OwnerUserId AND Name = 'Popular Question' AND Date >= DATEADD(year, -1, cast('2024-10-01 12:34:56' as timestamp)))
+      ELSE 0
+    END AS PopularQuestionBadgesInLastYear,
+    CASE 
+      WHEN p.PostTypeId = 1 THEN 
+        (SELECT COUNT(*) FROM Badges WHERE UserId = p.OwnerUserId AND Name = 'Notable Question' AND Date >= DATEADD(year, -1, cast('2024-10-01 12:34:56' as timestamp)))
+      ELSE 0
+    END AS NotableQuestionBadgesInLastYear,
+    CASE 
+      WHEN p.PostTypeId = 1 THEN 
+        (SELECT COUNT(*) FROM Badges WHERE UserId = p.OwnerUserId AND Name = 'Famous Question' AND Date >= DATEADD(year, -1, cast('2024-10-01 12:34:56' as timestamp)))
+      ELSE 0
+    END AS FamousQuestionBadgesInLastYear,
+    CASE 
+      WHEN p.PostTypeId = 1 THEN 
+        (SELECT COUNT(*) FROM Badges WHERE UserId = p.OwnerUserId AND Name = 'Stellar Question' AND Date >= DATEADD(year, -1, cast('2024-10-01 12:34:56' as timestamp)))
+      ELSE 0
+    END AS StellarQuestionBadgesInLastYear,
+    CASE 
+      WHEN p.PostTypeId = 1 THEN 
+        (SELECT COUNT(*) FROM Badges WHERE UserId = p.OwnerUserId AND Name = 'Self-Learner' AND Date >= DATEADD(year, -1, cast('2024-10-01 12:34:56' as timestamp)))
+      ELSE 0
+    END AS SelfLearnerBadgesInLastYear
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON p.Id = v.PostId
+),
+PostAggregates AS (
+  SELECT 
+    Id,
+    PostTypeId,
+    Score,
+    ViewCount,
+    AnswerCount,
+    CommentCount,
+    FavoriteCount,
+    DaysActive,
+    PositiveScore,
+    NegativeScore,
+    EngagementCount,
+    PostTypeDesc,
+    PostStatus,
+    VoteCount,
+    VoteActivity,
+    UserPostRank,
+    GlobalRank,
+    PrevScore,
+    NextScore,
+    MovingAverageScore,
+    ScorePercentile,
+    ScoreRank,
+    DenseScoreRank,
+    DaysSinceLastEdit,
+    TagCount,
+    OwnerReputationWeighted,
+    OwnerDisplayName,
+    IsAnswer,
+    HasAnswers,
+    NetUserReputation,
+    TitleLength,
+    BodyLength,
+    CleanTags,
+    TagArray,
+    AnswerCountForQuestion,
+    CommentCountForQuestion,
+    ParentQuestionTitle,
+    TopAnswerUserId,
+    MaxAnswerScore,
+    AvgAnswerScore,
+    UpVotesForQuestion,
+    AcceptedAnswerCount,
+    TemporalCategory,
+    UserViewCount,
+    PostsInLastYear,
+    CommentsInLastYear,
+    VotesInLastYear,
+    EditsInLastYear,
+    VotersCount,
+    CloseVotesInLastYear,
+    MigrationsInLastYear,
+    DuplicateCount,
+    DuplicatedCount,
+    GreatBadgesInLastYear,
+    GreatAnswerBadgesInLastYear,
+    AnswererBadgesInLastYear,
+    QuestionAnswererBadgesInLastYear,
+    PopularQuestionBadgesInLastYear,
+    NotableQuestionBadgesInLastYear,
+    FamousQuestionBadgesInLastYear,
+    StellarQuestionBadgesInLastYear,
+    SelfLearnerBadgesInLastYear,
+    COALESCE(AnswerCountForQuestion, 0) / NULLIF(COALESCE(CommentCountForQuestion, 1), 0) AS AnswerToCommentRatio,
+    CASE 
+      WHEN COALESCE(MaxAnswerScore, 0) > 0 THEN 
+        (COALESCE(Score, 0) - COALESCE(MaxAnswerScore, 0)) / NULLIF(COALESCE(MaxAnswerScore, 1), 0)
+      ELSE 0 
+    END AS ScoreVsTopAnswer,
+    CASE 
+      WHEN COALESCE(UpVotesForQuestion, 0) > 0 THEN 
+        COALESCE(UpVotesForQuestion, 0) / NULLIF(COALESCE(VoteCount, 1), 0) 
+      ELSE 0 
+    END AS UpVotePercentage,
+    CASE 
+      WHEN COALESCE(ClosedDate, CreationDate) > DATEADD(year, -1, cast('2024-10-01 12:34:56' as timestamp)) THEN 1
+      ELSE 0
+    END AS RecentlyModified,
+    CASE 
+      WHEN COALESCE(AnswerCount, 0) > 0 THEN 
+        COALESCE(Score, 0) / NULLIF(COALESCE(AnswerCount, 1), 0) 
+      ELSE 0 
+    END AS ScorePerAnswer,
+    CASE 
+      WHEN COALESCE(CommentCount, 0) > 0 THEN 
+        COALESCE(Score, 0) / NULLIF(COALESCE(CommentCount, 1), 0) 
+      ELSE 0 
+    END AS ScorePerComment,
+    CASE 
+      WHEN COALESCE(ViewCount, 0) > 0 THEN 
+        COALESCE(EngagementCount, 0) / NULLIF(COALESCE(ViewCount, 1), 0) 
+      ELSE 0 
+    END AS EngagementPerView
+  FROM PostStats
+),
+UserActivity AS (
+  SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.CreationDate,
+    COALESCE(COUNT(DISTINCT p.Id), 0) AS TotalPosts,
+    COALESCE(COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END), 0) AS TotalQuestions,
+    COALESCE(COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END), 0) AS TotalAnswers,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END), 0) AS TotalQuestionScore,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END), 0) AS TotalAnswerScore,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END), 0) AS TotalQuestionViews,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.ViewCount ELSE 0 END), 0) AS TotalAnswerViews,
+    COALESCE(COUNT(DISTINCT c.Id), 0) AS TotalComments,
+    COALESCE(SUM(v.VoteTypeId = 2) * 1.0 / NULLIF(COUNT(v.Id), 0), 0) AS UpVoteRatio,
+    COALESCE(COUNT(DISTINCT b.Id), 0) AS TotalBadges,
+    COALESCE(SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END), 0) AS GoldBadges,
+    COALESCE(SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END), 0) AS SilverBadges,
+    COALESCE(SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END), 0) AS BronzeBadges,
+    COALESCE(AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END), 0) AS AvgQuestionScore,
+    COALESCE(AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE NULL END), 0) AS AvgAnswerScore,
+    COALESCE(MIN(p.CreationDate), u.CreationDate) AS FirstPostDate,
+    COALESCE(MAX(p.CreationDate), u.CreationDate) AS LastPostDate,
+    DATEDIFF(day, MIN(p.CreationDate), MAX(p.CreationDate)) AS ActiveDays,
+    COALESCE(SUM(CASE WHEN p.CreationDate > DATEADD(year, -1, cast('2024-10-01 12:34:56' as timestamp)) THEN 1 ELSE 0 END), 0) AS RecentPosts,
+    COALESCE(SUM(CASE WHEN p.CreationDate > DATEADD(month, -6, cast('2024-10-01 12:34:56' as timestamp)) THEN 1 ELSE 0 END), 0) AS RecentPosts6Months,
+    100 * COALESCE(SUM(CASE WHEN p.PostTypeId = 1 AND p.Score > 0 THEN 1 ELSE 0 END) * 1.0 / NULLIF(COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END), 0), 0) AS PositiveQuestionRate,
+    100 * COALESCE(SUM(CASE WHEN p.PostTypeId = 2 AND p.Score > 0 THEN 1 ELSE 0 END) * 1.0 / NULLIF(COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END), 0), 0) AS PositiveAnswerRate,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN 1 ELSE 0 END), 0) * 1.0 / NULLIF(COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END), 0) AS QuestionWithAnswersRate,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 1 AND p.CommentCount > 0 THEN 1 ELSE 0 END), 0) * 1.0 / NULLIF(COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END), 0) AS QuestionWithCommentsRate,
+    COALESCE(SUM(p.ViewCount) * 1.0 / NULLIF(COUNT(p.Id), 0), 0) AS AvgPostViews,
+    COALESCE(SUM(p.Score) * 1.0 / NULLIF(COUNT(p.Id), 0), 0) AS AvgPostScore,
+    COALESCE(SUM(p.AnswerCount) * 1.0 / NULLIF(COUNT(p.Id), 0), 0) AS AvgAnswersPerQuestion,
+    COALESCE(SUM(p.CommentCount) * 1.0 / NULLIF(COUNT(p.Id), 0), 0) AS AvgCommentsPerPost,
+    COALESCE(SUM(p.FavoriteCount) * 1.0 / NULLIF(COUNT(p.Id), 0), 0) AS AvgFavoritesPerPost,
+    COALESCE(SUM(CASE WHEN p.LastEditDate IS NOT NULL THEN 1 ELSE 0 END) * 1.0 / NULLIF(COUNT(p.Id), 0), 0) AS EditedRatio,
+    COALESCE(SUM(CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END) * 1.0 / NULLIF(COUNT(p.Id), 0), 0) AS ClosedRatio,
+    DATEDIFF(day, u.CreationDate, u.LastAccessDate) AS DaysSinceLastAccess  
+  FROM Users u
+  LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+  LEFT JOIN Comments c ON u.Id = c.UserId
+  LEFT JOIN Votes v ON u.Id = v.UserId
+  LEFT JOIN Badges b ON u.Id = b.UserId
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate
+)
+SELECT 
+  pa.Id,
+  pa.PostTypeId,
+  pa.Score,
+  pa.ViewCount,
+  pa.AnswerCount,
+  pa.CommentCount,
+  pa.FavoriteCount,
+  pa.DaysActive,
+  pa.PositiveScore,
+  pa.NegativeScore,
+  pa.EngagementCount,
+  pa.PostTypeDesc,
+  pa.PostStatus,
+  pa.VoteCount,
+  pa.VoteActivity,
+  pa.UserPostRank,
+  pa.GlobalRank,
+  pa.PrevScore,
+  pa.NextScore,
+  pa.MovingAverageScore,
+  pa.ScorePercentile,
+  pa.ScoreRank,
+  pa.DenseScoreRank,
+  pa.DaysSinceLastEdit,
+  pa.TagCount,
+  pa.OwnerReputationWeighted,
+  pa.OwnerDisplayName,
+  pa.IsAnswer,
+  pa.HasAnswers,
+  pa.NetUserReputation,
+  pa.TitleLength,
+  pa.BodyLength,
+  pa.CleanTags,
+  pa.AnswerCountForQuestion,
+  pa.CommentCountForQuestion,
+  pa.ParentQuestionTitle,
+  pa.TopAnswerUserId,
+  pa.MaxAnswerScore,
+  pa.AvgAnswerScore,
+  pa.UpVotesForQuestion,
+  pa.AcceptedAnswerCount,
+  pa.TemporalCategory,
+  pa.UserViewCount,
+  pa.PostsInLastYear,
+  pa.CommentsInLastYear,
+  pa.VotesInLastYear,
+  pa.EditsInLastYear,
+  pa.VotersCount,
+  pa.CloseVotesInLastYear,
+  pa.MigrationsInLastYear,
+  pa.DuplicateCount,
+  pa.DuplicatedCount,
+  pa.GreatBadgesInLastYear,
+  pa.GreatAnswerBadgesInLastYear,
+  pa.AnswererBadgesInLastYear,
+  pa.QuestionAnswererBadgesInLastYear,
+  pa.PopularQuestionBadgesInLastYear,
+  pa.NotableQuestionBadgesInLastYear,
+  pa.FamousQuestionBadgesInLastYear,
+  pa.StellarQuestionBadgesInLastYear,
+  pa.SelfLearnerBadgesInLastYear,
+  pa.AnswerToCommentRatio,
+  pa.ScoreVsTopAnswer,
+  pa.UpVotePercentage,
+  pa.RecentlyModified,
+  pa.ScorePerAnswer,
+  pa.ScorePerComment,
+  pa.EngagementPerView,
+  ua.DisplayName AS UserDisplayName,
+  ua.Reputation AS UserReputation,
+  ua.Views AS UserViews,
+  ua.TotalPosts,
+  ua.TotalQuestions,
+  ua.TotalAnswers,
+  ua.TotalQuestionScore,
+  ua.TotalAnswerScore,
+  ua.TotalQuestionViews,
+  ua.TotalAnswerViews,
+  ua.TotalComments,
+  ua.UpVoteRatio,
+  ua.TotalBadges,
+  ua.GoldBadges,
+  ua.SilverBadges,
+  ua.BronzeBadges,
+  ua.AvgQuestionScore,
+  ua.AvgAnswerScore,
+  ua.FirstPostDate,
+  ua.LastPostDate,
+  ua.ActiveDays,
+  ua.RecentPosts,
+  ua.RecentPosts6Months,
+  ua.PositiveQuestionRate,
+  ua.PositiveAnswerRate,
+  ua.QuestionWithAnswersRate,
+  ua.QuestionWithCommentsRate,
+  ua.AvgPostViews,
+  ua.AvgPostScore,
+  ua.AvgAnswersPerQuestion,
+  ua.AvgCommentsPerPost,
+  ua.AvgFavoritesPerPost,
+  ua.EditedRatio,
+  ua.ClosedRatio,
+  ua.DaysSinceLastAccess,
+  CASE WHEN pa.TagArray IS NOT NULL THEN 1 ELSE 0 END AS HasTags,
+  CASE WHEN pa.Tags IS NOT NULL THEN ARRAY_LENGTH(pa.TagArray, 1) ELSE 0 END AS TagArrayLength,
+  CASE WHEN pa.MaxAnswerScore IS NOT NULL THEN 1 ELSE 0 END AS HasAnswerScores,
+  CASE WHEN pa.TopAnswerUserId IS NOT NULL THEN 1 ELSE 0 END AS HasTopAnswer,
+  CASE WHEN pa.ParentQuestionTitle IS NOT NULL THEN 1 ELSE 0 END AS HasParentTitle,
+  CASE WHEN pa.DuplicateCount > 0 THEN 1 ELSE 0 END AS IsDuplicate,
+  CASE WHEN pa.DuplicatedCount > 0 THEN 1 ELSE 0 END AS IsDuplicated,
+  CASE WHEN pa.GreatBadgesInLastYear > 0 THEN 1 ELSE 0 END AS HasGreatBadges,
+  CASE WHEN pa.GreatAnswerBadgesInLastYear > 0 THEN 1 ELSE 0 END AS HasGreatAnswerBadges,
+  CASE WHEN pa.AnswererBadgesInLastYear > 0 THEN 1 ELSE 0 END AS HasAnswererBadges,
+  CASE WHEN pa.QuestionAnswererBadgesInLastYear > 0 THEN 1 ELSE 0 END AS HasQuestionAnswererBadges,
+  CASE WHEN pa.PopularQuestionBadgesInLastYear > 0 THEN 1 ELSE 0 END AS HasPopularQuestionBadges,
+  CASE WHEN pa.NotableQuestionBadgesInLastYear > 0 THEN 1 ELSE 0 END AS HasNotableQuestionBadges,
+  CASE WHEN pa.FamousQuestionBadgesInLastYear > 0 THEN 1 ELSE 0 END AS HasFamousQuestionBadges,
+  CASE WHEN pa.StellarQuestionBadgesInLastYear > 0 THEN 1 ELSE 0 END AS HasStellarQuestionBadges,
+  CASE WHEN pa.SelfLearnerBadgesInLastYear > 0 THEN 1 ELSE 0 END AS HasSelfLearnerBadges,
+  COALESCE(pa.AnswerCountForQuestion, 0) * COALESCE(pa.UpVotesForQuestion, 0) + 
+  COALESCE(pa.CommentCountForQuestion, 0) * COALESCE(pa.Score, 0) AS ComplexEngagementMetric,
+  (COALESCE(pa.TagCount, 0) + COALESCE(pa.VoteCount, 0) + COALESCE(pa.ViewCount, 0)) * 
+  COALESCE(pa.Score, 0) AS WeightedMetric,
+  CASE 
+    WHEN pa.ScorePercentile >= 90 THEN 'Top 10%'
+    WHEN pa.ScorePercentile >= 70 THEN 'Top 30%'
+    WHEN pa.ScorePercentile >= 50 THEN 'Top 50%'
+    WHEN pa.ScorePercentile >= 30 THEN 'Top 70%'
+    ELSE 'Bottom 30%'
+  END AS ScorePercentileCategory,
+  CASE 
+    WHEN pa.VoteCount >= 100 THEN 'Highly Voted'
+    WHEN pa.VoteCount >= 50 THEN 'Moderately Voted'
+    WHEN pa.VoteCount >= 10 THEN 'Low Voted'
+    ELSE 'Very Low Voted'
+  END AS VoteCategory,
+  CASE 
+    WHEN pa.ViewCount >= 1000 THEN 'Highly Viewed'
+    WHEN pa.ViewCount >= 100 THEN 'Moderately Viewed'
+    WHEN pa.ViewCount >= 10 THEN 'Low Viewed'
+    ELSE 'Very Low Viewed'
+  END AS ViewCategory,
+  CASE 
+    WHEN pa.Score > 0 THEN 'Positive Score'
+    WHEN pa.Score < 0 THEN 'Negative Score'
+    ELSE 'Zero Score'
+  END AS ScoreCategory,
+  CASE 
+    WHEN pa.DaysActive >= 365 THEN 'Yearly Active'
+    WHEN pa.DaysActive >= 90 THEN 'Quarterly Active'
+    WHEN pa.DaysActive >= 30 THEN 'Monthly Active'
+    WHEN pa.DaysActive >= 7 THEN 'Weekly Active'
+    ELSE 'Daily Active'
+  END AS ActivityCategory,
+  CASE 
+    WHEN pa.TagCount >= 5 THEN 'High Tag Count'
+    WHEN pa.TagCount >= 3 THEN 'Medium Tag Count'
+    WHEN pa.TagCount >= 1 THEN 'Low Tag Count'
+    ELSE 'No Tags'
+  END AS TagCategory,
+  CASE 
+    WHEN pa.NetUserReputation > 10000 THEN 'Expert'
+    WHEN pa.NetUserReputation > 1000 THEN 'Intermediate'
+    WHEN pa.NetUserReputation > 100 THEN 'Beginner'
+    ELSE 'Novice'
+  END AS ReputationCategory,
+  COALESCE(LEFT(pa.ParentQuestionTitle, 50), 'N/A') + ' - ' + 
+  COALESCE(CAST(pa.AnswerCountForQuestion AS VARCHAR(10)), '0') + ' answers' AS QuestionSummary
+FROM PostAggregates pa
+LEFT JOIN UserActivity ua ON pa.OwnerUserId = ua.UserId
+WHERE pa.Id IS NOT NULL
+  AND (pa.Score > 0 OR pa.ViewCount > 0 OR pa.VoteCount > 0 OR pa.AnswerCount > 0 OR pa.CommentCount > 0)
+  AND pa.PostStatus != 'Closed'
+  AND pa.TemporalCategory IN ('Recent', 'Last Month', 'Last Quarter')
+  AND (pa.TagCount >= 1 OR pa.Score > 5 OR pa.ViewCount > 100 OR pa.VoteCount > 10)
+ORDER BY pa.Score DESC, pa.ViewCount DESC, pa.VoteCount DESC, pa.AnswerCount DESC, pa.CommentCount DESC
+OFFSET 0 ROWS
+FETCH NEXT 1000 ROWS ONLY;

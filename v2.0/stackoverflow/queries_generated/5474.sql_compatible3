@@ -1,0 +1,125 @@
+WITH TopUsers AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.AccountId,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.LastAccessDate DESC) AS rn
+  FROM Users u
+  WHERE u.Reputation >= 1000
+),
+PostActivity AS (
+  SELECT
+    p.Id AS PostId,
+    p.OwnerUserId,
+    p.PostTypeId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Tags,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.Body,
+    p.ContentLicense,
+    COALESCE(vs.UpVotes, 0) AS UpVotes,
+    COALESCE(vs.DownVotes, 0) AS DownVotes,
+    CASE
+      WHEN p.PostTypeId = 1 THEN 'Question'
+      WHEN p.PostTypeId = 2 THEN 'Answer'
+      ELSE 'Other'
+    END AS PostKind,
+    (p.Score * 1.0) / NULLIF(p.ViewCount, 0) AS ScorePerView
+  FROM Posts p
+  LEFT JOIN (
+    SELECT
+      PostId,
+      SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+      SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+    FROM Votes
+    GROUP BY PostId
+  ) vs ON vs.PostId = p.Id
+  WHERE p.CreationDate >= (DATE '2024-10-01' - INTERVAL '2' YEAR)
+),
+CorrelatedStats AS (
+  SELECT
+    pa.PostId,
+    pa.OwnerUserId,
+    pa.PostTypeId,
+    pa.Title,
+    pa.Score,
+    pa.ViewCount,
+    pa.CreationDate,
+    pa.LastActivityDate,
+    pa.Tags,
+    pa.PostKind,
+    pa.ScorePerView,
+    u.DisplayName AS OwnerDisplayName,
+    b.Name AS BadgeName,
+    b.Class AS BadgeClass,
+    (
+      SELECT STRING_AGG(C.Text, '; ')
+      FROM Comments C
+      WHERE C.PostId = pa.PostId
+        AND C.CreationDate >= (DATE '2024-10-01' - INTERVAL '3' MONTH)
+    ) AS RecentComments
+  FROM PostActivity pa
+  LEFT JOIN Users u ON pa.OwnerUserId = u.Id
+  LEFT JOIN Badges b ON b.UserId = pa.OwnerUserId
+  WHERE pa.LastActivityDate >= (DATE '2024-10-01' - INTERVAL '6' MONTH)
+),
+Windowed AS (
+  SELECT
+    cs.PostId,
+    cs.OwnerUserId,
+    cs.PostTypeId,
+    cs.Title,
+    cs.Score,
+    cs.ViewCount,
+    cs.CreationDate,
+    cs.LastActivityDate,
+    cs.Tags,
+    cs.PostKind,
+    cs.ScorePerView,
+    cs.OwnerDisplayName,
+    cs.BadgeName,
+    cs.BadgeClass,
+    cs.RecentComments,
+    ROW_NUMBER() OVER (PARTITION BY cs.OwnerUserId ORDER BY cs.LastActivityDate DESC) AS rn_by_owner,
+    SUM(cs.Score) OVER (
+      PARTITION BY cs.OwnerUserId
+      ORDER BY cs.LastActivityDate
+      RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS RollingYearScore
+  FROM CorrelatedStats cs
+)
+SELECT
+  w.OwnerUserId,
+  w.OwnerDisplayName,
+  w.PostId,
+  w.PostTypeId,
+  w.Title,
+  w.Score,
+  w.ViewCount,
+  w.LastActivityDate,
+  w.Tags,
+  w.PostKind,
+  w.ScorePerView,
+  w.BadgeName,
+  w.BadgeClass,
+  w.RecentComments,
+  w.RollingYearScore
+FROM Windowed w
+WHERE w.rn_by_owner = 1
+  AND (w.Score > 0 OR w.ViewCount > 100)
+ORDER BY w.RollingYearScore DESC, w.ScorePerView DESC
+LIMIT 100;

@@ -1,0 +1,115 @@
+-- {"query": "5382.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 803} 
+WITH
+RecentActivePosts AS (
+  SELECT
+    p.Id,
+    p.PostTypeId,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.Title,
+    p.Tags,
+    p.Score,
+    p.ViewCount,
+    p.LastActivityDate,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.ParentId,
+    p.AcceptedAnswerId
+  FROM Posts p
+  WHERE p.CreationDate >= NOW() - INTERVAL '30 days'
+),
+PostHistorySummary AS (
+  SELECT
+    ph.PostId,
+    ph.PostHistoryTypeId,
+    ph.CreationDate AS HistoryDate,
+    ph.UserId AS HistoryUserId,
+    ph.Comment,
+    ph.Text
+  FROM PostHistory ph
+  WHERE ph.CreationDate >= NOW() - INTERVAL '30 days'
+),
+TopTags AS (
+  SELECT
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId,
+    t.WikiPostId
+  FROM Tags t
+  WHERE t.Count > 100
+),
+CorrelatedStats AS (
+  SELECT
+    rap.Id AS PostId,
+    rap.Title,
+    rap.OwnerUserId,
+    rap.Score,
+    rap.ViewCount,
+    CASE
+      WHEN rap.AcceptedAnswerId IS NOT NULL THEN 1
+      ELSE 0
+    END AS HasAcceptedAnswer,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = rap.Id) AS CommentCountForPost,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = rap.Id AND v.VoteTypeId = 2) AS UpVotesForPost,
+    (SELECT AVG(v.BountyAmount) FROM Votes v WHERE v.PostId = rap.Id AND v.VoteTypeId = 8) AS AvgBounty
+  FROM RecentActivePosts rap
+),
+JoinedUsers AS (
+  SELECT
+    cu.Id AS UserId,
+    cu.DisplayName,
+    cu.Reputation,
+    cu.AccountId,
+    cu.LastAccessDate,
+    cu.Location,
+    cu.WebsiteUrl,
+    cu.Views,
+    cu.UpVotes,
+    cu.DownVotes,
+    cu.ProfileImageUrl,
+    cu.EmailHash,
+    cu.AboutMe,
+    cu.CreationDate
+  FROM Users cu
+  JOIN TopTags tt ON 1=1
+  WHERE cu.Id = COALESCE((SELECT OwnerUserId FROM RecentActivePosts LIMIT 1), cu.Id)
+),
+CTE_Summary AS (
+  SELECT
+    co.PostId,
+    ro.Name AS CloseReason,
+    ph.Comment AS EditComment,
+    ph.Text AS EditText,
+    ph.CreationDate AS HistoryDate
+  FROM PostHistorySummary ph
+  LEFT JOIN CloseReasonTypes ro ON ph.Comment LIKE CONCAT('%', ro.Id, '%')
+  GROUP BY co.PostId, ro.Name, ph.Comment, ph.Text, ph.CreationDate
+)
+SELECT
+  rap.Id AS PostId,
+  rap.Title,
+  rap.Score,
+  rap.ViewCount,
+  rap.LastActivityDate,
+  rap.HasAcceptedAnswer,
+  rap.CommentCountForPost,
+  rap.UpVotesForPost,
+  rap.AvgBounty,
+  ju.DisplayName AS OwnerDisplayName,
+  ju.Reputation,
+  ju.Location,
+  ju.WebsiteUrl,
+  ju.AccountId,
+  tt.TagName,
+  cs.CloseReason,
+  cs.EditComment,
+  cs.EditText,
+  hx.HistoryDate
+FROM CorrelatedStats rap
+LEFT JOIN JoinedUsers ju ON rap.OwnerUserId = ju.UserId
+LEFT JOIN TopTags tt ON rap.Title LIKE '%' || tt.TagName || '%'
+LEFT JOIN CTE_Summary cs ON rap.PostId = cs.PostId
+LEFT JOIN PostHistorySummary hx ON rap.PostId = hx.PostId
+ORDER BY rap.Score DESC NULLS LAST, rap.LastActivityDate DESC
+LIMIT 100;

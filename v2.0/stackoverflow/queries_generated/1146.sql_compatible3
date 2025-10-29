@@ -1,0 +1,260 @@
+WITH PostInteractions AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        p.OwnerUserId AS PostOwnerUserId,
+        pr.OwnerUserId AS RelatedPostOwnerUserId,
+        'LINKED_TO' AS InteractionType,
+        pl.CreationDate AS InteractionDate
+    FROM PostLinks pl
+    JOIN Posts p ON pl.PostId = p.Id
+    JOIN Posts pr ON pl.RelatedPostId = pr.Id
+    WHERE pl.LinkTypeId = 1
+    UNION ALL
+    SELECT
+        pl.RelatedPostId AS PostId,
+        pl.PostId AS RelatedPostId,
+        pr.OwnerUserId AS PostOwnerUserId,
+        p.OwnerUserId AS RelatedPostOwnerUserId,
+        'DUPLICATE_OF' AS InteractionType,
+        pl.CreationDate AS InteractionDate
+    FROM PostLinks pl
+    JOIN Posts p ON pl.PostId = p.Id
+    JOIN Posts pr ON pl.RelatedPostId = pr.Id
+    WHERE pl.LinkTypeId = 3
+),
+UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.CreationDate AS UserCreationDate,
+        u.Reputation,
+        u.Views AS TotalProfileViews,
+        u.UpVotes AS TotalUpVotesGiven,
+        u.DownVotes AS TotalDownVotesGiven,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostScore,
+        MAX(p.LastActivityDate) AS LastPostActivity,
+        COALESCE(CAST(SUM(p.Score) AS NUMERIC) / NULLIF(COUNT(p.Id), 0), 0) AS AvgPostScorePerPost,
+        AVG(u.Reputation) OVER (PARTITION BY DATE_TRUNC('month', u.CreationDate)) AS AvgMonthlyNewUserReputation
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    GROUP BY u.Id, u.DisplayName, u.CreationDate, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.LastAccessDate
+),
+PostContentDetails AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate AS PostCreationDate,
+        p.Tags,
+        p.FavoriteCount,
+        p.AnswerCount,
+        p.ClosedDate,
+        p.LastEditDate,
+        COALESCE(p.Title, SUBSTR(p.Body, 1, 100) || '...') AS PostTitleSnippet,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId, p.PostTypeId ORDER BY p.Score DESC, p.CreationDate DESC) AS rn_post_by_user_type,
+        SUM(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS UserCumulativePostScore
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+ModerationInfluence AS (
+    SELECT
+        ph.UserId,
+        COUNT(DISTINCT ph.PostId) AS PostsAffectedByModeration,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (10, 12, 14, 19) THEN 1 ELSE 0 END) AS ModerationActionsTakenCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (11, 13, 15, 20) THEN 1 ELSE 0 END) AS ModerationReversalsMadeCount,
+        (CASE WHEN COUNT(*) > 0 THEN (
+            CASE WHEN EXISTS (
+                SELECT 1
+                FROM (
+                    SELECT ph_inner.PostId, ph_inner.UserId AS closer_userid
+                    FROM PostHistory ph_inner
+                    WHERE ph_inner.PostHistoryTypeId = 10
+                      AND ph_inner.UserId = ph.UserId
+                ) closers
+                JOIN PostHistory ph_reopen
+                  ON ph_reopen.PostId = closers.PostId
+                 AND ph_reopen.PostHistoryTypeId = 11
+                 AND (
+                       (ph_reopen.UserId IS DISTINCT FROM closers.closer_userid)
+                       OR (ph_reopen.UserId IS NOT NULL AND closers.closer_userid IS NULL)
+                       OR (ph_reopen.UserId IS NULL AND closers.closer_userid IS NOT NULL)
+                     )
+            ) THEN TRUE ELSE FALSE END
+        ) ELSE FALSE END) AS HasContestedCloseAction
+    FROM PostHistory ph
+    WHERE ph.UserId IS NOT NULL
+      AND ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20)
+    GROUP BY ph.UserId
+),
+UserTagContributions AS (
+    SELECT
+        pcd.OwnerUserId AS UserId,
+        TRIM(tag) AS TagName,
+        COUNT(DISTINCT pcd.PostId) AS TagPostCount,
+        SUM(pcd.Score) AS TagTotalScore,
+        ROW_NUMBER() OVER (PARTITION BY pcd.OwnerUserId ORDER BY SUM(pcd.Score) DESC, COUNT(DISTINCT pcd.PostId) DESC) AS rn_tag_by_user
+    FROM PostContentDetails pcd,
+         UNNEST(string_to_array(SUBSTR(pcd.Tags, 2, LENGTH(pcd.Tags) - 2), '><')) AS tag
+    WHERE pcd.Tags IS NOT NULL AND pcd.Tags <> ''
+    GROUP BY pcd.OwnerUserId, TRIM(tag)
+),
+UserBadgeSummary AS (
+    SELECT
+        b.UserId,
+        COUNT(b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+),
+AggregatedLinkedPosts AS (
+    SELECT
+        pi.PostId,
+        pi.PostOwnerUserId AS UserId,
+        COUNT(pi.RelatedPostId) AS TotalRelatedPosts,
+        SUM(CASE WHEN pi.InteractionType = 'DUPLICATE_OF' THEN 1 ELSE 0 END) AS TotalDuplicatesOf,
+        MAX(pi.InteractionDate) AS LastPostRelationDate,
+        DENSE_RANK() OVER (ORDER BY COUNT(pi.RelatedPostId) DESC) AS PostRelationRank
+    FROM PostInteractions pi
+    GROUP BY pi.PostId, pi.PostOwnerUserId
+    HAVING COUNT(pi.RelatedPostId) >= 2
+),
+UserCommentActivity AS (
+    SELECT
+        c.UserId,
+        COUNT(c.Id) AS UserTotalComments,
+        MAX(c.CreationDate) AS LastCommentDate,
+        CASE WHEN COUNT(*) > 0 THEN (
+            CASE WHEN EXISTS (
+                SELECT 1
+                FROM Comments c_sub
+                WHERE c_sub.UserId = c.UserId
+                  AND c_sub.Score > 1
+                  AND c_sub.CreationDate >= (DATE '2024-10-01' - INTERVAL '90' DAY)
+            ) THEN TRUE ELSE FALSE END
+        ) ELSE FALSE END AS HasRecentHighScoreComments
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+    GROUP BY c.UserId
+)
+SELECT
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.TotalPosts,
+    uas.TotalQuestions,
+    uas.TotalAnswers,
+    uas.TotalComments,
+    uca.UserTotalComments,
+    uca.LastCommentDate,
+    uca.HasRecentHighScoreComments,
+    uas.AvgPostScorePerPost,
+    uas.LastPostActivity,
+    uas.AvgMonthlyNewUserReputation,
+    mi.PostsAffectedByModeration,
+    mi.ModerationActionsTakenCount,
+    mi.ModerationReversalsMadeCount,
+    mi.HasContestedCloseAction,
+    COALESCE(ubs.TotalBadges, 0) AS TotalBadges,
+    COALESCE(ubs.GoldBadges, 0) AS GoldBadges,
+    CASE
+        WHEN COALESCE(ubs.TotalBadges, 0) > 0 THEN ROUND(CAST(uas.Reputation AS NUMERIC) / ubs.TotalBadges, 2)
+        ELSE 0.0
+    END AS ReputationPerBadge,
+    utc.TopTag1,
+    utc.TopTag1Score,
+    utc.TopTag2,
+    utc.TopTag2Score,
+    utc.TopTag3,
+    utc.TopTag3Score,
+    DENSE_RANK() OVER (ORDER BY uas.TotalPostScore DESC, uas.Reputation DESC) AS OverallUserScoreRank,
+    CONCAT(
+        'Member for ',
+        DATE_PART('year', AGE(DATE '2024-10-01', uas.UserCreationDate)),
+        ' years, last access on ',
+        TO_CHAR(uas.LastAccessDate, 'YYYY-MM-DD HH24:MI')
+    ) AS UserTenureAndAccessSummary,
+    (
+        SELECT COUNT(DISTINCT pcd_sub.PostId)
+        FROM PostContentDetails pcd_sub
+        WHERE pcd_sub.OwnerUserId = uas.UserId
+          AND pcd_sub.PostTypeId = 1
+          AND pcd_sub.Score > 50
+          AND pcd_sub.ViewCount > 10000
+          AND pcd_sub.AnswerCount IS NOT NULL AND pcd_sub.AnswerCount > 3
+          AND pcd_sub.ClosedDate IS NULL
+          AND pcd_sub.LastEditDate >= (DATE '2024-10-01' - INTERVAL '6' MONTH)
+    ) AS HighImpactOpenQuestionsCount,
+    COALESCE(alp.TotalRelatedPosts, 0) AS PostsWithRelations,
+    COALESCE(alp.TotalDuplicatesOf, 0) AS PostsMarkedAsDuplicateSource,
+    alp.LastPostRelationDate,
+    alp.PostRelationRank,
+    CASE
+        WHEN uas.TotalProfileViews > (SELECT AVG(Views) FROM Users WHERE Views IS NOT NULL) THEN 'Above Average Views'
+        WHEN uas.TotalProfileViews < (SELECT AVG(Views) FROM Users WHERE Views IS NOT NULL) THEN 'Below Average Views'
+        ELSE 'Average Views'
+    END AS ProfileViewCategory
+FROM UserActivitySummary uas
+LEFT JOIN ModerationInfluence mi ON uas.UserId = mi.UserId
+LEFT JOIN UserBadgeSummary ubs ON uas.UserId = ubs.UserId
+LEFT JOIN UserCommentActivity uca ON uas.UserId = uca.UserId
+LEFT JOIN (
+    SELECT
+        UserId,
+        MAX(CASE WHEN rn_tag_by_user = 1 THEN TagName END) AS TopTag1,
+        MAX(CASE WHEN rn_tag_by_user = 1 THEN TagTotalScore END) AS TopTag1Score,
+        MAX(CASE WHEN rn_tag_by_user = 2 THEN TagName END) AS TopTag2,
+        MAX(CASE WHEN rn_tag_by_user = 2 THEN TagTotalScore END) AS TopTag2Score,
+        MAX(CASE WHEN rn_tag_by_user = 3 THEN TagName END) AS TopTag3,
+        MAX(CASE WHEN rn_tag_by_user = 3 THEN TagTotalScore END) AS TopTag3Score
+    FROM UserTagContributions
+    GROUP BY UserId
+) AS utc ON uas.UserId = utc.UserId
+LEFT JOIN AggregatedLinkedPosts alp ON uas.UserId = alp.UserId
+WHERE (uas.TotalPosts > 0 OR uas.TotalComments > 0 OR uas.TotalProfileViews > 0)
+GROUP BY
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.TotalPosts,
+    uas.TotalQuestions,
+    uas.TotalAnswers,
+    uas.TotalComments,
+    uca.UserTotalComments,
+    uca.LastCommentDate,
+    uca.HasRecentHighScoreComments,
+    uas.AvgPostScorePerPost,
+    uas.LastPostActivity,
+    uas.AvgMonthlyNewUserReputation,
+    mi.PostsAffectedByModeration,
+    mi.ModerationActionsTakenCount,
+    mi.ModerationReversalsMadeCount,
+    mi.HasContestedCloseAction,
+    ubs.TotalBadges,
+    ubs.GoldBadges,
+    ubs.TotalBadges,
+    utc.TopTag1,
+    utc.TopTag1Score,
+    utc.TopTag2,
+    utc.TopTag2Score,
+    utc.TopTag3,
+    utc.TopTag3Score,
+    alp.TotalRelatedPosts,
+    alp.TotalDuplicatesOf,
+    alp.LastPostRelationDate,
+    alp.PostRelationRank,
+    uas.UserCreationDate,
+    uas.LastAccessDate
+ORDER BY uas.Reputation DESC, OverallUserScoreRank ASC, uas.UserId
+LIMIT 500;

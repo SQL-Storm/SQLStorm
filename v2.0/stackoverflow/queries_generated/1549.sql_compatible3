@@ -1,0 +1,207 @@
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.Views AS UserViews,
+        U.UpVotes,
+        U.DownVotes,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        COUNT(CASE WHEN B.Class = 1 THEN B.Id END) AS GoldBadges,
+        COUNT(CASE WHEN B.Class = 2 THEN B.Id END) AS SilverBadges,
+        COUNT(CASE WHEN B.Class = 3 THEN B.Id END) AS BronzeBadges,
+        COALESCE(U.Location, 'Unknown') AS UserLocation,
+        CASE
+            WHEN U.UpVotes > U.DownVotes * 5 THEN 'Highly Positive'
+            WHEN U.UpVotes * 2 > U.DownVotes THEN 'Mostly Positive'
+            WHEN U.DownVotes > U.UpVotes * 2 THEN 'Mostly Negative'
+            ELSE 'Balanced'
+        END AS VoteSentiment,
+        (U.Reputation * 0.5 + U.UpVotes * 0.3 - U.DownVotes * 0.1 + U.Views * 0.01) AS EngagementScore,
+        RANK() OVER (ORDER BY U.Reputation DESC, U.LastAccessDate DESC) AS OverallUserRank
+    FROM Users U
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    WHERE U.Reputation > 1000
+      AND U.LastAccessDate >= DATE '2022-01-01'
+      AND U.CreationDate <= DATE '2023-12-31'
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.Views, U.UpVotes, U.DownVotes, U.CreationDate, U.LastAccessDate, U.Location
+),
+PostActivityMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.ClosedDate,
+        P.LastEditDate,
+        P.LastActivityDate,
+        P.Title,
+        P.Tags,
+        (SELECT COUNT(DISTINCT PH2.Id) FROM PostHistory PH2 WHERE PH2.PostId = P.Id AND PH2.PostHistoryTypeId IN (4,5,6,8,9)) AS EditCount,
+        (SELECT COUNT(DISTINCT C2.Id) FROM Comments C2 WHERE C2.PostId = P.Id AND C2.CreationDate >= P.CreationDate AND C2.CreationDate <= P.LastActivityDate) AS ActualCommentCount,
+        COALESCE(P.AcceptedAnswerId, -1) AS AcceptedAnswerId,
+        LAG(P.LastActivityDate, 1, P.CreationDate) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate) AS PrevPostActivityDate,
+        LEAD(P.LastActivityDate, 1, P.LastActivityDate) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate) AS NextPostActivityDate,
+        CASE
+            WHEN P.Tags IS NOT NULL AND CHAR_LENGTH(P.Tags) > 2 THEN
+                CARDINALITY(STRING_TO_ARRAY(SUBSTRING(P.Tags FROM 2 FOR CHAR_LENGTH(P.Tags) - 2), '><'))
+            ELSE 0
+        END AS TagCount,
+        STRING_AGG(PRCT.Name, ', ' ORDER BY PH.CreationDate) AS CloseReasons
+    FROM Posts P
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId AND PH.PostHistoryTypeId = 10
+    LEFT JOIN CloseReasonTypes PRCT ON CAST(PH.Comment AS INTEGER) = PRCT.Id
+    WHERE P.PostTypeId = 1
+      AND P.CreationDate >= DATE '2022-01-01'
+      AND P.Score > 5
+      AND (P.ViewCount > 1000 OR P.FavoriteCount > 10)
+    GROUP BY P.Id, P.PostTypeId, P.OwnerUserId, P.CreationDate, P.Score, P.ViewCount, P.AnswerCount, P.CommentCount, P.FavoriteCount, P.ClosedDate, P.LastEditDate, P.LastActivityDate, P.Title, P.Tags, P.AcceptedAnswerId
+),
+RelatedPostInfluence AS (
+    SELECT
+        PL.PostId,
+        SUM(CASE WHEN PL.LinkTypeId = 1 THEN 1 ELSE 0 END) AS LinkedPostsCount,
+        SUM(CASE WHEN PL.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicatePostsCount,
+        AVG(COALESCE(RELATED_P.Score, 0)) AS AvgRelatedPostScore,
+        COUNT(DISTINCT RELATED_P.OwnerUserId) AS UniqueRelatedOwners
+    FROM PostLinks PL
+    INNER JOIN Posts RELATED_P ON PL.RelatedPostId = RELATED_P.Id
+    GROUP BY PL.PostId
+),
+UserCommentMetrics AS (
+    SELECT
+        C.UserId,
+        C.PostId,
+        COUNT(C.Id) AS UserCommentCountOnPost,
+        AVG(C.Score) AS AvgCommentScoreOnPost,
+        MAX(C.CreationDate) AS LastCommentDateOnPost,
+        SUM(CASE WHEN C.Text ILIKE '%great%' OR C.Text ILIKE '%awesome%' THEN 1 ELSE 0 END) AS PositiveCommentCount,
+        SUM(CASE WHEN C.Text ILIKE '%bug%' OR C.Text ILIKE '%issue%' THEN 1 ELSE 0 END) AS NegativeCommentCount,
+        NTILE(4) OVER (PARTITION BY C.PostId ORDER BY COUNT(C.Id) DESC, AVG(C.Score) DESC) AS CommenterQuartileOnPost
+    FROM Comments C
+    WHERE C.UserId IS NOT NULL
+      AND CHAR_LENGTH(C.Text) BETWEEN 10 AND 500
+      AND C.CreationDate >= DATE '2022-01-01'
+    GROUP BY C.UserId, C.PostId
+),
+PrimaryAnalysis AS (
+    SELECT
+        UE.UserId,
+        UE.DisplayName,
+        'Primary Performance' AS AnalysisType,
+        UE.Reputation,
+        UE.EngagementScore,
+        UE.VoteSentiment,
+        UE.OverallUserRank,
+        PAM.PostId,
+        PAM.Title AS PostTitle,
+        PAM.Score AS PostScore,
+        PAM.ViewCount AS PostViewCount,
+        PAM.AnswerCount,
+        PAM.EditCount,
+        PAM.ActualCommentCount,
+        PAM.TagCount,
+        PAM.CloseReasons,
+        COALESCE(RPI.LinkedPostsCount, 0) AS TotalLinkedPosts,
+        COALESCE(RPI.DuplicatePostsCount, 0) AS TotalDuplicatePosts,
+        COALESCE(RPI.AvgRelatedPostScore, 0) AS AvgRelatedPostScore,
+        COALESCE(UCM.UserCommentCountOnPost, 0) AS CurrentUserCommentCount,
+        COALESCE(UCM.AvgCommentScoreOnPost, 0) AS CurrentUserAvgCommentScore,
+        COALESCE(UCM.PositiveCommentCount, 0) AS CurrentUserPositiveComments,
+        COALESCE(UCM.NegativeCommentCount, 0) AS CurrentUserNegativeComments,
+        PAM.PrevPostActivityDate,
+        PAM.NextPostActivityDate,
+        EXTRACT(EPOCH FROM (PAM.LastActivityDate - PAM.PostCreationDate)) / 3600 AS HoursActiveAfterCreation,
+        CASE
+            WHEN PAM.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN PAM.AnswerCount > 0 AND PAM.AcceptedAnswerId IS NOT NULL THEN 'Answered & Accepted'
+            WHEN PAM.AnswerCount > 0 THEN 'Answered'
+            ELSE 'Open'
+        END AS PostStatus,
+        RANK() OVER (PARTITION BY UE.UserLocation, UE.VoteSentiment ORDER BY PAM.Score DESC, PAM.ViewCount DESC) AS SpecificRank,
+        NTILE(5) OVER (ORDER BY UE.EngagementScore DESC, PAM.Score DESC) AS SpecificQuintile,
+        NULLIF(UE.GoldBadges + UE.SilverBadges + UE.BronzeBadges, 0) AS TotalBadges
+    FROM UserEngagement UE
+    INNER JOIN PostActivityMetrics PAM ON UE.UserId = PAM.OwnerUserId
+    LEFT JOIN RelatedPostInfluence RPI ON PAM.PostId = RPI.PostId
+    LEFT JOIN UserCommentMetrics UCM ON UE.UserId = UCM.UserId AND PAM.PostId = UCM.PostId
+    WHERE
+        PAM.PostCreationDate BETWEEN UE.UserCreationDate AND UE.LastAccessDate
+        AND (PAM.Score >= 10 OR COALESCE(UCM.AvgCommentScoreOnPost, 0) >= 1)
+        AND (PAM.Tags ILIKE '%<sql>%' OR PAM.Tags ILIKE '%<database>%')
+        AND ((PAM.FavoriteCount IS NOT NULL AND PAM.FavoriteCount > 0) OR PAM.ViewCount > 5000)
+        AND NOT EXISTS (
+            SELECT 1
+            FROM PostHistory PH_DEL
+            WHERE PH_DEL.PostId = PAM.PostId
+              AND PH_DEL.PostHistoryTypeId = 12
+        )
+),
+RelatedInfluenceAnalysis AS (
+    SELECT
+        UE.UserId,
+        UE.DisplayName,
+        'Related Post Influence' AS AnalysisType,
+        UE.Reputation,
+        UE.EngagementScore,
+        UE.VoteSentiment,
+        UE.OverallUserRank,
+        PAM.PostId,
+        PAM.Title AS PostTitle,
+        PAM.Score AS PostScore,
+        PAM.ViewCount AS PostViewCount,
+        PAM.AnswerCount,
+        PAM.EditCount,
+        PAM.ActualCommentCount,
+        PAM.TagCount,
+        PAM.CloseReasons,
+        COALESCE(RPI.LinkedPostsCount, 0) AS TotalLinkedPosts,
+        COALESCE(RPI.DuplicatePostsCount, 0) AS TotalDuplicatePosts,
+        COALESCE(RPI.AvgRelatedPostScore, 0) AS AvgRelatedPostScore,
+        COALESCE(UCM.UserCommentCountOnPost, 0) AS CurrentUserCommentCount,
+        COALESCE(UCM.AvgCommentScoreOnPost, 0) AS CurrentUserAvgCommentScore,
+        COALESCE(UCM.PositiveCommentCount, 0) AS CurrentUserPositiveComments,
+        COALESCE(UCM.NegativeCommentCount, 0) AS CurrentUserNegativeComments,
+        PAM.PrevPostActivityDate,
+        PAM.NextPostActivityDate,
+        EXTRACT(EPOCH FROM (PAM.LastActivityDate - PAM.PostCreationDate)) / 3600 AS HoursActiveAfterCreation,
+        CASE
+            WHEN PAM.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN PAM.AnswerCount > 0 AND PAM.AcceptedAnswerId IS NOT NULL THEN 'Answered & Accepted'
+            WHEN PAM.AnswerCount > 0 THEN 'Answered'
+            ELSE 'Open'
+        END AS PostStatus,
+        RANK() OVER (PARTITION BY RPI.UniqueRelatedOwners ORDER BY RPI.LinkedPostsCount DESC, RPI.DuplicatePostsCount DESC) AS SpecificRank,
+        NTILE(5) OVER (ORDER BY RPI.LinkedPostsCount DESC, RPI.AvgRelatedPostScore DESC) AS SpecificQuintile,
+        NULLIF(UE.GoldBadges + UE.SilverBadges + UE.BronzeBadges, 0) AS TotalBadges
+    FROM UserEngagement UE
+    INNER JOIN PostActivityMetrics PAM ON UE.UserId = PAM.OwnerUserId
+    INNER JOIN RelatedPostInfluence RPI ON PAM.PostId = RPI.PostId
+    LEFT JOIN UserCommentMetrics UCM ON UE.UserId = UCM.UserId AND PAM.PostId = UCM.PostId
+    WHERE
+        RPI.LinkedPostsCount + RPI.DuplicatePostsCount > 0
+        AND RPI.UniqueRelatedOwners > 1
+        AND (PAM.ViewCount > 10000 OR PAM.FavoriteCount > 50)
+        AND NOT EXISTS (
+            SELECT 1
+            FROM Votes V
+            WHERE V.PostId = PAM.PostId
+              AND V.VoteTypeId = 10
+              AND V.CreationDate >= PAM.PostCreationDate
+        )
+)
+SELECT *
+FROM PrimaryAnalysis
+WHERE SpecificQuintile <= 2
+UNION ALL
+SELECT *
+FROM RelatedInfluenceAnalysis
+WHERE SpecificQuintile <= 2
+ORDER BY AnalysisType DESC, EngagementScore DESC, PostScore DESC
+LIMIT 2000;

@@ -1,0 +1,151 @@
+-- {"query": "3005.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2277} 
+
+WITH 
+/* ------------------------------------------------------------------
+   1. Aggregate user‐level statistics (posts, scores, median, etc.)
+   ------------------------------------------------------------------ */
+UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COALESCE(u.Location, '[unknown]')        AS Location,
+        COUNT(p.Id)                               AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        AVG(p.Score)                              AS AvgScore,
+        /* Median score per user – windowed percentile */
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) 
+            OVER (PARTITION BY u.Id)            AS MedianScore
+    FROM Users u
+    LEFT JOIN Posts p 
+           ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location
+),
+
+/* ------------------------------------------------------------------
+   2. Badge points per user (Gold=100, Silver=50, Bronze=10)
+   ------------------------------------------------------------------ */
+BadgePoints AS (
+    SELECT 
+        b.UserId,
+        SUM(CASE b.Class 
+                WHEN 1 THEN 100   -- Gold
+                WHEN 2 THEN 50    -- Silver
+                ELSE 10           -- Bronze
+            END)                         AS BadgeScore,
+        COUNT(*)                         AS BadgeCount,
+        SUM(CASE WHEN b.TagBased = 1 THEN 1 ELSE 0 END) AS TagBadgeCount
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+/* ------------------------------------------------------------------
+   3. Most recent voting activity (up‑/down‑votes only)
+   ------------------------------------------------------------------ */
+RecentVote AS (
+    SELECT 
+        v.UserId,
+        MAX(v.CreationDate) AS LastVoteDate
+    FROM Votes v
+    WHERE v.VoteTypeId IN (2,3)          -- UpMod / DownMod
+    GROUP BY v.UserId
+),
+
+/* ------------------------------------------------------------------
+   4. Tag usage per user (questions only, split Tags column)
+   ------------------------------------------------------------------ */
+TagUsage AS (
+    SELECT 
+        p.OwnerUserId                                     AS UserId,
+        t.TagName,
+        COUNT(*)                                          AS TagPosts
+    FROM Posts p
+    /* Split the <tag1><tag2>… string into rows */
+    LEFT JOIN LATERAL regexp_split_to_table(p.Tags, '\><') AS split(tag_raw) ON p.Tags IS NOT NULL
+    LEFT JOIN Tags t 
+           ON t.TagName = substring(split.tag_raw FROM 2 FOR char_length(split.tag_raw)-2)
+    WHERE p.PostTypeId = 1               -- questions only
+      AND p.Tags IS NOT NULL
+    GROUP BY p.OwnerUserId, t.TagName
+),
+
+/* ------------------------------------------------------------------
+   5. Top tag per user (row_number to pick the most frequent)
+   ------------------------------------------------------------------ */
+TopTag AS (
+    SELECT 
+        tu.UserId,
+        tu.TagName,
+        ROW_NUMBER() OVER (PARTITION BY tu.UserId ORDER BY tu.TagPosts DESC) AS rn
+    FROM TagUsage tu
+),
+
+/* ------------------------------------------------------------------
+   6. Combine everything together
+   ------------------------------------------------------------------ */
+Combined AS (
+    SELECT 
+        us.Id                                   AS UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.TotalPosts,
+        us.QuestionCount,
+        us.AnswerCount,
+        us.AvgScore,
+        us.MedianScore,
+        COALESCE(bp.BadgeScore, 0)              AS BadgeScore,
+        COALESCE(rv.LastVoteDate, us.CreationDate) AS LastActive,
+        CASE 
+            WHEN us.Reputation > 10000                     THEN 'High'
+            WHEN us.Reputation BETWEEN 2000 AND 10000      THEN 'Medium'
+            ELSE                                               'Low'
+        END                                      AS RepTier,
+        COALESCE(tt.TagName, '[no tag]')          AS TopTag
+    FROM UserStats us
+    LEFT JOIN BadgePoints bp   ON bp.UserId = us.Id
+    LEFT JOIN RecentVote rv    ON rv.UserId = us.Id
+    LEFT JOIN TopTag tt        ON tt.UserId = us.Id AND tt.rn = 1
+)
+
+/* ------------------------------------------------------------------
+   7. Final result set with a UNION ALL summary row
+   ------------------------------------------------------------------ */
+SELECT 
+    UserId,
+    DisplayName,
+    Reputation,
+    TotalPosts,
+    QuestionCount,
+    AnswerCount,
+    AvgScore,
+    MedianScore,
+    BadgeScore,
+    LastActive,
+    RepTier,
+    TopTag
+FROM Combined
+WHERE 
+    (RepTier = 'High'   AND TotalPosts   > 100)
+    OR
+    (RepTier = 'Low'    AND BadgeScore  > 200)
+
+UNION ALL
+
+SELECT
+    0                                   AS UserId,
+    'TOTAL'                             AS DisplayName,
+    SUM(Reputation)                     AS Reputation,
+    SUM(TotalPosts)                     AS TotalPosts,
+    SUM(QuestionCount)                  AS QuestionCount,
+    SUM(AnswerCount)                    AS AnswerCount,
+    AVG(AvgScore)                       AS AvgScore,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY MedianScore) AS MedianScore,
+    SUM(BadgeScore)                     AS BadgeScore,
+    MAX(LastActive)                     AS LastActive,
+    NULL                                AS RepTier,
+    NULL                                AS TopTag
+FROM Combined
+ORDER BY Reputation DESC, TotalPosts DESC
+LIMIT 100;

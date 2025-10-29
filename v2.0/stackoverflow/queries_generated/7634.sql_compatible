@@ -1,0 +1,195 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        STRING_AGG(DISTINCT CASE WHEN POSITION('<sql>' IN p.Tags) > 0 THEN '1' ELSE '0' END, ',') AS HasSqlTag,
+        STRING_AGG(DISTINCT CASE WHEN p.PostTypeId = 1 THEN 'Q' WHEN p.PostTypeId = 2 THEN 'A' ELSE 'O' END, ',') AS PostTypes,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        NTILE(10) OVER (ORDER BY u.Reputation) AS ReputationDecile
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Reputation > 100
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.LastAccessDate
+),
+TopUsers AS (
+    SELECT UserId, DisplayName, Reputation, PostCount, CommentCount, BadgeCount
+    FROM UserStats
+    WHERE ReputationRank <= 100
+),
+PostActivity AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserPostRank,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevScore,
+        LAG(p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevPostDate,
+        CAST((JULIANDAY(p.CreationDate) - JULIANDAY(LAG(p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate))) AS INTEGER) AS DaysBetweenPosts,
+        CASE 
+            WHEN p.Score > 0 THEN 'High'
+            WHEN p.Score > -10 THEN 'Medium'
+            ELSE 'Low'
+        END AS ScoreCategory,
+        CASE 
+            WHEN p.Tags LIKE '%<sql>%' THEN 1 
+            ELSE 0 
+        END AS IsSqlQuestion,
+        COALESCE(p.AcceptedAnswerId, 0) AS HasAcceptedAnswer
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+    AND p.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1' YEAR)
+),
+UserPostSummary AS (
+    SELECT 
+        pu.UserId,
+        pu.DisplayName,
+        COUNT(pa.PostId) AS TotalPosts,
+        SUM(CASE WHEN pa.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN pa.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        AVG(pa.Score) AS AvgScore,
+        SUM(pa.ViewCount) AS TotalViews,
+        MIN(pa.CreationDate) AS FirstPostDate,
+        MAX(pa.CreationDate) AS LastPostDate,
+        STRING_AGG(DISTINCT pa.ScoreCategory, ',') AS ScoreCategories,
+        COUNT(DISTINCT CASE WHEN pa.IsSqlQuestion = 1 THEN pa.PostId END) AS SqlQuestionCount
+    FROM TopUsers pu
+    JOIN PostActivity pa ON pa.OwnerUserId = pu.UserId
+    GROUP BY pu.UserId, pu.DisplayName
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            ELSE 'Niche'
+        END AS TagPopularity,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS PopularityRank,
+        LAG(t.Count) OVER (ORDER BY t.Count DESC) - t.Count AS CountDifference
+    FROM Tags t
+    WHERE t.Count > 50
+),
+RecentBadges AS (
+    SELECT 
+        b.UserId,
+        b.Name AS BadgeName,
+        b.Date AS BadgeDate,
+        b.Class,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC) AS RecentBadgeRank,
+        LAG(b.Date) OVER (PARTITION BY b.UserId ORDER BY b.Date DESC) AS PrevBadgeDate,
+        CAST((JULIANDAY(b.Date) - JULIANDAY(LAG(b.Date) OVER (PARTITION BY b.UserId ORDER BY b.Date DESC))) AS INTEGER) AS DaysBetweenBadges,
+        CASE 
+            WHEN b.Class = 1 THEN 'Gold'
+            WHEN b.Class = 2 THEN 'Silver'
+            ELSE 'Bronze'
+        END AS BadgeTier
+    FROM Badges b
+    WHERE b.Date >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '3' MONTH)
+),
+FinalAnalysis AS (
+    SELECT 
+        ups.UserId,
+        ups.DisplayName,
+        ups.TotalPosts,
+        ups.QuestionCount,
+        ups.AnswerCount,
+        ups.AvgScore,
+        ups.TotalViews,
+        ups.SqlQuestionCount,
+        ups.ScoreCategories,
+        us.Reputation,
+        us.PostCount AS UserPostCount,
+        us.CommentCount AS UserCommentCount,
+        us.BadgeCount AS UserBadgeCount,
+        CASE 
+            WHEN ups.SqlQuestionCount > 0 THEN 'SQL Expert'
+            WHEN ups.QuestionCount > 0 THEN 'Active Questioner'
+            WHEN ups.AnswerCount > 0 THEN 'Active Answerer'
+            ELSE 'Passive User'
+        END AS UserRole,
+        COUNT(DISTINCT CASE WHEN tb.BadgeTier = 'Gold' THEN tb.BadgeName END) AS GoldBadgeCount,
+        COUNT(DISTINCT CASE WHEN tb.BadgeTier = 'Silver' THEN tb.BadgeName END) AS SilverBadgeCount,
+        COUNT(DISTINCT CASE WHEN tb.BadgeTier = 'Bronze' THEN tb.BadgeName END) AS BronzeBadgeCount,
+        MIN(tb.BadgeDate) AS FirstBadgeDate,
+        MAX(tb.BadgeDate) AS LastBadgeDate,
+        AVG(tb.DaysBetweenBadges) AS AvgDaysBetweenBadges,
+        ta.TagPopularity,
+        ta.PopularityRank AS TagPopularityRank,
+        CASE 
+            WHEN ups.AvgScore > 50 THEN 'High Scorer'
+            WHEN ups.AvgScore > 10 THEN 'Moderate Scorer'
+            ELSE 'Low Scorer'
+        END AS ScoringLevel,
+        CASE 
+            WHEN ups.TotalViews > 1000 THEN 'High Visibility'
+            WHEN ups.TotalViews > 100 THEN 'Moderate Visibility'
+            ELSE 'Low Visibility'
+        END AS VisibilityLevel
+    FROM UserPostSummary ups
+    JOIN UserStats us ON us.UserId = ups.UserId
+    LEFT JOIN RecentBadges tb ON tb.UserId = ups.UserId
+    LEFT JOIN TagAnalysis ta ON ta.TagCount = ups.SqlQuestionCount
+    WHERE us.Reputation > 1000
+    GROUP BY 
+        ups.UserId, ups.DisplayName, ups.TotalPosts, ups.QuestionCount, ups.AnswerCount, 
+        ups.AvgScore, ups.TotalViews, ups.SqlQuestionCount, ups.ScoreCategories,
+        us.Reputation, us.PostCount, us.CommentCount, us.BadgeCount, ta.TagPopularity, ta.PopularityRank
+)
+SELECT 
+    fa.UserId,
+    fa.DisplayName,
+    fa.TotalPosts,
+    fa.QuestionCount,
+    fa.AnswerCount,
+    CAST(fa.AvgScore AS DECIMAL(10,2)) AS AvgScore,
+    fa.TotalViews,
+    fa.SqlQuestionCount,
+    fa.UserRole,
+    fa.GoldBadgeCount,
+    fa.SilverBadgeCount,
+    fa.BronzeBadgeCount,
+    fa.FirstBadgeDate,
+    fa.LastBadgeDate,
+    CAST(fa.AvgDaysBetweenBadges AS DECIMAL(10,2)) AS AvgDaysBetweenBadges,
+    fa.TagPopularity,
+    fa.TagPopularityRank,
+    fa.ScoringLevel,
+    fa.VisibilityLevel,
+    CASE 
+        WHEN fa.TotalPosts > 100 AND fa.SqlQuestionCount > 20 THEN 'Veteran SQL Contributor'
+        WHEN fa.SqlQuestionCount > 10 THEN 'Active SQL Contributor'
+        WHEN fa.TotalPosts > 50 THEN 'Regular Contributor'
+        ELSE 'Occasional Contributor'
+    END AS ContributionLevel,
+    ROW_NUMBER() OVER (ORDER BY fa.TotalViews DESC, fa.AvgScore DESC) AS OverallRank,
+    RANK() OVER (PARTITION BY fa.ScoringLevel ORDER BY fa.TotalViews DESC) AS ScoringLevelRank,
+    DENSE_RANK() OVER (ORDER BY fa.GoldBadgeCount DESC, fa.SilverBadgeCount DESC) AS BadgeRank
+FROM FinalAnalysis fa
+WHERE fa.GoldBadgeCount + fa.SilverBadgeCount + fa.BronzeBadgeCount > 0
+ORDER BY 
+    fa.TotalViews DESC,
+    fa.AvgScore DESC,
+    fa.TotalPosts DESC
+LIMIT 500;

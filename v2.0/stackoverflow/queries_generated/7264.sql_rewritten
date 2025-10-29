@@ -1,0 +1,164 @@
+-- {"query": "7264.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1851} 
+WITH UserPostStats AS (
+  SELECT 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(p.Id) as TotalPosts,
+    COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) as QuestionCount,
+    COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) as AnswerCount,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) as TotalQuestionScore,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) as TotalAnswerScore,
+    AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END) as AvgQuestionScore,
+    AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE NULL END) as AvgAnswerScore,
+    MAX(p.CreationDate) as LastPostDate
+  FROM Users u
+  LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+  WHERE u.Id IS NOT NULL
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopTags AS (
+  SELECT 
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId,
+    t.WikiPostId,
+    CASE 
+      WHEN t.Count > 1000 THEN 'High'
+      WHEN t.Count > 100 THEN 'Medium'
+      ELSE 'Low'
+    END as TagLevel,
+    ROW_NUMBER() OVER (ORDER BY t.Count DESC) as Rank
+  FROM Tags t
+  WHERE t.TagName IS NOT NULL
+),
+PostActivity AS (
+  SELECT 
+    p.Id as PostId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.PostTypeId,
+    p.Tags,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    DATEDIFF(day, p.CreationDate, COALESCE(p.ClosedDate, p.LastActivityDate, cast('2024-10-01 12:34:56' as timestamp))) as AgeInDays,
+    CASE 
+      WHEN p.PostTypeId = 1 AND p.Score > 10 THEN 'HighlyVotedQuestion'
+      WHEN p.PostTypeId = 1 AND p.Score > 0 THEN 'RegularQuestion'
+      WHEN p.PostTypeId = 2 AND p.Score > 5 THEN 'HighlyVotedAnswer'
+      WHEN p.PostTypeId = 2 AND p.Score > 0 THEN 'RegularAnswer'
+      ELSE 'Other'
+    END as PostCategory,
+    COALESCE(p.LastActivityDate, p.CreationDate) as EffectiveActivityDate
+  FROM Posts p
+  WHERE p.Id IS NOT NULL AND p.CreationDate IS NOT NULL
+)
+SELECT 
+  'Performance Benchmark Report' as ReportTitle,
+  COUNT(*) as TotalRecords,
+  COUNT(DISTINCT ups.UserId) as ActiveUsers,
+  COUNT(DISTINCT pa.PostId) as TotalPosts,
+  COUNT(CASE WHEN pa.PostCategory LIKE '%Question%' THEN 1 END) as TotalQuestions,
+  COUNT(CASE WHEN pa.PostCategory LIKE '%Answer%' THEN 1 END) as TotalAnswers,
+  (SELECT COUNT(*) FROM Badges) as TotalBadges,
+  (SELECT COUNT(*) FROM Comments) as TotalComments,
+  (SELECT COUNT(*) FROM PostLinks) as TotalLinks,
+  (SELECT AVG(Score) FROM Posts) as AvgPostScore,
+  (SELECT AVG(Reputation) FROM Users) as AvgUserReputation,
+  SUM(CASE WHEN pa.PostTypeId = 1 THEN 1 ELSE 0 END) as QuestionCount,
+  SUM(CASE WHEN pa.PostTypeId = 2 THEN 1 ELSE 0 END) as AnswerCount,
+  SUM(pa.ViewCount) as TotalViews,
+  SUM(pa.Score) as TotalScore,
+  MAX(pa.CreationDate) as LatestPostDate,
+  MIN(pa.CreationDate) as EarliestPostDate,
+  AVG(pa.AgeInDays) as AvgAgeInDays,
+  STRING_AGG(CASE WHEN pt.Rank <= 10 THEN pt.TagName ELSE NULL END, ', ') WITHIN GROUP (ORDER BY pt.Rank) as TopTags,
+  COUNT(*) OVER() as TotalRows,
+  ROW_NUMBER() OVER (ORDER BY ups.Reputation DESC) as ReputationRank,
+  CASE 
+    WHEN ups.Reputation > 100000 THEN 'Elite'
+    WHEN ups.Reputation > 50000 THEN 'Veteran'
+    WHEN ups.Reputation > 10000 THEN 'Experienced'
+    ELSE 'Beginner'
+  END as UserTier
+FROM UserPostStats ups
+FULL OUTER JOIN PostActivity pa ON ups.UserId = pa.OwnerUserId
+LEFT JOIN TopTags pt ON pt.TagLevel = 'High' OR pt.Rank <= 5
+WHERE (ups.UserId IS NOT NULL OR pa.PostId IS NOT NULL)
+GROUP BY 
+  ups.UserId, ups.DisplayName, ups.Reputation, ups.TotalPosts, ups.QuestionCount, 
+  ups.AnswerCount, ups.TotalQuestionScore, ups.TotalAnswerScore, ups.AvgQuestionScore, 
+  ups.AvgAnswerScore, ups.LastPostDate, pa.PostId, pa.Title, pa.Score, pa.ViewCount, 
+  pa.CreationDate, pa.OwnerUserId, pa.PostTypeId, pa.Tags, pa.AnswerCount, pa.CommentCount,
+  pa.FavoriteCount, pa.AgeInDays, pa.PostCategory, pa.EffectiveActivityDate, pt.TagName, pt.Count, pt.ExcerptPostId, pt.WikiPostId, pt.TagLevel, pt.Rank
+HAVING 
+  COUNT(*) > 0 
+  AND (COUNT(ups.UserId) > 0 OR COUNT(pa.PostId) > 0)
+  AND (MAX(pa.CreationDate) > '2020-01-01' OR MAX(ups.LastPostDate) > '2020-01-01')
+  AND (COUNT(*) = (SELECT COUNT(*) FROM Users) OR COUNT(*) = (SELECT COUNT(*) FROM Posts))
+UNION ALL
+SELECT 
+  'Statistical Summary' as ReportTitle,
+  NULL as TotalRecords,
+  NULL as ActiveUsers,
+  NULL as TotalPosts,
+  NULL as TotalQuestions,
+  NULL as TotalAnswers,
+  NULL as TotalBadges,
+  NULL as TotalComments,
+  NULL as TotalLinks,
+  (SELECT AVG(Score) FROM Votes) as AvgPostScore,
+  (SELECT AVG(Reputation) FROM Users) as AvgUserReputation,
+  SUM(CASE WHEN PostTypeId = 1 THEN 1 ELSE 0 END) as QuestionCount,
+  SUM(CASE WHEN PostTypeId = 2 THEN 1 ELSE 0 END) as AnswerCount,
+  SUM(ViewCount) as TotalViews,
+  SUM(Score) as TotalScore,
+  MAX(CreationDate) as LatestPostDate,
+  MIN(CreationDate) as EarliestPostDate,
+  AVG(DATEDIFF(day, CreationDate, COALESCE(ClosedDate, LastActivityDate, cast('2024-10-01 12:34:56' as timestamp)))) as AvgAgeInDays,
+  STRING_AGG(Tags, ', ') WITHIN GROUP (ORDER BY Id) as TopTags,
+  COUNT(*) OVER() as TotalRows,
+  NULL as ReputationRank,
+  CASE 
+    WHEN AVG(Reputation) > 100000 THEN 'Elite'
+    ELSE 'Standard'
+  END as UserTier
+FROM Posts p
+WHERE 
+  p.Id IS NOT NULL
+  AND p.CreationDate IS NOT NULL
+  AND p.Score IS NOT NULL
+  AND (p.PostTypeId IN (1, 2) OR p.PostTypeId IS NULL)
+  AND EXISTS (
+    SELECT 1 FROM Users u 
+    WHERE u.Id = p.OwnerUserId 
+    AND u.Reputation IS NOT NULL 
+    AND u.Reputation > 0
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM Posts p2 
+    WHERE p2.Id = p.Id 
+    AND p2.Title IS NULL
+  )
+  AND COALESCE(p.ParentId, 0) > 0
+  AND LENGTH(COALESCE(p.Title, '')) > 0
+  AND (
+    p.Score > 0 
+    OR EXISTS (
+      SELECT 1 FROM Votes v 
+      WHERE v.PostId = p.Id 
+      AND v.VoteTypeId IN (1, 2, 3)
+    )
+  )
+  AND COALESCE(p.AnswerCount, 0) >= 0
+  AND COALESCE(p.CommentCount, 0) >= 0
+  AND COALESCE(p.FavoriteCount, 0) >= 0
+  AND DATEDIFF(day, p.CreationDate, COALESCE(p.ClosedDate, p.LastActivityDate, cast('2024-10-01 12:34:56' as timestamp))) >= -365
+ORDER BY 
+  CASE WHEN ReportTitle = 'Performance Benchmark Report' THEN 1 ELSE 2 END,
+  TotalPosts DESC,
+  AvgUserReputation DESC;

@@ -1,0 +1,146 @@
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.ViewCount > 1000 THEN p.Id END) AS HighViewQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.Score > 10 THEN p.Id END) AS HighScoreAnswers,
+    COUNT(DISTINCT b.Id) AS BadgesEarned,
+    COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+    ROUND(AVG(CAST(p.Score AS DOUBLE PRECISION)), 2) AS AvgPostScore,
+    MAX(p.CreationDate) AS LastPostDate,
+    MIN(p.CreationDate) AS FirstPostDate,
+    CAST((EXTRACT(EPOCH FROM MAX(p.CreationDate)) - EXTRACT(EPOCH FROM MIN(p.CreationDate))) / 86400 AS INTEGER) AS DaysActive,
+    COUNT(DISTINCT c.Id) AS CommentsMade,
+    COUNT(DISTINCT pl.Id) AS LinksCreated,
+    COUNT(DISTINCT ph.Id) AS PostHistoryActions,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p2 
+        WHERE p2.OwnerUserId = u.Id 
+          AND p2.PostTypeId = 1 
+          AND p2.ClosedDate IS NOT NULL
+    ) AS ClosedQuestions,
+    ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY COUNT(DISTINCT p.Id) DESC, u.Reputation DESC) AS UserPostRanking,
+    (
+        SELECT t.TagName
+        FROM (
+            SELECT t_inner.TagName, COUNT(*) AS cnt
+            FROM Posts p3
+            INNER JOIN Posts p4 ON p3.Id = p4.ParentId
+            LEFT JOIN Tags t_inner ON t_inner.TagName = SUBSTRING(p3.Tags FROM 2 FOR CHAR_LENGTH(p3.Tags)-2)
+            WHERE p3.OwnerUserId = u.Id
+              AND p3.PostTypeId = 1
+            GROUP BY t_inner.TagName
+            ORDER BY cnt DESC
+            LIMIT 1
+        ) s
+    ) AS TopTag,
+    (
+        SELECT 
+            CASE 
+                WHEN TotalPosts > 0 THEN (CAST(HighScoreAnswers AS DOUBLE PRECISION) / NULLIF(CAST(TotalPosts AS DOUBLE PRECISION), 0)) * 100
+                ELSE 0
+            END
+        FROM (
+            SELECT 
+                u2.Id AS UserId,
+                COUNT(DISTINCT p5.Id) AS TotalPosts,
+                COUNT(DISTINCT CASE WHEN p5.PostTypeId = 1 THEN p5.Id END) AS Questions,
+                COUNT(DISTINCT CASE WHEN p5.PostTypeId = 2 THEN p5.Id END) AS Answers,
+                COUNT(DISTINCT CASE WHEN p5.PostTypeId = 1 AND p5.ViewCount > 1000 THEN p5.Id END) AS HighViewQuestions,
+                COUNT(DISTINCT CASE WHEN p5.PostTypeId = 2 AND p5.Score > 10 THEN p5.Id END) AS HighScoreAnswers,
+                COUNT(DISTINCT b2.Id) AS BadgesEarned,
+                MAX(p5.CreationDate) AS LastPostDate,
+                MIN(p5.CreationDate) AS FirstPostDate
+            FROM Users u2
+            LEFT JOIN Posts p5 ON u2.Id = p5.OwnerUserId
+            LEFT JOIN Badges b2 ON u2.Id = b2.UserId
+            WHERE u2.Id = u.Id
+            GROUP BY u2.Id
+        ) ue
+    ) AS AnswerQualityPercentage,
+    (
+        SELECT STRING_AGG(
+            CASE 
+                WHEN p5.PostTypeId = 1 THEN 'Q:' || CAST(p5.Id AS VARCHAR)
+                WHEN p5.PostTypeId = 2 THEN 'A:' || CAST(p5.Id AS VARCHAR)
+                ELSE 'O:' || CAST(p5.Id AS VARCHAR)
+            END,
+            '; '
+        )
+        FROM Posts p5
+        WHERE p5.OwnerUserId = u.Id
+          AND p5.CreationDate > (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year')
+    ) AS RecentPostIds,
+    COALESCE(
+        (
+            SELECT Title
+            FROM Posts p6
+            WHERE p6.OwnerUserId = u.Id
+              AND p6.PostTypeId = 1
+              AND p6.Title IS NOT NULL
+            ORDER BY p6.CreationDate DESC
+            LIMIT 1
+        ),
+        'No Questions'
+    ) AS LatestQuestionTitle,
+    CASE 
+        WHEN u.Reputation >= 10000 AND u.ViewCount > 10000 THEN 'Elite'
+        WHEN u.Reputation >= 5000 AND u.ViewCount > 5000 THEN 'Veteran'
+        WHEN u.Reputation >= 1000 AND u.ViewCount > 1000 THEN 'Regular'
+        WHEN u.Reputation >= 100 THEN 'Newbie'
+        ELSE 'Beginner'
+    END AS UserCategory,
+    (
+        RIGHT('000000000' || CAST(u.Reputation AS VARCHAR), 9) ||
+        '|' ||
+        CAST(CAST((EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP)) ) - EXTRACT(EPOCH FROM u.CreationDate)) / 86400 AS INTEGER) AS VARCHAR) ||
+        '|' ||
+        CASE WHEN u.WebsiteUrl IS NOT NULL THEN 'Y' ELSE 'N' END ||
+        '|' ||
+        CASE WHEN u.AboutMe IS NOT NULL AND CHAR_LENGTH(u.AboutMe) > 0 THEN 'Y' ELSE 'N' END ||
+        '|' ||
+        CAST(COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS VARCHAR)
+    ) AS ProfileCompletionMetrics
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN Comments c ON u.Id = c.UserId
+LEFT JOIN PostLinks pl ON u.Id = pl.RelatedPostId OR u.Id = pl.PostId
+LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+WHERE 
+    u.Id BETWEEN 1 AND 50000
+    AND (
+        p.Id IS NULL 
+        OR (p.CreationDate > (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '2 years') AND p.CreationDate < CAST('2024-10-01 12:34:56' AS TIMESTAMP))
+    )
+    AND (
+        b.Id IS NULL 
+        OR b.Date > (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year')
+    )
+GROUP BY 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.ViewCount,
+    u.CreationDate,
+    u.WebsiteUrl,
+    u.AboutMe
+HAVING 
+    COUNT(DISTINCT p.Id) > 0
+    AND (
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 0
+        OR COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) > 0
+    )
+ORDER BY 
+    u.Reputation DESC,
+    COUNT(DISTINCT p.Id) DESC,
+    (
+        SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 2
+    ) DESC
+LIMIT 1000 OFFSET 0;

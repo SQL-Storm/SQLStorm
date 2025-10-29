@@ -1,0 +1,135 @@
+-- {"query": "5692.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1118} 
+WITH
+-- sample benchmark: complex join network with windowed aggregates and correlated subqueries
+RecentActivity AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.Title,
+    p.Tags,
+    COALESCE(p.AnswerCount, 0) AS AnswerCount,
+    COALESCE(p.CommentCount, 0) AS CommentCount,
+    COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    u.DisplayName,
+    u.Location,
+    v.VoteTypeId,
+    v.UserId AS VoterUserId,
+    v.CreationDate AS VoteDate,
+    bt.Name AS BadgeName,
+    bt.Class AS BadgeClass
+  FROM
+    Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN Badges bt ON bt.UserId = u.Id
+  WHERE
+    p.LastActivityDate >= (CURRENT_DATE - INTERVAL '180 days')
+),
+-- compute per-post activity diversity metrics using window functions
+PostMetrics AS (
+  SELECT
+    PostId,
+    PostTypeId,
+    OwnerUserId,
+    CreationDate,
+    LastActivityDate,
+    Title,
+    Tags,
+    Score,
+    ViewCount,
+    AnswerCount,
+    CommentCount,
+    FavoriteCount,
+    Reputation,
+    UserCreationDate,
+    DisplayName,
+    Location,
+    COUNT(DISTINCT VoteTypeId) OVER (PARTITION BY PostId) AS DistinctVoteTypes,
+    MAX(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY PostId) AS HasUpvote,
+    MAX(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) OVER (PARTITION BY PostId) AS HasDownvote,
+    MAX(CASE WHEN BadgeClass = 1 THEN 1 ELSE 0 END) OVER (PARTITION BY PostId) AS HasGoldBadge,
+    MAX(CASE WHEN BadgeClass = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY PostId) AS HasSilverBadge,
+    MAX(CASE WHEN BadgeClass = 3 THEN 1 ELSE 0 END) OVER (PARTITION BY PostId) AS HasBronzeBadge
+  FROM
+    RecentActivity
+),
+-- correlated subquery to fetch top related posts by same tags with a slight skew on recent activity
+RelatedTop AS (
+  SELECT
+    rp.Id AS RelatedPostId,
+    rp.Title AS RelatedTitle,
+    rp.Tags AS RelatedTags,
+    rp.CreationDate AS RelatedCreationDate,
+    rp.ViewCount AS RelatedViews,
+    rp.Score AS RelatedScore,
+    ROW_NUMBER() OVER (PARTITION BY rp.Tags ORDER BY rp.Score DESC, rp.CreationDate DESC) AS rn
+  FROM
+    Posts rp
+  WHERE
+    rp.Id <> (SELECT PostId FROM RecentActivity WHERE PostId = rp.Id LIMIT 1)
+    AND rp.LastActivityDate >= (CURRENT_DATE - INTERVAL '90 days')
+),
+-- final selection combining metrics, correlations, and additional computed fields
+Final AS (
+  SELECT
+    pm.PostId,
+    pm.PostTypeId,
+    pm.OwnerUserId,
+    pm.CreationDate,
+    pm.LastActivityDate,
+    pm.Title,
+    pm.Tags,
+    pm.Score,
+    pm.ViewCount,
+    pm.AnswerCount,
+    pm.CommentCount,
+    pm.FavoriteCount,
+    pm.Reputation,
+    pm.UserCreationDate,
+    pm.DisplayName,
+    pm.Location,
+    pm.DistinctVoteTypes,
+    pm.HasUpvote,
+    pm.HasDownvote,
+    pm.HasGoldBadge,
+    pm.HasSilverBadge,
+    pm.HasBronzeBadge,
+    -- string-based transformation on tags for stress testing string expressions
+    LOWER(REGEXP_REPLACE(pm.Tags, '[<>]', '', 'g')) AS NormalizedTags,
+    -- nested windowed metric: rank of post among all posts by the same owner by LastActivityDate
+    RANK() OVER (PARTITION BY pm.OwnerUserId ORDER BY pm.LastActivityDate DESC) AS OwnerRecentRank,
+    -- correlated scalar subquery: total number of related posts for the same tags (imitates complex predicate)
+    (SELECT COUNT(*) FROM RelatedTop r WHERE r.RelatedTags = pm.Tags AND r.rn <= 10) AS TopRelatedCount,
+    -- set operation: union a synthetic row to stress planner
+    (pm.PostId) AS SyntheticKey
+  FROM
+    PostMetrics pm
+  LEFT JOIN RelatedTop rt ON rt.Rn = 1 -- dummy join to introduce correlation
+  WHERE
+    pm.LastActivityDate >= (CURRENT_DATE - INTERVAL '365 days')
+)
+SELECT DISTINCT
+  f.PostId,
+  f.Title,
+  f.Tags,
+  f.ViewCount,
+  f.Score,
+  f.DistinctVoteTypes,
+  f.HasUpvote,
+  f.HasBronzeBadge,
+  f.NormalizedTags,
+  f.OwnerRecentRank,
+  f.TopRelatedCount
+FROM
+  Final f
+ORDER BY
+  f.OwnerRecentRank ASC,
+  f.Score DESC
+LIMIT 100;

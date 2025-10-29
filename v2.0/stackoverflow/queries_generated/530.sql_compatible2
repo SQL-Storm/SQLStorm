@@ -1,0 +1,370 @@
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.location,
+        u.creationdate,
+        u.upvotes,
+        u.downvotes,
+        u.views,
+        coalesce(nullif(trim(u.websiteurl), ''), 'N/A') as websiteurl,
+        case
+            when u.location ilike '%remote%' then 'Remote-ish'
+            when u.location is null then 'Unknown'
+            else split_part(u.location, ',', 1)
+        end as location_bucket
+    from users u
+    where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+user_badge_stats as (
+    select
+        b.userid,
+        count(*) as total_badges,
+        sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+        sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+        sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+        min(b.date) as first_badge_date,
+        max(b.date) as last_badge_date
+    from badges b
+    group by b.userid
+),
+q_posts as (
+    select
+        p.id,
+        p.owneruserid as user_id,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        p.favoritecount,
+        p.answercount,
+        p.commentcount,
+        p.acceptedanswerid,
+        p.title,
+        p.tags,
+        string_to_array(substring(p.tags, 2, greatest(length(p.tags)-2,0)), '><') as tag_array
+    from posts p
+    where p.posttypeid = 1
+),
+a_posts as (
+    select
+        p.id,
+        p.parentid as question_id,
+        p.owneruserid as user_id,
+        p.creationdate,
+        p.score,
+        p.commentcount
+    from posts p
+    where p.posttypeid = 2
+),
+-- Replace set-returning unnest inside aggregate by expanding tags in a derived table before aggregation
+question_activity as (
+    select
+        q.user_id,
+        count(distinct q.id) as q_count,
+        avg(q.score) as q_avg_score,
+        sum(case when q.score > 0 then 1 else 0 end) as q_positive,
+        sum(coalesce(q.viewcount,0)) as q_views,
+        max(q.creationdate) as last_q_date,
+        count(distinct case when q.acceptedanswerid is not null then q.id end) as q_with_accepted,
+        count(distinct t.tagname) as distinct_tag_uses
+    from q_posts q
+    left join lateral (
+        select lower(trim(t)) as tagname
+        from unnest(q.tag_array) as t
+        where t is not null and t <> ''
+    ) t on true
+    group by q.user_id
+),
+answer_activity as (
+    select
+        a.user_id,
+        count(*) as a_count,
+        avg(a.score) as a_avg_score,
+        sum(case when a.score > 0 then 1 else 0 end) as a_positive,
+        max(a.creationdate) as last_a_date
+    from a_posts a
+    group by a.user_id
+),
+tag_pref as (
+    select
+        q.user_id,
+        lower(trim(t)) as tagname,
+        count(*) as tag_uses
+    from q_posts q
+    cross join lateral unnest(q.tag_array) as t
+    where t is not null and t <> ''
+    group by q.user_id, lower(trim(t))
+),
+top_tag_per_user as (
+    select user_id, tagname, tag_uses,
+           row_number() over (partition by user_id order by tag_uses desc, tagname) as rn
+    from tag_pref
+),
+user_votes as (
+    select
+        v.postid,
+        v.userid,
+        v.votetypeid,
+        v.creationdate,
+        count(*) as cnt
+    from votes v
+    group by v.postid, v.userid, v.votetypeid, v.creationdate
+),
+post_vote_agg as (
+    select
+        p.id as post_id,
+        sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+        sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+        sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+        sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_total
+    from posts p
+    left join votes v on v.postid = p.id
+    group by p.id
+),
+post_links_class as (
+    select
+        pl.postid,
+        sum(case when pl.linktypeid = 1 then 1 else 0 end) as linked_count,
+        sum(case when pl.linktypeid = 3 then 1 else 0 end) as dup_count,
+        min(pl.creationdate) as first_link_date
+    from postlinks pl
+    group by pl.postid
+),
+closure_events as (
+    select
+        ph.postid,
+        count(*) filter (where ph.posthistorytypeid = 10) as close_events,
+        max(case when ph.posthistorytypeid = 10 then ph.creationdate end) as last_closed_at,
+        max(case when ph.posthistorytypeid = 10 then
+            case
+                when coalesce(nullif(ph.comment,''), '') = '' then null
+                when regexp_replace(coalesce(nullif(ph.comment,''), ''), '\D','','g') = '' then null
+                else cast(regexp_replace(coalesce(nullif(ph.comment,''), ''), '\D','','g') as integer)
+            end
+        end) as last_close_reason_id
+    from posthistory ph
+    where ph.posthistorytypeid in (10,11,12,13,14,15,19,20,35,36,37,38)
+    group by ph.postid
+),
+user_most_recent_posts as (
+    select
+        p.owneruserid as user_id,
+        p.id as post_id,
+        p.posttypeid,
+        p.creationdate,
+        row_number() over (partition by p.owneruserid order by p.creationdate desc, p.id desc) as rn
+    from posts p
+    where p.owneruserid is not null
+),
+user_recent_post_detail as (
+    select
+        u.user_id,
+        mp.post_id,
+        mp.posttypeid,
+        mp.creationdate as post_date,
+        pv.upvotes,
+        pv.downvotes,
+        pv.favorites,
+        pv.bounty_total,
+        pl.linked_count,
+        pl.dup_count,
+        ce.close_events,
+        ce.last_closed_at,
+        ce.last_close_reason_id
+    from (select * from user_most_recent_posts where rn = 1) mp
+    join recent_users u on u.user_id = mp.user_id
+    left join post_vote_agg pv on pv.post_id = mp.post_id
+    left join post_links_class pl on pl.postid = mp.post_id
+    left join closure_events ce on ce.postid = mp.post_id
+),
+user_comment_stats as (
+    select
+        c.userid as user_id,
+        count(*) as comment_count,
+        avg(c.score) as avg_comment_score,
+        max(c.creationdate) as last_comment_date,
+        sum(case when c.text ilike '%thanks%' then 1 else 0 end) as thanks_count
+    from comments c
+    where c.userid is not null
+    group by c.userid
+),
+question_answer_mix as (
+    select
+        u.user_id,
+        coalesce(qa.q_count,0) as q_count,
+        coalesce(aa.a_count,0) as a_count,
+        case
+            when coalesce(qa.q_count,0) + coalesce(aa.a_count,0) = 0 then null
+            else round(100.0 * coalesce(qa.q_count,0) / (coalesce(qa.q_count,0) + coalesce(aa.a_count,0)), 2)
+        end as pct_questions
+    from recent_users u
+    left join question_activity qa on qa.user_id = u.user_id
+    left join answer_activity aa on aa.user_id = u.user_id
+),
+accepted_answer_lag as (
+    select
+        q.id as question_id,
+        q.owneruserid as asker_id,
+        q.acceptedanswerid,
+        q.creationdate as q_date,
+        a.creationdate as a_date,
+        extract(epoch from (a.creationdate - q.creationdate)) / 3600.0 as hours_to_accept
+    from posts q
+    left join posts a on a.id = q.acceptedanswerid
+    where q.posttypeid = 1
+),
+user_accept_speed as (
+    select
+        asker_id as user_id,
+        avg(hours_to_accept) as avg_hours_to_accept,
+        percentile_cont(0.5) within group (order by hours_to_accept) as median_hours_to_accept
+    from accepted_answer_lag
+    where hours_to_accept is not null and hours_to_accept >= 0
+    group by asker_id
+),
+user_quality_score as (
+    select
+        u.user_id,
+        coalesce(qa.q_avg_score, 0) as q_avg_score,
+        coalesce(aa.a_avg_score, 0) as a_avg_score,
+        coalesce(b.total_badges, 0) as total_badges,
+        coalesce(b.gold_badges, 0) as gold_badges,
+        coalesce(cs.comment_count,0) as comment_count,
+        coalesce(pv.upvotes,0) + coalesce(pv.favorites,0) - 2 * coalesce(pv.downvotes,0) as last_post_engagement,
+        coalesce(um.median_hours_to_accept, 9999) as median_hours_to_accept,
+        round(
+            (0.5 * coalesce(aa.a_avg_score,0)) +
+            (0.3 * coalesce(qa.q_avg_score,0)) +
+            (0.1 * least(coalesce(b.gold_badges,0), 10)) +
+            (0.1 * greatest(least(coalesce(cs.comment_count,0), 100), 0)) / 10.0 +
+            (case when coalesce(um.median_hours_to_accept,9999) < 24 then 1 else 0 end) * 1.0 +
+            (least(coalesce(pv.upvotes,0) - coalesce(pv.downvotes,0), 50) / 10.0)
+        , 2) as composite_quality
+    from recent_users u
+    left join question_activity qa on qa.user_id = u.user_id
+    left join answer_activity aa on aa.user_id = u.user_id
+    left join user_badge_stats b on b.userid = u.user_id
+    left join user_comment_stats cs on cs.user_id = u.user_id
+    left join user_recent_post_detail pv on pv.user_id = u.user_id
+    left join user_accept_speed um on um.user_id = u.user_id
+),
+dupe_graph as (
+    select
+        q.id as question_id,
+        count(*) as dup_inbound
+    from posts q
+    left join postlinks pl on pl.relatedpostid = q.id and pl.linktypeid = 3
+    where q.posttypeid = 1
+    group by q.id
+),
+tag_popularity as (
+    select
+        lower(trim(t.tagname)) as tagname,
+        t.count as global_tag_count
+    from tags t
+),
+final as (
+    select
+        u.user_id,
+        u.displayname,
+        u.location_bucket,
+        u.reputation,
+        u.upvotes - u.downvotes as net_votes,
+        coalesce(qa.q_count,0) as questions,
+        coalesce(aa.a_count,0) as answers,
+        qam.pct_questions,
+        coalesce(b.total_badges,0) as badges_total,
+        coalesce(b.gold_badges,0) as badges_gold,
+        coalesce(b.silver_badges,0) as badges_silver,
+        coalesce(b.bronze_badges,0) as badges_bronze,
+        td.tagname as top_tag,
+        td.tag_uses as top_tag_uses,
+        tp.global_tag_count as top_tag_global_count,
+        rd.post_id as last_post_id,
+        rd.posttypeid as last_post_type,
+        rd.post_date,
+        rd.upvotes as last_post_up,
+        rd.downvotes as last_post_down,
+        rd.favorites as last_post_fav,
+        rd.bounty_total as last_post_bounty,
+        rd.linked_count as last_post_linked_refs,
+        rd.dup_count as last_post_dup_refs,
+        rd.close_events as last_post_close_events,
+        rd.last_closed_at,
+        rd.last_close_reason_id,
+        cs.comment_count,
+        cs.avg_comment_score,
+        cs.last_comment_date,
+        cs.thanks_count,
+        uqs.composite_quality,
+        row_number() over (
+            order by
+                uqs.composite_quality desc nulls last,
+                coalesce(aa.a_count,0) desc,
+                coalesce(qa.q_count,0) desc,
+                u.reputation desc,
+                u.user_id
+        ) as quality_rank
+    from recent_users u
+    left join question_activity qa on qa.user_id = u.user_id
+    left join answer_activity aa on aa.user_id = u.user_id
+    left join question_answer_mix qam on qam.user_id = u.user_id
+    left join user_badge_stats b on b.userid = u.user_id
+    left join user_recent_post_detail rd on rd.user_id = u.user_id
+    left join user_comment_stats cs on cs.user_id = u.user_id
+    left join user_quality_score uqs on uqs.user_id = u.user_id
+    left join (select user_id, tagname, tag_uses from top_tag_per_user where rn = 1) td on td.user_id = u.user_id
+    left join tag_popularity tp on tp.tagname = td.tagname
+)
+select
+    f.*,
+    case
+        when f.badges_gold >= 5 and f.composite_quality >= 10 then 'Elite'
+        when f.badges_gold >= 1 and f.composite_quality >= 7 then 'Advanced'
+        when f.composite_quality is null then 'Unknown'
+        else 'Regular'
+    end as quality_tier,
+    case
+        when f.top_tag is null then null
+        else json_build_object(
+            'tag', f.top_tag,
+            'userTagUses', f.top_tag_uses,
+            'globalTagUses', f.top_tag_global_count,
+            'normalized', case when coalesce(f.top_tag_global_count,0) > 0
+                               then round(1.0 * coalesce(f.top_tag_uses,0) / f.top_tag_global_count, 4)
+                               else null end
+        )
+    end as top_tag_metrics,
+    (
+        select json_agg(x)
+        from (
+            select
+                p.id as question_id,
+                p.creationdate as created,
+                p.score,
+                coalesce(pl.dup_count,0) as dup_inbound,
+                coalesce(pv.upvotes,0) as upvotes,
+                coalesce(pv.downvotes,0) as downvotes
+            from posts p
+            left join post_links_class pl on pl.postid = p.id
+            left join post_vote_agg pv on pv.post_id = p.id
+            where p.posttypeid = 1 and p.owneruserid = f.user_id
+            order by p.score desc nulls last, p.creationdate desc
+            limit 5
+        ) x
+    ) as top_questions_sample
+from final f
+where
+    (
+        (coalesce(f.answers,0) + coalesce(f.questions,0)) >= 3
+        and (coalesce(f.last_post_up,0) - coalesce(f.last_post_down,0)) >= -2
+        and (coalesce(f.badges_total,0) >= 1 or coalesce(f.comment_count,0) >= 5)
+    )
+    or (
+        f.reputation >= (select percentile_cont(0.90) within group (order by reputation) from users)
+        and f.composite_quality is not null
+    )
+order by
+    f.quality_rank
+fetch first 200 rows only;

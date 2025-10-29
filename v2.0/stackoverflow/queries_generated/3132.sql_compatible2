@@ -1,0 +1,136 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.UpVotes, 0) - COALESCE(u.DownVotes, 0) AS NetVotes,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        SUM(CASE b.Class WHEN 1 THEN 1000 WHEN 2 THEN 500 ELSE 100 END) AS BadgeScore,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes
+),
+
+TopUsers AS (
+    SELECT *
+    FROM UserStats
+    WHERE RepRank <= 100
+),
+
+TagInsights AS (
+    SELECT 
+        t.TagName,
+        COUNT(p.Id) AS TagPostCount,
+        AVG(p.Score) AS AvgScore,
+        STRING_AGG(DISTINCT u.DisplayName, ', ') FILTER (WHERE u.Id IS NOT NULL) AS ActiveUsers
+    FROM Tags t
+    LEFT JOIN Posts p 
+        ON p.Tags LIKE ('%' || '<' || t.TagName || '>' || '%')
+    LEFT JOIN Users u 
+        ON u.Id = p.OwnerUserId
+    GROUP BY t.TagName
+    HAVING COUNT(p.Id) > 50
+),
+
+RecentVotes AS (
+    SELECT 
+        v.PostId,
+        MAX(v.CreationDate) AS LastVoteDate,
+        COUNT(*) FILTER (WHERE vt.Name = 'UpMod') AS UpVotes,
+        COUNT(*) FILTER (WHERE vt.Name = 'DownMod') AS DownVotes,
+        SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 WHEN vt.Name = 'DownMod' THEN -1 ELSE 0 END) AS VoteScore
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE v.CreationDate >= CAST(CAST('2024-10-01' AS date) - INTERVAL '30 days' AS date)
+    GROUP BY v.PostId
+),
+
+PostPerformance AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        COALESCE(rv.UpVotes, 0) - COALESCE(rv.DownVotes, 0) AS RecentVoteDelta,
+        rv.VoteScore,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS RankByScore
+    FROM Posts p
+    LEFT JOIN RecentVotes rv ON rv.PostId = p.Id
+    WHERE p.PostTypeId IN (1, 2)
+)
+
+SELECT 
+    tu.Id AS UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.NetVotes,
+    tu.QuestionCount,
+    tu.AnswerCount,
+    tu.BadgeScore,
+    tu.RepRank,
+    pp.Id AS PostId,
+    pp.Title,
+    pp.Score,
+    pp.ViewCount,
+    pp.RecentVoteDelta,
+    pp.VoteScore,
+    pp.RankByScore,
+    ti.TagName,
+    ti.TagPostCount,
+    ti.AvgScore,
+    ti.ActiveUsers
+FROM TopUsers tu
+LEFT JOIN LATERAL (
+    SELECT p.Id, p.Title, p.Score, p.ViewCount, p.PostTypeId, p.OwnerUserId
+    FROM Posts p
+    WHERE p.OwnerUserId = tu.Id
+      AND p.PostTypeId = 2
+    ORDER BY p.Score DESC
+    LIMIT 1
+) pp ON TRUE
+LEFT JOIN LATERAL (
+    SELECT ti.TagName, ti.TagPostCount, ti.AvgScore, ti.ActiveUsers
+    FROM TagInsights ti
+    WHERE EXISTS (
+        SELECT 1
+        FROM Posts p2
+        WHERE p2.OwnerUserId = tu.Id
+          AND p2.Tags LIKE ('%' || '<' || ti.TagName || '>' || '%')
+    )
+    ORDER BY ti.TagPostCount DESC
+    LIMIT 1
+) ti ON TRUE
+ORDER BY tu.RepRank, pp.RankByScore NULLS LAST
+LIMIT 200
+
+UNION ALL
+
+SELECT 
+    CAST(NULL AS bigint) AS UserId,
+    CAST(NULL AS text) AS DisplayName,
+    CAST(NULL AS bigint) AS Reputation,
+    CAST(NULL AS bigint) AS NetVotes,
+    CAST(NULL AS bigint) AS QuestionCount,
+    CAST(NULL AS bigint) AS AnswerCount,
+    CAST(NULL AS bigint) AS BadgeScore,
+    CAST(NULL AS bigint) AS RepRank,
+    p.Id AS PostId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    COALESCE(rv.UpVotes, 0) - COALESCE(rv.DownVotes, 0) AS RecentVoteDelta,
+    rv.VoteScore,
+    ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS RankByScore,
+    CAST(NULL AS text) AS TagName,
+    CAST(NULL AS bigint) AS TagPostCount,
+    CAST(NULL AS numeric) AS AvgScore,
+    CAST(NULL AS text) AS ActiveUsers
+FROM Posts p
+JOIN RecentVotes rv ON rv.PostId = p.Id
+WHERE p.PostTypeId = 1
+  AND p.CreationDate >= CAST(CAST('2024-10-01' AS date) - INTERVAL '7 days' AS date)
+ORDER BY RankByScore
+LIMIT 50;

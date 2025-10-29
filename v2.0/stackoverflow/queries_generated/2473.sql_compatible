@@ -1,0 +1,141 @@
+with recursive RecursivePostParents as (
+    select 
+        p.Id, 
+        p.ParentId, 
+        p.Title,
+        1 as Level
+    from Posts p
+    where p.PostTypeId = 2
+      and p.ParentId is not null
+    union all
+    select 
+        p.Id,
+        p.ParentId,
+        p.Title,
+        r.Level + 1
+    from Posts p
+    join RecursivePostParents r on p.Id = r.ParentId
+    where p.PostTypeId = 2
+),
+UserBadgeStats as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct b.Id) as BadgeCount,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostVoteAggregates as (
+    select 
+        p.Id as PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotesCount,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotesCount,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc) as RankByScore
+    from Posts p
+    left join Votes v on v.PostId = p.Id
+    where p.PostTypeId in (1, 2)
+    group by p.Id, p.OwnerUserId, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount
+),
+TopPostsWithComments as (
+    select
+        pv.PostId,
+        pv.OwnerUserId,
+        pv.PostTypeId,
+        pv.CreationDate,
+        pv.Score,
+        pv.ViewCount,
+        pv.UpVotesCount,
+        pv.DownVotesCount,
+        pv.RankByScore,
+        count(c.Id) as CommentCount,
+        max(c.CreationDate) as LastCommentDate,
+        string_agg(distinct coalesce(u.DisplayName, c.UserDisplayName, 'unknown'), ', ') filter (where c.UserId is not null or c.UserDisplayName is not null) as Commenters
+    from PostVoteAggregates pv
+    left join Comments c on c.PostId = pv.PostId
+    left join Users u on u.Id = c.UserId
+    where pv.RankByScore <= 10
+    group by pv.PostId, pv.OwnerUserId, pv.PostTypeId, pv.CreationDate, pv.Score, pv.ViewCount, pv.UpVotesCount, pv.DownVotesCount, pv.RankByScore
+),
+PostLinksWithDetails as (
+    select 
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.LinkTypeId,
+        lt.Name as LinkTypeName,
+        p.Title as RelatedPostTitle,
+        p.PostTypeId as RelatedPostTypeId,
+        p.Score as RelatedPostScore
+    from PostLinks pl
+    inner join LinkTypes lt on lt.Id = pl.LinkTypeId
+    inner join Posts p on p.Id = pl.RelatedPostId
+    where pl.LinkTypeId in (1, 3)
+),
+FinalAggregated as (
+    select
+        ubs.UserId,
+        ubs.DisplayName,
+        ubs.BadgeCount,
+        ubs.GoldBadges,
+        ubs.SilverBadges,
+        ubs.BronzeBadges,
+        ubs.LastBadgeDate,
+        count(distinct pp.Id) filter (where pp.PostTypeId = 1) as NumQuestions,
+        count(distinct pp.Id) filter (where pp.PostTypeId = 2) as NumAnswers,
+        coalesce(sum(case when pv.UpVotesCount is not null then pv.UpVotesCount else 0 end),0) as TotalUpVotesOnPosts,
+        coalesce(sum(case when pv.DownVotesCount is not null then pv.DownVotesCount else 0 end),0) as TotalDownVotesOnPosts,
+        max(case when pv.Score is not null then pv.Score else 0 end) as MaxPostScore,
+        max(case when pv.ViewCount is not null then pv.ViewCount else 0 end) as MaxPostViews,
+        avg(case when pv.Score is not null then pv.Score else null end) as AvgPostScore,
+        string_agg(distinct tpt.Name, ', ') as PostTypes,
+        max(pp.CreationDate) as LastPostDate
+    from Users ubs
+    left join Posts pp on pp.OwnerUserId = ubs.UserId
+    left join PostVoteAggregates pv on pv.PostId = pp.Id
+    left join PostTypes tpt on tpt.Id = pp.PostTypeId
+    group by ubs.UserId, ubs.DisplayName, ubs.BadgeCount, ubs.GoldBadges, ubs.SilverBadges, ubs.BronzeBadges, ubs.LastBadgeDate
+)
+select 
+    f.UserId,
+    f.DisplayName,
+    f.BadgeCount,
+    f.GoldBadges,
+    f.SilverBadges,
+    f.BronzeBadges,
+    f.LastBadgeDate,
+    f.NumQuestions,
+    f.NumAnswers,
+    f.TotalUpVotesOnPosts,
+    f.TotalDownVotesOnPosts,
+    f.MaxPostScore,
+    f.MaxPostViews,
+    round(f.AvgPostScore::numeric,2) as AvgPostScore,
+    f.PostTypes,
+    f.LastPostDate,
+    coalesce(tp.CommentCount,0) as TopPostCommentCount,
+    tp.LastCommentDate as MostRecentCommentOnTopPost,
+    tp.Commenters,
+    (select string_agg(distinct coalesce(tl.LinkTypeName || '->' || tl.RelatedPostTitle || '(' || tl.RelatedPostScore || ')', ''), '; ')
+     from (
+         select tl.LinkTypeName, tl.RelatedPostTitle, tl.RelatedPostScore
+         from PostLinksWithDetails tl
+         where tl.PostId in (
+             select Id from Posts where OwnerUserId = f.UserId limit 5
+         )
+         limit 5
+     ) q
+    ) as SamplePostLinks
+from FinalAggregated f
+left join TopPostsWithComments tp on tp.OwnerUserId = f.UserId and tp.RankByScore = 1
+where f.BadgeCount > 0
+order by f.TotalUpVotesOnPosts desc, f.BadgeCount desc
+limit 50;

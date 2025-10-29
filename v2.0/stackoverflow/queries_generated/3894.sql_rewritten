@@ -1,0 +1,114 @@
+-- {"query": "3894.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2148} 
+WITH
+    UserStats AS (
+        SELECT
+            u.Id,
+            u.DisplayName,
+            u.Reputation,
+            COALESCE(u.UpVotes, 0) - COALESCE(u.DownVotes, 0) AS NetVotes,
+            (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+            (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadges,
+            (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadges
+        FROM Users u
+    ),
+
+    AnswerMetrics AS (
+        SELECT
+            a.OwnerUserId AS UserId,
+            COUNT(*)                                   AS AnswerCount,
+            AVG(COALESCE(a.Score, 0))                  AS AvgScore,
+            MAX(a.CreationDate)                        AS LastAnswerDate,
+            SUM(CASE WHEN a.Id = p.AcceptedAnswerId THEN 1 ELSE 0 END) AS AcceptedAnswers
+        FROM Posts a
+        LEFT JOIN Posts p ON p.AcceptedAnswerId = a.Id
+        WHERE a.PostTypeId = 2            -- Answers
+        GROUP BY a.OwnerUserId
+    ),
+
+    QuestionTagStats AS (
+        SELECT
+            p.OwnerUserId AS UserId,
+            UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags)-2), '><')) AS Tag,
+            COUNT(*) AS QCount
+        FROM Posts p
+        WHERE p.PostTypeId = 1               -- Questions
+          AND p.Tags IS NOT NULL
+        GROUP BY p.OwnerUserId, Tag
+    ),
+
+    TopTags AS (
+        SELECT
+            UserId,
+            STRING_AGG(Tag, ', ') FILTER (WHERE rn <= 5) AS Top5Tags
+        FROM (
+            SELECT
+                UserId,
+                Tag,
+                ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY QCount DESC) AS rn
+            FROM QuestionTagStats
+        ) t
+        GROUP BY UserId
+    ),
+
+    RecentActivity AS (
+        SELECT
+            u.Id,
+            GREATEST(
+                COALESCE(u.LastAccessDate, TIMESTAMP '1970-01-01'),
+                COALESCE((SELECT MAX(CreationDate) FROM Posts p WHERE p.OwnerUserId = u.Id), TIMESTAMP '1970-01-01'),
+                COALESCE((SELECT MAX(CreationDate) FROM Comments c WHERE c.UserId = u.Id), TIMESTAMP '1970-01-01')
+            ) AS LastActivity
+        FROM Users u
+    ),
+
+    Combined AS (
+        SELECT
+            us.Id,
+            us.DisplayName,
+            us.Reputation,
+            us.NetVotes,
+            us.GoldBadges,
+            us.SilverBadges,
+            us.BronzeBadges,
+            COALESCE(am.AnswerCount, 0)               AS AnswerCount,
+            COALESCE(am.AvgScore, 0)                  AS AvgAnswerScore,
+            COALESCE(am.AcceptedAnswers, 0)           AS AcceptedAnswers,
+            COALESCE(ra.LastActivity, us.CreationDate) AS LastActivityDate,
+            COALESCE(tt.Top5Tags, '')                 AS Top5Tags
+        FROM UserStats us
+        LEFT JOIN AnswerMetrics am   ON am.UserId = us.Id
+        LEFT JOIN RecentActivity ra  ON ra.Id = us.Id
+        LEFT JOIN TopTags tt        ON tt.UserId = us.Id
+    )
+
+-- First result set: high‑reputation or prolific answerers
+SELECT *
+FROM Combined
+WHERE Reputation > 10000
+   OR (AnswerCount >= 100 AND AvgAnswerScore > 5)
+ORDER BY Reputation DESC, AvgAnswerScore DESC
+LIMIT 100
+
+UNION ALL
+
+-- Separator row (all NULLs except a marker)
+SELECT
+    NULL::int          AS Id,
+    '---'::varchar(40) AS DisplayName,
+    NULL::int          AS Reputation,
+    NULL::int          AS NetVotes,
+    NULL::int          AS GoldBadges,
+    NULL::int          AS SilverBadges,
+    NULL::int          AS BronzeBadges,
+    NULL::int          AS AnswerCount,
+    NULL::numeric      AS AvgAnswerScore,
+    NULL::int          AS AcceptedAnswers,
+    NULL::timestamp    AS LastActivityDate,
+    NULL::varchar(4000) AS Top5Tags
+
+INTERSECT
+
+-- Only keep rows of users that have earned at least five gold badges
+SELECT *
+FROM Combined
+WHERE GoldBadges >= 5;

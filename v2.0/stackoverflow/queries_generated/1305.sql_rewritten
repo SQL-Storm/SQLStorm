@@ -1,0 +1,186 @@
+-- {"query": "1305.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2913} 
+WITH RecentHighlyVotedQuestions AS (
+    -- CTE 1: Identifies questions (PostTypeId = 1) with high engagement within the last 3 years.
+    -- Calculates a composite 'activity_score' and ranks them using ROW_NUMBER.
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.CreationDate AS QuestionCreationDate,
+        p.LastActivityDate AS QuestionLastActivityDate,
+        p.Score AS QuestionScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.AcceptedAnswerId,
+        p.Title,
+        p.Tags,
+        COALESCE(p.OwnerDisplayName, u.DisplayName, 'Community') AS OwnerDisplayName, -- NULL logic: Fallback display name
+        -- Complex expression for activity_score, handling potential NULLs and division by zero
+        (p.Score * 5 + COALESCE(p.ViewCount, 0) / NULLIF(10, 0) + COALESCE(p.AnswerCount, 0) * 10 + COALESCE(p.CommentCount, 0) * 2 + COALESCE(p.FavoriteCount, 0) * 20) AS activity_score,
+        ROW_NUMBER() OVER (ORDER BY (p.Score * 5 + COALESCE(p.ViewCount, 0) / 10) DESC, p.CreationDate DESC) AS rn_overall_popularity
+    FROM
+        Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id -- Outer join to get user details
+    WHERE
+        p.PostTypeId = 1
+        AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '3 years' -- Date arithmetic
+        AND p.Score >= 10
+        AND p.ViewCount >= 100
+),
+PostCommentActivity AS (
+    -- CTE 2: Aggregates comment statistics for the highly-voted questions.
+    -- Includes a correlated subquery to find expert commenters.
+    SELECT
+        c.PostId,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        SUM(COALESCE(c.Score, 0)) AS TotalCommentScore,
+        AVG(COALESCE(c.Score, 0)) AS AvgCommentScore,
+        MAX(c.CreationDate) AS LastCommentDate,
+        COUNT(CASE WHEN c.UserId IS NOT NULL THEN 1 END) AS NumberOfCommenters,
+        -- Correlated subquery: Counts commenters on *this* post who have a 'gold' non-tag-based badge and significantly higher reputation than the post owner.
+        (
+            SELECT COUNT(DISTINCT b.UserId)
+            FROM Comments c_inner
+            JOIN Badges b ON c_inner.UserId = b.UserId
+            JOIN Users u_badge ON b.UserId = u_badge.Id
+            JOIN RecentHighlyVotedQuestions rhvq_owner ON c_inner.PostId = rhvq_owner.PostId -- Link back to outer query's PostId
+            JOIN Users u_owner ON rhvq_owner.OwnerUserId = u_owner.Id
+            WHERE c_inner.PostId = c.PostId -- Correlation condition
+              AND b.Class = 1 -- Gold badges
+              AND b.TagBased = FALSE -- Named badges
+              AND b.Name LIKE '%Analyst%' -- String expression: Pattern matching
+              AND u_badge.Reputation > u_owner.Reputation * 1.5 -- Complicated predicate/calculation
+        ) AS GoldBadgeCommentersCount
+    FROM
+        Comments c
+    WHERE
+        c.PostId IN (SELECT PostId FROM RecentHighlyVotedQuestions) -- Non-correlated subquery for filtering
+    GROUP BY
+        c.PostId
+),
+UserPostEditAndBadgeMetrics AS (
+    -- CTE 3: Gathers editor activity and badge information related to the popular questions.
+    -- Uses window functions for per-user and per-post analysis.
+    SELECT
+        ph.PostId,
+        ph.UserId AS EditorUserId,
+        u.DisplayName AS EditorDisplayName,
+        COUNT(ph.Id) AS TotalEdits,
+        MAX(ph.CreationDate) AS LastEditDate,
+        -- Correlated subquery: Checks if the editor has any Gold Tag-Based Badges that match any of the question's tags.
+        (
+            SELECT COUNT(b_inner.Id)
+            FROM Badges b_inner
+            WHERE b_inner.UserId = u.Id
+              AND b_inner.Class = 1 -- Gold badge
+              AND b_inner.TagBased = TRUE
+              AND EXISTS (
+                    -- String expression: Unnesting and checking for tag matches
+                    SELECT 1
+                    FROM unnest(string_to_array(substring(q.Tags, 2, length(q.Tags) - 2), '><')) AS post_tag
+                    WHERE b_inner.Name ILIKE '%' || post_tag || '%'
+                  )
+        ) AS GoldTagBadgesForEditor,
+        -- Window function: Sum of edits by this user across all edited posts in the CTE's scope
+        SUM(COUNT(ph.Id)) OVER (PARTITION BY ph.UserId) AS TotalEditsByUserGlobal,
+        -- Window function: Rank editors by their last edit date for each post
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY MAX(ph.CreationDate) DESC) AS rn_latest_editor_per_post
+    FROM
+        PostHistory ph
+    JOIN Users u ON ph.UserId = u.Id
+    JOIN RecentHighlyVotedQuestions q ON ph.PostId = q.PostId
+    WHERE
+        ph.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9) -- Edit Title, Body, Tags or Rollback (PostHistoryTypes table)
+        AND ph.CreationDate >= q.QuestionCreationDate -- Edits must be after question creation
+    GROUP BY
+        ph.PostId, ph.UserId, u.DisplayName, u.Id, q.Tags
+),
+PostClosureAnalysis AS (
+    -- CTE 4: Analyzes post closure and reopening events.
+    -- Uses LEAD window function to find the next event in sequence for a post, useful for calculating time between closure and reopening.
+    SELECT
+        ph.PostId,
+        ph.CreationDate AS EventDate,
+        ph.PostHistoryTypeId,
+        ph.Comment AS EventComment,
+        cr.Name AS CloseReasonName,
+        LEAD(ph.CreationDate, 1) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS NextEventDate,
+        LEAD(ph.PostHistoryTypeId, 1) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS NextEventTypeId
+    FROM
+        PostHistory ph
+    LEFT JOIN CloseReasonTypes cr ON ph.PostHistoryTypeId = 10 AND ph.Comment ~ '^[0-9]+$' AND ph.Comment::smallint = cr.Id -- NULL logic, type casting, string expression (regex)
+    WHERE
+        ph.PostHistoryTypeId IN (10, 11) -- Post Closed, Post Reopened (PostHistoryTypes table)
+),
+TopUsersWithMultipleRoles AS (
+    -- CTE 5: Identifies users who play multiple roles (owner, commenter, editor) in the highly-voted questions.
+    -- Uses UNION ALL set operator to combine distinct user IDs from different roles.
+    SELECT UserId, 'Owner' AS Role FROM RecentHighlyVotedQuestions WHERE OwnerUserId IS NOT NULL
+    UNION ALL
+    SELECT UserId, 'Commenter' AS Role FROM Comments WHERE PostId IN (SELECT PostId FROM RecentHighlyVotedQuestions) AND UserId IS NOT NULL
+    UNION ALL
+    SELECT EditorUserId, 'Editor' AS Role FROM UserPostEditAndBadgeMetrics WHERE EditorUserId IS NOT NULL
+)
+-- Main query: Joins all CTEs and performs final aggregations, rankings, and conditional logic.
+SELECT
+    rhvq.PostId,
+    rhvq.Title,
+    rhvq.OwnerDisplayName,
+    rhvq.QuestionCreationDate,
+    rhvq.QuestionLastActivityDate,
+    rhvq.QuestionScore,
+    rhvq.ViewCount,
+    rhvq.AnswerCount,
+    pca.TotalComments,
+    pca.AvgCommentScore,
+    pca.LastCommentDate,
+    pca.GoldBadgeCommentersCount,
+    MAX(upem.LastEditDate) AS LastPostEditDate,
+    SUM(upem.TotalEdits) AS TotalUniqueUserEdits,
+    MAX(upem.TotalEditsByUserGlobal) AS MaxEditorEditsAcrossPosts,
+    COUNT(DISTINCT upem.EditorUserId) AS NumberOfEditors,
+    COUNT(DISTINCT CASE WHEN upem.GoldTagBadgesForEditor > 0 THEN upem.EditorUserId END) AS EditorsWithGoldTagBadges,
+    -- Complicated calculation: Average activity duration in days for a post
+    AVG(EXTRACT(EPOCH FROM (rhvq.QuestionLastActivityDate - rhvq.QuestionCreationDate)) / (60 * 60 * 24)) AS AvgPostLifeDays,
+    -- CASE statement: Categorizes posts based on various engagement metrics
+    CASE
+        WHEN rhvq.AnswerCount > 10 AND COALESCE(rhvq.FavoriteCount, 0) > 50 THEN 'High Engagement & Popular'
+        WHEN rhvq.QuestionScore > 50 AND COALESCE(pca.TotalComments, 0) > 20 THEN 'Highly Discussed'
+        WHEN COALESCE(pca.GoldBadgeCommentersCount, 0) > 0 OR COUNT(DISTINCT CASE WHEN upem.GoldTagBadgesForEditor > 0 THEN upem.EditorUserId END) > 0 THEN 'Expert Involved'
+        WHEN rhvq.AcceptedAnswerId IS NOT NULL AND rhvq.AnswerCount > 0 THEN 'Answered & Accepted'
+        ELSE 'General Activity'
+    END AS PostEngagementCategory,
+    -- Window function: Ranks posts by their combined activity score
+    DENSE_RANK() OVER (ORDER BY rhvq.activity_score DESC, rhvq.QuestionCreationDate DESC) AS OverallActivityRank,
+    -- Complicated calculation: Average time in days between a post being closed and then reopened
+    AVG(CASE WHEN pca_close.PostHistoryTypeId = 10 AND pca_close.NextEventTypeId = 11 THEN EXTRACT(EPOCH FROM (pca_close.NextEventDate - pca_close.EventDate)) / (60 * 60 * 24) END) AS AvgDaysClosedBeforeReopen,
+    -- String aggregation: Lists distinct editor display names
+    STRING_AGG(DISTINCT upem.EditorDisplayName, '; ' ORDER BY upem.EditorDisplayName) AS DistinctEditors,
+    -- Correlated subquery: Checks if the post owner also acted as a commenter or editor on any of these posts.
+    (
+        SELECT COUNT(DISTINCT t.UserId)
+        FROM TopUsersWithMultipleRoles t
+        WHERE t.UserId = rhvq.OwnerUserId AND t.Role = 'Owner'
+          AND EXISTS (SELECT 1 FROM TopUsersWithMultipleRoles t2 WHERE t2.UserId = t.UserId AND t2.Role IN ('Commenter', 'Editor'))
+    ) AS OwnerWithMultipleRolesFlag
+FROM
+    RecentHighlyVotedQuestions rhvq
+LEFT JOIN PostCommentActivity pca ON rhvq.PostId = pca.PostId -- Outer join
+LEFT JOIN UserPostEditAndBadgeMetrics upem ON rhvq.PostId = upem.PostId -- Outer join
+LEFT JOIN PostClosureAnalysis pca_close ON rhvq.PostId = pca_close.PostId -- Outer join
+WHERE
+    rhvq.rn_overall_popularity <= 1000 -- Limit to top N popular questions for manageable query scope
+    AND (
+        rhvq.AcceptedAnswerId IS NOT NULL -- NULL logic check
+        OR (COALESCE(pca.TotalComments, 0) > 5 AND COALESCE(upem.TotalEdits, 0) > 2)
+    ) -- Further filtering based on engagement
+    AND COALESCE(LENGTH(rhvq.Tags), 0) > 2 -- Ensure tags exist and are not empty for parsing (string expression)
+GROUP BY
+    rhvq.PostId, rhvq.Title, rhvq.OwnerDisplayName, rhvq.QuestionCreationDate, rhvq.QuestionLastActivityDate, rhvq.QuestionScore,
+    rhvq.ViewCount, rhvq.AnswerCount, rhvq.FavoriteCount, rhvq.activity_score, rhvq.AcceptedAnswerId,
+    pca.TotalComments, pca.AvgCommentScore, pca.LastCommentDate, pca.GoldBadgeCommentersCount,
+    rhvq.Tags -- Tags needed for correlated subquery in `UserPostEditAndBadgeMetrics`
+ORDER BY
+    OverallActivityRank ASC, rhvq.QuestionScore DESC
+LIMIT 500;

@@ -1,0 +1,114 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.UpVotes, 0) - COALESCE(u.DownVotes, 0) AS NetVotes,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes
+),
+QuestionScore AS (
+    SELECT 
+        p.OwnerUserId AS UserId,
+        AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL) AS AvgQuestionScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS MedianQuestionScore, /* fallback: approximate median as avg if PERCENTILE_CONT not available */
+        SUM(CASE WHEN p.FavoriteCount > 10 THEN 1 ELSE 0 END) AS PopularQuestionCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+    GROUP BY p.OwnerUserId
+),
+RecentActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        GREATEST(
+            COALESCE(u.LastAccessDate, TIMESTAMP '1970-01-01'),
+            COALESCE(MAX(v.CreationDate), TIMESTAMP '1970-01-01'),
+            COALESCE(MAX(c.CreationDate), TIMESTAMP '1970-01-01')
+        ) AS LastActivity
+    FROM Users u
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    GROUP BY u.Id, u.LastAccessDate
+),
+UserTagOverlap AS (
+    SELECT 
+        us.Id,
+        STRING_AGG(DISTINCT tg.TagName, ';') FILTER (WHERE tg.TagName IS NOT NULL) AS TagsUsed,
+        COUNT(DISTINCT tg.TagName) AS DistinctTagCount
+    FROM UserStats us
+    LEFT JOIN Posts p ON p.OwnerUserId = us.Id AND p.PostTypeId = 1
+    LEFT JOIN LATERAL (
+        SELECT regexp_split_to_table(p.Tags, '><') AS raw_tag
+    ) split ON true
+    LEFT JOIN Tags tg ON tg.TagName = TRIM(BOTH '<>' FROM split.raw_tag)
+    GROUP BY us.Id
+),
+MainRows AS (
+    SELECT
+        us.Id,
+        us.DisplayName,
+        us.Reputation,
+        us.NetVotes,
+        us.GoldBadges,
+        us.SilverBadges,
+        us.BronzeBadges,
+        us.QuestionCount,
+        us.AnswerCount,
+        qs.AvgQuestionScore,
+        qs.MedianQuestionScore,
+        qs.PopularQuestionCount,
+        ra.LastActivity,
+        uto.TagsUsed,
+        uto.DistinctTagCount,
+        CASE
+            WHEN us.Reputation > 20000 THEN 'Legendary'
+            WHEN us.Reputation > 10000 THEN 'Expert'
+            WHEN us.Reputation > 5000  THEN 'Seasoned'
+            ELSE 'Novice'
+        END AS ReputationTier,
+        COALESCE(us.LastPostDate, TIMESTAMP '1970-01-01') AS LastPostDate
+    FROM UserStats us
+    LEFT JOIN QuestionScore qs ON qs.UserId = us.Id
+    LEFT JOIN RecentActivity ra ON ra.UserId = us.Id
+    LEFT JOIN UserTagOverlap uto ON uto.Id = us.Id
+    WHERE (us.QuestionCount + us.AnswerCount) > 0
+      AND (qs.AvgQuestionScore IS NULL OR qs.AvgQuestionScore > 0)
+      AND us.Reputation IS NOT NULL
+)
+SELECT *
+FROM (
+    SELECT *
+    FROM MainRows
+    ORDER BY Reputation DESC, AvgQuestionScore DESC NULLS LAST
+    LIMIT 10
+
+    UNION ALL
+
+    SELECT
+        CAST(NULL AS bigint) AS Id,
+        CAST('---' AS varchar) AS DisplayName,
+        CAST(NULL AS integer) AS Reputation,
+        CAST(NULL AS integer) AS NetVotes,
+        CAST(NULL AS integer) AS GoldBadges,
+        CAST(NULL AS integer) AS SilverBadges,
+        CAST(NULL AS integer) AS BronzeBadges,
+        CAST(NULL AS integer) AS QuestionCount,
+        CAST(NULL AS integer) AS AnswerCount,
+        CAST(NULL AS numeric) AS AvgQuestionScore,
+        CAST(NULL AS numeric) AS MedianQuestionScore,
+        CAST(NULL AS integer) AS PopularQuestionCount,
+        CAST(NULL AS timestamp) AS LastActivity,
+        CAST(NULL AS varchar) AS TagsUsed,
+        CAST(NULL AS integer) AS DistinctTagCount,
+        CAST('Separator' AS varchar) AS ReputationTier,
+        CAST(NULL AS timestamp) AS LastPostDate
+) t
+LIMIT 0 OFFSET 0;

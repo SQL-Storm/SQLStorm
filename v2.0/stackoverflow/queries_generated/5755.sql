@@ -1,0 +1,43 @@
+-- {"query": "5755.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 526} 
+SELECT
+  u.Id AS UserId,
+  u.DisplayName AS UserName,
+  u.Reputation,
+  u.CreationDate AS UserCreationDate,
+  u.LastAccessDate,
+  COALESCE(u.Location, 'Unknown') AS Location,
+  COUNT(DISTINCT p.Id) AS TotalPosts,
+  SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+  SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+  AVG(v.Score) FILTER (WHERE v.PostId IS NOT NULL) AS AvgVotesPerPost,
+  MAX(p.LastActivityDate) AS LastActivityDate,
+  STRING_AGG(DISTINCT t.Name, ',') AS TagNames,
+  SUM(CASE
+        WHEN v.VoteTypeId = 2 THEN 1
+        WHEN v.VoteTypeId = 6 THEN -1
+        ELSE 0
+      END) AS NetVoteScore,
+  (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id) AS BadgeCount,
+  SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+  SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+  SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+FROM
+  Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+  LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+  LEFT JOIN Tags t ON t.Id = (SELECT tg.Id FROM Tags tg WHERE tg.ExcerptPostId = p.Id OR tg.WikiPostId = p.Id LIMIT 1)
+  LEFT JOIN Badges b ON b.UserId = u.Id
+WHERE
+  u.AccountId IS NOT NULL
+  AND u.Reputation > 100
+  AND (p.CreationDate IS NULL OR p.CreationDate > NOW() - INTERVAL '1 year')
+GROUP BY
+  u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Location
+HAVING
+  COUNT(DISTINCT p.Id) > 5
+ORDER BY
+  NetVoteScore DESC NULLS LAST,
+  TotalPosts DESC
+LIMIT 100;

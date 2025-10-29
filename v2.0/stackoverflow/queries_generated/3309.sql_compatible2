@@ -1,0 +1,194 @@
+WITH
+user_activity AS (
+    SELECT
+        u.Id                         AS user_id,
+        u.DisplayName                AS user_name,
+        u.Reputation                 AS total_rep,
+        u.CreationDate               AS acct_created,
+        COUNT(DISTINCT p.Id)         AS recent_posts,
+        COUNT(DISTINCT c.Id)         AS recent_comments,
+        COUNT(DISTINCT v.Id)         AS recent_votes,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS up_votes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS down_votes,
+        MAX(p.CreationDate)          AS last_post_date,
+        MAX(c.CreationDate)          AS last_comment_date,
+        MAX(v.CreationDate)          AS last_vote_date
+    FROM Users u
+    LEFT JOIN Posts p
+           ON p.OwnerUserId = u.Id
+          AND p.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days')
+    LEFT JOIN Comments c
+           ON c.UserId = u.Id
+          AND c.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days')
+    LEFT JOIN Votes v
+           ON v.UserId = u.Id
+          AND v.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days')
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+user_badges AS (
+    SELECT
+        b.UserId                         AS user_id,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS gold_cnt,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS silver_cnt,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS bronze_cnt,
+        STRING_AGG(DISTINCT b.Name, ', ')  AS badge_list
+    FROM Badges b
+    GROUP BY b.UserId
+),
+user_top_tags AS (
+    SELECT
+        p.OwnerUserId                              AS user_id,
+        tag,
+        COUNT(*)                                   AS tag_use_cnt,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId
+                           ORDER BY COUNT(*) DESC) AS rn
+    FROM (
+        SELECT
+            OwnerUserId,
+            -- remove angle brackets and split tags like "<tag1><tag2>"
+            regexp_split_to_table(regexp_replace(Tags, '[<>]', '', 'g'), '><') AS tag
+        FROM Posts
+        WHERE PostTypeId = 1
+          AND Tags IS NOT NULL
+    ) p
+    GROUP BY p.OwnerUserId, tag
+),
+recent_accepted AS (
+    SELECT
+        a.Id                       AS answer_id,
+        a.OwnerUserId              AS answerer_id,
+        a.CreationDate             AS answer_date,
+        q.Id                       AS question_id,
+        q.Title                    AS question_title,
+        q.Tags                     AS question_tags,
+        q.Score                    AS question_score,
+        a.Score                    AS answer_score,
+        COALESCE(a.FavoriteCount,0) AS answer_fav_cnt,
+        EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))/60 AS minutes_to_answer
+    FROM Posts a
+    JOIN Posts q
+      ON q.Id = a.ParentId
+     AND q.PostTypeId = 1
+    WHERE a.PostTypeId = 2
+      AND q.AcceptedAnswerId = a.Id
+      AND a.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days')
+),
+duplicate_links AS (
+    SELECT
+        pl.PostId                AS duplicate_post_id,
+        pl.RelatedPostId         AS target_post_id,
+        pl.CreationDate          AS link_date,
+        p.Title                  AS duplicate_title,
+        t.Title                  AS target_title,
+        (p.Score - COALESCE(t.Score,0)) AS score_delta
+    FROM PostLinks pl
+    JOIN Posts p  ON p.Id = pl.PostId
+    JOIN Posts t  ON t.Id = pl.RelatedPostId
+    WHERE pl.LinkTypeId = 3
+),
+primary_result AS (
+    SELECT
+        ua.user_id,
+        ua.user_name,
+        ua.total_rep,
+        COALESCE(ub.gold_cnt,0) AS gold_cnt,
+        COALESCE(ub.silver_cnt,0) AS silver_cnt,
+        COALESCE(ub.bronze_cnt,0) AS bronze_cnt,
+        ub.badge_list,
+        ua.recent_posts,
+        ua.recent_comments,
+        ua.recent_votes,
+        ua.up_votes,
+        ua.down_votes,
+        ua.last_post_date,
+        ua.last_comment_date,
+        ua.last_vote_date,
+        COALESCE((
+            SELECT JSON_AGG(JSON_BUILD_OBJECT('tag', tag, 'uses', tag_use_cnt))
+            FROM (
+                SELECT tag, tag_use_cnt
+                FROM user_top_tags utt
+                WHERE utt.user_id = ua.user_id
+                  AND utt.rn <= 5
+                ORDER BY tag_use_cnt DESC
+            ) jt
+        ), CAST('[]' AS json))                         AS top_tags_json,
+        (
+            SELECT ra.answer_id
+            FROM recent_accepted ra
+            WHERE ra.answerer_id = ua.user_id
+            ORDER BY ra.answer_date DESC
+            LIMIT 1
+        )                                 AS latest_accepted_answer_id,
+        (
+            SELECT ra.minutes_to_answer
+            FROM recent_accepted ra
+            WHERE ra.answerer_id = ua.user_id
+            ORDER BY ra.minutes_to_answer
+            LIMIT 1
+        )                                 AS best_answer_speed_min,
+        dl.duplicate_post_id,
+        dl.target_post_id,
+        dl.link_date,
+        dl.duplicate_title,
+        dl.target_title,
+        dl.score_delta
+    FROM user_activity ua
+    LEFT JOIN user_badges ub
+           ON ub.user_id = ua.user_id
+    LEFT JOIN duplicate_links dl
+           ON dl.duplicate_post_id = ua.user_id
+    WHERE
+        (ua.total_rep > 1000 OR COALESCE(ub.gold_cnt,0) >= 1)
+        AND (ua.last_post_date IS NOT NULL
+             OR ua.last_comment_date IS NOT NULL
+             OR ua.last_vote_date IS NOT NULL)
+        AND (COALESCE(ub.bronze_cnt,0) + COALESCE(ub.silver_cnt,0) > 10)
+),
+secondary_result AS (
+    SELECT
+        u.Id                         AS user_id,
+        u.DisplayName                AS user_name,
+        u.Reputation                 AS total_rep,
+        COALESCE(ub.gold_cnt,0)      AS gold_cnt,
+        COALESCE(ub.silver_cnt,0)    AS silver_cnt,
+        COALESCE(ub.bronze_cnt,0)    AS bronze_cnt,
+        ub.badge_list,
+        0                            AS recent_posts,
+        0                            AS recent_comments,
+        0                            AS recent_votes,
+        0                            AS up_votes,
+        0                            AS down_votes,
+        NULL                         AS last_post_date,
+        NULL                         AS last_comment_date,
+        NULL                         AS last_vote_date,
+        CAST('[]' AS json)           AS top_tags_json,
+        NULL                         AS latest_accepted_answer_id,
+        NULL                         AS best_answer_speed_min,
+        NULL                         AS duplicate_post_id,
+        NULL                         AS target_post_id,
+        NULL                         AS link_date,
+        NULL                         AS duplicate_title,
+        NULL                         AS target_title,
+        NULL                         AS score_delta
+    FROM Users u
+    JOIN user_badges ub
+          ON ub.user_id = u.Id
+    LEFT JOIN user_activity ua
+          ON ua.user_id = u.Id
+    WHERE ua.user_id IS NULL
+      AND (COALESCE(ub.gold_cnt,0) + COALESCE(ub.silver_cnt,0) + COALESCE(ub.bronze_cnt,0)) > 0
+)
+SELECT *
+FROM (
+    SELECT * FROM primary_result
+    ORDER BY total_rep DESC, gold_cnt DESC, recent_posts DESC
+    OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY
+) t1
+UNION ALL
+SELECT *
+FROM (
+    SELECT * FROM secondary_result
+    ORDER BY total_rep DESC
+    LIMIT 50
+) t2;

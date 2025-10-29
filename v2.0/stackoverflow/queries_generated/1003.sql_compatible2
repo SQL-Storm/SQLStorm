@@ -1,0 +1,158 @@
+WITH UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName AS UserDisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.Views AS UserProfileViews,
+        COUNT(DISTINCT q.Id) AS QuestionsPosted,
+        COUNT(DISTINCT a.Id) AS AnswersPosted,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        SUM(COALESCE(q.Score, 0) + COALESCE(a.Score, 0)) AS TotalPostScore,
+        AVG(CASE WHEN a.Score IS NOT NULL THEN a.Score END) AS AvgAnswerScore,
+        MAX(p.CreationDate) AS LatestPostDate,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        MAX(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS HasGoldBadge,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (10, 12) THEN 1 ELSE 0 END) AS PostsClosedOrDeletedCount
+    FROM Users u
+    LEFT JOIN Posts q ON u.Id = q.OwnerUserId AND q.PostTypeId = 1
+    LEFT JOIN Posts a ON u.Id = a.OwnerUserId AND a.PostTypeId = 2
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId AND (ph.PostId = q.Id OR ph.PostId = a.Id)
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Views
+),
+PostLifeCycleEvents AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.LastActivityDate,
+        p.ViewCount,
+        p.Score,
+        p.AnswerCount,
+        p.Tags,
+        p.Title,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) AS FirstClosedDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.CreationDate END) AS FirstReopenedDate,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 END) AS CloseCount,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 END) AS ReopenCount,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10
+                 THEN (SELECT crt.Name FROM CloseReasonTypes crt WHERE crt.Id = CAST(ph.Comment AS INTEGER))
+                 ELSE NULL END) AS LastCloseReason,
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (14, 19) THEN ph.CreationDate END) AS LatestModeratorActionDate,
+        STRING_AGG(DISTINCT SUBSTRING(ph_tags.Text FROM 2 FOR CHAR_LENGTH(ph_tags.Text) - 2), ', ') AS AllTagsEverUsed,
+        LAG(MAX(ph.CreationDate)) OVER (PARTITION BY p.Id ORDER BY MAX(ph.CreationDate), MAX(ph.PostHistoryTypeId)) AS PreviousHistoryDate
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    LEFT JOIN PostHistory ph_tags ON p.Id = ph_tags.PostId AND ph_tags.PostHistoryTypeId IN (3,6,9)
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.OwnerUserId, p.CreationDate, p.LastActivityDate, p.ViewCount, p.Score, p.AnswerCount, p.Tags, p.Title
+    HAVING COUNT(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 END) > 0
+),
+PostCommentSentiment AS (
+    SELECT
+        c.PostId,
+        SUM(CASE WHEN LOWER(c.Text) LIKE '%great%' OR LOWER(c.Text) LIKE '%helpful%' THEN 1 ELSE 0 END) AS PositiveCommentCount,
+        SUM(CASE WHEN LOWER(c.Text) LIKE '%bug%' OR LOWER(c.Text) LIKE '%error%' OR LOWER(c.Text) LIKE '%wrong%' THEN 1 ELSE 0 END) AS NegativeCommentCount,
+        AVG(c.Score) AS AvgCommentScore,
+        MAX(CASE WHEN c.UserId IS NOT NULL AND c.CreationDate = (SELECT MAX(c2.CreationDate) FROM Comments c2 WHERE c2.PostId = c.PostId AND CHAR_LENGTH(c2.Text) > 100)
+                 THEN c.Text ELSE NULL END) AS LatestLongComment
+    FROM Comments c
+    GROUP BY c.PostId
+),
+RelatedPostMetrics AS (
+    SELECT
+        pl.PostId,
+        COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 1 THEN pl.RelatedPostId END) AS LinkedPostsCount,
+        COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN pl.RelatedPostId END) AS DuplicatePostsCount,
+        SUM(CASE WHEN pl.LinkTypeId = 3 THEN p_related.Score ELSE 0 END) AS SumDuplicatePostScore
+    FROM PostLinks pl
+    JOIN Posts p_related ON pl.RelatedPostId = p_related.Id
+    GROUP BY pl.PostId
+),
+RankedPostsByActivity AS (
+    SELECT
+        ple.PostId,
+        ple.OwnerUserId,
+        ple.PostCreationDate,
+        ple.LastActivityDate,
+        ple.Title,
+        ple.ViewCount,
+        ple.Score,
+        ple.Tags,
+        ple.FirstClosedDate,
+        ple.FirstReopenedDate,
+        ple.CloseCount,
+        ple.ReopenCount,
+        ple.LastCloseReason,
+        ple.LatestModeratorActionDate,
+        EXTRACT(EPOCH FROM (ple.FirstReopenedDate - ple.FirstClosedDate)) / 3600.0 AS TimeToFirstReopenHours,
+        RANK() OVER (ORDER BY ple.ViewCount DESC, ple.Score DESC, ple.AnswerCount DESC) AS OverallActivityRank,
+        (SELECT AVG(a.Score) FROM Posts a WHERE a.ParentId = ple.PostId AND a.PostTypeId = 2) AS AvgAnswerScoreForQuestion,
+        EXISTS(SELECT 1 FROM Posts a WHERE a.ParentId = ple.PostId AND a.Id = (SELECT q.AcceptedAnswerId FROM Posts q WHERE q.Id = ple.PostId)) AS HasAcceptedAnswer
+    FROM PostLifeCycleEvents ple
+    WHERE ple.ReopenCount > 0
+)
+SELECT
+    rp.PostId,
+    rp.Title,
+    rp.Tags,
+    rp.OwnerUserId,
+    uas.UserDisplayName AS OwnerDisplayName,
+    uas.Reputation AS OwnerReputation,
+    rp.PostCreationDate,
+    rp.LastActivityDate,
+    rp.ViewCount,
+    rp.Score,
+    rp.AnswerCount,
+    rp.FirstClosedDate,
+    rp.FirstReopenedDate,
+    rp.CloseCount,
+    rp.ReopenCount,
+    rp.LastCloseReason,
+    rp.TimeToFirstReopenHours,
+    rp.LatestModeratorActionDate,
+    COALESCE(rp.AvgAnswerScoreForQuestion, 0.0) AS AvgAnswerScoreForQuestion,
+    rp.HasAcceptedAnswer,
+    uas.QuestionsPosted,
+    uas.AnswersPosted,
+    uas.CommentsMade,
+    uas.TotalPostScore AS OwnerTotalPostScore,
+    uas.AvgAnswerScore AS OwnerAvgAnswerScore,
+    uas.TotalBadges AS OwnerTotalBadges,
+    uas.HasGoldBadge AS OwnerHasGoldBadge,
+    pc.PositiveCommentCount,
+    pc.NegativeCommentCount,
+    pc.AvgCommentScore,
+    pc.LatestLongComment,
+    rpm.LinkedPostsCount,
+    rpm.DuplicatePostsCount,
+    rpm.SumDuplicatePostScore,
+    rp.OverallActivityRank,
+    CASE
+        WHEN rp.ViewCount > 5000 AND rp.Score > 50 AND rp.ReopenCount > 1 THEN 'High-Impact-Reopened'
+        WHEN rp.ViewCount > 1000 AND rp.Score > 10 AND rp.TimeToFirstReopenHours < 72 THEN 'Quick-Resolution-Reopened'
+        WHEN rp.LastCloseReason = 'Off-topic' AND rp.ReopenCount > 0 THEN 'Off-topic-Reopened'
+        WHEN rp.LastCloseReason IS NULL AND rp.ReopenCount > 0 THEN 'Reopened-Without-Clear-CloseReason'
+        ELSE 'General-Reopened'
+    END AS PostCategory,
+    SPLIT_PART(SUBSTRING(rp.Tags FROM 2 FOR CHAR_LENGTH(rp.Tags) - 2), '><', 1) AS PrimaryTag,
+    EXISTS (
+        SELECT 1
+        FROM Comments c_owner
+        WHERE c_owner.PostId = rp.PostId
+          AND c_owner.UserId = rp.OwnerUserId
+          AND (LOWER(c_owner.Text) LIKE '%closed%' OR LOWER(c_owner.Text) LIKE '%reopen%')
+    ) AS OwnerCommentedOnModeration
+FROM RankedPostsByActivity rp
+LEFT JOIN UserActivitySummary uas ON rp.OwnerUserId = uas.UserId
+LEFT JOIN PostCommentSentiment pc ON rp.PostId = pc.PostId
+LEFT JOIN RelatedPostMetrics rpm ON rp.PostId = rpm.PostId
+WHERE rp.Score > 0
+  AND uas.Reputation > 1000
+  AND rp.TimeToFirstReopenHours IS NOT NULL AND rp.TimeToFirstReopenHours > 0
+  AND (COALESCE(rpm.LinkedPostsCount, 0) > 0 OR COALESCE(rpm.DuplicatePostsCount, 0) > 0)
+ORDER BY rp.OverallActivityRank ASC, rp.TimeToFirstReopenHours DESC, uas.Reputation DESC
+LIMIT 500;

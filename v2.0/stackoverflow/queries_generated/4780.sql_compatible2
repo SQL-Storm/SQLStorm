@@ -1,0 +1,169 @@
+WITH
+  RankedPosts AS (
+    SELECT
+      p.Id AS PostId,
+      p.PostTypeId,
+      p.OwnerUserId,
+      p.CreationDate AS PostCreationDate,
+      p.Score AS PostScore,
+      p.ViewCount AS PostViewCount,
+      p.FavoriteCount AS PostFavoriteCount,
+      p.AnswerCount AS PostAnswerCount,
+      p.CommentCount AS PostCommentCount,
+      p.ClosedDate,
+      pt.Name AS PostTypeName,
+      ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) AS rn_post_type,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+      COUNT(c.Id) AS CommentCountTotal,
+      CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS HasAcceptedAnswer,
+      CASE WHEN p.OwnerUserId IS NOT NULL THEN 'Registered' ELSE 'Anonymous' END AS OwnerType,
+      (
+        SELECT
+          COUNT(*)
+        FROM
+          PostHistory ph
+        WHERE
+          ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4, 5, 6)
+      ) AS EditCount
+    FROM
+      Posts p
+      JOIN PostTypes pt ON p.PostTypeId = pt.Id
+      LEFT JOIN Votes v ON p.Id = v.PostId
+      LEFT JOIN Comments c ON p.Id = c.PostId
+    WHERE
+      p.PostTypeId IN (1, 2) AND p.CreationDate > TIMESTAMP '2023-01-01'
+    GROUP BY
+      p.Id,
+      p.PostTypeId,
+      p.OwnerUserId,
+      p.CreationDate,
+      p.Score,
+      p.ViewCount,
+      p.FavoriteCount,
+      p.AnswerCount,
+      p.CommentCount,
+      p.ClosedDate,
+      pt.Name,
+      p.AcceptedAnswerId
+  ),
+  UserPostStats AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate AS UserCreationDate,
+      COUNT(CASE WHEN rp.PostTypeId = 1 THEN rp.PostId END) AS QuestionCount,
+      COUNT(CASE WHEN rp.PostTypeId = 2 THEN rp.PostId END) AS AnswerCount,
+      AVG(rp.PostScore) AS AvgPostScore,
+      SUM(rp.PostViewCount) AS TotalPostViews,
+      MAX(rp.PostCreationDate) AS LastPostDate
+    FROM
+      Users u
+      LEFT JOIN RankedPosts rp ON u.Id = rp.OwnerUserId
+    WHERE
+      u.Reputation > 1000
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate
+  )
+SELECT
+  rp.PostId,
+  rp.PostTypeName,
+  rp.PostCreationDate,
+  rp.PostScore,
+  rp.PostViewCount,
+  rp.PostFavoriteCount,
+  rp.PostAnswerCount,
+  rp.PostCommentCount,
+  rp.UpVoteCount,
+  rp.DownVoteCount,
+  rp.CommentCountTotal,
+  rp.HasAcceptedAnswer,
+  rp.OwnerType,
+  rp.EditCount,
+  CASE
+    WHEN rp.ClosedDate IS NOT NULL THEN 'Closed'
+    ELSE 'Open'
+  END AS PostStatus,
+  ups.DisplayName AS OwnerDisplayName,
+  ups.Reputation AS OwnerReputation,
+  ups.QuestionCount AS OwnerTotalQuestions,
+  ups.AnswerCount AS OwnerTotalAnswers,
+  ups.AvgPostScore AS OwnerAvgPostScore,
+  ups.TotalPostViews AS OwnerTotalPostViews,
+  CASE
+    WHEN ups.LastPostDate IS NOT NULL THEN EXTRACT(day FROM (TIMESTAMP '2024-10-01 12:34:56' - ups.LastPostDate))
+    ELSE NULL
+  END AS DaysSinceLastPost,
+  ('Score: ' || rp.PostScore || ', Views: ' || rp.PostViewCount || ', Answers: ' || rp.PostAnswerCount) AS PostSummaryString,
+  CASE
+    WHEN rp.PostScore > 50 AND rp.PostViewCount > 1000 THEN 'High Performance'
+    WHEN rp.PostScore < 0 THEN 'Low Performance'
+    ELSE 'Average Performance'
+  END AS PerformanceCategory,
+  COALESCE(rp.PostFavoriteCount, 0) AS SafeFavoriteCount,
+  (rp.UpVoteCount - rp.DownVoteCount) AS NetVoteScore,
+  (
+    SELECT
+      COUNT(ph_inner.Id)
+    FROM
+      PostHistory ph_inner
+    WHERE
+      ph_inner.PostId = rp.PostId
+      AND ph_inner.PostHistoryTypeId = 10
+  ) AS CloseVoteCount,
+  rp.rn_post_type
+FROM
+  RankedPosts rp
+  LEFT OUTER JOIN UserPostStats ups ON rp.OwnerUserId = ups.UserId
+WHERE
+  rp.rn_post_type <= 100
+  AND (
+    rp.PostScore > 0 OR rp.PostViewCount > 0
+  )
+  AND ups.UserId IS NOT NULL
+UNION
+SELECT
+  NULL AS PostId,
+  'Summary' AS PostTypeName,
+  NULL AS PostCreationDate,
+  AVG(rp.PostScore) AS PostScore,
+  SUM(rp.PostViewCount) AS PostViewCount,
+  SUM(rp.PostFavoriteCount) AS PostFavoriteCount,
+  SUM(rp.PostAnswerCount) AS PostAnswerCount,
+  SUM(rp.PostCommentCount) AS PostCommentCount,
+  SUM(rp.UpVoteCount) AS UpVoteCount,
+  SUM(rp.DownVoteCount) AS DownVoteCount,
+  SUM(rp.CommentCountTotal) AS CommentCountTotal,
+  CAST(SUM(rp.HasAcceptedAnswer) AS INTEGER) AS HasAcceptedAnswer,
+  NULL AS OwnerType,
+  COUNT(*) AS EditCount,
+  NULL AS PostStatus,
+  NULL AS OwnerDisplayName,
+  AVG(ups.Reputation) AS OwnerReputation,
+  SUM(ups.QuestionCount) AS OwnerTotalQuestions,
+  SUM(ups.AnswerCount) AS OwnerTotalAnswers,
+  AVG(ups.AvgPostScore) AS OwnerAvgPostScore,
+  SUM(ups.TotalPostViews) AS OwnerTotalPostViews,
+  NULL AS DaysSinceLastPost,
+  'Overall Site Statistics' AS PostSummaryString,
+  NULL AS PerformanceCategory,
+  COALESCE(SUM(COALESCE(rp.PostFavoriteCount,0)), 0) AS SafeFavoriteCount,
+  SUM(rp.UpVoteCount - rp.DownVoteCount) AS NetVoteScore,
+  NULL AS CloseVoteCount,
+  NULL AS rn_post_type
+FROM
+  RankedPosts rp
+  LEFT OUTER JOIN UserPostStats ups ON rp.OwnerUserId = ups.UserId
+WHERE
+  rp.rn_post_type <= 100
+  AND (
+    rp.PostScore > 0 OR rp.PostViewCount > 0
+  )
+  AND ups.UserId IS NOT NULL
+ORDER BY
+  PostStatus DESC,
+  PostScore DESC;

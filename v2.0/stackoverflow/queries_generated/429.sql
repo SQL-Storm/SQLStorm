@@ -1,0 +1,360 @@
+-- {"query": "429.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3254} 
+with
+-- recent activity window over posts
+recent_posts as (
+  select
+    p.id,
+    p.posttypeid,
+    p.creationdate,
+    p.owneruserid,
+    p.title,
+    p.tags,
+    p.viewcount,
+    p.score,
+    p.answercount,
+    p.closeddate,
+    p.lastactivitydate,
+    dense_rank() over (order by coalesce(p.lastactivitydate, p.creationdate) desc, p.id desc) as recency_rank
+  from posts p
+  where p.posttypeid in (1,2)
+),
+-- top N recent posts for focus
+top_recent as (
+  select *
+  from recent_posts
+  where recency_rank <= 500
+),
+-- derive tag arrays and normalized fields
+tagged as (
+  select
+    tr.*,
+    string_to_array(substring(tr.tags, 2, greatest(length(tr.tags)-2,0)), '><') as tag_arr,
+    coalesce(nullif(trim(tr.title), ''), '[no title]') as norm_title
+  from top_recent tr
+),
+-- explode tags
+tag_expanded as (
+  select
+    t.id as post_id,
+    t.posttypeid,
+    unnest(t.tag_arr) as tag_name
+  from tagged t
+  where t.posttypeid = 1
+),
+-- votes aggregation with window functions
+vote_agg as (
+  select
+    v.postid,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+    count(*) filter (where v.votetypeid in (2,3,5)) as counted_votes,
+    max(v.creationdate) as last_vote_at,
+    min(v.creationdate) as first_vote_at
+  from votes v
+  where v.postid in (select id from top_recent)
+  group by v.postid
+),
+-- comments aggregation with correlated subqueries for extremes
+comment_agg as (
+  select
+    c.postid,
+    count(*) as comment_count,
+    coalesce(sum(greatest(c.score,0)), 0) as nonneg_comment_score_sum,
+    max(c.score) as max_comment_score,
+    min(c.score) as min_comment_score,
+    max(c.creationdate) as last_comment_at,
+    (select c2.text from comments c2
+       where c2.postid = c.postid
+       order by c2.score desc nulls last, c2.creationdate asc
+       limit 1) as top_comment_text,
+    (select c3.userid from comments c3
+       where c3.postid = c.postid and c3.userid is not null
+       group by c3.userid
+       order by count(*) desc, max(c3.creationdate) desc
+       limit 1) as most_active_commenter_id
+  from comments c
+  where c.postid in (select id from top_recent)
+  group by c.postid
+),
+-- answers per question and accepted answer indicators
+answer_agg as (
+  select
+    q.id as question_id,
+    count(a.id) filter (where a.posttypeid = 2) as answer_count_calc,
+    max(a.score) filter (where a.posttypeid = 2) as max_answer_score,
+    avg(a.score) filter (where a.posttypeid = 2) as avg_answer_score,
+    bool_or(a.id = q.acceptedanswerid) as has_accepted_answer
+  from posts q
+  left join posts a on a.parentid = q.id
+  where q.id in (select id from top_recent where posttypeid = 1)
+  group by q.id
+),
+-- user reputation buckets and activity windows
+user_dim as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    date_part('year', age(current_timestamp, u.creationdate)) as account_age_years,
+    width_bucket(u.reputation, 0, 100000, 10) as rep_bucket,
+    sum(b.class = 1::smallint)::int as gold_badges,
+    sum(b.class = 2::smallint)::int as silver_badges,
+    sum(b.class = 3::smallint)::int as bronze_badges,
+    max(b.date) as last_badge_at
+  from users u
+  left join badges b on b.userid = u.id
+  where u.id in (select distinct owneruserid from top_recent where owneruserid is not null)
+  group by u.id, u.displayname, u.reputation, u.creationdate
+),
+-- link/duplicate relationships
+link_agg as (
+  select
+    pl.postid,
+    count(*) filter (where pl.linktypeid = 1) as linked_count,
+    count(*) filter (where pl.linktypeid = 3) as duplicate_count,
+    max(pl.creationdate) as last_link_at,
+    array_agg(pl.relatedpostid order by pl.creationdate desc) filter (where pl.linktypeid = 3) as dup_targets
+  from postlinks pl
+  where pl.postid in (select id from top_recent)
+  group by pl.postid
+),
+-- post history signals
+history_flags as (
+  select
+    ph.postid,
+    bool_or(ph.posthistorytypeid = 10) as was_closed_flag,
+    bool_or(ph.posthistorytypeid = 11) as was_reopened_flag,
+    bool_or(ph.posthistorytypeid in (24)) as has_suggested_edits,
+    count(*) filter (where ph.posthistorytypeid in (4,5,6,7,8,9)) as edit_events,
+    max(ph.creationdate) filter (where ph.posthistorytypeid in (4,5,6)) as last_edit_at,
+    max(case when ph.posthistorytypeid = 10 then try_cast(ph.comment as int) end) as last_close_reason_id
+  from posthistory ph
+  where ph.postid in (select id from top_recent)
+  group by ph.postid
+),
+-- close reason map for readability
+close_reason_map as (
+  select crt.id as reason_id, crt.name as reason_name
+  from closereasontypes crt
+),
+-- tag popularity blend (recent post tags vs global tag counts)
+tag_stats as (
+  select
+    te.post_id,
+    te.tag_name,
+    t.count as global_tag_count,
+    row_number() over (partition by te.post_id order by coalesce(t.count,0) desc, te.tag_name) as tag_rank
+  from tag_expanded te
+  left join tags t on lower(t.tagname) = lower(te.tag_name)
+),
+-- assemble question-focused facts
+question_facts as (
+  select
+    q.id,
+    q.norm_title,
+    q.viewcount,
+    q.score,
+    q.answercount,
+    aa.answer_count_calc,
+    aa.max_answer_score,
+    aa.avg_answer_score,
+    aa.has_accepted_answer,
+    va.upvotes,
+    va.downvotes,
+    va.favorites,
+    va.counted_votes,
+    ca.comment_count,
+    ca.nonneg_comment_score_sum,
+    ca.max_comment_score,
+    ca.min_comment_score,
+    la.linked_count,
+    la.duplicate_count,
+    hf.was_closed_flag,
+    hf.was_reopened_flag,
+    hf.has_suggested_edits,
+    hf.edit_events,
+    hf.last_edit_at,
+    hf.last_close_reason_id,
+    lr.reason_name as last_close_reason_name,
+    q.owneruserid,
+    q.creationdate,
+    q.lastactivitydate
+  from tagged q
+  left join answer_agg aa on aa.question_id = q.id
+  left join vote_agg va on va.postid = q.id
+  left join comment_agg ca on ca.postid = q.id
+  left join link_agg la on la.postid = q.id
+  left join history_flags hf on hf.postid = q.id
+  left join close_reason_map lr on lr.reason_id = hf.last_close_reason_id
+  where q.posttypeid = 1
+),
+-- compute composite scores with null handling and string ops
+scored as (
+  select
+    qf.*,
+    coalesce(qf.upvotes,0) - coalesce(qf.downvotes,0) as net_votes,
+    coalesce(qf.favorites,0) + greatest(coalesce(qf.viewcount,0) / nullif((extract(epoch from (current_timestamp - qf.creationdate)) / 86400.0),0), 0)::int as attention_score,
+    case
+      when qf.has_accepted_answer then 3
+      when qf.answer_count_calc > 0 then 2
+      when qf.comment_count > 0 then 1
+      else 0
+    end as engagement_level,
+    length(coalesce(qf.norm_title,'')) as title_len,
+    (regexp_count(coalesce(qf.norm_title,''), '\bhow\b|\bwhy\b|\bwhat\b', 'i')) as interrogative_hits
+  from question_facts qf
+),
+-- choose top tags to display
+top_tags as (
+  select
+    ts.post_id,
+    string_agg(ts.tag_name, ', ' order by ts.tag_rank)
+      filter (where ts.tag_rank <= 3) as top3_tags,
+    max(ts.global_tag_count) as max_tag_popularity
+  from tag_stats ts
+  group by ts.post_id
+),
+-- user enrichment
+owner_enriched as (
+  select
+    s.id,
+    s.norm_title,
+    s.viewcount,
+    s.score,
+    s.answercount,
+    s.answer_count_calc,
+    s.max_answer_score,
+    s.avg_answer_score,
+    s.has_accepted_answer,
+    s.upvotes,
+    s.downvotes,
+    s.favorites,
+    s.counted_votes,
+    s.comment_count,
+    s.nonneg_comment_score_sum,
+    s.max_comment_score,
+    s.min_comment_score,
+    s.linked_count,
+    s.duplicate_count,
+    s.was_closed_flag,
+    s.was_reopened_flag,
+    s.has_suggested_edits,
+    s.edit_events,
+    s.last_edit_at,
+    s.last_close_reason_name,
+    s.creationdate,
+    s.lastactivitydate,
+    s.net_votes,
+    s.attention_score,
+    s.engagement_level,
+    s.title_len,
+    s.interrogative_hits,
+    tt.top3_tags,
+    tt.max_tag_popularity,
+    ud.user_id as owner_user_id,
+    coalesce(ud.displayname, '[user deleted]') as owner_display_name,
+    ud.reputation,
+    ud.account_age_years,
+    ud.rep_bucket,
+    coalesce(ud.gold_badges,0) as gold_badges,
+    coalesce(ud.silver_badges,0) as silver_badges,
+    coalesce(ud.bronze_badges,0) as bronze_badges,
+    ud.last_badge_at
+  from scored s
+  left join top_tags tt on tt.post_id = s.id
+  left join user_dim ud on ud.user_id = s.owneruserid
+),
+-- rank across multiple dimensions
+ranked as (
+  select
+    oe.*,
+    row_number() over (order by coalesce(oe.attention_score,0) desc, coalesce(oe.net_votes,0) desc, oe.id desc) as rk_attention,
+    row_number() over (order by coalesce(oe.score,0) desc, coalesce(oe.viewcount,0) desc, oe.id desc) as rk_score,
+    row_number() over (order by coalesce(oe.comment_count,0) desc, coalesce(oe.edit_events,0) desc, oe.id desc) as rk_discussion,
+    row_number() over (order by coalesce(oe.duplicate_count,0) desc, coalesce(oe.linked_count,0) desc, oe.id desc) as rk_links
+  from owner_enriched oe
+),
+-- compute percentile ranks via window functions
+percentiles as (
+  select
+    r.*,
+    ntile(100) over (order by coalesce(r.attention_score,0)) as p_attn,
+    ntile(100) over (order by coalesce(r.net_votes,0)) as p_votes,
+    ntile(100) over (order by coalesce(r.viewcount,0)) as p_views
+  from ranked r
+),
+-- finalize with synthetic complexity and null logic
+final as (
+  select
+    p.*,
+    case
+      when p.was_closed_flag and not coalesce(p.was_reopened_flag,false) then 'Closed'
+      when p.was_closed_flag and p.was_reopened_flag then 'Reopened'
+      when p.duplicate_count > 0 then 'DuplicateLinked'
+      else 'Open'
+    end as moderation_state,
+    case
+      when p.rep_bucket >= 9 then 'Veteran'
+      when p.rep_bucket between 5 and 8 then 'Experienced'
+      when p.rep_bucket between 2 and 4 then 'Intermediate'
+      when p.rep_bucket = 1 then 'New'
+      else 'Unknown'
+    end as owner_segment,
+    (coalesce(p.attention_score,0) * 0.5
+     + coalesce(p.net_votes,0) * 1.5
+     + coalesce(p.comment_count,0) * 0.3
+     + case when p.has_accepted_answer then 2 else 0 end
+     - case when p.moderation_state in ('Closed','DuplicateLinked') then 1 else 0 end)::numeric(18,2) as composite_score,
+    left(coalesce(p.norm_title,''), 120) ||
+      case when length(coalesce(p.norm_title,'')) > 120 then '…' else '' end as truncated_title
+  from percentiles p
+)
+select
+  f.id as post_id,
+  f.truncated_title as title,
+  coalesce(f.top3_tags, '[no tags]') as tags,
+  f.owner_user_id,
+  f.owner_display_name,
+  f.reputation,
+  f.owner_segment,
+  f.viewcount,
+  f.score,
+  f.net_votes,
+  f.upvotes,
+  f.downvotes,
+  f.favorites,
+  f.comment_count,
+  f.answer_count_calc as answers,
+  f.has_accepted_answer,
+  f.moderation_state,
+  coalesce(f.last_close_reason_name, 'N/A') as last_close_reason,
+  f.duplicate_count,
+  f.linked_count,
+  f.edit_events,
+  f.attention_score,
+  f.composite_score,
+  f.p_attn,
+  f.p_votes,
+  f.p_views,
+  f.creationdate,
+  f.lastactivitydate
+from final f
+where
+  -- complicated predicates with null and string logic
+  (
+    f.owner_segment <> 'Unknown'
+    or (f.owner_display_name is null or f.owner_display_name ilike '%user%')
+  )
+  and (
+    f.top3_tags is not null
+    or f.comment_count > 0
+    or f.answers > 0
+  )
+  and (
+    f.title_len > 0
+    and f.interrogative_hits >= 0
+  )
+order by f.composite_score desc, f.attention_score desc, f.id desc
+limit 200;

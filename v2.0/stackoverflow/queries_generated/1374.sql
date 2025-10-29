@@ -1,0 +1,265 @@
+-- {"query": "1374.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3871} 
+
+WITH UserStatsAndInfluence AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.UpVotes,
+        U.DownVotes,
+        U.Views AS UserViews,
+        U.Location,
+        U.AboutMe,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(DISTINCT P_Q.Id) AS TotalQuestions,
+        COUNT(DISTINCT P_A.Id) AS TotalAnswers,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COALESCE(SUM(P_Q.Score), 0) AS TotalQuestionScore,
+        COALESCE(SUM(P_A.Score), 0) AS TotalAnswerScore,
+        COALESCE(AVG(P_Q.Score) FILTER (WHERE P_Q.Id IS NOT NULL), 0.0) AS AvgQuestionScore,
+        COALESCE(AVG(P_A.Score) FILTER (WHERE P_A.Id IS NOT NULL), 0.0) AS AvgAnswerScore,
+        SUM(CASE WHEN P_Q.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS QuestionsWithAcceptedAnswer,
+        NTILE(10) OVER (ORDER BY U.Reputation DESC) AS ReputationDecile, -- Divide users into 10 reputation groups
+        LAG(U.LastAccessDate, 1) OVER (PARTITION BY U.Location ORDER BY U.LastAccessDate) AS PreviousAccessDateInLocation
+    FROM
+        Users U
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN Posts P_Q ON U.Id = P_Q.OwnerUserId AND P_Q.PostTypeId = 1 -- Questions
+    LEFT JOIN Posts P_A ON U.Id = P_A.OwnerUserId AND P_A.PostTypeId = 2 -- Answers
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.UpVotes, U.DownVotes, U.Views, U.Location, U.AboutMe
+),
+PostQualityAndActivity AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.Title,
+        P.CreationDate AS PostCreationDate,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.OwnerUserId,
+        P.LastEditorUserId,
+        P.LastEditDate,
+        P.LastActivityDate,
+        P.ClosedDate,
+        P.Tags,
+        EXTRACT(EPOCH FROM (NOW() - P.LastEditDate)) / (3600 * 24) AS DaysSinceLastEdit, -- Age in days
+        EXTRACT(EPOCH FROM (NOW() - P.LastActivityDate)) / (3600 * 24) AS DaysSinceLastActivity,
+        COUNT(DISTINCT PH.Id) AS TotalHistoryEntries,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.Id END) AS EditHistoryCount, -- Title, Body, Tags edits
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.Id END) AS CloseHistoryCount,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId = 11 THEN PH.Id END) AS ReopenHistoryCount,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (35, 36) THEN PH.Id END) AS MigrationHistoryCount,
+        DENSE_RANK() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.ViewCount DESC) AS PostRankByScoreViews,
+        CASE
+            WHEN P.PostTypeId = 1 AND P.AcceptedAnswerId IS NULL AND P.AnswerCount = 0 AND P.ViewCount > 500 AND P.CreationDate < (NOW() - INTERVAL '1 year') THEN TRUE
+            ELSE FALSE
+        END AS IsUnansweredStaleQuestion,
+        EXISTS (SELECT 1 FROM PostLinks PL WHERE PL.PostId = P.Id AND PL.LinkTypeId = 3) AS IsDuplicateSource, -- Is this post a duplicate of another?
+        EXISTS (SELECT 1 FROM PostLinks PL WHERE PL.RelatedPostId = P.Id AND PL.LinkTypeId = 3) AS IsDuplicateTarget,  -- Is this post a target of a duplicate?
+        RANK() OVER (PARTITION BY P.PostTypeId ORDER BY P.FavoriteCount DESC NULLS LAST) AS FavoriteRank
+    FROM
+        Posts P
+    JOIN PostTypes PT ON P.PostTypeId = PT.Id
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    GROUP BY
+        P.Id, P.PostTypeId, PT.Name, P.Title, P.CreationDate, P.Score, P.ViewCount, P.AnswerCount, P.CommentCount,
+        P.FavoriteCount, P.OwnerUserId, P.LastEditorUserId, P.LastEditDate, P.LastActivityDate, P.ClosedDate, P.Tags
+),
+TagEngagementAndPerformance AS (
+    SELECT
+        T.TagName,
+        COUNT(DISTINCT P.Id) AS TaggedPostsCount,
+        SUM(P.Score) AS TotalScoreForTag,
+        AVG(P.Score) AS AvgScoreForTag,
+        SUM(P.ViewCount) AS TotalViewsForTag,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TaggedQuestionsCount,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TaggedAnswersCount,
+        COUNT(DISTINCT CASE WHEN P.ClosedDate IS NOT NULL AND P.PostTypeId = 1 THEN P.Id END) AS ClosedQuestionsWithTag,
+        (COUNT(DISTINCT CASE WHEN P.ClosedDate IS NOT NULL AND P.PostTypeId = 1 THEN P.Id END) * 100.0) / NULLIF(COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END), 0) AS ClosedQuestionRate,
+        LAG(COUNT(DISTINCT P.Id), 1, 0) OVER (ORDER BY COUNT(DISTINCT P.Id) DESC) AS PreviousTagCountByUsage,
+        LEAD(AVG(P.Score), 1, 0.0) OVER (ORDER BY AVG(P.Score) DESC) AS NextTagAvgScore
+    FROM
+        Posts P,
+        UNNEST(string_to_array(substring(P.Tags, 2, LENGTH(P.Tags) - 2), '><')) AS T(TagName)
+    WHERE
+        P.Tags IS NOT NULL AND LENGTH(TRIM(P.Tags)) > 2 -- Ensure tags are not empty after stripping '<>'
+        AND P.CreationDate > (NOW() - INTERVAL '3 years') -- Focus on recent tag performance
+    GROUP BY
+        T.TagName
+    HAVING
+        COUNT(DISTINCT P.Id) > 100 -- Focus on more frequently used tags
+),
+AdvancedPostHistoryAnalysis AS (
+    SELECT
+        PH.PostId,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.CreationDate ELSE NULL END) AS LastClosedDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 11 THEN PH.CreationDate ELSE NULL END) AS LastReopenedDate,
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 END) AS CloseVoteCount,
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 END) AS ReopenVoteCount,
+        COUNT(DISTINCT PH.UserId) AS DistinctEditorsInHistory,
+        (SELECT C.Text FROM Comments C WHERE C.PostId = PH.PostId ORDER BY C.CreationDate DESC LIMIT 1) AS LatestCommentText, -- Correlated subquery
+        STRING_AGG(DISTINCT CR.Name, '; ' ORDER BY CR.Name) FILTER (WHERE PH.PostHistoryTypeId = 10 AND PH.Comment IS NOT NULL) AS AllCloseReasons, -- Aggregate all close reasons if available
+        STRING_AGG(DISTINCT U.DisplayName, ', ' ORDER BY U.DisplayName) FILTER (WHERE PH.PostHistoryTypeId = 10 AND PH.UserId IS NOT NULL) AS UsersWhoClosedPost
+    FROM
+        PostHistory PH
+    LEFT JOIN CloseReasonTypes CR ON PH.PostHistoryTypeId = 10 AND PH.Comment IS NOT NULL AND CR.Id = CAST(PH.Comment AS SMALLINT)
+    LEFT JOIN Users U ON PH.UserId = U.Id
+    GROUP BY
+        PH.PostId
+),
+ComplexUserReputationBreakdown AS (
+    SELECT
+        USI.UserId,
+        USI.DisplayName,
+        USI.Reputation,
+        USI.Location,
+        USI.UserCreationDate,
+        USI.LastAccessDate,
+        USI.TotalBadges,
+        USI.GoldBadges,
+        USI.SilverBadges,
+        USI.BronzeBadges,
+        USI.TotalQuestions,
+        USI.TotalAnswers,
+        USI.TotalComments,
+        USI.TotalQuestionScore,
+        USI.TotalAnswerScore,
+        USI.AvgQuestionScore,
+        USI.AvgAnswerScore,
+        USI.ReputationDecile,
+        -- Rank user within their location based on reputation, handling NULL locations
+        RANK() OVER (PARTITION BY COALESCE(USI.Location, 'Unknown') ORDER BY USI.Reputation DESC) AS RankInLocation,
+        -- Ratio of question score to total score, using NULLIF for division by zero
+        (USI.TotalQuestionScore * 1.0) / NULLIF((USI.TotalQuestionScore + USI.TotalAnswerScore), 0) AS QuestionScoreRatio,
+        -- Calculate the reputation gain rate per day active, handling potential division by zero for new users
+        USI.Reputation / NULLIF(EXTRACT(EPOCH FROM (USI.LastAccessDate - USI.UserCreationDate)) / (3600 * 24), 0) AS AvgReputationPerDayActive,
+        -- Percentage of posts that are answers
+        (USI.TotalAnswers * 100.0) / NULLIF((USI.TotalQuestions + USI.TotalAnswers), 0) AS AnswerContributionPercentage,
+        -- Check if user has "About Me" populated and is active (last access within 90 days)
+        (USI.AboutMe IS NOT NULL AND USI.AboutMe != '' AND USI.LastAccessDate >= (NOW() - INTERVAL '90 days')) AS HasActiveProfileDescription,
+        COALESCE(UPPER(SUBSTRING(USI.Location, 1, 3)), 'NON') AS LocationPrefix -- Example string manipulation
+    FROM
+        UserStatsAndInfluence USI
+)
+-- Main Query combining insights from various CTEs
+SELECT
+    'HighReputationUsers' AS AnalysisCategory,
+    CRBD.DisplayName AS EntityName,
+    COALESCE(CRBD.Location, 'Unspecified') AS EntityLocation,
+    CRBD.Reputation,
+    CRBD.RankInLocation,
+    NULL AS PostTitle,
+    NULL AS TagName,
+    CRBD.TotalQuestions,
+    CRBD.TotalAnswers,
+    CRBD.TotalBadges,
+    CRBD.AvgReputationPerDayActive,
+    CRBD.AnswerContributionPercentage,
+    NULL AS PostScore,
+    NULL AS PostViewCount,
+    NULL AS DaysSinceLastActivity,
+    NULL AS ClosedQuestionRate,
+    NULL AS LatestCommentExcerpt,
+    NULL AS AllCloseReasons,
+    CRBD.UserCreationDate,
+    CRBD.LastAccessDate,
+    NULL AS IsDuplicateSource,
+    NULL AS IsUnansweredStaleQuestion,
+    CRBD.HasActiveProfileDescription,
+    CRBD.LocationPrefix
+FROM
+    ComplexUserReputationBreakdown CRBD
+WHERE
+    CRBD.ReputationDecile = 1 -- Top 10% reputation
+    AND (CRBD.TotalQuestions + CRBD.TotalAnswers) > 100 -- Active users
+    AND CRBD.GoldBadges >= 3
+    AND CRBD.AvgReputationPerDayActive > 10 -- High rep gain rate
+    AND CRBD.Location IS NOT NULL
+UNION ALL
+SELECT
+    'PotentiallyProblematicQuestions' AS AnalysisCategory,
+    COALESCE(USI.DisplayName, 'Community') AS EntityName,
+    COALESCE(USI.Location, 'N/A') AS EntityLocation,
+    COALESCE(USI.Reputation, 0) AS Reputation,
+    COALESCE(CRBD.RankInLocation, 0) AS RankInLocation,
+    PQA.Title AS PostTitle,
+    NULL AS TagName,
+    COALESCE(USI.TotalQuestions, 0) AS TotalQuestions,
+    COALESCE(USI.TotalAnswers, 0) AS TotalAnswers,
+    COALESCE(USI.TotalBadges, 0) AS TotalBadges,
+    COALESCE(CRBD.AvgReputationPerDayActive, 0.0) AS AvgReputationPerDayActive,
+    COALESCE(CRBD.AnswerContributionPercentage, 0.0) AS AnswerContributionPercentage,
+    PQA.Score AS PostScore,
+    PQA.ViewCount AS PostViewCount,
+    PQA.DaysSinceLastActivity,
+    NULL AS ClosedQuestionRate,
+    SUBSTRING(APHA.LatestCommentText, 1, 100) AS LatestCommentExcerpt, -- String function
+    APHA.AllCloseReasons,
+    PQA.PostCreationDate,
+    PQA.LastActivityDate,
+    PQA.IsDuplicateSource,
+    PQA.IsUnansweredStaleQuestion,
+    COALESCE(CRBD.HasActiveProfileDescription, FALSE) AS HasActiveProfileDescription,
+    COALESCE(CRBD.LocationPrefix, 'N/A') AS LocationPrefix
+FROM
+    PostQualityAndActivity PQA
+LEFT JOIN UserStatsAndInfluence USI ON PQA.OwnerUserId = USI.UserId
+LEFT JOIN ComplexUserReputationBreakdown CRBD ON PQA.OwnerUserId = CRBD.UserId
+LEFT JOIN AdvancedPostHistoryAnalysis APHA ON PQA.PostId = APHA.PostId
+WHERE
+    PQA.PostTypeId = 1 -- Only questions
+    AND PQA.PostCreationDate > (NOW() - INTERVAL '5 years') -- Only somewhat recent questions
+    AND (
+        PQA.IsUnansweredStaleQuestion = TRUE
+        OR PQA.EditHistoryCount > 5
+        OR APHA.ReopenVoteCount > 0
+        OR PQA.IsDuplicateSource = TRUE
+        OR PQA.Score < 5 AND PQA.ViewCount > 1000 -- Low score but high views
+        OR APHA.UsersWhoClosedPost IS NOT NULL
+    )
+UNION ALL
+SELECT
+    'TrendingTagsWithHighCloseRate' AS AnalysisCategory,
+    NULL AS EntityName,
+    NULL AS EntityLocation,
+    NULL AS Reputation,
+    NULL AS RankInLocation,
+    NULL AS PostTitle,
+    TEP.TagName,
+    NULL AS TotalQuestions,
+    NULL AS TotalAnswers,
+    NULL AS TotalBadges,
+    NULL AS AvgReputationPerDayActive,
+    NULL AS AnswerContributionPercentage,
+    NULL AS PostScore,
+    NULL AS PostViewCount,
+    NULL AS DaysSinceLastActivity,
+    TEP.ClosedQuestionRate,
+    NULL AS LatestCommentExcerpt,
+    TEP.NextTagAvgScore::TEXT AS AllCloseReasons, -- Re-purposing for another metric
+    NULL AS UserCreationDate,
+    NULL AS LastAccessDate,
+    NULL AS IsDuplicateSource,
+    NULL AS IsUnansweredStaleQuestion,
+    FALSE AS HasActiveProfileDescription,
+    'N/A' AS LocationPrefix
+FROM
+    TagEngagementAndPerformance TEP
+WHERE
+    TEP.ClosedQuestionRate > 20 -- More than 20% of questions with this tag are closed
+    AND TEP.TaggedQuestionsCount > 500 -- Significant number of questions
+    AND TEP.AvgScoreForTag < 5 -- Generally low quality
+    AND TEP.PreviousTagCountByUsage > 0 -- Has previous data for comparison
+ORDER BY
+    AnalysisCategory, Reputation DESC NULLS LAST, PostScore DESC NULLS LAST, TaggedPostsCount DESC NULLS LAST;

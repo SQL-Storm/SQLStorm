@@ -1,0 +1,113 @@
+-- {"query": "3773.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2306} 
+
+WITH
+    UserPostAgg AS (
+        SELECT
+            u.Id                                     AS UserId,
+            u.DisplayName,
+            u.Reputation,
+            COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1)          AS QuestionCount,
+            COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2)          AS AnswerCount,
+            AVG(p.Score) FILTER (WHERE p.PostTypeId IN (1,2))    AS AvgPostScore,
+            MAX(p.CreationDate)                                 AS LastPostDate
+        FROM Users u
+        LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+        GROUP BY u.Id, u.DisplayName, u.Reputation
+    ),
+    UserBadgeAgg AS (
+        SELECT
+            b.UserId,
+            COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+            COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+            COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+            COUNT(*)                             AS TotalBadges,
+            MAX(b.Date)                          AS LastBadgeDate
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+    UserVoteAgg AS (
+        SELECT
+            v.UserId,
+            COUNT(*) FILTER (WHERE vt.Id = 2) AS UpVotesGiven,
+            COUNT(*) FILTER (WHERE vt.Id = 3) AS DownVotesGiven,
+            COUNT(*) FILTER (WHERE vt.Id = 5) AS FavoritesGiven,
+            COUNT(*)                         AS TotalVotesGiven
+        FROM Votes v
+        JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+        WHERE v.UserId IS NOT NULL
+        GROUP BY v.UserId
+    ),
+    RecentActivity AS (
+        SELECT
+            u.Id AS UserId,
+            GREATEST(
+                COALESCE(u.LastAccessDate,      TIMESTAMP '1970-01-01'),
+                COALESCE(up.LastPostDate,      TIMESTAMP '1970-01-01'),
+                COALESCE(ub.LastBadgeDate,    TIMESTAMP '1970-01-01')
+            ) AS MostRecentActivity
+        FROM Users u
+        LEFT JOIN UserPostAgg up ON up.UserId = u.Id
+        LEFT JOIN UserBadgeAgg ub ON ub.UserId = u.Id
+    ),
+    TopTagUsage AS (
+        SELECT
+            p.OwnerUserId                                 AS UserId,
+            UNNEST(string_to_array(TRIM(BOTH '<>' FROM p.Tags), '><')) AS Tag,
+            COUNT(*)                                      AS TagCount
+        FROM Posts p
+        WHERE p.Tags IS NOT NULL
+        GROUP BY p.OwnerUserId, Tag
+    ),
+    UserTopTag AS (
+        SELECT
+            t.UserId,
+            t.Tag,
+            t.TagCount,
+            ROW_NUMBER() OVER (PARTITION BY t.UserId ORDER BY t.TagCount DESC) AS rn
+        FROM TopTagUsage t
+    )
+SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    COALESCE(up.QuestionCount,0)            AS QuestionCount,
+    COALESCE(up.AnswerCount,0)              AS AnswerCount,
+    ROUND(COALESCE(up.AvgPostScore,0)::numeric,2) AS AvgPostScore,
+    COALESCE(ub.GoldBadges,0)               AS GoldBadges,
+    COALESCE(ub.SilverBadges,0)             AS SilverBadges,
+    COALESCE(ub.BronzeBadges,0)             AS BronzeBadges,
+    COALESCE(uv.UpVotesGiven,0)             AS UpVotesGiven,
+    COALESCE(uv.DownVotesGiven,0)           AS DownVotesGiven,
+    CASE
+        WHEN ub.TotalBadges IS NULL THEN 'None'
+        ELSE CONCAT(ub.GoldBadges, 'G/', ub.SilverBadges, 'S/', ub.BronzeBadges, 'B')
+    END                                     AS BadgeSummary,
+    COALESCE(tt.Tag, 'NoTag')               AS TopTag,
+    COALESCE(tt.TagCount,0)                 AS TopTagUsage,
+    ra.MostRecentActivity,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+    COUNT(*) OVER ()                        AS TotalUsers
+FROM Users u
+LEFT JOIN UserPostAgg   up ON up.UserId = u.Id
+LEFT JOIN UserBadgeAgg  ub ON ub.UserId = u.Id
+LEFT JOIN UserVoteAgg   uv ON uv.UserId = u.Id
+LEFT JOIN RecentActivity ra ON ra.UserId = u.Id
+LEFT JOIN UserTopTag    tt ON tt.UserId = u.Id AND tt.rn = 1
+WHERE u.Reputation > 10000
+
+UNION ALL
+
+SELECT
+    NULL, '---', NULL,
+    NULL, NULL, NULL,
+    NULL, NULL, NULL,
+    NULL, NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL
+ORDER BY ReputationRank
+LIMIT 100;

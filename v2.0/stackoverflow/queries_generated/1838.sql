@@ -1,0 +1,129 @@
+-- {"query": "1838.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1741} 
+
+WITH UserRelevantPostStats AS (
+    -- Aggregates basic user statistics over the last 5 years, focusing on posts
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.CreationDate AS UserCreationDate,
+        u.Reputation,
+        u.UpVotes,
+        u.DownVotes,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END) AS TotalQuestionViews,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS TotalAnswerScoreAllPosts, -- Sum of scores for all answers
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestionsPosted,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswersPosted,
+        COUNT(DISTINCT p.AcceptedAnswerId) AS TotalAcceptedAnswersReceived,
+        SUM(COALESCE(p.FavoriteCount, 0)) AS TotalFavoriteCountOnPosts
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE p.CreationDate >= (NOW() - INTERVAL '5 years') OR p.Id IS NULL -- Include users even if no posts in range
+    GROUP BY u.Id, u.DisplayName, u.CreationDate, u.Reputation, u.UpVotes, u.DownVotes
+    HAVING u.CreationDate <= (NOW() - INTERVAL '1 year') -- User active for at least 1 year
+),
+SQLPerformanceAnswers AS (
+    -- Identifies answers to questions tagged with both 'SQL' and 'performance' within the last 5 years
+    SELECT
+        a.OwnerUserId AS UserId,
+        a.Id AS AnswerId,
+        a.Score AS AnswerScore,
+        q.Id AS QuestionId
+    FROM Posts a -- answers
+    INNER JOIN Posts q ON a.ParentId = q.Id -- questions
+    WHERE a.PostTypeId = 2
+      AND q.PostTypeId = 1
+      AND a.CreationDate >= (NOW() - INTERVAL '5 years')
+      AND q.CreationDate >= (NOW() - INTERVAL '5 years')
+      AND (
+            (q.Tags LIKE '%<sql>%' AND q.Tags LIKE '%<performance>%')
+            OR
+            (q.Tags LIKE '%<database>%' AND q.Tags LIKE '%<optimization>%')
+          )
+),
+UserSQLPerformanceAnswerAggregates AS (
+    -- Aggregates scores for SQL/Performance answers for each user
+    SELECT
+        UserId,
+        COUNT(AnswerId) AS NumRelevantAnswers,
+        SUM(AnswerScore) AS CumulativeRelevantAnswerScore,
+        AVG(AnswerScore) AS AverageRelevantAnswerScore
+    FROM SQLPerformanceAnswers
+    GROUP BY UserId
+    HAVING COUNT(AnswerId) >= 5 -- Require at least 5 relevant answers
+),
+UserUniqueQuestionTags AS (
+    -- Counts unique tags used by each user in their questions over the last 5 years
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(DISTINCT LOWER(TRIM(tag.value))) AS UniqueQuestionTagCount
+    FROM Posts p
+    CROSS JOIN LATERAL UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><')) AS tag(value)
+    WHERE p.PostTypeId = 1
+      AND p.Tags IS NOT NULL
+      AND p.CreationDate >= (NOW() - INTERVAL '5 years')
+    GROUP BY p.OwnerUserId
+),
+UserLatestBodyEdit AS (
+    -- Finds the most recent 'Edit Body' comment for each user
+    SELECT
+        ph.UserId,
+        ph.Comment AS LatestEditComment,
+        ph.CreationDate AS EditDate,
+        ROW_NUMBER() OVER(PARTITION BY ph.UserId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 5 -- Edit Body
+      AND ph.Comment IS NOT NULL
+      AND LENGTH(TRIM(ph.Comment)) > 5 -- Ensure a non-trivial comment
+)
+SELECT
+    urs.DisplayName,
+    urs.Reputation,
+    urs.UserCreationDate,
+    urs.TotalQuestionsPosted,
+    urs.TotalAnswersPosted,
+    urs.TotalQuestionViews,
+    COALESCE(uspa.CumulativeRelevantAnswerScore, 0) AS CumulativeRelevantAnswerScore,
+    COALESCE(uspa.AverageRelevantAnswerScore, 0.0) AS AverageRelevantAnswerScore,
+    COALESCE(uut.UniqueQuestionTagCount, 0) AS TotalUniqueQuestionTags,
+    -- Calculate a net vote ratio for user's all votes
+    COALESCE(
+        (urs.UpVotes::numeric - urs.DownVotes) / NULLIF(urs.UpVotes::numeric + urs.DownVotes, 0),
+        0.0
+    ) AS NetVoteRatio,
+    -- Display the most recent body edit comment, or a default message if none
+    COALESCE(
+        ule.LatestEditComment,
+        'No recent relevant body edit comment found.'
+    ) AS MostRecentBodyEditComment,
+    -- Calculate an elaborate engagement score
+    (
+        urs.Reputation * 0.05 -- Reputation contributes significantly
+        + urs.TotalQuestionViews * 0.001 -- Views on questions
+        + urs.TotalAnswerScoreAllPosts * 0.01 -- General answer score
+        + urs.TotalAcceptedAnswersReceived * 10 -- Accepted answers are high value
+        + urs.TotalFavoriteCountOnPosts * 0.5 -- Posts favorited by others
+        + COALESCE(uspa.NumRelevantAnswers, 0) * 2 -- Specific relevant answers count more
+        + COALESCE(uspa.CumulativeRelevantAnswerScore, 0) * 0.02 -- Score from relevant answers
+        + COALESCE(uut.UniqueQuestionTagCount, 0) * 0.1 -- Diversity in topics
+        + CASE WHEN ule.LatestEditComment IS NOT NULL THEN 1 ELSE 0 END * 2 -- Bonus for recent edit activity
+    ) AS EngagementScore,
+    -- Rank users based on their engagement score and relevant answer score
+    RANK() OVER (ORDER BY (
+        urs.Reputation * 0.05
+        + urs.TotalQuestionViews * 0.001
+        + urs.TotalAnswerScoreAllPosts * 0.01
+        + urs.TotalAcceptedAnswersReceived * 10
+        + urs.TotalFavoriteCountOnPosts * 0.5
+        + COALESCE(uspa.NumRelevantAnswers, 0) * 2
+        + COALESCE(uspa.CumulativeRelevantAnswerScore, 0) * 0.02
+        + COALESCE(uut.UniqueQuestionTagCount, 0) * 0.1
+        + CASE WHEN ule.LatestEditComment IS NOT NULL THEN 1 ELSE 0 END * 2
+    ) DESC, COALESCE(uspa.CumulativeRelevantAnswerScore, 0) DESC, urs.Reputation DESC) AS OverallRanking
+FROM UserRelevantPostStats urs
+INNER JOIN UserSQLPerformanceAnswerAggregates uspa ON urs.UserId = uspa.UserId
+LEFT JOIN UserUniqueQuestionTags uut ON urs.UserId = uut.UserId
+LEFT JOIN UserLatestBodyEdit ule ON urs.UserId = ule.UserId AND ule.rn = 1
+WHERE urs.TotalAnswersPosted >= 10 -- Final filter: at least 10 answers overall (not just relevant ones)
+  AND urs.Reputation > 50 -- Filter out very low reputation users
+ORDER BY EngagementScore DESC, OverallRanking ASC
+LIMIT 10;

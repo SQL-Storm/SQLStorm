@@ -1,0 +1,134 @@
+-- {"query": "3594.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2228} 
+WITH UserStats AS (
+    SELECT 
+        u.Id                                     AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.UpVotes,0) - COALESCE(u.DownVotes,0) AS NetVotes,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        SUM(CASE 
+                WHEN v.VoteTypeId = 2 THEN 1      -- UpMod
+                WHEN v.VoteTypeId = 3 THEN -1     -- DownMod
+                ELSE 0
+            END)                                    AS PostScoreSum,
+        MAX(p.CreationDate)                      AS LastPostDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank
+    FROM Users u
+    LEFT JOIN Posts  p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes  v ON v.PostId = p.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes
+),
+
+TagInfo AS (
+    SELECT 
+        t.Id                      AS TagId,
+        t.TagName,
+        t.Count                   AS TagCount,
+        COALESCE(e.Title, '')     AS ExcerptTitle,
+        COALESCE(w.Title, '')     AS WikiTitle
+    FROM Tags t
+    LEFT JOIN Posts e ON e.Id = t.ExcerptPostId
+    LEFT JOIN Posts w ON w.Id = t.WikiPostId
+),
+
+TopTagsPerUser AS (
+    SELECT 
+        us.UserId,
+        STRING_AGG(DISTINCT tg.TagName, ', ') 
+            WITHIN GROUP (ORDER BY tg.TagName) AS TopTags
+    FROM UserStats us
+    JOIN Posts p 
+        ON p.OwnerUserId = us.UserId 
+        AND p.PostTypeId = 1               -- only questions
+    JOIN LATERAL (
+        SELECT unnest(string_to_array(
+                substring(p.Tags, 2, length(p.Tags)-2), '><')) AS Tag
+    ) pt ON true
+    JOIN TagInfo tg 
+        ON tg.TagName = pt.Tag
+    GROUP BY us.UserId
+),
+
+ClosedDuplicateInfo AS (
+    SELECT 
+        ph.PostId,
+        ph.CreationDate                        AS CloseDate,
+        CASE 
+            WHEN ph.Comment ~ '^\d+$' THEN ph.Comment::int 
+            ELSE NULL 
+        END                                   AS DuplicateTargetId
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10          -- Close
+      AND ph.Comment ~ '^\d+$'               -- comment holds duplicate target id
+),
+
+UserBadgeStats AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        STRING_AGG(DISTINCT b.Name, '; ')   AS BadgeList
+    FROM Badges b
+    GROUP BY b.UserId
+)
+
+SELECT 
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.NetVotes,
+    us.QuestionCount,
+    us.AnswerCount,
+    us.PostScoreSum,
+    us.RepRank,
+    COALESCE(tb.TopTags, '')          AS TopTags,
+    COALESCE(ub.GoldBadges, 0)        AS GoldBadges,
+    COALESCE(ub.SilverBadges, 0)      AS SilverBadges,
+    COALESCE(ub.BronzeBadges, 0)      AS BronzeBadges,
+    ub.BadgeList,
+    CASE 
+        WHEN EXISTS (
+            SELECT 1 
+            FROM ClosedDuplicateInfo cdi
+            WHERE cdi.PostId IN (
+                SELECT p.Id 
+                FROM Posts p 
+                WHERE p.OwnerUserId = us.UserId
+            )
+        ) THEN 1 ELSE 0 
+    END                               AS HasClosedDuplicate
+FROM UserStats us
+LEFT JOIN TopTagsPerUser tb ON tb.UserId = us.UserId
+LEFT JOIN UserBadgeStats ub ON ub.UserId = us.UserId
+WHERE us.Reputation > 1000
+  AND (us.QuestionCount + us.AnswerCount) > 10
+  AND NOT EXISTS (
+        SELECT 1 
+        FROM Users du 
+        WHERE du.Id = us.UserId 
+          AND du.EmailHash IS NULL
+    )
+ORDER BY us.RepRank
+LIMIT 100
+
+UNION ALL
+
+SELECT 
+    NULL           AS UserId,
+    'TOTAL'        AS DisplayName,
+    SUM(us.Reputation)   AS Reputation,
+    NULL           AS NetVotes,
+    SUM(us.QuestionCount) AS QuestionCount,
+    SUM(us.AnswerCount)   AS AnswerCount,
+    SUM(us.PostScoreSum)  AS PostScoreSum,
+    NULL           AS RepRank,
+    NULL           AS TopTags,
+    NULL           AS GoldBadges,
+    NULL           AS SilverBadges,
+    NULL           AS BronzeBadges,
+    NULL           AS BadgeList,
+    NULL           AS HasClosedDuplicate
+FROM UserStats us
+WHERE us.Reputation > 1000;

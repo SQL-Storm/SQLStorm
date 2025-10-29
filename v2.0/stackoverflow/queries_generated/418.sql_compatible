@@ -1,0 +1,346 @@
+with
+-- Active users with rank by recent activity and reputation buckets
+active_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.location,
+    u.creationdate,
+    u.lastaccessdate,
+    coalesce(nullif(trim(u.websiteurl), ''), 'n/a') as websiteurl_norm,
+    width_bucket(u.reputation, 0, 100000, 10) as rep_bucket,
+    row_number() over (partition by width_bucket(u.reputation, 0, 100000, 10) order by u.lastaccessdate desc, u.reputation desc, u.id) as recency_rank
+  from users u
+  where u.lastaccessdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+),
+-- Questions with tags exploded and annotated with tag rank (by tag count)
+questions_with_tags as (
+  select
+    p.id as question_id,
+    p.owneruserid,
+    lower(trim(t.tag)) as tag,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    dense_rank() over (order by tg.count desc nulls last) as tag_pop_rank
+  from posts p
+  cross join lateral unnest(
+    case
+      when p.posttypeid = 1 and p.tags is not null and length(p.tags) > 2
+        then string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')
+      else array[]::varchar[]
+    end
+  ) as t(tag)
+  left join tags tg on lower(tg.tagname) = lower(t.tag)
+  where p.posttypeid = 1
+),
+-- Answers with their parent question and acceptance info
+answers_enriched as (
+  select
+    a.id as answer_id,
+    a.parentid as question_id,
+    a.owneruserid as answerer_id,
+    a.score as answer_score,
+    a.creationdate as answer_creation,
+    q.acceptedanswerid,
+    (a.id = q.acceptedanswerid) as is_accepted,
+    row_number() over (partition by a.parentid order by a.score desc nulls last, a.creationdate asc, a.id) as rank_in_question_by_score
+  from posts a
+  join posts q on q.id = a.parentid and a.posttypeid = 2
+),
+-- User badge summary with counts per class and first/last badge dates
+user_badges as (
+  select
+    b.userid,
+    count(*) as badge_count,
+    sum(case when b.class = 1 then 1 else 0 end) as gold_count,
+    sum(case when b.class = 2 then 1 else 0 end) as silver_count,
+    sum(case when b.class = 3 then 1 else 0 end) as bronze_count,
+    min(b.date) as first_badge_date,
+    max(b.date) as last_badge_date
+  from badges b
+  group by b.userid
+),
+-- Votes aggregation per post with up/down and favorites, plus net score delta from votes
+post_votes_agg as (
+  select
+    v.postid,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+    sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end) as vote_net_delta,
+    max(v.creationdate) as last_vote_date
+  from votes v
+  group by v.postid
+),
+-- Recent closures and reasons per question (most recent closure event)
+recent_closures as (
+  select distinct on (ph.postid)
+    ph.postid as question_id,
+    ph.creationdate as closed_at,
+    ph.comment as close_reason_id,
+    crt.name as close_reason_name
+  from posthistory ph
+  left join closereasontypes crt on crt.id = cast(nullif(ph.comment, '') as smallint)
+  where ph.posthistorytypeid = 10
+  order by ph.postid, ph.creationdate desc
+),
+-- Link graph for duplicates and related links with counts
+post_links_agg as (
+  select
+    pl.postid,
+    sum(case when pl.linktypeid = 3 then 1 else 0 end) as duplicate_links,
+    sum(case when pl.linktypeid = 1 then 1 else 0 end) as related_links,
+    max(pl.creationdate) as last_link_date
+  from postlinks pl
+  group by pl.postid
+),
+-- Comments summary per post and last comment info
+comments_agg as (
+  select
+    c.postid,
+    count(*) as comment_count,
+    max(c.score) filter (where c.score is not null) as max_comment_score,
+    max(c.creationdate) as last_comment_date
+  from comments c
+  group by c.postid
+),
+-- Per-question metrics combining above
+question_metrics as (
+  select
+    q.question_id,
+    q.owneruserid as asker_id,
+    q.creationdate as asked_at,
+    q.score as q_score,
+    q.viewcount,
+    qwt.tag,
+    qwt.tag_pop_rank,
+    coalesce(pva.upvotes, 0) as q_up,
+    coalesce(pva.downvotes, 0) as q_down,
+    coalesce(pva.favorites, 0) as q_fav,
+    coalesce(pva.vote_net_delta, 0) as q_vote_net_delta,
+    coalesce(ca.comment_count, 0) as q_comment_count,
+    rc.closed_at,
+    rc.close_reason_name,
+    pla.duplicate_links,
+    pla.related_links
+  from posts q
+  join questions_with_tags qwt on qwt.question_id = q.id
+  left join post_votes_agg pva on pva.postid = q.id
+  left join comments_agg ca on ca.postid = q.id
+  left join recent_closures rc on rc.question_id = q.id
+  left join post_links_agg pla on pla.postid = q.id
+  where q.posttypeid = 1
+),
+-- Accepted answer info and best-scoring answer
+answer_metrics as (
+  select
+    qe.question_id,
+    max(ae.answer_score) filter (where ae.is_accepted) as accepted_answer_score,
+    min(ae.answer_creation) filter (where ae.is_accepted) as accepted_answer_time,
+    max(ae.answer_score) as best_answer_score,
+    min(ae.answer_creation) filter (where ae.rank_in_question_by_score = 1) as best_answer_time,
+    count(*) as answer_count,
+    sum(case when ae.is_accepted then 1 else 0 end) as accepted_count
+  from answers_enriched ae
+  join posts qe on qe.id = ae.question_id
+  group by qe.id
+),
+-- Derive performance-heavy computed fields with string/NULL logic
+derived as (
+  select
+    qm.question_id,
+    qm.asker_id,
+    qm.asked_at,
+    qm.q_score,
+    qm.viewcount,
+    qm.tag,
+    qm.tag_pop_rank,
+    am.answer_count,
+    coalesce(am.accepted_count, 0) > 0 as has_accepted,
+    coalesce(am.accepted_answer_score, -2147483648) as accepted_answer_score,
+    coalesce(am.best_answer_score, -2147483648) as best_answer_score,
+    qm.q_up,
+    qm.q_down,
+    qm.q_fav,
+    qm.q_vote_net_delta,
+    qm.q_comment_count,
+    qm.closed_at,
+    qm.close_reason_name,
+    qm.duplicate_links,
+    qm.related_links,
+    case
+      when qm.viewcount > 0 then round((cast(qm.q_up as numeric) - cast(qm.q_down as numeric)) / greatest(cast(qm.viewcount as numeric), 1), 6)
+      else 0
+    end as vote_density,
+    case
+      when am.answer_count > 0 then round(cast(qm.q_comment_count as numeric) / cast(am.answer_count as numeric), 6)
+      else null
+    end as comments_per_answer,
+    case
+      when qm.q_score is null then 'unknown'
+      when qm.q_score >= 10 then 'hot'
+      when qm.q_score between 0 and 9 then 'warm'
+      else 'cold'
+    end as heat_bucket,
+    -- synthetic title-like string using tag and close reason
+    trim(both ' ' from
+      coalesce(nullif(qm.tag, ''), 'untagged')
+      || case when qm.close_reason_name is not null then ' [closed: ' || qm.close_reason_name || ']' else '' end
+    ) as label,
+    -- boolean like expressions across multiple nullable inputs
+    (coalesce(qm.duplicate_links, 0) > 0 or coalesce(qm.close_reason_name, '') ilike '%duplicate%') as is_dupeish
+  from question_metrics qm
+  left join answer_metrics am on am.question_id = qm.question_id
+),
+-- Join with users and badges to bring user context
+question_user_context as (
+  select
+    d.*,
+    au.displayname as asker_name,
+    au.location as asker_location,
+    au.websiteurl_norm as asker_website,
+    au.reputation as asker_reputation,
+    au.rep_bucket as asker_rep_bucket,
+    au.recency_rank as asker_recency_rank,
+    ub.badge_count,
+    coalesce(ub.gold_count, 0) as gold_count,
+    coalesce(ub.silver_count, 0) as silver_count,
+    coalesce(ub.bronze_count, 0) as bronze_count
+  from derived d
+  left join active_users au on au.user_id = d.asker_id
+  left join user_badges ub on ub.userid = d.asker_id
+),
+-- Build a per-tag rolling window of question quality indicators
+tag_quality as (
+  select
+    quc.*,
+    avg(quc.q_score) over (partition by quc.tag rows between 99 preceding and current row) as rolling_avg_qscore_100,
+    avg(quc.best_answer_score) over (partition by quc.tag rows between 99 preceding and current row) as rolling_avg_best_answer_100,
+    sum(case when quc.has_accepted then 1 else 0 end) over (partition by quc.tag rows between 99 preceding and current row) as rolling_accepted_100,
+    percentile_cont(0.5) within group (order by coalesce(quc.viewcount, 0)) over (partition by quc.tag) as median_views_per_tag
+  from question_user_context quc
+),
+-- Identify top-N per tag by a composite score
+ranked as (
+  select
+    tq.*,
+    (
+      coalesce(tq.q_score, 0)*1.0
+      + coalesce(tq.best_answer_score, 0)*0.6
+      + case when tq.has_accepted then 3 else 0 end
+      + greatest(least(coalesce(tq.viewcount,0)/1000.0, 50), 0)
+      + coalesce(tq.q_fav, 0)*0.2
+      - coalesce(tq.q_down, 0)*0.5
+      + case when tq.is_dupeish then -2 else 0 end
+    ) as composite_score
+  from tag_quality tq
+),
+-- Select top 5 per tag and also keep some lower-ranked to stress set operators
+top_per_tag as (
+  select * from (
+    select
+      r.*,
+      row_number() over (partition by r.tag order by r.composite_score desc nulls last, r.asked_at desc, r.question_id) as rn
+    from ranked r
+  ) s
+  where s.rn <= 5
+),
+bottom_sample_per_tag as (
+  select * from (
+    select
+      r.*,
+      row_number() over (partition by r.tag order by r.composite_score asc nulls first, r.asked_at asc, r.question_id) as rn_low
+    from ranked r
+  ) s
+  where s.rn_low <= 2
+),
+-- Combine sets to get a diverse sample
+sample_set as (
+  select * from top_per_tag
+  union all
+  select * from bottom_sample_per_tag
+),
+-- Correlated subquery: first comment snippet per question (if any)
+first_comment as (
+  select
+    c.postid as question_id,
+    substring(c.text from 1 for 120) as first_comment_snippet
+  from comments c
+  where c.id = (
+    select c2.id
+    from comments c2
+    where c2.postid = c.postid
+    order by c2.creationdate asc, c2.id asc
+    limit 1
+  )
+)
+select
+  s.tag,
+  s.tag_pop_rank,
+  s.question_id,
+  s.asked_at,
+  s.asker_id,
+  coalesce(s.asker_name, '(unknown)') as asker_name,
+  coalesce(nullif(s.asker_location, ''), 'n/a') as asker_location,
+  s.asker_reputation,
+  s.asker_rep_bucket,
+  s.asker_recency_rank,
+  s.badge_count,
+  s.gold_count,
+  s.silver_count,
+  s.bronze_count,
+  s.q_score,
+  s.viewcount,
+  s.q_up,
+  s.q_down,
+  s.q_fav,
+  s.q_vote_net_delta,
+  s.q_comment_count,
+  s.has_accepted,
+  s.accepted_answer_score,
+  s.best_answer_score,
+  s.vote_density,
+  s.comments_per_answer,
+  s.heat_bucket,
+  s.label,
+  s.is_dupeish,
+  s.rolling_avg_qscore_100,
+  s.rolling_avg_best_answer_100,
+  s.rolling_accepted_100,
+  s.median_views_per_tag,
+  fc.first_comment_snippet,
+  -- complicated predicate projection example
+  case
+    when s.closed_at is not null and s.close_reason_name is not null then 'closed'
+    when s.closed_at is not null then 'closed-unknown'
+    when s.is_dupeish then 'dupeish'
+    when s.q_score < 0 and s.viewcount < coalesce(cast(s.median_views_per_tag as int), 0) then 'low-signal'
+    else 'open'
+  end as status_bucket
+from sample_set s
+left join first_comment fc on fc.question_id = s.question_id
+where
+  -- compound filter mixing numeric, string, and null logic
+  (
+    s.composite_score > 5
+    or (s.has_accepted and s.q_score >= 0 and coalesce(s.viewcount, 0) > 100)
+    or (s.q_fav >= 3 and s.q_down <= 1)
+  )
+  and (
+    s.asker_reputation is null
+    or s.asker_reputation >= 50
+    or (s.asker_name ilike '%bot%') is not true
+  )
+  and (
+    s.tag not ilike any (array['%test%', '%homework%'])
+    or s.tag is null
+  )
+order by
+  s.tag_pop_rank nulls last,
+  s.tag,
+  s.composite_score desc nulls last,
+  s.asked_at desc,
+  s.question_id
+limit 500;

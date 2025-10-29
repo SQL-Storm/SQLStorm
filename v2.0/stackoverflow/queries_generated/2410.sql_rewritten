@@ -1,0 +1,156 @@
+-- {"query": "2410.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1523} 
+with RecursivePostHierarchy as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.AcceptedAnswerId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        1 as Level,
+        array[p.Id] as Path
+    from Posts p
+    where p.PostTypeId = 1 -- questions only
+    union all
+    select
+        child.Id,
+        child.PostTypeId,
+        child.ParentId,
+        child.AcceptedAnswerId,
+        child.OwnerUserId,
+        child.CreationDate,
+        child.Score,
+        child.ViewCount,
+        child.Title,
+        child.Tags,
+        parent.Level + 1 as Level,
+        parent.Path || child.Id
+    from Posts child
+    join RecursivePostHierarchy parent on parent.Id = child.ParentId
+    where child.PostTypeId = 2 -- answers only
+), UserBadgesCount as (
+    select 
+        b.UserId, 
+        count(*) filter (where b.Class = 1) as GoldBadges,
+        count(*) filter (where b.Class = 2) as SilverBadges,
+        count(*) filter (where b.Class = 3) as BronzeBadges,
+        count(*) as TotalBadges
+    from Badges b
+    group by b.UserId
+), LatestUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        max(ph.CreationDate) as LastEditDate,
+        max(c.CreationDate) as LastCommentDate
+    from Users u
+    left join PostHistory ph on ph.UserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+), QuestionStats as (
+    select
+        q.Id,
+        q.Title,
+        q.OwnerUserId,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        coalesce(q.AnswerCount, 0) as AnswerCount,
+        coalesce(q.FavoriteCount, 0) as FavoriteCount,
+        q.AcceptedAnswerId,
+        (select count(*) from Votes v where v.PostId = q.Id and v.VoteTypeId = 2) as UpVotes,
+        (select count(*) from Votes v where v.PostId = q.Id and v.VoteTypeId = 3) as DownVotes,
+        case when q.ClosedDate is not null then 1 else 0 end as IsClosed,
+        q.Tags,
+        (select string_agg(distinct lt.Name, ', ') from PostLinks pl join LinkTypes lt on pl.LinkTypeId = lt.Id where pl.PostId = q.Id) as LinkedPostTypes,
+        row_number() over (partition by q.OwnerUserId order by q.Score desc, q.CreationDate desc) as UserTopQuestionRank
+    from Posts q
+    where q.PostTypeId = 1
+), ComplexPostRanking as (
+    select
+        rph.Id,
+        rph.PostTypeId,
+        rph.ParentId,
+        rph.CreationDate,
+        rph.Score,
+        rph.ViewCount,
+        rph.Level,
+        rph.Path,
+        qs.Title,
+        qs.AnswerCount,
+        qs.FavoriteCount,
+        qs.UpVotes,
+        qs.DownVotes,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ub.TotalBadges,
+        lu.DisplayName,
+        lu.Reputation,
+        lu.LastAccessDate,
+        lu.LastEditDate,
+        lu.LastCommentDate,
+        -- complex score calculation with NULL-safe coalesce and conditional arithmetic
+        (rph.Score * 0.7 + coalesce(qs.ViewCount,0) * 0.15 + coalesce(qs.AnswerCount,0) * 3 + coalesce(qs.FavoriteCount,0) * 5 + coalesce(ub.GoldBadges,0) * 10 + coalesce(ub.SilverBadges,0) * 5 + coalesce(ub.BronzeBadges,0) * 2) /
+        greatest(extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - rph.CreationDate))/86400, 1) as WeightedScorePerDay
+    from RecursivePostHierarchy rph
+    left join QuestionStats qs on qs.Id = case when rph.PostTypeId=2 then rph.ParentId else rph.Id end
+    left join UserBadgesCount ub on ub.UserId = rph.OwnerUserId
+    left join LatestUserActivity lu on lu.UserId = rph.OwnerUserId
+), FilteredPosts as (
+    select *
+    from ComplexPostRanking
+    where 
+        (Tags ilike '%<sql>%' or Tags ilike '%<performance>%') and -- looking for specific tags in XML style string
+        UserTopQuestionRank <= 5 and -- top 5 questions by user
+        IsClosed = 0 and -- only open questions
+        CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years' and -- recent posts
+        (ViewCount > 1000 or Score > 10) -- popular content
+), DistinctTopPosts as (
+    select distinct on (OwnerUserId) 
+        Id, PostTypeId, Title, OwnerUserId, WeightedScorePerDay
+    from FilteredPosts
+    order by OwnerUserId, WeightedScorePerDay desc
+), UnionedSet as (
+    select OwnerUserId, 'Question' as PostCategory, Id, Title, WeightedScorePerDay
+    from DistinctTopPosts
+    where PostTypeId = 1
+    union
+    select OwnerUserId, 'Answer' as PostCategory, rph.Id, rph.Title, rph.WeightedScorePerDay
+    from FilteredPosts rph
+    where rph.PostTypeId = 2 and rph.Level = 2
+), RankedUnion as (
+    select
+        us.*,
+        rank() over (partition by us.PostCategory order by us.WeightedScorePerDay desc) as RankByCategory,
+        dense_rank() over (order by us.WeightedScorePerDay desc) as GlobalRank
+    from UnionedSet us
+)
+select
+    ru.GlobalRank,
+    ru.RankByCategory,
+    ru.PostCategory,
+    ru.Id as PostId,
+    left(ru.Title, 150) || case when length(ru.Title) > 150 then '...' else '' end as ShortTitle,
+    ru.WeightedScorePerDay,
+    coalesce(u.DisplayName, 'unknown user') as OwnerName,
+    u.Reputation,
+    u.LastAccessDate,
+    case 
+        when u.Reputation > 100000 then 'Legend'
+        when u.Reputation > 20000 then 'Expert'
+        when u.Reputation > 5000 then 'Intermediate'
+        else 'Novice'
+    end as UserLevel
+from RankedUnion ru
+left join Users u on u.Id = ru.OwnerUserId
+where ru.GlobalRank <= 50
+order by ru.GlobalRank
+;

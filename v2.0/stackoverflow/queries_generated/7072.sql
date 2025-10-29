@@ -1,0 +1,176 @@
+-- {"query": "7072.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1637} 
+SELECT 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) as TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) as TotalQuestionScore,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) as TotalAnswerScore,
+    AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) as AvgQuestionScore,
+    AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) as AvgAnswerScore,
+    COUNT(DISTINCT c.Id) as TotalComments,
+    COUNT(DISTINCT b.Id) as TotalBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) as GoldBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) as SilverBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) as BronzeBadges,
+    COALESCE(
+        (SELECT TOP 1 bt.Name 
+         FROM Badges b2 
+         JOIN BadgeTypes bt ON b2.Class = bt.Id 
+         WHERE b2.UserId = u.Id 
+         ORDER BY b2.Date DESC), 
+        'No Badge'
+    ) as RecentBadgeType,
+    COALESCE(
+        (SELECT STRING_AGG(t.TagName, ', ') 
+         FROM Posts p3 
+         CROSS APPLY STRING_SPLIT(p3.Tags, '>') as tag_split 
+         JOIN Tags t ON t.TagName = LTRIM(RTRIM(tag_split.value))
+         WHERE p3.OwnerUserId = u.Id 
+         AND p3.PostTypeId = 1 
+         AND p3.Tags IS NOT NULL
+         GROUP BY p3.OwnerUserId
+         HAVING COUNT(*) > 0
+        ), 
+        'No Tags'
+    ) as TopTags,
+    (
+        SELECT COUNT(*) 
+        FROM PostHistory ph 
+        WHERE ph.UserId = u.Id 
+        AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)
+    ) as EditCount,
+    (
+        SELECT COUNT(*) 
+        FROM Votes v 
+        WHERE v.UserId = u.Id 
+        AND v.VoteTypeId IN (2, 3) 
+        AND v.CreationDate >= DATEADD(YEAR, -1, GETDATE())
+    ) as RecentVotes,
+    ROW_NUMBER() OVER (
+        ORDER BY 
+            SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) + 
+            SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) DESC
+    ) as UserRank,
+    DENSE_RANK() OVER (
+        PARTITION BY 
+            CASE WHEN u.Reputation > 10000 THEN 'High' 
+                 WHEN u.Reputation > 1000 THEN 'Medium' 
+                 ELSE 'Low' END
+        ORDER BY 
+            SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) + 
+            SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) DESC
+    ) as ReputationRank,
+    CASE 
+        WHEN u.Reputation > 100000 THEN 'Elite'
+        WHEN u.Reputation > 50000 THEN 'Expert'
+        WHEN u.Reputation > 10000 THEN 'Advanced'
+        WHEN u.Reputation > 1000 THEN 'Intermediate'
+        ELSE 'Beginner'
+    END as ReputationLevel,
+    EXISTS(
+        SELECT 1 
+        FROM Posts p4 
+        WHERE p4.OwnerUserId = u.Id 
+        AND p4.Score > 100
+    ) as HasHighScoringPosts,
+    IIF(
+        u.LastAccessDate >= DATEADD(DAY, -7, GETDATE()), 
+        'Active', 
+        'Inactive'
+    ) as UserStatus,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p5 
+        WHERE p5.OwnerUserId = u.Id 
+        AND p5.PostTypeId = 1 
+        AND p5.AcceptedAnswerId IS NOT NULL
+    ) as QuestionsWithAcceptedAnswers,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p6 
+        WHERE p6.OwnerUserId = u.Id 
+        AND p6.PostTypeId = 2 
+        AND p6.Score > 0
+    ) as PositiveAnswerCount,
+    (
+        SELECT SUM(v.BountyAmount) 
+        FROM Votes v 
+        WHERE v.UserId = u.Id 
+        AND v.VoteTypeId = 8
+    ) as TotalBountyAwarded,
+    (
+        SELECT AVG(p1.Score) 
+        FROM Posts p1 
+        WHERE p1.OwnerUserId = u.Id 
+        AND p1.PostTypeId = 1
+    ) as AverageQuestionScore,
+    (
+        SELECT MAX(p2.Score) 
+        FROM Posts p2 
+        WHERE p2.OwnerUserId = u.Id 
+        AND p2.PostTypeId = 2
+    ) as MaxAnswerScore,
+    (
+        SELECT STRING_AGG(
+            CASE 
+                WHEN v.VoteTypeId = 2 THEN 'Upvote' 
+                WHEN v.VoteTypeId = 3 THEN 'Downvote' 
+                ELSE 'Other' 
+            END, 
+            ', '
+        ) 
+        FROM Votes v 
+        WHERE v.UserId = u.Id 
+        AND v.CreationDate >= DATEADD(MONTH, -6, GETDATE())
+    ) as RecentVoteTypes,
+    (
+        SELECT COUNT(DISTINCT ph1.PostId) 
+        FROM PostHistory ph1 
+        WHERE ph1.UserId = u.Id 
+        AND ph1.PostHistoryTypeId IN (10, 11, 12, 13)
+    ) as ModerationActions,
+    (
+        SELECT COUNT(DISTINCT p7.Id) 
+        FROM Posts p7 
+        INNER JOIN PostLinks pl ON p7.Id = pl.PostId 
+        WHERE p7.OwnerUserId = u.Id 
+        AND pl.LinkTypeId = 3
+    ) as DuplicateLinksCreated,
+    (
+        SELECT COUNT(DISTINCT p8.Id) 
+        FROM Posts p8 
+        WHERE p8.OwnerUserId = u.Id 
+        AND p8.ViewCount > 1000
+    ) as PopularPostsCount
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN Comments c ON u.Id = c.UserId
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+LEFT JOIN Votes v ON u.Id = v.UserId
+LEFT JOIN PostLinks pl ON u.Id = pl.PostId
+LEFT JOIN Tags t ON u.Id = t.Id
+WHERE u.Reputation > 0
+    AND u.CreationDate >= DATEADD(YEAR, -5, GETDATE())
+    AND (
+        p.Id IS NULL 
+        OR (p.Id IS NOT NULL AND (p.PostTypeId IN (1, 2) OR p.PostTypeId IS NULL))
+    )
+GROUP BY 
+    u.Id, 
+    u.DisplayName, 
+    u.Reputation, 
+    u.LastAccessDate,
+    u.CreationDate
+HAVING 
+    COUNT(DISTINCT COALESCE(p.Id, 0)) > 0
+    AND COUNT(DISTINCT COALESCE(c.Id, 0)) >= 0
+    AND COUNT(DISTINCT CASE WHEN b.Id IS NOT NULL THEN b.Id ELSE 0 END) >= 0
+ORDER BY 
+    TotalQuestionScore DESC,
+    TotalAnswerScore DESC,
+    TotalPosts DESC
+OPTION (RECOMPILE)

@@ -1,0 +1,221 @@
+WITH UserEngagementSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.Views AS UserProfileViews,
+        u.UpVotes AS TotalUpVotesGiven,
+        u.DownVotes AS TotalDownVotesGiven,
+        COALESCE(u.Location, 'Global') AS UserLocationCategory,
+        CASE
+            WHEN u.AboutMe IS NOT NULL AND LENGTH(TRIM(u.AboutMe)) > 200 THEN 'Very Detailed Bio'
+            WHEN u.AboutMe IS NOT NULL AND LENGTH(TRIM(u.AboutMe)) BETWEEN 50 AND 200 THEN 'Moderate Bio'
+            WHEN u.AboutMe IS NOT NULL AND LENGTH(TRIM(u.AboutMe)) < 50 THEN 'Minimal Bio'
+            ELSE 'No Bio Provided'
+        END AS AboutMeDescriptor,
+        COUNT(DISTINCT p.Id) AS TotalPostsCreated,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsAsked,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersProvided,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN COALESCE(p.ViewCount,0) ELSE 0 END) AS TotalQuestionViewCount,
+        SUM(COALESCE(p.Score, 0)) AS SumOfPostScores,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        MAX(p.CreationDate) AS LatestPostActivityDate,
+        MIN(p.CreationDate) AS EarliestPostActivityDate,
+        COUNT(DISTINCT b.Name) AS UniqueBadgeNames,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadgesCount,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadgesCount,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadgesCount
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    LEFT JOIN
+        Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes, u.Location, u.AboutMe
+),
+PostContentAnalysis AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.AnswerCount AS QuestionAnswerCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        CASE
+            WHEN p.Tags IS NULL THEN 0
+            ELSE LENGTH(REPLACE(REPLACE(REPLACE(p.Tags, '<', ''), '>', ','), '||', ''))
+        END AS TagsConcatenatedLength,
+        (CASE WHEN p.Tags IS NULL THEN 0 ELSE COALESCE((SELECT COUNT(*) FROM UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><')) AS t(tag) ),0) END) AS DistinctTagCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS ContentEditCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseVoteCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenVoteCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 12 THEN 1 ELSE 0 END) AS DeleteVoteCount,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 AND ph.Comment IN ('101', '1') THEN 'Duplicate'
+                 WHEN ph.PostHistoryTypeId = 10 AND ph.Comment IN ('102', '2') THEN 'Off-topic'
+                 WHEN ph.PostHistoryTypeId = 10 AND ph.Comment IN ('103', '4') THEN 'Needs Clarity'
+                 ELSE NULL END) AS LastMajorCloseReason,
+        COUNT(DISTINCT pl.RelatedPostId) AS TotalLinkedPosts,
+        SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS TotalDuplicateLinks,
+        CASE WHEN EXISTS (
+            SELECT 1
+            FROM PostHistory ph_edit_user
+            WHERE ph_edit_user.PostId = p.Id
+              AND ph_edit_user.PostHistoryTypeId IN (4,5,6)
+              AND ph_edit_user.UserId IS NOT NULL
+              AND ph_edit_user.UserId != p.OwnerUserId
+        ) THEN 1 ELSE 0 END AS HasExternalEditor,
+        (CASE WHEN p.Body IS NULL THEN 0 ELSE (LENGTH(p.Body) - LENGTH(REPLACE(p.Body, '<code>', ''))) / NULLIF(LENGTH('<code>'),0) END) AS CodeBlockCount,
+        COALESCE(p.LastEditDate, p.CreationDate) AS EffectiveLastActivityDate
+    FROM
+        Posts p
+    LEFT JOIN
+        PostHistory ph ON p.Id = ph.PostId
+    LEFT JOIN
+        PostLinks pl ON p.Id = pl.PostId
+    GROUP BY
+        p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.FavoriteCount, p.ClosedDate, p.Tags, p.Body, p.LastEditDate
+),
+UserPostPerformance AS (
+    SELECT
+        ues.UserId,
+        ues.DisplayName,
+        ues.Reputation,
+        pca.PostId,
+        pca.PostTypeId,
+        pca.PostScore,
+        pca.ViewCount,
+        pca.QuestionAnswerCount,
+        pca.FavoriteCount,
+        pca.ContentEditCount,
+        pca.CloseVoteCount,
+        pca.LastMajorCloseReason,
+        pca.DistinctTagCount,
+        pca.HasExternalEditor,
+        pca.CodeBlockCount,
+        pca.EffectiveLastActivityDate,
+        ues.UserCreationDate,
+        ues.TotalPostsCreated,
+        ues.GoldBadgesCount,
+        RANK() OVER (PARTITION BY ues.UserId ORDER BY pca.PostScore DESC, pca.PostCreationDate ASC) AS PostScoreRankPerUser,
+        AVG(pca.PostScore) OVER (PARTITION BY ues.UserId ORDER BY pca.PostCreationDate ROWS BETWEEN 3 PRECEDING AND 1 PRECEDING) AS AvgPrev3PostScore,
+        EXTRACT(EPOCH FROM (LEAD(pca.PostCreationDate, 1) OVER (PARTITION BY ues.UserId ORDER BY pca.PostCreationDate) - pca.PostCreationDate)) / (60 * 60 * 24) AS DaysToNextPost,
+        NULLIF(SUM(CASE WHEN p_ans.AcceptedAnswerId = pca.PostId THEN 1 ELSE 0 END) OVER (PARTITION BY ues.UserId, pca.PostTypeId), 0) /
+        NULLIF(COUNT(CASE WHEN pca.PostTypeId = 2 AND p_ans.ParentId = pca.PostId THEN 1 ELSE NULL END) OVER (PARTITION BY ues.UserId, pca.PostTypeId), 0) AS UserAnswerAcceptanceRatio
+    FROM
+        UserEngagementSummary ues
+    INNER JOIN
+        PostContentAnalysis pca ON ues.UserId = pca.OwnerUserId
+    LEFT JOIN
+        Posts p_ans ON pca.PostId = p_ans.AcceptedAnswerId OR (pca.PostTypeId = 2 AND pca.PostId = p_ans.ParentId)
+    WHERE
+        ues.Reputation >= 500
+        AND pca.PostScore > 0
+        AND pca.PostCreationDate BETWEEN DATE '2021-01-01' AND DATE '2023-12-31'
+        AND NOT EXISTS (
+            SELECT 1
+            FROM PostHistory ph_migrated
+            WHERE ph_migrated.PostId = pca.PostId
+              AND ph_migrated.PostHistoryTypeId = 35
+        )
+    GROUP BY
+        ues.UserId, ues.DisplayName, ues.Reputation, pca.PostId, pca.PostTypeId, pca.PostScore, pca.ViewCount, pca.QuestionAnswerCount, pca.FavoriteCount, pca.ContentEditCount, pca.CloseVoteCount, pca.LastMajorCloseReason, pca.DistinctTagCount, pca.HasExternalEditor, pca.CodeBlockCount, pca.EffectiveLastActivityDate, ues.UserCreationDate, ues.TotalPostsCreated, ues.GoldBadgesCount, pca.PostCreationDate, p_ans.AcceptedAnswerId, p_ans.ParentId
+),
+UserBehaviorSegmentation AS (
+    SELECT
+        UserId,
+        DisplayName,
+        Reputation,
+        GoldBadgesCount,
+        TotalPostsCreated,
+        SUM(PostScore) AS AggregatePostScore,
+        AVG(PostScore) AS AveragePostScore,
+        MAX(PostScoreRankPerUser) AS HighestPostRank,
+        AVG(AvgPrev3PostScore) AS OverallAvgPrevPostScore,
+        AVG(DaysToNextPost) AS AvgDaysBetweenPosts,
+        SUM(ContentEditCount) AS TotalContentEdits,
+        SUM(CloseVoteCount) AS TotalClosedPostsInitiated,
+        SUM(CASE WHEN LastMajorCloseReason = 'Duplicate' THEN 1 ELSE 0 END) AS DuplicateClosedPosts,
+        SUM(CASE WHEN HasExternalEditor = 1 THEN 1 ELSE 0 END) AS PostsWithExternalEdits,
+        SUM(CodeBlockCount) AS TotalCodeBlocksInPosts,
+        AVG(UserAnswerAcceptanceRatio) AS OverallUserAnswerAcceptanceRatio,
+        CASE
+            WHEN GoldBadgesCount >= 3 AND Reputation >= 10000 AND TotalPostsCreated >= 50 THEN 'High-Achiever Elite'
+            WHEN GoldBadgesCount >= 1 AND Reputation >= 5000 AND TotalPostsCreated >= 20 THEN 'Established Contributor'
+            WHEN Reputation BETWEEN 1000 AND 4999 AND TotalPostsCreated >= 10 THEN 'Active Contributor'
+            ELSE 'Emerging Participant'
+        END AS UserCategory,
+        (Reputation * 0.4) +
+        (SUM(PostScore) * 0.1) +
+        (GoldBadgesCount * 5) +
+        (TotalPostsCreated * 0.5) -
+        (SUM(CloseVoteCount) * 2) +
+        (COALESCE(AVG(UserAnswerAcceptanceRatio), 0) * 100) AS CompositeEngagementScore
+    FROM
+        UserPostPerformance
+    GROUP BY
+        UserId, DisplayName, Reputation, GoldBadgesCount, TotalPostsCreated
+)
+SELECT
+    ubs.UserId,
+    ubs.DisplayName,
+    ubs.Reputation,
+    ubs.UserCategory,
+    ubs.CompositeEngagementScore,
+    ubs.AggregatePostScore,
+    ubs.TotalContentEdits,
+    ubs.DuplicateClosedPosts,
+    ubs.PostsWithExternalEdits,
+    RANK() OVER (ORDER BY ubs.CompositeEngagementScore DESC, ubs.Reputation DESC) AS GlobalEngagementRank
+FROM
+    UserBehaviorSegmentation ubs
+WHERE
+    ubs.UserCategory IN ('High-Achiever Elite', 'Established Contributor')
+    AND ubs.TotalContentEdits >= 5
+    AND ubs.OverallUserAnswerAcceptanceRatio IS NOT NULL AND ubs.OverallUserAnswerAcceptanceRatio > 0.5
+    AND NOT EXISTS (
+        SELECT 1
+        FROM Posts p_q
+        WHERE p_q.OwnerUserId = ubs.UserId
+          AND p_q.PostTypeId = 1
+          AND EXISTS (
+            SELECT 1
+            FROM Posts p_a
+            WHERE p_a.ParentId = p_q.Id
+              AND p_a.OwnerUserId = ubs.UserId
+              AND p_a.PostTypeId = 2
+          )
+    )
+
+UNION ALL
+
+SELECT
+    ubs.UserId,
+    ubs.DisplayName,
+    ubs.Reputation,
+    ubs.UserCategory,
+    ubs.CompositeEngagementScore,
+    ubs.AggregatePostScore,
+    ubs.TotalContentEdits,
+    ubs.DuplicateClosedPosts,
+    ubs.PostsWithExternalEdits,
+    RANK() OVER (ORDER BY ubs.CompositeEngagementScore DESC, ubs.Reputation DESC) AS GlobalEngagementRank
+FROM
+    UserBehaviorSegmentation ubs
+WHERE
+    ubs.UserCategory IN ('Active Contributor', 'Emerging Participant')
+    AND ubs.DuplicateClosedPosts > 0
+    AND ubs.PostsWithExternalEdits >= 1
+    AND ubs.Reputation < 5000
+    AND ubs.AvgDaysBetweenPosts < 30
+    AND ubs.TotalCodeBlocksInPosts >= 3
+ORDER BY
+    GlobalEngagementRank ASC, Reputation DESC
+LIMIT 500;

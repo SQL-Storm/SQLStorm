@@ -1,0 +1,255 @@
+-- {"query": "7004.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2681} 
+WITH PostStats AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.Body,
+        COALESCE(p.AnswerCount, 0) AS AnswerCountCoalesced,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostTypeDescription,
+        CASE 
+            WHEN p.Score > 100 THEN 'HighlyVoted'
+            WHEN p.Score > 10 THEN 'ModeratelyVoted'
+            WHEN p.Score > 0 THEN 'LowVoted'
+            ELSE 'NoVotes'
+        END AS VotingLevel,
+        DATEDIFF(day, p.CreationDate, CURRENT_TIMESTAMP) AS DaysSinceCreation,
+        COALESCE(p.ViewCount, 0) / NULLIF(COALESCE(p.Score, 1), 0) AS ViewsPerScoreRatio,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND LENGTH(p.Tags) > 0 THEN 
+                ARRAY_LENGTH(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><'), 1)
+            ELSE 0
+        END AS TagCountEstimate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserPostRank
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+AnswerStats AS (
+    SELECT 
+        a.ParentId,
+        COUNT(*) AS TotalAnswers,
+        AVG(a.Score) AS AvgAnswerScore,
+        MAX(a.Score) AS MaxAnswerScore,
+        CASE 
+            WHEN COUNT(*) > 0 THEN 
+                CASE WHEN CAST(AVG(a.Score) AS NUMERIC(10,2)) > 5 THEN 'Good'
+                     WHEN CAST(AVG(a.Score) AS NUMERIC(10,2)) > 0 THEN 'Average'
+                     ELSE 'Poor'
+                END
+            ELSE 'NoAnswers'
+        END AS AnswerQuality,
+        STRING_AGG(CAST(a.Score AS VARCHAR), ',') AS AnswerScoresList
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+    GROUP BY a.ParentId
+),
+QuestionStats AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        q.CommentCount,
+        q.FavoriteCount,
+        q.CreationDate,
+        q.OwnerUserId,
+        COALESCE(a.TotalAnswers, 0) AS AnswerCount,
+        COALESCE(a.AvgAnswerScore, 0) AS AvgAnswerScore,
+        COALESCE(a.MaxAnswerScore, 0) AS MaxAnswerScore,
+        CASE WHEN COALESCE(a.TotalAnswers, 0) > 0 THEN 
+            CASE WHEN COALESCE(a.AvgAnswerScore, 0) >= 10 THEN 'Excellent'
+                 WHEN COALESCE(a.AvgAnswerScore, 0) >= 5 THEN 'Good'
+                 ELSE 'Poor'
+            END
+        ELSE 'NoAnswersYet' END AS OverallAnswerQuality,
+        CASE WHEN q.Score > 50 THEN 'HighlyVotedQuestion'
+             WHEN q.Score > 10 THEN 'ModerateVotedQuestion'
+             ELSE 'LowVotedQuestion' END AS QuestionPopularity,
+        COALESCE(q.AnswerCount, 0) * 100.0 / NULLIF(COALESCE(q.ViewCount, 1), 0) AS AnswerToViewRatio,
+        CASE WHEN q.AcceptedAnswerId IS NOT NULL THEN 'HasAcceptedAnswer'
+             ELSE 'NoAcceptedAnswer' END AS HasAcceptedAnswerFlag,
+        q.Tags,
+        COALESCE(LENGTH(q.Tags), 0) AS TagLength,
+        DATEDIFF(day, q.CreationDate, CURRENT_TIMESTAMP) AS DaysSinceQuestionCreation
+    FROM Posts q
+    LEFT JOIN AnswerStats a ON q.Id = a.ParentId
+    WHERE q.PostTypeId = 1
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.AccountId,
+        CASE WHEN u.ViewCount > 1000000 THEN 'HighTraffic'
+             WHEN u.ViewCount > 100000 THEN 'MediumTraffic'
+             ELSE 'LowTraffic' END AS TrafficLevel,
+        COALESCE(COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END), 0) AS QuestionsAsked,
+        COALESCE(COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END), 0) AS AnswersGiven,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN COALESCE(p.Score, 0) ELSE 0 END), 0) AS TotalQuestionScore,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN COALESCE(p.Score, 0) ELSE 0 END), 0) AS TotalAnswerScore,
+        CASE WHEN u.Reputation > 1000000 THEN 'Legendary'
+             WHEN u.Reputation > 100000 THEN 'Master'
+             WHEN u.Reputation > 10000 THEN 'Expert'
+             WHEN u.Reputation > 1000 THEN 'Intermediate'
+             ELSE 'Beginner' END AS ReputationLevel,
+        STRING_AGG(DISTINCT p.Title, ' | ') AS UserQuestionTitles,
+        STRING_AGG(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Title ELSE NULL END, ' | ') AS UserAnswerTitles
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.AccountId
+),
+PostHistorySummary AS (
+    SELECT 
+        ph.PostId,
+        COUNT(*) AS HistoryCount,
+        MAX(ph.CreationDate) AS LatestHistoryDate,
+        COUNT(DISTINCT ph.PostHistoryTypeId) AS DistinctHistoryTypes,
+        STRING_AGG(DISTINCT ph.Comment, ', ') AS HistoryComments,
+        STRING_AGG(DISTINCT ph.Text, ' | ') AS HistoryTexts
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+),
+FinalAnalysis AS (
+    SELECT 
+        qs.QuestionId,
+        qs.Title,
+        qs.QuestionScore,
+        qs.ViewCount,
+        qs.AnswerCount,
+        qs.CommentCount,
+        qs.FavoriteCount,
+        qs.OwnerUserId,
+        qs.AnswerCount AS TotalAnswers,
+        qs.AvgAnswerScore,
+        qs.MaxAnswerScore,
+        qs.AnswerQuality,
+        qs.QuestionPopularity,
+        qs.AnswerToViewRatio,
+        qs.HasAcceptedAnswerFlag,
+        qs.Tags,
+        qs.TagLength,
+        qs.DaysSinceQuestionCreation,
+        CASE WHEN qs.QuestionScore > 100 AND qs.AnswerCount > 5 THEN 'HotQuestion'
+             WHEN qs.QuestionScore > 50 AND qs.AnswerCount > 3 THEN 'PopularQuestion'
+             ELSE 'RegularQuestion' END AS QuestionTrend,
+        CASE WHEN qs.AnswerCount > 0 THEN 
+            CASE WHEN qs.AnswerCount >= qs.AnswerCount OR qs.AnswerCount > qs.AvgAnswerScore THEN 'HighlyAnswered'
+                 ELSE 'ModeratelyAnswered' END
+            ELSE 'Unanswered' END AS AnswerStatus,
+        CASE WHEN qs.ViewCount > 10000 THEN 'Viral'
+             WHEN qs.ViewCount > 1000 THEN 'Popular'
+             WHEN qs.ViewCount > 100 THEN 'Moderate'
+             ELSE 'LowView' END AS ViewStatus,
+        CASE WHEN qs.AnswerCount / NULLIF(qs.ViewCount, 0) > 0.1 THEN 'HighAnswerRate'
+             WHEN qs.AnswerCount / NULLIF(qs.ViewCount, 0) > 0.05 THEN 'MediumAnswerRate'
+             ELSE 'LowAnswerRate' END AS AnswerToViewRate,
+        u.DisplayName AS OwnerName,
+        u.Reputation AS OwnerReputation,
+        u.TrafficLevel,
+        u.QuestionsAsked,
+        u.AnswersGiven,
+        u.TotalQuestionScore,
+        u.TotalAnswerScore,
+        u.ReputationLevel,
+        u.UserQuestionTitles,
+        u.UserAnswerTitles,
+        ph.HistoryCount,
+        ph.LatestHistoryDate,
+        ph.DistinctHistoryTypes,
+        ph.HistoryComments,
+        ph.HistoryTexts,
+        CASE WHEN ph.HistoryCount > 20 THEN 'HighlyEdited'
+             WHEN ph.HistoryCount > 10 THEN 'ModeratelyEdited'
+             ELSE 'SparselyEdited' END AS EditLevel,
+        DATEDIFF(day, qs.CreationDate, ph.LatestHistoryDate) AS DaysSinceLastEdit,
+        CASE WHEN qs.AnswerCount > 0 THEN (qs.AnswerCount * 1.0) / (qs.ViewCount * 1.0) ELSE 0 END AS AnswerToVisitRatio,
+        COALESCE(LENGTH(qs.Tags), 0) / NULLIF(COALESCE(LENGTH(qs.Title), 1), 0) AS TagToTitleRatio,
+        CASE WHEN qs.DaysSinceQuestionCreation > 365 THEN 'OldQuestion'
+             WHEN qs.DaysSinceQuestionCreation > 30 THEN 'RecentQuestion'
+             ELSE 'VeryRecentQuestion' END AS RecencyLevel
+    FROM QuestionStats qs
+    LEFT JOIN UserActivity u ON qs.OwnerUserId = u.UserId
+    LEFT JOIN PostHistorySummary ph ON qs.QuestionId = ph.PostId
+)
+SELECT 
+    fa.QuestionId,
+    fa.Title,
+    fa.QuestionScore,
+    fa.ViewCount,
+    fa.AnswerCount,
+    fa.CommentCount,
+    fa.FavoriteCount,
+    fa.OwnerName,
+    fa.OwnerReputation,
+    fa.AnswerQuality,
+    fa.QuestionPopularity,
+    fa.AnswerToViewRatio,
+    fa.HasAcceptedAnswerFlag,
+    fa.Tags,
+    fa.TagLength,
+    fa.DaysSinceQuestionCreation,
+    fa.QuestionTrend,
+    fa.AnswerStatus,
+    fa.ViewStatus,
+    fa.AnswerToViewRate,
+    fa.TrafficLevel,
+    fa.QuestionsAsked,
+    fa.AnswersGiven,
+    fa.TotalQuestionScore,
+    fa.TotalAnswerScore,
+    fa.ReputationLevel,
+    fa.HistoryCount,
+    fa.LatestHistoryDate,
+    fa.DistinctHistoryTypes,
+    fa.EditLevel,
+    fa.DaysSinceLastEdit,
+    fa.AnswerToVisitRatio,
+    fa.TagToTitleRatio,
+    fa.RecencyLevel,
+    CASE 
+        WHEN fa.QuestionScore > 50 AND fa.AnswerCount > 5 AND fa.ViewCount > 1000 THEN 'EliteQuestion'
+        WHEN fa.QuestionScore > 30 AND fa.AnswerCount > 3 AND fa.ViewCount > 500 THEN 'PopularQuestion'
+        WHEN fa.QuestionScore > 10 AND fa.AnswerCount > 1 AND fa.ViewCount > 100 THEN 'StandardQuestion'
+        ELSE 'BasicQuestion' 
+    END AS QuestionClassification,
+    COALESCE(ROUND(fa.Reputation / NULLIF(fa.OwnerReputation, 0) * 100.0, 2), 0) AS ReputationRatio,
+    (fa.QuestionScore + fa.AnswerCount + fa.ViewCount) AS CombinedMetrics,
+    CASE WHEN fa.ViewCount > 10000 AND fa.AnswerCount > 5 THEN 'ViralQuestionWithAnswers'
+         WHEN fa.ViewCount > 5000 AND fa.AnswerCount > 3 THEN 'PopularQuestionWithSomeAnswers'
+         ELSE 'RegularQuestion' END AS EngagementLevel,
+    CASE 
+        WHEN fa.HistoryCount > 10 THEN 
+            CASE 
+                WHEN fa.AnswerQuality = 'Excellent' THEN 'WellMaintainedExcellentAnswers'
+                WHEN fa.AnswerQuality = 'Good' THEN 'WellMaintainedGoodAnswers'
+                ELSE 'MaintenanceRequired'
+            END
+        ELSE 'NormalMaintenance'
+    END AS MaintenanceStatus
+FROM FinalAnalysis fa
+WHERE fa.QuestionScore > 0 
+    AND fa.OwnerReputation IS NOT NULL
+    AND (fa.AnswerCount IS NOT NULL OR fa.AnswerCount = 0)
+    AND fa.QuestionScore BETWEEN 1 AND 1000
+ORDER BY 
+    fa.QuestionScore DESC,
+    fa.ViewCount DESC,
+    fa.AnswerCount DESC
+LIMIT 1000;

@@ -1,0 +1,340 @@
+WITH UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.UpVotes,
+        u.DownVotes,
+        u.Views AS UserViews,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScoreOwned,
+        COALESCE(COUNT(DISTINCT p.Id), 0) AS TotalPostsOwned,
+        COALESCE(COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END), 0) AS TotalQuestionsOwned,
+        COALESCE(COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END), 0) AS TotalAnswersOwned,
+        COALESCE(SUM(c.Score), 0) AS TotalCommentScoreMade,
+        COALESCE(COUNT(DISTINCT c.Id), 0) AS TotalCommentsMade,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE NULL END) AS AvgQuestionViewCount,
+        MAX(p.LastActivityDate) AS LastPostActivityDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.UpVotes, u.DownVotes, u.Views
+    HAVING u.Reputation > 5000 AND u.LastAccessDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year')
+),
+PostTagAnalysis AS (
+    SELECT
+        p.Id AS PostId,
+        LOWER(unnest(string_to_array(TRIM(BOTH '<>' FROM p.Tags), '><'))) AS TagName
+    FROM Posts p
+    WHERE p.Tags IS NOT NULL AND p.Tags <> '' AND p.PostTypeId = 1
+),
+PostHistoricalContext AS (
+    SELECT
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate AS HistoryDate,
+        ph.UserId AS HistoryUserId,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn,
+        LAG(ph.PostHistoryTypeId, 1, 0) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS PreviousHistoryType,
+        LEAD(ph.PostHistoryTypeId, 1, 0) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS NextHistoryType,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (10, 101) THEN 1 END) OVER (PARTITION BY ph.PostId) AS CloseVoteEventCount,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 END) OVER (PARTITION BY ph.PostId) AS ReopenVoteEventCount
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 10, 11, 12, 13, 16, 19, 20)
+),
+RelatedPostMetrics AS (
+    SELECT
+        pl.PostId,
+        COUNT(DISTINCT pl.RelatedPostId) AS TotalLinkedPosts,
+        COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN pl.RelatedPostId END) AS TotalDuplicateLinks,
+        AVG(rp.Score) AS AvgRelatedPostScore,
+        MAX(rp.CreationDate) AS MaxRelatedPostCreationDate
+    FROM PostLinks pl
+    JOIN Posts rp ON pl.RelatedPostId = rp.Id
+    GROUP BY pl.PostId
+),
+UserInfluenceRanking AS (
+    SELECT
+        ue.UserId,
+        ue.DisplayName,
+        ue.Reputation,
+        ue.UserCreationDate,
+        ue.LastAccessDate,
+        ue.TotalPostsOwned,
+        ue.TotalQuestionsOwned,
+        ue.TotalAnswersOwned,
+        ue.TotalCommentsMade,
+        ue.GoldBadges,
+        ue.TotalPostScoreOwned,
+        ue.AvgQuestionViewCount,
+        ue.LastPostActivityDate,
+        (SELECT
+            CAST(COUNT(c2.Id) AS DECIMAL) / NULLIF(ue.TotalQuestionsOwned, 0)
+         FROM Comments c2
+         JOIN Posts p2 ON c2.PostId = p2.Id
+         WHERE c2.UserId = ue.UserId AND p2.OwnerUserId = ue.UserId AND p2.PostTypeId = 1
+        ) AS SelfCommentRatioOnQuestions,
+        EXISTS (
+            SELECT 1
+            FROM PostHistory ph_inner
+            WHERE ph_inner.UserId = ue.UserId
+            AND ph_inner.PostHistoryTypeId = 5
+            AND EXISTS (
+                SELECT 1
+                FROM PostHistory ph_inner2
+                WHERE ph_inner2.PostId = ph_inner.PostId
+                AND ph_inner2.UserId = ue.UserId
+                AND ph_inner2.PostHistoryTypeId = 8
+                AND ph_inner2.CreationDate > ph_inner.CreationDate
+            )
+        ) AS HasEditedAndRolledBackBody,
+        DENSE_RANK() OVER (ORDER BY
+            (ue.Reputation * 0.5) +
+            (ue.TotalPostScoreOwned * 0.3) +
+            (ue.GoldBadges * 100) +
+            (COALESCE(ue.AvgQuestionViewCount, 0) * 0.01) DESC,
+            ue.LastAccessDate DESC
+        ) AS InfluenceRank
+    FROM UserEngagement ue
+    WHERE ue.TotalPostsOwned > 0
+),
+QuestionTagAggregate AS (
+    SELECT
+        pta.PostId,
+        STRING_AGG(DISTINCT pta.TagName, ', ') AS AllTags,
+        COUNT(DISTINCT pta.TagName) AS TagCount,
+        MAX(t.Count) AS MaxTagPopularity,
+        SUM(CASE WHEN t.IsModeratorOnly = TRUE THEN 1 ELSE 0 END) AS ModeratorOnlyTagCount
+    FROM PostTagAnalysis pta
+    JOIN Tags t ON pta.TagName = t.TagName
+    GROUP BY pta.PostId
+),
+FinalPostMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.OwnerUserId,
+        phc.PreviousHistoryType,
+        phc.NextHistoryType,
+        COALESCE(phc.CloseVoteEventCount, 0) AS CloseVoteEventCount,
+        COALESCE(phc.ReopenVoteEventCount, 0) AS ReopenVoteEventCount,
+        rpm.TotalLinkedPosts,
+        rpm.TotalDuplicateLinks,
+        rpm.AvgRelatedPostScore,
+        qta.AllTags,
+        qta.TagCount,
+        qta.MaxTagPopularity,
+        qta.ModeratorOnlyTagCount,
+        COALESCE(CAST(p.Score AS DECIMAL) / NULLIF(p.ViewCount, 0), 0.0) AS ScorePerView,
+        COALESCE(CAST(p.AnswerCount AS DECIMAL) / NULLIF(p.CommentCount, 0), 0.0) AS AnswerCommentRatio,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL AND p.CommunityOwnedDate IS NOT NULL THEN 'Closed & Community Owned'
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+            ELSE 'Open'
+        END AS PostStatusCategory
+    FROM Posts p
+    LEFT JOIN (
+        SELECT
+            ph.PostId,
+            ph.PreviousHistoryType,
+            ph.NextHistoryType,
+            ph.rn,
+            (SELECT COUNT(DISTINCT ph2.Id) FROM PostHistory ph2 WHERE ph2.PostId = ph.PostId AND ph2.PostHistoryTypeId IN (10,101)) AS CloseVoteEventCount,
+            (SELECT COUNT(DISTINCT ph3.Id) FROM PostHistory ph3 WHERE ph3.PostId = ph.PostId AND ph3.PostHistoryTypeId = 11) AS ReopenVoteEventCount
+        FROM (
+            SELECT
+                ph_inner.PostId,
+                ph_inner.PreviousHistoryType,
+                ph_inner.NextHistoryType,
+                ph_inner.PostHistoryTypeId,
+                ph_inner.CreationDate,
+                ROW_NUMBER() OVER (PARTITION BY ph_inner.PostId ORDER BY ph_inner.CreationDate DESC) AS rn
+            FROM PostHistory ph_inner
+            WHERE ph_inner.PostHistoryTypeId IN (1,2,3,4,5,6,10,11,12,13,16,19,20)
+        ) ph
+        WHERE ph.rn = 1
+    ) phc ON p.Id = phc.PostId
+    LEFT JOIN RelatedPostMetrics rpm ON p.Id = rpm.PostId
+    LEFT JOIN QuestionTagAggregate qta ON p.Id = qta.PostId
+    WHERE p.PostTypeId IN (1, 2)
+),
+AvgScorePerInfluence AS (
+    SELECT
+        uir.InfluenceRank,
+        AVG(fp.Score) AS AvgPostScoreInInfluenceRank
+    FROM UserInfluenceRanking uir
+    JOIN FinalPostMetrics fp ON uir.UserId = fp.OwnerUserId
+    GROUP BY uir.InfluenceRank
+),
+FinalJoined AS (
+    SELECT
+        uir.UserId,
+        uir.DisplayName,
+        uir.Reputation,
+        uir.InfluenceRank,
+        uir.TotalPostsOwned,
+        uir.TotalQuestionsOwned,
+        uir.TotalAnswersOwned,
+        uir.GoldBadges,
+        uir.SelfCommentRatioOnQuestions,
+        uir.HasEditedAndRolledBackBody,
+        fp.PostId,
+        fp.Title,
+        fp.PostTypeId,
+        fp.PostCreationDate,
+        fp.Score,
+        fp.ViewCount,
+        fp.CommentCount,
+        fp.FavoriteCount,
+        fp.ScorePerView,
+        fp.AnswerCommentRatio,
+        fp.PostStatusCategory,
+        fp.AllTags,
+        fp.TagCount,
+        fp.MaxTagPopularity,
+        fp.TotalLinkedPosts,
+        fp.TotalDuplicateLinks,
+        fp.AvgRelatedPostScore,
+        COALESCE(asp.AvgPostScoreInInfluenceRank, 0) AS AvgPostScoreInInfluenceRank,
+        (LENGTH(COALESCE(fp.Title, '')) + LENGTH(COALESCE(fp.AllTags, ''))) AS TitleAndTagLengthCombined,
+        fp.CloseVoteEventCount,
+        fp.ReopenVoteEventCount,
+        uir.LastAccessDate,
+        uir.UserCreationDate,
+        fp.OwnerUserId
+    FROM UserInfluenceRanking uir
+    INNER JOIN FinalPostMetrics fp ON uir.UserId = fp.OwnerUserId
+    LEFT JOIN AvgScorePerInfluence asp ON uir.InfluenceRank = asp.InfluenceRank
+    WHERE uir.InfluenceRank <= 100
+    AND fp.ScorePerView > 0.05
+    AND COALESCE(fp.TotalLinkedPosts, 0) > 0
+    AND (
+        fp.PostStatusCategory = 'Closed & Community Owned'
+        OR (fp.PostStatusCategory = 'Open' AND fp.PostCreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '3 years'))
+    )
+    AND (
+        (fp.PostTypeId = 1 AND fp.Title ILIKE '%performance%' AND COALESCE(fp.TagCount, 0) > 1)
+        OR (fp.PostTypeId = 2 AND fp.Score > 25 AND fp.AnswerCommentRatio IS NOT NULL AND fp.AnswerCommentRatio > 0.5)
+        OR (fp.PostTypeId = 1 AND EXISTS (
+            SELECT 1 FROM Comments c_outer
+            WHERE c_outer.PostId = fp.PostId
+            AND c_outer.UserId = uir.UserId
+            AND c_outer.CreationDate > fp.PostCreationDate + INTERVAL '1 day'
+            AND c_outer.Text ILIKE '%solution%'
+            AND c_outer.Score > (
+                SELECT AVG(c_inner.Score) FROM Comments c_inner WHERE c_inner.PostId = fp.PostId AND c_inner.UserId IS NOT NULL
+            ) * 1.2
+        ))
+    )
+    AND uir.LastAccessDate > uir.UserCreationDate + INTERVAL '180 days'
+    AND NOT uir.HasEditedAndRolledBackBody
+    AND (fp.CloseVoteEventCount > 0 OR fp.ReopenVoteEventCount > 0)
+)
+SELECT
+    fj.UserId,
+    fj.DisplayName,
+    fj.Reputation,
+    fj.InfluenceRank,
+    fj.TotalPostsOwned,
+    fj.TotalQuestionsOwned,
+    fj.TotalAnswersOwned,
+    fj.GoldBadges,
+    fj.SelfCommentRatioOnQuestions,
+    fj.HasEditedAndRolledBackBody,
+    fj.PostId,
+    fj.Title,
+    fj.PostTypeId,
+    fj.PostCreationDate,
+    fj.Score,
+    fj.ViewCount,
+    fj.CommentCount,
+    fj.FavoriteCount,
+    fj.ScorePerView,
+    fj.AnswerCommentRatio,
+    fj.PostStatusCategory,
+    fj.AllTags,
+    fj.TagCount,
+    fj.MaxTagPopularity,
+    fj.TotalLinkedPosts,
+    fj.TotalDuplicateLinks,
+    fj.AvgRelatedPostScore,
+    fj.AvgPostScoreInInfluenceRank,
+    SUM(fj.ViewCount) OVER (PARTITION BY fj.UserId ORDER BY fj.PostCreationDate, fj.PostId) AS RunningViewCountUserCumulative,
+    (LENGTH(COALESCE(fj.Title, '')) + LENGTH(COALESCE(fj.AllTags, ''))) AS TitleAndTagLengthCombined
+FROM FinalJoined fj
+ORDER BY PostCreationDate DESC, Score DESC
+LIMIT 5000
+
+UNION ALL
+
+SELECT
+    NULL AS UserId,
+    'Anonymous Contributor' AS DisplayName,
+    NULL AS Reputation,
+    999999 AS InfluenceRank,
+    NULL AS TotalPostsOwned,
+    NULL AS TotalQuestionsOwned,
+    NULL AS TotalAnswersOwned,
+    NULL AS GoldBadges,
+    NULL AS SelfCommentRatioOnQuestions,
+    NULL AS HasEditedAndRolledBackBody,
+    p_unowned.Id AS PostId,
+    p_unowned.Title,
+    p_unowned.PostTypeId,
+    p_unowned.CreationDate AS PostCreationDate,
+    p_unowned.Score,
+    p_unowned.ViewCount,
+    p_unowned.CommentCount,
+    p_unowned.FavoriteCount,
+    COALESCE(CAST(p_unowned.Score AS DECIMAL) / NULLIF(p_unowned.ViewCount, 0), 0.0) AS ScorePerView,
+    COALESCE(CAST(p_unowned.AnswerCount AS DECIMAL) / NULLIF(p_unowned.CommentCount, 0), 0.0) AS AnswerCommentRatio,
+    CASE
+        WHEN p_unowned.ClosedDate IS NOT NULL AND p_unowned.CommunityOwnedDate IS NOT NULL THEN 'Closed & Community Owned'
+        WHEN p_unowned.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN p_unowned.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        ELSE 'Open'
+    END AS PostStatusCategory,
+    AllTagsAgg.AllTags,
+    AllTagsAgg.TagCount,
+    NULL AS MaxTagPopularity,
+    NULL AS TotalLinkedPosts,
+    NULL AS TotalDuplicateLinks,
+    NULL AS AvgRelatedPostScore,
+    NULL AS AvgPostScoreInInfluenceRank,
+    NULL AS RunningViewCountUserCumulative,
+    (LENGTH(COALESCE(p_unowned.Title, '')) + LENGTH(COALESCE(p_unowned.Tags, ''))) AS TitleAndTagLengthCombined
+FROM Posts p_unowned
+LEFT JOIN (
+    SELECT
+        p2.Id,
+        STRING_AGG(DISTINCT LOWER(unnest(string_to_array(TRIM(BOTH '<>' FROM p2.Tags), '><'))), ', ') AS AllTags,
+        COUNT(DISTINCT LOWER(unnest(string_to_array(TRIM(BOTH '<>' FROM p2.Tags), '><')))) AS TagCount
+    FROM Posts p2
+    GROUP BY p2.Id
+) AllTagsAgg ON p_unowned.Id = AllTagsAgg.Id
+WHERE p_unowned.OwnerUserId IS NULL
+AND p_unowned.PostTypeId = 1
+AND p_unowned.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '4 years')
+AND p_unowned.ViewCount > 50000
+AND p_unowned.CommentCount > 100
+AND p_unowned.FavoriteCount > 200
+AND p_unowned.Title ILIKE '%algorithm%'
+GROUP BY
+    p_unowned.Id, p_unowned.Title, p_unowned.PostTypeId, p_unowned.CreationDate,
+    p_unowned.Score, p_unowned.ViewCount, p_unowned.CommentCount, p_unowned.FavoriteCount,
+    p_unowned.ClosedDate, p_unowned.CommunityOwnedDate, p_unowned.AnswerCount, p_unowned.Tags,
+    AllTagsAgg.AllTags, AllTagsAgg.TagCount
+HAVING AllTagsAgg.TagCount > 3
+ORDER BY PostCreationDate DESC, Score DESC
+LIMIT 5000;

@@ -1,0 +1,145 @@
+WITH 
+UserActivity AS (
+    SELECT 
+        u.Id                                 AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.Views,0) 
+          + COALESCE(u.UpVotes,0) 
+          - COALESCE(u.DownVotes,0)           AS NetScore,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COUNT(c.Id)                              AS CommentCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesGiven,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesGiven,
+        MAX(p.CreationDate)                     AS LastPostDate,
+        MAX(c.CreationDate)                     AS LastCommentDate
+    FROM Users u
+    LEFT JOIN Posts      p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments   c ON c.UserId = u.Id
+    LEFT JOIN Votes      v ON v.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+
+UserBadges AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        STRING_AGG(DISTINCT b.Name, ', ')    AS BadgeList
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+TagStats AS (
+    SELECT 
+        t.TagName,
+        t.Count                               AS TagUseCount,
+        COALESCE(e.QuestionCnt,0)              AS TotalQuestions,
+        COALESCE(e.AnswerCnt,0)                AS TotalAnswers,
+        CASE 
+            WHEN COALESCE(e.QuestionCnt,0)=0 THEN NULL
+            ELSE ROUND(100.0 * COALESCE(e.AnswerCnt,0) / COALESCE(e.QuestionCnt,0), 2)
+        END                                   AS AnswerRatePct,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank
+    FROM Tags t
+    LEFT JOIN (
+        SELECT 
+            Tag,
+            SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCnt,
+            SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCnt
+        FROM (
+            SELECT p.Id,
+                   p.PostTypeId,
+                   -- extract tags like <tag1><tag2> into rows in a dialect-independent way:
+                   -- remove leading and trailing <> then split on '><'
+                   -- Use a recursive CTE to split since UNNEST/string_to_array not portable
+                   substring(p.Tags from 2 for char_length(p.Tags)-2) AS TagString
+            FROM Posts p
+            WHERE p.PostTypeId IN (1,2) AND p.Tags IS NOT NULL AND p.Tags <> ''
+        ) p
+        JOIN LATERAL (
+            WITH RECURSIVE split(tag_value, rest) AS (
+                SELECT
+                    CASE
+                        WHEN position('><' IN p.TagString) = 0 THEN p.TagString
+                        ELSE substring(p.TagString from 1 for position('><' IN p.TagString)-1)
+                    END,
+                    CASE
+                        WHEN position('><' IN p.TagString) = 0 THEN NULL
+                        ELSE substring(p.TagString from position('><' IN p.TagString)+2)
+                    END
+                UNION ALL
+                SELECT
+                    CASE
+                        WHEN rest IS NULL THEN NULL
+                        WHEN position('><' IN rest) = 0 THEN rest
+                        ELSE substring(rest from 1 for position('><' IN rest)-1)
+                    END,
+                    CASE
+                        WHEN rest IS NULL THEN NULL
+                        WHEN position('><' IN rest) = 0 THEN NULL
+                        ELSE substring(rest from position('><' IN rest)+2)
+                    END
+                FROM split
+                WHERE rest IS NOT NULL
+            )
+            SELECT tag_value AS Tag
+            FROM split
+            WHERE tag_value IS NOT NULL
+        ) s ON TRUE
+        GROUP BY Tag
+    ) e ON e.Tag = t.TagName
+),
+
+RecentClosed AS (
+    SELECT 
+        ph.PostId,
+        ph.CreationDate,
+        COALESCE(NULLIF(ph.Comment,''), 'Unknown') AS CloseReason,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10   -- Post Closed
+)
+
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.NetScore,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.CommentCount,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ub.BadgeList,
+    COALESCE(rc.CloseReason, 'Active') AS RecentCloseReason,
+    tg.TagName,
+    tg.TagUseCount,
+    tg.AnswerRatePct,
+    tg.TagRank
+FROM UserActivity ua
+LEFT JOIN UserBadges ub ON ub.UserId = ua.UserId
+LEFT JOIN LATERAL (
+    SELECT rc.CloseReason
+    FROM RecentClosed rc
+    WHERE rc.PostId = (
+        SELECT p.Id
+        FROM Posts p
+        WHERE p.OwnerUserId = ua.UserId
+        ORDER BY p.CreationDate DESC
+        LIMIT 1
+    ) AND rc.rn = 1
+) rc ON TRUE
+LEFT JOIN LATERAL (
+    SELECT ts.TagName, ts.TagUseCount, ts.AnswerRatePct, ts.TagRank
+    FROM TagStats ts
+    ORDER BY ts.TagUseCount DESC
+    LIMIT 5
+) tg ON TRUE
+WHERE ua.Reputation > 1000
+  AND (ua.QuestionCount + ua.AnswerCount) > 10
+ORDER BY ua.NetScore DESC, ua.Reputation DESC
+LIMIT 100;

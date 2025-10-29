@@ -1,0 +1,117 @@
+WITH recent_answers AS (
+    /* Answers posted in the last 180 days */
+    SELECT
+        a.Id                AS answer_id,
+        a.ParentId          AS question_id,
+        a.OwnerUserId,
+        a.CreationDate,
+        a.Score,
+        q.Tags,
+        ROW_NUMBER() OVER (PARTITION BY a.OwnerUserId, q.Tags
+                           ORDER BY a.CreationDate DESC) AS rn
+    FROM Posts a
+    JOIN Posts q
+          ON q.Id = a.ParentId
+    WHERE a.PostTypeId = 2
+      AND a.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '180 days'
+),
+tagged_answers AS (
+    /* explode the tag list of the question */
+    SELECT
+        TRIM(t)                                   AS tag,
+        ra.OwnerUserId,
+        ra.Score,
+        ra.answer_id,
+        ra.CreationDate,
+        CASE WHEN ra.answer_id = q.AcceptedAnswerId THEN 1 ELSE 0 END AS is_accepted
+    FROM recent_answers ra
+    LEFT JOIN Posts q
+           ON q.Id = ra.question_id
+    CROSS JOIN LATERAL
+           UNNEST(string_to_array(TRIM(BOTH '<>' FROM ra.Tags), '><')) AS t
+),
+user_tag_stats AS (
+    /* aggregate per user+tag */
+    SELECT
+        tag,
+        OwnerUserId,
+        COUNT(*)                                   AS answer_cnt,
+        AVG(Score) FILTER (WHERE Score IS NOT NULL) AS avg_score,
+        SUM(is_accepted)                           AS accepted_cnt,
+        MAX(CreationDate)                          AS last_answer_dt
+    FROM tagged_answers
+    GROUP BY tag, OwnerUserId
+),
+gold_tag_badges AS (
+    /* gold badges that are tag-based (badge name = tag name) */
+    SELECT
+        b.UserId,
+        t.TagName,
+        COUNT(*) AS gold_badge_cnt
+    FROM Badges b
+    JOIN Tags   t ON (b.TagBased = TRUE OR b.TagBased = 1) AND b.Name = t.TagName
+    WHERE b.Class = 1
+    GROUP BY b.UserId, t.TagName
+),
+ranked_users AS (
+    SELECT
+        uts.tag,
+        uts.OwnerUserId,
+        u.Reputation,
+        uts.answer_cnt,
+        uts.avg_score,
+        uts.accepted_cnt,
+        uts.last_answer_dt,
+        COALESCE(gtb.gold_badge_cnt,0)            AS gold_badge_cnt,
+        ROW_NUMBER() OVER (PARTITION BY uts.tag
+                           ORDER BY uts.answer_cnt DESC,
+                                    u.Reputation DESC) AS tag_rank
+    FROM user_tag_stats uts
+    JOIN Users u
+          ON u.Id = uts.OwnerUserId
+    LEFT JOIN gold_tag_badges gtb
+          ON gtb.UserId = uts.OwnerUserId
+         AND gtb.TagName = uts.tag
+    WHERE u.Reputation > 1000
+)
+SELECT
+    r.tag,
+    r.OwnerUserId,
+    u.DisplayName,
+    r.Reputation,
+    r.answer_cnt,
+    ROUND(r.avg_score::numeric,2)                         AS avg_score,
+    r.accepted_cnt,
+    r.gold_badge_cnt,
+    r.last_answer_dt,
+    CASE WHEN r.answer_cnt = 0
+         THEN NULL
+         ELSE ROUND(CAST(r.accepted_cnt AS numeric) / CAST(r.answer_cnt AS numeric),3)
+    END                                         AS acceptance_rate,
+    CASE WHEN r.gold_badge_cnt > 0
+         THEN 'BadgeHolder'
+         ELSE 'NoBadge'
+    END                                         AS badge_status
+FROM ranked_users r
+JOIN Users u
+      ON u.Id = r.OwnerUserId
+WHERE r.tag_rank <= 5
+UNION ALL
+/* tags with no recent answers */
+SELECT
+    t.TagName      AS tag,
+    NULL           AS OwnerUserId,
+    NULL           AS DisplayName,
+    NULL           AS Reputation,
+    0              AS answer_cnt,
+    NULL           AS avg_score,
+    NULL           AS accepted_cnt,
+    0              AS gold_badge_cnt,
+    NULL           AS last_answer_dt,
+    NULL           AS acceptance_rate,
+    'NoAnswers'    AS badge_status
+FROM Tags t
+WHERE NOT EXISTS (
+    SELECT 1 FROM ranked_users ru WHERE ru.tag = t.TagName
+)
+ORDER BY tag, OwnerUserId NULLS LAST;

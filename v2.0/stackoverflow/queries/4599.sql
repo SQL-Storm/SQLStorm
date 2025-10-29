@@ -1,0 +1,97 @@
+WITH RankedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        u.DisplayName AS OwnerDisplayName,
+        ROW_NUMBER() OVER(PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) as rn
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.Title IS NOT NULL AND LENGTH(p.Title) > 10
+),
+PostComments AS (
+    SELECT
+        c.PostId,
+        COUNT(c.Id) AS CommentCount,
+        AVG(c.Score) AS AvgCommentScore,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM Comments c
+    GROUP BY c.PostId
+),
+HighReputationUsers AS (
+    SELECT Id
+    FROM Users
+    WHERE Reputation > 10000
+),
+PostHistoryWithCounts AS (
+    SELECT
+        ph.PostId,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 5 THEN 1 END) AS BodyEditCount,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 4 THEN 1 END) AS TitleEditCount
+    FROM PostHistory ph
+    WHERE ph.UserId IN (SELECT Id FROM HighReputationUsers)
+    GROUP BY ph.PostId
+),
+PostLinkSummary AS (
+    SELECT
+        pl.PostId,
+        COUNT(DISTINCT pl.RelatedPostId) AS NumberOfLinkedPosts,
+        SUM(CASE WHEN lt.Name = 'Duplicate' THEN 1 ELSE 0 END) AS DuplicateLinkCount
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    GROUP BY pl.PostId
+)
+SELECT
+    rp.PostId,
+    rp.Title,
+    pt.Name AS PostTypeName,
+    rp.OwnerDisplayName,
+    rp.CreationDate,
+    COALESCE(pc.CommentCount, 0) AS TotalComments,
+    COALESCE(pc.AvgCommentScore, 0.0) AS AverageCommentScore,
+    CASE
+        WHEN pc.LastCommentDate IS NULL THEN 'Never Commented'
+        WHEN cast('2024-10-01 12:34:56' as timestamp) - pc.LastCommentDate < INTERVAL '7 days' THEN 'Recent'
+        ELSE 'Old'
+    END AS CommentActivity,
+    COALESCE(phc.BodyEditCount, 0) AS HighReputationBodyEdits,
+    COALESCE(phc.TitleEditCount, 0) AS HighReputationTitleEdits,
+    COALESCE(pls.NumberOfLinkedPosts, 0) AS TotalLinkedPosts,
+    COALESCE(pls.DuplicateLinkCount, 0) AS TotalDuplicateLinks,
+    CASE
+        WHEN rp.rn <= 5 THEN 'Top 5 Recent Post'
+        WHEN rp.rn > 5 AND rp.rn <= 20 THEN 'Next 15 Recent Post'
+        ELSE 'Older Post'
+    END AS PostRankByType,
+    CASE
+        WHEN rp.OwnerUserId IN (SELECT Id FROM HighReputationUsers) THEN 'High Rep User'
+        ELSE 'Standard User'
+    END AS OwnerReputationStatus,
+    LENGTH(rp.Title) AS TitleLength,
+    UPPER(SUBSTR(rp.Title, 1, 1)) || SUBSTR(rp.Title, 2) AS FormattedTitle
+FROM RankedPosts rp
+JOIN PostTypes pt ON rp.PostTypeId = pt.Id
+LEFT JOIN PostComments pc ON rp.PostId = pc.PostId
+LEFT JOIN PostHistoryWithCounts phc ON rp.PostId = phc.PostId
+LEFT JOIN PostLinkSummary pls ON rp.PostId = pls.PostId
+WHERE rp.PostTypeId IN (1, 2)
+  AND (rp.Title LIKE '%performance%' OR rp.Title LIKE '%benchmark%')
+GROUP BY
+    rp.PostId,
+    rp.Title,
+    pt.Name,
+    rp.OwnerDisplayName,
+    rp.CreationDate,
+    pc.CommentCount,
+    pc.AvgCommentScore,
+    pc.LastCommentDate,
+    phc.BodyEditCount,
+    phc.TitleEditCount,
+    pls.NumberOfLinkedPosts,
+    pls.DuplicateLinkCount,
+    rp.rn,
+    rp.OwnerUserId
+ORDER BY rp.CreationDate DESC
+LIMIT 100;

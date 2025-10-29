@@ -1,0 +1,215 @@
+-- {"query": "1659.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3307} 
+
+WITH UserActivitySummary AS (
+    -- CTE 1: Summarizes user activity and applies initial filtering for active users.
+    -- Includes a correlated subquery to count gold badges per user.
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.Views AS UserViews,
+        u.UpVotes AS UserUpVotes,
+        u.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        AVG(p.Score) AS AvgPostScore,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        (SELECT COUNT(DISTINCT b.Id) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadgeCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    WHERE u.Reputation >= 1000 -- Filter for reasonably reputable users
+      AND u.LastAccessDate >= (NOW() - INTERVAL '1 year') -- Only recently active users
+      AND u.Views > 50 -- Users with significant profile views
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Views, u.UpVotes, u.DownVotes
+    HAVING COUNT(DISTINCT p.Id) > 5 -- Users with at least 5 posts
+),
+PostEngagementMetrics AS (
+    -- CTE 2: Calculates various engagement metrics for Questions and Answers.
+    -- Includes non-correlated subqueries for specific counts and average score by owner.
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.ParentId,
+        p.AcceptedAnswerId,
+        p.Title, -- Will be NULL for answers, handled in final SELECT
+        p.Tags,
+        LENGTH(p.Body) AS BodyLength,
+        COALESCE(p.LastEditDate, p.CreationDate) AS EffectiveLastEditDate, -- NULL logic
+        (SELECT COUNT(DISTINCT ph.Id) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4, 5, 6)) AS EditHistoryCount, -- Count of title/body/tags edits
+        (SELECT COUNT(DISTINCT v.Id) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpvoteCount, -- Count of UpMod votes
+        (SELECT COUNT(DISTINCT v.Id) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS DownvoteCount, -- Count of DownMod votes
+        (SELECT COUNT(DISTINCT ph_close.Id) FROM PostHistory ph_close WHERE ph_close.PostId = p.Id AND ph_close.PostHistoryTypeId = 10) AS CloseVoteHistoryCount,
+        (SELECT AVG(p_o.Score) FROM Posts p_o WHERE p_o.OwnerUserId = p.OwnerUserId AND p_o.PostTypeId = p.PostTypeId) AS AvgOwnerPostScore -- Avg score of owner's posts of same type
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) -- Focus on Questions (1) and Answers (2)
+      AND p.CreationDate >= (NOW() - INTERVAL '3 years') -- Only recent posts
+      AND (p.Body ILIKE '%sql%' OR p.Body ILIKE '%database%' OR p.Body ILIKE '%query%' OR p.Body ILIKE '%index%') -- String expression: complex text search
+      AND p.OwnerUserId IS NOT NULL -- Exclude community-owned or deleted user posts
+),
+TagAnalysis AS (
+    -- CTE 3: Parses tags from posts and enriches with tag-specific information.
+    -- Includes a correlated subquery to check for specific tag-based gold badges.
+    SELECT
+        pem.PostId,
+        pem.OwnerUserId,
+        pem.PostTypeId,
+        pem.Score,
+        pem.ViewCount,
+        pem.FavoriteCount,
+        pem.UpvoteCount,
+        pem.DownvoteCount,
+        pem.EditHistoryCount,
+        pem.CloseVoteHistoryCount,
+        pem.Title,
+        pem.BodyLength,
+        pem.AvgOwnerPostScore,
+        LOWER(TRIM(REPLACE(REPLACE(tag_val, '<', ''), '>', ''))) AS TagName, -- String expressions: cleaning tag strings
+        EXISTS ( -- Correlated subquery: check for gold badge for the specific tag
+            SELECT 1
+            FROM Badges b
+            WHERE b.UserId = pem.OwnerUserId
+              AND b.Name = LOWER(TRIM(REPLACE(REPLACE(tag_val, '<', ''), '>', '')))
+              AND b.Class = 1
+        ) AS HasGoldTagBadge
+    FROM PostEngagementMetrics pem
+    CROSS JOIN LATERAL ( -- Lateral join to unnest tags efficiently
+        SELECT UNNEST(string_to_array(SUBSTRING(pem.Tags FROM 2 FOR LENGTH(pem.Tags) - 2), '><')) AS tag_val
+    ) AS tags_unnested
+    WHERE pem.Tags IS NOT NULL AND LENGTH(pem.Tags) > 2 -- Ensure tags exist and are valid
+    AND tags_unnested.tag_val IS NOT NULL AND tags_unnested.tag_val != ''
+),
+ParentQuestionDetails AS (
+    -- CTE 4: Fetches details for parent questions, used for answers.
+    SELECT
+        p.Id AS QuestionId,
+        p.Title AS QuestionTitle,
+        p.CommentCount AS QuestionCommentCount,
+        p.Score AS QuestionScore,
+        p.OwnerUserId AS QuestionOwnerId,
+        p.AcceptedAnswerId AS AcceptedAnswerIdForQuestion
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+)
+-- Main query part 1: Analyzes Question engagement
+SELECT
+    'QuestionEngagement' AS MetricType,
+    uas.DisplayName AS UserIdentifier,
+    ta.PostId,
+    ta.Title AS PostTitle, -- Question title
+    ta.TagName,
+    ta.Score AS PostScore,
+    ta.ViewCount,
+    ta.FavoriteCount,
+    ta.UpvoteCount,
+    ta.DownvoteCount,
+    ta.EditHistoryCount,
+    ta.CloseVoteHistoryCount,
+    (ta.UpvoteCount - ta.DownvoteCount) AS NetVotes,
+    (ta.UpvoteCount * 1.0 / NULLIF(ta.DownvoteCount + ta.UpvoteCount, 0)) AS UpvoteRatio, -- Calculation with NULLIF
+    ta.HasGoldTagBadge,
+    ta.BodyLength,
+    ta.AvgOwnerPostScore AS OwnerAveragePostScore,
+    ROW_NUMBER() OVER (PARTITION BY uas.UserId, ta.TagName ORDER BY ta.Score DESC, ta.PostId) AS PostRankByTagScore, -- Window function
+    NTILE(4) OVER (PARTITION BY ta.TagName ORDER BY ta.ViewCount DESC) AS ViewCountQuartile, -- Window function
+    (SELECT c.Text FROM Comments c WHERE c.PostId = ta.PostId ORDER BY c.CreationDate DESC LIMIT 1) AS LatestCommentText, -- Correlated subquery
+    CASE -- Complicated predicate/expression/calculation with NULL logic
+        WHEN pem_q_outer.AcceptedAnswerId IS NOT NULL THEN 'AcceptedAnswered'
+        WHEN pem_q_outer.ClosedDate IS NOT NULL THEN 'ClosedQuestion'
+        WHEN ta.Score > 50 AND ta.FavoriteCount > 5 THEN 'HighlyPopular'
+        WHEN ta.ViewCount > 10000 THEN 'HighVisibility'
+        ELSE 'StandardActive'
+    END AS PostStatusIndicator,
+    COALESCE(phc.Name, 'No Close Reason Recorded') AS LastCloseReason, -- NULL logic with COALESCE
+    pli.RelatedPostId AS DuplicateOfPostId,
+    NULL AS AnswerParentId,
+    COALESCE(leu.DisplayName, 'Community') AS LastEditorDisplayName, -- NULL logic with COALESCE
+    DATE_PART('day', NOW() - ta.PostCreationDate) AS DaysSinceCreation -- Date calculation
+FROM TagAnalysis ta
+JOIN UserActivitySummary uas ON ta.OwnerUserId = uas.UserId
+JOIN PostEngagementMetrics pem_q_outer ON ta.PostId = pem_q_outer.PostId AND ta.PostTypeId = 1 -- Join for Question details
+LEFT JOIN PostLinks pli ON ta.PostId = pli.PostId AND pli.LinkTypeId = 3 -- Outer join for duplicate links
+LEFT JOIN PostHistory ph_close_reason ON ta.PostId = ph_close_reason.PostId AND ph_close_reason.PostHistoryTypeId = 10 -- Outer join for close event
+LEFT JOIN CloseReasonTypes phc ON ph_close_reason.Comment = phc.Id::varchar(50) -- Outer join for close reason name (type cast)
+LEFT JOIN Users leu ON pem_q_outer.LastEditorUserId = leu.Id -- Outer join for Last Editor's DisplayName
+WHERE ta.Score > 0 -- Positive scored questions
+  AND ta.ViewCount > 500
+  AND ta.UpvoteCount > ta.DownvoteCount
+  AND ta.BodyLength > 200
+  AND EXISTS ( -- Correlated subquery in WHERE: owner also answered other recent questions
+      SELECT 1
+      FROM Posts p_ans
+      WHERE p_ans.OwnerUserId = ta.OwnerUserId
+        AND p_ans.PostTypeId = 2
+        AND p_ans.CreationDate >= (NOW() - INTERVAL '1 year')
+      GROUP BY p_ans.OwnerUserId
+      HAVING COUNT(DISTINCT p_ans.Id) >= 2
+  )
+  AND ta.AvgOwnerPostScore > 10 -- Complex predicate
+  AND ta.PostId % 5 != 0 -- Modulo operator for further filtering
+  AND LENGTH(ta.Title) > 10 -- String length predicate
+
+UNION ALL
+
+-- Main query part 2: Analyzes Answer contributions
+SELECT
+    'AnswerContribution' AS MetricType,
+    uas.DisplayName AS UserIdentifier,
+    ta.PostId,
+    pqd.QuestionTitle AS PostTitle, -- Parent question's title for an answer
+    ta.TagName,
+    ta.Score AS PostScore,
+    NULL AS ViewCount, -- Answers don't have direct view counts
+    ta.FavoriteCount, -- Usually 0 or NULL for answers
+    ta.UpvoteCount,
+    ta.DownvoteCount,
+    ta.EditHistoryCount,
+    ta.CloseVoteHistoryCount,
+    (ta.UpvoteCount - ta.DownvoteCount) AS NetVotes,
+    (ta.UpvoteCount * 1.0 / NULLIF(ta.DownvoteCount + ta.UpvoteCount, 0)) AS UpvoteRatio,
+    ta.HasGoldTagBadge,
+    ta.BodyLength,
+    ta.AvgOwnerPostScore AS OwnerAveragePostScore,
+    RANK() OVER (PARTITION BY pem_a_outer.ParentId ORDER BY ta.Score DESC, ta.PostId) AS AnswerRankInQuestion, -- Window function
+    NTILE(4) OVER (PARTITION BY pqd.QuestionId ORDER BY ta.EditHistoryCount DESC) AS EditCountQuartile, -- Window function
+    (SELECT c.Text FROM Comments c WHERE c.PostId = ta.PostId ORDER BY c.CreationDate DESC LIMIT 1) AS LatestCommentText, -- Correlated subquery
+    CASE -- Complicated predicate/expression/calculation with NULL logic
+        WHEN pem_a_outer.PostId = pqd.AcceptedAnswerIdForQuestion THEN 'AcceptedAnswer'
+        WHEN ta.Score > 20 AND ta.UpvoteCount > 10 THEN 'HighImpactAnswer'
+        WHEN ta.BodyLength > 500 THEN 'DetailedAnswer'
+        ELSE 'StandardAnswer'
+    END AS PostStatusIndicator,
+    NULL AS LastCloseReason, -- Answers usually aren't closed directly
+    NULL AS DuplicateOfPostId,
+    pem_a_outer.ParentId AS AnswerParentId,
+    (SELECT u_editor.DisplayName FROM Users u_editor WHERE u_editor.Id = (SELECT ph_ans_edit.UserId FROM PostHistory ph_ans_edit WHERE ph_ans_edit.PostId = ta.PostId AND ph_ans_edit.PostHistoryTypeId IN (5,6) ORDER BY ph_ans_edit.CreationDate DESC LIMIT 1)) AS LastEditorDisplayName, -- Correlated subquery
+    DATE_PART('hour', NOW() - ta.PostCreationDate) AS HoursSinceCreation -- Date calculation
+FROM TagAnalysis ta
+JOIN UserActivitySummary uas ON ta.OwnerUserId = uas.UserId
+JOIN PostEngagementMetrics pem_a_outer ON ta.PostId = pem_a_outer.PostId AND ta.PostTypeId = 2 -- Join for Answer details
+JOIN ParentQuestionDetails pqd ON pem_a_outer.ParentId = pqd.QuestionId -- Join to get parent question details
+WHERE ta.Score >= 5 -- Answers with a reasonable score
+  AND pem_a_outer.ParentId IS NOT NULL -- Must be an answer to a question
+  AND ta.CommentCount > (pqd.QuestionCommentCount * 1.5 + pqd.QuestionScore / 10.0) -- Complicated predicate/calculation
+  AND ta.BodyLength > 150 -- String length predicate on body
+  AND ta.EditHistoryCount >= 1 -- At least one edit
+  AND EXISTS ( -- Correlated subquery in WHERE: owner also created a question with an accepted answer
+      SELECT 1
+      FROM Posts p_q_owner
+      WHERE p_q_owner.OwnerUserId = ta.OwnerUserId
+        AND p_q_owner.PostTypeId = 1
+        AND p_q_owner.AcceptedAnswerId IS NOT NULL
+      LIMIT 1
+  )
+  AND pqd.QuestionTitle IS NOT NULL -- NULL logic: ensure the associated question has a title
+;

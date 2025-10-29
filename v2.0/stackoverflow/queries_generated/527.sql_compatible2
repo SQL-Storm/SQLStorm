@@ -1,0 +1,318 @@
+with params as (
+  select
+    cast(365 as int) as lookback_days,
+    cast(0.05 as numeric) as top_fraction,
+    cast(10 as int) as min_answers,
+    cast(100 as int) as min_views
+),
+recent_questions as (
+  select p.*
+  from Posts p
+  join PostTypes pt on pt.Id = p.PostTypeId and pt.Name = 'Question'
+  cross join params
+  where p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '1 day' * params.lookback_days
+    and coalesce(p.ViewCount, 0) >= params.min_views
+),
+question_stats as (
+  select
+    q.Id as QuestionId,
+    q.OwnerUserId,
+    q.AcceptedAnswerId,
+    q.Score as QuestionScore,
+    q.ViewCount,
+    q.CreationDate as QuestionCreationDate,
+    q.Tags,
+    q.Title,
+    (
+      select cast(count(*) as int)
+      from Posts a
+      where a.ParentId = q.Id and a.PostTypeId = 2
+    ) as AnswerCount,
+    (
+      select avg(a.Score)
+      from Posts a
+      where a.ParentId = q.Id and a.PostTypeId = 2
+    ) as AvgAnswerScore,
+    (
+      select max(a.CreationDate)
+      from Posts a
+      where a.ParentId = q.Id and a.PostTypeId = 2
+    ) as LastAnswerDate,
+    (
+      select sum(case when v.VoteTypeId = 2 then 1 when v.VoteTypeId = 3 then -1 else 0 end)
+      from Votes v
+      where v.PostId = q.Id
+    ) as NetVotes,
+    (
+      select count(*) filter (where v.VoteTypeId = 5)
+      from Votes v
+      where v.PostId = q.Id
+    ) as FavoriteCountVotes
+  from recent_questions q
+),
+accepted_answer_users as (
+  select
+    qa.QuestionId,
+    a.Id as AcceptedAnswerId,
+    a.OwnerUserId as AcceptedOwnerUserId,
+    a.Score as AcceptedAnswerScore,
+    a.CreationDate as AcceptedAnswerDate
+  from question_stats qa
+  left join Posts a
+    on a.Id = qa.AcceptedAnswerId
+),
+answers_enriched as (
+  select
+    a.ParentId as QuestionId,
+    a.Id as AnswerId,
+    a.OwnerUserId as AnswerOwnerId,
+    a.Score as AnswerScore,
+    a.CreationDate as AnswerCreationDate,
+    u.Reputation as AnswerOwnerReputation,
+    u.DisplayName as AnswerOwnerDisplayName
+  from Posts a
+  left join Users u on u.Id = a.OwnerUserId
+  where a.PostTypeId = 2
+),
+answer_rankings as (
+  select
+    ae.QuestionId,
+    ae.AnswerId,
+    ae.AnswerOwnerId,
+    ae.AnswerScore,
+    ae.AnswerCreationDate,
+    ae.AnswerOwnerReputation,
+    ae.AnswerOwnerDisplayName,
+    row_number() over (partition by ae.QuestionId order by ae.AnswerScore desc nulls last, ae.AnswerCreationDate asc nulls last, ae.AnswerId asc) as rn_by_score,
+    rank() over (partition by ae.QuestionId order by ae.AnswerScore desc nulls last) as rnk_by_score,
+    dense_rank() over (partition by ae.QuestionId order by ae.AnswerCreationDate asc nulls last) as drnk_by_time
+  from answers_enriched ae
+),
+question_with_top_answers as (
+  select
+    qs.*,
+    ar.AnswerId as TopAnswerId,
+    ar.AnswerOwnerId as TopAnswerOwnerId,
+    ar.AnswerScore as TopAnswerScore,
+    ar.AnswerOwnerReputation as TopAnswerOwnerReputation,
+    ar.AnswerOwnerDisplayName as TopAnswerOwnerDisplayName
+  from question_stats qs
+  left join answer_rankings ar
+    on ar.QuestionId = qs.QuestionId and ar.rn_by_score = 1
+),
+question_activity as (
+  select
+    q.Id as QuestionId,
+    count(*) filter (where c.Id is not null) as CommentCount,
+    max(c.CreationDate) as LastCommentDate,
+    max(ph.CreationDate) filter (where ph.PostHistoryTypeId in (4,5,6,7,8,9)) as LastEditDate,
+    bool_or(ph.PostHistoryTypeId in (10,35)) as WasClosedOrMigrated
+  from recent_questions q
+  left join Comments c on c.PostId = q.Id
+  left join PostHistory ph on ph.PostId = q.Id
+  group by q.Id
+),
+tag_exploded as (
+  select
+    q.Id as QuestionId,
+    unnest(string_to_array(substring(q.Tags from 2 for length(q.Tags)-2), '><')) as tag
+  from recent_questions q
+  where q.Tags is not null and q.Tags like '<%>'
+),
+tag_stats as (
+  select
+    te.QuestionId,
+    array_agg(te.tag order by te.tag) as tags_array,
+    count(*) as tag_count,
+    sum(case when te.tag ilike any (array['%sql%','%postgres%','%mysql%','%server%']) then 1 else 0 end) as db_tag_hits
+  from tag_exploded te
+  group by te.QuestionId
+),
+user_basics as (
+  select
+    u.Id as UserId,
+    u.Reputation,
+    u.UpVotes,
+    u.DownVotes,
+    u.Views,
+    coalesce(nullif(bcounts.gold,0),0) as GoldBadges,
+    coalesce(nullif(bcounts.silver,0),0) as SilverBadges,
+    coalesce(nullif(bcounts.bronze,0),0) as BronzeBadges
+  from Users u
+  left join (
+    select
+      b.UserId,
+      count(*) filter (where b.Class = 1) as gold,
+      count(*) filter (where b.Class = 2) as silver,
+      count(*) filter (where b.Class = 3) as bronze
+    from Badges b
+    group by b.UserId
+  ) bcounts on bcounts.UserId = u.Id
+),
+owner_enriched as (
+  select
+    q.Id as QuestionId,
+    u.Reputation as OwnerReputation,
+    u.UpVotes as OwnerUpVotes,
+    u.DownVotes as OwnerDownVotes,
+    (u.UpVotes - u.DownVotes) as OwnerNetVotes,
+    (u.GoldBadges*9 + u.SilverBadges*3 + u.BronzeBadges) as OwnerBadgeScore
+  from recent_questions q
+  left join user_basics u on u.UserId = q.OwnerUserId
+),
+dup_links as (
+  select
+    pl.PostId as QuestionId,
+    count(*) filter (where pl.LinkTypeId = 3) as DuplicateLinkCount,
+    count(*) filter (where pl.LinkTypeId = 1) as LinkedCount,
+    max(pl.CreationDate) as LastLinkDate
+  from PostLinks pl
+  join recent_questions q on q.Id = pl.PostId
+  group by pl.PostId
+),
+close_reasons as (
+  select
+    ph.PostId as QuestionId,
+    max(ph.CreationDate) filter (where ph.PostHistoryTypeId = 10) as ClosedAt,
+    max(case
+      when ph.PostHistoryTypeId = 10 then nullif(ph.Comment,'')
+      else null
+    end) as CloseReasonIdRaw
+  from PostHistory ph
+  join recent_questions q on q.Id = ph.PostId
+  group by ph.PostId
+),
+close_reason_names as (
+  select
+    cr.QuestionId,
+    coalesce(
+      crt.Name,
+      case
+        when cr.CloseReasonIdRaw ~ '^[0-9]+$' then 'Unknown(' || cr.CloseReasonIdRaw || ')'
+        else null
+      end
+    ) as CloseReasonName
+  from close_reasons cr
+  left join CloseReasonTypes crt
+    on (cr.CloseReasonIdRaw ~ '^[0-9]+$') and crt.Id = cast(cr.CloseReasonIdRaw as smallint)
+),
+scored as (
+  select
+    qta.QuestionId,
+    qta.Title,
+    qta.Tags,
+    qs.AnswerCount,
+    qs.AvgAnswerScore,
+    qs.QuestionScore,
+    qs.ViewCount,
+    qa.CommentCount,
+    qa.LastCommentDate,
+    qa.LastEditDate,
+    qa.WasClosedOrMigrated,
+    coalesce(dl.DuplicateLinkCount,0) as DuplicateLinkCount,
+    coalesce(dl.LinkedCount,0) as LinkedCount,
+    crn.CloseReasonName,
+    o.OwnerReputation,
+    o.OwnerUpVotes,
+    o.OwnerDownVotes,
+    o.OwnerNetVotes,
+    o.OwnerBadgeScore,
+    qta.TopAnswerId,
+    qta.TopAnswerOwnerId,
+    qta.TopAnswerScore,
+    qta.TopAnswerOwnerReputation,
+    qta.TopAnswerOwnerDisplayName,
+    aa.AcceptedAnswerId,
+    aa.AcceptedOwnerUserId,
+    aa.AcceptedAnswerScore,
+    aa.AcceptedAnswerDate,
+    ts.tags_array,
+    ts.tag_count,
+    ts.db_tag_hits,
+    greatest(
+      0,
+      coalesce(qs.ViewCount,0) / nullif(100.0,0) +
+      coalesce(qs.QuestionScore,0) * 5.0 +
+      coalesce(qs.NetVotes,0) * 3.0 +
+      coalesce(qs.AnswerCount,0) * 2.0 +
+      coalesce(qs.AvgAnswerScore,0) * 4.0 +
+      coalesce(o.OwnerReputation,0) / 500.0 +
+      coalesce(o.OwnerBadgeScore,0) * 1.5 +
+      coalesce(ts.db_tag_hits,0) * 10.0 -
+      (case when qa.WasClosedOrMigrated then 50.0 else 0 end) -
+      coalesce(dl.DuplicateLinkCount,0) * 8.0
+    ) as PopularityScore,
+    extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - qs.QuestionCreationDate)) / 86400.0 as AgeDays,
+    case
+      when qs.AnswerCount >= (select lookback_days from params) then true
+      else false
+    end as HasManyAnswers
+  from question_with_top_answers qta
+  join question_stats qs on qs.QuestionId = qta.QuestionId
+  left join question_activity qa on qa.QuestionId = qta.QuestionId
+  left join dup_links dl on dl.QuestionId = qta.QuestionId
+  left join close_reason_names crn on crn.QuestionId = qta.QuestionId
+  left join owner_enriched o on o.QuestionId = qta.QuestionId
+  left join accepted_answer_users aa on aa.QuestionId = qta.QuestionId
+  left join tag_stats ts on ts.QuestionId = qta.QuestionId
+),
+ranked as (
+  select
+    s.*,
+    (s.PopularityScore / nullif((1 + s.AgeDays/30.0),0)) as DecayedScore,
+    percent_rank() over (order by s.PopularityScore desc nulls last) as pr_popularity,
+    cume_dist() over (order by (s.PopularityScore / nullif((1 + s.AgeDays/30.0),0)) desc nulls last) as cd_decay,
+    row_number() over (order by (s.PopularityScore / nullif((1 + s.AgeDays/30.0),0)) desc nulls last, s.PopularityScore desc nulls last, s.ViewCount desc nulls last) as rn_overall
+  from scored s
+),
+thresholds as (
+  select
+    (select top_fraction from params) as frac,
+    (select count(*) from ranked) as total_rows
+),
+top_cut as (
+  select
+    r.*,
+    t.frac,
+    t.total_rows,
+    cast((t.total_rows * t.frac) as int) as keep_rows
+  from ranked r
+  cross join thresholds t
+),
+final as (
+  select *
+  from top_cut
+  where rn_overall <= greatest(1, keep_rows)
+)
+select
+  f.QuestionId,
+  coalesce(f.Title, '(no title)') as Title,
+  coalesce(f.Tags, '') as Tags,
+  f.AnswerCount,
+  round(cast(coalesce(f.AvgAnswerScore,0) as numeric), 2) as AvgAnswerScore,
+  f.QuestionScore,
+  f.ViewCount,
+  f.PopularityScore,
+  round(cast(f.DecayedScore as numeric), 2) as DecayedScore,
+  round(cast((f.pr_popularity*100) as numeric), 2) as PopularityPercentile,
+  round(cast((f.cd_decay*100) as numeric), 2) as DecayedCumePercent,
+  f.OwnerReputation,
+  f.OwnerBadgeScore,
+  f.TopAnswerId,
+  f.TopAnswerScore,
+  f.TopAnswerOwnerReputation,
+  f.AcceptedAnswerId,
+  f.AcceptedAnswerScore,
+  f.CloseReasonName,
+  f.DuplicateLinkCount,
+  f.LinkedCount,
+  f.CommentCount,
+  f.LastCommentDate,
+  f.LastEditDate,
+  f.WasClosedOrMigrated,
+  f.tag_count,
+  f.db_tag_hits,
+  f.AgeDays,
+  f.HasManyAnswers
+from final f
+order by f.DecayedScore desc nulls last, f.PopularityScore desc nulls last, f.ViewCount desc nulls last;

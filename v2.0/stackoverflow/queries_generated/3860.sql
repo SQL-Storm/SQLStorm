@@ -1,0 +1,106 @@
+-- {"query": "3860.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2179} 
+
+WITH 
+UserBadgeCounts AS (
+    SELECT 
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END)  AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END)  AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END)  AS BronzeBadges,
+        COUNT(*)                                        AS TotalBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserPostMetrics AS (
+    SELECT 
+        p.OwnerUserId AS UserId,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 1)                            AS Questions,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 2)                            AS Answers,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId IN (1,2))                   AS AvgScore,
+        MAX(p.CreationDate)                                                AS LastPostDate
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+UserRecentVotes AS (
+    SELECT 
+        v.UserId,
+        ROW_NUMBER() OVER (PARTITION BY v.UserId ORDER BY v.CreationDate DESC) AS VoteRank,
+        v.VoteTypeId,
+        v.CreationDate
+    FROM Votes v
+    WHERE v.UserId IS NOT NULL
+),
+TopUsers AS (
+    SELECT 
+        u.Id,
+        COALESCE(u.DisplayName, 'Anonymous')                         AS DisplayName,
+        u.Reputation,
+        ubc.GoldBadges,
+        ubc.SilverBadges,
+        ubc.BronzeBadges,
+        ubc.TotalBadges,
+        upm.Questions,
+        upm.Answers,
+        ROUND(upm.AvgScore, 2)                                      AS AvgScore,
+        upm.LastPostDate,
+        (SELECT COUNT(*) 
+         FROM Posts p2 
+         WHERE p2.OwnerUserId = u.Id AND p2.PostTypeId = 1)        AS DirectQuestionCount,
+        (SELECT COUNT(*) 
+         FROM Comments c 
+         WHERE c.UserId = u.Id)                                     AS CommentCount,
+        (SELECT STRING_AGG(t.TagName, ', ')
+         FROM Tags t
+         JOIN (SELECT DISTINCT unnest(string_to_array(p.Tags, '><')) AS TagName
+               FROM Posts p
+               WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) pt
+           ON pt.TagName = t.TagName
+         LIMIT 5)                                                   AS TopTags,
+        CASE 
+            WHEN u.Reputation > 20000 THEN 'PowerUser'
+            WHEN u.Reputation > 10000 THEN 'Trusted'
+            ELSE 'Newbie'
+        END                                                         AS ReputationBand,
+        CONCAT(COALESCE(u.DisplayName, 'User'), ' (',
+               COALESCE(u.Location, 'Unknown'), ')')                AS UserLabel
+    FROM Users u
+    LEFT JOIN UserBadgeCounts ubc ON ubc.UserId = u.Id
+    LEFT JOIN UserPostMetrics upm ON upm.UserId = u.Id
+    WHERE (u.Reputation > 5000 OR ubc.TotalBadges > 10)
+      AND (u.Location IS NOT NULL OR u.AboutMe ILIKE '%sql%')
+),
+UserWithNoPosts AS (
+    SELECT 
+        u.Id,
+        COALESCE(u.DisplayName, 'Anonymous')                         AS DisplayName,
+        u.Reputation,
+        NULL                                                         AS GoldBadges,
+        NULL                                                         AS SilverBadges,
+        NULL                                                         AS BronzeBadges,
+        NULL                                                         AS TotalBadges,
+        0                                                            AS Questions,
+        0                                                            AS Answers,
+        NULL                                                         AS AvgScore,
+        NULL                                                         AS LastPostDate,
+        0                                                            AS DirectQuestionCount,
+        0                                                            AS CommentCount,
+        NULL                                                         AS TopTags,
+        'NoPosts'                                                    AS ReputationBand,
+        CONCAT(COALESCE(u.DisplayName, 'User'), ' (',
+               COALESCE(u.Location, 'Unknown'), ')')                AS UserLabel
+    FROM Users u
+    WHERE NOT EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id)
+)
+SELECT *
+FROM (
+    SELECT *,
+           ROW_NUMBER() OVER (ORDER BY Reputation DESC, TotalBadges DESC NULLS LAST) AS RankOverall
+    FROM TopUsers
+    UNION ALL
+    SELECT *,
+           NULL AS RankOverall
+    FROM UserWithNoPosts
+) AS Combined
+ORDER BY RankOverall NULLS LAST, Reputation DESC
+LIMIT 100;

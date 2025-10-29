@@ -1,0 +1,207 @@
+-- {"query": "2127.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1816} 
+
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        ARRAY[t.TagName] AS Ancestors
+    FROM Tags t
+    WHERE t.IsRequired = 1
+
+    UNION ALL
+
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Ancestors || t.TagName
+    FROM Tags t
+    JOIN RecursiveTagHierarchy r ON t.Id <> r.Id AND POSITION(t.TagName IN ARRAY_TO_STRING(r.Ancestors, ',')) = 0
+    WHERE t.IsModeratorOnly = 0
+),
+UserBadgeSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        MAX(u.Reputation) AS MaxReputation,
+        AVG(COALESCE(p.Score, 0)) AS AvgPostScore
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+PostActivity AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS RecentPostRank
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) AND p.CreationDate IS NOT NULL
+),
+PostVoteStats AS (
+    SELECT
+        p.Id AS PostId,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotes,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVotes,
+        COUNT(v.Id) AS TotalVotes,
+        SUM(COALESCE(v.BountyAmount, 0)) AS TotalBounty
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    GROUP BY p.Id
+),
+QuestionAnswerSummary AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.OwnerUserId,
+        COUNT(a.Id) AS AnswerCount,
+        AVG(a.Score) AS AverageAnswerScore,
+        MAX(a.Score) AS MaxAnswerScore,
+        COUNT(DISTINCT c.Id) AS CommentCount
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    LEFT JOIN Comments c ON c.PostId = q.Id
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.Title, q.CreationDate, q.OwnerUserId
+),
+TaggedQuestions AS (
+    SELECT
+        p.Id AS PostId,
+        UNNEST(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><')) AS Tag
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+),
+DuplicateLinkedPosts AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id AND lt.Name = 'Duplicate'
+),
+UserActivityWindow AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        p.Id AS PostId,
+        p.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.CreationDate) AS PostSeq,
+        LEAD(p.CreationDate) OVER (PARTITION BY u.Id ORDER BY p.CreationDate) AS NextPostDate,
+        EXTRACT(EPOCH FROM (LEAD(p.CreationDate) OVER (PARTITION BY u.Id ORDER BY p.CreationDate) - p.CreationDate)) AS SecondsToNextPost
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id
+    WHERE p.CreationDate IS NOT NULL
+),
+CloseReopenCounts AS (
+    SELECT
+        p.Id AS PostId,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenCount,
+        MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId = 10) AS LastCloseDate,
+        MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId = 11) AS LastReopenDate
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+    GROUP BY p.Id
+)
+SELECT
+    ubs.DisplayName,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    ubs.MaxReputation,
+    ua.PostSeq,
+    ua.PostId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    pv.UpVotes,
+    pv.DownVotes,
+    pq.AnswerCount,
+    pq.AverageAnswerScore,
+    pq.CommentCount,
+    cr.CloseCount,
+    cr.ReopenCount,
+    CASE
+        WHEN cr.CloseCount > cr.ReopenCount THEN 'Currently Closed'
+        ELSE 'Open'
+    END AS PostStatus,
+    STRING_AGG(DISTINCT t.Tag, ',') AS Tags,
+    CASE
+        WHEN ua.SecondsToNextPost IS NOT NULL THEN CONCAT(
+            FLOOR(ua.SecondsToNextPost / 3600), 'h ',
+            FLOOR((ua.SecondsToNextPost % 3600) / 60), 'm ',
+            FLOOR(ua.SecondsToNextPost % 60), 's'
+        )
+        ELSE 'N/A'
+    END AS TimeToNextPost,
+    rh.Ancestors AS TagHierarchyPath,
+    CASE
+        WHEN pv.TotalVotes > 0 THEN ROUND(pv.UpVotes::DECIMAL / pv.TotalVotes * 100, 2)
+        ELSE NULL
+    END AS UpvotePercentage,
+    pv.TotalBounty,
+    -- string condition concatenations and NULL logic involving user web and location info
+    CONCAT(
+        COALESCE(u.WebsiteUrl, '[No Website]'), ' | ',
+        COALESCE(NULLIF(u.Location, ''), '[Unknown Location]')
+    ) AS UserLinkLocation,
+    CASE
+        WHEN pq.AnswerCount > 0 THEN CONCAT(pq.AverageAnswerScore, '/', pq.MaxAnswerScore)
+        ELSE 'No Answers'
+    END AS AnswerScoreSummary
+FROM UserBadgeSummary ubs
+JOIN UserActivityWindow ua ON ua.UserId = ubs.UserId
+JOIN Posts p ON p.Id = ua.PostId
+LEFT JOIN PostVoteStats pv ON pv.PostId = p.Id
+LEFT JOIN QuestionAnswerSummary pq ON pq.QuestionId = CASE WHEN p.PostTypeId = 1 THEN p.Id ELSE p.ParentId END
+LEFT JOIN CloseReopenCounts cr ON cr.PostId = p.Id
+LEFT JOIN TaggedQuestions t ON t.PostId = p.Id
+LEFT JOIN RecursiveTagHierarchy rh ON t.Tag = rh.TagName
+LEFT JOIN Users u ON u.Id = p.OwnerUserId
+WHERE ua.PostSeq <= 5
+AND ( 
+    (pv.TotalVotes IS NULL OR pv.TotalVotes > 10) -- filter on vote activity
+    OR (pq.AnswerCount > 3)
+    OR cr.CloseCount > 0
+)
+GROUP BY
+    ubs.DisplayName,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    ubs.MaxReputation,
+    ua.PostSeq,
+    ua.PostId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    pv.UpVotes,
+    pv.DownVotes,
+    pq.AnswerCount,
+    pq.AverageAnswerScore,
+    pq.CommentCount,
+    cr.CloseCount,
+    cr.ReopenCount,
+    cr.CloseCount,
+    cr.ReopenCount,
+    ua.SecondsToNextPost,
+    rh.Ancestors,
+    pv.TotalVotes,
+    pv.TotalBounty,
+    u.WebsiteUrl,
+    u.Location,
+    pq.AnswerCount,
+    pq.AverageAnswerScore,
+    pq.MaxAnswerScore
+ORDER BY ubs.MaxReputation DESC, ua.PostSeq, p.Score DESC
+LIMIT 100;

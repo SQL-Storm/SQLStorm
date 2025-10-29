@@ -1,0 +1,72 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.Title,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.LastActivityDate,
+        U.DisplayName AS OwnerDisplayName,
+        U.Reputation,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.ViewCount DESC) AS Rank
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId = 1 AND P.Score > 0 AND P.ViewCount > 100
+),
+BadgeCounts AS (
+    SELECT 
+        U.Id AS UserId,
+        U.DisplayName,
+        COUNT(DISTINCT B.Id) AS BadgeCount
+    FROM 
+        Users U
+    JOIN 
+        Badges B ON U.Id = B.UserId
+    WHERE 
+        B.Class = 1 AND B.TagBased = FALSE
+    GROUP BY 
+        U.Id, U.DisplayName
+),
+CommentMetrics AS (
+    SELECT 
+        P.Id AS PostId,
+        COUNT(C.Id) AS CommentCount,
+        MAX(C.Score) AS MaxCommentScore
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Comments C ON P.Id = C.PostId
+    GROUP BY 
+        P.Id
+)
+SELECT 
+    RP.Id AS PostId,
+    RP.Title,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.LastActivityDate,
+    RP.Rank,
+    COALESCE(BC.BadgeCount, 0) AS BadgeCount,
+    (SELECT COUNT(*) FROM Votes V1 WHERE V1.PostId = RP.Id AND V1.VoteTypeId IN (2, 3)) AS VoteDiff,
+    (SELECT COALESCE(SUM(V2.Score), 0) FROM Votes V2 WHERE V2.PostId = RP.Id AND V2.VoteTypeId = 2) AS TotalUpVotes,
+    (SELECT COALESCE(SUM(V3.Score), 0) FROM Votes V3 WHERE V3.PostId = RP.Id AND V3.VoteTypeId = 3) AS TotalDownVotes,
+    (SELECT U2.DisplayName FROM Users U2 WHERE U2.Id = (
+         SELECT V4.UserId FROM Votes V4 WHERE V4.PostId = RP.Id AND V4.VoteTypeId = 2 ORDER BY V4.CreationDate DESC LIMIT 1
+    )) AS LastUpVoter,
+    (SELECT COUNT(*) FROM PostLinks PL WHERE PL.PostId = RP.Id AND PL.LinkTypeId = 3) AS DuplicateCount,
+    (SELECT MAX(PH.CreationDate) FROM PostHistory PH WHERE PH.PostId = RP.Id AND PH.PostHistoryTypeId = 10) AS LastClosedDate,
+    (SELECT PH2.Text FROM PostHistory PH2 WHERE PH2.PostId = RP.Id AND PH2.PostHistoryTypeId = 10 ORDER BY PH2.CreationDate DESC LIMIT 1) AS LastCloseReason,
+    CM.CommentCount,
+    CM.MaxCommentScore
+FROM 
+    RankedPosts RP
+LEFT JOIN 
+    BadgeCounts BC ON RP.OwnerDisplayName = BC.DisplayName
+LEFT JOIN 
+    CommentMetrics CM ON RP.Id = CM.PostId
+ORDER BY 
+    RP.Rank;

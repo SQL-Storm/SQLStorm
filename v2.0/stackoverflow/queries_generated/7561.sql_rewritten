@@ -1,0 +1,184 @@
+-- {"query": "7561.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1785} 
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        STRING_AGG(DISTINCT p.Title, ', ') as PostTitles,
+        STRING_AGG(DISTINCT u.Location, ', ') as Locations
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000 AND u.Views > 100
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.ParentId,
+        p.PostTypeId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as PostType,
+        CASE 
+            WHEN p.Score >= 100 THEN 'High'
+            WHEN p.Score >= 50 THEN 'Medium'
+            ELSE 'Low'
+        END as ScoreCategory,
+        COALESCE(p.Title, 'No Title') as CleanTitle,
+        COALESCE(p.Tags, '') as Tags,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as UserPostRank,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) as TotalUserPosts
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) 
+    AND p.Score IS NOT NULL 
+    AND p.CreationDate > '2020-01-01'
+),
+QualityPosts AS (
+    SELECT 
+        pa.PostId,
+        pa.Title,
+        pa.Score,
+        pa.ScoreCategory,
+        pa.OwnerUserId,
+        pa.CreationDate,
+        pa.ViewCount,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.PostType,
+        DENSE_RANK() OVER (ORDER BY pa.Score DESC) as ScoreRank,
+        AVG(pa.Score) OVER (PARTITION BY pa.OwnerUserId) as OwnerAvgScore,
+        CASE 
+            WHEN pa.AnswerCount > 0 AND pa.CommentCount > 0 THEN 'Active'
+            WHEN pa.AnswerCount > 0 OR pa.CommentCount > 0 THEN 'Moderately Active'
+            ELSE 'Inactive'
+        END as ActivityLevel,
+        COALESCE(
+            (SELECT COUNT(*) 
+             FROM PostHistory ph 
+             WHERE ph.PostId = pa.PostId 
+             AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)),
+            0
+        ) as EditCount
+    FROM PostAnalysis pa
+    WHERE pa.Score >= 0
+),
+CommunityMetrics AS (
+    SELECT 
+        q.*,
+        u.DisplayName as OwnerDisplayName,
+        u.Reputation as OwnerReputation,
+        COALESCE(
+            (SELECT p.Title 
+             FROM Posts p 
+             WHERE p.Id = q.OwnerUserId 
+             AND p.PostTypeId = 1),
+            'No Question Found'
+        ) as UserQuestionTitle,
+        CASE 
+            WHEN q.OwnerReputation > 10000 THEN 'Elite'
+            WHEN q.OwnerReputation > 5000 THEN 'Expert'
+            WHEN q.OwnerReputation > 1000 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as UserLevel,
+        (SELECT COUNT(*) 
+         FROM Posts p2 
+         WHERE p2.OwnerUserId = q.OwnerUserId 
+         AND p2.CreationDate > '2022-01-01') as RecentPostsCount,
+        DATEDIFF(DAY, q.CreationDate, cast('2024-10-01 12:34:56' as timestamp)) as DaysSinceCreation,
+        ROUND(
+            CAST(q.Score AS FLOAT) / NULLIF((q.ViewCount + 1), 0), 
+            4
+        ) as ScorePerView,
+        ROUND(
+            CAST(q.AnswerCount AS FLOAT) / NULLIF((q.CommentCount + 1), 0), 
+            4
+        ) as AnswersPerComment,
+        CASE 
+            WHEN q.EditCount >= 10 THEN 'Very Active'
+            WHEN q.EditCount >= 5 THEN 'Active'
+            WHEN q.EditCount >= 1 THEN 'Moderate'
+            ELSE 'Inactive'
+        END as EditActivityLevel,
+        IIF(q.Score > 0 AND q.ViewCount > 0, 
+            (q.Score * 100.0) / (q.ViewCount + 1), 
+            0
+        ) as EngagementScore,
+        CASE 
+            WHEN q.Tag LIKE '%sql%' OR q.Tag LIKE '%database%' THEN 'Technical'
+            WHEN q.Tag LIKE '%programming%' OR q.Tag LIKE '%coding%' THEN 'Programming'
+            WHEN q.Tag LIKE '%design%' OR q.Tag LIKE '%ui%' THEN 'Design'
+            ELSE 'General'
+        END as TopicCategory
+    FROM QualityPosts q
+    JOIN Users u ON q.OwnerUserId = u.Id
+    WHERE q.PostType IN ('Question', 'Answer')
+),
+FinalRankings AS (
+    SELECT 
+        cm.*,
+        ROW_NUMBER() OVER (ORDER BY cm.Score DESC, cm.ViewCount DESC, cm.AnswerCount DESC) as OverallRank,
+        RANK() OVER (PARTITION BY cm.UserLevel ORDER BY cm.Score DESC) as UserLevelRank,
+        DENSE_RANK() OVER (ORDER BY cm.ActivityLevel, cm.Score DESC) as ActivityScoreRank,
+        PERCENT_RANK() OVER (ORDER BY cm.Score) * 100 as ScorePercentile,
+        NTILE(4) OVER (ORDER BY cm.Score) as ScoreQuartile,
+        CASE 
+            WHEN cm.ScorPerView > 0.05 THEN 'High Engager'
+            WHEN cm.ScorPerView > 0.02 THEN 'Medium Engager'
+            ELSE 'Low Engager'
+        END as EngagementLevel,
+        LAG(cm.Score, 1) OVER (ORDER BY cm.Score DESC) as PrevScore,
+        LAG(cm.ViewCount, 1) OVER (ORDER BY cm.Score DESC) as PrevViewCount,
+        LEAD(cm.Score, 1) OVER (ORDER BY cm.Score DESC) as NextScore,
+        AVG(cm.Score) OVER (ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING) as MovingAvg3,
+        MAX(cm.Score) OVER () as MaxScore,
+        MIN(cm.Score) OVER () as MinScore
+    FROM CommunityMetrics cm
+)
+SELECT 
+    fr.*,
+    CASE 
+        WHEN fr.Score > 0 AND fr.Score = fr.MaxScore THEN 'Top Post'
+        WHEN fr.Score > 0 AND fr.Score >= (fr.MaxScore * 0.9) THEN 'Excellent'
+        WHEN fr.Score > 0 AND fr.Score >= (fr.MaxScore * 0.75) THEN 'Good'
+        WHEN fr.Score > 0 AND fr.Score >= (fr.MaxScore * 0.5) THEN 'Average'
+        ELSE 'Below Average'
+    END as PerformanceTier,
+    CASE 
+        WHEN fr.DaysSinceCreation < 30 THEN 'New'
+        WHEN fr.DaysSinceCreation < 180 THEN 'Recent'
+        WHEN fr.DaysSinceCreation < 365 THEN 'Established'
+        ELSE 'Veteran'
+    END as PostAgeCategory,
+    CASE 
+        WHEN fr.DaysSinceCreation <= 7 THEN 'Weekly'
+        WHEN fr.DaysSinceCreation <= 30 THEN 'Monthly'
+        WHEN fr.DaysSinceCreation <= 90 THEN 'Quarterly'
+        ELSE 'Yearly'
+    END as PostingFrequency
+FROM FinalRankings fr
+WHERE fr.Score > 0 
+    AND fr.Views > 10 
+    AND fr.AnswerCount >= 0 
+    AND fr.CommentCount >= 0
+    AND fr.OwnerDisplayName IS NOT NULL
+ORDER BY fr.Score DESC, fr.ViewCount DESC
+OPTION (MAXDOP 4)

@@ -1,0 +1,206 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT c.Id) as Comments,
+        COUNT(DISTINCT b.Id) as Badges,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) as ReputationRank,
+        DENSE_RANK() OVER (ORDER BY u.Views DESC) as ViewRank,
+        NTILE(100) OVER (ORDER BY u.Reputation) as RepPercentile,
+        CASE 
+            WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 100 
+            THEN 'Expert'
+            WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 50 
+            THEN 'Advanced'
+            WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 10 
+            THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as ExperienceLevel
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopQuestions AS (
+    SELECT 
+        p.Id as QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        COUNT(DISTINCT v.Id) as VoteCount,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) as UpVotes,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) as DownVotes,
+        AVG(CAST(p.Score AS FLOAT)) OVER (PARTITION BY p.OwnerUserId) as UserAvgScore,
+        MAX(p.CreationDate) OVER (PARTITION BY p.OwnerUserId) as UserLastPostDate,
+        ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.ViewCount DESC) as ScoreRank,
+        CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END as HasAcceptedAnswer
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (2, 3)
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.CreationDate, p.OwnerUserId, p.Tags, p.AcceptedAnswerId
+),
+QuestionTags AS (
+    SELECT 
+        tq.QuestionId,
+        tq.Title,
+        STRING_AGG(LEFT(tag, 35), ', ') as TagList,
+        COUNT(tag) as TagCount,
+        MAX(tq.Score) as MaxScore,
+        AVG(tq.ViewCount) as AvgViews,
+        STRING_AGG(CASE WHEN tq.Score > 100 THEN tag ELSE NULL END, ', ') as HighScoreTags
+    FROM TopQuestions tq,
+    LATERAL (
+        SELECT UNNEST(STRING_TO_ARRAY(
+            REPLACE(REPLACE(tq.Tags, '<', ''), '>', ''), '<>'
+        )) AS tag
+    ) tags
+    WHERE tags.tag IS NOT NULL AND tags.tag <> ''
+    GROUP BY tq.QuestionId, tq.Title
+),
+UserPostStats AS (
+    SELECT 
+        u.Id as UserId,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        AVG(p.Score) as AvgScore,
+        AVG(p.ViewCount) as AvgViews,
+        STDDEV(p.Score) as ScoreStdDev,
+        MAX(p.CreationDate) as LastActivity,
+        CAST(DATE_PART('day', MAX(p.CreationDate) - MIN(p.CreationDate)) AS INTEGER) as DaysActive,
+        COUNT(DISTINCT DATE_TRUNC('day', p.CreationDate)) as ActiveDays,
+        COUNT(DISTINCT CASE WHEN p.Score > 0 THEN p.Id END) as PositiveScorePosts,
+        COUNT(DISTINCT CASE WHEN p.Score < 0 THEN p.Id END) as NegativeScorePosts,
+        COUNT(DISTINCT CASE WHEN p.ParentId IS NULL AND p.PostTypeId = 1 THEN p.Id END) as OriginalQuestions,
+        AVG(CAST(p.ViewCount AS FLOAT)) as AvgViewsPerPost
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE p.CreationDate >= DATE '2020-01-01'
+    GROUP BY u.Id
+),
+PostHistorySummary AS (
+    SELECT 
+        ph.PostId,
+        COUNT(*) as ChangeCount,
+        COUNT(DISTINCT ph.PostHistoryTypeId) as ChangeTypes,
+        MAX(ph.CreationDate) as LastChange,
+        MIN(ph.CreationDate) as FirstChange,
+        AVG(EXTRACT(EPOCH FROM (ph.CreationDate - prev_creation)) / 86400.0) as AvgDaysBetweenChanges,
+        STRING_AGG(DISTINCT CAST(ph.PostHistoryTypeId AS VARCHAR), ', ') as ChangeTypeList,
+        STRING_AGG(DISTINCT CASE WHEN ph.UserId IS NOT NULL THEN CAST(ph.UserId AS VARCHAR) ELSE 'System' END, ', ') as ChangedByUsers
+    FROM (
+        SELECT 
+            ph.*,
+            LAG(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS prev_creation
+        FROM PostHistory ph
+        WHERE ph.CreationDate >= DATE '2021-01-01'
+    ) ph
+    WHERE ph.prev_creation IS NOT NULL
+    GROUP BY ph.PostId
+)
+SELECT 
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.Views,
+    uas.UpVotes,
+    uas.DownVotes,
+    uas.TotalPosts,
+    uas.Questions,
+    uas.Answers,
+    uas.Comments,
+    uas.Badges,
+    uas.ReputationRank,
+    uas.ViewRank,
+    uas.RepPercentile,
+    CASE 
+        WHEN uas.Questions > 0 AND uas.Answers > 0 
+        THEN CAST(ROUND((CAST(uas.Answers AS NUMERIC) / CAST(uas.Questions AS NUMERIC)), 2) AS DECIMAL(5,2))
+        ELSE NULL 
+    END as AnswerToQuestionRatio,
+    uas.ExperienceLevel,
+    COALESCE(tq.QuestionId, 0) as TopQuestionId,
+    COALESCE(tq.Title, 'No Top Question') as TopQuestionTitle,
+    COALESCE(tq.Score, 0) as TopQuestionScore,
+    COALESCE(tq.ViewCount, 0) as TopQuestionViews,
+    COALESCE(tq.AnswerCount, 0) as TopQuestionAnswers,
+    COALESCE(tq.CommentCount, 0) as TopQuestionComments,
+    COALESCE(tq.ScoreRank, 1000000) as TopQuestionRank,
+    COALESCE(tq.HasAcceptedAnswer, 0) as HasAcceptedAnswer,
+    COALESCE(qt.TagList, '') as TopQuestionTags,
+    COALESCE(qt.TagCount, 0) as TagCount,
+    COALESCE(qt.HighScoreTags, '') as HighScoreTags,
+    COALESCE(up.TotalPosts, 0) as UserTotalPosts,
+    COALESCE(up.QuestionCount, 0) as UserQuestionCount,
+    COALESCE(up.AnswerCount, 0) as UserAnswerCount,
+    COALESCE(up.AvgScore, 0) as UserAvgScore,
+    COALESCE(up.AvgViews, 0) as UserAvgViews,
+    COALESCE(up.DaysActive, 0) as UserDaysActive,
+    COALESCE(phs.ChangeCount, 0) as PostChangeCount,
+    COALESCE(phs.ChangeTypes, 0) as DifferentChangeTypes,
+    COALESCE(ROUND(AVG(CAST(tq.Score AS FLOAT)) OVER (ORDER BY uas.Reputation DESC ROWS BETWEEN 100 PRECEDING AND 100 FOLLOWING), 2), 0) as ReputationGroupAverageScore,
+    CASE 
+        WHEN uas.Views IS NOT NULL AND uas.Reputation IS NOT NULL 
+        THEN CASE 
+            WHEN uas.Views > 10000 THEN 'High Visibility'
+            WHEN uas.Views > 5000 THEN 'Medium Visibility'
+            WHEN uas.Views > 1000 THEN 'Low Visibility'
+            ELSE 'Minimal Visibility'
+        END
+        ELSE 'Unknown Visibility'
+    END as VisibilityLevel,
+    CASE 
+        WHEN EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.Score > 1000) 
+        THEN 'High Scorer'
+        WHEN EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.Score > 500) 
+        THEN 'Medium Scorer'
+        WHEN EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = uas.UserId AND p.Score > 100) 
+        THEN 'Low Scorer'
+        ELSE 'New User'
+    END as ScoringLevel,
+    CASE 
+        WHEN (uas.Questions * 100.0 / NULLIF(uas.Answers + uas.Questions, 0)) > 50 
+        THEN 'Question Focused'
+        WHEN (uas.Answers * 100.0 / NULLIF(uas.Answers + uas.Questions, 0)) > 50 
+        THEN 'Answer Focused'
+        ELSE 'Balanced'
+    END as ActivityFocus,
+    NULLIF(LEFT(uas.DisplayName, 10), '') as DisplayNameShort,
+    CASE 
+        WHEN uas.LastPostDate IS NOT NULL AND uas.LastPostDate < DATE '2022-01-01' 
+        THEN 'Inactive'
+        WHEN uas.LastPostDate IS NOT NULL AND uas.LastPostDate >= DATE '2022-01-01' 
+        THEN 'Active'
+        ELSE 'New'
+    END as ActivityStatus
+FROM UserActivityStats uas
+LEFT JOIN TopQuestions tq ON uas.UserId = tq.OwnerUserId 
+    AND tq.ScoreRank = 1
+LEFT JOIN QuestionTags qt ON tq.QuestionId = qt.QuestionId
+LEFT JOIN UserPostStats up ON uas.UserId = up.UserId
+LEFT JOIN PostHistorySummary phs ON tq.QuestionId = phs.PostId
+WHERE 
+    uas.Reputation > 1000 
+    AND (uas.TotalPosts > 0 OR uas.Comments > 0 OR uas.Badges > 0)
+    AND (tq.QuestionId IS NOT NULL OR uas.Questions > 0)
+ORDER BY 
+    uas.Reputation DESC,
+    uas.Views DESC,
+    uas.TotalPosts DESC
+LIMIT 5000;

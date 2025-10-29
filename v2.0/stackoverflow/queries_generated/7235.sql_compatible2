@@ -1,0 +1,345 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Elite'
+            WHEN u.Reputation >= 1000 THEN 'Professional'
+            WHEN u.Reputation >= 100 THEN 'Novice'
+            ELSE 'Beginner'
+        END AS ReputationTier,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END), 0) AS QuestionCount,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END), 0) AS AnswerCount,
+        COALESCE(SUM(p.Score), 0) AS TotalScore,
+        RANK() OVER (ORDER BY SUM(p.Score) DESC) AS ScoreRank,
+        DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT b.Id) DESC) AS BadgeRank
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        Reputation,
+        DisplayName,
+        PostCount,
+        BadgeCount,
+        QuestionCount,
+        AnswerCount,
+        TotalScore,
+        ScoreRank,
+        BadgeRank,
+        ROW_NUMBER() OVER (ORDER BY TotalScore DESC) AS RankByScore,
+        ROW_NUMBER() OVER (ORDER BY BadgeCount DESC) AS RankByBadges
+    FROM UserStats
+    WHERE PostCount > 0
+),
+TagUsage AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagCount,
+        COALESCE(SUM(p.Score), 0) AS TotalScore,
+        AVG(p.Score) AS AvgScore,
+        COUNT(DISTINCT p.OwnerUserId) AS UserCount,
+        STRING_AGG(DISTINCT u.DisplayName, ', ') AS TagUsers,
+        RANK() OVER (ORDER BY SUM(p.Score) DESC) AS ScoreRank,
+        PERCENT_RANK() OVER (ORDER BY t.Count) AS PercentileRank
+    FROM Tags t
+    LEFT JOIN Posts p 
+        ON ('<' || t.TagName || '>') = ANY (
+            regexp_split_to_array(p.Tags, '><')
+        )
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE t.Count > 10
+    GROUP BY t.TagName, t.Count
+),
+ComplexAnalytics AS (
+    SELECT 
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.PostCount,
+        tu.BadgeCount,
+        tu.QuestionCount,
+        tu.AnswerCount,
+        tu.TotalScore,
+        tu.ScoreRank,
+        tu.BadgeRank,
+        tu.RankByScore,
+        tu.RankByBadges,
+        CASE WHEN tu.BadgeCount > 50 THEN 'Master' 
+             WHEN tu.BadgeCount > 25 THEN 'Expert' 
+             ELSE 'Enthusiast' END AS BadgeLevel,
+        CASE WHEN tu.QuestionCount > 50 THEN 'Active Questioner' 
+             WHEN tu.QuestionCount > 10 THEN 'Regular Questioner' 
+             ELSE 'Occasional Questioner' END AS QuestionActivity,
+        CASE WHEN tu.AnswerCount > 200 THEN 'Veteran Answerer' 
+             WHEN tu.AnswerCount > 50 THEN 'Regular Answerer' 
+             ELSE 'Occasional Answerer' END AS AnswerActivity,
+        CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - tu.LastPostDate)) / 86400 AS integer) AS DaysSinceLastPost,
+        (tu.TotalScore * 1.0 / NULLIF(tu.Reputation, 0)) AS ScorePerReputation,
+        ABS(tu.PostCount - LAG(tu.PostCount) OVER (ORDER BY tu.PostCount)) AS PostCountChange,
+        ROW_NUMBER() OVER (PARTITION BY CASE WHEN tu.BadgeCount > 50 THEN 'Master' WHEN tu.BadgeCount > 25 THEN 'Expert' ELSE 'Enthusiast' END ORDER BY tu.TotalScore DESC) AS WithinBadgeLevelRank,
+        tu.LastPostDate
+    FROM TopUsers tu
+    GROUP BY
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.PostCount,
+        tu.BadgeCount,
+        tu.QuestionCount,
+        tu.AnswerCount,
+        tu.TotalScore,
+        tu.ScoreRank,
+        tu.BadgeRank,
+        tu.RankByScore,
+        tu.RankByBadges,
+        tu.LastPostDate
+),
+PostBreakdown AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.LastActivityDate,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question' 
+            WHEN p.PostTypeId = 2 THEN 'Answer' 
+            ELSE 'Other' 
+        END AS PostType,
+        COALESCE(p.Score, 0) / NULLIF(p.ViewCount, 0) AS ScoreRatio,
+        CASE WHEN p.AnswerCount > 0 THEN 'Has Answers' ELSE 'No Answers' END AS AnswerStatus,
+        CASE 
+            WHEN p.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'Above Avg'
+            WHEN p.Score < (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'Below Avg'
+            ELSE 'Avg' 
+        END AS ScoreCategory,
+        CASE 
+            WHEN p.CreationDate > (SELECT MAX(CreationDate) - INTERVAL '30 days' FROM Posts) THEN 'Recent'
+            WHEN p.CreationDate > (SELECT MAX(CreationDate) - INTERVAL '90 days' FROM Posts) THEN 'Medium'
+            ELSE 'Old' 
+        END AS Recency,
+        CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate)) / 86400 AS integer) AS AgeInDays,
+        DENSE_RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS ScoreRankByType,
+        RANK() OVER (ORDER BY p.CreationDate) AS ChronologicalRank
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+    GROUP BY
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.LastActivityDate
+),
+FinalAnalysis AS (
+    SELECT 
+        ca.UserId,
+        ca.DisplayName,
+        ca.Reputation,
+        ca.PostCount,
+        ca.BadgeCount,
+        ca.QuestionCount,
+        ca.AnswerCount,
+        ca.TotalScore,
+        ca.ScoreRank,
+        ca.BadgeRank,
+        ca.RankByScore,
+        ca.RankByBadges,
+        ca.BadgeLevel,
+        ca.QuestionActivity,
+        ca.AnswerActivity,
+        ca.DaysSinceLastPost,
+        ca.ScorePerReputation,
+        ca.WithinBadgeLevelRank,
+        tb.ScoreRatio,
+        tb.AnswerStatus,
+        tb.ScoreCategory,
+        tb.Recency,
+        tb.AgeInDays,
+        tb.ScoreRankByType,
+        tb.ChronologicalRank,
+        CASE 
+            WHEN ca.QuestionCount > 0 AND ca.AnswerCount > 0 THEN 'Active Contributor'
+            WHEN ca.QuestionCount > 0 THEN 'Questioner'
+            WHEN ca.AnswerCount > 0 THEN 'Answerer'
+            ELSE 'Observer'
+        END AS EngagementLevel,
+        CASE 
+            WHEN ca.BadgeCount >= 100 THEN 'Legend'
+            WHEN ca.BadgeCount >= 50 THEN 'Veteran'
+            WHEN ca.BadgeCount >= 25 THEN 'Active'
+            ELSE 'Contributor'
+        END AS ContributionTier,
+        CASE 
+            WHEN tb.ScoreRatio > 1.0 THEN 'High Activity'
+            WHEN tb.ScoreRatio > 0.5 THEN 'Medium Activity'
+            ELSE 'Low Activity'
+        END AS ActivityLevel,
+        COALESCE(
+            (SELECT COUNT(*) 
+             FROM Comments c 
+             WHERE c.UserId = ca.UserId 
+             AND c.CreationDate > (SELECT MAX(CreationDate) - INTERVAL '30 days' FROM Comments)
+            ), 0) AS RecentComments
+    FROM ComplexAnalytics ca
+    LEFT JOIN PostBreakdown tb ON ca.UserId = tb.OwnerUserId
+    WHERE tb.ScoreRankByType <= 10 OR tb.ScoreRankByType IS NULL
+    GROUP BY
+        ca.UserId,
+        ca.DisplayName,
+        ca.Reputation,
+        ca.PostCount,
+        ca.BadgeCount,
+        ca.QuestionCount,
+        ca.AnswerCount,
+        ca.TotalScore,
+        ca.ScoreRank,
+        ca.BadgeRank,
+        ca.RankByScore,
+        ca.RankByBadges,
+        ca.BadgeLevel,
+        ca.QuestionActivity,
+        ca.AnswerActivity,
+        ca.DaysSinceLastPost,
+        ca.ScorePerReputation,
+        ca.WithinBadgeLevelRank,
+        tb.ScoreRatio,
+        tb.AnswerStatus,
+        tb.ScoreCategory,
+        tb.Recency,
+        tb.AgeInDays,
+        tb.ScoreRankByType,
+        tb.ChronologicalRank,
+        ca.WithinBadgeLevelRank,
+        ca.UserId,
+        ca.DisplayName,
+        ca.Reputation,
+        ca.PostCount,
+        ca.BadgeCount,
+        ca.QuestionCount,
+        ca.AnswerCount,
+        ca.TotalScore,
+        ca.ScoreRank,
+        ca.BadgeRank,
+        ca.RankByScore,
+        ca.RankByBadges,
+        ca.BadgeLevel,
+        ca.QuestionActivity,
+        ca.AnswerActivity,
+        ca.DaysSinceLastPost,
+        ca.ScorePerReputation,
+        ca.WithinBadgeLevelRank,
+        tb.ScoreRatio,
+        tb.AnswerStatus,
+        tb.ScoreCategory,
+        tb.Recency,
+        tb.AgeInDays,
+        tb.ScoreRankByType,
+        tb.ChronologicalRank,
+        ca.UserId,
+        ca.DisplayName
+),
+FinalResults AS (
+    SELECT 
+        fa.UserId,
+        fa.DisplayName,
+        fa.Reputation,
+        fa.PostCount,
+        fa.BadgeCount,
+        fa.QuestionCount,
+        fa.AnswerCount,
+        fa.TotalScore,
+        fa.ScoreRank,
+        fa.BadgeRank,
+        fa.RankByScore,
+        fa.RankByBadges,
+        fa.BadgeLevel,
+        fa.QuestionActivity,
+        fa.AnswerActivity,
+        fa.DaysSinceLastPost,
+        fa.ScorePerReputation,
+        fa.WithinBadgeLevelRank,
+        fa.ScoreRatio,
+        fa.AnswerStatus,
+        fa.ScoreCategory,
+        fa.Recency,
+        fa.AgeInDays,
+        fa.ScoreRankByType,
+        fa.ChronologicalRank,
+        fa.EngagementLevel,
+        fa.ContributionTier,
+        fa.ActivityLevel,
+        fa.RecentComments
+    FROM FinalAnalysis fa
+)
+SELECT 
+    fr.UserId,
+    fr.DisplayName,
+    fr.Reputation,
+    fr.PostCount,
+    fr.BadgeCount,
+    fr.QuestionCount,
+    fr.AnswerCount,
+    fr.TotalScore,
+    fr.ScoreRank,
+    fr.BadgeRank,
+    fr.RankByScore,
+    fr.RankByBadges,
+    fr.BadgeLevel,
+    fr.QuestionActivity,
+    fr.AnswerActivity,
+    fr.DaysSinceLastPost,
+    fr.ScorePerReputation,
+    fr.WithinBadgeLevelRank,
+    fr.ScoreRatio,
+    fr.AnswerStatus,
+    fr.ScoreCategory,
+    fr.Recency,
+    fr.AgeInDays,
+    fr.ScoreRankByType,
+    fr.ChronologicalRank,
+    fr.EngagementLevel,
+    fr.ContributionTier,
+    fr.ActivityLevel,
+    fr.RecentComments,
+    ROW_NUMBER() OVER (ORDER BY fr.TotalScore DESC, fr.BadgeCount DESC) AS OverallRank,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY fr.TotalScore) AS MedianScore,
+    AVG(fr.ScorePerReputation) OVER (PARTITION BY fr.ContributionTier) AS AvgScorePerRepByTier,
+    COUNT(*) OVER () AS TotalUserCount,
+    SUM(fr.TotalScore) OVER () AS TotalScoreSum,
+    CASE WHEN fr.BadgeCount > (SELECT AVG(BadgeCount) FROM UserStats) THEN 1 ELSE 0 END AS AboveAvgBadges,
+    CASE WHEN fr.QuestionCount > (SELECT AVG(QuestionCount) FROM UserStats) THEN 1 ELSE 0 END AS AboveAvgQuestions,
+    CASE WHEN fr.AnswerCount > (SELECT AVG(AnswerCount) FROM UserStats) THEN 1 ELSE 0 END AS AboveAvgAnswers
+FROM FinalResults fr
+WHERE fr.ScoreRank <= 20 
+    OR fr.BadgeRank <= 20
+    OR fr.RankByScore <= 20
+    OR fr.RankByBadges <= 20
+ORDER BY fr.TotalScore DESC, fr.BadgeCount DESC, fr.QuestionCount DESC
+LIMIT 500;

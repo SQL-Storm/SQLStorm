@@ -1,0 +1,119 @@
+WITH
+UserStats AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    COALESCE(u.WebsiteUrl, '') AS Website,
+    COUNT(p.Id) AS TotalPosts,
+    COUNT(DISTINCT t.TagName) AS DistinctTagsUsed,
+    SUM(COALESCE(p.Score, 0)) AS ScoreSum,
+    GREATEST(
+      COALESCE(MAX(p.LastActivityDate), DATE '1900-01-01'),
+      COALESCE(MAX(c.CreationDate), DATE '1900-01-01'),
+      COALESCE(MAX(v.CreationDate), DATE '1900-01-01')
+    ) AS LastActivity
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Comments c ON c.UserId = u.Id
+  LEFT JOIN Votes v ON v.UserId = u.Id
+  LEFT JOIN Tags t ON CAST(t.Id AS VARCHAR) = p.Tags
+  WHERE u.Id > 0
+  GROUP BY
+    u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate,
+    u.Location, u.Views, u.UpVotes, u.DownVotes, COALESCE(u.WebsiteUrl, '')
+),
+HotTagMetrics AS (
+  SELECT
+    u.Id AS UserId,
+    (
+      SELECT COUNT(*)
+      FROM Posts q
+      JOIN Tags tg
+        ON POSITION(CONCAT('>', CAST(tg.Id AS VARCHAR), '>') IN CONCAT('>', COALESCE(q.Tags, ''), '>')) > 0
+      WHERE q.OwnerUserId = u.Id AND q.PostTypeId = 1
+        AND q.ViewCount > 100
+    ) AS HotTagPostCount
+  FROM Users u
+),
+RankedUsers AS (
+  SELECT
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.CreationDate,
+    us.LastAccessDate,
+    us.Location,
+    us.Views,
+    us.UpVotes,
+    us.DownVotes,
+    us.Website,
+    us.TotalPosts,
+    us.DistinctTagsUsed,
+    us.ScoreSum,
+    us.LastActivity,
+    ht.HotTagPostCount,
+    ROW_NUMBER() OVER (
+      ORDER BY
+        COALESCE(us.ScoreSum, 0) * 2
+        + COALESCE(ht.HotTagPostCount, 0)
+        + (CASE WHEN us.Reputation > 1000 THEN 5 ELSE 0 END)
+        DESC
+    ) AS RankWithinBenchmark
+  FROM UserStats us
+  LEFT JOIN HotTagMetrics ht ON ht.UserId = us.UserId
+),
+Derived AS (
+  SELECT
+    ru.UserId,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.TotalPosts,
+    ru.DistinctTagsUsed,
+    ru.ScoreSum,
+    ru.LastActivity,
+    ru.HotTagPostCount,
+    CASE
+      WHEN ru.TotalPosts > 100 THEN 'VeryActive'
+      WHEN ru.TotalPosts > 50 THEN 'Active'
+      ELSE 'Casual'
+    END AS ActivityBand,
+    CASE
+      WHEN ru.Reputation > 5000 THEN 'PowerUser'
+      WHEN ru.Reputation > 1000 THEN 'RisingStar'
+      ELSE 'Newbie'
+    END AS UserTier
+  FROM RankedUsers ru
+  LEFT JOIN PostHistory ph ON ph.UserId = ru.UserId
+  LEFT JOIN Posts p ON p.Id = ph.PostId
+  WHERE COALESCE(ru.ScoreSum,0) > 0
+)
+SELECT
+  d.UserId,
+  d.DisplayName,
+  d.Reputation,
+  d.TotalPosts,
+  d.DistinctTagsUsed,
+  d.ScoreSum,
+  d.LastActivity,
+  d.HotTagPostCount,
+  d.ActivityBand,
+  d.UserTier,
+  (COALESCE(d.ScoreSum,0) * 3
+   + COALESCE(d.HotTagPostCount,0) * 7
+   - COALESCE(pv.BountyAmount,0)) AS BenchmarkScore
+FROM Derived d
+LEFT JOIN Votes pv ON pv.UserId = d.UserId AND pv.VoteTypeId = 8
+LEFT JOIN Posts p ON p.OwnerUserId = d.UserId
+GROUP BY
+  d.UserId, d.DisplayName, d.Reputation, d.TotalPosts, d.DistinctTagsUsed,
+  d.ScoreSum, d.LastActivity, d.HotTagPostCount, d.ActivityBand, d.UserTier,
+  pv.BountyAmount
+ORDER BY BenchmarkScore DESC
+LIMIT 100;

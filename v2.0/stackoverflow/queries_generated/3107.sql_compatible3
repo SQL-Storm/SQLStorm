@@ -1,0 +1,126 @@
+WITH UserPostStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS Questions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS Answers,
+        AVG(p.Score) AS AvgScore,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p
+        ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        SUM(CASE WHEN b.TagBased = TRUE THEN 1 ELSE 0 END) AS TagBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+UserTagActivity AS (
+    SELECT
+        up.Id AS UserId,
+        LISTAGG(DISTINCT TRIM(BOTH '<' FROM TRIM(BOTH '>' FROM tag_raw)), ',') WITHIN GROUP (ORDER BY tag_raw) AS TagsUsed,
+        COUNT(DISTINCT t.Id) AS DistinctTags
+    FROM UserPostStats up
+    JOIN Posts p
+        ON p.OwnerUserId = up.Id
+        AND p.PostTypeId = 1
+        AND p.Tags IS NOT NULL
+    CROSS JOIN LATERAL
+        (
+          SELECT regexp_matches(p.Tags, '[^<>]+', 'g') AS tag_match
+        ) AS tag_matches(tag_match)
+    CROSS JOIN LATERAL
+        (SELECT tag_match[1] AS tag_raw) AS tag_raw_row
+    JOIN Tags t
+        ON t.TagName = TRIM(BOTH '<' FROM TRIM(BOTH '>' FROM tag_raw_row.tag_raw))
+    GROUP BY up.Id
+),
+
+UserRankings AS (
+    SELECT
+        up.Id,
+        up.DisplayName,
+        up.Reputation,
+        up.TotalPosts,
+        up.AvgScore,
+        COALESCE(ub.GoldBadges, 0) AS GoldBadges,
+        COALESCE(ub.SilverBadges, 0) AS SilverBadges,
+        COALESCE(ub.BronzeBadges, 0) AS BronzeBadges,
+        COALESCE(ub.TagBadges, 0) AS TagBadges,
+        uta.TagsUsed,
+        ROW_NUMBER() OVER (ORDER BY up.Reputation DESC, up.TotalPosts DESC) AS ReputationRank,
+        RANK() OVER (
+            ORDER BY
+                (COALESCE(up.AvgScore, 0) *
+                 (COALESCE(ub.GoldBadges, 0) * 5 +
+                  COALESCE(ub.SilverBadges, 0) * 2 +
+                  COALESCE(ub.BronzeBadges, 0)
+                 )
+                ) DESC
+        ) AS ContributionRank
+    FROM UserPostStats up
+    LEFT JOIN UserBadgeCounts ub ON ub.UserId = up.Id
+    LEFT JOIN UserTagActivity uta ON uta.UserId = up.Id
+)
+
+SELECT
+    ur.Id,
+    ur.DisplayName,
+    ur.Reputation,
+    ur.TotalPosts,
+    ur.AvgScore,
+    ur.GoldBadges,
+    ur.SilverBadges,
+    ur.BronzeBadges,
+    ur.TagBadges,
+    ur.TagsUsed,
+    ur.ReputationRank,
+    ur.ContributionRank,
+    (SELECT c.Text
+       FROM Comments c
+      WHERE c.UserId = ur.Id
+      ORDER BY c.CreationDate DESC
+      FETCH FIRST 1 ROW ONLY) AS LatestComment,
+    (SELECT vt.Name
+       FROM Votes v
+       JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+       JOIN Posts p ON p.Id = v.PostId
+      WHERE p.OwnerUserId = ur.Id
+      ORDER BY v.CreationDate DESC
+      FETCH FIRST 1 ROW ONLY) AS LatestVoteType
+FROM UserRankings ur
+WHERE ur.ReputationRank <= 100
+   OR ur.ContributionRank <= 50
+
+UNION ALL
+
+SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    0 AS TotalPosts,
+    CAST(NULL AS NUMERIC) AS AvgScore,
+    0 AS GoldBadges,
+    0 AS SilverBadges,
+    0 AS BronzeBadges,
+    0 AS TagBadges,
+    CAST(NULL AS VARCHAR) AS TagsUsed,
+    CAST(NULL AS INTEGER) AS ReputationRank,
+    CAST(NULL AS INTEGER) AS ContributionRank,
+    CAST(NULL AS VARCHAR) AS LatestComment,
+    CAST(NULL AS VARCHAR) AS LatestVoteType
+FROM Users u
+WHERE NOT EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id)
+  AND u.Reputation > 1000
+ORDER BY Reputation DESC
+FETCH FIRST 200 ROWS ONLY;

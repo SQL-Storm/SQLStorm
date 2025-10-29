@@ -1,0 +1,175 @@
+WITH
+QualifiedPosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.Body,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.LastEditorUserId,
+    p.LastEditDate,
+    p.ContentLicense,
+    u.Reputation,
+    u.DisplayName AS OwnerDisplayName,
+    u.CreationDate AS OwnerCreationDate,
+    u.Views AS OwnerViews,
+    u.UpVotes AS OwnerUpVotes,
+    u.DownVotes AS OwnerDownVotes,
+    u.Location AS OwnerLocation,
+    u.AccountId AS OwnerAccountId,
+    v_v.UserId AS VoterUserId,
+    v.VoteSum
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN (
+      SELECT PostId, SUM(CASE WHEN VoteTypeId IN (2,3) THEN 1 ELSE 0 END) AS VoteSum,
+             MAX(CASE WHEN UserId IS NOT NULL THEN UserId END) AS dummy
+      FROM Votes
+      GROUP BY PostId
+  ) AS v ON p.Id = v.PostId
+  LEFT JOIN LATERAL (
+      SELECT UserId
+      FROM Votes
+      WHERE PostId = p.Id
+        AND VoteTypeId IN (2,14,15)
+      ORDER BY CreationDate DESC
+      LIMIT 1
+  ) AS v_v ON true
+  WHERE p.PostTypeId IN (1,2)
+),
+CorrelatedStats AS (
+  SELECT
+    qp.PostId,
+    qp.PostTypeId,
+    qp.OwnerUserId,
+    qp.Title,
+    qp.Tags,
+    qp.CreationDate,
+    qp.LastActivityDate,
+    qp.Score,
+    qp.ViewCount,
+    qp.CommentCount,
+    qp.AnswerCount,
+    qp.FavoriteCount,
+    qp.Body,
+    qp.ParentId,
+    qp.AcceptedAnswerId,
+    qp.LastEditorUserId,
+    qp.LastEditDate,
+    qp.ContentLicense,
+    qp.Reputation,
+    qp.OwnerDisplayName,
+    qp.OwnerCreationDate,
+    qp.OwnerViews,
+    qp.OwnerUpVotes,
+    qp.OwnerDownVotes,
+    qp.OwnerLocation,
+    qp.OwnerAccountId,
+    qp.VoterUserId
+  FROM QualifiedPosts qp
+  LEFT JOIN Posts AS p2 ON qp.PostId = p2.ParentId
+),
+TaggedScores AS (
+  SELECT
+    cs.PostId,
+    cs.Title,
+    cs.Tags,
+    cs.CreationDate,
+    cs.LastActivityDate,
+    cs.Score,
+    cs.ViewCount,
+    cs.CommentCount,
+    cs.AnswerCount,
+    cs.OwnerDisplayName,
+    cs.Reputation,
+    cs.OwnerUserId,
+    ROW_NUMBER() OVER (
+      PARTITION BY cs.OwnerUserId
+      ORDER BY cs.Score DESC, cs.ViewCount DESC, cs.LastActivityDate DESC
+    ) AS rn_by_owner
+  FROM CorrelatedStats cs
+),
+WindowAgg AS (
+  SELECT
+    ts.PostId,
+    ts.Title,
+    ts.Tags,
+    ts.CreationDate,
+    ts.LastActivityDate,
+    ts.Score,
+    ts.ViewCount,
+    ts.CommentCount,
+    ts.AnswerCount,
+    ts.Reputation,
+    ts.OwnerDisplayName,
+    SUM(ts.Score) OVER (PARTITION BY DATE_TRUNC('month', ts.CreationDate)) AS SumScoreMonth,
+    AVG(ts.ViewCount) OVER (PARTITION BY DATE_TRUNC('month', ts.CreationDate)) AS AvgViewsMonth,
+    MAX(ts.LastActivityDate) OVER () AS GlobalLastActivity
+  FROM TaggedScores ts
+  WHERE ts.rn_by_owner = 1
+),
+Final AS (
+  SELECT
+    w.PostId,
+    w.Title,
+    w.Tags,
+    w.CreationDate,
+    w.LastActivityDate,
+    w.Score,
+    w.ViewCount,
+    w.CommentCount,
+    w.AnswerCount,
+    w.Reputation,
+    w.OwnerDisplayName,
+    w.SumScoreMonth,
+    w.AvgViewsMonth,
+    w.GlobalLastActivity
+  FROM WindowAgg w
+  ORDER BY w.Score DESC, w.ViewCount DESC
+  LIMIT 100
+)
+SELECT
+  F.PostId,
+  F.Title,
+  F.Tags,
+  F.CreationDate,
+  F.LastActivityDate,
+  F.Score,
+  F.ViewCount,
+  F.CommentCount,
+  F.AnswerCount,
+  F.Reputation,
+  F.OwnerDisplayName,
+  F.SumScoreMonth,
+  F.AvgViewsMonth,
+  F.GlobalLastActivity
+FROM Final F
+LEFT JOIN PostLinks PL ON PL.PostId = F.PostId
+LEFT JOIN LinkTypes LT ON LT.Id = PL.LinkTypeId
+LEFT JOIN Tags T ON T.Id = (
+    SELECT ExcerptPostId
+    FROM Tags
+    WHERE TagName = ANY(string_to_array(REPLACE(F.Tags, '><', ','), ','))
+    LIMIT 1
+)
+LEFT JOIN Badges B ON B.UserId = (
+    SELECT OwnerUserId FROM Posts WHERE Id = F.PostId
+  ) AND B.Class = 1
+WHERE (F.Tags IS NOT NULL OR F.Title IS NOT NULL)
+  AND NOT EXISTS (
+    SELECT 1
+    FROM Votes v2
+    WHERE v2.PostId = F.PostId AND v2.VoteTypeId = 10
+  )
+  AND F.CreationDate >= DATE_TRUNC('year', CAST('2024-10-01' AS date))
+ORDER BY F.GlobalLastActivity DESC, F.Score DESC;

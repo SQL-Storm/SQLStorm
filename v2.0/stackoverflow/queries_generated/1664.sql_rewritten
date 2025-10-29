@@ -1,0 +1,199 @@
+-- {"query": "1664.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3488} 
+WITH UserActivitySummary AS (
+    -- Summarizes user-level activity and engagement metrics
+    SELECT
+        u.Id AS UserId,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COALESCE(SUM(p.ViewCount), 0) AS TotalPostViews,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+        MAX(GREATEST(COALESCE(p.LastActivityDate, p.CreationDate), COALESCE(c.CreationDate, '1900-01-01'::timestamp))) AS LastUserActivityDate,
+        COUNT(DISTINCT co.Id) AS TotalCommentsMade,
+        CAST(AVG(p.Score) AS NUMERIC(10, 2)) AS AvgPostScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments co ON u.Id = co.UserId
+    GROUP BY u.Id
+),
+PostHistoricalContext AS (
+    -- Gathers historical context for posts, like edit dates and close reasons
+    SELECT
+        ph.PostId,
+        MIN(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.CreationDate ELSE NULL END) AS FirstEditDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.CreationDate ELSE NULL END) AS LastEditDate,
+        -- Correlated subquery logic for latest close reason: this ensures the latest applies
+        (
+            SELECT crt_inner.Name
+            FROM PostHistory ph_inner
+            LEFT JOIN CloseReasonTypes crt_inner ON CAST(ph_inner.Comment AS INT) = crt_inner.Id
+            WHERE ph_inner.PostId = ph.PostId
+              AND ph_inner.PostHistoryTypeId = 10
+            ORDER BY ph_inner.CreationDate DESC
+            LIMIT 1
+        ) AS LatestCloseReason,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 16 AND ph.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '2 year' THEN TRUE ELSE FALSE END) AS CommunityOwnedRecently,
+        ARRAY_AGG(DISTINCT crt.Name ORDER BY crt.Name) FILTER (WHERE ph.PostHistoryTypeId = 10) AS AllCloseReasons,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.Id END) AS EditCount
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON ph.PostHistoryTypeId = 10 AND CAST(ph.Comment AS INT) = crt.Id
+    GROUP BY ph.PostId
+),
+PostTagStats AS (
+    -- Extracts tags from questions and links them to posts and owner users
+    SELECT
+        p.Id AS PostId,
+        p.CreationDate,
+        p.OwnerUserId,
+        UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><')) AS TagName,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND LENGTH(TRIM(p.Tags)) > 2
+),
+MonthlyTagPerformance AS (
+    -- Aggregates tag performance metrics on a monthly basis
+    SELECT
+        EXTRACT(YEAR FROM pts.CreationDate) AS Year,
+        EXTRACT(MONTH FROM pts.CreationDate) AS Month,
+        pts.TagName,
+        COUNT(DISTINCT pts.PostId) AS MonthlyQuestionCount,
+        CAST(AVG(pts.Score) AS NUMERIC(10,2)) AS AvgMonthlyTagScore,
+        SUM(pts.ViewCount) AS TotalMonthlyTagViews
+    FROM PostTagStats pts
+    GROUP BY 1, 2, 3
+),
+QuestionAnalysis AS (
+    -- Analyzes questions, their owners, and related attributes
+    SELECT
+        u.Id AS UserIdentifier,
+        COALESCE(u.DisplayName, 'Ghost User (Q)') AS UserDisplayInfo,
+        u.Reputation,
+        u.CreationDate AS UserJoinedDate,
+        q.Id AS PostIdentifier,
+        q.PostTypeId,
+        q.Title AS PostTitle,
+        q.Score AS PostScore,
+        q.ViewCount AS PostViewCount,
+        q.CreationDate AS PostCreationDate,
+        ue.TotalQuestions AS UserTotalQuestions,
+        ue.AvgPostScore AS UserAvgPostScore,
+        phc_q.LatestCloseReason AS PostCloseReason,
+        phc_q.EditCount AS PostEditCount,
+        a.Score AS AcceptedAnswerScore,
+        STRING_AGG(DISTINCT b.Name, '; ') FILTER (WHERE b.Class = 1) AS GoldBadges,
+        -- Correlated subquery to find the user's most active tag by sum of post scores
+        (
+            SELECT pts.TagName
+            FROM PostTagStats pts
+            WHERE pts.OwnerUserId = u.Id
+            GROUP BY pts.TagName
+            ORDER BY SUM(pts.Score) DESC, COUNT(pts.PostId) DESC
+            LIMIT 1
+        ) AS UsersMostActiveTag,
+        LAG(q.CreationDate, 1, '1900-01-01'::timestamp) OVER (PARTITION BY u.Id ORDER BY q.CreationDate) AS PreviousPostDate,
+        AGE(q.CreationDate, LAG(q.CreationDate, 1, '1900-01-01'::timestamp) OVER (PARTITION BY u.Id ORDER BY q.CreationDate)) AS TimeSincePrevPost,
+        RANK() OVER (PARTITION BY u.Id ORDER BY q.Score DESC, q.ViewCount DESC) AS RankOfPostByUser,
+        NTILE(4) OVER (ORDER BY q.ViewCount DESC) AS ViewCountQuartileOverall,
+        -- Correlated subquery for count of duplicate links
+        (SELECT COUNT(DISTINCT pl_dup.RelatedPostId) FROM PostLinks pl_dup WHERE pl_dup.PostId = q.Id AND pl_dup.LinkTypeId = 3) AS DuplicateCount,
+        -- Correlated subquery for average comment score
+        (SELECT CAST(AVG(c.Score) AS NUMERIC(10,2)) FROM Comments c WHERE c.PostId = q.Id AND c.UserId IS NOT NULL) AS AvgCommentScoreForPost,
+        LOWER(SUBSTRING(u.DisplayName, 1, COALESCE(NULLIF(POSITION(' ' IN u.DisplayName), 0) - 1, LENGTH(u.DisplayName)))) AS UserFirstNameLower,
+        REPLACE(TRIM(BOTH '<>' FROM q.Tags), '><', ', ') AS FormattedTags,
+        COALESCE(q.FavoriteCount, 0) AS FavoriteCount,
+        -- Correlated subquery for relevant tag's average monthly score
+        (SELECT MAX(mtp.AvgMonthlyTagScore) FROM MonthlyTagPerformance mtp WHERE mtp.TagName = (SELECT pts_inner.TagName FROM PostTagStats pts_inner WHERE pts_inner.PostId = q.Id LIMIT 1) AND mtp.Year = EXTRACT(YEAR FROM q.CreationDate) AND mtp.Month = EXTRACT(MONTH FROM q.CreationDate)) AS RelevantTagAvgScoreMonth,
+        'Question' AS RecordType,
+        (SELECT COUNT(DISTINCT pph.UserId) FROM PostHistory pph WHERE pph.PostId = q.Id AND pph.PostHistoryTypeId IN (4,5,6)) AS UniqueEditorsCount,
+        (SELECT AVG(LENGTH(pph.Text)) FROM PostHistory pph WHERE pph.PostId = q.Id AND pph.PostHistoryTypeId = 5) AS AvgBodyEditLength,
+        (SELECT COUNT(DISTINCT v.UserId) FROM Votes v WHERE v.PostId = q.Id AND v.VoteTypeId = 2) AS UpVoteCountOnPost
+    FROM Users u
+    LEFT JOIN UserActivitySummary ue ON u.Id = ue.UserId
+    JOIN Posts q ON u.Id = q.OwnerUserId AND q.PostTypeId = 1
+    LEFT JOIN PostHistoricalContext phc_q ON q.Id = phc_q.PostId
+    LEFT JOIN Posts a ON q.AcceptedAnswerId = a.Id AND a.PostTypeId = 2
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE
+        u.Reputation >= 1000
+        AND q.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '5 year'
+        AND q.ViewCount > 500
+        AND (q.ClosedDate IS NULL OR q.AcceptedAnswerId IS NOT NULL) -- NULL logic combined with other conditions
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate,
+        ue.TotalQuestions, ue.AvgPostScore,
+        q.Id, q.Title, q.Score, q.ViewCount, q.CreationDate, q.PostTypeId, q.Tags, q.FavoriteCount,
+        phc_q.LatestCloseReason, phc_q.EditCount,
+        a.Score
+),
+AnswerAnalysis AS (
+    -- Analyzes answers, their owners, and related attributes, linking to parent questions
+    SELECT
+        u.Id AS UserIdentifier,
+        COALESCE(u.DisplayName, 'Ghost User (A)') AS UserDisplayInfo,
+        u.Reputation,
+        u.CreationDate AS UserJoinedDate,
+        ans.Id AS PostIdentifier,
+        ans.PostTypeId,
+        qp.Title AS PostTitle, -- Title of the parent question
+        ans.Score AS PostScore,
+        ans.ViewCount AS PostViewCount, -- This is typically NULL for answers, COALESCE to 0 implicitly
+        ans.CreationDate AS PostCreationDate,
+        ue.TotalAnswers AS UserTotalQuestions, -- Generalised as 'user total related posts'
+        ue.AvgPostScore AS UserAvgPostScore,
+        phc_ans.LatestCloseReason AS PostCloseReason, -- Should be NULL for answers usually
+        phc_ans.EditCount AS PostEditCount,
+        NULL AS AcceptedAnswerScore, -- N/A for answers
+        STRING_AGG(DISTINCT b.Name, '; ') FILTER (WHERE b.Class = 2) AS SilverBadges, -- Focus on Silver Badges
+        -- Correlated subquery for most active tag of the *parent question*
+        (
+            SELECT pts.TagName
+            FROM PostTagStats pts
+            WHERE pts.PostId = qp.Id
+            GROUP BY pts.TagName
+            ORDER BY SUM(pts.Score) DESC, COUNT(pts.PostId) DESC
+            LIMIT 1
+        ) AS UsersMostActiveTag,
+        LAG(ans.CreationDate, 1, '1900-01-01'::timestamp) OVER (PARTITION BY u.Id ORDER BY ans.CreationDate) AS PreviousPostDate,
+        AGE(ans.CreationDate, LAG(ans.CreationDate, 1, '1900-01-01'::timestamp) OVER (PARTITION BY u.Id ORDER BY ans.CreationDate)) AS TimeSincePrevPost,
+        RANK() OVER (PARTITION BY u.Id ORDER BY ans.Score DESC) AS RankOfPostByUser,
+        NTILE(4) OVER (ORDER BY ans.Score DESC) AS ViewCountQuartileOverall, -- Using score for answers
+        -- Correlated subquery for count of linked posts for the answer
+        (SELECT COUNT(DISTINCT pl_link.RelatedPostId) FROM PostLinks pl_link WHERE pl_link.PostId = ans.Id AND pl_link.LinkTypeId = 1) AS LinkedPostCount,
+        -- Correlated subquery for average comment score
+        (SELECT CAST(AVG(c.Score) AS NUMERIC(10,2)) FROM Comments c WHERE c.PostId = ans.Id AND c.UserId IS NOT NULL) AS AvgCommentScoreForPost,
+        UPPER(SUBSTRING(u.Location, 1, COALESCE(NULLIF(POSITION(',' IN u.Location), 0) - 1, LENGTH(u.Location)))) AS UserCityUpper, -- Different string function/logic
+        REPLACE(TRIM(BOTH '<>' FROM qp.Tags), '><', ', ') AS FormattedTags, -- Tags of parent question
+        0 AS FavoriteCount, -- N/A for answers
+        -- Correlated subquery for relevant tag's average monthly score from parent question
+        (SELECT MAX(mtp.AvgMonthlyTagScore) FROM MonthlyTagPerformance mtp WHERE mtp.TagName = (SELECT pts_inner.TagName FROM PostTagStats pts_inner WHERE pts_inner.PostId = qp.Id LIMIT 1) AND mtp.Year = EXTRACT(YEAR FROM qp.CreationDate) AND mtp.Month = EXTRACT(MONTH FROM qp.CreationDate)) AS RelevantTagAvgScoreMonth,
+        'Answer' AS RecordType,
+        (SELECT COUNT(DISTINCT pph.UserId) FROM PostHistory pph WHERE pph.PostId = ans.Id AND pph.PostHistoryTypeId IN (4,5,6)) AS UniqueEditorsCount,
+        (SELECT AVG(LENGTH(pph.Text)) FROM PostHistory pph WHERE pph.PostId = ans.Id AND pph.PostHistoryTypeId = 5) AS AvgBodyEditLength,
+        (SELECT COUNT(DISTINCT v.UserId) FROM Votes v WHERE v.PostId = ans.Id AND v.VoteTypeId = 2) AS UpVoteCountOnPost
+    FROM Users u
+    LEFT JOIN UserActivitySummary ue ON u.Id = ue.UserId
+    JOIN Posts ans ON u.Id = ans.OwnerUserId AND ans.PostTypeId = 2
+    JOIN Posts qp ON ans.ParentId = qp.Id AND qp.PostTypeId = 1 -- Join to parent question
+    LEFT JOIN PostHistoricalContext phc_ans ON ans.Id = phc_ans.PostId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE
+        u.Reputation >= 500
+        AND ans.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '3 year'
+        AND ans.Score >= 10
+        AND qp.ViewCount > 1000 -- Answers to popular questions
+        AND NOT EXISTS (SELECT 1 FROM PostLinks pl_offensive WHERE pl_offensive.PostId = ans.Id AND pl_offensive.LinkTypeId = 4) -- Correlated subquery with NOT EXISTS
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate,
+        ue.TotalAnswers, ue.AvgPostScore,
+        ans.Id, ans.Score, ans.ViewCount, ans.CreationDate, ans.PostTypeId,
+        qp.Id, qp.Title, qp.Tags, qp.CreationDate, qp.ViewCount,
+        phc_ans.LatestCloseReason, phc_ans.EditCount
+)
+-- Final UNION ALL combines the analysis of questions and answers
+SELECT * FROM QuestionAnalysis
+UNION ALL
+SELECT * FROM AnswerAnalysis
+ORDER BY UserIdentifier, PostCreationDate DESC
+LIMIT 1000;

@@ -1,0 +1,501 @@
+with
+q as (
+  select
+    p.Id as QuestionId,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    coalesce(nullif(trim(p.OwnerDisplayName), ''), u.DisplayName, '(anonymous)') as OwnerName
+  from Posts p
+  left join Users u on u.Id = p.OwnerUserId
+  where p.PostTypeId = 1
+),
+a as (
+  select
+    pa.ParentId as QuestionId,
+    count(*) as AnswerCount,
+    avg(pa.Score) as AvgAnswerScore,
+    max(pa.CreationDate) as LastAnswerDate,
+    sum(case when pa.Id = q.AcceptedAnswerId then 1 else 0 end) as HasAccepted
+  from Posts pa
+  join Posts q on q.Id = pa.ParentId and q.PostTypeId = 1
+  where pa.PostTypeId = 2
+  group by pa.ParentId
+),
+cmt as (
+  select
+    c.PostId as QuestionId,
+    sum(case when c.Score > 0 then 1 else 0 end) as PosComments,
+    sum(case when c.Score <= 0 or c.Score is null then 1 else 0 end) as NonPosComments,
+    max(c.CreationDate) as LastCommentDate
+  from Comments c
+  group by c.PostId
+),
+vh as (
+  select
+    v.PostId as QuestionId,
+    sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+    sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+    sum(case when v.VoteTypeId = 5 then 1 else 0 end) as Favorites,
+    max(v.CreationDate) as LastVoteDate
+  from Votes v
+  group by v.PostId
+),
+ph_close as (
+  select
+    ph.PostId as QuestionId,
+    min(ph.CreationDate) as FirstCloseDate,
+    max(ph.CreationDate) as LastCloseDate,
+    count(*) as CloseEvents,
+    sum(case when ph.Comment in ('101','102','103','104','105','1','2','3','4','7','10','20') then 1 else 0 end) as CloseEventsWithReason
+  from PostHistory ph
+  where ph.PostHistoryTypeId in (10,11)
+  group by ph.PostId
+),
+dups as (
+  select
+    pl.PostId as QuestionId,
+    sum(case when pl.LinkTypeId = 3 then 1 else 0 end) as DuplicateLinks,
+    sum(case when pl.LinkTypeId = 1 then 1 else 0 end) as LinkedLinks,
+    min(pl.CreationDate) as FirstLinkDate
+  from PostLinks pl
+  group by pl.PostId
+),
+tag_split as (
+  select
+    q.QuestionId,
+    unnest(string_to_array(substring(q.Tags, 2, greatest(length(q.Tags)-2,0)), '><')) as tag
+  from q
+  where q.Tags is not null and q.Tags <> ''
+),
+tag_stats as (
+  select
+    ts.QuestionId,
+    count(*) as TagCount,
+    string_agg(lower(ts.tag), '|' order by lower(ts.tag)) as TagList,
+    sum(case when t.IsModeratorOnly = true then 1 else 0 end) as ModOnlyTags,
+    sum(case when t.IsRequired = true then 1 else 0 end) as RequiredTags,
+    sum(coalesce(t.Count,0)) as SumTagUsage
+  from tag_split ts
+  left join Tags t on lower(t.TagName) = lower(ts.tag)
+  group by ts.QuestionId
+),
+user_metrics as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.UpVotes,
+    u.DownVotes,
+    u.CreationDate,
+    u.LastAccessDate,
+    coalesce(nullif(trim(u.Location), ''), '(unknown)') as Location,
+    (select max(reputation_val) from (
+       select u2.Reputation as reputation_val,
+              row_number() over (order by u2.Reputation) as rn,
+              count(*) over () as total_count
+       from Users u2
+       where u2.Reputation is not null
+    ) sub where rn <= ceil(sub.total_count / 2.0)
+    ) as GlobalRepMedian
+  from Users u
+),
+badge_counts as (
+  select
+    b.UserId,
+    count(*) as TotalBadges,
+    sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+    sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+    sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+    sum(case when b.TagBased = true then 1 else 0 end) as TagBadges,
+    min(b.Date) as FirstBadgeDate,
+    max(b.Date) as LastBadgeDate
+  from Badges b
+  group by b.UserId
+),
+q_activity as (
+  select
+    q.QuestionId,
+    q.Title,
+    q.OwnerUserId,
+    q.OwnerName,
+    q.CreationDate as QuestionDate,
+    q.Score as QuestionScore,
+    q.ViewCount,
+    t.TagCount,
+    t.TagList,
+    t.ModOnlyTags,
+    t.RequiredTags,
+    t.SumTagUsage,
+    a.AnswerCount,
+    a.AvgAnswerScore,
+    a.LastAnswerDate,
+    a.HasAccepted,
+    c.PosComments,
+    c.NonPosComments,
+    c.LastCommentDate,
+    v.UpVotes,
+    v.DownVotes,
+    v.Favorites,
+    v.LastVoteDate,
+    ph.FirstCloseDate,
+    ph.LastCloseDate,
+    ph.CloseEvents,
+    ph.CloseEventsWithReason,
+    d.DuplicateLinks,
+    d.LinkedLinks,
+    d.FirstLinkDate
+  from q
+  left join tag_stats t on t.QuestionId = q.QuestionId
+  left join a on a.QuestionId = q.QuestionId
+  left join cmt c on c.QuestionId = q.QuestionId
+  left join vh v on v.QuestionId = q.QuestionId
+  left join ph_close ph on ph.QuestionId = q.QuestionId
+  left join dups d on d.QuestionId = q.QuestionId
+),
+activity_rank as (
+  select
+    qa.QuestionId,
+    qa.Title,
+    qa.OwnerUserId,
+    qa.OwnerName,
+    qa.QuestionDate,
+    qa.QuestionScore,
+    qa.ViewCount,
+    qa.TagCount,
+    qa.TagList,
+    qa.ModOnlyTags,
+    qa.RequiredTags,
+    qa.SumTagUsage,
+    qa.AnswerCount,
+    qa.AvgAnswerScore,
+    qa.LastAnswerDate,
+    qa.HasAccepted,
+    qa.PosComments,
+    qa.NonPosComments,
+    qa.LastCommentDate,
+    qa.UpVotes,
+    qa.DownVotes,
+    qa.Favorites,
+    qa.LastVoteDate,
+    qa.FirstCloseDate,
+    qa.LastCloseDate,
+    qa.CloseEvents,
+    qa.CloseEventsWithReason,
+    qa.DuplicateLinks,
+    qa.LinkedLinks,
+    qa.FirstLinkDate,
+    coalesce(qa.UpVotes,0) - coalesce(qa.DownVotes,0) as NetVotes,
+    coalesce(qa.AnswerCount,0) + coalesce(qa.PosComments,0) + coalesce(qa.NonPosComments,0) as InteractionCount,
+    greatest(
+      coalesce(qa.LastAnswerDate, timestamp 'epoch'),
+      coalesce(qa.LastCommentDate, timestamp 'epoch'),
+      coalesce(qa.LastVoteDate, timestamp 'epoch'),
+      coalesce(qa.FirstLinkDate, timestamp 'epoch'),
+      coalesce(qa.LastCloseDate, coalesce(qa.FirstCloseDate, timestamp 'epoch')),
+      coalesce(qa.QuestionDate, timestamp 'epoch')
+    ) as LastActivityAny,
+    case
+      when qa.TagCount is null or qa.TagCount = 0 then 'untagged'
+      when qa.ModOnlyTags > 0 then 'mod-heavy'
+      when qa.RequiredTags > 0 then 'required'
+      when qa.TagCount >= 5 then 'broad'
+      else 'normal'
+    end as TagProfile,
+    case when qa.HasAccepted > 0 then 1 else 0 end as AcceptedFlag,
+    case when qa.CloseEvents > 0 then 1 else 0 end as ClosedFlag
+  from q_activity qa
+),
+scored as (
+  select
+    ar.QuestionId,
+    ar.Title,
+    ar.OwnerUserId,
+    ar.OwnerName,
+    ar.QuestionDate,
+    ar.QuestionScore,
+    ar.ViewCount,
+    ar.TagCount,
+    ar.TagList,
+    ar.ModOnlyTags,
+    ar.RequiredTags,
+    ar.SumTagUsage,
+    ar.AnswerCount,
+    ar.AvgAnswerScore,
+    ar.LastAnswerDate,
+    ar.HasAccepted,
+    ar.PosComments,
+    ar.NonPosComments,
+    ar.LastCommentDate,
+    ar.UpVotes,
+    ar.DownVotes,
+    ar.Favorites,
+    ar.LastVoteDate,
+    ar.FirstCloseDate,
+    ar.LastCloseDate,
+    ar.CloseEvents,
+    ar.CloseEventsWithReason,
+    ar.DuplicateLinks,
+    ar.LinkedLinks,
+    ar.FirstLinkDate,
+    ar.NetVotes,
+    ar.InteractionCount,
+    ar.LastActivityAny,
+    ar.TagProfile,
+    ar.AcceptedFlag,
+    ar.ClosedFlag,
+    (
+      coalesce(ar.NetVotes,0)*2
+      + coalesce(ar.Favorites,0)
+      + coalesce(ar.AnswerCount,0)*3
+      + coalesce(ar.AvgAnswerScore,0)
+      + (case when ar.AcceptedFlag = 1 then 10 else 0 end)
+      - coalesce(ar.DownVotes,0)
+      - (case when ar.ClosedFlag = 1 then 5 else 0 end)
+      + least(coalesce(ar.ViewCount,0)/100.0, 50)
+      + least(coalesce(ar.SumTagUsage,0)/1000.0, 50)
+    ) as ActivityScore
+  from activity_rank ar
+),
+user_join as (
+  select
+    s.QuestionId,
+    s.Title,
+    s.OwnerUserId,
+    s.OwnerName,
+    s.QuestionDate,
+    s.QuestionScore,
+    s.ViewCount,
+    s.TagCount,
+    s.TagList,
+    s.ModOnlyTags,
+    s.RequiredTags,
+    s.SumTagUsage,
+    s.AnswerCount,
+    s.AvgAnswerScore,
+    s.LastAnswerDate,
+    s.HasAccepted,
+    s.PosComments,
+    s.NonPosComments,
+    s.LastCommentDate,
+    s.UpVotes,
+    s.DownVotes,
+    s.Favorites,
+    s.LastVoteDate,
+    s.FirstCloseDate,
+    s.LastCloseDate,
+    s.CloseEvents,
+    s.CloseEventsWithReason,
+    s.DuplicateLinks,
+    s.LinkedLinks,
+    s.FirstLinkDate,
+    s.NetVotes,
+    s.InteractionCount,
+    s.LastActivityAny,
+    s.TagProfile,
+    s.AcceptedFlag,
+    s.ClosedFlag,
+    s.ActivityScore,
+    um.UserId,
+    um.DisplayName as UserDisplayName,
+    um.Reputation,
+    um.UpVotes as UserUpVotes,
+    um.DownVotes as UserDownVotes,
+    um.Location,
+    um.GlobalRepMedian,
+    bc.TotalBadges,
+    bc.GoldBadges,
+    bc.SilverBadges,
+    bc.BronzeBadges,
+    bc.TagBadges
+  from scored s
+  left join user_metrics um on um.UserId = s.OwnerUserId
+  left join badge_counts bc on bc.UserId = s.OwnerUserId
+),
+ranked as (
+  select
+    uj.QuestionId,
+    uj.Title,
+    uj.OwnerUserId,
+    uj.OwnerName,
+    uj.QuestionDate,
+    uj.QuestionScore,
+    uj.ViewCount,
+    uj.TagCount,
+    uj.TagList,
+    uj.ModOnlyTags,
+    uj.RequiredTags,
+    uj.SumTagUsage,
+    uj.AnswerCount,
+    uj.AvgAnswerScore,
+    uj.LastAnswerDate,
+    uj.HasAccepted,
+    uj.PosComments,
+    uj.NonPosComments,
+    uj.LastCommentDate,
+    uj.UpVotes,
+    uj.DownVotes,
+    uj.Favorites,
+    uj.LastVoteDate,
+    uj.FirstCloseDate,
+    uj.LastCloseDate,
+    uj.CloseEvents,
+    uj.CloseEventsWithReason,
+    uj.DuplicateLinks,
+    uj.LinkedLinks,
+    uj.FirstLinkDate,
+    uj.NetVotes,
+    uj.InteractionCount,
+    uj.LastActivityAny,
+    uj.TagProfile,
+    uj.AcceptedFlag,
+    uj.ClosedFlag,
+    uj.ActivityScore,
+    uj.UserId,
+    uj.UserDisplayName,
+    uj.Reputation,
+    uj.UserUpVotes,
+    uj.UserDownVotes,
+    uj.Location,
+    uj.GlobalRepMedian,
+    uj.TotalBadges,
+    uj.GoldBadges,
+    uj.SilverBadges,
+    uj.BronzeBadges,
+    uj.TagBadges,
+    row_number() over (order by uj.ActivityScore desc, uj.LastActivityAny desc, uj.QuestionDate desc) as rn,
+    dense_rank() over (order by uj.TagProfile, coalesce(uj.TagCount,0) desc, coalesce(uj.DuplicateLinks,0) desc) as TagDenseRank,
+    percent_rank() over (order by coalesce(uj.AnswerCount,0) desc) as AnswerPercentile,
+    sum(coalesce(uj.Favorites,0)) over (partition by uj.TagProfile) as FavoritesByTagProfile,
+    avg(coalesce(uj.ActivityScore,0)) over (partition by uj.Location) as AvgScoreByLocation
+  from user_join uj
+),
+filters as (
+  select
+    r.QuestionId,
+    r.Title,
+    r.OwnerUserId,
+    r.OwnerName,
+    r.QuestionDate,
+    r.QuestionScore,
+    r.ViewCount,
+    r.TagCount,
+    r.TagList,
+    r.ModOnlyTags,
+    r.RequiredTags,
+    r.SumTagUsage,
+    r.AnswerCount,
+    r.AvgAnswerScore,
+    r.LastAnswerDate,
+    r.HasAccepted,
+    r.PosComments,
+    r.NonPosComments,
+    r.LastCommentDate,
+    r.UpVotes,
+    r.DownVotes,
+    r.Favorites,
+    r.LastVoteDate,
+    r.FirstCloseDate,
+    r.LastCloseDate,
+    r.CloseEvents,
+    r.CloseEventsWithReason,
+    r.DuplicateLinks,
+    r.LinkedLinks,
+    r.FirstLinkDate,
+    r.NetVotes,
+    r.InteractionCount,
+    r.LastActivityAny,
+    r.TagProfile,
+    r.AcceptedFlag,
+    r.ClosedFlag,
+    r.ActivityScore,
+    r.UserId,
+    r.UserDisplayName,
+    r.Reputation,
+    r.UserUpVotes,
+    r.UserDownVotes,
+    r.Location,
+    r.GlobalRepMedian,
+    r.TotalBadges,
+    r.GoldBadges,
+    r.SilverBadges,
+    r.BronzeBadges,
+    r.TagBadges,
+    r.rn,
+    r.TagDenseRank,
+    r.AnswerPercentile,
+    r.FavoritesByTagProfile,
+    r.AvgScoreByLocation
+  from ranked r
+  where
+    (
+      coalesce(r.AnswerCount,0) >= 2
+      or (r.AcceptedFlag = 1 and coalesce(r.NetVotes,0) >= 0)
+      or (r.ClosedFlag = 0 and coalesce(r.Favorites,0) >= 3)
+    )
+    and (
+      r.TagProfile <> 'mod-heavy'
+      or (r.TagProfile = 'mod-heavy' and coalesce(r.DuplicateLinks,0) = 0)
+    )
+    and not (
+      r.TagCount is null and r.ViewCount is null and r.UpVotes is null and r.DownVotes is null
+    )
+),
+dedup as (
+  select distinct on (f.QuestionId)
+    f.*
+  from filters f
+  order by f.QuestionId, f.rn
+)
+select
+  d.QuestionId,
+  left(coalesce(d.Title,''), 150) as TitleSnippet,
+  d.OwnerName,
+  coalesce(d.UserDisplayName, '(deleted user)') as UserDisplayName,
+  d.Location,
+  d.Reputation,
+  case when d.Reputation >= d.GlobalRepMedian then 'above_median' else 'below_median' end as RepBand,
+  d.TagProfile,
+  coalesce(d.TagList, '(no-tags)') as TagList,
+  d.TagCount,
+  d.AnswerCount,
+  d.AvgAnswerScore,
+  d.AcceptedFlag,
+  d.NetVotes,
+  d.UpVotes,
+  d.DownVotes,
+  d.Favorites,
+  d.ViewCount,
+  d.CloseEvents,
+  d.DuplicateLinks,
+  d.InteractionCount,
+  d.ActivityScore,
+  d.AnswerPercentile,
+  d.TagDenseRank,
+  d.FavoritesByTagProfile,
+  d.AvgScoreByLocation,
+  d.LastActivityAny,
+  d.QuestionDate,
+  d.FirstCloseDate,
+  d.LastCloseDate,
+  d.LastCommentDate,
+  d.LastAnswerDate,
+  d.LastVoteDate
+from dedup d
+where
+  not exists (
+    select 1
+    from Posts p2
+    where p2.PostTypeId = 1
+      and p2.OwnerUserId = d.OwnerUserId
+      and coalesce((
+        select count(*) from Votes v2
+        where v2.PostId = p2.Id and v2.VoteTypeId = 5
+      ),0) = 0
+      and p2.Id <> d.QuestionId
+  )
+order by d.ActivityScore desc, d.LastActivityAny desc
+limit 200;

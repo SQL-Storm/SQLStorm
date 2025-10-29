@@ -1,0 +1,172 @@
+WITH
+RecentPopularPosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.ViewCount,
+    p.Score,
+    p.Tags,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.ViewCount DESC, p.Score DESC, p.CreationDate DESC) AS rn
+  FROM Posts p
+  WHERE p.PostTypeId = 1 -- questions
+    AND p.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180 days'
+),
+TagHotness AS (
+  SELECT
+    t.TagName,
+    AVG(p.Score) AS avg_score,
+    SUM(p.ViewCount) AS total_views,
+    COUNT(*) AS post_count
+  FROM Posts p
+  JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags)-2), '><')) AS TagName
+  ) AS t ON true
+  WHERE p.PostTypeId = 1
+  GROUP BY t.TagName
+),
+UserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    COUNT(DISTINCT p.Id) AS posts_created,
+    SUM(p.ViewCount) AS total_views_by_user,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes_on_their_posts,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes_on_their_posts
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  GROUP BY u.Id, u.DisplayName
+),
+CorrelatedActivity AS (
+  SELECT
+    r.PostId,
+    r.Title,
+    r.CreationDate,
+    r.ViewCount,
+    r.Score,
+    r.Tags,
+    r.OwnerUserId,
+    r.LastActivityDate,
+    ua.posts_created,
+    ua.total_views_by_user,
+    ua.upvotes_on_their_posts,
+    ua.downvotes_on_their_posts
+  FROM RecentPopularPosts r
+  LEFT JOIN UserActivity ua ON ua.UserId = r.OwnerUserId
+  WHERE r.rn <= 5
+),
+ComplexMeasures AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.ViewCount,
+    p.Score,
+    p.Tags,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCount,
+    (SELECT COUNT(*) FROM Votes v2 WHERE v2.PostId = p.Id AND v2.VoteTypeId = 2) AS UpVotes,
+    (SELECT COUNT(*) FROM Votes v2 WHERE v2.PostId = p.Id AND v2.VoteTypeId = 3) AS DownVotes,
+    CASE
+      WHEN p.ViewCount > 1000 THEN 'Hot'
+      WHEN p.ViewCount > 500 THEN 'Warm'
+      ELSE 'Cold'
+    END AS PopularityBucket,
+    (SELECT STRING_AGG(vt.Name || ':' || v.Id::text, '|')
+     FROM Votes v JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+     WHERE v.PostId = p.Id) AS VoteSummary,
+    (SELECT MAX(CreationDate) FROM PostLinks pl WHERE pl.PostId = p.Id) AS LastLinkCreated,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = p.Id) AS LinkCount,
+    (SELECT COUNT(*) FROM Tags t WHERE t.ExcerptPostId = p.Id) AS TagExcerptCount
+  FROM Posts p
+  LEFT JOIN LATERAL (
+    SELECT 1
+  ) AS l ON true
+  WHERE p.PostTypeId = 1
+),
+SetOperations AS (
+  SELECT
+    c.PostId,
+    c.Title,
+    c.CreationDate,
+    c.ViewCount,
+    c.Score,
+    c.Tags,
+    c.OwnerUserId,
+    c.LastActivityDate,
+    c.CommentCount,
+    c.UpVotes,
+    c.DownVotes,
+    c.PopularityBucket,
+    c.VoteSummary,
+    c.LastLinkCreated,
+    c.LinkCount,
+    c.TagExcerptCount,
+    ROW_NUMBER() OVER (ORDER BY c.LastActivityDate DESC, c.ViewCount DESC, c.Score DESC) AS rn_to_top
+  FROM ComplexMeasures c
+  WHERE c.TagExcerptCount >= 0
+  UNION ALL
+  SELECT
+    t.PostId,
+    t.Title,
+    t.CreationDate,
+    t.ViewCount,
+    t.Score,
+    t.Tags,
+    t.OwnerUserId,
+    t.LastActivityDate,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = t.PostId) AS CommentCount,
+    (SELECT COUNT(*) FROM Votes v2 WHERE v2.PostId = t.PostId AND v2.VoteTypeId = 2) AS UpVotes,
+    (SELECT COUNT(*) FROM Votes v2 WHERE v2.PostId = t.PostId AND v2.VoteTypeId = 3) AS DownVotes,
+    CASE
+      WHEN t.ViewCount > 1000 THEN 'Hot'
+      WHEN t.ViewCount > 500 THEN 'Warm'
+      ELSE 'Cold'
+    END AS PopularityBucket,
+    (SELECT STRING_AGG(vt.Name || ':' || v.Id::text, '|')
+     FROM Votes v JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+     WHERE v.PostId = t.PostId) AS VoteSummary,
+    (SELECT MAX(CreationDate) FROM PostLinks pl WHERE pl.PostId = t.PostId) AS LastLinkCreated,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = t.PostId) AS LinkCount,
+    (SELECT COUNT(*) FROM Tags tx WHERE tx.ExcerptPostId = t.PostId) AS TagExcerptCount,
+    ROW_NUMBER() OVER (ORDER BY t.LastActivityDate DESC, t.ViewCount DESC) AS rn_to_top
+  FROM PostHistory ph
+  JOIN Posts t ON t.Id = ph.PostId
+  WHERE ph.PostHistoryTypeId IN (10, 16)
+)
+SELECT
+  sr.PostId,
+  sr.Title,
+  sr.CreationDate,
+  sr.ViewCount,
+  sr.Score,
+  sr.Tags,
+  sr.OwnerUserId,
+  sr.LastActivityDate,
+  sr.CommentCount,
+  sr.UpVotes,
+  sr.DownVotes,
+  sr.PopularityBucket,
+  sr.VoteSummary,
+  sr.LastLinkCreated,
+  sr.LinkCount,
+  sr.TagExcerptCount,
+  u.DisplayName AS OwnerDisplayName,
+  u.Reputation,
+  u.CreationDate AS OwnerCreationDate,
+  (SELECT COUNT(*) FROM Badges b WHERE b.UserId = sr.OwnerUserId) AS BadgeCount,
+  CASE
+    WHEN u.Location IS NULL THEN 'Unknown'
+    ELSE u.Location
+  END AS OwnerLocation
+FROM SetOperations sr
+LEFT JOIN Users u ON u.Id = sr.OwnerUserId
+LEFT JOIN PostLinks pl ON pl.PostId = sr.PostId
+LEFT JOIN Tags t ON t.ExcerptPostId = sr.PostId
+WHERE sr.rn_to_top <= 100
+ORDER BY sr.LastActivityDate DESC NULLS LAST, sr.ViewCount DESC, sr.Score DESC
+LIMIT 200;

@@ -1,0 +1,133 @@
+-- {"query": "7447.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1371} 
+WITH UserPostStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        SUM(COALESCE(p.Score, 0)) as TotalScore,
+        AVG(COALESCE(p.Score, 0)) as AvgScore,
+        MAX(p.CreationDate) as LastPostDate,
+        STRING_AGG(DISTINCT COALESCE(p.Tags, ''), ', ') as AllTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE p.CreationDate >= '2020-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        TotalPosts,
+        Questions,
+        Answers,
+        TotalScore,
+        AvgScore,
+        LastPostDate,
+        AllTags,
+        ROW_NUMBER() OVER (ORDER BY TotalScore DESC, Reputation DESC) as ScoreRank,
+        DENSE_RANK() OVER (ORDER BY Reputation DESC) as RepRank
+    FROM UserPostStats
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            ELSE 'Niche'
+        END as TagCategory,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as PopularityRank
+    FROM Tags t
+),
+RecentActivity AS (
+    SELECT 
+        ph.PostId,
+        ph.UserId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        u.DisplayName as EditorName,
+        CASE 
+            WHEN ph.PostHistoryTypeId IN (1, 4) THEN 'Title Changed'
+            WHEN ph.PostHistoryTypeId IN (2, 5) THEN 'Body Edited'
+            WHEN ph.PostHistoryTypeId IN (3, 6) THEN 'Tags Updated'
+            WHEN ph.PostHistoryTypeId = 10 THEN 'Post Closed'
+            WHEN ph.PostHistoryTypeId = 11 THEN 'Post Reopened'
+            ELSE 'Other'
+        END as ActivityType,
+        LAG(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) as PreviousEditTime,
+        DATEDIFF('MINUTE', LAG(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate), ph.CreationDate) as MinutesSinceLastEdit
+    FROM PostHistory ph
+    LEFT JOIN Users u ON ph.UserId = u.Id
+    WHERE ph.CreationDate >= '2023-01-01'
+),
+UserBadges AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) as TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) as GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) as SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) as BronzeBadges,
+        STRING_AGG(b.Name, ', ') as BadgeNames,
+        MAX(b.Date) as LastBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+),
+PostQualityMetrics AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CommentCount,
+        p.AnswerCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        CASE 
+            WHEN p.Score > 100 THEN 'Excellent'
+            WHEN p.Score > 50 THEN 'Good'
+            WHEN p.Score > 10 THEN 'Average'
+            ELSE 'Low'
+        END as QualityLevel,
+        CASE 
+            WHEN p.ViewCount > 1000 THEN 'High View'
+            WHEN p.ViewCount > 100 THEN 'Medium View'
+            ELSE 'Low View'
+        END as PopularityLevel,
+        CASE 
+            WHEN p.AnswerCount > 10 THEN 'Many Answers'
+            WHEN p.AnswerCount > 5 THEN 'Some Answers'
+            ELSE 'Few Answers'
+        END as AnswerLevel,
+        (p.Score * 1.0 / NULLIF(p.ViewCount, 0)) as ScoreToViewRatio,
+        NULLIF(p.AnswerCount, 0) / NULLIF(p.CommentCount, 0) as AnswersToCommentsRatio
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.CreationDate >= '2022-01-01'
+)
+SELECT 
+    'Overall Performance Analysis' as ReportTitle,
+    COUNT(*) as TotalRecords,
+    COUNT(DISTINCT tu.UserId) as ActiveUsers,
+    COUNT(DISTINCT ta.TagName) as TotalTags,
+    COUNT(DISTINCT ra.PostId) as RecentPosts,
+    SUM(CASE WHEN tu.TotalPosts > 100 THEN 1 ELSE 0 END) as HighActivityUsers,
+    SUM(CASE WHEN pql.Score > 100 THEN 1 ELSE 0 END) as HighScoreQuestions,
+    AVG(tu.TotalScore) as AvgUserScore,
+    AVG(pql.Score) as AvgQuestionScore,
+    AVG(ta.TagCount) as AvgTagCount,
+    STRING_AGG(CONCAT('User:', tu.DisplayName, '|Rep:', tu.Reputation, '|Posts:', tu.TotalPosts), '; ') as UserSummary
+FROM TopUsers tu
+FULL OUTER JOIN TagAnalysis ta ON 1 = 1
+FULL OUTER JOIN RecentActivity ra ON 1 = 1
+FULL OUTER JOIN PostQualityMetrics pql ON 1 = 1
+WHERE tu.ScoreRank <= 50 OR ta.PopularityRank <= 50 OR ra.CreationDate IS NOT NULL OR pql.Score IS NOT NULL
+    AND (tu.UserId IS NULL OR tu.Reputation > 1000)
+    AND (ta.TagName IS NULL OR ta.TagCount > 100)
+    AND (ra.PostId IS NULL OR ra.MinutesSinceLastEdit IS NULL OR ra.MinutesSinceLastEdit > 1)
+    AND (pql.PostId IS NULL OR pql.ScoreToViewRatio IS NULL OR pql.ScoreToViewRatio > 0.01)

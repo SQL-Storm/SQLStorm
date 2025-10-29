@@ -1,0 +1,99 @@
+WITH
+RecentActive AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.Body,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    u.Reputation AS OwnerReputation,
+    u.DisplayName AS OwnerDisplayName,
+    COALESCE(v.TotalUpVotes, 0) AS UpVotesFromVotes,
+    COALESCE(v.TotalDownVotes, 0) AS DownVotesFromVotes,
+    pc.ClosedDate,
+    ch.Name AS CloseReasonName
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN (
+    SELECT
+      PostId,
+      SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotes,
+      SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotes
+    FROM Votes
+    GROUP BY PostId
+  ) v ON p.Id = v.PostId
+  LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+  LEFT JOIN CloseReasonTypes ch ON ph.Comment IS NOT NULL AND ph.Comment LIKE '%' || CAST(ch.Id AS VARCHAR(100)) || '%'
+  LEFT JOIN (
+    SELECT PostId, MAX(ClosedDate) AS ClosedDate
+    FROM Posts
+    WHERE ClosedDate IS NOT NULL
+    GROUP BY PostId
+  ) pc ON pc.PostId = p.Id
+  WHERE p.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30' DAY)
+),
+TagPopularity AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS TagCount,
+    AVG(p.Score) AS AvgPostScore
+  FROM Tags t
+  JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+  WHERE p.PostTypeId = 1
+  GROUP BY t.TagName
+),
+CorrelatedStats AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.Score,
+    p.ViewCount,
+    u.Reputation AS UserReputation,
+    w.Name AS WikiTagName,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate DESC) AS rn,
+    p.OwnerUserId,
+    p.LastActivityDate
+  FROM Posts p
+  JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Tags w ON w.TagName = (
+    CASE
+      WHEN p.Tags LIKE '<%>%' THEN SUBSTRING(p.Tags FROM 2 FOR POSITION('>' IN SUBSTRING(p.Tags FROM 2)) - 1)
+      ELSE NULL
+    END
+  )
+  WHERE p.LastActivityDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '7' DAY)
+)
+SELECT
+  ra.PostId,
+  ra.Title,
+  ra.Tags,
+  ra.Score,
+  ra.ViewCount,
+  ra.OwnerDisplayName,
+  ra.OwnerReputation,
+  ra.ClosedDate,
+  ra.CloseReasonName,
+  tp.TagCount,
+  tp.AvgPostScore,
+  cs.UserReputation AS CorrelatedUserReputation,
+  cs.rn,
+  ra.LastActivityDate,
+  ra.OwnerUserId
+FROM RecentActive ra
+LEFT JOIN TagPopularity tp ON ra.Tags LIKE '%' || tp.TagName || '%'
+LEFT JOIN CorrelatedStats cs ON ra.PostId = cs.PostId
+WHERE
+  ra.ViewCount > 100
+  AND ra.Score BETWEEN -5 AND 100
+  AND (ra.CloseReasonName IS NULL OR ra.CloseReasonName NOT IN ('Too localized', 'Not a real question'))
+ORDER BY ra.LastActivityDate DESC, ra.Score DESC
+LIMIT 200;

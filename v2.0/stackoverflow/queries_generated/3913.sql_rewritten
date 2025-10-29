@@ -1,0 +1,100 @@
+-- {"query": "3913.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1919} 
+WITH RecentQuestions AS (
+    SELECT 
+        p.Id,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.Title,
+        regexp_split_to_table(substr(p.Tags, 2, length(p.Tags)-2), '><') AS Tag
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '1 year'
+),
+UserPosts AS (
+    SELECT 
+        u.Id AS UserId,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 1) AS AvgQuestionScore,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id
+),
+UserBadges AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        STRING_AGG(DISTINCT b.Name, ', ') AS BadgeList
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserLatestAccepted AS (
+    SELECT 
+        u.Id AS UserId,
+        (
+            SELECT p.Title
+            FROM Posts p
+            WHERE p.PostTypeId = 2
+              AND p.OwnerUserId = u.Id
+              AND p.Id = p.AcceptedAnswerId
+            ORDER BY p.CreationDate DESC
+            LIMIT 1
+        ) AS LatestAcceptedTitle
+    FROM Users u
+),
+Combined AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        COALESCE(up.QuestionCount, 0)      AS Questions,
+        COALESCE(up.AnswerCount, 0)        AS Answers,
+        COALESCE(up.AvgQuestionScore, 0)   AS AvgQScore,
+        COALESCE(ub.GoldBadges, 0)         AS Gold,
+        COALESCE(ub.SilverBadges, 0)       AS Silver,
+        COALESCE(ub.BronzeBadges, 0)       AS Bronze,
+        ub.BadgeList,
+        up.LastPostDate,
+        ul.LatestAcceptedTitle,
+        u.Reputation,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, COALESCE(ub.GoldBadges,0) DESC) AS RepRank
+    FROM Users u
+    LEFT JOIN UserPosts up       ON up.UserId = u.Id
+    LEFT JOIN UserBadges ub      ON ub.UserId = u.Id
+    LEFT JOIN UserLatestAccepted ul ON ul.UserId = u.Id
+)
+SELECT *
+FROM Combined
+WHERE RepRank <= 100
+  AND (Gold > 0 OR Bronze > 5)
+
+UNION ALL
+
+SELECT 
+    c.Id,
+    c.DisplayName,
+    c.Questions,
+    c.Answers,
+    c.AvgQScore,
+    c.Gold,
+    c.Silver,
+    c.Bronze,
+    c.BadgeList,
+    c.LastPostDate,
+    c.LatestAcceptedTitle,
+    c.Reputation,
+    c.RepRank
+FROM Combined c
+WHERE c.LatestAcceptedTitle IS NULL
+  AND EXISTS (
+      SELECT 1
+      FROM PostHistory ph
+      WHERE ph.PostId = c.Id
+        AND ph.PostHistoryTypeId = 10
+        AND ph.Comment IS NOT NULL
+        AND ph.Comment::int = 101
+  )
+ORDER BY RepRank ASC, Gold DESC, Reputation DESC;

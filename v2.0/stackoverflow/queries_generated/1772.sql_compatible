@@ -1,0 +1,241 @@
+WITH UserContributionStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswers,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostScore,
+        SUM(COALESCE(c.Score, 0)) AS TotalCommentScore,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END)::NUMERIC(10,2) AS AvgQuestionScore,
+        CASE
+            WHEN u.Reputation >= 100000 THEN 'Legendary'
+            WHEN u.Reputation >= 20000 THEN 'Highly Esteemed'
+            WHEN u.Reputation >= 5000 THEN 'Esteemed'
+            WHEN u.Reputation >= 1000 THEN 'Experienced'
+            ELSE 'Novice'
+        END AS ReputationTier
+    FROM Users AS u
+    LEFT JOIN Posts AS p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments AS c ON u.Id = c.UserId
+    LEFT JOIN Badges AS b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+    HAVING
+        COUNT(DISTINCT p.Id) > 0 OR COUNT(DISTINCT c.Id) > 0
+),
+PostVoteSummary AS (
+    SELECT
+        v.PostId,
+        SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpvoteCount,
+        SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownvoteCount,
+        SUM(CASE WHEN vt.Name = 'Favorite' THEN 1 ELSE 0 END) AS FavoriteCount
+    FROM Votes AS v
+    JOIN VoteTypes AS vt ON v.VoteTypeId = vt.Id
+    GROUP BY v.PostId
+),
+HighlyEngagedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.ViewCount,
+        p.Score,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.CommentCount,
+        p.ClosedDate
+    FROM Posts AS p
+    WHERE p.PostTypeId = 1
+      AND p.Score > 50
+      AND p.ViewCount > 10000
+    UNION ALL
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.ViewCount,
+        p.Score,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.CommentCount,
+        p.ClosedDate
+    FROM Posts AS p
+    WHERE p.PostTypeId = 2
+      AND p.Score > 20
+      AND p.CommentCount > 5
+),
+PostActivitySummary AS (
+    SELECT
+        hep.PostId,
+        hep.PostTypeId,
+        hep.Title,
+        hep.CreationDate AS PostCreationDate,
+        hep.LastActivityDate,
+        hep.ViewCount,
+        hep.Score,
+        hep.OwnerUserId,
+        hep.AcceptedAnswerId,
+        hep.CommentCount,
+        hep.ClosedDate,
+        COUNT(DISTINCT ph.Id) AS EditHistoryCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN ph.Id END) AS MajorEditCount,
+        COUNT(DISTINCT ph.UserId) AS DistinctEditors,
+        pvs.UpvoteCount,
+        pvs.DownvoteCount,
+        pvs.FavoriteCount,
+        AVG(COALESCE(c.Score,0))::NUMERIC(10,2) AS AvgCommentScore,
+        EXTRACT(EPOCH FROM (hep.LastActivityDate - hep.CreationDate)) / (60 * 60 * 24) AS PostActivityDays,
+        (COALESCE(pvs.UpvoteCount,0) > 10 AND COALESCE(pvs.DownvoteCount,0) > 5) AS IsControversial,
+        (
+            SELECT ph_corr.Comment
+            FROM PostHistory AS ph_corr
+            WHERE ph_corr.PostId = hep.PostId
+              AND ph_corr.PostHistoryTypeId IN (4,5,6)
+              AND ph_corr.Comment IS NOT NULL
+            ORDER BY ph_corr.CreationDate DESC
+            LIMIT 1
+        ) AS LastEditComment
+    FROM HighlyEngagedPosts AS hep
+    LEFT JOIN PostHistory AS ph ON hep.PostId = ph.PostId
+    LEFT JOIN PostVoteSummary AS pvs ON hep.PostId = pvs.PostId
+    LEFT JOIN Comments AS c ON hep.PostId = c.PostId
+    GROUP BY
+        hep.PostId, hep.PostTypeId, hep.Title, hep.CreationDate, hep.LastActivityDate, hep.ViewCount, hep.Score,
+        hep.OwnerUserId, hep.AcceptedAnswerId, hep.CommentCount, hep.ClosedDate,
+        pvs.UpvoteCount, pvs.DownvoteCount, pvs.FavoriteCount
+),
+TagPerformance AS (
+    SELECT
+        UPPER(TRIM(tag)) AS TagName,
+        COUNT(p.Id) AS TaggedPostsCount,
+        SUM(p.Score) AS TotalTagScore,
+        AVG(p.ViewCount)::NUMERIC(10,2) AS AvgTagViewCount,
+        DENSE_RANK() OVER (ORDER BY SUM(p.Score) DESC, COUNT(p.Id) DESC) AS TagScoreRank
+    FROM Posts AS p
+    JOIN HighlyEngagedPosts AS hep ON p.Id = hep.PostId
+    CROSS JOIN LATERAL (
+        SELECT UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><')) AS tag
+    ) t
+    WHERE p.PostTypeId = 1
+      AND p.Tags IS NOT NULL
+      AND LENGTH(p.Tags) > 2
+    GROUP BY UPPER(TRIM(tag))
+    HAVING COUNT(p.Id) >= 5
+),
+PostLinkAnalysis AS (
+    SELECT
+        pl.PostId,
+        COUNT(CASE WHEN lt.Name = 'Linked' THEN 1 END) AS LinkedToCount,
+        COUNT(CASE WHEN lt.Name = 'Duplicate' THEN 1 END) AS IsDuplicateOfCount,
+        STRING_AGG(CASE WHEN lt.Name = 'Duplicate' THEN CAST(pl.RelatedPostId AS TEXT) ELSE NULL END, '; ' ORDER BY pl.RelatedPostId) FILTER (WHERE lt.Name = 'Duplicate') AS DuplicateOfPostsList,
+        EXISTS (
+            SELECT 1
+            FROM PostLinks AS pl_rev
+            JOIN LinkTypes AS lt_rev ON pl_rev.LinkTypeId = lt_rev.Id
+            WHERE pl_rev.RelatedPostId = pl.PostId AND lt_rev.Name = 'Duplicate'
+        ) AS IsReferencedAsDuplicate
+    FROM PostLinks AS pl
+    JOIN LinkTypes AS lt ON pl.LinkTypeId = lt.Id
+    JOIN HighlyEngagedPosts AS hep ON pl.PostId = hep.PostId
+    GROUP BY pl.PostId
+)
+SELECT
+    ucs.DisplayName AS User_DisplayName,
+    ucs.Reputation,
+    ucs.ReputationTier,
+    TO_CHAR(ucs.UserCreationDate, 'YYYY-MM-DD HH24:MI:SS') AS User_CreationDate,
+    TO_CHAR(ucs.LastAccessDate, 'YYYY-MM-DD HH24:MI:SS') AS User_LastAccessDate,
+    ucs.TotalPosts,
+    ucs.TotalQuestions,
+    ucs.TotalAnswers,
+    ucs.TotalComments,
+    ucs.TotalPostScore,
+    ucs.TotalCommentScore,
+    ucs.TotalBadges,
+    ucs.AvgQuestionScore,
+    pa.PostId,
+    COALESCE(pa.Title, 'N/A') AS Post_Title,
+    pt.Name AS Post_Type,
+    pa.ViewCount AS Post_ViewCount,
+    pa.Score AS Post_Score,
+    pa.EditHistoryCount,
+    pa.MajorEditCount,
+    pa.DistinctEditors,
+    pa.UpvoteCount,
+    pa.DownvoteCount,
+    pa.FavoriteCount,
+    pa.CommentCount AS Post_CommentCount,
+    pa.AvgCommentScore AS Post_AvgCommentScore,
+    pa.PostActivityDays,
+    pa.IsControversial AS Post_IsControversial,
+    COALESCE(phist_close.Comment, crt.Name, 'N/A') AS Post_CloseReason,
+    COALESCE(pa.LastEditComment, 'No significant edit comment') AS Post_LastEditComment,
+    COALESCE(tperf.TagName, 'Untagged/Minor Tags') AS Dominant_TagName,
+    COALESCE(tperf.TaggedPostsCount, 0) AS Dominant_TagPostsCount,
+    COALESCE(tperf.TotalTagScore, 0) AS Dominant_TagTotalScore,
+    COALESCE(tperf.AvgTagViewCount, 0.0) AS Dominant_TagAvgViewCount,
+    COALESCE(tperf.TagScoreRank, 9999) AS Dominant_TagScoreRank,
+    COALESCE(pla.LinkedToCount, 0) AS Post_LinkedToCount,
+    COALESCE(pla.IsDuplicateOfCount, 0) AS Post_IsDuplicateOfCount,
+    COALESCE(pla.DuplicateOfPostsList, 'None') AS Post_DuplicateOfPosts,
+    pla.IsReferencedAsDuplicate AS Post_IsReferencedAsDuplicate,
+    RANK() OVER (ORDER BY ucs.Reputation DESC) AS GlobalUserReputationRank,
+    AVG(pa.Score) OVER (PARTITION BY ucs.ReputationTier)::NUMERIC(10,2) AS AvgPostScore_ByReputationTier,
+    CASE
+        WHEN pa.ViewCount > 5000 AND pa.Score > 100 AND pa.PostActivityDays < 30 AND pa.PostTypeId = 1 THEN 'Hot Question'
+        WHEN pa.ViewCount > 1000 AND pa.Score > 50 AND pa.PostActivityDays < 60 AND pa.PostTypeId = 2 THEN 'Hot Answer'
+        ELSE 'Warm/Cold'
+    END AS Post_HeatStatus,
+    CASE
+        WHEN u.EmailHash IS NOT NULL AND LENGTH(u.EmailHash) > 8
+        THEN SUBSTRING(u.EmailHash FROM 1 FOR 4) || '...' || SUBSTRING(u.EmailHash FROM LENGTH(u.EmailHash) - 3 FOR 4)
+        ELSE COALESCE(u.EmailHash, 'N/A')
+    END AS Masked_EmailHash_Snippet,
+    COALESCE(
+        CASE
+            WHEN u.AboutMe IS NULL THEN 'User has no "About Me" section.'
+            WHEN LENGTH(u.AboutMe) < 50 THEN 'User has a very short "About Me" section: ' || u.AboutMe
+            ELSE SUBSTRING(u.AboutMe FROM 1 FOR 100) || '...'
+        END,
+        'N/A'
+    ) AS AboutMe_Snippet
+FROM UserContributionStats AS ucs
+LEFT JOIN Users AS u ON ucs.UserId = u.Id
+INNER JOIN PostActivitySummary AS pa ON ucs.UserId = pa.OwnerUserId
+LEFT JOIN PostTypes AS pt ON pa.PostTypeId = pt.Id
+LEFT JOIN (
+    SELECT
+        p.OwnerUserId,
+        UPPER(TRIM(tag)) AS TagName,
+        SUM(p.Score) AS TagScore,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY SUM(p.Score) DESC, COUNT(p.Id) DESC) AS rn
+    FROM Posts AS p
+    JOIN UserContributionStats AS ucs_tag ON p.OwnerUserId = ucs_tag.UserId
+    CROSS JOIN LATERAL (
+        SELECT UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><')) AS tag
+    ) t
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2
+    GROUP BY p.OwnerUserId, UPPER(TRIM(tag))
+) AS DominantUserTag ON ucs.UserId = DominantUserTag.OwnerUserId AND DominantUserTag.rn = 1
+LEFT JOIN TagPerformance AS tperf ON DominantUserTag.TagName = tperf.TagName
+LEFT JOIN PostLinkAnalysis AS pla ON pa.PostId = pla.PostId
+LEFT JOIN PostHistory AS phist_close ON pa.PostId = phist_close.PostId
+    AND phist_close.PostHistoryTypeId = (SELECT Id FROM PostHistoryTypes WHERE Name = 'Post Closed')
+LEFT JOIN CloseReasonTypes AS crt ON TRY_CAST(phist_close.Comment AS INTEGER) = crt.Id
+WHERE
+    (ucs.Reputation > 1000 AND pa.PostId IS NOT NULL)
+ORDER BY
+    GlobalUserReputationRank ASC,
+    Post_HeatStatus DESC,
+    pa.PostCreationDate DESC
+LIMIT 500;

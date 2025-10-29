@@ -1,0 +1,242 @@
+-- {"query": "7024.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2509} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        COUNT(DISTINCT c.Id) AS Comments,
+        COUNT(DISTINCT b.Id) AS Badges,
+        COALESCE(SUM(p.Score), 0) AS TotalScore,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END), 0) AS QuestionScore,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END), 0) AS AnswerScore,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(u.LastAccessDate) AS LastAccessDate,
+        DATEDIFF(DAY, u.CreationDate, MAX(u.LastAccessDate)) AS DaysSinceRegistration,
+        CASE 
+            WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 0 
+            THEN CAST(COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS FLOAT) / COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END)
+            ELSE 0 
+        END AS AnswerToQuestionRatio,
+        STRING_AGG(DISTINCT p.Tags, ',') WITHIN GROUP (ORDER BY p.Tags) AS AllTags,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.ViewCount > 100 THEN p.Id END) AS HighViewQuestions
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate, u.LastAccessDate
+),
+PostPerformanceMetrics AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        COALESCE(p.AnswerCount, 0) + COALESCE(p.CommentCount, 0) AS EngagementCount,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question' 
+            WHEN p.PostTypeId = 2 THEN 'Answer' 
+            ELSE 'Other' 
+        END AS PostType,
+        CASE 
+            WHEN p.ViewCount > 1000 THEN 'High'
+            WHEN p.ViewCount > 100 THEN 'Medium'
+            WHEN p.ViewCount > 0 THEN 'Low'
+            ELSE 'None'
+        END AS ViewLevel,
+        DATEDIFF(DAY, p.CreationDate, GETDATE()) AS AgeInDays,
+        p.Score * (1 + (CASE WHEN p.ViewCount > 0 THEN LOG(p.ViewCount) ELSE 0 END) / 10.0) AS ScoreWithViewFactor,
+        ROW_NUMBER() OVER (ORDER BY (p.Score * (1 + (CASE WHEN p.ViewCount > 0 THEN LOG(p.ViewCount) ELSE 0 END) / 10.0)) DESC) AS RankByWeightedScore,
+        DENSE_RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS RankByPostType,
+        RANK() OVER (ORDER BY p.Score DESC) AS OverallRank
+    FROM Posts p
+    WHERE p.Id IS NOT NULL AND p.CreationDate IS NOT NULL
+),
+TopPerformers AS (
+    SELECT 
+        u.UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.TotalPosts,
+        u.Questions,
+        u.Answers,
+        u.Comments,
+        u.Badges,
+        u.TotalScore,
+        u.QuestionScore,
+        u.AnswerScore,
+        u.AvgPostScore,
+        u.LastPostDate,
+        u.LastAccessDate,
+        u.DaysSinceRegistration,
+        u.AnswerToQuestionRatio,
+        u.AllTags,
+        u.HighViewQuestions,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Expert'
+            WHEN u.Reputation >= 1000 THEN 'Intermediate'
+            WHEN u.Reputation >= 100 THEN 'Beginner'
+            ELSE 'Newbie'
+        END AS ReputationLevel,
+        CASE 
+            WHEN u.Questions > 50 THEN 'High Volume'
+            WHEN u.Questions > 10 THEN 'Moderate Volume'
+            WHEN u.Questions > 0 THEN 'Low Volume'
+            ELSE 'No Questions'
+        END AS QuestionActivity,
+        CASE 
+            WHEN u.Answers > 100 THEN 'High Answerer'
+            WHEN u.Answers > 50 THEN 'Moderate Answerer'
+            WHEN u.Answers > 10 THEN 'Low Answerer'
+            ELSE 'No Answers'
+        END AS AnswerActivity,
+        CASE 
+            WHEN u.Badges > 50 THEN 'Active Badge Holder'
+            WHEN u.Badges > 20 THEN 'Moderate Badge Holder'
+            WHEN u.Badges > 5 THEN 'Beginner Badge Holder'
+            ELSE 'No Badges'
+        END AS BadgeActivity
+    FROM UserActivityStats u
+    WHERE u.TotalPosts > 0
+)
+SELECT 
+    tp.UserId,
+    tp.DisplayName,
+    tp.Reputation,
+    tp.Views,
+    tp.UpVotes,
+    tp.DownVotes,
+    tp.TotalPosts,
+    tp.Questions,
+    tp.Answers,
+    tp.Comments,
+    tp.Badges,
+    tp.TotalScore,
+    tp.QuestionScore,
+    tp.AnswerScore,
+    tp.AvgPostScore,
+    tp.LastPostDate,
+    tp.LastAccessDate,
+    tp.DaysSinceRegistration,
+    tp.AnswerToQuestionRatio,
+    tp.AllTags,
+    tp.HighViewQuestions,
+    tp.ReputationLevel,
+    tp.QuestionActivity,
+    tp.AnswerActivity,
+    tp.BadgeActivity,
+    pp.PostId,
+    pp.Title,
+    pp.Score,
+    pp.ViewCount,
+    pp.AnswerCount,
+    pp.CommentCount,
+    pp.FavoriteCount,
+    pp.CreationDate,
+    pp.PostTypeId,
+    pp.EngagementCount,
+    pp.PostType,
+    pp.ViewLevel,
+    pp.AgeInDays,
+    pp.ScoreWithViewFactor,
+    pp.RankByWeightedScore,
+    pp.RankByPostType,
+    pp.OverallRank,
+    CASE 
+        WHEN pp.RankByWeightedScore <= 10 THEN 'Top Performer'
+        WHEN pp.RankByWeightedScore <= 50 THEN 'High Performer'
+        WHEN pp.RankByWeightedScore <= 100 THEN 'Medium Performer'
+        ELSE 'Regular Performer'
+    END AS PerformanceCategory,
+    CASE 
+        WHEN (tp.HighViewQuestions > 0 AND pp.ViewCount > 1000) THEN 'High Impact'
+        WHEN pp.ViewCount > 100 THEN 'Moderate Impact'
+        WHEN pp.ViewCount > 0 THEN 'Low Impact'
+        ELSE 'No Impact'
+    END AS ImpactLevel,
+    CASE 
+        WHEN pp.ScoreWithViewFactor > 1000 THEN 'Very High Score'
+        WHEN pp.ScoreWithViewFactor > 500 THEN 'High Score'
+        WHEN pp.ScoreWithViewFactor > 100 THEN 'Medium Score'
+        ELSE 'Low Score'
+    END AS ScoreLevel,
+    DATEDIFF(DAY, tp.LastPostDate, pp.CreationDate) AS DaysSinceLastPost,
+    (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = tp.UserId AND p2.CreationDate > tp.LastPostDate) AS PostsSinceLastPost,
+    COALESCE(
+        LAG(pp.ScoreWithViewFactor) OVER (ORDER BY pp.ScoreWithViewFactor DESC), 
+        0
+    ) AS PreviousTopScore,
+    ROUND(
+        (pp.ScoreWithViewFactor - COALESCE(LAG(pp.ScoreWithViewFactor) OVER (ORDER BY pp.ScoreWithViewFactor DESC), 0)) 
+        / NULLIF(COALESCE(LAG(pp.ScoreWithViewFactor) OVER (ORDER BY pp.ScoreWithViewFactor DESC), 1), 0) * 100, 
+        2
+    ) AS ScoreChangePercent,
+    ROW_NUMBER() OVER (ORDER BY pp.ScoreWithViewFactor DESC) AS SequentialRank,
+    RANK() OVER (PARTITION BY pp.PostTypeId ORDER BY pp.ScoreWithViewFactor DESC) AS RankedByPostType,
+    DENSE_RANK() OVER (ORDER BY pp.ScoreWithViewFactor DESC) AS DenseRankedByScore,
+    COUNT(*) OVER () AS TotalPostsInAnalysis,
+    CASE 
+        WHEN pp.ScoreWithViewFactor > (SELECT AVG(ScoreWithViewFactor) FROM PostPerformanceMetrics) THEN 'Above Average'
+        ELSE 'Below Average'
+    END AS PerformanceVsAverage,
+    CASE 
+        WHEN tp.TotalScore > (SELECT AVG(TotalScore) FROM TopPerformers) 
+        AND pp.ScoreWithViewFactor > (SELECT AVG(ScoreWithViewFactor) FROM PostPerformanceMetrics) 
+        THEN 'Exceptional Contributor'
+        WHEN tp.TotalScore > (SELECT AVG(TotalScore) FROM TopPerformers) OR pp.ScoreWithViewFactor > (SELECT AVG(ScoreWithViewFactor) FROM PostPerformanceMetrics) 
+        THEN 'Strong Contributor'
+        ELSE 'Regular Contributor'
+    END AS ContributorStatus,
+    CASE 
+        WHEN tp.DaysSinceRegistration > 365 THEN 'Veteran'
+        WHEN tp.DaysSinceRegistration > 180 THEN 'Experienced'
+        WHEN tp.DaysSinceRegistration > 30 THEN 'Intermediate'
+        ELSE 'Recent'
+    END AS UserSeniority,
+    CASE 
+        WHEN tp.LastAccessDate > DATEADD(DAY, -30, GETDATE()) THEN 'Active'
+        WHEN tp.LastAccessDate > DATEADD(DAY, -90, GETDATE()) THEN 'Moderately Active'
+        ELSE 'Inactive'
+    END AS UserActivityLevel,
+    CASE 
+        WHEN tp.Answers > tp.Questions THEN 'Answer Focused'
+        WHEN tp.Questions > tp.Answers THEN 'Question Focused'
+        ELSE 'Balanced Focus'
+    END AS ContributionFocus,
+    CASE 
+        WHEN tp.Reputation > 10000 THEN 
+            CASE 
+                WHEN pp.ScoreWithViewFactor > (SELECT AVG(ScoreWithViewFactor) FROM PostPerformanceMetrics WHERE PostTypeId = 1) THEN 'Elite Question Contributor'
+                WHEN pp.ScoreWithViewFactor > (SELECT AVG(ScoreWithViewFactor) FROM PostPerformanceMetrics WHERE PostTypeId = 2) THEN 'Elite Answer Contributor'
+                ELSE 'Elite Contributor'
+            END
+        ELSE 'Non-Elite Contributor'
+    END AS EliteStatus,
+    'Query Analysis Complete' AS StatusIndicator
+FROM TopPerformers tp
+INNER JOIN PostPerformanceMetrics pp ON tp.UserId = pp.OwnerUserId
+WHERE pp.PostId IS NOT NULL 
+    AND tp.Reputation > 100
+    AND (
+        pp.ScoreWithViewFactor > (SELECT AVG(ScoreWithViewFactor) FROM PostPerformanceMetrics) 
+        OR tp.TotalScore > (SELECT AVG(TotalScore) FROM TopPerformers)
+    )
+    AND pp.CreationDate >= DATEADD(YEAR, -1, GETDATE())
+ORDER BY pp.ScoreWithViewFactor DESC, tp.TotalScore DESC, tp.Reputation DESC
+OPTION (RECOMPILE, MAXDOP 8);

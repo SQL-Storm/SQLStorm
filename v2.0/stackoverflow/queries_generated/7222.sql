@@ -1,0 +1,248 @@
+-- {"query": "7222.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2850} 
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+        SUM(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as cumulative_score,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) as user_post_count,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN 'Question with Answers'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as post_category
+    FROM Posts p
+    WHERE p.CreationDate >= '2022-01-01' 
+),
+UserActivity AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.AccountId,
+        COALESCE(SUM(p.Score), 0) as total_score,
+        COUNT(p.Id) as posts_count,
+        MAX(p.CreationDate) as last_post_date,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as questions_count,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as answers_count,
+        COUNT(b.Id) as badges_count,
+        STRING_AGG(DISTINCT CASE WHEN b.Class = 1 THEN b.Name END, ', ') as gold_badges,
+        STRING_AGG(DISTINCT CASE WHEN b.Class = 2 THEN b.Name END, ', ') as silver_badges,
+        STRING_AGG(DISTINCT CASE WHEN b.Class = 3 THEN b.Name END, ', ') as bronze_badges
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes, u.AccountId
+),
+PostAnalysis AS (
+    SELECT 
+        r.Id,
+        r.PostTypeId,
+        r.OwnerUserId,
+        r.Score,
+        r.ViewCount,
+        r.CreationDate,
+        r.Title,
+        r.Tags,
+        r.AnswerCount,
+        r.CommentCount,
+        r.FavoriteCount,
+        r.rn,
+        r.prev_score,
+        r.cumulative_score,
+        r.user_post_count,
+        r.post_category,
+        CASE 
+            WHEN r.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1 AND CreationDate >= '2022-01-01') THEN 'Above Avg'
+            WHEN r.Score < (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1 AND CreationDate >= '2022-01-01') THEN 'Below Avg'
+            ELSE 'Avg'
+        END as score_ranking,
+        CASE 
+            WHEN r.ViewCount > (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = 1 AND CreationDate >= '2022-01-01') THEN 'High Views'
+            ELSE 'Low Views'
+        END as view_category,
+        DATEDIFF('day', r.CreationDate, CURRENT_TIMESTAMP) as days_since_creation,
+        DATEDIFF('day', r.CreationDate, LAG(r.CreationDate) OVER (PARTITION BY r.OwnerUserId ORDER BY r.CreationDate)) as days_between_posts
+    FROM RankedPosts r
+    WHERE r.rn <= 5
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.IsRequired,
+        t.IsModeratorOnly,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        LAG(t.Count) OVER (ORDER BY t.Count DESC) as prev_count,
+        NTH_VALUE(t.Count, 1) OVER (ORDER BY t.Count DESC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) as min_count,
+        NTH_VALUE(t.Count, 1) OVER (ORDER BY t.Count DESC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) as max_count,
+        PERCENT_RANK() OVER (ORDER BY t.Count) as count_percentile,
+        CASE 
+            WHEN t.Count >= (SELECT AVG(Count) FROM Tags) THEN 'Above Avg'
+            ELSE 'Below Avg'
+        END as count_category
+    FROM Tags t
+    WHERE t.Count > 100
+),
+ComplexUserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        COALESCE(ua.total_score, 0) as net_score,
+        COALESCE(ua.posts_count, 0) as total_posts,
+        COALESCE(ua.questions_count, 0) as questions,
+        COALESCE(ua.answers_count, 0) as answers,
+        COALESCE(ua.badges_count, 0) as total_badges,
+        COALESCE(ua.gold_badges, '') as gold_badges_list,
+        COALESCE(ua.silver_badges, '') as silver_badges_list,
+        COALESCE(ua.bronze_badges, '') as bronze_badges_list,
+        CASE 
+            WHEN ua.total_score > (SELECT AVG(total_score) FROM UserActivity) THEN 'High Scorer'
+            WHEN ua.total_score < (SELECT AVG(total_score) FROM UserActivity) THEN 'Low Scorer'
+            ELSE 'Average Scorer'
+        END as scorer_category,
+        CASE 
+            WHEN ua.posts_count > (SELECT AVG(posts_count) FROM UserActivity) THEN 'Active Poster'
+            WHEN ua.posts_count < (SELECT AVG(posts_count) FROM UserActivity) THEN 'Inactive Poster'
+            ELSE 'Average Poster'
+        END as poster_category,
+        DATEDIFF('day', u.CreationDate, CURRENT_TIMESTAMP) as user_age_days,
+        CASE 
+            WHEN DATEDIFF('day', u.CreationDate, CURRENT_TIMESTAMP) > 365 THEN 'Veteran'
+            WHEN DATEDIFF('day', u.CreationDate, CURRENT_TIMESTAMP) > 180 THEN 'Regular'
+            ELSE 'Newbie'
+        END as user_status
+    FROM Users u
+    FULL OUTER JOIN UserActivity ua ON u.Id = ua.UserId
+    WHERE u.Reputation > 1000 OR u.Views > 1000
+)
+SELECT 
+    pa.Id as PostId,
+    pa.PostTypeId,
+    pa.OwnerUserId,
+    pa.Score,
+    pa.ViewCount,
+    pa.CreationDate,
+    pa.Title,
+    pa.Tags,
+    pa.AnswerCount,
+    pa.CommentCount,
+    pa.FavoriteCount,
+    pa.rn,
+    pa.prev_score,
+    pa.cumulative_score,
+    pa.user_post_count,
+    pa.post_category,
+    pa.score_ranking,
+    pa.view_category,
+    pa.days_since_creation,
+    pa.days_between_posts,
+    COALESCE(ta.TagName, 'No Tags') as most_popular_tag,
+    COALESCE(ta.Count, 0) as tag_count,
+    COALESCE(ta.count_percentile, 0) as tag_percentile,
+    COALESCE(cus.DisplayName, 'Unknown User') as UserName,
+    COALESCE(cus.Reputation, 0) as UserReputation,
+    COALESCE(cus.total_posts, 0) as UserTotalPosts,
+    COALESCE(cus.questions, 0) as UserQuestions,
+    COALESCE(cus.answers, 0) as UserAnswers,
+    COALESCE(cus.total_badges, 0) as UserBadges,
+    COALESCE(cus.scorer_category, 'Unknown') as UserScorerCategory,
+    COALESCE(cus.poster_category, 'Unknown') as UserPosterCategory,
+    COALESCE(cus.user_age_days, 0) as UserAgeDays,
+    COALESCE(cus.user_status, 'Unknown') as UserStatus,
+    CASE 
+        WHEN pa.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1 AND creationdate >= '2022-01-01')
+        AND pa.ViewCount > (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = 1 AND creationdate >= '2022-01-01')
+        AND pa.AnswerCount > 0 THEN 'High Performing'
+        WHEN pa.Score < (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1 AND creationdate >= '2022-01-01')
+        AND pa.ViewCount < (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = 1 AND creationdate >= '2022-01-01') THEN 'Low Performing'
+        ELSE 'Average Performing'
+    END as performance_status,
+    CASE 
+        WHEN pa.days_since_creation > 30 AND pa.AnswerCount = 0 THEN 'Stale Question'
+        WHEN pa.days_since_creation <= 7 AND pa.ViewCount > 100 THEN 'Fresh Hot'
+        WHEN pa.days_since_creation <= 30 AND pa.AnswerCount > 0 THEN 'Recently Active'
+        ELSE 'Other'
+    END as post_status
+FROM PostAnalysis pa
+LEFT JOIN TagAnalysis ta ON ta.Count = (SELECT MAX(Count) FROM Tags WHERE TagName IN (SELECT trim(unnest(string_to_array(pa.Tags, '<>')))))
+LEFT JOIN ComplexUserStats cus ON pa.OwnerUserId = cus.Id
+WHERE pa.Score IS NOT NULL 
+AND (pa.Tags IS NOT NULL AND pa.Tags != '')
+AND pa.CreationDate BETWEEN '2022-01-01' AND CURRENT_TIMESTAMP
+ORDER BY pa.Score DESC, pa.ViewCount DESC, pa.CreationDate DESC
+LIMIT 10000
+EXCEPT
+SELECT 
+    pa.Id as PostId,
+    pa.PostTypeId,
+    pa.OwnerUserId,
+    pa.Score,
+    pa.ViewCount,
+    pa.CreationDate,
+    pa.Title,
+    pa.Tags,
+    pa.AnswerCount,
+    pa.CommentCount,
+    pa.FavoriteCount,
+    pa.rn,
+    pa.prev_score,
+    pa.cumulative_score,
+    pa.user_post_count,
+    pa.post_category,
+    pa.score_ranking,
+    pa.view_category,
+    pa.days_since_creation,
+    pa.days_between_posts,
+    COALESCE(ta.TagName, 'No Tags') as most_popular_tag,
+    COALESCE(ta.Count, 0) as tag_count,
+    COALESCE(ta.count_percentile, 0) as tag_percentile,
+    COALESCE(cus.DisplayName, 'Unknown User') as UserName,
+    COALESCE(cus.Reputation, 0) as UserReputation,
+    COALESCE(cus.total_posts, 0) as UserTotalPosts,
+    COALESCE(cus.questions, 0) as UserQuestions,
+    COALESCE(cus.answers, 0) as UserAnswers,
+    COALESCE(cus.total_badges, 0) as UserBadges,
+    COALESCE(cus.scorer_category, 'Unknown') as UserScorerCategory,
+    COALESCE(cus.poster_category, 'Unknown') as UserPosterCategory,
+    COALESCE(cus.user_age_days, 0) as UserAgeDays,
+    COALESCE(cus.user_status, 'Unknown') as UserStatus,
+    CASE 
+        WHEN pa.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1 AND creationdate >= '2022-01-01')
+        AND pa.ViewCount > (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = 1 AND creationdate >= '2022-01-01')
+        AND pa.AnswerCount > 0 THEN 'High Performing'
+        WHEN pa.Score < (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1 AND creationdate >= '2022-01-01')
+        AND pa.ViewCount < (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = 1 AND creationdate >= '2022-01-01') THEN 'Low Performing'
+        ELSE 'Average Performing'
+    END as performance_status,
+    CASE 
+        WHEN pa.days_since_creation > 30 AND pa.AnswerCount = 0 THEN 'Stale Question'
+        WHEN pa.days_since_creation <= 7 AND pa.ViewCount > 100 THEN 'Fresh Hot'
+        WHEN pa.days_since_creation <= 30 AND pa.AnswerCount > 0 THEN 'Recently Active'
+        ELSE 'Other'
+    END as post_status
+FROM PostAnalysis pa
+LEFT JOIN TagAnalysis ta ON ta.Count = (SELECT MAX(Count) FROM Tags WHERE TagName IN (SELECT trim(unnest(string_to_array(pa.Tags, '<>')))))
+LEFT JOIN ComplexUserStats cus ON pa.OwnerUserId = cus.Id
+WHERE pa.Score IS NOT NULL 
+AND (pa.Tags IS NOT NULL AND pa.Tags != '')
+AND pa.CreationDate BETWEEN '2022-01-01' AND CURRENT_TIMESTAMP
+AND pa.post_category = 'Question with Answers'
+ORDER BY pa.Score DESC, pa.ViewCount DESC, pa.CreationDate DESC
+LIMIT 5000

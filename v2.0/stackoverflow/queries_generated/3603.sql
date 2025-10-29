@@ -1,0 +1,94 @@
+-- {"query": "3603.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1745} 
+
+WITH UserStats AS (
+    SELECT u.Id,
+           u.DisplayName,
+           u.Reputation,
+           /* badge counts per class */
+           (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+           (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadges,
+           (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadges,
+           /* post counts */
+           (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS QuestionCount,
+           (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS AnswerCount
+    FROM Users u
+    WHERE u.Reputation > 1000
+),
+TagUsage AS (
+    SELECT p.OwnerUserId AS UserId,
+           UNNEST(string_to_array(TRIM(BOTH '<>' FROM p.Tags), '><')) AS Tag,
+           COUNT(*) AS TagCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.Tags IS NOT NULL
+    GROUP BY p.OwnerUserId, Tag
+),
+RecentPosts AS (
+    SELECT p.Id,
+           p.OwnerUserId,
+           p.Title,
+           p.CreationDate,
+           ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+VoteAgg AS (
+    SELECT v.PostId,
+           SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS UpVotes,
+           SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS DownVotes,
+           COUNT(*) FILTER (WHERE vt.Id = 5) AS Favorites
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY v.PostId
+)
+SELECT us.Id                                 AS UserId,
+       us.DisplayName,
+       us.Reputation,
+       us.GoldBadges,
+       us.SilverBadges,
+       us.BronzeBadges,
+       us.QuestionCount,
+       us.AnswerCount,
+       COALESCE(rp.Title, 'No recent post')  AS RecentPostTitle,
+       COALESCE(rp.CreationDate,
+                TIMESTAMP '1970-01-01')      AS RecentPostDate,
+       COALESCE(va.UpVotes, 0)               AS RecentPostUpVotes,
+       COALESCE(va.DownVotes, 0)             AS RecentPostDownVotes,
+       COALESCE(va.Favorites, 0)             AS RecentPostFavorites,
+       tu.Tag,
+       tu.TagCount
+FROM UserStats us
+LEFT JOIN RecentPosts rp
+       ON rp.OwnerUserId = us.Id AND rp.rn = 1
+LEFT JOIN VoteAgg va
+       ON va.PostId = rp.Id
+LEFT JOIN (
+    SELECT UserId,
+           Tag,
+           TagCount,
+           ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY TagCount DESC) AS rn_tag
+    FROM TagUsage
+) tu
+       ON tu.UserId = us.Id AND tu.rn_tag = 1
+WHERE (us.Reputation IS NOT NULL AND us.Reputation > 0)
+  AND (us.GoldBadges + us.SilverBadges + us.BronzeBadges) > 5
+
+UNION ALL
+
+SELECT NULL,
+       'Aggregate Summary',
+       NULL,
+       SUM(GoldBadges),
+       SUM(SilverBadges),
+       SUM(BronzeBadges),
+       SUM(QuestionCount),
+       SUM(AnswerCount),
+       NULL,
+       NULL,
+       NULL,
+       NULL,
+       NULL,
+       NULL
+FROM UserStats
+ORDER BY Reputation DESC NULLS LAST
+LIMIT 100;

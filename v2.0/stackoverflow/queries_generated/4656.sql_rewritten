@@ -1,0 +1,139 @@
+-- {"query": "4656.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1407} 
+WITH RECURSIVE PostHierarchy AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.Title,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        1 AS Level
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.ParentId IS NULL
+
+    UNION ALL
+
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.Title,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        ph.Level + 1 AS Level
+    FROM Posts p
+    JOIN PostHierarchy ph ON p.ParentId = ph.Id
+    WHERE p.PostTypeId = 2
+),
+UserPostCounts AS (
+    SELECT
+        OwnerUserId,
+        COUNT(CASE WHEN PostTypeId = 1 THEN Id END) AS QuestionCount,
+        COUNT(CASE WHEN PostTypeId = 2 THEN Id END) AS AnswerCount,
+        SUM(CASE WHEN Score > 0 THEN 1 ELSE 0 END) AS PositiveScorePosts,
+        MAX(CreationDate) AS LastPostDate
+    FROM Posts
+    WHERE OwnerUserId IS NOT NULL AND OwnerUserId <> -1
+    GROUP BY OwnerUserId
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COALESCE(upc.QuestionCount, 0) AS TotalQuestions,
+        COALESCE(upc.AnswerCount, 0) AS TotalAnswers,
+        COALESCE(upc.PositiveScorePosts, 0) AS PostsWithPositiveScore,
+        DATEDIFF(day, u.CreationDate, cast('2024-10-01 12:34:56' as timestamp)) AS DaysSinceCreation,
+        CASE
+            WHEN u.LastAccessDate < DATEADD(day, -365, cast('2024-10-01 12:34:56' as timestamp)) THEN 'Inactive'
+            WHEN u.LastAccessDate < DATEADD(day, -90, cast('2024-10-01 12:34:56' as timestamp)) THEN 'Moderately Active'
+            ELSE 'Active'
+        END AS ActivityStatus
+    FROM Users u
+    LEFT JOIN UserPostCounts upc ON u.Id = upc.OwnerUserId
+),
+QuestionDetails AS (
+    SELECT
+        ph.Id AS QuestionId,
+        ph.Title,
+        ph.CreationDate AS QuestionCreationDate,
+        ph.Score AS QuestionScore,
+        ph.AnswerCount AS QuestionAnswerCount,
+        ph.FavoriteCount AS QuestionFavoriteCount,
+        ua.DisplayName AS QuestionOwnerDisplayName,
+        ua.Reputation AS QuestionOwnerReputation,
+        DATEDIFF(hour, ph.CreationDate, ph.ClosedDate) AS HoursToClose,
+        ROW_NUMBER() OVER (PARTITION BY ph.Id ORDER BY ph.Level) AS RowNum
+    FROM PostHierarchy ph
+    JOIN UserActivity ua ON ph.OwnerUserId = ua.UserId
+    WHERE ph.PostTypeId = 1 AND ph.Level = 1
+),
+AnswerDetails AS (
+    SELECT
+        ph.Id AS AnswerId,
+        ph.ParentId AS QuestionId,
+        ph.Score AS AnswerScore,
+        ph.CreationDate AS AnswerCreationDate,
+        ua.DisplayName AS AnswerOwnerDisplayName,
+        ua.Reputation AS AnswerOwnerReputation,
+        CASE WHEN ph.Score > qd.QuestionScore THEN 'HigherScoreThanQuestion' ELSE 'LowerScoreThanQuestion' END AS ScoreComparison,
+        DENSE_RANK() OVER (PARTITION BY ph.ParentId ORDER BY ph.Score DESC, ph.CreationDate ASC) AS RankByScore
+    FROM PostHierarchy ph
+    JOIN UserActivity ua ON ph.OwnerUserId = ua.UserId
+    JOIN QuestionDetails qd ON ph.ParentId = qd.QuestionId
+    WHERE ph.PostTypeId = 2
+)
+SELECT
+    qd.QuestionId,
+    qd.Title,
+    qd.QuestionCreationDate,
+    qd.QuestionScore,
+    qd.QuestionAnswerCount,
+    qd.QuestionFavoriteCount,
+    qd.QuestionOwnerDisplayName,
+    qd.QuestionOwnerReputation,
+    qd.HoursToClose,
+    ad.AnswerId,
+    ad.AnswerScore,
+    ad.AnswerCreationDate,
+    ad.AnswerOwnerDisplayName,
+    ad.AnswerOwnerReputation,
+    ad.ScoreComparison,
+    CASE
+        WHEN ad.RankByScore = 1 THEN 'BestAnswer'
+        WHEN ad.RankByScore <= 5 THEN 'Top5Answer'
+        ELSE 'OtherAnswer'
+    END AS AnswerRank,
+    CASE
+        WHEN qd.QuestionOwnerReputation > 10000 AND ad.AnswerOwnerReputation > 5000 THEN 'HighReputationInteraction'
+        WHEN qd.QuestionOwnerReputation < 1000 AND ad.AnswerOwnerReputation < 500 THEN 'LowReputationInteraction'
+        ELSE 'StandardInteraction'
+    END AS ReputationInteractionLevel,
+    CAST(SUBSTRING(qd.Title, 1, 10) AS VARCHAR(10)) AS FirstTenCharsOfTitle,
+    cast('2024-10-01 12:34:56' as timestamp) AS QueryExecutionTimestamp
+FROM QuestionDetails qd
+FULL OUTER JOIN AnswerDetails ad ON qd.QuestionId = ad.QuestionId
+WHERE qd.QuestionAnswerCount > 0
+  AND qd.QuestionScore > ad.AnswerScore -- Only include questions where the best answer has a lower score than the question
+  AND (qd.ClosedDate IS NULL OR qd.ClosedDate > DATEADD(day, -30, cast('2024-10-01 12:34:56' as timestamp)))
+  AND qd.QuestionOwnerReputation > 100
+  AND ad.AnswerOwnerReputation IS NOT NULL
+  AND EXISTS (
+        SELECT 1
+        FROM PostLinks pl
+        WHERE pl.PostId = qd.QuestionId AND pl.LinkTypeId = 3
+    )
+ORDER BY qd.QuestionScore DESC, qd.QuestionAnswerCount DESC
+LIMIT 1000;

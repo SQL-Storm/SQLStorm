@@ -1,0 +1,312 @@
+-- {"query": "7599.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2578} 
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        RANK() OVER (ORDER BY u.Reputation DESC) as ReputationRank,
+        DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) as PostActivityRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        PostCount,
+        QuestionCount,
+        AnswerCount,
+        CommentCount,
+        BadgeCount,
+        LastPostDate,
+        ReputationRank,
+        PostActivityRank,
+        CASE 
+            WHEN Reputation > 100000 THEN 'Super User'
+            WHEN Reputation > 50000 THEN 'Expert'
+            WHEN Reputation > 10000 THEN 'Advanced'
+            ELSE 'Regular'
+        END as UserTier,
+        ROW_NUMBER() OVER (PARTITION BY 
+            CASE 
+                WHEN Reputation > 100000 THEN 'Super User'
+                WHEN Reputation > 50000 THEN 'Expert'
+                WHEN Reputation > 10000 THEN 'Advanced'
+                ELSE 'Regular'
+            END 
+            ORDER BY PostCount DESC
+        ) as TierRank
+    FROM UserStats
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.Tags,
+        p.ParentId,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NULL AND p.AnswerCount > 0 THEN 'Unanswered'
+            ELSE 'Not Question'
+        END as QuestionStatus,
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PreviousScore,
+        LEAD(p.CreationDate, 1, CURRENT_TIMESTAMP) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as NextPostDate,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as AvgUserScore,
+        NTILE(4) OVER (ORDER BY p.CreationDate) as PostTimeQuartile,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags != '' THEN 
+                (LENGTH(p.Tags) - LENGTH(REPLACE(p.Tags, '>', '')) + 1)
+            ELSE 0 
+        END as TagCount,
+        ABS(p.Score - LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate)) as ScoreChange
+    FROM Posts p
+    WHERE p.CreationDate > DATEADD(YEAR, -5, CURRENT_TIMESTAMP)
+),
+CombinedData AS (
+    SELECT 
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.PostCount,
+        tu.QuestionCount,
+        tu.AnswerCount,
+        tu.CommentCount,
+        tu.BadgeCount,
+        tu.LastPostDate,
+        tu.ReputationRank,
+        tu.PostActivityRank,
+        tu.UserTier,
+        tu.TierRank,
+        pa.PostId,
+        pa.Title,
+        pa.Score,
+        pa.ViewCount,
+        pa.CreationDate as PostCreationDate,
+        pa.PostTypeId,
+        pa.AnswerCount as PostAnswerCount,
+        pa.CommentCount as PostCommentCount,
+        pa.FavoriteCount,
+        pa.Tags,
+        pa.QuestionStatus,
+        pa.PreviousScore,
+        pa.NextPostDate,
+        pa.AvgUserScore,
+        pa.PostTimeQuartile,
+        pa.TagCount,
+        pa.ScoreChange,
+        CASE 
+            WHEN pa.Score >= 100 THEN 'Popular'
+            WHEN pa.Score >= 20 THEN 'Moderate'
+            WHEN pa.Score >= 0 THEN 'Low'
+            ELSE 'Negative'
+        END as PostPopularity,
+        DATEDIFF(DAY, pa.CreationDate, CURRENT_TIMESTAMP) as DaysSincePost,
+        CASE 
+            WHEN pa.PostTypeId = 1 AND pa.QuestionStatus = 'Answered' THEN 
+                (SELECT COUNT(*) FROM Posts WHERE ParentId = pa.PostId)
+            ELSE 0
+        END as TotalAnswers,
+        CASE 
+            WHEN EXISTS (
+                SELECT 1 FROM PostHistory ph 
+                WHERE ph.PostId = pa.PostId 
+                AND ph.PostHistoryTypeId IN (10, 11) 
+                AND ph.CreationDate BETWEEN pa.CreationDate AND DATEADD(MONTH, 1, pa.CreationDate)
+            ) THEN 'Has Close/Reopen Events'
+            ELSE 'No Close/Reopen'
+        END as CloseReopenStatus,
+        COALESCE(
+            (SELECT TOP 1 Comment 
+             FROM PostHistory ph 
+             WHERE ph.PostId = pa.PostId 
+             AND ph.PostHistoryTypeId = 10 
+             ORDER BY ph.CreationDate DESC), 
+            'No Close Reason'
+        ) as LastCloseReason
+    FROM TopUsers tu
+    INNER JOIN PostAnalysis pa ON tu.UserId = pa.OwnerUserId
+    WHERE tu.ReputationRank <= 1000
+),
+FinalAggregation AS (
+    SELECT 
+        cd.UserId,
+        cd.DisplayName,
+        cd.Reputation,
+        cd.PostCount,
+        cd.QuestionCount,
+        cd.AnswerCount,
+        cd.CommentCount,
+        cd.BadgeCount,
+        cd.LastPostDate,
+        cd.ReputationRank,
+        cd.PostActivityRank,
+        cd.UserTier,
+        cd.TierRank,
+        cd.PostId,
+        cd.Title,
+        cd.Score,
+        cd.ViewCount,
+        cd.PostCreationDate,
+        cd.PostTypeId,
+        cd.PostAnswerCount,
+        cd.PostCommentCount,
+        cd.FavoriteCount,
+        cd.Tags,
+        cd.QuestionStatus,
+        cd.PreviousScore,
+        cd.NextPostDate,
+        cd.AvgUserScore,
+        cd.PostTimeQuartile,
+        cd.TagCount,
+        cd.ScoreChange,
+        cd.PostPopularity,
+        cd.DaysSincePost,
+        cd.TotalAnswers,
+        cd.CloseReopenStatus,
+        cd.LastCloseReason,
+        -- Complex calculations and transformations
+        CAST(
+            CASE 
+                WHEN cd.Score > 0 AND cd.ViewCount > 0 THEN 
+                    ROUND((cd.Score * 100.0 / cd.ViewCount), 2)
+                ELSE 0 
+            END as DECIMAL(10,2)
+        ) as ScorePerViewRatio,
+        CAST(
+            CASE 
+                WHEN cd.PostAnswerCount IS NOT NULL AND cd.PostAnswerCount > 0 THEN 
+                    ROUND((cd.QuestionsCount * 100.0 / cd.PostAnswerCount), 2)
+                ELSE 0 
+            END as DECIMAL(10,2)
+        ) as ReplyToQuestionRatio,
+        -- Advanced string operations
+        UPPER(
+            CASE 
+                WHEN cd.Title IS NOT NULL THEN 
+                    LEFT(cd.Title, CASE WHEN LENGTH(cd.Title) > 50 THEN 50 ELSE LENGTH(cd.Title) END)
+                ELSE 'No Title'
+            END
+        ) as ShortenedTitle,
+        -- Set operators and complex predicates
+        CASE 
+            WHEN cd.DaysSincePost <= 30 AND cd.Score > 50 THEN 'Hot Recent'
+            WHEN cd.DaysSincePost > 30 AND cd.Score > 100 THEN 'Popular Older'
+            ELSE 'Ordinary'
+        END as PostClassification,
+        -- Null-aware logic and window functions
+        COALESCE(
+            (SELECT AVG(pa.Score) 
+             FROM PostAnalysis pa 
+             WHERE pa.OwnerUserId = cd.UserId 
+             AND pa.CreationDate BETWEEN cd.PostCreationDate AND DATEADD(DAY, 7, cd.PostCreationDate)),
+            0
+        ) as WeeklyAvgScore,
+        -- Correlated subquery with multiple conditions
+        (SELECT COUNT(*) 
+         FROM Votes v 
+         WHERE v.PostId = cd.PostId 
+         AND v.VoteTypeId IN (2, 3, 5) 
+         AND v.CreationDate >= DATEADD(MONTH, -3, cd.PostCreationDate)) as RecentVotesCount
+    FROM CombinedData cd
+),
+AggregatedResults AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        AVG(Score) as AvgPostScore,
+        MAX(PostCount) as MaxPostCount,
+        SUM(QuestionCount) as TotalQuestions,
+        SUM(AnswerCount) as TotalAnswers,
+        SUM(CommentCount) as TotalComments,
+        AVG(PostCreationDate) as AvgPostCreationDate,
+        COUNT(*) as TotalPosts,
+        COUNT(DISTINCT TagCount) as UniqueTagCounts,
+        STDEV(Score) as ScoreStandardDeviation,
+        -- Complex aggregation with multiple conditions
+        CASE 
+            WHEN AVG(PostPopularity = 'Popular') * 100.0 / COUNT(*) > 50 THEN 'Highly Popular'
+            WHEN AVG(PostPopularity = 'Moderate') * 100.0 / COUNT(*) > 30 THEN 'Moderately Popular'
+            ELSE 'Regular'
+        END as OverallPopularityTier,
+        -- Window function with complex ordering
+        ROW_NUMBER() OVER (ORDER BY AVG(Score) DESC, Reputation DESC) as PostPerformanceRank,
+        -- String concatenation with null handling
+        STRING_AGG(
+            CASE 
+                WHEN Tags IS NOT NULL THEN 
+                    LEFT(Tags, 20)
+                ELSE 'No Tags'
+            END, 
+            ', '
+        ) as SampleTags
+    FROM FinalAggregation
+    GROUP BY UserId, DisplayName, Reputation
+),
+RankedResults AS (
+    SELECT 
+        ar.*,
+        RANK() OVER (ORDER BY ar.AvgPostScore DESC) as ScoreRank,
+        DENSE_RANK() OVER (ORDER BY ar.Reputation DESC) as RepRank,
+        -- Complex mathematical operations
+        POWER(ar.AvgPostScore, 2) as ScoreSquared,
+        LOG10(CAST(ar.Reputation AS FLOAT) + 1) as LogReputation,
+        -- Conditional aggregation
+        SUM(ar.TotalQuestions) OVER (ORDER BY ar.Reputation DESC) as CumulativeQuestions
+    FROM AggregatedResults ar
+)
+SELECT 
+    rr.UserId,
+    rr.DisplayName,
+    rr.Reputation,
+    rr.AvgPostScore,
+    rr.MaxPostCount,
+    rr.TotalQuestions,
+    rr.TotalAnswers,
+    rr.TotalComments,
+    rr.AvgPostCreationDate,
+    rr.TotalPosts,
+    rr.UniqueTagCounts,
+    rr.ScoreStandardDeviation,
+    rr.OverallPopularityTier,
+    rr.PostPerformanceRank,
+    rr.SampleTags,
+    rr.ScoreRank,
+    rr.RepRank,
+    rr.ScoreSquared,
+    rr.LogReputation,
+    rr.CumulativeQuestions,
+    -- Final complex expression
+    CASE 
+        WHEN rr.ScoreRank <= 50 AND rr.RepRank <= 100 THEN 'Elite Contributor'
+        WHEN rr.ScoreRank <= 200 AND rr.RepRank <= 500 THEN 'Veteran Contributor'
+        WHEN rr.ScoreRank <= 500 THEN 'Active Contributor'
+        ELSE 'Regular Contributor'
+    END as ContributorStatus
+FROM RankedResults rr
+WHERE rr.Reputation > 0
+AND rr.AvgPostScore IS NOT NULL
+ORDER BY rr.ScoreRank ASC, rr.RepRank ASC
+LIMIT 1000;

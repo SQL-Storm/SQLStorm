@@ -1,0 +1,189 @@
+-- {"query": "1325.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2476} 
+
+WITH UserActivitySummary AS (
+    -- Summarizes various user activities and badge counts
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Views,
+        u.UpVotes AS TotalUpVotesGiven,
+        u.DownVotes AS TotalDownVotesGiven,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(COALESCE(p.FavoriteCount, 0)) AS TotalQuestionFavorites,
+        SUM(p.Score) AS TotalPostScoreReceived,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COALESCE(SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END), 0) AS TotalPostEdits,
+        DATE_PART('day', u.LastAccessDate - u.CreationDate) AS DaysActive,
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (10, 35) THEN ph.CreationDate ELSE NULL END) AS LastClosureActivity,
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (11, 36) THEN ph.CreationDate ELSE NULL END) AS LastReopenMigrationActivity
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes
+),
+PostContentAnalysis AS (
+    -- Analyzes post content, history, and associated links
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        LENGTH(p.Body) AS BodyLength,
+        LENGTH(p.Title) AS TitleLength,
+        ARRAY_LENGTH(STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><'), 1) AS TagCount,
+        COUNT(DISTINCT c.Id) AS CommentCountOnPost,
+        MAX(c.Score) AS MaxCommentScoreOnPost,
+        COUNT(DISTINCT ph.Id) AS HistoryEntryCount,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate ELSE NULL END) AS PostClosedDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.CreationDate ELSE NULL END) AS PostReopenedDate,
+        -- Correlated subquery to count duplicate links for the post
+        (SELECT COUNT(DISTINCT pl_dup.RelatedPostId)
+         FROM PostLinks pl_dup
+         WHERE pl_dup.PostId = p.Id AND pl_dup.LinkTypeId = 3) AS DuplicateLinkCount,
+        COALESCE(p.AcceptedAnswerId, -1) AS AcceptedAnswerId
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    GROUP BY
+        p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Body, p.Title, p.Tags, p.AcceptedAnswerId
+),
+UserPostAggregates AS (
+    -- Aggregates post-related metrics per user
+    SELECT
+        usa.UserId,
+        usa.DisplayName,
+        usa.Reputation,
+        usa.TotalPosts,
+        usa.TotalQuestions,
+        usa.TotalAnswers,
+        usa.TotalPostScoreReceived,
+        usa.TotalCommentsMade,
+        usa.GoldBadges,
+        usa.SilverBadges,
+        usa.BronzeBadges,
+        usa.TotalPostEdits,
+        usa.DaysActive,
+        usa.LastClosureActivity,
+        usa.LastReopenMigrationActivity,
+        AVG(pca.Score) AS AveragePostScore,
+        AVG(pca.ViewCount) AS AveragePostViewCount,
+        SUM(COALESCE(pca.TagCount, 0)) AS TotalTagsUsed,
+        SUM(CASE WHEN pca.PostTypeId = 1 THEN COALESCE(pca.DuplicateLinkCount, 0) ELSE 0 END) AS TotalDuplicatesLinked,
+        COUNT(DISTINCT pca.PostId) FILTER (WHERE pca.PostClosedDate IS NOT NULL) AS ClosedPostsCount,
+        COUNT(DISTINCT pca.PostId) FILTER (WHERE pca.PostReopenedDate IS NOT NULL) AS ReopenedPostsCount
+    FROM UserActivitySummary usa
+    LEFT JOIN PostContentAnalysis pca ON usa.UserId = pca.OwnerUserId
+    GROUP BY
+        usa.UserId, usa.DisplayName, usa.Reputation, usa.TotalPosts, usa.TotalQuestions, usa.TotalAnswers,
+        usa.TotalPostScoreReceived, usa.TotalCommentsMade, usa.GoldBadges, usa.SilverBadges, usa.BronzeBadges,
+        usa.TotalPostEdits, usa.DaysActive, usa.LastClosureActivity, usa.LastReopenMigrationActivity
+),
+ReputationChangeRate AS (
+    -- Calculates reputation change rate and applies ranking/ntile window functions
+    SELECT
+        upa.UserId,
+        upa.DisplayName,
+        upa.Reputation,
+        upa.TotalPosts,
+        upa.TotalQuestions,
+        upa.TotalAnswers,
+        upa.TotalPostScoreReceived,
+        upa.TotalCommentsMade,
+        upa.GoldBadges,
+        upa.SilverBadges,
+        upa.BronzeBadges,
+        upa.TotalPostEdits,
+        upa.DaysActive,
+        upa.LastClosureActivity,
+        upa.LastReopenMigrationActivity,
+        upa.AveragePostScore,
+        upa.AveragePostViewCount,
+        upa.TotalTagsUsed,
+        upa.TotalDuplicatesLinked,
+        upa.ClosedPostsCount,
+        upa.ReopenedPostsCount,
+        CASE
+            WHEN upa.DaysActive > 0 THEN CAST(upa.Reputation AS numeric) / upa.DaysActive
+            ELSE 0.0
+        END AS ReputationPerDay,
+        RANK() OVER (ORDER BY upa.Reputation DESC, upa.TotalPosts DESC) AS ReputationRank,
+        NTILE(10) OVER (ORDER BY upa.TotalPostScoreReceived DESC) AS PostScoreDecile
+    FROM UserPostAggregates upa
+    WHERE upa.TotalPosts > 0 AND upa.TotalCommentsMade > 0
+)
+SELECT
+    rcr.UserId,
+    rcr.DisplayName,
+    rcr.Reputation,
+    rcr.TotalPosts,
+    rcr.TotalQuestions,
+    rcr.TotalAnswers,
+    rcr.TotalPostScoreReceived,
+    rcr.TotalCommentsMade,
+    rcr.GoldBadges,
+    rcr.SilverBadges,
+    rcr.BronzeBadges,
+    rcr.TotalPostEdits,
+    rcr.DaysActive,
+    rcr.ReputationPerDay,
+    rcr.ReputationRank,
+    rcr.PostScoreDecile,
+    rcr.AveragePostScore,
+    rcr.AveragePostViewCount,
+    rcr.TotalTagsUsed,
+    rcr.TotalDuplicatesLinked,
+    rcr.ClosedPostsCount,
+    rcr.ReopenedPostsCount,
+    -- Correlated subquery: retrieves the title of the user's most viewed question
+    (SELECT p_sq.Title
+     FROM Posts p_sq
+     WHERE p_sq.OwnerUserId = rcr.UserId
+       AND p_sq.PostTypeId = 1
+       AND p_sq.ViewCount IS NOT NULL
+     ORDER BY p_sq.ViewCount DESC, p_sq.CreationDate DESC
+     LIMIT 1) AS MostViewedQuestionTitle,
+    -- String expression and NULL logic: extracts and formats a location prefix
+    COALESCE(UPPER(SUBSTRING(u.Location, 1, 5)), 'UNKNOWN_LOCATION') AS UserLocationPrefix,
+    -- Window function: calculates the average reputation of users within the same post score decile
+    AVG(rcr.Reputation) OVER (PARTITION BY rcr.PostScoreDecile) AS AvgReputationInDecile,
+    -- Complex calculation: difference in days between last closure and last reopen/migration activity
+    CASE
+        WHEN rcr.LastClosureActivity IS NOT NULL AND rcr.LastReopenMigrationActivity IS NOT NULL
+             AND rcr.LastReopenMigrationActivity >= rcr.LastClosureActivity
+        THEN DATE_PART('day', rcr.LastReopenMigrationActivity - rcr.LastClosureActivity)
+        ELSE NULL
+    END AS DaysBetweenClosureAndReopen,
+    -- Correlated subquery with EXISTS: checks if the user has accepted one of their own answers to their questions
+    EXISTS (
+        SELECT 1
+        FROM Posts q
+        JOIN Posts a ON q.AcceptedAnswerId = a.Id
+        WHERE q.OwnerUserId = rcr.UserId
+          AND a.OwnerUserId = rcr.UserId
+          AND q.PostTypeId = 1
+        LIMIT 1
+    ) AS HasSelfAcceptedAnswer
+FROM ReputationChangeRate rcr
+LEFT JOIN Users u ON rcr.UserId = u.Id
+WHERE rcr.ReputationPerDay > 0.1 -- Filters for users with a decent reputation growth rate
+  AND rcr.GoldBadges >= 1 -- Requires at least one gold badge
+  AND rcr.TotalPosts > 100 -- Filters for users with a significant number of posts
+  AND rcr.TotalQuestions >= 5
+  AND rcr.TotalAnswers >= 20
+  AND (rcr.ClosedPostsCount = 0 OR rcr.ReopenedPostsCount > 0) -- Prefers users whose posts are not closed, or if closed, have also been reopened
+  AND rcr.TotalPostEdits > rcr.TotalPosts / 10.0 -- Users who actively edit their posts
+ORDER BY rcr.ReputationRank ASC, rcr.ReputationPerDay DESC, rcr.TotalPostScoreReceived DESC
+LIMIT 250;

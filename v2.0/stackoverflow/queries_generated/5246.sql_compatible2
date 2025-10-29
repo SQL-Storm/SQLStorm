@@ -1,0 +1,107 @@
+WITH top_users AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.LastAccessDate DESC) AS rn
+  FROM Users u
+),
+recent_posts AS (
+  SELECT
+    p.Id AS PostId,
+    p.OwnerUserId,
+    p.PostTypeId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.LastActivityDate,
+    p.AcceptedAnswerId,
+    p.ParentId,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.Body
+  FROM Posts p
+  WHERE p.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '180' DAY)
+),
+activity_summary AS (
+  SELECT
+    rp.OwnerUserId,
+    COUNT(*) AS posts_last_180d,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS questions_last_180d,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS answers_last_180d,
+    SUM(p.Score) AS score_last_180d,
+    MAX(p.LastActivityDate) AS last_activity
+  FROM recent_posts rp
+  LEFT JOIN Posts p ON rp.PostId = p.Id
+  GROUP BY rp.OwnerUserId
+),
+qualified_users AS (
+  SELECT
+    tu.UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    ascore.posts_last_180d,
+    ascore.questions_last_180d,
+    ascore.answers_last_180d,
+    ascore.score_last_180d,
+    ascore.last_activity,
+    tu.Views,
+    tu.UpVotes,
+    tu.DownVotes,
+    NULL::text AS Title
+  FROM top_users tu
+  LEFT JOIN activity_summary ascore ON tu.UserId = ascore.OwnerUserId
+  WHERE tu.rn <= 100
+),
+complex_calc AS (
+  SELECT
+    qu.UserId,
+    qu.DisplayName,
+    qu.Reputation,
+    qu.posts_last_180d,
+    qu.questions_last_180d,
+    qu.answers_last_180d,
+    qu.score_last_180d,
+    qu.last_activity,
+    (COALESCE(qu.score_last_180d, 0) * 1.0) / NULLIF(COALESCE(qu.posts_last_180d, 0), 0) AS avg_score_per_post,
+    (COALESCE(qu.Views, 0) + COALESCE(qu.UpVotes, 0) - COALESCE(qu.DownVotes, 0)) AS net_reputation_metric,
+    CAST((CAST('2024-10-01' AS date) - CAST(qu.last_activity AS date)) AS INTEGER) AS days_since_last_activity,
+    (SELECT COUNT(*) FROM UNNEST(string_to_array(COALESCE(qu.Title, ''), ' ')) AS tword) AS title_word_count
+  FROM qualified_users qu
+  GROUP BY
+    qu.UserId,
+    qu.DisplayName,
+    qu.Reputation,
+    qu.posts_last_180d,
+    qu.questions_last_180d,
+    qu.answers_last_180d,
+    qu.score_last_180d,
+    qu.last_activity,
+    qu.Views,
+    qu.UpVotes,
+    qu.DownVotes,
+    qu.Title
+)
+SELECT
+  c.UserId,
+  c.DisplayName,
+  c.Reputation,
+  c.posts_last_180d,
+  c.questions_last_180d,
+  c.answers_last_180d,
+  c.score_last_180d,
+  c.last_activity,
+  c.avg_score_per_post,
+  c.net_reputation_metric,
+  c.days_since_last_activity,
+  c.title_word_count
+FROM complex_calc c
+ORDER BY c.Reputation DESC NULLS LAST, c.last_activity DESC
+LIMIT 200;

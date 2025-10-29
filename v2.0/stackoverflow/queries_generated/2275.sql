@@ -1,0 +1,138 @@
+-- {"query": "2275.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1332} 
+
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        ARRAY[t.TagName] AS AncestorPath
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0 AND t.IsRequired = 0
+    UNION ALL
+    SELECT 
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        r.AncestorPath || t2.TagName
+    FROM Tags t2
+    JOIN PostLinks pl ON pl.PostId = t2.ExcerptPostId
+    JOIN RecursiveTagHierarchy r ON pl.RelatedPostId = r.Id
+    WHERE t2.IsModeratorOnly = 0 AND t2.IsRequired = 0 AND NOT t2.TagName = ANY(r.AncestorPath)
+),
+UserBadgeStats AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COUNT(DISTINCT CASE WHEN b.TagBased=1 THEN b.Name ELSE NULL END) AS DistinctTagBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+PostAnswerStats AS (
+    SELECT
+        p.ParentId AS QuestionId,
+        COUNT(*) AS TotalAnswers,
+        AVG(p.Score) AS AverageAnswerScore,
+        MAX(p.Score) AS MaxAnswerScore,
+        SUM(CASE WHEN EXISTS (
+            SELECT 1 FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2
+        ) THEN 1 ELSE 0 END) AS AnswersWithUpvotes
+    FROM Posts p
+    WHERE p.PostTypeId = 2 -- answers only
+    GROUP BY p.ParentId
+),
+UserActivityWindow AS (
+    SELECT 
+        p.OwnerUserId,
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS RecentPostRank,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) AS TotalPostsByUser,
+        SUM(COALESCE(p.Score,0)) OVER (PARTITION BY p.OwnerUserId) AS TotalScoreByUser
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL AND p.OwnerUserId <> -1
+),
+PostTitleSentiment AS (
+    SELECT
+        p.Id,
+        p.Title,
+        LENGTH(p.Title) AS TitleLength,
+        LENGTH(REGEXP_REPLACE(p.Title, '[aeiouAEIOU]', '', 'g')) AS TitleConsonants,
+        LENGTH(REGEXP_REPLACE(p.Title, '[^aeiouAEIOU]', '', 'g')) AS TitleVowels,
+        CASE 
+            WHEN POSITION('error' IN LOWER(p.Title)) > 0 THEN 1 
+            ELSE 0 
+        END AS ContainsError
+    FROM Posts p
+    WHERE p.PostTypeId = 1 -- questions only
+),
+LastCommentPerPost AS (
+    SELECT DISTINCT ON (c.PostId)
+        c.PostId,
+        c.Id AS CommentId,
+        c.CreationDate AS CommentDate,
+        COALESCE(c.UserId, -1) AS CommentUserId,
+        c.Text
+    FROM Comments c
+    ORDER BY c.PostId, c.CreationDate DESC
+)
+SELECT
+    q.Id AS QuestionId,
+    q.Title,
+    q.CreationDate AS QuestionCreated,
+    ua.Reputation AS OwnerReputation,
+    ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges, ub.DistinctTagBadges,
+    pas.TotalAnswers,
+    COALESCE(pas.AverageAnswerScore, 0) AS AvgAnswerScore,
+    pas.MaxAnswerScore,
+    pas.AnswersWithUpvotes,
+    ps.TitleLength,
+    ps.TitleConsonants,
+    ps.TitleVowels,
+    ps.ContainsError,
+    lc.CommentDate AS LastCommentDate,
+    lc.CommentUserId AS LastCommentUserId,
+    lc.Text AS LastCommentText,
+    string_agg(DISTINCT rt.TagName, ', ') FILTER (WHERE rt.TagName IS NOT NULL) AS RelatedTagChain,
+    CASE 
+        WHEN q.AcceptedAnswerId IS NOT NULL THEN 'Accepted'
+        WHEN q.ClosedDate IS NOT NULL THEN 'Closed'
+        ELSE 'Open'
+    END AS PostStatus,
+    ua.TotalPostsByUser,
+    ua.TotalScoreByUser,
+    ROW_NUMBER() OVER (PARTITION BY ua.OwnerUserId ORDER BY q.Score DESC) AS UserTopQuestionsRank,
+    EXISTS (
+        SELECT 1
+        FROM PostHistory ph
+        WHERE ph.PostId = q.Id
+          AND ph.PostHistoryTypeId IN (10,11) -- Closed/Reopened
+          AND ph.CreationDate > q.CreationDate
+    ) AS WasClosedAndReopened,
+    COALESCE(pl.LinkCount, 0) AS LinkedPostsCount
+FROM Posts q
+LEFT JOIN Users ua ON ua.Id = q.OwnerUserId
+LEFT JOIN UserBadgeStats ub ON ub.UserId = q.OwnerUserId
+LEFT JOIN PostAnswerStats pas ON pas.QuestionId = q.Id
+LEFT JOIN PostTitleSentiment ps ON ps.Id = q.Id
+LEFT JOIN LastCommentPerPost lc ON lc.PostId = q.Id
+LEFT JOIN RecursiveTagHierarchy rt ON rt.TagName = ANY(string_to_array(substring(q.Tags FROM 2 FOR length(q.Tags)-2), '><'))
+LEFT JOIN UserActivityWindow ua_w ON ua_w.PostId = q.Id
+LEFT JOIN LATERAL (
+    SELECT COUNT(*) AS LinkCount
+    FROM PostLinks pl
+    WHERE pl.PostId = q.Id OR pl.RelatedPostId = q.Id
+) pl ON true
+WHERE q.PostTypeId = 1
+  AND q.Score >= (
+      SELECT PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY Score) FROM Posts WHERE PostTypeId = 1
+  )
+  AND (
+      ps.ContainsError = 1
+      OR q.ClosedDate IS NOT NULL
+      OR (ub.GoldBadges > 0 AND pas.TotalAnswers > 5)
+  )
+ORDER BY q.Score DESC, q.CreationDate DESC
+LIMIT 100;

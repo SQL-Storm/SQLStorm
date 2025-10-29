@@ -1,0 +1,180 @@
+-- {"query": "1656.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2559} 
+WITH UserActivitySummary AS (
+    -- Summarize user activity and influence based on various metrics
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - u.LastAccessDate)) / 86400.0 AS DaysSinceLastAccess, -- Calculate days since last access
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswers,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        (SELECT COUNT(b.Id) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges, -- Correlated subquery for gold badges
+        (SELECT COUNT(DISTINCT ph.Id) FROM PostHistory ph WHERE ph.UserId = u.Id AND ph.PostHistoryTypeId IN (4,5,6)) AS TotalEditsMade -- Correlated subquery for total edits
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    WHERE u.Reputation >= 1000 -- Filter for more influential users
+      AND u.LastAccessDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year' -- Active in the last year
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.UpVotes, u.DownVotes
+),
+PostDetailedMetrics AS (
+    -- Calculate detailed metrics for posts, including tag arrays and extensive edit history
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.LastActivityDate,
+        p.ClosedDate,
+        p.AcceptedAnswerId,
+        CASE
+            WHEN p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2 THEN string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><')
+            ELSE NULL
+        END AS TagArray, -- Parse tags into an array
+        p.Title,
+        LENGTH(COALESCE(p.Body, '')) AS BodyLength, -- Handle NULL body with COALESCE
+        COALESCE(p.LastEditorUserId, p.OwnerUserId) AS EffectiveLastEditorId, -- NULL logic: Fallback editor
+        (SELECT COUNT(ph.Id) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4,5,6)) AS PostEditCount,
+        (SELECT MAX(ph.CreationDate) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4,5,6)) AS LatestEditDate,
+        CASE
+            WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN 'QuestionWithAnswers'
+            WHEN p.PostTypeId = 1 AND p.AnswerCount = 0 THEN 'QuestionNoAnswers'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'OtherPostType'
+        END AS PostCategory,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id) AS UpvoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id) AS DownvoteCount,
+        NTILE(4) OVER (ORDER BY p.Score DESC) AS ScoreQuartile -- Window function: Divide posts into quartiles by score
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (2,3) -- Only consider up/down votes for this window function
+    WHERE p.PostTypeId IN (1, 2) -- Focus on Questions and Answers
+      AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '2 year' -- Recent posts
+),
+PostTagAnalysis AS (
+    -- Flatten post tags for individual tag analysis
+    SELECT
+        pdm.PostId,
+        pdm.PostCreationDate,
+        pdm.OwnerUserId,
+        TRIM(tag_val) AS TagName,
+        pdm.Score,
+        pdm.ViewCount,
+        pdm.CommentCount,
+        pdm.PostCategory,
+        pdm.PostEditCount
+    FROM PostDetailedMetrics pdm
+    LEFT JOIN LATERAL UNNEST(pdm.TagArray) AS tag_val ON TRUE -- Lateral join for array unnesting
+    WHERE tag_val IS NOT NULL AND TRIM(tag_val) != ''
+)
+-- Main query: Combine insights from user activity and post metrics, incorporating advanced features
+SELECT
+    uas.DisplayName AS AuthorDisplayName,
+    uas.Reputation,
+    uas.TotalPosts,
+    pdm.PostId,
+    pdm.Title,
+    pdm.PostCreationDate,
+    pdm.Score,
+    pdm.ViewCount,
+    pdm.UpvoteCount,
+    pdm.DownvoteCount,
+    pdm.PostCategory,
+    pdm.PostEditCount,
+    pdm.BodyLength,
+    pdm.ScoreQuartile,
+    pdm.TagArray, -- The array of tags for the post
+    pta.TagName AS RepresentativeTag, -- A single tag from the array for grouping/ranking
+    qa.RelatedPostId AS DuplicatedPostId,
+    qa.DuplicateTitle,
+    -- Correlated Subquery: Check if the post's author has edited any other post by a different user
+    EXISTS (
+        SELECT 1
+        FROM PostHistory ph_corr
+        WHERE ph_corr.PostHistoryTypeId IN (4, 5, 6) -- Edit types
+          AND ph_corr.UserId = uas.UserId
+          AND ph_corr.PostId != pdm.PostId -- Different post
+          AND EXISTS (
+                SELECT 1
+                FROM Posts p_corr_inner
+                WHERE p_corr_inner.Id = ph_corr.PostId
+                  AND p_corr_inner.OwnerUserId IS NOT NULL
+                  AND p_corr_inner.OwnerUserId != uas.UserId
+          )
+    ) AS HasEditedOthersPosts,
+    -- NULL Logic with conditional expression: Determine if a question received an accepted answer within 7 days
+    CASE
+        WHEN pdm.PostTypeId = 1 AND pdm.AcceptedAnswerId IS NOT NULL THEN
+            CASE
+                WHEN (SELECT MIN(a.CreationDate) FROM Posts a WHERE a.Id = pdm.AcceptedAnswerId) IS NOT NULL
+                     AND (SELECT MIN(a.CreationDate) FROM Posts a WHERE a.Id = pdm.AcceptedAnswerId) <= (pdm.PostCreationDate + INTERVAL '7 day')
+                THEN 'AcceptedQuickly'
+                ELSE 'AcceptedLater'
+            END
+        WHEN pdm.PostTypeId = 1 AND pdm.AcceptedAnswerId IS NULL THEN 'NoAcceptedAnswer'
+        ELSE NULL -- Not a question
+    END AS AcceptedAnswerStatus,
+    LAG(pdm.Score, 1, 0) OVER (PARTITION BY uas.UserId ORDER BY pdm.PostCreationDate) AS PreviousPostScore, -- Window function: Score of the previous post by the same user
+    COALESCE(pdm.FavoriteCount, 0) AS ActualFavoriteCount, -- Handle potential NULL favorite counts with COALESCE
+    AVG(pdm.Score) OVER (PARTITION BY pta.TagName) AS AvgScoreForTag, -- Window function: Average score for the tag
+    RANK() OVER (PARTITION BY pta.TagName ORDER BY pdm.Score DESC, pdm.ViewCount DESC) AS RankInTagByScore -- Window function: Rank posts by score within each tag
+FROM UserActivitySummary uas
+INNER JOIN PostDetailedMetrics pdm ON uas.UserId = pdm.OwnerUserId
+LEFT JOIN LATERAL (
+    -- Lateral join to find the most recent duplicate link for a question
+    SELECT
+        pl.RelatedPostId,
+        dp.Title AS DuplicateTitle
+    FROM PostLinks pl
+    JOIN Posts dp ON pl.RelatedPostId = dp.Id
+    WHERE pl.PostId = pdm.PostId AND pl.LinkTypeId = 3 -- Duplicate links
+    ORDER BY pl.CreationDate DESC
+    LIMIT 1
+) qa ON pdm.PostTypeId = 1 -- Only questions can have duplicates
+LEFT JOIN PostTagAnalysis pta ON pdm.PostId = pta.PostId AND pta.TagName IS NOT NULL AND pta.PostCreationDate = pdm.PostCreationDate
+WHERE (pdm.Score > 0 OR pdm.ViewCount > 100) -- Filter for impactful posts
+  AND pdm.BodyLength > 50 -- Ensure substantive content
+-- Set operator: Combine the above results with posts that are highly edited but perhaps low score, creating a different perspective
+UNION ALL
+SELECT
+    uas.DisplayName AS AuthorDisplayName,
+    uas.Reputation,
+    uas.TotalPosts,
+    pdm.PostId,
+    pdm.Title,
+    pdm.PostCreationDate,
+    pdm.Score,
+    pdm.ViewCount,
+    pdm.UpvoteCount,
+    pdm.DownvoteCount,
+    pdm.PostCategory,
+    pdm.PostEditCount,
+    pdm.BodyLength,
+    pdm.ScoreQuartile,
+    pdm.TagArray,
+    pta.TagName AS RepresentativeTag,
+    NULL AS DuplicatedPostId, -- Not relevant for this branch of UNION
+    NULL AS DuplicateTitle,
+    FALSE AS HasEditedOthersPosts, -- Simplified for this branch
+    NULL AS AcceptedAnswerStatus, -- Not relevant for this branch
+    LAG(pdm.Score, 1, 0) OVER (PARTITION BY uas.UserId ORDER BY pdm.PostCreationDate) AS PreviousPostScore,
+    COALESCE(pdm.FavoriteCount, 0) AS ActualFavoriteCount,
+    AVG(pdm.Score) OVER (PARTITION BY pta.TagName) AS AvgScoreForTag,
+    RANK() OVER (PARTITION BY pta.TagName ORDER BY pdm.Score DESC, pdm.ViewCount DESC) AS RankInTagByScore
+FROM UserActivitySummary uas
+INNER JOIN PostDetailedMetrics pdm ON uas.UserId = pdm.OwnerUserId
+LEFT JOIN PostTagAnalysis pta ON pdm.PostId = pta.PostId AND pta.TagName IS NOT NULL AND pta.PostCreationDate = pdm.PostCreationDate
+WHERE pdm.PostEditCount >= 5 -- Posts with significant edits
+  AND pdm.Score <= 5 -- But relatively low score
+  AND pdm.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year' -- And still somewhat recent
+ORDER BY Reputation DESC, PostCreationDate DESC, RankInTagByScore ASC;

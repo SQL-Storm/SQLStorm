@@ -1,0 +1,99 @@
+WITH TopActiveUsers AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    COUNT(p.Id) AS PostCount,
+    SUM(p.Score) AS ScoreSum,
+    MIN(p.CreationDate) AS FirstPostDate,
+    STRING_AGG(DISTINCT t.Name, ',') AS PostTypes
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN PostTypes t ON p.PostTypeId = t.Id
+  GROUP BY
+    u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Location
+  HAVING COUNT(p.Id) > 0
+),
+RecentActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    MAX(v.CreationDate) AS LastVoteDate,
+    COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpvotesGiven,
+    COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownvotesGiven,
+    MAX(p.LastActivityDate) AS LastPostActivity
+  FROM Users u
+  LEFT JOIN Votes v ON v.UserId = u.Id
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id, u.DisplayName
+),
+TagEngagement AS (
+  SELECT
+    u.Id AS UserId,
+    COUNT(tt.Id) AS TagCount,
+    STRING_AGG(t.TagName, ',') AS Tags
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN (
+    SELECT p2.Id AS PostId, CAST(x AS INTEGER) AS tag_id
+    FROM Posts p2
+    CROSS JOIN LATERAL (
+      SELECT trim(regexp_replace(elem, '^>|>$', '')) AS elem
+      FROM unnest(string_to_array(COALESCE(p2.Tags, ''), '><')) AS elem
+    ) AS elems
+    CROSS JOIN LATERAL (SELECT CASE WHEN elems.elem = '' THEN NULL ELSE elems.elem END) AS cleaned(elem)
+    CROSS JOIN LATERAL (SELECT CAST(cleaned.elem AS INTEGER) AS x) AS casted
+    WHERE p2.Tags IS NOT NULL AND p2.Tags <> ''
+  ) s ON s.PostId = p.Id
+  LEFT JOIN Tags t ON t.Id = s.tag_id
+  LEFT JOIN Tags tt ON tt.Id = t.Id
+  GROUP BY u.Id
+),
+Combined AS (
+  SELECT
+    hu.UserId,
+    hu.DisplayName AS UserName,
+    hu.Reputation,
+    hu.CreationDate AS UserCreation,
+    hu.LastAccessDate AS UserLastAccess,
+    hu.Location,
+    r.LastVoteDate,
+    r.UpvotesGiven,
+    r.DownvotesGiven,
+    r.LastPostActivity,
+    ta.TagCount,
+    ta.Tags,
+    hu.PostCount,
+    hu.ScoreSum,
+    hu.PostTypes
+  FROM TopActiveUsers hu
+  JOIN RecentActivity r ON r.UserId = hu.UserId
+  LEFT JOIN TagEngagement ta ON ta.UserId = hu.UserId
+)
+SELECT
+  UserId,
+  UserName,
+  Reputation,
+  UserCreation,
+  UserLastAccess,
+  Location,
+  LastVoteDate,
+  UpvotesGiven,
+  DownvotesGiven,
+  LastPostActivity,
+  TagCount,
+  Tags,
+  PostCount,
+  ScoreSum,
+  PostTypes
+FROM Combined
+WHERE
+  (ScoreSum > 100 OR PostCount > 20)
+  AND (TagCount IS NULL OR TagCount > 0)
+ORDER BY
+  ScoreSum DESC,
+  PostCount DESC
+LIMIT 100;

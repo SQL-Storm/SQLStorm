@@ -1,0 +1,311 @@
+WITH UserBaseStats AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS UserUpVotesGiven,
+        U.DownVotes AS UserDownVotesGiven,
+        COALESCE(U.Location, 'Unknown') AS UserLocation,
+        CASE
+            WHEN U.WebsiteUrl IS NOT NULL AND TRIM(U.WebsiteUrl) <> '' THEN 'HasWebsite'
+            ELSE 'NoWebsite'
+        END AS HasWebsiteFlag,
+        EXTRACT(YEAR FROM U.CreationDate) AS UserAccountCreationYear
+    FROM Users U
+    WHERE U.Reputation > 500
+),
+PostDetailedAggregates AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostNetScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount AS DirectCommentCount,
+        P.FavoriteCount,
+        P.LastActivityDate,
+        LENGTH(P.Body) AS BodyCharCount,
+        LENGTH(COALESCE(P.Title, '')) AS TitleCharCount,
+        P.Tags,
+        P.ParentId,
+        P.AcceptedAnswerId,
+        COALESCE(SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpvoteCount,
+        COALESCE(SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownvoteCount,
+        COALESCE(AVG(C.Score), 0.0) AS AvgCommentScore,
+        (SELECT COUNT(DISTINCT C_sub.UserId) FROM Comments C_sub WHERE C_sub.PostId = P.Id AND C_sub.UserId IS NOT NULL) AS UniqueCommentersOnPost,
+        COALESCE(COUNT(DISTINCT PH_Edit.Id) FILTER (WHERE PH_Edit.PostHistoryTypeId IN (4, 5, 6)), 0) AS TotalEdits,
+        COALESCE(COUNT(DISTINCT PH_Close.Id) FILTER (WHERE PH_Close.PostHistoryTypeId = 10), 0) AS TotalCloseEvents,
+        COALESCE(MAX(PH_Close.CreationDate) FILTER (WHERE PH_Close.PostHistoryTypeId = 10), P.ClosedDate) AS LastClosedDate,
+        DATE_PART('day', P.LastActivityDate - P.CreationDate) AS DaysActive,
+        COALESCE(NULLIF(P.Score, 0) / NULLIF(P.ViewCount, 0), 0.0) AS ScorePerViewRatio,
+        LEAD(P.LastActivityDate, 1, TIMESTAMP '9999-12-31 00:00:00') OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate) AS NextPostActivityDate
+    FROM Posts P
+    LEFT JOIN Votes V ON P.Id = V.PostId
+    LEFT JOIN Comments C ON P.Id = C.PostId
+    LEFT JOIN PostHistory PH_Edit ON P.Id = PH_Edit.PostId AND PH_Edit.PostHistoryTypeId IN (4, 5, 6)
+    LEFT JOIN PostHistory PH_Close ON P.Id = PH_Close.PostId AND PH_Close.PostHistoryTypeId = 10
+    GROUP BY
+        P.Id, P.PostTypeId, P.OwnerUserId, P.CreationDate, P.Score, P.ViewCount, P.AnswerCount,
+        P.CommentCount, P.FavoriteCount, P.LastActivityDate, P.Body, P.Title, P.Tags, P.ParentId, P.AcceptedAnswerId, P.ClosedDate
+),
+UserPostSummary AS (
+    SELECT
+        PDA.OwnerUserId AS UserId,
+        COUNT(PDA.PostId) AS UserTotalPosts,
+        SUM(PDA.UpvoteCount) AS UserTotalPostUpvotesReceived,
+        SUM(PDA.DownvoteCount) AS UserTotalPostDownvotesReceived,
+        AVG(PDA.PostNetScore) AS UserAvgPostScore,
+        MAX(PDA.PostCreationDate) AS UserLatestPostDate,
+        MIN(PDA.PostCreationDate) AS UserEarliestPostDate,
+        SUM(PDA.TotalEdits) AS UserTotalEditsAcrossPosts,
+        SUM(CASE WHEN PDA.PostTypeId = 2 AND Q.AcceptedAnswerId = PDA.PostId THEN 1 ELSE 0 END) AS AcceptedAnswersProvided,
+        COUNT(DISTINCT PDA.PostId) FILTER (WHERE PDA.PostTypeId = 1 AND PDA.AnswerCount > 0) AS QuestionsWithAnswers,
+        COUNT(PDA.PostId) AS Rolling3PostCount,
+        AVG(PDA.PostNetScore) AS Rolling3PostAvgScore,
+        DATE_PART('day', MAX(PDA.NextPostActivityDate) - MIN(PDA.PostCreationDate)) AS TotalActivitySpanDays
+    FROM PostDetailedAggregates PDA
+    LEFT JOIN Posts Q ON PDA.PostTypeId = 2 AND PDA.ParentId = Q.Id
+    GROUP BY PDA.OwnerUserId
+),
+UserBadgeAchievements AS (
+    SELECT
+        B.UserId,
+        COUNT(B.Id) AS TotalBadges,
+        COUNT(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        COUNT(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        COUNT(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(B.Date) AS LastBadgeDate
+    FROM Badges B
+    GROUP BY B.UserId
+),
+-- Helper to split tags into rows using standard SQL string functions (no UNNEST)
+TaggedPosts AS (
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        P.Score AS PostScore,
+        TRIM(SUBSTRING(tag FROM 1 FOR 1000)) AS TagName  -- tag length safe-guard
+    FROM Posts P
+    CROSS JOIN LATERAL (
+        SELECT
+            CASE
+                WHEN instr_tags.pos = 1 THEN substr(instr_tags.tags_blob, instr_tags.start, instr_tags.len)
+                ELSE substr(instr_tags.tags_blob, instr_tags.start, instr_tags.len)
+            END AS tag
+        FROM (
+            -- build a virtual table of tag positions by iterating with recursive CTE
+            SELECT
+                P.Tags AS tags_blob,
+                1 AS pos,
+                CASE
+                    WHEN P.Tags LIKE '<%>%'
+                    THEN 2
+                    ELSE 0
+                END AS start,
+                CASE
+                    WHEN P.Tags LIKE '<%>%'
+                    THEN (instr(replace(P.Tags, '><', '>|<'), '>|<') - 1) - 2
+                    ELSE 0
+                END AS len
+        ) instr_tags
+    ) t
+    WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL AND TRIM(P.Tags) <> ''
+),
+-- Since CROSS JOIN LATERAL string splitting is not portable, provide portable tag extraction via recursive CTE
+TagSplit AS (
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        P.Score AS PostScore,
+        TRIM(SUBSTR(P.Tags, 2,
+            CASE
+                WHEN INSTR(SUBSTR(P.Tags, 2), '><') = 0 THEN LENGTH(P.Tags) - 2
+                ELSE INSTR(SUBSTR(P.Tags, 2), '><') - 1
+            END
+        )) AS TagName,
+        CASE
+            WHEN INSTR(SUBSTR(P.Tags, 2), '><') = 0 THEN NULL
+            ELSE SUBSTR(P.Tags, 2 + INSTR(SUBSTR(P.Tags, 2), '><') + 0)
+        END AS RemainingTags
+    FROM Posts P
+    WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL AND TRIM(P.Tags) <> ''
+    UNION ALL
+    SELECT
+        PostId,
+        OwnerUserId,
+        PostScore,
+        TRIM(SUBSTR(RemainingTags, 1,
+            CASE
+                WHEN INSTR(RemainingTags, '><') = 0 THEN LENGTH(RemainingTags)
+                ELSE INSTR(RemainingTags, '><') - 1
+            END
+        )) AS TagName,
+        CASE
+            WHEN INSTR(RemainingTags, '><') = 0 THEN NULL
+            ELSE SUBSTR(RemainingTags, INSTR(RemainingTags, '><') + 3)
+        END AS RemainingTags
+    FROM TagSplit
+    WHERE RemainingTags IS NOT NULL AND RemainingTags <> ''
+),
+TagQuestionStats AS (
+    SELECT
+        TS.TagName,
+        TS.OwnerUserId AS UserId,
+        COUNT(TS.PostId) AS TaggedQuestionCount,
+        SUM(TS.PostScore) AS TagQuestionScore,
+        ROW_NUMBER() OVER (PARTITION BY TS.OwnerUserId ORDER BY COUNT(TS.PostId) DESC, SUM(TS.PostScore) DESC) AS rn_tag_user
+    FROM TagSplit TS
+    GROUP BY TS.TagName, TS.OwnerUserId
+),
+UserMostInfluentialTag AS (
+    SELECT
+        TQS.UserId,
+        TQS.TagName AS MostFrequentTagName,
+        TQS.TaggedQuestionCount,
+        TQS.TagQuestionScore
+    FROM TagQuestionStats TQS
+    WHERE TQS.rn_tag_user = 1
+),
+GlobalTagPerformance AS (
+    SELECT
+        TS.TagName AS TagName,
+        SUM(TS.PostScore) AS TagTotalScore,
+        AVG(TS.PostScore) AS TagAverageScore,
+        COUNT(DISTINCT TS.PostId) AS TaggedPostCount,
+        SUM((SELECT P2.ViewCount FROM Posts P2 WHERE P2.Id = TS.PostId)) AS TagTotalViewCount
+    FROM TagSplit TS
+    GROUP BY TS.TagName
+),
+PotentialHighImpactPosts AS (
+    SELECT
+        PDA.PostId,
+        PDA.PostNetScore,
+        PDA.ViewCount,
+        PDA.LastActivityDate,
+        PDA.PostCreationDate,
+        PDA.OwnerUserId,
+        (PDA.ViewCount * 0.1 + PDA.PostNetScore * 0.5 + PDA.DirectCommentCount * 0.8) AS ImpactScore,
+        RANK() OVER (ORDER BY (PDA.ViewCount * 0.1 + PDA.PostNetScore * 0.5 + PDA.DirectCommentCount * 0.8) DESC) AS ImpactRank
+    FROM PostDetailedAggregates PDA
+    WHERE PDA.PostTypeId = 1 AND PDA.ViewCount > 5000 AND PDA.PostNetScore >= 0
+    ORDER BY ImpactScore DESC
+    LIMIT 2000
+),
+HotQuestionCandidates AS (
+    SELECT
+        PDA.PostId,
+        PDA.PostNetScore,
+        PDA.ViewCount,
+        PDA.DirectCommentCount,
+        PDA.OwnerUserId,
+        DENSE_RANK() OVER (ORDER BY PDA.PostNetScore DESC, PDA.ViewCount DESC) AS RankScoreViews,
+        (TIMESTAMP '2024-10-01 12:34:56' - PDA.LastActivityDate) AS TimeSinceLastActivity
+    FROM PostDetailedAggregates PDA
+    WHERE PDA.PostTypeId = 1
+      AND PDA.PostCreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year')
+      AND PDA.PostNetScore > 50
+      AND PDA.ViewCount > 1000
+),
+ModeratorActivitySummary AS (
+    SELECT
+        PH.UserId,
+        COUNT(PH.Id) AS TotalModActions,
+        COUNT(CASE WHEN PH.PostHistoryTypeId IN (14, 15, 19, 20) THEN 1 ELSE 0 END) AS LockUnlockProtectUnprotectActions,
+        COUNT(DISTINCT PH.PostId) AS DistinctPostsAffected,
+        MAX(PH.CreationDate) AS LastModActionDate
+    FROM PostHistory PH
+    WHERE PH.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20, 33, 34)
+    GROUP BY PH.UserId
+),
+CommunityMetrics AS (
+    SELECT
+        DATE_TRUNC('month', P.CreationDate) AS Month,
+        COUNT(P.Id) AS TotalPostsInMonth,
+        AVG(P.Score) AS AvgPostScoreInMonth,
+        SUM(P.ViewCount) AS TotalViewsInMonth
+    FROM Posts P
+    WHERE P.PostTypeId = 1
+    GROUP BY DATE_TRUNC('month', P.CreationDate)
+)
+SELECT
+    UBS.UserId,
+    UBS.DisplayName,
+    UBS.Reputation,
+    UBS.UserCreationDate,
+    UBS.LastAccessDate,
+    UBS.UserProfileViews,
+    UBS.UserLocation,
+    UBS.HasWebsiteFlag,
+    COALESCE(UPS.UserTotalPosts, 0) AS TotalPostsByThisUser,
+    COALESCE(UPS.UserAvgPostScore, 0.0) AS AvgPostScoreByThisUser,
+    COALESCE(UPS.AcceptedAnswersProvided, 0) AS AcceptedAnswersUserProvided,
+    COALESCE(UBA.GoldBadges, 0) AS GoldBadgesCount,
+    COALESCE(UBA.TotalBadges, 0) AS OverallBadgeCount,
+    UMIT.MostFrequentTagName,
+    UMIT.TaggedQuestionCount AS MostFrequentTagQuestionCount,
+    GTP.TagTotalScore AS MostFrequentTagGlobalScore,
+    GTP.TagAverageScore AS MostFrequentTagGlobalAvgScore,
+    COALESCE(MAS.TotalModActions, 0) AS TotalModeratorActions,
+    COALESCE(MAS.LastModActionDate, TIMESTAMP '1900-01-01 00:00:00') AS LatestModeratorActionDate,
+    PDA.PostId AS TopPostByScoreId,
+    PDA.PostNetScore AS TopPostByScoreNetScore,
+    PDA.ViewCount AS TopPostByScoreViewCount,
+    (
+        (UBS.Reputation * 0.1) +
+        (COALESCE(UPS.UserTotalPosts, 0) * 0.5) +
+        (COALESCE(UPS.UserAvgPostScore, 0.0) * 2.0) +
+        (COALESCE(UPS.AcceptedAnswersProvided, 0) * 10.0) +
+        (COALESCE(UBS.UserProfileViews, 0) * 0.01) +
+        (COALESCE(UBS.UserUpVotesGiven, 0) * 0.05) -
+        (COALESCE(UBS.UserDownVotesGiven, 0) * 0.1) +
+        (COALESCE(UPS.UserTotalEditsAcrossPosts, 0) * 0.2) +
+        (COALESCE(UBA.GoldBadges, 0) * 5.0) +
+        (COALESCE(UMIT.TagQuestionScore, 0) * 0.01) +
+        (CASE WHEN COALESCE(MAS.TotalModActions, 0) > 0 THEN 100 ELSE 0 END)
+    ) AS CalculatedUserOverallInfluenceScore,
+    AVG(PDA.PostNetScore) OVER (PARTITION BY UBS.UserLocation ORDER BY UBS.Reputation DESC, UBS.UserId) AS AvgTopPostScoreInLocation,
+    NTILE(5) OVER (ORDER BY UBS.Reputation DESC, COALESCE(UPS.UserTotalPosts, 0) DESC, COALESCE(UBA.GoldBadges, 0) DESC) AS ReputationTier,
+    (
+        SELECT
+            'Recent Hot Question: ' || HQC.PostId || ' Score: ' || HQC.PostNetScore || ' Views: ' || HQC.ViewCount || ' Comments: ' || HQC.DirectCommentCount || ' Time Since Last Activity (minutes): ' || EXTRACT(EPOCH FROM HQC.TimeSinceLastActivity)/60
+        FROM HotQuestionCandidates HQC
+        WHERE HQC.OwnerUserId = UBS.UserId
+        ORDER BY HQC.TimeSinceLastActivity ASC, HQC.RankScoreViews ASC
+        LIMIT 1
+    ) AS LatestHotQuestionInfo,
+    (
+        SELECT
+            'High Impact Post: ' || PHIP.PostId || ' Score: ' || PHIP.PostNetScore || ' Views: ' || PHIP.ViewCount || ' ImpactRank: ' || PHIP.ImpactRank
+        FROM PotentialHighImpactPosts PHIP
+        WHERE PHIP.OwnerUserId = UBS.UserId
+        ORDER BY PHIP.ImpactRank ASC
+        LIMIT 1
+    ) AS TopImpactPostInfo,
+    COALESCE(CM.TotalPostsInMonth, 0) AS TotalCommunityPostsInUserCreationMonth,
+    COALESCE(CM.AvgPostScoreInMonth, 0.0) AS AvgCommunityPostScoreInUserCreationMonth
+FROM UserBaseStats UBS
+LEFT JOIN UserPostSummary UPS ON UBS.UserId = UPS.UserId
+LEFT JOIN UserBadgeAchievements UBA ON UBS.UserId = UBA.UserId
+LEFT JOIN UserMostInfluentialTag UMIT ON UBS.UserId = UMIT.UserId
+LEFT JOIN GlobalTagPerformance GTP ON UMIT.MostFrequentTagName = GTP.TagName
+LEFT JOIN ModeratorActivitySummary MAS ON UBS.UserId = MAS.UserId
+LEFT JOIN (
+    SELECT PostId, OwnerUserId, PostNetScore, ViewCount, PostCreationDate,
+           ROW_NUMBER() OVER (PARTITION BY OwnerUserId ORDER BY PostNetScore DESC, ViewCount DESC, PostCreationDate DESC) as rn
+    FROM PostDetailedAggregates
+    WHERE PostTypeId IN (1,2)
+) PDA ON UBS.UserId = PDA.OwnerUserId AND PDA.rn = 1
+LEFT JOIN CommunityMetrics CM ON CM.Month = DATE_TRUNC('month', UBS.UserCreationDate)
+WHERE UBS.Reputation > 2000
+    AND (COALESCE(UPS.UserTotalPosts, 0) > 10 OR COALESCE(UBA.TotalBadges, 0) > 5)
+    AND (
+        UBS.LastAccessDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year') OR
+        COALESCE(MAS.LastModActionDate, TIMESTAMP '1900-01-01 00:00:00') >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6 months')
+    )
+ORDER BY CalculatedUserOverallInfluenceScore DESC, UBS.Reputation DESC, UBS.LastAccessDate DESC
+LIMIT 500;

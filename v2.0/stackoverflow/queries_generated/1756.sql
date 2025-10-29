@@ -1,0 +1,204 @@
+-- {"query": "1756.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3335} 
+
+WITH RecentHighImpactPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.LastActivityDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+        p.Tags,
+        p.CommunityOwnedDate,
+        p.ClosedDate,
+        ROW_NUMBER() OVER (PARTITION BY EXTRACT(YEAR FROM p.CreationDate) ORDER BY p.Score DESC, p.ViewCount DESC) AS YearlyScoreRank,
+        RANK() OVER (ORDER BY (p.Score * 0.6 + p.ViewCount * 0.2 + COALESCE(p.AnswerCount, 0) * 0.15 + COALESCE(p.FavoriteCount, 0) * 0.05) DESC, p.CreationDate DESC) AS GlobalImpactRank
+    FROM Posts AS p
+    WHERE
+        p.PostTypeId = 1 -- Questions
+        AND p.CreationDate >= '2022-01-01' -- Relatively recent data
+        AND p.ViewCount > 5000
+        AND p.Score > 75
+        AND p.OwnerUserId IS NOT NULL -- Exclude community-owned or deleted users for detailed user analysis
+        AND p.LastActivityDate IS NOT NULL
+),
+UserContributionOverview AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT p_q.Id) AS TotalQuestionsPosted,
+        COUNT(DISTINCT p_a.Id) AS TotalAnswersPosted,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT b.Id) AS TotalBadgesEarned,
+        SUM(COALESCE(p_q.Score, 0) + COALESCE(p_a.Score, 0)) AS TotalPostScore,
+        AVG(CASE WHEN p_q.PostTypeId = 1 THEN p_q.Score ELSE NULL END) AS AvgQuestionScore,
+        AVG(CASE WHEN p_a.PostTypeId = 2 THEN p_a.Score ELSE NULL END) AS AvgAnswerScore,
+        MAX(u.LastAccessDate) AS UserLastActivityDate
+    FROM Users AS u
+    LEFT JOIN Posts AS p_q ON u.Id = p_q.OwnerUserId AND p_q.PostTypeId = 1
+    LEFT JOIN Posts AS p_a ON u.Id = p_a.OwnerUserId AND p_a.PostTypeId = 2
+    LEFT JOIN Comments AS c ON u.Id = c.UserId
+    LEFT JOIN Badges AS b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+    HAVING COUNT(DISTINCT p_q.Id) + COUNT(DISTINCT p_a.Id) > 10 -- Users with at least significant activity
+),
+PostHistoryAnalysis AS (
+    SELECT
+        ph.PostId,
+        COUNT(DISTINCT ph.UserId) AS DistinctEditors,
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (10, 101, 102, 103, 104, 105) THEN 1 ELSE 0 END) AS WasClosed,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS WasReopened,
+        MIN(ph.CreationDate) AS FirstEditDate,
+        MAX(ph.CreationDate) AS LastEditDate,
+        -- Average days between consecutive edits by any user
+        AVG(EXTRACT(EPOCH FROM (ph.CreationDate - LAG(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate))) / (60.0 * 60.0 * 24.0)) AS AvgDaysBetweenEdits
+    FROM PostHistory AS ph
+    WHERE ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11) -- Initial, Edit, Rollback, Close, Reopen events
+    GROUP BY ph.PostId
+    HAVING COUNT(ph.Id) > 2 -- Posts with at least some history for analysis
+)
+SELECT
+    rhp.PostId,
+    rhp.Title,
+    rhp.PostCreationDate,
+    rhp.LastActivityDate,
+    rhp.Score,
+    rhp.ViewCount,
+    rhp.AnswerCount,
+    rhp.FavoriteCount,
+    rhp.YearlyScoreRank,
+    rhp.GlobalImpactRank,
+    uco.DisplayName AS OwnerDisplayName,
+    uco.Reputation AS OwnerReputation,
+    uco.TotalQuestionsPosted AS OwnerTotalQuestions,
+    uco.TotalAnswersPosted AS OwnerTotalAnswers,
+    uco.TotalCommentsMade AS OwnerTotalComments,
+    uco.TotalBadgesEarned AS OwnerTotalBadges,
+    COALESCE(pha.DistinctEditors, 0) AS PostDistinctEditors,
+    COALESCE(pha.AvgDaysBetweenEdits, 0.0) AS PostAvgDaysBetweenEdits,
+    CASE
+        WHEN rhp.ClosedDate IS NOT NULL AND pha.WasReopened = 1 THEN 'Closed & Reopened'
+        WHEN rhp.ClosedDate IS NOT NULL THEN 'Closed Permanently'
+        WHEN rhp.CommunityOwnedDate IS NOT NULL THEN 'Community Wiki'
+        ELSE 'Open Active'
+    END AS PostStatusDetail,
+    LENGTH(rhp.Title) AS TitleLength,
+    LENGTH(rhp.Body) AS BodyApproxLength, -- Assuming Body is a TEXT field. LENGTH might be slow.
+    ARRAY_LENGTH(string_to_array(SUBSTRING(rhp.Tags FROM 2 FOR LENGTH(rhp.Tags)-2), '><'), 1) AS NumberOfTags,
+    (SELECT COUNT(DISTINCT c.UserId)
+     FROM Comments AS c
+     WHERE c.PostId = rhp.PostId
+       AND c.CreationDate BETWEEN rhp.PostCreationDate AND rhp.PostCreationDate + INTERVAL '90 day' -- Comment activity in first 90 days
+       AND c.Score > 1
+    ) AS InitialActiveCommenters,
+    (SELECT COALESCE(MAX(c.Text), 'No Top Comment')
+     FROM Comments AS c
+     WHERE c.PostId = rhp.PostId
+       AND c.Score = (SELECT MAX(c2.Score) FROM Comments AS c2 WHERE c2.PostId = c.PostId)
+     LIMIT 1
+    ) AS TopVotedCommentText,
+    LOWER(SUBSTRING(rhp.Title FROM 1 FOR 10)) || '_' || UPPER(SUBSTRING(COALESCE(uco.DisplayName, 'UNKNOWN') FROM 1 FOR 5)) || '_' || rhp.PostId AS ComplexIdentifier,
+    -- Combined decay score calculation
+    (rhp.Score * 0.4 + rhp.ViewCount * 0.3 + rhp.FavoriteCount * 0.1 + COALESCE(rhp.AnswerCount, 0) * 0.2)
+    * (1.0 / (EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - rhp.LastActivityDate)) / (60.0 * 60.0 * 24.0 * 60.0) + 1.0)) AS QuestionEngagementScore
+FROM RecentHighImpactPosts AS rhp
+LEFT JOIN UserContributionOverview AS uco ON rhp.OwnerUserId = uco.UserId
+LEFT JOIN PostHistoryAnalysis AS pha ON rhp.PostId = pha.PostId
+WHERE
+    rhp.GlobalImpactRank <= 2500 -- Top N impact posts
+    AND uco.Reputation > 10000 -- Owners with high reputation
+    AND (pha.DistinctEditors IS NULL OR pha.DistinctEditors <= 10) -- Not excessively edited by too many unique people
+    AND (rhp.Tags LIKE '%<postgresql>%' OR rhp.Tags LIKE '%<sql-server>%' OR rhp.Tags LIKE '%<mysql>%') -- Focus on specific database tags
+    AND (rhp.ClosedDate IS NULL OR rhp.ClosedDate > CURRENT_TIMESTAMP - INTERVAL '1 year') -- Not closed for too long
+    AND (SELECT COUNT(v.Id) FROM Votes v WHERE v.PostId = rhp.PostId AND v.VoteTypeId = 2 AND v.CreationDate > CURRENT_TIMESTAMP - INTERVAL '6 month') > 20 -- At least 20 recent upvotes
+    AND NOT EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = rhp.OwnerUserId AND b.Name = 'Disciplined') -- Exclude owners who are too "disciplined"
+ORDER BY QuestionEngagementScore DESC, rhp.GlobalImpactRank ASC
+LIMIT 1000
+
+UNION ALL
+
+-- Second part of the query using a set operator:
+-- Find highly upvoted answers to questions that have been linked as duplicates or related,
+-- demonstrating parent-child relationships, link types, and different aggregation/filtering.
+WITH PopularAnswerDetails AS (
+    SELECT
+        pa.Id AS PostId,
+        pa.ParentId AS QuestionId,
+        pa.CreationDate AS PostCreationDate,
+        pa.LastActivityDate,
+        pa.Score,
+        COALESCE(pa.FavoriteCount, 0) AS FavoriteCount,
+        pa.OwnerUserId,
+        pa.CommunityOwnedDate,
+        RANK() OVER (PARTITION BY pa.ParentId ORDER BY pa.Score DESC, pa.CreationDate DESC) AS AnswerRankPerQuestion,
+        COUNT(DISTINCT ph_ans.UserId) AS AnswerDistinctEditors,
+        AVG(EXTRACT(EPOCH FROM (ph_ans.CreationDate - LAG(ph_ans.CreationDate) OVER (PARTITION BY ph_ans.PostId ORDER BY ph_ans.CreationDate))) / (60.0 * 60.0 * 24.0)) AS AvgDaysBetweenAnswerEdits
+    FROM Posts AS pa -- Answer posts
+    LEFT JOIN PostHistory AS ph_ans ON pa.Id = ph_ans.PostId AND ph_ans.PostHistoryTypeId IN (4, 5, 6) -- Only edit events for answers
+    WHERE
+        pa.PostTypeId = 2 -- Answers
+        AND pa.Score > 50 -- Highly upvoted answers
+        AND pa.OwnerUserId IS NOT NULL
+        AND pa.Body IS NOT NULL
+    GROUP BY pa.Id, pa.ParentId, pa.CreationDate, pa.LastActivityDate, pa.Score, pa.FavoriteCount, pa.OwnerUserId, pa.CommunityOwnedDate
+)
+SELECT
+    pad.PostId,
+    qp.Title AS QuestionTitle, -- The parent's title
+    pad.PostCreationDate,
+    pad.LastActivityDate,
+    pad.Score,
+    qp.ViewCount AS QuestionViewCount, -- Get parent question's view count
+    NULL AS AnswerCount, -- Answers don't have answers
+    pad.FavoriteCount,
+    NULL AS YearlyScoreRank, -- Not applicable here
+    RANK() OVER (ORDER BY pad.Score DESC, pad.LastActivityDate DESC) AS GlobalImpactRank,
+    au.DisplayName AS OwnerDisplayName,
+    au.Reputation AS OwnerReputation,
+    au.TotalQuestionsPosted AS OwnerTotalQuestions,
+    au.TotalAnswersPosted AS OwnerTotalAnswers,
+    au.TotalCommentsMade AS OwnerTotalComments,
+    au.TotalBadgesEarned AS OwnerTotalBadges,
+    COALESCE(pad.AnswerDistinctEditors, 0) AS PostDistinctEditors,
+    COALESCE(pad.AvgDaysBetweenAnswerEdits, 0.0) AS PostAvgDaysBetweenEdits,
+    CASE
+        WHEN qp.AcceptedAnswerId = pad.PostId THEN 'Accepted Answer'
+        WHEN pad.CommunityOwnedDate IS NOT NULL THEN 'Community Wiki Answer'
+        ELSE 'Regular Answer'
+    END AS PostStatusDetail,
+    NULL AS TitleLength, -- Answers don't have titles
+    LENGTH(pa_body.Body) AS BodyApproxLength, -- Retrieve actual body length from Posts
+    NULL AS NumberOfTags, -- Answers don't have tags
+    (SELECT COUNT(DISTINCT c.UserId)
+     FROM Comments AS c
+     WHERE c.PostId = pad.PostId
+       AND c.Score > 0
+       AND c.Text IS NOT NULL AND LENGTH(c.Text) > 10 -- Only meaningful comments
+    ) AS InitialActiveCommenters,
+    (SELECT COALESCE(MAX(c.Text), 'No Top Comment')
+     FROM Comments AS c
+     WHERE c.PostId = pad.PostId
+       AND c.Score = (SELECT MAX(c2.Score) FROM Comments AS c2 WHERE c2.PostId = c.PostId)
+     LIMIT 1
+    ) AS TopVotedCommentText,
+    'ANS_' || LOWER(SUBSTRING(COALESCE(au.DisplayName, 'UNKN') FROM 1 FOR 4)) || '_' || pad.PostId AS ComplexIdentifier,
+    (pad.Score * 0.7 + pad.FavoriteCount * 0.3)
+    * (1.0 / (EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - pad.LastActivityDate)) / (60.0 * 60.0 * 24.0 * 30.0) + 1.0)) AS AnswerEngagementScore
+FROM PopularAnswerDetails AS pad
+INNER JOIN Posts AS qp ON pad.QuestionId = qp.Id AND qp.PostTypeId = 1 -- Join to parent question
+INNER JOIN PostLinks AS pl ON qp.Id = pl.PostId AND pl.LinkTypeId IN (1, 3) -- Question is linked or duplicate
+INNER JOIN Posts AS pa_body ON pad.PostId = pa_body.Id -- Join back to Posts for Body text
+LEFT JOIN UserContributionOverview AS au ON pad.OwnerUserId = au.UserId
+WHERE
+    pad.AnswerRankPerQuestion <= 5 -- Only top 5 answers per linked question
+    AND au.Reputation > 5000 -- Answerers with good reputation
+    AND qp.ClosedDate IS NULL -- Only answers to open questions
+    AND qp.Tags LIKE '%<api>%' -- Relevant to specific tag for questions
+    AND (qp.FavoriteCount IS NULL OR qp.FavoriteCount < 50) -- Avoid questions that are too popular (to get different set)
+ORDER BY AnswerEngagementScore DESC
+LIMIT 500;

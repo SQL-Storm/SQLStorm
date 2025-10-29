@@ -1,0 +1,76 @@
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    MAX(u.CreationDate) AS LatestAccountActivity,
+    MAX(p.LastActivityDate) AS LatestPostActivity,
+    AVG(p.Score) AS AvgPostScore,
+    MAX(p.ViewCount) AS MaxPostViews,
+    MIN(p.CreationDate) AS EarliestPost,
+    MAX(p.CreationDate) AS LatestPost,
+    (
+        SELECT COUNT(*) 
+        FROM Votes v 
+        WHERE v.PostId = p.Id AND v.VoteTypeId = 2
+    ) AS TotalUpVotes,
+    (
+        SELECT COUNT(*) 
+        FROM Votes v 
+        WHERE v.PostId = p.Id AND v.VoteTypeId = 3
+    ) AS TotalDownVotes,
+    (
+        SELECT STRING_AGG(t.TagName, ', ')
+        FROM Tags t
+        WHERE t.Id IN (
+            SELECT pt.TagId 
+            FROM PostTags pt 
+            WHERE pt.PostId = p.Id
+        )
+    ) AS TaggedWith,
+    (
+        SELECT COUNT(*) 
+        FROM Badges b2 
+        WHERE b2.UserId = u.Id AND b2.Class = 1
+    ) AS GoldBadgeCount,
+    (
+        SELECT COUNT(*) FROM (
+            WITH RECURSIVE PostHierarchy AS (
+                SELECT 
+                    p2.Id AS PostId, 
+                    p2.ParentId AS ParentPostId, 
+                    1 AS Level
+                FROM 
+                    Posts p2
+                WHERE 
+                    p2.PostTypeId = 2 AND p2.ParentId IS NOT NULL
+                UNION ALL
+                SELECT 
+                    ph.PostId, 
+                    p3.ParentId AS ParentPostId, 
+                    ph.Level + 1 AS Level
+                FROM 
+                    PostHierarchy ph
+                    INNER JOIN Posts p3 ON ph.ParentPostId = p3.Id
+                WHERE 
+                    p3.PostTypeId = 2 AND p3.ParentId IS NOT NULL
+            )
+            SELECT 1 FROM PostHierarchy WHERE Level > 1
+        ) t_sub
+    ) AS NestedReplyCount
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+GROUP BY 
+    u.Id,
+    u.DisplayName,
+    u.Reputation
+HAVING 
+    u.Reputation > 1000
+ORDER BY 
+    TotalPosts DESC, 
+    AvgPostScore DESC;

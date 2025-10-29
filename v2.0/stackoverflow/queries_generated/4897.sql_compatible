@@ -1,0 +1,115 @@
+WITH
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      COUNT(DISTINCT p.Id) AS QuestionCount,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+      SUM(p.ViewCount) AS TotalViews,
+      MAX(p.CreationDate) AS LastPostDate,
+      RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS QuestionRank,
+      DENSE_RANK() OVER (ORDER BY SUM(p.ViewCount) DESC) AS ViewRank
+    FROM Users AS u
+    JOIN Posts AS p
+      ON u.Id = p.OwnerUserId
+    WHERE
+      p.PostTypeId IN (1, 2)
+      AND u.CreationDate >= DATE '2010-01-01'
+    GROUP BY
+      u.Id,
+      u.DisplayName
+  ),
+  PostEngagement AS (
+    SELECT
+      p.Id AS PostId,
+      p.OwnerUserId,
+      p.Title,
+      p.CreationDate,
+      p.Score,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      COUNT(DISTINCT c.Id) AS CommentCountTotal,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+      AVG(p.Score) OVER (PARTITION BY p.PostTypeId) AS AvgScoreByType,
+      p.PostTypeId
+    FROM Posts AS p
+    LEFT JOIN Comments AS c
+      ON p.Id = c.PostId
+    LEFT JOIN Votes AS v
+      ON p.Id = v.PostId
+    WHERE
+      p.PostTypeId = 1 AND p.CreationDate BETWEEN DATE '2010-01-01' AND DATE '2023-12-31'
+    GROUP BY
+      p.Id,
+      p.OwnerUserId,
+      p.Title,
+      p.CreationDate,
+      p.Score,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      p.PostTypeId
+  ),
+  HighValueQuestions AS (
+    SELECT
+      pe.PostId,
+      pe.OwnerUserId,
+      pe.Title,
+      pe.CreationDate,
+      pe.Score,
+      pe.AnswerCount,
+      pe.CommentCountTotal,
+      pe.UpVoteCount,
+      pe.DownVoteCount,
+      pe.FavoriteCount,
+      ua.DisplayName AS OwnerDisplayName,
+      (pe.UpVoteCount - pe.DownVoteCount) * POWER(pe.Score + 1, 1.5) AS EngagementScore
+    FROM PostEngagement AS pe
+    JOIN UserActivity AS ua
+      ON pe.OwnerUserId = ua.UserId
+    WHERE
+      pe.Score > 50 AND pe.AnswerCount > 10 AND ua.ViewRank <= 100
+  )
+SELECT
+  h.Title,
+  h.CreationDate,
+  h.OwnerDisplayName,
+  h.Score,
+  h.AnswerCount,
+  h.CommentCountTotal,
+  h.UpVoteCount,
+  h.DownVoteCount,
+  h.FavoriteCount,
+  h.EngagementScore,
+  CASE
+    WHEN h.EngagementScore > 1000000 THEN 'Exceptional'
+    WHEN h.EngagementScore > 500000 THEN 'High'
+    WHEN h.EngagementScore > 100000 THEN 'Medium'
+    ELSE 'Low'
+  END AS EngagementLevel,
+  COALESCE(ua.QuestionCount, 0) AS UserTotalQuestions,
+  COALESCE(ua.TotalViews, 0) AS UserTotalViews,
+  CASE
+    WHEN h.CreationDate < ua.LastPostDate THEN 'Oldest'
+    ELSE 'Recent'
+  END AS PostAgeCategory,
+  ph.Comment AS LatestModeratorComment
+FROM HighValueQuestions AS h
+LEFT JOIN UserActivity AS ua
+  ON h.OwnerUserId = ua.UserId
+LEFT JOIN (
+  SELECT
+    PostId,
+    Comment,
+    ROW_NUMBER() OVER (PARTITION BY PostId ORDER BY CreationDate DESC) as rn
+  FROM PostHistory
+  WHERE PostHistoryTypeId = 33
+) AS ph
+  ON h.PostId = ph.PostId AND ph.rn = 1
+WHERE
+  h.EngagementScore > 50000
+ORDER BY
+  h.EngagementScore DESC
+LIMIT 50;

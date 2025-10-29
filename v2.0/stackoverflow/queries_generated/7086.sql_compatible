@@ -1,0 +1,330 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT c.Id) as Comments,
+        COUNT(DISTINCT b.Id) as Badges,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        CAST('2024-10-01 12:34:56' AS timestamp) - u.CreationDate AS AccountAgeInterval,
+        EXTRACT(epoch FROM (CAST('2024-10-01 12:34:56' AS timestamp) - u.CreationDate))/86400 as AccountAgeDays,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Elite'
+            WHEN u.Reputation >= 1000 THEN 'Veteran'
+            WHEN u.Reputation >= 100 THEN 'Member'
+            ELSE 'Newbie'
+        END as ReputationLevel,
+        ROW_NUMBER() OVER (PARTITION BY u.Reputation ORDER BY u.CreationDate) as ReputationRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate
+),
+TopUsersByActivity AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        Views,
+        UpVotes,
+        DownVotes,
+        TotalPosts,
+        Questions,
+        Answers,
+        Comments,
+        Badges,
+        LastPostDate,
+        LastCommentDate,
+        AccountAgeDays,
+        ReputationLevel,
+        ReputationRank,
+        RANK() OVER (ORDER BY TotalPosts DESC, UpVotes DESC) as ActivityRank,
+        DENSE_RANK() OVER (ORDER BY Reputation DESC) as ReputationRank2
+    FROM UserActivityStats
+),
+PostAnalytics AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        p.ParentId,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Question with Accepted Answer'
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as PostTypeCategory,
+        CASE 
+            WHEN p.ViewCount > 1000 THEN 'High Views'
+            WHEN p.ViewCount > 100 THEN 'Medium Views'
+            WHEN p.ViewCount > 10 THEN 'Low Views'
+            ELSE 'Very Low Views'
+        END as ViewCategory,
+        CASE 
+            WHEN p.Score > 50 THEN 'Highly Voted'
+            WHEN p.Score > 10 THEN 'Moderately Voted'
+            WHEN p.Score > 0 THEN 'Slightly Voted'
+            ELSE 'Unvoted or Downvoted'
+        END as VoteCategory,
+        COALESCE(UPPER(SUBSTRING(p.Title FROM 1 FOR 1)), 'N/A') as FirstLetter,
+        COALESCE(NULLIF(p.Tags, ''), '') as TagsCleaned,
+        CHAR_LENGTH(COALESCE(p.Tags, '')) as TagLength,
+        EXTRACT(epoch FROM (CAST('2024-10-01 12:34:56' AS timestamp) - p.CreationDate))/86400 as DaysSinceCreation,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+            ELSE 'Active'
+        END as PostStatus,
+        DENSE_RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) as ScoreRankWithinType,
+        PERCENT_RANK() OVER (ORDER BY p.Score) as ScorePercentile
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+PostsWithComplexTags AS (
+    SELECT 
+        pa.PostId,
+        pa.Title,
+        pa.Score,
+        pa.ViewCount,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.FavoriteCount,
+        pa.CreationDate,
+        pa.OwnerUserId,
+        pa.PostTypeId,
+        pa.Tags,
+        pa.ParentId,
+        pa.PostTypeCategory,
+        pa.ViewCategory,
+        pa.VoteCategory,
+        pa.FirstLetter,
+        pa.TagsCleaned,
+        pa.TagLength,
+        pa.DaysSinceCreation,
+        pa.PostStatus,
+        pa.ScoreRankWithinType,
+        pa.ScorePercentile,
+        CASE 
+            WHEN pa.TagsCleaned LIKE '%<c>%' OR pa.TagsCleaned LIKE '%<java>%' OR pa.TagsCleaned LIKE '%<python>%' THEN 'Programming Related'
+            WHEN pa.TagsCleaned LIKE '%<database>%' OR pa.TagsCleaned LIKE '%<sql>%' THEN 'Database Related'
+            WHEN pa.TagsCleaned LIKE '%<web>%' OR pa.TagsCleaned LIKE '%<html>%' OR pa.TagsCleaned LIKE '%<css>%' THEN 'Web Development'
+            ELSE 'Other'
+        END as TagFocusArea,
+        CASE 
+            WHEN pa.OwnerUserId IS NOT NULL AND EXISTS (
+                SELECT 1 FROM Votes v 
+                INNER JOIN VoteTypes vt ON v.VoteTypeId = vt.Id 
+                WHERE v.PostId = pa.PostId AND vt.Name IN ('UpMod', 'DownMod')
+            ) THEN 1
+            ELSE 0
+        END as HasVotingActivity,
+        (
+            SELECT COUNT(*) 
+            FROM Comments c 
+            WHERE c.PostId = pa.PostId
+        ) as CommentCountSubquery,
+        (
+            SELECT COUNT(*) 
+            FROM Posts p2 
+            WHERE p2.ParentId = pa.PostId AND p2.PostTypeId = 2
+        ) as AnswerCountSubquery,
+        (
+            SELECT COUNT(*) 
+            FROM Badges b 
+            WHERE b.UserId = pa.OwnerUserId AND b.Date > pa.CreationDate
+        ) as BadgesAfterPost,
+        COALESCE(
+            (
+                SELECT b.Name 
+                FROM Badges b 
+                WHERE b.UserId = pa.OwnerUserId AND b.Date > pa.CreationDate 
+                ORDER BY b.Date DESC
+                LIMIT 1
+            ), 'No Recent Badge'
+        ) as MostRecentBadge
+    FROM PostAnalytics pa
+),
+FinalAnalysis AS (
+    SELECT 
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.Views,
+        tu.UpVotes,
+        tu.DownVotes,
+        tu.TotalPosts,
+        tu.Questions,
+        tu.Answers,
+        tu.Comments,
+        tu.Badges,
+        tu.LastPostDate,
+        tu.LastCommentDate,
+        tu.AccountAgeDays,
+        tu.ReputationLevel,
+        tu.ReputationRank,
+        tu.ActivityRank,
+        tu.ReputationRank2,
+        pa.PostId,
+        pa.Title,
+        pa.Score,
+        pa.ViewCount,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.FavoriteCount,
+        pa.CreationDate,
+        pa.PostTypeId,
+        pa.Tags,
+        pa.ParentId,
+        pa.PostTypeCategory,
+        pa.ViewCategory,
+        pa.VoteCategory,
+        pa.FirstLetter,
+        pa.TagsCleaned,
+        pa.TagLength,
+        pa.DaysSinceCreation,
+        pa.PostStatus,
+        pa.ScoreRankWithinType,
+        pa.ScorePercentile,
+        pa.TagFocusArea,
+        pa.HasVotingActivity,
+        pa.CommentCountSubquery,
+        pa.AnswerCountSubquery,
+        pa.BadgesAfterPost,
+        pa.MostRecentBadge,
+        ROW_NUMBER() OVER (PARTITION BY pa.OwnerUserId ORDER BY pa.Score DESC) as PostsRankedByScore,
+        RANK() OVER (PARTITION BY pa.PostTypeId ORDER BY pa.Score DESC) as PostsRankedByTypeScore,
+        NTILE(4) OVER (ORDER BY pa.Score) as Quartile,
+        LAG(pa.Score, 1) OVER (PARTITION BY pa.OwnerUserId ORDER BY pa.Score DESC) as PrevScore,
+        LEAD(pa.Score, 1) OVER (PARTITION BY pa.OwnerUserId ORDER BY pa.Score DESC) as NextScore,
+        AVG(pa.Score) OVER (PARTITION BY pa.OwnerUserId) as AvgScorePerUser,
+        SUM(pa.ViewCount) OVER (PARTITION BY pa.OwnerUserId) as TotalViewsPerUser,
+        MAX(pa.Score) OVER (PARTITION BY pa.OwnerUserId) as MaxScorePerUser,
+        MIN(pa.ViewCount) OVER (PARTITION BY pa.OwnerUserId) as MinViewCountPerUser
+    FROM TopUsersByActivity tu
+    INNER JOIN PostsWithComplexTags pa ON tu.UserId = pa.OwnerUserId
+    WHERE tu.TotalPosts > 0
+)
+SELECT 
+    fa.UserId,
+    fa.DisplayName,
+    fa.Reputation,
+    fa.Views,
+    fa.UpVotes,
+    fa.DownVotes,
+    fa.TotalPosts,
+    fa.Questions,
+    fa.Answers,
+    fa.Comments,
+    fa.Badges,
+    fa.LastPostDate,
+    fa.LastCommentDate,
+    fa.AccountAgeDays,
+    fa.ReputationLevel,
+    fa.ReputationRank,
+    fa.ActivityRank,
+    fa.ReputationRank2,
+    fa.PostId,
+    fa.Title,
+    fa.Score,
+    fa.ViewCount,
+    fa.AnswerCount,
+    fa.CommentCount,
+    fa.FavoriteCount,
+    fa.CreationDate,
+    fa.PostTypeId,
+    fa.Tags,
+    fa.ParentId,
+    fa.PostTypeCategory,
+    fa.ViewCategory,
+    fa.VoteCategory,
+    fa.FirstLetter,
+    fa.TagsCleaned,
+    fa.TagLength,
+    fa.DaysSinceCreation,
+    fa.PostStatus,
+    fa.ScoreRankWithinType,
+    fa.ScorePercentile,
+    fa.TagFocusArea,
+    fa.HasVotingActivity,
+    fa.CommentCountSubquery,
+    fa.AnswerCountSubquery,
+    fa.BadgesAfterPost,
+    fa.MostRecentBadge,
+    fa.PostsRankedByScore,
+    fa.PostsRankedByTypeScore,
+    fa.Quartile,
+    fa.PrevScore,
+    fa.NextScore,
+    fa.AvgScorePerUser,
+    fa.TotalViewsPerUser,
+    fa.MaxScorePerUser,
+    fa.MinViewCountPerUser,
+    CASE 
+        WHEN fa.Score > (SELECT AVG(Score) FROM FinalAnalysis) THEN 'Above Avg Score'
+        WHEN fa.Score > (SELECT AVG(Score) FROM FinalAnalysis) * 0.9 THEN 'Near Avg Score'
+        WHEN fa.Score > (SELECT AVG(Score) FROM FinalAnalysis) * 0.8 THEN 'Below Avg Score'
+        ELSE 'Significantly Below Avg'
+    END as ScoreStatus,
+    CASE 
+        WHEN fa.Reputation > 10000 THEN 'Elite Contributor'
+        WHEN fa.Reputation > 5000 THEN 'Veteran Contributor'
+        WHEN fa.Reputation > 1000 THEN 'Active Contributor'
+        ELSE 'Regular Contributor'
+    END as ContributorType,
+    EXTRACT(epoch FROM (CAST('2024-10-01 12:34:56' AS timestamp) - fa.CreationDate))/86400 as DaysSincePost,
+    CASE 
+        WHEN fa.TagFocusArea LIKE '%Programming%' THEN 1
+        WHEN fa.TagFocusArea LIKE '%Database%' THEN 1
+        WHEN fa.TagFocusArea LIKE '%Web%' THEN 1
+        ELSE 0
+    END as TechFocus,
+    COALESCE(
+        (
+            SELECT COUNT(*)
+            FROM Posts p
+            WHERE p.OwnerUserId = fa.UserId AND p.PostTypeId = 1
+        ), 0
+    ) as UserQuestions,
+    COALESCE(
+        (
+            SELECT COUNT(*)
+            FROM Posts p
+            WHERE p.OwnerUserId = fa.UserId AND p.PostTypeId = 2
+        ), 0
+    ) as UserAnswers,
+    (
+        SELECT COUNT(*) 
+        FROM Votes v
+        INNER JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+        WHERE v.PostId = fa.PostId AND vt.Name = 'UpMod'
+    ) as UpvotesForPost,
+    (
+        SELECT COUNT(*) 
+        FROM Votes v
+        INNER JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+        WHERE v.PostId = fa.PostId AND vt.Name = 'DownMod'
+    ) as DownvotesForPost
+FROM FinalAnalysis fa
+WHERE fa.Score > 0 
+    AND fa.ViewCount > 50 
+    AND fa.Answers > 0 
+    AND fa.Comments > 0
+ORDER BY fa.Score DESC, fa.Reputation DESC, fa.Views DESC
+OFFSET 100 ROWS 
+FETCH NEXT 100 ROWS ONLY;

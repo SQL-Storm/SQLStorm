@@ -1,0 +1,192 @@
+-- {"query": "7002.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1828} 
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.AccountId,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COUNT(DISTINCT v.Id) as VoteCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        MAX(b.Date) as LastBadgeDate,
+        ROW_NUMBER() OVER (PARTITION BY u.AccountId ORDER BY u.Reputation DESC) as AccountRank,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Elite'
+            WHEN u.Reputation > 5000 THEN 'Veteran'
+            WHEN u.Reputation > 1000 THEN 'Regular'
+            ELSE 'Newbie'
+        END as RepTier
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    WHERE u.Reputation > 0
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.AccountId
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END as PostType,
+        COALESCE(p.AnswerCount, 0) as AnswerCount,
+        COALESCE(p.CommentCount, 0) as CommentCount,
+        CASE 
+            WHEN p.Score > 100 THEN 'Hot'
+            WHEN p.Score > 50 THEN 'Popular'
+            WHEN p.Score > 10 THEN 'Average'
+            ELSE 'Low'
+        END as Popularity,
+        LAG(p.Score, 1) OVER (ORDER BY p.CreationDate) as PreviousScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) as MovingAvgScore,
+        RANK() OVER (ORDER BY p.Score DESC) as ScoreRank,
+        DENSE_RANK() OVER (ORDER BY p.OwnerUserId, p.CreationDate) as UserPostSequence
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserPostActivity AS (
+    SELECT 
+        ua.UserId,
+        COUNT(*) as TotalPosts,
+        SUM(CASE WHEN pa.Score > 0 THEN 1 ELSE 0 END) as PositivePosts,
+        SUM(CASE WHEN pa.Score < 0 THEN 1 ELSE 0 END) as NegativePosts,
+        AVG(pa.Score) as AvgScore,
+        MAX(pa.CreationDate) as LastActivity,
+        EXTRACT(YEAR FROM pa.CreationDate) as ActivityYear
+    FROM UserStats ua
+    JOIN PostAnalysis pa ON ua.UserId = pa.OwnerUserId
+    WHERE pa.CreationDate >= '2010-01-01'
+    GROUP BY ua.UserId, EXTRACT(YEAR FROM pa.CreationDate)
+),
+DetailedStats AS (
+    SELECT 
+        us.UserId,
+        us.DisplayName,
+        us.RepTier,
+        us.PostCount,
+        us.CommentCount,
+        us.BadgeCount,
+        us.VoteCount,
+        us.LastPostDate,
+        us.AccountRank,
+        COALESCE(upa.TotalPosts, 0) as TotalUserPosts,
+        COALESCE(upa.PositivePosts, 0) as PositiveUserPosts,
+        COALESCE(upa.NegativePosts, 0) as NegativeUserPosts,
+        COALESCE(upa.AvgScore, 0) as AvgUserPostScore,
+        CASE 
+            WHEN us.PostCount > 0 AND us.BadgeCount > 0 THEN (us.BadgeCount * 100.0 / us.PostCount)
+            ELSE 0 
+        END as BadgeEfficiency,
+        CASE 
+            WHEN us.VoteCount > 0 THEN (us.VoteCount * 1.0 / us.PostCount)
+            ELSE 0 
+        END as VotingActivity,
+        CASE 
+            WHEN us.PostCount > 0 THEN (us.CommentCount * 1.0 / us.PostCount)
+            ELSE 0 
+        END as CommentActivity,
+        DENSE_RANK() OVER (ORDER BY us.Reputation DESC) as ReputationRank,
+        DENSE_RANK() OVER (ORDER BY us.PostCount DESC) as PostActivityRank,
+        CASE 
+            WHEN us.PostCount > 100 THEN 'Expert'
+            WHEN us.PostCount > 50 THEN 'Advanced'
+            WHEN us.PostCount > 10 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as ExperienceLevel
+    FROM UserStats us
+    LEFT JOIN UserPostActivity upa ON us.UserId = upa.UserId
+)
+SELECT 
+    ds.UserId,
+    ds.DisplayName,
+    ds.RepTier,
+    ds.ExperienceLevel,
+    ds.ReputationRank,
+    ds.PostActivityRank,
+    ds.PostCount,
+    ds.CommentCount,
+    ds.BadgeCount,
+    ds.VoteCount,
+    ds.TotalUserPosts,
+    ds.PositiveUserPosts,
+    ds.NegativeUserPosts,
+    ds.AvgUserPostScore,
+    ds.BadgeEfficiency,
+    ds.VotingActivity,
+    ds.CommentActivity,
+    ds.LastPostDate,
+    ds.LastBadgeDate,
+    ds.AccountRank,
+    'Score Analysis: ' || 
+    CASE WHEN ds.AvgUserPostScore > 5 THEN 'Highly Engaged ' 
+         WHEN ds.AvgUserPostScore > 2 THEN 'Moderately Engaged ' 
+         ELSE 'Low Engagement ' 
+    END || 
+    CASE WHEN ds.BadgeEfficiency > 20 THEN 'Highly Recognized' 
+         WHEN ds.BadgeEfficiency > 10 THEN 'Moderately Recognized' 
+         ELSE 'Underrecognized'
+    END as UserProfile,
+    CASE 
+        WHEN ds.RepTier = 'Elite' AND ds.PostCount > 1000 THEN 'Top Performer'
+        WHEN ds.RepTier IN ('Veteran', 'Elite') AND ds.BadgeEfficiency > 15 THEN 'Consistent Contributor'
+        WHEN ds.VotingActivity > 1 AND ds.CommentActivity > 0.5 THEN 'Active Community Member'
+        WHEN ds.ScoreRank <= 50 THEN 'High Impact Contributor'
+        ELSE 'Regular User'
+    END as UserCategory,
+    COALESCE((
+        SELECT COUNT(*) 
+        FROM Posts p 
+        JOIN PostHistory ph ON p.Id = ph.PostId 
+        WHERE p.OwnerUserId = ds.UserId 
+        AND ph.PostHistoryTypeId = 10 
+        AND ph.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year'
+    ), 0) as RecentClosings,
+    COALESCE((
+        SELECT STRING_AGG('Post ' || p.Id || ' (' || p.Title || ')', '; ')
+        FROM Posts p
+        WHERE p.OwnerUserId = ds.UserId
+        AND p.Score > 100
+        AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '2 year'
+        ORDER BY p.Score DESC
+        LIMIT 3
+    ), 'No high-scoring posts') as TopPosts,
+    COALESCE((
+        SELECT COUNT(DISTINCT ph.UserId)
+        FROM PostHistory ph
+        JOIN Posts p ON ph.PostId = p.Id
+        WHERE p.OwnerUserId = ds.UserId
+        AND ph.PostHistoryTypeId IN (1, 2, 3)
+        AND ph.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 month'
+    ), 0) as RecentEditors,
+    CASE 
+        WHEN ds.PostCount > 0 AND ds.CommentCount > 0 THEN 
+            ROUND((ds.CommentCount * 1.0 / ds.PostCount), 2)
+        ELSE 0
+    END as CommentToPostRatio
+FROM DetailedStats ds
+WHERE ds.PostCount > 0
+AND ds.ReputationRank <= 1000
+AND ds.LastPostDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '3 years'
+AND (
+    ds.PostCount > 100 
+    OR ds.BadgeCount > 5 
+    OR ds.VoteCount > 100
+)
+ORDER BY ds.ReputationRank ASC, ds.PostCount DESC
+LIMIT 500

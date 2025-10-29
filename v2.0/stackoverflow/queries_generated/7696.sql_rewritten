@@ -1,0 +1,231 @@
+-- {"query": "7696.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2148} 
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.ParentId,
+        p.AcceptedAnswerId,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+        LAG(p.ViewCount) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_views,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as avg_score,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) as post_count,
+        CASE 
+            WHEN p.Score > 100 THEN 'High'
+            WHEN p.Score > 50 THEN 'Medium'
+            ELSE 'Low'
+        END as score_category
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserActivity AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        COUNT(DISTINCT p.Id) as post_count,
+        COUNT(DISTINCT c.Id) as comment_count,
+        COUNT(DISTINCT b.Id) as badge_count,
+        COALESCE(SUM(p.Score), 0) as total_score,
+        COALESCE(AVG(p.Score), 0) as avg_score,
+        MAX(p.CreationDate) as last_post_date
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId OR u.Id = p.LastEditorUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views
+),
+QuestionStats AS (
+    SELECT 
+        q.Id as QuestionId,
+        q.Title,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.CommentCount,
+        q.CreationDate,
+        q.OwnerUserId,
+        q.Tags,
+        CASE 
+            WHEN q.AcceptedAnswerId IS NOT NULL THEN 1
+            ELSE 0
+        END as has_accepted_answer,
+        COALESCE(q.AnswerCount, 0) + COALESCE(q.CommentCount, 0) as total_interactions,
+        DATEDIFF('day', q.CreationDate, cast('2024-10-01 12:34:56' as timestamp)) as age_days,
+        REGEXP_REPLACE(q.Tags, '<[^>]*>', '', 'g') as clean_tags
+    FROM Posts q
+    WHERE q.PostTypeId = 1
+),
+AnswerStats AS (
+    SELECT 
+        a.ParentId,
+        COUNT(*) as answer_count,
+        AVG(a.Score) as avg_answer_score,
+        MAX(a.CreationDate) as latest_answer_date
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+    GROUP BY a.ParentId
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            ELSE 'Rare'
+        END as tag_category,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as rank_by_popularity
+    FROM Tags t
+),
+UserPostHistory AS (
+    SELECT 
+        ph.UserId,
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        ph.Comment,
+        CASE
+            WHEN ph.PostHistoryTypeId IN (1, 4, 6) THEN 'Title/Tag Edit'
+            WHEN ph.PostHistoryTypeId IN (2, 5) THEN 'Body Edit'
+            WHEN ph.PostHistoryTypeId = 10 THEN 'Closed'
+            WHEN ph.PostHistoryTypeId IN (12, 13) THEN 'Deleted/Undeleted'
+            ELSE 'Other'
+        END as edit_category
+    FROM PostHistory ph
+    WHERE ph.UserId IS NOT NULL AND ph.PostId IS NOT NULL
+),
+UserPostSummary AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        COUNT(DISTINCT ph.PostId) as posts_edited,
+        COUNT(*) as edits_count,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (1, 4, 6) THEN ph.PostId END) as title_tag_edits,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (2, 5) THEN ph.PostId END) as body_edits,
+        MIN(ph.CreationDate) as first_edit,
+        MAX(ph.CreationDate) as last_edit,
+        AVG(DATEDIFF('day', ph.CreationDate, cast('2024-10-01 12:34:56' as timestamp))) as avg_days_since_edit,
+        STRING_AGG(DISTINCT ph.edit_category, ', ') as edit_categories
+    FROM Users u
+    LEFT JOIN UserPostHistory ph ON u.Id = ph.UserId
+    GROUP BY u.Id, u.DisplayName
+),
+ComplexAnalysis AS (
+    SELECT 
+        rs.Id as PostId,
+        rs.Title,
+        rs.Score,
+        rs.ViewCount,
+        rs.OwnerUserId,
+        rs.score_category,
+        rs.avg_score,
+        rs.post_count,
+        rs.prev_score,
+        rs.prev_views,
+        uas.DisplayName as OwnerName,
+        uas.Reputation,
+        uas.total_score as user_total_score,
+        uas.avg_score as user_avg_score,
+        qs.has_accepted_answer,
+        qs.total_interactions,
+        qs.age_days,
+        qs.clean_tags,
+        COALESCE(ans.answer_count, 0) as answer_count,
+        COALESCE(ans.avg_answer_score, 0) as avg_answer_score,
+        ta.TagName,
+        ta.tag_category,
+        ta.rank_by_popularity,
+        ups.posts_edited,
+        ups.edits_count,
+        ups.title_tag_edits,
+        ups.body_edits,
+        ups.first_edit,
+        ups.last_edit,
+        ups.avg_days_since_edit,
+        CASE 
+            WHEN rs.avg_score > 100 AND rs.post_count > 10 THEN 'High Performer'
+            WHEN rs.avg_score > 50 AND rs.post_count > 5 THEN 'Medium Performer'
+            ELSE 'Low Performer'
+        END as performance_category,
+        ROW_NUMBER() OVER (ORDER BY rs.Score DESC) as rank_by_score,
+        RANK() OVER (PARTITION BY rs.OwnerUserId ORDER BY rs.CreationDate DESC) as user_post_rank
+    FROM RankedPosts rs
+    JOIN UserActivity uas ON rs.OwnerUserId = uas.UserId
+    LEFT JOIN QuestionStats qs ON rs.Id = qs.QuestionId
+    LEFT JOIN AnswerStats ans ON rs.Id = ans.ParentId
+    LEFT JOIN TagAnalysis ta ON rs.Title LIKE '%' || ta.TagName || '%'
+    LEFT JOIN UserPostSummary ups ON rs.OwnerUserId = ups.UserId
+    WHERE rs.rn <= 10
+)
+SELECT 
+    ca.PostId,
+    ca.Title,
+    ca.Score,
+    ca.ViewCount,
+    ca.OwnerName,
+    ca.Reputation,
+    ca.score_category,
+    ca.performance_category,
+    ca.has_accepted_answer,
+    ca.total_interactions,
+    ca.age_days,
+    ca.clean_tags,
+    ca.answer_count,
+    ca.avg_answer_score,
+    ca.TagName,
+    ca.tag_category,
+    ca.rank_by_popularity,
+    ca.posts_edited,
+    ca.edits_count,
+    ca.title_tag_edits,
+    ca.body_edits,
+    ca.first_edit,
+    ca.last_edit,
+    ca.avg_days_since_edit,
+    CASE 
+        WHEN ca.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'Above Average'
+        WHEN ca.Score < (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'Below Average'
+        ELSE 'Average'
+    END as score_vs_avg,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = ca.OwnerUserId AND p.PostTypeId = 1) as user_question_count,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = ca.OwnerUserId AND p.PostTypeId = 2) as user_answer_count,
+    CASE 
+        WHEN ca.posts_edited > 50 THEN 'Very Active Editor'
+        WHEN ca.posts_edited > 20 THEN 'Active Editor'
+        WHEN ca.posts_edited > 5 THEN 'Moderate Editor'
+        ELSE 'Light Editor'
+    END as editing_frequency,
+    COALESCE(SUBSTRING(ca.clean_tags FROM 1 FOR 100), 'No Tags') as sample_tags,
+    DATEDIFF('day', ca.first_edit, ca.last_edit) as editing_duration_days,
+    CASE 
+        WHEN ca.user_total_score > 10000 THEN 'Super User'
+        WHEN ca.user_total_score > 1000 THEN 'Regular User'
+        ELSE 'New User'
+    END as user_level,
+    ROW_NUMBER() OVER (ORDER BY ca.Score DESC) as overall_rank,
+    RANK() OVER (PARTITION BY ca.OwnerUserId ORDER BY ca.Score DESC) as user_rank,
+    DENSE_RANK() OVER (ORDER BY ca.avg_answer_score DESC) as avg_answer_score_rank,
+    NTILE(4) OVER (ORDER BY ca.Score) as score_quartile,
+    PERCENT_RANK() OVER (ORDER BY ca.Score) as score_percentile,
+    CUME_DIST() OVER (ORDER BY ca.Reputation) as reputation_cume_dist,
+    LAG(ca.Score) OVER (ORDER BY ca.Score DESC) as next_highest_score,
+    LEAD(ca.Score) OVER (ORDER BY ca.Score DESC) as next_lower_score,
+    FIRST_VALUE(ca.Title) OVER (ORDER BY ca.Score DESC) as highest_scoring_title,
+    LAST_VALUE(ca.Title) OVER (ORDER BY ca.Score DESC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) as lowest_scoring_title
+FROM ComplexAnalysis ca
+WHERE ca.PostId IS NOT NULL
+HAVING 
+    ca.score_category IS NOT NULL 
+    AND ca.performance_category IS NOT NULL
+    AND (ca.posts_edited IS NOT NULL OR ca.edits_count IS NOT NULL)
+ORDER BY ca.Score DESC, ca.ViewCount DESC
+LIMIT 1000;

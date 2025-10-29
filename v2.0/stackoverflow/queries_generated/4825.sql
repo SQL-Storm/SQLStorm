@@ -1,0 +1,109 @@
+-- {"query": "4825.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1324} 
+
+WITH RankedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.AnswerCount,
+        ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.CreationDate DESC) AS rn
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1 -- Questions only
+),
+RecentActivity AS (
+    SELECT
+        ph.PostId,
+        MAX(ph.CreationDate) AS LastActivityTimestamp
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 22, 24, 25, 31, 33, 34, 35, 36, 37, 38, 50, 52, 53, 66)
+    GROUP BY ph.PostId
+),
+HighScoringUsers AS (
+    SELECT
+        UserId,
+        COUNT(Id) AS VoteCount
+    FROM Votes
+    WHERE VoteTypeId IN (2, 3) -- UpMod, DownMod
+    GROUP BY UserId
+    HAVING COUNT(Id) > 1000
+),
+AnswerQuality AS (
+    SELECT
+        p.ParentId AS QuestionId,
+        AVG(CAST(p.Score AS DECIMAL(10, 2))) AS AvgAnswerScore,
+        COUNT(p.Id) AS NumberOfAnswers,
+        SUM(CASE WHEN p.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END) AS AcceptedAnswerFlag
+    FROM Posts p
+    JOIN Posts q ON p.ParentId = q.Id
+    WHERE p.PostTypeId = 2 -- Answers only
+    GROUP BY p.ParentId
+),
+TagPerformance AS (
+    SELECT
+        t.TagName,
+        COUNT(DISTINCT p.Id) AS QuestionCount,
+        SUM(p.Score) AS TotalScore,
+        AVG(CAST(p.ViewCount AS DECIMAL(10, 2))) AS AvgViewCount
+    FROM Posts p
+    JOIN Tags t ON ',' + REPLACE(p.Tags, '><', ',') + ',' LIKE '%,' + t.TagName + ',%'
+    WHERE p.PostTypeId = 1 -- Questions only
+    GROUP BY t.TagName
+    HAVING COUNT(DISTINCT p.Id) > 50
+)
+SELECT
+    rp.PostId,
+    rp.Title,
+    rp.OwnerDisplayName,
+    rp.PostCreationDate,
+    rp.Score,
+    rp.AnswerCount,
+    COALESCE(ra.LastActivityTimestamp, rp.PostCreationDate) AS LastRelevantActivity,
+    COALESCE(aq.AvgAnswerScore, 0.0) AS AverageAnswerScore,
+    aq.NumberOfAnswers,
+    CASE WHEN aq.AcceptedAnswerFlag > 0 THEN 'Yes' ELSE 'No' END AS HasAcceptedAnswer,
+    CASE WHEN hsu.UserId IS NOT NULL THEN 'HighScoring' ELSE 'Standard' END AS OwnerReputationCategory,
+    tp.TagName AS TopPerformingTag,
+    tp.TotalScore AS TagTotalScore,
+    tp.AvgViewCount AS TagAvgViews,
+    CASE
+        WHEN rp.Score > 1000 AND rp.AnswerCount > 50 THEN 'Highly Popular'
+        WHEN rp.Score > 100 AND rp.AnswerCount > 10 THEN 'Moderately Popular'
+        ELSE 'Less Popular'
+    END AS PopularityBucket,
+    rp.Score * LOG(COALESCE(aq.NumberOfAnswers, 1) + 1) AS WeightedScore
+FROM RankedPosts rp
+LEFT JOIN RecentActivity ra ON rp.PostId = ra.PostId
+LEFT JOIN HighScoringUsers hsu ON rp.OwnerUserId = hsu.UserId
+LEFT JOIN AnswerQuality aq ON rp.PostId = aq.QuestionId
+LEFT JOIN TagPerformance tp ON ',' + REPLACE(rp.Tags, '><', ',') + ',' LIKE '%,' + tp.TagName + ',%'
+WHERE rp.rn <= 500 -- Consider top 500 ranked posts
+    AND rp.Score >= 0
+    AND rp.PostCreationDate BETWEEN '2020-01-01' AND '2023-12-31'
+    AND (tp.TagName IS NOT NULL OR rp.AnswerCount > 0) -- Ensure some tag data or answers exist
+UNION ALL
+SELECT
+    NULL,
+    'Aggregate Metrics',
+    NULL,
+    NULL,
+    AVG(rp.Score),
+    AVG(CAST(rp.AnswerCount AS DECIMAL(10, 2))),
+    MAX(COALESCE(ra.LastActivityTimestamp, rp.PostCreationDate)),
+    AVG(COALESCE(aq.AvgAnswerScore, 0.0)),
+    AVG(CAST(aq.NumberOfAnswers AS DECIMAL(10, 2))),
+    AVG(CAST(aq.AcceptedAnswerFlag AS DECIMAL(10, 2))),
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL
+FROM RankedPosts rp
+LEFT JOIN RecentActivity ra ON rp.PostId = ra.PostId
+LEFT JOIN AnswerQuality aq ON rp.PostId = aq.QuestionId
+WHERE rp.rn <= 500
+    AND rp.Score >= 0
+    AND rp.PostCreationDate BETWEEN '2020-01-01' AND '2023-12-31';

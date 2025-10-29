@@ -1,0 +1,212 @@
+-- {"query": "1742.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3150} 
+WITH UserEngagementSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COALESCE(u.Location, 'Unknown') AS UserLocation,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsPosted,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersPosted,
+        COUNT(DISTINCT p.Id) AS TotalPostsCreated,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN v_in.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesReceived,
+        SUM(CASE WHEN v_in.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesReceived,
+        SUM(CASE WHEN v_out.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesGiven,
+        SUM(CASE WHEN v_out.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesGiven,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(p.CreationDate) AS LatestPostDate,
+        MIN(p.CreationDate) AS EarliestPostDate
+    FROM Users AS u
+    LEFT JOIN Posts AS p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments AS c ON u.Id = c.UserId
+    LEFT JOIN Votes AS v_in ON u.Id = v_in.UserId AND v_in.VoteTypeId IN (2, 3)
+    LEFT JOIN Badges AS b ON u.Id = b.UserId
+    LEFT JOIN Posts AS p_voted ON v_in.PostId = p_voted.Id -- To link votes *to* posts
+    LEFT JOIN Votes AS v_out ON u.Id = v_out.UserId AND v_out.VoteTypeId IN (2, 3) -- Votes *by* user
+    WHERE u.Reputation > 100
+      AND u.LastAccessDate >= (NOW() - INTERVAL '1 year')
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Location
+),
+PostHistoricalAnalysis AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.LastEditDate,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (10, 101) THEN 1 ELSE 0 END) AS CloseCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (11) THEN 1 ELSE 0 END) AS ReopenCount,
+        MAX(ph.CreationDate) AS LastHistoryDate,
+        STRING_AGG(DISTINCT t.TagName, ', ') FILTER (WHERE t.TagName IS NOT NULL) AS AssociatedTagNames,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL AND p.CommunityOwnedDate IS NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'CommunityWiki'
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+            ELSE 'Open'
+        END AS PostStatusCategory
+    FROM Posts AS p
+    LEFT JOIN PostHistory AS ph ON p.Id = ph.PostId
+    LEFT JOIN LATERAL UNNEST(string_to_array(TRIM(BOTH '<>' FROM p.Tags), '><')) AS tag_name ON TRUE -- For unnesting tags
+    LEFT JOIN Tags AS t ON tag_name = t.TagName
+    WHERE p.PostTypeId IN (1, 2) -- Questions and Answers
+      AND p.CreationDate >= (NOW() - INTERVAL '5 years')
+      AND (p.Score > 0 OR p.ViewCount > 100)
+    GROUP BY
+        p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.OwnerUserId,
+        p.Title, p.Tags, p.CommentCount, p.FavoriteCount, p.ClosedDate, p.LastEditDate
+),
+DetailedPostMetrics AS (
+    SELECT
+        pha.PostId,
+        pha.PostTypeId,
+        pha.PostCreationDate,
+        pha.Score,
+        pha.ViewCount,
+        pha.OwnerUserId,
+        pha.Title,
+        pha.Tags,
+        pha.CommentCount,
+        pha.FavoriteCount,
+        pha.ClosedDate,
+        pha.LastEditDate,
+        pha.EditCount,
+        pha.CloseCount,
+        pha.ReopenCount,
+        pha.LastHistoryDate,
+        pha.AssociatedTagNames,
+        pha.PostStatusCategory,
+        (pha.Score * 0.5 + pha.CommentCount * 0.3 + COALESCE(pha.FavoriteCount, 0) * 0.2) AS EngagementScore,
+        (pha.ViewCount::NUMERIC / NULLIF(pha.Score, 0)) AS ViewsPerScoreRatio,
+        EXTRACT(EPOCH FROM (NOW() - pha.PostCreationDate)) / (60 * 60 * 24 * 365.25) AS AgeInYears, -- Age in years
+        COUNT(DISTINCT pl.RelatedPostId) FILTER (WHERE pl.LinkTypeId = 1) AS LinkedPostsCount,
+        COUNT(DISTINCT pl.RelatedPostId) FILTER (WHERE pl.LinkTypeId = 3) AS DuplicatePostsCount,
+        LAG(pha.Score, 1, 0) OVER (PARTITION BY pha.OwnerUserId ORDER BY pha.PostCreationDate) AS PrevPostScore,
+        RANK() OVER (PARTITION BY pha.PostTypeId ORDER BY pha.Score DESC, pha.ViewCount DESC) AS RankByScoreAndViews,
+        NTH_VALUE(SUBSTRING(pha.Title, 1, 20), 1) OVER (PARTITION BY pha.OwnerUserId ORDER BY pha.Score DESC) AS BestTitleSnippet
+    FROM PostHistoricalAnalysis AS pha
+    LEFT JOIN PostLinks AS pl ON pha.PostId = pl.PostId
+    WHERE (pha.ClosedDate IS NULL OR pha.ReopenCount > 0)
+      AND NOT EXISTS (
+            SELECT 1 FROM PostHistory ph_del
+            WHERE ph_del.PostId = pha.PostId
+              AND ph_del.PostHistoryTypeId = 12
+              AND ph_del.CreationDate > pha.CreationDate
+        ) -- Exclude deleted posts
+    GROUP BY
+        pha.PostId, pha.PostTypeId, pha.PostCreationDate, pha.Score, pha.ViewCount, pha.OwnerUserId,
+        pha.Title, pha.Tags, pha.CommentCount, pha.FavoriteCount, pha.ClosedDate, pha.LastEditDate,
+        pha.EditCount, pha.CloseCount, pha.ReopenCount, pha.LastHistoryDate, pha.AssociatedTagNames,
+        pha.PostStatusCategory
+)
+SELECT
+    ues.UserId,
+    ues.DisplayName,
+    ues.Reputation,
+    ues.UserCreationDate,
+    ues.UserLocation,
+    dpm.PostId,
+    dpm.PostTypeId,
+    dpm.Title,
+    dpm.AssociatedTagNames,
+    dpm.Score AS PostScore,
+    dpm.ViewCount AS PostViewCount,
+    dpm.EngagementScore,
+    dpm.ViewsPerScoreRatio,
+    dpm.AgeInYears,
+    dpm.PostStatusCategory,
+    dpm.EditCount,
+    dpm.CloseCount,
+    dpm.ReopenCount,
+    dpm.LinkedPostsCount,
+    dpm.DuplicatePostsCount,
+    dpm.PrevPostScore,
+    dpm.RankByScoreAndViews,
+    dpm.BestTitleSnippet,
+    ues.TotalQuestionsPosted,
+    ues.TotalAnswersPosted,
+    ues.TotalPostsCreated,
+    ues.TotalCommentsMade,
+    ues.UpvotesReceived,
+    ues.DownvotesReceived,
+    (ues.UpvotesReceived - ues.DownvotesReceived) AS NetVotesReceived,
+    COALESCE(ues.GoldBadges, 0) AS GoldBadges,
+    COALESCE(ues.SilverBadges, 0) AS SilverBadges,
+    COALESCE(ues.BronzeBadges, 0) AS BronzeBadges,
+    (SELECT AVG(ph_avg.Score) FROM PostHistoricalAnalysis ph_avg WHERE ph_avg.OwnerUserId = ues.UserId) AS AvgUserPostScore,
+    CASE
+        WHEN ues.TotalQuestionsPosted > ues.TotalAnswersPosted * 2 AND ues.TotalAnswersPosted > 0 THEN 'Questioner'
+        WHEN ues.TotalAnswersPosted > ues.TotalQuestionsPosted * 2 AND ues.TotalQuestionsPosted > 0 THEN 'Answerer'
+        WHEN ues.TotalPostsCreated > 0 THEN 'Contributor'
+        ELSE 'Lurker'
+    END AS UserRoleHeuristic,
+    EXTRACT(DAY FROM (NOW() - ues.LastAccessDate)) AS DaysSinceLastAccess,
+    NULLIF(UPPER(SUBSTRING(TRIM(LEADING '<' FROM SPLIT_PART(dpm.Tags, '>', 1)), 1, 15)), '') AS PrimaryTagUpperPrefix
+FROM UserEngagementSummary AS ues
+INNER JOIN DetailedPostMetrics AS dpm ON ues.UserId = dpm.OwnerUserId
+WHERE ues.TotalPostsCreated > 5
+  AND dpm.EngagementScore > 5
+  AND (dpm.PostTypeId = 1 AND dpm.ClosedDate IS NULL AND dpm.AgeInYears < 3 AND dpm.Tags LIKE '%<sql>%') -- Active SQL questions
+  OR (dpm.PostTypeId = 2 AND dpm.Score > 10 AND dpm.PostCreationDate > (NOW() - INTERVAL '2 year') AND dpm.Tags LIKE '%<performance>%') -- High-scoring recent performance answers
+UNION ALL
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    u.LastAccessDate,
+    COALESCE(u.Location, 'Unknown') AS UserLocation,
+    NULL AS PostId,
+    NULL AS PostTypeId,
+    NULL AS Title,
+    NULL AS AssociatedTagNames,
+    NULL AS PostScore,
+    NULL AS PostViewCount,
+    NULL AS EngagementScore,
+    NULL AS ViewsPerScoreRatio,
+    EXTRACT(EPOCH FROM (NOW() - u.CreationDate)) / (60 * 60 * 24 * 365.25) AS AgeInYears,
+    'OrphanedActivity' AS PostStatusCategory,
+    NULL AS EditCount,
+    NULL AS CloseCount,
+    NULL AS ReopenCount,
+    NULL AS LinkedPostsCount,
+    NULL AS DuplicatePostsCount,
+    NULL AS PrevPostScore,
+    NULL AS RankByScoreAndViews,
+    NULL AS BestTitleSnippet,
+    0 AS TotalQuestionsPosted,
+    0 AS TotalAnswersPosted,
+    0 AS TotalPostsCreated,
+    COUNT(c.Id) AS TotalCommentsMade,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesReceived,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesReceived,
+    (SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) - SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END)) AS NetVotesReceived,
+    COALESCE(SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END), 0) AS GoldBadges,
+    COALESCE(SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END), 0) AS SilverBadges,
+    COALESCE(SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END), 0) AS BronzeBadges,
+    NULL AS AvgUserPostScore,
+    'SilentContributor' AS UserRoleHeuristic,
+    EXTRACT(DAY FROM (NOW() - u.LastAccessDate)) AS DaysSinceLastAccess,
+    NULL AS PrimaryTagUpperPrefix
+FROM Users AS u
+LEFT JOIN Comments AS c ON u.Id = c.UserId
+LEFT JOIN Votes AS v ON u.Id = v.UserId
+LEFT JOIN Badges AS b ON u.Id = b.UserId
+WHERE u.Id NOT IN (SELECT DISTINCT OwnerUserId FROM Posts WHERE OwnerUserId IS NOT NULL)
+  AND u.Reputation > 500
+  AND u.LastAccessDate >= (NOW() - INTERVAL '6 months')
+  AND LENGTH(COALESCE(u.AboutMe, '')) > 50
+GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Location
+HAVING COUNT(c.Id) > 10 OR SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) > 50
+ORDER BY Reputation DESC, DaysSinceLastAccess ASC NULLS LAST;

@@ -1,0 +1,57 @@
+SELECT 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    MAX(u.CreationDate) AS LatestAccountActivity,
+    MAX(p.LastActivityDate) AS LatestPostActivity,
+    AVG(p.Score) AS AvgPostScore,
+    MAX(ph.CreationDate) AS LastEdit,
+    -- Top ten duplicate question titles concatenated (standard SQL string aggregation)
+    (SELECT STRING_AGG(t.Title, ', ' ORDER BY t.Title)
+     FROM (
+         SELECT DISTINCT p2inner.Title
+         FROM PostLinks plinner
+         JOIN Posts pinner ON pinner.OwnerUserId = u.Id
+         JOIN Posts p2inner ON plinner.RelatedPostId = p2inner.Id AND p2inner.PostTypeId = 1
+         WHERE plinner.PostId = pinner.Id AND plinner.LinkTypeId = 3
+         ORDER BY p2inner.Title
+         LIMIT 10
+     ) t
+    ) AS TopTenDuplicateQuestions,
+    (
+        SELECT COUNT(*) 
+        FROM Badges b 
+        WHERE b.UserId = u.Id AND b.Class = 1
+    ) AS GoldBadgeCount,
+    (
+        SELECT COUNT(DISTINCT p3.Id) 
+        FROM Posts p3 
+        INNER JOIN Votes v ON v.PostId = p3.Id AND v.VoteTypeId = 2 
+        WHERE p3.OwnerUserId = u.Id 
+          AND v.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1' YEAR)
+    ) AS UpvotesReceivedLastYear
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON p.OwnerUserId = u.Id
+LEFT JOIN 
+    PostLinks pl ON pl.PostId = p.Id AND pl.LinkTypeId = 3
+LEFT JOIN 
+    Posts p2 ON pl.RelatedPostId = p2.Id AND p2.PostTypeId = 1
+LEFT JOIN 
+    PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 5
+WHERE 
+    u.Reputation > 10000
+GROUP BY 
+    u.Id,
+    u.DisplayName,
+    u.Reputation
+HAVING 
+    AVG(p.Score) > 10
+ORDER BY 
+    u.Reputation DESC, 
+    TotalPosts DESC
+LIMIT 100;

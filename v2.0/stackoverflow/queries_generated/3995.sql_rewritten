@@ -1,0 +1,107 @@
+-- {"query": "3995.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2403} 
+WITH UserStats AS (
+    SELECT u.Id                          AS UserId,
+           u.DisplayName,
+           u.Reputation,
+           COUNT(p.Id)                    AS TotalPosts,
+           SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+           SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+           AVG(p.Score)                   AS AvgPostScore,
+           MAX(p.CreationDate)            AS LastPostDate
+    FROM   Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+BadgeStats AS (
+    SELECT b.UserId,
+           COUNT(*)                                    AS TotalBadges,
+           SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+           SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+           SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM   Badges b
+    GROUP BY b.UserId
+),
+TagUsage AS (
+    SELECT p.OwnerUserId                              AS UserId,
+           UNNEST(string_to_array(TRIM(BOTH '<>' FROM p.Tags), '><')) AS Tag,
+           COUNT(*)                                   AS TagCount
+    FROM   Posts p
+    WHERE  p.Tags IS NOT NULL
+    GROUP BY p.OwnerUserId, Tag
+),
+TopTags AS (
+    SELECT tu.UserId,
+           STRING_AGG(tu.Tag || ':' || tu.TagCount, ', '
+                     ORDER BY tu.TagCount DESC)      AS TopTagsList
+    FROM (
+        SELECT *,
+               ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY TagCount DESC) AS rn
+        FROM   TagUsage
+    ) tu
+    WHERE  tu.rn <= 5
+    GROUP BY tu.UserId
+),
+RecentActivity AS (
+    SELECT u.Id                                        AS UserId,
+           MAX(COALESCE(p.LastActivityDate, p.CreationDate)) AS RecentActivityDate,
+           COUNT(DISTINCT c.Id)                      AS RecentCommentCount
+    FROM   Users u
+    LEFT JOIN Posts    p ON p.OwnerUserId = u.Id
+                         AND p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+    LEFT JOIN Comments c ON c.UserId = u.Id
+                         AND c.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+    GROUP BY u.Id
+),
+UserRanking AS (
+    SELECT us.UserId,
+           us.Reputation,
+           ROW_NUMBER() OVER (ORDER BY us.Reputation DESC) AS RepRank,
+           PERCENT_RANK() OVER (ORDER BY us.Reputation)   AS RepPercentile
+    FROM   UserStats us
+)
+SELECT us.UserId,
+       us.DisplayName,
+       us.Reputation,
+       us.TotalPosts,
+       us.QuestionCount,
+       us.AnswerCount,
+       ROUND(us.AvgPostScore::numeric, 2)            AS AvgScore,
+       COALESCE(bs.TotalBadges, 0)                  AS TotalBadges,
+       COALESCE(bs.GoldBadges, 0)                   AS GoldBadges,
+       COALESCE(bs.SilverBadges, 0)                 AS SilverBadges,
+       COALESCE(bs.BronzeBadges, 0)                 AS BronzeBadges,
+       COALESCE(tt.TopTagsList, '')                 AS TopTags,
+       ur.RepRank,
+       ROUND(ur.RepPercentile * 100, 2)             AS RepPercentile,
+       ra.RecentActivityDate,
+       ra.RecentCommentCount,
+       CASE
+           WHEN us.Reputation > (SELECT AVG(Reputation) FROM Users) THEN 'Above Avg'
+           WHEN us.Reputation = (SELECT AVG(Reputation) FROM Users) THEN 'Average'
+           ELSE 'Below Avg'
+       END                                          AS ReputationTier,
+       (SELECT COUNT(*) FROM Posts p2
+        WHERE p2.OwnerUserId = us.UserId AND p2.Score < 0) AS NegativeScorePosts,
+       (SELECT COUNT(*) FROM Votes v
+        WHERE v.UserId = us.UserId AND v.VoteTypeId = 2)   AS UpVotesGiven,
+       (SELECT COUNT(*) FROM Votes v
+        WHERE v.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = us.UserId)
+          AND v.VoteTypeId = 2)                           AS UpVotesReceived,
+       (SELECT STRING_AGG(DISTINCT t.TagName, ', ')
+        FROM   Tags t
+        JOIN   PostLinks pl ON pl.RelatedPostId = t.WikiPostId
+        WHERE  pl.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = us.UserId)
+       )                                                  AS AllUserTags
+FROM   UserStats      us
+LEFT JOIN BadgeStats    bs ON bs.UserId = us.UserId
+LEFT JOIN TopTags       tt ON tt.UserId = us.UserId
+LEFT JOIN RecentActivity ra ON ra.UserId = us.UserId
+LEFT JOIN UserRanking   ur ON ur.UserId = us.UserId
+WHERE  us.Reputation IS NOT NULL
+ORDER BY us.Reputation DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL
+WHERE FALSE;

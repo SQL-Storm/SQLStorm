@@ -1,0 +1,231 @@
+-- {"query": "2625.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2104} 
+with RecursiveTagHierarchy as (
+    select t.Id, t.TagName, 0 as Level, t.IsModeratorOnly, t.IsRequired
+    from Tags t
+    where t.IsRequired = 1
+    union all
+    select tg.Id, tg.TagName, rh.Level + 1, tg.IsModeratorOnly, tg.IsRequired
+    from Tags tg
+    inner join RecursiveTagHierarchy rh on rh.Id = tg.Id and tg.IsModeratorOnly = 0
+),
+UserActivity as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) as PostsCount,
+        sum(case when p.PostTypeId = 1 then 1 else 0 end) as QuestionsCount,
+        sum(case when p.PostTypeId = 2 then 1 else 0 end) as AnswersCount,
+        coalesce(sum(vtUp.VotesCount), 0) as UpVotesReceived,
+        coalesce(sum(vtDown.VotesCount), 0) as DownVotesReceived,
+        max(p.CreationDate) as LastPostDate,
+        row_number() over (order by count(distinct p.Id) desc) as ActivityRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join (
+        select PostId, count(*) as VotesCount
+        from Votes
+        where VoteTypeId = 2 -- UpMod
+        group by PostId
+    ) vtUp on vtUp.PostId = p.Id
+    left join (
+        select PostId, count(*) as VotesCount
+        from Votes
+        where VoteTypeId = 3 -- DownMod
+        group by PostId
+    ) vtDown on vtDown.PostId = p.Id
+    group by u.Id, u.DisplayName
+),
+PostWithCommentsAndVotes as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.AcceptedAnswerId,
+        coalesce(c.CommentsCount,0) as CommentsCount,
+        coalesce(v.UpVotes,0) as UpVotes,
+        coalesce(v.DownVotes,0) as DownVotes,
+        case when p.PostTypeId = 1 then p.AnswerCount else null end as AnswerCount,
+        case when p.PostTypeId = 1 and p.ClosedDate is not null then 1 else 0 end as IsClosed
+    from Posts p
+    left join (
+        select PostId, count(*) as CommentsCount
+        from Comments
+        group by PostId
+    ) c on c.PostId = p.Id
+    left join (
+        select 
+            PostId,
+            sum(case when VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+            sum(case when VoteTypeId = 3 then 1 else 0 end) as DownVotes
+        from Votes
+        group by PostId
+    ) v on v.PostId = p.Id
+),
+AcceptedAnswers as (
+    select
+        pa.Id as AnswerId,
+        pa.ParentId as QuestionId,
+        pa.Score as AnswerScore,
+        pa.OwnerUserId as AnswerOwnerId,
+        pa.CreationDate as AnswerCreationDate
+    from Posts pa
+    where pa.PostTypeId = 2
+),
+QuestionAnswerStats as (
+    select
+        q.Id as QuestionId,
+        count(distinct a.Id) as TotalAnswers,
+        avg(a.Score) as AvgAnswerScore,
+        max(a.Score) as MaxAnswerScore,
+        min(a.Score) as MinAnswerScore,
+        max(a.AnswerCreationDate) as LatestAnswerDate
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+    group by q.Id
+),
+TopBadgesPerUser as (
+    select distinct on (b.UserId)
+        b.UserId,
+        b.Name as TopBadgeName,
+        b.Class as TopBadgeClass,
+        b.Date as BadgeAwardDate
+    from Badges b
+    order by b.UserId, b.Class -- Gold(1) first then Silver(2) ...
+),
+UserRankings as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct b.Id) as BadgeCount,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        row_number() over (order by u.Reputation desc, count(distinct b.Id) desc) as ReputationRank
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+),
+DuplicateLinks as (
+    select pl.PostId as DuplicatePostId, pl.RelatedPostId as OriginalPostId, pl.CreationDate
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId and lt.Name = 'Duplicate'
+),
+RecentPostEdits as (
+    select
+        ph.PostId,
+        ph.UserId,
+        ph.CreationDate as EditDate,
+        pt.Name as EditType
+    from PostHistory ph
+    join PostHistoryTypes pt on pt.Id = ph.PostHistoryTypeId
+    where ph.CreationDate > now() - interval '30 days'
+),
+PostScoreRanks as (
+    select
+        p.Id,
+        p.Score,
+        rank() over (partition by p.PostTypeId order by p.Score desc) as ScoreRank
+    from Posts p
+    where p.PostTypeId in (1,2)
+),
+QuestionsWithComplexTagCount as (
+    select
+        p.Id as QuestionId,
+        p.Tags,
+        array_length(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><'),1) as TagCount,
+        p.Score,
+        qas.TotalAnswers,
+        qas.AvgAnswerScore,
+        (p.ViewCount::float / nullif(p.Score + 1, 0)) as ViewToScoreRatio
+    from Posts p
+    left join QuestionAnswerStats qas on qas.QuestionId = p.Id
+    where p.PostTypeId = 1
+    and array_length(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><'),1) > 3
+),
+HighActivityUsersWithBadgeFilter as (
+    select
+        ua.UserId,
+        ua.DisplayName,
+        ua.PostsCount,
+        ua.QuestionsCount,
+        ua.AnswersCount,
+        ur.GoldBadges,
+        ur.SilverBadges,
+        ur.BronzeBadges,
+        ur.ReputationRank
+    from UserActivity ua
+    join UserRankings ur on ur.UserId = ua.UserId
+    where ua.PostsCount > 100
+    and (ur.GoldBadges > 0 or ur.SilverBadges > 5)
+),
+AnswerPerformance as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.Score,
+        a.CreationDate,
+        u.DisplayName as Answerer,
+        (a.Score::float / nullif(extract(day from now() - a.CreationDate),0)) as ScorePerDay,
+        dense_rank() over(partition by a.ParentId order by a.Score desc) as AnswerScoreRank
+    from Posts a
+    left join Users u on u.Id = a.OwnerUserId
+    where a.PostTypeId = 2
+),
+QuestionWithAcceptedAnswerScore AS (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.Score as QuestionScore,
+        aa.AnswerScore as AcceptedAnswerScore,
+        (q.Score - coalesce(aa.AnswerScore,0)) as ScoreDifference
+    from Posts q
+    left join AcceptedAnswers aa on aa.QuestionId = q.Id
+    where q.PostTypeId = 1
+)
+select 
+    u.DisplayName,
+    u.Reputation,
+    u.GoldBadges,
+    u.SilverBadges,
+    u.BronzeBadges,
+    ua.PostsCount,
+    ua.QuestionsCount,
+    ua.AnswersCount,
+    q.Title as SampleHighTagQuestion,
+    q.TagCount,
+    q.Score as QuestionScore,
+    q.TotalAnswers,
+    q.AvgAnswerScore,
+    q.ViewToScoreRatio,
+    aa.AnswerScore as AcceptedAnswerScore,
+    rpe.EditDate as RecentEditDate,
+    dl.OriginalPostId as DuplicatedOriginalPostId,
+    ap.AnswerScoreRank,
+    ap.ScorePerDay,
+    psr.ScoreRank as QuestionScoreRank,
+    CASE 
+      WHEN q.IsClosed = 1 THEN 'Closed' 
+      WHEN q.IsClosed = 0 AND q.Score > 5 THEN 'HighScoreOpen'
+      ELSE 'Other'
+    END as QuestionStatusCategory
+from HighActivityUsersWithBadgeFilter u
+left join UserActivity ua on ua.UserId = u.UserId
+left join QuestionsWithComplexTagCount q on q.QuestionId in (
+    select Id from Posts where OwnerUserId = u.UserId and PostTypeId = 1 order by Score desc limit 1
+)
+left join QuestionWithAcceptedAnswerScore aa on aa.QuestionId = q.QuestionId
+left join RecentPostEdits rpe on rpe.UserId = u.UserId
+left join DuplicateLinks dl on dl.DuplicatePostId = q.QuestionId
+left join AnswerPerformance ap on ap.AnswerId = aa.AcceptedAnswerScore
+left join PostScoreRanks psr on psr.Id = q.QuestionId
+where u.PostsCount > 500
+order by u.Reputation desc, ua.PostsCount desc
+limit 100;

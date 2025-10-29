@@ -1,0 +1,257 @@
+WITH UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.UpVotes AS UserTotalUpVotesGiven,
+        u.DownVotes AS UserTotalDownVotesGiven,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END), 0) AS QuestionsAuthored,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END), 0) AS AnswersAuthored,
+        COALESCE(COUNT(DISTINCT p.Id), 0) AS TotalPostsAuthored,
+        COALESCE(COUNT(DISTINCT c.Id), 0) AS TotalCommentsMade,
+        COALESCE(COUNT(DISTINCT b.Id), 0) AS TotalBadgesEarned
+    FROM
+        Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.UpVotes, u.DownVotes
+),
+PostHistoryAggregates AS (
+    SELECT
+        ph.PostId,
+        COUNT(ph.Id) AS TotalHistoryEvents,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditRevisionCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN 1 ELSE 0 END) AS StatusChangeCount,
+        COUNT(DISTINCT ph.UserId) AS UniqueHistoryContributors,
+        MAX(ph.CreationDate) AS LatestHistoryDate,
+        MIN(ph.CreationDate) AS EarliestHistoryDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Comment ELSE NULL END) AS LastCloseReasonId
+    FROM
+        PostHistory ph
+    GROUP BY
+        ph.PostId
+),
+DetailedPostMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount AS PostCommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.CommunityOwnedDate,
+        COALESCE(p.Tags, 'N/A') AS TagsString,
+        COALESCE(SUM(c.Score), 0) AS TotalLinkedCommentScore,
+        COUNT(DISTINCT pl.RelatedPostId) AS LinkedPostsCount,
+        CASE
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN TRUE
+            ELSE FALSE
+        END AS HasAcceptedAnswer,
+        COALESCE(EXTRACT(EPOCH FROM (p.LastActivityDate - p.LastEditDate)) / 3600, 0) AS HoursSinceLastEditToLastActivity
+    FROM
+        Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId AND pl.LinkTypeId = 1
+    GROUP BY
+        p.Id, p.PostTypeId, p.OwnerUserId, p.Title, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.ClosedDate, p.CommunityOwnedDate, p.Tags, p.LastActivityDate, p.LastEditDate
+),
+TagPerformance AS (
+    SELECT
+        dp.OwnerUserId,
+        LOWER(TRIM(tag)) AS TagName,
+        COUNT(dp.PostId) AS PostsWithTag,
+        SUM(dp.Score) AS TagTotalScore,
+        SUM(dp.ViewCount) AS TagTotalViews
+    FROM
+        DetailedPostMetrics dp,
+        LATERAL (
+            SELECT UNNEST(string_to_array(SUBSTRING(dp.TagsString FROM 2 FOR CHAR_LENGTH(dp.TagsString) - 2), '><')) AS tag
+        ) t
+    WHERE
+        dp.TagsString != 'N/A' AND dp.PostTypeId = 1
+    GROUP BY
+        dp.OwnerUserId, LOWER(TRIM(tag))
+),
+RankedTagPerformance AS (
+    SELECT
+        tp.OwnerUserId AS UserId,
+        tp.TagName,
+        tp.PostsWithTag,
+        tp.TagTotalScore,
+        ROW_NUMBER() OVER (PARTITION BY tp.OwnerUserId ORDER BY tp.TagTotalScore DESC, tp.PostsWithTag DESC) AS TagRank
+    FROM
+        TagPerformance tp
+),
+FinalUserPostAnalysis AS (
+    SELECT
+        ue.UserId,
+        ue.DisplayName,
+        ue.Reputation,
+        ue.UserCreationDate,
+        ue.QuestionsAuthored,
+        ue.AnswersAuthored,
+        ue.TotalPostsAuthored,
+        ue.TotalCommentsMade,
+        ue.TotalBadgesEarned,
+        dp.PostId,
+        dp.PostTypeId,
+        dp.Title AS PostTitle,
+        dp.PostCreationDate,
+        dp.Score AS PostScore,
+        dp.ViewCount AS PostViewCount,
+        dp.AnswerCount AS PostAnswerCount,
+        dp.PostCommentCount,
+        dp.FavoriteCount AS PostFavoriteCount,
+        dpa.TotalHistoryEvents,
+        dpa.EditRevisionCount,
+        dpa.StatusChangeCount,
+        dpa.UniqueHistoryContributors,
+        dpa.LatestHistoryDate,
+        dp.HasAcceptedAnswer,
+        dp.HoursSinceLastEditToLastActivity,
+        rtp.TagName AS TopContributingTag,
+        rtp.TagTotalScore,
+        (CAST(SUM(dp.Score * dp.ViewCount) OVER (PARTITION BY ue.UserId) AS DECIMAL) /
+         NULLIF(SUM(dp.ViewCount) OVER (PARTITION BY ue.UserId), 0)) AS UserWeightedAvgPostScore,
+        ROW_NUMBER() OVER (PARTITION BY ue.UserId, dp.PostTypeId ORDER BY dp.Score DESC, dp.ViewCount DESC) AS PostRankByTypeForUser,
+        (SELECT COUNT(b.Id) FROM Badges b WHERE b.UserId = ue.UserId AND b.Class = 1 AND b.Name IN ('Gold Badge', 'Legendary', 'Fanatic')) AS InfluentialGoldBadgesCount,
+        EXISTS (
+            SELECT 1
+            FROM PostLinks pl_sub
+            INNER JOIN Posts p_sub ON pl_sub.RelatedPostId = p_sub.Id
+            WHERE pl_sub.PostId = dp.PostId
+              AND pl_sub.LinkTypeId = 3
+              AND p_sub.Score > 200
+              AND p_sub.ViewCount > 5000
+        ) AS HasHighlyScoredDuplicate,
+        (CAST(ue.QuestionsAuthored + ue.AnswersAuthored + ue.TotalCommentsMade AS DECIMAL) /
+         NULLIF(
+            (SELECT COUNT(p_all.Id) FROM Posts p_all) + (SELECT COUNT(c_all.Id) FROM Comments c_all),
+            0
+         )
+        ) AS UserGlobalParticipationRatio,
+        (CASE
+            WHEN EXISTS (SELECT 1 FROM Posts p_body WHERE p_body.Id = dp.PostId AND p_body.Body LIKE '%<pre><code>%') THEN 'Contains Code'
+            WHEN dp.HasAcceptedAnswer THEN 'Has Accepted Answer'
+            WHEN dp.Title ILIKE '%error%' OR dp.Title ILIKE '%bug%' THEN 'Problematic Title'
+            ELSE 'General'
+        END) AS PostContentCategory,
+        COALESCE(
+            (EXTRACT(EPOCH FROM (ue.LastAccessDate - dpa.LatestHistoryDate)) / 3600),
+            -1
+        ) AS HoursSincePostHistoryToUserAccess,
+        (dp.CommunityOwnedDate IS NOT NULL AND dp.ClosedDate IS NOT NULL) AS WasCommunityOwnedAndClosed,
+        dpa.EditRevisionCount AS EditRevisionCount_for_output
+    FROM
+        UserEngagement ue
+    INNER JOIN DetailedPostMetrics dp ON ue.UserId = dp.OwnerUserId
+    LEFT JOIN PostHistoryAggregates dpa ON dp.PostId = dpa.PostId
+    LEFT JOIN RankedTagPerformance rtp ON ue.UserId = rtp.UserId AND rtp.TagRank = 1
+    WHERE
+        ue.Reputation > 10000
+        AND ue.TotalPostsAuthored > 50
+        AND dp.PostCreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '3 years')
+        AND dp.Score > 100
+        AND COALESCE(dpa.EditRevisionCount, 0) >= 5
+        AND (dp.PostTypeId = 1 OR dp.PostTypeId = 2)
+)
+SELECT
+    fupa.UserId,
+    fupa.DisplayName,
+    fupa.Reputation,
+    fupa.UserWeightedAvgPostScore,
+    fupa.QuestionsAuthored,
+    fupa.AnswersAuthored,
+    fupa.TotalBadgesEarned,
+    fupa.PostId,
+    fupa.PostTitle,
+    fupa.PostScore,
+    fupa.PostViewCount,
+    fupa.PostRankByTypeForUser,
+    fupa.TopContributingTag,
+    fupa.TagTotalScore,
+    fupa.InfluentialGoldBadgesCount,
+    fupa.HasHighlyScoredDuplicate,
+    fupa.UserGlobalParticipationRatio,
+    fupa.PostContentCategory,
+    fupa.HoursSincePostHistoryToUserAccess,
+    fupa.WasCommunityOwnedAndClosed,
+    (fupa.Reputation / 1000.0) + (fupa.UserWeightedAvgPostScore * 0.5) + (fupa.TotalBadgesEarned * 10) + (fupa.EditRevisionCount_for_output * 2) AS FinalEngagementScore,
+    NULL::text AS RecordType,
+    NULL::bigint AS RelatedUserId,
+    NULL::bigint AS RelatedPostId,
+    NULL::text AS RelatedPostTitle,
+    NULL::integer AS RelatedPostScore
+FROM
+    FinalUserPostAnalysis fupa
+
+UNION ALL
+
+SELECT
+    NULL::bigint AS UserId,
+    NULL::text AS DisplayName,
+    NULL::integer AS Reputation,
+    NULL::numeric AS UserWeightedAvgPostScore,
+    NULL::integer AS QuestionsAuthored,
+    NULL::integer AS AnswersAuthored,
+    NULL::integer AS TotalBadgesEarned,
+    NULL::bigint AS PostId,
+    NULL::text AS PostTitle,
+    NULL::integer AS PostScore,
+    NULL::bigint AS PostViewCount,
+    NULL::bigint AS PostRankByTypeForUser,
+    NULL::text AS TopContributingTag,
+    NULL::numeric AS TagTotalScore,
+    NULL::integer AS InfluentialGoldBadgesCount,
+    NULL::boolean AS HasHighlyScoredDuplicate,
+    NULL::numeric AS UserGlobalParticipationRatio,
+    NULL::text AS PostContentCategory,
+    NULL::numeric AS HoursSincePostHistoryToUserAccess,
+    NULL::boolean AS WasCommunityOwnedAndClosed,
+    NULL::numeric AS FinalEngagementScore,
+    sub.RecordType,
+    sub.UserId AS RelatedUserId,
+    sub.RelatedPostId,
+    sub.RelatedPostTitle,
+    sub.RelatedPostScore
+FROM (
+    SELECT
+        'Top 5 Question' AS RecordType,
+        fupa_q.UserId,
+        fupa_q.PostId AS RelatedPostId,
+        fupa_q.PostTitle AS RelatedPostTitle,
+        fupa_q.PostScore AS RelatedPostScore,
+        fupa_q.PostRankByTypeForUser
+    FROM
+        FinalUserPostAnalysis fupa_q
+    WHERE
+        fupa_q.PostTypeId = 1 AND fupa_q.PostRankByTypeForUser <= 5
+        AND fupa_q.WasCommunityOwnedAndClosed = FALSE
+    UNION ALL
+    SELECT
+        'Top 5 Answer' AS RecordType,
+        fupa_a.UserId,
+        fupa_a.PostId AS RelatedPostId,
+        fupa_a.PostTitle AS RelatedPostTitle,
+        fupa_a.PostScore AS RelatedPostScore,
+        fupa_a.PostRankByTypeForUser
+    FROM
+        FinalUserPostAnalysis fupa_a
+    WHERE
+        fupa_a.PostTypeId = 2 AND fupa_a.PostRankByTypeForUser <= 5
+        AND fupa_a.HasAcceptedAnswer = TRUE
+) sub
+ORDER BY
+    FinalEngagementScore DESC NULLS LAST,
+    Reputation DESC NULLS LAST,
+    PostScore DESC NULLS LAST
+LIMIT 500;

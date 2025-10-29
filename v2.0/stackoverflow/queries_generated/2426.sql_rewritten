@@ -1,0 +1,109 @@
+-- {"query": "2426.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1265} 
+with RecursiveUserHierarchy as (
+    select u.Id, u.DisplayName, u.Reputation, u.CreationDate, 1 as Level
+    from Users u
+    where u.Reputation > 20000
+    union all
+    select u2.Id, u2.DisplayName, u2.Reputation, u2.CreationDate, ruh.Level + 1
+    from Users u2
+    join RecursiveUserHierarchy ruh on ruh.Id = u2.Id - 1 -- simulate hierarchy with adjacent IDs for benchmarking
+    where u2.Reputation > 20000 and ruh.Level < 5
+),
+TopQuestions as (
+    select p.Id, p.OwnerUserId, p.Title, p.CreationDate, p.Score, p.Tags,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.CreationDate desc) as rn
+    from Posts p 
+    where p.PostTypeId = 1 and p.Score > 10 and p.CreationDate >= cast('2024-10-01' as date) - interval '2 years'
+),
+QuestionBadges as (
+    select b.UserId, Count(*) as BadgeCount,
+           sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+           sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+           sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges
+    from Badges b
+    join TopQuestions tq on b.UserId = tq.OwnerUserId
+    where b.Date >= cast('2024-10-01' as date) - interval '2 years'
+    group by b.UserId
+),
+CommentsStats as (
+    select c.PostId, count(*) as CommentCount,
+           sum(case when c.UserId is null then 1 else 0 end) as AnonymousComments,
+           avg(length(c.Text)) as AvgCommentLength
+    from Comments c
+    group by c.PostId
+),
+AcceptedAnswersWithVotes as (
+    select a.Id, a.ParentId as QuestionId, a.Score as AnswerScore,
+        coalesce(v.UpVotesCount, 0) as UpVotes, coalesce(v.DownVotesCount, 0) as DownVotes,
+        u.DisplayName as AnswerOwnerName
+    from Posts a
+    left join (
+        select v.PostId,
+            sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotesCount,
+            sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotesCount
+        from Votes v
+        join VoteTypes vt on v.VoteTypeId = vt.Id
+        group by v.PostId
+    ) v on a.Id = v.PostId
+    left join Users u on a.OwnerUserId = u.Id
+    where a.PostTypeId = 2
+),
+DuplicateQuestions as (
+    select pl.PostId as DuplicateId, pl.RelatedPostId as OriginalQuestionId
+    from PostLinks pl
+    join LinkTypes lt on pl.LinkTypeId = lt.Id
+    where lt.Name = 'Duplicate'
+),
+QuestionsWithHistory as (
+    select ph.PostId, max(ph.CreationDate) as LastEditDate,
+        count(distinct ph.PostHistoryTypeId) as HistoryEventsCount,
+        bool_or(ph.PostHistoryTypeId in (10, 11)) as WasClosedOrReopened
+    from PostHistory ph
+    group by ph.PostId
+),
+UserActivityRank as (
+    select u.Id, u.DisplayName, 
+        rank() over (order by coalesce(qc.QuestionsCount, 0) desc, coalesce(ab.BadgeCount, 0) desc) as ActivityRank
+    from Users u
+    left join (
+        select OwnerUserId, count(*) as QuestionsCount
+        from Posts
+        where PostTypeId = 1 and CreationDate >= cast('2024-10-01' as date) - interval '1 year'
+        group by OwnerUserId
+    ) qc on u.Id = qc.OwnerUserId
+    left join (
+        select UserId, count(*) as BadgeCount
+        from Badges
+        where Date >= cast('2024-10-01' as date) - interval '1 year'
+        group by UserId
+    ) ab on u.Id = ab.UserId
+),
+BenchmarkSet as (
+    select tq.Id as QuestionId, tq.OwnerUserId, tq.Title, tq.Score, tq.Tags, 
+        ab.BadgeCount, ab.GoldBadges, ab.SilverBadges, ab.BronzeBadges, 
+        cs.CommentCount, cs.AnonymousComments, cs.AvgCommentLength,
+        aav.Id as AcceptedAnswerId, aav.AnswerScore, aav.UpVotes, aav.DownVotes, aav.AnswerOwnerName,
+        qwh.LastEditDate, qwh.HistoryEventsCount, qwh.WasClosedOrReopened,
+        dup.OriginalQuestionId,
+        uar.ActivityRank
+    from TopQuestions tq
+    left join QuestionBadges ab on tq.OwnerUserId = ab.UserId
+    left join CommentsStats cs on tq.Id = cs.PostId
+    left join AcceptedAnswersWithVotes aav on tq.AcceptedAnswerId = aav.Id
+    left join QuestionsWithHistory qwh on tq.Id = qwh.PostId
+    left join DuplicateQuestions dup on tq.Id = dup.DuplicateId
+    left join UserActivityRank uar on tq.OwnerUserId = uar.Id
+    where tq.rn = 1
+)
+select *
+from BenchmarkSet bs
+where 
+    (bs.Score + coalesce(bs.BadgeCount,0)*2) * (coalesce(bs.CommentCount,0) + 1) > 50
+    and (bs.WasClosedOrReopened is false or bs.WasClosedOrReopened is null)
+    and (
+        (bs.Tags is not null and bs.Tags like '%<sql>%') 
+        or bs.ActivityRank <= 100 
+        or bs.GoldBadges >= 3
+    )
+order by bs.ActivityRank asc nulls last, bs.Score desc
+limit 100;

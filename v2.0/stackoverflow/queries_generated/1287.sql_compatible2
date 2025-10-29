@@ -1,0 +1,207 @@
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.Views,
+        U.UpVotes,
+        U.DownVotes,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        COALESCE(U.Location, 'Global_Unknown') AS UserLocation,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsOwned,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersOwned,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        MAX(P.Score) AS MaxPostScoreOwned,
+        AVG(P.Score) AS AveragePostScoreOwned,
+        DATE_PART('day', TIMESTAMP '2024-10-01 12:34:56' - MAX(U.LastAccessDate)) AS DaysSinceLastUserActivity,
+        CAST(COALESCE(U.UpVotes, 0) AS DECIMAL) / NULLIF(COALESCE(U.DownVotes, 0) + COALESCE(U.UpVotes, 0) + 1, 0) AS UpDownVoteRatio,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15) THEN PH.CreationDate ELSE NULL END) AS LastUserModerationActionDate
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN PostHistory PH ON U.Id = PH.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.Views, U.UpVotes, U.DownVotes, U.CreationDate, U.LastAccessDate, U.Location
+    HAVING COUNT(DISTINCT P.Id) > 5 AND U.Reputation > 500
+),
+PostEngagementMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount AS PostCommentCount,
+        COALESCE(P.FavoriteCount, 0) AS PostFavoriteCount,
+        P.CreationDate AS PostCreationDate,
+        P.LastActivityDate AS PostLastActivityDate,
+        P.ClosedDate,
+        P.CommunityOwnedDate,
+        P.OwnerUserId,
+        NULLIF(SUBSTRING(P.Tags FROM 2 FOR (POSITION('>' IN P.Tags) - 2)), '') AS PrimaryTag,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived,
+        SUM(CASE WHEN V.VoteTypeId = 1 THEN 1 ELSE 0 END) AS AcceptedVotes,
+        COALESCE(P.Title, 'No Title Provided for Post ' || P.Id) AS PostTitleClean,
+        (SELECT COUNT(DISTINCT C.UserId) FROM Comments C WHERE C.PostId = P.Id) AS UniqueCommenters,
+        (SELECT AVG(C.Score) FROM Comments C WHERE C.PostId = P.Id) AS AverageCommentScore
+    FROM Posts P
+    LEFT JOIN Votes V ON P.Id = V.PostId AND V.VoteTypeId IN (1, 2, 3)
+    WHERE P.PostTypeId = 1
+    GROUP BY P.Id, P.PostTypeId, P.Score, P.ViewCount, P.AnswerCount, P.CommentCount, P.FavoriteCount, P.CreationDate, P.LastActivityDate, P.ClosedDate, P.CommunityOwnedDate, P.OwnerUserId, P.Tags, P.Title
+),
+PostHistoryDetails AS (
+    SELECT
+        PH.PostId,
+        COUNT(DISTINCT PH.Id) AS TotalHistoryEvents,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseVoteEventCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenVoteEventCount,
+        MAX(CASE WHEN EXISTS (
+            SELECT 1
+            FROM PostHistory PH_INNER
+            WHERE PH_INNER.PostId = PH.PostId
+              AND PH_INNER.PostHistoryTypeId IN (35, 36)
+        ) THEN 'Migrated' ELSE 'Not Migrated' END) AS MigrationStatus,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 AND PH.Comment IN ('101', '102', '103', '104', '105') THEN PH.Comment ELSE NULL END) AS LatestCloseReasonCode
+    FROM PostHistory PH
+    GROUP BY PH.PostId
+),
+LinkedPostInfluence AS (
+    SELECT
+        PL.PostId,
+        COUNT(DISTINCT PL.RelatedPostId) AS TotalLinkedPosts,
+        SUM(CASE WHEN PL.LinkTypeId = 3 THEN 1 ELSE 0 END) AS TotalDuplicateLinks,
+        COUNT(PL.PostId) OVER (PARTITION BY PL.PostId ORDER BY PL.CreationDate ROWS BETWEEN 90 PRECEDING AND CURRENT ROW) AS LinkedPostsRecentWindow,
+        PL.CreationDate
+    FROM PostLinks PL
+    WHERE PL.LinkTypeId IN (1, 3)
+    GROUP BY PL.PostId, PL.CreationDate
+)
+SELECT
+    PEM.PostId,
+    PEM.PostTitleClean AS PostTitle,
+    'Question' AS PostType,
+    UAS.DisplayName AS OwnerDisplayName,
+    UAS.Reputation AS OwnerReputation,
+    UAS.UserLocation AS OwnerLocation,
+    PEM.PostScore,
+    PEM.ViewCount,
+    PEM.AnswerCount,
+    PEM.PostCommentCount,
+    PEM.PostFavoriteCount,
+    PEM.PrimaryTag,
+    PEM.UpVotesReceived,
+    PEM.DownVotesReceived,
+    PEM.AcceptedVotes,
+    PHD.TotalHistoryEvents,
+    PHD.EditCount,
+    PHD.CloseVoteEventCount,
+    PHD.ReopenVoteEventCount,
+    PHD.MigrationStatus,
+    PHD.LatestCloseReasonCode,
+    LPI.TotalLinkedPosts,
+    LPI.TotalDuplicateLinks,
+    LPI.LinkedPostsRecentWindow,
+    COALESCE(UAS.UpDownVoteRatio, 0.0) * (PEM.UpVotesReceived - PEM.DownVotesReceived) AS InfluenceScore,
+    (SELECT MAX(V_bounty.BountyAmount) FROM Votes V_bounty WHERE V_bounty.PostId = PEM.PostId AND V_bounty.VoteTypeId = 8) AS MaxBountyAmount,
+    RANK() OVER (PARTITION BY PEM.PrimaryTag ORDER BY PEM.PostScore DESC, PEM.ViewCount DESC) AS RankWithinTagByScore,
+    AVG(PEM.ViewCount) OVER (PARTITION BY UAS.UserId ORDER BY PEM.PostCreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS AvgViewCountByUser,
+    LAG(PEM.PostScore, 1, 0) OVER (PARTITION BY UAS.UserId ORDER BY PEM.PostCreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS PreviousPostScoreByOwner,
+    LEAD(PEM.PostScore, 1, 0) OVER (PARTITION BY UAS.UserId ORDER BY PEM.PostCreationDate ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) AS NextPostScoreByOwner,
+    CASE
+        WHEN PEM.ClosedDate IS NOT NULL AND PEM.CommunityOwnedDate IS NULL AND COALESCE(PHD.ReopenVoteEventCount,0) = 0 THEN 'Closed & Unreopened'
+        WHEN PEM.ClosedDate IS NOT NULL AND PEM.CommunityOwnedDate IS NOT NULL THEN 'Closed & Community Owned'
+        WHEN PEM.ClosedDate IS NULL AND PEM.AnswerCount = 0 AND PEM.PostCommentCount = 0 THEN 'Open & Unanswered/Uncommented'
+        WHEN PEM.AcceptedVotes > 0 THEN 'Accepted Answer Present'
+        ELSE 'Active/Other'
+    END AS PostStatusCategory,
+    (PEM.PostTitleClean LIKE '%SQL%' OR LOWER(PEM.PrimaryTag) LIKE '%database%') AS IsDatabaseRelated,
+    DATE_PART('day', TIMESTAMP '2024-10-01 12:34:56' - PEM.PostCreationDate) AS DaysSinceCreation,
+    DATE_PART('day', TIMESTAMP '2024-10-01 12:34:56' - COALESCE(PEM.PostLastActivityDate, PEM.PostCreationDate)) AS DaysSinceLastActivityActual,
+    COALESCE(PEM.AverageCommentScore, 0.0) AS AverageCommentScore,
+    COALESCE(PEM.UniqueCommenters, 0) AS UniqueCommentersCount
+FROM PostEngagementMetrics PEM
+LEFT JOIN UserActivitySummary UAS ON PEM.OwnerUserId = UAS.UserId
+LEFT JOIN PostHistoryDetails PHD ON PEM.PostId = PHD.PostId
+LEFT JOIN LinkedPostInfluence LPI ON PEM.PostId = LPI.PostId
+WHERE
+    PEM.PostTypeId = 1
+    AND (
+        (UAS.Reputation > 10000 AND PEM.ViewCount > 50000 AND PEM.AnswerCount > 5)
+        OR
+        (PEM.PrimaryTag IS NOT NULL AND LOWER(PEM.PrimaryTag) IN ('python', 'java', 'javascript', 'c#', 'performance', 'sql') AND PEM.PostScore > 100)
+        OR
+        (COALESCE(PHD.CloseVoteEventCount,0) > 0 AND COALESCE(PHD.ReopenVoteEventCount,0) > 0 AND PEM.PostScore < 0 AND PEM.PostLastActivityDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year')
+    )
+    AND COALESCE(UAS.DaysSinceLastUserActivity, 999999) < 365
+    AND PEM.PostLastActivityDate IS NOT NULL
+    AND COALESCE(PEM.AverageCommentScore, 0) > -2
+    AND (PEM.PostTitleClean LIKE '%benchmark%' OR PEM.PostTitleClean LIKE '%optimize%' OR PEM.PostTitleClean LIKE '%latency%')
+UNION ALL
+SELECT
+    P.Id AS PostId,
+    COALESCE(P.Title, 'Answer to Post ' || P.ParentId) AS PostTitle,
+    'Answer' AS PostType,
+    U.DisplayName AS OwnerDisplayName,
+    U.Reputation AS OwnerReputation,
+    COALESCE(U.Location, 'Answer_Unknown_Region') AS OwnerLocation,
+    P.Score AS PostScore,
+    NULL AS ViewCount,
+    NULL AS AnswerCount,
+    P.CommentCount AS PostCommentCount,
+    COALESCE(P.FavoriteCount, 0) AS PostFavoriteCount,
+    NULL AS PrimaryTag,
+    SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+    SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived,
+    SUM(CASE WHEN V.VoteTypeId = 1 THEN 1 ELSE 0 END) AS AcceptedVotes,
+    COUNT(DISTINCT PH.Id) AS TotalHistoryEvents,
+    SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditCount,
+    SUM(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseVoteEventCount,
+    SUM(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenVoteEventCount,
+    MAX(CASE WHEN EXISTS (
+            SELECT 1
+            FROM PostHistory PH_INNER
+            WHERE PH_INNER.PostId = P.Id
+              AND PH_INNER.PostHistoryTypeId IN (35, 36)
+        ) THEN 'Migrated' ELSE 'Not Migrated' END) AS MigrationStatus,
+    NULL AS LatestCloseReasonCode,
+    COUNT(DISTINCT PL.RelatedPostId) AS TotalLinkedPosts,
+    SUM(CASE WHEN PL.LinkTypeId = 3 THEN 1 ELSE 0 END) AS TotalDuplicateLinks,
+    COUNT(PL.PostId) OVER (PARTITION BY PL.PostId ORDER BY PL.CreationDate ROWS BETWEEN 90 PRECEDING AND CURRENT ROW) AS LinkedPostsRecentWindow,
+    CAST(COALESCE(U.UpVotes, 0) AS DECIMAL) / NULLIF(COALESCE(U.DownVotes, 0) + COALESCE(U.UpVotes, 0) + 1, 0) * P.Score AS AnswererInfluenceScore,
+    (SELECT MAX(V_bounty.BountyAmount) FROM Votes V_bounty WHERE V_bounty.PostId = P.ParentId AND V_bounty.VoteTypeId = 8) AS MaxBountyAmountOnQuestion,
+    RANK() OVER (PARTITION BY P.ParentId ORDER BY P.Score DESC, P.CreationDate ASC) AS RankWithinQuestionByScore,
+    AVG(P.Score) OVER (PARTITION BY U.Id ORDER BY P.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS AvgScoreByUser,
+    LAG(P.Score, 1, 0) OVER (PARTITION BY U.Id ORDER BY P.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS PreviousAnswerScoreByOwner,
+    LEAD(P.Score, 1, 0) OVER (PARTITION BY U.Id ORDER BY P.CreationDate ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) AS NextAnswerScoreByOwner,
+    CASE
+        WHEN P.Score > 50 AND U.Reputation > 10000 THEN 'Highly Rated Answer by Expert'
+        WHEN EXISTS (SELECT 1 FROM Posts WHERE AcceptedAnswerId = P.Id) THEN 'Accepted Answer'
+        WHEN P.CreationDate < TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '3 year' AND P.Score < 0 THEN 'Old Low-Score Answer'
+        ELSE 'Other Answer'
+    END AS PostStatusCategory,
+    (P.Body LIKE '%index%' OR P.Body LIKE '%query plan%' OR P.Body LIKE '%cache%' OR P.Body LIKE '%concurrency%') AS IsDatabaseRelated,
+    DATE_PART('day', TIMESTAMP '2024-10-01 12:34:56' - P.CreationDate) AS DaysSinceCreation,
+    DATE_PART('day', TIMESTAMP '2024-10-01 12:34:56' - COALESCE(P.LastActivityDate, P.CreationDate)) AS DaysSinceLastActivityActual,
+    (SELECT AVG(C_INNER.Score) FROM Comments C_INNER WHERE C_INNER.PostId = P.Id) AS AverageCommentScore,
+    (SELECT COUNT(DISTINCT C_INNER.UserId) FROM Comments C_INNER WHERE C_INNER.PostId = P.Id) AS UniqueCommentersCount
+FROM Posts P
+LEFT JOIN Users U ON P.OwnerUserId = U.Id
+LEFT JOIN Votes V ON P.Id = V.PostId AND V.VoteTypeId IN (1, 2, 3)
+LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+LEFT JOIN PostLinks PL ON P.Id = PL.PostId
+WHERE P.PostTypeId = 2
+  AND P.ParentId IS NOT NULL
+  AND U.Reputation > 200
+  AND P.Score >= 5
+  AND (
+    LOWER(P.Body) LIKE '%performance%' OR LOWER(P.Body) LIKE '%optimization%' OR LOWER(P.Body) LIKE '%bottleneck%'
+  )
+GROUP BY P.Id, P.Title, U.DisplayName, U.Reputation, U.Location, P.Score, P.ViewCount, P.CommentCount, P.FavoriteCount,
+    U.UpVotes, U.DownVotes, P.ParentId, P.CreationDate, P.LastActivityDate, P.Body, PL.PostId, PL.CreationDate
+ORDER BY PostScore DESC, DaysSinceCreation ASC
+LIMIT 1000;

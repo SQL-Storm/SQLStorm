@@ -1,0 +1,167 @@
+-- {"query": "2883.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1825} 
+with RecursiveTagAggregates as (
+    select
+        t.Id as TagId,
+        t.TagName,
+        count(p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        sum(coalesce(p.Score,0)) as TotalPostScore,
+        max(p.CreationDate) as LatestPostDate
+    from Tags t
+    left join Posts p on 
+        p.Tags is not null and
+        position(('<' || t.TagName || '>') in p.Tags) > 0
+    group by t.Id, t.TagName
+), UserBadgeRanks as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+), UserReputationStats as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        u.Views,
+        coalesce(ubGold.BadgeCount,0) as GoldBadges,
+        coalesce(ubSilver.BadgeCount,0) as SilverBadges,
+        coalesce(ubBronze.BadgeCount,0) as BronzeBadges,
+        dense_rank() over (order by u.Reputation desc) as ReputationRank,
+        row_number() over (partition by u.Location order by u.Reputation desc nulls last) as LocationRepRank
+    from Users u
+    left join UserBadgeRanks ubGold on ubGold.UserId = u.Id and ubGold.Class = 1
+    left join UserBadgeRanks ubSilver on ubSilver.UserId = u.Id and ubSilver.Class = 2
+    left join UserBadgeRanks ubBronze on ubBronze.UserId = u.Id and ubBronze.Class = 3
+), PostsWithAnswers as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionCreation,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.OwnerUserId as AnswerOwner,
+        a.CreationDate as AnswerCreation,
+        u.DisplayName as AnswererName,
+        exists (
+            select 1 from Votes v where v.PostId = q.Id and v.VoteTypeId = 5
+        ) as HasFavorites,
+        case 
+            when q.ClosedDate is null then 0
+            else 1
+        end as IsClosed
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Users u on u.Id = a.OwnerUserId
+    where q.PostTypeId = 1
+), ClosedQuestionsWithReasons as (
+    select
+        ph.PostId,
+        string_agg(distinct crt.Name, ', ') as CloseReasons
+    from PostHistory ph
+    left join CloseReasonTypes crt on crt.Id::text = ph.Comment
+    where ph.PostHistoryTypeId = 10 and ph.PostId is not null
+    group by ph.PostId
+), VoteCountsPerPost as (
+    select
+        p.Id as PostId,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+        sum(case when v.VoteTypeId = 6 then 1 else 0 end) as CloseVotes
+    from Posts p
+    left join Votes v on v.PostId = p.Id
+    group by p.Id
+), UserLastActivity as (
+    select
+        u.Id,
+        u.DisplayName,
+        max(ph.CreationDate) as LastPostEdit,
+        max(coalesce(c.CreationDate, ph.CreationDate)) as LastActivity,
+        count(distinct ph.PostId) as EditedPostsCount,
+        count(distinct c.Id) as CommentCount
+    from Users u
+    left join PostHistory ph on ph.UserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    group by u.Id, u.DisplayName
+), QuestionAndDuplicates as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        duplicated.RelatedPostId as DuplicateOf,
+        duplicateOfQ.Title as DuplicateOfTitle
+    from Posts q
+    left join PostLinks duplicated on duplicated.PostId = q.Id and duplicated.LinkTypeId = 3
+    left join Posts duplicateOfQ on duplicateOfQ.Id = duplicated.RelatedPostId
+    where q.PostTypeId = 1
+)
+select 
+    qa.QuestionId,
+    qa.Title,
+    qa.CreationDate,
+    qa.Score,
+    qa.ViewCount,
+    cqr.CloseReasons,
+    vc.UpVotes,
+    vc.DownVotes,
+    vc.CloseVotes,
+    case when qa.DuplicateOf is not null then 1 else 0 end as IsDuplicate,
+    qa.DuplicateOfTitle,
+    r.DisplayName as QuestionOwner,
+    r.Reputation,
+    r.GoldBadges,
+    r.SilverBadges,
+    r.BronzeBadges,
+    r.Location,
+    r.Views,
+    r.ReputationRank,
+    r.LocationRepRank,
+    fav.FavoriteCount,
+    coalesce(uactivity.LastActivity, r.LastAccessDate) as LastUserActivity,
+    count(distinct c.Id) as CommentCount,
+    max(ph.CreationDate) as LastEditDate,
+    count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+    avg(a.Score) filter (where a.PostTypeId = 2) as AvgAnswerScore,
+    sum(case when a.Score >= 10 then 1 else 0 end) filter (where a.PostTypeId = 2) as HighScoreAnswers,
+    max(a.Score) filter (where a.PostTypeId = 2) as MaxAnswerScore,
+    string_agg(distinct t.TagName, ', ') as Tags,
+    -- Window Function: Running sum of question scores by creation date
+    sum(qa.Score) over (order by qa.CreationDate rows between unbounded preceding and current row) as RunningTotalScore,
+    -- Complicated expression: Weighted score considering answer count and favorites
+    (qa.Score * 1.5 + count(distinct p.Id) filter (where p.PostTypeId = 2) * 2 + coalesce(fav.FavoriteCount, 0) * 3) as WeightedPopularityScore,
+    -- String manipulation: Title length and truncated title
+    length(qa.Title) as TitleLength,
+    substring(qa.Title from 1 for 50) || case when length(qa.Title) > 50 then '...' else '' end as ShortTitle
+from Posts qa
+inner join Users r on r.Id = qa.OwnerUserId
+left join Posts a on a.ParentId = qa.Id and a.PostTypeId = 2
+left join Comments c on c.PostId = qa.Id
+left join PostHistory ph on ph.PostId = qa.Id
+left join Votes v on v.PostId = qa.Id
+left join VoteCountsPerPost vc on vc.PostId = qa.Id
+left join ClosedQuestionsWithReasons cqr on cqr.PostId = qa.Id
+left join UserReputationStats urs on urs.Id = r.Id
+left join UserLastActivity uactivity on uactivity.Id = r.Id
+left join (
+    select PostId, count(*) as FavoriteCount
+    from Votes where VoteTypeId = 5
+    group by PostId
+) fav on fav.PostId = qa.Id
+left join Tags t on qa.Tags is not null and position(('<' || t.TagName || '>') in qa.Tags) > 0
+left join Posts p on p.ParentId = qa.Id and p.PostTypeId = 2
+where qa.PostTypeId = 1
+group by
+    qa.Id, qa.Title, qa.CreationDate, qa.Score, qa.ViewCount, cqr.CloseReasons, 
+    vc.UpVotes, vc.DownVotes, vc.CloseVotes, qa.DuplicateOf, qa.DuplicateOfTitle, r.DisplayName,
+    r.Reputation, r.Views, r.Location, r.GoldBadges, r.SilverBadges, r.BronzeBadges,
+    r.ReputationRank, r.LocationRepRank, fav.FavoriteCount, uactivity.LastActivity, r.LastAccessDate
+order by WeightedPopularityScore desc NULLS LAST
+limit 100;

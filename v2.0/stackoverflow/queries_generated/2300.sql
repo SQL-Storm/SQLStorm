@@ -1,0 +1,161 @@
+-- {"query": "2300.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1411} 
+with RecursiveBadgeCTE as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class,
+        b.TagBased,
+        row_number() over (partition by u.Id order by b.Class asc, b.Date desc) as rn
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    where u.Reputation > 1000
+),
+RankedPosts as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc) as user_post_rank,
+        count(*) over (partition by p.OwnerUserId) as total_posts_by_user
+    from Posts p
+    where p.PostTypeId in (1, 2) -- Questions or Answers
+),
+FilteredPostHistory as (
+    select
+        ph.Id,
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.UserId,
+        ph.CreationDate,
+        ph.Comment,
+        crt.Name as HistoryTypeName,
+        crt.Id as CloseReasonId,
+        coalesce(nullif(ph.Comment, ''), NULL) as CleanComment
+    from PostHistory ph
+    left join PostHistoryTypes crt on ph.PostHistoryTypeId = crt.Id
+    left join CloseReasonTypes crt on ph.Comment::int = crt.Id and ph.PostHistoryTypeId = 10
+    where ph.CreationDate >= current_date - interval '1 year'
+),
+UserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(p.Id) as NumPosts,
+        count(distinct ph.Id) filter (where ph.PostHistoryTypeId in (10,11)) as CloseReopenActions,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as TotalUpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as TotalDownVotes,
+        max(p.Score) as MaxPostScore,
+        min(p.CreationDate) as FirstPostDate,
+        max(p.CreationDate) as LastPostDate
+    from Users u
+    left join Posts p on u.Id = p.OwnerUserId
+    left join PostHistory ph on p.Id = ph.PostId and ph.PostHistoryTypeId in (10,11)
+    left join Votes v on p.Id = v.PostId
+    group by u.Id, u.DisplayName
+),
+FilteredComments as (
+    select
+        c.Id,
+        c.PostId,
+        c.UserId,
+        c.CreationDate,
+        c.Score,
+        c.Text,
+        c.UserDisplayName,
+        row_number() over (partition by c.PostId order by c.Score desc nulls last, c.CreationDate desc) as rn
+    from Comments c
+    where c.CreationDate > current_date - interval '6 months'
+),
+TopComments as (
+    select *
+    from FilteredComments
+    where rn <= 3
+),
+UserTagUsage as (
+    select
+        u.Id as UserId,
+        unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags) - 2), '><')) as Tag
+    from Users u
+    join Posts p on u.Id = p.OwnerUserId
+    where p.PostTypeId = 1 -- Questions only
+),
+TagPopularity as (
+    select
+        Tag,
+        count(*) as TagUseCount
+    from UserTagUsage
+    group by Tag
+),
+DuplicateLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId
+    from PostLinks pl
+    where pl.LinkTypeId = 3 -- Duplicate links
+),
+QuestionsWithDuplicates as (
+    select
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        count(distinct dl.RelatedPostId) as DuplicateCount
+    from Posts p
+    left join DuplicateLinks dl on p.Id = dl.PostId
+    where p.PostTypeId = 1
+    group by p.Id, p.Title, p.OwnerUserId
+),
+-- Correlated subquery to find if user has answered their own questions and the average score difference
+UserSelfAnswerStats as (
+    select
+        q.OwnerUserId as UserId,
+        count(a.Id) as NumSelfAnswers,
+        avg(a.Score - q.Score) as AvgScoreDiffAnswerQuestion
+    from Posts q
+    join Posts a on q.Id = a.ParentId and a.OwnerUserId = q.OwnerUserId and a.PostTypeId = 2
+    where q.PostTypeId = 1
+    group by q.OwnerUserId
+)
+select
+    ua.UserId,
+    ua.DisplayName,
+    ua.NumPosts,
+    ua.CloseReopenActions,
+    ua.TotalUpVotes,
+    ua.TotalDownVotes,
+    ua.MaxPostScore,
+    ua.FirstPostDate,
+    ua.LastPostDate,
+    coalesce(rbc.BadgeName, 'No Badge') as TopBadgeName,
+    coalesce(rbc.Class, 4) as TopBadgeClass,
+    coalesce(rbc.TagBased, 0) as TopBadgeTagBased,
+    coalesce(ut.NumSelfAnswers, 0) as NumSelfAnswers,
+    coalesce(ut.AvgScoreDiffAnswerQuestion, 0) as AvgScoreDiffAnswerQuestion,
+    qd.DuplicateCount,
+    (select string_agg(distinct t.TagName, ', ') 
+        from Tags t 
+        join UserTagUsage utu on t.TagName = utu.Tag 
+        where utu.UserId = ua.UserId
+        order by TagPopularity.TagUseCount desc nulls last
+        limit 5
+    ) as TopTagsUsed,
+    (select string_agg(tc.Text, ' ||| ') 
+        from TopComments tc 
+        join Posts p2 on tc.PostId = p2.Id 
+        where p2.OwnerUserId = ua.UserId
+        order by tc.Score desc nulls last, tc.CreationDate desc
+        limit 3
+    ) as TopCommentsOnUserPosts
+from UserActivity ua
+left join RecursiveBadgeCTE rbc on ua.UserId = rbc.UserId and rbc.rn = 1
+left join UserSelfAnswerStats ut on ua.UserId = ut.UserId
+left join QuestionsWithDuplicates qd on ua.UserId = qd.OwnerUserId
+where ua.NumPosts > 10
+order by ua.TotalUpVotes desc nulls last, ua.NumPosts desc
+limit 100;

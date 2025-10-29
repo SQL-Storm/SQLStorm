@@ -1,0 +1,153 @@
+WITH
+    UserPosts AS (
+        SELECT
+            u.Id                              AS UserId,
+            COUNT(p.Id)                       AS TotalPosts,
+            SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+            SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+            MAX(p.CreationDate)               AS LastPostDate
+        FROM Users u
+        LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+        GROUP BY u.Id
+    ),
+
+    UserBadges AS (
+        SELECT
+            b.UserId,
+            COUNT(*)                                 AS BadgeCount,
+            SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+            SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+            SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+
+    TagUsage AS (
+        SELECT
+            p.OwnerUserId                              AS UserId,
+            unnest(string_to_array(substring(p.Tags,2,length(p.Tags)-2), '><')) AS Tag,
+            COUNT(*)                                   AS TagUseCount
+        FROM Posts p
+        WHERE p.Tags IS NOT NULL AND p.PostTypeId = 1
+        GROUP BY p.OwnerUserId, unnest(string_to_array(substring(p.Tags,2,length(p.Tags)-2), '><'))
+    ),
+
+    TopUserTags AS (
+        SELECT
+            tu.UserId,
+            string_agg(tu.Tag, ', ') AS TopTags
+        FROM (
+            SELECT
+                t.UserId,
+                t.Tag,
+                ROW_NUMBER() OVER (PARTITION BY t.UserId ORDER BY t.TagUseCount DESC) AS rn
+            FROM TagUsage t
+        ) tu
+        WHERE tu.rn <= 3
+        GROUP BY tu.UserId
+    ),
+
+    RecentActivity AS (
+        SELECT
+            u.Id                                          AS UserId,
+            GREATEST(
+                COALESCE(MAX(p.CreationDate),      TIMESTAMP '1970-01-01'),
+                COALESCE(MAX(c.CreationDate),      TIMESTAMP '1970-01-01'),
+                COALESCE(MAX(v.CreationDate),      TIMESTAMP '1970-01-01')
+            )                                            AS LastActivity
+        FROM Users u
+        LEFT JOIN Posts    p ON p.OwnerUserId = u.Id
+        LEFT JOIN Comments c ON c.UserId      = u.Id
+        LEFT JOIN Votes    v ON v.UserId      = u.Id
+        GROUP BY u.Id
+    ),
+
+    ScoreStats AS (
+        SELECT
+            p.OwnerUserId  AS UserId,
+            SUM(p.Score)   AS TotalScore,
+            AVG(p.Score)   AS AvgScore,
+            MAX(p.Score)   AS MaxScore,
+            MIN(p.Score)   AS MinScore
+        FROM Posts p
+        WHERE p.Score IS NOT NULL
+        GROUP BY p.OwnerUserId
+    ),
+
+    TopRankedUsers AS (
+        SELECT
+            u.Id AS UserId,
+            ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS rn
+        FROM Users u
+    )
+
+SELECT
+    u.Id,
+    COALESCE(u.DisplayName, 'Anonymous')            AS DisplayName,
+    u.Reputation,
+    COALESCE(up.TotalPosts,     0)                 AS TotalPosts,
+    COALESCE(up.QuestionCount, 0)                 AS QuestionCount,
+    COALESCE(up.AnswerCount,   0)                 AS AnswerCount,
+    COALESCE(ss.TotalScore,    0)                 AS TotalScore,
+    COALESCE(ss.AvgScore,      0)                 AS AvgScore,
+    COALESCE(ub.GoldBadges,    0)                 AS GoldBadges,
+    COALESCE(ub.SilverBadges,  0)                 AS SilverBadges,
+    COALESCE(ub.BronzeBadges,  0)                 AS BronzeBadges,
+    COALESCE(tu.TopTags,       '')                AS TopTags,
+    ra.LastActivity,
+    CASE
+        WHEN u.Reputation > 20000 THEN 'Legendary'
+        WHEN u.Reputation > 10000 THEN 'Expert'
+        WHEN u.Reputation > 5000  THEN 'Seasoned'
+        ELSE 'Novice'
+    END                                            AS ReputationLevel,
+    CASE
+        WHEN up.LastPostDate IS NULL THEN NULL
+        ELSE DATE_PART('day', CAST('2024-10-01 12:34:56' AS TIMESTAMP) - up.LastPostDate)
+    END                                            AS DaysSinceLastPost,
+    (SELECT COUNT(*) FROM Posts p2
+        WHERE p2.OwnerUserId = u.Id
+          AND p2.PostTypeId = 2
+          AND p2.Score > 0)                        AS PositiveAnswers,
+    (SELECT COUNT(*) FROM Votes v2
+        WHERE v2.UserId = u.Id
+          AND v2.VoteTypeId = 2)                    AS UpVotesGiven,
+    (SELECT COUNT(*) FROM Votes v3
+        WHERE v3.UserId = u.Id
+          AND v3.VoteTypeId = 3)                    AS DownVotesGiven
+FROM Users u
+LEFT JOIN UserPosts    up ON up.UserId = u.Id
+LEFT JOIN UserBadges   ub ON ub.UserId = u.Id
+LEFT JOIN ScoreStats   ss ON ss.UserId = u.Id
+LEFT JOIN TopUserTags  tu ON tu.UserId = u.Id
+LEFT JOIN RecentActivity ra ON ra.UserId = u.Id
+WHERE u.Id IN (
+    SELECT UserId FROM TopRankedUsers WHERE rn <= 1000
+)
+
+UNION ALL
+
+SELECT
+    CAST(NULL AS INTEGER)                          AS Id,
+    'TOTAL'                                         AS DisplayName,
+    SUM(u.Reputation)                               AS Reputation,
+    SUM(COALESCE(up.TotalPosts, 0))                 AS TotalPosts,
+    SUM(COALESCE(up.QuestionCount, 0))              AS QuestionCount,
+    SUM(COALESCE(up.AnswerCount, 0))                AS AnswerCount,
+    SUM(COALESCE(ss.TotalScore, 0))                 AS TotalScore,
+    AVG(COALESCE(ss.AvgScore, 0))                   AS AvgScore,
+    SUM(COALESCE(ub.GoldBadges, 0))                 AS GoldBadges,
+    SUM(COALESCE(ub.SilverBadges, 0))               AS SilverBadges,
+    SUM(COALESCE(ub.BronzeBadges, 0))               AS BronzeBadges,
+    NULL                                            AS TopTags,
+    MAX(ra.LastActivity)                           AS LastActivity,
+    NULL                                            AS ReputationLevel,
+    NULL                                            AS DaysSinceLastPost,
+    NULL                                            AS PositiveAnswers,
+    NULL                                            AS UpVotesGiven,
+    NULL                                            AS DownVotesGiven
+FROM Users u
+LEFT JOIN UserPosts    up ON up.UserId = u.Id
+LEFT JOIN UserBadges   ub ON ub.UserId = u.Id
+LEFT JOIN ScoreStats   ss ON ss.UserId = u.Id
+LEFT JOIN RecentActivity ra ON ra.UserId = u.Id;

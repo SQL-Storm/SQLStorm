@@ -1,0 +1,142 @@
+with RecursiveUserPosts as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.CreationDate,
+        p.Tags,
+        row_number() over (partition by u.Id order by p.CreationDate desc) as RecentPostRank,
+        dense_rank() over (partition by u.Id order by p.PostTypeId) as PostTypeRank
+    from Users u 
+    left join Posts p on p.OwnerUserId = u.Id
+    where u.Reputation > 5000
+),
+BadgeAggregates as (
+    select 
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        count(distinct b.Name) as DistinctBadges,
+        max(b.Date) as LastBadgeDate
+    from Badges b
+    group by b.UserId
+),
+PostAnswerStats as (
+    select 
+        p.ParentId as QuestionId,
+        count(case when p.Score >= 5 then 1 end) as HighScoreAnswers,
+        avg(p.Score) as AvgAnswerScore,
+        max(p.Score) as MaxAnswerScore,
+        sum(case when exists (
+            select 1 
+            from Votes v2 
+            where v2.PostId = p.Id and v2.VoteTypeId = 2 and v2.CreationDate >= cast('2024-10-01' as date) - interval '30 days'
+            ) then 1 else 0 end) as AnswersWithRecentUpvotes
+    from Posts p 
+    where p.PostTypeId = 2
+    group by p.ParentId
+),
+UserActivityWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        -- emulate cumulative distinct counts by counting distinct in a correlated subquery up to the current CreationDate
+        (select count(distinct p1.Id) 
+         from Posts p1 
+         where p1.OwnerUserId = u.Id and p1.PostTypeId = 1 and p1.CreationDate <= coalesce(p.CreationDate, cast('2024-10-01 12:34:56' as timestamp))
+        ) as CumulativeQuestions,
+        (select count(distinct p1.Id) 
+         from Posts p1 
+         where p1.OwnerUserId = u.Id and p1.PostTypeId = 2 and p1.CreationDate <= coalesce(p.CreationDate, cast('2024-10-01 12:34:56' as timestamp))
+        ) as CumulativeAnswers,
+        (select count(*) 
+         from Posts p1 
+         where p1.OwnerUserId = u.Id and p1.Score > 10 and p1.CreationDate <= coalesce(p.CreationDate, cast('2024-10-01 12:34:56' as timestamp))
+        ) as CumulativeHighScorePosts,
+        max(p.Score) over (partition by u.Id) as MaxPostScore
+    from Users u 
+    left join Posts p on p.OwnerUserId = u.Id
+    where u.Reputation > 1000
+),
+LatestPostHistory as (
+    select ph1.PostId, ph1.Id, ph1.PostHistoryTypeId, ph1.CreationDate, ph1.UserId, ph1.UserDisplayName
+    from PostHistory ph1
+    inner join (
+        select PostId, max(CreationDate) as MaxDate
+        from PostHistory
+        group by PostId
+    ) ph2 on ph1.PostId = ph2.PostId and ph1.CreationDate = ph2.MaxDate
+),
+ComplexUserTagStats as (
+    select 
+        u.Id as UserId,
+        lower(substring(t.TagName from 1 for 3)) as TagPrefix,
+        count(distinct case when p.PostTypeId = 1 and p.Tags like concat('%<', t.TagName, '>%') then p.Id end) as QuestionCountWithTag,
+        count(distinct case when p2.PostTypeId = 2 and p2.ParentId = p.Id then p2.Id end) as AnswerCountForTaggedQuestions,
+        sum(p.Score + coalesce(v.UpVotes,0) - coalesce(v.DownVotes,0)) as CompositeScore
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Tags t on p.Tags like concat('%<', t.TagName, '>%')
+    left join Posts p2 on p2.ParentId = p.Id and p2.PostTypeId = 2
+    left join (
+        select Id as UserId, sum(Coalesce(0,0)) as UpVotes, sum(Coalesce(0,0)) as DownVotes
+        from Users
+        group by Id
+    ) v on v.UserId = u.Id
+    where u.Reputation > 3000
+    group by u.Id, lower(substring(t.TagName from 1 for 3))
+),
+CombinedPostsWithComments as (
+    select
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score as PostScore,
+        p.CreationDate,
+        c.Id as CommentId,
+        c.Score as CommentScore,
+        c.UserId as CommentUserId,
+        c.UserDisplayName as CommentUserDisplayName,
+        rank() over (partition by p.Id order by coalesce(c.Score,0) desc) as CommentRank
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+)
+select 
+    u.Id as UserId,
+    u.DisplayName,
+    ba.GoldBadges,
+    ba.SilverBadges,
+    ba.BronzeBadges,
+    rsp.Score as RecentPostScore,
+    rsp.PostId as RecentPostId,
+    pas.HighScoreAnswers,
+    pas.AvgAnswerScore,
+    pas.MaxAnswerScore,
+    pas.AnswersWithRecentUpvotes,
+    ua.CumulativeQuestions,
+    ua.CumulativeAnswers,
+    ua.CumulativeHighScorePosts,
+    ua.MaxPostScore,
+    lst.PostHistoryTypeId as LastHistoryType,
+    lst.UserDisplayName as LastEditor,
+    cts.TagPrefix,
+    cts.QuestionCountWithTag,
+    cts.AnswerCountForTaggedQuestions,
+    cts.CompositeScore,
+    cpc.CommentId,
+    cpc.CommentScore,
+    cpc.CommentUserId,
+    cpc.CommentUserDisplayName
+from Users u
+inner join BadgeAggregates ba on ba.UserId = u.Id
+left join RecursiveUserPosts rsp on rsp.UserId = u.Id and rsp.RecentPostRank = 1
+left join PostAnswerStats pas on pas.QuestionId = rsp.PostId
+left join UserActivityWindow ua on ua.UserId = u.Id
+left join LatestPostHistory lst on lst.PostId = rsp.PostId
+left join ComplexUserTagStats cts on cts.UserId = u.Id
+left join CombinedPostsWithComments cpc on cpc.PostId = rsp.PostId and cpc.CommentRank = 1
+where u.Reputation > 2000 and (ba.GoldBadges > 0 or ba.SilverBadges > 5)
+order by ba.GoldBadges desc, ua.CumulativeHighScorePosts desc, pas.AvgAnswerScore desc
+limit 100;

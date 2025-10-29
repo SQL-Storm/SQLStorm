@@ -1,0 +1,52 @@
+-- {"query": "6430.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-micro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 502} 
+
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    COUNT(DISTINCT v.PostId) AS TotalVotes,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id ELSE NULL END) AS TotalQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id ELSE NULL END) AS TotalAnswers,
+    MAX(p.Score) AS HighestScoredPost,
+    MIN(p.CreationDate) AS FirstPostDate,
+    MAX(p.LastActivityDate) AS LastActiveDate,
+    b.Name AS LatestBadge,
+    b.Date AS BadgeDate,
+    ph.Comment AS LastEditComment
+FROM 
+    Users u
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    (SELECT 
+         ph.UserId, 
+         ph.PostId, 
+         MAX(ph.CreationDate) AS LastEditDate
+     FROM 
+         PostHistory ph
+     WHERE 
+         ph.PostHistoryTypeId IN (2, 5, 6) 
+     GROUP BY 
+         ph.UserId, 
+         ph.PostId) 
+    AS latest_edit ON u.Id = latest_edit.UserId
+LEFT JOIN 
+    PostHistory ph ON latest_edit.UserId = ph.UserId AND latest_edit.PostId = ph.PostId AND latest_edit.LastEditDate = ph.CreationDate
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+WHERE 
+    (p.PostTypeId = 1 OR p.PostTypeId = 2)
+    AND p.LastActivityDate > DATE_SUB(CURRENT_TIMESTAMP, INTERVAL 1 YEAR)
+GROUP BY 
+    u.Id
+HAVING 
+    COUNT(DISTINCT v.PostId) > 100
+ORDER BY 
+    u.Reputation DESC, 
+    TotalPosts DESC
+LIMIT 100;

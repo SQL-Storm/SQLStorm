@@ -1,0 +1,183 @@
+WITH RECURSIVE PostHierarchy AS (
+    SELECT Id, ParentId, PostTypeId, OwnerUserId, Score, ViewCount, Title,
+           0 AS Depth, CAST(Id AS VARCHAR(1000)) AS Path
+    FROM Posts
+    WHERE PostTypeId = 1 AND ParentId IS NULL
+
+    UNION ALL
+
+    SELECT p.Id, p.ParentId, p.PostTypeId, p.OwnerUserId, p.Score, p.ViewCount, p.Title,
+           ph.Depth + 1 AS Depth, ph.Path || ',' || CAST(p.Id AS VARCHAR(1000)) AS Path
+    FROM Posts p
+    INNER JOIN PostHierarchy ph ON p.ParentId = ph.Id
+    WHERE ph.Depth < 5
+),
+UserStats AS (
+    SELECT u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes,
+           COUNT(DISTINCT b.Id) AS TotalBadges,
+           COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+           COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+           COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+           AVG(CAST(p.Score AS DOUBLE PRECISION)) AS AvgPostScore,
+           COUNT(DISTINCT p.Id) AS PostCount,
+           STRING_AGG(DISTINCT p.Title, '; ') AS PostTitles
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TagStats AS (
+    SELECT t.TagName, t.Count,
+           AVG(CAST(p.Score AS DOUBLE PRECISION)) AS AvgScore,
+           COUNT(DISTINCT p.Id) AS PostCount,
+           STRING_AGG(DISTINCT p.Title, '; ') AS PostTitles
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    WHERE p.PostTypeId = 1
+    GROUP BY t.TagName, t.Count
+),
+PostAnalysis AS (
+    SELECT p.Id, p.Title, p.Score, p.ViewCount, p.OwnerUserId, p.CreationDate, p.Tags,
+           CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS HasAcceptedAnswer,
+           CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+           CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN 1 ELSE 0 END AS IsCommunityOwned,
+           CAST((EXTRACT(EPOCH FROM (COALESCE(p.ClosedDate, TIMESTAMP '2024-10-01 12:34:56') - p.CreationDate)) / 86400) AS INTEGER) AS DaysOpen,
+           COALESCE(p.AnswerCount, 0) AS AnswerCount,
+           COALESCE(p.CommentCount, 0) AS CommentCount,
+           ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS UserPostRank,
+           AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS OwnerAvgScore,
+           RANK() OVER (ORDER BY p.Score DESC) AS GlobalScoreRank,
+           DENSE_RANK() OVER (ORDER BY p.ViewCount DESC) AS ViewRank,
+           NTILE(100) OVER (ORDER BY p.Score ASC) AS ScorePercentile,
+           CASE WHEN p.Score > (SELECT AVG(Score) FROM Posts) THEN 'AboveAvg'
+                WHEN p.Score < (SELECT AVG(Score) FROM Posts) THEN 'BelowAvg'
+                ELSE 'Avg' END AS ScoreCategory
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) AND p.Score IS NOT NULL AND p.ViewCount IS NOT NULL
+),
+ComplexVoterAnalysis AS (
+    SELECT v.PostId,
+           COUNT(v.Id) AS VoteCount,
+           SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+           SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+           SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoriteVotes,
+           AVG(CAST(v.BountyAmount AS DOUBLE PRECISION)) AS AvgBountyAmount,
+           STRING_AGG(CAST(v.UserId AS VARCHAR), ',') AS VoterIds,
+           STRING_AGG(CASE WHEN v.UserId IS NOT NULL THEN u.DisplayName ELSE 'Anonymous' END, ', ') AS VoterNames
+    FROM Votes v
+    LEFT JOIN Users u ON v.UserId = u.Id
+    WHERE v.VoteTypeId IN (2, 3, 5) AND v.PostId IN (SELECT Id FROM Posts WHERE PostTypeId = 1)
+    GROUP BY v.PostId
+)
+SELECT
+    'Post Analysis Report' AS ReportName,
+    COUNT(*) AS TotalPosts,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1) AS TotalQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 2) AS TotalAnswers,
+    (SELECT AVG(Score) FROM Posts WHERE PostTypeId IN (1, 2)) AS OverallAvgScore,
+    (SELECT COUNT(*) FROM Posts WHERE ClosedDate IS NOT NULL) AS ClosedPosts,
+    (SELECT COUNT(*) FROM Posts WHERE CommunityOwnedDate IS NOT NULL) AS CommunityOwnedPosts,
+    (SELECT COUNT(*) FROM Posts WHERE ViewCount > (SELECT AVG(ViewCount) FROM Posts WHERE ViewCount IS NOT NULL)) AS HighViewCountPosts,
+    (SELECT STRING_AGG(TagName, ', ') FROM Tags WHERE Count > (SELECT AVG(Count) FROM Tags WHERE Count IS NOT NULL)) AS PopularTags,
+    (SELECT COUNT(*) FROM (SELECT DISTINCT OwnerUserId FROM Posts WHERE Score > 1000) AS HighScoreUsers) AS HighScoringUsers,
+    (SELECT COUNT(*) FROM Posts p WHERE EXISTS (SELECT 1 FROM Comments c WHERE c.PostId = p.Id)) AS PostsWithComments,
+    (SELECT COUNT(*) FROM Posts p WHERE EXISTS (SELECT 1 FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (10,11,12,13,14,15,19,20))) AS PostsWithHistoryEvents,
+    (SELECT COUNT(*) FROM Users u WHERE EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id AND p.Score > 1000)) AS UsersWithHighScorePosts,
+    (SELECT COUNT(*) FROM Badges b WHERE EXISTS (SELECT 1 FROM Users u WHERE u.Id = b.UserId AND u.Reputation > 10000)) AS BadgesFromReputableUsers,
+    (SELECT COUNT(*) FROM (SELECT OwnerUserId, COUNT(*) AS PostsWithAvgScore FROM Posts WHERE Score IS NOT NULL GROUP BY OwnerUserId HAVING COUNT(*) > 5) AS HighPostCountUsers) AS UsersWithManyPosts,
+    (SELECT COUNT(*) FROM (SELECT PostId, COUNT(*) AS VoteCount FROM Votes WHERE VoteTypeId IN (2,3,5) GROUP BY PostId HAVING COUNT(*) > 50) AS HighlyVotedPosts) AS HighlyVotedPosts,
+    (SELECT COUNT(*) FROM (SELECT Id FROM Posts WHERE Tags IS NOT NULL AND Tags <> '') AS TaggedPosts) AS TaggedPosts,
+    (SELECT COUNT(*) FROM (SELECT Id FROM Posts WHERE Body IS NOT NULL AND LENGTH(Body) > 1000) AS LongPosts) AS LongPosts,
+    (SELECT COUNT(*) FROM (SELECT p.Id FROM Posts p INNER JOIN PostLinks pl ON p.Id = pl.PostId WHERE pl.LinkTypeId = 3) AS DuplicatePosts) AS DuplicateLinkedPosts,
+    (SELECT COUNT(*) FROM (SELECT UserId FROM Votes WHERE VoteTypeId IN (2,3) GROUP BY UserId HAVING COUNT(*) > 1000) AS ActiveVoters) AS ActiveVoters,
+    (SELECT COUNT(*) FROM Comments WHERE Text IS NOT NULL AND LENGTH(Text) > 100) AS LongComments,
+    (SELECT COUNT(*) FROM PostHistory WHERE Text IS NOT NULL AND LENGTH(Text) > 500) AS LongHistoryTexts,
+    (SELECT COUNT(*) FROM Users WHERE DisplayName IS NOT NULL AND DisplayName <> '') AS UsersWithDisplayNames,
+    (SELECT COUNT(*) FROM Posts WHERE Body LIKE '%<code>%' OR Body LIKE '%`%`%') AS CodePosts,
+    (SELECT COUNT(*) FROM Posts WHERE Body LIKE '%<p>%</p>%' OR Body LIKE '%<div>%' OR Body LIKE '%<span>%</span>%') AS HTMLFormattedPosts,
+    (SELECT COUNT(*) FROM Tags WHERE TagName LIKE '%-%' AND TagName NOT LIKE '%%') AS HyphenatedTags,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND AnswerCount > 10) AS QuestionsWithManyAnswers,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND CommentCount > 5) AS QuestionsWithManyComments,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND FavoriteCount > 10) AS QuestionsWithManyFavorites,
+    NULL AS NullValuePlaceholder
+FROM Posts
+GROUP BY 1
+HAVING COUNT(*) > 0
+
+UNION ALL
+
+SELECT
+    'User Statistics Summary' AS ReportName,
+    COUNT(*) AS TotalPosts,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1) AS TotalQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 2) AS TotalAnswers,
+    (SELECT AVG(Score) FROM Posts WHERE PostTypeId IN (1, 2)) AS OverallAvgScore,
+    (SELECT COUNT(*) FROM Posts WHERE ClosedDate IS NOT NULL) AS ClosedPosts,
+    (SELECT COUNT(*) FROM Posts WHERE CommunityOwnedDate IS NOT NULL) AS CommunityOwnedPosts,
+    (SELECT COUNT(*) FROM Posts WHERE ViewCount > (SELECT AVG(ViewCount) FROM Posts WHERE ViewCount IS NOT NULL)) AS HighViewCountPosts,
+    NULL AS PopularTags,
+    NULL AS HighScoringUsers,
+    (SELECT COUNT(*) FROM Posts p WHERE EXISTS (SELECT 1 FROM Comments c WHERE c.PostId = p.Id)) AS PostsWithComments,
+    (SELECT COUNT(*) FROM Posts p WHERE EXISTS (SELECT 1 FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (10,11,12,13,14,15,19,20))) AS PostsWithHistoryEvents,
+    NULL AS UsersWithHighScorePosts,
+    (SELECT COUNT(*) FROM Badges b WHERE EXISTS (SELECT 1 FROM Users u WHERE u.Id = b.UserId AND u.Reputation > 10000)) AS BadgesFromReputableUsers,
+    NULL AS UsersWithManyPosts,
+    (SELECT COUNT(*) FROM (SELECT PostId, COUNT(*) AS VoteCount FROM Votes WHERE VoteTypeId IN (2,3,5) GROUP BY PostId HAVING COUNT(*) > 50) AS HighlyVotedPosts) AS HighlyVotedPosts,
+    (SELECT COUNT(*) FROM (SELECT Id FROM Posts WHERE Tags IS NOT NULL AND Tags <> '') AS TaggedPosts) AS TaggedPosts,
+    (SELECT COUNT(*) FROM (SELECT Id FROM Posts WHERE Body IS NOT NULL AND LENGTH(Body) > 1000) AS LongPosts) AS LongPosts,
+    (SELECT COUNT(*) FROM (SELECT p.Id FROM Posts p INNER JOIN PostLinks pl ON p.Id = pl.PostId WHERE pl.LinkTypeId = 3) AS DuplicatePosts) AS DuplicateLinkedPosts,
+    (SELECT COUNT(*) FROM (SELECT UserId FROM Votes WHERE VoteTypeId IN (2,3) GROUP BY UserId HAVING COUNT(*) > 1000) AS ActiveVoters) AS ActiveVoters,
+    (SELECT COUNT(*) FROM Comments WHERE Text IS NOT NULL AND LENGTH(Text) > 100) AS LongComments,
+    (SELECT COUNT(*) FROM PostHistory WHERE Text IS NOT NULL AND LENGTH(Text) > 500) AS LongHistoryTexts,
+    (SELECT COUNT(*) FROM Users WHERE DisplayName IS NOT NULL AND DisplayName <> '') AS UsersWithDisplayNames,
+    (SELECT COUNT(*) FROM Posts WHERE Body LIKE '%<code>%' OR Body LIKE '%`%`%') AS CodePosts,
+    (SELECT COUNT(*) FROM Posts WHERE Body LIKE '%<p>%</p>%' OR Body LIKE '%<div>%' OR Body LIKE '%<span>%</span>%') AS HTMLFormattedPosts,
+    (SELECT COUNT(*) FROM Tags WHERE TagName LIKE '%-%' AND TagName NOT LIKE '%%') AS HyphenatedTags,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND AnswerCount > 10) AS QuestionsWithManyAnswers,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND CommentCount > 5) AS QuestionsWithManyComments,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND FavoriteCount > 10) AS QuestionsWithManyFavorites,
+    NULL AS NullValuePlaceholder
+FROM Users
+WHERE EXISTS (SELECT 1 FROM Posts WHERE OwnerUserId = Users.Id)
+GROUP BY 1
+HAVING COUNT(*) > 0
+
+UNION ALL
+
+SELECT
+    'Tag Statistics Summary' AS ReportName,
+    0 AS TotalPosts,
+    0 AS TotalQuestions,
+    0 AS TotalAnswers,
+    0 AS OverallAvgScore,
+    0 AS ClosedPosts,
+    0 AS CommunityOwnedPosts,
+    0 AS HighViewCountPosts,
+    NULL AS PopularTags,
+    NULL AS HighScoringUsers,
+    0 AS PostsWithComments,
+    0 AS PostsWithHistoryEvents,
+    0 AS UsersWithHighScorePosts,
+    0 AS BadgesFromReputableUsers,
+    0 AS UsersWithManyPosts,
+    0 AS HighlyVotedPosts,
+    0 AS TaggedPosts,
+    0 AS LongPosts,
+    0 AS DuplicateLinkedPosts,
+    0 AS ActiveVoters,
+    0 AS LongComments,
+    0 AS LongHistoryTexts,
+    0 AS UsersWithDisplayNames,
+    0 AS CodePosts,
+    0 AS HTMLFormattedPosts,
+    0 AS HyphenatedTags,
+    0 AS QuestionsWithManyAnswers,
+    0 AS QuestionsWithManyComments,
+    0 AS QuestionsWithManyFavorites,
+    STRING_AGG(SUBSTRING(TagName FROM 1 FOR 50), ', ') AS NullValuePlaceholder
+FROM Tags
+WHERE EXISTS (SELECT 1 FROM Posts WHERE Tags LIKE '%' || TagName || '%')
+  AND TagName IS NOT NULL AND TagName <> ''
+GROUP BY TagName
+HAVING COUNT(*) > 0
+ORDER BY 2 DESC;

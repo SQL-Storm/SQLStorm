@@ -1,0 +1,284 @@
+with recent_users as (
+    select u.id as user_id,
+           u.displayname,
+           u.reputation,
+           u.creationdate,
+           u.location,
+           coalesce(nullif(trim(u.websiteurl), ''), 'unknown') as websiteurl_norm,
+           date_trunc('month', u.creationdate) as signup_month
+    from users u
+    where u.creationdate >= (select coalesce(max(creationdate), cast('1900-01-01' as timestamp)) - interval '2 years' from users)
+),
+active_questions as (
+    select p.id,
+           p.owneruserid,
+           p.creationdate,
+           p.score,
+           p.viewcount,
+           p.answercount,
+           p.tags,
+           p.title,
+           p.closeddate,
+           p.lastactivitydate
+    from posts p
+    where p.posttypeid = 1
+      and p.creationdate >= (select coalesce(min(creationdate), cast('2024-10-01 12:34:56' as timestamp) - interval '5 years') from posts where posttypeid = 1)
+),
+answers as (
+    select a.id,
+           a.parentid as question_id,
+           a.owneruserid as answerer_id,
+           a.creationdate as answer_created,
+           a.score as answer_score
+    from posts a
+    where a.posttypeid = 2
+),
+question_tag_array as (
+    select q.id as question_id,
+           string_to_array(substring(q.tags, 2, length(q.tags)-2), '><') as tag_arr
+    from active_questions q
+    where q.tags is not null
+),
+top_tags as (
+    select t.tag,
+           count(*) as tag_q_count,
+           row_number() over (order by count(*) desc) as rn
+    from (
+        select unnest(qt.tag_arr) as tag
+        from question_tag_array qt
+    ) s
+    group by t.tag
+),
+accepted_status as (
+    select q.id as question_id,
+           case when q.acceptedanswerid is not null then 1 else 0 end as has_accepted
+    from posts q
+    where q.posttypeid = 1
+),
+user_badge_rollup as (
+    select b.userid,
+           sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+           sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+           sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+           count(*) as total_badges,
+           max(b.date) as last_badge_date
+    from badges b
+    group by b.userid
+),
+vote_rollup as (
+    select v.postid,
+           sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+           sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+           sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounties_started,
+           sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounties_awarded,
+           count(*) as total_votes
+    from votes v
+    where v.creationdate >= (select coalesce(max(creationdate), cast('2024-10-01 12:34:56' as timestamp) - interval '10 years') - interval '3 years' from votes)
+    group by v.postid
+),
+comment_activity as (
+    select c.postid,
+           count(*) as comment_count,
+           max(c.creationdate) as last_comment_date,
+           sum(case when c.score > 0 then 1 else 0 end) as positive_comments
+    from comments c
+    group by c.postid
+),
+post_links_rollup as (
+    select pl.postid,
+           sum(case when pl.linktypeid = 1 then 1 else 0 end) as linked_count,
+           sum(case when pl.linktypeid = 3 then 1 else 0 end) as duplicate_count,
+           count(*) as total_links
+    from postlinks pl
+    group by pl.postid
+),
+close_reasons as (
+    select ph.postid,
+           count(*) filter (where ph.posthistorytypeid = 10) as close_events,
+           max(case when ph.posthistorytypeid = 10 then try_cast(ph.comment as integer) end) as last_close_reason_id,
+           max(ph.creationdate) filter (where ph.posthistorytypeid = 10) as last_closed_at
+    from posthistory ph
+    group by ph.postid
+),
+question_user as (
+    select q.id as question_id,
+           q.owneruserid as question_owner_id
+    from active_questions q
+),
+answer_user as (
+    select a.question_id,
+           a.answerer_id,
+           count(*) as answers_by_user,
+           max(a.answer_score) as max_answer_score,
+           sum(case when a.answer_score > 0 then 1 else 0 end) as pos_answer_count,
+           min(a.answer_created) as first_answer_at
+    from answers a
+    group by a.question_id, a.answerer_id
+),
+best_answerer as (
+    select au.question_id,
+           au.answerer_id,
+           au.answers_by_user,
+           au.max_answer_score,
+           row_number() over (partition by au.question_id order by au.max_answer_score desc, au.answers_by_user desc, au.first_answer_at asc) as rn
+    from answer_user au
+),
+question_quality as (
+    select q.id as question_id,
+           q.creationdate,
+           q.score,
+           q.viewcount,
+           q.answercount,
+           coalesce(v.upvotes, 0) as upvotes,
+           coalesce(v.downvotes, 0) as downvotes,
+           coalesce(v.bounties_started, 0) as bounty_started,
+           coalesce(v.bounties_awarded, 0) as bounty_awarded,
+           coalesce(ca.comment_count, 0) as comment_count,
+           coalesce(ca.positive_comments, 0) as positive_comments,
+           coalesce(pl.total_links, 0) as links_total,
+           coalesce(pl.duplicate_count, 0) as dup_count,
+           coalesce(cr.close_events, 0) as close_events,
+           cr.last_close_reason_id,
+           cr.last_closed_at,
+           case
+             when q.viewcount is null or q.viewcount = 0 then null
+             else round((cast(q.score as numeric) + coalesce(v.upvotes,0) - coalesce(v.downvotes,0)) / nullif(q.viewcount,0), 6)
+           end as engagement_ratio
+    from active_questions q
+    left join vote_rollup v on v.postid = q.id
+    left join comment_activity ca on ca.postid = q.id
+    left join post_links_rollup pl on pl.postid = q.id
+    left join close_reasons cr on cr.postid = q.id
+),
+user_metrics as (
+    select u.id as user_id,
+           u.displayname,
+           u.reputation,
+           u.creationdate,
+           coalesce(ub.total_badges, 0) as total_badges,
+           coalesce(ub.gold_badges, 0) as gold_badges,
+           coalesce(ub.silver_badges, 0) as silver_badges,
+           coalesce(ub.bronze_badges, 0) as bronze_badges,
+           ub.last_badge_date,
+           u.upvotes,
+           u.downvotes,
+           u.views,
+           date_part('year', age(cast('2024-10-01 12:34:56' as timestamp), u.creationdate)) as account_age_years,
+           case when u.websiteurl ~* '^(https?://)?(www\.)?github\.com/' then 1 else 0 end as has_github,
+           case when position('@' in coalesce(u.location,'')) > 0 then 1 else 0 end as suspicious_location
+    from users u
+    left join user_badge_rollup ub on ub.userid = u.id
+),
+question_owner_metrics as (
+    select qu.question_id,
+           um.user_id as owner_id,
+           um.reputation as owner_rep,
+           um.total_badges as owner_badges,
+           um.gold_badges as owner_gold,
+           um.account_age_years as owner_age_years,
+           um.has_github as owner_has_github
+    from question_user qu
+    left join user_metrics um on um.user_id = qu.question_owner_id
+),
+best_answerer_metrics as (
+    select ba.question_id,
+           ba.answerer_id,
+           um.reputation as answerer_rep,
+           um.total_badges as answerer_badges,
+           um.gold_badges as answerer_gold,
+           ba.max_answer_score,
+           ba.answers_by_user
+    from best_answerer ba
+    join user_metrics um on um.user_id = ba.answerer_id
+    where ba.rn = 1
+),
+tag_focus as (
+    select qt.question_id,
+           tt.tag as top_tag,
+           tt.rn as tag_rank_global
+    from question_tag_array qt
+    join top_tags tt
+      on tt.tag = any(qt.tag_arr)
+    where tt.rn <= 50
+),
+engagement_buckets as (
+    select qq.question_id,
+           case
+             when qq.engagement_ratio is null then 'unknown'
+             when qq.engagement_ratio < 0.0001 then 'very_low'
+             when qq.engagement_ratio < 0.001 then 'low'
+             when qq.engagement_ratio < 0.01 then 'medium'
+             when qq.engagement_ratio < 0.05 then 'high'
+             else 'very_high'
+           end as engagement_bucket
+    from question_quality qq
+),
+dedup_questions as (
+    select qq.question_id,
+           row_number() over (
+             partition by coalesce(lower(regexp_replace(p.title, '\s+', ' ', 'g')), cast(p.id as text))
+             order by qq.dup_count desc, qq.score desc, qq.viewcount desc, p.creationdate asc
+           ) as title_group_rn
+    from question_quality qq
+    join posts p on p.id = qq.question_id
+)
+select
+    qq.question_id,
+    p.title,
+    p.creationdate,
+    qq.score,
+    qq.viewcount,
+    qq.answercount,
+    qq.upvotes,
+    qq.downvotes,
+    qq.bounty_awarded - qq.bounty_started as bounty_delta,
+    qq.comment_count,
+    qq.positive_comments,
+    qq.links_total,
+    qq.dup_count,
+    qq.close_events,
+    qq.last_close_reason_id,
+    qq.last_closed_at,
+    qq.engagement_ratio,
+    eb.engagement_bucket,
+    coalesce(tf.top_tag, 'other') as top_tag_in_top50,
+    tf.tag_rank_global,
+    qom.owner_id,
+    qom.owner_rep,
+    qom.owner_badges,
+    qom.owner_gold,
+    qom.owner_age_years,
+    bam.answerer_id as best_answerer_id,
+    bam.answerer_rep,
+    bam.answerer_badges,
+    bam.answerer_gold,
+    bam.max_answer_score,
+    bam.answers_by_user,
+    case
+      when qq.dup_count > 0 and coalesce(qq.close_events,0) > 0 then 'duplicate_closed'
+      when coalesce(qq.close_events,0) > 0 then 'closed'
+      when qq.dup_count > 0 then 'duplicate_linked'
+      else 'normal'
+    end as status_category
+from question_quality qq
+join posts p on p.id = qq.question_id
+left join engagement_buckets eb on eb.question_id = qq.question_id
+left join tag_focus tf on tf.question_id = qq.question_id
+left join question_owner_metrics qom on qom.question_id = qq.question_id
+left join best_answerer_metrics bam on bam.question_id = qq.question_id
+join dedup_questions dq on dq.question_id = qq.question_id and dq.title_group_rn = 1
+where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+  and coalesce(qq.viewcount, 0) >= 10
+  and (
+        qq.engagement_ratio is null
+        or qq.engagement_ratio > (
+            select percentile_disc(0.4) within group (order by coalesce(q2.engagement_ratio, -1))
+            from question_quality q2
+          )
+      )
+order by
+  eb.engagement_bucket nulls last,
+  coalesce(tf.tag_rank_global, 9999),
+  qq.engagement_ratio desc nulls last,
+  qq.viewcount desc
+limit 1000;

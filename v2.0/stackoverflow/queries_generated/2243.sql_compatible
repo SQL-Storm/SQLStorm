@@ -1,0 +1,169 @@
+with RecursiveUserBadges as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class,
+        row_number() over (partition by u.Id order by b.Date desc) as rnk
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    where b.Class is not null
+),
+LatestBadges as (
+    select * from RecursiveUserBadges where rnk <= 3
+),
+QuestionAnswerStats as (
+    select
+        p.OwnerUserId,
+        count(case when pt.Name = 'Question' then 1 end) as QuestionCount,
+        count(case when pt.Name = 'Answer' then 1 end) as AnswerCount,
+        sum(case when pt.Name = 'Question' then coalesce(p.Score,0) else 0 end) as TotalQuestionScore,
+        sum(case when pt.Name = 'Answer' then coalesce(p.Score,0) else 0 end) as TotalAnswerScore
+    from Posts p
+    inner join PostTypes pt on p.PostTypeId = pt.Id
+    where p.OwnerUserId is not null
+    group by p.OwnerUserId
+),
+UserRecentActivity as (
+    select 
+        u.Id as UserId,
+        max(p.LastActivityDate) as LastPostActivity,
+        max(c.CreationDate) as LastCommentDate,
+        max(ph.CreationDate) as LastEditDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join PostHistory ph on ph.UserId = u.Id
+    group by u.Id
+),
+UserReputationBuckets as (
+    select 
+        Id as UserId,
+        case 
+            when Reputation >= 50000 then 'Elite'
+            when Reputation >= 10000 then 'Experienced'
+            when Reputation >= 1000 then 'Intermediate'
+            else 'Beginner'
+        end as ReputationLevel
+    from Users
+),
+UserTagInterest as (
+    select
+        p.OwnerUserId as UserId,
+        unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')) as Tag,
+        count(*) as TagCount
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+    group by p.OwnerUserId, unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><'))
+),
+UserTopTags as (
+    select distinct on (UserId)
+        UserId,
+        Tag,
+        TagCount
+    from UserTagInterest
+    order by UserId, TagCount desc
+),
+ClosedQuestions as (
+    select
+        ph.PostId,
+        prs.Name as CloseReason,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    inner join PostHistoryTypes pht on ph.PostHistoryTypeId = pht.Id and pht.Name = 'Post Closed'
+    left join CloseReasonTypes prs on cast(ph.Comment as integer) = prs.Id
+    where ph.PostId in (select Id from Posts where PostTypeId = 1)
+),
+QuestionDuplicates as (
+    select
+        pl.PostId as QuestionId,
+        pl.RelatedPostId as DuplicateOfQuestionId,
+        pl.CreationDate as DuplicationDate,
+        lt.Name as LinkTypeName
+    from PostLinks pl
+    inner join LinkTypes lt on pl.LinkTypeId = lt.Id
+    where lt.Name = 'Duplicate'
+),
+AnswerAcceptanceRate as (
+    select
+        q.OwnerUserId,
+        count(a.Id) as AnswersGiven,
+        count(case when q.AcceptedAnswerId = a.Id then 1 end) as AnswersAccepted
+    from Posts q
+    join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1 and q.OwnerUserId is not null
+    group by q.OwnerUserId
+),
+UserActivitySummary as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        urb.ReputationLevel,
+        coalesce(qas.QuestionCount, 0) as TotalQuestions,
+        coalesce(qas.AnswerCount, 0) as TotalAnswers,
+        coalesce(qas.TotalQuestionScore, 0) as QuestionScore,
+        coalesce(qas.TotalAnswerScore, 0) as AnswerScore,
+        coalesce(aar.AnswersAccepted,0) as AcceptedAnswers,
+        coalesce(aar.AnswersGiven,0) as AnswersGiven,
+        case when coalesce(aar.AnswersGiven,0) > 0 then round(100.0 * coalesce(aar.AnswersAccepted,0) / aar.AnswersGiven,2) else null end as AcceptanceRate,
+        lba.BadgeName,
+        lba.Class as BadgeClass,
+        ur.LastPostActivity,
+        ur.LastCommentDate,
+        ur.LastEditDate,
+        utt.Tag as FavoriteTag
+    from Users u
+    left join UserReputationBuckets urb on u.Id = urb.UserId
+    left join QuestionAnswerStats qas on u.Id = qas.OwnerUserId
+    left join AnswerAcceptanceRate aar on u.Id = aar.OwnerUserId
+    left join LatestBadges lba on u.Id = lba.UserId and lba.rnk = 1
+    left join UserRecentActivity ur on u.Id = ur.UserId
+    left join UserTopTags utt on u.Id = utt.UserId
+)
+select 
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.ReputationLevel,
+    uas.TotalQuestions,
+    uas.TotalAnswers,
+    uas.QuestionScore,
+    uas.AnswerScore,
+    uas.AnswersGiven,
+    uas.AcceptedAnswers,
+    uas.AcceptanceRate,
+    uas.BadgeName,
+    case uas.BadgeClass
+        when 1 then 'Gold'
+        when 2 then 'Silver'
+        when 3 then 'Bronze'
+        else 'None'
+    end as BadgeClass,
+    uas.LastPostActivity,
+    uas.LastCommentDate,
+    uas.LastEditDate,
+    coalesce(u.Location, 'Unknown') as Location,
+    uas.FavoriteTag,
+    coalesce(t.Count,0) as FavoriteTagPostCount,
+    coalesce(clq.CloseReason, 'N/A') as LastClosedReason,
+    coalesce(qd.DuplicateOfQuestionId, -1) as LastDuplicateOf,
+    greatest(
+        extract(epoch from (timestamp '2024-10-01 12:34:56' - coalesce(uas.LastPostActivity, timestamp '1970-01-01'))),
+        extract(epoch from (timestamp '2024-10-01 12:34:56' - coalesce(uas.LastCommentDate, timestamp '1970-01-01'))),
+        extract(epoch from (timestamp '2024-10-01 12:34:56' - coalesce(uas.LastEditDate, timestamp '1970-01-01')))
+    ) / 86400.0 as DaysSinceLastActivity
+from UserActivitySummary uas
+left join Users u on uas.UserId = u.Id
+left join Tags t on uas.FavoriteTag = t.TagName
+left join ClosedQuestions clq on clq.PostId = (
+    select ph2.PostId from PostHistory ph2
+    where ph2.UserId = uas.UserId and ph2.PostHistoryTypeId = 10
+    order by ph2.CreationDate desc limit 1
+)
+left join QuestionDuplicates qd on qd.QuestionId = (
+    select p.Id from Posts p where p.OwnerUserId = uas.UserId and p.PostTypeId = 1 order by p.CreationDate desc limit 1
+)
+where uas.Reputation > 1000
+order by uas.Reputation desc, uas.AcceptanceRate desc
+limit 100;

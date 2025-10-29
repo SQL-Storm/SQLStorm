@@ -1,0 +1,114 @@
+WITH RankedPostEdits AS (
+    SELECT
+        ph.PostId,
+        ph.UserId,
+        ph.CreationDate,
+        ROW_NUMBER() OVER(PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate DESC) as rn
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6)
+),
+UserEditActivity AS (
+    SELECT
+        rpe.UserId,
+        COUNT(DISTINCT rpe.PostId) AS PostsEditedCount,
+        AVG(p.AnswerCount) AS AvgAnswerCountForEditedPosts,
+        MAX(p.Score) AS MaxScoreOfEditedPosts,
+        SUM(CASE WHEN rpe.CreationDate < (cast('2024-10-01' as date) - INTERVAL '1 year') THEN 1 ELSE 0 END) AS OldEditsCount
+    FROM RankedPostEdits rpe
+    JOIN Posts p ON rpe.PostId = p.Id
+    WHERE rpe.rn = 1
+    GROUP BY rpe.UserId
+),
+UserPostInteraction AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LastPostCreationDate,
+        COUNT(DISTINCT CASE WHEN p.OwnerUserId = u.Id THEN p.Id END) AS PostOwnedCount,
+        COUNT(DISTINCT CASE WHEN p.LastEditorUserId = u.Id THEN p.Id END) AS PostEditedByCount
+    FROM Users u
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId OR u.Id = p.LastEditorUserId
+    GROUP BY u.Id, u.DisplayName
+),
+UserActivitySummary AS (
+    SELECT
+        upi.UserId,
+        upi.DisplayName,
+        upi.CommentCount,
+        upi.UpVoteCount,
+        upi.DownVoteCount,
+        upi.BadgeCount,
+        COALESCE(uea.PostsEditedCount, 0) AS TotalPostsEdited,
+        COALESCE(uea.OldEditsCount, 0) AS OldEditsCount,
+        COALESCE(uea.AvgAnswerCountForEditedPosts, 0) AS AvgAnswerCountForEditedPosts,
+        COALESCE(uea.MaxScoreOfEditedPosts, 0) AS MaxScoreOfEditedPosts,
+        upi.LastPostCreationDate,
+        upi.PostOwnedCount,
+        upi.PostEditedByCount
+    FROM UserPostInteraction upi
+    LEFT JOIN UserEditActivity uea ON upi.UserId = uea.UserId
+)
+SELECT
+    uas.DisplayName,
+    uas.CommentCount,
+    uas.UpVoteCount,
+    uas.DownVoteCount,
+    uas.BadgeCount,
+    uas.TotalPostsEdited,
+    uas.OldEditsCount,
+    CASE
+        WHEN uas.TotalPostsEdited > 0 THEN CAST(uas.OldEditsCount AS DOUBLE PRECISION) / uas.TotalPostsEdited
+        ELSE 0.0
+    END AS PercentageOldEdits,
+    uas.AvgAnswerCountForEditedPosts,
+    uas.MaxScoreOfEditedPosts,
+    uas.LastPostCreationDate,
+    uas.PostOwnedCount,
+    uas.PostEditedByCount,
+    CASE
+        WHEN uas.PostOwnedCount > 0 THEN CAST(uas.PostEditedByCount AS DOUBLE PRECISION) / uas.PostOwnedCount
+        ELSE 0.0
+    END AS EditRatio,
+    (uas.UpVoteCount - uas.DownVoteCount) AS NetVoteScore,
+    SUBSTRING(uas.DisplayName FROM 1 FOR 3) AS DisplayNamePrefix,
+    UPPER(COALESCE(CAST(uea.UserId AS VARCHAR), 'N/A')) AS UserIDHashEquivalent
+FROM UserActivitySummary uas
+LEFT JOIN UserEditActivity uea ON uas.UserId = uea.UserId
+WHERE uas.BadgeCount > 5 OR uas.TotalPostsEdited > 10
+
+UNION ALL
+
+SELECT
+    'Total' AS DisplayName,
+    SUM(uas.CommentCount) AS CommentCount,
+    SUM(uas.UpVoteCount) AS UpVoteCount,
+    SUM(uas.DownVoteCount) AS DownVoteCount,
+    SUM(uas.BadgeCount) AS BadgeCount,
+    SUM(uas.TotalPostsEdited) AS TotalPostsEdited,
+    SUM(uas.OldEditsCount) AS OldEditsCount,
+    CASE
+        WHEN SUM(uas.TotalPostsEdited) > 0 THEN CAST(SUM(uas.OldEditsCount) AS DOUBLE PRECISION) / SUM(uas.TotalPostsEdited)
+        ELSE 0.0
+    END AS PercentageOldEdits,
+    AVG(uas.AvgAnswerCountForEditedPosts) AS AvgAnswerCountForEditedPosts,
+    MAX(uas.MaxScoreOfEditedPosts) AS MaxScoreOfEditedPosts,
+    NULL::timestamp AS LastPostCreationDate,
+    SUM(uas.PostOwnedCount) AS PostOwnedCount,
+    SUM(uas.PostEditedByCount) AS PostEditedByCount,
+    CASE
+        WHEN SUM(uas.PostOwnedCount) > 0 THEN CAST(SUM(uas.PostEditedByCount) AS DOUBLE PRECISION) / SUM(uas.PostOwnedCount)
+        ELSE 0.0
+    END AS EditRatio,
+    SUM(uas.UpVoteCount - uas.DownVoteCount) AS NetVoteScore,
+    NULL AS DisplayNamePrefix,
+    'TOTAL_HASH' AS UserIDHashEquivalent
+FROM UserActivitySummary uas
+LEFT JOIN UserEditActivity uea ON uas.UserId = uea.UserId
+WHERE uas.BadgeCount > 5 OR uas.TotalPostsEdited > 10;

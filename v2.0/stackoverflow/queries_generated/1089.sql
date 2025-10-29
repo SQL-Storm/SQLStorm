@@ -1,0 +1,193 @@
+-- {"query": "1089.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2691} 
+
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate,
+        U.LastAccessDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COALESCE(SUM(CASE WHEN P.PostTypeId = 1 THEN P.Score ELSE 0 END), 0) AS TotalQuestionScore,
+        COALESCE(SUM(CASE WHEN P.PostTypeId = 2 THEN P.Score ELSE 0 END), 0) AS TotalAnswerScore,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        COALESCE(SUM(CASE WHEN V_Received.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS TotalUpVotesReceived,
+        COALESCE(SUM(CASE WHEN V_Received.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS TotalDownVotesReceived,
+        COALESCE(SUM(CASE WHEN V_Given.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS TotalUpVotesGiven,
+        COALESCE(SUM(CASE WHEN V_Given.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS TotalDownVotesGiven,
+        (EXTRACT(EPOCH FROM (U.LastAccessDate - U.CreationDate)) / (60 * 60 * 24))::int AS UserActiveDays
+    FROM
+        Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Votes V_Received ON P.Id = V_Received.PostId
+    LEFT JOIN Votes V_Given ON U.Id = V_Given.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate
+),
+PostRevisionAnalysis AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.LastEditDate,
+        P.ClosedDate,
+        P.ViewCount,
+        P.Score,
+        COUNT(DISTINCT PH.Id) AS RevisionCount,
+        COUNT(DISTINCT PH.UserId) AS DistinctEditors,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (10, 101, 102, 103, 104, 105) THEN 1 ELSE 0 END) AS WasEverClosedByHistory,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS WasEverReopenedByHistory,
+        -- Calculate time difference between consecutive edits by the same user on the same post
+        AVG(
+            CASE
+                WHEN LAG(PH.CreationDate) OVER (PARTITION BY PH.PostId, PH.UserId ORDER BY PH.CreationDate) IS NOT NULL
+                THEN EXTRACT(EPOCH FROM (PH.CreationDate - LAG(PH.CreationDate) OVER (PARTITION BY PH.PostId, PH.UserId ORDER BY PH.CreationDate))) / (60 * 60)
+                ELSE NULL
+            END
+        ) AS AvgHoursBetweenEditsBySameUser,
+        STRING_AGG(DISTINCT PHT.Name, '; ') FILTER (WHERE PH.PostHistoryTypeId IN (4, 5, 6, 10, 11)) AS SignificantHistoryTypes
+    FROM
+        Posts P
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    LEFT JOIN PostHistoryTypes PHT ON PH.PostHistoryTypeId = PHT.Id
+    GROUP BY
+        P.Id, P.PostTypeId, P.OwnerUserId, P.CreationDate, P.LastEditDate, P.ClosedDate, P.ViewCount, P.Score
+),
+TagPerformanceMetrics AS (
+    SELECT
+        PostId,
+        AVG(Score) AS PostTagAvgScore,
+        SUM(ViewCount) AS PostTagTotalViewCount,
+        COUNT(DISTINCT Tag) AS NumTags
+    FROM (
+        SELECT
+            P.Id AS PostId,
+            P.Score,
+            P.ViewCount,
+            TRIM(REPLACE(REPLACE(T.unnested_tag, '&lt;', ''), '&gt;', '')) AS Tag
+        FROM Posts P
+        CROSS JOIN LATERAL UNNEST(string_to_array(substring(P.Tags, 2, length(P.Tags)-2), '><')) AS T(unnested_tag)
+        WHERE P.Tags IS NOT NULL AND P.PostTypeId = 1
+    ) AS TaggedPosts
+    GROUP BY PostId
+),
+LinkedPostsSummary AS (
+    SELECT
+        P.Id AS PostId,
+        COUNT(DISTINCT PL.RelatedPostId) AS TotalLinkedPosts,
+        SUM(CASE WHEN PL.LinkTypeId = 3 THEN 1 ELSE 0 END) AS TotalDuplicateLinks,
+        AVG(RELATED_P.Score) AS AvgScoreOfLinkedPosts,
+        MAX(RELATED_P.ViewCount) AS MaxViewCountOfLinkedPosts,
+        MIN(RELATED_P.CreationDate) AS EarliestLinkedPostDate
+    FROM
+        Posts P
+    LEFT JOIN PostLinks PL ON P.Id = PL.PostId
+    LEFT JOIN Posts RELATED_P ON PL.RelatedPostId = RELATED_P.Id
+    GROUP BY
+        P.Id
+),
+UserBadgeAwards AS (
+    SELECT
+        B.UserId,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        SUM(CASE WHEN B.TagBased = TRUE THEN 1 ELSE 0 END) AS TagBasedBadges
+    FROM Badges B
+    GROUP BY B.UserId
+)
+SELECT
+    UAS.UserId,
+    UAS.DisplayName,
+    UAS.Reputation,
+    UAS.TotalPosts,
+    UAS.TotalQuestions,
+    UAS.TotalAnswers,
+    PRA.PostId,
+    PRA.PostTypeId,
+    PRA.PostCreationDate,
+    PRA.Score AS PostScore,
+    PRA.ViewCount AS PostViewCount,
+    PRA.RevisionCount,
+    PRA.DistinctEditors,
+    LPS.TotalLinkedPosts,
+    LPS.TotalDuplicateLinks,
+    TFM.NumTags,
+    UBA.TotalBadges,
+    UBA.GoldBadges,
+    (UAS.Reputation * 0.1) +
+    (UAS.TotalPosts * 0.5) +
+    (UAS.TotalUpVotesReceived * 0.8) -
+    (UAS.TotalDownVotesReceived * 0.3) +
+    (UAS.TotalCommentsMade * 0.2) +
+    (PRA.Score * 0.6) +
+    (PRA.ViewCount * 0.01) +
+    (PRA.RevisionCount * 0.4) +
+    (COALESCE(LPS.TotalLinkedPosts, 0) * 0.7) +
+    (COALESCE(TFM.NumTags, 0) * 0.3) +
+    (COALESCE(UBA.GoldBadges, 0) * 10) AS WeightedEngagementScore,
+    RANK() OVER (ORDER BY (UAS.Reputation * 0.1) +
+                            (UAS.TotalPosts * 0.5) +
+                            (UAS.TotalUpVotesReceived * 0.8) -
+                            (UAS.TotalDownVotesReceived * 0.3) +
+                            (UAS.TotalCommentsMade * 0.2) +
+                            (PRA.Score * 0.6) +
+                            (PRA.ViewCount * 0.01) +
+                            (PRA.RevisionCount * 0.4) +
+                            (COALESCE(LPS.TotalLinkedPosts, 0) * 0.7) +
+                            (COALESCE(TFM.NumTags, 0) * 0.3) +
+                            (COALESCE(UBA.GoldBadges, 0) * 10) DESC) AS OverallEngagementRank,
+    (CASE
+        WHEN PRA.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN PRA.WasEverClosedByHistory = 1 THEN 'Closed_By_History'
+        WHEN P_Main.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+        ELSE 'Open'
+    END) AS PostStatus,
+    COALESCE(UAS.DisplayName, 'Anonymous') AS UserDisplayName_Coalesced,
+    NULLIF(PRA.AvgHoursBetweenEditsBySameUser, 0) AS NonZeroAvgEditHours,
+    (SELECT EXISTS (
+        SELECT 1
+        FROM Votes V_Offensive
+        WHERE V_Offensive.PostId = PRA.PostId
+          AND V_Offensive.VoteTypeId = 4
+          AND V_Offensive.UserId IS NULL
+    )) AS HasOffensiveVotes,
+    (SELECT EXISTS (
+        SELECT 1
+        FROM Posts P_Correlated
+        WHERE P_Correlated.OwnerUserId = UAS.UserId
+          AND P_Correlated.PostTypeId = 2
+          AND EXISTS (SELECT 1 FROM Posts Q_Correlated WHERE Q_Correlated.Id = P_Correlated.ParentId AND Q_Correlated.ClosedDate IS NOT NULL)
+        LIMIT 1
+    )) AS AnsweredClosedQuestion,
+    LOWER(SUBSTRING(UAS.DisplayName, 1, 5)) || '_' || LENGTH(UAS.DisplayName) AS DisplayNameHash,
+    (EXTRACT(EPOCH FROM (NOW() - UAS.CreationDate)) / (60 * 60 * 24 * 365.25))::numeric(5,2) AS YearsSinceCreation
+FROM
+    UserActivitySummary UAS
+INNER JOIN PostRevisionAnalysis PRA ON UAS.UserId = PRA.OwnerUserId
+LEFT JOIN Posts P_Main ON PRA.PostId = P_Main.Id -- Re-join to original Posts for AcceptedAnswerId
+LEFT JOIN TagPerformanceMetrics TFM ON PRA.PostId = TFM.PostId
+LEFT JOIN LinkedPostsSummary LPS ON PRA.PostId = LPS.PostId
+LEFT JOIN UserBadgeAwards UBA ON UAS.UserId = UBA.UserId
+WHERE
+    UAS.Reputation > 500
+    AND UAS.TotalPosts > 5
+    AND PRA.PostTypeId IN (1, 2)
+    AND (PRA.Score >= 10 OR PRA.ViewCount >= 100)
+    AND (PRA.LastEditDate IS NOT NULL AND PRA.LastEditDate > (NOW() - INTERVAL '1 year'))
+    AND (PRA.ClosedDate IS NULL OR (PRA.ClosedDate > (NOW() - INTERVAL '2 year') AND PRA.WasEverReopenedByHistory = 1))
+    AND NOT EXISTS (
+        SELECT 1
+        FROM Comments C_NoActivity
+        WHERE C_NoActivity.PostId = PRA.PostId
+          AND C_NoActivity.CreationDate > (NOW() - INTERVAL '6 months')
+        HAVING COUNT(C_NoActivity.Id) = 0
+    )
+ORDER BY
+    WeightedEngagementScore DESC, UAS.Reputation DESC, PRA.PostCreationDate ASC
+LIMIT 1000;

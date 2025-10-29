@@ -1,0 +1,282 @@
+WITH
+  AnsweredQuestions AS (
+    SELECT
+      p.Id AS QuestionId,
+      p.OwnerUserId AS QuestionOwnerUserId,
+      p.Title AS QuestionTitle,
+      p.CreationDate AS QuestionCreationDate,
+      p.Score AS QuestionScore,
+      p.FavoriteCount AS QuestionFavoriteCount,
+      p.AnswerCount AS QuestionAnswerCount,
+      COUNT(a.Id) AS ActualAnswerCount,
+      MAX(a.Score) AS MaxAnswerScore,
+      AVG(a.Score) AS AvgAnswerScore,
+      SUM(CASE WHEN a.OwnerUserId = p.OwnerUserId THEN 1 ELSE 0 END) AS AnswersByQuestionOwner,
+      MAX(a.CreationDate) AS LastAnswerDate
+    FROM Posts p
+    JOIN Posts a
+      ON p.Id = a.ParentId
+    WHERE
+      p.PostTypeId = 1 AND a.PostTypeId = 2
+    GROUP BY
+      p.Id,
+      p.OwnerUserId,
+      p.Title,
+      p.CreationDate,
+      p.Score,
+      p.FavoriteCount,
+      p.AnswerCount
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate AS UserCreationDate,
+      u.Views AS UserViews,
+      u.UpVotes AS UserUpVotes,
+      u.DownVotes AS UserDownVotes,
+      COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsAsked,
+      COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersGiven,
+      COUNT(DISTINCT c.Id) AS CommentsMade,
+      COUNT(DISTINCT b.Id) AS BadgesEarned,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS TotalAnswerScore,
+      MAX(p.LastActivityDate) AS LastPostActivityDate
+    FROM Users u
+    LEFT JOIN Posts p
+      ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c
+      ON u.Id = c.UserId
+    LEFT JOIN Badges b
+      ON u.Id = b.UserId
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate,
+      u.Views,
+      u.UpVotes,
+      u.DownVotes
+  ),
+  TopAnswers AS (
+    SELECT
+      a.Id AS AnswerId,
+      a.ParentId AS QuestionId,
+      a.OwnerUserId AS AnswerOwnerUserId,
+      a.Score AS AnswerScore,
+      a.CreationDate AS AnswerCreationDate,
+      ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS rn
+    FROM Posts a
+    WHERE
+      a.PostTypeId = 2
+  ),
+  QuestionMetrics AS (
+    SELECT
+      aq.QuestionId,
+      aq.QuestionTitle,
+      aq.QuestionScore,
+      aq.QuestionFavoriteCount,
+      aq.QuestionAnswerCount,
+      aq.ActualAnswerCount,
+      aq.MaxAnswerScore,
+      aq.AvgAnswerScore,
+      aq.AnswersByQuestionOwner,
+      aq.LastAnswerDate,
+      aq.QuestionCreationDate,
+      ta.AnswerId AS TopAnswerId,
+      ta.AnswerOwnerUserId AS TopAnswerOwnerUserId,
+      ta.AnswerScore AS TopAnswerScore,
+      ta.AnswerCreationDate AS TopAnswerCreationDate,
+      CASE
+        WHEN aq.QuestionOwnerUserId IS NULL THEN 'Anonymous'
+        ELSE COALESCE(ua_q.DisplayName, 'Deleted User')
+      END AS QuestionOwnerDisplayName,
+      CASE
+        WHEN ta.AnswerOwnerUserId IS NULL THEN 'Anonymous'
+        ELSE COALESCE(ua_a.DisplayName, 'Deleted User')
+      END AS TopAnswerOwnerDisplayName,
+      CAST( FLOOR(EXTRACT(EPOCH FROM (aq.LastAnswerDate - aq.QuestionCreationDate)) / 86400) AS INTEGER ) AS DaysToFirstAnswer,
+      ROW_NUMBER() OVER (ORDER BY aq.QuestionScore DESC, aq.QuestionFavoriteCount DESC) AS QuestionRank
+    FROM AnsweredQuestions aq
+    LEFT JOIN TopAnswers ta
+      ON aq.QuestionId = ta.QuestionId AND ta.rn = 1
+    LEFT JOIN UserActivity ua_q
+      ON aq.QuestionOwnerUserId = ua_q.UserId
+    LEFT JOIN UserActivity ua_a
+      ON ta.AnswerOwnerUserId = ua_a.UserId
+  ),
+  TitleTags AS (
+    -- dialect-generic approach: split tags in title by removing brackets and splitting on commas using a portable method
+    -- Implemented by treating titles as comma-separated lists when brackets present. Uses a recursive CTE to split strings.
+    split_input AS (
+      SELECT
+        qm.QuestionId,
+        qm.QuestionTitle,
+        CASE WHEN POSITION('[' IN qm.QuestionTitle) > 0 AND POSITION(']' IN qm.QuestionTitle) > POSITION('[' IN qm.QuestionTitle)
+             THEN SUBSTRING(qm.QuestionTitle FROM POSITION('[' IN qm.QuestionTitle) + 1 FOR POSITION(']' IN qm.QuestionTitle) - POSITION('[' IN qm.QuestionTitle) - 1)
+             ELSE NULL
+        END AS tag_list
+      FROM QuestionMetrics qm
+    ),
+    recursive_split(id, remaining, tag) AS (
+      SELECT id, tag_list AS remaining, NULL::VARCHAR AS tag FROM split_input
+      WHERE tag_list IS NOT NULL
+      UNION ALL
+      SELECT
+        id,
+        CASE
+          WHEN POSITION(',' IN remaining) > 0 THEN SUBSTRING(remaining FROM POSITION(',' IN remaining) + 1)
+          ELSE ''
+        END,
+        CASE
+          WHEN POSITION(',' IN remaining) > 0 THEN TRIM(SUBSTRING(remaining FROM 1 FOR POSITION(',' IN remaining) - 1))
+          ELSE TRIM(remaining)
+        END
+      FROM recursive_split
+      WHERE remaining IS NOT NULL AND remaining <> ''
+    )
+    SELECT id AS QuestionId, COUNT(*) AS TagCountInTitle
+    FROM recursive_split
+    WHERE tag IS NOT NULL AND TRIM(tag) <> ''
+    GROUP BY id
+  )
+SELECT
+  qm.QuestionId,
+  qm.QuestionTitle,
+  qm.QuestionScore,
+  qm.QuestionFavoriteCount,
+  qm.QuestionAnswerCount,
+  qm.ActualAnswerCount,
+  qm.MaxAnswerScore,
+  qm.AvgAnswerScore,
+  qm.AnswersByQuestionOwner,
+  qm.QuestionOwnerDisplayName,
+  qm.TopAnswerId,
+  qm.TopAnswerScore,
+  qm.TopAnswerOwnerDisplayName,
+  qm.DaysToFirstAnswer,
+  ua.UserCreationDate,
+  ua.Reputation,
+  ua.UserViews,
+  ua.UserUpVotes,
+  ua.UserDownVotes,
+  ua.QuestionsAsked,
+  ua.AnswersGiven,
+  ua.CommentsMade,
+  ua.BadgesEarned,
+  ua.TotalAnswerScore,
+  CASE
+    WHEN ua.LastPostActivityDate IS NULL THEN 'Never'
+    ELSE CAST(ua.LastPostActivityDate AS VARCHAR)
+  END AS LastActivity,
+  qm.QuestionRank,
+  CASE
+    WHEN qm.QuestionScore > 100 AND qm.ActualAnswerCount > 10 THEN 'High Impact'
+    WHEN qm.QuestionScore < 0 AND qm.ActualAnswerCount < 3 THEN 'Low Engagement'
+    ELSE 'Standard'
+  END AS QuestionImpactCategory,
+  '---' AS Separator,
+  (
+    SELECT
+      COUNT(*)
+    FROM PostHistory ph
+    WHERE
+      ph.PostId = qm.QuestionId AND ph.PostHistoryTypeId IN (4, 5)
+  ) AS EditCountForQuestion,
+  (
+    SELECT
+      SUM(CAST(ph_inner.Text AS INTEGER))
+    FROM PostHistory ph_inner
+    WHERE
+      ph_inner.PostId = qm.QuestionId AND ph_inner.PostHistoryTypeId IN (12, 13)
+  ) AS VoteCountForQuestionHistory,
+  COALESCE(pt.Name, 'Unknown Post Type') AS QuestionPostTypeName,
+  CASE
+    WHEN qm.QuestionScore < 0 THEN 'Negative Score'
+    WHEN qm.QuestionScore BETWEEN 0 AND 10 THEN 'Low Score'
+    WHEN qm.QuestionScore BETWEEN 11 AND 50 THEN 'Medium Score'
+    ELSE 'High Score'
+  END AS ScoreCategory,
+  UPPER(SUBSTRING(qm.QuestionTitle FROM 1 FOR 3)) AS TitlePrefix,
+  COALESCE(tt.TagCountInTitle, 0) AS TagCountInTitle,
+  CASE
+    WHEN EXISTS (
+      SELECT 1 FROM PostLinks pl WHERE pl.PostId = qm.QuestionId AND pl.LinkTypeId = 3
+    ) THEN 'Is Duplicate Link'
+    ELSE 'Not a Duplicate Link'
+  END AS LinkStatus,
+  CASE
+    WHEN qm.QuestionScore IS NULL THEN 'NULL Score'
+    WHEN qm.QuestionFavoriteCount IS NULL THEN 'NULL FavoriteCount'
+    ELSE 'Valid'
+  END AS DataValidity,
+  LAG(qm.QuestionScore, 1, 0) OVER (ORDER BY qm.QuestionCreationDate) AS PreviousQuestionScore,
+  LEAD(qm.QuestionScore, 1, 0) OVER (ORDER BY qm.QuestionCreationDate) AS NextQuestionScore,
+  qm.QuestionRank - ROW_NUMBER() OVER (PARTITION BY qm.QuestionOwnerDisplayName ORDER BY qm.QuestionScore DESC) AS RankDifferenceForOwner,
+  ua_m.UserCreationDate AS ModeratorOrAdminCreationDate,
+  CASE
+    WHEN qm.QuestionOwnerDisplayName = 'Anonymous' OR qm.QuestionOwnerDisplayName IS NULL THEN 1
+    ELSE 0
+  END AS IsQuestionAnonymousOrDeleted
+FROM QuestionMetrics qm
+LEFT JOIN UserActivity ua
+  ON qm.QuestionId = ua.UserId
+LEFT JOIN UserActivity ua_m
+  ON qm.TopAnswerOwnerUserId = ua_m.UserId
+LEFT JOIN PostTypes pt
+  ON pt.Id = 1
+LEFT JOIN TitleTags tt
+  ON qm.QuestionId = tt.QuestionId
+WHERE
+  qm.QuestionScore > -5 AND qm.ActualAnswerCount > 0
+
+UNION
+
+SELECT
+  NULL AS QuestionId,
+  NULL AS QuestionTitle,
+  NULL AS QuestionScore,
+  NULL AS QuestionFavoriteCount,
+  NULL AS QuestionAnswerCount,
+  NULL AS ActualAnswerCount,
+  NULL AS MaxAnswerScore,
+  NULL AS AvgAnswerScore,
+  NULL AS AnswersByQuestionOwner,
+  NULL AS QuestionOwnerDisplayName,
+  NULL AS TopAnswerId,
+  NULL AS TopAnswerScore,
+  NULL AS TopAnswerOwnerDisplayName,
+  NULL AS DaysToFirstAnswer,
+  ua.UserCreationDate,
+  ua.Reputation,
+  ua.UserViews,
+  ua.UserUpVotes,
+  ua.UserDownVotes,
+  ua.QuestionsAsked,
+  ua.AnswersGiven,
+  ua.CommentsMade,
+  ua.BadgesEarned,
+  ua.TotalAnswerScore,
+  CAST(ua.LastPostActivityDate AS VARCHAR) AS LastActivity,
+  NULL AS QuestionRank,
+  'User Summary' AS QuestionImpactCategory,
+  '---' AS Separator,
+  NULL AS EditCountForQuestion,
+  NULL AS VoteCountForQuestionHistory,
+  'User Stats' AS QuestionPostTypeName,
+  NULL AS ScoreCategory,
+  NULL AS TitlePrefix,
+  NULL AS TagCountInTitle,
+  NULL AS LinkStatus,
+  NULL AS DataValidity,
+  NULL AS PreviousQuestionScore,
+  NULL AS NextQuestionScore,
+  NULL AS RankDifferenceForOwner,
+  NULL AS ModeratorOrAdminCreationDate,
+  NULL AS IsQuestionAnonymousOrDeleted
+FROM UserActivity ua
+WHERE
+  ua.Reputation > 10000
+ORDER BY
+  QuestionRank NULLS LAST,
+  LastActivity DESC;

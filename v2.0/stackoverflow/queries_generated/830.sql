@@ -1,0 +1,298 @@
+-- {"query": "830.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2760} 
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        u.location,
+        count(*) filter (where b.class = 1) as gold_badges,
+        count(*) filter (where b.class = 2) as silver_badges,
+        count(*) filter (where b.class = 3) as bronze_badges,
+        max(b.date) as last_badge_date
+    from users u
+    left join badges b
+      on b.userid = u.id
+    where u.creationdate >= (select date_trunc('year', max(creationdate)) from users)
+    group by u.id, u.displayname, u.reputation, u.creationdate, u.location
+),
+question_activity as (
+    select
+        p.owneruserid as user_id,
+        count(*) as questions,
+        sum(coalesce(p.viewcount,0)) as question_views,
+        sum(coalesce(p.score,0)) as question_score,
+        sum(case when p.closeddate is not null then 1 else 0 end) as closed_questions,
+        avg(nullif(p.answercount,0)) as avg_answercount_nonzero
+    from posts p
+    where p.posttypeid = 1
+      and p.creationdate >= (select date_trunc('year', max(creationdate)) from posts)
+    group by p.owneruserid
+),
+answer_activity as (
+    select
+        p.owneruserid as user_id,
+        count(*) as answers,
+        sum(coalesce(p.score,0)) as answer_score,
+        count(distinct p.parentid) as distinct_questions_answered,
+        count(*) filter (where p.score > 0) as positive_answers,
+        max(p.creationdate) as last_answer_date
+    from posts p
+    where p.posttypeid = 2
+    group by p.owneruserid
+),
+comment_stats as (
+    select
+        c.userid as user_id,
+        count(*) as comments,
+        sum(coalesce(c.score,0)) as comment_score,
+        max(c.creationdate) as last_comment_date
+    from comments c
+    group by c.userid
+),
+vote_tallies as (
+    select
+        p.owneruserid as user_id,
+        sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes_received,
+        sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes_received,
+        sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started_amount,
+        sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded_amount
+    from posts p
+    join votes v
+      on v.postid = p.id
+    group by p.owneruserid
+),
+dup_links as (
+    select
+        q.owneruserid as user_id,
+        count(*) as duplicates_marked_on_their_posts,
+        count(distinct pl.relatedpostid) as distinct_dupe_targets
+    from postlinks pl
+    join posts q on q.id = pl.postid and q.posttypeid = 1
+    where pl.linktypeid = 3
+    group by q.owneruserid
+),
+tag_extract as (
+    select
+        p.id,
+        p.owneruserid as user_id,
+        unnest(string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')) as tagname
+    from posts p
+    where p.posttypeid = 1
+      and p.tags is not null
+),
+top_user_tags as (
+    select user_id, tagname, cnt,
+           dense_rank() over (partition by user_id order by cnt desc, tagname) as rnk
+    from (
+        select user_id, tagname, count(*) as cnt
+        from tag_extract
+        group by user_id, tagname
+    ) s
+),
+user_top3_tags as (
+    select user_id,
+           string_agg(tagname || ':' || cnt::text, ', ' order by rnk, tagname) as top3_tags
+    from (
+        select user_id, tagname, cnt, rnk
+        from top_user_tags
+        where rnk <= 3
+    ) x
+    group by user_id
+),
+post_edits as (
+    select
+        ph.userid as editor_user_id,
+        ph.postid,
+        count(*) filter (where ph.posthistorytypeid in (4,5,6,7,8,9,24)) as edit_events,
+        min(ph.creationdate) as first_edit_date,
+        max(ph.creationdate) as last_edit_date
+    from posthistory ph
+    group by ph.userid, ph.postid
+),
+edit_agg as (
+    select
+        editor_user_id as user_id,
+        count(distinct postid) as posts_edited,
+        sum(edit_events) as total_edit_events,
+        max(last_edit_date) as last_edit_any
+    from post_edits
+    group by editor_user_id
+),
+user_core as (
+    select
+        ru.user_id,
+        ru.displayname,
+        coalesce(ru.location, '(unknown)') as location,
+        ru.reputation,
+        ru.creationdate,
+        coalesce(ru.gold_badges,0) as gold_badges,
+        coalesce(ru.silver_badges,0) as silver_badges,
+        coalesce(ru.bronze_badges,0) as bronze_badges,
+        ru.last_badge_date,
+        coalesce(qa.questions,0) as questions,
+        coalesce(qa.question_views,0) as question_views,
+        coalesce(qa.question_score,0) as question_score,
+        coalesce(qa.closed_questions,0) as closed_questions,
+        qa.avg_answercount_nonzero,
+        coalesce(aa.answers,0) as answers,
+        coalesce(aa.answer_score,0) as answer_score,
+        coalesce(aa.distinct_questions_answered,0) as distinct_questions_answered,
+        coalesce(aa.positive_answers,0) as positive_answers,
+        aa.last_answer_date,
+        coalesce(cs.comments,0) as comments,
+        coalesce(cs.comment_score,0) as comment_score,
+        cs.last_comment_date,
+        coalesce(vt.upvotes_received,0) as upvotes_received,
+        coalesce(vt.downvotes_received,0) as downvotes_received,
+        coalesce(vt.bounty_started_amount,0) as bounty_started_amount,
+        coalesce(vt.bounty_awarded_amount,0) as bounty_awarded_amount,
+        coalesce(dl.duplicates_marked_on_their_posts,0) as duplicates_marked_on_their_posts,
+        coalesce(dl.distinct_dupe_targets,0) as distinct_dupe_targets,
+        ut.top3_tags,
+        coalesce(ea.posts_edited,0) as posts_edited,
+        coalesce(ea.total_edit_events,0) as total_edit_events,
+        ea.last_edit_any
+    from recent_users ru
+    left join question_activity qa on qa.user_id = ru.user_id
+    left join answer_activity aa on aa.user_id = ru.user_id
+    left join comment_stats cs on cs.user_id = ru.user_id
+    left join vote_tallies vt on vt.user_id = ru.user_id
+    left join dup_links dl on dl.user_id = ru.user_id
+    left join user_top3_tags ut on ut.user_id = ru.user_id
+    left join edit_agg ea on ea.user_id = ru.user_id
+),
+scored as (
+    select
+        uc.*,
+        -- engagement score with mixed signals and null-safe arithmetic
+        (
+            0.6 * ln(1 + uc.question_views)
+          + 1.0 * ln(1 + uc.answers + uc.questions)
+          + 0.8 * greatest(uc.answer_score, 0)
+          + 0.5 * greatest(uc.question_score, 0)
+          + 0.3 * uc.comment_score
+          + 2.0 * uc.gold_badges
+          + 1.2 * uc.silver_badges
+          + 0.6 * uc.bronze_badges
+          + 0.4 * uc.upvotes_received
+          - 0.7 * uc.downvotes_received
+          - 1.5 * uc.closed_questions
+          + 0.1 * coalesce(uc.bounty_awarded_amount,0)
+        ) as engagement_score,
+        case
+          when uc.answers > 0 then round(100.0 * uc.positive_answers::numeric / uc.answers, 2)
+          else null
+        end as pct_positive_answers,
+        -- recent activity composite timestamp
+        greatest(
+            uc.last_answer_date,
+            uc.last_comment_date,
+            uc.last_badge_date,
+            uc.last_edit_any,
+            uc.creationdate
+        ) as last_activity_any
+    from user_core uc
+),
+ranked as (
+    select
+        s.*,
+        row_number() over (
+            partition by (case when s.location ilike '%united states%' then 'US' else 'Non-US' end)
+            order by s.engagement_score desc, s.reputation desc, s.user_id
+        ) as regional_rank,
+        ntile(10) over (order by s.engagement_score desc nulls last) as decile,
+        avg(s.engagement_score) over () as global_avg_score,
+        stddev_pop(s.engagement_score) over () as global_stddev_score
+    from scored s
+),
+flagged as (
+    select
+        r.*,
+        case
+          when r.engagement_score is null then 'MISSING'
+          when r.engagement_score >= coalesce(r.global_avg_score + 2 * nullif(r.global_stddev_score,0), r.global_avg_score) then 'OUTLIER_HI'
+          when r.engagement_score <= coalesce(r.global_avg_score - 2 * nullif(r.global_stddev_score,0), r.global_avg_score) then 'OUTLIER_LO'
+          else 'NORMAL'
+        end as outlier_flag
+    from ranked r
+),
+dupe_pairs as (
+    select
+        q.id as dup_post_id,
+        q.owneruserid as user_id,
+        pl.relatedpostid as target_id,
+        row_number() over (partition by q.id order by pl.creationdate desc, pl.id desc) as rn
+    from postlinks pl
+    join posts q on q.id = pl.postid and q.posttypeid = 1
+    where pl.linktypeid = 3
+),
+canonical_dupes as (
+    select user_id,
+           count(*) as latest_dupe_marks,
+           count(distinct target_id) as latest_distinct_targets
+    from dupe_pairs
+    where rn = 1
+    group by user_id
+)
+select
+    f.user_id,
+    coalesce(f.displayname, '(anonymous)') as displayname,
+    f.location,
+    f.reputation,
+    f.engagement_score,
+    f.decile,
+    f.outlier_flag,
+    f.regional_rank,
+    f.questions,
+    f.answers,
+    f.distinct_questions_answered,
+    f.question_views,
+    f.question_score,
+    f.answer_score,
+    f.comments,
+    f.comment_score,
+    f.upvotes_received,
+    f.downvotes_received,
+    f.bounty_started_amount,
+    f.bounty_awarded_amount,
+    f.gold_badges,
+    f.silver_badges,
+    f.bronze_badges,
+    f.closed_questions,
+    f.posts_edited,
+    f.total_edit_events,
+    coalesce(f.top3_tags, '(no tags)') as top3_tags,
+    coalesce(cd.latest_dupe_marks,0) as latest_dupe_marks,
+    coalesce(cd.latest_distinct_targets,0) as latest_distinct_targets,
+    f.last_activity_any,
+    -- string expression and null logic example
+    trim(both ' ' from
+        coalesce(f.displayname, '') || ' @ ' ||
+        coalesce(nullif(f.location,''), 'somewhere')
+    ) as display_with_location
+from flagged f
+left join canonical_dupes cd on cd.user_id = f.user_id
+where
+    -- complicated predicate: focus on active-ish users with any signal
+    (
+        f.engagement_score > 0
+        or (f.answers + f.questions) >= 5
+        or (f.gold_badges + f.silver_badges + f.bronze_badges) >= 3
+        or f.posts_edited >= 10
+    )
+    and (
+        f.last_activity_any >= now() - interval '3 years'
+        or (f.reputation >= 1000 and f.decile <= 3)
+    )
+    and not (
+        f.location ilike '%test%'
+        and f.reputation < 50
+        and coalesce(f.comments,0) = 0
+    )
+order by
+    f.decile asc,
+    f.engagement_score desc nulls last,
+    f.reputation desc,
+    f.user_id
+limit 250;

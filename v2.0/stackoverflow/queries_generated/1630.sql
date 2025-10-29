@@ -1,0 +1,208 @@
+-- {"query": "1630.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3616} 
+
+WITH UserSummary AS (
+    -- Summarizes user activity and reputation metrics, including active days and average post score.
+    SELECT
+        u.Id AS UserId,
+        COALESCE(u.DisplayName, 'Anonymous Contributor') AS UserDisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        EXTRACT(DAY FROM (u.LastAccessDate - u.CreationDate)) AS DaysActive,
+        COUNT(p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        AVG(CAST(COALESCE(p.Score, 0) AS NUMERIC)) AS AvgPostScore,
+        MAX(p.CreationDate) AS LatestPostDate,
+        NULLIF(TRIM(u.WebsiteUrl), '') AS UserWebsite,
+        u.Views AS UserProfileViews
+    FROM Users AS u
+    LEFT JOIN Posts AS p ON u.Id = p.OwnerUserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.WebsiteUrl, u.Views
+    HAVING COUNT(p.Id) > 5 AND u.Reputation > 100 -- Filter out very inactive/low-rep users
+),
+PostDetailAndEngagement AS (
+    -- Gathers detailed engagement metrics for questions, including vote counts, comment activity, and edit history.
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount AS DirectCommentCount,
+        COALESCE(p.FavoriteCount, 0) AS FavoriteCountFromPost, -- NULL handling for FavoriteCount
+        p.LastEditDate,
+        p.Title,
+        p.Tags,
+        p.ClosedDate,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotes,
+        SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS TotalFavoritesFromVotes,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        LAG(p.LastEditDate, 1, p.CreationDate) OVER (PARTITION BY p.Id ORDER BY p.LastEditDate) AS PreviousEditDate, -- Window function: LAG with default
+        (SELECT p_ans.Score FROM Posts AS p_ans WHERE p_ans.Id = p.AcceptedAnswerId AND p_ans.PostTypeId = 2) AS AcceptedAnswerScore -- Correlated subquery for accepted answer score
+    FROM Posts AS p
+    LEFT JOIN Comments AS c ON p.Id = c.PostId
+    LEFT JOIN Votes AS v ON p.Id = v.PostId
+    WHERE p.PostTypeId = 1 -- Focus on questions
+    GROUP BY
+        p.Id, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount,
+        p.FavoriteCount, p.LastEditDate, p.Title, p.Tags, p.ClosedDate, p.AcceptedAnswerId
+),
+PostHistoryAnomalies AS (
+    -- Identifies posts with unusual history patterns like multiple close/reopen events or frequent body edits.
+    SELECT
+        ph.PostId,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (10, 101) THEN 1 END) AS CloseEvents, -- Post Closed (Old/New)
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 END) AS ReopenEvents, -- Post Reopened
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (5, 8) THEN 1 END) AS BodyEditEvents, -- Edit Body or Rollback Body
+        MIN(ph.CreationDate) AS FirstHistoryEvent,
+        MAX(ph.CreationDate) AS LastHistoryEvent,
+        -- Attempt to extract the last close reason name, handling cases where 'Comment' might not be a valid integer ID
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (10, 101) AND ph.Comment ~ '^[0-9]+$' THEN crt.Name ELSE NULL END) AS LastCloseReasonName,
+        NTILE(4) OVER (ORDER BY COUNT(ph.Id) DESC) AS HistoryEventQuartile -- Categorize posts into quartiles based on history event count
+    FROM PostHistory AS ph
+    LEFT JOIN CloseReasonTypes AS crt ON (ph.PostHistoryTypeId IN (10, 101) AND ph.Comment = crt.Id::VARCHAR)
+    WHERE ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 10, 11, 12, 13, 16, 19, 20, 50) -- Broad range of relevant history types
+    GROUP BY ph.PostId
+    HAVING COUNT(ph.Id) > 3 AND COUNT(CASE WHEN ph.PostHistoryTypeId IN (10, 101, 11) THEN 1 END) >= 1 -- Posts with significant closing/reopening history
+),
+TagExpertiseAndBadges AS (
+    -- Analyzes user expertise in specific tags based on post scores and badge achievements.
+    SELECT
+        u.Id AS UserId,
+        tag.value AS TagName, -- Tag extracted from Posts.Tags
+        COUNT(p.Id) AS PostsInTag,
+        SUM(p.Score) AS TotalScoreInTag,
+        AVG(CAST(COALESCE(p.Score, 0) AS NUMERIC)) AS AvgScoreInTag,
+        MAX(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS HasGoldBadgeInTag, -- Indicates if user has a Gold badge for this tag
+        COUNT(DISTINCT b.Id) AS TotalBadges
+    FROM Users AS u
+    INNER JOIN Posts AS p ON u.Id = p.OwnerUserId
+    -- Lateral join to unnest the tags string into individual tag rows. Assumes PostgreSQL string functions.
+    CROSS JOIN LATERAL (SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><')) AS value) AS tag
+    LEFT JOIN Badges AS b ON u.Id = b.UserId AND b.TagBased = TRUE AND b.Name = tag.value
+    WHERE p.PostTypeId IN (1, 2) AND p.Tags IS NOT NULL AND LENGTH(TRIM(p.Tags)) > 2 -- Only questions/answers with tags
+    GROUP BY u.Id, tag.value
+    HAVING COUNT(p.Id) > 2 AND SUM(p.Score) > 10 -- Minimum contribution in a tag to be considered an 'expert'
+),
+CombinedUserPostMetrics AS (
+    -- Combines all previous CTEs to form a comprehensive view of highly engaged users and their posts.
+    SELECT
+        us.UserId,
+        us.UserDisplayName,
+        us.Reputation,
+        us.TotalPosts,
+        us.TotalQuestions,
+        us.TotalAnswers,
+        us.AvgPostScore,
+        pde.PostId,
+        pde.Title,
+        pde.PostScore,
+        pde.ViewCount,
+        pde.AnswerCount,
+        pde.TotalComments,
+        pde.TotalUpVotes,
+        pde.TotalDownVotes,
+        pde.FavoriteCountFromPost + pde.TotalFavoritesFromVotes AS CombinedFavoriteCount, -- Aggregate favorite counts
+        pde.PreviousEditDate,
+        pde.LastEditDate,
+        pde.AcceptedAnswerScore,
+        pha.CloseEvents,
+        pha.ReopenEvents,
+        pha.BodyEditEvents,
+        pha.LastCloseReasonName,
+        teb.TagName,
+        teb.PostsInTag,
+        teb.TotalScoreInTag,
+        teb.AvgScoreInTag,
+        teb.HasGoldBadgeInTag,
+        teb.TotalBadges,
+        -- Complex weighted performance calculation, considering reputation, average post score, and tag-specific expertise
+        (us.Reputation * 0.15 + us.AvgPostScore * 0.35 + COALESCE(teb.AvgScoreInTag, 0) * 0.30 + (pde.TotalUpVotes - pde.TotalDownVotes) * 0.20) AS WeightedUserPerformance,
+        -- Overall ranking of users based on their weighted performance
+        DENSE_RANK() OVER (ORDER BY (us.Reputation * 0.15 + us.AvgPostScore * 0.35 + COALESCE(teb.AvgScoreInTag, 0) * 0.30 + (pde.TotalUpVotes - pde.TotalDownVotes) * 0.20) DESC, us.TotalPosts DESC) AS OverallUserRank,
+        -- Categorizes users based on their primary contribution type
+        CASE
+            WHEN us.TotalQuestions > us.TotalAnswers * 1.5 AND us.TotalAnswers > 0 THEN 'Question-Heavy Contributor'
+            WHEN us.TotalAnswers > us.TotalQuestions * 1.5 AND us.TotalQuestions > 0 THEN 'Answer-Heavy Contributor'
+            WHEN us.TotalQuestions = 0 AND us.TotalAnswers = 0 THEN 'Inactive/Unknown'
+            ELSE 'Balanced Contributor'
+        END AS ContributionCategory,
+        COALESCE(us.UserWebsite, 'No Website Provided') AS DisplayWebsite,
+        -- Extracts the first 5 characters of the title, converting to lowercase and NULLing if it matches 'how t'
+        NULLIF(LOWER(SUBSTRING(pde.Title, 1, 5)), 'how t') AS TitlePrefixIfQuestion,
+        -- Correlated subquery: counts gold badges for the specific user
+        (SELECT COUNT(DISTINCT b2.Id) FROM Badges AS b2 WHERE b2.UserId = us.UserId AND b2.Class = 1) AS UserGoldBadgeCount
+    FROM UserSummary AS us
+    INNER JOIN PostDetailAndEngagement AS pde ON us.UserId = pde.OwnerUserId
+    LEFT JOIN PostHistoryAnomalies AS pha ON pde.PostId = pha.PostId
+    LEFT JOIN TagExpertiseAndBadges AS teb ON us.UserId = teb.UserId AND pde.Tags LIKE '%<' || teb.TagName || '>%' -- Join back on the specific tag present in the post
+    WHERE
+        us.Reputation > 2000
+        AND us.DaysActive > 730 -- Active for at least 2 years
+        AND pde.PostId IS NOT NULL
+        AND (pde.ClosedDate IS NULL OR pha.ReopenEvents > 0) -- Either not closed or has been reopened
+        AND (pde.Title ILIKE '%performance%' OR pde.Title ILIKE '%optimization%' OR pde.Tags ILIKE '%<sql>%' OR pde.Tags ILIKE '%<database>%') -- String matching using ILIKE
+        AND (pde.LastEditDate IS NOT NULL AND pde.PreviousEditDate IS NOT NULL AND (pde.LastEditDate - pde.PreviousEditDate) < INTERVAL '60 days') -- Posts edited frequently
+        AND EXISTS (SELECT 1 FROM Comments c WHERE c.PostId = pde.PostId AND c.CreationDate > NOW() - INTERVAL '180 days' AND c.Score > 0) -- Correlated subquery: recent, positive-score comments
+        AND COALESCE(pha.BodyEditEvents, 0) >= 1 -- At least one body edit/rollback history
+        AND COALESCE(teb.HasGoldBadgeInTag, 0) = 1 -- User has a Gold badge for the specific tag relevant to the post
+),
+UnderappreciatedPosts AS (
+    -- Identifies posts with high view counts but a low number of answers or low score, suggesting potential "community debt".
+    SELECT
+        us.UserId,
+        us.UserDisplayName,
+        us.Reputation,
+        us.TotalPosts,
+        us.TotalQuestions,
+        us.TotalAnswers,
+        us.AvgPostScore,
+        pde.PostId,
+        pde.Title,
+        pde.PostScore,
+        pde.ViewCount,
+        pde.AnswerCount,
+        pde.TotalComments,
+        pde.TotalUpVotes,
+        pde.TotalDownVotes,
+        pde.FavoriteCountFromPost + pde.TotalFavoritesFromVotes AS CombinedFavoriteCount,
+        pde.PreviousEditDate,
+        pde.LastEditDate,
+        pde.AcceptedAnswerScore,
+        pha.CloseEvents,
+        pha.ReopenEvents,
+        pha.BodyEditEvents,
+        pha.LastCloseReasonName,
+        'N/A' AS TagName, -- No specific tag focus for this branch
+        NULL AS PostsInTag,
+        NULL AS TotalScoreInTag,
+        NULL AS AvgScoreInTag,
+        0 AS HasGoldBadgeInTag,
+        (SELECT COUNT(DISTINCT b_alt.Id) FROM Badges AS b_alt WHERE b_alt.UserId = us.UserId) AS TotalBadges, -- Correlated for total badges
+        (us.Reputation * 0.05 + pde.ViewCount * 0.0005 - COALESCE(pde.AnswerCount, 0) * 0.05 - COALESCE(pde.PostScore, 0) * 0.01) AS WeightedUserPerformance, -- Different weighting for "underappreciated"
+        DENSE_RANK() OVER (ORDER BY (us.Reputation * 0.05 + pde.ViewCount * 0.0005 - COALESCE(pde.AnswerCount, 0) * 0.05 - COALESCE(pde.PostScore, 0) * 0.01) DESC, pde.ViewCount DESC) AS OverallUserRank,
+        'Underappreciated Content' AS ContributionCategory, -- Specific category for this UNION ALL branch
+        COALESCE(us.UserWebsite, 'No Website Provided') AS DisplayWebsite,
+        NULLIF(LOWER(SUBSTRING(pde.Title, 1, 5)), 'how t') AS TitlePrefixIfQuestion,
+        (SELECT COUNT(DISTINCT b2.Id) FROM Badges AS b2 WHERE b2.UserId = us.UserId AND b2.Class = 1) AS UserGoldBadgeCount
+    FROM UserSummary AS us
+    INNER JOIN PostDetailAndEngagement AS pde ON us.UserId = pde.OwnerUserId
+    LEFT JOIN PostHistoryAnomalies AS pha ON pde.PostId = pha.PostId
+    WHERE
+        us.Reputation BETWEEN 500 AND 5000 -- Moderate reputation range
+        AND pde.ViewCount > 10000 -- High views
+        AND (pde.AnswerCount IS NULL OR pde.AnswerCount < 3) -- Low number of answers
+        AND COALESCE(pde.PostScore, 0) < 10 -- Low post score
+        AND pde.CreationDate > NOW() - INTERVAL '3 year' -- Relatively recent posts
+        AND pde.ClosedDate IS NULL -- Must not be closed
+)
+-- Final result set combines highly engaged posts with underappreciated posts, ordered by a combined ranking.
+SELECT * FROM CombinedUserPostMetrics
+UNION ALL
+SELECT * FROM UnderappreciatedPosts
+ORDER BY OverallUserRank ASC, Reputation DESC, PostId
+LIMIT 2000;

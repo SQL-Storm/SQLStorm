@@ -1,0 +1,141 @@
+-- {"query": "4603.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1399} 
+
+WITH
+  QuestionMetrics AS (
+    SELECT
+      p.Id AS QuestionId,
+      p.OwnerUserId,
+      p.Title,
+      p.CreationDate AS QuestionCreationDate,
+      p.Score AS QuestionScore,
+      p.ViewCount AS QuestionViewCount,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      p.ClosedDate,
+      p.CommunityOwnedDate,
+      (
+        SELECT
+          COUNT(*)
+        FROM
+          Posts AS a
+        WHERE
+          a.ParentId = p.Id AND a.PostTypeId = 2
+      ) AS AnswerCountSubquery,
+      (
+        SELECT
+          SUM(s.Score)
+        FROM
+          Posts AS a
+          JOIN Votes AS s ON a.Id = s.PostId
+        WHERE
+          a.ParentId = p.Id AND a.PostTypeId = 2 AND s.VoteTypeId = 2
+      ) AS TotalAnswerUpvotes,
+      (
+        SELECT
+          AVG(s.Score)
+        FROM
+          Posts AS a
+          JOIN Votes AS s ON a.Id = s.PostId
+        WHERE
+          a.ParentId = p.Id AND a.PostTypeId = 2 AND s.VoteTypeId = 3
+      ) AS AvgAnswerDownvotes,
+      ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.ViewCount DESC) AS RankByScoreView,
+      DENSE_RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS RankByUserCreation,
+      LAG(p.CreationDate, 1, NULL) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousQuestionDate
+    FROM
+      Posts AS p
+    WHERE
+      p.PostTypeId = 1 AND p.OwnerUserId IS NOT NULL AND p.CreationDate > '2023-01-01'
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate AS UserCreationDate,
+      u.Views AS UserViews,
+      u.UpVotes AS UserUpVotes,
+      u.DownVotes AS UserDownVotes,
+      COUNT(DISTINCT qm.QuestionId) AS NumberOfQuestions,
+      SUM(qm.AnswerCount) AS TotalAnswersGiven,
+      AVG(qm.QuestionScore) AS AvgQuestionScore,
+      SUM(qm.QuestionViewCount) AS TotalQuestionViews,
+      MAX(qm.QuestionCreationDate) AS LatestQuestionDate,
+      COUNT(DISTINCT b.Id) AS NumberOfBadges
+    FROM
+      Users AS u
+      LEFT JOIN QuestionMetrics AS qm ON u.Id = qm.OwnerUserId
+      LEFT JOIN Badges AS b ON u.Id = b.UserId AND b.Class IN (1, 2)
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate,
+      u.Views,
+      u.UpVotes,
+      u.DownVotes
+    HAVING
+      COUNT(DISTINCT qm.QuestionId) > 5 OR u.Reputation > 10000
+  )
+SELECT
+  ua.DisplayName,
+  ua.Reputation,
+  ua.NumberOfQuestions,
+  ua.TotalAnswersGiven,
+  ua.AvgQuestionScore,
+  ua.TotalQuestionViews,
+  ua.LatestQuestionDate,
+  ua.NumberOfBadges,
+  qm.Title AS MostRecentHighScoringQuestion,
+  qm.QuestionScore AS ScoreOfMostRecentHighScoringQuestion,
+  qm.QuestionViewCount AS ViewCountOfMostRecentHighScoringQuestion,
+  qm.AnswerCount AS AnswersOnMostRecentHighScoringQuestion,
+  qm.TotalAnswerUpvotes AS TotalUpvotesOnAnswers,
+  qm.AvgAnswerDownvotes AS AvgDownvotesOnAnswers,
+  CASE
+    WHEN qm.ClosedDate IS NOT NULL THEN 'Closed'
+    WHEN qm.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+    ELSE 'Open'
+  END AS QuestionStatus,
+  CASE
+    WHEN ua.UserCreationDate < qm.QuestionCreationDate THEN 'User Older Than Question'
+    ELSE 'User Newer Than Question'
+  END AS UserQuestionAgeRelation,
+  CASE
+    WHEN ua.UserCreationDate > qm.PreviousQuestionDate THEN 'ConsecutiveQuestion'
+    ELSE 'NonConsecutiveQuestion'
+  END AS QuestionConsecutiveness,
+  LAG(ua.Reputation, 1, 0) OVER (ORDER BY ua.Reputation DESC) AS PreviousUserReputation,
+  LEAD(ua.Reputation, 1, 0) OVER (ORDER BY ua.Reputation DESC) AS NextUserReputation,
+  (ua.UserUpVotes - ua.UserDownVotes) AS NetUserVotes,
+  COALESCE(ua.UserViews, 0) AS UserViewsCoalesced,
+  LENGTH(ua.DisplayName) AS DisplayNameLength,
+  UPPER(SUBSTRING(ua.DisplayName FROM 1 FOR 1)) AS FirstInitialOfDisplayName,
+  (
+    SELECT
+      COUNT(*)
+    FROM
+      PostHistory AS ph
+      JOIN PostHistoryTypes AS pht ON ph.PostHistoryTypeId = pht.Id
+    WHERE
+      ph.UserId = ua.UserId AND pht.Name IN ('Edit Body', 'Edit Title')
+  ) AS NumberOfEdits,
+  (
+    SELECT
+      COUNT(DISTINCT pl.RelatedPostId)
+    FROM
+      Posts AS p
+      JOIN PostLinks AS pl ON p.Id = pl.PostId
+      JOIN LinkTypes AS lt ON pl.LinkTypeId = lt.Id
+    WHERE
+      p.OwnerUserId = ua.UserId AND lt.Name = 'Duplicate'
+  ) AS NumberOfDuplicateLinksCreated
+FROM
+  UserActivity AS ua
+  LEFT JOIN QuestionMetrics AS qm ON ua.UserId = qm.OwnerUserId
+WHERE
+  qm.RankByScoreView <= 5 OR qm.RankByUserCreation <= 3
+ORDER BY
+  ua.Reputation DESC,
+  ua.NumberOfQuestions DESC;

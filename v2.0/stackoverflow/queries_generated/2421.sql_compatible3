@@ -1,0 +1,177 @@
+WITH RECURSIVE RecursiveUserBadgeCounts AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        b.Class,
+        CAST(COUNT(*) AS integer) AS BadgeCount
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, b.Class
+
+    UNION ALL
+
+    SELECT
+        r.UserId,
+        r.DisplayName,
+        CASE WHEN r.Class IS NULL THEN 3 ELSE r.Class + 1 END AS Class,
+        CAST(0 AS integer) AS BadgeCount
+    FROM RecursiveUserBadgeCounts r
+    WHERE r.Class < 3
+),
+FilteredPosts AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.Title,
+        p.AcceptedAnswerId,
+        p.ParentId
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+      AND p.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '365 days'
+),
+PostVotesAgg AS (
+    SELECT
+        v.PostId,
+        SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes,
+        COUNT(DISTINCT v.UserId) AS UniqueVoters
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY v.PostId
+),
+CommentsWithUser AS (
+    SELECT 
+        c.PostId,
+        COUNT(*) AS CommentCount,
+        COUNT(DISTINCT c.UserId) AS DistinctCommenters,
+        STRING_AGG(DISTINCT COALESCE(c.UserDisplayName, 'Anonymous'), ', ' ORDER BY c.CreationDate DESC) AS RecentCommenters
+    FROM Comments c
+    WHERE c.CreationDate > CAST('2024-10-01' AS date) - INTERVAL '180 days'
+    GROUP BY c.PostId
+),
+LatestEditAgg AS (
+    SELECT
+        ph.PostId,
+        MAX(ph.CreationDate) AS LastEditDate,
+        ph.UserId AS LastEditorUserId,
+        ph.UserDisplayName AS LastEditorName
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4,5,6)
+    GROUP BY ph.PostId, ph.UserId, ph.UserDisplayName
+),
+QuestionsWithAcceptedAnswers AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.Tags,
+        q.AcceptedAnswerId,
+        a.Score AS AcceptedAnswerScore,
+        a.OwnerUserId AS AcceptedAnswerOwner,
+        pva.UpVotes AS AcceptedAnswerUpVotes,
+        pva.DownVotes AS AcceptedAnswerDownVotes
+    FROM FilteredPosts q
+    LEFT JOIN FilteredPosts a ON q.AcceptedAnswerId = a.Id AND a.PostTypeId = 2
+    LEFT JOIN PostVotesAgg pva ON a.Id = pva.PostId
+    WHERE q.PostTypeId = 1
+),
+UserReputationWindow AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        NTILE(5) OVER (ORDER BY u.Reputation DESC) AS ReputationQuintile
+    FROM Users u
+),
+PostLinkDuplicates AS (
+    SELECT
+        pl.PostId,
+        COUNT(CASE WHEN lt.Name = 'Duplicate' THEN 1 END) AS DuplicateLinksCount,
+        COUNT(*) AS TotalLinksCount
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    GROUP BY pl.PostId
+),
+ComplexUserPostMetrics AS (
+    SELECT
+        u.Id AS UserId,
+        COALESCE(COUNT(DISTINCT p.Id), 0) AS TotalPosts,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END), 0) AS Questions,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END), 0) AS Answers,
+        AVG(COALESCE(p.Score, 0)) AS AvgScorePerPost,
+        COALESCE(SUM(p.ViewCount), 0) AS TotalViewsOnPosts
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId IN (1,2)
+    GROUP BY u.Id, u.Id
+),
+FinalRanking AS (
+    SELECT
+        u.UserId,
+        u.DisplayName,
+        u.TotalPosts,
+        u.Questions,
+        u.Answers,
+        u.AvgScorePerPost,
+        u.TotalViewsOnPosts,
+        ur.Reputation,
+        ur.ReputationRank,
+        ur.ReputationQuintile,
+        COALESCE(rub.BadgeCountGold, 0) AS GoldBadges,
+        COALESCE(rub.BadgeCountSilver, 0) AS SilverBadges,
+        COALESCE(rub.BadgeCountBronze, 0) AS BronzeBadges
+    FROM ComplexUserPostMetrics u
+    JOIN UserReputationWindow ur ON ur.UserId = u.UserId
+    LEFT JOIN (
+        SELECT 
+            UserId,
+            SUM(CASE WHEN Class = 1 THEN BadgeCount ELSE 0 END) AS BadgeCountGold,
+            SUM(CASE WHEN Class = 2 THEN BadgeCount ELSE 0 END) AS BadgeCountSilver,
+            SUM(CASE WHEN Class = 3 THEN BadgeCount ELSE 0 END) AS BadgeCountBronze
+        FROM RecursiveUserBadgeCounts
+        GROUP BY UserId
+    ) rub ON rub.UserId = u.UserId
+)
+SELECT 
+    fr.UserId,
+    fr.DisplayName,
+    fr.Reputation,
+    fr.ReputationRank,
+    fr.ReputationQuintile,
+    fr.TotalPosts,
+    fr.Questions,
+    fr.Answers,
+    fr.AvgScorePerPost,
+    fr.TotalViewsOnPosts,
+    fr.GoldBadges,
+    fr.SilverBadges,
+    fr.BronzeBadges,
+    pq.Title AS SampleQuestionTitle,
+    pq.Score AS SampleQuestionScore,
+    pq.ViewCount AS SampleQuestionViews,
+    COALESCE(pl.DuplicateLinksCount, 0) AS DuplicateLinksOnSampleQuestion,
+    cwr.CommentCount AS SampleQuestionCommentCount,
+    cwr.DistinctCommenters AS SampleQuestionDistinctCommenters,
+    cwr.RecentCommenters AS SampleQuestionRecentCommenters
+FROM FinalRanking fr
+LEFT JOIN (
+    SELECT DISTINCT ON (OwnerUserId) Id, Title, Score, ViewCount, OwnerUserId
+    FROM Posts
+    WHERE PostTypeId = 1
+    ORDER BY OwnerUserId, Score DESC, ViewCount DESC, Id
+) pq ON pq.OwnerUserId = fr.UserId
+LEFT JOIN PostLinkDuplicates pl ON pl.PostId = pq.Id
+LEFT JOIN CommentsWithUser cwr ON cwr.PostId = pq.Id
+WHERE fr.TotalPosts > 10
+ORDER BY fr.ReputationRank
+LIMIT 100;

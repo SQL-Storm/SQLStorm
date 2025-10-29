@@ -1,0 +1,251 @@
+WITH UserBadgeStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsCount,
+        COUNT(DISTINCT a.Id) FILTER (WHERE a.PostTypeId = 2) AS AnswersCount,
+        AVG(COALESCE(p.Score, 0)) FILTER (WHERE p.PostTypeId = 1) AS AvgQuestionScore,
+        AVG(COALESCE(a.Score, 0)) FILTER (WHERE a.PostTypeId = 2) AS AvgAnswerScore,
+        MAX(p.CreationDate) AS LastQuestionDate,
+        MAX(a.CreationDate) AS LastAnswerDate
+    FROM
+        Users u
+        LEFT JOIN Badges b ON b.UserId = u.Id
+        LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+        LEFT JOIN Posts a ON a.OwnerUserId = u.Id AND a.PostTypeId = 2
+    GROUP BY u.Id, u.DisplayName
+), RecentActivePosts AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.Title,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+    FROM
+        Posts p
+    WHERE
+        p.CreationDate > (CAST('2024-10-01' AS DATE) - INTERVAL '180 days')
+), LinkedDuplicates AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name AS LinkTypeName
+    FROM
+        PostLinks pl
+        JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    WHERE
+        lt.Name = 'Duplicate'
+), PostScoresWithVotes AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVotesCount,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownVotesCount,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END), 0) AS FavoriteVotesCount
+    FROM
+        Posts p
+        LEFT JOIN Votes v ON v.PostId = p.Id
+    GROUP BY
+        p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score
+), UserActivityRanked AS (
+    SELECT
+        ubs.UserId,
+        ubs.DisplayName,
+        ubs.GoldBadges,
+        ubs.SilverBadges,
+        ubs.BronzeBadges,
+        ubs.QuestionsCount,
+        ubs.AnswersCount,
+        ubs.AvgQuestionScore,
+        ubs.AvgAnswerScore,
+        ubs.LastQuestionDate,
+        ubs.LastAnswerDate,
+        COALESCE(SUM(psw.UpVotesCount),0) AS TotalUpVotesReceived,
+        COALESCE(SUM(psw.DownVotesCount),0) AS TotalDownVotesReceived,
+        RANK() OVER (ORDER BY u.Reputation DESC NULLS LAST, ubs.QuestionsCount DESC, ubs.AnswersCount DESC) AS UserRank
+    FROM
+        UserBadgeStats ubs
+        LEFT JOIN Posts p ON p.OwnerUserId = ubs.UserId
+        LEFT JOIN PostScoresWithVotes psw ON psw.PostId = p.Id
+        LEFT JOIN Users u ON u.Id = ubs.UserId
+    GROUP BY
+        ubs.UserId, ubs.DisplayName, ubs.GoldBadges, ubs.SilverBadges, ubs.BronzeBadges, ubs.QuestionsCount, ubs.AnswersCount,
+        ubs.AvgQuestionScore, ubs.AvgAnswerScore, ubs.LastQuestionDate, ubs.LastAnswerDate, u.Reputation
+), PostActivityWindows AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        COALESCE(prom.Score, 0) AS ParentPostScore,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS RecentPostRank,
+        CASE
+            WHEN pos.rn > 1 THEN pos.CreationDate - LAG(pos.CreationDate) OVER (PARTITION BY pos.OwnerUserId ORDER BY pos.CreationDate)
+            ELSE NULL
+        END AS TimeSincePreviousPost,
+        CHAR_LENGTH(p.Title) AS TitleLength,
+        CHAR_LENGTH(p.Body) AS BodyLength,
+        POSITION('sql' IN LOWER(COALESCE(p.Tags, ''))) > 0 AS ContainsSQLTag
+    FROM
+        Posts p
+        LEFT JOIN Posts prom ON prom.Id = p.ParentId
+        LEFT JOIN RecentActivePosts pos ON pos.Id = p.Id
+    WHERE
+        p.PostTypeId IN (1,2)
+), CloseReasonSummary AS (
+    SELECT
+        ph.PostId,
+        crt.Name AS CloseReasonName,
+        MAX(ph.CreationDate) AS LastCloseDate,
+        COUNT(*) AS CloseVotesCount
+    FROM
+        PostHistory ph
+        JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+        LEFT JOIN CloseReasonTypes crt ON ph.Comment = CAST(crt.Id AS VARCHAR)
+    WHERE
+        ph.PostHistoryTypeId = 10
+    GROUP BY
+        ph.PostId, crt.Name
+), ComplexUserSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COALESCE(ub.GoldBadges, 0) AS GoldBadges,
+        COALESCE(ub.SilverBadges, 0) AS SilverBadges,
+        COALESCE(ub.BronzeBadges, 0) AS BronzeBadges,
+        COALESCE(pq.QuestionCount, 0) AS QuestionCount,
+        COALESCE(ans.AnswerCount, 0) AS AnswerCount,
+        COALESCE(pq.AvgQScore, 0) AS AvgQuestionScore,
+        COALESCE(ans.AvgAScore, 0) AS AvgAnswerScore,
+        COALESCE(cv.ClosedQuestionsCount, 0) AS ClosedQuestionsCount,
+        CASE
+            WHEN COALESCE(pq.QuestionCount,0) = 0 THEN NULL
+            ELSE ROUND(1.0 * COALESCE(ub.GoldBadges,0) / pq.QuestionCount, 4)
+        END AS GoldBadgesPerQuestion,
+        CASE
+            WHEN COALESCE(ans.AnswerCount,0) = 0 THEN NULL
+            ELSE ROUND(1.0 * COALESCE(ub.SilverBadges,0) / ans.AnswerCount, 4)
+        END AS SilverBadgesPerAnswer
+    FROM
+        Users u
+        LEFT JOIN (
+            SELECT
+                UserId,
+                COUNT(CASE WHEN Class = 1 THEN 1 END) AS GoldBadges,
+                COUNT(CASE WHEN Class = 2 THEN 1 END) AS SilverBadges,
+                COUNT(CASE WHEN Class = 3 THEN 1 END) AS BronzeBadges
+            FROM
+                Badges
+            GROUP BY UserId
+        ) ub ON ub.UserId = u.Id
+        LEFT JOIN (
+            SELECT
+                OwnerUserId,
+                COUNT(*) AS QuestionCount,
+                AVG(Score) AS AvgQScore
+            FROM
+                Posts
+            WHERE PostTypeId = 1
+            GROUP BY OwnerUserId
+        ) pq ON pq.OwnerUserId = u.Id
+        LEFT JOIN (
+            SELECT
+                OwnerUserId,
+                COUNT(*) AS AnswerCount,
+                AVG(Score) AS AvgAScore
+            FROM
+                Posts
+            WHERE PostTypeId = 2
+            GROUP BY OwnerUserId
+        ) ans ON ans.OwnerUserId = u.Id
+        LEFT JOIN (
+            SELECT
+                p.OwnerUserId,
+                COUNT(*) AS ClosedQuestionsCount
+            FROM
+                PostHistory ph
+                JOIN Posts p ON p.Id = ph.PostId
+            WHERE
+                ph.PostHistoryTypeId = 10
+                AND p.PostTypeId = 1
+            GROUP BY p.OwnerUserId
+        ) cv ON cv.OwnerUserId = u.Id
+)
+SELECT DISTINCT
+    cus.UserId,
+    cus.DisplayName,
+    cus.GoldBadges,
+    cus.SilverBadges,
+    cus.BronzeBadges,
+    cus.QuestionCount,
+    cus.AnswerCount,
+    cus.AvgQuestionScore,
+    cus.AvgAnswerScore,
+    cus.ClosedQuestionsCount,
+    cus.GoldBadgesPerQuestion,
+    cus.SilverBadgesPerAnswer,
+    pas.LatestPostId,
+    pas.PostTypeId,
+    pas.Score AS LatestPostScore,
+    pas.ViewCount AS LatestPostViews,
+    pas.Tags AS LatestPostTags,
+    pas.ParentPostScore,
+    pas.TimeSincePreviousPost,
+    CASE
+        WHEN pas.ContainsSQLTag THEN 'Yes'
+        ELSE 'No'
+    END AS ContainsSQLTag,
+    COALESCE(lkd.CountDuplicates, 0) AS DuplicateLinksMade,
+    COALESCE(crs.CloseReasonName, 'Not Closed') AS MostRecentCloseReason,
+    crs.LastCloseDate,
+    COALESCE(crs.CloseVotesCount, 0) AS CloseVotesCount,
+    ROW_NUMBER() OVER (PARTITION BY cus.UserId ORDER BY pas.Score DESC NULLS LAST) AS PostRankByScore
+FROM
+    ComplexUserSummary cus
+    LEFT JOIN LATERAL (
+        SELECT
+            p.Id AS LatestPostId,
+            p.PostTypeId,
+            p.Score,
+            p.ViewCount,
+            p.Tags,
+            COALESCE(prom.Score, 0) AS ParentPostScore,
+            (p.CreationDate - LAG(p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate)) AS TimeSincePreviousPost,
+            POSITION('sql' IN LOWER(COALESCE(p.Tags, ''))) > 0 AS ContainsSQLTag
+        FROM Posts p
+        LEFT JOIN Posts prom ON prom.Id = p.ParentId
+        WHERE p.OwnerUserId = cus.UserId
+        ORDER BY p.CreationDate DESC
+        LIMIT 1
+    ) pas ON TRUE
+    LEFT JOIN (
+        SELECT
+            pl.PostId,
+            COUNT(*) AS CountDuplicates
+        FROM PostLinks pl
+        JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+        GROUP BY pl.PostId
+    ) lkd ON lkd.PostId = pas.LatestPostId
+    LEFT JOIN CloseReasonSummary crs ON crs.PostId = pas.LatestPostId
+WHERE
+    cus.QuestionCount > 10
+    AND cus.AvgQuestionScore >= 1
+    AND cus.ClosedQuestionsCount < 5
+ORDER BY
+    cus.GoldBadges DESC,
+    cus.QuestionCount DESC,
+    pas.Score DESC
+LIMIT 100;

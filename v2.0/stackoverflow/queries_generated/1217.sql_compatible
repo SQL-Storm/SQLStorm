@@ -1,0 +1,186 @@
+WITH UserEngagementSummary AS (
+    SELECT
+        U.Id AS UserId,
+        COALESCE(U.DisplayName, 'AnonymousUser') AS UserDisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.UpVotes AS TotalUpVotesCast,
+        U.DownVotes AS TotalDownVotesCast,
+        COUNT(DISTINCT P.Id) AS TotalOwnedPosts,
+        SUM(P.Score) AS TotalOwnedPostsScore,
+        AVG(CASE WHEN P.PostTypeId = 1 THEN P.Score END) AS AvgQuestionScore,
+        AVG(CASE WHEN P.PostTypeId = 2 THEN P.Score END) AS AvgAnswerScore,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        MAX(CASE WHEN B.Class = 1 THEN B.Date ELSE NULL END) AS LatestGoldBadgeDate,
+        (EXTRACT(EPOCH FROM (U.LastAccessDate - U.CreationDate)) / (60 * 60 * 24.0)) AS DaysSinceCreation,
+        CASE
+            WHEN U.Reputation >= 20000 THEN 'Elder'
+            WHEN U.Reputation >= 5000 THEN 'Veteran'
+            WHEN U.Reputation >= 1000 THEN 'Experienced'
+            WHEN U.Reputation >= 100 THEN 'Active'
+            ELSE 'Newbie'
+        END AS ReputationTier
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    LEFT JOIN Badges AS B ON U.Id = B.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.UpVotes, U.DownVotes
+),
+PostContentMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.OwnerUserId,
+        P.Title,
+        P.CreationDate AS PostCreationDate,
+        P.LastActivityDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount AS PostCommentCount,
+        P.FavoriteCount,
+        P.ParentId,
+        P.AcceptedAnswerId,
+        P_Accepted.OwnerUserId AS AcceptedAnswerOwnerUserId,
+        P_Parent.OwnerUserId AS ParentPostOwnerUserId,
+        COALESCE(P.Tags, '') AS TagsString,
+        -- convert tags like '<tag1><tag2>' into array of tag strings; use generic split approach
+        CASE WHEN COALESCE(P.Tags, '') = '' THEN ARRAY[]::text[] ELSE regexp_split_to_array(trim(BOTH '<>' FROM COALESCE(P.Tags, '')), '><') END AS TagArray,
+        LENGTH(P.Body) AS BodyLength,
+        (SELECT COUNT(V.Id) FROM Votes AS V WHERE V.PostId = P.Id AND V.VoteTypeId = 2) AS UpVoteCount,
+        (SELECT COUNT(V.Id) FROM Votes AS V WHERE V.PostId = P.Id AND V.VoteTypeId = 3) AS DownVoteCount,
+        (SELECT COUNT(DISTINCT C_Inner.UserId) FROM Comments AS C_Inner WHERE C_Inner.PostId = P.Id AND C_Inner.UserId IS NOT NULL) AS DistinctCommenterCount,
+        (CASE WHEN P.Tags IS NOT NULL AND (P.Tags LIKE '%<sql>%' OR P.Tags LIKE '%<database>%') THEN TRUE ELSE FALSE END) AS HasSqlOrDatabaseTag,
+        CASE
+            WHEN P.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN P.CommunityOwnedDate IS NOT NULL THEN 'CommunityOwned'
+            WHEN P.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+            ELSE 'Open'
+        END AS PostStatus
+    FROM Posts AS P
+    INNER JOIN PostTypes AS PT ON P.PostTypeId = PT.Id
+    LEFT JOIN Posts AS P_Accepted ON P.AcceptedAnswerId = P_Accepted.Id
+    LEFT JOIN Posts AS P_Parent ON P.ParentId = P_Parent.Id
+    WHERE P.CreationDate >= TIMESTAMP '2021-01-01'
+),
+PostHistoryTimeline AS (
+    SELECT
+        PH.PostId,
+        PH.PostHistoryTypeId,
+        PHT.Name AS HistoryTypeName,
+        PH.CreationDate AS HistoryDate,
+        PH.UserId AS HistoryEditorUserId,
+        ROW_NUMBER() OVER (PARTITION BY PH.PostId, PH.PostHistoryTypeId ORDER BY PH.CreationDate DESC) AS rn_latest_per_type,
+        LAG(PH.CreationDate, 1, PH.CreationDate) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) AS PreviousHistoryDate,
+        CASE
+            WHEN NULLIF(regexp_replace(COALESCE(PH.Comment, ''), '[^0-9]', '', 'g'), '') = '' THEN NULL
+            ELSE CAST(NULLIF(regexp_replace(COALESCE(PH.Comment, ''), '[^0-9]', '', 'g'), '') AS SMALLINT)
+        END AS CloseReasonId_Parsed
+    FROM PostHistory AS PH
+    INNER JOIN PostHistoryTypes AS PHT ON PH.PostHistoryTypeId = PHT.Id
+    WHERE PH.PostHistoryTypeId IN (5, 10, 11, 12, 13, 16)
+),
+UserPostInteraction AS (
+    SELECT
+        UES.UserId,
+        UES.UserDisplayName,
+        UES.Reputation,
+        UES.ReputationTier,
+        UES.TotalOwnedPosts,
+        UES.TotalOwnedPostsScore,
+        UES.AvgQuestionScore,
+        UES.AvgAnswerScore,
+        PCM.PostId,
+        PCM.PostTypeName,
+        PCM.Title,
+        PCM.PostCreationDate,
+        PCM.LastActivityDate,
+        PCM.PostScore,
+        PCM.ViewCount,
+        PCM.UpVoteCount,
+        PCM.DownVoteCount,
+        PCM.FavoriteCount,
+        PCM.BodyLength,
+        PCM.HasSqlOrDatabaseTag,
+        PCM.PostStatus,
+        PCM.TagArray,
+        RANK() OVER (PARTITION BY UES.UserId ORDER BY PCM.PostScore DESC NULLS LAST, PCM.ViewCount DESC NULLS LAST) AS UserPostScoreRank,
+        AVG(PCM.PostScore) OVER (PARTITION BY UES.ReputationTier) AS AvgScoreInReputationTier,
+        MAX(CASE WHEN PCM.PostCreationDate > UES.LastAccessDate - INTERVAL '30 days' THEN 1 ELSE 0 END) OVER (PARTITION BY UES.UserId) AS PostedRecentlyFlag,
+        (EXISTS (
+            SELECT 1
+            FROM Badges B_Inner
+            WHERE B_Inner.UserId = UES.UserId
+            AND B_Inner.Name LIKE 'Organizer%'
+        )) AS HasOrganizerBadge,
+        (COALESCE(PCM.ViewCount, 0) * 0.1 + COALESCE(PCM.UpVoteCount, 0) * 1.0 - COALESCE(PCM.DownVoteCount, 0) * 0.5 + COALESCE(PCM.PostCommentCount, 0) * 0.8 + COALESCE(PCM.FavoriteCount, 0) * 1.5) AS EngagementScore,
+        EXTRACT(EPOCH FROM (CAST(TIMESTAMP '2024-10-01 12:34:56' AS TIMESTAMP) - PCM.LastActivityDate)) / 3600.0 AS HoursSinceLastActivity,
+        CASE WHEN COALESCE(LENGTH(PCM.Title), 0) > 50 THEN SUBSTRING(PCM.Title FROM 1 FOR 47) || '...' ELSE PCM.Title END AS ShortTitle
+    FROM UserEngagementSummary AS UES
+    INNER JOIN PostContentMetrics AS PCM ON UES.UserId = PCM.OwnerUserId
+    WHERE PCM.PostScore > 0 AND UES.DaysSinceCreation > 30
+)
+SELECT
+    UPI.UserId,
+    UPI.UserDisplayName,
+    UPI.Reputation,
+    UPI.ReputationTier,
+    UPI.TotalOwnedPosts,
+    UPI.TotalOwnedPostsScore,
+    UPI.AvgQuestionScore,
+    UPI.AvgAnswerScore,
+    UPI.PostId,
+    UPI.PostTypeName,
+    UPI.ShortTitle,
+    UPI.PostCreationDate,
+    UPI.LastActivityDate,
+    UPI.PostScore,
+    UPI.ViewCount,
+    UPI.UpVoteCount,
+    UPI.DownVoteCount,
+    UPI.FavoriteCount,
+    UPI.BodyLength,
+    UPI.HasSqlOrDatabaseTag,
+    UPI.PostStatus,
+    UPI.UserPostScoreRank,
+    UPI.AvgScoreInReputationTier,
+    UPI.PostedRecentlyFlag,
+    UPI.HasOrganizerBadge,
+    UPI.EngagementScore,
+    UPI.HoursSinceLastActivity,
+    MAX(CASE WHEN PHT.HistoryTypeName = 'Edit Body' THEN PHT.HistoryDate ELSE NULL END) AS LatestBodyEditDate,
+    MAX(CASE WHEN PHT.HistoryTypeName = 'Post Closed' THEN CRS.Name ELSE NULL END) AS LatestCloseReasonName,
+    (EXTRACT(EPOCH FROM (MAX(PHT.HistoryDate) - UPI.PostCreationDate)) / (60 * 60 * 24.0)) AS DaysUntilLastHistoryEvent,
+    cardinality(UPI.TagArray) AS NumberOfTagsOnPost,
+    CASE
+        WHEN UPI.EngagementScore > COALESCE(UPI.ViewCount, 0) * 0.5 THEN 'HighEngagement'
+        WHEN UPI.EngagementScore > COALESCE(UPI.ViewCount, 0) * 0.1 THEN 'MediumEngagement'
+        ELSE 'LowEngagement'
+    END AS EngagementCategory
+FROM UserPostInteraction AS UPI
+LEFT JOIN PostHistoryTimeline AS PHT ON UPI.PostId = PHT.PostId AND PHT.rn_latest_per_type = 1
+LEFT JOIN CloseReasonTypes AS CRS ON PHT.CloseReasonId_Parsed = CRS.Id
+WHERE
+    (
+        UPI.PostTypeName = 'Question' AND UPI.AvgQuestionScore IS NOT NULL AND COALESCE(UPI.ViewCount, 0) > 100
+    )
+    OR
+    (
+        UPI.PostTypeName = 'Answer' AND COALESCE(UPI.PostScore, 0) > 5 AND COALESCE(UPI.BodyLength, 0) > 100
+    )
+GROUP BY
+    UPI.UserId, UPI.UserDisplayName, UPI.Reputation, UPI.ReputationTier, UPI.TotalOwnedPosts, UPI.TotalOwnedPostsScore, UPI.AvgQuestionScore, UPI.AvgAnswerScore,
+    UPI.PostId, UPI.PostTypeName, UPI.ShortTitle, UPI.PostCreationDate, UPI.LastActivityDate, UPI.PostScore, UPI.ViewCount, UPI.UpVoteCount,
+    UPI.DownVoteCount, UPI.FavoriteCount, UPI.BodyLength, UPI.HasSqlOrDatabaseTag, UPI.PostStatus, UPI.UserPostScoreRank,
+    UPI.AvgScoreInReputationTier, UPI.PostedRecentlyFlag, UPI.HasOrganizerBadge, UPI.EngagementScore, UPI.HoursSinceLastActivity,
+    UPI.TagArray
+HAVING
+    COUNT(CASE WHEN PHT.HistoryTypeName = 'Post Closed' THEN PHT.PostId END) < 2
+    AND AVG(COALESCE(UPI.FavoriteCount, 0)) > 1
+ORDER BY
+    UPI.Reputation DESC, UPI.EngagementScore DESC, UPI.HoursSinceLastActivity ASC
+LIMIT 1000;

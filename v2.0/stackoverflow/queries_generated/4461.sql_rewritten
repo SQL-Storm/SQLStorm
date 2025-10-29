@@ -1,0 +1,210 @@
+-- {"query": "4461.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1677} 
+WITH
+  PostEngagement AS (
+    SELECT
+      p.Id AS PostId,
+      p.PostTypeId,
+      p.OwnerUserId,
+      p.CreationDate AS PostCreationDate,
+      p.Score AS PostScore,
+      p.ViewCount AS PostViewCount,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      p.ClosedDate,
+      pt.Name AS PostTypeName,
+      CASE
+        WHEN p.PostTypeId = 1 THEN 'Question'
+        WHEN p.PostTypeId = 2 THEN 'Answer'
+        ELSE 'Other'
+      END AS MainPostType,
+      CASE
+        WHEN p.ClosedDate IS NOT NULL THEN 1
+        ELSE 0
+      END AS IsClosed,
+      COALESCE(
+        (
+          SELECT
+            COUNT(c.Id)
+          FROM
+            Comments c
+          WHERE
+            c.PostId = p.Id
+        ),
+        0
+      ) AS TotalComments,
+      COALESCE(
+        (
+          SELECT
+            COUNT(v.Id)
+          FROM
+            Votes v
+          WHERE
+            v.PostId = p.Id AND v.VoteTypeId = 2 -- UpMod
+        ),
+        0
+      ) AS TotalUpVotes,
+      COALESCE(
+        (
+          SELECT
+            COUNT(v.Id)
+          FROM
+            Votes v
+          WHERE
+            v.PostId = p.Id AND v.VoteTypeId = 3 -- DownMod
+        ),
+        0
+      ) AS TotalDownVotes,
+      COALESCE(
+        (
+          SELECT
+            COUNT(ph.Id)
+          FROM
+            PostHistory ph
+          WHERE
+            ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+        ),
+        0
+      ) AS TotalEdits
+    FROM
+      Posts p
+      JOIN PostTypes pt
+        ON p.PostTypeId = pt.Id
+    WHERE
+      p.PostTypeId IN (1, 2) -- Questions and Answers
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate AS UserCreationDate,
+      u.Views AS UserViews,
+      u.UpVotes AS UserUpVotes,
+      u.DownVotes AS UserDownVotes,
+      COUNT(DISTINCT pe.PostId) AS TotalPostsCreated,
+      SUM(pe.PostScore) AS TotalPostScore,
+      AVG(pe.PostViewCount) AS AvgPostViewCount,
+      SUM(pe.TotalComments) AS TotalCommentsMade,
+      SUM(pe.TotalUpVotes) AS TotalUpVotesGiven,
+      SUM(pe.TotalDownVotes) AS TotalDownVotesGiven,
+      COUNT(b.Id) AS TotalBadges
+    FROM
+      Users u
+      LEFT JOIN PostEngagement pe
+        ON u.Id = pe.OwnerUserId
+      LEFT JOIN Badges b
+        ON u.Id = b.UserId
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate,
+      u.Views,
+      u.UpVotes,
+      u.DownVotes
+  ),
+  LaggedPostScore AS (
+    SELECT
+      PostId,
+      PostScore,
+      PostCreationDate,
+      LAG(PostScore, 1, 0) OVER (PARTITION BY OwnerUserId ORDER BY PostCreationDate) AS PreviousPostScore,
+      ROW_NUMBER() OVER (PARTITION BY OwnerUserId ORDER BY PostCreationDate) AS RowNum
+    FROM
+      PostEngagement
+    WHERE
+      OwnerUserId IS NOT NULL
+  ),
+  UserPostScoreChange AS (
+    SELECT
+      OwnerUserId,
+      SUM(CASE WHEN PostScore > PreviousPostScore THEN 1 ELSE 0 END) AS PostsWithScoreIncrease,
+      AVG(PostScore - PreviousPostScore) AS AvgScoreChange
+    FROM
+      LaggedPostScore
+    WHERE
+      RowNum > 1
+    GROUP BY
+      OwnerUserId
+  ),
+  RankedUsers AS (
+    SELECT
+      ua.UserId,
+      ua.DisplayName,
+      ua.Reputation,
+      ua.UserCreationDate,
+      ua.TotalPostsCreated,
+      ua.TotalPostScore,
+      ua.AvgPostViewCount,
+      ua.TotalCommentsMade,
+      ua.TotalUpVotesGiven,
+      ua.TotalDownVotesGiven,
+      ua.TotalBadges,
+      upcsc.PostsWithScoreIncrease,
+      upcsc.AvgScoreChange,
+      DENSE_RANK() OVER (ORDER BY ua.Reputation DESC) AS ReputationRank,
+      NTILE(5) OVER (ORDER BY ua.UserCreationDate) AS CreationDateQuintile
+    FROM
+      UserActivity ua
+      LEFT JOIN UserPostScoreChange upcsc
+        ON ua.UserId = upcsc.OwnerUserId
+  )
+SELECT
+  'PerformanceBenchmark' AS QueryName,
+  pu.DisplayName AS UserDisplayName,
+  pu.Reputation AS UserReputation,
+  pu.UserCreationDate,
+  pu.TotalPostsCreated,
+  pu.TotalPostScore,
+  pu.AvgPostViewCount,
+  pu.TotalCommentsMade,
+  pu.TotalUpVotesGiven,
+  pu.TotalDownVotesGiven,
+  pu.TotalBadges,
+  pu.PostsWithScoreIncrease,
+  pu.AvgScoreChange,
+  pu.ReputationRank,
+  pu.CreationDateQuintile,
+  COUNT(pe.PostId) AS PostsInTopQuintile,
+  SUM(pe.PostScore) AS TotalScoreInTopQuintile,
+  AVG(pe.PostViewCount) AS AvgViewCountInTopQuintile,
+  AVG(
+    CASE
+      WHEN pe.IsClosed = 1 THEN DATEDIFF(day, pe.PostCreationDate, pe.ClosedDate)
+      ELSE NULL
+    END
+  ) AS AvgDaysToClose,
+  SUM(pe.TotalEdits) AS TotalEditsOnPosts,
+  COUNT(DISTINCT pl.RelatedPostId) AS TotalLinkedPosts
+FROM
+  RankedUsers pu
+  LEFT JOIN PostEngagement pe
+    ON pu.UserId = pe.OwnerUserId
+    AND pu.CreationDateQuintile = NTILE(5) OVER (ORDER BY pe.PostCreationDate)
+  LEFT JOIN PostLinks pl
+    ON pe.PostId = pl.PostId
+  LEFT JOIN PostTypes pt
+    ON pe.PostTypeId = pt.Id
+WHERE
+  pu.Reputation > 1000 -- Focusing on more established users
+  AND pu.UserCreationDate < cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year' -- Users active for at least a year
+GROUP BY
+  pu.UserId,
+  pu.DisplayName,
+  pu.Reputation,
+  pu.UserCreationDate,
+  pu.TotalPostsCreated,
+  pu.TotalPostScore,
+  pu.AvgPostViewCount,
+  pu.TotalCommentsMade,
+  pu.TotalUpVotesGiven,
+  pu.TotalDownVotesGiven,
+  pu.TotalBadges,
+  pu.PostsWithScoreIncrease,
+  pu.AvgScoreChange,
+  pu.ReputationRank,
+  pu.CreationDateQuintile
+ORDER BY
+  pu.ReputationRank,
+  pu.UserId;

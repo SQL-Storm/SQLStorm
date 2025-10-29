@@ -1,0 +1,285 @@
+-- {"query": "1226.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 4097} 
+
+WITH UserContributionMetrics AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(DISTINCT p_q.Id) AS TotalQuestionsAsked,
+        COUNT(DISTINCT p_a.Id) AS TotalAnswersProvided,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN p_a.AcceptedAnswerId IS NOT NULL AND p_a.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAcceptedAnswersContributed,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesGiven,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesGiven,
+        SUM(COALESCE(p_q.Score, 0) + COALESCE(p_a.Score, 0) + COALESCE(c_score_sum.TotalCommentScore, 0)) AS TotalContentScoreReceived,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        MAX(u.LastAccessDate) AS LastUserActivityDate
+    FROM Users u
+    LEFT JOIN Posts p_q ON u.Id = p_q.OwnerUserId AND p_q.PostTypeId = 1 -- Questions by user
+    LEFT JOIN Posts p_a ON u.Id = p_a.OwnerUserId AND p_a.PostTypeId = 2 -- Answers by user
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN (SELECT UserId, PostId, SUM(Score) AS TotalCommentScore FROM Comments GROUP BY UserId, PostId) c_score_sum ON u.Id = c_score_sum.UserId
+    GROUP BY u.Id
+),
+PostQualityMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.Tags,
+        p.Title,
+        COALESCE(p.AcceptedAnswerId, -1) AS AcceptedAnswerId_Value, -- Use -1 for no accepted answer
+        SUM(COALESCE(c.Score, 0)) AS TotalCommentScore,
+        COUNT(DISTINCT c.UserId) AS DistinctCommenters,
+        (SELECT ph_latest.UserId
+         FROM PostHistory ph_latest
+         WHERE ph_latest.PostId = p.Id
+           AND ph_latest.PostHistoryTypeId IN (4, 5, 6, 8, 9) -- Edit types
+         ORDER BY ph_latest.CreationDate DESC
+         LIMIT 1) AS LastEditorUserId_PostHistory,
+        (SELECT ph_latest.UserDisplayName
+         FROM PostHistory ph_latest
+         WHERE ph_latest.PostId = p.Id
+           AND ph_latest.PostHistoryTypeId IN (4, 5, 6, 8, 9) -- Edit types
+         ORDER BY ph_latest.CreationDate DESC
+         LIMIT 1) AS LastEditorDisplayName_PostHistory,
+        -- Window function to get rank of post based on score for its owner
+        RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate DESC) AS PostScoreRankByOwner,
+        -- Calculate post age in days
+        EXTRACT(EPOCH FROM (NOW() - p.CreationDate)) / (60 * 60 * 24) AS PostAgeDays,
+        (LENGTH(p.Body) / 100.0) * (COALESCE(p.CommentCount, 0) + 1) AS PostContentEngagementMetric
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    WHERE p.PostTypeId IN (1, 2) -- Only Questions and Answers
+    GROUP BY p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.CommentCount, p.FavoriteCount, p.ClosedDate, p.Tags, p.Title, p.AcceptedAnswerId
+),
+TagPerformanceMetrics AS (
+    SELECT
+        LOWER(TRIM(UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><')))) AS TagName,
+        COUNT(DISTINCT p.Id) AS QuestionsCount,
+        SUM(p.Score) AS TotalTagScore,
+        AVG(p.ViewCount) AS AvgTagViewCount,
+        COUNT(DISTINCT p.OwnerUserId) AS UniqueTagContributors,
+        MAX(p.LastActivityDate) AS LastTagActivity
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2
+    GROUP BY LOWER(TRIM(UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><'))))
+    HAVING COUNT(DISTINCT p.Id) > 50 -- Only consider reasonably popular tags
+       AND SUM(p.Score) > 100
+),
+UsersWithComplexEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.Location,
+        u.Views AS UserProfileViews,
+        ucm.TotalQuestionsAsked,
+        ucm.TotalAnswersProvided,
+        ucm.TotalCommentsMade,
+        ucm.TotalAcceptedAnswersContributed,
+        ucm.TotalContentScoreReceived,
+        ucm.GoldBadges,
+        ucm.SilverBadges,
+        ucm.BronzeBadges,
+        COALESCE(pqm.PostId, -1) AS TopQuestionId,
+        pqm.Title AS TopQuestionTitle,
+        pqm.Score AS TopQuestionScore,
+        pqm.ViewCount AS TopQuestionViewCount,
+        pqm.CommentCount AS TopQuestionCommentCount,
+        pqm.TotalCommentScore AS TopQuestionTotalCommentScore,
+        pqm.DistinctCommenters AS TopQuestionDistinctCommenters,
+        pqm.LastEditorDisplayName_PostHistory AS TopQuestionLastEditor,
+        tp.TagName AS AssociatedTagName,
+        tp.TotalTagScore AS AssociatedTagOverallScore,
+        tp.QuestionsCount AS AssociatedTagQuestionCount,
+        -- Correlated subquery: check if user has posted an answer to their top question (if it's a question)
+        EXISTS (
+            SELECT 1
+            FROM Posts ans
+            WHERE ans.ParentId = pqm.PostId
+              AND ans.OwnerUserId = u.Id
+              AND ans.PostTypeId = 2
+        ) AS HasAnsweredOwnTopQuestion,
+        -- Window function: Avg post score for users in the same location (for questions)
+        AVG(pqm.Score) OVER (PARTITION BY u.Location) AS AvgQuestionScoreInLocation,
+        -- Complex calculation combining user and post metrics, avoiding division by zero
+        (u.Reputation * 0.15 + ucm.TotalContentScoreReceived * 0.4 + ucm.GoldBadges * 15 + ucm.SilverBadges * 7 + ucm.BronzeBadges * 2 +
+         COALESCE(pqm.PostContentEngagementMetric, 0)) /
+        (NULLIF(ucm.TotalQuestionsAsked + ucm.TotalAnswersProvided + ucm.TotalCommentsMade, 0) + 1 +
+         CASE WHEN u.AboutMe IS NOT NULL THEN LENGTH(u.AboutMe)/100.0 ELSE 0 END) AS CompositeEngagementScore,
+        -- Case expression for user status, including NULL logic for location
+        CASE
+            WHEN u.Reputation >= 10000 AND ucm.GoldBadges >= 3 AND ucm.TotalAcceptedAnswersContributed >= 5 THEN 'Elite Luminary'
+            WHEN u.Reputation >= 5000 AND ucm.TotalQuestionsAsked >= 50 AND u.Location IS NOT NULL THEN 'Seasoned Prolific Contributor (' || u.Location || ')'
+            WHEN u.Reputation >= 1000 AND ucm.TotalAnswersProvided >= 100 THEN 'Dedicated Responder'
+            WHEN u.Reputation > 500 THEN 'Aspiring Contributor'
+            ELSE 'New Challenger'
+        END AS UserTier,
+        -- Another correlated subquery to check for specific badges
+        (SELECT COUNT(b2.Id) FROM Badges b2 WHERE b2.UserId = u.Id AND b2.Name LIKE '%Contributor%' AND b2.Class IN (1,2)) AS SpecialContributorBadgesCount
+    FROM Users u
+    LEFT JOIN UserContributionMetrics ucm ON u.Id = ucm.UserId
+    LEFT JOIN PostQualityMetrics pqm ON u.Id = pqm.OwnerUserId AND pqm.PostTypeId = 1 AND pqm.PostScoreRankByOwner = 1 -- Get the highest scoring question for each user
+    LEFT JOIN LATERAL ( -- Lateral join to unnest tags and join with TagPerformanceMetrics
+        SELECT tp_inner.TagName, tp_inner.TotalTagScore, tp_inner.QuestionsCount
+        FROM UNNEST(string_to_array(SUBSTRING(pqm.Tags, 2, LENGTH(pqm.Tags) - 2), '><')) AS q_tag(TagName_raw)
+        JOIN TagPerformanceMetrics tp_inner ON LOWER(TRIM(q_tag.TagName_raw)) = tp_inner.TagName
+        ORDER BY tp_inner.TotalTagScore DESC
+        LIMIT 1 -- Pick the highest scoring associated tag
+    ) AS tp ON TRUE
+    WHERE
+        u.Reputation > 200 AND u.Views > 100
+        AND (u.Location LIKE '%USA%' OR u.Location LIKE '%Canada%' OR u.Location IS NULL) -- Complex predicate with NULL logic
+        AND u.CreationDate >= '2021-01-01' -- Recent active users
+        AND u.DisplayName IS NOT NULL
+        AND LOWER(u.DisplayName) NOT LIKE '%anon%'
+        AND LENGTH(COALESCE(u.AboutMe, '')) > 50 -- Users who have bothered to write about themselves
+),
+HighlyLinkedAndDuplicatedPostsInfo AS (
+    SELECT
+        p.Id AS SourcePostId,
+        p.Title AS SourcePostTitle,
+        p.ViewCount AS SourcePostViewCount,
+        p.CreationDate AS SourcePostCreationDate,
+        p.OwnerUserId AS SourcePostOwnerUserId,
+        u.DisplayName AS SourcePostOwnerDisplayName,
+        u.Reputation AS SourcePostOwnerReputation,
+        COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 1 THEN pl.RelatedPostId END) AS TotalTimesLinked,
+        COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN pl.RelatedPostId END) AS TotalTimesDuplicated,
+        ARRAY_AGG(DISTINCT p_rel_linked.Title) FILTER (WHERE pl.LinkTypeId = 1 AND p_rel_linked.Title IS NOT NULL) AS LinkedPostTitles,
+        ARRAY_AGG(DISTINCT p_rel_dup.Title) FILTER (WHERE pl.LinkTypeId = 3 AND p_rel_dup.Title IS NOT NULL) AS DuplicatePostTitles,
+        MAX(pl.CreationDate) AS LastLinkOrDuplicateDate,
+        -- Window function: Average Score of related posts for this post
+        AVG(p_rel_linked.Score) OVER (PARTITION BY p.Id) AS AvgRelatedPostScore
+    FROM Posts p
+    JOIN PostLinks pl ON p.Id = pl.PostId
+    LEFT JOIN Posts p_rel_linked ON pl.RelatedPostId = p_rel_linked.Id AND pl.LinkTypeId = 1
+    LEFT JOIN Posts p_rel_dup ON pl.RelatedPostId = p_rel_dup.Id AND pl.LinkTypeId = 3
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1 -- Only questions as source posts
+      AND p.ViewCount > 5000
+      AND p.CreationDate >= '2020-01-01'
+    GROUP BY p.Id, p.Title, p.ViewCount, p.CreationDate, p.OwnerUserId, u.DisplayName, u.Reputation
+    HAVING (COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 1 THEN pl.RelatedPostId END) >= 10
+            OR COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN pl.RelatedPostId END) >= 5)
+)
+-- Main query combining users with complex engagement and highly referenced posts
+SELECT
+    'UserComplexEngagement' AS RecordSource,
+    uce.UserId,
+    uce.DisplayName,
+    uce.Reputation,
+    uce.UserCreationDate,
+    uce.LastAccessDate,
+    COALESCE(uce.Location, 'Unspecified Global') AS UserLocation, -- NULL logic with COALESCE
+    uce.UserProfileViews,
+    uce.TotalQuestionsAsked,
+    uce.TotalAnswersProvided,
+    uce.TotalCommentsMade,
+    uce.TotalAcceptedAnswersContributed,
+    uce.TotalContentScoreReceived,
+    uce.GoldBadges,
+    uce.SilverBadges,
+    uce.BronzeBadges,
+    uce.TopQuestionId,
+    uce.TopQuestionTitle,
+    uce.TopQuestionScore,
+    uce.TopQuestionViewCount,
+    uce.TopQuestionCommentCount,
+    uce.TopQuestionTotalCommentScore,
+    uce.TopQuestionDistinctCommenters,
+    uce.TopQuestionLastEditor,
+    uce.AssociatedTagName,
+    uce.AssociatedTagOverallScore,
+    uce.AssociatedTagQuestionCount,
+    uce.HasAnsweredOwnTopQuestion,
+    uce.AvgQuestionScoreInLocation,
+    uce.CompositeEngagementScore,
+    uce.UserTier,
+    uce.SpecialContributorBadgesCount,
+    NULL::INT AS SourcePostId,
+    NULL::VARCHAR(300) AS SourcePostTitle,
+    NULL::INT AS SourcePostViewCount,
+    NULL::TIMESTAMP AS SourcePostCreationDate,
+    NULL::INT AS SourcePostOwnerUserId,
+    NULL::VARCHAR(40) AS SourcePostOwnerDisplayName,
+    NULL::INT AS SourcePostOwnerReputation,
+    NULL::BIGINT AS TotalTimesLinked,
+    NULL::BIGINT AS TotalTimesDuplicated,
+    NULL::TEXT[] AS LinkedPostTitles,
+    NULL::TEXT[] AS DuplicatePostTitles,
+    NULL::TIMESTAMP AS LastLinkOrDuplicateDate,
+    NULL::NUMERIC AS AvgRelatedPostScore
+FROM UsersWithComplexEngagement uce
+WHERE uce.CompositeEngagementScore > 10
+    AND uce.SpecialContributorBadgesCount > 0
+    AND uce.TopQuestionTitle IS NOT NULL
+    AND uce.TopQuestionViewCount > 500
+ORDER BY uce.CompositeEngagementScore DESC, uce.Reputation DESC
+LIMIT 500
+
+UNION ALL
+
+SELECT
+    'HighlyReferencedPosts' AS RecordSource,
+    hlp.SourcePostOwnerUserId AS UserId,
+    hlp.SourcePostOwnerDisplayName AS DisplayName,
+    hlp.SourcePostOwnerReputation AS Reputation,
+    NULL AS UserCreationDate,
+    NULL AS LastAccessDate,
+    COALESCE(u.Location, 'Undisclosed Location') AS UserLocation, -- Use original user's location if available
+    u.Views AS UserProfileViews,
+    NULL AS TotalQuestionsAsked,
+    NULL AS TotalAnswersProvided,
+    NULL AS TotalCommentsMade,
+    NULL AS TotalAcceptedAnswersContributed,
+    NULL AS TotalContentScoreReceived,
+    NULL AS GoldBadges,
+    NULL AS SilverBadges,
+    NULL AS BronzeBadges,
+    hlp.SourcePostId AS TopQuestionId,
+    hlp.SourcePostTitle AS TopQuestionTitle,
+    NULL AS TopQuestionScore,
+    hlp.SourcePostViewCount AS TopQuestionViewCount,
+    NULL AS TopQuestionCommentCount,
+    NULL AS TopQuestionTotalCommentScore,
+    NULL AS TopQuestionDistinctCommenters,
+    NULL AS TopQuestionLastEditor,
+    NULL AS AssociatedTagName,
+    NULL AS AssociatedTagOverallScore,
+    NULL AS AssociatedTagQuestionCount,
+    NULL AS HasAnsweredOwnTopQuestion,
+    NULL AS AvgQuestionScoreInLocation,
+    NULL AS CompositeEngagementScore,
+    'Key Content Influencer' AS UserTier,
+    NULL AS SpecialContributorBadgesCount,
+    hlp.SourcePostId,
+    hlp.SourcePostTitle,
+    hlp.SourcePostViewCount,
+    hlp.SourcePostCreationDate,
+    hlp.SourcePostOwnerUserId,
+    hlp.SourcePostOwnerDisplayName,
+    hlp.SourcePostOwnerReputation,
+    hlp.TotalTimesLinked,
+    hlp.TotalTimesDuplicated,
+    hlp.LinkedPostTitles,
+    hlp.DuplicatePostTitles,
+    hlp.LastLinkOrDuplicateDate,
+    hlp.AvgRelatedPostScore
+FROM HighlyLinkedAndDuplicatedPostsInfo hlp
+LEFT JOIN Users u ON hlp.SourcePostOwnerUserId = u.Id -- Join to get user info for the linked posts part
+WHERE (hlp.TotalTimesLinked >= 15 OR hlp.TotalTimesDuplicated >= 8)
+  AND hlp.AvgRelatedPostScore > 5
+ORDER BY (hlp.TotalTimesLinked * 2 + hlp.TotalTimesDuplicated * 3) DESC, hlp.SourcePostOwnerReputation DESC
+LIMIT 200;

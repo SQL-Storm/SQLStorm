@@ -1,0 +1,138 @@
+-- {"query": "4545.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1663} 
+WITH RECURSIVE PostTree AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.CreationDate AS PostCreationDate,
+        p.OwnerUserId,
+        p.Title,
+        p.Score AS PostScore,
+        p.AnswerCount,
+        pt.Name AS PostTypeName,
+        ROW_NUMBER() OVER (ORDER BY p.Id) as rn
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.PostTypeId = 1 -- Only start with questions
+    
+    UNION ALL
+    
+    SELECT
+        a.Id,
+        a.PostTypeId,
+        a.AcceptedAnswerId,
+        a.ParentId,
+        a.CreationDate AS PostCreationDate,
+        a.OwnerUserId,
+        a.Title,
+        a.Score AS PostScore,
+        a.AnswerCount,
+        pt.Name AS PostTypeName,
+        ROW_NUMBER() OVER (ORDER BY a.Id) as rn
+    FROM Posts a
+    JOIN PostTypes pt ON a.PostTypeId = pt.Id
+    WHERE a.PostTypeId = 2 AND a.ParentId IS NOT NULL AND a.ParentId IN (SELECT Id FROM PostTree)
+),
+UserContributionStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+        COUNT(DISTINCT COALESCE(p.Id, c.Id)) AS TotalContributions,
+        SUM(COALESCE(p.Score, 0)) AS TotalScoreOfContributions,
+        MAX(u.CreationDate) AS UserCreationDate,
+        AVG(p.Score) AS AvgPostScore,
+        AVG(c.Score) AS AvgCommentScore
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.PostTypeId IN (1, 2) -- Questions and Answers
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    GROUP BY u.Id, u.DisplayName
+),
+PostLag AS (
+    SELECT
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate AS HistoryCreationDate,
+        LAG(ph.CreationDate, 1, ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS PreviousHistoryDate
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (2, 5) -- Initial Body and Edit Body
+),
+ClosedQuestions AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title AS QuestionTitle,
+        p.ClosedDate,
+        crt.Name AS CloseReason
+    FROM Posts p
+    JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId = 10 -- Post Closed
+    JOIN CloseReasonTypes crt ON CAST(ph.Comment AS SMALLINT) = crt.Id
+    WHERE p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL
+),
+TagPopularity AS (
+    SELECT
+        t.TagName,
+        t.Count AS TagCount,
+        SUM(p.Score) AS TotalScoreForTag,
+        COUNT(p.Id) AS NumberOfPostsWithTag
+    FROM Tags t
+    JOIN Posts p ON ',' || REPLACE(REPLACE(REPLACE(p.Tags, '<', ','), '>', ','), ',', ',') || ',' LIKE '%,' || t.TagName || ',%'
+    WHERE p.PostTypeId = 1 -- Only for questions
+    GROUP BY t.TagName, t.Count
+    HAVING COUNT(p.Id) > 100
+)
+SELECT
+    pt.Id AS PostId,
+    pt.PostTypeName,
+    pt.Title AS PostTitle,
+    pt.PostScore,
+    pt.AnswerCount,
+    pt.PostCreationDate,
+    DATEDIFF(day, pt.PostCreationDate, cast('2024-10-01 12:34:56' as timestamp)) AS DaysSinceCreation,
+    ucc.DisplayName AS PostOwnerDisplayName,
+    ucc.Reputation AS PostOwnerReputation,
+    ucc.GoldBadges AS PostOwnerGoldBadges,
+    ucc.SilverBadges AS PostOwnerSilverBadges,
+    ucc.BronzeBadges AS PostOwnerBronzeBadges,
+    ucc.TotalContributions AS PostOwnerTotalContributions,
+    ucc.TotalScoreOfContributions AS PostOwnerTotalScoreOfContributions,
+    COALESCE(cq.CloseReason, 'Not Closed') AS CurrentCloseReason,
+    COALESCE(tp.TagPopularityRank, 10000) AS TagPopularityRank,
+    CASE
+        WHEN (pl.HistoryCreationDate - pl.PreviousHistoryDate) > '7 day' THEN 'Significant Lag'
+        WHEN (pl.HistoryCreationDate - pl.PreviousHistoryDate) <= '1 day' THEN 'Fast Edit'
+        ELSE 'Normal Edit'
+    END AS EditLagStatus,
+    CASE
+        WHEN pt.PostScore > 100 AND ucc.Reputation > 10000 THEN 'High Value Post by Expert'
+        WHEN pt.PostScore <= 0 THEN 'Low Score Post'
+        ELSE 'Standard Post'
+    END AS PostQualityCategory,
+    (pt.PostScore *ucc.Reputation) AS WeightedScore,
+    LENGTH(pt.Title) AS TitleLength,
+    SUBSTRING(pt.Title, 1, 10) AS FirstTenCharsOfTitle,
+    CASE WHEN pt.PostScore IS NULL THEN TRUE ELSE FALSE END AS IsScoreNull,
+    COALESCE(ucc.AvgPostScore, 0) AS UserAvgPostScore,
+    COALESCE(ucc.AvgCommentScore, 0) AS UserAvgCommentScore,
+    ROW_NUMBER() OVER (ORDER BY pt.PostScore DESC, pt.PostCreationDate ASC) AS ScoreRank,
+    DENSE_RANK() OVER (PARTITION BY pt.PostTypeName ORDER BY pt.PostScore DESC) AS TypeScoreRank
+FROM PostTree pt
+LEFT JOIN UserContributionStats ucc ON pt.OwnerUserId = ucc.UserId
+LEFT JOIN ClosedQuestions cq ON pt.Id = cq.QuestionId
+LEFT JOIN PostLag pl ON pt.Id = pl.PostId AND pl.PostHistoryTypeId = 5 -- Join on Edit Body
+LEFT JOIN (
+    SELECT
+        TagName,
+        NumberOfPostsWithTag,
+        ROW_NUMBER() OVER (ORDER BY NumberOfPostsWithTag DESC, TagCount DESC) AS TagPopularityRank
+    FROM TagPopularity
+) tp ON tp.TagName IN (SELECT value FROM STRING_SPLIT(REPLACE(REPLACE(pt.Tags, '<', ' '), '>', ' '), ' '))
+WHERE pt.PostTypeName = 'Question' -- Focus on questions
+  AND pt.PostScore > -10 -- Exclude severely downvoted posts for performance
+  AND ucc.Reputation IS NOT NULL
+  AND ucc.TotalContributions > 5
+ORDER BY pt.PostScore DESC, pt.PostCreationDate ASC
+LIMIT 1000;

@@ -1,0 +1,202 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 AS Depth,
+        CAST(ARRAY[t.TagName] AS varchar[]) AS Path
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+
+    UNION ALL
+
+    SELECT 
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        r.Depth + 1,
+        r.Path || t2.TagName
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r ON t2.IsModeratorOnly = FALSE AND t2.Id > r.Id
+    WHERE r.Depth < 3
+),
+FilteredPosts AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.Title,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.LastActivityDate
+    FROM Posts p
+    WHERE p.PostTypeId IN (1,2)
+      AND p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '5 years')
+),
+AnswerRanks AS (
+    SELECT
+        p.Id,
+        p.ParentId,
+        p.Score,
+        p.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS RankByScore,
+        COUNT(*) OVER (PARTITION BY p.ParentId) AS TotalAnswers
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+),
+UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COALESCE(SUM(vt_up.VoteCount), 0) AS TotalUpVotes,
+        COALESCE(SUM(vt_down.VoteCount), 0) AS TotalDownVotes,
+        MAX(p.LastActivityDate) AS LastActivity
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT 
+            v.PostId,
+            COUNT(*) AS VoteCount
+        FROM Votes v
+        WHERE v.VoteTypeId = 2
+        GROUP BY v.PostId
+    ) vt_up ON vt_up.PostId = p.Id
+    LEFT JOIN (
+        SELECT 
+            v.PostId,
+            COUNT(*) AS VoteCount
+        FROM Votes v
+        WHERE v.VoteTypeId = 3
+        GROUP BY v.PostId
+    ) vt_down ON vt_down.PostId = p.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+PostDuplicatesCTE AS (
+    SELECT 
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name AS LinkTypeName,
+        ROW_NUMBER() OVER (PARTITION BY pl.PostId ORDER BY pl.CreationDate DESC) AS LinkRank
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    WHERE pl.LinkTypeId = 3
+),
+LatestPostHistory AS (
+    SELECT ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        ph.UserId,
+        ph.Comment
+    FROM (
+        SELECT ph.*,
+               ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) rn
+        FROM PostHistory ph
+        WHERE ph.PostHistoryTypeId IN (10,11)
+    ) ph
+    WHERE ph.rn = 1
+),
+UserTopBadge AS (
+    SELECT
+        b.UserId,
+        b.Name,
+        b.Class,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Class ASC, b.Date DESC) AS rn
+    FROM Badges b
+),
+QuestionWithAnswerStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.OwnerUserId,
+        COUNT(a.Id) AS TotalAnswers,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Id END) AS TimesClosed,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.Id END) AS TimesReopened,
+        (SELECT COUNT(*) 
+         FROM Votes v WHERE v.PostId = q.Id AND v.VoteTypeId = 5) AS FavoriteCountVotes,
+        (SELECT STRING_AGG(DISTINCT t.TagName, ',' ORDER BY t.TagName)
+         FROM Tags t
+         WHERE t.Id IN (
+             SELECT CAST(x AS integer)
+             FROM unnest(string_to_array(TRIM(BOTH '<>' FROM q.Tags), '><')) AS x
+         )) AS TagNames,
+        q.Tags
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    LEFT JOIN PostHistory ph ON ph.PostId = q.Id
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount, q.OwnerUserId, q.Tags
+)
+SELECT
+    qs.QuestionId,
+    qs.Title,
+    qs.CreationDate,
+    qs.QuestionScore,
+    qs.ViewCount,
+    ua.DisplayName AS QuestionOwner,
+    ua.Reputation AS QuestionOwnerRep,
+    qs.TotalAnswers,
+    qs.TimesClosed,
+    qs.TimesReopened,
+    qs.FavoriteCountVotes,
+    ua.LastActivity AS QuestionOwnerLastActivity,
+    utb.Name AS TopBadgeName,
+    utb.Class AS TopBadgeClass,
+    STRING_AGG(DISTINCT CAST(dups.RelatedPostId AS varchar) || ' (' || dups.LinkTypeName || ')', ', ') AS DuplicateRelations,
+    (
+        SELECT json_agg(json_build_object(
+            'AnswerId', a.Id,
+            'Score', a.Score,
+            'RankByScore', ar.RankByScore,
+            'IsAccepted', (a.Id = q.AcceptedAnswerId),
+            'AnswerOwnerId', a.OwnerUserId,
+            'AnswerCreationDate', a.CreationDate,
+            'CommentsCount', COALESCE(c.Count,0)
+        ) ORDER BY ar.RankByScore)
+        FROM Posts a
+        LEFT JOIN AnswerRanks ar ON ar.Id = a.Id
+        LEFT JOIN (
+            SELECT PostId, COUNT(*) AS Count FROM Comments GROUP BY PostId
+        ) c ON c.PostId = a.Id
+        WHERE a.ParentId = qs.QuestionId AND a.PostTypeId = 2
+    ) AS AnswersSummary,
+    (
+        SELECT COUNT(*)
+        FROM Comments c
+        WHERE c.PostId = qs.QuestionId
+          AND (c.Text ~* 'performance|benchmark|optimization')
+    ) AS RelevantCommentCount,
+    CASE
+        WHEN qs.TimesClosed > 0 THEN 'Closed'
+        ELSE 'Open'
+    END AS CurrentStatus,
+    qs.TagNames
+FROM QuestionWithAnswerStats qs
+LEFT JOIN Users ua ON ua.Id = qs.OwnerUserId
+LEFT JOIN UserTopBadge utb ON utb.UserId = ua.Id AND utb.rn = 1
+LEFT JOIN PostDuplicatesCTE dups ON dups.PostId = qs.QuestionId AND dups.LinkRank = 1
+WHERE ua.Reputation > 1000
+  AND (qs.ViewCount > 1000 OR qs.QuestionScore >= 10)
+  AND qs.CreationDate > (DATE '2024-10-01' - INTERVAL '2 years')
+GROUP BY 
+    qs.QuestionId, qs.Title, qs.CreationDate, qs.QuestionScore, qs.ViewCount, ua.DisplayName, ua.Reputation, 
+    qs.TotalAnswers, qs.TimesClosed, qs.TimesReopened, qs.FavoriteCountVotes, ua.LastActivity, utb.Name, utb.Class, qs.TagNames, dups.RelatedPostId
+ORDER BY qs.ViewCount DESC, qs.QuestionScore DESC
+LIMIT 50;

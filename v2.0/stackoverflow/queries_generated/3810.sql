@@ -1,0 +1,141 @@
+-- {"query": "3810.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2303} 
+
+/*  Complex benchmark query on the StackOverflow schema  */
+WITH 
+/*  All non‑moderator tags  */
+TagList AS (
+    SELECT t.Id,
+           t.TagName,
+           t.Count
+    FROM   Tags t
+    WHERE  t.IsModeratorOnly = 0
+),
+
+/*  All questions  */
+QuestionPosts AS (
+    SELECT p.Id,
+           p.Title,
+           p.CreationDate,
+           p.OwnerUserId,
+           p.Score,
+           p.ViewCount,
+           p.Tags,
+           p.AnswerCount,
+           p.FavoriteCount
+    FROM   Posts p
+    WHERE  p.PostTypeId = 1          -- Question
+),
+
+/*  Associate each question with every tag it contains, keep a row‑number per question  */
+TaggedQuestions AS (
+    SELECT q.*,
+           tl.TagName,
+           ROW_NUMBER() OVER (PARTITION BY q.Id 
+                              ORDER BY POSITION('<' || tl.TagName || '>' IN q.Tags)) AS rn
+    FROM   QuestionPosts q
+    JOIN   TagList tl
+           ON q.Tags LIKE '%<' || tl.TagName || '>%'
+),
+
+/*  Keep only the first tag per question (to avoid exploding the row‑count)  */
+FirstTag AS (
+    SELECT *
+    FROM   TaggedQuestions
+    WHERE  rn = 1
+),
+
+/*  Monthly activity per tag  */
+MonthlyActivity AS (
+    SELECT ft.TagName,
+           DATE_TRUNC('month', ft.CreationDate)               AS month,
+           COUNT(*)                                           AS questions,
+           SUM(ft.AnswerCount)                                AS total_answers,
+           AVG(ft.Score)                                      AS avg_score,
+           SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END)  AS upvotes,
+           SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END)  AS downvotes,
+           COUNT(DISTINCT ft.OwnerUserId)                     AS distinct_askers,
+           COUNT(DISTINCT a.OwnerUserId)                      AS distinct_answerers
+    FROM   FirstTag ft
+    LEFT JOIN Votes v
+           ON v.PostId = ft.Id
+          AND v.VoteTypeId IN (2,3)                         -- up / down votes
+    LEFT JOIN Posts a
+           ON a.ParentId = ft.Id
+          AND a.PostTypeId = 2                             -- answers
+    GROUP  BY ft.TagName, DATE_TRUNC('month', ft.CreationDate)
+),
+
+/*  Rank months per tag by number of questions (top 3 months)  */
+RankedMonths AS (
+    SELECT ma.*,
+           RANK() OVER (PARTITION BY ma.TagName 
+                        ORDER BY ma.questions DESC)          AS month_rank
+    FROM   MonthlyActivity ma
+),
+
+/*  Top users overall (by total post score)  */
+TopUsers AS (
+    SELECT u.Id,
+           u.DisplayName,
+           COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS questions_asked,
+           COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS answers_given,
+           SUM(p.Score)                               AS total_score,
+           ROW_NUMBER() OVER (ORDER BY SUM(p.Score) DESC) AS rn
+    FROM   Users u
+    LEFT JOIN Posts p
+           ON p.OwnerUserId = u.Id
+    GROUP  BY u.Id, u.DisplayName
+    HAVING COUNT(p.Id) > 0
+),
+
+/*  Gold badges per user (concatenated)  */
+TopBadges AS (
+    SELECT b.UserId,
+           STRING_AGG(b.Name, ', ') AS badge_list,
+           COUNT(*)                AS badge_count
+    FROM   Badges b
+    WHERE  b.Class = 1                                 -- Gold
+    GROUP  BY b.UserId
+)
+
+SELECT 
+    r.TagName,
+    TO_CHAR(r.month, 'YYYY-MM')               AS month,
+    r.questions,
+    r.total_answers,
+    ROUND(r.avg_score, 2)                      AS avg_score,
+    r.upvotes,
+    r.downvotes,
+    r.distinct_askers,
+    r.distinct_answerers,
+    COALESCE(tu.DisplayName, 'Anonymous')      AS top_user,
+    tu.questions_asked,
+    tu.answers_given,
+    tu.total_score,
+    COALESCE(tb.badge_list, '')                AS top_user_gold_badges,
+    tb.badge_count
+FROM   RankedMonths r
+LEFT   JOIN TopUsers tu
+       ON tu.rn = 1
+LEFT   JOIN TopBadges tb
+       ON tb.UserId = tu.Id
+WHERE  r.month_rank <= 3
+
+UNION ALL
+
+/*  Overall summary (across all tags)  */
+SELECT 
+    'Overall'                                   AS TagName,
+    NULL                                        AS month,
+    SUM(r.questions)                            AS questions,
+    SUM(r.total_answers)                        AS total_answers,
+    ROUND(AVG(r.avg_score), 2)                  AS avg_score,
+    SUM(r.upvotes)                              AS upvotes,
+    SUM(r.downvotes)                            AS downvotes,
+    SUM(r.distinct_askers)                      AS distinct_askers,
+    SUM(r.distinct_answerers)                   AS distinct_answerers,
+    NULL, NULL, NULL, NULL, NULL, NULL
+FROM   RankedMonths r
+WHERE  r.month_rank <= 3
+
+ORDER BY TagName, month NULLS LAST;

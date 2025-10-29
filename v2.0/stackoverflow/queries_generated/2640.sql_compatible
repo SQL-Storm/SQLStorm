@@ -1,0 +1,164 @@
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        coalesce(sum(vp.Score),0) as TotalPostScore,
+        coalesce(sum(case when v.VoteTypeId = 2 then 1 else 0 end),0) as UpVotesCast,
+        coalesce(sum(case when v.VoteTypeId = 3 then 1 else 0 end),0) as DownVotesCast
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    left join Posts vp on vp.Id = v.PostId
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+UserBadgeStats as (
+    select
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        count(distinct b.Id) as TotalBadges
+    from Badges b
+    group by b.UserId
+),
+HighImpactPosts as (
+    select
+        p.Id,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        case when p.PostTypeId = 1 then p.AcceptedAnswerId else null end as AcceptedAnswerId,
+        p.Tags,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc) as PostRankDesc
+    from Posts p
+    where p.Score > 50 and p.CreationDate > (date '2024-10-01' - interval '365' day)
+),
+PostAnswerStats as (
+    select
+        p.ParentId as QuestionId,
+        count(p.Id) as AnswerCount,
+        avg(p.Score) as AvgAnswerScore,
+        max(p.Score) as MaxAnswerScore
+    from Posts p
+    where p.PostTypeId = 2
+    group by p.ParentId
+),
+LinkedDuplicateQuestions as (
+    select distinct
+        pl.PostId as DuplicateQuestionId,
+        pl.RelatedPostId as OriginalQuestionId,
+        pq.Title as DuplicateTitle,
+        po.Title as OriginalTitle,
+        pl.CreationDate as LinkCreation,
+        u.DisplayName as OriginalAuthor,
+        u.Reputation as OriginalAuthorReputation
+    from PostLinks pl
+    inner join Posts pq on pq.Id = pl.PostId and pq.PostTypeId = 1
+    inner join Posts po on po.Id = pl.RelatedPostId and po.PostTypeId = 1
+    left join Users u on u.Id = po.OwnerUserId
+    where pl.LinkTypeId = 3
+    and pl.CreationDate > (date '2024-10-01' - interval '180' day)
+),
+RecentCommentsOnLowScorePosts as (
+    select
+        c.Id as CommentId,
+        c.PostId,
+        c.Score as CommentScore,
+        c.Text,
+        c.CreationDate as CommentDate,
+        p.Score as PostScore,
+        p.PostTypeId,
+        u.DisplayName as CommentUserName,
+        u.Reputation as CommentUserReputation
+    from Comments c
+    inner join Posts p on p.Id = c.PostId
+    left join Users u on u.Id = c.UserId
+    where p.Score < 0
+    and c.CreationDate > (date '2024-10-01' - interval '30' day)
+),
+UserRankings as (
+    select
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.TotalPostScore,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        rank() over (order by ua.Reputation desc, ua.TotalPostScore desc) as ReputationRank
+    from RecursiveUserActivity ua
+    left join UserBadgeStats ub on ub.UserId = ua.UserId
+),
+AcceptedAnswerScores as (
+    select
+        p.Id as QuestionId,
+        p.AcceptedAnswerId,
+        pa.Score as AcceptedAnswerScore,
+        p.Score as QuestionScore,
+        p.CreationDate
+    from Posts p
+    left join Posts pa on pa.Id = p.AcceptedAnswerId
+    where p.PostTypeId = 1
+    and p.AcceptedAnswerId is not null
+),
+AnswersWithoutAccepted as (
+    select
+        p.ParentId as QuestionId,
+        count(p.Id) as TotalAnswers,
+        sum(case when p.Id not in (select AcceptedAnswerId from Posts where AcceptedAnswerId is not null) then 1 else 0 end) as NonAcceptedAnswersCount
+    from Posts p
+    where p.PostTypeId = 2
+    group by p.ParentId
+)
+
+select
+    ur.UserId,
+    ur.DisplayName,
+    ur.Reputation,
+    ur.QuestionCount,
+    ur.AnswerCount,
+    ur.TotalPostScore,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    qp.PostRankDesc as HighestScorePostRank,
+    qp.Score as HighestScorePostScore,
+    coalesce(pa.AvgAnswerScore, 0) as AvgAnswerScoreOnTheirQuestions,
+    coalesce(pa.MaxAnswerScore, 0) as MaxAnswerScoreOnTheirQuestions,
+    coalesce(ld.DuplicateTitle, '') as RecentDuplicateQuestionTitle,
+    coalesce(ld.OriginalTitle, '') as OriginalDuplicateTitle,
+    rc.CommentId as RecentNegativePostCommentId,
+    rc.CommentScore,
+    rc.Text as CommentText,
+    rc.CommentDate,
+    rc.CommentUserName,
+    rc.CommentUserReputation,
+    aa.AcceptedAnswerScore,
+    aa.QuestionScore as AcceptedAnswerQuestionScore,
+    case
+        when aa.AcceptedAnswerScore is null then 'No Accepted Answer'
+        when aa.AcceptedAnswerScore > aa.QuestionScore then 'Accepted Answer Better'
+        when aa.AcceptedAnswerScore = aa.QuestionScore then 'Accepted Answer Equal'
+        else 'Accepted Answer Worse'
+    end as AcceptedAnswerPerformance,
+    ur.ReputationRank
+from UserRankings ur
+left join HighImpactPosts qp on qp.OwnerUserId = ur.UserId and qp.PostRankDesc = 1
+left join PostAnswerStats pa on pa.QuestionId = qp.Id
+left join LinkedDuplicateQuestions ld on ld.OriginalAuthorReputation > 10000 and ld.OriginalAuthorReputation < ur.Reputation and ld.OriginalQuestionId in (select Id from Posts where OwnerUserId = ur.UserId)
+left join RecentCommentsOnLowScorePosts rc on rc.CommentUserReputation > 100 and rc.PostId in (select Id from Posts where OwnerUserId = ur.UserId)
+left join AcceptedAnswerScores aa on aa.QuestionId = qp.Id
+left join UserBadgeStats ub on ub.UserId = ur.UserId
+where ur.Reputation > 5000
+order by ur.ReputationRank, qp.Score desc
+limit 100;

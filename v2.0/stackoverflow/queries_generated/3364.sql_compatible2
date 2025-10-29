@@ -1,0 +1,218 @@
+WITH 
+RecentActivity AS (
+    SELECT DISTINCT u.Id,
+           u.DisplayName,
+           u.Reputation,
+           COALESCE(u.Location, 'Unknown') AS Location,
+           GREATEST(
+               COALESCE(u.LastAccessDate, TIMESTAMP '1970-01-01'),
+               COALESCE(p.LastActivityDate, TIMESTAMP '1970-01-01'),
+               COALESCE(c.CreationDate, TIMESTAMP '1970-01-01'),
+               COALESCE(v.CreationDate, TIMESTAMP '1970-01-01')
+           ) AS LastSeen
+    FROM Users u
+    LEFT JOIN Posts p        ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c     ON c.UserId = u.Id
+    LEFT JOIN Votes v        ON v.UserId = u.Id
+    WHERE GREATEST(
+               COALESCE(u.LastAccessDate, TIMESTAMP '1970-01-01'),
+               COALESCE(p.LastActivityDate, TIMESTAMP '1970-01-01'),
+               COALESCE(c.CreationDate, TIMESTAMP '1970-01-01'),
+               COALESCE(v.CreationDate, TIMESTAMP '1970-01-01')
+           ) >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 day'
+),
+TagStats AS (
+    SELECT t.Id,
+           t.TagName,
+           t.Count AS TotalTagCount,
+           COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+           COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswerCount,
+           ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE ('%' || '<' || t.TagName || '>' || '%')
+    GROUP BY t.Id, t.TagName, t.Count
+    HAVING COUNT(p.Id) > 0
+    ORDER BY t.Count DESC
+    LIMIT 20
+),
+UserBadgeAgg AS (
+    SELECT ra.Id AS UserId,
+           ra.DisplayName,
+           ra.Reputation,
+           ra.Location,
+           ra.LastSeen,
+           COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+           COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+           COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+           SUM(CASE WHEN b.TagBased = TRUE OR b.TagBased = 1 THEN 1 ELSE 0 END) AS TagBasedBadgeCount
+    FROM RecentActivity ra
+    LEFT JOIN Badges b ON b.UserId = ra.Id
+    GROUP BY ra.Id, ra.DisplayName, ra.Reputation, ra.Location, ra.LastSeen
+),
+LatestVotePerPost AS (
+    SELECT v.PostId,
+           vt.Name AS VoteType,
+           v.CreationDate,
+           v.UserId,
+           ROW_NUMBER() OVER (PARTITION BY v.PostId ORDER BY v.CreationDate DESC) AS rn
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+),
+RankedPostsPerTag AS (
+    SELECT p.Id AS PostId,
+           p.Title,
+           p.Score,
+           p.CreationDate,
+           t.TagName,
+           ROW_NUMBER() OVER (PARTITION BY t.Id ORDER BY p.Score DESC, p.CreationDate DESC) AS RankWithinTag
+    FROM TagStats t
+    JOIN Posts p ON p.Tags LIKE ('%' || '<' || t.TagName || '>' || '%')
+    WHERE p.PostTypeId = 1
+),
+QuestionAgg AS (
+    SELECT p.Id,
+           p.Title,
+           p.Score,
+           p.ViewCount,
+           p.AnswerCount,
+           p.CreationDate,
+           'Question' AS PostKind
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+AnswerAgg AS (
+    SELECT p.Id,
+           SUBSTRING(p.Body FROM 1 FOR 100) || '...' AS Title,
+           p.Score,
+           NULL AS ViewCount,
+           NULL AS AnswerCount,
+           p.CreationDate,
+           'Answer' AS PostKind
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+)
+
+SELECT *
+FROM (
+    SELECT uba.UserId,
+           uba.DisplayName,
+           uba.Reputation,
+           uba.Location,
+           uba.LastSeen,
+           uba.GoldBadges,
+           uba.SilverBadges,
+           uba.BronzeBadges,
+           uba.TagBasedBadgeCount,
+           CAST(NULL AS INTEGER) AS TagId,
+           CAST(NULL AS VARCHAR) AS TagName,
+           CAST(NULL AS INTEGER) AS TagRank,
+           CAST(NULL AS INTEGER) AS PostId,
+           CAST(NULL AS VARCHAR) AS PostTitle,
+           CAST(NULL AS INTEGER) AS PostScore,
+           CAST(NULL AS INTEGER) AS PostRankWithinTag,
+           CAST(NULL AS VARCHAR) AS VoteType,
+           CAST(NULL AS TIMESTAMP) AS LatestVoteDate,
+           CAST(NULL AS INTEGER) AS VoteUserId,
+           CAST(NULL AS VARCHAR) AS AggregateKind,
+           CAST(NULL AS INTEGER) AS AggScore,
+           CAST(NULL AS INTEGER) AS AggViewCount,
+           CAST(NULL AS INTEGER) AS AggAnswerCount,
+           CAST(NULL AS TIMESTAMP) AS AggCreationDate
+    FROM UserBadgeAgg uba
+
+    UNION ALL
+
+    SELECT CAST(NULL AS INTEGER) AS UserId,
+           CAST(NULL AS VARCHAR) AS DisplayName,
+           CAST(NULL AS INTEGER) AS Reputation,
+           CAST(NULL AS VARCHAR) AS Location,
+           CAST(NULL AS TIMESTAMP) AS LastSeen,
+           CAST(NULL AS INTEGER) AS GoldBadges,
+           CAST(NULL AS INTEGER) AS SilverBadges,
+           CAST(NULL AS INTEGER) AS BronzeBadges,
+           CAST(NULL AS INTEGER) AS TagBasedBadgeCount,
+           t.Id AS TagId,
+           t.TagName,
+           t.TagRank,
+           rp.PostId,
+           rp.Title,
+           rp.Score,
+           rp.RankWithinTag,
+           CAST(NULL AS VARCHAR) AS VoteType,
+           CAST(NULL AS TIMESTAMP) AS LatestVoteDate,
+           CAST(NULL AS INTEGER) AS VoteUserId,
+           CAST(NULL AS VARCHAR) AS AggregateKind,
+           CAST(NULL AS INTEGER) AS AggScore,
+           CAST(NULL AS INTEGER) AS AggViewCount,
+           CAST(NULL AS INTEGER) AS AggAnswerCount,
+           CAST(NULL AS TIMESTAMP) AS AggCreationDate
+    FROM TagStats t
+    JOIN RankedPostsPerTag rp ON rp.TagName = t.TagName
+
+    UNION ALL
+
+    SELECT CAST(NULL AS INTEGER) AS UserId,
+           CAST(NULL AS VARCHAR) AS DisplayName,
+           CAST(NULL AS INTEGER) AS Reputation,
+           CAST(NULL AS VARCHAR) AS Location,
+           CAST(NULL AS TIMESTAMP) AS LastSeen,
+           CAST(NULL AS INTEGER) AS GoldBadges,
+           CAST(NULL AS INTEGER) AS SilverBadges,
+           CAST(NULL AS INTEGER) AS BronzeBadges,
+           CAST(NULL AS INTEGER) AS TagBasedBadgeCount,
+           CAST(NULL AS INTEGER) AS TagId,
+           CAST(NULL AS VARCHAR) AS TagName,
+           CAST(NULL AS INTEGER) AS TagRank,
+           lv.PostId,
+           p.Title,
+           p.Score,
+           CAST(NULL AS INTEGER) AS PostRankWithinTag,
+           lv.VoteType,
+           lv.CreationDate AS LatestVoteDate,
+           lv.UserId AS VoteUserId,
+           CAST(NULL AS VARCHAR) AS AggregateKind,
+           CAST(NULL AS INTEGER) AS AggScore,
+           CAST(NULL AS INTEGER) AS AggViewCount,
+           CAST(NULL AS INTEGER) AS AggAnswerCount,
+           CAST(NULL AS TIMESTAMP) AS AggCreationDate
+    FROM LatestVotePerPost lv
+    JOIN Posts p ON p.Id = lv.PostId
+    WHERE lv.rn = 1
+
+    UNION ALL
+
+    SELECT CAST(NULL AS INTEGER) AS UserId,
+           CAST(NULL AS VARCHAR) AS DisplayName,
+           CAST(NULL AS INTEGER) AS Reputation,
+           CAST(NULL AS VARCHAR) AS Location,
+           CAST(NULL AS TIMESTAMP) AS LastSeen,
+           CAST(NULL AS INTEGER) AS GoldBadges,
+           CAST(NULL AS INTEGER) AS SilverBadges,
+           CAST(NULL AS INTEGER) AS BronzeBadges,
+           CAST(NULL AS INTEGER) AS TagBasedBadgeCount,
+           CAST(NULL AS INTEGER) AS TagId,
+           CAST(NULL AS VARCHAR) AS TagName,
+           CAST(NULL AS INTEGER) AS TagRank,
+           qa.Id AS PostId,
+           qa.Title,
+           qa.Score,
+           CAST(NULL AS INTEGER) AS PostRankWithinTag,
+           CAST(NULL AS VARCHAR) AS VoteType,
+           CAST(NULL AS TIMESTAMP) AS LatestVoteDate,
+           CAST(NULL AS INTEGER) AS VoteUserId,
+           qa.PostKind AS AggregateKind,
+           qa.Score AS AggScore,
+           qa.ViewCount AS AggViewCount,
+           qa.AnswerCount AS AggAnswerCount,
+           qa.CreationDate AS AggCreationDate
+    FROM (
+        SELECT * FROM QuestionAgg
+        UNION ALL
+        SELECT * FROM AnswerAgg
+    ) qa
+) AS BenchmarkResult
+ORDER BY
+    COALESCE(UserId, 0) DESC,
+    COALESCE(TagRank, 9999) ASC,
+    COALESCE(PostRankWithinTag, 9999) ASC,
+    COALESCE(AggScore, 0) DESC;

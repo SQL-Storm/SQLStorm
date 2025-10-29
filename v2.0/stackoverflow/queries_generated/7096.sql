@@ -1,0 +1,307 @@
+-- {"query": "7096.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2975} 
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COUNT(DISTINCT v.Id) as VoteCount,
+        MAX(p.CreationDate) as LastPostDate,
+        AVG(p.Score) as AvgPostScore,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2) FILTER (WHERE p.Tags IS NOT NULL), ', ') as AllTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId OR u.Id = p.LastEditorUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    WHERE u.AccountId IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+RankedUsers AS (
+    SELECT 
+        *,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, PostCount DESC) as RankByReputation,
+        RANK() OVER (ORDER BY Views DESC, UpVotes DESC) as RankByPopularity,
+        DENSE_RANK() OVER (ORDER BY BadgeCount DESC, VoteCount DESC) as RankByActivity
+    FROM UserStats
+),
+TopPosts AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.PostTypeId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as PostType,
+        COALESCE(p.AnswerCount, 0) + COALESCE(p.CommentCount, 0) as EngagementCount,
+        CASE 
+            WHEN p.Score >= 100 THEN 'High'
+            WHEN p.Score >= 50 THEN 'Medium'
+            ELSE 'Low'
+        END as ScoreLevel
+    FROM Posts p
+    WHERE p.CreationDate >= '2023-01-01'
+),
+PostsWithTags AS (
+    SELECT 
+        tp.*, 
+        t.TagName,
+        t.Count as TagCount,
+        ROW_NUMBER() OVER (PARTITION BY tp.Id ORDER BY t.Count DESC) as TagRank,
+        CASE 
+            WHEN t.IsRequired = 1 THEN 'Required'
+            WHEN t.IsModeratorOnly = 1 THEN 'Moderator Only'
+            ELSE 'Regular'
+        END as TagType
+    FROM TopPosts tp
+    LEFT JOIN Tags t ON tp.Tags IS NOT NULL 
+        AND t.TagName IN (SELECT UNNEST(string_to_array(SUBSTRING(tp.Tags, 2, LENGTH(tp.Tags) - 2), '><')))
+    WHERE tp.Tags IS NOT NULL
+),
+QualifiedUsers AS (
+    SELECT 
+        ru.*,
+        COALESCE(ROUND((ru.PostCount * 100.0 / NULLIF((SELECT COUNT(*) FROM Posts WHERE OwnerUserId = ru.UserId), 0)), 2), 0) as PostPercentage,
+        COALESCE(ROUND((ru.BadgeCount * 100.0 / NULLIF((SELECT COUNT(*) FROM Badges WHERE UserId = ru.UserId), 0)), 2), 0) as BadgePercentage,
+        LAG(ru.Reputation) OVER (ORDER BY ru.Reputation DESC) - ru.Reputation as ReputationGap,
+        CASE 
+            WHEN ru.VoteCount > 1000 THEN 'Highly Active'
+            WHEN ru.VoteCount > 500 THEN 'Active'
+            WHEN ru.VoteCount > 100 THEN 'Moderate'
+            ELSE 'Low'
+        END as ActivityLevel
+    FROM RankedUsers ru
+    WHERE ru.RankByReputation <= 1000
+),
+UserEngagement AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        SUM(CASE WHEN p.Score > 0 THEN p.Score ELSE 0 END) as PositiveScore,
+        SUM(CASE WHEN p.Score < 0 THEN p.Score ELSE 0 END) as NegativeScore,
+        AVG(p.Score) as AvgScore,
+        STRING_AGG(DISTINCT p.Title, ', ') FILTER (WHERE p.Title IS NOT NULL AND LENGTH(p.Title) > 20) as LongTitles,
+        COALESCE(STRING_AGG(p.Tags, '; ') FILTER (WHERE p.Tags IS NOT NULL), 'No Tags') as AllTags,
+        MAX(p.CreationDate) as LastActivity
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.CreationDate >= '2020-01-01' AND u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName
+),
+PostMetrics AS (
+    SELECT 
+        ps.Id as PostId,
+        ps.Title,
+        ps.Score,
+        ps.ViewCount,
+        ps.CreationDate,
+        ps.OwnerUserId,
+        ps.PostTypeId,
+        ps.AnswerCount,
+        ps.CommentCount,
+        ps.FavoriteCount,
+        ps.Tags,
+        COALESCE(ps.AnswerCount, 0) + COALESCE(ps.CommentCount, 0) as TotalEngagement,
+        CASE 
+            WHEN ps.AnswerCount > 10 THEN 'High Engagement'
+            WHEN ps.AnswerCount > 5 THEN 'Medium Engagement'
+            WHEN ps.AnswerCount > 0 THEN 'Low Engagement'
+            ELSE 'No Answers'
+        END as EngagementTier,
+        CASE 
+            WHEN ps.Score >= 100 THEN 'Gold Standard'
+            WHEN ps.Score >= 50 THEN 'Silver Standard'
+            WHEN ps.Score >= 10 THEN 'Bronze Standard'
+            ELSE 'Standard'
+        END as ScoreTier,
+        AVG(ps.Score) OVER (PARTITION BY ps.OwnerUserId) as UserAverageScore,
+        COUNT(*) OVER (PARTITION BY ps.OwnerUserId) as UserPostCount,
+        RANK() OVER (ORDER BY ps.Score DESC) as GlobalRank,
+        DENSE_RANK() OVER (ORDER BY ps.CreationDate DESC) as RecentRank
+    FROM Posts ps
+    WHERE ps.CreationDate >= '2022-01-01'
+),
+UserBadges AS (
+    SELECT 
+        b.UserId,
+        b.Name as BadgeName,
+        b.Date,
+        b.Class,
+        CASE 
+            WHEN b.Class = 1 THEN 'Gold'
+            WHEN b.Class = 2 THEN 'Silver' 
+            WHEN b.Class = 3 THEN 'Bronze'
+            ELSE 'Unknown'
+        END as BadgeTier,
+        COUNT(*) OVER (PARTITION BY b.UserId, b.Class) as ClassCount,
+        LAG(b.Date) OVER (PARTITION BY b.UserId ORDER BY b.Date) as PreviousBadgeDate,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Date) as BadgeSequence
+    FROM Badges b
+    WHERE b.Date >= '2020-01-01'
+),
+CombinedMetrics AS (
+    SELECT 
+        'All Users' as MetricGroup,
+        COUNT(*) as TotalRecords,
+        COUNT(DISTINCT UserId) as UniqueUsers,
+        COUNT(DISTINCT PostId) as UniquePosts,
+        COUNT(DISTINCT BadgeId) as UniqueBadges,
+        COUNT(*) FILTER (WHERE Score > 0) as PositiveScores,
+        COUNT(*) FILTER (WHERE Score < 0) as NegativeScores,
+        AVG(Score) as AverageScore,
+        MIN(CreationDate) as EarliestDate,
+        MAX(CreationDate) as LatestDate
+    FROM (
+        SELECT u.Id as UserId, p.Id as PostId, b.Id as BadgeId, p.Score, p.CreationDate
+        FROM Users u
+        LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+        LEFT JOIN Badges b ON u.Id = b.UserId
+        WHERE u.CreationDate >= '2020-01-01'
+    ) sub
+    UNION ALL
+    SELECT 
+        'Recent Users' as MetricGroup,
+        COUNT(*) as TotalRecords,
+        COUNT(DISTINCT UserId) as UniqueUsers,
+        COUNT(DISTINCT PostId) as UniquePosts,
+        COUNT(DISTINCT BadgeId) as UniqueBadges,
+        COUNT(*) FILTER (WHERE Score > 0) as PositiveScores,
+        COUNT(*) FILTER (WHERE Score < 0) as NegativeScores,
+        AVG(Score) as AverageScore,
+        MIN(CreationDate) as EarliestDate,
+        MAX(CreationDate) as LatestDate
+    FROM (
+        SELECT u.Id as UserId, p.Id as PostId, b.Id as BadgeId, p.Score, p.CreationDate
+        FROM Users u
+        LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+        LEFT JOIN Badges b ON u.Id = b.UserId
+        WHERE u.CreationDate >= '2023-01-01'
+    ) sub
+    UNION ALL
+    SELECT 
+        'Active Users' as MetricGroup,
+        COUNT(*) as TotalRecords,
+        COUNT(DISTINCT UserId) as UniqueUsers,
+        COUNT(DISTINCT PostId) as UniquePosts,
+        COUNT(DISTINCT BadgeId) as UniqueBadges,
+        COUNT(*) FILTER (WHERE Score > 0) as PositiveScores,
+        COUNT(*) FILTER (WHERE Score < 0) as NegativeScores,
+        AVG(Score) as AverageScore,
+        MIN(CreationDate) as EarliestDate,
+        MAX(CreationDate) as LatestDate
+    FROM (
+        SELECT u.Id as UserId, p.Id as PostId, b.Id as BadgeId, p.Score, p.CreationDate
+        FROM Users u
+        LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+        LEFT JOIN Badges b ON u.Id = b.UserId
+        WHERE u.Reputation > 1000 AND u.CreationDate >= '2020-01-01'
+    ) sub
+)
+SELECT 
+    q.UserId,
+    q.DisplayName,
+    q.Reputation,
+    q.PostCount,
+    q.QuestionCount,
+    q.AnswerCount,
+    q.BadgeCount,
+    q.VoteCount,
+    q.RankByReputation,
+    q.RankByPopularity,
+    q.RankByActivity,
+    q.PostPercentage,
+    q.BadgePercentage,
+    q.ReputationGap,
+    q.ActivityLevel,
+    uem.TotalPosts,
+    uem.Questions,
+    uem.Answers,
+    uem.PositiveScore,
+    uem.NegativeScore,
+    uem.AvgScore,
+    pm.PostId,
+    pm.Title,
+    pm.Score,
+    pm.ViewCount,
+    pm.AnswerCount as PostAnswerCount,
+    pm.CommentCount,
+    pm.FavoriteCount,
+    pm.Tags,
+    pm.TotalEngagement,
+    pm.EngagementTier,
+    pm.ScoreTier,
+    pm.UserAverageScore,
+    pm.UserPostCount,
+    pm.GlobalRank,
+    pm.RecentRank,
+    ub.BadgeName,
+    ub.Date as BadgeDate,
+    ub.BadgeTier,
+    ub.ClassCount,
+    ub.BadgeSequence,
+    cm.MetricGroup,
+    cm.TotalRecords,
+    cm.UniqueUsers,
+    cm.UniquePosts,
+    cm.UniqueBadges,
+    cm.PositiveScores,
+    cm.NegativeScores,
+    cm.AverageScore,
+    cm.EarliestDate,
+    cm.LatestDate,
+    CASE 
+        WHEN q.Reputation > 10000 THEN 'Elite'
+        WHEN q.Reputation > 5000 THEN 'Veteran'
+        WHEN q.Reputation > 1000 THEN 'Experienced'
+        ELSE 'Beginner'
+    END as ReputationTier,
+    CASE 
+        WHEN q.PostCount > 1000 THEN 'High Productivity'
+        WHEN q.PostCount > 500 THEN 'Moderate Productivity'
+        WHEN q.PostCount > 100 THEN 'Low Productivity'
+        ELSE 'Minimal Productivity'
+    END as ProductivityLevel,
+    CASE 
+        WHEN q.BadgeCount > 10 THEN 'Awarded'
+        WHEN q.BadgeCount > 5 THEN 'Recognized'  
+        WHEN q.BadgeCount > 0 THEN 'Beginner Recognition'
+        ELSE 'No Recognition'
+    END as RecognitionLevel,
+    (q.PostCount + q.BadgeCount + q.VoteCount) as OverallActivityScore,
+    (q.PostCount * 0.5) + (q.BadgeCount * 0.3) + (q.VoteCount * 0.2) as WeightedActivityScore,
+    LAG(q.Reputation) OVER (ORDER BY q.Reputation DESC) - q.Reputation as ReputationGapFromNext,
+    ROW_NUMBER() OVER (ORDER BY (q.PostCount + q.BadgeCount + q.VoteCount) DESC) as OverallActivityRank
+FROM QualifiedUsers q
+JOIN UserEngagement uem ON q.UserId = uem.UserId
+JOIN PostMetrics pm ON q.UserId = pm.OwnerUserId
+LEFT JOIN UserBadges ub ON q.UserId = ub.UserId
+JOIN CombinedMetrics cm ON 1=1
+WHERE q.Reputation > 100
+  AND q.PostCount > 0
+  AND pm.Score > 0
+  AND cm.MetricGroup = 'All Users'
+ORDER BY 
+    q.Reputation DESC,
+    q.PostCount DESC,
+    pm.Score DESC,
+    cm.TotalRecords DESC
+LIMIT 1000 OFFSET 0;

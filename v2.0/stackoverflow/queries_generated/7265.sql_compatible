@@ -1,0 +1,291 @@
+WITH RankedPosts AS (
+  SELECT 
+    p.Id,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.Title,
+    p.Tags,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ContentLicense,
+    LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PrevScore,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as UserPostRank,
+    DENSE_RANK() OVER (ORDER BY p.Score DESC) as ScoreRank,
+    NTILE(10) OVER (ORDER BY p.Score) as ScoreDecile
+  FROM Posts p
+  WHERE p.PostTypeId IN (1, 2) 
+    AND p.CreationDate >= TIMESTAMP '2010-01-01'
+    AND p.Score IS NOT NULL
+),
+UserStats AS (
+  SELECT 
+    u.Id as UserId,
+    u.Reputation,
+    u.DisplayName,
+    u.LastAccessDate,
+    COUNT(DISTINCT p.Id) as TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+    SUM(COALESCE(p.Score, 0)) as TotalScore,
+    AVG(COALESCE(p.Score, 0)) as AvgScore,
+    MAX(p.CreationDate) as LatestPostDate,
+    STRING_AGG(DISTINCT p.Tags, '; ') as AllTags,
+    CASE WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+      AVG(EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate)) / 86400.0)
+    ELSE NULL END as AvgDaysBetweenPosts,
+    CASE WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+      SUM(COALESCE(p.ViewCount, 0)) / COUNT(DISTINCT p.Id) 
+    ELSE 0 END as AvgViewsPerPost
+  FROM Users u
+  LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+  WHERE u.CreationDate >= TIMESTAMP '2008-01-01'
+  GROUP BY u.Id, u.Reputation, u.DisplayName, u.LastAccessDate
+),
+PostsWithBadges AS (
+  SELECT 
+    p.Id,
+    p.Title,
+    p.OwnerUserId,
+    p.PostTypeId,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    COALESCE(p.Tags, '') as Tags,
+    CONCAT_WS(' ', 
+      CASE WHEN p.PostTypeId = 1 THEN 'Question' ELSE 'Answer' END,
+      CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Accepted' ELSE 'Unaccepted' END,
+      CASE WHEN p.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END
+    ) as PostTypeLabel,
+    CASE 
+      WHEN p.Score >= 1000 THEN 'TopScoring'
+      WHEN p.Score >= 100 THEN 'HighScoring'
+      WHEN p.Score >= 0 THEN 'ModerateScoring'
+      ELSE 'LowScoring'
+    END as ScoringCategory,
+    EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate)) / 86400.0 as DaysActive,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) as RankByScore,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = p.OwnerUserId) as TotalBadges,
+    COALESCE(p.ContentLicense, 'Unknown') as License,
+    CASE WHEN p.Tags IS NOT NULL AND p.Tags != '' THEN string_to_array(p.Tags, '>') ELSE NULL END as TagArray,
+    CASE WHEN p.Score + COALESCE((SELECT AVG(ps.Score) FROM Posts ps WHERE ps.OwnerUserId = p.OwnerUserId AND ps.Score IS NOT NULL), 0) > 100 THEN 1 ELSE 0 END as IsAboveAverage,
+    LEAD(p.Id, 1) OVER (ORDER BY p.Score DESC) as NextHigherPostId,
+    LAG(p.Id, 1) OVER (ORDER BY p.Score DESC) as NextLowerPostId
+  FROM Posts p
+  WHERE p.PostTypeId IN (1, 2)
+    AND p.CreationDate >= TIMESTAMP '2010-01-01'
+    AND p.Score IS NOT NULL
+    AND p.OwnerUserId IS NOT NULL
+),
+FilteredPosts AS (
+  SELECT 
+    pp.*,
+    us.Reputation,
+    us.DisplayName,
+    us.TotalPosts,
+    us.AvgScore,
+    CASE WHEN us.TotalPosts > 1 THEN 'Active' ELSE 'Inactive' END as UserActivityStatus,
+    CASE 
+      WHEN pp.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'AboveAverageQuestion'
+      WHEN pp.Score < (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'BelowAverageQuestion'
+      ELSE 'AverageQuestion'
+    END as QuestionPerformance,
+    CASE 
+      WHEN pp.AnswerCount > 0 
+        AND pp.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1 AND AnswerCount > 0) 
+        THEN 'HighAnsweredQuestion'
+      ELSE 'LowAnsweredQuestion'
+    END as AnsweredQuestionStatus
+  FROM PostsWithBadges pp
+  JOIN UserStats us ON pp.OwnerUserId = us.UserId
+  WHERE pp.Score >= 0
+    AND COALESCE(pp.Tags, '') != ''
+),
+CombinedAnalysis AS (
+  SELECT 
+    fp.*,
+    COALESCE(
+      CASE 
+        WHEN fp.PostTypeId = 1 THEN 
+          CONCAT('Q: ', fp.Title)
+        ELSE 
+          CONCAT('A: ', 
+            CASE 
+              WHEN fp.OwnerDisplayName IS NOT NULL THEN fp.OwnerDisplayName
+              ELSE 'Anonymous'
+            END,
+            ' - ', 
+            SUBSTRING(fp.Title, 1, 30), '...')
+      END, 
+      'Unknown Post'
+    ) as PostTitleSummary,
+    CASE 
+      WHEN ROW_NUMBER() OVER (ORDER BY fp.Score DESC) <= 5 THEN 'Top5'
+      WHEN fp.Score >= (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'AboveAvg'
+      ELSE 'BelowAvg'
+    END as ScoreBucket,
+    CASE 
+      WHEN fp.ViewCount IS NULL OR fp.ViewCount = 0 THEN 'ZeroViews'
+      WHEN fp.ViewCount > 10000 THEN 'HighViews'
+      WHEN fp.ViewCount > 1000 THEN 'MediumViews'
+      ELSE 'LowViews'
+    END as ViewStatus,
+    CASE 
+      WHEN fp.AnswerCount > 5 THEN 'ManyAnswers'
+      WHEN fp.AnswerCount > 0 THEN 'SomeAnswers'
+      ELSE 'NoAnswers'
+    END as AnswerStatus,
+    CASE 
+      WHEN fp.CommentCount > 5 THEN 'ManyComments'
+      WHEN fp.CommentCount > 0 THEN 'SomeComments'
+      ELSE 'NoComments'
+    END as CommentStatus,
+    CASE 
+      WHEN fp.FavoriteCount > 10 THEN 'HighFavorites'
+      WHEN fp.FavoriteCount > 0 THEN 'SomeFavorites'
+      ELSE 'NoFavorites'
+    END as FavoriteStatus,
+    CASE 
+      WHEN fp.DaysActive < 0 THEN 'PastDays'
+      WHEN fp.DaysActive < 30 THEN 'RecentDays'
+      WHEN fp.DaysActive < 365 THEN 'MediumDays'
+      ELSE 'OldDays'
+    END as ActivityStatus
+  FROM FilteredPosts fp
+),
+AggregatedResults AS (
+  SELECT 
+    COUNT(*) as TotalPosts,
+    COUNT(DISTINCT OwnerUserId) as DistinctUsers,
+    AVG(Score) as AvgScore,
+    MAX(Score) as MaxScore,
+    MIN(Score) as MinScore,
+    COUNT(DISTINCT CASE WHEN PostTypeId = 1 THEN Id END) as TotalQuestions,
+    COUNT(DISTINCT CASE WHEN PostTypeId = 2 THEN Id END) as TotalAnswers,
+    AVG(ViewCount) as AvgViews,
+    AVG(AnswerCount) as AvgAnswers,
+    AVG(CommentCount) as AvgComments,
+    AVG(FavoriteCount) as AvgFavorites,
+    (SELECT COUNT(*) FROM Badges) as TotalBadges,
+    (SELECT COUNT(*) FROM Posts WHERE ParentId IS NOT NULL AND OwnerUserId IS NULL) as AnonymousAnswers,
+    (SELECT COUNT(*) FROM Posts WHERE ParentId IS NOT NULL AND OwnerUserId IS NOT NULL) as RegisteredAnswers
+  FROM CombinedAnalysis
+),
+TagAnalysis AS (
+  SELECT 
+    tag,
+    COUNT(*) as TagCount,
+    COUNT(DISTINCT OwnerUserId) as UserCount,
+    AVG(Score) as AvgScore,
+    AVG(ViewCount) as AvgViews,
+    STRING_AGG(TagName, ', ') as TaggedPosts,
+    CASE 
+      WHEN COUNT(*) > 10 THEN 'PopularTag'
+      WHEN COUNT(*) > 5 THEN 'MediumTag'
+      ELSE 'NicheTag'
+    END as TagStatus
+  FROM (
+    SELECT 
+      tag_elem as tag,
+      ca.OwnerUserId,
+      ca.Score,
+      ca.ViewCount,
+      CONCAT(ca.Title, ' (', ca.Id, ')') as TagName
+    FROM CombinedAnalysis ca,
+    UNNEST(COALESCE(ca.TagArray, ARRAY[]::text[])) WITH ORDINALITY AS t(tag_elem, ord)
+    WHERE tag_elem IS NOT NULL 
+      AND LENGTH(tag_elem) > 0
+  ) sub
+  GROUP BY tag
+)
+SELECT 
+  ar.TotalPosts,
+  ar.DistinctUsers,
+  ar.AvgScore,
+  ar.MaxScore,
+  ar.MinScore,
+  ar.TotalQuestions,
+  ar.TotalAnswers,
+  ar.AvgViews,
+  ar.AvgAnswers,
+  ar.AvgComments,
+  ar.AvgFavorites,
+  ar.TotalBadges,
+  ar.AnonymousAnswers,
+  ar.RegisteredAnswers,
+  ta.TagCount,
+  ta.UserCount,
+  ta.AvgScore as TagAvgScore,
+  ta.AvgViews as TagAvgViews,
+  ta.TagStatus,
+  CASE 
+    WHEN ar.AvgScore > (SELECT AVG(Score) FROM Posts) THEN 'AboveOverallAvg'
+    WHEN ar.AvgScore < (SELECT AVG(Score) FROM Posts) THEN 'BelowOverallAvg'
+    ELSE 'Average'
+  END as ScoreComparison,
+  COALESCE(
+    STRING_AGG(
+      CASE 
+        WHEN ca.PostTitleSummary IS NOT NULL THEN ca.PostTitleSummary
+        ELSE 'Unknown'
+      END, 
+      '; '
+    ) FILTER (WHERE ca.PostTitleSummary IS NOT NULL) OVER (PARTITION BY ca.ScoreBucket), 
+    ''
+  ) as BucketPosts,
+  LAG(ar.TotalPosts) OVER (ORDER BY ar.AvgScore) as PrevAvgScorePosts,
+  LEAD(ar.TotalPosts) OVER (ORDER BY ar.AvgScore) as NextAvgScorePosts,
+  CASE WHEN ar.AvgScore IS NOT NULL THEN 
+    (ar.TotalPosts::numeric / NULLIF(ar.TotalAnswers, 0)) 
+  ELSE 0 END as PostsPerAnswer,
+  CASE WHEN ar.AvgViews IS NOT NULL THEN 
+    (ar.AvgViews * 1000000 / NULLIF(ar.TotalPosts, 0)) 
+  ELSE 0 END as ViewsPerMillionPosts,
+  ROW_NUMBER() OVER (ORDER BY ar.AvgScore DESC) as ScoreRanking,
+  DENSE_RANK() OVER (ORDER BY ar.AvgScore DESC) as DenseScoreRank,
+  NTILE(5) OVER (ORDER BY ar.AvgScore DESC) as ScoreQuintile,
+  (ar.AvgScore - (SELECT AVG(Score) FROM Posts)) / NULLIF((SELECT STDDEV(Score) FROM Posts), 0) as ZScore,
+  CASE 
+    WHEN ar.MaxScore = ar.MinScore THEN 'NoVariance'
+    ELSE 'WithVariance'
+  END as ScoreVariance,
+  STRING_AGG(DISTINCT ca.ViewStatus, ', ') as ViewStatusBucket,
+  STRING_AGG(DISTINCT ca.AnswerStatus, ', ') as AnswerStatusBucket,
+  STRING_AGG(DISTINCT ca.CommentStatus, ', ') as CommentStatusBucket,
+  STRING_AGG(DISTINCT ca.FavoriteStatus, ', ') as FavoriteStatusBucket,
+  STRING_AGG(DISTINCT ca.ActivityStatus, ', ') as ActivityStatusBucket,
+  CONCAT(
+    COUNT(*) OVER () - ROW_NUMBER() OVER (ORDER BY ar.AvgScore DESC, ar.TotalPosts DESC),
+    ' posts are behind'
+  ) as BehindCount
+FROM AggregatedResults ar
+JOIN TagAnalysis ta ON ta.TagStatus = 'PopularTag'
+LEFT JOIN CombinedAnalysis ca ON ar.TotalPosts > 0
+WHERE ar.TotalPosts > 0
+GROUP BY 
+  ar.TotalPosts,
+  ar.DistinctUsers,
+  ar.AvgScore,
+  ar.MaxScore,
+  ar.MinScore,
+  ar.TotalQuestions,
+  ar.TotalAnswers,
+  ar.AvgViews,
+  ar.AvgAnswers,
+  ar.AvgComments,
+  ar.AvgFavorites,
+  ar.TotalBadges,
+  ar.AnonymousAnswers,
+  ar.RegisteredAnswers,
+  ta.TagCount,
+  ta.UserCount,
+  ta.AvgScore,
+  ta.AvgViews,
+  ta.TagStatus
+ORDER BY ar.AvgScore DESC, ar.TotalPosts DESC
+LIMIT 1000;

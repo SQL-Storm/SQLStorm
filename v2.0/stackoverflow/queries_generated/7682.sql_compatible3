@@ -1,0 +1,143 @@
+SELECT 
+    p.Id AS PostId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation,
+    CASE 
+        WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Question with Accepted Answer'
+        WHEN p.PostTypeId = 2 THEN 'Answer'
+        WHEN p.PostTypeId = 1 THEN 'Question'
+        ELSE 'Other'
+    END AS PostTypeDescription,
+    COALESCE(p.AnswerCount, 0) AS AnswerCount,
+    COALESCE(p.CommentCount, 0) AS CommentCount,
+    COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS TotalComments,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId IN (2,3)) AS VoteCount,
+    (SELECT SUM(v.BountyAmount) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 8) AS TotalBounty,
+    (SELECT STRING_AGG(b.Name, ', ') FROM Badges b WHERE b.UserId = p.OwnerUserId AND b.TagBased = 0) AS UserBadges,
+    (SELECT STRING_AGG(t.TagName, ', ') FROM (
+        SELECT DISTINCT UNNEST(STRING_TO_ARRAY(TRIM(BOTH '<>' FROM p.Tags), '><')) AS TagName
+    ) t) AS TagsList,
+    (SELECT 
+        CASE 
+            WHEN COUNT(*) > 0 THEN 'Has History'
+            ELSE 'No History'
+        END
+    FROM PostHistory ph2 
+    WHERE ph2.PostId = p.Id AND ph2.PostHistoryTypeId IN (1,2,3,4,5,6,10,11,12,13)
+    ) AS HistoryStatus,
+    (SELECT 
+        COUNT(*)
+    FROM PostLinks pl
+    WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3
+    ) AS DuplicateCount,
+    (SELECT 
+        STRING_AGG(lt.Name, ' | ')
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    WHERE pl.PostId = p.Id
+    ) AS LinkTypes,
+    (SELECT 
+        MAX(ph3.CreationDate)
+    FROM PostHistory ph3
+    WHERE ph3.PostId = p.Id
+    ) AS LastActivityDate,
+    RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS ScoreRankInUser,
+    DENSE_RANK() OVER (ORDER BY p.Score DESC) AS GlobalScoreRank,
+    ROW_NUMBER() OVER (ORDER BY p.CreationDate DESC, p.Score DESC) AS RowNumber,
+    FIRST_VALUE(p.Score) OVER (ORDER BY p.Id) AS MaxScore,
+    LAG(p.Score, 1) OVER (ORDER BY p.CreationDate) AS PreviousScore,
+    LEAD(p.Score, 1) OVER (ORDER BY p.CreationDate) AS NextScore,
+    AVG(p.Score) OVER (ORDER BY p.CreationDate ROWS BETWEEN 10 PRECEDING AND CURRENT ROW) AS MovingAverage,
+    CASE 
+        WHEN EXISTS (
+            SELECT 1 FROM PostHistory ph4 
+            WHERE ph4.PostId = p.Id AND ph4.PostHistoryTypeId = 10 AND ph4.Comment LIKE '%101%'
+        ) THEN 'Duplicate Closed'
+        WHEN EXISTS (
+            SELECT 1 FROM PostHistory ph5 
+            WHERE ph5.PostId = p.Id AND ph5.PostHistoryTypeId = 10 AND ph5.Comment LIKE '%102%'
+        ) THEN 'Off-topic Closed'
+        WHEN EXISTS (
+            SELECT 1 FROM PostHistory ph6 
+            WHERE ph6.PostId = p.Id AND ph6.PostHistoryTypeId = 10
+        ) THEN 'Other Closed'
+        ELSE 'Not Closed'
+    END AS ClosureType,
+    CASE 
+        WHEN p.PostTypeId = 1 AND COALESCE(p.AnswerCount,0) > 0 THEN 
+            (SELECT 
+                STRING_AGG(a.OwnerDisplayName || ': ' || CAST(a.Score AS VARCHAR), '; ')
+                FROM Posts a 
+                WHERE a.ParentId = p.Id AND a.PostTypeId = 2
+            )
+        ELSE NULL
+    END AS TopAnswers,
+    CASE 
+        WHEN p.OwnerUserId IS NOT NULL AND p.OwnerUserId > 0 THEN 
+            (SELECT COUNT(*) FROM Posts p_owner_q WHERE p_owner_q.OwnerUserId = p.OwnerUserId AND p_owner_q.PostTypeId = 1)
+        ELSE 0
+    END AS TotalQuestionsAsked,
+    CASE 
+        WHEN p.OwnerUserId IS NOT NULL AND p.OwnerUserId > 0 THEN 
+            (SELECT COUNT(*) FROM Posts p_owner_a WHERE p_owner_a.OwnerUserId = p.OwnerUserId AND p_owner_a.PostTypeId = 2)
+        ELSE 0
+    END AS TotalAnswersGiven,
+    CASE 
+        WHEN p.Score > 100 THEN 'Highly Voted'
+        WHEN p.Score > 50 THEN 'Moderately Voted'
+        WHEN p.Score > 0 THEN 'Slightly Voted'
+        ELSE 'No Votes'
+    END AS VoteStatus,
+    'Post #' || CAST(p.Id AS VARCHAR) || ' created on ' || TO_CHAR(p.CreationDate, 'YYYY-MM-DD') || ' by ' || COALESCE(u.DisplayName, 'Anonymous User') AS PostSummary
+FROM Posts p
+LEFT JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN Posts p2 ON p2.Id = p.AcceptedAnswerId
+WHERE 
+    p.PostTypeId IN (1,2)
+    AND p.CreationDate >= DATE '2020-01-01'
+    AND (
+        p.Score > 10 
+        OR EXISTS (
+            SELECT 1 FROM Comments c 
+            WHERE c.PostId = p.Id AND c.Score > 5
+        )
+    )
+    AND (
+        p.Tags IS NOT NULL 
+        AND p.Tags <> ''
+    )
+    AND (
+        LOWER(p.Title) LIKE '%sql%' 
+        OR EXISTS (
+            SELECT 1 FROM Tags t 
+            WHERE t.TagName IN ('sql', 'postgresql', 'database') 
+            AND LOWER(p.Tags) LIKE '%' || LOWER(t.TagName) || '%'
+        )
+    )
+    AND (
+        p.ViewCount > 0 
+        OR p.CommentCount > 0
+        OR p.FavoriteCount > 0
+    )
+    AND (
+        COALESCE(p.LastActivityDate, p.CreationDate) >= DATE '2021-01-01'
+    )
+    AND NOT EXISTS (
+        SELECT 1 FROM PostHistory ph2 
+        WHERE ph2.PostId = p.Id 
+        AND ph2.PostHistoryTypeId IN (12, 13, 10)
+        AND ph2.CreationDate > DATE '2020-01-01'
+    )
+    AND (
+        (p.PostTypeId = 1)
+        OR (p.PostTypeId = 2 AND EXISTS (
+                SELECT 1 FROM Posts pq WHERE pq.Id = p.ParentId AND pq.PostTypeId = 1
+            ))
+    )
+ORDER BY p.CreationDate DESC, p.Score DESC
+FETCH FIRST 1000 ROWS ONLY;

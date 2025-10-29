@@ -1,0 +1,166 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        COUNT(DISTINCT b.Id) AS Badges,
+        COUNT(DISTINCT c.Id) AS Comments,
+        COUNT(DISTINCT v.Id) AS Votes,
+        MAX(p.CreationDate) AS LastPostDate,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        ROW_NUMBER() OVER (ORDER BY u.CreationDate) AS SeniorityRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId OR u.Id = p.LastEditorUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    WHERE u.CreationDate >= DATE '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate
+),
+PostPerformanceMetrics AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question' 
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostType,
+        CAST((EXTRACT(EPOCH FROM (COALESCE(p.LastActivityDate, p.CreationDate) - p.CreationDate)) / 86400) AS INTEGER) AS DaysActive,
+        CASE 
+            WHEN p.Score >= 100 THEN 'HighlyUpvoted'
+            WHEN p.Score >= 25 THEN 'Upvoted'
+            WHEN p.Score >= 0 THEN 'Neutral'
+            WHEN p.Score < 0 THEN 'Downvoted'
+            ELSE 'Unknown'
+        END AS ScoreCategory,
+        COALESCE(p.ViewCount, 0) + COALESCE(p.AnswerCount, 0) + COALESCE(p.CommentCount, 0) AS EngagementMetric,
+        PERCENT_RANK() OVER (ORDER BY COALESCE(p.ViewCount, 0) + COALESCE(p.AnswerCount, 0) + COALESCE(p.CommentCount, 0)) AS EngagementPercentile,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS OwnerAverageScore,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PostSequenceNumber
+    FROM Posts p
+    WHERE p.CreationDate >= DATE '2015-01-01'
+),
+UserPostInteractions AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.TotalPosts,
+        uas.Questions,
+        uas.Answers,
+        uas.Badges,
+        uas.Comments,
+        uas.Votes,
+        uas.ReputationRank,
+        uas.SeniorityRank,
+        AVG(ppm.Score) AS AveragePostScore,
+        AVG(ppm.ViewCount) AS AverageViews,
+        AVG(ppm.AnswerCount) AS AverageAnswers,
+        AVG(ppm.CommentCount) AS AverageComments,
+        MAX(ppm.DaysActive) AS MaxActiveDays,
+        STRING_AGG(DISTINCT CASE WHEN ppm.PostType = 'Question' THEN ppm.Title END, '; ') AS QuestionTitles,
+        STRING_AGG(DISTINCT CASE WHEN ppm.PostType = 'Answer' THEN ppm.Title END, '; ') AS AnswerTitles,
+        JSON_AGG(CASE WHEN ppm.ScoreCategory = 'HighlyUpvoted' THEN ppm.PostId END) FILTER (WHERE ppm.ScoreCategory = 'HighlyUpvoted') AS HighlyUpvotedPostIds
+    FROM UserActivityStats uas
+    LEFT JOIN PostPerformanceMetrics ppm ON uas.UserId = ppm.OwnerUserId
+    GROUP BY uas.UserId, uas.DisplayName, uas.Reputation, uas.TotalPosts, uas.Questions, uas.Answers, 
+             uas.Badges, uas.Comments, uas.Votes, uas.ReputationRank, uas.SeniorityRank
+)
+SELECT 
+    upi.UserId,
+    upi.DisplayName,
+    upi.Reputation,
+    upi.TotalPosts,
+    upi.Questions,
+    upi.Answers,
+    upi.Badges,
+    upi.Comments,
+    upi.Votes,
+    upi.ReputationRank,
+    upi.SeniorityRank,
+    upi.AveragePostScore,
+    upi.AverageViews,
+    upi.AverageAnswers,
+    upi.AverageComments,
+    upi.MaxActiveDays,
+    upi.QuestionTitles,
+    upi.AnswerTitles,
+    CASE 
+        WHEN upi.Reputation > 10000 THEN 'Elite'
+        WHEN upi.Reputation > 5000 THEN 'Advanced'
+        WHEN upi.Reputation > 1000 THEN 'Intermediate'
+        ELSE 'Beginner'
+    END AS UserTier,
+    CASE 
+        WHEN upi.TotalPosts > 1000 THEN 'Veteran'
+        WHEN upi.TotalPosts > 500 THEN 'Experienced'
+        WHEN upi.TotalPosts > 100 THEN 'Seasoned'
+        ELSE 'New'
+    END AS PostingExperience,
+    CASE 
+        WHEN upi.Questions > 0 AND upi.Answers = 0 THEN 'Question Only'
+        WHEN upi.Questions = 0 AND upi.Answers > 0 THEN 'Answer Only'
+        WHEN upi.Questions > 0 AND upi.Answers > 0 THEN 'Both'
+        ELSE 'Neither'
+    END AS ContributionType,
+    COALESCE(
+        (SELECT COUNT(DISTINCT ph.PostId) 
+         FROM PostHistory ph 
+         WHERE ph.UserId = upi.UserId 
+         AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)
+        ), 0
+    ) AS EditCount,
+    COALESCE(
+        (SELECT COUNT(DISTINCT ph.PostId) 
+         FROM PostHistory ph 
+         WHERE ph.UserId = upi.UserId 
+         AND ph.PostHistoryTypeId IN (10, 11, 12, 13)
+        ), 0
+    ) AS ActivityChangeCount,
+    CASE 
+        WHEN upi.Votes > 0 THEN 
+            ROUND(CAST(upi.UpVotes AS NUMERIC) / NULLIF(CAST(upi.Votes AS NUMERIC), 0) * 100, 2)
+        ELSE NULL
+    END AS UpVotePercentage,
+    CASE 
+        WHEN upi.Badges > 0 THEN 
+            ROUND(CAST(upi.Badges AS NUMERIC) / NULLIF(CAST(upi.TotalPosts AS NUMERIC), 0) * 100, 2)
+        ELSE NULL
+    END AS BadgeToPostRatio,
+    RANK() OVER (ORDER BY upi.Reputation DESC, upi.TotalPosts DESC) AS OverallRank,
+    DENSE_RANK() OVER (ORDER BY upi.Reputation DESC) AS ReputationRankDense,
+    ROW_NUMBER() OVER (ORDER BY upi.Reputation DESC) AS RankRowNumber,
+    LAG(upi.Reputation, 1) OVER (ORDER BY upi.Reputation DESC) - upi.Reputation AS ReputationDifferenceFromPrevious,
+    ROUND(AVG(upi.Reputation) OVER (ORDER BY upi.Reputation DESC ROWS BETWEEN 5 PRECEDING AND 5 FOLLOWING), 2) AS MovingAverageReputation,
+    CASE 
+        WHEN upi.Comments > 0 AND upi.Answers > 0 AND upi.Questions > 0 THEN 'VeryActive'
+        WHEN upi.Comments > 0 OR upi.Answers > 0 OR upi.Questions > 0 THEN 'Active'
+        ELSE 'Inactive'
+    END AS ActivityStatus,
+    ('User ' || CAST(upi.UserId AS VARCHAR) || ' - ' || upi.DisplayName || ' (Tier: ' ||
+           CASE 
+               WHEN upi.Reputation > 10000 THEN 'Elite'
+               WHEN upi.Reputation > 5000 THEN 'Advanced'
+               WHEN upi.Reputation > 1000 THEN 'Intermediate'
+               ELSE 'Beginner'
+           END || ')') AS UserSummary
+FROM UserPostInteractions upi
+WHERE upi.Reputation > 500
+ORDER BY upi.Reputation DESC, upi.TotalPosts DESC
+LIMIT 1000;

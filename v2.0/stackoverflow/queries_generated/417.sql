@@ -1,0 +1,376 @@
+-- {"query": "417.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3847} 
+with
+-- Parameterizable date bounds
+params as (
+  select
+    date_trunc('month', now()) - interval '24 months' as start_date,
+    date_trunc('month', now()) - interval '0 months'  as end_date
+),
+-- Expand questions and answers, normalize owner and editor info
+posts_norm as (
+  select
+    p.id,
+    p.posttypeid,
+    p.creationdate,
+    coalesce(p.lastactivitydate, p.creationdate) as lastactivitydate,
+    p.score,
+    p.viewcount,
+    p.ownernickname,
+    p.owneruserid,
+    p.lasteditoruserid,
+    p.title,
+    p.tags,
+    p.answercount,
+    p.commentcount,
+    p.favoritecount,
+    p.acceptedanswerid,
+    p.parentid
+  from (
+    select
+      id, posttypeid, creationdate, lastactivitydate, score, viewcount,
+      coalesce(ownerdisplayname, u.displayname) as ownernickname,
+      owneruserid, lasteditoruserid, title, tags, answercount, commentcount,
+      favoritecount, acceptedanswerid, parentid
+    from posts p
+    left join users u on u.id = p.owneruserid
+  ) p
+),
+-- Monthly buckets for posts in range
+post_months as (
+  select
+    pn.*,
+    date_trunc('month', pn.creationdate) as post_month
+  from posts_norm pn
+  cross join params pr
+  where pn.creationdate >= pr.start_date
+    and pn.creationdate < pr.end_date
+),
+-- Votes aggregated by month and post with window functions
+vote_agg as (
+  select
+    v.postid,
+    date_trunc('month', v.creationdate) as vote_month,
+    sum(case when vt.name = 'UpMod' then 1 else 0 end) as upvotes,
+    sum(case when vt.name = 'DownMod' then 1 else 0 end) as downvotes,
+    sum(case when vt.name = 'Favorite' then 1 else 0 end) as favorites,
+    sum(case when vt.name in ('Deletion','Undeletion','Spam') then 1 else 0 end) as mod_signals,
+    count(*) as total_votes,
+    row_number() over (partition by v.postid order by date_trunc('month', v.creationdate)) as rn_first_month
+  from votes v
+  join votetypes vt on vt.id = v.votetypeid
+  cross join params pr
+  where v.creationdate >= pr.start_date
+    and v.creationdate < pr.end_date
+  group by v.postid, date_trunc('month', v.creationdate)
+),
+-- Comments aggregated per post per month with text heuristics
+comment_agg as (
+  select
+    c.postid,
+    date_trunc('month', c.creationdate) as comment_month,
+    count(*) as comments,
+    sum(case when c.score > 0 then 1 else 0 end) as pos_comments,
+    sum(case when c.score < 0 then 1 else 0 end) as neg_comments,
+    sum(case when lower(c.text) like any(array['%thanks%','%thank you%','%great%','%nice%']) then 1 else 0 end) as pleasantries,
+    sum(case when lower(c.text) ~ '\\b(off-topic|duplicate|too broad|unclear)\\b' then 1 else 0 end) as moderation_hints
+  from comments c
+  cross join params pr
+  where c.creationdate >= pr.start_date
+    and c.creationdate < pr.end_date
+  group by c.postid, date_trunc('month', c.creationdate)
+),
+-- Post history signals (closures, migrations, locks) with JSON/text inspection
+history_signals as (
+  select
+    ph.postid,
+    date_trunc('month', ph.creationdate) as hist_month,
+    sum(case when pht.name in ('Post Closed','Post Reopened') then 1 else 0 end) as close_reopen_events,
+    sum(case when pht.name in ('Post Locked','Post Unlocked') then 1 else 0 end) as lock_events,
+    sum(case when pht.name like 'Post Migrated%' or pht.name like 'Post Migrated Away' or pht.name like 'Post Migrated Here' then 1 else 0 end) as migrate_events,
+    sum(case when pht.name in ('SelectedHotQuestion','RemovedHotQuestion') then 1 else 0 end) as hot_swings,
+    -- approximate duplicate flags from JSON text structure
+    sum(case when pht.name = 'Post Closed' and ph.text ilike '%OriginalQuestionIds%' then 1 else 0 end) as duplicate_flags
+  from posthistory ph
+  join posthistorytypes pht on pht.id = ph.posthistorytypeid
+  cross join params pr
+  where ph.creationdate >= pr.start_date
+    and ph.creationdate < pr.end_date
+  group by ph.postid, date_trunc('month', ph.creationdate)
+),
+-- Post links: duplicates and related
+link_signals as (
+  select
+    pl.postid,
+    date_trunc('month', pl.creationdate) as link_month,
+    sum(case when lt.name = 'Duplicate' then 1 else 0 end) as dup_links,
+    sum(case when lt.name = 'Linked' then 1 else 0 end) as related_links,
+    count(*) as links_total,
+    count(distinct pl.relatedpostid) as distinct_targets
+  from postlinks pl
+  join linktypes lt on lt.id = pl.linktypeid
+  cross join params pr
+  where pl.creationdate >= pr.start_date
+    and pl.creationdate < pr.end_date
+  group by pl.postid, date_trunc('month', pl.creationdate)
+),
+-- Tag normalization: explode question tags
+question_tags as (
+  select
+    p.id as postid,
+    unnest(string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')) as tag
+  from posts p
+  where p.posttypeid = 1
+    and p.tags is not null
+),
+-- Tag popularity for normalization
+tag_stats as (
+  select
+    qt.tag,
+    count(*) as tag_usage,
+    max(t.count) as catalog_count
+  from question_tags qt
+  left join tags t on t.tagname = qt.tag
+  group by qt.tag
+),
+-- For each question, compute a tag entropy-ish measure
+question_tag_features as (
+  select
+    qt.postid,
+    count(*) as tag_count,
+    sum(ln(greatest(ts.catalog_count, ts.tag_usage, 1))) as tag_pop_log_sum,
+    sum(case when ts.tag_usage <= 10 then 1 else 0 end) as rare_tags
+  from question_tags qt
+  join tag_stats ts on ts.tag = qt.tag
+  group by qt.postid
+),
+-- User reputation cohorts per month
+user_cohorts as (
+  select
+    u.id as userid,
+    width_bucket(coalesce(u.reputation,0), 0, 100000, 10) as rep_bucket,
+    case
+      when u.reputation >= 20000 then 'Legend'
+      when u.reputation >= 10000 then 'Elite'
+      when u.reputation >= 5000 then 'Senior'
+      when u.reputation >= 1000 then 'Intermediate'
+      else 'Newbie'
+    end as rep_label
+  from users u
+),
+-- Badge velocity per user per month
+badge_velocity as (
+  select
+    b.userid,
+    date_trunc('month', b.date) as badge_month,
+    count(*) as badges_total,
+    sum(case when b.class = 1 then 1 else 0 end) as golds,
+    sum(case when b.class = 2 then 1 else 0 end) as silvers,
+    sum(case when b.class = 3 then 1 else 0 end) as bronzes,
+    sum(case when b.tagbased = 1 then 1 else 0 end) as tag_badges
+  from badges b
+  cross join params pr
+  where b.date >= pr.start_date
+    and b.date < pr.end_date
+  group by b.userid, date_trunc('month', b.date)
+),
+-- First answer time for each question via correlated subquery
+first_answer as (
+  select
+    q.id as question_id,
+    (select min(a.creationdate) from posts a where a.parentid = q.id and a.posttypeid = 2) as first_answer_date
+  from posts q
+  where q.posttypeid = 1
+),
+-- Monthly rollup combining everything
+monthly_rollup as (
+  select
+    pm.post_month,
+    pm.id as postid,
+    pm.posttypeid,
+    pm.title,
+    pm.owneruserid,
+    pm.ownernickname,
+    pm.score,
+    pm.viewcount,
+    pm.answercount,
+    pm.commentcount,
+    pm.favoritecount,
+    qa.tag_count,
+    qa.tag_pop_log_sum,
+    qa.rare_tags,
+    fa.first_answer_date,
+    extract(epoch from (fa.first_answer_date - pm.creationdate))/3600.0 as hours_to_first_answer,
+    coalesce(va.upvotes,0) as upvotes,
+    coalesce(va.downvotes,0) as downvotes,
+    coalesce(va.favorites,0) as votes_favorites,
+    coalesce(va.mod_signals,0) as votes_mod_signals,
+    coalesce(va.total_votes,0) as total_votes,
+    coalesce(ca.comments,0) as comments,
+    coalesce(ca.pos_comments,0) as pos_comments,
+    coalesce(ca.neg_comments,0) as neg_comments,
+    coalesce(ca.pleasantries,0) as pleasantries,
+    coalesce(ca.moderation_hints,0) as moderation_hints,
+    coalesce(hs.close_reopen_events,0) as close_reopen_events,
+    coalesce(hs.lock_events,0) as lock_events,
+    coalesce(hs.migrate_events,0) as migrate_events,
+    coalesce(hs.hot_swings,0) as hot_swings,
+    coalesce(hs.duplicate_flags,0) as duplicate_flags,
+    coalesce(ls.dup_links,0) as dup_links,
+    coalesce(ls.related_links,0) as related_links,
+    coalesce(ls.links_total,0) as links_total,
+    coalesce(ls.distinct_targets,0) as distinct_targets
+  from post_months pm
+  left join vote_agg va on va.postid = pm.id and va.vote_month = pm.post_month
+  left join comment_agg ca on ca.postid = pm.id and ca.comment_month = pm.post_month
+  left join history_signals hs on hs.postid = pm.id and hs.hist_month = pm.post_month
+  left join link_signals ls on ls.postid = pm.id and ls.link_month = pm.post_month
+  left join question_tag_features qa on qa.postid = pm.id
+  left join first_answer fa on fa.question_id = pm.id
+),
+-- User enrichment per post-month
+user_enriched as (
+  select
+    mr.*,
+    uc.rep_bucket,
+    uc.rep_label,
+    bv.badges_total,
+    bv.golds, bv.silvers, bv.bronzes,
+    bv.tag_badges
+  from monthly_rollup mr
+  left join user_cohorts uc on uc.userid = mr.owneruserid
+  left join badge_velocity bv on bv.userid = mr.owneruserid and bv.badge_month = mr.post_month
+),
+-- Rank posts within month by composite score using window functions
+scored as (
+  select
+    ue.*,
+    (
+      coalesce(ue.upvotes,0) * 3
+      - coalesce(ue.downvotes,0) * 2
+      + coalesce(ue.votes_favorites,0) * 1
+      + coalesce(ue.comments,0) * 0.2
+      + coalesce(ue.pleasantries,0) * 0.1
+      - coalesce(ue.moderation_hints,0) * 0.5
+      - coalesce(ue.dup_links,0) * 1.5
+      - case when coalesce(ue.hours_to_first_answer, 1e9) > 168 then 2 else 0 end
+      + coalesce(ue.tag_badges,0) * 0.5
+      + case when ue.rep_label in ('Elite','Legend') then 2 when ue.rep_label in ('Senior') then 1 else 0 end
+    ) as composite_score,
+    row_number() over (partition by ue.post_month order by
+      coalesce(ue.upvotes,0) desc,
+      coalesce(ue.viewcount,0) desc,
+      coalesce(ue.score,0) desc,
+      ue.id
+    ) as activity_rank,
+    rank() over (partition by ue.post_month order by
+      coalesce(ue.score,0) desc
+    ) as score_rank,
+    dense_rank() over (partition by ue.post_month order by
+      coalesce(ue.viewcount,0) desc
+    ) as view_rank,
+    percentile_cont(0.5) within group (order by coalesce(ue.upvotes,0)) over (partition by ue.post_month) as month_upvote_median
+  from user_enriched ue
+),
+-- Outlier detection using z-scores per month
+z_scored as (
+  select
+    s.*,
+    avg(coalesce(s.composite_score,0.0)) over (partition by s.post_month) as mean_comp,
+    stddev_pop(coalesce(s.composite_score,0.0)) over (partition by s.post_month) as std_comp,
+    avg(coalesce(s.viewcount,0.0)) over (partition by s.post_month) as mean_views,
+    stddev_pop(coalesce(s.viewcount,0.0)) over (partition by s.post_month) as std_views
+  from scored s
+),
+finalized as (
+  select
+    z.*,
+    case
+      when z.std_comp > 0 then (z.composite_score - z.mean_comp)/z.std_comp
+      else null
+    end as comp_z,
+    case
+      when z.std_views > 0 then (z.viewcount - z.mean_views)/z.std_views
+      else null
+    end as views_z,
+    case
+      when z.duplicate_flags > 0 or z.dup_links > 0 then 'LikelyDuplicate'
+      when z.lock_events > 0 then 'Locked'
+      when z.migrate_events > 0 then 'Migrated'
+      else 'Normal'
+    end as moderation_class
+  from z_scored z
+),
+-- Top-N per month using set operator to ensure stable union of multiple ranking strategies
+topn as (
+  (
+    select post_month, postid, title, owneruserid, ownernickname, composite_score, activity_rank, score_rank, view_rank,
+           comp_z, views_z, moderation_class
+    from finalized
+    where activity_rank <= 50
+  )
+  union
+  (
+    select post_month, postid, title, owneruserid, ownernickname, composite_score, activity_rank, score_rank, view_rank,
+           comp_z, views_z, moderation_class
+    from finalized
+    where score_rank <= 50
+  )
+  union
+  (
+    select post_month, postid, title, owneruserid, ownernickname, composite_score, activity_rank, score_rank, view_rank,
+           comp_z, views_z, moderation_class
+    from finalized
+    where view_rank <= 50
+  )
+),
+-- Deduplicate and re-rank the unioned top-N
+reranked as (
+  select
+    t.post_month,
+    t.postid,
+    min(t.title) as title,
+    min(t.owneruserid) as owneruserid,
+    min(t.ownernickname) as ownernickname,
+    avg(t.composite_score) as composite_score,
+    avg(t.comp_z) as comp_z,
+    avg(t.views_z) as views_z,
+    min(t.moderation_class) as moderation_class
+  from topn t
+  group by t.post_month, t.postid
+),
+-- Outer join with months grid to include empty months (for benchmarking outer joins)
+months_grid as (
+  select generate_series(
+    (select start_date from params),
+    (select end_date from params) - interval '1 month',
+    interval '1 month'
+  )::timestamp as month_bucket
+),
+month_summary as (
+  select
+    mg.month_bucket as month,
+    count(r.postid) as top_posts,
+    avg(r.composite_score) as avg_comp_score,
+    percentile_cont(0.9) within group (order by r.composite_score) as p90_comp_score,
+    sum(case when r.moderation_class <> 'Normal' then 1 else 0 end) as moderated_top_posts
+  from months_grid mg
+  left join reranked r on r.post_month = mg.month_bucket
+  group by mg.month_bucket
+)
+select
+  to_char(r.post_month, 'YYYY-MM') as month,
+  r.postid,
+  coalesce(r.title, '[no title]') as title,
+  r.owneruserid,
+  coalesce(r.ownernickname, '[deleted]') as owner,
+  round(r.composite_score::numeric, 3) as composite_score,
+  round(coalesce(r.comp_z,0)::numeric, 3) as comp_z,
+  round(coalesce(r.views_z,0)::numeric, 3) as views_z,
+  r.moderation_class,
+  ms.top_posts as month_top_posts,
+  round(ms.avg_comp_score::numeric, 3) as month_avg_comp_score,
+  round(ms.p90_comp_score::numeric, 3) as month_p90_comp_score,
+  ms.moderated_top_posts
+from reranked r
+join month_summary ms on ms.month = r.post_month
+order by r.post_month desc, r.composite_score desc, r.postid;

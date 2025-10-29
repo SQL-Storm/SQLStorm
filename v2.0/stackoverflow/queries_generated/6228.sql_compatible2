@@ -1,0 +1,61 @@
+SELECT 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id ELSE NULL END) AS TotalQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id ELSE NULL END) AS TotalAnswers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 3 THEN p.Id ELSE NULL END) AS TotalWikis,
+    SUM(p.Score) AS TotalScore,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN p.AnswerCount ELSE 0 END) AS TotalAnswersToQuestions,
+    MAX(u.LastAccessDate) AS LastAccessDate,
+    b.Class,
+    t.TagNames,
+    ph.RevisionGUID,
+    ph.CreationDate AS LastEditDate
+FROM 
+    Users u
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN LATERAL
+    (SELECT 
+         ph.PostId,
+         ph.RevisionGUID,
+         ph.CreationDate,
+         ph.UserId
+     FROM 
+         PostHistory ph
+     WHERE 
+         ph.PostHistoryTypeId IN (2, 5, 6)
+       AND ph.UserId = u.Id
+     LIMIT 1
+    ) ph ON true
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    (SELECT 
+         PostId,
+         STRING_AGG(TagName, ', ') AS TagNames
+     FROM 
+         Tags
+     GROUP BY 
+         PostId
+    ) t ON t.PostId = p.Id
+WHERE 
+    u.Reputation > 10000
+    AND p.PostTypeId IN (1, 2)
+    AND EXISTS (
+        SELECT 1 
+        FROM 
+            Votes v 
+        WHERE 
+            v.PostId = p.Id 
+            AND v.VoteTypeId = 2
+    )
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation, u.LastAccessDate, b.Class, t.TagNames, ph.RevisionGUID, ph.CreationDate
+HAVING 
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id ELSE NULL END) > 5
+ORDER BY 
+    TotalScore DESC, 
+    u.Reputation DESC;

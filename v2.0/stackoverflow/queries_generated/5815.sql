@@ -1,0 +1,112 @@
+-- {"query": "5815.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 860} 
+WITH
+RecentActivePosts AS (
+  SELECT p.Id,
+         p.PostTypeId,
+         p.Title,
+         p.Tags,
+         p.CreationDate,
+         p.LastActivityDate,
+         p.OwnerUserId,
+         p.ViewCount,
+         p.Score,
+         p.AnswerCount,
+         p.CommentCount,
+         p.FavoriteCount
+  FROM Posts p
+  WHERE p.PostTypeId IN (1,2) -- Questions and Answers
+),
+TagStats AS (
+  SELECT t.TagName,
+         COUNT(*) AS TagPostCount,
+         AVG(p.Score) FILTER (WHERE p.PostTypeId = 1) AS AvgQuestionScore,
+         SUM(p.ViewCount) AS TotalViews
+  FROM Tags t
+  JOIN Posts p ON p.Id = t.Id OR p.Id = t.WikiPostId -- include tag-associated posts if present
+  GROUP BY t.TagName
+),
+TopContributors AS (
+  SELECT u.Id AS UserId,
+         u.DisplayName,
+         u.Reputation,
+         u.Views,
+         u.UpVotes,
+         u.DownVotes,
+         ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.Views DESC) AS rn
+  FROM Users u
+  WHERE u.Reputation IS NOT NULL
+),
+UserBadges AS (
+  SELECT b.UserId,
+         COUNT(*) AS BadgeCount,
+         STRING_AGG(b.Name, ',') AS BadgeNames
+  FROM Badges b
+  GROUP BY b.UserId
+),
+RecentVotes AS (
+  SELECT v.PostId,
+         v.VoteTypeId,
+         v.UserId,
+         v.CreationDate,
+         v.BountyAmount
+  FROM Votes v
+  WHERE v.CreationDate >= NOW() - INTERVAL '7 days'
+),
+OpenCloseActivity AS (
+  SELECT ph.PostId,
+         ph.PostHistoryTypeId,
+         ph.Comment,
+         ph.CreationDate,
+         ph.UserId,
+         ph.Text
+  FROM PostHistory ph
+  WHERE ph.PostHistoryTypeId IN (10,11,16,50) -- Post Closed, Reopened, Community Owned, CommunityBump
+)
+SELECT
+  rp.Id AS PostId,
+  rp.PostTypeId,
+  rp.Title,
+  rp.Tags,
+  rp.CreationDate,
+  rp.LastActivityDate,
+  rp.OwnerUserId,
+  ru.DisplayName AS OwnerDisplayName,
+  ru.Reputation AS OwnerReputation,
+  ru.Views AS OwnerViews,
+  ru.UpVotes AS OwnerUpVotes,
+  ru.DownVotes AS OwnerDownVotes,
+  rp.ViewCount,
+  rp.Score,
+  rp.AnswerCount,
+  rp.CommentCount,
+  rp.FavoriteCount,
+  tname.TagName AS TopTaggedName,
+  ts.TagPostCount,
+  ts.AvgQuestionScore,
+  ts.TotalViews,
+  uc.DisplayName AS TopResponder,
+  uc2.DisplayName AS LastEditorName,
+  ubd.BadgeNames AS BadgesEarned,
+  ub.BadgeCount AS BadgeCount,
+  rv.VoteTypeId AS RecentVoteType,
+  rv.CreationDate AS RecentVoteDate,
+  ac.Comment AS CloseComment,
+  ac.CreationDate AS CloseDate
+FROM RecentActivePosts rp
+LEFT JOIN LATERAL (
+  SELECT t.TagName
+  FROM Tags t
+  WHERE rp.Title ILIKE '%' || t.TagName || '%'
+  LIMIT 1
+) tname ON true
+LEFT JOIN TagStats ts ON ts.TagName = tname.TagName
+LEFT JOIN Users ru ON ru.Id = rp.OwnerUserId
+LEFT JOIN Users uc ON uc.Id = rp.LastEditorUserId
+LEFT JOIN Users uc2 ON uc2.Id = rp.OwnerUserId
+LEFT JOIN UserBadges ub ON ub.UserId = rp.OwnerUserId
+LEFT JOIN TopContributors tc ON tc.UserId = rp.OwnerUserId
+LEFT JOIN UserBadges ubd ON ubd.BadgeCount IS NOT NULL AND ubd.UserId = rp.OwnerUserId
+LEFT JOIN RecentVotes rv ON rv.PostId = rp.Id
+LEFT JOIN OpenCloseActivity ac ON ac.PostId = rp.Id
+ORDER BY rp.LastActivityDate DESC
+LIMIT 100;

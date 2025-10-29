@@ -1,0 +1,223 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        CAST(ARRAY[t.TagName] AS VARCHAR[]) AS AncestorTags
+    FROM Tags t
+    WHERE NOT EXISTS (
+        SELECT 1 FROM PostLinks pl
+        JOIN Posts p ON p.Id = pl.PostId
+        WHERE p.PostTypeId = 1 AND pl.RelatedPostId = t.ExcerptPostId
+    )
+    UNION ALL
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        rth.AncestorTags || t2.TagName
+    FROM RecursiveTagHierarchy rth
+    JOIN Tags t2 ON t2.Id = (
+        SELECT p.ParentId
+        FROM Posts p
+        WHERE p.Tags LIKE '%' || t2.TagName || '%' AND p.Id = t2.ExcerptPostId
+        LIMIT 1
+    )
+    WHERE t2.Id IS NOT NULL
+),
+UserBadgeSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+        SUM(COALESCE(b.Class,0)) AS TotalBadgeClassSum,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName
+),
+PostVoteAggs AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVotes,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVotes,
+        COUNT(CASE WHEN v.VoteTypeId = 5 THEN 1 END) AS FavoriteCount,
+        AVG(EXTRACT(EPOCH FROM (v.CreationDate - p.CreationDate))) AS AvgVoteDelaySeconds
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    GROUP BY p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate
+),
+RankedPosts AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        pv.UpVotes,
+        pv.DownVotes,
+        pv.FavoriteCount,
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC NULLS LAST, p.ViewCount DESC NULLS LAST) AS ScoreRank,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS RecentPostRank
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN PostVoteAggs pv ON p.Id = pv.PostId
+    WHERE p.PostTypeId IN (1, 2)
+),
+PostCommentsAgg AS (
+    SELECT
+        c.PostId,
+        COUNT(*) AS CommentCount,
+        AVG(c.Score) AS AvgCommentScore,
+        MAX(c.CreationDate) AS LastCommentDate,
+        STRING_AGG(
+            CASE
+                WHEN c.UserId IS NOT NULL THEN c.UserDisplayName || '(' || CAST(c.UserId AS TEXT) || '): ' || SUBSTRING(c.Text FROM 1 FOR 30)
+                ELSE c.UserDisplayName || ': ' || SUBSTRING(c.Text FROM 1 FOR 30)
+            END, '; ' ORDER BY c.CreationDate DESC
+        ) AS LatestCommentsPreview
+    FROM Comments c
+    GROUP BY c.PostId
+),
+CorrelatedAnswerScores AS (
+    SELECT
+        q.Id AS QuestionId,
+        (SELECT AVG(a.Score) FROM Posts a WHERE a.ParentId = q.Id AND a.PostTypeId = 2) AS AvgAnswerScore,
+        (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = q.Id AND a.PostTypeId = 2 AND a.Score >= 10) AS HighScoreAnswerCount,
+        (SELECT COUNT(DISTINCT v.UserId) FROM Votes v 
+            JOIN Posts a ON a.Id = v.PostId 
+            WHERE a.ParentId = q.Id AND a.PostTypeId = 2 AND v.VoteTypeId = 2) AS UniqueUpvotersOnAnswers
+    FROM Posts q
+    WHERE q.PostTypeId = 1
+),
+ClosedQuestionsWithReasons AS (
+    SELECT
+        ph.PostId,
+        ph.CreationDate AS CloseDate,
+        crt.Name AS CloseReasonName,
+        ph.UserId AS ClosedByUserId,
+        u.DisplayName AS ClosedByUserName,
+        ph.Comment AS CloseReasonCode
+    FROM PostHistory ph
+    JOIN CloseReasonTypes crt ON CAST(ph.Comment AS INTEGER) = crt.Id
+    LEFT JOIN Users u ON ph.UserId = u.Id
+    WHERE ph.PostHistoryTypeId = 10
+),
+CombinedPosts AS (
+    SELECT
+        rp.Id,
+        rp.Title,
+        rp.Tags,
+        rp.Score,
+        rp.ViewCount,
+        rp.CreationDate,
+        rp.OwnerUserId,
+        rp.OwnerDisplayName,
+        rp.UpVotes,
+        rp.DownVotes,
+        rp.FavoriteCount,
+        rp.ScoreRank,
+        rp.RecentPostRank,
+        pca.AvgAnswerScore,
+        pca.HighScoreAnswerCount,
+        pca.UniqueUpvotersOnAnswers,
+        cwa.CloseDate,
+        cwa.CloseReasonName,
+        cwa.ClosedByUserName,
+        pc.CommentCount,
+        pc.AvgCommentScore,
+        pc.LastCommentDate,
+        pc.LatestCommentsPreview,
+        ubs.GoldBadges,
+        ubs.SilverBadges,
+        ubs.BronzeBadges
+    FROM RankedPosts rp
+    LEFT JOIN CorrelatedAnswerScores pca ON rp.Id = pca.QuestionId
+    LEFT JOIN ClosedQuestionsWithReasons cwa ON rp.Id = cwa.PostId
+    LEFT JOIN PostCommentsAgg pc ON rp.Id = pc.PostId
+    LEFT JOIN Users u ON rp.OwnerUserId = u.Id
+    LEFT JOIN UserBadgeSummary ubs ON u.Id = ubs.UserId
+),
+FinalSelection AS (
+    SELECT
+        cp.Id,
+        COALESCE(cp.Title, '[No Title]') AS PostTitle,
+        COALESCE(cp.OwnerDisplayName, '[Anonymous]') AS Author,
+        TRIM(BOTH '<' FROM TRIM(BOTH '>' FROM cp.Tags)) AS CleanTags,
+        cp.Score,
+        cp.ViewCount,
+        cp.UpVotes,
+        cp.DownVotes,
+        cp.FavoriteCount,
+        cp.CommentCount,
+        cp.AvgCommentScore,
+        COALESCE(cp.AvgAnswerScore, 0) AS AvgAnswerScore,
+        cp.HighScoreAnswerCount,
+        cp.UniqueUpvotersOnAnswers,
+        cp.CloseDate,
+        cp.CloseReasonName,
+        cp.ClosedByUserName,
+        cp.GoldBadges,
+        cp.SilverBadges,
+        cp.BronzeBadges,
+        CASE
+            WHEN cp.CloseDate IS NOT NULL THEN 'Closed'
+            WHEN cp.ScoreRank <= 10 THEN 'Top Scored'
+            ELSE 'Open'
+        END AS PostStatus,
+        CASE
+            WHEN cp.Tags LIKE '%sql%' THEN 'SQL Tag'
+            WHEN cp.Tags LIKE '%performance%' THEN 'Performance Tag'
+            ELSE 'Other'
+        END AS TagCategory,
+        ROW_NUMBER() OVER (PARTITION BY CASE WHEN cp.CloseDate IS NULL THEN 1 ELSE 0 END ORDER BY cp.Score DESC, cp.ViewCount DESC) AS StatusRank,
+        COALESCE(cp.LatestCommentsPreview, '[No Comments]') AS CommentPreview,
+        CHAR_LENGTH(COALESCE(cp.Title, '')) AS TitleLength,
+        (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = cp.Id) AS LinkedPostsCount,
+        (SELECT COUNT(*) FROM PostLinks pl2 WHERE pl2.RelatedPostId = cp.Id) AS IncomingLinksCount
+    FROM CombinedPosts cp
+    WHERE (cp.ScoreRank <= 20 OR cp.CloseDate IS NOT NULL)
+)
+SELECT
+    fs.Id,
+    fs.PostTitle,
+    fs.Author,
+    fs.CleanTags,
+    fs.Score,
+    fs.ViewCount,
+    fs.UpVotes,
+    fs.DownVotes,
+    fs.FavoriteCount,
+    fs.CommentCount,
+    fs.AvgCommentScore,
+    fs.AvgAnswerScore,
+    fs.HighScoreAnswerCount,
+    fs.UniqueUpvotersOnAnswers,
+    fs.CloseDate,
+    fs.CloseReasonName,
+    fs.ClosedByUserName,
+    fs.GoldBadges,
+    fs.SilverBadges,
+    fs.BronzeBadges,
+    fs.PostStatus,
+    fs.TagCategory,
+    fs.StatusRank,
+    fs.CommentPreview,
+    fs.TitleLength,
+    fs.LinkedPostsCount,
+    fs.IncomingLinksCount
+FROM FinalSelection fs
+WHERE fs.StatusRank <= 15
+ORDER BY
+    fs.PostStatus DESC,
+    fs.Score DESC,
+    fs.ViewCount DESC,
+    fs.TitleLength DESC;

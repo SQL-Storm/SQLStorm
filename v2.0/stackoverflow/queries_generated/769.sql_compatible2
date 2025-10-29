@@ -1,0 +1,311 @@
+with
+recent_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.location,
+    coalesce(u.websiteurl, '') as websiteurl,
+    u.upvotes,
+    u.downvotes,
+    extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - u.creationdate)) / 86400.0 as account_age_days,
+    (u.upvotes - u.downvotes) * ln(greatest(u.reputation + 1, 2)) as engagement_score
+  from users u
+  where u.lastaccessdate > cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+),
+latest_questions as (
+  select
+    p.id as question_id,
+    p.owneruserid as user_id,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.answercount,
+    p.favoritecount,
+    p.commentcount,
+    p.acceptedanswerid,
+    p.closeddate,
+    p.title,
+    p.tags,
+    string_to_array(substring(p.tags, 2, length(p.tags)-2), '><') as tag_arr,
+    row_number() over (partition by p.owneruserid order by p.creationdate desc) as rn
+  from posts p
+  join recent_users ru on ru.user_id = p.owneruserid
+  where p.posttypeid = 1
+),
+latest20 as (
+  select *
+  from latest_questions
+  where rn <= 20
+),
+q_activity as (
+  select
+    l.user_id,
+    l.question_id,
+    l.creationdate,
+    l.score,
+    l.viewcount,
+    l.answercount,
+    l.favoritecount,
+    l.commentcount,
+    l.acceptedanswerid,
+    l.closeddate,
+    l.title,
+    l.tags,
+    l.tag_arr,
+    sum(coalesce(l.viewcount,0)) over (partition by l.user_id order by l.creationdate rows between unbounded preceding and current row) as cum_views,
+    avg(coalesce(l.score,0)) over (partition by l.user_id order by l.creationdate rows between 9 preceding and current row) as avg_score_last10,
+    count(*) over (partition by l.user_id) as user_q_count,
+    dense_rank() over (order by date_trunc('month', l.creationdate) desc) as month_rank
+  from latest20 l
+),
+tag_stats as (
+  select
+    qa.user_id,
+    lower(trim(t)) as tagname,
+    count(*) as tag_q_count,
+    sum(qa.viewcount) as tag_views,
+    avg(qa.score) as tag_avg_score
+  from q_activity qa
+  cross join lateral unnest(qa.tag_arr) as t
+  group by qa.user_id, lower(trim(t))
+),
+tag_enriched as (
+  select
+    ts.user_id,
+    ts.tagname,
+    ts.tag_q_count,
+    ts.tag_views,
+    ts.tag_avg_score,
+    coalesce(tt.count, 0) as global_tag_count,
+    -- convert boolean flags to integers to avoid mixing boolean and integer types in COALESCE
+    case when tt.ismoderatoronly is true then 1 else 0 end as is_mod_only,
+    case when tt.isrequired is true then 1 else 0 end as is_required
+  from tag_stats ts
+  left join tags tt on lower(tt.tagname) = ts.tagname
+),
+q_votes as (
+  select
+    v.postid as question_id,
+    v.votetypeid,
+    count(*) as vote_count,
+    sum(coalesce(v.bountyamount,0)) as total_bounty
+  from votes v
+  join latest20 l on l.question_id = v.postid
+  group by v.postid, v.votetypeid
+),
+q_comments as (
+  select
+    c.postid as question_id,
+    count(*) as comment_ct,
+    avg(coalesce(c.score,0)) as avg_comment_score,
+    sum(case when c.text ~* '\b(thanks|great|nice|awesome|helpful)\b' then 1 else 0 end) as pos_kw,
+    sum(case when c.text ~* '\b(duplicate|off-topic|bad|wrong|unclear)\b' then 1 else 0 end) as neg_kw
+  from comments c
+  join latest20 l on l.question_id = c.postid
+  group by c.postid
+),
+q_close as (
+  select
+    ph.postid as question_id,
+    min(case when ph.posthistorytypeid = 10 then ph.creationdate end) as first_close_date,
+    max(case when ph.posthistorytypeid = 10 then nullif(trim(ph.comment),'') end) as close_reason_raw,
+    bool_or(ph.posthistorytypeid = 11) as was_reopened
+  from posthistory ph
+  join latest20 l on l.question_id = ph.postid
+  where ph.posthistorytypeid in (10,11)
+  group by ph.postid
+),
+q_dupes as (
+  select
+    pl.postid as question_id,
+    count(*) filter (where pl.linktypeid = 3) as dup_count,
+    count(*) filter (where pl.linktypeid = 1) as linked_count,
+    min(pl.creationdate) filter (where pl.linktypeid = 3) as first_dup_date
+  from postlinks pl
+  join latest20 l on l.question_id = pl.postid
+  group by pl.postid
+),
+q_agg as (
+  select
+    qa.*,
+    coalesce(qv_up.vote_count,0) as upvotes,
+    coalesce(qv_down.vote_count,0) as downvotes,
+    coalesce(qv_fav.vote_count,0) as favorites,
+    coalesce(qv_bstart.total_bounty,0) as bounty_started,
+    coalesce(qv_bclose.total_bounty,0) as bounty_awarded,
+    coalesce(qc.comment_ct,0) as comment_ct,
+    coalesce(qc.avg_comment_score,0.0) as avg_comment_score,
+    coalesce(qc.pos_kw,0) as pos_kw,
+    coalesce(qc.neg_kw,0) as neg_kw,
+    coalesce(qd.dup_count,0) as dup_count,
+    coalesce(qd.linked_count,0) as linked_count,
+    (coalesce(qc.comment_ct,0) * 1.0) / nullif(greatest(qa.viewcount,1),0) as comments_per_view,
+    case when (coalesce(qc.pos_kw,0) + coalesce(qc.neg_kw,0)) > 0 then (coalesce(qc.pos_kw,0) - coalesce(qc.neg_kw,0)) * 1.0 / (coalesce(qc.pos_kw,0) + coalesce(qc.neg_kw,0)) else null end as sentiment_index,
+    coalesce(qc.comment_ct,0) + coalesce(qv_up.vote_count,0) + coalesce(qv_down.vote_count,0) as interaction_weight
+  from q_activity qa
+  left join q_votes qv_up on qv_up.question_id = qa.question_id and qv_up.votetypeid = 2
+  left join q_votes qv_down on qv_down.question_id = qa.question_id and qv_down.votetypeid = 3
+  left join q_votes qv_fav on qv_fav.question_id = qa.question_id and qv_fav.votetypeid = 5
+  left join q_votes qv_bstart on qv_bstart.question_id = qa.question_id and qv_bstart.votetypeid = 8
+  left join q_votes qv_bclose on qv_bclose.question_id = qa.question_id and qv_bclose.votetypeid = 9
+  left join q_comments qc on qc.question_id = qa.question_id
+  left join q_dupes qd on qd.question_id = qa.question_id
+),
+q_quality as (
+  select
+    qa.*,
+    case when qa.acceptedanswerid is not null then 1 else 0 end as has_accepted,
+    case when qa.closeddate is not null then 1 else 0 end as is_closed,
+    case when qa.score >= 5 and qa.viewcount >= 1000 then 1 else 0 end as is_popular,
+    greatest(0, coalesce(qa.score,0)) * 1.0 / nullif(coalesce(qa.downvotes,0) + 1,0) as score_to_down_ratio,
+    case
+      when qa.dup_count > 0 then 'duplicate'
+      when qa.closeddate is not null then 'closed'
+      when qa.score < 0 then 'controversial'
+      when qa.viewcount >= 10000 then 'viral'
+      else 'normal'
+    end as q_bucket
+  from q_agg qa
+),
+user_tag_rank as (
+  select
+    te.user_id,
+    te.tagname,
+    te.tag_q_count,
+    te.tag_views,
+    te.tag_avg_score,
+    te.global_tag_count,
+    te.is_mod_only,
+    te.is_required,
+    sum(qq.interaction_weight) filter (where lower(qq.tags) like '%' || te.tagname || '%') over (partition by te.user_id, te.tagname) as tag_interactions
+  from tag_enriched te
+  left join q_quality qq on qq.user_id = te.user_id
+),
+user_tag_top as (
+  select
+    utr.*,
+    row_number() over (partition by utr.user_id order by coalesce(utr.tag_interactions,0) desc, utr.tag_views desc, utr.tag_q_count desc) as tag_rank
+  from user_tag_rank utr
+),
+user_rollup as (
+  select
+    ru.user_id,
+    ru.displayname,
+    ru.reputation,
+    ru.creationdate,
+    ru.location,
+    ru.websiteurl,
+    ru.upvotes,
+    ru.downvotes,
+    ru.account_age_days,
+    ru.engagement_score,
+    count(*) filter (where qq.month_rank = 1) as q_count_latest_month,
+    count(*) as q_count_20,
+    sum(qq.viewcount) as views_20,
+    avg(qq.score) as avg_score_20,
+    sum(case when qq.has_accepted = 1 then 1 else 0 end) as accepted_20,
+    sum(case when qq.is_closed = 1 then 1 else 0 end) as closed_20,
+    avg(qq.sentiment_index) as avg_sentiment_idx,
+    percentile_disc(0.5) within group (order by coalesce(qq.viewcount,0)) as p50_views,
+    percentile_disc(0.9) within group (order by coalesce(qq.viewcount,0)) as p90_views
+  from recent_users ru
+  left join q_quality qq on qq.user_id = ru.user_id
+  group by ru.user_id, ru.displayname, ru.reputation, ru.creationdate, ru.location, ru.websiteurl, ru.upvotes, ru.downvotes, ru.account_age_days, ru.engagement_score
+),
+user_best_worst as (
+  select
+    qq.user_id,
+    first_value(qq.question_id) over (partition by qq.user_id order by (qq.score*2 + coalesce(qq.upvotes,0) - coalesce(qq.downvotes,0) + ln(greatest(qq.viewcount+1,1))) desc, qq.creationdate desc) as best_qid,
+    first_value(qq.title) over (partition by qq.user_id order by (qq.score*2 + coalesce(qq.upvotes,0) - coalesce(qq.downvotes,0) + ln(greatest(qq.viewcount+1,1))) desc, qq.creationdate desc) as best_title,
+    first_value(qq.score) over (partition by qq.user_id order by (qq.score*2 + coalesce(qq.upvotes,0) - coalesce(qq.downvotes,0) + ln(greatest(qq.viewcount+1,1))) desc, qq.creationdate desc) as best_score,
+    first_value(qq.viewcount) over (partition by qq.user_id order by (qq.score*2 + coalesce(qq.upvotes,0) - coalesce(qq.downvotes,0) + ln(greatest(qq.viewcount+1,1))) asc, qq.creationdate asc) as worst_views,
+    first_value(qq.question_id) over (partition by qq.user_id order by (qq.score*2 + coalesce(qq.upvotes,0) - coalesce(qq.downvotes,0) + ln(greatest(qq.viewcount+1,1))) asc, qq.creationdate asc) as worst_qid
+  from q_quality qq
+),
+user_badges as (
+  select
+    b.userid as user_id,
+    count(*) as badge_ct,
+    count(*) filter (where b.class = 1) as gold_ct,
+    count(*) filter (where b.class = 2) as silver_ct,
+    count(*) filter (where b.class = 3) as bronze_ct,
+    count(*) filter (where b.tagbased = 1) as tag_badge_ct,
+    min(b.date) as first_badge_date,
+    max(b.date) as last_badge_date
+  from badges b
+  join recent_users ru on ru.user_id = b.userid
+  group by b.userid
+),
+final_users as (
+  select
+    ur.*,
+    ub.badge_ct,
+    ub.gold_ct,
+    ub.silver_ct,
+    ub.bronze_ct,
+    ub.tag_badge_ct,
+    ub.first_badge_date,
+    ub.last_badge_date,
+    ubw.best_qid,
+    ubw.best_title,
+    ubw.best_score,
+    ubw.worst_qid,
+    ubw.worst_views
+  from user_rollup ur
+  left join user_badges ub on ub.user_id = ur.user_id
+  left join (
+    select distinct user_id, best_qid, best_title, best_score, worst_qid, worst_views
+    from user_best_worst
+  ) ubw on ubw.user_id = ur.user_id
+  where
+    (ur.q_count_20 >= 5 or coalesce(ub.badge_ct,0) >= 10)
+    and (ur.avg_sentiment_idx is null or ur.avg_sentiment_idx > -0.5)
+)
+select
+  fu.user_id,
+  fu.displayname,
+  fu.reputation,
+  fu.engagement_score,
+  fu.q_count_20,
+  fu.q_count_latest_month,
+  fu.views_20,
+  fu.avg_score_20,
+  fu.accepted_20,
+  fu.closed_20,
+  fu.p50_views,
+  fu.p90_views,
+  fu.badge_ct,
+  fu.gold_ct,
+  fu.silver_ct,
+  fu.bronze_ct,
+  coalesce(fu.tag_badge_ct,0) as tag_badge_ct,
+  fu.best_qid,
+  fu.best_title,
+  fu.best_score,
+  fu.worst_qid,
+  fu.worst_views,
+  utt.tagname as top_tag,
+  utt.tag_q_count as top_tag_qs,
+  utt.tag_views as top_tag_views,
+  utt.tag_avg_score as top_tag_avg_score,
+  utt.global_tag_count as top_tag_global_count,
+  utt.is_mod_only as top_tag_mod_only,
+  utt.is_required as top_tag_required
+from final_users fu
+left join user_tag_top utt
+  on utt.user_id = fu.user_id
+ and utt.tag_rank = 1
+where
+  (
+    fu.reputation >= 1000
+    or (fu.reputation between 100 and 999 and fu.engagement_score > 100)
+    or (fu.reputation < 100 and fu.q_count_latest_month >= 2 and fu.avg_score_20 > 0)
+  )
+  and coalesce(fu.views_20,0) >= 0
+order by
+  fu.engagement_score desc nulls last,
+  fu.views_20 desc,
+  fu.user_id
+limit 200;

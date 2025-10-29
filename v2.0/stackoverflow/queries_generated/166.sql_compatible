@@ -1,0 +1,275 @@
+with recent_questions as (
+    select
+        p.Id as QuestionId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.Tags,
+        coalesce(nullif(trim(p.Title), ''), '[untitled]') as SafeTitle,
+        case when p.ClosedDate is not null then 1 else 0 end as IsClosed
+    from Posts p
+    where p.PostTypeId = 1
+      and p.CreationDate >= (select max(CreationDate) - interval '365 days' from Posts where PostTypeId = 1)
+),
+tag_expansion as (
+    select
+        q.QuestionId,
+        lower(regexp_replace(tag, '\s+', '')) as tag
+    from recent_questions q,
+         unnest(string_to_array(substring(q.Tags from 2 for length(q.Tags)-2), '><')) as tag
+),
+tag_rank as (
+    select
+        t.tag,
+        count(*) as tag_freq,
+        row_number() over (order by count(*) desc, min(t.tag)) as tag_rank_desc
+    from tag_expansion t
+    group by t.tag
+),
+answers as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId as AnswererId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreationDate
+    from Posts a
+    where a.PostTypeId = 2
+),
+first_answer as (
+    select
+        a.QuestionId,
+        min(a.AnswerCreationDate) as FirstAnswerDate
+    from answers a
+    group by a.QuestionId
+),
+answer_stats as (
+    select
+        a.QuestionId,
+        count(*) as AnswerCount,
+        avg(cast(a.AnswerScore as numeric)) as AvgAnswerScore,
+        sum(case when a.AnswerScore > 0 then 1 else 0 end) as PositiveAnswers,
+        max(a.AnswerScore) as MaxAnswerScore
+    from answers a
+    group by a.QuestionId
+),
+votes_agg as (
+    select
+        v.PostId,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+        sum(case when v.VoteTypeId = 5 then 1 else 0 end) as Favorites,
+        sum(case when v.VoteTypeId = 8 then coalesce(v.BountyAmount,0) else 0 end) as BountyStarted,
+        sum(case when v.VoteTypeId = 9 then coalesce(v.BountyAmount,0) else 0 end) as BountyAwarded,
+        min(v.CreationDate) filter (where v.VoteTypeId in (2,3)) as FirstVoteAt
+    from Votes v
+    group by v.PostId
+),
+commenter_diversity as (
+    select
+        c.PostId,
+        count(*) as CommentCount,
+        count(distinct coalesce(cast(c.UserId as text), c.UserDisplayName)) as DistinctCommenters
+    from Comments c
+    group by c.PostId
+),
+linkage as (
+    select
+        pl.PostId,
+        sum(case when pl.LinkTypeId = 1 then 1 else 0 end) as LinkedCount,
+        sum(case when pl.LinkTypeId = 3 then 1 else 0 end) as DuplicateCount
+    from PostLinks pl
+    group by pl.PostId
+),
+close_reasons as (
+    select
+        ph.PostId,
+        max(ph.CreationDate) as LastCloseEvent,
+        max(case
+            when ph.PostHistoryTypeId = 10 then
+                nullif(trim(ph.Comment), '')
+            else null
+        end) as LastCloseReasonIdRaw
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (10,11)
+    group by ph.PostId
+),
+close_reason_name as (
+    select
+        cr.PostId,
+        coalesce(
+            crt.Name,
+            case
+                when cr.LastCloseReasonIdRaw ~ '^[0-9]+$' then 'UnknownReasonId:' || cr.LastCloseReasonIdRaw
+                when cr.LastCloseReasonIdRaw is null then null
+                else 'Unparsed:' || cr.LastCloseReasonIdRaw
+            end
+        ) as CloseReasonName
+    from close_reasons cr
+    left join CloseReasonTypes crt
+      on cast(crt.Id as text) = cr.LastCloseReasonIdRaw
+),
+owner_stats as (
+    select
+        u.Id as OwnerUserId,
+        u.Reputation,
+        u.CreationDate as UserCreationDate,
+        coalesce(nullif(u.Location, ''), 'Unknown') as Location,
+        u.UpVotes as LifetimeUpVotes,
+        u.DownVotes as LifetimeDownVotes,
+        u.Views as ProfileViews
+    from Users u
+),
+accepts as (
+    select
+        q.Id as QuestionId,
+        q.AcceptedAnswerId
+    from Posts q
+    where q.PostTypeId = 1 and q.AcceptedAnswerId is not null
+),
+accepted_answerer as (
+    select
+        ac.QuestionId,
+        a.OwnerUserId as AcceptedAnswererId
+    from accepts ac
+    join Posts a on a.Id = ac.AcceptedAnswerId
+),
+user_interactions as (
+    select
+        q.QuestionId,
+        case when q.OwnerUserId is null then 1 else 0 end as IsAnonymous,
+        os.Reputation as OwnerReputation,
+        os.Location as OwnerLocation,
+        os.LifetimeUpVotes,
+        os.LifetimeDownVotes
+    from recent_questions q
+    left join owner_stats os on os.OwnerUserId = q.OwnerUserId
+),
+response_time as (
+    select
+        q.QuestionId,
+        extract(epoch from (fa.FirstAnswerDate - q.CreationDate)) as SecsToFirstAnswer
+    from recent_questions q
+    left join first_answer fa on fa.QuestionId = q.QuestionId
+),
+quality_score as (
+    select
+        q.QuestionId,
+        coalesce(va.UpVotes,0)*2
+        - coalesce(va.DownVotes,0)*3
+        + coalesce(va.Favorites,0)
+        + coalesce(asx.PositiveAnswers,0)
+        + case when q.IsClosed = 1 then -5 else 0 end
+        + case when crn.CloseReasonName ilike '%duplicate%' then -3 else 0 end
+        + least(coalesce(asx.MaxAnswerScore,0), 10)
+        + case when rt.SecsToFirstAnswer is null then -2 else greatest(0, 5 - floor(coalesce(rt.SecsToFirstAnswer, 999999)/3600)::int) end
+        as QualityScore
+    from recent_questions q
+    left join votes_agg va on va.PostId = q.QuestionId
+    left join answer_stats asx on asx.QuestionId = q.QuestionId
+    left join close_reason_name crn on crn.PostId = q.QuestionId
+    left join response_time rt on rt.QuestionId = q.QuestionId
+),
+ranking as (
+    select
+        q.QuestionId,
+        q.SafeTitle,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        ui.OwnerReputation,
+        ui.OwnerLocation,
+        coalesce(ui.LifetimeUpVotes,0) - coalesce(ui.LifetimeDownVotes,0) as OwnerNetVotes,
+        va.UpVotes,
+        va.DownVotes,
+        va.Favorites,
+        la.LinkedCount,
+        la.DuplicateCount,
+        cs.QualityScore,
+        tr.tag,
+        tr.tag_rank_desc,
+        row_number() over (
+            partition by tr.tag
+            order by
+                cs.QualityScore desc nulls last,
+                q.ViewCount desc nulls last,
+                q.Score desc nulls last,
+                q.CreationDate desc
+        ) as RankWithinTag,
+        dense_rank() over (
+            order by
+                cs.QualityScore desc nulls last,
+                coalesce(va.UpVotes,0) - coalesce(va.DownVotes,0) desc,
+                q.ViewCount desc nulls last
+        ) as GlobalDenseRank
+    from recent_questions q
+    left join votes_agg va on va.PostId = q.QuestionId
+    left join linkage la on la.PostId = q.QuestionId
+    left join user_interactions ui on ui.QuestionId = q.QuestionId
+    left join quality_score cs on cs.QuestionId = q.QuestionId
+    left join lateral (
+        select te.tag
+        from tag_expansion te
+        where te.QuestionId = q.QuestionId
+        order by (select tag_rank_desc from tag_rank tr2 where tr2.tag = te.tag)
+        limit 1
+    ) t1 on true
+    left join tag_rank tr on tr.tag = t1.tag
+),
+accepted_corr as (
+    select
+        r.QuestionId,
+        case when exists (
+            select 1
+            from accepted_answerer aa
+            join Users ou on ou.Id = (select OwnerUserId from Posts qq where qq.Id = r.QuestionId)
+            join Users au on au.Id = aa.AcceptedAnswererId
+            where aa.QuestionId = r.QuestionId
+              and au.Reputation > ou.Reputation
+        ) then 1 else 0 end as AcceptedByHigherRep
+    from ranking r
+)
+select
+    r.QuestionId,
+    r.SafeTitle,
+    r.CreationDate,
+    r.Score as QuestionScore,
+    r.ViewCount,
+    r.OwnerReputation,
+    r.OwnerLocation,
+    r.OwnerNetVotes,
+    r.UpVotes,
+    r.DownVotes,
+    r.Favorites,
+    r.LinkedCount,
+    r.DuplicateCount,
+    r.tag as PrimaryTag,
+    r.tag_rank_desc as PrimaryTagRank,
+    r.RankWithinTag,
+    r.GlobalDenseRank,
+    qs.QualityScore,
+    coalesce(cdiv.CommentCount,0) as CommentCount,
+    coalesce(cdiv.DistinctCommenters,0) as DistinctCommenters,
+    coalesce(rt.SecsToFirstAnswer, null) as SecsToFirstAnswer,
+    case when ac.AcceptedAnswerId is null then 0 else 1 end as HasAcceptedAnswer,
+    coalesce(acorr.AcceptedByHigherRep, 0) as AcceptedByHigherRep,
+    coalesce(crn.CloseReasonName, 'NotClosed') as CloseReasonName
+from ranking r
+left join quality_score qs on qs.QuestionId = r.QuestionId
+left join commenter_diversity cdiv on cdiv.PostId = r.QuestionId
+left join response_time rt on rt.QuestionId = r.QuestionId
+left join accepts ac on ac.QuestionId = r.QuestionId
+left join accepted_corr acorr on acorr.QuestionId = r.QuestionId
+left join close_reason_name crn on crn.PostId = r.QuestionId
+where (r.RankWithinTag <= 50 or r.GlobalDenseRank <= 200)
+  and (
+        r.OwnerLocation is null
+        or lower(r.OwnerLocation) not like '%stack overflow%'
+        or r.OwnerReputation >= 1
+      )
+order by
+    r.GlobalDenseRank,
+    r.RankWithinTag,
+    r.QuestionId
+limit 1000;

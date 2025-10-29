@@ -1,0 +1,241 @@
+with params as (
+  select
+    date_trunc('month', cast('2024-10-01 12:34:56' as timestamp)) - interval '24 months' as start_month,
+    date_trunc('month', cast('2024-10-01 12:34:56' as timestamp)) - interval '1 month'  as end_month
+),
+questions as (
+  select
+    p.Id,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Title,
+    p.Tags,
+    coalesce(p.AnswerCount, 0) as AnswerCount,
+    p.AcceptedAnswerId,
+    p.ClosedDate
+  from Posts p
+  where p.PostTypeId = 1
+    and p.CreationDate >= (select start_month from params)
+    and p.CreationDate <  (select end_month from params) + interval '1 month'
+),
+answers as (
+  select
+    a.Id,
+    a.ParentId as QuestionId,
+    a.OwnerUserId,
+    a.CreationDate,
+    a.Score
+  from Posts a
+  where a.PostTypeId = 2
+),
+q_activity as (
+  select
+    q.Id as QuestionId,
+    q.OwnerUserId,
+    cast(q.CreationDate as date) as QuestionDate,
+    q.CreationDate,
+    q.Score as QuestionScore,
+    q.ViewCount,
+    q.Title,
+    q.Tags,
+    q.AnswerCount,
+    q.AcceptedAnswerId,
+    q.ClosedDate,
+    count(case when a.CreationDate <= q.CreationDate + interval '7 days' then 1 end) as answers_in_7d,
+    sum(case when a.CreationDate <= q.CreationDate + interval '7 days' then a.Score else 0 end) as answers_score_in_7d,
+    min(a.CreationDate) as first_answer_time,
+    max(a.CreationDate) as last_answer_time
+  from questions q
+  left join answers a
+    on a.QuestionId = q.Id
+  group by q.Id, q.OwnerUserId, q.CreationDate, q.Score, q.ViewCount, q.Title, q.Tags, q.AnswerCount, q.AcceptedAnswerId, q.ClosedDate
+),
+accepted as (
+  select
+    qa.QuestionId,
+    qa.AcceptedAnswerId,
+    aa.CreationDate as accepted_creation,
+    extract(epoch from (aa.CreationDate - qa.CreationDate)) / 3600.0 as hours_to_accept
+  from q_activity qa
+  left join Posts aa
+    on aa.Id = qa.AcceptedAnswerId
+),
+votes_agg as (
+  select
+    v.PostId,
+    sum(case when v.VoteTypeId = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.VoteTypeId = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.VoteTypeId = 5 then 1 else 0 end) as favorites,
+    sum(case when v.VoteTypeId in (8,9) then 1 else 0 end) as bounty_events,
+    sum(coalesce(v.BountyAmount,0)) as bounty_amount
+  from Votes v
+  where v.CreationDate >= (select start_month from params)
+    and v.CreationDate <  (select end_month from params) + interval '1 month'
+  group by v.PostId
+),
+links_agg as (
+  select
+    pl.RelatedPostId as QuestionId,
+    sum(case when pl.LinkTypeId = 3 then 1 else 0 end) as dup_marked_by,
+    sum(case when pl.LinkTypeId = 1 then 1 else 0 end) as linked_by
+  from PostLinks pl
+  group by pl.RelatedPostId
+),
+history_closure as (
+  select
+    ph.PostId as QuestionId,
+    min(case when ph.PostHistoryTypeId in (10,35) then ph.CreationDate end) as first_closed_or_migrated,
+    max(case when ph.PostHistoryTypeId in (11) then ph.CreationDate end) as last_reopen
+  from PostHistory ph
+  group by ph.PostId
+),
+user_stats as (
+  select
+    u.Id as UserId,
+    u.Reputation,
+    u.CreationDate,
+    u.UpVotes,
+    u.DownVotes,
+    u.Views,
+    coalesce(nullif(trim(split_part(coalesce(u.Location,''), ',', 1)), ''), 'Unknown') as CountryLike,
+    coalesce((select count(*) from Badges b where b.UserId = u.Id and b.Class = 1), 0) as gold_badges,
+    coalesce((select count(*) from Badges b where b.UserId = u.Id and b.Class = 2), 0) as silver_badges,
+    coalesce((select count(*) from Badges b where b.UserId = u.Id and b.Class = 3), 0) as bronze_badges
+  from Users u
+),
+tag_expansion as (
+  select
+    qa.QuestionId,
+    unnest(string_to_array(substring(coalesce(qa.Tags,'<>'), 2, greatest(length(coalesce(qa.Tags,'<>'))-2,0)), '><')) as tag
+  from q_activity qa
+),
+tag_rank as (
+  select
+    te.tag,
+    count(*) as tag_q_count,
+    row_number() over (order by count(*) desc, te.tag) as tag_rank_global
+  from tag_expansion te
+  group by te.tag
+),
+per_question_tag_rank as (
+  select
+    te.QuestionId,
+    string_agg(t.tag || ':' || cast(tag_rank_global as varchar), ',' order by tag_rank_global asc) as tag_rank_list
+  from tag_expansion te
+  join tag_rank t on te.tag = t.tag
+  group by te.QuestionId
+),
+monthly_bins as (
+  select
+    date_trunc('month', qa.CreationDate) as month_bucket,
+    qa.QuestionId,
+    qa.OwnerUserId,
+    qa.QuestionScore,
+    qa.ViewCount,
+    qa.AnswerCount,
+    qa.answers_in_7d,
+    qa.answers_score_in_7d,
+    accepted.hours_to_accept,
+    (qa.ClosedDate is not null) as is_closed,
+    coalesce(v.upvotes,0) as upvotes,
+    coalesce(v.downvotes,0) as downvotes,
+    coalesce(v.favorites,0) as favorites,
+    coalesce(v.bounty_events,0) as bounty_events,
+    coalesce(v.bounty_amount,0) as bounty_amount,
+    coalesce(l.dup_marked_by,0) as dup_marked_by,
+    coalesce(l.linked_by,0) as linked_by,
+    hc.first_closed_or_migrated,
+    hc.last_reopen,
+    pr.tag_rank_list
+  from q_activity qa
+  left join accepted accepted on accepted.QuestionId = qa.QuestionId
+  left join votes_agg v on v.PostId = qa.QuestionId
+  left join links_agg l on l.QuestionId = qa.QuestionId
+  left join history_closure hc on hc.QuestionId = qa.QuestionId
+  left join per_question_tag_rank pr on pr.QuestionId = qa.QuestionId
+),
+user_enriched as (
+  select
+    mb.*,
+    us.Reputation,
+    us.UpVotes as user_upvotes,
+    us.DownVotes as user_downvotes,
+    us.Views as user_profile_views,
+    us.CountryLike,
+    us.gold_badges,
+    us.silver_badges,
+    us.bronze_badges,
+    case
+      when us.Reputation >= 20000 then 'Legend'
+      when us.Reputation >= 10000 then 'Expert'
+      when us.Reputation >= 3000 then 'Advanced'
+      when us.Reputation >= 1000 then 'Intermediate'
+      when us.Reputation is null then 'Unknown'
+      else 'Beginner'
+    end as user_segment
+  from monthly_bins mb
+  left join user_stats us
+    on us.UserId = mb.OwnerUserId
+),
+rolled as (
+  select
+    month_bucket,
+    user_segment,
+    CountryLike,
+    percentile_cont(0.5) within group (order by coalesce(ViewCount,0)) as median_views,
+    avg(ViewCount) as avg_views,
+    stddev_pop(ViewCount) as std_views,
+    avg(coalesce(QuestionScore,0)) as avg_q_score,
+    avg(coalesce(upvotes,0) - coalesce(downvotes,0)) as avg_net_votes,
+    sum(case when hours_to_accept is not null and hours_to_accept <= 24 then 1 else 0 end) * 1.0
+      / nullif(count(*),0) as pct_accepted_24h,
+    sum(case when is_closed then 1 else 0 end) as closed_cnt,
+    sum(favorites) as favorites_sum,
+    sum(bounty_amount) as bounty_sum,
+    sum(dup_marked_by) as dup_incoming,
+    sum(linked_by) as linked_incoming,
+    count(*) as q_count
+  from user_enriched
+  group by month_bucket, user_segment, CountryLike
+),
+ranked as (
+  select
+    r.*,
+    dense_rank() over (partition by month_bucket order by coalesce(avg_net_votes, -1e9) desc, q_count desc) as rank_by_net_votes,
+    row_number() over (partition by month_bucket order by median_views desc nulls last) as rn_by_median_views
+  from rolled r
+),
+null_sentinel as (
+  select
+    coalesce(to_char(month_bucket, 'YYYY-MM'), 'ALL') as month_key,
+    coalesce(user_segment, 'ALL') as user_segment,
+    coalesce(CountryLike, 'ALL') as country_like,
+    median_views,
+    avg_views,
+    std_views,
+    avg_q_score,
+    avg_net_votes,
+    round(100.0 * coalesce(pct_accepted_24h,0.0), 2) as pct_accepted_24h,
+    closed_cnt,
+    favorites_sum,
+    bounty_sum,
+    dup_incoming,
+    linked_incoming,
+    q_count,
+    rank_by_net_votes,
+    rn_by_median_views
+  from ranked
+)
+select *
+from null_sentinel
+where (
+  month_key <> 'ALL'
+  or (user_segment = 'ALL' and country_like = 'ALL')
+)
+order by
+  case when month_key = 'ALL' then 1 else 0 end,
+  month_key,
+  user_segment,
+  country_like;

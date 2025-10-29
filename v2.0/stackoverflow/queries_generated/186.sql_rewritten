@@ -1,0 +1,361 @@
+-- {"query": "186.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3346} 
+with
+-- Parameterizable time window
+params as (
+  select
+    date_trunc('month', cast('2024-10-01 12:34:56' as timestamp)) - interval '24 months' as start_ts,
+    cast('2024-10-01 12:34:56' as timestamp) as end_ts
+),
+-- Candidate questions in window, with parsed tags array and cleanliness flags
+q as (
+  select
+    p.Id as QuestionId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    coalesce(p.AnswerCount, 0) as AnswerCount,
+    string_to_array(substring(p.Tags, 2, greatest(length(p.Tags)-2,0)), '><') as tag_arr,
+    p.ClosedDate,
+    (p.CommunityOwnedDate is not null) as is_community,
+    p.Title
+  from Posts p
+  join PostTypes pt on pt.Id = p.PostTypeId and pt.Name = 'Question'
+  cross join params prm
+  where p.CreationDate >= prm.start_ts
+    and p.CreationDate < prm.end_ts
+),
+-- First activity (comment/edit/history) after question creation
+first_activity as (
+  select
+    q.QuestionId,
+    min(act.dt) as first_activity_ts
+  from q
+  left join (
+    select c.PostId as pid, c.CreationDate as dt from Comments c
+    union all
+    select ph.PostId as pid, ph.CreationDate as dt from PostHistory ph
+  ) act on act.pid = q.QuestionId and act.dt > q.CreationDate
+  group by q.QuestionId
+),
+-- Answers for each question with responder metrics
+answers as (
+  select
+    a.ParentId as QuestionId,
+    a.Id as AnswerId,
+    a.CreationDate as AnswerCreationDate,
+    a.Score as AnswerScore,
+    a.OwnerUserId as AnswererId
+  from Posts a
+  join PostTypes pt on pt.Id = a.PostTypeId and pt.Name = 'Answer'
+),
+-- First answer per question and time-to-first-answer
+first_answer as (
+  select
+    a.QuestionId,
+    min(a.AnswerCreationDate) as first_answer_ts,
+    count(*) filter (where a.AnswerCreationDate is not null) as answer_count_calc
+  from answers a
+  group by a.QuestionId
+),
+-- Votes aggregated per question (up, down, favorite) and net score delta after creation day
+vote_agg as (
+  select
+    v.PostId as QuestionId,
+    count(*) filter (where vt.Name = 'UpMod') as upvotes,
+    count(*) filter (where vt.Name = 'DownMod') as downvotes,
+    count(*) filter (where vt.Name = 'Favorite') as favorites,
+    count(*) filter (where vt.Name in ('UpMod','DownMod')) as total_votes
+  from Votes v
+  join VoteTypes vt on vt.Id = v.VoteTypeId
+  group by v.PostId
+),
+-- Close reasons encountered
+close_reasons as (
+  select
+    ph.PostId as QuestionId,
+    min(ph.CreationDate) as first_close_ts,
+    min(case
+          when ph.PostHistoryTypeId = 10
+               and ph.Comment ~ '^[0-9]+$'
+          then ph.Comment::int
+        end) as first_close_reason_id
+  from PostHistory ph
+  where ph.PostHistoryTypeId in (10 /* closed */)
+  group by ph.PostId
+),
+-- Duplicate links and linked posts
+link_stats as (
+  select
+    pl.PostId as QuestionId,
+    count(*) filter (where lt.Name = 'Duplicate') as duplicate_links,
+    count(*) filter (where lt.Name = 'Linked') as linked_links,
+    max(pl.CreationDate) as last_link_ts
+  from PostLinks pl
+  join LinkTypes lt on lt.Id = pl.LinkTypeId
+  group by pl.PostId
+),
+-- Tag popularity snapshot for each tag used (join against Tags)
+tag_popularity as (
+  select
+    t.TagName,
+    t.Count as GlobalTagCount,
+    t.IsModeratorOnly,
+    t.IsRequired
+  from Tags t
+),
+-- Expand question tags and attach popularity
+q_tags as (
+  select
+    q.QuestionId,
+    lower(trim(tg)) as tagname
+  from q
+  cross join lateral unnest(q.tag_arr) as tg
+),
+q_tag_pop as (
+  select
+    qt.QuestionId,
+    avg(coalesce(tp.GlobalTagCount, 0))::numeric as avg_tag_popularity,
+    max(coalesce(tp.GlobalTagCount, 0)) as max_tag_popularity,
+    count(*) filter (where coalesce(tp.IsModeratorOnly, 0) = 1) as moderator_only_tag_count
+  from q_tags qt
+  left join tag_popularity tp on tp.TagName = qt.tagname
+  group by qt.QuestionId
+),
+-- Owner metrics
+owner_metrics as (
+  select
+    u.Id as UserId,
+    u.Reputation,
+    u.UpVotes,
+    u.DownVotes,
+    u.Views as ProfileViews,
+    date_part('year', age(cast('2024-10-01 12:34:56' as timestamp), u.CreationDate))::int as account_age_years,
+    coalesce(nullif(trim(u.Location), ''), 'Unknown') as norm_location
+  from Users u
+),
+-- Badges per user aggregated and recent badges
+user_badges as (
+  select
+    b.UserId,
+    count(*) filter (where b.Class = 1) as gold_badges,
+    count(*) filter (where b.Class = 2) as silver_badges,
+    count(*) filter (where b.Class = 3) as bronze_badges,
+    count(*) filter (where b.TagBased = 1) as tag_badges,
+    max(b.Date) as last_badge_ts
+  from Badges b
+  group by b.UserId
+),
+-- Comment engagement in the first 48 hours per question
+early_comments as (
+  select
+    c.PostId as QuestionId,
+    count(*) filter (where c.Score > 0) as pos_comments,
+    count(*) filter (where c.Score <= 0 or c.Score is null) as nonpos_comments,
+    count(distinct c.UserId) as distinct_commenters
+  from Comments c
+  join q on q.QuestionId = c.PostId
+  where c.CreationDate <= q.CreationDate + interval '48 hours'
+  group by c.PostId
+),
+-- Rolling weekly cohort stats for questions
+weekly as (
+  select
+    date_trunc('week', q.CreationDate) as wk,
+    count(*) as questions_in_week,
+    avg(q.Score) as avg_score_week,
+    percentile_cont(0.5) within group (order by q.ViewCount) as p50_views_week
+  from q
+  group by date_trunc('week', q.CreationDate)
+),
+-- Rank questions by multiple criteria within week
+ranked as (
+  select
+    q.QuestionId,
+    q.CreationDate,
+    w.wk,
+    dense_rank() over (partition by w.wk order by q.Score desc nulls last, q.ViewCount desc nulls last, q.AnswerCount desc nulls last) as wk_rank
+  from q
+  join weekly w on w.wk = date_trunc('week', q.CreationDate)
+),
+-- Synthesize per-question metrics with various joins and null logic
+per_question as (
+  select
+    q.QuestionId,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    q.AnswerCount,
+    q.OwnerUserId,
+    q.ClosedDate,
+    q.is_community,
+    q.Title,
+    qa.avg_tag_popularity,
+    qa.max_tag_popularity,
+    qa.moderator_only_tag_count,
+    coalesce(v.upvotes, 0) as upvotes,
+    coalesce(v.downvotes, 0) as downvotes,
+    coalesce(v.favorites, 0) as favorites,
+    coalesce(v.total_votes, 0) as total_votes,
+    fa.first_activity_ts,
+    fans.first_answer_ts,
+    extract(epoch from (fans.first_answer_ts - q.CreationDate)) / 3600.0 as hours_to_first_answer,
+    cr.first_close_ts,
+    cr.first_close_reason_id,
+    ls.duplicate_links,
+    ls.linked_links,
+    ls.last_link_ts,
+    ec.pos_comments,
+    ec.nonpos_comments,
+    ec.distinct_commenters,
+    rm.wk_rank,
+    om.Reputation,
+    om.UpVotes as owner_upvotes_alltime,
+    om.DownVotes as owner_downvotes_alltime,
+    om.ProfileViews,
+    om.account_age_years,
+    om.norm_location,
+    ub.gold_badges,
+    ub.silver_badges,
+    ub.bronze_badges,
+    ub.tag_badges,
+    ub.last_badge_ts,
+    -- Robustness: flags
+    case when q.ClosedDate is not null then 1 else 0 end as is_closed,
+    case when fans.first_answer_ts is null then 1 else 0 end as no_answers_flag,
+    case when qa.moderator_only_tag_count > 0 then 1 else 0 end as has_mod_only_tag
+  from q
+  left join q_tag_pop qa on qa.QuestionId = q.QuestionId
+  left join vote_agg v on v.QuestionId = q.QuestionId
+  left join first_activity fa on fa.QuestionId = q.QuestionId
+  left join first_answer fans on fans.QuestionId = q.QuestionId
+  left join close_reasons cr on cr.QuestionId = q.QuestionId
+  left join link_stats ls on ls.QuestionId = q.QuestionId
+  left join early_comments ec on ec.QuestionId = q.QuestionId
+  left join ranked rm on rm.QuestionId = q.QuestionId
+  left join owner_metrics om on om.UserId = q.OwnerUserId
+  left join user_badges ub on ub.UserId = q.OwnerUserId
+),
+-- Derive a difficulty/engagement composite score with mixed numeric/string/null logic
+scored as (
+  select
+    pq.*,
+    -- Normalize components and compute a composite benchmark metric
+    (
+      coalesce(ln(nullif(pq.ViewCount,0)), 0) * 0.20
+      + coalesce(pq.Score, 0) * 0.25
+      + coalesce(pq.upvotes - pq.downvotes, 0) * 0.15
+      + coalesce((case when pq.hours_to_first_answer is null then 48 else least(pq.hours_to_first_answer, 168) end), 0) * -0.05
+      + coalesce(pq.distinct_commenters, 0) * 0.10
+      + coalesce(pq.favorites, 0) * 0.05
+      + case when pq.is_closed = 1 then -0.15 else 0 end
+      + case when pq.has_mod_only_tag = 1 then -0.05 else 0 end
+      + case when pq.is_community then 0.02 else 0 end
+    )::numeric as composite_score,
+    -- String-based features
+    length(coalesce(pq.Title, '')) as title_len,
+    (regexp_matches(coalesce(pq.Title,''), '\b(how|why|what|when|where|can|should)\b', 'i')) is not null as is_interrogative_title
+  from per_question pq
+),
+-- Window analytics across entire set
+windows as (
+  select
+    s.*,
+    row_number() over (order by s.composite_score desc nulls last, s.ViewCount desc nulls last) as global_rank,
+    percentile_disc(0.9) within group (order by s.composite_score) over () as p90_comp,
+    avg(s.composite_score) over () as avg_comp_all,
+    stddev_samp(s.composite_score) over () as stddev_comp_all,
+    avg(s.Score) over () as avg_score_all,
+    avg(s.ViewCount) over () as avg_views_all
+  from scored s
+),
+-- Correlated subquery example: count of answers by high-rep users per question
+hi_rep_answers as (
+  select
+    a.QuestionId,
+    count(*) as high_rep_answer_count
+  from answers a
+  where exists (
+    select 1
+    from Users u
+    where u.Id = a.AnswererId
+      and u.Reputation >= (
+        select percentile_cont(0.75) within group (order by Reputation)
+        from Users
+      )
+  )
+  group by a.QuestionId
+),
+-- Set operator example: questions with either duplicate links or closed as duplicates, union distinct
+dup_candidates as (
+  select ls.QuestionId from link_stats ls where coalesce(ls.duplicate_links,0) > 0
+  union
+  select cr.QuestionId from close_reasons cr
+  join PostHistoryTypes pht on pht.Id = 10
+  where cr.first_close_reason_id in (1,101)
+),
+-- Final selection with complex predicates
+final as (
+  select
+    w.*,
+    coalesce(hra.high_rep_answer_count, 0) as high_rep_answer_count,
+    case when d.QuestionId is not null then 1 else 0 end as is_duplicate_related
+  from windows w
+  left join hi_rep_answers hra on hra.QuestionId = w.QuestionId
+  left join dup_candidates d on d.QuestionId = w.QuestionId
+  where
+    -- Complex predicate mixing nulls, ranges, and string logic
+    (
+      (w.Score >= 0 and coalesce(w.title_len,0) >= 10)
+      or (w.Score < 0 and w.ViewCount > 0 and w.is_interrogative_title)
+    )
+    and coalesce(w.total_votes, 0) + coalesce(w.favorites, 0) >= 1
+)
+select
+  f.QuestionId,
+  f.CreationDate,
+  f.global_rank,
+  round(f.composite_score::numeric, 3) as composite_score,
+  f.Score as question_score,
+  f.ViewCount,
+  f.AnswerCount,
+  round(coalesce(f.hours_to_first_answer, -1)::numeric, 2) as hours_to_first_answer,
+  f.upvotes,
+  f.downvotes,
+  f.favorites,
+  f.total_votes,
+  f.title_len,
+  f.is_interrogative_title,
+  f.avg_tag_popularity,
+  f.max_tag_popularity,
+  f.moderator_only_tag_count,
+  f.is_closed,
+  f.is_community,
+  f.first_activity_ts,
+  f.first_close_ts,
+  f.first_close_reason_id,
+  f.duplicate_links,
+  f.linked_links,
+  f.last_link_ts,
+  f.distinct_commenters,
+  f.wk_rank,
+  f.Reputation as owner_reputation,
+  f.account_age_years as owner_account_age_years,
+  f.gold_badges,
+  f.silver_badges,
+  f.bronze_badges,
+  f.tag_badges,
+  f.high_rep_answer_count,
+  f.is_duplicate_related,
+  -- Benchmarking-friendly bucketing
+  width_bucket(coalesce(f.ViewCount,0), 0, greatest(coalesce(f.avg_views_all,1),1), 10) as view_bucket,
+  width_bucket(coalesce(f.Score,0), -5, greatest(coalesce(f.avg_score_all,1),1), 10) as score_bucket,
+  case
+    when f.composite_score >= f.p90_comp then 'top10pct'
+    when f.composite_score >= f.avg_comp_all + coalesce(f.stddev_comp_all,0) then 'above_avg'
+    when f.composite_score is null then 'unknown'
+    else 'normal'
+  end as comp_bucket
+from final f
+order by f.global_rank
+limit 500;

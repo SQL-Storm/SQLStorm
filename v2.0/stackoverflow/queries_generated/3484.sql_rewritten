@@ -1,0 +1,133 @@
+-- {"query": "3484.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2620} 
+WITH UserStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.Location, 'Unknown')               AS Location,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadges,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS QuestionCount,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS AnswerCount,
+        (SELECT COUNT(DISTINCT t.TagName)
+            FROM Posts p
+            JOIN LATERAL regexp_split_to_table(p.Tags, '><') AS tag(tag) ON true
+            JOIN Tags t ON t.TagName = tag.tag
+            WHERE p.OwnerUserId = u.Id)              AS DistinctTagCount
+    FROM Users u
+    WHERE u.Reputation > 1000
+),
+PostScoreStats AS (
+    SELECT
+        p.OwnerUserId,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) AS AvgAnswerScore,
+        MAX(p.CreationDate)                               AS LastPostDate,
+        SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS AcceptedAnswersGiven
+    FROM Posts p
+    GROUP BY p.OwnerUserId
+),
+RecentVotes AS (
+    SELECT
+        v.UserId,
+        COUNT(*)                                               AS RecentVoteCount,
+        SUM(CASE WHEN vt.Name = 'UpMod'   THEN 1 ELSE 0 END)   AS UpVotes,
+        SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END)   AS DownVotes
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE v.CreationDate >= cast('2024-10-01' as date) - INTERVAL '30 days'
+    GROUP BY v.UserId
+),
+Combined AS (
+    SELECT
+        us.Id,
+        us.DisplayName,
+        us.Reputation,
+        us.GoldBadges,
+        us.SilverBadges,
+        us.BronzeBadges,
+        ps.AvgQuestionScore,
+        ps.AvgAnswerScore,
+        ps.LastPostDate,
+        ps.AcceptedAnswersGiven,
+        rv.RecentVoteCount,
+        rv.UpVotes,
+        rv.DownVotes,
+        us.DistinctTagCount,
+        ROW_NUMBER() OVER (PARTITION BY us.Location ORDER BY us.Reputation DESC) AS RankInLocation
+    FROM UserStats us
+    LEFT JOIN PostScoreStats ps ON ps.OwnerUserId = us.Id
+    LEFT JOIN RecentVotes rv   ON rv.UserId    = us.Id
+),
+TopUsers AS (
+    SELECT *
+    FROM Combined
+    WHERE RankInLocation <= 5
+),
+DuplicateQuestions AS (
+    SELECT
+        p.Id                                   AS QuestionId,
+        CAST(ph.Comment AS INTEGER)            AS DuplicateOfId,
+        p.Title,
+        p.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY CAST(ph.Comment AS INTEGER)
+                           ORDER BY p.CreationDate DESC) AS RN
+    FROM Posts p
+    JOIN PostHistory ph ON ph.PostId = p.Id
+    WHERE p.PostTypeId = 1
+      AND ph.PostHistoryTypeId = 10               -- Post Closed
+      AND ph.Comment ~ '^\d+$'                    -- comment holds numeric duplicate target id
+)
+SELECT
+    tu.Id,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.GoldBadges,
+    tu.SilverBadges,
+    tu.BronzeBadges,
+    ROUND(tu.AvgQuestionScore, 2) AS AvgQScore,
+    ROUND(tu.AvgAnswerScore,   2) AS AvgAScore,
+    tu.LastPostDate,
+    tu.AcceptedAnswersGiven,
+    tu.RecentVoteCount,
+    tu.UpVotes,
+    tu.DownVotes,
+    tu.DistinctTagCount,
+    du.Title                      AS DuplicateQuestionTitle,
+    du.DuplicateOfId,
+    du.CreationDate               AS DuplicateCreated
+FROM TopUsers tu
+LEFT JOIN (
+    SELECT d.QuestionId, d.Title, d.DuplicateOfId, d.CreationDate
+    FROM DuplicateQuestions d
+    WHERE d.RN = 1
+) du ON du.DuplicateOfId = tu.Id
+WHERE (tu.GoldBadges > 0 OR tu.SilverBadges > 2)
+  AND (tu.AvgQuestionScore IS NULL OR tu.AvgQuestionScore > 0)
+ORDER BY tu.Reputation DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    NULL                                    AS Id,
+    '--- Aggregated Summary ---'            AS DisplayName,
+    SUM(tu.Reputation)                      AS Reputation,
+    SUM(tu.GoldBadges)                      AS GoldBadges,
+    SUM(tu.SilverBadges)                    AS SilverBadges,
+    SUM(tu.BronzeBadges)                    AS BronzeBadges,
+    NULL                                    AS AvgQScore,
+    NULL                                    AS AvgAScore,
+    NULL                                    AS LastPostDate,
+    NULL                                    AS AcceptedAnswersGiven,
+    NULL                                    AS RecentVoteCount,
+    NULL                                    AS UpVotes,
+    NULL                                    AS DownVotes,
+    NULL                                    AS DistinctTagCount,
+    NULL                                    AS DuplicateQuestionTitle,
+    NULL                                    AS DuplicateOfId,
+    NULL                                    AS DuplicateCreated
+FROM TopUsers tu
+EXCEPT
+SELECT * FROM TopUsers LIMIT 0;

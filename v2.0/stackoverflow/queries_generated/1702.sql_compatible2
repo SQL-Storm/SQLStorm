@@ -1,0 +1,231 @@
+WITH UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.Views AS UserViews,
+        u.UpVotes AS UserUpVotes,
+        u.DownVotes AS UserDownVotes,
+        CASE
+            WHEN u.Reputation >= 50000 THEN 'Legendary'
+            WHEN u.Reputation >= 10000 THEN 'Expert'
+            WHEN u.Reputation >= 1000 THEN 'Advanced'
+            WHEN u.Reputation >= 200 THEN 'Intermediate'
+            ELSE 'Novice'
+        END AS ReputationTier,
+        COUNT(b.Id) AS TotalBadges,
+        MAX(b.Date) AS LastBadgeDate,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        AVG(
+            EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - b.Date)) / (3600 * 24 * 365.25)
+        ) FILTER (WHERE b.Date IS NOT NULL) AS AvgBadgeAgeYears
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.LastAccessDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')
+      AND u.Views > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes
+),
+PostEngagementMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.OwnerUserId,
+        COALESCE(p.OwnerDisplayName, uas.DisplayName, 'Community User') AS PostOwnerDisplayName,
+        p.CreationDate AS PostCreationDate,
+        p.LastActivityDate,
+        p.Score,
+        p.ViewCount,
+        p.Body,
+        p.AnswerCount,
+        p.CommentCount,
+        COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+        p.Title,
+        NULLIF(TRIM(SPLIT_PART(SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags) - 2)), '><', 1)), '') AS PrimaryTag,
+        EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS timestamp) - p.CreationDate)) AS PostAgeDays,
+        CASE
+            WHEN p.ViewCount > 50000 AND COALESCE(p.FavoriteCount, 0) >= (p.ViewCount * 0.01) THEN 'Viral'
+            WHEN p.ViewCount > 10000 AND COALESCE(p.FavoriteCount, 0) >= (p.ViewCount * 0.005) THEN 'Hot Topic'
+            WHEN p.ViewCount > 1000 AND COALESCE(p.FavoriteCount, 0) >= (p.ViewCount * 0.001) THEN 'Trending'
+            ELSE 'Standard'
+        END AS PostTrendStatus,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotes,
+        SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS TotalFavoritesFromVotes
+    FROM Posts p
+    LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN UserActivitySummary uas ON p.OwnerUserId = uas.UserId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE p.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 years')
+      AND p.PostTypeId IN (1, 2)
+      AND p.Body IS NOT NULL
+    GROUP BY
+        p.Id, p.PostTypeId, pt.Name, p.OwnerUserId, p.OwnerDisplayName, uas.DisplayName,
+        p.CreationDate, p.LastActivityDate, p.Score, p.ViewCount, p.Body, p.AnswerCount,
+        p.CommentCount, p.FavoriteCount, p.Title, p.Tags
+),
+PostHistoryWithLags AS (
+    SELECT
+        ph.PostId,
+        ph.Id AS PhId,
+        ph.UserId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        ph.Comment
+    FROM PostHistory ph
+    WHERE ph.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 years')
+),
+PostHistoryLagged AS (
+    SELECT
+        phw.PostId,
+        phw.PhId,
+        phw.UserId,
+        phw.PostHistoryTypeId,
+        phw.CreationDate,
+        LAG(phw.CreationDate) OVER (PARTITION BY phw.PostId ORDER BY phw.CreationDate) AS PrevCreationDate,
+        phw.Comment
+    FROM PostHistoryWithLags phw
+),
+PostHistorySummary AS (
+    SELECT
+        phl.PostId,
+        COUNT(phl.PhId) AS TotalHistoryEvents,
+        COUNT(DISTINCT phl.UserId) AS UniqueEditors,
+        MAX(phl.CreationDate) AS LastHistoryEditDate,
+        SUM(CASE WHEN phl.PostHistoryTypeId IN (4,5,6) THEN 1 ELSE 0 END) AS EditCount,
+        SUM(CASE WHEN phl.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseCount,
+        SUM(CASE WHEN phl.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenCount,
+        MAX(CASE WHEN phl.PostHistoryTypeId = 10 THEN COALESCE(crt.Name, 'Unknown Reason') ELSE NULL END) AS LastCloseReasonName,
+        AVG(
+            EXTRACT(EPOCH FROM (phl.CreationDate - phl.PrevCreationDate))
+        ) FILTER (WHERE phl.PostHistoryTypeId IN (4,5,6) AND phl.PrevCreationDate IS NOT NULL) AS AvgTimeBetweenEditsSeconds
+    FROM PostHistoryLagged phl
+    LEFT JOIN CloseReasonTypes crt ON phl.PostHistoryTypeId = 10 AND phl.Comment = CAST(crt.Id AS varchar(50))
+    GROUP BY phl.PostId
+),
+LinkedPostAnalysis AS (
+    SELECT
+        pl.PostId,
+        COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 1 THEN pl.RelatedPostId ELSE NULL END) AS LinkedPostsCount,
+        COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN pl.RelatedPostId ELSE NULL END) AS DuplicatePostsCount,
+        MAX(CASE WHEN pl.LinkTypeId = 3 THEN 'True' ELSE 'False' END) AS IsDuplicateSource
+    FROM PostLinks pl
+    WHERE pl.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 years')
+    GROUP BY pl.PostId
+),
+CommentSentimentSummary AS (
+    SELECT
+        c.PostId,
+        COUNT(c.Id) AS TotalComments,
+        SUM(c.Score) AS TotalCommentScore,
+        COUNT(DISTINCT c.UserId) AS UniqueCommenters,
+        MAX(c.CreationDate) AS LastCommentDate,
+        SUM(CASE WHEN LOWER(c.Text) LIKE '%thank%' OR LOWER(c.Text) LIKE '%helpful%' OR LOWER(c.Text) LIKE '%appreciate%' THEN 1 ELSE 0 END) AS PositiveComments,
+        SUM(CASE WHEN LOWER(c.Text) LIKE '%bug%' OR LOWER(c.Text) LIKE '%error%' OR LOWER(c.Text) LIKE '%problem%' THEN 1 ELSE 0 END) AS ProblemComments
+    FROM Comments c
+    WHERE c.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 years')
+    GROUP BY c.PostId
+),
+TagPerformance AS (
+    SELECT
+        pem.PrimaryTag,
+        COUNT(DISTINCT pem.PostId) AS TaggedPostsCount,
+        AVG(pem.Score) AS AverageTagScore,
+        SUM(pem.ViewCount) AS TotalTagViews,
+        SUM(pem.FavoriteCount) AS TotalTagFavorites,
+        (SUM(pem.ViewCount) * 0.3 + SUM(pem.FavoriteCount) * 1.5 + COUNT(DISTINCT pem.PostId) * 5 + AVG(pem.TotalUpVotes) * 0.5) AS TagPopularityScore
+    FROM PostEngagementMetrics pem
+    WHERE pem.PrimaryTag IS NOT NULL
+    GROUP BY pem.PrimaryTag
+)
+SELECT
+    pem.PostId,
+    pem.PostTypeName,
+    pem.Title,
+    pem.PostOwnerDisplayName,
+    uas.ReputationTier,
+    pem.PostCreationDate,
+    pem.LastActivityDate,
+    pem.PostAgeDays,
+    pem.PostTrendStatus,
+    pem.Score AS PostScore,
+    pem.ViewCount,
+    pem.TotalUpVotes,
+    pem.TotalDownVotes,
+    pem.TotalFavoritesFromVotes + pem.FavoriteCount AS CombinedFavoriteCount,
+    COALESCE(pem.AnswerCount, 0) AS AnswerCount,
+    COALESCE(css.TotalComments, 0) AS TotalComments,
+    COALESCE(css.TotalCommentScore, 0) AS TotalCommentScore,
+    COALESCE(css.UniqueCommenters, 0) AS UniqueCommenters,
+    COALESCE(css.PositiveComments, 0) AS PositiveComments,
+    COALESCE(css.ProblemComments, 0) AS ProblemComments,
+    COALESCE(phs.TotalHistoryEvents, 0) AS TotalHistoryEvents,
+    COALESCE(phs.EditCount, 0) AS TotalEdits,
+    COALESCE(phs.CloseCount, 0) AS TotalCloses,
+    COALESCE(phs.ReopenCount, 0) AS TotalReopens,
+    phs.LastCloseReasonName,
+    COALESCE(phs.AvgTimeBetweenEditsSeconds, 0) AS AvgTimeBetweenEditsSeconds,
+    COALESCE(lpa.LinkedPostsCount, 0) AS LinkedPostsCount,
+    COALESCE(lpa.DuplicatePostsCount, 0) AS DuplicatePostsCount,
+    COALESCE(lpa.IsDuplicateSource, 'False') AS IsDuplicateSource,
+    pem.PrimaryTag,
+    tp.TagPopularityScore,
+    RANK() OVER (PARTITION BY pem.PostTypeId, pem.PrimaryTag ORDER BY (pem.Score + pem.FavoriteCount * 2) DESC, pem.PostCreationDate DESC) AS RankWithinTagType,
+    SUM(pem.TotalUpVotes) OVER (PARTITION BY pem.OwnerUserId ORDER BY pem.PostCreationDate) AS CumulativeUpvotesByOwner,
+    AVG(pem.ViewCount) OVER (PARTITION BY pem.PostTypeId ORDER BY pem.PostCreationDate ROWS BETWEEN 10 PRECEDING AND CURRENT ROW) AS MovingAvgViewCount,
+    EXISTS (
+        SELECT 1
+        FROM Badges b
+        WHERE b.UserId = pem.OwnerUserId AND b.Class = 1 AND b.Date >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '6 months')
+    ) AS OwnerHasRecentGoldBadge,
+    (
+        SELECT COUNT(pl_inner.RelatedPostId)
+        FROM PostLinks pl_inner
+        JOIN Posts p_inner ON pl_inner.RelatedPostId = p_inner.Id
+        WHERE pl_inner.PostId = pem.PostId
+          AND pl_inner.LinkTypeId IN (1, 3)
+          AND p_inner.Score >= 10
+    ) AS HighScoreRelatedPostsCount,
+    COALESCE(
+        SUBSTRING(REGEXP_REPLACE(pem.Body, '<[^>]+>', '', 'g') FROM 1 FOR 150) ||
+        CASE WHEN CHAR_LENGTH(REGEXP_REPLACE(pem.Body, '<[^>]+>', '', 'g')) > 150 THEN '...' ELSE '' END,
+        'No body preview available'
+    ) AS BodyPreviewText,
+    CASE
+        WHEN pem.PostAgeDays > 365 AND COALESCE(phs.TotalHistoryEvents, 0) = 0 THEN 'Neglected Old Post'
+        WHEN pem.PostAgeDays > 365 AND COALESCE(phs.EditCount, 0) = 0 AND COALESCE(css.TotalComments, 0) = 0 THEN 'Forgotten Content'
+        ELSE 'Active/Normal'
+    END AS PostLifecycleStatus,
+    (
+        SELECT COUNT(sq.PostId)
+        FROM (
+            SELECT pem_inner.PostId
+            FROM PostEngagementMetrics pem_inner
+            WHERE pem_inner.PostTrendStatus = 'Viral'
+            UNION
+            SELECT pem_inner.PostId
+            FROM PostEngagementMetrics pem_inner
+            JOIN PostHistorySummary phs_inner ON pem_inner.PostId = phs_inner.PostId
+            JOIN CommentSentimentSummary css_inner ON pem_inner.PostId = css_inner.PostId
+            JOIN UserActivitySummary uas_inner ON pem_inner.OwnerUserId = uas_inner.UserId
+            WHERE phs_inner.EditCount >= 5
+              AND css_inner.TotalComments >= 10
+              AND uas_inner.GoldBadges >= 1
+        ) sq
+        WHERE sq.PostId = pem.PostId
+    ) > 0 AS IsHighlyEngagedOrViral
+FROM PostEngagementMetrics pem
+LEFT JOIN UserActivitySummary uas ON pem.OwnerUserId = uas.UserId
+LEFT JOIN PostHistorySummary phs ON pem.PostId = phs.PostId
+LEFT JOIN LinkedPostAnalysis lpa ON pem.PostId = lpa.PostId
+LEFT JOIN CommentSentimentSummary css ON pem.PostId = css.PostId
+LEFT JOIN TagPerformance tp ON pem.PrimaryTag = tp.PrimaryTag
+WHERE pem.OwnerUserId IS NOT NULL
+  AND pem.PostAgeDays > 30
+  AND pem.Score >= 0
+ORDER BY pem.LastActivityDate DESC, pem.Score DESC, pem.ViewCount DESC
+LIMIT 5000;

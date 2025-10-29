@@ -1,0 +1,157 @@
+-- {"query": "4426.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1456} 
+
+WITH
+  RankedQuestions AS (
+    SELECT
+      p.Id AS PostId,
+      p.Title,
+      p.OwnerUserId,
+      p.CreationDate,
+      p.Score,
+      p.AnswerCount,
+      p.ViewCount,
+      u.DisplayName AS OwnerDisplayName,
+      ROW_NUMBER() OVER (ORDER BY p.ViewCount DESC, p.Score DESC, p.AnswerCount DESC) AS ViewRank,
+      ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.AnswerCount DESC, p.ViewCount DESC) AS ScoreRank,
+      SUM(COALESCE(c.Score, 0)) OVER (PARTITION BY p.Id) AS TotalCommentScore,
+      AVG(CAST(p.ViewCount AS BIGINT)) OVER () AS AvgSiteViewCount,
+      CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed
+    FROM
+      Posts AS p
+      LEFT JOIN Users AS u
+      ON p.OwnerUserId = u.Id
+    WHERE
+      p.PostTypeId = 1 AND p.CreationDate >= '2023-01-01'
+    GROUP BY
+      p.Id,
+      p.Title,
+      p.OwnerUserId,
+      p.CreationDate,
+      p.Score,
+      p.AnswerCount,
+      p.ViewCount,
+      u.DisplayName,
+      p.ClosedDate
+  ),
+  HighEngagementQuestions AS (
+    SELECT
+      rq.*
+    FROM
+      RankedQuestions AS rq
+    WHERE
+      rq.ViewRank <= 100 OR rq.ScoreRank <= 100
+  ),
+  QuestionAnswers AS (
+    SELECT
+      p.ParentId,
+      COUNT(p.Id) AS AnswerCount,
+      SUM(p.Score) AS TotalAnswerScore,
+      AVG(CAST(p.ViewCount AS BIGINT)) AS AvgAnswerViewCount
+    FROM
+      Posts AS p
+    WHERE
+      p.PostTypeId = 2 AND p.ParentId IN (
+        SELECT
+          PostId
+        FROM
+          HighEngagementQuestions
+      )
+    GROUP BY
+      p.ParentId
+  ),
+  UserContribution AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      COUNT(DISTINCT ph.PostId) AS PostHistoryCount,
+      COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (2, 5) THEN ph.PostId END) AS BodyEditCount,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvoteCount,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvoteCount,
+      COUNT(DISTINCT b.Id) AS BadgeCount
+    FROM
+      Users AS u
+      LEFT JOIN PostHistory AS ph
+      ON u.Id = ph.UserId
+      LEFT JOIN Votes AS v
+      ON u.Id = v.UserId
+      LEFT JOIN Badges AS b
+      ON u.Id = b.UserId
+    WHERE
+      u.Id IN (
+        SELECT
+          OwnerUserId
+        FROM
+          HighEngagementQuestions
+      )
+    GROUP BY
+      u.Id,
+      u.DisplayName
+  ),
+  TagPerformance AS (
+    SELECT
+      t.TagName,
+      COUNT(DISTINCT p.Id) AS PostCount,
+      SUM(CAST(p.Score AS BIGINT)) AS TotalScore,
+      AVG(CAST(p.ViewCount AS BIGINT)) AS AvgViewCount,
+      MAX(p.CreationDate) AS LastPostDate
+    FROM
+      Posts AS p
+      JOIN Tags AS t
+      ON ',' || REPLACE(REPLACE(p.Tags, '><', ','), '"', '') || ',' LIKE '%,' || t.TagName || ',%'
+    WHERE
+      p.PostTypeId = 1 AND p.CreationDate >= DATE('now', '-1 year')
+    GROUP BY
+      t.TagName
+  )
+SELECT
+  heq.PostId,
+  heq.Title,
+  heq.OwnerDisplayName,
+  heq.CreationDate,
+  heq.Score,
+  heq.AnswerCount AS QuestionAnswerCount,
+  heq.ViewCount AS QuestionViewCount,
+  COALESCE(qa.AnswerCount, 0) AS TotalAnswers,
+  COALESCE(qa.TotalAnswerScore, 0) AS TotalAnswerScore,
+  heq.TotalCommentScore,
+  heq.ViewRank,
+  heq.ScoreRank,
+  CASE
+    WHEN heq.IsClosed = 1 AND heq.ClosedDate IS NOT NULL THEN STRFTIME('%Y-%m-%d', heq.ClosedDate)
+    WHEN heq.IsClosed = 0 THEN 'Not Closed'
+    ELSE 'Unknown'
+  END AS ClosureStatus,
+  uc.PostHistoryCount,
+  uc.BodyEditCount,
+  uc.UpvoteCount,
+  uc.DownvoteCount,
+  uc.BadgeCount,
+  tp.TagName,
+  tp.PostCount AS TagPostCount,
+  tp.TotalScore AS TagTotalScore,
+  tp.AvgViewCount AS TagAvgViewCount,
+  tp.LastPostDate,
+  'Engagement Ratio: ' || CAST(CAST(heq.Score AS REAL) / NULLIF(heq.ViewCount, 0) AS VARCHAR) AS EngagementRatio,
+  CASE WHEN heq.OwnerUserId IS NULL THEN 'Community' ELSE 'User' END AS OwnerType,
+  UPPER(SUBSTR(heq.Title, 1, 1)) || SUBSTR(heq.Title, 2) AS FormattedTitle
+FROM
+  HighEngagementQuestions AS heq
+LEFT JOIN
+  QuestionAnswers AS qa
+  ON heq.PostId = qa.ParentId
+LEFT JOIN
+  UserContribution AS uc
+  ON heq.OwnerUserId = uc.UserId
+LEFT JOIN
+  TagPerformance AS tp
+  ON tp.TagName IN (
+    SELECT
+      TRIM(value)
+    FROM
+      json_each(REPLACE(REPLACE(heq.Tags, '><', '","'), '"', ''))
+  )
+WHERE
+  heq.Score > 50 OR heq.ViewCount > 10000 OR heq.TotalCommentScore > 200
+ORDER BY
+  heq.ScoreRank,
+  heq.ViewRank;

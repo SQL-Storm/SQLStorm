@@ -1,0 +1,150 @@
+WITH
+RecentActivePosts AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.PostTypeId,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.FavoriteCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.ContentLicense
+  FROM Posts p
+  WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '180' DAY
+),
+TopUsers AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.AccountId,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    ROW_NUMBER() OVER (PARTITION BY u.AccountId ORDER BY u.Reputation DESC, u.LastAccessDate DESC) AS rn
+  FROM Users u
+  WHERE u.AccountId IS NOT NULL
+),
+TagPopularities AS (
+  SELECT
+    tag AS TagName,
+    COUNT(*) AS TagCount
+  FROM RecentActivePosts p,
+       UNNEST(string_to_array(p.Tags, '<>')) AS tag
+  WHERE p.Tags IS NOT NULL
+  GROUP BY tag
+),
+CorrelatedSub AS (
+  SELECT
+    ro.Id AS PostId,
+    ro.Title,
+    ro.OwnerUserId,
+    ro.LastActivityDate,
+    ro.Score,
+    v2.VoteCount
+  FROM Posts ro
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS VoteCount
+    FROM Votes
+    WHERE VoteTypeId IN (2, 3)
+    GROUP BY PostId
+  ) v2 ON v2.PostId = ro.Id
+  WHERE ro.LastActivityDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '90' DAY
+),
+WindowedStats AS (
+  SELECT
+    p.Id,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    ROW_NUMBER() OVER (ORDER BY p.LastActivityDate DESC) AS rn_desc,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate DESC) AS rn_per_user
+  FROM Posts p
+  WHERE p.LastActivityDate IS NOT NULL
+),
+Joined AS (
+  SELECT
+    r.Id AS PostId,
+    r.Title,
+    r.OwnerUserId,
+    r.LastActivityDate,
+    r.Score,
+    COALESCE(v2.VoteCount, 0) AS UpDownVoteCount,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation AS OwnerReputation,
+    tag AS TagName,
+    tp.TagCount
+  FROM RecentActivePosts r
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS VoteCount
+    FROM Votes
+    WHERE VoteTypeId IN (2, 3)
+    GROUP BY PostId
+  ) v2 ON v2.PostId = r.Id
+  LEFT JOIN Users u ON u.Id = r.OwnerUserId
+  LEFT JOIN LATERAL UNNEST(string_to_array(r.Tags, '<>')) AS tag ON TRUE
+  LEFT JOIN (
+    SELECT tag AS TagName, COUNT(*) AS TagCount
+    FROM Posts p2, UNNEST(string_to_array(p2.Tags, '<>')) AS tag
+    WHERE p2.Tags IS NOT NULL
+    GROUP BY tag
+  ) tp ON tp.TagName = tag
+)
+SELECT
+  p.Id AS post_id,
+  p.Title AS post_title,
+  p.OwnerUserId AS owner_id,
+  o.DisplayName AS owner_display_name,
+  o.Reputation AS owner_reputation,
+  p.LastActivityDate AS last_activity,
+  p.Score AS score,
+  p.ViewCount AS view_count,
+  p.AnswerCount AS answer_count,
+  p.CommentCount AS comment_count,
+  p.Tags AS tags_raw,
+  ARRAY_AGG(DISTINCT tl.tag) AS top_tags,
+  SUM(tp.TagCount) OVER () AS total_tag_popularity,
+  v.VoteCount AS total_votes_on_post
+FROM (
+  SELECT
+    r.Id,
+    r.Title,
+    r.OwnerUserId,
+    r.LastActivityDate,
+    r.Score,
+    r.ViewCount,
+    r.AnswerCount,
+    r.CommentCount,
+    r.Tags
+  FROM RecentActivePosts r
+) p
+LEFT JOIN (
+  SELECT PostId, COUNT(*) AS VoteCount
+  FROM Votes
+  WHERE VoteTypeId IN (2, 3)
+  GROUP BY PostId
+) v ON v.PostId = p.Id
+LEFT JOIN Users o ON o.Id = p.OwnerUserId
+LEFT JOIN LATERAL UNNEST(string_to_array(COALESCE(p.Tags, ''), '<>')) AS tl(tag) ON TRUE
+LEFT JOIN (
+  SELECT tag AS TagName, COUNT(*) AS TagCount
+  FROM Posts p2, UNNEST(string_to_array(COALESCE(p2.Tags, ''), '<>')) AS tag
+  WHERE p2.Tags <> '' AND p2.Tags IS NOT NULL
+  GROUP BY tag
+) tp ON tp.TagName = tl.tag
+GROUP BY
+  p.Id, p.Title, p.OwnerUserId, o.DisplayName, o.Reputation, p.LastActivityDate,
+  p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.Tags, v.VoteCount
+ORDER BY p.LastActivityDate DESC
+LIMIT 100;

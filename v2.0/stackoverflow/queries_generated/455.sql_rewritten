@@ -1,0 +1,286 @@
+-- {"query": "455.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2948} 
+with
+recent_users as (
+  select u.Id as UserId, u.DisplayName, u.Reputation, u.CreationDate,
+         date_trunc('month', u.CreationDate) as SignupMonth,
+         coalesce(nullif(trim(split_part(coalesce(u.Location,''), ',', 1)), ''), 'Unknown') as RegionHint
+  from Users u
+  where u.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+),
+question_posts as (
+  select p.Id, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Title, p.Tags, p.AnswerCount,
+         p.AcceptedAnswerId, p.ClosedDate
+  from Posts p
+  where p.PostTypeId = 1
+),
+answer_posts as (
+  select a.Id, a.ParentId, a.OwnerUserId, a.Score, a.CreationDate
+  from Posts a
+  where a.PostTypeId = 2
+),
+engagement as (
+  select c.PostId,
+         count(*) filter (where c.Score > 0) as PosComments,
+         count(*) filter (where c.Score <= 0 or c.Score is null) as NonPosComments,
+         max(c.CreationDate) as LastCommentDate
+  from Comments c
+  group by c.PostId
+),
+post_votes as (
+  select v.PostId,
+         count(*) filter (where v.VoteTypeId = 2) as UpVotes,
+         count(*) filter (where v.VoteTypeId = 3) as DownVotes,
+         count(*) filter (where v.VoteTypeId = 5) as Favorites,
+         count(*) filter (where v.VoteTypeId in (8,9)) as BountyEvents,
+         sum(case when v.VoteTypeId in (8,9) then coalesce(v.BountyAmount,0) else 0 end) as BountyAmount
+  from Votes v
+  group by v.PostId
+),
+dupe_links as (
+  select pl.PostId, count(*) as DupeCount
+  from PostLinks pl
+  where pl.LinkTypeId = 3
+  group by pl.PostId
+),
+tag_expansion as (
+  select q.Id as PostId,
+         unnest(string_to_array(substring(coalesce(q.Tags,''), 2, greatest(length(coalesce(q.Tags,'')) - 2, 0)), '><')) as tagname
+  from question_posts q
+),
+top_tags as (
+  select te.PostId,
+         string_agg(te.tagname, ',' order by te.tagname) as TagList,
+         count(*) as TagCount
+  from tag_expansion te
+  group by te.PostId
+),
+accepted_answer_age as (
+  select q.Id as QuestionId,
+         case when q.AcceptedAnswerId is null then null
+              else (select a.CreationDate from Posts a where a.Id = q.AcceptedAnswerId)
+         end as AcceptedAnswerDate,
+         q.CreationDate as QuestionDate
+  from question_posts q
+),
+edit_events as (
+  select ph.PostId,
+         min(ph.CreationDate) filter (where ph.PostHistoryTypeId in (4,5,6)) as FirstEditDate,
+         count(*) filter (where ph.PostHistoryTypeId in (4,5,6,24)) as EditCount,
+         count(*) filter (where ph.PostHistoryTypeId = 10) as CloseVotesEvents
+  from PostHistory ph
+  group by ph.PostId
+),
+user_badges as (
+  select b.UserId,
+         count(*) as TotalBadges,
+         count(*) filter (where b.Class = 1) as GoldBadges,
+         count(*) filter (where b.Class = 2) as SilverBadges,
+         count(*) filter (where b.Class = 3) as BronzeBadges,
+         count(*) filter (where b.TagBased = 1) as TagBadges
+  from Badges b
+  group by b.UserId
+),
+activity_window as (
+  select q.Id as PostId,
+         q.OwnerUserId,
+         q.CreationDate,
+         q.Score,
+         q.ViewCount,
+         coalesce(pv.UpVotes,0) as UpVotes,
+         coalesce(pv.DownVotes,0) as DownVotes,
+         coalesce(pv.Favorites,0) as Favorites,
+         coalesce(pv.BountyEvents,0) as BountyEvents,
+         coalesce(pv.BountyAmount,0) as BountyAmount,
+         coalesce(e.PosComments,0) as PosComments,
+         coalesce(e.NonPosComments,0) as NonPosComments,
+         e.LastCommentDate,
+         coalesce(d.DupeCount,0) as DupeCount,
+         tt.TagList,
+         tt.TagCount,
+         ed.FirstEditDate,
+         ed.EditCount,
+         ed.CloseVotesEvents,
+         q.AnswerCount,
+         q.AcceptedAnswerId,
+         q.ClosedDate
+  from question_posts q
+  left join post_votes pv on pv.PostId = q.Id
+  left join engagement e on e.PostId = q.Id
+  left join dupe_links d on d.PostId = q.Id
+  left join top_tags tt on tt.PostId = q.Id
+  left join edit_events ed on ed.PostId = q.Id
+),
+owner_enriched as (
+  select aw.*,
+         ru.DisplayName as OwnerName,
+         ru.Reputation as OwnerRep,
+         ru.SignupMonth,
+         ub.TotalBadges,
+         ub.GoldBadges,
+         ub.SilverBadges,
+         ub.BronzeBadges,
+         ub.TagBadges,
+         ru.RegionHint
+  from activity_window aw
+  left join recent_users ru on ru.UserId = aw.OwnerUserId
+  left join user_badges ub on ub.UserId = aw.OwnerUserId
+),
+calc as (
+  select
+    oe.*,
+    case
+      when oe.ViewCount is null or oe.ViewCount = 0 then null
+      else (oe.UpVotes - oe.DownVotes)::numeric / nullif(oe.ViewCount,0)
+    end as VoteViewRatio,
+    case
+      when oe.AnswerCount is null or oe.AnswerCount = 0 then 0
+      else oe.Favorites::numeric / oe.AnswerCount
+    end as FavPerAnswer,
+    coalesce(oe.UpVotes - oe.DownVotes, 0) + (coalesce(oe.Favorites,0) * 0.5) + (coalesce(oe.BountyAmount,0) / 100.0) as WeightedScore,
+    case
+      when oe.TagCount is null then 'none'
+      when oe.TagCount = 0 then 'none'
+      when oe.TagCount between 1 and 2 then 'narrow'
+      when oe.TagCount between 3 and 5 then 'medium'
+      else 'broad'
+    end as TagBreadth,
+    case when oe.ClosedDate is not null then 1 else 0 end as IsClosed,
+    case when oe.AcceptedAnswerId is not null then 1 else 0 end as HasAccepted,
+    extract(epoch from (coalesce(oe.LastCommentDate, oe.CreationDate) - oe.CreationDate)) / 3600.0 as HoursToLastComment
+  from owner_enriched oe
+),
+ranks as (
+  select
+    c.*,
+    row_number() over (partition by date_trunc('month', c.CreationDate) order by c.WeightedScore desc nulls last) as RankInMonth,
+    dense_rank() over (order by c.WeightedScore desc nulls last) as GlobalDenseRank,
+    percent_rank() over (order by c.WeightedScore) as GlobalPercentile,
+    ntile(20) over (order by coalesce(c.VoteViewRatio, -1)) as VoteViewVigintile
+  from calc c
+),
+accept_latency as (
+  select
+    aa.QuestionId,
+    aa.AcceptedAnswerDate,
+    aa.QuestionDate,
+    extract(epoch from (aa.AcceptedAnswerDate - aa.QuestionDate)) / 3600.0 as HoursToAccept
+  from accepted_answer_age aa
+),
+final_scored as (
+  select
+    r.*,
+    al.HoursToAccept,
+    case
+      when r.IsClosed = 1 then r.WeightedScore - 5
+      when coalesce(al.HoursToAccept, 999999) < 24 then r.WeightedScore + 2
+      when coalesce(al.HoursToAccept, 999999) between 24 and 168 then r.WeightedScore + 1
+      else r.WeightedScore
+    end as AdjustedScore
+  from ranks r
+  left join accept_latency al on al.QuestionId = r.Id
+),
+flagged as (
+  select
+    fs.*,
+    case
+      when fs.DupeCount > 0 and fs.IsClosed = 1 then 'duplicate-closed'
+      when fs.DupeCount > 0 then 'duplicate-open'
+      when fs.IsClosed = 1 then 'closed'
+      when fs.HasAccepted = 1 then 'accepted'
+      else 'open'
+    end as StatusLabel
+  from final_scored fs
+),
+monthly_summary as (
+  select
+    date_trunc('month', f.CreationDate) as Month,
+    count(*) as Questions,
+    avg(f.AdjustedScore) as AvgAdjScore,
+    sum(case when f.StatusLabel like 'duplicate-%' then 1 else 0 end) as Duplicates,
+    avg(nullif(f.HoursToAccept,0)) as AvgHoursToAccept,
+    percentile_cont(0.95) within group (order by coalesce(f.WeightedScore,0)) as P95WeightedScore
+  from flagged f
+  group by 1
+),
+top_per_month as (
+  select *
+  from (
+    select f.*,
+           row_number() over (partition by date_trunc('month', f.CreationDate) order by f.AdjustedScore desc nulls last, f.ViewCount desc nulls last) as rn
+    from flagged f
+  ) z
+  where z.rn <= 3
+),
+rare_regions as (
+  select RegionHint
+  from recent_users
+  group by RegionHint
+  having count(*) < 50
+),
+cross_tag_compare as (
+  select
+    t1.PostId,
+    t1.tagname as TagA,
+    t2.tagname as TagB
+  from tag_expansion t1
+  join tag_expansion t2
+    on t1.PostId = t2.PostId and t1.tagname < t2.tagname
+),
+tag_pair_popularity as (
+  select TagA, TagB, count(*) as PairCount
+  from cross_tag_compare
+  group by TagA, TagB
+  having count(*) >= 10
+)
+select
+  f.Id as QuestionId,
+  coalesce(f.Title, '(no title)') as Title,
+  f.CreationDate,
+  f.OwnerName,
+  f.OwnerRep,
+  f.RegionHint,
+  case when rr.RegionHint is not null then 1 else 0 end as IsRareRegionOwner,
+  f.TagList,
+  f.TagBreadth,
+  f.UpVotes, f.DownVotes, f.Favorites, f.BountyAmount,
+  f.PosComments, f.NonPosComments,
+  f.ViewCount, f.AnswerCount,
+  round(coalesce(f.VoteViewRatio, -1)::numeric, 6) as VoteViewRatio,
+  round(coalesce(f.FavPerAnswer, 0)::numeric, 6) as FavPerAnswer,
+  round(coalesce(f.HoursToLastComment, 0)::numeric, 2) as HoursToLastComment,
+  round(coalesce(f.HoursToAccept, 0)::numeric, 2) as HoursToAccept,
+  round(coalesce(f.WeightedScore, 0)::numeric, 3) as WeightedScore,
+  round(coalesce(f.AdjustedScore, 0)::numeric, 3) as AdjustedScore,
+  f.StatusLabel,
+  f.RankInMonth,
+  f.GlobalDenseRank,
+  round(f.GlobalPercentile::numeric, 6) as GlobalPercentile,
+  f.VoteViewVigintile,
+  ms.Questions as MonthQuestions,
+  ms.AvgAdjScore as MonthAvgAdjScore,
+  ms.Duplicates as MonthDuplicates,
+  ms.AvgHoursToAccept as MonthAvgHoursToAccept,
+  ms.P95WeightedScore as MonthP95WeightedScore,
+  coalesce(tp.TagA || '+' || tp.TagB, 'n/a') as FrequentTagPair
+from flagged f
+left join monthly_summary ms on ms.Month = date_trunc('month', f.CreationDate)
+left join rare_regions rr on rr.RegionHint = f.RegionHint
+left join lateral (
+  select tpp.TagA, tpp.TagB
+  from tag_pair_popularity tpp
+  join tag_expansion te on te.PostId = f.Id and te.tagname in (tpp.TagA, tpp.TagB)
+  group by tpp.TagA, tpp.TagB
+  having count(distinct te.tagname) = 2
+  order by tpp.PairCount desc
+  limit 1
+) tp on true
+where f.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+  and coalesce(f.OwnerRep, 0) >= 100
+  and (
+    f.TagBreadth in ('narrow','medium')
+    or (f.TagBreadth = 'broad' and f.UpVotes - f.DownVotes >= 5)
+  )
+  and not (f.TagList ilike '%regex%' and f.TagList ilike '%javascript%')
+  and (f.DupeCount = 0 or f.StatusLabel not like 'duplicate-%')
+order by f.AdjustedScore desc nulls last, f.ViewCount desc nulls last
+limit 250;

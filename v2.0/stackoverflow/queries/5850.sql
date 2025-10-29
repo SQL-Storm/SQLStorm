@@ -1,0 +1,72 @@
+WITH TopActiveUsers AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(p.Id) AS PostCount,
+    SUM(p.Score) AS ScoreSum,
+    MIN(p.CreationDate) AS FirstPostDate,
+    MAX(p.LastActivityDate) AS LastActivity
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  WHERE u.Reputation > 1000
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TagHotness AS (
+  SELECT
+    t.TagName,
+    AVG(v.BountyAmount) FILTER (WHERE v.BountyAmount IS NOT NULL) AS AvgBounty,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesOnPosts,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesOnPosts
+  FROM Tags tg
+  JOIN Posts p ON p.Id = tg.ExcerptPostId
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  CROSS JOIN LATERAL (
+    SELECT TRIM(value) AS TagName
+    FROM UNNEST(STRING_TO_ARRAY(SUBSTRING(tg.TagName FROM 1 FOR 100), ',')) AS t(value)
+  ) AS t
+  GROUP BY t.TagName
+),
+RecentActivity AS (
+  SELECT
+    p.Id AS PostId,
+    p.OwnerUserId,
+    p.Title,
+    p.PostTypeId,
+    p.ViewCount,
+    p.Score,
+    p.CreationDate,
+    p.LastActivityDate,
+    ROW_NUMBER() OVER (
+      PARTITION BY p.OwnerUserId
+      ORDER BY p.LastActivityDate DESC
+    ) AS rn
+  FROM Posts p
+  WHERE p.LastActivityDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30' DAY)
+)
+SELECT
+  tua.UserId,
+  tua.DisplayName,
+  tua.Reputation,
+  tua.PostCount,
+  tua.ScoreSum,
+  ta.TagName,
+  ta.AvgBounty,
+  ta.UpvotesOnPosts,
+  ta.DownvotesOnPosts,
+  ra.PostId,
+  ra.Title,
+  ra.PostTypeId,
+  ra.ViewCount,
+  ra.Score AS PostScore,
+  ra.CreationDate,
+  ra.LastActivityDate
+FROM TopActiveUsers tua
+LEFT JOIN TagHotness ta ON ta.TagName IS NOT NULL
+LEFT JOIN (
+  SELECT *
+  FROM RecentActivity
+  WHERE rn = 1
+) ra ON ra.OwnerUserId = tua.UserId
+ORDER BY tua.Reputation DESC, tua.PostCount DESC, ra.LastActivityDate DESC
+LIMIT 100;

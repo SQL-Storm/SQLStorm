@@ -1,0 +1,200 @@
+-- {"query": "7666.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2220} 
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        MAX(b.Date) as LastBadgeDate,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) as QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) as AnswerCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+RankedUsers AS (
+    SELECT 
+        *,
+        ROW_NUMBER() OVER (ORDER BY TotalScore DESC, Reputation DESC) as RankByScore,
+        DENSE_RANK() OVER (ORDER BY BadgeCount DESC) as RankByBadges,
+        NTILE(100) OVER (ORDER BY Views DESC) as PercentileByViews
+    FROM UserStats
+),
+TopAnswers AS (
+    SELECT 
+        p.Id as AnswerId,
+        p.ParentId,
+        p.OwnerUserId,
+        p.Score,
+        p.CreationDate,
+        p.Body,
+        p.Title,
+        COALESCE(LENGTH(p.Body) - LENGTH(REPLACE(LOWER(p.Body), 'sql', '')), 0) as SqlOccurrences,
+        DATEDIFF('DAY', p.CreationDate, NOW()) as AgeInDays
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+    AND p.Score > 10
+    AND p.OwnerUserId IS NOT NULL
+),
+QuestionAnalysis AS (
+    SELECT 
+        q.Id as QuestionId,
+        q.Title,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.CommentCount,
+        q.CreationDate,
+        q.OwnerUserId,
+        q.Tags,
+        COALESCE(q.AnswerCount, 0) as AnswerCount,
+        COALESCE(q.CommentCount, 0) as CommentCount,
+        CASE 
+            WHEN q.AnswerCount > 0 AND q.Score > 5 THEN 'Active'
+            WHEN q.AnswerCount = 0 AND q.Score < 0 THEN 'Inactive'
+            WHEN q.AnswerCount > 0 AND q.Score < 0 THEN 'AnsweredButLowScore'
+            ELSE 'Neutral'
+        END as QuestionStatus,
+        COALESCE(LENGTH(q.Tags) - LENGTH(REPLACE(q.Tags, '>', '')), 0) as TagCount,
+        DATEDIFF('DAY', q.CreationDate, NOW()) as AgeInDays
+    FROM Posts q
+    WHERE q.PostTypeId = 1
+    AND q.CreationDate > '2020-01-01'
+),
+ComplexTagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        COALESCE((SELECT COUNT(*) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%'), 0) as PostsWithTag,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            WHEN t.Count > 10 THEN 'Niche'
+            ELSE 'Rare'
+        END as TagPopularity,
+        COALESCE((SELECT AVG(p.Score) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%'), 0) as AvgScore,
+        COALESCE((SELECT AVG(p.ViewCount) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%'), 0) as AvgViews,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as PopularityRank
+    FROM Tags t
+),
+UserActivityPatterns AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        COUNT(DISTINCT CASE WHEN p.CreationDate > NOW() - INTERVAL '30 DAY' THEN p.Id END) as RecentPosts,
+        COUNT(DISTINCT CASE WHEN c.CreationDate > NOW() - INTERVAL '30 DAY' THEN c.Id END) as RecentComments,
+        COUNT(DISTINCT CASE WHEN b.Date > NOW() - INTERVAL '30 DAY' THEN b.Id END) as RecentBadges,
+        MIN(CASE WHEN p.CreationDate IS NOT NULL THEN p.CreationDate END) as FirstPostDate,
+        MAX(CASE WHEN p.CreationDate IS NOT NULL THEN p.CreationDate END) as LastPostDate,
+        DATEDIFF('YEAR', MIN(CASE WHEN p.CreationDate IS NOT NULL THEN p.CreationDate END), NOW()) as YearsActive,
+        COALESCE((SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1), 0) as QuestionsAsked,
+        COALESCE((SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2), 0) as AnswersGiven,
+        COALESCE((SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1), 0) as AvgQuestionScore,
+        COALESCE((SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2), 0) as AvgAnswerScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 500
+    GROUP BY u.Id, u.DisplayName
+)
+SELECT 
+    ru.UserId,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.TotalScore,
+    ru.PostCount,
+    ru.QuestionCount,
+    ru.AnswerCount,
+    ru.BadgeCount,
+    ru.RankByScore,
+    ru.RankByBadges,
+    ru.PercentileByViews,
+    CASE 
+        WHEN ru.RankByScore <= 100 THEN 'Top 100 Score'
+        WHEN ru.RankByBadges <= 100 THEN 'Top 100 Badges'
+        ELSE 'Standard'
+    END as UserTier,
+    COALESCE((SELECT STRING_AGG(DISTINCT ta.TagName, ', ') 
+              FROM Posts p 
+              JOIN (
+                  SELECT TRIM(BOTH '<>' FROM UNNEST(STRING_TO_ARRAY(p.Tags, '><'))) as TagName
+                  FROM Posts p 
+                  WHERE p.OwnerUserId = ru.UserId AND p.PostTypeId = 1 AND p.Tags IS NOT NULL
+              ) ta 
+              ON ta.TagName IN ('sql', 'database', 'postgresql', 'mysql', 'oracle')
+              WHERE p.OwnerUserId = ru.UserId), 'No relevant tags') as RelevantTagList,
+    COALESCE((
+        SELECT AVG(CASE WHEN Score > 0 THEN UpVotes ELSE 0 END) 
+        FROM Posts p 
+        WHERE p.OwnerUserId = ru.UserId AND p.PostTypeId = 1
+    ), 0) as AvgUpVotes,
+    (SELECT COUNT(*) 
+     FROM PostLinks pl 
+     JOIN Posts p ON pl.PostId = p.Id 
+     WHERE pl.RelatedPostId IN (SELECT Id FROM Posts WHERE OwnerUserId = ru.UserId) 
+     AND pl.LinkTypeId = 3) as DuplicateLinks,
+    CASE 
+        WHEN (ru.QuestionCount * 1.0 / NULLIF(ru.PostCount, 0)) > 0.5 THEN 'Question Focused'
+        WHEN (ru.AnswerCount * 1.0 / NULLIF(ru.PostCount, 0)) > 0.7 THEN 'Answer Focused'
+        ELSE 'Balanced'
+    END as ContributionStyle,
+    COALESCE((SELECT MIN(AgeInDays) FROM TopAnswers WHERE OwnerUserId = ru.UserId), 0) as MinAnswerAge,
+    COALESCE((SELECT MAX(AgeInDays) FROM TopAnswers WHERE OwnerUserId = ru.UserId), 0) as MaxAnswerAge,
+    (
+        SELECT COUNT(*) 
+        FROM PostHistory ph 
+        JOIN Posts p ON ph.PostId = p.Id 
+        WHERE ph.UserId = ru.UserId AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)
+    ) as EditHistoryTransactions,
+    COALESCE((
+        SELECT STRING_AGG(DISTINCT p.Title, ': ')
+        FROM Posts p 
+        WHERE p.OwnerUserId = ru.UserId AND p.PostTypeId = 1
+        AND p.CreationDate > NOW() - INTERVAL '6 MONTH'
+        ORDER BY p.CreationDate DESC
+        LIMIT 5
+    ), 'No recent questions') as RecentQuestions,
+    COALESCE((
+        SELECT STRING_AGG(DISTINCT p.Title || ' (' || p.Score || ')', ' | ')
+        FROM Posts p 
+        JOIN (
+            SELECT ParentId, MAX(CreationDate) as LatestAnswerDate
+            FROM Posts
+            WHERE PostTypeId = 2
+            GROUP BY ParentId
+        ) latest ON p.Id = latest.ParentId
+        WHERE p.OwnerUserId = ru.UserId AND p.PostTypeId = 2
+        AND p.CreationDate >= latest.LatestAnswerDate - INTERVAL '10 DAY'
+        ORDER BY p.CreationDate DESC
+        LIMIT 3
+    ), 'No recent activity') as RecentAnswersSummary,
+    CASE 
+        WHEN ru.BadgeCount > 100 THEN 'Veteran'
+        WHEN ru.BadgeCount > 50 THEN 'Experienced'
+        WHEN ru.BadgeCount > 10 THEN 'Intermediate'
+        ELSE 'New'
+    END as BadgeLevel,
+    CASE 
+        WHEN ru.Reputation > 100000 THEN 'Expert'
+        WHEN ru.Reputation > 50000 THEN 'Advanced'
+        WHEN ru.Reputation > 10000 THEN 'Intermediate'
+        ELSE 'Beginner'
+    END as ReputationLevel
+FROM RankedUsers ru
+WHERE ru.PercentileByViews > 50
+ORDER BY ru.RankByScore, ru.Reputation DESC
+LIMIT 100;

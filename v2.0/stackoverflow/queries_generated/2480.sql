@@ -1,0 +1,148 @@
+-- {"query": "2480.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1321} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        0 as Level,
+        array[t.Id] as Path
+    from Tags t
+    where t.IsModeratorOnly = 0
+    union all
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        r.Level + 1,
+        r.Path || t2.Id
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.Id <> all(r.Path)
+    where t2.Count > 5 and r.Level < 3
+)
+, UserBadgeSummary AS (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter(where b.Class = 1) as GoldBadges,
+        count(b.Id) filter(where b.Class = 2) as SilverBadges,
+        count(b.Id) filter(where b.Class = 3) as BronzeBadges,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+)
+, PostScores AS (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        coalesce(p.AnswerCount, 0) as AnswerCount,
+        p.Tags,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.CreationDate) as UserPostRank,
+        case when p.PostTypeId = 1 then 1 else 0 end as IsQuestion,
+        case when p.PostTypeId = 2 then 1 else 0 end as IsAnswer
+    from Posts p
+    where p.Score is not null and p.CreationDate > '2015-01-01'
+)
+, AnswerWithParent AS (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId,
+        a.Score as AnswerScore,
+        q.Score as QuestionScore,
+        q.Tags,
+        q.CreationDate as QuestionCreated,
+        a.CreationDate as AnswerCreated
+    from Posts a
+    inner join Posts q on a.ParentId = q.Id and q.PostTypeId = 1
+    where a.PostTypeId = 2 and a.Score > 0
+)
+, CloseReasonAggregated AS (
+    select
+        pht.PostId,
+        crt.Name as CloseReasonName,
+        count(*) as CloseCount
+    from PostHistory pht
+    join PostHistoryTypes phtt on pht.PostHistoryTypeId = phtt.Id
+    join CloseReasonTypes crt on crt.Id::text = pht.Comment
+    where phtt.Name = 'Post Closed' and crt.Id is not null
+    group by pht.PostId, crt.Name
+)
+select distinct
+    us.UserId,
+    us.DisplayName,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    ps.Id as PostId,
+    ps.PostTypeId,
+    ps.Score as PostScore,
+    ps.ViewCount,
+    answ.AnswerId,
+    answ.AnswerScore,
+    answ.QuestionId,
+    answ.QuestionScore,
+    answ.Tags as QuestionTags,
+    cr.CloseReasonName,
+    cr.CloseCount,
+    date_part('year', age(current_date, us.LastBadgeDate)) as YearsSinceLastBadge,
+    case 
+        when ps.Score > 100 then 'High Score'
+        when ps.Score between 20 and 100 then 'Medium Score'
+        else 'Low Score'
+    end as ScoreCategory,
+    concat(
+        left(coalesce(ps.Tags, ''),
+            greatest(0, position('>' in coalesce(ps.Tags, '') || '<') - 2)
+    ), '_', us.UserId::text) as SampleTagString,
+    row_number() over (partition by us.UserId order by ps.Score desc) as PostsRankByScore,
+    lag(ps.Score) over (partition by us.UserId order by ps.CreationDate) as PreviousPostScore,
+    lead(ps.Score) over (partition by us.UserId order by ps.CreationDate) as NextPostScore,
+    (select count(*) from Comments c 
+        where c.PostId = ps.Id and (c.UserId = us.UserId or c.UserId is null)
+          and length(c.Text) > 50
+    ) as LongCommentsByUserOnPost,
+    (select max(pht.CreationDate) from PostHistory pht where pht.PostId = ps.Id and pht.UserId = us.UserId) as LastUserEditOnPost
+from UserBadgeSummary us
+left join PostScores ps on ps.OwnerUserId = us.UserId
+left join AnswerWithParent answ on answ.AnswerId = ps.Id
+left join CloseReasonAggregated cr on cr.PostId = ps.Id
+where (us.GoldBadges > 0 or us.SilverBadges > 1)
+  and (
+    ps.Tags ilike '%<sql>%'
+    or (answ.Tags ilike any (array['%<database>%', '%<performance>%']))
+  )
+union
+select 
+    u.Id as UserId,
+    u.DisplayName,
+    0 as GoldBadges, 0 as SilverBadges, 0 as BronzeBadges,
+    null as PostId,
+    null as PostTypeId,
+    null as PostScore,
+    null as ViewCount,
+    null as AnswerId,
+    null as AnswerScore,
+    null as QuestionId,
+    null as QuestionScore,
+    null as QuestionTags,
+    null as CloseReasonName,
+    null as CloseCount,
+    null as YearsSinceLastBadge,
+    'User without badges' as ScoreCategory,
+    null as SampleTagString,
+    null as PostsRankByScore,
+    null as PreviousPostScore,
+    null as NextPostScore,
+    null as LongCommentsByUserOnPost,
+    null as LastUserEditOnPost
+from Users u
+where not exists (
+    select 1 from Badges b where b.UserId = u.Id
+)
+order by 1, 7 desc nulls last
+limit 100;

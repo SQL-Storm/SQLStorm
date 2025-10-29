@@ -1,0 +1,141 @@
+WITH
+user_badges AS (
+    SELECT u.id                                          AS user_id,
+           COALESCE(SUM(CASE WHEN b.class = 1 THEN 1 END),0) AS gold_badges,
+           COALESCE(SUM(CASE WHEN b.class = 2 THEN 1 END),0) AS silver_badges,
+           COALESCE(SUM(CASE WHEN b.class = 3 THEN 1 END),0) AS bronze_badges,
+           MAX(b.date)                                   AS last_badge_date
+    FROM   users u
+    LEFT   JOIN badges b ON b.userid = u.id
+    GROUP  BY u.id
+),
+user_posts AS (
+    SELECT p.owneruserid                                   AS user_id,
+           COUNT(*) FILTER (WHERE p.posttypeid = 1)       AS ques_cnt,
+           COUNT(*) FILTER (WHERE p.posttypeid = 2)       AS ans_cnt,
+           AVG(p.score)                                   AS avg_score,
+           MAX(p.creationdate)                            AS last_post_dt
+    FROM   posts p
+    GROUP  BY p.owneruserid
+),
+user_votes AS (
+    SELECT v.userid                                         AS user_id,
+           COUNT(*) FILTER (WHERE vt.name = 'UpMod')       AS up_votes,
+           COUNT(*) FILTER (WHERE vt.name = 'DownMod')     AS down_votes,
+           COUNT(*) FILTER (WHERE vt.name = 'Favorite')    AS fav_votes
+    FROM   votes v
+    JOIN   votetypes vt ON vt.id = v.votetypeid
+    GROUP  BY v.userid
+),
+recent_commenters AS (
+    SELECT DISTINCT c.userid AS user_id
+    FROM   comments c
+    WHERE  c.creationdate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days')
+),
+tag_usage AS (
+    SELECT t.tagname,
+           COUNT(p.id)                                     AS ques_used,
+           SUM(p.viewcount)                                AS total_views,
+           MAX(p.creationdate)                             AS latest_q_dt
+    FROM   tags t
+    JOIN   posts p ON p.tags LIKE '%' || t.tagname || '%'
+    WHERE  p.posttypeid = 1
+    GROUP  BY t.tagname
+),
+user_tag_affinity AS (
+    SELECT p.owneruserid                                   AS user_id,
+           t.tagname,
+           COUNT(*)                                        AS tag_q_cnt,
+           ROW_NUMBER() OVER (PARTITION BY p.owneruserid
+                              ORDER BY COUNT(*) DESC)    AS rn
+    FROM   posts p
+    JOIN   tags t ON p.tags LIKE '%' || t.tagname || '%'
+    WHERE  p.posttypeid = 1
+    GROUP  BY p.owneruserid, t.tagname
+    HAVING COUNT(*) >= 5
+),
+top_user_tags AS (
+    SELECT user_id,
+           STRING_AGG(tagname, ', ') FILTER (WHERE rn <= 3) AS top_3_tags
+    FROM   user_tag_affinity
+    GROUP  BY user_id
+),
+main_users AS (
+    SELECT
+        u.id                                            AS user_id,
+        u.displayname,
+        ub.gold_badges,
+        ub.silver_badges,
+        ub.bronze_badges,
+        ub.last_badge_date,
+        up.ques_cnt,
+        up.ans_cnt,
+        ROUND(COALESCE(up.avg_score,0)::double precision::numeric,2)      AS avg_post_score,
+        up.last_post_dt,
+        uv.up_votes,
+        uv.down_votes,
+        uv.fav_votes,
+        CASE WHEN rc.user_id IS NOT NULL THEN 1 ELSE 0 END AS commented_last_30d,
+        tu.top_3_tags,
+        u.reputation
+    FROM   users u
+    LEFT   JOIN user_badges ub   ON ub.user_id   = u.id
+    LEFT   JOIN user_posts up    ON up.user_id   = u.id
+    LEFT   JOIN user_votes uv    ON uv.user_id   = u.id
+    LEFT   JOIN recent_commenters rc ON rc.user_id = u.id
+    LEFT   JOIN top_user_tags tu ON tu.user_id   = u.id
+    WHERE  u.reputation > 1000
+    GROUP BY
+        u.id, u.displayname,
+        ub.gold_badges, ub.silver_badges, ub.bronze_badges, ub.last_badge_date,
+        up.ques_cnt, up.ans_cnt, up.avg_score, up.last_post_dt,
+        uv.up_votes, uv.down_votes, uv.fav_votes,
+        rc.user_id, tu.top_3_tags, u.reputation
+    ORDER  BY ub.gold_badges DESC,
+              ub.silver_badges DESC,
+              u.reputation DESC
+    LIMIT  100
+)
+
+SELECT
+    user_id,
+    displayname,
+    gold_badges,
+    silver_badges,
+    bronze_badges,
+    last_badge_date,
+    ques_cnt,
+    ans_cnt,
+    avg_post_score,
+    last_post_dt,
+    up_votes,
+    down_votes,
+    fav_votes,
+    commented_last_30d,
+    top_3_tags
+FROM main_users
+
+UNION ALL
+
+SELECT
+    NULL                                            AS user_id,
+    '--- Tag Summary ---'                           AS displayname,
+    NULL AS gold_badges,
+    NULL AS silver_badges,
+    NULL AS bronze_badges,
+    NULL AS last_badge_date,
+    NULL AS ques_cnt,
+    NULL AS ans_cnt,
+    NULL AS avg_post_score,
+    NULL AS last_post_dt,
+    NULL AS up_votes,
+    NULL AS down_votes,
+    NULL AS fav_votes,
+    NULL AS commented_last_30d,
+    STRING_AGG(t.tagname || ':' || CAST(t.ques_used AS text), '; ')   AS top_3_tags
+FROM   (
+        SELECT tagname, ques_used
+        FROM   tag_usage
+        ORDER  BY ques_used DESC
+        LIMIT  10
+       ) t;

@@ -1,0 +1,118 @@
+-- {"query": "3237.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2307} 
+
+WITH UserBadgeStats AS (
+    SELECT u.Id                                 AS UserId,
+           u.DisplayName,
+           u.Reputation,
+           COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+           COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+           COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+           SUM(CASE WHEN b.TagBased = 1 THEN 1 ELSE 0 END) AS TagBadges
+    FROM   Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+RecentQuestionPosts AS (
+    SELECT p.Id,
+           p.Title,
+           p.CreationDate,
+           p.Score,
+           p.OwnerUserId,
+           p.Tags,
+           p.ViewCount,
+           p.FavoriteCount,
+           p.AnswerCount,
+           ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+    FROM   Posts p
+    WHERE  p.PostTypeId = 1                         -- Question
+      AND  p.CreationDate >= CURRENT_DATE - INTERVAL '30 days'
+),
+
+TagPopularity AS (
+    SELECT
+        UNNEST(string_to_array(trim(both '<>' FROM t.Tags), '><')) AS Tag,
+        COUNT(*)                                          AS QuestionCount,
+        AVG(p.Score)                                      AS AvgScore,
+        SUM(p.ViewCount)                                  AS TotalViews
+    FROM   RecentQuestionPosts p
+    CROSS  JOIN LATERAL (SELECT p.Tags) t
+    GROUP  BY UNNEST(string_to_array(trim(both '<>' FROM t.Tags), '><'))
+),
+
+LatestCommentPerPost AS (
+    SELECT c.PostId,
+           c.Id      AS CommentId,
+           c.Text,
+           c.CreationDate,
+           ROW_NUMBER() OVER (PARTITION BY c.PostId ORDER BY c.CreationDate DESC) AS rn
+    FROM   Comments c
+),
+
+PostVoteAggregates AS (
+    SELECT v.PostId,
+           SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+           SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+           MAX(v.CreationDate)                              AS LastVoteDate
+    FROM   Votes v
+    GROUP BY v.PostId
+)
+
+SELECT
+    ubs.UserId,
+    ubs.DisplayName,
+    ubs.Reputation,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    ubs.TagBadges,
+    rq.Id                                 AS QuestionId,
+    rq.Title,
+    rq.CreationDate,
+    rq.Score,
+    rq.ViewCount,
+    rq.FavoriteCount,
+    rq.AnswerCount,
+    COALESCE(lc.CommentId, -1)           AS LatestCommentId,
+    COALESCE(lc.Text, '(no comment)')    AS LatestCommentText,
+    COALESCE(vu.UpVotes, 0)              AS UpVotes,
+    COALESCE(vu.DownVotes, 0)            AS DownVotes,
+    CASE
+        WHEN rq.Score >= 10 AND tp.QuestionCount >= 5 THEN 'Hot'
+        WHEN rq.Score < 0                                 THEN 'Neg'
+        ELSE                                              'Normal'
+    END                                   AS QuestionStatus,
+    tp.Tag,
+    tp.QuestionCount,
+    tp.AvgScore,
+    tp.TotalViews
+FROM   UserBadgeStats ubs
+JOIN   RecentQuestionPosts rq
+       ON rq.OwnerUserId = ubs.UserId AND rq.rn = 1
+LEFT   JOIN LatestCommentPerPost lc
+       ON lc.PostId = rq.Id AND lc.rn = 1
+LEFT   JOIN PostVoteAggregates vu
+       ON vu.PostId = rq.Id
+LEFT   JOIN LATERAL (
+           SELECT UNNEST(string_to_array(trim(both '<>' FROM rq.Tags), '><')) AS Tag
+       ) AS tlist ON TRUE
+LEFT   JOIN TagPopularity tp
+       ON tp.Tag = tlist.Tag
+WHERE  (ubs.Reputation > 10000 OR ubs.GoldBadges > 0)
+  AND  (rq.Score IS NOT NULL AND rq.Score <> 0)
+  AND  (rq.ClosedDate IS NULL OR rq.ClosedDate > CURRENT_DATE - INTERVAL '1 day')
+ORDER BY ubs.Reputation DESC, rq.Score DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    NULL,NULL,NULL,NULL,NULL,NULL,NULL,
+    p.Id,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,
+    NULL,NULL,NULL,NULL,NULL,NULL,NULL
+FROM   Posts p
+WHERE  p.PostTypeId = 2                         -- Answer
+  AND  NOT EXISTS (SELECT 1 FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2)
+  AND  p.CreationDate < CURRENT_DATE - INTERVAL '365 days'
+ORDER BY p.CreationDate DESC
+LIMIT 50;

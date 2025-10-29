@@ -1,0 +1,200 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.UpVotes,
+        u.DownVotes,
+        u.Views,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS PostActivityRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes, u.Views
+),
+TopQuestions AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        LISTAGG(t.TagName, ', ') WITHIN GROUP (ORDER BY t.TagName) AS Tags,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS OwnerTopQuestion
+    FROM Posts p
+    INNER JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT 
+            Id,
+            UNNEST(STRING_TO_ARRAY(TRIM(BOTH '<' FROM TRIM(BOTH '>' FROM Tags)), '><')) AS TagName
+        FROM Posts 
+        WHERE PostTypeId = 1 AND Tags IS NOT NULL
+    ) t ON p.Id = t.Id
+    WHERE p.PostTypeId = 1 AND p.Score > 100
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.CreationDate, p.OwnerUserId, u.DisplayName
+),
+BadgeAnalysis AS (
+    SELECT 
+        b.UserId,
+        b.Name AS BadgeName,
+        b.Date,
+        b.Class,
+        CASE 
+            WHEN b.Class = 1 THEN 'Gold'
+            WHEN b.Class = 2 THEN 'Silver'
+            ELSE 'Bronze'
+        END AS BadgeType,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId, b.Class ORDER BY b.Date DESC) AS RecentBadgeRank,
+        COUNT(*) OVER (PARTITION BY b.UserId) AS TotalBadges
+    FROM Badges b
+),
+PostActivity AS (
+    SELECT 
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.UserId,
+        ph.CreationDate,
+        ph.Comment,
+        CASE 
+            WHEN ph.PostHistoryTypeId = 1 THEN 'Title Changed'
+            WHEN ph.PostHistoryTypeId = 2 THEN 'Body Changed'
+            WHEN ph.PostHistoryTypeId = 10 THEN 'Post Closed'
+            WHEN ph.PostHistoryTypeId = 11 THEN 'Post Reopened'
+            WHEN ph.PostHistoryTypeId IN (12, 13) THEN 'Post Deleted/Undeleted'
+            ELSE 'Other'
+        END AS ActivityType,
+        DENSE_RANK() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS ActivitySequence
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (1, 2, 10, 11, 12, 13)
+),
+UserEngagement AS (
+    SELECT 
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.PostCount,
+        us.CommentCount,
+        us.BadgeCount,
+        us.AvgPostScore,
+        us.LastPostDate,
+        us.ReputationRank,
+        us.PostActivityRank,
+        COALESCE(MAX(pa.ActivitySequence), 0) AS RecentActivity,
+        CAST(DATE_PART('day', TIMESTAMP '2024-10-01 12:34:56' - us.LastPostDate) AS INTEGER) AS DaysSinceLastPost,
+        CASE 
+            WHEN us.PostCount > 0 THEN (us.CommentCount * 100.0) / us.PostCount
+            ELSE 0 
+        END AS CommentToPostRatio,
+        CASE 
+            WHEN us.Reputation > 10000 THEN 'High'
+            WHEN us.Reputation > 5000 THEN 'Medium'
+            ELSE 'Low'
+        END AS RepLevel
+    FROM UserStats us
+    LEFT JOIN PostActivity pa ON us.UserId = pa.UserId
+    GROUP BY us.UserId, us.DisplayName, us.Reputation, us.PostCount, us.CommentCount, us.BadgeCount, us.AvgPostScore, us.LastPostDate, us.ReputationRank, us.PostActivityRank
+),
+FilteredUsers AS (
+    SELECT 
+        ue.UserId,
+        ue.DisplayName,
+        ue.Reputation,
+        ue.PostCount,
+        ue.CommentCount,
+        ue.BadgeCount,
+        ue.AvgPostScore,
+        ue.LastPostDate,
+        ue.ReputationRank,
+        ue.PostActivityRank,
+        ue.RecentActivity,
+        ue.DaysSinceLastPost,
+        ue.CommentToPostRatio,
+        ue.RepLevel,
+        CASE 
+            WHEN ue.Reputation > 10000 AND ue.PostCount > 50 THEN 'Elite Contributor'
+            WHEN ue.Reputation > 5000 AND ue.PostCount > 20 THEN 'Active Contributor'
+            WHEN ue.Reputation > 1000 AND ue.PostCount > 5 THEN 'Regular Contributor'
+            ELSE 'Standard User'
+        END AS ContributionTier
+    FROM UserEngagement ue
+    WHERE ue.PostCount > 0 AND ue.Reputation > 1000
+),
+TopBadgeHolders AS (
+    SELECT 
+        ba.UserId,
+        ba.BadgeName,
+        ba.Date,
+        ba.BadgeType,
+        ba.RecentBadgeRank,
+        ba.TotalBadges,
+        ROW_NUMBER() OVER (PARTITION BY ba.BadgeName ORDER BY ba.Date DESC) AS BadgePopularityRank
+    FROM BadgeAnalysis ba
+    WHERE ba.BadgeType = 'Gold'
+    AND ba.RecentBadgeRank = 1
+)
+SELECT 
+    fu.UserId,
+    fu.DisplayName,
+    fu.Reputation,
+    fu.PostCount,
+    fu.CommentCount,
+    fu.BadgeCount,
+    fu.AvgPostScore,
+    fu.LastPostDate,
+    fu.ReputationRank,
+    fu.PostActivityRank,
+    fu.RecentActivity,
+    fu.DaysSinceLastPost,
+    fu.CommentToPostRatio,
+    fu.RepLevel,
+    fu.ContributionTier,
+    CASE 
+        WHEN fu.Reputation > 10000 THEN 'Elite'
+        WHEN fu.Reputation > 5000 THEN 'Advanced'
+        WHEN fu.Reputation > 1000 THEN 'Intermediate'
+        ELSE 'Beginner'
+    END AS SkillLevel,
+    COALESCE(tq.Title, 'No Top Question') AS TopQuestionTitle,
+    COALESCE(tq.Score, 0) AS TopQuestionScore,
+    COALESCE(tq.ViewCount, 0) AS TopQuestionViews,
+    COALESCE(tq.AnswerCount, 0) AS TopQuestionAnswers,
+    COALESCE(tq.CommentCount, 0) AS TopQuestionComments,
+    COALESCE(tq.Tags, 'None') AS TopQuestionTags,
+    COALESCE(th.BadgeName, 'No Gold Badge') AS RecentGoldBadge,
+    COALESCE(th.BadgePopularityRank, 0) AS BadgePopularity,
+    CASE 
+        WHEN (fu.ReputationRank <= 100 AND fu.PostCount > 50) THEN 'Top 100 Reputation & High Activity'
+        WHEN (fu.ReputationRank <= 100 AND fu.CommentToPostRatio > 20) THEN 'Top 100 Reputation & Active Commenter'
+        ELSE 'Standard Contributor'
+    END AS UserClassification
+FROM FilteredUsers fu
+LEFT JOIN (
+    SELECT 
+        UserId,
+        Title,
+        Score,
+        ViewCount,
+        AnswerCount,
+        CommentCount,
+        Tags
+    FROM TopQuestions
+    WHERE OwnerTopQuestion = 1
+) tq ON fu.UserId = tq.UserId
+LEFT JOIN TopBadgeHolders th ON fu.UserId = th.UserId
+WHERE (fu.Reputation > 5000 OR fu.PostCount > 20 OR fu.CommentCount > 100)
+    AND fu.DaysSinceLastPost <= 30
+    AND fu.Reputation > 1000
+    AND fu.ContributionTier IN ('Elite Contributor', 'Active Contributor', 'Regular Contributor')
+ORDER BY fu.Reputation DESC, fu.PostCount DESC, fu.BadgeCount DESC;

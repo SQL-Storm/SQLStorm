@@ -1,0 +1,215 @@
+-- {"query": "4489.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2107} 
+
+WITH
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      COUNT(DISTINCT ph.Id) AS PostHistoryCount,
+      SUM(CASE WHEN ph.PostHistoryTypeId = 2 THEN 1 ELSE 0 END) AS BodyEdits,
+      SUM(CASE WHEN ph.PostHistoryTypeId IN (1, 4, 7) THEN 1 ELSE 0 END) AS TitleEdits,
+      SUM(CASE WHEN ph.PostHistoryTypeId IN (3, 6, 9) THEN 1 ELSE 0 END) AS TagEdits,
+      MAX(p.CreationDate) AS LastPostCreationDate,
+      COUNT(DISTINCT p.Id) AS TotalPosts,
+      COUNT(DISTINCT c.Id) AS TotalComments,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesGiven,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesGiven
+    FROM
+      Users AS u
+    LEFT JOIN
+      Posts AS p
+      ON u.Id = p.OwnerUserId
+    LEFT JOIN
+      PostHistory AS ph
+      ON u.Id = ph.UserId AND p.Id = ph.PostId
+    LEFT JOIN
+      Comments AS c
+      ON u.Id = c.UserId AND p.Id = c.PostId
+    LEFT JOIN
+      Votes AS v
+      ON u.Id = v.UserId AND p.Id = v.PostId
+    WHERE
+      u.Id BETWEEN 1 AND 10000
+    GROUP BY
+      u.Id,
+      u.DisplayName
+  ),
+  PostEngagement AS (
+    SELECT
+      p.Id AS PostId,
+      p.OwnerUserId,
+      p.Title,
+      p.Score,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate DESC) AS PostRankByActivity,
+      AVG(c.Score) OVER (PARTITION BY p.Id) AS AvgCommentScore,
+      COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS TotalUpvotes,
+      COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS TotalDownvotes,
+      CASE
+        WHEN p.ClosedDate IS NOT NULL THEN 1
+        ELSE 0
+      END AS IsClosed
+    FROM
+      Posts AS p
+    LEFT JOIN
+      Comments AS c
+      ON p.Id = c.PostId
+    LEFT JOIN
+      Votes AS v
+      ON p.Id = v.PostId
+    WHERE
+      p.PostTypeId = 1 AND p.OwnerUserId BETWEEN 1 AND 10000
+    GROUP BY
+      p.Id,
+      p.OwnerUserId,
+      p.Title,
+      p.Score,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      p.LastActivityDate,
+      p.ClosedDate
+  )
+SELECT
+  ua.DisplayName,
+  ua.Reputation,
+  ua.CreationDate,
+  ua.PostHistoryCount,
+  ua.BodyEdits,
+  ua.TitleEdits,
+  ua.TagEdits,
+  ua.TotalPosts,
+  ua.TotalComments,
+  ua.UpvotesGiven,
+  ua.DownvotesGiven,
+  pe.Title AS FirstQuestionTitle,
+  pe.Score AS FirstQuestionScore,
+  pe.AnswerCount AS FirstQuestionAnswerCount,
+  pe.CommentCount AS FirstQuestionCommentCount,
+  pe.FavoriteCount AS FirstQuestionFavoriteCount,
+  pe.TotalUpvotes AS FirstQuestionTotalUpvotes,
+  pe.TotalDownvotes AS FirstQuestionTotalDownvotes,
+  pe.AvgCommentScore AS FirstQuestionAvgCommentScore,
+  pe.IsClosed AS FirstQuestionIsClosed,
+  COALESCE(u2.DisplayName, 'Community') AS LastEditorDisplayName,
+  CASE
+    WHEN ua.LastPostCreationDate IS NULL THEN 'Never Posted'
+    WHEN ua.LastPostCreationDate > CURRENT_TIMESTAMP - INTERVAL '1 day' THEN 'Within Last Day'
+    WHEN ua.LastPostCreationDate > CURRENT_TIMESTAMP - INTERVAL '7 days' THEN 'Within Last Week'
+    WHEN ua.LastPostCreationDate > CURRENT_TIMESTAMP - INTERVAL '30 days' THEN 'Within Last Month'
+    ELSE 'Older than a Month'
+  END AS RecencyOfActivity,
+  CASE
+    WHEN LENGTH(u.AboutMe) > 100 THEN 'Long Bio'
+    WHEN u.AboutMe IS NULL THEN 'No Bio'
+    ELSE 'Short Bio'
+  END AS AboutMeLength,
+  CASE
+    WHEN ua.PostHistoryCount > 50 THEN 'High Activity'
+    WHEN ua.PostHistoryCount > 10 THEN 'Medium Activity'
+    ELSE 'Low Activity'
+  END AS ActivityLevel,
+  pl.RelatedPostId AS LinkedToPostId,
+  CASE
+    WHEN pt.Name = 'Question' THEN 'Q'
+    WHEN pt.Name = 'Answer' THEN 'A'
+    ELSE 'Other'
+  END AS PostTypeCategory
+FROM
+  UserActivity AS ua
+LEFT JOIN
+  Users AS u
+  ON ua.UserId = u.Id
+LEFT JOIN
+  PostEngagement AS pe
+  ON ua.UserId = pe.OwnerUserId AND pe.PostRankByActivity = 1
+LEFT JOIN
+  Users AS u2
+  ON p.LastEditorUserId = u2.Id
+LEFT JOIN
+  PostLinks AS pl
+  ON ua.UserId = pl.PostId AND pl.LinkTypeId = 1
+LEFT JOIN
+  Posts AS p
+  ON ua.UserId = p.OwnerUserId AND p.Id = pl.RelatedPostId
+LEFT JOIN
+  PostTypes AS pt
+  ON p.PostTypeId = pt.Id
+WHERE
+  ua.DisplayName ILIKE '%john%' OR ua.DisplayName ILIKE '%doe%'
+  OR ua.PostHistoryCount > 100
+  OR ua.UpvotesGiven > ua.DownvotesGiven * 2
+UNION ALL
+SELECT
+  ua.DisplayName,
+  ua.Reputation,
+  ua.CreationDate,
+  ua.PostHistoryCount,
+  ua.BodyEdits,
+  ua.TitleEdits,
+  ua.TagEdits,
+  ua.TotalPosts,
+  ua.TotalComments,
+  ua.UpvotesGiven,
+  ua.DownvotesGiven,
+  pe.Title AS FirstQuestionTitle,
+  pe.Score AS FirstQuestionScore,
+  pe.AnswerCount AS FirstQuestionAnswerCount,
+  pe.CommentCount AS FirstQuestionCommentCount,
+  pe.FavoriteCount AS FirstQuestionFavoriteCount,
+  pe.TotalUpvotes AS FirstQuestionTotalUpvotes,
+  pe.TotalDownvotes AS FirstQuestionTotalDownvotes,
+  pe.AvgCommentScore AS FirstQuestionAvgCommentScore,
+  pe.IsClosed AS FirstQuestionIsClosed,
+  COALESCE(u2.DisplayName, 'Community') AS LastEditorDisplayName,
+  CASE
+    WHEN ua.LastPostCreationDate IS NULL THEN 'Never Posted'
+    WHEN ua.LastPostCreationDate > CURRENT_TIMESTAMP - INTERVAL '1 day' THEN 'Within Last Day'
+    WHEN ua.LastPostCreationDate > CURRENT_TIMESTAMP - INTERVAL '7 days' THEN 'Within Last Week'
+    WHEN ua.LastPostCreationDate > CURRENT_TIMESTAMP - INTERVAL '30 days' THEN 'Within Last Month'
+    ELSE 'Older than a Month'
+  END AS RecencyOfActivity,
+  CASE
+    WHEN LENGTH(u.AboutMe) > 100 THEN 'Long Bio'
+    WHEN u.AboutMe IS NULL THEN 'No Bio'
+    ELSE 'Short Bio'
+  END AS AboutMeLength,
+  CASE
+    WHEN ua.PostHistoryCount > 50 THEN 'High Activity'
+    WHEN ua.PostHistoryCount > 10 THEN 'Medium Activity'
+    ELSE 'Low Activity'
+  END AS ActivityLevel,
+  pl.RelatedPostId AS LinkedToPostId,
+  CASE
+    WHEN pt.Name = 'Question' THEN 'Q'
+    WHEN pt.Name = 'Answer' THEN 'A'
+    ELSE 'Other'
+  END AS PostTypeCategory
+FROM
+  UserActivity AS ua
+JOIN
+  Users AS u
+  ON ua.UserId = u.Id
+LEFT JOIN
+  PostEngagement AS pe
+  ON ua.UserId = pe.OwnerUserId AND pe.PostRankByActivity = 1
+LEFT JOIN
+  Posts AS p
+  ON ua.UserId = p.LastEditorUserId
+LEFT JOIN
+  Users AS u2
+  ON p.LastEditorUserId = u2.Id
+LEFT JOIN
+  PostLinks AS pl
+  ON ua.UserId = pl.RelatedPostId AND pl.LinkTypeId = 3
+LEFT JOIN
+  Posts AS p2
+  ON ua.UserId = p2.Id AND p2.Id = pl.PostId
+LEFT JOIN
+  PostTypes AS pt
+  ON p2.PostTypeId = pt.Id
+WHERE
+  ua.DisplayName IS NULL OR ua.PostHistoryCount < 10
+  OR ua.DownvotesGiven >= ua.UpvotesGiven;

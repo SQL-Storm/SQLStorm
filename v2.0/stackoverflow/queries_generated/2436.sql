@@ -1,0 +1,139 @@
+-- {"query": "2436.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1434} 
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        u.Views,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsCount,
+        count(distinct a.Id) filter (where a.PostTypeId = 2) as AnswersCount,
+        count(distinct b.Id) as BadgesCount,
+        row_number() over (partition by u.Id order by ph.CreationDate desc nulls last) as LastEditRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 1
+    left join Posts a on a.OwnerUserId = u.Id and a.PostTypeId = 2
+    left join Badges b on b.UserId = u.Id
+    left join PostHistory ph on ph.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location, u.Views
+),
+TopUsers as (
+    select *
+    from RecursiveUserActivity
+    where QuestionsCount + AnswersCount > 50
+    order by Reputation desc
+    limit 100
+),
+UserVotesSummary as (
+    select
+        v.UserId,
+        count(*) filter (where vt.Name='UpMod') as UpVotesCount,
+        count(*) filter (where vt.Name='DownMod') as DownVotesCount,
+        count(*) filter (where vt.VoteTypeId in (8,9) and v.BountyAmount is not null) as BountiesAwarded,
+        sum(coalesce(v.BountyAmount, 0)) as TotalBountyAmount
+    from Votes v
+    join VoteTypes vt on vt.Id = v.VoteTypeId
+    group by v.UserId
+),
+UserQuestionStats as (
+    select 
+        p.OwnerUserId as UserId,
+        count(p.Id) as TotalQuestions,
+        avg(p.Score) as AvgQuestionScore,
+        max(p.Score) as MaxQuestionScore,
+        count(distinct pl.Id) filter (where lt.Name='Duplicate') as DuplicatedQuestionsCount,
+        count(distinct c.Id) as TotalCommentsOnQuestions
+    from Posts p
+    left join PostLinks pl on pl.PostId = p.Id
+    left join LinkTypes lt on lt.Id = pl.LinkTypeId
+    left join Comments c on c.PostId = p.Id
+    where p.PostTypeId = 1
+    group by p.OwnerUserId
+),
+RecentHighActivityPosts as (
+    select
+        p.Id, p.Title, p.OwnerUserId, p.PostTypeId,
+        p.CreationDate, p.Score, p.ViewCount,
+        dense_rank() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as RankByScoreAndViews
+    from Posts p
+    where p.CreationDate >= (current_date - interval '90 days')
+),
+AcceptedAnswerSubquery as (
+    select
+        q.Id as QuestionId,
+        a.Id as AcceptedAnswerId,
+        a.Score as AcceptedAnswerScore,
+        a.CreationDate as AcceptedAnswerDate,
+        users.DisplayName as AnswerOwnerName,
+        users.Reputation as AnswerOwnerReputation
+    from Posts q
+    left join Posts a on a.Id = q.AcceptedAnswerId and a.PostTypeId = 2
+    left join Users users on users.Id = a.OwnerUserId
+    where q.PostTypeId = 1
+),
+HighReputationUsersWithBadges as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        array_agg(distinct b.Name) filter (where b.Class = 1) as GoldBadges,
+        array_agg(distinct b.Name) filter (where b.Class = 2) as SilverBadges,
+        array_agg(distinct b.Name) filter (where b.Class = 3) as BronzeBadges
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    where u.Reputation > 10000
+    group by u.Id, u.DisplayName, u.Reputation
+),
+QuestionsWithCloseReason as (
+    select
+        ph.PostId,
+        crt.Name as CloseReason,
+        ph.CreationDate as CloseDate,
+        ph.UserId as ClosedByUserId,
+        u.DisplayName as ClosedByUserName
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int) and ph.PostHistoryTypeId = 10
+    left join Users u on u.Id = ph.UserId
+    where ph.PostHistoryTypeId = 10
+)
+select
+    tu.UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    coalesce(uvs.UpVotesCount,0) as TotalUpVotes,
+    coalesce(uvs.DownVotesCount,0) as TotalDownVotes,
+    coalesce(uvs.BountiesAwarded,0) as BountiesAwarded,
+    coalesce(uvs.TotalBountyAmount,0) as TotalBountyAmount,
+    coalesce(uqs.TotalQuestions,0) as TotalQuestions,
+    coalesce(uqs.AvgQuestionScore,0) as AvgQuestionScore,
+    coalesce(uqs.DuplicatedQuestionsCount,0) as DuplicatedQuestionsCount,
+    coalesce(uqs.TotalCommentsOnQuestions,0) as TotalCommentsOnQuestions,
+    hrub.GoldBadges,
+    hrub.SilverBadges,
+    hrub.BronzeBadges,
+    (
+        select json_agg(json_build_object(
+            'QuestionId', q.Id,
+            'Title', q.Title,
+            'Score', q.Score,
+            'ViewCount', q.ViewCount,
+            'AcceptedAnswerScore', aa.AcceptedAnswerScore,
+            'AcceptedAnswerOwner', aa.AnswerOwnerName,
+            'AcceptedAnswerOwnerReputation', aa.AnswerOwnerReputation
+        ))
+        from Posts q
+        left join AcceptedAnswerSubquery aa on aa.QuestionId = q.Id
+        left join QuestionsWithCloseReason cwr on cwr.PostId = q.Id
+        where q.PostTypeId = 1
+          and q.OwnerUserId = tu.UserId
+          and (cwr.PostId is null or cwr.CloseDate >= now()- interval '365 days')
+        order by q.Score desc
+        limit 5
+    ) as TopQuestions
+from TopUsers tu
+left join UserVotesSummary uvs on uvs.UserId = tu.UserId
+left join UserQuestionStats uqs on uqs.UserId = tu.UserId
+left join HighReputationUsersWithBadges hrub on hrub.UserId = tu.UserId
+order by tu.Reputation desc
+limit 50;

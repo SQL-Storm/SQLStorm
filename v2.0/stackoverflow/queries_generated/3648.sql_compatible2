@@ -1,0 +1,154 @@
+WITH
+    user_posts AS (
+        SELECT
+            u.Id                                      AS user_id,
+            COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS question_cnt,
+            COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS answer_cnt,
+            COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1
+                                 AND p.AcceptedAnswerId IS NOT NULL) AS accepted_cnt,
+            COALESCE(SUM(p.Score),0)                  AS total_score,
+            MAX(p.CreationDate)                      AS last_post_dt
+        FROM Users u
+        LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+        GROUP BY u.Id
+    ),
+
+    user_comments AS (
+        SELECT
+            u.Id                     AS user_id,
+            COUNT(c.Id)              AS comment_cnt,
+            MAX(c.CreationDate)      AS last_comment_dt
+        FROM Users u
+        LEFT JOIN Comments c ON c.UserId = u.Id
+        GROUP BY u.Id
+    ),
+
+    user_badges AS (
+        SELECT
+            u.Id                                                AS user_id,
+            COUNT(b.Id)                                         AS badge_cnt,
+            COUNT(b.Id) FILTER (WHERE b.Class = 1)              AS gold_cnt,
+            COUNT(b.Id) FILTER (WHERE b.Class = 2)              AS silver_cnt,
+            COUNT(b.Id) FILTER (WHERE b.Class = 3)              AS bronze_cnt,
+            STRING_AGG(DISTINCT b.Name, ', ') FILTER (WHERE b.Class = 1) AS gold_list
+        FROM Users u
+        LEFT JOIN Badges b ON b.UserId = u.Id
+        GROUP BY u.Id
+    ),
+
+    user_votes AS (
+        SELECT
+            u.Id                                                AS user_id,
+            COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2)         AS upvotes_given,
+            COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 3)         AS downvotes_given,
+            COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 5)         AS favorites_given
+        FROM Users u
+        LEFT JOIN Votes v ON v.UserId = u.Id
+        GROUP BY u.Id
+    ),
+
+    recent_activity AS (
+        SELECT
+            u.Id                                     AS user_id,
+            GREATEST(
+                COALESCE(MAX(p.CreationDate),   TIMESTAMP '1970-01-01'),
+                COALESCE(MAX(c.CreationDate),   TIMESTAMP '1970-01-01'),
+                COALESCE(MAX(v.CreationDate),   TIMESTAMP '1970-01-01')
+            )                                        AS last_activity_dt
+        FROM Users u
+        LEFT JOIN Posts    p ON p.OwnerUserId = u.Id
+        LEFT JOIN Comments c ON c.UserId      = u.Id
+        LEFT JOIN Votes    v ON v.UserId      = u.Id
+        GROUP BY u.Id
+    ),
+
+    user_top_tag AS (
+        SELECT
+            up.user_id,
+            t.TagName,
+            COUNT(*) AS cnt,
+            ROW_NUMBER() OVER (PARTITION BY up.user_id ORDER BY COUNT(*) DESC) AS rn
+        FROM user_posts up
+        JOIN Posts p ON p.OwnerUserId = up.user_id AND p.PostTypeId = 1
+        CROSS JOIN LATERAL (
+            SELECT UNNEST(string_to_array(TRIM(BOTH '<>' FROM p.Tags), '><')) AS tag
+        ) AS x
+        JOIN Tags t ON t.TagName = x.tag
+        GROUP BY up.user_id, t.TagName
+    ),
+
+    user_best_tag AS (
+        SELECT user_id, TagName, cnt AS tag_cnt
+        FROM user_top_tag
+        WHERE rn = 1
+    ),
+
+    main_users AS (
+    SELECT
+        u.Id                                             AS user_id,
+        COALESCE(u.DisplayName,'Anonymous')              AS display_name,
+        u.Reputation,
+        up.question_cnt,
+        up.answer_cnt,
+        up.accepted_cnt,
+        up.total_score,
+        uc.comment_cnt,
+        ub.gold_cnt,
+        ub.silver_cnt,
+        ub.bronze_cnt,
+        ub.gold_list,
+        uv.upvotes_given,
+        uv.downvotes_given,
+        uv.favorites_given,
+        ra.last_activity_dt,
+        COALESCE(ubt.TagName,'N/A')                      AS top_tag,
+        COALESCE(ubt.tag_cnt,0)                          AS top_tag_post_cnt,
+        CASE WHEN u.LastAccessDate > u.CreationDate
+             THEN 'Active' ELSE 'Inactive' END          AS activity_status,
+        CASE 
+            WHEN (COALESCE(up.total_score,0) + COALESCE(ub.gold_cnt,0)*100
+                  + COALESCE(ub.silver_cnt,0)*50 + COALESCE(ub.bronze_cnt,0)*10) > 10000
+            THEN 'PowerUser' ELSE 'RegularUser' END    AS user_tier
+    FROM Users u
+    LEFT JOIN user_posts      up  ON up.user_id    = u.Id
+    LEFT JOIN user_comments   uc  ON uc.user_id    = u.Id
+    LEFT JOIN user_badges     ub  ON ub.user_id    = u.Id
+    LEFT JOIN user_votes      uv  ON uv.user_id    = u.Id
+    LEFT JOIN recent_activity ra  ON ra.user_id   = u.Id
+    LEFT JOIN user_best_tag   ubt ON ubt.user_id   = u.Id
+    WHERE (u.Reputation > 1000 OR COALESCE(up.answer_cnt,0) > 10)
+    ORDER BY u.Reputation DESC
+    LIMIT 100
+    )
+
+SELECT * FROM main_users
+
+UNION ALL
+
+SELECT
+    NULL                                            AS user_id,
+    'TOTAL'                                         AS display_name,
+    SUM(u.Reputation)                               AS reputation,
+    SUM(COALESCE(up.question_cnt,0))                AS question_cnt,
+    SUM(COALESCE(up.answer_cnt,0))                  AS answer_cnt,
+    SUM(COALESCE(up.accepted_cnt,0))                AS accepted_cnt,
+    SUM(COALESCE(up.total_score,0))                 AS total_score,
+    SUM(COALESCE(uc.comment_cnt,0))                 AS comment_cnt,
+    SUM(COALESCE(ub.gold_cnt,0))                    AS gold_cnt,
+    SUM(COALESCE(ub.silver_cnt,0))                  AS silver_cnt,
+    SUM(COALESCE(ub.bronze_cnt,0))                  AS bronze_cnt,
+    NULL                                            AS gold_list,
+    SUM(COALESCE(uv.upvotes_given,0))               AS upvotes_given,
+    SUM(COALESCE(uv.downvotes_given,0))             AS downvotes_given,
+    SUM(COALESCE(uv.favorites_given,0))             AS favorites_given,
+    NULL                                            AS last_activity_dt,
+    NULL                                            AS top_tag,
+    NULL                                            AS top_tag_post_cnt,
+    NULL                                            AS activity_status,
+    NULL                                            AS user_tier
+FROM Users u
+LEFT JOIN user_posts    up ON up.user_id   = u.Id
+LEFT JOIN user_comments uc ON uc.user_id   = u.Id
+LEFT JOIN user_badges   ub ON ub.user_id   = u.Id
+LEFT JOIN user_votes    uv ON uv.user_id   = u.Id
+WHERE u.Id IS NOT NULL;

@@ -1,0 +1,200 @@
+WITH UserEngagementSummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS TotalUpVotesGiven,
+        U.DownVotes AS TotalDownVotesGiven,
+        COALESCE(SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END), 0) AS QuestionsAsked,
+        COALESCE(SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END), 0) AS AnswersProvided,
+        COALESCE(COUNT(DISTINCT P.Id), 0) AS TotalPostsCreated,
+        COALESCE(COUNT(DISTINCT C.Id), 0) AS TotalCommentsMade,
+        COALESCE(COUNT(DISTINCT B.Id), 0) AS TotalBadgesEarned,
+        AVG(CAST(P.Score AS NUMERIC)) FILTER (WHERE P.Score IS NOT NULL) AS AveragePostScore,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - U.CreationDate)) / (60 * 60 * 24) AS DaysActiveSinceCreation,
+        U.Location
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    WHERE U.Reputation > 500
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Views, U.UpVotes, U.DownVotes, U.Location
+),
+PostPerformanceMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.Title,
+        P.Tags,
+        COALESCE(P.LastEditDate, P.CreationDate) AS EffectiveLastEditDate,
+        RANK() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.ViewCount DESC) AS RankByScoreAndViews,
+        NTILE(5) OVER (ORDER BY P.CreationDate) AS CreationDateQuintile,
+        ARRAY_LENGTH(STRING_TO_ARRAY(SUBSTRING(P.Tags, 2, CHAR_LENGTH(P.Tags) - 2), '><'), 1) AS NumberOfTags,
+        CAST(P.Score AS NUMERIC) / NULLIF(P.ViewCount, 0) AS ScorePerViewRatio,
+        (SELECT COUNT(DISTINCT V.Id) FROM Votes V WHERE V.PostId = P.Id AND V.VoteTypeId = 2) AS UpVoteCount,
+        (SELECT COUNT(DISTINCT V.Id) FROM Votes V WHERE V.PostId = P.Id AND V.VoteTypeId = 3) AS DownVoteCount,
+        CASE WHEN P.AcceptedAnswerId IS NOT NULL THEN 'Accepted' ELSE 'Not Accepted' END AS AnswerStatus,
+        P.EffectiveLastEditDate -- include for grouping/usage safety in outer queries if needed
+    FROM Posts P
+    INNER JOIN PostTypes PT ON P.PostTypeId = PT.Id
+    WHERE P.CreationDate BETWEEN DATE '2022-01-01' AND DATE '2023-12-31'
+      AND P.PostTypeId IN (1, 2)
+      AND P.ViewCount > 100 AND P.Score IS NOT NULL
+),
+PostHistoryDetails AS (
+    SELECT
+        PH.PostId,
+        COUNT(PH.Id) AS TotalHistoryEvents,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS TotalEditEvents,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS TotalCloseEvents,
+        MAX(PH.CreationDate) AS LastHistoryActivity,
+        STRING_AGG(DISTINCT CRT.Name, '; ' ORDER BY CRT.Name) FILTER (WHERE PH.PostHistoryTypeId = 10 AND PH.Comment IS NOT NULL) AS DistinctCloseReasons,
+        MAX(CHAR_LENGTH(PH.Text)) AS MaxHistoryTextLength
+    FROM PostHistory PH
+    LEFT JOIN CloseReasonTypes CRT ON
+        -- try to safely cast PH.Comment to integer where it looks numeric
+        (PH.Comment ~ '^[0-9]+$' AND CAST(PH.Comment AS INTEGER) = CRT.Id)
+    WHERE PH.CreationDate > DATE '2022-06-01'
+    GROUP BY PH.PostId
+),
+LinkedPostAggregates AS (
+    SELECT
+        PL.PostId,
+        COUNT(DISTINCT PL.RelatedPostId) AS TotalRelatedPosts,
+        SUM(CASE WHEN PL.LinkTypeId = 1 THEN 1 ELSE 0 END) AS DirectLinksOutCount,
+        SUM(CASE WHEN PL.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicateLinksOutCount
+    FROM PostLinks PL
+    WHERE PL.CreationDate > DATE '2022-01-01'
+    GROUP BY PL.PostId
+),
+HighScoringTags AS (
+    SELECT
+        TRIM(tag) AS TagName
+    FROM (
+        SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(P.Tags, 2, CHAR_LENGTH(P.Tags) - 2), '><')) AS tag, P.Score
+        FROM Posts P
+        WHERE P.Tags IS NOT NULL AND CHAR_LENGTH(P.Tags) > 2 AND P.PostTypeId = 1
+    ) t
+    GROUP BY TRIM(tag)
+    HAVING AVG(CAST(t.Score AS NUMERIC)) > 10
+),
+HighlyViewedTags AS (
+    SELECT
+        TRIM(tag) AS TagName
+    FROM (
+        SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(P.Tags, 2, CHAR_LENGTH(P.Tags) - 2), '><')) AS tag, P.ViewCount
+        FROM Posts P
+        WHERE P.Tags IS NOT NULL AND CHAR_LENGTH(P.Tags) > 2 AND P.PostTypeId = 1 AND P.ViewCount > 50000
+    ) t
+    GROUP BY TRIM(tag)
+),
+CommonPopularTags AS (
+    SELECT TagName FROM HighScoringTags
+    INTERSECT
+    SELECT TagName FROM HighlyViewedTags
+),
+TagPerformanceBreakdown AS (
+    SELECT
+        TFP.TagName,
+        SUM(PPM.PostScore) AS TaggedPostsTotalScore,
+        COUNT(PPM.PostId) AS TaggedPostsCount,
+        AVG(PPM.ScorePerViewRatio) FILTER (WHERE PPM.ScorePerViewRatio IS NOT NULL) AS AvgTagScorePerView,
+        DENSE_RANK() OVER (ORDER BY SUM(PPM.PostScore) DESC, COUNT(PPM.PostId) DESC) AS TagScoreRankOverall
+    FROM (
+        SELECT P.Id AS PostId, TRIM(UNNEST(STRING_TO_ARRAY(SUBSTRING(P.Tags, 2, CHAR_LENGTH(P.Tags) - 2), '><'))) AS TagName
+        FROM Posts P
+        WHERE P.Tags IS NOT NULL AND CHAR_LENGTH(P.Tags) > 2
+    ) TFP
+    INNER JOIN PostPerformanceMetrics PPM ON TFP.PostId = PPM.PostId
+    INNER JOIN CommonPopularTags CPT ON TFP.TagName = CPT.TagName
+    GROUP BY TFP.TagName
+    HAVING COUNT(PPM.PostId) > 100
+)
+SELECT
+    UES.UserId,
+    UES.DisplayName,
+    UES.Reputation,
+    UES.UserProfileViews,
+    UES.QuestionsAsked,
+    UES.AnswersProvided,
+    UES.AveragePostScore,
+    PPM.PostId,
+    PPM.PostTypeName,
+    PPM.PostScore,
+    PPM.ViewCount,
+    PPM.AnswerCount,
+    PPM.CommentCount,
+    PPM.FavoriteCount,
+    PPM.Title,
+    PPM.NumberOfTags,
+    PPM.RankByScoreAndViews,
+    PPM.CreationDateQuintile,
+    COALESCE(PPM.ScorePerViewRatio, 0.0) AS NormalizedScorePerView,
+    PPM.UpVoteCount,
+    PPM.DownVoteCount,
+    PHD.TotalHistoryEvents,
+    PHD.TotalEditEvents,
+    PHD.TotalCloseEvents,
+    PHD.DistinctCloseReasons,
+    PHD.MaxHistoryTextLength,
+    LPA.TotalRelatedPosts,
+    LPA.DirectLinksOutCount,
+    LPA.DuplicateLinksOutCount,
+    TPB.TagName AS MostRelevantTagName,
+    TPB.TaggedPostsTotalScore AS RelevantTagScore,
+    TPB.TaggedPostsCount AS RelevantTagPostCount,
+    TPB.AvgTagScorePerView AS RelevantTagAvgScorePerView,
+    TPB.TagScoreRankOverall AS RelevantTagRank,
+    (SELECT MAX(U_LOC.Reputation)
+     FROM Users U_LOC
+     WHERE U_LOC.Location IS NOT NULL
+       AND UES.Location IS NOT NULL
+       AND U_LOC.Location LIKE '%' || UES.Location || '%'
+       AND U_LOC.Id <> UES.UserId
+    ) AS MaxReputationInSameApproxLocation,
+    CASE
+        WHEN UES.Reputation > 20000 AND PPM.PostScore > 100 AND PPM.AnswerStatus = 'Accepted' THEN 'Elite Contributor & High-Impact Post'
+        WHEN UES.Reputation > 5000 AND PPM.PostScore > 50 THEN 'Significant Contributor & Popular Post'
+        WHEN UES.Reputation > 1000 AND PPM.PostScore > 10 THEN 'Active Contributor'
+        ELSE 'Emerging Contributor'
+    END AS ContributionTier,
+    TO_CHAR(PPM.EffectiveLastEditDate, 'YYYY-MM-DD HH24:MI:SS') AS FormattedLastEditDate,
+    UPPER(SUBSTRING(COALESCE(UES.DisplayName, 'UNKNOWN') FROM 1 FOR 1)) AS FirstLetterOfDisplayName,
+    UES.Location
+FROM UserEngagementSummary UES
+INNER JOIN PostPerformanceMetrics PPM ON UES.UserId = PPM.OwnerUserId
+LEFT JOIN PostHistoryDetails PHD ON PPM.PostId = PHD.PostId
+LEFT JOIN LinkedPostAggregates LPA ON PPM.PostId = LPA.PostId
+LEFT JOIN (
+    SELECT
+        TFP_sub.PostId,
+        MIN(TFP_sub.TagName) AS TagName
+    FROM (
+        SELECT P_sub.Id AS PostId, TRIM(UNNEST(STRING_TO_ARRAY(SUBSTRING(P_sub.Tags, 2, CHAR_LENGTH(P_sub.Tags) - 2), '><'))) AS TagName
+        FROM Posts P_sub
+        WHERE P_sub.Tags IS NOT NULL AND CHAR_LENGTH(P_sub.Tags) > 2
+    ) TFP_sub
+    INNER JOIN CommonPopularTags CPT_sub ON TFP_sub.TagName = CPT_sub.TagName
+    GROUP BY TFP_sub.PostId
+) PostPrimaryTag ON PPM.PostId = PostPrimaryTag.PostId
+LEFT JOIN TagPerformanceBreakdown TPB ON PostPrimaryTag.TagName = TPB.TagName
+WHERE PPM.RankByScoreAndViews <= 200
+  AND UES.DaysActiveSinceCreation >= 730
+  AND (COALESCE(PHD.TotalCloseEvents, 0) = 0 OR PHD.DistinctCloseReasons LIKE '%Duplicate%' OR PHD.DistinctCloseReasons IS NULL)
+  AND PPM.UpVoteCount > COALESCE(PPM.DownVoteCount, 0) * 2
+  AND PPM.NumberOfTags BETWEEN 2 AND 5
+  AND UES.AveragePostScore IS NOT NULL
+  AND UES.Location IS NOT NULL
+ORDER BY UES.Reputation DESC, PPM.PostScore DESC, TPB.TagScoreRankOverall ASC NULLS LAST, PPM.CreationDateQuintile DESC
+LIMIT 1000;

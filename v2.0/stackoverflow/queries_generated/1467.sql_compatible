@@ -1,0 +1,155 @@
+WITH UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesGiven,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesGiven,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        NTILE(4) OVER (ORDER BY u.CreationDate) AS CreationDateQuartile,
+        CASE
+            WHEN u.Reputation >= 20000 THEN 'Legendary'
+            WHEN u.Reputation >= 5000 THEN 'Veteran'
+            WHEN u.Reputation >= 1000 THEN 'Experienced'
+            WHEN u.Reputation >= 100 THEN 'Contributor'
+            ELSE 'Novice'
+        END AS ReputationTier
+    FROM Users AS u
+    LEFT JOIN Posts AS p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments AS c ON u.Id = c.UserId
+    LEFT JOIN Votes AS v ON u.Id = v.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+QuestionMeta AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.OwnerUserId,
+        q.Title,
+        q.CreationDate AS QuestionCreationDate,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        q.CommentCount,
+        q.FavoriteCount,
+        q.Tags,
+        q.ClosedDate,
+        q.AcceptedAnswerId,
+        (SELECT COUNT(DISTINCT pl.RelatedPostId) FROM PostLinks pl WHERE pl.PostId = q.Id AND pl.LinkTypeId = 3) AS DuplicateCount,
+        (SELECT COUNT(DISTINCT pl.RelatedPostId) FROM PostLinks pl WHERE pl.PostId = q.Id AND pl.LinkTypeId = 1) AS LinkedCount,
+        (SELECT crt.Name FROM PostHistory ph INNER JOIN CloseReasonTypes crt ON CAST(ph.Comment AS smallint) = crt.Id WHERE ph.PostId = q.Id AND ph.PostHistoryTypeId = 10 ORDER BY ph.CreationDate DESC LIMIT 1) AS CloseReason,
+        a.OwnerUserId AS AcceptedAnswerOwnerId,
+        a.Score AS AcceptedAnswerScore,
+        a.CreationDate AS AcceptedAnswerCreationDate,
+        EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate)) / 3600.0 AS TimeToAcceptAnswerHours,
+        COALESCE(q.FavoriteCount, 0) + (COALESCE(q.Score, 0) * 2) + (COALESCE(q.AnswerCount, 0) * 3) + (COALESCE(q.ViewCount, 0) / 100.0) AS WeightedQuestionEngagementScore,
+        LENGTH(q.Body) AS QuestionBodyLength
+    FROM Posts AS q
+    LEFT JOIN Posts AS a ON q.AcceptedAnswerId = a.Id
+    WHERE q.PostTypeId = 1
+),
+RecentPostActivity AS (
+    SELECT
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate AS HistoryDate,
+        ph.UserId AS HistoryUserId,
+        ph.UserDisplayName AS HistoryUserDisplayName,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC, ph.Id DESC) AS rn_latest_history
+    FROM PostHistory AS ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6, 10, 11, 12, 13, 16, 19, 20, 35)
+),
+TagAnalysis AS (
+    SELECT
+        qm.QuestionId,
+        TRIM(tag_val) AS ParsedTag,
+        t.Id AS TagId,
+        t.Count AS TagUseCount,
+        t.IsModeratorOnly
+    FROM QuestionMeta AS qm
+    CROSS JOIN LATERAL UNNEST(string_to_array(SUBSTRING(qm.Tags, 2, LENGTH(qm.Tags)-2), '><')) AS tag_val
+    INNER JOIN Tags AS t ON TRIM(tag_val) = t.TagName
+    WHERE qm.Tags IS NOT NULL AND LENGTH(qm.Tags) > 2
+)
+SELECT
+    ue.UserId,
+    ue.DisplayName,
+    ue.Reputation,
+    ue.ReputationTier,
+    ue.TotalPosts,
+    ue.TotalComments,
+    qm.QuestionId,
+    qm.Title,
+    qm.QuestionCreationDate,
+    qm.QuestionScore,
+    qm.ViewCount,
+    qm.AnswerCount,
+    qm.WeightedQuestionEngagementScore,
+    qm.QuestionBodyLength,
+    qm.TimeToAcceptAnswerHours,
+    qm.CloseReason,
+    rp.HistoryDate AS LatestActivityDate,
+    rp.PostHistoryTypeId AS LatestActivityType,
+    ph_type.Name AS LatestActivityTypeName,
+    COALESCE(b.GoldBadgeCount, 0) AS GoldBadges,
+    COALESCE(b.SilverBadgeCount, 0) AS SilverBadges,
+    COALESCE(b.BronzeBadgeCount, 0) AS BronzeBadges,
+    (SELECT COUNT(DISTINCT c2.Id) FROM Comments AS c2 WHERE c2.PostId = qm.QuestionId AND c2.CreationDate > qm.QuestionCreationDate + INTERVAL '1 day' AND c2.UserId IS NOT NULL) AS CommentsAfterFirstDayByUsers,
+    (SELECT COUNT(DISTINCT v2.Id) FROM Votes AS v2 WHERE v2.PostId = qm.QuestionId AND v2.VoteTypeId = 2 AND v2.CreationDate > qm.QuestionCreationDate + INTERVAL '7 days' AND v2.UserId IS NOT NULL) AS UpvotesAfterFirstWeekByUsers,
+    CASE
+        WHEN qm.ClosedDate IS NOT NULL AND qm.AcceptedAnswerId IS NULL THEN 'Closed_NoAcceptedAnswer'
+        WHEN qm.ClosedDate IS NOT NULL AND qm.AcceptedAnswerId IS NOT NULL THEN 'Closed_AcceptedAnswer'
+        WHEN qm.ClosedDate IS NULL AND qm.AcceptedAnswerId IS NOT NULL THEN 'Open_AcceptedAnswer'
+        ELSE 'Open_NoAcceptedAnswer'
+    END AS QuestionStatusCategory,
+    STRING_AGG(ta.ParsedTag, '; ' ORDER BY ta.ParsedTag) AS CombinedTagsInfo,
+    MAX(ta.TagUseCount) AS MaxTagUseCountInQuestion,
+    BOOL_OR(ta.IsModeratorOnly) AS ContainsModeratorOnlyTag
+FROM UserEngagement AS ue
+INNER JOIN QuestionMeta AS qm ON ue.UserId = qm.OwnerUserId
+LEFT JOIN RecentPostActivity AS rp ON qm.QuestionId = rp.PostId AND rp.rn_latest_history = 1
+LEFT JOIN PostHistoryTypes AS ph_type ON rp.PostHistoryTypeId = ph_type.Id
+LEFT JOIN (
+    SELECT
+        UserId,
+        SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadgeCount,
+        SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadgeCount,
+        SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadgeCount
+    FROM Badges
+    GROUP BY UserId
+) AS b ON ue.UserId = b.UserId
+LEFT JOIN TagAnalysis AS ta ON qm.QuestionId = ta.QuestionId
+WHERE
+    ue.ReputationTier IN ('Veteran', 'Experienced')
+    AND qm.QuestionScore >= 5
+    AND qm.QuestionBodyLength > 80
+    AND (qm.Tags LIKE '%<sql>%' OR qm.Tags LIKE '%<database>%' OR qm.Tags LIKE '%<performance>%')
+    AND qm.QuestionCreationDate >= ue.LastAccessDate - INTERVAL '2 year'
+    AND qm.TimeToAcceptAnswerHours BETWEEN 0.1 AND 72
+    AND NOT EXISTS (
+        SELECT 1 FROM PostHistory ph_del
+        WHERE ph_del.PostId = qm.QuestionId
+          AND ph_del.PostHistoryTypeId = 12
+          AND EXISTS (
+              SELECT 1 FROM PostHistory ph_undel
+              WHERE ph_undel.PostId = qm.QuestionId
+                AND ph_undel.PostHistoryTypeId = 13
+                AND ph_undel.UserId = ph_del.UserId
+                AND ph_undel.CreationDate < ph_del.CreationDate + INTERVAL '1 hour'
+          )
+    )
+GROUP BY
+    ue.UserId, ue.DisplayName, ue.Reputation, ue.ReputationTier, ue.TotalPosts, ue.TotalComments,
+    qm.QuestionId, qm.Title, qm.QuestionCreationDate, qm.QuestionScore, qm.ViewCount, qm.AnswerCount,
+    qm.WeightedQuestionEngagementScore, qm.QuestionBodyLength, qm.TimeToAcceptAnswerHours,
+    qm.CloseReason, rp.HistoryDate, rp.PostHistoryTypeId, ph_type.Name,
+    b.GoldBadgeCount, b.SilverBadgeCount, b.BronzeBadgeCount, qm.ClosedDate, qm.AcceptedAnswerId
+ORDER BY
+    ue.Reputation DESC, qm.WeightedQuestionEngagementScore DESC, qm.QuestionCreationDate DESC
+LIMIT 500;

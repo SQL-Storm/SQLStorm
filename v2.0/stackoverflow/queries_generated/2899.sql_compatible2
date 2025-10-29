@@ -1,0 +1,160 @@
+WITH RECURSIVE RecursiveTagTree AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 AS Level,
+        ARRAY[t.TagName] AS TagPath
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+  UNION ALL
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Level + 1,
+        r.TagPath || t.TagName
+    FROM Tags t
+    JOIN RecursiveTagTree r ON t.Count < r.Count AND t.Id <> r.Id
+    WHERE r.Level < 3
+),
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        b.Class,
+        COUNT(*) AS BadgeCount
+    FROM Badges b
+    GROUP BY b.UserId, b.Class
+),
+UserReputationRank AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+),
+QuestionAnswerStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.CreationDate AS QuestionCreationDate,
+        q.Score AS QuestionScore,
+        COALESCE(ans.AnswerCount, 0) AS TotalAnswers,
+        COALESCE(acc.Score, 0) AS AcceptedAnswerScore,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = q.Id AND v.VoteTypeId = 5) AS FavoritesCount,
+        ROW_NUMBER() OVER (PARTITION BY q.OwnerUserId ORDER BY q.CreationDate DESC) AS RecentQuestionRN
+    FROM Posts q
+    LEFT JOIN (
+        SELECT ParentId, COUNT(*) AS AnswerCount
+        FROM Posts
+        WHERE PostTypeId = 2
+        GROUP BY ParentId
+    ) ans ON ans.ParentId = q.Id
+    LEFT JOIN Posts acc ON acc.Id = q.AcceptedAnswerId
+    WHERE q.PostTypeId = 1
+),
+ComplexPostLinks AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name AS LinkTypeName,
+        COALESCE(p.Score, 0) AS RelatedPostScore,
+        SUBSTRING(p.Title FROM 1 FOR 50) AS RelatedPostTitleSnippet,
+        ROW_NUMBER() OVER (PARTITION BY pl.PostId ORDER BY pl.CreationDate DESC) AS LinkRecencyRank
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    LEFT JOIN Posts p ON p.Id = pl.RelatedPostId
+),
+PostCommentsWithUser AS (
+    SELECT
+        c.Id,
+        c.PostId,
+        c.Score AS CommentScore,
+        CHAR_LENGTH(c.Text) AS CommentLength,
+        c.CreationDate AS CommentDate,
+        COALESCE(u.DisplayName, c.UserDisplayName) AS CommentAuthor,
+        CASE WHEN c.UserId IS NULL THEN 0 ELSE 1 END AS IsRegisteredUser
+    FROM Comments c
+    LEFT JOIN Users u ON u.Id = c.UserId
+),
+QuestionsWithComplexLogic AS (
+    SELECT
+        qas.QuestionId,
+        qas.Title,
+        qas.QuestionScore,
+        qas.TotalAnswers,
+        qas.AcceptedAnswerScore,
+        qas.FavoritesCount,
+        ur.RankDateDiff,
+        ubc.GoldBadges,
+        ubc.SilverBadges,
+        ubc.BronzeBadges,
+        (
+            SELECT STRING_AGG(distinct rt.TagName, ', ' ORDER BY rt.Level)
+            FROM RecursiveTagTree rt
+            CROSS JOIN LATERAL (
+                SELECT unnest(string_to_array(SUBSTRING(qas.Title FROM 1 FOR 100), ' ')) AS TitleWords
+            ) tw
+            WHERE lower(rt.TagName) LIKE lower('%' || tw.TitleWords || '%') AND rt.Level <= 2
+        ) AS RelatedTags
+    FROM QuestionAnswerStats qas
+    LEFT JOIN (
+        SELECT 
+            u.Id,
+            COALESCE(u.LastAccessDate - u.CreationDate, INTERVAL '0') AS RankDateDiff
+        FROM Users u
+    ) ur ON ur.Id = qas.OwnerUserId
+    LEFT JOIN (
+        SELECT 
+            ub.UserId,
+            MAX(CASE WHEN ub.Class = 1 THEN ub.BadgeCount ELSE 0 END) AS GoldBadges,
+            MAX(CASE WHEN ub.Class = 2 THEN ub.BadgeCount ELSE 0 END) AS SilverBadges,
+            MAX(CASE WHEN ub.Class = 3 THEN ub.BadgeCount ELSE 0 END) AS BronzeBadges
+        FROM UserBadgeCounts ub
+        GROUP BY ub.UserId
+    ) ubc ON ubc.UserId = qas.OwnerUserId
+    WHERE qas.RecentQuestionRN <= 5
+),
+FinalResult AS (
+    SELECT
+        qcl.QuestionId,
+        qcl.Title,
+        qcl.QuestionScore,
+        qcl.TotalAnswers,
+        qcl.AcceptedAnswerScore,
+        qcl.FavoritesCount,
+        qcl.GoldBadges,
+        qcl.SilverBadges,
+        qcl.BronzeBadges,
+        COALESCE(cl.LinkTypeName, 'No Link') AS MostRelevantLinkType,
+        COALESCE(cl.RelatedPostTitleSnippet, 'N/A') AS RelatedPostSnippet,
+        COALESCE(pc.CommentAuthor, 'Anonymous') AS TopCommentAuthor,
+        pc.CommentScore,
+        qcl.RelatedTags,
+        CASE 
+            WHEN qcl.QuestionScore > 10 AND qcl.TotalAnswers > 3 THEN 'Hot Topic'
+            WHEN qcl.QuestionScore BETWEEN 1 AND 10 THEN 'Active'
+            ELSE 'Less Popular'
+        END AS PopularityStatus
+    FROM QuestionsWithComplexLogic qcl
+    LEFT JOIN LATERAL (
+        SELECT clt.PostId, clt.RelatedPostId, clt.LinkTypeName, clt.RelatedPostScore, clt.RelatedPostTitleSnippet, clt.LinkRecencyRank
+        FROM ComplexPostLinks clt
+        WHERE clt.PostId = qcl.QuestionId
+        ORDER BY clt.LinkRecencyRank
+        LIMIT 1
+    ) cl ON TRUE
+    LEFT JOIN LATERAL (
+        SELECT pcw.Id, pcw.PostId, pcw.CommentScore, pcw.CommentLength, pcw.CommentDate, pcw.CommentAuthor, pcw.IsRegisteredUser
+        FROM PostCommentsWithUser pcw
+        WHERE pcw.PostId = qcl.QuestionId
+        ORDER BY pcw.CommentScore DESC NULLS LAST, pcw.CommentDate DESC
+        LIMIT 1
+    ) pc ON TRUE
+)
+SELECT *
+FROM FinalResult
+ORDER BY PopularityStatus DESC, QuestionScore DESC, TotalAnswers DESC
+LIMIT 50;

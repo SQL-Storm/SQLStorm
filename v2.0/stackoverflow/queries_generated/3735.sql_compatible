@@ -1,0 +1,189 @@
+WITH
+user_summary AS (
+    SELECT
+        u.Id                                   AS user_id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.Views,0)                    AS total_views,
+        COUNT(b.Id)                            AS total_badges,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS gold_badges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS silver_badges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS bronze_badges,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END)   AS up_votes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END)   AS down_votes,
+        SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END)   AS favorites
+    FROM Users u
+    LEFT JOIN Badges b        ON b.UserId = u.Id
+    LEFT JOIN Posts p         ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v         ON v.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views
+),
+tag_popularity AS (
+    SELECT
+        TRIM(BOTH '<' FROM REGEXP_REPLACE(unnested_tag, '>$', '')) AS tag,
+        COUNT(*)                                            AS tag_uses,
+        AVG(p.Score)                                        AS avg_score,
+        SUM(p.ViewCount)                                    AS total_views
+    FROM Posts p,
+    LATERAL (
+      SELECT UNNEST(string_to_array(p.Tags, '><')) AS unnested_tag
+    ) s
+    WHERE p.PostTypeId = 1
+      AND p.Tags IS NOT NULL
+    GROUP BY TRIM(BOTH '<' FROM REGEXP_REPLACE(unnested_tag, '>$', ''))
+),
+user_top_answers AS (
+    SELECT
+        a.OwnerUserId                           AS user_id,
+        a.Id                                    AS answer_id,
+        a.ParentId                              AS question_id,
+        a.Score                                 AS answer_score,
+        a.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY a.OwnerUserId ORDER BY a.Score DESC, a.CreationDate DESC) AS rn
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+      AND a.Score > 0
+),
+question_comment_stats AS (
+    SELECT
+        q.Id                                 AS question_id,
+        q.Title,
+        q.Score                              AS question_score,
+        COALESCE(c.comment_cnt,0)             AS comment_count,
+        CASE
+            WHEN COALESCE(c.comment_cnt,0) = 0 THEN 'No comments'
+            WHEN COALESCE(c.comment_cnt,0) <= 3 THEN 'Low activity'
+            ELSE 'High activity'
+        END                                 AS activity_level
+    FROM Posts q
+    LEFT JOIN (
+        SELECT
+            p.Id                                   AS post_id,
+            COUNT(cm.Id)                           AS comment_cnt
+        FROM Posts p
+        LEFT JOIN Comments cm ON cm.PostId = p.Id
+        WHERE p.PostTypeId = 1
+        GROUP BY p.Id
+    ) c ON c.post_id = q.Id
+    WHERE q.PostTypeId = 1
+),
+combined_user_data AS (
+    SELECT
+        us.user_id,
+        us.DisplayName,
+        us.Reputation,
+        us.total_views,
+        us.total_badges,
+        us.gold_badges,
+        us.silver_badges,
+        us.bronze_badges,
+        us.up_votes,
+        us.down_votes,
+        us.favorites,
+        ua.answer_id,
+        ua.question_id,
+        ua.answer_score,
+        ua.CreationDate          AS answer_date,
+        CAST(NULL AS INTEGER)    AS question_id_alt,
+        CAST(NULL AS VARCHAR)    AS question_title_alt,
+        CAST(NULL AS INTEGER)    AS comment_cnt_alt,
+        CAST(NULL AS VARCHAR)    AS activity_level_alt
+    FROM user_summary us
+    LEFT JOIN user_top_answers ua
+          ON ua.user_id = us.user_id AND ua.rn = 1
+
+    UNION ALL
+
+    SELECT
+        qs.question_id            AS user_id,
+        CAST(NULL AS VARCHAR(4000))         AS DisplayName,
+        CAST(NULL AS INTEGER)               AS Reputation,
+        CAST(NULL AS INTEGER)               AS total_views,
+        CAST(NULL AS INTEGER)               AS total_badges,
+        CAST(NULL AS INTEGER)               AS gold_badges,
+        CAST(NULL AS INTEGER)               AS silver_badges,
+        CAST(NULL AS INTEGER)               AS bronze_badges,
+        CAST(NULL AS INTEGER)               AS up_votes,
+        CAST(NULL AS INTEGER)               AS down_votes,
+        CAST(NULL AS INTEGER)               AS favorites,
+        CAST(NULL AS INTEGER)               AS answer_id,
+        CAST(NULL AS INTEGER)               AS question_id,
+        CAST(NULL AS INTEGER)               AS answer_score,
+        CAST(NULL AS TIMESTAMP)             AS answer_date,
+        qs.question_id            AS question_id_alt,
+        qs.Title                  AS question_title_alt,
+        qs.comment_count          AS comment_cnt_alt,
+        qs.activity_level         AS activity_level_alt
+    FROM question_comment_stats qs
+)
+
+SELECT
+    cu.user_id,
+    cu.DisplayName,
+    cu.Reputation,
+    cu.total_views,
+    cu.total_badges,
+    cu.gold_badges,
+    cu.silver_badges,
+    cu.bronze_badges,
+    cu.up_votes,
+    cu.down_votes,
+    cu.favorites,
+    cu.answer_id,
+    cu.question_id,
+    cu.answer_score,
+    cu.answer_date,
+    cu.question_id_alt,
+    cu.question_title_alt,
+    cu.comment_cnt_alt,
+    cu.activity_level_alt,
+    COALESCE(t.tag, 'NoTag')                          AS top_tag,
+    COALESCE(t.tag_uses,0)                            AS top_tag_uses,
+    -- cast to numeric with precision using standard SQL CAST
+    CAST(COALESCE(t.avg_score,0) AS NUMERIC(10,2))    AS top_tag_avg_score,
+    COALESCE(t.total_views,0)                         AS top_tag_total_views,
+    (COALESCE(cu.Reputation,0) * 0.6
+     + COALESCE(cu.gold_badges,0) * 100
+     + COALESCE(cu.silver_badges,0) * 50
+     + COALESCE(cu.bronze_badges,0) * 20
+     + COALESCE(cu.up_votes,0) * 1
+     - COALESCE(cu.down_votes,0) * 2)                AS weighted_score
+FROM combined_user_data cu
+LEFT JOIN LATERAL (
+    SELECT
+        tp.tag,
+        tp.tag_uses,
+        tp.avg_score,
+        tp.total_views
+    FROM tag_popularity tp
+    ORDER BY tp.tag_uses DESC, tp.avg_score DESC
+    LIMIT 1
+) t ON TRUE
+WHERE (cu.user_id IS NOT NULL AND cu.DisplayName IS NOT NULL)
+   OR (cu.question_id_alt IS NOT NULL AND cu.activity_level_alt = 'High activity')
+GROUP BY
+    cu.user_id,
+    cu.DisplayName,
+    cu.Reputation,
+    cu.total_views,
+    cu.total_badges,
+    cu.gold_badges,
+    cu.silver_badges,
+    cu.bronze_badges,
+    cu.up_votes,
+    cu.down_votes,
+    cu.favorites,
+    cu.answer_id,
+    cu.question_id,
+    cu.answer_score,
+    cu.answer_date,
+    cu.question_id_alt,
+    cu.question_title_alt,
+    cu.comment_cnt_alt,
+    cu.activity_level_alt,
+    t.tag,
+    t.tag_uses,
+    t.avg_score,
+    t.total_views
+ORDER BY weighted_score DESC
+LIMIT 500;

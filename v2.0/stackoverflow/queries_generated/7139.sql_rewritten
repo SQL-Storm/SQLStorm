@@ -1,0 +1,169 @@
+-- {"query": "7139.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1437} 
+WITH PostStats AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.Body,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevScore,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PostRank,
+        COALESCE(p.Score, 0) + COALESCE(p.ViewCount, 0) AS ScoreViewSum,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostTypeDesc,
+        CASE 
+            WHEN p.Score >= 100 THEN 'Highly Rated'
+            WHEN p.Score >= 10 THEN 'Moderately Rated'
+            ELSE 'Low Rated'
+        END AS RatingCategory
+    FROM Posts p
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        STRING_AGG(DISTINCT p.Tags, ', ') AS AllTags,
+        AVG(p.Score) AS AvgScore,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) AS MedianScore,
+        CASE 
+            WHEN MAX(p.CreationDate) >= DATEADD(month, -6, cast('2024-10-01 12:34:56' as timestamp)) THEN 'Active'
+            ELSE 'Inactive'
+        END AS ActivityStatus
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TagAnalysis AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        COALESCE(t.Count, 0) * 0.1 + 
+        CASE WHEN t.IsRequired = 1 THEN 50 ELSE 0 END +
+        CASE WHEN t.IsModeratorOnly = 1 THEN 30 ELSE 0 END AS TagPriorityScore,
+        RANK() OVER (ORDER BY t.Count DESC) AS PopularityRank,
+        LAG(t.Count) OVER (ORDER BY t.Count DESC) - t.Count AS CountChange
+    FROM Tags t
+),
+ComplexMetrics AS (
+    SELECT 
+        ps.Id,
+        ps.PostTypeId,
+        ps.Score,
+        ps.ViewCount,
+        ps.AnswerCount,
+        ps.CommentCount,
+        ps.FavoriteCount,
+        ps.CreationDate,
+        ps.OwnerUserId,
+        ps.Title,
+        ps.Tags,
+        ps.PrevScore,
+        ps.PostRank,
+        ps.ScoreViewSum,
+        ps.PostTypeDesc,
+        ps.RatingCategory,
+        CASE 
+            WHEN ps.Score >= 10 AND ps.AnswerCount >= 5 THEN 1
+            WHEN ps.Score >= 5 AND ps.AnswerCount >= 1 THEN 1
+            ELSE 0
+        END AS HasGoodAnswers,
+        CASE 
+            WHEN ps.ScoreViewSum > 500 AND ps.PostRank > 1 THEN 1
+            ELSE 0
+        END AS HighEngagementPost,
+        COALESCE(ps.Score, 0) * 0.3 + 
+        COALESCE(ps.ViewCount, 0) * 0.2 + 
+        COALESCE(ps.AnswerCount, 0) * 0.25 + 
+        COALESCE(ps.CommentCount, 0) * 0.15 + 
+        COALESCE(ps.FavoriteCount, 0) * 0.1 AS CompositeScore
+    FROM PostStats ps
+)
+SELECT 
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.PostCount,
+    ua.CommentCount,
+    ua.BadgeCount,
+    ua.ActivityStatus,
+    CASE 
+        WHEN ua.PostCount > 0 THEN ua.AvgScore 
+        ELSE 0 
+    END AS AveragePostScore,
+    COALESCE(ua.MedianScore, 0) AS MedianPostScore,
+    STRING_AGG(DISTINCT COALESCE(pa.Title, 'No Title'), '; ') AS RecentTitles,
+    COALESCE(
+        COUNT(DISTINCT CASE WHEN cm.HasGoodAnswers = 1 THEN cm.Id END),
+        0
+    ) AS GoodAnswerCount,
+    COALESCE(
+        COUNT(DISTINCT CASE WHEN cm.HighEngagementPost = 1 THEN cm.Id END),
+        0
+    ) AS HighEngagementCount,
+    CASE 
+        WHEN COUNT(DISTINCT cm.Id) > 0 THEN 
+            AVG(cm.CompositeScore) 
+        ELSE 0 
+    END AS AverageCompositeScore,
+    STRING_AGG(
+        CASE 
+            WHEN ta.PopularityRank <= 10 THEN ta.TagName 
+            ELSE NULL 
+        END, 
+        ', '
+    ) AS TopTags,
+    RANK() OVER (ORDER BY AVG(cm.CompositeScore) DESC) AS UserRankByScore,
+    DENSE_RANK() OVER (ORDER BY ua.Reputation DESC) AS UserReputationRank,
+    FIRST_VALUE(ua.DisplayName) OVER (
+        PARTITION BY ua.ActivityStatus 
+        ORDER BY AVG(cm.CompositeScore) DESC
+    ) AS BestUserInActivityStatus
+FROM UserActivity ua
+LEFT JOIN ComplexMetrics cm ON ua.UserId = cm.OwnerUserId
+LEFT JOIN Posts pa ON ua.UserId = pa.OwnerUserId
+LEFT JOIN TagAnalysis ta ON pa.Tags LIKE '%' + ta.TagName + '%'
+GROUP BY 
+    ua.UserId, 
+    ua.DisplayName, 
+    ua.Reputation, 
+    ua.PostCount, 
+    ua.CommentCount, 
+    ua.BadgeCount, 
+    ua.ActivityStatus, 
+    ua.AvgScore, 
+    ua.MedianScore
+HAVING 
+    COUNT(DISTINCT cm.Id) >= 0
+    AND CASE 
+        WHEN ua.PostCount > 0 THEN ua.AvgScore > 0 
+        ELSE 1 
+    END
+    AND COUNT(DISTINCT COALESCE(pa.Tags, 'NULL')) >= 0
+ORDER BY 
+    CASE WHEN AVG(cm.CompositeScore) IS NULL THEN 0 ELSE AVG(cm.CompositeScore) END DESC,
+    ua.Reputation DESC
+LIMIT 1000;

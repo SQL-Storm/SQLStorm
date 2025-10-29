@@ -1,0 +1,442 @@
+-- {"query": "7887.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 3432} 
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) as QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) as AnswerCount,
+        MAX(p.Score) as MaxPostScore,
+        AVG(p.Score) as AvgPostScore,
+        COUNT(DISTINCT CASE WHEN p.Score > 0 THEN p.Id END) as PositiveScorePosts,
+        COUNT(DISTINCT CASE WHEN p.Score < 0 THEN p.Id END) as NegativeScorePosts,
+        COUNT(DISTINCT CASE WHEN p.Score = 0 THEN p.Id END) as ZeroScorePosts,
+        SUM(p.ViewCount) as TotalViews,
+        STRING_AGG(DISTINCT p.Tags, ', ') as AllTags,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN p.Id END) as AcceptedQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN p.Id END) as QuestionWithAnswers,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.ParentId IS NOT NULL THEN p.Id END) as AnsweredQuestions,
+        MAX(p.CreationDate) as LastPostDate,
+        MIN(p.CreationDate) as FirstPostDate,
+        DATEDIFF(day, MIN(p.CreationDate), MAX(p.CreationDate)) as DaysActive,
+        COUNT(DISTINCT CASE WHEN p.ParentId IS NOT NULL AND p.PostTypeId = 2 AND p.Score > 0 THEN p.ParentId END) as PositiveAnswersToQuestions,
+        COUNT(DISTINCT CASE WHEN p.ParentId IS NOT NULL AND p.PostTypeId = 2 AND p.Score < 0 THEN p.ParentId END) as NegativeAnswersToQuestions,
+        COUNT(DISTINCT CASE WHEN p.ParentId IS NOT NULL AND p.PostTypeId = 2 AND p.Score = 0 THEN p.ParentId END) as ZeroScoreAnswersToQuestions
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.DeletedDate IS NULL
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.OwnerDisplayName,
+        p.ParentId,
+        p.AcceptedAnswerId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.Tags,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 
+                COALESCE(p.AnswerCount, 0) + COALESCE(p.CommentCount, 0)
+            WHEN p.PostTypeId = 2 THEN 
+                COALESCE(p.CommentCount, 0) + COALESCE(p.Score, 0) * 2
+            ELSE 0 
+        END as EngagementScore,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 
+                CASE 
+                    WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+                    WHEN p.AnswerCount IS NULL OR p.AnswerCount = 0 THEN 'Unanswered'
+                    ELSE 'Answered' 
+                END
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other' 
+        END as PostStatus,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) as ScoreRank,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as UserPostSequence,
+        LAG(p.Score, 1) OVER (ORDER BY p.CreationDate) as PreviousScore,
+        LEAD(p.Score, 1) OVER (ORDER BY p.CreationDate) as NextScore,
+        AVG(p.Score) OVER (ORDER BY p.CreationDate ROWS BETWEEN 5 PRECEDING AND 5 FOLLOWING) as MovingAverageScore
+    FROM Posts p
+    WHERE p.DeletedDate IS NULL
+),
+UserPostStats AS (
+    SELECT 
+        ps.UserId,
+        ps.DisplayName,
+        ps.Reputation,
+        ps.PostCount,
+        ps.QuestionCount,
+        ps.AnswerCount,
+        ps.MaxPostScore,
+        ps.AvgPostScore,
+        ps.PositiveScorePosts,
+        ps.NegativeScorePosts,
+        ps.ZeroScorePosts,
+        ps.TotalViews,
+        ps.AllTags,
+        ps.AcceptedQuestions,
+        ps.QuestionWithAnswers,
+        ps.AnsweredQuestions,
+        ps.LastPostDate,
+        ps.FirstPostDate,
+        ps.DaysActive,
+        ps.PositiveAnswersToQuestions,
+        ps.NegativeAnswersToQuestions,
+        ps.ZeroScoreAnswersToQuestions,
+        CASE 
+            WHEN ps.PostCount > 0 THEN
+                CAST(ps.PositiveScorePosts AS FLOAT) / CAST(ps.PostCount AS FLOAT) * 100
+            ELSE 0 
+        END as PositiveScorePercentage,
+        CASE 
+            WHEN ps.QuestionCount > 0 THEN
+                CAST(ps.AcceptedQuestions AS FLOAT) / CAST(ps.QuestionCount AS FLOAT) * 100
+            ELSE 0 
+        END as AcceptanceRate,
+        CASE 
+            WHEN ps.QuestionCount > 0 THEN
+                CAST(ps.QuestionWithAnswers AS FLOAT) / CAST(ps.QuestionCount AS FLOAT) * 100
+            ELSE 0 
+        END as AnswerRate,
+        CASE 
+            WHEN ps.AnswerCount > 0 THEN
+                CAST(ps.AnsweredQuestions AS FLOAT) / CAST(ps.AnswerCount AS FLOAT) * 100
+            ELSE 0 
+        END as AnswerCompletionRate,
+        CASE 
+            WHEN ps.DaysActive > 0 THEN 
+                CAST(ps.PostCount AS FLOAT) / CAST(ps.DaysActive AS FLOAT)
+            ELSE 0 
+        END as PostsPerDay,
+        CASE 
+            WHEN ps.PostCount > 0 THEN 
+                CAST(ps.TotalViews AS FLOAT) / CAST(ps.PostCount AS FLOAT)
+            ELSE 0 
+        END as AvgViewsPerPost
+    FROM UserStats ps
+    WHERE ps.PostCount > 0
+),
+HighEngagementPosts AS (
+    SELECT 
+        pa.PostId,
+        pa.Title,
+        pa.PostTypeId,
+        pa.Score,
+        pa.ViewCount,
+        pa.CreationDate,
+        pa.OwnerUserId,
+        pa.OwnerDisplayName,
+        pa.ParentId,
+        pa.AcceptedAnswerId,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.Tags,
+        pa.EngagementScore,
+        pa.PostStatus,
+        pa.ScoreRank,
+        pa.UserPostSequence,
+        pa.PreviousScore,
+        pa.NextScore,
+        pa.MovingAverageScore,
+        CASE 
+            WHEN pa.EngagementScore > (
+                SELECT AVG(EngagementScore) 
+                FROM PostAnalysis 
+                WHERE PostTypeId = 1
+            ) * 1.5 THEN 'High Engagement'
+            WHEN pa.EngagementScore > (
+                SELECT AVG(EngagementScore) 
+                FROM PostAnalysis 
+                WHERE PostTypeId = 1
+            ) THEN 'Above Average'
+            ELSE 'Below Average'
+        END as EngagementLevel,
+        CASE 
+            WHEN pa.MovingAverageScore > (
+                SELECT AVG(MovingAverageScore) 
+                FROM PostAnalysis
+            ) * 1.3 THEN 'High Velocity'
+            WHEN pa.MovingAverageScore > (
+                SELECT AVG(MovingAverageScore) 
+                FROM PostAnalysis
+            ) THEN 'Moderate Velocity'
+            ELSE 'Low Velocity'
+        END as VelocityLevel
+    FROM PostAnalysis pa
+    WHERE pa.PostTypeId IN (1, 2) AND pa.EngagementScore > 0
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.IsRequired = 1 THEN 'Required'
+            WHEN t.IsModeratorOnly = 1 THEN 'Moderator Only'
+            ELSE 'Standard'
+        END as TagType,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as PopularityRank,
+        PERCENT_RANK() OVER (ORDER BY t.Count) as PopularityPercentile,
+        LAG(t.Count, 1) OVER (ORDER BY t.Count DESC) as PreviousCount,
+        LEAD(t.Count, 1) OVER (ORDER BY t.Count DESC) as NextCount
+    FROM Tags t
+    WHERE t.Count > 0
+),
+UserTagAnalysis AS (
+    SELECT 
+        ups.UserId,
+        ups.DisplayName,
+        ups.Reputation,
+        ups.PostCount,
+        ups.QuestionCount,
+        ups.AnswerCount,
+        ups.PositiveScorePercentage,
+        ups.AcceptanceRate,
+        ups.AnswerRate,
+        ups.AnswerCompletionRate,
+        ups.PostsPerDay,
+        ups.AvgViewsPerPost,
+        STRING_AGG(DISTINCT SUBSTRING(ups.AllTags, 2, LENGTH(ups.AllTags) - 2), ', ') as AllTagNames,
+        COUNT(DISTINCT CASE WHEN ups.AllTags IS NOT NULL AND ups.AllTags != '' THEN 1 END) as TagCount,
+        AVG(CASE WHEN ups.AllTags IS NOT NULL THEN LEN(ups.AllTags) ELSE 0 END) as AvgTagLength,
+        DENSE_RANK() OVER (ORDER BY ups.Reputation DESC) as ReputationRank
+    FROM UserPostStats ups
+    GROUP BY ups.UserId, ups.DisplayName, ups.Reputation, ups.PostCount, ups.QuestionCount, ups.AnswerCount, ups.PositiveScorePercentage, ups.AcceptanceRate, ups.AnswerRate, ups.AnswerCompletionRate, ups.PostsPerDay, ups.AvgViewsPerPost
+)
+SELECT 
+    'Performance Benchmark Result' as ReportTitle,
+    GETDATE() as BenchmarkDate,
+    COUNT(*) as TotalUsers,
+    (
+        SELECT COUNT(*) 
+        FROM Posts 
+        WHERE DeletedDate IS NULL AND PostTypeId IN (1, 2)
+    ) as TotalPosts,
+    (
+        SELECT COUNT(*) 
+        FROM Comments
+    ) as TotalComments,
+    (
+        SELECT COUNT(*) 
+        FROM Badges
+    ) as TotalBadges,
+    (
+        SELECT COUNT(*) 
+        FROM Tags
+    ) as TotalTags,
+    (
+        SELECT COUNT(*) 
+        FROM PostHistory
+    ) as TotalHistoryRecords,
+    (
+        SELECT AVG(Reputation) 
+        FROM Users
+    ) as AvgReputation,
+    (
+        SELECT AVG(PostCount) 
+        FROM UserPostStats
+    ) as AvgPostsPerUser,
+    (
+        SELECT AVG(CommentCount) 
+        FROM UserStats
+    ) as AvgCommentsPerUser,
+    (
+        SELECT AVG(BadgeCount) 
+        FROM UserStats
+    ) as AvgBadgesPerUser,
+    (
+        SELECT AVG(Score) 
+        FROM Posts 
+        WHERE DeletedDate IS NULL AND PostTypeId IN (1, 2)
+    ) as AvgPostScore,
+    (
+        SELECT MAX(ViewCount) 
+        FROM Posts 
+        WHERE DeletedDate IS NULL AND PostTypeId IN (1, 2)
+    ) as MaxPostViews,
+    (
+        SELECT MAX(CreationDate) 
+        FROM Posts
+    ) as LatestPostDate,
+    (
+        SELECT MIN(CreationDate) 
+        FROM Posts
+    ) as EarliestPostDate,
+    (
+        SELECT COUNT(*) 
+        FROM PostHistory 
+        WHERE PostHistoryTypeId IN (10, 11, 12, 13)
+    ) as TotalModifications,
+    (
+        SELECT COUNT(*) 
+        FROM Posts 
+        WHERE PostTypeId = 1 AND AnswerCount IS NULL
+    ) as QuestionsWithoutAnswers,
+    (
+        SELECT COUNT(*) 
+        FROM Posts 
+        WHERE PostTypeId = 1 AND AnswerCount > 0
+    ) as QuestionsWithAnswers,
+    (
+        SELECT COUNT(*) 
+        FROM Posts 
+        WHERE PostTypeId = 2 AND ParentId IS NOT NULL
+    ) as AnsweredPosts,
+    (
+        SELECT COUNT(*) 
+        FROM HighEngagementPosts
+    ) as HighEngagementPosts,
+    (
+        SELECT COUNT(*) 
+        FROM TagAnalysis
+    ) as TotalPopularTags,
+    (
+        SELECT AVG(Count) 
+        FROM TagAnalysis
+    ) as AvgTagCount,
+    (
+        SELECT MAX(Count) 
+        FROM TagAnalysis
+    ) as MaxTagCount,
+    (
+        SELECT COUNT(*) 
+        FROM UserTagAnalysis
+    ) as UserTagAnalysisCount,
+    (
+        SELECT AVG(Reputation) 
+        FROM UserTagAnalysis
+    ) as AvgTagUserReputation,
+    (
+        SELECT COUNT(*) 
+        FROM UserPostStats 
+        WHERE PositiveScorePercentage > 75
+    ) as HighPositiveScoreUsers,
+    (
+        SELECT COUNT(*) 
+        FROM UserPostStats 
+        WHERE AcceptanceRate > 50
+    ) as HighAcceptanceRateUsers,
+    (
+        SELECT COUNT(*) 
+        FROM UserPostStats 
+        WHERE AnswerCompletionRate > 75
+    ) as HighAnswerCompletionRateUsers,
+    (
+        SELECT COUNT(*) 
+        FROM UserPostStats 
+        WHERE PostCount > 100
+    ) as HighPostCountUsers,
+    (
+        SELECT COUNT(*) 
+        FROM UserPostStats 
+        WHERE PostsPerDay > 0.5
+    ) as HighActivityUsers,
+    (
+        SELECT COUNT(*) 
+        FROM UserTagAnalysis
+    ) as TagAnalysisUsers,
+    (
+        SELECT COUNT(*) 
+        FROM UserPostStats
+    ) as PostAnalysisUsers,
+    (
+        SELECT COUNT(*) 
+        FROM PostAnalysis
+    ) as TotalPostAnalysisRecords,
+    (
+        SELECT COUNT(*) 
+        FROM PostHistory
+    ) as TotalHistoryCount,
+    (
+        SELECT COUNT(*) 
+        FROM Posts 
+        WHERE PostTypeId = 2 AND Score > 10
+    ) as HighScoreAnswers,
+    (
+        SELECT COUNT(*) 
+        FROM Posts 
+        WHERE PostTypeId = 1 AND Score > 100
+    ) as HighScoreQuestions
+FROM 
+    Users u,
+    (
+        SELECT COUNT(*) as DummyCount
+        FROM UserTagAnalysis
+    ) x,
+    (
+        SELECT COUNT(*) as DummyCount
+        FROM PostAnalysis
+    ) y
+WHERE 
+    EXISTS (
+        SELECT 1
+        FROM Posts p
+        WHERE p.OwnerUserId = u.Id
+        AND p.DeletedDate IS NULL
+    )
+    AND EXISTS (
+        SELECT 1
+        FROM Badges b
+        WHERE b.UserId = u.Id
+    )
+    AND EXISTS (
+        SELECT 1
+        FROM Comments c
+        WHERE c.UserId = u.Id
+    )
+    AND EXISTS (
+        SELECT 1
+        FROM PostHistory ph
+        WHERE ph.UserId = u.Id
+    )
+    AND EXISTS (
+        SELECT 1
+        FROM Posts p
+        WHERE p.OwnerUserId = u.Id
+        AND p.PostTypeId IN (1, 2)
+    )
+    AND EXISTS (
+        SELECT 1
+        FROM Tags t
+        WHERE t.TagName LIKE '%sql%'
+    )
+    AND DATEADD(day, -30, GETDATE()) <= (
+        SELECT MAX(p.CreationDate)
+        FROM Posts p
+        WHERE p.OwnerUserId = u.Id
+    )
+    AND u.Reputation > 1000
+    AND u.Views > 5000
+    AND u.UpVotes > 500
+    AND u.DownVotes < 100
+    AND u.AccountId IS NOT NULL
+    AND u.DisplayName IS NOT NULL
+    AND u.WebsiteUrl IS NOT NULL
+    AND u.Location IS NOT NULL
+    AND u.AboutMe IS NOT NULL
+    AND u.EmailHash IS NOT NULL
+    AND u.ProfileImageUrl IS NOT NULL
+    AND NOT EXISTS (
+        SELECT 1
+        FROM Posts p
+        WHERE p.OwnerUserId = u.Id
+        AND p.DeletedDate IS NOT NULL
+    )
+ORDER BY u.Reputation DESC
+OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY

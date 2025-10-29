@@ -1,0 +1,209 @@
+WITH RECURSIVE RecursiveUserTags AS (
+    SELECT 
+        u.Id AS UserId,
+        unnest(string_to_array(coalesce(p.Tags,''), '><')) AS Tag
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+    WHERE p.Tags IS NOT NULL
+    UNION ALL
+    SELECT 
+        rut.UserId,
+        unnest(string_to_array(t.Tags, '><'))
+    FROM RecursiveUserTags rut
+    JOIN Posts p ON p.Tags LIKE '%' || rut.Tag || '%'
+    JOIN Tags t ON t.TagName = rut.Tag
+    WHERE rut.Tag IS NOT NULL
+),
+UserBadgeTagCounts AS (
+    SELECT
+        b.UserId,
+        b.Name AS BadgeName,
+        count(distinct rut.Tag) AS DistinctTags,
+        sum(case when b.Class = 1 then 1 else 0 end) AS GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) AS SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) AS BronzeBadges
+    FROM Badges b
+    LEFT JOIN RecursiveUserTags rut ON rut.UserId = b.UserId
+    GROUP BY b.UserId, b.Name
+),
+LatestPostVotes AS (
+    SELECT
+        v.PostId,
+        v.VoteTypeId,
+        v.CreationDate,
+        v.UserId AS VoterId,
+        v.BountyAmount
+    FROM (
+        SELECT *, ROW_NUMBER() OVER (PARTITION BY PostId ORDER BY CreationDate DESC) rn
+        FROM Votes
+        WHERE VoteTypeId IN (2,3,8,9)
+    ) v
+    WHERE rn = 1
+),
+QuestionAnswerRanks AS (
+    SELECT 
+        q.Id AS QuestionId,
+        a.Id AS AnswerId,
+        a.OwnerUserId AS AnswerUserId,
+        a.Score AS AnswerScore,
+        row_number() OVER (PARTITION BY q.Id ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank,
+        q.AcceptedAnswerId,
+        q.Title,
+        q.Tags,
+        q.CreationDate AS QuestionCreation,
+        q.Score AS QuestionScore
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+),
+PostClosingInfo AS (
+    SELECT 
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        crt.Name AS CloseReason,
+        ph.CreationDate AS CloseDate
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS integer)
+    WHERE ph.PostHistoryTypeId = 10
+),
+UserReputationWindows AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate,
+        u.DisplayName,
+        sum(coalesce(vtCnt.UpMod,0)) OVER (ORDER BY u.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativeUpvotes,
+        sum(coalesce(vtCnt.DownMod,0)) OVER (ORDER BY u.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativeDownvotes,
+        dense_rank() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+    LEFT JOIN (
+        SELECT UserId,
+            sum(case when VoteTypeId = 2 then 1 else 0 end) AS UpMod,
+            sum(case when VoteTypeId = 3 then 1 else 0 end) AS DownMod
+        FROM Votes
+        GROUP BY UserId
+    ) vtCnt ON vtCnt.UserId = u.Id
+),
+PostAnswerVotes AS (
+    SELECT
+        a.ParentId AS QuestionId,
+        a.Id AS AnswerId,
+        count(distinct case when v.VoteTypeId = 2 then v.Id end) AS UpVotes,
+        count(distinct case when v.VoteTypeId = 3 then v.Id end) AS DownVotes,
+        count(distinct v.Id) AS TotalVotes
+    FROM Posts a
+    LEFT JOIN Votes v ON v.PostId = a.Id
+    WHERE a.PostTypeId = 2
+    GROUP BY a.ParentId, a.Id
+),
+ComplexUserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        count(distinct p.Id) AS TotalPosts,
+        count(distinct b.Id) AS TotalBadges,
+        count(distinct c.Id) FILTER (WHERE c.Score > 0) AS PositiveComments,
+        max(ph.CreationDate) AS LastEditDate,
+        count(distinct ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6)) AS EditCount,
+        coalesce(sum(case when v.VoteTypeId = 2 then 1 else 0 end), 0) AS UpVotesReceived,
+        coalesce(sum(case when v.VoteTypeId = 3 then 1 else 0 end), 0) AS DownVotesReceived,
+        count(distinct distinctTags.Tag) AS DistinctTagsOnPosts
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    LEFT JOIN LATERAL (
+        SELECT distinct unnest(string_to_array(coalesce(p2.Tags,''), '><')) AS Tag
+        FROM Posts p2
+        WHERE p2.OwnerUserId = u.Id AND p2.Tags IS NOT NULL
+    ) distinctTags ON true
+    GROUP BY u.Id, u.DisplayName
+)
+SELECT
+    q.Title,
+    q.QuestionId,
+    q.AnswerId,
+    q.AnswerUserId,
+    q.AnswerScore,
+    q.AnswerRank,
+    q.AcceptedAnswerId,
+    pci.CloseReason,
+    pci.CloseDate,
+    urw.DisplayName AS QuestionAuthor,
+    urw.ReputationRank,
+    urw.CumulativeUpvotes,
+    urw.CumulativeDownvotes,
+    ubtc.DistinctTags,
+    ubtc.GoldBadges,
+    ubtc.SilverBadges,
+    ubtc.BronzeBadges,
+    paw.UpVotes,
+    paw.DownVotes,
+    paw.TotalVotes,
+    cua.TotalPosts,
+    cua.TotalBadges,
+    cua.PositiveComments,
+    cua.LastEditDate,
+    cua.EditCount,
+    cua.UpVotesReceived,
+    cua.DownVotesReceived,
+    cua.DistinctTagsOnPosts,
+    concat_ws(' | ', replace(coalesce(q.Tags,''), '><', ',')) AS TagList,
+    case 
+        when q.QuestionScore > 100 then 'Hot'
+        when q.QuestionScore BETWEEN 50 AND 100 then 'Popular'
+        else 'Regular'
+    end AS QuestionPopularity,
+    row_number() OVER (PARTITION BY q.AnswerUserId ORDER BY q.AnswerScore DESC) AS AnswererRank,
+    case when q.AcceptedAnswerId = q.AnswerId then true else false end AS IsAcceptedAnswer,
+    (
+        SELECT count(*) 
+        FROM Comments c2 
+        WHERE c2.PostId = q.QuestionId
+          AND c2.CreationDate > q.QuestionCreation
+          AND (c2.Text ILIKE '%help%' OR c2.Text ILIKE '%debug%')
+    ) AS HelpCommentsAfterQuestionCreation
+FROM QuestionAnswerRanks q
+LEFT JOIN PostClosingInfo pci ON pci.PostId = q.QuestionId
+LEFT JOIN UserReputationWindows urw ON urw.UserId = (SELECT OwnerUserId FROM Posts WHERE Id = q.QuestionId)
+LEFT JOIN UserBadgeTagCounts ubtc ON ubtc.UserId = urw.UserId
+LEFT JOIN PostAnswerVotes paw ON paw.AnswerId = q.AnswerId
+LEFT JOIN ComplexUserActivity cua ON cua.UserId = q.AnswerUserId
+WHERE coalesce(pci.CloseDate, DATE '2999-12-31') > q.QuestionCreation
+  AND q.AnswerRank <= 3
+
+UNION ALL
+
+SELECT 
+    NULL,
+    -1,
+    NULL,
+    -1,
+    -1,
+    -1,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL
+
+ORDER BY AnswererRank NULLS LAST, QuestionPopularity DESC, AnswerScore DESC
+LIMIT 100;

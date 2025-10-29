@@ -1,0 +1,133 @@
+-- {"query": "3198.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2641} 
+
+WITH
+    badge_counts AS (
+        SELECT
+            b.UserId,
+            COUNT(*) FILTER (WHERE b.Class = 1) AS gold_cnt,
+            COUNT(*) FILTER (WHERE b.Class = 2) AS silver_cnt,
+            COUNT(*) FILTER (WHERE b.Class = 3) AS bronze_cnt,
+            COUNT(*)                                 AS total_badges
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+    post_stats AS (
+        SELECT
+            p.OwnerUserId AS UserId,
+            COUNT(*) FILTER (WHERE p.PostTypeId = 1)               AS question_cnt,
+            COUNT(*) FILTER (WHERE p.PostTypeId = 2)               AS answer_cnt,
+            AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END)      AS avg_answer_score,
+            MAX(p.CreationDate)                                   AS last_post_date,
+            MAX(p.ViewCount) FILTER (WHERE p.PostTypeId = 1)      AS max_question_views,
+            COALESCE(SUM(p.FavoriteCount),0)                      AS total_favorites
+        FROM Posts p
+        WHERE p.OwnerUserId IS NOT NULL
+        GROUP BY p.OwnerUserId
+    ),
+    recent_activity AS (
+        SELECT
+            u.Id AS UserId,
+            GREATEST(
+                COALESCE(ps.last_post_date,    '1970-01-01'::timestamp),
+                COALESCE(c.max_comment_date,  '1970-01-01'::timestamp),
+                COALESCE(v.max_vote_date,    '1970-01-01'::timestamp)
+            ) AS latest_activity
+        FROM Users u
+        LEFT JOIN (
+            SELECT OwnerUserId, MAX(CreationDate) AS max_comment_date
+            FROM Comments
+            GROUP BY OwnerUserId
+        ) c ON c.OwnerUserId = u.Id
+        LEFT JOIN (
+            SELECT UserId, MAX(CreationDate) AS max_vote_date
+            FROM Votes
+            GROUP BY UserId
+        ) v ON v.UserId = u.Id
+        LEFT JOIN post_stats ps ON ps.UserId = u.Id
+    ),
+    top_tags AS (
+        SELECT
+            pt.OwnerUserId AS UserId,
+            tag,
+            cnt,
+            ROW_NUMBER() OVER (PARTITION BY pt.OwnerUserId ORDER BY cnt DESC) AS rn
+        FROM (
+            SELECT
+                OwnerUserId,
+                unnest(string_to_array(trim(both '<>' from Tags), '><')) AS tag
+            FROM Posts
+            WHERE OwnerUserId IS NOT NULL AND Tags IS NOT NULL
+        ) pt
+        JOIN (
+            SELECT
+                tag,
+                COUNT(*) AS cnt
+            FROM (
+                SELECT unnest(string_to_array(trim(both '<>' from Tags), '><')) AS tag
+                FROM Posts
+                WHERE Tags IS NOT NULL
+            ) t
+            GROUP BY tag
+        ) tg ON tg.tag = pt.tag
+        GROUP BY pt.OwnerUserId, tag, cnt
+    ),
+    user_combined AS (
+        SELECT
+            u.Id,
+            u.DisplayName,
+            u.Reputation,
+            COALESCE(bc.gold_cnt,0)      AS gold_badges,
+            COALESCE(bc.silver_cnt,0)    AS silver_badges,
+            COALESCE(bc.bronze_cnt,0)    AS bronze_badges,
+            COALESCE(ps.question_cnt,0)  AS questions,
+            COALESCE(ps.answer_cnt,0)    AS answers,
+            ROUND(COALESCE(ps.avg_answer_score,0),2) AS avg_answer_score,
+            COALESCE(ps.total_favorites,0)           AS favorites,
+            ra.latest_activity,
+            COALESCE(tt.tag,'<none>')    AS top_tag,
+            ( u.Reputation * 0.4
+            + COALESCE(ps.answer_cnt,0) * 0.2
+            + COALESCE(ps.question_cnt,0) * 0.1
+            + COALESCE(bc.total_badges,0) * 0.15
+            + COALESCE(ps.total_favorites,0) * 0.05 ) AS composite_score
+        FROM Users u
+        LEFT JOIN badge_counts   bc ON bc.UserId = u.Id
+        LEFT JOIN post_stats     ps ON ps.UserId = u.Id
+        LEFT JOIN recent_activity ra ON ra.UserId = u.Id
+        LEFT JOIN (
+            SELECT UserId, tag
+            FROM top_tags
+            WHERE rn = 1
+        ) tt ON tt.UserId = u.Id
+    ),
+    elite_users AS (
+        SELECT *
+        FROM user_combined
+        WHERE Reputation > 20000
+        UNION ALL
+        SELECT *
+        FROM user_combined
+        WHERE gold_badges >= 10 AND silver_badges >= 20
+    )
+SELECT
+    Id,
+    DisplayName,
+    Reputation,
+    gold_badges,
+    silver_badges,
+    bronze_badges,
+    questions,
+    answers,
+    avg_answer_score,
+    favorites,
+    top_tag,
+    composite_score,
+    ROW_NUMBER() OVER (ORDER BY composite_score DESC) AS rank,
+    CASE
+        WHEN latest_activity >= (CURRENT_DATE - INTERVAL '30 days') THEN 'Active'
+        ELSE 'Dormant'
+    END AS activity_status
+FROM elite_users
+WHERE composite_score IS NOT NULL
+ORDER BY composite_score DESC
+LIMIT 20;

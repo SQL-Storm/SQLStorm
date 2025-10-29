@@ -1,0 +1,144 @@
+-- {"query": "4828.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1531} 
+
+WITH
+  RankedAnswers AS (
+    SELECT
+      p.Id AS PostId,
+      p.ParentId AS QuestionId,
+      p.OwnerUserId,
+      p.CreationDate AS AnswerDate,
+      p.Score AS AnswerScore,
+      ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS AnswerRank,
+      LAG(p.Score, 1, -1) OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS PreviousScore,
+      LEAD(p.Score, 1, -1) OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS NextScore,
+      RANK() OVER (PARTITION BY p.ParentId ORDER BY p.CreationDate DESC) AS LatestAnswerRank
+    FROM Posts AS p
+    WHERE
+      p.PostTypeId = 2 -- Answers
+  ),
+  QuestionsWithRanks AS (
+    SELECT
+      q.Id AS QuestionId,
+      q.OwnerUserId AS QuestionOwnerUserId,
+      q.CreationDate AS QuestionDate,
+      q.Score AS QuestionScore,
+      q.AnswerCount,
+      q.FavoriteCount,
+      q.ClosedDate,
+      CASE
+        WHEN q.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN q.FavoriteCount > 100 THEN 'Highly Favorited'
+        WHEN q.Score > 1000 THEN 'High Score'
+        ELSE 'Regular'
+      END AS QuestionCategory,
+      ra.AnswerId,
+      ra.AnswerScore,
+      ra.AnswerRank,
+      ra.LatestAnswerRank,
+      u.DisplayName AS QuestionOwnerDisplayName,
+      COALESCE(q.ViewCount, 0) AS ActualViewCount,
+      -- Calculate a "quality score" for the question, considering votes, answers, and user reputation
+      (
+        (COALESCE(q.Score, 0) * 5) + (COALESCE(q.FavoriteCount, 0) * 10) + (COALESCE(q.AnswerCount, 0) * 2) + (COALESCE(u.Reputation, 0) / 1000)
+      ) AS QuestionQualityScore
+    FROM Posts AS q
+    JOIN RankedAnswers AS ra
+      ON q.Id = ra.QuestionId
+    LEFT JOIN Users AS u
+      ON q.OwnerUserId = u.Id
+    WHERE
+      q.PostTypeId = 1 -- Questions
+      AND ra.AnswerRank <= 3 -- Top 3 answers by score
+  ),
+  UserActivity AS (
+    SELECT
+      UserId,
+      COUNT(Id) AS TotalVotes,
+      SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+      SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+      SUM(CASE WHEN VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoriteVotes -- Old favorite vote type
+    FROM Votes
+    WHERE
+      UserId IS NOT NULL
+    GROUP BY
+      UserId
+  ),
+  PostHistorySummary AS (
+    SELECT
+      PostId,
+      MAX(CASE WHEN PostHistoryTypeId = 5 THEN CreationDate ELSE NULL END) AS LastBodyEditDate,
+      MAX(CASE WHEN PostHistoryTypeId = 6 THEN CreationDate ELSE NULL END) AS LastTagEditDate,
+      COUNT(DISTINCT CASE WHEN PostHistoryTypeId = 10 THEN UserId ELSE NULL END) AS CloseVoteCount
+    FROM PostHistory
+    GROUP BY
+      PostId
+  )
+SELECT
+  q.QuestionId,
+  q.QuestionDate,
+  q.QuestionScore,
+  q.AnswerCount,
+  q.FavoriteCount,
+  q.QuestionCategory,
+  q.QuestionOwnerDisplayName,
+  q.QuestionQualityScore,
+  q.AnswerId AS TopAnswerId,
+  q.AnswerScore AS TopAnswerScore,
+  q.AnswerRank AS TopAnswerRank,
+  q.LatestAnswerRank AS LatestAnswerRank,
+  ua.TotalVotes AS QuestionOwnerTotalVotes,
+  ua.UpVotes AS QuestionOwnerUpVotes,
+  ua.DownVotes AS QuestionOwnerDownVotes,
+  phs.LastBodyEditDate,
+  phs.LastTagEditDate,
+  phs.CloseVoteCount,
+  -- Calculate a "responsiveness score" for the question owner to their question
+  CASE
+    WHEN q.QuestionDate IS NOT NULL AND phs.LastBodyEditDate IS NOT NULL THEN
+      EXTRACT(EPOCH FROM (phs.LastBodyEditDate - q.QuestionDate)) / 60.0 -- in minutes
+    ELSE NULL
+  END AS QuestionResponseTimeMinutes,
+  -- Check if the question has been linked as a duplicate
+  CASE
+    WHEN EXISTS (
+      SELECT
+        1
+      FROM PostLinks AS pl
+      WHERE
+        pl.RelatedPostId = q.QuestionId AND pl.LinkTypeId = 3 -- Duplicate link type
+    ) THEN 'Linked as Duplicate'
+    ELSE 'Not Linked as Duplicate'
+  END AS DuplicateStatus,
+  -- String concatenation of tags for questions with high scores
+  CASE
+    WHEN q.QuestionScore > 500 THEN REPLACE(REPLACE(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><', ' | '), '<', '')
+    ELSE NULL
+  END AS FormattedTags
+FROM QuestionsWithRanks AS q
+LEFT JOIN UserActivity AS ua
+  ON q.QuestionOwnerUserId = ua.UserId
+LEFT JOIN PostHistorySummary AS phs
+  ON q.QuestionId = phs.PostId
+LEFT JOIN Posts AS p
+  ON q.QuestionId = p.Id
+WHERE
+  q.QuestionOwnerUserId IS NOT NULL
+  AND q.AnswerScore >= 0 -- Ensure valid answer scores
+  AND ua.TotalVotes > 10 -- Filter for users with some activity
+  AND q.QuestionQualityScore > (
+    SELECT
+      AVG(
+        (
+          (COALESCE(p2.Score, 0) * 5) + (COALESCE(p2.FavoriteCount, 0) * 10) + (COALESCE(p2.AnswerCount, 0) * 2) + (COALESCE(u2.Reputation, 0) / 1000)
+        )
+      )
+    FROM Posts AS p2
+    LEFT JOIN Users AS u2
+      ON p2.OwnerUserId = u2.Id
+    WHERE
+      p2.PostTypeId = 1
+  ) -- Only include questions above the average quality score
+ORDER BY
+  q.QuestionQualityScore DESC,
+  q.QuestionDate ASC
+LIMIT 100;

@@ -1,0 +1,205 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        MAX(b.Date) as LastBadgeDate,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Elite'
+            WHEN u.Reputation > 5000 THEN 'Veteran'
+            WHEN u.Reputation > 1000 THEN 'Experienced'
+            ELSE 'Novice'
+        END as ReputationTier,
+        CASE 
+            WHEN u.Views > 10000 THEN 'Highly Viewed'
+            WHEN u.Views > 5000 THEN 'Popular'
+            WHEN u.Views > 1000 THEN 'Noticeable'
+            ELSE 'Ordinary'
+        END as ViewStatus
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostPerformanceMetrics AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.OwnerUserId,
+        p.ParentId,
+        p.PostTypeId,
+        CASE 
+            WHEN p.Score > 100 THEN 'Viral'
+            WHEN p.Score > 50 THEN 'Popular'
+            WHEN p.Score > 10 THEN 'Noticeable'
+            ELSE 'Basic'
+        END as ScoreCategory,
+        CASE 
+            WHEN p.ViewCount > 10000 THEN 'Highly Viewed'
+            WHEN p.ViewCount > 5000 THEN 'Viewed'
+            WHEN p.ViewCount > 1000 THEN 'Seen'
+            ELSE 'Obscure'
+        END as ViewCategory,
+        CASE
+            WHEN (p.LastActivityDate IS NOT NULL AND p.CreationDate IS NOT NULL)
+                 THEN CAST(
+                      -- Use standard SQL: difference in days via EXTRACT(EPOCH FROM ...)/86400 for timestamptz/timestamp
+                      -- For systems where EXTRACT(EPOCH FROM ...) is supported:
+                      (EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate)) / 86400)
+                      AS INTEGER
+                 )
+            ELSE NULL
+        END as DaysActive,
+        CASE 
+            WHEN p.AnswerCount > 0 AND p.Score > 0 THEN CAST(p.Score AS DOUBLE PRECISION) / p.AnswerCount
+            ELSE 0
+        END as ScorePerAnswer,
+        ABS(p.ViewCount - (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = 1)) as ViewDeviationFromAvg,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) as ScoreRank,
+        DENSE_RANK() OVER (ORDER BY p.ViewCount DESC) as ViewRank
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserPostEngagement AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.ReputationTier,
+        uas.ViewStatus,
+        uas.PostCount,
+        uas.CommentCount,
+        uas.BadgeCount,
+        AVG(ppm.Score) as AvgScore,
+        AVG(ppm.ViewCount) as AvgViews,
+        AVG(ppm.AnswerCount) as AvgAnswers,
+        STRING_AGG(CASE WHEN ppm.Score > 50 THEN ppm.Title ELSE NULL END, '; ') as PopularTitles,
+        STRING_AGG(CASE WHEN ppm.ViewCount > 1000 THEN ppm.Title ELSE NULL END, '; ') as ViewedTitles,
+        COUNT(CASE WHEN ppm.Score > 50 THEN 1 END) as PopularPostCount,
+        COUNT(CASE WHEN ppm.ViewCount > 1000 THEN 1 END) as ViewedPostCount
+    FROM UserActivityStats uas
+    LEFT JOIN PostPerformanceMetrics ppm ON uas.UserId = ppm.OwnerUserId
+    GROUP BY uas.UserId, uas.DisplayName, uas.ReputationTier, uas.ViewStatus, uas.PostCount, uas.CommentCount, uas.BadgeCount
+),
+TagPopularity AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 5000 THEN 'Trendsetting'
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Notable'
+            ELSE 'Niche'
+        END as PopularityLevel,
+        RANK() OVER (ORDER BY t.Count DESC) as PopularityRank,
+        LAG(t.Count) OVER (ORDER BY t.Count DESC) as PreviousCount,
+        (t.Count - LAG(t.Count) OVER (ORDER BY t.Count DESC)) as CountChange
+    FROM Tags t
+),
+ComplexUserAnalysis AS (
+    SELECT 
+        upa.UserId,
+        upa.DisplayName,
+        upa.ReputationTier,
+        upa.ViewStatus,
+        upa.PostCount,
+        upa.CommentCount,
+        upa.BadgeCount,
+        upa.AvgScore,
+        upa.AvgViews,
+        upa.AvgAnswers,
+        upa.PopularTitles,
+        upa.ViewedTitles,
+        upa.PopularPostCount,
+        upa.ViewedPostCount,
+        CASE 
+            WHEN upa.PostCount > 10 AND upa.AvgScore > 25 THEN 'Active Contributor'
+            WHEN upa.PostCount > 5 AND upa.ViewedPostCount > 2 THEN 'Engaged Participant'
+            WHEN upa.BadgeCount > 5 THEN 'Recognized Member'
+            ELSE 'Regular User'
+        END as UserRole,
+        CASE 
+            WHEN upa.AvgViews > 1000 AND upa.ViewedPostCount > 3 THEN 'Highly Visible'
+            WHEN upa.AvgScore > 50 AND upa.PopularPostCount > 1 THEN 'Reputable'
+            WHEN upa.BadgeCount > 10 THEN 'Awarded'
+            ELSE 'Standard'
+        END as UserStatus
+    FROM UserPostEngagement upa
+)
+SELECT 
+    COALESCE(cua.UserId, 0) as UserId,
+    COALESCE(cua.DisplayName, 'Unknown') as DisplayName,
+    COALESCE(cua.ReputationTier, 'Unknown') as ReputationTier,
+    COALESCE(cua.ViewStatus, 'Unknown') as ViewStatus,
+    cua.PostCount,
+    cua.CommentCount,
+    cua.BadgeCount,
+    ROUND(COALESCE(cua.AvgScore, 0), 2) as AvgScore,
+    ROUND(COALESCE(cua.AvgViews, 0), 0) as AvgViews,
+    ROUND(COALESCE(cua.AvgAnswers, 0), 2) as AvgAnswers,
+    COALESCE(cua.PopularTitles, '') as PopularTitles,
+    COALESCE(cua.ViewedTitles, '') as ViewedTitles,
+    cua.PopularPostCount,
+    cua.ViewedPostCount,
+    COALESCE(cua.UserRole, 'N/A') as UserRole,
+    COALESCE(cua.UserStatus, 'N/A') as UserStatus,
+    CASE 
+        WHEN cua.PostCount = 0 THEN NULL
+        ELSE ROUND((COALESCE(cua.AvgScore, 0) * COALESCE(cua.AvgViews, 0)) / (COALESCE(cua.PostCount, 1) * 1000.0), 4)
+    END as EngagementIndex,
+    CASE 
+        WHEN cua.ViewedPostCount = 0 THEN NULL
+        ELSE ROUND((COALESCE(cua.PopularPostCount, 0) * 100.0) / NULLIF(cua.PostCount, 0), 2)
+    END as PopularPercentage,
+    ROW_NUMBER() OVER (ORDER BY COALESCE(cua.AvgScore, 0) DESC, COALESCE(cua.AvgViews, 0) DESC) as OverallRank,
+    DENSE_RANK() OVER (PARTITION BY cua.ReputationTier ORDER BY COALESCE(cua.AvgScore, 0) DESC) as ReputationRank,
+    CASE 
+        WHEN cua.PostCount > 20 AND cua.AvgScore > 100 THEN 'High Impact'
+        WHEN cua.ViewedPostCount > 5 AND cua.AvgViews > 5000 THEN 'Influential'
+        WHEN cua.BadgeCount > 15 THEN 'Achievement Focused'
+        ELSE 'Average'
+    END as ContributionType
+FROM ComplexUserAnalysis cua
+WHERE cua.PostCount >= 0
+    AND (cua.AvgScore IS NULL OR cua.AvgScore >= -100)
+    AND (cua.AvgViews IS NULL OR cua.AvgViews >= 0)
+    AND (cua.AvgAnswers IS NULL OR cua.AvgAnswers >= 0)
+    AND COALESCE(cua.UserRole, 'N/A') NOT IN ('Regular User', 'N/A')
+    AND COALESCE(cua.UserStatus, 'N/A') NOT IN ('Standard', 'N/A')
+    AND (
+        (cua.PostCount > 10 AND cua.AvgScore > 10) 
+        OR (cua.ViewedPostCount > 2 AND cua.ViewedTitles IS NOT NULL)
+        OR (cua.BadgeCount > 3 AND cua.PopularPostCount > 1)
+    )
+ORDER BY 
+    CASE WHEN cua.UserRole = 'Active Contributor' THEN 1
+         WHEN cua.UserRole = 'Engaged Participant' THEN 2
+         WHEN cua.UserRole = 'Recognized Member' THEN 3
+         ELSE 4 END,
+    CASE WHEN cua.UserStatus = 'Highly Visible' THEN 1
+         WHEN cua.UserStatus = 'Reputable' THEN 2
+         WHEN cua.UserStatus = 'Awarded' THEN 3
+         ELSE 4 END,
+    COALESCE(cua.AvgScore, 0) DESC,
+    COALESCE(cua.AvgViews, 0) DESC,
+    cua.PostCount DESC,
+    cua.BadgeCount DESC,
+    COALESCE(cua.PopularPostCount, 0) DESC,
+    ROW_NUMBER() OVER (ORDER BY COALESCE(cua.AvgScore, 0) DESC, COALESCE(cua.AvgViews, 0) DESC) ASC
+LIMIT 1000;

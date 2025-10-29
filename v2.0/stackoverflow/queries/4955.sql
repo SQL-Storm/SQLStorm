@@ -1,0 +1,113 @@
+WITH RankedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount AS PostViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        ROW_NUMBER() OVER(PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) AS rn_by_type_creation,
+        ROW_NUMBER() OVER(PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS rn_by_type_score,
+        LAG(p.Score, 1, 0) OVER (ORDER BY p.CreationDate) AS PreviousScore,
+        LEAD(p.Score, 1, 0) OVER (ORDER BY p.CreationDate) AS NextScore,
+        CAST(SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags) - 2)) AS TEXT) AS ParsedTags,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+            ELSE 'Open'
+        END AS PostStatus
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1, 2)
+),
+CommentAggregates AS (
+    SELECT
+        c.PostId,
+        COUNT(c.Id) AS TotalComments,
+        SUM(c.Score) AS TotalCommentScore,
+        MAX(c.CreationDate) AS LatestCommentDate
+    FROM Comments c
+    GROUP BY c.PostId
+),
+VoteAggregates AS (
+    SELECT
+        v.PostId,
+        COUNT(CASE WHEN vt.Name = 'UpMod' THEN v.Id END) AS UpVotes,
+        COUNT(CASE WHEN vt.Name = 'DownMod' THEN v.Id END) AS DownVotes,
+        COUNT(CASE WHEN vt.Name = 'Favorite' THEN v.Id END) AS Favorites
+    FROM Votes v
+    JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    WHERE vt.Name IN ('UpMod', 'DownMod', 'Favorite')
+    GROUP BY v.PostId
+),
+UserPostHistory AS (
+    SELECT
+        ph.UserId,
+        COUNT(DISTINCT ph.PostId) AS PostsTouchedByHistory,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (1, 2, 3) THEN ph.Id END) AS InitialEdits,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.Id END) AS SubsequentEdits,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Id END) AS CloseVotes,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 16 THEN ph.Id END) AS CommunityOwnedEvents
+    FROM PostHistory ph
+    WHERE ph.UserId IS NOT NULL
+    GROUP BY ph.UserId
+)
+SELECT
+    rp.PostId,
+    rp.PostTypeName,
+    rp.OwnerDisplayName,
+    rp.PostCreationDate,
+    rp.PostScore,
+    rp.PostViewCount,
+    rp.AnswerCount,
+    rp.CommentCount,
+    rp.FavoriteCount,
+    COALESCE(ca.TotalComments, 0) AS TotalComments,
+    COALESCE(ca.TotalCommentScore, 0) AS TotalCommentScore,
+    COALESCE(va.UpVotes, 0) AS TotalUpVotes,
+    COALESCE(va.DownVotes, 0) AS TotalDownVotes,
+    COALESCE(va.Favorites, 0) AS TotalFavorites,
+    rp.PostStatus,
+    rp.ParsedTags,
+    rp.PreviousScore,
+    rp.NextScore,
+    CASE
+        WHEN rp.PostScore > 0 AND rp.AnswerCount > 0 THEN CAST(rp.PostScore AS REAL) / rp.AnswerCount
+        WHEN rp.PostScore > 0 THEN CAST(rp.PostScore AS REAL)
+        ELSE 0.0
+    END AS ScorePerAnswer,
+    upu.PostsTouchedByHistory,
+    upu.InitialEdits,
+    upu.SubsequentEdits,
+    upu.CloseVotes,
+    upu.CommunityOwnedEvents,
+    CASE
+        WHEN ca.LatestCommentDate IS NOT NULL AND rp.PostCreationDate < ca.LatestCommentDate THEN 'Has Comments After Creation'
+        ELSE 'No Comments After Creation'
+    END AS CommentActivity,
+    CASE
+        WHEN rp.PostScore > rp.PreviousScore AND rp.PostScore > rp.NextScore THEN 'Peak Score'
+        WHEN rp.PostScore < rp.PreviousScore AND rp.PostScore < rp.NextScore THEN 'Trough Score'
+        ELSE 'Stable Score'
+    END AS ScoreTrend,
+    rp.rn_by_type_creation,
+    rp.rn_by_type_score
+FROM RankedPosts rp
+LEFT JOIN CommentAggregates ca ON rp.PostId = ca.PostId
+LEFT JOIN VoteAggregates va ON rp.PostId = va.PostId
+LEFT JOIN UserPostHistory upu ON rp.OwnerUserId = upu.UserId
+WHERE rp.PostTypeId = 1
+  AND rp.PostScore BETWEEN -5 AND 100
+  AND rp.PostViewCount > 100
+  AND rp.AnswerCount IS NOT NULL
+  AND rp.OwnerUserId IS NOT NULL
+  AND rp.PostCreationDate >= TIMESTAMP '2023-01-01'
+ORDER BY rp.PostScore DESC, rp.PostViewCount DESC
+LIMIT 1000;

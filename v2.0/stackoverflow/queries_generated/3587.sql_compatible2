@@ -1,0 +1,122 @@
+WITH user_posts AS (
+    SELECT 
+        u.id                              AS user_id,
+        COUNT(p.id)                       AS post_cnt,
+        COALESCE(SUM(p.score),0)          AS total_score,
+        AVG(p.viewcount)                  AS avg_views,
+        MAX(p.creationdate)               AS last_post_dt,
+        -- get title of the most recent post per user
+        (SELECT p2.title
+         FROM posts p2
+         WHERE p2.owneruserid = u.id
+         ORDER BY p2.creationdate DESC
+         LIMIT 1)                         AS last_post_title,
+        COUNT(DISTINCT UNNEST(              /* explode array of tags   */
+            CASE 
+                WHEN p.tags IS NOT NULL 
+                THEN string_to_array(trim(both '<>' FROM p.tags), '><')
+                ELSE ARRAY[]::text
+            END
+        ))                               AS distinct_tag_cnt
+    FROM users u
+    LEFT JOIN posts p 
+        ON p.owneruserid = u.id
+    GROUP BY u.id
+),
+user_badges AS (
+    SELECT 
+        b.userid                         AS user_id,
+        COUNT(*) FILTER (WHERE b.class = 1) AS gold_cnt,
+        COUNT(*) FILTER (WHERE b.class = 2) AS silver_cnt,
+        COUNT(*) FILTER (WHERE b.class = 3) AS bronze_cnt,
+        COUNT(DISTINCT b.name)               AS distinct_badge_cnt
+    FROM badges b
+    GROUP BY b.userid
+),
+user_accepted_answers AS (
+    SELECT 
+        a.owneruserid                     AS user_id,
+        COUNT(*)                          AS accepted_ans_cnt
+    FROM posts a
+    JOIN posts q 
+        ON q.acceptedanswerid = a.id
+    WHERE a.posttypeid = 2               -- answers only
+    GROUP BY a.owneruserid
+),
+ranked_users AS (
+    SELECT 
+        u.id,
+        u.displayname,
+        COALESCE(up.post_cnt,0)          AS post_cnt,
+        COALESCE(up.total_score,0)       AS total_score,
+        COALESCE(up.avg_views,0)         AS avg_views,
+        COALESCE(ub.gold_cnt,0)          AS gold_cnt,
+        COALESCE(ub.silver_cnt,0)        AS silver_cnt,
+        COALESCE(ub.bronze_cnt,0)        AS bronze_cnt,
+        COALESCE(ua.accepted_ans_cnt,0) AS accepted_ans_cnt,
+        ROW_NUMBER() OVER (ORDER BY COALESCE(up.total_score,0) DESC) AS score_rank,
+        up.last_post_title
+    FROM users u
+    LEFT JOIN user_posts up      ON up.user_id = u.id
+    LEFT JOIN user_badges ub     ON ub.user_id = u.id
+    LEFT JOIN user_accepted_answers ua ON ua.user_id = u.id
+),
+recent_activity AS (
+    SELECT 
+        p.owneruserid                AS user_id,
+        MAX(p.lastactivitydate)      AS last_activity_dt,
+        COUNT(*) FILTER (WHERE v.votetypeid = 2) AS upvote_cnt
+    FROM posts p
+    LEFT JOIN votes v 
+        ON v.postid = p.id AND v.votetypeid = 2
+    GROUP BY p.owneruserid
+)
+SELECT 
+    ru.id,
+    ru.displayname,
+    ru.post_cnt,
+    ru.total_score,
+    ru.avg_views,
+    ru.gold_cnt,
+    ru.silver_cnt,
+    ru.bronze_cnt,
+    ru.accepted_ans_cnt,
+    ru.score_rank,
+    CASE 
+        WHEN ru.total_score > 20000 THEN 'Legendary'
+        WHEN ru.total_score > 10000 THEN 'Superstar'
+        WHEN ru.total_score > 5000  THEN 'Guru'
+        WHEN ru.total_score > 1000 THEN 'Contributor'
+        ELSE 'Newbie'
+    END                              AS reputation_tier,
+    COALESCE(ra.last_activity_dt, ru.last_post_dt) AS most_recent_dt,
+    COALESCE(ra.upvote_cnt,0)       AS recent_upvote_cnt,
+    COALESCE(ru.last_post_title,'(no posts)') AS recent_post_title
+FROM ranked_users ru
+LEFT JOIN recent_activity ra 
+    ON ra.user_id = ru.id
+WHERE ru.score_rank <= 100
+
+UNION ALL
+
+SELECT 
+    CAST(NULL AS BIGINT),
+    '---',
+    CAST(NULL AS BIGINT),
+    CAST(NULL AS BIGINT),
+    CAST(NULL AS NUMERIC),
+    CAST(NULL AS BIGINT),
+    CAST(NULL AS BIGINT),
+    CAST(NULL AS BIGINT),
+    CAST(NULL AS BIGINT),
+    CAST(NULL AS BIGINT),
+    CAST(NULL AS TIMESTAMP),
+    CAST(NULL AS BIGINT),
+    CAST(NULL AS TEXT)
+WHERE EXISTS (
+    SELECT 1 FROM posts p 
+    WHERE p.tags IS NOT NULL AND p.tags LIKE '%<c%>'
+    EXCEPT
+    SELECT 1 FROM posts p2 WHERE p2.tags IS NULL
+)
+ORDER BY score_rank ASC NULLS LAST, id;

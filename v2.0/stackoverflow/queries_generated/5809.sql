@@ -1,0 +1,120 @@
+-- {"query": "5809.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 751} 
+WITH
+TopActiveTags AS (
+  SELECT
+    t.TagName,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+    SUM(CASE WHEN v.VoteTypeId = 6 THEN 1 ELSE 0 END) AS CloseVotes,
+    COUNT(*) AS TagPosts
+  FROM
+    Tags tg
+    LEFT JOIN Posts p ON tg.Id = p.Tags
+    LEFT JOIN Votes v ON p.Id = v.PostId
+  WHERE
+    p.PostTypeId = 1
+  GROUP BY
+    t.TagName
+),
+TaggedPostNetwork AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.CommentCount,
+    p.LastActivityDate,
+    p.FavoriteCount,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+  FROM
+    Posts p
+  WHERE
+    p.PostTypeId = 1
+),
+RecentTagWikis AS (
+  SELECT
+    t.TagName,
+    MAX(p.LastActivityDate) AS LastActive
+  FROM
+    Posts p
+    JOIN Tags t ON p.Id = t.WikiPostId
+  WHERE
+    t.IsModeratorOnly = 0
+  GROUP BY
+    t.TagName
+),
+UserImpact AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.WebsiteUrl,
+    COALESCE(b.Class, 0) AS GoldBadgeClass
+  FROM
+    Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId AND b.Class = 1
+),
+ComplexBenchmark AS (
+  SELECT
+    up.UserId,
+    up.DisplayName,
+    up.Reputation,
+    up.Views,
+    up.UpVotes,
+    up.DownVotes,
+    up.CreationDate,
+    up.LastAccessDate,
+    up.Location,
+    up.WebsiteUrl,
+    up.GoldBadgeClass,
+    pv.PostId,
+    pv.Title,
+    pv.Tags,
+    pv.CreationDate AS PostDate,
+    pv.Score,
+    pv.ViewCount,
+    pv.CommentCount,
+    pv.LastActivityDate,
+    pv.Favorites,
+    nt.LastActive AS TagLastActive
+  FROM
+    UserImpact up
+    CROSS APPLY (
+      SELECT TOP 5
+        rp.PostId,
+        rp.Title,
+        rp.Tags,
+        rp.CreationDate,
+        rp.Score,
+        rp.ViewCount,
+        rp.CommentCount,
+        rp.LastActivityDate,
+        pv.BountyAmount,
+        pv.FavoriteCount AS Favorites
+      FROM
+        TaggedPostNetwork rp
+      WHERE
+        rp.OwnerUserId = up.UserId
+      ORDER BY
+        rp.CreationDate DESC
+    ) pv
+    LEFT JOIN RecentTagWikis nt ON nt.TagName = SUBSTRING(pv.Tags, 2, LEN(pv.Tags) - 2)
+)
+SELECT
+  *
+FROM
+  ComplexBenchmark
+WHERE
+  PostDate > DATEADD(day, -30, GETDATE())
+ORDER BY
+  Reputation DESC, PostDate DESC
+OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY;

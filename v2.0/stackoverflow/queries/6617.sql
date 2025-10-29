@@ -1,0 +1,42 @@
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id ELSE NULL END) AS TotalQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id ELSE NULL END) AS TotalAnswers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 3 THEN p.Id ELSE NULL END) AS TotalWikis,
+    SUM(p.Score) AS TotalScore,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN p.AnswerCount ELSE 0 END) AS TotalQuestionsAnswers,
+    MAX(u.LastAccessDate) AS LastAccessDate,
+    MIN(p.CreationDate) AS EarliestPost,
+    MAX(p.LastActivityDate) AS LatestActivity,
+    b.Class,
+    t.TagName,
+    v.BountyAmount
+FROM 
+    Users u
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Tags t ON p.Id = t.ExcerptPostId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId AND v.VoteTypeId = 8
+WHERE 
+    u.Reputation > 10000
+    AND p.CreationDate >= DATE_TRUNC('month', CAST('2024-10-01' AS DATE)) - INTERVAL '1 year'
+    AND (u.Location IS NOT NULL AND u.Location != '')
+GROUP BY 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.LastAccessDate,
+    b.Class,
+    t.TagName,
+    v.BountyAmount
+HAVING 
+    COUNT(DISTINCT p.Id) > 50
+ORDER BY 
+    u.Reputation DESC, TotalScore DESC
+LIMIT 100;

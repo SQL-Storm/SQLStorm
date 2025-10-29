@@ -1,0 +1,300 @@
+with params as (
+    select
+        date_trunc('month', cast('2024-10-01 12:34:56' as timestamp)) - interval '24 months' as start_month,
+        date_trunc('month', cast('2024-10-01 12:34:56' as timestamp)) as end_month
+),
+months as (
+    select generate_series(start_month, end_month, interval '1 month') as month_start
+    from params
+),
+questions as (
+    select
+        p.Id,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.AcceptedAnswerId
+    from Posts p
+    where p.PostTypeId = 1
+      and p.CreationDate >= (select start_month from params)
+),
+answers as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId as AnswerOwnerId,
+        a.CreationDate as AnswerCreationDate,
+        a.Score as AnswerScore
+    from Posts a
+    where a.PostTypeId = 2
+),
+answer_stats as (
+    select
+        a.*,
+        q.CreationDate as QuestionCreationDate,
+        cast(extract(epoch from (a.AnswerCreationDate - q.CreationDate)) as bigint) as secs_to_answer,
+        row_number() over (partition by a.QuestionId order by a.AnswerCreationDate asc, a.AnswerId asc) as rn_first,
+        row_number() over (partition by a.QuestionId order by a.AnswerScore desc nulls last, a.AnswerCreationDate asc, a.AnswerId asc) as rn_top
+    from answers a
+    join questions q on q.Id = a.QuestionId
+),
+accepted_vs_top as (
+    select
+        q.Id as QuestionId,
+        q.AcceptedAnswerId,
+        max(case when s.rn_top = 1 then s.AnswerId end) as TopAnswerId,
+        max(case when s.rn_first = 1 then s.AnswerId end) as FirstAnswerId,
+        min(s.secs_to_answer) as FastestSecsToAnswer
+    from questions q
+    left join answer_stats s on s.QuestionId = q.Id
+    group by q.Id, q.AcceptedAnswerId
+),
+vote_agg as (
+    select
+        v.PostId,
+        sum(case when v.VoteTypeId = 2 then 1 when v.VoteTypeId = 3 then -1 else 0 end) as net_votes,
+        sum(case when v.VoteTypeId = 5 then 1 else 0 end) as favorites,
+        sum(case when v.VoteTypeId = 8 then coalesce(v.BountyAmount,0) else 0 end) as bounty_started,
+        sum(case when v.VoteTypeId = 9 then coalesce(v.BountyAmount,0) else 0 end) as bounty_awarded
+    from Votes v
+    group by v.PostId
+),
+question_tags as (
+    select
+        q.Id as QuestionId,
+        trim(both ' ' from tag) as TagName
+    from questions q
+         cross join lateral unnest(string_to_array(substring(q.Tags, 2, greatest(length(q.Tags)-2,0)), '><')) as tag
+),
+tag_rank as (
+    select
+        qt.TagName,
+        count(*) as tag_q_count,
+        row_number() over (order by count(*) desc, TagName) as tag_rank_global
+    from question_tags qt
+    group by qt.TagName
+),
+closure_events as (
+    select
+        ph.PostId,
+        min(ph.CreationDate) filter (where ph.PostHistoryTypeId = 10) as FirstClosedAt,
+        count(*) filter (where ph.PostHistoryTypeId = 10) as CloseEvents,
+        count(*) filter (where ph.PostHistoryTypeId = 11) as ReopenEvents,
+        count(*) filter (where ph.PostHistoryTypeId = 19) as ProtectEvents
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (10,11,19)
+    group by ph.PostId
+),
+owner_stats as (
+    select
+        u.Id as UserId,
+        u.Reputation,
+        u.CreationDate as UserCreated,
+        u.UpVotes,
+        u.DownVotes,
+        u.Location,
+        coalesce(nullif(trim(u.DisplayName), ''), '(anonymous)') as DisplayNameNorm,
+        case when u.WebsiteUrl ilike '%github%' then 1 else 0 end as HasGithub
+    from Users u
+),
+per_tag_month as (
+    select
+        m.month_start,
+        coalesce(qt.TagName, '(no-tag)') as TagName,
+        count(distinct q.Id) as Questions,
+        count(distinct a.AnswerId) as Answers,
+        avg(nullif(q.Score,0)) filter (where q.Score is not null) as AvgQScoreNonZero,
+        percentile_cont(0.5) within group (order by s.secs_to_answer) as MedianSecsToFirstAnswer,
+        sum(case when avs.AcceptedAnswerId is not null then 1 else 0 end) as WithAccepted,
+        sum(case when avs.AcceptedAnswerId is not null and avs.AcceptedAnswerId = avs.TopAnswerId then 1 else 0 end) as AcceptedIsTop,
+        sum(case when avs.FirstAnswerId = avs.TopAnswerId and avs.TopAnswerId is not null then 1 else 0 end) as FirstIsTop,
+        sum(coalesce(vq.net_votes,0)) as SumQNetVotes,
+        sum(coalesce(va.net_votes,0)) as SumANetVotes,
+        sum(coalesce(vq.favorites,0)) as SumFavorites,
+        sum(coalesce(vq.bounty_started,0)) as SumBountyStarted,
+        sum(coalesce(va.bounty_awarded,0)) as SumBountyAwarded,
+        sum(case when ce.FirstClosedAt is not null then 1 else 0 end) as ClosedQuestions,
+        sum(ce.CloseEvents) as CloseEvents,
+        sum(ce.ReopenEvents) as ReopenEvents,
+        sum(ce.ProtectEvents) as ProtectEvents,
+        count(distinct case when os.Reputation >= 10000 then q.OwnerUserId end) as DistinctHighRepAskers,
+        avg(case when os.Reputation is not null then os.Reputation end) as AvgAskerReputation,
+        count(distinct case when os.HasGithub = 1 then q.OwnerUserId end) as DistinctAskersWithGithub
+    from months m
+    left join questions q
+        on q.CreationDate >= m.month_start
+       and q.CreationDate <  m.month_start + interval '1 month'
+    left join question_tags qt on qt.QuestionId = q.Id
+    left join answer_stats s on s.QuestionId = q.Id and s.rn_first = 1
+    left join answers a on a.QuestionId = q.Id
+        and a.AnswerCreationDate >= m.month_start
+        and a.AnswerCreationDate <  m.month_start + interval '1 month'
+    left join vote_agg vq on vq.PostId = q.Id
+    left join vote_agg va on va.PostId = a.AnswerId
+    left join accepted_vs_top avs on avs.QuestionId = q.Id
+    left join closure_events ce on ce.PostId = q.Id
+    left join owner_stats os on os.UserId = q.OwnerUserId
+    group by m.month_start, coalesce(qt.TagName, '(no-tag)')
+),
+top_tags as (
+    select TagName
+    from tag_rank
+    where tag_rank_global <= 50
+),
+series as (
+    select
+        m.month_start,
+        t.TagName
+    from months m
+    cross join top_tags t
+),
+dense_series as (
+    select
+        s.month_start,
+        s.TagName,
+        coalesce(ptm.Questions, 0) as Questions,
+        coalesce(ptm.Answers, 0) as Answers,
+        coalesce(ptm.AvgQScoreNonZero, 0) as AvgQScoreNonZero,
+        coalesce(ptm.MedianSecsToFirstAnswer, 0) as MedianSecsToFirstAnswer,
+        coalesce(ptm.WithAccepted, 0) as WithAccepted,
+        coalesce(ptm.AcceptedIsTop, 0) as AcceptedIsTop,
+        coalesce(ptm.FirstIsTop, 0) as FirstIsTop,
+        coalesce(ptm.SumQNetVotes, 0) as SumQNetVotes,
+        coalesce(ptm.SumANetVotes, 0) as SumANetVotes,
+        coalesce(ptm.SumFavorites, 0) as SumFavorites,
+        coalesce(ptm.SumBountyStarted, 0) as SumBountyStarted,
+        coalesce(ptm.SumBountyAwarded, 0) as SumBountyAwarded,
+        coalesce(ptm.ClosedQuestions, 0) as ClosedQuestions,
+        coalesce(ptm.CloseEvents, 0) as CloseEvents,
+        coalesce(ptm.ReopenEvents, 0) as ReopenEvents,
+        coalesce(ptm.ProtectEvents, 0) as ProtectEvents,
+        coalesce(ptm.DistinctHighRepAskers, 0) as DistinctHighRepAskers,
+        coalesce(ptm.AvgAskerReputation, 0) as AvgAskerReputation,
+        coalesce(ptm.DistinctAskersWithGithub, 0) as DistinctAskersWithGithub
+    from series s
+    left join per_tag_month ptm
+      on ptm.month_start = s.month_start
+     and ptm.TagName = s.TagName
+),
+rolling as (
+    select
+        d.month_start,
+        d.TagName,
+        d.Questions,
+        d.Answers,
+        d.AvgQScoreNonZero,
+        d.MedianSecsToFirstAnswer,
+        d.WithAccepted,
+        d.AcceptedIsTop,
+        d.FirstIsTop,
+        d.SumQNetVotes,
+        d.SumANetVotes,
+        d.SumFavorites,
+        d.SumBountyStarted,
+        d.SumBountyAwarded,
+        d.ClosedQuestions,
+        d.CloseEvents,
+        d.ReopenEvents,
+        d.ProtectEvents,
+        d.DistinctHighRepAskers,
+        d.AvgAskerReputation,
+        d.DistinctAskersWithGithub,
+        sum(Questions) over w as RollingQuestions3m,
+        sum(Answers) over w as RollingAnswers3m,
+        avg(nullif(MedianSecsToFirstAnswer,0)) over w as RollingMedianSecsToFirstAnswer3m,
+        sum(ClosedQuestions) over w as RollingClosedQuestions3m,
+        sum(SumFavorites) over w as RollingFavorites3m,
+        sum(SumBountyStarted) over w as RollingBountyStarted3m,
+        sum(SumBountyAwarded) over w as RollingBountyAwarded3m
+    from dense_series d
+    window w as (partition by d.TagName order by d.month_start rows between 2 preceding and current row)
+),
+improving as (
+    select TagName, month_start,
+           (RollingAnswers3m - lag(RollingAnswers3m) over (partition by TagName order by month_start)) as dAnswers3m,
+           (RollingFavorites3m - lag(RollingFavorites3m) over (partition by TagName order by month_start)) as dFavs3m
+    from rolling
+),
+degrading as (
+    select TagName, month_start,
+           (lag(RollingQuestions3m) over (partition by TagName order by month_start) - RollingQuestions3m) as dQuestions3mDrop,
+           (lag(RollingBountyStarted3m) over (partition by TagName order by month_start) - RollingBountyStarted3m) as dBountyStartDrop
+    from rolling
+),
+signal as (
+    select i.TagName, i.month_start,
+           case when coalesce(i.dAnswers3m,0) > 0 and coalesce(i.dFavs3m,0) > 0 then 1 else 0 end as ImprovingFlag
+    from improving i
+    union all
+    select d.TagName, d.month_start,
+           case when coalesce(d.dQuestions3mDrop,0) > 0 and coalesce(d.dBountyStartDrop,0) > 0 then -1 else 0 end as ImprovingFlag
+    from degrading d
+),
+signal_collapse as (
+    select TagName, month_start,
+           sum(ImprovingFlag) as NetSignal
+    from signal
+    group by TagName, month_start
+),
+tag_meta as (
+    select
+        t.TagName,
+        max(case when t.IsModeratorOnly = true then 1 else 0 end) as IsModeratorOnly,
+        max(case when t.IsRequired = true then 1 else 0 end) as IsRequired
+    from Tags t
+    group by t.TagName
+),
+final as (
+    select
+        cast(r.month_start as date) as month_start_date,
+        r.TagName,
+        coalesce(tm.IsModeratorOnly, 0) as IsModeratorOnly,
+        coalesce(tm.IsRequired, 0) as IsRequired,
+        r.Questions,
+        r.Answers,
+        r.AvgQScoreNonZero,
+        r.MedianSecsToFirstAnswer,
+        r.WithAccepted,
+        r.AcceptedIsTop,
+        r.FirstIsTop,
+        r.SumQNetVotes,
+        r.SumANetVotes,
+        r.SumFavorites,
+        r.SumBountyStarted,
+        r.SumBountyAwarded,
+        r.ClosedQuestions,
+        r.CloseEvents,
+        r.ReopenEvents,
+        r.ProtectEvents,
+        r.DistinctHighRepAskers,
+        r.AvgAskerReputation,
+        r.DistinctAskersWithGithub,
+        r.RollingQuestions3m,
+        r.RollingAnswers3m,
+        r.RollingMedianSecsToFirstAnswer3m,
+        r.RollingClosedQuestions3m,
+        r.RollingFavorites3m,
+        r.RollingBountyStarted3m,
+        r.RollingBountyAwarded3m,
+        coalesce(sc.NetSignal, 0) as NetSignal,
+        ('tag=' || r.TagName ||
+         '|q=' || r.Questions ||
+         '|a=' || r.Answers ||
+         '|fav=' || r.SumFavorites ||
+         '|b3=' || r.RollingBountyAwarded3m ||
+         '|sig=' || coalesce(sc.NetSignal,0) ||
+         case when coalesce(tm.IsModeratorOnly,0)=1 then '|mod' else '' end ||
+         case when coalesce(tm.IsRequired,0)=1 then '|req' else '' end
+        ) as Descriptor
+    from rolling r
+    left join signal_collapse sc on sc.TagName = r.TagName and sc.month_start = r.month_start
+    left join tag_meta tm on tm.TagName = r.TagName
+)
+select *
+from final
+where month_start_date >= (select cast(start_month as date) from params)
+order by month_start_date desc, TagName asc
+limit 1000;

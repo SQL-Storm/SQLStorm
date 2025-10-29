@@ -1,0 +1,47 @@
+SELECT 
+    u.DisplayName,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    MAX(u.Reputation) AS MaxReputation,
+    MIN(p.CreationDate) AS EarliestPost,
+    MAX(p.LastActivityDate) AS LatestActivity,
+    b.Name AS LatestBadge,
+    ROW_NUMBER() OVER(PARTITION BY u.Id ORDER BY MAX(p.LastActivityDate) DESC) AS RecentActivityRank,
+    (
+        SELECT STRING_AGG(t.TagName, ', ')
+        FROM Tags t
+        WHERE t.Id IN (
+            SELECT pt.TagId
+            FROM PostTags pt
+            WHERE pt.PostId = p.Id
+        )
+    ) AS Tags,
+    (
+        SELECT COUNT(*)
+        FROM PostLinks pl
+        WHERE pl.PostId = p.Id
+    ) AS LinkedPostsCount
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+WHERE 
+    b.Date = (
+        SELECT MAX(b2.Date) 
+        FROM Badges b2 
+        WHERE b2.UserId = u.Id
+    )
+    AND p.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1' YEAR)
+GROUP BY 
+    u.Id,
+    u.DisplayName,
+    b.Name,
+    p.Id
+HAVING 
+    COUNT(DISTINCT p.Id) > 10
+ORDER BY 
+    TotalPosts DESC, 
+    MaxReputation DESC;

@@ -1,0 +1,206 @@
+WITH RankedPosts AS (
+  SELECT 
+    p.Id,
+    p.PostTypeId,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.Title,
+    p.Tags,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn,
+    LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS prev_score,
+    LAG(p.ViewCount) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS prev_views
+  FROM Posts p
+  WHERE p.PostTypeId IN (1, 2)
+),
+UserStats AS (
+  SELECT 
+    u.Id AS UserId,
+    u.Reputation,
+    u.DisplayName,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+    SUM(p.Score) AS TotalScore,
+    AVG(p.Score) AS AvgScore,
+    MAX(p.CreationDate) AS LastPostDate,
+    STRING_AGG(DISTINCT p.Title, '; ') AS PostTitles
+  FROM Users u
+  LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+  WHERE u.Reputation > 1000
+  GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes
+),
+TagAnalysis AS (
+  SELECT 
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId,
+    t.WikiPostId,
+    COALESCE(p1.ViewCount, 0) AS ExcerptViews,
+    COALESCE(p2.ViewCount, 0) AS WikiViews,
+    CASE 
+      WHEN t.Count > 1000 THEN 'Popular'
+      WHEN t.Count > 100 THEN 'Moderate'
+      ELSE 'Niche'
+    END AS TagCategory
+  FROM Tags t
+  LEFT JOIN Posts p1 ON t.ExcerptPostId = p1.Id
+  LEFT JOIN Posts p2 ON t.WikiPostId = p2.Id
+),
+PostAnalysis AS (
+  SELECT 
+    rp.Id,
+    rp.PostTypeId,
+    rp.Score,
+    rp.ViewCount,
+    rp.CreationDate,
+    rp.OwnerUserId,
+    rp.Title,
+    rp.Tags,
+    rp.AnswerCount,
+    rp.CommentCount,
+    rp.FavoriteCount,
+    rp.rn,
+    rp.prev_score,
+    rp.prev_views,
+    CASE 
+      WHEN rp.Score > 0 THEN (rp.Score * 100.0 / NULLIF(rp.ViewCount, 0)) 
+      ELSE 0 
+    END AS ScorePerView,
+    CASE 
+      WHEN rp.prev_score IS NOT NULL THEN (rp.Score - rp.prev_score) 
+      ELSE 0 
+    END AS ScoreChange,
+    CASE 
+      WHEN rp.prev_views IS NOT NULL THEN (rp.ViewCount - rp.prev_views) 
+      ELSE 0 
+    END AS ViewChange
+  FROM RankedPosts rp
+),
+AnswerQuality AS (
+  SELECT 
+    a.Id AS AnswerId,
+    a.ParentId AS QuestionId,
+    a.Score,
+    a.CreationDate,
+    u.DisplayName AS AnswererName,
+    u.Reputation AS AnswererReputation,
+    CASE 
+      WHEN a.Score > 10 THEN 'High Quality'
+      WHEN a.Score > 0 THEN 'Moderate Quality'
+      ELSE 'Low Quality' 
+    END AS QualityLevel,
+    CAST(
+      COALESCE(
+        (
+          EXTRACT(EPOCH FROM (
+            (SELECT MAX(ph.CreationDate) FROM PostHistory ph WHERE ph.PostId = a.Id AND ph.PostHistoryTypeId = 12)
+            - a.CreationDate
+          )) / 86400
+        ),
+        NULL
+      ) AS INTEGER
+    ) AS DaysSinceLastEdit
+  FROM Posts a
+  JOIN Users u ON a.OwnerUserId = u.Id
+  WHERE a.PostTypeId = 2 AND a.Score >= 0
+),
+UserActivity AS (
+  SELECT 
+    u.Id,
+    u.DisplayName,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END), 0) AS QuestionsAsked,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END), 0) AS AnswersGiven,
+    COUNT(DISTINCT c.Id) AS CommentsMade,
+    COUNT(DISTINCT b.Id) AS BadgesEarned,
+    COUNT(DISTINCT v.Id) AS VotesGiven,
+    CASE 
+      WHEN COUNT(DISTINCT c.Id) > 100 THEN 'Active'
+      WHEN COUNT(DISTINCT c.Id) > 10 THEN 'Moderate'
+      ELSE 'Inactive'
+    END AS ActivityLevel
+  FROM Users u
+  LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+  LEFT JOIN Comments c ON u.Id = c.UserId
+  LEFT JOIN Badges b ON u.Id = b.UserId
+  LEFT JOIN Votes v ON u.Id = v.UserId
+  GROUP BY u.Id, u.DisplayName
+),
+ParsedTags AS (
+  -- parse tags into rows without using dialect-specific regexp_split_to_table
+  SELECT DISTINCT
+    TRIM(tag) AS TagName,
+    pa2.OwnerUserId
+  FROM PostAnalysis pa2,
+  LATERAL (
+    SELECT CASE
+      WHEN pa2.Tags IS NULL OR pa2.Tags = '' THEN NULL
+      ELSE UNNEST(string_to_array(REPLACE(REPLACE(pa2.Tags, '<', ''), '>', ','), ',')) 
+    END AS tag
+  ) s
+  WHERE s.tag IS NOT NULL
+)
+SELECT 
+  ua.Id AS UserId,
+  ua.DisplayName,
+  ua.QuestionsAsked,
+  ua.AnswersGiven,
+  ua.CommentsMade,
+  ua.BadgesEarned,
+  ua.VotesGiven,
+  ua.ActivityLevel,
+  us.Reputation,
+  us.Views,
+  us.TotalPosts,
+  us.Questions,
+  us.Answers,
+  us.TotalScore,
+  us.AvgScore,
+  us.PostTitles,
+  COUNT(pa.Id) AS RecentQuestions,
+  AVG(pa.ScorePerView) AS AvgScorePerView,
+  AVG(pa.ScoreChange) AS AvgScoreChange,
+  AVG(pa.ViewChange) AS AvgViewChange,
+  STRING_AGG(CASE WHEN ta.TagCategory = 'Popular' THEN ta.TagName ELSE NULL END, ', ') AS PopularTags,
+  STRING_AGG(CASE WHEN ta.TagCategory = 'Moderate' THEN ta.TagName ELSE NULL END, ', ') AS ModerateTags,
+  STRING_AGG(CASE WHEN ta.TagCategory = 'Niche' THEN ta.TagName ELSE NULL END, ', ') AS NicheTags,
+  SUM(CASE WHEN aq.QualityLevel = 'High Quality' THEN 1 ELSE 0 END) AS HighQualityAnswers,
+  AVG(aq.DaysSinceLastEdit) AS AvgDaysSinceLastEdit,
+  STRING_AGG(DISTINCT pa.Title, '; ') AS RecentPostTitles,
+  CASE 
+    WHEN us.TotalPosts > 100 AND us.AvgScore >= 50 THEN 'Elite'
+    WHEN us.TotalPosts > 50 AND us.AvgScore >= 25 THEN 'Experienced'
+    WHEN us.TotalPosts > 10 AND us.AvgScore >= 5 THEN 'Regular'
+    ELSE 'Beginner'
+  END AS UserRank,
+  DATE_TRUNC('month', MAX(us.LastPostDate)) AS MonthlyActivity,
+  COUNT(DISTINCT CASE WHEN pa.CreationDate >= (DATE '2024-10-01' - INTERVAL '3' MONTH) THEN pa.Id END) AS RecentPosts3Months
+FROM UserActivity ua
+JOIN UserStats us ON ua.Id = us.UserId
+LEFT JOIN PostAnalysis pa ON us.UserId = pa.OwnerUserId AND pa.rn <= 10
+LEFT JOIN ParsedTags pt ON pt.OwnerUserId = us.UserId
+LEFT JOIN TagAnalysis ta ON ta.TagName = pt.TagName
+LEFT JOIN AnswerQuality aq ON us.UserId = aq.AnswererReputation
+WHERE ua.ActivityLevel IN ('Active', 'Moderate')
+GROUP BY 
+  ua.Id, ua.DisplayName, ua.QuestionsAsked, ua.AnswersGiven, 
+  ua.CommentsMade, ua.BadgesEarned, ua.VotesGiven, ua.ActivityLevel,
+  us.Reputation, us.Views, us.TotalPosts, us.Questions, us.Answers,
+  us.TotalScore, us.AvgScore, us.PostTitles, us.LastPostDate
+HAVING 
+  COUNT(pa.Id) >= 5 AND 
+  AVG(pa.ScorePerView) > 0.01 AND
+  COUNT(DISTINCT CASE WHEN pa.CreationDate >= (DATE '2024-10-01' - INTERVAL '3' MONTH) THEN pa.Id END) >= 2
+ORDER BY 
+  us.Reputation DESC, 
+  us.TotalScore DESC,
+  ua.QuestionsAsked DESC,
+  ua.AnswersGiven DESC
+FETCH FIRST 1000 ROWS ONLY;

@@ -1,0 +1,250 @@
+-- {"query": "7060.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2346} 
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        COALESCE(SUM(p.ViewCount), 0) as TotalViews,
+        MAX(p.CreationDate) as LastPostDate,
+        LEAD(u.CreationDate, 1) OVER (ORDER BY u.CreationDate) as NextUserCreationDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        PostCount,
+        CommentCount,
+        BadgeCount,
+        QuestionCount,
+        AnswerCount,
+        TotalScore,
+        TotalViews,
+        LastPostDate,
+        NextUserCreationDate,
+        DENSE_RANK() OVER (ORDER BY TotalScore DESC) as ScoreRank,
+        PERCENT_RANK() OVER (ORDER BY Reputation) as RepPercentile,
+        ROW_NUMBER() OVER (ORDER BY LastPostDate DESC) as RecentActivityRank
+    FROM UserStats
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.Tags,
+        COALESCE(p.AcceptedAnswerId, 0) as HasAcceptedAnswer,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN 'Question with Answers'
+            WHEN p.PostTypeId = 1 AND p.AnswerCount = 0 THEN 'Question without Answers'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as PostCategory,
+        CASE 
+            WHEN p.Score > 100 THEN 'Highly Rated'
+            WHEN p.Score > 50 THEN 'Moderately Rated'
+            WHEN p.Score > 0 THEN 'Slightly Rated'
+            ELSE 'Not Rated'
+        END as RatingLevel,
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) as ScoreRankWithinType,
+        AVG(p.Score) OVER (PARTITION BY p.PostTypeId) as AvgScorePerType,
+        STRING_AGG(CASE WHEN p.Tags IS NOT NULL THEN p.Tags ELSE '' END, ' ') OVER (ORDER BY p.CreationDate ROWS BETWEEN 10 PRECEDING AND CURRENT ROW) as RecentTags,
+        LAG(p.Score, 1) OVER (ORDER BY p.CreationDate) as PreviousScore,
+        CASE 
+            WHEN p.Score > LAG(p.Score, 1) OVER (ORDER BY p.CreationDate) THEN 'Increased'
+            WHEN p.Score < LAG(p.Score, 1) OVER (ORDER BY p.CreationDate) THEN 'Decreased'
+            ELSE 'Stable'
+        END as ScoreTrend,
+        CASE WHEN p.ViewCount > 1000 THEN 1 ELSE 0 END as PopularPost,
+        CASE WHEN p.CommentCount > 5 THEN 1 ELSE 0 END as CommentedPost
+    FROM Posts p
+    WHERE p.CreationDate >= '2010-01-01' AND p.CreationDate <= '2023-12-31'
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE WHEN t.IsRequired = 1 THEN 'Required' ELSE 'Optional' END as TagType,
+        CASE WHEN t.IsModeratorOnly = 1 THEN 'Moderator Only' ELSE 'Public' END as AccessLevel,
+        DENSE_RANK() OVER (ORDER BY t.Count DESC) as TagPopularityRank,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY t.Count) as MedianTagCount,
+        AVG(t.Count) OVER () as AvgTagCount
+    FROM Tags t
+),
+CombinedAnalysis AS (
+    SELECT 
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.PostCount,
+        tu.QuestionCount,
+        tu.AnswerCount,
+        tu.TotalScore,
+        tu.TotalViews,
+        pa.PostId,
+        pa.Title,
+        pa.Score,
+        pa.ViewCount,
+        pa.ScoreRankWithinType,
+        pa.AvgScorePerType,
+        pa.PostCategory,
+        pa.RatingLevel,
+        pa.RecentTags,
+        ta.TagName,
+        ta.TagCount,
+        ta.TagPopularityRank,
+        CASE 
+            WHEN tu.Reputation > 10000 THEN 'Elite'
+            WHEN tu.Reputation > 5000 THEN 'Veteran'
+            WHEN tu.Reputation > 1000 THEN 'Experienced'
+            ELSE 'Beginner'
+        END as UserTier,
+        CASE 
+            WHEN tu.Reputation > (SELECT AVG(Reputation) FROM Users) THEN 'Above Average'
+            WHEN tu.Reputation < (SELECT AVG(Reputation) FROM Users) THEN 'Below Average'
+            ELSE 'Average'
+        END as RepComparison,
+        CASE 
+            WHEN pa.Score > pa.AvgScorePerType THEN 'Above Average Score'
+            WHEN pa.Score < pa.AvgScorePerType THEN 'Below Average Score'
+            ELSE 'Average Score'
+        END as ScoreComparison,
+        ABS(pa.Score - pa.AvgScorePerType) as ScoreDeviation,
+        COALESCE(pa.PopularPost, 0) as IsPopular,
+        COALESCE(pa.CommentedPost, 0) as IsCommented
+    FROM TopUsers tu
+    JOIN PostAnalysis pa ON tu.UserId = pa.OwnerUserId
+    JOIN TagAnalysis ta ON pa.Tags LIKE '%' + ta.TagName + '%'
+    WHERE pa.PostId IS NOT NULL AND ta.TagName IS NOT NULL
+),
+FinalAnalysis AS (
+    SELECT 
+        ca.UserId,
+        ca.DisplayName,
+        ca.Reputation,
+        ca.PostCount,
+        ca.QuestionCount,
+        ca.AnswerCount,
+        ca.TotalScore,
+        ca.TotalViews,
+        ca.PostId,
+        ca.Title,
+        ca.Score,
+        ca.ViewCount,
+        ca.ScoreRankWithinType,
+        ca.AvgScorePerType,
+        ca.PostCategory,
+        ca.RatingLevel,
+        ca.RecentTags,
+        ca.TagName,
+        ca.TagCount,
+        ca.TagPopularityRank,
+        ca.UserTier,
+        ca.RepComparison,
+        ca.ScoreComparison,
+        ca.ScoreDeviation,
+        ca.IsPopular,
+        ca.IsCommented,
+        ROW_NUMBER() OVER (PARTITION BY ca.UserId ORDER BY ca.Score DESC) as UserPostRank,
+        DENSE_RANK() OVER (ORDER BY ca.Score DESC) as GlobalScoreRank,
+        NTILE(100) OVER (ORDER BY ca.Reputation) as RepDecile,
+        PERCENT_RANK() OVER (ORDER BY ca.Score) as ScorePercentile,
+        CASE 
+            WHEN ca.PostCategory = 'Question with Answers' AND ca.IsPopular = 1 AND ca.Score > 50 THEN 'High Impact Question'
+            WHEN ca.PostCategory = 'Answer' AND ca.IsCommented = 1 AND ca.Score > 20 THEN 'Well Commented Answer'
+            WHEN ca.PostCategory = 'Question without Answers' AND ca.RepComparison = 'Above Average' THEN 'Question from Above Average User'
+            ELSE 'Regular Post'
+        END as PostClassification,
+        CASE 
+            WHEN ca.Reputation > (SELECT AVG(Reputation) FROM Users) + STDDEV_POP(Reputation) OVER() THEN 1
+            ELSE 0
+        END as HighReputationUser
+    FROM CombinedAnalysis ca
+    WHERE ca.Reputation > 1000
+)
+SELECT 
+    fa.UserId,
+    fa.DisplayName,
+    fa.Reputation,
+    fa.PostCount,
+    fa.QuestionCount,
+    fa.AnswerCount,
+    fa.TotalScore,
+    fa.TotalViews,
+    fa.PostId,
+    fa.Title,
+    fa.Score,
+    fa.ViewCount,
+    fa.ScoreRankWithinType,
+    fa.AvgScorePerType,
+    fa.PostCategory,
+    fa.RatingLevel,
+    LEFT(fa.RecentTags, 200) as RecentTags,
+    fa.TagName,
+    fa.TagCount,
+    fa.TagPopularityRank,
+    fa.UserTier,
+    fa.RepComparison,
+    fa.ScoreComparison,
+    fa.ScoreDeviation,
+    fa.IsPopular,
+    fa.IsCommented,
+    fa.UserPostRank,
+    fa.GlobalScoreRank,
+    fa.RepDecile,
+    fa.ScorePercentile,
+    fa.PostClassification,
+    fa.HighReputationUser,
+    COALESCE(fa.Score * fa.Reputation / NULLIF(fa.PostCount, 0), 0) as ScoreReputationRatio,
+    CASE 
+        WHEN fa.ScoreDeviation > 50 THEN 'Significant Deviation'
+        WHEN fa.ScoreDeviation > 20 THEN 'Moderate Deviation'
+        WHEN fa.ScoreDeviation > 5 THEN 'Minor Deviation'
+        ELSE 'Minimal Deviation'
+    END as DeviationLevel,
+    COUNT(*) OVER (PARTITION BY fa.UserId) as UserPostCount,
+    AVG(fa.Score) OVER (PARTITION BY fa.UserId) as UserAverageScore,
+    MAX(fa.TagCount) OVER (PARTITION BY fa.UserId) as MaxUserTagCount,
+    MIN(fa.TagCount) OVER (PARTITION BY fa.UserId) as MinUserTagCount
+FROM FinalAnalysis fa
+WHERE fa.Score > 0 AND fa.Score IS NOT NULL
+  AND fa.Reputation IS NOT NULL
+  AND fa.PostId IS NOT NULL
+  AND (fa.PostCategory = 'Question with Answers' OR fa.PostCategory = 'Answer' OR fa.PostCategory = 'Question without Answers')
+  AND (fa.Score > (SELECT AVG(Score) FROM Posts WHERE Score IS NOT NULL) OR fa.TagCount > 10)
+  AND EXISTS (
+    SELECT 1 
+    FROM Posts p 
+    WHERE p.OwnerUserId = fa.UserId 
+      AND p.CreationDate >= fa.LastPostDate - INTERVAL '1 year'
+      AND p.PostTypeId IN (1, 2)
+  )
+  AND COALESCE(fa.Score, 0) * COALESCE(fa.Reputation, 0) > 100000
+ORDER BY 
+    fa.GlobalScoreRank,
+    fa.Reputation DESC,
+    fa.TagCount DESC
+LIMIT 1000;

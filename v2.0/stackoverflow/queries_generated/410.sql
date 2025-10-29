@@ -1,0 +1,349 @@
+-- {"query": "410.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3094} 
+with recent_q as (
+    select
+        p.Id as QuestionId,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        coalesce(p.AnswerCount, 0) as AnswerCount,
+        sum(case when v.VoteTypeId = 2 then 1 when v.VoteTypeId = 3 then -1 else 0 end) as NetVotes,
+        count(case when v.VoteTypeId = 5 then 1 end) as Favorites
+    from Posts p
+    left join Votes v on v.PostId = p.Id
+    where p.PostTypeId = 1
+      and p.CreationDate >= (select max(CreationDate) - interval '365 days' from Posts where PostTypeId = 1)
+    group by p.Id, p.OwnerUserId, p.Title, p.CreationDate, p.Score, p.ViewCount, p.Tags, p.AnswerCount
+),
+accepted_answers as (
+    select
+        q.Id as QuestionId,
+        a.Id as AcceptedAnswerId,
+        a.OwnerUserId as AcceptedOwnerId,
+        a.Score as AcceptedScore,
+        a.CreationDate as AcceptedCreationDate
+    from Posts q
+    join Posts a on a.Id = q.AcceptedAnswerId
+    where q.PostTypeId = 1
+),
+answer_stats as (
+    select
+        p.ParentId as QuestionId,
+        count(*) as TotalAnswers,
+        avg(p.Score::numeric) as AvgAnswerScore,
+        max(p.Score) as MaxAnswerScore,
+        min(p.Score) as MinAnswerScore
+    from Posts p
+    where p.PostTypeId = 2
+    group by p.ParentId
+),
+user_activity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate as UserCreationDate,
+        u.Location,
+        u.UpVotes,
+        u.DownVotes,
+        sum(b.case_cnt) as BadgeCountWeighted
+    from Users u
+    left join (
+        select UserId,
+               sum(case when Class = 1 then 9 when Class = 2 then 3 when Class = 3 then 1 else 0 end) as case_cnt
+        from Badges
+        group by UserId
+    ) b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location, u.UpVotes, u.DownVotes
+),
+tag_exploded as (
+    select
+        rq.QuestionId,
+        unnest(string_to_array(substring(coalesce(rq.Tags, ''), 2, greatest(length(coalesce(rq.Tags, '')) - 2, 0)), '><')) as TagName
+    from recent_q rq
+),
+tag_rank as (
+    select
+        te.TagName,
+        count(*) as TagFreq,
+        rank() over (order by count(*) desc, min(te.TagName)) as TagPopularityRank
+    from tag_exploded te
+    group by te.TagName
+),
+duplicates as (
+    select
+        pl.PostId as QuestionId,
+        count(*) filter (where pl.LinkTypeId = 3) as DuplicateLinks,
+        count(*) filter (where pl.LinkTypeId = 1) as LinkedLinks
+    from PostLinks pl
+    group by pl.PostId
+),
+close_events as (
+    select
+        ph.PostId as QuestionId,
+        min(ph.CreationDate) filter (where ph.PostHistoryTypeId = 10) as FirstClosedAt,
+        max(ph.CreationDate) filter (where ph.PostHistoryTypeId = 11) as LastReopenedAt,
+        count(*) filter (where ph.PostHistoryTypeId = 10) as CloseEvents,
+        count(*) filter (where ph.PostHistoryTypeId = 11) as ReopenEvents,
+        count(*) filter (where ph.PostHistoryTypeId in (12,13)) as DeleteUndeleteEvents,
+        count(*) filter (where ph.PostHistoryTypeId = 35) as MigratedAway,
+        count(*) filter (where ph.PostHistoryTypeId = 36) as MigratedHere
+    from PostHistory ph
+    group by ph.PostId
+),
+comment_agg as (
+    select
+        c.PostId as QuestionId,
+        count(*) as CommentCount,
+        max(c.Score) as MaxCommentScore,
+        avg(c.Score::numeric) as AvgCommentScore,
+        string_agg(distinct coalesce(c.UserDisplayName, 'anonymous'), ', ' order by coalesce(c.UserDisplayName, 'anonymous')) as Commenters
+    from Comments c
+    group by c.PostId
+),
+question_quality as (
+    select
+        rq.QuestionId,
+        rq.OwnerUserId,
+        rq.Title,
+        rq.CreationDate,
+        rq.Score,
+        rq.ViewCount,
+        rq.AnswerCount,
+        rq.NetVotes,
+        rq.Favorites,
+        coalesce(asf.TotalAnswers, 0) as TotalAnswers,
+        asf.AvgAnswerScore,
+        asf.MaxAnswerScore,
+        asf.MinAnswerScore,
+        dupe.DuplicateLinks,
+        dupe.LinkedLinks,
+        ce.FirstClosedAt,
+        ce.LastReopenedAt,
+        ce.CloseEvents,
+        ce.ReopenEvents,
+        ce.DeleteUndeleteEvents,
+        ce.MigratedAway,
+        ce.MigratedHere,
+        ca.CommentCount,
+        ca.MaxCommentScore,
+        ca.AvgCommentScore,
+        ca.Commenters
+    from recent_q rq
+    left join answer_stats asf on asf.QuestionId = rq.QuestionId
+    left join duplicates dupe on dupe.QuestionId = rq.QuestionId
+    left join close_events ce on ce.QuestionId = rq.QuestionId
+    left join comment_agg ca on ca.QuestionId = rq.QuestionId
+),
+user_rollup as (
+    select
+        qa.OwnerUserId as UserId,
+        count(*) as QuestionsCount,
+        sum(qa.Score) as TotalQuestionScore,
+        avg(qa.Score::numeric) as AvgQuestionScore,
+        sum(coalesce(qa.ViewCount,0)) as TotalViews,
+        sum(coalesce(qa.NetVotes,0)) as TotalNetVotes,
+        sum(coalesce(qa.Favorites,0)) as TotalFavorites,
+        sum(coalesce(qa.TotalAnswers,0)) as SumAnswersReceived
+    from question_quality qa
+    group by qa.OwnerUserId
+),
+accepted_metrics as (
+    select
+        rq.QuestionId,
+        case when aa.AcceptedAnswerId is not null then 1 else 0 end as HasAcceptedAnswer,
+        aa.AcceptedAnswerId,
+        aa.AcceptedOwnerId,
+        aa.AcceptedScore,
+        date_part('epoch', aa.AcceptedCreationDate - rq.CreationDate) as SecondsToAccept
+    from recent_q rq
+    left join accepted_answers aa on aa.QuestionId = rq.QuestionId
+),
+user_enriched as (
+    select
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.UserCreationDate,
+        ua.Location,
+        ua.UpVotes,
+        ua.DownVotes,
+        coalesce(ua.BadgeCountWeighted,0) as BadgeCountWeighted,
+        ur.QuestionsCount,
+        ur.TotalQuestionScore,
+        ur.AvgQuestionScore,
+        ur.TotalViews,
+        ur.TotalNetVotes,
+        ur.TotalFavorites,
+        ur.SumAnswersReceived
+    from user_activity ua
+    left join user_rollup ur on ur.UserId = ua.UserId
+),
+title_signals as (
+    select
+        rq.QuestionId,
+        length(coalesce(rq.Title, '')) as TitleLen,
+        regexp_count(coalesce(rq.Title,''), '\?') as QMarkCount,
+        regexp_count(coalesce(rq.Title,''), '!') as ExclaimCount,
+        case
+            when rq.Title ~* 'how|why|what|where|when|can|does|is|are' then 1 else 0
+        end as HasInterrogative
+    from recent_q rq
+),
+tag_top3 as (
+    select
+        te.QuestionId,
+        string_agg(tr.TagName, ', ' order by tr.TagPopularityRank) as TopTagsByPopularity
+    from tag_exploded te
+    join tag_rank tr on tr.TagName = te.TagName
+    where tr.TagPopularityRank <= 3
+    group by te.QuestionId
+),
+normalized as (
+    select
+        qq.*,
+        am.HasAcceptedAnswer,
+        am.AcceptedAnswerId,
+        am.AcceptedOwnerId,
+        am.AcceptedScore,
+        am.SecondsToAccept,
+        ts.TitleLen,
+        ts.QMarkCount,
+        ts.ExclaimCount,
+        ts.HasInterrogative,
+        tt.TopTagsByPopularity
+    from question_quality qq
+    left join accepted_metrics am on am.QuestionId = qq.QuestionId
+    left join title_signals ts on ts.QuestionId = qq.QuestionId
+    left join tag_top3 tt on tt.QuestionId = qq.QuestionId
+),
+scored as (
+    select
+        n.QuestionId,
+        n.OwnerUserId,
+        n.Title,
+        coalesce(n.Score,0) as Score,
+        coalesce(n.ViewCount,0) as ViewCount,
+        coalesce(n.NetVotes,0) as NetVotes,
+        coalesce(n.Favorites,0) as Favorites,
+        coalesce(n.TotalAnswers,0) as TotalAnswers,
+        coalesce(n.AvgAnswerScore,0) as AvgAnswerScore,
+        coalesce(n.CommentCount,0) as CommentCount,
+        coalesce(n.HasAcceptedAnswer,0) as HasAcceptedAnswer,
+        coalesce(n.SecondsToAccept, 0) as SecondsToAccept,
+        coalesce(n.TitleLen,0) as TitleLen,
+        coalesce(n.QMarkCount,0) as QMarkCount,
+        coalesce(n.ExclaimCount,0) as ExclaimCount,
+        coalesce(n.HasInterrogative,0) as HasInterrogative,
+        coalesce(n.DuplicateLinks,0) as DuplicateLinks,
+        coalesce(n.CloseEvents,0) as CloseEvents,
+        coalesce(n.ReopenEvents,0) as ReopenEvents,
+        coalesce(n.DeleteUndeleteEvents,0) as DeleteUndeleteEvents,
+        coalesce(n.MigratedAway,0) as MigratedAway,
+        coalesce(n.MigratedHere,0) as MigratedHere,
+        n.TopTagsByPopularity,
+        -- composite score mixing popularity, engagement, quality, and penalties
+        (
+            0.40 * ln(1 + greatest(n.ViewCount,0)) +
+            0.25 * (coalesce(n.NetVotes,0)) +
+            0.10 * (coalesce(n.Favorites,0)) +
+            0.10 * (coalesce(n.TotalAnswers,0)) +
+            0.05 * (coalesce(n.AvgAnswerScore,0)) +
+            0.05 * (coalesce(n.CommentCount,0)) +
+            0.08 * (case when coalesce(n.HasAcceptedAnswer,0) = 1 then 5 else 0 end) +
+            0.03 * (case when coalesce(n.HasInterrogative,0) = 1 then 1 else 0 end) -
+            0.15 * (coalesce(n.DuplicateLinks,0)) -
+            0.12 * (coalesce(n.CloseEvents,0)) -
+            0.05 * (coalesce(n.ReopenEvents,0)) -
+            0.03 * (coalesce(n.DeleteUndeleteEvents,0)) -
+            0.02 * (coalesce(n.ExclaimCount,0))
+        ) as CompositeScore
+    from normalized n
+),
+ranked as (
+    select
+        s.*,
+        dense_rank() over (order by s.CompositeScore desc, s.NetVotes desc, s.ViewCount desc, s.Score desc, s.QuestionId) as GlobalRank,
+        row_number() over (partition by s.OwnerUserId order by s.CompositeScore desc, s.QuestionId) as UserLocalRank
+    from scored s
+),
+user_final as (
+    select
+        re.*,
+        ue.DisplayName,
+        ue.Reputation,
+        ue.Location,
+        ue.BadgeCountWeighted,
+        ue.QuestionsCount,
+        ue.TotalQuestionScore,
+        ue.AvgQuestionScore,
+        ue.TotalViews as UserTotalViews,
+        ue.TotalNetVotes as UserTotalNetVotes,
+        ue.TotalFavorites as UserTotalFavorites,
+        ue.SumAnswersReceived
+    from ranked re
+    left join user_enriched ue on ue.UserId = re.OwnerUserId
+),
+saves as (
+    select
+        v.PostId,
+        count(*) as SaveCount
+    from Votes v
+    where v.VoteTypeId = 5
+    group by v.PostId
+),
+final as (
+    select
+        uf.*,
+        coalesce(sv.SaveCount,0) as SaveCount,
+        case when uf.Reputation is null then 1 else 0 end as IsOwnerDeletedOrUnknown
+    from user_final uf
+    left join saves sv on sv.PostId = uf.QuestionId
+)
+select
+    f.QuestionId,
+    f.Title,
+    f.OwnerUserId,
+    coalesce(f.DisplayName, '(unknown)') as OwnerDisplayName,
+    f.Reputation,
+    f.Location,
+    f.BadgeCountWeighted,
+    f.Score,
+    f.ViewCount,
+    f.NetVotes,
+    f.Favorites,
+    f.SaveCount,
+    f.TotalAnswers,
+    f.CommentCount,
+    f.HasAcceptedAnswer,
+    f.SecondsToAccept,
+    f.TitleLen,
+    f.QMarkCount,
+    f.ExclaimCount,
+    f.HasInterrogative,
+    f.DuplicateLinks,
+    f.CloseEvents,
+    f.ReopenEvents,
+    f.DeleteUndeleteEvents,
+    f.MigratedAway,
+    f.MigratedHere,
+    f.TopTagsByPopularity,
+    f.CompositeScore,
+    f.GlobalRank,
+    f.UserLocalRank,
+    f.QuestionsCount,
+    f.TotalQuestionScore,
+    f.AvgQuestionScore,
+    f.UserTotalViews,
+    f.UserTotalNetVotes,
+    f.UserTotalFavorites,
+    f.SumAnswersReceived,
+    f.IsOwnerDeletedOrUnknown
+from final f
+where (f.CloseEvents = 0 or f.ReopenEvents >= 1 or f.HasAcceptedAnswer = 1)
+  and (f.TitleLen > 0 and f.Title !~* '(?:test|dummy)')
+  and coalesce(f.CompositeScore, 0) is not null
+order by f.GlobalRank
+limit 250;

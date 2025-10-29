@@ -1,0 +1,96 @@
+-- {"query": "5785.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 838} 
+WITH
+-- sample time-bounded snapshot for performance variety
+RecentPosts AS (
+  SELECT
+    p.Id,
+    p.PostTypeId,
+    p.Title,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.AcceptedAnswerId,
+    p.ParentId,
+    p.LastActivityDate,
+    p.LastEditDate,
+    p.CommentCount,
+    p.FavoriteCount
+  FROM Posts p
+  WHERE p.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '180 days')
+),
+-- correlated subquery: top 3 related posts by tag population
+TopTagRelated AS (
+  SELECT
+    p.Id AS PostId,
+    t.TagName AS Tag,
+    (SELECT COUNT(*) FROM Posts q WHERE q.Tags LIKE '%' || t.TagName || '%' ) AS TagPostCount
+  FROM RecentPosts p
+  CROSS JOIN LATERAL (
+    SELECT UNNEST(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')) AS TagName
+  ) t
+),
+-- windowed ranking of related posts by score and recency
+RankedRelated AS (
+  SELECT
+    r.PostId,
+    r.Tag,
+    r.TagPostCount,
+    ROW_NUMBER() OVER (PARTITION BY r.PostId ORDER BY r.TagPostCount DESC, (SELECT COALESCE(MAX(v.CreationDate), p.CreationDate) FROM Posts v WHERE v.Id = r.PostId) DESC) AS rn
+  FROM TopTagRelated r
+),
+-- provide some aggregation on posts with outer join to user meta to stress NULLs and joins
+UserStats AS (
+  SELECT
+    up.Id AS UserId,
+    up.DisplayName,
+    up.Reputation,
+    up.CreationDate AS UserCreationDate,
+    up.LastAccessDate,
+    up.Views,
+    up.UpVotes,
+    up.DownVotes,
+    up.AccountId,
+    COUNT(DISTINCT c.Id) AS CommentCount,
+    MAX(v.CreationDate) AS LastVoteDate
+  FROM Users up
+  LEFT JOIN Posts p ON p.OwnerUserId = up.Id
+  LEFT JOIN Comments c ON c.UserId = up.Id
+  LEFT JOIN Votes v ON v.UserId = up.Id
+  GROUP BY up.Id, up.DisplayName, up.Reputation, up.CreationDate, up.LastAccessDate, up.Views, up.UpVotes, up.DownVotes, up.AccountId
+),
+-- multi-CTE: compute a complex derived metric with NULL-safe arithmetic and string exprs
+Metrics AS (
+  SELECT
+    r.PostId,
+    r.Tag,
+    r.TagPostCount,
+    ROUND(COALESCE(p.Score, 0) * 1.0 / NULLIF(p.ViewCount, 0), 6) AS ScorePerView,
+    CASE WHEN p.ViewCount IS NULL THEN NULL
+         WHEN p.ViewCount < 100 THEN 'low-traffic'
+         WHEN p.ViewCount < 1000 THEN 'mid-traffic'
+         ELSE 'high-traffic' END AS TrafficBucket,
+    LENGTH(p.Title) AS TitleLength,
+    (CASE WHEN p.Body IS NOT NULL THEN LENGTH(p.Body) ELSE 0 END) AS BodyLength
+  FROM RankedRelated r
+  JOIN RecentPosts p ON p.Id = r.PostId
+  WHERE r.rn = 1
+)
+SELECT
+  m.PostId,
+  m.Tag,
+  m.TagPostCount,
+  m.ScorePerView,
+  m.TrafficBucket,
+  m.TitleLength,
+  m.BodyLength,
+  u.DisplayName AS OwnerDisplayName,
+  u.Reputation AS OwnerReputation,
+  u.LastAccessDate AS OwnerLastAccess
+FROM Metrics m
+LEFT JOIN Posts p ON p.Id = m.PostId
+LEFT JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN UserStats us ON us.UserId = u.Id
+ORDER BY m.TagPostCount DESC, m.ScorePerView DESC
+LIMIT 100;

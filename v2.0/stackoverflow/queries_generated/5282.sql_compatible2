@@ -1,0 +1,144 @@
+WITH
+RecentQuestions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.OwnerDisplayName,
+    p.LastActivityDate,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn_owner
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180 days'
+),
+TagStats AS (
+  SELECT
+    tag AS TagName,
+    COUNT(*) AS TagCount
+  FROM Posts t,
+       LATERAL (
+         SELECT unnest(string_to_array(substr(t.Tags, 2, length(t.Tags)-2), '><')) AS tag
+       ) s
+  WHERE t.PostTypeId = 1
+  GROUP BY tag
+),
+ActiveTagWikis AS (
+  SELECT
+    tg.TagName,
+    tg.TagCount,
+    r.OwnerUserId,
+    r.OwnerDisplayName,
+    r.CreationDate AS QuestionCreated
+  FROM TagStats tg
+  JOIN LATERAL (
+    SELECT p.OwnerUserId, p.OwnerDisplayName, p.CreationDate
+    FROM Posts p
+    WHERE p.PostTypeId = 5
+      AND p.Tags ILIKE '%' || tg.TagName || '%'
+    ORDER BY p.CreationDate DESC
+    LIMIT 1
+  ) r ON TRUE
+),
+CrossLink AS (
+  SELECT
+    q.PostId,
+    q.Title,
+    q.Tags,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    q.OwnerUserId,
+    q.OwnerDisplayName,
+    COALESCE(v1.CountVotes, 0) AS Upvotes,
+    COALESCE(v2.CountVotes, 0) AS Downvotes
+  FROM RecentQuestions q
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS CountVotes
+    FROM Votes
+    WHERE VoteTypeId = 2
+    GROUP BY PostId
+  ) v1 ON v1.PostId = q.PostId
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS CountVotes
+    FROM Votes
+    WHERE VoteTypeId = 3
+    GROUP BY PostId
+  ) v2 ON v2.PostId = q.PostId
+),
+Windowed AS (
+  SELECT
+    PostId,
+    Title,
+    Tags,
+    CreationDate,
+    ViewCount,
+    Upvotes,
+    Downvotes,
+    OwnerUserId,
+    OwnerDisplayName,
+    ROW_NUMBER() OVER (
+      PARTITION BY OwnerUserId
+      ORDER BY CreationDate DESC
+    ) AS rn_by_owner
+  FROM CrossLink
+)
+SELECT
+  w.PostId,
+  w.Title,
+  w.Tags,
+  w.CreationDate,
+  w.ViewCount,
+  w.Upvotes,
+  w.Downvotes,
+  u.Id AS UserId,
+  u.DisplayName AS UserDisplayName,
+  u.Reputation,
+  u.CreationDate AS UserCreationDate,
+  u.LastAccessDate,
+  u.Location,
+  u.AboutMe,
+  u.Views,
+  u.UpVotes,
+  u.DownVotes,
+  u.ProfileImageUrl,
+  u.WebsiteUrl,
+  u.EmailHash,
+  u.AccountId,
+  a.TagName AS MostDiscussedTag,
+  COALESCE(a.TagCount, 0) AS TagPopularity,
+  w.rn_by_owner
+FROM Windowed w
+LEFT JOIN Users u ON w.OwnerUserId = u.Id
+LEFT JOIN ActiveTagWikis a ON TRUE
+WHERE w.rn_by_owner = 1
+GROUP BY
+  w.PostId,
+  w.Title,
+  w.Tags,
+  w.CreationDate,
+  w.ViewCount,
+  w.Upvotes,
+  w.Downvotes,
+  u.Id,
+  u.DisplayName,
+  u.Reputation,
+  u.CreationDate,
+  u.LastAccessDate,
+  u.Location,
+  u.AboutMe,
+  u.Views,
+  u.UpVotes,
+  u.DownVotes,
+  u.ProfileImageUrl,
+  u.WebsiteUrl,
+  u.EmailHash,
+  u.AccountId,
+  a.TagName,
+  a.TagCount,
+  w.rn_by_owner
+ORDER BY (w.Upvotes - w.Downvotes) DESC, w.ViewCount DESC
+LIMIT 100;

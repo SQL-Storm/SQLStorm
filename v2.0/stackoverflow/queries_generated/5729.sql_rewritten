@@ -1,0 +1,116 @@
+-- {"query": "5729.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 990} 
+WITH ExpensivePostActivity AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    u.Reputation,
+    u.DisplayName,
+    u.CreationDate AS UserCreationDate,
+    u.LastAccessDate,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id) AS UpVotesGivenToPost,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id) AS DownVotesGivenToPost,
+    MAX(CASE WHEN vt.Name = 'AcceptedByOriginator' THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id) AS IsAccepted
+  FROM Posts p
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  LEFT JOIN Users u ON u.Id = p.OwnerUserId
+  LEFT JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+  WHERE p.PostTypeId IN (1, 2) -- Questions and Answers
+),
+TagAndWikiContext AS (
+  SELECT
+    t.TagName,
+    t.Count AS TagCount,
+    t.IsModeratorOnly,
+    t.IsRequired,
+    t.ExcerptPostId,
+    t.WikiPostId,
+    t.Id AS TagId
+  FROM Tags t
+),
+RecentActivity AS (
+  SELECT
+    a.PostId,
+    a.PostTypeId,
+    a.Title,
+    a.OwnerUserId,
+    a.CreationDate,
+    a.LastActivityDate,
+    a.Reputation,
+    a.DisplayName,
+    a.UserCreationDate,
+    a.LastAccessDate,
+    a.UpVotesGivenToPost,
+    a.DownVotesGivenToPost,
+    a.IsAccepted,
+    ROW_NUMBER() OVER (PARTITION BY a.PostId ORDER BY a.LastActivityDate DESC) AS rn
+  FROM ExpensivePostActivity a
+  LEFT JOIN PostLinks pl ON pl.PostId = a.PostId
+  LEFT JOIN Tags t ON t.Id = (SELECT TOP 1 Id FROM Tags WHERE TagName = ANY(string_to_array(REPLACE(a.Tags, '<',''), '>') ) LIMIT 1)
+  WHERE a.LastActivityDate IS NOT NULL
+),
+CorrelatedCommentStats AS (
+  SELECT
+    r.PostId,
+    COUNT(c.Id) AS CommentCountLast30,
+    MAX(c.CreationDate) AS LastCommentDate
+  FROM RecentActivity r
+  LEFT JOIN Comments c ON c.PostId = r.PostId
+  WHERE c.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+  GROUP BY r.PostId
+),
+FinalOutput AS (
+  SELECT
+    ra.PostId,
+    ra.PostTypeId,
+    ra.Title,
+    ra.OwnerUserId,
+    ra.DisplayName AS OwnerDisplayName,
+    ra.Reputation,
+    ra.CreationDate,
+    ra.LastActivityDate,
+    ra.UpVotesGivenToPost,
+    ra.DownVotesGivenToPost,
+    ra.IsAccepted,
+    c.LastCommentDate,
+    c.CommentCountLast30,
+    SUM(v.BountyAmount) FILTER (WHERE v.BountyAmount IS NOT NULL) OVER (PARTITION BY ra.PostId) AS TotalBounty,
+    vr.Name AS VoteTypeName
+  FROM RecentActivity ra
+  LEFT JOIN Votes v ON v.PostId = ra.PostId
+  LEFT JOIN VoteTypes vr ON vr.Id = v.VoteTypeId
+  LEFT JOIN CorrelatedCommentStats c ON c.PostId = ra.PostId
+  WHERE ra.rn = 1
+  GROUP BY
+    ra.PostId, ra.PostTypeId, ra.Title, ra.OwnerUserId, ra.DisplayName, ra.Reputation,
+    ra.CreationDate, ra.LastActivityDate, ra.UpVotesGivenToPost, ra.DownVotesGivenToPost,
+    ra.IsAccepted, c.LastCommentDate, c.CommentCountLast30, vr.Name
+)
+SELECT
+  fo.PostId,
+  fo.PostTypeId,
+  fo.Title,
+  fo.OwnerUserId,
+  fo.OwnerDisplayName,
+  fo.Reputation,
+  fo.CreationDate,
+  fo.LastActivityDate,
+  fo.UpVotesGivenToPost,
+  fo.DownVotesGivenToPost,
+  fo.IsAccepted,
+  fo.LastCommentDate,
+  fo.CommentCountLast30,
+  fo.TotalBounty,
+  fo.VoteTypeName
+FROM FinalOutput fo
+ORDER BY fo.LastActivityDate DESC, fo.Score DESC NULLS LAST
+LIMIT 200;

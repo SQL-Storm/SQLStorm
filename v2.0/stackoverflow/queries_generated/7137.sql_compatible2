@@ -1,0 +1,247 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(p.CreationDate) AS LatestPostDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Elite'
+            WHEN u.Reputation >= 1000 THEN 'Advanced'
+            WHEN u.Reputation >= 100 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END AS UserLevel
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        p.ParentId,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Question with Accepted Answer'
+            WHEN p.PostTypeId = 1 THEN 'Question without Accepted Answer'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostCategory,
+        CASE 
+            WHEN p.Score > 100 THEN 'Highly Voted'
+            WHEN p.Score > 50 THEN 'Moderately Voted'
+            WHEN p.Score > 0 THEN 'Low Voted'
+            ELSE 'No Votes'
+        END AS VoteStatus,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS ScoreRank,
+        RANK() OVER (ORDER BY p.ViewCount DESC) AS ViewRank,
+        LAG(p.Score, 1) OVER (ORDER BY p.CreationDate) AS PrevScore,
+        LAG(p.ViewCount, 1) OVER (ORDER BY p.CreationDate) AS PrevViewCount
+    FROM Posts p
+    WHERE p.CreationDate >= TIMESTAMP '2020-01-01'
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagCount,
+        t.WikiPostId,
+        t.ExcerptPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            WHEN t.Count > 10 THEN 'Niche'
+            ELSE 'Rare'
+        END AS PopularityLevel,
+        DENSE_RANK() OVER (ORDER BY t.Count DESC) AS PopularityRank,
+        AVG(t.Count) OVER () AS AvgTagCount
+    FROM Tags t
+    WHERE t.Count > 0
+),
+VotingPatterns AS (
+    SELECT 
+        v.PostId,
+        v.VoteTypeId,
+        COUNT(*) AS VoteCount,
+        MAX(v.CreationDate) AS LastVoteDate,
+        AVG(EXTRACT(EPOCH FROM v.CreationDate)) AS AvgVoteEpoch,
+        TO_TIMESTAMP(AVG(EXTRACT(EPOCH FROM v.CreationDate))) AS AvgVoteDate,
+        STRING_AGG(DISTINCT u.DisplayName, ', ' ORDER BY u.DisplayName) AS VotedByUsers,
+        CASE 
+            WHEN v.VoteTypeId IN (2, 3) THEN 'Reputation Votes'
+            WHEN v.VoteTypeId IN (4, 12) THEN 'Moderation Votes'
+            WHEN v.VoteTypeId IN (8, 9) THEN 'Bounty Votes'
+            ELSE 'Other Votes'
+        END AS VoteCategory
+    FROM Votes v
+    LEFT JOIN Users u ON v.UserId = u.Id
+    WHERE v.CreationDate >= TIMESTAMP '2020-01-01'
+    GROUP BY v.PostId, v.VoteTypeId
+),
+CombinedAnalysis AS (
+    SELECT 
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.PostCount,
+        us.CommentCount,
+        us.BadgeCount,
+        us.AvgPostScore,
+        us.UserLevel,
+        us.ReputationRank,
+        pa.PostId,
+        pa.Title,
+        pa.Score,
+        pa.ViewCount,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.PostCategory,
+        pa.VoteStatus,
+        pa.ScoreRank,
+        pa.ViewRank,
+        ta.TagName,
+        ta.TagCount,
+        ta.PopularityLevel,
+        vp.VoteTypeId,
+        vp.VoteCount,
+        vp.VoteCategory,
+        CASE 
+            WHEN pa.Score > 0 AND pa.AnswerCount > 0 THEN pa.Score * pa.AnswerCount
+            ELSE 0
+        END AS EngagementScore,
+        CASE 
+            WHEN pa.CreationDate >= DATE '2022-01-01' THEN 'Recent'
+            WHEN pa.CreationDate >= DATE '2020-01-01' THEN 'Modern'
+            ELSE 'Historical'
+        END AS TimePeriod,
+        COALESCE(pa.ParentId, 0) AS ParentId,
+        COALESCE(vp.VoteCount, 0) AS TotalVotes
+    FROM UserStats us
+    INNER JOIN PostAnalysis pa ON us.UserId = pa.OwnerUserId
+    LEFT JOIN VotingPatterns vp ON pa.PostId = vp.PostId
+    LEFT JOIN (
+        SELECT 
+            p.Id AS PostId,
+            t.TagName
+        FROM Posts p,
+             LATERAL (
+               SELECT regexp_split_to_table(
+                 trim(BOTH '<' FROM trim(BOTH '>' FROM p.Tags)),
+                 '><'
+               ) AS TagName
+             ) t
+        WHERE p.Tags IS NOT NULL AND p.Tags <> ''
+    ) tag_joined ON pa.PostId = tag_joined.PostId
+    LEFT JOIN TagAnalysis ta ON tag_joined.TagName = ta.TagName
+    WHERE us.PostCount > 0
+),
+FinalAggregation AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        PostCount,
+        CommentCount,
+        BadgeCount,
+        AvgPostScore,
+        UserLevel,
+        ReputationRank,
+        COUNT(DISTINCT PostId) AS TotalPosts,
+        AVG(Score) AS AvgPostScoreAll,
+        SUM(Score) AS TotalScore,
+        MAX(MaxScore) AS MaxScore,
+        SUM(EngagementScore) AS TotalEngagement,
+        STRING_AGG(DISTINCT PostCategory, ' | ' ORDER BY PostCategory) AS PostCategories,
+        STRING_AGG(DISTINCT VoteCategory, ' | ' ORDER BY VoteCategory) AS VoteCategories,
+        STRING_AGG(DISTINCT TagName, ' | ' ORDER BY TagName) AS TaggedTopics,
+        SUM(CASE WHEN VoteCount > 0 THEN 1 ELSE 0 END) AS PostsWithVotes,
+        AVG(TotalVotes) AS AvgVotesPerPost,
+        COUNT(DISTINCT CASE WHEN VoteCategory = 'Reputation Votes' THEN PostId END) AS ReputationVotedPosts,
+        COUNT(DISTINCT CASE WHEN VoteCategory = 'Moderation Votes' THEN PostId END) AS ModerationVotedPosts,
+        COUNT(DISTINCT CASE WHEN VoteCategory = 'Bounty Votes' THEN PostId END) AS BountyVotedPosts,
+        CASE 
+            WHEN AVG(PostScore) > 10 THEN 'Highly Engaging'
+            WHEN AVG(PostScore) > 5 THEN 'Moderately Engaging'
+            ELSE 'Low Engagement'
+        END AS EngagementLevel
+    FROM (
+        SELECT 
+            ca.UserId,
+            ca.DisplayName,
+            ca.Reputation,
+            ca.PostCount,
+            ca.CommentCount,
+            ca.BadgeCount,
+            ca.AvgPostScore,
+            ca.UserLevel,
+            ca.ReputationRank,
+            ca.PostId,
+            ca.Score,
+            ca.PostCategory,
+            ca.VoteCategory,
+            ca.TagName,
+            ca.VoteCount,
+            ca.EngagementScore,
+            ca.TotalVotes,
+            ca.Score AS PostScore,
+            MAX(ca.Score) OVER (PARTITION BY ca.UserId) AS MaxScore
+        FROM CombinedAnalysis ca
+    ) subquery
+    GROUP BY UserId, DisplayName, Reputation, PostCount, CommentCount, BadgeCount, AvgPostScore, UserLevel, ReputationRank
+)
+SELECT 
+    fa.UserId,
+    fa.DisplayName,
+    fa.Reputation,
+    fa.PostCount,
+    fa.CommentCount,
+    fa.BadgeCount,
+    fa.AvgPostScore,
+    fa.UserLevel,
+    fa.ReputationRank,
+    fa.TotalPosts,
+    fa.AvgPostScoreAll,
+    fa.TotalScore,
+    fa.MaxScore,
+    fa.TotalEngagement,
+    fa.PostCategories,
+    fa.VoteCategories,
+    fa.TaggedTopics,
+    fa.PostsWithVotes,
+    fa.AvgVotesPerPost,
+    fa.ReputationVotedPosts,
+    fa.ModerationVotedPosts,
+    fa.BountyVotedPosts,
+    fa.EngagementLevel,
+    CASE 
+        WHEN fa.ReputationRank <= 10 THEN 'Top 10'
+        WHEN fa.ReputationRank <= 50 THEN 'Top 50'
+        WHEN fa.ReputationRank <= 100 THEN 'Top 100'
+        ELSE 'Below Top 100'
+    END AS RankingTier,
+    ROUND((fa.AvgPostScoreAll * 100.0 / NULLIF(fa.Reputation, 0)), 2) AS ScorePerRepRatio,
+    ROUND((fa.TotalScore * 1.0 / NULLIF(fa.TotalPosts, 0)), 2) AS AvgScorePerPost,
+    (SELECT COUNT(*) FROM FinalAggregation fa2 WHERE fa2.Reputation > fa.Reputation) AS HigherReputationUsers,
+    (SELECT COUNT(*) FROM FinalAggregation fa3 WHERE fa3.Reputation < fa.Reputation) AS LowerReputationUsers
+FROM FinalAggregation fa
+WHERE fa.PostCount > 0
+  AND (fa.Reputation > 1000 OR fa.BadgeCount > 5 OR fa.TotalPosts > 10)
+ORDER BY fa.Reputation DESC
+LIMIT 1000
+OFFSET 100;

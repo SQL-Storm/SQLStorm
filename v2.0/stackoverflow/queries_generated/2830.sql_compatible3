@@ -1,0 +1,173 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id, 
+        t.TagName, 
+        t.Count, 
+        t.IsModeratorOnly, 
+        t.IsRequired, 
+        1 AS Level
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+
+    UNION ALL
+
+    SELECT 
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.IsModeratorOnly,
+        t2.IsRequired,
+        r.Level + 1
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r ON t2.Count < r.Count
+    WHERE t2.IsRequired = FALSE
+),
+UserBadgeCounts AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        COALESCE(SUM(v.UpVotes),0) AS TotalUpVotes,
+        COALESCE(SUM(v.DownVotes),0) AS TotalDownVotes,
+        u.Reputation
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id AND v.VoteTypeId IN (2,3)
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+QuestionAnswerStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate AS QuestionCreation,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        a.Id AS AnswerId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerCreation,
+        a.OwnerUserId AS AnswerOwnerId,
+        a.OwnerDisplayName AS AnswerOwnerName,
+        ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank,
+        CASE WHEN q.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END AS IsAcceptedAnswer
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+),
+HighImpactPosts AS (
+    SELECT
+        q.QuestionId,
+        q.Title,
+        q.QuestionCreation,
+        q.QuestionScore,
+        q.ViewCount,
+        COUNT(DISTINCT q.AnswerId) AS NumberOfAnswers,
+        SUM(COALESCE(q.AnswerScore,0)) AS TotalAnswerScore,
+        MAX(COALESCE(q.AnswerScore,0)) AS MaxAnswerScore,
+        SUM(q.IsAcceptedAnswer) AS HasAcceptedAnswer,
+        STRING_AGG(DISTINCT u.DisplayName, ', ' ORDER BY u.Reputation DESC) AS TopAnswerers,
+        q.Tags
+    FROM QuestionAnswerStats q
+    LEFT JOIN Users u ON u.Id = q.AnswerOwnerId
+    GROUP BY q.QuestionId, q.Title, q.QuestionCreation, q.QuestionScore, q.ViewCount, q.Tags
+    HAVING COUNT(DISTINCT q.AnswerId) > 3 AND q.ViewCount > 1000
+),
+LatestPostHistory AS (
+    SELECT ph.PostId, ph.UserId, ph.CreationDate, ph.PostHistoryTypeId, ph.Comment,
+           ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (10,11,12,13)
+),
+PostsWithCloseStatus AS (
+    SELECT p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount,
+           lph.PostHistoryTypeId as CloseStatusTypeId,
+           crt.Name AS CloseReason,
+           CASE 
+               WHEN lph.PostHistoryTypeId IS NULL THEN 'Open'
+               WHEN lph.PostHistoryTypeId = 10 THEN 'Closed'
+               WHEN lph.PostHistoryTypeId = 11 THEN 'Reopened'
+               WHEN lph.PostHistoryTypeId = 12 THEN 'Deleted'
+               WHEN lph.PostHistoryTypeId = 13 THEN 'Undeleted'
+               ELSE 'Unknown'
+           END AS CloseStatus
+    FROM Posts p
+    LEFT JOIN LatestPostHistory lph ON p.Id = lph.PostId AND lph.rn = 1
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(lph.Comment AS INTEGER)
+    WHERE p.PostTypeId = 1
+),
+CombinedAnswerVotes AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.Score AS AnswerScore,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        COUNT(v.Id) AS TotalVotes,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC) AS AnswerPos
+    FROM Posts a
+    LEFT JOIN Votes v ON v.PostId = a.Id
+    WHERE a.PostTypeId = 2
+    GROUP BY a.Id, a.ParentId, a.Score
+),
+TopAnswersWithText AS (
+    SELECT c.AnswerId, c.QuestionId, c.AnswerScore, c.UpVotes, c.DownVotes, c.TotalVotes, p.Body,
+           ROW_NUMBER() OVER (PARTITION BY c.QuestionId ORDER BY c.AnswerScore DESC) AS RN
+    FROM CombinedAnswerVotes c
+    JOIN Posts p ON p.Id = c.AnswerId
+    WHERE c.AnswerPos <= 3
+),
+FinalResult AS (
+    SELECT
+        h.QuestionId,
+        h.Title AS QuestionTitle,
+        h.ViewCount,
+        h.NumberOfAnswers,
+        h.TotalAnswerScore,
+        h.MaxAnswerScore,
+        h.HasAcceptedAnswer,
+        h.TopAnswerers,
+        p.CloseStatus,
+        p.CloseReason,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ub.Reputation,
+        ta.AnswerId,
+        SUBSTRING(REGEXP_REPLACE(ta.Body, '<[^>]+>', '', 'g') FROM 1 FOR 100) AS AnswerTextSnippet,
+        ta.AnswerScore,
+        ta.UpVotes,
+        ta.DownVotes,
+        ta.TotalVotes,
+        ROW_NUMBER() OVER (PARTITION BY h.QuestionId ORDER BY ta.AnswerScore DESC) AS AnswerRank
+    FROM HighImpactPosts h
+    JOIN PostsWithCloseStatus p ON p.Id = h.QuestionId
+    LEFT JOIN UserBadgeCounts ub ON ub.UserId = p.OwnerUserId
+    LEFT JOIN TopAnswersWithText ta ON ta.QuestionId = h.QuestionId
+)
+SELECT
+    QuestionId,
+    QuestionTitle,
+    ViewCount,
+    NumberOfAnswers,
+    TotalAnswerScore,
+    MaxAnswerScore,
+    HasAcceptedAnswer,
+    TopAnswerers,
+    CloseStatus,
+    CloseReason,
+    GoldBadges,
+    SilverBadges,
+    BronzeBadges,
+    Reputation,
+    AnswerRank,
+    AnswerId,
+    AnswerScore,
+    UpVotes,
+    DownVotes,
+    TotalVotes,
+    AnswerTextSnippet
+FROM FinalResult
+WHERE AnswerRank <= 3
+ORDER BY ViewCount DESC, TotalAnswerScore DESC, QuestionId;

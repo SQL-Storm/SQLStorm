@@ -1,0 +1,315 @@
+with
+recent_users as (
+  select
+    u.id,
+    u.displayname,
+    u.reputation,
+    u.location,
+    u.websiteurl,
+    coalesce(nullif(trim(u.location), ''), 'Unknown') as norm_location,
+    date_trunc('month', u.creationdate) as cohort_month,
+    ntile(10) over (order by u.reputation desc) as rep_decile,
+    row_number() over (order by greatest(u.lastaccessdate, u.creationdate) desc, u.id) as recency_rank
+  from users u
+  where u.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '10 years'
+),
+q as (
+  select
+    p.id as question_id,
+    p.owneruserid,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.title,
+    p.tags,
+    p.acceptedanswerid,
+    cardinality(string_to_array(coalesce(nullif(substring(p.tags, 2, length(p.tags)-2), ''), ''), '><')) as tag_count,
+    position('python' in lower(coalesce(p.title, ''))) > 0 as mentions_python,
+    case when p.closeddate is null then 0 else 1 end as is_closed
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= (select min(creationdate) from users)
+),
+a as (
+  select
+    pa.parentid as question_id,
+    count(*) as answers,
+    sum(case when pa.score > 0 then 1 else 0 end) as positive_answers,
+    max(pa.score) as max_answer_score,
+    min(pa.creationdate) as first_answer_time
+  from posts pa
+  where pa.posttypeid = 2
+  group by pa.parentid
+),
+q_votes as (
+  select
+    v.postid as question_id,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+    count(*) filter (where v.votetypeid in (2,3)) as total_ud_votes,
+    count(*) as total_votes,
+    max(v.creationdate) as last_vote_at
+  from votes v
+  group by v.postid
+),
+q_hist as (
+  select
+    h.postid as question_id,
+    sum(case when h.posthistorytypeid = 10 then 1 else 0 end) as closes,
+    sum(case when h.posthistorytypeid = 11 then 1 else 0 end) as reopens,
+    sum(case when h.posthistorytypeid in (4,5,6,7,8,9,24) then 1 else 0 end) as edits,
+    max(case when h.posthistorytypeid = 10 then h.creationdate end) as last_closed_at,
+    max(h.creationdate) as last_hist_at,
+    count(*) filter (where h.posthistorytypeid = 50) as community_bumps
+  from posthistory h
+  group by h.postid
+),
+q_dupes as (
+  select
+    pl.postid as question_id,
+    count(*) filter (where pl.linktypeid = 3) as duplicate_marks,
+    count(*) filter (where pl.linktypeid = 1) as linked_refs,
+    min(case when pl.linktypeid = 3 then pl.creationdate end) as first_dupe_mark_at
+  from postlinks pl
+  group by pl.postid
+),
+q_tags as (
+  select
+    q.question_id,
+    lower(trim(t)) as tag
+  from q
+  cross join lateral unnest(
+    case
+      when q.tags is null then array[]::varchar[]
+      else string_to_array(substring(q.tags, 2, greatest(length(q.tags)-2,0)), '><')
+    end
+  ) as t
+),
+tag_metrics as (
+  select
+    qt.tag,
+    count(distinct qt.question_id) as questions_with_tag,
+    max(q.creationdate) as last_question_at,
+    sum(q.score) as agg_score,
+    avg(cast(q.viewcount as numeric)) as avg_views
+  from q_tags qt
+  join q on q.question_id = qt.question_id
+  group by qt.tag
+),
+user_q as (
+  select
+    u.id as user_id,
+    count(*) as questions,
+    sum(q.score) as q_score,
+    avg(cast(q.viewcount as numeric)) as q_avg_views,
+    sum(coalesce(v.upvotes,0) - coalesce(v.downvotes,0)) as q_net_votes,
+    sum(coalesce(d.duplicate_marks,0)) as q_dupes,
+    sum(case when q.acceptedanswerid is not null then 1 else 0 end) as q_with_accepted
+  from recent_users u
+  left join q on q.owneruserid = u.id
+  left join q_votes v on v.question_id = q.question_id
+  left join q_dupes d on d.question_id = q.question_id
+  group by u.id
+),
+user_a as (
+  select
+    u.id as user_id,
+    count(*) as answers,
+    sum(pa.score) as a_score,
+    avg(cast(pa.score as numeric)) filter (where pa.score is not null) as a_avg_score,
+    count(*) filter (where pa.score > 0) as a_positive_answers,
+    count(*) filter (where pa.score < 0) as a_negative_answers,
+    count(distinct pa.parentid) as distinct_questions_answered
+  from recent_users u
+  left join posts pa on pa.posttypeid = 2 and pa.owneruserid = u.id
+  group by u.id
+),
+user_badges as (
+  select
+    b.userid as user_id,
+    count(*) as badges_total,
+    sum(case when b.class = 1 then 1 else 0 end) as gold,
+    sum(case when b.class = 2 then 1 else 0 end) as silver,
+    sum(case when b.class = 3 then 1 else 0 end) as bronze,
+    count(*) filter (where b.tagbased = true) as tag_badges,
+    min(b.date) as first_badge_at,
+    max(b.date) as last_badge_at
+  from badges b
+  group by b.userid
+),
+user_first_activity as (
+  select
+    u.id as user_id,
+    least(
+      coalesce(min(p.creationdate), timestamp '9999-12-31'),
+      coalesce(min(c.creationdate), timestamp '9999-12-31')
+    ) as first_activity_at
+  from users u
+  left join posts p on p.owneruserid = u.id
+  left join comments c on c.userid = u.id
+  group by u.id
+),
+q_ranked as (
+  select
+    q.question_id,
+    q.owneruserid,
+    q.creationdate,
+    q.score,
+    q.viewcount,
+    q.title,
+    q.tags,
+    q.acceptedanswerid,
+    q.tag_count,
+    q.mentions_python,
+    q.is_closed,
+    coalesce(v.upvotes,0) as upvotes,
+    coalesce(v.downvotes,0) as downvotes,
+    coalesce(v.total_votes,0) as total_votes,
+    coalesce(a.answers,0) as answers,
+    dense_rank() over (order by coalesce(v.upvotes,0) desc, coalesce(a.answers,0) desc, q.viewcount desc) as hot_rank,
+    row_number() over (partition by date_trunc('month', q.creationdate) order by coalesce(v.upvotes,0) desc, q.viewcount desc) as monthly_rank
+  from q
+  left join q_votes v on v.question_id = q.question_id
+  left join a on a.question_id = q.question_id
+),
+periods as (
+  select
+    generate_series(date_trunc('month', cast('2024-10-01 12:34:56' as timestamp) - interval '36 months')::date, date_trunc('month', cast('2024-10-01 12:34:56' as timestamp))::date, interval '1 month') as month_start
+),
+monthly_loc as (
+  select
+    p.month_start,
+    ru.norm_location,
+    count(distinct q.question_id) as questions,
+    avg(cast(q.score as numeric)) as avg_score,
+    percentile_cont(0.5) within group (order by coalesce(q.viewcount,0)) as median_views
+  from periods p
+  join recent_users ru on true
+  left join q on q.owneruserid = ru.id and date_trunc('month', q.creationdate) = p.month_start
+  group by p.month_start, ru.norm_location
+),
+user_kpis as (
+  select
+    ru.id as user_id,
+    ru.displayname,
+    ru.rep_decile,
+    ru.norm_location,
+    uq.questions,
+    ua.answers,
+    coalesce(uq.q_score,0) + coalesce(ua.a_score,0) as total_post_score,
+    coalesce(uq.q_net_votes,0) as q_net_votes,
+    coalesce(ua.a_positive_answers,0) as pos_answers,
+    coalesce(ua.a_negative_answers,0) as neg_answers,
+    case
+      when coalesce(ua.answers,0) = 0 then null
+      else round(100.0 * coalesce(ua.a_positive_answers,0) / nullif(ua.answers,0), 2)
+    end as ans_pos_rate,
+    coalesce(ub.badges_total,0) as badges_total,
+    concat(coalesce(ub.gold,0), '/', coalesce(ub.silver,0), '/', coalesce(ub.bronze,0)) as badge_split,
+    coalesce(uq.q_with_accepted,0) as questions_with_accepted,
+    coalesce(uq.q_dupes,0) as questions_duped,
+    greatest(
+      coalesce((select max(c.creationdate) from comments c where c.userid = ru.id), timestamp '1970-01-01'),
+      coalesce((select max(p.creationdate) from posts p where p.owneruserid = ru.id), timestamp '1970-01-01')
+    ) as last_user_activity_at
+  from recent_users ru
+  left join user_q uq on uq.user_id = ru.id
+  left join user_a ua on ua.user_id = ru.id
+  left join user_badges ub on ub.user_id = ru.id
+),
+ranked_users as (
+  select
+    uk.user_id,
+    uk.displayname,
+    uk.rep_decile,
+    uk.norm_location,
+    uk.questions,
+    uk.answers,
+    uk.total_post_score,
+    uk.q_net_votes,
+    uk.pos_answers,
+    uk.neg_answers,
+    uk.ans_pos_rate,
+    uk.badges_total,
+    uk.badge_split,
+    uk.questions_with_accepted,
+    uk.questions_duped,
+    uk.last_user_activity_at,
+    (
+      0.5 * coalesce(uk.total_post_score,0) +
+      10  * coalesce(uk.badges_total,0) +
+      1.5 * coalesce(uk.q_net_votes,0) +
+      3   * coalesce(uk.pos_answers,0) -
+      2   * coalesce(uk.neg_answers,0) +
+      case when uk.questions_with_accepted > 0 then 7 else 0 end -
+      case when uk.questions_duped > 0 then 5 else 0 end +
+      (10 - uk.rep_decile)
+    ) as influence_score,
+    row_number() over (partition by uk.norm_location order by
+      (
+        0.5 * coalesce(uk.total_post_score,0) +
+        10  * coalesce(uk.badges_total,0) +
+        1.5 * coalesce(uk.q_net_votes,0) +
+        3   * coalesce(uk.pos_answers,0) -
+        2   * coalesce(uk.neg_answers,0) +
+        case when uk.questions_with_accepted > 0 then 7 else 0 end -
+        case when uk.questions_duped > 0 then 5 else 0 end +
+        (10 - uk.rep_decile)
+      ) desc, uk.user_id) as loc_rank
+  from user_kpis uk
+)
+select
+  ru.norm_location as location,
+  ru.displayname,
+  ru.user_id,
+  ru.influence_score,
+  ru.rep_decile,
+  coalesce(ru.total_post_score,0) as total_post_score,
+  ru.badges_total,
+  ru.badge_split,
+  ru.questions_with_accepted,
+  ru.questions_duped,
+  ru.last_user_activity_at,
+  ml.month_start,
+  ml.questions as loc_monthly_questions,
+  ml.avg_score as loc_monthly_avg_q_score,
+  ml.median_views as loc_monthly_median_views,
+  tm.tag as sample_tag,
+  tm.questions_with_tag as tag_popularity,
+  tm.avg_views as tag_avg_views,
+  qr.question_id as exemplar_question_id,
+  qr.score as exemplar_q_score,
+  qr.viewcount as exemplar_q_views,
+  qr.hot_rank as exemplar_hot_rank,
+  qr.monthly_rank as exemplar_monthly_rank,
+  case
+    when qr.is_closed = 1 then 'CLOSED'
+    when qr.acceptedanswerid is not null then 'ANSWERED'
+    else 'OPEN'
+  end as exemplar_state,
+  case when qr.mentions_python then 'PY' else 'GEN' end as title_flag
+from ranked_users ru
+left join lateral (
+  select ml.*
+  from monthly_loc ml
+  where ml.norm_location = ru.norm_location
+  order by ml.month_start desc
+  limit 1
+) ml on true
+left join lateral (
+  select tm.*
+  from tag_metrics tm
+  order by tm.questions_with_tag desc, tm.tag
+  limit 1
+) tm on true
+left join lateral (
+  select qr.*
+  from q_ranked qr
+  join posts p on p.id = qr.question_id
+  where p.owneruserid = ru.user_id
+  order by qr.hot_rank, qr.score desc, qr.viewcount desc
+  limit 1
+) qr on true
+where ru.loc_rank <= 5
+order by ru.influence_score desc, ru.norm_location, ru.user_id;

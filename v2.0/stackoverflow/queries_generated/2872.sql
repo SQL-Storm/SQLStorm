@@ -1,0 +1,133 @@
+-- {"query": "2872.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1248} 
+with RecursivePostTree as (
+    select p.Id, p.Title, p.PostTypeId, p.ParentId, p.Score, p.CreationDate,
+        cast(p.Title as varchar(1000)) as FullTitlePath,
+        1 as Depth
+    from Posts p
+    where p.PostTypeId = 1
+    and p.Score > (select percentile_cont(0.5) within group (order by Score) from Posts where PostTypeId = 1)
+
+    union all
+
+    select c.Id, c.Title, c.PostTypeId, c.ParentId, c.Score, c.CreationDate,
+        r.FullTitlePath || ' > ' || coalesce(c.Title, '(no title)'),
+        r.Depth + 1
+    from Posts c
+    join RecursivePostTree r on c.ParentId = r.Id
+    where c.PostTypeId = 2
+),
+UserBadgeCounts as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        sum(coalesce(u.Views,0)) as TotalViews,
+        sum(coalesce(u.UpVotes,0)) as TotalUpVotes,
+        sum(coalesce(u.DownVotes,0)) as TotalDownVotes
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    group by u.Id, u.DisplayName
+),
+PostLinkCounts as (
+    select 
+        pl.PostId,
+        count(distinct case when lt.Name = 'Linked' then pl.RelatedPostId end) as LinkedCount,
+        count(distinct case when lt.Name = 'Duplicate' then pl.RelatedPostId end) as DuplicateCount
+    from PostLinks pl
+    join LinkTypes lt on pl.LinkTypeId = lt.Id
+    group by pl.PostId
+),
+LatestPostHistories as (
+    select distinct on (ph.PostId)
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        pht.Name as PostHistoryTypeName,
+        ph.CreationDate,
+        ph.UserId,
+        ph.UserDisplayName,
+        ph.Comment
+    from PostHistory ph
+    join PostHistoryTypes pht on ph.PostHistoryTypeId = pht.Id
+    order by ph.PostId, ph.CreationDate desc
+),
+AnswerStatistics as (
+    select
+        p.ParentId as QuestionId,
+        count(*) as AnswerCount,
+        avg(p.Score) as AvgAnswerScore,
+        max(p.Score) as MaxAnswerScore,
+        sum(case when p.Score >= 5 then 1 else 0 end) as HighScoreAnswers,
+        bool_or(p.OwnerUserId is NULL) as HasAnonymousAnswer
+    from Posts p
+    where p.PostTypeId = 2
+    group by p.ParentId
+),
+RankedPosts as (
+    select 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        u.DisplayName as OwnerName,
+        abs(date_part('epoch', now() - p.CreationDate))/86400.0 as DaysOld,
+        row_number() over(partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as ScoreRank,
+        dense_rank() over(order by p.Score desc) as DenseScoreRank
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId in (1,2)
+)
+select
+    rp.Id,
+    rp.Title,
+    rp.Score,
+    rp.ViewCount,
+    rp.DaysOld,
+    rp.ScoreRank,
+    rp.DenseScoreRank,
+    coalesce(abc.AnswerCount, 0) as AnswerCount,
+    coalesce(abc.AvgAnswerScore, 0) as AvgAnswerScore,
+    coalesce(abc.MaxAnswerScore, 0) as MaxAnswerScore,
+    coalesce(abc.HighScoreAnswers, 0) as HighScoreAnswers,
+    ul.PostHistoryTypeName as LatestHistoryType,
+    ul.CreationDate as LatestHistoryDate,
+    ul.UserDisplayName as LatestEditor,
+    ul.Comment as LatestHistoryComment,
+    pl.LikedCount,
+    coalesce(pl.LinkedCount, 0) as LinkedPosts,
+    coalesce(pl.DuplicateCount, 0) as DuplicatePosts,
+    ubc.GoldBadges,
+    ubc.SilverBadges,
+    ubc.BronzeBadges,
+    ubc.TotalViews,
+    ubc.TotalUpVotes,
+    ubc.TotalDownVotes,
+    rpt.FullTitlePath,
+    case 
+      when rp.Score >= 20 and rp.ViewCount > 1000 then 'Hot' 
+      when rp.Score between 10 and 19 then 'Trending'
+      else 'Normal' 
+    end as PopularityCategory,
+    case 
+      when ubc.GoldBadges > 5 then 'Elite'
+      when ubc.SilverBadges > 15 then 'Veteran'
+      else 'Newbie'
+    end as UserBadgeLevel
+from RankedPosts rp
+left join AnswerStatistics abc on rp.Id = abc.QuestionId
+left join LatestPostHistories ul on rp.Id = ul.PostId
+left join PostLinkCounts pl on rp.Id = pl.PostId
+left join UserBadgeCounts ubc on (select OwnerUserId from Posts where Id = rp.Id) = ubc.UserId
+left join RecursivePostTree rpt on rp.Id = rpt.Id
+where rp.Score > 5
+and (
+    rabid_day := date_part('dow', rp.CreationDate)::int
+) not in (0,6)
+and (
+    rp.Title is not null
+    and length(rp.Title) > 10
+)
+order by rp.Score desc, rp.ViewCount desc
+limit 100;

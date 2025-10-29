@@ -1,0 +1,141 @@
+-- {"query": "2144.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1015} 
+with RecursiveUserBadges AS (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class,
+        row_number() over(partition by u.Id order by b.Date desc) as BadgeRank
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    where u.Reputation > 10000
+),
+FilteredPosts as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        coalesce(p.Title, '') as Title,
+        p.Tags,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.ParentId
+    from Posts p
+    where p.CreationDate >= cast('2024-10-01' as date) - interval '1 year'
+      and (p.PostTypeId = 1 or p.PostTypeId = 2)
+),
+PostWithAnswers as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.Tags,
+        q.CreationDate as QuestionDate,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViews,
+        a.Id as AnswerId,
+        a.CreationDate as AnswerDate,
+        a.Score as AnswerScore,
+        a.OwnerUserId as AnswerOwnerId,
+        a.ParentId,
+        u.DisplayName as AnswerOwnerName,
+        r.BadgeName,
+        r.Class as BadgeClass
+    from FilteredPosts q
+    left join FilteredPosts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Users u on u.Id = a.OwnerUserId
+    left join RecursiveUserBadges r on r.UserId = a.OwnerUserId and r.BadgeRank = 1
+    where q.PostTypeId = 1
+),
+RankedAnswers as (
+    select
+        *,
+        rank() over(partition by QuestionId order by AnswerScore desc, AnswerDate asc) as AnswerRank
+    from PostWithAnswers
+),
+AnswerCommentsCount as (
+    select
+        c.PostId,
+        count(c.Id) as CommentCount
+    from Comments c
+    group by c.PostId
+),
+ComplexAnalysis as (
+    select
+        r.QuestionId,
+        r.Title,
+        r.Tags,
+        r.QuestionDate,
+        r.QuestionScore,
+        r.QuestionViews,
+        r.AnswerId,
+        r.AnswerDate,
+        r.AnswerScore,
+        r.AnswerOwnerId,
+        r.AnswerOwnerName,
+        r.BadgeName,
+        r.BadgeClass,
+        coalesce(ac.CommentCount, 0) as AnswerCommentCount,
+        (select count(*) from PostLinks pl where pl.PostId = r.QuestionId and pl.LinkTypeId = 3) as DuplicateCount,
+        case
+           when r.AnswerDate is not null then 
+            extract(epoch from (r.AnswerDate - r.QuestionDate))/3600.0
+           else null
+        end as HoursToAnswer,
+        length(r.Title) as TitleLength,
+        case
+          when r.Tags is not null then array_length(string_to_array(substring(r.Tags from 2 for char_length(r.Tags)-2), '><'), 1)
+          else 0
+        end as TagCount,
+        (r.AnswerScore::float / nullif(r.QuestionScore,0)) as AnswerQuestionScoreRatio,
+        rank() over (partition by r.QuestionId order by r.AnswerScore desc nulls last, ac.CommentCount desc nulls last) as CombinedRank
+    from RankedAnswers r
+    left join AnswerCommentsCount ac on ac.PostId = r.AnswerId
+    where r.AnswerRank <= 5
+)
+select 
+    QuestionId,
+    Title,
+    TagCount,
+    QuestionScore,
+    QuestionViews,
+    DuplicateCount,
+    AnswerId,
+    AnswerOwnerName,
+    coalesce(BadgeName, 'None') as TopBadge,
+    BadgeClass,
+    AnswerScore,
+    AnswerCommentCount,
+    HoursToAnswer,
+    TitleLength,
+    round(AnswerQuestionScoreRatio, 3) as ScoreRatio,
+    CombinedRank
+from ComplexAnalysis
+where CombinedRank <= 3
+order by QuestionViews desc, QuestionScore desc, AnswerScore desc
+union
+select
+    p.Id as QuestionId,
+    coalesce(p.Title, 'N/A'),
+    0,
+    p.Score,
+    p.ViewCount,
+    0,
+    null,
+    'Community',
+    'None',
+    null,
+    null,
+    null,
+    length(coalesce(p.Title, '')) as TitleLength,
+    null,
+    0
+from Posts p
+where p.PostTypeId = 1
+  and p.ViewCount > 100000
+  and not exists (
+    select 1 from Posts a where a.ParentId = p.Id
+)
+order by QuestionViews desc
+limit 50;

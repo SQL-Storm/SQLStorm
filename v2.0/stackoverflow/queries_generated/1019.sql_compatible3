@@ -1,0 +1,197 @@
+WITH PopularTags AS (
+    SELECT
+        TRIM(tag) AS TagName,
+        COUNT(p.Id) AS QuestionCount,
+        AVG(p.Score) AS AverageScore
+    FROM Posts p,
+    LATERAL (
+        SELECT value AS tag
+        FROM json_each_text('[' || REPLACE(REPLACE(SUBSTRING(p.Tags FROM 2 FOR (LENGTH(p.Tags) - 2)), '><', '","'), '"', '\"') || ']')
+    ) jt
+    WHERE p.PostTypeId = 1
+      AND p.Tags IS NOT NULL
+      AND LENGTH(p.Tags) > 2
+    GROUP BY TRIM(tag)
+    HAVING COUNT(p.Id) > 100
+    ORDER BY COUNT(p.Id) DESC, AVG(p.Score) DESC
+    LIMIT 10
+),
+PostEditHistorySummary AS (
+    SELECT
+        ph.PostId,
+        COUNT(DISTINCT ph.UserId) AS UniqueEditors,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6, 8, 9) THEN 1 ELSE 0 END) AS EditCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenCount,
+        MIN(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId IN (4, 5, 6)) AS FirstEditDate,
+        MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId = 10) AS LastCloseDate,
+        MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId = 11) AS LastReopenDate,
+        MAX(CASE WHEN ph_close.PostHistoryTypeId = 10 AND ph_reopen.PostHistoryTypeId = 11 AND ph_reopen.CreationDate > ph_close.CreationDate THEN 1 ELSE 0 END) AS WasClosedThenReopened
+    FROM PostHistory ph
+    LEFT JOIN PostHistory ph_close ON ph.PostId = ph_close.PostId AND ph_close.PostHistoryTypeId = 10
+    LEFT JOIN PostHistory ph_reopen ON ph.PostId = ph_reopen.PostId AND ph_reopen.PostHistoryTypeId = 11
+    GROUP BY ph.PostId
+),
+UserPostEditStats AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        AVG(pes.EditCount) AS AvgQuestionEditCount,
+        MAX(pes.WasClosedThenReopened) AS HasAnyQuestionBeenClosedAndReopened
+    FROM Posts p
+    JOIN PostEditHistorySummary pes ON p.Id = pes.PostId
+    WHERE p.PostTypeId = 1
+      AND p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+UserAnswerAcceptanceRates AS (
+    SELECT
+        q.OwnerUserId AS OwnerUserId,
+        COUNT(DISTINCT q.Id) AS TotalQuestionsAsked,
+        SUM(CASE WHEN q.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS QuestionsWithAcceptedAnswers,
+        COALESCE(CAST(SUM(CASE WHEN q.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS NUMERIC) / COUNT(DISTINCT q.Id), 0) AS AcceptanceRate,
+        AVG(a.Score) AS AvgAcceptedAnswerScore
+    FROM Posts q
+    LEFT JOIN Posts a ON q.AcceptedAnswerId = a.Id
+    WHERE q.PostTypeId = 1
+      AND q.OwnerUserId IS NOT NULL
+    GROUP BY q.OwnerUserId
+    HAVING COUNT(DISTINCT q.Id) >= 5
+),
+UserBadgeClassCounts AS (
+    SELECT
+        b.UserId,
+        COUNT(b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserCommentActivity AS (
+    SELECT
+        c.UserId,
+        COUNT(c.Id) AS TotalComments,
+        SUM(c.Score) AS TotalCommentScore,
+        AVG(c.Score) AS AvgCommentScore,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+    GROUP BY c.UserId
+),
+UserPostLinkAnalysis AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        SUM(CASE WHEN pl.LinkTypeId = 1 AND pl.PostId = p.Id THEN 1 ELSE 0 END) AS LinkedAsSource,
+        SUM(CASE WHEN pl.LinkTypeId = 1 AND pl.RelatedPostId = p.Id THEN 1 ELSE 0 END) AS LinkedAsRelated,
+        SUM(CASE WHEN pl.LinkTypeId = 3 AND pl.PostId = p.Id THEN 1 ELSE 0 END) AS DuplicatedAsSource,
+        SUM(CASE WHEN pl.LinkTypeId = 3 AND pl.RelatedPostId = p.Id THEN 1 ELSE 0 END) AS DuplicatedAsRelated
+    FROM Posts p
+    JOIN PostLinks pl ON p.Id = pl.PostId OR p.Id = pl.RelatedPostId
+    WHERE p.PostTypeId IN (1, 2)
+      AND p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+UserTagPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId AS UserId,
+        p.Score,
+        TRIM(tag) AS TagName
+    FROM Posts p,
+    LATERAL (
+        SELECT value AS tag
+        FROM json_each_text('[' || REPLACE(REPLACE(SUBSTRING(p.Tags FROM 2 FOR (LENGTH(p.Tags) - 2)), '><', '","'), '"', '\"') || ']')
+    ) jt
+    WHERE p.PostTypeId = 1
+      AND p.OwnerUserId IS NOT NULL
+      AND p.Tags IS NOT NULL
+      AND LENGTH(p.Tags) > 2
+),
+UserTagContributionsAggregated AS (
+    SELECT
+        cnt.UserId,
+        STRING_AGG(DISTINCT cnt.TagName || ' (' || CAST(cnt.cnt AS VARCHAR) || ')', '; ') AS TopTagContributionsString,
+        SUM(cnt.cnt) AS TotalQuestionsInPopularTags,
+        SUM(cnt.sum_score) AS TotalScoreInPopularTags
+    FROM (
+        SELECT
+            utp.UserId,
+            utp.TagName,
+            COUNT(utp.PostId) AS cnt,
+            SUM(utp.Score) AS sum_score
+        FROM UserTagPosts utp
+        WHERE utp.TagName IN (SELECT TagName FROM PopularTags)
+        GROUP BY utp.UserId, utp.TagName
+    ) cnt
+    GROUP BY cnt.UserId
+    HAVING SUM(cnt.cnt) > 5 AND COUNT(DISTINCT cnt.TagName) >= 2
+)
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    u.LastAccessDate,
+    COALESCE(ura.AcceptanceRate, 0) AS QuestionAcceptanceRate,
+    COALESCE(ubc.GoldBadges, 0) AS GoldBadges,
+    COALESCE(ubc.SilverBadges, 0) AS SilverBadges,
+    COALESCE(ubc.BronzeBadges, 0) AS BronzeBadges,
+    COALESCE(uca.TotalComments, 0) AS TotalCommentsMade,
+    COALESCE(uca.AvgCommentScore, 0.0) AS AvgCommentScore,
+    COALESCE(upla.LinkedAsSource, 0) AS QuestionsLinkedAsSource,
+    COALESCE(upla.DuplicatedAsRelated, 0) AS QuestionsDuplicatedAsRelated,
+    utca.TopTagContributionsString AS TopTagContributions,
+    utca.TotalQuestionsInPopularTags,
+    utca.TotalScoreInPopularTags,
+    COALESCE(ues.AvgQuestionEditCount, 0.0) AS AvgQuestionEditCount,
+    COALESCE(ues.HasAnyQuestionBeenClosedAndReopened, 0) AS HasAnyQuestionBeenClosedAndReopened,
+    RANK() OVER (ORDER BY u.Reputation DESC, COALESCE(ubc.TotalBadges, 0) DESC) AS ReputationBadgeRank,
+    NTILE(10) OVER (ORDER BY u.Views DESC) AS ViewsDecile,
+    LAG(u.Reputation, 1, 0) OVER (ORDER BY u.CreationDate) AS PrevUserReputationByCreationDate,
+    LEAD(u.Reputation, 1, 0) OVER (ORDER BY u.CreationDate) AS NextUserReputationByCreationDate,
+    AVG(u.Reputation) OVER (PARTITION BY COALESCE(SUBSTRING(u.Location FROM 1 FOR 5), 'Unknown')) AS AvgReputationInLocationPrefix,
+    (COALESCE(ura.AcceptanceRate, 0) * 100 * (COALESCE(ubc.GoldBadges, 0) + COALESCE(ubc.SilverBadges, 0) * 0.5 + COALESCE(ubc.BronzeBadges, 0) * 0.25) + COALESCE(uca.AvgCommentScore, 0) + utca.TotalScoreInPopularTags / 100.0) AS UserEngagementScore,
+    EXISTS (
+        SELECT 1
+        FROM Comments c_inner
+        JOIN UserTagPosts utp_inner ON c_inner.PostId = utp_inner.PostId
+        WHERE c_inner.UserId = u.Id
+          AND utp_inner.UserId = u.Id
+          AND utp_inner.TagName IN (SELECT TagName FROM PopularTags)
+          AND c_inner.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '6 months'
+          AND c_inner.Text ILIKE '%clarification%'
+        LIMIT 1
+    ) AS HasRecentSelfClarificationComment,
+    COALESCE(SUBSTRING(u.AboutMe FROM 1 FOR 100), 'No "About Me" provided') AS AboutMeExcerpt,
+    CASE
+        WHEN u.WebsiteUrl IS NOT NULL AND u.WebsiteUrl LIKE '%github.com%' THEN 'GitHub'
+        WHEN u.WebsiteUrl IS NOT NULL AND u.WebsiteUrl LIKE '%linkedin.com%' THEN 'LinkedIn'
+        WHEN u.WebsiteUrl IS NOT NULL AND u.WebsiteUrl LIKE '%stackoverflow.com%' THEN 'StackOverflow'
+        WHEN u.WebsiteUrl IS NOT NULL AND u.WebsiteUrl LIKE '%twitter.com%' THEN 'Twitter'
+        ELSE 'Other/None'
+    END AS PrimaryWebsiteType,
+    EXTRACT(EPOCH FROM (u.LastAccessDate - u.CreationDate)) / (60 * 60 * 24 * 365.25) AS YearsActive
+FROM Users u
+LEFT JOIN UserAnswerAcceptanceRates ura ON u.Id = ura.OwnerUserId
+LEFT JOIN UserBadgeClassCounts ubc ON u.Id = ubc.UserId
+LEFT JOIN UserCommentActivity uca ON u.Id = uca.UserId
+LEFT JOIN UserPostLinkAnalysis upla ON u.Id = upla.UserId
+INNER JOIN UserTagContributionsAggregated utca ON u.Id = utca.UserId
+LEFT JOIN UserPostEditStats ues ON u.Id = ues.UserId
+WHERE
+    u.Reputation > 5000
+    AND u.Views > 1000
+    AND ((u.Location IS NOT NULL AND u.Location ILIKE '%united states%') OR u.Location IS NULL)
+    AND u.CreationDate < CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+    AND COALESCE(ubc.TotalBadges, 0) >= 5
+    AND COALESCE(ura.AcceptanceRate, 0) > 0.10
+    AND NOT EXISTS (
+        SELECT 1
+        FROM Badges b_recent
+        WHERE b_recent.UserId = u.Id
+          AND b_recent.Name ILIKE '%student%'
+          AND b_recent.Date > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+    )
+ORDER BY
+    UserEngagementScore DESC, ReputationBadgeRank
+LIMIT 500;

@@ -1,0 +1,139 @@
+-- {"query": "2846.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1379} 
+with RecursiveUserPosts as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.AcceptedAnswerId,
+        1 as Level
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    where u.Reputation > 1000 and p.Id is not null
+
+    union all
+
+    select
+        rup.UserId,
+        rup.DisplayName,
+        p2.Id,
+        p2.PostTypeId,
+        p2.CreationDate,
+        p2.Score,
+        p2.ViewCount,
+        p2.Tags,
+        p2.AcceptedAnswerId,
+        Level + 1
+    from RecursiveUserPosts rup
+    join Posts p2 on p2.ParentId = rup.PostId
+    where Level < 3
+),
+AggregatedBadges as (
+    select
+        UserId,
+        count(*) filter (where Class = 1) as GoldBadges,
+        count(*) filter (where Class = 2) as SilverBadges,
+        count(*) filter (where Class = 3) as BronzeBadges,
+        count(distinct Name) as UniqueBadges
+    from Badges
+    group by UserId
+),
+RecentEdits as (
+    select
+        ph.UserId,
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        p.Title,
+        u.DisplayName as EditorName,
+        row_number() over (partition by ph.PostId order by ph.CreationDate desc) as rn
+    from PostHistory ph
+    join Posts p on p.Id = ph.PostId
+    left join Users u on u.Id = ph.UserId
+    where ph.PostHistoryTypeId in (4,5,6) and ph.UserId is not null
+),
+TopTags as (
+    select
+        t.Id, t.TagName, t.Count,
+        row_number() over (order by t.Count desc) as rn
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+    limit 50
+),
+UserTagEngagement as (
+    select
+        rup.UserId,
+        tag.TagName,
+        count(distinct rup.PostId) as UserPostCount,
+        sum(coalesce(p.Score,0)) as TotalScore,
+        avg(coalesce(p.ViewCount,0)) as AvgViews,
+        max(p.CreationDate) as LastPostDate
+    from RecursiveUserPosts rup
+    join Posts p on p.Id = rup.PostId
+    cross join lateral (
+        select unnest(
+            regexp_split_to_array(
+                substring(coalesce(p.Tags,''), 2, length(coalesce(p.Tags,'')) - 2), '><'
+            )
+        ) as TagName
+    ) as tag
+    join Tags on Tags.TagName = tag.TagName
+    where tag.TagName in (select TagName from TopTags)
+    group by rup.UserId, tag.TagName
+    having count(distinct rup.PostId) > 1
+),
+UserVoteStats as (
+    select
+        v.UserId,
+        count(*) as TotalVotes,
+        count(*) filter (where vt.Name = 'UpMod') as UpVotesGiven,
+        count(*) filter (where vt.Name = 'DownMod') as DownVotesGiven,
+        avg(extract(epoch from age(v.CreationDate, u.CreationDate))/3600/24) as AvgDaysAfterUserCreation
+    from Votes v
+    join VoteTypes vt on vt.Id = v.VoteTypeId
+    join Users u on u.Id = v.UserId
+    where v.UserId is not null
+    group by v.UserId
+)
+select distinct
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    abs(u.Views) % 37 + 1 as ModuloViewBucket,
+    ab.GoldBadges,
+    ab.SilverBadges,
+    ab.BronzeBadges,
+    ab.UniqueBadges,
+    coalesce(vs.TotalVotes,0) as TotalVotesGiven,
+    coalesce(vs.UpVotesGiven,0) as UpVotesGiven,
+    coalesce(vs.DownVotesGiven,0) as DownVotesGiven,
+    round(coalesce(vs.AvgDaysAfterUserCreation, 0),2) as AvgDaysAfterJoining,
+    max(rp.CreationDate) as LastActivity,
+    string_agg(distinct concat_ws(':', ut.TagName, ut.UserPostCount, coalesce(ut.TotalScore, 0)), ',' order by ut.UserPostCount desc nulls last) as TagEngagementSummary,
+    case when p.PostTypeId = 1 then p.Title else null end as SampleQuestionTitle,
+    p.Score as SamplePostScore,
+    coalesce(ph_edit.Comment, 'No recent edit comment') as LastEditComment,
+    coalesce(u.WebsiteUrl, 'N/A') as WebsiteUrl,
+    case when u.Location is null or trim(u.Location) = '' then 'Unknown' else u.Location end as UserLocation,
+    case when u.LastAccessDate > cast('2024-10-01 12:34:56' as timestamp) - interval '30 days' then 'Active' else 'Inactive' end as ActivityStatus
+from Users u
+left join AggregatedBadges ab on ab.UserId = u.Id
+left join UserVoteStats vs on vs.UserId = u.Id
+left join RecursiveUserPosts rp on rp.UserId = u.Id
+left join Posts p on p.Id = rp.PostId
+left join lateral (
+    select ph.Comment
+    from PostHistory ph
+    where ph.PostId = rp.PostId and ph.UserId = u.Id and ph.PostHistoryTypeId in (4,5)
+    order by ph.CreationDate desc limit 1
+) ph_edit on true
+left join UserTagEngagement ut on ut.UserId = u.Id
+where u.Reputation > 1000
+group by u.Id, u.DisplayName, u.Reputation, ab.GoldBadges, ab.SilverBadges, ab.BronzeBadges, ab.UniqueBadges, vs.TotalVotes, vs.UpVotesGiven, vs.DownVotesGiven, vs.AvgDaysAfterUserCreation, p.PostTypeId, p.Title, p.Score, ph_edit.Comment, u.WebsiteUrl, u.Location, u.LastAccessDate
+having max(rp.CreationDate) > (cast('2024-10-01 12:34:56' as timestamp) - interval '1 year')
+order by u.Reputation desc, TotalVotesGiven desc
+limit 100;

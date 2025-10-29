@@ -1,0 +1,240 @@
+with recent_posts as (
+  select
+    p.id,
+    p.posttypeid,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    coalesce(p.title, substring(p.body from 1 for 80)) as title_or_snippet,
+    p.owneruserid as owneruserid,
+    p.acceptedanswerid,
+    p.parentid,
+    p.tags,
+    p.lastactivitydate
+  from posts p
+  where p.creationdate >= (select max(creationdate) - interval '365 day' from posts)
+),
+tag_expanded as (
+  select
+    rp.id as post_id,
+    unnest(string_to_array(substring(rp.tags, 2, greatest(length(rp.tags)-2,0)), '><')) as tag
+  from recent_posts rp
+  where rp.posttypeid = 1
+),
+user_quality as (
+  select
+    u.id as user_id,
+    u.reputation,
+    u.creationdate,
+    u.location,
+    sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+    sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+    sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+    coalesce(sum(case when b.tagbased = true then 1 else 0 end),0) as tag_badges,
+    count(b.id) as total_badges,
+    avg(nullif(u.upvotes - u.downvotes, 0)) over () as global_netvote_avg
+  from users u
+  left join badges b on b.userid = u.id
+  group by u.id, u.reputation, u.creationdate, u.location
+),
+activity_flags as (
+  select
+    p.id as post_id,
+    max(case when ph.posthistorytypeid in (10,35) then 1 else 0 end) as was_closed_or_migrated,
+    max(case when ph.posthistorytypeid in (11,20) then 1 else 0 end) as was_reopened_or_unprotected,
+    max(case when ph.posthistorytypeid in (12) then 1 else 0 end) as was_deleted,
+    max(case when ph.posthistorytypeid in (13) then 1 else 0 end) as was_undeleted,
+    max(case when ph.posthistorytypeid in (19) then 1 else 0 end) as was_protected,
+    min(ph.creationdate) filter (where ph.posthistorytypeid in (10,35)) as first_close_or_migrate_at
+  from posts p
+  left join posthistory ph on ph.postid = p.id
+  group by p.id
+),
+vote_aggs as (
+  select
+    v.postid,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+    sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_total,
+    min(v.creationdate) filter (where v.votetypeid in (2,3)) as first_vote_at,
+    max(v.creationdate) filter (where v.votetypeid in (2,3)) as last_vote_at
+  from votes v
+  group by v.postid
+),
+linked_dupes as (
+  select
+    pl.postid,
+    count(*) filter (where pl.linktypeid = 1) as linked_count,
+    count(*) filter (where pl.linktypeid = 3) as dup_count,
+    max(pl.creationdate) as last_link_at
+  from postlinks pl
+  group by pl.postid
+),
+accepted_answer_info as (
+  select
+    q.id as question_id,
+    a.id as answer_id,
+    a.score as answer_score,
+    a.owneruserid as answer_owner,
+    a.creationdate as answer_creationdate
+  from posts q
+  join posts a on a.id = q.acceptedanswerid
+),
+question_metrics as (
+  select
+    rp.id as post_id,
+    rp.creationdate,
+    rp.score,
+    rp.viewcount,
+    rp.title_or_snippet,
+    rp.owneruserid,
+    uq.reputation as owner_reputation,
+    uq.total_badges,
+    uq.tag_badges,
+    af.was_closed_or_migrated,
+    af.was_deleted,
+    va.upvotes,
+    va.downvotes,
+    va.favorites,
+    va.bounty_total,
+    ld.linked_count,
+    ld.dup_count,
+    aa.answer_id,
+    aa.answer_score,
+    count(distinct c.id) as comment_count,
+    count(distinct a2.id) as answer_count,
+    coalesce(array_remove(array_agg(distinct te.tag) , NULL), array[]::text[]) as tags_array
+  from recent_posts rp
+  left join user_quality uq on uq.user_id = rp.owneruserid
+  left join activity_flags af on af.post_id = rp.id
+  left join vote_aggs va on va.postid = rp.id
+  left join linked_dupes ld on ld.postid = rp.id
+  left join accepted_answer_info aa on aa.question_id = rp.id
+  left join comments c on c.postid = rp.id
+  left join posts a2 on a2.parentid = rp.id and a2.posttypeid = 2
+  left join tag_expanded te on te.post_id = rp.id
+  where rp.posttypeid = 1
+  group by
+    rp.id, rp.creationdate, rp.score, rp.viewcount, rp.title_or_snippet, rp.owneruserid,
+    uq.reputation, uq.total_badges, uq.tag_badges,
+    af.was_closed_or_migrated, af.was_deleted,
+    va.upvotes, va.downvotes, va.favorites, va.bounty_total,
+    ld.linked_count, ld.dup_count,
+    aa.answer_id, aa.answer_score
+),
+ranked_questions as (
+  select
+    qm.*,
+    case
+      when qm.viewcount is null or qm.viewcount = 0 then null
+      else round((cast(qm.score as numeric) + coalesce(qm.upvotes,0) - coalesce(qm.downvotes,0) + coalesce(qm.favorites,0)*0.5 + coalesce(qm.bounty_total,0)/100.0)
+          / nullif(qm.viewcount,0), 6)
+    end as engagement_ratio,
+    row_number() over (partition by (qm.tags_array[1]) order by qm.score desc nulls last, qm.viewcount desc nulls last) as rn_by_primary_tag,
+    dense_rank() over (order by coalesce(qm.upvotes,0) - coalesce(qm.downvotes,0) desc nulls last) as netvote_rank,
+    ntile(10) over (order by coalesce(qm.viewcount,0) desc nulls last) as view_ntile
+  from question_metrics qm
+),
+agg_by_tag as (
+  select
+    lower(tag) as tag,
+    count(*) as q_count,
+    avg(score) as avg_score,
+    avg(coalesce(upvotes,0) - coalesce(downvotes,0)) as avg_netvotes,
+    avg(coalesce(viewcount,0)) as avg_views,
+    sum(case when was_closed_or_migrated = 1 then 1 else 0 end) as closed_or_migrated,
+    sum(answer_count) as total_answers
+  from tag_expanded
+  join ranked_questions rq on rq.post_id = tag_expanded.post_id
+  group by lower(tag)
+),
+paired_users as (
+  select
+    q.owneruserid as q_owner,
+    a.owneruserid as a_owner,
+    count(*) as pair_count,
+    sum(a.score) as pair_answer_score
+  from posts a
+  join posts q on q.id = a.parentid and q.posttypeid = 1 and a.posttypeid = 2
+  where a.creationdate >= (select max(creationdate) - interval '365 day' from posts)
+  group by q.owneruserid, a.owneruserid
+),
+filter_users as (
+  select
+    uq.user_id,
+    uq.reputation,
+    uq.total_badges,
+    uq.tag_badges,
+    case when uq.reputation >= coalesce((select percentile_cont(0.9) within group (order by reputation) from users), 1) then 1 else 0 end as is_top10pct
+  from user_quality uq
+)
+select
+  rq.post_id,
+  rq.creationdate,
+  rq.title_or_snippet,
+  rq.score,
+  rq.viewcount,
+  rq.owneruserid,
+  rq.owner_reputation,
+  rq.total_badges,
+  rq.tag_badges,
+  rq.upvotes,
+  rq.downvotes,
+  rq.favorites,
+  rq.bounty_total,
+  rq.linked_count,
+  rq.dup_count,
+  rq.answer_id,
+  rq.answer_score,
+  rq.comment_count,
+  rq.answer_count,
+  rq.tags_array,
+  rq.engagement_ratio,
+  rq.rn_by_primary_tag,
+  rq.netvote_rank,
+  rq.view_ntile,
+  coalesce(agt.avg_score, 0) as primary_tag_avg_score,
+  coalesce(agt.avg_netvotes, 0) as primary_tag_avg_netvotes,
+  fu.is_top10pct,
+  coalesce(pu_pair.pair_count, 0) as qa_pair_count_with_owner,
+  coalesce(pu_pair.pair_answer_score, 0) as qa_pair_answer_score_with_owner,
+  case
+    when rq.dup_count > 0 or rq.was_closed_or_migrated = 1 then 'problematic'
+    when rq.engagement_ratio is null then 'low-signal'
+    when rq.engagement_ratio >= (
+      select avg(engagement_ratio) from ranked_questions where engagement_ratio is not null
+    ) then 'high-engagement'
+    else 'normal'
+  end as engagement_bucket
+from ranked_questions rq
+left join lateral (
+  select agt.*
+  from agg_by_tag agt
+  where agt.tag = lower(coalesce(rq.tags_array[1], ''))
+) agt on true
+left join filter_users fu on fu.user_id = rq.owneruserid
+left join lateral (
+  select pair_count, pair_answer_score
+  from paired_users
+  where q_owner = rq.owneruserid
+  order by pair_answer_score desc nulls last
+  limit 1
+) pu_pair on true
+where
+  (
+    rq.engagement_ratio is not null
+    and rq.engagement_ratio > 0
+    and (rq.title_or_snippet ilike any (array[
+      '%performance%', '%index%', '%join%', '%window%', '%hash%', '%query%', '%optimiz%'
+    ]))
+  )
+  or (
+    rq.dup_count > 0
+    and rq.viewcount > coalesce((select avg(viewcount) from ranked_questions), 0)
+  )
+order by
+  rq.netvote_rank asc nulls last,
+  rq.rn_by_primary_tag asc,
+  rq.creationdate desc
+limit 250;

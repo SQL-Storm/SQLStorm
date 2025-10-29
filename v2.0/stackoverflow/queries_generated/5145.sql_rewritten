@@ -1,0 +1,94 @@
+-- {"query": "5145.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 732} 
+WITH RankedPosts AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.PostTypeId,
+    p.Tags,
+    p.ViewCount,
+    p.Score,
+    p.AcceptedAnswerId,
+    p.ParentId,
+    p.LastActivityDate,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.Body,
+    p.LastEditDate,
+    p.LastEditorUserId,
+    p.OwnerDisplayName,
+    p.ContentLicense,
+    COALESCE(a.Score, 0) AS AcceptedScore
+  FROM Posts p
+  LEFT JOIN Posts a ON a.Id = p.AcceptedAnswerId
+),
+Aggs AS (
+  SELECT
+    rp.Id,
+    rp.Title,
+    rp.CreationDate,
+    rp.OwnerUserId,
+    rp.PostTypeId,
+    rp.Tags,
+    rp.ViewCount,
+    rp.Score,
+    rp.AcceptedAnswerId,
+    rp.ParentId,
+    rp.LastActivityDate,
+    rp.CommentCount,
+    rp.FavoriteCount,
+    rp.Body,
+    rp.LastEditDate,
+    rp.LastEditorUserId,
+    rp.OwnerDisplayName,
+    rp.ContentLicense,
+    rp.AcceptedScore,
+    -- window function: rank posts by score within day buckets and post type
+    ROW_NUMBER() OVER (
+      PARTITION BY CAST(rp.CreationDate AS DATE), rp.PostTypeId
+      ORDER BY rp.Score DESC, rp.ViewCount DESC
+    ) AS RnkDayType
+  FROM RankedPosts rp
+),
+ZeroDiff AS (
+  SELECT
+    a.*,
+    -- correlated subquery: count of comments by a specific user on the post
+    (SELECT COUNT(*) FROM Comments c
+     WHERE c.PostId = a.Id AND c.UserId = a.OwnerUserId) AS UserCommentCount
+  FROM Aggs a
+),
+Final AS (
+  SELECT
+    z.*,
+    -- set operation: union with a synthetic row to benchmark
+    CASE
+      WHEN z.RnkDayType = 1 THEN 'TopOfDay'
+      ELSE 'Other'
+    END AS BenchmarkTag
+  FROM ZeroDiff z
+  UNION ALL
+  SELECT
+    NULL::int AS Id,
+    NULL AS Title,
+    NULL::timestamp AS CreationDate,
+    NULL::int AS OwnerUserId,
+    NULL::smallint AS PostTypeId,
+    NULL AS Tags,
+    NULL::int AS ViewCount,
+    NULL AS Score,
+    NULL AS AcceptedAnswerId,
+    NULL AS ParentId,
+    NULL::timestamp AS LastActivityDate,
+    NULL::int AS CommentCount,
+    NULL AS FavoriteCount,
+    NULL AS Body,
+    NULL AS timestamp AS LastEditDate,
+    NULL AS int AS LastEditorUserId,
+    NULL AS OwnerDisplayName,
+    NULL AS ContentLicense,
+    NULL AS AcceptedScore,
+    NULL AS RnkDayType,
+    'Synthetic' AS BenchmarkTag
+  WHERE NOT EXISTS (SELECT 1);

@@ -1,0 +1,104 @@
+WITH RankedPosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.PostTypeId,
+    ROW_NUMBER() OVER (
+      PARTITION BY CAST(p.CreationDate AS date)
+      ORDER BY p.Score DESC, p.ViewCount DESC, p.CreationDate DESC
+    ) AS rn_per_day,
+    SUM(p.ViewCount) OVER (
+      PARTITION BY p.OwnerUserId
+      ORDER BY p.CreationDate
+      ROWS BETWEEN 29 PRECEDING AND CURRENT ROW
+    ) AS rolling_30_day_views
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.DeletionDate IS NULL OR p.DeletionDate > CAST('2024-10-01 12:34:56' AS timestamp)
+),
+TopQuestions AS (
+  SELECT
+    rp.PostId,
+    rp.Title,
+    rp.Tags,
+    rp.CreationDate,
+    rp.Score,
+    rp.ViewCount,
+    rp.OwnerUserId,
+    rp.LastActivityDate,
+    rp.CommentCount,
+    rp.AnswerCount,
+    rp.FavoriteCount,
+    rp.PostTypeId,
+    rp.rn_per_day,
+    rp.rolling_30_day_views,
+    (
+      SELECT COUNT(*)
+      FROM (
+        SELECT trim(t) AS tag_text
+        FROM regexp_split_to_table(rp.Tags, '[<>]+') AS t
+        WHERE trim(t) <> ''
+      ) AS tag_list
+      JOIN Tags tg ON lower(tag_list.tag_text) = lower(tg.TagName)
+    ) AS tag_match_count
+  FROM RankedPosts rp
+  WHERE rp.PostTypeId = 1
+    AND rp.rn_per_day = 1
+),
+RecentLowActivity AS (
+  SELECT
+    tq.PostId,
+    tq.Title,
+    tq.Tags,
+    tq.CreationDate,
+    tq.Score,
+    tq.ViewCount,
+    tq.OwnerUserId,
+    tq.LastActivityDate,
+    tq.CommentCount,
+    tq.AnswerCount,
+    tq.FavoriteCount,
+    tq.rolling_30_day_views,
+    tq.tag_match_count,
+    tq.PostTypeId,
+    COALESCE(tq.Score, 0) * 2
+      + COALESCE(tq.ViewCount, 0) * 0.5
+      + COALESCE(tq.AnswerCount, 0) * 3
+      + COALESCE(tq.tag_match_count, 0) * 4
+      + CASE WHEN tq.LastActivityDate IS NULL THEN 0 ELSE 1 END AS composite_score
+  FROM TopQuestions tq
+  WHERE tq.rolling_30_day_views IS NOT NULL
+    AND tq.tag_match_count IS NULL
+)
+SELECT
+  rls.PostId,
+  rls.Title,
+  rls.Tags,
+  rls.CreationDate,
+  rls.Score,
+  rls.ViewCount,
+  rls.OwnerUserId,
+  rls.LastActivityDate,
+  rls.CommentCount,
+  rls.AnswerCount,
+  rls.FavoriteCount,
+  rls.rolling_30_day_views,
+  rls.tag_match_count,
+  rls.composite_score,
+  u.DisplayName AS OwnerDisplayName,
+  lu.DisplayName AS LastEditorDisplayName
+FROM RecentLowActivity rls
+LEFT JOIN Users u ON rls.OwnerUserId = u.Id
+LEFT JOIN Posts p_last ON p_last.Id = rls.PostId
+LEFT JOIN Users lu ON p_last.LastEditorUserId = lu.Id
+ORDER BY rls.composite_score DESC, rls.LastActivityDate DESC
+LIMIT 100;

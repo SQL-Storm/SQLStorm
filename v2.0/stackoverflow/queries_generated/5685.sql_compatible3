@@ -1,0 +1,134 @@
+WITH recent_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.LastActivityDate,
+    p.AnswerCount,
+    p.CommentCount
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '90 days'
+),
+recent_comments AS (
+  SELECT
+    c.PostId,
+    c.Id AS CommentId,
+    c.UserId,
+    c.UserDisplayName,
+    c.Text,
+    c.CreationDate,
+    c.Score AS CommentScore
+  FROM Comments c
+  JOIN Posts p ON p.Id = c.PostId
+  WHERE p.PostTypeId = 1
+    AND c.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '90 days'
+),
+tag_wikis AS (
+  SELECT
+    t.TagName AS Tag,
+    t.Count AS TagCount,
+    t.WikiPostId,
+    t.IsModeratorOnly,
+    t.IsRequired
+  FROM Tags t
+  WHERE t.IsModeratorOnly = FALSE
+),
+top_users AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.UpVotes,
+    u.DownVotes,
+    u.Views,
+    u.ProfileImageUrl
+  FROM Users u
+  WHERE u.Reputation > 10000
+),
+complex_points AS (
+  SELECT
+    qp.PostId,
+    qp.Title,
+    qp.OwnerUserId,
+    qp.CreationDate,
+    qp.Score,
+    qp.ViewCount,
+    qp.Tags,
+    (qp.Score * 1.0) / NULLIF(qp.ViewCount, 0) AS score_per_view,
+    (SELECT AVG(CAST(p2.Score AS DECIMAL)) FROM Posts p2 WHERE p2.PostTypeId = 1) AS avg_post_score,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = qp.PostId) AS total_comments,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = qp.PostId AND v.VoteTypeId = 2) AS upvotes,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = qp.PostId AND v.VoteTypeId = 3) AS downvotes
+  FROM recent_questions qp
+),
+windowed AS (
+  SELECT
+    cp.PostId,
+    cp.Title,
+    cp.OwnerUserId,
+    cp.CreationDate,
+    cp.Score,
+    cp.ViewCount,
+    cp.Tags,
+    cp.score_per_view,
+    cp.avg_post_score,
+    cp.total_comments,
+    cp.upvotes,
+    cp.downvotes,
+    ROW_NUMBER() OVER (PARTITION BY cp.OwnerUserId ORDER BY cp.CreationDate DESC) AS rn_owner
+  FROM complex_points cp
+)
+SELECT
+  w.PostId,
+  w.Title,
+  w.OwnerUserId AS OwnerId,
+  w.CreationDate,
+  w.Score,
+  w.ViewCount,
+  w.Tags,
+  w.score_per_view,
+  w.avg_post_score,
+  w.total_comments,
+  w.upvotes,
+  w.downvotes,
+  u.DisplayName AS OwnerDisplayName,
+  u.Reputation AS OwnerReputation,
+  u.LastAccessDate,
+  v.LastVoteType
+FROM windowed w
+LEFT JOIN top_users u ON u.UserId = w.OwnerUserId
+LEFT JOIN (
+  SELECT p.Id AS PostId,
+         MAX(v.Name) AS LastVoteType
+  FROM Posts p
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  WHERE v.VoteTypeId = 2
+  GROUP BY p.Id
+) v ON v.PostId = w.PostId
+LEFT JOIN tag_wikis TW ON TW.Tag = ANY( string_to_array(substr(w.Tags, 2, length(w.Tags) - 2), '><') )
+GROUP BY
+  w.PostId,
+  w.Title,
+  w.OwnerUserId,
+  w.CreationDate,
+  w.Score,
+  w.ViewCount,
+  w.Tags,
+  w.score_per_view,
+  w.avg_post_score,
+  w.total_comments,
+  w.upvotes,
+  w.downvotes,
+  u.DisplayName,
+  u.Reputation,
+  u.LastAccessDate,
+  v.LastVoteType
+ORDER BY w.score_per_view DESC
+LIMIT 100;

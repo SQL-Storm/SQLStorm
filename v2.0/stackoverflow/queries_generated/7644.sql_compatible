@@ -1,0 +1,223 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT c.Id) as Comments,
+        COUNT(DISTINCT b.Id) as Badges,
+        MAX(p.CreationDate) as LastPostDate,
+        RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) as PostRank,
+        ROW_NUMBER() OVER (PARTITION BY u.Reputation ORDER BY u.Id) as RepRowNum
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000 
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+PostMetrics AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.ParentId,
+        p.PostTypeId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as PostType,
+        CASE 
+            WHEN p.Score > 100 THEN 'High'
+            WHEN p.Score > 50 THEN 'Medium'
+            WHEN p.Score > 0 THEN 'Low'
+            ELSE 'None'
+        END as ScoreTier,
+        CAST((CAST('2024-10-01 12:34:56' AS timestamp) - CAST(p.CreationDate AS timestamp)) AS interval) AS _interval_diff,
+        EXTRACT(epoch FROM CAST((CAST('2024-10-01 12:34:56' AS timestamp) - CAST(p.CreationDate AS timestamp)) AS interval))/86400.0 AS DaysSinceCreation,
+        COALESCE(p.AnswerCount, 0) as AnswerCount,
+        COALESCE(p.CommentCount, 0) as CommentCount,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+            ELSE 'Open'
+        END as PostStatus,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PreviousScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as UserAvgScore,
+        NTILE(4) OVER (ORDER BY p.Score) as Quartile
+    FROM Posts p
+    WHERE p.CreationDate >= '2020-01-01'
+),
+UserPostAnalysis AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.TotalPosts,
+        uas.Questions,
+        uas.Answers,
+        uas.Comments,
+        uas.Badges,
+        uas.LastPostDate,
+        uas.PostRank,
+        uas.RepRowNum,
+        AVG(pma.Score) as AvgPostScore,
+        MAX(pma.Score) as MaxPostScore,
+        MIN(pma.Score) as MinPostScore,
+        COUNT(CASE WHEN pma.PostStatus = 'Closed' THEN 1 END) as ClosedPosts,
+        COUNT(CASE WHEN pma.PostStatus = 'Open' THEN 1 END) as OpenPosts,
+        COUNT(CASE WHEN pma.PostStatus = 'Community Owned' THEN 1 END) as CommunityOwnedPosts,
+        ROUND(AVG(pma.DaysSinceCreation), 2) as AvgDaysSinceCreation,
+        STRING_AGG(DISTINCT pma.PostType, ', ') as PostTypesUsed,
+        STRING_AGG(DISTINCT pma.ScoreTier, ', ') as ScoreTiers
+    FROM UserActivityStats uas
+    LEFT JOIN PostMetrics pma ON uas.UserId = pma.OwnerUserId
+    WHERE uas.TotalPosts > 0
+    GROUP BY uas.UserId, uas.DisplayName, uas.Reputation, uas.TotalPosts, uas.Questions, uas.Answers, uas.Comments, uas.Badges, uas.LastPostDate, uas.PostRank, uas.RepRowNum
+),
+PostAnalysis AS (
+    SELECT 
+        pma.PostId,
+        pma.Title,
+        pma.Score,
+        pma.ViewCount,
+        pma.CreationDate,
+        pma.OwnerUserId,
+        pma.ParentId,
+        pma.PostTypeId,
+        pma.PostType,
+        pma.ScoreTier,
+        pma.DaysSinceCreation,
+        pma.AnswerCount,
+        pma.CommentCount,
+        pma.PostStatus,
+        pma.PreviousScore,
+        pma.UserAvgScore,
+        pma.Quartile,
+        COALESCE(pma.PreviousScore, 0) - COALESCE(pma.UserAvgScore, 0) as ScoreDeviationFromAvg,
+        CASE 
+            WHEN pma.PreviousScore IS NULL THEN 'New'
+            WHEN pma.Score > pma.PreviousScore THEN 'Improved'
+            WHEN pma.Score < pma.PreviousScore THEN 'Declined'
+            ELSE 'Stable'
+        END as ScoreChange,
+        CASE 
+            WHEN pma.DaysSinceCreation <= 1 THEN 'Fresh'
+            WHEN pma.DaysSinceCreation <= 7 THEN 'Recent'
+            WHEN pma.DaysSinceCreation <= 30 THEN 'Active'
+            ELSE 'Legacy'
+        END as AgeCategory,
+        RANK() OVER (ORDER BY pma.Score DESC) as GlobalScoreRank,
+        DENSE_RANK() OVER (PARTITION BY pma.OwnerUserId ORDER BY pma.Score DESC) as UserScoreRank,
+        NTH_VALUE(pma.Title, 1) OVER (PARTITION BY pma.OwnerUserId ORDER BY pma.Score DESC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) as TopScoringPost,
+        PERCENT_RANK() OVER (ORDER BY pma.Score) as ScorePercentile,
+        COALESCE(pma.AnswerCount, 0) / NULLIF(COALESCE(pma.ViewCount, 0), 0) as AnswerToViewRatio,
+        CASE 
+            WHEN pma.Score > 50 AND pma.ViewCount > 1000 THEN 'Popular'
+            WHEN pma.Score > 25 AND pma.ViewCount > 500 THEN 'Notable'
+            WHEN pma.Score > 10 AND pma.ViewCount > 100 THEN 'Noticeable'
+            ELSE 'Regular'
+        END as PopularityLevel,
+        STRING_AGG(DISTINCT CASE WHEN pma.PostStatus = 'Closed' THEN 'Closed' END, ', ') OVER (PARTITION BY pma.OwnerUserId) as UserClosedStatus,
+        STRING_AGG(DISTINCT CASE WHEN pma.ScoreTier = 'High' THEN 'High Score' END, ', ') OVER (PARTITION BY pma.OwnerUserId) as UserHighScorePosts,
+        ROW_NUMBER() OVER (PARTITION BY pma.OwnerUserId, pma.PostStatus ORDER BY pma.CreationDate DESC) as StatusRank
+    FROM PostMetrics pma
+    WHERE pma.Score IS NOT NULL AND pma.OwnerUserId IS NOT NULL
+)
+SELECT 
+    COALESCE(uaa.UserId, 0) as UserId,
+    COALESCE(uaa.DisplayName, 'Unknown') as DisplayName,
+    COALESCE(uaa.Reputation, 0) as Reputation,
+    COALESCE(uaa.TotalPosts, 0) as TotalPosts,
+    COALESCE(uaa.Questions, 0) as Questions,
+    COALESCE(uaa.Answers, 0) as Answers,
+    COALESCE(uaa.Comments, 0) as Comments,
+    COALESCE(uaa.Badges, 0) as Badges,
+    COALESCE(uaa.LastPostDate, TIMESTAMP '1900-01-01') as LastPostDate,
+    COALESCE(uaa.PostRank, 0) as PostRank,
+    COALESCE(uaa.RepRowNum, 0) as RepRowNum,
+    COALESCE(uaa.AvgPostScore, 0) as AvgPostScore,
+    COALESCE(uaa.MaxPostScore, 0) as MaxPostScore,
+    COALESCE(uaa.MinPostScore, 0) as MinPostScore,
+    COALESCE(uaa.ClosedPosts, 0) as ClosedPosts,
+    COALESCE(uaa.OpenPosts, 0) as OpenPosts,
+    COALESCE(uaa.CommunityOwnedPosts, 0) as CommunityOwnedPosts,
+    COALESCE(uaa.AvgDaysSinceCreation, 0) as AvgDaysSinceCreation,
+    COALESCE(uaa.PostTypesUsed, 'None') as PostTypesUsed,
+    COALESCE(uaa.ScoreTiers, 'None') as ScoreTiers,
+    COALESCE(paa.PostId, 0) as PostId,
+    COALESCE(paa.Title, 'No Title') as Title,
+    COALESCE(paa.Score, 0) as Score,
+    COALESCE(paa.ViewCount, 0) as ViewCount,
+    COALESCE(paa.CreationDate, TIMESTAMP '1900-01-01') as CreationDate,
+    COALESCE(paa.ParentId, 0) as ParentId,
+    COALESCE(paa.PostTypeId, 0) as PostTypeId,
+    COALESCE(paa.PostType, 'Unknown') as PostType,
+    COALESCE(paa.ScoreTier, 'None') as ScoreTier,
+    COALESCE(paa.DaysSinceCreation, 0) as DaysSinceCreation,
+    COALESCE(paa.AnswerCount, 0) as AnswerCount,
+    COALESCE(paa.CommentCount, 0) as CommentCount,
+    COALESCE(paa.PostStatus, 'Unknown') as PostStatus,
+    COALESCE(paa.PreviousScore, 0) as PreviousScore,
+    COALESCE(paa.UserAvgScore, 0) as UserAvgScore,
+    COALESCE(paa.Quartile, 0) as Quartile,
+    COALESCE(paa.ScoreDeviationFromAvg, 0) as ScoreDeviationFromAvg,
+    COALESCE(paa.ScoreChange, 'Unknown') as ScoreChange,
+    COALESCE(paa.AgeCategory, 'Unknown') as AgeCategory,
+    COALESCE(paa.GlobalScoreRank, 0) as GlobalScoreRank,
+    COALESCE(paa.UserScoreRank, 0) as UserScoreRank,
+    COALESCE(paa.TopScoringPost, 'No Post') as TopScoringPost,
+    COALESCE(paa.ScorePercentile, 0) as ScorePercentile,
+    COALESCE(paa.AnswerToViewRatio, 0) as AnswerToViewRatio,
+    COALESCE(paa.PopularityLevel, 'Regular') as PopularityLevel,
+    COALESCE(paa.UserClosedStatus, 'None') as UserClosedStatus,
+    COALESCE(paa.UserHighScorePosts, 'None') as UserHighScorePosts,
+    COALESCE(paa.StatusRank, 0) as StatusRank,
+    CASE 
+        WHEN uaa.UserId IS NOT NULL AND paa.PostId IS NOT NULL THEN 'Active User with Posts'
+        WHEN uaa.UserId IS NOT NULL THEN 'Active User'
+        WHEN paa.PostId IS NOT NULL THEN 'Post Analysis'
+        ELSE 'No Data'
+    END as AnalysisCategory,
+    CASE 
+        WHEN uaa.Reputation > 10000 THEN 'Highly Reputable'
+        WHEN uaa.Reputation > 5000 THEN 'Reputable'
+        WHEN uaa.Reputation > 1000 THEN 'Moderate'
+        ELSE 'Beginner'
+    END as ReputationLevel,
+    CONCAT(uaa.PostRank, '_', paa.GlobalScoreRank) as CompositeRank,
+    CASE 
+        WHEN paa.PostStatus = 'Open' AND paa.Score > 50 THEN 'High Value Open Post'
+        WHEN paa.PostStatus = 'Closed' AND paa.Score > 100 THEN 'High Value Closed Post'
+        ELSE 'Standard Post'
+    END as PostClassification,
+    ROUND(
+        CASE 
+            WHEN paa.AnswerCount IS NOT NULL AND paa.ViewCount IS NOT NULL THEN 
+                (paa.AnswerCount * 1.0) / NULLIF(paa.ViewCount, 0)
+            ELSE 0
+        END, 4
+    ) as AnalyticalRatio,
+    COUNT(*) OVER () as TotalRecords
+FROM UserPostAnalysis uaa
+FULL OUTER JOIN PostAnalysis paa ON uaa.UserId = paa.OwnerUserId
+WHERE 
+    (uaa.UserId IS NOT NULL OR paa.PostId IS NOT NULL)
+    AND 
+    (
+        (COALESCE(uaa.Reputation, 0) > 500 OR COALESCE(paa.Score, 0) > 25)
+        OR
+        (COALESCE(uaa.TotalPosts, 0) > 10 OR COALESCE(paa.PostStatus, '') IN ('Closed', 'Open'))
+    )
+    AND 
+    (
+        (COALESCE(uaa.PostRank, 999999) <= 50 OR COALESCE(paa.GlobalScoreRank, 999999) <= 100)
+        OR
+        (COALESCE(paa.ScoreTier, '') = 'High' OR COALESCE(uaa.ScoreTiers, '') LIKE '%High%')
+    );

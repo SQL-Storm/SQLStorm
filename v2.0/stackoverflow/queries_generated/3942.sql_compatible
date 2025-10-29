@@ -1,0 +1,158 @@
+WITH
+UserReputation AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COALESCE(u.UpVotes,0) - COALESCE(u.DownVotes,0)               AS NetVotes,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1)                        AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2)                        AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3)                        AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate,
+             u.UpVotes, u.DownVotes
+),
+UserActivity AS (
+    SELECT
+        p.OwnerUserId                                    AS UserId,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 1)        AS QuestionsAsked,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 2)        AS AnswersGiven,
+        MAX(p.CreationDate)                             AS LastPostDate
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+TagPopularity AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC)      AS TagRank
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0
+),
+UserQuestionTags AS (
+    SELECT
+        p.OwnerUserId                                                AS UserId,
+        UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags)-2),
+                               '><'))                               AS Tag,
+        COUNT(*)                                                     AS TagUsage
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+    GROUP BY p.OwnerUserId, Tag
+),
+TopUserTags AS (
+    SELECT
+        uq.UserId,
+        uq.Tag,
+        uq.TagUsage,
+        ROW_NUMBER() OVER (PARTITION BY uq.UserId ORDER BY uq.TagUsage DESC) AS TagPos
+    FROM UserQuestionTags uq
+),
+RecentCloseReasons AS (
+    SELECT
+        ph.PostId,
+        ph.CreationDate,
+        CAST(ph.Comment AS integer)                           AS CloseReasonId,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10
+),
+UserCloseStats AS (
+    SELECT
+        p.OwnerUserId                                          AS UserId,
+        COUNT(DISTINCT rc.CloseReasonId)                       AS DistinctCloseReasons,
+        COUNT(*) FILTER (WHERE rc.CloseReasonId = 101)         AS DuplicateClosings,
+        COUNT(*) FILTER (WHERE rc.CloseReasonId = 102)         AS OffTopicClosings
+    FROM Posts p
+    JOIN RecentCloseReasons rc ON rc.PostId = p.Id AND rc.rn = 1
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+Combined AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        ur.NetVotes,
+        ur.GoldBadges,
+        ur.SilverBadges,
+        ur.BronzeBadges,
+        COALESCE(ua.QuestionsAsked,0)               AS QuestionsAsked,
+        COALESCE(ua.AnswersGiven,0)                 AS AnswersGiven,
+        COALESCE(ua.LastPostDate, u.CreationDate)   AS LastActivity,
+        COALESCE(ucs.DistinctCloseReasons,0)        AS DistinctCloseReasons,
+        COALESCE(ucs.DuplicateClosings,0)           AS DuplicateClosings,
+        COALESCE(ucs.OffTopicClosings,0)            AS OffTopicClosings,
+        (u.Reputation * 0.4) +
+        (ur.NetVotes * 0.3) +
+        (ur.GoldBadges   * 100) +
+        (ur.SilverBadges * 50)  +
+        (ur.BronzeBadges * 20)  +
+        (COALESCE(ua.QuestionsAsked,0) * 5) +
+        (COALESCE(ua.AnswersGiven,0)   * 8) -
+        (COALESCE(ucs.DistinctCloseReasons,0) * 15)         AS CompositeScore
+    FROM Users u
+    LEFT JOIN UserReputation ur   ON ur.Id = u.Id
+    LEFT JOIN UserActivity   ua   ON ua.UserId = u.Id
+    LEFT JOIN UserCloseStats ucs  ON ucs.UserId = u.Id
+)
+SELECT *
+FROM (
+    SELECT
+        c.Id,
+        c.DisplayName,
+        c.Reputation,
+        c.NetVotes,
+        c.GoldBadges,
+        c.SilverBadges,
+        c.BronzeBadges,
+        c.QuestionsAsked,
+        c.AnswersGiven,
+        c.LastActivity,
+        c.DistinctCloseReasons,
+        c.DuplicateClosings,
+        c.OffTopicClosings,
+        c.CompositeScore,
+        ROW_NUMBER() OVER (ORDER BY c.CompositeScore DESC)         AS RankOverall,
+        CASE
+            WHEN c.GoldBadges > 0                     THEN 'Elite'
+            WHEN c.SilverBadges > 5                   THEN 'Veteran'
+            ELSE                                           'Member'
+        END                                                         AS UserTier,
+        (SELECT tq.Tag
+         FROM TopUserTags tq
+         WHERE tq.UserId = c.Id AND tq.TagPos = 1)                 AS TopTag,
+        CAST(NULLIF(c.DuplicateClosings,0) AS integer)              AS FirstDuplicateClosing
+    FROM Combined c
+) ranked
+WHERE RankOverall <= 10
+UNION ALL
+SELECT
+    CAST(NULL AS integer)                     AS Id,
+    '---'                                     AS DisplayName,
+    CAST(NULL AS integer)                     AS Reputation,
+    CAST(NULL AS integer)                     AS NetVotes,
+    CAST(NULL AS integer)                     AS GoldBadges,
+    CAST(NULL AS integer)                     AS SilverBadges,
+    CAST(NULL AS integer)                     AS BronzeBadges,
+    CAST(NULL AS integer)                     AS QuestionsAsked,
+    CAST(NULL AS integer)                     AS AnswersGiven,
+    CAST(NULL AS timestamp)                   AS LastActivity,
+    CAST(NULL AS integer)                     AS DistinctCloseReasons,
+    CAST(NULL AS integer)                     AS DuplicateClosings,
+    CAST(NULL AS integer)                     AS OffTopicClosings,
+    CAST(NULL AS numeric)                     AS CompositeScore,
+    CAST(NULL AS integer)                     AS RankOverall,
+    CAST(NULL AS varchar)                     AS UserTier,
+    CAST(NULL AS varchar)                     AS TopTag,
+    CAST(NULL AS timestamp)                   AS FirstDuplicateClosing
+WHERE FALSE
+EXCEPT
+SELECT *
+FROM (
+    SELECT *
+    FROM ranked
+    WHERE UserTier = 'Member' AND CompositeScore < 0
+) sub;

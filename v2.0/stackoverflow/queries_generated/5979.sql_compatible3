@@ -1,0 +1,46 @@
+SELECT
+  u.Id AS UserId,
+  u.DisplayName AS UserName,
+  COUNT(p.Id) AS PostsCreated,
+  AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS AvgQuestionScore,
+  SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+  MAX(p.CreationDate) OVER (PARTITION BY u.Id) AS LastActive,
+  COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN p.Id END) AS UpvotesReceived,
+  COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN p.Id END) AS DownvotesReceived,
+  STRING_AGG(DISTINCT t.TagName, ',') AS TagSet,
+  MIN(CASE WHEN p.OwnerUserId IS NULL THEN 1 ELSE 0 END) AS HasOrphanedPosts,
+  CASE
+    WHEN u.Reputation > 2000 THEN 'High'
+    WHEN u.Reputation > 500 THEN 'Medium'
+    ELSE 'Low'
+  END AS ReputationTier
+FROM
+  Users u
+  LEFT JOIN Posts p
+    ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v
+    ON v.PostId = p.Id
+  LEFT JOIN LATERAL (
+      SELECT unnest(string_to_array(COALESCE(p.Tags, ''), '<>')) AS tagname
+  ) AS tag_split
+    ON TRUE
+  LEFT JOIN Tags t
+    ON LOWER(t.TagName) = LOWER(tag_split.tagname)
+WHERE
+  u.AccountId IS NOT NULL
+  AND u.LastAccessDate < CAST('2024-10-01 12:34:56' AS TIMESTAMP)
+GROUP BY
+  u.Id,
+  u.DisplayName,
+  u.Reputation,
+  u.AccountId,
+  MAX(p.CreationDate) OVER (PARTITION BY u.Id),
+  CASE
+    WHEN u.Reputation > 2000 THEN 'High'
+    WHEN u.Reputation > 500 THEN 'Medium'
+    ELSE 'Low'
+  END
+ORDER BY
+  ReputationTier DESC,
+  PostsCreated DESC
+LIMIT 100;

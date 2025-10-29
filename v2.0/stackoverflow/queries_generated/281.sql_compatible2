@@ -1,0 +1,336 @@
+with recent_users as (
+    select u.id as user_id,
+           u.displayname,
+           u.reputation,
+           u.creationdate,
+           date_trunc('month', u.creationdate) as signup_month,
+           coalesce(nullif(trim(split_part(coalesce(u.location,''), ',', 1)), ''), 'Unknown') as region_hint
+    from users u
+    where u.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+),
+question_posts as (
+    select p.id as post_id,
+           p.owneruserid as user_id,
+           p.creationdate,
+           p.score,
+           p.viewcount,
+           p.title,
+           p.tags,
+           p.answercount,
+           p.closeddate,
+           case when p.tags is not null then cardinality(string_to_array(substring(p.tags, 2, greatest(length(p.tags)-2,0)), '><')) else 0 end as tag_count
+    from posts p
+    where p.posttypeid = 1
+      and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+),
+answer_posts as (
+    select a.id as answer_id,
+           a.parentid as question_id,
+           a.owneruserid as user_id,
+           a.creationdate,
+           a.score
+    from posts a
+    where a.posttypeid = 2
+      and a.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+),
+user_activity as (
+    select ru.user_id,
+           count(distinct qp.post_id) filter (where qp.post_id is not null) as q_count,
+           count(distinct ap.answer_id) filter (where ap.answer_id is not null) as a_count,
+           coalesce(sum(qp.score),0) as q_score,
+           coalesce(sum(ap.score),0) as a_score,
+           coalesce(sum(qp.viewcount),0) as q_views,
+           coalesce(sum(qp.answercount),0) as q_answers_received,
+           max(greatest(coalesce(qp.creationdate, cast('1970-01-01' as timestamp)), coalesce(ap.creationdate, cast('1970-01-01' as timestamp)))) as last_post_date
+    from recent_users ru
+    left join question_posts qp on qp.user_id = ru.user_id
+    left join answer_posts ap on ap.user_id = ru.user_id
+    group by ru.user_id
+),
+user_badges as (
+    select b.userid as user_id,
+           count(*) as badge_count,
+           count(*) filter (where b.class = 1) as gold_count,
+           count(*) filter (where b.class = 2) as silver_count,
+           count(*) filter (where b.class = 3) as bronze_count,
+           max(b.date) as last_badge_date
+    from badges b
+    where b.date >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+    group by b.userid
+),
+question_closures as (
+    select ph.postid as post_id,
+           min(ph.creationdate) as first_closed_at,
+           max(ph.creationdate) as last_closed_at,
+           count(*) as close_events,
+           count(*) filter (where ph.posthistorytypeid in (11)) as reopen_events
+    from posthistory ph
+    where ph.posthistorytypeid in (10,11) -- closed or reopened
+    group by ph.postid
+),
+duplicates as (
+    select pl.postid as dup_post_id,
+           pl.relatedpostid as orig_post_id,
+           min(pl.creationdate) as first_link_date,
+           count(*) as dup_links
+    from postlinks pl
+    where pl.linktypeid = 3
+    group by pl.postid, pl.relatedpostid
+),
+favorite_votes as (
+    select v.postid,
+           count(*) as fav_count,
+           min(v.creationdate) as first_fav_at,
+           max(v.creationdate) as last_fav_at
+    from votes v
+    where v.votetypeid = 5
+      and v.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+    group by v.postid
+),
+comment_stats as (
+    select c.postid,
+           count(*) as comment_count,
+           sum(c.score) as comment_score,
+           max(c.creationdate) as last_comment_at
+    from comments c
+    where c.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+    group by c.postid
+),
+accepted_answer_latency as (
+    select q.id as question_id,
+           q.creationdate as question_created,
+           a.id as accepted_answer_id,
+           a.creationdate as accepted_created,
+           extract(epoch from (a.creationdate - q.creationdate)) / 3600.0 as hours_to_accept
+    from posts q
+    join posts a on a.id = q.acceptedanswerid
+    where q.posttypeid = 1
+      and q.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+),
+user_quality_scores as (
+    select ua.user_id,
+           (ua.q_score + ua.a_score) * 1.0
+           + ln(greatest(ua.q_views,1)) * 0.75
+           + coalesce(ub.gold_count,0) * 5
+           + coalesce(ub.silver_count,0) * 2
+           + coalesce(ub.bronze_count,0) * 1
+           - (select coalesce(sum(case when v2.votetypeid = 3 then 1 else 0 end), 0) from votes v2 join posts p2 on p2.id = v2.postid and p2.owneruserid = ua.user_id and v2.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years') as quality_score
+    from user_activity ua
+    left join user_badges ub on ub.user_id = ua.user_id
+    group by ua.user_id, ua.q_score, ua.a_score, ua.q_views, ub.gold_count, ub.silver_count, ub.bronze_count
+),
+question_enriched as (
+    select qp.post_id,
+           qp.user_id,
+           qp.creationdate,
+           qp.score,
+           qp.viewcount,
+           qp.title,
+           qp.tags,
+           qp.answercount,
+           qp.closeddate,
+           qp.tag_count,
+           coalesce(fc.fav_count, 0) as fav_count,
+           coalesce(cs.comment_count, 0) as comment_count,
+           coalesce(cs.comment_score, 0) as comment_score,
+           qc.first_closed_at,
+           qc.last_closed_at,
+           qc.close_events,
+           qc.reopen_events,
+           al.hours_to_accept,
+           d.dup_links,
+           case
+             when qp.tags is null then array[]::text[] -- keep array literal for compatibility; will be handled below where necessary
+             else string_to_array(substring(qp.tags, 2, greatest(length(qp.tags)-2,0)), '><')
+           end as tag_array
+    from question_posts qp
+    left join favorite_votes fc on fc.postid = qp.post_id
+    left join comment_stats cs on cs.postid = qp.post_id
+    left join question_closures qc on qc.post_id = qp.post_id
+    left join accepted_answer_latency al on al.question_id = qp.post_id
+    left join duplicates d on d.dup_post_id = qp.post_id
+),
+tag_exploded as (
+    select qe.post_id,
+           qe.user_id,
+           lower(trim(t)) as tagname,
+           qe.score,
+           qe.viewcount,
+           qe.answercount,
+           qe.fav_count,
+           qe.comment_count,
+           qe.comment_score,
+           qe.hours_to_accept,
+           qe.closeddate,
+           qe.creationdate
+    from question_enriched qe,
+    lateral unnest(qe.tag_array) as t
+),
+tag_rankings as (
+    select te.tagname,
+           count(*) as q_cnt,
+           avg(te.score) as avg_score,
+           avg(te.viewcount) as avg_views,
+           percentile_cont(0.5) within group (order by coalesce(te.hours_to_accept, 1e9)) as p50_accept_hours,
+           sum(case when te.closeddate is not null then 1 else 0 end) as closed_cnt
+    from tag_exploded te
+    group by te.tagname
+),
+user_post_windows as (
+    select qe.user_id,
+           qe.post_id,
+           qe.creationdate,
+           qe.score,
+           sum(qe.score) over (partition by qe.user_id order by qe.creationdate rows between unbounded preceding and current row) as running_score,
+           avg(qe.viewcount) over (partition by qe.user_id order by qe.creationdate rows between 10 preceding and current row) as mov_avg_views_11,
+           row_number() over (partition by qe.user_id order by qe.creationdate desc) as rn_desc
+    from question_enriched qe
+),
+active_user_flags as (
+    select ru.user_id,
+           case when ua.q_count + ua.a_count >= 5 then 1 else 0 end as is_active,
+           case when (cast('2024-10-01 12:34:56' as timestamp) - coalesce(ua.last_post_date, ru.creationdate)) <= interval '90 days' then 1 else 0 end as is_recently_active
+    from recent_users ru
+    left join user_activity ua on ua.user_id = ru.user_id
+    group by ru.user_id, ua.q_count, ua.a_count, ua.last_post_date, ru.creationdate
+),
+cross_user_influence as (
+    select u1.user_id as user_id,
+           count(distinct u2.user_id) as commenters_on_my_posts
+    from posts p
+    join comments c on c.postid = p.id and c.userid is not null and c.userid <> p.owneruserid
+    join recent_users u1 on u1.user_id = p.owneruserid
+    join recent_users u2 on u2.user_id = c.userid
+    where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+    group by u1.user_id
+),
+final_user_metrics as (
+    select ru.user_id,
+           ru.displayname,
+           ru.reputation,
+           ru.signup_month,
+           ru.region_hint,
+           ua.q_count,
+           ua.a_count,
+           ua.q_score,
+           ua.a_score,
+           ua.q_views,
+           ua.q_answers_received,
+           ua.last_post_date,
+           ub.badge_count,
+           ub.gold_count,
+           ub.silver_count,
+           ub.bronze_count,
+           uqs.quality_score,
+           auf.is_active,
+           auf.is_recently_active,
+           coalesce(cui.commenters_on_my_posts, 0) as commenters_on_my_posts
+    from recent_users ru
+    left join user_activity ua on ua.user_id = ru.user_id
+    left join user_badges ub on ub.user_id = ru.user_id
+    left join user_quality_scores uqs on uqs.user_id = ru.user_id
+    left join active_user_flags auf on auf.user_id = ru.user_id
+    left join cross_user_influence cui on cui.user_id = ru.user_id
+),
+ranked_users as (
+    select fum.user_id,
+           fum.displayname,
+           fum.reputation,
+           fum.signup_month,
+           fum.region_hint,
+           fum.q_count,
+           fum.a_count,
+           fum.q_score,
+           fum.a_score,
+           fum.q_views,
+           fum.q_answers_received,
+           fum.last_post_date,
+           fum.badge_count,
+           fum.gold_count,
+           fum.silver_count,
+           fum.bronze_count,
+           fum.quality_score,
+           fum.is_active,
+           fum.is_recently_active,
+           fum.commenters_on_my_posts,
+           ntile(10) over (order by coalesce(fum.quality_score, -1e9) desc) as quality_decile,
+           rank() over (order by coalesce(fum.quality_score, -1e9) desc, fum.reputation desc) as global_rank
+    from final_user_metrics fum
+),
+per_user_tag_mix as (
+    select te.user_id,
+           string_agg(distinct te.tagname, ',' order by te.tagname) as tag_mix_sample,
+           count(*) as tag_mentions
+    from tag_exploded te
+    group by te.user_id
+),
+question_outliers as (
+    select qe.post_id,
+           qe.user_id,
+           qe.score,
+           qe.viewcount,
+           qe.fav_count,
+           qe.comment_count,
+           case when qe.score >= (select avg(score) + 3*stddev_pop(score) from question_enriched) then 1 else 0 end as is_high_score_outlier,
+           case when qe.viewcount >= (select avg(viewcount) + 3*stddev_pop(viewcount) from question_enriched) then 1 else 0 end as is_high_view_outlier
+    from question_enriched qe
+),
+unioned as (
+    select
+        'USER' as entity_type,
+        cast(ru.user_id as text) as entity_id,
+        ru.displayname as title_or_name,
+        cast(ru.reputation as text) as metric_a,
+        cast(ru.quality_score as text) as metric_b,
+        to_char(coalesce(ru.last_post_date, ru.signup_month), 'YYYY-MM-DD') as date_k,
+        null as tag_or_reason,
+        cast(ru.global_rank as text) as extra_1,
+        cast(ru.quality_decile as text) as extra_2
+    from ranked_users ru
+    where ru.is_active = 1
+
+    union all
+
+    select
+        'QUESTION' as entity_type,
+        cast(qe.post_id as text) as entity_id,
+        coalesce(nullif(qe.title,''), '[no title]') as title_or_name,
+        cast(qe.score as text) as metric_a,
+        cast(qe.viewcount as text) as metric_b,
+        to_char(qe.creationdate, 'YYYY-MM-DD') as date_k,
+        (select string_agg(t, ',') from unnest(qe.tag_array) t) as tag_or_reason,
+        cast(coalesce(qo.is_high_score_outlier,0) as text) as extra_1,
+        cast(coalesce(qo.is_high_view_outlier,0) as text) as extra_2
+    from question_enriched qe
+    left join question_outliers qo on qo.post_id = qe.post_id
+
+    union all
+
+    select
+        'TAG' as entity_type,
+        tr.tagname as entity_id,
+        tr.tagname as title_or_name,
+        cast(tr.q_cnt as text) as metric_a,
+        cast(round(tr.avg_views::numeric, 2) as text) as metric_b,
+        to_char(date_trunc('month', cast('2024-10-01 12:34:56' as timestamp)), 'YYYY-MM-01') as date_k,
+        'p50_accept_hours=' || coalesce(cast(round(cast(tr.p50_accept_hours as numeric),2) as text), 'null') as tag_or_reason,
+        cast(tr.closed_cnt as text) as extra_1,
+        cast(round(tr.avg_score::numeric, 2) as text) as extra_2
+    from tag_rankings tr
+),
+filtered as (
+    select u.*
+    from unioned u
+    where
+      (
+        (u.entity_type = 'USER' and (cast(u.metric_a as int) >= 1000 or cast(u.extra_2 as int) <= 3))
+        or
+        (u.entity_type = 'QUESTION' and (cast(u.metric_a as int) >= 5 or cast(u.extra_1 as int) = 1))
+        or
+        (u.entity_type = 'TAG' and (cast(u.metric_a as int) >= 50 or position('p50_accept_hours=' in coalesce(u.tag_or_reason,'')) > 0))
+      )
+)
+select *
+from filtered
+order by entity_type, date_k desc, cast(metric_b as numeric) nulls last
+limit 500;

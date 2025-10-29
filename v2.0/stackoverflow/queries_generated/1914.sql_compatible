@@ -1,0 +1,201 @@
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.UpVotes,
+        U.DownVotes,
+        U.Views AS UserProfileViews,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COALESCE(SUM(P.Score), 0) AS TotalPostScore,
+        COALESCE(SUM(CASE WHEN V.VoteTypeId = 9 THEN V.BountyAmount ELSE 0 END), 0) AS TotalBountyReceived,
+        MAX(P.LastActivityDate) AS LastPostActivity,
+        MAX(C.CreationDate) AS LastCommentActivity,
+        CASE
+            WHEN U.Reputation >= 250000 THEN 'Legend'
+            WHEN U.Reputation >= 50000 THEN 'Guru'
+            WHEN U.Reputation >= 10000 THEN 'Expert'
+            WHEN U.Reputation >= 2000 THEN 'Apprentice'
+            ELSE 'Novice'
+        END AS ReputationTier,
+        U.Location,
+        U.AboutMe
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Votes V ON U.Id = V.UserId AND V.VoteTypeId IN (2, 3, 9)
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.UpVotes, U.DownVotes, U.Views, U.Location, U.AboutMe
+    HAVING U.Reputation >= 1000 AND U.DisplayName IS NOT NULL
+),
+PostHistoricalMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.FavoriteCount,
+        P.LastEditDate,
+        COUNT(PH.Id) AS TotalEditHistoryEntries,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS MajorEditCount,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN CRT.Name ELSE NULL END) AS LatestCloseReason,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 2 THEN LENGTH(PH.Text) ELSE NULL END) AS InitialBodyLength,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 5 THEN LENGTH(PH.Text) ELSE NULL END) AS LatestBodyLength,
+        ROW_NUMBER() OVER(PARTITION BY P.OwnerUserId ORDER BY P.CreationDate DESC) AS UserLatestPostRank,
+        LAG(P.LastEditDate, 1, P.CreationDate) OVER(PARTITION BY P.OwnerUserId, P.Id ORDER BY PH.CreationDate) AS PreviousEditDate
+    FROM Posts P
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    LEFT JOIN CloseReasonTypes CRT ON PH.PostHistoryTypeId = 10 AND PH.Comment IS NOT NULL AND CRT.Id = CAST(PH.Comment AS smallint)
+    WHERE P.OwnerUserId IS NOT NULL
+    GROUP BY P.Id, P.PostTypeId, P.OwnerUserId, P.CreationDate, P.Score, P.ViewCount, P.AnswerCount, P.FavoriteCount, P.LastEditDate
+),
+TagCategorization AS (
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        TRIM(UNNEST(string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><'))) AS TagName,
+        'Programming' AS TagCategory,
+        P.Score AS TagPostScore
+    FROM Posts P
+    WHERE P.PostTypeId = 1
+      AND P.Tags IS NOT NULL
+      AND (P.Tags LIKE '%<java>%' OR P.Tags LIKE '%<python>%' OR P.Tags LIKE '%<c#>%' OR P.Tags LIKE '%<javascript>%')
+    UNION ALL
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        TRIM(UNNEST(string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><'))) AS TagName,
+        'Database' AS TagCategory,
+        P.Score AS TagPostScore
+    FROM Posts P
+    WHERE P.PostTypeId = 1
+      AND P.Tags IS NOT NULL
+      AND (P.Tags LIKE '%<sql>%' OR P.Tags LIKE '%<database>%' OR P.Tags LIKE '%<postgresql>%' OR P.Tags LIKE '%<mysql>%')
+),
+QualifiedContributors AS (
+    SELECT
+        UAS.UserId,
+        UAS.DisplayName,
+        UAS.Reputation,
+        UAS.QuestionCount,
+        UAS.AnswerCount,
+        UAS.TotalComments,
+        UAS.TotalPostScore,
+        UAS.LastPostActivity,
+        UAS.LastCommentActivity,
+        (
+         SELECT COUNT(P_inner.Id) > 0
+         FROM Posts P_inner
+         WHERE P_inner.OwnerUserId = UAS.UserId
+           AND P_inner.AcceptedAnswerId IS NOT NULL
+           AND (SELECT P_question.AnswerCount FROM Posts P_question WHERE P_question.Id = P_inner.ParentId) > 5
+        ) AS HasAcceptedInComplexQuestion,
+        (
+         SELECT COALESCE(AVG(P_recent_answers.Score), 0)
+         FROM (
+             SELECT P_sub_inner.Score
+             FROM Posts P_sub_inner
+             WHERE P_sub_inner.OwnerUserId = UAS.UserId AND P_sub_inner.PostTypeId = 2
+             ORDER BY P_sub_inner.CreationDate DESC
+             LIMIT 5
+         ) AS P_recent_answers
+        ) AS AvgScoreLast5Answers,
+        NTILE(5) OVER (ORDER BY UAS.Reputation DESC, UAS.TotalPostScore DESC) AS ReputationQuintile
+    FROM UserActivitySummary UAS
+    WHERE UAS.Reputation > 2000
+      AND (UAS.QuestionCount + UAS.AnswerCount) > 20
+      AND UAS.TotalComments > 10
+),
+ModeratorEditedPosts AS (
+    SELECT
+        PH.PostId,
+        MAX(PH.CreationDate) AS LastModActionDate,
+        COUNT(PH.Id) AS ModActionCount
+    FROM PostHistory PH
+    WHERE PH.UserId IS NOT NULL AND PH.UserId BETWEEN 1 AND 3
+      AND PH.PostHistoryTypeId IN (4, 5, 6, 14, 15, 19, 20)
+    GROUP BY PH.PostId
+),
+UserBadgeSummary AS (
+    SELECT
+        B.UserId,
+        COUNT(B.Id) AS TotalBadges,
+        MAX(CASE WHEN B.Class = 1 THEN B.Name ELSE NULL END) AS GoldBadgeName,
+        MAX(CASE WHEN B.Class = 2 THEN B.Name ELSE NULL END) AS SilverBadgeName,
+        MAX(B.Class) AS HighestBadgeClassValue,
+        MIN(B.Class) AS LowestBadgeClassValue
+    FROM Badges B
+    GROUP BY B.UserId
+)
+SELECT
+    QC.UserId,
+    QC.DisplayName,
+    QC.Reputation,
+    QC.ReputationQuintile,
+    QC.QuestionCount,
+    QC.AnswerCount,
+    QC.TotalComments,
+    QC.HasAcceptedInComplexQuestion,
+    QC.AvgScoreLast5Answers,
+    COALESCE(TP.ProgrammingTagPostCount, 0) AS ProgrammingTagContribution,
+    COALESCE(TP.DatabaseTagPostCount, 0) AS DatabaseTagContribution,
+    UAS.ReputationTier,
+    PHM.TotalEditHistoryEntries AS LatestPostEditHistory,
+    PHM.MajorEditCount AS LatestPostMajorEdits,
+    PHM.LatestCloseReason AS LatestPostClosureReason,
+    ABS(UAS.UpVotes - UAS.DownVotes) AS NetVoteDifference,
+    COALESCE(PHM.InitialBodyLength, 0) AS InitialPostContentLength,
+    COALESCE(PHM.LatestBodyLength, 0) AS CurrentPostContentLength,
+    COALESCE(MOD.LastModActionDate, TIMESTAMP '1900-01-01 00:00:00') AS PostLastModeratedActionDate,
+    COALESCE(UBS.GoldBadgeName, UBS.SilverBadgeName, 'No Gold/Silver Badge') AS TopBadgeAwarded,
+    DATE_PART('year', AGE(TIMESTAMP '2024-10-01 12:34:56', UAS.UserCreationDate)) AS YearsOnPlatform,
+    PERCENT_RANK() OVER (ORDER BY QC.Reputation DESC, QC.AvgScoreLast5Answers DESC) AS UserPerformancePercentRank,
+    DENSE_RANK() OVER (PARTITION BY QC.ReputationQuintile ORDER BY QC.TotalPostScore DESC, UAS.UserProfileViews DESC) AS RankWithinReputationQuintile,
+    (QC.TotalPostScore * 0.4 + QC.QuestionCount * 0.2 + QC.AnswerCount * 0.3 + QC.TotalComments * 0.1) AS CalculatedImpactScore,
+    CASE
+        WHEN UAS.AboutMe IS NOT NULL AND LENGTH(UAS.AboutMe) > 200 AND UAS.AboutMe LIKE '%developer%' THEN 'Verbose Developer'
+        WHEN UAS.AboutMe IS NOT NULL AND LENGTH(UAS.AboutMe) BETWEEN 50 AND 200 THEN 'Concise Contributor'
+        WHEN UAS.AboutMe IS NULL THEN 'No AboutMe Info'
+        ELSE 'Limited AboutMe Info'
+    END AS AboutMeProfileDetail
+FROM QualifiedContributors QC
+JOIN UserActivitySummary UAS ON QC.UserId = UAS.UserId
+LEFT JOIN PostHistoricalMetrics PHM ON QC.UserId = PHM.OwnerUserId AND PHM.UserLatestPostRank = 1
+LEFT JOIN (
+    SELECT
+        OwnerUserId,
+        COUNT(CASE WHEN TagCategory = 'Programming' THEN PostId END) AS ProgrammingTagPostCount,
+        COUNT(CASE WHEN TagCategory = 'Database' THEN PostId END) AS DatabaseTagPostCount
+    FROM TagCategorization
+    GROUP BY OwnerUserId
+) AS TP ON QC.UserId = TP.OwnerUserId
+LEFT JOIN UserBadgeSummary UBS ON QC.UserId = UBS.UserId
+LEFT JOIN ModeratorEditedPosts MOD ON PHM.PostId = MOD.PostId
+WHERE QC.Reputation > 5000
+  AND QC.AvgScoreLast5Answers > 3
+  AND (PHM.PostId IS NULL OR PHM.TotalEditHistoryEntries > 0 OR PHM.PostTypeId IS DISTINCT FROM 1)
+  AND (UAS.Location IS NULL OR (LOWER(UAS.Location) NOT LIKE '%india%' AND LOWER(UAS.Location) NOT LIKE '%china%'))
+  AND NOT EXISTS (
+      SELECT 1
+      FROM Posts P_closed
+      WHERE P_closed.Id = PHM.PostId
+        AND P_closed.PostTypeId = 1
+        AND P_closed.ClosedDate IS NOT NULL
+        AND P_closed.AcceptedAnswerId IS NULL
+        AND P_closed.Id IN (
+            SELECT PH_closed.PostId
+            FROM PostHistory PH_closed
+            WHERE PH_closed.PostId = P_closed.Id
+              AND PH_closed.PostHistoryTypeId = 10
+              AND PH_closed.Comment IN ('1', '2', '101', '102')
+        )
+  )
+ORDER BY CalculatedImpactScore DESC, UserPerformancePercentRank ASC
+LIMIT 750;

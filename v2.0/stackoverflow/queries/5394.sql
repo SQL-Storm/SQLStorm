@@ -1,0 +1,103 @@
+WITH RecentActivePosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.Body,
+    p.ContentLicense,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation,
+    u.CreationDate AS OwnerCreationDate,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+    MAX(CASE WHEN LOWER(vt.Name) = LOWER('AcceptedByOriginator') THEN 1 ELSE 0 END) AS HasAccepted
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+  WHERE p.LastActivityDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days')
+  GROUP BY
+    p.Id, p.PostTypeId, p.OwnerUserId, p.Title, p.Tags,
+    p.CreationDate, p.LastActivityDate, p.Score, p.ViewCount,
+    p.AnswerCount, p.CommentCount, p.FavoriteCount, p.Body,
+    p.ContentLicense, u.DisplayName, u.Reputation, u.CreationDate
+),
+TagRelationships AS (
+  SELECT
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId,
+    t.WikiPostId,
+    CASE
+      WHEN t.IsModeratorOnly = TRUE OR (t.IsModeratorOnly IS NOT NULL AND CAST(t.IsModeratorOnly AS text) = '1') THEN TRUE
+      ELSE FALSE
+    END AS IsModOnly
+  FROM Tags t
+),
+CrossJoinStats AS (
+  SELECT
+    par.PostId,
+    par.PostTypeId,
+    par.OwnerUserId,
+    par.Title,
+    par.Tags,
+    par.CreationDate,
+    par.LastActivityDate,
+    par.Score,
+    par.ViewCount,
+    par.AnswerCount,
+    par.CommentCount,
+    par.FavoriteCount,
+    par.Body,
+    par.ContentLicense,
+    par.OwnerDisplayName,
+    par.Reputation,
+    par.OwnerCreationDate,
+    par.UpVotes,
+    par.DownVotes,
+    par.HasAccepted,
+    tmap.TagName,
+    t.Count AS TagCount,
+    t.IsModOnly
+  FROM RecentActivePosts par
+  LEFT JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(par.Tags FROM 2 FOR (char_length(par.Tags)-2)), '><')) AS TagName
+  ) AS tmap ON TRUE
+  LEFT JOIN TagRelationships t ON t.TagName = tmap.TagName
+)
+SELECT
+  cjs.PostId,
+  cjs.PostTypeId,
+  cjs.OwnerUserId,
+  cjs.Title,
+  cjs.Tags,
+  cjs.CreationDate,
+  cjs.LastActivityDate,
+  cjs.Score,
+  cjs.ViewCount,
+  cjs.AnswerCount,
+  cjs.CommentCount,
+  cjs.FavoriteCount,
+  cjs.Body,
+  cjs.ContentLicense,
+  cjs.OwnerDisplayName,
+  cjs.Reputation,
+  cjs.OwnerCreationDate,
+  cjs.UpVotes,
+  cjs.DownVotes,
+  cjs.HasAccepted,
+  cjs.TagName,
+  cjs.TagCount,
+  cjs.IsModOnly
+FROM CrossJoinStats cjs
+ORDER BY cjs.LastActivityDate DESC, cjs.Score DESC
+LIMIT 200;

@@ -1,0 +1,159 @@
+-- {"query": "2079.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1544} 
+WITH UserBadgeCounts AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COUNT(b.Id) AS TotalBadges,
+        COALESCE(SUM(CASE WHEN b.TagBased = 1 THEN 1 ELSE 0 END),0) AS TagBasedBadges
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName
+), TopUsers AS (
+    SELECT 
+        UserId, DisplayName, GoldBadges, SilverBadges, BronzeBadges, TotalBadges, TagBasedBadges,
+        ROW_NUMBER() OVER (ORDER BY GoldBadges DESC, SilverBadges DESC, BronzeBadges DESC, TotalBadges DESC) AS RankByBadges
+    FROM UserBadgeCounts
+    WHERE TotalBadges > 10
+), PostsWithLinkInfo AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.Tags,
+        pl.LinkTypeId,
+        pl.RelatedPostId,
+        lt.Name AS LinkTypeName
+    FROM Posts p
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+    LEFT JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    WHERE p.PostTypeId IN (1,2) -- questions and answers
+), QuestionsWithAcceptedAnswerInfo AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        a.Score AS AcceptedAnswerScore,
+        a.OwnerUserId AS AcceptedAnswerUserId,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC NULLS LAST) AS RN_UserTopQuestion
+    FROM Posts p
+    LEFT JOIN Posts a ON p.AcceptedAnswerId = a.Id
+    WHERE p.PostTypeId = 1
+), CompetitiveQuestions AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.OwnerUserId,
+        q.AcceptedAnswerId,
+        q.AcceptedAnswerScore,
+        u.DisplayName AS OwnerName,
+        aa_u.DisplayName AS AcceptedAnswerOwnerName,
+        q.RN_UserTopQuestion
+    FROM QuestionsWithAcceptedAnswerInfo q
+    LEFT JOIN Users u ON q.OwnerUserId = u.Id
+    LEFT JOIN Users aa_u ON q.AcceptedAnswerUserId = aa_u.Id
+    WHERE q.Score >= ALL (
+        SELECT Score FROM Posts p2 WHERE p2.OwnerUserId = q.OwnerUserId AND p2.PostTypeId = 1
+    )
+), TaggedPostStats AS (
+    SELECT 
+        unnest(string_to_array(trim(both '<>' FROM Tags), '><')) AS Tag,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 1) AS AvgQuestionScore,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 2) AS AvgAnswerScore
+    FROM Posts p
+    WHERE Tags IS NOT NULL
+    GROUP BY Tag
+), UserActivityWindows AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        p.PostTypeId,
+        COUNT(p.Id) AS PostsCount,
+        SUM(p.Score) AS TotalPostScore,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY MAX(p.CreationDate) DESC) AS RecentActivityRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id, u.DisplayName, p.PostTypeId
+), CorrelatedCloseVotes AS (
+    SELECT 
+        ph.PostId,
+        ph.CreationDate,
+        ph.UserId,
+        crt.Name AS CloseReasonName,
+        COUNT(*) OVER (PARTITION BY ph.PostId) AS CloseVoteCount
+    FROM PostHistory ph
+    INNER JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id AND ph.PostHistoryTypeId = 10
+    LEFT JOIN CloseReasonTypes crt ON ph.Comment::int = crt.Id
+    WHERE ph.PostId IS NOT NULL
+), UnionRecentHotQuestions AS (
+    SELECT Id, Title, CreationDate, Score FROM Posts WHERE Id IN (
+        SELECT PostId FROM PostHistory WHERE PostHistoryTypeId = 52 -- SelectedHotQuestion
+        AND CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '30 days'
+    )
+    UNION
+    SELECT Id, Title, CreationDate, Score FROM Posts WHERE Score >= 1000 AND PostTypeId = 1
+)
+SELECT 
+    tu.UserId,
+    tu.DisplayName,
+    tu.GoldBadges,
+    tu.SilverBadges,
+    tu.BronzeBadges,
+    tu.TotalBadges,
+    tu.TagBasedBadges,
+    pq.QuestionId,
+    pq.Title AS TopQuestionTitle,
+    pq.Score AS TopQuestionScore,
+    pq.ViewCount AS TopQuestionViews,
+    pq.AcceptedAnswerScore,
+    pq.OwnerName AS QuestionOwnerName,
+    pq.AcceptedAnswerOwnerName,
+    tps.Tag,
+    tps.QuestionCount,
+    tps.AnswerCount,
+    COALESCE(tps.AvgQuestionScore,0) AS AvgQuestionScore,
+    COALESCE(tps.AvgAnswerScore,0) AS AvgAnswerScore,
+    uaw.PostTypeId,
+    uaw.PostsCount,
+    uaw.TotalPostScore,
+    ccv.CloseVoteCount,
+    ccv.CloseReasonName,
+    uhq.Id AS HotQuestionId,
+    uhq.Title AS HotQuestionTitle,
+    uhq.CreationDate AS HotQuestionCreationDate,
+    uhq.Score AS HotQuestionScore
+FROM TopUsers tu
+LEFT JOIN CompetitiveQuestions pq ON pq.OwnerUserId = tu.UserId AND pq.RN_UserTopQuestion = 1
+LEFT JOIN TaggedPostStats tps ON tps.Tag IN (
+    SELECT unnest(string_to_array(trunc_tags, '><')) FROM (
+        SELECT substring(t.Tags, 2, length(t.Tags)-2) AS trunc_tags FROM Posts t WHERE t.OwnerUserId = tu.UserId LIMIT 1
+    ) sub
+)
+LEFT JOIN UserActivityWindows uaw ON uaw.UserId = tu.UserId
+LEFT JOIN LATERAL (
+    SELECT CloseVoteCount, CloseReasonName
+    FROM CorrelatedCloseVotes
+    WHERE PostId = pq.QuestionId
+    ORDER BY CreationDate DESC 
+    LIMIT 1
+) ccv ON TRUE
+LEFT JOIN UnionRecentHotQuestions uhq ON uhq.Title LIKE '%' || COALESCE(pq.Title, '') || '%'
+WHERE tu.RankByBadges <= 20
+ORDER BY tu.GoldBadges DESC, tu.SilverBadges DESC, tu.BronzeBadges DESC, pq.Score DESC NULLS LAST
+LIMIT 100;

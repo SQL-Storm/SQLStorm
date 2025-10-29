@@ -1,0 +1,164 @@
+WITH PostInteraction AS (
+    SELECT
+        p.Id AS PostId,
+        pt.Name AS PostTypeName,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.CommunityOwnedDate,
+        COUNT(DISTINCT c.Id) AS CommentCountTotal,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn_user_post
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE p.PostTypeId IN (1, 2)
+    GROUP BY
+        p.Id,
+        pt.Name,
+        p.OwnerUserId,
+        u.DisplayName,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.CommunityOwnedDate
+),
+RecentPostActivity AS (
+    SELECT
+        ph.PostId,
+        MAX(ph.CreationDate) AS LastEditDate,
+        COUNT(DISTINCT ph.Id) AS HistoryCount
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (2, 4, 5, 8)
+    GROUP BY ph.PostId
+),
+UserEngagement AS (
+    SELECT
+        pi.OwnerUserId,
+        COUNT(DISTINCT pi.PostId) AS PostsOwned,
+        SUM(pi.Score) AS TotalScore,
+        AVG(pi.Score) AS AvgScore,
+        SUM(pi.ViewCount) AS TotalViews,
+        AVG(pi.FavoriteCount) AS AvgFavorites,
+        COUNT(DISTINCT CASE WHEN pi.ClosedDate IS NOT NULL THEN pi.PostId ELSE NULL END) AS ClosedPosts,
+        SUM(CASE WHEN pi.rn_user_post <= 5 THEN 1 ELSE 0 END) AS RecentPostsCount
+    FROM PostInteraction pi
+    WHERE pi.OwnerUserId IS NOT NULL AND pi.rn_user_post <= 50
+    GROUP BY pi.OwnerUserId
+),
+PostDetails AS (
+    SELECT
+        pi.PostId,
+        pi.PostTypeName,
+        pi.OwnerUserId,
+        pi.OwnerDisplayName,
+        pi.CreationDate,
+        pi.Score,
+        pi.ViewCount,
+        pi.AnswerCount,
+        pi.CommentCountTotal,
+        pi.UpVoteCount,
+        pi.DownVoteCount,
+        pi.ClosedDate,
+        pi.CommunityOwnedDate,
+        rpa.LastEditDate,
+        rpa.HistoryCount,
+        ue.PostsOwned,
+        ue.TotalScore,
+        ue.AvgScore,
+        ue.TotalViews,
+        ue.AvgFavorites,
+        ue.ClosedPosts,
+        ue.RecentPostsCount,
+        CASE
+            WHEN pi.Score > 100 AND pi.AnswerCount > 10 THEN 'Highly Engaged Question'
+            WHEN pi.Score < 0 THEN 'Controversial Post'
+            WHEN pi.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+            WHEN pi.ClosedDate IS NOT NULL THEN 'Closed Post'
+            ELSE 'Standard Post'
+        END AS PostStatusCategory,
+        LOWER(COALESCE(u.Location, 'Unknown')) AS UserLocation,
+        CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - u.CreationDate)) / 86400 AS INTEGER) AS UserAgeInDays,
+        CASE
+            WHEN u.WebsiteUrl IS NOT NULL AND u.WebsiteUrl <> '' THEN 'Has Website'
+            ELSE 'No Website'
+        END AS UserWebsiteStatus,
+        SUBSTRING(u.AboutMe FROM 1 FOR 50) AS AboutMeSnippet
+    FROM PostInteraction pi
+    LEFT JOIN RecentPostActivity rpa ON pi.PostId = rpa.PostId
+    LEFT JOIN UserEngagement ue ON pi.OwnerUserId = ue.OwnerUserId
+    LEFT JOIN Users u ON pi.OwnerUserId = u.Id
+    WHERE pi.PostTypeName = 'Question'
+)
+SELECT
+    pd.PostId,
+    pd.PostTypeName,
+    pd.OwnerUserId,
+    pd.OwnerDisplayName,
+    pd.CreationDate,
+    pd.Score,
+    pd.ViewCount,
+    pd.AnswerCount,
+    pd.CommentCountTotal,
+    pd.UpVoteCount,
+    pd.DownVoteCount,
+    pd.ClosedDate,
+    pd.CommunityOwnedDate,
+    pd.LastEditDate,
+    pd.HistoryCount,
+    pd.PostsOwned,
+    pd.TotalScore,
+    pd.AvgScore,
+    pd.TotalViews,
+    pd.AvgFavorites,
+    pd.ClosedPosts,
+    pd.RecentPostsCount,
+    pd.PostStatusCategory,
+    pd.UserLocation,
+    pd.UserAgeInDays,
+    pd.UserWebsiteStatus,
+    pd.AboutMeSnippet,
+    CASE
+        WHEN pd.AvgScore IS NOT NULL AND pd.AvgScore > 5 THEN 'High Performer'
+        WHEN pd.ClosedPosts > 0 AND pd.PostsOwned > 10 THEN 'Experienced but has Closed Content'
+        WHEN pd.HistoryCount > 5 THEN 'Frequently Edited'
+        ELSE 'Standard Performer'
+    END AS PerformanceTier,
+    (
+        'User ' ||
+        pd.OwnerDisplayName ||
+        ' created a ' ||
+        pd.PostTypeName ||
+        ' on ' ||
+        TO_CHAR(CAST(pd.CreationDate AS TIMESTAMP), 'YYYY-MM-DD') ||
+        ' with a score of ' ||
+        CAST(pd.Score AS varchar) ||
+        '. It has ' ||
+        CAST(pd.AnswerCount AS varchar) ||
+        ' answers and ' ||
+        CAST(pd.CommentCountTotal AS varchar) ||
+        ' comments. User has ' ||
+        CAST(pd.PostsOwned AS varchar) ||
+        ' posts owned, with an average score of ' ||
+        COALESCE(CAST(pd.AvgScore AS varchar), 'NULL') ||
+        '.'
+    ) AS DescriptiveSummary
+FROM PostDetails pd
+WHERE pd.OwnerUserId IS NOT NULL
+  AND pd.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year')
+  AND pd.UserAgeInDays > 365
+ORDER BY pd.Score DESC, pd.CreationDate DESC
+LIMIT 1000;

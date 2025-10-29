@@ -1,0 +1,15 @@
+title: SQLStorm v2.0 Umbra Benchmark (24h)
+repetitions: 1
+warmup: 0
+timeout: 10
+fetch_result: false
+global_timeout: 86400
+query_seed: 42
+output: results/v2.0/umbra
+systems:
+  - title: Umbra
+    dbms: umbra
+    settings:
+      usedirectio: true
+    parameter:
+      version: "25.10"

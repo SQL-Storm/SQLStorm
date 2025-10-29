@@ -1,0 +1,50 @@
+-- {"query": "6954.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-micro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 784} 
+
+SELECT 
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id ELSE NULL END) AS TotalQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id ELSE NULL END) AS TotalAnswers,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 3 THEN p.Id ELSE NULL END) AS TotalWikis,
+    SUM(p.Score) AS TotalScore,
+    SUM(p.ViewCount) AS TotalViews,
+    MAX(p.LastActivityDate) AS LastActivity,
+    MAX(CASE WHEN p.PostTypeId = 1 THEN pl.RelatedPostId ELSE NULL END) AS MostRecentAcceptedAnswer,
+    AVG(p.Score) AS AvgScorePerPost,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate ELSE NULL END) AS LastClosedPost,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.CreationDate ELSE NULL END) AS LastReopenedPost,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 12 THEN ph.CreationDate ELSE NULL END) AS LastDeletedPost,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 13 THEN ph.CreationDate ELSE NULL END) AS LastUndeletedPost,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 14 THEN ph.CreationDate ELSE NULL END) AS LastLockedPost,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 15 THEN ph.CreationDate ELSE NULL END) AS LastUnlockedPost,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 33 THEN ph.CreationDate ELSE NULL END) AS LastPostNoticeAdded,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 34 THEN ph.CreationDate ELSE NULL END) AS LastPostNoticeRemoved,
+    MAX(CASE WHEN v.VoteTypeId = 8 THEN v.BountyAmount ELSE NULL END) AS MaxBountyAmount,
+    COUNT(DISTINCT b.Id) AS TotalBadges,
+    SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+    SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+    SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+    MAX(c.CreationDate) AS LastComment,
+    MAX(CASE WHEN t.TagName LIKE '%database%' THEN t.Count ELSE NULL END) AS DatabaseTagCount,
+    MAX(CASE WHEN t.TagName LIKE '%sql%' THEN t.Count ELSE NULL END) AS SqlTagCount
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    PostLinks pl ON p.Id = pl.PostId AND pl.LinkTypeId = 3
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+LEFT JOIN 
+    Comments c ON p.Id = c.PostId
+LEFT JOIN 
+    Tags t ON p.Tags IS NOT NULL AND t.Id = ANY(STRING_TO_ARRAY(p.Tags, '/><')::int[])
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+GROUP BY 
+    u.Id
+ORDER BY 
+    u.Reputation DESC;

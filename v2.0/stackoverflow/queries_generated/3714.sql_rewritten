@@ -1,0 +1,138 @@
+-- {"query": "3714.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2265} 
+-- Benchmark query: combines CTEs, window functions, lateral joins, outer joins,
+-- correlated subqueries, set operators and complex predicates.
+WITH
+-- 1. Aggregate user statistics
+user_stats AS (
+    SELECT
+        u.id                              AS user_id,
+        u.displayname                     AS display_name,
+        u.reputation,
+        COALESCE(SUM(p.score),0)           AS total_post_score,
+        COUNT(DISTINCT CASE WHEN b.class = 1 THEN b.id END) AS gold_badge_cnt,
+        COUNT(DISTINCT CASE WHEN b.class = 2 THEN b.id END) AS silver_badge_cnt,
+        COUNT(DISTINCT CASE WHEN b.class = 3 THEN b.id END) AS bronze_badge_cnt,
+        MAX(p.creationdate)               AS last_post_dt,
+        MAX(v.creationdate)               AS last_vote_dt
+    FROM users u
+    LEFT JOIN posts   p ON p.owneruserid = u.id
+    LEFT JOIN badges  b ON b.userid      = u.id
+    LEFT JOIN votes   v ON v.userid      = u.id
+    GROUP BY u.id, u.displayname, u.reputation
+),
+
+-- 2. Rank users by reputation (only the very high‑rep crowd)
+top_users AS (
+    SELECT
+        us.*,
+        ROW_NUMBER() OVER (ORDER BY us.reputation DESC, us.gold_badge_cnt DESC) AS rn
+    FROM user_stats us
+    WHERE us.reputation > 50000
+),
+
+-- 3. Question‑level statistics (answers, comments, close reason, etc.)
+question_stats AS (
+    SELECT
+        q.id                                   AS q_id,
+        q.owneruserid                          AS owner_user_id,
+        q.title,
+        q.creationdate,
+        q.score,
+        q.viewcount,
+        q.answercount,
+        q.favoritecount,
+        COALESCE(a.ans_cnt,0)                  AS real_answer_cnt,
+        COALESCE(c.cmt_cnt,0)                  AS comment_cnt,
+        CASE WHEN q.closeddate IS NOT NULL THEN 1 ELSE 0 END   AS is_closed,
+        COALESCE(cr.name,'')                   AS close_reason_name,
+        ROW_NUMBER() OVER (PARTITION BY q.owneruserid
+                           ORDER BY q.score DESC)          AS user_q_rank
+    FROM posts q
+    -- answers per question
+    LEFT JOIN (
+        SELECT parentid, COUNT(*) AS ans_cnt
+        FROM posts
+        WHERE posttypeid = 2                -- answers
+        GROUP BY parentid
+    ) a ON a.parentid = q.id
+    -- comments per post
+    LEFT JOIN (
+        SELECT postid, COUNT(*) AS cmt_cnt
+        FROM comments
+        GROUP BY postid
+    ) c ON c.postid = q.id
+    -- close reason (if any)
+    LEFT JOIN posthistory ph
+          ON ph.postid = q.id
+         AND ph.posthistorytypeid = 10            -- Post Closed
+    LEFT JOIN closereasontypes cr
+          ON cr.id = CAST(ph.comment AS SMALLINT)
+    WHERE q.posttypeid = 1                         -- questions only
+),
+
+-- 4. Tag popularity (tags extracted from the Posts.Tags CSV‑style column)
+tag_popularity AS (
+    SELECT
+        t.tag_name,
+        COUNT(*)                                  AS tag_use_cnt,
+        COALESCE(SUM(p.score),0)                  AS total_score,
+        ROW_NUMBER() OVER (ORDER BY COUNT(*) DESC) AS tag_rank
+    FROM posts p
+    CROSS JOIN LATERAL
+         regexp_split_to_table(p.tags, '[><]') AS t(tag_name)
+    WHERE p.posttypeid = 1                -- only questions have the tag list
+      AND t.tag_name <> ''                -- guard against empty strings
+    GROUP BY t.tag_name
+),
+
+-- 5. Assemble the final result: top users + their best question + most popular tag
+final_set AS (
+    SELECT
+        tu.user_id,
+        tu.display_name,
+        tu.reputation,
+        tu.gold_badge_cnt,
+        q.q_id          AS top_question_id,
+        q.title         AS top_question_title,
+        q.score         AS top_question_score,
+        q.real_answer_cnt AS top_question_answer_cnt,
+        q.is_closed,
+        q.close_reason_name,
+        tp.tag_name     AS top_tag,
+        tp.tag_use_cnt  AS top_tag_use_cnt
+    FROM top_users tu
+    LEFT JOIN LATERAL (
+        SELECT *
+        FROM question_stats qs
+        WHERE qs.owner_user_id = tu.user_id
+        ORDER BY qs.score DESC
+        LIMIT 1
+    ) q ON true
+    LEFT JOIN LATERAL (
+        SELECT *
+        FROM tag_popularity tp
+        ORDER BY tp.total_score DESC
+        LIMIT 1
+    ) tp ON true
+    WHERE tu.rn <= 20
+)
+
+-- 6. Combine with a dummy row set to test UNION ALL and sorting of NULLs
+SELECT *
+FROM final_set
+UNION ALL
+SELECT
+    NULL::int      AS user_id,
+    NULL::text     AS display_name,
+    NULL::int      AS reputation,
+    NULL::int      AS gold_badge_cnt,
+    NULL::int      AS top_question_id,
+    NULL::text     AS top_question_title,
+    NULL::int      AS top_question_score,
+    NULL::int      AS top_question_answer_cnt,
+    NULL::int      AS is_closed,
+    NULL::text     AS close_reason_name,
+    NULL::text     AS top_tag,
+    NULL::int      AS top_tag_use_cnt
+ORDER BY reputation DESC NULLS LAST
+LIMIT 30;

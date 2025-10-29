@@ -1,0 +1,268 @@
+-- {"query": "755.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3105} 
+with recent_users as (
+  select u.id as user_id,
+         u.displayname,
+         u.reputation,
+         u.creationdate,
+         coalesce(nullif(trim(split_part(coalesce(u.location,''), ',', 1)), ''), 'Unknown') as region_hint,
+         row_number() over (order by u.creationdate desc, u.id desc) as rn
+  from users u
+  where u.creationdate >= (select max(creationdate) - interval '730 days' from users)
+),
+badge_stats as (
+  select b.userid,
+         count(*) as total_badges,
+         sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+         sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+         sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+         sum(case when b.tagbased = 1 then 1 else 0 end) as tag_badges,
+         min(b.date) as first_badge_date,
+         max(b.date) as last_badge_date
+  from badges b
+  group by b.userid
+),
+user_posts as (
+  select p.owneruserid as user_id,
+         count(*) filter (where p.posttypeid = 1) as questions,
+         count(*) filter (where p.posttypeid = 2) as answers,
+         sum(coalesce(p.score,0)) as post_score_sum,
+         sum(coalesce(p.viewcount,0)) as total_views,
+         max(p.lastactivitydate) as last_activity,
+         sum(case when p.closeddate is not null then 1 else 0 end) as closed_posts
+  from posts p
+  where p.owneruserid is not null
+  group by p.owneruserid
+),
+accepted_answers as (
+  select q.owneruserid as asker_id,
+         a.owneruserid as answerer_id,
+         count(*) as accepted_count,
+         sum(coalesce(a.score,0)) as accepted_score_sum
+  from posts q
+  join posts a on a.id = q.acceptedanswerid and a.posttypeid = 2
+  where q.posttypeid = 1
+  group by q.owneruserid, a.owneruserid
+),
+user_vote_agg as (
+  select v.userid as user_id,
+         count(*) filter (where v.votetypeid = 2) as upvotes_cast,
+         count(*) filter (where v.votetypeid = 3) as downvotes_cast,
+         sum(coalesce(v.bountyamount,0)) filter (where v.votetypeid in (8,9)) as bounty_total,
+         min(v.creationdate) as first_vote,
+         max(v.creationdate) as last_vote
+  from votes v
+  where v.userid is not null
+  group by v.userid
+),
+comment_stats as (
+  select c.userid as user_id,
+         count(*) as comments_made,
+         sum(coalesce(c.score,0)) as comment_score_sum,
+         max(c.creationdate) as last_comment_at
+  from comments c
+  where c.userid is not null
+  group by c.userid
+),
+tag_expertise as (
+  select p.owneruserid as user_id,
+         lower(unnest(string_to_array(substring(p.tags, 2, greatest(length(p.tags)-2,0)), '><'))) as tag_name,
+         count(*) as tag_posts,
+         sum(coalesce(p.score,0)) as tag_score
+  from posts p
+  where p.posttypeid = 1
+    and p.owneruserid is not null
+    and p.tags is not null
+  group by p.owneruserid, lower(unnest(string_to_array(substring(p.tags, 2, greatest(length(p.tags)-2,0)), '><')))
+),
+top_tag as (
+  select te.user_id,
+         (array_agg(te.tag_name order by te.tag_score desc, te.tag_posts desc, te.tag_name asc))[1] as top_tag,
+         (array_agg(te.tag_score order by te.tag_score desc, te.tag_posts desc, te.tag_name asc))[1] as top_tag_score,
+         (array_agg(te.tag_posts order by te.tag_score desc, te.tag_posts desc, te.tag_name asc))[1] as top_tag_posts
+  from (
+    select user_id, tag_name,
+           tag_posts,
+           tag_score,
+           row_number() over (partition by user_id order by tag_score desc, tag_posts desc, tag_name asc) as rn
+    from tag_expertise
+  ) te
+  where te.rn <= 5
+  group by te.user_id
+),
+question_hotness as (
+  select p.id as post_id,
+         p.owneruserid as user_id,
+         p.creationdate,
+         p.viewcount,
+         p.score,
+         p.answercount,
+         -- simple hotness heuristic
+         (coalesce(p.viewcount,0) * 0.001 + coalesce(p.score,0) * 3 + coalesce(p.answercount,0) * 2) /
+         nullif(extract(epoch from (now() - coalesce(p.creationdate, now())))/3600.0 + 2, 0) as hotness
+  from posts p
+  where p.posttypeid = 1
+),
+user_hot_posts as (
+  select q.user_id,
+         avg(q.hotness) as avg_hotness,
+         max(q.hotness) as max_hotness,
+         count(*) filter (where q.hotness > 1) as hot_questions_over_1
+  from question_hotness q
+  group by q.user_id
+),
+postlink_dupes as (
+  select pl.postid,
+         count(*) filter (where pl.linktypeid = 3) as dupes_marked,
+         count(*) filter (where pl.linktypeid = 1) as linked_refs
+  from postlinks pl
+  group by pl.postid
+),
+closed_reasons as (
+  select ph.postid,
+         max(case when ph.posthistorytypeid = 10 then ph.comment end) as close_reason_id_text,
+         max(ph.creationdate) filter (where ph.posthistorytypeid = 10) as closed_at
+  from posthistory ph
+  where ph.posthistorytypeid in (10,11,12,13,14,15,19,20,35)
+  group by ph.postid
+),
+user_closure_mix as (
+  select p.owneruserid as user_id,
+         sum(case when cr.close_reason_id_text in ('101','102','103','104','105') then 1 else 0 end) as modern_closures,
+         sum(case when cr.close_reason_id_text in ('1','2','3','4','7','10','20') then 1 else 0 end) as legacy_closures
+  from posts p
+  left join closed_reasons cr on cr.postid = p.id
+  where p.owneruserid is not null
+  group by p.owneruserid
+),
+activity_streaks as (
+  select p.owneruserid as user_id,
+         date_trunc('day', p.lastactivitydate) as activity_day,
+         count(*) as posts_touched
+  from posts p
+  where p.owneruserid is not null
+    and p.lastactivitydate is not null
+  group by p.owneruserid, date_trunc('day', p.lastactivitydate)
+),
+streak_calc as (
+  select user_id,
+         max(streak_len) as max_streak_days
+  from (
+    select user_id,
+           activity_day,
+           sum(is_new_streak::int) over (partition by user_id order by activity_day) as streak_group,
+           count(*) over (partition by user_id, sum(is_new_streak::int) over (partition by user_id order by activity_day)) as streak_len
+    from (
+      select a.user_id,
+             a.activity_day,
+             case
+               when lag(a.activity_day) over (partition by a.user_id order by a.activity_day) = a.activity_day - interval '1 day'
+               then 0 else 1
+             end as is_new_streak
+      from activity_streaks a
+    ) s1
+  ) s2
+  group by user_id
+),
+recent_q_activity as (
+  select p.owneruserid as user_id,
+         sum(case when p.creationdate >= now() - interval '90 days' and p.posttypeid = 1 then 1 else 0 end) as questions_90d,
+         sum(case when p.creationdate >= now() - interval '90 days' and p.posttypeid = 2 then 1 else 0 end) as answers_90d
+  from posts p
+  where p.owneruserid is not null
+  group by p.owneruserid
+),
+user_rank as (
+  select ru.user_id,
+         dense_rank() over (order by coalesce(bs.total_badges,0) desc, coalesce(up.post_score_sum,0) desc, coalesce(uv.upvotes_cast,0) desc, ru.reputation desc) as merit_rank
+  from recent_users ru
+  left join badge_stats bs on bs.userid = ru.user_id
+  left join user_posts up on up.user_id = ru.user_id
+  left join user_vote_agg uv on uv.user_id = ru.user_id
+),
+name_norm as (
+  select u.id as user_id,
+         trim(regexp_replace(coalesce(u.displayname, ''), '\s+', ' ', 'g')) as norm_name,
+         case when position('@' in coalesce(u.websiteurl,'')) > 0 then substring(u.websiteurl from 'https?://([^/]+)') else null end as domain
+  from users u
+)
+select
+  ru.user_id,
+  nn.norm_name as display_name,
+  ru.region_hint,
+  ru.creationdate as user_since,
+  coalesce(bs.total_badges,0) as total_badges,
+  coalesce(bs.gold_badges,0) as gold_badges,
+  coalesce(bs.silver_badges,0) as silver_badges,
+  coalesce(bs.bronze_badges,0) as bronze_badges,
+  coalesce(bs.tag_badges,0) as tag_badges,
+  coalesce(up.questions,0) as total_questions,
+  coalesce(up.answers,0) as total_answers,
+  coalesce(up.post_score_sum,0) as total_post_score,
+  coalesce(up.total_views,0) as total_views,
+  coalesce(up.closed_posts,0) as closed_posts,
+  coalesce(uv.upvotes_cast,0) as upvotes_cast,
+  coalesce(uv.downvotes_cast,0) as downvotes_cast,
+  coalesce(uv.bounty_total,0) as bounty_spent,
+  coalesce(cs.comments_made,0) as comments_made,
+  coalesce(cs.comment_score_sum,0) as comment_score_sum,
+  coalesce(tt.top_tag, 'none') as top_tag,
+  coalesce(tt.top_tag_score,0) as top_tag_score,
+  coalesce(tt.top_tag_posts,0) as top_tag_posts,
+  coalesce(uh.avg_hotness,0) as avg_hotness,
+  coalesce(uh.max_hotness,0) as max_hotness,
+  coalesce(uh.hot_questions_over_1,0) as hot_questions_over_1,
+  coalesce(ucm.modern_closures,0) as modern_closures,
+  coalesce(ucm.legacy_closures,0) as legacy_closures,
+  coalesce(sc.max_streak_days,0) as max_streak_days,
+  coalesce(rqa.questions_90d,0) as questions_last_90d,
+  coalesce(rqa.answers_90d,0) as answers_last_90d,
+  ur.merit_rank,
+  -- correlated subquery: proportion of user's answers that are accepted
+  coalesce((
+    select round(100.0 * sum(case when q.acceptedanswerid = a.id then 1 else 0 end)::numeric
+                 / nullif(count(*)::numeric,0), 2)
+    from posts a
+    join posts q on q.id = a.parentid and q.posttypeid = 1
+    where a.posttypeid = 2 and a.owneruserid = ru.user_id
+  ), 0.0) as answer_accept_rate_pct,
+  -- null-safe derived efficiency
+  round(
+    case when coalesce(up.answers,0) = 0 then 0
+         else greatest(0, coalesce(aa.accepted_count,0))::numeric / up.answers
+    end, 4
+  ) as acceptance_efficiency,
+  -- string expressions and null logic
+  coalesce(nn.domain, 'unknown.domain') as website_domain_sample
+from recent_users ru
+left join badge_stats bs on bs.userid = ru.user_id
+left join user_posts up on up.user_id = ru.user_id
+left join user_vote_agg uv on uv.user_id = ru.user_id
+left join comment_stats cs on cs.user_id = ru.user_id
+left join top_tag tt on tt.user_id = ru.user_id
+left join user_hot_posts uh on uh.user_id = ru.user_id
+left join user_closure_mix ucm on ucm.user_id = ru.user_id
+left join streak_calc sc on sc.user_id = ru.user_id
+left join recent_q_activity rqa on rqa.user_id = ru.user_id
+left join user_rank ur on ur.user_id = ru.user_id
+left join name_norm nn on nn.user_id = ru.user_id
+left join (
+  select answerer_id, sum(accepted_count) as accepted_count
+  from accepted_answers
+  group by answerer_id
+) aa on aa.answerer_id = ru.user_id
+where
+  -- complex predicates
+  (coalesce(bs.total_badges,0) > 0 or coalesce(up.post_score_sum,0) > 50 or coalesce(uv.upvotes_cast,0) > 25)
+  and coalesce(rqa.questions_90d,0) + coalesce(rqa.answers_90d,0) >= 0
+  and (nn.norm_name is null or length(nn.norm_name) >= 1)
+  and (
+    ru.reputation >= 100
+    or (coalesce(up.answers,0) >= 10 and coalesce(uv.upvotes_cast,0) >= 10)
+    or (coalesce(uh.max_hotness,0) > 2.5 and coalesce(tt.top_tag_posts,0) >= 3)
+  )
+order by
+  ur.merit_rank nulls last,
+  coalesce(uh.max_hotness,0) desc,
+  coalesce(up.post_score_sum,0) desc,
+  ru.user_id
+limit 500;

@@ -1,0 +1,75 @@
+-- {"query": "5110.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 596} 
+SELECT
+  u.DisplayName AS UserName,
+  u.Reputation,
+  p.Id AS PostId,
+  p.Title,
+  p.Tags,
+  p.PostTypeId,
+  p.CreationDate,
+  p.LastActivityDate,
+  pv.Score AS CurrentScore,
+  pv.VoteTypeName,
+  c.Count as CommentCountOnPost,
+  COALESCE(b.BadgeCount, 0) AS GoldBadgesOnUser,
+  b2.TagBadgeCount,
+  gd.LastEditorDisplayName,
+  gd.LastEditDate,
+  wl.LastLikeDate,
+  CASE
+    WHEN p.ViewCount IS NULL THEN 0
+    ELSE p.ViewCount
+  END AS ViewCount,
+  CASE
+    WHEN p.ParentId IS NULL THEN 'Root'
+    ELSE 'HasParent'
+  END AS PostHierarchy,
+  array_to_string(string_to_array(p.Tags, '><'), ',') AS TagList,
+  CASE
+    WHEN p.AcceptedAnswerId IS NOT NULL THEN p.AcceptedAnswerId
+    ELSE NULL
+  END AS AcceptedAnswerId
+FROM
+  Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN (
+    SELECT PostId, MAX(CreationDate) AS LastLikeDate
+    FROM Votes
+    WHERE VoteTypeId = 6 -- Close (rare here) or adapt as needed
+    GROUP BY PostId
+  ) wl ON wl.PostId = p.Id
+  LEFT JOIN (
+    SELECT PostId, SUM(Score) AS Score
+    FROM Votes
+    GROUP BY PostId
+  ) pv ON pv.PostId = p.Id
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS Count
+    FROM Comments
+    GROUP BY PostId
+  ) c ON c.PostId = p.Id
+  LEFT JOIN (
+    SELECT OwnerUserId, COUNT(*) AS BadgeCount
+    FROM Badges
+    WHERE Class = 1 -- Gold
+    GROUP BY OwnerUserId
+  ) b ON b.OwnerUserId = u.Id
+  LEFT JOIN (
+    SELECT OwnerUserId, COUNT(*) AS TagBadgeCount
+    FROM Badges
+    WHERE TagBased = TRUE
+    GROUP BY OwnerUserId
+  ) b2 ON b2.OwnerUserId = u.Id
+  LEFT JOIN (
+    SELECT Id, UserId, UserDisplayName, LastEditDate, LastEditorDisplayName
+    FROM Posts
+    WHERE Id IS NOT NULL
+  ) gd ON gd.UserId = u.Id
+WHERE
+  p.CreationDate >= (CURRENT_DATE - INTERVAL '365 days')
+  AND (p.PostTypeId = 1 OR p.PostTypeId = 2)
+  AND (p.Tags LIKE '%<sql>%'
+       OR p.Title ILIKE '%benchmark%')
+ORDER BY
+  p.CreationDate DESC
+LIMIT 100;

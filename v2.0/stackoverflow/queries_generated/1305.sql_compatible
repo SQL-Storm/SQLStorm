@@ -1,0 +1,174 @@
+WITH RecentHighlyVotedQuestions AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.CreationDate AS QuestionCreationDate,
+        p.LastActivityDate AS QuestionLastActivityDate,
+        p.Score AS QuestionScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.AcceptedAnswerId,
+        p.Title,
+        p.Tags,
+        COALESCE(p.OwnerDisplayName, u.DisplayName, 'Community') AS OwnerDisplayName,
+        (p.Score * 5 + COALESCE(p.ViewCount, 0) / NULLIF(10, 0) + COALESCE(p.AnswerCount, 0) * 10 + COALESCE(p.CommentCount, 0) * 2 + COALESCE(p.FavoriteCount, 0) * 20) AS activity_score,
+        ROW_NUMBER() OVER (ORDER BY (p.Score * 5 + COALESCE(p.ViewCount, 0) / 10) DESC, p.CreationDate DESC) AS rn_overall_popularity
+    FROM
+        Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE
+        p.PostTypeId = 1
+        AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 years'
+        AND p.Score >= 10
+        AND p.ViewCount >= 100
+),
+PostCommentActivity AS (
+    SELECT
+        c.PostId,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        SUM(COALESCE(c.Score, 0)) AS TotalCommentScore,
+        AVG(COALESCE(c.Score, 0)) AS AvgCommentScore,
+        MAX(c.CreationDate) AS LastCommentDate,
+        COUNT(CASE WHEN c.UserId IS NOT NULL THEN 1 END) AS NumberOfCommenters,
+        (
+            SELECT COUNT(DISTINCT b.UserId)
+            FROM Comments c_inner
+            JOIN Badges b ON c_inner.UserId = b.UserId
+            JOIN Users u_badge ON b.UserId = u_badge.Id
+            JOIN RecentHighlyVotedQuestions rhvq_owner ON c_inner.PostId = rhvq_owner.PostId
+            JOIN Users u_owner ON rhvq_owner.OwnerUserId = u_owner.Id
+            WHERE c_inner.PostId = c.PostId
+              AND b.Class = 1
+              AND b.TagBased = FALSE
+              AND b.Name LIKE '%Analyst%'
+              AND u_badge.Reputation > u_owner.Reputation * 1.5
+        ) AS GoldBadgeCommentersCount
+    FROM
+        Comments c
+    WHERE
+        c.PostId IN (SELECT PostId FROM RecentHighlyVotedQuestions)
+    GROUP BY
+        c.PostId
+),
+UserPostEditAndBadgeMetrics AS (
+    SELECT
+        ph.PostId,
+        ph.UserId AS EditorUserId,
+        u.DisplayName AS EditorDisplayName,
+        COUNT(ph.Id) AS TotalEdits,
+        MAX(ph.CreationDate) AS LastEditDate,
+        (
+            SELECT COUNT(b_inner.Id)
+            FROM Badges b_inner
+            WHERE b_inner.UserId = u.Id
+              AND b_inner.Class = 1
+              AND b_inner.TagBased = TRUE
+              AND EXISTS (
+                    SELECT 1
+                    FROM unnest(string_to_array(SUBSTRING(q.Tags FROM 2 FOR LENGTH(q.Tags) - 2), '><')) AS post_tag
+                    WHERE b_inner.Name ILIKE '%' || post_tag || '%'
+                  )
+        ) AS GoldTagBadgesForEditor,
+        SUM(COUNT(ph.Id)) OVER (PARTITION BY ph.UserId) AS TotalEditsByUserGlobal,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY MAX(ph.CreationDate) DESC) AS rn_latest_editor_per_post
+    FROM
+        PostHistory ph
+    JOIN Users u ON ph.UserId = u.Id
+    JOIN RecentHighlyVotedQuestions q ON ph.PostId = q.PostId
+    WHERE
+        ph.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9)
+        AND ph.CreationDate >= q.QuestionCreationDate
+    GROUP BY
+        ph.PostId, ph.UserId, u.DisplayName, u.Id, q.Tags
+),
+PostClosureAnalysis AS (
+    SELECT
+        ph.PostId,
+        ph.CreationDate AS EventDate,
+        ph.PostHistoryTypeId,
+        ph.Comment AS EventComment,
+        cr.Name AS CloseReasonName,
+        LEAD(ph.CreationDate, 1) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS NextEventDate,
+        LEAD(ph.PostHistoryTypeId, 1) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS NextEventTypeId
+    FROM
+        PostHistory ph
+    LEFT JOIN CloseReasonTypes cr ON ph.PostHistoryTypeId = 10 AND ph.Comment ~ '^[0-9]+$' AND CAST(ph.Comment AS smallint) = cr.Id
+    WHERE
+        ph.PostHistoryTypeId IN (10, 11)
+),
+TopUsersWithMultipleRoles AS (
+    SELECT OwnerUserId AS UserId, 'Owner' AS Role FROM RecentHighlyVotedQuestions WHERE OwnerUserId IS NOT NULL
+    UNION ALL
+    SELECT UserId, 'Commenter' AS Role FROM Comments WHERE PostId IN (SELECT PostId FROM RecentHighlyVotedQuestions) AND UserId IS NOT NULL
+    UNION ALL
+    SELECT EditorUserId AS UserId, 'Editor' AS Role FROM UserPostEditAndBadgeMetrics WHERE EditorUserId IS NOT NULL
+)
+SELECT
+    rhvq.PostId,
+    rhvq.Title,
+    rhvq.OwnerDisplayName,
+    rhvq.QuestionCreationDate,
+    rhvq.QuestionLastActivityDate,
+    rhvq.QuestionScore,
+    rhvq.ViewCount,
+    rhvq.AnswerCount,
+    pca.TotalComments,
+    pca.AvgCommentScore,
+    pca.LastCommentDate,
+    pca.GoldBadgeCommentersCount,
+    MAX(upem.LastEditDate) AS LastPostEditDate,
+    SUM(upem.TotalEdits) AS TotalUniqueUserEdits,
+    MAX(upem.TotalEditsByUserGlobal) AS MaxEditorEditsAcrossPosts,
+    COUNT(DISTINCT upem.EditorUserId) AS NumberOfEditors,
+    COUNT(DISTINCT CASE WHEN upem.GoldTagBadgesForEditor > 0 THEN upem.EditorUserId END) AS EditorsWithGoldTagBadges,
+    AVG(EXTRACT(EPOCH FROM (rhvq.QuestionLastActivityDate - rhvq.QuestionCreationDate)) / (60 * 60 * 24)) AS AvgPostLifeDays,
+    CASE
+        WHEN rhvq.AnswerCount > 10 AND COALESCE(rhvq.FavoriteCount, 0) > 50 THEN 'High Engagement & Popular'
+        WHEN rhvq.QuestionScore > 50 AND COALESCE(pca.TotalComments, 0) > 20 THEN 'Highly Discussed'
+        WHEN COALESCE(pca.GoldBadgeCommentersCount, 0) > 0 OR COUNT(DISTINCT CASE WHEN upem.GoldTagBadgesForEditor > 0 THEN upem.EditorUserId END) > 0 THEN 'Expert Involved'
+        WHEN rhvq.AcceptedAnswerId IS NOT NULL AND rhvq.AnswerCount > 0 THEN 'Answered & Accepted'
+        ELSE 'General Activity'
+    END AS PostEngagementCategory,
+    DENSE_RANK() OVER (ORDER BY rhvq.activity_score DESC, rhvq.QuestionCreationDate DESC) AS OverallActivityRank,
+    AVG(CASE WHEN pca_close.PostHistoryTypeId = 10 AND pca_close.NextEventTypeId = 11 THEN EXTRACT(EPOCH FROM (pca_close.NextEventDate - pca_close.EventDate)) / (60 * 60 * 24) END) AS AvgDaysClosedBeforeReopen,
+    STRING_AGG(DISTINCT upem.EditorDisplayName, '; ' ORDER BY upem.EditorDisplayName) AS DistinctEditors,
+    (
+        SELECT COUNT(DISTINCT t.UserId)
+        FROM TopUsersWithMultipleRoles t
+        WHERE t.UserId = rhvq.OwnerUserId AND t.Role = 'Owner'
+          AND EXISTS (SELECT 1 FROM TopUsersWithMultipleRoles t2 WHERE t2.UserId = t.UserId AND t2.Role IN ('Commenter', 'Editor'))
+    ) AS OwnerWithMultipleRolesFlag
+FROM
+    RecentHighlyVotedQuestions rhvq
+LEFT JOIN PostCommentActivity pca ON rhvq.PostId = pca.PostId
+LEFT JOIN UserPostEditAndBadgeMetrics upem ON rhvq.PostId = upem.PostId
+LEFT JOIN PostClosureAnalysis pca_close ON rhvq.PostId = pca_close.PostId
+WHERE
+    rhvq.rn_overall_popularity <= 1000
+    AND (
+        rhvq.AcceptedAnswerId IS NOT NULL
+        OR (COALESCE(pca.TotalComments, 0) > 5 AND COALESCE(upem.TotalEdits, 0) > 2)
+    )
+    AND COALESCE(LENGTH(rhvq.Tags), 0) > 2
+GROUP BY
+    rhvq.PostId,
+    rhvq.Title,
+    rhvq.OwnerDisplayName,
+    rhvq.QuestionCreationDate,
+    rhvq.QuestionLastActivityDate,
+    rhvq.QuestionScore,
+    rhvq.ViewCount,
+    rhvq.AnswerCount,
+    rhvq.FavoriteCount,
+    rhvq.activity_score,
+    rhvq.AcceptedAnswerId,
+    pca.TotalComments,
+    pca.AvgCommentScore,
+    pca.LastCommentDate,
+    pca.GoldBadgeCommentersCount,
+    rhvq.Tags
+ORDER BY
+    OverallActivityRank ASC, rhvq.QuestionScore DESC
+LIMIT 500;

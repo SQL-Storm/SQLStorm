@@ -1,0 +1,144 @@
+-- {"query": "1058.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2254} 
+WITH UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.UpVotes,
+        u.DownVotes,
+        u.Views AS UserProfileViews,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC, u.UpVotes DESC, u.LastAccessDate DESC) AS ReputationRank,
+        -- Complex calculation for user engagement score, factoring in reputation, votes, and account age.
+        (u.Reputation + u.UpVotes * 2 - u.DownVotes * 0.5) * (1.0 + EXTRACT(EPOCH FROM (u.LastAccessDate - u.CreationDate)) / 31536000.0 / 100.0) AS UserEngagementScore,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        MAX(CASE WHEN b.Name LIKE '%Analyst%' OR b.Name LIKE '%Contributor%' THEN 1 ELSE 0 END) AS IsSpecializedUser
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000 AND u.Views > 50 AND u.DisplayName IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.UpVotes, u.DownVotes, u.Views
+),
+PostEngagementDetails AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title AS QuestionTitle,
+        q.CreationDate AS QuestionCreationDate,
+        q.Score AS QuestionScore,
+        q.ViewCount AS QuestionViewCount,
+        q.OwnerUserId AS QuestionOwnerId,
+        q.Tags,
+        q.AnswerCount,
+        a.Id AS AcceptedAnswerId,
+        a.CreationDate AS AcceptedAnswerCreationDate,
+        a.Score AS AcceptedAnswerScore,
+        -- Time taken for an answer to be accepted in hours
+        EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate)) / 3600.0 AS TimeToAcceptAnswerHours,
+        -- Running average of question scores for a user, ordered by creation date
+        AVG(q.Score) OVER (PARTITION BY q.OwnerUserId ORDER BY q.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS RunningAvgQuestionScoreByOwner,
+        -- Number of tags, handling NULLs and string splitting
+        COALESCE(ARRAY_LENGTH(string_to_array(SUBSTRING(q.Tags, 2, LENGTH(q.Tags) - 2), '><'), 1), 0) AS NumberOfTags,
+        -- Count of duplicate links for this question
+        SUM(CASE WHEN pl_dup.LinkTypeId = 3 THEN 1 ELSE 0 END) OVER (PARTITION BY q.Id) AS DuplicateLinkCount,
+        -- Count of how many other posts link to this question
+        SUM(CASE WHEN pl_linked.LinkTypeId = 1 THEN 1 ELSE 0 END) OVER (PARTITION BY q.Id) AS LinkedFromOtherPostsCount
+    FROM Posts q
+    INNER JOIN Posts a ON q.AcceptedAnswerId = a.Id -- Only questions with accepted answers
+    LEFT JOIN PostLinks pl_dup ON q.Id = pl_dup.PostId AND pl_dup.LinkTypeId = 3
+    LEFT JOIN PostLinks pl_linked ON q.Id = pl_linked.RelatedPostId AND pl_linked.LinkTypeId = 1
+    WHERE q.PostTypeId = 1
+      AND q.Score > 50
+      AND q.ViewCount > 1000
+      AND q.Title IS NOT NULL
+      AND q.AcceptedAnswerId IS NOT NULL
+),
+PostHistoryAudit AS (
+    SELECT
+        ph.PostId,
+        MAX(ph.CreationDate) AS LastHistoryDate,
+        MIN(ph.CreationDate) AS FirstHistoryDate,
+        COUNT(ph.Id) AS TotalHistoryEvents,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditCount, -- Title, Body, Tags edits
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseEventCount,
+        -- Extract numeric CloseReasonId from comment field, defaulting to 0 if not found
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN CAST(COALESCE(SUBSTRING(ph.Comment FROM '^[0-9]+'), '0') AS INT) ELSE NULL END) AS LastCloseReasonId,
+        COALESCE(MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate ELSE NULL END), '1900-01-01 00:00:00') AS LastClosedDate,
+        -- Average interval between history events for a post in seconds
+        AVG(EXTRACT(EPOCH FROM (ph.CreationDate - LAG(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate)))) AS AvgEditIntervalSeconds
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 10, 11, 12, 13) -- Initial, Edits, Close/Reopen/Delete/Undelete
+    GROUP BY ph.PostId
+),
+CorrelatedUserInteraction AS (
+    -- Correlated subquery to count high-scoring posts edited by a user, but not owned by them
+    SELECT
+        uas.UserId,
+        COUNT(DISTINCT p.Id) AS UserEditedHighScorePostsCount
+    FROM UserActivitySummary uas
+    JOIN Posts p ON uas.UserId = p.LastEditorUserId
+    WHERE p.Score > 200
+      AND p.PostTypeId IN (1, 2)
+      AND p.OwnerUserId <> uas.UserId -- Ensure the edited post is not owned by the editor
+    GROUP BY uas.UserId
+)
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.ReputationRank,
+    ua.UserEngagementScore,
+    ua.TotalBadges,
+    ua.GoldBadges,
+    ua.IsSpecializedUser,
+    ped.QuestionId,
+    ped.QuestionTitle,
+    ped.QuestionScore,
+    ped.QuestionViewCount,
+    ped.NumberOfTags,
+    ped.TimeToAcceptAnswerHours,
+    ped.RunningAvgQuestionScoreByOwner,
+    ped.DuplicateLinkCount,
+    ped.LinkedFromOtherPostsCount,
+    pha.TotalHistoryEvents,
+    pha.EditCount,
+    pha.CloseEventCount,
+    pha.LastCloseReasonId,
+    pha.LastClosedDate,
+    pha.AvgEditIntervalSeconds,
+    ci.UserEditedHighScorePostsCount,
+    -- Non-correlated subquery: Count of highly upvoted comments on the question
+    (SELECT COUNT(c.Id) FROM Comments c WHERE c.PostId = ped.QuestionId AND c.Score > 5) AS HighScoreCommentCount,
+    -- Non-correlated subquery: Date of the last upvote or the question creation date if no upvotes
+    COALESCE(
+        (SELECT MAX(v.CreationDate) FROM Votes v WHERE v.PostId = ped.QuestionId AND v.VoteTypeId = 2),
+        ped.QuestionCreationDate
+    ) AS LastUpvoteOrQuestionDate,
+    -- Complicated CASE expression for acceptance speed categorization
+    CASE
+        WHEN ped.TimeToAcceptAnswerHours IS NULL THEN 'No Acceptance Data'
+        WHEN ped.TimeToAcceptAnswerHours < 24 THEN 'Fast Accepted (<1 day)'
+        WHEN ped.TimeToAcceptAnswerHours BETWEEN 24 AND 168 THEN 'Moderately Accepted (1 day - 1 week)'
+        WHEN ped.TimeToAcceptAnswerHours > 168 THEN 'Slow Accepted (>1 week)'
+        ELSE 'Undefined'
+    END AS AcceptanceSpeedCategory,
+    -- Score per view ratio, handling division by zero using NULLIF
+    ped.QuestionScore / NULLIF(ped.QuestionViewCount, 0) AS ScorePerViewRatio,
+    -- Correlated subquery: Average question score for the specific owner from PostEngagementDetails
+    (SELECT AVG(inner_ped.QuestionScore) FROM PostEngagementDetails inner_ped WHERE inner_ped.QuestionOwnerId = ua.UserId) AS AvgQuestionScoreForOwner
+FROM UserActivitySummary ua
+INNER JOIN PostEngagementDetails ped ON ua.UserId = ped.QuestionOwnerId
+LEFT JOIN PostHistoryAudit pha ON ped.QuestionId = pha.PostId
+LEFT JOIN CorrelatedUserInteraction ci ON ua.UserId = ci.UserId
+WHERE ua.ReputationRank <= 1000 -- Filter for top active users
+  AND ped.NumberOfTags >= 3 -- Questions with at least 3 tags
+  AND (ped.QuestionTitle LIKE '%SQL%' OR ped.QuestionTitle LIKE '%database%' OR ped.Tags LIKE '%<postgresql>%' OR ped.Tags LIKE '%<sql-server>%') -- Specific keywords in title or tags
+  AND (pha.EditCount > 1 OR pha.CloseEventCount > 0 OR pha.AvgEditIntervalSeconds < 3600) -- Posts with multiple edits, close events, or rapid edits
+  AND NOT EXISTS ( -- Exclude posts that were ever deleted
+        SELECT 1
+        FROM PostHistory ph_inner
+        WHERE ph_inner.PostId = ped.QuestionId
+          AND ph_inner.PostHistoryTypeId = 12
+    )
+ORDER BY ua.UserEngagementScore DESC, ped.RunningAvgQuestionScoreByOwner DESC, pha.LastHistoryDate DESC, ped.TimeToAcceptAnswerHours ASC
+LIMIT 1000;

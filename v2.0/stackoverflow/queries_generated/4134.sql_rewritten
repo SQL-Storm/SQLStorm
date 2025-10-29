@@ -1,0 +1,91 @@
+-- {"query": "4134.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1009} 
+WITH RecentQuestions AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title AS QuestionTitle,
+        p.OwnerUserId,
+        p.CreationDate AS QuestionCreationDate,
+        p.Score AS QuestionScore,
+        p.AnswerCount,
+        ROW_NUMBER() OVER (ORDER BY p.CreationDate DESC) as rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.CreationDate > DATE('now', '-30 days')
+),
+HighScoringAnswers AS (
+    SELECT
+        a.ParentId AS QuestionId,
+        a.Id AS AnswerId,
+        a.OwnerUserId AS AnswerOwnerUserId,
+        a.CreationDate AS AnswerCreationDate,
+        a.Score AS AnswerScore,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) as answer_rank
+    FROM Posts a
+    WHERE a.PostTypeId = 2 AND a.ParentId IN (SELECT QuestionId FROM RecentQuestions)
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT ph.Id) AS PostHistoryCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 2 THEN 1 ELSE 0 END) AS BodyEdits,
+        MAX(ph.CreationDate) AS LastPostHistoryDate
+    FROM Users u
+    JOIN PostHistory ph ON u.Id = ph.UserId
+    WHERE ph.CreationDate > DATE('now', '-90 days')
+    GROUP BY u.Id, u.DisplayName
+    HAVING COUNT(DISTINCT ph.Id) > 5
+),
+TagPopularity AS (
+    SELECT
+        t.TagName,
+        t.Count AS TagCount,
+        COUNT(DISTINCT p.Id) AS QuestionsWithTag,
+        AVG(CAST(p.AnswerCount AS REAL)) AS AvgAnswersPerQuestion
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Id = t.WikiPostId AND p.PostTypeId = 1
+    WHERE t.TagName NOT LIKE '%-%' -- Exclude tag-wiki excerpts
+    GROUP BY t.TagName, t.Count
+    HAVING COUNT(DISTINCT p.Id) > 100
+)
+SELECT
+    rq.QuestionTitle,
+    rq.QuestionScore,
+    COALESCE(ua.DisplayName, 'Anonymous') AS QuestionOwnerDisplayName,
+    COALESCE(ua.PostHistoryCount, 0) AS QuestionOwnerHistoryCount,
+    hsa.AnswerId,
+    hsa.AnswerScore,
+    COALESCE(ua_ans.DisplayName, 'Anonymous') AS AnswerOwnerDisplayName,
+    COALESCE(ua_ans.BodyEdits, 0) AS AnswerOwnerBodyEdits,
+    tp.TagName,
+    tp.TagCount,
+    tp.AvgAnswersPerQuestion,
+    CASE
+        WHEN rq.AnswerCount > 5 THEN 'High Answer Count'
+        WHEN rq.QuestionScore < 0 THEN 'Negative Score'
+        ELSE 'Standard'
+    END AS QuestionStatus,
+    CASE
+        WHEN hsa.AnswerScore > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 2 AND ParentId = rq.QuestionId)
+        THEN 'Above Average Answer'
+        WHEN hsa.AnswerScore <= 0 THEN 'Zero or Negative Answer Score'
+        ELSE 'Average Answer'
+    END AS AnswerQualityIndicator,
+    hsa.AnswerCreationDate,
+    rq.QuestionCreationDate
+FROM RecentQuestions rq
+LEFT JOIN UserActivity ua ON rq.OwnerUserId = ua.UserId
+LEFT JOIN HighScoringAnswers hsa ON rq.QuestionId = hsa.QuestionId AND hsa.answer_rank = 1
+LEFT JOIN UserActivity ua_ans ON hsa.AnswerOwnerUserId = ua_ans.UserId
+LEFT JOIN (
+    SELECT DISTINCT
+        p.Id,
+        t.TagName
+    FROM Posts p
+    CROSS APPLY STRING_SPLIT(REPLACE(REPLACE(p.Tags, '<', ''), '>', ''), ' ') AS s
+    JOIN Tags t ON t.TagName = s.value
+    WHERE p.PostTypeId = 1
+) AS post_tags ON rq.QuestionId = post_tags.Id
+LEFT JOIN TagPopularity tp ON post_tags.TagName = tp.TagName
+WHERE rq.rn BETWEEN 1 AND 500
+ORDER BY rq.QuestionCreationDate DESC, hsa.AnswerScore DESC
+LIMIT 100;

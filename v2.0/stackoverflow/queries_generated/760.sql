@@ -1,0 +1,298 @@
+-- {"query": "760.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3034} 
+with
+q as (
+  select p.Id as QuestionId,
+         p.OwnerUserId as AskerId,
+         p.CreationDate as QuestionCreation,
+         p.Score as QuestionScore,
+         p.ViewCount,
+         p.Tags,
+         p.AcceptedAnswerId,
+         coalesce(nullif(trim(p.Title), ''), '[no title]') as TitleNorm
+  from Posts p
+  where p.PostTypeId = 1
+),
+a as (
+  select a.Id as AnswerId,
+         a.ParentId as QuestionId,
+         a.OwnerUserId as AnswererId,
+         a.CreationDate as AnswerCreation,
+         a.Score as AnswerScore
+  from Posts a
+  where a.PostTypeId = 2
+),
+uv as (
+  select v.PostId,
+         count(*) filter (where v.VoteTypeId = 2) as UpVotes,
+         count(*) filter (where v.VoteTypeId = 3) as DownVotes,
+         count(*) filter (where v.VoteTypeId = 5) as Favorites,
+         count(*) filter (where v.VoteTypeId = 8) as BountyStarts,
+         count(*) filter (where v.VoteTypeId = 9) as BountyCloses
+  from Votes v
+  group by v.PostId
+),
+qh as (
+  select ph.PostId,
+         min(ph.CreationDate) filter (where ph.PostHistoryTypeId in (1,2,3)) as FirstRevision,
+         max(ph.CreationDate) filter (where ph.PostHistoryTypeId in (4,5,6)) as LastEdit,
+         bool_or(ph.PostHistoryTypeId in (10,11,12,13,14,15,19,20,35)) as HasModerationEvents,
+         count(*) filter (where ph.PostHistoryTypeId in (24)) as SuggestedEditsApplied,
+         count(*) filter (where ph.PostHistoryTypeId in (35,36)) as Migrations
+  from PostHistory ph
+  group by ph.PostId
+),
+dups as (
+  select pl.PostId as DuplicateId,
+         pl.RelatedPostId as OriginalId,
+         min(pl.CreationDate) as FirstDupLinkDate
+  from PostLinks pl
+  where pl.LinkTypeId = 3
+  group by pl.PostId, pl.RelatedPostId
+),
+linked as (
+  select pl.PostId,
+         count(*) filter (where pl.LinkTypeId = 1) as LinkedCount,
+         count(*) filter (where pl.LinkTypeId = 3) as DuplicateCount
+  from PostLinks pl
+  group by pl.PostId
+),
+tag_unpivot as (
+  select q.QuestionId,
+         lower(trim(t)) as tag
+  from q
+  cross join lateral unnest(string_to_array(substring(coalesce(q.Tags,'<>'), 2, greatest(length(coalesce(q.Tags,'<>'))-2,0)), '><')) as t
+),
+tag_stats as (
+  select tu.tag,
+         count(distinct tu.QuestionId) as TaggedQuestions,
+         percentile_cont(0.5) within group (order by q.ViewCount) as MedianViewsForTag
+  from tag_unpivot tu
+  join q on q.QuestionId = tu.QuestionId
+  group by tu.tag
+),
+user_stats as (
+  select u.Id as UserId,
+         u.Reputation,
+         u.UpVotes,
+         u.DownVotes,
+         u.Views as ProfileViews,
+         coalesce(nullif(u.Location,''),'[unknown]') as LocationNorm,
+         date_part('year', age(now(), u.CreationDate)) as AccountAgeYears
+  from Users u
+),
+answer_rank as (
+  select
+    a.QuestionId,
+    a.AnswerId,
+    a.AnswererId,
+    a.AnswerScore,
+    a.AnswerCreation,
+    row_number() over (partition by a.QuestionId order by a.Score desc nulls last, a.CreationDate asc) as ScoreRank,
+    rank() over (partition by a.QuestionId order by a.CreationDate asc) as SpeedRank,
+    dense_rank() over (partition by a.QuestionId order by a.Score desc nulls last) as DenseScoreRank
+  from a
+),
+accepted_vs_top as (
+  select
+    q.QuestionId,
+    case when q.AcceptedAnswerId is not null then 1 else 0 end as HasAccepted,
+    case when q.AcceptedAnswerId is not null and q.AcceptedAnswerId = ar.AnswerId and ar.ScoreRank = 1 then 1 else 0 end as AcceptedIsTopByScore,
+    min(ar.ScoreRank) filter (where ar.AnswerId = q.AcceptedAnswerId) as AcceptedScoreRank,
+    min(ar.SpeedRank) filter (where ar.AnswerId = q.AcceptedAnswerId) as AcceptedSpeedRank,
+    max(ar.AnswerScore) as TopAnswerScore
+  from q
+  left join answer_rank ar on ar.QuestionId = q.QuestionId
+  group by q.QuestionId, q.AcceptedAnswerId
+),
+question_activity as (
+  select
+    q.QuestionId,
+    q.QuestionCreation,
+    q.ViewCount,
+    coalesce(uvq.UpVotes,0) as QUp,
+    coalesce(uvq.DownVotes,0) as QDown,
+    coalesce(uvq.Favorites,0) as QFav,
+    coalesce(lk.LinkedCount,0) as LinkedCount,
+    coalesce(lk.DuplicateCount,0) as DuplicateCount,
+    case
+      when qh.HasModerationEvents then 1 else 0
+    end as HasModEvents,
+    coalesce(qh.SuggestedEditsApplied,0) as SuggestedEdits,
+    qh.LastEdit
+  from q
+  left join uv uvq on uvq.PostId = q.QuestionId
+  left join linked lk on lk.PostId = q.QuestionId
+  left join qh on qh.PostId = q.QuestionId
+),
+time_buckets as (
+  select
+    qa.QuestionId,
+    width_bucket(extract(epoch from qa.QuestionCreation)::bigint, 0, extract(epoch from now())::bigint, 20) as AgeBucket,
+    width_bucket(qa.ViewCount, 0, greatest(qa.ViewCount,1), 10) as ViewSkewBucket
+  from question_activity qa
+),
+engagement as (
+  select
+    qa.QuestionId,
+    (qa.QUp - qa.QDown) as NetVotes,
+    (qa.QUp + qa.QDown + qa.QFav) as Interactions,
+    case when qa.LastEdit is not null then 1 else 0 end as WasEdited,
+    (qa.LinkedCount + qa.DuplicateCount) as LinkSignals
+  from question_activity qa
+),
+asker as (
+  select
+    q.QuestionId,
+    u.UserId as AskerId,
+    u.Reputation as AskerRep,
+    u.AccountAgeYears as AskerAgeYears,
+    u.LocationNorm as AskerLocation
+  from q
+  left join user_stats u on u.UserId = q.AskerId
+),
+first_answer_latency as (
+  select
+    q.QuestionId,
+    min(a.AnswerCreation) as FirstAnswerTime,
+    extract(epoch from (min(a.AnswerCreation) - q.QuestionCreation))/3600.0 as FirstAnswerLatencyHours
+  from q
+  left join a on a.QuestionId = q.QuestionId
+  group by q.QuestionId, q.QuestionCreation
+),
+dup_cluster as (
+  select
+    coalesce(d.OriginalId, q.QuestionId) as CanonicalId,
+    q.QuestionId,
+    min(d.FirstDupLinkDate) as FirstDupDate
+  from q
+  left join dups d on d.DuplicateId = q.QuestionId
+  group by coalesce(d.OriginalId, q.QuestionId), q.QuestionId
+),
+canon_agg as (
+  select
+    CanonicalId,
+    count(*) as ClusterSize,
+    count(*) filter (where QuestionId <> CanonicalId) as DuplicateMembers
+  from dup_cluster
+  group by CanonicalId
+),
+tag_agg_per_question as (
+  select
+    tu.QuestionId,
+    array_agg(tu.tag order by tu.tag) as tags_sorted,
+    string_agg(tu.tag, ',', order by tu.tag) as tags_csv,
+    max(ts.TaggedQuestions) as MaxTagPopularity,
+    min(ts.TaggedQuestions) as MinTagPopularity
+  from tag_unpivot tu
+  left join tag_stats ts on ts.tag = tu.tag
+  group by tu.QuestionId
+),
+complex_pred as (
+  select
+    qa.QuestionId,
+    case
+      when ev.NetVotes >= 5
+           and coalesce(avt.AcceptedIsTopByScore,0) = 1
+           and coalesce(qa.HasModEvents,0) = 0
+           and (coalesce(ts.MaxTagPopularity,0) - coalesce(ts.MinTagPopularity,0)) <= 1000
+      then 1 else 0 end as IsHealthyThread
+  from question_activity qa
+  left join engagement ev on ev.QuestionId = qa.QuestionId
+  left join accepted_vs_top avt on avt.QuestionId = qa.QuestionId
+  left join tag_agg_per_question ts on ts.QuestionId = qa.QuestionId
+),
+scored as (
+  select
+    qa.QuestionId,
+    qa.ViewCount,
+    ev.NetVotes,
+    ev.Interactions,
+    ev.LinkSignals,
+    coalesce(fal.FirstAnswerLatencyHours, 1e6) as FirstAnswerLatencyHours,
+    coalesce(avt.TopAnswerScore, -2147483648) as TopAnswerScore,
+    case when avt.HasAccepted = 1 then 1 else 0 end as HasAccepted,
+    case when avt.AcceptedIsTopByScore = 1 then 1 else 0 end as AcceptedIsTop,
+    coalesce(ts.MaxTagPopularity,0) as MaxTagPopularity,
+    coalesce(ts.MinTagPopularity,0) as MinTagPopularity,
+    case when qa.ViewCount > 0 then (ev.Interactions::numeric / qa.ViewCount) else null end as InteractionPerView,
+    case when ev.Interactions > 0 then (ev.NetVotes::numeric / ev.Interactions) else null end as SentimentRatio,
+    greatest(0, least(1,
+      coalesce((log(least(qa.ViewCount+1,1000000)) / 14.0),0) * 0.25 +
+      coalesce((ev.NetVotes::numeric / nullif(ev.Interactions,0)),0) * 0.35 +
+      coalesce((1.0 / nullif(fal.FirstAnswerLatencyHours,0)),0) * 0.20 +
+      coalesce((case when avt.AcceptedIsTopByScore = 1 then 1 else 0 end),0) * 0.20
+    )) as QualityScore
+  from question_activity qa
+  left join engagement ev on ev.QuestionId = qa.QuestionId
+  left join accepted_vs_top avt on avt.QuestionId = qa.QuestionId
+  left join first_answer_latency fal on fal.QuestionId = qa.QuestionId
+  left join tag_agg_per_question ts on ts.QuestionId = qa.QuestionId
+),
+ranked as (
+  select
+    s.*,
+    row_number() over (order by s.QualityScore desc nulls last, s.NetVotes desc nulls last, s.ViewCount desc nulls last) as GlobalRowNum,
+    rank() over (order by s.QualityScore desc nulls last) as GlobalRank,
+    ntile(20) over (order by s.QualityScore desc nulls last) as QualityVigintile
+  from scored s
+),
+final_set as (
+  select
+    'healthy' as bucket,
+    r.*
+  from ranked r
+  join complex_pred cp on cp.QuestionId = r.QuestionId
+  where cp.IsHealthyThread = 1
+
+  union all
+
+  select
+    'needs_attention' as bucket,
+    r.*
+  from ranked r
+  left join complex_pred cp on cp.QuestionId = r.QuestionId
+  where coalesce(cp.IsHealthyThread,0) = 0
+    and (r.SentimentRatio is null or r.SentimentRatio < 0.25
+         or r.FirstAnswerLatencyHours > 24
+         or r.HasAccepted = 0)
+
+  union all
+
+  select
+    'long_tail' as bucket,
+    r.*
+  from ranked r
+  where r.ViewCount < 50
+     or r.InteractionPerView is null
+)
+select
+  fs.bucket,
+  fs.QuestionId,
+  coalesce(q.TitleNorm, '[no title]') as Title,
+  coalesce(ask.AskerLocation,'[unknown]') as AskerLocation,
+  coalesce(ask.AskerRep,0) as AskerRep,
+  fs.ViewCount,
+  fs.NetVotes,
+  fs.Interactions,
+  round(coalesce(fs.InteractionPerView,0)::numeric, 4) as InteractionPerView,
+  round(coalesce(fs.SentimentRatio,0)::numeric, 4) as SentimentRatio,
+  round(case when fs.FirstAnswerLatencyHours >= 1e6 then null else fs.FirstAnswerLatencyHours end::numeric, 2) as FirstAnswerLatencyHours,
+  fs.HasAccepted,
+  fs.AcceptedIsTop,
+  fs.TopAnswerScore,
+  fs.MaxTagPopularity,
+  fs.MinTagPopularity,
+  round(fs.QualityScore::numeric, 4) as QualityScore,
+  fs.GlobalRank,
+  fs.QualityVigintile,
+  coalesce(ts.tags_csv,'') as TagsCSV,
+  case when fs.NetVotes >= 10 and fs.HasAccepted = 1 then 'evergreen'
+       when fs.NetVotes < 0 and fs.HasAccepted = 0 then 'controversial'
+       when fs.ViewCount > 10000 and fs.Interactions < 5 then 'visited-rarely-engaged'
+       else 'normal' end as HeuristicLabel
+from final_set fs
+left join q on q.QuestionId = fs.QuestionId
+left join asker ask on ask.QuestionId = fs.QuestionId
+left join tag_agg_per_question ts on ts.QuestionId = fs.QuestionId
+where fs.GlobalRowNum <= 10000
+order by fs.bucket, fs.GlobalRank, fs.QuestionId;

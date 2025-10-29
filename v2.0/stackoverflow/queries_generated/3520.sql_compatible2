@@ -1,0 +1,130 @@
+WITH 
+user_stats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id)                                   AS total_posts,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1)            AS question_cnt,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2)            AS answer_cnt,
+        (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 2)                AS up_votes,
+        (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 3)                AS down_votes,
+        (SELECT COUNT(DISTINCT b.Class) FROM Badges b WHERE b.UserId = u.Id)                     AS badge_classes,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id)                                    AS badge_cnt
+    FROM Users u
+),
+
+ranked_users AS (
+    SELECT 
+        us.Id,
+        us.DisplayName,
+        us.Reputation,
+        us.CreationDate,
+        us.LastAccessDate,
+        us.total_posts,
+        us.question_cnt,
+        us.answer_cnt,
+        us.up_votes,
+        us.down_votes,
+        us.badge_classes,
+        us.badge_cnt,
+        ROW_NUMBER() OVER (ORDER BY us.Reputation DESC, us.total_posts DESC)                  AS rep_rank,
+        RANK()      OVER (PARTITION BY 
+                            CASE 
+                                WHEN us.Reputation >= 20000 THEN 'high' 
+                                WHEN us.Reputation >= 5000  THEN 'mid' 
+                                ELSE 'low' 
+                            END 
+                         ORDER BY us.Reputation DESC)                                      AS tier_rank,
+        CASE 
+            WHEN us.down_votes = 0 THEN NULL 
+            ELSE CAST(us.up_votes AS DOUBLE PRECISION) / us.down_votes 
+        END                                                                               AS up_down_ratio
+    FROM user_stats us
+),
+
+tag_usage AS (
+    SELECT 
+        p.OwnerUserId                           AS user_id,
+        tg.tag                                  AS tag_name,
+        COUNT(*)                                 AS tag_cnt
+    FROM Posts p
+    LEFT JOIN LATERAL regexp_split_to_table(p.Tags, '<|>') AS tg(tag) ON tg.tag <> ''
+    LEFT JOIN Tags t ON t.TagName = tg.tag
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId, tg.tag
+),
+
+last_activity AS (
+    SELECT 
+        u.Id,
+        GREATEST(
+            COALESCE(u.LastAccessDate, TIMESTAMP '1970-01-01'),
+            COALESCE((SELECT MAX(p.LastActivityDate) FROM Posts p WHERE p.OwnerUserId = u.Id), TIMESTAMP '1970-01-01'),
+            COALESCE((SELECT MAX(c.CreationDate)    FROM Comments c WHERE c.UserId = u.Id), TIMESTAMP '1970-01-01')
+        ) AS last_seen
+    FROM Users u
+),
+
+neg_score_flag AS (
+    SELECT 
+        u.Id,
+        CASE WHEN EXISTS (
+               SELECT 1 FROM Posts p 
+               WHERE p.OwnerUserId = u.Id AND p.Score < 0
+             )
+             THEN 1 ELSE 0 END                                            AS has_negative_posts
+    FROM Users u
+)
+
+SELECT
+    ru.Id,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.total_posts,
+    ru.question_cnt,
+    ru.answer_cnt,
+    ru.badge_cnt,
+    ru.up_down_ratio,
+    la.last_seen,
+    COALESCE(tu.all_tags_per_user, '')                                 AS tag_list,
+    CASE 
+        WHEN ru.rep_rank <= 10  THEN 'Top 10'
+        WHEN ru.rep_rank <= 100 THEN 'Top 100'
+        ELSE 'Other' 
+    END                                                               AS rank_group,
+    nf.has_negative_posts,
+    (SELECT STRING_AGG(DISTINCT vt.Name, ',')
+       FROM VoteTypes vt
+       JOIN Votes v ON v.VoteTypeId = vt.Id
+       WHERE v.UserId = ru.Id)                                        AS vote_types_used
+FROM ranked_users ru
+LEFT JOIN last_activity   la ON la.Id = ru.Id
+LEFT JOIN (
+    SELECT user_id, STRING_AGG(tag_name, ',') AS all_tags_per_user
+    FROM tag_usage
+    GROUP BY user_id
+) tu ON tu.user_id = ru.Id
+LEFT JOIN neg_score_flag nf ON nf.Id = ru.Id
+WHERE ru.tier_rank <= 5
+UNION ALL
+SELECT
+    CAST(NULL AS bigint),
+    'Overall Summary'                                    AS display_name,
+    CAST(NULL AS integer),
+    SUM(total_posts),
+    SUM(question_cnt),
+    SUM(answer_cnt),
+    SUM(badge_cnt),
+    CAST(NULL AS double precision),
+    CAST(NULL AS timestamp),
+    CAST(NULL AS text),
+    CAST(NULL AS text),
+    CAST(NULL AS integer),
+    CAST(NULL AS text)
+FROM ranked_users
+ORDER BY 
+    Reputation DESC NULLS LAST,
+    Id ASC;

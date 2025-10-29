@@ -1,0 +1,148 @@
+-- {"query": "3048.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 3286} 
+
+WITH
+    user_base AS (
+        SELECT
+            u.Id,
+            u.DisplayName,
+            u.Reputation,
+            u.CreationDate,
+            u.LastAccessDate,
+            COALESCE(u.Location, 'Unknown')            AS Location,
+            u.Views,
+            u.UpVotes,
+            u.DownVotes
+        FROM Users u
+    ),
+    post_agg AS (
+        SELECT
+            p.OwnerUserId                             AS UserId,
+            COUNT(*) FILTER (WHERE p.PostTypeId = 1)  AS QuestionCount,
+            COUNT(*) FILTER (WHERE p.PostTypeId = 2)  AS AnswerCount,
+            SUM(p.Score) FILTER (WHERE p.PostTypeId = 1) AS QuestionScoreSum,
+            SUM(p.Score) FILTER (WHERE p.PostTypeId = 2) AS AnswerScoreSum,
+            MAX(p.CreationDate)                      AS LastPostDate,
+            MIN(p.CreationDate)                      AS FirstPostDate,
+            COUNT(DISTINCT regexp_split_to_table(p.Tags, '<>')) 
+                FILTER (WHERE p.Tags IS NOT NULL)   AS DistinctTagCount
+        FROM Posts p
+        WHERE p.OwnerUserId IS NOT NULL
+        GROUP BY p.OwnerUserId
+    ),
+    badge_agg AS (
+        SELECT
+            b.UserId,
+            COUNT(*)                                            AS BadgeCount,
+            COUNT(*) FILTER (WHERE b.Class = 1)                AS GoldBadgeCount,
+            COUNT(*) FILTER (WHERE b.Class = 2)                AS SilverBadgeCount,
+            COUNT(*) FILTER (WHERE b.Class = 3)                AS BronzeBadgeCount,
+            STRING_AGG(DISTINCT b.Name, ', ') FILTER (WHERE b.Class = 1) 
+                                                            AS GoldBadgeNames
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+    vote_agg AS (
+        SELECT
+            v.PostId,
+            COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS UpVoteCount,
+            COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS DownVoteCount
+        FROM Votes v
+        GROUP BY v.PostId
+    ),
+    recent_activity AS (
+        SELECT
+            p.OwnerUserId                        AS UserId,
+            p.Id                                 AS PostId,
+            p.Title,
+            p.CreationDate,
+            ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId 
+                               ORDER BY p.CreationDate DESC) AS rn
+        FROM Posts p
+        WHERE p.CreationDate >= CURRENT_DATE - INTERVAL '30 days'
+    ),
+    user_top_posts AS (
+        SELECT
+            ra.UserId,
+            ra.PostId,
+            ra.Title,
+            ra.CreationDate,
+            v.UpVoteCount,
+            v.DownVoteCount
+        FROM recent_activity ra
+        JOIN vote_agg v ON v.PostId = ra.PostId
+        WHERE ra.rn <= 5
+    )
+SELECT
+    ub.Id,
+    ub.DisplayName,
+    ub.Reputation,
+    ub.Location,
+    ub.Views,
+    ub.UpVotes,
+    ub.DownVotes,
+    COALESCE(pa.QuestionCount,0)                    AS QuestionCount,
+    COALESCE(pa.AnswerCount,0)                      AS AnswerCount,
+    COALESCE(pa.QuestionScoreSum,0)                 AS QuestionScoreSum,
+    COALESCE(pa.AnswerScoreSum,0)                   AS AnswerScoreSum,
+    COALESCE(pa.DistinctTagCount,0)                 AS DistinctTagCount,
+    COALESCE(ba.BadgeCount,0)                       AS BadgeCount,
+    COALESCE(ba.GoldBadgeCount,0)                   AS GoldBadgeCount,
+    COALESCE(ba.SilverBadgeCount,0)                 AS SilverBadgeCount,
+    COALESCE(ba.BronzeBadgeCount,0)                 AS BronzeBadgeCount,
+    COALESCE(ba.GoldBadgeNames,'')                  AS GoldBadgeNames,
+    TO_CHAR(COALESCE(pa.LastPostDate, ub.CreationDate), 'YYYY-MM-DD')
+                                                    AS LastPostDate,
+    TO_CHAR(COALESCE(pa.FirstPostDate, ub.CreationDate), 'YYYY-MM-DD')
+                                                    AS FirstPostDate,
+    STRING_AGG(DISTINCT tp.Title, '; ') 
+        FILTER (WHERE tp.Title IS NOT NULL)          AS RecentTopPostTitles,
+    (SELECT AVG(p3.Score) 
+        FROM Posts p3 
+        WHERE p3.OwnerUserId = ub.Id 
+          AND p3.Score IS NOT NULL)                  AS AvgUserScore
+FROM user_base ub
+LEFT JOIN post_agg   pa ON pa.UserId = ub.Id
+LEFT JOIN badge_agg  ba ON ba.UserId = ub.Id
+LEFT JOIN user_top_posts tp ON tp.UserId = ub.Id
+GROUP BY
+    ub.Id, ub.DisplayName, ub.Reputation, ub.Location, ub.Views,
+    ub.UpVotes, ub.DownVotes,
+    pa.QuestionCount, pa.AnswerCount, pa.QuestionScoreSum, pa.AnswerScoreSum,
+    pa.DistinctTagCount, ba.BadgeCount, ba.GoldBadgeCount,
+    ba.SilverBadgeCount, ba.BronzeBadgeCount, ba.GoldBadgeNames,
+    pa.LastPostDate, pa.FirstPostDate
+HAVING
+    (ub.Reputation > 1000 OR ba.GoldBadgeCount > 0)
+ORDER BY
+    ub.Reputation DESC,
+    GoldBadgeCount DESC,
+    QuestionCount DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    NULL                               AS Id,
+    'AggregatedTotals'                 AS DisplayName,
+    SUM(ub.Reputation)                 AS Reputation,
+    NULL                               AS Location,
+    SUM(ub.Views)                      AS Views,
+    SUM(ub.UpVotes)                    AS UpVotes,
+    SUM(ub.DownVotes)                  AS DownVotes,
+    SUM(COALESCE(pa.QuestionCount,0))  AS QuestionCount,
+    SUM(COALESCE(pa.AnswerCount,0))    AS AnswerCount,
+    SUM(COALESCE(pa.QuestionScoreSum,0)) AS QuestionScoreSum,
+    SUM(COALESCE(pa.AnswerScoreSum,0))   AS AnswerScoreSum,
+    SUM(COALESCE(pa.DistinctTagCount,0)) AS DistinctTagCount,
+    SUM(COALESCE(ba.BadgeCount,0))     AS BadgeCount,
+    SUM(COALESCE(ba.GoldBadgeCount,0)) AS GoldBadgeCount,
+    SUM(COALESCE(ba.SilverBadgeCount,0)) AS SilverBadgeCount,
+    SUM(COALESCE(ba.BronzeBadgeCount,0)) AS BronzeBadgeCount,
+    NULL                               AS GoldBadgeNames,
+    NULL                               AS LastPostDate,
+    NULL                               AS FirstPostDate,
+    NULL                               AS RecentTopPostTitles,
+    NULL                               AS AvgUserScore
+FROM user_base ub
+LEFT JOIN post_agg pa ON pa.UserId = ub.Id
+LEFT JOIN badge_agg ba ON ba.UserId = ub.Id;

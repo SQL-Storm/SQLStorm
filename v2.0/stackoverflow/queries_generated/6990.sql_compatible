@@ -1,0 +1,82 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.Title,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.LastActivityDate,
+        P.OwnerUserId,
+        U.DisplayName,
+        U.Reputation,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.ViewCount DESC) AS Rank
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId IN (1, 2) AND P.Score > 0
+),
+BadgeCounts AS (
+    SELECT 
+        U.Id AS UserId,
+        COUNT(DISTINCT B.Id) AS BadgeCount
+    FROM 
+        Users U
+    LEFT JOIN 
+        Badges B ON U.Id = B.UserId
+    GROUP BY 
+        U.Id
+),
+PostTags AS (
+    -- normalize tag relations if Tags are stored as a delimited string in RankedPosts.Tags
+    -- attempt to split by common delimiters; this version uses a generic approach for ANSI SQL using LIKE,
+    -- but for better accuracy replace with a proper string-split function for your dialect
+    SELECT
+        RP.Id AS PostId,
+        T.Id AS TagId,
+        T.TagName
+    FROM RankedPosts RP
+    JOIN Tags T
+      ON RP.Tags IS NOT NULL
+     AND (
+          RP.Tags = T.Id::text
+          OR RP.Tags LIKE T.Id || ',%'
+          OR RP.Tags LIKE '%,' || T.Id || ',%'
+          OR RP.Tags LIKE '%,' || T.Id
+     )
+)
+SELECT 
+    RP.Id,
+    RP.Title,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.LastActivityDate,
+    RP.Rank,
+    RP.OwnerUserId,
+    U.DisplayName,
+    U.Reputation,
+    COALESCE(BC.BadgeCount, 0) AS BadgeCount,
+    CASE 
+        WHEN RP.Rank <= 3 THEN 'Top'
+        WHEN RP.Rank <= 10 THEN 'High'
+        ELSE 'Low'
+    END AS RankStatus,
+    STRING_AGG(PT.TagName, ', ' ORDER BY COUNT(PT.TagId) DESC) AS TopTags
+FROM 
+    RankedPosts RP
+LEFT JOIN 
+    Users U ON RP.OwnerUserId = U.Id
+LEFT JOIN 
+    PostHistory PH ON RP.Id = PH.PostId AND PH.PostHistoryTypeId = 10
+LEFT JOIN 
+    BadgeCounts BC ON RP.OwnerUserId = BC.UserId
+LEFT JOIN 
+    PostTags PT ON RP.Id = PT.PostId
+WHERE 
+    RP.Rank <= 10 AND PH.RevisionGUID IS NOT NULL
+GROUP BY 
+    RP.Id, RP.Title, RP.Score, RP.ViewCount, RP.CreationDate, RP.LastActivityDate, RP.Rank, RP.OwnerUserId, U.DisplayName, U.Reputation, BC.BadgeCount
+ORDER BY 
+    RP.Rank ASC;

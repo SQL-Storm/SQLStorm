@@ -1,0 +1,263 @@
+WITH UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.UpVotes,
+        u.DownVotes,
+        u.Views,
+        b.GoldBadges,
+        b.SilverBadges,
+        b.BronzeBadges,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+        COALESCE(COUNT(DISTINCT p.Id), 0) AS TotalPosts,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END), 0) AS TotalQuestions,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END), 0) AS TotalAnswers,
+        COALESCE(SUM(c.Score), 0) AS TotalCommentScore,
+        COALESCE(COUNT(DISTINCT c.Id), 0) AS TotalComments
+    FROM
+        Users u
+    LEFT JOIN (
+        SELECT
+            UserId,
+            SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+            SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+            SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+        FROM Badges
+        GROUP BY UserId
+    ) b ON u.Id = b.UserId
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId AND c.CreationDate BETWEEN p.CreationDate AND p.LastActivityDate
+    WHERE
+        u.Reputation > 5000 AND u.LastAccessDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2' YEAR)
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.UpVotes, u.DownVotes, u.Views, b.GoldBadges, b.SilverBadges, b.BronzeBadges
+),
+PostDetails AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.FavoriteCount,
+        (SELECT COUNT(DISTINCT v.Id) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpvoteCount,
+        (SELECT COUNT(DISTINCT v.Id) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS DownvoteCount,
+        (SELECT COUNT(DISTINCT c.Id) FROM Comments c WHERE c.PostId = p.Id) AS CommentCountForPost,
+        ph_status.IsClosed,
+        ph_status.ClosureReason
+    FROM
+        Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN (
+        SELECT
+            ph_inner.PostId,
+            MAX(CASE WHEN ph_inner.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS IsClosed,
+            MAX(CASE WHEN ph_inner.PostHistoryTypeId = 10 THEN crt.Name ELSE NULL END) AS ClosureReason
+        FROM PostHistory ph_inner
+        LEFT JOIN CloseReasonTypes crt ON CAST(ph_inner.Comment AS INTEGER) = crt.Id AND ph_inner.PostHistoryTypeId = 10
+        WHERE ph_inner.PostHistoryTypeId IN (10, 11)
+        GROUP BY ph_inner.PostId
+    ) ph_status ON p.Id = ph_status.PostId
+    WHERE
+        p.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2' YEAR)
+        AND (p.Title ILIKE '%sql%' OR p.Body ILIKE '%query%' OR p.Tags ILIKE '%<database>%')
+),
+RankedUserPosts AS (
+    SELECT
+        pd.PostId,
+        pd.PostTypeName,
+        pd.OwnerUserId,
+        pd.PostScore,
+        pd.ViewCount,
+        pd.Title,
+        pd.UpvoteCount,
+        pd.DownvoteCount,
+        pd.CommentCountForPost,
+        pd.IsClosed,
+        pd.ClosureReason,
+        RANK() OVER (PARTITION BY pd.OwnerUserId ORDER BY pd.PostScore DESC, pd.ViewCount DESC, pd.PostCreationDate DESC) AS PostRankByPopularity,
+        LAG(pd.PostScore, 1, 0) OVER (PARTITION BY pd.OwnerUserId ORDER BY pd.PostCreationDate) AS PreviousPostScore,
+        CASE
+            WHEN pd.Tags LIKE '%<java>%' THEN 'Java'
+            WHEN pd.Tags LIKE '%<python>%' THEN 'Python'
+            WHEN pd.Tags LIKE '%<c#>%' THEN 'C#'
+            WHEN pd.Tags LIKE '%<javascript>%' THEN 'JavaScript'
+            ELSE 'Other Tech'
+        END AS PrimaryTechTagCategory,
+        (SELECT pl.RelatedPostId FROM PostLinks pl WHERE pl.PostId = pd.PostId AND pl.LinkTypeId = 3 FETCH FIRST 1 ROWS ONLY) AS DuplicateOfPostId,
+        pd.PostCreationDate
+    FROM
+        PostDetails pd
+),
+UserOverallMetrics AS (
+    SELECT
+        ue.UserId,
+        ue.DisplayName,
+        ue.Reputation,
+        ue.UserCreationDate,
+        ue.LastAccessDate,
+        ue.UpVotes,
+        ue.DownVotes,
+        ue.Views,
+        ue.GoldBadges,
+        ue.SilverBadges,
+        ue.BronzeBadges,
+        ue.TotalPostScore,
+        ue.TotalPosts,
+        ue.TotalQuestions,
+        ue.TotalAnswers,
+        ue.TotalCommentScore,
+        ue.TotalComments,
+        ROUND(COALESCE(CAST(ue.TotalPostScore AS NUMERIC) / NULLIF(ue.TotalPosts, 0), 0), 2) AS AvgPostScore,
+        ROUND(COALESCE(CAST((ue.UpVotes + ue.TotalPostScore + ue.TotalCommentScore) AS NUMERIC) / NULLIF(ue.DownVotes + ue.TotalComments + ue.TotalPosts, 0), 0), 2) AS UserActivityWeight,
+        NTILE(10) OVER (ORDER BY ue.Reputation DESC, ue.LastAccessDate DESC) AS ReputationDecile
+    FROM
+        UserEngagement ue
+),
+GlobalAverages AS (
+    SELECT
+        AVG(p.Score) AS AvgPostScoreGlobal,
+        AVG(p.ViewCount) AS AvgViewCountGlobal,
+        AVG(c.Score) AS AvgCommentScoreGlobal,
+        COUNT(DISTINCT p.Id) AS TotalPostsGlobal,
+        COUNT(DISTINCT u.Id) AS TotalUsersGlobal
+    FROM
+        Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+)
+SELECT
+    uom.DisplayName,
+    uom.Reputation,
+    uom.ReputationDecile,
+    uom.TotalPosts,
+    uom.TotalQuestions,
+    uom.TotalAnswers,
+    uom.AvgPostScore,
+    uom.UserActivityWeight,
+    uom.GoldBadges,
+    uom.SilverBadges,
+    uom.BronzeBadges,
+    (
+        SELECT
+            rp.Title
+        FROM RankedUserPosts rp
+        WHERE rp.OwnerUserId = uom.UserId AND rp.PostRankByPopularity = 1 AND rp.PostTypeName = 'Question'
+        FETCH FIRST 1 ROWS ONLY
+    ) AS TopQuestionTitle,
+    (
+        SELECT
+            rp.PostScore
+        FROM RankedUserPosts rp
+        WHERE rp.OwnerUserId = uom.UserId AND rp.PostRankByPopularity = 1 AND rp.PostTypeName = 'Question'
+        FETCH FIRST 1 ROWS ONLY
+    ) AS TopQuestionScore,
+    (
+        SELECT
+            rp.PrimaryTechTagCategory
+        FROM RankedUserPosts rp
+        WHERE rp.OwnerUserId = uom.UserId AND rp.PostRankByPopularity = 1 AND rp.PostTypeName = 'Question'
+        FETCH FIRST 1 ROWS ONLY
+    ) AS TopQuestionTechCategory,
+    (
+        SELECT COUNT(DISTINCT link.RelatedPostId)
+        FROM PostLinks link
+        WHERE link.PostId IN (SELECT rp.PostId FROM RankedUserPosts rp WHERE rp.OwnerUserId = uom.UserId)
+          AND link.LinkTypeId = 1
+    ) AS LinkedPostsCount,
+    (
+        SELECT
+            CASE
+                WHEN EXISTS (SELECT 1 FROM Posts acc_ans WHERE acc_ans.AcceptedAnswerId = rp_q.PostId) THEN 'Has Accepted Answer'
+                WHEN rp_q.PostTypeName = 'Answer' THEN 'N/A for Answer'
+                ELSE 'No Accepted Answer Yet'
+            END
+        FROM RankedUserPosts rp_q
+        WHERE rp_q.OwnerUserId = uom.UserId AND rp_q.PostRankByPopularity = 1 AND rp_q.PostTypeName = 'Question'
+        FETCH FIRST 1 ROWS ONLY
+    ) AS TopQuestionAcceptedAnswerStatus,
+    GA.AvgPostScoreGlobal,
+    GA.AvgViewCountGlobal,
+    CASE
+        WHEN uom.AvgPostScore > GA.AvgPostScoreGlobal THEN 'Above Average Post Score'
+        WHEN uom.AvgPostScore < GA.AvgPostScoreGlobal THEN 'Below Average Post Score'
+        ELSE 'Average Post Score'
+    END AS PostScoreComparison,
+    (
+        SELECT MAX(ph.CreationDate)
+        FROM PostHistory ph
+        WHERE ph.UserId = uom.UserId AND ph.PostHistoryTypeId IN (4, 5, 6)
+    ) AS LastEditDateByEditor,
+    COALESCE(uom.TotalPosts, 0) + COALESCE(uom.TotalComments, 0) AS TotalContributions,
+    NULLIF(uom.TotalQuestions + uom.TotalAnswers, 0) AS QuestionsAndAnswers,
+    (uom.LastAccessDate > uom.UserCreationDate + INTERVAL '1' YEAR) AS LongTermUser,
+    'High-Tier Influencer' AS UserSegment
+FROM
+    UserOverallMetrics uom
+CROSS JOIN
+    GlobalAverages GA
+WHERE
+    uom.UserActivityWeight > 1.5
+    AND (uom.ReputationDecile <= 3 OR uom.GoldBadges > 0)
+UNION ALL
+SELECT
+    u.DisplayName,
+    u.Reputation,
+    NTILE(10) OVER (ORDER BY u.Reputation DESC) AS ReputationDecile,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswers,
+    ROUND(COALESCE(AVG(p.Score), 0), 2) AS AvgPostScore,
+    ROUND(COALESCE((u.UpVotes + COALESCE(SUM(p.Score),0) + COALESCE(SUM(c.Score),0)) / NULLIF(u.DownVotes + COUNT(DISTINCT c.Id) + COUNT(DISTINCT p.Id), 0), 0), 2) AS UserActivityWeight,
+    SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+    SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+    SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+    'N/A' AS TopQuestionTitle,
+    0 AS TopQuestionScore,
+    'N/A' AS TopQuestionTechCategory,
+    0 AS LinkedPostsCount,
+    'N/A' AS TopQuestionAcceptedAnswerStatus,
+    GA.AvgPostScoreGlobal,
+    GA.AvgViewCountGlobal,
+    CASE
+        WHEN ROUND(COALESCE(AVG(p.Score), 0), 2) > GA.AvgPostScoreGlobal THEN 'Above Average Post Score'
+        WHEN ROUND(COALESCE(AVG(p.Score), 0), 2) < GA.AvgPostScoreGlobal THEN 'Below Average Post Score'
+        ELSE 'Average Post Score'
+    END AS PostScoreComparison,
+    MAX(ph.CreationDate) AS LastEditDateByEditor,
+    COALESCE(COUNT(DISTINCT p.Id), 0) + COALESCE(COUNT(DISTINCT c.Id), 0) AS TotalContributions,
+    NULLIF(COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) + COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END), 0) AS QuestionsAndAnswers,
+    (u.LastAccessDate > u.CreationDate + INTERVAL '1' YEAR) AS LongTermUser,
+    'Mid-Tier Active Contributor' AS UserSegment
+FROM
+    Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN Comments c ON u.Id = c.UserId
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN PostHistory ph ON u.Id = ph.UserId AND ph.PostHistoryTypeId IN (4,5,6)
+CROSS JOIN GlobalAverages GA
+WHERE
+    u.Reputation BETWEEN 1000 AND 5000
+    AND u.CreationDate BETWEEN (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '3' YEAR) AND (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1' YEAR)
+    AND NOT EXISTS (
+        SELECT 1
+        FROM Posts p_sub
+        WHERE p_sub.OwnerUserId = u.Id AND p_sub.PostTypeId = 1 AND p_sub.FavoriteCount > 50
+    )
+GROUP BY
+    u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.UpVotes, u.DownVotes, GA.AvgPostScoreGlobal, GA.AvgViewCountGlobal
+HAVING
+    COUNT(DISTINCT p.Id) > 5 AND COUNT(DISTINCT c.Id) > 10
+ORDER BY
+    UserActivityWeight DESC, Reputation DESC
+FETCH FIRST 50 ROWS ONLY;

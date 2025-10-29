@@ -1,0 +1,160 @@
+WITH UserContributionSummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsAsked,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersProvided,
+        COALESCE(SUM(P.Score), 0) AS TotalPostScore,
+        COALESCE(SUM(P.ViewCount), 0) AS TotalPostViews,
+        COALESCE(AVG(CASE WHEN P.PostTypeId IN (1, 2) THEN P.Score ELSE NULL END), 0) AS AvgQuestionAnswerScore,
+        COALESCE(SUM(C.Score), 0) AS TotalCommentScore,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        MAX(COALESCE(P.LastActivityDate, C.CreationDate, U.LastAccessDate)) AS LastKnownActivity,
+        AVG(CASE WHEN P.PostTypeId = 1 AND P.AnswerCount IS NOT NULL THEN P.AnswerCount ELSE NULL END) AS AvgAnswersPerQuestion
+    FROM
+        Users U
+    LEFT JOIN
+        Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN
+        Comments C ON U.Id = C.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate
+),
+PostHistoricalRevisions AS (
+    SELECT
+        PH.PostId,
+        COUNT(DISTINCT PH.UserId) AS UniqueEditors,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (5, 6, 10, 11) THEN PH.Id END) AS SignificantRevisionCount,
+        MAX(PH.CreationDate) AS LastRevisionDate,
+        ARRAY_AGG(DISTINCT PH.PostHistoryTypeId) AS AllHistoryTypes,
+        MIN(CASE WHEN PH.PostHistoryTypeId IN (1, 2) THEN PH.CreationDate ELSE NULL END) AS InitialContentCreationDate
+    FROM
+        PostHistory PH
+    GROUP BY
+        PH.PostId
+),
+TagUsageAndInfluence AS (
+    SELECT
+        TRIM(UNNEST(string_to_array(SUBSTRING(P.Tags FROM 2 FOR CHAR_LENGTH(P.Tags) - 2), '><'))) AS TagName,
+        P.Id AS PostId,
+        P.Score AS PostScore,
+        P.ViewCount AS PostViewCount,
+        P.CreationDate AS PostCreationDate
+    FROM
+        Posts P
+    WHERE
+        P.PostTypeId = 1
+        AND P.Tags IS NOT NULL
+        AND CHAR_LENGTH(P.Tags) > 2
+),
+AggregatedTagMetrics AS (
+    SELECT
+        TUI.TagName,
+        COUNT(TUI.PostId) AS TaggedPostsCount,
+        SUM(TUI.PostScore) AS TotalTagScore,
+        AVG(TUI.PostScore) AS AvgTagPostScore,
+        SUM(TUI.PostViewCount) AS TotalTagViewCount,
+        COUNT(DISTINCT TUI.PostId) FILTER (WHERE TUI.PostCreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')) AS RecentTaggedPostsCount
+    FROM
+        TagUsageAndInfluence TUI
+    GROUP BY
+        TUI.TagName
+)
+SELECT
+    U.UserId,
+    U.DisplayName,
+    U.Reputation,
+    U.TotalPosts,
+    U.QuestionsAsked,
+    U.AnswersProvided,
+    U.TotalPostScore,
+    U.TotalPostViews,
+    U.TotalCommentsMade,
+    U.LastKnownActivity,
+    U.AvgAnswersPerQuestion,
+    COALESCE(B.TotalBadges, 0) AS TotalBadgesAwarded,
+    COALESCE(B.GoldBadges, 0) AS GoldBadges,
+    COALESCE(B.SilverBadges, 0) AS SilverBadges,
+    COALESCE(B.BronzeBadges, 0) AS BronzeBadges,
+    P.Id AS QuestionId,
+    P.Title AS QuestionTitle,
+    P.Score AS QuestionScore,
+    P.ViewCount AS QuestionViewCount,
+    P.AnswerCount AS QuestionAnswerCount,
+    P.FavoriteCount AS QuestionFavoriteCount,
+    PR.SignificantRevisionCount,
+    PR.UniqueEditors,
+    PR.LastRevisionDate,
+    CAST('2024-10-01 12:34:56' AS timestamp) - P.CreationDate AS QuestionAge,
+    CAST('2024-10-01 12:34:56' AS timestamp) - PR.InitialContentCreationDate AS ContentAgeFromFirstEdit,
+    (P.Score * 0.5 + P.ViewCount * 0.05 + COALESCE(P.FavoriteCount, 0) * 2 + COALESCE(P.AnswerCount, 0) * 1.5) AS QuestionEngagementScore,
+    LAG(P.Score, 1, 0) OVER (PARTITION BY U.UserId ORDER BY P.CreationDate) AS PreviousQuestionScore,
+    NTH_VALUE(P.Title, 1) OVER (PARTITION BY U.UserId ORDER BY P.Score DESC, P.CreationDate ASC) AS TopScoringQuestionTitle,
+    (SELECT COUNT(V.Id) FROM Votes V WHERE V.PostId = P.Id AND V.VoteTypeId = 2) AS QuestionUpvoteCount,
+    (SELECT COUNT(V.Id) FROM Votes V WHERE V.PostId = P.Id AND V.VoteTypeId = 3) AS QuestionDownvoteCount,
+    ATM.TaggedPostsCount AS MainTagUsageCount,
+    ATM.AvgTagPostScore AS MainTagAvgPostScore,
+    (U.Reputation * 0.1 + U.TotalPostScore * 0.2 + U.TotalCommentsMade * 0.05 + COALESCE(B.TotalBadges, 0) * 1 + COALESCE(ATM.AvgTagPostScore, 0) * 0.1) AS UserInfluenceScore,
+    CASE
+        WHEN U.Reputation > 10000 AND U.QuestionsAsked > 100 AND U.AnswersProvided > 200 THEN 'Veteran Expert'
+        WHEN U.Reputation > 5000 AND U.TotalPosts > 150 THEN 'Active Contributor'
+        WHEN U.Reputation > 1000 AND U.TotalPosts > 50 THEN 'Engaged Member'
+        ELSE 'Casual User'
+    END AS UserEngagementTier,
+    COALESCE(SUBSTRING(TRIM(COALESCE(NULLIF(U.Location, ''), '')) FROM 1 FOR 20), 'Unknown Region') AS TrimmedLocation,
+    NULLIF(LOWER(SUBSTRING(U.DisplayName FROM POSITION(' ' IN U.DisplayName) + 1)), '') AS UserLastName,
+    RANK() OVER (
+        ORDER BY (U.Reputation + U.TotalPostScore * 2 + COALESCE(B.TotalBadges, 0) * 5 + U.TotalCommentsMade) DESC,
+                 U.LastKnownActivity DESC
+    ) AS GlobalUserRank
+FROM
+    UserContributionSummary U
+LEFT JOIN LATERAL (
+    SELECT
+        B.UserId,
+        COUNT(B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM
+        Badges B
+    WHERE
+        B.UserId = U.UserId
+    GROUP BY
+        B.UserId
+) B ON TRUE
+LEFT JOIN
+    Posts P ON U.UserId = P.OwnerUserId AND P.PostTypeId = 1
+LEFT JOIN
+    PostHistoricalRevisions PR ON P.Id = PR.PostId
+LEFT JOIN LATERAL (
+    SELECT
+        ATM_Inner.TagName,
+        ATM_Inner.TaggedPostsCount,
+        ATM_Inner.AvgTagPostScore
+    FROM
+        AggregatedTagMetrics ATM_Inner
+    WHERE
+        P.Tags IS NOT NULL
+        AND CHAR_LENGTH(P.Tags) > 2
+        AND ATM_Inner.TagName = ANY(string_to_array(SUBSTRING(P.Tags FROM 2 FOR CHAR_LENGTH(P.Tags) - 2), '><'))
+    ORDER BY ATM_Inner.TaggedPostsCount DESC
+    LIMIT 1
+) ATM ON TRUE
+WHERE
+    U.TotalPosts > 5
+    AND P.Score > 0
+    AND P.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '5 year')
+    AND (
+        P.ClosedDate IS NULL
+        OR PR.SignificantRevisionCount > 3
+    )
+    AND U.DisplayName IS NOT NULL
+    AND U.DisplayName NOT LIKE '%Community%'
+    AND COALESCE(NULLIF(U.Location, ''), '') <> ''
+ORDER BY
+    GlobalUserRank ASC, QuestionEngagementScore DESC, U.LastKnownActivity DESC
+LIMIT 1000;

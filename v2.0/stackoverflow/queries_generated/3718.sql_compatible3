@@ -1,0 +1,190 @@
+WITH 
+UserActivity AS (
+    SELECT 
+        u.Id                           AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id)           AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END)      AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END)      AS Answers,
+        COUNT(DISTINCT c.Id)           AS TotalComments,
+        SUM(COALESCE(v.UpVotes,0) - COALESCE(v.DownVotes,0)) AS NetVotes,
+        COUNT(DISTINCT b.Id)           AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(p.CreationDate)            AS LatestPostDate
+    FROM Users u
+    LEFT JOIN Posts p          ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c       ON c.UserId = u.Id
+    LEFT JOIN (
+        SELECT 
+            v.PostId,
+            SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes v
+        JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+        GROUP BY v.PostId
+    ) v ON v.PostId = p.Id
+    LEFT JOIN Badges b        ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+UserLatestPost AS (
+    SELECT 
+        ua.UserId,
+        (SELECT p.Id
+         FROM Posts p
+         WHERE p.OwnerUserId = ua.UserId
+         ORDER BY p.CreationDate DESC
+         LIMIT 1)                         AS LatestPostId,
+        (SELECT p.Title
+         FROM Posts p
+         WHERE p.OwnerUserId = ua.UserId
+         ORDER BY p.CreationDate DESC
+         LIMIT 1)                         AS LatestPostTitle,
+        (SELECT p.Score
+         FROM Posts p
+         WHERE p.OwnerUserId = ua.UserId
+         ORDER BY p.CreationDate DESC
+         LIMIT 1)                         AS LatestPostScore
+    FROM UserActivity ua
+),
+-- Convert Tags string like '<tag1><tag2>' into rows without using UNNEST/STRING_TO_ARRAY
+TagUsage AS (
+    SELECT 
+        TRIM(BOTH '<>' FROM SUBSTR(p.Tags, s.start_pos, s.len)) AS Tag,
+        COUNT(*)                                           AS QuestionCount,
+        SUM(p.Score)                                       AS TotalScore,
+        AVG(p.ViewCount)                                   AS AvgViews
+    FROM Posts p
+    JOIN (
+        -- generate positions of tags by scanning the string for '<' characters
+        SELECT
+            pos1 AS start_pos,
+            pos2 - pos1 + 1 AS len,
+            id
+        FROM (
+            SELECT
+                p2.Id,
+                instr(p2.Tags, '<', 1, n) AS pos1,
+                instr(p2.Tags, '>', pos1) AS pos2
+            FROM Posts p2,
+            (SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5
+             UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9 UNION ALL SELECT 10) nums
+            WHERE p2.Tags IS NOT NULL
+        ) s0
+        WHERE pos1 > 0 AND pos2 > 0
+    ) s ON s.id = p.Id
+    WHERE p.PostTypeId = 1
+      AND p.Tags IS NOT NULL
+    GROUP BY TRIM(BOTH '<>' FROM SUBSTR(p.Tags, s.start_pos, s.len))
+),
+UserRanking AS (
+    SELECT 
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.TotalPosts,
+        ua.Questions,
+        ua.Answers,
+        ua.TotalComments,
+        ua.NetVotes,
+        ua.TotalBadges,
+        ua.GoldBadges,
+        ua.SilverBadges,
+        ua.BronzeBadges,
+        ua.LatestPostDate,
+        ulp.LatestPostId,
+        ulp.LatestPostTitle,
+        ulp.LatestPostScore,
+        (   ua.Reputation * 0.4
+          + ua.TotalPosts * 0.2
+          + ua.TotalComments * 0.1
+          + ua.NetVotes * 0.15
+          + (ua.GoldBadges   * 10
+           + ua.SilverBadges * 5
+           + ua.BronzeBadges * 2) * 0.15
+        )                                                   AS ActivityScore,
+        ROW_NUMBER() OVER (ORDER BY 
+            (   ua.Reputation * 0.4
+              + ua.TotalPosts * 0.2
+              + ua.TotalComments * 0.1
+              + ua.NetVotes * 0.15
+              + (ua.GoldBadges   * 10
+               + ua.SilverBadges * 5
+               + ua.BronzeBadges * 2) * 0.15
+            ) DESC)                                          AS RankByScore
+    FROM UserActivity ua
+    LEFT JOIN UserLatestPost ulp ON ulp.UserId = ua.UserId
+),
+TopEntities AS (
+    SELECT 
+        'Tag'               AS EntityType,
+        tu.Tag               AS EntityName,
+        tu.QuestionCount    AS Metric,
+        NULL                AS ExtraInfo
+    FROM TagUsage tu
+    WHERE tu.QuestionCount > 1000
+    UNION ALL
+    SELECT 
+        'User'              AS EntityType,
+        ur.DisplayName      AS EntityName,
+        ur.TotalPosts       AS Metric,
+        ('Rank:' || CAST(ur.RankByScore AS varchar)) AS ExtraInfo
+    FROM UserRanking ur
+    WHERE ur.RankByScore <= 50
+)
+SELECT 
+    COALESCE(u.UserId, -1)                         AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.TotalPosts,
+    u.TotalComments,
+    u.NetVotes,
+    u.GoldBadges,
+    u.SilverBadges,
+    u.BronzeBadges,
+    u.ActivityScore,
+    u.RankByScore,
+    ulp.LatestPostId,
+    ulp.LatestPostTitle,
+    ulp.LatestPostScore,
+    t.Tag,
+    t.QuestionCount,
+    t.TotalScore,
+    t.AvgViews,
+    te.EntityType,
+    te.EntityName,
+    te.Metric,
+    te.ExtraInfo,
+    ROW_NUMBER() OVER (PARTITION BY COALESCE(u.UserId, 0) 
+                       ORDER BY u.ActivityScore DESC) AS UserRowNum,
+    CASE 
+        WHEN u.Reputation IS NULL THEN 'NoRep'
+        WHEN u.Reputation < 1000 THEN 'LowRep'
+        WHEN u.Reputation BETWEEN 1000 AND 10000 THEN 'MidRep'
+        ELSE 'HighRep'
+    END                                            AS ReputationBand
+FROM UserRanking u
+LEFT JOIN UserLatestPost ulp 
+    ON ulp.UserId = u.UserId
+LEFT JOIN (
+    SELECT 
+        Tag,
+        QuestionCount,
+        TotalScore,
+        AvgViews,
+        ROW_NUMBER() OVER (ORDER BY QuestionCount DESC) AS TagRank
+    FROM TagUsage
+) t ON t.TagRank = u.RankByScore
+LEFT JOIN TopEntities te 
+    ON (te.EntityType = 'User' AND te.EntityName = u.DisplayName)
+    OR (te.EntityType = 'Tag'   AND te.EntityName = t.Tag)
+WHERE 
+    (u.ActivityScore IS NOT NULL AND u.ActivityScore > 0)
+    OR (t.QuestionCount IS NOT NULL AND t.QuestionCount > 500)
+ORDER BY 
+    COALESCE(u.ActivityScore,0) DESC,
+    t.QuestionCount DESC,
+    te.Metric DESC
+LIMIT 200;

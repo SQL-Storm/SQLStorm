@@ -1,0 +1,140 @@
+-- {"query": "2860.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1519} 
+
+with RecursiveUserActivity as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct p.Id) as QuestionsPosted,
+        count(distinct a.Id) as AnswersPosted,
+        coalesce(sum(p.Score),0) + coalesce(sum(a.Score),0) as TotalPostScore,
+        max(p.CreationDate) as LastQuestionDate,
+        max(a.CreationDate) as LastAnswerDate,
+        row_number() over (partition by u.Id order by greatest(coalesce(max(p.CreationDate),'1900-01-01'), coalesce(max(a.CreationDate), '1900-01-01')) desc) as rn
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 1
+    left join Posts a on a.OwnerUserId = u.Id and a.PostTypeId = 2
+    group by u.Id, u.DisplayName, u.Reputation
+),
+BadgeCounts as (
+    select 
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        sum(case when b.TagBased = 1 then 1 else 0 end) as TagBasedBadges
+    from Badges b
+    group by b.UserId
+),
+TopTagsByUser as (
+    select
+        u.Id as UserId,
+        t.TagName,
+        count(*) as TagUsage,
+        rank() over (partition by u.Id order by count(*) desc) as TagRank
+    from Posts p
+    join Users u on p.OwnerUserId = u.Id
+    cross join lateral unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')) as t(TagName)
+    where p.PostTypeId = 1
+    group by u.Id, t.TagName
+),
+LatestClosedQuestions as (
+    select 
+        p.Id, p.Title, p.OwnerUserId, p.Score, p.CreationDate, ph.Comment as CloseReason,
+        row_number() over (partition by p.Id order by ph.CreationDate desc) as rn
+    from Posts p
+    join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 10
+    where p.PostTypeId = 1
+),
+AvgAnswerScorePerQuestion as (
+    select 
+        p.Id as QuestionId,
+        avg(coalesce(a.Score,0)) as AvgAnswerScore,
+        count(a.Id) as AnswerCount
+    from Posts p
+    left join Posts a on a.ParentId = p.Id and a.PostTypeId = 2
+    where p.PostTypeId = 1
+    group by p.Id
+),
+UserVoteSummary as (
+    select 
+        v.UserId,
+        sum(case when vt.Name='UpMod' then 1 else 0 end) as UpVotesCast,
+        sum(case when vt.Name='DownMod' then 1 else 0 end) as DownVotesCast,
+        sum(case when vt.Name='Favorite' then 1 else 0 end) as FavoritesGiven,
+        count(distinct v.PostId) as UniquePostsVoted
+    from Votes v
+    join VoteTypes vt on vt.Id = v.VoteTypeId
+    where v.UserId is not null
+    group by v.UserId
+),
+RecursiveMaxScore as (
+    select Id, Score from Posts where PostTypeId in (1,2)
+    union all
+    select p.Id, greatest(p.Score, rm.Score)
+    from Posts p
+    join RecursiveMaxScore rm on p.ParentId = rm.Id
+    where p.PostTypeId = 2
+),
+FinalOutput as (
+    select 
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        coalesce(bc.GoldBadges,0) as GoldBadges,
+        coalesce(bc.SilverBadges,0) as SilverBadges,
+        coalesce(bc.BronzeBadges,0) as BronzeBadges,
+        coalesce(bc.TagBasedBadges,0) as TagBasedBadges,
+        ua.QuestionsPosted,
+        ua.AnswersPosted,
+        ua.TotalPostScore,
+        coalesce(uvs.UpVotesCast,0) as UpVotesCast,
+        coalesce(uvs.DownVotesCast,0) as DownVotesCast,
+        coalesce(uvs.FavoritesGiven,0) as FavoritesGiven,
+        coalesce(uvs.UniquePostsVoted,0) as UniquePostsVoted,
+        tt.TagName as TopTag,
+        tt.TagUsage as TopTagUsage,
+        lq.Title as LastClosedQuestionTitle,
+        lq.CloseReason,
+        lq.Score as LastClosedQuestionScore
+    from RecursiveUserActivity ua
+    left join BadgeCounts bc on bc.UserId = ua.UserId
+    left join UserVoteSummary uvs on uvs.UserId = ua.UserId
+    left join (select * from TopTagsByUser where TagRank = 1) tt on tt.UserId = ua.UserId
+    left join LatestClosedQuestions lq on lq.OwnerUserId = ua.UserId and lq.rn = 1
+    where ua.rn = 1 and ua.Reputation > 1000
+)
+select 
+    f.UserId,
+    f.DisplayName,
+    f.Reputation,
+    f.GoldBadges,
+    f.SilverBadges,
+    f.BronzeBadges,
+    f.TagBasedBadges,
+    f.QuestionsPosted,
+    f.AnswersPosted,
+    f.TotalPostScore,
+    f.UpVotesCast,
+    f.DownVotesCast,
+    f.FavoritesGiven,
+    f.UniquePostsVoted,
+    coalesce(f.TopTag, 'NoTags') as TopTag,
+    f.TopTagUsage,
+    coalesce(f.LastClosedQuestionTitle, 'NoRecentClosures') as LastClosedQuestionTitle,
+    f.CloseReason,
+    f.LastClosedQuestionScore,
+    -- Complex calculated field: weighted score with null logic and string concatenation
+    (f.Reputation * 0.01 + f.TotalPostScore * 0.1 + 
+     f.GoldBadges * 5 + f.SilverBadges * 3 + f.BronzeBadges * 1 - 
+     coalesce(f.DownVotesCast,0) * 0.5 + coalesce(f.UpVotesCast,0) * 0.2) as WeightedUserImpact,
+    -- String expression concatenating reputation ranks and tags
+    concat_ws(' | ',
+        concat('User: ', f.DisplayName),
+        concat('RepRank: ', dense_rank() over (order by f.Reputation desc)),
+        concat('TopTagUsage: ', coalesce(f.TopTagUsage::text, '0')),
+        concat('ClosedQScore: ', coalesce(f.LastClosedQuestionScore::text, '0'))
+    ) as UserSummaryString    
+from FinalOutput f
+order by WeightedUserImpact desc
+limit 25;

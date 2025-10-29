@@ -1,0 +1,87 @@
+-- {"query": "3347.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1835} 
+
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.CreationDate, TIMESTAMP '1970-01-01')         AS UserCreated,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1)               AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2)               AS AnswerCount,
+        SUM(p.Score) FILTER (WHERE p.PostTypeId = 1)              AS QuestionScoreSum,
+        SUM(p.Score) FILTER (WHERE p.PostTypeId = 2)              AS AnswerScoreSum,
+        COUNT(b.Id)                                               AS BadgeCount,
+        MAX(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END)              AS HasGoldBadge,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2)               AS UpVoteCount,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 3)               AS DownVoteCount
+    FROM Users u
+    LEFT JOIN Posts   p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges  b ON b.UserId      = u.Id
+    LEFT JOIN Votes   v ON v.UserId      = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+
+RecentActivity AS (
+    SELECT 
+        p.OwnerUserId                                           AS UserId,
+        MAX(p.CreationDate)                                     AS LastPostDate,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 1)                AS RecentQuestions,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 2)                AS RecentAnswers
+    FROM Posts p
+    WHERE p.CreationDate >= NOW() - INTERVAL '30 days'
+    GROUP BY p.OwnerUserId
+),
+
+TagSearch AS (
+    SELECT DISTINCT
+        u.Id                                                    AS UserId,
+        t.TagName,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY t.Count DESC) AS TagRank
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id
+    JOIN LATERAL (
+        SELECT UNNEST(string_to_array(TRIM(BOTH '[]' FROM p.Tags), '><')) AS rawTag
+    ) AS taglist ON TRUE
+    JOIN Tags t ON t.TagName = taglist.rawTag
+    WHERE p.Tags IS NOT NULL
+),
+
+Combined AS (
+    SELECT
+        us.Id,
+        us.DisplayName,
+        us.Reputation,
+        us.QuestionCount,
+        us.AnswerCount,
+        us.QuestionScoreSum,
+        us.AnswerScoreSum,
+        us.BadgeCount,
+        us.HasGoldBadge,
+        us.UpVoteCount,
+        us.DownVoteCount,
+        COALESCE(ra.LastPostDate, TIMESTAMP '1970-01-01')       AS LastPostDate,
+        COALESCE(ra.RecentQuestions, 0)                         AS RecentQuestions,
+        COALESCE(ra.RecentAnswers, 0)                           AS RecentAnswers,
+        COALESCE(ts.TagName, 'none')                            AS TopTag,
+        ts.TagRank
+    FROM UserStats us
+    LEFT JOIN RecentActivity ra ON ra.UserId = us.Id
+    LEFT JOIN TagSearch ts      ON ts.UserId = us.Id AND ts.TagRank = 1
+)
+
+SELECT *
+FROM Combined
+WHERE (Combined.Reputation > 10000 OR Combined.HasGoldBadge = 1)
+  AND (Combined.QuestionCount + Combined.AnswerCount) > 0
+  AND (Combined.TopTag IS NOT NULL AND Combined.TopTag <> 'none')
+ORDER BY Combined.Reputation DESC NULLS LAST
+LIMIT 100
+
+UNION ALL
+
+SELECT 
+    NULL::int, NULL::varchar, NULL::int, NULL::int, NULL::int,
+    NULL::int, NULL::int, NULL::int, NULL::bit, NULL::int,
+    NULL::int, NULL::timestamp, NULL::int, NULL::int, NULL::varchar,
+    NULL::int
+WHERE FALSE;

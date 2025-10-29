@@ -1,0 +1,123 @@
+WITH RankedUserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) AS PostCount,
+        SUM(CASE WHEN pt.Name = 'Question' THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN pt.Name = 'Answer' THEN 1 ELSE 0 END) AS AnswerCount,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, COUNT(p.Id) DESC) AS RankByReputationAndActivity
+    FROM Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE u.CreationDate < (CAST('2024-10-01' AS DATE) - INTERVAL '1 year')
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+PostTags AS (
+    SELECT
+        posts.Id AS PostId,
+        TRIM(BOTH '<>' FROM tag) AS TagName
+    FROM Posts posts,
+    LATERAL (
+        SELECT regexp_split_to_table(SUBSTRING(posts.Tags FROM 2 FOR (char_length(posts.Tags) - 2)), '><') AS tag
+    ) s
+    WHERE posts.Tags IS NOT NULL AND posts.PostTypeId = 1
+),
+PostContentAnalysis AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.Body,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        pt.Name AS PostType,
+        ptags.TagName,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+            ELSE 'Active'
+        END AS PostStatus,
+        ABS(char_length(SUBSTRING(COALESCE(p.Body, '') FROM 1 FOR 500)) - char_length(LOWER(COALESCE(p.Title, '')))) AS TitleBodySimilarity,
+        CASE
+            WHEN char_length(COALESCE(p.Body, '')) > 1000 AND COALESCE(p.AnswerCount, 0) > 5 THEN 1
+            ELSE 0
+        END AS IsComplexOrPopular,
+        p.AnswerCount,
+        p.OwnerUserId
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN PostTags ptags ON p.Id = ptags.PostId
+    WHERE p.CreationDate > (CAST('2024-10-01' AS DATE) - INTERVAL '6 months')
+),
+UserPostInteraction AS (
+    SELECT
+        p.OwnerUserId,
+        COUNT(c.Id) AS CommentCountForUserPosts,
+        AVG(c.Score) AS AvgCommentScoreForUserPosts
+    FROM Posts p
+    JOIN Comments c ON p.Id = c.PostId
+    WHERE c.CreationDate > (CAST('2024-10-01' AS DATE) - INTERVAL '3 months')
+    GROUP BY p.OwnerUserId
+)
+SELECT
+    rua.DisplayName,
+    rua.Reputation,
+    rua.PostCount,
+    rua.QuestionCount,
+    rua.AnswerCount,
+    pca.Title,
+    pca.PostType,
+    pca.TagName,
+    pca.PostStatus,
+    pca.TitleBodySimilarity,
+    pca.IsComplexOrPopular,
+    upi.CommentCountForUserPosts,
+    upi.AvgCommentScoreForUserPosts,
+    CASE
+        WHEN rua.RankByReputationAndActivity <= 100 THEN 'Top 100'
+        WHEN rua.RankByReputationAndActivity <= 500 THEN 'Top 500'
+        ELSE 'Other'
+    END AS UserTier,
+    CASE
+        WHEN pca.Score > 50 AND pca.ViewCount > 10000 THEN 'High Impact'
+        WHEN pca.Score < 0 OR pca.ViewCount < 100 THEN 'Low Engagement'
+        ELSE 'Moderate Engagement'
+    END AS PostEngagementLevel,
+    COALESCE(u.Location, 'Unknown Location') AS UserLocation,
+    CASE WHEN u.WebsiteUrl IS NULL THEN 'No Website' ELSE 'Has Website' END AS UserWebsiteStatus,
+    CAST(SUBSTRING(COALESCE(u.AboutMe, '') FROM 1 FOR 100) AS VARCHAR(100)) AS AboutMeSnippet,
+    rua.RankByReputationAndActivity,
+    pca.Score,
+    pca.OwnerUserId
+FROM RankedUserActivity rua
+JOIN UserPostInteraction upi ON rua.UserId = upi.OwnerUserId
+LEFT JOIN Posts p ON rua.UserId = p.OwnerUserId
+LEFT JOIN PostContentAnalysis pca ON p.Id = pca.PostId
+LEFT JOIN Users u ON rua.UserId = u.Id
+WHERE pca.PostId IS NOT NULL
+  AND (pca.Score > 0 OR COALESCE(pca.AnswerCount, 0) > 0)
+  AND (upi.CommentCountForUserPosts > 0 OR upi.AvgCommentScoreForUserPosts IS NOT NULL)
+  AND (pca.IsComplexOrPopular = 1 OR rua.RankByReputationAndActivity <= 100)
+GROUP BY
+    rua.DisplayName,
+    rua.Reputation,
+    rua.PostCount,
+    rua.QuestionCount,
+    rua.AnswerCount,
+    pca.Title,
+    pca.PostType,
+    pca.TagName,
+    pca.PostStatus,
+    pca.TitleBodySimilarity,
+    pca.IsComplexOrPopular,
+    upi.CommentCountForUserPosts,
+    upi.AvgCommentScoreForUserPosts,
+    u.Location,
+    u.WebsiteUrl,
+    u.AboutMe,
+    rua.RankByReputationAndActivity,
+    pca.Score,
+    pca.OwnerUserId
+ORDER BY rua.Reputation DESC, pca.Score DESC
+LIMIT 100;

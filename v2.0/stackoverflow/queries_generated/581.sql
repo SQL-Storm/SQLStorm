@@ -1,0 +1,300 @@
+-- {"query": "581.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2989} 
+with recent_users as (
+    select u.id as user_id,
+           u.displayname,
+           u.reputation,
+           u.creationdate,
+           u.location,
+           u.upvotes,
+           u.downvotes,
+           coalesce(nullif(trim(u.websiteurl), ''), 'n/a') as websiteurl,
+           row_number() over (order by u.creationdate desc, u.id desc) as rn
+    from users u
+    where u.creationdate >= (select date_trunc('year', max(creationdate)) - interval '2 years' from users)
+),
+tagged_questions as (
+    select p.id as post_id,
+           p.title,
+           p.tags,
+           p.owneruserid,
+           p.creationdate,
+           p.score,
+           p.viewcount,
+           p.answercount,
+           p.commentcount,
+           p.closeddate,
+           case when p.tags ilike '%<sql>%'
+                 or p.title ilike '%sql%'
+                 or p.body ilike '%SELECT%' then 1 else 0 end as is_sqlish,
+           string_to_array(substring(p.tags, 2, length(p.tags)-2), '><') as tag_array
+    from posts p
+    where p.posttypeid = 1
+      and p.creationdate >= (select date_trunc('year', max(creationdate)) - interval '3 years' from posts)
+),
+answers as (
+    select a.id as answer_id,
+           a.parentid as question_id,
+           a.owneruserid as answer_owner_id,
+           a.score as answer_score,
+           a.creationdate as answer_date
+    from posts a
+    where a.posttypeid = 2
+),
+votes_agg as (
+    select v.postid,
+           sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+           sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+           sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+           sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started,
+           sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded,
+           count(*) as total_votes,
+           min(v.creationdate) as first_vote_at,
+           max(v.creationdate) as last_vote_at
+    from votes v
+    where v.creationdate >= (select date_trunc('year', max(creationdate)) - interval '3 years' from votes)
+    group by v.postid
+),
+comment_stats as (
+    select c.postid,
+           count(*) as comments_count,
+           sum(case when c.score > 0 then 1 else 0 end) as pos_comments,
+           max(c.creationdate) as last_comment_at
+    from comments c
+    where c.creationdate >= (select date_trunc('year', max(creationdate)) - interval '3 years' from comments)
+    group by c.postid
+),
+dup_links as (
+    select pl.postid as question_id,
+           count(*) filter (where pl.linktypeid = 3) as dup_count,
+           count(*) filter (where pl.linktypeid = 1) as linked_count,
+           min(pl.creationdate) as first_link_at,
+           max(pl.creationdate) as last_link_at
+    from postlinks pl
+    group by pl.postid
+),
+badge_ranks as (
+    select b.userid,
+           count(*) filter (where b.class = 1) as gold_count,
+           count(*) filter (where b.class = 2) as silver_count,
+           count(*) filter (where b.class = 3) as bronze_count,
+           count(*) as total_badges,
+           max(b.date) as last_badge_at
+    from badges b
+    group by b.userid
+),
+owner_activity as (
+    select u.id as owner_id,
+           u.displayname as owner_name,
+           u.reputation as owner_rep,
+           coalesce(br.total_badges,0) as owner_badges,
+           coalesce(br.gold_count,0) as owner_gold,
+           coalesce(br.silver_count,0) as owner_silver,
+           coalesce(br.bronze_count,0) as owner_bronze,
+           coalesce(u.upvotes,0) - coalesce(u.downvotes,0) as owner_netvotes,
+           u.creationdate as owner_created
+    from users u
+    left join badge_ranks br on br.userid = u.id
+),
+q_enriched as (
+    select q.post_id,
+           q.title,
+           q.tags,
+           q.owneruserid,
+           q.creationdate,
+           q.score,
+           q.viewcount,
+           q.answercount,
+           q.commentcount,
+           q.closeddate,
+           q.is_sqlish,
+           va.upvotes,
+           va.downvotes,
+           va.favorites,
+           va.bounty_started,
+           va.bounty_awarded,
+           va.total_votes,
+           cs.comments_count,
+           cs.pos_comments,
+           cs.last_comment_at,
+           dl.dup_count,
+           dl.linked_count,
+           dl.first_link_at,
+           dl.last_link_at
+    from tagged_questions q
+    left join votes_agg va on va.postid = q.post_id
+    left join comment_stats cs on cs.postid = q.post_id
+    left join dup_links dl on dl.question_id = q.post_id
+),
+answerers as (
+    select a.question_id,
+           count(*) as answers_total,
+           count(*) filter (where a.answer_score > 0) as answers_positive,
+           max(a.answer_score) as best_answer_score,
+           min(a.answer_date) as first_answer_at,
+           max(a.answer_date) as last_answer_at,
+           count(distinct a.answer_owner_id) as distinct_answerers
+    from answers a
+    group by a.question_id
+),
+owner_quality as (
+    select p.owneruserid as owner_id,
+           count(*) as questions_asked,
+           avg(nullif(p.score,0)) filter (where p.score is not null) as avg_q_score_nonzero,
+           percentile_cont(0.5) within group (order by coalesce(p.viewcount,0)) as median_views,
+           sum(case when p.acceptedanswerid is not null then 1 else 0 end) as accepted_qs
+    from posts p
+    where p.posttypeid = 1
+    group by p.owneruserid
+),
+post_history_flags as (
+    select ph.postid,
+           max(case when ph.posthistorytypeid in (10,35) then 1 else 0 end) as was_closed_or_migrated,
+           max(case when ph.posthistorytypeid in (11,13) then 1 else 0 end) as was_reopened_or_undeleted,
+           sum(case when ph.posthistorytypeid in (4,5,6) then 1 else 0 end) as edit_events
+    from posthistory ph
+    group by ph.postid
+),
+ranked_questions as (
+    select qe.*,
+           an.answers_total,
+           an.answers_positive,
+           an.best_answer_score,
+           an.first_answer_at,
+           an.last_answer_at,
+           an.distinct_answerers,
+           oa.owner_name,
+           oa.owner_rep,
+           oa.owner_badges,
+           oa.owner_gold,
+           oa.owner_silver,
+           oa.owner_bronze,
+           oa.owner_netvotes,
+           oq.questions_asked,
+           oq.avg_q_score_nonzero,
+           oq.median_views,
+           oq.accepted_qs,
+           phf.was_closed_or_migrated,
+           phf.was_reopened_or_undeleted,
+           phf.edit_events,
+           case
+             when qe.closeddate is not null or coalesce(phf.was_closed_or_migrated,0)=1 then 'closed_or_migrated'
+             when qe.is_sqlish = 1 and coalesce(qe.upvotes,0) >= 10 then 'sql_hot'
+             when coalesce(qe.viewcount,0) > 10000 then 'high_traffic'
+             else 'normal'
+           end as q_bucket,
+           coalesce(qe.upvotes,0) - coalesce(qe.downvotes,0) as net_votes,
+           (coalesce(qe.viewcount,0) / nullif(extract(epoch from (now() - qe.creationdate)) / 86400.0, 0)) as views_per_day,
+           dense_rank() over (order by coalesce(qe.upvotes,0) - coalesce(qe.downvotes,0) desc, coalesce(qe.viewcount,0) desc, qe.creationdate asc) as popularity_rank,
+           row_number() over (partition by case when qe.is_sqlish=1 then 'sqlish' else 'other' end order by coalesce(qe.upvotes,0) desc, coalesce(qe.viewcount,0) desc) as tag_partition_rank
+    from q_enriched qe
+    left join answerers an on an.question_id = qe.post_id
+    left join owner_activity oa on oa.owner_id = qe.owneruserid
+    left join owner_quality oq on oq.owner_id = qe.owneruserid
+    left join post_history_flags phf on phf.postid = qe.post_id
+),
+top_and_bottom as (
+    select 'top' as grp, rq.*
+    from ranked_questions rq
+    where rq.popularity_rank <= 100
+
+    union all
+
+    select 'bottom' as grp, rq.*
+    from ranked_questions rq
+    where rq.popularity_rank > (select coalesce(max(popularity_rank),0) - 99 from ranked_questions)
+),
+tag_expansion as (
+    select tab.grp,
+           tab.post_id,
+           unnest(coalesce(tq.tag_array, array[]::varchar[])) as tag_name
+    from top_and_bottom tab
+    join tagged_questions tq on tq.post_id = tab.post_id
+),
+tag_with_meta as (
+    select te.grp,
+           te.post_id,
+           te.tag_name,
+           t.count as tag_global_count,
+           t.ismoderatoronly,
+           t.isrequired
+    from tag_expansion te
+    left join tags t on lower(t.tagname) = lower(te.tag_name)
+),
+final_scores as (
+    select tab.grp,
+           tab.post_id,
+           tab.title,
+           tab.creationdate,
+           tab.owner_name,
+           tab.owner_rep,
+           tab.owner_badges,
+           tab.net_votes,
+           tab.viewcount,
+           tab.views_per_day,
+           tab.answers_total,
+           tab.best_answer_score,
+           tab.q_bucket,
+           tab.tag_partition_rank,
+           count(distinct case when twm.tag_global_count > 0 then twm.tag_name end) as distinct_popular_tags,
+           sum(case when coalesce(twm.tag_global_count,0) = 0 then 1 else 0 end) as rare_tags,
+           max(coalesce(twm.tag_global_count,0)) as max_tag_popularity,
+           min(coalesce(twm.tag_global_count,0)) as min_tag_popularity,
+           sum(case when coalesce(twm.ismoderatoronly,0)=1 then 1 else 0 end) as mod_only_tags,
+           sum(case when coalesce(twm.isrequired,0)=1 then 1 else 0 end) as required_tags,
+           -- composite score mixing engagement, freshness, owner prowess, and tag rarity
+           (
+             0.40 * (coalesce(tab.net_votes,0)) +
+             0.25 * ln(1 + coalesce(tab.viewcount,0)) +
+             0.15 * coalesce(tab.best_answer_score,0) +
+             0.10 * greatest(0, least(1000, coalesce(tab.owner_rep,0))) / 1000.0 * 50 +
+             0.10 * (1 + coalesce(rare_tags,0))
+           ) as composite_score
+    from top_and_bottom tab
+    left join tag_with_meta twm on twm.post_id = tab.post_id and twm.grp = tab.grp
+    group by tab.grp, tab.post_id, tab.title, tab.creationdate, tab.owner_name, tab.owner_rep, tab.owner_badges,
+             tab.net_votes, tab.viewcount, tab.views_per_day, tab.answers_total, tab.best_answer_score, tab.q_bucket, tab.tag_partition_rank
+),
+with_nulls as (
+    select fs.*,
+           case when fs.owner_name is null then 1 else 0 end as owner_missing_flag,
+           case when fs.answers_total is null then 1 else 0 end as answers_missing_flag
+    from final_scores fs
+),
+ranked_output as (
+    select wn.*,
+           rank() over (partition by grp order by composite_score desc nulls last, net_votes desc, viewcount desc, creationdate asc) as grp_rank
+    from with_nulls wn
+)
+select ro.grp,
+       ro.grp_rank,
+       ro.post_id,
+       coalesce(ro.title, '[no title]') as title,
+       ro.creationdate,
+       coalesce(ro.owner_name, format('user#%s', sub.user_id::text)) as owner_name_or_userid,
+       ro.owner_rep,
+       ro.owner_badges,
+       ro.net_votes,
+       ro.viewcount,
+       round(coalesce(ro.views_per_day,0)::numeric, 3) as views_per_day,
+       ro.answers_total,
+       ro.best_answer_score,
+       ro.q_bucket,
+       ro.tag_partition_rank,
+       ro.distinct_popular_tags,
+       ro.rare_tags,
+       ro.max_tag_popularity,
+       ro.min_tag_popularity,
+       ro.mod_only_tags,
+       ro.required_tags,
+       round(ro.composite_score::numeric, 3) as composite_score
+from ranked_output ro
+left join lateral (
+    select ru.user_id
+    from recent_users ru
+    where ru.user_id = (select owneruserid from posts p where p.id = ro.post_id)
+    order by ru.rn
+    limit 1
+) sub on true
+where (ro.grp = 'top' and ro.grp_rank <= 50)
+   or (ro.grp = 'bottom' and ro.grp_rank <= 50)
+order by ro.grp, ro.grp_rank, ro.post_id;

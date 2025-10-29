@@ -1,0 +1,188 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count AS TagCount,
+        1 AS Level,
+        ARRAY[t.TagName] AS TagPath
+    FROM Tags t
+    WHERE t.IsModeratorOnly = false AND t.IsRequired = false
+
+    UNION ALL
+
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Level + 1,
+        r.TagPath || t.TagName
+    FROM Tags t
+    JOIN RecursiveTagHierarchy r ON t.Id != r.Id AND t.Count < r.TagCount
+    WHERE r.Level < 2
+),
+PostAggregates AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        COALESCE(p.ViewCount, 0) AS ViewCount,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        p.Tags,
+        row_number() OVER (
+            PARTITION BY p.OwnerUserId, p.PostTypeId
+            ORDER BY p.Score DESC, p.CreationDate ASC
+        ) AS UserPostRank,
+        count(*) OVER (PARTITION BY p.OwnerUserId, p.PostTypeId) AS UserPostCount
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        b.Class,
+        count(*) AS BadgeCount
+    FROM Badges b
+    GROUP BY b.UserId, b.Class
+),
+UserReputationRanks AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        rank() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        dense_rank() OVER (PARTITION BY COALESCE(u.Location, 'Unknown') ORDER BY u.Reputation DESC) AS LocationReputationRank
+    FROM Users u
+),
+PostCloseInfo AS (
+    SELECT
+        ph.PostId,
+        max(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) AS CloseDate,
+        max(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Comment END) AS CloseReasonIdStr
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.PostId
+),
+PostWithCloseReason AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Tags,
+        pci.CloseDate,
+        crt.Name AS CloseReasonName
+    FROM Posts p
+    LEFT JOIN PostCloseInfo pci ON pci.PostId = p.Id
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(pci.CloseReasonIdStr AS integer)
+    WHERE p.PostTypeId = 1
+),
+UserLatestActivity AS (
+    SELECT
+        u.Id AS UserId,
+        max(COALESCE(p.LastActivityDate, p.CreationDate)) AS LatestPostActivity,
+        max(c.CreationDate) AS LatestCommentDate,
+        max(ph.CreationDate) AS LatestHistoryEdit,
+        greatest(
+            COALESCE(max(COALESCE(p.LastActivityDate, p.CreationDate)), TIMESTAMP '1900-01-01'),
+            COALESCE(max(c.CreationDate), TIMESTAMP '1900-01-01'),
+            COALESCE(max(ph.CreationDate), TIMESTAMP '1900-01-01')
+        ) AS LatestUserActivity
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+    GROUP BY u.Id
+),
+UserVoteStats AS (
+    SELECT
+        p.OwnerUserId,
+        vt.Name AS VoteType,
+        count(v.Id) AS VoteCount
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    JOIN Posts p ON p.Id = v.PostId
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId, vt.Name
+),
+FilteredPosts AS (
+    SELECT
+        pa.PostId,
+        pa.Title,
+        pa.OwnerUserId,
+        pa.CreationDate,
+        pa.Score,
+        pa.ViewCount,
+        pa.AnswerCount,
+        pa.Tags
+    FROM PostAggregates pa
+    WHERE pa.UserPostCount > 5 AND pa.UserPostRank <= 3
+),
+CorrelatedTopComment AS (
+    SELECT
+        p.Id AS PostId,
+        (
+            SELECT c.Text
+            FROM Comments c
+            WHERE c.PostId = p.Id
+            ORDER BY c.Score DESC NULLS LAST, c.CreationDate ASC
+            FETCH FIRST 1 ROW ONLY
+        ) AS TopCommentText
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+PostTitleTagConcat AS (
+    SELECT
+        p.Id AS PostId,
+        -- convert tags like '<tag1><tag2>' to 'tag1><tag2' then substring removes surrounding <>
+        concat_ws(' | ', COALESCE(p.Title, 'No Title'), substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2)) AS TitleTagConcat
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+)
+SELECT DISTINCT
+    u.Id AS UserId,
+    u.DisplayName,
+    ur.Reputation,
+    ur.ReputationRank,
+    ur.LocationReputationRank,
+    COALESCE(ub.Gold, 0) AS GoldBadges,
+    COALESCE(ub.Silver, 0) AS SilverBadges,
+    COALESCE(ub.Bronze, 0) AS BronzeBadges,
+    ua.LatestUserActivity,
+    COALESCE(vts.VoteCount, 0) AS UpModVotes,
+    COALESCE(vtsd.VoteCount, 0) AS DownModVotes,
+    fp.PostId,
+    fp.Title AS PostTitle,
+    fp.Tags AS PostTags,
+    fp.Score AS PostScore,
+    fp.ViewCount,
+    fp.AnswerCount,
+    pt.TitleTagConcat,
+    crc.CloseReasonName,
+    cc.TopCommentText,
+    rh.Level AS TagHierarchyLevel,
+    rh.TagPath[array_upper(rh.TagPath, 1)] AS DeepestTag
+FROM Users u
+LEFT JOIN UserReputationRanks ur ON ur.UserId = u.Id
+LEFT JOIN (
+    SELECT 
+        UserId,
+        max(CASE WHEN Class = 1 THEN BadgeCount ELSE 0 END) AS Gold,
+        max(CASE WHEN Class = 2 THEN BadgeCount ELSE 0 END) AS Silver,
+        max(CASE WHEN Class = 3 THEN BadgeCount ELSE 0 END) AS Bronze
+    FROM UserBadgeCounts
+    GROUP BY UserId
+) ub ON ub.UserId = u.Id
+LEFT JOIN UserLatestActivity ua ON ua.UserId = u.Id
+LEFT JOIN UserVoteStats vts ON vts.OwnerUserId = u.Id AND vts.VoteType = 'UpMod'
+LEFT JOIN UserVoteStats vtsd ON vtsd.OwnerUserId = u.Id AND vtsd.VoteType = 'DownMod'
+LEFT JOIN FilteredPosts fp ON fp.OwnerUserId = u.Id
+LEFT JOIN PostTitleTagConcat pt ON pt.PostId = fp.PostId
+LEFT JOIN PostWithCloseReason crc ON crc.Id = fp.PostId
+LEFT JOIN CorrelatedTopComment cc ON cc.PostId = fp.PostId
+LEFT JOIN RecursiveTagHierarchy rh ON rh.TagName = (string_to_array(fp.Tags, '><'))[1]
+WHERE u.Reputation > 1000
+  AND (COALESCE(vts.VoteCount, 0) - COALESCE(vtsd.VoteCount, 0)) > 50
+  AND ua.LatestUserActivity > (DATE '2024-10-01' - INTERVAL '180' DAY)
+ORDER BY ur.ReputationRank, fp.Score DESC
+FETCH FIRST 100 ROWS ONLY;

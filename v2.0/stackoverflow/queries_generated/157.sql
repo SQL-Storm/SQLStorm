@@ -1,0 +1,298 @@
+-- {"query": "157.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2690} 
+with recent_posts as (
+    select
+        p.id,
+        p.posttypeid,
+        p.creationdate,
+        p.owneruserid,
+        p.score,
+        p.viewcount,
+        p.title,
+        p.tags,
+        p.acceptedanswerid,
+        p.parentid
+    from posts p
+    where p.creationdate >= (select max(creationdate) - interval '365 days' from posts)
+),
+user_activity as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        coalesce(u.location, 'Unknown') as location,
+        u.creationdate as user_creationdate,
+        count(distinct rp.id) as posts_last_year,
+        sum(case when rp.posttypeid = 1 then 1 else 0 end) as questions_last_year,
+        sum(case when rp.posttypeid = 2 then 1 else 0 end) as answers_last_year,
+        coalesce(sum(greatest(rp.score, 0)), 0) as nonneg_score_last_year,
+        coalesce(sum(nullif(rp.viewcount, 0)), 0) as views_last_year
+    from users u
+    left join recent_posts rp
+      on rp.owneruserid = u.id
+    group by u.id, u.displayname, u.reputation, coalesce(u.location, 'Unknown'), u.creationdate
+),
+votes_agg as (
+    select
+        v.postid,
+        sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+        sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+        sum(case when v.votetypeid = 1 then 1 else 0 end) as accepted_by_originator,
+        sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started,
+        sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded
+    from votes v
+    where v.creationdate >= (select max(creationdate) - interval '365 days' from posts)
+    group by v.postid
+),
+comment_stats as (
+    select
+        c.postid,
+        count(*) as comment_count,
+        max(c.score) as max_comment_score,
+        avg(c.score) as avg_comment_score
+    from comments c
+    where c.creationdate >= (select max(creationdate) - interval '365 days' from posts)
+    group by c.postid
+),
+badge_windows as (
+    select
+        b.userid,
+        b.name as badge_name,
+        b.class as badge_class,
+        b.date,
+        row_number() over (partition by b.userid order by b.date desc, b.id desc) as rn,
+        count(*) over (partition by b.userid) as total_badges,
+        sum(case when b.class = 1 then 1 else 0 end) over (partition by b.userid) as gold_badges,
+        sum(case when b.class = 2 then 1 else 0 end) over (partition by b.userid) as silver_badges,
+        sum(case when b.class = 3 then 1 else 0 end) over (partition by b.userid) as bronze_badges
+    from badges b
+),
+question_links as (
+    select
+        pl.postid as question_id,
+        sum(case when pl.linktypeid = 1 then 1 else 0 end) as linked_count,
+        sum(case when pl.linktypeid = 3 then 1 else 0 end) as dup_count
+    from postlinks pl
+    group by pl.postid
+),
+edits_cte as (
+    select
+        ph.postid,
+        count(*) filter (where ph.posthistorytypeid in (4,5,6)) as direct_edits,
+        count(*) filter (where ph.posthistorytypeid in (24)) as suggested_edits,
+        min(ph.creationdate) as first_edit_date,
+        max(ph.creationdate) as last_edit_date,
+        sum(case when ph.posthistorytypeid in (10,35) then 1 else 0 end) as closes_or_migrations
+    from posthistory ph
+    where ph.creationdate >= (select max(creationdate) - interval '365 days' from posts)
+    group by ph.postid
+),
+tag_explode as (
+    select
+        p.id as post_id,
+        unnest(string_to_array(substring(p.tags, 2, greatest(length(p.tags)-2,0)), '><')) as tag
+    from posts p
+    where p.posttypeid = 1
+      and p.tags is not null
+),
+top_tags as (
+    select
+        te.post_id,
+        string_agg(tt.tag, ',' order by tt.cnt desc, tt.tag) as top3_tags
+    from (
+        select te.post_id, te.tag, count(*) over (partition by te.tag) as cnt,
+               row_number() over (partition by te.post_id order by count(*) over (partition by te.tag) desc, te.tag) as rn
+        from tag_explode te
+    ) tt
+    where tt.rn <= 3
+    group by te.post_id
+),
+post_core as (
+    select
+        p.id,
+        p.posttypeid,
+        p.creationdate,
+        p.owneruserid,
+        p.score,
+        p.viewcount,
+        p.title,
+        p.tags,
+        p.acceptedanswerid,
+        p.parentid,
+        va.upvotes,
+        va.downvotes,
+        va.accepted_by_originator,
+        va.bounty_started,
+        va.bounty_awarded,
+        cs.comment_count,
+        cs.max_comment_score,
+        cs.avg_comment_score,
+        ec.direct_edits,
+        ec.suggested_edits,
+        ec.first_edit_date,
+        ec.last_edit_date,
+        ec.closes_or_migrations,
+        ql.linked_count,
+        ql.dup_count,
+        tt.top3_tags
+    from posts p
+    left join votes_agg va on va.postid = p.id
+    left join comment_stats cs on cs.postid = p.id
+    left join edits_cte ec on ec.postid = p.id
+    left join question_links ql on ql.question_id = p.id
+    left join top_tags tt on tt.post_id = p.id
+),
+answer_aggregation as (
+    select
+        p.parentid as question_id,
+        count(*) as answers_count,
+        avg(p.score) as avg_answer_score,
+        max(p.score) as max_answer_score,
+        sum(case when p.id = q.acceptedanswerid then 1 else 0 end) as accepted_present
+    from posts p
+    join posts q on q.id = p.parentid and q.posttypeid = 1
+    where p.posttypeid = 2
+    group by p.parentid
+),
+user_rank as (
+    select
+        ua.user_id,
+        ua.displayname,
+        ua.location,
+        ua.reputation,
+        ua.posts_last_year,
+        ua.questions_last_year,
+        ua.answers_last_year,
+        ua.nonneg_score_last_year,
+        ua.views_last_year,
+        bw.total_badges,
+        bw.gold_badges,
+        bw.silver_badges,
+        bw.bronze_badges,
+        bw.badge_name as latest_badge_name,
+        bw.badge_class as latest_badge_class,
+        dense_rank() over (order by ua.reputation desc, ua.nonneg_score_last_year desc nulls last, ua.posts_last_year desc) as rep_rank
+    from user_activity ua
+    left join badge_windows bw
+      on bw.userid = ua.user_id and bw.rn = 1
+),
+qualified_questions as (
+    select
+        pc.*,
+        aa.answers_count,
+        aa.avg_answer_score,
+        aa.max_answer_score,
+        aa.accepted_present,
+        u.displayname as owner_name,
+        ur.rep_rank,
+        ur.reputation as owner_reputation,
+        case
+            when pc.score is null then 'no-score'
+            when pc.score >= 10 then 'hot'
+            when pc.score between 0 and 9 then 'warm'
+            else 'cold'
+        end as heat_bucket,
+        case
+            when pc.closedate is not null then 'closed'
+            when pc.dup_count > 0 then 'duplicate'
+            else 'open'
+        end as state_bucket
+    from (
+        select
+            p.*,
+            p.lastactivitydate,
+            p.closedate
+        from posts p
+        where p.posttypeid = 1
+          and p.creationdate >= (select max(creationdate) - interval '365 days' from posts)
+    ) q
+    join post_core pc on pc.id = q.id
+    left join answer_aggregation aa on aa.question_id = q.id
+    left join users u on u.id = pc.owneruserid
+    left join user_rank ur on ur.user_id = pc.owneruserid
+),
+scored as (
+    select
+        qq.*,
+        coalesce(qq.upvotes,0) - coalesce(qq.downvotes,0) as net_votes,
+        coalesce(qq.views_last_year, 0) + coalesce(qq.viewcount, 0) as blended_views,
+        (coalesce(qq.answers_count,0) * 2)
+          + (case when qq.accepted_present > 0 then 5 else 0 end)
+          + (coalesce(qq.net_votes,0))
+          + (case when qq.dup_count > 0 then -3 else 0 end)
+          + (case when qq.direct_edits > 0 then 1 else 0 end)
+          + (case when qq.suggested_edits > 0 then 1 else 0 end)
+          + least(coalesce(qq.comment_count,0), 10)
+          + (case when qq.state_bucket = 'closed' then -5 else 0 end)
+          as engagement_score
+    from qualified_questions qq
+),
+banded as (
+    select
+        s.*,
+        ntile(10) over (order by s.engagement_score desc nulls last, s.creationdate desc) as decile,
+        row_number() over (partition by s.heat_bucket order by s.engagement_score desc nulls last, s.creationdate desc, s.id desc) as rn_heat,
+        row_number() over (order by s.engagement_score desc nulls last, s.creationdate desc, s.id desc) as rn_global
+    from scored s
+),
+dupe_groups as (
+    select
+        p.id as dup_id,
+        pl.relatedpostid as canonical_id
+    from postlinks pl
+    join posts p on p.id = pl.postid and p.posttypeid = 1
+    where pl.linktypeid = 3
+),
+dupe_rollup as (
+    select
+        dg.canonical_id,
+        count(distinct dg.dup_id) as dup_cluster_size
+    from dupe_groups dg
+    group by dg.canonical_id
+),
+final_set as (
+    select
+        b.*,
+        dr.dup_cluster_size,
+        coalesce(dr.dup_cluster_size, 0) as dup_cluster_size_coalesce,
+        case when dr.dup_cluster_size is null then false else true end as has_dupe_cluster
+    from banded b
+    left join dupe_rollup dr on dr.canonical_id = b.id
+)
+-- Final selection mixing set operators and complicated predicates
+select *
+from final_set f
+where
+    (
+        f.decile <= 3
+        and f.engagement_score >= (
+            select avg(engagement_score)
+            from scored
+            where heat_bucket = f.heat_bucket
+        )
+    )
+    or (
+        f.state_bucket in ('duplicate','closed')
+        and f.has_dupe_cluster = true
+        and exists (
+            select 1
+            from posthistory ph
+            where ph.postid = f.id
+              and ph.posthistorytypeid in (10,35,53)
+        )
+    )
+    or (
+        f.owner_reputation >= (
+            select percentile_disc(0.9) within group (order by reputation)
+            from users
+        )
+        and f.comment_count is not null
+        and f.avg_comment_score is not null
+        and (coalesce(f.avg_comment_score, 0) > 1.5 or coalesce(f.max_comment_score, 0) >= 5)
+    )
+union all
+select *
+from final_set f2
+where
+    f2.rn_global <= 50
+    and f2.creationdate >= (select max(creationdate) - interval '30 days' from posts)
+order by engagement_score desc nulls last, creationdate desc, id desc;

@@ -1,0 +1,174 @@
+-- {"query": "2629.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1649} 
+with RecursiveTagCounts as (
+    select
+        t.Id as TagId,
+        t.TagName,
+        p.Id as PostId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        u.Id as UserId,
+        u.Reputation,
+        row_number() over (partition by t.Id order by p.CreationDate) as TagPostRank
+    from Tags t
+    join Posts p on p.PostTypeId = 1 and  
+         exists (
+            select 1 
+            from unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><')) tag 
+            where tag = t.TagName
+         )
+    left join Users u on u.Id = p.OwnerUserId
+),
+UserBadgeStats as (
+    select
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges
+    from Badges b
+    group by b.UserId
+),
+UserActivitySummary as (
+    select
+        u.Id as UserId,
+        count(distinct p.Id) as TotalQuestions,
+        count(distinct a.Id) as TotalAnswers,
+        max(p.CreationDate) filter (where p.PostTypeId = 1) as LastQuestionDate,
+        max(a.CreationDate) filter (where a.PostTypeId = 2) as LastAnswerDate,
+        u.Reputation,
+        coalesce(badges.GoldBadges,0) as GoldBadges,
+        coalesce(badges.SilverBadges,0) as SilverBadges,
+        coalesce(badges.BronzeBadges,0) as BronzeBadges,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 1
+    left join Posts a on a.OwnerUserId = u.Id and a.PostTypeId = 2
+    left join UserBadgeStats badges on badges.UserId = u.Id
+    group by u.Id, u.Reputation, badges.GoldBadges, badges.SilverBadges, badges.BronzeBadges, u.Views, u.UpVotes, u.DownVotes
+),
+TopPostsPerTag as (
+    select
+        rtc.TagId,
+        rtc.TagName,
+        rtc.PostId,
+        rtc.CreationDate,
+        rtc.Score,
+        rtc.ViewCount,
+        ua.UserId,
+        ua.Reputation,
+        ua.GoldBadges,
+        ua.SilverBadges,
+        ua.BronzeBadges,
+        row_number() over (partition by rtc.TagId order by rtc.Score desc, rtc.ViewCount desc) as PostRank
+    from RecursiveTagCounts rtc
+    left join UserActivitySummary ua on ua.UserId = rtc.UserId
+),
+PostCommentsAgg as (
+    select 
+        c.PostId,
+        count(*) as CommentCount,
+        avg(c.Score) as AvgCommentScore,
+        bool_or(c.Text is null) as AnyNullCommentText
+    from Comments c
+    group by c.PostId
+),
+PostLinkSummary as (
+    select
+        pl.PostId,
+        count(distinct case when lt.Name = 'Duplicate' then pl.RelatedPostId end) as DuplicateCount,
+        count(distinct case when lt.Name = 'Linked' then pl.RelatedPostId end) as LinkedCount
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    group by pl.PostId
+),
+AnswerStats as (
+    select
+        p.ParentId as QuestionId,
+        count(p.Id) as AnswerCount,
+        max(p.Score) as MaxAnswerScore,
+        avg(p.Score) as AvgAnswerScore,
+        sum(case when p.Score > 10 then 1 else 0 end) as HighlyVotedAnswers
+    from Posts p
+    where p.PostTypeId = 2
+    group by p.ParentId
+),
+ComplexPostAnalysis as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        ua.UserId as QuestionOwnerId,
+        ua.Reputation as QuestionOwnerReputation,
+        ua.GoldBadges,
+        ua.SilverBadges,
+        ua.BronzeBadges,
+        coalesce(pc.CommentCount, 0) as CommentCount,
+        pc.AvgCommentScore,
+        coalesce(pls.DuplicateCount, 0) as DuplicateLinks,
+        coalesce(pls.LinkedCount, 0) as LinkedPosts,
+        coalesce(ans.AnswerCount,0) as AnswerCount,
+        coalesce(ans.MaxAnswerScore,0) as BestAnswerScore,
+        coalesce(ans.AvgAnswerScore,0) as AverageAnswerScore,
+        coalesce(ans.HighlyVotedAnswers,0) as HighScoreAnswers,
+        row_number() over (partition by ua.UserId order by q.CreationDate desc) as UserQuestionRank,
+        exists (
+          select 1
+          from Votes v
+          where v.PostId = q.Id and v.VoteTypeId = 3 -- DownMod
+            and v.CreationDate > q.CreationDate
+            and v.UserId is not null
+            and v.UserId <> q.OwnerUserId
+            and v.CreationDate < q.CreationDate + interval '7 days'
+            limit 1
+        ) as HasEarlyDownvotes,
+        case 
+          when q.ClosedDate is not null then 'Closed'
+          when ans.AnswerCount = 0 then 'Unanswered'
+          else 'Active'
+        end as QuestionStatus
+    from Posts q
+    left join UserActivitySummary ua on ua.UserId = q.OwnerUserId
+    left join PostCommentsAgg pc on pc.PostId = q.Id
+    left join PostLinkSummary pls on pls.PostId = q.Id
+    left join AnswerStats ans on ans.QuestionId = q.Id
+    where q.PostTypeId = 1
+)
+select 
+    cpa.QuestionId,
+    cpa.Title,
+    cpa.CreationDate,
+    cpa.Score,
+    cpa.ViewCount,
+    cpa.Reputation as QuestionOwnerReputation,
+    cpa.GoldBadges,
+    cpa.SilverBadges,
+    cpa.BronzeBadges,
+    cpa.CommentCount,
+    coalesce(cpa.AvgCommentScore,0) as AverageCommentScore,
+    cpa.DuplicateLinks,
+    cpa.LinkedPosts,
+    cpa.AnswerCount,
+    cpa.BestAnswerScore,
+    round(cpa.AverageAnswerScore,2) as RoundedAverageAnswerScore,
+    cpa.HighScoreAnswers,
+    cpa.UserQuestionRank,
+    cpa.HasEarlyDownvotes,
+    cpa.QuestionStatus,
+    -- Compute a complex string expression blending title, status, and badges
+    concat(
+        substring(cpa.Title, 1, 40), 
+        ' [', cpa.QuestionStatus, '] ',
+        ' (G:', cpa.GoldBadges, ',S:', cpa.SilverBadges, ',B:', cpa.BronzeBadges, ') ', 
+        case when cpa.HasEarlyDownvotes then '⚠ Early downvotes' else '✔ Clean start' end
+    ) as SummaryString
+from ComplexPostAnalysis cpa
+where cpa.Score > 5
+  and cpa.ViewCount > 100
+  and cpa.AnswerCount > 2
+  and (cpa.DuplicateLinks + cpa.LinkedPosts) > 0
+order by cpa.Score desc, cpa.ViewCount desc
+limit 100;

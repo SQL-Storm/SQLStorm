@@ -1,0 +1,122 @@
+-- {"query": "5635.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 852} 
+WITH RankedPosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.ViewCount,
+    p.Score,
+    p.OwnerUserId,
+    p.Tags,
+    p.ParentId,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ContentLicense,
+    ROW_NUMBER() OVER (
+      ORDER BY
+        p.Score DESC,
+        p.ViewCount DESC,
+        p.LastActivityDate DESC,
+        p.CreationDate DESC
+    ) AS rn
+  FROM Posts p
+  LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  WHERE p.PostTypeId = 1 -- Questions
+    AND p.ClosedDate IS NULL
+),
+TopQ AS (
+  SELECT * FROM RankedPosts WHERE rn <= 100
+),
+Expanded AS (
+  SELECT
+    tq.PostId,
+    tq.Title,
+    tq.CreationDate,
+    tq.LastActivityDate,
+    tq.ViewCount,
+    tq.Score,
+    tq.OwnerUserId,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation,
+    u.CreationDate AS OwnerCreationDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    COALESCE(b.Count, 0) AS TagCount,
+    STRING_AGG(CONCAT(t.TagName, ':', t.Count), ',') AS TagSummary
+  FROM TopQ tq
+  LEFT JOIN Users u ON u.Id = tq.OwnerUserId
+  LEFT JOIN (
+    SELECT t.Id, t.TagName, t.Count
+    FROM Tags t
+  ) t ON 1=1
+  LEFT JOIN (
+    SELECT TagName, Count
+    FROM Tags
+  ) AS tagset ON 1=1
+  LEFT JOIN LATERAL (
+    SELECT COUNT(*) AS Count
+  ) b ON 1=1
+  GROUP BY
+    tq.PostId, tq.Title, tq.CreationDate, tq.LastActivityDate, tq.ViewCount, tq.Score,
+    tq.OwnerUserId, u.DisplayName, u.Reputation, u.CreationDate, u.Location, u.Views, u.UpVotes, u.DownVotes
+),
+CorrelatedAgg AS (
+  SELECT
+    e.PostId,
+    e.Title,
+    e.OwnerDisplayName,
+    e.Reputation,
+    e.TagSummary,
+    e.TagCount,
+    e.LastActivityDate,
+    e.ViewCount,
+    e.Score,
+    COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotes,
+    COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVotes,
+    MAX(CASE WHEN v.VoteTypeId = 8 THEN v.BountyAmount ELSE NULL END) AS Bounty
+  FROM Expanded e
+  LEFT JOIN Votes v ON v.PostId = e.PostId
+  GROUP BY
+    e.PostId, e.Title, e.OwnerDisplayName, e.Reputation, e.TagSummary, e.TagCount, e.LastActivityDate,
+    e.ViewCount, e.Score
+),
+Final AS (
+  SELECT
+    ca.PostId,
+    ca.Title,
+    ca.OwnerDisplayName,
+    ca.Reputation,
+    ca.TagSummary,
+    ca.TagCount,
+    ca.LastActivityDate,
+    ca.ViewCount,
+    ca.Score,
+    ca.UpVotes,
+    ca.DownVotes,
+    ca.Bounty,
+    ROW_NUMBER() OVER (ORDER BY ca.LastActivityDate DESC, ca.ViewCount DESC, ca.Score DESC) AS rank
+  FROM CorrelatedAgg ca
+)
+SELECT
+  f.PostId,
+  f.Title,
+  f.OwnerDisplayName,
+  f.Reputation,
+  f.TagSummary,
+  f.TagCount,
+  f.LastActivityDate,
+  f.ViewCount,
+  f.Score,
+  f.UpVotes,
+  f.DownVotes,
+  f.Bounty,
+  f.rank
+FROM Final f
+WHERE f.rank <= 50
+ORDER BY f.rank;

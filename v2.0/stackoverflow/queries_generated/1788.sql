@@ -1,0 +1,200 @@
+-- {"query": "1788.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2690} 
+
+WITH UserEngagementSummary AS (
+    -- Aggregates user activity, including post counts, comment counts, badge counts, and vote statistics.
+    -- Demonstrates LEFT JOIN to include users who might not have posts/comments/badges.
+    -- Includes correlated subqueries for actual up/down votes cast by the user, which might differ from cached values.
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsOwned,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersOwned,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT B.Id) AS TotalBadgesEarned,
+        SUM(P.Score) AS TotalPostScoreByOwner,
+        SUM(P.ViewCount) AS TotalPostViewsByOwner,
+        U.UpVotes AS UserUpVotesGivenCache, -- Cached value from Users table
+        U.DownVotes AS UserDownVotesGivenCache, -- Cached value from Users table
+        (SELECT COUNT(V.Id) FROM Votes V WHERE V.UserId = U.Id AND V.VoteTypeId = 2) AS ActualUpVotesGiven, -- Correlated subquery for actual votes
+        (SELECT COUNT(V.Id) FROM Votes V WHERE V.UserId = U.Id AND V.VoteTypeId = 3) AS ActualDownVotesGiven, -- Correlated subquery for actual votes
+        MAX(U.LastAccessDate) AS LastUserActivityDate,
+        AVG(EXTRACT(DAY FROM (P.CreationDate - U.CreationDate))) AS AvgDaysToFirstPost -- PostgreSQL DATEDIFF equivalent
+    FROM
+        Users AS U
+    LEFT JOIN
+        Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN
+        Comments AS C ON U.Id = C.UserId
+    LEFT JOIN
+        Badges AS B ON U.Id = B.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.UpVotes, U.DownVotes, U.LastAccessDate
+),
+PostCommentStats AS (
+    -- Aggregates comment statistics for each post.
+    SELECT
+        PostId,
+        COUNT(Id) AS ActualCommentCount,
+        AVG(CAST(Score AS DECIMAL)) AS AvgCommentScore,
+        MAX(CreationDate) AS LatestCommentDate,
+        MIN(CreationDate) AS EarliestCommentDate
+    FROM Comments
+    GROUP BY PostId
+),
+PostDetailedPerformance AS (
+    -- Analyzes detailed post performance metrics, including history, text analysis, and window functions.
+    -- Includes string expressions, NULL logic (COALESCE, NULLIF), and subqueries for history counts.
+    -- Extracts the primary tag using string manipulation.
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.FavoriteCount,
+        P.Title,
+        P.Tags,
+        P.AcceptedAnswerId,
+        P.ParentId,
+        P.ClosedDate,
+        P.CommunityOwnedDate,
+        U_Owner.DisplayName AS OwnerDisplayName,
+        EXTRACT(EPOCH FROM (P.LastActivityDate - P.CreationDate)) / 3600 AS HoursToLastActivity, -- PostgreSQL DATEDIFF equivalent for hours
+        NULLIF(CHAR_LENGTH(TRIM(P.Body)), 0) AS BodyCharCount, -- Character length, excluding leading/trailing whitespace
+        (LENGTH(P.Body) - LENGTH(REPLACE(P.Body, '<code>', ''))) / LENGTH('<code>') AS CodeBlockCount, -- Counts occurrences of '<code>'
+        (SELECT COUNT(PH_Inner.Id)
+         FROM PostHistory PH_Inner
+         WHERE PH_Inner.PostId = P.Id
+           AND PH_Inner.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9) -- Edit/Rollback Title/Body/Tags
+        ) AS MajorEditCount,
+        (SELECT COUNT(DISTINCT PH_Close.Id)
+         FROM PostHistory PH_Close
+         WHERE PH_Close.PostId = P.Id
+           AND PH_Close.PostHistoryTypeId IN (10, 101, 102, 103, 104, 105)
+        ) AS PostCloseEvents,
+        (SELECT COUNT(DISTINCT PH_Reopen.Id)
+         FROM PostHistory PH_Reopen
+         WHERE PH_Reopen.PostId = P.Id
+           AND PH_Reopen.PostHistoryTypeId = 11
+        ) AS PostReopenEvents,
+        COALESCE(PCS.ActualCommentCount, 0) AS ActualCommentCount, -- NULL logic
+        COALESCE(PCS.AvgCommentScore, 0.0) AS AvgCommentScore, -- NULL logic
+        CASE WHEN P.PostTypeId = 1 THEN
+            RANK() OVER (PARTITION BY EXTRACT(YEAR FROM P.CreationDate) ORDER BY P.Score DESC, P.ViewCount DESC)
+        ELSE NULL END AS YearlyQuestionScoreRank, -- Window function
+        CASE
+            WHEN P.ClosedDate IS NOT NULL AND P.CommunityOwnedDate IS NOT NULL THEN 'Closed & Community Owned'
+            WHEN P.ClosedDate IS NOT NULL THEN 'Closed Only'
+            WHEN P.CommunityOwnedDate IS NOT NULL THEN 'Community Owned Only'
+            ELSE 'Neither Closed Nor Community Owned'
+        END AS ClosureCommunityStatus, -- NULL logic
+        CAST(COALESCE(P.Score + P.FavoriteCount + COALESCE(PCS.ActualCommentCount, 0) + COALESCE(P.AnswerCount, 0), 0) AS DECIMAL)
+        / NULLIF(P.ViewCount, 0) AS EngagementRatio, -- Complicated calculation with NULLIF
+        CASE
+            WHEN P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2 THEN
+                TRIM(SUBSTRING(P.Tags, 2, POSITION('><' IN P.Tags || '><') - 2))
+            ELSE NULL
+        END AS PrimaryTag -- String expression for extracting the first tag
+    FROM
+        Posts AS P
+    INNER JOIN
+        PostTypes AS PT ON P.PostTypeId = PT.Id
+    LEFT JOIN
+        Users AS U_Owner ON P.OwnerUserId = U_Owner.Id
+    LEFT JOIN
+        PostCommentStats AS PCS ON P.Id = PCS.PostId
+    WHERE P.PostTypeId IN (1, 2) -- Focus on Questions and Answers
+),
+TagGlobalMetrics AS (
+    -- Aggregates global metrics for each tag from the Tags table and Badges.
+    SELECT
+        T.TagName,
+        T.Id AS TagId,
+        T.Count AS TagsTableEntryCount,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadgesForTag,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadgesForTag,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadgesForTag
+    FROM
+        Tags AS T
+    LEFT JOIN
+        Badges AS B ON B.TagBased = TRUE AND B.Name = T.TagName
+    GROUP BY
+        T.TagName, T.Id, T.Count
+),
+PrimaryTagPostAggregates AS (
+    -- Aggregates post-related metrics for each primary tag.
+    SELECT
+        PDP.PrimaryTag AS TagName,
+        COUNT(PDP.PostId) AS NumberOfQuestionsWithPrimaryTag,
+        SUM(PDP.PostScore) AS TotalScoreForPrimaryTag,
+        AVG(CAST(PDP.ViewCount AS DECIMAL)) AS AvgViewsForPrimaryTag
+    FROM
+        PostDetailedPerformance AS PDP
+    WHERE
+        PDP.PostTypeId = 1 AND PDP.PrimaryTag IS NOT NULL
+    GROUP BY
+        PDP.PrimaryTag
+),
+PostNetworkMetrics AS (
+    -- Analyzes post links (linked/duplicate) and includes a correlated subquery for related post owner reputation.
+    SELECT
+        P.Id AS PostId,
+        SUM(CASE WHEN PL.LinkTypeId = 1 THEN 1 ELSE 0 END) AS OutgoingLinksCount,
+        SUM(CASE WHEN PL.LinkTypeId = 3 THEN 1 ELSE 0 END) AS OutgoingDuplicateLinksCount,
+        (SELECT COUNT(PL_IN.Id) FROM PostLinks PL_IN WHERE PL_IN.RelatedPostId = P.Id AND PL_IN.LinkTypeId = 1) AS IncomingLinksCount,
+        (SELECT COUNT(PL_DUP_IN.Id) FROM PostLinks PL_DUP_IN WHERE PL_DUP_IN.RelatedPostId = P.Id AND PL_DUP_IN.LinkTypeId = 3) AS IncomingDuplicateLinksCount,
+        (SELECT MAX(U.Reputation)
+         FROM Posts P_Related
+         JOIN PostLinks PL_Related ON P_Related.Id = PL_Related.PostId AND PL_Related.RelatedPostId = P.Id
+         JOIN Users U ON P_Related.OwnerUserId = U.Id
+         WHERE PL_Related.LinkTypeId = 1 AND U.Reputation IS NOT NULL
+        ) AS MaxReputationOfLinkedPostOwner -- Correlated subquery
+    FROM
+        Posts AS P
+    LEFT JOIN
+        PostLinks AS PL ON P.Id = PL.PostId
+    GROUP BY P.Id
+),
+ClosedPostReasons AS (
+    -- Determines closure reasons and migration status from post history.
+    -- Handles both old (PostHistoryTypeId=10 with CloseReasonId in Comment) and new close reasons.
+    SELECT
+        PH.PostId,
+        MAX(CR_Lookup.Name) AS LastCloseReason, -- Max is used for simplicity, not necessarily the *last* chronologically
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (10, 101, 102, 103, 104, 105) THEN PH.Id END) AS TotalCloseEvents,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 35 THEN 1 ELSE 0 END) AS WasMigratedAway,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 36 THEN 1 ELSE 0 END) AS WasMigratedHere
+    FROM
+        PostHistory AS PH
+    LEFT JOIN
+        CloseReasonTypes AS CR_Lookup
+        ON (PH.PostHistoryTypeId = 10 AND PH.Comment = CAST(CR_Lookup.Id AS VARCHAR(50))) -- Old close reasons
+        OR (PH.PostHistoryTypeId IN (101, 102, 103, 104, 105) AND PH.PostHistoryTypeId = CR_Lookup.Id) -- New close reasons
+    GROUP BY
+        PH.PostId
+),
+CombinedCriteriaPosts AS (
+    -- Uses a SET OPERATOR (UNION ALL) to combine posts based on different criteria.
+    -- This CTE demonstrates selecting from two distinct sets of data.
+    SELECT
+        PDP.PostId,
+        'HighlyEngagedAndVoted' AS Criteria_Type,
+        PDP.PostCreationDate,
+        PDP.OwnerUserId
+    FROM
+        PostDetailedPerformance AS PDP
+    WHERE
+        PDP.PostScore > 500
+        AND PDP.EngagementRatio > 0.1
+        AND PDP.PostTypeId = 1
+    UNION ALL
+    SELECT
+        PDP.PostId,
+        'RecentlyModifiedAndViewed' AS Criteria_Type,
+        PDP.PostCreationDate,

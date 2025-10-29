@@ -1,0 +1,383 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        COALESCE(SUM(p.Score), 0) as TotalPostScore,
+        COALESCE(SUM(p.ViewCount), 0) as TotalViews,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(p.LastActivityDate) as LastActivityDate,
+        LAG(MAX(p.CreationDate)) OVER (ORDER BY u.Id) as PreviousPostDate,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY MAX(p.CreationDate)) as PostSequence,
+        AVG(COALESCE(p.Score, 0)) OVER (PARTITION BY u.Id) as AvgPostScore,
+        NTILE(4) OVER (ORDER BY u.Reputation DESC) as RepQuartile,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 100 THEN 'High'
+            WHEN COUNT(DISTINCT p.Id) > 50 THEN 'Medium'
+            WHEN COUNT(DISTINCT p.Id) > 10 THEN 'Low'
+            ELSE 'Minimal'
+        END as ActivityLevel,
+        COALESCE(
+            (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = u.Id AND PostTypeId = 1 AND Score > 10),
+            0
+        ) as HighScoreQuestions,
+        COALESCE(
+            (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = u.Id AND PostTypeId = 2 AND Score > 5),
+            0
+        ) as HighScoreAnswers,
+        ROW_NUMBER() OVER (ORDER BY COALESCE(SUM(p.Score), 0) DESC) as RankByScore,
+        CASE 
+            WHEN u.EmailHash IS NOT NULL THEN 'Verified'
+            WHEN u.WebsiteUrl IS NOT NULL THEN 'HasWebsite'
+            WHEN u.Location IS NOT NULL THEN 'HasLocation'
+            ELSE 'Basic'
+        END as ProfileCompleteness,
+        CASE WHEN u.AccountId IS NOT NULL THEN u.AccountId ELSE 0 END as AccountIdOrNull
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.EmailHash, u.WebsiteUrl, u.Location, u.AccountId
+),
+QuestionStats AS (
+    SELECT 
+        p.Id as QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Tags,
+        LAG(p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PrevQuestionDate,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PrevQuestionScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as AvgScorePerUser,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) as ScoreRank,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) as GlobalScoreRank,
+        (p.CreationDate - LAG(p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate)) as DaysBetweenQuestions,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags != '' THEN 
+                (LENGTH(p.Tags) - LENGTH(REPLACE(p.Tags, '><', '')) + 1)
+            ELSE 0
+        END as TagCount,
+        CASE 
+            WHEN LENGTH(p.Title) > 50 THEN 'LongTitle'
+            WHEN LENGTH(p.Title) > 20 THEN 'MediumTitle'
+            ELSE 'ShortTitle'
+        END as TitleLengthCategory,
+        CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 'HasAccepted' ELSE 'NoAccepted' END as AnswerStatus
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+AnswerStats AS (
+    SELECT 
+        p.Id as AnswerId,
+        p.ParentId,
+        p.OwnerUserId,
+        p.Score,
+        p.CreationDate,
+        p.LastEditDate,
+        CASE 
+            WHEN p.LastEditDate IS NOT NULL AND p.CreationDate < p.LastEditDate THEN 
+                EXTRACT(EPOCH FROM (p.LastEditDate - p.CreationDate)) / 3600.0
+            ELSE 0
+        END as EditHours,
+        ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC) as AnswerRank,
+        COALESCE(
+            (SELECT AVG(p2.Score) FROM Posts p2 WHERE p2.ParentId = p.ParentId),
+            0
+        ) as AvgAnswerScorePerQuestion,
+        CASE 
+            WHEN p.Score > 10 AND p.OwnerUserId IS NOT NULL THEN 'HighValue'
+            WHEN p.Score > 5 THEN 'MediumValue'
+            ELSE 'LowValue'
+        END as AnswerQualityRank,
+        LAG(p.Score) OVER (PARTITION BY p.ParentId ORDER BY p.CreationDate) as PrevAnswerScore
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+),
+UserPostPerformance AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.PostCount,
+        uas.QuestionCount,
+        uas.AnswerCount,
+        uas.TotalPostScore,
+        uas.AvgPostScore,
+        uss.QuestionId,
+        uss.Title,
+        uss.Score as QuestionScore,
+        uss.ViewCount,
+        uss.AnswerCount as QuestionAnswerCount,
+        uss.CommentCount,
+        uss.CreationDate as QuestionCreationDate,
+        uss.GlobalScoreRank,
+        uss.TagCount,
+        uss.TitleLengthCategory,
+        uss.AnswerStatus,
+        CASE WHEN uss.Score > (SELECT AVG(qs.Score) FROM QuestionStats qs WHERE qs.OwnerUserId = uas.UserId) THEN 'AboveAverage' ELSE 'BelowAverage' END as ScorePerformance
+    FROM UserActivityStats uas
+    INNER JOIN QuestionStats uss ON uas.UserId = uss.OwnerUserId
+    WHERE uas.PostCount > 0
+),
+UserAnswerPerformance AS (
+    SELECT 
+        uas.UserId,
+        uas.Reputation,
+        uas.AnswerCount,
+        uas.TotalPostScore,
+        COUNT(ass.AnswerId) as TotalAnswers,
+        AVG(ass.Score) as AvgAnswerScore,
+        MAX(ass.Score) as MaxAnswerScore,
+        MIN(ass.Score) as MinAnswerScore,
+        SUM(ass.Score) as TotalAnswerScore,
+        COUNT(CASE WHEN ass.Score > 0 THEN 1 END) as PositiveScoreAnswers,
+        COUNT(CASE WHEN ass.Score < 0 THEN 1 END) as NegativeScoreAnswers,
+        COUNT(CASE WHEN ass.Score = 0 THEN 1 END) as ZeroScoreAnswers
+    FROM UserActivityStats uas
+    LEFT JOIN AnswerStats ass ON uas.UserId = ass.OwnerUserId
+    GROUP BY uas.UserId, uas.Reputation, uas.AnswerCount, uas.TotalPostScore
+),
+TopUsersByScore AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        TotalPostScore,
+        RANK() OVER (ORDER BY TotalPostScore DESC) as ScoreRank,
+        CASE WHEN Reputation > 10000 THEN 'HighReputation' ELSE 'NormalReputation' END as RepCategory,
+        CASE 
+            WHEN RANK() OVER (ORDER BY TotalPostScore DESC) <= 10 THEN 'Top10'
+            WHEN RANK() OVER (ORDER BY TotalPostScore DESC) <= 50 THEN 'Top50'
+            WHEN RANK() OVER (ORDER BY TotalPostScore DESC) <= 100 THEN 'Top100'
+            ELSE 'Others'
+        END as Category
+    FROM UserActivityStats
+    WHERE TotalPostScore > 0
+),
+ComplexAnalysis AS (
+    SELECT 
+        upp.UserId,
+        upp.DisplayName,
+        upp.Reputation,
+        upp.PostCount,
+        upp.QuestionCount,
+        upp.AnswerCount,
+        upp.TotalPostScore,
+        upp.AvgPostScore,
+        upp.QuestionId,
+        upp.QuestionScore,
+        upp.ViewCount,
+        upp.QuestionAnswerCount,
+        upp.CommentCount,
+        upp.QuestionCreationDate,
+        upp.GlobalScoreRank,
+        upp.TagCount,
+        upp.TitleLengthCategory,
+        upp.AnswerStatus,
+        upp.ScorePerformance,
+        uap.TotalAnswers,
+        uap.AvgAnswerScore,
+        uap.MaxAnswerScore,
+        uap.MinAnswerScore,
+        uap.TotalAnswerScore,
+        uap.PositiveScoreAnswers,
+        uap.NegativeScoreAnswers,
+        uap.ZeroScoreAnswers,
+        tu.ScoreRank as TopUserRank,
+        tu.RepCategory,
+        tu.Category,
+        COALESCE(
+            (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = upp.UserId AND p2.PostTypeId = 1 AND p2.Score > 0),
+            0
+        ) as PositiveQuestions,
+        COALESCE(
+            (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = upp.UserId AND p2.PostTypeId = 1 AND p2.Score < 0),
+            0
+        ) as NegativeQuestions,
+        COALESCE(
+            (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = upp.UserId AND p2.PostTypeId = 1 AND p2.Score = 0),
+            0
+        ) as NeutralQuestions,
+        ROW_NUMBER() OVER (PARTITION BY upp.UserId ORDER BY upp.QuestionScore DESC) as QuestionScoreRow,
+        COUNT(*) OVER (PARTITION BY upp.UserId) as QuestionsPerUser,
+        COALESCE(
+            (SELECT COUNT(*) FROM Badges b2 WHERE b2.UserId = upp.UserId AND b2.Class = 1),
+            0
+        ) as GoldBadges,
+        COALESCE(
+            (SELECT COUNT(*) FROM Badges b2 WHERE b2.UserId = upp.UserId AND b2.Class = 2),
+            0
+        ) as SilverBadges,
+        COALESCE(
+            (SELECT COUNT(*) FROM Badges b2 WHERE b2.UserId = upp.UserId AND b2.Class = 3),
+            0
+        ) as BronzeBadges,
+        CASE 
+            WHEN upp.QuestionCount > 0 AND upp.AnswerCount > 0 THEN 
+                (CAST(upp.AnswerCount AS DOUBLE PRECISION) / CAST(upp.QuestionCount AS DOUBLE PRECISION))
+            ELSE 0
+        END as AnswerToQuestionRatio,
+        CASE WHEN upp.AnswerCount >= 50 AND upp.QuestionCount >= 10 THEN 'HighActivity' ELSE 'NormalActivity' END as ActivityLevel,
+        COALESCE(
+            (SELECT MAX(p3.CreationDate) FROM Posts p3 WHERE p3.OwnerUserId = upp.UserId AND p3.PostTypeId = 1),
+            TIMESTAMP '1900-01-01'
+        ) as LastQuestionDate,
+        COALESCE(
+            (SELECT MAX(p3.CreationDate) FROM Posts p3 WHERE p3.OwnerUserId = upp.UserId AND p3.PostTypeId = 2),
+            TIMESTAMP '1900-01-01'
+        ) as LastAnswerDate
+    FROM UserPostPerformance upp
+    LEFT JOIN UserAnswerPerformance uap ON upp.UserId = uap.UserId
+    LEFT JOIN TopUsersByScore tu ON upp.UserId = tu.UserId
+    WHERE upp.QuestionScore > 0
+),
+FinalAggregation AS (
+    SELECT 
+        'User Analysis Summary' as ReportType,
+        COUNT(DISTINCT UserId) as TotalUsers,
+        COUNT(DISTINCT QuestionId) as TotalQuestions,
+        SUM(PostCount) as TotalPosts,
+        SUM(QuestionCount) as TotalQuestionsPosted,
+        SUM(AnswerCount) as TotalAnswersPosted,
+        SUM(TotalPostScore) as CombinedScore,
+        AVG(Reputation) as AverageReputation,
+        AVG(TotalPostScore) as AvgUserScore,
+        MAX(Reputation) as MaxReputation,
+        MIN(Reputation) as MinReputation,
+        COUNT(*) as RecordsProcessed,
+        CAST(NULL AS INTEGER) as UserId,
+        CAST(NULL AS TEXT) as DisplayName,
+        CAST(NULL AS INTEGER) as QuestionId,
+        CAST(NULL AS INTEGER) as QuestionScore,
+        CAST(NULL AS INTEGER) as ViewCount,
+        CAST(NULL AS INTEGER) as AnswerCount,
+        CAST(NULL AS INTEGER) as CommentCount
+    FROM ComplexAnalysis
+    
+    UNION ALL
+    
+    SELECT 
+        'Top 10 Users by Score' as ReportType,
+        0 as TotalUsers,
+        0 as TotalQuestions,
+        0 as TotalPosts,
+        0 as TotalQuestionsPosted,
+        0 as TotalAnswersPosted,
+        0 as CombinedScore,
+        0 as AverageReputation,
+        0 as AvgUserScore,
+        0 as MaxReputation,
+        0 as MinReputation,
+        0 as RecordsProcessed,
+        UserId,
+        DisplayName,
+        CAST(NULL AS INTEGER) as QuestionId,
+        QuestionScore,
+        ViewCount,
+        AnswerCount,
+        CommentCount
+    FROM ComplexAnalysis
+    WHERE TopUserRank <= 10
+    -- ORDER BY cannot appear before UNION ALL, will be applied in outer query
+    
+    UNION ALL
+    
+    SELECT 
+        'Question Analysis' as ReportType,
+        0 as TotalUsers,
+        COUNT(*) as TotalQuestions,
+        0 as TotalPosts,
+        0 as TotalQuestionsPosted,
+        0 as TotalAnswersPosted,
+        SUM(QuestionScore) as CombinedScore,
+        0 as AverageReputation,
+        AVG(QuestionScore) as AvgQuestionScore,
+        MAX(QuestionScore) as MaxQuestionScore,
+        MIN(QuestionScore) as MinQuestionScore,
+        COUNT(*) as RecordsProcessed,
+        UserId,
+        CAST(NULL AS TEXT) as DisplayName,
+        QuestionId,
+        QuestionScore,
+        ViewCount,
+        QuestionAnswerCount,
+        CAST(NULL AS INTEGER) as CommentCount
+    FROM ComplexAnalysis
+    GROUP BY UserId, QuestionId, QuestionScore, ViewCount, QuestionAnswerCount
+    
+    UNION ALL
+    
+    SELECT 
+        'Tag Statistics' as ReportType,
+        0 as TotalUsers,
+        0 as TotalQuestions,
+        0 as TotalPosts,
+        0 as TotalQuestionsPosted,
+        0 as TotalAnswersPosted,
+        0 as CombinedScore,
+        0 as AverageReputation,
+        0 as AvgUserScore,
+        0 as MaxReputation,
+        0 as MinReputation,
+        COUNT(*) as RecordsProcessed,
+        CAST(NULL AS INTEGER) as UserId,
+        CAST(NULL AS TEXT) as DisplayName,
+        CAST(NULL AS INTEGER) as QuestionId,
+        CAST(NULL AS INTEGER) as QuestionScore,
+        TagCount,
+        CAST(NULL AS INTEGER) as AnswerCount,
+        CAST(NULL AS INTEGER) as CommentCount
+    FROM ComplexAnalysis
+    WHERE TagCount > 0
+    GROUP BY TagCount
+)
+SELECT 
+    ReportType,
+    TotalUsers,
+    TotalQuestions,
+    TotalPosts,
+    TotalQuestionsPosted,
+    TotalAnswersPosted,
+    CombinedScore,
+    AverageReputation,
+    AvgUserScore,
+    MaxReputation,
+    MinReputation,
+    RecordsProcessed,
+    UserId,
+    DisplayName,
+    QuestionId,
+    QuestionScore,
+    ViewCount,
+    AnswerCount,
+    CommentCount
+FROM FinalAggregation
+WHERE ReportType IN ('User Analysis Summary', 'Top 10 Users by Score')
+ORDER BY 
+    CASE ReportType 
+        WHEN 'User Analysis Summary' THEN 1
+        WHEN 'Top 10 Users by Score' THEN 2
+        ELSE 3
+    END,
+    CASE ReportType 
+        WHEN 'User Analysis Summary' THEN 0
+        WHEN 'Top 10 Users by Score' THEN 1
+        ELSE 2
+    END,
+    QuestionScore DESC NULLS LAST,
+    CombinedScore DESC NULLS LAST,
+    TotalPosts DESC NULLS LAST
+LIMIT 1000;

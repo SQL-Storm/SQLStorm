@@ -1,0 +1,181 @@
+-- {"query": "2263.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1652} 
+with RecursiveTagHierarchy as (
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 as Level
+    from Tags t
+    where t.IsRequired = 1
+
+    union all
+
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        r.Level + 1
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id = r.Id + 1
+    where t.IsRequired = 0 and r.Level < 3
+),
+UserBadgeCounts as (
+    select 
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        count(*) as TotalBadges
+    from Badges b
+    group by b.UserId
+),
+PostScoresWithRanks as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Title,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc nulls last, p.ViewCount desc nulls last) as UserPostRank,
+        dense_rank() over (partition by p.PostTypeId order by p.Score desc) as ScoreRank
+    from Posts p
+    where p.PostTypeId in (1,2)
+),
+TopPostsWithAnswers as (
+    select 
+        q.Id as QuestionId,
+        q.Title as QuestionTitle,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViews,
+        q.OwnerUserId as QuestionOwner,
+        coalesce(a.AnswerCount,0) as AnswerCount,
+        coalesce(aa.AcceptedAnswerScore, 0) as AcceptedAnswerScore,
+        coalesce(aa.AcceptedAnswerOwnerReputation,0) as AcceptedAnswerOwnerReputation
+    from Posts q
+    left join (
+        select ParentId, count(*) as AnswerCount 
+        from Posts 
+        where PostTypeId = 2
+        group by ParentId
+    ) a on q.Id = a.ParentId
+    left join (
+        select a.ParentId,
+            max(a.Score) as AcceptedAnswerScore,
+            u.Reputation as AcceptedAnswerOwnerReputation
+        from Posts a
+        left join Users u on a.OwnerUserId = u.Id
+        where a.PostTypeId = 2 and a.Id in (
+            select AcceptedAnswerId from Posts where AcceptedAnswerId is not null
+        )
+        group by a.ParentId, u.Reputation
+    ) aa on q.Id = aa.ParentId
+    where q.PostTypeId = 1 
+        and q.CreationDate >= (cast('2024-10-01' as date) - interval '6 months')
+),
+CommentRichness as (
+    select 
+        c.PostId,
+        count(c.Id) as CommentCount,
+        avg(length(c.Text)) as AvgCommentLength,
+        sum(case when c.UserId is null then 1 else 0 end) as AnonymousComments,
+        sum(case when c.Text ~* 'bug|error|fail|issue' then 1 else 0 end) as ProblematicComments
+    from Comments c
+    group by c.PostId
+),
+VotesSummary as (
+    select 
+        v.PostId,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+        sum(case when v.VoteTypeId = 8 then coalesce(v.BountyAmount,0) else 0 end) as TotalBounty,
+        count(distinct v.UserId) as UniqueVoters
+    from Votes v
+    group by v.PostId
+),
+UserActivityWindow as (
+    select 
+        u.Id,
+        u.DisplayName,
+        u.CreationDate,
+        u.Reputation,
+        u.Location,
+        count(distinct ph.PostId) filter (where ph.PostHistoryTypeId in (10,12)) over (partition by u.Id order by ph.CreationDate rows between 30 preceding and current row) as CloseOrDeleteEventsLast30Days,
+        count(distinct ph.PostId) filter (where ph.PostHistoryTypeId = 25) over (partition by u.Id order by ph.CreationDate rows between 365 preceding and current row) as TweetsLastYear
+    from Users u
+    left join PostHistory ph on u.Id = ph.UserId
+),
+DuplicatePostLinks as (
+    select 
+        pl.PostId,
+        pl.RelatedPostId,
+        p1.Title as PostTitle,
+        p2.Title as RelatedPostTitle
+    from PostLinks pl
+    inner join Posts p1 on pl.PostId = p1.Id
+    inner join Posts p2 on pl.RelatedPostId = p2.Id
+    where pl.LinkTypeId = 3
+)
+select distinct
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    ubc.GoldBadges,
+    ubc.SilverBadges,
+    ubc.BronzeBadges,
+    ua.CloseOrDeleteEventsLast30Days,
+    ua.TweetsLastYear,
+    pswr.Id as PostId,
+    pswr.PostTypeId,
+    pswr.Score as PostScore,
+    pswr.ViewCount as PostViewCount,
+    pswr.UserPostRank,
+    tpa.QuestionTitle,
+    tpa.AnswerCount,
+    tpa.AcceptedAnswerScore,
+    tpa.AcceptedAnswerOwnerReputation,
+    cr.CommentCount,
+    cr.AvgCommentLength,
+    cr.AnonymousComments,
+    cr.ProblematicComments,
+    vs.UpVotes,
+    vs.DownVotes,
+    vs.TotalBounty,
+    vs.UniqueVoters,
+    dtl.RelatedPostId as DuplicateOfPostId,
+    dtl.RelatedPostTitle as DuplicateOfPostTitle,
+    case 
+        when pswr.Score > avg(pswr.Score) over (partition by pswr.PostTypeId) then 'AboveAverageScore'
+        else 'BelowAverageScore' 
+    end as ScorePerformance,
+    substr(tpa.QuestionTitle || ' - ' || coalesce(u.Location, 'Unknown Location'), 1, 80) as CombinedTitleLocation,
+    case 
+        when u.Reputation > 10000 then 'Expert'
+        when u.Reputation between 1000 and 10000 then 'Intermediate'
+        else 'Newbie'
+    end as UserExperienceLevel,
+    case 
+        when coalesce(cr.ProblematicComments,0) > 0 then 'FlaggedComments'
+        else 'CleanComments'
+    end as CommentQualityFlag
+from Users u
+left join UserBadgeCounts ubc on u.Id = ubc.UserId
+left join UserActivityWindow ua on u.Id = ua.Id
+left join PostScoresWithRanks pswr on pswr.OwnerUserId = u.Id and pswr.UserPostRank <= 3
+left join TopPostsWithAnswers tpa on tpa.QuestionId = pswr.Id
+left join CommentRichness cr on cr.PostId = pswr.Id
+left join VotesSummary vs on vs.PostId = pswr.Id
+left join DuplicatePostLinks dtl on dtl.PostId = pswr.Id
+where (pswr.Score is not null and pswr.Score > 5) or (ubc.TotalBadges > 5)
+order by u.Reputation desc nulls last, pswr.Score desc nulls last
+limit 100;

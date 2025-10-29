@@ -1,0 +1,174 @@
+-- {"query": "2486.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1541} 
+with RecursiveTagCounts as (
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        abs(length(t.TagName) - length(replace(t.TagName, 'a', ''))) as a_count,
+        row_number() over (order by t.Count desc) as rn
+    from Tags t
+    where t.TagName is not null
+),
+FilteredPosts as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        coalesce(p.Title, '') as Title,
+        p.AcceptedAnswerId,
+        p.AnswerCount,
+        p.ClosedDate,
+        p.LastActivityDate
+    from Posts p
+    where p.PostTypeId in (1, 2) and p.Score > 5
+),
+AnswerAggregates as (
+    select
+        p.ParentId as QuestionId,
+        count(*) as AnswerTotal,
+        max(p.Score) as MaxAnswerScore,
+        avg(p.Score) as AvgAnswerScore
+    from Posts p
+    where p.PostTypeId = 2
+    group by p.ParentId
+),
+UserBadgeRanks as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserReputationRanks as (
+    select
+        u.Id as UserId,
+        u.Reputation,
+        rank() over (order by u.Reputation desc) as RepRank
+    from Users u
+),
+PostCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReasonName,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    where ph.PostHistoryTypeId = 10 -- Post Closed
+),
+UserActiveDayStats as (
+    select
+        u.Id as UserId,
+        date_trunc('day', u.CreationDate) as CreationDay,
+        date_trunc('day', u.LastAccessDate) as LastAccessDay,
+        extract(epoch from (u.LastAccessDate - u.CreationDate))/86400 as ActiveDays
+    from Users u
+),
+PostLinkCounts as (
+    select
+        pl.PostId,
+        count(distinct pl.RelatedPostId) as RelatedPostCount,
+        count(distinct case when pl.LinkTypeId = 3 then pl.RelatedPostId end) as DuplicateLinkCount
+    from PostLinks pl
+    group by pl.PostId
+),
+QuestionWithStats as (
+    select
+        fp.Id,
+        fp.Title,
+        fp.Score,
+        fp.ViewCount,
+        fp.Tags,
+        coalesce(aa.AnswerTotal, 0) as AnswerCount,
+        coalesce(aa.MaxAnswerScore, 0) as MaxAnswerScore,
+        coalesce(aa.AvgAnswerScore, 0) as AvgAnswerScore,
+        plc.RelatedPostCount,
+        plp.DuplicateLinkCount,
+        phc.CloseReasonName,
+        fp.ClosedDate
+    from FilteredPosts fp
+    left join AnswerAggregates aa on aa.QuestionId = fp.Id
+    left join PostLinkCounts plc on plc.PostId = fp.Id
+    left join PostLinkCounts plp on plp.PostId = fp.Id and plp.DuplicateLinkCount > 0
+    left join PostCloseReasons phc on phc.PostId = fp.Id
+    where fp.PostTypeId = 1
+),
+RankedQuestions as (
+    select
+        qws.*,
+        row_number() over (
+            partition by case when qws.CloseReasonName is null then 'Open' else 'Closed' end
+            order by qws.Score desc, qws.ViewCount desc) as rn
+    from QuestionWithStats qws
+),
+ComplexRanking as (
+    select
+        rq.Id,
+        rq.Title,
+        rq.Score,
+        rq.ViewCount,
+        rq.Tags,
+        rq.AnswerCount,
+        rq.MaxAnswerScore,
+        rq.AvgAnswerScore,
+        rq.RelatedPostCount,
+        rq.DuplicateLinkCount,
+        rq.CloseReasonName,
+        rq.ClosedDate,
+        -- Calculate title complexity: number of vowels * length of title modulo 7 plus score normalized
+        (
+            (length(lower(rq.Title)) - length(replace(lower(rq.Title), 'a', '')) +
+             length(lower(rq.Title)) - length(replace(lower(rq.Title), 'e', '')) +
+             length(lower(rq.Title)) - length(replace(lower(rq.Title), 'i', '')) +
+             length(lower(rq.Title)) - length(replace(lower(rq.Title), 'o', '')) +
+             length(lower(rq.Title)) - length(replace(lower(rq.Title), 'u', ''))
+            ) * length(rq.Title) % 7
+        ) + (rq.Score / nullif(nullif(rq.AnswerCount, 0), 0) + 1) as TitleComplexityScore
+    from RankedQuestions rq
+    where rq.rn <= 100
+)
+select
+    cr.Id as QuestionId,
+    cr.Title,
+    cr.Score,
+    cr.ViewCount,
+    cr.AnswerCount,
+    cr.MaxAnswerScore,
+    round(cr.AvgAnswerScore::numeric, 2) as AvgAnswerScore,
+    cr.RelatedPostCount,
+    cr.DuplicateLinkCount,
+    coalesce(cr.CloseReasonName, 'Open') as Status,
+    cr.ClosedDate,
+    cr.TitleComplexityScore,
+    -- Fetch top answer by score for each question (correlated subquery with lateral join)
+    (select a.Id
+     from Posts a
+     where a.ParentId = cr.Id and a.PostTypeId = 2
+     order by a.Score desc nulls last, a.CreationDate asc limit 1) as TopAnswerId,
+    -- Calculate whether the question has been edited after accepted answer was posted
+    case 
+      when cr.AcceptedAnswerId is not null then exists (
+          select 1
+          from PostHistory phh
+          where phh.PostId = cr.Id 
+            and phh.CreationDate > (
+                select p2.CreationDate from Posts p2 where p2.Id = cr.AcceptedAnswerId
+            )
+            and phh.PostHistoryTypeId in (4,5,6) -- Edits to title, body or tags
+      )
+      else null
+    end as EditedAfterAcceptedAnswer,
+    -- Count of badges for owners of question
+    coalesce((select sum(bc.BadgeCount) from UserBadgeRanks bc where bc.UserId = cr.Id), 0) as OwnerBadgeCount,
+    -- Owner reputation from Users table, join with null logic if owner is missing (deleted)
+    u.Reputation as OwnerReputation,
+    -- Calculate days since creation for question weighted by score and view count, with NULL safe logic
+    greatest(0, extract(epoch from (current_timestamp - cr.CreationDate))/86400 * (cr.Score + coalesce(cr.ViewCount,0) * 0.01)) as WeightedAgeScore
+from ComplexRanking cr
+left join Users u on u.Id = cr.OwnerUserId
+order by cr.TitleComplexityScore desc, cr.Score desc
+limit 50;

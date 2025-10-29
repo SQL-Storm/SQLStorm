@@ -1,0 +1,134 @@
+WITH
+recent_top_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.OwnerUserId,
+    ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.ViewCount DESC, p.CreationDate DESC) AS rn
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.ClosedDate IS NULL
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '90' DAY
+),
+tag_stats AS (
+  SELECT
+    t.tag AS tag,
+    COUNT(*) AS qcount,
+    AVG(r.Score) AS avg_score,
+    SUM(r.ViewCount) AS total_views
+  FROM recent_top_questions r
+  CROSS JOIN LATERAL (
+    SELECT unnest(string_to_array(substr(r.Tags, 2, length(r.Tags)-2), '><')) AS tag
+  ) t
+  GROUP BY t.tag
+),
+top_users AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.ProfileImageUrl,
+    u.AccountId,
+    COUNT(p.Id) AS post_count
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  WHERE u.Reputation > 1000
+  GROUP BY
+    u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate,
+    u.Location, u.Views, u.UpVotes, u.DownVotes, u.ProfileImageUrl, u.AccountId
+),
+complex_post_history AS (
+  SELECT
+    ph.PostId,
+    ph.Id AS HistoryId,
+    ph.PostHistoryTypeId,
+    ph.CreationDate,
+    ph.UserId,
+    ph.Comment,
+    ph.Text,
+    ph.RevisionGUID
+  FROM PostHistory ph
+  WHERE ph.PostHistoryTypeId IN (10, 16, 24, 33, 34, 50)
+),
+linked_posts AS (
+  SELECT
+    pl.PostId,
+    pl.RelatedPostId,
+    pl.LinkTypeId,
+    lt.Name AS LinkTypeName,
+    p1.Title AS PostTitle,
+    p2.Title AS RelatedPostTitle
+  FROM PostLinks pl
+  JOIN Posts p1 ON pl.PostId = p1.Id
+  JOIN Posts p2 ON pl.RelatedPostId = p2.Id
+  JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+  WHERE pl.LinkTypeId IN (1, 3)
+),
+recent_votes AS (
+  SELECT
+    v.PostId,
+    v.VoteTypeId,
+    vt.Name AS VoteTypeName,
+    v.UserId,
+    v.CreationDate,
+    v.BountyAmount
+  FROM Votes v
+  JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+  WHERE v.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30' DAY
+),
+first_block AS (
+  SELECT
+    q.PostId,
+    q.Title,
+    q.CreationDate AS QuestionCreation,
+    q.Score,
+    q.ViewCount,
+    q.OwnerUserId,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation,
+    u.Location,
+    q.Tags,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = q.OwnerUserId AND b.Class = 1) AS OwnerGoldBadges,
+    ROW_NUMBER() OVER (ORDER BY q.Score DESC, q.ViewCount DESC) AS RankWithinRecent
+  FROM recent_top_questions q
+  JOIN Users u ON q.OwnerUserId = u.Id
+  WHERE q.ViewCount > 0
+    AND q.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '90' DAY
+    AND (SELECT COUNT(*) FROM Posts p2 WHERE p2.ParentId = q.PostId AND p2.PostTypeId = 2) > 0
+  GROUP BY
+    q.PostId, q.Title, q.CreationDate, q.Score, q.ViewCount, q.OwnerUserId,
+    u.DisplayName, u.Reputation, u.Location, q.Tags
+  ORDER BY RankWithinRecent
+  LIMIT 5
+),
+second_block AS (
+  SELECT
+    CAST(NULL AS BIGINT) AS PostId,
+    CAST(NULL AS TEXT) AS Title,
+    CAST(NULL AS TIMESTAMP) AS QuestionCreation,
+    CAST(NULL AS INTEGER) AS Score,
+    CAST(NULL AS BIGINT) AS ViewCount,
+    CAST(NULL AS BIGINT) AS OwnerUserId,
+    CAST(NULL AS TEXT) AS OwnerDisplayName,
+    CAST(NULL AS INTEGER) AS Reputation,
+    CAST(NULL AS TEXT) AS Location,
+    t.tag AS Tags,
+    CAST(NULL AS INTEGER) AS OwnerGoldBadges,
+    CAST(NULL AS INTEGER) AS RankWithinRecent
+  FROM tag_stats t
+  ORDER BY t.tag
+  LIMIT 5
+)
+SELECT * FROM first_block
+UNION ALL
+SELECT * FROM second_block;

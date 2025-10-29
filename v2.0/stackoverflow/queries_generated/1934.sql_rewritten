@@ -1,0 +1,319 @@
+-- {"query": "1934.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 4139} 
+WITH UserActivityMetrics AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.WebsiteUrl,
+        u.Location,
+        u.Views AS UserViews,
+        u.UpVotes AS UserUpVotes,
+        u.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT q.Id) FILTER (WHERE q.PostTypeId = 1) AS TotalQuestionsOwned,
+        COUNT(DISTINCT a.Id) FILTER (WHERE a.PostTypeId = 2) AS TotalAnswersOwned,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostScoreOwned,
+        MAX(COALESCE(p.LastActivityDate, u.LastAccessDate)) AS LastActivityDateFromPosts,
+        MAX(u.LastAccessDate) AS LatestUserActivity,
+        DATE_PART('year', AGE(cast('2024-10-01 12:34:56' as timestamp), u.CreationDate)) AS AccountAgeYears,
+        NTILE(4) OVER (ORDER BY u.Reputation DESC) AS ReputationQuartile,
+        CASE
+            WHEN u.Location IS NULL THEN 'Unknown'
+            WHEN u.Location LIKE '%New York%' THEN 'US_Northeast'
+            WHEN u.Location LIKE '%London%' OR u.Location LIKE '%UK%' THEN 'Europe_UK'
+            WHEN u.Location LIKE '%California%' THEN 'US_WestCoast'
+            ELSE 'Other_Location'
+        END AS LocationCategory,
+        (SELECT COUNT(DISTINCT b.Id) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+        (SELECT COUNT(DISTINCT b.Id) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadges,
+        (SELECT COUNT(DISTINCT b.Id) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadges,
+        (SELECT SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) FROM Votes v WHERE v.UserId = u.Id) AS TotalPostsFavoritedByUser
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Posts q ON u.Id = q.OwnerUserId AND q.PostTypeId = 1
+    LEFT JOIN
+        Posts a ON u.Id = a.OwnerUserId AND a.PostTypeId = 2
+    LEFT JOIN
+        Comments c ON u.Id = c.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.WebsiteUrl, u.Location, u.Views, u.UpVotes, u.DownVotes
+),
+PostHistoricalMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Title,
+        p.Body,
+        p.Tags,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.OwnerUserId,
+        COUNT(DISTINCT ph.Id) AS TotalHistoryEntries,
+        COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (4, 5, 6)) AS EditCount,
+        MAX(ph.CreationDate) AS LastEditDateFromHistory,
+        AVG(CASE WHEN c.Score IS NOT NULL THEN c.Score ELSE 0 END) AS AverageCommentScore,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS PostUpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS PostDownVotes,
+        MAX(CASE WHEN v.VoteTypeId = 1 THEN TRUE ELSE FALSE END) AS HasAcceptedAnswerVote,
+        STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><') AS TagArray,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserPostSeqNumDesc,
+        CASE
+            WHEN p.Title IS NULL THEN 'No Title Provided'
+            WHEN LENGTH(p.Title) < 20 THEN 'Short Title'
+            WHEN LENGTH(p.Title) > 100 THEN 'Long Title'
+            ELSE 'Medium Title'
+        END AS TitleLengthCategory,
+        (SELECT COUNT(pl.Id) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 1) AS LinkedToCount,
+        (SELECT COUNT(pl.Id) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3) AS DuplicateOfCount
+    FROM
+        Posts p
+    LEFT JOIN
+        PostHistory ph ON p.Id = ph.PostId
+    LEFT JOIN
+        Comments c ON p.Id = c.PostId
+    LEFT JOIN
+        Votes v ON p.Id = v.PostId
+    GROUP BY
+        p.Id, p.PostTypeId, p.Title, p.Body, p.Tags, p.CreationDate, p.Score, p.ViewCount,
+        p.AnswerCount, p.CommentCount, p.FavoriteCount, p.ClosedDate, p.OwnerUserId
+),
+QuestionAnswerEngagement AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.OwnerUserId AS QuestionOwnerId,
+        q.CreationDate AS QuestionCreationDate,
+        q.AcceptedAnswerId,
+        MIN(a.CreationDate) AS FirstAnswerDate,
+        COUNT(a.Id) AS TotalAnswers,
+        AVG(a.Score) AS AvgAnswerScore,
+        SUM(a.Score) AS TotalAnswerScore,
+        (SELECT AVG(PostScore) FROM PostHistoricalMetrics WHERE PostId = q.AcceptedAnswerId) AS AcceptedAnswerScore
+    FROM
+        Posts q
+    LEFT JOIN
+        Posts a ON q.Id = a.ParentId AND a.PostTypeId = 2
+    WHERE
+        q.PostTypeId = 1
+    GROUP BY
+        q.Id, q.OwnerUserId, q.CreationDate, q.AcceptedAnswerId
+)
+SELECT
+    uam.UserId,
+    uam.DisplayName,
+    uam.Reputation,
+    uam.AccountAgeYears,
+    uam.ReputationQuartile,
+    uam.TotalPostsOwned,
+    uam.TotalQuestionsOwned,
+    uam.TotalAnswersOwned,
+    uam.TotalCommentsMade,
+    uam.TotalPostScoreOwned,
+    uam.GoldBadges,
+    uam.SilverBadges,
+    uam.BronzeBadges,
+    uam.TotalPostsFavoritedByUser,
+    pqh.PostId AS TopPostId,
+    COALESCE(pqh.Title, uam.DisplayName || '''s Post') AS TopPostTitle,
+    pqh.PostScore AS TopPostScore,
+    pqh.ViewCount AS TopPostViewCount,
+    pqh.EditCount AS TopPostEditCount,
+    pqh.PostCreationDate AS TopPostCreationDate,
+    AGE(cast('2024-10-01 12:34:56' as timestamp), pqh.PostCreationDate) AS TimeSinceTopPostCreation,
+    pqh.TitleLengthCategory AS TopPostTitleCategory,
+    pqh.LinkedToCount AS TopPostLinkedToCount,
+    pqh.DuplicateOfCount AS TopPostDuplicateOfCount,
+    qae.QuestionId AS EngagedQuestionId,
+    qae.TotalAnswers AS EngagedQuestionAnswerCount,
+    qae.AvgAnswerScore AS EngagedQuestionAvgAnswerScore,
+    qae.AcceptedAnswerScore AS EngagedQuestionAcceptedAnswerScore,
+    CASE
+        WHEN uam.WebsiteUrl IS NOT NULL AND uam.WebsiteUrl LIKE '%stackexchange.com%' THEN TRUE
+        ELSE FALSE
+    END AS HasStackExchangeWebsite,
+    REPLACE(LOWER(COALESCE(uam.Location, 'N/A')), ' ', '-') AS NormalizedLocation,
+    pqh.TagArray[1] AS FirstTagOfTopPost,
+    AVG(pqh.PostScore) OVER (PARTITION BY uam.ReputationQuartile) AS AvgPostScoreInRepQuartile,
+    RANK() OVER (PARTITION BY uam.LocationCategory ORDER BY uam.TotalPostsOwned DESC, uam.Reputation DESC) AS RankInLocationCategoryByPosts,
+    LAG(uam.TotalPostsOwned, 1, 0) OVER (PARTITION BY uam.ReputationQuartile ORDER BY uam.Reputation DESC) AS PrevUserTotalPostsInQuartile,
+    (
+        SELECT
+            MAX(a_sub.Score)
+        FROM
+            Posts AS a_sub
+        WHERE
+            a_sub.ParentId = qae.QuestionId
+            AND a_sub.OwnerUserId = uam.UserId
+            AND a_sub.PostTypeId = 2
+    ) AS MaxScoreOwnAnswerToEngagedQuestion,
+    (
+        SELECT
+            MAX(ph_sub.CreationDate)
+        FROM
+            PostHistory AS ph_sub
+        WHERE
+            ph_sub.UserId = uam.UserId
+            AND ph_sub.PostHistoryTypeId IN (10, 11, 12, 13) -- Close/Reopen/Delete/Undelete votes
+    ) AS LatestVoteActivityDate,
+    LENGTH(pqh.Body) AS TopPostBodyLength,
+    pqh.PostUpVotes AS TopPostUpVotes,
+    pqh.PostDownVotes AS TopPostDownVotes,
+    (pqh.PostUpVotes::NUMERIC / NULLIF(pqh.PostUpVotes + pqh.PostDownVotes, 0)) AS TopPostUpvoteRatio
+FROM
+    UserActivityMetrics uam
+LEFT JOIN
+    PostHistoricalMetrics pqh ON uam.UserId = pqh.OwnerUserId AND pqh.UserPostSeqNumDesc = 1 -- Get the most recent post for each user
+LEFT JOIN
+    QuestionAnswerEngagement qae ON uam.UserId = qae.QuestionOwnerId AND qae.TotalAnswers > 0
+WHERE
+    uam.TotalPostsOwned > 5
+    AND uam.Reputation > 100
+    AND (pqh.PostScore IS NULL OR pqh.PostScore >= 0) -- NULL logic
+    AND (pqh.ClosedDate IS NULL OR pqh.ClosedDate > (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year')) -- Not too old closed posts
+    AND (uam.Location IS NOT NULL AND uam.Location NOT LIKE '%Internet%')
+    AND (pqh.TagArray[1] IS NULL OR pqh.TagArray[1] NOT LIKE 'sql%') -- String expression & NULL logic
+    AND uam.DisplayName IS NOT NULL AND LENGTH(uam.DisplayName) > 3
+EXCEPT
+SELECT
+    uam.UserId,
+    uam.DisplayName,
+    uam.Reputation,
+    uam.AccountAgeYears,
+    uam.ReputationQuartile,
+    uam.TotalPostsOwned,
+    uam.TotalQuestionsOwned,
+    uam.TotalAnswersOwned,
+    uam.TotalCommentsMade,
+    uam.TotalPostScoreOwned,
+    uam.GoldBadges,
+    uam.SilverBadges,
+    uam.BronzeBadges,
+    uam.TotalPostsFavoritedByUser,
+    pqh.PostId,
+    COALESCE(pqh.Title, uam.DisplayName || '''s Post'),
+    pqh.PostScore,
+    pqh.ViewCount,
+    pqh.EditCount,
+    pqh.PostCreationDate,
+    AGE(cast('2024-10-01 12:34:56' as timestamp), pqh.PostCreationDate),
+    pqh.TitleLengthCategory,
+    pqh.LinkedToCount,
+    pqh.DuplicateOfCount,
+    qae.QuestionId,
+    qae.TotalAnswers,
+    qae.AvgAnswerScore,
+    qae.AcceptedAnswerScore,
+    CASE WHEN uam.WebsiteUrl IS NOT NULL AND uam.WebsiteUrl LIKE '%stackexchange.com%' THEN TRUE ELSE FALSE END,
+    REPLACE(LOWER(COALESCE(uam.Location, 'N/A')), ' ', '-'),
+    pqh.TagArray[1],
+    AVG(pqh.PostScore) OVER (PARTITION BY uam.ReputationQuartile),
+    RANK() OVER (PARTITION BY uam.LocationCategory ORDER BY uam.TotalPostsOwned DESC, uam.Reputation DESC),
+    LAG(uam.TotalPostsOwned, 1, 0) OVER (PARTITION BY uam.ReputationQuartile ORDER BY uam.Reputation DESC),
+    (
+        SELECT MAX(a_sub.Score)
+        FROM Posts AS a_sub
+        WHERE a_sub.ParentId = qae.QuestionId
+              AND a_sub.OwnerUserId = uam.UserId
+              AND a_sub.PostTypeId = 2
+    ),
+    (
+        SELECT MAX(ph_sub.CreationDate)
+        FROM PostHistory AS ph_sub
+        WHERE ph_sub.UserId = uam.UserId
+              AND ph_sub.PostHistoryTypeId IN (10, 11, 12, 13)
+    ),
+    LENGTH(pqh.Body),
+    pqh.PostUpVotes,
+    pqh.PostDownVotes,
+    (pqh.PostUpVotes::NUMERIC / NULLIF(pqh.PostUpVotes + pqh.PostDownVotes, 0))
+FROM
+    UserActivityMetrics uam
+LEFT JOIN
+    PostHistoricalMetrics pqh ON uam.UserId = pqh.OwnerUserId AND pqh.UserPostSeqNumDesc = 1
+LEFT JOIN
+    QuestionAnswerEngagement qae ON uam.UserId = qae.QuestionOwnerId AND qae.TotalAnswers > 0
+WHERE
+    uam.UserDownVotes > uam.UserUpVotes * 3 -- Users with significantly more downvotes than upvotes
+    AND uam.Reputation < 500
+    AND pqh.PostTypeId IS NULL -- Users who haven't posted anything but have lots of downvotes
+    AND uam.LocationCategory = 'Other_Location' -- And are not from primary known locations
+UNION ALL
+SELECT
+    uam.UserId,
+    uam.DisplayName,
+    uam.Reputation,
+    uam.AccountAgeYears,
+    uam.ReputationQuartile,
+    uam.TotalPostsOwned,
+    uam.TotalQuestionsOwned,
+    uam.TotalAnswersOwned,
+    uam.TotalCommentsMade,
+    uam.TotalPostScoreOwned,
+    uam.GoldBadges,
+    uam.SilverBadges,
+    uam.BronzeBadges,
+    uam.TotalPostsFavoritedByUser,
+    pqh.PostId,
+    COALESCE(pqh.Title, uam.DisplayName || '''s Post'),
+    pqh.PostScore,
+    pqh.ViewCount,
+    pqh.EditCount,
+    pqh.PostCreationDate,
+    AGE(cast('2024-10-01 12:34:56' as timestamp), pqh.PostCreationDate),
+    pqh.TitleLengthCategory,
+    pqh.LinkedToCount,
+    pqh.DuplicateOfCount,
+    qae.QuestionId,
+    qae.TotalAnswers,
+    qae.AvgAnswerScore,
+    qae.AcceptedAnswerScore,
+    CASE WHEN uam.WebsiteUrl IS NOT NULL AND uam.WebsiteUrl LIKE '%stackexchange.com%' THEN TRUE ELSE FALSE END,
+    REPLACE(LOWER(COALESCE(uam.Location, 'N/A')), ' ', '-'),
+    pqh.TagArray[1],
+    AVG(pqh.PostScore) OVER (PARTITION BY uam.ReputationQuartile),
+    RANK() OVER (PARTITION BY uam.LocationCategory ORDER BY uam.TotalPostsOwned DESC, uam.Reputation DESC),
+    LAG(uam.TotalPostsOwned, 1, 0) OVER (PARTITION BY uam.ReputationQuartile ORDER BY uam.Reputation DESC),
+    (
+        SELECT MAX(a_sub.Score)
+        FROM Posts AS a_sub
+        WHERE a_sub.ParentId = qae.QuestionId
+              AND a_sub.OwnerUserId = uam.UserId
+              AND a_sub.PostTypeId = 2
+    ),
+    (
+        SELECT MAX(ph_sub.CreationDate)
+        FROM PostHistory AS ph_sub
+        WHERE ph_sub.UserId = uam.UserId
+              AND ph_sub.PostHistoryTypeId IN (10, 11, 12, 13)
+    ),
+    LENGTH(pqh.Body),
+    pqh.PostUpVotes,
+    pqh.PostDownVotes,
+    (pqh.PostUpVotes::NUMERIC / NULLIF(pqh.PostUpVotes + pqh.PostDownVotes, 0))
+FROM
+    UserActivityMetrics uam
+LEFT JOIN
+    PostHistoricalMetrics pqh ON uam.UserId = pqh.OwnerUserId AND pqh.UserPostSeqNumDesc = 1
+LEFT JOIN
+    QuestionAnswerEngagement qae ON uam.UserId = qae.QuestionOwnerId AND qae.TotalAnswers > 0
+WHERE
+    uam.GoldBadges > 0
+    AND uam.TotalQuestionsOwned > 10
+    AND uam.TotalAnswersOwned > 20
+    AND uam.ReputationQuartile = 1
+    AND LENGTH(COALESCE(pqh.Body, '')) > 500 -- Ensure the body is substantial
+    AND pqh.PostTypeId = 1 -- Only questions
+    AND qae.AvgAnswerScore > 5 -- Highly engaged questions
+ORDER BY
+    Reputation DESC, TotalPostsOwned DESC
+LIMIT 5000;

@@ -1,0 +1,333 @@
+with
+top_tags as (
+  select
+    t.id as tag_id,
+    t.tagname,
+    t.count as tag_total_count,
+    t.ismoderatoronly,
+    t.isrequired,
+    coalesce(t.excerptpostid, t.wikipostid) as any_wiki_post_id
+  from tags t
+  where t.count > (
+    select percentile_disc(0.85) within group (order by t2.count) from tags t2
+  )
+),
+question_tags as (
+  select
+    p.id as question_id,
+    p.creationdate as question_created,
+    p.score as question_score,
+    p.viewcount,
+    p.owneruserid as question_owner_id,
+    p.acceptedanswerid,
+    lower(trim(tag)) as tagname
+  from posts p
+  cross join lateral unnest(
+    case
+      when p.posttypeid = 1 and p.tags is not null and length(p.tags) > 2
+      then string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')
+      else cast(array[] as text[])
+    end
+  ) as tag
+  where p.posttypeid = 1
+),
+question_top_tags as (
+  select
+    qt.question_id,
+    qt.question_created,
+    qt.question_score,
+    qt.viewcount,
+    qt.question_owner_id,
+    qt.acceptedanswerid,
+    tt.tag_id,
+    tt.tagname,
+    tt.tag_total_count,
+    tt.ismoderatoronly,
+    tt.isrequired
+  from question_tags qt
+  join top_tags tt
+    on tt.tagname = qt.tagname
+),
+question_agg as (
+  select
+    qtt.question_id,
+    min(qtt.question_created) as question_created,
+    max(qtt.question_score) as question_score,
+    max(qtt.viewcount) as viewcount,
+    count(distinct qtt.tag_id) as distinct_top_tag_count,
+    bool_or(qtt.ismoderatoronly) as has_moderator_only_tag,
+    bool_or(qtt.isrequired) as has_required_tag
+  from question_top_tags qtt
+  group by qtt.question_id
+),
+answers as (
+  select
+    a.id as answer_id,
+    a.parentid as question_id,
+    a.creationdate as answer_created,
+    a.score as answer_score,
+    a.owneruserid as answer_owner_id,
+    case when a.id = q.acceptedanswerid then 1 else 0 end as is_accepted
+  from posts a
+  join posts q on q.id = a.parentid and a.posttypeid = 2 and q.posttypeid = 1
+),
+answer_ranks as (
+  select
+    ans.*,
+    rank() over (partition by ans.question_id order by ans.is_accepted desc, ans.answer_score desc, ans.answer_created asc) as rank_by_quality,
+    row_number() over (partition by ans.question_id order by ans.answer_created asc) as rn_by_time
+  from answers ans
+),
+vote_agg as (
+  select
+    v.postid,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+    count(*) as total_votes,
+    max(v.creationdate) as last_vote_at
+  from votes v
+  where v.creationdate >= (
+    select min(p.creationdate)
+    from posts p
+    where p.id = v.postid
+  )
+  group by v.postid
+),
+comment_signal as (
+  select
+    c.postid as question_id,
+    count(*) filter (where c.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days') as comments_30d,
+    sum(c.score) as comment_score_sum,
+    max(c.creationdate) as last_comment_at,
+    max(length(c.text)) as max_comment_len
+  from comments c
+  group by c.postid
+),
+history_flags as (
+  select
+    ph.postid as question_id,
+    max(case when ph.posthistorytypeid in (10,35) then 1 else 0 end) as was_closed_or_migrated,
+    max(case when ph.posthistorytypeid in (11) then 1 else 0 end) as was_reopened,
+    count(*) filter (where ph.posthistorytypeid in (4,5,6,24)) as edit_events,
+    min(ph.creationdate) filter (where ph.posthistorytypeid in (10,11,12,13,14,15,19,20,35)) as first_moderation_event_at
+  from posthistory ph
+  group by ph.postid
+),
+owner_features as (
+  select
+    u.id as owner_id,
+    u.reputation,
+    u.creationdate as user_created,
+    u.lastaccessdate as user_last_seen,
+    u.upvotes - u.downvotes as net_votes,
+    coalesce(nullif(trim(u.location), ''), 'Unknown') as normalized_location
+  from users u
+),
+primary_tag as (
+  select
+    qtt.question_id,
+    qtt.tag_id,
+    qtt.tagname,
+    qtt.tag_total_count,
+    row_number() over (
+      partition by qtt.question_id
+      order by qtt.tag_total_count desc, qtt.tagname asc
+    ) as rn
+  from question_top_tags qtt
+),
+question_features as (
+  select
+    qa.question_id,
+    qa.question_created,
+    qa.question_score,
+    qa.viewcount,
+    qa.distinct_top_tag_count,
+    qa.has_moderator_only_tag,
+    qa.has_required_tag,
+    pf.tag_id as primary_tag_id,
+    pf.tagname as primary_tagname,
+    pf.tag_total_count as primary_tag_popularity,
+    coalesce(vq.upvotes, 0) as q_upvotes,
+    coalesce(vq.downvotes, 0) as q_downvotes,
+    coalesce(vq.favorites, 0) as q_favorites,
+    coalesce(vq.total_votes, 0) as q_total_votes,
+    vq.last_vote_at as q_last_vote_at,
+    cs.comments_30d,
+    cs.comment_score_sum,
+    cs.last_comment_at,
+    cs.max_comment_len,
+    hf.was_closed_or_migrated,
+    hf.was_reopened,
+    hf.edit_events,
+    hf.first_moderation_event_at
+  from question_agg qa
+  left join vote_agg vq on vq.postid = qa.question_id
+  left join comment_signal cs on cs.question_id = qa.question_id
+  left join history_flags hf on hf.question_id = qa.question_id
+  left join primary_tag pf on pf.question_id = qa.question_id and pf.rn = 1
+),
+answer_summary as (
+  select
+    ar.question_id,
+    count(*) as answer_count,
+    count(*) filter (where ar.is_accepted = 1) as accepted_count,
+    max(ar.answer_score) as best_answer_score,
+    min(ar.answer_created) as first_answer_at,
+    max(ar.answer_created) as last_answer_at,
+    avg(ar.answer_score) filter (where ar.rn_by_time <= 3) as avg_first3_scores,
+    sum(case when ar.rank_by_quality <= 1 then 1 else 0 end) as top1_count
+  from answer_ranks ar
+  group by ar.question_id
+),
+tag_time_stats as (
+  select
+    qtt.tag_id,
+    qtt.tagname,
+    qtt.question_id,
+    qtt.question_created,
+    count(*) over (partition by qtt.tag_id order by qtt.question_created
+                   rows between 99 preceding and current row) as questions_last_100,
+    avg(qf.viewcount) over (partition by qtt.tag_id order by qtt.question_created
+                   rows between 99 preceding and current row) as avg_views_last_100,
+    -- compute p90_score_all_time using a windowed aggregation via subquery to avoid ordered-set OVER
+    (
+      select percentile_cont(0.9) within group (order by qq.question_score)
+      from question_features qq
+      join question_top_tags qtt2 on qtt2.question_id = qq.question_id
+      where qtt2.tag_id = qtt.tag_id
+    ) as p90_score_all_time
+  from question_top_tags qtt
+  join question_features qf on qf.question_id = qtt.question_id
+),
+notable_questions as (
+  select question_id from question_features
+  where coalesce(q_upvotes,0) - coalesce(q_downvotes,0) >= 5
+  union
+  select question_id from answer_summary
+  where best_answer_score >= 10 or accepted_count >= 1
+  except
+  select question_id from question_features
+  where was_closed_or_migrated = 1 and was_reopened = 0
+),
+final_features as (
+  select
+    qf.question_id,
+    qf.question_created,
+    qf.question_score,
+    qf.viewcount,
+    qf.distinct_top_tag_count,
+    qf.has_moderator_only_tag,
+    qf.has_required_tag,
+    qf.primary_tag_id,
+    qf.primary_tagname,
+    qf.primary_tag_popularity,
+    qf.q_upvotes,
+    qf.q_downvotes,
+    qf.q_favorites,
+    qf.q_total_votes,
+    qf.q_last_vote_at,
+    qf.comments_30d,
+    qf.comment_score_sum,
+    qf.last_comment_at,
+    qf.max_comment_len,
+    qf.was_closed_or_migrated,
+    qf.was_reopened,
+    qf.edit_events,
+    qf.first_moderation_event_at,
+    coalesce(asum.answer_count, 0) as answer_count,
+    coalesce(asum.accepted_count, 0) as accepted_count,
+    asum.best_answer_score,
+    asum.first_answer_at,
+    asum.last_answer_at,
+    asum.avg_first3_scores,
+    asum.top1_count,
+    tts.questions_last_100,
+    tts.avg_views_last_100,
+    tts.p90_score_all_time
+  from question_features qf
+  left join answer_summary asum on asum.question_id = qf.question_id
+  left join tag_time_stats tts
+    on tts.question_id = qf.question_id
+    and tts.tag_id = qf.primary_tag_id
+),
+scored as (
+  select
+    f.*,
+    (
+      coalesce(f.q_upvotes,0)*2
+      - coalesce(f.q_downvotes,0)*1.5
+      + coalesce(f.q_favorites,0)*1
+      + coalesce(f.answer_count,0)*0.75
+      + case when f.accepted_count > 0 then 5 else 0 end
+      + least(coalesce(f.best_answer_score,0), 25)*0.5
+      + ln(greatest(coalesce(f.viewcount,0), 1))
+      + case when f.has_required_tag then 2 else 0 end
+      - case when f.has_moderator_only_tag then 1 else 0 end
+      + coalesce(f.avg_views_last_100, 0) / 100.0
+      + coalesce(f.p90_score_all_time, 0) * 0.2
+      + case when f.was_reopened = 1 then 1 else 0 end
+      - case when f.was_closed_or_migrated = 1 then 2 else 0 end
+    ) as composite_score
+  from final_features f
+),
+ranked as (
+  select
+    s.*,
+    (
+      s.composite_score
+      + case
+          when s.question_created >= cast('2024-10-01 12:34:56' as timestamp) - interval '7 days' then 2
+          when s.question_created >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days' then 1
+          else 0
+        end
+    ) as boosted_score,
+    row_number() over (
+      partition by s.primary_tag_id
+      order by
+        (
+          s.composite_score
+          + case
+              when s.question_created >= cast('2024-10-01 12:34:56' as timestamp) - interval '7 days' then 2
+              when s.question_created >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days' then 1
+              else 0
+            end
+        ) desc,
+        s.answer_count desc,
+        s.viewcount desc,
+        s.question_id asc
+    ) as tag_rank
+  from scored s
+)
+select
+  r.primary_tagname as tag,
+  r.primary_tag_id,
+  r.question_id,
+  r.question_created,
+  r.question_score,
+  r.viewcount,
+  r.answer_count,
+  r.accepted_count,
+  r.best_answer_score,
+  r.q_upvotes,
+  r.q_downvotes,
+  r.q_favorites,
+  r.comments_30d,
+  r.edit_events,
+  r.was_closed_or_migrated,
+  r.was_reopened,
+  r.boosted_score,
+  r.tag_rank,
+  case
+    when nq.question_id is not null then 'notable'
+    else 'regular'
+  end as category,
+  coalesce(u.displayname, concat('user#', cast(r.question_id as varchar))) as owner_hint,
+  coalesce(ofe.normalized_location, 'Unknown') as owner_location
+from ranked r
+left join notable_questions nq on nq.question_id = r.question_id
+left join posts q on q.id = r.question_id
+left join owner_features ofe on ofe.owner_id = q.owneruserid
+left join users u on u.id = q.owneruserid
+where r.tag_rank <= 50
+order by r.boosted_score desc, r.tag_rank asc, r.question_id asc;

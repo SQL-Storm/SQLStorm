@@ -1,0 +1,181 @@
+-- {"query": "1413.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2855} 
+WITH UserStatsV2 AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.DisplayName AS UserDisplayName,
+        u.Views AS UserViews,
+        u.UpVotes AS UserUpVotesGiven,
+        u.DownVotes AS UserDownVotesGiven,
+        COUNT(DISTINCT p_q.Id) AS TotalQuestionsAsked,
+        COUNT(DISTINCT p_a.Id) AS TotalAnswersPosted,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT b.Id) AS TotalBadgesEarned,
+        SUM(COALESCE(v_up.UpVotesReceived, 0)) AS TotalUpVotesReceivedOnPosts,
+        SUM(COALESCE(v_down.DownVotesReceived, 0)) AS TotalDownVotesReceivedOnPosts
+    FROM Users u
+    LEFT JOIN Posts p_q ON u.Id = p_q.OwnerUserId AND p_q.PostTypeId = 1
+    LEFT JOIN Posts p_a ON u.Id = p_a.OwnerUserId AND p_a.PostTypeId = 2
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN (
+        SELECT p.OwnerUserId, COUNT(v.Id) AS UpVotesReceived
+        FROM Votes v
+        JOIN Posts p ON v.PostId = p.Id
+        WHERE v.VoteTypeId = (SELECT Id FROM VoteTypes WHERE Name = 'UpMod')
+        GROUP BY p.OwnerUserId
+    ) AS v_up ON u.Id = v_up.OwnerUserId
+    LEFT JOIN (
+        SELECT p.OwnerUserId, COUNT(v.Id) AS DownVotesReceived
+        FROM Votes v
+        JOIN Posts p ON v.PostId = p.Id
+        WHERE v.VoteTypeId = (SELECT Id FROM VoteTypes WHERE Name = 'DownMod')
+        GROUP BY p.OwnerUserId
+    ) AS v_down ON u.Id = v_down.OwnerUserId
+    GROUP BY u.Id, u.Reputation, u.CreationDate, u.DisplayName, u.Views, u.UpVotes, u.DownVotes
+),
+PostHistoryAgg AS (
+    SELECT
+        ph.PostId,
+        COUNT(ph.Id) AS TotalHistoryEvents,
+        SUM(CASE WHEN pht.Name LIKE '%Edit%' THEN 1 ELSE 0 END) AS TotalEdits,
+        SUM(CASE WHEN pht.Name = 'Post Closed' THEN 1 ELSE 0 END) AS TotalCloseEvents,
+        SUM(CASE WHEN pht.Name = 'Post Reopened' THEN 1 ELSE 0 END) AS TotalReopenEvents,
+        MIN(CASE WHEN pht.Name LIKE '%Edit%' THEN ph.CreationDate END) AS FirstEditDate,
+        MAX(CASE WHEN pht.Name LIKE '%Edit%' THEN ph.CreationDate END) AS LastEditDate,
+        ARRAY_AGG(DISTINCT ph.UserId) FILTER (WHERE pht.Name = 'Post Closed') AS ClosingUserIds,
+        ARRAY_AGG(DISTINCT ph.UserId) FILTER (WHERE pht.Name = 'Post Reopened') AS ReopeningUserIds
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    GROUP BY ph.PostId
+),
+PostTagAnalysis AS (
+    SELECT
+        p.Id AS PostId,
+        LOWER(t.TagName) AS TagNameLower,
+        ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY t.TagName) AS TagRank,
+        AVG(p.Score) OVER (PARTITION BY t.TagName) AS TagAvgScore,
+        COUNT(p.Id) OVER (PARTITION BY t.TagName) AS TagQuestionCount
+    FROM Posts p
+    CROSS JOIN LATERAL UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><')) AS TagName_Unnested
+    JOIN Tags t ON TagName_Unnested = t.TagName
+    WHERE p.Tags IS NOT NULL AND LENGTH(TRIM(p.Tags)) > 2 AND p.PostTypeId = 1
+),
+RecentPostActivity AS (
+    SELECT
+        p.Id AS PostId,
+        p.CreationDate AS PostCreationDate,
+        p.LastActivityDate,
+        COALESCE(p.LastEditDate, p.CreationDate) AS EffectiveLastEditDate,
+        DENSE_RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate DESC) AS UserPostActivityRank,
+        LAG(p.LastActivityDate, 1, p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevPostActivityDate,
+        EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate)) / 3600.0 AS HoursSinceCreationToLastActivity,
+        (SELECT COUNT(DISTINCT c_sub.UserId) FROM Comments c_sub WHERE c_sub.PostId = p.Id AND c_sub.CreationDate > (p.CreationDate + INTERVAL '1 day')) AS UniqueCommentersAfterFirstDay
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+),
+PostsWithUpvotes AS (
+    SELECT DISTINCT PostId FROM Votes WHERE VoteTypeId = (SELECT Id FROM VoteTypes WHERE Name = 'UpMod')
+),
+PostsWithComments AS (
+    SELECT DISTINCT PostId FROM Comments
+),
+UpvotedAndCommentedPosts AS (
+    SELECT PostId FROM PostsWithUpvotes INTERSECT SELECT PostId FROM PostsWithComments
+)
+SELECT
+    us.UserId,
+    us.UserDisplayName,
+    us.Reputation,
+    us.TotalQuestionsAsked,
+    us.TotalAnswersPosted,
+    us.TotalCommentsMade,
+    us.TotalBadgesEarned,
+    us.UserUpVotesGiven,
+    us.UserDownVotesGiven,
+    us.TotalUpVotesReceivedOnPosts,
+    us.TotalDownVotesReceivedOnPosts,
+    q.Id AS QuestionId,
+    q.Title AS QuestionTitle,
+    q.CreationDate AS QuestionCreationDate,
+    q.ViewCount AS QuestionViewCount,
+    q.Score AS QuestionScore,
+    NULLIF(q.AnswerCount, 0) AS QuestionAnswerCount_NullIfZero,
+    q.CommentCount AS QuestionCommentCount,
+    q.FavoriteCount AS QuestionFavoriteCount,
+    ph.TotalEdits AS QuestionEditCount,
+    ph.TotalCloseEvents AS QuestionCloseCount,
+    ph.TotalReopenEvents AS QuestionReopenCount,
+    q.ClosedDate IS NOT NULL AS IsQuestionClosed,
+    COALESCE(q.ClosedDate, '1900-01-01 00:00:00') AS ActualOrPlaceholderClosedDate,
+    EXTRACT(DAY FROM (cast('2024-10-01 12:34:56' as timestamp) - q.CreationDate)) AS DaysSinceQuestionCreation,
+    (SELECT AVG(v.BountyAmount) FROM Votes v WHERE v.PostId = q.Id AND v.VoteTypeId = (SELECT Id FROM VoteTypes WHERE Name = 'BountyStart')) AS AvgBountyAmount,
+    (SELECT COUNT(DISTINCT v_fav.UserId) FROM Votes v_fav WHERE v_fav.PostId = q.Id AND v_fav.VoteTypeId = (SELECT Id FROM VoteTypes WHERE Name = 'Favorite')) AS FavoriteCountFromVotes,
+    (
+        SELECT MAX(CASE WHEN pht_inner.Name = 'Initial Body' THEN LENGTH(ph_inner.Text) WHEN pht_inner.Name = 'Edit Body' THEN LENGTH(ph_inner.Text) ELSE 0 END)
+        FROM PostHistory ph_inner
+        JOIN PostHistoryTypes pht_inner ON ph_inner.PostHistoryTypeId = pht_inner.Id
+        WHERE ph_inner.PostId = q.Id
+    ) AS MaxBodyLengthInHistory,
+    a.Id AS AcceptedAnswerId,
+    a.OwnerUserId AS AcceptedAnswerOwnerUserId,
+    a.Score AS AcceptedAnswerScore,
+    COALESCE(a.CreationDate, '2000-01-01 00:00:00') AS AcceptedAnswerCreationDate,
+    q_comments.TotalQuestionComments,
+    q_tags.TagNameLower AS MainQuestionTag,
+    q_tags.TagAvgScore AS MainTagAvgQuestionScore,
+    rpa.HoursSinceCreationToLastActivity,
+    rpa.UniqueCommentersAfterFirstDay,
+    CASE
+        WHEN us.Reputation >= 10000 AND us.TotalQuestionsAsked > 50 THEN 'HighRepExperienced'
+        WHEN us.Reputation >= 1000 AND us.TotalAnswersPosted > 20 THEN 'MidRepContributor'
+        ELSE 'NewOrLowRep'
+    END AS UserCategory,
+    CASE
+        WHEN q.Score > 50 AND q.ViewCount > 10000 THEN 'ViralQuestion'
+        WHEN NULLIF(q.AnswerCount, 0) > 5 AND q.AcceptedAnswerId IS NOT NULL THEN 'WellAnsweredQuestion'
+        WHEN q.ClosedDate IS NOT NULL AND COALESCE(ph.TotalReopenEvents, 0) > 0 THEN 'ClosedThenReopenedQuestion'
+        WHEN uacp.PostId IS NOT NULL THEN 'UpvotedAndCommented'
+        ELSE 'NormalQuestion'
+    END AS QuestionStatusLabel,
+    pl.RelatedPostId AS LinkedQuestionId,
+    lt.Name AS LinkTypeName,
+    (SELECT MAX(ph_mig.CreationDate) FROM PostHistory ph_mig WHERE ph_mig.PostId = q.Id AND ph_mig.PostHistoryTypeId IN (35, 36)) AS LastMigrationDate,
+    (
+        SELECT STRING_AGG(b_gold.Name, ', ' ORDER BY b_gold.Name)
+        FROM Badges b_gold
+        WHERE b_gold.UserId = us.UserId AND b_gold.Class = 1
+        LIMIT 3
+    ) AS UserGoldBadges,
+    (
+        SELECT COUNT(*)
+        FROM Badges b_recent
+        WHERE b_recent.UserId = us.UserId AND b_recent.Date > (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '90 days')
+    ) AS RecentBadgesCount
+FROM UserStatsV2 us
+INNER JOIN Posts q ON us.UserId = q.OwnerUserId AND q.PostTypeId = 1
+LEFT JOIN Posts a ON q.AcceptedAnswerId = a.Id AND a.PostTypeId = 2
+LEFT JOIN PostHistoryAgg ph ON q.Id = ph.PostId
+LEFT JOIN (
+    SELECT PostId, COUNT(Id) AS TotalQuestionComments
+    FROM Comments
+    GROUP BY PostId
+) AS q_comments ON q.Id = q_comments.PostId
+LEFT JOIN PostTagAnalysis q_tags ON q.Id = q_tags.PostId AND q_tags.TagRank = 1
+LEFT JOIN RecentPostActivity rpa ON q.Id = rpa.PostId
+LEFT JOIN PostLinks pl ON q.Id = pl.PostId AND pl.LinkTypeId = (SELECT Id FROM LinkTypes WHERE Name = 'Linked')
+LEFT JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+LEFT JOIN UpvotedAndCommentedPosts uacp ON q.Id = uacp.PostId
+WHERE us.Reputation > 100 AND q.CreationDate BETWEEN '2019-01-01' AND '2022-12-31'
+  AND (q.Tags LIKE '%<sql>%' OR q.Tags LIKE '%<database>%')
+  AND (
+        (q.ViewCount > 5000 AND q.Score > 20) OR
+        (NULLIF(q.AnswerCount, 0) > 3 AND q.FavoriteCount > 5) OR
+        (us.TotalBadgesEarned > 10 AND q.CommunityOwnedDate IS NOT NULL)
+      )
+  AND (COALESCE(ph.TotalCloseEvents, 0) = 0 OR COALESCE(ph.TotalReopenEvents, 0) > 0)
+  AND us.TotalQuestionsAsked > (SELECT AVG(TotalQuestionsAsked) FROM UserStatsV2 WHERE Reputation > 500)
+  AND (LOWER(q.Title) LIKE '%performance%' OR LOWER(q.Body) LIKE '%benchmark%')
+ORDER BY us.Reputation DESC, q.CreationDate DESC, rpa.HoursSinceCreationToLastActivity DESC
+LIMIT 1000;

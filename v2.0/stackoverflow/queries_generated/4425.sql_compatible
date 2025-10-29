@@ -1,0 +1,139 @@
+WITH
+  RankedPostEdits AS (
+    SELECT
+      ph.PostId,
+      ph.UserId,
+      ph.PostHistoryTypeId,
+      ph.CreationDate,
+      p.OwnerUserId AS OriginalOwnerUserId,
+      p.PostTypeId,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    JOIN Posts p
+      ON ph.PostId = p.Id
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6) AND ph.UserId IS NOT NULL
+  ),
+  UserEditSummary AS (
+    SELECT
+      rpe.UserId,
+      COUNT(DISTINCT rpe.PostId) AS UniquePostsEdited,
+      SUM(CASE WHEN rpe.PostHistoryTypeId = 4 THEN 1 ELSE 0 END) AS TitleEdits,
+      SUM(CASE WHEN rpe.PostHistoryTypeId = 5 THEN 1 ELSE 0 END) AS BodyEdits,
+      SUM(CASE WHEN rpe.PostHistoryTypeId = 6 THEN 1 ELSE 0 END) AS TagEdits,
+      AVG(p.Score::numeric) AS AvgPostScoreForEditedPosts
+    FROM RankedPostEdits rpe
+    JOIN Posts p
+      ON rpe.PostId = p.Id
+    WHERE
+      rpe.rn = 1
+    GROUP BY
+      rpe.UserId
+  ),
+  PostEditFrequency AS (
+    SELECT
+      PostId,
+      COUNT(Id) AS EditCount
+    FROM PostHistory
+    WHERE
+      PostHistoryTypeId IN (4, 5, 6)
+    GROUP BY
+      PostId
+  ),
+  HighEngagementUsers AS (
+    SELECT
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.UpVotes,
+      u.DownVotes,
+      COUNT(p.Id) AS TotalPostsOwned,
+      SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsOwned,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersOwned,
+      COALESCE(SUM(p.FavoriteCount), 0) AS TotalFavorites
+    FROM Users u
+    LEFT JOIN Posts p
+      ON u.Id = p.OwnerUserId
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.UpVotes,
+      u.DownVotes
+    HAVING
+      COUNT(p.Id) > 100 AND u.Reputation > 10000
+  )
+SELECT
+  heu.DisplayName AS UserDisplayName,
+  heu.Reputation,
+  heu.TotalPostsOwned,
+  heu.QuestionsOwned,
+  heu.AnswersOwned,
+  ues.UniquePostsEdited,
+  ues.TitleEdits,
+  ues.BodyEdits,
+  ues.TagEdits,
+  COALESCE(ues.AvgPostScoreForEditedPosts, 0) AS AvgScoreOfEditedPosts,
+  COALESCE(pref.EditCount, 0) AS TotalEditsByThisUserOnTheirPosts,
+  CASE
+    WHEN heu.TotalFavorites > 0 THEN heu.TotalFavorites / CAST(heu.TotalPostsOwned AS DOUBLE PRECISION)
+    ELSE 0
+  END AS AvgFavoritesPerPost,
+  CASE
+    WHEN ues.UniquePostsEdited > 0 THEN CAST(ues.BodyEdits AS DOUBLE PRECISION) / ues.UniquePostsEdited
+    ELSE 0
+  END AS AvgBodyEditsPerUser,
+  COALESCE(
+    (
+      SELECT
+        COUNT(*)
+      FROM Badges b
+      WHERE
+        b.UserId = heu.Id AND b.Class = 1
+    ),
+    0
+  ) AS GoldBadges,
+  COALESCE(
+    (
+      SELECT
+        COUNT(*)
+      FROM Badges b
+      WHERE
+        b.UserId = heu.Id AND b.Class = 2
+    ),
+    0
+  ) AS SilverBadges,
+  COALESCE(
+    (
+      SELECT
+        COUNT(*)
+      FROM Badges b
+      WHERE
+        b.UserId = heu.Id AND b.Class = 3
+    ),
+    0
+  ) AS BronzeBadges,
+  LOWER(SUBSTRING(heu.DisplayName FROM 1 FOR 3)) AS UserDisplayNamePrefix,
+  COALESCE(
+    (
+      SELECT
+        SUM(CAST(ph.CommentCount AS DOUBLE PRECISION))
+      FROM Posts p2
+      JOIN PostHistory ph
+        ON p2.Id = ph.PostId
+      WHERE
+        p2.OwnerUserId = heu.Id AND ph.PostHistoryTypeId = 5
+    ),
+    0
+  ) AS TotalCommentEditsOnUserPosts
+FROM HighEngagementUsers heu
+LEFT JOIN UserEditSummary ues
+  ON heu.Id = ues.UserId
+LEFT JOIN PostEditFrequency pref
+  ON heu.Id = pref.PostId
+WHERE
+  ues.UniquePostsEdited IS NOT NULL AND ues.UniquePostsEdited > 5
+ORDER BY
+  heu.Reputation DESC,
+  AvgScoreOfEditedPosts DESC NULLS LAST
+LIMIT 100;

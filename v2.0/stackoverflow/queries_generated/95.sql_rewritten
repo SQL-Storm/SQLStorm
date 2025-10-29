@@ -1,0 +1,392 @@
+-- {"query": "95.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3331} 
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        u.location,
+        coalesce(nullif(trim(split_part(coalesce(u.websiteurl, ''), '/', 3)), ''), 'no-domain') as website_domain,
+        date_trunc('month', u.creationdate) as cohort_month
+    from users u
+),
+question_posts as (
+    select
+        p.id as post_id,
+        p.owneruserid as user_id,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        p.title,
+        p.tags,
+        p.closeddate,
+        p.acceptedanswerid,
+        p.answercount
+    from posts p
+    where p.posttypeid = 1
+),
+answer_posts as (
+    select
+        p.id as post_id,
+        p.parentid as question_id,
+        p.owneruserid as user_id,
+        p.creationdate,
+        p.score
+    from posts p
+    where p.posttypeid = 2
+),
+user_activity as (
+    select
+        ru.user_id,
+        ru.displayname,
+        ru.reputation,
+        ru.cohort_month,
+        count(distinct qp.post_id) filter (where qp.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days') as questions_last_year,
+        count(distinct ap.post_id) filter (where ap.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days') as answers_last_year,
+        sum(qp.viewcount) filter (where qp.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days') as question_views_last_year,
+        sum(qp.score) filter (where qp.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days') as question_score_last_year,
+        sum(ap.score) filter (where ap.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days') as answer_score_last_year
+    from recent_users ru
+    left join question_posts qp on qp.user_id = ru.user_id
+    left join answer_posts ap on ap.user_id = ru.user_id
+    group by ru.user_id, ru.displayname, ru.reputation, ru.cohort_month
+),
+post_interactions as (
+    select
+        p.id as post_id,
+        p.owneruserid as owner_id,
+        count(c.id) as comment_count,
+        count(v.id) filter (where v.votetypeid = 2) as upvotes,
+        count(v.id) filter (where v.votetypeid = 3) as downvotes,
+        count(v.id) filter (where v.votetypeid = 5) as favorites,
+        max(ph.creationdate) filter (where ph.posthistorytypeid in (10,11,12,13,14,15,19,20)) as last_mod_event,
+        bool_or(ph.posthistorytypeid = 10 and ph.comment ~ '^(101|102|103|104|105)$') as has_closure_event
+    from posts p
+    left join comments c on c.postid = p.id
+    left join votes v on v.postid = p.id
+    left join posthistory ph on ph.postid = p.id
+    group by p.id, p.owneruserid
+),
+duplicate_links as (
+    select
+        pl.postid as dup_post_id,
+        pl.relatedpostid as canonical_post_id,
+        min(pl.creationdate) as first_dup_link_date,
+        count(*) as dup_link_count
+    from postlinks pl
+    where pl.linktypeid = 3
+    group by pl.postid, pl.relatedpostid
+),
+q_agg as (
+    select
+        qp.post_id,
+        qp.user_id,
+        qp.creationdate,
+        qp.score,
+        qp.viewcount,
+        qp.title,
+        qp.tags,
+        qp.closeddate,
+        qp.acceptedanswerid,
+        pi.comment_count,
+        pi.upvotes,
+        pi.downvotes,
+        pi.favorites,
+        pi.last_mod_event,
+        pi.has_closure_event,
+        dl.first_dup_link_date,
+        dl.dup_link_count
+    from question_posts qp
+    left join post_interactions pi on pi.post_id = qp.post_id
+    left join duplicate_links dl on dl.dup_post_id = qp.post_id
+),
+tag_expanded as (
+    select
+        qa.post_id,
+        unnest(string_to_array(substring(coalesce(qa.tags,''), 2, greatest(length(coalesce(qa.tags,'')) - 2, 0)), '><')) as tagname
+    from q_agg qa
+),
+tag_with_meta as (
+    select
+        te.post_id,
+        lower(te.tagname) as tagname,
+        t.count as tag_total_count,
+        t.ismoderatoronly,
+        t.isrequired
+    from tag_expanded te
+    left join tags t on lower(t.tagname) = lower(te.tagname)
+),
+answer_latency as (
+    select
+        a.question_id,
+        min(a.creationdate) as first_answer_time,
+        count(*) as total_answers,
+        sum(case when a.score > 0 then 1 else 0 end) as pos_answers
+    from answer_posts a
+    group by a.question_id
+),
+accepted_answer_stats as (
+    select
+        q.post_id,
+        aa.post_id as accepted_answer_id,
+        aa.creationdate as accepted_answer_time,
+        aa.score as accepted_answer_score
+    from q_agg q
+    left join posts aa on aa.id = q.acceptedanswerid
+),
+closed_reasons as (
+    select
+        ph.postid as post_id,
+        max(ph.creationdate) as last_closed_date,
+        max(case
+            when ph.posthistorytypeid = 10 and ph.comment ~ '^(101|102|103|104|105)$' then ph.comment
+            else null end
+        ) as close_reason_code
+    from posthistory ph
+    where ph.posthistorytypeid in (10,11)
+    group by ph.postid
+),
+user_badges as (
+    select
+        b.userid,
+        count(*) as total_badges,
+        count(*) filter (where b.class = 1) as gold_badges,
+        count(*) filter (where b.class = 2) as silver_badges,
+        count(*) filter (where b.class = 3) as bronze_badges,
+        count(*) filter (where b.tagbased = 1) as tag_badges,
+        max(b.date) as last_badge_date
+    from badges b
+    group by b.userid
+),
+cohorts as (
+    select
+        ua.user_id,
+        ua.displayname,
+        ua.reputation,
+        ua.cohort_month,
+        ub.total_badges,
+        ub.gold_badges,
+        ub.silver_badges,
+        ub.bronze_badges,
+        ub.tag_badges,
+        ub.last_badge_date,
+        ua.questions_last_year,
+        ua.answers_last_year,
+        ua.question_views_last_year,
+        ua.question_score_last_year,
+        ua.answer_score_last_year
+    from user_activity ua
+    left join user_badges ub on ub.userid = ua.user_id
+),
+question_metrics as (
+    select
+        q.post_id,
+        q.user_id,
+        q.creationdate,
+        q.score,
+        q.viewcount,
+        q.title,
+        q.tags,
+        coalesce(q.closeddate, cr.last_closed_date) as closed_date_any,
+        cr.close_reason_code,
+        q.comment_count,
+        q.upvotes,
+        q.downvotes,
+        q.favorites,
+        q.last_mod_event,
+        q.has_closure_event,
+        al.first_answer_time,
+        al.total_answers,
+        al.pos_answers,
+        aas.accepted_answer_id,
+        aas.accepted_answer_time,
+        aas.accepted_answer_score,
+        dl.dup_link_count,
+        dl.first_dup_link_date
+    from q_agg q
+    left join answer_latency al on al.question_id = q.post_id
+    left join accepted_answer_stats aas on aas.post_id = q.post_id
+    left join closed_reasons cr on cr.post_id = q.post_id
+    left join duplicate_links dl on dl.dup_post_id = q.post_id
+),
+ranked_questions as (
+    select
+        qm.*,
+        case
+            when qm.viewcount is null then 0
+            else qm.viewcount
+        end as viewcount_safe,
+        case
+            when qm.score is null then 0
+            else qm.score
+        end as score_safe,
+        extract(epoch from (coalesce(qm.first_answer_time, qm.creationdate) - qm.creationdate)) as sec_to_first_answer,
+        extract(epoch from (coalesce(qm.accepted_answer_time, qm.creationdate) - qm.creationdate)) as sec_to_accept,
+        row_number() over (partition by qm.user_id order by qm.creationdate desc, qm.post_id desc) as rn_user_recent,
+        dense_rank() over (order by coalesce(qm.viewcount,0) desc, coalesce(qm.score,0) desc, qm.post_id) as dr_global_popularity
+    from question_metrics qm
+),
+user_post_windows as (
+    select
+        rq.*,
+        sum(coalesce(rq.score,0)) over (partition by rq.user_id order by rq.creationdate rows between unbounded preceding and current row) as cum_user_score,
+        avg(coalesce(rq.viewcount,0)) over (partition by rq.user_id order by rq.creationdate rows between 10 preceding and current row) as mov_avg_views_last_10,
+        count(*) over (partition by rq.user_id) as total_q_by_user
+    from ranked_questions rq
+),
+domain_mix as (
+    select
+        ru.user_id,
+        ru.website_domain,
+        count(*) as domain_posts
+    from recent_users ru
+    join posts p on p.owneruserid = ru.user_id
+    group by ru.user_id, ru.website_domain
+),
+domain_pref as (
+    select distinct on (dm.user_id)
+        dm.user_id,
+        dm.website_domain as top_domain,
+        dm.domain_posts
+    from domain_mix dm
+    order by dm.user_id, dm.domain_posts desc nulls last, dm.website_domain
+),
+closed_reason_dim as (
+    select
+        crt.id::text as code,
+        crt.name
+    from closerreasontypes crt
+),
+final_scores as (
+    select
+        upw.post_id,
+        upw.user_id,
+        upw.creationdate,
+        upw.title,
+        upw.tags,
+        upw.viewcount_safe,
+        upw.score_safe,
+        upw.total_q_by_user,
+        upw.cum_user_score,
+        upw.mov_avg_views_last_10,
+        upw.dr_global_popularity,
+        upw.sec_to_first_answer,
+        upw.sec_to_accept,
+        coalesce(crd.name, case when upw.close_reason_code is not null then 'Unknown Reason' end) as close_reason_name,
+        case when upw.closed_date_any is not null then 1 else 0 end as is_closed,
+        case when upw.accepted_answer_id is not null then 1 else 0 end as has_accepted,
+        case when upw.dup_link_count is not null and upw.dup_link_count > 0 then 1 else 0 end as is_marked_duplicate,
+        case
+            when upw.accepted_answer_id is not null then 1.0
+            when upw.total_answers is null or upw.total_answers = 0 then 0.0
+            else least(1.0, coalesce(upw.pos_answers::numeric,0) / nullif(upw.total_answers::numeric,0))
+        end as answer_quality_ratio,
+        greatest(
+            0,
+            0.5 * log(1 + upw.viewcount_safe) +
+            0.3 * upw.score_safe +
+            coalesce(0.2 * (upw.favorites), 0) -
+            1.5 * coalesce((upw.downvotes), 0)
+        ) as popularity_score,
+        case
+            when upw.sec_to_first_answer is null then null
+            when upw.sec_to_first_answer < 3600 then 'under 1h'
+            when upw.sec_to_first_answer < 86400 then '1h-24h'
+            when upw.sec_to_first_answer < 604800 then '1-7d'
+            else '7d+'
+        end as first_answer_bucket
+    from user_post_windows upw
+    left join closed_reason_dim crd on crd.code = upw.close_reason_code
+),
+tag_rollup as (
+    select
+        twm.post_id,
+        string_agg(
+            case
+                when coalesce(twm.tag_total_count, 0) > 0 then twm.tagname || ':' || twm.tag_total_count
+                else twm.tagname || ':0'
+            end
+            , ','
+            order by coalesce(twm.tag_total_count, 0) desc, twm.tagname
+        ) as tag_stats
+    from tag_with_meta twm
+    group by twm.post_id
+),
+user_summary as (
+    select
+        c.user_id,
+        c.displayname,
+        c.reputation,
+        c.cohort_month,
+        c.total_badges,
+        c.gold_badges,
+        c.silver_badges,
+        c.bronze_badges,
+        c.tag_badges,
+        c.last_badge_date,
+        dp.top_domain
+    from cohorts c
+    left join domain_pref dp on dp.user_id = c.user_id
+),
+scored as (
+    select
+        fs.post_id,
+        fs.user_id,
+        us.displayname,
+        us.reputation,
+        us.cohort_month,
+        us.total_badges,
+        us.gold_badges,
+        us.silver_badges,
+        us.bronze_badges,
+        us.tag_badges,
+        us.top_domain,
+        fs.creationdate,
+        fs.title,
+        fs.tags,
+        tr.tag_stats,
+        fs.viewcount_safe,
+        fs.score_safe,
+        fs.total_q_by_user,
+        fs.cum_user_score,
+        fs.mov_avg_views_last_10,
+        fs.dr_global_popularity,
+        fs.sec_to_first_answer,
+        fs.sec_to_accept,
+        fs.close_reason_name,
+        fs.is_closed,
+        fs.has_accepted,
+        fs.is_marked_duplicate,
+        fs.answer_quality_ratio,
+        fs.popularity_score,
+        fs.first_answer_bucket
+    from final_scores fs
+    left join user_summary us on us.user_id = fs.user_id
+    left join tag_rollup tr on tr.post_id = fs.post_id
+)
+select
+    s.*,
+    percentile_disc(0.5) within group (order by s.popularity_score) over () as global_popularity_median,
+    percentile_disc(0.9) within group (order by s.popularity_score) over () as global_popularity_p90,
+    rank() over (partition by s.cohort_month order by s.popularity_score desc, s.viewcount_safe desc nulls last, s.post_id) as rank_in_cohort,
+    count(*) over (partition by s.cohort_month) as cohort_size,
+    case
+        when s.is_closed = 1 then 'closed'
+        when s.is_marked_duplicate = 1 then 'duplicate'
+        when s.has_accepted = 1 then 'answered'
+        else 'open'
+    end as post_status_bucket
+from scored s
+where
+    s.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+    and (
+        s.popularity_score > (
+            select avg(fs2.popularity_score)
+            from final_scores fs2
+            where fs2.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+        )
+        or s.answer_quality_ratio is null
+        or s.is_marked_duplicate = 1
+    )
+order by s.popularity_score desc, s.dr_global_popularity asc, s.creationdate desc
+limit 500;

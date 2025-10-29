@@ -1,0 +1,278 @@
+-- {"query": "1389.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 4256} 
+
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.Views AS UserViews,
+        U.UpVotes AS UserUpVotes,
+        U.DownVotes AS UserDownVotes,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate AS UserLastAccessDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COUNT(DISTINCT CASE WHEN V.VoteTypeId = 2 THEN V.Id END) AS TotalUpvotesGiven,
+        COUNT(DISTINCT CASE WHEN V.VoteTypeId = 3 THEN V.Id END) AS TotalDownvotesGiven,
+        SUM(CASE WHEN P.PostTypeId IN (1,2) THEN P.Score ELSE 0 END) AS SumPostScores,
+        MAX(P.LastActivityDate) AS LastPostActivity,
+        MIN(B.Date) AS FirstBadgeDate,
+        COUNT(B.Id) AS TotalBadges,
+        MAX(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS HasGoldBadge,
+        DENSE_RANK() OVER (ORDER BY U.Reputation DESC, U.CreationDate ASC) AS ReputationRank,
+        LAG(U.Reputation, 1, 0) OVER (ORDER BY U.Reputation) AS PreviousUserReputation
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Votes V ON U.Id = V.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.Views, U.UpVotes, U.DownVotes, U.CreationDate, U.LastAccessDate
+),
+PostVersionHistory AS (
+    SELECT
+        PH.PostId,
+        MIN(PH.CreationDate) AS FirstEditDate,
+        MAX(PH.CreationDate) AS LastEditDate,
+        COUNT(CASE WHEN PH.PostHistoryTypeId IN (4,5,6) THEN PH.Id END) AS EditCount,
+        COUNT(CASE WHEN PH.PostHistoryTypeId IN (7,8,9) THEN PH.Id END) AS RollbackCount,
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.Id END) AS CloseVoteCount,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN COALESCE(NULLIF(PH.Comment, ''), '0') END) AS LastCloseReasonIdText, -- Using NULLIF and COALESCE, '0' for no reason
+        STRING_AGG(DISTINCT SUBSTRING(PH.Text, 1, 10), '; ') FILTER (WHERE PH.PostHistoryTypeId = 5 AND LENGTH(PH.Text) > 0) AS SampleEditTexts
+    FROM PostHistory PH
+    GROUP BY PH.PostId
+),
+QuestionDetails AS (
+    SELECT
+        Q.Id AS QuestionId,
+        Q.Title AS QuestionTitle,
+        Q.CreationDate AS QuestionCreationDate,
+        Q.OwnerUserId AS QuestionOwnerId,
+        Q.Score AS QuestionScore,
+        Q.ViewCount,
+        Q.AnswerCount,
+        Q.FavoriteCount,
+        Q.LastActivityDate AS QuestionLastActivityDate,
+        Q.ClosedDate,
+        Q.CommunityOwnedDate,
+        PH.FirstEditDate,
+        PH.LastEditDate,
+        PH.EditCount,
+        PH.RollbackCount,
+        PH.CloseVoteCount,
+        PH.LastCloseReasonIdText,
+        CASE
+            WHEN Q.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN Q.CommunityOwnedDate IS NOT NULL THEN 'CommunityOwned'
+            WHEN Q.AnswerCount = 0 AND (NOW() - Q.CreationDate) > INTERVAL '30 days' THEN 'StaleNoAnswers'
+            ELSE 'Open'
+        END AS QuestionStatus,
+        (SELECT MAX(A.Score) FROM Posts A WHERE A.ParentId = Q.Id AND A.PostTypeId = 2) AS MaxAnswerScore,
+        COALESCE(PL_Linked.LinkedCount, 0) AS LinkedPostsCount,
+        COALESCE(PL_Duplicate.DuplicateCount, 0) AS DuplicatePostsCount,
+        STRING_AGG(DISTINCT TagSplit.TagName, ' | ') AS AssociatedTags,
+        EXTRACT(EPOCH FROM (Q.LastActivityDate - Q.CreationDate)) / 3600 AS HoursSinceCreationToLastActivity,
+        CASE
+            WHEN Q.Tags LIKE '%<sql>%' OR Q.Tags LIKE '%<database>%' THEN TRUE
+            ELSE FALSE
+        END AS HasDatabaseTags
+    FROM Posts Q
+    LEFT JOIN PostVersionHistory PH ON Q.Id = PH.PostId
+    LEFT JOIN (SELECT PostId, COUNT(RelatedPostId) AS LinkedCount FROM PostLinks WHERE LinkTypeId = 1 GROUP BY PostId) PL_Linked ON Q.Id = PL_Linked.PostId
+    LEFT JOIN (SELECT PostId, COUNT(RelatedPostId) AS DuplicateCount FROM PostLinks WHERE LinkTypeId = 3 GROUP BY PostId) PL_Duplicate ON Q.Id = PL_Duplicate.PostId
+    LEFT JOIN LATERAL (SELECT (regexp_split_to_table(SUBSTRING(Q.Tags, 2, LENGTH(Q.Tags)-2), '><')) AS TagName WHERE Q.Tags IS NOT NULL AND LENGTH(Q.Tags) > 2) AS TagSplit ON TRUE
+    WHERE Q.PostTypeId = 1 -- Only questions
+    GROUP BY Q.Id, Q.Title, Q.CreationDate, Q.OwnerUserId, Q.Score, Q.ViewCount, Q.AnswerCount, Q.FavoriteCount, Q.LastActivityDate, Q.ClosedDate, Q.CommunityOwnedDate, PH.FirstEditDate, PH.LastEditDate, PH.EditCount, PH.RollbackCount, PH.CloseVoteCount, PH.LastCloseReasonIdText, PL_Linked.LinkedCount, PL_Duplicate.DuplicateCount, Q.Tags
+),
+AnswerDetails AS (
+    SELECT
+        A.Id AS AnswerId,
+        A.ParentId AS QuestionId,
+        A.OwnerUserId AS AnswerOwnerId,
+        A.CreationDate AS AnswerCreationDate,
+        A.Score AS AnswerScore,
+        P.AcceptedAnswerId IS NOT NULL AND P.AcceptedAnswerId = A.Id AS IsAcceptedAnswer,
+        COALESCE(PH.EditCount, 0) AS AnswerEditCount,
+        COALESCE(PH.RollbackCount, 0) AS AnswerRollbackCount,
+        (SELECT COUNT(C.Id) FROM Comments C WHERE C.PostId = A.Id AND C.CreationDate BETWEEN A.CreationDate AND NOW()) AS CommentsOnAnswerCount,
+        ROUND(COALESCE(A.Score * 1.0 / NULLIF(P.ViewCount, 0), 0), 2) AS ScorePerQuestionViewRatio, -- Score relative to parent question's views
+        FIRST_VALUE(A.Score) OVER (PARTITION BY A.ParentId ORDER BY A.CreationDate ASC) AS FirstAnswerScore,
+        LAG(A.Score, 1, 0) OVER (PARTITION BY A.ParentId ORDER BY A.CreationDate ASC) AS PreviousAnswerScoreInQuestion
+    FROM Posts A
+    JOIN Posts P ON A.ParentId = P.Id
+    LEFT JOIN PostVersionHistory PH ON A.Id = PH.PostId
+    WHERE A.PostTypeId = 2 -- Only answers
+),
+PostCommentActivity AS (
+    SELECT
+        C.PostId,
+        SUM(C.Score) AS TotalCommentScore,
+        COUNT(C.Id) AS TotalCommentCount,
+        COUNT(DISTINCT C.UserId) AS UniqueCommenters,
+        MAX(LENGTH(C.Text)) AS MaxCommentLength,
+        MIN(LENGTH(C.Text)) AS MinCommentLength,
+        AVG(LENGTH(C.Text)) AS AvgCommentLength
+    FROM Comments C
+    GROUP BY C.PostId
+),
+CombinedPostAnalysis AS (
+    SELECT
+        QD.QuestionId AS PostId,
+        'Question' AS PostType,
+        QD.QuestionTitle AS PostTitle,
+        QD.QuestionCreationDate AS PostCreationDate,
+        QD.QuestionOwnerId AS PostOwnerId,
+        QD.QuestionScore AS PostScore,
+        QD.ViewCount,
+        QD.AnswerCount,
+        QD.FavoriteCount,
+        QD.QuestionLastActivityDate AS PostLastActivityDate,
+        QD.ClosedDate,
+        QD.CommunityOwnedDate,
+        QD.FirstEditDate,
+        QD.LastEditDate,
+        QD.EditCount,
+        QD.RollbackCount,
+        QD.CloseVoteCount,
+        QD.LastCloseReasonIdText,
+        QD.QuestionStatus,
+        NULL AS IsAcceptedAnswer,
+        QD.MaxAnswerScore,
+        QD.LinkedPostsCount,
+        QD.DuplicatePostsCount,
+        QD.AssociatedTags,
+        QD.HoursSinceCreationToLastActivity,
+        QD.HasDatabaseTags,
+        PCA.TotalCommentScore AS CurrentPostTotalCommentScore,
+        PCA.TotalCommentCount AS CurrentPostTotalCommentCount,
+        PCA.UniqueCommenters AS CurrentPostUniqueCommenters,
+        PCA.MaxCommentLength AS CurrentPostMaxCommentLength,
+        PCA.MinCommentLength AS CurrentPostMinCommentLength,
+        PCA.AvgCommentLength AS CurrentPostAvgCommentLength
+    FROM QuestionDetails QD
+    LEFT JOIN PostCommentActivity PCA ON QD.QuestionId = PCA.PostId
+
+    UNION ALL
+
+    SELECT
+        AD.AnswerId AS PostId,
+        'Answer' AS PostType,
+        LEFT(P.Body, 100) || CASE WHEN LENGTH(P.Body) > 100 THEN '...' ELSE '' END AS PostTitle, -- Using SUBSTRING for answers as they don't have titles
+        AD.AnswerCreationDate AS PostCreationDate,
+        AD.AnswerOwnerId AS PostOwnerId,
+        AD.AnswerScore AS PostScore,
+        NULL AS ViewCount, -- Answers don't have direct view counts
+        NULL AS AnswerCount,
+        NULL AS FavoriteCount,
+        P.LastActivityDate AS PostLastActivityDate,
+        P.ClosedDate,
+        P.CommunityOwnedDate,
+        PH.FirstEditDate,
+        PH.LastEditDate,
+        AD.AnswerEditCount AS EditCount,
+        AD.AnswerRollbackCount AS RollbackCount,
+        NULL AS CloseVoteCount, -- Answers can't be closed directly
+        NULL AS LastCloseReasonIdText,
+        CASE
+            WHEN AD.IsAcceptedAnswer THEN 'Accepted'
+            WHEN (NOW() - AD.AnswerCreationDate) > INTERVAL '90 days' AND AD.AnswerScore < 0 THEN 'LowScoreStale'
+            ELSE 'Active'
+        END AS PostStatus,
+        AD.IsAcceptedAnswer,
+        NULL AS MaxAnswerScore, -- Only applicable for questions
+        COALESCE(PL_Linked.LinkedCount, 0) AS LinkedPostsCount,
+        COALESCE(PL_Duplicate.DuplicateCount, 0) AS DuplicatePostsCount,
+        STRING_AGG(DISTINCT TagSplit.TagName, ' | ') AS AssociatedTags, -- Retrieve tags from parent question
+        EXTRACT(EPOCH FROM (P.LastActivityDate - AD.AnswerCreationDate)) / 3600 AS HoursSinceCreationToLastActivity,
+        CASE
+            WHEN P_Parent.Tags LIKE '%<sql>%' OR P_Parent.Tags LIKE '%<database>%' THEN TRUE
+            ELSE FALSE
+        END AS HasDatabaseTags,
+        PCA.TotalCommentScore AS CurrentPostTotalCommentScore,
+        PCA.TotalCommentCount AS CurrentPostTotalCommentCount,
+        PCA.UniqueCommenters AS CurrentPostUniqueCommenters,
+        PCA.MaxCommentLength AS CurrentPostMaxCommentLength,
+        PCA.MinCommentLength AS CurrentPostMinCommentLength,
+        PCA.AvgCommentLength AS CurrentPostAvgCommentLength
+    FROM AnswerDetails AD
+    JOIN Posts P ON AD.AnswerId = P.Id -- Join back to Posts for Body, LastActivityDate etc.
+    JOIN Posts P_Parent ON AD.QuestionId = P_Parent.Id -- For parent question tags
+    LEFT JOIN PostVersionHistory PH ON AD.AnswerId = PH.PostId
+    LEFT JOIN (SELECT PostId, COUNT(RelatedPostId) AS LinkedCount FROM PostLinks WHERE LinkTypeId = 1 GROUP BY PostId) PL_Linked ON AD.AnswerId = PL_Linked.PostId
+    LEFT JOIN (SELECT PostId, COUNT(RelatedPostId) AS DuplicateCount FROM PostLinks WHERE LinkTypeId = 3 GROUP BY PostId) PL_Duplicate ON AD.AnswerId = PL_Duplicate.PostId
+    LEFT JOIN LATERAL (SELECT (regexp_split_to_table(SUBSTRING(P_Parent.Tags, 2, LENGTH(P_Parent.Tags)-2), '><')) AS TagName WHERE P_Parent.Tags IS NOT NULL AND LENGTH(P_Parent.Tags) > 2) AS TagSplit ON TRUE
+    LEFT JOIN PostCommentActivity PCA ON AD.AnswerId = PCA.PostId
+    GROUP BY AD.AnswerId, P.Body, AD.AnswerCreationDate, AD.AnswerOwnerId, AD.AnswerScore, P.LastActivityDate, P.ClosedDate, P.CommunityOwnedDate, PH.FirstEditDate, PH.LastEditDate, AD.AnswerEditCount, AD.AnswerRollbackCount, AD.IsAcceptedAnswer, PL_Linked.LinkedCount, PL_Duplicate.LinkedCount, P_Parent.Tags, P.Id, AD.QuestionId, PCA.TotalCommentScore, PCA.TotalCommentCount, PCA.UniqueCommenters, PCA.MaxCommentLength, PCA.MinCommentLength, PCA.AvgCommentLength
+)
+SELECT
+    CPA.PostId,
+    CPA.PostType,
+    CPA.PostTitle,
+    CPA.PostCreationDate,
+    CPA.PostOwnerId,
+    UE.DisplayName AS PostOwnerDisplayName,
+    UE.Reputation AS PostOwnerReputation,
+    CPA.PostScore,
+    CPA.ViewCount,
+    CPA.AnswerCount,
+    CPA.FavoriteCount,
+    CPA.PostLastActivityDate,
+    CPA.ClosedDate,
+    CPA.PostOverallStatus,
+    CPA.IsAcceptedAnswer,
+    CPA.MaxAnswerScore,
+    CPA.EditCount,
+    CPA.RollbackCount,
+    CPA.CloseVoteCount,
+    COALESCE(CRT.Name, 'No Close Reason') AS LastCloseReasonName, -- Outer join to CloseReasonTypes
+    CPA.LinkedPostsCount,
+    CPA.DuplicatePostsCount,
+    CPA.AssociatedTags,
+    CPA.HoursSinceCreationToLastActivity,
+    CPA.HasDatabaseTags,
+    CPA.CurrentPostTotalCommentScore,
+    CPA.CurrentPostTotalCommentCount,
+    CPA.UniqueCommenters AS CurrentPostUniqueCommenters,
+    CPA.CurrentPostMaxCommentLength,
+    CPA.CurrentPostMinCommentLength,
+    CPA.CurrentPostAvgCommentLength,
+    AVG(CPA.PostScore) OVER (PARTITION BY CPA.PostOwnerId ORDER BY CPA.PostCreationDate) AS RunningAvgOwnerPostScore,
+    SUM(CPA.PostScore) OVER (PARTITION BY CPA.PostOwnerId ORDER BY CPA.PostCreationDate) AS CumulativeOwnerPostScore,
+    COUNT(CPA.PostId) OVER (PARTITION BY CPA.PostOwnerId) AS TotalPostsByOwner,
+    DENSE_RANK() OVER (ORDER BY CPA.PostScore DESC, CPA.PostCreationDate DESC) AS GlobalPostScoreRank,
+    (SELECT COUNT(DISTINCT B.Id) FROM Badges B WHERE B.UserId = CPA.PostOwnerId AND B.Date < CPA.PostCreationDate) AS BadgesBeforePost, -- Correlated subquery
+    LOWER(LEFT(COALESCE(UE.DisplayName, 'Unknown'), 3)) || LPAD(COALESCE(UE.Reputation, 0)::text, 7, '0') || '-' || SUBSTRING(MD5(CPA.PostTitle || COALESCE(CPA.PostCreationDate::text, '')), 1, 8) AS ComplexIdentifierString, -- String manipulations
+    CASE
+        WHEN CPA.PostType = 'Question' AND CPA.AnswerCount > 0 AND CPA.EditCount = 0 THEN 'NoEditQuestionWithAnswers'
+        WHEN CPA.PostType = 'Answer' AND CPA.IsAcceptedAnswer THEN 'AcceptedAnswer'
+        WHEN CPA.PostScore > 50 AND CPA.CurrentPostTotalCommentCount > 10 THEN 'HighImpactDiscussion'
+        ELSE 'Other'
+    END AS PostCategoryFlag,
+    CPA.PostCreationDate::date - UE.UserCreationDate::date AS DaysSinceOwnerCreationToPost
+FROM CombinedPostAnalysis CPA
+LEFT JOIN UserEngagement UE ON CPA.PostOwnerId = UE.UserId
+LEFT JOIN CloseReasonTypes CRT ON CPA.LastCloseReasonIdText = CRT.Id::text -- Assuming LastCloseReasonIdText can be cast to smallint
+WHERE
+    CPA.PostCreationDate >= '2020-01-01' -- Date range filter
+    AND CPA.PostOwnerId IS NOT NULL -- Exclude community posts explicitly (OwnerUserId -1, which is not NULL, but community user is usually Id -1)
+    AND (
+        CPA.PostScore > 5
+        OR CPA.ViewCount > 1000
+        OR CPA.FavoriteCount > 10
+        OR (CPA.PostType = 'Answer' AND CPA.IsAcceptedAnswer)
+    ) -- Complex predicate
+    AND NOT EXISTS (
+        SELECT 1
+        FROM PostHistory PH_dup
+        WHERE PH_dup.PostId = CPA.PostId
+          AND PH_dup.PostHistoryTypeId = 10 -- Check for close events
+          AND PH_dup.CreationDate > CPA.PostCreationDate
+          AND PH_dup.Comment IN ('101', '102') -- Specific close reasons (Duplicate or Off-topic)
+    ) -- Correlated subquery with NOT EXISTS
+    AND (CPA.AssociatedTags LIKE '%sql%' OR CPA.AssociatedTags LIKE '%database%' OR CPA.AssociatedTags LIKE '%performance%') -- String pattern matching on aggregated tags
+ORDER BY
+    UE.Reputation DESC,
+    CPA.PostLastActivityDate DESC,
+    CPA.PostScore DESC
+LIMIT 5000;

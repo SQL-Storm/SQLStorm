@@ -1,0 +1,443 @@
+-- {"query": "164.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 4726} 
+with
+-- parameterizable dates
+params as (
+  select
+    date_trunc('month', now()) - interval '24 months' as from_month,
+    date_trunc('month', now()) - interval '1 month' as to_month
+),
+-- active users in window, classifying by activity blend
+active_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.location,
+    coalesce(nullif(trim(u.websiteurl), ''), 'n/a') as websiteurl_norm,
+    sum(case when p.posttypeid in (1,2) then 1 else 0 end) as authored_posts,
+    sum(coalesce(p.viewcount,0)) as total_views,
+    sum(coalesce(p.score,0)) as total_post_score,
+    sum(coalesce(c.score,0)) as total_comment_score,
+    count(distinct p.id) filter (where p.posttypeid = 1) as questions_authored,
+    count(distinct p.id) filter (where p.posttypeid = 2) as answers_authored,
+    count(distinct c.id) as comments_authored,
+    min(least(u.creationdate, min(p.creationdate) over (partition by u.id))) as first_contrib_at,
+    max(greatest(u.lastaccessdate, max(coalesce(p.lastactivitydate, p.creationdate)) over (partition by u.id))) as last_active_at
+  from users u
+  left join posts p
+    on p.owneruserid = u.id
+    and p.creationdate >= (select from_month from params)
+    and p.creationdate <  (select to_month   from params) + interval '1 month'
+  left join comments c
+    on c.userid = u.id
+    and c.creationdate >= (select from_month from params)
+    and c.creationdate <  (select to_month   from params) + interval '1 month'
+  group by u.id, u.displayname, u.reputation, u.location, u.websiteurl
+),
+-- monthly post aggregates with tag parsing
+monthly_posts as (
+  select
+    date_trunc('month', p.creationdate)::date as yyyymm,
+    p.posttypeid,
+    count(*) as posts,
+    sum(coalesce(p.viewcount,0)) as views,
+    sum(coalesce(p.score,0)) as score,
+    sum(coalesce(p.answercount,0)) filter (where p.posttypeid = 1) as total_answers_on_questions,
+    count(*) filter (where p.closeddate is not null) as closed_posts,
+    count(distinct (unnest(string_to_array(substring(p.tags, 2, greatest(length(p.tags)-2,0)), '><')))) filter (where p.posttypeid = 1 and p.tags is not null) as distinct_tags_this_month
+  from posts p
+  where p.creationdate >= (select from_month from params)
+    and p.creationdate <  (select to_month   from params) + interval '1 month'
+  group by 1,2
+),
+-- compute rolling KPIs using window functions
+monthly_kpis as (
+  select
+    yyyymm,
+    posttypeid,
+    posts,
+    views,
+    score,
+    total_answers_on_questions,
+    closed_posts,
+    distinct_tags_this_month,
+    sum(posts) over (partition by posttypeid order by yyyymm rows between 2 preceding and current row) as posts_3mo,
+    sum(score) over (partition by posttypeid order by yyyymm rows between 2 preceding and current row) as score_3mo,
+    sum(views) over (partition by posttypeid order by yyyymm rows between 5 preceding and current row) as views_6mo,
+    avg(nullif(views,0)::numeric / nullif(posts,0)) over (partition by posttypeid order by yyyymm rows between 2 preceding and current row) as avg_views_per_post_3mo
+  from monthly_posts
+),
+-- identify duplicates via PostLinks and compute duplicate clusters
+dupe_edges as (
+  select pl.postid, pl.relatedpostid
+  from postlinks pl
+  where pl.linktypeid = 3
+),
+dupe_counts as (
+  select
+    p.id as question_id,
+    count(distinct e.relatedpostid) as duplicates_of,
+    count(distinct e2.postid) as has_duplicates_from
+  from posts p
+  left join dupe_edges e
+    on e.postid = p.id
+  left join dupe_edges e2
+    on e2.relatedpostid = p.id
+  where p.posttypeid = 1
+  group by p.id
+),
+-- votes distribution per month and vote type with percentiles
+monthly_votes as (
+  select
+    date_trunc('month', v.creationdate)::date as yyyymm,
+    v.votetypeid,
+    count(*) as vote_count,
+    approx_percentile(count(*), 0.5) over (partition by votetypeid) as median_votes_placeholder -- for engines supporting approx_percentile
+  from votes v
+  where v.creationdate >= (select from_month from params)
+    and v.creationdate <  (select to_month   from params) + interval '1 month'
+  group by 1,2
+),
+-- accepted answer latency per question
+answer_latency as (
+  select
+    q.id as question_id,
+    q.creationdate as question_created,
+    a.id as accepted_answer_id,
+    a.creationdate as answer_created,
+    extract(epoch from (a.creationdate - q.creationdate)) / 3600.0 as accept_latency_hours
+  from posts q
+  join posts a on a.id = q.acceptedanswerid
+  where q.posttypeid = 1
+    and q.creationdate >= (select from_month from params)
+    and q.creationdate <  (select to_month   from params) + interval '1 month'
+),
+-- correlate comments sentiment-ish proxy using score and length
+comment_signal as (
+  select
+    p.id as post_id,
+    avg(c.score) as avg_comment_score,
+    avg(length(c.text)) as avg_comment_len,
+    sum(case when c.score > 0 and length(c.text) > 140 then 1 else 0 end) as long_positive_comments
+  from posts p
+  left join comments c on c.postid = p.id
+    and c.creationdate >= (select from_month from params)
+    and c.creationdate <  (select to_month   from params) + interval '1 month'
+  where p.creationdate >= (select from_month from params)
+    and p.creationdate <  (select to_month   from params) + interval '1 month'
+  group by p.id
+),
+-- user tiering
+user_tiers as (
+  select
+    au.user_id,
+    case
+      when au.reputation >= 100000 then 'legend'
+      when au.reputation >= 20000 then 'veteran'
+      when au.reputation >= 5000 then 'experienced'
+      when au.reputation >= 1000 then 'intermediate'
+      else 'newbie'
+    end as rep_tier,
+    case
+      when coalesce(au.answers_authored,0) >= coalesce(au.questions_authored,0) * 3 then 'answerer'
+      when coalesce(au.questions_authored,0) > coalesce(au.answers_authored,0) * 2 then 'asker'
+      else 'balanced'
+    end as activity_style
+  from active_users au
+),
+-- tag popularity drift comparing first and last 6 months
+tag_counts as (
+  select
+    date_trunc('month', p.creationdate)::date as yyyymm,
+    unnest(string_to_array(substring(p.tags, 2, greatest(length(p.tags)-2,0)), '><')) as tag,
+    count(*) as uses
+  from posts p
+  where p.posttypeid = 1 and p.tags is not null
+    and p.creationdate >= (select from_month from params)
+    and p.creationdate <  (select to_month   from params) + interval '1 month'
+  group by 1,2
+),
+tag_windows as (
+  select
+    tag,
+    sum(uses) filter (where yyyymm < (select from_month from params) + interval '6 months') as uses_first_6mo,
+    sum(uses) filter (where yyyymm >= (select to_month from params) - interval '5 months') as uses_last_6mo
+  from tag_counts
+  group by tag
+),
+tag_drift as (
+  select
+    tw.tag,
+    coalesce(tw.uses_first_6mo,0) as uses_first_6mo,
+    coalesce(tw.uses_last_6mo,0) as uses_last_6mo,
+    (coalesce(tw.uses_last_6mo,0) - coalesce(tw.uses_first_6mo,0)) as delta_6mo
+  from tag_windows tw
+),
+-- posts enriched with signals
+post_enriched as (
+  select
+    p.id,
+    p.posttypeid,
+    p.creationdate,
+    p.owneruserid,
+    p.score,
+    coalesce(p.viewcount,0) as viewcount,
+    p.title,
+    p.tags,
+    qd.duplicates_of,
+    qd.has_duplicates_from,
+    cs.avg_comment_score,
+    cs.avg_comment_len,
+    cs.long_positive_comments,
+    al.accept_latency_hours,
+    case
+      when p.posttypeid = 1 then cardinality(string_to_array(substring(p.tags, 2, greatest(length(p.tags)-2,0)), '><'))
+      else null
+    end as tag_count
+  from posts p
+  left join dupe_counts qd on qd.question_id = p.id
+  left join comment_signal cs on cs.post_id = p.id
+  left join answer_latency al on al.question_id = p.id
+  where p.creationdate >= (select from_month from params)
+    and p.creationdate <  (select to_month   from params) + interval '1 month'
+),
+-- compute per-user performance metrics over the window
+user_perf as (
+  select
+    u.id as user_id,
+    count(*) filter (where pe.posttypeid = 1) as q_count,
+    count(*) filter (where pe.posttypeid = 2) as a_count,
+    sum(pe.score) as total_score,
+    avg(nullif(pe.score,0)) as avg_nonzero_post_score,
+    sum(pe.viewcount) as total_views,
+    avg(pe.viewcount) as avg_views_per_post,
+    avg(pe.accept_latency_hours) filter (where pe.accept_latency_hours is not null) as avg_accept_latency_hours,
+    sum(coalesce(pe.long_positive_comments,0)) as long_pos_comments
+  from users u
+  left join post_enriched pe on pe.owneruserid = u.id
+  group by u.id
+),
+-- correlate badges
+badge_summary as (
+  select
+    b.userid as user_id,
+    count(*) as badges_total,
+    count(*) filter (where b.class = 1) as gold_badges,
+    count(*) filter (where b.class = 2) as silver_badges,
+    count(*) filter (where b.class = 3) as bronze_badges,
+    count(*) filter (where b.tagbased = 1) as tag_badges
+  from badges b
+  group by b.userid
+),
+-- monthly closures by reason from PostHistory
+monthly_closures as (
+  select
+    date_trunc('month', ph.creationdate)::date as yyyymm,
+    ph.postid,
+    ph.userid,
+    ph.comment as close_reason_id_text
+  from posthistory ph
+  where ph.posthistorytypeid = 10
+    and ph.creationdate >= (select from_month from params)
+    and ph.creationdate <  (select to_month   from params) + interval '1 month'
+),
+closure_enriched as (
+  select
+    mc.yyyymm,
+    mc.postid,
+    mc.userid,
+    nullif(regexp_replace(mc.close_reason_id_text, '[^0-9]', '', 'g'), '')::int as close_reason_id,
+    crt.name as close_reason_name
+  from monthly_closures mc
+  left join closereasontypes crt on crt.id = nullif(regexp_replace(mc.close_reason_id_text, '[^0-9]', '', 'g'), '')::int
+),
+-- rank users by multi-factor score using window functions
+user_rankings as (
+  select
+    up.user_id,
+    coalesce(up.total_score,0) as total_score,
+    coalesce(up.total_views,0) as total_views,
+    coalesce(up.q_count,0) as q_count,
+    coalesce(up.a_count,0) as a_count,
+    coalesce(bs.badges_total,0) as badges_total,
+    0.6 * coalesce(up.total_score,0)
+    + 0.2 * coalesce(up.total_views,0) / nullif(up.q_count + up.a_count,0)
+    + 5.0 * coalesce(bs.gold_badges,0)
+    + 2.0 * coalesce(bs.silver_badges,0)
+    + 1.0 * coalesce(bs.bronze_badges,0)
+    + 0.5 * coalesce(up.long_pos_comments,0) as perf_score,
+    rank() over (order by
+      0.6 * coalesce(up.total_score,0)
+      + 0.2 * coalesce(up.total_views,0) / nullif(up.q_count + up.a_count,0)
+      + 5.0 * coalesce(bs.gold_badges,0)
+      + 2.0 * coalesce(bs.silver_badges,0)
+      + 1.0 * coalesce(bs.bronze_badges,0)
+      + 0.5 * coalesce(up.long_pos_comments,0) desc, up.user_id) as perf_rank
+  from user_perf up
+  left join badge_summary bs on bs.user_id = up.user_id
+),
+-- combine all monthly metrics into a wide dataset
+calendar as (
+  select generate_series((select from_month from params)::date, (select to_month from params)::date, interval '1 month')::date as yyyymm
+),
+monthly_wide as (
+  select
+    cal.yyyymm,
+    -- posts
+    mpq.posts as questions,
+    mpa.posts as answers,
+    mpq.views as q_views,
+    mpa.views as a_views,
+    mpq.score as q_score,
+    mpa.score as a_score,
+    mpq.total_answers_on_questions as answers_on_questions,
+    mpq.closed_posts as questions_closed,
+    mpq.distinct_tags_this_month as distinct_tags,
+    -- rolling windows
+    kpiq.posts_3mo as q_posts_3mo,
+    kpia.posts_3mo as a_posts_3mo,
+    kpiq.views_6mo as q_views_6mo,
+    kpia.views_6mo as a_views_6mo,
+    kpiq.avg_views_per_post_3mo as q_avg_views_per_post_3mo,
+    kpia.avg_views_per_post_3mo as a_avg_views_per_post_3mo,
+    -- votes
+    mv2.vote_count as upvotes,
+    mv3.vote_count as downvotes,
+    mv5.vote_count as favorites
+  from calendar cal
+  left join monthly_kpis kpiq on kpiq.yyyymm = cal.yyyymm and kpiq.posttypeid = 1
+  left join monthly_kpis kpia on kpia.yyyymm = cal.yyyymm and kpia.posttypeid = 2
+  left join monthly_posts mpq on mpq.yyyymm = cal.yyyymm and mpq.posttypeid = 1
+  left join monthly_posts mpa on mpa.yyyymm = cal.yyyymm and mpa.posttypeid = 2
+  left join monthly_votes mv2 on mv2.yyyymm = cal.yyyymm and mv2.votetypeid = 2
+  left join monthly_votes mv3 on mv3.yyyymm = cal.yyyymm and mv3.votetypeid = 3
+  left join monthly_votes mv5 on mv5.yyyymm = cal.yyyymm and mv5.votetypeid = 5
+),
+-- build per-tag drift ranks
+tag_ranked as (
+  select
+    td.tag,
+    td.uses_first_6mo,
+    td.uses_last_6mo,
+    td.delta_6mo,
+    dense_rank() over (order by td.delta_6mo desc, td.tag) as rising_rank,
+    dense_rank() over (order by td.delta_6mo asc, td.tag) as falling_rank
+  from tag_drift td
+),
+-- prepare final selection with correlated subqueries for strings and null logic
+final_users as (
+  select
+    u.id as user_id,
+    coalesce(nullif(u.displayname, ''), '[anonymous]') as display_name,
+    coalesce(u.location, 'Unknown') as location,
+    ut.rep_tier,
+    ut.activity_style,
+    ur.perf_rank,
+    ur.perf_score,
+    up.q_count,
+    up.a_count,
+    up.total_score,
+    up.total_views,
+    bs.badges_total,
+    bs.gold_badges,
+    bs.silver_badges,
+    bs.bronze_badges,
+    -- top tag used by this user's questions in window
+    (
+      select t.tag
+      from posts pq
+      cross join lateral unnest(string_to_array(substring(pq.tags, 2, greatest(length(pq.tags)-2,0)), '><')) as t(tag)
+      where pq.posttypeid = 1
+        and pq.owneruserid = u.id
+        and pq.creationdate >= (select from_month from params)
+        and pq.creationdate <  (select to_month   from params) + interval '1 month'
+      group by t.tag
+      order by count(*) desc, t.tag
+      limit 1
+    ) as top_question_tag,
+    -- normalized website host extraction
+    (
+      case
+        when position('://' in coalesce(u.websiteurl,'')) > 0
+          then split_part(split_part(u.websiteurl, '://', 2), '/', 1)
+        when coalesce(u.websiteurl,'') <> '' then split_part(u.websiteurl, '/', 1)
+        else null
+      end
+    ) as website_host
+  from users u
+  left join user_tiers ut on ut.user_id = u.id
+  left join user_rankings ur on ur.user_id = u.id
+  left join user_perf up on up.user_id = u.id
+  left join badge_summary bs on bs.user_id = u.id
+)
+select
+  mw.yyyymm,
+  -- monthly aggregates
+  mw.questions,
+  mw.answers,
+  mw.q_views,
+  mw.a_views,
+  mw.q_score,
+  mw.a_score,
+  mw.answers_on_questions,
+  mw.questions_closed,
+  mw.distinct_tags,
+  mw.q_posts_3mo,
+  mw.a_posts_3mo,
+  mw.q_views_6mo,
+  mw.a_views_6mo,
+  mw.q_avg_views_per_post_3mo,
+  mw.a_avg_views_per_post_3mo,
+  coalesce(mw.upvotes,0) as upvotes,
+  coalesce(mw.downvotes,0) as downvotes,
+  coalesce(mw.favorites,0) as favorites,
+  -- top 5 rising and falling tags as CSVs via correlated subqueries
+  (
+    select string_agg(tag, ',')
+    from (
+      select tr.tag from tag_ranked tr
+      where tr.rising_rank <= 5
+      order by tr.rising_rank, tr.tag
+    ) s
+  ) as top_rising_tags,
+  (
+    select string_agg(tag, ',')
+    from (
+      select tr.tag from tag_ranked tr
+      where tr.falling_rank <= 5
+      order by tr.falling_rank, tr.tag
+    ) s
+  ) as top_falling_tags,
+  -- top 10 users this month by perf score who were active in window
+  (
+    select string_agg(concat(fu.display_name, ' (#', fu.user_id::text, ')'), '; ' order by ur.perf_rank)
+    from final_users fu
+    join user_rankings ur on ur.user_id = fu.user_id
+    where ur.perf_rank <= 10
+  ) as top10_users,
+  -- sample of 5 most controversial questions (high abs score delta vs comments)
+  (
+    select string_agg(concat('[', p.id::text, '] ', left(coalesce(p.title,''), 60)), '; ')
+    from post_enriched p
+    where p.posttypeid = 1
+    order by (coalesce(p.avg_comment_score,0) * 10.0 - coalesce(p.score,0)) desc nulls last, p.id
+    limit 5
+  ) as controversial_questions_sample,
+  -- closure mix this month (all-time window, just projected per row for benchmark stress)
+  (
+    select string_agg(concat(coalesce(crt.close_reason_name,'Unknown'), ':', cnt::text), ', ' order by cnt desc)
+    from (
+      select coalesce(ce.close_reason_name, 'Unknown') as close_reason_name, count(*) as cnt
+      from closure_enriched ce
+      group by 1
+    ) x
+  ) as closure_mix,
+  -- sanity metrics with null logic
+  case when coalesce(mw.questions,0) + coalesce(mw.answers,0) = 0 then null
+       else round(100.0 * coalesce(mw.upvotes,0) / nullif(coalesce(mw.upvotes,0) + coalesce(mw.downvotes,0),0), 2)
+  end as upvote_ratio_pct,
+  case when coalesce(mw.questions_closed,0) = 0 then null
+       else round(100.0 * coalesce(mw.questions_closed,0) / nullif(coalesce(mw.questions,0),0), 2)
+  end as q_close_rate_pct
+from monthly_wide mw
+order by mw.yyyymm;

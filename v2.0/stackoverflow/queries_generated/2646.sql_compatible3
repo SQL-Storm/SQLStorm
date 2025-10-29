@@ -1,0 +1,162 @@
+with RecursiveTagCounts as (
+    select
+        t.Id as TagId,
+        t.TagName,
+        p.Id as PostId,
+        coalesce(p.ViewCount, 0) as ViewCount,
+        coalesce(p.Score, 0) as Score,
+        row_number() over (partition by t.Id order by p.CreationDate desc) as rn
+    from Tags t
+    join Posts p on p.PostTypeId = 1 and p.Tags like '%' || '<' || t.TagName || '>' || '%'
+    where t.IsModeratorOnly = false
+), TagSummary as (
+    select
+        TagId,
+        TagName,
+        count(*) as TotalQuestions,
+        sum(ViewCount) as TotalViews,
+        sum(Score) as TotalScore,
+        avg(Score) as AvgScore,
+        max(ViewCount) as MaxViewCount
+    from RecursiveTagCounts
+    group by TagId, TagName
+), RecentHighScoreQuestions as (
+    select
+        p.Id as QuestionId,
+        p.Title,
+        u.DisplayName as OwnerName,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        (
+            select string_agg(vote_entry, ' | ')
+            from (
+                select
+                    'User:' || coalesce(coalesce(vu.DisplayName, 'Unknown'), '[deleted]') || ', Vote:' || vt.Name || ', Date:' || to_char(v.CreationDate, 'YYYY-MM-DD') as vote_entry
+                from Votes v
+                left join Users vu on vu.Id = v.UserId
+                join VoteTypes vt on vt.Id = v.VoteTypeId
+                where v.PostId = p.Id and v.VoteTypeId in (2, 3)
+                order by v.CreationDate desc
+                limit 3
+            ) t
+        ) as RecentVotes,
+        (select count(*) from Posts ans where ans.PostTypeId = 2 and ans.ParentId = p.Id and ans.Score > p.Score / 2.0) as HighScoreAnswersCount
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId = 1
+      and p.Score > 10
+      and p.CreationDate > cast('2024-10-01' as date) - interval '180 day'
+), ClosedQuestions as (
+    select
+        ph.PostId,
+        max(ph.CreationDate) as ClosedDate,
+        crt.Name as CloseReason
+    from PostHistory ph
+    join PostHistoryTypes pht on pht.Id = ph.PostHistoryTypeId and pht.Name = 'Post Closed'
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    group by ph.PostId, crt.Name
+), QuestionsWithCloseInfo as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        u.DisplayName as OwnerName,
+        q.Score,
+        q.ViewCount,
+        cq.ClosedDate,
+        coalesce(cq.CloseReason, 'Not Closed') as CloseReason
+    from Posts q
+    left join Users u on u.Id = q.OwnerUserId
+    left join ClosedQuestions cq on cq.PostId = q.Id
+    where q.PostTypeId = 1
+), AnswersWithUserReputation as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.Score as AnswerScore,
+        u.Id as UserId,
+        u.Reputation,
+        row_number() over (partition by a.ParentId order by a.Score desc, u.Reputation desc) as AnswerRank
+    from Posts a
+    left join Users u on u.Id = a.OwnerUserId
+    where a.PostTypeId = 2
+), TopAnswersWithBadges as (
+    select
+        a.AnswerId,
+        a.QuestionId,
+        a.AnswerScore,
+        a.UserId,
+        a.Reputation,
+        b.Name as BadgeName,
+        b.Class as BadgeClass,
+        dense_rank() over (partition by a.QuestionId order by b.Class) as BadgeRank
+    from AnswersWithUserReputation a
+    left join Badges b on b.UserId = a.UserId and b.Date < cast('2024-10-01 12:34:56' as timestamp)
+    where a.AnswerRank <= 3
+), CombinedQuestionsAnswers as (
+    select
+        q.QuestionId,
+        q.Title,
+        q.OwnerName as QuestionOwner,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.ClosedDate,
+        q.CloseReason,
+        a.AnswerId,
+        a.AnswerScore,
+        a.UserId,
+        a.Reputation,
+        a.BadgeName,
+        a.BadgeClass,
+        row_number() over (partition by q.QuestionId order by coalesce(a.AnswerScore,0) desc) as AnswerOrder
+    from QuestionsWithCloseInfo q
+    left join TopAnswersWithBadges a on a.QuestionId = q.QuestionId
+), StringAggregates as (
+    select
+        cq.QuestionId,
+        count(distinct ca.UserId) as DistinctAnswerers,
+        string_agg(distinct coalesce(ca.BadgeName, 'NoBadge') || ' (Class:' || coalesce(cast(ca.BadgeClass as text), '-') || ')', ', ' ) as BadgeSummary
+    from CombinedQuestionsAnswers cq
+    left join CombinedQuestionsAnswers ca on ca.QuestionId = cq.QuestionId
+    group by cq.QuestionId
+)
+select
+    ts.TagName,
+    ts.TotalQuestions,
+    ts.TotalViews,
+    ts.TotalScore,
+    ts.AvgScore,
+    ts.MaxViewCount,
+    rhq.QuestionId,
+    rhq.Title as HighScoreQuestionTitle,
+    rhq.OwnerName as QuestionOwner,
+    rhq.CreationDate as QuestionCreated,
+    rhq.Score as QuestionScore,
+    rhq.ViewCount as QuestionViews,
+    rhq.RecentVotes,
+    rhq.HighScoreAnswersCount,
+    cq.ClosedDate,
+    cq.CloseReason,
+    ag.DistinctAnswerers,
+    ag.BadgeSummary,
+    ca.AnswerId,
+    ca.AnswerScore,
+    ca.UserId,
+    ca.Reputation,
+    ca.BadgeName,
+    ca.BadgeClass,
+    rank() over (partition by ts.TagId order by rhq.Score desc, rhq.ViewCount desc) as RankInTag,
+    round(
+        ((cast(rhq.Score as numeric)) * 0.7 + (cast(rhq.ViewCount as numeric)) * 0.3) / nullif(ts.MaxViewCount, 0),
+        4
+    ) as PopularityIndex
+from TagSummary ts
+join RecentHighScoreQuestions rhq on exists (
+    select 1 from RecursiveTagCounts rtc where rtc.TagId = ts.TagId and rtc.PostId = rhq.QuestionId
+)
+left join QuestionsWithCloseInfo cq on cq.QuestionId = rhq.QuestionId
+left join CombinedQuestionsAnswers ca on ca.QuestionId = rhq.QuestionId
+left join StringAggregates ag on ag.QuestionId = rhq.QuestionId
+where ts.TotalQuestions > 100
+order by ts.TotalScore desc, rhq.Score desc, rhq.ViewCount desc
+limit 100;

@@ -1,0 +1,101 @@
+-- {"query": "3141.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1679} 
+WITH top_users AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS rn
+    FROM Users u
+    WHERE u.Reputation IS NOT NULL
+),
+user_badge_stats AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) AS badge_cnt,
+        SUM(CASE 
+                WHEN b.Class = 1 THEN 10   -- Gold
+                WHEN b.Class = 2 THEN 5    -- Silver
+                ELSE 1                     -- Bronze
+            END) AS badge_score
+    FROM Badges b
+    GROUP BY b.UserId
+),
+question_stats AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate,
+        p.Score AS QuestionScore,
+        p.ViewCount,
+        p.FavoriteCount,
+        COALESCE(p.Tags, '') AS TagList,
+        (SELECT COUNT(*) 
+         FROM Posts a 
+         WHERE a.ParentId = p.Id AND a.PostTypeId = 2) AS AnswerCount,
+        (SELECT MAX(v.CreationDate) 
+         FROM Votes v 
+         WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS LastUpvoteDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn_user_q
+    FROM Posts p
+    WHERE p.PostTypeId = 1                -- questions only
+),
+top_questions AS (
+    SELECT 
+        qs.*,
+        ROW_NUMBER() OVER (
+            ORDER BY (qs.QuestionScore*2 + qs.ViewCount/100 + qs.FavoriteCount*3) DESC
+        ) AS global_rank
+    FROM question_stats qs
+    WHERE qs.rn_user_q <= 5                -- keep only latest 5 questions per user
+),
+tag_expansion AS (
+    SELECT 
+        q.QuestionId,
+        UNNEST(string_to_array(TRIM(BOTH '<>' FROM q.TagList), '><')) AS TagName
+    FROM top_questions q
+),
+tag_counts AS (
+    SELECT 
+        te.TagName,
+        COUNT(*) AS cnt
+    FROM tag_expansion te
+    GROUP BY te.TagName
+),
+linked_posts AS (
+    SELECT 
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name AS LinkTypeName,
+        p.Title AS RelatedTitle
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    JOIN Posts p ON p.Id = pl.RelatedPostId
+    WHERE lt.Name = 'Duplicate'
+)
+SELECT 
+    tu.Id AS UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    ub.badge_cnt,
+    ub.badge_score,
+    tq.QuestionId,
+    tq.Title,
+    tq.QuestionScore,
+    tq.ViewCount,
+    tq.FavoriteCount,
+    tq.AnswerCount,
+    EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - tq.CreationDate))/3600 AS HoursSinceAsked,
+    COALESCE(lp.RelatedPostId, 0) AS DuplicateOfPostId,
+    lp.RelatedTitle,
+    tc.TagName,
+    tc.cnt AS TagUsageInTopSet
+FROM top_users tu
+LEFT JOIN user_badge_stats ub ON ub.UserId = tu.Id
+LEFT JOIN top_questions tq ON tq.OwnerUserId = tu.Id
+LEFT JOIN linked_posts lp ON lp.PostId = tq.QuestionId
+LEFT JOIN tag_counts tc 
+       ON tc.TagName = ANY(string_to_array(TRIM(BOTH '<>' FROM tq.TagList), '><'))
+WHERE tu.rn <= 100
+ORDER BY tu.Reputation DESC, tq.global_rank ASC
+LIMIT 200;

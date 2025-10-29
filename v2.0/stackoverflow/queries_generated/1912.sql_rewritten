@@ -1,0 +1,299 @@
+-- {"query": "1912.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3677} 
+WITH UserInteractionMetrics AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.Views AS UserProfileViews,
+        u.UpVotes AS UserUpVotes,
+        u.DownVotes AS UserDownVotes,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END), 0) AS TotalQuestionsPosted,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END), 0) AS TotalAnswersPosted,
+        COALESCE(SUM(CASE WHEN p.PostTypeId IN (1, 2) THEN p.Score ELSE 0 END), 0) AS TotalPostScores,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END), 0) AS TotalQuestionViewCount,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT b.Id) AS TotalBadgesEarned,
+        MAX(p.CreationDate) AS LatestPostDate,
+        MIN(p.CreationDate) AS EarliestPostDate,
+        (DATE_PART('day', u.LastAccessDate - u.CreationDate)) AS UserAccountAgeDays,
+        (DATE_PART('day', cast('2024-10-01' as date) - u.LastAccessDate)) AS DaysSinceLastAccess
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate,
+        u.Views, u.UpVotes, u.DownVotes
+),
+PostActivityTimelines AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount AS PostViewCount,
+        p.AnswerCount AS PostAnswerCount,
+        p.CommentCount AS PostCommentCount,
+        p.AcceptedAnswerId,
+        p.ClosedDate,
+        -- Window function: Rank posts by score within their respective PostType for the owner
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId, p.PostTypeId ORDER BY p.Score DESC, p.CreationDate DESC) AS PostScoreRankByOwnerAndType,
+        -- Window function: Calculate average score of all posts by the same owner
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS AvgOwnerPostScore,
+        -- Window function: Calculate days since previous post by the same user
+        EXTRACT(EPOCH FROM (p.CreationDate - LAG(p.CreationDate, 1, p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate))) / (60 * 60 * 24) AS DaysSincePreviousPost,
+        -- String expression: Extract and process tags
+        CASE
+            WHEN p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2
+            THEN LOWER(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2))
+            ELSE NULL
+        END AS RawTagsString,
+        -- Non-correlated subquery for edit count
+        (SELECT COUNT(DISTINCT ph.Id) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4,5,6)) AS EditCount,
+        -- Non-correlated subquery for upvote count
+        (SELECT COUNT(DISTINCT v.Id) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpVoteCount,
+        -- Non-correlated subquery for downvote count
+        (SELECT COUNT(DISTINCT v.Id) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS DownVoteCount
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL -- Exclude community user posts
+),
+TagMetrics AS (
+    SELECT
+        te.PostId,
+        STRING_AGG(te.TagName, ';') AS AllProcessedTags,
+        COUNT(te.TagName) AS NumberOfTags,
+        SUM(t.Count) AS TotalTagPopularityScore -- Sum of `Count` from `Tags` table for each tag in the post
+    FROM (
+        SELECT
+            p.Id AS PostId,
+            LOWER(TRIM(UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><')))) AS TagName
+        FROM Posts p
+        WHERE p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2 AND p.PostTypeId = 1 -- Only consider questions for tag metrics
+    ) AS te
+    JOIN Tags t ON te.TagName = t.TagName
+    GROUP BY te.PostId
+),
+AcceptedAnswerDetails AS (
+    SELECT
+        p_q.Id AS QuestionId,
+        p_a.Id AS AcceptedAnswerId,
+        p_a.OwnerUserId AS AcceptedAnswererId,
+        p_a.Score AS AcceptedAnswerScore,
+        u_a.Reputation AS AcceptedAnswererReputation,
+        p_a.CreationDate AS AcceptedAnswerCreationDate,
+        -- Correlated subquery: Average score of *other* answers by this accepted answerer for *other* questions
+        (
+            SELECT AVG(p_other.Score)
+            FROM Posts p_other
+            WHERE p_other.OwnerUserId = p_a.OwnerUserId
+              AND p_other.PostTypeId = 2
+              AND p_other.Id != p_a.Id
+        ) AS AvgOtherAnswererScore
+    FROM Posts p_q
+    JOIN Posts p_a ON p_q.AcceptedAnswerId = p_a.Id
+    JOIN Users u_a ON p_a.OwnerUserId = u_a.Id
+    WHERE p_q.PostTypeId = 1 AND p_a.PostTypeId = 2
+)
+SELECT
+    -- User Identifiers and Core Metrics
+    uim.UserId,
+    uim.DisplayName,
+    uim.Reputation,
+    uim.UserCreationDate,
+    uim.LastAccessDate,
+    uim.UserAccountAgeDays,
+    uim.DaysSinceLastAccess,
+    uim.UserProfileViews,
+    uim.UserUpVotes,
+    uim.UserDownVotes,
+    uim.TotalQuestionsPosted,
+    uim.TotalAnswersPosted,
+    uim.TotalCommentsMade,
+    uim.TotalBadgesEarned,
+    uim.TotalPostScores,
+    uim.TotalQuestionViewCount,
+    
+    -- Post Identifiers and Core Metrics (for Questions)
+    pat.PostId AS QuestionId,
+    pat.PostCreationDate AS QuestionCreationDate,
+    pat.PostScore AS QuestionScore,
+    pat.PostViewCount AS QuestionViewCount,
+    pat.PostAnswerCount AS QuestionAnswerCount,
+    pat.PostCommentCount AS QuestionCommentCount,
+    pat.EditCount AS QuestionEditCount,
+    pat.UpVoteCount AS QuestionUpVoteCount,
+    pat.DownVoteCount AS QuestionDownVoteCount,
+    pat.PostScoreRankByOwnerAndType AS QuestionRankByOwnerScore,
+    pat.AvgOwnerPostScore,
+    pat.DaysSincePreviousPost,
+    
+    -- Post Age and Performance Ratios
+    (DATE_PART('day', cast('2024-10-01' as date) - pat.PostCreationDate)) AS QuestionAgeDays,
+    NULLIF(pat.PostScore * 1.0 / GREATEST(1, pat.PostViewCount), 0) AS ScoreToViewRatio, -- NULLIF for division by zero
+    NULLIF(pat.PostAnswerCount * 1.0 / GREATEST(1, pat.PostCommentCount), 0) AS AnswerToCommentRatio,
+    
+    -- Question Status and History (using PostHistory and CloseReasonTypes)
+    (
+        SELECT ph.CreationDate
+        FROM PostHistory ph
+        WHERE ph.PostId = pat.PostId
+          AND ph.PostHistoryTypeId = 10 -- Post Closed
+        ORDER BY ph.CreationDate DESC
+        LIMIT 1
+    ) AS LastClosedDate,
+    (
+        SELECT crt.Name
+        FROM PostHistory ph
+        JOIN CloseReasonTypes crt ON ph.Comment::smallint = crt.Id -- Cast to smallint for join
+        WHERE ph.PostId = pat.PostId
+          AND ph.PostHistoryTypeId = 10
+        ORDER BY ph.CreationDate DESC
+        LIMIT 1
+    ) AS LastCloseReason,
+    COALESCE(pat.ClosedDate IS NOT NULL, FALSE) AS IsQuestionClosed,
+    
+    -- Tag-related Metrics
+    tm.AllProcessedTags,
+    tm.NumberOfTags,
+    tm.TotalTagPopularityScore,
+    
+    -- Accepted Answer Details
+    aad.AcceptedAnswerId,
+    aad.AcceptedAnswererId,
+    aad.AcceptedAnswerScore,
+    aad.AcceptedAnswererReputation,
+    aad.AcceptedAnswerCreationDate,
+    aad.AvgOtherAnswererScore,
+    
+    -- User Reputation Tier (Complicated Predicate/Expression)
+    CASE
+        WHEN uim.Reputation >= 10000 THEN 'Legendary'
+        WHEN uim.Reputation >= 5000 THEN 'Expert'
+        WHEN uim.Reputation >= 1000 THEN 'Advanced'
+        WHEN uim.Reputation >= 200 THEN 'Contributor'
+        ELSE 'Newbie'
+    END AS ReputationTier,
+    
+    -- String Expression Example (Concatenation and conditional formatting)
+    CONCAT(
+        'User: ', COALESCE(uim.DisplayName, 'Anonymous'),
+        ' | Question: ', COALESCE(p.Title, 'No Title'),
+        ' (Score: ', pat.PostScore, ')'
+    ) AS CombinedInfoString,
+    
+    -- NULL Logic Example for Last Editor
+    COALESCE(
+        p.LastEditorDisplayName,
+        (SELECT u_editor.DisplayName FROM Users u_editor WHERE u_editor.Id = p.LastEditorUserId LIMIT 1),
+        'Community'
+    ) AS EffectiveLastEditorDisplayName
+    
+FROM UserInteractionMetrics uim
+JOIN PostActivityTimelines pat ON uim.UserId = pat.OwnerUserId
+JOIN Posts p ON pat.PostId = p.Id AND p.PostTypeId = 1 -- Focus on Questions
+LEFT JOIN TagMetrics tm ON pat.PostId = tm.PostId
+LEFT JOIN AcceptedAnswerDetails aad ON pat.PostId = aad.QuestionId
+WHERE
+    uim.TotalQuestionsPosted > 0
+    AND pat.PostCreationDate >= '2020-01-01' -- Filter for recent activity
+    AND pat.DaysSincePreviousPost IS NOT NULL -- Exclude first posts for this metric
+    AND (pat.PostScore > 10 OR pat.PostViewCount > 500) -- Significant questions only
+    AND (
+        -- Complicated predicate with NULL logic and string expression
+        uim.DisplayName IS NOT NULL AND uim.DisplayName LIKE '%User%'
+        OR (uim.Reputation > 5000 AND uim.TotalBadgesEarned > 50)
+        OR (pat.RawTagsString LIKE '%sql%' AND pat.PostScore > 50)
+    )
+
+UNION ALL -- Use UNION ALL to include high-scoring answers as a separate set of results, ensuring column consistency
+
+SELECT
+    uim.UserId,
+    uim.DisplayName,
+    uim.Reputation,
+    uim.UserCreationDate,
+    uim.LastAccessDate,
+    uim.UserAccountAgeDays,
+    uim.DaysSinceLastAccess,
+    uim.UserProfileViews,
+    uim.UserUpVotes,
+    uim.UserDownVotes,
+    uim.TotalQuestionsPosted,
+    uim.TotalAnswersPosted,
+    uim.TotalCommentsMade,
+    uim.TotalBadgesEarned,
+    uim.TotalPostScores,
+    uim.TotalQuestionViewCount, -- This will often be 0 for answers, but kept for column consistency
+    
+    pat.PostId AS AnswerId, -- Renamed for clarity in UNION ALL part
+    pat.PostCreationDate AS AnswerCreationDate,
+    pat.PostScore AS AnswerScore,
+    pat.PostViewCount AS AnswerViewCount, -- Generally 0 for answers
+    pat.PostAnswerCount AS AnswerCount, -- Generally 0 for answers
+    pat.PostCommentCount AS AnswerCommentCount,
+    pat.EditCount AS AnswerEditCount,
+    pat.UpVoteCount AS AnswerUpVoteCount,
+    pat.DownVoteCount AS AnswerDownVoteCount,
+    pat.PostScoreRankByOwnerAndType AS AnswerRankByOwnerScore,
+    pat.AvgOwnerPostScore,
+    pat.DaysSincePreviousPost,
+    
+    (DATE_PART('day', cast('2024-10-01' as date) - pat.PostCreationDate)) AS AnswerAgeDays,
+    NULLIF(pat.PostScore * 1.0 / GREATEST(1, pat.PostViewCount), 0) AS ScoreToViewRatio, -- Generally 0 for answers
+    NULLIF(pat.PostAnswerCount * 1.0 / GREATEST(1, pat.PostCommentCount), 0) AS AnswerToCommentRatio, -- Generally 0 for answers
+    
+    NULL AS LastClosedDate, -- Not applicable for answers
+    NULL AS LastCloseReason, -- Not applicable for answers
+    FALSE AS IsQuestionClosed, -- Not applicable for answers
+    
+    NULL AS AllProcessedTags, -- Not applicable for answers (generally)
+    0 AS NumberOfTags,
+    0 AS TotalTagPopularityScore,
+    
+    NULL AS AcceptedAnswerId, -- Not applicable as the main entity is an answer
+    NULL AS AcceptedAnswererId,
+    NULL AS AcceptedAnswerScore,
+    NULL AS AcceptedAnswererReputation,
+    NULL AS AcceptedAnswerCreationDate,
+    NULL AS AvgOtherAnswererScore,
+    
+    CASE
+        WHEN uim.Reputation >= 10000 THEN 'Legendary'
+        WHEN uim.Reputation >= 5000 THEN 'Expert'
+        WHEN uim.Reputation >= 1000 THEN 'Advanced'
+        WHEN uim.Reputation >= 200 THEN 'Contributor'
+        ELSE 'Newbie'
+    END AS ReputationTier,
+    
+    CONCAT(
+        'User: ', COALESCE(uim.DisplayName, 'Anonymous'),
+        ' | Answer (to Post ', pat.PostId, '): ',
+        LEFT(COALESCE(p.Body, 'No Body'), 50), '...' -- String expression with LEFT
+    ) AS CombinedInfoString,
+    
+    COALESCE(
+        p.LastEditorDisplayName,
+        (SELECT u_editor.DisplayName FROM Users u_editor WHERE u_editor.Id = p.LastEditorUserId LIMIT 1),
+        'Community'
+    ) AS EffectiveLastEditorDisplayName
+    
+FROM UserInteractionMetrics uim
+JOIN PostActivityTimelines pat ON uim.UserId = pat.OwnerUserId
+JOIN Posts p ON pat.PostId = p.Id AND p.PostTypeId = 2 -- Focus on Answers
+WHERE
+    uim.TotalAnswersPosted > 0
+    AND pat.PostCreationDate >= '2020-01-01'
+    AND pat.DaysSincePreviousPost IS NOT NULL
+    AND pat.PostScore > 5 -- Include only high-scoring answers
+    AND (
+        p.Body LIKE '%solution%' OR p.Body LIKE '%fix%' -- String matching on Body
+        OR uim.Reputation > 2000
+    )
+ORDER BY
+    Reputation DESC,
+    QuestionCreationDate DESC NULLS LAST, -- Ensures questions appear before answers from the same user if both exist
+    AnswerCreationDate DESC NULLS LAST
+LIMIT 10000;

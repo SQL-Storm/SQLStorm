@@ -1,0 +1,166 @@
+with RecursiveBadges as (
+    select
+        b.Id,
+        b.UserId,
+        b.Name,
+        b.Date,
+        b.Class,
+        b.TagBased,
+        1 as Depth
+    from Badges b
+    where b.Class = 1 and b.TagBased = 0
+
+    union all
+
+    select
+        b.Id,
+        b.UserId,
+        b.Name,
+        b.Date,
+        b.Class,
+        b.TagBased,
+        rb.Depth + 1
+    from Badges b
+    join RecursiveBadges rb on b.UserId = rb.UserId
+    where b.Date > rb.Date and b.Class = 1 and b.TagBased = 0
+),
+
+UserPostScores as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        coalesce(sum(p.Score),0) as TotalScore,
+        sum(case when p.PostTypeId = 1 then 1 else 0 end) as QuestionCount,
+        sum(case when p.PostTypeId = 2 then 1 else 0 end) as AnswerCount,
+        max(p.CreationDate) as LastPostDate,
+        min(p.CreationDate) as FirstPostDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName
+),
+
+PostAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.CreationDate as QuestionCreation,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.OwnerUserId as AnswererUserId,
+        a.CreationDate as AnswerCreation,
+        ROW_NUMBER() over (partition by q.Id order by a.Score desc, a.CreationDate asc) as AnswerRank,
+        count(a.Id) over (partition by q.Id) as AnswersPerQuestion
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+),
+
+AnswerLag as (
+    select
+        QuestionId,
+        AnswerId,
+        AnswerScore,
+        AnswererUserId,
+        AnswerCreation,
+        QuestionCreation,
+        AnswersPerQuestion,
+        AnswerRank,
+        (extract(epoch from AnswerCreation) - extract(epoch from QuestionCreation)) / 3600.0 as HoursToAnswer
+    from PostAnswerStats
+),
+
+TopUsers as (
+    select distinct
+        ub.UserId,
+        u.DisplayName,
+        count(distinct b.Id) as GoldBadgeCount,
+        coalesce(ups.TotalScore, 0) as UserTotalScore,
+        coalesce(ups.QuestionCount,0) as UserQuestionCount,
+        coalesce(ups.AnswerCount,0) as UserAnswerCount
+    from RecursiveBadges ub
+    join Users u on u.Id = ub.UserId
+    left join UserPostScores ups ON ups.UserId = ub.UserId
+    group by ub.UserId, u.DisplayName, ups.TotalScore, ups.QuestionCount, ups.AnswerCount
+    having count(distinct ub.Id) > 2
+),
+
+CloseReasonCounts as (
+    select
+        ph.PostId,
+        crt.Name as CloseReasonName,
+        count(*) as CloseCount
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = (ph.Comment)::integer
+    where ph.PostHistoryTypeId = 10 and ph.Comment is not null
+    group by ph.PostId, crt.Name
+),
+
+QuestionsWithCloseInfo as (
+    select
+        p.Id as QuestionId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        crc.CloseReasonName,
+        crc.CloseCount
+    from Posts p
+    left join CloseReasonCounts crc on crc.PostId = p.Id
+    where p.PostTypeId = 1
+),
+
+RecursiveBadgeDates as (
+    select
+        UserId,
+        min(Date) as FirstGoldBadgeDate,
+        max(Date) as LastGoldBadgeDate
+    from RecursiveBadges
+    group by UserId
+)
+
+select 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    count(distinct b.Name) as TotalBadges,
+    count(distinct case when b.Class = 1 then b.Id end) as GoldBadges,
+    count(distinct case when b.Class = 2 then b.Id end) as SilverBadges,
+    count(distinct case when b.Class = 3 then b.Id end) as BronzeBadges,
+    up.TotalScore,
+    up.QuestionCount,
+    up.AnswerCount,
+    max(ph.CreationDate) as LastHistoryEdit,
+    sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotesReceived,
+    sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotesReceived,
+    max(case when anslag.AnswerRank = 1 then anslag.AnswerScore end) as TopAnswerScore,
+    avg(case when anslag.AnswerRank <= 3 then anslag.HoursToAnswer end) as AvgHoursToTop3Answers,
+    cr.CloseCount,
+    cr.CloseReasonName,
+    tbd.FirstGoldBadgeDate,
+    tbd.LastGoldBadgeDate,
+    length(coalesce(u.AboutMe, '')) as AboutMeLength,
+    case
+        when u.WebsiteUrl is null or trim(u.WebsiteUrl) = '' then 'No Website'
+        else 'Visit: ' || u.WebsiteUrl
+    end as WebsiteInfo,
+    string_agg(distinct coalesce(cast(pl.LinkTypeId as varchar), 'N/A'), ',' order by pl.LinkTypeId) as LinkTypesUsed,
+    string_agg(distinct coalesce(lt.Name, 'Unknown'), ',' order by lt.Name) as LinkTypeNames
+from Users u
+left join Badges b on b.UserId = u.Id
+left join UserPostScores up on up.UserId = u.Id
+left join PostHistory ph on ph.UserId = u.Id
+left join Votes v on v.UserId = u.Id
+left join AnswerLag anslag on anslag.AnswererUserId = u.Id
+left join QuestionsWithCloseInfo cr on cr.QuestionId = ph.PostId
+left join RecursiveBadgeDates tbd on tbd.UserId = u.Id
+left join PostLinks pl on pl.PostId in (
+    select p2.Id from Posts p2 where p2.OwnerUserId = u.Id
+)
+left join LinkTypes lt on lt.Id = pl.LinkTypeId
+where u.Reputation > 10000
+group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, up.TotalScore, up.QuestionCount, up.AnswerCount, cr.CloseCount, cr.CloseReasonName, tbd.FirstGoldBadgeDate, tbd.LastGoldBadgeDate, u.AboutMe, u.WebsiteUrl
+having count(distinct b.Id) > 0
+order by up.TotalScore desc NULLS LAST, GoldBadges desc NULLS LAST
+limit 50;

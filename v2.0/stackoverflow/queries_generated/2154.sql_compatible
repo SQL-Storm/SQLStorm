@@ -1,0 +1,190 @@
+with RecursiveTagCount as (
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        coalesce(p.AnswerCount, 0) as TotalAnswers,
+        coalesce(p.ViewCount, 0) as TotalViews,
+        row_number() over (order by t.Count desc, t.TagName) as TagRank
+    from Tags t
+    left join Posts p on p.Id = t.ExcerptPostId and p.PostTypeId = 1
+    where t.IsModeratorOnly = false
+),
+UserActivity as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionsAsked,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswersGiven,
+        count(distinct c.Id) as CommentsMade,
+        coalesce(sum(vt.UpVotes), 0) as TotalUpVotes,
+        coalesce(sum(vt.DownVotes), 0) as TotalDownVotes,
+        max(b.Date) as LastBadgeDate,
+        string_agg(distinct b.Name, ', ' order by b.Date desc) as RecentBadges
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join (
+        select v.UserId,
+            sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+            sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes
+        from Votes v
+        join VoteTypes vt on v.VoteTypeId = vt.Id
+        where v.UserId is not null
+        group by v.UserId
+    ) vt on vt.UserId = u.Id
+    left join Badges b on b.UserId = u.Id and b.Date > cast('2024-10-01 12:34:56' as timestamp) - interval '1 year'
+    group by u.Id, u.DisplayName, u.Reputation
+),
+LatestPostEdits as (
+    select ph.PostId, max(ph.CreationDate) as LastEditDate
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (4,5,6,7,8,9)
+    group by ph.PostId
+),
+PostsWithEdits as (
+    select 
+        p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.Tags,
+        u.DisplayName as OwnerName,
+        lpe.LastEditDate,
+        p.AcceptedAnswerId,
+        (select count(*) from Comments c where c.PostId = p.Id) as CommentCount,
+        (select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 2) as UpVoteCount,
+        (select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 3) as DownVoteCount
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    left join LatestPostEdits lpe on lpe.PostId = p.Id
+    where p.PostTypeId = 1 and p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+),
+AggregatedCloseReasons as (
+    select 
+        ph.PostId,
+        crt.Name as CloseReasonName,
+        count(*) as CloseCount
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where ph.PostHistoryTypeId = 10 and ph.Comment is not null
+    group by ph.PostId, crt.Name
+),
+HighImpactQuestions as (
+    select 
+        pwe.Id, pwe.Title, pwe.CreationDate, pwe.Score, pwe.ViewCount, pwe.Tags, pwe.OwnerName,
+        pwe.UpVoteCount, pwe.DownVoteCount, pwe.CommentCount, pwe.LastEditDate,
+        coalesce(acr.CloseCount, 0) as CloseVotes,
+        acr.CloseReasonName
+    from PostsWithEdits pwe
+    left join AggregatedCloseReasons acr on acr.PostId = pwe.Id
+    where pwe.Score > 10 or pwe.ViewCount > 1000
+),
+TopAnswerers as (
+    select 
+        u.Id, u.DisplayName, 
+        count(distinct a.Id) as AnswersCount,
+        avg(a.Score) as AvgAnswerScore,
+        max(a.Score) as MaxAnswerScore,
+        percentile_cont(0.5) within group (order by a.Score) as MedianAnswerScore
+    from Users u
+    join Posts a on a.OwnerUserId = u.Id and a.PostTypeId = 2
+    group by u.Id, u.DisplayName
+    having count(distinct a.Id) > 20
+),
+AnswerStatistics as (
+    select 
+        p.Id as QuestionId,
+        p.Title,
+        count(a.Id) as TotalAnswers,
+        sum(case when a.Score > 5 then 1 else 0 end) as HighScoreAnswers,
+        max(a.Score) as MaxAnswerScore,
+        min(a.Score) as MinAnswerScore,
+        avg(a.Score) as AvgAnswerScore,
+        stddev(a.Score) as StddevAnswerScore
+    from Posts p
+    left join Posts a on a.ParentId = p.Id and a.PostTypeId = 2
+    where p.PostTypeId = 1 and p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+    group by p.Id, p.Title
+),
+CombinedAnalysis as (
+    select 
+        hiq.Id as QuestionId,
+        hiq.Title,
+        hiq.ViewCount,
+        hiq.Score,
+        hiq.Tags,
+        hiq.OwnerName,
+        hiq.CloseVotes,
+        hiq.CloseReasonName,
+        ta.AnswersCount,
+        ta.AvgAnswerScore,
+        ta.MaxAnswerScore,
+        ta.MedianAnswerScore,
+        u.Reputation,
+        u.QuestionsAsked,
+        u.AnswersGiven,
+        u.CommentsMade,
+        u.TotalUpVotes,
+        u.TotalDownVotes,
+        u.LastBadgeDate
+    from HighImpactQuestions hiq
+    left join AnswerStatistics ta on ta.QuestionId = hiq.Id
+    left join Users u on u.DisplayName = hiq.OwnerName
+    order by hiq.Score desc NULLS LAST, hiq.ViewCount desc
+    limit 100
+)
+select 
+    ca.QuestionId,
+    ca.Title,
+    regexp_matches(coalesce(ca.Tags, ''), '[^><]+') [1] as FirstTag,
+    ca.ViewCount,
+    ca.Score,
+    ca.CloseVotes,
+    ca.CloseReasonName,
+    ca.AnswersCount,
+    ca.AvgAnswerScore,
+    ca.MaxAnswerScore,
+    ca.MedianAnswerScore,
+    ca.Reputation as OwnerReputation,
+    ca.QuestionsAsked,
+    ca.AnswersGiven,
+    ca.CommentsMade,
+    ca.TotalUpVotes,
+    ca.TotalDownVotes,
+    to_char(ca.LastBadgeDate, 'YYYY-MM-DD') as LastBadgeDate,
+    case
+        when coalesce(ca.CloseVotes, 0) > 5 then 'Highly Controversial'
+        when coalesce(ca.Score, 0) > 50 then 'Highly Useful'
+        else 'Normal'
+    end as QuestionImpactCategory,
+    concat_ws(' | ', ca.Title, coalesce(ca.CloseReasonName, 'No Close Reason')) as CompositeTitle,
+    length(coalesce(ca.Title, '')) as TitleLength,
+    length(coalesce(ca.Tags, '')) as TagsLength,
+    rank() over (order by ca.Score desc, ca.ViewCount desc) as RankByScoreView
+from CombinedAnalysis ca
+where (coalesce(ca.AnswersCount, 0) > 5 or coalesce(ca.Score, 0) > 20)
+union
+select 
+    null as QuestionId,
+    'SUMMARY ROW - TOP TAGS' as Title,
+    null as FirstTag,
+    sum(rtc.TotalViews) as ViewCount,
+    sum(rtc.Count) as Score,
+    null as CloseVotes,
+    null as CloseReasonName,
+    null as AnswersCount,
+    null as AvgAnswerScore,
+    null as MaxAnswerScore,
+    null as MedianAnswerScore,
+    null as OwnerReputation,
+    null as QuestionsAsked,
+    null as AnswersGiven,
+    null as CommentsMade,
+    null as TotalUpVotes,
+    null as TotalDownVotes,
+    null as LastBadgeDate,
+    'Summary' as QuestionImpactCategory,
+    null as CompositeTitle,
+    null as TitleLength,
+    null as TagsLength,
+    null as RankByScoreView
+from RecursiveTagCount rtc
+where rtc.TagRank <= 10;

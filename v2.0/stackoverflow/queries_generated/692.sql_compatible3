@@ -1,0 +1,420 @@
+with
+active_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    coalesce(nullif(trim(u.location), ''), 'Unknown') as location_norm,
+    date_trunc('month', u.creationdate) as cohort_month,
+    sum(coalesce(v_up.cnt,0)) as upvotes_given,
+    sum(coalesce(v_down.cnt,0)) as downvotes_given,
+    sum(coalesce(c_cnt.cnt,0)) as comments_made
+  from users u
+  left join lateral (
+    select userId, count(*) as cnt
+    from votes v
+    where v.userid = u.id and v.votetypeid = 2
+    group by userid
+  ) v_up on true
+  left join lateral (
+    select userId, count(*) as cnt
+    from votes v
+    where v.userid = u.id and v.votetypeid = 3
+    group by userid
+  ) v_down on true
+  left join lateral (
+    select userid, count(*) as cnt
+    from comments c
+    where c.userid = u.id
+    group by userid
+  ) c_cnt on true
+  where u.reputation >= (
+    select percentile_disc(0.5) within group (order by reputation) from users
+  )
+  group by u.id, u.displayname, u.reputation, u.creationdate, location_norm, cohort_month
+),
+questions as (
+  select
+    p.id as qid,
+    p.owneruserid as asker_id,
+    p.creationdate as q_created,
+    p.score as q_score,
+    p.viewcount,
+    p.answercount,
+    p.acceptedanswerid,
+    p.title,
+    p.tags,
+    string_to_array(substring(p.tags, 2, greatest(length(p.tags)-2,0)), '><') as tag_arr
+  from posts p
+  where p.posttypeid = 1
+),
+answers as (
+  select
+    a.id as aid,
+    a.parentid as qid,
+    a.owneruserid as answerer_id,
+    a.creationdate as a_created,
+    a.score as a_score,
+    (a.id = q.acceptedanswerid) as is_accepted
+  from posts a
+  join posts q on q.id = a.parentid and a.posttypeid = 2
+),
+question_answer_metrics as (
+  select
+    q.qid,
+    min(a.a_created) filter (where a.a_created is not null) as first_answer_time,
+    min(a.a_created) filter (where a.is_accepted) as accepted_time,
+    count(*) filter (where a.aid is not null) as total_answers,
+    max(a.a_score) as max_answer_score,
+    sum(case when a.is_accepted then 1 else 0 end) as accepted_count
+  from questions q
+  left join answers a on a.qid = q.qid
+  group by q.qid
+),
+post_vote_agg as (
+  select
+    v.postid,
+    sum(case when votetypeid = 2 then 1 else 0 end) as up_cnt,
+    sum(case when votetypeid = 3 then 1 else 0 end) as down_cnt,
+    sum(case when votetypeid = 8 then coalesce(bountyamount,0) else 0 end) as bounty_started,
+    sum(case when votetypeid = 9 then coalesce(bountyamount,0) else 0 end) as bounty_awarded
+  from votes v
+  group by v.postid
+),
+post_links_expanded as (
+  select
+    pl.postid,
+    pl.relatedpostid,
+    pl.linktypeid,
+    lt.name as link_name,
+    case when pl.linktypeid = 3 then 1 else 0 end as is_duplicate
+  from postlinks pl
+  join linktypes lt on lt.id = pl.linktypeid
+),
+question_closure as (
+  select
+    ph.postid as qid,
+    min(ph.creationdate) filter (where ph.posthistorytypeid = 10) as first_closed_at,
+    max(ph.creationdate) filter (where ph.posthistorytypeid = 11) as last_reopened_at,
+    count(*) filter (where ph.posthistorytypeid = 10) as close_events,
+    count(*) filter (where ph.posthistorytypeid = 11) as reopen_events,
+    array_agg(distinct
+      case
+        when ph.posthistorytypeid = 10 then
+          nullif(trim(regexp_replace(ph.comment, '[^0-9]', '', 'g')), '')
+        else null
+      end
+    ) filter (where ph.posthistorytypeid = 10 and ph.comment is not null) as close_reason_ids_text
+  from posthistory ph
+  group by ph.postid
+),
+tag_ranks as (
+  select
+    t.tagname,
+    t.count,
+    dense_rank() over (order by t.count desc nulls last) as tag_rank
+  from tags t
+),
+question_tags as (
+  select
+    q.qid,
+    unnest(q.tag_arr) as tagname
+  from questions q
+  where q.tags is not null
+),
+question_tag_rank as (
+  select
+    qt.qid,
+    tr.tagname,
+    tr.tag_rank,
+    tr.count as tag_total_count
+  from question_tags qt
+  left join tag_ranks tr on tr.tagname = qt.tagname
+),
+question_tag_stats as (
+  select
+    qid,
+    min(tag_rank) as best_tag_rank,
+    avg(cast(tag_rank as numeric)) as avg_tag_rank,
+    max(tag_total_count) as max_tag_count
+  from question_tag_rank
+  group by qid
+),
+badge_agg as (
+  select
+    b.userid,
+    sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+    sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+    sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+    sum(case when coalesce(b.tagbased,0::int) = 1 then 1 else 0 end) as tag_badges
+  from badges b
+  group by b.userid
+),
+question_full as (
+  select
+    q.qid,
+    q.asker_id,
+    q.q_created,
+    q.q_score,
+    q.viewcount,
+    q.answercount,
+    q.title,
+    qa.first_answer_time,
+    qa.accepted_time,
+    qa.total_answers,
+    qa.max_answer_score,
+    qa.accepted_count,
+    pv.up_cnt as q_upvotes,
+    pv.down_cnt as q_downvotes,
+    pv.bounty_started,
+    pv.bounty_awarded,
+    qc.first_closed_at,
+    qc.last_reopened_at,
+    qc.close_events,
+    qc.reopen_events,
+    coalesce(qts.best_tag_rank, 999999) as best_tag_rank,
+    coalesce(qts.avg_tag_rank, 999999) as avg_tag_rank,
+    qts.max_tag_count
+  from questions q
+  left join question_answer_metrics qa on qa.qid = q.qid
+  left join post_vote_agg pv on pv.postid = q.qid
+  left join question_closure qc on qc.qid = q.qid
+  left join question_tag_stats qts on qts.qid = q.qid
+),
+user_post_metrics as (
+  select
+    u.user_id,
+    sum(case when p.posttypeid = 1 then 1 else 0 end) as questions_authored,
+    sum(case when p.posttypeid = 2 then 1 else 0 end) as answers_authored,
+    avg(nullif(p.score,0)) filter (where p.posttypeid in (1,2)) as avg_nonzero_score,
+    sum(coalesce(p.score,0)) filter (where p.posttypeid = 2) as answer_score_sum,
+    sum(coalesce(p.score,0)) filter (where p.posttypeid = 1) as question_score_sum,
+    max(p.creationdate) as last_post_at
+  from active_users u
+  left join posts p on p.owneruserid = u.user_id
+  group by u.user_id
+),
+answerer_metrics as (
+  select
+    a.answerer_id as user_id,
+    count(*) as answers_count,
+    sum(case when a.is_accepted then 1 else 0 end) as accepted_answers,
+    avg(a.a_score) as avg_answer_score,
+    percentile_cont(0.5) within group (order by a.a_score) as median_answer_score
+  from answers a
+  group by a.answerer_id
+),
+dup_graph as (
+  select
+    ple.postid as duplicate_of,
+    count(*) filter (where ple.is_duplicate = 1) as dup_edges,
+    count(*) filter (where ple.is_duplicate = 0) as link_edges
+  from post_links_expanded ple
+  group by ple.postid
+),
+question_time_windows as (
+  select
+    qf.*,
+    date_trunc('month', qf.q_created) as q_month,
+    count(*) over (partition by date_trunc('month', qf.q_created)) as questions_in_month,
+    avg(qf.q_score) over (partition by date_trunc('month', qf.q_created)) as avg_qscore_in_month,
+    percentile_cont(0.9) within group (order by qf.viewcount) over (partition by date_trunc('month', qf.q_created)) as p90_views_in_month
+  from question_full qf
+),
+question_first_comment as (
+  select
+    q.qid,
+    (
+      select min(c.creationdate)
+      from comments c
+      where c.postid = q.qid
+        and c.creationdate >= q.q_created
+    ) as first_comment_time
+  from questions q
+),
+user_region as (
+  select
+    au.user_id,
+    case
+      when lower(au.location_norm) similar to '%(usa|united states|new york|ca|tx|wa|san |los )%' then 'North America'
+      when lower(au.location_norm) similar to '%(canada|toronto|vancouver|montreal)%' then 'North America'
+      when lower(au.location_norm) similar to '%(uk|united kingdom|london|england|scotland|wales|ireland)%' then 'Europe'
+      when lower(au.location_norm) similar to '%(germany|france|spain|italy|netherlands|sweden|norway|denmark|finland|poland|swiss|austria)%' then 'Europe'
+      when lower(au.location_norm) similar to '%(india|bangalore|mumbai|delhi|hyderabad|pune|chennai)%' then 'Asia'
+      when lower(au.location_norm) similar to '%(china|beijing|shanghai|shenzhen|hong kong)%' then 'Asia'
+      when lower(au.location_norm) similar to '%(japan|tokyo|osaka)%' then 'Asia'
+      when lower(au.location_norm) similar to '%(australia|sydney|melbourne|nz|new zealand)%' then 'Oceania'
+      when lower(au.location_norm) similar to '%(brazil|argentina|chile|mexico|colombia|peru)%' then 'Latin America'
+      when lower(au.location_norm) similar to '%(russia|moscow|saint petersburg)%' then 'Europe'
+      else 'Other'
+    end as region
+  from active_users au
+),
+question_engagement as (
+  select
+    qtw.qid,
+    extract(epoch from (qtw.first_answer_time - qtw.q_created)) as secs_to_first_answer,
+    extract(epoch from (qtw.accepted_time - qtw.q_created)) as secs_to_accept,
+    extract(epoch from (qfc.first_comment_time - qtw.q_created)) as secs_to_first_comment,
+    (qtw.q_upvotes - coalesce(qtw.q_downvotes,0)) as net_votes,
+    case when qtw.first_closed_at is not null and qtw.last_reopened_at is null then 1 else 0 end as currently_closed,
+    case when coalesce(qtw.bounty_awarded,0) > 0 then 1 else 0 end as had_bounty
+  from question_time_windows qtw
+  left join question_first_comment qfc on qfc.qid = qtw.qid
+),
+user_composite as (
+  select
+    au.user_id,
+    au.displayname,
+    au.reputation,
+    ur.region,
+    ua.questions_authored,
+    ua.answers_authored,
+    coalesce(am.answers_count,0) as answers_count,
+    coalesce(am.accepted_answers,0) as accepted_answers,
+    coalesce(am.avg_answer_score,0) as avg_answer_score,
+    ba.gold_badges,
+    ba.silver_badges,
+    ba.bronze_badges,
+    ba.tag_badges,
+    (au.reputation * 0.002
+     + coalesce(ua.answers_authored,0) * 0.5
+     + coalesce(am.accepted_answers,0) * 1.0
+     + coalesce(ba.gold_badges,0) * 2.0
+     + coalesce(ba.silver_badges,0) * 1.0
+     + coalesce(ba.bronze_badges,0) * 0.25
+     + coalesce(au.upvotes_given,0) * 0.05
+     - coalesce(au.downvotes_given,0) * 0.02
+    ) as composite_score
+  from active_users au
+  left join user_region ur on ur.user_id = au.user_id
+  left join user_post_metrics ua on ua.user_id = au.user_id
+  left join answerer_metrics am on am.user_id = au.user_id
+  left join badge_agg ba on ba.userid = au.user_id
+),
+user_ranks as (
+  select
+    uc.*,
+    rank() over (order by composite_score desc nulls last) as global_rank,
+    rank() over (partition by region order by composite_score desc nulls last) as region_rank
+  from user_composite uc
+),
+question_with_user_quality as (
+  select
+    qtw.*,
+    uqa.displayname as asker_name,
+    ur.region as asker_region,
+    urank.region_rank as asker_region_rank,
+    urank.global_rank as asker_global_rank,
+    uc.composite_score as asker_comp_score
+  from question_time_windows qtw
+  left join users uqa on uqa.id = qtw.asker_id
+  left join user_region ur on ur.user_id = qtw.asker_id
+  left join user_ranks urank on urank.user_id = qtw.asker_id
+  left join user_composite uc on uc.user_id = qtw.asker_id
+),
+final_enriched as (
+  select
+    qwuq.qid,
+    qwuq.q_created,
+    qwuq.title,
+    qwuq.q_score,
+    qwuq.viewcount,
+    qwuq.answercount,
+    qwuq.questions_in_month,
+    qwuq.avg_qscore_in_month,
+    qwuq.p90_views_in_month,
+    qwuq.asker_name,
+    qwuq.asker_region,
+    qwuq.asker_region_rank,
+    qwuq.asker_global_rank,
+    qwuq.asker_comp_score,
+    qa.secs_to_first_answer,
+    qa.secs_to_accept,
+    qa.secs_to_first_comment,
+    qa.net_votes,
+    qa.currently_closed,
+    qa.had_bounty,
+    coalesce(dg.dup_edges,0) as duplicate_edges,
+    coalesce(dg.link_edges,0) as related_edges
+  from question_with_user_quality qwuq
+  left join question_engagement qa on qa.qid = qwuq.qid
+  left join dup_graph dg on dg.duplicate_of = qwuq.qid
+),
+scored as (
+  select
+    f.*,
+    avg(cast(viewcount as numeric)) over () as avg_views,
+    stddev_pop(cast(viewcount as numeric)) over () as sd_views,
+    case
+      when stddev_pop(cast(viewcount as numeric)) over () > 0
+      then (viewcount - avg(cast(viewcount as numeric)) over ()) / nullif(stddev_pop(cast(viewcount as numeric)) over (),0)
+      else null
+    end as z_views,
+    avg(cast(q_score as numeric)) over () as avg_qs,
+    stddev_pop(cast(q_score as numeric)) over () as sd_qs,
+    case
+      when stddev_pop(cast(q_score as numeric)) over () > 0
+      then (q_score - avg(cast(q_score as numeric)) over ()) / nullif(stddev_pop(cast(q_score as numeric)) over (),0)
+      else null
+    end as z_qs
+  from final_enriched f
+),
+interesting_q as (
+  select s.*
+  from scored s
+  where
+    (
+      (s.viewcount > s.p90_views_in_month and s.q_score >= s.avg_qs)
+      or
+      (s.secs_to_first_answer is not null and s.secs_to_first_answer < 3600 and s.net_votes > 0)
+      or
+      (s.currently_closed = 1 and coalesce(s.duplicate_edges,0) > 0)
+    )
+    and coalesce(s.asker_comp_score,0) >= (
+      select avg(composite_score) from user_composite
+    )
+),
+non_interesting_q as (
+  select qid from final_enriched
+  except
+  select qid from interesting_q
+)
+select
+  iq.qid,
+  iq.q_created,
+  iq.title,
+  iq.q_score,
+  iq.viewcount,
+  iq.answercount,
+  iq.questions_in_month,
+  round(cast(iq.avg_qscore_in_month as numeric), 3) as avg_qscore_in_month,
+  round(cast(iq.p90_views_in_month as numeric), 0) as p90_views_in_month,
+  iq.asker_name,
+  iq.asker_region,
+  iq.asker_region_rank,
+  iq.asker_global_rank,
+  round(cast(iq.asker_comp_score as numeric), 2) as asker_composite_score,
+  iq.secs_to_first_answer,
+  iq.secs_to_accept,
+  iq.secs_to_first_comment,
+  iq.net_votes,
+  iq.currently_closed,
+  iq.had_bounty,
+  iq.duplicate_edges,
+  iq.related_edges,
+  (
+    select count(*)
+    from comments c
+    where c.postid = iq.qid and c.userid = (select asker_id from questions where qid = iq.qid)
+  ) as asker_comments_on_question,
+  case when exists (
+    select 1
+    from question_tag_rank qtr
+    where qtr.qid = iq.qid and qtr.tag_rank <= 100
+  ) then 1 else 0 end as has_top100_tag,
+  case when iq.qid in (select qid from non_interesting_q) then 0 else 1 end as is_interesting
+from interesting_q iq
+order by iq.viewcount desc nulls last, iq.q_score desc nulls last
+limit 500;

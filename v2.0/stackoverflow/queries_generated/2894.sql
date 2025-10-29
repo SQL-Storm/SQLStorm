@@ -1,0 +1,203 @@
+-- {"query": "2894.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1927} 
+
+WITH RecursiveTagHierarchy AS (
+    SELECT t.Id, t.TagName, t.Count, 0 AS Level,
+           CAST(t.TagName AS VARCHAR(1000)) AS Path
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0 AND t.IsRequired = 0
+
+    UNION ALL
+
+    SELECT child.Id, child.TagName, child.Count, parent.Level + 1,
+           parent.Path || ' > ' || child.TagName
+    FROM Tags child
+    JOIN RecursiveTagHierarchy parent ON child.WikiPostId = parent.Id
+    WHERE child.IsModeratorOnly = 0 AND child.IsRequired = 0
+),
+PostsWithCommentStats AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        count(c.Id) FILTER (WHERE c.Score >= 5) AS HighScoreComments,
+        count(c.Id) FILTER (WHERE c.Score < 0 OR c.Text ILIKE '%error%' OR c.Text ILIKE '%fail%') AS NegativeOrErrorComments,
+        max(c.CreationDate) AS LastCommentDate
+    FROM Posts p
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    WHERE p.PostTypeId IN (1, 2)
+    GROUP BY p.Id, p.PostTypeId, p.CreationDate, p.OwnerUserId, p.Score, p.ViewCount, p.Title
+),
+UserBadgeStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COUNT(DISTINCT b.TagBased) AS BadgeTypes,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+TopPostsWithUserStats AS (
+    SELECT
+        p.PostId,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.HighScoreComments,
+        p.NegativeOrErrorComments,
+        p.LastCommentDate,
+        u.DisplayName,
+        u.GoldBadges,
+        u.SilverBadges,
+        u.BronzeBadges,
+        u.BadgeTypes,
+        u.LastBadgeDate,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS PostRank
+    FROM PostsWithCommentStats p
+    LEFT JOIN UserBadgeStats u ON u.UserId = p.OwnerUserId
+    WHERE p.Score IS NOT NULL
+),
+AcceptedAnswerVotes AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        COUNT(v.Id) FILTER (WHERE vt.Name = 'UpMod') AS UpVotes,
+        COUNT(v.Id) FILTER (WHERE vt.Name = 'DownMod') AS DownVotes,
+        SUM(CASE WHEN v.VoteTypeId = 8 THEN v.BountyAmount ELSE 0 END) AS TotalBounty
+    FROM Posts a
+    LEFT JOIN Votes v ON v.PostId = a.Id
+    LEFT JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE a.PostTypeId = 2
+    GROUP BY a.Id, a.ParentId
+),
+QuestionsWithAcceptedAnswers AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        a.AnswerId,
+        a.UpVotes,
+        a.DownVotes,
+        a.TotalBounty,
+        ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY a.UpVotes DESC NULLS LAST) AS AnswerRank
+    FROM Posts q
+    LEFT JOIN AcceptedAnswerVotes a ON a.QuestionId = q.Id
+    WHERE q.PostTypeId = 1
+),
+QuestionsFiltered AS (
+    SELECT
+        q.QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.QuestionScore,
+        q.ViewCount,
+        q.AnswerId,
+        q.UpVotes,
+        q.DownVotes,
+        q.TotalBounty
+    FROM QuestionsWithAcceptedAnswers q
+    WHERE q.AnswerRank = 1 OR q.AnswerId IS NULL
+),
+RecentPostHistories AS (
+    SELECT DISTINCT ON (ph.PostId)
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        pht.Name AS HistoryTypeName,
+        ph.UserId,
+        u.DisplayName,
+        ph.CreationDate,
+        ph.Comment,
+        ph.Text
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht ON pht.Id = ph.PostHistoryTypeId
+    LEFT JOIN Users u ON u.Id = ph.UserId
+    ORDER BY ph.PostId, ph.CreationDate DESC
+),
+FinalResult AS (
+    SELECT
+        tpfs.QuestionId,
+        tpfs.Title AS QuestionTitle,
+        tpfs.CreationDate AS QuestionCreation,
+        tpfs.QuestionScore,
+        tpfs.ViewCount AS QuestionViews,
+        tpfs.AnswerId,
+        a.Score AS AnswerScore,
+        av.UpVotes AS AnswerUpVotes,
+        av.DownVotes AS AnswerDownVotes,
+        av.TotalBounty,
+        ub.DisplayName AS OwnerDisplayName,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        RPH.HistoryTypeName AS LastPostHistoryType,
+        RPH.CreationDate AS LastPostHistoryDate,
+        RPH.Comment AS LastEditComment,
+        CASE 
+            WHEN (ub.GoldBadges + ub.SilverBadges + ub.BronzeBadges) >= 50 THEN 'Expert'
+            WHEN (ub.GoldBadges + ub.SilverBadges + ub.BronzeBadges) BETWEEN 10 AND 49 THEN 'Intermediate'
+            ELSE 'Novice'
+        END AS UserReputationCategory,
+        -- Complex string expression concatenating tags, title and user's badge summary
+        COALESCE(
+            (SELECT STRING_AGG(DISTINCT t.TagName, ', ') 
+             FROM Posts p2
+             CROSS JOIN LATERAL string_to_array(substring(p2.Tags FROM 2 FOR char_length(p2.Tags) - 2), '><') as tag_arr(tag)
+             JOIN Tags t ON t.TagName = tag_arr.tag
+             WHERE p2.Id = tpfs.QuestionId AND t.IsModeratorOnly = 0
+            ), 'NoTags') || ' | ' ||
+        tpfs.Title || ' | User Badges: ' ||
+        COALESCE(CAST(ub.GoldBadges AS VARCHAR), '0') || 'G ' ||
+        COALESCE(CAST(ub.SilverBadges AS VARCHAR), '0') || 'S ' ||
+        COALESCE(CAST(ub.BronzeBadges AS VARCHAR), '0') || 'B' AS TagTitleBadgeSummary
+    FROM QuestionsFiltered tpfs
+    LEFT JOIN Posts a ON a.Id = tpfs.AnswerId
+    LEFT JOIN AcceptedAnswerVotes av ON av.AnswerId = tpfs.AnswerId
+    LEFT JOIN UserBadgeStats ub ON ub.UserId = (SELECT OwnerUserId FROM Posts WHERE Id = tpfs.QuestionId)
+    LEFT JOIN RecentPostHistories RPH ON RPH.PostId = tpfs.QuestionId
+    WHERE tpfs.QuestionScore > 10
+)
+SELECT * FROM FinalResult
+UNION
+SELECT
+    NULL AS QuestionId,
+    'Summary Stats' AS QuestionTitle,
+    NULL AS QuestionCreation,
+    COUNT(DISTINCT p.Id) AS QuestionCount,
+    SUM(p.ViewCount) AS TotalViews,
+    NULL AS AnswerId,
+    NULL AS AnswerScore,
+    NULL AS AnswerUpVotes,
+    NULL AS AnswerDownVotes,
+    NULL AS TotalBounty,
+    NULL AS OwnerDisplayName,
+    SUM(COALESCE(bd.GoldBadges,0)) AS TotalGoldBadges,
+    SUM(COALESCE(bd.SilverBadges,0)) AS TotalSilverBadges,
+    SUM(COALESCE(bd.BronzeBadges,0)) AS TotalBronzeBadges,
+    NULL AS LastPostHistoryType,
+    NULL AS LastPostHistoryDate,
+    NULL AS LastEditComment,
+    NULL AS UserReputationCategory,
+    NULL AS TagTitleBadgeSummary
+FROM Posts p
+LEFT JOIN Users u ON u.Id = p.OwnerUserId
+LEFT JOIN (
+    SELECT UserId,
+           COUNT(CASE WHEN Class = 1 THEN 1 END) AS GoldBadges,
+           COUNT(CASE WHEN Class = 2 THEN 1 END) AS SilverBadges,
+           COUNT(CASE WHEN Class = 3 THEN 1 END) AS BronzeBadges
+    FROM Badges
+    GROUP BY UserId
+) bd ON bd.UserId = u.Id
+WHERE p.PostTypeId = 1
+ORDER BY QuestionScore DESC NULLS LAST, QuestionCreation DESC NULLS LAST;

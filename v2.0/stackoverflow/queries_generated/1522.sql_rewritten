@@ -1,0 +1,218 @@
+-- {"query": "1522.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2836} 
+WITH UsersWithPostsButNoComments AS (
+    -- Identify users who have created posts but have never made a comment.
+    -- This uses the set operator EXCEPT.
+    SELECT DISTINCT P.OwnerUserId AS UserId
+    FROM Posts P
+    WHERE P.OwnerUserId IS NOT NULL
+    EXCEPT
+    SELECT DISTINCT C.UserId AS UserId
+    FROM Comments C
+    WHERE C.UserId IS NOT NULL
+),
+UserEngagement AS (
+    -- Aggregates user-specific statistics, including badge counts, post/comment activity,
+    -- and a flag indicating if the user has posts but no comments.
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.UpVotes AS UserUpVotes,
+        U.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.TagBased = TRUE THEN 1 ELSE 0 END) AS TagBasedBadgesCount,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsCount,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersCount,
+        AVG(CASE WHEN P.PostTypeId IN (1, 2) THEN P.Score ELSE NULL END) AS AveragePostScore,
+        MAX(P.LastActivityDate) AS LastPostActivity,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        SUM(CASE WHEN C.Score > 0 THEN 1 ELSE 0 END) AS PositiveCommentsCount,
+        UWPBNC.UserId IS NOT NULL AS HasPostsNoCommentsFlag -- Integration of set operator CTE
+    FROM
+        Users U
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN UsersWithPostsButNoComments UWPBNC ON U.Id = UWPBNC.UserId
+    WHERE
+        U.Reputation > 100 -- Filter for more engaged users
+        AND U.LastAccessDate >= cast('2024-10-01' as date) - INTERVAL '1 year' -- Recently active users
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.UpVotes, U.DownVotes, UWPBNC.UserId
+),
+PostDetailsExtended AS (
+    -- Gathers detailed information for posts, including vote counts (using correlated subqueries),
+    -- latest history, and inferred editor display name with NULL logic.
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.LastEditDate,
+        P.LastActivityDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.Title,
+        P.Tags,
+        P.ClosedDate,
+        CR.Name AS CloseReason,
+        (SELECT COUNT(V.Id) FROM Votes V WHERE V.PostId = P.Id AND V.VoteTypeId = 2) AS UpVoteCount, -- Correlated subquery for upvotes
+        (SELECT COUNT(V.Id) FROM Votes V WHERE V.PostId = P.Id AND V.VoteTypeId = 3) AS DownVoteCount, -- Correlated subquery for downvotes
+        CASE
+            WHEN P.AcceptedAnswerId IS NOT NULL THEN TRUE
+            ELSE FALSE
+        END AS HasAcceptedAnswer,
+        NULLIF(TRIM(SUBSTRING(P.Body, 1, 100)), '') AS BodyExcerpt, -- String manipulation and NULL logic
+        PH.Text AS LastHistoryText,
+        PH.CreationDate AS LastHistoryDate,
+        ROW_NUMBER() OVER (PARTITION BY P.Id ORDER BY PH.CreationDate DESC, PH.Id DESC) AS rn_post_history, -- Window function for latest history
+        COALESCE(P.LastEditorDisplayName, (SELECT U.DisplayName FROM Users U WHERE U.Id = P.LastEditorUserId), 'Community') AS ActualLastEditorDisplayName -- NULL logic with correlated subquery
+    FROM
+        Posts P
+    JOIN PostTypes PT ON P.PostTypeId = PT.Id
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId AND PH.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20, 35) -- Filter for relevant history types
+    LEFT JOIN CloseReasonTypes CR ON PH.PostHistoryTypeId = 10 AND PH.Comment IS NOT NULL AND PH.Comment ~ '^[0-9]+$' AND PH.Comment::smallint = CR.Id -- Complicated join condition with regex and cast
+    WHERE
+        P.CreationDate >= cast('2024-10-01' as date) - INTERVAL '3 years'
+),
+RecentPostStats AS (
+    -- Aggregates post-related statistics, including linked/duplicate counts and uses window functions
+    -- for ranking posts and calculating rolling averages.
+    SELECT
+        PDE.PostId,
+        PDE.PostTypeId,
+        PDE.PostTypeName,
+        PDE.OwnerUserId,
+        PDE.PostCreationDate,
+        PDE.PostScore,
+        PDE.ViewCount,
+        PDE.AnswerCount,
+        PDE.CommentCount,
+        PDE.FavoriteCount,
+        PDE.Title,
+        PDE.Tags,
+        PDE.ClosedDate,
+        PDE.CloseReason,
+        PDE.UpVoteCount,
+        PDE.DownVoteCount,
+        PDE.HasAcceptedAnswer,
+        PDE.BodyExcerpt,
+        PDE.ActualLastEditorDisplayName,
+        COUNT(DISTINCT PL.RelatedPostId) AS LinkedPostsCount,
+        SUM(CASE WHEN PL.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicateLinksCount,
+        DENSE_RANK() OVER (PARTITION BY PDE.PostTypeId ORDER BY PDE.PostScore DESC, PDE.ViewCount DESC) AS PostRankByScoreAndViews, -- Window function for ranking
+        AVG(PDE.PostScore) OVER (PARTITION BY PDE.PostTypeName ORDER BY PDE.PostCreationDate ROWS BETWEEN 30 PRECEDING AND CURRENT ROW) AS RollingAvgTypeScore -- Window function for rolling average
+    FROM
+        PostDetailsExtended PDE
+    LEFT JOIN PostLinks PL ON PDE.PostId = PL.PostId
+    WHERE
+        PDE.rn_post_history = 1 -- Ensures only the most recent history entry is considered
+    GROUP BY
+        PDE.PostId, PDE.PostTypeId, PDE.PostTypeName, PDE.OwnerUserId, PDE.PostCreationDate, PDE.PostScore,
+        PDE.ViewCount, PDE.AnswerCount, PDE.CommentCount, PDE.FavoriteCount, PDE.Title, PDE.Tags,
+        PDE.ClosedDate, PDE.CloseReason, PDE.UpVoteCount, PDE.DownVoteCount, PDE.HasAcceptedAnswer,
+        PDE.BodyExcerpt, PDE.ActualLastEditorDisplayName
+),
+TagPerformance AS (
+    -- Extracts individual tags from post data for further analysis.
+    SELECT
+        UNNEST(string_to_array(SUBSTRING(RPS.Tags, 2, LENGTH(RPS.Tags) - 2), '><')) AS TagName, -- String expression to parse tags
+        RPS.PostId,
+        RPS.PostScore,
+        RPS.ViewCount
+    FROM
+        RecentPostStats RPS
+    WHERE
+        RPS.Tags IS NOT NULL AND LENGTH(RPS.Tags) > 2 -- NULL logic
+),
+AggregatedTagStats AS (
+    -- Calculates aggregate statistics for each tag and ranks them by popularity.
+    SELECT
+        TP.TagName,
+        COUNT(TP.PostId) AS TagPostCount,
+        AVG(TP.PostScore) AS AvgTagPostScore,
+        SUM(TP.ViewCount) AS TotalTagViewCount,
+        RANK() OVER (ORDER BY COUNT(TP.PostId) DESC, AVG(TP.PostScore) DESC) AS TagPopularityRank -- Window function for tag ranking
+    FROM
+        TagPerformance TP
+    GROUP BY
+        TP.TagName
+)
+-- Main query to combine all the above information, apply complex filtering,
+-- and perform final calculations and categorizations.
+SELECT
+    UE.UserId,
+    UE.DisplayName,
+    UE.Reputation,
+    UE.TotalBadges,
+    UE.GoldBadges,
+    UE.QuestionsCount,
+    UE.AnswersCount,
+    UE.AveragePostScore,
+    UE.LastAccessDate,
+    UE.HasPostsNoCommentsFlag, -- Flag indicating if a user has posts but no comments
+    RPS.PostId,
+    RPS.PostTypeName,
+    RPS.Title,
+    RPS.PostScore,
+    RPS.ViewCount,
+    RPS.UpVoteCount,
+    RPS.DownVoteCount,
+    RPS.FavoriteCount,
+    RPS.HasAcceptedAnswer,
+    RPS.CloseReason,
+    RPS.LinkedPostsCount,
+    RPS.DuplicateLinksCount,
+    RPS.ActualLastEditorDisplayName,
+    RPS.PostRankByScoreAndViews,
+    RPS.RollingAvgTypeScore,
+    ATS.TagName AS MostImpactfulTag,
+    ATS.TagPopularityRank AS MostImpactfulTagRank,
+    (UE.Reputation + UE.UserUpVotes - UE.UserDownVotes) * (UE.TotalPosts + UE.TotalComments) AS UserEngagementIndex, -- Complicated calculation
+    COALESCE(RPS.BodyExcerpt, '[No excerpt available]') AS DisplayBodyExcerpt, -- NULL logic
+    CASE
+        WHEN RPS.PostScore >= 100 AND RPS.ViewCount >= 10000 AND (RPS.PostCreationDate > cast('2024-10-01' as date) - INTERVAL '1 year') THEN 'Viral Recent'
+        WHEN RPS.PostScore >= 50 AND RPS.ViewCount >= 5000 THEN 'Popular'
+        WHEN RPS.ClosedDate IS NOT NULL AND RPS.CloseReason ILIKE '%Duplicate%' THEN 'Closed-Duplicate'
+        WHEN RPS.PostTypeName = 'Question' AND RPS.AnswerCount = 0 AND RPS.CommentCount = 0 THEN 'Unanswered Uncommented'
+        ELSE 'Regular'
+    END AS PostCategory, -- Complicated CASE expression
+    RPS.PostCreationDate::date AS PostCreationDay,
+    EXTRACT(DAY FROM (RPS.LastActivityDate - RPS.PostCreationDate)) AS PostActivityDaysSpan -- Date calculation
+FROM
+    UserEngagement UE
+JOIN
+    RecentPostStats RPS ON UE.UserId = RPS.OwnerUserId
+LEFT JOIN LATERAL ( -- Lateral join to find the most impactful tag for each post
+    SELECT
+        ATS_sub.TagName,
+        ATS_sub.TagPopularityRank
+    FROM
+        AggregatedTagStats ATS_sub
+    WHERE
+        RPS.Tags LIKE '%' || '<' || ATS_sub.TagName || '>' || '%' -- String expression for tag matching
+    ORDER BY ATS_sub.TagPopularityRank ASC
+    LIMIT 1
+) AS ATS ON TRUE
+WHERE
+    RPS.PostRankByScoreAndViews <= 10 -- Filter for top posts of each type
+    AND RPS.PostScore >= 10
+    AND (RPS.Title ILIKE '%SQL%' OR RPS.BodyExcerpt ILIKE '%database%') -- Complicated string predicates
+    AND RPS.PostId NOT IN (SELECT V.PostId FROM Votes V WHERE V.VoteTypeId = 12) -- Exclude spam posts using NOT IN subquery
+    AND UE.GoldBadges > 0 -- Users with at least one gold badge
+    AND (RPS.ClosedDate IS NULL OR RPS.CloseReason NOT IN ('Not a real question', 'Needs more focus', 'Off-topic')) -- NULL logic and complex negation
+    AND (RPS.AnswerCount > 0 OR RPS.PostTypeId = 1) -- Ensure questions or answers
+    AND UE.HasPostsNoCommentsFlag IS FALSE -- Exclude users identified as only posting, never commenting
+ORDER BY
+    UserEngagementIndex DESC,
+    RPS.RollingAvgTypeScore DESC,
+    RPS.PostCreationDate DESC
+LIMIT 500;

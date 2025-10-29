@@ -1,0 +1,345 @@
+WITH RankedUsers AS (
+    SELECT 
+        u.Id,
+        u.Reputation,
+        u.CreationDate,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) as RepRank,
+        COUNT(p.Id) as PostCount,
+        SUM(COALESCE(p.Score, 0)) as TotalScore,
+        AVG(CAST(p.Score AS DOUBLE PRECISION)) as AvgScore,
+        MAX(p.CreationDate) as LatestPostDate,
+        -- Use dialect-agnostic string aggregation: LISTAGG or GROUP_CONCAT may be available; keep generic STRING_AGG
+        STRING_AGG(COALESCE(p.Title, ''), ' | ') as AllTitles,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Elite'
+            WHEN u.Reputation >= 1000 THEN 'Veteran'
+            WHEN u.Reputation >= 100 THEN 'Active'
+            ELSE 'Newbie'
+        END as UserTier
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Reputation > 0
+    GROUP BY u.Id, u.Reputation, u.CreationDate, u.DisplayName, u.Views, u.UpVotes, u.DownVotes
+),
+TopPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ParentId,
+        p.AcceptedAnswerId,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) as ScoreRank,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) as ScoreRankDense,
+        NTILE(10) OVER (ORDER BY p.Score DESC) as ScoreQuartile
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) AND p.Score > 0
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            WHEN t.Count > 10 THEN 'Niche'
+            ELSE 'Rare'
+        END as TagPopularity,
+        COALESCE((SELECT COUNT(*) FROM Posts WHERE Tags LIKE '%' || t.TagName || '%'), 0) as UsageCount
+    FROM Tags t
+),
+UserActivitySummary AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT v.Id) as VoteCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COUNT(DISTINCT ph.Id) as HistoryCount,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) as UpVotesReceived,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) as DownVotesReceived
+    FROM Users u
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    GROUP BY u.Id, u.DisplayName
+)
+SELECT 
+    'Performance Benchmark Report' as ReportTitle,
+    COUNT(*) as TotalUsers,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1) as QuestionCount,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 2) as AnswerCount,
+    (SELECT COUNT(*) FROM Tags) as TagCount,
+    (SELECT COUNT(*) FROM Badges) as BadgeCount,
+    (SELECT COUNT(*) FROM Comments) as CommentCount,
+    (SELECT COUNT(*) FROM Votes) as VoteCount,
+    (SELECT COUNT(*) FROM PostHistory) as HistoryCount,
+    COUNT(DISTINCT CASE WHEN ru.RepRank <= 100 THEN ru.Id END) as Top100Reputations,
+    SUM(CASE WHEN ru.RepRank <= 100 THEN 1 ELSE 0 END) as Top100UserCount,
+    AVG(CASE WHEN ru.RepRank <= 100 THEN ru.Reputation END) as AvgReputationTop100,
+    AVG(CASE WHEN ru.RepRank > 100 THEN ru.Reputation END) as AvgReputationOthers,
+    MAX(ru.Reputation) as MaxReputation,
+    (
+        SELECT CAST(SUM(CAST(p.Score AS BIGINT) * CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0.5 END) AS DECIMAL(18,2))
+        FROM Posts p 
+        WHERE p.PostTypeId IN (1, 2) AND p.Score > 0
+    ) as WeightedScoreSum,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.PostTypeId = 2 AND EXISTS (
+            SELECT 1 FROM Posts q WHERE q.AcceptedAnswerId = p.Id
+        )
+    ) as AnsweredQuestions,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL
+    ) as QuestionsWithAcceptedAnswer,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND p.Tags <> ''
+    ) as TaggedQuestions,
+    (
+        SELECT COUNT(*) 
+        FROM Users u 
+        WHERE u.AccountId IS NOT NULL
+    ) as UserWithAccounts,
+    (
+        SELECT COUNT(*) 
+        FROM Users u 
+        WHERE u.WebsiteUrl IS NOT NULL AND u.WebsiteUrl <> ''
+    ) as UsersWithWebsites,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.LastActivityDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30' DAY
+    ) as RecentlyActivePosts,
+    (
+        SELECT COUNT(*) 
+        FROM Badges b 
+        WHERE b.Class = 1
+    ) as GoldBadges,
+    (
+        SELECT COUNT(*) 
+        FROM Badges b 
+        WHERE b.Class = 2
+    ) as SilverBadges,
+    (
+        SELECT COUNT(*) 
+        FROM Badges b 
+        WHERE b.Class = 3
+    ) as BronzeBadges,
+    (
+        SELECT COUNT(*) 
+        FROM Votes v 
+        WHERE v.VoteTypeId IN (2, 3)
+    ) as VotingActivity,
+    (
+        SELECT COUNT(*) 
+        FROM PostHistory ph 
+        WHERE ph.PostHistoryTypeId = 10
+    ) as PostClosedCount,
+    (
+        SELECT COUNT(*) 
+        FROM PostHistory ph 
+        WHERE ph.PostHistoryTypeId = 13
+    ) as PostUndeletedCount,
+    (
+        SELECT COUNT(*) 
+        FROM Comments c 
+        WHERE c.Text LIKE '%help%' OR c.Text LIKE '%please%'
+    ) as HelpRequests,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.Body LIKE '%code%' OR p.Body LIKE '%javascript%' OR p.Body LIKE '%python%'
+    ) as CodeRelatedPosts,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.Tags LIKE '%<c>%' OR p.Tags LIKE '%<java>%' OR p.Tags LIKE '%<python>%'
+    ) as LanguageSpecificTags,
+    (
+        SELECT AVG(ru.TotalScore) 
+        FROM RankedUsers ru 
+        WHERE ru.RepRank <= 100
+    ) as AvgScoreTop100,
+    (
+        SELECT STRING_AGG(DISTINCT ru.DisplayName, ', ') 
+        FROM RankedUsers ru 
+        WHERE ru.RepRank IN (1, 2, 3, 4, 5, 10, 25, 50, 100)
+    ) as TopUsersNames,
+    (
+        SELECT COUNT(*) 
+        FROM RankedUsers ru 
+        WHERE ru.PostCount >= 100 AND ru.RepRank <= 100
+    ) as TopActiveUsers,
+    (
+        SELECT COUNT(*) 
+        FROM UserActivitySummary uas 
+        WHERE uas.VoteCount >= 100 AND uas.CommentCount >= 50
+    ) as HighlyActiveUsers,
+    (
+        SELECT AVG(ta.UsageCount) 
+        FROM TagAnalysis ta
+    ) as AvgTagUsageCount,
+    (
+        SELECT COUNT(*) 
+        FROM TagAnalysis ta 
+        WHERE ta.TagPopularity = 'Popular'
+    ) as PopularTags,
+    (
+        SELECT MIN(ru.LatestPostDate) 
+        FROM RankedUsers ru
+    ) as OldestUserPostDate,
+    (
+        SELECT MAX(ru.LatestPostDate) 
+        FROM RankedUsers ru
+    ) as NewestUserPostDate,
+    (
+        SELECT CASE WHEN qcount = 0 THEN 0.0 ELSE cnt * 100.0 / qcount END
+        FROM (
+            SELECT COUNT(*) as cnt, (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1) as qcount
+            FROM Posts p
+            WHERE p.AnswerCount > 0
+        ) s
+    ) as QuestionsWithAnswersPercentage,
+    (
+        SELECT AVG(CAST(p.ViewCount AS DOUBLE PRECISION)) 
+        FROM Posts p 
+        WHERE p.PostTypeId = 1
+    ) as AvgQuestionViews,
+    (
+        SELECT AVG(CAST(p.ViewCount AS DOUBLE PRECISION)) 
+        FROM Posts p 
+        WHERE p.PostTypeId = 2
+    ) as AvgAnswerViews,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.CommentCount > 10
+    ) as HighlyCommentedPosts,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.FavoriteCount > 5
+    ) as HighlyFavoritedPosts,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1)
+    ) as AboveAverageQuestions,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p 
+        WHERE p.Score < (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 2)
+    ) as BelowAverageAnswers,
+    (
+        SELECT COUNT(DISTINCT p.OwnerUserId) 
+        FROM Posts p 
+        WHERE p.PostTypeId = 1
+    ) as UniqueQuestionOwners,
+    (
+        SELECT COUNT(DISTINCT p.OwnerUserId) 
+        FROM Posts p 
+        WHERE p.PostTypeId = 2
+    ) as UniqueAnswerOwners,
+    (
+        SELECT STRING_AGG(DISTINCT t.TagName, ', ') 
+        FROM Tags t 
+        WHERE t.Count > 500
+    ) as HighCountTags,
+    (
+        SELECT COUNT(*) 
+        FROM (
+            SELECT DISTINCT p.OwnerUserId 
+            FROM Posts p 
+            WHERE p.PostTypeId = 1
+            INTERSECT
+            SELECT DISTINCT p.OwnerUserId 
+            FROM Posts p 
+            WHERE p.PostTypeId = 2
+        ) as SharedOwners
+    ) as UsersWithBothQuestionsAndAnswers,
+    (
+        SELECT COUNT(*) 
+        FROM (
+            SELECT p.OwnerUserId 
+            FROM Posts p 
+            WHERE p.PostTypeId = 1
+            EXCEPT
+            SELECT DISTINCT p.OwnerUserId 
+            FROM Posts p 
+            WHERE p.PostTypeId = 2
+        ) as OnlyQuestionOwners
+    ) as OnlyQuestionOwners,
+    (
+        SELECT COUNT(*) 
+        FROM (
+            SELECT p.OwnerUserId 
+            FROM Posts p 
+            WHERE p.PostTypeId = 2
+            EXCEPT
+            SELECT DISTINCT p.OwnerUserId 
+            FROM Posts p 
+            WHERE p.PostTypeId = 1
+        ) as OnlyAnswerOwners
+    ) as OnlyAnswerOwners,
+    (
+        SELECT COUNT(*) 
+        FROM (
+            SELECT UserId 
+            FROM Comments 
+            WHERE UserId IS NOT NULL
+            INTERSECT
+            SELECT Id 
+            FROM Users
+        ) as ActiveCommentators
+    ) as ActiveCommentatorsCount,
+    (
+        SELECT COUNT(*) 
+        FROM Votes v 
+        WHERE v.UserId IS NOT NULL
+    ) as VotedUsersCount,
+    (
+        SELECT COUNT(*) 
+        FROM Badges b 
+        WHERE b.UserId IS NOT NULL
+    ) as BadgedUsersCount
+FROM RankedUsers ru
+    FULL OUTER JOIN TopPosts tp ON 1=1
+    FULL OUTER JOIN TagAnalysis ta ON 1=1
+    FULL OUTER JOIN UserActivitySummary uas ON 1=1
+WHERE ru.RepRank <= 1000
+GROUP BY  
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1),
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 2),
+    (SELECT COUNT(*) FROM Tags),
+    (SELECT COUNT(*) FROM Badges),
+    (SELECT COUNT(*) FROM Comments),
+    (SELECT COUNT(*) FROM Votes),
+    (SELECT COUNT(*) FROM PostHistory),
+    (SELECT CAST(SUM(CAST(p.Score AS BIGINT) * CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0.5 END) AS DECIMAL(18,2)) FROM Posts p WHERE p.PostTypeId IN (1, 2) AND p.Score > 0),
+    (SELECT COUNT(*) FROM Posts p WHERE p.PostTypeId = 2 AND EXISTS (SELECT 1 FROM Posts q WHERE q.AcceptedAnswerId = p.Id)),
+    (SELECT COUNT(*) FROM Posts p WHERE p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL)
+HAVING 
+    COUNT(*) > 0
+ORDER BY 
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1) DESC,
+    (SELECT COUNT(*) FROM Users u WHERE u.Reputation > 0) DESC;

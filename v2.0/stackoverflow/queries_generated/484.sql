@@ -1,0 +1,278 @@
+-- {"query": "484.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2480} 
+with recent_users as (
+  select u.id as user_id,
+         u.displayname,
+         u.reputation,
+         u.location,
+         u.creationdate,
+         coalesce(nullif(trim(lower(u.websiteurl)), ''), 'n/a') as norm_site
+  from users u
+  where u.creationdate >= (select date_trunc('year', max(creationdate)) from users)
+),
+question_posts as (
+  select p.id,
+         p.owneruserid,
+         p.creationdate,
+         p.score,
+         p.viewcount,
+         p.title,
+         p.tags,
+         p.acceptedanswerid,
+         p.favoritecount,
+         p.commentcount
+  from posts p
+  where p.posttypeid = 1
+),
+answer_posts as (
+  select p.id,
+         p.parentid as question_id,
+         p.owneruserid,
+         p.creationdate,
+         p.score
+  from posts p
+  where p.posttypeid = 2
+),
+votes_agg as (
+  select v.postid,
+         sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+         sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+         sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+         count(*) as total_votes,
+         max(v.creationdate) as last_vote_at
+  from votes v
+  group by v.postid
+),
+comments_agg as (
+  select c.postid,
+         count(*) as comment_count,
+         max(c.creationdate) as last_comment_at
+  from comments c
+  group by c.postid
+),
+badges_agg as (
+  select b.userid,
+         count(*) filter (where b.class = 1) as gold_count,
+         count(*) filter (where b.class = 2) as silver_count,
+         count(*) filter (where b.class = 3) as bronze_count,
+         count(*) as total_badges,
+         max(b.date) as last_badge_at
+  from badges b
+  group by b.userid
+),
+dup_links as (
+  select pl.postid as dup_post_id,
+         pl.relatedpostid as canonical_id,
+         count(*) as dup_link_count,
+         max(pl.creationdate) as last_dup_at
+  from postlinks pl
+  where pl.linktypeid = 3
+  group by pl.postid, pl.relatedpostid
+),
+close_events as (
+  select ph.postid,
+         min(ph.creationdate) filter (where ph.posthistorytypeid = 10) as first_closed_at,
+         max(ph.creationdate) filter (where ph.posthistorytypeid = 10) as last_closed_at,
+         count(*) filter (where ph.posthistorytypeid = 10) as close_count,
+         string_agg(distinct
+            case
+              when ph.posthistorytypeid = 10 and ph.comment ~ '^\d+$' then ph.comment
+              else null
+            end, ','
+         ) as close_reason_ids
+  from posthistory ph
+  where ph.postid is not null
+  group by ph.postid
+),
+tag_expansion as (
+  select q.id as question_id,
+         unnest(string_to_array(substring(q.tags, 2, greatest(length(q.tags)-2,0)), '><')) as tagname
+  from question_posts q
+  where q.tags is not null and q.tags like '<%>'
+),
+tag_popularity as (
+  select te.question_id,
+         te.tagname,
+         t.count as global_tag_count,
+         row_number() over (partition by te.question_id order by coalesce(t.count, 0) desc, te.tagname) as tag_rank
+  from tag_expansion te
+  left join tags t on lower(t.tagname) = lower(te.tagname)
+),
+accepted_latency as (
+  select q.id as question_id,
+         q.creationdate as question_created_at,
+         a.creationdate as accepted_created_at,
+         extract(epoch from (a.creationdate - q.creationdate)) as accept_latency_seconds
+  from question_posts q
+  join posts a on a.id = q.acceptedanswerid
+),
+answer_stats as (
+  select q.id as question_id,
+         count(a.id) as answer_count,
+         avg(a.score) as avg_answer_score,
+         max(a.creationdate) as last_answer_at
+  from question_posts q
+  left join answer_posts a on a.question_id = q.id
+  group by q.id
+),
+recent_activity as (
+  select q.id as question_id,
+         greatest(
+           coalesce(q.creationdate, '-infinity'::timestamp),
+           coalesce(v.last_vote_at, '-infinity'::timestamp),
+           coalesce(ca.last_comment_at, '-infinity'::timestamp),
+           coalesce(ans.last_answer_at, '-infinity'::timestamp)
+         ) as last_activity_at
+  from question_posts q
+  left join votes_agg v on v.postid = q.id
+  left join comments_agg ca on ca.postid = q.id
+  left join answer_stats ans on ans.question_id = q.id
+),
+owner_enriched as (
+  select q.id as question_id,
+         u.user_id,
+         u.displayname,
+         u.reputation,
+         u.location,
+         u.norm_site,
+         coalesce(b.total_badges, 0) as total_badges,
+         coalesce(b.gold_count, 0) as gold_badges,
+         coalesce(b.silver_count, 0) as silver_badges,
+         coalesce(b.bronze_count, 0) as bronze_badges
+  from question_posts q
+  left join recent_users u on u.user_id = q.owneruserid
+  left join badges_agg b on b.userid = q.owneruserid
+),
+score_norm as (
+  select q.id as question_id,
+         q.score,
+         q.viewcount,
+         case
+           when q.viewcount is null or q.viewcount = 0 then null
+           else q.score::numeric / q.viewcount::numeric
+         end as score_per_view,
+         percentile_cont(0.5) within group (order by q.score) over () as score_median,
+         avg(q.score) over () as score_avg_all
+  from question_posts q
+),
+question_ranked as (
+  select
+    q.id as question_id,
+    q.title,
+    q.creationdate,
+    q.viewcount,
+    q.score,
+    v.upvotes,
+    v.downvotes,
+    v.favorites,
+    v.total_votes,
+    coalesce(v.upvotes,0) - coalesce(v.downvotes,0) as net_votes,
+    s.score_per_view,
+    s.score_median,
+    s.score_avg_all,
+    ans.answer_count,
+    ans.avg_answer_score,
+    ra.last_activity_at,
+    ce.first_closed_at,
+    ce.last_closed_at,
+    ce.close_count,
+    ce.close_reason_ids,
+    dl.dup_link_count,
+    case when dl.canonical_id is not null then 1 else 0 end as is_marked_duplicate,
+    row_number() over (order by coalesce(v.upvotes,0) - coalesce(v.downvotes,0) desc, q.viewcount desc, q.creationdate desc) as popularity_rank,
+    dense_rank() over (order by coalesce(ra.last_activity_at, q.creationdate) desc) as recency_rank
+  from question_posts q
+  left join votes_agg v on v.postid = q.id
+  left join answer_stats ans on ans.question_id = q.id
+  left join recent_activity ra on ra.question_id = q.id
+  left join close_events ce on ce.postid = q.id
+  left join lateral (
+    select sum(dup_link_count) as dup_link_count, min(canonical_id) as canonical_id
+    from dup_links d
+    where d.dup_post_id = q.id
+  ) dl on true
+),
+top_tags as (
+  select tp.question_id,
+         string_agg(tp.tagname || ':' || coalesce(tp.global_tag_count::text, '0'), ', ' order by tp.tag_rank) as tag_summary,
+         max(case when tp.tag_rank = 1 then tp.tagname end) as top_tag
+  from tag_popularity tp
+  where tp.tag_rank <= 5
+  group by tp.question_id
+),
+final_scores as (
+  select
+    qr.question_id,
+    qr.popularity_rank,
+    qr.recency_rank,
+    qr.net_votes,
+    qr.viewcount,
+    qr.answer_count,
+    qr.close_count,
+    qr.is_marked_duplicate,
+    coalesce(1.0 / nullif(qr.popularity_rank,0), 0) * 0.5
+      + coalesce(1.0 / nullif(qr.recency_rank,0), 0) * 0.3
+      + coalesce(ln(nullif(qr.viewcount,0)), 0) * 0.1
+      + coalesce(qr.net_votes, 0) * 0.05
+      - coalesce(qr.close_count, 0) * 0.1
+      - case when qr.is_marked_duplicate = 1 then 0.2 else 0 end
+      as composite_score
+  from question_ranked qr
+)
+select
+  qr.question_id,
+  q.title,
+  left(coalesce(q.body, ''), 120) as body_snippet,
+  oe.displayname as owner_name,
+  oe.reputation as owner_rep,
+  oe.location as owner_location,
+  oe.norm_site as owner_site_norm,
+  oe.total_badges,
+  oe.gold_badges,
+  oe.silver_badges,
+  oe.bronze_badges,
+  qr.score,
+  qr.viewcount,
+  qr.net_votes,
+  qr.total_votes,
+  qr.upvotes,
+  qr.downvotes,
+  qr.favorites,
+  ss.score_per_view,
+  round(coalesce(ss.score_per_view, 0)::numeric, 4) as score_per_view_rounded,
+  qs.answer_count,
+  qs.avg_answer_score,
+  al.accept_latency_seconds,
+  ra.last_activity_at,
+  tt.tag_summary,
+  tt.top_tag,
+  qr.close_count,
+  qr.close_reason_ids,
+  qr.is_marked_duplicate,
+  case when qr.is_marked_duplicate = 1 then 'DUP' else 'OK' end as dup_flag,
+  fs.composite_score,
+  row_number() over (order by fs.composite_score desc nulls last, qr.popularity_rank, qr.recency_rank) as overall_rank
+from question_ranked qr
+join posts q on q.id = qr.question_id
+left join owner_enriched oe on oe.question_id = qr.question_id
+left join score_norm ss on ss.question_id = qr.question_id
+left join answer_stats qs on qs.question_id = qr.question_id
+left join accepted_latency al on al.question_id = qr.question_id
+left join recent_activity ra on ra.question_id = qr.question_id
+left join top_tags tt on tt.question_id = qr.question_id
+left join final_scores fs on fs.question_id = qr.question_id
+where (qr.score > ss.score_median or qr.viewcount > 0)
+  and coalesce(oe.reputation, 0) >= 0
+  and (
+    tt.top_tag is null
+    or tt.top_tag not ilike any (array['meta%', 'discussion%', '%thanks%'])
+  )
+  and (
+    qr.close_count is null
+    or qr.close_count < 5
+  )
+  and (
+    qr.last_closed_at is null
+    or qr.last_closed_at < coalesce(ra.last_activity_at, qr.creationdate)
+  )
+order by fs.composite_score desc nulls last, qr.popularity_rank, qr.recency_rank
+limit 250;

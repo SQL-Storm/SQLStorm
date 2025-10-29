@@ -1,0 +1,218 @@
+-- {"query": "7622.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2219} 
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        COUNT(DISTINCT b.Id) AS Badges,
+        COUNT(DISTINCT c.Id) AS Comments,
+        COUNT(DISTINCT v.Id) AS Votes,
+        MAX(p.CreationDate) AS LastPostDate,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS PostRank,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Elite'
+            WHEN u.Reputation >= 1000 THEN 'Veteran'
+            WHEN u.Reputation >= 100 THEN 'Member'
+            ELSE 'Newbie'
+        END AS MembershipTier
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        u.DisplayName AS Author,
+        p.PostTypeId,
+        CASE WHEN p.PostTypeId = 1 THEN p.AnswerCount ELSE 0 END AS AnswerCount,
+        CASE WHEN p.PostTypeId = 1 THEN p.CommentCount ELSE 0 END AS CommentCount,
+        p.Tags,
+        STRING_AGG(tags.TagName, ', ') AS TagList,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS ScoreRank,
+        NTILE(10) OVER (ORDER BY p.Score DESC) AS ScoreDecile
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT Id, unnest(string_to_array(Tags, '><')) AS TagName
+        FROM Posts
+        WHERE Tags IS NOT NULL
+    ) tags ON p.Id = tags.Id
+    WHERE p.Score > 0
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.CreationDate, u.DisplayName, p.PostTypeId, p.AnswerCount, p.CommentCount, p.Tags
+),
+ActivityAnalysis AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT ph.Id) AS HistoryActions,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN ph.Id END) AS ModerationActions,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6) THEN ph.Id END) AS EditActions,
+        STRING_AGG(DISTINCT pht.Name, ', ') AS ActionTypes,
+        AVG(CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN 1 ELSE 0 END) AS ModerationRatio,
+        ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT ph.Id) DESC) AS ActivityRank
+    FROM Users u
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    LEFT JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    GROUP BY u.Id, u.DisplayName
+),
+RankedUsers AS (
+    SELECT 
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.Views,
+        us.UpVotes,
+        us.DownVotes,
+        us.TotalPosts,
+        us.Questions,
+        us.Answers,
+        us.Badges,
+        us.Comments,
+        us.Votes,
+        us.LastPostDate,
+        us.ReputationRank,
+        us.PostRank,
+        us.MembershipTier,
+        aa.HistoryActions,
+        aa.ModerationActions,
+        aa.EditActions,
+        aa.ActionTypes,
+        aa.ModerationRatio,
+        aa.ActivityRank,
+        DENSE_RANK() OVER (ORDER BY us.Reputation + us.Views + us.UpVotes - us.DownVotes DESC) AS CombinedRank,
+        CASE 
+            WHEN us.Reputation > (SELECT AVG(Reputation) FROM Users) AND us.TotalPosts > 100 THEN 'High Performer'
+            WHEN us.Reputation > (SELECT AVG(Reputation) FROM Users) THEN 'Above Average'
+            WHEN us.Reputation < (SELECT AVG(Reputation) FROM Users) THEN 'Below Average'
+            ELSE 'Average'
+        END AS PerformanceLevel,
+        CASE 
+            WHEN us.Questions > 50 AND us.Answers > 200 THEN 'Question Master'
+            WHEN us.Questions > 30 OR us.Answers > 100 THEN 'Active Contributor'
+            ELSE 'Regular User'
+        END AS ContributionLevel
+    FROM UserStats us
+    JOIN ActivityAnalysis aa ON us.UserId = aa.UserId
+)
+SELECT 
+    ru.UserId,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.Views,
+    ru.UpVotes,
+    ru.DownVotes,
+    ru.TotalPosts,
+    ru.Questions,
+    ru.Answers,
+    ru.Badges,
+    ru.Comments,
+    ru.Votes,
+    ru.LastPostDate,
+    ru.ReputationRank,
+    ru.PostRank,
+    ru.MembershipTier,
+    ru.HistoryActions,
+    ru.ModerationActions,
+    ru.EditActions,
+    ru.ActionTypes,
+    ru.ModerationRatio,
+    ru.ActivityRank,
+    ru.CombinedRank,
+    ru.PerformanceLevel,
+    ru.ContributionLevel,
+    CASE 
+        WHEN ru.TotalPosts > 0 THEN ROUND((ru.Answers * 100.0 / NULLIF(ru.TotalPosts, 0)), 2)
+        ELSE 0
+    END AS AnswerRatio,
+    CASE 
+        WHEN ru.QuestionCount > 0 THEN ROUND((ru.Views * 1.0 / NULLIF(ru.QuestionCount, 0)), 0)
+        ELSE NULL
+    END AS AvgViewsPerQuestion,
+    CASE 
+        WHEN ru.Score > 0 THEN ROW_NUMBER() OVER (ORDER BY ru.Score DESC)
+        ELSE NULL
+    END AS ScoreRankBasedOnUser,
+    NULLIF(
+        (SELECT COUNT(*) FROM TopPosts tp WHERE tp.PostId IN (
+            SELECT p.Id FROM Posts p WHERE p.OwnerUserId = ru.UserId
+        )),
+        0
+    ) AS TopPostsCount,
+    STRING_AGG(
+        CASE 
+            WHEN tp.ScoreRank <= 5 THEN tp.Title || ' (' || tp.Score || ')'
+            ELSE NULL
+        END,
+        ', '
+    ) AS Top5Posts,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = ru.UserId AND p.PostTypeId = 1) AS QuestionCount,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = ru.UserId AND p.PostTypeId = 2) AS AnswerCount,
+    (SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = ru.UserId AND p.PostTypeId = 1) AS AvgQuestionScore,
+    (SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = ru.UserId AND p.PostTypeId = 2) AS AvgAnswerScore,
+    (SELECT MAX(p.CreationDate) FROM Posts p WHERE p.OwnerUserId = ru.UserId) AS LastActivityDate,
+    CASE 
+        WHEN ru.Reputation > 20000 THEN 1
+        WHEN ru.Reputation > 10000 THEN 2
+        WHEN ru.Reputation > 5000 THEN 3
+        WHEN ru.Reputation > 1000 THEN 4
+        ELSE 5
+    END AS ReputationTierLevel,
+    COALESCE(
+        (SELECT AVG(p.Score) FROM Posts p 
+         WHERE p.OwnerUserId = ru.UserId 
+         AND p.CreationDate >= DATEADD(month, -3, GETDATE())), 
+        0
+    ) AS RecentAvgScore,
+    (SELECT COUNT(DISTINCT p.Id) FROM Posts p 
+     WHERE p.OwnerUserId = ru.UserId 
+     AND p.CreationDate >= DATEADD(year, -1, GETDATE())) AS PostsLastYear,
+    CASE 
+        WHEN (SELECT COUNT(DISTINCT p.Id) FROM Posts p 
+              WHERE p.OwnerUserId = ru.UserId 
+              AND p.CreationDate >= DATEADD(year, -1, GETDATE())) > 0 THEN 
+            ROUND(
+                (SELECT AVG(p.ViewCount) FROM Posts p 
+                 WHERE p.OwnerUserId = ru.UserId 
+                 AND p.CreationDate >= DATEADD(year, -1, GETDATE())), 
+                0
+            )
+        ELSE 0
+    END AS AvgViewsLastYear,
+    NULLIF(
+        (SELECT SUM(p.ViewCount) FROM Posts p 
+         WHERE p.OwnerUserId = ru.UserId 
+         AND p.CreationDate >= DATEADD(year, -1, GETDATE())), 
+        0
+    ) AS TotalViewsLastYear,
+    (SELECT STRING_AGG(DISTINCT p.PostTypeId::text, ', ') 
+     FROM Posts p 
+     WHERE p.OwnerUserId = ru.UserId) AS PostTypesUsed,
+    (SELECT COUNT(DISTINCT c.Id) FROM Comments c 
+     WHERE c.UserId = ru.UserId 
+     AND c.CreationDate >= DATEADD(month, -6, GETDATE())) AS RecentComments
+FROM RankedUsers ru
+LEFT JOIN TopPosts tp ON ru.UserId = (SELECT OwnerUserId FROM Posts WHERE Id = tp.PostId)
+WHERE ru.Reputation > 0
+GROUP BY 
+    ru.UserId, ru.DisplayName, ru.Reputation, ru.Views, ru.UpVotes, ru.DownVotes,
+    ru.TotalPosts, ru.Questions, ru.Answers, ru.Badges, ru.Comments, ru.Votes,
+    ru.LastPostDate, ru.ReputationRank, ru.PostRank, ru.MembershipTier,
+    ru.HistoryActions, ru.ModerationActions, ru.EditActions, ru.ActionTypes,
+    ru.ModerationRatio, ru.ActivityRank, ru.CombinedRank, ru.PerformanceLevel,
+    ru.ContributionLevel
+ORDER BY ru.CombinedRank, ru.Reputation DESC
+LIMIT 1000;

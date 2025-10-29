@@ -1,0 +1,215 @@
+-- {"query": "4012.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2240} 
+
+WITH
+  RankedPosts AS (
+    SELECT
+      p.Id AS PostId,
+      p.OwnerUserId,
+      p.Title,
+      p.Score,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      p.ClosedDate,
+      p.CreationDate AS PostCreationDate,
+      ROW_NUMBER() OVER (
+        PARTITION BY
+          p.OwnerUserId
+        ORDER BY
+          p.Score DESC,
+          p.FavoriteCount DESC,
+          p.AnswerCount DESC
+      ) AS rn_user_best_post,
+      AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS avg_user_score,
+      COUNT(c.Id) OVER (PARTITION BY p.OwnerUserId) AS user_comment_count,
+      SUM(p.ViewCount) OVER (PARTITION BY p.OwnerUserId) AS total_user_views,
+      CASE
+        WHEN p.ClosedDate IS NOT NULL THEN 1
+        ELSE 0
+      END AS is_closed_flag
+    FROM Posts AS p
+    LEFT JOIN Comments AS c
+      ON p.Id = c.PostId
+    WHERE
+      p.PostTypeId = 1
+    GROUP BY
+      p.Id,
+      p.OwnerUserId,
+      p.Title,
+      p.Score,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      p.ClosedDate,
+      p.CreationDate
+  ),
+  UserPostStats AS (
+    SELECT
+      OwnerUserId,
+      COUNT(PostId) AS total_posts,
+      SUM(CASE WHEN is_closed_flag = 1 THEN 1 ELSE 0 END) AS closed_posts_count,
+      AVG(score) AS avg_post_score,
+      MAX(score) AS max_post_score,
+      AVG(AnswerCount) AS avg_answer_count,
+      MAX(AnswerCount) AS max_answer_count,
+      SUM(FavoriteCount) AS total_favorite_count,
+      MAX(PostCreationDate) AS latest_post_date,
+      MIN(PostCreationDate) AS earliest_post_date,
+      (
+        SELECT
+          COUNT(*)
+        FROM Votes AS v
+        WHERE
+          v.UserId = rp.OwnerUserId AND v.VoteTypeId = 2
+      ) AS total_upvotes,
+      (
+        SELECT
+          COUNT(*)
+        FROM Votes AS v
+        WHERE
+          v.UserId = rp.OwnerUserId AND v.VoteTypeId = 3
+      ) AS total_downvotes,
+      AVG(total_user_views) AS overall_avg_views,
+      AVG(user_comment_count) AS overall_avg_comments
+    FROM RankedPosts AS rp
+    GROUP BY
+      OwnerUserId
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate AS UserCreationDate,
+      u.Views AS UserViews,
+      ups.total_posts,
+      ups.closed_posts_count,
+      ups.avg_post_score,
+      ups.max_post_score,
+      ups.avg_answer_count,
+      ups.max_answer_count,
+      ups.total_favorite_count,
+      ups.latest_post_date,
+      ups.earliest_post_date,
+      ups.total_upvotes,
+      ups.total_downvotes,
+      ups.overall_avg_views,
+      ups.overall_avg_comments,
+      rp.Title AS best_post_title,
+      rp.Score AS best_post_score,
+      rp.AnswerCount AS best_post_answer_count,
+      rp.CommentCount AS best_post_comment_count,
+      rp.FavoriteCount AS best_post_favorite_count,
+      rp.is_closed_flag AS best_post_is_closed,
+      DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS reputation_rank,
+      ROW_NUMBER() OVER (ORDER BY u.CreationDate ASC) AS user_creation_order
+    FROM Users AS u
+    JOIN UserPostStats AS ups
+      ON u.Id = ups.OwnerUserId
+    LEFT JOIN RankedPosts AS rp
+      ON u.Id = rp.OwnerUserId AND rp.rn_user_best_post = 1
+    WHERE
+      ups.total_posts > 10 AND u.Reputation > 1000
+  )
+SELECT
+  ua.UserId,
+  ua.DisplayName,
+  ua.Reputation,
+  ua.UserCreationDate,
+  ua.UserViews,
+  ua.total_posts,
+  ua.closed_posts_count,
+  ua.avg_post_score,
+  ua.max_post_score,
+  ua.avg_answer_count,
+  ua.max_answer_count,
+  ua.total_favorite_count,
+  ua.latest_post_date,
+  ua.earliest_post_date,
+  ua.total_upvotes,
+  ua.total_downvotes,
+  ua.overall_avg_views,
+  ua.overall_avg_comments,
+  ua.best_post_title,
+  ua.best_post_score,
+  ua.best_post_answer_count,
+  ua.best_post_comment_count,
+  ua.best_post_favorite_count,
+  ua.best_post_is_closed,
+  ua.reputation_rank,
+  ua.user_creation_order,
+  pht.Name AS last_post_history_type,
+  ph.CreationDate AS last_post_history_date,
+  ph.Comment AS last_post_history_comment,
+  COALESCE(u_last_edit.DisplayName, ph.UserDisplayName) AS last_editor_display_name,
+  CASE
+    WHEN ua.Reputation > 50000 THEN 'High Reputation'
+    WHEN ua.Reputation BETWEEN 10000 AND 50000 THEN 'Medium Reputation'
+    ELSE 'Low Reputation'
+  END AS reputation_category,
+  CASE
+    WHEN ua.total_posts > 100 THEN 'Prolific Contributor'
+    WHEN ua.total_posts > 20 THEN 'Active Contributor'
+    ELSE 'New Contributor'
+  END AS post_contribution_level,
+  SUBSTRING(ua.DisplayName, 1, 3) AS display_name_prefix,
+  LAG(ua.Reputation, 1, 0) OVER (ORDER BY ua.UserCreationDate) AS previous_user_reputation,
+  LEAD(ua.Reputation, 1, 0) OVER (ORDER BY ua.UserCreationDate) AS next_user_reputation,
+  ROW_NUMBER() OVER (ORDER BY ua.total_posts DESC) AS posts_desc_rank,
+  RANK() OVER (ORDER BY ua.total_favorite_count DESC) AS favorite_count_rank,
+  DENSE_RANK() OVER (ORDER BY ua.latest_post_date DESC) AS latest_activity_rank,
+  COUNT(*) OVER () AS total_users_in_result
+FROM UserActivity AS ua
+LEFT JOIN PostHistory AS ph
+  ON ua.UserId = ph.UserId
+LEFT JOIN PostHistoryTypes AS pht
+  ON ph.PostHistoryTypeId = pht.Id
+LEFT JOIN Users AS u_last_edit
+  ON ph.UserId = u_last_edit.Id
+WHERE
+  ph.PostId IN (
+    SELECT
+      Id
+    FROM Posts
+    WHERE
+      OwnerUserId = ua.UserId
+  )
+  AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 22, 24, 25, 31, 33, 34, 35, 36, 37, 38, 50, 52, 53, 66)
+  AND ph.CreationDate > ua.earliest_post_date
+GROUP BY
+  ua.UserId,
+  ua.DisplayName,
+  ua.Reputation,
+  ua.UserCreationDate,
+  ua.UserViews,
+  ua.total_posts,
+  ua.closed_posts_count,
+  ua.avg_post_score,
+  ua.max_post_score,
+  ua.avg_answer_count,
+  ua.max_answer_count,
+  ua.total_favorite_count,
+  ua.latest_post_date,
+  ua.earliest_post_date,
+  ua.total_upvotes,
+  ua.total_downvotes,
+  ua.overall_avg_views,
+  ua.overall_avg_comments,
+  ua.best_post_title,
+  ua.best_post_score,
+  ua.best_post_answer_count,
+  ua.best_post_comment_count,
+  ua.best_post_favorite_count,
+  ua.best_post_is_closed,
+  ua.reputation_rank,
+  ua.user_creation_order,
+  pht.Name,
+  ph.CreationDate,
+  ph.Comment,
+  last_editor_display_name
+HAVING
+  COUNT(ph.Id) > 5
+ORDER BY
+  ua.Reputation DESC,
+  ua.total_posts DESC,
+  ua.latest_post_date DESC;

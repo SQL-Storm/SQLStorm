@@ -1,0 +1,264 @@
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate AS UserLastAccessDate,
+        COALESCE(SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END), 0) AS TotalQuestionsAsked,
+        COALESCE(SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END), 0) AS TotalAnswersGiven,
+        COALESCE(COUNT(DISTINCT P.Id), 0) AS TotalPosts,
+        COALESCE(COUNT(DISTINCT C.Id), 0) AS TotalCommentsMade,
+        COALESCE(SUM(P.Score), 0) AS TotalPostScore,
+        COALESCE(SUM(V.BountyAmount), 0) AS TotalBountySpent,
+        MAX(COALESCE(P.LastActivityDate, P.CreationDate, C.CreationDate)) AS LatestActivityDate,
+        AVG(CASE WHEN P.PostTypeId = 2 THEN P.Score ELSE NULL END) AS AvgAnswerScore,
+        CAST(COUNT(CASE WHEN P.PostTypeId = 2 AND P.Id = PP.AcceptedAnswerId THEN 1 ELSE NULL END) AS NUMERIC) /
+        NULLIF(COUNT(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE NULL END), 0) AS AcceptedAnswerRatio,
+        (
+            SELECT COUNT(DISTINCT TRIM(SUBSTRING(tag, 1, 35)))
+            FROM (
+                SELECT unnest(string_to_array(SUBSTRING(QP.Tags FROM 2 FOR (char_length(QP.Tags) - 2)), '><')) AS tag
+                FROM Posts AS QP
+                WHERE QP.OwnerUserId = U.Id AND QP.PostTypeId = 1 AND QP.Tags IS NOT NULL
+            ) t
+        ) AS UniqueTagsAskedCount,
+        U.UpVotes - U.DownVotes AS NetUserVotes
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    LEFT JOIN Votes AS V ON U.Id = V.UserId AND V.VoteTypeId IN (8, 9)
+    LEFT JOIN Posts AS PP ON P.ParentId = PP.Id
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.UpVotes, U.DownVotes
+),
+PostHistoryAggregates AS (
+    SELECT
+        PH.PostId,
+        COUNT(DISTINCT PH.Id) AS TotalHistoryEvents,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS TotalEdits,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS TotalClosedEvents,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS TotalReopenedEvents,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN CRC.Name ELSE NULL END) AS LastCloseReason,
+        COUNT(DISTINCT PH.UserId) AS UniqueEditors,
+        MAX(PH.CreationDate) AS LastHistoryEventDate,
+        (
+            SELECT sub_U.Reputation
+            FROM PostHistory AS sub_PH
+            JOIN Users AS sub_U ON sub_PH.UserId = sub_U.Id
+            WHERE sub_PH.PostId = PH.PostId AND sub_PH.PostHistoryTypeId = 5
+            ORDER BY sub_PH.CreationDate DESC
+            LIMIT 1
+        ) AS LastBodyEditorReputation,
+        EXTRACT(EPOCH FROM (MAX(CASE WHEN PH.PostHistoryTypeId IN (4,5,6) THEN PH.CreationDate ELSE NULL END) - MIN(CASE WHEN PH.PostHistoryTypeId IN (4,5,6) THEN PH.CreationDate ELSE NULL END))) / (60 * 60 * 24) AS DaysBetweenFirstAndLastEdit
+    FROM PostHistory AS PH
+    LEFT JOIN CloseReasonTypes AS CRC ON PH.PostHistoryTypeId = 10 AND PH.Comment = CAST(CRC.Id AS VARCHAR)
+    GROUP BY PH.PostId
+),
+QuestionScoresAndActivity AS (
+    SELECT
+        Q.Id AS QuestionId,
+        Q.OwnerUserId,
+        Q.Title,
+        Q.Tags,
+        Q.ViewCount,
+        Q.Score AS QuestionScore,
+        Q.CreationDate AS QuestionCreationDate,
+        Q.LastActivityDate AS QuestionLastActivityDate,
+        Q.AnswerCount,
+        Q.CommentCount,
+        Q.FavoriteCount,
+        Q.ClosedDate,
+        COUNT(DISTINCT A.Id) AS ActualAnswerCount,
+        AVG(A.Score) AS AvgAnswerScore,
+        MAX(A.CreationDate) AS LastAnswerDate,
+        COUNT(DISTINCT Q_C.Id) AS QuestionCommentCount,
+        COUNT(DISTINCT Q_C.UserId) AS UniqueCommentersOnQuestion,
+        ROW_NUMBER() OVER (PARTITION BY Q.OwnerUserId ORDER BY Q.Score * Q.ViewCount DESC NULLS LAST, Q.CreationDate DESC) AS QuestionRankByEngagement,
+        (Q.Body ILIKE '%performance%' OR Q.Body ILIKE '%optimization%' OR Q.Body ILIKE '%benchmark%') AS HasPerformanceKeywords,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - Q.CreationDate)) / (60 * 60 * 24) AS DaysSinceCreation,
+        LAG(Q.AcceptedAnswerId, 1, 0) OVER (PARTITION BY Q.OwnerUserId ORDER BY Q.CreationDate) AS PreviousAcceptedAnswerId
+    FROM Posts AS Q
+    LEFT JOIN Posts AS A ON Q.Id = A.ParentId AND A.PostTypeId = 2
+    LEFT JOIN Comments AS Q_C ON Q.Id = Q_C.PostId
+    WHERE Q.PostTypeId = 1
+    GROUP BY Q.Id, Q.OwnerUserId, Q.Title, Q.Tags, Q.ViewCount, Q.Score, Q.CreationDate, Q.LastActivityDate, Q.AnswerCount, Q.CommentCount, Q.FavoriteCount, Q.ClosedDate, Q.Body
+),
+AnswerEngagement AS (
+    SELECT
+        A.Id AS AnswerId,
+        A.ParentId AS QuestionId,
+        A.OwnerUserId,
+        A.Score AS AnswerScore,
+        A.CreationDate AS AnswerCreationDate,
+        A.LastActivityDate AS AnswerLastActivityDate,
+        A.CommentCount AS AnswerCommentCount,
+        P.AcceptedAnswerId AS IsAcceptedAnswer,
+        RANK() OVER (PARTITION BY A.ParentId ORDER BY A.Score DESC, A.CreationDate ASC) AS AnswerRankInQuestion,
+        (A.Body ILIKE '%solution%' OR A.Body ILIKE '%example%' OR A.Body ILIKE '%code%') AS HasSolutionKeywords,
+        (
+            SELECT COUNT(B.Id)
+            FROM Badges AS B
+            JOIN Tags AS T ON B.Name = T.TagName
+            WHERE B.UserId = A.OwnerUserId AND B.Class = 1 AND A.ParentId IS NOT NULL AND P.Tags LIKE '%' || T.TagName || '%'
+        ) AS GoldBadgesForParentTags
+    FROM Posts AS A
+    JOIN Posts AS P ON A.ParentId = P.Id
+    WHERE A.PostTypeId = 2
+),
+BadgeInfo AS (
+    SELECT
+        B.UserId,
+        COUNT(CASE WHEN B.Class = 1 THEN 1 ELSE NULL END) AS GoldBadges,
+        COUNT(CASE WHEN B.Class = 2 THEN 1 ELSE NULL END) AS SilverBadges,
+        COUNT(CASE WHEN B.Class = 3 THEN 1 ELSE NULL END) AS BronzeBadges,
+        SUM(CASE WHEN B.TagBased = TRUE THEN 1 ELSE 0 END) AS TagBasedBadges
+    FROM Badges AS B
+    GROUP BY B.UserId
+),
+TopTagsSummary AS (
+    SELECT
+        TRIM(SUBSTRING(tag FROM 1 FOR 35)) AS TagName,
+        COUNT(DISTINCT Q.Id) AS QuestionsWithTag,
+        SUM(Q.ViewCount) AS TotalTagViewCount
+    FROM (
+        SELECT Q.Id, Q.ViewCount, unnest(string_to_array(SUBSTRING(Q.Tags FROM 2 FOR (char_length(Q.Tags)-2)), '><')) AS tag
+        FROM Posts AS Q
+        WHERE Q.PostTypeId = 1 AND Q.Tags IS NOT NULL
+    ) t
+    GROUP BY TagName
+    HAVING COUNT(DISTINCT t.Id) >= 50
+    ORDER BY TotalTagViewCount DESC
+    LIMIT 10
+)
+SELECT
+    UE.UserId,
+    UE.DisplayName,
+    UE.Reputation,
+    'Question' AS PostType,
+    QS.QuestionId AS PostId,
+    QS.Title AS PostTitle,
+    QS.QuestionScore AS PostScore,
+    QS.ViewCount AS PostViewCount,
+    QS.QuestionCreationDate AS PostCreationDate,
+    QS.QuestionLastActivityDate AS PostLastActivityDate,
+    QS.ClosedDate,
+    UE.TotalQuestionsAsked AS UserTotalPostsOfType,
+    UE.TotalAnswersGiven AS UserTotalOtherPostsOfType,
+    UE.AvgAnswerScore AS UserAvgAnswerScore,
+    BI.GoldBadges,
+    BI.SilverBadges,
+    BI.BronzeBadges,
+    PHA.TotalEdits AS PostTotalEdits,
+    PHA.TotalClosedEvents,
+    PHA.TotalReopenedEvents,
+    PHA.LastCloseReason,
+    PHA.LastBodyEditorReputation,
+    PHA.DaysBetweenFirstAndLastEdit,
+    QS.ActualAnswerCount AS PostRelatedCount1,
+    QS.FavoriteCount AS PostRelatedCount2,
+    QS.HasPerformanceKeywords AS PostKeywordMatch,
+    QS.DaysSinceCreation AS PostAgeDays,
+    QS.QuestionRankByEngagement AS PostRank,
+    (UE.TotalPostScore * 0.5) + (UE.TotalQuestionsAsked * 10) + (UE.TotalAnswersGiven * 5) + (UE.TotalCommentsMade * 0.1) AS UserEngagementScore,
+    (QS.QuestionScore * 2) + (COALESCE(QS.ActualAnswerCount, 0) * 5) + (QS.FavoriteCount * 3) - (COALESCE(PHA.TotalClosedEvents,0) * 50) + (COALESCE(PHA.TotalReopenedEvents,0) * 25) AS PostHealthScore,
+    COALESCE(SUBSTRING(QS.Tags FROM 2 FOR LEAST(50, char_length(QS.Tags)-2)), 'NO_TAGS') AS FirstTagsSnippet,
+    CASE
+        WHEN BI.GoldBadges IS NOT NULL AND PHA.TotalEdits IS NOT NULL AND BI.GoldBadges > PHA.TotalEdits THEN 'HighAchievementLowEdits'
+        WHEN BI.GoldBadges IS NULL AND BI.SilverBadges IS NULL AND BI.BronzeBadges IS NULL THEN 'NoBadges'
+        ELSE 'Mixed'
+    END AS UserAchievementProfile,
+    CASE
+        WHEN QS.QuestionScore > 100 AND QS.ViewCount > 5000 AND QS.ActualAnswerCount >= 5 AND QS.ClosedDate IS NULL
+             AND (SELECT COUNT(*) FROM TopTagsSummary TTS WHERE QS.Tags LIKE '%' || TTS.TagName || '%') > 0
+        THEN 'HotQuestion'
+        WHEN QS.QuestionScore > 50 AND QS.ViewCount > 1000 AND QS.ActualAnswerCount >= 2 AND QS.ClosedDate IS NULL
+        THEN 'ActiveQuestion'
+        WHEN QS.ClosedDate IS NOT NULL AND COALESCE(PHA.TotalClosedEvents,0) > COALESCE(PHA.TotalReopenedEvents,0) THEN 'ClosedButTroubled'
+        ELSE 'Regular'
+    END AS PostStatusCategory,
+    QS.PreviousAcceptedAnswerId AS RelatedPostId
+FROM UserEngagement AS UE
+LEFT JOIN BadgeInfo AS BI ON UE.UserId = BI.UserId
+INNER JOIN QuestionScoresAndActivity AS QS ON UE.UserId = QS.OwnerUserId
+LEFT JOIN PostHistoryAggregates AS PHA ON QS.QuestionId = PHA.PostId
+WHERE
+    UE.Reputation > 1000
+    AND QS.QuestionRankByEngagement = 1
+    AND QS.DaysSinceCreation BETWEEN 30 AND 365 * 5
+    AND (
+        (QS.HasPerformanceKeywords AND QS.QuestionScore > 20 AND QS.ActualAnswerCount > 2)
+        OR
+        (QS.FavoriteCount >= 10 AND QS.ViewCount > 500)
+    )
+    AND (PHA.TotalClosedEvents IS NULL OR PHA.TotalClosedEvents < 3)
+    AND (UE.AcceptedAnswerRatio IS NULL OR UE.AcceptedAnswerRatio > 0.1)
+    AND (PHA.LastBodyEditorReputation IS NULL OR PHA.LastBodyEditorReputation > UE.Reputation * 0.8)
+    AND NOT EXISTS (
+        SELECT 1
+        FROM PostLinks PL
+        WHERE PL.PostId = QS.QuestionId AND PL.LinkTypeId = 3
+    )
+    AND QS.OwnerUserId IS NOT NULL
+UNION ALL
+SELECT
+    UE.UserId,
+    UE.DisplayName,
+    UE.Reputation,
+    'Answer' AS PostType,
+    AE.AnswerId AS PostId,
+    SUBSTRING(A.Body FROM 1 FOR 100) AS PostTitle,
+    AE.AnswerScore AS PostScore,
+    NULL AS PostViewCount,
+    AE.AnswerCreationDate AS PostCreationDate,
+    AE.AnswerLastActivityDate AS PostLastActivityDate,
+    NULL AS ClosedDate,
+    UE.TotalAnswersGiven AS UserTotalPostsOfType,
+    UE.TotalQuestionsAsked AS UserTotalOtherPostsOfType,
+    UE.AvgAnswerScore AS UserAvgAnswerScore,
+    BI.GoldBadges,
+    BI.SilverBadges,
+    BI.BronzeBadges,
+    PHA.TotalEdits AS PostTotalEdits,
+    PHA.TotalClosedEvents,
+    PHA.TotalReopenedEvents,
+    PHA.LastCloseReason,
+    PHA.LastBodyEditorReputation,
+    PHA.DaysBetweenFirstAndLastEdit,
+    AE.AnswerCommentCount AS PostRelatedCount1,
+    AE.GoldBadgesForParentTags AS PostRelatedCount2,
+    AE.HasSolutionKeywords AS PostKeywordMatch,
+    EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - AE.AnswerCreationDate)) / (60 * 60 * 24) AS PostAgeDays,
+    AE.AnswerRankInQuestion AS PostRank,
+    (UE.TotalPostScore * 0.5) + (UE.TotalQuestionsAsked * 10) + (UE.TotalAnswersGiven * 5) + (UE.TotalCommentsMade * 0.1) AS UserEngagementScore,
+    (AE.AnswerScore * 3) + (COALESCE(AE.AnswerCommentCount, 0) * 0.5) + (CASE WHEN AE.IsAcceptedAnswer IS NOT NULL THEN 100 ELSE 0 END) AS PostHealthScore,
+    COALESCE(SUBSTRING(P.Tags FROM 2 FOR LEAST(50, char_length(P.Tags)-2)), 'NO_TAGS') AS FirstTagsSnippet,
+    CASE
+        WHEN BI.GoldBadges IS NOT NULL AND PHA.TotalEdits IS NOT NULL AND BI.GoldBadges > PHA.TotalEdits THEN 'HighAchievementLowEdits'
+        WHEN BI.GoldBadges IS NULL AND BI.SilverBadges IS NULL AND BI.BronzeBadges IS NULL THEN 'NoBadges'
+        ELSE 'Mixed'
+    END AS UserAchievementProfile,
+    CASE
+        WHEN AE.AnswerScore > 50 AND AE.AnswerRankInQuestion = 1 AND AE.IsAcceptedAnswer IS NOT NULL
+        THEN 'TopAcceptedAnswer'
+        WHEN AE.AnswerScore > 20 AND AE.HasSolutionKeywords
+        THEN 'ValuableAnswer'
+        ELSE 'StandardAnswer'
+    END AS PostStatusCategory,
+    AE.QuestionId AS RelatedPostId
+FROM UserEngagement AS UE
+LEFT JOIN BadgeInfo AS BI ON UE.UserId = BI.UserId
+INNER JOIN AnswerEngagement AS AE ON UE.UserId = AE.OwnerUserId
+LEFT JOIN PostHistoryAggregates AS PHA ON AE.AnswerId = PHA.PostId
+LEFT JOIN Posts AS A ON AE.AnswerId = A.Id
+LEFT JOIN Posts AS P ON AE.QuestionId = P.Id
+WHERE
+    UE.Reputation > 5000
+    AND AE.AnswerScore > 10
+    AND AE.AnswerRankInQuestion <= 3
+    AND (AE.IsAcceptedAnswer IS NOT NULL OR AE.AnswerScore > 25)
+    AND (PHA.TotalEdits IS NULL OR PHA.TotalEdits < 5)
+    AND AE.OwnerUserId IS NOT NULL
+ORDER BY
+    PostHealthScore DESC,
+    UserEngagementScore DESC
+LIMIT 2000;

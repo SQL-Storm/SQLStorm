@@ -1,0 +1,224 @@
+-- {"query": "7923.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1933} 
+WITH PostStats AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Title,
+        p.Tags,
+        p.Body,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as UserPostRank,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) as TotalPostsByUser,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as AvgScoreByUser,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PrevScore,
+        CASE 
+            WHEN p.Score > (SELECT AVG(Score) FROM Posts) THEN 'AboveAvg'
+            WHEN p.Score < (SELECT AVG(Score) FROM Posts) THEN 'BelowAvg'
+            ELSE 'Avg'
+        END as ScoreCategory,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags != '' THEN
+                ARRAY_LENGTH(string_to_array(trim(trim(p.Tags, '<'), '>'), '><'), 1)
+            ELSE 0 
+        END as TagCount,
+        COALESCE(p.AnswerCount, 0) + COALESCE(p.CommentCount, 0) as EngagementCount,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            WHEN p.PostTypeId = 4 THEN 'TagWikiExcerpt'
+            WHEN p.PostTypeId = 5 THEN 'TagWiki'
+            ELSE 'Other'
+        END as PostTypeDesc,
+        CASE 
+            WHEN p.LastActivityDate > p.CreationDate AND 
+                 EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate)) > 86400 
+            THEN 'Active'
+            ELSE 'Inactive'
+        END as ActivityStatus
+    FROM Posts p
+),
+UserEngagement AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.ViewCount as UserViewCount,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(ps.Id) as PostsCreated,
+        SUM(ps.Score) as TotalScore,
+        AVG(ps.Score) as AvgScore,
+        MAX(ps.ViewCount) as MaxView,
+        SUM(ps.AnswerCount) as TotalAnswers,
+        SUM(ps.CommentCount) as TotalComments,
+        SUM(ps.FavoriteCount) as TotalFavorites,
+        MIN(ps.CreationDate) as FirstPostDate,
+        MAX(ps.CreationDate) as LastPostDate,
+        CASE 
+            WHEN COUNT(ps.Id) > 0 THEN 
+                EXTRACT(EPOCH FROM (MAX(ps.CreationDate) - MIN(ps.CreationDate))) / 86400
+            ELSE 0 
+        END as DaysActive
+    FROM Users u
+    LEFT JOIN PostStats ps ON u.Id = ps.OwnerUserId
+    WHERE ps.Id IS NOT NULL OR u.Id IN (SELECT DISTINCT OwnerUserId FROM Posts WHERE OwnerUserId IS NOT NULL)
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.ViewCount, u.UpVotes, u.DownVotes
+),
+TopTags AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as TagRank,
+        AVG(ps.Score) as AvgScoreOfPosts,
+        COUNT(ps.Id) as PostsWithTag,
+        STRING_AGG(DISTINCT ps.Title, ' | ' ORDER BY ps.Title) as SampleTitles
+    FROM Tags t
+    LEFT JOIN Posts ps ON ps.Tags LIKE '%' || t.TagName || '%'
+    WHERE t.TagName IS NOT NULL AND t.TagName != ''
+    GROUP BY t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId
+),
+ComplexAnalysis AS (
+    SELECT 
+        ps.Id as PostId,
+        ps.Title,
+        ps.Score,
+        ps.ViewCount,
+        ps.OwnerUserId,
+        ps.PostTypeDesc,
+        ps.ScoreCategory,
+        ps.TagCount,
+        ps.EngagementCount,
+        ps.UserPostRank,
+        ps.TotalPostsByUser,
+        ps.AvgScoreByUser,
+        ps.PrevScore,
+        ps.ActivityStatus,
+        ps.CreationDate,
+        ps.LastActivityDate,
+        CASE 
+            WHEN ps.TagCount > 3 THEN 'Many'
+            WHEN ps.TagCount > 1 THEN 'Few'
+            ELSE 'Single'
+        END as TagDensity,
+        CASE 
+            WHEN ps.Score > 0 AND ps.ViewCount > 100 THEN 'Popular'
+            WHEN ps.Score > 0 THEN 'Good'
+            WHEN ps.ViewCount > 100 THEN 'Viewed'
+            ELSE 'Low'
+        END as PostQuality,
+        CASE 
+            WHEN ps.Score > ps.AvgScoreByUser AND ps.TagCount > 2 THEN 'HighValue'
+            WHEN ps.Score <= ps.AvgScoreByUser AND ps.ViewCount > 50 THEN 'AverageValue'
+            ELSE 'BelowAverage'
+        END as ValueRank
+    FROM PostStats ps
+    WHERE ps.OwnerUserId IS NOT NULL AND ps.Title IS NOT NULL AND ps.Title != ''
+),
+UserPerformanceRanking AS (
+    SELECT 
+        ue.UserId,
+        ue.DisplayName,
+        ue.Reputation,
+        ue.PostsCreated,
+        ue.TotalScore,
+        ue.AvgScore,
+        ue.MaxView,
+        ue.TotalAnswers,
+        ue.TotalComments,
+        ue.TotalFavorites,
+        ue.DaysActive,
+        NTILE(5) OVER (ORDER BY ue.TotalScore DESC) as PerformanceTier,
+        NTILE(5) OVER (ORDER BY ue.Reputation DESC) as ReputationTier,
+        CASE 
+            WHEN ue.PostsCreated > 100 THEN 'Veteran'
+            WHEN ue.PostsCreated > 50 THEN 'Experienced'
+            WHEN ue.PostsCreated > 10 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as PostingExperience,
+        CASE 
+            WHEN ue.Reputation > 10000 THEN 'Elite'
+            WHEN ue.Reputation > 5000 THEN 'Expert'
+            WHEN ue.Reputation > 1000 THEN 'Advanced'
+            ELSE 'Basic'
+        END as ReputationLevel
+    FROM UserEngagement ue
+)
+SELECT 
+    ca.PostId,
+    ca.Title,
+    ca.Score,
+    ca.ViewCount,
+    ca.OwnerUserId,
+    ca.PostTypeDesc,
+    ca.ScoreCategory,
+    ca.TagCount,
+    ca.EngagementCount,
+    ca.UserPostRank,
+    ca.TotalPostsByUser,
+    ca.AvgScoreByUser,
+    ca.PrevScore,
+    ca.ActivityStatus,
+    ca.TagDensity,
+    ca.PostQuality,
+    ca.ValueRank,
+    ue.DisplayName as AuthorName,
+    ue.Reputation as AuthorReputation,
+    ue.PostsCreated as AuthorPostCount,
+    ue.TotalScore as AuthorTotalScore,
+    upr.ReputationLevel,
+    upr.PostingExperience,
+    upr.PerformanceTier,
+    upr.ReputationTier,
+    tt.TagName,
+    tt.TagCount as TagUsageCount,
+    tt.AvgScoreOfPosts as TagAvgScore,
+    tt.PostsWithTag as TagPostCount,
+    CASE 
+        WHEN tt.SampleTitles IS NOT NULL THEN 
+            LEFT(tt.SampleTitles, 200) || '...'
+        ELSE 'No Sample Titles'
+    END as SamplePostTitles,
+    CASE 
+        WHEN ca.Score > (SELECT AVG(Score) FROM Posts) AND 
+             ca.ViewCount > (SELECT AVG(ViewCount) FROM Posts WHERE ViewCount IS NOT NULL) AND
+             ca.TagCount > 1
+        THEN 'HighPerforming'
+        WHEN ca.Score > 0 OR ca.ViewCount > 100
+        THEN 'GoodPerforming'
+        ELSE 'BelowAvg'
+    END as PerformanceStatus
+FROM ComplexAnalysis ca
+LEFT JOIN UserEngagement ue ON ca.OwnerUserId = ue.UserId
+LEFT JOIN UserPerformanceRanking upr ON ca.OwnerUserId = upr.UserId
+LEFT JOIN TopTags tt ON tt.TagRank <= 5 AND 
+    EXISTS (
+        SELECT 1 FROM Posts p2
+        WHERE p2.Id = ca.PostId AND 
+              p2.Tags LIKE '%' || tt.TagName || '%'
+    )
+WHERE 
+    (ca.Score > 0 OR ca.ViewCount > 50) AND
+    (ca.TagCount > 0 OR tt.TagName IS NOT NULL) AND
+    (ca.PostTypeDesc IN ('Question', 'Answer') OR ca.PostTypeDesc IS NULL) AND
+    (ue.PostsCreated >= 1 OR ue.UserId IS NULL) AND
+    (
+        SELECT COUNT(*)
+        FROM Posts p3
+        WHERE p3.OwnerUserId = ca.OwnerUserId 
+              AND p3.CreationDate > '2020-01-01'::timestamp
+    ) > 0
+ORDER BY 
+    ca.Score DESC,
+    ca.ViewCount DESC,
+    ca.CreationDate DESC
+LIMIT 5000;

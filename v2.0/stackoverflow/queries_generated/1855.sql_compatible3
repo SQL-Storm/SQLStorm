@@ -1,0 +1,234 @@
+WITH UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadgeCount,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadgeCount,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadgeCount,
+        MAX(b.Date) AS LastBadgeAwardDate,
+        u.Reputation * 1.0 / NULLIF(EXTRACT(EPOCH FROM (u.LastAccessDate - u.CreationDate)) / (24 * 60 * 60), 0) AS RepPerDay,
+        RANK() OVER (ORDER BY u.UpVotes DESC, u.Id) AS UpVoteRank,
+        EXTRACT(DAY FROM (u.CreationDate - LAG(u.CreationDate) OVER (ORDER BY u.CreationDate))) AS DaysSincePrevUser
+    FROM Users AS u
+    LEFT JOIN Posts AS p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments AS c ON u.Id = c.UserId
+    LEFT JOIN Badges AS b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.UpVotes
+    HAVING COUNT(DISTINCT p.Id) > 5 AND u.Reputation > 1000
+),
+PostVersionInfo AS (
+    SELECT
+        ph.PostId,
+        COUNT(ph.Id) AS TotalHistoryEvents,
+        COUNT(DISTINCT ph.UserId) AS UniqueEditors,
+        MAX(ph.CreationDate) AS LastEditOrActivityDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 AND EXISTS (
+                SELECT 1
+                FROM PostHistory ph_reopen
+                WHERE ph_reopen.PostId = ph.PostId
+                  AND ph_reopen.PostHistoryTypeId = 11
+                  AND ph_reopen.CreationDate > ph.CreationDate
+            ) THEN 1 ELSE 0 END) AS WasClosedThenReopened,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 16 THEN 1 ELSE 0 END) AS HasCommunityOwnedHistory
+    FROM PostHistory AS ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6, 10, 11, 16)
+    GROUP BY ph.PostId
+),
+QuestionMetrics AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate AS QuestionCreationDate,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        q.FavoriteCount,
+        q.OwnerUserId,
+        q.AcceptedAnswerId,
+        string_to_array(substring(q.Tags FROM 2 FOR char_length(q.Tags) - 2), '><') AS TagArray,
+        (q.Score * 0.5 + COALESCE(q.FavoriteCount, 0) * 0.8 + COALESCE(q.AnswerCount, 0) * 1.2) * 1.0 / NULLIF(q.ViewCount, 0.01) AS EngagementRatio,
+        CASE
+            WHEN q.AcceptedAnswerId IS NOT NULL THEN 'Accepted'
+            WHEN q.ClosedDate IS NOT NULL THEN 'Closed'
+            ELSE 'Open'
+        END AS QuestionStatus,
+        EXTRACT(DAY FROM (a.CreationDate - q.CreationDate)) AS DaysToAcceptedAnswer,
+        (SELECT AVG(ans.Score) FROM Posts ans WHERE ans.ParentId = q.Id AND ans.PostTypeId = 2) AS AverageAnswerScore,
+        ROW_NUMBER() OVER (PARTITION BY EXTRACT(YEAR FROM q.CreationDate) ORDER BY q.Score DESC, q.ViewCount DESC) AS RankInYear,
+        LEAD(q.CreationDate, 1) OVER (PARTITION BY q.OwnerUserId ORDER BY q.CreationDate) AS NextQuestionDate
+    FROM Posts AS q
+    LEFT JOIN Posts AS a ON q.AcceptedAnswerId = a.Id
+    WHERE q.PostTypeId = 1
+    AND q.CreationDate >= DATE '2020-01-01'
+),
+LinkedPostAnalysis AS (
+    SELECT
+        pl.PostId,
+        COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 1 THEN pl.RelatedPostId END) AS LinkedPostsCount,
+        COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN pl.RelatedPostId END) AS DuplicatePostsCount,
+        MAX(lt.Name) AS PrimaryLinkType
+    FROM PostLinks AS pl
+    JOIN LinkTypes AS lt ON pl.LinkTypeId = lt.Id
+    GROUP BY pl.PostId
+),
+AggregatedTagUsage AS (
+    SELECT
+        t.tag AS TagName,
+        COUNT(DISTINCT qm.QuestionId) AS QuestionsWithTag,
+        SUM(qm.QuestionScore) AS TotalTagScore,
+        AVG(qm.EngagementRatio) AS AvgTagEngagement
+    FROM QuestionMetrics AS qm,
+         UNNEST(qm.TagArray) AS t(tag)
+    GROUP BY t.tag
+    HAVING COUNT(DISTINCT qm.QuestionId) > 50
+),
+BaseQueryResults AS (
+    SELECT
+        qm.QuestionId,
+        ue.DisplayName,
+        ue.Reputation,
+        ue.QuestionCount,
+        ue.AnswerCount,
+        ue.RepPerDay,
+        ue.UpVoteRank,
+        qm.Title,
+        qm.QuestionCreationDate,
+        qm.QuestionScore,
+        qm.ViewCount,
+        qm.AnswerCount AS QuestionAnswerCount,
+        qm.FavoriteCount,
+        qm.QuestionStatus,
+        qm.DaysToAcceptedAnswer,
+        qm.AverageAnswerScore,
+        qm.EngagementRatio,
+        pvi.TotalHistoryEvents,
+        pvi.UniqueEditors,
+        pvi.WasClosedThenReopened,
+        pvi.HasCommunityOwnedHistory,
+        lpa.LinkedPostsCount,
+        lpa.DuplicatePostsCount,
+        (qm.QuestionScore * 0.4 + qm.EngagementRatio * 0.2 + COALESCE(pvi.UniqueEditors, 0) * 0.1 + COALESCE(lpa.LinkedPostsCount, 0) * 0.1 + COALESCE(CASE WHEN pvi.WasClosedThenReopened THEN 1 ELSE 0 END, 0) * 50) AS WeightedImpactScore,
+        COALESCE(ph.Text, 'N/A') AS LastCloseReasonText,
+        COALESCE(ph_reason.Name, 'No Close Reason') AS LastCloseReasonTypeName,
+        at.TagName AS MostPopularTagInQuestion,
+        at.QuestionsWithTag AS TagQuestionCount,
+        at.AvgTagEngagement AS TagEngagementScore,
+        CASE
+            WHEN qm.Title ILIKE '%performance%' OR qm.Title ILIKE '%optimization%' THEN 'Performance-Related'
+            WHEN qm.Title ILIKE '%database%' OR qm.Title ILIKE '%sql%' THEN 'Database-Related'
+            ELSE 'General Tech'
+        END AS QuestionCategory,
+        SUM(CASE WHEN c.CreationDate > qm.QuestionCreationDate AND c.Text ILIKE '%great%' THEN 1 ELSE 0 END) AS PositiveCommentsAfterQuestion,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVoteCountOnQuestion,
+        'HighEngagementQuestion' AS ResultType
+    FROM QuestionMetrics AS qm
+    JOIN UserEngagement AS ue ON qm.OwnerUserId = ue.UserId
+    LEFT JOIN PostVersionInfo AS pvi ON qm.QuestionId = pvi.PostId
+    LEFT JOIN LinkedPostAnalysis AS lpa ON qm.QuestionId = lpa.PostId
+    LEFT JOIN PostHistory AS ph ON qm.QuestionId = ph.PostId AND ph.PostHistoryTypeId = 10 AND ph.CreationDate = pvi.LastEditOrActivityDate
+    LEFT JOIN CloseReasonTypes AS ph_reason ON ph.Comment IS NOT NULL AND ph.Comment ~ '^[0-9]+$' AND ph_reason.Id = CAST(ph.Comment AS INTEGER)
+    LEFT JOIN (
+        SELECT
+            qm_inner.QuestionId,
+            (SELECT a.TagName FROM AggregatedTagUsage a WHERE a.TagName = ANY(qm_inner.TagArray) ORDER BY a.QuestionsWithTag DESC, a.AvgTagEngagement DESC LIMIT 1) AS TagName
+        FROM QuestionMetrics AS qm_inner
+    ) AS top_tag ON qm.QuestionId = top_tag.QuestionId
+    LEFT JOIN AggregatedTagUsage AS at ON top_tag.TagName = at.TagName
+    LEFT JOIN Comments AS c ON qm.QuestionId = c.PostId
+    LEFT JOIN Votes AS v ON qm.QuestionId = v.PostId AND v.VoteTypeId = 2
+    WHERE
+        ue.Reputation > 5000
+        AND ue.GoldBadgeCount >= 1
+        AND qm.QuestionScore > 100
+        AND qm.EngagementRatio > 0.5
+        AND COALESCE(pvi.TotalHistoryEvents, 0) > 5
+        AND COALESCE(pvi.UniqueEditors, 0) > 2
+        AND (lpa.LinkedPostsCount IS NULL OR lpa.LinkedPostsCount > 0)
+        AND NOT (qm.Title ILIKE '%bug%' AND qm.QuestionStatus = 'Closed')
+        AND qm.RankInYear <= 10
+        AND (qm.NextQuestionDate IS NULL OR EXTRACT(DAY FROM (qm.NextQuestionDate - qm.QuestionCreationDate)) < 90)
+    GROUP BY
+        qm.QuestionId, ue.DisplayName, ue.Reputation, ue.QuestionCount, ue.AnswerCount, ue.RepPerDay, ue.UpVoteRank,
+        qm.Title, qm.QuestionCreationDate, qm.QuestionScore, qm.ViewCount, qm.AnswerCount, qm.FavoriteCount,
+        qm.QuestionStatus, qm.DaysToAcceptedAnswer, qm.AverageAnswerScore, qm.EngagementRatio,
+        pvi.TotalHistoryEvents, pvi.UniqueEditors, pvi.WasClosedThenReopened, pvi.HasCommunityOwnedHistory,
+        lpa.LinkedPostsCount, lpa.DuplicatePostsCount,
+        COALESCE(ph.Text, 'N/A'), COALESCE(ph_reason.Name, 'No Close Reason'),
+        at.TagName, at.QuestionsWithTag, at.AvgTagEngagement
+),
+HighRepCommentQuestions AS (
+    SELECT
+        q.Id AS QuestionId,
+        ue.DisplayName,
+        ue.Reputation,
+        ue.QuestionCount,
+        ue.AnswerCount,
+        ue.RepPerDay,
+        ue.UpVoteRank,
+        q.Title,
+        q.CreationDate AS QuestionCreationDate,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.AnswerCount AS QuestionAnswerCount,
+        q.FavoriteCount,
+        CASE
+            WHEN q.AcceptedAnswerId IS NOT NULL THEN 'Accepted'
+            WHEN q.ClosedDate IS NOT NULL THEN 'Closed'
+            ELSE 'Open'
+        END AS QuestionStatus,
+        EXTRACT(DAY FROM (a.CreationDate - q.CreationDate)) AS DaysToAcceptedAnswer,
+        (SELECT AVG(ans.Score) FROM Posts ans WHERE ans.ParentId = q.Id AND ans.PostTypeId = 2) AS AverageAnswerScore,
+        (q.Score * 0.5 + COALESCE(q.FavoriteCount, 0) * 0.8 + COALESCE(q.AnswerCount, 0) * 1.2) * 1.0 / NULLIF(q.ViewCount, 0.01) AS EngagementRatio,
+        COALESCE(pvi.TotalHistoryEvents, 0) AS TotalHistoryEvents,
+        COALESCE(pvi.UniqueEditors, 0) AS UniqueEditors,
+        COALESCE(pvi.WasClosedThenReopened, FALSE) AS WasClosedThenReopened,
+        COALESCE(pvi.HasCommunityOwnedHistory, 0) AS HasCommunityOwnedHistory,
+        COALESCE(lpa.LinkedPostsCount, 0) AS LinkedPostsCount,
+        COALESCE(lpa.DuplicatePostsCount, 0) AS DuplicatePostsCount,
+        (q.Score * 0.3 + ue.Reputation * 0.01 + COUNT(com.Id) * 0.5) AS WeightedImpactScore,
+        COALESCE(ph.Text, 'N/A') AS LastCloseReasonText,
+        COALESCE(ph_reason.Name, 'No Close Reason') AS LastCloseReasonTypeName,
+        (SELECT a.TagName FROM AggregatedTagUsage a WHERE a.TagName = ANY(string_to_array(substring(q.Tags FROM 2 FOR char_length(q.Tags) - 2), '><')) ORDER BY a.QuestionsWithTag DESC, a.AvgTagEngagement DESC LIMIT 1) AS MostPopularTagInQuestion,
+        (SELECT a.QuestionsWithTag FROM AggregatedTagUsage a WHERE a.TagName = ANY(string_to_array(substring(q.Tags FROM 2 FOR char_length(q.Tags) - 2), '><')) ORDER BY a.QuestionsWithTag DESC, a.AvgTagEngagement DESC LIMIT 1) AS TagQuestionCount,
+        (SELECT a.AvgTagEngagement FROM AggregatedTagUsage a WHERE a.TagName = ANY(string_to_array(substring(q.Tags FROM 2 FOR char_length(q.Tags) - 2), '><')) ORDER BY a.QuestionsWithTag DESC, a.AvgTagEngagement DESC LIMIT 1) AS TagEngagementScore,
+        CASE
+            WHEN q.Title ILIKE '%security%' OR q.Title ILIKE '%vulnerability%' THEN 'Security-Related'
+            WHEN q.Title ILIKE '%cloud%' OR q.Title ILIKE '%aws%' OR q.Title ILIKE '%azure%' THEN 'Cloud-Related'
+            ELSE 'Other Tech'
+        END AS QuestionCategory,
+        SUM(CASE WHEN com.CreationDate > q.CreationDate AND com.Text ILIKE '%insightful%' THEN 1 ELSE 0 END) AS PositiveCommentsAfterQuestion,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVoteCountOnQuestion,
+        'HighRepCommentQuestion' AS ResultType
+    FROM Posts AS q
+    JOIN UserEngagement AS ue ON q.OwnerUserId = ue.UserId
+    LEFT JOIN Posts AS a ON q.AcceptedAnswerId = a.Id
+    LEFT JOIN PostVersionInfo AS pvi ON q.Id = pvi.PostId
+    LEFT JOIN LinkedPostAnalysis AS lpa ON q.Id = lpa.PostId
+    LEFT JOIN PostHistory AS ph ON q.Id = ph.PostId AND ph.PostHistoryTypeId = 10 AND ph.CreationDate = pvi.LastEditOrActivityDate
+    LEFT JOIN CloseReasonTypes AS ph_reason ON ph.Comment IS NOT NULL AND ph.Comment ~ '^[0-9]+$' AND ph_reason.Id = CAST(ph.Comment AS INTEGER)
+    LEFT JOIN Comments AS com ON q.Id = com.PostId
+    LEFT JOIN Votes AS v ON q.Id = v.PostId AND v.VoteTypeId = 2
+    WHERE
+        q.PostTypeId = 1
+        AND ue.Reputation > 10000
+        AND q.CommentCount > 20
+        AND q.CreationDate >= DATE '2021-01-01'
+        AND q.Score > 50
+    GROUP BY
+        q.Id, ue.DisplayName, ue.Reputation, ue.QuestionCount, ue.AnswerCount, ue.RepPerDay, ue.UpVoteRank,
+        q.Title, q.CreationDate, q.Score, q.ViewCount, q.AnswerCount, q.FavoriteCount,
+        q.AcceptedAnswerId, q.ClosedDate, a.CreationDate, pvi.TotalHistoryEvents, pvi.UniqueEditors,
+        pvi.WasClosedThenReopened, pvi.HasCommunityOwnedHistory, lpa.LinkedPostsCount, lpa.DuplicatePostsCount,
+        COALESCE(ph.Text, 'N/A'), COALESCE(ph_reason.Name, 'No Close Reason')
+)
+SELECT * FROM BaseQueryResults
+UNION ALL
+SELECT * FROM HighRepCommentQuestions
+ORDER BY WeightedImpactScore DESC, Reputation DESC
+LIMIT 200;

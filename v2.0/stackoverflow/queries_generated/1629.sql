@@ -1,0 +1,256 @@
+-- {"query": "1629.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3951} 
+
+WITH UserEngagement AS (
+    -- CTE 1: Summarizes user activity, including post counts, comment counts, and various vote/badge statistics.
+    -- Features: Outer joins, aggregation, CASE expressions, COALESCE for NULL handling.
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswers,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        SUM(P.Score) AS TotalPostScore,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN P.ViewCount ELSE 0 END) AS TotalQuestionViews,
+        SUM(CASE WHEN P.AcceptedAnswerId IS NOT NULL AND P.OwnerUserId = U.Id THEN 1 ELSE 0 END) AS AcceptedAnswersGiven,
+        SUM(CASE WHEN PA.OwnerUserId = U.Id THEN 1 ELSE 0 END) AS AnswersAcceptedByOthers,
+        COALESCE(SUM(V_Bounty.BountyAmount), 0) AS TotalBountyGiven,
+        COUNT(DISTINCT V_Fav.UserId) AS TotalFavoritesMade,
+        COUNT(B.Id) AS TotalBadges,
+        COUNT(CASE WHEN B.Class = 1 THEN B.Id END) AS GoldBadges,
+        MAX(P.LastActivityDate) AS LastPostActivityDate,
+        MAX(P.CreationDate) AS LastPostCreationDate
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN Votes V_Bounty ON U.Id = V_Bounty.UserId AND V_Bounty.VoteTypeId = 8 -- BountyStart votes
+    LEFT JOIN Votes V_Fav ON U.Id = V_Fav.UserId AND V_Fav.VoteTypeId = 5 -- Favorite votes
+    LEFT JOIN Posts PA ON PA.AcceptedAnswerId = P.Id AND P.PostTypeId = 2 -- To identify answers accepted by others
+    WHERE U.Id IS NOT NULL
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate
+),
+PostVersionHistory AS (
+    -- CTE 2: Tracks significant post history events like closing, reopening, and edits.
+    -- Features: Correlated subqueries, MIN/MAX aggregation, type casting.
+    SELECT
+        PH.PostId,
+        MIN(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.CreationDate END) AS FirstClosedDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 11 THEN PH.CreationDate END) AS LastReopenedDate,
+        (
+            -- Correlated subquery to retrieve the name of the *first* close reason
+            SELECT CR.Name
+            FROM PostHistory PH_Sub
+            JOIN CloseReasonTypes CR ON PH_Sub.Comment::smallint = CR.Id
+            WHERE PH_Sub.PostId = PH.PostId
+              AND PH_Sub.PostHistoryTypeId = 10
+            ORDER BY PH_Sub.CreationDate
+            LIMIT 1
+        ) AS FirstCloseReason,
+        (
+            -- Correlated subquery to retrieve the text of the *first* body edit
+            SELECT PH_Body.Text
+            FROM PostHistory PH_Body
+            WHERE PH_Body.PostId = PH.PostId
+              AND PH_Body.PostHistoryTypeId = 5 -- Edit Body
+            ORDER BY PH_Body.CreationDate
+            LIMIT 1
+        ) AS FirstEditedBodyText,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.Id END) AS TotalEdits,
+        COUNT(DISTINCT PH.UserId) AS DistinctEditors,
+        MAX(PH.CreationDate) AS LastHistoryDate
+    FROM PostHistory PH
+    GROUP BY PH.PostId
+),
+TagAnalysis AS (
+    -- CTE 3: Explodes the 'Tags' string into individual tag names for analysis.
+    -- Features: String expressions (SUBSTRING, LENGTH, string_to_array, UNNEST, TRIM).
+    SELECT
+        P.Id AS PostId,
+        TRIM(UNNEST(string_to_array(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags) - 2), '><'))) AS TagName
+    FROM Posts P
+    WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2
+),
+QuestionTagMetrics AS (
+    -- CTE 4: Aggregates tag-specific information for questions.
+    -- Features: STRING_AGG, aggregation with CASE, LEFT JOIN.
+    SELECT
+        TA.PostId,
+        STRING_AGG(TA.TagName, ', ') AS TagsList,
+        COUNT(DISTINCT TA.TagName) AS UniqueTagCount,
+        SUM(CASE WHEN T.IsModeratorOnly THEN 1 ELSE 0 END) AS ModeratorOnlyTagCount,
+        SUM(CASE WHEN T.IsRequired THEN 1 ELSE 0 END) AS RequiredTagCount
+    FROM TagAnalysis TA
+    LEFT JOIN Tags T ON TA.TagName = T.TagName
+    GROUP BY TA.PostId
+),
+PostComplexity AS (
+    -- CTE 5: Calculates various complexity metrics for posts.
+    -- Features: String functions (LENGTH, REPLACE, CHAR(10)), complex arithmetic, NULLIF, CEIL, CASE expressions.
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.Title,
+        P.Body,
+        LENGTH(P.Body) AS BodyLength,
+        LENGTH(REPLACE(P.Body, ' ', '')) AS BodyLengthNoSpaces,
+        (LENGTH(P.Body) - LENGTH(REPLACE(P.Body, '<pre>', ''))) / LENGTH('<pre>') AS CodeBlockCount,
+        (LENGTH(P.Body) - LENGTH(REPLACE(P.Body, CHAR(10), ''))) AS NewlineCount,
+        CAST((LENGTH(P.Body) - LENGTH(REPLACE(P.Body, '<code>', '')))/LENGTH('<code>') + (LENGTH(P.Body) - LENGTH(REPLACE(P.Body, '<pre>', '')))/LENGTH('<pre>') AS NUMERIC)
+        / NULLIF(CEIL(LENGTH(P.Body) / 100.0), 0) AS CodeDensityPer100Chars,
+        CASE
+            WHEN P.Title LIKE '%SQL%' OR P.Title LIKE '%database%' OR P.Tags LIKE '%<sql>%' OR P.Tags LIKE '%<database>%' THEN 'Database Related'
+            WHEN P.Title LIKE '%javascript%' OR P.Tags LIKE '%<javascript>%' THEN 'Frontend Related'
+            WHEN P.Title LIKE '%python%' OR P.Title LIKE '%java%' OR P.Tags LIKE '%<python>%' OR P.Tags LIKE '%<java>%' THEN 'Backend Related'
+            ELSE 'General Programming'
+        END AS TopicCategory,
+        NULLIF(P.AnswerCount, 0) AS EffectiveAnswerCount
+    FROM Posts P
+),
+PostLinkSummary AS (
+    -- CTE 6: Summarizes linked posts and duplicate status for each post.
+    -- Features: BOOL_OR aggregation, LEFT JOIN.
+    SELECT
+        P.Id AS PostId,
+        COUNT(DISTINCT PL_Linked.RelatedPostId) AS LinkedPostsCount,
+        COUNT(DISTINCT PL_Dup.RelatedPostId) AS DuplicateOfCount,
+        BOOL_OR(PL_Linked.LinkTypeId = 1) AS HasOutgoingLink,
+        BOOL_OR(PL_Dup.LinkTypeId = 3) AS IsDuplicate
+    FROM Posts P
+    LEFT JOIN PostLinks PL_Linked ON P.Id = PL_Linked.PostId AND PL_Linked.LinkTypeId = 1
+    LEFT JOIN PostLinks PL_Dup ON P.Id = PL_Dup.PostId AND PL_Dup.LinkTypeId = 3
+    GROUP BY P.Id
+)
+-- Main Query Branch 1: Focus on "Influential Questions"
+SELECT
+    UE.UserId,
+    UE.DisplayName,
+    UE.Reputation,
+    'Question' AS PostType,
+    P.Id AS PostId,
+    P.Title AS PostTitle,
+    P.CreationDate AS PostCreationDate,
+    P.Score AS PostScore,
+    P.ViewCount AS PostViewCount,
+    PC.BodyLength,
+    PC.CodeBlockCount,
+    PC.TopicCategory,
+    PC.EffectiveAnswerCount,
+    -- Window Function: Rank questions by view count within their primary tag group
+    RANK() OVER (PARTITION BY SUBSTRING(QTM.TagsList FROM 1 FOR POSITION(',' IN QTM.TagsList)-1) ORDER BY P.ViewCount DESC, P.Id) AS RankInPrimaryTagByViews,
+    -- Window Function: Calculate the difference in score between the current question and the previous one by the same user
+    P.Score - LAG(P.Score, 1, 0) OVER (PARTITION BY UE.UserId ORDER BY P.CreationDate) AS ScoreChangeFromPrevPost,
+    COALESCE(PVH.FirstClosedDate, '9999-12-31 23:59:59') AS PostFirstClosedDate,
+    PVH.FirstCloseReason,
+    PVH.TotalEdits,
+    PVH.DistinctEditors,
+    QTM.TagsList,
+    QTM.UniqueTagCount,
+    PLS.LinkedPostsCount,
+    PLS.IsDuplicate,
+    -- Complicated Calculation: Custom "Question Influence Score"
+    CAST(P.Score AS NUMERIC) * 0.7
+    + COALESCE(P.ViewCount, 0) * 0.05
+    + COALESCE(P.AnswerCount, 0) * 2.0
+    + COALESCE(P.FavoriteCount, 0) * 2.5
+    + (SELECT COUNT(C_Sub.Id) FROM Comments C_Sub WHERE C_Sub.PostId = P.Id AND C_Sub.Score > 0) * 1.0
+    + (CASE WHEN PVH.FirstClosedDate IS NULL THEN 1.0 ELSE -2.0 END)
+    + (CASE WHEN PLS.HasOutgoingLink THEN 0.5 ELSE 0.0 END)
+    + (CASE WHEN QTM.RequiredTagCount > 0 THEN 0.2 ELSE 0.0 END)
+    + (CASE WHEN PC.CodeDensityPer100Chars > 0.5 THEN 1.0 ELSE 0.0 END) AS PostInfluenceScore,
+    -- String Expression: Extracts and transforms title/author info
+    SUBSTRING(P.Title, 1, 50) || ' - ' || REVERSE(SUBSTRING(UE.DisplayName, 1, 15)) AS TitleSummaryAndAuthorRef,
+    -- Correlated Subquery: Checks for a late accepted answer (could be a performance hot-spot)
+    P.Id IN (SELECT V.PostId FROM Votes V WHERE V.VoteTypeId = 1 AND V.PostId = P.Id AND V.CreationDate > P.CreationDate + INTERVAL '1 hour' LIMIT 1) AS HasAcceptedAnswerLate
+FROM UserEngagement UE
+LEFT JOIN Posts P ON UE.UserId = P.OwnerUserId
+LEFT JOIN PostVersionHistory PVH ON P.Id = PVH.PostId
+LEFT JOIN PostComplexity PC ON P.Id = PC.PostId
+LEFT JOIN QuestionTagMetrics QTM ON P.Id = QTM.PostId
+LEFT JOIN PostLinkSummary PLS ON P.Id = PLS.PostId
+WHERE
+    P.PostTypeId = 1
+    AND UE.Reputation > 5000
+    AND P.CreationDate >= NOW() - INTERVAL '3 years'
+    AND P.Score > 20
+    AND P.ViewCount > 1000
+    AND QTM.UniqueTagCount >= 2
+    AND P.Title IS NOT NULL
+    AND P.Tags LIKE '%<sql>%'
+    AND PC.BodyLength > 300
+    AND NOT PLS.IsDuplicate
+    AND (
+        (P.AnswerCount > 3 AND P.AcceptedAnswerId IS NOT NULL) OR
+        (P.FavoriteCount > 10 AND P.Score > 50)
+    )
+
+UNION ALL
+
+-- Main Query Branch 2: Focus on "Influential Answers" using a SET operator (UNION ALL)
+SELECT
+    UE.UserId,
+    UE.DisplayName,
+    UE.Reputation,
+    'Answer' AS PostType,
+    P.Id AS PostId,
+    P_Parent.Title AS PostTitle, -- Title from parent question
+    P.CreationDate AS PostCreationDate,
+    P.Score AS PostScore,
+    NULL AS PostViewCount, -- Answers don't have direct view counts
+    PC.BodyLength,
+    PC.CodeBlockCount,
+    PC.TopicCategory,
+    NULL AS EffectiveAnswerCount, -- Answers don't have answer counts
+    -- Window Function: Rank answers by score for a given question
+    DENSE_RANK() OVER (PARTITION BY P.ParentId ORDER BY P.Score DESC, P.Id) AS RankInQuestionByScore,
+    -- Window Function: Calculate the score of the next answer by the same user
+    LEAD(P.Score, 1, 0) OVER (PARTITION BY UE.UserId ORDER BY P.CreationDate) AS ScoreOfNextPost,
+    COALESCE(PVH.FirstClosedDate, '9999-12-31 23:59:59') AS PostFirstClosedDate,
+    PVH.FirstCloseReason,
+    PVH.TotalEdits,
+    PVH.DistinctEditors,
+    QTM_Parent.TagsList, -- Get tags from the parent question
+    QTM_Parent.UniqueTagCount,
+    PLS.LinkedPostsCount,
+    PLS.IsDuplicate,
+    -- Complicated Calculation: Custom "Answer Influence Score"
+    CAST(P.Score AS NUMERIC) * 1.0
+    + (CASE WHEN P_Parent.AcceptedAnswerId = P.Id THEN 5.0 ELSE 0.0 END) -- Significant bonus for being accepted
+    + (SELECT COUNT(C_Sub.Id) FROM Comments C_Sub WHERE C_Sub.PostId = P.Id AND C_Sub.CreationDate >= P.CreationDate + INTERVAL '1 day' AND C_Sub.Score > 0) * 1.5
+    + COALESCE(P.FavoriteCount, 0) * 3.0
+    + (CASE WHEN PC.BodyLength > 1500 THEN 2.0 ELSE 0.0 END)
+    + (CASE WHEN PVH.TotalEdits > 2 THEN 1.0 ELSE 0.0 END)
+    + (CASE WHEN PVH.FirstEditedBodyText IS NOT NULL THEN 0.5 ELSE 0.0 END)
+    + (CASE WHEN P.LastActivityDate > P.CreationDate + INTERVAL '1 month' THEN 0.8 ELSE 0.0 END)
+    AS PostInfluenceScore,
+    -- String Expression: Extracts and transforms parent title/author ref for answers
+    SUBSTRING(REPLACE(REPLACE(P_Parent.Title, 'how to', 'solution to'), 'best way', 'optimal path'), 1, 50) || ' -> ' || SUBSTRING(UE.DisplayName, 1, 15) AS TitleSummaryAndAuthorRef,
+    -- Correlated Subquery: Counts upvotes on the parent question (demonstrates a join to a subquery result)
+    (SELECT COUNT(V_Parent.Id) FROM Votes V_Parent WHERE V_Parent.PostId = P.ParentId AND V_Parent.VoteTypeId = 2) AS ParentQuestionUpvoteCount
+FROM UserEngagement UE
+LEFT JOIN Posts P ON UE.UserId = P.OwnerUserId
+LEFT JOIN Posts P_Parent ON P.ParentId = P_Parent.Id -- Join to get parent question details
+LEFT JOIN PostVersionHistory PVH ON P.Id = PVH.PostId
+LEFT JOIN PostComplexity PC ON P.Id = PC.PostId
+LEFT JOIN QuestionTagMetrics QTM_Parent ON P.ParentId = QTM_Parent.PostId -- Tags from parent question
+LEFT JOIN PostLinkSummary PLS ON P.Id = PLS.PostId
+WHERE
+    P.PostTypeId = 2
+    AND UE.Reputation > 2000
+    AND P.CreationDate >= NOW() - INTERVAL '4 years'
+    AND P.Score > 10
+    AND P.Body IS NOT NULL AND LENGTH(P.Body) > 100
+    AND (
+        P_Parent.AcceptedAnswerId = P.Id OR
+        (P.Score > 50 AND COALESCE(P.FavoriteCount, 0) > 2)
+    )
+    AND P_Parent.Id IS NOT NULL
+    AND QTM_Parent.TagsList LIKE '%<java>%'
+ORDER BY
+    Reputation DESC,
+    PostInfluenceScore DESC,
+    UserId,
+    PostCreationDate DESC
+LIMIT 2000;

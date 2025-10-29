@@ -1,0 +1,274 @@
+-- {"query": "1102.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3838} 
+
+WITH UserActivity AS (
+    -- Summarize user activity and reputation details
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Views AS UserViews,
+        U.UpVotes AS UserUpVotes,
+        U.DownVotes AS UserDownVotes,
+        COALESCE(U.Location, 'Unspecified') AS UserLocation,
+        -- Calculate days since user creation, handling potential future dates gracefully
+        GREATEST(0, CAST(EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - U.CreationDate)) / (60 * 60 * 24) AS INT)) AS DaysSinceUserCreation,
+        -- Count distinct types of badges
+        COUNT(DISTINCT CASE WHEN B.Class = 1 THEN B.Id END) AS GoldBadgesCount,
+        COUNT(DISTINCT CASE WHEN B.Class = 2 THEN B.Id END) AS SilverBadgesCount,
+        COUNT(DISTINCT CASE WHEN B.Class = 3 THEN B.Id END) AS BronzeBadgesCount,
+        -- Total number of badges
+        COUNT(B.Id) AS TotalBadges
+    FROM Users AS U
+    LEFT JOIN Badges AS B ON U.Id = B.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate,
+        U.Views, U.UpVotes, U.DownVotes, U.Location
+),
+PostStats AS (
+    -- Aggregate statistics for each post, including edit history and comment counts
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount AS PostViewCount,
+        P.AnswerCount,
+        P.CommentCount AS PostCommentCount,
+        P.FavoriteCount,
+        P.LastEditDate,
+        P.LastActivityDate,
+        P.Title AS PostTitle,
+        P.Tags AS PostTags,
+        P.AcceptedAnswerId,
+        P.ParentId,
+        -- Calculate post age in days, ensuring non-negative
+        GREATEST(0, CAST(EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - P.CreationDate)) / (60 * 60 * 24) AS INT)) AS PostAgeDays,
+        -- Count distinct editors for a post (excluding initial owner) using FILTER clause
+        COUNT(DISTINCT PH.UserId) FILTER (WHERE PH.PostHistoryTypeId IN (4, 5, 6) AND PH.UserId IS NOT NULL AND PH.UserId <> P.OwnerUserId) AS EditorCount,
+        -- Count total edit events
+        COUNT(PH.Id) FILTER (WHERE PH.PostHistoryTypeId IN (4, 5, 6)) AS TotalEditEvents,
+        -- Check if post has ever been closed
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS WasClosed,
+        -- Sum of all net votes for a post
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 WHEN V.VoteTypeId = 3 THEN -1 ELSE 0 END) AS TotalNetVotes,
+        -- Count unique users who favorited the post
+        COUNT(DISTINCT V.UserId) FILTER (WHERE V.VoteTypeId = 5 AND V.UserId IS NOT NULL) AS UniqueFavoriters
+    FROM Posts AS P
+    LEFT JOIN PostHistory AS PH ON P.Id = PH.PostId
+    LEFT JOIN Votes AS V ON P.Id = V.PostId
+    GROUP BY
+        P.Id, P.PostTypeId, P.OwnerUserId, P.CreationDate, P.Score, P.ViewCount,
+        P.AnswerCount, P.CommentCount, P.FavoriteCount, P.LastEditDate,
+        P.LastActivityDate, P.Title, P.Tags, P.AcceptedAnswerId, P.ParentId
+),
+TagAnalysis AS (
+    -- Analyze tag usage and popularity for questions
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        T.TagName,
+        T.Count AS TagGlobalCount,
+        -- Use string_to_array as hinted by schema, guarding against NULLs or empty strings
+        CASE
+            WHEN P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2
+            THEN array_length(string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><'), 1)
+            ELSE 0
+        END AS NumTagsOnPost,
+        -- Window function: Rank tags by their global count
+        RANK() OVER (ORDER BY T.Count DESC) AS TagPopularityRank
+    FROM Posts AS P
+    -- Explode the tags for each post to link to the Tags table using LATERAL unnest
+    LEFT JOIN LATERAL (
+        SELECT tag_name_str
+        FROM unnest(string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><')) AS tag_name_str
+        WHERE P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2
+    ) AS PostTag ON TRUE
+    LEFT JOIN Tags AS T ON PostTag.tag_name_str = T.TagName
+    WHERE P.PostTypeId = 1 -- Only questions typically have user-defined tags
+),
+UserPostPerformance AS (
+    -- Combine user activity with aggregated post performance
+    SELECT
+        UA.UserId,
+        UA.DisplayName,
+        UA.Reputation,
+        UA.DaysSinceUserCreation,
+        UA.GoldBadgesCount,
+        UA.SilverBadgesCount,
+        UA.BronzeBadgesCount,
+        UA.TotalBadges,
+        UA.UserLocation,
+        -- Aggregated post metrics for each user
+        COUNT(PS.PostId) AS TotalPostsCreated,
+        SUM(CASE WHEN PS.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsCreated,
+        SUM(CASE WHEN PS.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersCreated,
+        SUM(PS.PostScore) AS TotalPostScore,
+        SUM(PS.PostViewCount) AS TotalPostViews,
+        SUM(PS.PostCommentCount) AS TotalPostComments,
+        SUM(PS.FavoriteCount) AS TotalPostFavorites,
+        SUM(PS.EditorCount) AS TotalPostEditors,
+        SUM(PS.TotalEditEvents) AS TotalPostEditEvents,
+        -- Average score per post, handling division by zero for users with no posts
+        COALESCE(AVG(PS.PostScore), 0) AS AvgPostScore,
+        -- Average age of posts
+        COALESCE(AVG(PS.PostAgeDays), 0) AS AvgPostAgeDays,
+        -- Maximum score for any post by the user
+        MAX(PS.PostScore) AS MaxPostScore,
+        -- Correlated subquery: find the owner's highest-scoring post's title
+        (SELECT P_top.Title FROM Posts P_top WHERE P_top.OwnerUserId = UA.UserId ORDER BY P_top.Score DESC NULLS LAST LIMIT 1) AS TopPostTitleByScore,
+        -- Correlated subquery (EXISTS): check if user has any post with 'SQL' (case-insensitive) in its body
+        EXISTS (
+            SELECT 1
+            FROM Posts P_inner
+            WHERE P_inner.OwnerUserId = UA.UserId
+              AND P_inner.Body ILIKE '%sql%'
+              AND P_inner.PostTypeId IN (1, 2)
+        ) AS HasSqlRelatedPost,
+        -- Window function: Calculate average reputation of users in the same location
+        AVG(UA.Reputation) OVER (PARTITION BY UA.UserLocation) AS AvgReputationInLocation,
+        -- Window function: Rank users by their total post score
+        DENSE_RANK() OVER (ORDER BY SUM(COALESCE(PS.PostScore, 0)) DESC) AS UserScoreRank
+    FROM UserActivity AS UA
+    LEFT JOIN PostStats AS PS ON UA.UserId = PS.OwnerUserId
+    GROUP BY
+        UA.UserId, UA.DisplayName, UA.Reputation, UA.DaysSinceUserCreation,
+        UA.GoldBadgesCount, UA.SilverBadgesCount, UA.BronzeBadgesCount,
+        UA.TotalBadges, UA.UserLocation
+),
+ClosedQuestionDetails AS (
+    -- Information about closed questions and their reasons
+    SELECT
+        PS.PostId,
+        PS.PostTitle,
+        PS.OwnerUserId,
+        PH.CreationDate AS CloseDate,
+        CR.Name AS CloseReason,
+        -- Find posts that were reopened after being closed using a window function
+        MAX(CASE WHEN PH_reopen.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) OVER (PARTITION BY PS.PostId) AS WasReopened
+    FROM PostStats AS PS
+    INNER JOIN PostHistory AS PH
+        ON PS.PostId = PH.PostId
+        AND PH.PostHistoryTypeId = 10 -- Post Closed event
+    LEFT JOIN CloseReasonTypes AS CR
+        -- Ensure Comment is a number for CloseReasonId using regex and cast
+        ON PH.Comment IS NOT NULL AND PH.Comment ~ '^[0-9]+$'
+        AND CR.Id = CAST(PH.Comment AS smallint)
+    LEFT JOIN PostHistory AS PH_reopen
+        ON PS.PostId = PH_reopen.PostId
+        AND PH_reopen.PostHistoryTypeId = 11 -- Post Reopened event
+    WHERE PS.PostTypeId = 1 -- Only questions can be closed
+)
+-- Main query: Analyze user and post performance with detailed filtering and aggregation
+-- First branch: Comprehensive user performance based on post activity and quality metrics
+SELECT
+    UPP.UserId,
+    UPP.DisplayName,
+    UPP.Reputation,
+    UPP.GoldBadgesCount,
+    UPP.TotalPostsCreated,
+    UPP.QuestionsCreated,
+    UPP.AnswersCreated,
+    UPP.TotalPostScore,
+    UPP.TotalPostViews,
+    UPP.TotalPostComments,
+    UPP.AvgPostScore,
+    UPP.AvgReputationInLocation,
+    UPP.UserScoreRank,
+    UPP.TopPostTitleByScore,
+    UPP.HasSqlRelatedPost,
+    SUM(CASE WHEN TA.TagName = 'sql' THEN 1 ELSE 0 END) AS SqlTagCount,
+    SUM(CASE WHEN TA.TagName = 'performance' THEN 1 ELSE 0 END) AS PerformanceTagCount,
+    -- Calculate a "Quality Score" based on various factors, using COALESCE for NULL safety
+    CAST(
+        COALESCE(UPP.AvgPostScore, 0) * 0.5 +
+        COALESCE(UPP.TotalPostFavorites, 0) * 0.2 +
+        COALESCE(UPP.GoldBadgesCount, 0) * 10 +
+        CASE WHEN UPP.HasSqlRelatedPost THEN 5 ELSE 0 END -
+        CASE WHEN UPP.TotalPostEditEvents > 5 THEN UPP.TotalPostEditEvents * 0.1 ELSE 0 END
+    AS NUMERIC(10, 2)) AS CalculatedQualityScore,
+    -- Non-correlated subquery for average post age of questions related to a specific tag ('java')
+    (
+        SELECT COALESCE(AVG(PS_inner.PostAgeDays), 0)
+        FROM PostStats AS PS_inner
+        LEFT JOIN LATERAL (
+            SELECT tag_name_str
+            FROM unnest(string_to_array(SUBSTRING(PS_inner.PostTags, 2, LENGTH(PS_inner.PostTags) - 2), '><')) AS tag_name_str
+            WHERE PS_inner.PostTags IS NOT NULL AND LENGTH(PS_inner.PostTags) > 2
+        ) AS PostTag_inner ON TRUE
+        WHERE PS_inner.PostTypeId = 1
+          AND PostTag_inner.tag_name_str = 'java'
+    ) AS AvgJavaQuestionAge,
+    -- Count of closed questions by this user
+    COUNT(DISTINCT CQD.PostId) AS ClosedQuestionsByOwner,
+    -- Count of closed questions by this user that were later reopened
+    COUNT(DISTINCT CASE WHEN CQD.WasReopened = 1 THEN CQD.PostId END) AS ReopenedQuestionsByOwner,
+    -- Find a sample close reason for a question by this user, prioritizing non-NULL
+    MAX(CQD.CloseReason) FILTER (WHERE CQD.CloseReason IS NOT NULL) AS SampleCloseReason,
+    'Primary Analysis' AS AnalysisType
+FROM UserPostPerformance AS UPP
+LEFT JOIN TagAnalysis AS TA ON UPP.UserId = TA.OwnerUserId
+LEFT JOIN ClosedQuestionDetails AS CQD ON UPP.UserId = CQD.OwnerUserId
+WHERE
+    UPP.Reputation > 1000 -- Filter users with significant reputation
+    AND UPP.DaysSinceUserCreation >= 365 -- Only users active for at least a year
+    AND (UPP.QuestionsCreated > 5 OR UPP.AnswersCreated > 10) -- Users with some content contribution
+    AND UPP.TotalPostsCreated IS NOT NULL -- Ensure user has at least one post
+    AND NOT UPP.HasSqlRelatedPost -- Example of a negative filter based on correlated subquery
+    AND UPP.UserLocation IS NOT NULL AND UPP.UserLocation <> 'Unspecified' -- Filter out users without specified location
+    -- String expression: Filter top post titles for specific keywords, handling NULLs
+    AND COALESCE(UPP.TopPostTitleByScore, '') ILIKE '%design%'
+GROUP BY
+    UPP.UserId, UPP.DisplayName, UPP.Reputation, UPP.GoldBadgesCount,
+    UPP.TotalPostsCreated, UPP.QuestionsCreated, UPP.AnswersCreated,
+    UPP.TotalPostScore, UPP.TotalPostViews, UPP.TotalPostComments,
+    UPP.AvgPostScore, UPP.AvgReputationInLocation, UPP.UserScoreRank,
+    UPP.TopPostTitleByScore, UPP.HasSqlRelatedPost
+HAVING
+    COUNT(DISTINCT TA.PostId) > 0 -- Users must have at least one tagged post considered
+    AND (SUM(CASE WHEN TA.TagName = 'sql' THEN 1 ELSE 0 END) + SUM(CASE WHEN TA.TagName = 'performance' THEN 1 ELSE 0 END)) >= 1 -- Has at least one 'sql' or 'performance' tagged question
+
+UNION ALL
+
+-- Second branch: A simpler analysis of highly-reputed users with recent activity, focusing on different metrics
+SELECT
+    UA.UserId,
+    UA.DisplayName,
+    UA.Reputation,
+    UA.GoldBadgesCount,
+    0 AS TotalPostsCreated, -- Not calculated in this branch, use default
+    0 AS QuestionsCreated,
+    0 AS AnswersCreated,
+    0 AS TotalPostScore,
+    0 AS TotalPostViews,
+    0 AS TotalPostComments,
+    0 AS AvgPostScore,
+    AVG(UA.Reputation) OVER (PARTITION BY UA.UserLocation) AS AvgReputationInLocation,
+    DENSE_RANK() OVER (ORDER BY UA.Reputation DESC, UA.LastAccessDate DESC) AS UserScoreRank,
+    NULL AS TopPostTitleByScore,
+    FALSE AS HasSqlRelatedPost,
+    0 AS SqlTagCount,
+    0 AS PerformanceTagCount,
+    CAST(
+        COALESCE(UA.Reputation, 0) * 0.1 + COALESCE(UA.GoldBadgesCount, 0) * 5 +
+        CASE WHEN UA.DaysSinceUserCreation < 365 THEN 20 ELSE 0 END -- Bonus for relatively new high-rep users
+    AS NUMERIC(10, 2)) AS CalculatedQualityScore, -- Simpler quality score formula
+    0 AS AvgJavaQuestionAge,
+    0 AS ClosedQuestionsByOwner,
+    0 AS ReopenedQuestionsByOwner,
+    NULL AS SampleCloseReason,
+    'Recent High Rep User Analysis' AS AnalysisType
+FROM UserActivity AS UA
+WHERE
+    UA.Reputation > 5000 -- Higher reputation threshold
+    AND UA.LastAccessDate > CURRENT_TIMESTAMP - INTERVAL '6 months' -- Recently active
+    AND UA.TotalBadges > 0 -- Must have at least one badge
+    AND UA.UserLocation IS NOT NULL
+GROUP BY
+    UA.UserId, UA.DisplayName, UA.Reputation, UA.GoldBadgesCount,
+    UA.UserLocation, UA.TotalBadges, UA.LastAccessDate, UA.DaysSinceUserCreation
+ORDER BY
+    CalculatedQualityScore DESC, Reputation DESC
+LIMIT 200; -- Limit the combined result set

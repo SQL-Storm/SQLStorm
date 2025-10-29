@@ -1,0 +1,210 @@
+-- {"query": "1897.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3629} 
+
+WITH UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswers,
+        SUM(CASE WHEN p.PostTypeId IN (1, 2) THEN p.Score ELSE 0 END) AS TotalPostScore,
+        SUM(CASE WHEN c.Id IS NOT NULL THEN c.Score ELSE 0 END) AS TotalCommentScore,
+        MAX(COALESCE(p.LastActivityDate, p.CreationDate)) AS LastPostOrCommentActivityDate,
+        MIN(p.CreationDate) AS FirstPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    GROUP BY u.Id, u.DisplayName, u.CreationDate
+),
+PostDetailsAggregated AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount AS DirectCommentCount,
+        p.FavoriteCount,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.ClosedDate,
+        p.Tags,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvoteCount, -- UpMod
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvoteCount, -- DownMod
+        COUNT(DISTINCT comm.Id) AS TotalComments,
+        MAX(comm.CreationDate) AS LastCommentDate,
+        (SELECT COUNT(DISTINCT ph_inner.Id)
+         FROM PostHistory ph_inner
+         WHERE ph_inner.PostId = p.Id
+           AND ph_inner.PostHistoryTypeId IN (4, 5, 6)) AS EditHistoryCount, -- Correlated subquery for edits
+        (SELECT COUNT(DISTINCT pl_inner.RelatedPostId)
+         FROM PostLinks pl_inner
+         WHERE pl_inner.PostId = p.Id AND pl_inner.LinkTypeId = 1) AS LinkedPostCount, -- Correlated subquery for linked posts
+        (SELECT STRING_AGG(DISTINCT ph_close_reason.Comment, '; ')
+         FROM PostHistory ph_close_reason
+         WHERE ph_close_reason.PostId = p.Id AND ph_close_reason.PostHistoryTypeId = 10 AND ph_close_reason.Comment IS NOT NULL
+        ) AS LastCloseReasonDetails -- String aggregation for close reasons
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    LEFT JOIN Comments comm ON p.Id = comm.PostId
+    GROUP BY
+        p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount,
+        p.AnswerCount, p.CommentCount, p.FavoriteCount, p.AcceptedAnswerId,
+        p.ParentId, p.LastEditDate, p.LastActivityDate, p.ClosedDate, p.Tags
+),
+TagUsageStats AS (
+    SELECT
+        TRIM(UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><'))) AS TagName,
+        p.Id AS PostId,
+        p.OwnerUserId
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2
+),
+RankedUserComments AS (
+    SELECT
+        c.Id AS CommentId,
+        c.PostId,
+        c.CreationDate AS CommentCreationDate,
+        c.Score AS CommentScore,
+        c.UserId AS CommenterUserId,
+        ROW_NUMBER() OVER (PARTITION BY c.UserId ORDER BY c.CreationDate DESC) AS rn_comment_by_user_desc,
+        LAG(c.CreationDate) OVER (PARTITION BY c.UserId ORDER BY c.CreationDate) AS PrevCommentDateByUser
+    FROM Comments c
+),
+UserReputationRanks AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS GlobalReputationRank,
+        NTILE(10) OVER (ORDER BY u.Reputation DESC) AS ReputationDecile,
+        ROW_NUMBER() OVER (PARTITION BY EXTRACT(YEAR FROM u.CreationDate) ORDER BY u.Reputation DESC) AS YearReputationRank
+    FROM Users u
+),
+UserPostHistoryEdits AS (
+    SELECT
+        ph.UserId,
+        ph.PostId,
+        ph.RevisionGUID,
+        ph.Comment,
+        ph.CreationDate,
+        ph.PostHistoryTypeId,
+        LAG(ph.CreationDate) OVER (PARTITION BY ph.UserId, ph.PostId ORDER BY ph.CreationDate) AS PreviousHistoryDate,
+        ROW_NUMBER() OVER (PARTITION BY ph.UserId ORDER BY ph.CreationDate DESC) AS rn_user_latest_history
+    FROM PostHistory ph
+    WHERE ph.UserId IS NOT NULL
+)
+SELECT
+    u.Id AS UserId,
+    uas.DisplayName,
+    u.Reputation,
+    urr.GlobalReputationRank,
+    urr.ReputationDecile,
+    uas.TotalPosts,
+    uas.TotalQuestions,
+    uas.TotalAnswers,
+    COALESCE(uas.TotalPostScore, 0) AS UserTotalPostScore,
+    COALESCE(uas.TotalCommentScore, 0) AS UserTotalCommentScore,
+    EXTRACT(EPOCH FROM (NOW() - uas.UserCreationDate)) / (3600 * 24 * 365.25) AS UserAgeYears, -- complicated calculation
+    COALESCE(u.UpVotes, 0) AS UserUpVotes,
+    COALESCE(u.DownVotes, 0) AS UserDownVotes,
+    NULLIF(COALESCE(u.UpVotes, 0), 0) / NULLIF(COALESCE(u.DownVotes, 0), 0) AS UpDownVoteRatio, -- NULL logic, division by zero
+    LOWER(LEFT(COALESCE(u.AboutMe, ''), 50)) AS AboutMeExcerpt, -- string manipulation, NULL logic
+    b_gold.Name AS GoldBadgeName,
+    COUNT(b_all.Id) FILTER (WHERE b_all.Class = 1) AS GoldBadgeCount,
+    COUNT(b_all.Id) FILTER (WHERE b_all.Class = 2) AS SilverBadgeCount,
+    COUNT(b_all.Id) FILTER (WHERE b_all.Class = 3) AS BronzeBadgeCount,
+    -- User's Top Question details
+    COALESCE(tq.Id, -1) AS TopQuestionId,
+    tq.Title AS TopQuestionTitle,
+    COALESCE(tq_perf.PostScore, 0) AS TopQuestionScore,
+    COALESCE(tq_perf.ViewCount, 0) AS TopQuestionViews,
+    COALESCE(tq_perf.TotalComments, 0) AS TopQuestionComments,
+    COALESCE(tq_perf.UpvoteCount, 0) AS TopQuestionUpvotes,
+    COALESCE(tq_perf.DownvoteCount, 0) AS TopQuestionDownvotes,
+    (SELECT COUNT(DISTINCT pl_q.RelatedPostId)
+     FROM PostLinks pl_q
+     WHERE pl_q.PostId = tq.Id AND pl_q.LinkTypeId = 3) AS TopQuestionDuplicateCount, -- correlated subquery
+    -- User's Top Answer details
+    COALESCE(ta.Id, -1) AS TopAnswerId,
+    COALESCE(ta_perf.PostScore, 0) AS TopAnswerScore,
+    COALESCE(ta_perf.UpvoteCount, 0) AS TopAnswerUpvotes,
+    COALESCE(ta_perf.DownvoteCount, 0) AS TopAnswerDownvotes,
+    COALESCE(qa.Title, 'N/A') AS AnsweredQuestionTitle, -- NULL logic
+    CASE
+        WHEN ta.AcceptedAnswerId IS NOT NULL AND (SELECT p_parent.AcceptedAnswerId FROM Posts p_parent WHERE p_parent.Id = ta.ParentId) = ta.Id THEN 'AcceptedAnswerByOwner'
+        WHEN ta.ParentId IS NOT NULL AND (SELECT p_parent.AcceptedAnswerId FROM Posts p_parent WHERE p_parent.Id = ta.ParentId) IS NOT NULL THEN 'AnsweredButOtherAccepted'
+        WHEN ta.ParentId IS NOT NULL AND (SELECT p_parent.AcceptedAnswerId FROM Posts p_parent WHERE p_parent.Id = ta.ParentId) IS NULL THEN 'AnsweredNotYetAccepted'
+        ELSE 'N/A'
+    END AS AnswerAcceptanceStatus, -- conditional logic with subquery and NULL logic
+    -- Overall Post and Comment activity metrics
+    AVG(p_all.Score) FILTER (WHERE p_all.PostTypeId = 1) OVER (PARTITION BY u.Id) AS AvgQuestionScore, -- window function
+    AVG(p_all.Score) FILTER (WHERE p_all.PostTypeId = 2) OVER (PARTITION BY u.Id) AS AvgAnswerScore, -- window function
+    AVG(p_all.ViewCount) OVER (PARTITION BY u.Id) AS AvgPostViewCount, -- window function
+    mph.CreationDate AS LatestUserHistoryDate,
+    mph.PostHistoryTypeId AS LatestUserHistoryType,
+    EXTRACT(DAY FROM (NOW() - mph.CreationDate)) AS DaysSinceLatestUserHistory, -- date arithmetic
+    COUNT(ph_edit.PostId) FILTER (WHERE ph_edit.PostHistoryTypeId IN (4,5,6) AND ph_edit.CreationDate >= NOW() - INTERVAL '1 year') AS EditsInLastYear, -- complicated predicate
+    COUNT(DISTINCT t_all.TagName) AS NumberOfUniqueTagsPosted,
+    STRING_AGG(DISTINCT t_all.TagName, ', ') FILTER (WHERE t_all.TagName IS NOT NULL AND t_all.TagName != '') AS AllTagsPosted, -- string aggregation, NULL filter
+    COALESCE(rc.CommentId, -1) AS MostRecentCommentIdByUser,
+    COALESCE(rc.CommentScore, 0) AS MostRecentCommentScoreByUser,
+    rc.CommentCreationDate AS MostRecentCommentDateByUser,
+    EXTRACT(MINUTE FROM (rc.CommentCreationDate - rc.PrevCommentDateByUser)) AS TimeSincePrevCommentMinutes, -- date arithmetic
+    COALESCE(rc_post.Title, 'No Post Found') AS PostTitleOfMostRecentCommentByUser -- NULL logic, outer join dependency
+FROM Users u
+LEFT JOIN UserActivitySummary uas ON u.Id = uas.UserId
+LEFT JOIN UserReputationRanks urr ON u.Id = urr.UserId
+LEFT JOIN Badges b_gold ON u.Id = b_gold.UserId AND b_gold.Class = 1 AND b_gold.TagBased = FALSE -- Example: Filter for non-tag-based gold badges
+LEFT JOIN Badges b_all ON u.Id = b_all.UserId -- For total badge counts
+LEFT JOIN Posts p_all ON u.Id = p_all.OwnerUserId -- For overall user post metrics (window functions)
+LEFT JOIN (
+    SELECT
+        p_q.Id,
+        p_q.OwnerUserId,
+        p_q.Title,
+        p_q.Tags,
+        ROW_NUMBER() OVER (PARTITION BY p_q.OwnerUserId ORDER BY p_q.Score DESC, p_q.ViewCount DESC) as rn
+    FROM Posts p_q
+    WHERE p_q.PostTypeId = 1
+) AS tq ON u.Id = tq.OwnerUserId AND tq.rn = 1 -- User's top question
+LEFT JOIN PostDetailsAggregated tq_perf ON tq.Id = tq_perf.PostId
+LEFT JOIN (
+    SELECT
+        p_a.Id,
+        p_a.OwnerUserId,
+        p_a.ParentId,
+        p_a.AcceptedAnswerId,
+        ROW_NUMBER() OVER (PARTITION BY p_a.OwnerUserId ORDER BY p_a.Score DESC) as rn
+    FROM Posts p_a
+    WHERE p_a.PostTypeId = 2
+) AS ta ON u.Id = ta.OwnerUserId AND ta.rn = 1 -- User's top answer
+LEFT JOIN PostDetailsAggregated ta_perf ON ta.Id = ta_perf.PostId
+LEFT JOIN Posts qa ON ta.ParentId = qa.Id AND qa.PostTypeId = 1 -- Original question for the top answer
+LEFT JOIN UserPostHistoryEdits mph ON u.Id = mph.UserId AND mph.rn_user_latest_history = 1 -- User's most recent PostHistory entry
+LEFT JOIN PostHistory ph_edit ON u.Id = ph_edit.UserId -- For counting user's edits
+LEFT JOIN RankedUserComments rc ON u.Id = rc.CommenterUserId AND rc.rn_comment_by_user_desc = 1 -- Most recent comment by this user on any post
+LEFT JOIN Posts rc_post ON rc.PostId = rc_post.Id -- Post where the user's most recent comment was made
+LEFT JOIN TagUsageStats t_all ON u.Id = t_all.OwnerUserId -- Join to get all tags associated with a user's posts
+WHERE u.Reputation >= 1000 -- Filter for meaningful users
+AND uas.TotalPosts > 0
+AND (u.Location IS NOT NULL OR LENGTH(COALESCE(u.AboutMe, '')) > 10) -- NULL logic in WHERE clause, string length
+AND (tq.Title LIKE '%SQL%' OR tq.Title LIKE '%database%' OR tq.Title LIKE '%performance%' OR ta.Id IS NOT NULL) -- complicated predicate with OR and NULL
+GROUP BY
+    u.Id, uas.DisplayName, u.Reputation, urr.GlobalReputationRank, urr.ReputationDecile,
+    uas.TotalPosts, uas.TotalQuestions, uas.TotalAnswers, uas.TotalPostScore,
+    uas.TotalCommentScore, uas.UserCreationDate, u.UpVotes, u.DownVotes, u.AboutMe,
+    b_gold.Name, tq.Id, tq.Title, tq_perf.PostScore, tq_perf.ViewCount, tq_perf.TotalComments,
+    tq_perf.UpvoteCount, tq_perf.DownvoteCount, ta.Id, ta_perf.PostScore, ta_perf.UpvoteCount,
+    ta_perf.DownvoteCount, qa.Title, ta.AcceptedAnswerId, ta.ParentId, mph.CreationDate,
+    mph.PostHistoryTypeId, rc.CommentId, rc.CommentScore, rc.CommentCreationDate,
+    rc.PrevCommentDateByUser, rc_post.Title, tq.Tags
+HAVING COUNT(DISTINCT b_all.Id) > 0 -- Users with at least one badge
+AND COUNT(DISTINCT CASE WHEN p_all.PostTypeId = 1 AND p_all.CreationDate > NOW() - INTERVAL '6 month' THEN p_all.Id END) > 2 -- At least 3 questions in last 6 months
+ORDER BY u.Reputation DESC, uas.LastPostOrCommentActivityDate DESC
+LIMIT 500;

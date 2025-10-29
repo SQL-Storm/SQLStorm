@@ -1,0 +1,129 @@
+WITH recent_activity AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    COALESCE(p.Tags, '') AS Tags,
+    COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVotes,
+    COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVotes,
+    MAX(CASE WHEN c.Id IS NOT NULL THEN c.Id END) AS LatestCommentId
+  FROM Posts p
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  LEFT JOIN Comments c ON c.PostId = p.Id
+  LEFT JOIN LATERAL (
+    SELECT 1
+  ) AS sub ON TRUE
+  WHERE p.PostTypeId IN (1,2) -- questions and answers
+  GROUP BY
+    p.Id, p.PostTypeId, p.Title, p.CreationDate, p.LastActivityDate, p.Score, p.ViewCount, p.OwnerUserId, p.Tags
+),
+tag_derived AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.ViewCount,
+    p.Score,
+    p.OwnerUserId,
+    t.TagName AS PrimaryTag,
+    -- Replace PARSENAME(REPLACE(t.TagName, '_', '.'), 1) with standard SQL expression:
+    -- take substring after last '.' by using reverse/position or split_part if available.
+    -- Using standard SQL: substring with regexp to get last segment after dot.
+    COALESCE(
+      NULLIF(
+        regexp_replace(t.TagName, '^.*\\.(.*)$', '\\1'),
+        t.TagName
+      ),
+      t.TagName
+    ) AS TagTag
+  FROM Posts p
+  LEFT JOIN Tags t ON t.Id = p.Tags -- using Tags as a join to introduce complexity
+  WHERE p.PostTypeId = 1
+),
+windowed AS (
+  SELECT
+    ra.PostId,
+    ra.PostTypeId,
+    ra.Title,
+    ra.CreationDate,
+    ra.LastActivityDate,
+    ra.Score,
+    ra.ViewCount,
+    ra.OwnerUserId,
+    ROW_NUMBER() OVER (
+      PARTITION BY ra.OwnerUserId
+      ORDER BY ra.LastActivityDate DESC, ra.Score DESC
+    ) AS rn_owner,
+    ROW_NUMBER() OVER (
+      ORDER BY ra.LastActivityDate DESC, ra.Score DESC
+    ) AS rn_global
+  FROM recent_activity ra
+),
+promoted AS (
+  SELECT
+    w.PostId,
+    w.Title,
+    w.LastActivityDate,
+    w.Score,
+    w.ViewCount,
+    w.OwnerUserId,
+    w.rn_global,
+    w.rn_owner,
+    CASE
+      WHEN w.rn_global <= 100 THEN 'Top100'
+      WHEN w.rn_owner <= 5 THEN 'ActiveOwner'
+      ELSE 'Other'
+    END AS Category
+  FROM windowed w
+)
+SELECT
+  p.PostId,
+  p.PostTypeId,
+  p.Title,
+  p.CreationDate,
+  p.LastActivityDate,
+  p.Score,
+  p.ViewCount,
+  u.DisplayName AS OwnerDisplayName,
+  COALESCE(u.Reputation, 0) AS OwnerReputation,
+  pv.UpVotes,
+  pv.DownVotes,
+  p.Tags,
+  CASE
+    WHEN p.Tags IS NOT NULL AND CHAR_LENGTH(p.Tags) > 0 THEN
+      (SELECT STRING_AGG(t.TagName, ',') FROM Tags t WHERE t.Id IS NOT NULL AND t.TagName IS NOT NULL)
+    ELSE ''
+  END AS TagList,
+  CASE
+    WHEN pv.UpVotes > pv.DownVotes THEN pv.UpVotes - pv.DownVotes
+    ELSE pv.DownVotes - pv.UpVotes
+  END AS NetVoteImpact,
+  CASE
+    WHEN p.OwnerUserId IS NOT NULL THEN
+      (SELECT COUNT(*) FROM Posts q WHERE q.OwnerUserId = p.OwnerUserId AND q.PostTypeId = 1) 
+    ELSE 0
+  END AS TotalQuestionsByOwner,
+  CASE
+    WHEN p.LastEditorUserId IS NOT NULL THEN
+      (SELECT DisplayName FROM Users WHERE Id = p.LastEditorUserId)
+    ELSE NULL
+  END AS LastEditorDisplayName
+FROM promoted p
+LEFT JOIN Users u ON u.Id = p.OwnerUserId
+LEFT JOIN (
+  SELECT PostId, SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+         SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+  FROM Votes
+  GROUP BY PostId
+) pv ON pv.PostId = p.PostId
+LEFT JOIN LATERAL (
+  SELECT 1
+) AS dummy ON TRUE
+WHERE p.rn_global <= 100
+ORDER BY p.LastActivityDate DESC, p.Score DESC;

@@ -1,0 +1,102 @@
+-- {"query": "3070.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2094} 
+
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        SUM(COALESCE(p.Score,0)) AS TotalPostScore,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVoteCount,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVoteCount,
+        COUNT(b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p   ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v   ON v.UserId = u.Id
+    LEFT JOIN Badges b  ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TagPopularity AS (
+    SELECT 
+        t.TagName,
+        COUNT(p.Id) AS TagPostCount,
+        AVG(p.Score) AS AvgScore,
+        MAX(p.CreationDate) AS RecentPostDate
+    FROM Tags t
+    JOIN Posts p 
+      ON p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+     AND p.PostTypeId = 1
+    GROUP BY t.TagName
+),
+RecentClosedQuestions AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        ph.Comment::int AS CloseReasonId,
+        ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY ph.CreationDate DESC) AS rn
+    FROM Posts p
+    JOIN PostHistory ph ON ph.PostId = p.Id
+    WHERE ph.PostHistoryTypeId = 10            -- Closed
+),
+TopUserComments AS (
+    SELECT 
+        us.Id,
+        (SELECT COUNT(*) FROM Comments c WHERE c.UserId = us.Id) AS CommentCount
+    FROM UserStats us
+),
+CombinedStats AS (
+    SELECT 
+        us.Id,
+        us.DisplayName,
+        us.Reputation,
+        us.QuestionCount,
+        us.AnswerCount,
+        us.TotalPostScore,
+        us.UpVoteCount,
+        us.DownVoteCount,
+        us.BadgeCount,
+        us.LastPostDate,
+        tuc.CommentCount
+    FROM UserStats us
+    LEFT JOIN TopUserComments tuc ON tuc.Id = us.Id
+)
+
+SELECT 
+    cs.Id AS UserId,
+    cs.DisplayName,
+    cs.Reputation,
+    cs.QuestionCount,
+    cs.AnswerCount,
+    cs.TotalPostScore,
+    cs.UpVoteCount,
+    cs.DownVoteCount,
+    cs.BadgeCount,
+    cs.CommentCount,
+    COALESCE(cs.LastPostDate, TIMESTAMP '1970-01-01') AS LastPostDate,
+    tp.TagName,
+    tp.TagPostCount,
+    tp.AvgScore,
+    tp.RecentPostDate,
+    rcq.Title AS RecentlyClosedQuestion,
+    COALESCE(cr.Name, 'Unknown') AS CloseReasonName,
+    ROW_NUMBER() OVER (PARTITION BY cs.Id ORDER BY tp.TagPostCount DESC NULLS LAST) AS TagRankByUser
+FROM CombinedStats cs
+LEFT JOIN TagPopularity tp 
+       ON TRUE                               -- cross join to bring all tags for ranking
+LEFT JOIN (
+    SELECT Id, Title, CloseReasonId
+    FROM RecentClosedQuestions
+    WHERE rn = 1
+) rcq ON TRUE
+LEFT JOIN CloseReasonTypes cr 
+       ON cr.Id = rcq.CloseReasonId
+WHERE (cs.Reputation > 10000 OR cs.BadgeCount >= 5)
+  AND (tp.TagPostCount IS NULL OR tp.TagPostCount > 10)
+  AND (rcq.Title IS NOT NULL OR cs.QuestionCount > 0)
+ORDER BY 
+    cs.Reputation DESC NULLS LAST,
+    cs.TotalPostScore DESC,
+    tp.TagPostCount DESC NULLS FIRST;

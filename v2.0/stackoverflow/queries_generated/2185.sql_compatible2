@@ -1,0 +1,154 @@
+with RecursiveTags as (
+    select
+        p.Id as PostId,
+        unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) as Tag
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges
+    from Badges b
+    group by b.UserId
+),
+TopAnswerers as (
+    select
+        a.OwnerUserId,
+        count(*) as AnswerCount,
+        avg(a.Score) as AvgScore,
+        max(a.CreationDate) as LastAnswerDate,
+        row_number() over (partition by a.OwnerUserId order by a.CreationDate desc) rn
+    from Posts a
+    where a.PostTypeId = 2 and a.OwnerUserId is not null
+    group by a.OwnerUserId
+),
+QuestionsWithStatus as (
+    select
+        q.Id,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.FavoriteCount,
+        q.ClosedDate,
+        case
+            when q.ClosedDate is not null then 'Closed'
+            when q.AcceptedAnswerId is not null then 'Answered'
+            else 'Open'
+        end as Status,
+        u.Reputation as OwnerReputation,
+        u.DisplayName as OwnerName,
+        bc.GoldBadges,
+        bc.SilverBadges,
+        bc.BronzeBadges,
+        q.OwnerUserId
+    from Posts q
+    left join Users u on u.Id = q.OwnerUserId
+    left join UserBadgeCounts bc on bc.UserId = q.OwnerUserId
+    where q.PostTypeId = 1
+),
+DuplicateLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate as LinkCreationDate,
+        lt.Name as LinkTypeName
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    where pl.LinkTypeId = 3
+),
+QuestionCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReasonName,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where ph.PostHistoryTypeId = 10
+),
+RankedComments as (
+    select 
+        c.PostId,
+        c.Id as CommentId,
+        c.UserId,
+        u.DisplayName,
+        c.Score,
+        c.CreationDate,
+        row_number() over (partition by c.PostId order by c.Score desc, c.CreationDate asc) as CommentRank
+    from Comments c
+    left join Users u on u.Id = c.UserId
+),
+AnswerScoresWindow as (
+    select 
+        p.Id as AnswerId,
+        p.ParentId as QuestionId,
+        p.Score,
+        sum(p.Score) over (partition by p.ParentId) as TotalAnswerScore,
+        avg(p.Score) over (partition by p.ParentId) as AvgAnswerScore,
+        count(*) over (partition by p.ParentId) as AnswerCountForQuestion
+    from Posts p
+    where p.PostTypeId = 2
+)
+select 
+    q.Id as QuestionId,
+    q.Title,
+    q.Status,
+    q.CreationDate as QuestionCreated,
+    q.Score as QuestionScore,
+    q.ViewCount,
+    q.AnswerCount,
+    q.FavoriteCount,
+    coalesce(q.GoldBadges, 0) as QuestionOwnerGoldBadges,
+    coalesce(q.SilverBadges, 0) as QuestionOwnerSilverBadges,
+    coalesce(q.BronzeBadges, 0) as QuestionOwnerBronzeBadges,
+    q.OwnerName as QuestionOwnerName,
+    q.OwnerReputation as QuestionOwnerReputation,
+    dr.CloseReasonName,
+    array_agg(distinct rt.Tag) filter (where rt.Tag is not null) as Tags,
+    coalesce(asw.TotalAnswerScore,0) as TotalAnswerScore,
+    coalesce(asw.AvgAnswerScore,0) as AvgAnswerScore,
+    asw.AnswerCountForQuestion,
+    ta.AnswerCount as OwnerAnswerCount,
+    ta.AvgScore as OwnerAvgAnswerScore,
+    ta.LastAnswerDate as OwnerLastAnswer,
+    c.CommentId as TopCommentId,
+    c.DisplayName as TopCommenter,
+    c.Score as TopCommentScore,
+    c.CreationDate as TopCommentDate,
+    concat_ws(' | ',
+        'Owner: ', coalesce(q.OwnerName, 'Anonymous'),
+        ' | Rep: ', coalesce(cast(q.OwnerReputation as text), '0'),
+        ' | Status: ', q.Status,
+        ' | TagsCnt: ', coalesce(cast(array_length(array_agg(distinct rt.Tag), 1) as text), '0'),
+        ' | AvgAnswerScore: ', coalesce(cast(asw.AvgAnswerScore as text), '0')
+    ) as SummaryInfo
+from QuestionsWithStatus q
+left join RecursiveTags rt on rt.PostId = q.Id
+left join DuplicateLinks dl on dl.PostId = q.Id
+left join QuestionCloseReasons dr on dr.PostId = q.Id
+left join AnswerScoresWindow asw on asw.QuestionId = q.Id
+left join TopAnswerers ta on ta.OwnerUserId = q.OwnerUserId
+left join RankedComments c on c.PostId = q.Id and c.CommentRank = 1
+where 
+    (
+      q.Status = 'Closed' or 
+      (q.AnswerCount > 0 and q.Score > 5) or
+      (q.FavoriteCount > 10)
+    )
+    and (
+      q.OwnerReputation > (
+         select avg(Reputation) from Users where Reputation is not null
+      )
+      or coalesce(q.GoldBadges, 0) > 0
+    )
+group by 
+    q.Id, q.Title, q.Status, q.CreationDate, q.Score, q.ViewCount, q.AnswerCount, q.FavoriteCount, q.GoldBadges, q.SilverBadges, q.BronzeBadges,
+    q.OwnerName, q.OwnerReputation, dr.CloseReasonName, asw.TotalAnswerScore, asw.AvgAnswerScore, asw.AnswerCountForQuestion,
+    ta.AnswerCount, ta.AvgScore, ta.LastAnswerDate,
+    c.CommentId, c.DisplayName, c.Score, c.CreationDate, q.OwnerUserId
+order by q.Score desc, q.ViewCount desc
+limit 100;

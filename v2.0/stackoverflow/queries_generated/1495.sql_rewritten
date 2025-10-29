@@ -1,0 +1,212 @@
+-- {"query": "1495.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3379} 
+WITH PostHistorySummary AS (
+    -- Summarizes post history, including edit counts, last edit date, and close reason type.
+    SELECT
+        ph.PostId,
+        COUNT(ph.Id) AS TotalHistoryEvents,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9) THEN 1 ELSE 0 END) AS TotalEditsAndRollbacks,
+        MAX(ph.CreationDate) AS LastHistoryDate,
+        -- Attempt to extract close reason name for PostHistoryType 10
+        MAX(CASE
+                WHEN ph.PostHistoryTypeId = 10 AND ph.Comment IS NOT NULL AND ph.Comment ~ '^[0-9]+$' THEN
+                    (SELECT Name FROM CloseReasonTypes WHERE Id = ph.Comment::smallint)
+                WHEN ph.PostHistoryTypeId = 10 AND ph.Comment LIKE '%off-topic%' THEN 'Off-topic (textual)'
+                ELSE NULL
+            END) AS CloseReasonName,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseEventsCount,
+        -- Check if post has ever been community-owned based on history
+        MAX(CASE WHEN ph.PostHistoryTypeId = 16 THEN 1 ELSE 0 END) AS IsCommunityOwnedHistoryFlag
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+),
+PostCommentActivity AS (
+    -- Summarizes comment activity for each post, including top commenter
+    SELECT
+        c.PostId,
+        COUNT(c.Id) AS TotalComments,
+        SUM(c.Score) AS TotalCommentScore,
+        MAX(c.CreationDate) AS LastCommentDate,
+        -- Correlated subquery to find the UserId of the comment with the highest score on this post
+        (
+            SELECT sub_c.UserId
+            FROM Comments sub_c
+            WHERE sub_c.PostId = c.PostId
+            ORDER BY sub_c.Score DESC, sub_c.CreationDate DESC
+            LIMIT 1
+        ) AS TopCommenterUserId,
+        -- Calculate average comment score per post
+        AVG(c.Score) AS AvgCommentScore
+    FROM Comments c
+    GROUP BY c.PostId
+),
+PostTagAnalysis AS (
+    -- Extracts and analyzes tags for questions (PostTypeId = 1)
+    SELECT
+        p.Id AS PostId,
+        STRING_AGG(DISTINCT t.TagName, ', ') AS AllTags,
+        COUNT(DISTINCT t.Id) AS NumUniqueTags,
+        MAX(t.Count) AS MaxAssociatedTagUseCount, -- Max 'Count' from the Tags table for any tag on this post
+        SUM(CASE WHEN t.IsModeratorOnly THEN 1 ELSE 0 END) AS ModeratorOnlyTagCount,
+        MIN(t.ExcerptPostId) AS ArbitraryTagExcerptPostId -- Example: find an arbitrary excerpt post ID
+    FROM Posts p
+    JOIN LATERAL UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><')) AS tag_name_unnest ON TRUE
+    JOIN Tags t ON t.TagName = tag_name_unnest
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2 -- Only for questions with valid tags
+    GROUP BY p.Id
+),
+UserBadgeSummary AS (
+    -- Aggregates badge information for users
+    SELECT
+        b.UserId,
+        COUNT(b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(b.Date) AS LastBadgeAwardDate
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserActivityAndReputation AS (
+    -- Combines user reputation, creation date, views, and badge summary
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.DisplayName AS UserDisplayName,
+        u.Views AS UserProfileViews,
+        u.UpVotes AS UserTotalUpVotes,
+        u.DownVotes AS UserTotalDownVotes,
+        COALESCE(lbs.TotalBadges, 0) AS UserTotalBadges,
+        COALESCE(lbs.GoldBadges, 0) AS UserGoldBadges,
+        COALESCE(lbs.SilverBadges, 0) AS UserSilverBadges,
+        COALESCE(lbs.BronzeBadges, 0) AS UserBronzeBadges,
+        lbs.LastBadgeAwardDate,
+        -- Complex calculation: User's upvote effectiveness ratio
+        (CAST(u.UpVotes AS NUMERIC) + 1) / (CAST(u.DownVotes AS NUMERIC) + 1 + CASE WHEN u.UpVotes = 0 AND u.DownVotes = 0 THEN 1 ELSE 0 END) AS UpDownVoteEffectivenessRatio
+    FROM Users u
+    LEFT JOIN UserBadgeSummary lbs ON u.Id = lbs.UserId
+),
+InterestingPostIdentifiers AS (
+    -- Uses UNION ALL to combine different sets of "interesting" posts based on varying criteria
+    -- This CTE ensures distinct posts for the subsequent main query.
+    -- Criteria 1: Highly scored questions related to 'sql' or 'database' tags, relatively recent
+    SELECT p.Id AS PostId, p.PostTypeId, 'HighScoreSQLQuestion' AS InterestReason
+    FROM Posts p
+    WHERE p.PostTypeId = 1 -- Question
+      AND p.Score >= 100
+      AND p.Tags IS NOT NULL AND (p.Tags LIKE '%<sql>%' OR p.Tags LIKE '%<database>%')
+      AND p.CreationDate BETWEEN '2022-01-01' AND '2023-12-31'
+
+    UNION ALL
+
+    -- Criteria 2: Highly viewed answers to questions by users with high reputation
+    SELECT p.Id AS PostId, p.PostTypeId, 'HighViewAnswerByRepUser' AS InterestReason
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN Posts parent_q ON p.ParentId = parent_q.Id -- Join to parent question for its ViewCount
+    WHERE p.PostTypeId = 2 -- Answer
+      AND parent_q.ViewCount >= 50000 -- Parent question is highly viewed
+      AND u.Reputation >= 20000
+      AND p.CreationDate BETWEEN '2022-01-01' AND '2023-12-31'
+
+    UNION ALL
+
+    -- Criteria 3: Posts with significant edit history AND many comments
+    SELECT p.Id AS PostId, p.PostTypeId, 'HighlyEditedAndCommented' AS InterestReason
+    FROM Posts p
+    JOIN PostHistorySummary phs ON p.Id = phs.PostId
+    JOIN PostCommentActivity pca ON p.Id = pca.PostId
+    WHERE phs.TotalEditsAndRollbacks >= 5
+      AND pca.TotalComments >= 10
+      AND p.CreationDate BETWEEN '2022-01-01' AND '2023-12-31'
+),
+DistinctInterestingPosts AS (
+    -- Ensures unique PostIds from the combined InterestingPostIdentifiers
+    SELECT DISTINCT PostId, PostTypeId
+    FROM InterestingPostIdentifiers
+)
+-- Final SELECT statement combining all CTEs and adding window functions, NULL logic, and complex predicates
+SELECT
+    p.PostId,
+    pt.Name AS PostTypeName,
+    SUBSTRING(p_main.Title, 1, 100) AS ShortTitle,
+    p_main.CreationDate,
+    p_main.Score,
+    p_main.ViewCount,
+    COALESCE(p_main.AnswerCount, 0) AS AnswerCount,
+    COALESCE(p_main.FavoriteCount, 0) AS FavoriteCount,
+    p_main.OwnerUserId,
+    COALESCE(p_main.OwnerDisplayName, ua.UserDisplayName, 'Deleted User') AS OwnerDisplayComputedName,
+    ua.Reputation AS OwnerReputation,
+    ua.UserCreationDate AS OwnerAccountCreationDate,
+    ua.UserProfileViews AS OwnerProfileViews,
+    ua.UserGoldBadges,
+    ua.UpDownVoteEffectivenessRatio,
+    hs.TotalEditsAndRollbacks,
+    hs.LastHistoryDate,
+    COALESCE(hs.CloseReasonName, 'Not Closed / Open') AS PostCloseReason,
+    p_main.Body AS FullBodyContent, -- Include full body for text analysis if needed
+    LENGTH(p_main.Body) AS BodyLength,
+    pa.AllTags,
+    pa.NumUniqueTags,
+    pa.MaxAssociatedTagUseCount,
+    COALESCE(cm.TotalComments, 0) AS TotalComments,
+    COALESCE(cm.TotalCommentScore, 0) AS TotalCommentScore,
+    cm.LastCommentDate,
+    -- Check for linked/duplicate posts using non-correlated subqueries
+    (SELECT COUNT(Id) FROM PostLinks WHERE PostId = p.PostId AND LinkTypeId = 1) AS TotalLinkedPostsOut,
+    (SELECT COUNT(Id) FROM PostLinks WHERE PostId = p.PostId AND LinkTypeId = 3) AS TotalDuplicateTargets,
+    -- Window function: Rank posts by score within their PostType, ordered by creation date
+    ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p_main.Score DESC, p_main.CreationDate DESC) AS RankByScoreInType,
+    -- Window function: Average score of posts by the same owner, considering only posts created BEFORE this one
+    AVG(p_main.Score) OVER (PARTITION BY p_main.OwnerUserId ORDER BY p_main.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS AvgPrevOwnerPostScore,
+    -- Window function: Calculate cumulative sum of view counts by PostType over time
+    SUM(p_main.ViewCount) OVER (PARTITION BY pt.Name ORDER BY p_main.CreationDate) AS CumulativeViewCountByType,
+    -- Case expression with NULL logic to determine answer status
+    CASE
+        WHEN p_main.AcceptedAnswerId IS NOT NULL AND COALESCE(p_main.AnswerCount, 0) > 0 THEN 'Answered & Accepted'
+        WHEN p_main.AcceptedAnswerId IS NULL AND COALESCE(p_main.AnswerCount, 0) > 0 THEN 'Answered (No Accepted)'
+        WHEN COALESCE(p_main.AnswerCount, 0) = 0 AND p.PostTypeId = 1 THEN 'No Answers Yet'
+        WHEN p.PostTypeId = 2 THEN 'Is an Answer'
+        ELSE 'N/A for Post Type'
+    END AS AnswerStatusDetail,
+    -- String expression and NULL check for OwnerDisplayName, with conditional formatting
+    UPPER(COALESCE(ua.UserDisplayName, 'UNKNOWN USER')) || ' (' || COALESCE(ua.UserDisplayName, 'UNKNOWN') || ')' AS OwnerNameAndAlias,
+    -- Complicated calculation combining different engagement metrics, weighted by age
+    (
+        (p_main.Score * 1.5) + (COALESCE(p_main.ViewCount, 0) * 0.005) + (COALESCE(p_main.AnswerCount, 0) * 8) +
+        (COALESCE(cm.TotalComments, 0) * 3) + (COALESCE(p_main.FavoriteCount, 0) * 5) +
+        (COALESCE(hs.TotalEditsAndRollbacks, 0) * 2)
+    ) / (EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - p_main.CreationDate)) / (3600 * 24) + 1) AS PostEngagementWeightedIndex,
+    -- Correlated subquery to check if owner has other posts with 'tag-wiki' or 'privilege' tags
+    (
+        SELECT COUNT(DISTINCT sq_p.Id)
+        FROM Posts sq_p
+        JOIN LATERAL UNNEST(string_to_array(SUBSTRING(sq_p.Tags, 2, LENGTH(sq_p.Tags) - 2), '><')) AS sq_tag_name ON TRUE
+        WHERE sq_p.OwnerUserId = p_main.OwnerUserId
+          AND sq_p.Id != p.PostId -- Exclude the current post
+          AND (sq_tag_name LIKE '%tag-wiki%' OR sq_tag_name LIKE '%privilege%')
+    ) AS OwnerRelatedMetaPostsCount
+FROM DistinctInterestingPosts p
+JOIN Posts p_main ON p.PostId = p_main.Id
+JOIN PostTypes pt ON p.PostTypeId = pt.Id
+LEFT JOIN UserActivityAndReputation ua ON p_main.OwnerUserId = ua.UserId
+LEFT JOIN PostHistorySummary hs ON p.PostId = hs.PostId
+LEFT JOIN PostCommentActivity cm ON p.PostId = cm.PostId
+LEFT JOIN PostTagAnalysis pa ON p.PostId = pa.PostId
+WHERE
+    p_main.Score > 50 -- Additional filter on score for selected interesting posts
+    AND p_main.ViewCount > 10000 -- Additional filter on view count
+    AND p_main.LastActivityDate IS NOT NULL AND p_main.LastActivityDate > (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '6 months') -- Recently active
+    AND (ua.Reputation > 10000 OR ua.UserGoldBadges > 1) -- Owner has high rep or multiple gold badges
+    AND COALESCE(cm.TotalComments, 0) > 5 -- At least 5 comments
+    AND (hs.CloseEventsCount = 0 OR hs.CloseReasonName IS NULL) -- Not explicitly closed
+    AND p_main.Body LIKE '%code%' AND p_main.Body NOT LIKE '%[duplicate]%' -- Body contains code but isn't explicitly marked as duplicate (string expression logic)
+HAVING
+    -- Filter on aggregated/window function results, including those computed in the outer SELECT
+    (SUM(p_main.FavoriteCount) OVER (PARTITION BY p_main.OwnerUserId) > 50 OR AVG(p_main.Score) OVER (PARTITION BY p.PostTypeId) > 30)
+    AND AVG(cm.AvgCommentScore) OVER (PARTITION BY p_main.OwnerUserId) > 2 -- Average comment score for owner's posts is high
+ORDER BY
+    PostEngagementWeightedIndex DESC,
+    p_main.CreationDate DESC
+LIMIT 200 OFFSET 10;

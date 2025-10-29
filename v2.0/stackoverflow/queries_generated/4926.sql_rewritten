@@ -1,0 +1,143 @@
+-- {"query": "4926.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1235} 
+WITH RankedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        u.DisplayName AS OwnerDisplayName,
+        u.Reputation AS OwnerReputation,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) as rn_by_type_date,
+        SUM(COALESCE(c.Score, 0)) OVER (PARTITION BY p.Id) as TotalCommentScore
+    FROM Posts p
+    LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    WHERE p.CreationDate BETWEEN DATE_SUB(cast('2024-10-01 12:34:56' as timestamp), INTERVAL 30 DAY) AND cast('2024-10-01 12:34:56' as timestamp)
+    GROUP BY
+        p.Id,
+        p.OwnerUserId,
+        p.PostTypeId,
+        pt.Name,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        u.DisplayName,
+        u.Reputation
+),
+UserPostStats AS (
+    SELECT
+        OwnerUserId,
+        COUNT(Id) AS TotalPosts,
+        AVG(Score) AS AvgPostScore,
+        MAX(CreationDate) AS LastPostDate
+    FROM Posts
+    WHERE OwnerUserId IS NOT NULL AND OwnerUserId <> -1
+    GROUP BY OwnerUserId
+),
+HighReputationUsers AS (
+    SELECT
+        Id,
+        DisplayName,
+        Reputation,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadges
+    FROM Users u
+    WHERE Reputation > 10000
+)
+SELECT
+    rp.PostId,
+    rp.PostTypeName,
+    rp.CreationDate,
+    rp.Score,
+    rp.ViewCount,
+    rp.AnswerCount,
+    rp.CommentCount,
+    rp.FavoriteCount,
+    rp.TotalCommentScore,
+    rp.OwnerDisplayName,
+    rp.OwnerReputation,
+    ups.TotalPosts AS OwnerTotalPosts,
+    ups.AvgPostScore AS OwnerAvgPostScore,
+    CONCAT(COALESCE(hru.DisplayName, 'N/A'), ' (', COALESCE(CAST(hru.Reputation AS VARCHAR), 'N/A'), ')') AS HighRepUser,
+    hru.GoldBadges,
+    hru.SilverBadges,
+    hru.BronzeBadges,
+    CASE
+        WHEN rp.ViewCount > 100000 THEN 'High Traffic'
+        WHEN rp.Score > 100 THEN 'Highly Rated'
+        WHEN rp.AnswerCount > 50 THEN 'Popular Topic'
+        ELSE 'Standard'
+    END AS PostCategory,
+    CASE
+        WHEN EXISTS (SELECT 1 FROM PostLinks pl WHERE pl.PostId = rp.PostId AND pl.LinkTypeId = 3) THEN 'IsDuplicate'
+        ELSE 'NotDuplicate'
+    END AS DuplicateStatus,
+    COALESCE(u.DisplayName, 'Deleted User') AS LastEditorDisplayName,
+    rp.CreationDate + INTERVAL '1 year' AS EstimatedExpiry,
+    'PostRank_' || CAST(rp.rn_by_type_date AS VARCHAR) AS RankByTypeDate
+FROM RankedPosts rp
+LEFT JOIN UserPostStats ups ON rp.OwnerUserId = ups.OwnerUserId
+LEFT JOIN HighReputationUsers hru ON rp.OwnerUserId = hru.Id
+LEFT JOIN Users u ON rp.OwnerUserId = u.Id -- Join for LastEditorDisplayName from a different context if needed, this is a placeholder
+WHERE rp.rn_by_type_date <= 10
+UNION
+SELECT
+    NULL,
+    'Summary',
+    NULL,
+    AVG(Score),
+    SUM(ViewCount),
+    AVG(AnswerCount),
+    AVG(CommentCount),
+    AVG(FavoriteCount),
+    AVG(TotalCommentScore),
+    NULL,
+    AVG(OwnerReputation),
+    COUNT(ups.OwnerUserId),
+    AVG(ups.AvgPostScore),
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL
+FROM RankedPosts rp
+LEFT JOIN UserPostStats ups ON rp.OwnerUserId = ups.OwnerUserId
+WHERE rp.PostTypeId = 1 -- Only for questions in the union part
+UNION
+SELECT
+    NULL,
+    'Overall Avg Score',
+    NULL,
+    AVG(Score),
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL
+FROM Posts
+WHERE PostTypeId = 2;

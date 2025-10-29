@@ -1,0 +1,164 @@
+WITH RECURSIVE RecursiveTagCounts AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        p.Id AS PostId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    WHERE p.PostTypeId = 1
+
+    UNION ALL
+
+    SELECT
+        rt.Id,
+        rt.TagName,
+        rt.Count,
+        rt.IsModeratorOnly,
+        rt.IsRequired,
+        p2.Id,
+        p2.CreationDate,
+        p2.Score,
+        p2.ViewCount,
+        p2.Tags
+    FROM RecursiveTagCounts rt
+    JOIN Posts p2 ON p2.ParentId = rt.PostId AND p2.PostTypeId = 2
+),
+UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT ph.PostId) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6)) AS EditsMade,
+        COUNT(DISTINCT v.PostId) FILTER (WHERE v.VoteTypeId = 2) AS UpVotesMade,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        FIRST_VALUE(u.Location) OVER (PARTITION BY u.Id ORDER BY u.LastAccessDate DESC) AS LocationLatestAccess
+    FROM Users u
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location, u.LastAccessDate
+),
+QuestionAnswerStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate AS QuestionDate,
+        COALESCE(a.AnswerCount,0) AS AnswerCount,
+        COALESCE(a.MaxScore,0) AS MaxAnswerScore,
+        COALESCE(a.TotalAnswerScore,0) AS TotalAnswerScore,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        q.OwnerUserId,
+        q.AcceptedAnswerId
+    FROM Posts q
+    LEFT JOIN (
+        SELECT
+            p.ParentId,
+            COUNT(*) AS AnswerCount,
+            MAX(p.Score) AS MaxScore,
+            SUM(p.Score) AS TotalAnswerScore
+        FROM Posts p
+        WHERE p.PostTypeId = 2
+        GROUP BY p.ParentId
+    ) a ON a.ParentId = q.Id
+    WHERE q.PostTypeId = 1
+),
+TopUsersByAnswerScore AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        SUM(COALESCE(p.Score,0)) AS TotalAnswerScore,
+        DENSE_RANK() OVER (ORDER BY SUM(COALESCE(p.Score,0)) DESC) AS ScoreRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 2
+    GROUP BY u.Id, u.DisplayName
+    HAVING SUM(COALESCE(p.Score,0)) IS NOT NULL
+),
+UserAnswerDetails AS (
+    SELECT
+        p.Id AS AnswerId,
+        p.ParentId AS QuestionId,
+        p.OwnerUserId,
+        p.CreationDate AS AnswerCreationDate,
+        p.Score AS AnswerScore,
+        q.Score AS QuestionScore,
+        u.DisplayName AS AnswerOwner,
+        q.Title AS QuestionTitle,
+        ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS AnswerRank,
+        CASE WHEN q.AcceptedAnswerId = p.Id THEN 1 ELSE 0 END AS IsAccepted
+    FROM Posts p
+    JOIN Posts q ON q.Id = p.ParentId AND q.PostTypeId = 1
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 2
+),
+PostsWithCloseStatus AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.Tags,
+        p.ClosedDate,
+        cr.Name AS CloseReason,
+        ph.Comment AS CloseReasonIdJson
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+    LEFT JOIN CloseReasonTypes cr ON CAST(ph.Comment AS integer) = cr.Id
+    WHERE p.PostTypeId = 1
+)
+SELECT DISTINCT
+    qas.QuestionId,
+    qas.Title AS QuestionTitle,
+    qas.QuestionDate AS QuestionCreated,
+    qas.AnswerCount,
+    qas.MaxAnswerScore,
+    qas.TotalAnswerScore,
+    qas.QuestionScore,
+    qas.ViewCount,
+    qas.Tags,
+    u.DisplayName AS QuestionOwner,
+    ua.AnswerId,
+    ua.AnswerScore,
+    ua.IsAccepted,
+    ua.AnswerRank,
+    ua.AnswerOwner,
+    pws.CloseReason,
+    ueg.EditsMade,
+    ueg.UpVotesMade,
+    ueg.TotalBadges,
+    ueg.GoldBadges,
+    ueg.SilverBadges,
+    ueg.BronzeBadges,
+    ueg.LocationLatestAccess
+FROM QuestionAnswerStats qas
+LEFT JOIN Posts p ON p.Id = qas.AcceptedAnswerId AND p.PostTypeId = 2
+LEFT JOIN Users u ON u.Id = qas.OwnerUserId
+LEFT JOIN UserAnswerDetails ua ON ua.QuestionId = qas.QuestionId AND ua.AnswerRank <= 3
+LEFT JOIN PostsWithCloseStatus pws ON pws.Id = qas.QuestionId
+LEFT JOIN UserEngagement ueg ON ueg.UserId = qas.OwnerUserId
+WHERE qas.ViewCount > (
+    SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = 1
+) AND (
+    pws.CloseReason IS NULL OR pws.CloseReason = 'Off-topic'
+)
+AND (
+    ua.AnswerScore IS NOT NULL AND ua.AnswerScore > (
+        SELECT AVG(Score) FROM Posts WHERE PostTypeId = 2
+    )
+)
+ORDER BY qas.ViewCount DESC, qas.QuestionScore DESC, ua.AnswerScore DESC
+LIMIT 100;

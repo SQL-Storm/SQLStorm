@@ -1,0 +1,196 @@
+WITH
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.CreationDate,
+      COUNT(DISTINCT p.Id) AS TotalPosts,
+      SUM(CASE WHEN pt.Name = 'Question' THEN 1 ELSE 0 END) AS TotalQuestions,
+      SUM(CASE WHEN pt.Name = 'Answer' THEN 1 ELSE 0 END) AS TotalAnswers,
+      MAX(p.CreationDate) AS LastPostDate,
+      AVG(p.Score) AS AvgPostScore,
+      SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS AcceptedAnswersGiven,
+      COUNT(DISTINCT c.Id) AS TotalComments,
+      SUM(CASE WHEN c.Score > 0 THEN 1 ELSE 0 END) AS PositiveComments,
+      COUNT(DISTINCT b.Id) AS TotalBadges,
+      MAX(CASE WHEN b.Class = 1 THEN b.Date ELSE NULL END) AS GoldBadgeDate,
+      MAX(CASE WHEN b.Class = 2 THEN b.Date ELSE NULL END) AS SilverBadgeDate,
+      MAX(CASE WHEN b.Class = 3 THEN b.Date ELSE NULL END) AS BronzeBadgeDate,
+      SUM(CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20) THEN 1 ELSE 0 END) AS ModerationActions
+    FROM
+      Users u
+    LEFT JOIN
+      Posts p
+      ON u.Id = p.OwnerUserId
+    LEFT JOIN
+      PostTypes pt
+      ON p.PostTypeId = pt.Id
+    LEFT JOIN
+      Comments c
+      ON u.Id = c.UserId
+    LEFT JOIN
+      Badges b
+      ON u.Id = b.UserId
+    LEFT JOIN
+      PostHistory ph
+      ON u.Id = ph.UserId
+    WHERE
+      u.Id > 0
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.CreationDate
+  ),
+  PostEngagement AS (
+    SELECT
+      p.Id AS PostId,
+      p.Title,
+      pt.Name AS PostType,
+      u.DisplayName AS OwnerDisplayName,
+      p.CreationDate,
+      p.Score,
+      p.ViewCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      p.AnswerCount,
+      COALESCE(p.ClosedDate, TIMESTAMP '1900-01-01 00:00:00') AS ActualClosedDate,
+      p.CommunityOwnedDate,
+      CASE
+        WHEN p.PostTypeId = 1 THEN COALESCE(p.AnswerCount, 0)
+        ELSE 0
+      END AS QuestionAnswerCount,
+      CASE
+        WHEN p.PostTypeId = 2 THEN 1
+        ELSE 0
+      END AS IsAnswer,
+      COUNT(DISTINCT c.Id) AS CommentCountOnPost,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesOnPost,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesOnPost,
+      COUNT(DISTINCT pl.Id) AS PostLinksCount
+    FROM
+      Posts p
+    JOIN
+      PostTypes pt
+      ON p.PostTypeId = pt.Id
+    JOIN
+      Users u
+      ON p.OwnerUserId = u.Id
+    LEFT JOIN
+      Comments c
+      ON p.Id = c.PostId
+    LEFT JOIN
+      Votes v
+      ON p.Id = v.PostId AND v.VoteTypeId IN (2, 3)
+    LEFT JOIN
+      PostLinks pl
+      ON p.Id = pl.PostId OR p.Id = pl.RelatedPostId
+    WHERE
+      p.CreationDate >= DATE '2023-01-01' AND p.PostTypeId IN (1, 2)
+    GROUP BY
+      p.Id,
+      p.Title,
+      pt.Name,
+      u.DisplayName,
+      p.CreationDate,
+      p.Score,
+      p.ViewCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      p.AnswerCount,
+      p.ClosedDate,
+      p.CommunityOwnedDate,
+      p.PostTypeId
+  ),
+  RankedPosts AS (
+    SELECT
+      pe.PostId,
+      pe.Title,
+      pe.PostType,
+      pe.OwnerDisplayName,
+      pe.CreationDate,
+      pe.Score,
+      pe.ViewCount,
+      pe.CommentCount,
+      pe.FavoriteCount,
+      pe.AnswerCount,
+      pe.ActualClosedDate,
+      pe.CommunityOwnedDate,
+      pe.QuestionAnswerCount,
+      pe.IsAnswer,
+      pe.CommentCountOnPost,
+      pe.UpVotesOnPost,
+      pe.DownVotesOnPost,
+      pe.PostLinksCount,
+      ROW_NUMBER() OVER (ORDER BY pe.Score DESC, pe.ViewCount DESC) AS ScoreRank,
+      DENSE_RANK() OVER (PARTITION BY pe.PostType ORDER BY pe.FavoriteCount DESC) AS FavoriteRankByType,
+      SUM(pe.UpVotesOnPost) OVER (ORDER BY pe.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS RunningTotalUpvotes
+    FROM
+      PostEngagement pe
+  ),
+  TopPostOwner AS (
+    SELECT
+      p.OwnerUserId AS OwnerUserId
+    FROM
+      Posts p
+    WHERE
+      p.Id = (
+        SELECT
+          r.PostId
+        FROM
+          RankedPosts r
+        ORDER BY
+          r.Score DESC
+        FETCH FIRST 1 ROW ONLY
+      )
+    FETCH FIRST 1 ROW ONLY
+  )
+SELECT
+  ua.DisplayName,
+  ua.TotalPosts,
+  ua.TotalQuestions,
+  ua.TotalAnswers,
+  ua.AvgPostScore,
+  ua.AcceptedAnswersGiven,
+  ua.TotalComments,
+  ua.PositiveComments,
+  ua.TotalBadges,
+  ua.GoldBadgeDate,
+  ua.SilverBadgeDate,
+  ua.BronzeBadgeDate,
+  rp.Title AS TopPostTitle,
+  rp.Score AS TopPostScore,
+  rp.ViewCount AS TopPostViewCount,
+  rp.FavoriteRankByType,
+  rp.RunningTotalUpvotes,
+  CASE
+    WHEN rp.ActualClosedDate <> TIMESTAMP '1900-01-01 00:00:00' AND rp.CommunityOwnedDate IS NULL THEN 'Open'
+    WHEN rp.ActualClosedDate <> TIMESTAMP '1900-01-01 00:00:00' AND rp.CommunityOwnedDate IS NOT NULL THEN 'Community Owned & Closed'
+    WHEN rp.ActualClosedDate = TIMESTAMP '1900-01-01 00:00:00' AND rp.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+    ELSE 'Open'
+  END AS PostStatus,
+  CHARACTER_LENGTH(ua.DisplayName) AS DisplayNameLength,
+  SUBSTRING(ua.DisplayName FROM 1 FOR 3) AS DisplayNamePrefix,
+  CASE
+    WHEN ua.LastPostDate > ua.CreationDate THEN 'Active'
+    ELSE 'Inactive'
+  END AS UserActivityStatus,
+  CASE
+    WHEN ua.TotalQuestions > 0 AND ua.TotalAnswers > 0 THEN CAST(ua.TotalAnswers AS DOUBLE PRECISION) / ua.TotalQuestions
+    ELSE 0.0
+  END AS AnswerToQuestionRatio,
+  rp.PostLinksCount AS LinksToTopPost
+FROM
+  UserActivity ua
+LEFT JOIN
+  TopPostOwner tpo
+  ON ua.UserId = tpo.OwnerUserId
+LEFT JOIN
+  RankedPosts rp
+  ON tpo.OwnerUserId = CAST(rp.OwnerDisplayName AS INTEGER)
+WHERE
+  ua.TotalPosts > 10
+ORDER BY
+  ua.TotalBadges DESC,
+  ua.AvgPostScore DESC,
+  DisplayNameLength DESC
+FETCH FIRST 10 ROWS ONLY;

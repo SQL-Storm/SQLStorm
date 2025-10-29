@@ -1,0 +1,155 @@
+WITH top_posts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.PostTypeId,
+    p.CreationDate,
+    p.ViewCount,
+    p.Score,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.Body,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.LastEditorUserId,
+    p.LastEditDate,
+    p.ContentLicense
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+recent_activity AS (
+  SELECT
+    t.PostId,
+    t.LastActivityDate,
+    t.Score,
+    t.ViewCount,
+    t.AnswerCount,
+    t.CommentCount,
+    t.OwnerUserId,
+    t.Tags,
+    t.Title
+  FROM top_posts t
+  UNION ALL
+  SELECT
+    p.Id AS PostId,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.OwnerUserId,
+    p.Tags,
+    p.Title
+  FROM Posts p
+  WHERE p.PostTypeId = 2
+),
+author_stats AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.ProfileImageUrl,
+    u.Location,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.LastAccessDate DESC) AS rn
+  FROM Users u
+),
+badge_activity AS (
+  SELECT
+    b.UserId,
+    b.Name AS BadgeName,
+    b.Date AS AwardDate,
+    b.Class,
+    b.TagBased,
+    ROW_NUMBER() OVER (PARTITION BY b.UserId, b.Name ORDER BY b.Date DESC) AS rn
+  FROM Badges b
+),
+recent_votes AS (
+  SELECT
+    v.PostId,
+    v.VoteTypeId,
+    v.UserId,
+    v.CreationDate,
+    v.BountyAmount,
+    ROW_NUMBER() OVER (PARTITION BY v.PostId ORDER BY v.CreationDate DESC) AS rn
+  FROM Votes v
+  WHERE v.CreationDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days')
+),
+link_summary AS (
+  SELECT
+    pl.PostId,
+    pl.RelatedPostId,
+    lt.Name AS LinkTypeName,
+    pl.CreationDate
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+  WHERE lt.Name IN ('Linked','Duplicate')
+),
+complex_calc AS (
+  SELECT
+    t.PostId,
+    t.Title,
+    t.Tags,
+    t.LastActivityDate,
+    t.Score,
+    t.ViewCount,
+    (t.Score * 1.0 / NULLIF(t.ViewCount,0)) AS score_per_view,
+    EXTRACT(epoch FROM (CAST('2024-10-01' AS date) - CAST(t.LastActivityDate AS date))) / (365.0 * 24 * 60 * 60) AS age_years,
+    t.OwnerUserId
+  FROM recent_activity t
+),
+windowed AS (
+  SELECT
+    c.PostId,
+    c.Title,
+    c.Tags,
+    c.LastActivityDate,
+    c.Score,
+    c.ViewCount,
+    c.score_per_view,
+    c.age_years,
+    c.OwnerUserId,
+    ROW_NUMBER() OVER (PARTITION BY c.PostId ORDER BY c.LastActivityDate DESC) AS wn
+  FROM complex_calc c
+)
+SELECT
+  w.PostId,
+  w.Title,
+  w.Tags,
+  w.LastActivityDate,
+  w.Score,
+  w.ViewCount,
+  w.score_per_view,
+  w.age_years,
+  a.DisplayName AS Author,
+  a.Reputation,
+  a.rn AS AuthorRank,
+  b.BadgeName,
+  b.AwardDate,
+  b.Class AS BadgeClass,
+  rv.VoteTypeId,
+  rv.CreationDate AS VoteDate,
+  ls.RelatedPostId,
+  ls.LinkTypeName,
+  pv.rn AS VoteDupRank
+FROM windowed w
+LEFT JOIN author_stats a ON w.OwnerUserId = a.UserId
+LEFT JOIN badge_activity b ON a.UserId = b.UserId AND b.rn = 1
+LEFT JOIN recent_votes rv ON w.PostId = rv.PostId AND rv.rn = 1
+LEFT JOIN link_summary ls ON w.PostId = ls.PostId
+LEFT JOIN (
+  SELECT PostId, MIN(rn) AS rn
+  FROM recent_votes
+  GROUP BY PostId
+) pv ON w.PostId = pv.PostId
+WHERE w.wn = 1
+ORDER BY w.LastActivityDate DESC
+LIMIT 100;

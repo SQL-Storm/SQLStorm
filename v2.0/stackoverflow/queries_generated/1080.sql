@@ -1,0 +1,181 @@
+-- {"query": "1080.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3121} 
+
+WITH InfluentialUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.UpVotes AS UserUpVotes,
+        u.DownVotes AS UserDownVotes,
+        u.Views AS UserViews,
+        COUNT(b.Id) AS TotalBadges,
+        COUNT(CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        NTILE(4) OVER (ORDER BY u.Reputation DESC) AS ReputationQuartile,
+        FIRST_VALUE(u.DisplayName) OVER (ORDER BY u.Reputation DESC) AS OverallTopRepUser
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation >= 10000 -- High reputation threshold
+      AND u.CreationDate >= (CURRENT_DATE - INTERVAL '6 years') -- Relatively recent users
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.UpVotes, u.DownVotes, u.Views
+    HAVING COUNT(b.Id) > 5 -- Users with at least some badges
+),
+PostBodyMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        LENGTH(COALESCE(p.Body, '')) AS BodyLength,
+        LENGTH(COALESCE(p.Title, '')) AS TitleLength,
+        (p.Body LIKE '%<pre><code>%</pre></code>%' OR p.Body LIKE '%<code>%</code>%') AS HasCodeBlock,
+        CASE
+            WHEN p.Tags IS NOT NULL AND LENGTH(TRIM(p.Tags)) > 2
+            THEN CARDINALITY(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><'))
+            ELSE 0
+        END AS TagCount,
+        (p.Score * 1.0 / NULLIF(LENGTH(COALESCE(p.Body, '')), 0)) AS ScoreDensity,
+        p.Tags
+    FROM Posts p
+),
+PostVoteSummary AS (
+    SELECT
+        v.PostId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotes,
+        SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS TotalFavoriteVotes,
+        (SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) * 1.0 / NULLIF(SUM(CASE WHEN v.VoteTypeId IN (2,3) THEN 1 ELSE 0 END), 0)) AS UpVoteRatio
+    FROM Votes v
+    WHERE v.VoteTypeId IN (2, 3, 5) -- UpMod, DownMod, Favorite
+    GROUP BY v.PostId
+),
+PostHistoryMetrics AS (
+    SELECT
+        ph.PostId,
+        COUNT(DISTINCT ph.UserId)::BIGINT AS DistinctEditorCount,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 5 THEN ph.CreationDate END) AS LastBodyEditDate, -- Body edit
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) AS ClosureDate, -- Post Closed event
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 AND ph.Comment IS NOT NULL THEN CAST(ph.Comment AS SMALLINT) ELSE NULL END) AS CloseReasonId_IfClosed
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4,5,6,10) -- Edit Title, Edit Body, Edit Tags, Post Closed
+    GROUP BY ph.PostId
+)
+SELECT
+    'QuestionAnalysis' AS RecordType,
+    iu.UserId,
+    iu.DisplayName,
+    iu.Reputation,
+    iu.UserCreationDate,
+    p.Id AS EntityId,
+    p.Title AS EntityTitle,
+    p.CreationDate AS EntityCreationDate,
+    p.Score AS EntityScore,
+    p.ViewCount AS EntityViewCount,
+    p.AnswerCount AS EntityAnswerCount,
+    p.FavoriteCount AS EntityFavoriteCount,
+    pbm.BodyLength,
+    pbm.TitleLength,
+    pbm.HasCodeBlock,
+    pbm.TagCount,
+    pbm.ScoreDensity,
+    COALESCE(pvs.TotalUpVotes, 0) AS TotalUpVotes,
+    COALESCE(pvs.TotalDownVotes, 0) AS TotalDownVotes,
+    COALESCE(pvs.UpVoteRatio, 0.0) AS UpVoteRatio,
+    phm.DistinctEditorCount AS PostDistinctEditorCount,
+    phm.LastBodyEditDate AS PostLastBodyEditDate,
+    phm.ClosureDate AS PostClosureDate,
+    crt.Name AS PostCloseReason,
+    COALESCE( (SELECT AVG(c.Score) FROM Comments c WHERE c.PostId = p.Id)::NUMERIC, 0.0) AS AvgCommentScore, -- Correlated Subquery 1
+    p.CommentCount AS PostCommentCount,
+    COALESCE( (SELECT SUM(v.BountyAmount) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 8)::NUMERIC, 0.0) AS TotalBountyAmountOffered, -- Correlated Subquery 2
+    COUNT(DISTINCT pl_linked.RelatedPostId)::BIGINT AS LinkedPostsCount,
+    COUNT(DISTINCT pl_duplicate.RelatedPostId)::BIGINT AS DuplicatePostsCount,
+    LAG(p.ViewCount, 1, 0) OVER (PARTITION BY iu.UserId ORDER BY p.CreationDate) AS PrevActivityMetric, -- Window Function 1
+    NTILE(5) OVER (ORDER BY p.ViewCount DESC, p.Score DESC) AS PostRankMetric, -- Window Function 2
+    CASE
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        ELSE 'Active'
+    END AS PostStatus,
+    COALESCE(p.CommunityOwnedDate, p.LastActivityDate, p.CreationDate) AS EffectiveLastActivityDate,
+    STRING_AGG(DISTINCT (string_to_array(SUBSTRING(pbm.Tags, 2, LENGTH(pbm.Tags) - 2), '><'))[s.idx], ', ') FILTER (WHERE (string_to_array(SUBSTRING(pbm.Tags, 2, LENGTH(pbm.Tags) - 2), '><'))[s.idx] ILIKE '%sql%') AS KeywordRelatedTags -- String expression with array and aggregation
+FROM InfluentialUsers iu
+JOIN Posts p ON iu.UserId = p.OwnerUserId
+JOIN PostBodyMetrics pbm ON p.Id = pbm.PostId
+LEFT JOIN PostVoteSummary pvs ON p.Id = pvs.PostId
+LEFT JOIN PostHistoryMetrics phm ON p.Id = phm.PostId
+LEFT JOIN CloseReasonTypes crt ON phm.CloseReasonId_IfClosed = crt.Id
+LEFT JOIN PostLinks pl_linked ON p.Id = pl_linked.PostId AND pl_linked.LinkTypeId = 1 -- Linked posts
+LEFT JOIN PostLinks pl_duplicate ON p.Id = pl_duplicate.PostId AND pl_duplicate.LinkTypeId = 3 -- Duplicate posts
+LEFT JOIN LATERAL GENERATE_SERIES(1, pbm.TagCount) s(idx) ON pbm.TagCount > 0 -- Simulate unnesting for string_agg filter
+WHERE p.PostTypeId = 1 -- Only questions
+  AND p.CreationDate >= (CURRENT_DATE - INTERVAL '5 years') -- Focus on recent questions
+  AND p.Score > 5 -- Only questions with positive engagement
+GROUP BY
+    iu.UserId, iu.DisplayName, iu.Reputation, iu.UserCreationDate,
+    p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.FavoriteCount,
+    pbm.BodyLength, pbm.TitleLength, pbm.HasCodeBlock, pbm.TagCount, pbm.ScoreDensity, pbm.Tags,
+    pvs.TotalUpVotes, pvs.TotalDownVotes, pvs.UpVoteRatio,
+    phm.DistinctEditorCount, phm.LastBodyEditDate, phm.ClosureDate, crt.Name, p.CommentCount,
+    p.ClosedDate, p.CommunityOwnedDate, p.LastActivityDate
+UNION ALL
+SELECT
+    'AnswerAnalysis' AS RecordType,
+    iu.UserId,
+    iu.DisplayName,
+    iu.Reputation,
+    iu.UserCreationDate,
+    pa.Id AS EntityId,
+    qp.Title AS EntityTitle, -- Parent Question's Title
+    pa.CreationDate AS EntityCreationDate,
+    pa.Score AS EntityScore,
+    qp.ViewCount AS EntityViewCount, -- Parent Question's ViewCount
+    NULL AS EntityAnswerCount,
+    pa.FavoriteCount AS EntityFavoriteCount,
+    pbm_a.BodyLength,
+    NULL AS TitleLength, -- Answers don't have Title
+    pbm_a.HasCodeBlock,
+    pbm_q.TagCount AS TagCount, -- Tags from parent question
+    pbm_a.ScoreDensity,
+    COALESCE(pvs_a.TotalUpVotes, 0) AS TotalUpVotes,
+    COALESCE(pvs_a.TotalDownVotes, 0) AS TotalDownVotes,
+    COALESCE(pvs_a.UpVoteRatio, 0.0) AS UpVoteRatio,
+    phm_a.DistinctEditorCount AS PostDistinctEditorCount,
+    phm_a.LastBodyEditDate AS PostLastBodyEditDate,
+    NULL AS PostClosureDate,
+    NULL AS PostCloseReason,
+    COALESCE( (SELECT AVG(c.Score) FROM Comments c WHERE c.PostId = pa.Id)::NUMERIC, 0.0) AS AvgCommentScore, -- Correlated Subquery 3
+    pa.CommentCount AS PostCommentCount,
+    NULL::NUMERIC AS TotalBountyAmountOffered,
+    NULL::BIGINT AS LinkedPostsCount,
+    NULL::BIGINT AS DuplicatePostsCount,
+    LAG(pa.Score, 1, 0) OVER (PARTITION BY iu.UserId ORDER BY pa.CreationDate) AS PrevActivityMetric, -- Window Function 3
+    RANK() OVER (PARTITION BY qp.Id ORDER BY pa.Score DESC, pa.CreationDate) AS PostRankMetric, -- Window Function 4
+    CASE
+        WHEN qp.AcceptedAnswerId = pa.Id THEN 'Accepted Answer'
+        WHEN pa.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        ELSE 'Active'
+    END AS PostStatus,
+    COALESCE(pa.CommunityOwnedDate, pa.LastActivityDate, pa.CreationDate) AS EffectiveLastActivityDate,
+    STRING_AGG(DISTINCT (string_to_array(SUBSTRING(pbm_q.Tags, 2, LENGTH(pbm_q.Tags) - 2), '><'))[s.idx], ', ') FILTER (WHERE (string_to_array(SUBSTRING(pbm_q.Tags, 2, LENGTH(pbm_q.Tags) - 2), '><'))[s.idx] ILIKE '%java%') AS KeywordRelatedTags -- String expression with array and aggregation (for parent question tags)
+FROM InfluentialUsers iu
+JOIN Posts pa ON iu.UserId = pa.OwnerUserId
+JOIN Posts qp ON pa.ParentId = qp.Id -- Join to get parent question details
+JOIN PostBodyMetrics pbm_a ON pa.Id = pbm_a.PostId
+LEFT JOIN PostBodyMetrics pbm_q ON qp.Id = pbm_q.PostId -- For parent question tags
+LEFT JOIN PostVoteSummary pvs_a ON pa.Id = pvs_a.PostId
+LEFT JOIN PostHistoryMetrics phm_a ON pa.Id = phm_a.PostId
+LEFT JOIN LATERAL GENERATE_SERIES(1, pbm_q.TagCount) s(idx) ON pbm_q.TagCount > 0
+WHERE pa.PostTypeId = 2 -- Only answers
+  AND pa.CreationDate >= (CURRENT_DATE - INTERVAL '5 years') -- Focus on recent answers
+  AND (pa.Score >= 10 OR qp.AcceptedAnswerId = pa.Id) -- High-scoring or accepted answers
+GROUP BY
+    iu.UserId, iu.DisplayName, iu.Reputation, iu.UserCreationDate,
+    pa.Id, qp.Title, pa.CreationDate, pa.Score, qp.ViewCount, pa.FavoriteCount,
+    pbm_a.BodyLength, pbm_a.HasCodeBlock, pbm_q.TagCount, pbm_a.ScoreDensity, pbm_q.Tags,
+    pvs_a.TotalUpVotes, pvs_a.TotalDownVotes, pvs_a.UpVoteRatio,
+    phm_a.DistinctEditorCount, phm_a.LastBodyEditDate, pa.CommentCount,
+    qp.Id, qp.AcceptedAnswerId, pa.CommunityOwnedDate, pa.LastActivityDate
+ORDER BY Reputation DESC, EntityCreationDate DESC
+LIMIT 500;

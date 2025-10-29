@@ -1,0 +1,242 @@
+-- {"query": "7856.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2376} 
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+        CASE 
+            WHEN p.Score > 100 THEN 'High'
+            WHEN p.Score > 50 THEN 'Medium'
+            ELSE 'Low'
+        END as score_category
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserActivity AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        COUNT(DISTINCT p.Id) as post_count,
+        COUNT(DISTINCT c.Id) as comment_count,
+        COUNT(DISTINCT b.Id) as badge_count,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) as question_count,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) as answer_count,
+        AVG(p.Score) as avg_score,
+        MAX(p.CreationDate) as latest_activity
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views
+),
+PostMetrics AS (
+    SELECT 
+        rp.Id as PostId,
+        rp.Title,
+        rp.Tags,
+        rp.Score,
+        rp.ViewCount,
+        rp.AnswerCount,
+        rp.CommentCount,
+        rp.FavoriteCount,
+        rp.score_category,
+        rp.prev_score,
+        CASE 
+            WHEN rp.prev_score IS NOT NULL AND rp.prev_score > 0 
+            THEN ((rp.Score - rp.prev_score) * 100.0 / rp.prev_score)
+            ELSE NULL 
+        END as score_change_percent,
+        CASE 
+            WHEN rp.AnswerCount > 0 AND rp.QuestionCount > 0 
+            THEN CAST(rp.AnswerCount AS FLOAT) / CAST(rp.QuestionCount AS FLOAT)
+            ELSE NULL 
+        END as answer_to_question_ratio,
+        COALESCE(rp.Score, 0) + COALESCE(rp.ViewCount, 0) + COALESCE(rp.AnswerCount, 0) + COALESCE(rp.CommentCount, 0) as composite_metric,
+        DENSE_RANK() OVER (ORDER BY COALESCE(rp.Score, 0) + COALESCE(rp.ViewCount, 0) + COALESCE(rp.AnswerCount, 0) + COALESCE(rp.CommentCount, 0) DESC) as metric_rank
+    FROM RankedPosts rp
+    JOIN UserActivity ua ON rp.OwnerUserId = ua.UserId
+    WHERE rp.rn = 1 AND rp.Score IS NOT NULL
+)
+SELECT 
+    pm.PostId,
+    pm.Title,
+    pm.Tags,
+    pm.Score,
+    pm.ViewCount,
+    pm.AnswerCount,
+    pm.CommentCount,
+    pm.FavoriteCount,
+    pm.score_category,
+    pm.score_change_percent,
+    pm.answer_to_question_ratio,
+    pm.composite_metric,
+    pm.metric_rank,
+    ua.DisplayName as AuthorName,
+    ua.Reputation as AuthorReputation,
+    ua.post_count as AuthorPostCount,
+    ua.question_count as AuthorQuestionCount,
+    ua.answer_count as AuthorAnswerCount,
+    ua.avg_score as AuthorAvgScore,
+    CASE 
+        WHEN pm.score_change_percent IS NOT NULL AND pm.score_change_percent > 50 THEN 'Significant Growth'
+        WHEN pm.score_change_percent IS NOT NULL AND pm.score_change_percent > 20 THEN 'Moderate Growth'
+        WHEN pm.score_change_percent IS NOT NULL AND pm.score_change_percent < -50 THEN 'Significant Decline'
+        WHEN pm.score_change_percent IS NOT NULL AND pm.score_change_percent < -20 THEN 'Moderate Decline'
+        ELSE 'Stable'
+    END as performance_trend,
+    CASE 
+        WHEN pm.composite_metric > (SELECT AVG(composite_metric) * 1.5 FROM PostMetrics) THEN 'Top Tier'
+        WHEN pm.composite_metric > (SELECT AVG(composite_metric) * 1.2 FROM PostMetrics) THEN 'High Tier'
+        WHEN pm.composite_metric > (SELECT AVG(composite_metric) * 0.8 FROM PostMetrics) THEN 'Normal Tier'
+        ELSE 'Low Tier'
+    END as performance_category,
+    CASE 
+        WHEN ua.post_count > 50 THEN 'Highly Active'
+        WHEN ua.post_count > 25 THEN 'Active'
+        WHEN ua.post_count > 10 THEN 'Moderate'
+        ELSE 'Low Activity'
+    END as author_engagement_level,
+    CASE 
+        WHEN pm.Tags IS NOT NULL AND LENGTH(pm.Tags) > 0 THEN 
+            STRING_AGG(
+                TRIM(SUBSTRING(pm.Tags, 
+                    POSITION('<' IN pm.Tags) + 1, 
+                    POSITION('>' IN SUBSTRING(pm.Tags, POSITION('<' IN pm.Tags) + 1)) - 1)), 
+                ', '
+            )
+        ELSE ''
+    END as extracted_tags,
+    (SELECT COUNT(*) 
+     FROM PostHistory ph 
+     WHERE ph.PostId = pm.PostId 
+       AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)) as edit_count,
+    (SELECT COUNT(*) 
+     FROM Votes v 
+     WHERE v.PostId = pm.PostId 
+       AND v.VoteTypeId = 2) as upvote_count,
+    (SELECT COUNT(*) 
+     FROM Votes v 
+     WHERE v.PostId = pm.PostId 
+       AND v.VoteTypeId = 3) as downvote_count,
+    (SELECT COUNT(*) 
+     FROM Comments c 
+     WHERE c.PostId = pm.PostId) as comment_count_total
+FROM PostMetrics pm
+JOIN UserActivity ua ON pm.OwnerUserId = ua.UserId
+WHERE pm.metric_rank <= 1000
+  AND pm.score_category IN ('High', 'Medium')
+  AND pm.composite_metric > 100
+  AND pm.metric_rank > (
+    SELECT AVG(metric_rank) 
+    FROM PostMetrics 
+    WHERE score_category = 'High'
+  )
+  AND CASE 
+        WHEN pm.score_change_percent IS NOT NULL THEN ABS(pm.score_change_percent) > 10
+        ELSE FALSE 
+      END
+  AND ua.latest_activity >= '2019-01-01'
+GROUP BY 
+    pm.PostId, pm.Title, pm.Tags, pm.Score, pm.ViewCount, pm.AnswerCount, 
+    pm.CommentCount, pm.FavoriteCount, pm.score_category, pm.score_change_percent,
+    pm.answer_to_question_ratio, pm.composite_metric, pm.metric_rank,
+    ua.DisplayName, ua.Reputation, ua.post_count, ua.question_count,
+    ua.answer_count, ua.avg_score, ua.latest_activity
+HAVING 
+    COUNT(*) > 0
+EXCEPT
+SELECT 
+    pm.PostId,
+    pm.Title,
+    pm.Tags,
+    pm.Score,
+    pm.ViewCount,
+    pm.AnswerCount,
+    pm.CommentCount,
+    pm.FavoriteCount,
+    pm.score_category,
+    pm.score_change_percent,
+    pm.answer_to_question_ratio,
+    pm.composite_metric,
+    pm.metric_rank,
+    ua.DisplayName as AuthorName,
+    ua.Reputation as AuthorReputation,
+    ua.post_count as AuthorPostCount,
+    ua.question_count as AuthorQuestionCount,
+    ua.answer_count as AuthorAnswerCount,
+    ua.avg_score as AuthorAvgScore,
+    CASE 
+        WHEN pm.score_change_percent IS NOT NULL AND pm.score_change_percent > 50 THEN 'Significant Growth'
+        WHEN pm.score_change_percent IS NOT NULL AND pm.score_change_percent > 20 THEN 'Moderate Growth'
+        WHEN pm.score_change_percent IS NOT NULL AND pm.score_change_percent < -50 THEN 'Significant Decline'
+        WHEN pm.score_change_percent IS NOT NULL AND pm.score_change_percent < -20 THEN 'Moderate Decline'
+        ELSE 'Stable'
+    END as performance_trend,
+    CASE 
+        WHEN pm.composite_metric > (SELECT AVG(composite_metric) * 1.5 FROM PostMetrics) THEN 'Top Tier'
+        WHEN pm.composite_metric > (SELECT AVG(composite_metric) * 1.2 FROM PostMetrics) THEN 'High Tier'
+        WHEN pm.composite_metric > (SELECT AVG(composite_metric) * 0.8 FROM PostMetrics) THEN 'Normal Tier'
+        ELSE 'Low Tier'
+    END as performance_category,
+    CASE 
+        WHEN ua.post_count > 50 THEN 'Highly Active'
+        WHEN ua.post_count > 25 THEN 'Active'
+        WHEN ua.post_count > 10 THEN 'Moderate'
+        ELSE 'Low Activity'
+    END as author_engagement_level,
+    CASE 
+        WHEN pm.Tags IS NOT NULL AND LENGTH(pm.Tags) > 0 THEN 
+            STRING_AGG(
+                TRIM(SUBSTRING(pm.Tags, 
+                    POSITION('<' IN pm.Tags) + 1, 
+                    POSITION('>' IN SUBSTRING(pm.Tags, POSITION('<' IN pm.Tags) + 1)) - 1)), 
+                ', '
+            )
+        ELSE ''
+    END as extracted_tags,
+    (SELECT COUNT(*) 
+     FROM PostHistory ph 
+     WHERE ph.PostId = pm.PostId 
+       AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)) as edit_count,
+    (SELECT COUNT(*) 
+     FROM Votes v 
+     WHERE v.PostId = pm.PostId 
+       AND v.VoteTypeId = 2) as upvote_count,
+    (SELECT COUNT(*) 
+     FROM Votes v 
+     WHERE v.PostId = pm.PostId 
+       AND v.VoteTypeId = 3) as downvote_count,
+    (SELECT COUNT(*) 
+     FROM Comments c 
+     WHERE c.PostId = pm.PostId) as comment_count_total
+FROM PostMetrics pm
+JOIN UserActivity ua ON pm.OwnerUserId = ua.UserId
+WHERE pm.metric_rank <= 500
+  AND pm.score_category = 'High'
+  AND pm.composite_metric > 500
+  AND pm.score_change_percent IS NOT NULL
+  AND pm.score_change_percent > 30
+  AND ua.Reputation > 10000
+GROUP BY 
+    pm.PostId, pm.Title, pm.Tags, pm.Score, pm.ViewCount, pm.AnswerCount, 
+    pm.CommentCount, pm.FavoriteCount, pm.score_category, pm.score_change_percent,
+    pm.answer_to_question_ratio, pm.composite_metric, pm.metric_rank,
+    ua.DisplayName, ua.Reputation, ua.post_count, ua.question_count,
+    ua.answer_count, ua.avg_score, ua.latest_activity
+HAVING 
+    COUNT(*) > 0
+ORDER BY pm.composite_metric DESC, pm.metric_rank ASC
+LIMIT 1000;

@@ -1,0 +1,147 @@
+WITH
+  QuestionEdits AS (
+    SELECT
+      ph.PostId,
+      COUNT(ph.Id) AS NumberOfEdits,
+      SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS ContentEdits,
+      MAX(ph.CreationDate) AS LastEditDate,
+      AVG(EXTRACT(EPOCH FROM ph.CreationDate)) AS AvgEditDateEpoch
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (1,2,3,4,5,6,7,8,9)
+    GROUP BY ph.PostId
+  ),
+  AnswerDetails AS (
+    SELECT
+      p.Id AS QuestionId,
+      COUNT(a.Id) AS NumberOfAnswers,
+      SUM(CASE WHEN a.OwnerUserId = p.OwnerUserId THEN 1 ELSE 0 END) AS AnswersByOwner,
+      SUM(CASE WHEN a.OwnerUserId IS NULL THEN 1 ELSE 0 END) AS CommunityAnswers,
+      MAX(a.CreationDate) AS LastAnswerDate,
+      SUM(a.Score) AS TotalAnswerScore,
+      AVG(a.Score) AS AvgAnswerScore
+    FROM Posts p
+    LEFT JOIN Posts a
+      ON p.Id = a.ParentId AND a.PostTypeId = 2
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id
+  ),
+  TagStats AS (
+    SELECT
+      t.TagName,
+      t.Count,
+      (
+        SELECT COUNT(*)
+        FROM Posts p
+        WHERE p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+      ) AS PostsWithTag,
+      (
+        SELECT AVG(p.Score)
+        FROM Posts p
+        WHERE p.Tags LIKE '%' || '<' || t.TagName || '>' || '%' AND p.PostTypeId = 1
+      ) AS AvgQuestionScoreForTag
+    FROM Tags t
+    WHERE t.TagName NOT LIKE '%-%'
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      COUNT(DISTINCT p.Id) AS TotalPosts,
+      COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestions,
+      COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswers,
+      SUM(p.Score) AS TotalUserScore,
+      MAX(u.CreationDate) AS UserCreationDate,
+      FLOOR((EXTRACT(EPOCH FROM TIMESTAMP '2024-10-01 12:34:56') - EXTRACT(EPOCH FROM u.CreationDate)) / 86400) AS UserAgeInDays,
+      CASE WHEN u.WebsiteUrl IS NULL THEN 'No Website' ELSE 'Has Website' END AS WebsiteStatus,
+      CASE WHEN u.AboutMe LIKE '%SQL%' THEN 'SQL Mentioned' ELSE 'No SQL Mention' END AS AboutMeSQL
+    FROM Users u
+    LEFT JOIN Posts p
+      ON u.Id = p.OwnerUserId
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.CreationDate,
+      u.WebsiteUrl,
+      u.AboutMe
+  ),
+  PostWithUserAndAnswer AS (
+    SELECT
+      p.Id AS PostId,
+      p.Title,
+      p.CreationDate AS PostCreationDate,
+      p.Score AS PostScore,
+      p.AnswerCount,
+      p.ViewCount,
+      p.OwnerUserId,
+      u.DisplayName AS OwnerDisplayName,
+      ad.NumberOfAnswers,
+      ad.TotalAnswerScore,
+      ue.NumberOfEdits,
+      ue.LastEditDate,
+      CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+      CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN 1 ELSE 0 END AS IsCommunityOwned
+    FROM Posts p
+    JOIN Users u
+      ON p.OwnerUserId = u.Id
+    LEFT JOIN AnswerDetails ad
+      ON p.Id = ad.QuestionId
+    LEFT JOIN QuestionEdits ue
+      ON p.Id = ue.PostId
+    WHERE p.PostTypeId = 1 AND p.CreationDate > DATE '2023-01-01'
+  )
+SELECT
+  pwua.PostId,
+  pwua.Title,
+  pwua.PostScore,
+  pwua.NumberOfAnswers,
+  pwua.TotalAnswerScore,
+  pwua.NumberOfEdits,
+  pwua.IsClosed,
+  pwua.IsCommunityOwned,
+  ua.DisplayName AS OriginalPoster,
+  ua.UserAgeInDays,
+  ua.AboutMeSQL,
+  ts.AvgQuestionScoreForTag,
+  (
+    SELECT COUNT(*)
+    FROM Votes v
+    WHERE v.PostId = pwua.PostId AND v.VoteTypeId = 2
+  ) AS TotalUpVotes,
+  (
+    SELECT COUNT(*)
+    FROM Comments c
+    WHERE c.PostId = pwua.PostId
+  ) AS TotalComments,
+  CASE
+    WHEN pwua.NumberOfAnswers > 0
+      AND pwua.PostScore > (pwua.TotalAnswerScore::numeric / NULLIF(pwua.NumberOfAnswers,0)) THEN 'High Score Question Relative to Answers'
+    WHEN pwua.NumberOfAnswers = 0 AND pwua.PostScore > 10 THEN 'High Score Question with No Answers'
+    ELSE 'Standard Performance'
+  END AS PerformanceCategory,
+  ROW_NUMBER() OVER (ORDER BY pwua.PostScore DESC) AS RankByScore,
+  RANK() OVER (PARTITION BY ua.UserAgeInDays ORDER BY pwua.PostScore DESC) AS RankForUserAgeGroup
+FROM PostWithUserAndAnswer pwua
+JOIN UserActivity ua
+  ON pwua.OwnerUserId = ua.UserId
+LEFT JOIN Tags t
+  ON pwua.Title LIKE '%' || t.TagName || '%'
+LEFT JOIN TagStats ts
+  ON t.TagName = ts.TagName
+WHERE
+  pwua.PostScore > 5 AND ua.UserAgeInDays > 365
+GROUP BY
+  pwua.PostId,
+  pwua.Title,
+  pwua.PostScore,
+  pwua.NumberOfAnswers,
+  pwua.TotalAnswerScore,
+  pwua.NumberOfEdits,
+  pwua.IsClosed,
+  pwua.IsCommunityOwned,
+  ua.DisplayName,
+  ua.UserAgeInDays,
+  ua.AboutMeSQL,
+  ts.AvgQuestionScoreForTag,
+  pwua.OwnerUserId
+HAVING
+  COUNT(t.TagName) > 0 OR pwua.Title LIKE '%SQL%';

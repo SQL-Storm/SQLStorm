@@ -1,0 +1,167 @@
+-- {"query": "4222.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1648} 
+
+WITH
+  RankedPostEdits AS (
+    SELECT
+      ph.PostId,
+      ph.UserId,
+      ph.CreationDate,
+      ph.PostHistoryTypeId,
+      p.PostTypeId,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory AS ph
+    JOIN Posts AS p
+      ON ph.PostId = p.Id
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate AS UserCreationDate,
+      COUNT(DISTINCT p.Id) AS QuestionCount,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+      MAX(p.CreationDate) AS LastPostDate,
+      CAST(AVG(JULIANDAY(p.CreationDate) - JULIANDAY(u.CreationDate)) AS REAL) AS AvgDaysToFirstPost,
+      CAST(AVG(CASE WHEN p.PostTypeId = 2 THEN JULIANDAY(p.CreationDate) - JULIANDAY(u.CreationDate) ELSE NULL END) AS REAL) AS AvgDaysToFirstAnswer
+    FROM Users AS u
+    LEFT JOIN Posts AS p
+      ON u.Id = p.OwnerUserId
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate
+  ),
+  TagContribution AS (
+    SELECT
+      t.TagName,
+      COUNT(DISTINCT ps.Id) AS PostCount,
+      CAST(AVG(ps.Score) AS REAL) AS AvgScore,
+      SUM(CASE WHEN ps.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+      SUM(CASE WHEN ps.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+      COUNT(DISTINCT pf.PostId) AS FavoriteCount
+    FROM Tags AS t
+    LEFT JOIN Posts AS ps
+      ON ',' || ps.Tags || ',' LIKE '%,' || t.TagName || ',%'
+    LEFT JOIN Posts AS pf
+      ON ps.Id = pf.Id AND pf.FavoriteCount > 0
+    WHERE
+      t.TagName NOT LIKE '%-!%' -- Exclude specific tag types if necessary
+    GROUP BY
+      t.TagName
+  )
+SELECT
+  u.DisplayName AS UserDisplayName,
+  u.Reputation,
+  u.UserCreationDate,
+  u.QuestionCount,
+  u.AnswerCount,
+  u.AvgDaysToFirstPost,
+  u.AvgDaysToFirstAnswer,
+  p.Title AS LastEditedQuestionTitle,
+  p.CreationDate AS LastEditedQuestionCreationDate,
+  p.LastEditDate AS LastEditTimestamp,
+  p.Score AS LastEditedQuestionScore,
+  p.AnswerCount AS LastEditedQuestionAnswerCount,
+  tc.TagName,
+  tc.PostCount,
+  tc.AvgScore,
+  tc.FavoriteCount,
+  CASE
+    WHEN u.Reputation > 100000 THEN 'Legendary'
+    WHEN u.Reputation > 50000 THEN 'Expert'
+    WHEN u.Reputation > 10000 THEN 'Advanced'
+    WHEN u.Reputation > 1000 THEN 'Intermediate'
+    ELSE 'Novice'
+  END AS ReputationTier,
+  STRFTIME('%Y-%m', u.LastPostDate) AS MonthOfLastPost,
+  CASE
+    WHEN LENGTH(u.DisplayName) > 15 THEN SUBSTR(u.DisplayName, 1, 15) || '...'
+    ELSE u.DisplayName
+  END AS TruncatedDisplayName,
+  CASE
+    WHEN u.DisplayName IS NULL THEN 'Unknown'
+    ELSE u.DisplayName
+  END AS DisplayNameOrUnknown,
+  p.ViewCount,
+  p.CommentCount,
+  p.ClosedDate,
+  COALESCE(p.FavoriteCount, 0) AS NonNullFavoriteCount,
+  CASE
+    WHEN p.ClosedDate IS NOT NULL THEN STRFTIME('%Y', p.ClosedDate)
+    ELSE STRFTIME('%Y', p.CreationDate)
+  END AS YearOfClosureOrCreation,
+  (
+    SELECT
+      COUNT(*)
+    FROM Comments AS c
+    WHERE
+      c.UserId = u.UserId AND c.Score > 5
+  ) AS HighScoringCommentCount,
+  (
+    SELECT
+      COUNT(*)
+    FROM Votes AS v
+    WHERE
+      v.UserId = u.UserId AND v.VoteTypeId = 2 AND v.CreationDate > DATE('now', '-30 day')
+  ) AS RecentUpvotes,
+  CASE WHEN EXISTS (SELECT 1 FROM Badges AS b WHERE b.UserId = u.UserId AND b.Name LIKE '%Tag%' AND b.Class = 1) THEN 'Gold Tag Badge' ELSE 'No Gold Tag Badge' END AS HasGoldTagBadge,
+  CASE WHEN tc.TagName IN ('sql', 'performance', 'query', 'database') THEN TRUE ELSE FALSE END AS IsPerformanceRelatedTag
+FROM Users AS u
+JOIN RankedPostEdits AS rpe
+  ON u.Id = rpe.UserId AND rpe.rn = 1
+LEFT JOIN Posts AS p
+  ON rpe.PostId = p.Id
+LEFT JOIN TagContribution AS tc
+  ON tc.TagName IN (
+    SELECT
+      TRIM(SUBSTR(t.TagName, INSTR(t.TagName, '>') + 1))
+    FROM (
+      SELECT
+        SUBSTR(t.Tags, INSTR(t.Tags, '>') + 1) AS TagName
+      FROM Posts AS t
+      WHERE
+        t.Id = p.Id
+    ) AS t
+  ) AND tc.PostCount > 10
+WHERE
+  u.Reputation BETWEEN 1000 AND 50000
+  AND u.Views > 100
+  AND p.Score > 0
+  AND p.Title IS NOT NULL
+  AND p.Title <> ''
+  AND p.Title LIKE '%performance%'
+  AND u.DisplayName IS NOT NULL
+  AND NOT EXISTS (
+    SELECT
+      1
+    FROM Badges AS b
+    WHERE
+      b.UserId = u.Id AND b.Name = 'Autobiographer'
+  )
+GROUP BY
+  u.DisplayName,
+  u.Reputation,
+  u.UserCreationDate,
+  u.QuestionCount,
+  u.AnswerCount,
+  u.AvgDaysToFirstPost,
+  u.AvgDaysToFirstAnswer,
+  p.Title,
+  p.CreationDate,
+  p.LastEditDate,
+  p.Score,
+  p.AnswerCount,
+  tc.TagName,
+  tc.PostCount,
+  tc.AvgScore,
+  tc.FavoriteCount,
+  u.LastPostDate,
+  p.ViewCount,
+  p.CommentCount,
+  p.ClosedDate
+HAVING
+  COUNT(DISTINCT p.Id) > 2 OR SUM(p.Score) > 10;

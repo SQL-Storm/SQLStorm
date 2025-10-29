@@ -1,0 +1,74 @@
+-- {"query": "5576.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 577} 
+WITH
+q AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.ViewCount,
+    p.Score,
+    p.Tags,
+    p.OwnerUserId,
+    u.DisplayName AS OwnerName,
+    COUNT(DISTINCT c.Id) AS CommentCount,
+    COUNT(DISTINCT v.Id) AS VoteCount,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+    MAX(CASE WHEN b.Id IS NOT NULL THEN 1 ELSE 0 END) OVER () AS HasBadge
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Comments c ON c.PostId = p.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  LEFT JOIN Badges b ON b.UserId = p.OwnerUserId
+  WHERE p.PostTypeId = 1
+    AND p.ClosedDate IS NULL
+  GROUP BY
+    p.Id, p.Title, p.CreationDate, p.LastActivityDate, p.ViewCount, p.Score, p.Tags, p.OwnerUserId, u.DisplayName
+),
+recent AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.ViewCount,
+    p.Score,
+    p.Tags,
+    p.OwnerUserId,
+    p.OwnerName,
+    p.CommentCount,
+    p.VoteCount,
+    p.UpVotes,
+    p.DownVotes,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate DESC) AS rn
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId = 1
+    AND p.LastActivityDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '90 days'
+)
+SELECT
+  r.PostId,
+  r.Title,
+  r.CreationDate,
+  r.LastActivityDate,
+  r.ViewCount,
+  r.Score,
+  r.Tags,
+  r.OwnerUserId,
+  r.OwnerName,
+  r.CommentCount,
+  r.VoteCount,
+  r.UpVotes,
+  r.DownVotes
+FROM recent r
+JOIN LATERAL (
+  SELECT
+    COALESCE(pv.BountyAmount, 0) AS BountyAmount
+  FROM Votes pv
+  WHERE pv.PostId = r.PostId
+  ORDER BY pv.CreationDate DESC
+  LIMIT 1
+) AS vb ON true
+ORDER BY r.LastActivityDate DESC
+LIMIT 100;

@@ -1,0 +1,144 @@
+select PostId, count(*) as CommentCount
+        from Comments
+        group by PostId
+    ) cmt on cmt.PostId = p.Id
+    left join (
+        select
+            PostId,
+            sum(case when VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+            sum(case when VoteTypeId = 3 then 1 else 0 end) as DownVotes
+        from Votes
+        group by PostId
+    ) v on v.PostId = p.Id
+), RankedAnswers as (
+    select
+        p.Id,
+        p.ParentId,
+        p.Score,
+        p.CreationDate,
+        u.DisplayName as OwnerName,
+        row_number() over (partition by p.ParentId order by p.Score desc, p.CreationDate asc) as AnswerRank
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId = 2
+), DuplicateQuestions as (
+    select pl.PostId, pl.RelatedPostId, lt.Name as LinkTypeName, p1.Title as PostTitle, p2.Title as RelatedTitle
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    join Posts p1 on p1.Id = pl.PostId
+    join Posts p2 on p2.Id = pl.RelatedPostId
+    where lt.Name = 'Duplicate'
+), LatestPostHistories as (
+    select distinct on (PostId) 
+        ph.PostId,
+        ph.Id as HistoryId,
+        ph.PostHistoryTypeId,
+        pht.Name as HistoryTypeName,
+        ph.CreationDate,
+        ph.UserId,
+        u.DisplayName,
+        ph.Comment,
+        ph.Text
+    from PostHistory ph
+    join PostHistoryTypes pht on pht.Id = ph.PostHistoryTypeId
+    left join Users u on u.Id = ph.UserId
+    order by ph.PostId, ph.CreationDate desc
+)
+select 
+    ua.UserId,
+    ua.DisplayName as UserDisplayName,
+    ua.Reputation,
+    coalesce(bs.GoldBadges, 0) as GoldBadges,
+    coalesce(bs.SilverBadges, 0) as SilverBadges,
+    coalesce(bs.BronzeBadges, 0) as BronzeBadges,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.TotalPostScore,
+    p.Id as PostId,
+    p.PostTypeId,
+    p.Title,
+    p.Tags,
+    p.Score as PostScore,
+    p.ViewCount,
+    p.CommentCount,
+    p.UpVotes,
+    p.DownVotes,
+    case when p.IsClosed = 1 then 'Closed' else 'Open' end as PostStatus,
+    ra.Id as TopAnswerId,
+    ra.AnswerRank,
+    ra.Score as TopAnswerScore,
+    ra.OwnerName as TopAnswerOwner,
+    dup.RelatedPostId as DuplicateOf,
+    dup.RelatedTitle as DuplicateTitle,
+    lph.HistoryTypeName as LatestPostChange,
+    lph.CreationDate as LatestChangeDate,
+    round(
+        case 
+            when ua.TotalPostScore > 0 then 
+                ((cast(p.UpVotes as double precision) + 1) / nullif(p.DownVotes + 1, 0)) * ln(ua.TotalPostScore + 1)
+            else 0 
+        end
+        , 4) as WeightedScoreMetric,
+    substring(
+      substring(p.Tags from 2 for char_length(p.Tags) - 2)
+      from '([^><]+)') as FirstTag,
+    case 
+        when array_length(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><'), 1) > 3 then 'Multi Tag'
+        else 'Few Tags'
+    end as TagDensity,
+    coalesce(u.Location, 'Unknown') as UserLocation,
+    rank() over (partition by case when ua.Reputation >= 10000 then 1 else 0 end order by ua.Reputation desc) as ReputationRankHigh,
+    dense_rank() over (partition by case when ua.Reputation < 10000 then 1 else 0 end order by ua.Reputation desc) as ReputationRankNormal
+from UserActivity ua
+left join BadgeSummary bs on bs.UserId = ua.UserId
+left join Posts p on p.OwnerUserId = ua.UserId and p.PostTypeId = 1
+left join RankedAnswers ra on ra.ParentId = p.Id and ra.AnswerRank = 1
+left join DuplicateQuestions dup on dup.PostId = p.Id
+left join LatestPostHistories lph on lph.PostId = p.Id
+left join Users u on u.Id = ua.UserId
+where ua.QuestionCount > 0
+  and (
+    (p.CreationDate > DATE '2015-01-01' and p.Score > 5)
+    or
+    (ra.Score > 10 and ra.AnswerRank = 1)
+  )
+union
+select
+    ua.UserId,
+    ua.DisplayName || ' (without questions)' as UserDisplayName,
+    ua.Reputation,
+    coalesce(bs.GoldBadges,0),
+    coalesce(bs.SilverBadges,0),
+    coalesce(bs.BronzeBadges,0),
+    0 as QuestionCount,
+    ua.AnswerCount,
+    ua.TotalPostScore,
+    cast(NULL as bigint) as PostId,
+    cast(NULL as integer) as PostTypeId,
+    cast(NULL as text) as Title,
+    cast(NULL as text) as Tags,
+    cast(NULL as integer) as PostScore,
+    cast(NULL as integer) as ViewCount,
+    cast(NULL as integer) as CommentCount,
+    cast(NULL as integer) as UpVotes,
+    cast(NULL as integer) as DownVotes,
+    cast(NULL as text) as PostStatus,
+    cast(NULL as bigint) as TopAnswerId,
+    cast(NULL as integer) as AnswerRank,
+    cast(NULL as integer) as TopAnswerScore,
+    cast(NULL as text) as TopAnswerOwner,
+    cast(NULL as bigint) as DuplicateOf,
+    cast(NULL as text) as DuplicateTitle,
+    cast(NULL as text) as LatestPostChange,
+    cast(NULL as timestamp) as LatestChangeDate,
+    cast(NULL as numeric) as WeightedScoreMetric,
+    cast(NULL as text) as FirstTag,
+    cast(NULL as text) as TagDensity,
+    cast(NULL as text) as UserLocation,
+    cast(NULL as bigint) as ReputationRankHigh,
+    cast(NULL as bigint) as ReputationRankNormal
+from UserActivity ua
+left join BadgeSummary bs on bs.UserId = ua.UserId
+where ua.QuestionCount = 0
+order by ua.Reputation desc, UserDisplayName, PostId nulls last
+limit 100;

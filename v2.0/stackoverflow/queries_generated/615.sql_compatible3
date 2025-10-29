@@ -1,0 +1,371 @@
+with recent_posts as (
+    select
+        p.id as post_id,
+        p.posttypeid,
+        p.creationdate,
+        p.owneruserid,
+        p.score,
+        p.viewcount,
+        p.title,
+        p.tags,
+        case when p.closeddate is not null then 1 else 0 end as is_closed
+    from posts p
+    where p.creationdate >= (select max(creationdate) - interval '365 days' from posts)
+),
+user_activity as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate as user_created,
+        u.location,
+        u.websiteurl,
+        coalesce(u.upvotes, 0) - coalesce(u.downvotes, 0) as net_votes,
+        coalesce(nullif(trim(coalesce(u.location,'')), ''), 'Unknown') as norm_location
+    from users u
+),
+badge_stats as (
+    select
+        b.userid as user_id,
+        count(*) as badge_count,
+        sum(case when b.class = 1 then 1 else 0 end) as gold_count,
+        sum(case when b.class = 2 then 1 else 0 end) as silver_count,
+        sum(case when b.class = 3 then 1 else 0 end) as bronze_count,
+        min(b.date) as first_badge_date,
+        max(b.date) as last_badge_date
+    from badges b
+    group by b.userid
+),
+post_votes as (
+    select
+        v.postid,
+        count(case when v.votetypeid = 2 then 1 end) as upmods,
+        count(case when v.votetypeid = 3 then 1 end) as downmods,
+        count(case when v.votetypeid = 5 then 1 end) as favorites,
+        sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_total,
+        min(v.creationdate) as first_vote,
+        max(v.creationdate) as last_vote
+    from votes v
+    group by v.postid
+),
+comment_stats as (
+    select
+        c.postid,
+        count(*) as comment_count,
+        max(c.creationdate) as last_comment_date,
+        sum(case when c.score > 0 then 1 else 0 end) as positive_comments
+    from comments c
+    group by c.postid
+),
+close_reasons as (
+    select
+        ph.postid,
+        max(case when ph.posthistorytypeid = 10 then ph.creationdate end) as last_closed_date,
+        max(case when ph.posthistorytypeid = 10 then
+                 case when ph.comment ~ '^[0-9]+$' then cast(ph.comment as integer) else null end
+            end) as last_close_reason_id
+    from posthistory ph
+    group by ph.postid
+),
+dup_links as (
+    select
+        pl.postid,
+        count(case when pl.linktypeid = 3 then 1 end) as duplicate_links,
+        count(case when pl.linktypeid = 1 then 1 end) as linked_links,
+        max(pl.creationdate) as last_link_date
+    from postlinks pl
+    group by pl.postid
+),
+tag_expansion as (
+    select
+        rp.post_id,
+        unnest(string_to_array(substring(coalesce(rp.tags, ''), 2, greatest(length(coalesce(rp.tags,'')) - 2, 0)), '><')) as tagname
+    from recent_posts rp
+    where rp.posttypeid = 1
+),
+tag_ranks as (
+    select
+        te.post_id,
+        te.tagname,
+        t.count as tag_global_count,
+        row_number() over (partition by te.post_id order by coalesce(t.count, 0) desc, te.tagname) as tag_rank_dense
+    from tag_expansion te
+    left join tags t on lower(t.tagname) = lower(te.tagname)
+),
+top_tags as (
+    select
+        tr.post_id,
+        string_agg(tr.tagname, '|' order by tr.tag_rank_dense) as top3_tags,
+        sum(coalesce(tr.tag_global_count,0)) as top_tag_popularity
+    from tag_ranks tr
+    where tr.tag_rank_dense <= 3
+    group by tr.post_id
+),
+post_enriched as (
+    select
+        rp.post_id,
+        rp.posttypeid,
+        rp.creationdate,
+        rp.owneruserid,
+        rp.score,
+        rp.viewcount,
+        rp.title,
+        rp.tags,
+        rp.is_closed,
+        pv.upmods,
+        pv.downmods,
+        pv.favorites,
+        pv.bounty_total,
+        pv.first_vote,
+        pv.last_vote,
+        cs.comment_count,
+        cs.last_comment_date,
+        cs.positive_comments,
+        cr.last_closed_date,
+        cr.last_close_reason_id,
+        dl.duplicate_links,
+        dl.linked_links,
+        dl.last_link_date,
+        tt.top3_tags,
+        tt.top_tag_popularity
+    from recent_posts rp
+    left join post_votes pv on pv.postid = rp.post_id
+    left join comment_stats cs on cs.postid = rp.post_id
+    left join close_reasons cr on cr.postid = rp.post_id
+    left join dup_links dl on dl.postid = rp.post_id
+    left join top_tags tt on tt.post_id = rp.post_id
+),
+user_rollup as (
+    select
+        ua.user_id,
+        ua.displayname,
+        ua.reputation,
+        ua.user_created,
+        ua.location,
+        ua.websiteurl,
+        ua.net_votes,
+        ua.norm_location,
+        bs.badge_count,
+        bs.gold_count,
+        bs.silver_count,
+        bs.bronze_count,
+        bs.first_badge_date,
+        bs.last_badge_date,
+        count(pe.post_id) as posts_in_period,
+        sum(case when pe.posttypeid = 1 then 1 else 0 end) as questions_in_period,
+        sum(case when pe.posttypeid = 2 then 1 else 0 end) as answers_in_period,
+        coalesce(sum(pe.score), 0) as period_score_sum,
+        coalesce(sum(pe.viewcount), 0) as period_views_sum,
+        coalesce(sum(pe.favorites), 0) as period_favorites_sum,
+        max(pe.creationdate) as last_post_date
+    from user_activity ua
+    left join badge_stats bs on bs.user_id = ua.user_id
+    left join post_enriched pe on pe.owneruserid = ua.user_id
+    group by
+        ua.user_id, ua.displayname, ua.reputation, ua.user_created, ua.location, ua.websiteurl, ua.net_votes, ua.norm_location,
+        bs.badge_count, bs.gold_count, bs.silver_count, bs.bronze_count, bs.first_badge_date, bs.last_badge_date
+),
+post_quality as (
+    select
+        pe.post_id,
+        pe.owneruserid,
+        pe.posttypeid,
+        pe.creationdate,
+        pe.score,
+        pe.viewcount,
+        pe.favorites,
+        pe.upmods,
+        pe.downmods,
+        pe.comment_count,
+        pe.positive_comments,
+        pe.bounty_total,
+        pe.is_closed,
+        pe.last_closed_date,
+        pe.last_close_reason_id,
+        pe.duplicate_links,
+        pe.linked_links,
+        pe.top3_tags,
+        pe.top_tag_popularity,
+        round((
+             coalesce(pe.score,0) * 1.0
+             + coalesce(pe.upmods,0) * 0.8
+             - coalesce(pe.downmods,0) * 1.2
+             + coalesce(pe.favorites,0) * 0.5
+             + ln(1 + greatest(coalesce(pe.viewcount,0),0)) * 0.7
+             + least(coalesce(pe.positive_comments,0), 20) * 0.3
+             + case when coalesce(pe.bounty_total,0) > 0 then 2 else 0 end
+             - case when pe.is_closed = 1 then 3 else 0 end
+             - least(coalesce(pe.duplicate_links,0), 5) * 0.6
+        )::numeric, 2) as quality_score
+    from post_enriched pe
+),
+percentiles as (
+    select
+        pq.posttypeid,
+        percentile_cont(0.5) within group (order by pq.quality_score) as p50,
+        percentile_cont(0.9) within group (order by pq.quality_score) as p90
+    from post_quality pq
+    group by pq.posttypeid
+),
+post_ranked as (
+    select
+        pq.post_id,
+        pq.owneruserid,
+        pq.posttypeid,
+        pq.creationdate,
+        pq.score,
+        pq.viewcount,
+        pq.favorites,
+        pq.upmods,
+        pq.downmods,
+        pq.comment_count,
+        pq.positive_comments,
+        pq.bounty_total,
+        pq.is_closed,
+        pq.last_closed_date,
+        pq.last_close_reason_id,
+        pq.duplicate_links,
+        pq.linked_links,
+        pq.top3_tags,
+        pq.top_tag_popularity,
+        pq.quality_score,
+        pr.posttypeid as pr_posttype,
+        ntile(10) over (partition by pq.posttypeid order by pq.quality_score desc) as decile,
+        row_number() over (partition by pq.posttypeid order by pq.quality_score desc, pq.creationdate desc, pq.post_id) as rn,
+        avg(pq.quality_score) over (partition by pq.owneruserid) as user_avg_quality
+    from post_quality pq
+    join posts pr on pr.id = pq.post_id
+),
+correlated_flags as (
+    select
+        pq.post_id,
+        max(case when (exists (
+            select 1
+            from posthistory ph
+            where ph.postid = pq.post_id
+              and ph.posthistorytypeid in (24,14,19,50)
+              and ph.creationdate >= pq.creationdate
+        )) then 1 else 0 end) = 1 as has_significant_history,
+        max(case when (exists (
+            select 1
+            from comments c
+            where c.postid = pq.post_id
+              and c.creationdate >= pq.creationdate
+              and c.score > 5
+        )) then 1 else 0 end) = 1 as has_popular_comment
+    from post_quality pq
+    group by pq.post_id
+),
+final_set as (
+    select
+        pr.post_id,
+        pr.owneruserid,
+        pr.posttypeid,
+        pr.creationdate,
+        pr.quality_score,
+        pr.decile,
+        pr.user_avg_quality,
+        ua.displayname,
+        ua.reputation,
+        ua.net_votes,
+        ua.norm_location,
+        ua.badge_count,
+        ua.gold_count,
+        ua.silver_count,
+        ua.bronze_count,
+        ua.posts_in_period,
+        ua.questions_in_period,
+        ua.answers_in_period,
+        pe.top3_tags,
+        pe.top_tag_popularity,
+        coalesce(to_char(cast(pe.last_closed_date as timestamp without time zone), 'YYYY-MM'), 'N/A') as last_closed_month,
+        case when pe.last_close_reason_id is null then 'None'
+             else coalesce((select crt.name from closereasontypes crt where crt.id = pe.last_close_reason_id), 'Unknown')
+        end as last_close_reason,
+        cf.has_significant_history,
+        cf.has_popular_comment
+    from post_ranked pr
+    left join post_enriched pe on pe.post_id = pr.post_id
+    left join user_rollup ua on ua.user_id = pr.owneruserid
+    left join correlated_flags cf on cf.post_id = pr.post_id
+),
+augmented as (
+    select
+        fs.*,
+        case
+            when fs.quality_score >= coalesce(pct.p90, fs.quality_score) then 'Elite'
+            when fs.quality_score >= coalesce(pct.p50, fs.quality_score) then 'Strong'
+            else 'Typical'
+        end as quality_band
+    from final_set fs
+    left join percentiles pct on pct.posttypeid = fs.posttypeid
+),
+location_agg as (
+    select
+        a.norm_location,
+        count(*) as posts_cnt,
+        avg(a.quality_score) as avg_quality,
+        sum(case when a.quality_band = 'Elite' then 1 else 0 end) as elite_cnt
+    from augmented a
+    group by a.norm_location
+),
+elite_posts as (
+    select post_id, owneruserid, 'ELITE' as bucket from augmented where quality_band = 'Elite'
+    union
+    select a.post_id, a.owneruserid, 'TOP_TYPICAL' as bucket
+    from augmented a
+    where a.quality_band = 'Typical'
+      and a.norm_location in (
+        select l.norm_location
+        from location_agg l
+        order by l.avg_quality desc, l.posts_cnt desc
+        limit 5
+      )
+)
+select
+    a.post_id,
+    a.posttypeid,
+    a.creationdate,
+    a.quality_score,
+    a.quality_band,
+    a.decile,
+    a.user_avg_quality,
+    a.top3_tags,
+    a.top_tag_popularity,
+    a.last_close_reason,
+    a.has_significant_history,
+    a.has_popular_comment,
+    u.displayname,
+    u.reputation,
+    u.badge_count,
+    u.gold_count,
+    u.silver_count,
+    u.bronze_count,
+    u.posts_in_period,
+    u.questions_in_period,
+    u.answers_in_period,
+    u.net_votes,
+    u.norm_location,
+    ep.bucket as cohort_bucket,
+    rank() over (order by a.quality_score desc, a.creationdate desc, a.post_id) as global_rank
+from augmented a
+left join user_rollup u on u.user_id = a.owneruserid
+left join elite_posts ep on ep.post_id = a.post_id
+where
+    (
+        a.quality_band in ('Elite','Strong')
+        or (ep.bucket = 'TOP_TYPICAL' and coalesce(a.top3_tags, '') <> '')
+    )
+    and (
+        a.last_close_reason is null
+        or position(lower('duplicate') in lower(coalesce(a.last_close_reason,''))) = 0
+    )
+    and (
+        a.norm_location is null
+        or length(a.norm_location) >= 2
+    )
+order by
+    a.quality_score desc,
+    a.creationdate desc,
+    a.post_id
+limit 500;

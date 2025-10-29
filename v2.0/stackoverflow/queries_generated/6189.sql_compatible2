@@ -1,0 +1,104 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.Title,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        U.DisplayName,
+        U.Reputation,
+        P.OwnerUserId,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.ViewCount DESC) AS rank,
+        P.Tags
+    FROM 
+        Posts P
+    JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId IN (1, 2) AND P.Score > 0
+),
+BadgeCounts AS (
+    SELECT 
+        U.Id AS UserId,
+        COUNT(DISTINCT B.Id) AS BadgeCount
+    FROM 
+        Users U
+    JOIN 
+        Badges B ON U.Id = B.UserId
+    GROUP BY 
+        U.Id
+)
+SELECT 
+    RP.Id,
+    RP.Title,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.DisplayName,
+    RP.Reputation,
+    COALESCE(BC.BadgeCount, 0) AS BadgeCount,
+    CASE 
+        WHEN RP.rank <= 10 THEN 'Top'
+        WHEN RP.rank <= 100 THEN 'High'
+        ELSE 'Low'
+    END AS RankTier,
+    (
+        SELECT 
+            STRING_AGG(T.TagName, ', ')
+        FROM 
+            Tags T
+        JOIN (
+            -- split RP.Tags on '><' and remove surrounding '<' '>' in a SQL-dialect-neutral way
+            -- this produces a derived table of tag tokens
+            SELECT
+                CAST(TRIM(BOTH '<' FROM TRIM(BOTH '>' FROM token)) AS VARCHAR(255)) AS tag_token
+            FROM (
+                SELECT
+                    -- replace '><' with a delimiter and then split; use common table approach for dialects that support regexp_replace and string_split alternatives
+                    -- For broad compatibility we emulate splitting by repeated substring extraction using a recursive CTE
+                    -- Fallback: if tags is NULL or empty, return no rows
+                    CASE WHEN RP.Tags IS NULL OR RP.Tags = '' THEN NULL ELSE RP.Tags END AS tags_full
+            ) tags_source
+            CROSS JOIN LATERAL (
+                -- Convert tags_full like '<1><2><3>' into rows by iterative parsing in a dialect-neutral way is not portable.
+                -- Use a simple parser assuming tags are in form '<id><id2>...'
+                -- Implemented here with a recursive CTE per-row.
+                SELECT token FROM (
+                    WITH RECURSIVE splitter(pos, rest, token) AS (
+                        SELECT 1, tags_source.tags_full,
+                               NULL
+                        UNION ALL
+                        SELECT
+                            CASE
+                                WHEN instr(rest, '><') = 0 THEN length(rest) + 1
+                                ELSE instr(rest, '><') + 1
+                            END,
+                            CASE
+                                WHEN instr(rest, '><') = 0 THEN ''
+                                ELSE substr(rest, instr(rest, '><') + 2)
+                            END,
+                            CASE
+                                WHEN rest LIKE '<%>' THEN
+                                    -- single tag remaining
+                                    substr(rest, 2, length(rest) - 2)
+                                WHEN instr(rest, '><') = 0 THEN
+                                    NULL
+                                ELSE
+                                    substr(rest, 2, instr(rest, '><') - 2)
+                            END
+                        FROM splitter
+                        WHERE rest IS NOT NULL AND rest <> ''
+                    )
+                    SELECT token FROM splitter WHERE token IS NOT NULL
+                ) s_tokens
+            ) split_tokens(token)
+        ) tag_tokens ON TRUE
+        JOIN Tags T ON CAST(tag_tokens.tag_token AS INTEGER) = T.Id
+    ) AS Tags
+FROM 
+    RankedPosts RP
+LEFT JOIN 
+    BadgeCounts BC ON RP.OwnerUserId = BC.UserId
+ORDER BY 
+    RP.Score DESC, RP.ViewCount DESC
+LIMIT 100;

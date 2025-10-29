@@ -1,0 +1,348 @@
+-- {"query": "118.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3342} 
+with recent_questions as (
+    select
+        p.Id as QuestionId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        coalesce(p.AnswerCount, 0) as AnswerCount
+    from Posts p
+    where p.PostTypeId = 1
+      and p.CreationDate >= (select max(CreationDate) - interval '365 days' from Posts where PostTypeId = 1)
+),
+answers as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId as AnswererId,
+        a.CreationDate as AnswerCreationDate,
+        a.Score as AnswerScore,
+        row_number() over (partition by a.ParentId order by a.Score desc nulls last, a.CreationDate asc) as rn_by_score,
+        min(a.CreationDate) over (partition by a.ParentId) as first_answer_time
+    from Posts a
+    where a.PostTypeId = 2
+),
+question_stats as (
+    select
+        q.QuestionId,
+        q.OwnerUserId,
+        q.CreationDate as QuestionCreationDate,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.Title,
+        q.Tags,
+        q.AnswerCount,
+        min(a.AnswerCreationDate) as FirstAnswerAt,
+        max(a.AnswerCreationDate) as LastAnswerAt,
+        count(a.AnswerId) as ActualAnswerCount,
+        sum(case when a.AnswerScore > 0 then 1 else 0 end) as PositiveAnswers,
+        avg(a.AnswerScore::numeric) as AvgAnswerScore
+    from recent_questions q
+    left join answers a on a.QuestionId = q.QuestionId
+    group by q.QuestionId, q.OwnerUserId, q.CreationDate, q.Score, q.ViewCount, q.Title, q.Tags, q.AnswerCount
+),
+question_owner as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate as UserCreationDate,
+        u.Location,
+        u.UpVotes,
+        u.DownVotes,
+        u.Views as ProfileViews
+    from Users u
+),
+badges_by_user as (
+    select
+        b.UserId,
+        count(*) as TotalBadges,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        sum(case when b.TagBased = 1 then 1 else 0 end) as TagBadges,
+        max(b.Date) as LastBadgeDate
+    from Badges b
+    group by b.UserId
+),
+dup_links as (
+    select
+        pl.PostId as DuplicateQuestionId,
+        count(*) filter (where pl.LinkTypeId = 3) as DuplicateCount,
+        string_agg(distinct pl.RelatedPostId::text, ',') as RelatedDuplicateIds
+    from PostLinks pl
+    where pl.LinkTypeId = 3
+    group by pl.PostId
+),
+close_events as (
+    select
+        ph.PostId as QuestionId,
+        min(ph.CreationDate) as FirstClosedAt,
+        max(ph.CreationDate) as LastClosedAt,
+        count(*) as CloseEvents,
+        -- extract close reasons from the overloaded Comment column when type 10
+        string_agg(distinct
+            case
+                when ph.PostHistoryTypeId = 10 then
+                    trim(both '"' from split_part(coalesce(ph.Comment, ''), ':', 1))
+                else null
+            end
+            , ',') as CloseReasonIds
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (10,11,12,13,35)
+    group by ph.PostId
+),
+votes_on_questions as (
+    select
+        v.PostId as QuestionId,
+        count(*) filter (where v.VoteTypeId = 2) as UpVotes,
+        count(*) filter (where v.VoteTypeId = 3) as DownVotes,
+        count(*) filter (where v.VoteTypeId = 5) as Favorites,
+        count(*) filter (where v.VoteTypeId = 8) as BountyStarts,
+        sum(case when v.VoteTypeId in (8,9) then coalesce(v.BountyAmount,0) else 0 end) as BountyTotal
+    from Votes v
+    join recent_questions rq on rq.QuestionId = v.PostId
+    group by v.PostId
+),
+hotness as (
+    select
+        qs.QuestionId,
+        -- arbitrary "hotness" score to benchmark expressions
+        (coalesce(qs.ViewCount,0) / greatest(extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - qs.QuestionCreationDate)) / 3600.0, 1.0))::numeric
+        + coalesce(vq.UpVotes,0)*2
+        - coalesce(vq.DownVotes,0)
+        + coalesce(qs.QuestionScore,0)*1.5
+        + least(coalesce(qs.ActualAnswerCount,0), 10)*0.75
+        + case when ce.FirstClosedAt is not null then -5 else 0 end
+        + coalesce(vq.BountyTotal,0)/100.0
+        as HotnessScore
+    from question_stats qs
+    left join votes_on_questions vq on vq.QuestionId = qs.QuestionId
+    left join close_events ce on ce.QuestionId = qs.QuestionId
+),
+tag_expansion as (
+    select
+        qs.QuestionId,
+        unnest(string_to_array(substring(coalesce(qs.Tags,''), 2, greatest(length(coalesce(qs.Tags,'')) - 2, 0)), '><')) as TagName
+    from question_stats qs
+),
+tag_info as (
+    select
+        te.QuestionId,
+        te.TagName,
+        t.Count as TagGlobalCount,
+        t.IsModeratorOnly,
+        t.IsRequired
+    from tag_expansion te
+    left join Tags t on lower(t.TagName) = lower(te.TagName)
+),
+tag_metrics as (
+    select
+        QuestionId,
+        count(*) as TagCount,
+        avg(coalesce(TagGlobalCount,0)::numeric) as AvgTagPopularity,
+        sum(case when IsModeratorOnly = 1 then 1 else 0 end) as ModOnlyTags,
+        sum(case when IsRequired = 1 then 1 else 0 end) as RequiredTags,
+        string_agg(TagName, '|' order by TagGlobalCount desc nulls last) as TagList
+    from tag_info
+    group by QuestionId
+),
+accepted_answer as (
+    select
+        q.Id as QuestionId,
+        p.Id as AcceptedAnswerId,
+        p.OwnerUserId as AcceptedAnswererId,
+        p.Score as AcceptedAnswerScore,
+        p.CreationDate as AcceptedAnswerCreationDate
+    from Posts q
+    left join Posts p on p.Id = q.AcceptedAnswerId and p.PostTypeId = 2
+    where q.PostTypeId = 1
+),
+answerer_stats as (
+    select
+        a.QuestionId,
+        a.AnswererId,
+        count(*) as AnswersByUserToQuestion,
+        max(a.AnswerScore) as MaxAnswerScoreByUser
+    from answers a
+    group by a.QuestionId, a.AnswererId
+),
+top_answerer as (
+    select distinct on (a.QuestionId)
+        a.QuestionId,
+        a.AnswererId as TopAnswererId,
+        au.DisplayName as TopAnswererName,
+        au.Reputation as TopAnswererRep,
+        ab.TotalBadges as TopAnswererBadges
+    from answers a
+    join Users au on au.Id = a.AnswererId
+    left join badges_by_user ab on ab.UserId = au.Id
+    where a.rn_by_score = 1
+    order by a.QuestionId, a.AnswerScore desc nulls last, a.AnswerCreationDate asc
+),
+user_activity as (
+    select
+        u.Id as UserId,
+        coalesce(sum(case when p.PostTypeId = 1 then 1 else 0 end),0) as QuestionsAuthored,
+        coalesce(sum(case when p.PostTypeId = 2 then 1 else 0 end),0) as AnswersAuthored,
+        coalesce(sum(p.Score),0) as TotalPostScore,
+        max(p.LastActivityDate) as LastPostActivityDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id
+),
+normalized as (
+    select
+        qs.QuestionId,
+        qs.OwnerUserId,
+        u.DisplayName as OwnerName,
+        u.Reputation as OwnerRep,
+        coalesce(bu.TotalBadges,0) as OwnerBadges,
+        qs.QuestionCreationDate,
+        qs.QuestionScore,
+        qs.ViewCount,
+        coalesce(qs.AnswerCount,0) as DeclaredAnswerCount,
+        coalesce(qs.ActualAnswerCount,0) as ActualAnswerCount,
+        qs.FirstAnswerAt,
+        qs.LastAnswerAt,
+        qs.PositiveAnswers,
+        qs.AvgAnswerScore,
+        coalesce(vq.UpVotes,0) as QUpVotes,
+        coalesce(vq.DownVotes,0) as QDownVotes,
+        coalesce(vq.Favorites,0) as QFavorites,
+        coalesce(vq.BountyStarts,0) as QBountyStarts,
+        coalesce(vq.BountyTotal,0) as QBountyTotal,
+        ce.FirstClosedAt,
+        ce.LastClosedAt,
+        ce.CloseEvents,
+        ce.CloseReasonIds,
+        coalesce(dl.DuplicateCount,0) as DuplicateCount,
+        dl.RelatedDuplicateIds,
+        tm.TagCount,
+        tm.AvgTagPopularity,
+        tm.ModOnlyTags,
+        tm.RequiredTags,
+        tm.TagList,
+        aa.AcceptedAnswerId,
+        aa.AcceptedAnswererId,
+        aa.AcceptedAnswerScore,
+        aa.AcceptedAnswerCreationDate,
+        ta.TopAnswererId,
+        ta.TopAnswererName,
+        ta.TopAnswererRep,
+        ta.TopAnswererBadges,
+        ua.QuestionsAuthored,
+        ua.AnswersAuthored,
+        ua.TotalPostScore,
+        ua.LastPostActivityDate,
+        h.HotnessScore,
+        extract(epoch from (coalesce(qs.FirstAnswerAt, cast('2024-10-01 12:34:56' as timestamp)) - qs.QuestionCreationDate))/60.0 as MinutesToFirstAnswer,
+        case
+            when qs.FirstAnswerAt is null then null
+            else extract(epoch from (coalesce(aa.AcceptedAnswerCreationDate, qs.LastAnswerAt) - qs.FirstAnswerAt))/60.0
+        end as MinutesFromFirstToAcceptedOrLast,
+        case
+            when aa.AcceptedAnswerId is not null then 1
+            when qs.ActualAnswerCount > 0 then 0
+            else null
+        end as HasAcceptedAnswerFlag
+    from question_stats qs
+    left join question_owner u on u.UserId = qs.OwnerUserId
+    left join badges_by_user bu on bu.UserId = qs.OwnerUserId
+    left join votes_on_questions vq on vq.QuestionId = qs.QuestionId
+    left join close_events ce on ce.QuestionId = qs.QuestionId
+    left join dup_links dl on dl.DuplicateCount is not null and dl.DuplicateQuestionId = qs.QuestionId
+    left join tag_metrics tm on tm.QuestionId = qs.QuestionId
+    left join accepted_answer aa on aa.QuestionId = qs.QuestionId
+    left join top_answerer ta on ta.QuestionId = qs.QuestionId
+    left join user_activity ua on ua.UserId = qs.OwnerUserId
+    left join hotness h on h.QuestionId = qs.QuestionId
+),
+ranked as (
+    select
+        n.*,
+        row_number() over (order by h.HotnessScore desc nulls last, coalesce(n.QUpVotes,0) desc, n.ViewCount desc) as rn_hot,
+        row_number() over (order by coalesce(n.MinutesToFirstAnswer, 1e9)) as rn_fast_answer,
+        dense_rank() over (partition by (case when n.TagCount is null or n.TagCount = 0 then 'untagged' else 'tagged' end)
+                           order by coalesce(n.AvgTagPopularity,0) desc) as dr_tag_pop,
+        percent_rank() over (order by coalesce(n.OwnerRep,0)) as pr_owner_rep,
+        ntile(10) over (order by coalesce(n.QFavorites,0) desc) as nt_favorites_decile
+    from normalized n
+    left join hotness h on h.QuestionId = n.QuestionId
+),
+tag_rollup as (
+    select
+        r.QuestionId,
+        sum(case when lower(ti.TagName) like '%sql%' then 1 else 0 end) as HasSQLTag,
+        sum(case when lower(ti.TagName) in ('postgresql','sql-server','mysql','sqlite','oracle') then 1 else 0 end) as HasDBTag,
+        max(coalesce(ti.TagGlobalCount,0)) as MaxTagPopularity
+    from ranked r
+    left join tag_info ti on ti.QuestionId = r.QuestionId
+    group by r.QuestionId
+)
+select
+    r.QuestionId,
+    coalesce(r.OwnerName, '[unknown]') as OwnerName,
+    r.OwnerRep,
+    r.OwnerBadges,
+    r.Title,
+    r.TagList,
+    r.ViewCount,
+    r.QUpVotes,
+    r.QDownVotes,
+    r.QFavorites,
+    r.QBountyStarts,
+    r.QBountyTotal,
+    r.QuestionScore,
+    r.HotnessScore,
+    r.rn_hot,
+    r.rn_fast_answer,
+    r.dr_tag_pop,
+    r.pr_owner_rep,
+    r.nt_favorites_decile,
+    r.DuplicateCount,
+    r.CloseEvents,
+    r.CloseReasonIds,
+    r.DeclaredAnswerCount,
+    r.ActualAnswerCount,
+    r.AvgAnswerScore,
+    r.HasAcceptedAnswerFlag,
+    r.MinutesToFirstAnswer,
+    r.MinutesFromFirstToAcceptedOrLast,
+    r.TopAnswererName,
+    r.TopAnswererRep,
+    r.TopAnswererBadges,
+    tr.HasSQLTag > 0 as HasSQLTag,
+    tr.HasDBTag > 0 as HasDBTag,
+    tr.MaxTagPopularity,
+    case
+        when r.OwnerRep is null then 'unknown'
+        when r.OwnerRep >= 100000 then 'legend'
+        when r.OwnerRep >= 10000 then 'expert'
+        when r.OwnerRep >= 1000 then 'intermediate'
+        else 'novice'
+    end as OwnerTier
+from ranked r
+left join tag_rollup tr on tr.QuestionId = r.QuestionId
+where
+    -- complicated predicate combining null logic, string ops, and time windows
+    (
+        r.TagList is null
+        or position('sql' in lower(coalesce(r.TagList,''))) > 0
+        or (r.CloseEvents > 0 and coalesce(r.DuplicateCount,0) >= 1)
+    )
+    and coalesce(r.ViewCount,0) >= 0
+    and (r.OwnerRep is null or r.OwnerRep >= 0)
+    and (r.FirstClosedAt is null or r.FirstClosedAt >= r.QuestionCreationDate)
+    and (
+        r.QBountyTotal is null
+        or r.QBountyTotal >= 0
+    )
+order by
+    r.rn_hot,
+    r.rn_fast_answer,
+    r.QuestionId
+limit 500;

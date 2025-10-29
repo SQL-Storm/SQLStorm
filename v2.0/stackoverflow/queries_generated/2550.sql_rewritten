@@ -1,0 +1,139 @@
+-- {"query": "2550.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1255} 
+with RankedUserBadges as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class,
+        row_number() over (partition by u.Id order by b.Date desc) as BadgeRank
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    where b.TagBased = 0 or b.TagBased is null
+), 
+TopBadges as (
+    select UserId, BadgeName, Class 
+    from RankedUserBadges
+    where BadgeRank <= 3
+),
+UserActivity as (
+    select
+        u.Id,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p2.Id) filter (where p2.PostTypeId = 2) as AnswerCount,
+        count(distinct c.Id) as CommentCount,
+        coalesce(sum(vt2.VoteCount), 0) as TotalUpVotes,
+        coalesce(sum(vt3.VoteCount), 0) as TotalDownVotes
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Posts p2 on p2.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join (
+        select PostId, count(*) as VoteCount from Votes where VoteTypeId = 2 group by PostId
+    ) vt2 on vt2.PostId in (select Id from Posts where OwnerUserId = u.Id)
+    left join (
+        select PostId, count(*) as VoteCount from Votes where VoteTypeId = 3 group by PostId
+    ) vt3 on vt3.PostId in (select Id from Posts where OwnerUserId = u.Id)
+    group by u.Id, u.DisplayName
+),
+PostWithDupLinks as (
+    select 
+        p.Id,
+        p.Title,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        pl.LinkTypeId,
+        pl.RelatedPostId,
+        lt.Name as LinkTypeName,
+        dup.Title as DuplicateOfTitle
+    from Posts p
+    left join PostLinks pl on p.Id = pl.PostId and pl.LinkTypeId = 3
+    left join Posts dup on pl.RelatedPostId = dup.Id
+    left join LinkTypes lt on pl.LinkTypeId = lt.Id
+),
+PostScoresWindow as (
+    select
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        lag(p.Score) over (partition by p.OwnerUserId order by p.CreationDate) as PreviousPostScore,
+        lead(p.Score) over (partition by p.OwnerUserId order by p.CreationDate) as NextPostScore,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as ReverseScoreRank
+    from Posts p
+    where p.OwnerUserId is not null
+),
+LastEditWithUser as (
+    select
+        ph.PostId,
+        ph.CreationDate as EditDate,
+        ph.UserId,
+        u.DisplayName
+    from PostHistory ph
+    left join Users u on ph.UserId = u.Id
+    where ph.PostHistoryTypeId in (4,5,6,14) -- Title, Body, Tags edits or Suggested Edit Applied
+),
+LatestEditPerPost as (
+    select distinct on (PostId)
+        PostId,
+        EditDate,
+        UserId,
+        DisplayName
+    from LastEditWithUser
+    order by PostId, EditDate desc
+),
+ComplexUserStats as (
+    select
+        ua.Id as UserId,
+        ua.DisplayName,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.CommentCount,
+        ua.TotalUpVotes,
+        ua.TotalDownVotes,
+        coalesce(tb.BadgeName, 'No Top Badge') as TopBadge,
+        (select count(*) 
+            from Posts p 
+            where p.OwnerUserId = ua.Id and p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '1 year' and p.Score >= 5) as HighScorePostsThisYear,
+        (select max(ph.CreationDate) 
+            from PostHistory ph 
+            where ph.UserId = ua.Id) as LastUserActivityDate
+    from UserActivity ua
+    left join TopBadges tb on ua.Id = tb.UserId
+)
+select 
+    psw.Id as PostId,
+    psw.Title,
+    psw.Score,
+    psw.ViewCount,
+    psw.CreationDate,
+    u.DisplayName as OwnerName,
+    coalesce(pdup.DuplicateOfTitle, '') as DuplicateOfTitle,
+    psw.PreviousPostScore,
+    psw.NextPostScore,
+    lus.EditDate as LastEditDate,
+    lus.DisplayName as LastEditorName,
+    cus.QuestionCount,
+    cus.AnswerCount,
+    cus.CommentCount,
+    cus.TotalUpVotes,
+    cus.TotalDownVotes,
+    cus.TopBadge,
+    cus.HighScorePostsThisYear,
+    cus.LastUserActivityDate
+from PostScoresWindow psw
+left join Users u on psw.OwnerUserId = u.Id
+left join PostWithDupLinks pdup on pdup.Id = psw.Id
+left join LatestEditPerPost lus on lus.PostId = psw.Id
+left join ComplexUserStats cus on cus.UserId = psw.OwnerUserId
+where psw.Score > (select avg(score) from Posts where OwnerUserId = psw.OwnerUserId)
+  and (psw.ViewCount > 1000 or psw.AnswerCount > 5 or psw.Score > 10 or psw.Id in (
+      select PostId from PostLinks where LinkTypeId = 3
+  ))
+order by psw.Score desc, psw.ViewCount desc
+limit 100;

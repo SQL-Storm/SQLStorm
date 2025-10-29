@@ -1,0 +1,245 @@
+-- {"query": "1685.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 4229} 
+
+WITH UserCoreStats AS (
+    -- Initial aggregation of user profile details and self-reported metrics
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate AS UserLastAccessDate,
+        u.DisplayName,
+        u.WebsiteUrl,
+        u.Location,
+        u.AboutMe,
+        u.Views AS UserProfileViews,
+        u.UpVotes AS UserUpVotesGivenSelf, -- Upvotes given by this user (from Users.UpVotes)
+        u.DownVotes AS UserDownVotesGivenSelf -- Downvotes given by this user (from Users.DownVotes)
+    FROM Users u
+),
+PostDetailsExtended AS (
+    -- Pre-calculate post-level metrics including moderation event flags and text analysis
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.CommentCount,
+        p.Title,
+        p.Body,
+        p.Tags,
+        p.ClosedDate,
+        p.CommunityOwnedDate,
+        -- Non-correlated subquery for average comment score on this post
+        COALESCE((SELECT AVG(c_sub.Score) FROM Comments c_sub WHERE c_sub.PostId = p.Id), 0.0) AS AvgCommentScoreForPost,
+        -- Non-correlated subquery for distinct editors of this post (PostHistoryTypes 4,5,6 are edit types)
+        (SELECT COUNT(DISTINCT ph_sub.UserId) FROM PostHistory ph_sub WHERE ph_sub.PostId = p.Id AND ph_sub.PostHistoryTypeId IN (4,5,6)) AS DistinctEditorsForPost,
+        EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - p.CreationDate)) / 86400.0 AS PostAgeDays, -- Post age in days
+        COALESCE(LENGTH(p.Body), 0) AS BodyLength,
+        COALESCE(LENGTH(p.Title), 0) AS TitleLength,
+        -- String expression: Count approximate number of external links in the body
+        (LENGTH(p.Body) - LENGTH(REPLACE(p.Body, '<a', ''))) / LENGTH('<a') AS LinksInBodyCount,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS WasClosedFlag, -- Post Closed event
+        MAX(CASE WHEN ph.PostHistoryTypeId = 12 THEN 1 ELSE 0 END) AS WasDeletedFlag, -- Post Deleted event
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (35, 36) THEN 1 ELSE 0 END) AS WasMigratedFlag -- Post Migrated event
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId IN (10, 12, 35, 36)
+    WHERE p.OwnerUserId IS NOT NULL -- Exclude community/deleted users for owned posts
+    GROUP BY
+        p.Id, p.OwnerUserId, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount,
+        p.FavoriteCount, p.CommentCount, p.Title, p.Body, p.Tags, p.ClosedDate, p.CommunityOwnedDate
+),
+UserPostAggregates AS (
+    -- Aggregate post-related metrics for each user
+    SELECT
+        pde.OwnerUserId AS UserId,
+        COUNT(DISTINCT pde.PostId) AS TotalPostsCreated,
+        COUNT(DISTINCT CASE WHEN pde.PostTypeId = 1 THEN pde.PostId END) AS TotalQuestionsAsked,
+        COUNT(DISTINCT CASE WHEN pde.PostTypeId = 2 THEN pde.PostId END) AS TotalAnswersGiven,
+        SUM(CASE WHEN pde.PostTypeId = 1 THEN pde.ViewCount ELSE 0 END) AS TotalQuestionViews,
+        COALESCE(AVG(pde.PostScore), 0.0) AS AvgUserPostScore,
+        COALESCE(AVG(pde.ViewCount) FILTER (WHERE pde.PostTypeId = 1), 0.0) AS AvgQuestionViewCount,
+        COALESCE(MAX(pde.BodyLength), 0) AS MaxPostBodyLength,
+        COALESCE(MIN(pde.BodyLength), 0) AS MinPostBodyLength,
+        COUNT(CASE WHEN pde.PostAgeDays < 90 AND pde.PostScore > 5 THEN pde.PostId END) AS RecentHighScorePosts,
+        COUNT(CASE WHEN pde.WasClosedFlag = 1 THEN pde.PostId END) AS PostsClosedCount,
+        COUNT(CASE WHEN pde.WasDeletedFlag = 1 THEN pde.PostId END) AS PostsDeletedCount,
+        COUNT(CASE WHEN pde.Title ILIKE '%SQL%' OR pde.Body ILIKE '%database%' THEN pde.PostId END) AS SqlOrDbKeywordPosts,
+        SUM(pde.LinksInBodyCount) AS TotalLinksInPosts,
+        MAX(pde.PostCreationDate) AS LatestPostCreationDate
+    FROM PostDetailsExtended pde
+    GROUP BY pde.OwnerUserId
+),
+UserCommentAggregates AS (
+    -- Aggregate comment-related metrics for each user
+    SELECT
+        c.UserId,
+        COUNT(c.Id) AS TotalCommentsMade,
+        COALESCE(AVG(c.Score), 0.0) AS AvgCommentScoreGiven,
+        -- Correlated subquery: Find the highest score of a comment made by the user on their own posts
+        (
+            SELECT MAX(c_sub.Score)
+            FROM Comments c_sub
+            JOIN Posts p_sub ON c_sub.PostId = p_sub.Id
+            WHERE c_sub.UserId = c.UserId AND p_sub.OwnerUserId = c.UserId
+        ) AS MaxOwnPostCommentScore
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+    GROUP BY c.UserId
+),
+UserVoteAggregates AS (
+    -- Aggregate vote-related metrics for each user (votes given by this user)
+    SELECT
+        v.UserId,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS UpvotesGiven, -- UpMod
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS DownvotesGiven, -- DownMod
+        COUNT(CASE WHEN v.VoteTypeId = 5 THEN v.Id END) AS FavoritesMade, -- Favorite (bookmark)
+        COUNT(CASE WHEN v.VoteTypeId = 8 THEN v.Id END) AS BountiesStarted
+    FROM Votes v
+    WHERE v.UserId IS NOT NULL
+    GROUP BY v.UserId
+),
+UserBadgeAggregates AS (
+    -- Aggregate badge metrics for each user
+    SELECT
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadgesCount,
+        COUNT(CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadgesCount,
+        COUNT(CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadgesCount,
+        MAX(b.Date) AS LatestBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+),
+TagGlobalPerformance AS (
+    -- Global performance metrics for each tag, using string_to_array to unnest tags
+    SELECT
+        unnest(string_to_array(substring(p.Tags FROM 2 FOR LENGTH(p.Tags)-2), '><')) AS TagName,
+        COUNT(DISTINCT p.Id) AS TagPostCount,
+        COALESCE(AVG(p.Score), 0.0) AS AvgTagScore,
+        SUM(p.ViewCount) AS TotalTagViews,
+        SUM(p.AnswerCount) AS TotalTagAnswers
+    FROM Posts p
+    WHERE p.Tags IS NOT NULL AND p.PostTypeId = 1 -- Only consider questions for tag performance
+    GROUP BY unnest(string_to_array(substring(p.Tags FROM 2 FOR LENGTH(p.Tags)-2), '><'))
+),
+UserTagContribution AS (
+    -- User's specific contribution to various tags
+    SELECT
+        p.OwnerUserId AS UserId,
+        unnest(string_to_array(substring(p.Tags FROM 2 FOR LENGTH(p.Tags)-2), '><')) AS TagName,
+        COUNT(p.Id) AS PostsWithTagByUser,
+        COALESCE(AVG(p.Score), 0.0) AS AvgScoreForTagByUser
+    FROM Posts p
+    WHERE p.Tags IS NOT NULL AND p.OwnerUserId IS NOT NULL AND p.PostTypeId = 1
+    GROUP BY p.OwnerUserId, unnest(string_to_array(substring(p.Tags FROM 2 FOR LENGTH(p.Tags)-2), '><'))
+),
+UserWeightedTagScores AS (
+    -- Calculate a weighted average tag score for each user based on their contributions and global tag performance
+    SELECT
+        utc.UserId,
+        SUM(utc.AvgScoreForTagByUser * tgp.AvgTagScore) / NULLIF(SUM(tgp.AvgTagScore), 0) AS UserWeightedAvgTagScore,
+        -- String expression: Concatenate top tags for the user
+        STRING_AGG(DISTINCT utc.TagName, ', ' ORDER BY utc.TagName) AS UserTopTagsList
+    FROM UserTagContribution utc
+    JOIN TagGlobalPerformance tgp ON utc.TagName = tgp.TagName
+    GROUP BY utc.UserId
+)
+-- Main query to combine all CTEs and apply final calculations, window functions, and filtering
+SELECT
+    ucs.UserId,
+    ucs.DisplayName,
+    ucs.Reputation,
+    ucs.UserCreationDate,
+    ucs.UserLastAccessDate,
+    -- Complex calculation: User account age in years
+    EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - ucs.UserCreationDate)) / (365.25 * 86400.0) AS UserAccountAgeYears,
+    COALESCE(upa.TotalPostsCreated, 0) AS TotalPostsCreated,
+    COALESCE(upa.TotalQuestionsAsked, 0) AS TotalQuestionsAsked,
+    COALESCE(upa.TotalAnswersGiven, 0) AS TotalAnswersGiven,
+    COALESCE(uca.TotalCommentsMade, 0) AS TotalCommentsMade,
+    COALESCE(uva.UpvotesGiven, 0) AS UpvotesGivenByThisUser,
+    COALESCE(uva.DownvotesGiven, 0) AS DownvotesGivenByThisUser,
+    COALESCE(ucs.UserUpVotesGivenSelf, 0) AS UserUpvotesReceived, -- Upvotes received from Users table
+    COALESCE(ucs.UserDownVotesGivenSelf, 0) AS UserDownvotesReceived, -- Downvotes received from Users table
+    COALESCE(uba.GoldBadgesCount, 0) AS GoldBadges,
+    COALESCE(uba.SilverBadgesCount, 0) AS SilverBadges,
+    COALESCE(uba.BronzeBadgesCount, 0) AS BronzeBadges,
+    COALESCE(upa.AvgUserPostScore, 0.0) AS AvgPostScore,
+    COALESCE(upa.AvgQuestionViewCount, 0.0) AS AvgQuestionViews,
+    COALESCE(upa.MaxPostBodyLength, 0) AS MaxPostContentLength,
+    COALESCE(upa.PostsClosedCount, 0) AS NumberOfClosedPosts,
+    COALESCE(upa.PostsDeletedCount, 0) AS NumberOfDeletedPosts,
+    COALESCE(upa.SqlOrDbKeywordPosts, 0) AS PostsAboutSqlOrDb,
+    COALESCE(uwts.UserWeightedAvgTagScore, 0.0) AS UserWeightedTagScore,
+    COALESCE(uwts.UserTopTagsList, 'N/A') AS DominantTags,
+    COALESCE(uca.MaxOwnPostCommentScore, 0) AS HighestScoreOnOwnPostComment,
+    -- Complicated calculation: A composite score for user activity and influence
+    (
+        ucs.Reputation * 0.1
+        + COALESCE(upa.TotalQuestionsAsked, 0) * 0.5
+        + COALESCE(upa.TotalAnswersGiven, 0) * 0.7
+        + COALESCE(uca.TotalCommentsMade, 0) * 0.2
+        + COALESCE(uba.GoldBadgesCount, 0) * 5
+        - COALESCE(upa.PostsClosedCount, 0) * 3 -- Penalty for closed posts
+        - COALESCE(upa.PostsDeletedCount, 0) * 5 -- Penalty for deleted posts
+        + COALESCE(uwts.UserWeightedAvgTagScore, 0.0) * 0.1
+    ) AS CalculatedUserActivityScore,
+    -- Window function: Rank users by reputation and total posts
+    RANK() OVER (ORDER BY ucs.Reputation DESC, COALESCE(upa.TotalPostsCreated, 0) DESC) AS ReputationAndActivityRank,
+    -- Window function: DENSE_RANK for badge achievement
+    DENSE_RANK() OVER (ORDER BY COALESCE(uba.GoldBadgesCount, 0) DESC, COALESCE(uba.SilverBadgesCount, 0) DESC) AS BadgeEliteRank,
+    -- Window function: NTILE to categorize users by account age into 5 groups
+    NTILE(5) OVER (ORDER BY (EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - ucs.UserCreationDate)) / (365.25 * 86400.0)) DESC) AS AccountAgeQuintile,
+    -- Window function: LAG to compare current user's reputation to the previous user by last access date
+    LAG(ucs.Reputation, 1, 0) OVER (ORDER BY ucs.UserLastAccessDate) AS PreviousUserReputationByAccessDate,
+    -- Window function: Average post score for users within the same geographic location (NULL logic for unknown location)
+    AVG(COALESCE(upa.AvgUserPostScore, 0.0)) OVER (PARTITION BY COALESCE(ucs.Location, 'Unknown')) AS AvgPostScoreInUserLocation,
+    -- Window function: Rolling sum of SQL/DB related posts over a 1-year window, ordered by creation date
+    SUM(COALESCE(upa.SqlOrDbKeywordPosts, 0)) OVER (ORDER BY ucs.UserCreationDate ASC RANGE BETWEEN INTERVAL '1 YEAR' PRECEDING AND CURRENT ROW) AS RollingSqlDbPostsLastYear,
+    -- Complex predicate/NULL logic in CASE statement for user profiling
+    CASE
+        WHEN ucs.Reputation > 20000 AND COALESCE(uba.GoldBadgesCount, 0) >= 3 AND COALESCE(upa.AvgUserPostScore, 0.0) > 7 THEN 'Top Tier Guru'
+        WHEN ucs.Reputation > 5000 AND COALESCE(upa.TotalAnswersGiven, 0) > 100 AND COALESCE(uca.TotalCommentsMade, 0) > 50 THEN 'Active Contributor'
+        WHEN COALESCE(upa.PostsClosedCount, 0) > 5 OR COALESCE(upa.PostsDeletedCount, 0) > 2 THEN 'Problematic User (Needs Review)'
+        WHEN ucs.UserLastAccessDate < (CURRENT_TIMESTAMP - INTERVAL '6 MONTHS') AND COALESCE(upa.TotalPostsCreated, 0) > 0 THEN 'Inactive Veteran'
+        WHEN ucs.DisplayName IS NULL OR ucs.DisplayName = '' THEN 'Anonymous Contributor' -- NULL logic for DisplayName
+        ELSE 'Regular User'
+    END AS UserProfileStatus,
+    -- String expression: Snippet of "About Me", handling NULLs
+    COALESCE(SUBSTRING(ucs.AboutMe FROM 1 FOR 50), 'No "About Me" description provided.') AS AboutMeSnippet,
+    -- Correlated subquery: Count duplicate links originating from user's posts
+    (SELECT COUNT(DISTINCT pl.RelatedPostId)
+     FROM PostLinks pl
+     JOIN Posts p_linked ON pl.PostId = p_linked.Id
+     WHERE p_linked.OwnerUserId = ucs.UserId AND pl.LinkTypeId = 3
+    ) AS DuplicatesLinkedCount,
+    -- Complicated calculation: Average total views per year of account existence
+    (COALESCE(ucs.UserProfileViews, 0) + COALESCE(upa.TotalQuestionViews, 0)) / NULLIF(EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - ucs.UserCreationDate)) / (365.25 * 86400.0), 0) AS AvgViewsPerYear
+FROM
+    UserCoreStats ucs
+LEFT JOIN UserPostAggregates upa ON ucs.UserId = upa.UserId
+LEFT JOIN UserCommentAggregates uca ON ucs.UserId = uca.UserId
+LEFT JOIN UserVoteAggregates uva ON ucs.UserId = uva.UserId
+LEFT JOIN UserBadgeAggregates uba ON ucs.UserId = uba.UserId
+LEFT JOIN UserWeightedTagScores uwts ON ucs.UserId = uwts.UserId
+WHERE
+    ucs.Reputation > 500 -- Minimum reputation filter
+    AND (
+        COALESCE(upa.TotalPostsCreated, 0) > 10 -- Active users based on posts
+        OR COALESCE(uca.TotalCommentsMade, 0) > 20 -- OR active users based on comments
+    )
+    -- Non-correlated subquery with nested subquery for complex filtering
+    AND ucs.UserId IN (
+        SELECT u_sub.Id
+        FROM Users u_sub
+        WHERE u_sub.Reputation > (SELECT AVG(Reputation) * 0.5 FROM Users) -- Reputation above 50% of global average
+          AND u_sub.CreationDate > '2010-01-01' -- Users created after a specific date
+    )
+    AND ucs.DisplayName IS NOT NULL AND ucs.DisplayName <> '' -- Exclude users with no DisplayName
+    AND COALESCE(upa.AvgUserPostScore, 0.0) >= 0 -- Ensure non-negative average post score
+ORDER BY
+    CalculatedUserActivityScore DESC, ReputationAndActivityRank ASC
+LIMIT 500;

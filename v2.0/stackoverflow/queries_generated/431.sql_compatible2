@@ -1,0 +1,447 @@
+with params as (
+  select
+    cast(100 as int) as min_rep,
+    cast(365 as int) as active_days_window,
+    cast(10 as int) as min_answers_for_streak,
+    cast(5 as int) as min_badges_recent
+),
+active_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.lastaccessdate,
+    coalesce(nullif(trim(u.location), ''), 'Unknown') as location_norm,
+    date_trunc('day', u.lastaccessdate) as last_seen_day,
+    count(*) filter (where b.date >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days') as badges_30d,
+    count(*) as total_badges,
+    sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+    sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+    sum(case when b.class = 3 then 1 else 0 end) as bronze_badges
+  from users u
+  left join badges b on b.userid = u.id
+  group by u.id, u.displayname, u.reputation, u.creationdate, u.lastaccessdate, coalesce(nullif(trim(u.location), ''), 'Unknown'), date_trunc('day', u.lastaccessdate)
+),
+q_and_a as (
+  select
+    p.id,
+    p.posttypeid,
+    p.owneruserid,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.answercount,
+    p.parentid,
+    p.acceptedanswerid,
+    p.tags,
+    p.title,
+    p.lastactivitydate,
+    p.lasteditdate,
+    p.commentcount
+  from posts p
+  where p.posttypeid in (1,2)
+),
+questions as (
+  select *
+  from q_and_a
+  where posttypeid = 1
+),
+answers as (
+  select *
+  from q_and_a
+  where posttypeid = 2
+),
+answerers_activity as (
+  select
+    a.owneruserid as user_id,
+    count(*) as answers_total,
+    count(*) filter (where a.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days') as answers_30d,
+    avg(a.score) as avg_answer_score,
+    max(a.score) as max_answer_score,
+    min(a.creationdate) as first_answer_date,
+    max(a.creationdate) as last_answer_date
+  from answers a
+  group by a.owneruserid
+),
+questioners_activity as (
+  select
+    q.owneruserid as user_id,
+    count(*) as questions_total,
+    count(*) filter (where q.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days') as questions_30d,
+    avg(q.viewcount) as avg_q_views,
+    sum(case when q.acceptedanswerid is not null then 1 else 0 end) as accepted_count
+  from questions q
+  group by q.owneruserid
+),
+post_votes as (
+  select
+    v.postid,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites
+  from votes v
+  group by v.postid
+),
+post_comments as (
+  select
+    c.postid,
+    count(*) as comments_count,
+    avg(c.score) as avg_comment_score,
+    max(c.creationdate) as last_comment_date
+  from comments c
+  group by c.postid
+),
+q_metrics as (
+  select
+    q.id as question_id,
+    q.owneruserid as asker_id,
+    q.creationdate as q_created,
+    q.score as q_score,
+    q.viewcount as q_views,
+    q.answercount as q_answercount,
+    q.acceptedanswerid,
+    coalesce(pv.upvotes,0) as q_upvotes,
+    coalesce(pv.downvotes,0) as q_downvotes,
+    coalesce(pv.favorites,0) as q_favorites,
+    coalesce(pc.comments_count,0) as q_comments,
+    pc.last_comment_date as q_last_comment,
+    q.tags,
+    q.title
+  from questions q
+  left join post_votes pv on pv.postid = q.id
+  left join post_comments pc on pc.postid = q.id
+),
+a_metrics as (
+  select
+    a.id as answer_id,
+    a.parentid as question_id,
+    a.owneruserid as answerer_id,
+    a.creationdate as a_created,
+    a.score as a_score,
+    coalesce(pv.upvotes,0) as a_upvotes,
+    coalesce(pv.downvotes,0) as a_downvotes,
+    coalesce(pc.comments_count,0) as a_comments,
+    pc.last_comment_date as a_last_comment
+  from answers a
+  left join post_votes pv on pv.postid = a.id
+  left join post_comments pc on pc.postid = a.id
+),
+accepted_map as (
+  select
+    qm.question_id,
+    qm.acceptedanswerid as accepted_answer_id
+  from q_metrics qm
+  where qm.acceptedanswerid is not null
+),
+answer_with_accept as (
+  select
+    am.*,
+    case when am.answer_id = ac.accepted_answer_id then 1 else 0 end as is_accepted
+  from a_metrics am
+  left join accepted_map ac on ac.question_id = am.question_id
+),
+answer_streaks_prep as (
+  select
+    answerer_id,
+    date_trunc('day', a_created) as day_trunc,
+    min(a_created) as a_created_min
+  from a_metrics
+  group by answerer_id, date_trunc('day', a_created)
+),
+answer_streaks_numbering as (
+  select
+    p.answerer_id as user_id,
+    p.day_trunc,
+    row_number() over (partition by p.answerer_id order by p.day_trunc) as rn
+  from answer_streaks_prep p
+),
+answer_streaks as (
+  select
+    n.user_id,
+    min(p.a_created_min) as streak_start,
+    max(p.a_created_min) as streak_end,
+    count(*) as answers_in_streak
+  from answer_streaks_prep p
+  join answer_streaks_numbering n
+    on n.user_id = p.answerer_id and n.day_trunc = p.day_trunc
+  group by n.user_id, (p.day_trunc - (n.rn * interval '1 day'))
+),
+top_streaks as (
+  select
+    s.user_id,
+    max(answers_in_streak) as max_answer_streak,
+    max(streak_end) filter (where answers_in_streak = max(answers_in_streak) over (partition by s.user_id)) as max_streak_end
+  from answer_streaks s
+  group by s.user_id
+),
+user_quality as (
+  select
+    coalesce(aua.user_id, qa.user_id) as user_id,
+    coalesce(aua.answers_total,0) as answers_total,
+    coalesce(aua.answers_30d,0) as answers_30d,
+    coalesce(aua.avg_answer_score,0) as avg_answer_score,
+    coalesce(aua.max_answer_score,0) as max_answer_score,
+    coalesce(qa.questions_total,0) as questions_total,
+    coalesce(qa.questions_30d,0) as questions_30d,
+    coalesce(qa.avg_q_views,0) as avg_q_views,
+    coalesce(qa.accepted_count,0) as accepted_count,
+    coalesce(ts.max_answer_streak,0) as max_answer_streak
+  from answerers_activity aua
+  full outer join questioners_activity qa on qa.user_id = aua.user_id
+  left join top_streaks ts on ts.user_id = coalesce(aua.user_id, qa.user_id)
+),
+dupe_links as (
+  select
+    pl.relatedpostid as canonical_qid,
+    count(*) as dupes_count
+  from postlinks pl
+  where pl.linktypeid = 3
+  group by pl.relatedpostid
+),
+tag_explode as (
+  select
+    qm.question_id,
+    unnest(string_to_array(substring(qm.tags, 2, length(qm.tags)-2), '><')) as tag
+  from q_metrics qm
+  where qm.tags is not null and qm.tags like '<%>'
+),
+tag_stats as (
+  select
+    te.tag,
+    count(distinct te.question_id) as q_count,
+    avg(qm.q_score) as avg_q_score,
+    avg(qm.q_views) as avg_q_views
+  from tag_explode te
+  join q_metrics qm on qm.question_id = te.question_id
+  group by te.tag
+),
+recent_hot as (
+  select
+    qm.question_id,
+    qm.q_created,
+    qm.q_views,
+    qm.q_score,
+    case when qm.q_created >= cast('2024-10-01 12:34:56' as timestamp) - interval '7 days' and qm.q_views >= 1000 and qm.q_score >= 5 then 1 else 0 end as is_recent_hot
+  from q_metrics qm
+),
+user_post_rollup as (
+  select
+    u.id as user_id,
+    count(*) filter (where p.posttypeid = 1) as q_count,
+    count(*) filter (where p.posttypeid = 2) as a_count,
+    sum(coalesce(p.score,0)) as total_post_score,
+    sum(coalesce(p.viewcount,0)) as total_views,
+    max(p.lastactivitydate) as last_activity,
+    max(p.lasteditdate) as last_edit,
+    avg(coalesce(p.commentcount,0)) as avg_commentcount
+  from users u
+  left join posts p on p.owneruserid = u.id
+  group by u.id
+),
+user_flags as (
+  select
+    au.user_id,
+    case when au.reputation >= (select min_rep from params) then 1 else 0 end as is_high_rep,
+    case when au.badges_30d >= (select min_badges_recent from params) then 1 else 0 end as is_recently_decorated,
+    case when date_part('day', cast('2024-10-01 12:34:56' as timestamp) - au.last_seen_day) <= (select active_days_window from params) then 1 else 0 end as is_recently_active
+  from active_users au
+),
+accepted_answerers as (
+  select
+    aw.answerer_id as user_id,
+    count(*) filter (where aw.is_accepted = 1) as accepted_answers,
+    count(*) as total_answers_on_accepted_qs
+  from answer_with_accept aw
+  group by aw.answerer_id
+),
+post_history_events as (
+  select
+    ph.postid,
+    count(*) filter (where ph.posthistorytypeid in (10,35)) as closes_or_migrations,
+    count(*) filter (where ph.posthistorytypeid in (11,36)) as reopens_or_migrated_here,
+    count(*) filter (where ph.posthistorytypeid in (12)) as deletions,
+    count(*) filter (where ph.posthistorytypeid in (13)) as undeletions
+  from posthistory ph
+  group by ph.postid
+),
+question_health as (
+  select
+    qm.question_id,
+    coalesce(phe.closes_or_migrations,0) as closes_or_migrations,
+    coalesce(phe.reopens_or_migrated_here,0) as reopens_or_migrated_here,
+    coalesce(phe.deletions,0) as deletions,
+    coalesce(phe.undeletions,0) as undeletions,
+    coalesce(dl.dupes_count,0) as dupes_to_this
+  from q_metrics qm
+  left join post_history_events phe on phe.postid = qm.question_id
+  left join dupe_links dl on dl.canonical_qid = qm.question_id
+),
+user_score as (
+  select
+    up.user_id,
+    up.q_count,
+    up.a_count,
+    uq.answers_total,
+    uq.questions_total,
+    uq.avg_answer_score,
+    uq.max_answer_score,
+    uq.avg_q_views,
+    uq.accepted_count,
+    uq.max_answer_streak,
+    ua.reputation,
+    ua.badges_30d,
+    ua.total_badges,
+    ua.gold_badges,
+    ua.silver_badges,
+    ua.bronze_badges,
+    ua.location_norm,
+    uf.is_high_rep,
+    uf.is_recently_decorated,
+    uf.is_recently_active,
+    up.total_post_score,
+    up.total_views,
+    up.last_activity,
+    up.last_edit,
+    up.avg_commentcount,
+    coalesce(aa.accepted_answers,0) as accepted_answers,
+    coalesce(aa.total_answers_on_accepted_qs,0) as total_answers_on_accepted_qs
+  from user_post_rollup up
+  left join user_quality uq on uq.user_id = up.user_id
+  left join active_users ua on ua.user_id = up.user_id
+  left join user_flags uf on uf.user_id = up.user_id
+  left join accepted_answerers aa on aa.user_id = up.user_id
+),
+scored as (
+  select
+    us.*,
+    case
+      when coalesce(us.a_count,0) = 0 then null
+      else round(100.0 * coalesce(us.accepted_answers,0) / nullif(us.a_count,0), 2)
+    end as accept_rate_pct,
+    round(
+      coalesce(us.total_post_score,0)
+      + 2.0 * coalesce(us.answers_total,0)
+      + 0.5 * coalesce(us.questions_total,0)
+      + 5.0 * coalesce(us.accepted_answers,0)
+      + 0.01 * coalesce(us.total_views,0)
+      + 1.5 * coalesce(us.badges_30d,0)
+      + 0.1 * coalesce(us.total_badges,0)
+      + 3.0 * case when us.is_high_rep = 1 then 1 else 0 end
+      + 2.0 * case when us.is_recently_decorated = 1 then 1 else 0 end
+      + 2.0 * case when us.is_recently_active = 1 then 1 else 0 end
+      + 1.0 * coalesce(us.max_answer_streak,0)
+      + 4.0 * coalesce(us.gold_badges,0)
+      + 2.0 * coalesce(us.silver_badges,0)
+      + 1.0 * coalesce(us.bronze_badges,0)
+    , 2) as activity_score
+  from user_score us
+),
+qualifying_users as (
+  select
+    s.*,
+    rank() over (order by s.activity_score desc nulls last) as activity_rank,
+    dense_rank() over (order by coalesce(s.accept_rate_pct,0) desc nulls last) as accept_rank
+  from scored s
+  where coalesce(s.max_answer_streak,0) >= (select min_answers_for_streak from params)
+    and coalesce(s.answers_total,0) > 0
+),
+recent_questions as (
+  select
+    qm.*,
+    rh.is_recent_hot
+  from q_metrics qm
+  join recent_hot rh on rh.question_id = qm.question_id
+),
+user_recent_hot as (
+  select
+    rq.asker_id as user_id,
+    count(*) as recent_hot_qs
+  from recent_questions rq
+  group by rq.asker_id
+),
+final_users as (
+  select
+    qu.*,
+    coalesce(urh.recent_hot_qs,0) as recent_hot_qs
+  from qualifying_users qu
+  left join user_recent_hot urh on urh.user_id = qu.user_id
+),
+stringy as (
+  select
+    fu.user_id,
+    fu.activity_rank,
+    fu.accept_rank,
+    fu.activity_score,
+    fu.accept_rate_pct,
+    fu.reputation,
+    fu.answers_total,
+    fu.questions_total,
+    fu.max_answer_streak,
+    fu.badges_30d,
+    fu.total_badges,
+    fu.recent_hot_qs,
+    fu.location_norm,
+    regexp_replace(coalesce(fu.location_norm, 'Unknown'), '\s+', ' ', 'g') as location_clean,
+    upper(coalesce(fu.location_norm, 'UNKNOWN')) as location_upper,
+    left(coalesce(fu.location_norm, 'Unknown'), 20) as location_short
+  from final_users fu
+),
+recent_edits as (
+  select
+    p.id as post_id,
+    p.owneruserid as user_id,
+    count(*) filter (where ph.posthistorytypeid in (4,5,6,7,8,9,24)) as edit_events_recent
+  from posts p
+  left join posthistory ph on ph.postid = p.id and ph.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days'
+  group by p.id, p.owneruserid
+),
+recent_edit_rollup as (
+  select
+    re.user_id,
+    sum(re.edit_events_recent) as edits_30d
+  from recent_edits re
+  group by re.user_id
+)
+select
+  s.user_id,
+  u.displayname,
+  s.activity_rank,
+  s.accept_rank,
+  s.activity_score,
+  s.accept_rate_pct,
+  s.reputation,
+  s.answers_total,
+  s.questions_total,
+  s.max_answer_streak,
+  s.badges_30d,
+  s.total_badges,
+  s.recent_hot_qs,
+  s.location_clean,
+  s.location_upper,
+  s.location_short,
+  coalesce(rer.edits_30d,0) as edits_30d,
+  case
+    when s.activity_score >= percentile_disc(0.95) within group (order by s.activity_score) then 'Top 5%'
+    when s.activity_score >= percentile_disc(0.75) within group (order by s.activity_score) then 'Top 25%'
+    when s.activity_score >= percentile_disc(0.50) within group (order by s.activity_score) then 'Top 50%'
+    else 'Long tail'
+  end as activity_bucket,
+  coalesce((
+    select string_agg(ts.tag, ', ' order by ts.q_count desc, ts.avg_q_score desc)
+    from tag_stats ts
+    where ts.tag in (
+      select te.tag
+      from tag_explode te
+      join q_metrics qm on qm.question_id = te.question_id
+      where qm.asker_id = s.user_id
+      group by te.tag
+      order by count(*) desc
+      limit 5
+    )
+  ), 'no-top-tags') as top_tags_preview
+from stringy s
+join users u on u.id = s.user_id
+left join recent_edit_rollup rer on rer.user_id = s.user_id
+order by s.activity_rank
+limit 200;

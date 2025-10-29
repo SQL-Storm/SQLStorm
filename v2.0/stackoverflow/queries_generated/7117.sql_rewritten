@@ -1,0 +1,231 @@
+-- {"query": "7117.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2235} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT c.Id) as Comments,
+        COUNT(DISTINCT b.Id) as Badges,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        COUNT(DISTINCT CASE WHEN p.Score > 0 THEN p.Id END) as PositiveScorePosts,
+        COUNT(DISTINCT CASE WHEN p.Score < 0 THEN p.Id END) as NegativeScorePosts,
+        AVG(CAST(p.Score as FLOAT)) as AvgPostScore,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), ', ') as AllTags,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(*), 0) as QuestionPercentage,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(*), 0) as AnswerPercentage,
+        RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) as PostRank,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) as ReputationRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        COALESCE(p.AnswerCount, 0) as AnswerCount,
+        COALESCE(p.CommentCount, 0) as CommentCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Tags,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.ParentId,
+        CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END as HasAcceptedAnswer,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END as IsClosed,
+        CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN 1 ELSE 0 END as IsCommunityOwned,
+        p.LastEditDate,
+        COALESCE(STRING_AGG(DISTINCT SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), ' '), 'None') as TagList,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as UserPostRank,
+        NTILE(10) OVER (ORDER BY p.Score DESC) as ScoreDecile,
+        LAG(p.CreationDate) OVER (ORDER BY p.CreationDate) as PreviousPostDate,
+        LEAD(p.CreationDate) OVER (ORDER BY p.CreationDate) as NextPostDate,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as AvgScorePerUser,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) as TotalPostsPerUser,
+        CASE 
+            WHEN p.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'High'
+            WHEN p.Score < (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'Low'
+            ELSE 'Average'
+        END as ScoreCategory,
+        COALESCE(LEFT(p.Body, 100), '') as PreviewBody,
+        CASE WHEN p.Tags IS NOT NULL AND LENGTH(p.Tags) > 0 THEN 1 ELSE 0 END as HasTags
+    FROM Posts p
+    WHERE p.Id IS NOT NULL
+),
+BadgesWithUserStats AS (
+    SELECT 
+        b.Id as BadgeId,
+        b.Name as BadgeName,
+        b.Date as BadgeDate,
+        b.Class as BadgeClass,
+        b.UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        RANK() OVER (PARTITION BY b.UserId ORDER BY b.Date) as UserBadgeRank,
+        DENSE_RANK() OVER (ORDER BY b.Class, b.Date) as GlobalBadgeRank,
+        COUNT(*) OVER (PARTITION BY b.UserId) as UserBadgeCount,
+        CASE 
+            WHEN b.Class = 1 THEN 'Gold'
+            WHEN b.Class = 2 THEN 'Silver'
+            WHEN b.Class = 3 THEN 'Bronze'
+            ELSE 'Unknown'
+        END as BadgeTier
+    FROM Badges b
+    INNER JOIN Users u ON b.UserId = u.Id
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        pa.PostId,
+        pa.Title,
+        pa.Body,
+        pa.Score,
+        pa.ViewCount,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.CreationDate,
+        pa.LastActivityDate,
+        pa.Tags,
+        pa.OwnerUserId,
+        pa.PostTypeId,
+        pa.ParentId,
+        pa.HasAcceptedAnswer,
+        pa.IsClosed,
+        pa.IsCommunityOwned,
+        pa.LastEditDate,
+        pa.TagList,
+        pa.UserPostRank,
+        pa.ScoreDecile,
+        pa.PreviousPostDate,
+        pa.NextPostDate,
+        pa.AvgScorePerUser,
+        pa.TotalPostsPerUser,
+        pa.ScoreCategory,
+        pa.PreviewBody,
+        pa.HasTags,
+        CASE 
+            WHEN DATEDIFF('DAY', pa.CreationDate, cast('2024-10-01 12:34:56' as timestamp)) > 365 THEN 'Veteran'
+            WHEN DATEDIFF('DAY', pa.CreationDate, cast('2024-10-01 12:34:56' as timestamp)) > 180 THEN 'Regular'
+            WHEN DATEDIFF('DAY', pa.CreationDate, cast('2024-10-01 12:34:56' as timestamp)) > 30 THEN 'New'
+            ELSE 'Fresh'
+        END as PostingPeriod,
+        CASE WHEN pa.Score > 0 THEN 1 ELSE 0 END as IsPositive,
+        CASE WHEN pa.Score < 0 THEN 1 ELSE 0 END as IsNegative,
+        CASE WHEN pa.Score = 0 THEN 1 ELSE 0 END as IsNeutral,
+        CASE WHEN pa.AnswerCount > 0 THEN 'Answered' ELSE 'Unanswered' END as AnswerStatus,
+        CASE 
+            WHEN pa.CommentCount > 10 THEN 'Highly Commented'
+            WHEN pa.CommentCount > 5 THEN 'Moderately Commented'
+            WHEN pa.CommentCount > 0 THEN 'Sparingly Commented'
+            ELSE 'Uncommented'
+        END as CommentLevel,
+        CASE 
+            WHEN pa.ViewCount > 1000 THEN 'Viral'
+            WHEN pa.ViewCount > 500 THEN 'Popular'
+            WHEN pa.ViewCount > 100 THEN 'Moderate'
+            WHEN pa.ViewCount > 0 THEN 'Low'
+            ELSE 'No Views'
+        END as ViewStatus,
+        COALESCE(pa.Score, 0) * COALESCE(pa.ViewCount, 0) as ScoreViewProduct,
+        (COALESCE(pa.Score, 0) * COALESCE(pa.ViewCount, 0)) / NULLIF(COALESCE(pa.AnswerCount, 0) + 1, 0) as ScoreViewPerAnswer
+    FROM PostAnalysis pa
+)
+SELECT 
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.Views,
+    uas.UpVotes,
+    uas.DownVotes,
+    uas.TotalPosts,
+    uas.Questions,
+    uas.Answers,
+    uas.Comments,
+    uas.Badges,
+    uas.LastPostDate,
+    uas.LastCommentDate,
+    uas.PositiveScorePosts,
+    uas.NegativeScorePosts,
+    uas.AvgPostScore,
+    uas.AllTags,
+    uas.QuestionPercentage,
+    uas.AnswerPercentage,
+    uas.PostRank,
+    uas.ReputationRank,
+    cpa.PostId,
+    cpa.Title,
+    cpa.Body,
+    cpa.Score,
+    cpa.ViewCount,
+    cpa.AnswerCount,
+    cpa.CommentCount,
+    cpa.CreationDate,
+    cpa.LastActivityDate,
+    cpa.Tags,
+    cpa.OwnerUserId,
+    cpa.PostTypeId,
+    cpa.ParentId,
+    cpa.HasAcceptedAnswer,
+    cpa.IsClosed,
+    cpa.IsCommunityOwned,
+    cpa.LastEditDate,
+    cpa.TagList,
+    cpa.UserPostRank,
+    cpa.ScoreDecile,
+    cpa.PreviousPostDate,
+    cpa.NextPostDate,
+    cpa.AvgScorePerUser,
+    cpa.TotalPostsPerUser,
+    cpa.ScoreCategory,
+    cpa.PreviewBody,
+    cpa.HasTags,
+    cpa.PostingPeriod,
+    cpa.IsPositive,
+    cpa.IsNegative,
+    cpa.IsNeutral,
+    cpa.AnswerStatus,
+    cpa.CommentLevel,
+    cpa.ViewStatus,
+    cpa.ScoreViewProduct,
+    cpa.ScoreViewPerAnswer,
+    bws.BadgeId,
+    bws.BadgeName,
+    bws.BadgeDate,
+    bws.BadgeClass,
+    bws.BadgeTier,
+    bws.UserBadgeRank,
+    bws.GlobalBadgeRank,
+    bws.UserBadgeCount
+FROM UserActivityStats uas
+LEFT JOIN ComplexPostAnalysis cpa ON uas.UserId = cpa.OwnerUserId
+LEFT JOIN BadgesWithUserStats bws ON uas.UserId = bws.UserId
+WHERE 
+    (uas.TotalPosts > 0 OR uas.Comments > 0 OR uas.Badges > 0)
+    AND (uas.Reputation > 0 OR uas.Views > 0 OR uas.UpVotes > 0 OR uas.DownVotes > 0)
+    AND (cpa.PostId IS NOT NULL OR bws.BadgeId IS NOT NULL)
+    AND (CASE 
+            WHEN cpa.Score IS NOT NULL THEN cpa.Score > -50 
+            ELSE TRUE 
+        END)
+    AND uas.Reputation IS NOT NULL
+ORDER BY 
+    uas.Reputation DESC,
+    uas.TotalPosts DESC,
+    cpa.CreationDate DESC,
+    bws.BadgeDate DESC
+LIMIT 10000;

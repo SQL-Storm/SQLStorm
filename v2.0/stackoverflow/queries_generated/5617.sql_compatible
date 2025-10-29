@@ -1,0 +1,116 @@
+WITH top_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ContentLicense,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC, p.LastActivityDate DESC) AS rn
+  FROM Posts p
+  WHERE p.PostTypeId = 1 -- Questions
+    AND p.CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '180 days'
+),
+recent_activities AS (
+  SELECT
+    ph.PostId,
+    ph.CreationDate AS HistoryDate,
+    ph.PostHistoryTypeId,
+    ph.UserId AS HistoryUserId,
+    ph.Comment,
+    ph.Text
+  FROM PostHistory ph
+  WHERE ph.CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30 days'
+),
+user_summary AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.AccountId,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.WebsiteUrl,
+    u.ProfileImageUrl,
+    u.EmailHash,
+    COUNT(DISTINCT t.Id) AS TagCount,
+    MAX(p.LastActivityDate) AS LastActiveQuestionDate
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  -- The original attempt to split p.Tags and join to Tags used generate_series and referenced an alias collision.
+  -- For portability and to avoid engine-specific functions, approximate by joining Tags on tag name contained in p.Tags.
+  LEFT JOIN Tags t ON POSITION(CONCAT('<', t.TagName, '>') IN COALESCE(p.Tags, '')) > 0
+  GROUP BY
+    u.Id, u.DisplayName, u.Reputation, u.AccountId, u.LastAccessDate,
+    u.Location, u.Views, u.UpVotes, u.DownVotes, u.WebsiteUrl,
+    u.ProfileImageUrl, u.EmailHash
+),
+complex_metric AS (
+  SELECT
+    tp.PostId,
+    tp.Title,
+    tp.Tags,
+    tp.CreationDate,
+    tp.Score,
+    tp.ViewCount,
+    tp.OwnerUserId,
+    tp.LastActivityDate,
+    tp.AnswerCount,
+    tp.CommentCount,
+    tp.FavoriteCount,
+    tp.ContentLicense,
+    v_up.VoteCount AS UpVotesGiven,
+    v_down.VoteCount AS DownVotesGiven,
+    COALESCE(bg.GoldCount, 0) AS GoldBadgesForOwner,
+    CASE
+      WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+      WHEN tp.LastActivityDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '7 days' THEN 'Active'
+      ELSE 'Dormant'
+    END AS ActivityLabel
+  FROM top_questions tp
+  LEFT JOIN Votes v_up ON v_up.PostId = tp.PostId AND v_up.VoteTypeId = 2
+  LEFT JOIN Votes v_down ON v_down.PostId = tp.PostId AND v_down.VoteTypeId = 3
+  LEFT JOIN Badges bg ON bg.UserId = tp.OwnerUserId AND bg.Class = 1
+  LEFT JOIN Posts p ON p.Id = tp.PostId
+  WHERE tp.Score > 0
+    AND tp.ViewCount >= 50
+),
+final AS (
+  SELECT
+    cm.PostId,
+    cm.Title,
+    cm.Tags,
+    cm.CreationDate,
+    cm.Score,
+    cm.ViewCount,
+    cm.OwnerUserId,
+    cm.LastActivityDate,
+    cm.AnswerCount,
+    cm.CommentCount,
+    cm.FavoriteCount,
+    cm.ContentLicense,
+    cm.UpVotesGiven,
+    cm.DownVotesGiven,
+    cm.GoldBadgesForOwner,
+    cm.ActivityLabel,
+    ru.DisplayName AS OwnerDisplayName,
+    ru.Reputation AS OwnerReputation,
+    ru.LastAccessDate AS OwnerLastAccess
+  FROM complex_metric cm
+  LEFT JOIN Users ru ON ru.Id = cm.OwnerUserId
+  ORDER BY cm.Score DESC, cm.ViewCount DESC
+)
+SELECT
+  *
+FROM final
+WHERE ActivityLabel <> 'Dormant'
+LIMIT 200;

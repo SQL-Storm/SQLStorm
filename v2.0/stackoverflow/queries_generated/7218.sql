@@ -1,0 +1,172 @@
+-- {"query": "7218.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1617} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        COUNT(DISTINCT c.Id) AS Comments,
+        COUNT(DISTINCT b.Id) AS Badges,
+        MAX(p.CreationDate) AS LastPostDate,
+        RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS PostRank,
+        AVG(p.Score) AS AvgPostScore,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2) FILTER (WHERE p.Tags IS NOT NULL), ', ') AS AllTags,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 100 THEN 'High Activity'
+            WHEN COUNT(DISTINCT p.Id) > 50 THEN 'Medium Activity'
+            ELSE 'Low Activity'
+        END AS ActivityLevel
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopTags AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        RANK() OVER (ORDER BY t.Count DESC) AS TagRank,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 500 THEN 'Moderately Popular'
+            ELSE 'Niche'
+        END AS PopularityLevel
+    FROM Tags t
+    WHERE t.Count > 100
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        u.DisplayName AS OwnerName,
+        p.Tags,
+        DATEDIFF(DAY, p.CreationDate, COALESCE(p.ClosedDate, p.LastActivityDate, GETDATE())) AS AgeInDays,
+        CASE 
+            WHEN p.Score > 100 THEN 'Hot'
+            WHEN p.Score > 50 THEN 'Warm'
+            WHEN p.Score > 0 THEN 'Cool'
+            ELSE 'Cold'
+        END AS ScoreLevel,
+        CASE 
+            WHEN p.ViewCount > 1000 THEN 'Viral'
+            WHEN p.ViewCount > 500 THEN 'Popular'
+            WHEN p.ViewCount > 100 THEN 'Notable'
+            ELSE 'Obscure'
+        END AS ViewLevel,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS ScoreRank,
+        NTILE(4) OVER (ORDER BY p.Score) AS Quartile,
+        LAG(p.Score, 1) OVER (ORDER BY p.CreationDate) AS PrevScore,
+        ABS(p.Score - LAG(p.Score, 1) OVER (ORDER BY p.CreationDate)) AS ScoreChange,
+        COALESCE(p.Tags, '') AS CleanTags,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags LIKE '%<%' THEN 
+                ARRAY_LENGTH(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><'), 1)
+            ELSE 0
+        END AS TagCount,
+        (SELECT COUNT(*) FROM Posts WHERE ParentId = p.Id AND PostTypeId = 2) AS AnswerCountWithDeleted
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.CreationDate >= '2020-01-01'
+      AND p.PostTypeId IN (1, 2)
+),
+CombinedData AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.TotalPosts,
+        uas.Questions,
+        uas.Answers,
+        uas.Comments,
+        uas.Badges,
+        uas.LastPostDate,
+        uas.PostRank,
+        uas.AvgPostScore,
+        uas.AllTags,
+        uas.ActivityLevel,
+        ta.TagName,
+        ta.Count AS TagCount,
+        ta.TagRank,
+        ta.PopularityLevel,
+        pa.PostId,
+        pa.Title,
+        pa.Score,
+        pa.ViewCount,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.CreationDate AS PostCreationDate,
+        pa.ScoreLevel,
+        pa.ViewLevel,
+        pa.ScoreRank,
+        pa.Quartile,
+        pa.ScoreChange,
+        pa.TagCount AS PostTagCount,
+        pa.AnswerCountWithDeleted,
+        CASE 
+            WHEN pa.Score > 10 AND pa.ViewCount > 100 THEN TRUE
+            ELSE FALSE
+        END AS IsSuccessfulPost,
+        CASE 
+            WHEN pa.Score < 0 THEN 'Negative'
+            WHEN pa.Score = 0 THEN 'Neutral'
+            ELSE 'Positive'
+        END AS ScoreCategory,
+        CASE 
+            WHEN pa.AgeInDays <= 30 THEN 'New'
+            WHEN pa.AgeInDays <= 90 THEN 'Recent'
+            WHEN pa.AgeInDays <= 365 THEN 'Established'
+            ELSE 'Legacy'
+        END AS PostAgeCategory
+    FROM UserActivityStats uas
+    FULL OUTER JOIN TopTags ta ON 1=1
+    FULL OUTER JOIN PostAnalysis pa ON 1=1
+    WHERE (uas.UserId IS NOT NULL OR ta.TagName IS NOT NULL OR pa.PostId IS NOT NULL)
+) 
+SELECT 
+    COUNT(DISTINCT UserId) AS UniqueUsers,
+    COUNT(DISTINCT TagName) AS UniqueTags,
+    COUNT(DISTINCT PostId) AS UniquePosts,
+    AVG(Reputation) AS AvgReputation,
+    MAX(TotalPosts) AS MaxPosts,
+    MIN(Score) AS MinScore,
+    MAX(Score) AS MaxScore,
+    AVG(Score) AS AvgScore,
+    SUM(CASE WHEN IsSuccessfulPost = TRUE THEN 1 ELSE 0 END) AS SuccessfulPosts,
+    COUNT(DISTINCT CASE WHEN ActivityLevel = 'High Activity' THEN UserId END) AS HighActivityUsers,
+    COUNT(DISTINCT CASE WHEN PopularityLevel = 'Popular' THEN TagName END) AS PopularTags,
+    STRING_AGG(DISTINCT DisplayName, ', ') AS AllUserNames,
+    STRING_AGG(DISTINCT TagName, ', ') AS AllTagNames,
+    STRING_AGG(DISTINCT Title, ', ') AS AllPostTitles,
+    JSON_ARRAYAGG(JSON_OBJECT('UserId', UserId, 'PostId', PostId, 'Score', Score)) AS SamplePostData
+FROM CombinedData
+WHERE (UserId IS NOT NULL OR TagName IS NOT NULL OR PostId IS NOT NULL)
+  AND (UserId IS NOT NULL AND UserId > 0 OR TagName IS NOT NULL OR PostId IS NOT NULL)
+GROUP BY 
+    PostRank,
+    ScoreLevel,
+    ViewLevel,
+    ScoreCategory,
+    PostAgeCategory
+HAVING 
+    COUNT(*) > 10
+   OR COUNT(DISTINCT UserId) > 5
+   OR COUNT(DISTINCT TagName) > 5
+ORDER BY 
+    COUNT(*) DESC,
+    AVG(Score) DESC,
+    MAX(Reputation) DESC,
+    COUNT(DISTINCT PostId) DESC
+LIMIT 100;

@@ -1,0 +1,142 @@
+WITH
+  UserPostStats AS (
+    SELECT
+      p.OwnerUserId,
+      COUNT(p.Id) AS TotalPosts,
+      SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+      AVG(p.Score) AS AvgPostScore,
+      MAX(p.CreationDate) AS LastPostDate
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+  ),
+  UserCommentStats AS (
+    SELECT
+      c.UserId,
+      COUNT(c.Id) AS TotalComments,
+      AVG(c.Score) AS AvgCommentScore,
+      MAX(c.CreationDate) AS LastCommentDate
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+    GROUP BY c.UserId
+  ),
+  UserVoteStats AS (
+    SELECT
+      v.UserId,
+      COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVotesGiven,
+      COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVotesGiven,
+      MAX(v.CreationDate) AS LastVoteDate
+    FROM Votes v
+    WHERE v.UserId IS NOT NULL
+    GROUP BY v.UserId
+  ),
+  HighlyActiveUsers AS (
+    SELECT
+      u.Id
+    FROM Users u
+    JOIN UserPostStats ups
+      ON u.Id = ups.OwnerUserId
+    JOIN UserCommentStats ucs
+      ON u.Id = ucs.UserId
+    WHERE
+      ups.TotalPosts > 1000
+      AND ucs.TotalComments > 5000
+      AND u.Reputation > 50000
+      AND u.Views > 100000
+  ),
+  TopQuestions AS (
+    SELECT
+      p.Id,
+      p.OwnerUserId,
+      p.Title,
+      p.Score,
+      p.AnswerCount,
+      p.FavoriteCount,
+      ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.AnswerCount DESC) AS RowNum
+    FROM Posts p
+    WHERE
+      p.PostTypeId = 1
+      AND p.Score > 100
+      AND p.AnswerCount > 10
+  )
+SELECT
+  ha.Id AS UserId,
+  u.DisplayName,
+  ups.TotalPosts,
+  ucs.TotalComments,
+  uvs.UpVotesGiven,
+  uvs.DownVotesGiven,
+  tq.Title AS TopQuestionTitle,
+  tq.Score AS TopQuestionScore,
+  CASE
+    WHEN EXTRACT(day FROM (CAST('2024-10-01 12:34:56' AS timestamp) - u.CreationDate)) > 365 THEN 'Veteran'
+    WHEN EXTRACT(day FROM (CAST('2024-10-01 12:34:56' AS timestamp) - u.CreationDate)) > 90 THEN 'Experienced'
+    ELSE 'Newbie'
+  END AS UserStatus,
+  COALESCE(u.Location, 'Unknown') AS UserLocation,
+  CASE WHEN u.WebsiteUrl IS NULL OR u.WebsiteUrl = '' THEN 'No Website' ELSE 'Has Website' END AS WebsiteStatus,
+  (
+    SELECT
+      MAX(ph.CreationDate)
+    FROM PostHistory ph
+    WHERE
+      ph.UserId = u.Id
+      AND ph.PostHistoryTypeId IN (4, 5, 6)
+  ) AS LastEditDateForUser,
+  (
+    'User ' ||
+    u.DisplayName ||
+    ' has created ' ||
+    COALESCE(CAST(ups.TotalPosts AS varchar), '0') ||
+    ' posts and received ' ||
+    COALESCE(CAST((
+      SELECT COUNT(*) FROM Votes v2 WHERE v2.PostId IN (
+        SELECT p2.Id FROM Posts p2 WHERE p2.OwnerUserId = u.Id
+      ) AND v2.VoteTypeId = 2
+    ) AS varchar), '0') ||
+    ' upvotes on their posts. Their latest activity was on ' ||
+    COALESCE(TO_CHAR(CAST(u.LastAccessDate AS timestamp), 'YYYY-MM-DD HH24:MI:SS'), COALESCE(CAST(u.LastAccessDate AS varchar), ''))
+  ) AS UserSummary,
+  CASE
+    WHEN EXISTS (
+      SELECT 1
+      FROM Badges b
+      WHERE b.UserId = u.Id AND b.Name LIKE '%Gold%' AND b.Class = 1
+    ) THEN 'Has Gold Badge'
+    ELSE 'No Gold Badge'
+  END AS HasGoldBadge
+FROM HighlyActiveUsers ha
+JOIN Users u
+  ON ha.Id = u.Id
+LEFT JOIN UserPostStats ups
+  ON u.Id = ups.OwnerUserId
+LEFT JOIN UserCommentStats ucs
+  ON u.Id = ucs.UserId
+LEFT JOIN UserVoteStats uvs
+  ON u.Id = uvs.UserId
+LEFT JOIN TopQuestions tq
+  ON ha.Id = tq.OwnerUserId AND tq.RowNum = 1
+WHERE
+  u.DisplayName IS NOT NULL
+  AND u.Reputation BETWEEN 10000 AND 100000
+  AND COALESCE(u.DownVotes, 0) < COALESCE(u.UpVotes, 0) * 0.1
+GROUP BY
+  ha.Id,
+  u.Id,
+  u.DisplayName,
+  ups.TotalPosts,
+  ucs.TotalComments,
+  uvs.UpVotesGiven,
+  uvs.DownVotesGiven,
+  tq.Title,
+  tq.Score,
+  u.CreationDate,
+  u.Location,
+  u.WebsiteUrl,
+  u.LastAccessDate,
+  u.Reputation,
+  u.DownVotes,
+  u.UpVotes
+ORDER BY
+  u.Reputation DESC;

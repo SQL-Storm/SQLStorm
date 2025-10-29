@@ -1,0 +1,81 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.Title,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.LastActivityDate,
+        U.DisplayName AS OwnerDisplayName,
+        U.Reputation,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.ViewCount DESC) AS Rank
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId = 1 AND P.Score > 0 AND P.ViewCount > 100
+),
+BadgeCounts AS (
+    SELECT 
+        U.Id AS UserId,
+        U.DisplayName,
+        COUNT(DISTINCT B.Id) AS BadgeCount
+    FROM 
+        Users U
+    JOIN 
+        Badges B ON U.Id = B.UserId
+    WHERE 
+        B.Class = 1 AND (B.TagBased = FALSE OR B.TagBased IS NULL OR B.TagBased = 0)
+    GROUP BY 
+        U.Id, U.DisplayName
+),
+CommentStats AS (
+    SELECT 
+        P.Id AS PostId,
+        COUNT(C.Id) AS CommentCount,
+        MAX(C.Score) AS MaxCommentScore
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Comments C ON P.Id = C.PostId
+    GROUP BY 
+        P.Id
+)
+SELECT 
+    RP.Id AS PostId,
+    RP.Title,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.LastActivityDate,
+    RP.Rank,
+    COALESCE(BC.BadgeCount, 0) AS BadgeCount,
+    COALESCE(CS.CommentCount, 0) AS CommentCount,
+    COALESCE(CS.MaxCommentScore, 0) AS MaxCommentScore,
+    CASE 
+        WHEN RP.Score > 100 THEN 'High Scoring'
+        WHEN RP.ViewCount > 1000 THEN 'Highly Viewed'
+        ELSE 'Regular'
+    END AS PostStatus,
+    RP.OwnerDisplayName
+FROM 
+    RankedPosts RP
+LEFT JOIN 
+    BadgeCounts BC ON RP.OwnerDisplayName = BC.DisplayName
+LEFT JOIN 
+    CommentStats CS ON RP.Id = CS.PostId
+GROUP BY
+    RP.Id,
+    RP.Title,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.LastActivityDate,
+    RP.Rank,
+    BC.BadgeCount,
+    CS.CommentCount,
+    CS.MaxCommentScore,
+    RP.OwnerDisplayName
+ORDER BY 
+    RP.Rank, RP.Score DESC, RP.ViewCount DESC;

@@ -1,0 +1,139 @@
+-- {"query": "3097.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1897} 
+
+WITH 
+TagStats AS (
+    SELECT 
+        t.TagName,
+        COUNT(p.Id)                                            AS QuestionCount,
+        SUM(p.ViewCount)                                       AS TotalViews,
+        AVG(p.Score)                                           AS AvgScore,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END)      AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END)      AS DownVotes,
+        COUNT(DISTINCT u.Id)                                   AS ActiveUsers
+    FROM Tags t
+    LEFT JOIN Posts p 
+        ON p.Tags LIKE '%'||'<'||t.TagName||'>'||'%' 
+        AND p.PostTypeId = 1
+    LEFT JOIN Votes v 
+        ON v.PostId = p.Id
+    LEFT JOIN Users u 
+        ON u.Id = p.OwnerUserId
+    GROUP BY t.TagName
+),
+
+UserRank AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC)                         AS RepRank,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1)                                 AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2)                                 AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3)                                 AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Badges b 
+        ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+RecentClosed AS (
+    SELECT 
+        ph.PostId,
+        MAX(ph.CreationDate)                         AS CloseDate,
+        ph.Comment                                   AS CloseReason
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.PostId, ph.Comment
+),
+
+TopAnswered AS (
+    SELECT 
+        q.Id                                           AS QuestionId,
+        q.Title,
+        q.ViewCount,
+        q.Score,
+        ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY a.Score DESC NULLS LAST) AS AnswerRank,
+        a.Id                                           AS AnswerId,
+        a.Score                                        AS AnswerScore,
+        a.CreationDate                                 AS AnswerCreated
+    FROM Posts q
+    LEFT JOIN Posts a 
+        ON a.ParentId = q.Id 
+        AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+)
+
+SELECT 
+    ts.TagName,
+    ts.QuestionCount,
+    ts.TotalViews,
+    ROUND(ts.AvgScore::numeric, 2)           AS AvgScore,
+    ts.UpVotes,
+    ts.DownVotes,
+    ts.ActiveUsers,
+    ur.DisplayName,
+    ur.Reputation,
+    ur.RepRank,
+    ur.GoldBadges,
+    ur.SilverBadges,
+    ur.BronzeBadges,
+    rc.CloseDate,
+    rc.CloseReason,
+    ta.Title,
+    ta.ViewCount,
+    ta.Score,
+    ta.AnswerId,
+    ta.AnswerScore,
+    ta.AnswerCreated
+FROM TagStats ts
+LEFT JOIN UserRank ur 
+    ON ur.RepRank <= 10                                 -- top‑10 users overall
+LEFT JOIN LATERAL (
+    SELECT 
+        rc.CloseDate,
+        rc.CloseReason
+    FROM RecentClosed rc
+    WHERE rc.PostId = (
+        SELECT p.Id
+        FROM Posts p
+        WHERE p.Tags LIKE '%'||'<'||ts.TagName||'>'||'%' 
+          AND p.PostTypeId = 1
+        ORDER BY p.CreationDate DESC
+        LIMIT 1
+    )
+) rc ON TRUE
+LEFT JOIN LATERAL (
+    SELECT 
+        ta.Title,
+        ta.ViewCount,
+        ta.Score,
+        ta.AnswerId,
+        ta.AnswerScore,
+        ta.AnswerCreated
+    FROM TopAnswered ta
+    WHERE ta.QuestionId = (
+        SELECT p.Id
+        FROM Posts p
+        WHERE p.Tags LIKE '%'||'<'||ts.TagName||'>'||'%' 
+          AND p.PostTypeId = 1
+        ORDER BY p.ViewCount DESC
+        LIMIT 1
+    )
+      AND ta.AnswerRank = 1
+) ta ON TRUE
+WHERE ts.QuestionCount > 0
+ORDER BY ts.TotalViews DESC
+LIMIT 50
+
+UNION ALL
+
+SELECT 
+    'TOTAL'          AS TagName,
+    SUM(ts.QuestionCount),
+    SUM(ts.TotalViews),
+    ROUND(AVG(ts.AvgScore)::numeric, 2),
+    SUM(ts.UpVotes),
+    SUM(ts.DownVotes),
+    SUM(ts.ActiveUsers),
+    NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL
+FROM TagStats ts;

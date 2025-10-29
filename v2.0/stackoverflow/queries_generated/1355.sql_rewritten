@@ -1,0 +1,258 @@
+-- {"query": "1355.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3800} 
+WITH AggregatedPostHistory AS (
+    SELECT
+        PH.PostId,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (10, 101) THEN 1 ELSE 0 END) AS CloseEventsCount, -- 10: Post Closed, 101: Duplicate
+        SUM(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenEventsCount, -- 11: Post Reopened
+        SUM(CASE WHEN PH.PostHistoryTypeId = 12 THEN 1 ELSE 0 END) AS DeleteEventsCount, -- 12: Post Deleted
+        SUM(CASE WHEN PH.PostHistoryTypeId = 13 THEN 1 ELSE 0 END) AS UndeleteEventsCount, -- 13: Post Undeleted
+        MIN(PH.CreationDate) AS FirstHistoryEventDate,
+        MAX(PH.CreationDate) AS LastHistoryEventDate,
+        -- Aggregate distinct close reason names, handling NULLs and ensuring numeric comment before casting
+        STRING_AGG(DISTINCT CR.Name, '; ') FILTER (
+            WHERE PH.PostHistoryTypeId IN (10, 101)
+              AND PH.Comment IS NOT NULL
+              AND LENGTH(TRIM(PH.Comment)) <= 5 -- Assuming CloseReasonId is usually small
+              AND PH.Comment ~ '^[0-9]+$'      -- Ensure it's numeric before casting
+        ) AS AllCloseReasonNames
+    FROM PostHistory AS PH
+    LEFT JOIN CloseReasonTypes AS CR ON
+        PH.PostHistoryTypeId IN (10, 101)
+        AND PH.Comment IS NOT NULL
+        AND LENGTH(TRIM(PH.Comment)) <= 5
+        AND PH.Comment ~ '^[0-9]+$'
+        AND CAST(PH.Comment AS smallint) = CR.Id
+    GROUP BY PH.PostId
+),
+PostTagDetails AS (
+    -- Normalizes tags from the 'Tags' string in Posts
+    SELECT
+        P.Id AS PostId,
+        TRIM(LOWER(UNNEST(string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><')))) AS TagName
+    FROM Posts AS P
+    WHERE P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2
+),
+UserActivityMetrics AS (
+    -- Aggregates user-level activity and reputation metrics
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS UserTotalUpVotes,
+        U.DownVotes AS UserTotalDownVotes,
+        COUNT(P.Id) AS TotalPostsByOwner,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsByOwner,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersByOwner,
+        COALESCE(SUM(P.Score), 0) AS TotalPostScoreByOwner,
+        COALESCE(AVG(P.Score) FILTER (WHERE P.PostTypeId IN (1, 2)), 0.0) AS AvgQAScoreByOwner
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.Views, U.UpVotes, U.DownVotes
+    HAVING U.Reputation > 5000 AND COUNT(P.Id) > 20 -- Filter for active users
+),
+PostsWithProblemTags AS (
+    -- Identifies posts that contain specific 'problematic' tags
+    SELECT DISTINCT
+        PTD.PostId
+    FROM PostTagDetails AS PTD
+    WHERE PTD.TagName IN ('bug', 'error', 'security', 'vulnerability', 'performance', 'confusing', 'problem', 'unclear', 'misleading')
+),
+ControversialPosts AS (
+    -- Combines posts identified as controversial based on multiple criteria using UNION ALL
+    -- Criterion 1: Posts with significant close/reopen/delete/undelete history
+    SELECT
+        P.Id AS PostId,
+        'HistoryControversy' AS ControversyType,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.CommentCount,
+        P.ViewCount,
+        P.OwnerUserId,
+        APH.CloseEventsCount,
+        APH.ReopenEventsCount,
+        APH.DeleteEventsCount,
+        APH.UndeleteEventsCount,
+        APH.AllCloseReasonNames,
+        0.0 AS DownvoteRatioCalc -- Placeholder for this criterion
+    FROM Posts AS P
+    JOIN AggregatedPostHistory AS APH ON P.Id = APH.PostId
+    WHERE (APH.CloseEventsCount > 0 AND APH.ReopenEventsCount > 0) -- Closed and reopened
+       OR (APH.DeleteEventsCount > 0 AND APH.UndeleteEventsCount > 0 AND P.PostTypeId = 2) -- Undeleted answers
+       OR (APH.CloseEventsCount > 2 AND APH.AllCloseReasonNames IS NOT NULL) -- Multiple close attempts
+       AND P.PostTypeId IN (1, 2)
+
+    UNION ALL
+
+    -- Criterion 2: Posts with a high downvote ratio or generally low score despite high engagement
+    SELECT
+        P.Id AS PostId,
+        'VoteControversy' AS ControversyType,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.CommentCount,
+        P.ViewCount,
+        P.OwnerUserId,
+        COALESCE(APH.CloseEventsCount, 0) AS CloseEventsCount,
+        COALESCE(APH.ReopenEventsCount, 0) AS ReopenEventsCount,
+        COALESCE(APH.DeleteEventsCount, 0) AS DeleteEventsCount,
+        COALESCE(APH.UndeleteEventsCount, 0) AS UndeleteEventsCount,
+        APH.AllCloseReasonNames,
+        -- Calculate downvote ratio, handling division by zero
+        CAST(SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS NUMERIC) / NULLIF(SUM(CASE WHEN V.VoteTypeId IN (2, 3) THEN 1 ELSE 0 END), 0) AS DownvoteRatioCalc
+    FROM Posts AS P
+    LEFT JOIN Votes AS V ON P.Id = V.PostId AND V.VoteTypeId IN (2, 3) -- UpMod (2), DownMod (3)
+    LEFT JOIN AggregatedPostHistory AS APH ON P.Id = APH.PostId
+    WHERE P.PostTypeId IN (1, 2)
+    GROUP BY P.Id, P.CreationDate, P.Score, P.CommentCount, P.ViewCount, P.OwnerUserId,
+             APH.CloseEventsCount, APH.ReopenEventsCount, APH.DeleteEventsCount, APH.UndeleteEventsCount, APH.AllCloseReasonNames
+    HAVING (SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) > 5 AND CAST(SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS NUMERIC) / NULLIF(SUM(CASE WHEN V.VoteTypeId IN (2, 3) THEN 1 ELSE 0 END), 0) > 0.4) -- More than 40% downvotes
+        OR (P.Score < 0 AND P.CommentCount > 10) -- Negative score with many comments
+        OR (P.ViewCount > 10000 AND P.Score < 10 AND P.CommentCount > 50) -- Highly viewed but low score, high discussion
+
+    UNION ALL
+
+    -- Criterion 3: Posts explicitly tagged with "problematic" keywords
+    SELECT
+        P.Id AS PostId,
+        'TagControversy' AS ControversyType,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.CommentCount,
+        P.ViewCount,
+        P.OwnerUserId,
+        COALESCE(APH.CloseEventsCount, 0) AS CloseEventsCount,
+        COALESCE(APH.ReopenEventsCount, 0) AS ReopenEventsCount,
+        COALESCE(APH.DeleteEventsCount, 0) AS DeleteEventsCount,
+        COALESCE(APH.UndeleteEventsCount, 0) AS UndeleteEventsCount,
+        APH.AllCloseReasonNames,
+        0.0 AS DownvoteRatioCalc -- Placeholder for this criterion
+    FROM Posts AS P
+    JOIN PostsWithProblemTags AS PWP ON P.Id = PWP.PostId
+    LEFT JOIN AggregatedPostHistory AS APH ON P.Id = APH.PostId
+    WHERE P.PostTypeId IN (1, 2)
+),
+PostCommentAnalysis AS (
+    -- Analyzes comments for each post to find the most recent and top-scoring
+    SELECT
+        C.PostId,
+        MAX(CASE WHEN RC.rn = 1 THEN C.Text END) AS MostRecentCommentText,
+        MAX(CASE WHEN RC.rk = 1 THEN C.Text END) AS TopScoringCommentText,
+        MAX(CASE WHEN RC.rk = 1 THEN U.DisplayName END) AS TopScoringCommenterDisplayName,
+        COUNT(C.Id) AS TotalCommentsForPost,
+        SUM(CASE WHEN C.UserId IS NULL THEN 1 ELSE 0 END) AS AnonymousCommentCount
+    FROM Comments AS C
+    LEFT JOIN Users AS U ON C.UserId = U.Id
+    JOIN (
+        SELECT
+            c_inner.Id,
+            c_inner.PostId,
+            ROW_NUMBER() OVER (PARTITION BY c_inner.PostId ORDER BY c_inner.CreationDate DESC) AS rn, -- Most recent
+            RANK() OVER (PARTITION BY c_inner.PostId ORDER BY c_inner.Score DESC, c_inner.CreationDate DESC) AS rk -- Top scoring
+        FROM Comments AS c_inner
+    ) AS RC ON C.Id = RC.Id
+    GROUP BY C.PostId
+),
+RelatedPostSummary AS (
+    -- Summarizes linked and duplicate posts for each post
+    SELECT
+        PL.PostId,
+        COUNT(DISTINCT PL.RelatedPostId) AS NumberOfLinkedPosts,
+        STRING_AGG(DISTINCT LT.Name, '; ') AS LinkedPostTypes,
+        AVG(CASE WHEN R.Score > 0 THEN R.Score ELSE 0 END) AS AvgRelatedPostPositiveScore
+    FROM PostLinks AS PL
+    JOIN LinkTypes AS LT ON PL.LinkTypeId = LT.Id
+    LEFT JOIN Posts AS R ON PL.RelatedPostId = R.Id
+    GROUP BY PL.PostId
+),
+PostEditorCount AS (
+    -- Counts unique editors for each post based on history events
+    SELECT
+        PH.PostId,
+        COUNT(DISTINCT PH.UserId) AS UniqueEditorCount
+    FROM PostHistory AS PH
+    WHERE PH.UserId IS NOT NULL AND PH.PostHistoryTypeId IN (4, 5, 6, 8, 9, 24) -- Edit Title, Body, Tags, Rollback, Suggested Edit Applied
+    GROUP BY PH.PostId
+)
+-- Main Query to combine and present all relevant information
+SELECT
+    UAM.UserId,
+    UAM.DisplayName AS UserDisplayName,
+    UAM.Reputation,
+    UAM.TotalPostsByOwner,
+    UAM.AvgQAScoreByOwner,
+    P.Id AS PostId,
+    PT.Name AS PostTypeName,
+    P.Title AS PostTitle,
+    P.CreationDate AS PostCreationDate,
+    P.Score AS PostScore,
+    P.ViewCount AS PostViewCount,
+    P.AnswerCount,
+    P.CommentCount AS PostBuiltInCommentCount, -- Posts.CommentCount
+    P.FavoriteCount AS PostFavoriteCount,
+    CP.ControversyType,
+    CP.DownvoteRatioCalc,
+    CP.CloseEventsCount,
+    CP.ReopenEventsCount,
+    CP.DeleteEventsCount,
+    CP.UndeleteEventsCount,
+    CP.AllCloseReasonNames AS PostCloseReasons,
+    PCAN.TotalCommentsForPost,
+    PCAN.AnonymousCommentCount,
+    PCAN.MostRecentCommentText,
+    PCAN.TopScoringCommentText,
+    PCAN.TopScoringCommenterDisplayName,
+    RPS.NumberOfLinkedPosts,
+    RPS.LinkedPostTypes,
+    RPS.AvgRelatedPostPositiveScore,
+    PEC.UniqueEditorCount, -- Number of distinct users who edited this post
+    -- Correlated Subquery: Checks if the post (if a question) has an accepted answer
+    (SELECT EXISTS (
+        SELECT 1 FROM Posts AS QA WHERE QA.Id = P.Id AND QA.AcceptedAnswerId IS NOT NULL
+    )) AS HasAcceptedAnswer,
+    -- Correlated Subquery: Calculates the average score of answers associated with this post (if it's a question)
+    (SELECT COALESCE(AVG(A.Score), 0.0)
+     FROM Posts AS A
+     WHERE A.ParentId = P.Id AND A.PostTypeId = 2) AS AvgAnswerScore,
+    -- Window function: Ranks controversial posts by score within each user's contributions
+    RANK() OVER (PARTITION BY UAM.UserId ORDER BY P.Score DESC, P.CreationDate DESC) AS UserPostScoreRank,
+    -- Window function: Retrieves the score of the user's immediately preceding controversial post
+    LAG(P.Score, 1, 0) OVER (PARTITION BY UAM.UserId ORDER BY P.CreationDate) AS PreviousUserPostScore,
+    -- Window function: Calculates a running average of view counts for a user's controversial posts
+    AVG(P.ViewCount) OVER (PARTITION BY UAM.UserId ORDER BY P.CreationDate RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS RunningAvgViewCount,
+    -- Complex calculation: Combined Views per Comment Ratio, handling potential division by zero
+    COALESCE(
+        P.ViewCount * 1.0 / NULLIF(P.CommentCount + PCAN.TotalCommentsForPost, 0),
+        0.0
+    ) AS CombinedViewsPerCommentRatio,
+    -- String operations and conditional expressions for categorization
+    UPPER(LEFT(PT.Name, 3)) AS PostTypeAbbreviation,
+    CASE
+        WHEN P.Tags IS NULL OR LENGTH(TRIM(P.Tags)) <= 2 THEN 'No Tags'
+        WHEN P.Tags ILIKE '%<sql>%' OR P.Tags ILIKE '%<database>%' THEN 'Database Related'
+        WHEN P.Tags ILIKE '%<javascript>%' OR P.Tags ILIKE '%<typescript>%' THEN 'Frontend Related'
+        WHEN P.Tags ILIKE '%<python>%' OR P.Tags ILIKE '%<java>%' THEN 'Backend Related'
+        ELSE 'Other Tech'
+    END AS TagCategoryGroup,
+    -- Date difference calculation: Days since the last activity on the post
+    EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - P.LastActivityDate)) / (60 * 60 * 24) AS DaysSinceLastActivity,
+    -- NTH_VALUE window function: Retrieves the title of the 2nd highest scoring controversial post by a user
+    NTH_VALUE(P.Title, 2) OVER (PARTITION BY UAM.UserId ORDER BY P.Score DESC, P.CreationDate DESC) AS SecondHighestScoringPostTitle
+FROM ControversialPosts AS CP
+JOIN Posts AS P ON CP.PostId = P.Id
+JOIN PostTypes AS PT ON P.PostTypeId = PT.Id
+JOIN UserActivityMetrics AS UAM ON P.OwnerUserId = UAM.UserId
+LEFT JOIN PostCommentAnalysis AS PCAN ON P.Id = PCAN.PostId
+LEFT JOIN RelatedPostSummary AS RPS ON P.Id = RPS.PostId
+LEFT JOIN PostEditorCount AS PEC ON P.Id = PEC.PostId
+WHERE
+    (P.LastActivityDate IS NOT NULL AND P.LastActivityDate > (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '5 year')) -- Only include posts with recent activity
+    AND (P.ViewCount > 500 OR UAM.Reputation > 10000) -- Filter for widely seen posts or posts by highly reputable users
+    AND (P.Title IS NOT NULL AND P.Title != '')
+ORDER BY
+    UAM.Reputation DESC,
+    P.Score DESC,
+    P.ViewCount DESC,
+    CP.ControversyType
+LIMIT 5000;

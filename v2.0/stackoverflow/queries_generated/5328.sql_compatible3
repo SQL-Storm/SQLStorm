@@ -1,0 +1,82 @@
+SELECT
+  u.Id AS UserId,
+  u.DisplayName AS UserName,
+  u.Reputation,
+  COALESCE(u.Location, 'Unknown') AS Location,
+  u.CreationDate AS UserCreationDate,
+  u.LastAccessDate,
+  vtx.TotalVotes,
+  vtx.UpVotes,
+  vtx.DownVotes,
+  COALESCE(badge_summary.BadgeCount, 0) AS BadgeCount,
+  COALESCE(badge_summary.GoldCount, 0) AS GoldBadges,
+  COALESCE(badge_summary.SilverCount, 0) AS SilverBadges,
+  COALESCE(badge_summary.BronzeCount, 0) AS BronzeBadges,
+  COALESCE(tp.TotalQuestionPosts, 0) AS TotalQuestions,
+  COALESCE(tp.TotalAnswerPosts, 0) AS TotalAnswers,
+  STRING_AGG(COALESCE(CAST(c.Score AS VARCHAR), '0'), ',') AS CommentScores,
+  MAX(p.LastActivityDate) AS LastActivityDate,
+  ARRAY_AGG(DISTINCT t.TagName) FILTER (WHERE t.TagName IS NOT NULL) AS TagsViewed
+FROM
+  Users u
+  LEFT JOIN (
+    SELECT
+      UserId,
+      SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+      SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+      COUNT(*) AS TotalVotes
+    FROM Votes
+    GROUP BY UserId
+  ) vtx ON vtx.UserId = u.Id
+  LEFT JOIN (
+    SELECT
+      UserId,
+      COUNT(*) AS BadgeCount,
+      SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldCount,
+      SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverCount,
+      SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeCount
+    FROM Badges b
+    GROUP BY UserId
+  ) badge_summary ON badge_summary.UserId = u.Id
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN (
+    SELECT
+      p.OwnerUserId,
+      SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionPosts,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswerPosts
+    FROM Posts p
+    GROUP BY p.OwnerUserId
+  ) tp ON tp.OwnerUserId = u.Id
+  LEFT JOIN Comments c ON c.UserId = u.Id
+  LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+  LEFT JOIN Tags t ON t.Id = (
+    CASE
+      WHEN p.Tags IS NULL OR p.Tags = '' THEN NULL
+      ELSE
+        SUBSTRING(p.Tags FROM (POSITION('<' IN p.Tags) + 1) FOR (POSITION('>' IN p.Tags) - POSITION('<' IN p.Tags) - 1))
+    END
+  )
+WHERE
+  u.AccountId IS NOT NULL
+  AND u.Reputation > 100
+GROUP BY
+  u.Id,
+  u.DisplayName,
+  u.Reputation,
+  u.Location,
+  u.CreationDate,
+  u.LastAccessDate,
+  vtx.TotalVotes,
+  vtx.UpVotes,
+  vtx.DownVotes,
+  badge_summary.BadgeCount,
+  badge_summary.GoldCount,
+  badge_summary.SilverCount,
+  badge_summary.BronzeCount,
+  tp.TotalQuestionPosts,
+  tp.TotalAnswerPosts,
+  p.LastActivityDate
+ORDER BY
+  COALESCE(vtx.TotalVotes, 0) DESC,
+  u.Reputation DESC
+LIMIT 100;

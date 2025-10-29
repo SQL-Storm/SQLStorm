@@ -1,0 +1,497 @@
+SELECT 
+    p.Id AS PostId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    u.DisplayName AS OwnerName,
+    u.Reputation,
+    CASE 
+        WHEN p.PostTypeId = 1 THEN 'Question'
+        WHEN p.PostTypeId = 2 THEN 'Answer'
+        WHEN p.PostTypeId = 3 THEN 'Wiki'
+        ELSE 'Other'
+    END AS PostType,
+    COALESCE(p.Tags, '') AS Tags,
+    COALESCE(p.AnswerCount, 0) AS AnswerCount,
+    COALESCE(p.CommentCount, 0) AS CommentCount,
+    COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+    p.ClosedDate,
+    p.CommunityOwnedDate,
+    CASE 
+        WHEN p.ClosedDate IS NOT NULL THEN EXTRACT(DAY FROM (p.ClosedDate - p.CreationDate))
+        ELSE NULL 
+    END AS DaysToClose,
+    (
+        SELECT COUNT(*) 
+        FROM Comments c 
+        WHERE c.PostId = p.Id 
+        AND c.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 month')
+    ) AS RecentComments,
+    (
+        SELECT ph.Text
+        FROM PostHistory ph 
+        WHERE ph.PostId = p.Id 
+        AND ph.PostHistoryTypeId IN (1, 4) 
+        AND ph.CreationDate = (
+            SELECT MAX(ph2.CreationDate) 
+            FROM PostHistory ph2 
+            WHERE ph2.PostId = p.Id 
+            AND ph2.PostHistoryTypeId IN (1, 4)
+        )
+        LIMIT 1
+    ) AS LatestTitle,
+    (
+        SELECT STRING_AGG(b.Name, ', ') 
+        FROM Badges b 
+        WHERE b.UserId = p.OwnerUserId 
+        AND b.Date > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year')
+    ) AS RecentBadges,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserPostRank,
+    RANK() OVER (ORDER BY p.Score DESC) AS ScoreRank,
+    DENSE_RANK() OVER (ORDER BY p.ViewCount DESC) AS ViewRank,
+    NTILE(100) OVER (ORDER BY p.Score) AS ScorePercentile,
+    LAG(p.ViewCount, 1) OVER (ORDER BY p.CreationDate) AS PreviousViewCount,
+    LEAD(p.Score, 1) OVER (ORDER BY p.CreationDate) AS NextScore,
+    AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS AvgScorePerUser,
+    SUM(p.ViewCount) OVER (ORDER BY p.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativeViews,
+    COUNT(*) OVER (PARTITION BY p.OwnerUserId) AS TotalPostsPerUser,
+    CASE 
+        WHEN p.AnswerCount > 0 AND p.Score >= 10 THEN 'HighValue'
+        WHEN p.Score < 0 THEN 'Negative'
+        WHEN p.Score BETWEEN 0 AND 10 THEN 'Neutral'
+        ELSE 'Positive'
+    END AS ScoreCategory,
+    COALESCE(
+        (
+            SELECT v.VoteTypeId 
+            FROM Votes v 
+            WHERE v.PostId = p.Id 
+            AND v.UserId = p.OwnerUserId
+            LIMIT 1
+        ), 0
+    ) AS OwnerVoteType,
+    (
+        SELECT COUNT(*) 
+        FROM Votes v 
+        WHERE v.PostId = p.Id 
+        AND v.VoteTypeId IN (2, 3)
+    ) AS NetVotes,
+    EXISTS(
+        SELECT 1 
+        FROM Posts p2 
+        WHERE p2.ParentId = p.Id 
+        AND p2.PostTypeId = 2 
+        AND p2.Score > 10
+    ) AS HasHighScoringAnswer,
+    (
+        SELECT COUNT(DISTINCT ph.UserId) 
+        FROM PostHistory ph 
+        WHERE ph.PostId = p.Id 
+        AND ph.UserId IS NOT NULL
+    ) AS EditorCount,
+    CASE 
+        WHEN p.Tags LIKE '%<%<%' AND p.Tags LIKE '%>%>%' THEN 'MultipleTags'
+        ELSE 'SingleTag'
+    END AS TagStructure,
+    EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate)) / 86400.0 AS DaysSinceActivity,
+    CASE 
+        WHEN EXISTS(
+            SELECT 1 
+            FROM PostLinks pl 
+            WHERE pl.PostId = p.Id 
+            AND pl.LinkTypeId = 1
+        ) THEN 'Linked'
+        ELSE 'NotLinked'
+    END AS LinkStatus,
+    (
+        SELECT COALESCE(SUM(v.BountyAmount), 0)
+        FROM Votes v
+        WHERE v.PostId = p.Id
+        AND v.VoteTypeId = 8
+    ) AS TotalBounty,
+    (
+        SELECT COUNT(*) 
+        FROM Badges b 
+        WHERE b.UserId = p.OwnerUserId 
+        AND b.Class = 1
+    ) AS GoldBadgeCount,
+    (
+        SELECT COUNT(*) 
+        FROM Badges b 
+        WHERE b.UserId = p.OwnerUserId 
+        AND b.Class = 2
+    ) AS SilverBadgeCount,
+    (
+        SELECT COUNT(*) 
+        FROM Badges b 
+        WHERE b.UserId = p.OwnerUserId 
+        AND b.Class = 3
+    ) AS BronzeBadgeCount,
+    CASE 
+        WHEN p.FavoriteCount > 0 THEN (CAST(p.FavoriteCount AS DOUBLE PRECISION) / NULLIF(p.ViewCount, 0)) * 100
+        ELSE 0
+    END AS BookmarkRate,
+    (
+        SELECT COUNT(*) 
+        FROM Comments c 
+        WHERE c.PostId = p.Id 
+        AND c.Text ILIKE '%help%'
+    ) AS HelpMentions,
+    (
+        SELECT COUNT(*) 
+        FROM PostHistory ph 
+        WHERE ph.PostId = p.Id 
+        AND ph.PostHistoryTypeId IN (2, 5)
+    ) AS BodyEdits,
+    (
+        SELECT COUNT(*) 
+        FROM PostHistory ph 
+        WHERE ph.PostId = p.Id 
+        AND ph.PostHistoryTypeId IN (3, 6)
+    ) AS TagEdits,
+    (
+        SELECT ph.CreationDate 
+        FROM PostHistory ph 
+        WHERE ph.PostId = p.Id 
+        AND ph.PostHistoryTypeId = 10
+        ORDER BY ph.CreationDate ASC
+        LIMIT 1
+    ) AS FirstCloseDate,
+    (
+        SELECT ph.CreationDate 
+        FROM PostHistory ph 
+        WHERE ph.PostId = p.Id 
+        AND ph.PostHistoryTypeId = 11
+        ORDER BY ph.CreationDate ASC
+        LIMIT 1
+    ) AS FirstReopenDate,
+    (
+        SELECT COUNT(*) 
+        FROM PostHistory ph 
+        WHERE ph.PostId = p.Id 
+        AND ph.PostHistoryTypeId = 13
+    ) AS UndeleteCount,
+    (
+        SELECT COUNT(*) 
+        FROM PostHistory ph 
+        WHERE ph.PostId = p.Id 
+        AND ph.PostHistoryTypeId IN (12, 10, 11)
+    ) AS ActivityCount,
+    (
+        SELECT STRING_AGG(
+            CASE 
+                WHEN ph.PostHistoryTypeId IN (10, 11) THEN 'StatusChange'
+                WHEN ph.PostHistoryTypeId IN (2, 5) THEN 'BodyEdit'
+                WHEN ph.PostHistoryTypeId IN (3, 6) THEN 'TagEdit'
+                ELSE 'Other'
+            END, 
+            ', '
+        ) 
+        FROM PostHistory ph 
+        WHERE ph.PostId = p.Id
+    ) AS RecentActivityTypes,
+    (
+        SELECT MAX(ph.CreationDate) 
+        FROM PostHistory ph 
+        WHERE ph.PostId = p.Id 
+        AND ph.UserId = p.OwnerUserId
+    ) AS OwnerLastEditDate,
+    (
+        SELECT COUNT(*) 
+        FROM Votes v 
+        WHERE v.PostId = p.Id 
+        AND v.UserId = p.OwnerUserId
+        AND v.VoteTypeId = 5
+    ) AS OwnerFavorites,
+    (
+        SELECT COUNT(DISTINCT v.UserId) 
+        FROM Votes v 
+        WHERE v.PostId = p.Id 
+        AND v.VoteTypeId IN (2, 3, 5)
+    ) AS UniqueVoters,
+    (
+        SELECT AVG(p2.ViewCount) 
+        FROM Posts p2 
+        WHERE p2.OwnerUserId = p.OwnerUserId 
+        AND p2.Id != p.Id
+    ) AS AvgViewsForUser,
+    ABS(p.ViewCount - (
+        SELECT AVG(p2.ViewCount) 
+        FROM Posts p2 
+        WHERE p2.OwnerUserId = p.OwnerUserId 
+        AND p2.Id != p.Id
+    )) AS ViewCountDeviation,
+    CASE 
+        WHEN p.ViewCount >= (
+            SELECT PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY p2.ViewCount) 
+            FROM Posts p2 
+            WHERE p2.OwnerUserId = p.OwnerUserId
+        ) THEN 'Top5Percent'
+        WHEN p.ViewCount >= (
+            SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p2.ViewCount) 
+            FROM Posts p2 
+            WHERE p2.OwnerUserId = p.OwnerUserId
+        ) THEN 'Median'
+        ELSE 'BelowMedian'
+    END AS ViewPercentileCategory,
+    (
+        SELECT COUNT(*) 
+        FROM PostHistory ph 
+        WHERE ph.PostId = p.Id 
+        AND ph.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 weeks')
+    ) AS RecentActivityCount,
+    (
+        SELECT AVG(EXTRACT(EPOCH FROM ph.CreationDate)) 
+        FROM PostHistory ph 
+        WHERE ph.PostId = p.Id
+    ) AS AvgActivityDate,
+    (
+        SELECT EXTRACT(EPOCH FROM (MAX(ph.CreationDate) - MIN(ph.CreationDate)))
+        FROM PostHistory ph 
+        WHERE ph.PostId = p.Id
+    ) AS ActivityDuration,
+    (
+        SELECT COUNT(*) 
+        FROM PostHistory ph 
+        WHERE ph.PostId = p.Id 
+        AND ph.Comment IS NOT NULL
+    ) AS CommentedEvents,
+    (
+        SELECT ph.Comment 
+        FROM PostHistory ph 
+        WHERE ph.PostId = p.Id 
+        AND ph.Comment IS NOT NULL
+        ORDER BY ph.CreationDate DESC
+        LIMIT 1
+    ) AS LastEventComment,
+    (
+        SELECT STRING_AGG(
+            CASE 
+                WHEN p3.PostTypeId = 1 THEN 'Q'
+                WHEN p3.PostTypeId = 2 THEN 'A'
+                ELSE 'O'
+            END, 
+            '-'
+        ) 
+        FROM Posts p3 
+        WHERE p3.OwnerUserId = p.OwnerUserId 
+        AND p3.Id != p.Id
+    ) AS UserPostTypeSequence,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p4 
+        WHERE p4.OwnerUserId = p.OwnerUserId 
+        AND p4.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '3 months')
+    ) AS RecentPostsCount,
+    (
+        SELECT STRING_AGG(
+            CONCAT(SUBSTRING(p5.Title FROM 1 FOR 20), ' [', CASE WHEN p5.Score >= 10 THEN 'High' ELSE 'Low' END, ']'),
+            ' | '
+        )
+        FROM (
+            SELECT p5.*
+            FROM Posts p5
+            WHERE p5.OwnerUserId = p.OwnerUserId 
+            AND p5.Id != p.Id
+            ORDER BY p5.Score DESC
+            LIMIT 3
+        ) p5
+    ) AS TopPostsByScore,
+    (
+        SELECT STRING_AGG(
+            c.Text, 
+            ' | '
+        ) 
+        FROM (
+            SELECT c.*
+            FROM Comments c 
+            WHERE c.PostId = p.Id
+            AND LENGTH(c.Text) > 50
+            ORDER BY c.CreationDate DESC
+            LIMIT 2
+        ) c
+    ) AS LongComments,
+    (
+        SELECT COUNT(*) 
+        FROM PostHistory ph 
+        WHERE ph.PostId = p.Id 
+        AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)
+    ) AS TotalEdits,
+    (
+        SELECT COUNT(*) 
+        FROM PostHistory ph 
+        WHERE ph.PostId = p.Id 
+        AND ph.PostHistoryTypeId = 24
+    ) AS SuggestedEdits,
+    (
+        SELECT COUNT(*) 
+        FROM PostHistory ph 
+        WHERE ph.PostId = p.Id 
+        AND ph.PostHistoryTypeId = 17
+    ) AS MigrationEvents,
+    (
+        SELECT COUNT(*) 
+        FROM PostHistory ph 
+        WHERE ph.PostId = p.Id 
+        AND ph.PostHistoryTypeId IN (19, 20)
+    ) AS ProtectionEvents,
+    (
+        SELECT COUNT(*) 
+        FROM PostHistory ph 
+        WHERE ph.PostId = p.Id 
+        AND ph.PostHistoryTypeId = 35
+    ) AS MigratedAway,
+    (
+        SELECT COUNT(*) 
+        FROM PostHistory ph 
+        WHERE ph.PostId = p.Id 
+        AND ph.PostHistoryTypeId = 36
+    ) AS MigratedHere,
+    (
+        SELECT COUNT(*) 
+        FROM PostHistory ph 
+        WHERE ph.PostId = p.Id 
+        AND ph.PostHistoryTypeId IN (33, 34)
+    ) AS NoticeEvents,
+    (
+        SELECT COALESCE(MAX(ph.CreationDate), p.CreationDate)
+        FROM PostHistory ph 
+        WHERE ph.PostId = p.Id
+    ) AS LastModificationDate,
+    (
+        SELECT COUNT(*) 
+        FROM PostLinks pl 
+        WHERE pl.PostId = p.Id
+    ) AS DirectLinks,
+    (
+        SELECT COUNT(*) 
+        FROM PostLinks pl 
+        WHERE pl.RelatedPostId = p.Id
+    ) AS IncomingLinks,
+    (
+        SELECT COUNT(*) 
+        FROM Tags t 
+        WHERE t.TagName IN (
+            SELECT regexp_split_to_table(TRIM(BOTH '<>' FROM p.Tags), '><')
+        )
+    ) AS TagMatches,
+    (
+        SELECT COUNT(*) 
+        FROM Users u2 
+        WHERE u2.AccountId = u.AccountId
+    ) AS AccountUserCount,
+    (
+        SELECT STRING_AGG(
+            CONCAT('U', u2.Id, '-', u2.Reputation),
+            ' | '
+        ) 
+        FROM (
+            SELECT u2.*
+            FROM Users u2 
+            WHERE u2.AccountId = u.AccountId
+            AND u2.Id != u.Id
+            ORDER BY u2.Reputation DESC
+            LIMIT 2
+        ) u2
+    ) AS OtherAccountIdUsers,
+    (
+        SELECT COUNT(*) 
+        FROM Badges b 
+        WHERE b.UserId = u.Id
+    ) AS TotalBadges,
+    (
+        SELECT STRING_AGG(
+            b.Name,
+            ', '
+        ) 
+        FROM Badges b 
+        WHERE b.UserId = u.Id
+        AND b.Date > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 years')
+        ORDER BY b.Date DESC
+    ) AS RecentBadgesList,
+    (
+        SELECT STRING_AGG(
+            'V' || CAST(v.VoteTypeId AS VARCHAR(2)) || ' ' ||
+            CASE WHEN v.VoteTypeId IN (2, 3) THEN CAST(v.BountyAmount AS VARCHAR(10)) ELSE '' END,
+            ' | '
+        )
+        FROM (
+            SELECT v.*
+            FROM Votes v 
+            WHERE v.UserId = u.Id
+            ORDER BY v.CreationDate DESC
+            LIMIT 3
+        ) v
+    ) AS RecentVotes,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p6 
+        WHERE p6.OwnerUserId = u.Id 
+        AND p6.PostTypeId = 2
+    ) AS AnswerCount,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p6 
+        WHERE p6.OwnerUserId = u.Id 
+        AND p6.PostTypeId = 1
+    ) AS QuestionCount,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p6 
+        WHERE p6.OwnerUserId = u.Id 
+        AND p6.PostTypeId = 3
+    ) AS WikiCount,
+    (
+        SELECT AVG(p7.ViewCount) 
+        FROM Posts p7 
+        WHERE p7.OwnerUserId = u.Id
+    ) AS AvgPostViews,
+    (
+        SELECT SUM(p7.Score) 
+        FROM Posts p7 
+        WHERE p7.OwnerUserId = u.Id
+    ) AS TotalScore
+FROM Posts p
+LEFT JOIN Users u ON u.Id = p.OwnerUserId
+WHERE (
+    p.PostTypeId IN (1, 2) 
+    AND p.ViewCount >= 100
+    AND (
+        p.Score > 5 
+        OR p.AnswerCount > 3
+        OR p.FavoriteCount > 2
+    )
+)
+AND (
+    p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6 months')
+    OR p.LastActivityDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6 months')
+)
+AND NOT EXISTS (
+    SELECT 1 
+    FROM PostHistory ph 
+    WHERE ph.PostId = p.Id 
+    AND ph.PostHistoryTypeId = 12
+)
+AND (
+    u.Id IS NOT NULL 
+    OR p.OwnerUserId = -1
+)
+AND (
+    p.Tags IS NOT NULL 
+    AND LENGTH(TRIM(p.Tags)) > 0
+)
+AND (
+    p.Title IS NOT NULL 
+    AND LENGTH(TRIM(p.Title)) > 10
+)
+AND (
+    p.Body IS NOT NULL 
+    AND LENGTH(TRIM(p.Body)) > 50
+)
+AND (
+    (p.PostTypeId = 1 AND p.AnswerCount IS NOT NULL)
+    OR (p.PostTypeId = 2 AND p.ParentId IS NOT NULL)
+)
+ORDER BY p.Score DESC, p.ViewCount DESC
+LIMIT 1000;

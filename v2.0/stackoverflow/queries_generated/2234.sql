@@ -1,0 +1,129 @@
+-- {"query": "2234.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1190} 
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        count(distinct b.Id) as BadgeCount,
+        COALESCE(sum(vt.Name = 'UpMod'::varchar)::int,0) as TotalUpVotes,
+        COALESCE(sum(vt.Name = 'DownMod'::varchar)::int,0) as TotalDownVotes
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    left join VoteTypes vt on vt.Id = v.VoteTypeId
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+UserBadgeRanks as (
+    select
+        UserId,
+        Name,
+        Class,
+        row_number() over (partition by UserId order by Class) as BadgeRank
+    from Badges
+),
+QuestionAnswerDetails as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionCreated,
+        q.Score as QuestionScore,
+        q.Tags,
+        a.Id as AnswerId,
+        a.CreationDate as AnswerCreated,
+        a.Score as AnswerScore,
+        a.OwnerUserId as AnswerOwner,
+        -- Correlated subquery for comments count for each answer
+        (select count(*) from Comments c where c.PostId = a.Id) as AnswerCommentCount,
+        -- Window function for ranking answers per question by score desc, date asc
+        row_number() over (partition by q.Id order by a.Score desc, a.CreationDate) as AnswerRank
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+),
+TopTags as (
+    select
+        unnest(string_to_array(substring(Tags from 2 for length(Tags) - 2), '><')) as TagName,
+        count(*) as TagUsageCount
+    from Posts
+    where PostTypeId = 1 and Tags is not null and Tags <> ''
+    group by 1
+),
+DuplicateLinks as (
+    select distinct
+        pl.PostId as DuplicatePostId,
+        pl.RelatedPostId as OriginalPostId
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    where lt.Name = 'Duplicate'
+),
+QuestionCloseInfo as (
+    select
+        ph.PostId,
+        min(ph.CreationDate) as FirstCloseDate,
+        string_agg(distinct crt.Name, ', ') as CloseReasons
+    from PostHistory ph
+    left join CloseReasonTypes crt on crt.Id::varchar = ph.Comment -- ph.Comment holds CloseReasonId as string
+    where ph.PostHistoryTypeId = 10
+    group by ph.PostId
+),
+UserRecentBadgeInfo as (
+    select
+        u.Id as UserId,
+        max(b.Date) as LastBadgeDate,
+        max(b.Name) filter (where b.Class = 1) as LastGoldBadge,
+        max(b.Name) filter (where b.Class = 2) as LastSilverBadge,
+        max(b.Name) filter (where b.Class = 3) as LastBronzeBadge
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id
+)
+select
+    rua.UserId,
+    rua.DisplayName,
+    rua.Reputation,
+    rua.QuestionCount,
+    rua.AnswerCount,
+    rua.BadgeCount,
+    rua.TotalUpVotes,
+    rua.TotalDownVotes,
+    ub.Name as TopBadgeName,
+    ub.Class as TopBadgeClass,
+    qd.QuestionId,
+    qd.Title as QuestionTitle,
+    qd.QuestionCreated,
+    qd.QuestionScore,
+    qd.Tags,
+    qd.AnswerId,
+    qd.AnswerCreated,
+    qd.AnswerScore,
+    qd.AnswerOwner,
+    qd.AnswerCommentCount,
+    qd.AnswerRank,
+    dt.TagUsageCount,
+    dpl.OriginalPostId as DuplicateOf,
+    qci.FirstCloseDate,
+    qci.CloseReasons,
+    urbi.LastBadgeDate,
+    urbi.LastGoldBadge,
+    urbi.LastSilverBadge,
+    urbi.LastBronzeBadge
+from RecursiveUserActivity rua
+left join UserBadgeRanks ub on ub.UserId = rua.UserId and ub.BadgeRank = 1
+left join QuestionAnswerDetails qd on qd.AnswerOwner = rua.UserId and qd.AnswerRank = 1
+left join TopTags dt on dt.TagName = any(string_to_array(substring(qd.Tags from 2 for length(qd.Tags) - 2), '><'))
+left join DuplicateLinks dpl on dpl.DuplicatePostId = qd.QuestionId
+left join QuestionCloseInfo qci on qci.PostId = qd.QuestionId
+left join UserRecentBadgeInfo urbi on urbi.UserId = rua.UserId
+where rua.Reputation > (
+    select avg(Reputation) from Users
+)
+and (
+    qd.QuestionScore + coalesce(qd.AnswerScore,0)
+) > 10
+order by rua.Reputation desc NULLS LAST, qd.QuestionCreated desc
+limit 100;

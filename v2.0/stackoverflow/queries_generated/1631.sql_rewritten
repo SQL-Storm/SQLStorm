@@ -1,0 +1,216 @@
+-- {"query": "1631.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2879} 
+WITH UserEngagementSummary AS (
+    -- CTE 1: Summarizes user activity and badge counts
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Views AS TotalProfileViews,
+        U.UpVotes AS TotalUpVotesGiven,
+        U.DownVotes AS TotalDownVotesGiven,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsAsked,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersPosted,
+        SUM(CASE WHEN P.PostTypeId = 1 AND P.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS QuestionsWithAcceptedAnswer,
+        SUM(CASE WHEN P.PostTypeId = 2 AND P.Id = PARENT_POST.AcceptedAnswerId THEN 1 ELSE 0 END) AS AcceptedAnswersCount,
+        MAX(P.CreationDate) AS LatestPostCreationDate,
+        MIN(P.CreationDate) AS EarliestPostCreationDate,
+        COUNT(DISTINCT B.Id) AS TotalBadgesEarned,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Posts PARENT_POST ON P.ParentId = PARENT_POST.Id AND P.PostTypeId = 2 -- To check if an answer is accepted
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Views, U.UpVotes, U.DownVotes
+),
+PostHistoricalMetrics AS (
+    -- CTE 2: Calculates various historical metrics for posts
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        P.PostTypeId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.FavoriteCount,
+        P.AcceptedAnswerId,
+        P.ParentId,
+        P.ClosedDate,
+        P.CommunityOwnedDate,
+        P.LastEditDate,
+        P.LastActivityDate,
+        P.Tags,
+        (SELECT COUNT(PH.Id) FROM PostHistory PH WHERE PH.PostId = P.Id AND PH.PostHistoryTypeId IN (4, 5, 6)) AS ContentEditCount,
+        (SELECT MAX(PH.CreationDate) FROM PostHistory PH WHERE PH.PostId = P.Id AND PH.PostHistoryTypeId IN (4, 5, 6)) AS LatestContentEditDate,
+        (SELECT MIN(PH.CreationDate) FROM PostHistory PH WHERE PH.PostId = P.Id AND PH.PostHistoryTypeId IN (10, 101) AND PH.Comment IS NOT NULL) AS FirstCloseVoteDate,
+        (SELECT COUNT(V.Id) FROM Votes V WHERE V.PostId = P.Id AND V.VoteTypeId = 2) AS UpVoteCount,
+        (SELECT COUNT(V.Id) FROM Votes V WHERE V.PostId = P.Id AND V.VoteTypeId = 3) AS DownVoteCount,
+        (
+            SELECT SUM(V.BountyAmount)
+            FROM Votes V
+            WHERE V.PostId = P.Id AND V.VoteTypeId IN (8, 9)
+        ) AS TotalBountyPostedOrReceived,
+        (
+            SELECT MAX(V.CreationDate)
+            FROM Votes V
+            WHERE V.PostId = P.Id AND V.VoteTypeId = 1
+        ) AS AcceptedAnswerVoteDate,
+        (
+            SELECT string_agg(T.TagName, ',')
+            FROM (
+                SELECT TRIM(UNNEST(string_to_array(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags) - 2), '><'))) AS TagName
+            ) AS TagList
+            JOIN Tags T ON TagList.TagName = T.TagName
+            ORDER BY T.Count DESC
+            LIMIT 3
+        ) AS Top3TagsString,
+        (
+            SELECT COUNT(PL.Id)
+            FROM PostLinks PL
+            WHERE PL.PostId = P.Id AND PL.LinkTypeId = 1
+        ) AS LinkedPostsCount,
+        (
+            SELECT COUNT(PL.Id)
+            FROM PostLinks PL
+            WHERE PL.PostId = P.Id AND PL.LinkTypeId = 3
+        ) AS DuplicateLinksCount
+    FROM Posts P
+),
+MonthlyReputationGrowth AS (
+    -- CTE 3: Calculates monthly reputation growth and ranks users within their monthly creation cohort
+    SELECT
+        UES.UserId,
+        UES.Reputation,
+        UES.UserCreationDate,
+        UES.LatestPostCreationDate,
+        EXTRACT(YEAR FROM UES.UserCreationDate) AS CreationYear,
+        EXTRACT(MONTH FROM UES.UserCreationDate) AS CreationMonth,
+        UES.Reputation - COALESCE(LAG(UES.Reputation, 1, 0) OVER (PARTITION BY UES.UserId ORDER BY UES.LatestPostCreationDate), 0) AS ReputationChangeSinceLastActivity,
+        RANK() OVER (PARTITION BY EXTRACT(YEAR FROM UES.UserCreationDate), EXTRACT(MONTH FROM UES.UserCreationDate) ORDER BY UES.Reputation DESC, UES.UserId ASC) AS ReputationRankInCohort,
+        ROW_NUMBER() OVER (PARTITION BY UES.UserId ORDER BY UES.LatestPostCreationDate DESC) AS rn_user_latest_activity_for_rank -- Ensures one row per user in this CTE for joining
+    FROM UserEngagementSummary UES
+),
+HighImpactContributors AS (
+    -- CTE 4: Identifies users based on a combination of high scores and accepted answers
+    SELECT UES.UserId
+    FROM UserEngagementSummary UES
+    WHERE UES.Reputation >= 50000
+    AND UES.AcceptedAnswersCount >= 50
+    AND UES.GoldBadges >= 5
+    UNION
+    SELECT UES.UserId
+    FROM UserEngagementSummary UES
+    WHERE UES.TotalQuestionsAsked >= 100
+    AND UES.QuestionsWithAcceptedAnswer >= 75
+    AND UES.TotalUpVotesGiven > 10000
+)
+-- Main Query: Integrates all CTEs with complex logic, window functions, and string operations
+SELECT
+    UES.UserId,
+    UES.DisplayName,
+    UES.Reputation,
+    UES.UserCreationDate,
+    UES.LastAccessDate,
+    UES.TotalProfileViews,
+    UES.TotalQuestionsAsked,
+    UES.TotalAnswersPosted,
+    UES.AcceptedAnswersCount,
+    UES.GoldBadges,
+    UES.SilverBadges,
+    UES.BronzeBadges,
+    -- User-level derived metrics
+    COALESCE(UES.Reputation * 1.0 / NULLIF(EXTRACT(DAY FROM (cast('2024-10-01 12:34:56' as timestamp) - UES.UserCreationDate)), 0), 0) AS AvgDailyReputationGrowth,
+    EXTRACT(DAY FROM (cast('2024-10-01 12:34:56' as timestamp) - UES.LastAccessDate)) AS DaysSinceLastActivity,
+    MRG.ReputationRankInCohort,
+    MRG.ReputationChangeSinceLastActivity,
+    CASE
+        WHEN UES.Reputation >= 100000 AND UES.GoldBadges >= 10 THEN 'Elite Developer'
+        WHEN UES.Reputation >= 25000 AND UES.GoldBadges >= 3 THEN 'Senior Contributor'
+        WHEN UES.Reputation >= 5000 THEN 'Mid-Level Enthusiast'
+        ELSE 'Junior Member'
+    END AS UserTier,
+    -- Post-level aggregated metrics for user's owned posts
+    COUNT(PHM.PostId) AS TotalActivePostsWithMetrics,
+    AVG(PHM.PostScore) AS AveragePostScoreOwned,
+    AVG(PHM.ViewCount) AS AveragePostViewCountOwned,
+    MAX(PHM.FavoriteCount) AS MaxFavoriteCountOnOwnedPost,
+    COALESCE(SUM(PHM.TotalBountyPostedOrReceived), 0) AS TotalBountyInvolvedInOwnedPosts,
+    -- Correlated subquery for last activity type
+    (
+        SELECT PH.PostHistoryTypes.Name
+        FROM PostHistory PH
+        JOIN PostHistoryTypes ON PH.PostHistoryTypeId = PostHistoryTypes.Id
+        WHERE PH.UserId = UES.UserId
+        ORDER BY PH.CreationDate DESC
+        LIMIT 1
+    ) AS LastPostHistoryType,
+    -- Analyze last question for key metrics (using LATERAL JOIN for specific post details)
+    COALESCE(LP.PostScore, 0) AS LastQuestionScore,
+    COALESCE(LP.ViewCount, 0) AS LastQuestionViewCount,
+    COALESCE(LP.ContentEditCount, 0) AS LastQuestionEditCount,
+    COALESCE(EXTRACT(EPOCH FROM (LP.ClosedDate - LP.PostCreationDate)) / 3600.0, -1) AS LastQuestionHoursToClose, -- -1 if not closed
+    COALESCE(LP.Top3TagsString, 'N/A') AS LastQuestionTopTags,
+    CASE
+        WHEN LP.AcceptedAnswerId IS NOT NULL THEN TRUE
+        WHEN LP.PostTypeId = 1 AND LP.AcceptedAnswerId IS NULL AND cast('2024-10-01 12:34:56' as timestamp) - LP.PostCreationDate > INTERVAL '30 days' THEN FALSE
+        ELSE NULL -- Not a question or too new to evaluate
+    END AS LastQuestionHasAcceptedAnswer,
+    -- More complex string/null logic
+    (
+        SELECT SUM(LENGTH(COALESCE(C.Text, '')))
+        FROM Comments C
+        WHERE C.UserId = UES.UserId
+        AND C.CreationDate BETWEEN UES.LastAccessDate - INTERVAL '6 months' AND UES.LastAccessDate
+        AND C.Score > 0
+    ) AS PositiveCommentTextLengthLast6Months,
+    -- Indicate if user is a "High Impact Contributor" using the set defined by the CTE
+    CASE WHEN UES.UserId IN (SELECT UserId FROM HighImpactContributors) THEN TRUE ELSE FALSE END AS IsHighImpactContributor
+FROM UserEngagementSummary UES
+LEFT JOIN MonthlyReputationGrowth MRG ON UES.UserId = MRG.UserId AND MRG.rn_user_latest_activity_for_rank = 1 -- Join only the relevant rank row
+LEFT JOIN PostHistoricalMetrics PHM ON UES.UserId = PHM.OwnerUserId
+LEFT JOIN LATERAL ( -- LATERAL join to get details of the most recent *question* post for the user
+    SELECT pd_latest.*
+    FROM PostHistoricalMetrics pd_latest
+    WHERE pd_latest.OwnerUserId = UES.UserId
+      AND pd_latest.PostTypeId = 1
+    ORDER BY pd_latest.PostCreationDate DESC
+    LIMIT 1
+) LP ON TRUE
+WHERE
+    UES.Reputation > 100
+    AND UES.TotalPostsOwned + UES.TotalCommentsMade > 0 -- Filter out users with no activity
+GROUP BY
+    UES.UserId,
+    UES.DisplayName,
+    UES.Reputation,
+    UES.UserCreationDate,
+    UES.LastAccessDate,
+    UES.TotalProfileViews,
+    UES.TotalQuestionsAsked,
+    UES.TotalAnswersPosted,
+    UES.AcceptedAnswersCount,
+    UES.GoldBadges,
+    UES.SilverBadges,
+    UES.BronzeBadges,
+    MRG.ReputationRankInCohort,
+    MRG.ReputationChangeSinceLastActivity,
+    LP.PostScore,
+    LP.ViewCount,
+    LP.ContentEditCount,
+    LP.ClosedDate,
+    LP.PostCreationDate,
+    LP.Top3TagsString,
+    LP.AcceptedAnswerId,
+    LP.PostTypeId
+HAVING
+    COUNT(PHM.PostId) > 0 OR UES.TotalCommentsMade > 0 -- Ensure at least some relevant activity beyond just a profile
+ORDER BY
+    UES.Reputation DESC,
+    DaysSinceLastActivity ASC
+LIMIT 5000;

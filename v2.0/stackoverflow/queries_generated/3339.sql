@@ -1,0 +1,145 @@
+-- {"query": "3339.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1802} 
+
+/*  Benchmarking query that touches most tables, uses CTEs, window functions,
+    outer joins, correlated subqueries, set operators, string ops, and NULL logic */
+WITH
+    /* Basic user info plus a correlated sub‑query for latest activity */
+    user_base AS (
+        SELECT
+            u.Id                              AS user_id,
+            u.DisplayName                     AS display_name,
+            COALESCE(u.Location, 'Unknown')   AS location,
+            u.Reputation,
+            u.CreationDate,
+            /* most recent post (question or answer) title or NULL */
+            (SELECT p.Title
+               FROM Posts p
+              WHERE p.OwnerUserId = u.Id
+                AND p.Title IS NOT NULL
+              ORDER BY p.CreationDate DESC
+              LIMIT 1)                      AS latest_post_title
+        FROM Users u
+    ),
+
+    /* Badge aggregation per user */
+    badge_stats AS (
+        SELECT
+            b.UserId                         AS user_id,
+            COUNT(*)                         AS total_badges,
+            SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_badges,
+            SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_badges,
+            SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_badges,
+            STRING_AGG(DISTINCT b.Name, '; ') FILTER (WHERE b.Name IS NOT NULL) AS badge_names
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+
+    /* Post statistics per owner */
+    post_stats AS (
+        SELECT
+            p.OwnerUserId                     AS user_id,
+            COUNT(*)                         AS total_posts,
+            COUNT(*) FILTER (WHERE p.PostTypeId = 1) AS questions,
+            COUNT(*) FILTER (WHERE p.PostTypeId = 2) AS answers,
+            AVG(p.Score)                     AS avg_score,
+            MAX(p.CreationDate)              AS last_post_date
+        FROM Posts p
+        GROUP BY p.OwnerUserId
+    ),
+
+    /* Vote activity in the last 30 days – using FILTER clause for brevity */
+    recent_votes AS (
+        SELECT
+            v.UserId                         AS user_id,
+            COUNT(*)                         AS total_votes_30d,
+            COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS up_votes_30d,
+            COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS down_votes_30d
+        FROM Votes v
+        WHERE v.CreationDate >= CURRENT_DATE - INTERVAL '30 days'
+        GROUP BY v.UserId
+    ),
+
+    /* Tag popularity with a sample excerpt title (LEFT JOIN → outer join) */
+    top_tags AS (
+        SELECT
+            t.TagName,
+            t.Count                         AS tag_use_count,
+            COALESCE(e.Title, '(no excerpt)') AS sample_excerpt_title,
+            ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS tag_rank
+        FROM Tags t
+        LEFT JOIN Posts e
+               ON e.Id = t.ExcerptPostId               -- may be NULL
+        WHERE t.IsModeratorOnly = 0
+    ),
+
+    /* Users with no badges – generated via set operator */
+    users_no_badges AS (
+        SELECT
+            ub.user_id,
+            ub.display_name,
+            ub.location,
+            ub.reputation,
+            ub.creationdate,
+            NULL::int               AS total_badges,
+            0                       AS gold_badges,
+            0                       AS silver_badges,
+            0                       AS bronze_badges,
+            NULL::text              AS badge_names,
+            ps.total_posts,
+            ps.questions,
+            ps.answers,
+            ps.avg_score,
+            ps.last_post_date,
+            rv.total_votes_30d,
+            rv.up_votes_30d,
+            rv.down_votes_30d
+        FROM user_base ub
+        LEFT JOIN badge_stats bs ON bs.user_id = ub.user_id
+        INNER JOIN post_stats ps ON ps.user_id = ub.user_id
+        LEFT  JOIN recent_votes rv ON rv.user_id = ub.user_id
+        WHERE bs.user_id IS NULL
+    )
+/* Final result set combines users with badges and users without badges */
+SELECT *
+FROM (
+    /* Users that have at least one badge */
+    SELECT
+        ub.user_id,
+        ub.display_name,
+        ub.location,
+        ub.reputation,
+        ub.creation_date,
+        bs.total_badges,
+        bs.gold_badges,
+        bs.silver_badges,
+        bs.bronze_badges,
+        bs.badge_names,
+        ps.total_posts,
+        ps.questions,
+        ps.answers,
+        ROUND(ps.avg_score::numeric, 2)        AS avg_score,
+        ps.last_post_date,
+        rv.total_votes_30d,
+        rv.up_votes_30d,
+        rv.down_votes_30d,
+        /* Concatenated display string */
+        CONCAT(ub.display_name, ' [', ub.location, ']') AS user_label,
+        /* Derived metric: reputation per post, handling division by zero */
+        CASE WHEN ps.total_posts = 0 THEN 0
+             ELSE ROUND(ub.reputation::numeric / ps.total_posts, 2)
+        END                                   AS rep_per_post,
+        /* Flag indicating recent activity */
+        CASE WHEN rv.total_votes_30d > 0 THEN 'ACTIVE' ELSE 'IDLE' END AS activity_status
+    FROM user_base ub
+    INNER JOIN badge_stats bs ON bs.user_id = ub.user_id
+    INNER JOIN post_stats ps  ON ps.user_id = ub.user_id
+    LEFT  JOIN recent_votes rv ON rv.user_id = ub.user_id
+
+    UNION ALL
+
+    /* Users with zero badges (pre‑computed CTE) */
+    SELECT *
+    FROM users_no_badges
+) AS combined
+ORDER BY combined.reputation DESC
+LIMIT 100;

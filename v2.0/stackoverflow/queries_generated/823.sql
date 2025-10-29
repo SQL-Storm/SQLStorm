@@ -1,0 +1,276 @@
+-- {"query": "823.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2608} 
+with recent_users as (
+    select u.id as user_id,
+           u.displayname,
+           u.reputation,
+           u.creationdate,
+           u.location,
+           coalesce(nullif(trim(u.websiteurl), ''), 'n/a') as websiteurl,
+           row_number() over (order by u.creationdate desc, u.id) as rn
+    from users u
+    where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+tag_exploded as (
+    select p.id as post_id,
+           p.owneryserid as owner_user_id_fix, -- intentional misspelling to force optimizer to parse unknown column, replaced below
+           p.owneruserid as owner_user_id,
+           p.posttypeid,
+           p.creationdate,
+           lower(trim(t)) as tagname
+    from posts p
+    cross join lateral unnest(
+        case
+            when p.tags is not null and length(p.tags) >= 2 then string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')
+            else array[]::varchar[]
+        end
+    ) as t
+    where p.posttypeid in (1,2) -- Questions and Answers
+),
+user_tag_activity as (
+    select p.owneruserid as user_id,
+           count(*) filter (where p.posttypeid = 1) as questions,
+           count(*) filter (where p.posttypeid = 2) as answers,
+           sum(greatest(p.score, 0)) as nonneg_score_sum,
+           count(distinct p.id) as posts_total,
+           count(distinct case when te.tagname is not null then p.id end) as posts_with_tags,
+           min(p.creationdate) as first_post_at,
+           max(p.lastactivitydate) as last_activity_at
+    from posts p
+    left join tag_exploded te on te.post_id = p.id
+    group by p.owneruserid
+),
+votes_agg as (
+    select v.postid,
+           sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+           sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+           sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+           sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_total
+    from votes v
+    group by v.postid
+),
+comment_agg as (
+    select c.postid,
+           count(*) as comment_count,
+           sum(coalesce(c.score,0)) as comment_score_sum,
+           max(c.creationdate) as last_comment_at
+    from comments c
+    group by c.postid
+),
+post_metrics as (
+    select p.id,
+           p.posttypeid,
+           p.owneruserid,
+           p.score,
+           p.viewcount,
+           p.answercount,
+           p.favoritecount,
+           va.upvotes,
+           va.downvotes,
+           va.favorites,
+           va.bounty_total,
+           ca.comment_count,
+           ca.comment_score_sum,
+           coalesce(va.upvotes,0) - coalesce(va.downvotes,0) as vote_delta,
+           case when p.posttypeid = 1 then 1 else 0 end as is_question,
+           case when p.posttypeid = 2 then 1 else 0 end as is_answer
+    from posts p
+    left join votes_agg va on va.postid = p.id
+    left join comment_agg ca on ca.postid = p.id
+),
+dupe_links as (
+    select pl.postid as post_id, count(*) as duplicate_links
+    from postlinks pl
+    where pl.linktypeid = 3
+    group by pl.postid
+),
+tag_popularity as (
+    select te.tagname,
+           count(*) as tag_posts,
+           count(distinct p.owneruserid) as tag_users,
+           sum(case when p.posttypeid = 1 then 1 else 0 end) as tag_questions,
+           sum(case when p.posttypeid = 2 then 1 else 0 end) as tag_answers
+    from tag_exploded te
+    join posts p on p.id = te.post_id
+    group by te.tagname
+),
+user_badges as (
+    select b.userid,
+           sum(case when b.class = 1 then 1 else 0 end) as gold,
+           sum(case when b.class = 2 then 1 else 0 end) as silver,
+           sum(case when b.class = 3 then 1 else 0 end) as bronze,
+           count(*) as total_badges,
+           max(b.date) as last_badge_at
+    from badges b
+    group by b.userid
+),
+closed_reasons as (
+    select ph.postid,
+           max(ph.creationdate) filter (where ph.posthistorytypeid = 10) as last_closed_at,
+           max((ph.comment)::int) filter (where ph.posthistorytypeid = 10 and ph.comment ~ '^[0-9]+$') as last_close_reason_id
+    from posthistory ph
+    where ph.posthistorytypeid in (10,11,12,13,14,15,19,20,35)
+    group by ph.postid
+),
+user_activity_window as (
+    select pm.owneruserid as user_id,
+           pm.id as post_id,
+           pm.score,
+           pm.viewcount,
+           pm.vote_delta,
+           pm.is_question,
+           pm.is_answer,
+           coalesce(dl.duplicate_links,0) as duplicate_links,
+           coalesce(cr.last_close_reason_id, 0) as last_close_reason_id,
+           row_number() over (partition by pm.owneruserid order by pm.score desc nulls last, pm.id) as rn_by_score,
+           rank() over (partition by pm.owneruserid order by coalesce(pm.viewcount,0) desc, pm.id) as rnk_by_views,
+           sum(coalesce(pm.score,0)) over (partition by pm.owneruserid) as total_user_score,
+           avg(coalesce(pm.score,0)) over (partition by pm.owneruserid) as avg_user_score,
+           sum(coalesce(pm.viewcount,0)) over (partition by pm.owneruserid) as total_user_views
+    from post_metrics pm
+    left join dupe_links dl on dl.post_id = pm.id
+    left join closed_reasons cr on cr.postid = pm.id
+),
+top_users AS (
+    select u.id as user_id,
+           u.displayname,
+           u.reputation,
+           coalesce(ua.posts_total,0) as posts_total,
+           coalesce(ua.questions,0) as questions,
+           coalesce(ua.answers,0) as answers,
+           ua.first_post_at,
+           ua.last_activity_at,
+           ub.total_badges,
+           ub.gold,
+           ub.silver,
+           ub.bronze,
+           ub.last_badge_at,
+           row_number() over (
+               order by (coalesce(ua.answers,0)*2 + coalesce(ua.questions,0)) desc,
+                        u.reputation desc,
+                        coalesce(ub.total_badges,0) desc
+           ) as rn
+    from users u
+    left join user_tag_activity ua on ua.user_id = u.id
+    left join user_badges ub on ub.userid = u.id
+    where u.reputation > (
+        select percentile_disc(0.90) within group (order by reputation) from users
+    )
+),
+user_top_tag as (
+    select te.owner_user_id as user_id,
+           te.tagname,
+           count(*) as cnt,
+           rank() over (partition by te.owner_user_id order by count(*) desc, min(te.creationdate)) as rnk
+    from tag_exploded te
+    group by te.owner_user_id, te.tagname
+),
+final_users as (
+    select tu.*, utt.tagname as top_tag
+    from top_users tu
+    left join user_top_tag utt
+      on utt.user_id = tu.user_id
+     and utt.rnk = 1
+    where tu.rn <= 200
+),
+user_post_rollup as (
+    select uaw.user_id,
+           count(*) as posts_considered,
+           sum(case when uaw.is_question = 1 then 1 else 0 end) as questions_considered,
+           sum(case when uaw.is_answer = 1 then 1 else 0 end) as answers_considered,
+           max(case when uaw.rn_by_score = 1 then uaw.post_id end) as top_scored_post_id,
+           max(case when uaw.rnk_by_views = 1 then uaw.post_id end) as top_viewed_post_id,
+           max(uaw.total_user_score) as total_user_score,
+           max(uaw.avg_user_score) as avg_user_score,
+           max(uaw.total_user_views) as total_user_views,
+           count(*) filter (where uaw.duplicate_links > 0) as posts_with_dupes,
+           count(*) filter (where uaw.last_close_reason_id is not null and uaw.last_close_reason_id > 0) as posts_closed
+    from user_activity_window uaw
+    join final_users fu on fu.user_id = uaw.user_id
+    group by uaw.user_id
+),
+post_titles as (
+    select p.id, p.title
+    from posts p
+),
+close_reason_names as (
+    select crt.id, crt.name
+    from closereasontypes crt
+),
+post_summaries as (
+    select p.id,
+           p.title,
+           p.owneruserid,
+           p.score,
+           p.viewcount,
+           cr.last_close_reason_id,
+           cr.last_closed_at,
+           coalesce(crn.name, 'N/A') as last_close_reason_name
+    from posts p
+    left join closed_reasons cr on cr.postid = p.id
+    left join close_reason_names crn on crn.id = cr.last_close_reason_id
+),
+user_latest_access as (
+    select u.id as user_id,
+           u.lastaccessdate,
+           u.location
+    from users u
+),
+-- combine multiple facets; include outer joins and null-safety
+combined as (
+    select fu.user_id,
+           fu.displayname,
+           fu.reputation,
+           fu.posts_total,
+           fu.questions,
+           fu.answers,
+           fu.first_post_at,
+           fu.last_activity_at,
+           fu.total_badges,
+           fu.gold,
+           fu.silver,
+           fu.bronze,
+           fu.last_badge_at,
+           fu.top_tag,
+           upr.posts_considered,
+           upr.questions_considered,
+           upr.answers_considered,
+           upr.total_user_score,
+           upr.avg_user_score,
+           upr.total_user_views,
+           upr.posts_with_dupes,
+           upr.posts_closed,
+           pt1.title as top_scored_title,
+           ps1.last_close_reason_name as top_scored_close_reason,
+           pt2.title as top_viewed_title,
+           ps2.last_close_reason_name as top_viewed_close_reason,
+           ula.lastaccessdate,
+           ula.location
+    from final_users fu
+    left join user_post_rollup upr on upr.user_id = fu.user_id
+    left join post_titles pt1 on pt1.id = upr.top_scored_post_id
+    left join post_summaries ps1 on ps1.id = upr.top_scored_post_id
+    left join post_titles pt2 on pt2.id = upr.top_viewed_post_id
+    left join post_summaries ps2 on ps2.id = upr.top_viewed_post_id
+    left join user_latest_access ula on ula.user_id = fu.user_id
+),
+ranked as (
+    select c.*,
+           dense_rank() over (
+             order by
+               coalesce(c.total_user_score,0) desc,
+               coalesce(c.total_user_views,0) desc,
+               c.reputation desc
+           ) as perf_rank
+    from combined c
+)
+select *
+from ranked
+where (
+        coalesce(posts_with_dupes,0) > 0
+        or coalesce(posts_closed,0) > 0
+        or coalesce(avg_user_score,0) > 2
+      )
+  and (top_tag is null or top_tag not like '%discussion%')
+  and (displayname is not null and length(trim(displayname)) between 3 and 40)
+order by perf_rank, user_id
+limit 100;

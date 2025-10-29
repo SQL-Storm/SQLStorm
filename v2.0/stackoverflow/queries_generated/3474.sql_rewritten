@@ -1,0 +1,110 @@
+-- {"query": "3474.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1865} 
+WITH top_users AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS rn
+    FROM Users u
+    WHERE u.Reputation > 10000
+),
+question_stats AS (
+    SELECT 
+        p.OwnerUserId AS UserId,
+        COUNT(*) FILTER (WHERE p.Score > 0)          AS pos_questions,
+        COUNT(*) FILTER (WHERE p.Score <= 0)         AS nonpos_questions,
+        AVG(p.ViewCount)                             AS avg_views,
+        MAX(p.CreationDate)                          AS last_q_date
+    FROM Posts p
+    WHERE p.PostTypeId = 1                -- questions
+    GROUP BY p.OwnerUserId
+),
+answer_stats AS (
+    SELECT 
+        p.OwnerUserId AS UserId,
+        COUNT(*)                                   AS total_answers,
+        AVG(p.Score)                               AS avg_answer_score,
+        SUM(CASE WHEN p.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END) AS accepted_answers
+    FROM Posts p
+    JOIN Posts q ON q.Id = p.ParentId          -- join to the question to check acceptance
+    WHERE p.PostTypeId = 2                -- answers
+    GROUP BY p.OwnerUserId
+),
+badge_agg AS (
+    SELECT 
+        b.UserId,
+        STRING_AGG(DISTINCT b.Name, ',') AS badge_list,
+        MAX(b.Class)                     AS highest_badge_class
+    FROM Badges b
+    GROUP BY b.UserId
+),
+tag_usage AS (
+    SELECT 
+        unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS tag,
+        p.OwnerUserId                                                     AS UserId
+    FROM Posts p
+    WHERE p.PostTypeId = 1               -- questions
+      AND p.Tags IS NOT NULL
+),
+user_tag_counts AS (
+    SELECT 
+        tu.UserId,
+        COUNT(DISTINCT tu.Tag) AS distinct_tag_count,
+        COUNT(*)                AS tag_instances
+    FROM tag_usage tu
+    GROUP BY tu.UserId
+),
+duplicate_links AS (
+    SELECT 
+        pl.PostId,
+        COUNT(*)                     AS cnt_duplicate_links,
+        MAX(pl.CreationDate)         AS latest_dup_link_date
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 3          -- duplicate
+    GROUP BY pl.PostId
+),
+linked_links AS (
+    SELECT 
+        pl.PostId,
+        COUNT(*)                     AS cnt_linked_links,
+        MAX(pl.CreationDate)         AS latest_linked_link_date
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 1          -- linked
+    GROUP BY pl.PostId
+)
+SELECT 
+    tu.Id,
+    tu.DisplayName,
+    tu.Reputation,
+    qs.pos_questions,
+    qs.nonpos_questions,
+    qs.avg_views,
+    asr.total_answers,
+    asr.avg_answer_score,
+    asr.accepted_answers,
+    b.badge_list,
+    b.highest_badge_class,
+    utc.distinct_tag_count,
+    utc.tag_instances,
+    COALESCE(dl.cnt_duplicate_links, 0) AS duplicate_links_sent,
+    COALESCE(ll.cnt_linked_links,   0) AS linked_links_sent,
+    CASE 
+        WHEN qs.avg_views IS NULL THEN NULL
+        ELSE ROUND(qs.avg_views / NULLIF(utc.distinct_tag_count, 0), 2)
+    END AS view_per_tag_ratio,
+    ROW_NUMBER() OVER (PARTITION BY tu.Id ORDER BY GREATEST(COALESCE(dl.latest_dup_link_date, '1970-01-01'), COALESCE(ll.latest_linked_link_date, '1970-01-01')) DESC) AS recent_link_rank
+FROM top_users tu
+LEFT JOIN question_stats   qs ON qs.UserId = tu.Id
+LEFT JOIN answer_stats     asr ON asr.UserId = tu.Id
+LEFT JOIN badge_agg        b   ON b.UserId = tu.Id
+LEFT JOIN user_tag_counts  utc ON utc.UserId = tu.Id
+LEFT JOIN duplicate_links  dl  ON dl.PostId = tu.Id
+LEFT JOIN linked_links     ll  ON ll.PostId = tu.Id
+WHERE tu.rn <= 100
+ORDER BY tu.Reputation DESC, qs.avg_views DESC NULLS LAST
+
+UNION ALL
+
+SELECT 
+    NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL
+WHERE FALSE;

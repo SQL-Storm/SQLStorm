@@ -1,0 +1,148 @@
+-- {"query": "4826.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1208} 
+WITH
+  RankedPosts AS (
+    SELECT
+      p.Id,
+      p.PostTypeId,
+      p.OwnerUserId,
+      p.CreationDate,
+      p.Score,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      p.ViewCount,
+      ROW_NUMBER() OVER (
+        PARTITION BY
+          p.PostTypeId
+        ORDER BY
+          p.Score DESC,
+          p.ViewCount DESC
+      ) AS rn_score_view,
+      ROW_NUMBER() OVER (
+        ORDER BY
+          p.CreationDate DESC
+      ) AS rn_creation_date
+    FROM Posts AS p
+    WHERE
+      p.OwnerUserId IS NOT NULL
+      AND p.PostTypeId IN (1, 2)
+  ),
+  UserPostCounts AS (
+    SELECT
+      p.OwnerUserId,
+      COUNT(DISTINCT p.Id) AS total_posts,
+      SUM(p.Score) AS total_score,
+      SUM(p.ViewCount) AS total_views
+    FROM Posts AS p
+    WHERE
+      p.OwnerUserId IS NOT NULL
+    GROUP BY
+      p.OwnerUserId
+  ),
+  RecentPostActivity AS (
+    SELECT
+      p.Id,
+      MAX(ph.CreationDate) AS last_history_date
+    FROM Posts AS p
+    JOIN PostHistory AS ph
+      ON p.Id = ph.PostId
+    WHERE
+      ph.PostHistoryTypeId IN (2, 4, 5, 8)
+    GROUP BY
+      p.Id
+  ),
+  HighReputationUsers AS (
+    SELECT
+      Id
+    FROM Users
+    WHERE
+      Reputation > 50000
+  )
+SELECT
+  COALESCE(u.DisplayName, 'Deleted User') AS display_name,
+  pt.Name AS post_type_name,
+  rp.score,
+  rp.answer_count,
+  rp.comment_count,
+  rp.favorite_count,
+  rp.view_count,
+  COALESCE(rp.score, 0) + COALESCE(rp.view_count, 0) * 10 AS weighted_score,
+  CASE
+    WHEN rp.rn_score_view <= 10 THEN 'Top 10 by Score/View'
+    WHEN rp.rn_creation_date <= 50 THEN 'Top 50 by Creation'
+    ELSE 'Other'
+  END AS ranking_category,
+  CASE
+    WHEN EXISTS (
+      SELECT
+        1
+      FROM Badges AS b
+      WHERE
+        b.UserId = u.Id AND b.Name LIKE '%Expert%'
+    ) THEN 'Has Expert Badge'
+    ELSE 'No Expert Badge'
+  END AS badge_status,
+  DATEDIFF(
+    day,
+    u.CreationDate,
+    cast('2024-10-01 12:34:56' as timestamp)
+  ) AS days_since_creation,
+  CONCAT(
+    COALESCE(upc.total_posts, 0),
+    ' posts, ',
+    COALESCE(upc.total_score, 0),
+    ' score, ',
+    COALESCE(upc.total_views, 0),
+    ' views'
+  ) AS user_contribution_summary,
+  CASE
+    WHEN rpa.last_history_date IS NULL THEN 'No significant edit history'
+    WHEN DATEDIFF(hour, rpa.last_history_date, cast('2024-10-01 12:34:56' as timestamp)) < 24 THEN 'Edited in last 24 hours'
+    WHEN DATEDIFF(day, rpa.last_history_date, cast('2024-10-01 12:34:56' as timestamp)) < 7 THEN 'Edited in last week'
+    ELSE 'Edited more than a week ago'
+  END AS edit_recency,
+  CASE
+    WHEN u.Id IN (
+      SELECT
+        Id
+      FROM HighReputationUsers
+    ) THEN 'High Reputation'
+    ELSE 'Standard Reputation'
+  END AS reputation_level,
+  CASE
+    WHEN EXISTS (
+      SELECT
+        1
+      FROM PostLinks AS pl
+      WHERE
+        pl.PostId = rp.Id AND pl.LinkTypeId = 3
+    ) THEN 'Is a Duplicate Link'
+    WHEN EXISTS (
+      SELECT
+        1
+      FROM PostLinks AS pl
+      WHERE
+        pl.RelatedPostId = rp.Id AND pl.LinkTypeId = 3
+    ) THEN 'Is Linked To As Duplicate'
+    ELSE 'No Duplicate Link Association'
+  END AS duplicate_status
+FROM RankedPosts AS rp
+JOIN Posts AS p
+  ON rp.Id = p.Id
+LEFT JOIN Users AS u
+  ON rp.OwnerUserId = u.Id
+JOIN PostTypes AS pt
+  ON p.PostTypeId = pt.Id
+LEFT JOIN UserPostCounts AS upc
+  ON rp.OwnerUserId = upc.OwnerUserId
+LEFT JOIN RecentPostActivity AS rpa
+  ON rp.Id = rpa.Id
+WHERE
+  rp.rn_score_view <= 100
+  AND rp.rn_creation_date <= 200
+  AND rp.Score > 5
+  AND DATEDIFF(year, u.CreationDate, cast('2024-10-01 12:34:56' as timestamp)) > 0
+ORDER BY
+  rp.Score DESC,
+  rp.ViewCount DESC
+LIMIT 1000;

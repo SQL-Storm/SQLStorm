@@ -1,0 +1,132 @@
+WITH
+  RankedAnswers AS (
+    SELECT
+      p.Id AS PostId,
+      p.ParentId AS QuestionId,
+      p.OwnerUserId,
+      p.CreationDate AS AnswerDate,
+      ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS AnswerRank
+    FROM Posts p
+    WHERE
+      p.PostTypeId = 2 AND p.ParentId IS NOT NULL
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate AS UserCreationDate,
+      COUNT(DISTINCT p.Id) AS QuestionCount,
+      COUNT(DISTINCT a.Id) AS AnswerCount,
+      SUM(CASE WHEN p.Score > 0 THEN 1 ELSE 0 END) AS PositiveScoreQuestions,
+      SUM(CASE WHEN a.Score > 0 THEN 1 ELSE 0 END) AS PositiveScoreAnswers,
+      COUNT(DISTINCT b.Id) AS BadgeCount,
+      MAX(p.CreationDate) AS LastQuestionDate,
+      MAX(a.CreationDate) AS LastAnswerDate,
+      AVG(a_rank.AnswerRank) AS AvgAnswerRankForUser
+    FROM Users u
+    LEFT JOIN Posts p
+      ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+    LEFT JOIN Posts a
+      ON u.Id = a.OwnerUserId AND a.PostTypeId = 2
+    LEFT JOIN RankedAnswers a_rank
+      ON a.Id = a_rank.PostId
+    LEFT JOIN Badges b
+      ON u.Id = b.UserId
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate
+  ),
+  HotQuestions AS (
+    SELECT
+      p.Id AS QuestionId,
+      p.Title,
+      p.Score,
+      COALESCE(p.AnswerCount, 0) AS AnswerCount,
+      p.ViewCount,
+      p.CreationDate AS QuestionDate,
+      p.OwnerUserId,
+      RANK() OVER (ORDER BY COALESCE(p.FavoriteCount,0) DESC, COALESCE(p.ViewCount,0) DESC) AS HotRank
+    FROM Posts p
+    WHERE
+      p.PostTypeId = 1 AND p.ClosedDate IS NULL AND p.CommunityOwnedDate IS NULL
+  ),
+  UserPerformance AS (
+    SELECT
+      ua.UserId,
+      ua.DisplayName,
+      ua.Reputation,
+      ua.UserCreationDate,
+      ua.QuestionCount,
+      ua.AnswerCount,
+      ua.PositiveScoreQuestions,
+      ua.PositiveScoreAnswers,
+      ua.BadgeCount,
+      ua.LastQuestionDate,
+      ua.LastAnswerDate,
+      ua.AvgAnswerRankForUser,
+      hq.HotRank AS UserHotQuestionRank,
+      CASE
+        WHEN ua.AnswerCount > 0 THEN CAST(ua.PositiveScoreAnswers AS DOUBLE PRECISION) / ua.AnswerCount
+        ELSE 0
+      END AS AnswerAcceptanceRate,
+      CASE
+        WHEN ua.Reputation < 1000 THEN 'Novice'
+        WHEN ua.Reputation BETWEEN 1000 AND 10000 THEN 'Intermediate'
+        ELSE 'Expert'
+      END AS ReputationLevel,
+      COALESCE(ua.DisplayName, 'Anonymous') || ' (' || CAST(ua.UserId AS text) || ')' AS DisplayIdentifier,
+      EXTRACT(year FROM TIMESTAMP '2024-10-01 12:34:56') - EXTRACT(year FROM ua.UserCreationDate) AS YearsSinceCreation
+    FROM UserActivity ua
+    LEFT JOIN HotQuestions hq
+      ON ua.UserId = hq.OwnerUserId
+    GROUP BY
+      ua.UserId,
+      ua.DisplayName,
+      ua.Reputation,
+      ua.UserCreationDate,
+      ua.QuestionCount,
+      ua.AnswerCount,
+      ua.PositiveScoreQuestions,
+      ua.PositiveScoreAnswers,
+      ua.BadgeCount,
+      ua.LastQuestionDate,
+      ua.LastAnswerDate,
+      ua.AvgAnswerRankForUser,
+      hq.HotRank
+  )
+SELECT
+  up.UserId,
+  up.DisplayName,
+  up.Reputation,
+  up.UserCreationDate,
+  up.QuestionCount,
+  up.AnswerCount,
+  up.PositiveScoreQuestions,
+  up.PositiveScoreAnswers,
+  up.BadgeCount,
+  up.LastQuestionDate,
+  up.LastAnswerDate,
+  up.AvgAnswerRankForUser,
+  up.UserHotQuestionRank,
+  up.AnswerAcceptanceRate,
+  up.ReputationLevel,
+  up.DisplayIdentifier,
+  up.YearsSinceCreation,
+  hq_top.Title AS TopQuestionTitle,
+  hq_top.Score AS TopQuestionScore,
+  hq_top.ViewCount AS TopQuestionViews,
+  hq_top.QuestionDate AS TopQuestionDate,
+  (SELECT COUNT(*) FROM Comments c WHERE c.UserId = up.UserId AND c.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30 days')) AS RecentCommentsCount,
+  (SELECT COUNT(*) FROM Votes v WHERE v.UserId = up.UserId AND v.VoteTypeId IN (2,3) AND v.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30 days')) AS RecentVoteCount
+FROM UserPerformance up
+LEFT JOIN HotQuestions hq_top
+  ON up.UserId = hq_top.OwnerUserId AND hq_top.HotRank = 1
+WHERE
+  up.Reputation > 100 AND up.AnswerCount > 5
+ORDER BY
+  up.Reputation DESC,
+  up.AnswerAcceptanceRate DESC,
+  up.BadgeCount DESC;

@@ -1,0 +1,246 @@
+with RecursiveUserBadges as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class,
+        row_number() over (partition by u.Id order by b.Date desc) as BadgeRank
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    where b.Date >= cast('2024-10-01' as date) - interval '1 year'
+),
+TopBadges as (
+    select UserId, DisplayName, BadgeName, Class, BadgeRank
+    from RecursiveUserBadges
+    where BadgeRank <= 3
+),
+PostsWithAcceptedAnswerAndVotes as (
+    select
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.OwnerUserId,
+        coalesce(v_vt.UpVotes, 0) as TotalUpVotes,
+        coalesce(v_vt.DownVotes, 0) as TotalDownVotes,
+        u.Reputation as OwnerReputation,
+        case 
+            when p.ClosedDate is not null then 'Closed'
+            when p.AcceptedAnswerId is not null then 'Answered'
+            else 'Open'
+        end as PostStatus,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc) as UserTopPostRank
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    left join (
+        select
+            v.PostId,
+            sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+            sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes
+        from Votes v
+        join VoteTypes vt on v.VoteTypeId = vt.Id
+        group by v.PostId
+    ) v_vt on p.Id = v_vt.PostId
+    where p.PostTypeId = 1
+),
+AcceptedAnswersWithScores as (
+    select
+        a.Id,
+        a.ParentId,
+        a.Score,
+        a.OwnerUserId as AnswerOwnerUserId
+    from Posts a
+    where a.PostTypeId = 2
+),
+QuestionWithAcceptedAnswerAndAnswerInfo as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionCreation,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        q.OwnerUserId as QuestionOwnerUserId,
+        a.Id as AcceptedAnswerId,
+        a.Score as AcceptedAnswerScore,
+        a.AnswerOwnerUserId,
+        q.PostStatus,
+        q.TotalUpVotes,
+        q.TotalDownVotes,
+        q.OwnerReputation
+    from PostsWithAcceptedAnswerAndVotes q
+    left join AcceptedAnswersWithScores a on q.AcceptedAnswerId = a.Id
+),
+UserActivityWindow as (
+    select
+        QuestionOwnerUserId as UserId,
+        count(*) over (partition by QuestionOwnerUserId) as TotalQuestionsPosted,
+        avg(QuestionScore) over (partition by QuestionOwnerUserId) as AvgQuestionScore,
+        sum(case when PostStatus = 'Closed' then 1 else 0 end) over (partition by QuestionOwnerUserId) as ClosedQuestions,
+        sum(TotalUpVotes) over (partition by QuestionOwnerUserId) as SumUpVotes,
+        sum(TotalDownVotes) over (partition by QuestionOwnerUserId) as SumDownVotes,
+        row_number() over (partition by QuestionOwnerUserId order by QuestionCreation desc) as RecentQuestionRank
+    from QuestionWithAcceptedAnswerAndAnswerInfo
+),
+QuestionsWithDuplicateLinks as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.ViewCount,
+        q.Score,
+        q.Tags,
+        pll.RelatedPostId as DuplicateOfId,
+        rp.Title as DuplicateOfTitle,
+        case when q.ClosedDate is not null then 1 else 0 end as IsClosed,
+        q.OwnerUserId
+    from Posts q
+    left join PostLinks pll on pll.PostId = q.Id and pll.LinkTypeId = 3
+    left join Posts rp on rp.Id = pll.RelatedPostId
+    where q.PostTypeId = 1
+),
+UserCommentsSummary as (
+    select
+        c.UserId,
+        u.DisplayName,
+        count(distinct c.PostId) as DistinctPostsCommented,
+        count(*) as TotalComments,
+        avg(length(c.Text)) as AvgCommentLength,
+        sum(case when c.CreationDate >= cast('2024-10-01' as date) - interval '30 days' then 1 else 0 end) as RecentComments
+    from Comments c
+    join Users u on c.UserId = u.Id
+    group by c.UserId, u.DisplayName
+),
+RecentPostEdits as (
+    select
+        ph.PostId,
+        max(ph.CreationDate) as LastEditDate,
+        count(*) as TotalEdits,
+        sum(case when ph.PostHistoryTypeId = 4 then 1 else 0 end) as TitleEdits,
+        sum(case when ph.PostHistoryTypeId = 6 then 1 else 0 end) as TagEdits
+    from PostHistory ph
+    group by ph.PostId
+),
+QuestionsWithEditInfo as (
+    select
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        e.LastEditDate,
+        e.TotalEdits,
+        e.TitleEdits,
+        e.TagEdits,
+        p.Tags,
+        p.OwnerUserId
+    from Posts p
+    left join RecentPostEdits e on e.PostId = p.Id
+    where p.PostTypeId = 1
+),
+TagUsageStats as (
+    select
+        t.TagName,
+        t.Count,
+        coalesce((select count(*) from Posts p where p.Tags like '%' || ('<' || t.TagName || '>') || '%'), 0) as ActivePostsWithTag,
+        coalesce((select avg(p.Score) from Posts p where p.Tags like '%' || ('<' || t.TagName || '>') || '%'), 0) as AvgScoreWithTag,
+        coalesce((
+            select count(*)
+            from Posts p2
+            join Votes v2 on v2.PostId = p2.Id
+            join VoteTypes vt2 on vt2.Id = v2.VoteTypeId and vt2.Name = 'UpMod'
+            where p2.Tags like '%' || ('<' || t.TagName || '>') || '%'
+        ), 0) as TotalUpVotesWithTag
+    from Tags t
+    where t.Count > 100
+),
+DistinctTagNames as (
+    select TagName from Tags
+),
+TopScoredQuestions as (
+    select Id, Title, Score, OwnerUserId
+    from Posts
+    where PostTypeId = 1
+    order by Score desc
+    limit 100
+),
+RecentlyActiveQuestions as (
+    select Id, Title, Score, OwnerUserId, LastActivityDate
+    from Posts
+    where PostTypeId = 1 and LastActivityDate >= cast('2024-10-01' as date) - interval '7 days'
+    order by LastActivityDate desc
+    limit 100
+),
+InterestingQuestions as (
+    select Id, Title, Score, OwnerUserId from TopScoredQuestions
+    union
+    select Id, Title, Score, OwnerUserId from RecentlyActiveQuestions
+),
+FinalUserPostSummary as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        us.TotalQuestionsPosted,
+        us.AvgQuestionScore,
+        us.ClosedQuestions,
+        tb.BadgeName,
+        tb.Class,
+        uc.DistinctPostsCommented,
+        uc.TotalComments,
+        uc.AvgCommentLength,
+        coalesce(us.SumUpVotes, 0) as SumUpVotes,
+        coalesce(us.SumDownVotes, 0) as SumDownVotes,
+        ('User: ' || coalesce(u.DisplayName, 'Unknown')) as UserLabel,
+        ('Rep:' || cast(u.Reputation as varchar) || ' Badges:' || coalesce(tb_agg.BadgeList, 'None')) as UserBadgesSummary,
+        qwe.TotalEdits,
+        qwe.TitleEdits,
+        qwe.TagEdits,
+        qwe.LastEditDate,
+        case when qwe.LastEditDate is null then 'Never Edited' else 'Edited' end as EditStatus
+    from Users u
+    left join UserActivityWindow us on us.UserId = u.Id and us.RecentQuestionRank = 1
+    left join TopBadges tb on tb.UserId = u.Id and tb.BadgeRank = 1
+    left join UserCommentsSummary uc on uc.UserId = u.Id
+    left join QuestionsWithEditInfo qwe on qwe.OwnerUserId = u.Id
+    left join (
+        select UserId, string_agg(BadgeName, ', ') as BadgeList
+        from TopBadges
+        group by UserId
+    ) tb_agg on tb_agg.UserId = u.Id
+    where u.CreationDate < cast('2024-10-01' as date) - interval '30 days'
+)
+select
+    fus.UserId,
+    fus.DisplayName,
+    fus.Reputation,
+    fus.TotalQuestionsPosted,
+    fus.AvgQuestionScore,
+    fus.ClosedQuestions,
+    fus.BadgeName,
+    fus.Class,
+    fus.DistinctPostsCommented,
+    fus.TotalComments,
+    round(cast(fus.AvgCommentLength as numeric), 2) as AvgCommentLength,
+    fus.SumUpVotes,
+    fus.SumDownVotes,
+    fus.UserLabel,
+    fus.UserBadgesSummary,
+    fus.TotalEdits,
+    fus.TitleEdits,
+    fus.TagEdits,
+    fus.LastEditDate,
+    fus.EditStatus,
+    (
+        select string_agg(trim(t.TagName), ', ')
+        from (
+            select trim(value) as TagName
+            from regexp_split_to_table(coalesce(fus.UserBadgesSummary, ''), ',') as value
+        ) t
+        where length(t.TagName) > 0
+    ) as BadgeTags
+from FinalUserPostSummary fus
+where coalesce(fus.TotalQuestionsPosted, 0) > 5 or coalesce(fus.TotalComments, 0) > 10
+order by fus.Reputation desc, fus.TotalQuestionsPosted desc, fus.TotalComments desc
+limit 50;

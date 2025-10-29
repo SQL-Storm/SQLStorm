@@ -1,0 +1,258 @@
+WITH UserQuestions AS (
+    SELECT OwnerUserId AS UserId, COUNT(Id) AS TotalQuestionsPosted
+    FROM Posts
+    WHERE PostTypeId = 1
+    GROUP BY OwnerUserId
+),
+UserAnswers AS (
+    SELECT OwnerUserId AS UserId, COUNT(Id) AS TotalAnswersPosted
+    FROM Posts
+    WHERE PostTypeId = 2
+    GROUP BY OwnerUserId
+),
+UserComments AS (
+    SELECT UserId, COUNT(Id) AS TotalCommentsMade
+    FROM Comments
+    GROUP BY UserId
+),
+UserVotesCast AS (
+    SELECT
+        UserId,
+        SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesCast,
+        SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesCast
+    FROM Votes
+    GROUP BY UserId
+),
+UserBadges AS (
+    SELECT UserId, COUNT(Id) AS NumBadges
+    FROM Badges
+    GROUP BY UserId
+),
+UserPostScores AS (
+    SELECT
+        OwnerUserId AS UserId,
+        SUM(Score) AS TotalPostScoreReceived,
+        AVG(Score) AS AvgPostScore
+    FROM Posts
+    WHERE PostTypeId IN (1, 2)
+    GROUP BY OwnerUserId
+),
+UserEngagementStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COALESCE(uq.TotalQuestionsPosted, 0) AS TotalQuestionsPosted,
+        COALESCE(ua.TotalAnswersPosted, 0) AS TotalAnswersPosted,
+        COALESCE(uc.TotalCommentsMade, 0) AS TotalCommentsMade,
+        COALESCE(uvc.TotalUpVotesCast, 0) AS TotalUpVotesCast,
+        COALESCE(uvc.TotalDownVotesCast, 0) AS TotalDownVotesCast,
+        COALESCE(ups.TotalPostScoreReceived, 0) AS TotalPostScoreReceived,
+        COALESCE(ub.NumBadges, 0) AS NumBadges,
+        COALESCE(ups.AvgPostScore, 0.0) AS AvgPostScore
+    FROM Users u
+    LEFT JOIN UserQuestions uq ON u.Id = uq.UserId
+    LEFT JOIN UserAnswers ua ON u.Id = ua.UserId
+    LEFT JOIN UserComments uc ON u.Id = uc.UserId
+    LEFT JOIN UserVotesCast uvc ON u.Id = uvc.UserId
+    LEFT JOIN UserBadges ub ON u.Id = ub.UserId
+    LEFT JOIN UserPostScores ups ON u.Id = ups.UserId
+),
+PostHistoryAggregates AS (
+    SELECT
+        ph.PostId,
+        COUNT(ph.Id) AS TotalHistoryEntries,
+        MAX(ph.CreationDate) AS LastHistoryDate,
+        MIN(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6, 24) THEN ph.CreationDate END) AS FirstEditDate,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6, 24) THEN ph.UserId END) AS NumUniqueEditors,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseVoteHistoryCount,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) AS LastCloseVoteDate
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+),
+QuestionSpecificDetails AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.AcceptedAnswerId,
+        q.AnswerCount AS DeclaredAnswerCountFromPost,
+        q.ViewCount AS QuestionViewCount,
+        q.FavoriteCount AS QuestionFavoriteCount
+    FROM Posts q
+    WHERE q.PostTypeId = 1
+),
+AnswerSpecificDetails AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.Score AS AnswerScore,
+        CASE WHEN q.AcceptedAnswerId = a.Id THEN TRUE ELSE FALSE END AS IsAcceptedAnswer
+    FROM Posts a
+    JOIN Posts q ON a.ParentId = q.Id AND q.PostTypeId = 1
+    WHERE a.PostTypeId = 2
+),
+PostTags AS (
+    SELECT
+      p.Id AS PostId,
+      TRIM(tag) AS TagName
+    FROM Posts p,
+    LATERAL (
+      SELECT regexp_split_to_table(SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags) - 2)), '><') AS tag
+    ) AS tags
+    WHERE p.Tags IS NOT NULL
+)
+SELECT
+    p.Id AS PostId,
+    p.Title AS PostTitle,
+    pt.Name AS PostTypeName,
+    p.CreationDate AS PostCreationDate,
+    p.LastActivityDate AS PostLastActivityDate,
+    p.Score AS CurrentPostScore,
+    p.ViewCount AS PostViewCount,
+    p.OwnerUserId,
+    COALESCE(p.LastEditorUserId, -1) AS EffectiveLastEditorUserId,
+    CHAR_LENGTH(p.Body) AS PostBodyLengthChars,
+    COALESCE(p.CommentCount, 0) AS PostCommentCount,
+    COALESCE(p.FavoriteCount, 0) AS PostFavoriteCount,
+    p.ClosedDate AS PostClosedDate,
+    p.CommunityOwnedDate AS PostCommunityOwnedDate,
+    p.ContentLicense,
+    ues.DisplayName AS OwnerDisplayName,
+    ues.Reputation AS OwnerReputation,
+    ues.TotalQuestionsPosted,
+    ues.TotalAnswersPosted,
+    ues.NumBadges AS OwnerBadgeCount,
+    NULLIF(DATE_PART('day', p.CreationDate - ues.UserCreationDate), 0) AS DaysSinceOwnerJoinedBeforePost,
+    le_user.DisplayName AS LastEditorDisplayName,
+    le_user.Reputation AS LastEditorReputation,
+    pha.TotalHistoryEntries AS PostEditHistoryCount,
+    COALESCE(pha.NumUniqueEditors, 0) AS UniqueEditorsCount,
+    pha.CloseVoteHistoryCount,
+    pha.LastCloseVoteDate,
+    NULLIF(DATE_PART('hour', pha.FirstEditDate - p.CreationDate), 0) AS HoursToFirstEdit,
+    ptg.TagName AS TagName,
+    t.Count AS GlobalTagUsageCount,
+    t.IsModeratorOnly AS IsTagModeratorOnly,
+    t.IsRequired AS IsTagRequired,
+    pl_dup.RelatedPostId AS DuplicateOfPostId,
+    lt_dup.Name AS DuplicateLinkTypeName,
+    COALESCE(qsd.QuestionViewCount, asd.QuestionId) AS RelatedPostMetricA,
+    COALESCE(qsd.AcceptedAnswerId, p.ParentId) AS RelatedPostMetricB,
+    asd.IsAcceptedAnswer AS IsThisPostAcceptedAnswer,
+    (SELECT MAX(scc.CreationDate) FROM Comments scc WHERE scc.PostId = p.Id AND scc.UserId IS NOT NULL) AS LatestUserCommentDate,
+    (SELECT COALESCE(SUM(sv.BountyAmount), 0) FROM Votes sv WHERE sv.PostId = p.Id AND sv.VoteTypeId = 8) AS TotalBountyPosted,
+    (COALESCE(p.Score, 0) * (COALESCE(p.FavoriteCount, 0) + 1)) AS WeightedEngagementScore,
+    NULLIF(CAST(COALESCE(p.CommentCount, 0) AS NUMERIC) / NULLIF(CHAR_LENGTH(p.Body), 0), 0) AS CommentsPerBodyCharRatio,
+    (LOWER(p.Title) LIKE '%query%' OR LOWER(p.Body) LIKE '%database%') AS ContainsDatabaseKeyword,
+    CASE
+        WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Question_With_Accepted_Answer'
+        WHEN p.PostTypeId = 1 AND qsd.DeclaredAnswerCountFromPost > 0 AND p.AcceptedAnswerId IS NULL THEN 'Question_With_Unaccepted_Answers'
+        WHEN p.PostTypeId = 2 AND asd.IsAcceptedAnswer THEN 'Answer_Accepted_Status'
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed_Post'
+        ELSE 'Other_Post_STATUS'
+    END AS DetailedPostStatus,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS OwnerPostCreationRank,
+    AVG(p.Score) OVER (PARTITION BY pt.Name, EXTRACT(YEAR FROM p.CreationDate)) AS AvgPostScoreByTypeAndYear,
+    COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id), 0) AS TotalUpvotesOnThisPost,
+    COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id), 0) AS TotalDownvotesOnThisPost,
+    LAG(p.CreationDate, 1, TIMESTAMP '1970-01-01 00:00:00') OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevOwnerPostCreationDate,
+    LEAD(p.CreationDate, 1, TIMESTAMP '2099-12-31 23:59:59') OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextOwnerPostCreationDate,
+    DATE_PART('day', p.CreationDate - LAG(p.CreationDate, 1, TIMESTAMP '1970-01-01 00:00:00') OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate)) AS DaysSincePrevPost,
+    'PrimaryAnalysis_EngagedPosts' AS QuerySegmentIdentifier
+FROM Posts p
+INNER JOIN PostTypes pt ON p.PostTypeId = pt.Id
+LEFT JOIN UserEngagementStats ues ON p.OwnerUserId = ues.UserId
+LEFT JOIN Users le_user ON p.LastEditorUserId = le_user.Id
+LEFT JOIN PostHistoryAggregates pha ON p.Id = pha.PostId
+LEFT JOIN QuestionSpecificDetails qsd ON p.Id = qsd.QuestionId AND p.PostTypeId = 1
+LEFT JOIN AnswerSpecificDetails asd ON p.Id = asd.AnswerId AND p.PostTypeId = 2
+LEFT JOIN PostTags ptg ON p.Id = ptg.PostId
+LEFT JOIN Tags t ON ptg.TagName = t.TagName
+LEFT JOIN PostLinks pl_dup ON p.Id = pl_dup.PostId AND pl_dup.LinkTypeId = 3
+LEFT JOIN LinkTypes lt_dup ON pl_dup.LinkTypeId = lt_dup.Id
+LEFT JOIN Votes v ON p.Id = v.PostId
+WHERE p.CreationDate >= DATE '2022-01-01'
+  AND p.PostTypeId IN (1, 2)
+  AND (p.Score >= 10 OR p.ViewCount >= 1000 OR COALESCE(ues.Reputation, 0) >= 10000)
+  AND (p.ClosedDate IS NULL OR p.LastActivityDate > p.ClosedDate + INTERVAL '90 days')
+  AND ptg.TagName IS NOT NULL
+  AND ((LOWER(p.Body) NOT LIKE '%testtext%' AND LOWER(p.Body) NOT LIKE '%drafttext%' AND LOWER(p.Body) NOT LIKE '%exampletext%') OR p.OwnerUserId IS NULL)
+
+UNION ALL
+
+SELECT
+    p.Id AS PostId,
+    p.Title AS PostTitle,
+    pt.Name AS PostTypeName,
+    p.CreationDate AS PostCreationDate,
+    p.LastActivityDate AS PostLastActivityDate,
+    p.Score AS CurrentPostScore,
+    p.ViewCount AS PostViewCount,
+    p.OwnerUserId,
+    COALESCE(p.LastEditorUserId, -1) AS EffectiveLastEditorUserId,
+    CHAR_LENGTH(p.Body) AS PostBodyLengthChars,
+    COALESCE(p.CommentCount, 0) AS PostCommentCount,
+    COALESCE(p.FavoriteCount, 0) AS PostFavoriteCount,
+    p.ClosedDate AS PostClosedDate,
+    p.CommunityOwnedDate AS PostCommunityOwnedDate,
+    p.ContentLicense,
+    ues.DisplayName AS OwnerDisplayName,
+    ues.Reputation AS OwnerReputation,
+    ues.TotalQuestionsPosted,
+    ues.TotalAnswersPosted,
+    ues.NumBadges AS OwnerBadgeCount,
+    NULLIF(DATE_PART('day', p.CreationDate - ues.UserCreationDate), 0) AS DaysSinceOwnerJoinedBeforePost,
+    le_user.DisplayName AS LastEditorDisplayName,
+    le_user.Reputation AS LastEditorReputation,
+    pha.TotalHistoryEntries AS PostEditHistoryCount,
+    COALESCE(pha.NumUniqueEditors, 0) AS UniqueEditorsCount,
+    pha.CloseVoteHistoryCount,
+    pha.LastCloseVoteDate,
+    NULLIF(DATE_PART('hour', pha.FirstEditDate - p.CreationDate), 0) AS HoursToFirstEdit,
+    ptg.TagName AS TagName,
+    t.Count AS GlobalTagUsageCount,
+    t.IsModeratorOnly AS IsTagModeratorOnly,
+    t.IsRequired AS IsTagRequired,
+    pl_gen.RelatedPostId AS DuplicateOfPostId,
+    lt_gen.Name AS DuplicateLinkTypeName,
+    (SELECT COUNT(DISTINCT q_linked.Id) FROM Posts q_linked WHERE q_linked.ParentId = p.Id AND q_linked.PostTypeId = 2) AS RelatedPostMetricA,
+    (SELECT pl_related.RelatedPostId FROM PostLinks pl_related WHERE pl_related.PostId = p.Id AND pl_related.LinkTypeId = 1 ORDER BY pl_related.CreationDate DESC LIMIT 1) AS RelatedPostMetricB,
+    NULL AS IsThisPostAcceptedAnswer,
+    (SELECT MAX(scc.CreationDate) FROM Comments scc WHERE scc.PostId = p.Id AND scc.UserId IS NULL) AS LatestUserCommentDate,
+    (SELECT COALESCE(SUM(sv.BountyAmount), 0) FROM Votes sv WHERE sv.PostId = p.Id AND sv.VoteTypeId = 9) AS TotalBountyPosted,
+    (p.ViewCount * (CASE WHEN COALESCE(p.AnswerCount, 0) > 0 THEN p.AnswerCount ELSE 0.5 END)) AS WeightedEngagementScore,
+    NULLIF(CAST(COALESCE(p.FavoriteCount, 0) AS NUMERIC) / NULLIF(COALESCE(p.ViewCount, 0), 0), 0) AS CommentsPerBodyCharRatio,
+    (LOWER(p.Title) LIKE '%cloud%' OR LOWER(p.Body) LIKE '%aws%' OR LOWER(p.Body) LIKE '%azure%') AS ContainsDatabaseKeyword,
+    CASE
+        WHEN p.Score < 0 AND COALESCE(pha.CloseVoteHistoryCount, 0) > 0 THEN 'Controversial_Closed_Post'
+        WHEN p.PostTypeId = 2 AND p.Score > 50 THEN 'Highly_Rated_Answer'
+        WHEN p.OwnerUserId IS NULL AND p.CommunityOwnedDate IS NOT NULL THEN 'Community_Owned_Wiki'
+        ELSE 'Special_Review_Post'
+    END AS DetailedPostStatus,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate DESC) AS OwnerPostCreationRank,
+    AVG(p.CommentCount) OVER (PARTITION BY pt.Name, EXTRACT(QUARTER FROM p.CreationDate)) AS AvgPostScoreByTypeAndYear,
+    COALESCE(SUM(CASE WHEN v.VoteTypeId = 10 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id), 0) AS TotalUpvotesOnThisPost,
+    COALESCE(SUM(CASE WHEN v.VoteTypeId = 11 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id), 0) AS TotalDownvotesOnThisPost,
+    LAG(p.LastActivityDate, 1, TIMESTAMP '1970-01-01 00:00:00') OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate) AS PrevOwnerPostCreationDate,
+    LEAD(p.LastActivityDate, 1, TIMESTAMP '2099-12-31 23:59:59') OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate) AS NextOwnerPostCreationDate,
+    DATE_PART('hour', p.LastActivityDate - LAG(p.LastActivityDate, 1, TIMESTAMP '1970-01-01 00:00:00') OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate)) AS DaysSincePrevPost,
+    'SecondaryAnalysis_SpecialCases' AS QuerySegmentIdentifier
+FROM Posts p
+INNER JOIN PostTypes pt ON p.PostTypeId = pt.Id
+LEFT JOIN UserEngagementStats ues ON p.OwnerUserId = ues.UserId
+LEFT JOIN Users le_user ON p.LastEditorUserId = le_user.Id
+LEFT JOIN PostHistoryAggregates pha ON p.Id = pha.PostId
+LEFT JOIN PostTags ptg ON p.Id = ptg.PostId
+LEFT JOIN Tags t ON ptg.TagName = t.TagName
+LEFT JOIN PostLinks pl_gen ON p.Id = pl_gen.PostId AND pl_gen.LinkTypeId = 1
+LEFT JOIN LinkTypes lt_gen ON pl_gen.LinkTypeId = lt_gen.Id
+LEFT JOIN Votes v ON p.Id = v.PostId
+WHERE p.CreationDate >= DATE '2023-01-01'
+  AND p.PostTypeId IN (1, 2)
+  AND p.Score < 0
+  AND COALESCE(pha.TotalHistoryEntries, 0) > 3
+  AND p.OwnerUserId IS NOT NULL
+  AND (t.IsModeratorOnly IS TRUE OR t.IsRequired IS TRUE)
+ORDER BY PostCreationDate DESC, CurrentPostScore DESC
+LIMIT 10000;

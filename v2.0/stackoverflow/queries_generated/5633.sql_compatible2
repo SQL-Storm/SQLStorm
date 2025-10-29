@@ -1,0 +1,120 @@
+WITH TaggedActivity AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Title,
+    p.Tags,
+    u.Id AS UserId,
+    u.DisplayName AS UserName,
+    p.OwnerUserId,
+    p.LastEditDate,
+    -- compute TagCount in a dialect-neutral way: count occurrences of '<' as a proxy for tags,
+    -- handle NULL tags
+    CASE WHEN p.Tags IS NULL OR p.Tags = '' THEN 0
+         ELSE (LENGTH(p.Tags) - LENGTH(REPLACE(p.Tags, '<', '')))
+    END AS TagCount,
+    COUNT(*) OVER () AS TotalPosts
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId IN (1,2)
+),
+CorrelatedStats AS (
+  SELECT
+    t1.PostId,
+    t1.PostTypeId,
+    t1.CreationDate,
+    t1.Score,
+    t1.ViewCount,
+    t1.Title,
+    t1.Tags,
+    t1.UserId,
+    t1.UserName,
+    t1.OwnerUserId,
+    t1.LastEditDate,
+    t1.TagCount,
+    t2.Id AS RelatedPostId,
+    t2.Title AS RelatedTitle,
+    t2.CreationDate AS RelatedCreationDate,
+    t2.Score AS RelatedScore,
+    t2.ViewCount AS RelatedViewCount,
+    t2.Tags AS RelatedTags,
+    t2.OwnerUserId AS RelatedOwnerUserId
+  FROM TaggedActivity t1
+  LEFT JOIN Posts t2
+    ON t1.PostId <> t2.Id
+   AND t2.PostTypeId = 1
+   AND t2.CreationDate > t1.CreationDate
+   -- replace UNNEST + REGEXP_SPLIT_TO_ARRAY with a simple LIKE-based tag overlap heuristic
+   AND (
+     t1.Tags IS NOT NULL
+     AND t2.Tags IS NOT NULL
+     AND EXISTS (
+       SELECT 1
+       WHERE (
+         -- attempt to detect any shared tag by checking for any tag token from t1 appearing in t2
+         -- split t1.Tags by '<'... this is a heuristic using LIKE; exact splitting requires regexp functions
+         -- check common tags by splitting up to a reasonable number using simple pattern matching
+         t2.Tags LIKE '%' || COALESCE(NULLIF(SUBSTR(t1.Tags, INSTR(t1.Tags, '<') + 1,
+           CASE WHEN INSTR(t1.Tags, '</>') > INSTR(t1.Tags, '<') THEN INSTR(t1.Tags, '</>') - INSTR(t1.Tags, '<') - 1 ELSE 0 END), ''), '') || '%'
+       )
+     )
+   )
+  GROUP BY
+    t1.PostId, t1.PostTypeId, t1.CreationDate, t1.Score, t1.ViewCount, t1.Title, t1.Tags,
+    t1.UserId, t1.UserName, t1.OwnerUserId, t1.LastEditDate, t1.TagCount,
+    t2.Id, t2.Title, t2.CreationDate, t2.Score, t2.ViewCount, t2.Tags, t2.OwnerUserId
+),
+WindowAgg AS (
+  SELECT
+    PostId,
+    PostTypeId,
+    CreationDate,
+    Score,
+    ViewCount,
+    Title,
+    Tags,
+    UserId,
+    UserName,
+    OwnerUserId,
+    LastEditDate,
+    TagCount,
+    RelatedPostId,
+    RelatedTitle,
+    RelatedCreationDate,
+    RelatedScore,
+    RelatedViewCount,
+    RelatedTags,
+    RelatedOwnerUserId,
+    ROW_NUMBER() OVER (
+      PARTITION BY PostId
+      ORDER BY RelatedScore DESC, RelatedViewCount DESC, RelatedCreationDate ASC
+    ) AS rn
+  FROM CorrelatedStats
+)
+SELECT
+  PostId,
+  PostTypeId,
+  CreationDate,
+  Score,
+  ViewCount,
+  Title,
+  Tags,
+  UserId,
+  UserName,
+  OwnerUserId,
+  LastEditDate,
+  TagCount,
+  RelatedPostId,
+  RelatedTitle,
+  RelatedCreationDate,
+  RelatedScore,
+  RelatedViewCount,
+  RelatedTags,
+  RelatedOwnerUserId,
+  rn
+FROM WindowAgg
+WHERE rn = 1
+ORDER BY PostId, rn;

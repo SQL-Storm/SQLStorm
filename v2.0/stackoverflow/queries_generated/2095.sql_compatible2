@@ -1,0 +1,154 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id, 
+        t.TagName, 
+        t.Count,
+        ARRAY[t.TagName] AS AncestorTags
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+    UNION ALL
+    SELECT 
+        child.Id, 
+        child.TagName, 
+        child.Count,
+        rth.AncestorTags || child.TagName
+    FROM Tags child
+    JOIN RecursiveTagHierarchy rth ON child.Id <> rth.Id AND child.Count < rth.Count
+    WHERE array_position(rth.AncestorTags, child.TagName) IS NULL
+),
+TopUsersBadges AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+    HAVING COUNT(b.Id) > 5
+),
+PostActivity AS (
+    SELECT 
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        ph.PostHistoryTypeId,
+        ph.CreationDate AS HistoryDate,
+        ph.UserId AS EditorUserId,
+        ph.Comment AS EditComment,
+        ph.Text AS EditText,
+        v.VoteTypeId,
+        v.CreationDate AS VoteDate,
+        v.UserId AS VoterUserId,
+        CASE WHEN p.PostTypeId = 1 THEN (SELECT COUNT(*) FROM Posts ans WHERE ans.ParentId = p.Id AND ans.Score > 0) ELSE NULL END AS PositiveAnswerCount,
+        CASE WHEN p.PostTypeId = 1 
+            THEN (
+                SELECT string_agg(DISTINCT tag, '|' ) 
+                FROM regexp_split_to_table(substring(p.Tags FROM 2 FOR length(p.Tags)-2), '><') AS tag
+            )
+            ELSE NULL
+        END AS ParsedTags
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4,5,6,10,11)
+    LEFT JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId IN (2,3)
+    WHERE p.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+),
+UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        AVG(COALESCE(p.Score,0)) FILTER (WHERE p.PostTypeId IN (1,2)) AS AvgPostScore,
+        SUM(COALESCE(p.ViewCount,0)) FILTER (WHERE p.PostTypeId=1) AS TotalQuestionViews,
+        MAX(p.CreationDate) AS LastPostDate,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT ph.Id) AS EditsMade,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId=2) AS UpVotesGiven,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId=3) AS DownVotesGiven,
+        array_agg(DISTINCT tag) AS UserTags
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    LEFT JOIN LATERAL (
+        SELECT regexp_split_to_table(substring(p.Tags FROM 2 FOR length(p.Tags)-2), '><') AS tag
+    ) rt ON p.Tags IS NOT NULL
+    GROUP BY u.Id, u.DisplayName
+),
+MostActiveUsers AS (
+    SELECT UserId, DisplayName, (TotalPosts + TotalComments + EditsMade) AS ActivityScore
+    FROM UserActivitySummary
+    ORDER BY ActivityScore DESC
+    LIMIT 20
+),
+QuestionDuplicates AS (
+    SELECT 
+        pl.PostId AS DuplicateQuestionId,
+        pl.RelatedPostId AS OriginalQuestionId,
+        pq.Title AS DuplicateTitle,
+        po.Title AS OriginalTitle,
+        pl.CreationDate
+    FROM PostLinks pl
+    JOIN Posts pq ON pq.Id = pl.PostId AND pq.PostTypeId = 1
+    JOIN Posts po ON po.Id = pl.RelatedPostId AND po.PostTypeId = 1
+    WHERE pl.LinkTypeId = 3
+),
+UserBadgesWithTagCount AS (
+    SELECT 
+        b.UserId,
+        b.Name,
+        b.Class,
+        COUNT(DISTINCT t.Id) AS TagCount
+    FROM Badges b
+    LEFT JOIN Tags t ON b.Name ILIKE '%' || t.TagName || '%'
+    GROUP BY b.UserId, b.Name, b.Class
+),
+RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Tags,
+        p.OwnerUserId,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS RankByScoreView
+    FROM Posts p
+    WHERE p.PostTypeId IN (1,2) AND p.Score > 10 AND p.ViewCount > 5000
+)
+SELECT 
+    mau.ActivityScore,
+    mau.DisplayName AS MostActiveUser,
+    t.RankByScoreView,
+    t.Title AS TopPostTitle,
+    t.Score,
+    t.ViewCount,
+    string_agg(DISTINCT rth.TagName, ', ') AS RelatedRequiredTags,
+    qd.DuplicateTitle,
+    qd.OriginalTitle,
+    qd.CreationDate AS DuplicateMarkedDate,
+    ubwt.TagCount AS BadgeRelatedTagCount,
+    tsb.GoldBadges,
+    tsb.SilverBadges,
+    tsb.BronzeBadges
+FROM MostActiveUsers mau
+JOIN RankedPosts t ON t.OwnerUserId = mau.UserId
+LEFT JOIN RecursiveTagHierarchy rth ON position(rth.TagName IN coalesce(t.Tags,'')) > 0
+LEFT JOIN QuestionDuplicates qd ON qd.DuplicateQuestionId = t.Id
+LEFT JOIN UserBadgesWithTagCount ubwt ON ubwt.UserId = mau.UserId
+LEFT JOIN TopUsersBadges tsb ON tsb.UserId = mau.UserId
+WHERE t.RankByScoreView <= 5
+GROUP BY mau.ActivityScore, mau.DisplayName, t.RankByScoreView, t.Title, t.Score, t.ViewCount, qd.DuplicateTitle, qd.OriginalTitle, qd.CreationDate, ubwt.TagCount, tsb.GoldBadges, tsb.SilverBadges, tsb.BronzeBadges
+ORDER BY mau.ActivityScore DESC, t.RankByScoreView;

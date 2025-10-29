@@ -1,0 +1,119 @@
+-- {"query": "5865.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 952} 
+WITH TopUsers AS (
+  SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.AccountId,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.CreationDate ASC) AS rn
+  FROM Users u
+),
+RecentActivity AS (
+  SELECT
+    p.Id AS PostId,
+    p.OwnerUserId,
+    p.PostTypeId,
+    p.Title,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    COALESCE(a.TotalEdits, 0) AS EditCount,
+    COALESCE(vp.Upvotes, 0) AS UpVotes,
+    COALESCE(vp.Downvotes, 0) AS DownVotes,
+    COALESCE(br.BadgeCount, 0) AS BadgeCount
+  FROM Posts p
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS TotalEdits
+    FROM PostHistory
+    WHERE PostHistoryTypeId IN (4,5,6,8,9,18,19,24,33,34)
+    GROUP BY PostId
+  ) a ON a.PostId = p.Id
+  LEFT JOIN (
+    SELECT PostId, SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes,
+                   SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS Downvotes
+    FROM Votes
+    GROUP BY PostId
+  ) vp ON vp.PostId = p.Id
+  LEFT JOIN (
+    SELECT p.OwnerUserId, COUNT(*) AS BadgeCount
+    FROM Posts p
+    JOIN Badges b ON b.UserId = p.OwnerUserId
+    GROUP BY p.OwnerUserId
+  ) br ON br.OwnerUserId = p.OwnerUserId
+  WHERE p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '180 days'
+),
+CorrelatedTitle AS (
+  SELECT
+    t.PostId,
+    LOWER(t.Title) AS TitleLower,
+    t.EditCount,
+    t.UpVotes,
+    t.DownVotes,
+    t.BadgeCount,
+    ROW_NUMBER() OVER (PARTITION BY t.PostId ORDER BY t.Title IS NOT NULL DESC, t.TitleLower) AS rn
+  FROM RecentActivity t
+),
+ComplexAggregate AS (
+  SELECT
+    tp.Id AS PostTypeId,
+    tp.Name AS PostTypeName,
+    COUNT(*) AS TotalPosts,
+    SUM(r.EditCount) AS TotalEdits,
+    SUM(r.UpVotes) AS TotalUpVotes,
+    SUM(r.DownVotes) AS TotalDownVotes,
+    SUM(r.BadgeCount) AS TotalBadges
+  FROM ComplexQueryTypes tp
+  LEFT JOIN CorrelatedTitle r ON r.PostId = tp.Id
+  GROUP BY tp.Id, tp.Name
+),
+ComplexQueryTypes AS (
+  SELECT
+    p.Id,
+    p.PostTypeId,
+    p.Title,
+    p.Tags
+  FROM Posts p
+  WHERE p.LastActivityDate > p.CreationDate - INTERVAL '1 day'
+)
+SELECT
+  u.Id AS UserId,
+  u.DisplayName AS UserName,
+  u.Reputation,
+  u.AccountId,
+  t.TotalPosts,
+  t.TotalEdits,
+  t.TotalUpVotes,
+  t.TotalDownVotes,
+  t.TotalBadges
+FROM TopUsers u
+LEFT JOIN (
+  SELECT
+    p.OwnerUserId,
+    COUNT(*) AS TotalPosts,
+    SUM(coalesce(v.UpMod,0)) AS TotalUpVotes,
+    SUM(coalesce(v.DownMod,0)) AS TotalDownVotes,
+    SUM(b.Count) AS TotalBadges
+  FROM Posts p
+  LEFT JOIN (
+    SELECT PostId, SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpMod,
+                   SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownMod
+    FROM Votes
+    GROUP BY PostId
+  ) v ON v.PostId = p.Id
+  LEFT JOIN (
+    SELECT UserId, COUNT(*) AS Count
+    FROM Badges
+    GROUP BY UserId
+  ) b ON b.UserId = p.OwnerUserId
+  GROUP BY p.OwnerUserId
+) t ON t.OwnerUserId = u.Id
+WHERE u.Reputation > 1000
+ORDER BY u.Reputation DESC, u.CreationDate ASC
+LIMIT 100;

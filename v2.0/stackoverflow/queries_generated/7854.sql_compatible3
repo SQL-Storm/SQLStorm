@@ -1,0 +1,286 @@
+WITH UserPostStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        COALESCE(SUM(p.Score), 0) AS TotalScore,
+        COALESCE(AVG(p.Score), 0) AS AvgScore,
+        MAX(p.CreationDate) AS LatestPostDate,
+        CAST(MAX(p.CreationDate) AS DATE) - CAST(MIN(p.CreationDate) AS DATE) AS ActiveDays,
+        COUNT(DISTINCT CASE WHEN p.AnswerCount > 0 THEN p.Id END) AS QuestionsWithAnswers,
+        COUNT(DISTINCT CASE WHEN p.CommentCount > 0 THEN p.Id END) AS PostsWithComments,
+        COALESCE(
+          -- prefer STRING_AGG when available; standardized form: STRING_AGG(expression, delimiter) with ORDER BY in a subclause if supported
+          -- Use STRING_AGG with explicit cast to text for portability; fallback to LISTAGG syntax removed to avoid dialect issues
+          STRING_AGG(CAST(LEFT(p.Title, 50) AS TEXT), '; ' ORDER BY LEFT(p.Title,50))
+        ) AS SampleTitles
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.CreationDate >= TIMESTAMP '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        TotalPosts,
+        Questions,
+        Answers,
+        TotalScore,
+        AvgScore,
+        LatestPostDate,
+        ActiveDays,
+        QuestionsWithAnswers,
+        PostsWithComments,
+        SampleTitles,
+        ROW_NUMBER() OVER (ORDER BY TotalScore DESC) AS RankByScore,
+        DENSE_RANK() OVER (ORDER BY Reputation DESC) AS RankByReputation
+    FROM UserPostStats
+),
+UserBadges AS (
+    SELECT 
+        UserId,
+        COUNT(*) AS TotalBadges,
+        COUNT(CASE WHEN Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN Class = 3 THEN 1 END) AS BronzeBadges,
+        COALESCE(
+          STRING_AGG(CAST(Name AS TEXT), ', ' ORDER BY Name)
+        ) AS BadgeNames
+    FROM Badges
+    WHERE Date >= TIMESTAMP '2015-01-01'
+    GROUP BY UserId
+),
+QuestionAnalysis AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        COALESCE(p.Tags, '') AS Tags,
+        CASE 
+            WHEN p.AnswerCount = 0 THEN 'No Answers'
+            WHEN p.AnswerCount = 1 THEN 'One Answer'
+            WHEN p.AnswerCount BETWEEN 2 AND 5 THEN 'Few Answers'
+            WHEN p.AnswerCount BETWEEN 6 AND 10 THEN 'Many Answers'
+            ELSE 'Very Many Answers'
+        END AS AnswerCategory,
+        CASE 
+            WHEN p.Score > 100 THEN 'Very High'
+            WHEN p.Score > 50 THEN 'High'
+            WHEN p.Score > 10 THEN 'Medium'
+            ELSE 'Low'
+        END AS ScoreCategory,
+        CAST(p.LastActivityDate AS DATE) - CAST(p.CreationDate AS DATE) AS DaysSinceLastActivity,
+        COALESCE(p.AcceptedAnswerId, 0) AS HasAcceptedAnswer
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1 
+      AND p.CreationDate >= TIMESTAMP '2020-01-01'
+      AND p.ViewCount >= 100
+),
+AnswerAnalysis AS (
+    SELECT 
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.Score,
+        a.CreationDate,
+        a.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        CAST(a.CreationDate AS DATE) - CAST(q.CreationDate AS DATE) AS DaysToAnswer,
+        CASE 
+            WHEN a.Score > 10 THEN 'High Quality'
+            WHEN a.Score > 0 THEN 'Moderate Quality'
+            ELSE 'Low Quality'
+        END AS QualityCategory,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC) AS AnswerRank
+    FROM Posts a
+    LEFT JOIN Posts q ON a.ParentId = q.Id
+    LEFT JOIN Users u ON a.OwnerUserId = u.Id
+    WHERE a.PostTypeId = 2
+      AND q.PostTypeId = 1
+      AND q.CreationDate >= TIMESTAMP '2020-01-01'
+),
+CombinedAnalysis AS (
+    SELECT 
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.TotalPosts,
+        tu.Questions,
+        tu.Answers,
+        tu.TotalScore,
+        tu.AvgScore,
+        tu.LatestPostDate,
+        tu.ActiveDays,
+        tu.QuestionsWithAnswers,
+        tu.PostsWithComments,
+        ub.TotalBadges,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        CASE 
+            WHEN ub.TotalBadges > 10 THEN 'Badge Collector'
+            WHEN ub.TotalBadges > 5 THEN 'Active Contributor'
+            ELSE 'Occasional Participant'
+        END AS BadgeStatus,
+        qa.QuestionId,
+        qa.Title AS QuestionTitle,
+        qa.Score AS QuestionScore,
+        qa.ViewCount,
+        qa.AnswerCount,
+        qa.CommentCount,
+        qa.FavoriteCount,
+        qa.AnswerCategory,
+        qa.ScoreCategory,
+        qa.DaysSinceLastActivity,
+        aa.AnswerId,
+        aa.Score AS AnswerScore,
+        aa.DaysToAnswer,
+        aa.QualityCategory,
+        CASE 
+            WHEN aa.AnswerRank = 1 THEN 'Top Answer'
+            WHEN aa.AnswerRank <= 5 THEN 'Good Answer'
+            ELSE 'Average Answer'
+        END AS AnswerQuality,
+        (
+          (EXTRACT(YEAR FROM TIMESTAMP '2024-10-01 12:34:56') - EXTRACT(YEAR FROM tu.LatestPostDate)) * 12
+          + (EXTRACT(MONTH FROM TIMESTAMP '2024-10-01 12:34:56') - EXTRACT(MONTH FROM tu.LatestPostDate))
+        )::INTEGER * 1 AS MonthsSinceLastPost,
+        CASE 
+            WHEN tu.Reputation > 10000 THEN 'Elite'
+            WHEN tu.Reputation > 5000 THEN 'Experienced'
+            WHEN tu.Reputation > 1000 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END AS ExpertiseLevel
+    FROM TopUsers tu
+    LEFT JOIN UserBadges ub ON tu.UserId = ub.UserId
+    LEFT JOIN QuestionAnalysis qa ON tu.UserId = qa.OwnerUserId
+    LEFT JOIN AnswerAnalysis aa ON qa.QuestionId = aa.QuestionId
+    WHERE tu.RankByScore <= 100 OR COALESCE(ub.TotalBadges, 0) >= 5
+),
+FinalAnalysis AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        TotalPosts,
+        Questions,
+        Answers,
+        TotalScore,
+        AvgScore,
+        LatestPostDate,
+        ActiveDays,
+        QuestionsWithAnswers,
+        PostsWithComments,
+        TotalBadges,
+        GoldBadges,
+        SilverBadges,
+        BronzeBadges,
+        BadgeStatus,
+        QuestionId,
+        QuestionTitle,
+        QuestionScore,
+        ViewCount,
+        AnswerCount,
+        CommentCount,
+        FavoriteCount,
+        AnswerCategory,
+        ScoreCategory,
+        DaysSinceLastActivity,
+        AnswerId,
+        AnswerScore,
+        DaysToAnswer,
+        QualityCategory,
+        AnswerQuality,
+        MonthsSinceLastPost,
+        ExpertiseLevel,
+        ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY QuestionScore DESC NULLS LAST, AnswerScore DESC NULLS LAST) AS PostSequence,
+        CASE 
+            WHEN AVG(TotalScore) OVER (PARTITION BY UserId) > AVG(TotalScore) OVER () THEN 'Above Average'
+            WHEN AVG(TotalScore) OVER (PARTITION BY UserId) < AVG(TotalScore) OVER () THEN 'Below Average'
+            ELSE 'Average'
+        END AS PerformanceLevel,
+        (
+            DisplayName || 
+            ' (' || 
+            CASE WHEN COALESCE(GoldBadges,0) > 0 THEN CAST(GoldBadges AS VARCHAR) || 'G' ELSE '' END ||
+            CASE WHEN COALESCE(SilverBadges,0) > 0 THEN CAST(SilverBadges AS VARCHAR) || 'S' ELSE '' END ||
+            CASE WHEN COALESCE(BronzeBadges,0) > 0 THEN CAST(BronzeBadges AS VARCHAR) || 'B' ELSE '' END ||
+            ')'
+        ) AS UserDisplay,
+        CASE 
+            WHEN QuestionScore > 0 AND AnswerScore > 0 THEN 'Active Contributor'
+            WHEN QuestionScore > 0 THEN 'Questioner'
+            WHEN AnswerScore > 0 THEN 'Answerer'
+            ELSE 'Inactive'
+        END AS ParticipationType,
+        CASE WHEN AnswerCount > 0 THEN CAST(AnswerCount AS DOUBLE PRECISION) / NULLIF(QuestionCount, 0) ELSE NULL END AS AnswerRatio
+    FROM CombinedAnalysis
+)
+SELECT 
+    UserId,
+    DisplayName,
+    Reputation,
+    TotalPosts,
+    Questions,
+    Answers,
+    TotalScore,
+    AvgScore,
+    LatestPostDate,
+    ActiveDays,
+    QuestionsWithAnswers,
+    PostsWithComments,
+    TotalBadges,
+    GoldBadges,
+    SilverBadges,
+    BronzeBadges,
+    BadgeStatus,
+    QuestionId,
+    QuestionTitle,
+    QuestionScore,
+    ViewCount,
+    AnswerCount,
+    CommentCount,
+    FavoriteCount,
+    AnswerCategory,
+    ScoreCategory,
+    DaysSinceLastActivity,
+    AnswerId,
+    AnswerScore,
+    DaysToAnswer,
+    QualityCategory,
+    AnswerQuality,
+    MonthsSinceLastPost,
+    ExpertiseLevel,
+    PostSequence,
+    PerformanceLevel,
+    UserDisplay,
+    ParticipationType,
+    AnswerRatio,
+    CASE 
+        WHEN TotalScore > 500 AND COALESCE(TotalBadges,0) > 10 THEN 'High Performer'
+        WHEN TotalScore > 250 AND ActiveDays > 365 THEN 'Consistent Contributor'
+        WHEN TotalScore > 100 AND AnswerCount > 10 THEN 'Quality Contributor'
+        ELSE 'Regular Member'
+    END AS CommunityRole
+FROM FinalAnalysis
+WHERE 
+    (QuestionId IS NOT NULL OR AnswerId IS NOT NULL)
+    AND (Reputation > 100 OR COALESCE(TotalBadges,0) > 0)
+ORDER BY 
+    TotalScore DESC,
+    Reputation DESC,
+    LatestPostDate DESC
+OFFSET 0 ROWS
+FETCH NEXT 1000 ROWS ONLY;

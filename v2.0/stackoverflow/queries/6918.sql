@@ -1,0 +1,94 @@
+WITH RankedPosts AS (
+    SELECT 
+        P.Id,
+        P.Title,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.LastActivityDate,
+        P.OwnerUserId,
+        U.DisplayName AS OwnerDisplayName,
+        U.Reputation,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.ViewCount DESC) AS Rank
+    FROM 
+        Posts P
+    LEFT JOIN 
+        Users U ON P.OwnerUserId = U.Id
+    WHERE 
+        P.PostTypeId = 1 AND P.Score > 0 AND P.ViewCount > 100
+),
+BadgeCounts AS (
+    SELECT 
+        U.Id AS UserId,
+        U.DisplayName,
+        COUNT(B.Id) AS BadgeCount
+    FROM 
+        Users U
+    LEFT JOIN 
+        Badges B ON U.Id = B.UserId
+    GROUP BY 
+        U.Id, U.DisplayName
+),
+CommentMetrics AS (
+    SELECT 
+        PCH.Id AS PostId,
+        COUNT(C.Id) AS CommentCount,
+        MAX(C.Score) AS MaxCommentScore,
+        MIN(C.Score) AS MinCommentScore
+    FROM 
+        Posts PCH
+    LEFT JOIN 
+        Comments C ON PCH.Id = C.PostId
+    GROUP BY 
+        PCH.Id
+)
+SELECT 
+    RP.Id,
+    RP.Title,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.LastActivityDate,
+    RP.OwnerDisplayName,
+    RP.Reputation,
+    RP.Rank,
+    BC.BadgeCount,
+    CM.CommentCount,
+    CM.MaxCommentScore,
+    CM.MinCommentScore,
+    CASE 
+        WHEN RP.Score > 100 THEN 'High Scoring'
+        WHEN CM.CommentCount > 10 THEN 'Highly Discussed'
+        ELSE 'Regular'
+    END AS PostStatus,
+    -- SUBSTRING_INDEX is MySQL-specific; use standard SQL to get first word
+    CASE
+        WHEN POSITION(' ' IN RP.Title) = 0 THEN RP.Title
+        ELSE SUBSTRING(RP.Title FROM 1 FOR POSITION(' ' IN RP.Title) - 1)
+    END AS TitleFirstWord,
+    CASE 
+        WHEN RP.ViewCount > 1000 THEN 'Popular'
+        ELSE 'Regular'
+    END AS Popularity
+FROM 
+    RankedPosts RP
+LEFT JOIN 
+    BadgeCounts BC ON RP.OwnerUserId = BC.UserId
+LEFT JOIN 
+    CommentMetrics CM ON RP.Id = CM.PostId
+GROUP BY
+    RP.Id,
+    RP.Title,
+    RP.Score,
+    RP.ViewCount,
+    RP.CreationDate,
+    RP.LastActivityDate,
+    RP.OwnerDisplayName,
+    RP.Reputation,
+    RP.Rank,
+    BC.BadgeCount,
+    CM.CommentCount,
+    CM.MaxCommentScore,
+    CM.MinCommentScore
+ORDER BY 
+    RP.Rank, RP.Score DESC;

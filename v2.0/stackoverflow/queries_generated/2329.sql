@@ -1,0 +1,114 @@
+-- {"query": "2329.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1174} 
+with RecursiveTagHierarchy as (
+    select t.Id, t.TagName, t.Count, 1 as Level
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+  union all
+    select t2.Id, t2.TagName, t2.Count, rh.Level + 1
+    from Tags t2
+    inner join RecursiveTagHierarchy rh on t2.Count < rh.Count and t2.Id <> rh.Id
+    where rh.Level < 3
+), UsersWithBadgeCounts as (
+    select u.Id, u.DisplayName, u.Reputation,
+           count(case when b.Class = 1 then 1 end) as GoldBadges,
+           count(case when b.Class = 2 then 1 end) as SilverBadges,
+           count(case when b.Class = 3 then 1 end) as BronzeBadges,
+           coalesce(sum(p.Score),0) as TotalPostScore
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId in (1,2)
+    group by u.Id, u.DisplayName, u.Reputation
+), TopQuestions as (
+    select p.Id, p.Title, p.CreationDate, p.OwnerUserId, p.Score, p.ViewCount,
+           ROW_NUMBER() over (partition by p.OwnerUserId order by p.Score desc, p.CreationDate asc) as rn,
+           LAG(p.Score,1,0) over (partition by p.OwnerUserId order by p.Score desc) as PrevScore
+    from Posts p
+    where p.PostTypeId = 1 and p.CreationDate > (current_date - interval '365 days')
+), LatestCommentPerPost as (
+    select c.PostId, c.Id as CommentId, c.Text, c.CreationDate, c.UserId,
+           ROW_NUMBER() over (partition by c.PostId order by c.CreationDate desc, c.Id desc) as rn
+    from Comments c
+), PostAnswerStats as (
+    select p.ParentId as QuestionId,
+           count(p.Id) as AnswerCount,
+           max(p.Score) as MaxAnswerScore,
+           avg(p.Score) as AvgAnswerScore
+    from Posts p
+    where p.PostTypeId = 2
+    group by p.ParentId
+)
+select distinct
+  u.Id as UserId,
+  u.DisplayName,
+  u.Reputation,
+  u.GoldBadges, u.SilverBadges, u.BronzeBadges,
+  u.TotalPostScore,
+  q.Id as QuestionId,
+  q.Title,
+  q.CreationDate as QuestionCreationDate,
+  q.Score as QuestionScore,
+  q.ViewCount as QuestionViews,
+  q.PrevScore as PreviousHighestScore,
+  coalesce(pa.AnswerCount,0) as TotalAnswers,
+  coalesce(pa.MaxAnswerScore,0) as HighestAnswerScore,
+  coalesce(pa.AvgAnswerScore,0)::numeric(10,2) as AverageAnswerScore,
+  c.CommentId as LatestCommentId,
+  c.Text as LatestCommentText,
+  c.CreationDate as LatestCommentDate,
+  case 
+    when q.Score > 100 and pa.AnswerCount > 5 then 'Popular'
+    when q.Score between 20 and 100 and pa.AnswerCount between 1 and 5 then 'Moderate'
+    else 'Low'
+  end as PopularityCategory,
+  concat(
+    substring(coalesce(t.TagName,'') from 1 for 10),
+    ' (Lvl ', coalesce(rh.Level::text,'N/A'), ')'
+  ) as SampleTagInfo
+from UsersWithBadgeCounts u
+left join TopQuestions q on q.OwnerUserId = u.Id and q.rn = 1
+left join LatestCommentPerPost c on c.PostId = q.Id and c.rn = 1
+left join PostAnswerStats pa on pa.QuestionId = q.Id
+left join LATERAL (
+  select rt.Id, rt.TagName, rt.Level
+  from RecursiveTagHierarchy rt
+  join Posts p2 on p2.Tags like '%' || rt.TagName || '%'
+  where p2.Id = q.Id
+  order by rt.Level asc limit 1
+) rh on true
+where u.Reputation > 1000
+  and (
+    (q.CreationDate > (current_date - interval '180 days') and q.Score >= 10)
+    or q.Score is null
+  )
+order by u.Reputation desc, q.Score desc nulls last
+limit 100
+
+union
+
+select
+  u.Id as UserId,
+  u.DisplayName,
+  u.Reputation,
+  0 as GoldBadges, 0 as SilverBadges, 0 as BronzeBadges,
+  0 as TotalPostScore,
+  null as QuestionId,
+  null as Title,
+  null as QuestionCreationDate,
+  null as QuestionScore,
+  null as QuestionViews,
+  null as PreviousHighestScore,
+  0 as TotalAnswers,
+  0 as HighestAnswerScore,
+  0 as AverageAnswerScore,
+  null as LatestCommentId,
+  null as LatestCommentText,
+  null as LatestCommentDate,
+  'No Questions' as PopularityCategory,
+  null as SampleTagInfo
+from Users u
+where not exists (
+  select 1 from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 1
+)
+and u.Reputation > 1000
+order by u.Reputation desc
+limit 20;

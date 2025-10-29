@@ -1,0 +1,223 @@
+-- {"query": "1921.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3335} 
+
+WITH UserSummaryStats AS (
+    -- Aggregates user-specific data, including reputation, activity levels, and badge counts.
+    -- Uses LEFT JOIN to ensure users with no posts, comments, votes, or badges are still included.
+    SELECT
+        u.Id AS UserId,
+        COALESCE(u.DisplayName, 'Anonymous User') AS UserDisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.Views AS TotalProfileViews,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesGiven,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesGiven,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadgesCount,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadgesCount,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadgesCount,
+        -- Calculate average score of posts owned by the user, filtering NULL scores
+        AVG(p.Score) FILTER (WHERE p.OwnerUserId = u.Id AND p.Score IS NOT NULL) AS AvgOwnedPostScore,
+        -- Categorize user activity based on reputation and last access date using CASE WHEN
+        CASE
+            WHEN u.Reputation > 10000 AND u.LastAccessDate > (NOW() - INTERVAL '30 days') THEN 'Highly Active & Reputable'
+            WHEN u.Reputation > 1000 AND u.LastAccessDate > (NOW() - INTERVAL '90 days') THEN 'Active Contributor'
+            WHEN u.LastAccessDate > (NOW() - INTERVAL '1 year') THEN 'Occasional User'
+            ELSE 'Dormant User'
+        END AS UserActivityLevel,
+        -- Calculate approximate annual reputation growth, handling division by zero for new users
+        CASE
+            WHEN DATE_PART('year', NOW()) - DATE_PART('year', u.CreationDate) > 0
+            THEN u.Reputation / (DATE_PART('year', NOW()) - DATE_PART('year', u.CreationDate))
+            ELSE u.Reputation
+        END AS AvgAnnualReputationGrowth
+    FROM Users AS u
+    LEFT JOIN Posts AS p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments AS c ON u.Id = c.UserId
+    LEFT JOIN Votes AS v ON u.Id = v.UserId
+    LEFT JOIN Badges AS b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views
+),
+PostAggregatedMetrics AS (
+    -- Gathers detailed metrics for questions (PostTypeId = 1), including history, links, and tag parsing.
+    -- Utilizes window functions for ranking and moving averages.
+    SELECT
+        q.Id AS QuestionId,
+        q.OwnerUserId,
+        COALESCE(q.Title, 'No Title Provided') AS QuestionTitle,
+        q.CreationDate AS QuestionCreationDate,
+        q.LastEditDate,
+        q.LastActivityDate,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        q.FavoriteCount,
+        COALESCE(q.ClosedDate, '1900-01-01 00:00:00'::timestamp) AS ClosedDate, -- Default date for easier comparisons with NULL
+        LENGTH(q.Body) AS BodyLength,
+        TRIM(BOTH '>' FROM TRIM(BOTH '<' FROM q.Tags)) AS RawTagsString, -- Clean up tags for array conversion
+        string_to_array(TRIM(BOTH '>' FROM TRIM(BOTH '<' FROM q.Tags)), '><') AS TagArray, -- Converts tags string to an array
+        COUNT(DISTINCT pha.UserId) AS NumberOfEditors,
+        COUNT(DISTINCT phc.Id) AS TotalHistoryEntries,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN 1 ELSE 0 END) AS EditCount, -- Count of title, body, or tag edits
+        SUM(CASE WHEN pl.LinkTypeId = 1 THEN 1 ELSE 0 END) AS LinkedPostsCount,
+        SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicateLinksCount,
+        -- Correlated subquery: Checks if the post was ever reopened
+        EXISTS (
+            SELECT 1
+            FROM PostHistory ph_reopen
+            WHERE ph_reopen.PostId = q.Id AND ph_reopen.PostHistoryTypeId = 11 -- Post Reopened
+        ) AS WasReopened,
+        -- Window function: Ranks questions by score within each owner's posts
+        ROW_NUMBER() OVER (PARTITION BY q.OwnerUserId ORDER BY q.Score DESC, q.ViewCount DESC) AS RankByUserScore,
+        -- Window function: Calculates a moving average of question scores based on creation date
+        AVG(q.Score) OVER (ORDER BY q.CreationDate ASC ROWS BETWEEN 5 PRECEDING AND CURRENT ROW) AS MovingAvgScore,
+        -- Calculates time in hours from creation to last edit using AGE function
+        EXTRACT(EPOCH FROM AGE(q.LastEditDate, q.CreationDate)) / 3600.0 AS HoursUntilLastEdit,
+        q.AcceptedAnswerId IS NOT NULL AS HasAcceptedAnswer
+    FROM Posts AS q
+    LEFT JOIN PostHistory AS pha ON q.Id = pha.PostId AND pha.PostHistoryTypeId IN (4,5,6) -- For distinct editors
+    LEFT JOIN PostHistory AS phc ON q.Id = phc.PostId -- For total history entries count
+    LEFT JOIN PostHistory AS ph ON q.Id = ph.PostId -- For EditCount (using different alias to avoid conflict)
+    LEFT JOIN PostLinks AS pl ON q.Id = pl.PostId
+    WHERE q.PostTypeId = 1 -- Focus exclusively on questions
+    GROUP BY
+        q.Id, q.OwnerUserId, q.Title, q.CreationDate, q.LastEditDate, q.LastActivityDate,
+        q.Score, q.ViewCount, q.AnswerCount, q.FavoriteCount, q.ClosedDate, q.Body, q.Tags, q.AcceptedAnswerId
+),
+CommentSentimentAndActivity AS (
+    -- Aggregates comment data per post, including total counts, average scores, and sentiment breakdown.
+    -- Uses a window function to rank comments within a post (though not used in final SELECT, demonstrates capability)
+    SELECT
+        c.PostId,
+        COUNT(c.Id) AS TotalComments,
+        AVG(c.Score) AS AvgCommentScore,
+        SUM(CASE WHEN c.Score > 0 THEN 1 ELSE 0 END) AS PositiveComments,
+        SUM(CASE WHEN c.Score < 0 THEN 1 ELSE 0 END) AS NegativeComments,
+        MAX(c.CreationDate) AS LatestCommentDate,
+        ROW_NUMBER() OVER (PARTITION BY c.PostId ORDER BY c.Score DESC, c.CreationDate DESC) AS CommentRankInPost
+    FROM Comments AS c
+    GROUP BY c.PostId
+),
+SpecialPosts AS (
+    -- Uses a UNION ALL set operator to categorize questions into 'Highly Engaged' vs. 'Problematic' based on various metrics.
+    -- This helps identify different types of posts for targeted analysis.
+    SELECT
+        pam.QuestionId,
+        pam.QuestionTitle,
+        'Highly Engaged & Valued' AS PostCategory,
+        pam.QuestionScore,
+        pam.FavoriteCount,
+        pam.EditCount,
+        pam.AnswerCount
+    FROM PostAggregatedMetrics pam
+    WHERE pam.QuestionScore >= 150
+      AND pam.FavoriteCount >= 30
+      AND pam.EditCount < 7
+      AND pam.AnswerCount >= 3
+    UNION ALL
+    SELECT
+        pam.QuestionId,
+        pam.QuestionTitle,
+        'Problematic/Needs Review' AS PostCategory,
+        pam.QuestionScore,
+        pam.FavoriteCount,
+        pam.EditCount,
+        pam.AnswerCount
+    FROM PostAggregatedMetrics pam
+    LEFT JOIN CommentSentimentAndActivity csa ON pam.QuestionId = csa.PostId
+    WHERE (pam.EditCount >= 10 OR pam.TotalHistoryEntries >= 20 OR pam.ClosedDate > pam.CreationDate)
+      AND pam.QuestionScore < 20
+      AND COALESCE(csa.TotalComments, 0) > 5 -- If it has comments but still low score/problematic history
+)
+-- Main Query: Joins all CTEs and applies final filtering, complex calculations, and string manipulations.
+SELECT
+    uss.UserId,
+    uss.UserDisplayName,
+    uss.Reputation,
+    uss.UserActivityLevel,
+    uss.TotalQuestions,
+    uss.AvgOwnedPostScore,
+    uss.AvgAnnualReputationGrowth,
+    pam.QuestionId,
+    pam.QuestionTitle,
+    pam.QuestionScore,
+    pam.ViewCount,
+    pam.AnswerCount,
+    pam.FavoriteCount,
+    pam.BodyLength,
+    pam.EditCount,
+    pam.WasReopened,
+    pam.RankByUserScore,
+    pam.MovingAvgScore,
+    pam.HoursUntilLastEdit,
+    pam.HasAcceptedAnswer,
+    COALESCE(csa.TotalComments, 0) AS QuestionTotalComments,
+    COALESCE(csa.AvgCommentScore, 0.0) AS QuestionAvgCommentScore,
+    COALESCE(csa.PositiveComments, 0) AS QuestionPositiveComments,
+    COALESCE(csa.NegativeComments, 0) AS QuestionNegativeComments,
+    -- Calculates days since the latest comment, defaulting to a large number if no comments
+    COALESCE(DATE_PART('day', NOW() - csa.LatestCommentDate), 9999) AS DaysSinceLastComment,
+    -- String expressions: Extracts and transforms parts of the title
+    LOWER(SUBSTRING(pam.QuestionTitle FROM 1 FOR 15)) AS TitlePrefixLower,
+    UPPER(REPLACE(REPLACE(pam.QuestionTitle, ' ', '-'), '.', '')) AS TitleDashCasedUpper,
+    -- Complex calculation: Derives a 'Question Quality Score' based on various weighted metrics
+    (pam.QuestionScore * 0.7) + (pam.ViewCount * 0.005) + (pam.AnswerCount * 1.5) + (pam.FavoriteCount * 2.5)
+    - (pam.EditCount * 0.5) - (CASE WHEN pam.WasReopened THEN 10 ELSE 0 END) AS QuestionQualityScore,
+    -- NULL logic and CASE WHEN for a detailed categorization of question status
+    CASE
+        WHEN pam.ClosedDate > pam.QuestionCreationDate AND pam.AcceptedAnswerId IS NULL THEN 'Closed & Unanswered'
+        WHEN pam.HasAcceptedAnswer AND pam.ClosedDate <= pam.QuestionCreationDate THEN 'Answered & Open'
+        WHEN pam.AnswerCount = 0 AND pam.QuestionCreationDate < (NOW() - INTERVAL '180 days') THEN 'Stale No-Answer'
+        WHEN pam.FavoriteCount >= 50 AND pam.Score >= 100 AND pam.HasAcceptedAnswer THEN 'Highly Valued & Resolved'
+        ELSE 'Regular/Needs Attention'
+    END AS DetailedQuestionStatus,
+    -- Aggregates tags into a comma-separated string, handling potential NULLs from UNNEST
+    (
+        SELECT STRING_AGG(t.TagName, ', ')
+        FROM UNNEST(pam.TagArray) AS tt(TagName)
+        LEFT JOIN Tags t ON tt.TagName = t.TagName
+        WHERE tt.TagName IS NOT NULL
+    ) AS QuestionTagsList,
+    -- Correlated subquery: Retrieves the latest comment text from the question's owner on their own post
+    (
+        SELECT c_owner.Text
+        FROM Comments c_owner
+        WHERE c_owner.PostId = pam.QuestionId AND c_owner.UserId = pam.OwnerUserId
+        ORDER BY c_owner.CreationDate DESC
+        LIMIT 1
+    ) AS LatestOwnerCommentText,
+    -- Joins with the SpecialPosts CTE to classify questions, defaulting to 'Standard' if not a special post
+    COALESCE(sp.PostCategory, 'Standard') AS SpecialPostCategory,
+    -- Correlated subquery: Checks if the question's owner has ever commented on their own question
+    EXISTS (
+        SELECT 1
+        FROM Comments co
+        WHERE co.PostId = pam.QuestionId AND co.UserId = uss.UserId
+    ) AS HasOwnerCommentedOnOwnQuestion
+FROM UserSummaryStats AS uss
+JOIN PostAggregatedMetrics AS pam ON uss.UserId = pam.OwnerUserId
+LEFT JOIN CommentSentimentAndActivity AS csa ON pam.QuestionId = csa.PostId
+LEFT JOIN SpecialPosts AS sp ON pam.QuestionId = sp.QuestionId -- Left join to include all questions
+WHERE
+    uss.Reputation >= 500 -- Filters for more established users
+    AND pam.QuestionScore >= 10 -- Filters for reasonably scored questions
+    AND pam.ViewCount > 50 -- Filters for questions with some visibility
+    AND pam.BodyLength BETWEEN 100 AND 5000 -- Filters for questions with reasonable body length
+    AND ( -- Complex predicate for identifying interesting questions
+        pam.WasReopened = TRUE
+        OR pam.EditCount > 3
+        OR (pam.DuplicateLinksCount > 0 AND pam.AnswerCount = 0) -- Is a duplicate, but no answers
+        OR COALESCE(csa.AvgCommentScore, 0) < 0 -- Negative average comment score
+    )
+    AND pam.TagArray IS NOT NULL -- Ensures questions have tags
+    AND COALESCE(sp.PostCategory, 'Standard') != 'Highly Engaged & Valued' -- Excludes highly engaged posts from this specific analysis focus
+ORDER BY
+    QuestionQualityScore DESC,
+    uss.Reputation DESC,
+    pam.ViewCount DESC,
+    QuestionTotalComments DESC,
+    uss.AvgAnnualReputationGrowth DESC
+LIMIT 5000;

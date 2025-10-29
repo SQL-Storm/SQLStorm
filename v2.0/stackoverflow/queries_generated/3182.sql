@@ -1,0 +1,134 @@
+-- {"query": "3182.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2383} 
+
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT b.Id)                         AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(u.LastAccessDate)                        AS LastSeen,
+        COALESCE(u.Location, 'Unknown')               AS Location
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.LastAccessDate, u.Location
+),
+
+PostMetrics AS (
+    SELECT 
+        p.OwnerUserId                                   AS UserId,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 1)        AS QuestionCount,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 2)        AS AnswerCount,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 1)    AS AvgQuestionScore,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 2)    AS AvgAnswerScore,
+        MAX(p.CreationDate)                            AS LastPostDate,
+        STRING_AGG(
+            DISTINCT TRIM(BOTH '<>' FROM UNNEST(string_to_array(p.Tags, '><'))),
+            ','
+        )                                               AS AllTags
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+
+TagInfo AS (
+    SELECT 
+        t.TagName,
+        t.Count       AS TagUsage,
+        COALESCE(e.Title, w.Title) AS TagTitle
+    FROM Tags t
+    LEFT JOIN Posts e ON e.Id = t.ExcerptPostId
+    LEFT JOIN Posts w ON w.Id = t.WikiPostId
+    WHERE t.IsModeratorOnly = 0
+),
+
+UserTagCross AS (
+    SELECT 
+        us.Id        AS UserId,
+        us.DisplayName,
+        UNNEST(string_to_array(pm.AllTags, ',')) AS TagName,
+        ROW_NUMBER() OVER (PARTITION BY us.Id ORDER BY pm.AnswerCount DESC) AS TagRank
+    FROM UserStats us
+    JOIN PostMetrics pm ON pm.UserId = us.Id
+    WHERE pm.AllTags IS NOT NULL
+),
+
+RecentVotes AS (
+    SELECT 
+        v.PostId,
+        v.VoteTypeId,
+        COUNT(*)               AS VoteCount,
+        MAX(v.CreationDate)    AS LastVoteDate
+    FROM Votes v
+    WHERE v.CreationDate >= CURRENT_DATE - INTERVAL '30 days'
+    GROUP BY v.PostId, v.VoteTypeId
+),
+
+Combined AS (
+    SELECT 
+        us.Id,
+        us.DisplayName,
+        us.Reputation,
+        us.BadgeCount,
+        us.GoldBadges,
+        us.SilverBadges,
+        us.BronzeBadges,
+        us.Location,
+        COALESCE(pm.QuestionCount,0)               AS QuestionCount,
+        COALESCE(pm.AnswerCount,0)                 AS AnswerCount,
+        ROUND(COALESCE(pm.AvgQuestionScore,0),2)   AS AvgQuestionScore,
+        ROUND(COALESCE(pm.AvgAnswerScore,0),2)     AS AvgAnswerScore,
+        pm.LastPostDate,
+        us.LastSeen,
+        CASE
+            WHEN us.Reputation > 20000 THEN 'Legendary'
+            WHEN us.Reputation > 10000 THEN 'Expert'
+            WHEN us.Reputation > 2000  THEN 'Contributor'
+            ELSE 'Novice'
+        END                                        AS ReputationTier,
+        rv.TotalVotes,
+        rv.LastVoteDate
+    FROM UserStats us
+    LEFT JOIN PostMetrics pm ON pm.UserId = us.Id
+    LEFT JOIN (
+        SELECT 
+            v.PostId,
+            SUM(v.VoteCount)      AS TotalVotes,
+            MAX(v.LastVoteDate)   AS LastVoteDate
+        FROM RecentVotes v
+        GROUP BY v.PostId
+    ) rv ON rv.PostId = pm.UserId   -- intentionally odd join to increase complexity
+)
+
+SELECT *
+FROM Combined
+WHERE ReputationTier <> 'Novice'
+  AND (QuestionCount + AnswerCount) > 10
+  AND COALESCE(BadgeCount,0) >= 1
+ORDER BY Reputation DESC NULLS LAST, BadgeCount DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT 
+    NULL AS Id,
+    'Aggregates' AS DisplayName,
+    NULL AS Reputation,
+    SUM(BadgeCount)               AS BadgeCount,
+    NULL AS GoldBadges,
+    NULL AS SilverBadges,
+    NULL AS BronzeBadges,
+    NULL AS Location,
+    SUM(QuestionCount)            AS QuestionCount,
+    SUM(AnswerCount)              AS AnswerCount,
+    NULL AS AvgQuestionScore,
+    NULL AS AvgAnswerScore,
+    MAX(LastPostDate)             AS LastPostDate,
+    MAX(LastSeen)                 AS LastSeen,
+    NULL AS ReputationTier,
+    NULL AS TotalVotes,
+    NULL AS LastVoteDate
+FROM Combined
+WHERE ReputationTier <> 'Novice';

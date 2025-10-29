@@ -1,0 +1,140 @@
+WITH recent_posts AS (
+  SELECT
+    p.Id,
+    p.PostTypeId,
+    p.Title,
+    p.Tags,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.ContentLicense,
+    p.ParentId,
+    p.AcceptedAnswerId
+  FROM Posts p
+  WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days'
+),
+tag_summary AS (
+  SELECT
+    unnest(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')) AS tag
+  FROM Posts p
+  JOIN recent_posts r ON p.Id = r.Id
+  WHERE p.Tags IS NOT NULL
+),
+tag_pop AS (
+  SELECT tag, COUNT(*) AS tag_count
+  FROM tag_summary
+  GROUP BY tag
+),
+top_tags AS (
+  SELECT tag
+  FROM tag_pop
+  ORDER BY tag_count DESC
+  LIMIT 20
+),
+top_related AS (
+  SELECT
+    rp.Id AS post_id,
+    rp.Title AS post_title,
+    rp.OwnerUserId,
+    rp.Score,
+    rp.LastActivityDate,
+    rp.Tags,
+    jsonb_agg(DISTINCT jsonb_build_object(
+      'Relation', lt.Name,
+      'RelatedPostId', pl.RelatedPostId
+    )) AS related_info
+  FROM recent_posts rp
+  LEFT JOIN PostLinks pl ON rp.Id = pl.PostId
+  LEFT JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+  WHERE pl.RelatedPostId IS NOT NULL
+  GROUP BY rp.Id, rp.Title, rp.OwnerUserId, rp.Score, rp.LastActivityDate, rp.Tags
+),
+enhanced AS (
+  SELECT
+    t.tag,
+    p.Id AS post_id,
+    p.Title,
+    p.OwnerUserId,
+    u.Reputation,
+    u.DisplayName,
+    v.Score AS vote_score,
+    v.VoteTypeId,
+    v.CreationDate AS vote_date,
+    b.Class AS badge_class,
+    b.Name AS badge_name,
+    b.Date AS badge_date
+  FROM top_tags t
+  LEFT JOIN Posts p ON p.Tags LIKE '%' || t.tag || '%'
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  WHERE p.Id IS NOT NULL
+)
+SELECT
+  p.Id AS post_id,
+  p.Title AS post_title,
+  p.OwnerUserId,
+  u.DisplayName AS owner_display_name,
+  u.Reputation,
+  p.CreationDate,
+  p.LastActivityDate,
+  p.Score,
+  p.ViewCount,
+  p.Tags,
+  p.CommentCount,
+  p.AnswerCount,
+  p.FavoriteCount,
+  (SELECT array_agg(DISTINCT t.tag)
+   FROM (
+     SELECT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')) AS tag
+   ) AS t
+  ) AS post_tags_extracted,
+  COALESCE(ht.PostHistoryTypeId, 'Unknown') AS last_history_type,
+  pl.RelatedPostId,
+  lt.Name AS link_type,
+  (SELECT COUNT(*) FROM Votes v2 WHERE v2.PostId = p.Id AND v2.VoteTypeId = 2) AS upvotes_today,
+  (SELECT COUNT(*) FROM Votes v3 WHERE v3.PostId = p.Id AND v3.VoteTypeId = 3) AS downvotes_today,
+  (SELECT jsonb_agg(DISTINCT jsonb_build_object('tag', t2.tag, 'cnt', t2.cnt))
+   FROM (
+     SELECT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')) AS tag, 1 AS cnt
+   ) t2
+  ) AS tag_summary_json
+FROM
+  recent_posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+  LEFT JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+  LEFT JOIN (
+    SELECT Id, PostHistoryTypeId, PostId, CreationDate, UserId, UserDisplayName, Text
+    FROM PostHistory
+    WHERE PostHistoryTypeId IN (1, 2, 4, 5, 6, 10)
+  ) ht ON p.Id = ht.PostId
+WHERE
+  p.Id IN (SELECT post_id FROM top_related)
+  OR p.Id IN (SELECT Id FROM recent_posts)
+GROUP BY
+  p.Id,
+  p.Title,
+  p.OwnerUserId,
+  u.DisplayName,
+  u.Reputation,
+  p.CreationDate,
+  p.LastActivityDate,
+  p.Score,
+  p.ViewCount,
+  p.Tags,
+  p.CommentCount,
+  p.AnswerCount,
+  p.FavoriteCount,
+  ht.PostHistoryTypeId,
+  pl.RelatedPostId,
+  lt.Name
+ORDER BY
+  p.LastActivityDate DESC,
+  p.Score DESC
+LIMIT 100;

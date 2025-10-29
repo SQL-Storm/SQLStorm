@@ -1,0 +1,190 @@
+-- {"query": "7167.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2046} 
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.CreationDate DESC) as RecentPostRank,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Elite'
+            WHEN u.Reputation > 5000 THEN 'Advanced'
+            WHEN u.Reputation > 1000 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as ReputationLevel,
+        IIF(u.WebsiteUrl IS NOT NULL AND u.WebsiteUrl != '', 1, 0) as HasWebsite,
+        IIF(u.Location IS NOT NULL AND u.Location != '', 1, 0) as HasLocation,
+        IIF(u.AboutMe IS NOT NULL AND LEN(u.AboutMe) > 100, 1, 0) as HasDetailedProfile,
+        ABS(u.UpVotes - u.DownVotes) as NetVotes
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate > '2010-01-01' 
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.WebsiteUrl, u.Location, u.AboutMe
+),
+RankedUsers AS (
+    SELECT 
+        *,
+        RANK() OVER (ORDER BY Reputation DESC) as ReputationRank,
+        DENSE_RANK() OVER (ORDER BY PostCount DESC) as PostRank,
+        DENSE_RANK() OVER (ORDER BY BadgeCount DESC) as BadgeRank
+    FROM UserStats
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags != '' THEN 
+                (SELECT COUNT(*) FROM STRING_SPLIT(SUBSTRING(p.Tags, 2, LEN(p.Tags) - 2), '><'))
+            ELSE 0
+        END as TagCount,
+        CASE 
+            WHEN p.Score >= 100 THEN 'High'
+            WHEN p.Score >= 10 THEN 'Medium'
+            ELSE 'Low'
+        END as ScoreLevel,
+        CASE 
+            WHEN p.ParentId IS NOT NULL THEN 'Answer'
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            ELSE 'Other'
+        END as PostCategory,
+        IIF(p.ClosedDate IS NOT NULL, 1, 0) as IsClosed,
+        IIF(p.CommunityOwnedDate IS NOT NULL, 1, 0) as IsCommunityOwned,
+        DATEDIFF(day, p.CreationDate, GETDATE()) as DaysSinceCreation,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as UserPostRank,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PreviousScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as UserAverageScore
+    FROM Posts p
+    WHERE p.CreationDate > '2015-01-01'
+),
+UserPostStats AS (
+    SELECT 
+        pu.UserId,
+        COUNT(*) as TotalPosts,
+        SUM(CASE WHEN pa.PostCategory = 'Question' THEN 1 ELSE 0 END) as QuestionCount,
+        SUM(CASE WHEN pa.PostCategory = 'Answer' THEN 1 ELSE 0 END) as AnswerCount,
+        AVG(pa.Score) as AverageScore,
+        MAX(pa.Score) as MaxScore,
+        AVG(pa.ViewCount) as AverageViews,
+        COUNT(DISTINCT pa.TagCount) as UniqueTagCount,
+        SUM(CASE WHEN pa.IsClosed = 1 THEN 1 ELSE 0 END) as ClosedPosts,
+        SUM(CASE WHEN pa.IsCommunityOwned = 1 THEN 1 ELSE 0 END) as CommunityOwnedPosts
+    FROM RankedUsers pu
+    INNER JOIN PostAnalysis pa ON pu.UserId = pa.OwnerUserId
+    GROUP BY pu.UserId
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count >= 1000 THEN 'Popular'
+            WHEN t.Count >= 100 THEN 'Moderate'
+            ELSE 'Niche'
+        END as PopularityLevel,
+        IIF(t.IsRequired = 1, 'Required', 'Optional') as TagType,
+        IIF(t.IsModeratorOnly = 1, 'Moderator Only', 'Public') as AccessLevel
+    FROM Tags t
+    WHERE t.Count > 0
+),
+CombinedAnalysis AS (
+    SELECT 
+        ru.UserId,
+        ru.DisplayName,
+        ru.Reputation,
+        ru.PostCount,
+        ru.CommentCount,
+        ru.BadgeCount,
+        ups.TotalPosts,
+        ups.QuestionCount,
+        ups.AnswerCount,
+        ups.AverageScore,
+        ups.MaxScore,
+        ups.AverageViews,
+        ups.UniqueTagCount,
+        ups.ClosedPosts,
+        ups.CommunityOwnedPosts,
+        COALESCE(pa.Title, 'No Recent Post') as RecentPostTitle,
+        COALESCE(pa.PostCategory, 'None') as RecentPostCategory,
+        COALESCE(pa.Score, 0) as RecentPostScore,
+        COALESCE(pa.DaysSinceCreation, 0) as DaysSinceRecentPost,
+        COALESCE(pa.TagCount, 0) as RecentPostTagCount,
+        COALESCE(pa.ScoreLevel, 'Unknown') as RecentPostScoreLevel,
+        CASE 
+            WHEN ru.Reputation > 10000 AND ups.QuestionCount > 50 
+            THEN 'Expert'
+            WHEN ru.Reputation > 5000 AND ups.QuestionCount > 20
+            THEN 'Advanced'
+            WHEN ru.Reputation > 1000 AND ups.QuestionCount > 5
+            THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as UserExpertiseLevel,
+        COALESCE(ta.TagName, 'No Popular Tags') as PopularTag,
+        COALESCE(ta.PopularityLevel, 'Unknown') as PopularTagPopularity,
+        CASE 
+            WHEN COALESCE(pa.Score, 0) > COALESCE(ups.AverageScore, 0) THEN 'Above Average'
+            WHEN COALESCE(pa.Score, 0) < COALESCE(ups.AverageScore, 0) THEN 'Below Average'
+            ELSE 'Average'
+        END as PerformanceVsAverage
+    FROM RankedUsers ru
+    LEFT JOIN UserPostStats ups ON ru.UserId = ups.UserId
+    LEFT JOIN PostAnalysis pa ON ru.UserId = pa.OwnerUserId AND pa.UserPostRank = 1
+    LEFT JOIN TagAnalysis ta ON ta.Count = (SELECT MAX(Count) FROM Tags)
+    WHERE ru.Reputation > 1000 AND ru.PostCount > 0
+)
+SELECT 
+    COUNT(*) as TotalUsers,
+    AVG(Reputation) as AverageReputation,
+    AVG(PostCount) as AveragePostCount,
+    AVG(QuestionCount) as AverageQuestionCount,
+    AVG(AnswerCount) as AverageAnswerCount,
+    AVG(AverageScore) as AveragePostScore,
+    AVG(AverageViews) as AverageViews,
+    COUNT(DISTINCT CASE WHEN UserExpertiseLevel = 'Expert' THEN UserId END) as ExpertCount,
+    COUNT(DISTINCT CASE WHEN UserExpertiseLevel = 'Advanced' THEN UserId END) as AdvancedCount,
+    COUNT(DISTINCT CASE WHEN UserExpertiseLevel = 'Intermediate' THEN UserId END) as IntermediateCount,
+    COUNT(DISTINCT CASE WHEN UserExpertiseLevel = 'Beginner' THEN UserId END) as BeginnerCount,
+    MAX(Reputation) as MaxReputation,
+    MIN(Reputation) as MinReputation,
+    STRING_AGG(DisplayName, '; ') as UserList,
+        CASE 
+            WHEN AVG(AverageScore) > 20 THEN 'High Performing'
+            WHEN AVG(AverageScore) > 10 THEN 'Moderate Performing'
+            ELSE 'Low Performing'
+        END as PerformanceTier,
+    COUNT(DISTINCT CASE WHEN RecentPostScoreLevel = 'High' THEN UserId END) as HighScorePostCount,
+    COUNT(DISTINCT CASE WHEN RecentPostScoreLevel = 'Medium' THEN UserId END) as MediumScorePostCount,
+    COUNT(DISTINCT CASE WHEN RecentPostScoreLevel = 'Low' THEN UserId END) as LowScorePostCount,
+    SUM(CASE WHEN IsClosed = 1 THEN 1 ELSE 0 END) as TotalClosedPosts,
+    SUM(CASE WHEN IsCommunityOwned = 1 THEN 1 ELSE 0 END) as TotalCommunityOwnedPosts,
+    STRING_AGG(
+        CASE WHEN PerformanceVsAverage = 'Above Average' THEN DisplayName ELSE NULL END, 
+        '; '
+    ) as AboveAveragePerformers,
+    STRING_AGG(
+        CASE WHEN PerformanceVsAverage = 'Below Average' THEN DisplayName ELSE NULL END, 
+        '; '
+    ) as BelowAveragePerformers
+FROM CombinedAnalysis 
+WHERE RecentPostScore IS NOT NULL
+HAVING COUNT(*) > 0
+ORDER BY AverageReputation DESC
+OPTION (MAXDOP 1);

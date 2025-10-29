@@ -1,0 +1,226 @@
+-- {"query": "1326.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3586} 
+WITH UserEngagementSummary AS (
+    -- CTE 1: Aggregates user-level metrics including post counts, comment counts, badges,
+    -- total upvotes/downvotes received on their posts, average post score, and activity dates.
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT p_all.Id) AS TotalPostsByOwner,
+        COUNT(DISTINCT c.Id) AS TotalCommentsByOwner,
+        COUNT(DISTINCT b.Id) AS TotalBadgesEarned,
+        SUM(CASE WHEN vt_up.Name = 'UpMod' THEN 1 ELSE 0 END) AS TotalUpvotesReceivedOnPosts,
+        SUM(CASE WHEN vt_down.Name = 'DownMod' THEN 1 ELSE 0 END) AS TotalDownvotesReceivedOnPosts,
+        AVG(p_all.Score) FILTER (WHERE p_all.PostTypeId IN (1, 2)) AS AverageContentPostScore,
+        MIN(p_all.CreationDate) AS FirstPostDate,
+        MAX(COALESCE(p_all.LastActivityDate, p_all.CreationDate)) AS LatestUserPostActivityDate,
+        (u.UpVotes - u.DownVotes) AS UserNetVotesGiven, -- Total votes user *gave*
+        u.Views AS UserProfileViews
+    FROM Users u
+    LEFT JOIN Posts p_all ON u.Id = p_all.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v_on_posts ON p_all.Id = v_on_posts.PostId AND v_on_posts.VoteTypeId IN (2, 3) -- UpMod, DownMod received on posts
+    LEFT JOIN VoteTypes vt_up ON v_on_posts.VoteTypeId = vt_up.Id AND vt_up.Name = 'UpMod'
+    LEFT JOIN VoteTypes vt_down ON v_on_posts.VoteTypeId = vt_down.Id AND vt_down.Name = 'DownMod'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.UpVotes, u.DownVotes, u.Views
+),
+PostDetailsAndRanks AS (
+    -- CTE 2: Provides detailed post metrics, including subqueries for related post scores,
+    -- distinct editors, and window functions for ranking posts and analyzing creation date gaps.
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.Title,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount, -- Handle NULL for AnswerCount on non-questions
+        COALESCE(p.CommentCount, 0) AS PostCommentCount,
+        p.OwnerUserId,
+        p.Tags,
+        COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+        -- Correlated subquery: Get average score of answers for a question, or NULL if not a question/no answers
+        (
+            SELECT AVG(ans.Score)
+            FROM Posts ans
+            WHERE ans.ParentId = p.Id AND ans.PostTypeId = 2
+        ) AS AvgAnswerScoreForQuestion,
+        -- Correlated subquery: Count distinct users who edited this post
+        (
+            SELECT COUNT(DISTINCT ph.UserId)
+            FROM PostHistory ph
+            WHERE ph.PostId = p.Id
+              AND ph.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+              AND ph.UserId IS NOT NULL
+        ) AS DistinctEditorsCount,
+        COALESCE(p.AcceptedAnswerId IS NOT NULL, FALSE) AS HasAcceptedAnswer,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'CommunityOwned'
+            WHEN p.ViewCount > 5000 AND COALESCE(p.AnswerCount, 0) = 0 AND p.PostTypeId = 1 THEN 'HighTrafficNoAnswer'
+            WHEN p.Body LIKE '%security%' AND p.Score < 0 THEN 'SecurityConcernNegativeScore'
+            WHEN p.OwnerUserId IS NULL AND p.LastEditorUserId IS NOT NULL THEN 'CommunityEditedNoOwner'
+            ELSE 'Normal'
+        END AS PostStatusFlag,
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.CreationDate DESC) AS PostScoreRankPerType,
+        LAG(p.CreationDate, 1, p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevPostCreationDateByOwner,
+        DATE_PART('day', p.CreationDate - LAG(p.CreationDate, 1, p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate)) AS DaysSincePrevPostByOwner,
+        ARRAY_LENGTH(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><'), 1) AS TagCountAlternative -- Using string_to_array for robustness
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.PostTypeId IN (1, 2, 4, 5) -- Questions, Answers, TagWikiExcerpt, TagWiki
+),
+TagUsageAndPerformance AS (
+    -- CTE 3: Aggregates tag performance metrics, including average scores and view counts for questions associated with tags.
+    SELECT
+        t.TagName,
+        COUNT(DISTINCT p.Id) AS TotalTaggedQuestions,
+        AVG(p.Score) AS AvgScoreOfTaggedQuestions,
+        AVG(p.AnswerCount) AS AvgAnswerCountOfTaggedQuestions,
+        SUM(p.ViewCount) AS TotalViewCountForTag,
+        DENSE_RANK() OVER (ORDER BY SUM(p.ViewCount) DESC, COUNT(DISTINCT p.Id) DESC) AS TagPopularityRankByViews
+    FROM Tags t
+    -- Use LIKE for tag matching which can be performance intensive but demonstrates string ops
+    JOIN Posts p ON p.PostTypeId = 1 AND p.Tags LIKE '%' || t.TagName || '%'
+    GROUP BY t.TagName
+    HAVING COUNT(DISTINCT p.Id) >= 10 -- Only consider tags used in at least 10 questions
+),
+PostsWithRecentActivity AS (
+    -- CTE 4: Identifies posts that have received recent upvotes, indicating trending topics.
+    SELECT
+        v.PostId,
+        COUNT(v.Id) AS RecentUpvoteCount,
+        MAX(v.CreationDate) AS LastRecentUpvoteDate,
+        ROW_NUMBER() OVER (ORDER BY COUNT(v.Id) DESC, MAX(v.CreationDate) DESC) AS RecentUpvoteRank
+    FROM Votes v
+    JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    WHERE vt.Name = 'UpMod'
+      AND v.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '60 days' -- Activity within the last 60 days
+    GROUP BY v.PostId
+    HAVING COUNT(v.Id) >= 5 -- Posts with at least 5 recent upvotes
+),
+ProblematicPosts AS (
+    -- CTE 5: Identifies posts with significant or unusual history (multiple closes, deleted/undeleted events).
+    SELECT
+        ph.PostId,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 END) AS CloseCount,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 END) AS ReopenCount,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 12 THEN 1 END) AS DeleteCount,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 13 THEN 1 END) AS UndeleteCount,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN phc.Name ELSE NULL END) AS LastCloseReasonName -- Using CloseReasonTypes
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes phc ON ph.PostHistoryTypeId = 10 AND ph.Comment = phc.Id::text
+    WHERE ph.PostHistoryTypeId IN (10, 11, 12, 13)
+    GROUP BY ph.PostId
+    HAVING COUNT(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 END) > 1 -- Closed more than once
+        OR (COUNT(CASE WHEN ph.PostHistoryTypeId = 12 THEN 1 END) > 0 AND COUNT(CASE WHEN ph.PostHistoryTypeId = 13 THEN 1 END) > 0) -- Deleted and undeleted
+),
+UsersWhoCommentedButNotAnswered AS (
+    -- CTE 6: Demonstrates a set operator (EXCEPT) to find users who have commented but never posted an answer.
+    SELECT c.UserId
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+    EXCEPT
+    SELECT p.OwnerUserId
+    FROM Posts p
+    WHERE p.PostTypeId = 2 AND p.OwnerUserId IS NOT NULL
+)
+-- Main query to combine all insights, apply complex filtering, calculations, and string manipulation.
+SELECT
+    ues.UserId,
+    ues.DisplayName,
+    ues.Reputation,
+    ues.TotalPostsByOwner,
+    ues.TotalCommentsByOwner,
+    ues.TotalBadgesEarned,
+    COALESCE(ues.AverageContentPostScore, 0.0) AS AverageContentPostScore,
+    ues.FirstPostDate,
+    ues.LatestUserPostActivityDate,
+    pdar.PostId,
+    pdar.PostTypeName,
+    pdar.Title,
+    pdar.PostCreationDate,
+    pdar.PostScore,
+    pdar.ViewCount,
+    pdar.AnswerCount,
+    pdar.PostCommentCount,
+    pdar.AvgAnswerScoreForQuestion,
+    pdar.DistinctEditorsCount,
+    pdar.HasAcceptedAnswer,
+    pdar.PostStatusFlag,
+    pdar.PostScoreRankPerType,
+    pdar.DaysSincePrevPostByOwner,
+    pdar.TagCountAlternative AS PostTagCount,
+    tup.TagName AS TopAssociatedTagName,
+    tup.AvgScoreOfTaggedQuestions AS TopTagAvgScore,
+    pr.RecentUpvoteCount,
+    pr.LastRecentUpvoteDate,
+    pp.CloseCount AS PostCloseEvents,
+    pp.ReopenCount AS PostReopenEvents,
+    pp.LastCloseReasonName,
+    -- Complicated calculation: "User Impact Score"
+    (ues.TotalUpvotesReceivedOnPosts * 0.7 + ues.TotalBadgesEarned * 1.5 + ues.UserProfileViews * 0.01 - ues.TotalDownvotesReceivedOnPosts * 0.5) AS UserImpactScore,
+    -- String expression: Truncated Post Title (handling NULL)
+    COALESCE(UPPER(SUBSTRING(TRIM(pdar.Title), 1, 30)) || CASE WHEN LENGTH(TRIM(pdar.Title)) > 30 THEN '...' ELSE '' END, 'NO_TITLE') AS TruncatedPostTitleUpper,
+    -- Null logic for identifying users who commented but never posted an answer
+    CASE WHEN uwnca.UserId IS NOT NULL THEN 'CommenterOnly' ELSE 'MixedContributor' END AS ContributionType,
+    (SELECT COUNT(DISTINCT p_acc.Id) FROM Posts p_acc WHERE p_acc.OwnerUserId = ues.UserId AND p_acc.AcceptedAnswerId IS NOT NULL) AS UserAcceptedAnswerCount,
+    -- Correlated subquery: Get the display name of the last editor from PostHistory
+    (
+        SELECT ph_last.UserDisplayName
+        FROM PostHistory ph_last
+        WHERE ph_last.PostId = pdar.PostId
+          AND ph_last.PostHistoryTypeId IN (4, 5, 6) -- Edit types
+          AND ph_last.UserDisplayName IS NOT NULL
+        ORDER BY ph_last.CreationDate DESC
+        LIMIT 1
+    ) AS LastEditorDisplayNameForPost,
+    -- Calculate a "Content Freshness Score" in days
+    EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - pdar.PostCreationDate)) / (60 * 60 * 24) AS DaysSincePostCreation,
+    NULLIF(ues.UserProfileViews, 0) AS UserProfileViewsIfAny, -- Return NULL if views are 0
+    COALESCE(link_q.Id IS NOT NULL, FALSE) AS HasLinkedQuestions,
+    COALESCE(link_d.Id IS NOT NULL, FALSE) AS HasDuplicateQuestions
+FROM UserEngagementSummary ues
+LEFT JOIN PostDetailsAndRanks pdar ON ues.UserId = pdar.OwnerUserId
+LEFT JOIN PostsWithRecentActivity pr ON pdar.PostId = pr.PostId
+LEFT JOIN ProblematicPosts pp ON pdar.PostId = pp.PostId
+LEFT JOIN TagUsageAndPerformance tup ON pdar.Tags LIKE '%' || tup.TagName || '%' -- Join post to a top tag
+                                    AND tup.TagPopularityRankByViews <= 5 -- Only consider top 5 popular tags
+LEFT JOIN UsersWhoCommentedButNotAnswered uwnca ON ues.UserId = uwnca.UserId
+LEFT JOIN PostLinks link_q ON pdar.PostId = link_q.PostId AND link_q.LinkTypeId = 1 -- Linked questions
+LEFT JOIN PostLinks link_d ON pdar.PostId = link_d.PostId AND link_d.LinkTypeId = 3 -- Duplicate questions
+WHERE
+    ues.Reputation >= 5000 -- Minimum reputation for "impactful" users
+    AND pdar.PostScore >= 0 -- Filter out heavily downvoted posts
+    AND pdar.ViewCount >= 500 -- Minimum view count for relevance
+    AND (pdar.PostStatusFlag = 'Normal' OR pdar.PostStatusFlag = 'HighTrafficNoAnswer' OR pdar.PostStatusFlag = 'CommunityEditedNoOwner') -- Focus on open/active posts
+    AND pdar.DaysSincePrevPostByOwner IS NOT NULL -- Exclude first posts for this metric
+    AND EXISTS ( -- Correlated EXISTS subquery for posts with comments from *other* users
+        SELECT 1
+        FROM Comments c_exist
+        WHERE c_exist.PostId = pdar.PostId
+          AND c_exist.UserId IS NOT NULL
+          AND c_exist.UserId <> pdar.OwnerUserId
+    )
+    -- More complex predicate on user string info using CASE for different filtering based on display name
+    AND (
+        CASE
+            WHEN ues.DisplayName LIKE 'StackOverflow%' THEN TRUE -- Allow SO team members
+            WHEN ues.DisplayName IS NOT NULL AND LENGTH(TRIM(ues.DisplayName)) > 2 AND ues.DisplayName NOT LIKE 'anon%' THEN TRUE
+            ELSE FALSE
+        END
+    )
+    -- Combined condition using OR for different types of user impact
+    AND (ues.TotalBadgesEarned >= 10 OR ues.UserImpactScore >= 500 OR pr.RecentUpvoteCount >= 10)
+    -- Further filter based on tag performance (users involved in highly viewed tags)
+    AND (tup.TotalViewCountForTag IS NULL OR tup.TotalViewCountForTag > 100000)
+ORDER BY
+    ues.UserImpactScore DESC,
+    pdar.PostScore DESC,
+    pr.RecentUpvoteCount DESC,
+    pdar.PostCreationDate DESC
+LIMIT 2000;

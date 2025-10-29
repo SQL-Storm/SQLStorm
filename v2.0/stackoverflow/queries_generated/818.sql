@@ -1,0 +1,296 @@
+-- {"query": "818.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2940} 
+with recent_questions as (
+  select
+    p.Id as QuestionId,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.Title,
+    p.Tags,
+    p.AcceptedAnswerId,
+    coalesce(p.AnswerCount, 0) as AnswerCount
+  from Posts p
+  where p.PostTypeId = 1
+    and p.CreationDate >= (select date_trunc('month', max(CreationDate)) - interval '12 months' from Posts where PostTypeId = 1)
+),
+answers as (
+  select
+    a.Id as AnswerId,
+    a.ParentId as QuestionId,
+    a.OwnerUserId,
+    a.Score as AnswerScore,
+    a.CreationDate as AnswerCreation
+  from Posts a
+  where a.PostTypeId = 2
+),
+question_activity as (
+  select
+    q.QuestionId,
+    count(distinct c.Id) filter (where c.Id is not null) as CommentCount,
+    count(distinct v.Id) filter (where v.Id is not null and v.VoteTypeId = 2) as UpVotes,
+    count(distinct v.Id) filter (where v.Id is not null and v.VoteTypeId = 3) as DownVotes,
+    count(distinct v.Id) filter (where v.Id is not null and v.VoteTypeId in (8,9)) as BountyVotes,
+    max(v.CreationDate) as LastVoteAt,
+    max(c.CreationDate) as LastCommentAt
+  from recent_questions q
+  left join Comments c on c.PostId = q.QuestionId
+  left join Votes v on v.PostId = q.QuestionId
+  group by q.QuestionId
+),
+first_answer as (
+  select distinct on (a.QuestionId)
+    a.QuestionId,
+    a.AnswerId,
+    a.OwnerUserId as FirstAnswerUserId,
+    a.AnswerCreation as FirstAnswerAt,
+    a.AnswerScore as FirstAnswerScore
+  from answers a
+  inner join recent_questions q on q.QuestionId = a.QuestionId
+  order by a.QuestionId, a.AnswerCreation asc, a.AnswerId asc
+),
+user_quality as (
+  select
+    u.Id as UserId,
+    u.Reputation,
+    u.CreationDate,
+    u.UpVotes,
+    u.DownVotes,
+    u.Views,
+    sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+    sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+    sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+    count(b.Id) as TotalBadges,
+    percentile_disc(0.5) within group (order by coalesce(p.Score, 0)) as MedianPostScore
+  from Users u
+  left join Badges b on b.UserId = u.Id
+  left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId in (1,2)
+  group by u.Id, u.Reputation, u.CreationDate, u.UpVotes, u.DownVotes, u.Views
+),
+linkage as (
+  select
+    q.QuestionId,
+    count(*) filter (where pl.LinkTypeId = 1) as LinkedCount,
+    count(*) filter (where pl.LinkTypeId = 3) as DuplicateMarks,
+    bool_or(pl.LinkTypeId = 3) as IsMarkedDuplicate
+  from recent_questions q
+  left join PostLinks pl on pl.PostId = q.QuestionId
+  group by q.QuestionId
+),
+close_reasons as (
+  select
+    ph.PostId as QuestionId,
+    max(ph.CreationDate) as LastCloseEventAt,
+    max(case
+          when ph.PostHistoryTypeId = 10 then ph.Comment
+          when ph.PostHistoryTypeId = 35 then 'migrated_away'
+          when ph.PostHistoryTypeId = 36 then 'migrated_here'
+        end) as LastCloseReasonRaw,
+    sum(case when ph.PostHistoryTypeId = 10 then 1 else 0 end) as CloseEvents
+  from PostHistory ph
+  join recent_questions q on q.QuestionId = ph.PostId
+  where ph.PostHistoryTypeId in (10,35,36)
+  group by ph.PostId
+),
+dup_target_titles as (
+  select
+    pl.PostId as QuestionId,
+    string_agg(distinct coalesce(dp.Title, '[missing]'), ' | ') as DuplicateTargetTitles
+  from PostLinks pl
+  left join Posts dp on dp.Id = pl.RelatedPostId
+  where pl.LinkTypeId = 3
+  group by pl.PostId
+),
+tag_expansion as (
+  select
+    q.QuestionId,
+    unnest(string_to_array(substring(coalesce(q.Tags, ''), 2, greatest(length(coalesce(q.Tags,'')) - 2, 0)), '><')) as tag
+  from recent_questions q
+),
+tag_stats as (
+  select
+    t.QuestionId,
+    count(*) as TagCount,
+    string_agg(t.tag, ',' order by t.tag) as TagList,
+    sum(case when tg.IsModeratorOnly = 1 then 1 else 0 end) as ModOnlyTagCount,
+    sum(case when tg.IsRequired = 1 then 1 else 0 end) as RequiredTagCount
+  from tag_expansion t
+  left join Tags tg on tg.TagName = t.tag
+  group by t.QuestionId
+),
+answer_rankings as (
+  select
+    a.QuestionId,
+    a.AnswerId,
+    a.OwnerUserId,
+    a.AnswerScore,
+    a.AnswerCreation,
+    row_number() over (partition by a.QuestionId order by a.AnswerScore desc nulls last, a.AnswerCreation asc, a.AnswerId) as rn_by_score,
+    rank() over (partition by a.QuestionId order by a.AnswerCreation asc) as rank_by_time
+  from answers a
+  join recent_questions q on q.QuestionId = a.QuestionId
+),
+accepted_vs_top as (
+  select
+    q.QuestionId,
+    case when q.AcceptedAnswerId is null then 0 else 1 end as HasAccepted,
+    case when q.AcceptedAnswerId is not null and at.rn_by_score = 1 then 1 else 0 end as AcceptedIsTopByScore,
+    max(case when at.rn_by_score = 1 then at.AnswerId end) as TopScoreAnswerId,
+    max(case when at.rank_by_time = 1 then at.AnswerId end) as FirstAnswerId
+  from recent_questions q
+  left join answer_rankings at on at.QuestionId = q.QuestionId
+  group by q.QuestionId, q.AcceptedAnswerId
+),
+owner_effect as (
+  select
+    q.QuestionId,
+    uo.UserId as OwnerId,
+    uo.Reputation as OwnerRep,
+    uo.TotalBadges as OwnerBadges,
+    uo.GoldBadges as OwnerGold,
+    uo.SilverBadges as OwnerSilver,
+    uo.BronzeBadges as OwnerBronze,
+    coalesce(nullif(trim(split_part(coalesce(usr.Location,''), ',', 1)),''), '[unknown]') as OwnerRegion
+  from recent_questions q
+  left join user_quality uo on uo.UserId = q.OwnerUserId
+  left join Users usr on usr.Id = q.OwnerUserId
+),
+first_answerer_effect as (
+  select
+    q.QuestionId,
+    fa.FirstAnswerUserId,
+    uq.Reputation as FirstAnsRep,
+    uq.TotalBadges as FirstAnsBadges
+  from first_answer fa
+  right join recent_questions q on q.QuestionId = fa.QuestionId
+  left join user_quality uq on uq.UserId = fa.FirstAnswerUserId
+),
+question_scores as (
+  select
+    q.QuestionId,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    q.AnswerCount,
+    qa.UpVotes,
+    qa.DownVotes,
+    qa.CommentCount,
+    qa.BountyVotes,
+    greatest(coalesce(qa.UpVotes,0) - coalesce(qa.DownVotes,0), 0) as NetVotesPos,
+    case when q.ViewCount is null or q.ViewCount = 0 then null else round((q.Score::numeric / nullif(q.ViewCount,0))::numeric, 6) end as ScorePerView
+  from recent_questions q
+  left join question_activity qa on qa.QuestionId = q.QuestionId
+),
+quarterly as (
+  select
+    q.QuestionId,
+    to_char(q.CreationDate, 'YYYY-"Q"Q') as YearQuarter
+  from recent_questions q
+),
+rolling_stats as (
+  select
+    qs.QuestionId,
+    avg(qs.Score) over (partition by qt.YearQuarter) as AvgScoreQuarter,
+    percentile_cont(0.9) within group (order by qs.ViewCount) over (partition by qt.YearQuarter) as P90ViewsQuarter
+  from question_scores qs
+  join quarterly qt on qt.QuestionId = qs.QuestionId
+),
+cte_union as (
+  select QuestionId from recent_questions
+  union
+  select distinct PostId from Comments
+),
+complex_predicates as (
+  select
+    q.QuestionId,
+    case
+      when coalesce(q.Score, 0) >= 5
+        and (coalesce(ts.TagCount,0) between 2 and 5)
+        and not coalesce(lk.IsMarkedDuplicate, false)
+      then 1 else 0
+    end as LikelyHealthy,
+    case when cr.CloseEvents > 0 and cr.LastCloseEventAt > q.CreationDate then 1 else 0 end as HadCloseAfterCreation,
+    case when q.AnswerCount > 0 and fa.FirstAnswerAt is not null then 1 else 0 end as GotAnswersQuickly
+  from recent_questions q
+  left join tag_stats ts on ts.QuestionId = q.QuestionId
+  left join linkage lk on lk.QuestionId = q.QuestionId
+  left join close_reasons cr on cr.QuestionId = q.QuestionId
+  left join first_answer fa on fa.QuestionId = q.QuestionId
+)
+select
+  q.QuestionId,
+  q.Title,
+  qs.Score,
+  qs.ViewCount,
+  qs.AnswerCount,
+  qs.UpVotes,
+  qs.DownVotes,
+  qs.CommentCount,
+  qs.BountyVotes,
+  qs.NetVotesPos,
+  qs.ScorePerView,
+  rs.AvgScoreQuarter,
+  rs.P90ViewsQuarter,
+  ts.TagCount,
+  ts.TagList,
+  ts.ModOnlyTagCount,
+  ts.RequiredTagCount,
+  lk.LinkedCount,
+  lk.DuplicateMarks,
+  coalesce(dt.DuplicateTargetTitles, '') as DuplicateTargetTitles,
+  cr.LastCloseEventAt,
+  cr.LastCloseReasonRaw,
+  cr.CloseEvents,
+  avs.HasAccepted,
+  avs.AcceptedIsTopByScore,
+  avs.TopScoreAnswerId,
+  avs.FirstAnswerId,
+  oe.OwnerId,
+  oe.OwnerRep,
+  oe.OwnerBadges,
+  oe.OwnerGold,
+  oe.OwnerSilver,
+  oe.OwnerBronze,
+  oe.OwnerRegion,
+  fae.FirstAnswerUserId,
+  fae.FirstAnsRep,
+  fae.FirstAnsBadges,
+  cp.LikelyHealthy,
+  cp.HadCloseAfterCreation,
+  cp.GotAnswersQuickly,
+  case
+    when q.Tags is null then 'untagged'
+    when position('java' in lower(q.Tags)) > 0 then 'lang:java'
+    when position('python' in lower(q.Tags)) > 0 then 'lang:python'
+    when position('javascript' in lower(q.Tags)) > 0 then 'lang:javascript'
+    else 'lang:other'
+  end as LangBucket,
+  coalesce(nullif(trim(q.Title), ''), '[no title]') as SafeTitle,
+  coalesce(nullif(trim(regexp_replace(q.Title, '\s+', ' ', 'g')), ''), '[no title]') as NormalizedTitle,
+  case when q.AcceptedAnswerId is null then 'no' else 'yes' end as HasAcceptedAnswer,
+  extract(epoch from (now() - q.CreationDate))::bigint as AgeSeconds,
+  to_char(q.CreationDate, 'YYYY-MM-DD"T"HH24:MI:SS') as CreatedIso
+from recent_questions q
+join cte_union cu on cu.QuestionId = q.QuestionId
+left join question_scores qs on qs.QuestionId = q.QuestionId
+left join rolling_stats rs on rs.QuestionId = q.QuestionId
+left join tag_stats ts on ts.QuestionId = q.QuestionId
+left join linkage lk on lk.QuestionId = q.QuestionId
+left join dup_target_titles dt on dt.QuestionId = q.QuestionId
+left join close_reasons cr on cr.QuestionId = q.QuestionId
+left join accepted_vs_top avs on avs.QuestionId = q.QuestionId
+left join owner_effect oe on oe.QuestionId = q.QuestionId
+left join first_answerer_effect fae on fae.QuestionId = q.QuestionId
+left join complex_predicates cp on cp.QuestionId = q.QuestionId
+where (
+    q.Score >= 0
+    or (lk.IsMarkedDuplicate = true and cr.CloseEvents > 0)
+    or (ts.ModOnlyTagCount > 0 and qs.ViewCount > coalesce(rs.P90ViewsQuarter, 0))
+  )
+  and (q.OwnerUserId is null or oe.OwnerRep is not null or oe.OwnerBadges is not null)
+order by
+  coalesce(qs.ScorePerView, -1) desc nulls last,
+  qs.NetVotesPos desc,
+  qs.ViewCount desc,
+  q.QuestionId
+limit 500;

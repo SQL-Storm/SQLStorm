@@ -1,0 +1,331 @@
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        u.location,
+        coalesce(nullif(trim(u.websiteurl), ''), 'N/A') as websiteurl,
+        row_number() over (order by u.creationdate desc, u.id) as rn
+    from users u
+    where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+user_badge_mix as (
+    select
+        b.userid,
+        count(*) as badge_count,
+        sum(case when b.class = 1 then 1 else 0 end) as gold_count,
+        sum(case when b.class = 2 then 1 else 0 end) as silver_count,
+        sum(case when b.class = 3 then 1 else 0 end) as bronze_count,
+        sum(case when coalesce(b.tagbased, false) = true then 1 else 0 end) as tag_badges,
+        min(b.date) as first_badge_date,
+        max(b.date) as last_badge_date
+    from badges b
+    group by b.userid
+),
+question_activity as (
+    select
+        p.owneruserid as user_id,
+        count(*) filter (where p.posttypeid = 1) as q_count,
+        sum(coalesce(p.viewcount,0)) filter (where p.posttypeid = 1) as q_views,
+        sum(coalesce(p.score,0)) filter (where p.posttypeid = 1) as q_score,
+        avg(nullif(p.answercount,0)) filter (where p.posttypeid = 1) as avg_answers_per_q,
+        count(*) filter (where p.posttypeid = 1 and p.closeddate is not null) as closed_q_count,
+        count(*) filter (where p.posttypeid = 1 and p.acceptedanswerid is not null) as accepted_q_count
+    from posts p
+    where p.owneruserid is not null
+    group by p.owneruserid
+),
+answer_activity as (
+    select
+        p.owneruserid as user_id,
+        count(*) filter (where p.posttypeid = 2) as a_count,
+        sum(coalesce(p.score,0)) filter (where p.posttypeid = 2) as a_score
+    from posts p
+    where p.owneruserid is not null
+    group by p.owneruserid
+),
+comment_activity as (
+    select
+        c.userid as user_id,
+        count(*) as c_count,
+        sum(coalesce(c.score,0)) as c_score,
+        max(c.creationdate) as last_comment_date
+    from comments c
+    where c.userid is not null
+    group by c.userid
+),
+vote_breakdown as (
+    select
+        v.userid as user_id,
+        sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes_cast,
+        sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes_cast,
+        sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started,
+        sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded
+    from votes v
+    where v.userid is not null
+    group by v.userid
+),
+post_interactions as (
+    select
+        p.owneruserid as user_id,
+        count(distinct pl.relatedpostid) filter (where pl.linktypeid = 1) as linked_to_count,
+        count(distinct case when pl.linktypeid = 3 then pl.relatedpostid end) as dup_marked_to_count,
+        count(distinct case when pl.linktypeid = 3 then pl.postid end) as dup_marked_from_count
+    from posts p
+    left join postlinks pl
+      on pl.postid = p.id or pl.relatedpostid = p.id
+    where p.owneruserid is not null
+    group by p.owneruserid
+),
+hot_question_bursts as (
+    select
+        ph.userid as user_id,
+        count(*) filter (where ph.posthistorytypeid = 52) as hot_entries,
+        count(*) filter (where ph.posthistorytypeid = 53) as hot_exits,
+        min(ph.creationdate) filter (where ph.posthistorytypeid in (52,53)) as first_hot_event,
+        max(ph.creationdate) filter (where ph.posthistorytypeid in (52,53)) as last_hot_event
+    from posthistory ph
+    where ph.userid is not null
+    group by ph.userid
+),
+tag_usage as (
+    select
+        p.owneruserid as user_id,
+        lower(t) as tagname,
+        count(*) as tag_posts
+    from posts p
+    cross join lateral unnest(
+        case
+            when p.tags is null then array[]::text[]
+            else string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')
+        end
+    ) as t
+    where p.owneruserid is not null and p.posttypeid = 1
+    group by p.owneruserid, lower(t)
+),
+top_tag_per_user as (
+    select distinct on (tu.user_id)
+        tu.user_id,
+        tu.tagname,
+        tu.tag_posts
+    from tag_usage tu
+    order by tu.user_id, tu.tag_posts desc, tu.tagname
+),
+recent_editors as (
+    select
+        p.lasteditoruserid as user_id,
+        count(*) as edits_made,
+        max(p.lasteditdate) as last_edit_date
+    from posts p
+    where p.lasteditoruserid is not null
+    group by p.lasteditoruserid
+),
+activity_window as (
+    select
+        u.id as user_id,
+        count(*) filter (where p.creationdate >= u.creationdate and p.creationdate < u.creationdate + interval '30 days') as posts_first_30d,
+        count(*) filter (where p.creationdate >= u.creationdate + interval '30 days' and p.creationdate < u.creationdate + interval '365 days') as posts_day31_365
+    from users u
+    left join posts p on p.owneruserid = u.id
+    group by u.id
+),
+recent_questions as (
+    select
+        p.owneruserid as user_id,
+        count(*) as recent_q,
+        avg(p.score) as recent_q_avg_score
+    from posts p
+    where p.posttypeid = 1
+      and p.creationdate >= (select max(creationdate) - interval '90 days' from posts)
+    group by p.owneruserid
+),
+reputation_velocity as (
+    select
+        u.id as user_id,
+        u.reputation,
+        extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - u.creationdate)) / 86400.0 as days_since_join,
+        case when extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - u.creationdate)) > 0
+             then u.reputation / nullif(extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - u.creationdate)) / 86400.0, 0)
+             else null end as rep_per_day
+    from users u
+),
+ranked_users as (
+    select
+        ru.*,
+        row_number() over (order by coalesce(rv.rep_per_day, 0) desc, ru.reputation desc) as perf_rank
+    from recent_users ru
+    left join reputation_velocity rv on rv.user_id = ru.user_id
+),
+aggregate_posts as (
+    select
+        p.owneruserid as user_id,
+        count(*) as total_posts,
+        sum(case when p.posttypeid = 1 then 1 else 0 end) as total_q,
+        sum(case when p.posttypeid = 2 then 1 else 0 end) as total_a,
+        sum(coalesce(p.score,0)) as total_post_score,
+        max(p.lastactivitydate) as last_activity_date
+    from posts p
+    where p.owneruserid is not null
+    group by p.owneruserid
+),
+user_quality_score as (
+    select
+        u.user_id,
+        (
+            0.40 * coalesce((qa.q_score + aa.a_score), 0) +
+            0.25 * coalesce(ap.total_post_score, 0) +
+            0.15 * coalesce((vb.upvotes_cast - vb.downvotes_cast), 0) +
+            0.10 * coalesce(ubm.gold_count * 5 + ubm.silver_count * 2 + ubm.bronze_count, 0) +
+            0.05 * coalesce(ri.linked_to_count, 0) +
+            0.05 * coalesce(hq.hot_entries - hq.hot_exits, 0)
+        ) as quality_score
+    from (select distinct user_id from recent_users) u
+    left join question_activity qa on qa.user_id = u.user_id
+    left join answer_activity aa on aa.user_id = u.user_id
+    left join aggregate_posts ap on ap.user_id = u.user_id
+    left join vote_breakdown vb on vb.user_id = u.user_id
+    left join user_badge_mix ubm on ubm.userid = u.user_id
+    left join post_interactions ri on ri.user_id = u.user_id
+    left join hot_question_bursts hq on hq.user_id = u.user_id
+),
+dupe_network as (
+    select
+        p.owneruserid as user_id,
+        count(distinct case when pl.linktypeid = 3 then pl.relatedpostid end) as dup_targets,
+        count(distinct case when pl.linktypeid = 3 then pl.postid end) as dup_sources,
+        count(distinct case when pl.linktypeid = 1 then pl.relatedpostid end) as link_targets
+    from posts p
+    left join postlinks pl on pl.postid = p.id
+    where p.owneruserid is not null
+    group by p.owneruserid
+),
+closed_reason_stats as (
+    select
+        p.owneruserid as user_id,
+        count(*) filter (where ph.posthistorytypeid = 10) as close_events,
+        count(*) filter (where ph.posthistorytypeid = 11) as reopen_events,
+        count(*) filter (where ph.posthistorytypeid = 10 and ph.comment ~ '^[0-9]+$' and cast(ph.comment as integer) = 101) as duplicate_closes
+    from posts p
+    left join posthistory ph on ph.postid = p.id
+    where p.posttypeid = 1 and p.owneruserid is not null
+    group by p.owneruserid
+),
+tag_affinity as (
+    select
+        u.user_id,
+        tt.tagname as favorite_tag,
+        tt.tag_posts,
+        t.count as global_tag_count
+    from (select distinct user_id from recent_users) u
+    left join top_tag_per_user tt on tt.user_id = u.user_id
+    left join tags t on t.tagname = tt.tagname
+),
+final_scored as (
+    select
+        ru.user_id,
+        ru.displayname,
+        ru.reputation,
+        ru.creationdate,
+        ru.location,
+        ru.websiteurl,
+        ap.total_posts,
+        ap.total_q,
+        ap.total_a,
+        qa.q_count,
+        aa.a_count,
+        qa.q_views,
+        qa.q_score,
+        aa.a_score,
+        qa.avg_answers_per_q,
+        qa.closed_q_count,
+        qa.accepted_q_count,
+        ca.c_count as comments_made,
+        ca.c_score as comment_score,
+        ca.last_comment_date,
+        vb.upvotes_cast,
+        vb.downvotes_cast,
+        vb.bounty_started,
+        vb.bounty_awarded,
+        ubm.badge_count,
+        ubm.gold_count,
+        ubm.silver_count,
+        ubm.bronze_count,
+        ubm.tag_badges,
+        ubm.first_badge_date,
+        ubm.last_badge_date,
+        ri.linked_to_count,
+        ri.dup_marked_to_count,
+        ri.dup_marked_from_count,
+        hq.hot_entries,
+        hq.hot_exits,
+        hq.first_hot_event,
+        hq.last_hot_event,
+        re.edits_made,
+        re.last_edit_date,
+        aw.posts_first_30d,
+        aw.posts_day31_365,
+        rq.recent_q,
+        rq.recent_q_avg_score,
+        rv.rep_per_day,
+        dn.dup_targets,
+        dn.dup_sources,
+        dn.link_targets,
+        crs.close_events,
+        crs.reopen_events,
+        crs.duplicate_closes,
+        ta.favorite_tag,
+        ta.tag_posts as favorite_tag_posts,
+        ta.global_tag_count,
+        uq.quality_score,
+        rank() over (order by uq.quality_score desc nulls last, rv.rep_per_day desc nulls last, ru.reputation desc, ru.user_id) as overall_rank,
+        dense_rank() over (order by coalesce(rv.rep_per_day,0) desc, coalesce(ap.total_posts,0) desc) as velocity_rank,
+        sum(coalesce(ap.total_posts,0)) over () as total_posts_all_recent_users,
+        avg(coalesce(uq.quality_score,0)) over () as avg_quality_all_recent_users
+    from ranked_users ru
+    left join aggregate_posts ap on ap.user_id = ru.user_id
+    left join question_activity qa on qa.user_id = ru.user_id
+    left join answer_activity aa on aa.user_id = ru.user_id
+    left join comment_activity ca on ca.user_id = ru.user_id
+    left join vote_breakdown vb on vb.user_id = ru.user_id
+    left join user_badge_mix ubm on ubm.userid = ru.user_id
+    left join post_interactions ri on ri.user_id = ru.user_id
+    left join hot_question_bursts hq on hq.user_id = ru.user_id
+    left join recent_editors re on re.user_id = ru.user_id
+    left join activity_window aw on aw.user_id = ru.user_id
+    left join recent_questions rq on rq.user_id = ru.user_id
+    left join reputation_velocity rv on rv.user_id = ru.user_id
+    left join dupe_network dn on dn.user_id = ru.user_id
+    left join closed_reason_stats crs on crs.user_id = ru.user_id
+    left join tag_affinity ta on ta.user_id = ru.user_id
+    left join user_quality_score uq on uq.user_id = ru.user_id
+)
+select *
+from final_scored fs
+where
+    (
+        coalesce(fs.favorite_tag, '') <> ''
+        and length(fs.favorite_tag) between 2 and 35
+        and not (
+            fs.favorite_tag ilike '%test%' OR
+            fs.favorite_tag ilike '%example%' OR
+            fs.favorite_tag ilike '%foo%'
+        )
+    )
+    or (
+        fs.quality_score >= (
+            select percentile_cont(0.9) within group (order by quality_score)
+            from final_scored
+            where quality_score is not null
+        )
+        and coalesce(fs.a_count,0) >= coalesce(fs.q_count,0)
+    )
+    or (
+        fs.rep_per_day is not null
+        and fs.rep_per_day > 0
+        and fs.reputation > 0
+        and (coalesce(fs.upvotes_cast,0) - coalesce(fs.downvotes_cast,0)) >= 0
+        and (fs.total_posts is null or fs.total_posts > 10)
+    )
+order by fs.overall_rank
+limit 200;

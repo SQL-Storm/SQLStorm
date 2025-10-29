@@ -1,0 +1,110 @@
+WITH RankedPosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Body,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.OwnerUserId,
+    p.ViewCount,
+    p.Score,
+    p.AnswerCount,
+    p.CommentCount,
+    p.Tags,
+    p.PostTypeId,
+    p.FavoriteCount,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    u.Reputation,
+    u.DisplayName AS OwnerDisplayName,
+    ROW_NUMBER() OVER (
+      PARTITION BY p.PostTypeId
+      ORDER BY
+        p.Score DESC,
+        p.ViewCount * 0.5 + p.FavoriteCount * 2 - COALESCE(p.CommentCount, 0) * 0.25 +
+        CASE WHEN COALESCE(p.IsQuestion, false) THEN 1 ELSE 0 END
+    ) AS rn_type
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId IN (1,2) -- Questions and Answers
+    AND p.CreationDate >= CAST('2023-01-01' AS TIMESTAMP)
+),
+CorrelatedActivity AS (
+  SELECT
+    rp.PostId,
+    rp.Title,
+    rp.OwnerUserId,
+    rp.OwnerDisplayName,
+    rp.Reputation,
+    rp.LastActivityDate,
+    v1.CountUp AS UpvotesInWindow,
+    v2.CountDown AS DownvotesInWindow,
+    pv.rnk AS TopFamilyRank,
+    CASE
+      WHEN rp.PostTypeId = 1 THEN 'Question'
+      WHEN rp.PostTypeId = 2 THEN 'Answer'
+      ELSE 'Other'
+    END AS PostKind
+  FROM RankedPosts rp
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS CountUp
+    FROM Votes
+    WHERE VoteTypeId = 2
+      AND CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '7 days')
+    GROUP BY PostId
+  ) v1 ON v1.PostId = rp.PostId
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS CountDown
+    FROM Votes
+    WHERE VoteTypeId = 3
+      AND CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '7 days')
+    GROUP BY PostId
+  ) v2 ON v2.PostId = rp.PostId
+  LEFT JOIN (
+    SELECT p_inner.Id, p_inner.PostTypeId AS inner_PostTypeId, ROW_NUMBER() OVER (PARTITION BY p_inner.PostTypeId ORDER BY p_inner.CreationDate DESC) AS rnk
+    FROM Posts p_inner
+  ) pv ON pv.Id = rp.PostId AND pv.inner_PostTypeId = rp.PostTypeId
+  WHERE rp.rn_type = 1
+),
+WindowedStats AS (
+  SELECT
+    ca.PostId,
+    ca.Title,
+    ca.OwnerUserId,
+    ca.OwnerDisplayName,
+    ca.Reputation,
+    ca.LastActivityDate,
+    ca.PostKind,
+    ca.UpvotesInWindow,
+    ca.DownvotesInWindow,
+    ca.TopFamilyRank,
+    -- advanced calculation: normalized score with NULL-safe arithmetic
+    (
+      COALESCE((SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1), 0) * 0.3
+      + COALESCE((SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = 2), 1) * 0.7
+      + (ca.Reputation / NULLIF(1000, 0)) * 2.0
+    ) AS BenchmarkMetric
+  FROM CorrelatedActivity ca
+),
+FinalOutput AS (
+  SELECT
+    w.PostId,
+    w.Title,
+    w.OwnerDisplayName,
+    w.Reputation,
+    w.LastActivityDate,
+    w.PostKind,
+    w.UpvotesInWindow,
+    w.DownvotesInWindow,
+    w.TopFamilyRank,
+    w.BenchmarkMetric,
+    CASE
+      WHEN COALESCE(w.UpvotesInWindow, 0) >= 5 AND COALESCE(w.DownvotesInWindow, 0) = 0 THEN 'Excellent'
+      WHEN COALESCE(w.UpvotesInWindow, 0) > COALESCE(w.DownvotesInWindow, 0) THEN 'Positive'
+      ELSE 'Mixed'
+    END AS Sentiment
+  FROM WindowedStats w
+  ORDER BY w.BenchmarkMetric DESC NULLS LAST
+  LIMIT 200
+)
+SELECT * FROM FinalOutput;

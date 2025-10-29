@@ -1,0 +1,277 @@
+-- {"query": "7606.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 2349} 
+WITH UserStats AS (
+  SELECT 
+    u.Id,
+    u.Reputation,
+    u.CreationDate,
+    u.DisplayName,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.AccountId,
+    COUNT(DISTINCT p.Id) as TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+    COUNT(DISTINCT b.Id) as Badges,
+    MAX(p.CreationDate) as LastPostDate,
+    AVG(p.Score) as AvgPostScore,
+    STRING_AGG(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Title END, '; ') as QuestionTitles
+  FROM Users u
+  LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+  LEFT JOIN Badges b ON u.Id = b.UserId
+  WHERE u.Reputation > 1000
+  GROUP BY u.Id, u.Reputation, u.CreationDate, u.DisplayName, u.Views, u.UpVotes, u.DownVotes, u.AccountId
+),
+RankedUsers AS (
+  SELECT 
+    *,
+    ROW_NUMBER() OVER (ORDER BY Reputation DESC, Views DESC) as RankByReputation,
+    DENSE_RANK() OVER (ORDER BY TotalPosts DESC) as RankByPosts,
+    NTILE(10) OVER (ORDER BY UpVotes DESC) as UpVoteQuartile
+  FROM UserStats
+),
+PostAnalysis AS (
+  SELECT 
+    p.Id as PostId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.PostTypeId,
+    p.Tags,
+    p.ParentId,
+    CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END as HasAcceptedAnswer,
+    CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END as IsClosed,
+    CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN 1 ELSE 0 END as IsCommunityOwned,
+    CASE WHEN p.FavoriteCount > 0 THEN 1 ELSE 0 END as IsFavorited,
+    CASE WHEN p.Score >= 100 THEN 'High'
+         WHEN p.Score >= 10 THEN 'Medium'
+         ELSE 'Low' END as ScoreCategory,
+    COALESCE(p.Title, 'No Title') as SafeTitle,
+    COALESCE(p.Tags, 'No Tags') as SafeTags,
+    COALESCE(LEFT(p.Body, 100), 'No Body') as ShortBody,
+    DATEDIFF(day, p.CreationDate, cast('2024-10-01 12:34:56' as timestamp)) as DaysSinceCreation,
+    LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PreviousPostScore,
+    LEAD(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as NextPostScore
+  FROM Posts p
+  WHERE p.PostTypeId IN (1, 2) -- Questions and Answers only
+    AND p.CreationDate >= '2020-01-01'
+),
+UserPostMetrics AS (
+  SELECT 
+    r.Id as UserId,
+    r.DisplayName,
+    r.Reputation,
+    r.TotalPosts,
+    r.Questions,
+    r.Answers,
+    r.Badges,
+    r.RankByReputation,
+    r.RankByPosts,
+    r.UpVoteQuartile,
+    (
+      SELECT AVG(pa.Score) 
+      FROM PostAnalysis pa 
+      WHERE pa.OwnerUserId = r.Id 
+        AND pa.PostTypeId = 1
+    ) as AvgQuestionScore,
+    (
+      SELECT AVG(pa.Score)
+      FROM PostAnalysis pa 
+      WHERE pa.OwnerUserId = r.Id 
+        AND pa.PostTypeId = 2
+    ) as AvgAnswerScore,
+    (
+      SELECT COUNT(*) 
+      FROM PostAnalysis pa 
+      WHERE pa.OwnerUserId = r.Id 
+        AND pa.Score > 0
+    ) as PositiveScorePosts,
+    (
+      SELECT COUNT(*) 
+      FROM PostAnalysis pa 
+      WHERE pa.OwnerUserId = r.Id 
+        AND pa.Score < 0
+    ) as NegativeScorePosts,
+    (
+      SELECT COUNT(*) 
+      FROM PostAnalysis pa 
+      WHERE pa.OwnerUserId = r.Id 
+        AND pa.Score = 0
+    ) as ZeroScorePosts,
+    (
+      SELECT COUNT(*) 
+      FROM PostAnalysis pa 
+      WHERE pa.OwnerUserId = r.Id 
+        AND pa.HasAcceptedAnswer = 1
+    ) as AcceptedAnswers,
+    (
+      SELECT COUNT(*) 
+      FROM PostAnalysis pa 
+      WHERE pa.OwnerUserId = r.Id 
+        AND pa.IsClosed = 1
+    ) as ClosedPosts,
+    (
+      SELECT MAX(pa.DaysSinceCreation)
+      FROM PostAnalysis pa 
+      WHERE pa.OwnerUserId = r.Id
+    ) as MaxDaysSinceCreation
+  FROM RankedUsers r
+  WHERE r.TotalPosts > 0
+),
+TagAnalysis AS (
+  SELECT 
+    t.TagName,
+    t.Count,
+    t.IsRequired,
+    t.IsModeratorOnly,
+    (
+      SELECT AVG(p.Score)
+      FROM Posts p
+      WHERE p.PostTypeId = 1
+        AND p.Tags LIKE '%' || t.TagName || '%'
+    ) as AvgQuestionScoreByTag,
+    (
+      SELECT COUNT(*)
+      FROM Posts p
+      WHERE p.PostTypeId = 1
+        AND p.Tags LIKE '%' || t.TagName || '%'
+    ) as QuestionCountByTag,
+    (
+      SELECT MAX(p.CreationDate)
+      FROM Posts p
+      WHERE p.PostTypeId = 1
+        AND p.Tags LIKE '%' || t.TagName || '%'
+    ) as LatestQuestionDateByTag
+  FROM Tags t
+  WHERE t.Count > 10
+)
+SELECT 
+  upm.UserId,
+  upm.DisplayName,
+  upm.Reputation,
+  upm.TotalPosts,
+  upm.Questions,
+  upm.Answers,
+  upm.Badges,
+  upm.RankByReputation,
+  upm.RankByPosts,
+  upm.UpVoteQuartile,
+  upm.AvgQuestionScore,
+  upm.AvgAnswerScore,
+  upm.PositiveScorePosts,
+  upm.NegativeScorePosts,
+  upm.ZeroScorePosts,
+  upm.AcceptedAnswers,
+  upm.ClosedPosts,
+  upm.MaxDaysSinceCreation,
+  CASE 
+    WHEN upm.AvgQuestionScore > 50 THEN 'Highly Active Question Poster'
+    WHEN upm.AvgQuestionScore > 10 THEN 'Moderately Active Question Poster'
+    ELSE 'Low Activity Question Poster'
+  END as QuestionPosterType,
+  CASE 
+    WHEN upm.AvgAnswerScore > 20 THEN 'Highly Valued Answerer'
+    WHEN upm.AvgAnswerScore > 5 THEN 'Moderately Valued Answerer'
+    ELSE 'Low Valued Answerer'
+  END as AnswererType,
+  (
+    SELECT STRING_AGG(ta.TagName, ', ')
+    FROM Tags ta
+    WHERE ta.Count > 50
+      AND EXISTS (
+        SELECT 1 
+        FROM Posts p
+        WHERE p.OwnerUserId = upm.UserId
+          AND p.PostTypeId = 1
+          AND p.Tags LIKE '%' || ta.TagName || '%'
+      )
+    ORDER BY ta.Count DESC
+    LIMIT 5
+  ) as TopTags,
+  (
+    SELECT STRING_AGG(CONCAT(pa.PostId, ':', pa.Title, ' (', pa.Score, ')'), '; ')
+    FROM PostAnalysis pa
+    WHERE pa.OwnerUserId = upm.UserId
+      AND pa.PostTypeId = 1
+    ORDER BY pa.Score DESC
+    LIMIT 3
+  ) as TopQuestions,
+  (
+    SELECT STRING_AGG(CONCAT(pa.PostId, ':', pa.Title, ' (', pa.Score, ')'), '; ')
+    FROM PostAnalysis pa
+    WHERE pa.OwnerUserId = upm.UserId
+      AND pa.PostTypeId = 2
+    ORDER BY pa.Score DESC
+    LIMIT 3
+  ) as TopAnswers,
+  (
+    SELECT COUNT(DISTINCT pa.PostId)
+    FROM PostAnalysis pa
+    WHERE pa.OwnerUserId = upm.UserId
+      AND pa.IsClosed = 1
+  ) as TotalClosedQuestions,
+  (
+    SELECT COUNT(DISTINCT pa.PostId)
+    FROM PostAnalysis pa
+    WHERE pa.OwnerUserId = upm.UserId
+      AND pa.IsFavorited = 1
+  ) as TotalFavorites,
+  (
+    SELECT (COUNT(DISTINCT pa.PostId) * 100.0 / NULLIF(upm.TotalPosts, 0))
+    FROM PostAnalysis pa
+    WHERE pa.OwnerUserId = upm.UserId
+      AND pa.Score > 0
+  ) as PositiveScorePercentage,
+  (
+    SELECT COALESCE(MIN(pa.DaysSinceCreation), 0)
+    FROM PostAnalysis pa
+    WHERE pa.OwnerUserId = upm.UserId
+  ) as DaysActive,
+  (
+    CASE 
+      WHEN upm.MaxDaysSinceCreation > 365 THEN 'Long Term Active'
+      WHEN upm.MaxDaysSinceCreation > 90 THEN 'Medium Term Active'
+      WHEN upm.MaxDaysSinceCreation > 30 THEN 'Short Term Active'
+      ELSE 'New Poster'
+    END
+  ) as ActivityPeriod,
+  (
+    SELECT STRING_AGG(CONCAT(p.Id, ':', p.Title), '; ') 
+    FROM Posts p 
+    WHERE p.OwnerUserId = upm.UserId 
+      AND p.CreationDate > '2022-01-01'
+    ORDER BY p.CreationDate DESC
+    LIMIT 5
+  ) as RecentPosts,
+  EXISTS (
+    SELECT 1 
+    FROM Votes v 
+    WHERE v.UserId = upm.UserId 
+      AND v.VoteTypeId = 15
+      AND v.CreationDate > '2023-01-01'
+  ) as ModeratorReviewActivity,
+  (
+    SELECT COUNT(DISTINCT p.Id) 
+    FROM Posts p 
+    WHERE p.OwnerUserId = upm.UserId 
+      AND p.AcceptedAnswerId IS NOT NULL
+      AND (p.CreationDate > '2022-01-01' OR p.LastActivityDate > '2022-01-01')
+  ) as RecentAcceptedQuestions,
+  (
+    SELECT COUNT(DISTINCT p.Id) 
+    FROM Posts p 
+    WHERE p.OwnerUserId = upm.UserId 
+      AND p.PostTypeId = 1
+      AND p.AnswerCount > 0
+      AND (p.CreationDate > '2023-01-01' OR p.LastActivityDate > '2023-01-01')
+  ) as RecentQuestionsWithAnswers
+FROM UserPostMetrics upm
+WHERE upm.Reputation > 5000
+  AND upm.TotalPosts > 10
+  AND upm.MaxDaysSinceCreation < 1000
+ORDER BY upm.Reputation DESC, upm.TotalPosts DESC
+LIMIT 50;

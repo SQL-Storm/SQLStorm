@@ -1,0 +1,61 @@
+SELECT
+  u.Id AS UserId,
+  u.DisplayName AS DisplayName,
+  u.Reputation,
+  u.CreationDate AS UserCreationDate,
+  u.LastAccessDate,
+  u.Location,
+  COALESCE(u.AboutMe, '') AS AboutMe,
+  COALESCE(u.Views, 0) AS Views,
+  COALESCE(u.UpVotes, 0) AS UpVotes,
+  COALESCE(u.DownVotes, 0) AS DownVotes,
+  COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+  COUNT(DISTINCT a.Id) FILTER (WHERE a.PostTypeId = 2) AS AnswerCount,
+  COUNT(DISTINCT b.Id) AS BadgeCount,
+  MAX(CASE WHEN b.Class = 1 THEN b.Date END) AS GoldBadgeDate,
+  MAX(CASE WHEN b.Class = 2 THEN b.Date END) AS SilverBadgeDate,
+  MAX(CASE WHEN b.Class = 3 THEN b.Date END) AS BronzeBadgeDate,
+  (
+    SELECT AVG(EXTRACT(EPOCH FROM (aa.CreationDate - p2.CreationDate)) / 3600.0)
+    FROM Posts p2
+    JOIN Posts aa ON aa.Id = p2.AcceptedAnswerId
+    WHERE p2.PostTypeId = 1
+      AND p2.OwnerUserId = u.Id
+      AND p2.AcceptedAnswerId IS NOT NULL
+  ) AS AverageHoursToAcceptAnswer,
+  t.TagName AS TopTagName,
+  (
+    COALESCE((SELECT SUM(Score) FROM Posts WHERE OwnerUserId = u.Id),0)
+    + COALESCE((SELECT SUM(Class) FROM Badges WHERE UserId = u.Id),0)
+    + COALESCE((SELECT SUM(Views) FROM Users u2 WHERE u2.Id = u.Id),0)
+  ) AS CompositeScore
+FROM Users u
+LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+LEFT JOIN Posts a ON a.OwnerUserId = u.Id AND a.PostTypeId = 2
+LEFT JOIN Badges b ON b.UserId = u.Id
+LEFT JOIN LATERAL (
+  SELECT t2.Id, t2.TagName
+  FROM Tags t2
+  JOIN Posts ps ON ps.Id = t2.ExcerptPostId
+  WHERE ps.OwnerUserId = u.Id
+  GROUP BY t2.Id, t2.TagName
+  ORDER BY SUM(COALESCE(ps.Score,0)) DESC
+  LIMIT 1
+) t ON true
+GROUP BY
+  u.Id,
+  u.DisplayName,
+  u.Reputation,
+  u.CreationDate,
+  u.LastAccessDate,
+  u.Location,
+  u.AboutMe,
+  u.Views,
+  u.UpVotes,
+  u.DownVotes,
+  GoldBadgeDate,
+  SilverBadgeDate,
+  BronzeBadgeDate,
+  t.TagName
+ORDER BY CompositeScore DESC
+LIMIT 100;

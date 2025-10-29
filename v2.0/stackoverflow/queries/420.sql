@@ -1,0 +1,231 @@
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        u.location,
+        coalesce(nullif(trim(u.websiteurl), ''), 'N/A') as websiteurl_norm,
+        date_trunc('month', u.creationdate) as cohort_month
+    from users u
+    where u.creationdate >= (select max(creationdate) - interval '365 days' from users)
+),
+q_and_a as (
+    select
+        p.id,
+        p.posttypeid,
+        p.owneruserid,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        p.title,
+        p.tags,
+        p.acceptedanswerid,
+        p.parentid
+    from posts p
+    where p.posttypeid in (1,2)
+),
+user_posts as (
+    select
+        ru.user_id,
+        count(*) filter (where qa.posttypeid = 1) as questions_count,
+        count(*) filter (where qa.posttypeid = 2) as answers_count,
+        sum(qa.score) as total_post_score,
+        avg(nullif(qa.score,0)) as avg_nonzero_score,
+        max(qa.viewcount) filter (where qa.posttypeid = 1) as max_question_views,
+        min(qa.creationdate) as first_post_date,
+        max(qa.creationdate) as last_post_date
+    from recent_users ru
+    left join q_and_a qa
+      on qa.owneruserid = ru.user_id
+    group by ru.user_id
+),
+user_comments as (
+    select
+        ru.user_id,
+        count(c.id) as comment_count,
+        coalesce(sum(c.score),0) as comment_score_sum,
+        max(c.creationdate) as last_comment_date
+    from recent_users ru
+    left join comments c
+      on c.userid = ru.user_id
+    group by ru.user_id
+),
+user_votes as (
+    select
+        ru.user_id,
+        count(*) filter (where v.votetypeid = 2) as upvotes_cast,
+        count(*) filter (where v.votetypeid = 3) as downvotes_cast,
+        count(*) filter (where v.votetypeid in (8,9)) as bounties_interactions,
+        sum(v.bountyamount) filter (where v.votetypeid in (8,9)) as bounty_amount_total
+    from recent_users ru
+    left join votes v
+      on v.userid = ru.user_id
+    group by ru.user_id
+),
+user_badges as (
+    select
+        ru.user_id,
+        count(*) as total_badges,
+        count(*) filter (where b.class = 1) as gold_badges,
+        count(*) filter (where b.class = 2) as silver_badges,
+        count(*) filter (where b.class = 3) as bronze_badges,
+        count(*) filter (where b.tagbased = true) as tag_badges,
+        max(b.date) as last_badge_date
+    from recent_users ru
+    left join badges b
+      on b.userid = ru.user_id
+    group by ru.user_id
+),
+accept_stats as (
+    select
+        qa.owneruserid as question_owner_id,
+        count(*) as questions_with_accept,
+        sum(case when qa.acceptedanswerid is not null then 1 else 0 end) as accepted_questions,
+        round(100.0 * sum(case when qa.acceptedanswerid is not null then 1 else 0 end) / nullif(count(*),0), 2) as accept_rate_pct
+    from q_and_a qa
+    where qa.posttypeid = 1
+    group by qa.owneruserid
+),
+answerer_accepts as (
+    select
+        a.owneruserid as answer_owner_id,
+        count(*) filter (where q.acceptedanswerid = a.id) as answers_accepted,
+        count(*) as total_answers
+    from posts a
+    join posts q on q.id = a.parentid and q.posttypeid = 1
+    where a.posttypeid = 2
+    group by a.owneruserid
+),
+tag_extract as (
+    select
+        p.id as post_id,
+        unnest(string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')) as tag
+    from posts p
+    where p.posttypeid = 1 and p.tags is not null and length(p.tags) > 2
+),
+user_top_tag as (
+    select
+        qa.owneruserid as user_id,
+        te.tag,
+        count(*) as tag_q_count,
+        row_number() over (partition by qa.owneruserid order by count(*) desc, min(qa.creationdate)) as rn
+    from q_and_a qa
+    join tag_extract te on te.post_id = qa.id and qa.posttypeid = 1
+    group by qa.owneruserid, te.tag
+),
+user_activity_window as (
+    select
+        ru.user_id,
+        count(*) filter (where qa.posttypeid = 1 and qa.creationdate >= (timestamp '2024-10-01 12:34:56') - interval '30 days') as q_30d,
+        count(*) filter (where qa.posttypeid = 2 and qa.creationdate >= (timestamp '2024-10-01 12:34:56') - interval '30 days') as a_30d,
+        sum(qa.score) filter (where qa.creationdate >= (timestamp '2024-10-01 12:34:56') - interval '30 days') as score_30d,
+        count(*) filter (where qa.posttypeid = 1 and qa.creationdate >= (timestamp '2024-10-01 12:34:56') - interval '7 days') as q_7d,
+        count(*) filter (where qa.posttypeid = 2 and qa.creationdate >= (timestamp '2024-10-01 12:34:56') - interval '7 days') as a_7d
+    from recent_users ru
+    left join q_and_a qa on qa.owneruserid = ru.user_id
+    group by ru.user_id
+),
+postlink_stats as (
+    select
+        ru.user_id,
+        count(distinct case when pl.linktypeid = 3 then pl.postid end) as dup_marked_posts,
+        count(distinct case when pl.linktypeid = 1 then pl.postid end) as linked_posts
+    from recent_users ru
+    left join posts p on p.owneruserid = ru.user_id
+    left join postlinks pl on pl.postid = p.id
+    group by ru.user_id
+),
+posthistory_closures as (
+    select
+        ru.user_id,
+        count(*) filter (where ph.posthistorytypeid = 10) as close_events_on_posts,
+        count(*) filter (where ph.posthistorytypeid in (11,7)) as reopen_or_rollback_events
+    from recent_users ru
+    left join posts p on p.owneruserid = ru.user_id
+    left join posthistory ph on ph.postid = p.id
+    group by ru.user_id
+),
+quality_rank as (
+    select
+        ru.user_id,
+        ntile(5) over (order by coalesce(up.upvotes_cast,0) - coalesce(up.downvotes_cast,0) + coalesce(up.bounty_amount_total,0) desc) as quality_quintile
+    from recent_users ru
+    left join user_votes up on up.user_id = ru.user_id
+)
+select
+    ru.user_id,
+    coalesce(ru.displayname, concat('user#', cast(ru.user_id as varchar))) as displayname,
+    ru.reputation,
+    ru.cohort_month,
+    ru.location,
+    case
+        when ru.websiteurl_norm ilike '%stackoverflow%' then 'StackOverflow'
+        when ru.websiteurl_norm = 'N/A' then null
+        else ru.websiteurl_norm
+    end as website_domain_hint,
+    up.questions_count,
+    up.answers_count,
+    coalesce(up.total_post_score,0) as total_post_score,
+    up.avg_nonzero_score,
+    up.max_question_views,
+    up.first_post_date,
+    up.last_post_date,
+    uc.comment_count,
+    uc.comment_score_sum,
+    uc.last_comment_date,
+    uv.upvotes_cast,
+    uv.downvotes_cast,
+    uv.bounties_interactions,
+    uv.bounty_amount_total,
+    ub.total_badges,
+    ub.gold_badges,
+    ub.silver_badges,
+    ub.bronze_badges,
+    ub.tag_badges,
+    ub.last_badge_date,
+    ar.accept_rate_pct,
+    aa.answers_accepted,
+    aa.total_answers,
+    utt.tag as top_tag,
+    ps.dup_marked_posts,
+    ps.linked_posts,
+    phc.close_events_on_posts,
+    phc.reopen_or_rollback_events,
+    uaw.q_30d,
+    uaw.a_30d,
+    uaw.score_30d,
+    uaw.q_7d,
+    uaw.a_7d,
+    qr.quality_quintile,
+    case
+        when coalesce(up.questions_count,0) + coalesce(up.answers_count,0) + coalesce(uc.comment_count,0) = 0 then 'lurker'
+        when coalesce(ub.gold_badges,0) >= 1 or coalesce(aa.answers_accepted,0) >= 5 then 'expert'
+        when coalesce(up.answers_count,0) > coalesce(up.questions_count,0) then 'answerer'
+        when coalesce(up.questions_count,0) > 0 and coalesce(aa.answers_accepted,0) = 0 then 'asker-new'
+        else 'participant'
+    end as activity_segment
+from recent_users ru
+left join user_posts up on up.user_id = ru.user_id
+left join user_comments uc on uc.user_id = ru.user_id
+left join user_votes uv on uv.user_id = ru.user_id
+left join user_badges ub on ub.user_id = ru.user_id
+left join accept_stats ar on ar.question_owner_id = ru.user_id
+left join answerer_accepts aa on aa.answer_owner_id = ru.user_id
+left join user_top_tag utt on utt.user_id = ru.user_id and utt.rn = 1
+left join user_activity_window uaw on uaw.user_id = ru.user_id
+left join postlink_stats ps on ps.user_id = ru.user_id
+left join posthistory_closures phc on phc.user_id = ru.user_id
+left join quality_rank qr on qr.user_id = ru.user_id
+where
+    (
+        coalesce(up.questions_count,0) + coalesce(up.answers_count,0) + coalesce(uc.comment_count,0) >= 3
+        or coalesce(uv.upvotes_cast,0) - coalesce(uv.downvotes_cast,0) >= 5
+        or coalesce(ub.total_badges,0) >= 2
+    )
+    and (
+        ru.reputation >= 100
+        or (coalesce(aa.answers_accepted,0) >= 1 and coalesce(ar.accept_rate_pct,0) >= 25)
+        or (coalesce(uaw.q_7d,0) + coalesce(uaw.a_7d,0)) >= 1
+    )
+;

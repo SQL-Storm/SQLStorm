@@ -1,0 +1,212 @@
+WITH 
+/*----------------------------------------------------
+  1. Closed duplicate questions (and their original source)
+----------------------------------------------------*/
+closed_dupes AS (
+    SELECT 
+        q.Id                                      AS QuestionId,
+        q.Title,
+        q.CreationDate                           AS QCreation,
+        q.OwnerUserId                            AS QuestionOwner,
+        ph.CloseReasonId                         AS CloseReasonId,
+        ph.CreationDate                          AS CloseDate,
+        pl.RelatedPostId                         AS OriginalQuestionId,
+        p_orig.Title                              AS OriginalTitle,
+        p_orig.OwnerUserId                        AS OriginalOwner,
+        EXTRACT(EPOCH FROM (ph.CreationDate - q.CreationDate))/3600 AS HoursToClose,
+        q.Tags
+    FROM Posts q
+    JOIN PostHistory ph 
+          ON ph.PostId = q.Id 
+         AND ph.PostHistoryTypeId = 10                -- Post Closed
+    JOIN PostLinks pl 
+          ON pl.PostId = q.Id 
+         AND pl.LinkTypeId = 3                        -- Duplicate link
+    JOIN Posts p_orig 
+          ON p_orig.Id = pl.RelatedPostId
+    WHERE q.PostTypeId = 1                            -- Questions only
+      AND ph.Comment ~* '101'                         -- CloseReason = Duplicate (101)
+),
+/*----------------------------------------------------
+  2. Answers to those questions with timing & vote info
+----------------------------------------------------*/
+answer_metrics AS (
+    SELECT 
+        a.Id                                      AS AnswerId,
+        a.ParentId                               AS QuestionId,
+        a.OwnerUserId                            AS AnswerOwner,
+        a.CreationDate                           AS ACreation,
+        EXTRACT(EPOCH FROM (a.CreationDate - cd.QCreation))/3600 AS HoursToAnswer,
+        COALESCE(v_up.UpVotes,0)                  AS UpVoteCount,
+        COALESCE(v_down.DownVotes,0)              AS DownVoteCount,
+        CASE 
+            WHEN a.Id = q.AcceptedAnswerId THEN 1 
+            ELSE 0 
+        END                                      AS IsAccepted,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.CreationDate) AS AnswerRank
+    FROM Posts a
+    JOIN closed_dupes cd 
+          ON cd.QuestionId = a.ParentId
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS UpVotes
+        FROM Votes
+        WHERE VoteTypeId = 2
+        GROUP BY PostId
+    ) v_up  ON v_up.PostId = a.Id
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS DownVotes
+        FROM Votes
+        WHERE VoteTypeId = 3
+        GROUP BY PostId
+    ) v_down ON v_down.PostId = a.Id
+    LEFT JOIN Posts q 
+           ON q.Id = a.ParentId
+),
+/*----------------------------------------------------
+  3. Aggregate badge info per user (including null handling)
+----------------------------------------------------*/
+user_badges AS (
+    SELECT 
+        u.Id                                     AS UserId,
+        COUNT(b.*)                                AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        STRING_AGG(DISTINCT b.Name, ';')         AS BadgeList
+    FROM Users u
+    LEFT JOIN Badges b 
+           ON b.UserId = u.Id
+    GROUP BY u.Id
+),
+/*----------------------------------------------------
+  4. Tag usage statistics for the closed questions
+----------------------------------------------------*/
+question_tags AS (
+    SELECT 
+        cd.QuestionId,
+        UNNEST(string_to_array(TRIM(BOTH '<>' FROM cd.Tags), '><')) AS Tag
+    FROM closed_dupes cd
+    WHERE cd.Tags IS NOT NULL
+),
+tag_stats AS (
+    SELECT 
+        t.Tag,
+        COUNT(DISTINCT qt.QuestionId) AS QuestionCount,
+        COALESCE(SUM(t.Count),0)       AS TotalTagPostCount
+    FROM question_tags qt
+    JOIN Tags t 
+          ON t.TagName = qt.Tag
+    GROUP BY t.Tag
+),
+/*----------------------------------------------------
+  5. Combine user answer metrics with badge data
+----------------------------------------------------*/
+user_answer_stats AS (
+    SELECT 
+        am.AnswerOwner                                 AS UserId,
+        COUNT(*)                                       AS AnswersGiven,
+        AVG(am.HoursToAnswer)                          AS AvgHoursToAnswer,
+        SUM(am.IsAccepted)                             AS AcceptedAnswers,
+        SUM(am.UpVoteCount - am.DownVoteCount)         AS NetVoteScore,
+        MAX(am.HoursToAnswer)                          AS MaxHoursToAnswer,
+        MIN(am.HoursToAnswer)                          AS MinHoursToAnswer,
+        COUNT(DISTINCT am.QuestionId)                  AS DistinctQuestionsAnswered,
+        STRING_AGG(DISTINCT cd.Title, ' | ') FILTER (WHERE am.AnswerRank = 1) AS FirstAnswersTitles
+    FROM answer_metrics am
+    JOIN closed_dupes cd 
+          ON cd.QuestionId = am.QuestionId
+    GROUP BY am.AnswerOwner
+),
+/*----------------------------------------------------
+  6. Final composition with LEFT OUTER JOINs and NULL logic
+----------------------------------------------------*/
+final_stats AS (
+    SELECT 
+        u.Id                                         AS UserId,
+        COALESCE(u.DisplayName, 'Anonymous')         AS DisplayName,
+        u.Reputation,
+        COALESCE(ub.TotalBadges,0)                   AS TotalBadges,
+        COALESCE(ub.GoldBadges,0)                    AS GoldBadges,
+        COALESCE(ub.SilverBadges,0)                  AS SilverBadges,
+        COALESCE(ub.BronzeBadges,0)                  AS BronzeBadges,
+        COALESCE(ub.BadgeList, '')                   AS BadgeList,
+        COALESCE(uas.AnswersGiven,0)                 AS AnswersGiven,
+        COALESCE(ROUND(uas.AvgHoursToAnswer::numeric,2),0)    AS AvgHoursToAnswer,
+        COALESCE(uas.AcceptedAnswers,0)              AS AcceptedAnswers,
+        COALESCE(uas.NetVoteScore,0)                 AS NetVoteScore,
+        COALESCE(uas.DistinctQuestionsAnswered,0)    AS DistinctQuestionsAnswered,
+        CASE 
+            WHEN u.Reputation > 20000 THEN 'Elite' 
+            WHEN u.Reputation BETWEEN 10000 AND 20000 THEN 'Pro' 
+            WHEN u.Reputation BETWEEN 5000 AND 9999 THEN 'Experienced' 
+            ELSE 'Regular' 
+        END                                          AS ReputationTier,
+        COALESCE(uas.FirstAnswersTitles, '')         AS FirstAnswerSampleTitles,
+        /* Derived metric: badge efficiency */
+        CASE 
+            WHEN COALESCE(uas.AnswersGiven,0) = 0 THEN NULL 
+            ELSE ROUND(COALESCE(ub.TotalBadges,0)::numeric / uas.AnswersGiven, 2) 
+        END                                          AS BadgesPerAnswer
+    FROM Users u
+    LEFT JOIN user_badges ub 
+           ON ub.UserId = u.Id
+    LEFT JOIN user_answer_stats uas 
+           ON uas.UserId = u.Id
+    WHERE u.CreationDate < (DATE '2024-10-01' - INTERVAL '1 year')   -- exclude very new users
+)
+SELECT *
+FROM final_stats
+WHERE ReputationTier IN ('Elite','Pro')
+   OR BadgesPerAnswer IS NOT NULL
+ORDER BY BadgesPerAnswer DESC NULLS LAST
+LIMIT 100
+
+UNION ALL
+
+/*----------------------------------------------------
+  7. Baseline: users with answers on never-closed questions
+----------------------------------------------------*/
+WITH never_closed AS (
+    SELECT q.Id AS QuestionId
+    FROM Posts q
+    LEFT JOIN PostHistory ph 
+           ON ph.PostId = q.Id 
+          AND ph.PostHistoryTypeId = 10                -- Closed
+    WHERE q.PostTypeId = 1 
+      AND ph.Id IS NULL
+),
+nc_answer_metrics AS (
+    SELECT 
+        a.OwnerUserId AS UserId,
+        COUNT(*)      AS AnswersGiven,
+        AVG(EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))/3600) AS AvgHoursToAnswer
+    FROM Posts a
+    JOIN never_closed nc 
+          ON nc.QuestionId = a.ParentId
+    JOIN Posts q 
+          ON q.Id = a.ParentId
+    GROUP BY a.OwnerUserId
+)
+SELECT 
+    u.Id                                         AS UserId,
+    COALESCE(u.DisplayName, 'Anonymous')         AS DisplayName,
+    u.Reputation,
+    0                                            AS TotalBadges,
+    0                                            AS GoldBadges,
+    0                                            AS SilverBadges,
+    0                                            AS BronzeBadges,
+    ''                                           AS BadgeList,
+    COALESCE(nc.AnswersGiven,0)                  AS AnswersGiven,
+    COALESCE(ROUND(nc.AvgHoursToAnswer::numeric,2),0)     AS AvgHoursToAnswer,
+    0                                            AS AcceptedAnswers,
+    0                                            AS NetVoteScore,
+    0                                            AS DistinctQuestionsAnswered,
+    'N/A'                                        AS ReputationTier,
+    ''                                           AS FirstAnswerSampleTitles,
+    NULL                                         AS BadgesPerAnswer
+FROM Users u
+LEFT JOIN nc_answer_metrics nc 
+       ON nc.UserId = u.Id
+WHERE u.Reputation < 5000
+ORDER BY AnswersGiven DESC
+LIMIT 100;

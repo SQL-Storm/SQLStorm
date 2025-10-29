@@ -1,0 +1,128 @@
+WITH ranked_posts AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.Tags,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.Body,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.LastEditorUserId,
+    p.LastEditDate,
+    p.CommunityOwnedDate,
+    p.ContentLicense,
+    json_agg(
+      json_build_object(
+        'VoteTypeId', v.VoteTypeId,
+        'UserId', v.UserId,
+        'CreationDate', v.CreationDate,
+        'BountyAmount', v.BountyAmount
+      )
+      ORDER BY v.CreationDate
+    ) FILTER (WHERE v.VoteTypeId IS NOT NULL) AS VotesTimeline
+  FROM Posts p
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+  LEFT JOIN PostLinks pl2 ON pl2.RelatedPostId = p.Id
+  WHERE p.PostTypeId IN (1,2)
+  GROUP BY
+    p.Id, p.PostTypeId, p.Title, p.CreationDate, p.LastActivityDate,
+    p.Score, p.ViewCount, p.OwnerUserId, p.Tags, p.AnswerCount, p.CommentCount,
+    p.FavoriteCount, p.Body, p.ParentId, p.AcceptedAnswerId, p.LastEditorUserId,
+    p.LastEditDate, p.CommunityOwnedDate, p.ContentLicense
+),
+deadlock_probe AS (
+  SELECT
+    rp.PostId,
+    rp.Title,
+    rp.CreationDate,
+    rp.LastActivityDate,
+    rp.Score,
+    rp.ViewCount,
+    rp.OwnerUserId,
+    rp.Tags,
+    rp.AnswerCount,
+    rp.CommentCount,
+    rp.FavoriteCount,
+    rp.Body,
+    rp.ParentId,
+    rp.AcceptedAnswerId,
+    rp.LastEditorUserId,
+    rp.LastEditDate,
+    rp.CommunityOwnedDate,
+    rp.ContentLicense,
+    rp.VotesTimeline,
+    (
+      COALESCE(rp.Score, 0)
+      + COALESCE((SELECT AVG(v2.BountyAmount) FROM Votes v2 WHERE v2.PostId = rp.PostId AND v2.BountyAmount IS NOT NULL), 0)
+      + COALESCE((SELECT SUM(CASE WHEN v3.VoteTypeId = 2 THEN 1 ELSE 0 END) FROM Votes v3 WHERE v3.PostId = rp.PostId), 0)
+    ) AS performance_metric
+  FROM ranked_posts rp
+),
+windowed AS (
+  SELECT
+    d.PostId,
+    d.Title,
+    d.CreationDate,
+    d.LastActivityDate,
+    d.Score,
+    d.ViewCount,
+    d.OwnerUserId,
+    d.Tags,
+    d.AnswerCount,
+    d.CommentCount,
+    d.FavoriteCount,
+    d.Body,
+    d.ParentId,
+    d.AcceptedAnswerId,
+    d.LastEditorUserId,
+    d.LastEditDate,
+    d.CommunityOwnedDate,
+    d.ContentLicense,
+    d.VotesTimeline,
+    d.performance_metric,
+    ROW_NUMBER() OVER (
+      PARTITION BY d.OwnerUserId
+      ORDER BY d.LastActivityDate DESC, d.CreationDate ASC
+    ) AS rn_owner,
+    RANK() OVER (
+      ORDER BY d.performance_metric DESC
+    ) AS rnk_perf
+  FROM deadlock_probe d
+)
+SELECT
+  w.PostId,
+  w.Title,
+  w.CreationDate,
+  w.LastActivityDate,
+  w.Score,
+  w.ViewCount,
+  w.OwnerUserId,
+  w.Tags,
+  w.AnswerCount,
+  w.CommentCount,
+  w.FavoriteCount,
+  w.Body,
+  w.ParentId,
+  w.AcceptedAnswerId,
+  w.LastEditorUserId,
+  w.LastEditDate,
+  w.CommunityOwnedDate,
+  w.ContentLicense,
+  w.VotesTimeline,
+  w.performance_metric,
+  w.rn_owner,
+  w.rnk_perf
+FROM windowed w
+WHERE
+  w.rn_owner <= 5
+  AND w.rnk_perf <= 20
+ORDER BY w.rnk_perf, w.LastActivityDate DESC;

@@ -1,0 +1,44 @@
+SELECT 
+    u.DisplayName, 
+    p.Title, 
+    COUNT(DISTINCT v.Id) AS TotalVotes,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) AS LastClosedDate,
+    b.Name AS LatestBadge,
+    (SELECT STRING_AGG(t2.TagName, ',' ORDER BY t2.TagName)
+     FROM (
+       SELECT DISTINCT t1.TagName
+       FROM Tags t1
+       WHERE t1.ExcerptPostId = p.Id
+       ORDER BY t1.TagName
+       LIMIT 10
+     ) t2
+    ) AS TopTags,
+    u.Reputation
+FROM 
+    Users u
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+LEFT JOIN 
+    PostHistory ph ON p.Id = ph.PostId
+LEFT JOIN 
+    Tags t ON p.Id = t.ExcerptPostId
+WHERE 
+    u.Reputation > 1000
+    AND p.PostTypeId = 1
+    AND p.ViewCount > 100
+    AND p.Score > 0
+    AND p.LastActivityDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year')
+GROUP BY 
+    u.DisplayName, p.Title, b.Name, u.Id, p.Id, u.Reputation
+HAVING 
+    COUNT(DISTINCT v.Id) > 50
+ORDER BY 
+    TotalVotes DESC, 
+    u.Reputation DESC
+LIMIT 100;

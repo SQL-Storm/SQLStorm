@@ -1,0 +1,336 @@
+-- {"query": "1663.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 4082} 
+
+WITH CloseReasonMapping AS (
+    SELECT
+        CAST(ph.Comment AS SMALLINT) AS CloseReasonTypeId,
+        MAX(crt.Name) AS CloseReasonName
+    FROM PostHistory ph
+    JOIN CloseReasonTypes crt ON CAST(ph.Comment AS SMALLINT) = crt.Id
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY CAST(ph.Comment AS SMALLINT)
+),
+UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Views AS UserProfileViews,
+        u.UpVotes AS UserTotalUpvotesReceived,
+        u.DownVotes AS UserTotalDownvotesReceived,
+        COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestionsOwned,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswersOwned,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN v.VoteTypeId = 2 AND v.UserId = u.Id THEN 1 ELSE 0 END) AS TotalUpvotesGiven,
+        SUM(CASE WHEN v.VoteTypeId = 3 AND v.UserId = u.Id THEN 1 ELSE 0 END) AS TotalDownvotesGiven
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    WHERE u.CreationDate >= '2020-01-01'
+      AND u.LastAccessDate >= '2023-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes
+),
+PostEditAndCloseHistory AS (
+    SELECT
+        ph.PostId,
+        COUNT(ph.Id) AS TotalHistoryEvents,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN ph.Id END) AS EditRevisionCount,
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN ph.CreationDate END) AS LastBodyEditDate,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Id END) AS CloseEventCount,
+        MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId = 10) AS LastCloseEventDate,
+        ARRAY_AGG(DISTINCT cr.CloseReasonName) FILTER (WHERE ph.PostHistoryTypeId = 10) AS AllCloseReasonsGiven,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (12, 10) THEN 1 ELSE 0 END) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativeCloseAndDeleteEvents
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonMapping cr ON ph.PostHistoryTypeId = 10 AND CAST(ph.Comment AS SMALLINT) = cr.CloseReasonTypeId
+    WHERE ph.PostHistoryTypeId IN (4,5,6,10,12,13,16)
+    GROUP BY ph.PostId
+),
+PostLinkSummary AS (
+    SELECT
+        pl.PostId,
+        COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 1 THEN pl.RelatedPostId END) AS LinkedFromCount,
+        COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN pl.RelatedPostId END) AS DuplicateOfCount,
+        STRING_AGG(DISTINCT CAST(pl.RelatedPostId AS TEXT), ', ') FILTER (WHERE pl.LinkTypeId = 3) AS DuplicatePostIds
+    FROM PostLinks pl
+    GROUP BY pl.PostId
+),
+DetailedPostMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount AS PostCommentCount,
+        p.FavoriteCount,
+        COALESCE(peh.EditRevisionCount, 0) AS EditCount,
+        COALESCE(peh.CloseEventCount, 0) AS CloseCount,
+        peh.LastBodyEditDate,
+        peh.LastCloseEventDate,
+        peh.AllCloseReasonsGiven,
+        COALESCE(pls.LinkedFromCount, 0) AS LinkedPosts,
+        COALESCE(pls.DuplicateOfCount, 0) AS DuplicatesFound,
+        pls.DuplicatePostIds,
+        p.ParentId,
+        p.AcceptedAnswerId,
+        LENGTH(p.Body) AS BodyLength,
+        LENGTH(p.Title) AS TitleLength,
+        POSITION('<code>' IN LOWER(p.Body)) > 0 AS HasCodeBlock,
+        COALESCE(p.ClosedDate IS NOT NULL, FALSE) AS IsClosed,
+        COALESCE(p.CommunityOwnedDate IS NOT NULL, FALSE) AS IsCommunityOwned,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ROWS BETWEEN 3 PRECEDING AND 1 PRECEDING) AS AvgPrev3PostScore,
+        RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate DESC) AS OwnerPostRankByScore,
+        LAG(p.CreationDate, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostCreationDate
+    FROM Posts p
+    LEFT JOIN PostEditAndCloseHistory peh ON p.Id = peh.PostId
+    LEFT JOIN PostLinkSummary pls ON p.Id = pls.PostId
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserBadgeSummary AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(b.Id) AS TotalBadges,
+        COUNT(DISTINCT CASE WHEN b.TagBased = TRUE THEN b.Name END) AS UniqueTagBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserTagInterest AS (
+    SELECT
+        u.Id AS UserId,
+        STRING_AGG(DISTINCT LOWER(SUBSTRING(unnest(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><')), 1, 50)), ';') AS TopTagsString,
+        COUNT(DISTINCT LOWER(SUBSTRING(unnest(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2), '><')), 1, 50))) AS UniqueTagsUsedCount
+    FROM Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND p.Tags != ''
+    GROUP BY u.Id
+),
+CombinedUserPostStats AS (
+    SELECT
+        ue.UserId,
+        ue.DisplayName,
+        ue.Reputation,
+        ue.CreationDate,
+        ue.LastAccessDate,
+        ue.UserProfileViews,
+        ue.UserTotalUpvotesReceived,
+        ue.UserTotalDownvotesReceived,
+        ue.TotalPostsOwned,
+        ue.TotalQuestionsOwned,
+        ue.TotalAnswersOwned,
+        ue.TotalCommentsMade,
+        ue.TotalUpvotesGiven,
+        ue.TotalDownvotesGiven,
+        COALESCE(ubs.GoldBadges, 0) AS GoldBadges,
+        COALESCE(ubs.SilverBadges, 0) AS SilverBadges,
+        COALESCE(ubs.BronzeBadges, 0) AS BronzeBadges,
+        COALESCE(ubs.TotalBadges, 0) AS TotalBadges,
+        COALESCE(ubs.UniqueTagBadges, 0) AS UniqueTagBadges,
+        uti.TopTagsString,
+        uti.UniqueTagsUsedCount,
+        AVG(dpm.Score) AS AveragePostScore,
+        SUM(dpm.ViewCount) AS TotalPostViews,
+        SUM(CASE WHEN dpm.PostTypeId = 1 THEN dpm.ViewCount ELSE 0 END) AS TotalQuestionViews,
+        MAX(dpm.LastBodyEditDate) AS MostRecentPostEdit,
+        SUM(dpm.EditCount) AS TotalEditsOnOwnedPosts,
+        SUM(dpm.CloseCount) AS TotalCloseEventsOnOwnedPosts,
+        SUM(dpm.LinkedPosts) AS TotalLinkedPosts,
+        SUM(dpm.DuplicatesFound) AS TotalDuplicateDeclarations,
+        SUM(CASE WHEN dpm.IsClosed THEN 1 ELSE 0 END) AS PostsCurrentlyClosed,
+        SUM(CASE WHEN dpm.HasCodeBlock THEN 1 ELSE 0 END) AS PostsWithCode,
+        AVG(dpm.BodyLength) AS AvgPostBodyLength,
+        AVG(dpm.TitleLength) AS AvgPostTitleLength,
+        COALESCE(CAST(ue.TotalUpvotesGiven AS DECIMAL(10,2)) / NULLIF(ue.TotalDownvotesGiven, 0), 0) AS VotesGivenRatio,
+        COALESCE(CAST(ue.UserTotalUpvotesReceived AS DECIMAL(10,2)) / NULLIF(ue.UserTotalDownvotesReceived, 0), 0) AS VotesReceivedRatio,
+        COALESCE(CAST(ue.Reputation AS DECIMAL(10,2)) / NULLIF(EXTRACT(DAY FROM (CURRENT_TIMESTAMP - ue.CreationDate)), 0), 0) AS RepPerDayLifeTime,
+        COALESCE(AVG(dpm.AvgPrev3PostScore), 0) AS AvgMovingPrev3Scores
+    FROM UserEngagement ue
+    LEFT JOIN UserBadgeSummary ubs ON ue.UserId = ubs.UserId
+    LEFT JOIN UserTagInterest uti ON ue.UserId = uti.UserId
+    LEFT JOIN DetailedPostMetrics dpm ON ue.UserId = dpm.OwnerUserId
+    GROUP BY
+        ue.UserId, ue.DisplayName, ue.Reputation, ue.CreationDate, ue.LastAccessDate, ue.UserProfileViews,
+        ue.UserTotalUpvotesReceived, ue.UserTotalDownvotesReceived, ue.TotalPostsOwned, ue.TotalQuestionsOwned,
+        ue.TotalAnswersOwned, ue.TotalCommentsMade, ue.TotalUpvotesGiven, ue.TotalDownvotesGiven,
+        ubs.GoldBadges, ubs.SilverBadges, ubs.BronzeBadges, ubs.TotalBadges, ubs.UniqueTagBadges,
+        uti.TopTagsString, uti.UniqueTagsUsedCount
+),
+TopUsersByEngagement AS (
+    SELECT
+        cups.*,
+        RANK() OVER (ORDER BY cups.Reputation DESC, cups.TotalPostsOwned DESC) AS GlobalEngagementRank,
+        NTILE(5) OVER (ORDER BY cups.Reputation DESC) AS ReputationQuintile,
+        ROW_NUMBER() OVER (PARTITION BY COALESCE(cups.TopTagsString, 'No Tags') ORDER BY cups.Reputation DESC) AS RankWithinTagInterest
+    FROM CombinedUserPostStats cups
+    WHERE cups.TotalPostsOwned > 50 AND cups.AveragePostScore > 0
+),
+ModeratorPotential AS (
+    SELECT
+        tue.UserId,
+        tue.DisplayName,
+        tue.Reputation,
+        tue.GoldBadges,
+        tue.TotalQuestionsOwned,
+        tue.TotalAnswersOwned,
+        tue.AveragePostScore,
+        tue.PostsCurrentlyClosed,
+        tue.TotalEditsOnOwnedPosts,
+        tue.TopTagsString,
+        'Moderator Candidate' AS UserCategory,
+        NULL AS AdditionalInfo
+    FROM TopUsersByEngagement tue
+    WHERE tue.Reputation > 10000
+      AND tue.GoldBadges >= 5
+      AND tue.TotalQuestionsOwned > 20
+      AND tue.TotalAnswersOwned > 50
+      AND tue.PostsCurrentlyClosed = 0
+      AND tue.TotalEditsOnOwnedPosts < 100
+      AND tue.AvgPostBodyLength > 100
+),
+CommunityReviewers AS (
+    SELECT
+        tue.UserId,
+        tue.DisplayName,
+        tue.Reputation,
+        tue.GoldBadges,
+        tue.TotalQuestionsOwned,
+        tue.TotalAnswersOwned,
+        tue.AveragePostScore,
+        tue.PostsCurrentlyClosed,
+        tue.TotalEditsOnOwnedPosts,
+        tue.TopTagsString,
+        'Community Reviewer' AS UserCategory,
+        ARRAY_TO_STRING(
+            (SELECT ARRAY_AGG(DISTINCT reason) FROM (
+                SELECT UNNEST(dpm_inner.AllCloseReasonsGiven) AS reason
+                FROM DetailedPostMetrics dpm_inner
+                WHERE dpm_inner.OwnerUserId = tue.UserId AND dpm_inner.IsClosed = TRUE
+            ) AS subquery_reasons), ', '
+        ) AS PopularCloseReasons
+    FROM TopUsersByEngagement tue
+    WHERE tue.Reputation > 5000
+      AND tue.TotalCommentsMade > 100
+      AND tue.TotalUpvotesGiven > 500
+      AND tue.TotalDownvotesGiven < 100
+    GROUP BY tue.UserId, tue.DisplayName, tue.Reputation, tue.GoldBadges, tue.TotalQuestionsOwned, tue.TotalAnswersOwned, tue.AveragePostScore, tue.PostsCurrentlyClosed, tue.TotalEditsOnOwnedPosts, tue.TopTagsString
+),
+HighImpactContributors AS (
+    SELECT
+        tue.UserId,
+        tue.DisplayName,
+        tue.Reputation,
+        tue.GoldBadges,
+        tue.TotalQuestionsOwned,
+        tue.TotalAnswersOwned,
+        tue.AveragePostScore,
+        tue.PostsCurrentlyClosed,
+        tue.TotalEditsOnOwnedPosts,
+        tue.TopTagsString,
+        'High Impact Contributor' AS UserCategory,
+        CAST(tue.UserTotalUpvotesReceived AS TEXT) AS AdditionalInfo
+    FROM TopUsersByEngagement tue
+    WHERE tue.GlobalEngagementRank <= 100
+      AND tue.RepPerDayLifeTime > 10
+      AND tue.VotesReceivedRatio > 5
+),
+MigratedPostOwners AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalMigratedPosts,
+        ARRAY_AGG(DISTINCT ph.Text) FILTER (WHERE ph.PostHistoryTypeId = 35) AS MigratedAwayDetails,
+        ARRAY_AGG(DISTINCT ph.Text) FILTER (WHERE ph.PostHistoryTypeId = 36) AS MigratedHereDetails
+    FROM Posts p
+    JOIN PostHistory ph ON p.Id = ph.PostId
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE ph.PostHistoryTypeId IN (35, 36)
+    GROUP BY p.OwnerUserId, u.DisplayName
+    HAVING COUNT(DISTINCT p.Id) > 0
+),
+MigratedUserSummary AS (
+    SELECT
+        mpo.UserId,
+        mpo.DisplayName,
+        (SELECT Reputation FROM Users WHERE Id = mpo.UserId) AS Reputation,
+        NULL AS GoldBadges,
+        NULL AS TotalQuestionsOwned,
+        NULL AS TotalAnswersOwned,
+        NULL AS AveragePostScore,
+        NULL AS PostsCurrentlyClosed,
+        NULL AS TotalEditsOnOwnedPosts,
+        NULL AS TopTagsString,
+        'Migrated Post Owner' AS UserCategory,
+        CONCAT(
+            'Away: ', COALESCE(ARRAY_TO_STRING(mpo.MigratedAwayDetails, '; '), 'N/A'),
+            ' | Here: ', COALESCE(ARRAY_TO_STRING(mpo.MigratedHereDetails, '; '), 'N/A')
+        ) AS AdditionalInfo
+    FROM MigratedPostOwners mpo
+)
+SELECT
+    UserId,
+    DisplayName,
+    Reputation,
+    GoldBadges,
+    TotalQuestionsOwned,
+    TotalAnswersOwned,
+    AveragePostScore,
+    PostsCurrentlyClosed,
+    TotalEditsOnOwnedPosts,
+    TopTagsString,
+    UserCategory,
+    AdditionalInfo
+FROM ModeratorPotential
+UNION ALL
+SELECT
+    UserId,
+    DisplayName,
+    Reputation,
+    GoldBadges,
+    TotalQuestionsOwned,
+    TotalAnswersOwned,
+    AveragePostScore,
+    PostsCurrentlyClosed,
+    TotalEditsOnOwnedPosts,
+    TopTagsString,
+    UserCategory,
+    PopularCloseReasons AS AdditionalInfo
+FROM CommunityReviewers
+UNION ALL
+SELECT
+    UserId,
+    DisplayName,
+    Reputation,
+    GoldBadges,
+    TotalQuestionsOwned,
+    TotalAnswersOwned,
+    AveragePostScore,
+    PostsCurrentlyClosed,
+    TotalEditsOnOwnedPosts,
+    TopTagsString,
+    UserCategory,
+    AdditionalInfo
+FROM HighImpactContributors
+UNION ALL
+SELECT
+    UserId,
+    DisplayName,
+    Reputation,
+    GoldBadges,
+    TotalQuestionsOwned,
+    TotalAnswersOwned,
+    AveragePostScore,
+    PostsCurrentlyClosed,
+    TotalEditsOnOwnedPosts,
+    TopTagsString,
+    UserCategory,
+    AdditionalInfo
+FROM MigratedUserSummary
+ORDER BY Reputation DESC, UserCategory
+LIMIT 2000;

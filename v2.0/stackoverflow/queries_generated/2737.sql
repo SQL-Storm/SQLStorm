@@ -1,0 +1,133 @@
+-- {"query": "2737.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1267} 
+with UserBadges as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct case when b.Class = 1 then b.Id end) as GoldBadges,
+        count(distinct case when b.Class = 2 then b.Id end) as SilverBadges,
+        count(distinct case when b.Class = 3 then b.Id end) as BronzeBadges,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+RecentPosts as (
+    select 
+        p.Id as PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Tags,
+        p.AcceptedAnswerId,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as rn
+    from Posts p
+    where p.PostTypeId in (1, 2) -- Questions and Answers only
+),
+QuestionAnswers as (
+    select 
+        q.Id as QuestionId,
+        q.Title as QuestionTitle,
+        q.Tags,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.OwnerUserId as AnswerOwnerId,
+        u.DisplayName as AnswererDisplayName
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Users u on u.Id = a.OwnerUserId
+    where q.PostTypeId = 1 and q.ClosedDate is null
+),
+TopTags as (
+    select 
+        t.TagName,
+        count(p.Id) as PostCount,
+        avg(p.Score) as AvgScore,
+        max(p.ViewCount) as MaxViewCount
+    from Tags t
+    join Posts p on p.PostTypeId = 1 and p.Tags like '%' || t.TagName || '%'
+    where p.Tags is not null
+    group by t.TagName
+    having count(p.Id) > 100
+),
+UserActivity as (
+    select 
+        u.Id as UserId, 
+        u.DisplayName,
+        count(distinct p.Id) as PostCount,
+        count(distinct c.Id) as CommentCount,
+        coalesce(sum(vt2.Score),0) as VoteScoreSum,
+        max(p.CreationDate) as LastPostDate,
+        bool_or(case when bh.PostHistoryTypeId = 10 then true else false end) as HasClosedPosts
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    left join Votes vt2 on vt2.PostId = p.Id and vt2.VoteTypeId = 2 -- UpMod votes on user's posts
+    left join PostHistory bh on bh.PostId = p.Id
+    group by u.Id, u.DisplayName
+),
+DuplicateLinks as (
+    select 
+        pl.PostId,
+        pl.RelatedPostId,
+        count(*) over (partition by pl.PostId) as DupCount,
+        row_number() over (partition by pl.RelatedPostId order by pl.CreationDate desc) as rn
+    from PostLinks pl
+    where pl.LinkTypeId = 3 -- duplicates only
+),
+LatestPostComments as (
+    select distinct on (c.PostId)
+        c.PostId,
+        c.UserId,
+        c.Text as CommentText,
+        c.CreationDate as CommentDate
+    from Comments c
+    order by c.PostId, c.CreationDate desc
+)
+
+select 
+    u.DisplayName,
+    u.Reputation,
+    ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges,
+    ua.PostCount,
+    ua.CommentCount,
+    ua.VoteScoreSum,
+    ua.HasClosedPosts,
+    q.QuestionId,
+    q.QuestionTitle,
+    q.Tags,
+    q.AnswerId,
+    q.AnswerScore,
+    q.AnswererDisplayName,
+    dt.DupCount,
+    coalesce(lc.CommentText, 'No Comments') as LatestCommentOnPost,
+    tt.TagName,
+    tt.PostCount as TagPostCount,
+    tt.AvgScore as TagAverageScore,
+    tt.MaxViewCount as TagMaxViewCount,
+    dense_rank() over (partition by u.Id order by q.AnswerScore desc nulls last) as AnswerRankByScore,
+    case 
+       when ua.PostCount > 50 and ua.VoteScoreSum > 200 then 'Active'
+       when ua.PostCount > 10 then 'Moderate'
+       else 'Inactive'
+    end as ActivityCategory,
+    coalesce(p.ViewCount, 0) * 1.0 / nullif(u.Reputation,0) as ViewsPerReputationRatio,
+    case when p.Title is not null then upper(substr(p.Title,1,20)) else 'UNKNOWN' end as PostTitleSnippet
+from Users u
+inner join UserBadges ub on ub.UserId = u.Id
+left join UserActivity ua on ua.UserId = u.Id
+left join QuestionAnswers q on q.AnswerOwnerId = u.Id
+left join DuplicateLinks dt on dt.PostId = q.AnswerId and dt.rn = 1
+left join LatestPostComments lc on lc.PostId = q.AnswerId
+left join Posts p on p.Id = q.AnswerId
+left join TopTags tt on p.Tags like '%' || tt.TagName || '%'
+where 
+    u.CreationDate < now() - interval '180 days' and
+    ua.HasClosedPosts = false and
+    coalesce(q.AnswerScore,0) > 5 and
+    (select count(*) from PostHistory ph where ph.PostId = q.QuestionId and ph.PostHistoryTypeId = 10) = 0
+order by u.Reputation desc, q.AnswerScore desc
+limit 100;

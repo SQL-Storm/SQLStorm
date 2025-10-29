@@ -1,0 +1,113 @@
+-- {"query": "3949.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1902} 
+WITH UserStats AS (
+    SELECT u.Id,
+           u.DisplayName,
+           u.Reputation,
+           u.CreationDate,
+           u.LastAccessDate,
+           COALESCE(p.PostCnt, 0)          AS PostCount,
+           COALESCE(a.AnsCnt, 0)          AS AnswerCount,
+           COALESCE(v.UpVotes, 0) -
+           COALESCE(v.DownVotes, 0)       AS NetVoteScore,
+           ROW_NUMBER() OVER (ORDER BY COALESCE(p.PostCnt, 0) DESC) AS PostRank
+    FROM Users u
+    LEFT JOIN (
+        SELECT OwnerUserId, COUNT(*) AS PostCnt
+        FROM Posts
+        GROUP BY OwnerUserId
+    ) p ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT OwnerUserId, COUNT(*) AS AnsCnt
+        FROM Posts
+        WHERE PostTypeId = 2
+        GROUP BY OwnerUserId
+    ) a ON a.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT UserId,
+               SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+               SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes
+        GROUP BY UserId
+    ) v ON v.UserId = u.Id
+),
+
+TopBadges AS (
+    SELECT b.UserId,
+           STRING_AGG(b.Name, ', ') WITHIN GROUP (ORDER BY b.Class, b.Name) AS BadgeList,
+           MAX(b.Date) AS LatestBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+RecentClosedQuestions AS (
+    SELECT ph.PostId,
+           MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId = 10) AS ClosedDate,
+           MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Comment END) AS CloseReasonId
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.PostId
+),
+
+TagPopularity AS (
+    SELECT t.TagName,
+           t.Count,
+           ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank
+    FROM Tags t
+    WHERE t.IsRequired = 0
+),
+
+Combined AS (
+    SELECT us.Id,
+           us.DisplayName,
+           us.Reputation,
+           us.PostCount,
+           us.AnswerCount,
+           us.NetVoteScore,
+           us.PostRank,
+           tb.BadgeList,
+           tb.LatestBadgeDate,
+           rc.ClosedDate,
+           rc.CloseReasonId,
+           COALESCE(p.Title, '')               AS LastQuestionTitle,
+           COALESCE(p.Tags, '')                AS LastQuestionTags,
+           COALESCE(p.CreationDate, '1970-01-01') AS LastQuestionDate,
+           ROW_NUMBER() OVER (PARTITION BY us.Id ORDER BY p.CreationDate DESC NULLS LAST) AS QuestionRecencyRank
+    FROM UserStats us
+    LEFT JOIN TopBadges tb ON tb.UserId = us.Id
+    LEFT JOIN (
+        SELECT OwnerUserId, Id, Title, Tags, CreationDate
+        FROM Posts
+        WHERE PostTypeId = 1
+    ) p ON p.OwnerUserId = us.Id
+    LEFT JOIN RecentClosedQuestions rc ON rc.PostId = p.Id
+)
+
+SELECT *
+FROM Combined
+WHERE (PostCount > 10 AND Reputation > 1000)
+   OR (BadgeList IS NOT NULL AND LatestBadgeDate > cast('2024-10-01' as date) - INTERVAL '30 days')
+   OR (QuestionRecencyRank = 1
+       AND CloseReasonId IS NOT NULL
+       AND CAST(CloseReasonId AS INTEGER) BETWEEN 101 AND 105)
+ORDER BY PostRank ASC, Reputation DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT NULL AS Id,
+       '---' AS DisplayName,
+       NULL AS Reputation,
+       NULL AS PostCount,
+       NULL AS AnswerCount,
+       NULL AS NetVoteScore,
+       NULL AS PostRank,
+       NULL AS BadgeList,
+       NULL AS LatestBadgeDate,
+       NULL AS ClosedDate,
+       NULL AS CloseReasonId,
+       NULL AS LastQuestionTitle,
+       NULL AS LastQuestionTags,
+       NULL AS LastQuestionDate,
+       NULL AS QuestionRecencyRank
+FROM (SELECT 1) dummy
+WHERE NOT EXISTS (SELECT 1 FROM Combined WHERE PostCount > 10);

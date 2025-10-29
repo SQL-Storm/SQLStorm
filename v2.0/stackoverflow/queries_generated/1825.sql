@@ -1,0 +1,195 @@
+-- {"query": "1825.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2527} 
+
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        COALESCE(U.DisplayName, 'Anonymous') AS DisplayName,
+        U.Reputation,
+        U.CreationDate,
+        U.LastAccessDate,
+        U.Views AS ProfileViews,
+        U.UpVotes AS UserUpVotes,
+        U.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswers,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        SUM(COALESCE(P.Score, 0)) AS TotalPostScoreFromOwnedPosts,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadgesCount,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadgesCount,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadgesCount
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Views, U.UpVotes, U.DownVotes
+),
+PostDetailsExtended AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.OwnerUserId,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.CreationDate AS PostCreationDate,
+        P.LastEditDate,
+        P.ClosedDate,
+        P.AcceptedAnswerId,
+        P.Tags,
+        PL.RelatedPostId AS LinkedDuplicatePostId,
+        PL.LinkTypeId AS LinkedDuplicateTypeId,
+        (CASE WHEN P.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS HasAcceptedAnswerAvailable,
+        COALESCE(EXTRACT(EPOCH FROM (P.LastEditDate - P.CreationDate)) / 3600, 0) AS HoursSinceCreationToLastEdit,
+        COALESCE(EXTRACT(EPOCH FROM (P.ClosedDate - P.CreationDate)) / 86400, 0) AS DaysToClose,
+        (SELECT COUNT(DISTINCT PH.Id) FROM PostHistory PH WHERE PH.PostId = P.Id AND PH.PostHistoryTypeId IN (4,5,6)) AS EditCount,
+        (SELECT SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) FROM Votes V WHERE V.PostId = P.Id) AS UpVoteCount,
+        (SELECT SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) FROM Votes V WHERE V.PostId = P.Id) AS DownVoteCount
+    FROM Posts P
+    JOIN PostTypes PT ON P.PostTypeId = PT.Id
+    LEFT JOIN PostLinks PL ON P.Id = PL.PostId AND PL.LinkTypeId = 3
+),
+RankedPostsByActivity AS (
+    SELECT
+        PDE.*,
+        ROW_NUMBER() OVER (PARTITION BY PDE.OwnerUserId ORDER BY PDE.Score DESC, PDE.ViewCount DESC) AS UserPostRank,
+        AVG(PDE.Score) OVER (PARTITION BY PDE.PostTypeId) AS AvgScoreForPostType,
+        NTILE(10) OVER (ORDER BY PDE.Score DESC) AS ScoreDecile,
+        (CASE
+            WHEN PDE.PostTypeId = 1 AND PDE.Tags IS NOT NULL THEN (
+                SELECT COUNT(DISTINCT T.Id)
+                FROM Tags T
+                WHERE T.TagName = ANY(string_to_array(substring(PDE.Tags, 2, length(PDE.Tags)-2), '><'))
+                AND EXISTS (
+                    SELECT 1
+                    FROM Posts P_inner
+                    WHERE P_inner.OwnerUserId = PDE.OwnerUserId
+                    AND P_inner.Score > 500
+                    AND P_inner.PostTypeId = 1
+                    AND P_inner.Id <> PDE.PostId
+                    AND P_inner.Tags LIKE '%' || T.TagName || '%'
+                )
+            )
+            ELSE 0
+        END) AS CorrelatedHighScoreTagOverlapCount
+    FROM PostDetailsExtended PDE
+    WHERE PDE.PostTypeId IN (1, 2)
+    AND PDE.PostCreationDate >= '2020-01-01'
+),
+TopUsersByReputation AS (
+    SELECT
+        UAS.UserId,
+        UAS.DisplayName,
+        UAS.Reputation,
+        'High Reputation Contributor' AS UserCategory,
+        NULLIF(UAS.TotalPostScoreFromOwnedPosts, 0) / NULLIF(UAS.TotalPosts, 0) AS AvgScorePerPost
+    FROM UserActivitySummary UAS
+    WHERE UAS.Reputation >= 50000
+    AND UAS.GoldBadgesCount >= 5
+    AND UAS.TotalQuestions >= 10
+    AND EXISTS (
+        SELECT 1
+        FROM Posts P
+        WHERE P.OwnerUserId = UAS.UserId
+        AND P.PostTypeId = 1
+        AND P.ViewCount > 10000
+        AND P.AnswerCount >= 5
+    )
+),
+TopUsersByImpactfulPosts AS (
+    SELECT
+        UAS.UserId,
+        UAS.DisplayName,
+        UAS.Reputation,
+        'Impactful Post Author' AS UserCategory,
+        NULLIF(UAS.TotalPostScoreFromOwnedPosts, 0) / NULLIF(UAS.TotalPosts, 0) AS AvgScorePerPost
+    FROM UserActivitySummary UAS
+    WHERE UAS.TotalPostScoreFromOwnedPosts >= 500
+    AND UAS.TotalAnswers >= 20
+    AND UAS.SilverBadgesCount >= 10
+    AND NOT EXISTS (
+        SELECT 1
+        FROM Posts P
+        WHERE P.OwnerUserId = UAS.UserId
+        AND P.CreationDate < (CURRENT_DATE - INTERVAL '5 years')
+        AND P.Score < 0
+    )
+    AND UAS.TotalPosts > 0
+)
+SELECT
+    'UserSummary' AS DataType,
+    TU.UserId AS EntityId,
+    TU.DisplayName AS EntityName,
+    TU.Reputation AS EntityMetric1,
+    TU.UserCategory AS EntityCategory,
+    TU.AvgScorePerPost AS EntityMetric2,
+    UAS.TotalPosts AS EntityMetric3,
+    UAS.TotalCommentsMade AS EntityMetric4,
+    UAS.GoldBadgesCount AS EntityMetric5,
+    UAS.SilverBadgesCount AS EntityMetric6,
+    UAS.BronzeBadgesCount AS EntityMetric7,
+    COALESCE(U.Location, 'Unknown Location') AS AdditionalInfo1,
+    U.AboutMe IS NOT NULL AS AdditionalInfo2,
+    LENGTH(COALESCE(U.WebsiteUrl, '')) > 0 AS AdditionalInfo3,
+    AGE(U.LastAccessDate, U.CreationDate) AS AdditionalInfo4,
+    EXTRACT(DOW FROM U.CreationDate) AS AdditionalInfo5,
+    ROUND(CAST(UAS.UserUpVotes AS NUMERIC) / NULLIF(UAS.UserUpVotes + UAS.UserDownVotes, 0), 2) AS AdditionalInfo6,
+    NULL::INT AS AdditionalInfo7
+FROM TopUsersByReputation TU
+JOIN UserActivitySummary UAS ON TU.UserId = UAS.UserId
+JOIN Users U ON TU.UserId = U.Id
+UNION ALL
+SELECT
+    'UserSummary' AS DataType,
+    TI.UserId AS EntityId,
+    TI.DisplayName AS EntityName,
+    TI.Reputation AS EntityMetric1,
+    TI.UserCategory AS EntityCategory,
+    TI.AvgScorePerPost AS EntityMetric2,
+    UAS.TotalPosts AS EntityMetric3,
+    UAS.TotalCommentsMade AS EntityMetric4,
+    UAS.GoldBadgesCount AS EntityMetric5,
+    UAS.SilverBadgesCount AS EntityMetric6,
+    UAS.BronzeBadgesCount AS EntityMetric7,
+    COALESCE(U.Location, 'Unknown Location') AS AdditionalInfo1,
+    U.AboutMe IS NOT NULL AS AdditionalInfo2,
+    LENGTH(COALESCE(U.WebsiteUrl, '')) > 0 AS AdditionalInfo3,
+    AGE(U.LastAccessDate, U.CreationDate) AS AdditionalInfo4,
+    EXTRACT(DOW FROM U.CreationDate) AS AdditionalInfo5,
+    ROUND(CAST(UAS.UserUpVotes AS NUMERIC) / NULLIF(UAS.UserUpVotes + UAS.UserDownVotes, 0), 2) AS AdditionalInfo6,
+    NULL::INT AS AdditionalInfo7
+FROM TopUsersByImpactfulPosts TI
+JOIN UserActivitySummary UAS ON TI.UserId = UAS.UserId
+JOIN Users U ON TI.UserId = U.Id
+WHERE TI.UserId NOT IN (SELECT UserId FROM TopUsersByReputation)
+UNION ALL
+SELECT
+    'PostSummary' AS DataType,
+    RP.PostId AS EntityId,
+    COALESCE(P.Title, 'No Title') AS EntityName,
+    RP.Score AS EntityMetric1,
+    RP.PostTypeName AS EntityCategory,
+    RP.ScorePerViewRatio AS EntityMetric2,
+    RP.ViewCount AS EntityMetric3,
+    RP.CommentCount AS EntityMetric4,
+    RP.FavoriteCount AS EntityMetric5,
+    RP.EditCount AS EntityMetric6,
+    RP.HoursSinceCreationToLastEdit AS EntityMetric7,
+    COALESCE(U.Location, 'N/A') AS AdditionalInfo1,
+    (RP.HasAcceptedAnswerAvailable = 1) AS AdditionalInfo2,
+    LENGTH(COALESCE(P.Body, '')) > 1000 AS AdditionalInfo3,
+    AGE(CURRENT_DATE, RP.PostCreationDate) AS AdditionalInfo4,
+    RP.ScoreDecile AS AdditionalInfo5,
+    ROUND(CAST(RP.UpVoteCount AS NUMERIC) / NULLIF(RP.UpVoteCount + RP.DownVoteCount, 0), 2) AS AdditionalInfo6,
+    RP.CorrelatedHighScoreTagOverlapCount AS AdditionalInfo7
+FROM RankedPostsByActivity RP
+LEFT JOIN Users U ON RP.OwnerUserId = U.Id
+LEFT JOIN Posts P ON RP.PostId = P.Id
+WHERE RP.UserPostRank <= 3
+AND RP.AvgScoreForPostType > 5
+AND (RP.PostTypeName = 'Question' OR RP.HasAcceptedAnswerAvailable = 1)
+ORDER BY DataType, EntityMetric1 DESC NULLS LAST, EntityId ASC;

@@ -1,0 +1,292 @@
+-- {"query": "1542.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 4063} 
+WITH UserEngagementMetrics AS (
+    -- CTE 1: Aggregates user activity, reputation, and derived engagement metrics
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.Views AS UserProfileViews,
+        u.UpVotes AS UserUpVotesGiven,
+        u.DownVotes AS UserDownVotesGiven,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) AS TotalPostsCreated,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId IN (2, 3, 5, 8, 9)) AS TotalActionVotesCast, -- Up/Down/Favorite/BountyStart/BountyClose votes
+        COUNT(DISTINCT b.Id) AS TotalBadgesReceived,
+        MAX(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS HasGoldBadge,
+        AVG(EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - p.CreationDate)) / 86400.0) FILTER (WHERE p.CreationDate IS NOT NULL) AS AvgDaysSincePostCreation,
+        MAX(CASE WHEN p.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year') THEN 1 ELSE 0 END) AS PostedInLastYearFlag
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate, u.LastAccessDate
+    HAVING COUNT(DISTINCT p.Id) > 0 OR COUNT(DISTINCT c.Id) > 0 OR COUNT(DISTINCT v.Id) > 0 -- Filter out users with no recordable activity
+),
+PostHistoryDetailed AS (
+    -- CTE 2: Extracts detailed historical events and time differences for posts
+    SELECT
+        ph.PostId,
+        MIN(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId = 1) AS InitialTitleCreationDate,
+        MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId IN (4, 5, 6)) AS LastContentEditDate,
+        MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId = 10) AS LastClosedDate,
+        MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId = 11) AS LastReopenedDate,
+        MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId = 12) AS LastDeletedDate,
+        MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId = 13) AS LastUndeletedDate,
+        COUNT(DISTINCT ph.Id) AS TotalHistoryEntries,
+        COUNT(ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9)) AS TotalEditAndRollbackEvents,
+        (
+            SELECT MAX(ph2.CreationDate)
+            FROM PostHistory ph2
+            WHERE ph2.PostId = ph.PostId
+            AND ph2.PostHistoryTypeId IN (4, 5, 6)
+            AND ph2.CreationDate < (
+                SELECT MAX(ph3.CreationDate)
+                FROM PostHistory ph3
+                WHERE ph3.PostId = ph.PostId
+                AND ph3.PostHistoryTypeId IN (4, 5, 6)
+            )
+        ) AS SecondToLastEditDate,
+        (
+            SELECT crt.Name
+            FROM PostHistory ph_close
+            JOIN CloseReasonTypes crt ON CAST(SPLIT_PART(ph_close.Comment, ',', 1) AS SMALLINT) = crt.Id
+            WHERE ph_close.PostId = ph.PostId
+            AND ph_close.PostHistoryTypeId = 10
+            ORDER BY ph_close.CreationDate DESC
+            LIMIT 1
+        ) AS PrimaryCloseReasonName,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 50 THEN 1 ELSE 0 END) AS WasCommunityBumped
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+),
+PostContentAnalysis AS (
+    -- CTE 3: Analyzes content characteristics and related posts
+    SELECT
+        p.Id AS PostId,
+        LENGTH(p.Body) AS BodyCharacterCount,
+        LENGTH(p.Title) AS TitleCharacterCount,
+        LENGTH(p.Tags) AS TagsCharacterCount,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id AND c.Score > 0) AS PositiveCommentCount,
+        (SELECT COUNT(DISTINCT pl.RelatedPostId) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 1) AS LinksToOtherPostsCount,
+        (SELECT COUNT(DISTINCT pl.RelatedPostId) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3) AS DuplicatedByPostsCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvoteCountActual,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvoteCountActual,
+        SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoriteCountActual
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Body, p.Title, p.Tags
+),
+TagPerformanceMetrics AS (
+    -- CTE 4: Aggregates performance metrics per tag
+    SELECT
+        TRIM(UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><'))) AS TagName,
+        COUNT(DISTINCT p.Id) AS TaggedQuestionCount,
+        SUM(p.Score) AS TotalScorePerTag,
+        AVG(p.Score) AS AvgScorePerTag,
+        SUM(p.ViewCount) AS TotalViewsPerTag,
+        AVG(p.ViewCount) AS AvgViewsPerTag,
+        COUNT(DISTINCT p.OwnerUserId) AS UniqueOwnersPerTag
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND LENGTH(TRIM(p.Tags)) > 2
+    GROUP BY TRIM(UNNEST(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><')))
+),
+CoreQuestionData AS (
+    -- Base CTE for all main question data with joins to other CTEs and Users
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.FavoriteCount,
+        p.AnswerCount,
+        p.CommentCount,
+        u_owner.DisplayName AS OwnerDisplayName,
+        u_owner.Location AS OwnerLocation,
+        u_owner.WebsiteUrl AS OwnerWebsite,
+        u_editor.DisplayName AS LastEditorDisplayName,
+        uem.Reputation AS OwnerReputation,
+        phd.TotalEditAndRollbackEvents,
+        phd.TotalHistoryEntries,
+        pca.BodyCharacterCount,
+        pca.TitleCharacterCount,
+        pca.PositiveCommentCount,
+        pca.LinksToOtherPostsCount,
+        pca.DuplicatedByPostsCount,
+        pca.UpvoteCountActual,
+        pca.DownvoteCountActual,
+        COALESCE(phd.PrimaryCloseReasonName, 'N/A') AS PrimaryCloseReason,
+        CASE
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Accepted'
+            WHEN p.AnswerCount > 0 THEN 'Has Answers'
+            ELSE 'No Accepted Answer'
+        END AS AnswerStatus,
+        -- Window function: Calculate average score for the owner's posts within a specific time frame
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId, EXTRACT(YEAR FROM p.CreationDate)) AS OwnerAvgScoreInYear,
+        -- Window function: Rank posts by a complex engagement score within their creation year
+        RANK() OVER (PARTITION BY EXTRACT(YEAR FROM p.CreationDate) ORDER BY (p.Score * 2 + p.CommentCount * 3 + COALESCE(p.FavoriteCount, 0) * 5 + pca.UpvoteCountActual * 1.5) DESC, p.ViewCount DESC) AS EngagementRankByYear,
+        -- String expression: Formatted list of tags
+        ARRAY_TO_STRING(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><'), ', ') AS TagList,
+        -- Correlated subquery for the text of the most recent positive-score comment
+        (
+            SELECT c.Text
+            FROM Comments c
+            WHERE c.PostId = p.Id AND c.Score > 0
+            ORDER BY c.CreationDate DESC
+            LIMIT 1
+        ) AS LatestPositiveCommentText,
+        -- Complex calculation/expression: Weighted Engagement Ratio (avoid division by zero)
+        (p.Score * 10.0 + COALESCE(p.FavoriteCount, 0) * 5.0 + p.CommentCount * 2.0 + pca.LinksToOtherPostsCount * 3.0) / NULLIF(p.ViewCount + p.AnswerCount + 1, 0) AS WeightedEngagementRatio,
+        -- NULL logic: Effective last activity date (prefer LastEditDate from post, then LastActivityDate, then CreationDate)
+        COALESCE(p.LastEditDate, p.LastActivityDate, p.CreationDate) AS EffectiveLastActivityDate,
+        p.ClosedDate IS NOT NULL AS IsClosedFlag,
+        p.CommunityOwnedDate IS NOT NULL AS IsCommunityOwnedFlag,
+        AGE(cast('2024-10-01 12:34:56' as timestamp), p.CreationDate) AS PostAgeInterval,
+        (
+            SELECT AVG(v_bounty.BountyAmount)
+            FROM Votes v_bounty
+            WHERE v_bounty.PostId = p.Id AND v_bounty.VoteTypeId = 8 AND v_bounty.BountyAmount IS NOT NULL
+        ) AS AverageBountyAmount,
+        phd.LastClosedDate,
+        phd.LastReopenedDate,
+        phd.LastDeletedDate,
+        phd.LastUndeletedDate,
+        phd.WasCommunityBumped,
+        -- Correlated subquery for last body edit content, with string replacement
+        TRIM(COALESCE(
+            (SELECT REGEXP_REPLACE(ph_body.Text, '[^a-zA-Z0-9 ]', '', 'g') FROM PostHistory ph_body WHERE ph_body.PostId = p.Id AND ph_body.PostHistoryTypeId = 5 ORDER BY ph_body.CreationDate DESC LIMIT 1),
+            'No Body Edit'
+        )) AS LastBodyEditTextClean,
+        -- Example of a string function with conditional logic for tags
+        (CASE WHEN p.Tags LIKE '%<java>%' THEN 'Java Related'
+              WHEN p.Tags LIKE '%<python>%' THEN 'Python Related'
+              WHEN p.Tags LIKE '%<c#>%<' THEN 'C# Related'
+              ELSE 'Other Technology' END) AS PrimaryTechTagGroup
+    FROM Posts p
+    JOIN UserEngagementMetrics uem ON p.OwnerUserId = uem.UserId
+    LEFT JOIN Users u_owner ON p.OwnerUserId = u_owner.Id
+    LEFT JOIN Users u_editor ON p.LastEditorUserId = u_editor.Id
+    LEFT JOIN PostHistoryDetailed phd ON p.Id = phd.PostId
+    LEFT JOIN PostContentAnalysis pca ON p.Id = pca.PostId
+    WHERE p.PostTypeId = 1
+),
+HighlyEngagedOrReopenedQuestions AS (
+    -- Selects questions that are either highly engaged or have gone through a close-reopen cycle
+    SELECT
+        'Highly Engaged Question' AS QuestionCategory,
+        cq.PostId,
+        cq.Title,
+        cq.CreationDate,
+        cq.Score,
+        cq.ViewCount,
+        cq.FavoriteCount,
+        cq.AnswerCount,
+        cq.CommentCount,
+        cq.OwnerDisplayName,
+        cq.OwnerLocation,
+        cq.OwnerWebsite,
+        cq.LastEditorDisplayName,
+        cq.OwnerReputation,
+        cq.TotalEditAndRollbackEvents,
+        cq.TotalHistoryEntries,
+        cq.BodyCharacterCount,
+        cq.TitleCharacterCount,
+        cq.PositiveCommentCount,
+        cq.LinksToOtherPostsCount,
+        cq.DuplicatedByPostsCount,
+        cq.UpvoteCountActual,
+        cq.DownvoteCountActual,
+        cq.PrimaryCloseReason,
+        cq.AnswerStatus,
+        cq.OwnerAvgScoreInYear,
+        cq.EngagementRankByYear,
+        cq.TagList,
+        cq.LatestPositiveCommentText,
+        cq.WeightedEngagementRatio,
+        cq.EffectiveLastActivityDate,
+        cq.IsClosedFlag,
+        cq.IsCommunityOwnedFlag,
+        cq.PostAgeInterval,
+        cq.AverageBountyAmount,
+        cq.LastBodyEditTextClean,
+        cq.PrimaryTechTagGroup,
+        tpm.AvgScorePerTag AS FirstTagAverageScore
+    FROM CoreQuestionData cq
+    LEFT JOIN TagPerformanceMetrics tpm ON tpm.TagName = (SELECT TRIM(UNNEST(string_to_array(SUBSTRING(cq.TagList, 2, LENGTH(cq.TagList)-2), '><'))) LIMIT 1)
+    WHERE
+        cq.Score >= 100
+        AND cq.ViewCount >= 5000
+        AND cq.AnswerCount >= 5
+        AND cq.TotalEditAndRollbackEvents > 3
+        AND cq.WeightedEngagementRatio >= 1.5
+        AND cq.BodyCharacterCount > 500 -- Minimum body length
+        AND cq.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '5 years') -- Relatively recent
+        AND (cq.TagList ILIKE '%<database>%' OR cq.TagList ILIKE '%<query>%') -- Must contain specific tags
+        AND (cq.OwnerLocation IS NOT NULL AND cq.OwnerLocation <> '') -- Owner has a location
+        AND cq.WasCommunityBumped = 0 -- Not community bumped
+        AND cq.PrimaryTechTagGroup IN ('Java Related', 'Python Related', 'C# Related') -- Filter by primary tech group
+),
+ControversialOrHistoricalQuestions AS (
+    -- Selects questions that have been closed and reopened, or deleted and undeleted, or have very high edit counts
+    SELECT
+        'Controversial/Historical Question' AS QuestionCategory,
+        cq.PostId,
+        cq.Title,
+        cq.CreationDate,
+        cq.Score,
+        cq.ViewCount,
+        cq.FavoriteCount,
+        cq.AnswerCount,
+        cq.CommentCount,
+        cq.OwnerDisplayName,
+        cq.OwnerLocation,
+        cq.OwnerWebsite,
+        cq.LastEditorDisplayName,
+        cq.OwnerReputation,
+        cq.TotalEditAndRollbackEvents,
+        cq.TotalHistoryEntries,
+        cq.BodyCharacterCount,
+        cq.TitleCharacterCount,
+        cq.PositiveCommentCount,
+        cq.LinksToOtherPostsCount,
+        cq.DuplicatedByPostsCount,
+        cq.UpvoteCountActual,
+        cq.DownvoteCountActual,
+        cq.PrimaryCloseReason,
+        cq.AnswerStatus,
+        cq.OwnerAvgScoreInYear,
+        cq.EngagementRankByYear,
+        cq.TagList,
+        cq.LatestPositiveCommentText,
+        cq.WeightedEngagementRatio,
+        cq.EffectiveLastActivityDate,
+        cq.IsClosedFlag,
+        cq.IsCommunityOwnedFlag,
+        cq.PostAgeInterval,
+        cq.AverageBountyAmount,
+        cq.LastBodyEditTextClean,
+        cq.PrimaryTechTagGroup,
+        tpm.AvgScorePerTag AS FirstTagAverageScore
+    FROM CoreQuestionData cq
+    LEFT JOIN TagPerformanceMetrics tpm ON tpm.TagName = (SELECT TRIM(UNNEST(string_to_array(SUBSTRING(cq.TagList, 2, LENGTH(cq.TagList)-2), '><'))) LIMIT 1)
+    WHERE
+        (
+            (cq.LastClosedDate IS NOT NULL AND cq.LastReopenedDate IS NOT NULL AND cq.LastReopenedDate > cq.LastClosedDate) OR -- Closed and then reopened
+            (cq.LastDeletedDate IS NOT NULL AND cq.LastUndeletedDate IS NOT NULL AND cq.LastUndeletedDate > cq.LastDeletedDate) OR -- Deleted and then undeleted
+            cq.TotalEditAndRollbackEvents > 10 -- Very high edit activity
+        )
+        AND cq.CreationDate < (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '3 years') -- Older historical questions
+        AND cq.Score > 50 -- Still valuable
+        AND cq.DuplicatedByPostsCount = 0 -- Not a known duplicate source
+        AND cq.Title ILIKE '%problem%' -- Title contains "problem"
+        AND cq.IsCommunityOwnedFlag = TRUE -- Community owned
+        AND (cq.AverageBountyAmount IS NULL OR cq.AverageBountyAmount < 100) -- No massive bounties
+)
+-- Final result: Combine both sets of questions using UNION ALL
+SELECT * FROM HighlyEngagedOrReopenedQuestions
+UNION ALL
+SELECT * FROM ControversialOrHistoricalQuestions
+ORDER BY QuestionCategory DESC, WeightedEngagementRatio DESC, EngagementRankByYear ASC, PostAgeInterval DESC, OwnerReputation DESC;

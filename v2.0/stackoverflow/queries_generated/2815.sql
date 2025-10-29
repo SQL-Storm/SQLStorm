@@ -1,0 +1,170 @@
+-- {"query": "2815.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1494} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        cast(t.TagName as varchar(1000)) as TagPath,
+        1 as Level
+    from Tags t
+    where t.IsRequired = 1
+
+    union all
+
+    select
+        c.Id,
+        c.TagName,
+        c.Count,
+        c.ExcerptPostId,
+        c.WikiPostId,
+        c.IsModeratorOnly,
+        c.IsRequired,
+        r.TagPath || ' > ' || c.TagName,
+        r.Level + 1
+    from Tags c
+    join RecursiveTagHierarchy r on c.Id = r.Id + 1 -- artificial hierarchy to simulate recursion
+    where c.IsRequired = 1 and r.Level < 3
+),
+LatestPostHistories as (
+    select ph.PostId, ph.PostHistoryTypeId, ph.CreationDate,
+           row_number() over (partition by ph.PostId, ph.PostHistoryTypeId order by ph.CreationDate desc) as rn
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (4,5,6) -- Edit Title, Edit Body, Edit Tags
+),
+FilteredLatestEdits as (
+    select ph.PostId,
+           max(case when ph.PostHistoryTypeId = 4 then ph.Text else null end) as LatestTitleEdit,
+           max(case when ph.PostHistoryTypeId = 5 then ph.Text else null end) as LatestBodyEdit,
+           max(case when ph.PostHistoryTypeId = 6 then ph.Text else null end) as LatestTagsEdit
+    from LatestPostHistories ph
+    where ph.rn = 1
+    group by ph.PostId
+),
+AnswerAggregates as (
+    select p.ParentId,
+           count(*) as AnswerCount,
+           avg(p.Score) as AvgAnswerScore,
+           bool_or(p.Score > 5) as HasHighScoreAnswer,
+           max(p.CreationDate) as LastAnswerDate
+    from Posts p
+    where p.PostTypeId = 2
+    group by p.ParentId
+),
+UserRanking as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        dense_rank() over (order by u.Reputation desc) as ReputationRank,
+        avg(b.Class) over (partition by u.Id) as AvgBadgeClass,
+        count(b.Id) over (partition by u.Id) as BadgeCount
+    from Users u
+    left join Badges b on u.Id = b.UserId
+),
+QuestionFavorites as (
+    select p.Id as QuestionId,
+           p.OwnerUserId,
+           count(v.Id) filter (where v.VoteTypeId = 5) as FavoriteVotes,
+           count(v.Id) filter (where v.VoteTypeId = 2) as UpVotes,
+           count(v.Id) filter (where v.VoteTypeId = 3) as DownVotes
+    from Posts p
+    left join Votes v on p.Id = v.PostId
+    where p.PostTypeId = 1
+    group by p.Id, p.OwnerUserId
+),
+UserCommentActivity as (
+    select c.UserId,
+           count(c.Id) as CommentCount,
+           max(c.CreationDate) as LastCommentDate,
+           count(distinct c.PostId) as UniquePostsCommented
+    from Comments c
+    group by c.UserId
+),
+PostLinkInfo as (
+    select pl.PostId,
+           pl.LinkTypeId,
+           count(distinct pl.RelatedPostId) as RelatedPostCount
+    from PostLinks pl
+    group by pl.PostId, pl.LinkTypeId
+),
+ComplexFilterPosts as (
+    select
+        q.Id,
+        q.Title,
+        q.OwnerUserId,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        fa.FavoriteVotes,
+        fa.UpVotes,
+        fa.DownVotes,
+        aa.AnswerCount,
+        aa.AvgAnswerScore,
+        aa.HasHighScoreAnswer,
+        aa.LastAnswerDate,
+        u.DisplayName as OwnerName,
+        u.Reputation as OwnerReputation,
+        u.AvatarUrl,
+        fc.CommentCount,
+        fc.LastCommentDate,
+        fc.UniquePostsCommented,
+        pl.RelatedPostCount,
+        fle.LatestTitleEdit,
+        fle.LatestBodyEdit,
+        fle.LatestTagsEdit
+    from Posts q
+    left join QuestionFavorites fa on q.Id = fa.QuestionId
+    left join AnswerAggregates aa on q.Id = aa.ParentId
+    left join Users u on q.OwnerUserId = u.Id
+    left join UserCommentActivity fc on q.OwnerUserId = fc.UserId
+    left join PostLinkInfo pl on q.Id = pl.PostId and pl.LinkTypeId = 1
+    left join FilteredLatestEdits fle on q.Id = fle.PostId
+    where q.PostTypeId = 1
+      and q.Score > 10
+      and (fa.FavoriteVotes > 0 or fa.UpVotes > 5)
+      and (aa.AnswerCount is not null and aa.AnswerCount >= 2)
+      and (u.Reputation > 1000)
+      and (fc.CommentCount > 5 or fc.UniquePostsCommented > 3)
+      and (pl.RelatedPostCount > 1 or pl.RelatedPostCount is null)
+)
+
+select
+    cfp.Id as QuestionId,
+    cfp.Title,
+    cfp.OwnerName,
+    cfp.OwnerReputation,
+    cfp.CreationDate,
+    cfp.Score,
+    cfp.ViewCount,
+    coalesce(cfp.FavoriteVotes,0) as FavCount,
+    coalesce(cfp.UpVotes,0) as UpVotesCount,
+    coalesce(cfp.DownVotes,0) as DownVotesCount,
+    cfp.AnswerCount,
+    round(coalesce(cfp.AvgAnswerScore,0),2) as AvgAnswerScore,
+    case when cfp.HasHighScoreAnswer then 'Yes' else 'No' end as HasHighScoreAnswer,
+    cfp.LastAnswerDate,
+    cfp.CommentCount,
+    cfp.LastCommentDate,
+    cfp.UniquePostsCommented,
+    cfp.RelatedPostCount,
+    length(cfp.LatestTitleEdit) as LatestTitleEditLength,
+    length(cfp.LatestBodyEdit) as LatestBodyEditLength,
+    length(cfp.LatestTagsEdit) as LatestTagsEditLength,
+    -- complex string manipulation on title and tags
+    initcap(substr(cfp.Title, 1, 50)) || '...' as ShortTitle,
+    -- extract tag strings with NULL handling
+    coalesce(
+        substring(
+            cfp.LatestTagsEdit,
+            '[a-z0-9]+'
+        ),
+        'NoTags'
+    ) as FirstTagExtracted
+from ComplexFilterPosts cfp
+where cfp.LatestTitleEdit is not null or cfp.LatestTagsEdit is not null
+order by cfp.Score desc, cfp.ViewCount desc
+limit 50;

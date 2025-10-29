@@ -1,0 +1,188 @@
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS TotalUpVotesGiven,
+        U.DownVotes AS TotalDownVotesGiven,
+        COUNT(DISTINCT P.Id) AS TotalPostsCreated,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestionsAsked,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswersPosted,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT B.Id) AS TotalBadgesEarned,
+        SUM(P.Score) AS OverallPostScoreReceived,
+        AVG(P.Score) AS AvgPostScoreReceived,
+        U.Reputation - COALESCE((
+            SELECT SUM(P_Initial.Score)
+            FROM Posts P_Initial
+            WHERE P_Initial.OwnerUserId = U.Id
+              AND P_Initial.CreationDate < U.CreationDate + INTERVAL '3 months'
+        ), 0) AS ReputationGrowthAfterInitialPeriod
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    WHERE U.Reputation > 10000
+      AND U.LastAccessDate >= CAST('2024-10-01' AS date) - INTERVAL '6 months'
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Views, U.UpVotes, U.DownVotes
+),
+QuestionPerformanceMetrics AS (
+    SELECT
+        Q.Id AS QuestionId,
+        Q.OwnerUserId,
+        Q.Title,
+        Q.CreationDate AS QuestionCreationDate,
+        Q.Score AS QuestionScore,
+        Q.ViewCount,
+        Q.AnswerCount,
+        Q.FavoriteCount,
+        Q.ClosedDate,
+        COALESCE(Q.LastEditDate, Q.CreationDate) AS EffectiveLastEditDate,
+        STRING_TO_ARRAY(SUBSTRING(Q.Tags, 2, LENGTH(Q.Tags) - 2), '><') AS TagsArray,
+        (
+            SELECT COUNT(DISTINCT A_sub.OwnerUserId)
+            FROM Posts A_sub
+            WHERE A_sub.ParentId = Q.Id AND A_sub.PostTypeId = 2
+        ) AS UniqueAnswerersCount,
+        RANK() OVER (PARTITION BY Q.OwnerUserId ORDER BY Q.Score DESC, Q.CreationDate DESC) AS QuestionScoreRankByOwner,
+        AVG(Q.Score) OVER (PARTITION BY Q.OwnerUserId ORDER BY Q.CreationDate ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS RollingAvgQuestionScore,
+        (
+            SELECT MAX(PA.Score)
+            FROM Posts PA
+            WHERE PA.Id = Q.AcceptedAnswerId
+        ) AS AcceptedAnswerMaxScore,
+        CASE
+            WHEN Q.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN Q.AnswerCount = 0 AND Q.CreationDate < CAST('2024-10-01' AS date) - INTERVAL '1 year' THEN 'StaleNoAnswers'
+            WHEN Q.FavoriteCount > 50 AND Q.AcceptedAnswerId IS NULL AND Q.AnswerCount > 0 THEN 'PopularUnaccepted'
+            ELSE 'ActiveOrUncategorized'
+        END AS QuestionCategoryBasedOnStatus
+    FROM Posts Q
+    WHERE Q.PostTypeId = 1
+      AND Q.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '3 years'
+      AND Q.OwnerUserId IS NOT NULL
+),
+AnswerDetails AS (
+    SELECT
+        A.Id AS AnswerId,
+        A.ParentId AS QuestionId,
+        A.OwnerUserId AS AnswerOwnerUserId,
+        A.CreationDate AS AnswerCreationDate,
+        A.Score AS AnswerScore,
+        A.CommentCount AS AnswerCommentCount,
+        Q.Title AS ParentQuestionTitle,
+        Q.ViewCount AS ParentQuestionViewCount,
+        CASE WHEN Q.AcceptedAnswerId = A.Id THEN TRUE ELSE FALSE END AS IsAcceptedByQuestioner,
+        LAG(A.Score, 1, 0) OVER (PARTITION BY A.OwnerUserId ORDER BY A.CreationDate) AS PreviousAnswerScoreByUser,
+        DENSE_RANK() OVER (PARTITION BY A.ParentId ORDER BY A.Score DESC, A.CreationDate) AS AnswerRankInQuestion
+    FROM Posts A
+    JOIN Posts Q ON A.ParentId = Q.Id
+    WHERE A.PostTypeId = 2
+      AND A.OwnerUserId IS NOT NULL
+      AND A.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '3 years'
+),
+ModerationEventLog AS (
+    SELECT
+        PH.PostId,
+        PH.CreationDate AS EventDate,
+        PH.UserId AS ModeratorOrVoterUserId,
+        PHT.Name AS HistoryEventTypeName,
+        COALESCE(CR.Name, 'N/A') AS CloseReasonName,
+        EXTRACT(EPOCH FROM (PH.CreationDate - LAG(PH.CreationDate, 1, PH.CreationDate) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate)))/3600.0 AS HoursSincePreviousEvent,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) OVER (PARTITION BY PH.PostId) AS TotalCloseEventsForPost,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) OVER (PARTITION BY PH.PostId) AS TotalReopenEventsForPost
+    FROM PostHistory PH
+    JOIN PostHistoryTypes PHT ON PH.PostHistoryTypeId = PHT.Id
+    LEFT JOIN CloseReasonTypes CR ON PH.PostHistoryTypeId = 10 AND PH.Comment = CAST(CR.Id AS text)
+    WHERE PH.PostHistoryTypeId IN (10, 11, 12, 13)
+),
+TagPerformanceBreakdown AS (
+    SELECT
+        TagName_Unnested AS TagName,
+        COUNT(DISTINCT QPM.QuestionId) AS QuestionsWithTagCount,
+        SUM(QPM.QuestionScore) AS TotalTagScore,
+        AVG(QPM.QuestionScore) AS AverageTagScore,
+        MAX(QPM.ViewCount) AS MaxViewCountForTag,
+        NTILE(4) OVER (ORDER BY COUNT(DISTINCT QPM.QuestionId) DESC) AS TagPopularityQuartile,
+        (
+            SELECT MAX(AD_sub.AnswerScore)
+            FROM AnswerDetails AD_sub
+            JOIN QuestionPerformanceMetrics QPM_sub ON AD_sub.QuestionId = QPM_sub.QuestionId
+            CROSS JOIN UNNEST(QPM_sub.TagsArray) AS TagName_Sub_Unnested
+            WHERE TagName_Sub_Unnested = TagName_Unnested AND AD_sub.IsAcceptedByQuestioner = TRUE
+        ) AS MaxAcceptedAnswerScoreForTag
+    FROM QuestionPerformanceMetrics QPM
+    CROSS JOIN UNNEST(QPM.TagsArray) AS TagName_Unnested
+    GROUP BY TagName_Unnested
+    HAVING COUNT(DISTINCT QPM.QuestionId) > 25 AND AVG(QPM.QuestionScore) > 5
+)
+SELECT
+    UAS.UserId,
+    UAS.DisplayName,
+    UAS.Reputation,
+    UAS.TotalPostsCreated,
+    UAS.TotalQuestionsAsked,
+    UAS.TotalAnswersPosted,
+    UAS.ReputationGrowthAfterInitialPeriod,
+    QPM.QuestionId,
+    QPM.Title AS QuestionTitle,
+    QPM.QuestionCreationDate,
+    QPM.QuestionScore,
+    QPM.ViewCount AS QuestionViewCount,
+    QPM.QuestionCategoryBasedOnStatus,
+    QPM.QuestionScoreRankByOwner,
+    QPM.RollingAvgQuestionScore,
+    QPM.AcceptedAnswerMaxScore,
+    AD.AnswerId,
+    AD.AnswerScore,
+    AD.IsAcceptedByQuestioner,
+    AD.PreviousAnswerScoreByUser,
+    AD.AnswerRankInQuestion,
+    COALESCE(TPB.TagName, 'NoPrimaryTag') AS PrimaryTag,
+    TPB.QuestionsWithTagCount AS PrimaryTagQuestionCount,
+    TPB.AverageTagScore AS PrimaryTagAvgScore,
+    TPB.TagPopularityQuartile,
+    MO.HistoryEventTypeName AS LastModerationAction,
+    MO.CloseReasonName AS LastCloseReason,
+    MO.HoursSincePreviousEvent AS HoursBetweenModerationEvents,
+    MO.TotalCloseEventsForPost,
+    NULLIF(CAST(COUNT(CASE WHEN AD_Recent.IsAcceptedByQuestioner THEN 1 END) AS DECIMAL) /
+           NULLIF(COUNT(DISTINCT AD_Recent.AnswerId), 0), 0) AS UserRecentAcceptedAnswerRatio,
+    UAS.LastAccessDate
+FROM UserActivitySummary UAS
+LEFT JOIN QuestionPerformanceMetrics QPM ON UAS.UserId = QPM.OwnerUserId
+LEFT JOIN AnswerDetails AD ON QPM.QuestionId = AD.QuestionId AND UAS.UserId = AD.AnswerOwnerUserId
+LEFT JOIN LATERAL (SELECT (QPM.TagsArray)[1] AS TagName_From_Array) PrimaryTagExtractor ON TRUE
+LEFT JOIN TagPerformanceBreakdown TPB ON PrimaryTagExtractor.TagName_From_Array = TPB.TagName
+LEFT JOIN ModerationEventLog MO ON QPM.QuestionId = MO.PostId
+LEFT JOIN AnswerDetails AD_Recent ON UAS.UserId = AD_Recent.AnswerOwnerUserId
+    AND AD_Recent.AnswerCreationDate >= CAST('2024-10-01' AS date) - INTERVAL '1 year'
+WHERE
+    (UAS.TotalQuestionsAsked > 0 OR UAS.TotalAnswersPosted > 0)
+    AND (
+        (QPM.QuestionScore >= 5)
+        OR (AD.AnswerScore >= 3)
+        OR (MO.HistoryEventTypeName IN ('Post Closed', 'Post Reopened'))
+    )
+    AND (
+        QPM.Title LIKE '%performance%'
+        OR QPM.Title LIKE '%optimization%'
+        OR PrimaryTagExtractor.TagName_From_Array IN ('performance', 'sql-optimization', 'big-data')
+    )
+GROUP BY
+    UAS.UserId, UAS.DisplayName, UAS.Reputation, UAS.TotalPostsCreated, UAS.TotalQuestionsAsked, UAS.TotalAnswersPosted, UAS.ReputationGrowthAfterInitialPeriod,
+    QPM.QuestionId, QPM.Title, QPM.QuestionCreationDate, QPM.QuestionScore, QPM.ViewCount, QPM.QuestionCategoryBasedOnStatus, QPM.QuestionScoreRankByOwner,
+    QPM.RollingAvgQuestionScore, QPM.AcceptedAnswerMaxScore, AD.AnswerId, AD.AnswerScore, AD.IsAcceptedByQuestioner, AD.PreviousAnswerScoreByUser, AD.AnswerRankInQuestion,
+    TPB.TagName, TPB.QuestionsWithTagCount, TPB.AverageTagScore, TPB.TagPopularityQuartile,
+    MO.HistoryEventTypeName, MO.CloseReasonName, MO.HoursSincePreviousEvent, MO.TotalCloseEventsForPost,
+    UAS.LastAccessDate
+HAVING
+    UAS.ReputationGrowthAfterInitialPeriod > 500
+ORDER BY
+    UAS.Reputation DESC,
+    UAS.LastAccessDate DESC,
+    QPM.QuestionCreationDate DESC
+LIMIT 5000;

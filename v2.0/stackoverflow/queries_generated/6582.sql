@@ -1,0 +1,35 @@
+-- {"query": "6582.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-micro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 405} 
+
+SELECT 
+    u.DisplayName,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    SUM(CASE WHEN p.ViewCount > 1000 THEN 1 ELSE 0 END) AS PopularPosts,
+    COUNT(DISTINCT v.PostId) AS TotalVotes,
+    COUNT(DISTINCT CASE WHEN b.TagBased = 0 THEN b.Id ELSE NULL END) AS NamedBadges,
+    COUNT(DISTINCT CASE WHEN b.TagBased = 1 THEN b.Id ELSE NULL END) AS TagBadges,
+    AVG(u.Reputation) AS AvgReputation,
+    MAX(u.LastAccessDate) AS LastAccessDate,
+    SUBSTRING_INDEX(GROUP_CONCAT(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN p.Title END ORDER BY p.CreationDate DESC SEPARATOR ', '), ',', 5) AS RecentDuplicates
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+LEFT JOIN 
+    PostLinks pl ON p.Id = pl.PostId
+WHERE 
+    u.Reputation > 100
+    AND p.CreationDate > DATE_SUB(NOW(), INTERVAL 1 YEAR)
+    AND (p.PostTypeId = 1 OR p.PostTypeId = 2)
+GROUP BY 
+    u.Id
+HAVING 
+    TotalPosts > 50
+ORDER BY 
+    AvgReputation DESC, 
+    TotalPosts DESC;

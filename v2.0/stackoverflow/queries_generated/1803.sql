@@ -1,0 +1,202 @@
+-- {"query": "1803.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3366} 
+
+WITH UserEngagementSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.Views AS UserViews,
+        u.UpVotes AS UserUpVotesGiven,
+        u.DownVotes AS UserDownVotesGiven,
+        u.Location,
+        COUNT(DISTINCT p.Id) AS TotalPostsCreated,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestionsAsked,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswersProvided,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN p.PostTypeId IN (1, 2) THEN p.Score ELSE 0 END) AS TotalPostScoreOwned,
+        SUM(CASE WHEN v_received.VoteTypeId = (SELECT Id FROM VoteTypes WHERE Name = 'UpMod') THEN 1 ELSE 0 END) AS TotalUpvotesReceivedOnOwnPosts,
+        SUM(CASE WHEN v_received.VoteTypeId = (SELECT Id FROM VoteTypes WHERE Name = 'DownMod') THEN 1 ELSE 0 END) AS TotalDownvotesReceivedOnOwnPosts,
+        COUNT(b.Id) AS TotalBadges,
+        COUNT(CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        MAX(b.Date) AS LatestBadgeDate,
+        AVG(NULLIF(p.ViewCount, 0)) FILTER (WHERE p.PostTypeId = 1) AS AvgQuestionViewCount,
+        EXTRACT(EPOCH FROM (MAX(COALESCE(p.LastActivityDate, p.CreationDate)) - u.CreationDate)) / 86400.0 AS DaysSinceFirstActivity, -- Average days from user creation to post activity
+        -- Calculate an engagement score
+        (u.Reputation * 0.5) + (COUNT(DISTINCT p.Id) * 1.5) + (COUNT(DISTINCT c.Id) * 0.75) + u.UpVotes - u.DownVotes AS RawEngagementScore
+    FROM Users AS u
+    LEFT JOIN Posts AS p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments AS c ON u.Id = c.UserId
+    LEFT JOIN Badges AS b ON u.Id = b.UserId
+    LEFT JOIN Votes AS v_received ON p.Id = v_received.PostId AND v_received.UserId <> u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes, u.Location
+),
+QuestionPerformance AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.OwnerUserId,
+        q.CreationDate AS QuestionCreationDate,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.AnswerCount AS DeclaredAnswerCount,
+        q.CommentCount AS DeclaredCommentCount,
+        q.FavoriteCount,
+        q.LastActivityDate,
+        q.ClosedDate,
+        q.AcceptedAnswerId,
+        COALESCE(q.Title, 'No Title Provided') AS QuestionTitle,
+        q.Tags AS QuestionTagsRaw, -- Keep raw tags for later processing
+        COUNT(a.Id) AS ActualAnswerCount,
+        SUM(CASE WHEN a.Id IS NOT NULL THEN a.Score ELSE 0 END) AS TotalAnswersScore,
+        AVG(CASE WHEN a.Id IS NOT NULL THEN a.Score END) AS AvgAnswerScore,
+        COUNT(DISTINCT cq.Id) AS ActualQuestionComments,
+        -- Check for specific close reasons
+        MAX(CASE WHEN ph.PostHistoryTypeId = (SELECT Id FROM PostHistoryTypes WHERE Name = 'Post Closed') AND ph.Comment IN ('1', '101') THEN 1 ELSE 0 END) AS IsDuplicateClosed,
+        MAX(CASE WHEN ph.PostHistoryTypeId = (SELECT Id FROM PostHistoryTypes WHERE Name = 'Post Closed') AND ph.Comment IN ('2', '102') THEN 1 ELSE 0 END) AS IsOffTopicClosed,
+        -- Calculate time difference from creation to last activity
+        EXTRACT(EPOCH FROM (q.LastActivityDate - q.CreationDate)) / 3600.0 AS HoursToLastActivity,
+        -- Body length category
+        CASE
+            WHEN LENGTH(q.Body) IS NULL THEN 'Empty'
+            WHEN LENGTH(q.Body) < 500 THEN 'Short'
+            WHEN LENGTH(q.Body) BETWEEN 500 AND 2000 THEN 'Medium'
+            ELSE 'Long'
+        END AS QuestionBodyLengthCategory,
+        -- Whether it has an accepted answer
+        (q.AcceptedAnswerId IS NOT NULL) AS HasAcceptedAnswer
+    FROM Posts AS q
+    LEFT JOIN Posts AS a ON q.Id = a.ParentId AND a.PostTypeId = (SELECT Id FROM PostTypes WHERE Name = 'Answer')
+    LEFT JOIN Comments AS cq ON q.Id = cq.PostId
+    LEFT JOIN PostHistory AS ph ON q.Id = ph.PostId AND ph.PostHistoryTypeId = (SELECT Id FROM PostHistoryTypes WHERE Name = 'Post Closed')
+    WHERE q.PostTypeId = (SELECT Id FROM PostTypes WHERE Name = 'Question')
+    GROUP BY q.Id, q.OwnerUserId, q.CreationDate, q.Score, q.ViewCount, q.AnswerCount, q.CommentCount, q.FavoriteCount, q.LastActivityDate, q.ClosedDate, q.AcceptedAnswerId, q.Body, q.Title, q.Tags
+),
+TagUsageMetrics AS (
+    SELECT
+        LOWER(t.TagName) AS TagNameLower,
+        COUNT(DISTINCT q.QuestionId) AS QuestionsWithTag,
+        SUM(q.QuestionScore) AS TotalTagQuestionScore,
+        AVG(q.QuestionScore) AS AvgTagQuestionScore,
+        COUNT(DISTINCT CASE WHEN q.QuestionScore > 50 THEN q.QuestionId END) AS HighScoreQuestionsWithTag,
+        AVG(NULLIF(q.ViewCount, 0)) AS AvgTagQuestionViewCount
+    FROM QuestionPerformance AS q
+    LEFT JOIN LATERAL (SELECT unnest(string_to_array(substring(q.QuestionTagsRaw, 2, length(q.QuestionTagsRaw)-2), '><')) AS TagName) AS t ON q.QuestionTagsRaw IS NOT NULL AND length(q.QuestionTagsRaw) > 2
+    WHERE t.TagName IS NOT NULL
+    GROUP BY LOWER(t.TagName)
+),
+UserVoteBehavior AS (
+    SELECT
+        v.UserId,
+        vt.Name AS VoteTypeName,
+        COUNT(v.Id) AS VoteCount,
+        AVG(p.Score) AS AvgPostScoreVotedOn,
+        SUM(CASE WHEN p.PostTypeId = (SELECT Id FROM PostTypes WHERE Name = 'Question') THEN 1 ELSE 0 END) AS VotesOnQuestions,
+        SUM(CASE WHEN p.PostTypeId = (SELECT Id FROM PostTypes WHERE Name = 'Answer') THEN 1 ELSE 0 END) AS VotesOnAnswers
+    FROM Votes AS v
+    JOIN VoteTypes AS vt ON v.VoteTypeId = vt.Id
+    JOIN Posts AS p ON v.PostId = p.Id
+    WHERE v.UserId IS NOT NULL
+    GROUP BY v.UserId, vt.Name
+)
+SELECT
+    ues.UserId,
+    ues.DisplayName,
+    ues.Reputation,
+    ues.UserCreationDate,
+    ues.TotalPostsCreated,
+    ues.TotalQuestionsAsked,
+    ues.TotalAnswersProvided,
+    ues.TotalCommentsMade,
+    ues.TotalBadges,
+    ues.GoldBadges,
+    qp.QuestionId,
+    qp.QuestionCreationDate,
+    qp.QuestionScore,
+    qp.QuestionViewCount,
+    qp.ActualAnswerCount,
+    qp.TotalAnswersScore,
+    qp.AvgAnswerScore,
+    qp.HasAcceptedAnswer,
+    qp.IsDuplicateClosed,
+    qp.QuestionBodyLengthCategory,
+    tum.TagNameLower AS MostUsedTagByOwner,
+    tum.AvgTagQuestionScore,
+    uvb.VoteTypeName AS MostFrequentVoteType,
+    uvb.VoteCount AS MostFrequentVoteCount,
+    uvb.VotesOnQuestions,
+    uvb.VotesOnAnswers,
+    -- Correlated subquery: Count comments made by the owner on their own question within 24 hours of question creation
+    (SELECT COUNT(c_sub.Id)
+     FROM Comments AS c_sub
+     WHERE c_sub.PostId = qp.QuestionId
+       AND c_sub.UserId = qp.OwnerUserId
+       AND c_sub.CreationDate BETWEEN qp.QuestionCreationDate AND (qp.QuestionCreationDate + INTERVAL '24 hours')
+    ) AS OwnerEarlyCommentsOnQuestion,
+    -- Window function: Rank users based on their engagement score within their creation year
+    DENSE_RANK() OVER (PARTITION BY EXTRACT(YEAR FROM ues.UserCreationDate) ORDER BY ues.RawEngagementScore DESC, ues.Reputation DESC) AS RankByEngagementInYear,
+    -- Complicated calculation combining multiple metrics, handling potential NULLs
+    (COALESCE(qp.QuestionScore, 0) * 0.7 + COALESCE(qp.AvgAnswerScore, 0) * 0.3 + COALESCE(qp.FavoriteCount, 0) * 0.1) AS WeightedQuestionPerformance,
+    -- Null logic with COALESCE and complicated string expression
+    COALESCE(UPPER(SUBSTRING(ues.DisplayName, 1, 1)) || LPAD(COALESCE(ues.Location, 'UNSPECIFIED LOCATION'), 25, '-'), 'N/A_USER_DATA') AS UserIdentifierHash,
+    NULLIF(COALESCE(qp.QuestionViewCount, 0), 0) / NULLIF(COALESCE(qp.ActualAnswerCount, 0), 0) AS ViewsPerAnswerRatio, -- NULLIF to avoid division by zero
+    -- A complex CASE expression to categorize users based on their contribution profile
+    CASE
+        WHEN ues.GoldBadges >= 3 AND ues.TotalQuestionsAsked > 10 AND ues.AvgQuestionViewCount > 5000 THEN 'Elite Question Author'
+        WHEN ues.TotalAnswersProvided >= 20 AND ues.AvgAnswerScore >= 5 AND ues.TotalUpvotesReceivedOnOwnPosts > 100 THEN 'Valuable Answerer'
+        WHEN ues.RawEngagementScore > 1000 AND ues.TotalBadges > 15 AND ues.DaysSinceFirstActivity > 365 THEN 'Highly Engaged Veteran'
+        WHEN ues.Reputation > 5000 AND ues.TotalPostsCreated >= 10 THEN 'Established Contributor'
+        WHEN ues.TotalCommentsMade > 50 OR ues.TotalPostsCreated >= 5 THEN 'Active Participant'
+        ELSE 'Casual User'
+    END AS UserContributionTier,
+    -- String pattern matching check in title
+    (qp.QuestionTitle LIKE '%sql%' OR qp.QuestionTitle LIKE '%database%') AS IsDatabaseRelatedQuestion,
+    -- Check if user has recently edited posts, based on a post history entry
+    EXISTS (SELECT 1 FROM PostHistory ph WHERE ph.UserId = ues.UserId AND ph.CreationDate > CURRENT_DATE - INTERVAL '3 months' AND ph.PostHistoryTypeId IN ((SELECT Id FROM PostHistoryTypes WHERE Name = 'Edit Body'), (SELECT Id FROM PostHistoryTypes WHERE Name = 'Edit Tags'))) AS HasRecentEdits
+FROM UserEngagementSummary AS ues
+LEFT JOIN QuestionPerformance AS qp ON ues.UserId = qp.OwnerUserId
+LEFT JOIN (
+    -- Subquery to find the most used tag for a user's questions and its average score
+    SELECT
+        sq.OwnerUserId,
+        sq.TagNameLower,
+        sq.AvgTagQuestionScore,
+        ROW_NUMBER() OVER (PARTITION BY sq.OwnerUserId ORDER BY sq.QuestionsWithTag DESC, sq.AvgTagQuestionScore DESC) AS rn
+    FROM (
+        SELECT
+            qp_inner.OwnerUserId,
+            tum_inner.TagNameLower,
+            tum_inner.QuestionsWithTag,
+            tum_inner.AvgTagQuestionScore
+        FROM QuestionPerformance AS qp_inner
+        LEFT JOIN LATERAL (SELECT unnest(string_to_array(substring(qp_inner.QuestionTagsRaw, 2, length(qp_inner.QuestionTagsRaw)-2), '><')) AS TagName) AS t_inner ON qp_inner.QuestionTagsRaw IS NOT NULL AND length(qp_inner.QuestionTagsRaw) > 2
+        JOIN TagUsageMetrics AS tum_inner ON LOWER(t_inner.TagName) = tum_inner.TagNameLower
+        WHERE qp_inner.OwnerUserId IS NOT NULL
+    ) AS sq
+) AS tum ON ues.UserId = tum.OwnerUserId AND tum.rn = 1
+LEFT JOIN (
+    -- Subquery to find the most frequent vote type for each user
+    SELECT
+        uvb_inner.UserId,
+        uvb_inner.VoteTypeName,
+        uvb_inner.VoteCount,
+        uvb_inner.VotesOnQuestions,
+        uvb_inner.VotesOnAnswers,
+        ROW_NUMBER() OVER (PARTITION BY uvb_inner.UserId ORDER BY uvb_inner.VoteCount DESC, uvb_inner.VotesOnQuestions DESC) AS rn
+    FROM UserVoteBehavior AS uvb_inner
+) AS uvb ON ues.UserId = uvb.UserId AND uvb.rn = 1
+WHERE
+    ues.Reputation > 1000 -- Filter for more established users
+    AND ues.TotalPostsCreated >= 5 -- Users with at least some content
+    AND (qp.QuestionId IS NOT NULL OR ues.TotalCommentsMade > 20) -- Users who asked questions (matching criteria) OR made many comments
+    AND ues.LastAccessDate >= CURRENT_DATE - INTERVAL '1 year' -- Recently active users
+    AND qp.QuestionBodyLengthCategory IN ('Medium', 'Long') -- Focus on substantial questions
+    AND COALESCE(qp.HasAcceptedAnswer, FALSE) IS TRUE -- Only questions with accepted answers (or if qp is null, it's false)
+    AND ues.DaysSinceFirstActivity > 30 -- User active for at least a month
+    AND NOT COALESCE(qp.IsOffTopicClosed, 0) = 1 -- Exclude questions marked as off-topic
+ORDER BY
+    ues.Reputation DESC,
+    RankByEngagementInYear ASC,
+    WeightedQuestionPerformance DESC,
+    qp.QuestionCreationDate DESC
+LIMIT 1000;

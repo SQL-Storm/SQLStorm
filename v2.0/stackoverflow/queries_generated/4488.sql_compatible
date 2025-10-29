@@ -1,0 +1,184 @@
+WITH
+  RankedPostEdits AS (
+    SELECT
+      ph.PostId,
+      ph.UserId,
+      ph.CreationDate,
+      ph.PostHistoryTypeId,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM
+      PostHistory AS ph
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6)
+  ),
+  RecentPostInfo AS (
+    SELECT
+      p.Id AS PostId,
+      p.OwnerUserId,
+      p.CreationDate AS PostCreationDate,
+      p.Score AS PostScore,
+      p.ViewCount AS PostViewCount,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      p.ClosedDate,
+      pt.Name AS PostTypeName,
+      COALESCE(u.DisplayName, p.OwnerDisplayName) AS OwnerDisplayName,
+      rpe.UserId AS LastEditorId,
+      rpe.CreationDate AS LastEditDate,
+      rpe.PostHistoryTypeId AS LastEditTypeId,
+      CASE
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        ELSE 'Open'
+      END AS PostStatus,
+      CASE
+        WHEN rpe.CreationDate IS NOT NULL THEN
+          EXTRACT(EPOCH FROM (p.LastActivityDate - rpe.CreationDate)) / 86400.0
+        ELSE
+          EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate)) / 86400.0
+      END AS DaysSinceLastActivityOrEdit,
+      'Post: ' || CAST(p.Id AS TEXT) || ' | Type: ' || pt.Name || ' | Score: ' || CAST(p.Score AS TEXT) || ' | Views: ' || CAST(p.ViewCount AS TEXT) AS PostSummary,
+      (
+        SELECT
+          COUNT(*)
+        FROM
+          PostHistory AS ph_inner
+        WHERE
+          ph_inner.PostId = p.Id
+          AND ph_inner.PostHistoryTypeId BETWEEN 1 AND 9
+      ) AS TotalHistoryEntries,
+      (
+        SELECT
+          COUNT(c.Id)
+        FROM
+          Comments AS c
+        LEFT JOIN
+          Users AS u_comment ON c.UserId = u_comment.Id
+        WHERE
+          c.PostId = p.Id
+          AND u_comment.Reputation > 1000
+      ) AS HighReputationCommentCount,
+      CASE
+        WHEN p.Tags LIKE '%<sql>%' THEN 1
+        WHEN p.Tags LIKE '%<performance>%' THEN 1
+        WHEN p.Tags LIKE '%<optimization>%' THEN 1
+        ELSE 0
+      END AS HasPerformanceTag
+    FROM
+      Posts AS p
+      JOIN PostTypes AS pt ON p.PostTypeId = pt.Id
+      LEFT JOIN Users AS u ON p.OwnerUserId = u.Id
+      LEFT JOIN RankedPostEdits AS rpe ON p.Id = rpe.PostId AND rpe.rn = 1
+    WHERE
+      p.CreationDate >= '2023-01-01'
+      AND p.PostTypeId = 1
+      AND p.Score > 10
+  ),
+  PostTagCounts AS (
+    SELECT
+      pt.TagName,
+      SUM(p.AnswerCount) AS TotalAnswersForTag,
+      AVG(p.Score) AS AverageScoreForTag,
+      COUNT(p.Id) AS NumberOfQuestionsWithTag
+    FROM
+      Posts AS p
+      JOIN Tags AS pt ON p.Tags LIKE '%' || pt.TagName || '%'
+    WHERE
+      p.PostTypeId = 1
+      AND p.CreationDate >= '2023-01-01'
+    GROUP BY
+      pt.TagName
+    HAVING
+      COUNT(p.Id) > 100
+  ),
+  UserActivitySummary AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      COUNT(DISTINCT p.Id) AS TotalQuestionsPosted,
+      SUM(p.Score) AS TotalScoreOnQuestions,
+      COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+      COUNT(DISTINCT ph.Id) AS TotalHistoryEntries
+    FROM
+      Users AS u
+      LEFT JOIN Posts AS p ON u.Id = p.OwnerUserId AND p.PostTypeId = 1
+      LEFT JOIN Comments AS c ON u.Id = c.UserId
+      LEFT JOIN PostHistory AS ph ON u.Id = ph.UserId
+    WHERE
+      u.Reputation > 5000
+    GROUP BY
+      u.Id,
+      u.DisplayName
+  )
+SELECT
+  rpi.PostId,
+  rpi.PostTypeName,
+  rpi.OwnerDisplayName,
+  rpi.PostScore,
+  rpi.PostViewCount,
+  rpi.AnswerCount,
+  rpi.CommentCount,
+  rpi.FavoriteCount,
+  rpi.PostStatus,
+  rpi.DaysSinceLastActivityOrEdit,
+  rpi.PostSummary,
+  rpi.TotalHistoryEntries,
+  rpi.HighReputationCommentCount,
+  rpi.HasPerformanceTag,
+  ptc.TagName,
+  ptc.TotalAnswersForTag,
+  ptc.AverageScoreForTag,
+  uas.TotalQuestionsPosted,
+  uas.TotalScoreOnQuestions,
+  uas.TotalCommentsMade,
+  uas.TotalHistoryEntries AS UserTotalHistoryEntries,
+  CASE WHEN rpi.PostScore > 50 THEN 'High Scoring Question' ELSE 'Normal Question' END AS QuestionCategory,
+  CASE WHEN uas.TotalScoreOnQuestions > 10000 THEN 'High Achiever' ELSE 'Standard User' END AS UserCategory,
+  rpi.OwnerUserId,
+  rpi.PostCreationDate,
+  rpi.PostSummary -- repeated to ensure all selected/windowed columns are grouped where necessary
+FROM
+  RecentPostInfo AS rpi
+LEFT JOIN
+  PostTagCounts AS ptc ON EXISTS (SELECT 1 FROM Posts p WHERE p.Id = rpi.PostId AND p.Tags LIKE '%' || ptc.TagName || '%')
+LEFT JOIN
+  UserActivitySummary AS uas ON rpi.OwnerUserId = uas.UserId
+WHERE
+  rpi.PostViewCount > 1000
+  AND rpi.HasPerformanceTag = 1
+UNION
+SELECT
+  NULL,
+  NULL,
+  uas.DisplayName,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  'User Summary',
+  NULL,
+  'User: ' || uas.DisplayName || ' | Qs: ' || CAST(uas.TotalQuestionsPosted AS TEXT) || ' | Score: ' || CAST(uas.TotalScoreOnQuestions AS TEXT) || ' | Cmts: ' || CAST(uas.TotalCommentsMade AS TEXT),
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  uas.TotalQuestionsPosted,
+  uas.TotalScoreOnQuestions,
+  uas.TotalCommentsMade,
+  uas.UserTotalHistoryEntries,
+  NULL,
+  uas.UserCategory,
+  NULL,
+  NULL,
+  NULL
+FROM
+  UserActivitySummary AS uas
+WHERE
+  uas.TotalQuestionsPosted > 500
+ORDER BY
+  COALESCE(uas.TotalScoreOnQuestions, rpi.PostScore) DESC NULLS LAST,
+  rpi.PostScore DESC NULLS LAST;

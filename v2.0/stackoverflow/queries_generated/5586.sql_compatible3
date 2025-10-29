@@ -1,0 +1,231 @@
+WITH
+RecentActivePosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount
+    FROM Posts p
+    WHERE p.LastActivityDate > (DATE '2024-10-01' - INTERVAL '180' DAY)
+),
+TopUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.AccountId,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.UpVotes DESC, u.LastAccessDate DESC) AS rn
+    FROM Users u
+),
+BadgeAgg AS (
+    SELECT
+        b.UserId,
+        COUNT(*) AS GoldCount
+    FROM Badges b
+    WHERE b.Class = 1
+    GROUP BY b.UserId
+),
+-- normalize tags by splitting on angle brackets into rows using standard SQL-compatible method:
+PostTags AS (
+    SELECT
+        p.Id AS PostId,
+        TRIM(tag) AS TagName
+    FROM Posts p
+    CROSS JOIN LATERAL (
+        SELECT value AS tag FROM (VALUES (NULL)) v -- placeholder, replaced below per engine
+    ) dummy
+    WHERE p.Tags IS NOT NULL
+),
+-- Because some engines lack regexp_split_to_table and LATERAL in same way, provide a more portable split using recursive CTE
+SplitTags AS (
+    SELECT
+        p.Id AS PostId,
+        CAST('' AS VARCHAR) AS rest,
+        CAST(NULL AS VARCHAR) AS tag,
+        0 AS pos,
+        p.Tags AS fulltags
+    FROM Posts p
+    WHERE p.Tags IS NOT NULL AND p.PostTypeId = 1
+
+    UNION ALL
+
+    SELECT
+        st.PostId,
+        CASE
+            WHEN instr = 0 THEN '' 
+            ELSE substr(st.rest2, instr+1)
+        END AS rest,
+        CASE
+            WHEN instr = 0 THEN trim(replace(replace(st.fulltags, '<', ''), '>', ''))
+            ELSE trim(substr(st.rest2, 1, instr-1))
+        END AS tag,
+        pos+1,
+        st.fulltags
+    FROM (
+        SELECT
+            PostId,
+            CASE
+                WHEN pos = 0 THEN fulltags
+                ELSE rest
+            END AS rest2,
+            pos,
+            fulltags,
+            (coalesce(instr, 0)) AS instr
+        FROM (
+            SELECT
+                PostId,
+                rest,
+                pos,
+                fulltags,
+                CASE
+                    WHEN pos = 0 THEN instr(substr(fulltags, 2, length(fulltags)-2), '<>')
+                    ELSE instr(rest, '<>')
+                END AS instr
+            FROM (
+                SELECT
+                    PostId,
+                    rest,
+                    pos,
+                    fulltags
+                FROM SplitTags
+            ) x
+        ) y
+    ) st
+    WHERE pos < 1000 AND (st.tag IS NOT NULL AND st.tag <> '')
+),
+-- Fallback: simpler portable tag extraction using string functions for tags like '<tag1><tag2>'
+TagRows AS (
+    SELECT
+        p.Id AS PostId,
+        LOWER(TRIM(REPLACE(REPLACE(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2), '><', '>|<'), '|', '') )) AS TagNameRaw,
+        p.Score
+    FROM Posts p
+    WHERE p.Tags IS NOT NULL AND p.PostTypeId = 1
+),
+-- Hot tag aggregation using a portable method: join Votes and Posts, then parse tags by repeated splits using a helper that works in many engines
+HotTagScores AS (
+    SELECT
+        tag AS TagName,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS Downvotes,
+        AVG(p.Score) AS AvgPostScore
+    FROM (
+        -- A generic approach: split tags by iterating numbers 1..20 and extracting nth tag between angle brackets
+        SELECT
+            p.Id AS PostId,
+            LOWER(TRIM(
+                SUBSTRING(
+                    p.Tags,
+                    -- start pos of nth tag: position of (n-1)th '><' + 2
+                    CASE WHEN n = 1 THEN 2 ELSE instr_n(p.Tags, n) END,
+                    -- length until next '><' or closing '>'
+                    CASE WHEN instr_next(p.Tags, n) = 0 THEN instr_close(p.Tags, n) - CASE WHEN n = 1 THEN 1 ELSE instr_n(p.Tags, n)-1 END ELSE instr_next(p.Tags, n) - CASE WHEN n = 1 THEN 2 ELSE instr_n(p.Tags, n) END END
+                )
+            )) AS tag,
+            p.Score
+        FROM Posts p
+        JOIN (SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9 UNION ALL SELECT 10 UNION ALL SELECT 11 UNION ALL SELECT 12 UNION ALL SELECT 13 UNION ALL SELECT 14 UNION ALL SELECT 15 UNION ALL SELECT 16 UNION ALL SELECT 17 UNION ALL SELECT 18 UNION ALL SELECT 19 UNION ALL SELECT 20) nums
+        ON p.Tags IS NOT NULL AND p.PostTypeId = 1
+        WHERE
+            -- ensure extracted tag is not empty; functions instr_n/instr_next/instr_close are placeholders many engines provide via user-defined or built-in string functions; if not available replace with engine-specific expression
+            p.Tags LIKE '%<%>%'
+    ) t
+    LEFT JOIN Votes v ON v.PostId = t.PostId
+    LEFT JOIN Posts p ON p.Id = t.PostId
+    WHERE t.tag IS NOT NULL AND t.tag <> ''
+    GROUP BY tag
+),
+Combined AS (
+    SELECT
+        rap.PostId,
+        rap.PostTypeId,
+        rap.Title,
+        rap.OwnerUserId,
+        rap.CreationDate,
+        rap.LastActivityDate,
+        rap.Tags,
+        rap.Score,
+        rap.ViewCount,
+        rap.AnswerCount,
+        rap.CommentCount,
+        rap.FavoriteCount,
+        hu.UserId AS AuthorId,
+        hu.DisplayName AS AuthorName,
+        COALESCE(ba.GoldCount, 0) AS GoldCount,
+        hts.TagName,
+        hts.Upvotes AS TagUpvotes,
+        hts.Downvotes AS TagDownvotes,
+        hts.AvgPostScore
+    FROM RecentActivePosts rap
+    LEFT JOIN TopUsers hu ON rap.OwnerUserId = hu.UserId
+    LEFT JOIN BadgeAgg ba ON hu.UserId = ba.UserId
+    LEFT JOIN HotTagScores hts
+        ON rap.Tags IS NOT NULL
+        AND LOWER(hts.TagName) IN (
+            -- expand tags into rows using numbers 1..20 to avoid non-inner join on subquery
+            SELECT LOWER(TRIM(
+                SUBSTRING(
+                    rap.Tags,
+                    CASE WHEN n = 1 THEN 2 ELSE instr_n(rap.Tags, n) END,
+                    CASE WHEN instr_next(rap.Tags, n) = 0 THEN instr_close(rap.Tags, n) - CASE WHEN n = 1 THEN 1 ELSE instr_n(rap.Tags, n)-1 END ELSE instr_next(rap.Tags, n) - CASE WHEN n = 1 THEN 2 ELSE instr_n(rap.Tags, n) END
+                )
+            ))
+            )
+            FROM (SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9 UNION ALL SELECT 10 UNION ALL SELECT 11 UNION ALL SELECT 12 UNION ALL SELECT 13 UNION ALL SELECT 14 UNION ALL SELECT 15 UNION ALL SELECT 16 UNION ALL SELECT 17 UNION ALL SELECT 18 UNION ALL SELECT 19 UNION ALL SELECT 20) nums
+            WHERE rap.Tags IS NOT NULL
+        )
+    WHERE rap.PostTypeId IN (1,2)
+)
+SELECT
+    c.PostId,
+    c.Title,
+    c.AuthorId,
+    c.AuthorName,
+    c.CreationDate,
+    c.LastActivityDate,
+    c.Score,
+    c.ViewCount,
+    c.AnswerCount,
+    c.CommentCount,
+    c.FavoriteCount,
+    c.GoldCount,
+    c.TagName,
+    c.TagUpvotes,
+    c.TagDownvotes,
+    c.AvgPostScore
+FROM Combined c
+GROUP BY
+    c.PostId,
+    c.Title,
+    c.AuthorId,
+    c.AuthorName,
+    c.CreationDate,
+    c.LastActivityDate,
+    c.Score,
+    c.ViewCount,
+    c.AnswerCount,
+    c.CommentCount,
+    c.FavoriteCount,
+    c.GoldCount,
+    c.TagName,
+    c.TagUpvotes,
+    c.TagDownvotes,
+    c.AvgPostScore
+ORDER BY
+    c.LastActivityDate DESC,
+    c.Score DESC,
+    c.GoldCount DESC
+LIMIT 100;

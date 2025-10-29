@@ -1,0 +1,135 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        MAX(b.Date) AS LastBadgeDate,
+        CAST((CAST('2024-10-01 12:34:56' AS timestamp) - u.CreationDate) AS interval) /* placeholder for age calculation */,
+        /* Standard SQL DATE difference in days: use EXTRACT(epoch FROM ...) / 86400 or appropriate function per dialect.
+           Here provide AccountAgeDays as integer days using PostgreSQL-compatible expression: */
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - u.CreationDate)) / 86400 AS AccountAgeDays,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Elite'
+            WHEN u.Reputation > 5000 THEN 'Veteran'
+            WHEN u.Reputation > 1000 THEN 'Regular'
+            ELSE 'Newbie'
+        END AS UserTier,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END), 0) AS QuestionCount,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END), 0) AS AnswerCount,
+        COALESCE(SUM(p.Score), 0) AS TotalScore,
+        COALESCE(AVG(p.Score), 0) AS AvgPostScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+TopPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        STRING_AGG(b.Name, ', ' ORDER BY b.Date) AS BadgeNames,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC, p.ViewCount DESC) AS ScoreRank,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) AS RecentByType
+    FROM Posts p
+    LEFT JOIN Badges b ON p.OwnerUserId = b.UserId
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE p.PostTypeId IN (1, 2)
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.CreationDate, p.OwnerUserId, p.PostTypeId, p.Tags
+),
+CommunityMetrics AS (
+    SELECT 
+        'Total Users' AS MetricName,
+        COUNT(*) AS MetricValue
+    FROM Users
+    
+    UNION ALL
+    
+    SELECT 
+        'Total Posts' AS MetricName,
+        COUNT(*) AS MetricValue
+    FROM Posts
+    
+    UNION ALL
+    
+    SELECT 
+        'Total Comments' AS MetricName,
+        COUNT(*) AS MetricValue
+    FROM Comments
+    
+    UNION ALL
+    
+    SELECT 
+        'Total Badges' AS MetricName,
+        COUNT(*) AS MetricValue
+    FROM Badges
+)
+SELECT 
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.PostCount,
+    uas.CommentCount,
+    uas.BadgeCount,
+    uas.VoteCount,
+    uas.UserTier,
+    uas.QuestionCount,
+    uas.AnswerCount,
+    uas.TotalScore,
+    uas.AvgPostScore,
+    -- Ensure AccountAgeDays is selected consistently; using the computed column alias
+    uas.AccountAgeDays,
+    uas.LastPostDate,
+    uas.LastCommentDate,
+    uas.LastBadgeDate,
+    CASE 
+        WHEN uas.PostCount > 0 AND uas.CommentCount > 0 AND uas.BadgeCount > 0 
+        THEN 'High Engagement'
+        WHEN uas.PostCount > 0 OR uas.CommentCount > 0 OR uas.BadgeCount > 0 
+        THEN 'Moderate Engagement'
+        ELSE 'Low Engagement'
+    END AS EngagementLevel,
+    tp.Title AS TopPostTitle,
+    tp.Score AS TopPostScore,
+    tp.ViewCount AS TopPostViews,
+    tp.CommentCount AS TopPostComments,
+    tp.VoteCount AS TopPostVotes,
+    tp.ScoreRank,
+    tp.RecentByType,
+    tp.Tags AS TopPostTags,
+    tp.BadgeNames AS TopPostBadges,
+    COALESCE(cm.MetricValue, 0) AS CommunityMetric
+FROM UserActivityStats uas
+LEFT JOIN TopPosts tp ON uas.UserId = tp.OwnerUserId AND tp.ScoreRank = 1
+LEFT JOIN CommunityMetrics cm ON 1=1
+WHERE 
+    uas.Reputation > 100
+    AND (uas.PostCount > 1 OR uas.CommentCount > 1 OR uas.BadgeCount > 1)
+    AND uas.AccountAgeDays > 30
+    AND (
+        uas.LastPostDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days')
+        OR uas.LastCommentDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days')
+        OR uas.LastBadgeDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days')
+    )
+ORDER BY 
+    uas.TotalScore DESC,
+    uas.Reputation DESC,
+    uas.PostCount DESC,
+    uas.AccountAgeDays ASC;

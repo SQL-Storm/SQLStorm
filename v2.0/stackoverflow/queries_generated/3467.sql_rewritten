@@ -1,0 +1,146 @@
+-- {"query": "3467.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1805} 
+WITH
+/* 1 – User activity summary (including users with no posts) */
+usr_stats AS (
+    SELECT
+        u.Id                           AS user_id,
+        u.DisplayName                  AS display_name,
+        u.Reputation,
+        COALESCE(p.post_cnt, 0)         AS post_cnt,
+        COALESCE(p.score_sum, 0)        AS total_score,
+        COALESCE(p.view_sum, 0)         AS total_views,
+        COALESCE(p.avg_score, 0)        AS avg_score,
+        COALESCE(b.badge_cnt, 0)        AS badge_cnt,
+        COALESCE(b.gold_cnt, 0)         AS gold_badges,
+        COALESCE(b.silver_cnt, 0)       AS silver_badges,
+        COALESCE(b.bronze_cnt, 0)       AS bronze_badges,
+        COALESCE(v.recent_votes, 0)    AS recent_votes_30d,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS reputation_rank
+    FROM Users u
+    LEFT JOIN (
+        SELECT
+            OwnerUserId                         AS uid,
+            COUNT(*)                            AS post_cnt,
+            SUM(Score)                          AS score_sum,
+            SUM(ViewCount)                      AS view_sum,
+            AVG(Score)                          AS avg_score
+        FROM Posts
+        WHERE OwnerUserId IS NOT NULL
+        GROUP BY OwnerUserId
+    ) p ON p.uid = u.Id
+    LEFT JOIN (
+        SELECT
+            UserId                              AS uid,
+            COUNT(*)                            AS badge_cnt,
+            SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS gold_cnt,
+            SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS silver_cnt,
+            SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS bronze_cnt
+        FROM Badges
+        GROUP BY UserId
+    ) b ON b.uid = u.Id
+    LEFT JOIN (
+        SELECT
+            UserId                              AS uid,
+            COUNT(*) FILTER (WHERE CreationDate >= cast('2024-10-01' as date) - INTERVAL '30 days') AS recent_votes
+        FROM Votes
+        GROUP BY UserId
+    ) v ON v.uid = u.Id
+),
+
+/* 2 – Latest question per tag (including tags that never appeared in a question) */
+tag_latest_q AS (
+    SELECT
+        t.Id                                   AS tag_id,
+        t.TagName,
+        t.Count                                AS tag_use_count,
+        q.Id                                   AS latest_question_id,
+        q.CreationDate                         AS latest_question_date,
+        ROW_NUMBER() OVER (PARTITION BY t.Id ORDER BY q.CreationDate DESC NULLS LAST) AS rn
+    FROM Tags t
+    LEFT JOIN LATERAL (
+        SELECT
+            p.Id,
+            p.CreationDate
+        FROM Posts p
+        WHERE p.PostTypeId = 1                                          -- only questions
+          AND p.Tags LIKE concat('%<', t.TagName, '>%')
+        ORDER BY p.CreationDate DESC
+        LIMIT 1
+    ) q ON true
+),
+
+/* 3 – Users with no activity (for set‑operator test) */
+inactive_users AS (
+    SELECT
+        u.Id                         AS user_id,
+        u.DisplayName                AS display_name,
+        u.Reputation,
+        0                            AS post_cnt,
+        0                            AS total_score,
+        0                            AS total_views,
+        0                            AS avg_score,
+        0                            AS badge_cnt,
+        0                            AS gold_badges,
+        0                            AS silver_badges,
+        0                            AS bronze_badges,
+        0                            AS recent_votes_30d,
+        NULL                         AS reputation_rank
+    FROM Users u
+    WHERE NOT EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id)
+      AND NOT EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = u.Id)
+      AND NOT EXISTS (SELECT 1 FROM Votes v WHERE v.UserId = u.Id)
+),
+
+/* 4 – Aggregate of tag statistics */
+tag_stats AS (
+    SELECT
+        tlq.TagName,
+        tlq.tag_use_count,
+        COALESCE(tlq.latest_question_id, -1)   AS latest_question_id,
+        COALESCE(tlq.latest_question_date, TIMESTAMP '1970-01-01') AS latest_question_date,
+        COUNT(p.Id)                             AS total_questions_tagged,
+        AVG(p.Score)                            AS avg_question_score,
+        SUM(p.ViewCount)                        AS total_views_tagged
+    FROM tag_latest_q tlq
+    LEFT JOIN Posts p
+        ON p.PostTypeId = 1
+       AND p.Tags LIKE concat('%<', tlq.TagName, '>%')
+    GROUP BY tlq.TagName, tlq.tag_use_count, tlq.latest_question_id, tlq.latest_question_date
+)
+
+/* Final result set: union of active & inactive users plus a cross‑join with tag stats */
+SELECT
+    u.user_id,
+    u.display_name,
+    u.reputation,
+    u.post_cnt,
+    u.total_score,
+    u.total_views,
+    ROUND(u.avg_score, 2)                      AS avg_score,
+    u.badge_cnt,
+    u.gold_badges,
+    u.silver_badges,
+    u.bronze_badges,
+    u.recent_votes_30d,
+    u.reputation_rank,
+    t.TagName,
+    t.tag_use_count,
+    t.latest_question_id,
+    t.latest_question_date,
+    t.total_questions_tagged,
+    ROUND(t.avg_question_score, 2)            AS avg_question_score,
+    t.total_views_tagged
+FROM (
+    SELECT * FROM usr_stats
+    UNION ALL
+    SELECT * FROM inactive_users
+) u
+CROSS JOIN tag_stats t
+WHERE
+    /* Complex predicate mixing NULL handling, string functions and date logic */
+    (u.reputation_rank IS NULL OR u.reputation_rank <= 1000)
+    AND t.tag_use_count > 0
+    AND (t.latest_question_date > cast('2024-10-01' as date) - INTERVAL '365 days' OR t.latest_question_id = -1)
+ORDER BY
+    u.reputation DESC NULLS LAST,
+    t.tag_use_count DESC;

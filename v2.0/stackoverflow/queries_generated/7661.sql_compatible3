@@ -1,0 +1,143 @@
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+    COALESCE(SUM(p.Score), 0) AS TotalScore,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END), 0) AS QuestionScore,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END), 0) AS AnswerScore,
+    COUNT(DISTINCT b.Id) AS Badges,
+    COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+    AVG(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE NULL END) AS AvgQuestionViews,
+    AVG(CASE WHEN p.PostTypeId = 2 THEN p.ViewCount ELSE NULL END) AS AvgAnswerViews,
+    MAX(p.CreationDate) AS LatestPostDate,
+    MIN(p.CreationDate) AS FirstPostDate,
+    CAST(EXTRACT(DAY FROM (MAX(p.CreationDate) - MIN(p.CreationDate))) AS INTEGER) AS DaysActive,
+    COUNT(DISTINCT c.Id) AS TotalComments,
+    COUNT(DISTINCT v.Id) AS TotalVotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId IN (2, 3) THEN v.Id END) AS UpDownVotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS Upvotes,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS Downvotes,
+    COALESCE(SUM(CASE WHEN v.VoteTypeId IN (2, 3) THEN 1 ELSE 0 END), 0) AS VoteCount,
+    COALESCE(SUM(CASE WHEN v.VoteTypeId IN (2, 3) THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(DISTINCT p.Id), 0), 0) AS VoteRatio,
+    COALESCE(
+        (
+            SELECT t.TagName
+            FROM Posts p2
+            JOIN Tags t ON t.TagName = (
+                -- derive first tag from p2.Tags by removing leading '<' and taking up to first '><' or end
+                -- use standard SQL functions: replace and position
+                CASE
+                    WHEN POSITION('><' IN p2.Tags) > 0 THEN
+                        SUBSTRING(REPLACE(REPLACE(p2.Tags, '<', ''), '>', '' ) FROM 1 FOR POSITION(',' IN REPLACE(REPLACE(p2.Tags, '><', ',', 'g'), '<', '') - 1)
+                    ELSE
+                        REPLACE(REPLACE(p2.Tags, '<', ''), '>', '')
+                END
+            )
+            WHERE p2.OwnerUserId = u.Id AND p2.PostTypeId = 1
+            GROUP BY t.TagName
+            ORDER BY COUNT(*) DESC
+            LIMIT 1
+        ),
+        'No Tags'
+    ) AS TopTag,
+    RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+    (
+        SELECT COUNT(DISTINCT a.Id)
+        FROM Posts a
+        JOIN Posts q ON a.ParentId = q.Id
+        WHERE a.OwnerUserId = u.Id 
+          AND q.Tags LIKE '%<sql>%'
+          AND q.PostTypeId = 1
+    ) AS SqlAnswerCount,
+    (
+        SELECT 
+            AVG(PostsThisMonth) AS AvgMonthlyPosts,
+            MAX(PostsThisMonth) AS MaxMonthlyPosts,
+            STRING_AGG(CAST(PostsThisMonth AS VARCHAR), ', ') AS MonthlyPostCounts
+        FROM (
+            SELECT 
+                u2.Id AS UserId,
+                EXTRACT(YEAR FROM p2.CreationDate) AS Year,
+                EXTRACT(MONTH FROM p2.CreationDate) AS Month,
+                COUNT(p2.Id) AS PostsThisMonth,
+                AVG(p2.Score) AS AvgScoreThisMonth,
+                COUNT(CASE WHEN p2.PostTypeId = 1 THEN 1 END) AS QuestionsThisMonth,
+                COUNT(CASE WHEN p2.PostTypeId = 2 THEN 1 END) AS AnswersThisMonth
+            FROM Users u2
+            JOIN Posts p2 ON u2.Id = p2.OwnerUserId
+            WHERE u2.Id = u.Id
+            GROUP BY u2.Id, EXTRACT(YEAR FROM p2.CreationDate), EXTRACT(MONTH FROM p2.CreationDate)
+        ) ActivityPatterns
+    ) AS MonthlyActivityStats,
+    CASE 
+        WHEN u.Reputation >= 1000000 THEN 'Legendary'
+        WHEN u.Reputation >= 100000 THEN 'Master'
+        WHEN u.Reputation >= 10000 THEN 'Expert'
+        WHEN u.Reputation >= 1000 THEN 'Intermediate'
+        WHEN u.Reputation >= 100 THEN 'Beginner'
+        ELSE 'Novice'
+    END AS ReputationLevel,
+    (
+        SELECT COUNT(*) 
+        FROM (
+            SELECT p1.Id FROM Posts p1 WHERE p1.OwnerUserId = u.Id AND p1.PostTypeId = 1
+            UNION
+            SELECT p2.Id FROM Posts p2 WHERE p2.OwnerUserId = u.Id AND p2.PostTypeId = 2
+            UNION
+            SELECT c1.Id FROM Comments c1 WHERE c1.UserId = u.Id
+        ) x
+    ) AS CombinedActivityCount,
+    ('User_' || u.Id || '_Reputation_' || CAST(u.Reputation AS VARCHAR) || '_Level_' ||
+        CASE 
+            WHEN u.Reputation >= 1000 THEN 'Advanced'
+            WHEN u.Reputation >= 100 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END
+    ) AS UserIdentifier,
+    CASE 
+        WHEN u.Reputation >= 10000 AND u.ViewCount >= 10000 AND u.UpVotes >= 1000 THEN 'Highly Active'
+        WHEN u.Reputation >= 1000 AND u.ViewCount >= 5000 AND u.UpVotes >= 500 THEN 'Active'
+        WHEN u.Reputation >= 100 AND u.ViewCount >= 1000 AND u.UpVotes >= 100 THEN 'Moderate'
+        ELSE 'Inactive'
+    END AS ActivityStatus
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN Comments c ON u.Id = c.UserId
+LEFT JOIN Votes v ON u.Id = v.UserId
+LEFT JOIN Badges b ON u.Id = b.UserId
+WHERE u.Id IS NOT NULL
+  AND u.Reputation >= 0
+  AND (
+        (u.Reputation >= 1000 OR u.ViewCount >= 1000 OR u.UpVotes >= 100)
+        OR EXISTS (
+            SELECT 1
+            FROM Posts p2
+            WHERE p2.OwnerUserId = u.Id
+              AND p2.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6' MONTH)
+        )
+    )
+GROUP BY 
+    u.Id, 
+    u.DisplayName, 
+    u.Reputation, 
+    u.ViewCount, 
+    u.UpVotes, 
+    u.DownVotes
+HAVING 
+    COUNT(DISTINCT p.Id) >= 0
+    AND (
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 0 
+        OR COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) > 0
+        OR COUNT(DISTINCT c.Id) > 0
+        OR COUNT(DISTINCT b.Id) > 0
+    )
+ORDER BY 
+    u.Reputation DESC,
+    TotalPosts DESC,
+    TotalScore DESC
+LIMIT 100000 OFFSET 0;

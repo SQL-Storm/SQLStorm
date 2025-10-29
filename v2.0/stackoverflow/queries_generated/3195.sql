@@ -1,0 +1,111 @@
+-- {"query": "3195.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2181} 
+
+/*  Elaborate benchmark query using CTEs, window functions, outer joins, 
+    correlated subqueries, set operators and string/NULL logic.                */
+WITH UserBadgeCounts AS (
+    SELECT  b.UserId,
+            SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldCnt,
+            SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverCnt,
+            SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeCnt
+    FROM    Badges b
+    GROUP BY b.UserId
+),
+UserPostCounts AS (
+    SELECT  u.Id                              AS UserId,
+            COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QCnt,
+            COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS ACnt,
+            MAX(p.CreationDate)                         AS LastPostDt
+    FROM    Users u
+    LEFT JOIN Posts p
+           ON p.OwnerUserId = u.Id
+    GROUP BY u.Id
+),
+UserRecentActivity AS (
+    SELECT  u.Id                                           AS UserId,
+            MAX(v.CreationDate)       AS LastVoteDt,
+            MAX(c.CreationDate)       AS LastCommentDt,
+            MAX(p.CreationDate)       AS LastPostDt
+    FROM    Users u
+    LEFT JOIN Votes   v ON v.UserId   = u.Id
+    LEFT JOIN Comments c ON c.UserId   = u.Id
+    LEFT JOIN Posts   p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id
+),
+TopReputationUsers AS (
+    SELECT  u.Id,
+            u.DisplayName,
+            u.Reputation,
+            COALESCE(bc.GoldCnt,0)   AS GoldCnt,
+            COALESCE(bc.SilverCnt,0) AS SilverCnt,
+            COALESCE(bc.BronzeCnt,0) AS BronzeCnt,
+            upc.QCnt,
+            upc.ACnt,
+            upc.LastPostDt,
+            ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank
+    FROM    Users u
+    LEFT JOIN UserBadgeCounts   bc  ON bc.UserId = u.Id
+    LEFT JOIN UserPostCounts    upc ON upc.UserId = u.Id
+    WHERE   u.Reputation > 10000
+),
+TagAggregates AS (
+    SELECT  t.TagName,
+            t.Count                       AS TagUseCnt,
+            COALESCE(SUM(p.Score),0)      AS TotalScore,
+            STRING_AGG(DISTINCT CAST(p.Id AS varchar),',') 
+                 FILTER (WHERE p.Id IS NOT NULL) AS PostIds
+    FROM    Tags t
+    LEFT JOIN Posts p
+           ON p.Tags IS NOT NULL
+          AND POSITION('<' || t.TagName || '>' IN p.Tags) > 0
+    GROUP BY t.TagName, t.Count
+),
+UserWithSampleTag AS (
+    SELECT  tr.*,
+            ts.TagName,
+            ts.TagUseCnt,
+            ts.TotalScore
+    FROM    TopReputationUsers tr
+    LEFT JOIN LATERAL (
+        SELECT  tg.TagName, tg.TagUseCnt, tg.TotalScore
+        FROM    TagAggregates tg
+        ORDER BY tg.TotalScore DESC
+        LIMIT   1
+    ) ts ON TRUE
+),
+ClosedDuplicatePosts AS (
+    SELECT  ph.PostId,
+            ph.CreationDate                     AS CloseDate,
+            ph.Comment::int                     AS CloseReasonId,   -- 101 = Duplicate, 102 = Off‑topic duplicate
+            JSONB_ARRAY_ELEMENTS_TEXT(ph.Text) AS OriginalQId
+    FROM    PostHistory ph
+    WHERE   ph.PostHistoryTypeId = 10               -- Post Closed
+      AND   ph.Comment IS NOT NULL
+      AND   ph.Comment::int IN (101,102)
+)
+SELECT  uwst.UserId,
+        uwst.DisplayName,
+        uwst.Reputation,
+        uwst.GoldCnt,
+        uwst.SilverCnt,
+        uwst.BronzeCnt,
+        uwst.QCnt,
+        uwst.ACnt,
+        uwst.LastPostDt,
+        ura.LastVoteDt,
+        ura.LastCommentDt,
+        COALESCE(uwst.TagName,'(no tag)') AS SampleTag,
+        uwst.TagUseCnt,
+        uwst.TotalScore
+FROM    UserWithSampleTag uwst
+LEFT JOIN UserRecentActivity ura ON ura.UserId = uwst.Id
+WHERE   (ura.LastVoteDt    IS NULL OR ura.LastVoteDt    < CURRENT_DATE - INTERVAL '180 days')
+  AND   (ura.LastCommentDt IS NULL OR ura.LastCommentDt < CURRENT_DATE - INTERVAL '180 days')
+  AND   (uwst.LastPostDt   IS NULL OR uwst.LastPostDt   < CURRENT_DATE - INTERVAL '180 days')
+ORDER BY uwst.Reputation DESC
+LIMIT 50
+
+UNION ALL
+
+/*  Dummy row to force a set‑operator branch (no real data returned). */
+SELECT NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL
+WHERE FALSE;

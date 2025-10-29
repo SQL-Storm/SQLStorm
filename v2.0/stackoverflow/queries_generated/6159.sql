@@ -1,0 +1,38 @@
+-- {"query": "6159.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "nova-micro", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2098, "output_tokens": 392} 
+
+SELECT 
+    u.DisplayName,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 1 THEN p.Id ELSE NULL END) AS InitialTitles,
+    COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN p.Id ELSE NULL END) AS UpVotes,
+    COUNT(DISTINCT CASE WHEN b.TagBased = 1 THEN t.TagName ELSE NULL END) AS TagBasedBadges,
+    MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Comment ELSE NULL END) AS CloseReason,
+    STRING_AGG(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN p.Title ELSE NULL END, ', ') AS DuplicatePosts
+FROM 
+    Users u
+LEFT JOIN 
+    (SELECT 
+         ph.PostId, ph.PostHistoryTypeId, ph.Comment 
+     FROM 
+         PostHistory ph
+     WHERE 
+         ph.PostHistoryTypeId IN (10, 33, 34)) ph ON u.Id = ph.UserId
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    Tags t ON b.TagBased = t.Id
+LEFT JOIN 
+    PostLinks pl ON p.Id = pl.PostId
+WHERE 
+    (p.PostTypeId = 1 OR p.PostTypeId = 2)
+    AND p.LastActivityDate > DATEADD(month, -12, GETDATE())
+GROUP BY 
+    u.DisplayName
+HAVING 
+    COUNT(DISTINCT p.Id) > 100
+ORDER BY 
+    TotalPosts DESC;

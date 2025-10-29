@@ -1,0 +1,131 @@
+-- {"query": "5871.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1070} 
+WITH
+RecentActivity AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.PostTypeId,
+    p.CreationDate,
+    p.ViewCount,
+    p.Score,
+    p.OwnerUserId,
+    p.Tags,
+    p.LastActivityDate,
+    p.CommentCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.LastEditDate
+  FROM Posts p
+  WHERE p.CreationDate >= NOW() - INTERVAL '180 days'
+),
+TopAuthors AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.Location,
+    u.WebsiteUrl,
+    u.AboutMe,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.UpVotes DESC, u.CreationDate ASC) AS rn
+  FROM Users u
+  WHERE u.Reputation > 1000
+),
+TaggedActivity AS (
+  SELECT
+    ra.PostId,
+    ra.Title,
+    ra.PostTypeId,
+    ra.CreationDate,
+    ra.ViewCount,
+    ra.Score,
+    ra.OwnerUserId,
+    ra.Tags,
+    ra.LastActivityDate,
+    ra.CommentCount,
+    ra.AnswerCount,
+    ra.FavoriteCount,
+    ra.LastEditDate,
+    t.TagName
+  FROM RecentActivity ra
+  LEFT JOIN LATERAL (
+    SELECT unnest(string_to_array(substr(ra.Tags, 2, length(ra.Tags) - 2), '><')) AS TagName
+  ) t ON TRUE
+  WHERE ra.PostTypeId = 1
+),
+WindowedStats AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.ViewCount,
+    p.Score,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.Tags,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) OVER (
+      PARTITION BY p.Id
+      ORDER BY v.CreationDate
+      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS UpvotesToDate,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) OVER (
+      PARTITION BY p.Id
+      ORDER BY v.CreationDate
+      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS DownvotesToDate
+  FROM Posts p
+  LEFT JOIN Votes v ON v.PostId = p.Id
+)
+SELECT
+  -- Benchmark-friendly composite result
+  p.Id AS post_id,
+  p.Title AS post_title,
+  p.PostTypeId AS post_type_id,
+  pt.Name AS post_type_name,
+  COALESCE(u.DisplayName, p.OwnerDisplayName) AS owner,
+  p.CreationDate AS creation_date,
+  p.LastActivityDate AS last_activity_date,
+  p.ViewCount AS view_count,
+  p.Score AS score,
+  p.AnswerCount AS answer_count,
+  p.CommentCount AS comment_count,
+  p.FavoriteCount AS favorite_count,
+  p.Tags,
+  -- Windowed metrics and correlated expressions
+  (SELECT AVG(score) FROM Posts WHERE OwnerUserId = p.OwnerUserId) AS avg_owner_score,
+  (SELECT COUNT(*) FROM Posts WHERE OwnerUserId = p.OwnerUserId AND CreationDate >= NOW() - INTERVAL '30 days') AS posts_last_30d,
+  UpvotesToDate,
+  DownvotesToDate,
+  -- Complex string expression and NULL handling
+  CONCAT_WS(' | ', COALESCE(p.Title, ''), COALESCE(p.Tags, ''), COALESCE((SELECT Name FROM PostHistoryTypes WHERE Id = 36), '')) AS composite_text,
+  CASE
+    WHEN p.OwnerUserId IS NULL THEN 'anonymous'
+    WHEN p.OwnerUserId = -1 THEN 'community'
+    ELSE 'registered'
+  END AS owner_type,
+  -- Join to fetch a few related links with outer join and filter
+  l.RelatedPostId AS linked_post_id
+FROM Posts p
+LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+LEFT JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN WindowedStats ws ON ws.PostId = p.Id
+LEFT JOIN PostLinks l ON l.PostId = p.Id AND l.LinkTypeId = 1
+LEFT JOIN (
+  SELECT PostId, RelatedPostId
+  FROM PostLinks
+  WHERE LinkTypeId = 1
+) l ON l.PostId = p.Id
+WHERE
+  p.CreationDate >= NOW() - INTERVAL '365 days'
+  AND (p.ViewCount > (SELECT AVG(ViewCount) FROM Posts))
+  AND COALESCE(p.AcceptedAnswerId, -1) <> p.Id
+ORDER BY p.LastActivityDate DESC, p.Score DESC
+LIMIT 200;

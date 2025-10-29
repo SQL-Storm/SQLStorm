@@ -1,0 +1,227 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.ViewCount,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        AVG(p.Score) as AvgPostScore,
+        MAX(p.CreationDate) as LastPostDate,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+                CAST(EXTRACT(day FROM (TIMESTAMP '2024-10-01 12:34:56' - MIN(p.CreationDate))) AS INTEGER)
+            ELSE 0 
+        END as DaysSinceFirstPost,
+        (SELECT COUNT(*) 
+         FROM Posts p2 
+         WHERE p2.OwnerUserId = u.Id 
+         AND p2.PostTypeId = 1 
+         AND p2.Score > 0) as HighScoreQuestions,
+        (SELECT COUNT(*) 
+         FROM Posts p3 
+         WHERE p3.OwnerUserId = u.Id 
+         AND p3.PostTypeId = 2 
+         AND p3.Score > 0) as HighScoreAnswers,
+        (SELECT AVG(Score) 
+         FROM Posts p4 
+         WHERE p4.OwnerUserId = u.Id 
+         AND p4.PostTypeId = 2) as AvgAnswerScore,
+        (SELECT COUNT(*) 
+         FROM Votes v 
+         WHERE v.UserId = u.Id 
+         AND v.VoteTypeId = 2) as UpvoteCount,
+        (SELECT COUNT(*) 
+         FROM Votes v 
+         WHERE v.UserId = u.Id 
+         AND v.VoteTypeId = 3) as DownvoteCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.ViewCount, u.UpVotes, u.DownVotes
+),
+RankedUsers AS (
+    SELECT 
+        us.*,
+        ROW_NUMBER() OVER (ORDER BY us.Reputation DESC, us.PostCount DESC) as ReputationRank,
+        NTILE(10) OVER (ORDER BY us.Reputation) as ReputationQuintile,
+        RANK() OVER (ORDER BY us.AvgPostScore DESC) as AvgScoreRank
+    FROM UserStats us
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        (SELECT COUNT(*) 
+         FROM Posts p 
+         WHERE p.Tags LIKE '%' || t.TagName || '%'
+         AND p.PostTypeId = 1) as QuestionCount,
+        (SELECT AVG(p.Score) 
+         FROM Posts p 
+         WHERE p.Tags LIKE '%' || t.TagName || '%'
+         AND p.PostTypeId = 1) as AvgQuestionScore,
+        (SELECT COUNT(*) 
+         FROM Posts p 
+         WHERE p.Tags LIKE '%' || t.TagName || '%'
+         AND p.PostTypeId = 2) as AnswerCount,
+        (SELECT MIN(p.CreationDate) 
+         FROM Posts p 
+         WHERE p.Tags LIKE '%' || t.TagName || '%' 
+         AND p.PostTypeId = 1) as FirstQuestionDate,
+        (SELECT MAX(p.CreationDate) 
+         FROM Posts p 
+         WHERE p.Tags LIKE '%' || t.TagName || '%' 
+         AND p.PostTypeId = 1) as LastQuestionDate
+    FROM Tags t
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END as PostTypeDesc,
+        CASE 
+            WHEN p.Score > 0 THEN 'High'
+            WHEN p.Score = 0 THEN 'Neutral'
+            ELSE 'Low'
+        END as ScoreCategory,
+        COALESCE(SUBSTRING(p.Body FROM 1 FOR 100), '') as BodySnippet,
+        (CASE 
+            WHEN p.Tags IS NOT NULL AND CHAR_LENGTH(p.Tags) > 0 THEN 
+                (SELECT COUNT(*) 
+                 FROM unnest(string_to_array(SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags)-2)), '><')) AS tag
+                 WHERE tag LIKE '%sql%' OR tag LIKE '%database%' OR tag LIKE '%programming%')
+            ELSE 0 
+        END) as TechTagCount,
+        (SELECT COUNT(*) 
+         FROM Posts p2 
+         WHERE p2.ParentId = p.Id 
+         AND p2.PostTypeId = 2) as DerivedAnswerCount,
+        (SELECT COUNT(*) 
+         FROM Comments c 
+         WHERE c.PostId = p.Id) as DerivedCommentCount
+    FROM Posts p
+),
+UserPostActivity AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        p.OwnerUserId,
+        p.CreationDate as PostDate,
+        p.Score as PostScore,
+        p.Title,
+        p.PostTypeId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            ELSE 'Non-Question'
+        END as PostTypeDesc,
+        CAST(EXTRACT(day FROM p.CreationDate - u.CreationDate) AS INTEGER) as DaysSinceUserRegistration,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.CreationDate DESC) as RecentPostSequence
+    FROM Users u
+    INNER JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 years')
+),
+CombinedAnalysis AS (
+    SELECT 
+        ru.UserId,
+        ru.DisplayName,
+        ru.Reputation,
+        ru.PostCount,
+        ru.CommentCount,
+        ru.BadgeCount,
+        ru.AvgPostScore,
+        ru.LastPostDate,
+        ru.DaysSinceFirstPost,
+        ru.HighScoreQuestions,
+        ru.HighScoreAnswers,
+        ru.AvgAnswerScore,
+        ru.UpvoteCount,
+        ru.DownvoteCount,
+        ta.TagName,
+        ta.TagCount,
+        ta.QuestionCount,
+        ta.AnswerCount,
+        ta.AvgQuestionScore,
+        pa.PostId,
+        pa.Title,
+        pa.Score,
+        pa.ViewCount,
+        pa.DerivedAnswerCount as PostAnswerCount,
+        pa.DerivedCommentCount as PostCommentCount,
+        pa.CreationDate as PostCreationDate,
+        pa.PostTypeDesc as PostType,
+        pa.BodySnippet,
+        pa.TechTagCount,
+        upa.RecentPostSequence,
+        CASE 
+            WHEN ru.Reputation > 10000 THEN 'Elite'
+            WHEN ru.Reputation > 5000 THEN 'Veteran'
+            WHEN ru.Reputation > 1000 THEN 'Experienced'
+            ELSE 'Beginner'
+        END as UserTier,
+        CASE 
+            WHEN pa.Score >= 100 THEN 'Popular'
+            WHEN pa.Score >= 10 THEN 'Moderate'
+            WHEN pa.Score >= 0 THEN 'Neutral'
+            ELSE 'Controversial'
+        END as PostTrend
+    FROM RankedUsers ru
+    LEFT JOIN TagAnalysis ta ON 1=1
+    LEFT JOIN PostAnalysis pa ON 1=1
+    LEFT JOIN UserPostActivity upa ON ru.UserId = upa.UserId
+    WHERE ((ta.TagName IS NOT NULL) OR (pa.PostId IS NOT NULL) OR (upa.UserId IS NOT NULL))
+)
+SELECT 
+    COUNT(*) as TotalRecords,
+    COUNT(DISTINCT UserId) as UniqueUsers,
+    COUNT(DISTINCT TagName) as UniqueTags,
+    COUNT(DISTINCT PostId) as UniquePosts,
+    AVG(Reputation) as AvgReputation,
+    AVG(AvgPostScore) as AvgAvgPostScore,
+    SUM(PostCount) as TotalPosts,
+    MAX(MaxScore) as MaxUserScore,
+    MIN(DaysSinceFirstPost) as MinDaysSinceFirstPost,
+    AVG(TechTagCount) as AvgTechTagCount
+FROM (
+    SELECT 
+        ca.UserId,
+        ca.DisplayName,
+        ca.Reputation,
+        ca.PostCount,
+        ca.AvgPostScore,
+        ca.DaysSinceFirstPost,
+        ca.HighScoreQuestions,
+        ca.HighScoreAnswers,
+        ca.TechTagCount,
+        MAX(ca.Score) OVER (PARTITION BY ca.UserId) as MaxScore
+    FROM CombinedAnalysis ca
+    WHERE ca.Reputation > 1000
+) final
+WHERE EXISTS (
+    SELECT 1 
+    FROM CombinedAnalysis ca2 
+    WHERE ca2.UserId = final.UserId 
+    AND (ca2.TagName IS NOT NULL OR ca2.PostId IS NOT NULL)
+)
+GROUP BY UserId, DisplayName, Reputation, PostCount, AvgPostScore, DaysSinceFirstPost, HighScoreQuestions, HighScoreAnswers, TechTagCount
+HAVING COUNT(*) > 5
+ORDER BY AVG(Reputation) DESC
+FETCH FIRST 1000 ROWS ONLY;

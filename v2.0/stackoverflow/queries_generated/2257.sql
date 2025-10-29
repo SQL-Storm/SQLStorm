@@ -1,0 +1,207 @@
+-- {"query": "2257.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1884} 
+WITH RecursivePostPaths AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        0 AS Depth,
+        CAST(p.Id AS VARCHAR) AS Path,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.Tags
+    FROM Posts p
+    WHERE p.PostTypeId = 1 -- questions only
+
+    UNION ALL
+
+    SELECT
+        c.Id,
+        c.Title,
+        c.CreationDate,
+        r.Depth + 1,
+        r.Path || '->' || CAST(c.Id AS VARCHAR),
+        c.OwnerUserId,
+        c.Score,
+        c.ViewCount,
+        c.Tags
+    FROM Posts c
+    INNER JOIN RecursivePostPaths r ON c.ParentId = r.Id
+    WHERE c.PostTypeId = 2 -- answers
+),
+UserBadgeStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName
+),
+PostVoteSummary AS (
+    SELECT
+        p.Id AS PostId,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END),0) AS UpVotes,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END),0) AS DownVotes,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END),0) AS Favorites,
+        COUNT(v.Id) AS TotalVotes
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    GROUP BY p.Id
+),
+PostCloseReasonsCTE AS (
+    SELECT
+        ph.PostId,
+        crt.Name AS CloseReasonName,
+        ph.CreationDate AS CloseDate,
+        ROW_NUMBER() OVER(PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS INT)
+    WHERE ph.PostHistoryTypeId = 10 -- Post Closed
+),
+LatestCloseReasons AS (
+    SELECT
+        PostId,
+        CloseReasonName,
+        CloseDate
+    FROM PostCloseReasonsCTE
+    WHERE rn = 1
+),
+UserLastAccessRanked AS (
+    SELECT
+        Id,
+        DisplayName,
+        LastAccessDate,
+        RANK() OVER (ORDER BY LastAccessDate DESC) AS AccessRank
+    FROM Users
+    WHERE LastAccessDate IS NOT NULL
+),
+QuestionTagExplode AS (
+    SELECT
+        p.Id AS QuestionId,
+        TRIM(regexp_split_to_table(substring(p.Tags from 2 for length(p.Tags)-2), '><')) AS Tag
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+),
+TagBadgeCounts AS (
+    SELECT
+        t.TagName,
+        COUNT(b.Id) AS BadgeCount
+    FROM Tags t
+    LEFT JOIN Badges b ON b.TagBased = 1 AND b.Name = t.TagName
+    GROUP BY t.TagName
+),
+TopTagUsers AS (
+    SELECT
+        qte.Tag,
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(*) AS PostsWithTag,
+        RANK() OVER (PARTITION BY qte.Tag ORDER BY COUNT(*) DESC) AS TagRank
+    FROM QuestionTagExplode qte
+    JOIN Posts p2 ON p2.OwnerUserId IS NOT NULL AND p2.PostTypeId = 1 AND p2.Id = qte.QuestionId
+    JOIN Users u ON u.Id = p2.OwnerUserId
+    GROUP BY qte.Tag, u.Id, u.DisplayName
+),
+UserAnswerStats AS (
+    SELECT
+        a.OwnerUserId,
+        COUNT(*) AS AnswerCount,
+        AVG(a.Score) AS AvgAnswerScore,
+        MAX(a.Score) AS MaxAnswerScore,
+        SUM(CASE WHEN a.Score < 0 THEN 1 ELSE 0 END) AS NegativeScoreAnswers
+    FROM Posts a
+    WHERE a.PostTypeId = 2 AND a.OwnerUserId IS NOT NULL
+    GROUP BY a.OwnerUserId
+),
+QuestionsWithLinkCounts AS (
+    SELECT
+        p.Id,
+        COUNT(pl.Id) FILTER (WHERE lt.Name = 'Duplicate') AS DuplicateLinks,
+        COUNT(pl.Id) FILTER (WHERE lt.Name = 'Linked') AS LinkedPosts
+    FROM Posts p
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+    LEFT JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id
+),
+ComplexPostScoreCalc AS (
+    SELECT
+        p.Id,
+        (p.Score * 2 
+         + COALESCE(pvs.UpVotes,0) 
+         - COALESCE(pvs.DownVotes,0) * 1.5 
+         + COALESCE(pvs.Favorites,0) * 3
+         + LEAST(p.ViewCount / 100, 50)
+         + COALESCE(dlc.DuplicateLinks,0) * (-10)
+         + COALESCE(dlc.LinkedPosts,0) * 5
+         + (CASE WHEN p.ClosedDate IS NOT NULL THEN -25 ELSE 0 END)
+        ) AS CustomScore
+    FROM Posts p
+    LEFT JOIN PostVoteSummary pvs ON p.Id = pvs.PostId
+    LEFT JOIN QuestionsWithLinkCounts dlc ON p.Id = dlc.Id
+    WHERE p.PostTypeId = 1
+),
+MostActiveUsersLastYear AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        COUNT(p.Id) AS PostsLastYear,
+        COUNT(DISTINCT b.Id) AS BadgeCountLastYear
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.CreationDate >= NOW() - INTERVAL '1 year'
+    LEFT JOIN Badges b ON b.UserId = u.Id AND b.Date >= NOW() - INTERVAL '1 year'
+    GROUP BY u.Id, u.DisplayName
+    HAVING COUNT(p.Id) > 10
+),
+FinalResults AS (
+    SELECT
+        rpp.Id AS PostId,
+        rpp.Title,
+        rpp.CreationDate,
+        rpp.Depth,
+        rpp.Path,
+        us.DisplayName AS OwnerName,
+        us.GoldBadges,
+        us.SilverBadges,
+        us.BronzeBadges,
+        ca.CustomScore,
+        lcr.CloseReasonName,
+        uls.AccessRank,
+        tas.AnswerCount,
+        tas.AvgAnswerScore,
+        tas.NegativeScoreAnswers,
+        tusers.Tag,
+        tusers.PostsWithTag,
+        tb.BadgeCount AS TagBadgeCount,
+        mau.DisplayName AS ActiveUserName,
+        mau.PostsLastYear,
+        mau.BadgeCountLastYear,
+        -- complex string and null logic expressions
+        CASE 
+            WHEN rpp.Tags IS NULL OR rpp.Tags = '' THEN 'No Tags'
+            ELSE array_to_string(string_to_array(regexp_replace(rpp.Tags, '[^a-zA-Z0-9><]', '', 'g'), '><'), ', ')
+        END AS CleanedTagList,
+        COALESCE(u.AboutMe, 'No AboutMe Info') AS AboutMeInfo,
+        -- window function with partition
+        ROW_NUMBER() OVER (PARTITION BY tusers.Tag ORDER BY ca.CustomScore DESC) AS RankByTagScore
+    FROM RecursivePostPaths rpp
+    LEFT JOIN UserBadgeStats us ON us.UserId = rpp.OwnerUserId
+    LEFT JOIN ComplexPostScoreCalc ca ON ca.Id = rpp.Id
+    LEFT JOIN LatestCloseReasons lcr ON lcr.PostId = rpp.Id
+    LEFT JOIN UserLastAccessRanked uls ON uls.Id = rpp.OwnerUserId
+    LEFT JOIN UserAnswerStats tas ON tas.OwnerUserId = rpp.OwnerUserId
+    LEFT JOIN TopTagUsers tusers ON tusers.UserId = rpp.OwnerUserId
+    LEFT JOIN TagBadgeCounts tb ON tb.TagName = tusers.Tag
+    LEFT JOIN MostActiveUsersLastYear mau ON mau.Id = rpp.OwnerUserId
+    LEFT JOIN Users u ON u.Id = rpp.OwnerUserId
+    WHERE rpp.Depth <= 1 -- limit to questions and direct answers for brevity
+)
+SELECT *
+FROM FinalResults
+WHERE RankByTagScore <= 3
+ORDER BY Tag, CustomScore DESC, CreationDate DESC
+LIMIT 100;

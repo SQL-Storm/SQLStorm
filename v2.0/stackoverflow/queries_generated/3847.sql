@@ -1,0 +1,127 @@
+-- {"query": "3847.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2412} 
+
+/*  Complex benchmark query using CTEs, window functions, outer joins,
+    correlated sub‑queries, set operators and extensive NULL / string logic   */
+WITH
+/*--- badge aggregation per user ------------------------------------------*/
+user_badges AS (
+    SELECT u.id                                          AS user_id,
+           COALESCE(SUM(CASE WHEN b.class = 1 THEN 1 END),0) AS gold_badges,
+           COALESCE(SUM(CASE WHEN b.class = 2 THEN 1 END),0) AS silver_badges,
+           COALESCE(SUM(CASE WHEN b.class = 3 THEN 1 END),0) AS bronze_badges,
+           MAX(b.date)                                   AS last_badge_date
+    FROM   users u
+    LEFT   JOIN badges b ON b.userid = u.id
+    GROUP  BY u.id
+),
+
+/*--- post statistics per user -------------------------------------------*/
+user_posts AS (
+    SELECT p.owneruserid                                   AS user_id,
+           COUNT(*) FILTER (WHERE p.posttypeid = 1)       AS ques_cnt,
+           COUNT(*) FILTER (WHERE p.posttypeid = 2)       AS ans_cnt,
+           AVG(p.score)                                   AS avg_score,
+           MAX(p.creationdate)                            AS last_post_dt
+    FROM   posts p
+    GROUP  BY p.owneruserid
+),
+
+/*--- vote activity per user ---------------------------------------------*/
+user_votes AS (
+    SELECT v.userid                                         AS user_id,
+           COUNT(*) FILTER (WHERE vt.name = 'UpMod')       AS up_votes,
+           COUNT(*) FILTER (WHERE vt.name = 'DownMod')     AS down_votes,
+           COUNT(*) FILTER (WHERE vt.name = 'Favorite')    AS fav_votes
+    FROM   votes v
+    JOIN   votetypes vt ON vt.id = v.votetypeid
+    GROUP  BY v.userid
+),
+
+/*--- users who commented in the last 30 days ---------------------------*/
+recent_commenters AS (
+    SELECT DISTINCT c.userid AS user_id
+    FROM   comments c
+    WHERE  c.creationdate > now() - interval '30 days'
+),
+
+/*--- tag usage statistics (questions only) -----------------------------*/
+tag_usage AS (
+    SELECT t.tagname,
+           COUNT(p.id)                                     AS ques_used,
+           SUM(p.viewcount)                                AS total_views,
+           MAX(p.creationdate)                             AS latest_q_dt
+    FROM   tags t
+    JOIN   posts p ON p.tags LIKE '%'||t.tagname||'%'
+    WHERE  p.posttypeid = 1
+    GROUP  BY t.tagname
+),
+
+/*--- per‑user tag affinity (only tags used ≥5 times) --------------------*/
+user_tag_affinity AS (
+    SELECT p.owneruserid                                   AS user_id,
+           t.tagname,
+           COUNT(*)                                        AS tag_q_cnt,
+           ROW_NUMBER() OVER (PARTITION BY p.owneruserid
+                              ORDER BY COUNT(*) DESC)    AS rn
+    FROM   posts p
+    JOIN   tags t ON p.tags LIKE '%'||t.tagname||'%'
+    WHERE  p.posttypeid = 1
+    GROUP  BY p.owneruserid, t.tagname
+    HAVING COUNT(*) >= 5
+),
+
+/*--- top 3 tags per user ------------------------------------------------*/
+top_user_tags AS (
+    SELECT user_id,
+           STRING_AGG(tagname, ', ') FILTER (WHERE rn <= 3) AS top_3_tags
+    FROM   user_tag_affinity
+    GROUP  BY user_id
+)
+
+/*==========================================================================*/
+/*   Final result set: user summary + a tag‑summary row (set operator)     */
+SELECT
+    u.id                                            AS user_id,
+    u.displayname,
+    ub.gold_badges,
+    ub.silver_badges,
+    ub.bronze_badges,
+    ub.last_badge_date,
+    up.ques_cnt,
+    up.ans_cnt,
+    ROUND(COALESCE(up.avg_score,0)::numeric,2)      AS avg_post_score,
+    up.last_post_dt,
+    uv.up_votes,
+    uv.down_votes,
+    uv.fav_votes,
+    CASE WHEN rc.user_id IS NOT NULL THEN 1 ELSE 0 END AS commented_last_30d,
+    tu.top_3_tags
+FROM   users u
+LEFT   JOIN user_badges ub   ON ub.user_id   = u.id
+LEFT   JOIN user_posts up    ON up.user_id   = u.id
+LEFT   JOIN user_votes uv    ON uv.user_id   = u.id
+LEFT   JOIN recent_commenters rc ON rc.user_id = u.id
+LEFT   JOIN top_user_tags tu ON tu.user_id   = u.id
+WHERE  u.reputation > 1000
+ORDER  BY ub.gold_badges DESC,
+          ub.silver_badges DESC,
+          u.reputation DESC
+LIMIT  100
+
+UNION ALL
+
+/*--- tag summary row ------------------------------------------------------*/
+SELECT
+    NULL                                            AS user_id,
+    '--- Tag Summary ---'                           AS displayname,
+    NULL,NULL,NULL,NULL,
+    NULL,NULL,NULL,NULL,
+    NULL,NULL,NULL,
+    NULL,
+    STRING_AGG(t.tagname||':'||t.ques_used, '; ')   AS top_3_tags
+FROM   (
+        SELECT tagname, ques_used
+        FROM   tag_usage
+        ORDER  BY ques_used DESC
+        LIMIT  10
+       ) t;

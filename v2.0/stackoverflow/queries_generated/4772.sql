@@ -1,0 +1,205 @@
+-- {"query": "4772.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1776} 
+
+WITH
+  RankedPostEdits AS (
+    SELECT
+      ph.PostId,
+      ph.UserId,
+      u.DisplayName AS EditorDisplayName,
+      ph.CreationDate AS EditDate,
+      ph.PostHistoryTypeId,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId, ph.UserId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory AS ph
+    JOIN Users AS u
+      ON ph.UserId = u.Id
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+  ),
+  PostEditSummary AS (
+    SELECT
+      PostId,
+      STRING_AGG(EditorDisplayName || ' on ' || TO_CHAR(EditDate, 'YYYY-MM-DD HH24:MI:SS'), E'\n') AS EditHistory
+    FROM RankedPostEdits
+    WHERE
+      rn <= 5 -- Consider the latest 5 edits per user per post
+    GROUP BY
+      PostId
+  ),
+  QuestionDetails AS (
+    SELECT
+      p.Id AS QuestionId,
+      p.Title AS QuestionTitle,
+      p.CreationDate AS QuestionCreationDate,
+      p.OwnerUserId,
+      u.DisplayName AS QuestionOwnerDisplayName,
+      p.Score AS QuestionScore,
+      p.ViewCount AS QuestionViewCount,
+      p.AnswerCount AS TotalAnswers,
+      COALESCE(p.FavoriteCount, 0) AS Favorites,
+      CASE
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+        ELSE 'Open'
+      END AS QuestionStatus,
+      cr.Name AS CloseReason,
+      p.Tags,
+      (
+        SELECT
+          COUNT(c.Id)
+        FROM Comments AS c
+        WHERE
+          c.PostId = p.Id AND c.Score > 5
+      ) AS HighScoreComments,
+      (
+        SELECT
+          STRING_AGG(t.TagName, ', ')
+        FROM Tags AS t
+        WHERE
+          t.Id IN (
+            SELECT
+              TRIM(unnested_tag)
+            FROM UNNEST(STRING_TO_ARRAY(p.Tags, '><')) AS unnested_tag
+          )
+      ) AS FormattedTags,
+      CASE
+        WHEN p.OwnerUserId = -1 THEN 'Community'
+        ELSE u.DisplayName
+      END AS ActualOwnerDisplayName
+    FROM Posts AS p
+    LEFT JOIN Users AS u
+      ON p.OwnerUserId = u.Id
+    LEFT JOIN CloseReasonTypes AS cr
+      ON p.Id = (
+        SELECT
+          PostId
+        FROM PostHistory
+        WHERE
+          PostId = p.Id AND PostHistoryTypeId = 10
+        ORDER BY
+          CreationDate DESC
+        LIMIT 1
+      ) AND cr.Id = (
+        SELECT
+          CAST(Comment AS INT)
+        FROM PostHistory
+        WHERE
+          PostId = p.Id AND PostHistoryTypeId = 10
+        ORDER BY
+          CreationDate DESC
+        LIMIT 1
+      )
+    WHERE
+      p.PostTypeId = 1 -- Questions
+  ),
+  AnswerDetails AS (
+    SELECT
+      pa.Id AS AnswerId,
+      pa.ParentId AS QuestionId,
+      pa.OwnerUserId,
+      ua.DisplayName AS AnswerOwnerDisplayName,
+      pa.Score AS AnswerScore,
+      pa.CreationDate AS AnswerCreationDate,
+      pa.LastActivityDate AS AnswerLastActivityDate,
+      CASE
+        WHEN pa.Id = qd.AcceptedAnswerId THEN TRUE
+        ELSE FALSE
+      END AS IsAcceptedAnswer,
+      ROW_NUMBER() OVER (PARTITION BY pa.ParentId ORDER BY pa.Score DESC, pa.CreationDate ASC) AS answer_rank_by_score
+    FROM Posts AS pa
+    JOIN Users AS ua
+      ON pa.OwnerUserId = ua.Id
+    JOIN QuestionDetails AS qd
+      ON pa.ParentId = qd.QuestionId
+    WHERE
+      pa.PostTypeId = 2 -- Answers
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsAsked,
+      COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersGiven,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS TotalAnswerScore,
+      MAX(u.Reputation) AS UserReputation,
+      COUNT(DISTINCT b.Id) AS BadgeCount,
+      STRING_AGG(DISTINCT b.Name, ', ') AS BadgeNames
+    FROM Users AS u
+    LEFT JOIN Posts AS p
+      ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges AS b
+      ON u.Id = b.UserId
+    GROUP BY
+      u.Id,
+      u.DisplayName
+  ),
+  CommunityInteractions AS (
+    SELECT
+      p.Id AS PostId,
+      COUNT(DISTINCT ph.Id) AS PostHistoryCount,
+      COUNT(DISTINCT c.Id) AS CommentCount
+    FROM Posts AS p
+    LEFT JOIN PostHistory AS ph
+      ON p.Id = ph.PostId
+    LEFT JOIN Comments AS c
+      ON p.Id = c.PostId
+    GROUP BY
+      p.Id
+  )
+SELECT
+  qd.QuestionTitle,
+  qd.QuestionOwnerDisplayName,
+  qd.QuestionScore,
+  qd.QuestionViewCount,
+  qd.TotalAnswers,
+  qd.Favorites,
+  qd.QuestionStatus,
+  qd.CloseReason,
+  qd.FormattedTags,
+  qd.HighScoreComments,
+  COALESCE(pes.EditHistory, 'No edits recorded') AS EditHistorySummary,
+  ua.QuestionsAsked AS OwnerQuestionsAsked,
+  ua.AnswersGiven AS OwnerAnswersGiven,
+  ua.TotalAnswerScore AS OwnerTotalAnswerScore,
+  ua.UserReputation AS OwnerReputation,
+  ua.BadgeCount AS OwnerBadgeCount,
+  ua.BadgeNames AS OwnerBadges,
+  ci.PostHistoryCount,
+  ci.CommentCount,
+  COALESCE(ad.AnswerScore, 0) AS BestAnswerScore,
+  ad.AnswerOwnerDisplayName AS BestAnswerOwner,
+  ad.AnswerLastActivityDate AS BestAnswerLastActivity,
+  ad.IsAcceptedAnswer AS IsBestAnswerAccepted,
+  ad.answer_rank_by_score AS BestAnswerRank
+FROM QuestionDetails AS qd
+LEFT JOIN PostEditSummary AS pes
+  ON qd.QuestionId = pes.PostId
+LEFT JOIN UserActivity AS ua
+  ON qd.OwnerUserId = ua.UserId
+LEFT JOIN CommunityInteractions AS ci
+  ON qd.QuestionId = ci.PostId
+LEFT JOIN AnswerDetails AS ad
+  ON qd.QuestionId = ad.QuestionId AND ad.answer_rank_by_score = 1
+WHERE
+  qd.QuestionScore > 10
+  AND qd.TotalAnswers BETWEEN 2 AND 20
+  AND qd.QuestionViewCount > 1000
+  AND qd.QuestionCreationDate < '2023-01-01'
+  AND qd.OwnerUserId IS NOT NULL
+  AND qd.OwnerUserId <> -1
+  AND EXISTS (
+    SELECT
+      1
+    FROM Votes AS v
+    WHERE
+      v.PostId = qd.QuestionId AND v.VoteTypeId = 2 -- UpVotes
+  )
+  AND NOT EXISTS (
+    SELECT
+      1
+    FROM PostLinks AS pl
+    WHERE
+      pl.PostId = qd.QuestionId AND pl.LinkTypeId = 3 -- Duplicate Links
+  )
+ORDER BY
+  qd.QuestionScore DESC,
+  qd.QuestionViewCount DESC
+LIMIT 50;

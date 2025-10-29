@@ -1,0 +1,645 @@
+SELECT 
+    p.Id as PostId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    u.DisplayName as OwnerName,
+    CASE 
+        WHEN p.PostTypeId = 1 THEN 'Question'
+        WHEN p.PostTypeId = 2 THEN 'Answer'
+        WHEN p.PostTypeId = 3 THEN 'Wiki'
+        WHEN p.PostTypeId = 4 THEN 'TagWikiExcerpt'
+        WHEN p.PostTypeId = 5 THEN 'TagWiki'
+        ELSE 'Other'
+    END as PostType,
+    COALESCE(p.Tags, '') as Tags,
+    CASE 
+        WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'HasAcceptedAnswer'
+        WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NULL THEN 'NoAcceptedAnswer'
+        ELSE 'NotQuestion'
+    END as QuestionStatus,
+    COUNT(v.Id) as TotalVotes,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) as UpVotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) as DownVotes,
+    SUM(CASE WHEN v.VoteTypeId IN (8,9) THEN COALESCE(v.BountyAmount, 0) ELSE 0 END) as TotalBounty,
+    (
+        SELECT COUNT(*) 
+        FROM Comments c 
+        WHERE c.PostId = p.Id
+    ) as CommentCount,
+    (
+        SELECT COUNT(*) 
+        FROM PostHistory ph 
+        WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (1,2,3,4,5,6)
+    ) as EditCount,
+    (
+        SELECT COUNT(*) 
+        FROM PostLinks pl 
+        WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3
+    ) as DuplicateCount,
+    (
+        SELECT COUNT(*) 
+        FROM PostLinks pl 
+        WHERE pl.RelatedPostId = p.Id AND pl.LinkTypeId = 1
+    ) as LinkCount,
+    LAG(p.Score, 1, 0) OVER (ORDER BY p.CreationDate) as PreviousScore,
+    LEAD(p.Score, 1, 0) OVER (ORDER BY p.CreationDate) as NextScore,
+    ROW_NUMBER() OVER (ORDER BY p.Score DESC) as ScoreRank,
+    RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) as PostTypeScoreRank,
+    DENSE_RANK() OVER (ORDER BY p.ViewCount DESC) as ViewRank,
+    PERCENT_RANK() OVER (ORDER BY p.Score) as ScorePercentile,
+    NTILE(10) OVER (ORDER BY p.Score) as ScoreDecile,
+    AVG(p.Score) OVER (ORDER BY p.CreationDate ROWS BETWEEN 5 PRECEDING AND 5 FOLLOWING) as MovingAverageScore,
+    SUM(p.ViewCount) OVER (ORDER BY p.CreationDate) as CumulativeViews,
+    CASE 
+        WHEN p.Score >= 100 THEN 'High'
+        WHEN p.Score >= 10 THEN 'Medium'
+        WHEN p.Score >= 1 THEN 'Low'
+        ELSE 'VeryLow'
+    END as ScoreCategory,
+    CASE 
+        WHEN p.Tags IS NOT NULL AND p.Tags != '' THEN
+            (
+                SELECT STRING_AGG(tag, ', ')
+                FROM (
+                    SELECT TRIM(UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><'))) as tag
+                ) tags
+                WHERE tag IS NOT NULL AND tag != ''
+            )
+        ELSE NULL
+    END as TagList,
+    CASE 
+        WHEN EXISTS (
+            SELECT 1 
+            FROM PostHistory ph 
+            WHERE ph.PostId = p.Id 
+            AND ph.PostHistoryTypeId IN (10,12,13) 
+            AND ph.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30 day')
+        ) THEN 'RecentlyModified'
+        ELSE 'Stable'
+    END as ActivityStatus,
+    CASE 
+        WHEN u.Reputation > 10000 THEN 'Expert'
+        WHEN u.Reputation > 1000 THEN 'Intermediate'
+        WHEN u.Reputation > 100 THEN 'Beginner'
+        ELSE 'Newbie'
+    END as UserReputationLevel,
+    CASE WHEN p.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END as PostStatus,
+    COALESCE(p.AnswerCount, 0) as AnswerCount,
+    COALESCE(p.CommentCount, 0) as CommentCount,
+    COALESCE(p.FavoriteCount, 0) as FavoriteCount,
+    CASE 
+        WHEN p.PostTypeId = 1 THEN 
+            (
+                SELECT b.Name 
+                FROM Badges b 
+                WHERE b.UserId = p.OwnerUserId 
+                AND b.TagBased = 0 
+                AND b.Date BETWEEN p.CreationDate AND (p.CreationDate + INTERVAL '30 day')
+                ORDER BY b.Date
+                LIMIT 1
+            )
+        ELSE NULL
+    END as EarlyBadge,
+    (
+        SELECT COUNT(*) 
+        FROM Badges b 
+        WHERE b.UserId = p.OwnerUserId 
+        AND b.Class = 1
+    ) as GoldBadges,
+    (
+        SELECT COUNT(*) 
+        FROM Badges b 
+        WHERE b.UserId = p.OwnerUserId 
+        AND b.Class = 2
+    ) as SilverBadges,
+    (
+        SELECT COUNT(*) 
+        FROM Badges b 
+        WHERE b.UserId = p.OwnerUserId 
+        AND b.Class = 3
+    ) as BronzeBadges,
+    CASE 
+        WHEN (
+            SELECT COUNT(*) 
+            FROM PostHistory ph 
+            WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId = 24
+        ) > 0 THEN 'HasSuggestedEdits'
+        ELSE 'NoSuggestedEdits'
+    END as SuggestedEditStatus,
+    CASE 
+        WHEN (
+            SELECT COUNT(*) 
+            FROM PostHistory ph 
+            WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (10,11)
+        ) > 0 THEN 'HasCloseReopenHistory'
+        ELSE 'NoCloseReopenHistory'
+    END as CloseReopenStatus,
+    (
+        SELECT STRING_AGG(DISTINCT ph.Comment, ', ')
+        FROM PostHistory ph 
+        WHERE ph.PostId = p.Id AND ph.Comment IS NOT NULL
+        GROUP BY ph.PostId
+        HAVING COUNT(*) > 1
+    ) as CommentHistory,
+    ROUND(
+        (
+            (COALESCE(p.ViewCount, 0) * 1.0) / 
+            NULLIF(COALESCE(p.Score, 1), 0)
+        ), 2
+    ) as ViewScoreRatio,
+    CASE
+        WHEN (
+            SELECT COUNT(*) 
+            FROM PostHistory ph 
+            WHERE ph.PostId = p.Id AND ph.UserId IS NOT NULL
+        ) > 0 THEN 
+            ROUND(
+                (
+                    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id) * 1.0 / 
+                    NULLIF((SELECT COUNT(*) FROM Users u WHERE u.Id = p.OwnerUserId), 0)
+                ), 2
+            )
+        ELSE 0
+    END as OwnerActivityRatio,
+    (
+        SELECT MAX(ph.CreationDate)
+        FROM PostHistory ph
+        WHERE ph.PostId = p.Id
+    ) as LastHistoryDate,
+    CASE
+        WHEN p.PostTypeId = 1 THEN (
+            SELECT STRING_AGG(
+                CONCAT(
+                    'Post(', ph.PostId, ') Type(', ph.PostHistoryTypeId, ') by ', 
+                    COALESCE(ph.UserDisplayName, 'Unknown'), ' at ', ph.CreationDate
+                ), '; '
+            )
+            FROM PostHistory ph
+            WHERE ph.PostId = p.Id
+            AND ph.PostHistoryTypeId IN (1,2,3,4,5,6)
+            ORDER BY ph.CreationDate
+            LIMIT 10
+        )
+        ELSE NULL
+    END as RecentEditsSample,
+    CASE
+        WHEN p.ViewCount > 1000 AND p.Score > 50 THEN 'PopularHighScore'
+        WHEN p.ViewCount > 1000 AND p.Score BETWEEN 1 AND 50 THEN 'PopularLowScore'
+        WHEN p.ViewCount BETWEEN 100 AND 1000 AND p.Score > 50 THEN 'ModerateHighScore'
+        ELSE 'Standard'
+    END as PopularityCategory,
+    ABS(p.ViewCount - AVG(p.ViewCount) OVER ()) as ViewDeviation,
+    CASE
+        WHEN EXISTS (
+            SELECT 1 
+            FROM PostHistory ph 
+            WHERE ph.PostId = p.Id 
+            AND ph.PostHistoryTypeId IN (25, 52, 53)
+        ) 
+        THEN 'HasPromotionalActivity' 
+        ELSE 'NoPromotionalActivity'
+    END as PromotionStatus,
+    (
+        SELECT COUNT(*) 
+        FROM PostHistory ph 
+        WHERE ph.PostId = p.Id 
+        AND ph.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6 month')
+    ) as RecentActivityCount,
+    CASE
+        WHEN p.PostTypeId = 1 THEN 
+            EXTRACT(DAY FROM (COALESCE(p.ClosedDate, TIMESTAMP '2024-10-01 12:34:56') - p.CreationDate))
+        ELSE NULL
+    END as TimeToClosureDays,
+    (
+        SELECT COUNT(DISTINCT ph.UserId)
+        FROM PostHistory ph
+        WHERE ph.PostId = p.Id
+        AND ph.UserId IS NOT NULL
+    ) as UniqueEditors,
+    (
+        SELECT STRING_AGG(
+            CONCAT(
+                ph.UserDisplayName, '(', ph.UserId, ')'
+            ), '; '
+        )
+        FROM PostHistory ph
+        WHERE ph.PostId = p.Id
+        AND ph.UserId IS NOT NULL
+        GROUP BY ph.PostId
+        HAVING COUNT(*) > 0
+    ) as EditorsList,
+    COALESCE(p.OwnerUserId, 0) as OwnerUserId,
+    CASE
+        WHEN p.OwnerUserId = 0 THEN 'CommunityWiki'
+        WHEN p.OwnerUserId IS NULL THEN 'DeletedUser'
+        ELSE 'NormalUser'
+    END as OwnerType,
+    CASE
+        WHEN p.ContentLicense = 'CC BY-SA 3.0' THEN 'CreativeCommons'
+        WHEN p.ContentLicense = 'CC BY-SA 2.5' THEN 'OldCreativeCommons'
+        WHEN p.ContentLicense IS NULL THEN 'UnknownLicense'
+        ELSE 'OtherLicense'
+    END as LicenseStatus,
+    ROUND(
+        (COALESCE(p.Score, 0) * 100.0) / 
+        NULLIF((SELECT MAX(p2.Score) FROM Posts p2 WHERE p2.PostTypeId = p.PostTypeId), 0),
+        2
+    ) as ScorePercentileOfPostType,
+    CASE
+        WHEN p.PostTypeId = 1 THEN (
+            SELECT COUNT(*) 
+            FROM Posts p2 
+            WHERE p2.ParentId = p.Id
+            AND p2.PostTypeId = 2
+            AND p2.Score > 10
+        )
+        ELSE 0
+    END as HighScoringAnswers,
+    (
+        SELECT AVG(Score) 
+        FROM Posts p3 
+        WHERE p3.OwnerUserId = p.OwnerUserId
+        AND p3.PostTypeId = 2
+    ) as AvgAnswerScore,
+    COALESCE(p.AnswerCount, 0) - 
+    (
+        SELECT COUNT(*) 
+        FROM Posts p4 
+        WHERE p4.ParentId = p.Id
+        AND p4.Score <= 0
+    ) as NetAnswers,
+    CASE 
+        WHEN p.ViewCount > (
+            SELECT AVG(ViewCount) 
+            FROM Posts 
+            WHERE PostTypeId = p.PostTypeId
+        ) THEN 'AboveAverage'
+        ELSE 'BelowAverage'
+    END as ViewPerformance
+FROM Posts p
+LEFT JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN Votes v ON p.Id = v.PostId
+WHERE 
+    p.PostTypeId IN (1,2) 
+    AND (
+        (p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 year') AND p.CreationDate <= TIMESTAMP '2024-10-01 12:34:56')
+        OR p.Score > 100
+    )
+    AND (
+        p.ViewCount > 100 
+        OR p.Score > 50 
+        OR EXISTS (
+            SELECT 1 
+            FROM Comments c 
+            WHERE c.PostId = p.Id 
+            AND c.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '4 week')
+        )
+    )
+    AND NOT (
+        p.ViewCount = 0 
+        AND p.Score = 0 
+        AND p.CommentCount = 0
+    )
+GROUP BY 
+    p.Id, 
+    p.Title, 
+    p.Score, 
+    p.ViewCount, 
+    p.CreationDate, 
+    u.DisplayName, 
+    p.PostTypeId, 
+    p.Tags, 
+    p.AcceptedAnswerId, 
+    p.AnswerCount, 
+    p.CommentCount, 
+    p.FavoriteCount,
+    p.ClosedDate, 
+    p.OwnerUserId, 
+    p.ContentLicense
+HAVING 
+    COUNT(v.Id) > 0
+    AND (
+        (SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) > 10)
+        OR (SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) < 5)
+        OR (SUM(CASE WHEN v.VoteTypeId IN (8,9) THEN COALESCE(v.BountyAmount, 0) ELSE 0 END) > 1000)
+    )
+UNION ALL
+SELECT 
+    p.Id as PostId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    u.DisplayName as OwnerName,
+    'TagQuestion' as PostType,
+    COALESCE(p.Tags, '') as Tags,
+    CASE 
+        WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'HasAcceptedAnswer'
+        WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NULL THEN 'NoAcceptedAnswer'
+        ELSE 'NotQuestion'
+    END as QuestionStatus,
+    COUNT(v.Id) as TotalVotes,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) as UpVotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) as DownVotes,
+    SUM(CASE WHEN v.VoteTypeId IN (8,9) THEN COALESCE(v.BountyAmount, 0) ELSE 0 END) as TotalBounty,
+    (
+        SELECT COUNT(*) 
+        FROM Comments c 
+        WHERE c.PostId = p.Id
+    ) as CommentCount,
+    (
+        SELECT COUNT(*) 
+        FROM PostHistory ph 
+        WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (1,2,3,4,5,6)
+    ) as EditCount,
+    (
+        SELECT COUNT(*) 
+        FROM PostLinks pl 
+        WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3
+    ) as DuplicateCount,
+    (
+        SELECT COUNT(*) 
+        FROM PostLinks pl 
+        WHERE pl.RelatedPostId = p.Id AND pl.LinkTypeId = 1
+    ) as LinkCount,
+    LAG(p.Score, 1, 0) OVER (ORDER BY p.CreationDate) as PreviousScore,
+    LEAD(p.Score, 1, 0) OVER (ORDER BY p.CreationDate) as NextScore,
+    ROW_NUMBER() OVER (ORDER BY p.Score DESC) as ScoreRank,
+    RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) as PostTypeScoreRank,
+    DENSE_RANK() OVER (ORDER BY p.ViewCount DESC) as ViewRank,
+    PERCENT_RANK() OVER (ORDER BY p.Score) as ScorePercentile,
+    NTILE(10) OVER (ORDER BY p.Score) as ScoreDecile,
+    AVG(p.Score) OVER (ORDER BY p.CreationDate ROWS BETWEEN 5 PRECEDING AND 5 FOLLOWING) as MovingAverageScore,
+    SUM(p.ViewCount) OVER (ORDER BY p.CreationDate) as CumulativeViews,
+    CASE 
+        WHEN p.Score >= 100 THEN 'High'
+        WHEN p.Score >= 10 THEN 'Medium'
+        WHEN p.Score >= 1 THEN 'Low'
+        ELSE 'VeryLow'
+    END as ScoreCategory,
+    CASE 
+        WHEN p.Tags IS NOT NULL AND p.Tags != '' THEN
+            (
+                SELECT STRING_AGG(tag, ', ')
+                FROM (
+                    SELECT TRIM(UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><'))) as tag
+                ) tags
+                WHERE tag IS NOT NULL AND tag != ''
+            )
+        ELSE NULL
+    END as TagList,
+    CASE 
+        WHEN EXISTS (
+            SELECT 1 
+            FROM PostHistory ph 
+            WHERE ph.PostId = p.Id 
+            AND ph.PostHistoryTypeId IN (10,12,13) 
+            AND ph.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30 day')
+        ) THEN 'RecentlyModified'
+        ELSE 'Stable'
+    END as ActivityStatus,
+    CASE 
+        WHEN u.Reputation > 10000 THEN 'Expert'
+        WHEN u.Reputation > 1000 THEN 'Intermediate'
+        WHEN u.Reputation > 100 THEN 'Beginner'
+        ELSE 'Newbie'
+    END as UserReputationLevel,
+    CASE WHEN p.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END as PostStatus,
+    COALESCE(p.AnswerCount, 0) as AnswerCount,
+    COALESCE(p.CommentCount, 0) as CommentCount,
+    COALESCE(p.FavoriteCount, 0) as FavoriteCount,
+    CASE 
+        WHEN p.PostTypeId = 1 THEN 
+            (
+                SELECT b.Name 
+                FROM Badges b 
+                WHERE b.UserId = p.OwnerUserId 
+                AND b.TagBased = 0 
+                AND b.Date BETWEEN p.CreationDate AND (p.CreationDate + INTERVAL '30 day')
+                ORDER BY b.Date
+                LIMIT 1
+            )
+        ELSE NULL
+    END as EarlyBadge,
+    (
+        SELECT COUNT(*) 
+        FROM Badges b 
+        WHERE b.UserId = p.OwnerUserId 
+        AND b.Class = 1
+    ) as GoldBadges,
+    (
+        SELECT COUNT(*) 
+        FROM Badges b 
+        WHERE b.UserId = p.OwnerUserId 
+        AND b.Class = 2
+    ) as SilverBadges,
+    (
+        SELECT COUNT(*) 
+        FROM Badges b 
+        WHERE b.UserId = p.OwnerUserId 
+        AND b.Class = 3
+    ) as BronzeBadges,
+    CASE 
+        WHEN (
+            SELECT COUNT(*) 
+            FROM PostHistory ph 
+            WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId = 24
+        ) > 0 THEN 'HasSuggestedEdits'
+        ELSE 'NoSuggestedEdits'
+    END as SuggestedEditStatus,
+    CASE 
+        WHEN (
+            SELECT COUNT(*) 
+            FROM PostHistory ph 
+            WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (10,11)
+        ) > 0 THEN 'HasCloseReopenHistory'
+        ELSE 'NoCloseReopenHistory'
+    END as CloseReopenStatus,
+    (
+        SELECT STRING_AGG(DISTINCT ph.Comment, ', ')
+        FROM PostHistory ph 
+        WHERE ph.PostId = p.Id AND ph.Comment IS NOT NULL
+        GROUP BY ph.PostId
+        HAVING COUNT(*) > 1
+    ) as CommentHistory,
+    ROUND(
+        (
+            (COALESCE(p.ViewCount, 0) * 1.0) / 
+            NULLIF(COALESCE(p.Score, 1), 0)
+        ), 2
+    ) as ViewScoreRatio,
+    CASE
+        WHEN (
+            SELECT COUNT(*) 
+            FROM PostHistory ph 
+            WHERE ph.PostId = p.Id AND ph.UserId IS NOT NULL
+        ) > 0 THEN 
+            ROUND(
+                (
+                    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id) * 1.0 / 
+                    NULLIF((SELECT COUNT(*) FROM Users u WHERE u.Id = p.OwnerUserId), 0)
+                ), 2
+            )
+        ELSE 0
+    END as OwnerActivityRatio,
+    (
+        SELECT MAX(ph.CreationDate)
+        FROM PostHistory ph
+        WHERE ph.PostId = p.Id
+    ) as LastHistoryDate,
+    CASE
+        WHEN p.PostTypeId = 1 THEN (
+            SELECT STRING_AGG(
+                CONCAT(
+                    'Post(', ph.PostId, ') Type(', ph.PostHistoryTypeId, ') by ', 
+                    COALESCE(ph.UserDisplayName, 'Unknown'), ' at ', ph.CreationDate
+                ), '; '
+            )
+            FROM PostHistory ph
+            WHERE ph.PostId = p.Id
+            AND ph.PostHistoryTypeId IN (1,2,3,4,5,6)
+            ORDER BY ph.CreationDate
+            LIMIT 10
+        )
+        ELSE NULL
+    END as RecentEditsSample,
+    CASE
+        WHEN p.ViewCount > 1000 AND p.Score > 50 THEN 'PopularHighScore'
+        WHEN p.ViewCount > 1000 AND p.Score BETWEEN 1 AND 50 THEN 'PopularLowScore'
+        WHEN p.ViewCount BETWEEN 100 AND 1000 AND p.Score > 50 THEN 'ModerateHighScore'
+        ELSE 'Standard'
+    END as PopularityCategory,
+    ABS(p.ViewCount - AVG(p.ViewCount) OVER ()) as ViewDeviation,
+    CASE
+        WHEN EXISTS (
+            SELECT 1 
+            FROM PostHistory ph 
+            WHERE ph.PostId = p.Id 
+            AND ph.PostHistoryTypeId IN (25, 52, 53)
+        ) 
+        THEN 'HasPromotionalActivity' 
+        ELSE 'NoPromotionalActivity'
+    END as PromotionStatus,
+    (
+        SELECT COUNT(*) 
+        FROM PostHistory ph 
+        WHERE ph.PostId = p.Id 
+        AND ph.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6 month')
+    ) as RecentActivityCount,
+    CASE
+        WHEN p.PostTypeId = 1 THEN 
+            EXTRACT(DAY FROM (COALESCE(p.ClosedDate, TIMESTAMP '2024-10-01 12:34:56') - p.CreationDate))
+        ELSE NULL
+    END as TimeToClosureDays,
+    (
+        SELECT COUNT(DISTINCT ph.UserId)
+        FROM PostHistory ph
+        WHERE ph.PostId = p.Id
+        AND ph.UserId IS NOT NULL
+    ) as UniqueEditors,
+    (
+        SELECT STRING_AGG(
+            CONCAT(
+                ph.UserDisplayName, '(', ph.UserId, ')'
+            ), '; '
+        )
+        FROM PostHistory ph
+        WHERE ph.PostId = p.Id
+        AND ph.UserId IS NOT NULL
+        GROUP BY ph.PostId
+        HAVING COUNT(*) > 0
+    ) as EditorsList,
+    COALESCE(p.OwnerUserId, 0) as OwnerUserId,
+    CASE
+        WHEN p.OwnerUserId = 0 THEN 'CommunityWiki'
+        WHEN p.OwnerUserId IS NULL THEN 'DeletedUser'
+        ELSE 'NormalUser'
+    END as OwnerType,
+    CASE
+        WHEN p.ContentLicense = 'CC BY-SA 3.0' THEN 'CreativeCommons'
+        WHEN p.ContentLicense = 'CC BY-SA 2.5' THEN 'OldCreativeCommons'
+        WHEN p.ContentLicense IS NULL THEN 'UnknownLicense'
+        ELSE 'OtherLicense'
+    END as LicenseStatus,
+    ROUND(
+        (COALESCE(p.Score, 0) * 100.0) / 
+        NULLIF((SELECT MAX(p2.Score) FROM Posts p2 WHERE p2.PostTypeId = p.PostTypeId), 0),
+        2
+    ) as ScorePercentileOfPostType,
+    CASE
+        WHEN p.PostTypeId = 1 THEN (
+            SELECT COUNT(*) 
+            FROM Posts p2 
+            WHERE p2.ParentId = p.Id
+            AND p2.PostTypeId = 2
+            AND p2.Score > 10
+        )
+        ELSE 0
+    END as HighScoringAnswers,
+    (
+        SELECT AVG(Score) 
+        FROM Posts p3 
+        WHERE p3.OwnerUserId = p.OwnerUserId
+        AND p3.PostTypeId = 2
+    ) as AvgAnswerScore,
+    COALESCE(p.AnswerCount, 0) - 
+    (
+        SELECT COUNT(*) 
+        FROM Posts p4 
+        WHERE p4.ParentId = p.Id
+        AND p4.Score <= 0
+    ) as NetAnswers,
+    CASE 
+        WHEN p.ViewCount > (
+            SELECT AVG(ViewCount) 
+            FROM Posts 
+            WHERE PostTypeId = p.PostTypeId
+        ) THEN 'AboveAverage'
+        ELSE 'BelowAverage'
+    END as ViewPerformance
+FROM Posts p
+LEFT JOIN Users u ON p.OwnerUserId = u.Id
+LEFT JOIN Votes v ON p.Id = v.PostId
+WHERE 
+    p.PostTypeId = 1 
+    AND p.Tags IS NOT NULL
+    AND EXISTS (
+        SELECT 1 
+        FROM PostHistory ph 
+        WHERE ph.PostId = p.Id 
+        AND ph.PostHistoryTypeId IN (25, 52, 53)
+    )
+    AND (
+        p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 year') 
+        AND p.CreationDate <= TIMESTAMP '2024-10-01 12:34:56'
+    )
+    AND p.Score BETWEEN 5 AND 200
+GROUP BY 
+    p.Id, 
+    p.Title, 
+    p.Score, 
+    p.ViewCount, 
+    p.CreationDate, 
+    u.DisplayName, 
+    p.PostTypeId, 
+    p.Tags, 
+    p.AcceptedAnswerId, 
+    p.AnswerCount, 
+    p.CommentCount, 
+    p.FavoriteCount,
+    p.ClosedDate, 
+    p.OwnerUserId, 
+    p.ContentLicense
+HAVING 
+    COUNT(v.Id) > 5
+    AND (
+        (SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) >= 5)
+        OR (SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) <= 2)
+    )
+ORDER BY 
+    ScoreRank,
+    ViewRank,
+    TotalVotes DESC,
+    p.CreationDate DESC;

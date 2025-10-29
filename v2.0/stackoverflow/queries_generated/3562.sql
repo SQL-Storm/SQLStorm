@@ -1,0 +1,156 @@
+-- {"query": "3562.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1649} 
+
+WITH 
+    -- All questions that were closed as duplicate (CloseReasonId = 101) and their original duplicate source(s)
+    dup_questions AS (
+        SELECT 
+            ph.PostId                AS ClosedQuestionId,
+            CAST(ph.Comment AS int)  AS OriginalQuestionId,
+            ph.CreationDate          AS CloseDate,
+            ph.UserId                AS ClosedByUserId
+        FROM PostHistory ph
+        WHERE ph.PostHistoryTypeId = 10                     -- Post Closed
+          AND ph.Comment IS NOT NULL
+          AND TRY_CAST(ph.Comment AS int) = 101             -- CloseReasonId = Duplicate
+    ),
+    -- Answers to those questions, with timing and score info
+    answers_to_dup AS (
+        SELECT 
+            a.Id                     AS AnswerId,
+            a.ParentId               AS QuestionId,
+            a.OwnerUserId            AS AnswererId,
+            a.CreationDate           AS AnswerDate,
+            a.Score                  AS AnswerScore,
+            DATEDIFF(second, q.CreationDate, a.CreationDate) AS SecondsToAnswer,
+            q.Tags
+        FROM Posts a
+        JOIN Posts q ON q.Id = a.ParentId
+        WHERE a.PostTypeId = 2               -- Answer
+          AND EXISTS (SELECT 1 FROM dup_questions d WHERE d.ClosedQuestionId = q.Id)
+    ),
+    -- Aggregate per answerer
+    user_answer_agg AS (
+        SELECT 
+            ans.AnswererId,
+            COUNT(*)                              AS AnswersCount,
+            AVG(ans.AnswerScore)                  AS AvgAnswerScore,
+            AVG(ans.SecondsToAnswer) / 60.0       AS AvgMinutesToAnswer,
+            STRING_AGG(DISTINCT TRIM(BOTH '<>' FROM UNNEST(string_to_array(ans.Tags, '><'))), ',') 
+                                                  AS TagsUsed,
+            MAX(ans.AnswerDate)                   AS LastAnswerDate
+        FROM answers_to_dup ans
+        GROUP BY ans.AnswererId
+    ),
+    -- Badge summary per user
+    badge_summary AS (
+        SELECT 
+            b.UserId,
+            COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+            COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+            COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+            COUNT(*) FILTER (WHERE b.TagBased = 1) AS TagBadges,
+            MAX(b.Date)                         AS LatestBadgeDate
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+    -- Vote stats per user (only upvotes and downvotes on their posts)
+    vote_stats AS (
+        SELECT 
+            p.OwnerUserId AS UserId,
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesGiven,
+            SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesGiven,
+            COUNT(DISTINCT v.PostId)                           AS DistinctPostsVoted
+        FROM Votes v
+        JOIN Posts p ON p.Id = v.PostId
+        WHERE v.VoteTypeId IN (2,3)   -- UpMod, DownMod
+        GROUP BY p.OwnerUserId
+    ),
+    -- Users with no answers to duplicate-closed questions (for set operator)
+    users_no_dup_answers AS (
+        SELECT 
+            u.Id               AS UserId,
+            u.DisplayName,
+            u.Reputation,
+            NULL::int          AS AnswersCount,
+            NULL::float        AS AvgAnswerScore,
+            NULL::float        AS AvgMinutesToAnswer,
+            NULL::text         AS TagsUsed,
+            NULL::timestamp    AS LastAnswerDate,
+            0                  AS GoldBadges,
+            0                  AS SilverBadges,
+            0                  AS BronzeBadges,
+            0                  AS TagBadges,
+            NULL::timestamp    AS LatestBadgeDate,
+            0                  AS UpVotesGiven,
+            0                  AS DownVotesGiven,
+            0                  AS DistinctPostsVoted
+        FROM Users u
+        WHERE NOT EXISTS (
+            SELECT 1 
+            FROM answers_to_dup a 
+            WHERE a.AnswererId = u.Id
+        )
+    )
+-- Final result: union of active answerers and users with no such answers,
+-- ranked by a composite score using window functions.
+SELECT *
+FROM (
+    SELECT
+        u.Id                         AS UserId,
+        COALESCE(u.DisplayName, 'Anonymous') AS DisplayName,
+        u.Reputation,
+        COALESCE(ua.AnswersCount, 0)          AS AnswersCount,
+        COALESCE(ua.AvgAnswerScore, 0.0)      AS AvgAnswerScore,
+        COALESCE(ua.AvgMinutesToAnswer, 0.0)  AS AvgMinutesToAnswer,
+        ua.TagsUsed,
+        ua.LastAnswerDate,
+        bs.GoldBadges,
+        bs.SilverBadges,
+        bs.BronzeBadges,
+        bs.TagBadges,
+        bs.LatestBadgeDate,
+        vs.UpVotesGiven,
+        vs.DownVotesGiven,
+        vs.DistinctPostsVoted,
+        -- Composite performance score (higher is better)
+        ROW_NUMBER() OVER (
+            ORDER BY 
+                (u.Reputation * 0.4) +
+                (COALESCE(ua.AvgAnswerScore,0) * 10) +
+                (bs.GoldBadges * 20 + bs.SilverBadges * 10 + bs.BronzeBadges * 5) -
+                (COALESCE(ua.AvgMinutesToAnswer,0) * 0.1) DESC
+        ) AS PerformanceRank
+    FROM Users u
+    LEFT JOIN user_answer_agg ua   ON ua.AnswererId = u.Id
+    LEFT JOIN badge_summary bs    ON bs.UserId = u.Id
+    LEFT JOIN vote_stats vs       ON vs.UserId = u.Id
+    WHERE u.Reputation > 1000
+      AND (ua.AnswersCount IS NOT NULL OR bs.GoldBadges > 0)
+) AS ranked_active
+
+UNION ALL
+
+SELECT *
+FROM (
+    SELECT
+        nu.UserId,
+        nu.DisplayName,
+        nu.Reputation,
+        nu.AnswersCount,
+        nu.AvgAnswerScore,
+        nu.AvgMinutesToAnswer,
+        nu.TagsUsed,
+        nu.LastAnswerDate,
+        nu.GoldBadges,
+        nu.SilverBadges,
+        nu.BronzeBadges,
+        nu.TagBadges,
+        nu.LatestBadgeDate,
+        nu.UpVotesGiven,
+        nu.DownVotesGiven,
+        nu.DistinctPostsVoted,
+        NULL::int AS PerformanceRank
+    FROM users_no_dup_answers nu
+) AS ranked_inactive
+ORDER BY PerformanceRank NULLS LAST, Reputation DESC
+LIMIT 100;

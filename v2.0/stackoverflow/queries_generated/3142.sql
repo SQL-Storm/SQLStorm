@@ -1,0 +1,129 @@
+-- {"query": "3142.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2530} 
+
+WITH
+    UserStats AS (
+        SELECT
+            u.Id,
+            u.DisplayName,
+            u.Reputation,
+            u.CreationDate,
+            COALESCE(u.Views, 0)                                          AS Views,
+            COUNT(b.Id) FILTER (WHERE b.Class = 1)                        AS GoldBadges,
+            COUNT(b.Id) FILTER (WHERE b.Class = 2)                        AS SilverBadges,
+            COUNT(b.Id) FILTER (WHERE b.Class = 3)                        AS BronzeBadges,
+            COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1)                   AS QuestionCount,
+            COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2)                   AS AnswerCount,
+            SUM(p.Score) FILTER (WHERE p.PostTypeId = 1)                  AS QuestionScoreSum,
+            SUM(p.Score) FILTER (WHERE p.PostTypeId = 2)                  AS AnswerScoreSum
+        FROM Users u
+        LEFT JOIN Badges b   ON b.UserId = u.Id
+        LEFT JOIN Posts p    ON p.OwnerUserId = u.Id
+        GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Views
+    ),
+
+    RecentActivity AS (
+        SELECT
+            u.Id                                              AS UserId,
+            MAX(p.CreationDate) FILTER (WHERE p.PostTypeId = 1) AS LastQuestionDate,
+            MAX(p.CreationDate) FILTER (WHERE p.PostTypeId = 2) AS LastAnswerDate,
+            MAX(c.CreationDate)                                 AS LastCommentDate,
+            MAX(v.CreationDate)                                 AS LastVoteDate
+        FROM Users u
+        LEFT JOIN Posts    p ON p.OwnerUserId = u.Id
+        LEFT JOIN Comments c ON c.UserId = u.Id
+        LEFT JOIN Votes    v ON v.UserId = u.Id
+        GROUP BY u.Id
+    ),
+
+    UserTopPost AS (
+        SELECT
+            u.Id                                            AS UserId,
+            (SELECT p.Id
+             FROM Posts p
+             WHERE p.OwnerUserId = u.Id
+               AND p.PostTypeId IN (1, 2)
+             ORDER BY (SELECT COUNT(*) FROM Votes v
+                       WHERE v.PostId = p.Id AND v.VoteTypeId = 2) DESC NULLS LAST
+             LIMIT 1)                                      AS TopPostId
+        FROM Users u
+    ),
+
+    ReputationChanges AS (
+        SELECT
+            u.Id,
+            u.Reputation,
+            SUM(
+                CASE
+                    WHEN v.VoteTypeId = 2 THEN 10
+                    WHEN v.VoteTypeId = 3 THEN -2
+                    ELSE 0
+                END
+            ) OVER (
+                PARTITION BY u.Id
+                ORDER BY v.CreationDate
+                RANGE BETWEEN INTERVAL '30 days' PRECEDING AND CURRENT ROW
+            )                                            AS RepLast30Days
+        FROM Users u
+        LEFT JOIN Votes v
+               ON v.UserId = u.Id
+              AND v.CreationDate >= CURRENT_DATE - INTERVAL '30 days'
+        GROUP BY u.Id, u.Reputation, v.CreationDate
+    )
+
+SELECT
+    us.Id,
+    us.DisplayName,
+    us.Reputation,
+    us.Views,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    us.QuestionCount,
+    us.AnswerCount,
+    us.QuestionScoreSum,
+    us.AnswerScoreSum,
+    ra.LastQuestionDate,
+    ra.LastAnswerDate,
+    ra.LastCommentDate,
+    ra.LastVoteDate,
+    COALESCE(utp.TopPostId, -1)                         AS TopPostId,
+    rc.RepLast30Days,
+    CASE
+        WHEN us.Reputation > 20000 THEN 'Legendary'
+        WHEN us.Reputation > 10000 THEN 'Expert'
+        WHEN us.Reputation > 5000  THEN 'Experienced'
+        ELSE 'Novice'
+    END                                                AS ReputationTier,
+    COALESCE(NULLIF(us.DisplayName, ''), 'Anonymous') AS SafeDisplayName,
+    CONCAT('User_', us.Id)                            AS UserCode
+FROM UserStats us
+LEFT JOIN RecentActivity ra       ON ra.UserId = us.Id
+LEFT JOIN UserTopPost utp         ON utp.UserId = us.Id
+LEFT JOIN ReputationChanges rc   ON rc.Id = us.Id
+WHERE (us.QuestionCount + us.AnswerCount) > 0
+  AND us.Reputation IS NOT NULL
+ORDER BY us.Reputation DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    -1                                            AS Id,
+    'Community'                                   AS DisplayName,
+    SUM(us.Reputation)                            AS Reputation,
+    NULL                                          AS Views,
+    SUM(us.GoldBadges)                            AS GoldBadges,
+    SUM(us.SilverBadges)                          AS SilverBadges,
+    SUM(us.BronzeBadges)                          AS BronzeBadges,
+    SUM(us.QuestionCount)                         AS QuestionCount,
+    SUM(us.AnswerCount)                           AS AnswerCount,
+    SUM(us.QuestionScoreSum)                      AS QuestionScoreSum,
+    SUM(us.AnswerScoreSum)                        AS AnswerScoreSum,
+    NULL, NULL, NULL, NULL,
+    NULL,
+    NULL,
+    'Aggregated'                                  AS ReputationTier,
+    'Community'                                   AS SafeDisplayName,
+    'User_-1'                                      AS UserCode
+FROM UserStats us
+WHERE us.Reputation > 0;

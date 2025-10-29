@@ -1,0 +1,237 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.CreationDate,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        COALESCE(SUM(p.Score), 0) AS TotalScore,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN AVG(p.Score) 
+            ELSE 0 
+        END AS AvgPostScore,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2), ', ') AS AllTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.CreationDate
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        Reputation,
+        DisplayName,
+        PostCount,
+        CommentCount,
+        BadgeCount,
+        LastPostDate,
+        TotalScore,
+        AvgPostScore,
+        AllTags,
+        ROW_NUMBER() OVER (ORDER BY TotalScore DESC, Reputation DESC) AS Ranking
+    FROM UserStats
+),
+RecentActivity AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.Tags,
+        p.PostTypeId,
+        COUNT(ph.Id) AS HistoryCount,
+        MAX(ph.CreationDate) AS LastHistoryDate,
+        STRING_AGG(DISTINCT ph.Comment, ', ') AS HistoryComments,
+        STRING_AGG(DISTINCT ph.Text, ' | ') AS HistoryTexts
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    WHERE p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30 day')
+    GROUP BY p.Id, p.Title, p.Score, p.CreationDate, p.OwnerUserId, p.ViewCount, p.AnswerCount, p.CommentCount, p.Tags, p.PostTypeId
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        COALESCE(SUM(p.Score), 0) AS TotalScore,
+        COUNT(p.Id) AS PostCount,
+        AVG(p.Score) AS AvgScore,
+        STRING_AGG(DISTINCT CAST(p.OwnerUserId AS TEXT), ', ') AS PosterIds,
+        STRING_AGG(DISTINCT p.Title, ' | ') AS SampleTitles,
+        CASE 
+            WHEN COUNT(p.Id) > 0 THEN PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) 
+            ELSE 0 
+        END AS MedianScore
+    FROM Tags t
+    LEFT JOIN Posts p ON POSITION(t.TagName IN p.Tags) > 0
+    WHERE p.PostTypeId = 1
+    GROUP BY t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId
+),
+ComplexAnalysis AS (
+    SELECT 
+        tu.UserId,
+        tu.Reputation,
+        tu.DisplayName,
+        tu.PostCount,
+        tu.CommentCount,
+        tu.BadgeCount,
+        tu.LastPostDate,
+        tu.TotalScore,
+        tu.AvgPostScore,
+        tu.AllTags,
+        tu.Ranking,
+        ra.PostId,
+        ra.Title,
+        ra.Score AS PostScore,
+        ra.CreationDate AS PostCreationDate,
+        ra.ViewCount,
+        ra.AnswerCount,
+        ra.CommentCount,
+        ra.Tags AS PostTags,
+        ra.HistoryCount,
+        ra.LastHistoryDate,
+        ra.HistoryComments,
+        ra.HistoryTexts,
+        ta.TagName,
+        ta.TagCount,
+        ta.TotalScore AS TagTotalScore,
+        ta.PostCount AS TagPostCount,
+        ta.AvgScore AS TagAvgScore,
+        ta.PosterIds,
+        ta.SampleTitles,
+        ta.MedianScore AS TagMedianScore,
+        CASE 
+            WHEN ra.Score > COALESCE(ta.AvgScore, 0) THEN 'Above Avg' 
+            ELSE 'Below Avg' 
+        END AS ScoreStatus,
+        CASE 
+            WHEN tu.TotalScore > (SELECT AVG(TotalScore) FROM TopUsers) THEN 'Above Avg User' 
+            ELSE 'Below Avg User' 
+        END AS UserPerformance,
+        CASE 
+            WHEN ra.HistoryCount > 10 THEN 'High Activity' 
+            ELSE 'Low Activity' 
+        END AS ActivityLevel,
+        ROW_NUMBER() OVER (PARTITION BY tu.UserId ORDER BY ra.CreationDate DESC) AS PostRanking,
+        DENSE_RANK() OVER (ORDER BY ta.TagCount DESC) AS TagRanking,
+        NTILE(4) OVER (ORDER BY tu.Reputation DESC) AS ReputationQuartile,
+        CASE 
+            WHEN tu.BadgeCount > 10 THEN 'Many Badges' 
+            WHEN tu.BadgeCount > 5 THEN 'Some Badges' 
+            ELSE 'Few Badges' 
+        END AS BadgeLevel,
+        CASE WHEN tu.PostCount = 0 THEN 'No Posts' ELSE 'Has Posts' END AS PostStatus,
+        ABS(tu.TotalScore - COALESCE(ta.TotalScore, 0)) AS ScoreDifference,
+        COALESCE(SUBSTRING(ta.SampleTitles FROM 1 FOR 100), 'No Titles') AS TruncatedTitles,
+        CASE 
+            WHEN EXISTS (
+                SELECT 1 
+                FROM PostLinks pl 
+                WHERE pl.PostId = ra.PostId AND pl.LinkTypeId = 3
+            ) THEN 'Duplicate Link' 
+            ELSE 'No Duplicate' 
+        END AS DuplicateStatus
+    FROM TopUsers tu
+    LEFT JOIN RecentActivity ra ON tu.UserId = ra.OwnerUserId
+    LEFT JOIN TagAnalysis ta ON ra.Tags LIKE '%' || ta.TagName || '%'
+    WHERE tu.Ranking <= 50
+)
+SELECT 
+    ca.UserId,
+    ca.Reputation,
+    ca.DisplayName,
+    ca.PostCount,
+    ca.CommentCount,
+    ca.BadgeCount,
+    ca.LastPostDate,
+    ca.TotalScore,
+    ca.AvgPostScore,
+    ca.AllTags,
+    ca.Ranking,
+    ca.PostId,
+    ca.Title,
+    ca.PostScore,
+    ca.PostCreationDate,
+    ca.ViewCount,
+    ca.AnswerCount,
+    ca.CommentCount AS PostCommentCount,
+    ca.PostTags,
+    ca.HistoryCount,
+    ca.LastHistoryDate,
+    ca.HistoryComments,
+    ca.HistoryTexts,
+    ca.TagName,
+    ca.TagCount,
+    ca.TagTotalScore,
+    ca.TagPostCount,
+    ca.TagAvgScore,
+    ca.PosterIds,
+    ca.SampleTitles,
+    ca.TagMedianScore,
+    ca.ScoreStatus,
+    ca.UserPerformance,
+    ca.ActivityLevel,
+    ca.PostRanking,
+    ca.TagRanking,
+    ca.ReputationQuartile,
+    ca.BadgeLevel,
+    ca.PostStatus,
+    ca.ScoreDifference,
+    ca.TruncatedTitles,
+    ca.DuplicateStatus,
+    (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - ca.PostCreationDate)::INT DAY AS DaysSincePost,
+    CASE 
+        WHEN ca.PostScore > 100 THEN 'Very Popular' 
+        WHEN ca.PostScore > 50 THEN 'Popular' 
+        WHEN ca.PostScore > 10 THEN 'Moderate' 
+        ELSE 'Low' 
+    END AS PopularityRating,
+    CASE 
+        WHEN ca.ViewCount > 1000 THEN 'High Views' 
+        WHEN ca.ViewCount > 500 THEN 'Medium Views' 
+        ELSE 'Low Views' 
+    END AS ViewRating,
+    CASE 
+        WHEN ca.TagCount > 100 THEN 'High Tag Volume' 
+        WHEN ca.TagCount > 50 THEN 'Medium Tag Volume' 
+        ELSE 'Low Tag Volume' 
+    END AS TagVolumeRating,
+    CASE 
+        WHEN ca.PostCount > 100 THEN 'Very Active User' 
+        WHEN ca.PostCount > 50 THEN 'Active User' 
+        ELSE 'Occasional User' 
+    END AS UserActivityRating,
+    ABS(ca.PostScore - (SELECT AVG(PostScore) FROM ComplexAnalysis)) AS DeviationFromAvgScore,
+    COALESCE(
+        (SELECT COUNT(*) 
+         FROM Votes v 
+         WHERE v.PostId = ca.PostId AND v.VoteTypeId = 2), 
+        0
+    ) AS UpvoteCount,
+    COALESCE(
+        (SELECT COUNT(*) 
+         FROM Votes v 
+         WHERE v.PostId = ca.PostId AND v.VoteTypeId = 3), 
+        0
+    ) AS DownvoteCount,
+    (SELECT COUNT(*) 
+     FROM Comments c 
+     WHERE c.PostId = ca.PostId AND c.UserId IS NULL) AS AnonymousComments,
+    DENSE_RANK() OVER (ORDER BY EXTRACT(QUARTER FROM ca.PostCreationDate)) AS QuarterRank,
+    PERCENT_RANK() OVER (ORDER BY ca.Reputation DESC) AS ReputationPercentile,
+    CUME_DIST() OVER (ORDER BY ca.TotalScore) AS ScoreCumulativeDistribution
+FROM ComplexAnalysis ca
+WHERE ca.PostId IS NOT NULL 
+  AND ca.Title IS NOT NULL
+  AND (ca.ScoreStatus = 'Above Avg' OR ca.UserPerformance = 'Above Avg User')
+ORDER BY ca.Reputation DESC, ca.TotalScore DESC, ca.LastPostDate DESC
+OFFSET 0 ROWS FETCH NEXT 1000 ROWS ONLY;

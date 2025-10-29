@@ -1,0 +1,173 @@
+with RecursiveUserActivity as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+    count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+    count(distinct c.Id) as CommentCount,
+    count(distinct b.Id) as BadgeCount,
+    coalesce(sum(vt.UpVotes),0) as TotalUpVotes,
+    coalesce(sum(vt.DownVotes),0) as TotalDownVotes,
+    row_number() over (order by u.Reputation desc, u.LastAccessDate desc) as RepRank
+  from Users u
+  left join Posts p on p.OwnerUserId = u.Id
+  left join Comments c on c.UserId = u.Id
+  left join Badges b on b.UserId = u.Id
+  left join lateral (
+    select
+      sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+      sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes
+    from Votes v
+    join Posts pv on pv.Id = v.PostId
+    where pv.OwnerUserId = u.Id
+  ) vt on true
+  group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+RecentEdits as (
+  select
+    ph.PostId,
+    ph.UserId,
+    ph.PostHistoryTypeId,
+    ph.CreationDate,
+    p.PostTypeId,
+    pt.Name as PostTypeName,
+    u.DisplayName as EditorName,
+    row_number() over (partition by ph.PostId order by ph.CreationDate desc) as rn
+  from PostHistory ph
+  join Posts p on p.Id = ph.PostId
+  join PostTypes pt on pt.Id = p.PostTypeId
+  left join Users u on u.Id = ph.UserId
+  where ph.PostHistoryTypeId in (4,5,6)
+),
+RankedDuplicates as (
+  select
+    pl.PostId,
+    pl.RelatedPostId,
+    row_number() over (partition by pl.PostId order by pl.CreationDate desc) as DuplicateRank
+  from PostLinks pl
+  where pl.LinkTypeId = 3
+),
+UserBadgeRank as (
+  select
+    b.UserId,
+    b.Name,
+    b.Class,
+    dense_rank() over (partition by b.UserId order by b.Class) as BadgeClassRank,
+    count(*) over (partition by b.UserId) as TotalBadges
+  from Badges b
+),
+QuestionStats as (
+  select
+    p.Id as QuestionId,
+    p.Title,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.Score,
+    coalesce(p.ViewCount, 0) as ViewCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    string_agg(distinct u.DisplayName, ', ') filter (where u.Id is not null) as Answerers,
+    case when p.ClosedDate is not null then 1 else 0 end as IsClosed,
+    (select count(*) from Comments c where c.PostId = p.Id and c.CreationDate > (p.CreationDate + interval '30 day')) as LateCommentsCount,
+    (select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 1) as AcceptedByOriginatorVotes,
+    row_number() over (order by p.Score desc, p.ViewCount desc) as PopularityRank
+  from Posts p
+  left join Posts a on a.ParentId = p.Id and a.PostTypeId = 2
+  left join Users u on u.Id = a.OwnerUserId
+  where p.PostTypeId = 1
+  group by p.Id, p.Title, p.CreationDate, p.OwnerUserId, p.Score, p.ViewCount, p.AnswerCount, p.FavoriteCount, p.ClosedDate
+),
+ComplexTags as (
+  select
+    p.Id as PostId,
+    p.Tags,
+    string_to_array(trim(both '<>' from p.Tags), '><') as TagList,
+    (select count(*) from Tags t where t.TagName = any(string_to_array(trim(both '<>' from p.Tags), '><'))) as TagCount,
+    array_length(string_to_array(trim(both '<>' from p.Tags), '><'), 1) as TagArrayLength,
+    case
+      when p.Tags is null then 0
+      else regexp_count(p.Tags, '[<>]') / 2
+    end as EstimatedTagCountByRegex
+  from Posts p
+  where p.PostTypeId = 1 and p.Tags is not null
+),
+UserReputationDiffs as (
+  select
+    ua.UserId,
+    ua.Reputation,
+    lag(ua.Reputation) over (order by ua.Reputation desc) as PreviousReputation,
+    ua.Reputation - coalesce(lag(ua.Reputation) over (order by ua.Reputation desc), 0) as RepDiff,
+    ua.RepRank
+  from RecursiveUserActivity ua
+)
+select
+  q.QuestionId,
+  left(q.Title, 100) || case when length(q.Title) > 100 then '...' else '' end as ShortTitle,
+  q.CreationDate,
+  u.DisplayName as QuestionAuthor,
+  q.Score,
+  q.ViewCount,
+  q.AnswerCount,
+  q.FavoriteCount,
+  q.IsClosed,
+  q.LateCommentsCount,
+  q.AcceptedByOriginatorVotes,
+  coalesce(dups.DuplicateCount, 0) as NumberOfDuplicates,
+  dups.RankOfDuplicates,
+  array_to_string(array_agg(distinct ub.Name order by ub.Class, ub.Name), ', ') filter (where ub.Name is not null) as UserBadgeNames,
+  ua.Reputation,
+  ua.RepRank,
+  ua.RepDiff,
+  complex.TagCount,
+  complex.TagArrayLength,
+  complex.EstimatedTagCountByRegex,
+  re.EditorName as LastEditor,
+  re.PostHistoryTypeId as LastEditType,
+  re.CreationDate as LastEditDate
+from QuestionStats q
+join Users u on u.Id = q.OwnerUserId
+left join (
+  select
+    PostId,
+    count(*) as DuplicateCount,
+    max(DuplicateRank) as RankOfDuplicates
+  from RankedDuplicates
+  group by PostId
+) dups on dups.PostId = q.QuestionId
+left join UserBadgeRank ub on ub.UserId = u.Id
+left join RecursiveUserActivity ua on ua.UserId = u.Id
+left join ComplexTags complex on complex.PostId = q.QuestionId
+left join LATERAL (
+  select re2.UserId, re2.EditorName, re2.PostHistoryTypeId, re2.CreationDate
+  from RecentEdits re2
+  where re2.PostId = q.QuestionId and re2.rn = 1
+  limit 1
+) re on true
+group by
+  q.QuestionId,
+  q.Title,
+  q.CreationDate,
+  u.DisplayName,
+  q.Score,
+  q.ViewCount,
+  q.AnswerCount,
+  q.FavoriteCount,
+  q.IsClosed,
+  q.LateCommentsCount,
+  q.AcceptedByOriginatorVotes,
+  dups.DuplicateCount,
+  dups.RankOfDuplicates,
+  ua.Reputation,
+  ua.RepRank,
+  ua.RepDiff,
+  complex.TagCount,
+  complex.TagArrayLength,
+  complex.EstimatedTagCountByRegex,
+  re.EditorName,
+  re.PostHistoryTypeId,
+  re.CreationDate
+order by q.Score desc, q.ViewCount desc
+limit 100;

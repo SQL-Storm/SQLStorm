@@ -1,0 +1,160 @@
+-- {"query": "3989.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2672} 
+
+WITH
+    /* Questions that were closed as duplicates */
+    q AS (
+        SELECT
+            p.Id                     AS question_id,
+            p.OwnerUserId            AS owner_user_id,
+            p.Title,
+            p.Tags,
+            p.CreationDate,
+            p.Score                  AS question_score,
+            p.ViewCount,
+            p.FavoriteCount,
+            p.ClosedDate,
+            ph.Comment               AS close_reason_json,
+            COALESCE(p.AcceptedAnswerId, 0) AS accepted_answer_id
+        FROM Posts p
+        LEFT JOIN PostHistory ph
+               ON ph.PostId = p.Id
+              AND ph.PostHistoryTypeId = 10               -- Close
+        WHERE p.PostTypeId = 1                              -- Question
+          AND p.ClosedDate IS NOT NULL
+          AND ph.Comment LIKE '%101%'                       -- Duplicate reason
+    ),
+
+    /* All answers to those questions with vote aggregates */
+    a AS (
+        SELECT
+            p.ParentId               AS question_id,
+            p.Id                     AS answer_id,
+            p.OwnerUserId            AS answer_user_id,
+            p.CreationDate           AS answer_date,
+            p.Score                  AS answer_score,
+            COALESCE(v.up_votes,0)   AS up_votes,
+            COALESCE(v.down_votes,0) AS down_votes
+        FROM Posts p
+        LEFT JOIN (
+            SELECT
+                PostId,
+                SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS up_votes,
+                SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS down_votes
+            FROM Votes
+            GROUP BY PostId
+        ) v ON v.PostId = p.Id
+        WHERE p.PostTypeId = 2                              -- Answer
+    ),
+
+    /* User statistics including badge counts and net vote balance */
+    user_stats AS (
+        SELECT
+            u.Id                      AS user_id,
+            u.DisplayName,
+            u.Reputation,
+            COUNT(b.Id) FILTER (WHERE b.Class = 1) AS gold_badges,
+            COUNT(b.Id) FILTER (WHERE b.Class = 2) AS silver_badges,
+            COUNT(b.Id) FILTER (WHERE b.Class = 3) AS bronze_badges,
+            COALESCE(SUM(v.up_votes) - SUM(v.down_votes),0) AS net_vote_balance
+        FROM Users u
+        LEFT JOIN Badges b ON b.UserId = u.Id
+        LEFT JOIN (
+            SELECT
+                UserId,
+                SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS up_votes,
+                SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS down_votes
+            FROM Votes
+            WHERE VoteTypeId IN (2,3)
+            GROUP BY UserId
+        ) v ON v.UserId = u.Id
+        GROUP BY u.Id, u.DisplayName, u.Reputation
+    ),
+
+    /* Explode tags and compute a global tag count */
+    tag_counts AS (
+        SELECT
+            q.question_id,
+            UNNEST(string_to_array(TRIM(BOTH '<>' FROM q.Tags), '><')) AS tag,
+            COUNT(*) OVER (PARTITION BY UNNEST(string_to_array(TRIM(BOTH '<>' FROM q.Tags), '><'))) AS tag_global_count
+        FROM q
+    ),
+
+    /* Rank answers per question */
+    answer_rank AS (
+        SELECT
+            a.question_id,
+            a.answer_id,
+            a.answer_user_id,
+            a.answer_score,
+            ROW_NUMBER() OVER (PARTITION BY a.question_id ORDER BY a.answer_score DESC, a.answer_date ASC) AS rn
+        FROM a
+    ),
+
+    /* Keep only the top‑scoring answer for each question */
+    top_answers AS (
+        SELECT
+            ar.question_id,
+            ar.answer_id,
+            ar.answer_user_id,
+            ar.answer_score
+        FROM answer_rank ar
+        WHERE ar.rn = 1
+    ),
+
+    /* Combine everything */
+    combined AS (
+        SELECT
+            q.question_id,
+            q.Title,
+            q.Tags,
+            q.CreationDate,
+            q.question_score,
+            q.ViewCount,
+            q.FavoriteCount,
+            q.ClosedDate,
+            COALESCE(us.reputation,0)          AS owner_reputation,
+            us.gold_badges,
+            us.silver_badges,
+            us.bronze_badges,
+            us.net_vote_balance,
+            ta.answer_id,
+            ta.answer_score,
+            ta.answer_user_id,
+            COALESCE(au.DisplayName,'Deleted') AS answer_owner_name,
+            tc.tag,
+            tc.tag_global_count
+        FROM q
+        LEFT JOIN user_stats us   ON us.user_id = q.owner_user_id
+        LEFT JOIN top_answers ta  ON ta.question_id = q.question_id
+        LEFT JOIN Users au        ON au.Id = ta.answer_user_id
+        LEFT JOIN tag_counts tc  ON tc.question_id = q.question_id
+    )
+
+/* Final result set with several predicates, window‑style ranking and set operators */
+SELECT *
+FROM combined
+WHERE (owner_reputation + net_vote_balance) > 10000
+  AND (gold_badges > 0 OR silver_badges > 5)
+  AND answer_score IS NOT NULL
+  AND answer_score > (
+        SELECT AVG(a2.answer_score)
+        FROM a a2
+        WHERE a2.question_id = combined.question_id
+      )
+ORDER BY question_score DESC, answer_score DESC
+LIMIT 20
+
+UNION ALL
+
+/* Dummy rows to stress the UNION path */
+SELECT
+    NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,
+    NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL
+LIMIT 5
+
+EXCEPT
+
+/* Remove rows where a tag could not be parsed (NULL tag) */
+SELECT *
+FROM combined
+WHERE tag IS NULL;

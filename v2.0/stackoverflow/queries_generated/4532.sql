@@ -1,0 +1,171 @@
+-- {"query": "4532.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1499} 
+
+WITH
+  _PostsWithDetails AS (
+    SELECT
+      p.Id AS PostId,
+      pt.Name AS PostTypeName,
+      p.OwnerUserId,
+      p.Title,
+      p.Tags,
+      p.CreationDate,
+      p.Score,
+      p.ViewCount,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      p.ClosedDate,
+      COALESCE(u.DisplayName, p.OwnerDisplayName) AS OwnerDisplayName,
+      CASE
+        WHEN p.OwnerUserId IS NULL THEN -1
+        ELSE u.Reputation
+      END AS OwnerReputation,
+      ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY p.Id) AS rn
+    FROM
+      Posts AS p
+    JOIN
+      PostTypes AS pt
+      ON p.PostTypeId = pt.Id
+    LEFT JOIN
+      Users AS u
+      ON p.OwnerUserId = u.Id
+    WHERE
+      p.PostTypeId IN (1, 2)
+  ),
+  _UserActivity AS (
+    SELECT
+      UserId,
+      COUNT(Id) AS NumberOfPosts,
+      SUM(CASE WHEN PostTypeId = 1 THEN 1 ELSE 0 END) AS NumberOfQuestions,
+      SUM(CASE WHEN PostTypeId = 2 THEN 1 ELSE 0 END) AS NumberOfAnswers,
+      AVG(Score) AS AverageScore,
+      MAX(CreationDate) AS LastPostDate
+    FROM
+      Posts
+    WHERE
+      OwnerUserId > 0
+    GROUP BY
+      UserId
+  ),
+  _TopUsers AS (
+    SELECT
+      UserId
+    FROM
+      _UserActivity
+    ORDER BY
+      NumberOfPosts DESC
+    LIMIT 100
+  ),
+  _PostHistoryAnalysis AS (
+    SELECT
+      ph.PostId,
+      MAX(CASE WHEN ph.PostHistoryTypeId = 4 THEN ph.CreationDate ELSE NULL END) AS LastTitleEditDate,
+      MAX(CASE WHEN ph.PostHistoryTypeId = 5 THEN ph.CreationDate ELSE NULL END) AS LastBodyEditDate,
+      COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 2 THEN ph.UserId ELSE NULL END) AS DistinctBodyEditorCount
+    FROM
+      PostHistory AS ph
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5) AND ph.PostId IN (SELECT PostId FROM _PostsWithDetails)
+    GROUP BY
+      ph.PostId
+  ),
+  _UserPostStats AS (
+    SELECT
+      p.OwnerUserId,
+      COUNT(p.Id) AS TotalPostsOwned,
+      SUM(p.Score) AS TotalScoreOfPosts,
+      AVG(p.Score) AS AvgScoreOfPosts,
+      MAX(p.CreationDate) AS LatestPostOwnedDate,
+      SUM(p.AnswerCount) AS TotalAnswerCountOnOwnedQuestions,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersOwned
+    FROM
+      Posts AS p
+    WHERE
+      p.OwnerUserId IS NOT NULL AND p.OwnerUserId IN (SELECT UserId FROM _TopUsers)
+    GROUP BY
+      p.OwnerUserId
+  )
+SELECT
+  pd.PostId,
+  pd.PostTypeName,
+  pd.Title,
+  pd.Tags,
+  pd.CreationDate AS PostCreationDate,
+  pd.Score AS PostScore,
+  pd.ViewCount AS PostViewCount,
+  pd.AnswerCount AS PostAnswerCount,
+  pd.CommentCount AS PostCommentCount,
+  pd.FavoriteCount AS PostFavoriteCount,
+  pd.ClosedDate AS PostClosedDate,
+  pd.OwnerDisplayName,
+  pd.OwnerReputation,
+  COALESCE(ups.TotalPostsOwned, 0) AS UserTotalPostsOwned,
+  COALESCE(ups.TotalScoreOfPosts, 0) AS UserTotalScoreOfPosts,
+  COALESCE(ups.AvgScoreOfPosts, 0.0) AS UserAvgScoreOfPosts,
+  COALESCE(ups.LatestPostOwnedDate, '1970-01-01') AS UserLatestPostOwnedDate,
+  COALESCE(ups.TotalAnswerCountOnOwnedQuestions, 0) AS UserTotalAnswerCountOnOwnedQuestions,
+  COALESCE(ups.TotalAnswersOwned, 0) AS UserTotalAnswersOwned,
+  pha.LastTitleEditDate,
+  pha.LastBodyEditDate,
+  pha.DistinctBodyEditorCount,
+  (
+    SELECT
+      COUNT(*)
+    FROM
+      Comments AS c
+    WHERE
+      c.PostId = pd.PostId
+  ) AS CommentCountFromCommentsTable,
+  (
+    SELECT
+      COUNT(*)
+    FROM
+      Votes AS v
+    WHERE
+      v.PostId = pd.PostId AND v.VoteTypeId = 2
+  ) AS UpVoteCount,
+  (
+    SELECT
+      COUNT(*)
+    FROM
+      Votes AS v
+    WHERE
+      v.PostId = pd.PostId AND v.VoteTypeId = 3
+  ) AS DownVoteCount,
+  (
+    SELECT
+      COUNT(*)
+    FROM
+      PostLinks AS pl
+    WHERE
+      pl.PostId = pd.PostId AND pl.LinkTypeId = 3
+  ) AS DuplicateLinkCount,
+  CASE
+    WHEN pd.OwnerReputation > 50000 THEN 'HighReputation'
+    WHEN pd.OwnerReputation BETWEEN 10000 AND 50000 THEN 'MediumReputation'
+    ELSE 'LowReputation'
+  END AS ReputationTier,
+  CASE
+    WHEN pd.PostTypeName = 'Question' AND pd.Tags LIKE '%<sql>%' THEN 'SQL Question'
+    WHEN pd.PostTypeName = 'Question' THEN 'Other Question'
+    ELSE pd.PostTypeName
+  END AS CategorizedPostType,
+  DATE_PART('day', CURRENT_TIMESTAMP - pd.CreationDate) AS DaysSinceCreation,
+  CASE
+    WHEN pha.LastBodyEditDate IS NOT NULL THEN 'Edited'
+    ELSE 'Not Edited'
+  END AS EditStatus
+FROM
+  _PostsWithDetails AS pd
+LEFT JOIN
+  _UserPostStats AS ups
+  ON pd.OwnerUserId = ups.OwnerUserId
+LEFT JOIN
+  _PostHistoryAnalysis AS pha
+  ON pd.PostId = pha.PostId
+WHERE
+  pd.rn = 1 AND pd.OwnerUserId IS NOT NULL AND pd.OwnerUserId IN (SELECT UserId FROM _TopUsers)
+ORDER BY
+  pd.Score DESC,
+  pd.CreationDate ASC
+LIMIT 1000;

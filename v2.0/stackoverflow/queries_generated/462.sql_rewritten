@@ -1,0 +1,403 @@
+-- {"query": "462.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3691} 
+with
+-- Active users snapshot and normalized location
+active_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.lastaccessdate,
+    coalesce(nullif(trim(u.location), ''), 'Unknown') as location_norm,
+    u.upvotes,
+    u.downvotes,
+    u.views,
+    row_number() over (order by u.reputation desc, u.id) as rn_global
+  from users u
+  where u.reputation > 0
+    and u.creationdate < cast('2024-10-01 12:34:56' as timestamp)
+),
+-- Recent questions with tag array and text length metrics
+recent_questions as (
+  select
+    p.id,
+    p.creationdate,
+    p.owneruserid,
+    p.title,
+    p.score,
+    p.viewcount,
+    p.answercount,
+    p.favoritecount,
+    p.closeddate,
+    p.tags,
+    string_to_array(substring(p.tags, 2, greatest(length(p.tags)-2,0)), '><') as tag_arr,
+    length(coalesce(p.title,'')) as title_len,
+    (select count(1) from comments c where c.postid = p.id) as comment_count
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+),
+-- Answers within the same period with lag/lead windowing
+recent_answers as (
+  select
+    a.id,
+    a.parentid as question_id,
+    a.owneruserid as answerer_id,
+    a.creationdate,
+    a.score,
+    a.commentcount,
+    lead(a.score) over (partition by a.parentid order by a.score desc, a.id) as next_score,
+    lag(a.score) over (partition by a.parentid order by a.score desc, a.id) as prev_score
+  from posts a
+  where a.posttypeid = 2
+    and a.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+),
+-- Votes aggregation for questions and answers
+vote_agg as (
+  select
+    v.postid,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started,
+    sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded,
+    min(v.creationdate) as first_vote_at,
+    max(v.creationdate) as last_vote_at
+  from votes v
+  where v.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+  group by v.postid
+),
+-- Post link relationships for duplicates and linked posts
+link_rollup as (
+  select
+    pl.postid,
+    sum(case when pl.linktypeid = 3 then 1 else 0 end) as dup_count,
+    sum(case when pl.linktypeid = 1 then 1 else 0 end) as linked_count,
+    count(*) as total_links
+  from postlinks pl
+  where pl.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+  group by pl.postid
+),
+-- Post history signals for closures and migrations
+history_signals as (
+  select
+    ph.postid,
+    sum(case when ph.posthistorytypeid = 10 then 1 else 0 end) as closed_events,
+    sum(case when ph.posthistorytypeid = 11 then 1 else 0 end) as reopened_events,
+    sum(case when ph.posthistorytypeid in (35,36) then 1 else 0 end) as migration_events,
+    max(case when ph.posthistorytypeid = 10 then try_cast(ph.comment as int) end) as last_close_reason
+  from posthistory ph
+  where ph.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+  group by ph.postid
+),
+-- Tag popularity slice
+tag_popularity as (
+  select
+    t.tagname,
+    t.count as global_tag_count,
+    coalesce(t.ismodera toronly, 0) as is_mod_only,
+    coalesce(t.isrequired, 0) as is_required
+  from tags t
+),
+-- Expand questions by tags
+question_tags as (
+  select
+    rq.id as question_id,
+    lower(trim(tag)) as tagname
+  from recent_questions rq
+  cross join lateral unnest(coalesce(rq.tag_arr, array[]::varchar[])) as tag
+),
+-- Compute per-user activity metrics combining questions and answers
+user_activity as (
+  select
+    u.user_id,
+    sum(case when rq.id is not null then 1 else 0 end) as questions_asked,
+    sum(coalesce(rq.viewcount,0)) as question_views,
+    sum(coalesce(rq.score,0)) as question_score,
+    sum(coalesce(rq.answercount,0)) as answers_received,
+    sum(case when ra.id is not null then 1 else 0 end) as answers_posted,
+    sum(coalesce(ra.score,0)) as answer_score
+  from active_users u
+  left join recent_questions rq on rq.owneruserid = u.user_id
+  left join recent_answers ra on ra.answerer_id = u.user_id
+  group by u.user_id
+),
+-- Accepted answer signals
+accepted_map as (
+  select
+    q.id as question_id,
+    q.acceptedanswerid as accepted_id
+  from posts q
+  where q.posttypeid = 1
+    and q.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+),
+answer_quality as (
+  select
+    ra.id as answer_id,
+    ra.question_id,
+    ra.answerer_id,
+    ra.score,
+    case when ra.id = am.accepted_id then 1 else 0 end as is_accepted,
+    dense_rank() over (partition by ra.question_id order by ra.score desc nulls last, ra.id) as score_rank
+  from recent_answers ra
+  left join accepted_map am on am.question_id = ra.question_id
+),
+-- Comment density per post
+comment_density as (
+  select
+    p.id as post_id,
+    coalesce(p.commentcount, 0) as commentcount,
+    nullif(length(regexp_replace(coalesce(p.body, ''), '<[^>]*>', '', 'g')), 0) as plain_body_len,
+    case
+      when coalesce(p.commentcount,0) = 0 then null
+      else (nullif(length(regexp_replace(coalesce(p.body, ''), '<[^>]*>', '', 'g')), 0)::numeric / greatest(p.commentcount,1))
+    end as chars_per_comment
+  from posts p
+  where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+),
+-- Per tag aggregates for recent questions
+tag_agg as (
+  select
+    qt.tagname,
+    count(distinct qt.question_id) as questions_with_tag,
+    avg(rq.score) as avg_q_score,
+    avg(coalesce(va.upvotes,0) - coalesce(va.downvotes,0)) as avg_net_votes,
+    sum(case when hs.closed_events > 0 then 1 else 0 end) as closed_qs
+  from question_tags qt
+  join recent_questions rq on rq.id = qt.question_id
+  left join vote_agg va on va.postid = rq.id
+  left join history_signals hs on hs.postid = rq.id
+  group by qt.tagname
+),
+-- Users' top tag affinity from their asked questions
+user_top_tags as (
+  select
+    rq.owneruserid as user_id,
+    qt.tagname,
+    count(*) as cnt,
+    row_number() over (partition by rq.owneruserid order by count(*) desc, min(rq.id)) as rn
+  from recent_questions rq
+  join question_tags qt on qt.question_id = rq.id
+  group by rq.owneruserid, qt.tagname
+),
+-- Closed question diagnostics
+closed_diag as (
+  select
+    rq.id as question_id,
+    rq.owneruserid,
+    hs.last_close_reason,
+    coalesce(hs.closed_events,0) as times_closed,
+    coalesce(hs.reopened_events,0) as times_reopened,
+    case
+      when hs.closed_events > 0 and hs.reopened_events > 0 then 'closed-then-reopened'
+      when hs.closed_events > 0 then 'closed'
+      else 'open-or-unknown'
+    end as status
+  from recent_questions rq
+  left join history_signals hs on hs.postid = rq.id
+),
+-- Combine most signals at question grain
+question_fact as (
+  select
+    rq.id as question_id,
+    rq.owneruserid,
+    rq.creationdate,
+    rq.title,
+    rq.score,
+    rq.viewcount,
+    rq.answercount,
+    rq.favoritecount,
+    cd.status,
+    cd.times_closed,
+    cd.times_reopened,
+    cd.last_close_reason,
+    coalesce(va.upvotes,0) as q_upvotes,
+    coalesce(va.downvotes,0) as q_downvotes,
+    coalesce(va.bounty_started,0) as bounty_started,
+    coalesce(va.bounty_awarded,0) as bounty_awarded,
+    coalesce(lr.dup_count,0) as dup_links,
+    coalesce(lr.linked_count,0) as linked_links,
+    rq.comment_count,
+    case when rq.closeddate is not null then 1 else 0 end as was_closed_flag,
+    (select count(*) from postlinks x where x.relatedpostid = rq.id and x.linktypeid = 1) as inbound_links
+  from recent_questions rq
+  left join vote_agg va on va.postid = rq.id
+  left join link_rollup lr on lr.postid = rq.id
+  left join closed_diag cd on cd.question_id = rq.id
+),
+-- Rank questions per owner by a composite score
+ranked_questions as (
+  select
+    qf.*,
+    (
+      coalesce(qf.score,0) * 2
+      + coalesce(qf.q_upvotes,0)
+      - coalesce(qf.q_downvotes,0)
+      + coalesce(qf.viewcount,0) / 100
+      + coalesce(qf.bounty_awarded,0) / 50
+      + case when qf.dup_links > 0 then -10 else 0 end
+      + case when qf.was_closed_flag = 1 then -20 else 0 end
+      + coalesce(qf.inbound_links,0)
+    ) as composite_score
+  from question_fact qf
+),
+-- Filter only posts with "sql" in title or tag for targeted stress
+sql_focus as (
+  select distinct rq.id as question_id
+  from recent_questions rq
+  left join question_tags qt on qt.question_id = rq.id
+  where (lower(coalesce(rq.title,'')) like '%sql%')
+     or (qt.tagname = 'sql')
+),
+-- Per-user rollup with window distributions
+user_rollup as (
+  select
+    au.user_id,
+    au.displayname,
+    au.location_norm,
+    ua.questions_asked,
+    ua.answers_posted,
+    ua.question_score + ua.answer_score as total_score,
+    sum(rqf.composite_score) as sum_composite_qscore,
+    count(rqf.question_id) filter (where sf.question_id is not null) as sql_qs,
+    percentile_cont(0.5) within group (order by rqf.composite_score) as median_composite_qscore,
+    avg(rqf.composite_score) as avg_composite_qscore
+  from active_users au
+  left join user_activity ua on ua.user_id = au.user_id
+  left join ranked_questions rqf on rqf.owneruserid = au.user_id
+  left join sql_focus sf on sf.question_id = rqf.question_id
+  group by au.user_id, au.displayname, au.location_norm, ua.questions_asked, ua.answers_posted, ua.question_score, ua.answer_score
+),
+-- Identify top answers per question, including null-safe tie handling
+best_answers as (
+  select
+    aq.question_id,
+    min(aq.answer_id) filter (where aq.score_rank = 1) as top_answer_id,
+    max(aq.is_accepted) filter (where aq.score_rank = 1) as top_is_accepted,
+    avg(aq.score) filter (where aq.score_rank <= 3) as avg_top3_answer_score
+  from answer_quality aq
+  group by aq.question_id
+),
+-- Bring comment density and join to questions
+q_comment_density as (
+  select
+    cd.post_id as question_id,
+    cd.chars_per_comment
+  from comment_density cd
+),
+-- Final assemble with set operations to stress planner
+final_questions as (
+  select rqf.*
+  from ranked_questions rqf
+  where rqf.composite_score is not null
+  union all
+  select rqf.*
+  from ranked_questions rqf
+  where rqf.composite_score is null and 1=0 -- dead branch to keep shape
+),
+-- Derive location cohorts
+location_cohorts as (
+  select
+    ur.location_norm,
+    count(*) as users_in_location,
+    avg(ur.avg_composite_qscore) as loc_avg_qscore
+  from user_rollup ur
+  group by ur.location_norm
+)
+select
+  fq.question_id,
+  fq.owneruserid as owner_user_id,
+  au.displayname as owner_displayname,
+  au.location_norm as owner_location,
+  fq.creationdate,
+  fq.title,
+  fq.score as q_score,
+  fq.q_upvotes,
+  fq.q_downvotes,
+  fq.viewcount,
+  fq.answercount,
+  fq.favoritecount,
+  fq.bounty_started,
+  fq.bounty_awarded,
+  fq.dup_links,
+  fq.linked_links,
+  fq.inbound_links,
+  fq.times_closed,
+  fq.times_reopened,
+  fq.status as close_status,
+  fq.last_close_reason,
+  coalesce(ba.top_answer_id, -1) as top_answer_id,
+  coalesce(ba.top_is_accepted, 0) as top_is_accepted,
+  ba.avg_top3_answer_score,
+  tpop.tagname as sample_tag,
+  coalesce(tpop.questions_with_tag,0) as tag_qs_count,
+  coalesce(tpop.avg_q_score,0) as tag_avg_q_score,
+  qcd.chars_per_comment,
+  ur.questions_asked,
+  ur.answers_posted,
+  ur.total_score as user_total_score,
+  ur.sum_composite_qscore as user_sum_composite_qscore,
+  ur.sql_qs as user_sql_qs_last_year,
+  lc.users_in_location,
+  lc.loc_avg_qscore,
+  fq.composite_score,
+  row_number() over (
+    partition by fq.owneruserid
+    order by fq.composite_score desc, fq.viewcount desc, fq.question_id
+  ) as rn_by_owner,
+  dense_rank() over (
+    order by fq.composite_score desc nulls last, fq.viewcount desc, fq.question_id
+  ) as dense_rank_global,
+  case
+    when sf.question_id is not null then 'sql-topic'
+    when fq.viewcount > 10000 then 'high-traffic'
+    when fq.times_closed > 0 then 'controversial'
+    else 'general'
+  end as category_label
+from final_questions fq
+left join active_users au on au.user_id = fq.owneruserid
+left join best_answers ba on ba.question_id = fq.question_id
+left join lateral (
+  select ta.*
+  from tag_agg ta
+  join question_tags qt on qt.tagname = ta.tagname and qt.question_id = fq.question_id
+  order by ta.questions_with_tag desc nulls last, ta.tagname
+  limit 1
+) tpop on true
+left join q_comment_density qcd on qcd.question_id = fq.question_id
+left join user_rollup ur on ur.user_id = fq.owneruserid
+left join location_cohorts lc on lc.location_norm = au.location_norm
+left join sql_focus sf on sf.question_id = fq.question_id
+where
+  -- Complicated filter combining null logic and string ops
+  (
+    coalesce(fq.score, 0) + coalesce(fq.q_upvotes,0) - coalesce(fq.q_downvotes,0)
+    + case when fq.status = 'closed-then-reopened' then 5 else 0 end
+  ) >= (
+    select coalesce(avg(score),0)
+    from recent_questions rq2
+    where rq2.owneruserid = fq.owneruserid
+  )
+  and (
+    position('data' in lower(coalesce(fq.title,''))) = 0
+    or fq.inbound_links > 0
+    or fq.bounty_awarded > 0
+  )
+  and (
+    exists (
+      select 1
+      from answer_quality aq
+      where aq.question_id = fq.question_id
+        and (aq.is_accepted = 1 or aq.score >= 1)
+    )
+    or fq.answercount = 0
+  )
+  and (
+    case when au.reputation is null then false
+         when au.reputation >= 1000 then true
+         else fq.viewcount >= 500
+    end
+  )
+order by
+  dense_rank_global,
+  rn_by_owner
+limit 500;

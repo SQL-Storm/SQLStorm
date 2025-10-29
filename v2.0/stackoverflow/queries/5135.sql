@@ -1,0 +1,33 @@
+SELECT
+    u.Id AS UserId,
+    u.DisplayName AS UserName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS PostCount,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpvotesGiven,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownvotesGiven,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN v.BountyAmount ELSE 0 END) AS TotalUpvoteBounty,
+    MAX(p.LastActivityDate) AS LastActivity,
+    AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS AvgQuestionScore,
+    STRING_AGG(DISTINCT t.Name, ',') AS TagsTouched,
+    MAX(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END) AS MaxQuestionViews
+FROM
+    Users u
+LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+LEFT JOIN Votes v ON v.PostId = p.Id
+LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+LEFT JOIN (
+    SELECT
+        pt.Id,
+        pt.Name
+    FROM PostTypes pt
+) t ON t.Id = p.PostTypeId
+WHERE
+    u.Reputation > 1000
+    AND u.CreationDate < (CAST('2024-10-01' AS DATE) - INTERVAL '1 year')
+    AND (p.PostTypeId = 1 OR p.PostTypeId = 2)
+    AND (ph.PostHistoryTypeId IS NULL OR ph.PostHistoryTypeId NOT IN (50, 52))
+GROUP BY
+    u.Id, u.DisplayName, u.Reputation
+ORDER BY
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) DESC
+LIMIT 100;

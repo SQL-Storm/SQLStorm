@@ -1,0 +1,254 @@
+-- {"query": "1882.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3449} 
+WITH UserPostStats AS (
+    -- Calculate aggregated statistics for each user related to their posts (questions and answers)
+    SELECT
+        u.Id AS UserId,
+        COALESCE(u.DisplayName, 'Unknown User') AS DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.UpVotes AS UserTotalUpVotes,
+        u.DownVotes AS UserTotalDownVotes,
+        u.Views AS UserProfileViews,
+        COUNT(p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostScore,
+        AVG(CAST(COALESCE(p.Score, 0) AS NUMERIC)) AS AveragePostScore,
+        MAX(p.CreationDate) AS LatestPostDate,
+        COUNT(DISTINCT ph_edit.PostId) AS UniqueEditedPosts,
+        SUM(CASE WHEN ph_close.PostHistoryTypeId IN (10, 11) THEN 1 ELSE 0 END) AS PostCloseReopenEvents, -- 10=Post Closed, 11=Post Reopened
+        STRING_AGG(DISTINCT LOWER(SUBSTRING(t.TagName, 1, 25)), ' | ') FILTER (WHERE t.TagName IS NOT NULL AND t.TagName <> '') AS AssociatedTagsSummary,
+        NULLIF(SUM(LENGTH(p.Body)), 0) AS TotalPostBodyLength,
+        NULLIF(SUM(LENGTH(p.Title)), 0) AS TotalPostTitleLength
+    FROM
+        Users u
+    LEFT JOIN
+        Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        PostHistory ph_edit ON u.Id = ph_edit.UserId AND p.Id = ph_edit.PostId AND ph_edit.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+    LEFT JOIN
+        PostHistory ph_close ON u.Id = ph_close.UserId AND p.Id = ph_close.PostId AND ph_close.PostHistoryTypeId IN (10, 11) -- Post Closed, Post Reopened
+    LEFT JOIN LATERAL ( -- Use LATERAL join for unnesting tags from question posts
+        SELECT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')) AS TagName
+        WHERE p.Tags IS NOT NULL AND p.PostTypeId = 1
+    ) AS unnested_tags ON TRUE
+    LEFT JOIN Tags t ON unnested_tags.TagName = t.TagName
+    WHERE
+        u.Reputation > 500 -- Filter out users with very low reputation for relevance
+        AND u.CreationDate >= '2010-01-01' -- Focus on more recent, active users
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.UpVotes, u.DownVotes, u.Views
+),
+AcceptedAnswerEngagement AS (
+    -- Identify users whose answers are frequently accepted and analyze the response time
+    SELECT
+        p_ans.OwnerUserId AS AnswererId,
+        COUNT(p_ans.Id) AS AcceptedAnswersGiven,
+        SUM(COALESCE(p_ans.Score, 0)) AS AcceptedAnswersTotalScore,
+        AVG(EXTRACT(EPOCH FROM (p_ans.CreationDate - p_q.CreationDate)) / 3600.0) AS AvgTimeToAcceptHours, -- Average time from question creation to answer creation (for accepted answers)
+        AVG(EXTRACT(EPOCH FROM (p_q.ClosedDate - p_q.CreationDate)) / 86400.0) AS AvgQuestionCloseDaysForAcceptedAnswers -- Avg time for the question to be closed
+    FROM
+        Posts p_ans -- Answer post
+    INNER JOIN
+        Posts p_q ON p_ans.ParentId = p_q.Id -- Question post
+    WHERE
+        p_ans.PostTypeId = 2 -- Only answers
+        AND p_q.AcceptedAnswerId = p_ans.Id -- This answer was accepted
+    GROUP BY
+        p_ans.OwnerUserId
+),
+UserBadgeSummary AS (
+    -- Summarize badge counts for users, differentiating by class and calculating a badge rarity score
+    SELECT
+        b.UserId,
+        COUNT(b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(b.Date) AS LatestBadgeDate,
+        (SUM(CASE WHEN b.Class = 1 THEN 3 ELSE 0 END) + SUM(CASE WHEN b.Class = 2 THEN 2 ELSE 0 END) + SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END)) AS BadgeRarityScore
+    FROM
+        Badges b
+    GROUP BY
+        b.UserId
+),
+PostLinkActivity AS (
+    -- Identify users involved in linked or duplicate posts
+    SELECT
+        p.OwnerUserId AS PostOwnerId,
+        COUNT(DISTINCT pl.RelatedPostId) AS TotalLinkedPosts,
+        SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicateSourcePosts,
+        SUM(CASE WHEN pl.LinkTypeId = 1 THEN 1 ELSE 0 END) AS LinkedPosts
+    FROM
+        Posts p
+    INNER JOIN
+        PostLinks pl ON p.Id = pl.PostId
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY
+        p.OwnerUserId
+),
+CorrelatedSubqueryBenchmark AS (
+    -- This CTE employs correlated subqueries for specific, potentially heavy calculations
+    SELECT
+        ups.UserId,
+        (SELECT AVG(LENGTH(p.Body))
+         FROM Posts p
+         WHERE p.OwnerUserId = ups.UserId
+           AND p.PostTypeId = 1
+           AND p.CreationDate >= ups.UserCreationDate - INTERVAL '6 months' -- Questions from the last 6 months of user's activity
+           AND EXISTS ( -- Correlated check for questions that received answers quickly
+               SELECT 1
+               FROM Posts q_ans
+               WHERE q_ans.ParentId = p.Id
+                 AND q_ans.PostTypeId = 2
+                 AND q_ans.CreationDate < p.CreationDate + INTERVAL '24 hours' -- Answered within 24 hours
+               HAVING COUNT(q_ans.Id) >= 2 -- At least 2 quick answers
+           )
+        ) AS AvgQuickAnsweredQuestionBodyLength,
+        (SELECT COALESCE(SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END), 0)
+         FROM Votes v
+         JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+         WHERE v.PostId IN (SELECT p2.Id FROM Posts p2 WHERE p2.OwnerUserId = ups.UserId AND p2.PostTypeId = 2) -- Votes on user's own answers
+           AND vt.Name = 'UpMod'
+        ) AS UpVotesOnOwnAnswers,
+        (SELECT COALESCE(SUM(c.Score), 0)
+         FROM Comments c
+         WHERE c.UserId = ups.UserId
+           AND c.CreationDate > ups.LatestPostDate - INTERVAL '3 months' -- Recent comments by user
+           AND c.Text ILIKE '%thank%' -- Comments containing "thank"
+        ) AS RecentThanksCommentsScore
+    FROM UserPostStats ups
+    WHERE ups.TotalAnswers > 0 OR ups.TotalQuestions > 0
+),
+RankedUserActivity AS (
+    -- Combine various user metrics and apply window functions for ranking and comparison
+    SELECT
+        ups.UserId,
+        ups.DisplayName,
+        ups.Reputation,
+        ups.UserCreationDate,
+        ups.TotalPosts,
+        ups.TotalQuestions,
+        ups.TotalAnswers,
+        ups.TotalPostScore,
+        ups.AveragePostScore,
+        ups.UniqueEditedPosts,
+        ups.PostCloseReopenEvents,
+        COALESCE(aas.AcceptedAnswersGiven, 0) AS AcceptedAnswersCount,
+        COALESCE(aas.AcceptedAnswersTotalScore, 0) AS AcceptedAnswersScore,
+        COALESCE(aas.AvgTimeToAcceptHours, 0) AS AvgTimeToAcceptHours,
+        COALESCE(ubs.TotalBadges, 0) AS TotalBadges,
+        COALESCE(ubs.GoldBadges, 0) AS GoldBadges,
+        COALESCE(ubs.BadgeRarityScore, 0) AS BadgeRarityScore,
+        COALESCE(pla.TotalLinkedPosts, 0) AS TotalLinkedPosts,
+        COALESCE(pla.DuplicateSourcePosts, 0) AS DuplicateSourcePosts,
+        csb.AvgQuickAnsweredQuestionBodyLength,
+        csb.UpVotesOnOwnAnswers,
+        csb.RecentThanksCommentsScore,
+        ups.AssociatedTagsSummary,
+        (ups.UserProfileViews + ups.UserTotalUpVotes - ups.UserTotalDownVotes) AS UserEngagementMetric,
+        -- Window functions
+        RANK() OVER (ORDER BY ups.Reputation DESC, ups.TotalPostScore DESC) AS GlobalReputationRank,
+        NTILE(10) OVER (ORDER BY ups.TotalAnswers DESC NULLS LAST) AS AnswererDecile, -- Divide users into 10 groups based on answers
+        AVG(ups.AveragePostScore) OVER (PARTITION BY EXTRACT(YEAR FROM ups.UserCreationDate), EXTRACT(MONTH FROM ups.UserCreationDate)) AS AvgScoreInCreationMonth,
+        ROW_NUMBER() OVER (PARTITION BY COALESCE(ubs.GoldBadges, 0) > 0 ORDER BY ups.Reputation DESC) AS RankWithinGoldBadgeGroup
+    FROM
+        UserPostStats ups
+    LEFT JOIN
+        AcceptedAnswerEngagement aas ON ups.UserId = aas.AnswererId
+    LEFT JOIN
+        UserBadgeSummary ubs ON ups.UserId = ubs.UserId
+    LEFT JOIN
+        PostLinkActivity pla ON ups.UserId = pla.PostOwnerId
+    LEFT JOIN
+        CorrelatedSubqueryBenchmark csb ON ups.UserId = csb.UserId
+    WHERE
+        ups.TotalPosts > 5 -- Ensure minimum activity
+        AND ups.AveragePostScore IS NOT NULL
+),
+FinalUserSelection AS (
+    -- Combine ranks and other metrics for the final output, adding more complex filters
+    SELECT
+        rua.UserId,
+        rua.DisplayName,
+        rua.Reputation,
+        rua.TotalPosts,
+        rua.TotalQuestions,
+        rua.TotalAnswers,
+        rua.AveragePostScore,
+        rua.AcceptedAnswersCount,
+        rua.GoldBadges,
+        rua.BadgeRarityScore,
+        rua.GlobalReputationRank,
+        rua.AnswererDecile,
+        rua.AvgScoreInCreationMonth,
+        rua.AssociatedTagsSummary,
+        rua.AvgQuickAnsweredQuestionBodyLength,
+        rua.UpVotesOnOwnAnswers,
+        rua.RecentThanksCommentsScore,
+        rua.UserEngagementMetric,
+        -- More complex calculations/expressions
+        CASE
+            WHEN rua.GoldBadges > 0 AND rua.AcceptedAnswersCount > 10 AND rua.BadgeRarityScore > 5 THEN 'Elite Contributor'
+            WHEN rua.Reputation > 50000 AND rua.TotalQuestions > 20 AND rua.TotalAnswers > 20 THEN 'High-Rep Q&A Expert'
+            WHEN rua.TotalAnswers > 50 AND rua.AnswererDecile <= 3 AND rua.AvgTimeToAcceptHours > 0 AND rua.AvgTimeToAcceptHours < 12 THEN 'Prompt & Prolific Answerer'
+            WHEN rua.UniqueEditedPosts > 5 AND rua.PostCloseReopenEvents > 0 THEN 'Community Moderator'
+            ELSE 'Active User'
+        END AS UserCategory,
+        (rua.Reputation * 0.4 + rua.TotalPostScore * 0.2 + rua.AcceptedAnswersCount * 15 + COALESCE(rua.UpVotesOnOwnAnswers, 0) * 0.1 + rua.BadgeRarityScore * 5 + rua.UserEngagementMetric * 0.01) AS WeightedEngagementScore,
+        COALESCE(rua.DisplayName, 'Anonymous User') || ' (ID: ' || rua.UserId || ')' AS UserIdentifier,
+        -- NULL logic example: using COALESCE
+        COALESCE(rua.AssociatedTagsSummary, 'No Specific Tags Identified') AS PreferredTagSummary,
+        (SELECT pt.Name FROM PostTypes pt WHERE pt.Id = (
+            SELECT p_fav.PostTypeId FROM Posts p_fav WHERE p_fav.OwnerUserId = rua.UserId
+            ORDER BY p_fav.FavoriteCount DESC NULLS LAST, p_fav.Score DESC NULLS LAST
+            LIMIT 1
+        )) AS MostPopularPostType
+    FROM
+        RankedUserActivity rua
+    WHERE
+        rua.GlobalReputationRank <= 5000 -- Top 5000 users by reputation/score
+        AND (rua.AnswererDecile <= 7 OR rua.TotalQuestions >= 10) -- Active either as an answerer or questioner
+        AND rua.AveragePostScore > rua.AvgScoreInCreationMonth * 0.9 -- User's avg score is comparable or better than their cohort's avg score
+        AND rua.AssociatedTagsSummary IS NOT NULL -- Must have some tags associated
+)
+-- Final SELECT with a UNION ALL to demonstrate set operators, combining two different filters
+SELECT
+    UserId,
+    DisplayName,
+    Reputation,
+    TotalPosts,
+    UserCategory,
+    WeightedEngagementScore,
+    PreferredTagSummary,
+    MostPopularPostType,
+    'High-Value Contributor Criteria' AS SelectionDescription
+FROM
+    FinalUserSelection
+WHERE
+    Reputation > 75000
+    AND TotalAnswers > 30
+    AND GoldBadges > 0
+    AND UserCategory IN ('Elite Contributor', 'High-Rep Q&A Expert')
+    AND WeightedEngagementScore > 50000
+
+UNION ALL
+
+SELECT
+    UserId,
+    DisplayName,
+    Reputation,
+    TotalPosts,
+    UserCategory,
+    WeightedEngagementScore,
+    PreferredTagSummary,
+    MostPopularPostType,
+    'Community-Driven Activity Criteria' AS SelectionDescription
+FROM
+    FinalUserSelection
+WHERE
+    GlobalReputationRank <= 1000
+    AND UniqueEditedPosts > 3
+    AND PostCloseReopenEvents > 0
+    AND (AvgQuickAnsweredQuestionBodyLength IS NULL OR AvgQuickAnsweredQuestionBodyLength > 500) -- Either no such questions or they are substantially long
+    AND RecentThanksCommentsScore > 10;

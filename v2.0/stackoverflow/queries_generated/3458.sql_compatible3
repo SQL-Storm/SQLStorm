@@ -1,0 +1,148 @@
+WITH 
+    usr AS (
+        SELECT 
+            u.Id,
+            u.DisplayName,
+            u.Reputation,
+            u.CreationDate,
+            COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QCnt,
+            COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS ACnt,
+            COUNT(p.Id) AS TotalPosts,
+            AVG(p.Score) AS AvgScore,
+            MAX(p.CreationDate) AS LastPostDt
+        FROM Users u
+        LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+        GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+    ),
+    badge AS (
+        SELECT 
+            b.UserId,
+            COUNT(*) AS BCnt,
+            COUNT(*) FILTER (WHERE b.Class = 1) AS Gold,
+            COUNT(*) FILTER (WHERE b.Class = 2) AS Silver,
+            COUNT(*) FILTER (WHERE b.Class = 3) AS Bronze
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+    -- Split tags using SQL-standard functions: replace '><' with a delimiter and split via recursive CTE
+    posts_tags AS (
+        SELECT
+            p.OwnerUserId AS UserId,
+            TRIM(BOTH '<>' FROM p.Tags) AS tags_trimmed
+        FROM Posts p
+        WHERE p.Tags IS NOT NULL
+    ),
+    recursive_split AS (
+        SELECT
+            UserId,
+            tags_trimmed AS rest,
+            NULL::text AS tag,
+            0 AS idx
+        FROM posts_tags
+        UNION ALL
+        SELECT
+            rs.UserId,
+            CASE
+                WHEN instr_pos = 0 THEN '' 
+                ELSE SUBSTRING(rs.rest FROM instr_pos + 2) 
+            END AS rest,
+            CASE
+                WHEN instr_pos = 0 THEN rs.rest
+                ELSE SUBSTRING(rs.rest FROM 1 FOR instr_pos - 1)
+            END AS tag,
+            rs.idx + 1
+        FROM (
+            SELECT
+                rs.*,
+                COALESCE(NULLIF(POSITION('><' IN rs.rest), 0), 0) AS instr_pos
+            FROM recursive_split rs
+            WHERE rs.rest <> ''
+        ) rs
+        WHERE rs.rest IS NOT NULL
+    ),
+    -- Standardize POSITION function usage by replacing nonstandard instr references: POSITION returns 0 when not found in some DBs, so normalize
+    tag_use AS (
+        SELECT
+            UserId,
+            tag AS Tag,
+            COUNT(*) AS TagCnt
+        FROM (
+            SELECT UserId, tag
+            FROM recursive_split
+            WHERE tag IS NOT NULL AND tag <> ''
+        ) t
+        GROUP BY UserId, tag
+    ),
+    recent_votes AS (
+        SELECT 
+            v.UserId,
+            COUNT(*) AS VoteCnt30d
+        FROM Votes v
+        WHERE v.CreationDate >= DATE '2024-10-01' - INTERVAL '30' DAY
+        GROUP BY v.UserId
+    ),
+    top_tag_per_user AS (
+        SELECT 
+            t.UserId,
+            t.Tag,
+            t.TagCnt,
+            ROW_NUMBER() OVER (PARTITION BY t.UserId ORDER BY t.TagCnt DESC, t.Tag) AS rn
+        FROM tag_use t
+    )
+SELECT 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.TotalPosts,
+    u.QCnt,
+    u.ACnt,
+    COALESCE(u.AvgScore,0) AS AvgScore,
+    u.LastPostDt,
+    COALESCE(b.BCnt,0) AS BadgeCount,
+    COALESCE(b.Gold,0) AS GoldBadges,
+    COALESCE(b.Silver,0) AS SilverBadges,
+    COALESCE(b.Bronze,0) AS BronzeBadges,
+    COALESCE(rv.VoteCnt30d,0) AS RecentVoteCount,
+    tt.Tag AS TopTag,
+    tt.TagCnt AS TopTagUseCount,
+    CASE 
+        WHEN u.Reputation > 20000 THEN 'Elite'
+        WHEN u.Reputation > 10000 THEN 'PowerUser'
+        ELSE 'Regular'
+    END AS ReputationBand,
+    (NULLIF(u.LastPostDt, DATE '2024-10-01') IS NOT NULL) AS HasRecentPost
+FROM usr u
+LEFT JOIN badge b ON b.UserId = u.Id
+LEFT JOIN recent_votes rv ON rv.UserId = u.Id
+LEFT JOIN top_tag_per_user tt ON tt.UserId = u.Id AND tt.rn = 1
+WHERE 
+    u.Reputation >= 5000
+    AND (u.LastPostDt IS NULL OR u.LastPostDt >= DATE '2024-10-01' - INTERVAL '2' YEAR)
+    AND (COALESCE(b.BCnt,0) + COALESCE(rv.VoteCnt30d,0)) > 10
+
+UNION ALL
+
+SELECT 
+    NULL AS Id,
+    'TOTAL' AS DisplayName,
+    NULL AS Reputation,
+    SUM(u.TotalPosts) AS TotalPosts,
+    SUM(u.QCnt) AS QCnt,
+    SUM(u.ACnt) AS ACnt,
+    AVG(u.AvgScore) AS AvgScore,
+    MAX(u.LastPostDt) AS LastPostDt,
+    SUM(COALESCE(b.BCnt,0)) AS BadgeCount,
+    SUM(COALESCE(b.Gold,0)) AS GoldBadges,
+    SUM(COALESCE(b.Silver,0)) AS SilverBadges,
+    SUM(COALESCE(b.Bronze,0)) AS BronzeBadges,
+    SUM(COALESCE(rv.VoteCnt30d,0)) AS RecentVoteCount,
+    NULL AS TopTag,
+    NULL AS TopTagUseCount,
+    NULL AS ReputationBand,
+    NULL AS HasRecentPost
+FROM usr u
+LEFT JOIN badge b ON b.UserId = u.Id
+LEFT JOIN recent_votes rv ON rv.UserId = u.Id
+WHERE u.Reputation >= 5000
+ORDER BY Reputation DESC NULLS LAST, TotalPosts DESC NULLS LAST
+LIMIT 100;

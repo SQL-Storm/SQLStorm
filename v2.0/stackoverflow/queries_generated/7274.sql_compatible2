@@ -1,0 +1,274 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS prev_score,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS avg_score,
+        CASE 
+            WHEN p.Score > 100 THEN 'High'
+            WHEN p.Score > 50 THEN 'Medium'
+            ELSE 'Low'
+        END AS score_category,
+        COALESCE(p.Title, '') AS clean_title
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) 
+      AND p.CreationDate >= CAST('2010-01-01' AS TIMESTAMP)
+),
+UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.UpVotes,
+        u.DownVotes,
+        u.Views,
+        COUNT(DISTINCT p.Id) AS post_count,
+        COUNT(DISTINCT c.Id) AS comment_count,
+        COUNT(DISTINCT b.Id) AS badge_count,
+        MAX(p.CreationDate) AS last_post_date,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Elite'
+            WHEN u.Reputation > 1000 THEN 'Expert'
+            WHEN u.Reputation > 100 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END AS reputation_level,
+        CAST(
+            ROUND(
+                COALESCE(SUM(p.Score), 0) / NULLIF(COUNT(p.Id), 0)::numeric, 2
+            ) AS DOUBLE PRECISION
+        ) AS avg_post_score
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= CAST('2008-01-01' AS TIMESTAMP)
+    GROUP BY u.Id, u.Reputation, u.UpVotes, u.DownVotes, u.Views
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            ELSE 'Rare'
+        END AS popularity_level,
+        (SELECT COUNT(*) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%') AS related_posts,
+        COALESCE(
+            (SELECT AVG(p.Score) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%'), 
+            0
+        ) AS avg_tag_score
+    FROM Tags t
+    WHERE t.TagName IS NOT NULL
+),
+PostActivity AS (
+    SELECT 
+        ph.PostId,
+        ph.UserId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        ph.Comment,
+        ph.Text,
+        CASE 
+            WHEN ph.PostHistoryTypeId IN (1, 4, 6) THEN 'Title/Tag Edit'
+            WHEN ph.PostHistoryTypeId IN (2, 5) THEN 'Body Edit'
+            WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN 'Status Change'
+            ELSE 'Other'
+        END AS activity_type,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS latest_activity,
+        CAST((CAST('2024-10-01 12:34:56' AS TIMESTAMP) - ph.CreationDate) AS INTERVAL) AS _interval_diff,
+        EXTRACT(DAY FROM CAST((CAST('2024-10-01 12:34:56' AS TIMESTAMP) - ph.CreationDate) AS INTERVAL)) +
+        (EXTRACT(EPOCH FROM CAST((CAST('2024-10-01 12:34:56' AS TIMESTAMP) - ph.CreationDate) AS INTERVAL)) / 86400 - FLOOR(EXTRACT(EPOCH FROM CAST((CAST('2024-10-01 12:34:56' AS TIMESTAMP) - ph.CreationDate) AS INTERVAL)) / 86400))::integer * 0 AS _dummy,
+        FLOOR(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - ph.CreationDate)) / 86400)::integer AS days_since_activity
+    FROM PostHistory ph
+    WHERE ph.CreationDate >= CAST('2015-01-01' AS TIMESTAMP)
+),
+CombinedData AS (
+    SELECT 
+        rp.Id,
+        rp.PostTypeId,
+        rp.OwnerUserId,
+        rp.Score,
+        rp.ViewCount,
+        rp.CreationDate,
+        rp.Title,
+        rp.Tags,
+        rp.AnswerCount,
+        rp.CommentCount,
+        rp.FavoriteCount,
+        rp.score_category,
+        rp.prev_score,
+        rp.avg_score,
+        us.Reputation,
+        us.UpVotes,
+        us.DownVotes,
+        us.post_count,
+        us.comment_count,
+        us.badge_count,
+        us.last_post_date,
+        us.reputation_level,
+        us.avg_post_score,
+        ta.TagName,
+        ta.Count AS tag_count,
+        ta.popularity_level,
+        ta.related_posts,
+        ta.avg_tag_score,
+        pa.activity_type,
+        pa.days_since_activity,
+        CASE 
+            WHEN rp.Score > 0 AND rp.AnswerCount > 0 THEN 
+                CAST(ROUND(CAST(rp.AnswerCount AS numeric) / NULLIF(rp.Score, 0), 2) AS double precision)
+            ELSE 0
+        END AS answers_per_score,
+        CASE 
+            WHEN rp.CommentCount > 0 AND rp.ViewCount > 0 THEN 
+                CAST(ROUND(CAST(rp.CommentCount AS numeric) / NULLIF(rp.ViewCount, 0), 4) AS double precision)
+            ELSE 0
+        END AS comments_per_view,
+        CASE 
+            WHEN rp.FavoriteCount > 0 AND rp.Score > 0 THEN 
+                CAST(ROUND(CAST(rp.FavoriteCount AS numeric) / NULLIF(rp.Score, 0), 3) AS double precision)
+            ELSE 0
+        END AS favorites_per_score
+    FROM RankedPosts rp
+    LEFT JOIN UserStats us ON rp.OwnerUserId = us.UserId
+    LEFT JOIN (
+        SELECT DISTINCT 
+            p.Id,
+            t.TagName,
+            t.Count,
+            t.popularity_level,
+            (SELECT COUNT(*) FROM Posts p2 WHERE p2.Tags LIKE '%' || t.TagName || '%') AS related_posts,
+            COALESCE((SELECT AVG(p2.Score) FROM Posts p2 WHERE p2.Tags LIKE '%' || t.TagName || '%'), 0) AS avg_tag_score
+        FROM Posts p
+        JOIN Tags t ON p.Tags LIKE '%' || t.TagName || '%'
+        WHERE t.TagName IS NOT NULL
+    ) ta ON rp.Id = ta.Id
+    LEFT JOIN PostActivity pa ON rp.Id = pa.PostId
+    WHERE rp.rn = 1 
+      AND us.post_count > 0
+),
+FinalQuery AS (
+    SELECT 
+        cd.Id,
+        cd.PostTypeId,
+        cd.OwnerUserId,
+        cd.Score,
+        cd.ViewCount,
+        cd.CreationDate,
+        cd.Title,
+        cd.Tags,
+        cd.AnswerCount,
+        cd.CommentCount,
+        cd.FavoriteCount,
+        cd.score_category,
+        cd.prev_score,
+        cd.avg_score,
+        cd.Reputation,
+        cd.UpVotes,
+        cd.DownVotes,
+        cd.post_count,
+        cd.comment_count,
+        cd.badge_count,
+        cd.last_post_date,
+        cd.reputation_level,
+        cd.avg_post_score,
+        cd.TagName,
+        cd.tag_count,
+        cd.popularity_level,
+        cd.related_posts,
+        cd.avg_tag_score,
+        cd.activity_type,
+        cd.days_since_activity,
+        cd.answers_per_score,
+        cd.comments_per_view,
+        cd.favorites_per_score,
+        CASE 
+            WHEN cd.score_category = 'High' AND cd.reputation_level = 'Elite' THEN 'High Impact'
+            WHEN cd.score_category = 'Medium' AND cd.reputation_level IN ('Expert', 'Elite') THEN 'Medium Impact'
+            WHEN cd.score_category = 'Low' AND cd.avg_post_score > 10 THEN 'Low Score High Activity'
+            ELSE 'Normal'
+        END AS impact_category,
+        DENSE_RANK() OVER (ORDER BY cd.ViewCount DESC) AS view_rank,
+        RANK() OVER (ORDER BY cd.Score DESC) AS score_rank,
+        PERCENT_RANK() OVER (ORDER BY cd.Reputation) AS reputation_percentile,
+        NTILE(4) OVER (ORDER BY cd.Score) AS score_quartile,
+        LAG(cd.Score) OVER (ORDER BY cd.CreationDate) AS prev_score_by_date,
+        LAG(cd.Reputation) OVER (ORDER BY cd.CreationDate) AS prev_rep_by_date
+    FROM CombinedData cd
+    WHERE cd.post_count > 1 
+      AND cd.Reputation > 500
+)
+SELECT 
+    f.Id,
+    f.PostTypeId,
+    f.OwnerUserId,
+    f.Score,
+    f.ViewCount,
+    f.CreationDate,
+    f.Title,
+    f.Tags,
+    f.AnswerCount,
+    f.CommentCount,
+    f.FavoriteCount,
+    f.score_category,
+    f.prev_score,
+    f.avg_score,
+    f.Reputation,
+    f.UpVotes,
+    f.DownVotes,
+    f.post_count,
+    f.comment_count,
+    f.badge_count,
+    f.last_post_date,
+    f.reputation_level,
+    f.avg_post_score,
+    f.TagName,
+    f.tag_count,
+    f.popularity_level,
+    f.related_posts,
+    f.avg_tag_score,
+    f.activity_type,
+    f.days_since_activity,
+    f.answers_per_score,
+    f.comments_per_view,
+    f.favorites_per_score,
+    f.impact_category,
+    f.view_rank,
+    f.score_rank,
+    f.reputation_percentile,
+    f.score_quartile,
+    f.prev_score_by_date,
+    f.prev_rep_by_date,
+    CASE 
+        WHEN f.favorites_per_score > 0.1 THEN 'Highly Favorited'
+        WHEN f.answers_per_score > 0.5 THEN 'Well Answered'
+        WHEN f.comments_per_view > 0.05 THEN 'Highly Commented'
+        ELSE 'Regular Post'
+    END AS engagement_level,
+    (f.Title || ' - Tags: ' || COALESCE(f.Tags, 'None') || ' - Score: ' || CAST(f.Score AS VARCHAR) || ' - Views: ' || CAST(f.ViewCount AS VARCHAR)) AS formatted_post_info,
+    ABS(f.Score - f.avg_score) AS score_deviation_from_user_avg,
+    CASE 
+        WHEN f.days_since_activity IS NULL THEN 'Never'
+        WHEN f.days_since_activity = 0 THEN 'Today'
+        WHEN f.days_since_activity = 1 THEN 'Yesterday'
+        ELSE CAST(f.days_since_activity AS VARCHAR) || ' days ago'
+    END AS activity_status
+FROM FinalQuery f
+WHERE f.Score > 0 
+  AND f.ViewCount > 10
+  AND (f.TagName IS NOT NULL OR f.Tags IS NOT NULL)
+  AND f.reputation_level IN ('Elite', 'Expert')
+ORDER BY f.ViewCount DESC, f.Score DESC, f.CreationDate DESC
+LIMIT 1000;

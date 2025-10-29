@@ -1,0 +1,215 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        CAST(ARRAY[t.TagName] AS text[]) AS TagPath,
+        1 AS Level,
+        t.ExcerptPostId,
+        t.WikiPostId
+    FROM Tags t
+    WHERE NOT EXISTS (
+        SELECT 1 FROM Tags t2 WHERE t2.WikiPostId = t.ExcerptPostId
+    )
+    UNION ALL
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        rth.TagPath || t.TagName,
+        rth.Level + 1,
+        t.ExcerptPostId,
+        t.WikiPostId
+    FROM Tags t
+    JOIN RecursiveTagHierarchy rth ON t.ExcerptPostId = rth.WikiPostId
+    WHERE rth.Level < 5
+),
+PostVoteScores AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        COALESCE(SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 WHEN vt.Name = 'DownMod' THEN -1 ELSE 0 END), 0) AS VoteScore,
+        COUNT(DISTINCT v.Id) FILTER (WHERE vt.Name = 'Favorite') AS FavoriteCount,
+        COUNT(DISTINCT c.Id) AS CommentCount
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    GROUP BY p.Id, p.PostTypeId, p.OwnerUserId
+),
+UserActivity AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersCount,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopPosts AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AcceptedAnswerId,
+        p.AnswerCount,
+        pv.VoteScore,
+        p.PostTypeId,
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS ScoreRank
+    FROM Posts p
+    LEFT JOIN PostVoteScores pv ON pv.Id = p.Id
+    WHERE p.PostTypeId IN (1, 2)
+),
+DuplicatesWithOriginals AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate,
+        lt.Name AS LinkTypeName,
+        po.Title AS OriginalTitle,
+        p.Title AS DuplicateTitle
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId AND lt.Name = 'Duplicate'
+    JOIN Posts p ON p.Id = pl.PostId
+    JOIN Posts po ON po.Id = pl.RelatedPostId
+),
+UserBadgesWithLatest AS (
+    SELECT
+        b.UserId,
+        b.Name AS BadgeName,
+        b.Class,
+        b.TagBased,
+        b.Date,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC) AS LatestBadgeRank
+    FROM Badges b
+),
+QuestionsWithCloseReason AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.ClosedDate,
+        crt.Name AS CloseReason,
+        ph.Comment AS CloseReasonCode
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+    LEFT JOIN CloseReasonTypes crt ON CAST(crt.Id AS varchar) = ph.Comment
+    WHERE p.PostTypeId = 1
+),
+RankedAnswers AS (
+    SELECT
+        a.Id,
+        a.ParentId,
+        a.Score,
+        a.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+),
+AnswerSummary AS (
+    SELECT
+        r.AnswerRank,
+        COUNT(*) AS CountByRank
+    FROM RankedAnswers r
+    WHERE r.AnswerRank <= 5
+    GROUP BY r.AnswerRank
+),
+RecentEditors AS (
+    SELECT
+        ph.PostId,
+        u.DisplayName,
+        ph.CreationDate,
+        ph.PostHistoryTypeId,
+        ph.Comment,
+        ph.UserId
+    FROM PostHistory ph
+    LEFT JOIN Users u ON u.Id = ph.UserId
+    WHERE ph.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '30 day')
+    ORDER BY ph.CreationDate DESC
+    LIMIT 1000
+)
+
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.BadgeCount,
+    u.QuestionsCount,
+    u.AnswersCount,
+    u.ReputationRank,
+    tb.BadgeName,
+    tb.Class AS BadgeClass,
+    tb.TagBased,
+    t.Title AS TopQuestionTitle,
+    t.Score AS TopQuestionScore,
+    t2.Title AS TopAnswerTitle,
+    t2.Score AS TopAnswerScore,
+    q.CloseReason,
+    q.ClosedDate,
+    AVG(COALESCE(pv.VoteScore * NULLIF(COALESCE(pv.VoteScore,0), 0), 0) * 1.0) OVER (PARTITION BY u.Id) AS AvgWeightedScore,
+    array_to_string(rth.TagPath, ' > ') AS TagHierarchyPath,
+    (COALESCE(u.Location, 'Unknown') || ' | ' || COALESCE(u.WebsiteUrl, 'NoWebsite')) AS UserLocationWebsite,
+    CASE
+        WHEN u.LastAccessDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '7 day') THEN 'Active Recently'
+        WHEN u.LastAccessDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 day') THEN 'Less Active'
+        ELSE 'Inactive'
+    END AS ActivityStatus,
+    (SELECT COUNT(*) FROM Comments c2 WHERE c2.UserId = u.Id AND c2.CreationDate > CAST('2024-10-01' AS date) - INTERVAL '90 day') AS RecentCommentsCount,
+    da.CountByRank,
+    re.DisplayName AS RecentEditor,
+    re.CreationDate AS RecentEditDate,
+    CASE WHEN EXISTS (
+        SELECT 1 FROM Posts pdup WHERE pdup.AcceptedAnswerId = t2.Id
+    ) THEN 'Accepted Answer' ELSE 'Unaccepted' END AS AcceptedStatus
+FROM
+    UserActivity u
+    LEFT JOIN UserBadgesWithLatest tb ON tb.UserId = u.Id AND tb.LatestBadgeRank = 1
+    LEFT JOIN TopPosts t ON t.OwnerUserId = u.Id AND t.PostTypeId = 1 AND t.ScoreRank = 1
+    LEFT JOIN TopPosts t2 ON t2.OwnerUserId = u.Id AND t2.PostTypeId = 2 AND t2.ScoreRank = 1
+    LEFT JOIN PostVoteScores pv ON pv.Id = COALESCE(t.Id, t2.Id, pv.Id)
+    LEFT JOIN RecursiveTagHierarchy rth ON rth.Level = 1
+    LEFT JOIN QuestionsWithCloseReason q ON q.Id = t.Id
+    LEFT JOIN AnswerSummary da ON da.AnswerRank = 1
+    LEFT JOIN RecentEditors re ON re.UserId = u.Id
+WHERE u.Reputation > 1000
+GROUP BY
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.BadgeCount,
+    u.QuestionsCount,
+    u.AnswersCount,
+    u.ReputationRank,
+    tb.BadgeName,
+    tb.Class,
+    tb.TagBased,
+    t.Title,
+    t.Score,
+    t2.Title,
+    t2.Score,
+    q.CloseReason,
+    q.ClosedDate,
+    array_to_string(rth.TagPath, ' > '),
+    (COALESCE(u.Location, 'Unknown') || ' | ' || COALESCE(u.WebsiteUrl, 'NoWebsite')),
+    CASE
+        WHEN u.LastAccessDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '7 day') THEN 'Active Recently'
+        WHEN u.LastAccessDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 day') THEN 'Less Active'
+        ELSE 'Inactive'
+    END,
+    (SELECT COUNT(*) FROM Comments c2 WHERE c2.UserId = u.Id AND c2.CreationDate > CAST('2024-10-01' AS date) - INTERVAL '90 day'),
+    da.CountByRank,
+    re.DisplayName,
+    re.CreationDate
+ORDER BY u.ReputationRank
+LIMIT 100;

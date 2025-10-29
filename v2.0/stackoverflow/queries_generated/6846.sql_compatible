@@ -1,0 +1,46 @@
+SELECT 
+    u.DisplayName, 
+    u.Reputation,
+    COUNT(DISTINCT v.PostId) AS TotalVotes,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id ELSE NULL END) AS TotalQuestions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id ELSE NULL END) AS TotalAnswers,
+    MAX(p.Score) AS HighestScoredPost,
+    MIN(p.CreationDate) AS FirstPost,
+    MAX(p.LastActivityDate) AS LastActive,
+    b.Class,
+    b.TagBased,
+    ph.RevisionGUID,
+    ph.CreationDate AS LastRevision,
+    COALESCE(pl.RelatedPostId, -1) AS LinkedPostId
+FROM 
+    Users u
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+LEFT JOIN 
+    (
+     SELECT ph_inner.PostId, ph_inner.RevisionGUID, ph_inner.CreationDate
+     FROM PostHistory ph_inner
+     WHERE ph_inner.PostHistoryTypeId IN (1, 2, 5, 6, 10, 11, 12, 13, 14, 15, 19, 20, 35)
+     ORDER BY ph_inner.CreationDate DESC
+     LIMIT 1
+    ) ph ON u.Id = ph.PostId
+LEFT JOIN 
+    (
+     SELECT pl_inner.PostId, pl_inner.RelatedPostId
+     FROM PostLinks pl_inner
+     WHERE pl_inner.LinkTypeId = 1
+    ) pl ON u.Id = pl.PostId
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Votes v ON u.Id = v.UserId
+WHERE 
+    (u.Reputation > 10000 OR u.Reputation IS NULL)
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation, b.Id, b.Class, b.TagBased, ph.RevisionGUID, ph.CreationDate, pl.RelatedPostId
+ORDER BY 
+    u.Reputation DESC, 
+    TotalVotes DESC;

@@ -1,0 +1,133 @@
+WITH
+RecentHot AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.CommentCount,
+    p.AnswerCount,
+    ROW_NUMBER() OVER (ORDER BY p.ViewCount DESC, p.Score DESC, p.CreationDate DESC) AS rn
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+TagAnalytics AS (
+  SELECT
+    t.TagName,
+    tg.Count AS TagCount,
+    AVG(p.Score) AS AvgPostScore,
+    MAX(p.ViewCount) AS MaxViews,
+    MIN(p.ViewCount) AS MinViews,
+    COUNT(*) AS PostsInTag
+  FROM Tags tg
+  JOIN LATERAL (
+    SELECT *
+    FROM Posts p
+    WHERE p.Id = tg.ExcerptPostId
+  ) p ON true
+  CROSS JOIN LATERAL (
+    WITH RECURSIVE split_cte(pos, rest, value) AS (
+      SELECT
+        1 AS pos,
+        REPLACE(p.Tags, '<', '') AS rest,
+        CAST(NULL AS text) AS value
+      UNION ALL
+      SELECT
+        pos + 1,
+        CASE
+          WHEN POSITION('>' IN rest) > 0 THEN SUBSTRING(rest FROM POSITION('>' IN rest) + 1)
+          ELSE ''
+        END,
+        CASE
+          WHEN POSITION('>' IN rest) > 0 THEN TRIM(SUBSTRING(rest FROM 1 FOR POSITION('>' IN rest) - 1))
+          WHEN rest <> '' THEN TRIM(rest)
+          ELSE NULL
+        END
+      FROM split_cte
+      WHERE rest <> ''
+    )
+    SELECT value AS TagName
+    FROM split_cte
+    WHERE value IS NOT NULL
+  ) t
+  WHERE t.TagName <> ''
+  GROUP BY t.TagName, tg.Count
+),
+Hist AS (
+  SELECT
+    ht.Id AS HistoryId,
+    ht.PostId,
+    ht.PostHistoryTypeId,
+    ht.CreationDate,
+    ht.Text,
+    ht.Comment,
+    ht.UserId
+  FROM PostHistory ht
+  WHERE ht.PostHistoryTypeId IN (10, 16, 52, 53)
+),
+UserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY u.LastAccessDate DESC) AS rn
+  FROM Users u
+),
+Combined AS (
+  SELECT
+    h.PostId,
+    h.PostHistoryTypeId,
+    h.CreationDate AS HistoryDate,
+    u.UserId,
+    u.DisplayName AS EditorName,
+    u.Reputation,
+    p.Title,
+    p.Tags,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId
+  FROM Hist h
+  LEFT JOIN Posts p ON p.Id = h.PostId
+  LEFT JOIN UserActivity u ON u.UserId = h.UserId
+  WHERE h.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year') AND (CAST('2024-10-01 12:34:56' AS TIMESTAMP) IS NOT NULL)
+)
+SELECT
+  r.PostId,
+  r.Title,
+  r.Tags,
+  r.Score,
+  r.ViewCount,
+  r.CreationDate,
+  r.OwnerUserId,
+  r.LastActivityDate,
+  r.CommentCount,
+  r.AnswerCount,
+  a.TagName AS TopTag,
+  a.AvgPostScore,
+  a.MaxViews,
+  a.MinViews,
+  u.DisplayName AS LastEditor,
+  u.Reputation AS EditorReputation,
+  v.VoteCount
+FROM RecentHot r
+LEFT JOIN LATERAL (
+  SELECT ta.TagName,
+         ta.TagCount AS Count,
+         ta.TagCount * 1.0 / NULLIF((SELECT SUM(tg.Count) FROM Tags tg), 0) AS TagShare
+  FROM TagAnalytics ta
+  ORDER BY ta.TagCount DESC
+  LIMIT 1
+) a ON true
+LEFT JOIN Votes v ON v.PostId = r.PostId
+LEFT JOIN Users u ON u.Id = r.OwnerUserId
+WHERE r.rn <= 100
+ORDER BY r.ViewCount DESC, r.Score DESC, r.CreationDate DESC;

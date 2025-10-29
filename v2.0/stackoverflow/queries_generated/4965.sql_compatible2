@@ -1,0 +1,127 @@
+WITH QuestionEdits AS (
+    SELECT
+        ph.PostId,
+        COUNT(ph.Id) AS TotalEdits,
+        MAX(ph.CreationDate) AS LastEditDate
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6)
+    GROUP BY ph.PostId
+),
+AnswerCounts AS (
+    SELECT
+        p.Id AS QuestionId,
+        COUNT(a.Id) AS AnswerCount
+    FROM Posts p
+    LEFT JOIN Posts a ON p.Id = a.ParentId AND a.PostTypeId = 2
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS TotalUpvotesReceived,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS TotalDownvotesReceived,
+        COALESCE(SUM(CASE WHEN c.Id IS NOT NULL THEN 1 ELSE 0 END), 0) AS CommentCount
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId AND v.VoteTypeId IN (2, 3)
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+HighReputationUsers AS (
+    SELECT UserId
+    FROM UserActivity
+    WHERE Reputation >= 5000
+),
+TopQuestions AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount AS UndeletedAnswerCount,
+        ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.ViewCount DESC) AS Rank
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.ClosedDate IS NULL
+),
+QuestionMetadata AS (
+    SELECT
+        q.QuestionId,
+        q.Title,
+        q.Score,
+        q.ViewCount,
+        q.UndeletedAnswerCount,
+        qe.TotalEdits,
+        qe.LastEditDate,
+        ac.AnswerCount AS TotalAnswers,
+        COALESCE(pht.VoteCount, 0) AS CloseVoteCount,
+        CASE WHEN q.Score > 1000 THEN 'High Score' WHEN q.ViewCount > 10000 THEN 'High View' ELSE 'Standard' END AS QuestionCategory,
+        STRING_AGG(pt.Name, ', ') AS PostTypeNames,
+        q.Rank
+    FROM TopQuestions q
+    LEFT JOIN QuestionEdits qe ON q.QuestionId = qe.PostId
+    LEFT JOIN AnswerCounts ac ON q.QuestionId = ac.QuestionId
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS VoteCount
+        FROM PostHistory
+        WHERE PostHistoryTypeId = 10
+        GROUP BY PostId
+    ) pht ON q.QuestionId = pht.PostId
+    LEFT JOIN Posts p ON q.QuestionId = p.Id
+    LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    GROUP BY q.QuestionId, q.Title, q.Score, q.ViewCount, q.UndeletedAnswerCount, qe.TotalEdits, qe.LastEditDate, ac.AnswerCount, pht.VoteCount, q.Rank
+)
+SELECT
+    qm.QuestionId,
+    qm.Title,
+    qm.Score,
+    qm.ViewCount,
+    qm.UndeletedAnswerCount,
+    qm.TotalAnswers,
+    qm.TotalEdits,
+    qm.LastEditDate,
+    qm.CloseVoteCount,
+    qm.QuestionCategory,
+    qm.PostTypeNames,
+    ua.DisplayName AS OwnerDisplayName,
+    ua.Reputation AS OwnerReputation,
+    ua.TotalUpvotesReceived AS OwnerUpvotesReceived,
+    ua.TotalDownvotesReceived AS OwnerDownvotesReceived,
+    ua.CommentCount AS OwnerCommentCount,
+    CASE WHEN hr.UserId IS NOT NULL THEN 'Yes' ELSE 'No' END AS IsHighReputationOwner,
+    qm.Rank
+FROM QuestionMetadata qm
+LEFT JOIN Users owner ON owner.Id = (SELECT OwnerUserId FROM Posts WHERE Id = qm.QuestionId)
+LEFT JOIN UserActivity ua ON owner.Id = ua.UserId
+LEFT JOIN HighReputationUsers hr ON ua.UserId = hr.UserId
+WHERE qm.Rank <= 100
+
+UNION ALL
+
+SELECT
+    CAST(NULL AS BIGINT) AS QuestionId,
+    'Average Metrics' AS Title,
+    AVG(CAST(qm.Score AS NUMERIC)) AS Score,
+    AVG(CAST(qm.ViewCount AS NUMERIC)) AS ViewCount,
+    AVG(CAST(qm.UndeletedAnswerCount AS NUMERIC)) AS UndeletedAnswerCount,
+    AVG(CAST(qm.TotalAnswers AS NUMERIC)) AS TotalAnswers,
+    AVG(CAST(qm.TotalEdits AS NUMERIC)) AS TotalEdits,
+    CAST(NULL AS TIMESTAMP) AS LastEditDate,
+    AVG(CAST(qm.CloseVoteCount AS NUMERIC)) AS CloseVoteCount,
+    NULL AS QuestionCategory,
+    NULL AS PostTypeNames,
+    NULL AS OwnerDisplayName,
+    NULL AS OwnerReputation,
+    NULL AS OwnerUpvotesReceived,
+    NULL AS OwnerDownvotesReceived,
+    NULL AS OwnerCommentCount,
+    NULL AS IsHighReputationOwner,
+    NULL AS Rank
+FROM QuestionMetadata qm
+WHERE qm.Rank <= 100;

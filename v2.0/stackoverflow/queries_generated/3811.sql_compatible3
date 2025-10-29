@@ -1,0 +1,154 @@
+WITH
+    TopUsers AS (
+        SELECT
+            u.Id,
+            u.DisplayName,
+            u.Reputation,
+            COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+            COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+            COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesGiven,
+            SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesGiven,
+            ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank
+        FROM Users u
+        LEFT JOIN Badges b ON b.UserId = u.Id
+        LEFT JOIN Votes v  ON v.UserId = u.Id
+        GROUP BY u.Id, u.DisplayName, u.Reputation
+    ),
+    RecentPosts AS (
+        SELECT
+            p.Id,
+            p.Title,
+            p.CreationDate,
+            p.OwnerUserId,
+            p.Score,
+            p.ViewCount,
+            p.AnswerCount,
+            p.FavoriteCount,
+            p.Tags,
+            p.AcceptedAnswerId,
+            ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+    ),
+    TagStats AS (
+        SELECT
+            t.TagName,
+            t.Count AS TagUseCount,
+            COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+            AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS AvgQuestionScore,
+            MAX(p.CreationDate) AS LastQuestionDate
+        FROM Tags t
+        LEFT JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+        GROUP BY t.TagName, t.Count
+    ),
+    LatestCloseReason AS (
+        SELECT
+            ph.PostId,
+            ph.Comment AS CloseReason,
+            ph.CreationDate AS ClosedOn,
+            ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+        FROM PostHistory ph
+        WHERE ph.PostHistoryTypeId = 10
+    ),
+    TopUsersWithPost AS (
+        SELECT
+            tu.RepRank,
+            tu.DisplayName,
+            tu.Reputation,
+            tu.GoldBadges,
+            tu.SilverBadges,
+            tu.BronzeBadges,
+            COALESCE(tu.UpVotesGiven,0) - COALESCE(tu.DownVotesGiven,0) AS VoteBalance,
+            rp.Id AS PostId,
+            rp.Title,
+            rp.CreationDate,
+            rp.Score,
+            rp.ViewCount,
+            rp.AnswerCount,
+            rp.FavoriteCount,
+            rp.Tags,
+            rp.AcceptedAnswerId,
+            COALESCE(lcr.CloseReason,'Not Closed') AS CloseReason,
+            t.TagName,
+            ts.TagUseCount,
+            ts.QuestionCount,
+            ROUND(CAST(ts.AvgQuestionScore AS DECIMAL),2) AS AvgQuestionScore,
+            ts.LastQuestionDate,
+            CASE
+                WHEN rp.AnswerCount = 0 THEN 'Unanswered'
+                WHEN rp.AcceptedAnswerId IS NOT NULL THEN 'Answered & Accepted'
+                ELSE 'Answered'
+            END AS AnswerStatus,
+            (SELECT COUNT(*) FROM Comments c WHERE c.PostId = rp.Id AND c.Score > 0) AS PositiveCommentCount
+        FROM TopUsers tu
+        LEFT JOIN RecentPosts rp ON rp.OwnerUserId = tu.Id AND rp.rn = 1
+        LEFT JOIN LatestCloseReason lcr ON lcr.PostId = rp.Id AND lcr.rn = 1
+        LEFT JOIN LATERAL (
+            SELECT TRIM(BOTH '<>' FROM UNNEST(string_to_array(rp.Tags, '><'))) AS TagName
+        ) t ON rp.Tags IS NOT NULL
+        LEFT JOIN TagStats ts ON ts.TagName = t.TagName
+        WHERE tu.RepRank <= 100
+    ),
+    FinalTop AS (
+        SELECT
+            RepRank,
+            DisplayName,
+            Reputation,
+            GoldBadges,
+            SilverBadges,
+            BronzeBadges,
+            VoteBalance,
+            Title,
+            CreationDate,
+            Score,
+            ViewCount,
+            AnswerCount,
+            FavoriteCount,
+            Tags,
+            CloseReason,
+            TagName,
+            TagUseCount,
+            QuestionCount,
+            AvgQuestionScore,
+            LastQuestionDate,
+            AnswerStatus,
+            PositiveCommentCount
+        FROM TopUsersWithPost
+    ),
+    LowReputationUsers AS (
+        SELECT
+            CAST(NULL AS INTEGER) AS RepRank,
+            u.DisplayName,
+            u.Reputation,
+            CAST(NULL AS INTEGER) AS GoldBadges,
+            CAST(NULL AS INTEGER) AS SilverBadges,
+            CAST(NULL AS INTEGER) AS BronzeBadges,
+            CAST(NULL AS INTEGER) AS VoteBalance,
+            CAST(NULL AS VARCHAR) AS Title,
+            CAST(NULL AS TIMESTAMP) AS CreationDate,
+            CAST(NULL AS INTEGER) AS Score,
+            CAST(NULL AS INTEGER) AS ViewCount,
+            CAST(NULL AS INTEGER) AS AnswerCount,
+            CAST(NULL AS INTEGER) AS FavoriteCount,
+            CAST(NULL AS VARCHAR) AS Tags,
+            CAST(NULL AS VARCHAR) AS CloseReason,
+            CAST(NULL AS VARCHAR) AS TagName,
+            CAST(NULL AS INTEGER) AS TagUseCount,
+            CAST(NULL AS INTEGER) AS QuestionCount,
+            CAST(NULL AS DECIMAL) AS AvgQuestionScore,
+            CAST(NULL AS TIMESTAMP) AS LastQuestionDate,
+            CAST(NULL AS VARCHAR) AS AnswerStatus,
+            CAST(NULL AS INTEGER) AS PositiveCommentCount
+        FROM Users u
+        WHERE u.Reputation < 100
+        ORDER BY u.DisplayName DESC
+        LIMIT 10
+    )
+
+SELECT * FROM FinalTop
+ORDER BY RepRank, CreationDate DESC
+
+UNION ALL
+
+SELECT * FROM LowReputationUsers;

@@ -1,0 +1,404 @@
+WITH UserPostStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        COUNT(p.Id) AS TotalPosts,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS Questions,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS Answers,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS TotalQuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS TotalAnswerScore,
+        MAX(p.CreationDate) AS LatestPostDate,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END) AS AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE NULL END) AS AvgAnswerScore,
+        STRING_AGG(CASE WHEN p.PostTypeId = 1 THEN p.Title ELSE NULL END, '; ') AS QuestionTitles,
+        STRING_AGG(CASE WHEN p.PostTypeId = 2 THEN p.Body ELSE NULL END, ' || ') AS AnswerBodies,
+        RANK() OVER (ORDER BY COUNT(p.Id) DESC) AS PostRank,
+        RANK() OVER (ORDER BY SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) DESC) AS QuestionScoreRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.CreationDate >= TIMESTAMP '2010-01-01 00:00:00'
+      AND u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        Views,
+        TotalPosts,
+        Questions,
+        Answers,
+        TotalQuestionScore,
+        TotalAnswerScore,
+        LatestPostDate,
+        AvgQuestionScore,
+        AvgAnswerScore,
+        QuestionTitles,
+        AnswerBodies,
+        PostRank,
+        QuestionScoreRank
+    FROM UserPostStats
+    WHERE TotalPosts >= 100
+),
+UserBadges AS (
+    SELECT 
+        b.UserId,
+        COUNT(b.Id) AS TotalBadges,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        STRING_AGG(b.Name, ', ') AS BadgeNames,
+        STRING_AGG(CAST(b.Date AS VARCHAR), ', ') AS BadgeDates
+    FROM Badges b
+    GROUP BY b.UserId
+),
+PostComments AS (
+    SELECT 
+        c.PostId,
+        COUNT(c.Id) AS CommentCount,
+        STRING_AGG(c.Text, ' [SEP] ') AS CommentTexts,
+        MAX(c.CreationDate) AS LatestCommentDate,
+        MIN(c.CreationDate) AS FirstCommentDate
+    FROM Comments c
+    GROUP BY c.PostId
+),
+QuestionStats AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        p.AcceptedAnswerId,
+        COALESCE(p.AcceptedAnswerId, 0) AS EffectiveAnswerId,
+        CASE 
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 
+            WHEN p.AnswerCount > 0 THEN 0 
+            ELSE 2 
+        END AS QuestionStatus,
+        -- convert tags like '<a><b>' into array by trimming first and last char then splitting by '><'
+        (CASE WHEN p.Tags IS NOT NULL THEN STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2), '><') ELSE NULL END) AS TagArray,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed' 
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned' 
+            ELSE 'Open' 
+        END AS PostStatus,
+        COALESCE(
+            (SELECT COUNT(*) 
+             FROM PostHistory ph 
+             WHERE ph.PostId = p.Id 
+               AND ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 22, 31, 33, 34, 35, 36, 37, 38, 50, 52, 53, 66)
+            ), 0
+        ) AS HistoryEventsCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+AnswerStats AS (
+    SELECT 
+        p.Id AS AnswerId,
+        p.ParentId AS QuestionId,
+        p.Score,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Body,
+        p.LastEditDate,
+        CASE 
+            WHEN p.OwnerUserId IS NULL THEN 'Deleted User' 
+            ELSE 'Active User' 
+        END AS UserStatus,
+        CHAR_LENGTH(p.Body) AS BodyLength,
+        COALESCE(
+            (SELECT COUNT(*) 
+             FROM Votes v 
+             WHERE v.PostId = p.Id 
+               AND v.VoteTypeId IN (2, 3)
+            ), 0
+        ) AS VoteCount,
+        DENSE_RANK() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC) AS AnswerRankByScore
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+),
+AnswerVoting AS (
+    SELECT 
+        av.AnswerId,
+        av.QuestionId,
+        av.Score,
+        av.CreationDate,
+        av.OwnerUserId,
+        av.UserStatus,
+        av.BodyLength,
+        av.VoteCount,
+        av.AnswerRankByScore,
+        AVG(av.Score) OVER (PARTITION BY av.QuestionId) AS AvgScorePerQuestion,
+        MAX(av.CreationDate) OVER (PARTITION BY av.QuestionId) AS LastAnswerDatePerQuestion,
+        CASE 
+            WHEN av.VoteCount > 0 THEN (av.Score * 100.0 / NULLIF(av.VoteCount, 0)) 
+            ELSE 0 
+        END AS ScorePerVote,
+        CASE 
+            WHEN av.AnswerRankByScore = 1 THEN 1 
+            ELSE 0 
+        END AS IsTopAnswer
+    FROM AnswerStats av
+),
+QuestionDetailWithAnswers AS (
+    SELECT 
+        qs.QuestionId,
+        qs.Title,
+        qs.Score,
+        qs.ViewCount,
+        qs.AnswerCount,
+        qs.CommentCount,
+        qs.CreationDate,
+        qs.OwnerUserId,
+        qs.Tags,
+        qs.AcceptedAnswerId,
+        qs.QuestionStatus,
+        qs.PostStatus,
+        qs.HistoryEventsCount,
+        STRING_AGG(CASE WHEN av.AnswerId IS NOT NULL THEN CAST(av.AnswerId AS VARCHAR) ELSE NULL END, ', ') AS AnswerIds,
+        COUNT(av.AnswerId) AS TotalAnswers,
+        SUM(av.Score) AS TotalAnswerScore,
+        AVG(av.Score) AS AvgAnswerScore,
+        STRING_AGG(CASE WHEN av.AnswerId IS NOT NULL THEN CAST(av.BodyLength AS VARCHAR) ELSE NULL END, ', ') AS AnswerLengths,
+        STRING_AGG(CASE WHEN av.IsTopAnswer = 1 THEN CAST(av.AnswerId AS VARCHAR) ELSE NULL END, ', ') AS TopAnswers,
+        MAX(av.CreationDate) AS LatestAnswerDate,
+        COALESCE(MAX(ac.CommentCount), 0) AS TotalComments
+    FROM QuestionStats qs
+    LEFT JOIN AnswerVoting av ON qs.QuestionId = av.QuestionId
+    LEFT JOIN PostComments ac ON qs.QuestionId = ac.PostId
+    GROUP BY qs.QuestionId, qs.Title, qs.Score, qs.ViewCount, qs.AnswerCount, qs.CommentCount, qs.CreationDate, qs.OwnerUserId, qs.Tags, qs.AcceptedAnswerId, qs.QuestionStatus, qs.PostStatus, qs.HistoryEventsCount
+),
+UserActivitySummary AS (
+    SELECT 
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.Views,
+        tu.TotalPosts,
+        tu.Questions,
+        tu.Answers,
+        tu.TotalQuestionScore,
+        tu.TotalAnswerScore,
+        tu.LatestPostDate,
+        tu.AvgQuestionScore,
+        tu.AvgAnswerScore,
+        tu.QuestionTitles,
+        tu.AnswerBodies,
+        tu.PostRank,
+        tu.QuestionScoreRank,
+        ub.TotalBadges,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ub.BadgeNames,
+        ub.BadgeDates,
+        CASE 
+            WHEN ub.TotalBadges > 0 THEN 
+                DENSE_RANK() OVER (ORDER BY ub.TotalBadges DESC) 
+            ELSE 0 
+        END AS BadgeRank
+    FROM TopUsers tu
+    LEFT JOIN UserBadges ub ON tu.UserId = ub.UserId
+),
+AggregateStats AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.Views,
+        uas.TotalPosts,
+        uas.Questions,
+        uas.Answers,
+        uas.TotalQuestionScore,
+        uas.TotalAnswerScore,
+        uas.LatestPostDate,
+        uas.AvgQuestionScore,
+        uas.AvgAnswerScore,
+        uas.QuestionTitles,
+        uas.AnswerBodies,
+        uas.PostRank,
+        uas.QuestionScoreRank,
+        uas.TotalBadges,
+        uas.GoldBadges,
+        uas.SilverBadges,
+        uas.BronzeBadges,
+        uas.BadgeNames,
+        uas.BadgeDates,
+        uas.BadgeRank,
+        qs.QuestionId,
+        qs.Title,
+        qs.Score AS QuestionScore,
+        qs.AnswerCount,
+        qs.CommentCount,
+        qs.ViewCount,
+        qs.CreationDate AS QuestionCreationDate,
+        qs.PostStatus,
+        qs.HistoryEventsCount,
+        qs.AnswerIds,
+        qs.TotalAnswers,
+        qs.TotalAnswerScore,
+        qs.AvgAnswerScore AS AvgAnswerScoreFromQ,
+        qs.LatestAnswerDate,
+        qs.TotalComments,
+        CASE 
+            WHEN qs.TotalAnswers > 0 THEN 
+                COALESCE(
+                    (SELECT AVG(av.Score) 
+                     FROM AnswerVoting av 
+                     WHERE av.QuestionId = qs.QuestionId), 0
+                ) 
+            ELSE 0 
+        END AS AvgAnswerScoreFromSubquery,
+        -- ensure any column referenced later exists here; placeholder Points to avoid undefined reference
+        0 AS Points
+    FROM UserActivitySummary uas
+    LEFT JOIN QuestionDetailWithAnswers qs ON uas.UserId = qs.OwnerUserId
+),
+FinalResultSet AS (
+    SELECT DISTINCT
+        ast.UserId,
+        ast.DisplayName,
+        ast.Reputation,
+        ast.Views,
+        ast.TotalPosts,
+        ast.Questions,
+        ast.Answers,
+        ast.TotalQuestionScore,
+        ast.TotalAnswerScore,
+        ast.LatestPostDate,
+        ast.AvgQuestionScore,
+        ast.AvgAnswerScore,
+        ast.QuestionTitles,
+        ast.AnswerBodies,
+        ast.PostRank,
+        ast.QuestionScoreRank,
+        ast.TotalBadges,
+        ast.GoldBadges,
+        ast.SilverBadges,
+        ast.BronzeBadges,
+        ast.BadgeNames,
+        ast.BadgeDates,
+        ast.BadgeRank,
+        ast.QuestionId,
+        ast.Title,
+        ast.QuestionScore,
+        ast.AnswerCount,
+        ast.CommentCount,
+        ast.ViewCount,
+        ast.QuestionCreationDate,
+        ast.PostStatus,
+        ast.HistoryEventsCount,
+        ast.AnswerIds,
+        ast.TotalAnswers,
+        ast.TotalAnswerScore,
+        ast.AvgAnswerScoreFromQ,
+        ast.LatestAnswerDate,
+        ast.TotalComments,
+        ast.AvgAnswerScoreFromSubquery,
+        CASE 
+            WHEN ast.TotalBadges > 100 THEN 'Elite' 
+            WHEN ast.TotalBadges > 50 THEN 'Veteran' 
+            WHEN ast.TotalBadges > 10 THEN 'Regular' 
+            ELSE 'Beginner' 
+        END AS BadgeTier,
+        CASE 
+            WHEN ast.QuestionScore > 1000 THEN 'Highly Active' 
+            WHEN ast.QuestionScore > 100 THEN 'Moderately Active' 
+            ELSE 'Low Activity' 
+        END AS ActivityLevel,
+        -- use standard SQL date diff via EXTRACT epoch in seconds converted to days for portability if DATEDIFF not available; here keep portable form for many DBs using (date - date)
+        CAST((CAST(TIMESTAMP '2024-10-01 12:34:56' AS TIMESTAMP) - ast.QuestionCreationDate) AS INTERVAL) AS _interval_since_question,
+        -- compute DaysSinceQuestion as days from interval; some DBs require EXTRACT(DAY FROM ...)
+        COALESCE(EXTRACT(DAY FROM (CAST(TIMESTAMP '2024-10-01 12:34:56' AS TIMESTAMP) - ast.QuestionCreationDate)), 0) AS DaysSinceQuestion,
+        CASE 
+            WHEN (ast.AnswerCount > 5 AND ast.AnswerCount < 20) THEN 'Moderate' 
+            WHEN ast.AnswerCount >= 20 THEN 'Very Active' 
+            ELSE 'Not Active' 
+        END AS AnswerActivity,
+        CASE 
+            WHEN ast.ViewCount > 1000 THEN 'High View' 
+            WHEN ast.ViewCount > 100 THEN 'Moderate View' 
+            ELSE 'Low View' 
+        END AS ViewLevel,
+        ast.Points
+    FROM AggregateStats ast
+    WHERE ast.QuestionId IS NOT NULL
+)
+SELECT 
+    frs.UserId,
+    frs.DisplayName,
+    frs.Reputation,
+    frs.Views,
+    frs.TotalPosts,
+    frs.Questions,
+    frs.Answers,
+    frs.TotalQuestionScore,
+    frs.TotalAnswerScore,
+    frs.LatestPostDate,
+    frs.AvgQuestionScore,
+    frs.AvgAnswerScore,
+    CASE 
+        WHEN CHAR_LENGTH(frs.QuestionTitles) > 300 THEN SUBSTRING(frs.QuestionTitles FROM 1 FOR 300) || '...' 
+        ELSE frs.QuestionTitles 
+    END AS ShortQuestionTitles,
+    CASE 
+        WHEN CHAR_LENGTH(frs.AnswerBodies) > 500 THEN SUBSTRING(frs.AnswerBodies FROM 1 FOR 500) || '...' 
+        ELSE frs.AnswerBodies 
+    END AS ShortAnswerBodies,
+    frs.PostRank,
+    frs.QuestionScoreRank,
+    frs.TotalBadges,
+    frs.GoldBadges,
+    frs.SilverBadges,
+    frs.BronzeBadges,
+    CASE 
+        WHEN CHAR_LENGTH(frs.BadgeNames) > 200 THEN SUBSTRING(frs.BadgeNames FROM 1 FOR 200) || '...' 
+        ELSE frs.BadgeNames 
+    END AS ShortBadgeNames,
+    frs.BadgeRank,
+    frs.QuestionId,
+    CASE 
+        WHEN CHAR_LENGTH(frs.Title) > 100 THEN SUBSTRING(frs.Title FROM 1 FOR 100) || '...' 
+        ELSE frs.Title 
+    END AS ShortTitle,
+    frs.QuestionScore,
+    frs.AnswerCount,
+    frs.CommentCount,
+    frs.ViewCount,
+    frs.QuestionCreationDate,
+    frs.PostStatus,
+    frs.HistoryEventsCount,
+    frs.AnswerIds,
+    frs.TotalAnswers,
+    frs.TotalAnswerScore,
+    frs.AvgAnswerScoreFromQ,
+    frs.LatestAnswerDate,
+    frs.TotalComments,
+    frs.AvgAnswerScoreFromSubquery,
+    frs.BadgeTier,
+    frs.ActivityLevel,
+    frs.DaysSinceQuestion,
+    frs.AnswerActivity,
+    frs.ViewLevel,
+    (frs.Reputation * frs.TotalPosts) AS ReputationScore,
+    (frs.Points * 1000 / NULLIF(frs.TotalPosts, 0)) AS ScorePerPost,
+    CASE 
+        WHEN frs.BadgeRank <= 10 THEN 'Top 10' 
+        WHEN frs.BadgeRank <= 50 THEN 'Top 50' 
+        WHEN frs.BadgeRank <= 100 THEN 'Top 100' 
+        ELSE 'Other' 
+    END AS BadgesGroup
+FROM FinalResultSet frs
+WHERE frs.Reputation > 50000
+  AND frs.TotalPosts > 50
+  AND frs.QuestionScore > 100
+ORDER BY frs.Reputation DESC, frs.TotalPosts DESC
+LIMIT 1000 OFFSET 500;

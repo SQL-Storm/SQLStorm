@@ -1,0 +1,191 @@
+WITH
+recent_user_activity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.AccountId,
+    ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY u.LastAccessDate DESC) AS rn
+  FROM Users u
+),
+top_tags AS (
+  SELECT
+    t.TagName,
+    t.Count,
+    ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS rn
+  FROM Tags t
+  WHERE t.IsModeratorOnly = FALSE
+),
+post_deltas AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.Title,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.Tags,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.FavoriteCount,
+    p.ContentLicense,
+    COALESCE(v2.VoteCount, 0) AS Upvotes,
+    COALESCE(v3.VoteCount, 0) AS Downvotes,
+    CASE
+      WHEN p.PostTypeId = 1 THEN 'Question'
+      WHEN p.PostTypeId = 2 THEN 'Answer'
+      ELSE 'Other'
+    END AS PostKind
+  FROM Posts p
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS VoteCount
+    FROM Votes
+    WHERE VoteTypeId = 2
+    GROUP BY PostId
+  ) v2 ON v2.PostId = p.Id
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS VoteCount
+    FROM Votes
+    WHERE VoteTypeId = 3
+    GROUP BY PostId
+  ) v3 ON v3.PostId = p.Id
+),
+complex_query AS (
+  SELECT
+    pr.PostId,
+    pr.PostTypeId,
+    pr.OwnerUserId,
+    pr.Title,
+    pr.CreationDate,
+    pr.LastActivityDate,
+    pr.Score,
+    pr.ViewCount,
+    pr.AnswerCount,
+    pr.CommentCount,
+    pr.Tags,
+    pr.ParentId,
+    pr.AcceptedAnswerId,
+    pr.FavoriteCount,
+    pr.ContentLicense,
+    pr.Upvotes,
+    pr.Downvotes,
+    CASE
+      WHEN pr.PostTypeId = 1 THEN 'Question'
+      WHEN pr.PostTypeId = 2 THEN 'Answer'
+      ELSE 'Other'
+    END AS PostKind,
+    u.DisplayName AS OwnerDisplayName,
+    u.Reputation,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    b.Name AS BadgeName,
+    bh.Id AS HistoryId,
+    bh.PostHistoryTypeId,
+    bh.CreationDate AS HistoryDate,
+    bh.Comment
+  FROM post_deltas pr
+  LEFT JOIN Users u ON pr.OwnerUserId = u.Id
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  LEFT JOIN PostHistory ph ON ph.PostId = pr.PostId
+  LEFT JOIN PostHistory bh ON bh.PostId = pr.PostId
+  WHERE
+    pr.ViewCount > 0
+    AND pr.Score >= 0
+    AND (ph.PostHistoryTypeId IS NULL OR ph.PostHistoryTypeId IN (1,4,5,6,10,16,24))
+    AND (bh.PostHistoryTypeId IS NULL OR bh.PostHistoryTypeId IN (10,16))
+),
+final_result AS (
+  SELECT
+    c.PostId,
+    c.PostTypeId,
+    c.OwnerUserId,
+    c.Title,
+    c.CreationDate,
+    c.LastActivityDate,
+    c.Score,
+    c.ViewCount,
+    c.AnswerCount,
+    c.CommentCount,
+    c.Tags,
+    c.ParentId,
+    c.AcceptedAnswerId,
+    c.FavoriteCount,
+    c.ContentLicense,
+    c.Upvotes,
+    c.Downvotes,
+    c.PostKind,
+    c.OwnerDisplayName,
+    c.Reputation,
+    c.LastAccessDate,
+    c.Views,
+    c.BadgeName,
+    c.HistoryId,
+    c.PostHistoryTypeId,
+    c.HistoryDate,
+    c.Comment
+  FROM complex_query c
+  WHERE
+    c.LastActivityDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180' DAY)
+    AND COALESCE(c.OwnerUserId, -1) <> -1
+),
+aggregate_tags AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS Occurrences
+  FROM Posts p,
+       UNNEST(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS t(TagName)
+  WHERE p.Tags IS NOT NULL
+  GROUP BY t.TagName
+),
+ranked_tags AS (
+  SELECT
+    a.TagName,
+    a.Occurrences,
+    ROW_NUMBER() OVER (ORDER BY a.Occurrences DESC, a.TagName) AS TagRank
+  FROM aggregate_tags a
+)
+SELECT
+  fr.PostId,
+  fr.PostTypeId,
+  fr.OwnerUserId,
+  fr.Title,
+  fr.CreationDate,
+  fr.LastActivityDate,
+  fr.Score,
+  fr.ViewCount,
+  fr.AnswerCount,
+  fr.CommentCount,
+  fr.Tags,
+  fr.ParentId,
+  fr.AcceptedAnswerId,
+  fr.FavoriteCount,
+  fr.ContentLicense,
+  fr.Upvotes,
+  fr.Downvotes,
+  fr.PostKind,
+  fr.OwnerDisplayName,
+  fr.Reputation,
+  fr.LastAccessDate,
+  fr.Views,
+  fr.BadgeName,
+  fr.HistoryId,
+  fr.PostHistoryTypeId,
+  fr.HistoryDate,
+  fr.Comment,
+  rt.TagRank,
+  rt.TagName AS TopTagged
+FROM final_result fr
+LEFT JOIN ranked_tags rt ON true
+ORDER BY fr.LastActivityDate DESC, fr.Score DESC
+LIMIT 100;

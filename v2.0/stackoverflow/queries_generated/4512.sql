@@ -1,0 +1,156 @@
+-- {"query": "4512.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1669} 
+
+WITH
+  RankedAnswers AS (
+    SELECT
+      p.Id AS PostId,
+      p.ParentId AS QuestionId,
+      p.OwnerUserId AS AnswererUserId,
+      p.CreationDate AS AnswerCreationDate,
+      ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS Rank,
+      CASE
+        WHEN p.AcceptedAnswerId = p.Id THEN 1
+        ELSE 0
+      END AS IsAccepted,
+      SUM(CASE WHEN c.UserId = p.OwnerUserId THEN 1 ELSE 0 END) OVER (PARTITION BY p.ParentId, p.OwnerUserId) AS CommentCountByUser
+    FROM Posts AS p
+    LEFT JOIN Comments AS c
+      ON p.Id = c.PostId
+    WHERE
+      p.PostTypeId = 2 -- Answers
+    GROUP BY
+      p.Id,
+      p.ParentId,
+      p.OwnerUserId,
+      p.CreationDate,
+      p.Score,
+      p.AcceptedAnswerId
+  ),
+  QuestionMetadata AS (
+    SELECT
+      p.Id AS QuestionId,
+      p.OwnerUserId AS QuestionerUserId,
+      p.CreationDate AS QuestionCreationDate,
+      p.Score AS QuestionScore,
+      p.ViewCount AS QuestionViewCount,
+      p.AnswerCount AS QuestionAnswerCount,
+      p.FavoriteCount AS QuestionFavoriteCount,
+      p.ClosedDate,
+      pt.Name AS PostTypeName,
+      LENGTH(p.Title) AS TitleLength,
+      CASE
+        WHEN p.Tags IS NOT NULL THEN LENGTH(p.Tags) - LENGTH(REPLACE(p.Tags, '><', '')) + 1
+        ELSE 0
+      END AS TagCount,
+      UPPER(SUBSTRING(p.Title FROM 1 FOR 1)) || LOWER(SUBSTRING(p.Title FROM 2)) AS FormattedTitle,
+      COALESCE(u.DisplayName, p.OwnerDisplayName) AS OwnerDisplayName,
+      CASE WHEN p.ClosedDate IS NOT NULL AND p.ClosedDate > DATE('now', '-30 day') THEN 'Recently Closed' ELSE 'Open or Old' END AS ClosureStatus
+    FROM Posts AS p
+    JOIN PostTypes AS pt
+      ON p.PostTypeId = pt.Id
+    LEFT JOIN Users AS u
+      ON p.OwnerUserId = u.Id
+    WHERE
+      p.PostTypeId = 1 -- Questions
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      COUNT(DISTINCT ph.Id) AS PostHistoryCount,
+      SUM(CASE WHEN ph.PostHistoryTypeId IN (2, 5) THEN LENGTH(ph.Text) ELSE 0 END) AS TotalTextEditsLength,
+      MAX(ph.CreationDate) AS LastPostHistoryDate
+    FROM Users AS u
+    LEFT JOIN PostHistory AS ph
+      ON u.Id = ph.UserId
+    GROUP BY
+      u.Id
+  )
+SELECT
+  qm.QuestionId,
+  qm.FormattedTitle,
+  qm.QuestionScore,
+  qm.QuestionViewCount,
+  qm.QuestionFavoriteCount,
+  qm.QuestionAnswerCount,
+  qm.TagCount,
+  qm.ClosureStatus,
+  ra.Rank AS BestAnswerRank,
+  ra.AnswerCreationDate,
+  ra.CommentCountByUser,
+  CASE
+    WHEN ra.IsAccepted = 1 THEN 'Accepted'
+    WHEN ra.Rank <= 3 THEN 'Top ' || ra.Rank
+    ELSE 'Other'
+  END AS AnswerQuality,
+  DATEDIFF('day', qm.QuestionCreationDate, qm.ClosedDate) AS DaysToClose,
+  ua.PostHistoryCount,
+  ua.TotalTextEditsLength,
+  COALESCE(u.Reputation, 0) AS UserReputation,
+  CASE
+    WHEN qm.OwnerUserId IS NULL THEN 'Community'
+    WHEN ua.LastPostHistoryDate IS NOT NULL AND qm.QuestionCreationDate < ua.LastPostHistoryDate THEN 'Active Contributor'
+    ELSE 'Less Active'
+  END AS UserEngagementStatus
+FROM QuestionMetadata AS qm
+LEFT JOIN RankedAnswers AS ra
+  ON qm.QuestionId = ra.QuestionId AND ra.Rank = 1
+LEFT JOIN UserActivity AS ua
+  ON qm.QuestionerUserId = ua.UserId
+LEFT JOIN Users AS u
+  ON qm.OwnerUserId = u.Id
+WHERE
+  qm.QuestionScore > 5
+  AND qm.QuestionAnswerCount >= 1
+  AND qm.QuestionFavoriteCount > 0
+  AND qm.TitleLength > 10
+  AND qm.TagCount BETWEEN 2 AND 5
+  AND (qm.ClosedDate IS NULL OR qm.ClosedDate < qm.CreationDate) -- Ensure ClosedDate is after CreationDate if it exists
+  AND qm.PostTypeName = 'Question'
+  AND EXISTS (
+    SELECT
+      1
+    FROM PostLinks AS pl
+    WHERE
+      pl.PostId = qm.QuestionId AND pl.LinkTypeId = 3 -- Duplicate links
+  )
+UNION ALL
+SELECT
+  NULL AS QuestionId,
+  'Analysis Summary' AS FormattedTitle,
+  COUNT(DISTINCT qm.QuestionId) AS QuestionScore,
+  AVG(qm.QuestionViewCount) AS QuestionViewCount,
+  SUM(qm.QuestionFavoriteCount) AS QuestionFavoriteCount,
+  AVG(qm.QuestionAnswerCount) AS QuestionAnswerCount,
+  AVG(qm.TagCount) AS TagCount,
+  COUNT(DISTINCT CASE WHEN qm.ClosureStatus = 'Recently Closed' THEN qm.QuestionId ELSE NULL END) || ' Recently Closed' AS ClosureStatus,
+  COUNT(DISTINCT CASE WHEN ra.IsAccepted = 1 THEN qm.QuestionId ELSE NULL END) AS BestAnswerRank,
+  AVG(ra.AnswerCreationDate) AS AnswerCreationDate,
+  AVG(ra.CommentCountByUser) AS CommentCountByUser,
+  NULL AS AnswerQuality,
+  AVG(DATEDIFF('day', qm.QuestionCreationDate, qm.ClosedDate)) AS DaysToClose,
+  AVG(ua.PostHistoryCount) AS PostHistoryCount,
+  AVG(ua.TotalTextEditsLength) AS TotalTextEditsLength,
+  AVG(COALESCE(u.Reputation, 0)) AS UserReputation,
+  'Overall Average' AS UserEngagementStatus
+FROM QuestionMetadata AS qm
+LEFT JOIN RankedAnswers AS ra
+  ON qm.QuestionId = ra.QuestionId AND ra.Rank = 1
+LEFT JOIN UserActivity AS ua
+  ON qm.QuestionerUserId = ua.UserId
+LEFT JOIN Users AS u
+  ON qm.OwnerUserId = u.Id
+WHERE
+  qm.QuestionScore > 5
+  AND qm.QuestionAnswerCount >= 1
+  AND qm.QuestionFavoriteCount > 0
+  AND qm.TitleLength > 10
+  AND qm.TagCount BETWEEN 2 AND 5
+  AND (qm.ClosedDate IS NULL OR qm.ClosedDate < qm.CreationDate)
+  AND qm.PostTypeName = 'Question'
+  AND EXISTS (
+    SELECT
+      1
+    FROM PostLinks AS pl
+    WHERE
+      pl.PostId = qm.QuestionId AND pl.LinkTypeId = 3
+  );

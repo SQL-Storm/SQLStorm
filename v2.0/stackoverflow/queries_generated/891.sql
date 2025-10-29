@@ -1,0 +1,358 @@
+-- {"query": "891.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3669} 
+with
+-- recent active users with reputation tiers
+recent_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.location,
+    greatest(u.upvotes - coalesce(u.downvotes,0), 0) as net_votes,
+    case
+      when u.reputation >= 100000 then 'Legend'
+      when u.reputation >= 25000 then 'Elite'
+      when u.reputation >= 10000 then 'Pro'
+      when u.reputation >= 3000 then 'Advanced'
+      when u.reputation >= 1000 then 'Intermediate'
+      else 'Newbie'
+    end as rep_tier
+  from users u
+  where u.creationdate >= (select date_trunc('year', max(creationdate)) - interval '5 years' from users)
+),
+-- questions in the last N years with tag parsing and quality signals
+recent_questions as (
+  select
+    p.id as question_id,
+    p.owneruserid as user_id,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.title,
+    p.tags,
+    p.acceptedanswerid,
+    p.answercount,
+    -- normalize tags to lower and split
+    string_to_array(substring(p.tags, 2, length(p.tags)-2), '><') as tag_array,
+    (p.score * 2 + coalesce(p.viewcount,0) / 100)::numeric as quality_signal
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= (select date_trunc('year', max(creationdate)) - interval '5 years' from posts)
+),
+-- answers linked to those questions
+recent_answers as (
+  select a.id as answer_id, a.parentid as question_id, a.owneruserid as answerer_id, a.creationdate, a.score as answer_score
+  from posts a
+  where a.posttypeid = 2
+    and a.creationdate >= (select date_trunc('year', max(creationdate)) - interval '5 years' from posts)
+),
+-- votes aggregated per question with window distribution
+question_votes as (
+  select
+    v.postid as question_id,
+    v.votetypeid,
+    count(*) as vote_count,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) over (partition by v.postid) as upvotes_on_q,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) over (partition by v.postid) as downvotes_on_q,
+    min(v.creationdate) over (partition by v.postid) as first_vote_at,
+    max(v.creationdate) over (partition by v.postid) as last_vote_at
+  from votes v
+  where v.postid in (select question_id from recent_questions)
+  group by v.postid, v.votetypeid
+),
+-- comment activity per question
+question_comments as (
+  select
+    c.postid as question_id,
+    count(*) as comment_count,
+    sum(c.score) as comment_score_sum,
+    max(c.creationdate) as last_comment_at
+  from comments c
+  where c.postid in (select question_id from recent_questions)
+  group by c.postid
+),
+-- closure info via posthistory, with complex JSON/text and null logic
+closed_events as (
+  select
+    ph.postid as question_id,
+    ph.creationdate as closed_at,
+    nullif(ph.comment, '')::int as close_reason_id,
+    coalesce(crt.name, 'Unknown') as close_reason_name,
+    ph.text as raw_close_payload
+  from posthistory ph
+  left join closereasontypes crt on crt.id = nullif(ph.comment, '')::int
+  where ph.posthistorytypeid = 10
+),
+reopen_events as (
+  select ph.postid as question_id, ph.creationdate as reopened_at
+  from posthistory ph
+  where ph.posthistorytypeid = 11
+),
+-- duplicates via PostLinks (both sides)
+duplicates as (
+  select pl.postid as dup_id, pl.relatedpostid as original_id, pl.creationdate as linked_at
+  from postlinks pl
+  where pl.linktypeid = 3
+),
+-- tag popularity and metadata
+tag_meta as (
+  select
+    lower(t.tagname) as tagname,
+    t.count as post_count,
+    t.ismoderatoronly::int as is_mod_only,
+    t.isrequired::int as is_required
+  from tags t
+),
+-- explode tags for recent questions
+question_tags as (
+  select rq.question_id, lower(trim(tg)) as tagname
+  from recent_questions rq
+  cross join lateral unnest(rq.tag_array) as tg
+),
+-- badge achievements by user with time window and density
+badge_activity as (
+  select
+    b.userid,
+    count(*) as badges_total,
+    sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+    sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+    sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+    avg(extract(epoch from (lead(b.date) over (partition by b.userid order by b.date) - b.date))) as avg_secs_between_badges
+  from badges b
+  where b.date >= (select date_trunc('year', max(date)) - interval '5 years' from badges)
+  group by b.userid
+),
+-- user editing/maintenance actions via posthistory
+user_edit_actions as (
+  select
+    ph.userid as user_id,
+    count(*) filter (where ph.posthistorytypeid in (4,5,6)) as edits_made,
+    count(*) filter (where ph.posthistorytypeid in (24)) as suggested_applied,
+    count(*) filter (where ph.posthistorytypeid in (14,15)) as locks_toggles,
+    count(*) filter (where ph.posthistorytypeid in (12,13)) as delete_toggle
+  from posthistory ph
+  where ph.userid is not null
+    and ph.creationdate >= (select date_trunc('year', max(creationdate)) - interval '5 years' from posthistory)
+  group by ph.userid
+),
+-- compute question-level engagement metrics with windows and correlated subqueries
+question_engagement as (
+  select
+    rq.question_id,
+    rq.user_id,
+    rq.creationdate,
+    rq.title,
+    rq.score,
+    rq.viewcount,
+    rq.answercount,
+    rq.quality_signal,
+    coalesce(max(case when ca.answer_id is not null then 1 end) over (partition by rq.question_id), 0) as has_answers_flag,
+    (select count(*) from recent_answers ra where ra.question_id = rq.question_id and ra.answer_score > 0) as pos_answer_count,
+    (select count(*) from votes v where v.postid = rq.question_id and v.votetypeid = 2) as upvote_count,
+    (select count(*) from votes v where v.postid = rq.question_id and v.votetypeid = 3) as downvote_count
+  from recent_questions rq
+  left join recent_answers ca on ca.question_id = rq.question_id
+),
+-- bring in closure/duplicate/reopen details with precedence
+question_status as (
+  select
+    qe.question_id,
+    coalesce(closed.closed_at, timestamp 'epoch') as closed_at,
+    coalesce(reopen.reopened_at, timestamp 'epoch') as reopened_at,
+    case
+      when closed.closed_at is not null and (reopen.reopened_at is null or closed.closed_at > reopen.reopened_at) then 'Closed'
+      when reopen.reopened_at is not null and (closed.closed_at is null or reopen.reopened_at > closed.closed_at) then 'Reopened'
+      else 'OpenOrUnknown'
+    end as status,
+    dup.original_id as duplicate_of,
+    dup.linked_at as duplicate_linked_at,
+    closed.close_reason_id,
+    closed.close_reason_name
+  from question_engagement qe
+  left join closed_events closed on closed.question_id = qe.question_id
+  left join reopen_events reopen on reopen.question_id = qe.question_id
+  left join duplicates dup on dup.dup_id = qe.question_id
+),
+-- per-tag aggregates across the recent questions
+tag_rollup as (
+  select
+    qt.tagname,
+    count(distinct qt.question_id) as q_count,
+    avg(qe.score)::numeric as avg_q_score,
+    avg(qe.viewcount)::numeric as avg_q_views,
+    sum(qe.answercount) as total_answers,
+    sum(case when qs.status = 'Closed' then 1 else 0 end) as closed_qs,
+    sum(case when qs.duplicate_of is not null then 1 else 0 end) as duplicate_qs
+  from question_tags qt
+  join question_engagement qe on qe.question_id = qt.question_id
+  left join question_status qs on qs.question_id = qt.question_id
+  group by qt.tagname
+),
+-- normalize per user with window stats
+user_activity as (
+  select
+    ru.user_id,
+    ru.displayname,
+    ru.rep_tier,
+    ru.reputation,
+    ru.location,
+    ru.net_votes,
+    coalesce(ba.badges_total,0) as badges_total,
+    coalesce(ba.gold_badges,0) as gold_badges,
+    coalesce(ba.silver_badges,0) as silver_badges,
+    coalesce(ba.bronze_badges,0) as bronze_badges,
+    ba.avg_secs_between_badges,
+    coalesce(ue.edits_made,0) as edits_made,
+    coalesce(ue.suggested_applied,0) as suggested_edits_applied,
+    coalesce(ue.locks_toggles,0) as locks_toggles,
+    coalesce(ue.delete_toggle,0) as delete_toggle
+  from recent_users ru
+  left join badge_activity ba on ba.userid = ru.user_id
+  left join user_edit_actions ue on ue.user_id = ru.user_id
+),
+-- user-question join for authorship and aggregate performance
+authored_questions as (
+  select
+    qe.*,
+    us.displayname,
+    us.rep_tier,
+    us.reputation,
+    us.net_votes,
+    us.badges_total,
+    row_number() over (partition by us.user_id order by qe.quality_signal desc nulls last, qe.viewcount desc nulls last) as rn_best_q
+  from question_engagement qe
+  left join user_activity us on us.user_id = qe.user_id
+),
+-- derive percentile ranks and rolling stats for questions
+question_metrics as (
+  select
+    aq.question_id,
+    aq.user_id,
+    aq.title,
+    aq.creationdate,
+    aq.score,
+    aq.viewcount,
+    aq.answercount,
+    aq.quality_signal,
+    percentile_disc(0.5) within group (order by aq.viewcount) over () as median_views_all,
+    percentile_disc(0.9) within group (order by aq.score) over () as p90_score_all,
+    ntile(10) over (order by coalesce(aq.quality_signal,0) desc) as decile_quality,
+    sum(aq.viewcount) over (order by aq.creationdate rows between unbounded preceding and current row) as cum_views_by_time,
+    sum(aq.score) over (partition by aq.user_id order by aq.creationdate rows between 10 preceding and current row) as rolling_user_score_11
+  from authored_questions aq
+),
+-- combine all facts per question
+question_fact as (
+  select
+    qm.*,
+    qs.status,
+    qs.duplicate_of,
+    qs.close_reason_name,
+    coalesce(qc.comment_count,0) as comment_count,
+    coalesce(qc.comment_score_sum,0) as comment_score_sum,
+    qv.upvotes_on_q,
+    qv.downvotes_on_q,
+    coalesce(tr.avg_q_score,0) as tag_avg_score_signal,
+    coalesce(tr.avg_q_views,0) as tag_avg_views_signal
+  from question_metrics qm
+  left join question_status qs on qs.question_id = qm.question_id
+  left join question_comments qc on qc.question_id = qm.question_id
+  left join (select distinct question_id, upvotes_on_q, downvotes_on_q from question_votes) qv on qv.question_id = qm.question_id
+  left join (
+    select qt.question_id,
+           avg(tr.avg_q_score) over (partition by qt.question_id) as avg_q_score,
+           avg(tr.avg_q_views) over (partition by qt.question_id) as avg_q_views
+    from question_tags qt
+    join tag_rollup tr on tr.tagname = qt.tagname
+  ) tr on tr.question_id = qm.question_id
+),
+-- identify surprising questions (high views but low score or vice versa)
+surprises as (
+  select
+    qf.*,
+    case
+      when qf.viewcount >= qf.median_views_all * 2 and qf.score <= qf.p90_score_all / 4 then 'HighViewsLowScore'
+      when qf.viewcount <= greatest(1, qf.median_views_all / 3) and qf.score >= qf.p90_score_all then 'LowViewsHighScore'
+      else 'Normal'
+    end as surprise_class
+  from question_fact qf
+),
+-- rank within tag clusters using set-based operator to union authored and duplicate-of original
+tag_cluster_rank as (
+  select
+    s.question_id,
+    qt.tagname,
+    s.quality_signal,
+    dense_rank() over (partition by qt.tagname order by s.quality_signal desc nulls last) as tag_rank
+  from surprises s
+  join question_tags qt on qt.question_id = s.question_id
+  where s.status <> 'Closed'
+  union all
+  select
+    s2.duplicate_of as question_id,
+    qt2.tagname,
+    s2.quality_signal,
+    dense_rank() over (partition by qt2.tagname order by s2.quality_signal desc nulls last) as tag_rank
+  from surprises s2
+  join question_tags qt2 on qt2.question_id = s2.duplicate_of
+  where s2.duplicate_of is not null
+),
+-- final selection with complex predicates and string ops
+final_rank as (
+  select
+    s.question_id,
+    s.user_id,
+    coalesce(s.title, '[no title]') as title,
+    s.creationdate,
+    s.score,
+    s.viewcount,
+    s.answercount,
+    s.quality_signal,
+    s.decile_quality,
+    s.status,
+    s.close_reason_name,
+    s.comment_count,
+    s.comment_score_sum,
+    s.upvotes_on_q,
+    s.downvotes_on_q,
+    s.surprise_class,
+    tc.tagname,
+    tmeta.post_count as tag_post_count,
+    coalesce(tmeta.is_mod_only,0) as tag_mod_only,
+    coalesce(tmeta.is_required,0) as tag_required,
+    tcr.tag_rank,
+    -- string munging with null logic
+    trim(both ' ' from coalesce(s.title, '')) || ' | ' ||
+      upper(coalesce(s.status, 'NA')) || ' | tags: ' ||
+      coalesce(string_agg(distinct qt.tagname, ',' ) over (partition by s.question_id), '(none)') as summary_str,
+    -- complex score blending
+    (coalesce(s.quality_signal,0)
+     + coalesce(s.upvotes_on_q,0) * 1.5
+     - coalesce(s.downvotes_on_q,0) * 2
+     + case when s.surprise_class = 'HighViewsLowScore' then -5
+            when s.surprise_class = 'LowViewsHighScore' then 5
+            else 0 end
+     + case when s.status = 'Reopened' then 3 when s.status = 'Closed' then -3 else 0 end
+    )::numeric as blended_rank_score
+  from surprises s
+  left join tag_cluster_rank tcr on tcr.question_id = s.question_id
+  left join tag_meta tmeta on tmeta.tagname = tcr.tagname
+  left join question_tags qt on qt.question_id = s.question_id
+)
+select *
+from final_rank fr
+where
+  -- complicated predicates to stress optimizer
+  (fr.decile_quality between 1 and 3 and fr.viewcount > fr.median_views_all)
+  or (fr.decile_quality between 8 and 10 and fr.score < fr.p90_score_all / 2)
+  or (fr.status in ('Closed','Reopened') and coalesce(fr.close_reason_name,'') <> '')
+  or (fr.tag_mod_only = 1 and fr.answercount >= 1)
+  or (fr.surprise_class in ('HighViewsLowScore','LowViewsHighScore'))
+qualify row_number() over (
+  partition by fr.tagname
+  order by fr.blended_rank_score desc nulls last,
+           fr.viewcount desc nulls last,
+           fr.score desc nulls last,
+           fr.creationdate desc
+) <= 25
+order by fr.blended_rank_score desc nulls last, fr.creationdate desc;

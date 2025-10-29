@@ -1,0 +1,100 @@
+WITH
+UserStats AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id) AS PostCount,
+    (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id) AS CommentCount,
+    (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = (SELECT Id FROM VoteTypes WHERE Name = 'UpMod')) AS UpVotesCast,
+    (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = (SELECT Id FROM VoteTypes WHERE Name = 'DownMod')) AS DownVotesCast,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id) AS BadgeCount
+  FROM Users u
+),
+DailyUserActivity AS (
+  SELECT
+    p.OwnerUserId AS UserId,
+    CAST(p.CreationDate AS date) AS CreationDay,
+    COUNT(*) AS PostsOnDay,
+    SUM(CASE WHEN p.Score > 0 THEN 1 ELSE 0 END) AS PositiveScoresOnDay,
+    SUM(CASE WHEN p.ViewCount > 1000 THEN 1 ELSE 0 END) AS HighViewPosts
+  FROM Posts p
+  WHERE p.OwnerUserId IS NOT NULL
+  GROUP BY p.OwnerUserId, CAST(p.CreationDate AS date)
+),
+MostControversialPost AS (
+  SELECT UserId, PostId, Title, Score, AbsScore FROM (
+    SELECT
+      p.OwnerUserId AS UserId,
+      p.Id AS PostId,
+      p.Title,
+      p.Score,
+      ABS(p.Score) AS AbsScore,
+      ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY ABS(p.Score) DESC) AS rn
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+  ) t
+  WHERE rn = 1
+),
+LinkTypeDigest AS (
+  SELECT
+    pl.PostId,
+    lt.Name AS LinkTypeName,
+    COUNT(*) AS LinkCount
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+  GROUP BY pl.PostId, lt.Name
+),
+BenchmarkRow AS (
+  SELECT
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    COALESCE(us.PostCount, 0) AS PostCount,
+    COALESCE(us.CommentCount, 0) AS CommentCount,
+    COALESCE(us.UpVotesCast, 0) AS UpVotesCast,
+    COALESCE(us.DownVotesCast, 0) AS DownVotesCast,
+    COALESCE(us.BadgeCount, 0) AS BadgeCount,
+    (SELECT SUM(PostsOnDay) FROM DailyUserActivity dua WHERE dua.UserId = us.UserId AND dua.CreationDay >= CAST('2024-10-01' AS date) - INTERVAL '6' DAY) AS PostsLast7Days,
+    (SELECT SUM(PositiveScoresOnDay) FROM DailyUserActivity dua WHERE dua.UserId = us.UserId AND dua.CreationDay >= CAST('2024-10-01' AS date) - INTERVAL '6' DAY) AS PositiveScoresLast7Days,
+    (SELECT SUM(HighViewPosts) FROM DailyUserActivity dua WHERE dua.UserId = us.UserId AND dua.CreationDay >= CAST('2024-10-01' AS date) - INTERVAL '6' DAY) AS HighViewPostsLast7Days,
+    mcp.PostId AS MostControversialPostId,
+    mcp.Title AS MostControversialPostTitle,
+    mcp.Score AS MostControversialPostScore,
+    (SELECT SUM(ltd.LinkCount) FROM LinkTypeDigest ltd WHERE ltd.PostId IN (SELECT p2.Id FROM Posts p2 WHERE p2.OwnerUserId = us.UserId)) AS TotalLinkedPostCount,
+    (SELECT MAX(p.LastActivityDate) FROM Posts p WHERE p.OwnerUserId = us.UserId) AS LastPostActivityDate
+  FROM Users us
+  LEFT JOIN DailyUserActivity dua ON dua.UserId = us.UserId
+  LEFT JOIN MostControversialPost mcp ON mcp.UserId = us.UserId
+  GROUP BY
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.PostCount,
+    us.CommentCount,
+    us.UpVotesCast,
+    us.DownVotesCast,
+    us.BadgeCount,
+    mcp.PostId,
+    mcp.Title,
+    mcp.Score
+)
+SELECT
+  br.UserId,
+  br.DisplayName,
+  br.Reputation,
+  br.PostCount,
+  br.CommentCount,
+  br.UpVotesCast,
+  br.DownVotesCast,
+  br.BadgeCount,
+  br.PostsLast7Days,
+  br.PositiveScoresLast7Days,
+  br.HighViewPostsLast7Days,
+  br.MostControversialPostId,
+  br.MostControversialPostTitle,
+  br.MostControversialPostScore,
+  br.TotalLinkedPostCount,
+  br.LastPostActivityDate
+FROM BenchmarkRow br
+ORDER BY br.Reputation DESC, br.PostCount DESC, br.LastPostActivityDate DESC;

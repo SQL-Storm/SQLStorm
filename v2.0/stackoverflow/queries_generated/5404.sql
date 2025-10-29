@@ -1,0 +1,101 @@
+-- {"query": "5404.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 784} 
+WITH
+
+-- 1) recent top users by reputation with complex filters and windowing
+RecentTopUsers AS (
+  SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    ROW_NUMBER() OVER (
+      PARTITION BY CASE WHEN u.Reputation > 1000 THEN 1 ELSE 0 END
+      ORDER BY u.Reputation DESC, u.LastAccessDate DESC
+    ) AS rn
+  FROM Users u
+  WHERE u.CreationDate >= TIMESTAMPADD(MONTH, -24, CURRENT_TIMESTAMP)
+    AND (u.Location IS NULL OR TRIM(u.Location) <> '')
+),
+
+-- 2) badge density per user with NULL-safe aggregation
+UserBadges AS (
+  SELECT
+    b.UserId,
+    COUNT(*) AS BadgeCount,
+    MAX(b.Date) AS LastBadgeDate
+  FROM Badges b
+  GROUP BY b.UserId
+),
+
+-- 3) analyze post activity: correlated subquery for last activity per user
+UserPostActivity AS (
+  SELECT
+    p.OwnerUserId,
+    COUNT(*) AS PostCount,
+    MAX(p.LastActivityDate) AS LastActivity
+  FROM Posts p
+  WHERE p.OwnerUserId IS NOT NULL
+  GROUP BY p.OwnerUserId
+),
+
+-- 4) complex post-link relationships: find users whose posts are frequently linked to others
+LinkedPostStats AS (
+  SELECT
+    pl.PostId,
+    COUNT(*) FILTER (WHERE lt.Name = 'Linked') AS LinkCount,
+    COUNT(*) FILTER (WHERE lt.Name = 'Duplicate') AS DupCount,
+    p.OwnerUserId
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+  JOIN Posts p ON p.Id = pl.PostId
+  GROUP BY pl.PostId, p.OwnerUserId
+),
+
+-- 5) advanced aggregated metrics with windowing over time
+TimeWindowMetrics AS (
+  SELECT
+    v.PostId,
+    v.UserId,
+    v.VoteTypeId,
+    v.CreationDate,
+    SUM(CASE WHEN vt.Name IN ('UpMod', 'AcceptedByOriginator', 'Favorite') THEN 1 ELSE 0 END) OVER (
+      PARTITION BY v.PostId
+      ORDER BY v.CreationDate
+      ROWS BETWEEN 29 PRECEDING AND CURRENT ROW
+    ) AS RollingEngagement28d,
+    ROW_NUMBER() OVER (PARTITION BY v.PostId ORDER BY v.CreationDate) AS seq
+  FROM Votes v
+  JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+)
+
+SELECT
+  -- 6) final selected columns with rich combination
+  u.Id AS UserId,
+  u.DisplayName AS UserName,
+  u.Reputation,
+  ru.BadgeCount,
+  ru.LastBadgeDate,
+  upa.PostCount,
+  upa.LastActivity,
+  ub.LinkCount,
+  ub.DupCount,
+  t.LastView AS Last30dViews,
+  mw.RollingEngagement28d,
+  mw.seq
+FROM RecentTopUsers u
+LEFT JOIN UserBadges ru ON ru.UserId = u.Id
+LEFT JOIN UserPostActivity upa ON upa.OwnerUserId = u.Id
+LEFT JOIN LinkedPostStats mw ON mw.OwnerUserId = u.Id
+OUTER APPLY (
+  SELECT SUM(p.ViewCount) AS LastView
+  FROM Posts p
+  WHERE p.OwnerUserId = u.Id
+    AND p.CreationDate >= TIMESTAMPADD(DAY, -30, CURRENT_TIMESTAMP)
+) AS t
+ORDER BY u.Reputation DESC, u.LastAccessDate DESC
+LIMIT 100;

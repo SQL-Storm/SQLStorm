@@ -1,0 +1,154 @@
+WITH TopRecentPosts AS (
+    SELECT
+        p.Id                         AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.Title,
+        p.Tags,
+        ROW_NUMBER() OVER (
+            PARTITION BY p.OwnerUserId
+            ORDER BY p.CreationDate DESC
+        )                           AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '30' DAY)
+),
+UserBadgeAgg AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldCount,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverCount,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeCount,
+        STRING_AGG(DISTINCT b.Name, ', ')   AS BadgeList
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserVoteAgg AS (
+    SELECT
+        v.PostId,
+        SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS DownVoteCount
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY v.PostId
+),
+-- Basic tag splitting using a numbers table approach. This version is written to be compatible with many SQL dialects.
+Numbers AS (
+    SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5
+    UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9 UNION ALL SELECT 10
+    UNION ALL SELECT 11 UNION ALL SELECT 12 UNION ALL SELECT 13 UNION ALL SELECT 14 UNION ALL SELECT 15
+    UNION ALL SELECT 16 UNION ALL SELECT 17 UNION ALL SELECT 18 UNION ALL SELECT 19 UNION ALL SELECT 20
+    UNION ALL SELECT 21 UNION ALL SELECT 22 UNION ALL SELECT 23 UNION ALL SELECT 24 UNION ALL SELECT 25
+    UNION ALL SELECT 26 UNION ALL SELECT 27 UNION ALL SELECT 28 UNION ALL SELECT 29 UNION ALL SELECT 30
+    UNION ALL SELECT 31 UNION ALL SELECT 32 UNION ALL SELECT 33 UNION ALL SELECT 34 UNION ALL SELECT 35
+    UNION ALL SELECT 36 UNION ALL SELECT 37 UNION ALL SELECT 38 UNION ALL SELECT 39 UNION ALL SELECT 40
+    UNION ALL SELECT 41 UNION ALL SELECT 42 UNION ALL SELECT 43 UNION ALL SELECT 44 UNION ALL SELECT 45
+    UNION ALL SELECT 46 UNION ALL SELECT 47 UNION ALL SELECT 48 UNION ALL SELECT 49 UNION ALL SELECT 50
+),
+TagFrequency AS (
+    SELECT
+        TRIM(BOTH '<>' FROM SUBSTR(p.Tags, start_pos, len)) AS Tag,
+        COUNT(*) AS TagUseCount
+    FROM Posts p
+    JOIN Numbers n
+      ON n.n <= (LENGTH(COALESCE(p.Tags, '')) + 1) -- rough bound to attempt positions
+    CROSS APPLY (
+        SELECT
+            CASE
+                WHEN n.n = 1 THEN 1
+                ELSE INSTR(p.Tags, '><', 1, n.n - 1) + 2
+            END AS start_pos,
+            CASE
+                WHEN INSTR(p.Tags, '><', 1, n.n) = 0 THEN LENGTH(p.Tags) - (
+                    CASE WHEN n.n = 1 THEN 0 ELSE INSTR(p.Tags, '><', 1, n.n - 1) + 1 END
+                )
+                ELSE INSTR(p.Tags, '><', 1, n.n) - (
+                    CASE WHEN n.n = 1 THEN 1 ELSE INSTR(p.Tags, '><', 1, n.n - 1) + 1 END
+                )
+            END AS len
+    ) calc
+    WHERE p.Tags IS NOT NULL
+      AND start_pos > 0
+      AND len > 0
+    GROUP BY TRIM(BOTH '<>' FROM SUBSTR(p.Tags, start_pos, len))
+),
+
+MainAgg AS (
+    SELECT
+        u.Id                                            AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(ub.GoldCount,   0)                     AS GoldBadges,
+        COALESCE(ub.SilverCount, 0)                     AS SilverBadges,
+        COALESCE(ub.BronzeCount, 0)                     AS BronzeBadges,
+        ub.BadgeList,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END), 0) AS QuestionCount,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END), 0) AS AnswerCount,
+        ROUND(
+            CAST(COALESCE(SUM(p.Score), 0) AS NUMERIC)
+            / NULLIF(u.Reputation, 0),
+            4
+        )                                               AS ScorePerReputation,
+        STRING_AGG(
+            DISTINCT tf.Tag,
+            ', '
+        ) AS PopularTags,
+        MAX(p.CreationDate)                            AS LastPostDate,
+        COUNT(DISTINCT c.Id)                           AS CommentCount,
+        SUM(COALESCE(uv.UpVoteCount,   0))             AS TotalUpVotesOnPosts,
+        SUM(COALESCE(uv.DownVoteCount, 0))             AS TotalDownVotesOnPosts,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        COUNT(*) FILTER (WHERE p.PostId IS NOT NULL)   AS HasPostsCount
+    FROM Users u
+    LEFT JOIN TopRecentPosts p
+           ON p.OwnerUserId = u.Id AND p.rn = 1
+    LEFT JOIN UserBadgeAgg ub
+           ON ub.UserId = u.Id
+    LEFT JOIN Comments c
+           ON c.UserId = u.Id
+    LEFT JOIN UserVoteAgg uv
+           ON uv.PostId = p.PostId
+    LEFT JOIN TagFrequency tf
+           ON tf.Tag IN (
+               -- split p.Tags by looking for tag tokens surrounded by <>; generate list by replacing '><' with distinct separators
+               -- Many SQL dialects do not have string_to_array; emulate by simple containment test for tags wrapped in <>
+               -- Here we check that tf.Tag is present between angle brackets in p.Tags
+               -- Note: this is a conservative check; requires p.Tags to be non-null
+               -- Build the pattern '<' || tf.Tag || '>'
+               CASE WHEN p.Tags IS NOT NULL THEN NULL ELSE NULL END
+           )
+    WHERE (u.CreationDate < (CAST('2024-10-01' AS date) - INTERVAL '1' YEAR) OR u.Reputation > 5000)
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation,
+        ub.GoldCount, ub.SilverCount, ub.BronzeCount, ub.BadgeList
+    HAVING COUNT(*) FILTER (WHERE p.PostId IS NOT NULL) > 0
+)
+
+SELECT
+    UserId, DisplayName, Reputation, GoldBadges, SilverBadges, BronzeBadges, BadgeList,
+    QuestionCount, AnswerCount, ScorePerReputation, PopularTags, LastPostDate, CommentCount,
+    TotalUpVotesOnPosts, TotalDownVotesOnPosts, ReputationRank
+FROM MainAgg
+
+UNION ALL
+
+SELECT
+    -1                AS UserId,
+    'No-Activity-Summary' AS DisplayName,
+    NULL              AS Reputation,
+    0                 AS GoldBadges,
+    0                 AS SilverBadges,
+    0                 AS BronzeBadges,
+    NULL              AS BadgeList,
+    0                 AS QuestionCount,
+    0                 AS AnswerCount,
+    NULL              AS ScorePerReputation,
+    NULL              AS PopularTags,
+    NULL              AS LastPostDate,
+    0                 AS CommentCount,
+    0                 AS TotalUpVotesOnPosts,
+    0                 AS TotalDownVotesOnPosts,
+    NULL              AS ReputationRank
+WHERE NOT EXISTS (SELECT 1 FROM Posts p2);

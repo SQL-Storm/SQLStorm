@@ -1,0 +1,115 @@
+WITH tagged_activity AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.PostTypeId,
+    p.OwnerUserId,
+    array_to_string(string_to_array(p.Tags, '><'), ',') AS TagList,
+    p.Score,
+    p.ViewCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.LastActivityDate,
+    p.LastEditDate,
+    p.ContentLicense
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+recent_votes AS (
+  SELECT
+    v.PostId,
+    v.VoteTypeId,
+    v.UserId,
+    v.CreationDate,
+    v.BountyAmount,
+    u.Reputation,
+    u.DisplayName,
+    u.AccountId
+  FROM Votes v
+  LEFT JOIN Users u ON v.UserId = u.Id
+  WHERE v.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days'
+),
+top_tag_interactions AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS tag_count,
+    AVG(st.Reputation) AS avg_reputation
+  FROM Tags tg
+  JOIN Posts p ON tg.WikiPostId = p.Id OR tg.Id = p.Id
+  LEFT JOIN unnest(string_to_array(p.Tags, '><')) AS t(TagName) ON TRUE
+  LEFT JOIN Users st ON p.OwnerUserId = st.Id
+  GROUP BY t.TagName
+  ORDER BY tag_count DESC
+  LIMIT 50
+),
+complex_derived AS (
+  SELECT
+    ph.PostId,
+    ph.PostHistoryTypeId,
+    ph.UserId,
+    ph.CreationDate,
+    ph.Text,
+    ph.Comment
+  FROM PostHistory ph
+  WHERE ph.PostHistoryTypeId IN (10, 16, 52, 53)
+)
+SELECT
+  ta.PostId,
+  ta.Title,
+  ta.TagList,
+  ta.CreationDate AS PostCreationDate,
+  ta.Score,
+  ta.ViewCount,
+  ta.LastActivityDate,
+  ta.LastEditDate,
+  ra.RecentActivityScore AS RecActivityScore,
+  string_agg(DISTINCT vt.VoteTypeId_text, ',') AS VoteTypesAlongPost,
+  u.DisplayName AS OwnerDisplayName,
+  u.Reputation AS OwnerReputation,
+  -- use standard JSON construction compatible with multiple dialects
+  CAST(
+    '{'
+      || '"TopTags":'   || COALESCE(NULLIF(NULL::text, ''), 'null') || ','
+      || '"TopInteractors":' || COALESCE(NULLIF(NULL::text, ''), 'null')
+      || '}'
+    AS json
+  ) AS Supplement
+FROM tagged_activity ta
+LEFT JOIN (
+  SELECT
+    vv.PostId,
+    SUM(CASE WHEN vv.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+    SUM(CASE WHEN vv.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+    ARRAY_AGG(DISTINCT vv.VoteTypeId ORDER BY vv.VoteTypeId) AS VoteTypeIds
+  FROM Votes vv
+  GROUP BY vv.PostId
+) v ON ta.PostId = v.PostId
+LEFT JOIN LATERAL (
+  SELECT
+    CAST(unnested AS varchar) AS VoteTypeId_text,
+    unnested AS VoteTypeId_ord
+  FROM unnest(COALESCE(v.VoteTypeIds, ARRAY[]::integer[])) AS unnested
+) vt ON v.PostId IS NOT NULL
+LEFT JOIN Users u ON ta.OwnerUserId = u.Id
+LEFT JOIN (
+  SELECT PostId, COUNT(*) AS RecentActivityScore
+  FROM recent_votes
+  GROUP BY PostId
+) ra ON ta.PostId = ra.PostId
+LEFT JOIN top_tag_interactions tti ON ta.Title = tti.TagName
+LEFT JOIN complex_derived cd ON ta.PostId = cd.PostId
+GROUP BY
+  ta.PostId,
+  ta.Title,
+  ta.TagList,
+  ta.CreationDate,
+  ta.Score,
+  ta.ViewCount,
+  ta.LastActivityDate,
+  ta.LastEditDate,
+  ra.RecentActivityScore,
+  u.DisplayName,
+  u.Reputation
+ORDER BY ta.CreationDate DESC
+LIMIT 100;

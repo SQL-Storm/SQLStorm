@@ -1,0 +1,321 @@
+-- {"query": "71.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3264} 
+with recent_users as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate,
+        u.location,
+        coalesce(nullif(trim(u.websiteurl), ''), 'N/A') as websiteurl,
+        date_trunc('month', u.creationdate) as cohort_month,
+        row_number() over (order by u.creationdate desc, u.id desc) as rn_global
+    from users u
+    where u.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+),
+question_posts as (
+    select p.id, p.owneruserid, p.creationdate, p.score, p.viewcount, p.answercount, p.favoritecount,
+           p.title, p.tags, p.closeddate, p.communityowneddate
+    from posts p
+    where p.posttypeid = 1
+),
+answer_posts as (
+    select p.id, p.parentid, p.owneruserid, p.creationdate, p.score, p.commentcount
+    from posts p
+    where p.posttypeid = 2
+),
+user_activity as (
+    select
+        ru.user_id,
+        count(q.id) filter (where q.id is not null) as questions_asked,
+        count(a.id) filter (where a.id is not null) as answers_posted,
+        coalesce(sum(greatest(q.score,0)),0) + coalesce(sum(greatest(a.score,0)),0) as total_nonneg_score,
+        coalesce(sum(q.viewcount),0) as total_views_on_questions,
+        coalesce(sum(q.answercount),0) as total_answers_received,
+        count(distinct date_trunc('month', coalesce(q.creationdate,a.creationdate))) as active_months
+    from recent_users ru
+    left join question_posts q on q.owneruserid = ru.user_id
+    left join answer_posts a on a.owneruserid = ru.user_id
+    group by ru.user_id
+),
+question_quality as (
+    select
+        q.owneruserid as user_id,
+        percentile_disc(0.5) within group (order by coalesce(q.score,0)) as q_median_score,
+        avg(nullif(q.viewcount,0)) as q_avg_views_nonzero,
+        sum(case when q.favoritecount is null then 0 else 1 end) as q_with_fav_count,
+        sum(case when q.closeddate is not null then 1 else 0 end) as q_closed_count,
+        sum(case when q.communityowneddate is not null then 1 else 0 end) as q_comm_owned
+    from question_posts q
+    group by q.owneruserid
+),
+answer_latency as (
+    select
+        q.owneruserid as user_id,
+        avg(extract(epoch from (a.creationdate - q.creationdate))/3600.0) as avg_answer_latency_hours,
+        min(extract(epoch from (a.creationdate - q.creationdate))/3600.0) as min_answer_latency_hours,
+        max(extract(epoch from (a.creationdate - q.creationdate))/3600.0) as max_answer_latency_hours
+    from question_posts q
+    join answer_posts a on a.parentid = q.id
+    group by q.owneruserid
+),
+accepted_answerers as (
+    select
+        a.owneruserid as user_id,
+        count(*) as accepted_answers
+    from posts q
+    join posts a on a.id = q.acceptedanswerid and a.posttypeid = 2
+    group by a.owneruserid
+),
+vote_summary as (
+    select
+        p.owneruserid as user_id,
+        sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes_received,
+        sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes_received,
+        sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_started_amt,
+        sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded_amt
+    from posts p
+    join votes v on v.postid = p.id
+    group by p.owneruserid
+),
+comment_agg as (
+    select
+        coalesce(c.userid, -1) as user_id,
+        count(*) as comments_made,
+        sum(greatest(coalesce(c.score,0),0)) as comment_nonneg_score,
+        max(c.creationdate) as last_comment_date
+    from comments c
+    group by coalesce(c.userid, -1)
+),
+tag_usage as (
+    select
+        q.owneruserid as user_id,
+        unnest(string_to_array(substring(q.tags, 2, greatest(length(q.tags)-2,0)), '><')) as tagname
+    from question_posts q
+    where q.tags is not null and q.tags like '<%>'
+),
+top_tags as (
+    select
+        user_id,
+        tagname,
+        count(*) as tag_count,
+        row_number() over (partition by user_id order by count(*) desc, tagname) as tag_rn
+    from tag_usage
+    group by user_id, tagname
+),
+post_edits as (
+    select
+        ph.userid as editor_id,
+        count(*) filter (where ph.posthistorytypeid in (4,5,6,7,8,9,24)) as edits_applied,
+        count(*) filter (where ph.posthistorytypeid = 24) as suggested_edits_applied,
+        sum(case when ph.posthistorytypeid in (10,11,12,13,14,15,19,20,35) then 1 else 0 end) as mod_like_events
+    from posthistory ph
+    group by ph.userid
+),
+dup_links as (
+    select
+        pl.postid,
+        pl.relatedpostid,
+        pl.creationdate,
+        pl.linktypeid
+    from postlinks pl
+    where pl.linktypeid = 3
+),
+dup_clusters as (
+    select
+        least(pl.postid, pl.relatedpostid) as a,
+        greatest(pl.postid, pl.relatedpostid) as b
+    from dup_links pl
+),
+activity_score as (
+    select
+        ru.user_id,
+        0.4 * ln(1 + ua.questions_asked) +
+        0.6 * ln(1 + ua.answers_posted) +
+        0.2 * ln(1 + ua.total_views_on_questions) +
+        0.3 * ln(1 + coalesce(vs.upvotes_received,0) - coalesce(vs.downvotes_received,0)) +
+        0.5 * ln(1 + coalesce(aa.accepted_answers,0)) +
+        0.1 * ln(1 + coalesce(pe.edits_applied,0)) as score
+    from recent_users ru
+    left join user_activity ua on ua.user_id = ru.user_id
+    left join vote_summary vs on vs.user_id = ru.user_id
+    left join accepted_answerers aa on aa.user_id = ru.user_id
+    left join post_edits pe on pe.editor_id = ru.user_id
+),
+ranked_users as (
+    select
+        ru.*,
+        ua.questions_asked,
+        ua.answers_posted,
+        ua.total_nonneg_score,
+        ua.total_views_on_questions,
+        ua.total_answers_received,
+        ua.active_months,
+        qq.q_median_score,
+        qq.q_avg_views_nonzero,
+        qq.q_with_fav_count,
+        qq.q_closed_count,
+        al.avg_answer_latency_hours,
+        al.min_answer_latency_hours,
+        al.max_answer_latency_hours,
+        coalesce(vs.upvotes_received,0) as upvotes_received,
+        coalesce(vs.downvotes_received,0) as downvotes_received,
+        coalesce(vs.bounty_started_amt,0) as bounty_started_amt,
+        coalesce(vs.bounty_awarded_amt,0) as bounty_awarded_amt,
+        coalesce(aa.accepted_answers,0) as accepted_answers,
+        coalesce(ca.comments_made,0) as comments_made,
+        coalesce(ca.comment_nonneg_score,0) as comment_nonneg_score,
+        ca.last_comment_date,
+        coalesce(pe.edits_applied,0) as edits_applied,
+        coalesce(pe.suggested_edits_applied,0) as suggested_edits_applied,
+        coalesce(pe.mod_like_events,0) as mod_like_events,
+        coalesce(at.score,0) as activity_score,
+        dense_rank() over (
+            partition by date_trunc('year', ru.creationdate)
+            order by coalesce(at.score,0) desc, ru.reputation desc, ru.user_id
+        ) as cohort_rank,
+        row_number() over (
+            order by coalesce(at.score,0) desc, ru.reputation desc, ru.user_id
+        ) as global_rank
+    from recent_users ru
+    left join user_activity ua on ua.user_id = ru.user_id
+    left join question_quality qq on qq.user_id = ru.user_id
+    left join answer_latency al on al.user_id = ru.user_id
+    left join vote_summary vs on vs.user_id = ru.user_id
+    left join accepted_answerers aa on aa.user_id = ru.user_id
+    left join comment_agg ca on ca.user_id = ru.user_id
+    left join post_edits pe on pe.editor_id = ru.user_id
+    left join activity_score at on at.user_id = ru.user_id
+),
+badge_counts as (
+    select
+        b.userid as user_id,
+        sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+        sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+        sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+        sum(case when b.tagbased = 1 then 1 else 0 end) as tag_badges
+    from badges b
+    group by b.userid
+),
+top_tag_pivot as (
+    select
+        tt.user_id,
+        max(case when tt.tag_rn = 1 then tt.tagname end) as top_tag1,
+        max(case when tt.tag_rn = 2 then tt.tagname end) as top_tag2,
+        max(case when tt.tag_rn = 3 then tt.tagname end) as top_tag3
+    from top_tags tt
+    where tt.tag_rn <= 3
+    group by tt.user_id
+),
+outer_mix as (
+    select user_id from recent_users
+    union
+    select user_id from badge_counts
+),
+finalized as (
+    select
+        rm.user_id,
+        ru.displayname,
+        ru.reputation,
+        ru.location,
+        ru.websiteurl,
+        ru.cohort_month,
+        ru.rn_global,
+        ru.creationdate,
+        ru.global_rank,
+        ru.cohort_rank,
+        bc.gold_badges,
+        bc.silver_badges,
+        bc.bronze_badges,
+        bc.tag_badges,
+        coalesce(ru.questions_asked,0) as questions_asked,
+        coalesce(ru.answers_posted,0) as answers_posted,
+        coalesce(ru.total_nonneg_score,0) as total_nonneg_score,
+        coalesce(ru.total_views_on_questions,0) as total_views_on_questions,
+        coalesce(ru.total_answers_received,0) as total_answers_received,
+        coalesce(ru.active_months,0) as active_months,
+        coalesce(ru.q_median_score,0) as q_median_score,
+        ru.q_avg_views_nonzero,
+        coalesce(ru.q_with_fav_count,0) as q_with_fav_count,
+        coalesce(ru.q_closed_count,0) as q_closed_count,
+        ru.avg_answer_latency_hours,
+        ru.min_answer_latency_hours,
+        ru.max_answer_latency_hours,
+        ru.upvotes_received,
+        ru.downvotes_received,
+        ru.bounty_started_amt,
+        ru.bounty_awarded_amt,
+        ru.accepted_answers,
+        ru.comments_made,
+        ru.comment_nonneg_score,
+        ru.last_comment_date,
+        ru.edits_applied,
+        ru.suggested_edits_applied,
+        ru.mod_like_events,
+        ru.activity_score,
+        tt.top_tag1,
+        tt.top_tag2,
+        tt.top_tag3,
+        case
+            when coalesce(ru.activity_score,0) >= percentile_disc(0.9) within group (order by coalesce(ru.activity_score,0)) over ()
+            then 'P90+'
+            when coalesce(ru.activity_score,0) >= percentile_disc(0.75) within group (order by coalesce(ru.activity_score,0)) over ()
+            then 'P75-90'
+            when coalesce(ru.activity_score,0) >= percentile_disc(0.5) within group (order by coalesce(ru.activity_score,0)) over ()
+            then 'P50-75'
+            else 'Below P50'
+        end as performance_band,
+        case
+            when ru.downvotes_received > ru.upvotes_received then 'Net Negative'
+            when ru.accepted_answers > 0 then 'Accepted Answerer'
+            when coalesce(bc.gold_badges,0) > 0 then 'Has Gold'
+            else 'Regular'
+        end as user_archetype,
+        -- correlated subquery: time to first comment on any of the user's questions
+        (
+          select min(extract(epoch from (c.creationdate - q.creationdate))/3600.0)
+          from question_posts q
+          join comments c on c.postid = q.id
+          where q.owneruserid = rm.user_id
+        ) as hours_to_first_comment_on_own_question,
+        -- string expressions and null logic
+        trim(both ' ' from coalesce(ru.displayname, 'user-' || cast(rm.user_id as varchar))) ||
+        case when tt.top_tag1 is not null then ' [' || tt.top_tag1 || ']' else '' end as display_with_tag
+    from outer_mix rm
+    left join ranked_users ru on ru.user_id = rm.user_id
+    left join badge_counts bc on bc.user_id = rm.user_id
+    left join top_tag_pivot tt on tt.user_id = rm.user_id
+),
+band_stats as (
+    select
+        performance_band,
+        count(*) as users_in_band,
+        avg(activity_score) as avg_score_band,
+        stddev_pop(activity_score) as stddev_score_band
+    from finalized
+    group by performance_band
+)
+select
+    f.*,
+    bs.users_in_band,
+    bs.avg_score_band,
+    bs.stddev_score_band
+from finalized f
+left join band_stats bs on bs.performance_band = f.performance_band
+where
+    -- complex predicate mixing null logic and calculations
+    coalesce(f.activity_score, 0) >= 0
+    and (f.questions_asked + f.answers_posted) >= 1
+    and (
+        f.q_closed_count is null or f.q_closed_count < greatest(2, (f.questions_asked / nullif(f.active_months,0))::int)
+    )
+    and (
+        f.top_tag1 is null
+        or not exists (
+            select 1
+            from tags t
+            where lower(t.tagname) = lower(f.top_tag1)
+              and t.isrequired = 1
+        )
+    )
+order by f.global_rank
+limit 250;

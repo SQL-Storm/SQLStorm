@@ -1,0 +1,349 @@
+-- {"query": "889.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3465} 
+with
+-- recent active users with rank buckets
+active_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.location,
+    u.websiteurl,
+    u.upvotes,
+    u.downvotes,
+    u.views,
+    width_bucket(u.reputation, 0, greatest(u.reputation, 1), 10) as rep_bucket,
+    row_number() over (order by u.reputation desc, u.id) as rn_global,
+    row_number() over (partition by coalesce(nullif(trim(u.location), ''), 'Unknown') order by u.reputation desc nulls last, u.id) as rn_location
+  from users u
+  where u.creationdate >= (select coalesce(max(creationdate), '1900-01-01') from users) - interval '5 years'
+),
+-- questions and answers with normalized tags array for questions
+posts_norm as (
+  select
+    p.id,
+    p.posttypeid,
+    p.owneruserid,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.title,
+    p.tags,
+    case when p.posttypeid = 1 and p.tags is not null and length(p.tags) >= 2
+      then string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')
+      else null
+    end as tag_array,
+    p.acceptedanswerid,
+    p.parentid
+  from posts p
+),
+-- compute per-user aggregates with window functions
+user_post_agg as (
+  select
+    u.user_id,
+    count(*) filter (where pn.posttypeid = 1) as q_count,
+    count(*) filter (where pn.posttypeid = 2) as a_count,
+    sum(pn.score) as total_score,
+    avg(pn.score) filter (where pn.posttypeid = 1) as avg_q_score,
+    avg(pn.score) filter (where pn.posttypeid = 2) as avg_a_score,
+    max(pn.creationdate) as last_post_date,
+    min(pn.creationdate) as first_post_date,
+    percentile_cont(0.9) within group (order by pn.score) as p90_post_score,
+    count(distinct case when pn.posttypeid = 1 then pn.id end) as distinct_questions,
+    count(distinct case when pn.posttypeid = 2 then pn.parentid end) as distinct_answered_questions,
+    sum(case when pn.posttypeid = 1 and pn.acceptedanswerid is not null then 1 else 0 end) as questions_with_accept
+  from active_users u
+  left join posts_norm pn on pn.owneruserid = u.user_id
+  group by u.user_id
+),
+-- rolling acceptance and score signals on answers
+answer_signals as (
+  select
+    a.owneruserid as user_id,
+    a.id as answer_id,
+    a.parentid as question_id,
+    a.creationdate,
+    a.score,
+    sum(case when q.acceptedanswerid = a.id then 1 else 0 end) over (partition by a.owneruserid order by a.creationdate rows between unbounded preceding and current row) as cum_accepts,
+    avg(a.score) over (partition by a.owneruserid order by a.creationdate rows between 10 preceding and current row) as mov_avg_answer_score,
+    count(*) over (partition by a.owneruserid) as total_answers_user
+  from posts_norm a
+  join posts_norm q on q.id = a.parentid and q.posttypeid = 1
+  where a.posttypeid = 2
+),
+-- votes summary per user with correlated subqueries and null handling
+vote_summary as (
+  select
+    u.user_id,
+    coalesce((
+      select count(*) from votes v
+      join posts p on p.id = v.postid
+      where p.owneruserid = u.user_id and v.votetypeid = 2
+    ), 0) as upmods_received,
+    coalesce((
+      select count(*) from votes v
+      join posts p on p.id = v.postid
+      where p.owneruserid = u.user_id and v.votetypeid = 3
+    ), 0) as downmods_received,
+    coalesce((
+      select sum(v.bountyamount) from votes v
+      join posts p on p.id = v.postid
+      where p.owneruserid = u.user_id and v.votetypeid in (8,9)
+    ), 0) as bounty_total
+  from active_users u
+),
+-- tags per user using unnested arrays, excluding nulls
+user_top_tags as (
+  select
+    pn.owneruserid as user_id,
+    lower(t) as tag,
+    count(*) as tag_posts,
+    sum(case when pn.posttypeid = 1 then 1 else 0 end) as q_tag_posts
+  from posts_norm pn
+  left join lateral unnest(pn.tag_array) as t on true
+  where pn.posttypeid = 1
+  group by pn.owneruserid, lower(t)
+),
+-- rank tags per user
+user_tag_rank as (
+  select
+    utt.*,
+    row_number() over (partition by user_id order by tag_posts desc, tag asc) as tag_rn
+  from user_top_tags utt
+),
+-- duplicates and links interplay
+dup_graph as (
+  select
+    pl.postid,
+    pl.relatedpostid,
+    pl.creationdate,
+    pl.linktypeid,
+    case when pl.linktypeid = 3 then 1 else 0 end as is_duplicate
+  from postlinks pl
+),
+-- comment activity stats with string filters and NULL-safe logic
+comment_stats as (
+  select
+    u.user_id,
+    count(c.id) as comments_made,
+    sum(case when c.score > 0 then 1 else 0 end) as pos_comments,
+    avg(c.score) as avg_comment_score,
+    count(*) filter (where c.text ilike '%thanks%' or c.text ilike '%thank you%') as gratitude_comments,
+    count(*) filter (where c.text ~* '\b(lmao|lol|wtf)\b') as slang_comments
+  from active_users u
+  left join comments c on c.userid = u.user_id
+  group by u.user_id
+),
+-- closure reasons extracted from PostHistory JSON/comment fields
+close_reasons as (
+  select
+    ph.postid,
+    ph.userid,
+    max(ph.creationdate) as last_close_date,
+    max(case when ph.posthistorytypeid = 10 then ph.comment end) as last_close_reason_code_raw,
+    count(*) filter (where ph.posthistorytypeid = 10) as close_events
+  from posthistory ph
+  where ph.posthistorytypeid in (10,11)
+  group by ph.postid, ph.userid
+),
+-- compute per-user linkage to duplicates
+user_dup_impact as (
+  select
+    p.owneruserid as user_id,
+    count(distinct case when dg.is_duplicate = 1 and dg.postid = p.id then p.id end) as times_marked_dup,
+    count(distinct case when dg.is_duplicate = 1 and dg.relatedpostid = p.id then p.id end) as times_used_as_canonical,
+    count(distinct case when dg.linktypeid = 1 and dg.postid = p.id then p.id end) as has_outgoing_links
+  from posts p
+  left join dup_graph dg on dg.postid = p.id or dg.relatedpostid = p.id
+  group by p.owneruserid
+),
+-- CTE to compute "hot streaks" of answers per user (gaps and islands)
+answer_streaks as (
+  select
+    user_id,
+    answer_id,
+    creationdate::date as d,
+    creationdate,
+    sum(gap) over (partition by user_id order by creationdate) as island
+  from (
+    select
+      a.user_id,
+      a.answer_id,
+      a.creationdate,
+      case when lag(a.creationdate) over (partition by a.user_id order by a.creationdate) is null
+                or a.creationdate::date - lag(a.creationdate)::date > 1
+           then 1 else 0 end as gap
+    from answer_signals a
+  ) s
+),
+streak_lengths as (
+  select
+    user_id,
+    island,
+    min(d) as start_date,
+    max(d) as end_date,
+    count(*) as days_in_streak
+  from answer_streaks
+  group by user_id, island
+),
+-- build a dimension of post types and vote types to use in set ops
+dim_posttypes as (
+  select id, name from posttypes
+),
+dim_votetypes as (
+  select id, name from votetypes
+),
+-- unioned set to produce synthetic workload via set operators
+synth_set as (
+  select 'PT:' || name as label from dim_posttypes
+  union all
+  select 'VT:' || name from dim_votetypes
+),
+-- per-user favorite counts via votes and NULL logic for removed feature
+favorites_summary as (
+  select
+    u.user_id,
+    count(*) filter (where v.votetypeid = 5) as favorites_legacy
+  from active_users u
+  left join votes v on v.userid = u.user_id and v.votetypeid = 5
+  group by u.user_id
+),
+-- compute recent growth in reputation proxies using posts and votes within windows
+recent_activity as (
+  select
+    u.user_id,
+    count(*) filter (where pn.creationdate >= now() - interval '30 days') as posts_30d,
+    count(*) filter (where pn.posttypeid = 2 and pn.creationdate >= now() - interval '30 days') as answers_30d,
+    count(*) filter (where v.votetypeid = 2 and v.creationdate >= now() - interval '30 days') as upmods_30d_received
+  from active_users u
+  left join posts_norm pn on pn.owneruserid = u.user_id
+  left join votes v on v.postid = pn.id
+  group by u.user_id
+),
+-- users with gold badges in last year
+recent_gold_badges as (
+  select
+    b.userid as user_id,
+    count(*) filter (where b.class = 1 and b.date >= now() - interval '1 year') as gold_last_year,
+    max(b.date) filter (where b.class = 1) as last_gold_date
+  from badges b
+  group by b.userid
+),
+-- compute normalized score per post vs site average for that day
+post_score_norm as (
+  select
+    pn.id,
+    pn.owneruserid as user_id,
+    pn.posttypeid,
+    pn.creationdate::date as d,
+    pn.score,
+    pn.score - avg(pn.score) over (partition by pn.creationdate::date, pn.posttypeid) as score_vs_daytype
+  from posts_norm pn
+  where pn.posttypeid in (1,2)
+),
+user_score_norm as (
+  select
+    user_id,
+    avg(score_vs_daytype) as avg_score_vs_daytype,
+    stddev_pop(score_vs_daytype) as std_score_vs_daytype
+  from post_score_norm
+  group by user_id
+)
+select
+  u.user_id,
+  coalesce(u.displayname, concat('user#', u.user_id::text)) as displayname,
+  coalesce(nullif(trim(u.location), ''), 'Unknown') as location,
+  u.reputation,
+  u.views,
+  u.upvotes,
+  u.downvotes,
+  u.rn_global,
+  u.rn_location,
+  ua.q_count,
+  ua.a_count,
+  ua.total_score,
+  ua.avg_q_score,
+  ua.avg_a_score,
+  ua.p90_post_score,
+  ua.distinct_questions,
+  ua.distinct_answered_questions,
+  ua.questions_with_accept,
+  vs.upmods_received,
+  vs.downmods_received,
+  vs.bounty_total,
+  cs.comments_made,
+  cs.pos_comments,
+  cs.avg_comment_score,
+  cs.gratitude_comments,
+  cs.slang_comments,
+  ud.times_marked_dup,
+  ud.times_used_as_canonical,
+  ud.has_outgoing_links,
+  rs.posts_30d,
+  rs.answers_30d,
+  rs.upmods_30d_received,
+  coalesce(rg.gold_last_year, 0) as gold_last_year,
+  rg.last_gold_date,
+  usn.avg_score_vs_daytype,
+  usn.std_score_vs_daytype,
+  sl.max_streak_days,
+  string_agg(top.tag, ', ' order by top.tag) as top_tags,
+  -- complicated predicate-derived flags
+  case
+    when ua.a_count > 0 and (vs.upmods_received - vs.downmods_received) / nullif(ua.a_count::numeric, 0) > 2 then 'HighImpact'
+    when ua.q_count > 10 and ud.times_marked_dup::int > ua.q_count / 5 then 'NeedsTagCuration'
+    when coalesce(rg.gold_last_year, 0) >= 3 then 'RisingStar'
+    else 'Normal'
+  end as profile_flag,
+  -- embed last close reason code if the user recently closed their own question
+  max(case when cr.userid = u.user_id then cr.last_close_reason_code_raw end) as last_close_reason_code_raw,
+  -- include a sampled label from synth_set via cross join lateral for workload variety
+  (select s.label from synth_set s order by random() limit 1) as random_label
+from active_users u
+left join user_post_agg ua on ua.user_id = u.user_id
+left join vote_summary vs on vs.user_id = u.user_id
+left join comment_stats cs on cs.user_id = u.user_id
+left join user_dup_impact ud on ud.user_id = u.user_id
+left join recent_activity rs on rs.user_id = u.user_id
+left join recent_gold_badges rg on rg.user_id = u.user_id
+left join user_score_norm usn on usn.user_id = u.user_id
+left join close_reasons cr on cr.postid in (
+  select id from posts where owneruserid = u.user_id and posttypeid = 1
+)
+left join lateral (
+  select tag from user_tag_rank utr
+  where utr.user_id = u.user_id and utr.tag_rn <= 3 and utr.tag is not null
+  order by utr.tag_rn
+) top on true
+left join lateral (
+  select max(days_in_streak) as max_streak_days
+  from streak_lengths sl
+  where sl.user_id = u.user_id
+) sl on true
+where
+  -- complex predicate with NULL logic, string ops, and arithmetic
+  (
+    (u.reputation >= 1000 and ua.a_count >= 10)
+    or
+    (coalesce(u.location, '') ilike '%united%' and coalesce(ua.total_score, 0) > 100)
+    or
+    (u.websiteurl is not null and length(u.websiteurl) - length(replace(u.websiteurl, '.', '')) >= 1)
+  )
+  and coalesce(u.displayname, '') not ilike '%bot%'
+group by
+  u.user_id, u.displayname, u.location, u.reputation, u.views, u.upvotes, u.downvotes, u.rn_global, u.rn_location,
+  ua.q_count, ua.a_count, ua.total_score, ua.avg_q_score, ua.avg_a_score, ua.p90_post_score,
+  ua.distinct_questions, ua.distinct_answered_questions, ua.questions_with_accept,
+  vs.upmods_received, vs.downmods_received, vs.bounty_total,
+  cs.comments_made, cs.pos_comments, cs.avg_comment_score, cs.gratitude_comments, cs.slang_comments,
+  ud.times_marked_dup, ud.times_used_as_canonical, ud.has_outgoing_links,
+  rs.posts_30d, rs.answers_30d, rs.upmods_30d_received,
+  rg.gold_last_year, rg.last_gold_date,
+  usn.avg_score_vs_daytype, usn.std_score_vs_daytype,
+  sl.max_streak_days
+order by
+  profile_flag desc,
+  u.reputation desc,
+  ua.total_score desc nulls last,
+  ua.a_count desc nulls last
+limit 500;

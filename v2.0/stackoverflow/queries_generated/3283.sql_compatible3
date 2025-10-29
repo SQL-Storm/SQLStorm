@@ -1,0 +1,141 @@
+WITH q_posts AS (
+   SELECT p.Id,
+          p.Title,
+          COALESCE(p.Tags,'')                     AS Tags,
+          p.CreationDate,
+          p.Score,
+          p.ViewCount,
+          p.OwnerUserId,
+          p.AcceptedAnswerId,
+          p.ParentId,
+          ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId
+                             ORDER BY p.CreationDate DESC) AS rn_user
+   FROM Posts p
+   WHERE p.PostTypeId = 1
+     AND p.CreationDate >= CAST(CAST('2024-10-01' AS date) - INTERVAL '180 days' AS date)
+),
+tag_exploded AS (
+   SELECT qp.Id                              AS PostId,
+          TRIM(BOTH '<>' FROM regexp_split_to_table(qp.Tags, '><')) AS Tag,
+          qp.Score,
+          qp.ViewCount,
+          qp.CreationDate,
+          qp.OwnerUserId
+   FROM q_posts qp
+   WHERE qp.Tags <> ''
+),
+tag_stats AS (
+   SELECT te.Tag,
+          COUNT(*)                                            AS TagPostCount,
+          AVG(te.Score)                                       AS AvgScore,
+          SUM(te.ViewCount)                                   AS TotalViews,
+          MAX(te.CreationDate)                                AS LatestPostDate,
+          STRING_AGG(DISTINCT CAST(te.OwnerUserId AS varchar), ',' ) AS OwnerIds
+   FROM tag_exploded te
+   GROUP BY te.Tag
+),
+user_badges AS (
+   SELECT b.UserId,
+          SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END)      AS GoldBadges,
+          SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END)      AS SilverBadges,
+          SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END)      AS BronzeBadges,
+          STRING_AGG(DISTINCT b.Name, ';' )                 AS BadgeList
+   FROM Badges b
+   GROUP BY b.UserId
+),
+user_activity AS (
+   SELECT u.Id                                     AS UserId,
+          u.DisplayName,
+          u.Reputation,
+          u.CreationDate                           AS UserSince,
+          COALESCE(ub.GoldBadges,0)                AS GoldBadges,
+          COALESCE(ub.SilverBadges,0)              AS SilverBadges,
+          COALESCE(ub.BronzeBadges,0)              AS BronzeBadges,
+          ub.BadgeList,
+          (SELECT COUNT(*) FROM Posts p 
+            WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS QuestionCount,
+          (SELECT COUNT(*) FROM Posts p 
+            WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS AnswerCount,
+          (SELECT COUNT(*) FROM Comments c 
+            WHERE c.UserId = u.Id)                AS CommentCount,
+          (SELECT COUNT(*) FROM Votes v 
+            WHERE v.UserId = u.Id AND v.VoteTypeId = 2) AS UpVoteGiven
+   FROM Users u
+   LEFT JOIN user_badges ub ON ub.UserId = u.Id
+),
+post_votes AS (
+   SELECT v.PostId,
+          SUM(CASE WHEN v.VoteTypeId = 2 THEN 1
+                   WHEN v.VoteTypeId = 3 THEN -1
+                   ELSE 0 END)                     AS NetScore,
+          MAX(v.CreationDate)                       AS LastVoteDate
+   FROM Votes v
+   GROUP BY v.PostId
+)
+SELECT ua.UserId,
+       ua.DisplayName,
+       ua.Reputation,
+       ua.QuestionCount,
+       ua.AnswerCount,
+       ua.CommentCount,
+       ua.GoldBadges,
+       ua.SilverBadges,
+       ua.BronzeBadges,
+       ua.BadgeList,
+       COALESCE(ts.TagPostCount,0)                  AS TagPostCount,
+       COALESCE(ts.AvgScore,0)                      AS TagAvgScore,
+       COALESCE(ts.TotalViews,0)                    AS TagTotalViews,
+       ts.LatestPostDate,
+       pv.NetScore,
+       pv.LastVoteDate,
+       CASE
+         WHEN ua.Reputation > 20000 THEN 'Legendary'
+         WHEN ua.Reputation > 10000 THEN 'Expert'
+         WHEN ua.Reputation > 2000  THEN 'Intermediate'
+         ELSE 'Novice'
+       END                                          AS ReputationTier,
+       COALESCE(NULLIF(ts.OwnerIds,''), 'None')    AS TagOwnerIds
+FROM user_activity ua
+LEFT JOIN tag_stats ts
+  ON ts.Tag = ANY (
+        SELECT TRIM(BOTH '<>' FROM regexp_split_to_table(p.Tags, '><'))
+        FROM Posts p
+        WHERE p.OwnerUserId = ua.UserId
+          AND p.PostTypeId = 1
+        LIMIT 1
+     )
+LEFT JOIN post_votes pv
+  ON pv.PostId = (
+        SELECT p2.Id
+        FROM Posts p2
+        WHERE p2.OwnerUserId = ua.UserId
+          AND p2.PostTypeId = 1
+        ORDER BY p2.CreationDate DESC
+        LIMIT 1
+     )
+WHERE ua.Reputation IS NOT NULL
+
+UNION ALL
+
+SELECT NULL AS UserId,
+       NULL AS DisplayName,
+       NULL AS Reputation,
+       NULL AS QuestionCount,
+       NULL AS AnswerCount,
+       NULL AS CommentCount,
+       NULL AS GoldBadges,
+       NULL AS SilverBadges,
+       NULL AS BronzeBadges,
+       NULL AS BadgeList,
+       NULL AS TagPostCount,
+       NULL AS TagAvgScore,
+       NULL AS TagTotalViews,
+       NULL AS LatestPostDate,
+       NULL AS NetScore,
+       NULL AS LastVoteDate,
+       NULL AS ReputationTier,
+       NULL AS TagOwnerIds
+WHERE FALSE
+
+ORDER BY ReputationTier DESC NULLS LAST, Reputation DESC
+LIMIT 100;

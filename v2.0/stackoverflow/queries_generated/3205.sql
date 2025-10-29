@@ -1,0 +1,109 @@
+-- {"query": "3205.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2367} 
+
+/*  Complex performance‑benchmark query on the StackOverflow schema  */
+WITH TopRecentPosts AS (
+    SELECT
+        p.Id                         AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.Title,
+        p.Tags,
+        ROW_NUMBER() OVER (
+            PARTITION BY p.OwnerUserId
+            ORDER BY p.CreationDate DESC
+        )                           AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1                                 -- only questions
+      AND p.CreationDate >= CURRENT_DATE - INTERVAL '30 days'
+),
+UserBadgeAgg AS (
+    SELECT
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldCount,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverCount,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeCount,
+        STRING_AGG(DISTINCT b.Name, ', ')   AS BadgeList
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserVoteAgg AS (
+    SELECT
+        v.PostId,
+        SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS DownVoteCount
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY v.PostId
+),
+TagFrequency AS (
+    SELECT
+        TRIM(BOTH '<>' FROM UNNEST(string_to_array(p.Tags, '><'))) AS Tag,
+        COUNT(*)                                                    AS TagUseCount
+    FROM Posts p
+    WHERE p.Tags IS NOT NULL
+    GROUP BY 1
+)
+SELECT
+    u.Id                                            AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COALESCE(ub.GoldCount,   0)                     AS GoldBadges,
+    COALESCE(ub.SilverCount, 0)                     AS SilverBadges,
+    COALESCE(ub.BronzeCount, 0)                     AS BronzeBadges,
+    ub.BadgeList,
+    COALESCE(COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END), 0) AS QuestionCount,
+    COALESCE(COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END), 0) AS AnswerCount,
+    ROUND(
+        COALESCE(SUM(p.Score), 0)::numeric
+        / NULLIF(u.Reputation, 0),
+        4
+    )                                               AS ScorePerReputation,
+    STRING_AGG(
+        DISTINCT tf.Tag,
+        ', '
+    ) FILTER (WHERE tf.TagUseCount > 1000)         AS PopularTags,
+    MAX(p.CreationDate)                            AS LastPostDate,
+    COUNT(DISTINCT c.Id)                           AS CommentCount,
+    SUM(COALESCE(uv.UpVoteCount,   0))             AS TotalUpVotesOnPosts,
+    SUM(COALESCE(uv.DownVoteCount, 0))             AS TotalDownVotesOnPosts,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+FROM Users u
+LEFT JOIN TopRecentPosts p
+       ON p.OwnerUserId = u.Id AND p.rn = 1                -- most recent post per user
+LEFT JOIN UserBadgeAgg ub
+       ON ub.UserId = u.Id
+LEFT JOIN Comments c
+       ON c.UserId = u.Id
+LEFT JOIN UserVoteAgg uv
+       ON uv.PostId = p.PostId
+LEFT JOIN TagFrequency tf
+       ON tf.Tag = ANY (string_to_array(p.Tags, '><'))
+WHERE (u.CreationDate < CURRENT_DATE - INTERVAL '1 year' OR u.Reputation > 5000)
+GROUP BY
+    u.Id, u.DisplayName, u.Reputation,
+    ub.GoldCount, ub.SilverCount, ub.BronzeCount, ub.BadgeList
+HAVING COUNT(*) FILTER (WHERE p.PostId IS NOT NULL) > 0
+
+UNION ALL
+
+/*  Dummy row to test set‑operator handling  */
+SELECT
+    -1                AS UserId,
+    'No‑Activity‑Summary' AS DisplayName,
+    NULL              AS Reputation,
+    0                 AS GoldBadges,
+    0                 AS SilverBadges,
+    0                 AS BronzeBadges,
+    NULL              AS BadgeList,
+    0                 AS QuestionCount,
+    0                 AS AnswerCount,
+    NULL              AS ScorePerReputation,
+    NULL              AS PopularTags,
+    NULL              AS LastPostDate,
+    0                 AS CommentCount,
+    0                 AS TotalUpVotesOnPosts,
+    0                 AS TotalDownVotesOnPosts,
+    NULL              AS ReputationRank
+WHERE NOT EXISTS (SELECT 1 FROM Posts p2);

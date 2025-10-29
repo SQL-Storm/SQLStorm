@@ -1,0 +1,188 @@
+WITH UserProfileSummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS UserTotalUpVotesGiven,
+        U.DownVotes AS UserTotalDownVotesGiven,
+        U.Location,
+        U.AboutMe,
+        COUNT(DISTINCT P.Id) AS TotalPostsCreated,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestionsAsked,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswersProvided,
+        SUM(P.Score) AS TotalPostScoreReceived,
+        SUM(P.ViewCount) AS TotalPostViewsReceived,
+        SUM(P.FavoriteCount) AS TotalFavoriteCountsReceived,
+        MAX(P.LastActivityDate) AS LastPostActivityDate,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        COALESCE(SUM(C.Score), 0) AS TotalCommentScoreReceived,
+        COUNT(DISTINCT CASE WHEN B.Class = 1 THEN B.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN B.Class = 2 THEN B.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN B.Class = 3 THEN B.Id END) AS BronzeBadges,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - U.CreationDate)) / (60 * 60 * 24) AS UserAccountAgeDays,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - U.LastAccessDate)) / (60 * 60 * 24) AS DaysSinceLastAccess
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Views, U.UpVotes, U.DownVotes, U.Location, U.AboutMe
+),
+PostEngagementMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.LastActivityDate,
+        P.ClosedDate,
+        P.Title,
+        P.Tags,
+        P.AcceptedAnswerId,
+        (SELECT COUNT(DISTINCT PL.RelatedPostId) FROM PostLinks PL WHERE PL.PostId = P.Id AND PL.LinkTypeId = 1) AS LinkedPostCount,
+        (SELECT COUNT(DISTINCT PH.Id) FROM PostHistory PH WHERE PH.PostId = P.Id AND PH.PostHistoryTypeId IN (4, 5, 6)) AS EditCount,
+        (SELECT COUNT(DISTINCT PH.UserId) FROM PostHistory PH WHERE PH.PostId = P.Id AND PH.PostHistoryTypeId IN (4, 5, 6) AND PH.UserId IS NOT NULL) AS UniqueEditorCount,
+        (
+            SELECT CR.Name
+            FROM PostHistory PH_Close
+            LEFT JOIN CloseReasonTypes CR ON PH_Close.Comment = CAST(CR.Id AS varchar)
+            WHERE PH_Close.PostId = P.Id AND PH_Close.PostHistoryTypeId = 10
+            ORDER BY PH_Close.CreationDate DESC
+            LIMIT 1
+        ) AS LastCloseReason,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - P.CreationDate)) / (60 * 60 * 24) AS PostAgeDays,
+        COALESCE(P.AnswerCount, 0) * 1.5 + COALESCE(P.FavoriteCount, 0) * 3 + P.Score * 0.8 + COALESCE(P.ViewCount, 0) * 0.05 + COALESCE(P.CommentCount, 0) * 1.2 AS BasePostEngagementScore,
+        CASE
+            WHEN P.ClosedDate IS NOT NULL THEN -50.0
+            WHEN P.CommunityOwnedDate IS NOT NULL THEN 10.0
+            ELSE 0.0
+        END AS PostStatusModifier,
+        CASE
+            WHEN P.LastActivityDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days' THEN 10.0
+            WHEN P.LastActivityDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days' THEN 5.0
+            ELSE 0.0
+        END AS RecencyBoost
+    FROM Posts P
+    JOIN PostTypes PT ON P.PostTypeId = PT.Id
+    WHERE P.OwnerUserId IS NOT NULL AND P.PostTypeId IN (1, 2)
+),
+RankedPostPerformance AS (
+    SELECT
+        PEM.PostId,
+        PEM.PostTypeId,
+        PEM.PostTypeName,
+        PEM.OwnerUserId,
+        PEM.PostCreationDate,
+        PEM.PostScore,
+        PEM.ViewCount,
+        PEM.AnswerCount,
+        PEM.CommentCount,
+        PEM.FavoriteCount,
+        PEM.LastActivityDate,
+        PEM.ClosedDate,
+        PEM.Title,
+        PEM.Tags,
+        PEM.AcceptedAnswerId,
+        PEM.LinkedPostCount,
+        PEM.EditCount,
+        PEM.UniqueEditorCount,
+        PEM.LastCloseReason,
+        PEM.PostAgeDays,
+        PEM.BasePostEngagementScore,
+        PEM.PostStatusModifier,
+        PEM.RecencyBoost,
+        UPS.DisplayName AS OwnerDisplayName,
+        UPS.Reputation AS OwnerReputation,
+        (PEM.BasePostEngagementScore + PEM.PostStatusModifier + PEM.RecencyBoost) AS FinalPostEngagementScore,
+        ROW_NUMBER() OVER (PARTITION BY PEM.OwnerUserId ORDER BY (PEM.BasePostEngagementScore + PEM.PostStatusModifier + PEM.RecencyBoost) DESC, PEM.PostCreationDate DESC) AS UserPostRank,
+        AVG(LENGTH(PEM.Title)) OVER (PARTITION BY PEM.OwnerUserId) AS AvgTitleLengthForUser,
+        AVG(PEM.PostScore) OVER (PARTITION BY PEM.OwnerUserId) AS AvgScoreForUserPosts
+    FROM PostEngagementMetrics PEM
+    JOIN UserProfileSummary UPS ON PEM.OwnerUserId = UPS.UserId
+),
+UserInfluenceScore AS (
+    SELECT
+        UPS.UserId,
+        UPS.DisplayName,
+        UPS.Reputation,
+        UPS.UserAccountAgeDays,
+        UPS.DaysSinceLastAccess,
+        UPS.TotalPostsCreated,
+        UPS.TotalQuestionsAsked,
+        UPS.TotalAnswersProvided,
+        UPS.GoldBadges,
+        UPS.SilverBadges,
+        UPS.BronzeBadges,
+        COALESCE(SUM(RPP.FinalPostEngagementScore) / NULLIF(UPS.TotalPostsCreated, 0), 0) AS AvgEngagementScorePerPost,
+        UPS.Reputation * 0.5
+        + UPS.GoldBadges * 10
+        + UPS.SilverBadges * 5
+        + UPS.BronzeBadges * 2
+        + COALESCE(SUM(RPP.FinalPostEngagementScore) * 0.1, 0)
+        + COALESCE(UPS.UserProfileViews * 0.01, 0)
+        - (UPS.DaysSinceLastAccess / 365.0) * 0.5
+        + (CASE WHEN UPS.AboutMe IS NOT NULL AND LENGTH(TRIM(UPS.AboutMe)) > 50 THEN 5 ELSE 0 END)
+        AS OverallInfluenceScore,
+        NTILE(10) OVER (ORDER BY (UPS.Reputation * 0.5 + UPS.GoldBadges * 10 + COALESCE(SUM(RPP.FinalPostEngagementScore),0) * 0.1) DESC) AS InfluenceDecile
+    FROM UserProfileSummary UPS
+    LEFT JOIN RankedPostPerformance RPP ON UPS.UserId = RPP.OwnerUserId
+    GROUP BY UPS.UserId, UPS.DisplayName, UPS.Reputation, UPS.UserAccountAgeDays, UPS.DaysSinceLastAccess, UPS.TotalPostsCreated,
+             UPS.TotalQuestionsAsked, UPS.TotalAnswersProvided, UPS.GoldBadges, UPS.SilverBadges, UPS.BronzeBadges,
+             UPS.UserProfileViews, UPS.AboutMe
+)
+SELECT
+    UIS.DisplayName AS User_DisplayName,
+    UIS.Reputation AS User_Reputation,
+    UIS.OverallInfluenceScore,
+    UIS.InfluenceDecile,
+    RPP.PostTypeName AS Top_Post_Type,
+    RPP.Title AS Top_Post_Title,
+    RPP.PostScore AS Top_Post_Score,
+    RPP.ViewCount AS Top_Post_ViewCount,
+    RPP.FavoriteCount AS Top_Post_FavoriteCount,
+    RPP.FinalPostEngagementScore AS Top_Post_EngagementScore,
+    RPP.PostAgeDays AS Top_Post_Age_Days,
+    RPP.LinkedPostCount AS Top_Post_LinkedCount,
+    RPP.EditCount AS Top_Post_EditCount,
+    RPP.UniqueEditorCount AS Top_Post_UniqueEditors,
+    COALESCE(RPP.LastCloseReason, 'Not Closed') AS Top_Post_LastCloseReason,
+    UPS.Location AS User_Location,
+    SUBSTRING(COALESCE(UPS.AboutMe, 'No "About Me" description.'), 1, 100) || CASE WHEN LENGTH(COALESCE(UPS.AboutMe, '')) > 100 THEN '...' ELSE '' END AS User_AboutMe_Excerpt,
+    CASE
+        WHEN UIS.Reputation >= 100000 THEN 'Legendary'
+        WHEN UIS.Reputation >= 20000 THEN 'Highly Respected'
+        WHEN UIS.Reputation >= 5000 THEN 'Respected'
+        WHEN UIS.Reputation >= 1000 THEN 'Established'
+        ELSE 'Contributor'
+    END AS User_Reputation_Tier,
+    (
+        SELECT COUNT(DISTINCT B2.Name)
+        FROM Badges B2
+        WHERE B2.UserId = UIS.UserId AND B2.Date > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year' AND B2.Class = 1
+    ) AS GoldBadges_LastYearCount,
+    REPLACE(TRIM(SUBSTRING(RPP.Tags, 2, LENGTH(RPP.Tags) - 2)), '><', ', ') AS Top_Post_Tags_Formatted
+FROM UserInfluenceScore UIS
+JOIN RankedPostPerformance RPP ON UIS.UserId = RPP.OwnerUserId AND RPP.UserPostRank = 1
+LEFT JOIN UserProfileSummary UPS ON UIS.UserId = UPS.UserId
+WHERE
+    UIS.OverallInfluenceScore > (SELECT AVG(OverallInfluenceScore) * 0.5 FROM UserInfluenceScore WHERE TotalPostsCreated > 0)
+    AND UIS.TotalPostsCreated >= 5
+    AND UIS.DaysSinceLastAccess < 365
+    AND (
+        (UPS.Location IS NOT NULL AND LOWER(UPS.Location) LIKE '%stack%')
+        OR (UPS.AboutMe IS NOT NULL AND LOWER(UPS.AboutMe) LIKE '%developer%')
+        OR (RPP.PostTypeName = 'Question' AND RPP.PostAgeDays < 730)
+    )
+ORDER BY
+    UIS.OverallInfluenceScore DESC,
+    RPP.FinalPostEngagementScore DESC,
+    UIS.Reputation DESC
+LIMIT 1000;

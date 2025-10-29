@@ -1,0 +1,240 @@
+-- {"query": "1526.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3367} 
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(P.Score) AS TotalPostScore,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        SUM(COALESCE(C.Score, 0)) AS TotalCommentScore,
+        MAX(U.LastAccessDate) AS LastActivity,
+        COUNT(B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(DISTINCT VH.RevisionGUID) AS UniquePostHistoryRevisions
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    LEFT JOIN Badges AS B ON U.Id = B.UserId
+    LEFT JOIN PostHistory AS VH ON U.Id = VH.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate
+    HAVING COUNT(DISTINCT P.Id) > 5 AND U.Reputation > 1000 AND MAX(U.LastAccessDate) > (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year')
+),
+PostVersionHistory AS (
+    SELECT
+        PH.PostId,
+        COUNT(PH.Id) AS TotalRevisions,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditCount, -- Title, Body, Tags edits
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.CreationDate ELSE NULL END) AS LastClosedDate,
+        MIN(PH.CreationDate) AS FirstRevisionDate,
+        MAX(PH.CreationDate) AS LastRevisionDate,
+        COUNT(DISTINCT PH.UserId) AS DistinctEditors,
+        MAX(PH.CreationDate) FILTER (WHERE PH.PostHistoryTypeId = 50) AS LastCommunityBumpDate -- CommunityBump type
+    FROM PostHistory AS PH
+    GROUP BY PH.PostId
+),
+PostLinkAggregates AS (
+    SELECT
+        P.Id AS PostId,
+        COUNT(DISTINCT PL_Linked.RelatedPostId) AS OutboundLinks,
+        COUNT(DISTINCT PL_Duplicated.RelatedPostId) AS OutboundDuplicates,
+        COUNT(DISTINCT PL_IncomingLinked.PostId) AS InboundLinks,
+        COUNT(DISTINCT PL_IncomingDuplicated.PostId) AS InboundDuplicates,
+        SUM(CASE WHEN LT.Name = 'Linked' THEN 1 ELSE 0 END) AS TotalLinkedEvents,
+        SUM(CASE WHEN LT.Name = 'Duplicate' THEN 1 ELSE 0 END) AS TotalDuplicateEvents
+    FROM Posts AS P
+    LEFT JOIN PostLinks AS PL_Linked ON P.Id = PL_Linked.PostId AND PL_Linked.LinkTypeId = (SELECT Id FROM LinkTypes WHERE Name = 'Linked')
+    LEFT JOIN PostLinks AS PL_Duplicated ON P.Id = PL_Duplicated.PostId AND PL_Duplicated.LinkTypeId = (SELECT Id FROM LinkTypes WHERE Name = 'Duplicate')
+    LEFT JOIN PostLinks AS PL_IncomingLinked ON P.Id = PL_IncomingLinked.RelatedPostId AND PL_IncomingLinked.LinkTypeId = (SELECT Id FROM LinkTypes WHERE Name = 'Linked')
+    LEFT JOIN PostLinks AS PL_IncomingDuplicated ON P.Id = PL_IncomingDuplicated.RelatedPostId AND PL_IncomingDuplicated.LinkTypeId = (SELECT Id FROM LinkTypes WHERE Name = 'Duplicate')
+    LEFT JOIN LinkTypes AS LT ON PL_Linked.LinkTypeId = LT.Id OR PL_Duplicated.LinkTypeId = LT.Id OR PL_IncomingLinked.LinkTypeId = LT.Id OR PL_IncomingDuplicated.LinkTypeId = LT.Id
+    GROUP BY P.Id
+),
+TagPerformance AS (
+    SELECT
+        P.Id AS PostId,
+        TRIM(UNNEST(STRING_TO_ARRAY(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><'))) AS TagName
+    FROM Posts AS P
+    WHERE P.Tags IS NOT NULL AND P.PostTypeId = (SELECT Id FROM PostTypes WHERE Name = 'Question')
+),
+RankedPosts AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.Title,
+        P.OwnerUserId,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.LastActivityDate,
+        P.AnswerCount,
+        P.CommentCount,
+        P.FavoriteCount,
+        P.AcceptedAnswerId,
+        P.ParentId,
+        PVH.TotalRevisions,
+        PVH.EditCount,
+        COALESCE(PLA.OutboundLinks, 0) AS OutboundLinks,
+        COALESCE(PLA.InboundLinks, 0) AS InboundLinks,
+        COALESCE(PLA.OutboundDuplicates, 0) AS OutboundDuplicates,
+        COALESCE(PLA.InboundDuplicates, 0) AS InboundDuplicates,
+        CAST(COALESCE(P.ViewCount, 0) AS NUMERIC) / NULLIF(COALESCE(P.Score, 0), 0) AS ViewScoreRatio,
+        COALESCE(P.FavoriteCount, 0) + COALESCE(P.AnswerCount, 0) + COALESCE(P.CommentCount, 0) AS EngagementScore,
+        RANK() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.ViewCount DESC) AS RankByScoreViews,
+        NTILE(10) OVER (ORDER BY P.CreationDate DESC, P.LastActivityDate DESC) AS ActivityDecile,
+        LAG(P.LastActivityDate, 1, P.CreationDate) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate) AS PreviousPostActivityDate
+    FROM Posts AS P
+    INNER JOIN PostTypes AS PT ON P.PostTypeId = PT.Id
+    LEFT JOIN PostVersionHistory AS PVH ON P.Id = PVH.PostId
+    LEFT JOIN PostLinkAggregates AS PLA ON P.Id = PLA.PostId
+    WHERE P.PostTypeId IN ((SELECT Id FROM PostTypes WHERE Name = 'Question'), (SELECT Id FROM PostTypes WHERE Name = 'Answer'))
+    AND P.CreationDate >= '2022-01-01'
+    AND P.Score >= 0
+),
+AuthoritativeQuestions AS (
+    SELECT
+        RP.PostId,
+        RP.PostTypeId,
+        RP.PostTypeName,
+        RP.Title,
+        RP.OwnerUserId,
+        U.DisplayName AS OwnerDisplayName,
+        UE.TotalQuestions AS AuthorQuestions,
+        UE.TotalAnswers AS AuthorAnswers,
+        RP.Score,
+        RP.ViewCount,
+        RP.CreationDate,
+        RP.FavoriteCount,
+        RP.AnswerCount,
+        RP.TotalRevisions,
+        RP.EditCount,
+        RP.InboundLinks,
+        RP.InboundDuplicates,
+        RP.RankByScoreViews,
+        RP.ActivityDecile,
+        (
+            SELECT MAX(B.Date)
+            FROM Badges AS B
+            JOIN TagPerformance AS TP ON TP.PostId = RP.PostId
+            WHERE B.UserId = RP.OwnerUserId
+              AND B.TagBased = TRUE
+              AND B.Class = (SELECT Id FROM Badges WHERE Class = 1 LIMIT 1) -- Gold Badge
+              AND B.Name = TP.TagName
+        ) AS GoldTagBadgeDateForPost, -- Correlated subquery example
+        CASE
+            WHEN RP.AnswerCount > 5 AND RP.Score > 50 AND RP.FavoriteCount > 10 AND RP.InboundLinks > 2 THEN 'HighImpact'
+            WHEN RP.AnswerCount > 2 AND RP.Score > 10 AND RP.FavoriteCount > 2 AND RP.InboundLinks > 0 THEN 'MediumImpact'
+            ELSE 'LowImpact'
+        END AS ImpactCategory,
+        COALESCE(UPPER(SUBSTRING(RP.Title, 1, 1)), '#') AS TitleInitialChar,
+        (RP.Score * 0.4 + RP.ViewCount * 0.05 + RP.AnswerCount * 0.3 + RP.FavoriteCount * 0.2 + RP.InboundLinks * 0.05) AS CompositeEngagementScore,
+        RP.PreviousPostActivityDate
+    FROM RankedPosts AS RP
+    INNER JOIN Users AS U ON RP.OwnerUserId = U.Id
+    LEFT JOIN UserEngagement AS UE ON RP.OwnerUserId = UE.UserId
+    WHERE RP.PostTypeId = (SELECT Id FROM PostTypes WHERE Name = 'Question')
+    AND RP.RankByScoreViews <= 200 -- Top N questions by score/views
+    AND RP.ViewScoreRatio < 1000
+    AND RP.EditCount > 0
+),
+HighlyVotedAnswers AS (
+    SELECT
+        RP.PostId,
+        RP.PostTypeId,
+        RP.PostTypeName,
+        RP.Title,
+        RP.OwnerUserId,
+        U.DisplayName AS OwnerDisplayName,
+        UE.TotalAnswers AS AuthorTotalAnswers,
+        UE.GoldBadges AS AuthorGoldBadges,
+        RP.Score,
+        RP.ViewCount,
+        RP.CreationDate,
+        P_Parent.Title AS ParentQuestionTitle,
+        P_Parent.OwnerUserId AS ParentQuestionOwnerId,
+        P_Parent.AcceptedAnswerId AS ParentAcceptedAnswerId,
+        RP.PreviousPostActivityDate,
+        CASE
+            WHEN P_Parent.AcceptedAnswerId = RP.Id THEN 'AcceptedAnswer'
+            WHEN RP.Score > 20 AND RP.OwnerUserId IS NOT NULL THEN 'HighlyUpvoted'
+            WHEN RP.Score > 5 THEN 'ModeratelyUpvoted'
+            ELSE 'NormalAnswer'
+        END AS AnswerStatus,
+        RP.CompositeEngagementScore,
+        EXTRACT(EPOCH FROM (RP.CreationDate - RP.PreviousPostActivityDate)) / 3600 AS TimeSincePrevPostHours -- Calculation: Time difference in hours
+    FROM RankedPosts AS RP
+    INNER JOIN Users AS U ON RP.OwnerUserId = U.Id
+    LEFT JOIN Posts AS P_Parent ON RP.ParentId = P_Parent.Id
+    LEFT JOIN UserEngagement AS UE ON RP.OwnerUserId = UE.UserId
+    WHERE RP.PostTypeId = (SELECT Id FROM PostTypes WHERE Name = 'Answer')
+    AND RP.Score > 5
+    AND RP.RankByScoreViews <= 300
+    AND P_Parent.AcceptedAnswerId IS NOT NULL -- Only answers to questions that have an accepted answer
+)
+SELECT
+    'Question' AS ContentType,
+    AQ.PostId AS EntityId,
+    AQ.PostTypeName,
+    AQ.Title AS EntityTitle,
+    AQ.OwnerUserId,
+    AQ.OwnerDisplayName,
+    AQ.Score,
+    AQ.ViewCount,
+    AQ.FavoriteCount AS EngagementMetric,
+    AQ.CreationDate,
+    AGE(cast('2024-10-01 12:34:56' as timestamp), AQ.CreationDate) AS AgeOfPost,
+    AQ.ImpactCategory,
+    COALESCE(AQ.GoldTagBadgeDateForPost IS NOT NULL, FALSE) AS HasGoldTagBadgeForPost, -- NULL logic using COALESCE
+    NULL AS ParentEntityTitle,
+    NULL AS AnswerStatus,
+    AQ.CompositeEngagementScore,
+    AQ.TitleInitialChar,
+    UE_Main.TotalBadges AS AuthorTotalBadges,
+    UE_Main.Reputation AS AuthorReputation,
+    UE_Main.UniquePostHistoryRevisions AS AuthorTotalRevisions
+FROM AuthoritativeQuestions AS AQ
+LEFT JOIN UserEngagement AS UE_Main ON AQ.OwnerUserId = UE_Main.UserId
+WHERE COALESCE(AQ.GoldTagBadgeDateForPost IS NOT NULL, FALSE) -- Filter only if the user has a relevant gold tag badge (NULL-safe)
+AND AQ.CompositeEngagementScore > 150
+AND LENGTH(AQ.Title) > 15
+AND (AQ.Title ILIKE '%performance%' OR AQ.Title ILIKE '%optimization%' OR AQ.Title ILIKE '%scaling%') -- String matching on multiple patterns
+AND UE_Main.TotalBadges IS NOT NULL -- Ensure user engagement data is present
+AND AGE(cast('2024-10-01 12:34:56' as timestamp), AQ.CreationDate) < INTERVAL '6 months' -- Recent posts
+UNION ALL
+SELECT
+    'Answer' AS ContentType,
+    HVA.PostId AS EntityId,
+    HVA.PostTypeName,
+    HVA.Title AS EntityTitle,
+    HVA.OwnerUserId,
+    HVA.OwnerDisplayName,
+    HVA.Score,
+    HVA.ViewCount,
+    HVA.AuthorTotalAnswers AS EngagementMetric,
+    HVA.CreationDate,
+    AGE(cast('2024-10-01 12:34:56' as timestamp), HVA.CreationDate) AS AgeOfPost,
+    NULL AS ImpactCategory,
+    COALESCE(HVA.AuthorGoldBadges > 0, FALSE) AS HasGoldTagBadgeForPost,
+    HVA.ParentQuestionTitle,
+    HVA.AnswerStatus,
+    HVA.CompositeEngagementScore,
+    COALESCE(UPPER(SUBSTRING(HVA.Title, 1, 1)), '#') AS TitleInitialChar,
+    UE_Main.TotalBadges AS AuthorTotalBadges,
+    UE_Main.Reputation AS AuthorReputation,
+    UE_Main.UniquePostHistoryRevisions AS AuthorTotalRevisions
+FROM HighlyVotedAnswers AS HVA
+LEFT JOIN UserEngagement AS UE_Main ON HVA.OwnerUserId = UE_Main.UserId
+WHERE HVA.AnswerStatus = 'AcceptedAnswer'
+AND HVA.CompositeEngagementScore > 75
+AND HVA.ParentQuestionTitle IS NOT NULL
+AND HVA.TimeSincePrevPostHours IS NOT NULL AND HVA.TimeSincePrevPostHours < 240 -- Answer posted within 10 days of previous post
+AND HVA.OwnerDisplayName IS NOT NULL AND HVA.OwnerDisplayName != ''
+AND UE_Main.Reputation > 5000
+ORDER BY CompositeEngagementScore DESC, AgeOfPost ASC, HasGoldTagBadgeForPost DESC
+LIMIT 750;

@@ -1,0 +1,411 @@
+with recent_users as (
+  select u.id as user_id,
+         u.displayname,
+         u.reputation,
+         u.creationdate,
+         date_trunc('month', u.creationdate) as cohort_month,
+         coalesce(nullif(trim(u.location), ''), 'Unknown') as location_norm
+  from users u
+  where u.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+),
+q_posts as (
+  select p.id,
+         p.owneruserid as user_id,
+         p.creationdate,
+         p.score,
+         p.viewcount,
+         p.title,
+         p.tags,
+         p.acceptedanswerid,
+         p.closeddate
+  from posts p
+  where p.posttypeid = 1
+),
+a_posts as (
+  select p.id,
+         p.parentid as question_id,
+         p.owneruserid as user_id,
+         p.creationdate,
+         p.score
+  from posts p
+  where p.posttypeid = 2
+),
+q_activity as (
+  select q.id as question_id,
+         q.user_id,
+         q.creationdate as q_created,
+         q.score as q_score,
+         q.viewcount as q_views,
+         q.title as q_title,
+         q.tags as q_tags,
+         q.acceptedanswerid,
+         q.closeddate,
+         count(a.id) as answer_count,
+         sum(case when a.score > 0 then 1 else 0 end) as pos_answer_count,
+         max(a.creationdate) as last_answer_date,
+         min(a.creationdate) filter (where a.user_id = q.user_id) as self_answer_date
+  from q_posts q
+  left join a_posts a
+    on a.question_id = q.id
+  group by q.id, q.user_id, q.creationdate, q.score, q.viewcount, q.title, q.tags, q.acceptedanswerid, q.closeddate
+),
+tag_expanded as (
+  select qa.question_id,
+         unnest(string_to_array(substring(qa.q_tags, 2, length(qa.q_tags)-2), '><')) as tag
+  from q_activity qa
+  where qa.q_tags is not null
+    and qa.q_tags like '<%>'
+),
+user_stats as (
+  select ru.user_id,
+         ru.displayname,
+         ru.location_norm,
+         ru.reputation,
+         ru.cohort_month,
+         count(distinct qa.question_id) as questions_asked,
+         sum(qa.q_views) as total_views,
+         avg(qa.q_score) as avg_q_score,
+         sum(case when qa.acceptedanswerid is not null then 1 else 0 end) as accepted_count,
+         sum(case when qa.closeddate is not null then 1 else 0 end) as closed_count,
+         avg(extract(epoch from (coalesce(qa.last_answer_date, cast('2024-10-01 12:34:56' as timestamp)) - qa.q_created))/3600.0) as avg_hours_to_last_answer,
+         sum(case when qa.self_answer_date is not null then 1 else 0 end) as self_answered_questions
+  from recent_users ru
+  left join q_activity qa
+    on qa.user_id = ru.user_id
+  group by ru.user_id, ru.displayname, ru.location_norm, ru.reputation, ru.cohort_month
+),
+votes_agg as (
+  select v.postid,
+         sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+         sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+         count(*) filter (where v.votetypeid in (2,3)) as net_vote_events
+  from votes v
+  where v.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+  group by v.postid
+),
+comments_agg as (
+  select c.postid,
+         count(*) as comment_count,
+         avg(c.score) as avg_comment_score,
+         max(c.creationdate) as last_comment_date
+  from comments c
+  where c.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+  group by c.postid
+),
+postlink_dups as (
+  select pl.postid,
+         count(*) filter (where pl.linktypeid = 3) as duplicate_links,
+         count(*) filter (where pl.linktypeid = 1) as linked_links
+  from postlinks pl
+  where pl.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+  group by pl.postid
+),
+hot_history as (
+  select ph.postid,
+         min(ph.creationdate) filter (where ph.posthistorytypeid = 52) as first_hot_date,
+         max(ph.creationdate) filter (where ph.posthistorytypeid = 53) as last_removed_hot_date,
+         count(*) filter (where ph.posthistorytypeid = 52) as hot_promotions
+  from posthistory ph
+  where ph.posthistorytypeid in (52,53)
+  group by ph.postid
+),
+close_reasons as (
+  select ph.postid,
+         count(*) filter (where ph.posthistorytypeid = 10) as close_events,
+         count(*) filter (where ph.posthistorytypeid = 11) as reopen_events,
+         array_agg(distinct nullif(trim(ph.comment), '')) filter (where ph.posthistorytypeid = 10 and ph.comment is not null) as close_reason_ids
+  from posthistory ph
+  where ph.posthistorytypeid in (10,11)
+  group by ph.postid
+),
+badge_summary as (
+  select b.userid,
+         sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+         sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+         sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+         sum(case when b.tagbased = true then 1 else 0 end) as tag_badges
+  from badges b
+  where b.date >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+  group by b.userid
+),
+tag_popularity as (
+  select te.tag,
+         count(distinct te.question_id) as questions_with_tag
+  from tag_expanded te
+  group by te.tag
+),
+user_top_tag as (
+  select te_owner.user_id,
+         te_owner.tag,
+         row_number() over (partition by te_owner.user_id order by count(*) desc, te_owner.tag) as rn
+  from (
+    select qa.user_id, te.tag
+    from q_activity qa
+    join tag_expanded te on te.question_id = qa.question_id
+  ) te_owner
+  group by te_owner.user_id, te_owner.tag
+),
+question_enriched as (
+  select qa.question_id,
+         qa.user_id,
+         qa.q_created,
+         qa.q_score,
+         qa.q_views,
+         qa.q_title,
+         qa.q_tags,
+         qa.acceptedanswerid,
+         qa.closeddate,
+         qa.answer_count,
+         qa.pos_answer_count,
+         qa.last_answer_date,
+         qa.self_answer_date,
+         coalesce(va.upvotes, 0) as upvotes,
+         coalesce(va.downvotes, 0) as downvotes,
+         coalesce(va.net_vote_events, 0) as net_vote_events,
+         coalesce(ca.comment_count, 0) as comment_count,
+         ca.avg_comment_score,
+         ca.last_comment_date,
+         coalesce(pl.duplicate_links, 0) as duplicate_links,
+         coalesce(pl.linked_links, 0) as linked_links,
+         hh.first_hot_date,
+         hh.last_removed_hot_date,
+         hh.hot_promotions,
+         cr.close_events,
+         cr.reopen_events,
+         cr.close_reason_ids
+  from q_activity qa
+  left join votes_agg va on va.postid = qa.question_id
+  left join comments_agg ca on ca.postid = qa.question_id
+  left join postlink_dups pl on pl.postid = qa.question_id
+  left join hot_history hh on hh.postid = qa.question_id
+  left join close_reasons cr on cr.postid = qa.question_id
+),
+question_scored as (
+  select qe.question_id,
+         qe.user_id,
+         qe.q_created,
+         qe.q_score,
+         qe.q_views,
+         qe.q_title,
+         qe.q_tags,
+         qe.acceptedanswerid,
+         qe.closeddate,
+         qe.answer_count,
+         qe.pos_answer_count,
+         qe.last_answer_date,
+         qe.self_answer_date,
+         qe.upvotes,
+         qe.downvotes,
+         qe.net_vote_events,
+         qe.comment_count,
+         qe.avg_comment_score,
+         qe.last_comment_date,
+         qe.duplicate_links,
+         qe.linked_links,
+         qe.first_hot_date,
+         qe.last_removed_hot_date,
+         qe.hot_promotions,
+         qe.close_events,
+         qe.reopen_events,
+         qe.close_reason_ids,
+         -- popularity score mixing views, votes, comments, recency, and duplicates
+         (coalesce(qe.q_views,0) / nullif(1 + qe.linked_links,0))
+         + 10 * (coalesce(qe.upvotes,0) - 0.5 * coalesce(qe.downvotes,0))
+         + 2 * coalesce(qe.comment_count,0)
+         + case when qe.first_hot_date is not null then 100 else 0 end
+         - 5 * coalesce(qe.duplicate_links,0)
+         - 20 * case when qe.close_events > coalesce(qe.reopen_events,0) then 1 else 0 end
+         + case when qe.acceptedanswerid is not null then 25 else 0 end
+         + greatest(0, 30 - extract(day from cast('2024-10-01 12:34:56' as timestamp) - qe.q_created))
+         as popularity_score
+  from question_enriched qe
+),
+ranked_questions as (
+  select qs.question_id,
+         qs.user_id,
+         qs.q_created,
+         qs.q_score,
+         qs.q_views,
+         qs.q_title,
+         qs.q_tags,
+         qs.acceptedanswerid,
+         qs.closeddate,
+         qs.answer_count,
+         qs.pos_answer_count,
+         qs.last_answer_date,
+         qs.self_answer_date,
+         qs.upvotes,
+         qs.downvotes,
+         qs.net_vote_events,
+         qs.comment_count,
+         qs.avg_comment_score,
+         qs.last_comment_date,
+         qs.duplicate_links,
+         qs.linked_links,
+         qs.first_hot_date,
+         qs.last_removed_hot_date,
+         qs.hot_promotions,
+         qs.close_events,
+         qs.reopen_events,
+         qs.close_reason_ids,
+         qs.popularity_score,
+         ru.displayname as owner_displayname,
+         ru.reputation as owner_reputation,
+         tp.tag as any_tag,
+         tp_pop.questions_with_tag,
+         row_number() over (partition by qs.user_id order by qs.popularity_score desc, qs.q_views desc, qs.q_score desc, qs.question_id) as user_q_rank,
+         ntile(100) over (order by qs.popularity_score desc) as popularity_percentile
+  from question_scored qs
+  left join recent_users ru on ru.user_id = qs.user_id
+  left join tag_expanded tp on tp.question_id = qs.question_id
+  left join tag_popularity tp_pop on tp_pop.tag = tp.tag
+),
+best_per_user as (
+  select *
+  from ranked_questions
+  where user_q_rank <= 3
+),
+cohort_summary as (
+  select ru.cohort_month,
+         count(*) as users_in_cohort,
+         avg(ru.reputation) as avg_rep,
+         percentile_cont(0.5) within group (order by ru.reputation) as median_rep,
+         avg(us.questions_asked) as avg_questions_asked,
+         avg(us.total_views) as avg_total_views,
+         avg(us.avg_q_score) as avg_avg_q_score
+  from recent_users ru
+  left join user_stats us on us.user_id = ru.user_id
+  group by ru.cohort_month
+),
+all_candidates as (
+  select
+    'TOP_QUESTIONS' as bucket,
+    bp.question_id,
+    bp.user_id,
+    bp.owner_displayname,
+    bp.owner_reputation,
+    bp.q_created,
+    bp.q_score,
+    bp.q_views,
+    bp.answer_count,
+    bp.acceptedanswerid,
+    bp.popularity_score,
+    bp.popularity_percentile,
+    bp.any_tag,
+    bp.questions_with_tag
+  from best_per_user bp
+  union all
+  select
+    'HOT_DUPLICATES' as bucket,
+    qs.question_id,
+    qs.user_id,
+    ru.displayname,
+    ru.reputation,
+    qs.q_created,
+    qs.q_score,
+    qs.q_views,
+    qs.answer_count,
+    qs.acceptedanswerid,
+    qs.popularity_score,
+    qs.popularity_percentile,
+    tp.tag,
+    tpp.questions_with_tag
+  from question_scored qs
+  join postlink_dups d on d.postid = qs.question_id and d.duplicate_links > 0
+  left join recent_users ru on ru.user_id = qs.user_id
+  left join tag_expanded tp on tp.question_id = qs.question_id
+  left join tag_popularity tpp on tpp.tag = tp.tag
+  union all
+  select
+    'UNDERAPPRECIATED' as bucket,
+    qs.question_id,
+    qs.user_id,
+    ru.displayname,
+    ru.reputation,
+    qs.q_created,
+    qs.q_score,
+    qs.q_views,
+    qs.answer_count,
+    qs.acceptedanswerid,
+    qs.popularity_score,
+    qs.popularity_percentile,
+    tp.tag,
+    tpp.questions_with_tag
+  from question_scored qs
+  left join recent_users ru on ru.user_id = qs.user_id
+  left join tag_expanded tp on tp.question_id = qs.question_id
+  left join tag_popularity tpp on tpp.tag = tp.tag
+  where qs.q_score <= 0 and qs.q_views >= 1000
+),
+deduped as (
+  select ac.*,
+         row_number() over (
+           partition by ac.question_id, ac.bucket
+           order by ac.popularity_score desc, ac.q_views desc
+         ) as rn
+  from all_candidates ac
+),
+final_set as (
+  select d.*
+  from deduped d
+  where d.rn = 1
+),
+user_final as (
+  -- construct user_final from recent_users, user_stats, badge_summary, and user_top_tag
+  select ru.user_id,
+         ru.displayname,
+         ru.location_norm,
+         ru.reputation,
+         ru.cohort_month,
+         us.questions_asked,
+         us.total_views,
+         us.avg_q_score,
+         bs.gold_badges,
+         bs.silver_badges,
+         bs.bronze_badges,
+         bs.tag_badges,
+         utt.tag as top_tag
+  from recent_users ru
+  left join user_stats us on us.user_id = ru.user_id
+  left join badge_summary bs on bs.userid = ru.user_id
+  left join (
+    select user_id, tag
+    from user_top_tag
+    where rn = 1
+  ) utt on utt.user_id = ru.user_id
+)
+select
+  f.bucket,
+  f.question_id,
+  f.user_id,
+  coalesce(f.owner_displayname, 'User ' || cast(f.user_id as text)) as owner_displayname,
+  f.owner_reputation,
+  f.q_created,
+  f.q_score,
+  f.q_views,
+  f.answer_count,
+  case when f.acceptedanswerid is not null then true else false end as has_accepted_answer,
+  round(cast(f.popularity_score as numeric), 2) as popularity_score,
+  f.popularity_percentile,
+  coalesce(f.any_tag, 'untagged') as sample_tag,
+  coalesce(f.questions_with_tag, 0) as tag_question_count,
+  uf.location_norm as user_location,
+  uf.top_tag as user_top_tag,
+  uf.gold_badges,
+  uf.silver_badges,
+  uf.bronze_badges,
+  uf.tag_badges,
+  cs.cohort_month,
+  cs.users_in_cohort,
+  cs.avg_rep as cohort_avg_rep
+from final_set f
+left join user_final uf on uf.user_id = f.user_id
+left join cohort_summary cs on cs.cohort_month = uf.cohort_month
+where (f.bucket <> 'TOP_QUESTIONS' or f.popularity_percentile <= 10)
+  and (f.bucket <> 'UNDERAPPRECIATED' or f.q_created >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years')
+order by
+  f.bucket,
+  f.popularity_score desc,
+  f.q_views desc,
+  f.q_created desc
+limit 500;

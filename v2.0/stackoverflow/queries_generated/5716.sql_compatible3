@@ -1,0 +1,85 @@
+WITH recent_bounties AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    v.VoteTypeId,
+    v.UserId AS VoterUserId,
+    v.CreationDate AS VoteDate,
+    b.Date AS BadgeDate,
+    b.Name AS BadgeName,
+    u.Reputation,
+    u.DisplayName AS UserDisplayName,
+    LAST_VALUE(u.Reputation) OVER (PARTITION BY p.Id ORDER BY b.Date ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS LastReputation
+  FROM Posts p
+  LEFT JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId = 8
+  LEFT JOIN Badges b ON b.UserId = p.OwnerUserId
+  LEFT JOIN Users u ON u.Id = p.OwnerUserId
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '365' DAY)
+),
+tag_metrics AS (
+  SELECT
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId,
+    t.WikiPostId,
+    (SELECT COUNT(*) FROM Posts p2 WHERE p2.Tags LIKE '%' || t.TagName || '%' AND p2.PostTypeId = 1) AS TaggedQuestionCount,
+    (SELECT AVG(p3.Score) FROM Posts p3 WHERE p3.Tags LIKE '%' || t.TagName || '%' AND p3.PostTypeId = 1) AS AvgTagScore
+  FROM Tags t
+  WHERE (t.IsModeratorOnly = FALSE OR t.IsModeratorOnly IS NULL OR t.IsModeratorOnly = 0)
+),
+complex_filter AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    COALESCE(c.CommentCount, 0) AS CommentCount,
+    COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVotes,
+    COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownVotes,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+  FROM Posts p
+  LEFT JOIN Comments c ON c.PostId = p.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  WHERE p.PostTypeId = 1
+    AND p.OwnerUserId IS NOT NULL
+    AND p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2' YEAR)
+  GROUP BY p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.LastActivityDate, p.Score, p.ViewCount, p.Tags, c.CommentCount
+)
+SELECT
+  cf.Id AS PostId,
+  cf.Title,
+  up.DisplayName AS Owner,
+  cf.CreationDate,
+  cf.LastActivityDate,
+  cf.Score,
+  cf.ViewCount,
+  cf.Tags,
+  cf.CommentCount,
+  cf.UpVotes,
+  cf.DownVotes,
+  rb.BadgeName,
+  rb.BadgeDate,
+  rb.Reputation,
+  rb.LastReputation,
+  tm.TagName,
+  tm.Count AS TagCount,
+  tm.TaggedQuestionCount,
+  tm.AvgTagScore,
+  SUM(cf.ViewCount) OVER (PARTITION BY cf.OwnerUserId ORDER BY cf.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS RunningViews
+FROM complex_filter cf
+LEFT JOIN recent_bounties rb ON rb.PostId = cf.Id
+LEFT JOIN Users up ON up.Id = cf.OwnerUserId
+LEFT JOIN tag_metrics tm ON POSITION(tm.TagName IN cf.Tags) > 0
+WHERE cf.rn = 1
+ORDER BY cf.CreationDate DESC, cf.ViewCount DESC
+FETCH FIRST 100 ROWS ONLY;

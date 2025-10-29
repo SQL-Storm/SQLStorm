@@ -1,0 +1,138 @@
+-- {"query": "4375.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1658} 
+WITH UserPostInteractions AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.PostTypeId,
+        p.Score AS PostScore,
+        p.FavoriteCount AS PostFavoriteCount,
+        p.AnswerCount AS PostAnswerCount,
+        u.DisplayName AS OwnerDisplayName,
+        u.Reputation AS OwnerReputation,
+        COALESCE(c.CommentCount, 0) AS TotalComments,
+        COALESCE(ph.HistoryCount, 0) AS TotalHistoryEvents,
+        COALESCE(v.VoteCount, 0) AS TotalVotes
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS CommentCount
+        FROM Comments
+        GROUP BY PostId
+    ) c ON p.Id = c.PostId
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS HistoryCount
+        FROM PostHistory
+        GROUP BY PostId
+    ) ph ON p.Id = ph.PostId
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS VoteCount
+        FROM Votes
+        WHERE VoteTypeId IN (2, 3)
+        GROUP BY PostId
+    ) v ON p.Id = v.PostId
+    WHERE p.OwnerUserId IS NOT NULL
+),
+RankedPostInteractions AS (
+    SELECT
+        upi.*,
+        ROW_NUMBER() OVER(PARTITION BY upi.OwnerUserId ORDER BY upi.PostCreationDate DESC) AS UserPostRank,
+        AVG(upi.PostScore) OVER(PARTITION BY upi.OwnerUserId) AS AvgUserPostScore,
+        SUM(upi.PostFavoriteCount) OVER(PARTITION BY upi.OwnerUserId) AS TotalUserFavorites,
+        CASE
+            WHEN upi.PostTypeId = 1 THEN 'Question'
+            WHEN upi.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostTypeDescription,
+        DENSE_RANK() OVER (ORDER BY upi.OwnerReputation DESC) AS ReputationRank
+    FROM UserPostInteractions upi
+)
+SELECT
+    rpi.PostId,
+    rpi.OwnerUserId,
+    rpi.OwnerDisplayName,
+    rpi.PostCreationDate,
+    rpi.PostTypeDescription,
+    rpi.PostScore,
+    rpi.PostFavoriteCount,
+    rpi.PostAnswerCount,
+    rpi.TotalComments,
+    rpi.TotalHistoryEvents,
+    rpi.TotalVotes,
+    rpi.OwnerReputation,
+    rpi.UserPostRank,
+    rpi.AvgUserPostScore,
+    rpi.TotalUserFavorites,
+    rpi.ReputationRank,
+    CASE
+        WHEN rpi.PostScore > 1000 THEN 'High Score'
+        WHEN rpi.PostScore BETWEEN 100 AND 1000 THEN 'Medium Score'
+        ELSE 'Low Score'
+    END AS ScoreCategory,
+    CASE
+        WHEN rpi.UserPostRank <= 5 THEN 'Top 5 Recent'
+        WHEN rpi.UserPostRank <= 20 THEN 'Top 20 Recent'
+        ELSE 'Other Recent'
+    END AS RecentActivityCategory,
+    CASE
+        WHEN rpi.OwnerReputation > 50000 THEN 'Expert'
+        WHEN rpi.OwnerReputation > 10000 THEN 'Experienced'
+        ELSE 'Novice'
+    END AS UserExperienceLevel,
+    LOWER(SUBSTRING(rpi.OwnerDisplayName FROM 1 FOR 3)) AS DisplayNamePrefix,
+    (rpi.PostScore + rpi.PostFavoriteCount * 5 + rpi.TotalComments * 2) AS EngagementScore,
+    COALESCE(CAST(rpi.PostAnswerCount AS VARCHAR), 'N/A') AS AnswerCountStr
+FROM RankedPostInteractions rpi
+WHERE rpi.OwnerReputation > 1000
+  AND rpi.PostCreationDate BETWEEN '2020-01-01' AND '2023-12-31'
+  AND rpi.PostScore >= 0
+  AND rpi.PostTypeDescription <> 'Other'
+UNION
+SELECT
+    p.Id,
+    p.OwnerUserId,
+    u.DisplayName,
+    p.CreationDate,
+    CASE
+        WHEN p.PostTypeId = 1 THEN 'Question'
+        WHEN p.PostTypeId = 2 THEN 'Answer'
+        ELSE 'Other'
+    END,
+    p.Score,
+    p.FavoriteCount,
+    p.AnswerCount,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS TotalComments,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id) AS TotalHistoryEvents,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId IN (2, 3)) AS TotalVotes,
+    u.Reputation,
+    ROW_NUMBER() OVER(PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserPostRank,
+    AVG(p.Score) OVER(PARTITION BY p.OwnerUserId) AS AvgUserPostScore,
+    SUM(p.FavoriteCount) OVER(PARTITION BY p.OwnerUserId) AS TotalUserFavorites,
+    DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+    CASE
+        WHEN p.Score > 1000 THEN 'High Score'
+        WHEN p.Score BETWEEN 100 AND 1000 THEN 'Medium Score'
+        ELSE 'Low Score'
+    END AS ScoreCategory,
+    CASE
+        WHEN ROW_NUMBER() OVER(PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) <= 5 THEN 'Top 5 Recent'
+        WHEN ROW_NUMBER() OVER(PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) <= 20 THEN 'Top 20 Recent'
+        ELSE 'Other Recent'
+    END AS RecentActivityCategory,
+    CASE
+        WHEN u.Reputation > 50000 THEN 'Expert'
+        WHEN u.Reputation > 10000 THEN 'Experienced'
+        ELSE 'Novice'
+    END AS UserExperienceLevel,
+    LOWER(SUBSTRING(u.DisplayName FROM 1 FOR 3)) AS DisplayNamePrefix,
+    (p.Score + p.FavoriteCount * 5 + (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) * 2) AS EngagementScore,
+    COALESCE(CAST(p.AnswerCount AS VARCHAR), 'N/A') AS AnswerCountStr
+FROM Posts p
+LEFT JOIN Users u ON p.OwnerUserId = u.Id
+WHERE p.OwnerUserId IS NOT NULL
+  AND p.PostTypeId IN (1, 2)
+  AND p.ClosedDate IS NULL
+  AND EXISTS (SELECT 1 FROM Comments c WHERE c.PostId = p.Id AND c.Score > 5)
+  AND NOT EXISTS (SELECT 1 FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3)
+ORDER BY p.CreationDate DESC
+LIMIT 1000;

@@ -1,0 +1,174 @@
+WITH
+  RankedPostEdits AS (
+    SELECT
+      ph.PostId,
+      ph.UserId,
+      ph.UserDisplayName,
+      ph.CreationDate AS EditDate,
+      ph.PostHistoryTypeId,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) as rn
+    FROM
+      PostHistory ph
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6)
+  ),
+  UserPostActivity AS (
+    SELECT
+      p.OwnerUserId,
+      COUNT(DISTINCT p.Id) AS TotalPosts,
+      SUM(p.Score) AS TotalScore,
+      AVG(CAST(p.ViewCount AS NUMERIC)) AS AvgViewCount,
+      MAX(p.CreationDate) AS LatestPostDate
+    FROM
+      Posts p
+    WHERE
+      p.PostTypeId IN (1, 2)
+    GROUP BY
+      p.OwnerUserId
+  ),
+  TopContributors AS (
+    SELECT
+      upa.OwnerUserId,
+      u.DisplayName,
+      upa.TotalPosts,
+      upa.TotalScore,
+      upa.AvgViewCount,
+      (
+        SELECT COUNT(*) FROM Badges b WHERE b.UserId = upa.OwnerUserId AND b.Class = 1
+      ) AS GoldBadgeCount,
+      (
+        SELECT COUNT(*) FROM Badges b WHERE b.UserId = upa.OwnerUserId AND b.Class = 2
+      ) AS SilverBadgeCount,
+      (
+        SELECT COUNT(*) FROM Badges b WHERE b.UserId = upa.OwnerUserId AND b.Class = 3
+      ) AS BronzeBadgeCount
+    FROM
+      UserPostActivity upa
+    JOIN
+      Users u
+      ON upa.OwnerUserId = u.Id
+    WHERE
+      upa.TotalPosts > 100
+  ),
+  QuestionDetails AS (
+    SELECT
+      q.Id AS QuestionId,
+      q.Title,
+      q.CreationDate AS QuestionDate,
+      q.OwnerUserId AS QuestionOwnerUserId,
+      q.AnswerCount,
+      q.FavoriteCount,
+      q.ClosedDate,
+      pt.Name AS PostTypeName,
+      CASE
+        WHEN q.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN q.AnswerCount = 0 THEN 'Unanswered'
+        WHEN q.FavoriteCount > 10 THEN 'Popular'
+        ELSE 'Active'
+      END AS QuestionStatus
+    FROM
+      Posts q
+    JOIN
+      PostTypes pt
+      ON q.PostTypeId = pt.Id
+    WHERE
+      q.PostTypeId = 1
+  ),
+  AnswerDetails AS (
+    SELECT
+      a.Id AS AnswerId,
+      a.ParentId AS QuestionId,
+      a.OwnerUserId AS AnswerOwnerUserId,
+      a.Score AS AnswerScore,
+      a.CreationDate AS AnswerDate,
+      a.LastEditDate,
+      CASE
+        WHEN a.Score > (SELECT AVG(Score) FROM Posts p2 WHERE p2.ParentId = a.ParentId AND p2.PostTypeId = 2) THEN 'Above Average'
+        WHEN a.Score < (SELECT AVG(Score) FROM Posts p2 WHERE p2.ParentId = a.ParentId AND p2.PostTypeId = 2) THEN 'Below Average'
+        ELSE 'Average'
+      END AS AnswerQuality,
+      ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) as AnswerRank
+    FROM
+      Posts a
+    WHERE
+      a.PostTypeId = 2
+  )
+SELECT
+  qd.QuestionId,
+  qd.Title,
+  qd.QuestionDate,
+  tc.DisplayName AS TopContributorName,
+  tc.TotalPosts,
+  tc.TotalScore,
+  qd.AnswerCount,
+  qd.FavoriteCount,
+  qd.QuestionStatus,
+  ad.AnswerId,
+  ad.AnswerOwnerUserId,
+  ad.AnswerScore,
+  ad.AnswerDate,
+  ad.AnswerQuality,
+  CASE
+    WHEN EXISTS (
+      SELECT 1 FROM PostLinks pl WHERE pl.PostId = qd.QuestionId AND pl.LinkTypeId = 3
+    ) THEN 'Has Duplicate Link'
+    ELSE 'No Duplicate Link'
+  END AS DuplicateStatus,
+  COALESCE(u.DisplayName, 'Unknown User') AS QuestionOwnerDisplayName,
+  ph.UserDisplayName AS LastEditorDisplayName,
+  ph.EditDate AS LastEditDate,
+  CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - qd.QuestionDate)) / 86400 AS INTEGER) AS DaysSinceQuestion,
+  CASE
+    WHEN qd.ClosedDate IS NOT NULL THEN TO_CHAR(qd.ClosedDate, 'YYYY-MM-DD')
+    ELSE 'Not Closed'
+  END AS FormattedClosedDate,
+  (
+    SELECT string_agg(u2.DisplayName, ', ')
+    FROM Comments c
+    JOIN Users u2 ON c.UserId = u2.Id
+    WHERE c.PostId = qd.QuestionId AND c.Score > 5
+  ) AS TopCommentersForQuestion
+FROM
+  QuestionDetails qd
+LEFT JOIN
+  TopContributors tc
+  ON qd.QuestionOwnerUserId = tc.OwnerUserId
+LEFT JOIN
+  AnswerDetails ad
+  ON qd.QuestionId = ad.QuestionId
+  AND ad.AnswerRank = 1
+LEFT JOIN
+  Users u
+  ON qd.QuestionOwnerUserId = u.Id
+LEFT JOIN
+  RankedPostEdits ph
+  ON qd.QuestionId = ph.PostId
+  AND ph.rn = 1
+WHERE
+  qd.QuestionOwnerUserId IS NOT NULL
+  AND qd.AnswerCount > 0
+  AND qd.QuestionStatus <> 'Closed'
+  AND CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - qd.QuestionDate)) / 86400 AS INTEGER) BETWEEN 30 AND 365
+ORDER BY
+  qd.FavoriteCount DESC,
+  qd.AnswerCount DESC,
+  qd.QuestionDate ASC
+GROUP BY
+  qd.QuestionId,
+  qd.Title,
+  qd.QuestionDate,
+  tc.DisplayName,
+  tc.TotalPosts,
+  tc.TotalScore,
+  qd.AnswerCount,
+  qd.FavoriteCount,
+  qd.QuestionStatus,
+  ad.AnswerId,
+  ad.AnswerOwnerUserId,
+  ad.AnswerScore,
+  ad.AnswerDate,
+  ad.AnswerQuality,
+  qd.ClosedDate,
+  u.DisplayName,
+  ph.UserDisplayName,
+  ph.EditDate;

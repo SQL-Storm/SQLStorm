@@ -1,0 +1,216 @@
+WITH
+  RankedPosts AS (
+    SELECT
+      p.Id AS PostId,
+      p.OwnerUserId,
+      p.PostTypeId,
+      p.Score,
+      p.CommentCount,
+      p.FavoriteCount,
+      p.CreationDate,
+      pt.Name AS PostTypeName,
+      ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.FavoriteCount DESC) AS rn_score,
+      SUM(CASE WHEN c.Score > 0 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id) AS PositiveCommentCount,
+      AVG(p.Score) OVER (PARTITION BY p.PostTypeId) AS AvgScoreForType,
+      COUNT(c.Id) OVER (PARTITION BY p.Id) AS TotalCommentCount
+    FROM
+      Posts p
+      JOIN PostTypes pt
+      ON p.PostTypeId = pt.Id
+      LEFT JOIN Comments c
+      ON p.Id = c.PostId
+    WHERE
+      p.OwnerUserId IS NOT NULL AND p.OwnerUserId > 0
+    GROUP BY
+      p.Id,
+      p.OwnerUserId,
+      p.PostTypeId,
+      p.Score,
+      p.CommentCount,
+      p.FavoriteCount,
+      p.CreationDate,
+      pt.Name
+  ),
+  UserPostEngagement AS (
+    SELECT
+      rp.OwnerUserId,
+      rp.PostTypeName,
+      COUNT(rp.PostId) AS TotalPosts,
+      SUM(rp.Score) AS TotalScore,
+      AVG(rp.Score) AS AverageScore,
+      SUM(CASE WHEN rp.rn_score <= 5 THEN 1 ELSE 0 END) AS Top5RankedPosts
+    FROM
+      RankedPosts rp
+    WHERE
+      rp.PostTypeId IN (1, 2)
+    GROUP BY
+      rp.OwnerUserId,
+      rp.PostTypeName
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate,
+      u.Views,
+      u.UpVotes AS UserUpVotes,
+      u.DownVotes AS UserDownVotes,
+      COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS TotalUpVotes,
+      COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS TotalDownVotes,
+      COUNT(DISTINCT b.Id) AS BadgeCount,
+      MAX(b.Date) AS LastBadgeDate,
+      MAX(CASE WHEN b.Class = 1 THEN b.Date ELSE NULL END) AS LastGoldBadgeDate,
+      MAX(CASE WHEN b.Class = 2 THEN b.Date ELSE NULL END) AS LastSilverBadgeDate,
+      MAX(CASE WHEN b.Class = 3 THEN b.Date ELSE NULL END) AS LastBronzeBadgeDate,
+      MAX(CASE WHEN ph.PostHistoryTypeId IN (2, 5) THEN ph.CreationDate ELSE NULL END) AS LastContentEditDate,
+      COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20, 35, 36) THEN ph.PostId ELSE NULL END) AS ModerationActions
+    FROM
+      Users u
+      LEFT JOIN Votes v
+      ON u.Id = v.UserId
+      LEFT JOIN Badges b
+      ON u.Id = b.UserId
+      LEFT JOIN PostHistory ph
+      ON u.Id = ph.UserId
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate,
+      u.Views,
+      u.UpVotes,
+      u.DownVotes
+  ),
+  PostDetails AS (
+    SELECT
+      p.Id AS PostId,
+      p.Title,
+      p.Tags,
+      p.CreationDate AS PostCreationDate,
+      p.OwnerUserId,
+      pt.Name AS PostTypeName,
+      COALESCE(p.Score, 0) AS PostScore,
+      COALESCE(p.ViewCount, 0) AS PostViewCount,
+      COALESCE(p.CommentCount, 0) AS PostCommentCount,
+      COALESCE(p.FavoriteCount, 0) AS PostFavoriteCount,
+      CASE WHEN p.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS PostStatus,
+      COALESCE(pl.RelatedPostId, -1) AS LinkedPostId,
+      CASE WHEN pl.LinkTypeId = 3 THEN 'Duplicate' ELSE 'Linked' END AS LinkType
+    FROM
+      Posts p
+      JOIN PostTypes pt
+      ON p.PostTypeId = pt.Id
+      LEFT JOIN PostLinks pl
+      ON p.Id = pl.PostId
+    WHERE
+      p.PostTypeId IN (1, 2)
+  ),
+  UserAggregatedData AS (
+    SELECT
+      ua.UserId,
+      ua.DisplayName,
+      ua.Reputation,
+      ua.CreationDate,
+      ua.Views,
+      ua.UserUpVotes,
+      ua.UserDownVotes,
+      ua.TotalUpVotes,
+      ua.TotalDownVotes,
+      ua.BadgeCount,
+      ua.LastBadgeDate,
+      ua.LastGoldBadgeDate,
+      ua.LastSilverBadgeDate,
+      ua.LastBronzeBadgeDate,
+      ua.LastContentEditDate,
+      ua.ModerationActions,
+      COALESCE(upe_q.TotalPosts, 0) AS QuestionCount,
+      COALESCE(upe_q.TotalScore, 0) AS TotalQuestionScore,
+      COALESCE(upe_q.AverageScore, 0) AS AverageQuestionScore,
+      COALESCE(upe_a.TotalPosts, 0) AS AnswerCount,
+      COALESCE(upe_a.TotalScore, 0) AS TotalAnswerScore,
+      COALESCE(upe_a.AverageScore, 0) AS AverageAnswerScore,
+      COALESCE(upe_q.Top5RankedPosts, 0) AS Top5RankedQuestions
+    FROM
+      UserActivity ua
+      LEFT JOIN UserPostEngagement upe_q
+      ON ua.UserId = upe_q.OwnerUserId AND upe_q.PostTypeName = 'Question'
+      LEFT JOIN UserPostEngagement upe_a
+      ON ua.UserId = upe_a.OwnerUserId AND upe_a.PostTypeName = 'Answer'
+  )
+SELECT
+  pad.PostId,
+  pad.Title AS PostTitle,
+  pad.PostTypeName,
+  pad.PostStatus,
+  pad.LinkType,
+  CASE
+    WHEN pad.LinkedPostId <> -1 THEN ('Link to Post ID: ' || CAST(pad.LinkedPostId AS VARCHAR))
+    ELSE 'No Link'
+  END AS LinkDetails,
+  uad.DisplayName AS OwnerDisplayName,
+  uad.Reputation AS OwnerReputation,
+  uad.UserUpVotes AS OwnerUserUpVotes,
+  uad.UserDownVotes AS OwnerUserDownVotes,
+  uad.BadgeCount AS OwnerBadgeCount,
+  uad.LastGoldBadgeDate AS OwnerLastGoldBadgeDate,
+  uad.TotalUpVotes AS OwnerTotalVotesReceived,
+  uad.TotalAnswerScore AS OwnerTotalAnswerScore,
+  uad.AverageQuestionScore AS OwnerAverageQuestionScore,
+  uad.ModerationActions AS OwnerModerationActions,
+  rp.Score AS PostScore,
+  rp.PositiveCommentCount AS PostPositiveCommentCount,
+  rp.TotalCommentCount AS PostTotalCommentCount,
+  rp.FavoriteCount AS PostFavoriteCount,
+  rp.rn_score AS PostRankByScore,
+  CASE
+    WHEN rp.Score > rp.AvgScoreForType THEN 'Above Average Score'
+    WHEN rp.Score < rp.AvgScoreForType THEN 'Below Average Score'
+    ELSE 'Average Score'
+  END AS ScoreComparison,
+  SUBSTRING(pad.Tags FROM 3 FOR (POSITION('>' IN pad.Tags) - 3)) AS FirstTag,
+  (
+    (LENGTH(pad.Tags) - LENGTH(REPLACE(pad.Tags, '><', ''))) + 1
+  ) AS TagCount,
+  CASE
+    WHEN rp.PostTypeName = 'Question' AND rp.FavoriteCount > 100 THEN 'Highly Favorited Question'
+    WHEN rp.PostTypeName = 'Answer' AND rp.Score > 50 THEN 'Highly Scored Answer'
+    ELSE 'Standard Post'
+  END AS PostEngagementLevel,
+  COALESCE(
+    (
+      SELECT
+        COUNT(*)
+      FROM
+        PostHistory ph_sub
+      WHERE
+        ph_sub.PostId = pad.PostId AND ph_sub.PostHistoryTypeId IN (4, 5)
+    ),
+    0
+  ) AS NumberOfEdits,
+  COALESCE(
+    (
+      SELECT
+        MAX(ph_edit.CreationDate)
+      FROM
+        PostHistory ph_edit
+      WHERE
+        ph_edit.PostId = pad.PostId AND ph_edit.PostHistoryTypeId IN (4, 5)
+    ),
+    TIMESTAMP '1970-01-01'
+  ) AS LastEditDateFromHistory
+FROM
+  PostDetails pad
+  JOIN UserAggregatedData uad
+  ON pad.OwnerUserId = uad.UserId
+  JOIN RankedPosts rp
+  ON pad.PostId = rp.PostId
+WHERE
+  uad.Reputation > 10000
+  AND uad.LastContentEditDate > DATEADD(year, -2, CAST('2024-10-01 12:34:56' AS TIMESTAMP))
+  AND rp.PostTypeName IN ('Question', 'Answer')
+  AND rp.Score > 0
+  AND rp.TotalCommentCount > 5
+ORDER BY
+  uad.Reputation DESC,
+  rp.Score DESC;

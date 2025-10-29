@@ -1,0 +1,154 @@
+WITH RankedPosts AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.AcceptedAnswerId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        pt.Name AS PostTypeName,
+        ROW_NUMBER() OVER (ORDER BY p.CreationDate DESC) AS rn_creation,
+        SUM(COALESCE(c.Score, 0)) OVER (PARTITION BY p.Id) AS total_comment_score,
+        AVG(COALESCE(v.VoteTypeId, 0)) OVER (PARTITION BY p.Id) AS avg_vote_type
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    WHERE p.OwnerUserId IS NOT NULL
+),
+UserPostStats AS (
+    SELECT
+        rp.OwnerUserId,
+        COUNT(rp.Id) AS total_posts,
+        SUM(rp.Score) AS total_score,
+        AVG(rp.ViewCount) AS avg_view_count,
+        MAX(rp.CreationDate) AS latest_post_date,
+        CASE
+            WHEN SUM(rp.Score) > 1000 THEN 'High Scorer'
+            WHEN SUM(rp.Score) BETWEEN 500 AND 1000 THEN 'Medium Scorer'
+            ELSE 'Low Scorer'
+        END AS score_category,
+        COUNT(DISTINCT rp.PostTypeId) AS distinct_post_types,
+        SUM(CASE WHEN rp.PostTypeId = 1 THEN 1 ELSE 0 END) AS question_count,
+        SUM(CASE WHEN rp.PostTypeId = 2 THEN 1 ELSE 0 END) AS answer_count
+    FROM RankedPosts rp
+    WHERE rp.OwnerUserId > 0
+    GROUP BY rp.OwnerUserId
+),
+BadgesWithTags AS (
+    SELECT
+        b.UserId,
+        b.Name AS BadgeName,
+        b.Date AS BadgeDate,
+        CASE
+            WHEN b.Class = 1 THEN 'Gold'
+            WHEN b.Class = 2 THEN 'Silver'
+            WHEN b.Class = 3 THEN 'Bronze'
+            ELSE 'Unknown'
+        END AS BadgeClass,
+        CASE
+            WHEN b.TagBased = 1 THEN 'Tag Specific'
+            ELSE 'Named'
+        END AS BadgeType,
+        t.TagName
+    FROM Badges b
+    LEFT JOIN Tags t ON b.Name = t.TagName AND b.TagBased = 1
+    WHERE b.Name LIKE '%tag%' OR b.TagBased = 1
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(ups.total_posts, 0) AS user_total_posts,
+        COALESCE(ups.total_score, 0) AS user_total_score,
+        COALESCE(ups.avg_view_count, 0) AS user_avg_view_count,
+        COALESCE(ups.score_category, 'No Score Data') AS user_score_category,
+        COUNT(bwt.UserId) AS user_badge_count,
+        MAX(bwt.BadgeDate) AS latest_badge_date,
+        STRING_AGG(DISTINCT bwt.BadgeName, ', ') AS distinct_badge_names
+    FROM Users u
+    LEFT JOIN UserPostStats ups ON u.Id = ups.OwnerUserId
+    LEFT JOIN BadgesWithTags bwt ON u.Id = bwt.UserId
+    WHERE u.Id > 0
+    GROUP BY
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        ups.total_posts,
+        ups.total_score,
+        ups.avg_view_count,
+        ups.score_category
+),
+RecentQuestions AS (
+    SELECT
+        Id,
+        Title,
+        Tags,
+        CreationDate,
+        OwnerUserId,
+        Score,
+        AnswerCount,
+        PostTypeId
+    FROM RankedPosts
+    WHERE PostTypeId = 1
+      AND CreationDate > (CAST('2024-10-01' AS date) - INTERVAL '30' DAY)
+),
+QuestionsWithTopAnswers AS (
+    SELECT
+        rq.Id AS QuestionId,
+        rq.Title AS QuestionTitle,
+        rq.Tags AS QuestionTags,
+        rq.CreationDate AS QuestionCreationDate,
+        rq.Score AS QuestionScore,
+        rq.AnswerCount AS QuestionAnswerCount,
+        COALESCE(
+            (
+                SELECT STRING_AGG(CAST(p_ans.Id AS VARCHAR), ',')
+                FROM Posts p_ans
+                WHERE p_ans.ParentId = rq.Id
+                ORDER BY p_ans.Score DESC
+                LIMIT 3
+            ),
+            'No Answers'
+        ) AS TopAnswerIds,
+        rq.OwnerUserId
+    FROM RecentQuestions rq
+)
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.user_total_posts,
+    ua.user_total_score,
+    ua.user_avg_view_count,
+    ua.user_score_category,
+    ua.user_badge_count,
+    ua.latest_badge_date,
+    ua.distinct_badge_names,
+    qwat.QuestionTitle,
+    qwat.QuestionTags,
+    qwat.QuestionCreationDate,
+    qwat.QuestionScore,
+    qwat.QuestionAnswerCount,
+    qwat.TopAnswerIds,
+    COALESCE(pht.Comment, 'No Post History Comment') AS latest_post_history_comment,
+    CASE
+        WHEN qwat.QuestionScore > 50 AND qwat.QuestionAnswerCount > 10 THEN 'Popular Question'
+        WHEN qwat.QuestionScore < 0 AND qwat.QuestionAnswerCount = 0 THEN 'Unpopular Question'
+        ELSE 'Average Question'
+    END AS question_status,
+    (ua.user_total_posts * 1.1 + ua.user_total_score * 0.9 + ua.user_badge_count * 2.0) AS complex_performance_score,
+    SUBSTRING(ua.DisplayName FROM 1 FOR 3) || '-' || LOWER(REPLACE(ua.user_score_category, ' ', '_')) AS derived_identifier
+FROM UserActivity ua
+JOIN QuestionsWithTopAnswers qwat ON ua.UserId = qwat.OwnerUserId
+LEFT JOIN PostHistory pht ON qwat.QuestionId = pht.PostId
+    AND pht.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20, 35)
+WHERE ua.user_total_posts > 10
+ORDER BY complex_performance_score DESC
+LIMIT 100;

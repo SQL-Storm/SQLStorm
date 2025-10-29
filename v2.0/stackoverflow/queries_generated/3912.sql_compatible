@@ -1,0 +1,100 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        COALESCE(u.Reputation, 0) AS Reputation,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS QuestionCount,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS AnswerCount,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadges,
+        (SELECT COALESCE(SUM(CASE v.VoteTypeId WHEN 2 THEN 1 WHEN 3 THEN -1 ELSE 0 END),0)
+         FROM Votes v
+         WHERE v.UserId = u.Id) AS VoteScore
+    FROM Users u
+),
+RankedUsers AS (
+    SELECT 
+        Id,
+        DisplayName,
+        Reputation,
+        QuestionCount,
+        AnswerCount,
+        GoldBadges,
+        SilverBadges,
+        BronzeBadges,
+        VoteScore,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, GoldBadges DESC, SilverBadges DESC) AS rn
+    FROM UserStats
+)
+SELECT 
+    r.rn,
+    r.Id,
+    r.DisplayName,
+    r.Reputation,
+    r.QuestionCount,
+    r.AnswerCount,
+    r.GoldBadges,
+    r.SilverBadges,
+    r.BronzeBadges,
+    r.VoteScore,
+    COALESCE(qs.TotalViews,0) AS TotalQuestionViews,
+    COALESCE(av.AvgAnswerScore,0) AS AvgAnswerScore,
+    CASE 
+        WHEN r.QuestionCount = 0 THEN NULL 
+        ELSE CAST(r.AnswerCount AS NUMERIC) / NULLIF(r.QuestionCount,0)
+    END AS AnswersPerQuestion,
+    CASE 
+        WHEN (r.GoldBadges + r.SilverBadges + r.BronzeBadges) = 0 THEN 'None' 
+        ELSE 'HasBadges' 
+    END AS BadgeStatus,
+    COALESCE(t.TagList,'') AS TagList
+FROM RankedUsers r
+LEFT JOIN (
+    SELECT p.OwnerUserId, SUM(p.ViewCount) AS TotalViews
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+    GROUP BY p.OwnerUserId
+) qs ON qs.OwnerUserId = r.Id
+LEFT JOIN (
+    SELECT p.OwnerUserId, AVG(p.Score) AS AvgAnswerScore
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+    GROUP BY p.OwnerUserId
+) av ON av.OwnerUserId = r.Id
+LEFT JOIN (
+    SELECT 
+        p.OwnerUserId,
+        STRING_AGG(split_tag.tag, ', ') AS TagList
+    FROM Posts p
+    CROSS JOIN LATERAL regexp_split_to_table(
+        -- remove leading '<' and trailing '>' before splitting to handle tags like '<tag1><tag2>'
+        TRIM(BOTH '<>' FROM p.Tags),
+        '><'
+    ) AS split_tag(tag)
+    JOIN Tags t ON t.TagName = split_tag.tag
+    WHERE p.PostTypeId = 1
+    GROUP BY p.OwnerUserId
+) t ON t.OwnerUserId = r.Id
+WHERE r.rn <= 100
+
+UNION ALL
+
+SELECT 
+    NULL AS rn,
+    NULL AS Id,
+    '--- Summary ---' AS DisplayName,
+    NULL AS Reputation,
+    NULL AS QuestionCount,
+    NULL AS AnswerCount,
+    NULL AS GoldBadges,
+    NULL AS SilverBadges,
+    NULL AS BronzeBadges,
+    NULL AS VoteScore,
+    NULL AS TotalQuestionViews,
+    NULL AS AvgAnswerScore,
+    NULL AS AnswersPerQuestion,
+    NULL AS BadgeStatus,
+    NULL AS TagList
+FROM (SELECT 1) dummy
+ORDER BY rn NULLS LAST, Reputation DESC;

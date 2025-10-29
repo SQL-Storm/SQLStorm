@@ -1,0 +1,159 @@
+WITH
+    /* Basic user metrics */
+    user_metrics AS (
+        SELECT
+            u.Id                                           AS user_id,
+            u.DisplayName,
+            u.Reputation,
+            u.CreationDate                                 AS user_created,
+            COALESCE(u.Views, 0)                           AS total_views,
+            COALESCE(u.UpVotes, 0) - COALESCE(u.DownVotes, 0) AS net_votes,
+            COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1)    AS question_count,
+            COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2)    AS answer_count,
+            MAX(p.CreationDate) FILTER (WHERE p.PostTypeId = 1) AS latest_question,
+            MAX(p.CreationDate) FILTER (WHERE p.PostTypeId = 2) AS latest_answer
+        FROM Users u
+        LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+        GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Views, u.UpVotes, u.DownVotes
+    ),
+
+    /* Badge aggregation per user */
+    badge_agg AS (
+        SELECT
+            b.UserId                                     AS user_id,
+            COUNT(*)                                     AS total_badges,
+            COUNT(*) FILTER (WHERE b.Class = 1)          AS gold_badges,
+            COUNT(*) FILTER (WHERE b.Class = 2)          AS silver_badges,
+            COUNT(*) FILTER (WHERE b.Class = 3)          AS bronze_badges,
+            STRING_AGG(DISTINCT b.Name, ', ')           AS badge_names
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+
+    /* Tag usage derived from recent questions */
+    tag_usage AS (
+        SELECT
+            t.TagName,
+            COUNT(*)                                 AS tag_question_cnt,
+            AVG(p.Score)                             AS avg_score,
+            SUM(CASE WHEN p.FavoriteCount IS NULL THEN 0 ELSE p.FavoriteCount END) AS total_favorites,
+            STRING_AGG(DISTINCT CAST(u.Id AS varchar), ',')     AS contributing_user_ids
+        FROM Posts p
+        JOIN LATERAL regexp_split_to_table(p.Tags, '><') AS tag_raw(tag) ON true
+        JOIN Tags t ON t.TagName = tag_raw.tag
+        JOIN Users u ON u.Id = p.OwnerUserId
+        WHERE p.PostTypeId = 1                     -- only questions
+          AND p.CreationDate > CAST('2024-10-01' AS date) - INTERVAL '365 days'
+        GROUP BY t.TagName
+        ORDER BY tag_question_cnt DESC
+        LIMIT 100
+    ),
+
+    /* Recent activity per user (correlated subquery in SELECT) */
+    recent_activity AS (
+        SELECT
+            u.Id                                            AS user_id,
+            (SELECT MAX(v.CreationDate)
+               FROM Votes v
+               WHERE v.UserId = u.Id)                      AS last_vote_date,
+            (SELECT MAX(c.CreationDate)
+               FROM Comments c
+               WHERE c.UserId = u.Id)                      AS last_comment_date,
+            (SELECT MAX(ph.CreationDate)
+               FROM PostHistory ph
+               WHERE ph.UserId = u.Id)                     AS last_edit_date
+        FROM Users u
+    ),
+
+    /* Score histogram using window functions */
+    score_histogram AS (
+        SELECT
+            p.OwnerUserId                                 AS user_id,
+            p.Score,
+            ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS rn,
+            COUNT(*) OVER (PARTITION BY p.OwnerUserId)    AS total_posts
+        FROM Posts p
+        WHERE p.OwnerUserId IS NOT NULL
+    ),
+
+    /* Top users based on a composite metric */
+    top_users AS (
+        SELECT
+            um.user_id,
+            um.DisplayName,
+            um.Reputation,
+            COALESCE(ba.total_badges,0)    AS badge_total,
+            um.net_votes,
+            um.question_count,
+            um.answer_count,
+            ra.last_vote_date,
+            ra.last_comment_date,
+            ra.last_edit_date,
+            (um.Reputation * 0.4
+             + COALESCE(ba.gold_badges,0) * 100
+             + COALESCE(ba.silver_badges,0) * 50
+             + COALESCE(ba.bronze_badges,0) * 20
+             + um.net_votes * 0.1
+             + um.question_count * 2
+             + um.answer_count * 3)        AS composite_score,
+            ROW_NUMBER() OVER (ORDER BY
+                (um.Reputation * 0.4
+                 + COALESCE(ba.gold_badges,0) * 100
+                 + COALESCE(ba.silver_badges,0) * 50
+                 + COALESCE(ba.bronze_badges,0) * 20
+                 + um.net_votes * 0.1
+                 + um.question_count * 2
+                 + um.answer_count * 3) DESC) AS rank
+        FROM user_metrics um
+        LEFT JOIN badge_agg ba   ON ba.user_id = um.user_id
+        LEFT JOIN recent_activity ra ON ra.user_id = um.user_id
+        WHERE um.Reputation > 1000
+          AND (um.question_count + um.answer_count) > 0
+    )
+
+SELECT
+    tu.rank,
+    tu.user_id,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.composite_score,
+    tu.badge_total,
+    tu.net_votes,
+    tu.question_count,
+    tu.answer_count,
+    COALESCE(tu.last_vote_date, CAST('1970-01-01' AS timestamp))      AS last_vote,
+    COALESCE(tu.last_comment_date, CAST('1970-01-01' AS timestamp))   AS last_comment,
+    COALESCE(tu.last_edit_date, CAST('1970-01-01' AS timestamp))      AS last_edit,
+    CASE
+        WHEN tu.last_vote_date IS NULL AND tu.last_comment_date IS NULL THEN 'Dormant'
+        WHEN GREATEST(COALESCE(tu.last_vote_date,CAST('1970-01-01' AS timestamp)),
+                      COALESCE(tu.last_comment_date,CAST('1970-01-01' AS timestamp)),
+                      COALESCE(tu.last_edit_date,CAST('1970-01-01' AS timestamp))) > (CAST('2024-10-01' AS date) - INTERVAL '30 days')
+            THEN 'Active'
+        ELSE 'Semi-Active'
+    END                                            AS activity_status,
+    /* Pull top 5 tags the user has contributed to (using a correlated sub-query) */
+    (SELECT STRING_AGG(t.TagName, ', ') 
+       FROM (
+           SELECT t.TagName
+           FROM Posts p
+           JOIN LATERAL regexp_split_to_table(p.Tags, '><') AS tag_raw(tag) ON true
+           JOIN Tags t ON t.TagName = tag_raw.tag
+           WHERE p.OwnerUserId = tu.user_id
+             AND p.PostTypeId = 1
+           GROUP BY t.TagName
+           ORDER BY COUNT(*) DESC
+           LIMIT 5
+       ) t)                                            AS top_5_tags,
+    /* Show a sample of the user’s score histogram (first 3 rows) */
+    (SELECT STRING_AGG(CAST(sh.Score AS varchar), ',')
+       FROM (
+           SELECT sh.Score
+           FROM score_histogram sh
+           WHERE sh.user_id = tu.user_id
+           ORDER BY sh.rn
+           LIMIT 3
+       ) sh)                                            AS score_snapshot
+FROM top_users tu
+WHERE tu.rank <= 50
+ORDER BY tu.rank;

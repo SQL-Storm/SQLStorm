@@ -1,0 +1,338 @@
+-- {"query": "4168.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3128} 
+WITH
+  PostEngagement AS (
+    SELECT
+      p.Id AS PostId,
+      p.PostTypeId,
+      pt.Name AS PostTypeName,
+      p.OwnerUserId,
+      u.DisplayName AS OwnerDisplayName,
+      p.CreationDate AS PostCreationDate,
+      p.Score,
+      p.ViewCount,
+      p.FavoriteCount,
+      p.AnswerCount,
+      p.CommentCount,
+      CASE
+        WHEN p.ClosedDate IS NOT NULL THEN 1
+        ELSE 0
+      END AS IsClosed,
+      (
+        SELECT
+          COUNT(*)
+        FROM
+          Comments c
+        WHERE
+          c.PostId = p.Id
+      ) AS ActualCommentCount,
+      (
+        SELECT
+          COUNT(*)
+        FROM
+          Votes v
+        WHERE
+          v.PostId = p.Id AND v.VoteTypeId = 2 -- UpVote
+      ) AS UpVoteCount,
+      (
+        SELECT
+          COUNT(*)
+        FROM
+          Votes v
+        WHERE
+          v.PostId = p.Id AND v.VoteTypeId = 3 -- DownVote
+      ) AS DownVoteCount,
+      (
+        SELECT
+          COUNT(*)
+        FROM
+          PostLinks pl
+        WHERE
+          pl.PostId = p.Id AND pl.LinkTypeId = 3 -- Duplicate Link
+      ) AS DuplicateLinkCount,
+      ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS PostNumberForUser
+    FROM
+      Posts p
+      JOIN PostTypes pt
+      ON p.PostTypeId = pt.Id
+      LEFT JOIN Users u
+      ON p.OwnerUserId = u.Id
+    WHERE
+      p.PostTypeId IN (1, 2) -- Questions and Answers
+  ),
+  UserActivitySummary AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate AS UserCreationDate,
+      u.Views AS UserTotalViews,
+      u.UpVotes AS UserTotalUpvotes,
+      u.DownVotes AS UserTotalDownvotes,
+      COUNT(DISTINCT b.Id) AS BadgeCount,
+      SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadgeCount,
+      SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadgeCount,
+      SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadgeCount,
+      (
+        SELECT
+          COUNT(*)
+        FROM
+          Comments c
+        WHERE
+          c.UserId = u.Id
+      ) AS UserCommentCount,
+      (
+        SELECT
+          COUNT(*)
+        FROM
+          Votes v
+        WHERE
+          v.UserId = u.Id AND v.VoteTypeId = 2 -- UpVote
+      ) AS UserUpVoteCount,
+      (
+        SELECT
+          COUNT(*)
+        FROM
+          Votes v
+        WHERE
+          v.UserId = u.Id AND v.VoteTypeId = 3 -- DownVote
+      ) AS UserDownVoteCount,
+      MAX(pe.PostCreationDate) AS LastPostDate
+    FROM
+      Users u
+      LEFT JOIN Badges b
+      ON u.Id = b.UserId
+      LEFT JOIN PostEngagement pe
+      ON u.Id = pe.OwnerUserId
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate,
+      u.Views,
+      u.UpVotes,
+      u.DownVotes
+  ),
+  TopTenQuestions AS (
+    SELECT
+      Id AS QuestionId,
+      Title,
+      OwnerUserId,
+      Score,
+      FavoriteCount,
+      AnswerCount,
+      ROW_NUMBER() OVER (ORDER BY Score DESC, FavoriteCount DESC, AnswerCount DESC) AS Rank
+    FROM
+      Posts
+    WHERE
+      PostTypeId = 1 -- Questions
+  ),
+  QuestionAnswersStats AS (
+    SELECT
+      q.QuestionId,
+      q.Title AS QuestionTitle,
+      COUNT(a.Id) AS TotalAnswers,
+      SUM(CASE WHEN a.IsAcceptedAnswer = 1 THEN 1 ELSE 0 END) AS AcceptedAnswerCount,
+      AVG(a.Score) AS AverageAnswerScore,
+      MAX(a.Score) AS MaxAnswerScore,
+      MIN(a.Score) AS MinAnswerScore,
+      SUM(a.ViewCount) AS TotalAnswerViews,
+      SUM(a.FavoriteCount) AS TotalAnswerFavorites
+    FROM
+      (
+        SELECT
+          p.Id AS QuestionId,
+          p.Title,
+          p.Score,
+          p.FavoriteCount,
+          p.AnswerCount,
+          p.AcceptedAnswerId
+        FROM
+          Posts p
+        WHERE
+          p.PostTypeId = 1
+      ) q
+      LEFT JOIN (
+        SELECT
+          p.Id AS AnswerId,
+          p.ParentId AS QuestionId,
+          p.Score,
+          p.ViewCount,
+          p.FavoriteCount,
+          CASE
+            WHEN p.Id = p.AcceptedAnswerId THEN 1
+            ELSE 0
+          END AS IsAcceptedAnswer
+        FROM
+          Posts p
+        WHERE
+          p.PostTypeId = 2 -- Answers
+      ) a
+      ON q.QuestionId = a.QuestionId
+    GROUP BY
+      q.QuestionId,
+      q.Title
+  )
+SELECT
+  pe.PostId,
+  pe.PostTypeName,
+  pe.PostCreationDate,
+  pe.Score,
+  pe.ViewCount,
+  pe.FavoriteCount,
+  pe.AnswerCount AS QuestionAnswerCount,
+  pe.CommentCount AS QuestionCommentCount,
+  pe.IsClosed,
+  pe.ActualCommentCount AS PostActualCommentCount,
+  pe.UpVoteCount AS PostUpVotes,
+  pe.DownVoteCount AS PostDownVotes,
+  pe.DuplicateLinkCount,
+  pe.OwnerUserId,
+  pe.OwnerDisplayName,
+  uas.DisplayName AS OwnerDisplayNameFromUsers,
+  uas.Reputation AS OwnerReputation,
+  uas.UserCreationDate AS OwnerCreationDate,
+  uas.BadgeCount AS OwnerBadgeCount,
+  uas.GoldBadgeCount AS OwnerGoldBadges,
+  uas.SilverBadgeCount AS OwnerSilverBadges,
+  uas.BronzeBadgeCount AS OwnerBronzeBadges,
+  uas.UserCommentCount AS OwnerTotalComments,
+  uas.UserUpVoteCount AS OwnerTotalUpvotesGiven,
+  uas.UserDownVoteCount AS OwnerTotalDownvotesGiven,
+  CASE
+    WHEN pe.PostNumberForUser IS NULL THEN -1 -- Handle cases where user might not exist or have posts
+    WHEN pe.PostNumberForUser <= 10 THEN 'Top 10 Recent Post'
+    WHEN pe.PostNumberForUser > 10 AND pe.PostNumberForUser <= 50 THEN 'Next 40 Posts'
+    ELSE 'Older Post'
+  END AS PostRecencyCategory,
+  ttq.QuestionId AS TopTenQuestionId,
+  ttq.Title AS TopTenQuestionTitle,
+  ttq.Rank AS TopTenQuestionRank,
+  qas.TotalAnswers AS QuestionTotalAnswers,
+  qas.AcceptedAnswerCount AS QuestionAcceptedAnswerCount,
+  qas.AverageAnswerScore AS QuestionAverageAnswerScore,
+  qas.MaxAnswerScore AS QuestionMaxAnswerScore,
+  qas.MinAnswerScore AS QuestionMinAnswerScore,
+  qas.TotalAnswerViews AS QuestionTotalAnswerViews,
+  qas.TotalAnswerFavorites AS QuestionTotalAnswerFavorites,
+  COALESCE(pe.Score, 0) + COALESCE(pe.ViewCount, 0) + COALESCE(pe.FavoriteCount, 0) AS EngagementScore,
+  'Post_Info_' || CAST(pe.PostId AS VARCHAR) AS CompositeKey,
+  CASE
+    WHEN uas.LastPostDate IS NOT NULL AND pe.PostCreationDate IS NOT NULL THEN
+      CASE
+        WHEN pe.PostCreationDate > uas.LastPostDate THEN 'Current'
+        ELSE 'Past'
+      END
+    WHEN uas.LastPostDate IS NULL THEN 'No Prior Activity'
+    ELSE 'Unknown'
+  END AS ActivityStatus,
+  CONCAT(
+    IFNULL(pe.OwnerDisplayName, 'Anonymous'),
+    ' (',
+    IFNULL(CAST(uas.Reputation AS VARCHAR), 'N/A'),
+    ')'
+  ) AS FormattedOwnerInfo,
+  SUBSTRING(pe.PostTypeName, 1, 3) AS PostTypeAbbreviation,
+  (
+    pe.UpVoteCount * 1.0 / NULLIF(pe.DownVoteCount, 0)
+  ) AS UpvoteDownvoteRatio,
+  CASE
+    WHEN pe.PostTypeName = 'Question' AND pe.AnswerCount > 5 THEN 'High Activity Question'
+    WHEN pe.PostTypeName = 'Answer' AND pe.Score > 10 THEN 'Highly Scored Answer'
+    ELSE 'Standard Post'
+  END AS PostCategorization
+FROM
+  PostEngagement pe
+  LEFT JOIN UserActivitySummary uas
+  ON pe.OwnerUserId = uas.UserId
+  LEFT JOIN TopTenQuestions ttq
+  ON pe.PostId = ttq.QuestionId
+  LEFT JOIN QuestionAnswersStats qas
+  ON pe.PostId = qas.QuestionId
+WHERE
+  pe.Score > 0
+  AND pe.ViewCount > 100
+  AND uas.Reputation > 1000
+UNION
+SELECT
+  pe.PostId,
+  pe.PostTypeName,
+  pe.PostCreationDate,
+  pe.Score,
+  pe.ViewCount,
+  pe.FavoriteCount,
+  pe.AnswerCount AS QuestionAnswerCount,
+  pe.CommentCount AS QuestionCommentCount,
+  pe.IsClosed,
+  pe.ActualCommentCount AS PostActualCommentCount,
+  pe.UpVoteCount AS PostUpVotes,
+  pe.DownVoteCount AS PostDownVotes,
+  pe.DuplicateLinkCount,
+  pe.OwnerUserId,
+  pe.OwnerDisplayName,
+  uas.DisplayName AS OwnerDisplayNameFromUsers,
+  uas.Reputation AS OwnerReputation,
+  uas.UserCreationDate AS OwnerCreationDate,
+  uas.BadgeCount AS OwnerBadgeCount,
+  uas.GoldBadgeCount AS OwnerGoldBadges,
+  uas.SilverBadgeCount AS OwnerSilverBadges,
+  uas.BronzeBadgeCount AS OwnerBronzeBadges,
+  uas.UserCommentCount AS OwnerTotalComments,
+  uas.UserUpVoteCount AS OwnerTotalUpvotesGiven,
+  uas.UserDownVoteCount AS OwnerTotalDownvotesGiven,
+  CASE
+    WHEN pe.PostNumberForUser IS NULL THEN -1
+    WHEN pe.PostNumberForUser <= 10 THEN 'Top 10 Recent Post'
+    WHEN pe.PostNumberForUser > 10 AND pe.PostNumberForUser <= 50 THEN 'Next 40 Posts'
+    ELSE 'Older Post'
+  END AS PostRecencyCategory,
+  ttq.QuestionId AS TopTenQuestionId,
+  ttq.Title AS TopTenQuestionTitle,
+  ttq.Rank AS TopTenQuestionRank,
+  qas.TotalAnswers AS QuestionTotalAnswers,
+  qas.AcceptedAnswerCount AS QuestionAcceptedAnswerCount,
+  qas.AverageAnswerScore AS QuestionAverageAnswerScore,
+  qas.MaxAnswerScore AS QuestionMaxAnswerScore,
+  qas.MinAnswerScore AS QuestionMinAnswerScore,
+  qas.TotalAnswerViews AS QuestionTotalAnswerViews,
+  qas.TotalAnswerFavorites AS QuestionTotalAnswerFavorites,
+  COALESCE(pe.Score, 0) + COALESCE(pe.ViewCount, 0) + COALESCE(pe.FavoriteCount, 0) AS EngagementScore,
+  'Post_Info_' || CAST(pe.PostId AS VARCHAR) AS CompositeKey,
+  CASE
+    WHEN uas.LastPostDate IS NOT NULL AND pe.PostCreationDate IS NOT NULL THEN
+      CASE
+        WHEN pe.PostCreationDate > uas.LastPostDate THEN 'Current'
+        ELSE 'Past'
+      END
+    WHEN uas.LastPostDate IS NULL THEN 'No Prior Activity'
+    ELSE 'Unknown'
+  END AS ActivityStatus,
+  CONCAT(
+    IFNULL(pe.OwnerDisplayName, 'Anonymous'),
+    ' (',
+    IFNULL(CAST(uas.Reputation AS VARCHAR), 'N/A'),
+    ')'
+  ) AS FormattedOwnerInfo,
+  SUBSTRING(pe.PostTypeName, 1, 3) AS PostTypeAbbreviation,
+  (
+    pe.UpVoteCount * 1.0 / NULLIF(pe.DownVoteCount, 0)
+  ) AS UpvoteDownvoteRatio,
+  CASE
+    WHEN pe.PostTypeName = 'Question' AND pe.AnswerCount > 5 THEN 'High Activity Question'
+    WHEN pe.PostTypeName = 'Answer' AND pe.Score > 10 THEN 'Highly Scored Answer'
+    ELSE 'Standard Post'
+  END AS PostCategorization
+FROM
+  PostEngagement pe
+  RIGHT JOIN UserActivitySummary uas
+  ON pe.OwnerUserId = uas.UserId
+  LEFT JOIN TopTenQuestions ttq
+  ON pe.PostId = ttq.QuestionId
+  LEFT JOIN QuestionAnswersStats qas
+  ON pe.PostId = qas.QuestionId
+WHERE
+  pe.PostTypeId = 1 -- Only interested in Questions for this part of the UNION
+  AND pe.Score < 0
+  AND uas.UserCreationDate < '2010-01-01'
+  AND (
+    pe.FavoriteCount IS NULL OR pe.FavoriteCount = 0
+  );

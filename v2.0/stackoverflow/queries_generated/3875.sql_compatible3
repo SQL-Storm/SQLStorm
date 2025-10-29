@@ -1,0 +1,101 @@
+WITH user_summary AS (
+    SELECT u.Id,
+           u.DisplayName,
+           u.Reputation,
+           COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+           COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswerCount,
+           SUM(COALESCE(p.Score,0)) AS TotalScore,
+           MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+badge_counts AS (
+    SELECT b.UserId,
+           COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+           COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+           COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+top_tags AS (
+    SELECT t.TagName,
+           t.Count,
+           ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS rn
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0
+),
+recent_votes AS (
+    SELECT v.PostId,
+           SUM(CASE WHEN vt.Id = 2 THEN 1
+                    WHEN vt.Id = 3 THEN -1
+                    ELSE 0 END) AS NetVote,
+           MAX(v.CreationDate) AS LastVoteDate
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE v.CreationDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days')
+    GROUP BY v.PostId
+),
+main_results AS (
+    SELECT us.Id,
+           us.DisplayName,
+           us.Reputation,
+           us.QuestionCount,
+           us.AnswerCount,
+           us.TotalScore,
+           COALESCE(bc.GoldBadges,0)   AS GoldBadges,
+           COALESCE(bc.SilverBadges,0) AS SilverBadges,
+           COALESCE(bc.BronzeBadges,0) AS BronzeBadges,
+           COALESCE(rv.NetVote,0)      AS RecentNetVote,
+           CASE WHEN us.LastPostDate IS NULL THEN NULL
+                ELSE to_char(us.LastPostDate,'YYYY-MM-DD')
+           END                         AS LastPost,
+           STRING_AGG(DISTINCT tt.TagName, ', ') FILTER (WHERE tt.rn <= 5) AS TopTags
+    FROM user_summary us
+    LEFT JOIN badge_counts bc ON bc.UserId = us.Id
+    LEFT JOIN LATERAL (
+        SELECT p.Id
+        FROM Posts p
+        WHERE p.OwnerUserId = us.Id
+        ORDER BY p.CreationDate DESC
+        LIMIT 1
+    ) latest_post ON true
+    LEFT JOIN recent_votes rv ON rv.PostId = latest_post.Id
+    LEFT JOIN LATERAL (
+        SELECT trim(both '<>' FROM tag) AS TagName
+        FROM unnest(
+               string_to_array(
+                 (SELECT p.Tags FROM Posts p WHERE p.Id = latest_post.Id), '><'
+               )
+             ) AS tag
+    ) pt ON true
+    LEFT JOIN top_tags tt ON tt.TagName = pt.TagName
+    WHERE us.Reputation > 1000
+    GROUP BY us.Id, us.DisplayName, us.Reputation,
+             us.QuestionCount, us.AnswerCount, us.TotalScore,
+             bc.GoldBadges, bc.SilverBadges, bc.BronzeBadges,
+             rv.NetVote, us.LastPostDate
+    HAVING COUNT(tt.TagName) FILTER (WHERE tt.rn <= 5) > 0
+)
+SELECT *
+FROM main_results
+ORDER BY TotalScore DESC
+LIMIT 50
+
+UNION ALL
+
+SELECT CAST(NULL AS bigint) AS Id,
+       CAST('--- Summary Separator ---' AS text) AS DisplayName,
+       CAST(NULL AS bigint) AS Reputation,
+       CAST(NULL AS integer) AS QuestionCount,
+       CAST(NULL AS integer) AS AnswerCount,
+       CAST(NULL AS bigint) AS TotalScore,
+       CAST(NULL AS integer) AS GoldBadges,
+       CAST(NULL AS integer) AS SilverBadges,
+       CAST(NULL AS integer) AS BronzeBadges,
+       CAST(NULL AS integer) AS RecentNetVote,
+       CAST(NULL AS text) AS LastPost,
+       CAST(NULL AS text) AS TopTags
+
+ORDER BY DisplayName DESC
+LIMIT 51;

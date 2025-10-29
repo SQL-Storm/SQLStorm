@@ -1,0 +1,115 @@
+-- {"query": "3312.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1868} 
+
+/*  Complex benchmarking query on the StackOverflow schema  */
+WITH
+    /*  All tags  */
+    TagList AS (
+        SELECT t.Id   AS TagId,
+               t.TagName
+        FROM   Tags t
+    ),
+
+    /*  Answers posted in the last year, exploded into individual tags  */
+    AnswerPosts AS (
+        SELECT p.Id,
+               p.ParentId            AS QuestionId,
+               p.OwnerUserId,
+               p.Score,
+               p.CreationDate,
+               p.ViewCount,
+               regexp_split_to_table(p.Tags, '><') AS RawTag   -- yields strings like '<tag>'
+        FROM   Posts p
+        WHERE  p.PostTypeId = 2                                   -- answers only
+          AND  p.CreationDate >= now() - interval '1 year'
+    ),
+
+    /*  Normalise tag names (remove surrounding '<' '>') and aggregate per tag+user  */
+    TagAnswers AS (
+        SELECT tl.TagName,
+               ap.OwnerUserId,
+               COUNT(*)                                            AS AnswerCount,
+               AVG(ap.Score)                                       AS AvgScore,
+               SUM(ap.Score * LOG(1 + COALESCE(ap.ViewCount,0)))   AS WeightedScore,
+               MAX(ap.CreationDate)                               AS LastAnswerDate
+        FROM   TagList tl
+        LEFT JOIN AnswerPosts ap
+               ON tl.TagName = trim(both '<>' FROM ap.RawTag)
+        GROUP BY tl.TagName, ap.OwnerUserId
+    ),
+
+    /*  User reputation plus the date of their most recent badge (if any)  */
+    UserReputation AS (
+        SELECT u.Id                         AS UserId,
+               u.DisplayName,
+               u.Reputation,
+               (SELECT MAX(b.Date)
+                FROM   Badges b
+                WHERE  b.UserId = u.Id)    AS LastBadgeDate
+        FROM   Users u
+    ),
+
+    /*  Rank users per tag by weighted score (ties broken by reputation)  */
+    RankedUserTag AS (
+        SELECT ta.TagName,
+               ur.UserId,
+               ur.DisplayName,
+               ur.Reputation,
+               ta.AnswerCount,
+               ta.AvgScore,
+               ta.WeightedScore,
+               ROW_NUMBER() OVER (PARTITION BY ta.TagName
+                                  ORDER BY ta.WeightedScore DESC NULLS LAST,
+                                           ur.Reputation DESC)   AS rn,
+               ur.LastBadgeDate
+        FROM   TagAnswers ta
+               JOIN UserReputation ur ON ur.UserId = ta.OwnerUserId
+        WHERE  ta.AnswerCount IS NOT NULL
+    )
+
+/*  Final result set: top‑5 users per tag + placeholder rows for tags with no activity */
+SELECT
+    r.TagName,
+    r.UserId,
+    r.DisplayName,
+    r.Reputation,
+    r.AnswerCount,
+    ROUND(r.AvgScore, 2)          AS AvgScore,
+    ROUND(r.WeightedScore, 2)     AS WeightedScore,
+    COALESCE(to_char(r.LastBadgeDate, 'YYYY-MM-DD'), 'Never') AS LastBadge,
+    CONCAT(r.DisplayName, ' on ', r.TagName)                     AS DisplayTagUser
+FROM   RankedUserTag r
+WHERE  r.rn <= 5
+
+UNION ALL
+
+SELECT
+    tl.TagName,
+    NULL      AS UserId,
+    NULL      AS DisplayName,
+    NULL      AS Reputation,
+    0         AS AnswerCount,
+    NULL      AS AvgScore,
+    NULL      AS WeightedScore,
+    NULL      AS LastBadge,
+    CONCAT('No activity for tag ', tl.TagName)                  AS DisplayTagUser
+FROM   TagList tl
+WHERE  NOT EXISTS (SELECT 1 FROM RankedUserTag ru WHERE ru.TagName = tl.TagName)
+
+EXCEPT
+
+/*  Remove any rows where the user’s reputation is below 1 000 (illustrates set operator usage) */
+SELECT *
+FROM   (
+        SELECT
+            TagName,
+            UserId,
+            DisplayName,
+            Reputation,
+            AnswerCount,
+            AvgScore,
+            WeightedScore,
+            LastBadge,
+            DisplayTagUser
+        FROM   RankedUserTag
+        WHERE  Reputation < 1000
+       ) AS lowrep;

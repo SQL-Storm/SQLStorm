@@ -1,0 +1,245 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.LastActivityDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) as total_posts,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as avg_score,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+        CASE 
+            WHEN p.Score > (SELECT AVG(Score) FROM Posts WHERE OwnerUserId = p.OwnerUserId) 
+            THEN 'Above Average' 
+            ELSE 'Below Average' 
+        END as score_performance,
+        COALESCE(p.Title, 'No Title') as title_or_default,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags != '' 
+            THEN string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags)-2), '><') 
+            ELSE ARRAY[]::varchar[]
+        END as tag_array
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.AccountId,
+        COUNT(DISTINCT p.Id) as total_questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as total_answers,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) as total_question_score,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) as total_answer_score,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END) as avg_question_score,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE NULL END) as avg_answer_score,
+        MAX(p.CreationDate) as last_post_date,
+        COUNT(DISTINCT c.Id) as total_comments,
+        EXISTS(SELECT 1 FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId IN (8, 9)) as has_bounty_activity
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.AccountId
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        COALESCE((SELECT COUNT(*) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%'), 0) as usage_count,
+        CASE WHEN t.Count > 100 THEN 'Popular' ELSE 'Regular' END as tag_category,
+        EXTRACT(YEAR FROM CAST('2024-10-01 12:34:56' AS timestamp)) 
+          - EXTRACT(YEAR FROM COALESCE((SELECT MIN(p.CreationDate) FROM Posts p WHERE p.Tags LIKE '%' || t.TagName || '%'), CAST('1970-01-01' AS timestamp))) as tag_age_years
+    FROM Tags t
+    WHERE t.TagName IS NOT NULL AND t.TagName != ''
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        rp.Id as PostId,
+        rp.PostTypeId,
+        rp.OwnerUserId,
+        rp.Score,
+        rp.ViewCount,
+        rp.CreationDate,
+        rp.Title,
+        rp.AnswerCount,
+        rp.CommentCount,
+        rp.FavoriteCount,
+        COALESCE(rp.ClosedDate, CAST('1900-01-01' AS date)) as effective_closed_date,
+        rp.LastActivityDate,
+        rp.score_performance,
+        rp.total_posts,
+        rp.avg_score,
+        rp.prev_score,
+        CASE 
+            WHEN rp.prev_score IS NOT NULL 
+            AND rp.Score > rp.prev_score 
+            THEN (rp.Score - rp.prev_score) 
+            ELSE 0 
+        END as score_change,
+        CASE 
+            WHEN rp.Score > 0 
+            THEN (rp.Score * 100.0 / NULLIF(rp.avg_score, 0)) 
+            ELSE NULL 
+        END as score_percentage_vs_avg,
+        CASE 
+            WHEN rp.AnswerCount > 0 
+            THEN (rp.CommentCount * 100.0 / NULLIF(rp.AnswerCount, 0)) 
+            ELSE NULL 
+        END as comments_per_answer,
+        COALESCE(rp.title_or_default, 'Untitled') as normalized_title,
+        CASE 
+            WHEN cardinality(rp.tag_array) > 0 
+            THEN array_to_string(rp.tag_array, '; ') 
+            ELSE 'No Tags' 
+        END as joined_tags,
+        CASE 
+            WHEN rp.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 month') 
+            THEN 'Recent' 
+            WHEN rp.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year') 
+            THEN 'This Year' 
+            ELSE 'Older' 
+        END as creation_age_category,
+        COALESCE(
+            (SELECT COUNT(*) FROM PostHistory ph 
+             WHERE ph.PostId = rp.Id 
+             AND ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20)), 
+            0
+        ) as history_events_count,
+        rp.tag_array,
+        rp.title_or_default
+    FROM RankedPosts rp
+)
+SELECT 
+    cpa.PostId,
+    cpa.PostTypeId,
+    cpa.OwnerUserId,
+    cpa.Score,
+    cpa.ViewCount,
+    cpa.CreationDate,
+    cpa.Title,
+    cpa.AnswerCount,
+    cpa.CommentCount,
+    cpa.FavoriteCount,
+    cpa.effective_closed_date,
+    cpa.LastActivityDate,
+    cpa.score_performance,
+    cpa.total_posts,
+    cpa.avg_score,
+    cpa.score_change,
+    cpa.score_percentage_vs_avg,
+    cpa.comments_per_answer,
+    cpa.normalized_title,
+    cpa.joined_tags,
+    cpa.creation_age_category,
+    cpa.history_events_count,
+    us.DisplayName as owner_name,
+    us.Reputation as owner_reputation,
+    us.total_questions,
+    us.total_answers,
+    us.total_question_score,
+    us.total_answer_score,
+    us.avg_question_score,
+    us.avg_answer_score,
+    us.total_comments,
+    us.has_bounty_activity,
+    ta.TagName,
+    ta.Count as tag_count,
+    ta.usage_count,
+    ta.tag_category,
+    ta.tag_age_years,
+    CASE 
+        WHEN cpa.Score > 50 AND cpa.ViewCount > 1000 
+        THEN 'High Impact' 
+        WHEN cpa.Score > 10 AND cpa.ViewCount > 100 
+        THEN 'Moderate Impact' 
+        ELSE 'Low Impact' 
+    END as impact_level,
+    CASE 
+        WHEN cpa.creation_age_category = 'Recent' 
+        AND cpa.score_percentage_vs_avg > 120 
+        THEN 'Sudden Rise' 
+        WHEN cpa.creation_age_category = 'This Year' 
+        AND cpa.avg_score > 20 
+        THEN 'Active Contributor' 
+        ELSE 'Regular Contributor' 
+    END as user_role_classification,
+    CASE 
+        WHEN cpa.history_events_count > 5 
+        THEN 'Highly Active' 
+        WHEN cpa.history_events_count > 2 
+        THEN 'Moderately Active' 
+        ELSE 'Passive' 
+    END as post_activity_level,
+    COALESCE(
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = cpa.PostId AND v.VoteTypeId = 2), 
+        0
+    ) as upvotes,
+    COALESCE(
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = cpa.PostId AND v.VoteTypeId = 3), 
+        0
+    ) as downvotes,
+    COALESCE(
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = cpa.PostId), 
+        0
+    ) as comment_count,
+    CASE 
+        WHEN cpa.Score < 0 
+        THEN 'Negative' 
+        WHEN cpa.Score BETWEEN 0 AND 10 
+        THEN 'Low' 
+        WHEN cpa.Score BETWEEN 11 AND 50 
+        THEN 'Medium' 
+        WHEN cpa.Score BETWEEN 51 AND 100 
+        THEN 'High' 
+        ELSE 'Very High' 
+    END as score_level,
+    COALESCE(
+        (SELECT AVG(v.BountyAmount) FROM Votes v WHERE v.PostId = cpa.PostId AND v.VoteTypeId = 8), 
+        0
+    ) as average_bounty,
+    CASE 
+        WHEN cpa.Score > 0 AND cpa.CommentCount = 0 
+        THEN 'No Comments' 
+        WHEN cpa.Score > 0 AND cpa.CommentCount > 0 
+        THEN 'Has Comments' 
+        ELSE 'Neutral' 
+    END as comment_status,
+    COALESCE(
+        (SELECT string_agg(ph.Comment, '; ') 
+         FROM PostHistory ph 
+         WHERE ph.PostId = cpa.PostId 
+         AND ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20, 33, 34)), 
+        'No History'
+    ) as history_comments_summary
+FROM ComplexPostAnalysis cpa
+LEFT JOIN UserStats us ON cpa.OwnerUserId = us.UserId
+LEFT JOIN TagAnalysis ta ON EXISTS(
+    SELECT 1 FROM unnest(cpa.tag_array) AS tag WHERE tag = ta.TagName
+)
+WHERE cpa.OwnerUserId IS NOT NULL 
+   AND cpa.Score IS NOT NULL
+   AND us.Reputation > 1000
+   AND NOT (cpa.creation_age_category = 'Older' AND cpa.Score < 10)
+   AND (us.total_questions > 0 OR us.total_answers > 0)
+ORDER BY 
+    cpa.Score DESC, 
+    cpa.ViewCount DESC,
+    cpa.CreationDate DESC,
+    cpa.total_posts DESC
+LIMIT 1000 OFFSET 0;

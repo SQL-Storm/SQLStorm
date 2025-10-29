@@ -1,0 +1,220 @@
+with recursive RecursiveTagPaths as (
+    select 
+        t.Id,
+        t.TagName,
+        array[t.TagName] as TagPath,
+        t.Count,
+        t.IsModeratorOnly,
+        t.IsRequired
+    from Tags t
+    where t.IsRequired = true
+
+    union all
+
+    select
+        t.Id,
+        t.TagName,
+        r.TagPath || t.TagName,
+        t.Count,
+        t.IsModeratorOnly,
+        t.IsRequired
+    from Tags t
+    join RecursiveTagPaths r on t.IsModeratorOnly = false and t.Count < r.Count and not t.TagName = any(r.TagPath)
+),
+QuestionStats as (
+    select 
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        coalesce(p.Score,0) as Score,
+        coalesce(p.ViewCount,0) as Views,
+        p.Tags,
+        p.OwnerUserId,
+        (select count(*) from Posts Answers where Answers.ParentId = p.Id) as AnswerCount,
+        p.AcceptedAnswerId,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as UserRecentQuestionRank,
+        case 
+            when p.ClosedDate is not null then 1
+            else 0
+        end as IsClosed
+    from Posts p
+    where p.PostTypeId = 1
+),
+UserBadgeCounts as (
+    select 
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges
+    from Badges b
+    group by b.UserId
+),
+UserAggregates as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        u.UpVotes,
+        u.DownVotes,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        count(distinct q.Id) as QuestionsAsked,
+        sum(q.Score) as TotalQuestionScore,
+        sum(q.Views) as TotalQuestionViews,
+        sum(q.AnswerCount) as TotalAnswersToUserQuestions,
+        sum(case when q.IsClosed = 1 then 1 else 0 end) as ClosedQuestions
+    from Users u
+    left join QuestionStats q on u.Id = q.OwnerUserId
+    left join UserBadgeCounts ub on u.Id = ub.UserId
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location, u.UpVotes, u.DownVotes, ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges
+),
+AnswerDetails as (
+    select
+        a.Id,
+        a.ParentId as QuestionId,
+        a.CreationDate,
+        a.Score,
+        a.OwnerUserId,
+        a.LastActivityDate,
+        a.Body,
+        dense_rank() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank,
+        case 
+            when a.Id = q.AcceptedAnswerId then 1 
+            else 0 
+        end as IsAccepted
+    from Posts a
+    join Posts q on a.ParentId = q.Id and q.PostTypeId = 1
+    where a.PostTypeId = 2
+),
+AnswerWindow as (
+    select
+        ad.*,
+        count(*) over (partition by ad.QuestionId) as TotalAnswers
+    from AnswerDetails ad
+),
+RecentVotes as (
+    select 
+        v.PostId,
+        v.VoteTypeId,
+        count(*) as VoteCount
+    from Votes v
+    where v.CreationDate > (cast('2024-10-01' as date) - interval '30 days')
+    group by v.PostId, v.VoteTypeId
+),
+QuestionVoteSummary as (
+    select
+        q.Id as QuestionId,
+        sum(case when v.VoteTypeId = 2 then v.VoteCount else 0 end) as RecentUpVotes,
+        sum(case when v.VoteTypeId = 3 then v.VoteCount else 0 end) as RecentDownVotes,
+        sum(coalesce(v.VoteCount,0)) as TotalRecentVotes
+    from Posts q
+    left join RecentVotes v on q.Id = v.PostId
+    where q.PostTypeId = 1
+    group by q.Id
+),
+LinkedQuestionDuplicates as (
+    select
+        pl.PostId as DuplicateQuestionId,
+        pl.RelatedPostId as OriginalQuestionId
+    from PostLinks pl
+    join LinkTypes lt on pl.LinkTypeId = lt.Id and lt.Name = 'Duplicate'
+    join Posts p1 on pl.PostId = p1.Id and p1.PostTypeId = 1
+    join Posts p2 on pl.RelatedPostId = p2.Id and p2.PostTypeId = 1
+),
+DuplicationStats as (
+    select
+        q.Id,
+        (select count(*) from LinkedQuestionDuplicates ld where ld.OriginalQuestionId = q.Id) as DuplicateCount,
+        (select min(p.CreationDate) from Posts p join LinkedQuestionDuplicates ld on p.Id = ld.DuplicateQuestionId where ld.OriginalQuestionId = q.Id) as EarliestDuplicateDate
+    from Posts q
+    where q.PostTypeId = 1
+)
+select 
+    ua.Id as UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.Location,
+    ua.GoldBadges,
+    ua.SilverBadges,
+    ua.BronzeBadges,
+    ua.QuestionsAsked,
+    ua.TotalQuestionScore,
+    ua.TotalQuestionViews,
+    ua.TotalAnswersToUserQuestions,
+    ua.ClosedQuestions,
+    q.Id as QuestionId,
+    q.Title,
+    q.CreationDate as QuestionCreationDate,
+    q.Score as QuestionScore,
+    q.Views as QuestionViews,
+    q.AnswerCount,
+    q.FavoriteCount,
+    q.Tags,
+    q.IsClosed,
+    qas.RecentUpVotes,
+    qas.RecentDownVotes,
+    qas.TotalRecentVotes,
+    ad.Id as AnswerId,
+    ad.CreationDate as AnswerCreationDate,
+    ad.Score as AnswerScore,
+    ad.IsAccepted,
+    ad.AnswerRank,
+    ad.TotalAnswers,
+    ld.DuplicateCount,
+    ld.EarliestDuplicateDate,
+    case 
+        when q.Tags is null then array[]::text[]
+        else string_to_array(substring(q.Tags from 2 for char_length(q.Tags) - 2), '><')
+    end as TagArray,
+    rank() over (partition by q.Id order by ad.Score desc, ad.CreationDate asc) as AnswerScoreRank
+from UserAggregates ua
+left join QuestionStats q on ua.Id = q.OwnerUserId and q.UserRecentQuestionRank <= 5
+left join QuestionVoteSummary qas on q.Id = qas.QuestionId
+left join AnswerWindow ad on q.Id = ad.QuestionId and ad.AnswerRank <= 3
+left join DuplicationStats ld on q.Id = ld.Id
+where ua.Reputation > 1000 and ua.QuestionsAsked > 0
+
+union
+
+select 
+    ua.Id as UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.Location,
+    ua.GoldBadges,
+    ua.SilverBadges,
+    ua.BronzeBadges,
+    ua.QuestionsAsked,
+    ua.TotalQuestionScore,
+    ua.TotalQuestionViews,
+    ua.TotalAnswersToUserQuestions,
+    ua.ClosedQuestions,
+    null as QuestionId,
+    null as Title,
+    null as QuestionCreationDate,
+    null as QuestionScore,
+    null as QuestionViews,
+    null as AnswerCount,
+    null as FavoriteCount,
+    null as Tags,
+    null as IsClosed,
+    null as RecentUpVotes,
+    null as RecentDownVotes,
+    null as TotalRecentVotes,
+    null as AnswerId,
+    null as AnswerCreationDate,
+    null as AnswerScore,
+    null as IsAccepted,
+    null as AnswerRank,
+    null as TotalAnswers,
+    null as DuplicateCount,
+    null as EarliestDuplicateDate,
+    null as TagArray,
+    null as AnswerScoreRank
+from UserAggregates ua
+where ua.QuestionsAsked = 0
+
+order by Reputation desc, UserId, QuestionCreationDate desc NULLS LAST, AnswerScoreRank NULLS LAST;

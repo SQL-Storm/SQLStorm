@@ -1,0 +1,205 @@
+-- {"query": "2942.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1727} 
+with RecursiveTagCounts as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        p.Id as PostId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate
+    from Tags t
+    join Posts p on p.Tags is not null and 
+        position('<' || t.TagName || '>' in p.Tags) > 0
+    where p.PostTypeId = 1
+),
+RankedPosts as (
+    select
+        rtc.*,
+        row_number() over (partition by rtc.TagName order by rtc.Score desc, rtc.ViewCount desc) as TagRank
+    from RecursiveTagCounts rtc
+),
+TopTagPosts as (
+    select * from RankedPosts where TagRank <= 5
+),
+UserBadgeStats as (
+    select
+        b.UserId,
+        count(*) filter (where b.Class = 1) as GoldBadges,
+        count(*) filter (where b.Class = 2) as SilverBadges,
+        count(*) filter (where b.Class = 3) as BronzeBadges,
+        max(b.Date) as LastBadgeDate
+    from Badges b
+    group by b.UserId
+),
+UserRanks as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        coalesce(ubs.GoldBadges, 0) as GoldBadges,
+        coalesce(ubs.SilverBadges, 0) as SilverBadges,
+        coalesce(ubs.BronzeBadges, 0) as BronzeBadges,
+        u.CreationDate,
+        u.LastAccessDate,
+        dense_rank() over (order by u.Reputation desc) as ReputationRank
+    from Users u
+    left join UserBadgeStats ubs on u.Id = ubs.UserId
+),
+RecentHighScoreAnswers as (
+    select
+        p.Id,
+        p.ParentId,
+        p.OwnerUserId,
+        p.Score,
+        p.CreationDate,
+        p.Body,
+        u.DisplayName as OwnerName,
+        dense_rank() over (partition by p.ParentId order by p.Score desc, p.CreationDate asc) as AnswerRank
+    from Posts p
+    join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId = 2 and p.CreationDate > current_date - interval '30 days'
+),
+SelectedAnswers as (
+    select
+        rha.*
+    from RecentHighScoreAnswers rha
+    where rha.AnswerRank = 1
+),
+PostDuplicates as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name as LinkTypeName
+    from PostLinks pl
+    join LinkTypes lt on pl.LinkTypeId = lt.Id
+    where lt.Name = 'Duplicate'
+),
+PostCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReason,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    join PostHistoryTypes pht on ph.PostHistoryTypeId = pht.Id
+    left join CloseReasonTypes crt on ph.Comment is not null and cast(ph.Comment as int) = crt.Id
+    where ph.PostHistoryTypeId = 10
+),
+QuestionStats as (
+    select
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CreationDate,
+        p.Tags,
+        pr.CloseReason,
+        pr.CloseDate,
+        case when pr.PostId is null then false else true end as IsClosed,
+        coalesce(sd.RelatedPostId, null) as DuplicateOfPostId,
+        coalesce(sa.Id, null) as SelectedAnswerId,
+        coalesce(sa.Score, 0) as SelectedAnswerScore,
+        u.DisplayName as OwnerName,
+        ur.GoldBadges,
+        ur.SilverBadges,
+        ur.BronzeBadges
+    from Posts p
+    left join PostCloseReasons pr on pr.PostId = p.Id
+    left join PostDuplicates sd on sd.PostId = p.Id
+    left join SelectedAnswers sa on sa.ParentId = p.Id
+    join Users u on p.OwnerUserId = u.Id
+    left join UserBadgeStats ur on u.Id = ur.UserId
+    where p.PostTypeId = 1
+),
+ComplexQuery as (
+    select
+        qs.Id as QuestionId,
+        qs.Title,
+        qs.OwnerName,
+        qs.Score,
+        qs.ViewCount,
+        qs.AnswerCount,
+        qs.IsClosed,
+        qs.CloseReason,
+        qs.CloseDate,
+        qs.DuplicateOfPostId,
+        qs.SelectedAnswerId,
+        qs.SelectedAnswerScore,
+        qs.GoldBadges,
+        qs.SilverBadges,
+        qs.BronzeBadges,
+        length(qs.Title) as TitleLength,
+        array_length(string_to_array(trim(BOTH '<>' from qs.Tags), '><'), 1) as TagCount,
+        case
+            when qs.IsClosed then extract(day from coalesce(qs.CloseDate, now()) - qs.CreationDate)
+            else null
+        end as DaysUntilClose,
+        rank() over (partition by qs.IsClosed order by qs.Score desc, qs.ViewCount desc) as ScoreRank,
+        case
+            when qs.DuplicateOfPostId is not null then 'Duplicate'
+            when qs.IsClosed then 'Closed'
+            else 'Open'
+        end as PostStatusCategory
+    from QuestionStats qs
+),
+FinalOutput as (
+    select
+        cq.*,
+        -- Correlated subquery to count number of comments on question
+        (select count(*) from Comments c where c.PostId = cq.QuestionId) as CommentCount,
+        -- Window function for accumulated score over all questions ordered by CreationDate
+        sum(cq.Score) over (order by cq.CreationDate rows between unbounded preceding and current row) as AccumulatedScore,
+        -- String aggregation of tag names for this question (limited to 3 tags, ordered alphabetically)
+        (select string_agg(tag, ', ') from (
+            select unnest(string_to_array(trim(BOTH '<>' from cq.Tags), '><')) as tag
+            order by tag limit 3
+        ) sub) as Top3Tags,
+        -- Null handling: user's display name or '[deleted]'
+        coalesce(cq.OwnerName, '[deleted]') as SafeOwnerName,
+        -- Complex predicate on question popularity flags
+        case
+            when cq.Score > 10 and cq.ViewCount > 1000 and cq.AnswerCount > 3 then 'Hot'
+            when cq.Score between 1 and 10 and cq.ViewCount between 100 and 1000 then 'Warm'
+            else 'Cold'
+        end as PopularityFlag
+    from ComplexQuery cq
+)
+select
+    *
+from FinalOutput
+where TagCount > 1 and ScoreRank <= 100
+union
+select 
+    ttp.Id as QuestionId,
+    ttp.Title,
+    null as OwnerName,
+    ttp.Score,
+    ttp.ViewCount,
+    null::int as AnswerCount,
+    null::boolean as IsClosed,
+    null::varchar as CloseReason,
+    null::timestamp as CloseDate,
+    null::int as DuplicateOfPostId,
+    null::int as SelectedAnswerId,
+    null::int as SelectedAnswerScore,
+    null::int as GoldBadges,
+    null::int as SilverBadges,
+    null::int as BronzeBadges,
+    length(ttp.Title) as TitleLength,
+    array_length(string_to_array(trim(BOTH '<>' from ttp.Tags), '><'), 1) as TagCount,
+    null::int as DaysUntilClose,
+    null::int as ScoreRank,
+    null::varchar as PostStatusCategory,
+    -- Zero comments assumed
+    0 as CommentCount,
+    -- AccumulatedScore and Top3Tags unknown here, set null
+    null::int as AccumulatedScore,
+    null::varchar as Top3Tags,
+    '[community]' as SafeOwnerName,
+    'Hot' as PopularityFlag
+from Posts ttp
+where ttp.Id in (select Id from TopTagPosts)
+order by Score desc nulls last, ViewCount desc nulls last
+limit 200;

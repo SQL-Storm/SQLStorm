@@ -1,0 +1,328 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+        LAG(p.ViewCount) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_viewcount
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) as TotalQuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) as TotalAnswerScore,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END) as AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE NULL END) as AvgAnswerScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        COALESCE(p1.ViewCount, 0) as ExcerptViews,
+        COALESCE(p2.ViewCount, 0) as WikiViews,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            ELSE 'Niche'
+        END as TagPopularity,
+        CASE 
+            WHEN t.IsRequired = TRUE THEN 'Required'
+            WHEN t.IsModeratorOnly = TRUE THEN 'Moderator Only'
+            ELSE 'Standard'
+        END as TagType
+    FROM Tags t
+    LEFT JOIN Posts p1 ON t.ExcerptPostId = p1.Id
+    LEFT JOIN Posts p2 ON t.WikiPostId = p2.Id
+),
+PostAnalysis AS (
+    SELECT 
+        rp.Id,
+        rp.PostTypeId,
+        rp.OwnerUserId,
+        rp.Score,
+        rp.ViewCount,
+        rp.CreationDate,
+        rp.Title,
+        rp.Tags,
+        rp.AnswerCount,
+        rp.CommentCount,
+        rp.FavoriteCount,
+        rp.prev_score,
+        rp.prev_viewcount,
+        (rp.Score - COALESCE(rp.prev_score, 0)) as ScoreChange,
+        (rp.ViewCount - COALESCE(rp.prev_viewcount, 0)) as ViewChange,
+        CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - rp.CreationDate)) / 86400 AS INTEGER) as DaysSinceCreation,
+        CASE 
+            WHEN rp.Score > 100 THEN 'High'
+            WHEN rp.Score > 10 THEN 'Medium'
+            ELSE 'Low'
+        END as ScoreLevel,
+        CASE
+            WHEN rp.AnswerCount > 10 THEN 'Highly Answered'
+            WHEN rp.AnswerCount > 5 THEN 'Moderately Answered'
+            ELSE 'Low Answered'
+        END as AnswerLevel
+    FROM RankedPosts rp
+    WHERE rp.rn = 1
+),
+CombinedAnalysis AS (
+    SELECT 
+        pa.Id as PostId,
+        pa.PostTypeId,
+        pa.OwnerUserId,
+        pa.Score,
+        pa.ViewCount,
+        pa.CreationDate,
+        pa.Title,
+        pa.Tags,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.FavoriteCount,
+        pa.ScoreChange,
+        pa.ViewChange,
+        pa.DaysSinceCreation,
+        pa.ScoreLevel,
+        pa.AnswerLevel,
+        us.Reputation,
+        us.DisplayName as OwnerName,
+        us.TotalPosts,
+        us.Questions,
+        us.Answers,
+        us.TotalQuestionScore,
+        us.TotalAnswerScore,
+        us.AvgQuestionScore,
+        us.AvgAnswerScore,
+        ta.TagPopularity,
+        ta.TagType,
+        CASE 
+            WHEN pa.Score > us.TotalQuestionScore THEN 'Above Average Question Score'
+            WHEN pa.Score < us.TotalQuestionScore THEN 'Below Average Question Score'
+            ELSE 'Average Question Score'
+        END as ScoreComparison
+    FROM PostAnalysis pa
+    INNER JOIN UserStats us ON pa.OwnerUserId = us.UserId
+    LEFT JOIN TagAnalysis ta ON pa.Tags LIKE '%' || ta.TagName || '%'
+)
+SELECT 
+    ca.PostId,
+    ca.PostTypeId,
+    ca.OwnerUserId,
+    ca.Score,
+    ca.ViewCount,
+    ca.CreationDate,
+    ca.Title,
+    ca.Tags,
+    ca.AnswerCount,
+    ca.CommentCount,
+    ca.FavoriteCount,
+    ca.ScoreChange,
+    ca.ViewChange,
+    ca.DaysSinceCreation,
+    ca.ScoreLevel,
+    ca.AnswerLevel,
+    ca.Reputation,
+    ca.OwnerName,
+    ca.TotalPosts,
+    ca.Questions,
+    ca.Answers,
+    ca.TotalQuestionScore,
+    ca.TotalAnswerScore,
+    ca.AvgQuestionScore,
+    ca.AvgAnswerScore,
+    ca.TagPopularity,
+    ca.TagType,
+    ca.ScoreComparison,
+    COUNT(*) OVER() as TotalResults,
+    AVG(ca.Score) OVER() as AvgScore,
+    MAX(ca.ViewCount) OVER() as MaxViewCount,
+    STRING_AGG(CASE WHEN ca.TagPopularity = 'Popular' THEN ca.Tags END, ', ') as PopularTags,
+    RANK() OVER (ORDER BY ca.Score DESC) as ScoreRank,
+    DENSE_RANK() OVER (ORDER BY ca.ViewCount DESC) as ViewRank,
+    ROW_NUMBER() OVER (ORDER BY ca.CreationDate DESC) as RecentRank,
+    CASE 
+        WHEN ca.Score > (SELECT AVG(p.Score) FROM Posts p WHERE p.PostTypeId = 1) THEN 'Above Average'
+        ELSE 'Below Average'
+    END as AverageScoreFlag,
+    CASE 
+        WHEN ca.ViewCount > (SELECT AVG(p.ViewCount) FROM Posts p WHERE p.PostTypeId = 1) THEN 'High Traffic'
+        ELSE 'Low Traffic'
+    END as TrafficLevel,
+    COALESCE(NULLIF(ca.OwnerName, ''), 'Anonymous') as DisplayOwnerName,
+    CASE 
+        WHEN ca.ScoreChange > 0 THEN 'Positive Growth'
+        WHEN ca.ScoreChange < 0 THEN 'Negative Growth'
+        ELSE 'No Change'
+    END as ScoreTrend,
+    CASE 
+        WHEN ca.ViewChange > 0 THEN 'Increased Views'
+        WHEN ca.ViewChange < 0 THEN 'Decreased Views'
+        ELSE 'Stable Views'
+    END as ViewTrend,
+    CASE 
+        WHEN ca.TagType = 'Required' THEN 'Required Tag'
+        WHEN ca.TagType = 'Moderator Only' THEN 'Moderator Tag'
+        ELSE 'Standard Tag'
+    END as TagClassification,
+    CASE 
+        WHEN ca.TotalPosts = 0 THEN 'New User'
+        WHEN ca.TotalPosts < 10 THEN 'Occasional Poster'
+        WHEN ca.TotalPosts < 50 THEN 'Regular Poster'
+        ELSE 'Experienced Poster'
+    END as UserExperienceLevel,
+    CASE 
+        WHEN ca.DaysSinceCreation < 30 THEN 'New Post'
+        WHEN ca.DaysSinceCreation BETWEEN 30 AND 365 THEN 'Medium Age'
+        ELSE 'Old Post'
+    END as PostAgeCategory,
+    ABS(ca.ScoreChange) + ABS(ca.ViewChange) as TotalChangeMagnitude,
+    (ca.Score * ca.ViewCount) / (NULLIF(ca.DaysSinceCreation, 0) + 1) as ActivityIndex,
+    ('Post #' || ca.PostId || ' by ' || ca.OwnerName) as PostSummary,
+    CASE 
+        WHEN ca.AnswerCount > 0 THEN 
+            ROUND(ca.Score::numeric / NULLIF(ca.AnswerCount, 0), 2)
+        ELSE NULL
+    END as ScorePerAnswer,
+    CASE 
+        WHEN ca.CommentCount > 0 THEN 
+            ROUND(ca.Score::numeric / NULLIF(ca.CommentCount, 0), 2)
+        ELSE NULL
+    END as ScorePerComment,
+    CASE 
+        WHEN ca.FavoriteCount > 0 THEN 
+            ROUND(ca.Score::numeric / NULLIF(ca.FavoriteCount, 0), 2)
+        ELSE NULL
+    END as ScorePerFavorite,
+    CASE 
+        WHEN ca.ViewCount > 0 AND ca.Score > 0 THEN 
+            ROUND((ca.Score::numeric / ca.ViewCount) * 100, 2)
+        ELSE 0
+    END as ScoreToViewRatio,
+    CASE 
+        WHEN ca.Score > 0 THEN 
+            ROUND((ca.Score::numeric / NULLIF(ca.Reputation, 0)) * 1000, 2)
+        ELSE 0
+    END as ScoreToReputationRatio,
+    CASE 
+        WHEN ca.ViewCount > 0 THEN 
+            CASE 
+                WHEN ca.ViewCount > 10000 THEN 'Viral'
+                WHEN ca.ViewCount > 1000 THEN 'Popular' 
+                WHEN ca.ViewCount > 100 THEN 'Noticeable'
+                ELSE 'Unknown'
+            END
+        ELSE 'No Views'
+    END as ViewCategory,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = ca.PostId AND v.VoteTypeId IN (2, 3)) as TotalVotes,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = ca.PostId) as CommentCount,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = ca.PostId AND ph.PostHistoryTypeId IN (1, 2, 3)) as EditCount,
+    CASE 
+        WHEN ca.AnswerCount IS NULL OR ca.AnswerCount = 0 THEN 'No Answers'
+        WHEN ca.AnswerCount > 10 THEN 'Extremely Active'
+        WHEN ca.AnswerCount > 5 THEN 'Very Active'
+        WHEN ca.AnswerCount > 1 THEN 'Active'
+        ELSE 'Inactive'
+    END as AnswerActivityStatus,
+    (SELECT MIN(c.CreationDate) FROM Comments c WHERE c.PostId = ca.PostId) as FirstCommentAt,
+    (SELECT MAX(c.CreationDate) FROM Comments c WHERE c.PostId = ca.PostId) as LastCommentAt,
+    CAST(EXTRACT(EPOCH FROM (
+        (SELECT MAX(c.CreationDate) FROM Comments c WHERE c.PostId = ca.PostId)
+        -
+        (SELECT MIN(c.CreationDate) FROM Comments c WHERE c.PostId = ca.PostId)
+    )) / 86400 AS INTEGER) as CommentActivitySpan
+FROM CombinedAnalysis ca
+WHERE ca.PostTypeId IN (1, 2)
+  AND ca.Score IS NOT NULL
+  AND (ca.ViewCount IS NOT NULL OR ca.Score IS NOT NULL)
+  AND ca.OwnerName IS NOT NULL
+  AND ca.OwnerName != ''
+  AND ca.TagPopularity IS NOT NULL
+  AND ca.TagType IS NOT NULL
+  AND ca.ScoreLevel IS NOT NULL
+  AND ca.AnswerLevel IS NOT NULL
+  AND ca.ScoreTrend IS NOT NULL
+  AND ca.ViewTrend IS NOT NULL
+  AND ca.ViewCategory IS NOT NULL
+  AND ca.TagClassification IS NOT NULL
+  AND ca.UserExperienceLevel IS NOT NULL
+  AND ca.PostAgeCategory IS NOT NULL
+  AND ca.ScoreComparison IS NOT NULL
+  AND ca.AverageScoreFlag IS NOT NULL
+  AND ca.TrafficLevel IS NOT NULL
+  AND ca.DisplayOwnerName IS NOT NULL
+  AND ca.TotalChangeMagnitude IS NOT NULL
+  AND ca.ActivityIndex IS NOT NULL
+  AND ca.PostSummary IS NOT NULL
+  AND ca.ScorePerAnswer IS NOT NULL
+  AND ca.ScorePerComment IS NOT NULL
+  AND ca.ScorePerFavorite IS NOT NULL
+  AND ca.ScoreToViewRatio IS NOT NULL
+  AND ca.ScoreToReputationRatio IS NOT NULL
+  AND ca.AnswerActivityStatus IS NOT NULL
+  AND ca.FirstCommentAt IS NOT NULL
+  AND ca.LastCommentAt IS NOT NULL
+  AND ca.CommentActivitySpan IS NOT NULL
+GROUP BY 
+    ca.PostId,
+    ca.PostTypeId,
+    ca.OwnerUserId,
+    ca.Score,
+    ca.ViewCount,
+    ca.CreationDate,
+    ca.Title,
+    ca.Tags,
+    ca.AnswerCount,
+    ca.CommentCount,
+    ca.FavoriteCount,
+    ca.ScoreChange,
+    ca.ViewChange,
+    ca.DaysSinceCreation,
+    ca.ScoreLevel,
+    ca.AnswerLevel,
+    ca.Reputation,
+    ca.OwnerName,
+    ca.TotalPosts,
+    ca.Questions,
+    ca.Answers,
+    ca.TotalQuestionScore,
+    ca.TotalAnswerScore,
+    ca.AvgQuestionScore,
+    ca.AvgAnswerScore,
+    ca.TagPopularity,
+    ca.TagType,
+    ca.ScoreComparison
+HAVING 
+    ca.Score IS NOT NULL 
+    AND (ca.ViewCount IS NOT NULL OR ca.Score IS NOT NULL)
+    AND NOT (ca.Title IS NULL AND ca.Tags IS NULL)
+    AND ca.Score > 0
+    AND ca.ViewCount >= 0
+ORDER BY 
+    ca.Score DESC,
+    ca.ViewCount DESC,
+    ca.DaysSinceCreation ASC,
+    ca.TotalChangeMagnitude DESC
+LIMIT 1000;

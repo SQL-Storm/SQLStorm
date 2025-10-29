@@ -1,0 +1,216 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.AcceptedAnswerId,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+        LAG(p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_date,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) as total_posts_by_user,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as avg_score_by_user,
+        CASE 
+            WHEN p.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'High'
+            WHEN p.Score < (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'Low'
+            ELSE 'Average'
+        END as score_category,
+        COALESCE(p.Title, 'No Title') as safe_title,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags <> '' THEN 
+                CASE 
+                    WHEN array_length(string_to_array(trim(both '<>' FROM p.Tags), '><'), 1) > 0 
+                    THEN array_length(string_to_array(trim(both '<>' FROM p.Tags), '><'), 1)
+                    ELSE 0
+                END
+            ELSE 0 
+        END as tag_count,
+        CAST('2024-10-01 12:34:56' AS timestamp) - CAST(p.CreationDate AS timestamp) AS _interval_since_creation,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - CAST(p.CreationDate AS timestamp)))/86400 AS days_since_creation
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.CreationDate,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT rp.Id) as total_posts,
+        SUM(CASE WHEN rp.PostTypeId = 1 THEN 1 ELSE 0 END) as question_count,
+        SUM(CASE WHEN rp.PostTypeId = 2 THEN 1 ELSE 0 END) as answer_count,
+        AVG(rp.Score) as avg_score,
+        SUM(rp.Score) as total_score,
+        MAX(rp.CreationDate) as latest_post_date,
+        CASE 
+            WHEN COUNT(DISTINCT rp.Id) > 0 THEN
+                CASE 
+                    WHEN MAX(rp.Score) > 100 THEN 'Elite'
+                    WHEN MAX(rp.Score) > 50 THEN 'Advanced'
+                    ELSE 'Regular'
+                END
+            ELSE 'New'
+        END as user_level,
+        STRING_AGG(DISTINCT CASE WHEN rp.tag_count > 0 THEN rp.safe_title ELSE NULL END, ', ') as post_titles_with_tags
+    FROM Users u
+    LEFT JOIN RankedPosts rp ON u.Id = rp.OwnerUserId
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.CreationDate, u.Views, u.UpVotes, u.DownVotes
+),
+QuestionAnalysis AS (
+    SELECT 
+        rp.Id,
+        rp.Title,
+        rp.Score,
+        rp.ViewCount,
+        rp.AnswerCount,
+        rp.CommentCount,
+        rp.FavoriteCount,
+        rp.CreationDate,
+        rp.OwnerUserId,
+        rp.PostTypeId,
+        CASE 
+            WHEN rp.AnswerCount > 0 THEN 
+                (rp.Score * 1.0 / (rp.ViewCount + 1)) * (rp.AnswerCount + 1) 
+            ELSE 
+                (rp.Score * 1.0 / (rp.ViewCount + 1))
+        END as quality_score,
+        CASE 
+            WHEN rp.CommentCount > 0 THEN 
+                (rp.Score * 1.0 / (rp.ViewCount + 1)) * (rp.CommentCount + 1) 
+            ELSE 
+                (rp.Score * 1.0 / (rp.ViewCount + 1))
+        END as engagement_score,
+        rp.safe_title,
+        rp.tag_count,
+        rp.days_since_creation,
+        CASE 
+            WHEN rp.prev_score IS NOT NULL AND rp.prev_date IS NOT NULL THEN
+                (rp.Score - rp.prev_score) * 1.0 / NULLIF(
+                    EXTRACT(EPOCH FROM (CAST(rp.CreationDate AS timestamp) - CAST(rp.prev_date AS timestamp)))/86400
+                , 0)
+            ELSE 0 
+        END as score_growth_rate,
+        CASE 
+            WHEN rp.PostTypeId = 1 AND rp.AcceptedAnswerId IS NOT NULL THEN 1
+            WHEN rp.PostTypeId = 2 THEN 1
+            ELSE 0
+        END as has_resolution,
+        CASE 
+            WHEN rp.tag_count > 3 THEN 'Tag-heavy'
+            WHEN rp.tag_count = 0 THEN 'No Tags'
+            ELSE 'Normal Tags'
+        END as tag_density
+    FROM RankedPosts rp
+    WHERE rp.PostTypeId = 1
+),
+AnswerAnalysis AS (
+    SELECT 
+        rp.Id,
+        rp.ParentId,
+        rp.OwnerUserId,
+        rp.Score,
+        rp.CommentCount,
+        rp.CreationDate,
+        CASE 
+            WHEN rp.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 2) THEN 'High'
+            WHEN rp.Score < (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 2) THEN 'Low'
+            ELSE 'Average'
+        END as answer_score_category,
+        CASE 
+            WHEN rp.CommentCount > 5 THEN 'High Comment Count'
+            ELSE 'Normal Comment Count'
+        END as comment_level,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - CAST(rp.CreationDate AS timestamp)))/86400 as answer_age_days,
+        EXTRACT(EPOCH FROM (CAST(rp.CreationDate AS timestamp) - CAST((SELECT MIN(CreationDate) FROM Posts WHERE Id = rp.ParentId) AS timestamp)))/86400 as answer_to_question_age
+    FROM RankedPosts rp
+    WHERE rp.PostTypeId = 2
+)
+SELECT 
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.total_posts,
+    ua.question_count,
+    ua.answer_count,
+    ua.avg_score,
+    ua.total_score,
+    ua.latest_post_date,
+    ua.user_level,
+    ua.post_titles_with_tags,
+    COALESCE(SUM(qa.quality_score), 0) as total_quality_score,
+    COALESCE(SUM(qa.engagement_score), 0) as total_engagement_score,
+    COUNT(DISTINCT CASE WHEN qa.has_resolution = 1 THEN qa.Id ELSE NULL END) as resolved_questions,
+    AVG(qa.tag_count) as avg_tags_per_question,
+    MAX(qa.days_since_creation) as max_question_age,
+    COALESCE(SUM(aa.Score), 0) as total_answer_score,
+    COALESCE(COUNT(aa.Id), 0) as total_answers,
+    AVG(aa.answer_age_days) as avg_answer_age,
+    STRING_AGG(
+        COALESCE(
+            CASE 
+                WHEN qa.tag_count > 0 THEN 
+                    qa.safe_title || ' [' || qa.tag_count || ' tags]'
+                ELSE NULL
+            END, 
+            'No Title'
+        ), 
+        '; ' 
+    ) as top_questions_by_tags,
+    STRING_AGG(
+        CASE 
+            WHEN aa.answer_age_days < 30 THEN 
+                'Recent Answer (' || aa.answer_age_days || ' days)'
+            WHEN aa.answer_age_days BETWEEN 30 AND 180 THEN 
+                'Mid Age Answer (' || aa.answer_age_days || ' days)'
+            ELSE 
+                'Old Answer (' || aa.answer_age_days || ' days)'
+        END, 
+        '; '
+    ) as answer_age_groupings,
+    (CASE 
+        WHEN ua.total_posts > 0 AND ua.question_count > 0 THEN 
+            (ua.answer_count * 1.0 / ua.question_count)
+        ELSE 0 
+    END) as answer_to_question_ratio,
+    (CASE 
+        WHEN MAX(qa.score_growth_rate) IS NOT NULL THEN 
+            AVG(qa.score_growth_rate)
+        ELSE 0 
+    END) as avg_question_growth_rate
+FROM UserStats ua
+LEFT JOIN QuestionAnalysis qa ON ua.UserId = qa.OwnerUserId
+LEFT JOIN AnswerAnalysis aa ON ua.UserId = aa.OwnerUserId
+WHERE ua.total_posts > 0
+GROUP BY 
+    ua.UserId, 
+    ua.DisplayName, 
+    ua.Reputation, 
+    ua.total_posts, 
+    ua.question_count, 
+    ua.answer_count, 
+    ua.avg_score, 
+    ua.total_score, 
+    ua.latest_post_date, 
+    ua.user_level, 
+    ua.post_titles_with_tags
+HAVING 
+    (MAX(qa.days_since_creation) >= 30 OR MAX(aa.answer_age_days) >= 30)
+    AND (
+        COALESCE(SUM(qa.quality_score), 0) > 0 
+        OR COALESCE(SUM(aa.Score), 0) > 0
+    )
+ORDER BY 
+    ua.total_score DESC, 
+    ua.Reputation DESC
+LIMIT 1000;

@@ -1,0 +1,120 @@
+with RecursiveUserBadges as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class,
+        row_number() over (partition by u.Id order by b.Date desc) as rn
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    where u.Reputation > 1000
+),
+UserTopBadges as (
+    select UserId, DisplayName, BadgeName, Class
+    from RecursiveUserBadges
+    where rn <= 3
+),
+QuestionAnswerStats as (
+    select 
+        p.OwnerUserId,
+        count(case when p.PostTypeId = 1 then 1 end) as QuestionsCount,
+        count(case when p.PostTypeId = 2 then 1 end) as AnswersCount,
+        sum(case when p.PostTypeId = 1 then p.ViewCount else 0 end) as TotalQuestionViews,
+        sum(p.Score) as TotalPostScore,
+        max(p.CreationDate) as LatestPostDate
+    from Posts p
+    where p.OwnerUserId is not null
+    group by p.OwnerUserId
+),
+UserRecentActivity as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct ph.Id) as RecentEditsCount,
+        max(ph.CreationDate) as LastEditDate
+    from Users u
+    left join PostHistory ph on ph.UserId = u.Id and ph.CreationDate > (date '2024-10-01' - interval '30' day)
+    group by u.Id, u.DisplayName
+),
+TopQuestionsWithDuplicates as (
+    select 
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        replace(replace(coalesce(q.Tags,''), '<', ''), '>', '') as Tags,
+        count(distinct pl.Id) filter (where lt.Name = 'Duplicate') as DuplicateCount,
+        row_number() over (order by q.Score desc) as rn
+    from Posts q
+    left join PostLinks pl on pl.PostId = q.Id
+    left join LinkTypes lt on lt.Id = pl.LinkTypeId
+    where q.PostTypeId = 1 and q.CreationDate > (date '2024-10-01' - interval '1' year)
+    group by q.Id, q.Title, q.CreationDate, q.Score, q.Tags
+),
+UserQuestionAnswerPercentile as (
+    select 
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        pd.MedianScore,
+        ntile(4) over (partition by p.PostTypeId order by p.Score desc) as ScoreQuartile
+    from Posts p
+    join (
+        select PostTypeId,
+            percentile_disc(0.5) within group (order by Score) as MedianScore
+        from Posts
+        where PostTypeId in (1,2)
+        group by PostTypeId
+    ) pd on pd.PostTypeId = p.PostTypeId
+    where p.PostTypeId in (1, 2)
+),
+UserAggregateStats as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        coalesce(qas.QuestionsCount, 0) as QuestionsCount,
+        coalesce(qas.AnswersCount, 0) as AnswersCount,
+        coalesce(qas.TotalPostScore, 0) as TotalPostScore,
+        coalesce(ura.RecentEditsCount, 0) as RecentEditsCount
+    from Users u
+    left join QuestionAnswerStats qas on qas.OwnerUserId = u.Id
+    left join UserRecentActivity ura on ura.UserId = u.Id
+),
+BadgesSummary as (
+    select 
+        ub.UserId, 
+        string_agg(distinct ub.BadgeName || ' (' || 
+            case ub.Class when 1 then 'Gold' when 2 then 'Silver' when 3 then 'Bronze' else 'Unknown' end || ')', '; ' ) as BadgesList
+    from UserTopBadges ub
+    group by ub.UserId
+)
+select
+    uas.UserId,
+    uas.DisplayName,
+    uas.QuestionsCount,
+    uas.AnswersCount,
+    uas.TotalPostScore,
+    uas.RecentEditsCount,
+    coalesce(bs.BadgesList, 'No badges') as TopBadges,
+    count(distinct c.Id) filter (where c.CreationDate > (date '2024-10-01' - interval '90' day)) as RecentCommentCount,
+    avg(case when v.VoteTypeId = 2 then v.Score end) as AvgUpvotesOnPosts,
+    case when uas.QuestionsCount > 0 then uas.TotalPostScore * 1.0 / uas.QuestionsCount else null end as AvgScorePerQuestion,
+    min(qdu.DuplicateCount) as MinDuplicatesOnHighScoreQuestions
+from UserAggregateStats uas
+left join BadgesSummary bs on bs.UserId = uas.UserId
+left join Comments c on c.UserId = uas.UserId
+left join Votes v on v.UserId = uas.UserId
+left join (
+    select pq.OwnerUserId, pq.DuplicateCount
+    from Posts pq
+    join PostLinks pl on pl.PostId = pq.Id
+    join LinkTypes lt on lt.Id = pl.LinkTypeId and lt.Name = 'Duplicate'
+    where pq.PostTypeId = 1
+) qdu on qdu.OwnerUserId = uas.UserId
+where uas.QuestionsCount >= 5 and uas.TotalPostScore > 50
+group by 
+    uas.UserId, uas.DisplayName, uas.QuestionsCount, uas.AnswersCount, uas.TotalPostScore, 
+    uas.RecentEditsCount, bs.BadgesList
+having avg(case when v.VoteTypeId = 2 then v.Score end) > 1.5
+order by uas.TotalPostScore desc, uas.RecentEditsCount desc
+limit 50;

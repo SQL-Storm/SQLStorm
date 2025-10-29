@@ -1,0 +1,175 @@
+-- {"query": "2197.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1569} 
+
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 AS Level,
+        ARRAY[t.TagName] AS TagPath
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0 AND t.IsRequired = 0
+
+    UNION ALL
+
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Level + 1,
+        r.TagPath || t.TagName
+    FROM Tags t
+    JOIN PostLinks pl ON pl.PostId = t.ExcerptPostId
+    JOIN RecursiveTagHierarchy r ON pl.RelatedPostId = r.Id
+    WHERE r.Level < 3
+),
+RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.AcceptedAnswerId,
+        u.DisplayName,
+        u.Reputation,
+        ROW_NUMBER() OVER (
+            PARTITION BY p.PostTypeId
+            ORDER BY p.Score DESC, p.ViewCount DESC, p.CreationDate ASC
+        ) AS RankByScore
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1, 2) -- Questions and Answers
+),
+UserBadgeSummary AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        BOOL_OR(b.TagBased) AS HasTagBasedBadge,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+),
+PostCommentsAggregated AS (
+    SELECT 
+        c.PostId,
+        COUNT(*) AS CommentCount,
+        SUM(c.Score) AS TotalCommentScore,
+        MAX(c.CreationDate) AS LastCommentDate,
+        STRING_AGG(
+            CASE 
+                WHEN c.Text LIKE '%bug%' THEN 'bug reported'
+                WHEN c.Text LIKE '%feature%' THEN 'feature request'
+                ELSE 'general'
+            END, ',' ORDER BY c.CreationDate DESC
+        ) AS TagSummary
+    FROM Comments c
+    GROUP BY c.PostId
+),
+CloseReasonCounts AS (
+    SELECT 
+        ph.PostId,
+        crt.Name AS CloseReasonName,
+        COUNT(*) AS CloseReasonCount
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    LEFT JOIN CloseReasonTypes crt ON ph.Comment::int = crt.Id
+    WHERE pht.Name = 'Post Closed'
+    GROUP BY ph.PostId, crt.Name
+),
+PostAnswerStats AS (
+    SELECT 
+        q.Id AS QuestionId,
+        COUNT(a.Id) FILTER (WHERE a.Score >= 5) AS HighScoreAnswerCount,
+        AVG(a.Score) FILTER (WHERE a.Score IS NOT NULL) AS AvgAnswerScore,
+        COUNT(a.Id) AS TotalAnswerCount,
+        MAX(a.Score) AS MaxAnswerScore
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id
+),
+UserActivityWindows AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) OVER (PARTITION BY u.Id) AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) OVER (PARTITION BY u.Id) AS AnswerCount,
+        SUM(v.VoteTypeId = 2)::int FILTER (WHERE v.PostId IS NOT NULL) OVER (PARTITION BY u.Id) AS UpVotesReceived,
+        LEAD(u.LastAccessDate) OVER (ORDER BY u.LastAccessDate) AS NextUserAccess
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+),
+QuestionAndAnswerUnion AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Tags,
+        COALESCE(p.Score, 0) AS Score,
+        p.ViewCount,
+        u.DisplayName AS OwnerName,
+        u.Reputation AS OwnerReputation,
+        COALESCE(p.AcceptedAnswerId, -1) AS AcceptedAnswerId,
+        COALESCE(p.CommentCount, 0) AS CommentCount,
+        pas.HighScoreAnswerCount,
+        pas.AvgAnswerScore,
+        pas.TotalAnswerCount,
+        pas.MaxAnswerScore,
+        cta.CloseReasonName,
+        cta.CloseReasonCount,
+        COALESCE(badges.GoldBadges, 0) AS GoldBadges,
+        COALESCE(badges.SilverBadges, 0) AS SilverBadges,
+        COALESCE(badges.BronzeBadges, 0) AS BronzeBadges,
+        badges.HasTagBasedBadge
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN PostAnswerStats pas ON pas.QuestionId = p.Id
+    LEFT JOIN CloseReasonCounts cta ON cta.PostId = p.Id
+    LEFT JOIN UserBadgeSummary badges ON badges.UserId = p.OwnerUserId
+    WHERE p.PostTypeId = 1
+)
+SELECT 
+    qa.Id,
+    qa.Title,
+    qa.OwnerName,
+    qa.OwnerReputation,
+    CONCAT(
+        'Tags: ', COALESCE(qa.Tags, '<none>'), 
+        '; Comments: ', qa.CommentCount,
+        '; Score: ', qa.Score,
+        '; Views: ', qa.ViewCount
+    ) AS Summary,
+    CONCAT(
+        'Answers - Total: ', COALESCE(qa.TotalAnswerCount,0),
+        ', High Score (>=5): ', COALESCE(qa.HighScoreAnswerCount,0),
+        ', Avg Score: ', COALESCE(ROUND(qa.AvgAnswerScore::numeric,2), 'N/A'),
+        ', Max Score: ', COALESCE(qa.MaxAnswerScore, 'N/A')
+    ) AS AnswerStats,
+    CONCAT(
+        'Badges - Gold: ', qa.GoldBadges,
+        ', Silver: ', qa.SilverBadges,
+        ', Bronze: ', qa.BronzeBadges,
+        ', TagBased: ', CASE WHEN qa.HasTagBasedBadge THEN 'Yes' ELSE 'No' END
+    ) AS OwnerBadgeSummary,
+    COALESCE(qa.CloseReasonName, 'Open') AS CloseStatus,
+    COALESCE(qa.CloseReasonCount, 0) AS CloseVotesCount,
+    EXISTS (
+        SELECT 1 FROM Posts a WHERE a.ParentId = qa.Id AND a.Score > qa.Score
+    ) AS IsOutscoredByAnswer,
+    LENGTH(qa.Title) AS TitleLength,
+    NULLIF(qa.Tags, '') IS NOT NULL AND qa.Tags LIKE '%<sql>%' AS ContainsSQLTag
+FROM QuestionAndAnswerUnion qa
+WHERE qa.Score > (
+    SELECT PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY Score) FROM Posts WHERE PostTypeId = 1
+)
+ORDER BY qa.Score DESC, qa.ViewCount DESC
+LIMIT 100;

@@ -1,0 +1,292 @@
+-- {"query": "916.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2889} 
+with recent_users as (
+    select u.id as user_id,
+           u.displayname,
+           u.reputation,
+           u.creationdate,
+           u.location,
+           coalesce(nullif(trim(u.websiteurl), ''), 'unknown') as website_norm,
+           date_trunc('month', u.creationdate) as cohort_month,
+           row_number() over (order by u.creationdate desc, u.id desc) as rn_global
+    from users u
+),
+user_activity as (
+    select
+        u.user_id,
+        count(*) filter (where p.posttypeid = 1) as q_count,
+        count(*) filter (where p.posttypeid = 2) as a_count,
+        count(distinct p.id) as post_count,
+        sum(coalesce(p.score,0)) as total_post_score,
+        sum(coalesce(p.viewcount,0)) as total_views,
+        max(p.lastactivitydate) as last_post_activity
+    from recent_users u
+    left join posts p
+      on p.owneruserid = u.user_id
+    group by u.user_id
+),
+recent_posts as (
+    select
+        p.id,
+        p.posttypeid,
+        p.owneruserid,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        p.title,
+        p.tags,
+        p.acceptedanswerid,
+        p.parentid,
+        date_trunc('month', p.creationdate) as post_month,
+        row_number() over (partition by p.owneruserid order by p.creationdate desc, p.id desc) as rn_by_user
+    from posts p
+    where p.creationdate >= (select min(cohort_month) from recent_users) - interval '6 months'
+),
+post_quality as (
+    select
+        rp.id as post_id,
+        rp.owneruserid as user_id,
+        rp.posttypeid,
+        rp.creationdate,
+        rp.score,
+        rp.viewcount,
+        rp.title,
+        rp.tags,
+        /* approximate tag count based on <> separator, handle nulls */
+        case
+            when rp.tags is null then 0
+            else greatest(1, array_length(string_to_array(substring(rp.tags, 2, length(rp.tags)-2), '><'), 1))
+        end as tag_count,
+        /* string metric: title length and presence of question mark */
+        length(coalesce(rp.title, '')) as title_len,
+        (position('?' in coalesce(rp.title, '')) > 0)::int as has_qmark,
+        /* accepted answer indicator for questions */
+        case when rp.posttypeid = 1 and rp.acceptedanswerid is not null then 1 else 0 end as has_accepted,
+        /* compute comment and vote aggregates via correlated subqueries */
+        (select count(*) from comments c where c.postid = rp.id) as comment_count,
+        (select sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end)
+         from votes v where v.postid = rp.id) as net_votes,
+        /* last edit time, including nulls */
+        (select max(ph.creationdate) from posthistory ph
+         where ph.postid = rp.id and ph.posthistorytypeid in (4,5,6,7,8,9)) as last_edit_at
+    from recent_posts rp
+),
+dup_links as (
+    select pl.postid, pl.relatedpostid, pl.creationdate as link_created_at
+    from postlinks pl
+    where pl.linktypeid = 3
+),
+post_close_info as (
+    select ph.postid,
+           min(ph.creationdate) as first_closed_at,
+           max(ph.creationdate) filter (where ph.posthistorytypeid = 11) as last_reopened_at,
+           count(*) filter (where ph.posthistorytypeid = 10) as close_events,
+           /* extract the last close reason id present in Comment column when type=10 */
+           cast(nullif(regexp_replace(
+               coalesce(
+                   (array_agg(case when ph.posthistorytypeid = 10 then ph.comment end order by ph.creationdate desc))[1],
+                   ''
+               ),
+               '[^0-9]', '', 'g'
+           ), '') as int) as last_close_reason_id
+    from posthistory ph
+    where ph.posthistorytypeid in (10,11)
+    group by ph.postid
+),
+user_badges as (
+    select b.userid as user_id,
+           count(*) as badge_count,
+           count(*) filter (where b.class = 1) as gold_count,
+           count(*) filter (where b.class = 2) as silver_count,
+           count(*) filter (where b.class = 3) as bronze_count,
+           max(b.date) as last_badge_at
+    from badges b
+    group by b.userid
+),
+user_recent_interactions as (
+    select
+        u.user_id,
+        count(distinct c.id) as recent_comments,
+        count(distinct v.id) as recent_votes,
+        sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end) as recent_net_votes
+    from recent_users u
+    left join posts p on p.owneruserid = u.user_id
+    left join comments c on c.postid = p.id and c.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '90 days'
+    left join votes v on v.postid = p.id and v.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '90 days'
+    group by u.user_id
+),
+tag_expansion as (
+    /* explode tags for question posts in post_quality */
+    select pq.post_id,
+           unnest(string_to_array(substring(pq.tags, 2, length(pq.tags)-2), '><')) as tag
+    from post_quality pq
+    where pq.tags is not null and pq.posttypeid = 1
+),
+tag_stats as (
+    select te.post_id,
+           count(*) as tag_used_count,
+           sum(case when lower(te.tag) like any (array['%sql%','%postgres%','%mysql%','%sqlite%']) then 1 else 0 end) as db_tag_flag
+    from tag_expansion te
+    group by te.post_id
+),
+user_ranked as (
+    select
+        ru.user_id,
+        ru.displayname,
+        ru.reputation,
+        ru.cohort_month,
+        ua.post_count,
+        ua.q_count,
+        ua.a_count,
+        ua.total_post_score,
+        ua.total_views,
+        ub.badge_count,
+        ub.gold_count,
+        ub.silver_count,
+        ub.bronze_count,
+        uri.recent_comments,
+        uri.recent_votes,
+        uri.recent_net_votes,
+        coalesce(ua.total_post_score,0)
+          + coalesce(ub.gold_count,0) * 50
+          + coalesce(ub.silver_count,0) * 10
+          + coalesce(ub.bronze_count,0) * 3
+          + coalesce(uri.recent_net_votes,0) * 2
+          + coalesce(ua.q_count,0)
+          + coalesce(ua.a_count,0) * 2
+          + coalesce(ua.total_views,0) / 100 as activity_score
+    from recent_users ru
+    left join user_activity ua on ua.user_id = ru.user_id
+    left join user_badges ub on ub.user_id = ru.user_id
+    left join user_recent_interactions uri on uri.user_id = ru.user_id
+),
+post_enriched as (
+    select
+        pq.*,
+        coalesce(ts.tag_used_count, 0) as tag_used_count,
+        coalesce(ts.db_tag_flag, 0) as db_tag_flag,
+        dl.relatedpostid as dup_of_postid,
+        dl.link_created_at as dup_link_created_at,
+        pci.first_closed_at,
+        pci.last_reopened_at,
+        pci.close_events,
+        pci.last_close_reason_id,
+        /* compute a composite quality metric with null handling */
+        (
+            coalesce(pq.score,0)*3
+            + coalesce(pq.net_votes,0)*2
+            + coalesce(pq.comment_count,0)
+            + case when pq.has_accepted = 1 then 15 else 0 end
+            + case when pq.posttypeid = 2 and pq.parentid in (select id from posts where acceptedanswerid is not null) then 7 else 0 end
+            + case when pq.viewcount is not null then least(50, pq.viewcount/100) else 0 end
+            + case when pq.title_len > 60 then 5 when pq.title_len between 30 and 60 then 3 else 0 end
+            + case when pq.has_qmark = 1 then 1 else 0 end
+            - case when pci.close_events is not null and pci.close_events > 0 then 10 else 0 end
+        ) as quality_score
+    from post_quality pq
+    left join tag_stats ts on ts.post_id = pq.post_id
+    left join dup_links dl on dl.postid = pq.post_id
+    left join post_close_info pci on pci.postid = pq.post_id
+),
+user_post_window as (
+    select
+        pe.*,
+        ur.activity_score,
+        ur.reputation,
+        ur.displayname,
+        count(*) over (partition by pe.user_id) as user_total_posts,
+        row_number() over (partition by pe.user_id order by pe.quality_score desc, pe.creationdate desc, pe.post_id) as rn_by_quality,
+        avg(pe.quality_score) over (partition by pe.user_id) as avg_quality_by_user,
+        sum(case when pe.db_tag_flag > 0 then 1 else 0 end) over (partition by pe.user_id) as db_related_posts_by_user
+    from post_enriched pe
+    left join user_ranked ur on ur.user_id = pe.user_id
+),
+cohort_stats as (
+    select
+        ur.cohort_month,
+        count(*) as users_in_cohort,
+        avg(nullif(ur.activity_score,0)) as avg_activity_nonzero,
+        percentile_cont(0.9) within group (order by coalesce(ur.activity_score,0)) as p90_activity
+    from user_ranked ur
+    group by ur.cohort_month
+),
+top_posts_per_user as (
+    select upw.*
+    from user_post_window upw
+    where upw.rn_by_quality <= 3
+),
+cross_check as (
+    /* set operator example: intersect top posts with recently closed or duplicates */
+    select post_id from top_posts_per_user
+    intersect
+    select distinct coalesce(pci.postid, dl.postid) as post_id
+    from post_close_info pci
+    full outer join dup_links dl on dl.postid = pci.postid
+),
+final_scores as (
+    select
+        upw.user_id,
+        upw.displayname,
+        upw.reputation,
+        upw.post_id,
+        upw.posttypeid,
+        upw.creationdate,
+        upw.title,
+        upw.tags,
+        upw.quality_score,
+        upw.avg_quality_by_user,
+        upw.user_total_posts,
+        upw.db_related_posts_by_user,
+        cs.post_id is not null as is_controversial_top_post,
+        dense_rank() over (
+            order by
+                coalesce(upw.activity_score,0) desc,
+                coalesce(upw.avg_quality_by_user,0) desc,
+                upw.reputation desc
+        ) as global_user_rank,
+        row_number() over (
+            partition by upw.user_id
+            order by upw.quality_score desc, upw.creationdate desc
+        ) as rn_final
+    from user_post_window upw
+    left join cross_check cs on cs.post_id = upw.post_id
+)
+select
+    fs.global_user_rank,
+    fs.user_id,
+    fs.displayname,
+    fs.reputation,
+    fs.user_total_posts,
+    fs.db_related_posts_by_user,
+    fs.post_id,
+    fs.posttypeid,
+    fs.creationdate,
+    coalesce(nullif(fs.title, ''), '[no title]') as title,
+    /* synthesize a pseudo "tag summary" */
+    case
+        when fs.tags is null then 'untagged'
+        when length(fs.tags) > 300 then substring(fs.tags from 1 for 300) || '...'
+        else fs.tags
+    end as tags_summary,
+    round(coalesce(fs.quality_score,0)::numeric, 2) as quality_score,
+    round(coalesce(fs.avg_quality_by_user,0)::numeric, 2) as avg_quality_by_user,
+    fs.is_controversial_top_post as flagged,
+    /* complicated predicate projection: bucket by quality and recency */
+    case
+        when fs.quality_score >= 50 and fs.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '180 days' then 'elite_recent'
+        when fs.quality_score >= 50 then 'elite_legacy'
+        when fs.quality_score between 25 and 49 then 'strong'
+        when fs.quality_score between 10 and 24 then 'moderate'
+        when fs.quality_score is null then 'unknown'
+        else 'low'
+    end as quality_bucket
+from final_scores fs
+where fs.rn_final <= 3
+  and (
+        fs.quality_score is null
+        or fs.quality_score >= (
+            select coalesce(avg(quality_score) + stddev_pop(quality_score), 0)
+            from user_post_window
+        )
+        or fs.is_controversial_top_post
+      )
+order by fs.global_user_rank, fs.user_id, fs.rn_final;

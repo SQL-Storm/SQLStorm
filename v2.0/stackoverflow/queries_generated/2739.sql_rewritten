@@ -1,0 +1,223 @@
+-- {"query": "2739.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1903} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        array[t.Id] as Path
+    from Tags t
+    where t.IsRequired = 1
+
+    union all
+
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Path || t.Id
+    from Tags t
+    join RecursiveTagHierarchy r on t.IsModeratorOnly = 0 and t.Count < (select Count from Tags where Id = r.Id) and not t.Id = any(r.Path)
+    where array_length(r.Path,1) < 4
+),
+
+UserBadgeStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct b.Id) as TotalBadges,
+        count(distinct case when b.Class = 1 then b.Id end) as GoldBadges,
+        count(distinct case when b.Class = 2 then b.Id end) as SilverBadges,
+        count(distinct case when b.Class = 3 then b.Id end) as BronzeBadges,
+        count(distinct case when b.TagBased = 1 then b.Id end) as TagBasedBadges,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    group by u.Id, u.DisplayName
+),
+
+FilteredPosts as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.CommentCount,
+        row_number() over (partition by p.PostTypeId order by p.Score desc nulls last, p.ViewCount desc nulls last) as rn
+    from Posts p
+    where p.PostTypeId in (1, 2)
+      and p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '1 year'
+),
+
+PostAnswerAggregates as (
+    select
+        q.Id as QuestionId,
+        count(a.Id) filter (where a.Score > 5) as HighScoreAnswers,
+        count(a.Id) as TotalAnswers,
+        avg(a.Score) as AvgAnswerScore,
+        max(a.Score) as MaxAnswerScore,
+        min(a.Score) as MinAnswerScore,
+        sum(case when a.OwnerUserId is null then 1 else 0 end) as AnonymousAnswerCount
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+    group by q.Id
+),
+
+UserVoteActivity as (
+    select
+        v.UserId,
+        vt.Name as VoteTypeName,
+        count(*) as VoteCount,
+        max(v.CreationDate) as LastVoteDate
+    from Votes v
+    join VoteTypes vt on v.VoteTypeId = vt.Id
+    where v.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '6 months'
+    group by v.UserId, vt.Name
+),
+
+QuestionsWithCloseHistory as (
+    select
+        ph.PostId,
+        min(case when ph.PostHistoryTypeId = 10 then ph.CreationDate else null end) as FirstCloseDate,
+        max(case when ph.PostHistoryTypeId = 11 then ph.CreationDate else null end) as LastReopenDate,
+        count(case when ph.PostHistoryTypeId = 10 then 1 else null end) as CloseCount,
+        count(case when ph.PostHistoryTypeId = 11 then 1 else null end) as ReopenCount,
+        array_agg(distinct crt.Name) filter (where ph.PostHistoryTypeId = 10) as CloseReasons
+    from PostHistory ph
+    left join CloseReasonTypes crt on ph.Comment::int = crt.Id and ph.PostHistoryTypeId = 10
+    where ph.PostId in (select Id from Posts where PostTypeId = 1)
+    group by ph.PostId
+),
+
+FinalSelection as (
+    select
+        p.Id as PostId,
+        p.Title,
+        coalesce(p.Tags, '') as Tags,
+        u.DisplayName as OwnerDisplayName,
+        u.Reputation,
+        u.CreationDate as UserCreation,
+        u.Location,
+        u.Views as UserViews,
+        ub.TotalBadges,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ub.TagBasedBadges,
+        pa.TotalAnswers,
+        pa.HighScoreAnswers,
+        pa.AvgAnswerScore,
+        pa.MaxAnswerScore,
+        pa.MinAnswerScore,
+        pa.AnonymousAnswerCount,
+        qch.FirstCloseDate,
+        qch.LastReopenDate,
+        qch.CloseCount,
+        qch.ReopenCount,
+        qch.CloseReasons,
+        string_agg(distinct uv.VoteTypeName || ':' || cast(uv.VoteCount as varchar), ',' order by uv.VoteCount desc) as VoteSummary,
+        dense_rank() over (partition by p.Tags order by p.Score desc nulls last, p.ViewCount desc nulls last) as RankByTag,
+        p.Score,
+        p.ViewCount,
+        coalesce(p.CommentCount, 0) as CommentCount,
+        case 
+            when p.AcceptedAnswerId is not null then 1
+            else 0
+        end as HasAcceptedAnswer,
+        case 
+            when p.ClosedDate is not null or qch.CloseCount > qch.ReopenCount then 1 
+            else 0 
+        end as IsClosed,
+        case 
+            when p.Tags like '%<sql>%' or p.Title ilike '%sql%' then 1
+            else 0
+        end as RelatedToSQL,
+        length(p.Title) as TitleLength,
+        case when length(p.Title) > 50 then substring(p.Title from 1 for 50) || '...' else p.Title end as ShortTitle,
+        concat(
+            substring(coalesce(p.OwnerDisplayName, u.DisplayName, 'unknown') from 1 for 15),
+            ' [',
+            cast(u.Reputation as varchar),
+            ']'
+        ) as UserDisplayReputation,
+        (
+            select count(distinct ph2.Id)
+            from PostHistory ph2
+            where ph2.PostId = p.Id and ph2.PostHistoryTypeId in (4,5,6)
+            and ph2.CreationDate > p.CreationDate
+        ) as PostEditsCount
+    from FilteredPosts p
+    left join Users u on p.OwnerUserId = u.Id
+    left join UserBadgeStats ub on u.Id = ub.UserId
+    left join PostAnswerAggregates pa on p.Id = pa.QuestionId
+    left join QuestionsWithCloseHistory qch on p.Id = qch.PostId
+    left join UserVoteActivity uv on uv.UserId = u.Id
+    where p.Score >= 5
+)
+
+select 
+    fs.PostId,
+    fs.Title,
+    fs.ShortTitle,
+    fs.Tags,
+    fs.UserDisplayReputation,
+    fs.TotalBadges,
+    fs.GoldBadges,
+    fs.SilverBadges,
+    fs.BronzeBadges,
+    fs.TagBasedBadges,
+    fs.TotalAnswers,
+    fs.HighScoreAnswers,
+    fs.AvgAnswerScore,
+    fs.MaxAnswerScore,
+    fs.MinAnswerScore,
+    fs.AnonymousAnswerCount,
+    fs.VoteSummary,
+    fs.CommentCount,
+    case 
+        when fs.IsClosed = 1 then 'Closed' 
+        else 'Open' 
+    end as PostStatus,
+    fs.HasAcceptedAnswer,
+    fs.RelatedToSQL,
+    fs.PostEditsCount
+from FinalSelection fs
+where fs.RankByTag <= 10
+order by fs.RelatedToSQL desc, fs.Score desc, fs.CommentCount desc
+limit 100
+union
+select 
+    p.Id as PostId,
+    p.Title,
+    substring(p.Title from 1 for 50) || '...' as ShortTitle,
+    coalesce(p.Tags, ''),
+    coalesce(u.DisplayName, 'unknown') || ' [No Reput]' as UserDisplayReputation,
+    0 as TotalBadges,
+    0 as GoldBadges,
+    0 as SilverBadges,
+    0 as BronzeBadges,
+    0 as TagBasedBadges,
+    0 as TotalAnswers,
+    0 as HighScoreAnswers,
+    null::numeric as AvgAnswerScore,
+    null::int as MaxAnswerScore,
+    null::int as MinAnswerScore,
+    0 as AnonymousAnswerCount,
+    '' as VoteSummary,
+    0 as CommentCount,
+    'Open' as PostStatus,
+    0 as HasAcceptedAnswer,
+    0 as RelatedToSQL,
+    0 as PostEditsCount
+from Posts p
+left join Users u on p.OwnerUserId = u.Id
+where p.PostTypeId = 1
+  and p.Score < 0
+order by p.CreationDate desc
+limit 20;

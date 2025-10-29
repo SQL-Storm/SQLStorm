@@ -1,0 +1,234 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) as QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) as AnswerCount,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        COALESCE(SUM(p.ViewCount), 0) as TotalViews,
+        MAX(p.CreationDate) as LastPostDate,
+        RANK() OVER (ORDER BY COALESCE(SUM(p.Score), 0) DESC) as ScoreRank,
+        ROW_NUMBER() OVER (ORDER BY u.CreationDate) as JoinOrder
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.ParentId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.Tags,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags != '' THEN 
+                CARDINALITY(string_to_array(SUBSTRING(p.Tags, 2, CHAR_LENGTH(p.Tags)-2), '><'))
+            ELSE 0 
+        END as TagCount,
+        COALESCE(p.AnswerCount, 0) + COALESCE(p.CommentCount, 0) as EngagementCount,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Accepted'
+            WHEN p.PostTypeId = 1 AND p.Score > 0 THEN 'HighScore'
+            WHEN p.PostTypeId = 2 AND p.Score > 0 THEN 'Answer'
+            ELSE 'Other'
+        END as PostCategory,
+        CAST((julianday('2024-10-01 12:34:56') - julianday(p.CreationDate)) AS INTEGER) as AgeInDays,
+        DENSE_RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) as ScoreRankByType,
+        NTILE(4) OVER (ORDER BY p.Score) as ScoreQuartile
+    FROM Posts p
+    WHERE p.CreationDate >= TIMESTAMP '2020-01-01 00:00:00'
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagFrequency,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.IsRequired = 1 THEN 'Required'
+            WHEN t.IsModeratorOnly = 1 THEN 'ModeratorOnly'
+            ELSE 'General'
+        END as TagType,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as FrequencyRank,
+        PERCENT_RANK() OVER (ORDER BY t.Count) as FrequencyPercentile
+    FROM Tags t
+    WHERE t.Count > 10
+),
+UserActivity AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        COUNT(DISTINCT ph.Id) as HistoryCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (1, 2, 3) THEN ph.Id END) as EditCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN ph.Id END) as StatusChangeCount,
+        MIN(ph.CreationDate) as FirstActivity,
+        MAX(ph.CreationDate) as LastActivity,
+        EXTRACT(MONTH FROM ph.CreationDate) as ActivityMonth,
+        EXTRACT(YEAR FROM ph.CreationDate) as ActivityYear,
+        COUNT(DISTINCT ph.PostId) as UniquePostsActive
+    FROM Users u
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    GROUP BY u.Id, u.DisplayName, EXTRACT(MONTH FROM ph.CreationDate), EXTRACT(YEAR FROM ph.CreationDate)
+),
+ComplexQueryResults AS (
+    SELECT 
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.PostCount,
+        us.CommentCount,
+        us.BadgeCount,
+        us.QuestionCount,
+        us.AnswerCount,
+        us.TotalScore,
+        us.TotalViews,
+        us.LastPostDate,
+        us.ScoreRank,
+        us.JoinOrder,
+        pa.PostId,
+        pa.Title,
+        pa.Score as PostScore,
+        pa.ViewCount,
+        pa.CreationDate as PostCreationDate,
+        pa.PostTypeId,
+        pa.PostCategory,
+        pa.AgeInDays,
+        pa.ScoreRankByType,
+        pa.ScoreQuartile,
+        ta.TagName,
+        ta.TagFrequency,
+        ta.TagType,
+        ua.HistoryCount,
+        ua.EditCount,
+        ua.StatusChangeCount,
+        ua.FirstActivity,
+        ua.LastActivity,
+        ua.ActivityMonth,
+        ua.ActivityYear,
+        ua.UniquePostsActive,
+        CASE 
+            WHEN us.ScoreRank <= 10 AND pa.ScoreQuartile = 1 THEN 'TopPerformer'
+            WHEN us.Reputation > 10000 AND us.PostCount > 100 THEN 'Veteran'
+            WHEN pa.Score > 1000 AND pa.AgeInDays < 30 THEN 'Trending'
+            WHEN pa.AgeInDays > 365 AND pa.Score < 10 THEN 'LegacyLow'
+            ELSE 'Regular'
+        END as UserClassification,
+        CASE 
+            WHEN pa.TagCount > 3 THEN 'TagHeavy'
+            WHEN pa.TagCount = 0 THEN 'TagSparse'
+            ELSE 'TagModerate'
+        END as TagDensity,
+        ROUND(
+            CASE 
+                WHEN us.TotalViews > 0 THEN (us.TotalScore * 1.0 / us.TotalViews) * 1000
+                ELSE 0 
+            END, 2
+        ) as ScorePerView,
+        CASE 
+            WHEN LENGTH(pa.Title) > 50 THEN 'LongTitle'
+            WHEN LENGTH(pa.Title) < 20 THEN 'ShortTitle'
+            ELSE 'MediumTitle'
+        END as TitleLength,
+        DENSE_RANK() OVER (PARTITION BY pa.PostTypeId ORDER BY pa.CreationDate DESC) as RecentRank
+    FROM UserStats us
+    LEFT JOIN PostAnalysis pa ON us.UserId = pa.OwnerUserId
+    LEFT JOIN TagAnalysis ta ON EXISTS (
+        SELECT 1
+        FROM unnest(string_to_array(SUBSTRING(COALESCE(pa.Tags, ''), 2, CHAR_LENGTH(COALESCE(pa.Tags, ''))-2), '><')) as t(tag)
+        WHERE TRIM(BOTH '<>' FROM t.tag) = ta.TagName
+    )
+    LEFT JOIN UserActivity ua ON us.UserId = ua.UserId
+    WHERE 
+        (pa.PostTypeId = 1 OR pa.PostTypeId IS NULL)
+        AND (pa.Score > 0 OR pa.Score IS NULL)
+        AND (us.Reputation > 1000 OR us.UserId IS NULL)
+        AND (ta.TagFrequency > 10 OR ta.TagFrequency IS NULL)
+)
+
+SELECT 
+    UserId,
+    DisplayName,
+    Reputation,
+    PostCount,
+    CommentCount,
+    BadgeCount,
+    QuestionCount,
+    AnswerCount,
+    TotalScore,
+    TotalViews,
+    LastPostDate,
+    ScoreRank,
+    JoinOrder,
+    PostId,
+    Title,
+    PostScore,
+    ViewCount,
+    PostCreationDate,
+    PostTypeId,
+    PostCategory,
+    AgeInDays,
+    ScoreRankByType,
+    ScoreQuartile,
+    TagName,
+    TagFrequency,
+    TagType,
+    HistoryCount,
+    EditCount,
+    StatusChangeCount,
+    FirstActivity,
+    LastActivity,
+    ActivityMonth,
+    ActivityYear,
+    UniquePostsActive,
+    UserClassification,
+    TagDensity,
+    ScorePerView,
+    TitleLength,
+    RecentRank,
+    COALESCE(
+        (CASE WHEN ScoreRank <= 5 THEN 'TOP' ELSE '' END) || 
+        (CASE WHEN AnswerCount > 50 THEN 'EXPERT' ELSE '' END) ||
+        (CASE WHEN TotalViews > 10000 THEN 'POPULAR' ELSE '' END),
+        'NORMAL'
+    ) as PerformanceFlag,
+    ABS(TotalScore - AVG(TotalScore) OVER ()) as ScoreDeviation,
+    NTILE(5) OVER (ORDER BY ScorePerView DESC) as PerformanceDecile
+FROM ComplexQueryResults
+WHERE UserClassification IN ('TopPerformer', 'Veteran', 'Trending')
+    AND PostCategory IN ('Accepted', 'HighScore', 'Answer')
+    AND TagType IN ('General', 'Required')
+    AND AgeInDays BETWEEN 1 AND 365
+    AND (ScorePerView > 0 OR ScorePerView IS NULL)
+GROUP BY 
+    UserId, DisplayName, Reputation, PostCount, CommentCount, BadgeCount,
+    QuestionCount, AnswerCount, TotalScore, TotalViews, LastPostDate, ScoreRank,
+    JoinOrder, PostId, Title, PostScore, ViewCount, PostCreationDate, PostTypeId,
+    PostCategory, AgeInDays, ScoreRankByType, ScoreQuartile, TagName, TagFrequency,
+    TagType, HistoryCount, EditCount, StatusChangeCount, FirstActivity, LastActivity,
+    ActivityMonth, ActivityYear, UniquePostsActive, UserClassification, TagDensity,
+    ScorePerView, TitleLength, RecentRank
+HAVING 
+    COUNT(*) > 1
+    AND COUNT(DISTINCT PostId) > 1
+ORDER BY 
+    TotalScore DESC,
+    ScoreRank ASC,
+    RecentRank ASC,
+    ScorePerView DESC
+LIMIT 1000;

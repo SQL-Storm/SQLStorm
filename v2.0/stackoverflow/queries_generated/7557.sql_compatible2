@@ -1,0 +1,184 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+        COUNT(DISTINCT b.Id) as Badges,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        AVG(p.Score) as AvgScore,
+        MAX(p.CreationDate) as LastPostDate,
+        (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - u.CreationDate) AS AccountAgeInterval,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - u.CreationDate)) / 86400.0 AS AccountAgeDays,
+        CASE 
+            WHEN u.Views > 10000 THEN 'High'
+            WHEN u.Views > 1000 THEN 'Medium'
+            ELSE 'Low'
+        END as ViewLevel,
+        CASE 
+            WHEN u.Reputation >= 100000 THEN 'Expert'
+            WHEN u.Reputation >= 10000 THEN 'Advanced'
+            WHEN u.Reputation >= 1000 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as ReputationLevel
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate
+),
+TopPosts AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) as ScoreRank,
+        RANK() OVER (ORDER BY p.ViewCount DESC) as ViewRank,
+        DENSE_RANK() OVER (ORDER BY p.CreationDate DESC) as RecentRank
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) 
+),
+PostActivity AS (
+    SELECT 
+        ph.PostId,
+        COUNT(*) as ActivityCount,
+        MAX(ph.CreationDate) as LastActivity,
+        STRING_AGG(CASE WHEN ph.PostHistoryTypeId IN (1, 4, 10) THEN 'Edit' ELSE 'Other' END, ', ') as ActivityTypes,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (1, 4, 10) THEN ph.UserId END) as Editors
+    FROM PostHistory ph
+    WHERE ph.PostId IS NOT NULL
+    GROUP BY ph.PostId
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            ELSE 'Niche'
+        END as TagPopularity,
+        COALESCE((
+            SELECT COUNT(*) 
+            FROM Posts p 
+            WHERE p.Tags LIKE '%' || t.TagName || '%' 
+              AND p.PostTypeId = 1
+        ), 0) as RelatedQuestions
+    FROM Tags t
+),
+FilteredUsers AS (
+    SELECT 
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.Views,
+        us.TotalPosts,
+        us.Questions,
+        us.Answers,
+        us.Badges,
+        us.TotalScore,
+        us.AvgScore,
+        us.AccountAgeDays,
+        us.ViewLevel,
+        us.ReputationLevel,
+        CASE 
+            WHEN us.TotalPosts > 100 AND us.Reputation > 5000 THEN 'Active'
+            WHEN us.TotalPosts > 50 AND us.Reputation > 1000 THEN 'Regular'
+            WHEN us.TotalPosts > 10 AND us.Reputation > 100 THEN 'Occasional'
+            ELSE 'New'
+        END as EngagementLevel
+    FROM UserStats us
+    WHERE us.Reputation > 100
+)
+SELECT 
+    fu.UserId,
+    fu.DisplayName,
+    fu.Reputation,
+    fu.Views,
+    fu.TotalPosts,
+    fu.Questions,
+    fu.Answers,
+    fu.Badges,
+    fu.TotalScore,
+    fu.AvgScore,
+    fu.AccountAgeDays,
+    fu.ViewLevel,
+    fu.ReputationLevel,
+    fu.EngagementLevel,
+    COALESCE(tp.Score, 0) as TopPostScore,
+    COALESCE(tp.Title, 'No Top Post') as TopPostTitle,
+    COALESCE(pa.ActivityCount, 0) as PostActivityCount,
+    COALESCE(ta.TagCount, 0) as TagCount,
+    COALESCE(ta.TagPopularity, 'Unknown') as TagPopularity,
+    CASE 
+        WHEN fu.TotalPosts = 0 THEN NULL
+        ELSE (fu.Answers * 100.0 / fu.TotalPosts)
+    END as AnswerPercentage,
+    CASE 
+        WHEN fu.Views = 0 OR fu.TotalPosts = 0 THEN NULL
+        ELSE (fu.TotalScore * 1.0 / fu.Views)
+    END as ScorePerView,
+    COALESCE(
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = fu.UserId AND p.PostTypeId = 1 AND p.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30' DAY)),
+        0
+    ) as RecentQuestions,
+    COALESCE(
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = fu.UserId AND p.PostTypeId = 2 AND p.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30' DAY)),
+        0
+    ) as RecentAnswers,
+    CASE 
+        WHEN fu.Badges > 0 THEN 'Badge Holder'
+        ELSE 'No Badges'
+    END as BadgeStatus
+FROM FilteredUsers fu
+LEFT JOIN TopPosts tp ON fu.UserId = tp.OwnerUserId AND tp.ScoreRank = 1
+LEFT JOIN PostActivity pa ON tp.PostId = pa.PostId OR fu.UserId = pa.PostId -- keep join to post activity by post id; allow either top post or user id match
+LEFT JOIN TagAnalysis ta ON EXISTS (
+    SELECT 1 FROM Tags t WHERE t.TagName = ta.TagName AND ta.TagName = ta.TagName
+) /* no direct join by fu.UserId to tag name; keep left join but will not match users to tags by id */
+WHERE fu.Reputation > 1000 OR fu.TotalPosts > 10
+GROUP BY
+    fu.UserId,
+    fu.DisplayName,
+    fu.Reputation,
+    fu.Views,
+    fu.TotalPosts,
+    fu.Questions,
+    fu.Answers,
+    fu.Badges,
+    fu.TotalScore,
+    fu.AvgScore,
+    fu.AccountAgeDays,
+    fu.ViewLevel,
+    fu.ReputationLevel,
+    fu.EngagementLevel,
+    tp.Score,
+    tp.Title,
+    pa.ActivityCount,
+    ta.TagCount,
+    ta.TagPopularity
+HAVING (
+    CASE 
+        WHEN fu.Reputation > 100000 THEN TRUE
+        WHEN fu.TotalPosts > 50 AND fu.AvgScore > 5 THEN TRUE
+        WHEN fu.Badges > 5 THEN TRUE
+        ELSE FALSE
+    END
+)
+ORDER BY fu.Reputation DESC, fu.TotalPosts DESC
+LIMIT 1000;

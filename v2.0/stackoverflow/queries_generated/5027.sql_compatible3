@@ -1,0 +1,46 @@
+SELECT
+  u.Id AS UserId,
+  u.DisplayName,
+  u.Reputation,
+  COUNT(DISTINCT p.Id) AS PostCount,
+  SUM(p.Score) AS TotalScore,
+  AVG(p.ViewCount) AS AvgViewsPerPost,
+  MAX(p.LastActivityDate) AS LastActivity,
+  STRING_AGG(DISTINCT t.TagName, ',') AS Tagset,
+  COALESCE(b.GoldCount, 0) AS GoldBadges,
+  COALESCE(b.SilverCount, 0) AS SilverBadges,
+  COALESCE(b.BronzeCount, 0) AS BronzeBadges
+FROM
+  Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN (
+    SELECT
+      pb.UserId,
+      SUM(CASE WHEN pb.Class = 1 THEN 1 ELSE 0 END) AS GoldCount,
+      SUM(CASE WHEN pb.Class = 2 THEN 1 ELSE 0 END) AS SilverCount,
+      SUM(CASE WHEN pb.Class = 3 THEN 1 ELSE 0 END) AS BronzeCount
+    FROM Badges pb
+    GROUP BY pb.UserId
+  ) b ON b.UserId = u.Id
+  LEFT JOIN LATERAL (
+    SELECT trim(BOTH '><' FROM part) AS tagname
+    FROM unnest(string_to_array(COALESCE(p.Tags, ''), '><')) AS part
+  ) tn ON TRUE
+  LEFT JOIN Tags t ON t.TagName = tn.tagname
+WHERE
+  u.CreationDate <= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180 days')
+  AND u.Location IS NOT NULL
+GROUP BY
+  u.Id,
+  u.DisplayName,
+  u.Reputation,
+  b.GoldCount,
+  b.SilverCount,
+  b.BronzeCount
+HAVING
+  COUNT(DISTINCT p.Id) > 0
+ORDER BY
+  TotalScore DESC,
+  PostCount DESC,
+  u.Reputation DESC
+LIMIT 100;

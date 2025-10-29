@@ -1,0 +1,144 @@
+WITH
+  RecentQuestions AS (
+    SELECT
+      p.Id AS QuestionId,
+      p.OwnerUserId,
+      p.Title,
+      p.Tags,
+      p.CreationDate AS QuestionCreationDate,
+      p.Score AS QuestionScore,
+      p.AnswerCount,
+      p.FavoriteCount,
+      p.ViewCount AS QuestionViewCount,
+      u.DisplayName AS OwnerDisplayName,
+      ROW_NUMBER() OVER (ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    JOIN Users u
+      ON p.OwnerUserId = u.Id
+    WHERE
+      p.PostTypeId = 1
+      AND p.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '365' DAY)
+  ),
+  AnsweredQuestions AS (
+    SELECT
+      p.Id AS QuestionId,
+      COUNT(a.Id) AS NumberOfAnswers,
+      SUM(a.Score) AS TotalAnswerScore,
+      AVG(a.Score) AS AverageAnswerScore,
+      MAX(a.CreationDate) AS LastAnswerDate,
+      MAX(a.ViewCount) AS MaxAnswerViewCount,
+      SUM(CASE WHEN a.Id = pq.AcceptedAnswerId THEN 1 ELSE 0 END) AS IsAcceptedAnswerPresent
+    FROM Posts p
+    JOIN Posts a
+      ON p.Id = a.ParentId
+    LEFT JOIN Posts pq
+      ON pq.Id = p.AcceptedAnswerId
+    WHERE
+      p.PostTypeId = 1
+      AND a.PostTypeId = 2
+    GROUP BY
+      p.Id
+  ),
+  QuestionPerformance AS (
+    SELECT
+      rq.QuestionId,
+      rq.Title,
+      rq.Tags,
+      rq.OwnerDisplayName,
+      rq.QuestionCreationDate,
+      rq.QuestionScore,
+      rq.AnswerCount,
+      rq.FavoriteCount,
+      rq.QuestionViewCount,
+      COALESCE(aq.NumberOfAnswers, 0) AS TotalAnswers,
+      COALESCE(aq.TotalAnswerScore, 0) AS TotalAnswerScore,
+      COALESCE(aq.AverageAnswerScore, 0.0) AS AverageAnswerScore,
+      aq.LastAnswerDate,
+      aq.IsAcceptedAnswerPresent,
+      CASE
+        WHEN aq.IsAcceptedAnswerPresent > 0 THEN 'Accepted'
+        ELSE 'Not Accepted'
+      END AS AcceptanceStatus,
+      CASE
+        WHEN POSITION('sql' IN rq.Tags) > 0 AND rq.QuestionScore > 50 THEN 'SQL Expert Level'
+        WHEN POSITION('performance' IN rq.Tags) > 0 AND rq.QuestionScore > 100 THEN 'Performance Guru'
+        WHEN POSITION('optimization' IN rq.Tags) > 0 AND rq.QuestionScore > 75 THEN 'Optimization Master'
+        WHEN rq.AnswerCount > 10 AND rq.QuestionScore > 20 THEN 'High Engagement'
+        WHEN aq.LastAnswerDate IS NOT NULL AND CAST(aq.LastAnswerDate AS date) >= (CAST(rq.QuestionCreationDate AS date) + INTERVAL '7' DAY) THEN 'Actively Answered'
+        WHEN rq.FavoriteCount > 5 THEN 'Popular'
+        WHEN rq.QuestionScore < 0 THEN 'Negative Score'
+        ELSE 'Standard'
+      END AS PerformanceTier,
+      RANK() OVER (
+        PARTITION BY
+          CASE
+            WHEN rq.Tags IS NULL THEN NULL
+            WHEN POSITION('>' IN rq.Tags) > 0 AND POSITION('<' IN rq.Tags) > 0 THEN
+              SUBSTRING(rq.Tags FROM POSITION('<' IN rq.Tags)+1 FOR (POSITION('>' IN rq.Tags) - POSITION('<' IN rq.Tags) - 1))
+            ELSE rq.Tags
+          END
+        ORDER BY rq.QuestionScore DESC
+      ) AS RankInTag,
+      rq.rn
+    FROM RecentQuestions rq
+    LEFT JOIN AnsweredQuestions aq
+      ON rq.QuestionId = aq.QuestionId
+    WHERE
+      rq.rn <= 1000
+    GROUP BY
+      rq.QuestionId,
+      rq.Title,
+      rq.Tags,
+      rq.OwnerDisplayName,
+      rq.QuestionCreationDate,
+      rq.QuestionScore,
+      rq.AnswerCount,
+      rq.FavoriteCount,
+      rq.QuestionViewCount,
+      aq.NumberOfAnswers,
+      aq.TotalAnswerScore,
+      aq.AverageAnswerScore,
+      aq.LastAnswerDate,
+      aq.IsAcceptedAnswerPresent,
+      rq.rn
+  )
+SELECT
+  qp.QuestionId,
+  qp.Title,
+  qp.OwnerDisplayName,
+  qp.QuestionCreationDate,
+  qp.QuestionScore,
+  qp.TotalAnswers,
+  qp.TotalAnswerScore,
+  qp.AverageAnswerScore,
+  qp.AcceptanceStatus,
+  qp.PerformanceTier,
+  qp.RankInTag,
+  (
+    SELECT
+      COUNT(DISTINCT c.UserId)
+    FROM Comments c
+    WHERE
+      c.PostId = qp.QuestionId
+      AND c.UserId IS NOT NULL
+      AND c.CreationDate >= qp.QuestionCreationDate
+  ) AS DistinctCommenters,
+  (
+    SELECT column_value FROM (
+      SELECT 'Question' AS column_value
+      WHERE EXISTS (
+        SELECT 1 FROM Posts p WHERE p.Id = qp.QuestionId AND p.PostTypeId = 1
+      )
+      UNION ALL
+      SELECT 'Closed Question' AS column_value
+      WHERE EXISTS (
+        SELECT 1 FROM Posts p WHERE p.Id = qp.QuestionId AND p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL AND p.ClosedDate >= (CAST('2024-10-01' AS date) - INTERVAL '30' DAY)
+      )
+    ) sub
+  ) AS QuestionStatusFlag
+FROM QuestionPerformance qp
+WHERE
+  qp.RankInTag <= 5
+ORDER BY
+  qp.QuestionScore DESC,
+  qp.TotalAnswers DESC;

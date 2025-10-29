@@ -1,0 +1,93 @@
+-- {"query": "4841.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1098} 
+WITH RankedUserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(p.Id) AS PostCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.CreationDate ASC) AS ReputationRank,
+        DENSE_RANK() OVER (PARTITION BY COALESCE(u.Location, 'Unknown') ORDER BY u.LastAccessDate DESC) AS LastAccessRankInLocation
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.DisplayName IS NOT NULL AND u.DisplayName <> ''
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Location
+),
+PostEngagement AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        pt.Name AS PostTypeName,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+        CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN 1 ELSE 0 END AS IsCommunityOwned,
+        u.DisplayName AS OwnerDisplayName,
+        COALESCE(p.Tags, 'NoTags') AS CleanedTags,
+        RANK() OVER (ORDER BY p.Score DESC) AS ScoreRank,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) AS RecentPostNumber
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.CreationDate > '2023-01-01' AND p.Title IS NOT NULL AND LENGTH(p.Title) > 5
+),
+CommentAnalysis AS (
+    SELECT
+        c.PostId,
+        COUNT(c.Id) AS CommentCount,
+        AVG(c.Score) AS AvgCommentScore,
+        SUM(CASE WHEN c.UserId IS NULL THEN 1 ELSE 0 END) AS AnonymousCommentCount
+    FROM Comments c
+    GROUP BY c.PostId
+)
+SELECT
+    rua.UserId,
+    rua.DisplayName,
+    rua.Reputation,
+    rua.UserCreationDate,
+    rua.ReputationRank,
+    rua.LastAccessRankInLocation,
+    pe.PostId,
+    pe.Title,
+    pe.PostTypeName,
+    pe.Score,
+    pe.ViewCount,
+    pe.CommentCount AS PostCommentCount,
+    pe.FavoriteCount,
+    pe.IsClosed,
+    pe.IsCommunityOwned,
+    ca.CommentCount AS TotalCommentsOnPost,
+    ca.AvgCommentScore,
+    ca.AnonymousCommentCount,
+    COALESCE(CAST(pe.Score AS VARCHAR), 'N/A') AS ScoreString,
+    CASE
+        WHEN LENGTH(pe.CleanedTags) > 50 THEN SUBSTRING(pe.CleanedTags FROM 1 FOR 50) || '...'
+        ELSE pe.CleanedTags
+    END AS TruncatedTags,
+    CASE
+        WHEN pe.AnswerCount > 0 AND pe.Score > 10 THEN 'High Engagement Question'
+        WHEN pe.CommentCount > 5 AND pe.Score > 0 THEN 'Active Discussion'
+        ELSE 'Standard Post'
+    END AS PostStatusCategory,
+    'PostInfo-' || CAST(pe.PostId AS VARCHAR) AS CompositeId,
+    (SELECT MAX(CreationDate) FROM Posts WHERE OwnerUserId = rua.UserId) AS LatestPostDateForUser,
+    (SELECT COUNT(DISTINCT pl.RelatedPostId) FROM PostLinks pl WHERE pl.PostId = pe.PostId AND pl.LinkTypeId = 3) AS DuplicateLinkCount
+FROM RankedUserActivity rua
+JOIN PostEngagement pe ON rua.UserId = pe.OwnerDisplayName -- Using DisplayName as a proxy for OwnerUserId in PostEngagement
+LEFT JOIN CommentAnalysis ca ON pe.PostId = ca.PostId
+WHERE
+    rua.Reputation > 1000
+    AND pe.Score > 5
+    AND pe.ViewCount > 100
+    AND pe.PostTypeName IN ('Question', 'Answer')
+    AND pe.RecentPostNumber <= 100
+ORDER BY
+    rua.Reputation DESC,
+    pe.Score DESC,
+    pe.ViewCount DESC
+LIMIT 1000;

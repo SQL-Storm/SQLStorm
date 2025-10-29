@@ -1,0 +1,218 @@
+-- {"query": "1324.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3349} 
+
+WITH UserPostStats AS (
+    -- CTE 1: Calculate basic statistics for each user's posts
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostScore,
+        SUM(COALESCE(p.ViewCount, 0)) AS TotalPostViews,
+        AVG(COALESCE(p.Score, 0.0)) AS AvgPostScore,
+        AVG(COALESCE(p.ViewCount, 0.0)) AS AvgPostViews,
+        MAX(p.CreationDate) AS LatestPostDate,
+        MIN(p.CreationDate) AS EarliestPostDate
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+UserCommentStats AS (
+    -- CTE 2: Calculate basic statistics for each user's comments
+    SELECT
+        c.UserId,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        SUM(COALESCE(c.Score, 0)) AS TotalCommentScore,
+        AVG(COALESCE(c.Score, 0.0)) AS AvgCommentScore,
+        MAX(c.CreationDate) AS LatestCommentDate
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+    GROUP BY c.UserId
+),
+UserBadgeSummary AS (
+    -- CTE 3: Summarize badge counts for each user by class and tag-based status
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        SUM(CASE WHEN b.TagBased = TRUE THEN 1 ELSE 0 END) AS TagBasedBadges,
+        COUNT(b.Id) AS TotalBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+PostEditAnalysis AS (
+    -- CTE 4: Analyze post edit history to identify external edits
+    -- This CTE focuses on specific edit types and if the editor was different from the owner.
+    SELECT
+        ph.PostId,
+        ph.UserId AS EditorUserId,
+        ph.CreationDate AS EditDate,
+        ph.PostHistoryTypeId,
+        -- Determine if the edit was by someone other than the post owner using a correlated subquery
+        (ph.UserId IS NOT NULL AND ph.UserId <> (SELECT p.OwnerUserId FROM Posts p WHERE p.Id = ph.PostId LIMIT 1)) AS IsEditedByOtherUser
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+),
+PostHistoryTimeline AS (
+    -- CTE 5: A general timeline of significant post history events with window functions
+    -- Includes categorisation and time differences between events for a post.
+    SELECT
+        ph.Id AS HistoryId,
+        ph.PostId,
+        ph.CreationDate AS EventDate,
+        ph.UserId AS ActorUserId,
+        ph.PostHistoryTypeId,
+        pht.Name AS HistoryTypeName,
+        CASE
+            WHEN ph.PostHistoryTypeId IN (1, 2, 3) THEN 'INITIAL_CONTENT'
+            WHEN ph.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9) THEN 'CONTENT_MODIFICATION'
+            WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20) THEN 'STATUS_CHANGE' -- Close, Reopen, Delete, Undelete, Lock, Unlock, Protect, Unprotect
+            WHEN ph.PostHistoryTypeId IN (35, 36) THEN 'MIGRATION'
+            ELSE 'OTHER_ADMIN_EVENT'
+        END AS EventCategory,
+        LAG(ph.CreationDate, 1) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS PreviousEventDate,
+        LEAD(ph.CreationDate, 1) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS NextEventDate,
+        -- Time since previous event, handling NULLs
+        COALESCE(EXTRACT(EPOCH FROM (ph.CreationDate - LAG(ph.CreationDate, 1) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate))) / 3600, 0) AS HoursSincePreviousEvent
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+),
+PostInteractionMetrics AS (
+    -- CTE 6: Calculate interaction metrics for posts, specifically highly engaged questions
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.CommunityOwnedDate,
+        -- Complicated calculation for post age
+        EXTRACT(EPOCH FROM (NOW() - p.CreationDate)) / (60 * 60 * 24) AS PostAgeDays,
+        -- Ratio calculations, handling division by zero with NULLIF
+        COALESCE(NULLIF(p.AnswerCount, 0), 0) * 1.0 / COALESCE(NULLIF(p.ViewCount, 0), 1) AS AnswerToViewRatio,
+        COALESCE(NULLIF(p.FavoriteCount, 0), 0) * 1.0 / COALESCE(NULLIF(p.ViewCount, 0), 1) AS FavoriteToViewRatio,
+        COUNT(DISTINCT c.Id) AS TotalCommentsOnPost,
+        SUM(CASE WHEN c.UserId = p.OwnerUserId THEN 1 ELSE 0 END) AS OwnerCommentsOnPost,
+        -- String expressions for tag filtering
+        p.Tags LIKE '%<sql>%' OR p.Tags LIKE '%<database>%' OR p.Tags LIKE '%<postgresql>%' AS HasRelevantTag,
+        -- Correlated subquery to count distinct editors other than the owner
+        (SELECT COUNT(DISTINCT pea.EditorUserId)
+         FROM PostEditAnalysis pea
+         WHERE pea.PostId = p.Id AND pea.IsEditedByOtherUser = TRUE) AS OtherEditorsCount,
+        -- Correlated subquery to check if the post was ever closed
+        EXISTS (SELECT 1 FROM PostHistoryTimeline phtl WHERE phtl.PostId = p.Id AND phtl.EventCategory = 'STATUS_CHANGE' AND phtl.PostHistoryTypeId = 10) AS WasEverClosed,
+        -- Max hours between events for this post
+        (SELECT MAX(HoursSincePreviousEvent) FROM PostHistoryTimeline phtl WHERE phtl.PostId = p.Id) AS MaxHoursBetweenHistoryEvents
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    WHERE p.PostTypeId = 1 -- Only consider Questions
+      AND p.CreationDate >= '2020-01-01' -- Filter by recent questions
+      AND p.ViewCount > 500
+      AND p.AnswerCount > 2
+    GROUP BY p.Id, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.FavoriteCount, p.ClosedDate, p.CommunityOwnedDate, p.Tags
+),
+PostLinkSummary AS (
+    -- CTE 7: Analyze how posts are linked or duplicated
+    SELECT
+        pl.PostId,
+        SUM(CASE WHEN pl.LinkTypeId = 1 THEN 1 ELSE 0 END) AS LinkedFromCount,
+        SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicateOfCount,
+        COUNT(pl.RelatedPostId) AS TotalLinks
+    FROM PostLinks pl
+    GROUP BY pl.PostId
+),
+UserOverallEngagement AS (
+    -- CTE 8: Combine user stats with post interaction metrics to create a comprehensive view per user
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.Views AS UserProfileViews,
+        u.UpVotes AS UserUpVotes,
+        u.DownVotes AS UserDownVotes,
+        COALESCE(ups.TotalPosts, 0) AS TotalPosts,
+        COALESCE(ups.TotalQuestions, 0) AS TotalQuestions,
+        COALESCE(ups.TotalAnswers, 0) AS TotalAnswers,
+        COALESCE(ucs.TotalComments, 0) AS TotalComments,
+        COALESCE(ubs.GoldBadges, 0) AS GoldBadges,
+        COALESCE(ubs.SilverBadges, 0) AS SilverBadges,
+        COALESCE(ubs.BronzeBadges, 0) AS BronzeBadges,
+        COALESCE(ubs.TotalBadges, 0) AS TotalBadges,
+        -- Aggregated metrics from engaged questions
+        AVG(pim.PostScore) AS AvgEngagedQuestionScore,
+        AVG(pim.ViewCount) AS AvgEngagedQuestionViews,
+        AVG(pim.AnswerCount) AS AvgEngagedQuestionAnswers,
+        AVG(pim.AnswerToViewRatio) AS AvgEngagedQuestionAnswerToViewRatio,
+        AVG(pim.FavoriteToViewRatio) AS AvgEngagedQuestionFavoriteToViewRatio,
+        AVG(pim.OtherEditorsCount) AS AvgEngagedQuestionOtherEditors,
+        SUM(CASE WHEN pim.WasEverClosed THEN 1 ELSE 0 END) AS ClosedEngagedQuestionsCount,
+        COUNT(DISTINCT pim.PostId) AS TotalEngagedQuestions,
+        SUM(COALESCE(pls.LinkedFromCount, 0)) AS TotalLinkedQuestionsForUser,
+        SUM(COALESCE(pls.DuplicateOfCount, 0)) AS TotalDuplicateQuestionsForUser,
+        -- Weighted composite score for user activity - complex calculation
+        (u.Reputation * 0.4) + (COALESCE(ups.TotalPosts, 0) * 0.05) + (COALESCE(ucs.TotalComments, 0) * 0.05)
+        + (COALESCE(ubs.TotalBadges, 0) * 0.1) + (COALESCE(AVG(pim.PostScore), 0) * 0.1)
+        + (COALESCE(AVG(pim.AnswerToViewRatio), 0) * 100) + (COALESCE(SUM(ubs.GoldBadges), 0) * 0.2) AS CompositeActivityScore,
+        -- String expression and conditional logic for user reputation tier
+        CASE
+            WHEN u.Reputation >= 200000 THEN 'Legend'
+            WHEN u.Reputation >= 75000 THEN 'Grandmaster'
+            WHEN u.Reputation >= 25000 THEN 'Master'
+            WHEN u.Reputation >= 5000 THEN 'Advanced'
+            WHEN u.Reputation >= 1000 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END AS ReputationTier,
+        -- NULL logic: Check if user's last access date is recent (or if LastAccessDate is NULL, treat as active for this query's purpose)
+        (u.LastAccessDate >= NOW() - INTERVAL '60 days' OR u.LastAccessDate IS NULL) AS IsRecentlyActive
+    FROM Users u
+    LEFT JOIN UserPostStats ups ON u.Id = ups.UserId
+    LEFT JOIN UserCommentStats ucs ON u.Id = ucs.UserId
+    LEFT JOIN UserBadgeSummary ubs ON u.Id = ubs.UserId
+    LEFT JOIN PostInteractionMetrics pim ON u.Id = pim.OwnerUserId
+    LEFT JOIN PostLinkSummary pls ON pim.PostId = pls.PostId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes,
+        ups.TotalPosts, ups.TotalQuestions, ups.TotalAnswers, ucs.TotalComments,
+        ubs.GoldBadges, ubs.SilverBadges, ubs.BronzeBadges, ubs.TotalBadges
+    HAVING COUNT(DISTINCT pim.PostId) >= 5 -- Users with at least 5 engaged questions
+),
+UserRankedActivity AS (
+    -- CTE 9: Rank users based on their composite score and apply various window functions
+    SELECT
+        UserId,
+        DisplayName,
+        Reputation,
+        ReputationTier,
+        TotalPosts,
+        TotalQuestions,
+        TotalAnswers,
+        TotalComments,
+        GoldBadges,
+        SilverBadges,
+        BronzeBadges,
+        TotalBadges,
+        AvgEngagedQuestionScore,
+        AvgEngagedQuestionViews,
+        CompositeActivityScore,
+        IsRecentlyActive,
+        RANK() OVER (ORDER BY CompositeActivityScore DESC) AS RankByCompositeScore,
+        NTILE(5) OVER (ORDER BY Reputation DESC) AS ReputationQuintile, -- Using NTILE for distribution analysis
+        LAG(Reputation, 1, 0) OVER (ORDER BY CompositeActivityScore DESC) AS PrevRankReputation,
+        LEAD(DisplayName, 1) OVER (ORDER BY CompositeActivityScore DESC) AS NextRankDisplayName,
+        -- Correlated subquery example: calculate overall average post score for ALL posts by user (not just engaged)
+        COALESCE((SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = uoe.UserId AND p.PostTypeId IN (1,2) GROUP BY p.OwnerUserId), 0.0) AS OverallAvgPostScore,
+        -- Scalar subquery: total unique users in the same reputation tier
+        (SELECT COUNT(DISTINCT u2.Id) FROM UserOverallEngagement u2 WHERE u2.ReputationTier = uoe.ReputationTier) AS UsersInReputationTier
+    FROM UserOverallEngagement uoe
+),
+TopTagsForUsers AS (
+    -- CTE 10: Identify the most frequently used tags by these top users for their questions
+    SELECT
+        u.UserId,
+        SUBSTRING(UNNEST(string_to_array(TRIM(BOTH '<>' FROM p.Tags), '><')),

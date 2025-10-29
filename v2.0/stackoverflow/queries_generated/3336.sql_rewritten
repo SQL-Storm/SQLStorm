@@ -1,0 +1,178 @@
+-- {"query": "3336.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1871} 
+WITH 
+-- 1. Aggregate badge counts per user, split by class (gold/silver/bronze)
+user_badge_counts AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS gold_cnt,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS silver_cnt,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS bronze_cnt,
+        STRING_AGG(DISTINCT b.Name, '; ') FILTER (WHERE b.Class = 1) AS gold_names,
+        STRING_AGG(DISTINCT b.Name, '; ') FILTER (WHERE b.Class = 2) AS silver_names,
+        STRING_AGG(DISTINCT b.Name, '; ') FILTER (WHERE b.Class = 3) AS bronze_names
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+-- 2. Recent activity per user (latest post, comment or vote)
+user_recent_activity AS (
+    SELECT 
+        u.Id AS user_id,
+        GREATEST(
+            COALESCE(p.LastActivityDate, TIMESTAMP '1970-01-01'), 
+            COALESCE(c.CreationDate, TIMESTAMP '1970-01-01'), 
+            COALESCE(v.CreationDate, TIMESTAMP '1970-01-01')
+        ) AS latest_activity,
+        CASE 
+            WHEN p.LastActivityDate = GREATEST(p.LastActivityDate,c.CreationDate,v.CreationDate) 
+                 THEN 'Post' 
+            WHEN c.CreationDate = GREATEST(p.LastActivityDate,c.CreationDate,v.CreationDate) 
+                 THEN 'Comment' 
+            WHEN v.CreationDate = GREATEST(p.LastActivityDate,c.CreationDate,v.CreationDate) 
+                 THEN 'Vote' 
+            ELSE NULL 
+        END AS activity_source
+    FROM Users u
+    LEFT JOIN LATERAL (
+        SELECT LastActivityDate 
+        FROM Posts 
+        WHERE OwnerUserId = u.Id 
+        ORDER BY LastActivityDate DESC 
+        LIMIT 1
+    ) p ON TRUE
+    LEFT JOIN LATERAL (
+        SELECT CreationDate 
+        FROM Comments 
+        WHERE UserId = u.Id 
+        ORDER BY CreationDate DESC 
+        LIMIT 1
+    ) c ON TRUE
+    LEFT JOIN LATERAL (
+        SELECT CreationDate 
+        FROM Votes 
+        WHERE UserId = u.Id 
+        ORDER BY CreationDate DESC 
+        LIMIT 1
+    ) v ON TRUE
+),
+
+-- 3. Users with scores on their questions (average, median, rank)
+user_question_stats AS (
+    SELECT 
+        u.Id AS user_id,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS question_cnt,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 1) AS avg_question_score,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) 
+            FILTER (WHERE p.PostTypeId = 1) OVER (PARTITION BY u.Id) AS median_question_score,
+        ROW_NUMBER() OVER (ORDER BY AVG(p.Score) FILTER (WHERE p.PostTypeId = 1) DESC) AS score_rank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id
+),
+
+-- 4. Tags used by top users (set‑operator part – later UNION)
+top_user_tags AS (
+    SELECT DISTINCT 
+        t.TagName,
+        u.Id AS user_id
+    FROM Users u
+    JOIN user_question_stats qs ON qs.user_id = u.Id
+    JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+    CROSS JOIN LATERAL (
+        SELECT regexp_split_to_table(p.Tags, '[><]') AS tag
+    ) tag_split
+    JOIN Tags t ON t.TagName = trim(tag_split.tag, '<>') 
+    WHERE qs.score_rank <= 10
+),
+
+-- 5. Closed questions with their close reason text
+closed_questions AS (
+    SELECT 
+        p.Id AS post_id,
+        p.Title,
+        ph.CreationDate AS closed_date,
+        cr.Name AS close_reason,
+        COUNT(*) OVER (PARTITION BY p.Id) AS duplicate_votes
+    FROM Posts p
+    JOIN PostHistory ph ON ph.PostId = p.Id 
+        AND ph.PostHistoryTypeId = 10   -- Post Closed
+    LEFT JOIN CloseReasonTypes cr ON ph.Comment = cr.Id::varchar
+    WHERE p.PostTypeId = 1
+),
+
+-- 6. Combine user‑centric and tag‑centric rows
+combined AS (
+    SELECT 
+        u.Id                              AS user_id,
+        u.DisplayName                     AS user_name,
+        u.Reputation,
+        ub.gold_cnt,
+        ub.silver_cnt,
+        ub.bronze_cnt,
+        ub.gold_names,
+        ub.silver_names,
+        ub.bronze_names,
+        qa.question_cnt,
+        qa.avg_question_score,
+        qa.median_question_score,
+        qa.score_rank,
+        ra.latest_activity,
+        ra.activity_source,
+        COALESCE((
+            SELECT COUNT(*)
+            FROM Comments c
+            WHERE c.PostId = p.Id
+        ),0)                               AS total_comments_on_latest_post,
+        CASE 
+            WHEN cz.post_id IS NOT NULL THEN cz.close_reason 
+            ELSE NULL 
+        END                               AS latest_post_close_reason
+    FROM Users u
+    LEFT JOIN user_badge_counts ub   ON ub.UserId = u.Id
+    LEFT JOIN user_question_stats qa ON qa.user_id = u.Id
+    LEFT JOIN user_recent_activity ra ON ra.user_id = u.Id
+    LEFT JOIN Posts p                 ON p.OwnerUserId = u.Id 
+                                      AND p.CreationDate = ra.latest_activity
+    LEFT JOIN closed_questions cz    ON cz.post_id = p.Id
+    WHERE u.Reputation > 5000
+      AND (ub.gold_cnt > 0 OR qa.avg_question_score > 5 OR ra.activity_source = 'Vote')
+),
+
+-- 7. Tag popularity for those same top users
+tag_popularity AS (
+    SELECT 
+        t.TagName,
+        COUNT(*) AS tag_use_count,
+        STRING_AGG(DISTINCT u.DisplayName, ', ') AS users_using
+    FROM top_user_tags tut
+    JOIN Tags t ON t.TagName = tut.TagName
+    JOIN Users u ON u.Id = tut.user_id
+    GROUP BY t.TagName
+)
+
+SELECT *
+FROM combined
+
+UNION ALL
+
+SELECT 
+    NULL AS user_id,
+    NULL AS user_name,
+    NULL AS Reputation,
+    NULL AS gold_cnt,
+    NULL AS silver_cnt,
+    NULL AS bronze_cnt,
+    NULL AS gold_names,
+    NULL AS silver_names,
+    NULL AS bronze_names,
+    NULL AS question_cnt,
+    NULL AS avg_question_score,
+    NULL AS median_question_score,
+    NULL AS score_rank,
+    NULL AS latest_activity,
+    NULL AS activity_source,
+    NULL AS total_comments_on_latest_post,
+    NULL AS latest_post_close_reason
+FROM tag_popularity
+WHERE tag_use_count > 100
+ORDER BY score_rank NULLS LAST, tag_use_count DESC;

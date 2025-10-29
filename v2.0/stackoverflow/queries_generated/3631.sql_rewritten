@@ -1,0 +1,154 @@
+-- {"query": "3631.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2526} 
+WITH 
+-- Aggregate per‑user activity metrics
+UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COALESCE(SUM(p.Score),0)                         AS TotalPostScore,
+        COUNT(p.Id)                                      AS PostCount,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END)    AS QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END)    AS AnswerCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesGiven,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesGiven
+    FROM Users u
+    LEFT JOIN Posts p   ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v   ON v.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+
+-- Concatenate badge names and count by class
+BadgeAgg AS (
+    SELECT 
+        b.UserId,
+        STRING_AGG(b.Name, ', ' ORDER BY b.Class)       AS Badges,
+        COUNT(*) FILTER (WHERE b.Class = 1)             AS GoldCount,
+        COUNT(*) FILTER (WHERE b.Class = 2)             AS SilverCount,
+        COUNT(*) FILTER (WHERE b.Class = 3)             AS BronzeCount
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+-- Top tags with a sample excerpt title
+TopTags AS (
+    SELECT 
+        t.TagName,
+        t.Count                                 AS TagUseCount,
+        COALESCE(p.Title,'')                    AS SampleQuestionTitle,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Id = t.ExcerptPostId
+    WHERE t.IsModeratorOnly = 0
+),
+
+-- Most recent closure event per question
+RecentClosedQuestions AS (
+    SELECT 
+        ph.PostId,
+        ph.CreationDate                         AS ClosedDate,
+        CAST(ph.Comment AS int)                 AS CloseReasonId,
+        p.Title,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    JOIN Posts p ON p.Id = ph.PostId
+    WHERE ph.PostHistoryTypeId = 10            -- Post Closed
+),
+
+-- Windowed ranking of users
+UserActivityWindow AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC)               AS ReputationRank,
+        RANK()        OVER (ORDER BY u.CreationDate)                  AS JoinRank,
+        NTILE(4)      OVER (ORDER BY 
+                            COALESCE(us.TotalPostScore,0) 
+                          + COALESCE(ba.GoldCount*100,0) 
+                          + COALESCE(ba.SilverCount*10,0) 
+                          + COALESCE(ba.BronzeCount,0))               AS ActivityQuartile
+    FROM Users u
+    LEFT JOIN UserStats us ON us.Id = u.Id
+    LEFT JOIN BadgeAgg ba ON ba.UserId = u.Id
+),
+
+-- Combine everything for the top‑ranked users
+CombinedUsers AS (
+    SELECT 
+        ua.Id,
+        ua.DisplayName,
+        u.Reputation,
+        ua.ReputationRank,
+        ua.ActivityQuartile,
+        us.TotalPostScore,
+        us.PostCount,
+        us.QuestionCount,
+        us.AnswerCount,
+        us.UpVotesGiven,
+        us.DownVotesGiven,
+        COALESCE(ba.Badges,'')  AS BadgeList,
+        ba.GoldCount,
+        ba.SilverCount,
+        ba.BronzeCount
+    FROM UserActivityWindow ua
+    JOIN Users u             ON u.Id = ua.Id
+    LEFT JOIN UserStats us   ON us.Id = ua.Id
+    LEFT JOIN BadgeAgg ba    ON ba.UserId = ua.Id
+    WHERE ua.ReputationRank <= 1000
+)
+
+SELECT
+    cu.Id,
+    cu.DisplayName,
+    cu.Reputation,
+    cu.ReputationRank,
+    cu.ActivityQuartile,
+    cu.TotalPostScore,
+    cu.PostCount,
+    cu.QuestionCount,
+    cu.AnswerCount,
+    cu.UpVotesGiven,
+    cu.DownVotesGiven,
+    cu.BadgeList,
+    cu.GoldCount,
+    cu.SilverCount,
+    cu.BronzeCount,
+    COALESCE(rcq.Title,'No recent closed question')   AS RecentClosedQuestionTitle,
+    rcq.ClosedDate,
+    COALESCE(cr.Name,'Unknown')                       AS CloseReasonName
+FROM CombinedUsers cu
+LEFT JOIN (
+    SELECT PostId, Title, ClosedDate, CloseReasonId
+    FROM RecentClosedQuestions
+    WHERE rn = 1
+) rcq ON rcq.PostId = cu.Id
+LEFT JOIN CloseReasonTypes cr ON cr.Id = rcq.CloseReasonId
+
+UNION ALL
+
+SELECT
+    NULL               AS Id,
+    'Top Tags'          AS DisplayName,
+    NULL               AS Reputation,
+    NULL               AS ReputationRank,
+    tt.TagRank          AS ActivityQuartile,
+    NULL               AS TotalPostScore,
+    NULL               AS PostCount,
+    NULL               AS QuestionCount,
+    NULL               AS AnswerCount,
+    NULL               AS UpVotesGiven,
+    NULL               AS DownVotesGiven,
+    NULL               AS BadgeList,
+    NULL               AS GoldCount,
+    NULL               AS SilverCount,
+    NULL               AS BronzeCount,
+    tt.TagName          AS RecentClosedQuestionTitle,
+    tt.TagUseCount      AS ClosedDate,
+    tt.SampleQuestionTitle AS CloseReasonName
+FROM TopTags tt
+WHERE tt.TagRank <= 10
+
+ORDER BY 
+    ReputationRank NULLS LAST,
+    ActivityQuartile NULLS FIRST;

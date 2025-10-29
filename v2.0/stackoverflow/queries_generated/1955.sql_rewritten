@@ -1,0 +1,209 @@
+-- {"query": "1955.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3309} 
+WITH UserEngagement AS (
+    -- CTE 1: Aggregates user activity, reputation, and derived metrics.
+    -- Filters for users with a minimum number of posts and active in recent years.
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName AS UserName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COALESCE(u.Views, 0) AS UserTotalViews,
+        COALESCE(u.UpVotes, 0) AS TotalUpVotesGiven,
+        COALESCE(u.DownVotes, 0) AS TotalDownVotesGiven,
+        COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestionsAsked,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswersPosted,
+        SUM(CASE WHEN p.PostTypeId IN (1,2) THEN p.Score ELSE 0 END) AS SumOfPostScoresOwned,
+        AVG(CASE WHEN p.PostTypeId IN (1,2) THEN p.Score END) AS AvgPostScoreOwned,
+        MAX(p.LastActivityDate) AS LastOwnedPostActivityDate,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        COUNT(CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+        CASE
+            WHEN u.WebsiteUrl IS NOT NULL AND LENGTH(TRIM(u.WebsiteUrl)) > 5 THEN TRUE
+            ELSE FALSE
+        END AS HasWebsite,
+        LENGTH(u.AboutMe) AS AboutMeLength,
+        EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - u.LastAccessDate)) / 3600 / 24 AS DaysSinceLastAccess
+    FROM Users AS u
+    LEFT JOIN Posts AS p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges AS b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes, u.WebsiteUrl, u.AboutMe
+    HAVING COUNT(DISTINCT p.Id) >= 5 -- Users with at least 5 posts
+       AND u.Reputation > 1000 -- Only "experienced" users
+       AND u.LastAccessDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '2 year') -- Active within last 2 years
+),
+PostDetails AS (
+    -- CTE 2: Gathers detailed post information, including tag parsing, vote summaries, and link types.
+    -- Focuses on Questions (1) and Answers (2).
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.CreationDate AS PostCreationDate,
+        p.OwnerUserId,
+        p.Score AS PostScore,
+        COALESCE(p.ViewCount, 0) AS ViewCount,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        COALESCE(p.CommentCount, 0) AS CommentCount,
+        COALESCE(p.FavoriteCount, 0) AS PostFavoriteCount,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.ClosedDate,
+        p.CommunityOwnedDate,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.Title,
+        p.Body,
+        -- String processing for tags: removes leading/trailing '<', splits by '><', and cleans each tag.
+        ARRAY(SELECT TRIM(UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags)-2), '><')))) AS ParsedTags,
+        -- Calculate net votes directly from Votes table, for posts that have votes
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteSumActual, -- UpMod
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteSumActual, -- DownMod
+        SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoriteSumActual, -- Favorite
+        MAX(CASE WHEN v.VoteTypeId = 8 AND v.BountyAmount IS NOT NULL THEN v.BountyAmount ELSE 0 END) AS MaxBountyAmount,
+        -- Count linked/duplicate posts
+        COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 1 THEN pl.RelatedPostId END) AS LinkedPostsCount,
+        COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN pl.RelatedPostId END) AS DuplicatePostsCount,
+        -- Check if title contains common performance keywords
+        (p.Title ILIKE '%performance%' OR p.Title ILIKE '%optimize%' OR p.Title ILIKE '%speed%') AS IsPerformanceRelatedTitle
+    FROM Posts AS p
+    JOIN PostTypes AS pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Votes AS v ON p.Id = v.PostId
+    LEFT JOIN PostLinks AS pl ON p.Id = pl.PostId
+    WHERE p.PostTypeId IN (1, 2) -- Focus on Questions and Answers
+    GROUP BY p.Id, p.PostTypeId, pt.Name, p.CreationDate, p.OwnerUserId, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.LastEditDate, p.LastActivityDate, p.ClosedDate, p.CommunityOwnedDate, p.AcceptedAnswerId, p.ParentId, p.Title, p.Body, p.Tags
+),
+PostHistoryClosureAnalysis AS (
+    -- CTE 3: Analyzes post history for closure and re-opening events.
+    -- Uses a window function to get the latest status for each post.
+    SELECT
+        ph.PostId,
+        ph.CreationDate AS HistoryEventDate,
+        ph.PostHistoryTypeId,
+        -- Attempt to cast Comment to SMALLINT for CloseReasonId if PostHistoryTypeId is 10
+        CASE
+            WHEN ph.PostHistoryTypeId = 10 AND ph.Comment ~ '^[0-9]+$' THEN CAST(ph.Comment AS SMALLINT)
+            ELSE NULL
+        END AS CloseReasonId,
+        crt.Name AS CloseReasonName,
+        -- Rank history events to find the most recent close/reopen action
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC, ph.PostHistoryTypeId DESC) AS rn
+    FROM PostHistory AS ph
+    LEFT JOIN CloseReasonTypes AS crt ON
+        CASE
+            WHEN ph.PostHistoryTypeId = 10 AND ph.Comment ~ '^[0-9]+$' THEN CAST(ph.Comment AS SMALLINT)
+            ELSE NULL
+        END = crt.Id
+    WHERE ph.PostHistoryTypeId IN (10, 11) -- Post Closed (10) or Post Reopened (11)
+)
+SELECT
+    ue.UserId,
+    ue.UserName,
+    ue.Reputation,
+    ue.TotalPostsOwned,
+    ue.TotalQuestionsAsked,
+    ue.TotalAnswersPosted,
+    ue.GoldBadges,
+    ue.SilverBadges,
+    ue.BronzeBadges,
+    pd.PostId,
+    pd.PostTypeName,
+    pd.PostCreationDate,
+    pd.PostScore,
+    pd.ViewCount,
+    pd.AnswerCount,
+    pd.CommentCount,
+    pd.PostFavoriteCount AS ReportedFavoriteCount, -- From Posts table
+    pd.FavoriteSumActual AS ActualFavoriteCount, -- From Votes table
+    pd.MaxBountyAmount,
+    pd.LinkedPostsCount,
+    pd.DuplicatePostsCount,
+    pd.ParsedTags,
+    ph_latest.HistoryEventDate AS LatestClosureHistoryDate,
+    ph_latest.CloseReasonName AS LatestClosureReasonName,
+    -- Correlated subquery 1: Checks if any answer to this question has been accepted by a highly reputable user
+    (
+        SELECT EXISTS (
+            SELECT 1
+            FROM Posts AS accepted_ans
+            JOIN Users AS ans_owner ON accepted_ans.OwnerUserId = ans_owner.Id
+            WHERE accepted_ans.Id = pd.AcceptedAnswerId
+              AND accepted_ans.ParentId = pd.PostId
+              AND ans_owner.Reputation > 20000
+        )
+    ) AS AcceptedByHighRepUser,
+    -- Correlated subquery 2: Checks if the post has a highly upvoted comment by the owner user
+    (
+        SELECT EXISTS (
+            SELECT 1
+            FROM Comments AS c_owner
+            WHERE c_owner.PostId = pd.PostId
+              AND c_owner.UserId = ue.UserId
+              AND c_owner.Score > 2
+              AND LENGTH(c_owner.Text) > 75
+        )
+    ) AS OwnerHasEngagingComment,
+    -- Window function: Ranks users by their total owned post scores within their region (derived from Location)
+    RANK() OVER (PARTITION BY SUBSTRING(u_loc.Location FROM '^\w+') ORDER BY ue.SumOfPostScoresOwned DESC, ue.Reputation DESC) AS UserRegionalScoreRank,
+    -- Window function: Calculates a 3-month rolling average of post scores for each PostType, ordered by creation date
+    AVG(pd.PostScore) OVER (PARTITION BY pd.PostTypeId ORDER BY pd.PostCreationDate ROWS BETWEEN 3 MONTH PRECEDING AND CURRENT ROW) AS RollingAvgPostScoreByPostType,
+    -- Window function: Calculates the difference in days between the current post and the previous post by the same user
+    EXTRACT(DAY FROM (pd.PostCreationDate - LAG(pd.PostCreationDate, 1, ue.UserCreationDate) OVER (PARTITION BY ue.UserId ORDER BY pd.PostCreationDate))) AS DaysSincePreviousPostByUser,
+    -- Complicated engagement weighted score combining various metrics with specific weights
+    ROUND(
+        (COALESCE(pd.PostScore, 0) * 0.7) +
+        (COALESCE(pd.ViewCount, 0) * 0.005) +
+        (COALESCE(pd.AnswerCount, 0) * 1.5) +
+        (COALESCE(pd.CommentCount, 0) * 0.5) +
+        (COALESCE(pd.PostFavoriteCount, 0) * 2) +
+        (COALESCE(pd.UpVoteSumActual, 0) * 0.3) -
+        (COALESCE(pd.DownVoteSumActual, 0) * 0.1) +
+        (COALESCE(pd.MaxBountyAmount, 0) * 0.05) +
+        (CASE WHEN pd.AcceptedAnswerId IS NOT NULL THEN 5 ELSE 0 END)
+    , 2) AS EngagementWeightedScore,
+    -- NULL logic and complex string expression for a formatted post identifier
+    COALESCE(pd.Title, 'UNTITLED POST') || ' [' || COALESCE(pd.PostTypeName, 'UNKNOWN TYPE') || ' #' || pd.PostId || ']' AS FormattedPostIdentifier,
+    -- Categorizes posts based on parsed tags and title keywords, using array functions
+    CASE
+        WHEN pd.ParsedTags IS NOT NULL AND 'sql-server' = ANY(pd.ParsedTags) AND ('performance' = ANY(pd.ParsedTags) OR pd.IsPerformanceRelatedTitle) THEN 'SQL Server Performance'
+        WHEN pd.ParsedTags IS NOT NULL AND ('c#' = ANY(pd.ParsedTags) OR 'java' = ANY(pd.ParsedTags)) AND ('multithreading' = ANY(pd.ParsedTags) OR 'concurrency' = ANY(pd.ParsedTags)) THEN 'High Concurrency Dev'
+        WHEN pd.ParsedTags IS NULL OR array_length(pd.ParsedTags, 1) = 0 THEN 'Untagged/Generic'
+        WHEN pd.IsPerformanceRelatedTitle THEN 'General Performance'
+        ELSE 'Other Technical'
+    END AS PostTopicCategory,
+    -- Boolean flags for specific post states
+    (pd.ClosedDate IS NOT NULL AND ph_latest.PostHistoryTypeId = 10) AS WasClosedWithoutReopen,
+    (pd.CommunityOwnedDate IS NOT NULL AND pd.LastEditDate IS NOT NULL AND pd.LastEditDate < pd.CommunityOwnedDate) AS EditedBeforeCommunityOwned,
+    -- Average comment score on the specific post from comments created within the post's active period
+    (
+        SELECT AVG(c.Score)
+        FROM Comments AS c
+        WHERE c.PostId = pd.PostId
+          AND c.CreationDate BETWEEN pd.CreationDate AND pd.LastActivityDate
+          AND c.UserId IS NOT NULL
+          AND LENGTH(c.Text) > 15
+    ) AS AvgCommentScoreOnPost,
+    -- Count of distinctive tags, handling NULL
+    COALESCE(array_length(pd.ParsedTags, 1), 0) AS DistinctTagCount
+FROM UserEngagement AS ue
+INNER JOIN PostDetails AS pd ON ue.UserId = pd.OwnerUserId
+LEFT JOIN PostHistoryClosureAnalysis AS ph_latest ON pd.PostId = ph_latest.PostId AND ph_latest.rn = 1
+LEFT JOIN Users AS u_loc ON ue.UserId = u_loc.Id -- Re-join Users table for Location for window function
+WHERE
+    pd.ViewCount > 5000 -- Focus on highly viewed posts
+    AND pd.PostScore > 20 -- Focus on well-received posts
+    AND pd.PostTypeId = 1 -- Only analyze questions for the main result set
+    AND (pd.IsPerformanceRelatedTitle OR ('optimization' = ANY(pd.ParsedTags) OR 'benchmarking' = ANY(pd.ParsedTags))) -- Ensure relevance to performance/benchmarking
+    AND (
+        ph_latest.PostHistoryTypeId IS NULL -- Post was never closed
+        OR (ph_latest.PostHistoryTypeId = 11 AND ph_latest.HistoryEventDate > pd.PostCreationDate) -- Post was reopened
+    )
+    AND pd.OwnerUserId IS NOT NULL
+ORDER BY
+    EngagementWeightedScore DESC,
+    ue.Reputation DESC,
+    pd.PostCreationDate DESC
+LIMIT 1000;

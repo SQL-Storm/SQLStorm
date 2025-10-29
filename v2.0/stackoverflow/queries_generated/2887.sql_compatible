@@ -1,0 +1,135 @@
+with RecursiveBadgeUsers as (
+    select u.Id, u.DisplayName, u.Reputation, b.Class, b.Name as BadgeName, b.Date,
+        row_number() over (partition by u.Id order by b.Date desc) as rn
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    where b.Class is not null
+),
+RecentPostsWithAnswerStats as (
+    select 
+        p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Title, p.Tags,
+        p.AcceptedAnswerId, p.AnswerCount,
+        (select count(*) from Comments c where c.PostId = p.Id) as CommentCount,
+        (coalesce(p.Score,0)*2 + coalesce(p.ViewCount,0)/100 + coalesce((select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 2),0)*3
+        + coalesce((select count(*) from Comments c where c.PostId = p.Id),0)*1.5) as EngagementScore,
+        rank() over (partition by date_trunc('day', p.CreationDate) order by 
+            (coalesce(p.Score,0)*2 + coalesce(p.ViewCount,0)/100 + coalesce((select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 2),0)*3 + coalesce((select count(*) from Comments c where c.PostId = p.Id),0)*1.5) desc) as DailyEngagementRank
+    from Posts p
+    where p.CreationDate >= cast('2024-10-01' as date) - interval '30 days'
+), LatestUserActivity as (
+    select u.Id, u.DisplayName, u.Reputation, u.CreationDate,
+        max(ph.CreationDate) as LastPostEditDate,
+        max(v.CreationDate) as LastVoteDate,
+        max(c.CreationDate) as LastCommentDate,
+        greatest(
+            coalesce(max(ph.CreationDate), timestamp '1970-01-01'),
+            coalesce(max(v.CreationDate), timestamp '1970-01-01'),
+            coalesce(max(c.CreationDate), timestamp '1970-01-01')
+        ) as LastActivityDate
+    from Users u
+    left join PostHistory ph on ph.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate
+), TagAggregates as (
+    select
+        t.TagName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        sum(p.ViewCount) filter (where p.PostTypeId = 1) as TotalQuestionViews,
+        avg(p.Score) filter (where p.PostTypeId = 1) as AvgQuestionScore,
+        min(p.CreationDate) as FirstSeen,
+        max(p.CreationDate) as LastSeen
+    from Tags t
+    left join Posts p on p.Tags like ('%' || '<' || t.TagName || '>' || '%')
+    group by t.TagName
+), DuplicatePostPairs as (
+    select pl.PostId, pl.RelatedPostId, pl.CreationDate,
+        p1.Title as PostTitle, p2.Title as RelatedPostTitle
+    from PostLinks pl
+    inner join Posts p1 on p1.Id = pl.PostId
+    inner join Posts p2 on p2.Id = pl.RelatedPostId
+    where pl.LinkTypeId = 3
+), QuestionsWithAcceptedAnswerInfo as (
+    select p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.Tags,
+        a.Id as AnswerId, a.Score as AnswerScore, a.CreationDate as AnswerCreationDate,
+        u.DisplayName as OwnerName,
+        case when p.ClosedDate is not null then 1 else 0 end as IsClosed
+    from Posts p
+    left join Posts a on a.Id = p.AcceptedAnswerId
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId = 1
+),
+RecentHotQuestions as (
+    select q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount, q.Tags, q.AcceptedAnswerStatus, q.AnswerScore, q.AnswerCreationDate, q.OwnerName,
+           row_number() over (order by q.ViewCount desc, q.Score desc) as HotRank
+    from QuestionsWithAcceptedAnswerInfo q
+    where q.CreationDate >= cast('2024-10-01' as date) - interval '7 days'
+    and q.IsClosed = 0
+)
+select rph.Id as PostId,
+       rph.Title,
+       rph.CreationDate as PostCreated,
+       rph.Score as PostScore,
+       rph.ViewCount,
+       rph.EngagementScore,
+       rph.DailyEngagementRank,
+       u.DisplayName as OwnerDisplayName,
+       u.Reputation as OwnerReputation,
+       ru.LastActivityDate,
+       (
+         select string_agg(t.TagName, ', ' order by t_tag_count.cnt desc)
+         from (
+           select t.TagName, count(*) as cnt
+           from Tags t
+           where rph.Tags like ('%' || '<' || t.TagName || '>' || '%')
+           group by t.TagName
+           order by cnt desc
+           limit 3
+         ) t_tag_count
+       ) as TopTags,
+       coalesce(db.BadgeName, 'No Badge') as MostRecentBadgeName,
+       coalesce(db.Class, 0) as BadgeClass,
+       dp.RelatedPostId as DuplicateOf,
+       dp.RelatedPostTitle,
+       case when rph.AcceptedAnswerId is not null then 'Has Accepted Answer' else 'No Accepted Answer' end as AcceptedAnswerStatus,
+       coalesce(qw.AnswerScore, 0) as AcceptedAnswerScore,
+       coalesce(qw.AnswerCreationDate, timestamp '1970-01-01') as AcceptedAnswerCreated,
+       case when rph.CommentCount > 5 then 'Highly Commented' else 'Less Commented' end as CommentPopularity,
+       length(coalesce(rph.Title, '')) + length(coalesce(u.DisplayName, '')) as TitleOwnerNameLengthSum,
+       upper(substr(coalesce(rph.Title, ''), 1, 10)) as TitleSnippet,
+       (substr(coalesce(u.DisplayName, ''), 1, 5) || '_' || rph.Id) as OwnerPostCompositeKey
+from RecentPostsWithAnswerStats rph
+inner join Users u on u.Id = rph.OwnerUserId
+left join LatestUserActivity ru on ru.Id = u.Id
+left join RecursiveBadgeUsers db on db.Id = u.Id and db.rn = 1
+left join DuplicatePostPairs dp on dp.PostId = rph.Id
+left join QuestionsWithAcceptedAnswerInfo qw on qw.Id = rph.Id
+where rph.DailyEngagementRank <= 50
+
+union
+
+select rhq.Id,
+       rhq.Title,
+       rhq.CreationDate,
+       rhq.Score,
+       rhq.ViewCount,
+       null,
+       null,
+       rhq.OwnerName,
+       null,
+       null,
+       null,
+       null,
+       null,
+       null,
+       rhq.AcceptedAnswerStatus,
+       rhq.AnswerScore,
+       rhq.AnswerCreationDate,
+       null,
+       null,
+       null,
+       null
+from RecentHotQuestions rhq
+order by PostCreated desc, EngagementScore desc NULLS LAST
+fetch first 100 rows only;

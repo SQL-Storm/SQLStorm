@@ -1,0 +1,104 @@
+WITH recent_questions AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.Tags,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.LastActivityDate,
+    ROW_NUMBER() OVER (ORDER BY p.LastActivityDate DESC) AS rn
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days'
+),
+top_tags AS (
+  SELECT
+    unnest(string_to_array(substr(rq.Tags, 2, length(rq.Tags) - 2), '><')) AS tag,
+    rq.Id
+  FROM recent_questions rq
+),
+tag_activity AS (
+  SELECT
+    tt.tag AS Tag,
+    COUNT(*) AS QuestionCount,
+    AVG(rq.Score) AS AvgScore,
+    MAX(rq.ViewCount) AS MaxViews,
+    SUM(rq.AnswerCount) AS TotalAnswers
+  FROM recent_questions rq
+  JOIN top_tags tt ON tt.Id = rq.Id
+  GROUP BY tt.tag
+),
+correlated_users AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.LastAccessDate,
+    u.AccountId,
+    COUNT(DISTINCT rq.Id) FILTER (WHERE rq.Score > 0) AS ActiveQuestions,
+    AVG(COALESCE(v.BountyAmount, 0)) AS AvgBountyUsed
+  FROM Users u
+  LEFT JOIN Posts rq ON rq.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.PostId = rq.Id
+  WHERE u.Id IS NOT NULL
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.LastAccessDate, u.AccountId
+),
+activity_summary AS (
+  SELECT
+    rq.Id AS PostId,
+    rq.Title,
+    rq.CreationDate,
+    rq.LastActivityDate,
+    rq.OwnerUserId,
+    rq.Score,
+    rq.ViewCount,
+    rq.AnswerCount,
+    rq.CommentCount,
+    CASE
+      WHEN rq.ViewCount > 1000 THEN 'high-traffic'
+      WHEN rq.ViewCount > 100 THEN 'moderate-traffic'
+      ELSE 'low-traffic'
+    END AS TrafficBand,
+    CASE
+      WHEN rq.Score >= 10 THEN 'hot'
+      WHEN rq.Score >= 0 THEN 'warm'
+      ELSE 'cool'
+    END AS Popularity
+  FROM recent_questions rq
+),
+dedup AS (
+  SELECT DISTINCT ON (PostId) PostId, Title, CreationDate, LastActivityDate, OwnerUserId, Score, ViewCount, AnswerCount, CommentCount, TrafficBand, Popularity
+  FROM activity_summary
+  ORDER BY PostId, LastActivityDate DESC
+)
+SELECT
+  d.PostId,
+  d.Title,
+  d.CreationDate,
+  d.LastActivityDate,
+  d.OwnerUserId,
+  d.Score,
+  d.ViewCount,
+  d.AnswerCount,
+  d.CommentCount,
+  d.TrafficBand,
+  d.Popularity,
+  ta.Tag AS Tag,
+  ta.QuestionCount,
+  ta.AvgScore AS AvgTagScore,
+  ta.MaxViews AS MaxTagViews,
+  ta.TotalAnswers AS TotalTagAnswers,
+  cu.UserId AS CorrelatedUserId,
+  cu.DisplayName AS CorrelatedUserName,
+  cu.Reputation AS CorrelatedUserRep,
+  cu.LastAccessDate AS CorrelatedUserLastActive,
+  cu.AvgBountyUsed AS CorrelatedUserAvgBounty
+FROM dedup d
+LEFT JOIN tag_activity ta ON true
+LEFT JOIN correlated_users cu ON true
+ORDER BY d.LastActivityDate DESC
+LIMIT 100;

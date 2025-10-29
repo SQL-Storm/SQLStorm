@@ -1,0 +1,191 @@
+-- {"query": "1737.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3075} 
+
+WITH UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COALESCE(u.Location, 'Unspecified Location') AS UserLocation,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsAsked,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersPosted,
+        COUNT(DISTINCT p.Id) AS TotalPostsCreated,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        u.UpVotes AS TotalUpvotesGiven,
+        u.DownVotes AS TotalDownvotesGiven,
+        u.Views AS TotalProfileViews,
+        -- String expression: Extract and normalize first 5 characters of location
+        UPPER(TRIM(SUBSTRING(COALESCE(u.Location, 'N/A') FROM 1 FOR 5))) AS LocationPrefixNormalized
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Location,
+        u.UpVotes, u.DownVotes, u.Views
+),
+QuestionPerformance AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title AS QuestionTitle,
+        q.OwnerUserId AS QuestionOwnerId,
+        q.CreationDate AS QuestionCreationDate,
+        q.ViewCount,
+        q.Score AS QuestionScore,
+        COALESCE(q.AnswerCount, 0) AS AnswerCount,
+        COALESCE(q.FavoriteCount, 0) AS FavoriteCount,
+        q.ClosedDate,
+        -- Complicated calculation: Average score of answers to this question, handling NULLs
+        COALESCE(AVG(a.Score), 0.0) AS AvgAnswerScore,
+        -- String expression: Check if 'performance' or 'optimization' tags are present
+        (q.Tags LIKE '%<performance>%' OR q.Tags LIKE '%<optimization>%') AS IsPerformanceRelated,
+        -- NULL logic: Duration in hours from creation to last activity, NULL if no activity or activity before creation
+        EXTRACT(EPOCH FROM (q.LastActivityDate - q.CreationDate)) / 3600.0 AS HoursSinceCreationToLastActivity,
+        -- Correlated subquery: Get the display name of the most recent editor for the question
+        (SELECT ph.UserDisplayName
+         FROM PostHistory ph
+         WHERE ph.PostId = q.Id
+           AND ph.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Body, Tags
+         ORDER BY ph.CreationDate DESC
+         LIMIT 1) AS LastEditorDisplayNameForQuestion,
+        -- Window function: Rank questions by view count within the same creation year
+        DENSE_RANK() OVER (PARTITION BY EXTRACT(YEAR FROM q.CreationDate) ORDER BY q.ViewCount DESC, q.Score DESC) AS RankByViewsInCreationYear
+    FROM Posts q
+    LEFT JOIN Posts a ON q.Id = a.ParentId AND a.PostTypeId = 2 -- Link questions to their answers
+    WHERE q.PostTypeId = 1 -- Only questions
+    GROUP BY
+        q.Id, q.Title, q.OwnerUserId, q.CreationDate, q.ViewCount, q.Score, q.AnswerCount, q.FavoriteCount, q.ClosedDate, q.Tags, q.LastActivityDate
+),
+UserSelfEditActivitySummary AS (
+    SELECT
+        ph.UserId,
+        COUNT(DISTINCT ph.PostId) AS DistinctPostsSelfEdited,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS MinorSelfEdits,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (8, 9) THEN 1 ELSE 0 END) AS SelfRollbacks,
+        MAX(ph.CreationDate) AS LastSelfEditTimestamp,
+        -- Correlated subquery: Find if user ever edited a post that was later closed
+        EXISTS (SELECT 1 FROM Posts p_closed WHERE p_closed.Id = ph.PostId AND p_closed.ClosedDate IS NOT NULL AND p_closed.OwnerUserId = ph.UserId) AS EditedOwnClosedPost
+    FROM PostHistory ph
+    INNER JOIN Posts p ON ph.PostId = p.Id AND ph.UserId = p.OwnerUserId -- User edited their own post
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6, 8, 9) -- Edit Title, Body, Tags, Rollback Body, Rollback Tags
+    GROUP BY ph.UserId
+),
+RecentActivitySummary AS (
+    SELECT
+        ue.UserId,
+        ue.DisplayName,
+        ue.Reputation,
+        -- Window function: Calculate the moving average of reputation for users with similar total posts created
+        AVG(ue.Reputation) OVER (ORDER BY ue.TotalPostsCreated ASC ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING) AS SmoothAvgReputationByPostCount,
+        -- Complicated calculation: Ratio of answers to questions, handling division by zero
+        ue.TotalAnswersPosted * 1.0 / NULLIF(ue.TotalQuestionsAsked, 0) AS AnswerToQuestionRatio,
+        -- String expression: Create a user-activity fingerprint based on badge classes
+        'G:' || ue.GoldBadges || '|S:' || ue.SilverBadges || '|B:' || ue.BronzeBadges AS BadgeFingerprint,
+        -- CTE with set operator logic - users who have both asked questions and posted comments recently
+        (SELECT COUNT(DISTINCT p.Id) FROM Posts p WHERE p.OwnerUserId = ue.UserId AND p.CreationDate > NOW() - INTERVAL '90 days') AS RecentPosts,
+        (SELECT COUNT(DISTINCT c.Id) FROM Comments c WHERE c.UserId = ue.UserId AND c.CreationDate > NOW() - INTERVAL '90 days') AS RecentComments
+    FROM UserEngagement ue
+    WHERE ue.LastAccessDate > NOW() - INTERVAL '1 year' -- Active users in the last year
+),
+TopTagsByOwner AS (
+    -- Finds the most common tag associated with questions asked by each user
+    SELECT DISTINCT ON (p.OwnerUserId)
+        p.OwnerUserId AS UserId,
+        TRIM(BOTH '<>' FROM SPLIT_PART(REPLACE(REPLACE(p.Tags, '><', '|'), '<', ''), '|', 1)) AS TopTag,
+        COUNT(p.Id) OVER (PARTITION BY p.OwnerUserId, TRIM(BOTH '<>' FROM SPLIT_PART(REPLACE(REPLACE(p.Tags, '><', '|'), '<', ''), '|', 1))) AS TagCountForUser
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+    ORDER BY p.OwnerUserId, COUNT(p.Id) OVER (PARTITION BY p.OwnerUserId, TRIM(BOTH '<>' FROM SPLIT_PART(REPLACE(REPLACE(p.Tags, '><', '|'), '<', ''), '|', 1))) DESC
+),
+ModeratorActivityPosts AS (
+    -- Combine different types of moderator/closure related post history and vote events
+    SELECT
+        ph.PostId,
+        ph.CreationDate,
+        ph.PostHistoryTypeId AS EventTypeId,
+        ph.Comment,
+        ph.Text AS EventDetails,
+        'PostHistory' AS SourceCategory
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (10, 11, 14, 15, 19, 20) -- Closed, Reopened, Locked, Unlocked, Protected, Unprotected
+      AND ph.CreationDate > NOW() - INTERVAL '3 years'
+
+    UNION ALL
+
+    SELECT
+        v.PostId,
+        v.CreationDate,
+        v.VoteTypeId AS EventTypeId,
+        NULL AS Comment,
+        NULL AS EventDetails,
+        'Votes' AS SourceCategory
+    FROM Votes v
+    WHERE v.VoteTypeId IN (6, 7, 10, 11, 12) -- Close, Reopen, Deletion, Undeletion, Spam
+      AND v.CreationDate > NOW() - INTERVAL '3 years'
+)
+SELECT
+    ue.UserId,
+    ue.DisplayName,
+    ue.Reputation,
+    ue.UserLocation,
+    ue.TotalQuestionsAsked,
+    ue.TotalAnswersPosted,
+    ue.TotalCommentsMade,
+    ue.GoldBadges,
+    ue.SilverBadges,
+    ue.BronzeBadges,
+    rsa.SmoothAvgReputationByPostCount,
+    rsa.AnswerToQuestionRatio,
+    rsa.BadgeFingerprint,
+    COALESCE(usas.DistinctPostsSelfEdited, 0) AS DistinctPostsSelfEdited,
+    COALESCE(usas.MinorSelfEdits, 0) AS MinorSelfEdits,
+    usas.EditedOwnClosedPost,
+    COALESCE(ttp.TopTag, 'No Questions') AS MostCommonQuestionTag,
+    -- Correlated subquery with complex NULL logic: find the highest viewed self-answered question title
+    COALESCE(
+        (SELECT qp.QuestionTitle
+         FROM QuestionPerformance qp
+         WHERE qp.QuestionOwnerId = ue.UserId
+           AND qp.AnswerCount > 0
+         ORDER BY qp.ViewCount DESC
+         LIMIT 1), 'N/A'
+    ) AS HighestViewedSelfAnsweredQuestionTitle,
+    -- Window function: Calculate the NTH_VALUE (3rd highest reputation) among users with similar self-edit ratios
+    NTH_VALUE(ue.Reputation, 3) OVER (ORDER BY rsa.SelfEditRatio DESC NULLS LAST) AS ThirdHighestReputationBySelfEditRatio,
+    -- Set operator logic (simulated by COUNT distinct from ModeratorActivityPosts): Count unique moderator/closure events affecting user's posts
+    (SELECT COUNT(DISTINCT map.PostId)
+     FROM ModeratorActivityPosts map
+     INNER JOIN Posts p_user ON map.PostId = p_user.Id
+     WHERE p_user.OwnerUserId = ue.UserId
+    ) AS CountPostsAffectedByModeratorActions,
+    -- Complicated expression: A 'Content Quality Score' based on various factors
+    (ue.Reputation * 0.05 + ue.TotalUpvotesGiven * 0.01 + ue.TotalQuestionsAsked * 0.5 + ue.TotalAnswersPosted * 0.7 +
+     (COALESCE(usas.MinorSelfEdits, 0) - COALESCE(usas.SelfRollbacks, 0)) * 0.1 +
+     rsa.RecentPosts * 2 + rsa.RecentComments * 1.5 +
+     (ue.GoldBadges * 10 + ue.SilverBadges * 5 + ue.BronzeBadges * 1)) AS ContentQualityScore,
+    -- String expression: Concatenate recent activity and self-edit summary
+    'Recent: ' || rsa.RecentPosts || 'P/' || rsa.RecentComments || 'C; SelfEdits: ' || COALESCE(usas.DistinctPostsSelfEdited, 0) || 'D/' || COALESCE(usas.MinorSelfEdits, 0) || 'M' AS ActivitySummary
+FROM UserEngagement ue
+LEFT JOIN RecentActivitySummary rsa ON ue.UserId = rsa.UserId
+LEFT JOIN UserSelfEditActivitySummary usas ON ue.UserId = usas.UserId
+LEFT JOIN TopTagsByOwner ttp ON ue.UserId = ttp.UserId
+WHERE ue.Reputation > 1000
+  AND (ue.TotalPostsCreated > 10 OR ue.TotalCommentsMade > 20)
+  AND ue.LastAccessDate > NOW() - INTERVAL '6 months'
+  AND (ue.Location IS NOT NULL AND ue.Location LIKE 'U%') -- Example for specific location filtering with NULL logic and string expression
+GROUP BY
+    ue.UserId, ue.DisplayName, ue.Reputation, ue.UserLocation, ue.TotalQuestionsAsked, ue.TotalAnswersPosted,
+    ue.TotalCommentsMade, ue.GoldBadges, ue.SilverBadges, ue.BronzeBadges, rsa.SmoothAvgReputationByPostCount,
+    rsa.AnswerToQuestionRatio, rsa.BadgeFingerprint, usas.DistinctPostsSelfEdited, usas.MinorSelfEdits,
+    usas.EditedOwnClosedPost, ttp.TopTag, ue.TotalUpvotesGiven, ue.TotalProfileViews,
+    usas.SelfRollbacks, rsa.RecentPosts, rsa.RecentComments, ue.Location -- Include ue.Location for WHERE clause
+HAVING
+    COUNT(DISTINCT qp.QuestionId) FILTER (WHERE qp.IsPerformanceRelated) > 0 -- At least one performance-related question
+    OR COALESCE(usas.DistinctPostsSelfEdited, 0) > 3 -- Or user has self-edited at least 3 distinct posts
+ORDER BY
+    ContentQualityScore DESC, ue.Reputation DESC
+LIMIT 50;

@@ -1,0 +1,145 @@
+WITH
+    q AS (
+        SELECT
+            p.Id AS PostId,
+            p.Title,
+            p.Tags,
+            p.CreationDate,
+            p.Score,
+            p.ViewCount,
+            p.OwnerUserId,
+            p.LastActivityDate,
+            p.PostTypeId,
+            p.AcceptedAnswerId,
+            p.ParentId,
+            p.CommentCount,
+            p.FavoriteCount,
+            p.Body,
+            p.ContentLicense,
+            u.Reputation AS OwnerReputation,
+            u.CreationDate AS OwnerCreationDate,
+            u.DisplayName AS OwnerDisplayName,
+            u.LastAccessDate AS OwnerLastAccessDate,
+            u.Location AS OwnerLocation,
+            u.Views AS OwnerViews,
+            u.UpVotes AS OwnerUpVotes,
+            u.DownVotes AS OwnerDownVotes,
+            u.WebsiteUrl AS OwnerWebsite
+        FROM Posts p
+        LEFT JOIN Users u ON p.OwnerUserId = u.Id
+        WHERE p.PostTypeId IN (1, 2)
+          AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days'
+    ),
+    hist AS (
+        SELECT
+            p.Id AS PostId,
+            p.Title,
+            p.Tags,
+            p.CreationDate,
+            p.Score,
+            p.ViewCount,
+            p.OwnerUserId,
+            p.LastActivityDate,
+            p.PostTypeId,
+            p.AcceptedAnswerId,
+            p.ParentId,
+            p.CommentCount,
+            p.FavoriteCount,
+            p.Body,
+            p.ContentLicense,
+            ph.Id AS HistoryId,
+            ph.PostHistoryTypeId,
+            ph.CreationDate AS HistoryDate,
+            ph.UserId AS HistoryUserId,
+            ph.Comment
+        FROM Posts p
+        JOIN PostHistory ph ON ph.PostId = p.Id
+        WHERE ph.PostHistoryTypeId IN (1, 2, 4, 5, 6, 10, 16, 50)
+          AND ph.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days'
+    ),
+    linked AS (
+        SELECT
+            l.PostId,
+            l.RelatedPostId,
+            l.LinkTypeId,
+            lt.Name AS LinkTypeName,
+            p.Title AS RelatedPostTitle,
+            p.OwnerUserId AS RelatedOwnerId
+        FROM PostLinks l
+        JOIN Posts p ON l.RelatedPostId = p.Id
+        LEFT JOIN LinkTypes lt ON l.LinkTypeId = lt.Id
+        WHERE l.LinkTypeId IN (1, 3)
+    ),
+    tag_summary AS (
+        SELECT
+            tg.TagName,
+            COUNT(*) AS TagCount,
+            AVG(p.Score) AS AvgScore,
+            MAX(p.ViewCount) AS MaxViews
+        FROM Tags tg
+        JOIN Posts p ON tg.ExcerptPostId = p.Id
+        GROUP BY tg.TagName
+    ),
+    windowed AS (
+        SELECT
+            p.Id,
+            p.OwnerUserId,
+            p.Score,
+            p.ViewCount,
+            p.CreationDate,
+            ROW_NUMBER() OVER (
+                PARTITION BY p.OwnerUserId
+                ORDER BY p.Score DESC, p.ViewCount DESC, p.CreationDate DESC
+            ) AS rn_by_owner
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+    ),
+    outer_agg AS (
+        SELECT
+            b.Name AS BadgeNameForOwner,
+            u.Id AS UserId,
+            COUNT(*) AS BadgeCountForUser
+        FROM Badges b
+        JOIN Users u ON b.UserId = u.Id
+        WHERE b.Class IN (1, 2, 3)
+          AND b.TagBased = 0
+        GROUP BY b.Name, u.Id
+        HAVING COUNT(*) > 0
+    )
+
+SELECT
+    q.PostId,
+    q.Title,
+    q.Tags,
+    q.CreationDate AS PostCreationDate,
+    q.Score,
+    q.ViewCount,
+    q.OwnerUserId,
+    q.OwnerDisplayName,
+    q.OwnerReputation,
+    q.OwnerWebsite,
+    hist.HistoryId,
+    hist.PostHistoryTypeId,
+    hist.HistoryDate,
+    hist.Comment AS HistoryComment,
+    hist.HistoryUserId,
+    linked.RelatedPostTitle,
+    linked.LinkTypeName,
+    linked.LinkTypeId,
+    windowed.rn_by_owner,
+    windowed.Score AS WindowedScore,
+    windowed.ViewCount AS WindowedViews,
+    tag_summary.TagName,
+    tag_summary.TagCount,
+    tag_summary.AvgScore,
+    tag_summary.MaxViews,
+    outer_agg.BadgeNameForOwner,
+    outer_agg.BadgeCountForUser
+FROM q
+LEFT JOIN hist ON hist.PostId = q.PostId
+LEFT JOIN linked ON linked.PostId = q.PostId
+LEFT JOIN windowed ON windowed.Id = q.PostId
+LEFT JOIN tag_summary ON 1 = 1
+LEFT JOIN outer_agg ON outer_agg.UserId = q.OwnerUserId
+ORDER BY q.CreationDate DESC, hist.HistoryDate DESC
+LIMIT 200;

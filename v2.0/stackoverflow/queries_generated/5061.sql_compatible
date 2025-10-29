@@ -1,0 +1,98 @@
+WITH
+TagStats AS (
+  SELECT
+    t.TagName,
+    AVG(p.Score) AS AvgPostScore,
+    SUM(p.ViewCount) AS TotalViews,
+    AVG(p.ViewCount) AS AvgViews,
+    COUNT(*) AS PostCount
+  FROM
+    Posts p
+    JOIN Tags t ON p.Id = t.Id
+  WHERE
+    p.PostTypeId = 1
+  GROUP BY
+    t.TagName
+),
+RecentClose AS (
+  SELECT
+    ph.PostId,
+    ph.CreationDate AS CloseDate,
+    ph.Comment
+  FROM
+    PostHistory ph
+  WHERE
+    ph.PostHistoryTypeId = 10
+    AND ph.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 day')
+),
+DailyScoreRank AS (
+  SELECT
+    p.Id AS PostId,
+    p.CreationDate,
+    p.Score,
+    ROW_NUMBER() OVER (
+      PARTITION BY CAST(p.CreationDate AS date)
+      ORDER BY p.Score DESC, p.Id
+    ) AS ScoreRank
+  FROM
+    Posts p
+  WHERE
+    p.PostTypeId = 1
+),
+PopularOrInactive AS (
+  SELECT Id FROM Posts WHERE PostTypeId = 1 AND Score > 10
+  UNION
+  SELECT Id FROM Posts WHERE PostTypeId = 1 AND ViewCount = 0
+)
+SELECT
+  p.Id AS PostId,
+  p.Title,
+  p.Tags,
+  p.Score,
+  p.ViewCount,
+  p.CreationDate,
+  u.DisplayName AS Owner,
+  (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCount,
+  COALESCE(SUM(v.BountyAmount), 0) AS TotalBounty,
+  CASE
+    WHEN p.OwnerUserId IS NULL THEN 'Community'
+    ELSE 'User'
+  END AS OwnerType,
+  d.ScoreRank,
+  RC.CloseDate AS LastClosedDate,
+  RC.Comment AS CloseReasonComment,
+  TS.AvgPostScore,
+  TS.TotalViews,
+  TS.PostCount
+FROM
+  Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN DailyScoreRank d ON d.PostId = p.Id
+  LEFT JOIN RecentClose RC ON RC.PostId = p.Id
+  LEFT JOIN (
+    SELECT TagName, AVG(Score) AS AvgPostScore, SUM(ViewCount) AS TotalViews, COUNT(*) AS PostCount
+    FROM Posts
+    WHERE PostTypeId = 1
+    GROUP BY TagName
+  ) TS ON 1=1
+LEFT JOIN Votes v ON v.PostId = p.Id AND v.BountyAmount IS NOT NULL
+WHERE
+  p.Id IN (SELECT Id FROM PopularOrInactive)
+GROUP BY
+  p.Id,
+  p.Title,
+  p.Tags,
+  p.Score,
+  p.ViewCount,
+  p.CreationDate,
+  u.DisplayName,
+  d.ScoreRank,
+  RC.CloseDate,
+  RC.Comment,
+  TS.AvgPostScore,
+  TS.TotalViews,
+  TS.PostCount,
+  p.OwnerUserId
+ORDER BY
+  p.CreationDate DESC
+OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY;

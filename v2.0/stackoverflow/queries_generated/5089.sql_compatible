@@ -1,0 +1,110 @@
+WITH recent_top_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Tags,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.LastActivityDate DESC) AS rn_by_author
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180 days'
+),
+author_stats AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    COUNT(r.PostId) FILTER (WHERE r.rn_by_author = 1) AS top_question_count,
+    SUM(p.Score) AS total_score_of_top_questions,
+    SUM(p.ViewCount) AS total_views_of_top_questions,
+    MAX(p.LastActivityDate) AS last_top_activity
+  FROM Users u
+  LEFT JOIN recent_top_questions r ON u.Id = r.OwnerUserId
+  LEFT JOIN Posts p ON p.Id = r.PostId
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+complex_metrics AS (
+  SELECT
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.UserCreationDate,
+    us.top_question_count,
+    us.total_score_of_top_questions,
+    us.total_views_of_top_questions,
+    us.last_top_activity,
+    (us.total_views_of_top_questions * 1.0) / NULLIF(us.top_question_count, 0) AS views_per_top_question,
+    CASE
+      WHEN us.Reputation >= 2000 THEN 'Legend'
+      WHEN us.Reputation >= 1000 THEN 'Guru'
+      WHEN us.Reputation >= 500 THEN 'Contrib'
+      ELSE 'Newbie'
+    END AS user_tier,
+    (SELECT AVG(v.BountyAmount) FROM Votes v WHERE v.UserId = us.UserId AND v.BountyAmount > 0) AS avg_bounty_giving_rate
+  FROM author_stats us
+),
+filtered AS (
+  SELECT
+    *
+  FROM complex_metrics cm
+  WHERE cm.top_question_count > 0 OR cm.total_views_of_top_questions > 1000
+),
+final_rows AS (
+  SELECT
+    f.UserId,
+    f.DisplayName,
+    f.Reputation,
+    f.UserCreationDate,
+    f.top_question_count,
+    f.total_score_of_top_questions,
+    f.total_views_of_top_questions,
+    f.last_top_activity,
+    f.views_per_top_question,
+    f.user_tier,
+    f.avg_bounty_giving_rate,
+    (CASE WHEN f.last_top_activity IS NULL THEN NULL
+          ELSE DATE_PART('day', CAST('2024-10-01 12:34:56' AS timestamp) - f.last_top_activity) END) AS days_since_last_top_question,
+    (SELECT STRING_AGG(t.Name, ', ' ORDER BY t.Name)
+     FROM Posts p2
+     JOIN PostLinks pl ON pl.PostId = p2.Id
+     JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+     JOIN Tags t ON t.Id = CAST(p2.Tags AS integer)
+     WHERE p2.OwnerUserId = f.UserId AND p2.PostTypeId = 1
+     GROUP BY p2.OwnerUserId) AS related_tag_names
+  FROM filtered f
+  GROUP BY
+    f.UserId,
+    f.DisplayName,
+    f.Reputation,
+    f.UserCreationDate,
+    f.top_question_count,
+    f.total_score_of_top_questions,
+    f.total_views_of_top_questions,
+    f.last_top_activity,
+    f.views_per_top_question,
+    f.user_tier,
+    f.avg_bounty_giving_rate,
+    f.days_since_last_top_question
+)
+SELECT
+  fr.UserId,
+  fr.DisplayName,
+  fr.Reputation,
+  fr.UserCreationDate,
+  fr.top_question_count,
+  fr.total_score_of_top_questions,
+  fr.total_views_of_top_questions,
+  fr.last_top_activity,
+  fr.views_per_top_question,
+  fr.user_tier,
+  fr.avg_bounty_giving_rate,
+  fr.days_since_last_top_question,
+  fr.related_tag_names
+FROM final_rows fr
+ORDER BY fr.Reputation DESC NULLS LAST, fr.total_views_of_top_questions DESC NULLS LAST
+LIMIT 100;

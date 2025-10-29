@@ -1,0 +1,37 @@
+SELECT 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    MAX(u.CreationDate) AS LatestAccountActivity,
+    MAX(p.LastActivityDate) AS LatestPostActivity,
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+    (SELECT COUNT(*) FROM Votes v2 WHERE v2.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = u.Id) AND v2.VoteTypeId = 2) AS TotalUpVotesReceived,
+    (SELECT STRING_AGG(t.TagName, ', ') FROM Tags t WHERE CAST(t.Id AS VARCHAR) IN (
+         SELECT TRIM(BOTH '<>' FROM tag_str)
+         FROM (
+             SELECT UNNEST(STRING_TO_ARRAY(p.Tags, '><')) AS tag_str
+         ) AS unnested
+         WHERE p.Tags IS NOT NULL
+    )) AS PopularTags,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id AND c.Score > 0) AS PositiveComments,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId = 10) AS TotalCloseVotes
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+WHERE 
+    (u.Reputation > 1000 OR u.Reputation IS NULL)
+    AND (p.Score > 0 OR p.Score IS NULL)
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation, p.Id, p.Tags, p.LastActivityDate
+HAVING 
+    MAX(p.LastActivityDate) > (DATE_TRUNC('month', CAST('2024-10-01' AS DATE)) - INTERVAL '6' MONTH)
+ORDER BY 
+    u.Reputation DESC, 
+    TotalPosts DESC
+LIMIT 100;

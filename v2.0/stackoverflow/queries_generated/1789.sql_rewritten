@@ -1,0 +1,250 @@
+-- {"query": "1789.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3564} 
+WITH UserActivitySummary AS (
+    -- Summarizes key user activities and badge counts
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.UpVotes,
+        U.DownVotes,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        MAX(COALESCE(P.LastActivityDate, C.CreationDate, U.LastAccessDate)) AS LastActivityDate_User, -- NULL logic, multiple sources for activity
+        AVG(P.Score) FILTER (WHERE P.PostTypeId = 1) AS AvgQuestionScore, -- Conditional aggregation
+        AVG(P.Score) FILTER (WHERE P.PostTypeId = 2) AS AvgAnswerScore,
+        COUNT(DISTINCT V.PostId) AS TotalVotedPosts -- Count distinct posts user has voted on
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN Votes V ON U.Id = V.UserId AND V.VoteTypeId IN (2, 3, 5) -- UpMod, DownMod, Favorite votes
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.UpVotes, U.DownVotes
+),
+PostDetails AS (
+    -- Gathers detailed post information, including derived metrics and correlated subqueries
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.CreationDate AS PostCreationDate,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.FavoriteCount,
+        P.CommentCount,
+        P.OwnerUserId,
+        P.Title,
+        LENGTH(P.Body) AS BodyLength,
+        -- Correlated subquery for robust tag counting using string functions
+        (SELECT COUNT(DISTINCT tag) FROM UNNEST(string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><')) AS tags_arr(tag)) AS TagCount,
+        CASE WHEN P.AcceptedAnswerId IS NOT NULL THEN TRUE ELSE FALSE END AS IsAccepted,
+        P.ClosedDate,
+        -- Calculation for time to first edit in hours, NULL if no edit or first edit is same as creation
+        EXTRACT(EPOCH FROM (COALESCE(MIN_PH.MinEditDate, P.CreationDate) - P.CreationDate)) / 3600 AS TimeToFirstEditHours,
+        -- Correlated subquery to count edits (body, title, tags)
+        (SELECT COUNT(*) FROM PostHistory PH WHERE PH.PostId = P.Id AND PH.PostHistoryTypeId IN (4, 5, 6)) AS PostEditCount,
+        -- Correlated subquery to count user-generated comments (excluding community/anon)
+        (SELECT COUNT(*) FROM Comments C_inner WHERE C_inner.PostId = P.Id AND C_inner.CreationDate > P.CreationDate AND C_inner.UserId IS NOT NULL) AS UserCommentCount,
+        PH_Close.FirstCloseDate,
+        PH_Close.LastCloseDate,
+        PH_Migrated.MigrationCount,
+        PH_Migrated.LastMigrationDate
+    FROM Posts P
+    JOIN PostTypes PT ON P.PostTypeId = PT.Id
+    LEFT JOIN (
+        SELECT
+            PH.PostId,
+            MIN(PH.CreationDate) AS FirstCloseDate,
+            MAX(PH.CreationDate) AS LastCloseDate
+        FROM PostHistory PH
+        WHERE PH.PostHistoryTypeId = 10 -- Post Closed
+        GROUP BY PH.PostId
+    ) AS PH_Close ON P.Id = PH_Close.PostId
+    LEFT JOIN (
+        SELECT
+            PH.PostId,
+            MIN(PH.CreationDate) AS MinEditDate
+        FROM PostHistory PH
+        WHERE PH.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+        GROUP BY PH.PostId
+    ) AS MIN_PH ON P.Id = MIN_PH.PostId
+    LEFT JOIN (
+        SELECT
+            PH.PostId,
+            COUNT(CASE WHEN PH.PostHistoryTypeId IN (17, 35, 36) THEN 1 END) AS MigrationCount,
+            MAX(CASE WHEN PH.PostHistoryTypeId IN (17, 35, 36) THEN PH.CreationDate END) AS LastMigrationDate
+        FROM PostHistory PH
+        WHERE PH.PostHistoryTypeId IN (17, 35, 36) -- Post Migrated / Migrated Away / Migrated Here
+        GROUP BY PH.PostId
+    ) AS PH_Migrated ON P.Id = PH_Migrated.PostId
+    WHERE P.PostTypeId IN (1, 2) -- Focus on Questions and Answers
+),
+UserPostPerformance AS (
+    -- Combines user and post details, applying various window functions
+    SELECT
+        PD.PostId,
+        PD.PostTypeId,
+        PD.PostTypeName,
+        PD.OwnerUserId,
+        PD.PostCreationDate,
+        PD.Score,
+        PD.ViewCount,
+        PD.AnswerCount,
+        PD.FavoriteCount,
+        PD.CommentCount,
+        PD.Title,
+        PD.BodyLength,
+        PD.TagCount,
+        PD.IsAccepted,
+        PD.ClosedDate,
+        PD.TimeToFirstEditHours,
+        PD.PostEditCount,
+        PD.UserCommentCount,
+        PD.MigrationCount,
+        PD.LastMigrationDate,
+        UA.Reputation AS OwnerReputation,
+        UA.QuestionCount AS OwnerQuestionCount,
+        UA.AnswerCount AS OwnerAnswerCount,
+        UA.GoldBadges AS OwnerGoldBadges,
+        UA.LastActivityDate_User,
+        -- Window functions for ranking and rolling averages
+        RANK() OVER (PARTITION BY PD.PostTypeId ORDER BY PD.Score DESC, PD.ViewCount DESC) AS RankByScoreAndViews,
+        NTILE(10) OVER (PARTITION BY PD.PostTypeId ORDER BY PD.CreationDate) AS CreationDateDecile, -- Decile ranking
+        AVG(PD.Score) OVER (PARTITION BY PD.OwnerUserId ORDER BY PD.PostCreationDate ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) AS OwnerRollingAvgScore,
+        LAG(PD.Score, 1, 0) OVER (PARTITION BY PD.OwnerUserId ORDER BY PD.PostCreationDate) AS PreviousPostScore,
+        COUNT(PD.PostId) OVER (PARTITION BY PD.OwnerUserId ORDER BY PD.PostCreationDate) AS OwnerPostCumulativeCount
+    FROM PostDetails PD
+    JOIN UserActivitySummary UA ON PD.OwnerUserId = UA.UserId
+    WHERE PD.OwnerUserId IS NOT NULL -- Exclude posts by deleted users or community user if not explicit
+),
+QuestionAnswerInteractions AS (
+    -- Links questions to their answers and related comments for aggregation
+    SELECT
+        P_Q.Id AS QuestionId,
+        P_Q.Title AS QuestionTitle,
+        P_Q.OwnerUserId AS QuestionOwnerId,
+        P_Q.AcceptedAnswerId,
+        P_A.Id AS AnswerId,
+        P_A.OwnerUserId AS AnswerOwnerId,
+        COUNT(DISTINCT C_Q.Id) AS QuestionCommentCount,
+        COUNT(DISTINCT C_A.Id) AS AnswerCommentCount,
+        SUM(CASE WHEN P_A.Id = P_Q.AcceptedAnswerId THEN 1 ELSE 0 END) AS IsAcceptedAnswer
+    FROM Posts P_Q
+    LEFT JOIN Posts P_A ON P_Q.Id = P_A.ParentId AND P_A.PostTypeId = 2 -- All answers to the question
+    LEFT JOIN Comments C_Q ON P_Q.Id = C_Q.PostId
+    LEFT JOIN Comments C_A ON P_A.Id = C_A.PostId
+    WHERE P_Q.PostTypeId = 1 -- Only questions
+    GROUP BY
+        P_Q.Id, P_Q.Title, P_Q.OwnerUserId, P_Q.AcceptedAnswerId,
+        P_A.Id, P_A.OwnerUserId
+),
+DailyTrendsWithRank AS (
+    -- Calculates daily post metrics and rolling statistics
+    SELECT
+        DATE_TRUNC('day', CreationDate) AS ActivityDay,
+        COUNT(DISTINCT Id) AS DailyPosts,
+        SUM(Score) AS DailyScoreSum,
+        AVG(Score) AS DailyAvgScore,
+        -- More complex window functions for rolling median and growth rate
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY Score) OVER (ORDER BY DATE_TRUNC('day', CreationDate) RANGE BETWEEN INTERVAL '7 DAY' PRECEDING AND CURRENT ROW) AS MedianScore7DayRolling,
+        LAG(COUNT(DISTINCT Id), 1, 0) OVER (ORDER BY DATE_TRUNC('day', CreationDate)) AS PreviousDayPosts,
+        -- Daily post growth rate with NULL handling
+        (COUNT(DISTINCT Id) - LAG(COUNT(DISTINCT Id), 1, 0) OVER (ORDER BY DATE_TRUNC('day', CreationDate))) / CAST(NULLIF(LAG(COUNT(DISTINCT Id), 1, 0) OVER (ORDER BY DATE_TRUNC('day', CreationDate)), 0) AS NUMERIC) * 100 AS DailyPostGrowthRatePercent
+    FROM Posts
+    WHERE PostTypeId IN (1, 2) -- Only questions and answers
+    GROUP BY DATE_TRUNC('day', CreationDate)
+)
+-- Main final query that joins all CTEs and applies complex logic
+SELECT
+    UPP.PostId,
+    UPP.PostTypeName,
+    UPP.Title,
+    UPP.PostCreationDate,
+    UPP.Score,
+    UPP.ViewCount,
+    UPP.CommentCount,
+    UPP.FavoriteCount,
+    UPP.IsAccepted,
+    UPP.ClosedDate,
+    UPP.TagCount,
+    UPP.PostEditCount,
+    UPP.UserCommentCount,
+    UPP.OwnerUserId,
+    UPP.OwnerReputation,
+    UPP.OwnerGoldBadges,
+    UPP.RankByScoreAndViews,
+    UPP.CreationDateDecile,
+    UPP.OwnerRollingAvgScore,
+    UPP.PreviousPostScore,
+    UPP.OwnerPostCumulativeCount,
+    UA.TotalPosts AS OwnerTotalPosts,
+    UA.TotalComments AS OwnerTotalComments,
+    DT.DailyPosts,
+    DT.DailyAvgScore,
+    DT.MedianScore7DayRolling,
+    DT.DailyPostGrowthRatePercent,
+    COALESCE(QA.QuestionCommentAggCount, 0) AS RelatedQuestionComments, -- NULL logic using COALESCE
+    COALESCE(QA.AnswerCommentAggCount, 0) AS RelatedAnswerComments,
+    UPP.MigrationCount,
+    UPP.LastMigrationDate,
+    -- Complicated expression: Score-to-View Ratio adjusted by owner reputation, edit effort, and comment engagement
+    CAST(UPP.Score AS NUMERIC) / NULLIF(UPP.ViewCount, 0) * (1 + UPP.OwnerReputation / 100000.0) * (1 + UPP.PostEditCount / 10.0) * (1 + UPP.UserCommentCount / 5.0) AS WeightedEngagementRatio,
+    -- String expression: Truncated Title with indicator if closed or migrated
+    LEFT(UPP.Title, 50) || '...' ||
+        CASE
+            WHEN UPP.ClosedDate IS NOT NULL THEN ' [CLOSED]'
+            WHEN UPP.MigrationCount > 0 THEN ' [MIGRATED]'
+            ELSE ''
+        END AS DisplayTitleSummary,
+    -- Complex Predicate Check with correlated subquery for Post Impact Category
+    CASE
+        WHEN UPP.PostTypeId = 1 AND UPP.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1 AND CreationDate >= '2020-01-01') -- Correlated subquery for recent average score
+             AND UPP.IsAccepted
+             AND UPP.PostEditCount > 2
+             AND UPP.OwnerGoldBadges > 0
+             AND UPP.FavoriteCount > (SELECT PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY FavoriteCount) FROM Posts WHERE PostTypeId = 1) -- Window function in subquery
+        THEN 'HighImpactQuestion'
+        WHEN UPP.PostTypeId = 2 AND UPP.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 2 AND CreationDate >= '2020-01-01')
+             AND UPP.OwnerReputation > 50000
+             AND UPP.UserCommentCount >= 3
+        THEN 'ExpertAnswer'
+        WHEN UPP.ClosedDate IS NOT NULL AND UPP.Score < 0 AND UPP.MigrationCount = 0 THEN 'ProblematicPost'
+        ELSE 'Standard'
+    END AS PostImpactCategory,
+    -- Example of using string pattern matching in WHERE clause (moved to final WHERE)
+    UPP.Title LIKE '%SQL%' OR UPP.Title LIKE '%performance%' AS IsRelevantToBenchmarking
+FROM UserPostPerformance UPP
+LEFT JOIN UserActivitySummary UA ON UPP.OwnerUserId = UA.UserId
+LEFT JOIN DailyTrendsWithRank DT ON DATE_TRUNC('day', UPP.PostCreationDate) = DT.ActivityDay
+LEFT JOIN (
+    -- Aggregates comment counts from QuestionAnswerInteractions using UNION ALL
+    SELECT
+        QuestionId AS RelevantPostId,
+        SUM(QuestionCommentCount) AS QuestionCommentAggCount,
+        SUM(AnswerCommentCount) AS AnswerCommentAggCount
+    FROM QuestionAnswerInteractions
+    GROUP BY QuestionId
+    UNION ALL
+    SELECT
+        AnswerId AS RelevantPostId,
+        SUM(QuestionCommentCount) AS QuestionCommentAggCount,
+        SUM(AnswerCommentCount) AS AnswerCommentAggCount
+    FROM QuestionAnswerInteractions
+    WHERE AnswerId IS NOT NULL -- Exclude rows where AnswerId is NULL (i.e., question without answers)
+    GROUP BY AnswerId
+) QA ON UPP.PostId = QA.RelevantPostId
+WHERE
+    UPP.OwnerReputation > 1000 -- Filter for more established users
+    AND UPP.PostCreationDate >= '2020-01-01' -- Recent data
+    AND UPP.BodyLength > 100 -- Meaningful content
+    AND (UPP.Title LIKE '%SQL%' OR UPP.Title LIKE '%performance%' OR UPP.Title LIKE '%optimization%' OR UPP.PostTypeName = 'Answer') -- Complicated predicate/string matching
+    AND UPP.PostId NOT IN (SELECT PostId FROM PostHistory WHERE PostHistoryTypeId = 12 AND CreationDate >= UPP.PostCreationDate) -- Exclude deleted posts based on history
+ORDER BY
+    WeightedEngagementRatio DESC, UPP.PostCreationDate DESC, UPP.Score DESC
+LIMIT 1000;

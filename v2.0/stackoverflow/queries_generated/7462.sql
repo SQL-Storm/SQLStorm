@@ -1,0 +1,249 @@
+-- {"query": "7462.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 3612} 
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.LastActivityDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+        AVG(p.Score) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate ROWS BETWEEN 10 PRECEDING AND CURRENT ROW) as avg_score_10_posts,
+        NTILE(4) OVER (ORDER BY p.Score) as score_quartile
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) AND p.CreationDate >= '2010-01-01'
+),
+UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) as post_count,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) as question_count,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) as answer_count,
+        SUM(p.Score) as total_score,
+        AVG(p.Score) as avg_score,
+        MAX(p.CreationDate) as last_post_date,
+        STRING_AGG(DISTINCT p.Tags, '; ') as all_tags,
+        COUNT(DISTINCT b.Id) as badge_count
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= '2008-01-01'
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.LastAccessDate
+),
+QuestionStats AS (
+    SELECT 
+        p.Id as QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.LastActivityDate,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        CASE 
+            WHEN p.AnswerCount > 0 THEN 
+                (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = p.Id AND a.PostTypeId = 2 AND a.Score > 0)
+            ELSE 0 
+        END as positive_answers,
+        CASE 
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 
+                (SELECT Score FROM Posts WHERE Id = p.AcceptedAnswerId)
+            ELSE NULL 
+        END as accepted_answer_score,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) as comment_count,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) as upvotes,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) as downvotes,
+        (SELECT AVG(v.BountyAmount) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 8) as avg_bounty
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.CreationDate >= '2010-01-01'
+),
+AnswerStats AS (
+    SELECT 
+        p.Id as AnswerId,
+        p.ParentId,
+        p.Score,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.LastActivityDate,
+        p.Body,
+        CASE 
+            WHEN p.OwnerUserId IS NOT NULL THEN 
+                (SELECT rs.Reputation FROM Users rs WHERE rs.Id = p.OwnerUserId)
+            ELSE NULL 
+        END as owner_reputation,
+        CASE 
+            WHEN p.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1 AND ParentId = p.ParentId) THEN 
+                'Above avg'
+            WHEN p.Score < (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1 AND ParentId = p.ParentId) THEN 
+                'Below avg'
+            ELSE 'Avg' 
+        END as score_vs_question_avg,
+        CASE 
+            WHEN (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) > 10 THEN 
+                'Popular'
+            WHEN (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) BETWEEN 1 AND 10 THEN 
+                'Moderately Popular'
+            ELSE 
+                'Not Popular' 
+        END as popularity_level
+    FROM Posts p
+    WHERE p.PostTypeId = 2 AND p.CreationDate >= '2010-01-01'
+)
+SELECT 
+    'Performance Test Query' as test_name,
+    COUNT(DISTINCT rs.Id) as total_questions,
+    COUNT(DISTINCT rs.OwnerUserId) as active_users,
+    AVG(rs.Score) as avg_question_score,
+    MAX(rs.ViewCount) as max_views,
+    AVG(rs.AnswerCount) as avg_answers,
+    (SELECT COUNT(*) FROM Posts ps WHERE ps.PostTypeId = 2 AND ps.CreationDate >= '2010-01-01') as total_answers,
+    (SELECT COUNT(*) FROM Users us WHERE us.CreationDate >= '2008-01-01') as total_users,
+    COUNT(DISTINCT CASE WHEN rs.Score > 100 THEN rs.OwnerUserId ELSE NULL END) as high_score_users,
+    COUNT(DISTINCT CASE WHEN rs.Score < 10 THEN rs.OwnerUserId ELSE NULL END) as low_score_users,
+    COUNT(DISTINCT CASE WHEN rs.CreationDate > '2020-01-01' THEN rs.OwnerUserId ELSE NULL END) as recent_users,
+    (SELECT AVG(avg_score_10_posts) FROM RankedPosts) as avg_score_window,
+    COUNT(DISTINCT CASE WHEN rs.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN rs.Id ELSE NULL END) as above_avg_questions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND AcceptedAnswerId IS NOT NULL) as questions_with_accepted_answers,
+    MAX(CONCAT(LEFT(rs.Title, 30), '...')) as sample_title,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND AnswerCount = 0) as unanswered_questions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND CommentCount > 50) as highly_commented_questions,
+    (SELECT MAX(total_score) FROM UserStats) as highest_user_score,
+    (SELECT AVG(total_score) FROM UserStats) as avg_user_score,
+    COUNT(DISTINCT CASE WHEN rs.CreationDate >= '2015-01-01' OR rs.CreationDate <= '2015-12-31' THEN rs.Id ELSE NULL END) as year_2015_questions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags IS NOT NULL AND Tags LIKE '%android%') as android_questions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND Tags IS NOT NULL AND Tags LIKE '%java%') as java_questions,
+    COUNT(DISTINCT rs.OwnerUserId) as distinct_owners,
+    COUNT(DISTINCT CASE WHEN rs.Tags LIKE '%mysql%' THEN rs.Id ELSE NULL END) as mysql_questions,
+    COUNT(DISTINCT CASE WHEN rs.Tags LIKE '%python%' THEN rs.Id ELSE NULL END) as python_questions,
+    COUNT(DISTINCT CASE WHEN rs.Tags LIKE '%javascript%' THEN rs.Id ELSE NULL END) as javascript_questions,
+    COUNT(DISTINCT CASE WHEN rs.Tags LIKE '%c#' THEN rs.Id ELSE NULL END) as csharp_questions,
+    (SELECT COUNT(DISTINCT UserId) FROM Votes WHERE VoteTypeId = 2) as total_upvotes,
+    (SELECT COUNT(DISTINCT UserId) FROM Votes WHERE VoteTypeId = 3) as total_downvotes,
+    (SELECT COUNT(DISTINCT PostId) FROM Comments WHERE CreationDate >= '2010-01-01') as comments_2010_plus,
+    (SELECT STRING_AGG(DISTINCT DisplayName, ', ') FROM Users WHERE Reputation > 10000 AND CreationDate >= '2008-01-01') as high_reputation_users,
+    COUNT(DISTINCT CASE WHEN rs.LastActivityDate >= '2020-01-01' THEN rs.OwnerUserId ELSE NULL END) as recently_active_users,
+    (SELECT COUNT(DISTINCT PostId) FROM Votes WHERE VoteTypeId = 1) as accepted_answers,
+    ROUND(AVG(CAST(rs.AnswerCount AS FLOAT) / NULLIF(CAST(rs.ViewCount AS FLOAT), 0)) * 100, 2) as answer_to_view_ratio_percent,
+    (SELECT COUNT(DISTINCT TagName) FROM Tags WHERE Count > 1000) as popular_tags_count,
+    (SELECT COUNT(*) FROM Badges WHERE Date >= '2010-01-01') as badges_2010_plus,
+    (SELECT COUNT(*) FROM Posts WHERE ContentLicense = 'CC BY-SA 3.0') as cc_by_sa_posts,
+    (SELECT AVG(Reputation) FROM Users WHERE CreationDate >= '2008-01-01') as avg_user_reputation,
+    (SELECT COUNT(DISTINCT PostId) FROM PostHistory WHERE PostHistoryTypeId IN (1, 4, 5) AND CreationDate >= '2010-01-01') as edited_posts,
+    (SELECT COUNT(*) FROM VoteTypes) as total_vote_types,
+    (SELECT COUNT(DISTINCT PostId) FROM PostHistory WHERE PostHistoryTypeId IN (10, 11, 12, 13) AND CreationDate >= '2010-01-01') as post_status_changes
+FROM RankedPosts rs
+INNER JOIN UserStats us ON rs.OwnerUserId = us.UserId
+LEFT JOIN QuestionStats qs ON rs.Id = qs.QuestionId
+LEFT JOIN AnswerStats ans ON rs.Id = ans.ParentId
+WHERE rs.OwnerUserId IS NOT NULL
+  AND rs.Score IS NOT NULL
+  AND rs.ViewCount IS NOT NULL
+  AND rs.AnswerCount IS NOT NULL
+  AND rs.LastActivityDate IS NOT NULL
+  AND (
+    rs.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1)
+    OR rs.Score < (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1)
+    OR rs.ViewCount > (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = 1)
+    OR rs.AnswerCount > (SELECT AVG(AnswerCount) FROM Posts WHERE PostTypeId = 1)
+  )
+  AND (CASE 
+        WHEN rs.OwnerUserId IS NOT NULL THEN 
+          (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = rs.OwnerUserId AND p.PostTypeId = 1) > 10
+        ELSE FALSE 
+       END)
+  AND NOT (
+    rs.Tags IS NULL
+    OR (rs.Tags LIKE '%[%' AND rs.Tags LIKE '%]%' AND rs.Tags LIKE '%<>%')
+    OR (rs.Tags NOT LIKE '%<%' OR rs.Tags NOT LIKE '%>%')
+  )
+  AND EXISTS (
+    SELECT 1 FROM Badges b 
+    WHERE b.UserId = rs.OwnerUserId 
+    AND b.Date >= '2010-01-01' 
+    AND b.Name IN ('Excavator', 'Fanatic', 'Guru')
+  )
+GROUP BY rs.PostTypeId
+HAVING COUNT(DISTINCT rs.Id) > 1000
+   AND COUNT(DISTINCT rs.OwnerUserId) > 500
+UNION ALL
+SELECT 
+    'Cross-Join Test' as test_name,
+    COUNT(*) as total_questions,
+    COUNT(DISTINCT u.Id) as active_users,
+    AVG(p.Score) as avg_question_score,
+    MAX(p.ViewCount) as max_views,
+    AVG(p.AnswerCount) as avg_answers,
+    COUNT(*) as total_answers,
+    COUNT(DISTINCT u.Id) as total_users,
+    COUNT(DISTINCT CASE WHEN p.Score > 1000 THEN u.Id ELSE NULL END) as high_score_users,
+    COUNT(DISTINCT CASE WHEN p.Score < 0 THEN u.Id ELSE NULL END) as low_score_users,
+    COUNT(DISTINCT CASE WHEN p.CreationDate > '2020-01-01' THEN u.Id ELSE NULL END) as recent_users,
+    NULL as avg_score_window,
+    COUNT(*) as above_avg_questions,
+    COUNT(DISTINCT p.AcceptedAnswerId) as questions_with_accepted_answers,
+    MAX(LEFT(p.Title, 30)) as sample_title,
+    COUNT(DISTINCT CASE WHEN p.AnswerCount = 0 THEN p.Id ELSE NULL END) as unanswered_questions,
+    COUNT(DISTINCT CASE WHEN p.CommentCount > 100 THEN p.Id ELSE NULL END) as highly_commented_questions,
+    MAX(us.total_score) as highest_user_score,
+    AVG(us.total_score) as avg_user_score,
+    COUNT(*) as year_2015_questions,
+    COUNT(DISTINCT CASE WHEN p.Tags LIKE '%android%' THEN p.Id ELSE NULL END) as android_questions,
+    COUNT(DISTINCT CASE WHEN p.Tags LIKE '%java%' THEN p.Id ELSE NULL END) as java_questions,
+    COUNT(DISTINCT u.Id) as distinct_owners,
+    COUNT(DISTINCT CASE WHEN p.Tags LIKE '%mysql%' THEN p.Id ELSE NULL END) as mysql_questions,
+    COUNT(DISTINCT CASE WHEN p.Tags LIKE '%python%' THEN p.Id ELSE NULL END) as python_questions,
+    COUNT(DISTINCT CASE WHEN p.Tags LIKE '%javascript%' THEN p.Id ELSE NULL END) as javascript_questions,
+    COUNT(DISTINCT CASE WHEN p.Tags LIKE '%c#' THEN p.Id ELSE NULL END) as csharp_questions,
+    COUNT(DISTINCT v.UserId) as total_upvotes,
+    COUNT(DISTINCT v.UserId) as total_downvotes,
+    COUNT(DISTINCT c.PostId) as comments_2010_plus,
+    STRING_AGG(DISTINCT u.DisplayName, ', ') as high_reputation_users,
+    COUNT(DISTINCT CASE WHEN p.LastActivityDate >= '2020-01-01' THEN u.Id ELSE NULL END) as recently_active_users,
+    COUNT(DISTINCT v.PostId) as accepted_answers,
+    ROUND(AVG(CAST(p.AnswerCount AS FLOAT) / NULLIF(CAST(p.ViewCount AS FLOAT), 0)) * 100, 2) as answer_to_view_ratio_percent,
+    COUNT(DISTINCT t.TagName) as popular_tags_count,
+    COUNT(DISTINCT b.Id) as badges_2010_plus,
+    COUNT(DISTINCT CASE WHEN p.ContentLicense = 'CC BY-SA 3.0' THEN p.Id ELSE NULL END) as cc_by_sa_posts,
+    AVG(u.Reputation) as avg_user_reputation,
+    COUNT(DISTINCT ph.PostId) as edited_posts,
+    COUNT(DISTINCT vt.Id) as total_vote_types,
+    COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN ph.Id ELSE NULL END) as post_status_changes
+FROM Posts p
+CROSS JOIN Users u
+LEFT JOIN UserStats us ON u.Id = us.UserId
+LEFT JOIN Questions q ON p.Id = q.QuestionId
+LEFT JOIN Answers a ON p.Id = a.AnswerId
+LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (2, 3)
+LEFT JOIN Comments c ON p.Id = c.PostId AND c.CreationDate >= '2010-01-01'
+LEFT JOIN Tags t ON p.Tags LIKE '%' || t.TagName || '%'
+LEFT JOIN Badges b ON u.Id = b.UserId AND b.Date >= '2010-01-01'
+LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND ph.CreationDate >= '2010-01-01'
+LEFT JOIN VoteTypes vt ON vt.Id = 1
+WHERE p.PostTypeId = 1
+  AND p.CreationDate >= '2010-01-01'
+  AND u.CreationDate >= '2008-01-01'
+  AND (p.Score > 0 OR p.Score IS NULL)
+  AND (p.ViewCount > 0 OR p.ViewCount IS NULL)
+  AND u.Reputation > 0
+  AND EXISTS (
+    SELECT 1 FROM Posts p2 
+    WHERE p.OwnerUserId = p2.OwnerUserId 
+    AND p2.PostTypeId = 1 
+    AND p2.CreationDate >= '2010-01-01'
+  )
+GROUP BY p.PostTypeId
+HAVING COUNT(*) > 100000
+ORDER BY test_name;

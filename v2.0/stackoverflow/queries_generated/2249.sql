@@ -1,0 +1,160 @@
+-- {"query": "2249.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1447} 
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsCount,
+        count(distinct p2.Id) filter (where p2.PostTypeId = 2) as AnswersCount,
+        count(distinct b.Id) as BadgesCount,
+        sum(coalesce(vt1.UpVotes,0)) as TotalUpVotes,
+        sum(coalesce(vt2.DownVotes,0)) as TotalDownVotes
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 1
+    left join Posts p2 on p2.OwnerUserId = u.Id and p2.PostTypeId = 2
+    left join Badges b on b.UserId = u.Id
+    left join (
+        select vt.PostId, sum(case when vt.VoteTypeId = 2 then 1 else 0 end) as UpVotes
+        from Votes vt
+        group by vt.PostId
+    ) vt1 on vt1.PostId = p.Id
+    left join (
+        select vt.PostId, sum(case when vt.VoteTypeId = 3 then 1 else 0 end) as DownVotes
+        from Votes vt
+        group by vt.PostId
+    ) vt2 on vt2.PostId = p.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+TopBadgeHolders as (
+    select
+        UserId,
+        count(*) as BadgeCount,
+        max(Date) as MostRecentBadgeDate
+    from Badges
+    group by UserId
+    having count(*) > 50
+),
+RankedPosts as (
+    select
+        p.Id,
+        p.Title,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc nulls last) as PostRank,
+        dense_rank() over (order by p.Score desc) as GlobalScoreRank,
+        sum(p.Score) over (partition by p.OwnerUserId) as TotalScoreByUser
+    from Posts p
+    where p.PostTypeId in (1,2)
+),
+PostsWithCommentsAndVotes as (
+    select
+        rp.*,
+        coalesce(c.CommentCount,0) as CommentCount,
+        coalesce(v.UpVotes,0) as UpVotes,
+        coalesce(v.DownVotes,0) as DownVotes,
+        case when rp.Score < 0 then 1 else 0 end as NegativeScoreFlag
+    from RankedPosts rp
+    left join (
+        select PostId, count(*) as CommentCount from Comments group by PostId
+    ) c on c.PostId = rp.Id
+    left join (
+        select 
+            PostId,
+            sum(case when VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+            sum(case when VoteTypeId = 3 then 1 else 0 end) as DownVotes
+        from Votes
+        group by PostId
+    ) v on v.PostId = rp.Id
+),
+DuplicateLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate as LinkCreationDate,
+        lt.Name as LinkTypeName
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    where pl.LinkTypeId = 3 -- duplicates
+),
+CloseReasonsCount as (
+    select
+        ph.PostId,
+        count(*) filter (where ph.PostHistoryTypeId = 10) as CloseVotes,
+        count(distinct ph.Comment) filter (where ph.PostHistoryTypeId = 10) as DistinctCloseReasons
+    from PostHistory ph
+    group by ph.PostId
+),
+QuestionsWithDetails as (
+    select
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.AnswerCount,
+        p.Score,
+        crc.CloseVotes,
+        crc.DistinctCloseReasons,
+        dups.RelatedPostId as DuplicateOfPostId,
+        duplposts.Title as DuplicateOfPostTitle,
+        coalesce(u.DisplayName, p.OwnerDisplayName) as OwnerDisplayName,
+        p.CreationDate,
+        p.ViewCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc) as UserQuestionRank
+    from Posts p
+    left join CloseReasonsCount crc on crc.PostId = p.Id
+    left join DuplicateLinks dups on dups.PostId = p.Id
+    left join Posts duplposts on duplposts.Id = dups.RelatedPostId
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId = 1
+)
+select
+    r.UserId,
+    r.DisplayName,
+    r.Reputation,
+    r.QuestionsCount,
+    r.AnswersCount,
+    r.BadgesCount,
+    r.TotalUpVotes,
+    r.TotalDownVotes,
+    pwc.Id as TopQuestionId,
+    coalesce(pwc.Title, '[No Questions]') as TopQuestionTitle,
+    pwc.Score as TopQuestionScore,
+    pwc.ViewCount as TopQuestionViews,
+    pwc.FavoriteCount,
+    pwc.CloseVotes,
+    pwc.DistinctCloseReasons,
+    pwc.DuplicateOfPostId,
+    pwc.DuplicateOfPostTitle,
+    case 
+      when pwc.ClosedDate is not null then 'Closed' 
+      else 'Open' 
+    end as TopQuestionStatus,
+    (
+        select avg(sub.Score::float)
+        from Posts sub
+        where sub.OwnerUserId = r.UserId and sub.PostTypeId = 2
+    ) as AvgAnswerScore,
+    (
+        select count(*)
+        from PostsAnswers pa
+        where pa.OwnerUserId = r.UserId and pa.Score > pwc.Score
+    ) as AnswersBetterThanTopQuestion,
+    concat_ws(' | ',
+        'Reputation: ' || r.Reputation,
+        'Q_Count: ' || r.QuestionsCount,
+        'A_Count: ' || r.AnswersCount,
+        'Badges: ' || r.BadgesCount
+    ) as Summary,
+    case when r.Reputation > 10000 then 'HighRep' else 'NormalRep' end as ReputationBracket
+from RecursiveUserActivity r
+left join QuestionsWithDetails pwc on pwc.OwnerUserId = r.UserId and pwc.UserQuestionRank = 1
+where r.Reputation > 1000
+order by r.Reputation desc, pwc.Score desc
+limit 100;

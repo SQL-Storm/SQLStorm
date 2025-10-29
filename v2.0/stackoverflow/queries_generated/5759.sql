@@ -1,0 +1,126 @@
+-- {"query": "5759.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 898} 
+WITH recent_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.PostTypeId,
+    jsonb_build_object(
+      'Owner', u.DisplayName,
+      'Reputation', u.Reputation,
+      'CreationDate', u.CreationDate
+    ) AS OwnerInfo,
+    ROW_NUMBER() OVER (
+      PARTITION BY p.OwnerUserId
+      ORDER BY p.LastActivityDate DESC
+    ) AS rn_per_owner
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+  WHERE p.PostTypeId = 1 -- Questions
+    AND p.ClosedDate IS NULL
+    AND p.LastActivityDate > NOW() - INTERVAL '180 days'
+),
+popular_tags AS (
+  SELECT
+    unnest(string_to_array(substr(p.Tags, 2, length(p.Tags) - 2), '><')) AS tag,
+    COUNT(*) AS tag_count
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+  GROUP BY 1
+),
+top_users AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(p.Id) AS question_count,
+    AVG(p.Score) AS avg_score,
+    SUM(p.ViewCount) AS total_views
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+  ORDER BY total_views DESC
+  LIMIT 50
+),
+correlated_activity AS (
+  SELECT
+    q.PostId,
+    q.Title,
+    q.CreationDate,
+    q.LastActivityDate,
+    q.OwnerUserId,
+    q.OwnerInfo,
+    q.TagCount,
+    CASE
+      WHEN q.Score >= 0 THEN 1
+      ELSE 0
+    END AS favorability
+  FROM recent_questions q
+  LEFT JOIN (
+    SELECT
+      unnest(string_to_array(substr(p.Tags, 2, length(p.Tags) - 2), '><')) AS tag,
+      COUNT(*) AS cnt
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+    GROUP BY 1
+  ) t ON true
+  LEFT JOIN popular_tags pt ON pt.tag = q.tag
+)
+SELECT
+  rq.PostId,
+  rq.Title,
+  rq.CreationDate,
+  rq.LastActivityDate,
+  rq.OwnerUserId,
+  rq.OwnerInfo,
+  rq.TagCount,
+  cu.TotalTopComments,
+  fu.avg_score,
+  fu.total_views,
+  jsonb_agg(DISTINCT jsonb_build_object(
+    'CommentId', c.Id,
+    'Comment', c.Text,
+    'CommentUser', c.UserDisplayName,
+    'Created', c.CreationDate
+  )) AS RecentComments
+FROM correlated_activity rq
+LEFT JOIN (
+  SELECT
+    p.OwnerUserId,
+    COUNT(*) AS TotalTopComments
+  FROM Posts p
+  LEFT JOIN Comments c ON c.PostId = p.Id
+  WHERE c.CreationDate > NOW() - INTERVAL '30 days'
+  GROUP BY p.OwnerUserId
+) cu ON cu.OwnerUserId = rq.OwnerUserId
+LEFT JOIN (
+  SELECT
+    u.Id AS UserId,
+    AVG(p.Score) AS avg_score,
+    SUM(p.ViewCount) AS total_views
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId = 1
+  GROUP BY u.Id
+) fu ON fu.UserId = rq.OwnerUserId
+LEFT JOIN Posts p2 ON p2.Id = rq.PostId
+LEFT JOIN Comments c ON c.PostId = rq.PostId
+GROUP BY
+  rq.PostId,
+  rq.Title,
+  rq.CreationDate,
+  rq.LastActivityDate,
+  rq.OwnerUserId,
+  rq.OwnerInfo,
+  rq.TagCount,
+  cu.TotalTopComments,
+  fu.avg_score,
+  fu.total_views
+ORDER BY rq.LastActivityDate DESC
+LIMIT 100;

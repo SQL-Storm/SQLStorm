@@ -1,0 +1,146 @@
+WITH
+TagQuestions AS (
+    SELECT
+        t.Id               AS TagId,
+        t.TagName,
+        q.Id               AS QuestionId,
+        q.OwnerUserId      AS QuestionOwnerId,
+        q.CreationDate     AS QuestionCreated,
+        q.Score            AS QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        q.FavoriteCount,
+        q.ClosedDate,
+        COALESCE(q.LastActivityDate, q.CreationDate) AS LastActivity,
+        ROW_NUMBER() OVER (PARTITION BY t.Id ORDER BY COALESCE(q.LastActivityDate, q.CreationDate) DESC) AS rn_question
+    FROM Tags t
+    LEFT JOIN Posts q
+        ON q.PostTypeId = 1
+       AND q.Tags LIKE '%' || '<' || t.TagName || '>'
+),
+TagAnswers AS (
+    SELECT
+        tq.TagId,
+        tq.TagName,
+        a.Id                     AS AnswerId,
+        a.OwnerUserId            AS AnswerOwnerId,
+        a.CreationDate           AS AnswerCreated,
+        a.Score                  AS AnswerScore,
+        a.LastActivityDate       AS AnswerLastActivity,
+        (CASE WHEN a.AcceptedAnswerId IS NOT NULL AND a.ParentId = tq.QuestionId THEN TRUE ELSE FALSE END) AS IsAccepted,
+        ROW_NUMBER() OVER (PARTITION BY tq.TagId, a.OwnerUserId ORDER BY a.CreationDate DESC) AS rn_answer
+    FROM TagQuestions tq
+    JOIN Posts a
+        ON a.PostTypeId = 2
+       AND a.ParentId = tq.QuestionId
+),
+UserTagStats AS (
+    SELECT
+        ta.TagId,
+        ta.TagName,
+        ta.AnswerOwnerId               AS UserId,
+        COUNT(*)                       AS AnswersGiven,
+        SUM(ta.AnswerScore)            AS TotalAnswerScore,
+        AVG(ta.AnswerScore)            AS AvgAnswerScore,
+        MAX(CASE WHEN ta.IsAccepted THEN 1 ELSE 0 END) AS HasAccepted,
+        MIN(ta.AnswerCreated)          AS FirstAnswerDate,
+        MAX(ta.AnswerCreated)          AS LastAnswerDate
+    FROM TagAnswers ta
+    GROUP BY ta.TagId, ta.TagName, ta.AnswerOwnerId
+),
+UserInfo AS (
+    SELECT
+        u.Id                AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate      AS UserCreated,
+        COALESCE(SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END),0) AS GoldBadges,
+        COALESCE(SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END),0) AS SilverBadges,
+        COALESCE(SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END),0) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+TagUserRank AS (
+    SELECT
+        uts.TagId,
+        uts.TagName,
+        ui.UserId,
+        ui.DisplayName,
+        ui.Reputation,
+        ui.GoldBadges,
+        ui.SilverBadges,
+        ui.BronzeBadges,
+        uts.AnswersGiven,
+        uts.TotalAnswerScore,
+        uts.AvgAnswerScore,
+        uts.HasAccepted,
+        DENSE_RANK() OVER (PARTITION BY uts.TagId ORDER BY uts.TotalAnswerScore DESC, ui.Reputation DESC) AS RankInTag
+    FROM UserTagStats uts
+    JOIN UserInfo ui ON ui.UserId = uts.UserId
+),
+TagVoteActivity AS (
+    SELECT
+        tq.TagId,
+        tq.TagName,
+        v.VoteTypeId,
+        COUNT(*) AS VoteCount,
+        MAX(v.CreationDate) AS LastVoteDate
+    FROM TagQuestions tq
+    JOIN Votes v ON v.PostId = tq.QuestionId
+    WHERE v.VoteTypeId IN (2,3)
+    GROUP BY tq.TagId, tq.TagName, v.VoteTypeId
+),
+TagAggregates AS (
+    SELECT
+        t.TagId,
+        t.TagName,
+        COUNT(t.QuestionId)               AS QuestionCount,
+        SUM(t.ViewCount)                  AS TotalViews,
+        AVG(t.QuestionScore)              AS AvgQuestionScore,
+        MAX(t.LastActivity)               AS MostRecentActivity,
+        CAST(NULL AS INTEGER)             AS VoteTypeId,
+        CAST(NULL AS BIGINT)              AS VoteCount,
+        CAST(NULL AS TIMESTAMP)           AS LastVoteDate
+    FROM TagQuestions t
+    GROUP BY t.TagId, t.TagName
+
+    UNION ALL
+
+    SELECT
+        v.TagId,
+        v.TagName,
+        CAST(NULL AS BIGINT)             AS QuestionCount,
+        CAST(NULL AS BIGINT)             AS TotalViews,
+        CAST(NULL AS DOUBLE PRECISION)   AS AvgQuestionScore,
+        CAST(NULL AS TIMESTAMP)          AS MostRecentActivity,
+        v.VoteTypeId,
+        v.VoteCount,
+        v.LastVoteDate
+    FROM TagVoteActivity v
+)
+SELECT
+    ta.TagId,
+    ta.TagName,
+    COALESCE(ta.QuestionCount,0)          AS QuestionsInTag,
+    COALESCE(ta.TotalViews,0)             AS ViewsInTag,
+    CAST(ROUND(COALESCE(ta.AvgQuestionScore,0)::numeric, 2) AS double precision) AS AvgQuestionScore,
+    ta.MostRecentActivity,
+    COALESCE(vu.RankInTag,0)               AS TopUserRank,
+    COALESCE(vu.DisplayName,'<no-user>')   AS TopUserDisplayName,
+    COALESCE(vu.Reputation,0)              AS TopUserReputation,
+    COALESCE(vu.AnswersGiven,0)            AS TopUserAnswersGiven,
+    COALESCE(vu.TotalAnswerScore,0)        AS TopUserAnswerScore,
+    COALESCE(vu.GoldBadges,0)              AS TopUserGoldBadges,
+    COALESCE(vu.SilverBadges,0)            AS TopUserSilverBadges,
+    COALESCE(vu.BronzeBadges,0)            AS TopUserBronzeBadges,
+    COALESCE(vu.HasAccepted,0)             AS TopUserHasAcceptedAnswer,
+    COALESCE(ta.VoteTypeId,0)              AS VoteTypeId,
+    COALESCE(ta.VoteCount,0)               AS VoteCount,
+    ta.LastVoteDate
+FROM TagAggregates ta
+LEFT JOIN TagUserRank vu
+    ON vu.TagId = ta.TagId
+   AND vu.RankInTag = 1
+ORDER BY COALESCE(ta.QuestionCount,0) DESC,
+         ta.TagName;

@@ -1,0 +1,156 @@
+with UserActivityStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        coalesce(sum(p.Score),0) as TotalPostScore,
+        count(distinct c.Id) as CommentCount,
+        coalesce(sum(vt.UpVotesCount),0) as TotalUpVotes,
+        coalesce(sum(vt.DownVotesCount),0) as TotalDownVotes,
+        max(b.BadgeClassRank) as HighestBadgeClass,
+        rank() over (order by coalesce(sum(p.Score),0) desc) as ScoreRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join (
+        select
+            v.UserId,
+            sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotesCount,
+            sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotesCount
+        from Votes v
+        inner join VoteTypes vt on vt.Id = v.VoteTypeId
+        group by v.UserId
+    ) vt on vt.UserId = u.Id
+    left join (
+        select
+            UserId,
+            min(Class) as BadgeClassRank
+        from Badges
+        group by UserId
+    ) b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+TopPostsPerUser as (
+    select
+        p.OwnerUserId,
+        p.Id as TopPostId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        substring(p.Title from 1 for 60) as ShortTitle,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc) as RankByScore
+    from Posts p
+    where p.OwnerUserId is not null and p.PostTypeId in (1,2)
+),
+QuestionsWithAnswersCTE as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionDate,
+        q.ViewCount,
+        q.Score as QuestionScore,
+        count(a.Id) as AnswerCount,
+        coalesce(avg(a.Score),0) as AvgAnswerScore,
+        max(a.Score) as MaxAnswerScore,
+        count(distinct ph.Id) filter (
+            where ph.PostHistoryTypeId = 10 and ph.Comment is not null
+        ) as CloseVotesCount
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join PostHistory ph on ph.PostId = q.Id
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.CreationDate, q.ViewCount, q.Score
+),
+DuplicateLinksCTE as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        count(*) over (partition by pl.PostId) as DuplicateCount
+    from PostLinks pl
+    inner join LinkTypes lt on lt.Id = pl.LinkTypeId and lt.Name = 'Duplicate'
+),
+RankedQuestions as (
+    select
+        qwc.*,
+        row_number() over (partition by extract(year from qwc.QuestionDate) order by qwc.QuestionScore desc, qwc.ViewCount desc) as YearlyTopRank
+    from QuestionsWithAnswersCTE qwc
+)
+select
+    uas.UserId,
+    uas.DisplayName,
+    uas.QuestionCount,
+    uas.AnswerCount,
+    uas.TotalPostScore,
+    uas.CommentCount,
+    uas.TotalUpVotes,
+    uas.TotalDownVotes,
+    uas.HighestBadgeClass,
+    uas.ScoreRank,
+    tpu.TopPostId,
+    tpu.PostTypeId,
+    tpu.Score as TopPostScore,
+    tpu.ViewCount as TopPostViews,
+    tpu.CreationDate as TopPostDate,
+    tpu.ShortTitle as TopPostShortTitle,
+    rq.QuestionId as TopRankedQuestionId,
+    rq.Title as TopRankedQuestionTitle,
+    rq.AnswerCount,
+    rq.AvgAnswerScore,
+    rq.MaxAnswerScore,
+    rq.CloseVotesCount,
+    coalesce(dl.DuplicateCount,0) as DuplicateLinksOnTopPost,
+    case when uas.TotalPostScore > 1000 then 'High' 
+         when uas.TotalPostScore between 500 and 1000 then 'Medium'
+         else 'Low' end as UserScoreCategory,
+    case when uas.HighestBadgeClass = 1 then 'Gold'
+         when uas.HighestBadgeClass = 2 then 'Silver'
+         when uas.HighestBadgeClass = 3 then 'Bronze'
+         else 'None' end as HighestBadgeClassName,
+    coalesce(string_agg(distinct t.TagName, ', '), 'No Tags') as DistinctTagsUsed,
+    (select max(ph2.CreationDate)
+     from PostHistory ph2
+     where ph2.UserId = uas.UserId and ph2.PostId = tpu.TopPostId and ph2.PostHistoryTypeId in (4,5,6)
+    ) as LastEditDateOnTopPost,
+    sum(p.Score) over (partition by p.OwnerUserId order by p.CreationDate rows between unbounded preceding and current row) as CumulativeScoreByPostDate
+from UserActivityStats uas
+left join TopPostsPerUser tpu on tpu.OwnerUserId = uas.UserId and tpu.RankByScore = 1
+left join Posts p on p.Id = tpu.TopPostId
+left join Tags t on position(concat('<', t.TagName, '>') in p.Tags) > 0
+left join DuplicateLinksCTE dl on dl.PostId = tpu.TopPostId
+left join RankedQuestions rq on rq.QuestionId = tpu.TopPostId and rq.YearlyTopRank = 1
+where uas.QuestionCount > 0 and uas.AnswerCount > 0
+group by
+    uas.UserId,
+    uas.DisplayName,
+    uas.QuestionCount,
+    uas.AnswerCount,
+    uas.TotalPostScore,
+    uas.CommentCount,
+    uas.TotalUpVotes,
+    uas.TotalDownVotes,
+    uas.HighestBadgeClass,
+    uas.ScoreRank,
+    tpu.TopPostId,
+    tpu.PostTypeId,
+    tpu.Score,
+    tpu.ViewCount,
+    tpu.CreationDate,
+    tpu.ShortTitle,
+    rq.QuestionId,
+    rq.Title,
+    rq.AnswerCount,
+    rq.AvgAnswerScore,
+    rq.MaxAnswerScore,
+    rq.CloseVotesCount,
+    dl.DuplicateCount,
+    uas.TotalPostScore,
+    uas.HighestBadgeClass,
+    t.TagName,
+    tpu.OwnerUserId,
+    p.Id,
+    p.Score,
+    p.CreationDate
+order by uas.TotalPostScore desc
+limit 100;

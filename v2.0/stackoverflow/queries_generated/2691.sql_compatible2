@@ -1,0 +1,187 @@
+WITH RECURSIVE RecursivePostHierarchy AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        1 AS Depth,
+        ARRAY[p.Id] AS Path
+    FROM Posts p
+    WHERE p.ParentId IS NULL
+    UNION ALL
+    SELECT 
+        c.Id,
+        c.PostTypeId,
+        c.ParentId,
+        c.OwnerUserId,
+        c.Score,
+        c.ViewCount,
+        c.CreationDate,
+        c.Title,
+        c.Tags,
+        r.Depth + 1,
+        r.Path || c.Id
+    FROM Posts c
+    JOIN RecursivePostHierarchy r ON c.ParentId = r.Id
+    WHERE NOT c.Id = ANY(r.Path)
+),
+BadgeCounts AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id
+),
+LatestComments AS (
+    SELECT
+        c.PostId,
+        c.UserId,
+        c.Text,
+        c.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY c.PostId ORDER BY c.CreationDate DESC) AS rn
+    FROM Comments c
+),
+PostCloseInfo AS (
+    SELECT
+        ph.PostId,
+        MIN(ph.CreationDate) AS FirstCloseDate,
+        ARRAY_AGG(DISTINCT cr.Name ORDER BY cr.Name) AS CloseReasons
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    LEFT JOIN CloseReasonTypes cr ON (CAST(ph.Comment AS INTEGER) = cr.Id AND ph.PostHistoryTypeId = 10)
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.PostId
+),
+UserActivityRanks AS (
+    SELECT
+        u.Id AS UserId,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        ROW_NUMBER() OVER (PARTITION BY u.Location ORDER BY u.Reputation DESC) AS LocationReputationRank
+    FROM Users u
+    WHERE u.Location IS NOT NULL
+),
+TagPostAggregates AS (
+    SELECT
+        t.TagName,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 1) AS AvgQuestionScore,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 2) AS AvgAnswerScore
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE ('%' || '<' || t.TagName || '>' || '%')
+    GROUP BY t.TagName
+),
+UserScoreWindow AS (
+    SELECT
+        p.OwnerUserId,
+        p.Id AS PostId,
+        p.Score,
+        p.PostTypeId,
+        DENSE_RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS PostScoreRank,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevScore,
+        LEAD(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextScore,
+        p.CreationDate
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+),
+TopPostsWithComments AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.CreationDate,
+        COALESCE(lc.Text, '[No Comments]') AS LatestCommentText,
+        COALESCE(u.DisplayName, '[No Owner]') AS OwnerName,
+        bc.GoldBadges,
+        bc.SilverBadges,
+        bc.BronzeBadges,
+        pci.FirstCloseDate,
+        pci.CloseReasons
+    FROM Posts p
+    LEFT JOIN LatestComments lc ON lc.PostId = p.Id AND lc.rn = 1
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN BadgeCounts bc ON bc.UserId = u.Id
+    LEFT JOIN PostCloseInfo pci ON pci.PostId = p.Id
+    WHERE p.PostTypeId = 1
+      AND p.Score > 10
+),
+LinkDuplicates AS (
+    SELECT
+        pl.PostId,
+        ARRAY_AGG(DISTINCT pl.RelatedPostId) FILTER (WHERE lt.Name = 'Duplicate') AS DuplicateOfPostIds
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    GROUP BY pl.PostId
+)
+SELECT 
+    tph.Id AS RootQuestionId,
+    tph.Title AS RootQuestionTitle,
+    tph.Depth,
+    tph.Path,
+    tph.Score AS RootScore,
+    COALESCE(tpwc.LatestCommentText, '[No Comment]') AS RootLatestComment,
+    tph.OwnerUserId,
+    COALESCE(u.DisplayName, '[Deleted User]') AS OwnerDisplayName,
+    bc.GoldBadges,
+    bc.SilverBadges,
+    bc.BronzeBadges,
+    pci.FirstCloseDate,
+    COALESCE(
+      (REGEXP_SPLIT_TO_ARRAY(tph.Tags, '(<|>)'))[2],
+      '[No Tags]'
+    ) AS FirstTag,
+    ARRAY_LENGTH(REGEXP_SPLIT_TO_ARRAY(tph.Tags, '(<|>)'), 1) AS TagCount,
+    ta.QuestionCount,
+    ta.AnswerCount,
+    ta.AvgQuestionScore,
+    ta.AvgAnswerScore,
+    LAG(tph.Score) OVER (ORDER BY tph.CreationDate) AS PreviousRootScore,
+    LEAD(tph.Score) OVER (ORDER BY tph.CreationDate) AS NextRootScore,
+    usw.PrevScore AS PrevAnswerScore,
+    usw.NextScore AS NextAnswerScore,
+    COALESCE(ld.DuplicateOfPostIds, ARRAY[]::INTEGER[]) AS DuplicatePosts
+FROM RecursivePostHierarchy tph
+LEFT JOIN TopPostsWithComments tpwc ON tph.Id = tpwc.Id
+LEFT JOIN Users u ON tph.OwnerUserId = u.Id
+LEFT JOIN BadgeCounts bc ON bc.UserId = tph.OwnerUserId
+LEFT JOIN PostCloseInfo pci ON pci.PostId = tph.Id
+LEFT JOIN TagPostAggregates ta ON ta.TagName = (
+    (REGEXP_SPLIT_TO_ARRAY(tph.Tags, '(<|>)'))[2]
+)
+LEFT JOIN UserScoreWindow usw ON usw.PostId = tph.Id AND usw.OwnerUserId = tph.OwnerUserId
+LEFT JOIN LinkDuplicates ld ON tph.Id = ld.PostId
+WHERE tph.Depth = 1
+GROUP BY
+    tph.Id,
+    tph.Title,
+    tph.Depth,
+    tph.Path,
+    tph.Score,
+    tpwc.LatestCommentText,
+    tph.OwnerUserId,
+    u.DisplayName,
+    bc.GoldBadges,
+    bc.SilverBadges,
+    bc.BronzeBadges,
+    pci.FirstCloseDate,
+    (REGEXP_SPLIT_TO_ARRAY(tph.Tags, '(<|>)')),
+    ta.QuestionCount,
+    ta.AnswerCount,
+    ta.AvgQuestionScore,
+    ta.AvgAnswerScore,
+    tph.CreationDate,
+    usw.PrevScore,
+    usw.NextScore,
+    ld.DuplicateOfPostIds,
+    tpwc.Id
+ORDER BY tph.Score DESC
+LIMIT 50;

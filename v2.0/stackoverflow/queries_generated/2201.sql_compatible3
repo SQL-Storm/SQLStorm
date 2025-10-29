@@ -1,0 +1,136 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        ARRAY[t.Id] AS Ancestors
+    FROM Tags t
+    WHERE t.IsModeratorOnly = false
+    UNION ALL
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Ancestors || t.Id
+    FROM Tags t
+    JOIN RecursiveTagHierarchy r ON t.Id = ANY (r.Ancestors)
+    WHERE array_length(r.Ancestors, 1) < 3
+),
+UserBadgeRanks AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        SUM(CASE WHEN b.Class = 1 THEN 3 ELSE 0 END) + SUM(CASE WHEN b.Class = 2 THEN 2 ELSE 0 END) + SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BadgeRankScore,
+        COUNT(DISTINCT b.Name) AS DistinctBadgeCount
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id AND b.TagBased = false
+    GROUP BY u.Id, u.DisplayName
+),
+UserPostStats AS (
+    SELECT 
+        p.OwnerUserId AS UserId,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId IN (1,2)) AS AvgPostScore,
+        SUM(p.ViewCount) FILTER (WHERE p.PostTypeId = 1) AS TotalQuestionViews,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+TopAnswerersPerTag AS (
+    SELECT
+        t.TagName,
+        p.OwnerUserId AS UserId,
+        COUNT(p.Id) AS AnswersPerTag,
+        ROW_NUMBER() OVER (PARTITION BY t.TagName ORDER BY COUNT(p.Id) DESC) AS rn
+    FROM Posts p
+    CROSS JOIN LATERAL (
+        SELECT unnest(string_to_array(SUBSTRING(COALESCE(p.Tags, ''), 2, GREATEST(LENGTH(COALESCE(p.Tags, ''))-2,0)), '><')) AS TagName
+    ) AS t
+    JOIN Tags tg ON tg.TagName = t.TagName
+    WHERE p.PostTypeId = 2
+    GROUP BY t.TagName, p.OwnerUserId
+    HAVING COUNT(p.Id) > 5
+),
+FinalUserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        COALESCE(ups.QuestionCount, 0) AS QuestionCount,
+        COALESCE(ups.AnswerCount, 0) AS AnswerCount,
+        COALESCE(ups.AvgPostScore, 0) AS AvgPostScore,
+        COALESCE(ups.TotalQuestionViews, 0) AS TotalQuestionViews,
+        COALESCE(ubr.BadgeRankScore, 0) AS BadgeRankScore,
+        COALESCE(ubr.DistinctBadgeCount, 0) AS DistinctBadgeCount,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        LAG(u.LastAccessDate) OVER (ORDER BY u.Reputation DESC) AS PrevUserLastAccess,
+        LEAD(u.LastAccessDate) OVER (ORDER BY u.Reputation DESC) AS NextUserLastAccess
+    FROM Users u
+    LEFT JOIN UserPostStats ups ON ups.UserId = u.Id
+    LEFT JOIN UserBadgeRanks ubr ON ubr.UserId = u.Id
+    WHERE u.Reputation > 1000
+),
+UserBadgeInfo AS (
+    SELECT 
+        b.UserId,
+        STRING_AGG(b.Name || ':' || COALESCE(TO_CHAR(b.Date, 'YYYY-MM-DD'), 'N/A'), '; ' ORDER BY b.Date DESC) AS Badges,
+        COUNT(*) AS BadgeCount
+    FROM Badges b
+    GROUP BY b.UserId
+),
+ClosedQuestionCounts AS (
+    SELECT
+        ph.PostId,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId = 10) AS CloseVotesCount,
+        MAX(ph.CreationDate) AS LastCloseDate,
+        MIN(c.Id) AS CloseReasonId,
+        MAX(c.Name) AS CloseReasonName
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes c ON TRY_CAST(c.Id AS integer) = TRY_CAST(ph.Comment AS integer)
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.PostId
+)
+SELECT 
+    fus.Id AS UserId,
+    fus.DisplayName,
+    fus.Reputation,
+    fus.QuestionCount,
+    fus.AnswerCount,
+    ROUND(CAST(fus.AvgPostScore AS numeric), 2) AS AvgPostScore,
+    fus.TotalQuestionViews,
+    fus.BadgeRankScore,
+    fus.DistinctBadgeCount,
+    COALESCE(ubi.Badges, '') AS BadgeDetails,
+    fus.Location,
+    TO_CHAR(fus.CreationDate, 'YYYY-MM-DD') AS UserCreationDate,
+    TO_CHAR(fus.PrevUserLastAccess, 'YYYY-MM-DD') AS PrevUserLastAccessDate,
+    TO_CHAR(fus.NextUserLastAccess, 'YYYY-MM-DD') AS NextUserLastAccessDate,
+    COALESCE(cqc.CloseVotesCount, 0) AS ClosedQuestions,
+    cqc.CloseReasonName,
+    STRING_AGG(DISTINCT top.TagName || '(' || top.AnswersPerTag || ')', ', ') FILTER (WHERE top.rn = 1) AS TopTagsAnswered,
+    phs.PostId,
+    phs.PostHistoryTypeId,
+    phs.CreationDate AS PostHistoryDate,
+    phs.UserDisplayName AS Editor,
+    LEFT(phs.Comment, 50) AS EditCommentSnippet
+FROM FinalUserStats fus
+LEFT JOIN UserBadgeInfo ubi ON ubi.UserId = fus.Id
+LEFT JOIN ClosedQuestionCounts cqc ON cqc.PostId IN (
+    SELECT p.Id FROM Posts p WHERE p.OwnerUserId = fus.Id AND p.PostTypeId = 1
+)
+LEFT JOIN TopAnswerersPerTag top ON top.UserId = fus.Id
+LEFT JOIN LATERAL (
+    SELECT ph1.PostId, ph1.PostHistoryTypeId, ph1.CreationDate, ph1.UserDisplayName, ph1.Comment
+    FROM PostHistory ph1
+    JOIN Posts p1 ON p1.Id = ph1.PostId
+    WHERE p1.OwnerUserId = fus.Id
+    ORDER BY ph1.CreationDate DESC
+    LIMIT 1
+) phs ON true
+WHERE fus.QuestionCount > 0 AND fus.AnswerCount > 0
+GROUP BY fus.Id, fus.DisplayName, fus.Reputation, fus.QuestionCount, fus.AnswerCount, fus.AvgPostScore, fus.TotalQuestionViews, fus.BadgeRankScore, fus.DistinctBadgeCount, ubi.Badges, fus.Location, fus.CreationDate, fus.PrevUserLastAccess, fus.NextUserLastAccess, cqc.CloseVotesCount, cqc.CloseReasonName, phs.PostId, phs.PostHistoryTypeId, phs.CreationDate, phs.UserDisplayName, phs.Comment
+ORDER BY fus.Reputation DESC, fus.AnswerCount DESC
+LIMIT 50;

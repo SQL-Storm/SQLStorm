@@ -1,0 +1,173 @@
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate,
+        U.LastAccessDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(P.Score) AS TotalPostScore,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        SUM(C.Score) AS TotalCommentScore,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        MAX(P.CreationDate) AS LastPostDate,
+        MAX(C.CreationDate) AS LastCommentDate
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    WHERE U.Reputation >= 1000
+      AND U.CreationDate >= DATE '2010-01-01'
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate
+    HAVING COUNT(DISTINCT P.Id) > 5 OR COUNT(DISTINCT C.Id) > 10
+),
+PostHistoricalMetrics AS (
+    SELECT
+        PH.PostId,
+        COUNT(PH.Id) AS TotalHistoryEvents,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS TotalEdits,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS TotalClosedEvents,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS TotalReopenedEvents,
+        SUM(CASE WHEN PH.UserId = P.OwnerUserId AND PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS SelfEdits,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.CreationDate ELSE NULL END) AS LastEditDate,
+        MIN(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.CreationDate ELSE NULL END) AS FirstCloseDate,
+        -- compute average interval between consecutive self-edit events per post and user:
+        AVG(self_edit_interval_hours) AS AvgSelfEditIntervalHours
+    FROM (
+        SELECT
+            PH.*,
+            P.OwnerUserId AS PostOwnerUserId,
+            CASE
+                WHEN PH.UserId = P.OwnerUserId AND PH.PostHistoryTypeId IN (4,5,6)
+                THEN EXTRACT(EPOCH FROM (PH.CreationDate - LAG(PH.CreationDate) OVER (PARTITION BY PH.PostId, PH.UserId ORDER BY PH.CreationDate))) / 3600.0
+                ELSE NULL
+            END AS self_edit_interval_hours
+        FROM PostHistory PH
+        INNER JOIN Posts P ON PH.PostId = P.Id
+        WHERE PH.CreationDate >= DATE '2020-01-01'
+    ) PH
+    GROUP BY PH.PostId
+),
+QuestionLinkAndTagAnalysis AS (
+    SELECT
+        Q.Id AS QuestionId,
+        Q.Title,
+        Q.Tags,
+        Q.CreationDate AS QuestionCreationDate,
+        Q.AnswerCount,
+        Q.FavoriteCount,
+        COUNT(DISTINCT PL.RelatedPostId) AS OutgoingLinks,
+        COUNT(DISTINCT PL_REV.PostId) AS IncomingLinks,
+        SUBSTRING(Q.Tags FROM 2 FOR (POSITION('>' IN Q.Tags) - 2)) AS PrimaryTag,
+        AVG(Q.Score) OVER (PARTITION BY SUBSTRING(Q.Tags FROM 2 FOR (POSITION('>' IN Q.Tags) - 2))) AS AvgScoreForPrimaryTag,
+        MAX(CASE WHEN A.AcceptedAnswerId = Q.Id THEN 1 ELSE 0 END) AS HasAcceptedAnswer
+    FROM Posts Q
+    LEFT JOIN PostLinks PL ON Q.Id = PL.PostId AND PL.LinkTypeId = 1
+    LEFT JOIN PostLinks PL_REV ON Q.Id = PL_REV.RelatedPostId AND PL_REV.LinkTypeId = 1
+    LEFT JOIN Posts A ON Q.Id = A.ParentId AND A.PostTypeId = 2
+    WHERE Q.PostTypeId = 1
+      AND Q.CreationDate >= DATE '2020-01-01'
+      AND Q.Tags IS NOT NULL
+      AND LENGTH(Q.Tags) > 2
+    GROUP BY Q.Id, Q.Title, Q.Tags, Q.CreationDate, Q.AnswerCount, Q.FavoriteCount, Q.Score
+),
+TopQuestionContributors AS (
+    SELECT
+        QA.QuestionId,
+        QA.Title,
+        QA.PrimaryTag,
+        U.Id AS OwnerUserId,
+        U.DisplayName AS OwnerDisplayName,
+        QA.AvgScoreForPrimaryTag,
+        QA.QuestionCreationDate,
+        Q.Score AS ContributionMetricValue,
+        'HighScoreRank' AS RankingType,
+        RANK() OVER (PARTITION BY QA.PrimaryTag ORDER BY Q.Score DESC, QA.QuestionCreationDate DESC) AS RankInPrimaryTag
+    FROM QuestionLinkAndTagAnalysis QA
+    INNER JOIN Posts Q ON QA.QuestionId = Q.Id
+    INNER JOIN Users U ON Q.OwnerUserId = U.Id
+    WHERE Q.Score > 100
+
+    UNION ALL
+
+    SELECT
+        QA.QuestionId,
+        QA.Title,
+        QA.PrimaryTag,
+        U.Id AS OwnerUserId,
+        U.DisplayName AS OwnerDisplayName,
+        QA.AvgScoreForPrimaryTag,
+        QA.QuestionCreationDate,
+        Q.AnswerCount AS ContributionMetricValue,
+        'HighAnswerCountRank' AS RankingType,
+        RANK() OVER (PARTITION BY QA.PrimaryTag ORDER BY Q.AnswerCount DESC, QA.QuestionCreationDate DESC) AS RankInPrimaryTag
+    FROM QuestionLinkAndTagAnalysis QA
+    INNER JOIN Posts Q ON QA.QuestionId = Q.Id
+    INNER JOIN Users U ON Q.OwnerUserId = U.Id
+    WHERE Q.AnswerCount > 5
+)
+SELECT
+    UE.UserId,
+    UE.DisplayName AS UserDisplayName,
+    UE.Reputation,
+    UE.TotalQuestions,
+    UE.TotalAnswers,
+    UE.TotalPostScore,
+    UE.GoldBadges,
+    UE.SilverBadges,
+    P.Id AS PostId,
+    P.Title AS PostTitle,
+    PT.Name AS PostTypeName,
+    P.Score AS PostScore,
+    P.ViewCount,
+    P.AnswerCount AS QuestionAnswerCount,
+    P.FavoriteCount,
+    COALESCE(PHM.TotalEdits, 0) AS PostTotalEdits,
+    COALESCE(PHM.SelfEdits, 0) AS PostSelfEdits,
+    PHM.AvgSelfEditIntervalHours,
+    PHM.FirstCloseDate,
+    QATA.PrimaryTag,
+    QATA.OutgoingLinks,
+    QATA.IncomingLinks,
+    QATA.HasAcceptedAnswer,
+    TQC.RankingType,
+    TQC.RankInPrimaryTag AS QuestionRankInPrimaryTag,
+    TQC.ContributionMetricValue AS QuestionContributionMetric,
+    CASE
+        WHEN P.Body LIKE '%<a href="https://%' THEN 'ContainsExternalLink'
+        WHEN P.Body IS NULL OR LENGTH(P.Body) < 50 THEN 'ShortOrEmptyBody'
+        ELSE 'NormalBody'
+    END AS BodyCategory,
+    (CAST(P.Score AS NUMERIC) + COALESCE(P.AnswerCount, 0) * 2 + COALESCE(P.CommentCount, 0) * 0.5) / NULLIF(UE.Reputation, 0) AS InteractionReputationRatio,
+    (SELECT C.Text
+     FROM Comments C
+     WHERE C.PostId = P.Id
+     ORDER BY C.CreationDate DESC
+     LIMIT 1) AS LatestCommentText,
+    (SELECT EXISTS (
+        SELECT 1
+        FROM PostLinks PL_Inner
+        INNER JOIN Posts P_Linked ON PL_Inner.RelatedPostId = P_Linked.Id
+        WHERE PL_Inner.PostId = P.Id
+          AND P_Linked.Score > 500
+          AND P_Linked.PostTypeId = 1
+    )) AS HasHighScoringLinkedQuestion,
+    ROW_NUMBER() OVER (PARTITION BY UE.UserId ORDER BY P.Score DESC, P.CreationDate DESC) AS UserPostRank
+FROM UserEngagement UE
+INNER JOIN Posts P ON UE.UserId = P.OwnerUserId
+INNER JOIN PostTypes PT ON P.PostTypeId = PT.Id
+LEFT JOIN PostHistoricalMetrics PHM ON P.Id = PHM.PostId
+LEFT JOIN QuestionLinkAndTagAnalysis QATA ON P.Id = QATA.QuestionId
+LEFT JOIN TopQuestionContributors TQC ON P.Id = TQC.QuestionId AND UE.UserId = TQC.OwnerUserId
+WHERE P.CreationDate >= DATE '2021-01-01'
+  AND P.PostTypeId IN (1, 2)
+  AND (COALESCE(PHM.SelfEdits, 0) > 0 OR COALESCE(QATA.IncomingLinks, 0) > 1)
+  AND (UE.GoldBadges > 0 OR UE.SilverBadges > 2)
+  AND P.ViewCount > 1000
+  AND P.Body IS NOT NULL
+  AND NOT (P.ClosedDate IS NOT NULL AND P.CommunityOwnedDate IS NOT NULL)
+ORDER BY UE.Reputation DESC, UserPostRank ASC, PHM.AvgSelfEditIntervalHours ASC NULLS LAST;

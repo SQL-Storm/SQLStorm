@@ -1,0 +1,86 @@
+WITH
+UserStats AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    COUNT(CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+    COUNT(CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+    SUM(p.Score) AS TotalPostScore,
+    MAX(p.CreationDate) AS LastCreatedPost,
+    MAX(p.LastActivityDate) AS LastActivityDate,
+    EXTRACT(EPOCH FROM MAX(p.LastActivityDate)) AS LastActivityUnix
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id, u.DisplayName
+),
+TagActivity AS (
+  SELECT
+    u.Id AS UserId,
+    t.TagName,
+    COUNT(*) AS TagUsage,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsWithTag
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN (
+      SELECT p.Id AS PostId, TRIM(tag) AS tagname
+      FROM Posts p,
+      LATERAL (
+        SELECT regexp_split_to_table(COALESCE(p.Tags, ''), '><') AS tag
+      ) s
+  ) v ON v.PostId = p.Id
+  LEFT JOIN (SELECT DISTINCT TagName FROM Tags) AS t ON t.TagName = v.tagname
+  GROUP BY u.Id, t.TagName
+),
+UserPostRank AS (
+  SELECT
+    p.Id AS PostId,
+    p.OwnerUserId,
+    p.Title,
+    p.Score,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate DESC) AS RankByScore
+  FROM Posts p
+  WHERE p.OwnerUserId IS NOT NULL
+),
+RecentActivity AS (
+  SELECT
+    u.Id AS UserId,
+    MAX(CASE WHEN v.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30 days') THEN v.CreationDate END) AS LastVoteDate30d,
+    MAX(CASE WHEN c.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30 days') THEN c.CreationDate END) AS LastCommentDate30d,
+    MAX(p.LastActivityDate) AS LastPostActivity
+  FROM Users u
+  LEFT JOIN Votes v ON v.UserId = u.Id
+  LEFT JOIN Comments c ON c.UserId = u.Id
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id
+)
+SELECT
+  u.Id AS UserId,
+  u.DisplayName,
+  COALESCE(us.QuestionCount, 0) AS QuestionCount,
+  COALESCE(us.AnswerCount, 0) AS AnswerCount,
+  COALESCE(us.TotalPostScore, 0) AS TotalPostScore,
+  COALESCE(ra.LastVoteDate30d, TIMESTAMP '1970-01-01') AS LastVoteDate30d,
+  COALESCE(ra.LastCommentDate30d, TIMESTAMP '1970-01-01') AS LastCommentDate30d,
+  COALESCE(ra.LastPostActivity, TIMESTAMP '1970-01-01') AS LastPostActivity,
+  CONCAT(
+    'Rep:', COALESCE(CAST(u.Reputation AS VARCHAR), 'NA'),
+    ' | ',
+    'Loc:', COALESCE(u.Location, 'Unknown'),
+    ' | ',
+    'Posts:', (COALESCE(us.QuestionCount,0) + COALESCE(us.AnswerCount,0))
+  ) AS CustomDescriptor,
+  (
+    SELECT JSON_AGG(row_to_json(upr_row))
+    FROM (
+      SELECT upr.PostId, upr.Title, upr.Score, upr.RankByScore AS "Rank"
+      FROM UserPostRank upr
+      WHERE upr.OwnerUserId = u.Id
+        AND upr.RankByScore <= 3
+      ORDER BY upr.RankByScore
+    ) upr_row
+  ) AS TopPosts
+FROM Users u
+LEFT JOIN UserStats us ON us.UserId = u.Id
+LEFT JOIN RecentActivity ra ON ra.UserId = u.Id
+GROUP BY u.Id, u.DisplayName, us.QuestionCount, us.AnswerCount, us.TotalPostScore, ra.LastVoteDate30d, ra.LastCommentDate30d, ra.LastPostActivity, u.Reputation, u.Location
+ORDER BY u.Id;

@@ -1,0 +1,165 @@
+WITH RecursiveUserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COUNT(b.Id) AS BadgeCount,
+        AVG(COALESCE(p.Score, 0)) FILTER (WHERE p.PostTypeId IN (1,2)) AS AvgPostScore,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS Rnk
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Reputation IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+), 
+TopUsers AS (
+    SELECT * 
+    FROM RecursiveUserActivity
+    WHERE Rnk <= 1000
+),
+QuestionDetails AS (
+    SELECT 
+        p.Id, p.OwnerUserId, p.Title, p.CreationDate, p.Score, p.ViewCount, p.Tags,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevScore,
+        LEAD(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextScore,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCount,
+        (SELECT STRING_AGG(DISTINCT pht.Name, ', ')
+         FROM PostHistory phistory
+         JOIN PostHistoryTypes pht ON pht.Id = phistory.PostHistoryTypeId
+         WHERE phistory.PostId = p.Id AND phistory.UserId = p.OwnerUserId) AS UserPostHistories
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+UserAnswerStats AS (
+    SELECT 
+        a.OwnerUserId,
+        COUNT(*) AS AnsweredCount,
+        AVG(a.Score) AS AvgAnswerScore,
+        MAX(a.Score) AS MaxAnswerScore,
+        MIN(a.Score) AS MinAnswerScore,
+        COUNT(DISTINCT a.ParentId) AS DistinctQuestionsAnswered
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+    GROUP BY a.OwnerUserId
+),
+UserBadgesAggregated AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) AS TotalBadges,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        COUNT(DISTINCT CASE WHEN b.TagBased = TRUE THEN b.Name ELSE NULL END) AS TagBasedBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+CloseReasonAggregates AS (
+    SELECT 
+        ph.Comment AS CloseReasonId,
+        crt.Name AS CloseReasonName,
+        COUNT(*) AS CloseCount
+    FROM PostHistory ph
+    JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS SMALLINT)
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.Comment, crt.Name
+),
+UserVotesStats AS (
+    SELECT
+        v.UserId,
+        COUNT(*) FILTER (WHERE vt.Name = 'UpMod') AS UpVotes,
+        COUNT(*) FILTER (WHERE vt.Name = 'DownMod') AS DownVotes,
+        COUNT(*) FILTER (WHERE vt.Name = 'Favorite') AS Favorites,
+        COUNT(*) FILTER (WHERE vt.Name = 'Close') AS CloseVotes,
+        COUNT(*) FILTER (WHERE vt.Name = 'Reopen') AS ReopenVotes
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY v.UserId
+),
+UserPostLinkSummary AS (
+    SELECT
+        pl.PostId,
+        COUNT(CASE WHEN lt.Name = 'Duplicate' THEN 1 END) AS NumDuplicatesLinkFrom,
+        COUNT(CASE WHEN lt.Name = 'Linked' THEN 1 END) AS NumLinkedTo
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    GROUP BY pl.PostId
+),
+UserComplexAggregatedData AS (
+    SELECT 
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.CreationDate,
+        tu.LastAccessDate,
+        tu.QuestionCount,
+        tu.AnswerCount,
+        COALESCE(qd.CommentCount, 0) AS TotalCommentsOnQuestions,
+        COALESCE(ua.AvgAnswerScore, 0) AS AvgAnswerScore,
+        COALESCE(ub.TotalBadges, 0) AS TotalBadges,
+        COALESCE(uv.UpVotes, 0) AS UserUpVotes,
+        COALESCE(uv.DownVotes, 0) AS UserDownVotes,
+        COALESCE(uv.CloseVotes, 0) AS UserCloseVotes,
+        CAST(ROUND(COALESCE(tu.Reputation,0) * LOG(1 + tu.QuestionCount + tu.AnswerCount)::NUMERIC, 2) AS NUMERIC) AS ReputationWeightedActivity,
+        (SELECT STRING_AGG(DISTINCT t.TagName, ', ')
+         FROM Tags t 
+         JOIN Posts p ON p.Id = t.ExcerptPostId 
+         WHERE p.OwnerUserId = tu.UserId AND p.PostTypeId = 1
+         ORDER BY t.Count DESC
+         LIMIT 5) AS TopTags
+    FROM TopUsers tu
+    LEFT JOIN QuestionDetails qd ON qd.OwnerUserId = tu.UserId
+    LEFT JOIN UserAnswerStats ua ON ua.OwnerUserId = tu.UserId
+    LEFT JOIN UserBadgesAggregated ub ON ub.UserId = tu.UserId
+    LEFT JOIN UserVotesStats uv ON uv.UserId = tu.UserId
+    GROUP BY tu.UserId, tu.DisplayName, tu.Reputation, tu.CreationDate, tu.LastAccessDate, tu.QuestionCount, tu.AnswerCount, qd.CommentCount, ua.AvgAnswerScore, ub.TotalBadges, uv.UpVotes, uv.DownVotes, uv.CloseVotes
+),
+HighReputationActiveUsers AS (
+    SELECT 
+        UserId, DisplayName, Reputation, ReputationWeightedActivity,
+        ROW_NUMBER() OVER (ORDER BY ReputationWeightedActivity DESC) AS ActivityRank
+    FROM UserComplexAggregatedData
+    WHERE Reputation > 10000
+)
+SELECT 
+    hra.UserId,
+    hra.DisplayName,
+    hra.Reputation,
+    hra.ReputationWeightedActivity,
+    ua.AvgAnswerScore,
+    ua.TotalBadges,
+    ua.UserUpVotes,
+    ua.UserCloseVotes,
+    ua.TopTags,
+    cr.CloseReasonName,
+    cr.CloseCount,
+    CASE 
+        WHEN ua.UserCloseVotes > 0 THEN ROUND(CAST(cr.CloseCount AS NUMERIC) / ua.UserCloseVotes * 100.0, 2)
+        ELSE NULL 
+    END AS CloseVoteEffectivenessPct,
+    CONCAT(
+        SUBSTRING(ua.TopTags FROM 1 FOR 20), 
+        CASE WHEN COALESCE(LENGTH(ua.TopTags),0) > 20 THEN '...' ELSE '' END
+    ) AS TopTagsShort,
+    CASE 
+        WHEN (ua.UserUpVotes + ua.UserCloseVotes) > 0 THEN 
+            ROUND(
+                (1.0 * ua.UserUpVotes) / (ua.UserUpVotes + ua.UserCloseVotes) * 100.0, 2
+            )
+        ELSE NULL
+    END AS UpVoteRatioPct,
+    ROW_NUMBER() OVER (PARTITION BY cr.CloseReasonName ORDER BY hra.ReputationWeightedActivity DESC) AS RankedPerCloseReason
+FROM HighReputationActiveUsers hra
+LEFT JOIN UserComplexAggregatedData ua ON ua.UserId = hra.UserId
+LEFT JOIN CloseReasonAggregates cr ON cr.CloseReasonId = (
+    SELECT ph.Comment 
+    FROM PostHistory ph 
+    WHERE ph.PostHistoryTypeId = 10 AND ph.UserId = hra.UserId 
+    ORDER BY ph.CreationDate DESC LIMIT 1
+)
+WHERE hra.ActivityRank <= 50
+ORDER BY hra.ReputationWeightedActivity DESC, RankedPerCloseReason ASC;

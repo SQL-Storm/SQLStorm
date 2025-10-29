@@ -1,0 +1,276 @@
+-- {"query": "1979.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3817} 
+WITH UserActivitySummary AS (
+    -- Summarize user activity and reputation segments
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Views AS UserViews,
+        U.UpVotes,
+        U.DownVotes,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS QuestionsOwned,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS AnswersOwned,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(P.CreationDate) AS LatestPostDate,
+        NULLIF(SUM(P.Score), 0) AS TotalPostScoreOwned,
+        (SELECT AVG(SubP.Score) FROM Posts SubP WHERE SubP.OwnerUserId = U.Id AND SubP.PostTypeId IN (1,2)) AS AvgOwnerPostScore
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    LEFT JOIN Badges AS B ON U.Id = B.UserId
+    WHERE U.LastAccessDate >= '2200-01-01' -- Filter for recent active users for performance
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Views, U.UpVotes, U.DownVotes
+),
+PostEngagementMetrics AS (
+    -- Calculate detailed engagement metrics for questions
+    SELECT
+        PQ.Id AS PostId,
+        PQ.Title,
+        PQ.CreationDate AS PostCreationDate,
+        PQ.Score AS PostScore,
+        PQ.ViewCount,
+        PQ.AnswerCount,
+        PQ.CommentCount AS QuestionCommentCount,
+        PQ.FavoriteCount,
+        PQ.OwnerUserId,
+        PQ.Tags,
+        PQ.ClosedDate,
+        PQ.AcceptedAnswerId,
+        (SELECT MAX(PH.CreationDate) FROM PostHistory PH WHERE PH.PostId = PQ.Id AND PH.PostHistoryTypeId IN (4,5,6)) AS LastEditDate, -- Last body/title/tags edit
+        COALESCE(PQ.ViewCount, 0) * 1.0 / NULLIF(COALESCE(PQ.FavoriteCount, 0) + COALESCE(PQ.AnswerCount, 0) + COALESCE(PQ.CommentCount, 0) + PQ.Score, 0) AS EngagementRatio,
+        CASE
+            WHEN PQ.ViewCount > 50000 THEN 'Very Popular'
+            WHEN PQ.ViewCount > 10000 THEN 'Popular'
+            WHEN PQ.ViewCount > 1000 THEN 'Moderate'
+            ELSE 'Low'
+        END AS PopularitySegment,
+        EXISTS (SELECT 1 FROM PostLinks PL WHERE PL.PostId = PQ.Id AND PL.LinkTypeId = 3) AS IsDuplicateSource, -- Is this post a source of a duplicate link?
+        EXISTS (SELECT 1 FROM PostLinks PL WHERE PL.RelatedPostId = PQ.Id AND PL.LinkTypeId = 3) AS IsDuplicateTarget, -- Is this post a target of a duplicate link?
+        (SELECT
+            CASE
+                WHEN AVG(SubA.Score) > 10 THEN 'High Score Answers'
+                WHEN AVG(SubA.Score) > 0 THEN 'Moderate Score Answers'
+                ELSE 'Low/No Score Answers'
+            END
+         FROM Posts SubA
+         WHERE SubA.ParentId = PQ.Id AND SubA.PostTypeId = 2
+        ) AS AnswerQualitySegment
+    FROM Posts AS PQ
+    WHERE PQ.PostTypeId = 1 -- Only questions
+    AND PQ.CreationDate >= '2023-01-01' -- Recent questions for benchmark
+    AND PQ.ViewCount IS NOT NULL -- Exclude posts with no views
+),
+TagPerformanceMetrics AS (
+    -- Analyze performance characteristics per tag
+    SELECT
+        TRIM(UNNEST(string_to_array(SUBSTRING(T.Tags, 2, LENGTH(T.Tags)-2), '><'))) AS TagName,
+        T.PostId,
+        T.PostScore,
+        T.ViewCount,
+        T.OwnerUserId
+    FROM PostEngagementMetrics AS T
+    WHERE T.Tags IS NOT NULL AND LENGTH(TRIM(T.Tags)) > 2 -- Ensure tags exist and are not empty
+),
+AggregatedTagMetrics AS (
+    SELECT
+        TP.TagName,
+        COUNT(DISTINCT TP.PostId) AS QuestionsWithTag,
+        SUM(TP.PostScore) AS TotalTagScore,
+        AVG(TP.ViewCount) AS AvgTagViewCount,
+        RANK() OVER (ORDER BY SUM(TP.PostScore) DESC, COUNT(DISTINCT TP.PostId) DESC) AS TagScoreRank
+    FROM TagPerformanceMetrics AS TP
+    GROUP BY TP.TagName
+),
+PostHistoryAggregates AS (
+    -- Summarize post history events
+    SELECT
+        PH.PostId,
+        COUNT(CASE WHEN PH.PostHistoryTypeId IN (4,5,6) THEN 1 END) AS TotalEditEvents,
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 END) AS TotalCloseEvents,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.CreationDate END) AS LatestCloseDate,
+        MIN(CASE WHEN PH.PostHistoryTypeId IN (4,5,6) THEN PH.CreationDate END) AS FirstEditDate
+    FROM PostHistory AS PH
+    GROUP BY PH.PostId
+),
+LinkedPostDetails AS (
+    -- Get details about linked/duplicate posts
+    SELECT
+        PL.PostId,
+        PL.RelatedPostId,
+        LT.Name AS LinkTypeName,
+        P_Related.Title AS RelatedPostTitle,
+        P_Related.Score AS RelatedPostScore,
+        P_Related.OwnerUserId AS RelatedPostOwnerId
+    FROM PostLinks AS PL
+    INNER JOIN LinkTypes AS LT ON PL.LinkTypeId = LT.Id
+    LEFT JOIN Posts AS P_Related ON PL.RelatedPostId = P_Related.Id
+    WHERE PL.CreationDate >= '2023-01-01'
+),
+CombinedUserPostMetrics AS (
+    -- Combine user and post engagement data
+    SELECT
+        UAS.UserId,
+        UAS.DisplayName,
+        UAS.Reputation,
+        UAS.UserCreationDate,
+        UAS.TotalPostsOwned,
+        UAS.QuestionsOwned,
+        UAS.AnswersOwned,
+        UAS.GoldBadges,
+        UAS.LatestPostDate,
+        PEM.PostId,
+        PEM.Title AS PostTitle,
+        PEM.PostCreationDate,
+        PEM.PostScore,
+        PEM.ViewCount,
+        PEM.AnswerCount,
+        PEM.QuestionCommentCount,
+        PEM.FavoriteCount,
+        PEM.PopularitySegment,
+        PEM.IsDuplicateSource,
+        PEM.IsDuplicateTarget,
+        PEM.AnswerQualitySegment,
+        PHA.TotalEditEvents,
+        PHA.TotalCloseEvents,
+        PHA.LatestCloseDate,
+        PHA.FirstEditDate,
+        COALESCE(PEM.LastEditDate, PEM.PostCreationDate) AS EffectiveLastActivityDate, -- Use LastEditDate if available, else PostCreationDate
+        LAG(PEM.PostCreationDate, 1, '1900-01-01') OVER (PARTITION BY UAS.UserId ORDER BY PEM.PostCreationDate) AS PreviousPostDate,
+        LEAD(PEM.PostCreationDate, 1, '2999-01-01') OVER (PARTITION BY UAS.UserId ORDER BY PEM.PostCreationDate) AS NextPostDate,
+        RANK() OVER (PARTITION BY UAS.UserId ORDER BY PEM.PostScore DESC, PEM.ViewCount DESC) AS UserPostRank,
+        AVG(PEM.PostScore) OVER (PARTITION BY UAS.UserId) AS AvgUserQuestionScore,
+        SUM(PEM.ViewCount) OVER (PARTITION BY UAS.UserId ORDER BY PEM.PostCreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativeUserViews
+    FROM UserActivitySummary AS UAS
+    INNER JOIN PostEngagementMetrics AS PEM ON UAS.UserId = PEM.OwnerUserId
+    LEFT JOIN PostHistoryAggregates AS PHA ON PEM.PostId = PHA.PostId
+)
+-- Final Query: Select and apply complex logic
+SELECT
+    CUP.UserId,
+    CUP.DisplayName,
+    CUP.Reputation,
+    CUP.PostId,
+    CUP.PostTitle,
+    CUP.PostCreationDate,
+    CUP.PostScore,
+    CUP.ViewCount,
+    CUP.AnswerCount,
+    CUP.FavoriteCount,
+    CUP.PopularitySegment,
+    CUP.IsDuplicateSource,
+    CUP.IsDuplicateTarget,
+    CUP.AnswerQualitySegment,
+    CUP.TotalEditEvents,
+    CUP.TotalCloseEvents,
+    CUP.LatestCloseDate,
+    CUP.FirstEditDate,
+    AGE(CUP.EffectiveLastActivityDate, CUP.PostCreationDate) AS PostActivityDuration, -- Postgres specific, can be DATEDIFF in others
+    EXTRACT(EPOCH FROM (CUP.PostCreationDate - CUP.PreviousPostDate)) / 3600 AS TimeSincePreviousPostHours, -- Time in hours
+    EXTRACT(EPOCH FROM (CUP.NextPostDate - CUP.PostCreationDate)) / 86400 AS TimeToNextPostDays, -- Time in days
+    CUP.UserPostRank,
+    CUP.AvgUserQuestionScore,
+    CUP.CumulativeUserViews,
+    ATM.TagName,
+    ATM.QuestionsWithTag,
+    ATM.TotalTagScore,
+    ATM.AvgTagViewCount,
+    ATM.TagScoreRank,
+    LPD.RelatedPostId,
+    LPD.LinkTypeName,
+    LPD.RelatedPostTitle,
+    LPD.RelatedPostScore,
+    -- Correlated subquery: Get the most upvoted answer's body for questions with accepted answers
+    (SELECT SUBSTRING(SubP.Body, 1, 150)
+     FROM Posts AS SubP
+     WHERE SubP.Id = CUP.AcceptedAnswerId AND SubP.PostTypeId = 2
+     ORDER BY SubP.Score DESC
+     LIMIT 1) AS AcceptedAnswerBodyExcerpt,
+    -- Non-correlated subquery: Compare post score to overall average score of all questions
+    (CUP.PostScore * 100.0) / (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1 AND Score IS NOT NULL) AS ScoreVsOverallAvgPct,
+    -- Complicated predicate/expression using NULL logic, string manipulation, and calculations
+    CASE
+        WHEN CUP.IsDuplicateSource AND LPD.RelatedPostScore < CUP.PostScore THEN 'Duplicate Better Original'
+        WHEN CUP.PopularitySegment = 'Very Popular' AND CUP.AnswerCount = 0 AND CUP.FavoriteCount IS NULL THEN 'Unanswered Popular'
+        WHEN CUP.TotalCloseEvents > 0 AND CUP.LatestCloseDate > CUP.FirstEditDate THEN 'Edited Then Closed'
+        WHEN (CUP.Reputation * 1.0 / NULLIF(CUP.PostScore, 0)) > 50 AND CUP.QuestionsOwned > 10 THEN 'HighRepLowScoreQuestioner'
+        ELSE 'NormalEngagement'
+    END AS EngagementCategory,
+    UPPER(SUBSTRING(CUP.PostTitle, 1, 10)) || '...' || REPLACE(LOWER(CUP.PostTitle), 'sql', 'NOSQL') AS ModifiedTitlePreview,
+    CUP.Reputation - COALESCE(CUP.AvgUserQuestionScore * 10, 0) AS ReputationAdjustedForAvgPostScore
+FROM CombinedUserPostMetrics AS CUP
+LEFT JOIN LATERAL ( -- Lateral join to handle multiple tags per post efficiently
+    SELECT
+        TRIM(UNNEST(string_to_array(SUBSTRING(CUP.Tags, 2, LENGTH(CUP.Tags)-2), '><'))) AS TagName,
+        CUP.PostId
+) AS PostTags ON TRUE
+LEFT JOIN AggregatedTagMetrics AS ATM ON PostTags.TagName = ATM.TagName
+LEFT JOIN LinkedPostDetails AS LPD ON CUP.PostId = LPD.PostId
+WHERE
+    CUP.Reputation > 1000 -- Filter for more established users
+    AND CUP.PostScore > 5 -- Filter for posts with some positive score
+    AND (CUP.ViewCount > 500 OR CUP.FavoriteCount IS NOT NULL) -- Posts with significant views or favorites
+    AND (CUP.Title LIKE '%SQL%' OR CUP.Title LIKE '%database%' OR CUP.Title LIKE '%performance%') -- Specific keyword search
+    AND CUP.PostCreationDate IS NOT NULL -- Ensure creation date is not null
+    AND CUP.AcceptedAnswerId IS NOT NULL -- Only questions with an accepted answer
+    AND CUP.PostId NOT IN (SELECT PH_Del.PostId FROM PostHistory PH_Del WHERE PH_Del.PostHistoryTypeId = 12) -- Exclude deleted posts
+    -- Example of UNION ALL for different slices of data
+UNION ALL
+SELECT
+    U.Id AS UserId,
+    U.DisplayName,
+    U.Reputation,
+    U.CreationDate AS UserCreationDate,
+    P.Id AS PostId,
+    P.Title AS PostTitle,
+    P.CreationDate AS PostCreationDate,
+    P.Score AS PostScore,
+    P.ViewCount,
+    P.AnswerCount,
+    P.FavoriteCount,
+    'High Score Answer' AS PopularitySegment, -- Custom segment for union
+    FALSE AS IsDuplicateSource,
+    FALSE AS IsDuplicateTarget,
+    'N/A' AS AnswerQualitySegment,
+    0 AS TotalEditEvents,
+    0 AS TotalCloseEvents,
+    NULL AS LatestCloseDate,
+    NULL AS FirstEditDate,
+    AGE(P.LastActivityDate, P.CreationDate) AS PostActivityDuration,
+    NULL AS TimeSincePreviousPostHours,
+    NULL AS TimeToNextPostDays,
+    NULL AS UserPostRank,
+    NULL AS AvgUserQuestionScore,
+    NULL AS CumulativeUserViews,
+    T.TagName,
+    ATM_Ans.QuestionsWithTag,
+    ATM_Ans.TotalTagScore,
+    ATM_Ans.AvgTagViewCount,
+    ATM_Ans.TagScoreRank,
+    NULL AS RelatedPostId,
+    NULL AS LinkTypeName,
+    NULL AS RelatedPostTitle,
+    NULL AS RelatedPostScore,
+    SUBSTRING(P.Body, 1, 150) AS AcceptedAnswerBodyExcerpt, -- Directly get body excerpt for answers
+    (P.Score * 100.0) / (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 2 AND Score IS NOT NULL) AS ScoreVsOverallAvgPct,
+    'HighScoreAnswerEntry' AS EngagementCategory,
+    UPPER(SUBSTRING(P.Title, 1, 10)) || '...' || REPLACE(LOWER(P.Title), 'answer', 'RESPONSE') AS ModifiedTitlePreview,
+    U.Reputation - COALESCE(P.Score * 5, 0) AS ReputationAdjustedForAnswerScore
+FROM Posts AS P
+INNER JOIN Users AS U ON P.OwnerUserId = U.Id
+LEFT JOIN LATERAL (
+    SELECT TRIM(UNNEST(string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags)-2), '><'))) AS TagName, P.Id
+) AS PostTags_Ans ON TRUE
+LEFT JOIN AggregatedTagMetrics AS ATM_Ans ON PostTags_Ans.TagName = ATM_Ans.TagName
+WHERE P.PostTypeId = 2 -- Only answers
+AND P.Score > 50 -- Only highly upvoted answers
+AND P.CreationDate >= '2023-01-01'
+AND P.ParentId IS NOT NULL -- Must be an answer to a question
+AND EXISTS (SELECT 1 FROM Posts Q WHERE Q.Id = P.ParentId AND Q.AcceptedAnswerId = P.Id) -- Is an accepted answer
+ORDER BY PostScore DESC, Reputation DESC
+LIMIT 10000;

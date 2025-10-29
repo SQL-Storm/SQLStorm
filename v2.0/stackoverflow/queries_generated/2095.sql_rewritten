@@ -1,0 +1,149 @@
+-- {"query": "2095.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1524} 
+with RecursiveTagHierarchy as (
+    select 
+        t.Id, 
+        t.TagName, 
+        t.Count,
+        array[t.TagName] as AncestorTags
+    from Tags t
+    where t.IsRequired = 1
+    union all
+    select 
+        child.Id, 
+        child.TagName, 
+        child.Count,
+        rth.AncestorTags || child.TagName
+    from Tags child
+    join RecursiveTagHierarchy rth on child.Id <> rth.Id and child.Count < rth.Count
+    where array_position(rth.AncestorTags, child.TagName) is null
+),
+TopUsersBadges as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(distinct b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(distinct b.Id) filter (where b.Class = 3) as BronzeBadges,
+        rank() over (order by u.Reputation desc) as ReputationRank
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+    having count(b.Id) > 5
+),
+PostActivity as (
+    select 
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        ph.PostHistoryTypeId,
+        ph.CreationDate as HistoryDate,
+        ph.UserId as EditorUserId,
+        ph.Comment as EditComment,
+        ph.Text as EditText,
+        v.VoteTypeId,
+        v.CreationDate as VoteDate,
+        v.UserId as VoterUserId,
+        case when p.PostTypeId = 1 then (select count(*) from Posts ans where ans.ParentId = p.Id and ans.Score > 0) else null end as PositiveAnswerCount,
+        case when p.PostTypeId = 1 then 
+            (select string_agg(distinct regexp_split_to_table(substring(p.Tags from 2 for length(p.Tags)-2), '><'), '|'))
+            else null
+        end as ParsedTags
+    from Posts p
+    left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId in (4,5,6,10,11)
+    left join Votes v on v.PostId = p.Id and v.VoteTypeId in (2,3)
+    where p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+),
+UserActivitySummary as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) as TotalPosts,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as Questions,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as Answers,
+        avg(coalesce(p.Score,0)) filter (where p.PostTypeId in (1,2)) as AvgPostScore,
+        sum(coalesce(p.ViewCount,0)) filter (where p.PostTypeId=1) as TotalQuestionViews,
+        max(p.CreationDate) as LastPostDate,
+        count(distinct c.Id) as TotalComments,
+        count(distinct ph.Id) as EditsMade,
+        count(distinct v.Id) filter (where v.VoteTypeId=2) as UpVotesGiven,
+        count(distinct v.Id) filter (where v.VoteTypeId=3) as DownVotesGiven,
+        array_agg(distinct regexp_split_to_table(substring(p.Tags from 2 for length(p.Tags)-2), '><')) as UserTags
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join PostHistory ph on ph.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+MostActiveUsers as (
+    select UserId, DisplayName, (TotalPosts + TotalComments + EditsMade) as ActivityScore
+    from UserActivitySummary
+    order by ActivityScore desc
+    limit 20
+),
+QuestionDuplicates as (
+    select 
+        pl.PostId as DuplicateQuestionId,
+        pl.RelatedPostId as OriginalQuestionId,
+        pq.Title as DuplicateTitle,
+        po.Title as OriginalTitle,
+        pl.CreationDate
+    from PostLinks pl
+    join Posts pq on pq.Id = pl.PostId and pq.PostTypeId = 1
+    join Posts po on po.Id = pl.RelatedPostId and po.PostTypeId = 1
+    where pl.LinkTypeId = 3
+),
+UserBadgesWithTagCount as (
+    select 
+        b.UserId,
+        b.Name,
+        b.Class,
+        count(distinct t.Id) as TagCount
+    from Badges b
+    left join Tags t on b.Name ilike '%' || t.TagName || '%'
+    group by b.UserId, b.Name, b.Class
+),
+RankedPosts as (
+    select 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Tags,
+        p.OwnerUserId,
+        row_number() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as RankByScoreView
+    from Posts p
+    where p.PostTypeId in (1,2) and p.Score > 10 and p.ViewCount > 5000
+)
+select 
+    mau.ActivityScore,
+    mau.DisplayName as MostActiveUser,
+    t.RankByScoreView,
+    t.Title as TopPostTitle,
+    t.Score,
+    t.ViewCount,
+    string_agg(distinct rth.TagName, ', ') as RelatedRequiredTags,
+    qd.DuplicateTitle,
+    qd.OriginalTitle,
+    qd.CreationDate as DuplicateMarkedDate,
+    ubwt.TagCount as BadgeRelatedTagCount,
+    tsb.GoldBadges,
+    tsb.SilverBadges,
+    tsb.BronzeBadges
+from MostActiveUsers mau
+join RankedPosts t on t.OwnerUserId = mau.UserId
+left join RecursiveTagHierarchy rth on position(rth.TagName in coalesce(t.Tags,'')) > 0
+left join QuestionDuplicates qd on qd.DuplicateQuestionId = t.Id
+left join UserBadgesWithTagCount ubwt on ubwt.UserId = mau.UserId
+left join TopUsersBadges tsb on tsb.UserId = mau.UserId
+where t.RankByScoreView <= 5
+group by mau.ActivityScore, mau.DisplayName, t.RankByScoreView, t.Title, t.Score, t.ViewCount, qd.DuplicateTitle, qd.OriginalTitle, qd.CreationDate, ubwt.TagCount, tsb.GoldBadges, tsb.SilverBadges, tsb.BronzeBadges
+order by mau.ActivityScore desc, t.RankByScoreView;

@@ -1,0 +1,148 @@
+WITH recent_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.AnswerCount
+  FROM Posts p
+  WHERE p.PostTypeId = 1 -- Questions
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days'
+),
+tag_pop AS (
+  SELECT
+    t.tag,
+    COUNT(*) AS tag_count
+  FROM recent_questions rq,
+       UNNEST(STRING_TO_ARRAY(SUBSTR(rq.Tags, 2, LENGTH(rq.Tags) - 2), '><')) AS t(tag)
+  GROUP BY t.tag
+),
+top_tags AS (
+  SELECT tag FROM tag_pop ORDER BY tag_count DESC LIMIT 10
+),
+q_with_top_tags AS (
+  SELECT
+    rq.PostId,
+    rq.Title,
+    rq.Tags,
+    rq.CreationDate,
+    rq.Score,
+    rq.ViewCount,
+    rq.OwnerUserId,
+    rq.LastActivityDate,
+    rq.CommentCount,
+    rq.FavoriteCount,
+    rq.AnswerCount,
+    ARRAY_AGG(tt.tag) FILTER (WHERE tt.tag IS NOT NULL) AS TopTags
+  FROM recent_questions rq
+  LEFT JOIN LATERAL (
+    SELECT t.tag
+    FROM UNNEST(STRING_TO_ARRAY(SUBSTR(rq.Tags, 2, LENGTH(rq.Tags) - 2), '><')) AS t(tag)
+  ) tt ON TRUE
+  LEFT JOIN top_tags ttf ON tt.tag = ttf.tag
+  GROUP BY
+    rq.PostId, rq.Title, rq.Tags, rq.CreationDate, rq.Score, rq.ViewCount,
+    rq.OwnerUserId, rq.LastActivityDate, rq.CommentCount, rq.FavoriteCount, rq.AnswerCount
+),
+author_activity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    u.LastAccessDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.ProfileImageUrl,
+    u.Location,
+    u.AboutMe,
+    a.PostCount,
+    a.LastPostDate
+  FROM Users u
+  LEFT JOIN (
+    SELECT OwnerUserId, COUNT(*) AS PostCount, MAX(CreationDate) AS LastPostDate
+    FROM Posts
+    WHERE PostTypeId IN (1,2) -- questions and answers
+    GROUP BY OwnerUserId
+  ) a ON a.OwnerUserId = u.Id
+  WHERE u.Id IN (SELECT OwnerUserId FROM Posts WHERE PostTypeId = 1)
+),
+activity_summary AS (
+  SELECT
+    q.PostId,
+    q.Title,
+    q.Tags,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    q.OwnerUserId,
+    q.LastActivityDate,
+    q.CommentCount,
+    q.FavoriteCount,
+    q.AnswerCount,
+    q.TopTags,
+    le.UserId AS LastEditorId
+  FROM q_with_top_tags q
+  LEFT JOIN Posts p ON p.Id = q.PostId
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  LEFT JOIN Users uu ON uu.Id = p.OwnerUserId
+  LEFT JOIN (
+    SELECT OwnerUserId AS UserId, MAX(LastEditDate) AS LastEdit
+    FROM Posts
+    WHERE LastEditDate IS NOT NULL
+    GROUP BY OwnerUserId
+  ) le ON le.UserId = p.OwnerUserId
+
+  UNION ALL
+
+  SELECT
+    CAST(NULL AS INTEGER) AS PostId,
+    CAST(NULL AS TEXT) AS Title,
+    CAST(NULL AS TEXT) AS Tags,
+    CAST(NULL AS TIMESTAMP) AS CreationDate,
+    CAST(NULL AS INTEGER) AS Score,
+    CAST(NULL AS INTEGER) AS ViewCount,
+    CAST(NULL AS INTEGER) AS OwnerUserId,
+    CAST(NULL AS TIMESTAMP) AS LastActivityDate,
+    CAST(NULL AS INTEGER) AS CommentCount,
+    CAST(NULL AS INTEGER) AS FavoriteCount,
+    CAST(NULL AS INTEGER) AS AnswerCount,
+    CAST(NULL AS TEXT) AS TopTags,
+    CAST(NULL AS INTEGER) AS LastEditorId
+)
+SELECT
+  aq.PostId,
+  aq.Title,
+  aq.Tags,
+  aq.CreationDate AS PostCreationDate,
+  aq.Score AS PostScore,
+  aq.ViewCount AS PostViewCount,
+  aq.OwnerUserId,
+  aq.LastActivityDate AS PostLastActivityDate,
+  aq.CommentCount,
+  aq.FavoriteCount,
+  aq.AnswerCount,
+  aq.TopTags,
+  au.UserId AS AuthorId,
+  au.DisplayName AS AuthorName,
+  au.Reputation AS AuthorReputation,
+  au.UserCreationDate AS AuthorCreationDate,
+  au.LastAccessDate AS AuthorLastAccessDate,
+  au.Location AS AuthorLocation,
+  au.AboutMe AS AuthorAbout,
+  (SELECT COUNT(*) FROM Comments c WHERE c.PostId = aq.PostId) AS CommentCountTotal,
+  (SELECT ARRAY_AGG(DISTINCT v2.VoteTypeId) FROM Votes v2 WHERE v2.PostId = aq.PostId) AS VoteTypesOnPost
+FROM activity_summary aq
+LEFT JOIN author_activity au ON au.UserId = aq.OwnerUserId
+LEFT JOIN LATERAL (
+  SELECT 1
+) d ON TRUE
+ORDER BY aq.LastActivityDate DESC
+LIMIT 100;

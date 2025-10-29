@@ -1,0 +1,91 @@
+-- {"query": "5972.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 614} 
+WITH
+RecentActivePosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.PostTypeId,
+    ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.LastActivityDate DESC) AS rn
+  FROM Posts p
+  WHERE p.CreationDate >= CURRENT_DATE - INTERVAL '180 days'
+),
+TagStats AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS PostCount,
+    AVG(p.Score) AS AvgScore,
+    MAX(p.LastActivityDate) AS LastActive
+  FROM Posts p
+  JOIN unnest(string_to_array(p.Tags, '<>')) AS t(tag)
+    ON true
+  GROUP BY t.TagName
+),
+HighImpactUsers AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate
+  FROM Users u
+  WHERE u.Reputation > 10000
+),
+CrossJoined AS (
+  SELECT
+    p.PostId,
+    p.Title,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    u.DisplayName AS OwnerDisplayName,
+    v.VoteCount
+  FROM RecentActivePosts p
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS VoteCount
+    FROM Votes
+    WHERE CreationDate >= CURRENT_DATE - INTERVAL '60 days'
+    GROUP BY PostId
+  ) v ON v.PostId = p.PostId
+  LEFT JOIN Users u ON u.Id = p.OwnerUserId
+  WHERE p.rn = 1
+),
+Windowed AS (
+  SELECT
+    c.PostId,
+    c.Title,
+    c.OwnerUserId,
+    c.LastActivityDate,
+    c.Score,
+    c.ViewCount,
+    c.Tags,
+    c.OwnerDisplayName,
+    c.VoteCount,
+    ROW_NUMBER() OVER (ORDER BY c.LastActivityDate DESC, c.Score DESC) AS seq
+  FROM CrossJoined c
+)
+SELECT
+  w.PostId,
+  w.Title,
+  w.OwnerDisplayName,
+  w.LastActivityDate,
+  w.Score,
+  w.ViewCount,
+  w.Tags,
+  w.VoteCount,
+  (SELECT COUNT(*) FROM HighImpactUsers hi WHERE hi.Reputation > 5000) AS RichUserBucketSize,
+  (SELECT STRING_AGG(tg.TagName, ', ' ORDER BY tg.TagName)
+     FROM unnest(string_to_array(w.Tags, '<>')) AS tg(tagName)) AS TagList
+FROM Windowed w
+LEFT JOIN TagStats ts ON true
+LEFT JOIN HighImpactUsers hui ON hui.UserId = w.OwnerUserId
+WHERE w.seq = 1
+ORDER BY w.LastActivityDate DESC
+LIMIT 500;

@@ -1,0 +1,215 @@
+WITH HotQuestionsByActivity AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.AcceptedAnswerId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.Body,
+        p.OwnerUserId,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+        p.ClosedDate,
+        'Activity' AS SourceType
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '6 months'
+      AND p.ViewCount > 5000
+      AND p.Score > 20
+      AND p.AnswerCount > 5
+),
+HotQuestionsByUserEngagement AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.AcceptedAnswerId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.Body,
+        p.OwnerUserId,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+        p.ClosedDate,
+        'Engagement' AS SourceType
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+      AND u.Reputation > 50000
+      AND u.UpVotes > 10000
+      AND EXISTS (
+          SELECT 1
+          FROM Badges b
+          WHERE b.UserId = u.Id
+            AND b.Class = 1
+          GROUP BY b.UserId
+          HAVING COUNT(b.Id) >= 3
+      )
+),
+CombinedHotQuestions AS (
+    SELECT * FROM HotQuestionsByActivity
+    UNION ALL
+    SELECT * FROM HotQuestionsByUserEngagement
+),
+DistinctCombinedHotQuestions AS (
+    SELECT DISTINCT
+        PostId, PostTypeId, AcceptedAnswerId, PostCreationDate, PostScore, ViewCount, Body, OwnerUserId,
+        LastEditDate, LastActivityDate, Title, Tags, AnswerCount, CommentCount, FavoriteCount, ClosedDate
+    FROM CombinedHotQuestions
+),
+UserMetrics AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.DisplayName,
+        u.LastAccessDate,
+        u.WebsiteUrl,
+        u.Location,
+        u.UpVotes,
+        u.DownVotes,
+        u.Views AS UserProfileViews,
+        COUNT(b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        COUNT(p_owned_by_u.Id) AS TotalPostsOwned,
+        (
+         SELECT AVG(ans.Score)
+         FROM Posts ans
+         WHERE ans.ParentId IN (SELECT dhq.PostId FROM DistinctCombinedHotQuestions dhq WHERE dhq.OwnerUserId = u.Id)
+           AND ans.PostTypeId = 2
+           AND ans.OwnerUserId = u.Id
+        ) AS AvgAnswerScoreForHotQuestions
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Posts p_owned_by_u ON u.Id = p_owned_by_u.OwnerUserId
+    WHERE u.Id IN (SELECT DISTINCT OwnerUserId FROM DistinctCombinedHotQuestions)
+    GROUP BY u.Id, u.Reputation, u.CreationDate, u.DisplayName, u.LastAccessDate, u.WebsiteUrl, u.Location, u.UpVotes, u.DownVotes, u.Views
+    HAVING u.Reputation > 1000
+),
+PostHistoryDetails AS (
+    SELECT
+        ph.PostId,
+        COUNT(ph.Id) AS TotalHistoryEvents,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS TotalEdits,
+        MAX(ph.CreationDate) AS LastHistoryEventDate,
+        (
+         SELECT ph_inner.UserId
+         FROM PostHistory ph_inner
+         WHERE ph_inner.PostId = ph.PostId
+           AND ph_inner.PostHistoryTypeId = 5
+         ORDER BY ph_inner.CreationDate DESC
+         LIMIT 1
+        ) AS LastBodyEditorUserId
+    FROM PostHistory ph
+    WHERE ph.PostId IN (SELECT PostId FROM DistinctCombinedHotQuestions)
+    GROUP BY ph.PostId
+),
+PostAverageEventInterval AS (
+    SELECT
+        ph.PostId,
+        AVG(EXTRACT(EPOCH FROM (ph.CreationDate - prev_creation))) AS AvgEventIntervalSeconds
+    FROM (
+        SELECT
+            ph_inner.PostId,
+            ph_inner.CreationDate,
+            LAG(ph_inner.CreationDate) OVER (PARTITION BY ph_inner.PostId ORDER BY ph_inner.CreationDate) AS prev_creation
+        FROM PostHistory ph_inner
+        WHERE ph_inner.PostId IN (SELECT PostId FROM DistinctCombinedHotQuestions)
+    ) ph
+    WHERE ph.prev_creation IS NOT NULL
+    GROUP BY ph.PostId
+),
+PostTagStats AS (
+    SELECT
+        dhq.PostId,
+        tag_unnested.tag_name_raw AS TagName,
+        t.Count AS GlobalTagCount,
+        t.IsModeratorOnly,
+        (
+         SELECT COUNT(DISTINCT other_dhq.PostId)
+         FROM DistinctCombinedHotQuestions other_dhq
+         CROSS JOIN LATERAL UNNEST(string_to_array(SUBSTRING(other_dhq.Tags, 2, LENGTH(other_dhq.Tags) - 2), '><')) AS other_tags(tag_name_raw)
+         WHERE LOWER(other_tags.tag_name_raw) = LOWER(tag_unnested.tag_name_raw)
+           AND other_dhq.PostId <> dhq.PostId
+        ) AS HotQuestionsWithTagCount
+    FROM DistinctCombinedHotQuestions dhq
+    CROSS JOIN LATERAL UNNEST(string_to_array(SUBSTRING(dhq.Tags, 2, LENGTH(dhq.Tags) - 2), '><')) AS tag_unnested(tag_name_raw)
+    JOIN Tags t ON LOWER(t.TagName) = LOWER(tag_unnested.tag_name_raw)
+)
+SELECT
+    dhq.PostId,
+    dhq.Title,
+    dhq.PostCreationDate,
+    dhq.PostScore,
+    dhq.ViewCount,
+    um.DisplayName AS OwnerDisplayName,
+    um.Reputation AS OwnerReputation,
+    um.TotalBadges AS OwnerTotalBadges,
+    COALESCE(um.AvgAnswerScoreForHotQuestions, 0) AS AvgOwnerAnswerScoreForHotQuestions,
+    phd.TotalEdits,
+    phd.LastHistoryEventDate,
+    (
+     SELECT COUNT(ph_init.Id)
+     FROM PostHistory ph_init
+     WHERE ph_init.PostId = dhq.PostId
+       AND ph_init.PostHistoryTypeId IN (1, 2, 3)
+    ) AS InitialCreationEventsCount,
+    pts.TagName AS PrimaryTag,
+    pts.GlobalTagCount,
+    pts.HotQuestionsWithTagCount,
+    (dhq.PostScore * 0.75 + dhq.ViewCount / 1000.0 + dhq.AnswerCount * 2.0 + dhq.FavoriteCount * 1.5
+     + (EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - dhq.PostCreationDate)) / 86400.0) * 0.1
+     + (SELECT COALESCE(SUM(v.BountyAmount), 0) FROM Votes v WHERE v.PostId = dhq.PostId AND v.VoteTypeId = 8) * 5
+    ) AS EngagementIndex,
+    COALESCE(SUBSTRING(dhq.Body FROM 1 FOR 100), 'N/A') || ' ... [Tags: ' || dhq.Tags || ']' AS BodyPreviewWithTags,
+    CASE
+        WHEN dhq.AcceptedAnswerId IS NOT NULL THEN
+            (SELECT CASE WHEN p_acc.Score > COALESCE(um.AvgAnswerScoreForHotQuestions, 0) THEN 'HighScoreAccepted' ELSE 'Accepted' END
+             FROM Posts p_acc WHERE p_acc.Id = dhq.AcceptedAnswerId)
+        ELSE 'NoAcceptedAnswer'
+    END AS AcceptedAnswerStatus,
+    NTILE(5) OVER (PARTITION BY pts.TagName ORDER BY (dhq.PostScore * 0.75 + dhq.ViewCount / 1000.0 + dhq.AnswerCount * 2.0 + dhq.FavoriteCount * 1.5 + (EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - dhq.PostCreationDate)) / 86400.0) * 0.1 + (SELECT COALESCE(SUM(v.BountyAmount), 0) FROM Votes v WHERE v.PostId = dhq.PostId AND v.VoteTypeId = 8) * 5) DESC) AS EngagementTierByTag,
+    COALESCE(paei.AvgEventIntervalSeconds, 0) AS AvgEventIntervalSeconds,
+    COALESCE(ume.DisplayName, 'Community/Unknown') AS LastBodyEditorName,
+    NULLIF(ume.Reputation, 0) AS LastBodyEditorReputation,
+    (dhq.Body ILIKE '%json%') AS ContainsJsonBody,
+    (SELECT COUNT(c.Id) FROM Comments c WHERE c.PostId = dhq.PostId) AS TotalCommentCount,
+    dhq.ClosedDate IS NOT NULL AND EXISTS (SELECT 1 FROM PostLinks pl_check WHERE pl_check.PostId = dhq.PostId AND pl_check.LinkTypeId = 3) AS IsClosedDuplicate,
+    EXTRACT(DAY FROM (dhq.PostCreationDate - um.UserCreationDate)) AS PostOwnerAgeAtCreationDays,
+    TRIM(SUBSTRING(COALESCE(um.Location, 'Earth') FROM 1 FOR 20)) AS OwnerLocationSnippet,
+    NULLIF(dhq.PostScore, 0) / NULLIF(dhq.ViewCount, 0) AS ScorePerViewRatio
+FROM DistinctCombinedHotQuestions dhq
+JOIN UserMetrics um ON dhq.OwnerUserId = um.UserId
+LEFT JOIN PostHistoryDetails phd ON dhq.PostId = phd.PostId
+LEFT JOIN PostAverageEventInterval paei ON dhq.PostId = paei.PostId
+LEFT JOIN PostTagStats pts ON dhq.PostId = pts.PostId
+LEFT JOIN Users ume ON ume.Id = phd.LastBodyEditorUserId
+WHERE um.UserProfileViews > 1000
+  AND um.UpVotes / NULLIF(um.DownVotes, 0) > 5.0
+  AND dhq.PostScore > (SELECT AVG(p_other.Score) FROM Posts p_other WHERE p_other.OwnerUserId = dhq.OwnerUserId AND p_other.PostTypeId = 1) * 1.2
+  AND pts.TagName IS NOT NULL
+  AND dhq.LastEditDate IS NOT NULL AND dhq.LastEditDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 months'
+  AND dhq.ViewCount >= dhq.AnswerCount * 10
+  AND (dhq.Title ILIKE '%sql%' OR dhq.Title ILIKE '%database%' OR dhq.Tags ILIKE '%<sql>%')
+  AND (SELECT COUNT(c_count.Id) FROM Comments c_count WHERE c_count.PostId = dhq.PostId) > um.TotalPostsOwned / 5
+GROUP BY
+    dhq.PostId, dhq.Title, dhq.PostCreationDate, dhq.PostScore, dhq.ViewCount, um.DisplayName, um.Reputation,
+    um.TotalBadges, um.AvgAnswerScoreForHotQuestions, phd.TotalEdits, phd.LastHistoryEventDate,
+    pts.TagName, pts.GlobalTagCount, pts.HotQuestionsWithTagCount, dhq.Body, dhq.Tags, dhq.AcceptedAnswerId, dhq.ClosedDate,
+    um.UpVotes, um.DownVotes, um.UserProfileViews, um.UserId, dhq.FavoriteCount, dhq.AnswerCount, dhq.LastEditDate,
+    ume.DisplayName, ume.Reputation, paei.AvgEventIntervalSeconds, um.UserCreationDate, um.Location, dhq.LastActivityDate, phd.PostId, pts.PostId
+ORDER BY
+    EngagementIndex DESC, dhq.LastActivityDate DESC
+LIMIT 5000;

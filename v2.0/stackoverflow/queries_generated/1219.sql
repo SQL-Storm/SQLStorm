@@ -1,0 +1,246 @@
+-- {"query": "1219.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2943} 
+
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT P_Q.Id) AS TotalQuestionsPosted,
+        COUNT(DISTINCT P_A.Id) AS TotalAnswersPosted,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT B.Id) AS TotalBadgesEarned,
+        SUM(CASE WHEN C.Score IS NOT NULL THEN C.Score ELSE 0 END) AS TotalCommentScoreReceived,
+        MAX(COALESCE(P_Q.LastActivityDate, P_A.LastActivityDate, U.LastAccessDate)) AS LastKnownActivity,
+        AVG(COALESCE(P_Q.Score, P_A.Score)) AS AverageOwnedPostScore
+    FROM
+        Users AS U
+    LEFT JOIN
+        Posts AS P_Q ON U.Id = P_Q.OwnerUserId AND P_Q.PostTypeId = 1
+    LEFT JOIN
+        Posts AS P_A ON U.Id = P_A.OwnerUserId AND P_A.PostTypeId = 2
+    LEFT JOIN
+        Comments AS C ON U.Id = C.UserId
+    LEFT JOIN
+        Badges AS B ON U.Id = B.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate
+),
+PostEngagementMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.FavoriteCount,
+        P.ClosedDate,
+        P.OwnerUserId,
+        P.ParentId,
+        COUNT(DISTINCT V.Id) AS TotalVotesOnPost,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesOnPost,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesOnPost,
+        AVG(COALESCE(Comm.Score, 0)) AS AverageCommentScoreOnPost,
+        MAX(CASE WHEN P.PostTypeId = 1 AND P.AcceptedAnswerId IS NOT NULL THEN TRUE ELSE FALSE END) AS HasAcceptedAnswer
+    FROM
+        Posts AS P
+    LEFT JOIN
+        Votes AS V ON P.Id = V.PostId
+    LEFT JOIN
+        Comments AS Comm ON P.Id = Comm.PostId
+    GROUP BY
+        P.Id, P.PostTypeId, P.CreationDate, P.Score, P.ViewCount, P.AnswerCount, P.FavoriteCount, P.ClosedDate, P.OwnerUserId, P.ParentId
+),
+TagUsageAnalysis AS (
+    SELECT
+        Tag,
+        COUNT(DISTINCT P.Id) AS TaggedQuestionCount,
+        SUM(P.ViewCount) AS TotalViewsForTag,
+        AVG(P.Score) AS AverageScoreForTag,
+        MAX(P.CreationDate) AS LastTaggedQuestionDate
+    FROM
+        Posts AS P,
+        UNNEST(string_to_array(TRIM(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags)-2), '<>'), '><')) AS Tag
+    WHERE
+        P.PostTypeId = 1 AND P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2
+    GROUP BY
+        Tag
+    HAVING
+        COUNT(DISTINCT P.Id) > 50
+),
+PostHistoryTimeline AS (
+    SELECT
+        PH.PostId,
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 END) AS CloseEvents,
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 END) AS ReopenEvents,
+        MIN(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.CreationDate END) AS FirstClosedDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 11 THEN PH.CreationDate END) AS LastReopenedDate,
+        MIN(PH.CreationDate) FILTER (WHERE PH.PostHistoryTypeId = 5) AS FirstBodyEditDate,
+        MAX(PH.CreationDate) FILTER (WHERE PH.PostHistoryTypeId IN (4,5,6)) AS LastEditDateByHistory,
+        EXTRACT(EPOCH FROM (MIN(PH.CreationDate) FILTER (WHERE PH.PostHistoryTypeId IN (4,5,6)) - MIN(P_Origin.CreationDate))) / 60 AS MinutesToFirstEdit
+    FROM
+        PostHistory AS PH
+    JOIN
+        Posts AS P_Origin ON PH.PostId = P_Origin.Id
+    WHERE PH.PostHistoryTypeId IN (1,2,3,4,5,6,10,11)
+    GROUP BY
+        PH.PostId
+),
+HighestScoringComments AS (
+    SELECT
+        C.PostId,
+        C.UserId AS CommenterUserId,
+        C.Text AS CommentText,
+        C.Score AS CommentScore,
+        ROW_NUMBER() OVER (PARTITION BY C.PostId ORDER BY C.Score DESC, C.CreationDate DESC) AS rn
+    FROM
+        Comments AS C
+    WHERE
+        C.Score >= 3
+),
+CombinedQuestionAnalysis AS (
+    SELECT
+        'OpenOrNeverClosed' AS QuestionStatusCategory,
+        Q.Id AS QuestionId,
+        Q.Title AS QuestionTitle,
+        Q.CreationDate AS QuestionCreationDate,
+        Q.Score AS QuestionScore,
+        Q.ViewCount AS QuestionViewCount,
+        UAS_Q.DisplayName AS QuestionOwnerDisplayName,
+        UAS_Q.Reputation AS QuestionOwnerReputation,
+        UAS_Q.UserCreationDate,
+        PEM_Q.TotalVotesOnPost AS QuestionTotalVotes,
+        PEM_Q.UpVotesOnPost AS QuestionUpVotes,
+        PEM_Q.DownVotesOnPost AS QuestionDownVotes,
+        PEM_Q.AverageCommentScoreOnPost AS QuestionAvgCommentScore,
+        UAS_Q.TotalQuestionsPosted,
+        UAS_Q.TotalAnswersPosted,
+        UAS_Q.TotalCommentsMade,
+        UAS_Q.TotalBadgesEarned,
+        0 AS CloseEvents,
+        0 AS ReopenEvents,
+        CAST(NULL AS DOUBLE PRECISION) AS TimeBetweenCloseAndReopenHours,
+        PH_TL.MinutesToFirstEdit,
+        TUA.Tag AS PrimaryContributingTag,
+        TUA.TaggedQuestionCount AS TagQuestionCount,
+        TUA.AverageScoreForTag AS TagAvgScore,
+        (
+            SELECT
+                COALESCE(U_AA.DisplayName, 'Deleted User') || ' (' || AA.Score || ')'
+            FROM
+                Posts AS AA
+            LEFT JOIN
+                Users AS U_AA ON AA.OwnerUserId = U_AA.Id
+            WHERE
+                AA.Id = Q.AcceptedAnswerId
+                AND AA.PostTypeId = 2
+                AND AA.CreationDate IS NOT NULL
+                AND AA.Score > (
+                    SELECT
+                        AVG(P_INNER.Score) * 1.5
+                    FROM
+                        Posts AS P_INNER
+                    WHERE
+                        P_INNER.PostTypeId = 2
+                        AND P_INNER.CreationDate IS NOT NULL
+                        AND EXTRACT(YEAR FROM P_INNER.CreationDate) = EXTRACT(YEAR FROM AA.CreationDate)
+                        AND EXTRACT(MONTH FROM P_INNER.CreationDate) = EXTRACT(MONTH FROM AA.CreationDate)
+                )
+                AND AA.Id IS NOT NULL
+        ) AS AcceptedAnswerInfoIfSignificantlyAboveAvgScore,
+        RANK() OVER (PARTITION BY TUA.Tag ORDER BY Q.Score DESC, Q.ViewCount DESC) AS RankInPrimaryTag,
+        AVG(Q.Score) OVER (ORDER BY Q.CreationDate ROWS BETWEEN 30 PRECEDING AND 30 FOLLOWING) AS RollingAvgScore60Days,
+        COALESCE(HSC.CommentText, 'N/A') AS TopCommentText,
+        COALESCE(U_HSC.DisplayName, 'Anonymous') AS TopCommenterDisplayName,
+        FALSE AS WasClosed,
+        COALESCE(Q.FavoriteCount, 0) AS FavoriteCountOnQuestion,
+        EXTRACT(DAY FROM (NOW() - Q.CreationDate)) AS DaysSinceQuestionCreation,
+        COALESCE(SUBSTRING(Q.Body, 1, 150), 'No body content excerpt') AS QuestionBodyExcerpt,
+        (Q.Tags LIKE '%<sql>%' OR Q.Tags LIKE '%<database>%') AS IsSqlOrDatabaseRelated,
+        Q.ContentLicense
+    FROM
+        Posts AS Q
+    INNER JOIN
+        UserActivitySummary AS UAS_Q ON Q.OwnerUserId = UAS_Q.UserId
+    INNER JOIN
+        PostEngagementMetrics AS PEM_Q ON Q.Id = PEM_Q.PostId
+    LEFT JOIN
+        PostHistoryTimeline AS PH_TL ON Q.Id = PH_TL.PostId
+    LEFT JOIN
+        TagUsageAnalysis AS TUA ON TUA.Tag = TRIM(SUBSTRING(Q.Tags FROM 2 FOR (POSITION('>' IN Q.Tags) - 2)), '<>')
+    LEFT JOIN
+        HighestScoringComments AS HSC ON Q.Id = HSC.PostId AND HSC.rn = 1
+    LEFT JOIN
+        Users AS U_HSC ON HSC.CommenterUserId = U_HSC.Id
+    WHERE
+        Q.PostTypeId = 1
+        AND Q.CreationDate >= (NOW() - INTERVAL '5 year')
+        AND Q.OwnerUserId IS NOT NULL
+        AND Q.Score >= 10
+        AND Q.ViewCount >= 1000
+        AND (
+            (Q.ClosedDate IS NULL AND PH_TL.CloseEvents IS NULL)
+            OR
+            (Q.ClosedDate IS NULL AND COALESCE(PH_TL.CloseEvents, 0) = 0)
+        )
+        AND UAS_Q.Reputation >= 5000
+        AND (Q.Tags IS NULL OR Q.Tags LIKE '%<programming>%')
+        AND NOT EXISTS (
+            SELECT 1
+            FROM PostHistory PH_EX
+            WHERE PH_EX.PostId = Q.Id AND PH_EX.PostHistoryTypeId = 12
+        )
+
+    UNION ALL
+
+    SELECT
+        'ClosedThenReopened' AS QuestionStatusCategory,
+        Q.Id AS QuestionId,
+        Q.Title AS QuestionTitle,
+        Q.CreationDate AS QuestionCreationDate,
+        Q.Score AS QuestionScore,
+        Q.ViewCount AS QuestionViewCount,
+        UAS_Q.DisplayName AS QuestionOwnerDisplayName,
+        UAS_Q.Reputation AS QuestionOwnerReputation,
+        UAS_Q.UserCreationDate,
+        PEM_Q.TotalVotesOnPost AS QuestionTotalVotes,
+        PEM_Q.UpVotesOnPost AS QuestionUpVotes,
+        PEM_Q.DownVotesOnPost AS QuestionDownVotes,
+        PEM_Q.AverageCommentScoreOnPost AS QuestionAvgCommentScore,
+        UAS_Q.TotalQuestionsPosted,
+        UAS_Q.TotalAnswersPosted,
+        UAS_Q.TotalCommentsMade,
+        UAS_Q.TotalBadgesEarned,
+        PH_TL.CloseEvents,
+        PH_TL.ReopenEvents,
+        EXTRACT(EPOCH FROM (PH_TL.LastReopenedDate - PH_TL.FirstClosedDate)) / 3600 AS TimeBetweenCloseAndReopenHours,
+        PH_TL.MinutesToFirstEdit,
+        TUA.Tag AS PrimaryContributingTag,
+        TUA.TaggedQuestionCount AS TagQuestionCount,
+        TUA.AverageScoreForTag AS TagAvgScore,
+        (
+            SELECT
+                COALESCE(U_AA.DisplayName, 'Deleted User') || ' (' || AA.Score || ')'
+            FROM
+                Posts AS AA
+            LEFT JOIN
+                Users AS U_AA ON AA.OwnerUserId = U_AA.Id
+            WHERE
+                AA.Id = Q.AcceptedAnswerId
+                AND AA.PostTypeId = 2
+                AND AA.CreationDate IS NOT NULL
+                AND AA.Score > (
+                    SELECT
+                        AVG(P_INNER.Score) * 1.5
+                    FROM
+                        Posts AS P_INNER
+                    WHERE
+                        P_INNER.PostTypeId = 2
+                        AND P_INNER.CreationDate IS NOT NULL
+                        AND EXTRACT(YEAR FROM P_INNER.CreationDate) = EXTRACT(YEAR FROM AA.CreationDate)
+                        AND EXTRACT(MONTH FROM P_INNER.CreationDate) = EXTRACT(MONTH FROM AA.CreationDate)
+                )
+                AND AA.Id IS NOT NULL
+        ) AS AcceptedAnswerInfoIfSignificantlyAboveAvgScore,
+        RANK() OVER (PARTITION BY TUA.Tag ORDER BY Q.Score DESC

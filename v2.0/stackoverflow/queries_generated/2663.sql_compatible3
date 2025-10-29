@@ -1,0 +1,138 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        CAST(ARRAY[t.TagName] AS varchar[]) AS Path,
+        1 AS Level
+    FROM Tags t
+    WHERE t.IsModeratorOnly = false
+    UNION ALL
+    SELECT
+        t.Id,
+        t.TagName,
+        r.Path || t.TagName,
+        r.Level + 1
+    FROM Tags t
+    JOIN RecursiveTagHierarchy r ON t.ExcerptPostId = r.Id
+    WHERE r.Level < 3
+),
+UserBadgeSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COALESCE(SUM(b.Class), 0) AS BadgeScore,
+        RANK() OVER (ORDER BY COUNT(DISTINCT b.Id) DESC, u.Reputation DESC) AS BadgeRank
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName
+),
+PostVotesAgg AS (
+    SELECT
+        p.Id AS PostId,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVotes,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownVotes,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 8 THEN v.BountyAmount ELSE 0 END), 0) AS TotalBounty,
+        COUNT(*) AS TotalVotes
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    GROUP BY p.Id
+),
+QuestionsWithAnswers AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate AS QuestionCreated,
+        q.Score AS QuestionScore,
+        q.ViewCount AS QuestionViews,
+        q.Tags,
+        p.Id AS AnswerId,
+        p.Score AS AnswerScore,
+        p.ViewCount AS AnswerViews,
+        u.DisplayName AS AnswerUser,
+        p.CreationDate AS AnswerCreated,
+        pv.UpVotes AS AnswerUpVotes,
+        pv.DownVotes AS AnswerDownVotes,
+        pv.TotalBounty AS AnswerBounty
+    FROM Posts q
+    LEFT JOIN Posts p ON p.ParentId = q.Id AND p.PostTypeId = 2
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN PostVotesAgg pv ON p.Id = pv.PostId
+    WHERE q.PostTypeId = 1
+),
+ClosedRecently AS (
+    SELECT
+        ph.PostId,
+        MAX(ph.CreationDate) AS LastClosedDate,
+        STRING_AGG(DISTINCT crt.Name, ', ') AS CloseReasons
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id AND pht.Name = 'Post Closed'
+    LEFT JOIN CloseReasonTypes crt ON CAST(ph.Comment AS integer) = crt.Id
+    WHERE ph.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days'
+    GROUP BY ph.PostId
+),
+AnswersRanked AS (
+    SELECT
+        qa.*,
+        ROW_NUMBER() OVER (PARTITION BY qa.QuestionId ORDER BY qa.AnswerScore DESC NULLS LAST, qa.AnswerUpVotes DESC NULLS LAST) AS AnswerRanking
+    FROM QuestionsWithAnswers qa
+),
+TopAnswersWithCloseInfo AS (
+    SELECT
+        ar.QuestionId,
+        ar.Title,
+        ar.AnswerId,
+        ar.AnswerScore,
+        ar.AnswerUpVotes,
+        ar.AnswerDownVotes,
+        ar.AnswerBounty,
+        ar.AnswerUser,
+        ar.AnswerCreated,
+        cr.LastClosedDate,
+        cr.CloseReasons,
+        ubs.DisplayName AS AnswerUserBadge,
+        ubs.GoldBadges,
+        ubs.SilverBadges,
+        ubs.BronzeBadges,
+        ubs.BadgeScore,
+        ubs.BadgeRank,
+        STRING_AGG(DISTINCT th.TagName, ', ') AS TagsCovered
+    FROM AnswersRanked ar
+    LEFT JOIN ClosedRecently cr ON ar.QuestionId = cr.PostId
+    LEFT JOIN UserBadgeSummary ubs ON ubs.UserId = ar.AnswerUser
+    LEFT JOIN RecursiveTagHierarchy th ON POSITION(th.TagName IN COALESCE(ar.Tags, '')) > 0
+    WHERE ar.AnswerRanking <= 3
+    GROUP BY
+        ar.QuestionId, ar.Title, ar.AnswerId, ar.AnswerScore, ar.AnswerUpVotes, ar.AnswerDownVotes, ar.AnswerBounty,
+        ar.AnswerUser, ar.AnswerCreated,
+        cr.LastClosedDate, cr.CloseReasons,
+        ubs.DisplayName, ubs.GoldBadges, ubs.SilverBadges, ubs.BronzeBadges, ubs.BadgeScore, ubs.BadgeRank
+)
+SELECT
+    qtb.QuestionId,
+    qtb.Title,
+    qtb.AnswerId,
+    qtb.AnswerScore,
+    qtb.AnswerUpVotes,
+    qtb.AnswerDownVotes,
+    qtb.AnswerBounty,
+    COALESCE(qtb.AnswerUser, '[deleted]') AS AnswerUser,
+    qtb.AnswerCreated,
+    qtb.LastClosedDate,
+    COALESCE(qtb.CloseReasons, 'Open') AS CloseStatus,
+    qtb.AnswerUserBadge,
+    qtb.GoldBadges,
+    qtb.SilverBadges,
+    qtb.BronzeBadges,
+    qtb.BadgeScore,
+    qtb.BadgeRank,
+    SUBSTRING(qtb.TagsCovered FROM 1 FOR 100) AS TagsCovered,
+    ROW_NUMBER() OVER (PARTITION BY qtb.QuestionId ORDER BY qtb.AnswerScore DESC NULLS LAST, qtb.AnswerBounty DESC NULLS LAST) AS AnswerOrderWithinQuestion,
+    (SELECT COUNT(*) FROM Posts p2 WHERE p2.ParentId = qtb.QuestionId AND p2.PostTypeId = 2) AS TotalAnswersForQuestion,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = qtb.QuestionId AND c.CreationDate > qtb.AnswerCreated) AS CommentsAfterTopAnswer
+FROM TopAnswersWithCloseInfo qtb
+WHERE qtb.AnswerScore > 5 OR qtb.AnswerBounty > 0
+ORDER BY qtb.BadgeRank NULLS LAST, qtb.AnswerScore DESC NULLS LAST, qtb.AnswerBounty DESC NULLS LAST
+LIMIT 50;

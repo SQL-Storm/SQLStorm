@@ -1,0 +1,136 @@
+-- {"query": "2237.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1426} 
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.CreationDate,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsAsked,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersGiven,
+        coalesce(sum(v.VoteTypeId = 2::int::boolean)::int,0) as UpVotesReceived,
+        coalesce(sum(v.VoteTypeId = 3::int::boolean)::int,0) as DownVotesReceived,
+        row_number() over (partition by u.Id order by max(p.CreationDate) desc) as LastPostRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Votes v on v.PostId = p.Id
+    group by u.Id, u.DisplayName, u.CreationDate
+), RecentQuestions as (
+    select p.Id, p.OwnerUserId, p.Title, p.Score, p.CreationDate,
+           row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as rn
+    from Posts p
+    where p.PostTypeId = 1 and p.ClosedDate is null
+), FilteredQuestions as (
+    select q.*
+    from RecentQuestions q
+    where q.rn <= 5 -- last 5 questions per user
+), QuestionTags as (
+    select
+        fq.Id as QuestionId,
+        unnest(string_to_array(substring(fq.Tags from 2 for char_length(fq.Tags)-2), '><')) as Tag
+    from FilteredQuestions fq
+), TopTags as (
+    select Tag,
+         count(*) as QuestionsCount
+    from QuestionTags
+    group by Tag
+    having count(*) > 10
+    order by QuestionsCount desc
+    limit 10
+), AnswersWithScores as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId as AnswererId,
+        a.Score as AnswerScore,
+        p.Score as QuestionScore,
+        row_number() over (partition by a.ParentId order by a.Score desc nulls last) as AnswerRank
+    from Posts a
+    join Posts p on p.Id = a.ParentId
+    where a.PostTypeId = 2 and p.PostTypeId = 1 and p.ClosedDate is null
+), AcceptedAnswerDetails as (
+    select
+        q.Id as QuestionId,
+        q.AcceptedAnswerId,
+        aa.OwnerUserId as AcceptedAnswererId,
+        aa.Score as AcceptedAnswerScore
+    from Posts q
+    left join Posts aa on aa.Id = q.AcceptedAnswerId
+    where q.PostTypeId = 1
+), BadgeCounts as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+), UserBadgeSummary as (
+    select
+        UserId,
+        coalesce(sum(case when Class=1 then BadgeCount end),0) as GoldBadges,
+        coalesce(sum(case when Class=2 then BadgeCount end),0) as SilverBadges,
+        coalesce(sum(case when Class=3 then BadgeCount end),0) as BronzeBadges
+    from BadgeCounts
+    group by UserId
+), UserStats as (
+    select
+        rua.UserId,
+        rua.DisplayName,
+        rua.CreationDate,
+        rua.QuestionsAsked,
+        rua.AnswersGiven,
+        rua.UpVotesReceived,
+        rua.DownVotesReceived,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        max(fq.Score) filter (where fq.OwnerUserId = rua.UserId) as MaxQuestionScore,
+        max(aw.AnswerScore) filter (where aw.AnswererId = rua.UserId) as MaxAnswerScore,
+        count(distinct aw.QuestionId) filter (where aw.AnswererId = rua.UserId and aw.AnswerRank = 1) as AcceptedAnswerCounts
+    from RecursiveUserActivity rua
+    left join FilteredQuestions fq on fq.OwnerUserId = rua.UserId
+    left join AnswersWithScores aw on aw.AnswererId = rua.UserId
+    left join UserBadgeSummary ub on ub.UserId = rua.UserId
+    group by rua.UserId, rua.DisplayName, rua.CreationDate, rua.QuestionsAsked, rua.AnswersGiven, rua.UpVotesReceived, rua.DownVotesReceived, ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges
+)
+select
+    us.UserId,
+    us.DisplayName,
+    us.CreationDate,
+    us.QuestionsAsked,
+    us.AnswersGiven,
+    us.UpVotesReceived,
+    us.DownVotesReceived,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    coalesce(us.MaxQuestionScore,0) as MaxQuestionScore,
+    coalesce(us.MaxAnswerScore,0) as MaxAnswerScore,
+    coalesce(us.AcceptedAnswerCounts,0) as AcceptedAnswerCount,
+    tt.Tag as PopularQuestionTag,
+    (select count(*) from Comments c where c.UserId = us.UserId and c.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '1 year') as RecentCommentsCount,
+    (select count(*) from PostHistory ph where ph.UserId = us.UserId and ph.PostHistoryTypeId in (10,11)) as CloseReopenEvents,
+    case
+        when us.UpVotesReceived + us.DownVotesReceived = 0 then null
+        else round(1.0 * us.UpVotesReceived / (us.UpVotesReceived + us.DownVotesReceived), 2)
+    end as UpvoteRatio,
+    lag(us.QuestionsAsked) over (order by us.QuestionsAsked desc) as PrevUserQuestionsAsked,
+    lead(us.AnswersGiven) over (order by us.AnswersGiven asc) as NextUserAnswersGiven
+from UserStats us
+left join lateral (
+    select tt.Tag
+    from TopTags tt
+    join QuestionTags qt on qt.Tag = tt.Tag
+    join FilteredQuestions fq on fq.Id = qt.QuestionId
+    where fq.OwnerUserId = us.UserId
+    group by tt.Tag
+    order by count(*) desc
+    limit 1
+) tt on true
+where us.QuestionsAsked > 2
+and exists (
+    select 1 from Posts p 
+    where p.OwnerUserId = us.UserId 
+    and p.PostTypeId = 1 
+    and p.ClosedDate is null
+    and p.Score > 5
+)
+order by us.QuestionsAsked desc, us.UpVotesReceived desc;

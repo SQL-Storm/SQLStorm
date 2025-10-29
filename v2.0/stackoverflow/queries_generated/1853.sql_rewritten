@@ -1,0 +1,233 @@
+-- {"query": "1853.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3382} 
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.Views AS UserViews,
+        U.UpVotes AS UserUpVotesGiven,
+        U.DownVotes AS UserDownVotesGiven,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsAsked,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersGiven,
+        COALESCE(SUM(P.Score), 0) AS TotalPostScoreReceived,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        COALESCE(SUM(C.Score), 0) AS TotalCommentScoreReceived,
+        MAX(P.CreationDate) AS LatestPostDate,
+        MAX(C.CreationDate) AS LatestCommentDate,
+        MIN(U.CreationDate) AS UserCreationDate,
+        MAX(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS HasGoldBadge,
+        MAX(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS HasSilverBadge,
+        MAX(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS HasBronzeBadge,
+        U.Location
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.Views, U.UpVotes, U.DownVotes, U.CreationDate, U.Location
+),
+PostDetails AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.OwnerUserId,
+        P.Title,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        COALESCE(P.ViewCount, 0) AS PostViewCount,
+        P.AnswerCount,
+        COALESCE(P.FavoriteCount, 0) AS PostFavoriteCount,
+        LENGTH(P.Body) AS BodyLength,
+        LENGTH(P.Title) AS TitleLength,
+        -- Parse tags into an array for easier joining/analysis
+        CASE WHEN P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2 THEN string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><') ELSE '{}'::varchar[] END AS PostTagsArray,
+        ARRAY_LENGTH(CASE WHEN P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2 THEN string_to_array(SUBSTRING(P.Tags, 2, LENGTH(P.Tags) - 2), '><') ELSE '{}'::varchar[] END, 1) AS TagCount,
+        P.LastEditDate,
+        P.LastActivityDate,
+        P.ClosedDate,
+        P.AcceptedAnswerId,
+        -- Correlated subquery to find the latest timestamp of a body edit/initialization
+        (
+            SELECT MAX(PH_BODY.CreationDate)
+            FROM PostHistory PH_BODY
+            WHERE PH_BODY.PostId = P.Id
+            AND PH_BODY.PostHistoryTypeId IN (2, 5, 8) -- Initial Body, Edit Body, Rollback Body
+        ) AS LastBodyEditDate,
+        -- Correlated subquery to count distinct users who edited this post
+        (
+            SELECT COUNT(DISTINCT PH_EDITOR.UserId)
+            FROM PostHistory PH_EDITOR
+            WHERE PH_EDITOR.PostId = P.Id
+            AND PH_EDITOR.UserId IS NOT NULL
+        ) AS DistinctEditors,
+        -- Calculate post age in days when closed, or current age if not closed
+        EXTRACT(DAY FROM (COALESCE(P.ClosedDate, cast('2024-10-01 12:34:56' as timestamp)) - P.CreationDate)) AS PostAgeDaysWhenClosedOrCurrent,
+        -- Correlated subquery to check if the post has any "duplicate" links
+        EXISTS (
+            SELECT 1 FROM PostLinks PL WHERE PL.PostId = P.Id AND PL.LinkTypeId = 3
+        ) AS HasDuplicateLinks,
+        -- Window function: Rank posts by score within their PostType and CreationYear
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId, EXTRACT(YEAR FROM P.CreationDate) ORDER BY P.Score DESC, P.CreationDate ASC) AS RankInPostTypeByScore,
+        -- Window function: Calculate average score of posts by the same owner within a 30-day sliding window
+        AVG(P.Score) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate ROWS BETWEEN 30 PRECEDING AND CURRENT ROW) AS OwnerRollingAvgScore
+    FROM Posts P
+    JOIN PostTypes PT ON P.PostTypeId = PT.Id
+    WHERE P.PostTypeId IN (1, 2) -- Only questions and answers for detailed analysis
+),
+PostHistoryAnalysis AS (
+    SELECT
+        PH.PostId,
+        PH.UserId AS HistoryUserId,
+        PH.PostHistoryTypeId,
+        PHT.Name AS PostHistoryTypeName,
+        PH.CreationDate AS HistoryDate,
+        PH.Comment AS HistoryComment,
+        -- Window functions: Get previous and next history event types for sequence detection
+        LAG(PH.PostHistoryTypeId, 1) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) AS PrevHistoryType,
+        LEAD(PH.PostHistoryTypeId, 1) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate) AS NextHistoryType,
+        -- Calculate time difference between consecutive history events for the same post
+        EXTRACT(EPOCH FROM (PH.CreationDate - LAG(PH.CreationDate, 1) OVER (PARTITION BY PH.PostId ORDER BY PH.CreationDate))) AS TimeSincePrevEventSeconds,
+        -- Identify if a post was closed specifically as a duplicate (using a specific close reason ID 101)
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 AND PH.Comment LIKE '101%' THEN 1 ELSE 0 END) OVER (PARTITION BY PH.PostId) AS IsDuplicateClosed
+    FROM PostHistory PH
+    JOIN PostHistoryTypes PHT ON PH.PostHistoryTypeId = PHT.Id
+    WHERE PH.PostHistoryTypeId IN (10, 11, 12, 13, 101, 102, 103, 104, 105) -- Closed, Reopened, Deleted, Undeleted, specific close reasons
+),
+TagPerformance AS (
+    SELECT
+        T.TagName,
+        COUNT(DISTINCT P.Id) AS TotalPostsWithTag,
+        COALESCE(SUM(P.Score), 0) AS TotalTagScore,
+        AVG(P.Score) AS AvgTagScore,
+        COUNT(DISTINCT CASE WHEN P.ClosedDate IS NOT NULL THEN P.Id END) AS ClosedPostsWithTag,
+        -- Correlated subquery to find the most common owner of posts associated with this tag
+        (
+            SELECT U.DisplayName
+            FROM Posts P_INNER
+            JOIN Users U ON P_INNER.OwnerUserId = U.Id
+            WHERE P_INNER.Tags LIKE '%<' || T.TagName || '>%' -- Simplified tag matching for this subquery
+            GROUP BY U.DisplayName
+            ORDER BY COUNT(P_INNER.Id) DESC
+            LIMIT 1
+        ) AS MostCommonOwnerDisplayName,
+        -- Correlated subquery to calculate the average number of edits for posts containing this tag
+        (
+            SELECT AVG(PD_INNER.DistinctEditors)
+            FROM PostDetails PD_INNER
+            JOIN Posts P_INNER ON PD_INNER.PostId = P_INNER.Id
+            WHERE P_INNER.Tags LIKE '%<' || T.TagName || '>%'
+        ) AS AvgEditsForTagPosts
+    FROM Tags T
+    JOIN Posts P ON P.Tags LIKE '%<' || T.TagName || '>%' -- General tag search, not array-based
+    GROUP BY T.TagName
+),
+AnomalyPostsCTE AS (
+    -- Set Operator: First branch for anomaly detection: Highly viewed posts with relatively low scores
+    SELECT
+        PD.PostId,
+        'High Views, Low Score' AS AnomalyType,
+        PD.PostViewCount,
+        PD.PostScore
+    FROM PostDetails PD
+    WHERE PD.PostViewCount > 5000 AND PD.PostScore < 10 AND PD.PostTypeId = 1
+
+    UNION ALL
+
+    -- Set Operator: Second branch for anomaly detection: Highly scored posts with very few comments
+    SELECT
+        PD.PostId,
+        'High Score, Low Comments' AS AnomalyType,
+        PD.PostViewCount,
+        PD.PostScore
+    FROM PostDetails PD
+    WHERE PD.PostScore > 200 AND PD.AnswerCount > 0 AND PD.PostFavoriteCount < 5 AND PD.PostTypeId = 1
+)
+-- Main query combining all CTEs and applying various transformations
+SELECT
+    UE.UserId,
+    COALESCE(UE.DisplayName, 'Anonymous User') AS UserDisplayName, -- NULL logic: default display name
+    UE.Reputation,
+    UE.UserViews,
+    UE.TotalPosts,
+    UE.QuestionsAsked,
+    UE.AnswersGiven,
+    UE.TotalPostScoreReceived,
+    UE.TotalComments,
+    UE.TotalCommentScoreReceived,
+    UE.HasGoldBadge,
+    UE.HasSilverBadge,
+    UE.HasBronzeBadge,
+    PD.PostId,
+    PD.PostTypeName,
+    PD.Title AS PostTitle,
+    PD.PostCreationDate,
+    PD.PostScore,
+    PD.PostViewCount,
+    PD.PostFavoriteCount,
+    PD.BodyLength,
+    PD.TitleLength,
+    PD.TagCount,
+    -- Join TagPerformance using LATERAL UNNEST for all tags associated with a post, then aggregate
+    COALESCE(string_agg(DISTINCT TP_joined.TagName, ',' ORDER BY TP_joined.TagName), 'No Tags') AS AssociatedTagNames,
+    COALESCE(AVG(TP_joined.AvgTagScore), 0.0) AS AvgAssociatedTagScore,
+    PD.LastEditDate,
+    PD.LastActivityDate,
+    PD.ClosedDate,
+    PD.PostAgeDaysWhenClosedOrCurrent,
+    PD.HasDuplicateLinks,
+    PD.LastBodyEditDate,
+    PD.DistinctEditors,
+    PD.RankInPostTypeByScore,
+    PD.OwnerRollingAvgScore,
+    PHA.IsDuplicateClosed,
+    AP.AnomalyType, -- Anomaly type (NULL if not an anomaly)
+    AP.PostViewCount AS AnomalyPostViewCount,
+    AP.PostScore AS AnomalyPostScore,
+    -- Complicated Calculation: User engagement ratio
+    CAST(UE.TotalComments AS DECIMAL) / NULLIF(UE.TotalPosts, 0) AS CommentsPerPostRatio,
+    -- Complicated Predicate/Expression: Categorize 'Hotness' based on multiple metrics
+    CASE
+        WHEN UE.Reputation > 5000 AND PD.PostScore > 100 AND PD.PostViewCount > 10000 THEN 'Very Hot'
+        WHEN UE.Reputation > 1000 AND PD.PostScore > 50 AND PD.PostViewCount > 5000 THEN 'Hot'
+        ELSE 'Normal'
+    END AS HotnessCategory,
+    -- String Expression: Shortened title preview
+    SUBSTRING(PD.Title, 1, 50) || '...' AS ShortPostTitlePreview,
+    -- String Expression: Check for "problem" keywords in title (case-insensitive)
+    LOWER(PD.Title) SIMILAR TO '%(help|bug|error|problem|urgent|fix|issue)%' AS HasProblemKeywords,
+    -- NULL logic: Default value for user location if missing or empty
+    CASE WHEN UE.Location IS NULL OR TRIM(UE.Location) = '' THEN 'Unknown Location' ELSE UE.Location END AS UserLocationStatus
+FROM UserEngagement UE
+LEFT JOIN PostDetails PD ON UE.UserId = PD.OwnerUserId
+-- LATERAL JOIN to unnest the PostTagsArray and join with TagPerformance
+LEFT JOIN LATERAL UNNEST(PD.PostTagsArray) AS UnnestedTag (TagName) ON TRUE
+LEFT JOIN TagPerformance TP_joined ON UnnestedTag.TagName = TP_joined.TagName
+LEFT JOIN PostHistoryAnalysis PHA ON PD.PostId = PHA.PostId
+LEFT JOIN AnomalyPostsCTE AP ON PD.PostId = AP.PostId
+WHERE
+    UE.Reputation > 100 -- Filter for more established users
+    AND PD.PostCreationDate BETWEEN '2020-01-01' AND '2022-12-31' -- Specific date range
+    AND (PD.PostScore > 10 OR PD.PostViewCount > 1000) -- Filter for impactful posts
+    AND NOT EXISTS ( -- Correlated subquery: Exclude users who only posted answers without asking any questions
+        SELECT 1
+        FROM UserEngagement UE_INNER
+        WHERE UE_INNER.UserId = UE.UserId
+        AND UE_INNER.QuestionsAsked = 0
+        AND UE_INNER.AnswersGiven > 0
+    )
+    AND PHA.PostHistoryTypeId IS DISTINCT FROM 12 -- NULL logic: Exclude posts that were explicitly deleted
+    AND (PHA.PrevHistoryType = 10 AND PHA.NextHistoryType = 11) IS NOT TRUE -- NULL logic: Exclude posts that were closed and then immediately reopened (handles NULLs gracefully)
+GROUP BY
+    UE.UserId, UE.DisplayName, UE.Reputation, UE.UserViews, UE.TotalPosts, UE.QuestionsAsked, UE.AnswersGiven,
+    UE.TotalPostScoreReceived, UE.TotalComments, UE.TotalCommentScoreReceived, UE.HasGoldBadge, UE.HasSilverBadge,
+    UE.HasBronzeBadge, UE.Location, PD.PostId, PD.PostTypeName, PD.Title, PD.PostCreationDate, PD.PostScore,
+    PD.PostViewCount, PD.PostFavoriteCount, PD.BodyLength, PD.TitleLength, PD.TagCount, PD.LastEditDate,
+    PD.LastActivityDate, PD.ClosedDate, PD.PostAgeDaysWhenClosedOrCurrent, PD.HasDuplicateLinks,
+    PD.LastBodyEditDate, PD.DistinctEditors, PD.RankInPostTypeByScore, PD.OwnerRollingAvgScore,
+    PHA.IsDuplicateClosed, AP.AnomalyType, AP.PostViewCount, AP.PostScore
+ORDER BY
+    UE.Reputation DESC,
+    PD.PostScore DESC,
+    PD.PostCreationDate DESC
+LIMIT 1000;

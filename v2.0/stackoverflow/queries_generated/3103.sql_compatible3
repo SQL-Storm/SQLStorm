@@ -1,0 +1,116 @@
+WITH UserStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS Questions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS Answers,
+        COALESCE(SUM(p.Score), 0) AS TotalScore,
+        COALESCE(AVG(p.Score), 0) AS AvgScore,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(b.Class) AS HighestBadgeClass
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopPosts AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Score,
+        p.CreationDate,
+        p.OwnerUserId,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+UserVotes AS (
+    SELECT
+        v.UserId,
+        SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotesGiven,
+        SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotesGiven,
+        SUM(CASE WHEN vt.Name = 'Favorite' THEN 1 ELSE 0 END) AS FavoritesGiven
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY v.UserId
+),
+TagStats AS (
+    SELECT
+        t.TagName,
+        COUNT(p.Id) AS QuestionCount,
+        AVG(p.Score) AS AvgQuestionScore,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS ClosedCount
+    FROM Tags t
+    JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+    WHERE p.PostTypeId = 1
+    GROUP BY t.TagName
+),
+RecentComments AS (
+    SELECT
+        c.PostId,
+        STRING_AGG(TRIM(c.Text), '; ') AS CommentsAgg,
+        MAX(c.CreationDate) AS LatestComment
+    FROM Comments c
+    WHERE c.CreationDate > (CAST('2024-10-01' AS date) - INTERVAL '30' DAY)
+    GROUP BY c.PostId
+),
+MainRows AS (
+    SELECT
+        us.Id,
+        us.DisplayName,
+        us.Reputation,
+        us.TotalPosts,
+        us.Questions,
+        us.Answers,
+        us.TotalScore,
+        us.AvgScore,
+        us.BadgeCount,
+        us.HighestBadgeClass,
+        uv.UpVotesGiven,
+        uv.DownVotesGiven,
+        uv.FavoritesGiven,
+        tp.Id AS TopQuestionId,
+        tp.Title AS TopQuestionTitle,
+        tp.Score AS TopQuestionScore,
+        rc.CommentsAgg,
+        rc.LatestComment
+    FROM UserStats us
+    LEFT JOIN UserVotes uv ON uv.UserId = us.Id
+    LEFT JOIN TopPosts tp ON tp.OwnerUserId = us.Id AND tp.rn = 1
+    LEFT JOIN RecentComments rc ON rc.PostId = tp.Id
+    WHERE us.Reputation > 10000
+      AND (us.TotalScore IS NULL OR us.TotalScore <> 0)
+      AND (us.BadgeCount > 0 OR COALESCE(uv.FavoritesGiven, 0) > 5)
+)
+SELECT *
+FROM MainRows
+ORDER BY Reputation DESC, TotalScore DESC
+
+UNION ALL
+
+SELECT
+    CAST(NULL AS bigint) AS Id,
+    'Aggregate Summary' AS DisplayName,
+    CAST(NULL AS integer) AS Reputation,
+    SUM(us.TotalPosts) AS TotalPosts,
+    SUM(us.Questions) AS Questions,
+    SUM(us.Answers) AS Answers,
+    SUM(us.TotalScore) AS TotalScore,
+    AVG(us.AvgScore) AS AvgScore,
+    SUM(us.BadgeCount) AS BadgeCount,
+    MAX(us.HighestBadgeClass) AS HighestBadgeClass,
+    SUM(COALESCE(uv.UpVotesGiven, 0)) AS UpVotesGiven,
+    SUM(COALESCE(uv.DownVotesGiven, 0)) AS DownVotesGiven,
+    SUM(COALESCE(uv.FavoritesGiven, 0)) AS FavoritesGiven,
+    CAST(NULL AS bigint) AS TopQuestionId,
+    CAST(NULL AS text) AS TopQuestionTitle,
+    CAST(NULL AS integer) AS TopQuestionScore,
+    CAST(NULL AS text) AS CommentsAgg,
+    CAST(NULL AS timestamp) AS LatestComment
+FROM UserStats us
+LEFT JOIN UserVotes uv ON uv.UserId = us.Id
+WHERE us.Reputation > 5000
+;

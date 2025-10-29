@@ -1,0 +1,248 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LatestPostDate,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Elite'
+            WHEN u.Reputation > 5000 THEN 'Veteran'
+            WHEN u.Reputation > 1000 THEN 'Contributor'
+            ELSE 'Newbie'
+        END as UserTier,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) as Ranking,
+        AVG(p.Score) as AvgPostScore,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags)-2)), ', ') as AllTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 0
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes
+),
+TopUsers AS (
+    SELECT UserId, DisplayName, Reputation, PostCount, Ranking
+    FROM UserStats
+    WHERE Ranking <= 1000
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.PostTypeId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.Tags,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END as PostTypeDesc,
+        COALESCE(p.AcceptedAnswerId, 0) as HasAcceptedAnswer,
+        CASE 
+            WHEN p.Score > 10 THEN 'Highly Voted'
+            WHEN p.Score > 5 THEN 'Moderately Voted'
+            WHEN p.Score > 0 THEN 'Slightly Voted'
+            ELSE 'No Votes'
+        END as VoteCategory,
+        DENSE_RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) as ScoreRank,
+        AVG(p.Score) OVER (PARTITION BY p.PostTypeId) as AvgScoreByType,
+        RANK() OVER (ORDER BY p.CreationDate DESC) as RecencyRank,
+        LAG(p.Score, 1, 0) OVER (ORDER BY p.CreationDate) as PrevScore,
+        LAG(p.CreationDate, 1, DATE '1900-01-01') OVER (ORDER BY p.CreationDate) as PrevDate
+    FROM Posts p
+    WHERE p.Score IS NOT NULL 
+      AND p.CreationDate > DATE '2010-01-01'
+),
+RankedPosts AS (
+    SELECT 
+        pa.PostId,
+        pa.Title,
+        pa.Score,
+        pa.ViewCount,
+        pa.OwnerUserId,
+        pa.CreationDate,
+        pa.PostTypeDesc,
+        pa.HasAcceptedAnswer,
+        pa.VoteCategory,
+        pa.ScoreRank,
+        pa.AvgScoreByType,
+        pa.RecencyRank,
+        pa.PrevScore,
+        pa.PrevDate,
+        EXTRACT(day FROM (pa.CreationDate - pa.PrevDate)) as DaysSinceLastPost,
+        CASE WHEN pa.Score > pa.AvgScoreByType THEN 1 ELSE 0 END as AboveAverageScore
+    FROM PostAnalysis pa
+),
+QuestionAnalysis AS (
+    SELECT 
+        rp.PostId,
+        rp.Title,
+        rp.Score,
+        rp.ViewCount,
+        rp.OwnerUserId,
+        rp.CreationDate,
+        rp.VoteCategory,
+        rp.ScoreRank,
+        rp.AvgScoreByType,
+        rp.RecencyRank,
+        rp.DaysSinceLastPost,
+        rp.AboveAverageScore,
+        CASE 
+            WHEN rp.Score > 50 THEN 'Popular Question'
+            WHEN rp.Score > 20 THEN 'Good Question'
+            WHEN rp.Score > 5 THEN 'Average Question'
+            ELSE 'Low Question'
+        END as QuestionPopularity,
+        COUNT(v.Id) as VoteCount,
+        COUNT(DISTINCT v.UserId) as UniqueVoters,
+        AVG(v.BountyAmount) as AvgBounty,
+        MAX(v.CreationDate) as LastVoteDate
+    FROM RankedPosts rp
+    LEFT JOIN Votes v ON rp.PostId = v.PostId AND v.VoteTypeId IN (2, 3, 5)
+    WHERE rp.PostTypeDesc = 'Question'
+    GROUP BY rp.PostId, rp.Title, rp.Score, rp.ViewCount, rp.OwnerUserId, 
+             rp.CreationDate, rp.VoteCategory, rp.ScoreRank, rp.AvgScoreByType, 
+             rp.RecencyRank, rp.DaysSinceLastPost, rp.AboveAverageScore, rp.QuestionPopularity
+),
+AnswerAnalysis AS (
+    SELECT 
+        rp.PostId,
+        rp.Title,
+        rp.Score,
+        rp.ViewCount,
+        rp.OwnerUserId,
+        rp.CreationDate,
+        rp.VoteCategory,
+        rp.ScoreRank,
+        rp.AvgScoreByType,
+        rp.RecencyRank,
+        rp.DaysSinceLastPost,
+        rp.AboveAverageScore,
+        COUNT(v.Id) as VoteCount,
+        COUNT(DISTINCT v.UserId) as UniqueVoters,
+        AVG(v.BountyAmount) as AvgBounty,
+        MAX(v.CreationDate) as LastVoteDate
+    FROM RankedPosts rp
+    LEFT JOIN Votes v ON rp.PostId = v.PostId AND v.VoteTypeId IN (2, 3, 5)
+    WHERE rp.PostTypeDesc = 'Answer'
+    GROUP BY rp.PostId, rp.Title, rp.Score, rp.ViewCount, rp.OwnerUserId, 
+             rp.CreationDate, rp.VoteCategory, rp.ScoreRank, rp.AvgScoreByType, 
+             rp.RecencyRank, rp.DaysSinceLastPost, rp.AboveAverageScore
+),
+CombinedAnalysis AS (
+    SELECT 
+        'Question' as EntityType,
+        qa.PostId,
+        qa.Title,
+        qa.Score,
+        qa.ViewCount,
+        qa.OwnerUserId,
+        qa.CreationDate,
+        qa.QuestionPopularity as PopularityType,
+        qa.VoteCount,
+        qa.UniqueVoters,
+        qa.AvgBounty,
+        qa.LastVoteDate,
+        NULL::INTEGER as AnswerCount
+    FROM QuestionAnalysis qa
+    UNION ALL
+    SELECT 
+        'Answer' as EntityType,
+        aa.PostId,
+        aa.Title,
+        aa.Score,
+        aa.ViewCount,
+        aa.OwnerUserId,
+        aa.CreationDate,
+        'Answer' as PopularityType,
+        aa.VoteCount,
+        aa.UniqueVoters,
+        aa.AvgBounty,
+        aa.LastVoteDate,
+        NULL::INTEGER as AnswerCount
+    FROM AnswerAnalysis aa
+)
+SELECT 
+    ca.EntityType,
+    ca.PostId,
+    ca.Title,
+    ca.Score,
+    ca.ViewCount,
+    ca.OwnerUserId,
+    ca.CreationDate,
+    ca.PopularityType,
+    ca.VoteCount,
+    ca.UniqueVoters,
+    ca.AvgBounty,
+    ca.LastVoteDate,
+    us.Ranking,
+    us.DisplayName,
+    us.Reputation,
+    us.PostCount,
+    us.CommentCount,
+    us.BadgeCount,
+    CASE 
+        WHEN us.UserTier = 'Elite' AND ca.Score > 100 THEN 1
+        WHEN us.UserTier = 'Veteran' AND ca.Score > 75 THEN 1
+        WHEN us.UserTier = 'Contributor' AND ca.Score > 50 THEN 1
+        ELSE 0
+    END as HighValueContribution,
+    CASE WHEN ca.Score > 0 AND ca.VoteCount > 0 THEN CAST((ca.Score * 1.0 / ca.VoteCount) AS NUMERIC(10,2)) ELSE 0 END as ScoreEfficiency,
+    COALESCE(u1.DisplayName, 'Unknown') as OwnerDisplayName,
+    COALESCE(u2.DisplayName, 'Unknown') as EditorDisplayName,
+    STRING_AGG(DISTINCT SUBSTRING(ca.Title FROM 1 FOR 50), ' | ') as SampleTitles,
+    COUNT(*) OVER () as TotalResults
+FROM CombinedAnalysis ca
+INNER JOIN UserStats us ON ca.OwnerUserId = us.UserId
+LEFT JOIN Users u1 ON ca.OwnerUserId = u1.Id
+LEFT JOIN Users u2 ON ca.OwnerUserId = u2.Id
+LEFT JOIN Posts p ON ca.PostId = p.Id
+LEFT JOIN PostHistory ph ON ca.PostId = ph.PostId AND ph.PostHistoryTypeId IN (1, 2, 3)
+WHERE ca.Score > 10
+  AND us.Reputation > 1000
+  AND ca.CreationDate >= DATE '2020-01-01'
+  AND (ca.EntityType = 'Question' OR (ca.EntityType = 'Answer' AND ca.Score > 2))
+GROUP BY 
+    ca.EntityType,
+    ca.PostId,
+    ca.Title,
+    ca.Score,
+    ca.ViewCount,
+    ca.OwnerUserId,
+    ca.CreationDate,
+    ca.PopularityType,
+    ca.VoteCount,
+    ca.UniqueVoters,
+    ca.AvgBounty,
+    ca.LastVoteDate,
+    us.Ranking,
+    us.DisplayName,
+    us.Reputation,
+    us.PostCount,
+    us.CommentCount,
+    us.BadgeCount,
+    u1.DisplayName,
+    u2.DisplayName,
+    HighValueContribution,
+    ScoreEfficiency,
+    ca.TotalResults
+HAVING 
+    MAX(CASE WHEN us.UserTier = 'Elite' THEN 1 ELSE 0 END) = 1
+    OR MAX(CASE WHEN us.UserTier = 'Veteran' THEN 1 ELSE 0 END) = 1
+ORDER BY 
+    ca.Score DESC,
+    ca.ViewCount DESC,
+    ca.UniqueVoters DESC
+LIMIT 100;

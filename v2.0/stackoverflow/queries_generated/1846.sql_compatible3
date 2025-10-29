@@ -1,0 +1,226 @@
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.UpVotes AS TotalUpVotesGiven,
+        U.DownVotes AS TotalDownVotesGiven,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswers,
+        SUM(COALESCE(P.Score, 0)) AS TotalPostScore,
+        SUM(COALESCE(C.Score, 0)) AS TotalCommentScore,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        MAX(P.LastActivityDate) AS LastPostActivity,
+        MAX(C.CreationDate) AS LastCommentActivity
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.UpVotes, U.DownVotes, U.CreationDate, U.LastAccessDate
+),
+BadgeSummary AS (
+    SELECT
+        B.UserId,
+        COUNT(B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MIN(B.Date) AS FirstBadgeDate
+    FROM Badges B
+    GROUP BY B.UserId
+),
+PostHistoryDetails AS (
+    SELECT
+        PH.PostId,
+        PH.UserId AS EditorUserId,
+        PH.CreationDate AS HistoryDate,
+        PH.PostHistoryTypeId,
+        PHT.Name AS HistoryTypeName,
+        CR.Name AS CloseReasonName,
+        PH.Comment AS HistoryComment,
+        NULLIF(TRIM(PH.Text), '') AS HistoryTextRaw
+    FROM PostHistory PH
+    JOIN PostHistoryTypes PHT ON PH.PostHistoryTypeId = PHT.Id
+    LEFT JOIN CloseReasonTypes CR ON PH.PostHistoryTypeId = 10 AND PH.Comment = CAST(CR.Id AS VARCHAR)
+),
+PostTagAnalysis AS (
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        (
+          SELECT LISTAGG(s, ',') WITHIN GROUP (ORDER BY s) FROM (
+            SELECT TRIM(s) AS s
+            FROM (
+              SELECT regexp_split_to_table(SUBSTRING(P.Tags FROM 2 FOR (CHAR_LENGTH(P.Tags) - 2)), '><') AS s
+            ) t
+            WHERE TRIM(s) IN ('sql', 'performance', 'database', 'optimization', 'indexing', 'query')
+          ) sub
+        ) AS HotTags,
+        CASE
+            WHEN P.Tags IS NULL OR CHAR_LENGTH(P.Tags) <= 2 THEN 0
+            ELSE (SELECT COUNT(*) FROM regexp_split_to_table(SUBSTRING(P.Tags FROM 2 FOR (CHAR_LENGTH(P.Tags) - 2)), '><') AS s)
+        END AS TagCount
+    FROM Posts P
+    WHERE P.PostTypeId = 1
+      AND P.Tags IS NOT NULL
+      AND P.Tags <> '><'
+),
+OverallCommunityMetrics AS (
+    SELECT
+        AVG(UE.Reputation) AS AvgReputation,
+        AVG(UE.TotalPosts) AS AvgTotalPosts,
+        AVG(UE.TotalPostScore) AS AvgTotalPostScore,
+        AVG(UE.TotalComments) AS AvgTotalComments
+    FROM UserEngagement UE
+),
+UserCloseReasonSummary AS (
+    SELECT
+        P.OwnerUserId AS UserId,
+        PHD.PostId,
+        PHD.CloseReasonName
+    FROM Posts P
+    JOIN PostHistoryDetails PHD ON P.Id = PHD.PostId
+    WHERE PHD.PostHistoryTypeId = 10
+),
+HighImpactUsers AS (
+    SELECT
+        UE.UserId,
+        UE.DisplayName,
+        UE.Reputation,
+        UE.TotalQuestions,
+        UE.TotalAnswers,
+        COALESCE(BS.GoldBadges, 0) AS GoldBadgesCount,
+        UE.TotalPostScore,
+        UE.TotalCommentScore,
+        SUM(CASE WHEN PTA.HotTags IS NOT NULL AND LENGTH(PTA.HotTags) > 0 THEN 1 ELSE 0 END) AS PostsWithHotTags,
+        CAST(UE.TotalUpVotesGiven AS NUMERIC) / NULLIF(UE.TotalDownVotesGiven + 1, 0) AS UpDownVoteRatio,
+        UE.TotalPosts + UE.TotalComments AS TotalActivityEvents,
+        (
+            (UE.Reputation * 0.5)
+            + (COALESCE(BS.GoldBadges, 0) * 100)
+            + (UE.TotalPostScore * 0.7)
+            + (UE.TotalCommentScore * 0.3)
+            + (COUNT(DISTINCT UCRS.PostId) FILTER (WHERE UCRS.CloseReasonName IN ('Duplicate', 'Off-topic', 'Needs details or clarity')) * -50)
+            + (SUM(CASE WHEN PTA.HotTags IS NOT NULL AND LENGTH(PTA.HotTags) > 0 THEN 1 ELSE 0 END) * 20)
+        ) AS UserScore,
+        RANK() OVER (ORDER BY
+            (
+            (UE.Reputation * 0.5)
+            + (COALESCE(BS.GoldBadges, 0) * 100)
+            + (UE.TotalPostScore * 0.7)
+            + (UE.TotalCommentScore * 0.3)
+            + (COUNT(DISTINCT UCRS.PostId) FILTER (WHERE UCRS.CloseReasonName IN ('Duplicate', 'Off-topic', 'Needs details or clarity')) * -50)
+            + (SUM(CASE WHEN PTA.HotTags IS NOT NULL AND LENGTH(PTA.HotTags) > 0 THEN 1 ELSE 0 END) * 20)
+            ) DESC
+        ) AS ImpactRank,
+        AVG(UE.TotalPostScore) OVER (PARTITION BY (FLOOR(UE.TotalPosts / 10) * 10) ORDER BY UE.Reputation) AS AvgScoreInBand,
+        (
+         SELECT COUNT(DISTINCT C2.Id)
+         FROM Comments C2
+         WHERE C2.UserId = UE.UserId
+           AND LOWER(C2.Text) LIKE '%performance bottleneck%'
+           AND C2.CreationDate > (CAST('2024-10-01' AS DATE) - INTERVAL '1 year')
+        ) AS CorrelatedSubqueryMetric,
+        OCM.AvgReputation AS CommunityAvgReputation,
+        (UE.Reputation - OCM.AvgReputation) AS ReputationDeltaFromAvg,
+        CASE
+            WHEN CHAR_LENGTH(UE.DisplayName) > 20 THEN SUBSTRING(UE.DisplayName FROM 1 FOR 17) || '...'
+            ELSE UE.DisplayName
+        END AS ShortDisplayName,
+        COALESCE(CAST(UE.LastPostActivity AS VARCHAR), CAST(UE.LastCommentActivity AS VARCHAR), 'N/A') AS LastActivityCombined,
+        'High-Impact User' AS UserCategory
+    FROM UserEngagement UE
+    LEFT JOIN BadgeSummary BS ON UE.UserId = BS.UserId
+    LEFT JOIN PostTagAnalysis PTA ON UE.UserId = PTA.OwnerUserId
+    LEFT JOIN UserCloseReasonSummary UCRS ON UE.UserId = UCRS.UserId
+    CROSS JOIN OverallCommunityMetrics OCM
+    WHERE
+        UE.Reputation > OCM.AvgReputation * 1.2
+        AND COALESCE(BS.GoldBadges, 0) > 0
+        AND UE.TotalQuestions >= 5
+        AND UE.TotalAnswers >= 10
+        AND (
+            EXISTS (SELECT 1 FROM PostTagAnalysis pta2 WHERE pta2.OwnerUserId = UE.UserId AND pta2.HotTags IS NOT NULL AND LENGTH(pta2.HotTags) > 0)
+            OR EXISTS (SELECT 1 FROM Comments c WHERE c.UserId = UE.UserId AND c.PostId IN (SELECT Id FROM Posts p WHERE p.Tags LIKE '%<sql>%' OR p.Tags LIKE '%<performance>%'))
+        )
+    GROUP BY
+        UE.UserId, UE.DisplayName, UE.Reputation, UE.TotalQuestions, UE.TotalAnswers,
+        COALESCE(BS.GoldBadges, 0), UE.TotalPostScore, UE.TotalCommentScore,
+        UE.TotalUpVotesGiven, UE.TotalDownVotesGiven, UE.TotalPosts, UE.TotalComments,
+        UE.LastPostActivity, UE.LastCommentActivity, OCM.AvgReputation
+    HAVING
+        COUNT(DISTINCT UCRS.PostId) FILTER (WHERE UCRS.CloseReasonName IN ('Duplicate', 'Off-topic', 'Needs details or clarity')) < UE.TotalQuestions / 2
+),
+CommentGurus AS (
+    SELECT
+        UE.UserId,
+        UE.DisplayName,
+        UE.Reputation,
+        UE.TotalQuestions,
+        UE.TotalAnswers,
+        COALESCE(BS.GoldBadges, 0) AS GoldBadgesCount,
+        UE.TotalPostScore,
+        UE.TotalCommentScore,
+        SUM(CASE WHEN PTA.HotTags IS NOT NULL AND LENGTH(PTA.HotTags) > 0 THEN 1 ELSE 0 END) AS PostsWithHotTags,
+        CAST(UE.TotalUpVotesGiven AS NUMERIC) / NULLIF(UE.TotalDownVotesGiven + 1, 0) AS UpDownVoteRatio,
+        UE.TotalPosts + UE.TotalComments AS TotalActivityEvents,
+        (
+            (UE.Reputation * 0.2)
+            + (COALESCE(BS.SilverBadges, 0) * 50)
+            + (UE.TotalPostScore * 0.1)
+            + (UE.TotalCommentScore * 1.0)
+            + (UE.TotalComments * 0.5)
+        ) AS UserScore,
+        RANK() OVER (ORDER BY
+            (
+            (UE.Reputation * 0.2)
+            + (COALESCE(BS.SilverBadges, 0) * 50)
+            + (UE.TotalPostScore * 0.1)
+            + (UE.TotalCommentScore * 1.0)
+            + (UE.TotalComments * 0.5)
+            ) DESC
+        ) AS ImpactRank,
+        AVG(UE.TotalCommentScore) OVER (PARTITION BY (FLOOR(UE.TotalComments / 50) * 50) ORDER BY UE.Reputation) AS AvgScoreInBand,
+        (
+         SELECT COUNT(DISTINCT C2.Id)
+         FROM Comments C2
+         WHERE C2.UserId = UE.UserId
+           AND LOWER(C2.Text) LIKE '%clarification%'
+           AND C2.CreationDate > (CAST('2024-10-01' AS DATE) - INTERVAL '6 months')
+        ) AS CorrelatedSubqueryMetric,
+        OCM.AvgReputation AS CommunityAvgReputation,
+        (UE.Reputation - OCM.AvgReputation) AS ReputationDeltaFromAvg,
+        CASE
+            WHEN CHAR_LENGTH(UE.DisplayName) > 20 THEN SUBSTRING(UE.DisplayName FROM 1 FOR 17) || '...'
+            ELSE UE.DisplayName
+        END AS ShortDisplayName,
+        COALESCE(CAST(UE.LastCommentActivity AS VARCHAR), CAST(UE.LastPostActivity AS VARCHAR), 'N/A') AS LastActivityCombined,
+        'Comment Guru' AS UserCategory
+    FROM UserEngagement UE
+    LEFT JOIN BadgeSummary BS ON UE.UserId = BS.UserId
+    LEFT JOIN PostTagAnalysis PTA ON UE.UserId = PTA.OwnerUserId
+    CROSS JOIN OverallCommunityMetrics OCM
+    WHERE
+        UE.TotalComments >= OCM.AvgTotalComments * 1.5
+        AND UE.TotalCommentScore >= 100
+        AND COALESCE(BS.GoldBadges, 0) = 0
+        AND UE.TotalQuestions < 50
+        AND (UE.TotalAnswers < 50 OR UE.TotalAnswers IS NULL)
+    GROUP BY
+        UE.UserId, UE.DisplayName, UE.Reputation, UE.TotalQuestions, UE.TotalAnswers,
+        COALESCE(BS.GoldBadges, 0), COALESCE(BS.SilverBadges, 0), UE.TotalPostScore, UE.TotalCommentScore,
+        UE.TotalUpVotesGiven, UE.TotalDownVotesGiven, UE.TotalPosts, UE.TotalComments,
+        UE.LastPostActivity, UE.LastCommentActivity, OCM.AvgReputation
+)
+SELECT *
+FROM HighImpactUsers
+UNION ALL
+SELECT *
+FROM CommentGurus
+ORDER BY UserScore DESC, Reputation DESC
+LIMIT 100;

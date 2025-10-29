@@ -1,0 +1,161 @@
+WITH RECURSIVE
+-- 1. Pull recent questions and clean up tag list
+raw_q AS (
+    SELECT
+        p.Id               AS q_id,
+        p.Title,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        COALESCE(NULLIF(p.Tags, ''), '<>')                     AS raw_tags,
+        regexp_replace(p.Tags, '[<>]', '', 'g')               AS clean_tags
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '30 days'
+),
+
+-- 2. Explode tags into one row per tag
+exploded_tags AS (
+    SELECT
+        q.q_id,
+        q.Title,
+        q.CreationDate,
+        q.OwnerUserId,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        TRIM(t.tag)                     AS tag
+    FROM raw_q q,
+         LATERAL unnest(string_to_array(q.clean_tags, ',')) AS t(tag)
+),
+
+-- 3. Aggregate per‑tag statistics
+tag_stats AS (
+    SELECT
+        e.tag,
+        COUNT(*)                                          AS total_questions,
+        AVG(e.Score)                                      AS avg_score,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY e.Score) AS median_score,
+        SUM(e.ViewCount)                                  AS total_views,
+        MAX(e.CreationDate)                               AS latest_question,
+        COUNT(DISTINCT e.OwnerUserId)                     AS distinct_authors
+    FROM exploded_tags e
+    GROUP BY e.tag
+),
+
+-- 4. Pull recent answers with a correlated subquery for the parent question's title
+raw_a AS (
+    SELECT
+        a.Id                       AS a_id,
+        a.PostTypeId,
+        a.CreationDate,
+        a.OwnerUserId,
+        a.Score,
+        a.CommentCount,
+        (SELECT p.Title FROM Posts p WHERE p.Id = a.ParentId) AS parent_title,
+        (SELECT p.Tags  FROM Posts p WHERE p.Id = a.ParentId) AS parent_tags
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+      AND a.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '30 days'
+),
+
+-- 5. User activity summary (outer joins, NULL logic)
+user_activity AS (
+    SELECT
+        u.Id                                      AS user_id,
+        COALESCE(u.Reputation, 0)                 AS reputation,
+        COUNT(DISTINCT b.Id)                      AS badge_count,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS up_votes_given,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS down_votes_given,
+        MAX(u.LastAccessDate)                    AS last_seen
+    FROM Users u
+    LEFT JOIN Badges b   ON b.UserId = u.Id
+    LEFT JOIN Votes  v   ON v.UserId = u.Id
+    GROUP BY u.Id, u.Reputation
+),
+
+-- 6. Combine questions and answers using UNION ALL (set operator)
+combined AS (
+    SELECT
+        q.q_id                AS post_id,
+        q.Title               AS title,
+        q.CreationDate        AS created,
+        q.OwnerUserId         AS owner_id,
+        q.Score               AS score,
+        q.ViewCount           AS view_count,
+        q.AnswerCount         AS answer_count,
+        NULL                  AS comment_count,
+        'question'            AS post_type
+    FROM raw_q q
+    UNION ALL
+    SELECT
+        a.a_id                AS post_id,
+        a.parent_title        AS title,
+        a.CreationDate        AS created,
+        a.OwnerUserId         AS owner_id,
+        a.Score               AS score,
+        NULL                  AS view_count,
+        NULL                  AS answer_count,
+        a.CommentCount        AS comment_count,
+        'answer'              AS post_type
+    FROM raw_a a
+),
+
+-- 7. Rank combined posts per tag (window functions, outer join to tag_stats)
+ranked_posts AS (
+    SELECT
+        c.post_id,
+        c.title,
+        c.created,
+        c.owner_id,
+        c.score,
+        c.view_count,
+        c.answer_count,
+        c.comment_count,
+        c.post_type,
+        COALESCE(t.total_questions, 0)               AS tag_question_total,
+        ROW_NUMBER() OVER (PARTITION BY c.post_type ORDER BY c.score DESC NULLS LAST, c.created DESC) AS rn
+    FROM combined c
+    LEFT JOIN (
+        SELECT DISTINCT tag FROM exploded_tags
+    ) et ON TRUE  -- cross join to make tag context available
+    LEFT JOIN tag_stats t ON t.tag = et.tag
+),
+
+-- 8. Final selection with complex predicates and NULL handling
+final_set AS (
+    SELECT
+        rp.rn,
+        rp.post_id,
+        rp.title,
+        rp.score,
+        rp.view_count,
+        rp.answer_count,
+        rp.comment_count,
+        rp.post_type,
+        ua.reputation,
+        ua.badge_count,
+        ua.up_votes_given,
+        ua.down_votes_given,
+        ua.last_seen,
+        CASE
+            WHEN rp.score IS NULL THEN 'no score'
+            WHEN rp.score > COALESCE(t.avg_score, 0) THEN 'above avg'
+            WHEN rp.score = COALESCE(t.avg_score, 0) THEN 'equal avg'
+            ELSE 'below avg'
+        END AS score_vs_tag_avg,
+        COALESCE(rp.tag_question_total, 0)           AS related_tag_q_total
+    FROM ranked_posts rp
+    LEFT JOIN user_activity ua ON ua.user_id = rp.owner_id
+    LEFT JOIN tag_stats t        ON t.tag = (
+        SELECT et.tag FROM exploded_tags et WHERE et.q_id = rp.post_id LIMIT 1
+    )
+    WHERE rp.rn <= 100
+)
+
+SELECT *
+FROM final_set
+ORDER BY rn;

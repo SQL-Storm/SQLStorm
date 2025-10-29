@@ -1,0 +1,202 @@
+WITH CTE_Usage AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT p2.Id) as AnswerCount,
+        ROUND(AVG(CAST(p.Score AS NUMERIC)), 2) as AvgScore,
+        STRING_AGG(DISTINCT p.Tags, ', ') as AllTags,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 50 THEN 'High'
+            WHEN COUNT(DISTINCT p.Id) > 25 THEN 'Medium'
+            ELSE 'Low'
+        END as ActivityLevel
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Posts p2 ON u.Id = p2.OwnerUserId AND p2.PostTypeId = 2
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 500
+    GROUP BY u.Id, u.DisplayName
+)
+
+SELECT 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) as TotalPosts,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as Questions,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as Answers,
+    COALESCE(SUM(p.Score), 0) as TotalScore,
+    COALESCE(AVG(p.Score), 0) as AvgScore,
+    COUNT(DISTINCT b.Id) as BadgesReceived,
+    COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) as GoldBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) as SilverBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) as BronzeBadges,
+    COUNT(DISTINCT c.Id) as CommentsMade,
+    COUNT(DISTINCT ph.Id) as PostHistoryEvents,
+    COUNT(DISTINCT pl.Id) as PostLinks,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END), 0) as TotalQuestionViews,
+    COALESCE(AVG(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE NULL END), 0) as AvgQuestionViews,
+    STRING_AGG(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.Tags IS NOT NULL THEN p.Tags END, '; ') as AllQuestionTags,
+    COALESCE(MAX(p.CreationDate), TIMESTAMP '1900-01-01') as LastPostDate,
+    COALESCE(MAX(u.LastAccessDate), TIMESTAMP '1900-01-01') as LastAccessDate,
+    COALESCE(COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 THEN p.Id END), 0) as QuestionsWithAnswers,
+    COALESCE(COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN p.Id END), 0) as QuestionsWithAcceptedAnswers,
+    COALESCE(COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.ParentId IS NOT NULL THEN p.Id END), 0) as AnswersToQuestions,
+    COALESCE(COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL THEN p.Id END), 0) as ClosedQuestions,
+    COALESCE(COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.CommunityOwnedDate IS NOT NULL THEN p.Id END), 0) as CommunityOwnedQuestions,
+    COALESCE(COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.FavoriteCount > 0 THEN p.Id END), 0) as FavoritedQuestions,
+    COALESCE(COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.CommentCount > 0 THEN p.Id END), 0) as QuestionsWithComments,
+    COALESCE(COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.Score > 0 THEN p.Id END), 0) as HighScoreQuestions,
+    COALESCE(COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 AND p.Score > 0 THEN p.Id END), 0) as HighScoreAnswers,
+    COALESCE(ROUND(COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) * 100.0 / NULLIF(COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END), 0), 2), 0) as QuestionsToAnswersRatio,
+    COALESCE(ROUND(
+        (COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) + 
+         COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END)) * 100.0 / 
+        NULLIF(COUNT(DISTINCT p.Id), 0), 2), 0) as ParticipationRatio,
+    COALESCE(RANK() OVER (ORDER BY SUM(p.Score) DESC), 0) as ScoreRank,
+    COALESCE(DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC), 0) as ActivityRank,
+    COALESCE(NTILE(10) OVER (ORDER BY AVG(p.Score) DESC), 0) as ScoreQuintile,
+    COALESCE(
+        CASE 
+            WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 0 
+            AND COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) > 0 
+            THEN 'Active'
+            WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 0 
+            THEN 'Questioner'
+            WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) > 0 
+            THEN 'Answerer'
+            ELSE 'Inactive'
+        END, 
+        'Inactive'
+    ) as UserActivityType,
+    COALESCE(
+        CASE 
+            WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 100 
+            THEN 'Expert'
+            WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 50 
+            THEN 'Advanced'
+            WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 10 
+            THEN 'Intermediate'
+            ELSE 'Beginner'
+        END, 
+        'Beginner'
+    ) as QuestionExpertise,
+    COALESCE(
+        CASE 
+            WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) > 50 
+            THEN 'Expert'
+            WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) > 25 
+            THEN 'Advanced'
+            WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) > 5 
+            THEN 'Intermediate'
+            ELSE 'Beginner'
+        END, 
+        'Beginner'
+    ) as AnswerExpertise,
+    COALESCE(
+        CASE 
+            WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 0 
+            THEN ROUND(
+                CAST(COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS NUMERIC) / 
+                NULLIF(EXTRACT(DAY FROM (TIMESTAMP '2024-10-01 12:34:56' - u.CreationDate)), 0) * 30, 2)
+            ELSE 0
+        END, 
+        0
+    ) as AvgQuestionsPerMonth,
+    COALESCE(
+        CASE 
+            WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) > 0 
+            THEN ROUND(
+                CAST(COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS NUMERIC) / 
+                NULLIF(EXTRACT(DAY FROM (TIMESTAMP '2024-10-01 12:34:56' - u.CreationDate)), 0) * 30, 2)
+            ELSE 0
+        END, 
+        0
+    ) as AvgAnswersPerMonth,
+    COALESCE(
+        (SELECT p1.Title 
+         FROM Posts p1 
+         WHERE p1.OwnerUserId = u.Id 
+         AND p1.PostTypeId = 1 
+         ORDER BY p1.Score DESC
+         LIMIT 1), 
+        'No High Scoring Questions'
+    ) as TopQuestion,
+    COALESCE(
+        (SELECT p2.Title 
+         FROM Posts p2 
+         WHERE p2.OwnerUserId = u.Id 
+         AND p2.PostTypeId = 2 
+         ORDER BY p2.Score DESC
+         LIMIT 1), 
+        'No High Scoring Answers'
+    ) as TopAnswer,
+    COALESCE(
+        (SELECT b1.Name 
+         FROM Badges b1 
+         WHERE b1.UserId = u.Id 
+         ORDER BY b1.Date DESC
+         LIMIT 1), 
+        'No Recent Badges'
+    ) as MostRecentBadge,
+    COALESCE(
+        (SELECT p3.Title 
+         FROM Posts p3 
+         WHERE p3.PostTypeId = 1 
+         AND p3.OwnerUserId = u.Id 
+         ORDER BY p3.CreationDate DESC
+         LIMIT 1), 
+        'No Recent Questions'
+    ) as MostRecentQuestion
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN Comments c ON u.Id = c.UserId
+LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+LEFT JOIN PostLinks pl ON u.Id = pl.Id
+LEFT JOIN CTE_Usage cu ON cu.UserId = u.Id
+WHERE u.Reputation > 1000
+    AND u.CreationDate >= DATE '2010-01-01'
+    AND (
+        EXISTS (
+            SELECT 1 FROM Posts p2 
+            WHERE p2.OwnerUserId = u.Id 
+              AND p2.PostTypeId = 1 
+              AND p2.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '3 months')
+        )
+        OR EXISTS (
+            SELECT 1 FROM Posts p3 
+            WHERE p3.OwnerUserId = u.Id 
+              AND p3.PostTypeId = 2 
+              AND p3.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '3 months')
+        )
+        OR EXISTS (
+            SELECT 1 FROM Badges b2 
+            WHERE b2.UserId = u.Id 
+              AND b2.Date >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '3 months')
+        )
+    )
+    AND NOT (u.Id IN (
+        SELECT DISTINCT p4.OwnerUserId 
+        FROM Posts p4 
+        WHERE p4.PostTypeId = 1 
+        AND p4.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 day')
+        AND p4.ViewCount > 1000
+    ))
+GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+HAVING COUNT(DISTINCT p.Id) > 0 
+    AND COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) >= 0
+    AND COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) >= 0
+    AND COALESCE(SUM(p.Score), 0) >= -500
+    AND COUNT(DISTINCT c.Id) >= 0
+ORDER BY 
+    COALESCE(SUM(p.Score), 0) DESC,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) DESC,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) DESC,
+    u.Reputation DESC,
+    COUNT(DISTINCT b.Id) DESC,
+    u.LastAccessDate DESC
+OFFSET 0
+FETCH NEXT 1000 ROWS ONLY;

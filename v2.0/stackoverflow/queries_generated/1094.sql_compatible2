@@ -1,0 +1,196 @@
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.Views AS UserViews,
+        U.UpVotes AS UserUpVotes,
+        U.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        COUNT(DISTINCT C.Id) AS TotalComments,
+        SUM(COALESCE(P.Score,0)) AS TotalPostScore,
+        AVG(COALESCE(P.ViewCount,0)) AS AvgPostViewCount,
+        MAX(P.CreationDate) AS LastPostDate,
+        MIN(P.CreationDate) AS FirstPostDate,
+        U.AboutMe
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.Views, U.UpVotes, U.DownVotes, U.AboutMe
+    HAVING COUNT(DISTINCT P.Id) > 5
+       AND U.Reputation > 1000
+),
+PostHistoricalMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        P.PostTypeId,
+        P.CreationDate AS PostCreationDate,
+        P.LastActivityDate,
+        P.Score AS PostScore,
+        P.ViewCount AS PostViewCount,
+        COALESCE(P.AnswerCount, 0) AS ActualAnswerCount,
+        CASE WHEN P.Tags IS NULL THEN 0 ELSE array_length(string_to_array(substring(P.Tags, 2, length(P.Tags) - 2), '><'), 1) END AS TagCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6, 8, 9) THEN 1 ELSE 0 END) AS EditCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseHistoryCount,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.CreationDate ELSE NULL END) AS LastClosedDate,
+        COUNT(DISTINCT PH.UserId) AS UniqueEditors,
+        SUM(COALESCE(CM.Score, 0)) AS TotalCommentScore,
+        (EXTRACT(EPOCH FROM (P.LastActivityDate - P.CreationDate)) / 3600.0) AS ActivityHoursDuration
+    FROM Posts P
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    LEFT JOIN Comments CM ON P.Id = CM.PostId
+    WHERE P.PostTypeId IN (1, 2)
+    GROUP BY P.Id, P.OwnerUserId, P.PostTypeId, P.CreationDate, P.LastActivityDate, P.Score, P.ViewCount, P.AnswerCount, P.Tags
+    HAVING COUNT(DISTINCT PH.Id) > 1
+),
+RecentPostActivity AS (
+    WITH TopRecentUserPosts AS (
+        SELECT
+            PHM.PostId,
+            PHM.OwnerUserId,
+            PHM.PostTypeId,
+            PHM.PostCreationDate,
+            PHM.LastActivityDate,
+            PHM.PostScore,
+            PHM.PostViewCount,
+            PHM.ActualAnswerCount,
+            PHM.TagCount,
+            PHM.EditCount,
+            PHM.CloseHistoryCount,
+            PHM.LastClosedDate,
+            PHM.UniqueEditors,
+            PHM.TotalCommentScore,
+            PHM.ActivityHoursDuration,
+            ROW_NUMBER() OVER (PARTITION BY PHM.OwnerUserId ORDER BY PHM.PostCreationDate DESC) AS rn_user_post_desc,
+            LAG(PHM.PostCreationDate, 1, TIMESTAMP '1970-01-01 00:00:00') OVER (PARTITION BY PHM.OwnerUserId ORDER BY PHM.PostCreationDate) AS PrevPostCreationDate,
+            NTILE(4) OVER (ORDER BY PHM.PostScore DESC, PHM.PostViewCount DESC) AS ScoreViewQuartile,
+            'TopRecent' AS PostSetCategory
+        FROM PostHistoricalMetrics PHM
+        WHERE PHM.PostCreationDate > DATE '2020-01-01'
+    ),
+    HighImpactLegacyPosts AS (
+        SELECT
+            PHM.PostId,
+            PHM.OwnerUserId,
+            PHM.PostTypeId,
+            PHM.PostCreationDate,
+            PHM.LastActivityDate,
+            PHM.PostScore,
+            PHM.PostViewCount,
+            PHM.ActualAnswerCount,
+            PHM.TagCount,
+            PHM.EditCount,
+            PHM.CloseHistoryCount,
+            PHM.LastClosedDate,
+            PHM.UniqueEditors,
+            PHM.TotalCommentScore,
+            PHM.ActivityHoursDuration,
+            CAST(NULL AS BIGINT) AS rn_user_post_desc,
+            CAST(NULL AS TIMESTAMP) AS PrevPostCreationDate,
+            CAST(NULL AS INTEGER) AS ScoreViewQuartile,
+            'HighImpactLegacy' AS PostSetCategory
+        FROM PostHistoricalMetrics PHM
+        JOIN UserEngagement UE ON PHM.OwnerUserId = UE.UserId
+        WHERE UE.Reputation > 50000
+          AND PHM.PostScore > 100
+          AND PHM.PostTypeId = 1
+    )
+    SELECT * FROM TopRecentUserPosts WHERE rn_user_post_desc <= 5
+    UNION ALL
+    SELECT * FROM HighImpactLegacyPosts
+)
+SELECT
+    UE.UserId,
+    UE.DisplayName,
+    UE.Reputation,
+    RPA.PostId,
+    P.Title,
+    P.Tags,
+    RPA.PostCreationDate,
+    RPA.PostScore,
+    RPA.PostViewCount,
+    RPA.ActualAnswerCount,
+    RPA.EditCount,
+    RPA.UniqueEditors,
+    RPA.TotalCommentScore,
+    RPA.ActivityHoursDuration,
+    COALESCE(RPA.ScoreViewQuartile, 0) AS ScoreViewQuartile,
+    AGE(TIMESTAMP '2024-10-01 12:34:56', RPA.PostCreationDate) AS TimeSincePost,
+    EXTRACT(DAY FROM (RPA.PostCreationDate - COALESCE(RPA.PrevPostCreationDate, RPA.PostCreationDate))) AS DaysBetweenPosts,
+    COALESCE(PL.RelatedPostId, -1) AS LinkedRelatedPostId,
+    COALESCE(CLT.Name, 'NOT_CLOSED') AS ClosureReasonType,
+    CASE
+        WHEN UE.Reputation > 20000 AND RPA.PostScore > 75 THEN 'Elite Impact User Post'
+        WHEN UE.Reputation > 10000 AND RPA.EditCount > 5 AND RPA.ActivityHoursDuration > 24*7 THEN 'Highly Active Contributor Post'
+        WHEN UE.Reputation > 5000 AND RPA.ActualAnswerCount > 3 THEN 'Engaged Question Owner'
+        ELSE 'Regular Activity'
+    END AS ActivityCategory,
+    (SELECT AVG(SubP.Score) FROM Posts SubP WHERE SubP.OwnerUserId = UE.UserId AND SubP.Id != RPA.PostId AND SubP.PostTypeId = RPA.PostTypeId) AS AvgOtherPostScoreByOwnerOfType,
+    (SELECT COUNT(DISTINCT B.Name) FROM Badges B WHERE B.UserId = UE.UserId AND B.Class = 1 AND B.Date > UE.LastPostDate - INTERVAL '1 year') AS RecentGoldBadgesCount,
+    STRING_AGG(T.TagName, '; ') FILTER (WHERE T.TagName IS NOT NULL) AS AssociatedTagNames,
+    (CASE WHEN COALESCE(UE.AboutMe, '') ILIKE '%developer%' THEN TRUE ELSE FALSE END) AS AboutMeMentionsDeveloper,
+    RPA.PostSetCategory,
+    RPA.PrevPostCreationDate,
+    UE.LastPostDate,
+    PL.RelatedPostId,
+    CLT.Name
+FROM UserEngagement UE
+INNER JOIN RecentPostActivity RPA ON UE.UserId = RPA.OwnerUserId
+INNER JOIN Posts P ON RPA.PostId = P.Id
+LEFT JOIN PostLinks PL ON RPA.PostId = PL.PostId AND PL.LinkTypeId = 1
+LEFT JOIN PostHistory PH_Close ON RPA.PostId = PH_Close.PostId AND PH_Close.PostHistoryTypeId = 10 AND PH_Close.Id = (
+    SELECT MAX(PH2.Id)
+    FROM PostHistory PH2
+    WHERE PH2.PostId = RPA.PostId AND PH2.PostHistoryTypeId = 10
+)
+LEFT JOIN CloseReasonTypes CLT ON (PH_Close.Comment IS NOT NULL AND (CASE WHEN regexp_replace(PH_Close.Comment, '[^0-9]', '', 'g') = '' THEN NULL ELSE CAST(regexp_replace(PH_Close.Comment, '[^0-9]', '', 'g') AS INTEGER) END) = CLT.Id)
+LEFT JOIN (
+    SELECT DISTINCT unnest(string_to_array(substring(Tags, 2, length(Tags) - 2), '><')) AS TagName, Id AS PostId
+    FROM Posts
+    WHERE Tags IS NOT NULL AND Tags != '' AND length(Tags) > 2
+) PostTags ON PostTags.PostId = P.Id
+LEFT JOIN Tags T ON PostTags.TagName = T.TagName
+WHERE ((RPA.PostSetCategory = 'TopRecent' AND RPA.rn_user_post_desc <= 5)
+   OR (RPA.PostSetCategory = 'HighImpactLegacy' AND RPA.PostScore > 100))
+  AND RPA.PostScore > (
+      SELECT AVG(P_Inner.Score)
+      FROM Posts P_Inner
+      WHERE P_Inner.PostTypeId = P.PostTypeId
+        AND P_Inner.CreationDate > CAST('2024-10-01' AS DATE) - INTERVAL '5 year'
+  )
+  AND (P.Tags LIKE '%<sql>%' OR P.Tags LIKE '%<database>%' OR P.Tags LIKE '%<performance>%')
+  AND P.Title IS NOT NULL
+  AND P.Body IS NOT NULL
+  AND length(trim(P.Body)) > 100
+  AND UE.LastPostDate IS NOT NULL
+  AND (RPA.CloseHistoryCount = 0 OR RPA.LastClosedDate >= DATE '2023-01-01' OR RPA.PostSetCategory = 'HighImpactLegacy')
+  AND UE.AboutMe IS NOT NULL AND POSITION('data' IN LOWER(UE.AboutMe)) > 0
+GROUP BY
+    UE.UserId,
+    UE.DisplayName,
+    UE.Reputation,
+    RPA.PostId,
+    P.Title,
+    P.Tags,
+    RPA.PostCreationDate,
+    RPA.PostScore,
+    RPA.PostViewCount,
+    RPA.ActualAnswerCount,
+    RPA.EditCount,
+    RPA.UniqueEditors,
+    RPA.TotalCommentScore,
+    RPA.ActivityHoursDuration,
+    RPA.ScoreViewQuartile,
+    RPA.PrevPostCreationDate,
+    UE.LastPostDate,
+    PL.RelatedPostId,
+    CLT.Name,
+    UE.AboutMe,
+    RPA.PostSetCategory,
+    RPA.rn_user_post_desc
+ORDER BY
+    UE.Reputation DESC, RPA.PostScore DESC, RPA.PostCreationDate DESC, RPA.PostSetCategory DESC
+LIMIT 200;

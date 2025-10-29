@@ -1,0 +1,140 @@
+WITH UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Location,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswers,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostScore,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        SUM(COALESCE(c.Score, 0)) AS TotalCommentScore,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        MAX(p.LastActivityDate) AS LastPostActivity,
+        MAX(c.CreationDate) AS LastCommentActivity
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Location, u.UpVotes, u.DownVotes
+    HAVING
+        COUNT(DISTINCT p.Id) > 5
+        AND COUNT(DISTINCT c.Id) > 10
+),
+PostHistoricalMetrics AS (
+    SELECT
+        ph.PostId,
+        ph.UserId AS EditorUserId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate AS EditDate,
+        LAG(ph.CreationDate, 1, ph.CreationDate) OVER (PARTITION BY ph.PostId, ph.PostHistoryTypeId ORDER BY ph.CreationDate) AS PrevEditDate,
+        LAG(ph.UserId, 1, ph.UserId) OVER (PARTITION BY ph.PostId, ph.PostHistoryTypeId ORDER BY ph.CreationDate) AS PrevEditorUserId,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn_latest_history
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (2, 5, 6)
+),
+PostTagAnalysis AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        TRIM(BOTH '>' FROM TRIM(BOTH '<' FROM t.tag)) AS TagName
+    FROM Posts p
+    LEFT JOIN LATERAL unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS t(tag)
+        ON p.Tags IS NOT NULL AND length(p.Tags) > 2
+    WHERE p.PostTypeId = 1
+),
+TopTagsPerUser AS (
+    SELECT
+        pta.OwnerUserId AS UserId,
+        pta.TagName,
+        COUNT(pta.PostId) AS TaggedPostCount,
+        ROW_NUMBER() OVER (PARTITION BY pta.OwnerUserId ORDER BY COUNT(pta.PostId) DESC, pta.TagName ASC) AS TagRank
+    FROM PostTagAnalysis pta
+    WHERE pta.TagName IS NOT NULL
+    GROUP BY pta.OwnerUserId, pta.TagName
+)
+SELECT
+    ue.UserId,
+    COALESCE(ue.DisplayName, 'Anonymous') AS DisplayName,
+    ue.Reputation,
+    ue.Location,
+    ue.TotalPosts,
+    ue.TotalQuestions,
+    ue.TotalAnswers,
+    ue.TotalPostScore,
+    ue.TotalComments,
+    ue.TotalCommentScore,
+    ue.TotalBadges,
+    ue.LastAccessDate,
+    ue.CreationDate,
+    ue.LastPostActivity,
+    ue.LastCommentActivity,
+    tt.TagName AS TopContributingTag,
+    tt.TaggedPostCount,
+    ROUND(CAST(ue.TotalPostScore AS NUMERIC) / NULLIF(ue.TotalPosts, 0), 2) AS AvgPostScorePerUser,
+    ROUND(CAST(ue.UpVotes AS NUMERIC) / NULLIF(ue.DownVotes, 0), 2) AS UpDownVoteRatio,
+    (SELECT COUNT(DISTINCT psub.Id)
+     FROM Posts psub
+     WHERE psub.OwnerUserId = ue.UserId
+       AND psub.ViewCount > 10000
+       AND psub.FavoriteCount > 100
+       AND psub.PostTypeId = 1
+    ) AS HighImpactQuestionCount,
+    AVG(CASE WHEN p.PostTypeId = 1 AND p.PostTypeId IS NOT NULL THEN CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1.0 ELSE 0.0 END END) FILTER (WHERE p.PostTypeId = 1) AS QuestionAcceptanceRate,
+    SUM(CASE WHEN p.PostTypeId = 1 AND phm.EditDate IS NOT NULL THEN 1 ELSE 0 END) AS QuestionsWithEdits,
+    AVG(EXTRACT(EPOCH FROM (phm.EditDate - phm.PrevEditDate)) / 3600.0) FILTER (WHERE phm.EditDate IS NOT NULL AND phm.PrevEditDate IS NOT NULL AND phm.EditorUserId = ue.UserId AND phm.PostHistoryTypeId = 5) AS AvgTimeBetweenUserBodyEditsHours,
+    MAX(phm.EditDate) FILTER (WHERE phm.EditorUserId = ue.UserId AND phm.PostHistoryTypeId = 5) AS LastSelfBodyEditDate,
+    (SELECT AVG(csub.Score)
+     FROM Comments csub
+     WHERE csub.UserId = ue.UserId
+       AND csub.PostId IN (SELECT psub2.Id FROM Posts psub2 WHERE psub2.OwnerUserId = ue.UserId AND psub2.PostTypeId = 1)
+    ) AS AvgCommentScoreOnOwnQuestions,
+    (SELECT STRING_AGG(tt_sub.TagName, ', ' ORDER BY tt_sub.TagRank)
+     FROM TopTagsPerUser tt_sub
+     WHERE tt_sub.UserId = ue.UserId AND tt_sub.TagRank <= 3
+    ) AS Top3TagsList,
+    SUM(CASE WHEN p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END) AS ClosedQuestionsCount,
+    NTILE(5) OVER (ORDER BY ue.Reputation DESC) AS ReputationQuintile,
+    RANK() OVER (ORDER BY ue.TotalPostScore DESC, ue.TotalComments DESC, ue.Reputation DESC) AS OverallContributorRank,
+    (SELECT AVG(psub.Score)
+     FROM Posts psub
+     WHERE psub.PostTypeId = 1
+       AND psub.CreationDate BETWEEN ue.CreationDate AND ue.LastAccessDate
+    ) AS AvgGlobalQuestionScoreDuringUserLifetime,
+    AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) OVER (PARTITION BY ue.Location) AS AvgQuestionScoreInUserLocation,
+    COALESCE(
+        MIN(
+            CASE
+                WHEN POSITION('<code>' IN p.Body) > 0
+                     AND POSITION('</code>' IN p.Body) > POSITION('<code>' IN p.Body) + LENGTH('<code>') - 1
+                THEN LOWER(SUBSTRING(
+                    p.Body,
+                    POSITION('<code>' IN p.Body) + LENGTH('<code>'),
+                    POSITION('</code>' IN p.Body) - (POSITION('<code>' IN p.Body) + LENGTH('<code>'))
+                ))
+                ELSE NULL
+            END
+        ),
+        'No Code Snippet Found'
+    ) AS FirstQuestionCodeSnippet
+FROM UserEngagement ue
+LEFT JOIN TopTagsPerUser tt ON ue.UserId = tt.UserId AND tt.TagRank = 1
+LEFT JOIN Posts p ON ue.UserId = p.OwnerUserId
+LEFT JOIN PostHistoricalMetrics phm ON p.Id = phm.PostId AND phm.rn_latest_history = 1 AND phm.PostHistoryTypeId = 5
+WHERE ue.Reputation > 500
+  AND ue.LastAccessDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+  AND (ue.Location IS NOT NULL AND LENGTH(TRIM(ue.Location)) > 0 AND ue.Location NOT ILIKE '%internet%' AND ue.Location NOT ILIKE '%earth%' AND ue.Location NOT ILIKE '%online%')
+GROUP BY
+    ue.UserId, ue.DisplayName, ue.Reputation, ue.Location, ue.UpVotes, ue.DownVotes,
+    ue.TotalPosts, ue.TotalQuestions, ue.TotalAnswers, ue.TotalPostScore, ue.TotalComments, ue.TotalCommentScore,
+    ue.TotalBadges, ue.LastAccessDate, ue.CreationDate, ue.LastPostActivity, ue.LastCommentActivity,
+    tt.TagName, tt.TaggedPostCount,
+    p.Id, p.Body, p.PostTypeId, p.Score, p.AcceptedAnswerId, p.ClosedDate
+ORDER BY OverallContributorRank ASC, AvgTimeBetweenUserBodyEditsHours ASC NULLS LAST
+LIMIT 100;

@@ -1,0 +1,153 @@
+WITH
+    TopUsers AS (
+        SELECT
+            u.Id,
+            u.DisplayName,
+            u.Reputation,
+            COUNT(p.Id) AS TotalPosts,
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+            SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+            COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadgeCount,
+            ROW_NUMBER() OVER (ORDER BY SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) DESC) AS rn
+        FROM Users u
+        LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+        LEFT JOIN Votes v ON v.UserId = u.Id
+        LEFT JOIN Badges b ON b.UserId = u.Id
+        GROUP BY u.Id, u.DisplayName, u.Reputation
+        HAVING COUNT(p.Id) > 0
+    ),
+
+    RecentClosedQuestions AS (
+        SELECT
+            p.Id,
+            p.Title,
+            p.CreationDate,
+            p.ClosedDate,
+            p.OwnerUserId,
+            -- replace Postgres-specific string-to-array with a more portable split using XML path technique for tags like '<tag1><tag2>'
+            -- produce an array-like representation using a subquery returning one column of tag values separated by '|' for portability
+            (SELECT STRING_AGG(tag, '|') FROM (
+                SELECT TRIM(both '<>' FROM (SUBSTRING(p.Tags FROM ('<[^>]+>') FOR '#'))) AS tag
+                FROM (VALUES (p.Tags)) AS v(tags)
+                CROSS JOIN LATERAL (
+                    SELECT UNNEST(regexp_matches(v.tags, '<[^>]+>', 'g')) AS m
+                ) s(m)
+            ) s2(tag)) AS TagArray,
+            ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.ClosedDate DESC) AS rn_user
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+          AND p.ClosedDate IS NOT NULL
+    ),
+
+    TagStats AS (
+        SELECT
+            t.TagName,
+            COUNT(p.Id) AS QuestionCount,
+            CAST(ROUND(AVG(p.Score)::numeric, 2) AS NUMERIC(10,2)) AS AvgScore,
+            MAX(p.ViewCount) AS MaxViews,
+            STRING_AGG(DISTINCT u.DisplayName, ', ') FILTER (WHERE u.Reputation > 20000) AS TopHighRepUsers,
+            RANK() OVER (ORDER BY COUNT(p.Id) DESC) AS TagRank
+        FROM Tags t
+        JOIN Posts p ON p.Tags LIKE ('%' || '<' || t.TagName || '>' || '%')
+        JOIN Users u ON u.Id = p.OwnerUserId
+        WHERE p.PostTypeId = 1
+        GROUP BY t.TagName
+        HAVING COUNT(p.Id) > 5
+    ),
+
+    BadgeHierarchy AS (
+        SELECT
+            b.Id,
+            b.UserId,
+            b.Name,
+            b.Class,
+            (SELECT COUNT(*) FROM Badges b2 WHERE b2.UserId = b.UserId AND b2.Class < b.Class) AS LowerClassCount,
+            (SELECT MAX(b3.Class) FROM Badges b3 WHERE b3.UserId = b.UserId) AS MaxClassForUser
+        FROM Badges b
+    ),
+
+    UserDetail AS (
+        SELECT
+            tu.Id AS UserId,
+            tu.DisplayName,
+            tu.Reputation,
+            tu.TotalPosts,
+            tu.UpVoteCount,
+            tu.DownVoteCount,
+            tu.GoldBadgeCount,
+            rcq.Id AS RecentClosedQuestionId,
+            rcq.Title AS RecentClosedQuestionTitle,
+            rcq.ClosedDate,
+            rcq.TagArray,
+            bh.Name AS BadgeName,
+            bh.Class AS BadgeClass,
+            bh.LowerClassCount,
+            bh.MaxClassForUser,
+            tu.rn
+        FROM TopUsers tu
+        LEFT JOIN LATERAL (
+            SELECT *
+            FROM RecentClosedQuestions rcq
+            WHERE rcq.OwnerUserId = tu.Id AND rcq.rn_user = 1
+        ) rcq ON TRUE
+        LEFT JOIN BadgeHierarchy bh ON bh.UserId = tu.Id
+        WHERE tu.rn <= 100
+    )
+
+SELECT
+    ud.UserId,
+    ud.DisplayName,
+    ud.Reputation,
+    ud.TotalPosts,
+    ud.UpVoteCount,
+    ud.DownVoteCount,
+    ud.GoldBadgeCount,
+    ud.RecentClosedQuestionId,
+    ud.RecentClosedQuestionTitle,
+    ud.ClosedDate,
+    ts.TagName,
+    ts.QuestionCount,
+    ts.AvgScore,
+    ts.MaxViews,
+    ts.TopHighRepUsers,
+    ud.BadgeName,
+    ud.BadgeClass,
+    ud.LowerClassCount,
+    ud.MaxClassForUser
+FROM UserDetail ud
+LEFT JOIN LATERAL (
+    SELECT *
+    FROM TagStats ts
+    WHERE ts.TagName = ANY (string_to_array(ud.TagArray, '|'))
+    ORDER BY ts.QuestionCount DESC
+    LIMIT 1
+) ts ON TRUE
+
+UNION ALL
+
+SELECT
+    NULL AS UserId,
+    NULL AS DisplayName,
+    NULL AS Reputation,
+    NULL AS TotalPosts,
+    NULL AS UpVoteCount,
+    NULL AS DownVoteCount,
+    NULL AS GoldBadgeCount,
+    q.Id AS RecentClosedQuestionId,
+    q.Title AS RecentClosedQuestionTitle,
+    q.CreationDate AS ClosedDate,
+    NULL AS TagName,
+    NULL AS QuestionCount,
+    NULL AS AvgScore,
+    NULL AS MaxViews,
+    NULL AS TopHighRepUsers,
+    NULL AS BadgeName,
+    NULL AS BadgeClass,
+    NULL AS LowerClassCount,
+    NULL AS MaxClassForUser
+FROM Posts q
+WHERE q.PostTypeId = 1
+  AND q.Score < 0
+  AND NOT EXISTS (SELECT 1 FROM Votes v WHERE v.PostId = q.Id AND v.VoteTypeId = 2)
+ORDER BY UpVoteCount DESC NULLS LAST, RecentClosedQuestionTitle
+LIMIT 10;

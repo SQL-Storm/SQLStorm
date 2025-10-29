@@ -1,0 +1,224 @@
+-- {"query": "3365.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2461} 
+
+/*  Benchmark Query:  Comprehensive user‑activity snapshot with CTEs, window functions,
+    outer joins, correlated subqueries, set operators and rich NULL/string logic   */
+WITH
+/* -------------------------------------------------------------
+   1. Base user activity metrics
+   ------------------------------------------------------------- */
+user_base AS (
+    SELECT
+        u.Id                         AS user_id,
+        u.DisplayName                AS user_name,
+        u.Reputation,
+        u.CreationDate               AS user_created,
+        COALESCE(u.LastAccessDate, u.CreationDate) AS last_access,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        -- total number of posts (questions + answers + others)
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id)                AS total_posts,
+        -- total number of comments authored
+        (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id)                AS total_comments,
+        -- date of the most recent post
+        (SELECT MAX(p.CreationDate) FROM Posts p WHERE p.OwnerUserId = u.Id)   AS last_post_date
+    FROM Users u
+),
+
+/* -------------------------------------------------------------
+   2. Post‑level aggregates (scores, views, answers, tags)
+   ------------------------------------------------------------- */
+post_agg AS (
+    SELECT
+        p.OwnerUserId                                   AS user_id,
+        COUNT(*)                                        AS question_count,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END)   AS question_score_sum,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END)          AS question_score_avg,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END)         AS answer_count,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END)   AS answer_score_sum,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END)          AS answer_score_avg,
+        COUNT(DISTINCT UNNEST(                              -- distinct tags across all questions
+            CASE
+                WHEN p.Tags IS NOT NULL AND p.PostTypeId = 1
+                THEN STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags)-2), '><')
+                ELSE ARRAY[]::text[]
+            END
+        ))                                               AS distinct_tag_count
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+
+/* -------------------------------------------------------------
+   3. Badge aggregates (by class & tag‑based flag)
+   ------------------------------------------------------------- */
+badge_agg AS (
+    SELECT
+        b.UserId                                       AS user_id,
+        COUNT(*)                                       AS total_badges,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END)        AS gold_badges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END)        AS silver_badges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END)        AS bronze_badges,
+        COUNT(CASE WHEN b.TagBased = 1 THEN 1 END)    AS tag_badges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+
+/* -------------------------------------------------------------
+   4. Vote aggregates (up/down + favorites), respecting NULLs
+   ------------------------------------------------------------- */
+vote_agg AS (
+    SELECT
+        v.PostId                                       AS post_id,
+        p.OwnerUserId                                  AS user_id,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END)  AS up_votes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END)  AS down_votes,
+        SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END)  AS favorite_votes
+    FROM Votes v
+    JOIN Posts p ON p.Id = v.PostId
+    GROUP BY v.PostId, p.OwnerUserId
+),
+
+/* -------------------------------------------------------------
+   5. Recent activity window (last 30 days) with row_number
+   ------------------------------------------------------------- */
+recent_activity AS (
+    SELECT
+        p.OwnerUserId                                   AS user_id,
+        p.Id                                            AS post_id,
+        p.CreationDate                                  AS activity_date,
+        p.PostTypeId                                    AS activity_type,
+        ROW_NUMBER() OVER (
+            PARTITION BY p.OwnerUserId
+            ORDER BY p.CreationDate DESC
+        )                                               AS rn_recent_30d
+    FROM Posts p
+    WHERE p.CreationDate >= CURRENT_DATE - INTERVAL '30 days'
+),
+
+/* -------------------------------------------------------------
+   6. Users with any badge (LEFT JOIN to include users w/o badges)
+   ------------------------------------------------------------- */
+users_with_badges AS (
+    SELECT
+        ub.user_id,
+        COALESCE(ub.total_badges, 0)           AS total_badges,
+        COALESCE(ub.gold_badges, 0)            AS gold_badges,
+        COALESCE(ub.silver_badges, 0)          AS silver_badges,
+        COALESCE(ub.bronze_badges, 0)          AS bronze_badges,
+        COALESCE(ub.tag_badges, 0)             AS tag_badges
+    FROM badge_agg ub
+    RIGHT JOIN user_base ubh ON ubh.user_id = ub.user_id
+),
+
+/* -------------------------------------------------------------
+   7. Union of active and inactive users for set‑operator stress
+   ------------------------------------------------------------- */
+active_users AS (
+    SELECT
+        ub.user_id,
+        ub.user_name,
+        ub.reputation,
+        ub.total_posts,
+        ub.last_access,
+        pa.question_count,
+        pa.answer_count,
+        pa.distinct_tag_count,
+        ubh.last_post_date,
+        wb.total_badges,
+        wb.gold_badges,
+        wb.silver_badges,
+        wb.bronze_badges,
+        wb.tag_badges,
+        va.up_votes,
+        va.down_votes,
+        va.favorite_votes
+    FROM user_base ub
+    LEFT JOIN post_agg pa   ON pa.user_id = ub.user_id
+    LEFT JOIN users_with_badges wb ON wb.user_id = ub.user_id
+    LEFT JOIN vote_agg va   ON va.user_id = ub.user_id
+    WHERE ub.reputation > 1000
+),
+inactive_users AS (
+    SELECT
+        ub.user_id,
+        ub.user_name,
+        ub.reputation,
+        ub.total_posts,
+        ub.last_access,
+        pa.question_count,
+        pa.answer_count,
+        pa.distinct_tag_count,
+        ubh.last_post_date,
+        wb.total_badges,
+        wb.gold_badges,
+        wb.silver_badges,
+        wb.bronze_badges,
+        wb.tag_badges,
+        va.up_votes,
+        va.down_votes,
+        va.favorite_votes
+    FROM user_base ub
+    LEFT JOIN post_agg pa   ON pa.user_id = ub.user_id
+    LEFT JOIN users_with_badges wb ON wb.user_id = ub.user_id
+    LEFT JOIN vote_agg va   ON va.user_id = ub.user_id
+    WHERE ub.reputation <= 1000
+)
+
+/* -------------------------------------------------------------
+   8. Final result set with ranking and NULL‑aware calculations
+   ------------------------------------------------------------- */
+SELECT
+    u.user_id,
+    u.user_name,
+    u.reputation,
+    u.total_posts,
+    COALESCE(u.question_count, 0)                           AS question_count,
+    COALESCE(u.answer_count, 0)                             AS answer_count,
+    COALESCE(u.distinct_tag_count, 0)                       AS distinct_tags_used,
+    u.total_badges,
+    u.gold_badges,
+    u.silver_badges,
+    u.bronze_badges,
+    u.tag_badges,
+    COALESCE(u.up_votes, 0)                                 AS total_up_votes_on_posts,
+    COALESCE(u.down_votes, 0)                               AS total_down_votes_on_posts,
+    COALESCE(u.favorite_votes, 0)                           AS total_favorites,
+    u.last_access,
+    u.last_post_date,
+    /* Composite activity score – demonstrates arithmetic & CASE */
+    CASE
+        WHEN u.reputation IS NULL THEN 0
+        ELSE
+            (u.reputation * 0.4) +
+            (COALESCE(u.question_count,0) * 1.5) +
+            (COALESCE(u.answer_count,0) * 2.0) +
+            (COALESCE(u.gold_badges,0) * 10) +
+            (COALESCE(u.silver_badges,0) * 5) +
+            (COALESCE(u.bronze_badges,0) * 2) +
+            (COALESCE(u.up_votes,0) * 0.1) -
+            (COALESCE(u.down_votes,0) * 0.2)
+    END                                                    AS activity_score,
+    /* Rank users by activity_score (window function) */
+    ROW_NUMBER() OVER (ORDER BY
+        CASE
+            WHEN u.reputation IS NULL THEN -1
+            ELSE
+                (u.reputation * 0.4) +
+                (COALESCE(u.question_count,0) * 1.5) +
+                (COALESCE(u.answer_count,0) * 2.0) +
+                (COALESCE(u.gold_badges,0) * 10) +
+                (COALESCE(u.silver_badges,0) * 5) +
+                (COALESCE(u.bronze_badges,0) * 2) +
+                (COALESCE(u.up_votes,0) * 0.1) -
+                (COALESCE(u.down_votes,0) * 0.2)
+        END DESC,
+        u.user_id ASC
+    )                                                     AS activity_rank
+FROM (
+    SELECT * FROM active_users
+    UNION ALL
+    SELECT * FROM inactive_users
+) u
+ORDER BY activity_rank
+LIMIT 100;

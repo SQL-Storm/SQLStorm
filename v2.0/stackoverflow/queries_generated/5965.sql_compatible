@@ -1,0 +1,90 @@
+WITH RecentActivePosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount
+  FROM Posts p
+  WHERE p.PostTypeId = 1 -- Questions
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days'
+),
+TopTags AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS TagQuestionCount,
+    AVG(rap.Score) AS AvgScorePerQuestion,
+    MAX(rap.LastActivityDate) AS LastActive
+  FROM RecentActivePosts rap
+  JOIN LATERAL regexp_split_to_table(rap.Tags, '><') AS t(TagName) ON true
+  GROUP BY t.TagName
+),
+HotVotes AS (
+  SELECT
+    v.PostId,
+    v.VoteTypeId,
+    v.UserId,
+    v.CreationDate,
+    u.DisplayName AS Voter
+  FROM Votes v
+  JOIN Users u ON v.UserId = u.Id
+  WHERE v.VoteTypeId IN (2, 6) -- UpMod or Close
+    AND v.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '14 days'
+),
+PostActivity AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.OwnerUserId,
+    p.ViewCount,
+    p.Score,
+    COALESCE(b.Name, 'NoBadge') AS BadgeName
+  FROM Posts p
+  LEFT JOIN Badges b ON p.OwnerUserId = b.UserId AND b.Class = 1 -- Gold badge as a performance marker
+  WHERE p.PostTypeId = 1
+),
+ComplexMetrics AS (
+  SELECT
+    rap.PostId,
+    rap.Title,
+    rap.Tags,
+    rap.CreationDate,
+    rap.LastActivityDate,
+    rap.OwnerUserId,
+    rap.Score,
+    rap.ViewCount,
+    COALESCE(COUNT(hv.PostId) FILTER (WHERE hv.VoteTypeId = 2), 0) AS UpvotesInWindow,
+    COALESCE(COUNT(hv.PostId) FILTER (WHERE hv.VoteTypeId = 6), 0) AS CloseVotesInWindow,
+    pr.LastActive
+  FROM RecentActivePosts rap
+  LEFT JOIN HotVotes hv ON hv.PostId = rap.PostId
+  LEFT JOIN (
+    SELECT p.Id, MAX(p.LastActivityDate) AS LastActive
+    FROM Posts p
+    GROUP BY p.Id
+  ) pr ON rap.PostId = pr.Id
+  GROUP BY rap.PostId, rap.Title, rap.Tags, rap.CreationDate, rap.LastActivityDate, rap.OwnerUserId, rap.Score, rap.ViewCount, pr.LastActive
+)
+SELECT
+  cm.PostId,
+  cm.Title,
+  cm.Tags,
+  cm.CreationDate,
+  cm.LastActivityDate,
+  cm.OwnerUserId,
+  cm.Score,
+  cm.ViewCount,
+  cm.UpvotesInWindow,
+  cm.CloseVotesInWindow,
+  ht.TagName AS MostFrequentTag,
+  ta.BadgeName AS OwnerGoldBadge
+FROM ComplexMetrics cm
+LEFT JOIN TopTags ht ON ht.TagName = ANY(string_to_array(REPLACE(REPLACE(cm.Tags, '<', ''), '>', ''), '><'))
+LEFT JOIN PostActivity ta ON ta.PostId = cm.PostId
+ORDER BY cm.LastActivityDate DESC
+LIMIT 100;

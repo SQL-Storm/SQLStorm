@@ -1,0 +1,256 @@
+WITH UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate AS UserLastAccessDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswers,
+        COUNT(c.Id) AS TotalCommentsMade,
+        SUM(COALESCE(p.ViewCount, 0)) AS TotalPostViews,
+        SUM(COALESCE(p.FavoriteCount, 0)) AS TotalPostFavorites,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.AnswerCount ELSE 0 END) AS TotalAnswersReceived,
+        MAX(p.CreationDate) AS LastPostDate,
+        MIN(p.CreationDate) AS FirstPostDate,
+        COUNT(b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE NULL END) AS AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE NULL END) AS AvgAnswerScore,
+        COALESCE(u.Location, 'Unknown') AS UserLocation
+    FROM Users AS u
+    LEFT JOIN Posts AS p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments AS c ON u.Id = c.UserId
+    LEFT JOIN Badges AS b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Location
+),
+PostDetails AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        COALESCE(p.ViewCount, 0) AS ViewCount,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        COALESCE(p.CommentCount, 0) AS CommentCount,
+        COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+        p.ClosedDate,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        LENGTH(p.Body) AS BodyLength,
+        LENGTH(COALESCE(p.Title, '')) AS TitleLength,
+        COALESCE(p.Title, SUBSTRING(p.Body, 1, 50) || '...') AS DisplayTitle,
+        CASE WHEN LOWER(p.Body) LIKE '%performance%' OR LOWER(p.Body) LIKE '%optimization%' THEN 1 ELSE 0 END AS ContainsPerformanceKeyword,
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.CreationDate DESC) AS PostScoreRank,
+        -- use ROWS BETWEEN with a window frame of 7 days expressed via integer number of seconds by converting timestamps to epoch
+        AVG(p.Score) OVER (
+            PARTITION BY p.OwnerUserId
+            ORDER BY p.CreationDate
+            RANGE BETWEEN 7 * 24 * 3600 PRECEDING AND CURRENT ROW
+        ) AS AvgOwnerScoreLast7Days,
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevPostScore,
+        COALESCE((
+            SELECT STRING_AGG(unnest_tag.tag_name, ',')
+            FROM unnest(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><')) AS unnest_tag(tag_name)
+        ), 'N/A') AS TagList,
+        COALESCE(array_length(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><'), 1), 0) AS TagCount,
+        (SELECT COUNT(v_corr.Id)
+         FROM Votes AS v_corr
+         WHERE v_corr.PostId = p.Id AND v_corr.VoteTypeId IN (1,2,5)
+        ) > (
+            SELECT COALESCE(AVG(v_avg.vote_count), 0)
+            FROM (
+                SELECT p_avg.Id, COUNT(v_avg_inner.Id) AS vote_count
+                FROM Posts AS p_avg
+                LEFT JOIN Votes AS v_avg_inner ON p_avg.Id = v_avg_inner.PostId AND v_avg_inner.VoteTypeId IN (1,2,5)
+                WHERE p_avg.OwnerUserId = p.OwnerUserId
+                  AND DATE_TRUNC('day', p_avg.CreationDate) = DATE_TRUNC('day', p.CreationDate)
+                GROUP BY p_avg.Id
+            ) AS v_avg
+        ) AS HasAboveAvgDailyVotesForUser,
+        p.Tags AS RawTags
+    FROM Posts AS p
+    JOIN PostTypes AS pt ON p.PostTypeId = pt.Id
+    WHERE p.OwnerUserId IS NOT NULL AND p.OwnerUserId <> -1
+),
+PostHistoryAnalysis AS (
+    SELECT
+        ph.PostId,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.Id END) AS EditCount,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Id END) AS CloseCount,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.Id END) AS ReopenCount,
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.CreationDate ELSE NULL END) AS LastEditDateByHistory,
+        MIN(ph.CreationDate) AS InitialCreationDateByHistory,
+        EXTRACT(EPOCH FROM (MIN(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.CreationDate ELSE NULL END) - MIN(ph.CreationDate))) / 3600 AS TimeToFirstEditHours,
+        STRING_AGG(DISTINCT COALESCE(u.DisplayName, ph.UserDisplayName, 'Unknown Editor'), ', ') AS EditorsList
+    FROM PostHistory AS ph
+    LEFT JOIN Users AS u ON ph.UserId = u.Id
+    GROUP BY ph.PostId
+),
+LinkedPostAnalysis AS (
+    SELECT
+        pl.PostId,
+        COUNT(CASE WHEN pl.LinkTypeId = 1 THEN pl.Id END) AS LinkedToCount,
+        COUNT(CASE WHEN pl.LinkTypeId = 3 THEN pl.Id END) AS DuplicateOfCount,
+        STRING_AGG(DISTINCT CAST(pl.RelatedPostId AS varchar), ',') AS RelatedPostsList,
+        MAX(pl.CreationDate) AS LastLinkDate
+    FROM PostLinks AS pl
+    GROUP BY pl.PostId
+),
+VoteAnalysis AS (
+    SELECT
+        v.PostId,
+        SUM(CASE WHEN v.VoteTypeId = 1 THEN 1 ELSE 0 END) AS AcceptedAnswerVotes,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS Downvotes,
+        SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoriteVotes,
+        SUM(CASE WHEN v.BountyAmount IS NOT NULL THEN v.BountyAmount ELSE 0 END) AS TotalBountyAmount,
+        COUNT(DISTINCT v.UserId) AS UniqueVoters
+    FROM Votes AS v
+    GROUP BY v.PostId
+),
+TagMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        unnest(string_to_array(SUBSTRING(p.Tags, 2, LENGTH(p.Tags)-2), '><')) AS TagName
+    FROM Posts AS p
+    WHERE p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2
+),
+TagAggregates AS (
+    SELECT
+        tm.TagName,
+        COUNT(DISTINCT tm.PostId) AS PostsWithTag,
+        COALESCE(AVG(pd.Score), 0) AS AvgScoreForTag,
+        COALESCE(AVG(pd.ViewCount), 0) AS AvgViewCountForTag,
+        COALESCE(SUM(pd.CommentCount), 0) AS TotalCommentsForTag,
+        RANK() OVER (ORDER BY COUNT(DISTINCT tm.PostId) DESC) AS TagPopularityRank
+    FROM TagMetrics AS tm
+    JOIN PostDetails AS pd ON tm.PostId = pd.PostId
+    GROUP BY tm.TagName
+),
+CombinedAnalysis AS (
+    SELECT
+        'HighRepUserPostActivity' AS AnalysisSegment,
+        ue.UserId,
+        ue.DisplayName,
+        ue.Reputation,
+        ue.TotalPosts,
+        ue.TotalQuestions,
+        ue.TotalAnswers,
+        ue.GoldBadges,
+        pd.PostId,
+        pd.PostTypeName,
+        pd.DisplayTitle,
+        pd.PostCreationDate,
+        pd.Score AS PostScore,
+        pd.ViewCount AS PostViewCount,
+        pd.CommentCount AS PostCommentCount,
+        COALESCE(va.Upvotes, 0) AS PostUpvotes,
+        COALESCE(va.Downvotes, 0) AS PostDownvotes,
+        COALESCE(ph.EditCount, 0) AS PostEditCount,
+        COALESCE(lpa.LinkedToCount, 0) AS PostLinkedToCount,
+        COALESCE(lpa.DuplicateOfCount, 0) AS PostDuplicateOfCount,
+        ph.EditorsList,
+        pd.BodyLength,
+        pd.ContainsPerformanceKeyword,
+        pd.PostScoreRank,
+        pd.AvgOwnerScoreLast7Days,
+        pd.HasAboveAvgDailyVotesForUser,
+        pd.TagList,
+        pd.TagCount,
+        (SELECT ta_prim.AvgScoreForTag
+         FROM TagAggregates ta_prim
+         WHERE ta_prim.TagName = (
+             SELECT (string_to_array(SUBSTRING(pd.RawTags, 2, LENGTH(pd.RawTags)-2), '><'))[1]
+             FROM Posts
+             WHERE Id = pd.PostId AND pd.RawTags IS NOT NULL AND LENGTH(pd.RawTags) > 2
+             LIMIT 1
+         )
+        ) AS PrimaryTagAvgScore,
+        CASE
+            WHEN pd.ClosedDate IS NOT NULL AND ph.InitialCreationDateByHistory IS NOT NULL THEN
+                EXTRACT(EPOCH FROM (pd.ClosedDate - ph.InitialCreationDateByHistory)) / (24 * 3600)
+            ELSE NULL
+        END AS DaysToClose,
+        CASE WHEN COALESCE(va.Downvotes, 0) + COALESCE(va.AcceptedAnswerVotes, 0) = 0 THEN 1000.0
+             ELSE (COALESCE(va.Upvotes, 0) * 1.0) / (COALESCE(va.Downvotes, 0) + COALESCE(va.AcceptedAnswerVotes, 0))
+        END AS UpvoteToNegativeRatio,
+        (SELECT COALESCE(AVG(v.BountyAmount), 0) FROM Votes v WHERE v.PostId = pd.PostId AND v.VoteTypeId = 8) AS AvgBountyOnPost
+    FROM UserEngagement AS ue
+    JOIN PostDetails AS pd ON ue.UserId = pd.OwnerUserId
+    LEFT JOIN PostHistoryAnalysis AS ph ON pd.PostId = ph.PostId
+    LEFT JOIN LinkedPostAnalysis AS lpa ON pd.PostId = lpa.PostId
+    LEFT JOIN VoteAnalysis AS va ON pd.PostId = va.PostId
+    WHERE ue.Reputation > 5000
+      AND pd.ViewCount > 500
+      AND pd.PostCreationDate >= TIMESTAMP '2021-01-01'
+      AND pd.ContainsPerformanceKeyword = 1
+
+    UNION ALL
+
+    SELECT
+        'RecentEditedPostAnalysis' AS AnalysisSegment,
+        ue.UserId,
+        ue.DisplayName,
+        ue.Reputation,
+        ue.TotalPosts,
+        ue.TotalQuestions,
+        ue.TotalAnswers,
+        ue.GoldBadges,
+        pd.PostId,
+        pd.PostTypeName,
+        pd.DisplayTitle,
+        pd.PostCreationDate,
+        pd.Score AS PostScore,
+        pd.ViewCount AS PostViewCount,
+        pd.CommentCount AS PostCommentCount,
+        COALESCE(va.Upvotes, 0) AS PostUpvotes,
+        COALESCE(va.Downvotes, 0) AS PostDownvotes,
+        COALESCE(ph.EditCount, 0) AS PostEditCount,
+        COALESCE(lpa.LinkedToCount, 0) AS PostLinkedToCount,
+        COALESCE(lpa.DuplicateOfCount, 0) AS PostDuplicateOfCount,
+        ph.EditorsList,
+        pd.BodyLength,
+        pd.ContainsPerformanceKeyword,
+        pd.PostScoreRank,
+        pd.AvgOwnerScoreLast7Days,
+        pd.HasAboveAvgDailyVotesForUser,
+        pd.TagList,
+        pd.TagCount,
+        (SELECT ta_prim.AvgScoreForTag
+         FROM TagAggregates ta_prim
+         WHERE ta_prim.TagName = (
+             SELECT (string_to_array(SUBSTRING(pd.RawTags, 2, LENGTH(pd.RawTags)-2), '><'))[1]
+             FROM Posts
+             WHERE Id = pd.PostId AND pd.RawTags IS NOT NULL AND LENGTH(pd.RawTags) > 2
+             LIMIT 1
+         )
+        ) AS PrimaryTagAvgScore,
+        CASE
+            WHEN pd.ClosedDate IS NOT NULL AND ph.InitialCreationDateByHistory IS NOT NULL THEN
+                EXTRACT(EPOCH FROM (pd.ClosedDate - ph.InitialCreationDateByHistory)) / (24 * 3600)
+            ELSE NULL
+        END AS DaysToClose,
+        CASE WHEN COALESCE(va.Downvotes, 0) + COALESCE(va.AcceptedAnswerVotes, 0) = 0 THEN 1000.0
+             ELSE (COALESCE(va.Upvotes, 0) * 1.0) / (COALESCE(va.Downvotes, 0) + COALESCE(va.AcceptedAnswerVotes, 0))
+        END AS UpvoteToNegativeRatio,
+        (SELECT COALESCE(AVG(v.BountyAmount), 0) FROM Votes v WHERE v.PostId = pd.PostId AND v.VoteTypeId = 8) AS AvgBountyOnPost
+    FROM UserEngagement AS ue
+    JOIN PostDetails AS pd ON ue.UserId = pd.OwnerUserId
+    LEFT JOIN PostHistoryAnalysis AS ph ON pd.PostId = ph.PostId
+    LEFT JOIN LinkedPostAnalysis AS lpa ON pd.PostId = lpa.PostId
+    LEFT JOIN VoteAnalysis AS va ON pd.PostId = va.PostId
+    JOIN Users u_main ON ue.UserId = u_main.Id
+    WHERE ph.LastEditDateByHistory >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '60 days')
+      AND ue.TotalPosts > 50
+      AND pd.Score > 20
+      AND u_main.AboutMe IS NOT NULL AND LENGTH(u_main.AboutMe) > 100
+)
+SELECT
+    *
+FROM CombinedAnalysis
+ORDER BY AnalysisSegment, Reputation DESC, PostScore DESC
+LIMIT 2000;

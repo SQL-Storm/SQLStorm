@@ -1,0 +1,136 @@
+-- {"query": "2316.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1365} 
+
+WITH RecursiveTagHierarchy AS (
+    -- Simulate a hierarchy of tags by linking tags that appear together in questions
+    SELECT
+        t1.Id AS RootTagId,
+        t1.TagName AS RootTagName,
+        t2.Id AS RelatedTagId,
+        t2.TagName AS RelatedTagName,
+        1 AS Level
+    FROM Tags t1
+    JOIN Posts p1 ON p1.Tags LIKE CONCAT('%<', t1.TagName, '>%')
+    JOIN Tags t2 ON p1.Tags LIKE CONCAT('%<', t2.TagName, '>%') AND t1.Id <> t2.Id
+    WHERE t1.IsModeratorOnly = 0 AND t2.IsModeratorOnly = 0
+    UNION ALL
+    SELECT
+        r.RootTagId,
+        r.RootTagName,
+        t3.Id,
+        t3.TagName,
+        r.Level + 1
+    FROM RecursiveTagHierarchy r
+    JOIN Posts p2 ON p2.Tags LIKE CONCAT('%<', r.RelatedTagName, '>%')
+    JOIN Tags t3 ON p2.Tags LIKE CONCAT('%<', t3.TagName, '>%') AND t3.Id <> r.RelatedTagId AND t3.Id <> r.RootTagId
+    WHERE r.Level < 3 -- limit recursion depth to avoid infinite cycles
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsAsked,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersGiven,
+        COALESCE(SUM(vb.UpVotes), 0) AS TotalUpVotes,
+        COALESCE(SUM(vd.DownVotes), 0) AS TotalDownVotes,
+        MAX(b.Date) FILTER (WHERE b.Class = 1) AS LastGoldBadgeDate,
+        -- Window function example: rank users by reputation within locations
+        RANK() OVER (PARTITION BY COALESCE(NULLIF(TRIM(u.Location), ''), 'Unknown') ORDER BY u.Reputation DESC) AS LocationReputationRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT p.OwnerUserId, COUNT(*) AS UpVotes
+        FROM Posts p
+        JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId = 2
+        GROUP BY p.OwnerUserId
+    ) vb ON vb.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT p.OwnerUserId, COUNT(*) AS DownVotes
+        FROM Posts p
+        JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId = 3
+        GROUP BY p.OwnerUserId
+    ) vd ON vd.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, LocationReputationRank
+),
+PostEngagement AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.PostTypeId,
+        u.DisplayName AS OwnerName,
+        -- Correlated subquery for number of comments with score > 0 on the post
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id AND c.Score > 0) AS PositiveCommentsCount,
+        -- Calculate time to acceptance if exists
+        CASE
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN
+                EXTRACT(EPOCH FROM (a.CreationDate - p.CreationDate)) / 3600.0 -- hours to acceptance
+            ELSE NULL
+        END AS HoursToAcceptedAnswer,
+        -- Window function: dense_rank for posts by views within each post type
+        DENSE_RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.ViewCount DESC) AS ViewRankWithinType
+    FROM Posts p
+    LEFT JOIN Posts a ON a.Id = p.AcceptedAnswerId
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.Score > 5
+),
+CombinedResults AS (
+    SELECT
+        ua.UserId,
+        ua.DisplayName,
+        ua.LocationReputationRank,
+        ua.Reputation,
+        ua.QuestionsAsked,
+        ua.AnswersGiven,
+        ua.TotalUpVotes,
+        ua.TotalDownVotes,
+        ua.LastGoldBadgeDate,
+        pe.PostId,
+        pe.Title,
+        pe.Score,
+        pe.ViewCount,
+        pe.PositiveCommentsCount,
+        pe.HoursToAcceptedAnswer,
+        pe.ViewRankWithinType,
+        rt.RelatedTagName
+    FROM UserActivity ua
+    LEFT JOIN Posts p ON p.OwnerUserId = ua.UserId
+    LEFT JOIN PostEngagement pe ON pe.PostId = p.Id
+    LEFT JOIN RecursiveTagHierarchy rt ON rt.RootTagId IN (
+        SELECT t.Id FROM Tags t WHERE p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+    )
+    WHERE pe.PostId IS NOT NULL
+)
+
+SELECT DISTINCT
+    cr.DisplayName,
+    cr.Reputation,
+    cr.LocationReputationRank,
+    cr.QuestionsAsked,
+    cr.AnswersGiven,
+    cr.TotalUpVotes,
+    cr.TotalDownVotes,
+    cr.LastGoldBadgeDate,
+    cr.PostId,
+    LEFT(cr.Title, 100) || CASE WHEN LENGTH(cr.Title) > 100 THEN '...' ELSE '' END AS PostTitleSnippet,
+    cr.Score,
+    cr.ViewCount,
+    cr.PositiveCommentsCount,
+    ROUND(cr.HoursToAcceptedAnswer, 2) AS HoursToAcceptedAnswer,
+    cr.ViewRankWithinType,
+    cr.RelatedTagName,
+    -- Complex predicate: filter posts that have a high score to view ratio or recent accepted answers
+    CASE 
+        WHEN cr.ViewCount > 0 THEN cr.Score::float / cr.ViewCount
+        ELSE NULL
+    END AS ScoreToViewRatio
+FROM CombinedResults cr
+WHERE (cr.ScoreToViewRatio > 0.05 OR (cr.HoursToAcceptedAnswer IS NOT NULL AND cr.HoursToAcceptedAnswer < 48))
+  AND (cr.LastGoldBadgeDate IS NULL OR cr.LastGoldBadgeDate >= CURRENT_DATE - INTERVAL '1 year')
+ORDER BY cr.LocationReputationRank, cr.ScoreToViewRatio DESC NULLS LAST, cr.ViewCount DESC
+LIMIT 100;

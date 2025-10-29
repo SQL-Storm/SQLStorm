@@ -1,0 +1,363 @@
+with recent_posts as (
+    select
+        p.id,
+        p.posttypeid,
+        p.creationdate,
+        p.score,
+        p.viewcount,
+        p.owneruserid,
+        p.acceptedanswerid,
+        p.parentid,
+        p.title,
+        p.tags,
+        coalesce(p.answercount, 0) as answercount
+    from posts p
+    where p.creationdate >= (select max(creationdate) - interval '365 days' from posts)
+),
+users_aug as (
+    select
+        u.id as user_id,
+        u.displayname,
+        u.reputation,
+        u.creationdate as user_created,
+        u.location,
+        u.upvotes,
+        u.downvotes,
+        u.views,
+        sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+        sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+        sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+        count(b.id) as total_badges,
+        max(b.date) as last_badge_date
+    from users u
+    left join badges b on b.userid = u.id
+    group by u.id, u.displayname, u.reputation, u.creationdate, u.location, u.upvotes, u.downvotes, u.views
+),
+votes_agg as (
+    select
+        v.postid,
+        sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+        sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+        sum(case when v.votetypeid = 8 then coalesce(v.bountyamount,0) else 0 end) as bounty_start,
+        sum(case when v.votetypeid = 9 then coalesce(v.bountyamount,0) else 0 end) as bounty_close,
+        sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites_legacy
+    from votes v
+    where v.creationdate >= (select max(creationdate) - interval '365 days' from votes)
+    group by v.postid
+),
+q_and_a as (
+    select
+        q.id as question_id,
+        q.creationdate as q_created,
+        q.score as q_score,
+        q.viewcount as q_views,
+        q.title as q_title,
+        q.tags as q_tags,
+        q.owneruserid as q_owner_id,
+        q.acceptedanswerid,
+        q.answercount,
+        ph_close.closed_date,
+        crt.name as close_reason_name,
+        array_length(string_to_array(coalesce(substring(q.tags, 2, length(q.tags)-2), ''), '><'), 1) as tag_count
+    from recent_posts q
+    left join lateral (
+        select min(ph.creationdate) as closed_date,
+               max(case when ph.posthistorytypeid = 10 then ph.comment end) as close_reason_id_raw
+        from posthistory ph
+        where ph.postid = q.id
+          and ph.posthistorytypeid in (10, 11, 12, 13, 35)
+    ) ph_close on true
+    left join closereasontypes crt
+      on cast(crt.id as varchar) = nullif(ph_close.close_reason_id_raw, '')
+    where q.posttypeid = 1
+),
+answers_aug as (
+    select
+        a.id as answer_id,
+        a.parentid as question_id,
+        a.owneruserid as a_owner_id,
+        a.creationdate as a_created,
+        a.score as a_score,
+        a.commentcount as a_comments
+    from recent_posts a
+    where a.posttypeid = 2
+),
+accepted_answers as (
+    select
+        qa.question_id,
+        aa.answer_id,
+        aa.a_owner_id,
+        aa.a_created,
+        aa.a_score
+    from q_and_a qa
+    left join answers_aug aa
+      on aa.answer_id = qa.acceptedanswerid
+),
+answer_stats as (
+    select
+        aa.question_id,
+        count(*) as answers_total,
+        max(aa.a_score) as max_answer_score,
+        avg(cast(aa.a_score as numeric)) as avg_answer_score,
+        sum(case when aa.a_score > 0 then 1 else 0 end) as positive_answers
+    from answers_aug aa
+    group by aa.question_id
+),
+tag_counts as (
+    select
+        t.tagname,
+        t.count as global_tag_usage,
+        t.ismoderaTORonly,
+        t.isrequired
+    from tags t
+),
+linked_duplicates as (
+    select
+        pl.postid as dup_post_id,
+        pl.relatedpostid as original_post_id,
+        pl.creationdate as link_date
+    from postlinks pl
+    where pl.linktypeid = 3
+),
+activity_rank as (
+    select
+        p.id as post_id,
+        p.owneruserid as owner_id,
+        p.creationdate,
+        p.lastactivitydate,
+        p.score,
+        p.viewcount,
+        row_number() over (partition by p.owneruserid order by p.lastactivitydate desc NULLS LAST, p.creationdate desc) as rn_recent_by_user,
+        rank() over (order by p.viewcount desc NULLS LAST) as rk_views_global,
+        dense_rank() over (order by p.score desc NULLS LAST) as drk_score_global
+    from posts p
+    where p.creationdate >= (select max(creationdate) - interval '365 days' from posts)
+),
+questions_enriched as (
+    select
+        qa.*,
+        coalesce(v.upvotes,0) as q_upvotes,
+        coalesce(v.downvotes,0) as q_downvotes,
+        coalesce(v.bounty_start,0) as bounty_started,
+        coalesce(v.bounty_close,0) as bounty_paid,
+        coalesce(v.favorites_legacy,0) as favorites_legacy,
+        (coalesce(v.upvotes,0) - coalesce(v.downvotes,0)) as net_votes,
+        astat.answers_total,
+        astat.max_answer_score,
+        astat.avg_answer_score,
+        aacc.answer_id as accepted_answer_id,
+        aacc.a_owner_id as accepted_owner_id,
+        aacc.a_score as accepted_score,
+        ld.original_post_id as duplicate_of,
+        ld.link_date as duplicate_link_date
+    from q_and_a qa
+    left join votes_agg v on v.postid = qa.question_id
+    left join answer_stats astat on astat.question_id = qa.question_id
+    left join accepted_answers aacc on aacc.question_id = qa.question_id
+    left join linked_duplicates ld on ld.dup_post_id = qa.question_id
+),
+owner_metrics as (
+    select
+        qe.question_id,
+        u.displayname as owner_name,
+        u.reputation as owner_reputation,
+        u.location as owner_location,
+        u.total_badges,
+        u.gold_badges,
+        u.silver_badges,
+        u.bronze_badges,
+        u.last_badge_date
+    from questions_enriched qe
+    left join users_aug u on u.user_id = qe.q_owner_id
+),
+tag_explode as (
+    select
+        qe.question_id,
+        lower(trim(t)) as tag
+    from questions_enriched qe,
+    lateral unnest(
+        case
+            when qe.q_tags is null then array[]::text[]
+            when length(qe.q_tags) <= 2 then array[]::text[]
+            else string_to_array(substring(qe.q_tags, 2, length(qe.q_tags)-2), '><')
+        end
+    ) as t
+),
+tag_stats as (
+    select
+        te.question_id,
+        count(*) as tag_cnt,
+        sum(case when tc.global_tag_usage > 0 then 1 else 0 end) as known_tags,
+        max(tc.global_tag_usage) as max_tag_popularity,
+        min(tc.global_tag_usage) as min_tag_popularity
+    from tag_explode te
+    left join tag_counts tc on tc.tagname = te.tag
+    group by te.question_id
+),
+comment_sentiment as (
+    select
+        c.postid,
+        count(*) as comment_count,
+        sum(case when c.score > 0 then 1 else 0 end) as pos_comments,
+        sum(case when c.score < 0 then 1 else 0 end) as neg_comments,
+        avg(cast(c.score as numeric)) as avg_comment_score,
+        max(length(c.text)) as max_comment_len,
+        sum(case when lower(c.text) like '%thanks%' or lower(c.text) like '%thank you%' then 1 else 0 end) as thanks_count
+    from comments c
+    where c.creationdate >= (select max(creationdate) - interval '365 days' from comments)
+    group by c.postid
+),
+question_activity as (
+    select
+        qe.question_id,
+        ar.rk_views_global,
+        ar.drk_score_global,
+        ar.rn_recent_by_user
+    from questions_enriched qe
+    left join activity_rank ar on ar.post_id = qe.question_id
+),
+normalized_scores as (
+    select
+        qe.question_id,
+        qe.q_score,
+        qe.q_views,
+        qe.net_votes,
+        (cast(qe.q_score as numeric) / nullif((select max(score) from posts where posttypeid = 1), 0)) as score_norm,
+        (cast(qe.q_views as numeric) / nullif((select max(viewcount) from posts where posttypeid = 1), 0)) as views_norm,
+        (cast(qe.net_votes as numeric) / nullif((select max(coalesce(score,0)) from posts where posttypeid = 1), 0)) as votes_norm
+    from questions_enriched qe
+),
+final_rank as (
+    select
+        qe.question_id,
+        qe.q_created,
+        qe.q_title,
+        qe.tag_count,
+        coalesce(ts.tag_cnt, 0) as tags_total,
+        coalesce(ts.known_tags, 0) as tags_known,
+        coalesce(ts.max_tag_popularity, 0) as max_tag_popularity,
+        coalesce(ts.min_tag_popularity, 0) as min_tag_popularity,
+        nm.score_norm,
+        nm.views_norm,
+        nm.votes_norm,
+        qa.rk_views_global,
+        qa.drk_score_global,
+        qa.rn_recent_by_user,
+        coalesce(cs.comment_count,0) as comment_count,
+        coalesce(cs.thanks_count,0) as thanks_count,
+        qe.answers_total,
+        qe.accepted_answer_id,
+        qe.accepted_score,
+        qe.duplicate_of,
+        case when qe.closed_date is not null then 1 else 0 end as is_closed,
+        case when qe.duplicate_of is not null then 1 else 0 end as is_duplicate,
+        (
+            0.35 * coalesce(nm.views_norm,0) +
+            0.30 * coalesce(nm.score_norm,0) +
+            0.15 * coalesce(nm.votes_norm,0) +
+            0.10 * (case when qe.accepted_answer_id is not null then 1 else 0 end) +
+            0.05 * least(coalesce(cs.comment_count,0) / 10.0, 1.0) +
+            0.05 * least(coalesce(qe.answers_total,0) / 5.0, 1.0)
+        ) as composite_score
+    from questions_enriched qe
+    left join tag_stats ts on ts.question_id = qe.question_id
+    left join question_activity qa on qa.question_id = qe.question_id
+    left join normalized_scores nm on nm.question_id = qe.question_id
+    left join comment_sentiment cs on cs.postid = qe.question_id
+),
+per_user_window as (
+    select
+        fr.question_id,
+        fr.q_created,
+        fr.q_title,
+        fr.tag_count,
+        fr.tags_total,
+        fr.tags_known,
+        fr.max_tag_popularity,
+        fr.min_tag_popularity,
+        fr.score_norm,
+        fr.views_norm,
+        fr.votes_norm,
+        fr.rk_views_global,
+        fr.drk_score_global,
+        fr.rn_recent_by_user,
+        fr.comment_count,
+        fr.thanks_count,
+        fr.answers_total,
+        fr.accepted_answer_id,
+        fr.accepted_score,
+        fr.duplicate_of,
+        fr.is_closed,
+        fr.is_duplicate,
+        fr.composite_score,
+        row_number() over (partition by u.displayname order by fr.composite_score desc, fr.q_created desc) as rn_per_user,
+        avg(fr.composite_score) over () as avg_composite_global,
+        percentile_cont(0.9) within group (order by fr.composite_score) over () as p90_composite_global
+    from final_rank fr
+    left join posts p on p.id = fr.question_id
+    left join users u on u.id = p.owneruserid
+),
+topk as (
+    select *
+    from per_user_window
+    where rn_per_user <= 5
+),
+ordered_topk as (
+    select
+        t.question_id,
+        t.q_title,
+        t.q_created,
+        t.tag_count,
+        t.tags_total,
+        t.tags_known,
+        t.max_tag_popularity,
+        t.min_tag_popularity,
+        t.score_norm,
+        t.views_norm,
+        t.votes_norm,
+        t.rk_views_global,
+        t.drk_score_global,
+        t.rn_recent_by_user,
+        t.comment_count,
+        t.thanks_count,
+        t.answers_total,
+        t.accepted_answer_id,
+        t.accepted_score,
+        t.is_closed,
+        t.is_duplicate,
+        round(cast(t.composite_score as numeric), 6) as composite_score,
+        t.avg_composite_global,
+        t.p90_composite_global,
+        row_number() over (order by t.composite_score desc, t.q_created desc) as overall_rn
+    from topk t
+)
+select
+    ot.question_id,
+    ot.q_title,
+    ot.q_created,
+    ot.tag_count,
+    ot.tags_total,
+    ot.tags_known,
+    ot.max_tag_popularity,
+    ot.min_tag_popularity,
+    ot.score_norm,
+    ot.views_norm,
+    ot.votes_norm,
+    ot.rk_views_global,
+    ot.drk_score_global,
+    ot.rn_recent_by_user,
+    ot.comment_count,
+    ot.thanks_count,
+    ot.answers_total,
+    ot.accepted_answer_id,
+    ot.accepted_score,
+    ot.is_closed,
+    ot.is_duplicate,
+    ot.composite_score,
+    case
+        when ot.composite_score >= ot.p90_composite_global then 'top10%'
+        when ot.composite_score >= ot.avg_composite_global then 'above_avg'
+        else 'below_avg'
+    end as composite_bucket
+from ordered_topk ot
+where ot.overall_rn <= 200;

@@ -1,0 +1,166 @@
+-- {"query": "4887.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1758} 
+WITH RankedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount AS PostViewCount,
+        p.FavoriteCount AS PostFavoriteCount,
+        p.AnswerCount AS PostAnswerCount,
+        p.CommentCount AS PostCommentCount,
+        pt.Name AS PostTypeName,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) AS rn_post_type,
+        RANK() OVER (ORDER BY p.Score DESC) AS rnk_score
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.CreationDate BETWEEN '2023-01-01' AND '2023-12-31'
+),
+UserPostContribution AS (
+    SELECT
+        p.OwnerUserId,
+        COUNT(p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        AVG(p.PostScore) AS AvgPostScore,
+        MAX(p.PostCreationDate) AS LastPostDate
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        upc.TotalPosts,
+        upc.QuestionCount,
+        upc.AnswerCount,
+        upc.AvgPostScore,
+        upc.LastPostDate,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Users u
+    LEFT JOIN UserPostContribution upc ON u.Id = upc.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.LastAccessDate >= DATE('now', '-1 year')
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, upc.TotalPosts, upc.QuestionCount, upc.AnswerCount, upc.AvgPostScore, upc.LastPostDate
+),
+PostEditSummary AS (
+    SELECT
+        ph.PostId,
+        COUNT(DISTINCT ph.RevisionGUID) AS EditCount,
+        MAX(ph.CreationDate) AS LastEditDate
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9) -- Edit and Rollback types
+    GROUP BY ph.PostId
+),
+AggregatedPostData AS (
+    SELECT
+        rp.PostId,
+        rp.PostTypeId,
+        rp.PostTypeName,
+        rp.PostCreationDate,
+        rp.PostScore,
+        rp.PostViewCount,
+        rp.PostFavoriteCount,
+        rp.PostAnswerCount,
+        rp.PostCommentCount,
+        rp.rn_post_type,
+        rp.rnk_score,
+        pes.EditCount,
+        pes.LastEditDate,
+        COALESCE(u.DisplayName, 'Community') AS OwnerDisplayName,
+        CASE
+            WHEN rp.PostTypeId = 1 AND rp.PostAnswerCount > 0 THEN rp.PostAnswerCount * 100.0 / NULLIF(rp.PostFavoriteCount, 0)
+            WHEN rp.PostTypeId = 2 THEN rp.PostScore * 100.0 / NULLIF(rp.PostCommentCount, 0)
+            ELSE 0
+        END AS ScoreCommentRatio,
+        LENGTH(rp.Title) AS TitleLength,
+        SUBSTRING(rp.Tags, 2, LENGTH(rp.Tags) - 2) AS FormattedTags
+    FROM RankedPosts rp
+    LEFT JOIN UserEngagement u ON rp.OwnerUserId = u.UserId
+    LEFT JOIN PostEditSummary pes ON rp.PostId = pes.PostId
+    WHERE rp.PostTypeName IN ('Question', 'Answer')
+)
+SELECT
+    agg.PostId,
+    agg.PostTypeName,
+    agg.OwnerDisplayName,
+    agg.PostScore,
+    agg.PostViewCount,
+    agg.PostFavoriteCount,
+    agg.PostAnswerCount,
+    agg.PostCommentCount,
+    agg.EditCount,
+    agg.LastEditDate,
+    agg.ScoreCommentRatio,
+    agg.TitleLength,
+    agg.FormattedTags,
+    ue.Reputation AS OwnerReputation,
+    ue.UserCreationDate AS OwnerCreationDate,
+    ue.TotalPosts AS OwnerTotalPosts,
+    ue.QuestionCount AS OwnerQuestionCount,
+    ue.AnswerCount AS OwnerAnswerCount,
+    ue.AvgPostScore AS OwnerAvgPostScore,
+    ue.BadgeCount AS OwnerBadgeCount,
+    ue.LastBadgeDate AS OwnerLastBadgeDate,
+    CASE
+        WHEN agg.PostTypeId = 1 AND agg.PostScore > 100 THEN 'High Score Question'
+        WHEN agg.PostTypeId = 2 AND agg.PostScore > 50 THEN 'High Score Answer'
+        WHEN agg.EditCount > 5 THEN 'Frequently Edited'
+        ELSE 'Standard Post'
+    END AS PostCategory,
+    CASE
+        WHEN agg.PostTypeId = 1 THEN (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = agg.PostId AND pl.LinkTypeId = 3)
+        ELSE 0
+    END AS DuplicateLinkCount,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = agg.PostId AND c.Score < 0) AS NegativeScoreCommentCount,
+    CASE
+        WHEN EXISTS (SELECT 1 FROM PostHistory ph WHERE ph.PostId = agg.PostId AND ph.PostHistoryTypeId = 10) THEN 'Closed'
+        ELSE 'Open'
+    END AS PostStatus,
+    agg.PostCreationDate,
+    agg.rn_post_type,
+    agg.rnk_score
+FROM AggregatedPostData agg
+LEFT JOIN UserEngagement ue ON agg.OwnerUserId = ue.UserId
+WHERE agg.PostScore > 0
+   OR agg.PostViewCount > 1000
+   OR agg.PostFavoriteCount > 10
+UNION ALL
+SELECT
+    rp.PostId,
+    rp.PostTypeName,
+    'Community' AS OwnerDisplayName,
+    rp.PostScore,
+    rp.PostViewCount,
+    rp.PostFavoriteCount,
+    rp.PostAnswerCount,
+    rp.PostCommentCount,
+    NULL AS EditCount,
+    NULL AS LastEditDate,
+    0.0 AS ScoreCommentRatio,
+    NULL AS TitleLength,
+    NULL AS FormattedTags,
+    0 AS OwnerReputation,
+    NULL AS OwnerCreationDate,
+    NULL AS OwnerTotalPosts,
+    NULL AS OwnerQuestionCount,
+    NULL AS OwnerAnswerCount,
+    NULL AS OwnerAvgPostScore,
+    NULL AS OwnerBadgeCount,
+    NULL AS OwnerLastBadgeDate,
+    'Community Owned' AS PostCategory,
+    0 AS DuplicateLinkCount,
+    0 AS NegativeScoreCommentCount,
+    'Community Owned' AS PostStatus,
+    rp.PostCreationDate,
+    rp.rn_post_type,
+    rp.rnk_score
+FROM RankedPosts rp
+WHERE rp.PostTypeId IN (3, 5) -- Wiki, TagWiki
+  AND rp.rn_post_type <= 5
+ORDER BY rnk_score DESC, PostCreationDate DESC;

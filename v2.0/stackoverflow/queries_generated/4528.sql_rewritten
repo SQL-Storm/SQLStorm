@@ -1,0 +1,100 @@
+-- {"query": "4528.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1292} 
+WITH RecentPosts AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate,
+        pt.Name AS PostTypeName,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) as rn
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.CreationDate >= DATE('now', '-30 day')
+),
+UserPostActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (2, 5) THEN 1 ELSE 0 END) AS BodyEdits,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (1, 4, 7) THEN 1 ELSE 0 END) AS TitleEdits,
+        MAX(p.CreationDate) AS LatestPostDate
+    FROM Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId AND u.Id = ph.UserId
+    GROUP BY u.Id, u.DisplayName
+),
+HighReputationUsers AS (
+    SELECT
+        Id,
+        DisplayName,
+        Reputation
+    FROM Users
+    WHERE Reputation > 10000
+),
+PostEngagement AS (
+    SELECT
+        p.Id AS PostId,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVoteCount,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVoteCount,
+        CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS HasAcceptedAnswer
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    GROUP BY p.Id, p.AcceptedAnswerId
+)
+SELECT
+    rp1.PostTypeName AS PostType1,
+    rp1.Title AS PostTitle1,
+    rp1.CreationDate AS PostDate1,
+    COALESCE(hru.DisplayName, upa.DisplayName, 'Anonymous') AS PrimaryUserDisplayName,
+    COALESCE(hru.Reputation, upa.TotalPosts, 0) AS PrimaryUserScore,
+    pe1.CommentCount AS Post1CommentCount,
+    pe1.UpVoteCount AS Post1UpVotes,
+    pe1.DownVoteCount AS Post1DownVotes,
+    pe1.HasAcceptedAnswer AS Post1HasAcceptedAnswer,
+    rp2.PostTypeName AS PostType2,
+    rp2.Title AS PostTitle2,
+    rp2.CreationDate AS PostDate2,
+    pe2.CommentCount AS Post2CommentCount,
+    pe2.UpVoteCount AS Post2UpVotes,
+    pe2.DownVoteCount AS Post2DownVotes,
+    pe2.HasAcceptedAnswer AS Post2HasAcceptedAnswer,
+    CASE
+        WHEN pl.LinkTypeId = 1 THEN 'Linked'
+        WHEN pl.LinkTypeId = 3 THEN 'Duplicate'
+        ELSE 'Other'
+    END AS LinkType,
+    DATEDIFF(day, rp1.CreationDate, rp2.CreationDate) AS DaysBetweenPosts,
+    UPPER(SUBSTRING(rp1.Title, 1, 3) || '-' || LOWER(SUBSTRING(rp2.Title, LENGTH(rp2.Title)-2, 3))) AS TitleAbbreviation,
+    CASE
+        WHEN upa.BodyEdits > upa.TitleEdits * 2 THEN 'Body Focused Edits'
+        WHEN upa.TitleEdits > upa.BodyEdits * 2 THEN 'Title Focused Edits'
+        WHEN upa.BodyEdits > 0 OR upa.TitleEdits > 0 THEN 'Balanced Edits'
+        ELSE 'No Edits'
+    END AS UserEditFocus,
+    CASE
+        WHEN rp1.OwnerUserId IS NULL THEN 'Community Owned'
+        WHEN rp1.OwnerUserId = -1 THEN 'Community User'
+        WHEN rp1.OwnerUserId = COALESCE(upa.UserId, -999) THEN 'Same User'
+        ELSE 'Different User'
+    END AS OwnerRelationship,
+    CASE
+        WHEN pe1.UpVoteCount IS NULL AND pe1.DownVoteCount IS NULL THEN 'No Votes'
+        WHEN pe1.UpVoteCount > pe1.DownVoteCount THEN 'Net Positive'
+        WHEN pe1.DownVoteCount > pe1.UpVoteCount THEN 'Net Negative'
+        ELSE 'Neutral Votes'
+    END AS Post1VoteSentiment
+FROM RecentPosts rp1
+LEFT JOIN Posts p1 ON rp1.Id = p1.Id
+LEFT JOIN PostLinks pl ON p1.Id = pl.PostId
+LEFT JOIN Posts p2 ON pl.RelatedPostId = p2.Id
+LEFT JOIN RecentPosts rp2 ON p2.Id = rp2.Id
+LEFT JOIN PostEngagement pe1 ON rp1.Id = pe1.PostId
+LEFT JOIN PostEngagement pe2 ON rp2.Id = pe2.PostId
+LEFT JOIN UserPostActivity upa ON rp1.OwnerUserId = upa.UserId
+LEFT JOIN HighReputationUsers hru ON rp1.OwnerUserId = hru.Id
+WHERE rp1.rn <= 10 AND rp2.rn <= 10
+ORDER BY ABS(DATEDIFF(day, rp1.CreationDate, rp2.CreationDate)), rp1.CreationDate DESC;

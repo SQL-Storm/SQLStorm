@@ -1,0 +1,139 @@
+-- {"query": "4557.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1221} 
+WITH
+  RankedAnswers AS (
+    SELECT
+      p.Id AS AnswerId,
+      p.ParentId AS QuestionId,
+      p.OwnerUserId,
+      p.Score,
+      p.CreationDate AS AnswerCreationDate,
+      ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS rn
+    FROM Posts AS p
+    WHERE
+      p.PostTypeId = 2 -- Answers
+  ),
+  HighScoringQuestions AS (
+    SELECT
+      Id AS QuestionId,
+      Title,
+      OwnerUserId AS QuestionOwnerUserId,
+      Score AS QuestionScore,
+      CreationDate AS QuestionCreationDate,
+      Tags,
+      AnswerCount
+    FROM Posts
+    WHERE
+      PostTypeId = 1 -- Questions
+      AND Score > 100
+      AND AnswerCount > 5
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Reputation,
+      COUNT(DISTINCT c.Id) AS CommentCount,
+      COUNT(DISTINCT v.Id) AS VoteCount,
+      SUM(CASE WHEN ph.PostHistoryTypeId IN (2, 5) THEN 1 ELSE 0 END) AS PostEditCount,
+      MAX(u.LastAccessDate) AS LastAccessDate
+    FROM Users AS u
+    LEFT JOIN Comments AS c
+      ON u.Id = c.UserId
+    LEFT JOIN Votes AS v
+      ON u.Id = v.UserId
+    LEFT JOIN PostHistory AS ph
+      ON u.Id = ph.UserId
+    GROUP BY
+      u.Id,
+      u.DisplayName,
+      u.Reputation
+  )
+SELECT
+  hq.QuestionId,
+  hq.Title AS QuestionTitle,
+  hq.QuestionScore,
+  hq.QuestionCreationDate,
+  hq.Tags,
+  hq.AnswerCount AS TotalAnswerCount,
+  ra.AnswerId,
+  ra.Score AS AnswerScore,
+  ra.AnswerCreationDate,
+  ua.DisplayName AS AnswererDisplayName,
+  ua.Reputation AS AnswererReputation,
+  ua.CommentCount AS AnswererCommentCount,
+  ua.VoteCount AS AnswererVoteCount,
+  ua.PostEditCount AS AnswererEditCount,
+  ua.LastAccessDate AS AnswererLastAccessDate,
+  CASE
+    WHEN hq.OwnerUserId = ra.OwnerUserId THEN 'Same User'
+    ELSE 'Different Users'
+  END AS OwnerAnswererRelation,
+  UPPER(SUBSTRING(hq.Title FROM 1 FOR 3)) AS TitlePrefix,
+  DATEDIFF('day', hq.QuestionCreationDate, ra.AnswerCreationDate) AS DaysBetweenQuestionAndAnswer,
+  COALESCE(ua.DisplayName, 'Unknown') AS DisplayNameOrUnknown,
+  (
+    SELECT
+      COUNT(*)
+    FROM PostLinks AS pl
+    WHERE
+      pl.PostId = hq.QuestionId AND pl.LinkTypeId = 3 -- Duplicate link
+  ) AS DuplicateLinkCount
+FROM HighScoringQuestions AS hq
+LEFT OUTER JOIN RankedAnswers AS ra
+  ON hq.QuestionId = ra.QuestionId AND ra.rn = 1 -- Only the top-ranked answer
+LEFT OUTER JOIN UserActivity AS ua
+  ON ra.OwnerUserId = ua.UserId
+WHERE
+  hq.QuestionScore > (
+    SELECT
+      AVG(Score)
+    FROM Posts
+    WHERE
+      PostTypeId = 1
+  )
+  AND ra.AnswerScore >= 0 -- Ensure valid answer score
+UNION
+SELECT
+  hq.QuestionId,
+  hq.Title AS QuestionTitle,
+  hq.QuestionScore,
+  hq.QuestionCreationDate,
+  hq.Tags,
+  hq.AnswerCount AS TotalAnswerCount,
+  ra.AnswerId,
+  ra.Score AS AnswerScore,
+  ra.AnswerCreationDate,
+  ua.DisplayName AS AnswererDisplayName,
+  ua.Reputation AS AnswererReputation,
+  ua.CommentCount AS AnswererCommentCount,
+  ua.VoteCount AS AnswererVoteCount,
+  ua.PostEditCount AS AnswererEditCount,
+  ua.LastAccessDate AS AnswererLastAccessDate,
+  CASE
+    WHEN hq.OwnerUserId = ra.OwnerUserId THEN 'Same User'
+    ELSE 'Different Users'
+  END AS OwnerAnswererRelation,
+  UPPER(SUBSTRING(hq.Title FROM 1 FOR 3)) AS TitlePrefix,
+  DATEDIFF('day', hq.QuestionCreationDate, ra.AnswerCreationDate) AS DaysBetweenQuestionAndAnswer,
+  COALESCE(ua.DisplayName, 'Unknown') AS DisplayNameOrUnknown,
+  (
+    SELECT
+      COUNT(*)
+    FROM PostLinks AS pl
+    WHERE
+      pl.PostId = hq.QuestionId AND pl.LinkTypeId = 3 -- Duplicate link
+  ) AS DuplicateLinkCount
+FROM HighScoringQuestions AS hq
+RIGHT OUTER JOIN RankedAnswers AS ra
+  ON hq.QuestionId = ra.QuestionId AND ra.rn = 2 -- Only the second-ranked answer
+LEFT OUTER JOIN UserActivity AS ua
+  ON ra.OwnerUserId = ua.UserId
+WHERE
+  hq.QuestionScore <= (
+    SELECT
+      AVG(Score)
+    FROM Posts
+    WHERE
+      PostTypeId = 1
+  )
+  AND ra.AnswerScore >= 0;

@@ -1,0 +1,128 @@
+-- {"query": "3647.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2538} 
+WITH 
+-- Basic user stats
+UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.UpVotes,0) - COALESCE(u.DownVotes,0) AS NetVotes,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadges
+    FROM Users u
+),
+
+-- Aggregated post information per user
+PostAgg AS (
+    SELECT 
+        p.OwnerUserId AS UserId,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 1) AS Questions,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 2) AS Answers,
+        SUM(p.Score) FILTER (WHERE p.PostTypeId = 1) AS QuestionScore,
+        SUM(p.Score) FILTER (WHERE p.PostTypeId = 2) AS AnswerScore,
+        AVG(p.ViewCount) FILTER (WHERE p.PostTypeId = 1) AS AvgQuestionViews,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+
+-- Tag metadata (outer joins to excerpt/wiki posts)
+TagInfo AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagUseCount,
+        e.Id AS ExcerptPostId,
+        w.Id AS WikiPostId
+    FROM Tags t
+    LEFT JOIN Posts e ON e.Id = t.ExcerptPostId
+    LEFT JOIN Posts w ON w.Id = t.WikiPostId
+),
+
+-- User‑tag cross‑reference with ranking (window function)
+UserTagScore AS (
+    SELECT 
+        u.Id AS UserId,
+        ti.TagName,
+        COUNT(*) AS TaggedPosts,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY COUNT(*) DESC) AS TagRank
+    FROM Posts p
+    JOIN Users u ON u.Id = p.OwnerUserId
+    JOIN LATERAL (
+        SELECT UNNEST(string_to_array(
+            SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2),
+            '><')) AS tag
+    ) AS tags ON TRUE
+    JOIN TagInfo ti ON ti.TagName = tags.tag
+    WHERE p.Tags IS NOT NULL
+    GROUP BY u.Id, ti.TagName
+),
+
+-- Vote aggregation per post
+VoteAgg AS (
+    SELECT 
+        v.PostId,
+        SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        MAX(v.CreationDate) AS LastVoteDate
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY v.PostId
+)
+
+-- Final result set with assorted constructs
+SELECT 
+    us.Id,
+    us.DisplayName,
+    us.Reputation,
+    us.NetVotes,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    pa.Questions,
+    pa.Answers,
+    pa.QuestionScore,
+    pa.AnswerScore,
+    pa.AvgQuestionViews,
+    pa.LastPostDate,
+    COALESCE(va.UpVotes,0)        AS TotalPostUpVotes,
+    COALESCE(va.DownVotes,0)      AS TotalPostDownVotes,
+    COALESCE(ut.TagName,'N/A')    AS TopTag,
+    ut.TaggedPosts                AS TopTagPostCount,
+    ROW_NUMBER() OVER (PARTITION BY us.Id 
+                       ORDER BY (pa.QuestionScore + pa.AnswerScore) DESC) AS OverallRank,
+    CASE 
+        WHEN us.Reputation > 20000 THEN 'High'
+        WHEN us.Reputation BETWEEN 5000 AND 20000 THEN 'Medium'
+        ELSE 'Low'
+    END AS ReputationTier,
+    (SELECT COUNT(*) 
+       FROM Posts p2 
+       WHERE p2.OwnerUserId = us.Id 
+         AND p2.CreationDate > DATE '2023-01-01') AS RecentPosts
+FROM UserStats us
+LEFT JOIN PostAgg pa ON pa.UserId = us.Id
+-- join vote info of the most recent post of the user (correlated subquery)
+LEFT JOIN VoteAgg va 
+       ON va.PostId = (
+            SELECT p3.Id 
+            FROM Posts p3 
+            WHERE p3.OwnerUserId = us.Id 
+            ORDER BY p3.CreationDate DESC 
+            LIMIT 1
+       )
+LEFT JOIN (
+    SELECT UserId, TagName, TaggedPosts
+    FROM UserTagScore
+    WHERE TagRank = 1
+) ut ON ut.UserId = us.Id
+WHERE us.Reputation IS NOT NULL
+ORDER BY OverallRank
+LIMIT 100
+
+UNION ALL
+
+-- Dummy row to test set‑operator handling and NULL logic
+SELECT 
+    NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL

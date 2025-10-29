@@ -1,0 +1,137 @@
+WITH RECURSIVE RecursiveTagCounts AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        COALESCE(p.ViewCount, 0) AS PostViewCount,
+        1 AS Depth
+    FROM Tags t
+    LEFT JOIN Posts p ON p.PostTypeId = 1 AND p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    UNION ALL
+    SELECT
+        rtc.Id,
+        rtc.TagName,
+        rtc.Count,
+        rtc.IsModeratorOnly,
+        rtc.IsRequired,
+        rtc.PostViewCount / 2 AS PostViewCount,
+        rtc.Depth + 1 AS Depth
+    FROM RecursiveTagCounts rtc
+    WHERE rtc.Depth < 2
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersCount,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVotesGiven,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownVotesGiven,
+        MAX(CASE WHEN p.OwnerUserId = u.Id THEN p.CreationDate END) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+QuestionAnswerWindow AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.Score AS QuestionScore,
+        p.ViewCount,
+        p.CreationDate,
+        a.Id AS AnswerId,
+        a.Score AS AnswerScore,
+        a.OwnerUserId AS AnswererId,
+        row_number() OVER (PARTITION BY p.Id ORDER BY a.Score DESC, a.CreationDate) AS AnswerRank
+    FROM Posts p
+    LEFT JOIN Posts a ON a.ParentId = p.Id AND a.PostTypeId = 2
+    WHERE p.PostTypeId = 1
+),
+CloseVoteCounts AS (
+    SELECT
+        ph.PostId,
+        COUNT(*) AS CloseVotesCount,
+        MAX(ph.CreationDate) AS LastCloseVoteDate,
+        string_agg(DISTINCT crt.Name, ', ') AS CloseReasons
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS integer) AND ph.PostHistoryTypeId = 10
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.PostId
+),
+UserBadgeRanks AS (
+    SELECT
+        b.UserId,
+        b.Name,
+        b.Class,
+        COUNT(*) OVER (PARTITION BY b.UserId, b.Class) AS BadgeClassCount,
+        row_number() OVER (PARTITION BY b.UserId, b.Class ORDER BY b.Date DESC) AS BadgeRankByDate
+    FROM Badges b
+)
+SELECT DISTINCT
+    u.Id AS UserId,
+    u.DisplayName,
+    ua.QuestionsCount,
+    ua.AnswersCount,
+    ua.TotalPostScore,
+    ua.UpVotesGiven,
+    ua.DownVotesGiven,
+    ua.LastPostDate,
+    COALESCE(cvc.CloseVotesCount, 0) AS CloseVotesReceived,
+    cvc.CloseReasons,
+    ta.TagName,
+    SUM(rt.PostViewCount) OVER (PARTITION BY ta.TagName) AS TotalTagPostViewCounts,
+    MAX(qa.AnswerScore) FILTER (WHERE qa.AnswerRank = 1) AS TopAnswerScoreForUser,
+    ub.Name AS RecentBadgeName,
+    ub.Class AS RecentBadgeClass,
+    CASE
+        WHEN ub.Class = 1 THEN 'Gold'
+        WHEN ub.Class = 2 THEN 'Silver'
+        WHEN ub.Class = 3 THEN 'Bronze'
+        ELSE 'Unknown'
+    END AS RecentBadgeClassName,
+    SUBSTRING(u.AboutMe FROM 1 FOR 100) AS AboutMeSnippet,
+    CASE
+        WHEN u.WebsiteUrl IS NULL OR LENGTH(TRIM(u.WebsiteUrl)) = 0 THEN 'No Website'
+        ELSE u.WebsiteUrl
+    END AS WebsiteUrlStatus,
+    row_number() OVER (PARTITION BY u.Id ORDER BY ua.TotalPostScore DESC) AS UserScoreRank
+FROM Users u
+LEFT JOIN UserActivity ua ON ua.UserId = u.Id
+LEFT JOIN LATERAL (
+    SELECT cvc_sub.PostId, cvc_sub.CloseVotesCount, cvc_sub.CloseReasons
+    FROM CloseVoteCounts cvc_sub
+    WHERE cvc_sub.PostId IN (
+        SELECT p.Id FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1
+    )
+    LIMIT 1
+) cvc ON true
+LEFT JOIN RecursiveTagCounts rt ON rt.Depth = 1
+LEFT JOIN Tags ta ON ta.Id = rt.Id
+LEFT JOIN QuestionAnswerWindow qa ON qa.AnswererId = u.Id
+LEFT JOIN UserBadgeRanks ub ON ub.UserId = u.Id AND ub.BadgeRankByDate = 1
+WHERE ua.TotalPostScore IS NOT NULL
+  AND (u.Id % 5) = 0
+GROUP BY
+    u.Id,
+    u.DisplayName,
+    ua.QuestionsCount,
+    ua.AnswersCount,
+    ua.TotalPostScore,
+    ua.UpVotesGiven,
+    ua.DownVotesGiven,
+    ua.LastPostDate,
+    cvc.CloseVotesCount,
+    cvc.CloseReasons,
+    ta.TagName,
+    ub.Name,
+    ub.Class,
+    u.AboutMe,
+    u.WebsiteUrl,
+    ua.TotalPostScore,
+    u.Id
+ORDER BY ua.TotalPostScore DESC NULLS LAST, u.Id
+LIMIT 50;

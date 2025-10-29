@@ -1,0 +1,121 @@
+WITH RankedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.CommunityOwnedDate,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS rn_by_type_score,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) AS rn_by_type_date,
+        LAG(p.Score, 1, 0) OVER (ORDER BY p.CreationDate) AS PreviousScore,
+        LEAD(p.Score, 1, 0) OVER (ORDER BY p.CreationDate) AS NextScore,
+        SUM(p.Score) OVER (ORDER BY p.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS RunningTotalScore,
+        CASE
+            WHEN p.Score > 500 THEN 'High'
+            WHEN p.Score BETWEEN 100 AND 500 THEN 'Medium'
+            ELSE 'Low'
+        END AS ScoreCategory,
+        CASE
+            WHEN p.FavoriteCount IS NULL OR p.FavoriteCount = 0 THEN 'Not Favorited'
+            WHEN p.FavoriteCount > 10 THEN 'Very Popular'
+            ELSE 'Moderately Favorited'
+        END AS FavoriteStatus,
+        COALESCE(p.AnswerCount, 0) AS NonNullAnswerCount,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS PostStatus,
+        p.Tags
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1, 2)
+),
+PostAggregates AS (
+    SELECT
+        p.Id AS PostId,
+        COUNT(c.Id) AS CommentCountForPost,
+        SUM(c.Score) AS TotalCommentScoreForPost,
+        AVG(CAST(c.Score AS DECIMAL(10, 2))) AS AvgCommentScoreForPost,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM Posts p
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    GROUP BY p.Id
+),
+UserPostActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName AS UserName,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        SUM(p.Score) AS TotalScore,
+        AVG(CAST(p.Score AS DECIMAL(10, 2))) AS AvgScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS PostRankByUser,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY MAX(p.CreationDate) DESC) AS UserPostSequence
+    FROM Users u
+    JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id, u.DisplayName
+)
+SELECT
+    rp.PostId,
+    rp.PostTypeName,
+    rp.OwnerDisplayName,
+    rp.PostCreationDate,
+    rp.Score,
+    rp.ViewCount,
+    rp.FavoriteCount,
+    rp.ScoreCategory,
+    rp.FavoriteStatus,
+    rp.PostStatus,
+    pa.CommentCountForPost,
+    pa.TotalCommentScoreForPost,
+    upa.TotalPosts AS UserTotalPosts,
+    upa.QuestionCount AS UserQuestionCount,
+    upa.AnswerCount AS UserAnswerCount,
+    upa.AvgScore AS UserAvgScore,
+    CASE
+        WHEN rp.CommunityOwnedDate IS NOT NULL THEN 'Community Wiki'
+        ELSE 'User Owned'
+    END AS OwnershipType,
+    rp.RunningTotalScore,
+    rp.PreviousScore,
+    rp.NextScore,
+    upa.PostRankByUser,
+    rp.rn_by_type_score,
+    rp.rn_by_type_date,
+    rp.PostTypeName || ' - ' || COALESCE(rp.OwnerDisplayName, 'Anonymous') AS PostIdentifier,
+    COALESCE(pa.AvgCommentScoreForPost, 0) AS FinalAvgCommentScore,
+    CASE
+        WHEN rp.ClosedDate IS NULL THEN 'Active'
+        WHEN rp.ClosedDate > (cast('2024-10-01' as date) - INTERVAL '30 days') THEN 'Recently Closed'
+        ELSE 'Long Ago Closed'
+    END AS ClosureRecency,
+    rp.NonNullAnswerCount,
+    rp.Score - rp.NonNullAnswerCount AS NetScore,
+    CASE
+        WHEN rp.PostTypeId = 1 AND rp.Tags IS NOT NULL THEN SUBSTRING(rp.Tags FROM 2 FOR CHAR_LENGTH(rp.Tags) - 2)
+        ELSE NULL
+    END AS QuestionTags,
+    CASE
+        WHEN u.Id IS NOT NULL AND u.DisplayName = 'Community' THEN 'Community User'
+        WHEN u.Id IS NOT NULL AND u.Reputation > 100000 THEN 'High Reputation User'
+        WHEN u.Id IS NOT NULL THEN 'Regular User'
+        ELSE 'Unknown/Deleted User'
+    END AS UserType,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = rp.PostId AND v.VoteTypeId = 2) AS UpvoteCount,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = rp.PostId AND v.VoteTypeId = 3) AS DownvoteCount,
+    (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = rp.PostId AND pl.LinkTypeId = 3) AS DuplicateLinkCount
+FROM RankedPosts rp
+LEFT JOIN PostAggregates pa ON rp.PostId = pa.PostId
+LEFT JOIN UserPostActivity upa ON rp.OwnerUserId = upa.UserId
+LEFT JOIN Users u ON rp.OwnerUserId = u.Id
+WHERE (rp.Score > 0 OR COALESCE(rp.FavoriteCount, 0) > 0 OR COALESCE(pa.CommentCountForPost, 0) > 0)
+ORDER BY rp.PostCreationDate DESC
+LIMIT 1000;

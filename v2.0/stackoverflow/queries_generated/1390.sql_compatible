@@ -1,0 +1,197 @@
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS UserTotalUpVotesGiven,
+        U.DownVotes AS UserTotalDownVotesGiven,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestionsOwned,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswersOwned,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        SUM(P.Score) AS TotalPostScoreOwned,
+        SUM(COALESCE(P.ViewCount, 0)) AS TotalPostViewsOwned,
+        SUM(COALESCE(P.AnswerCount, 0)) AS TotalAnswersReceivedOnQuestions,
+        SUM(CASE WHEN V_Received.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesReceivedOnPosts,
+        SUM(CASE WHEN V_Received.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesReceivedOnPosts,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        MAX(B.Date) AS LastBadgeDate,
+        CAST(EXTRACT(EPOCH FROM (U.LastAccessDate - U.CreationDate)) / (60 * 60 * 24 * 365.25) AS numeric(10,2)) AS UserAgeInYears,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS TotalEditsOnOwnPosts,
+        MAX(PH.CreationDate) AS LastEditOnOwnPostDate,
+        NULLIF(SUM(CASE WHEN V_Received.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) / NULLIF(SUM(CASE WHEN V_Received.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS OverallPostVoteRatio
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN Votes AS V_Received ON P.Id = V_Received.PostId
+    LEFT JOIN Comments AS C ON U.Id = C.UserId
+    LEFT JOIN Badges AS B ON U.Id = B.UserId
+    LEFT JOIN PostHistory AS PH ON U.Id = PH.UserId AND PH.PostId = P.Id
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Views, U.UpVotes, U.DownVotes
+),
+PostEngagementMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.LastActivityDate,
+        P.Score AS PostScore,
+        P.ViewCount AS PostViewCount,
+        P.AnswerCount AS PostAnswerCount,
+        P.CommentCount AS PostCommentCount,
+        P.FavoriteCount AS PostFavoriteCount,
+        P.ClosedDate,
+        P.Title,
+        P.Tags,
+        COALESCE(SUM(CASE WHEN PV.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS PostUpVotes,
+        COALESCE(SUM(CASE WHEN PV.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS PostDownVotes,
+        COUNT(DISTINCT P_Comm.Id) AS ActualCommentCount,
+        AVG(P_Comm.Score) AS AvgCommentScore,
+        COUNT(DISTINCT PH.Id) AS TotalPostHistoryEvents,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (4,5,6,7,8,9) THEN PH.Id END) AS TotalPostEdits,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.CreationDate END) AS PostClosedEventDate,
+        (SELECT COUNT(DISTINCT ph_corr.UserId) FROM PostHistory ph_corr WHERE ph_corr.PostId = P.Id AND ph_corr.UserId IS NOT NULL AND ph_corr.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9)) AS UniqueEditorsCount,
+        CASE
+            WHEN P.PostTypeId = 1 AND P.ClosedDate IS NOT NULL THEN 'Closed Question'
+            WHEN P.PostTypeId = 1 AND P.AcceptedAnswerId IS NOT NULL THEN 'Answered Question'
+            WHEN P.PostTypeId = 1 THEN 'Open Question'
+            WHEN P.PostTypeId = 2 THEN 'Answer Post'
+            ELSE 'Other Post Type'
+        END AS PostStatusCategory,
+        NULLIF(COALESCE(SUM(CASE WHEN PV.VoteTypeId = 2 THEN 1 ELSE 0 END), 0), 0) / NULLIF(COALESCE(SUM(CASE WHEN PV.VoteTypeId = 3 THEN 1 ELSE 0 END), 0), 0) AS PostVoteRatio,
+        ROW_NUMBER() OVER (PARTITION BY P.PostTypeId ORDER BY P.Score DESC, P.CreationDate DESC) AS RankByScoreWithinType
+    FROM Posts AS P
+    LEFT JOIN Votes AS PV ON P.Id = PV.PostId
+    LEFT JOIN Comments AS P_Comm ON P.Id = P_Comm.PostId
+    LEFT JOIN PostHistory AS PH ON P.Id = PH.PostId
+    GROUP BY P.Id, P.PostTypeId, P.OwnerUserId, P.CreationDate, P.LastActivityDate, P.Score, P.ViewCount, P.AnswerCount, P.CommentCount, P.FavoriteCount, P.ClosedDate, P.Title, P.Tags, P.AcceptedAnswerId
+),
+TagAnalysis AS (
+    SELECT
+        PEM.PostId,
+        PEM.OwnerUserId,
+        PEM.PostTypeId,
+        unnest(string_to_array(SUBSTRING(PEM.Tags, 2, LENGTH(PEM.Tags)-2), '><')) AS TagName,
+        PEM.PostScore,
+        PEM.PostViewCount
+    FROM PostEngagementMetrics AS PEM
+    WHERE PEM.Tags IS NOT NULL AND LENGTH(PEM.Tags) > 2
+),
+TagPerformance AS (
+    SELECT
+        TA.TagName,
+        COUNT(TA.PostId) AS TotalPostsWithTag,
+        SUM(TA.PostScore) AS TotalTagScore,
+        AVG(TA.PostScore) AS AvgTagScore,
+        SUM(TA.PostViewCount) AS TotalTagViews,
+        DENSE_RANK() OVER (ORDER BY SUM(TA.PostScore) DESC, COUNT(TA.PostId) DESC) AS TagRankByScore
+    FROM TagAnalysis AS TA
+    GROUP BY TA.TagName
+    HAVING COUNT(TA.PostId) > 5
+),
+ClosedButReopenedPosts AS (
+    SELECT PH_Closed.PostId
+    FROM PostHistory AS PH_Closed
+    WHERE PH_Closed.PostHistoryTypeId = 10
+    INTERSECT
+    SELECT PH_Reopened.PostId
+    FROM PostHistory AS PH_Reopened
+    WHERE PH_Reopened.PostHistoryTypeId = 11
+),
+ControversialPostCandidates AS (
+    SELECT
+        PEM.PostId,
+        PEM.Title,
+        PEM.OwnerUserId,
+        PEM.PostCreationDate,
+        PEM.PostScore,
+        PEM.PostUpVotes,
+        PEM.PostDownVotes,
+        PEM.PostVoteRatio,
+        PEM.TotalPostEdits,
+        PEM.UniqueEditorsCount,
+        PEM.PostClosedEventDate,
+        LAG(PEM.PostScore, 1, 0) OVER (PARTITION BY PEM.OwnerUserId ORDER BY PEM.PostCreationDate) AS PreviousPostScore,
+        (SELECT CRT.Name FROM PostHistory ph_crt LEFT JOIN CloseReasonTypes CRT ON CAST(ph_crt.Comment AS INTEGER) = CRT.Id WHERE ph_crt.PostId = PEM.PostId AND ph_crt.PostHistoryTypeId = 10 ORDER BY ph_crt.CreationDate DESC LIMIT 1) AS LatestCloseReason
+    FROM PostEngagementMetrics AS PEM
+    LEFT JOIN ClosedButReopenedPosts AS CBRP ON PEM.PostId = CBRP.PostId
+    WHERE PEM.PostTypeId = 1
+      AND (PEM.PostDownVotes > 0 OR PEM.TotalPostEdits > 3)
+      AND PEM.PostScore < 10
+      AND CBRP.PostId IS NULL
+      AND (PEM.PostVoteRatio IS NULL OR PEM.PostVoteRatio < 0.5)
+),
+ComplexUserBadgeAnalysis AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        B.Name AS BadgeName,
+        B.Date AS BadgeAwardDate,
+        B.Class AS BadgeClass,
+        B.TagBased AS IsTagBasedBadge,
+        COUNT(B.Id) OVER (PARTITION BY U.Id) AS UserTotalBadges,
+        ROW_NUMBER() OVER (PARTITION BY U.Id ORDER BY B.Date ASC) AS BadgeSequence,
+        LAG(B.Date, 1) OVER (PARTITION BY U.Id ORDER BY B.Date ASC) AS PreviousBadgeDate,
+        (B.Date - LAG(B.Date, 1) OVER (PARTITION BY U.Id ORDER BY B.Date ASC)) AS TimeSinceLastBadge
+    FROM Users AS U
+    INNER JOIN Badges AS B ON U.Id = B.UserId
+    WHERE U.Reputation > 1000 AND B.Class IN (1, 2)
+)
+SELECT
+    UAS.UserId,
+    UAS.DisplayName AS UserDisplayName,
+    UAS.Reputation,
+    UAS.UserAgeInYears,
+    UAS.TotalQuestionsOwned,
+    UAS.TotalAnswersOwned,
+    UAS.TotalCommentsMade,
+    UAS.TotalPostScoreOwned,
+    UAS.TotalUpVotesReceivedOnPosts,
+    UAS.TotalDownVotesReceivedOnPosts,
+    UAS.OverallPostVoteRatio,
+    UAS.TotalBadges,
+    TP.TagName AS TopContributingTagName,
+    TP.AvgTagScore AS TopTagAvgScore,
+    TP.TotalPostsWithTag AS TopTagPostCount,
+    CPC.Title AS ControversialPostTitle,
+    CPC.PostScore AS ControversialPostScore,
+    CPC.PostVoteRatio AS ControversialPostVoteRatio,
+    CPC.LatestCloseReason,
+    CBA.BadgeName AS RecentGoldOrSilverBadge,
+    CBA.BadgeAwardDate AS RecentBadgeDate,
+    CBA.TimeSinceLastBadge,
+    (SELECT COUNT(DISTINCT post_link.RelatedPostId) FROM PostLinks post_link WHERE post_link.PostId = CPC.PostId AND post_link.LinkTypeId = 3) AS DuplicateLinkCount,
+    (SELECT AVG(C_sub.Score) FROM Comments C_sub WHERE C_sub.PostId = CPC.PostId AND C_sub.CreationDate > CPC.PostCreationDate AND C_sub.UserId IS NOT NULL AND C_sub.Text LIKE '%spam%') AS AvgCommentScoreOnSpammyControversialPost,
+    (SELECT MAX(ph_le.CreationDate) FROM PostHistory ph_le WHERE ph_le.PostId = CPC.PostId AND ph_le.PostHistoryTypeId IN (4,5,6) AND ph_le.UserId IS NOT NULL) AS LastEditDateOfControversialPost,
+    (SELECT SUM(V_sub.BountyAmount) FROM Votes V_sub WHERE V_sub.PostId = CPC.PostId AND V_sub.VoteTypeId IN (8,9) GROUP BY V_sub.PostId) AS TotalBountyOnControversialPost
+FROM UserActivitySummary AS UAS
+LEFT JOIN (
+    SELECT
+        TA.OwnerUserId AS UserId,
+        TP_Inner.TagName,
+        TP_Inner.AvgTagScore,
+        TP_Inner.TotalPostsWithTag,
+        ROW_NUMBER() OVER (PARTITION BY TA.OwnerUserId ORDER BY TP_Inner.AvgTagScore DESC, TP_Inner.TotalPostsWithTag DESC) AS rn
+    FROM TagAnalysis AS TA
+    JOIN TagPerformance AS TP_Inner ON TA.TagName = TP_Inner.TagName
+    WHERE TA.OwnerUserId IS NOT NULL
+) AS TP ON UAS.UserId = TP.UserId AND TP.rn = 1
+LEFT JOIN ControversialPostCandidates AS CPC ON UAS.UserId = CPC.OwnerUserId AND CPC.PostId = (
+    SELECT sub_cpc.PostId
+    FROM ControversialPostCandidates sub_cpc
+    WHERE sub_cpc.OwnerUserId = UAS.UserId
+    ORDER BY sub_cpc.PostClosedEventDate DESC NULLS LAST, sub_cpc.PostScore ASC
+    LIMIT 1
+)
+LEFT JOIN ComplexUserBadgeAnalysis AS CBA ON UAS.UserId = CBA.UserId AND CBA.BadgeSequence = UAS.TotalBadges
+WHERE UAS.TotalPostsOwned > 50
+  AND UAS.Reputation > 5000
+  AND UAS.UserAgeInYears > 2
+  AND UAS.DisplayName LIKE 'S%'
+  AND (UAS.TotalDownVotesReceivedOnPosts > UAS.TotalUpVotesReceivedOnPosts * 0.15 OR UAS.TotalEditsOnOwnPosts > 15)
+  AND UAS.UserId IN (SELECT DISTINCT P_sub.OwnerUserId FROM Posts P_sub WHERE P_sub.LastActivityDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'))
+ORDER BY UAS.Reputation DESC, UAS.TotalPostsOwned DESC, UAS.UserAgeInYears DESC
+LIMIT 1000;

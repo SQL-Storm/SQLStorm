@@ -1,0 +1,187 @@
+WITH UserEngagementMetrics AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.Views AS UserViews,
+        u.UpVotes AS UserUpVotesGiven,
+        u.DownVotes AS UserDownVotesGiven,
+        COUNT(DISTINCT p.Id) AS TotalPostsAuthored,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsAuthored,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersAuthored,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostScoreReceived,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS AvgQuestionScoreReceived,
+        MAX(p.CreationDate) AS LastPostCreationDate,
+        COUNT(DISTINCT b.Id) AS TotalBadgesEarned,
+        MAX(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS HasGoldBadge,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC, u.UpVotes DESC, COUNT(DISTINCT p.Id) DESC) AS ReputationActivityRank,
+        EXTRACT(YEAR FROM AGE(u.LastAccessDate, u.CreationDate)) AS YearsOnPlatform,
+        (SELECT COUNT(DISTINCT v.PostId) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId IN (2, 3)) AS DistinctPostsVotedOn
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes
+    HAVING COUNT(DISTINCT p.Id) > 5 AND u.Reputation > 500
+),
+PostRevisionDetails AS (
+    SELECT
+        ph.PostId,
+        ph.UserId AS RevisionEditorUserId,
+        ph.CreationDate AS RevisionDate,
+        ph.PostHistoryTypeId,
+        ph.Comment AS HistoryComment,
+        ph.Text AS RevisionText,
+        LAG(ph.RevisionGUID) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS PrevRevisionGUID,
+        LEAD(ph.RevisionGUID) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS NextRevisionGUID,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS RevisionSeqNum,
+        RANK() OVER (PARTITION BY ph.PostId, ph.PostHistoryTypeId ORDER BY ph.CreationDate DESC) AS LatestHistoryTypeRank
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 10, 11, 12, 13, 16)
+),
+QuestionMetaMetrics AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.OwnerUserId,
+        p.CreationDate AS QuestionCreationDate,
+        p.Score AS QuestionScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.Title AS QuestionTitle,
+        p.Tags AS QuestionTags,
+        p.ClosedDate,
+        p.CommunityOwnedDate,
+        p.LastActivityDate,
+        SUM(CASE WHEN prd.RevisionEditorUserId = p.OwnerUserId AND prd.PostHistoryTypeId IN (4,5,6) THEN 1 ELSE 0 END) AS OwnerSelfEditCount,
+        SUM(CASE WHEN prd.RevisionEditorUserId IS DISTINCT FROM p.OwnerUserId AND prd.PostHistoryTypeId IN (4,5,6) THEN 1 ELSE 0 END) AS OtherEditorEditCount,
+        MAX(CASE WHEN prd.PostHistoryTypeId = 10 THEN prd.RevisionDate END) AS LatestCloseDate,
+        MAX(CASE WHEN prd.PostHistoryTypeId = 11 THEN prd.RevisionDate END) AS LatestReopenDate,
+        STRING_AGG(DISTINCT crt.Name, ' | ') FILTER (WHERE prd.PostHistoryTypeId = 10 AND prd.HistoryComment IS NOT NULL AND prd.LatestHistoryTypeRank = 1) AS LatestCloseReasonNames,
+        (SELECT COUNT(DISTINCT pl_dup.RelatedPostId) FROM PostLinks pl_dup WHERE pl_dup.PostId = p.Id AND pl_dup.LinkTypeId = 3) AS NumDuplicateLinks,
+        COALESCE(p.AcceptedAnswerId, -1) AS AcceptedAnswerId,
+        AVG(c.Score) FILTER (WHERE c.PostId = p.Id AND c.Score IS NOT NULL) AS AvgQuestionCommentScore,
+        COUNT(DISTINCT t.TagName) AS NumUniqueTags,
+        (SELECT
+            COUNT(DISTINCT v_fav.UserId)
+            FROM Votes v_fav
+            WHERE v_fav.PostId = p.Id AND v_fav.VoteTypeId = 5
+        ) AS FavoriteUserCount,
+        (SELECT
+            SUM(LENGTH(ph_body.Text) - LENGTH(REPLACE(ph_body.Text, ' ', '')) + 1)
+            FROM PostHistory ph_body
+            WHERE ph_body.PostId = p.Id
+              AND ph_body.PostHistoryTypeId = 2
+            ORDER BY ph_body.CreationDate ASC
+            LIMIT 1
+        ) AS InitialBodyWordCount,
+        SUM(CASE WHEN v_q.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalQuestionUpVotesReceived,
+        SUM(CASE WHEN v_q.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalQuestionDownVotesReceived,
+        MAX(CASE WHEN ph_comm.PostHistoryTypeId = 16 THEN ph_comm.CreationDate END) AS LastCommunityOwnedDate
+    FROM Posts p
+    LEFT JOIN PostRevisionDetails prd ON p.Id = prd.PostId
+    LEFT JOIN PostRevisionDetails ph_comm ON p.Id = ph_comm.PostId AND ph_comm.PostHistoryTypeId = 16
+    LEFT JOIN Comments c ON p.Id = c.PostId
+    LEFT JOIN Tags t ON p.Tags LIKE '%' || t.TagName || '%'
+    LEFT JOIN CloseReasonTypes crt ON prd.PostHistoryTypeId = 10 AND prd.HistoryComment = CAST(crt.Id AS VARCHAR)
+    LEFT JOIN Votes v_q ON p.Id = v_q.PostId AND v_q.VoteTypeId IN (2,3)
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.FavoriteCount, p.Title, p.Tags, p.ClosedDate, p.CommunityOwnedDate, p.LastActivityDate, p.AcceptedAnswerId
+),
+AnswerSummaryPerQuestion AS (
+    SELECT
+        p.ParentId AS QuestionId,
+        COUNT(p.Id) AS TotalAnswersForQuestion,
+        AVG(p.Score) AS AvgAnswerScore,
+        MAX(p.Score) AS TopAnswerScore,
+        MIN(p.CreationDate) AS FirstAnswerDate,
+        MAX(p.CreationDate) AS LastAnswerDate,
+        SUM(CASE WHEN p.OwnerUserId IS NOT NULL THEN 1 ELSE 0 END) AS HasOwnerAnswer
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+    GROUP BY p.ParentId
+),
+ClosedReopenedAndCommunityOwnedUsers AS (
+    SELECT DISTINCT qmm.OwnerUserId
+    FROM QuestionMetaMetrics qmm
+    WHERE qmm.LatestCloseDate IS NOT NULL
+      AND qmm.LatestReopenDate IS NOT NULL
+      AND qmm.LatestReopenDate > qmm.LatestCloseDate
+    INTERSECT
+    SELECT DISTINCT qmm.OwnerUserId
+    FROM QuestionMetaMetrics qmm
+    WHERE qmm.LastCommunityOwnedDate IS NOT NULL
+)
+SELECT
+    uem.UserId,
+    uem.DisplayName,
+    uem.Reputation,
+    uem.YearsOnPlatform,
+    uem.TotalPostsAuthored,
+    uem.TotalQuestionsAuthored,
+    uem.TotalAnswersAuthored,
+    uem.TotalCommentsMade,
+    uem.TotalPostScoreReceived,
+    uem.AvgQuestionScoreReceived,
+    uem.TotalBadgesEarned,
+    uem.HasGoldBadge,
+    uem.ReputationActivityRank,
+    qmm.QuestionId,
+    qmm.QuestionTitle,
+    qmm.QuestionCreationDate,
+    qmm.QuestionScore,
+    qmm.ViewCount,
+    qmm.AnswerCount,
+    qmm.FavoriteCount,
+    qmm.OwnerSelfEditCount,
+    qmm.OtherEditorEditCount,
+    qmm.LatestCloseDate,
+    qmm.LatestReopenDate,
+    qmm.LatestCloseReasonNames,
+    qmm.NumDuplicateLinks,
+    qmm.AcceptedAnswerId,
+    COALESCE(ans.AvgAnswerScore, 0.0) AS QuestionAvgAnswerScore,
+    COALESCE(ans.TopAnswerScore, 0) AS QuestionTopAnswerScore,
+    COALESCE(ans.TotalAnswersForQuestion, 0) AS TotalAnswersForThisQuestion,
+    (qmm.TotalQuestionUpVotesReceived - qmm.TotalQuestionDownVotesReceived) AS QuestionNetVotes,
+    (CASE WHEN qmm.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END) AS QuestionStatus,
+    CASE
+        WHEN qmm.FavoriteCount > 100 AND qmm.ViewCount > 50000 THEN 'Highly Engaged Popular'
+        WHEN qmm.FavoriteCount > 50 AND qmm.ViewCount > 10000 THEN 'Moderately Engaged'
+        WHEN qmm.FavoriteCount > 0 OR qmm.ViewCount > 1000 THEN 'Slightly Engaged'
+        ELSE 'Low Engagement'
+    END AS EngagementCategory,
+    SUBSTRING(qmm.QuestionTags FROM 2 FOR LENGTH(qmm.QuestionTags) - 2) AS CleanedQuestionTags,
+    REPLACE(TRIM(qmm.QuestionTitle), ' ', '_') AS TitleWithUnderscores,
+    qmm.FavoriteUserCount,
+    qmm.InitialBodyWordCount,
+    DATE_PART('day', AGE(qmm.LastActivityDate, qmm.QuestionCreationDate)) AS DaysSinceCreationToLastActivity,
+    (SELECT us.DisplayName FROM Users us WHERE us.Id = qmm.AcceptedAnswerId) AS AcceptedAnswerOwnerDisplayName,
+    CASE
+        WHEN uem.UserId IN (SELECT cru.OwnerUserId FROM ClosedReopenedAndCommunityOwnedUsers cru) THEN 'TRUE'
+        ELSE 'FALSE'
+    END AS IsSpecialInteractionUser,
+    COALESCE(uem.UserUpVotesGiven, 0) - COALESCE(uem.UserDownVotesGiven, 0) AS UserNetVotesGiven,
+    (SELECT p_link.CreationDate FROM PostLinks p_link WHERE p_link.PostId = qmm.QuestionId ORDER BY p_link.CreationDate DESC LIMIT 1) AS LatestLinkedPostDate
+FROM UserEngagementMetrics uem
+INNER JOIN QuestionMetaMetrics qmm ON uem.UserId = qmm.OwnerUserId
+LEFT JOIN AnswerSummaryPerQuestion ans ON qmm.QuestionId = ans.QuestionId
+WHERE
+    uem.ReputationActivityRank <= 5000
+    AND qmm.QuestionScore >= 5
+    AND (qmm.QuestionTags LIKE '%<java>%' OR qmm.QuestionTags LIKE '%<c#>%')
+    AND (LENGTH(TRIM(qmm.QuestionTitle)) BETWEEN 20 AND 150)
+    AND qmm.LastActivityDate >= DATE '2021-01-01'
+    AND qmm.NumDuplicateLinks <= 5
+    AND (qmm.InitialBodyWordCount IS NULL OR qmm.InitialBodyWordCount >= 10)
+    AND qmm.OwnerSelfEditCount >= 1
+ORDER BY
+    uem.Reputation DESC,
+    qmm.QuestionScore DESC,
+    qmm.ViewCount DESC,
+    qmm.OwnerSelfEditCount DESC,
+    uem.TotalBadgesEarned DESC
+LIMIT 50000;

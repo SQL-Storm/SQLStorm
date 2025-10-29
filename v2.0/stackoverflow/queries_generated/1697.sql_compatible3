@@ -1,0 +1,180 @@
+WITH UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswers,
+        SUM(p.Score) AS TotalPostScoreGiven,
+        AVG(p.Score) AS AvgPostScore,
+        COUNT(c.Id) AS TotalCommentsMade,
+        MAX(b.CreationDate) AS LatestBadgeDate,
+        (SELECT COUNT(DISTINCT b2.Id) FROM Badges b2 WHERE b2.UserId = u.Id AND b2.Class = 1) AS GoldBadgesCount,
+        RANK() OVER (PARTITION BY DATE_TRUNC('month', u.CreationDate) ORDER BY u.Reputation DESC) AS MonthlyReputationRank,
+        EXTRACT(EPOCH FROM (MAX(p.CreationDate) - MIN(p.CreationDate))) / 3600 AS UserActivitySpanHours
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+PostContentAnalysis AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.Body,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount AS DirectCommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.CommunityOwnedDate,
+        p.LastEditDate,
+        p.LastActivityDate,
+        CASE
+            WHEN p.Tags IS NOT NULL AND CHAR_LENGTH(p.Tags) > 2
+            THEN string_to_array(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2), '><')
+            ELSE ARRAY[]::text
+        END AS TagArray,
+        COALESCE(p.Title, 'Untitled Post (ID: ' || CAST(p.Id AS VARCHAR) || ')') AS DisplayTitle,
+        CAST(p.Score AS NUMERIC) / NULLIF(p.ViewCount, 0) AS ScoreToViewRatio,
+        CAST(p.CommentCount AS NUMERIC) / NULLIF(CHAR_LENGTH(COALESCE(p.Body, '')), 0) AS CommentDensityInBody,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS RollingAvgOwnerScore,
+        EXTRACT(EPOCH FROM (p.CreationDate - LAG(p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate))) / 3600 AS HoursSincePreviousPost,
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.CreationDate DESC) AS PostScoreRankInType,
+        p.LastActivityDate
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+      AND p.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '5 year')
+),
+PostHistoryEvents AS (
+    SELECT
+        ph.PostId,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) AS LastClosedDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.CreationDate END) AS LastReopenedDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.CreationDate END) AS LastContentEditDate,
+        STRING_AGG(CASE WHEN ph.Comment IS NOT NULL AND ph.UserId IS NOT NULL AND ph.PostHistoryTypeId IN (10,11,14,15) THEN ph.Comment ELSE NULL END, ' | ') AS ModeratorActionComments,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 35 THEN 1 ELSE 0 END) = 1 AS WasMigratedAway,
+        FIRST_VALUE(ph.PostHistoryTypeId) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS LatestHistoryEventType
+    FROM PostHistory ph
+    WHERE ph.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '5 year')
+    GROUP BY ph.PostId
+),
+TopCommentsPerPost AS (
+    SELECT
+        c.PostId,
+        c.Id AS TopCommentId,
+        c.Text AS TopCommentText,
+        c.Score AS TopCommentScore,
+        c.CreationDate AS TopCommentDate,
+        ROW_NUMBER() OVER (PARTITION BY c.PostId ORDER BY c.Score DESC, c.CreationDate DESC) AS rn
+    FROM Comments c
+    WHERE c.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '5 year')
+)
+SELECT
+    pca.PostId,
+    pca.DisplayTitle,
+    pca.PostTypeId,
+    pca.PostCreationDate,
+    pca.PostScore,
+    pca.ViewCount,
+    pca.AnswerCount,
+    pca.DirectCommentCount,
+    pca.FavoriteCount,
+    uas.DisplayName AS OwnerDisplayName,
+    uas.Reputation AS OwnerReputation,
+    uas.GoldBadgesCount AS OwnerGoldBadges,
+    pca.ScoreToViewRatio,
+    pca.CommentDensityInBody,
+    pca.RollingAvgOwnerScore,
+    pca.HoursSincePreviousPost,
+    pca.ClosedDate,
+    pca.CommunityOwnedDate,
+    phe.LastClosedDate,
+    phe.LastReopenedDate,
+    phe.LastContentEditDate,
+    phe.ModeratorActionComments,
+    phe.WasMigratedAway,
+    COALESCE(
+        CASE
+            WHEN pca.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN pca.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+            WHEN phe.LastReopenedDate IS NOT NULL AND (phe.LastClosedDate IS NULL OR phe.LastReopenedDate > phe.LastClosedDate) THEN 'Reopened'
+            ELSE 'Open'
+        END, 'Unknown Status'
+    ) AS PostStatus,
+    CASE
+        WHEN pca.PostTypeId = 1 THEN
+            CASE
+                WHEN pca.PostScore >= 100 AND pca.AnswerCount >= 5 AND pca.ViewCount >= 10000 THEN 'Very Hot Question'
+                WHEN pca.PostScore >= 50 AND pca.AnswerCount >= 2 AND pca.ViewCount >= 5000 THEN 'Hot Question'
+                WHEN pca.ScoreToViewRatio > 0.1 AND pca.DirectCommentCount >= 10 THEN 'Engaging Question'
+                ELSE 'Regular Question'
+            END
+        WHEN pca.PostTypeId = 2 THEN
+            CASE
+                WHEN pca.PostScore >= 50 AND pca.ScoreToViewRatio > 0.2 AND pca.AcceptedAnswerId IS NOT NULL THEN 'Highly Valued Accepted Answer'
+                WHEN pca.PostScore >= 10 AND pca.DirectCommentCount >= 3 THEN 'Discussed Answer'
+                ELSE 'Regular Answer'
+            END
+        ELSE 'Other Post Type'
+    END AS PostEngagementCategory,
+    aa.PostScore AS AcceptedAnswerScore,
+    aa_owner.DisplayName AS AcceptedAnswerOwner,
+    aa.PostCreationDate AS AcceptedAnswerCreationDate,
+    tcp.TopCommentText,
+    tcp.TopCommentScore,
+    array_to_string(pca.TagArray, ', ') AS TagsList,
+    (EXISTS (
+        SELECT 1 FROM unnest(pca.TagArray) AS t(tag)
+        WHERE t.tag = 'sql' OR t.tag = 'database' OR t.tag = 'performance' OR t.tag = 'indexing' OR t.tag = 'query-optimization'
+    )) AS ContainsRelevantTechTag,
+    (EXISTS (
+        SELECT 1 FROM unnest(pca.TagArray) AS t(tag)
+        WHERE t.tag = 'opinion-based' OR t.tag = 'subjective' OR t.tag = 'discussion' OR t.tag = 'community-wiki'
+    )) AS IsSubjectiveTagPresent,
+    EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS timestamp) - pca.PostCreationDate)) AS PostAgeDays,
+    EXTRACT(EPOCH FROM (pca.LastActivityDate - pca.PostCreationDate)) / 3600 AS TimeToLastActivityHours,
+    (
+        (pca.PostScore * 2.5) +
+        (COALESCE(pca.ViewCount, 0) * 0.001) +
+        (COALESCE(pca.AnswerCount, 0) * 5.0) +
+        (COALESCE(pca.DirectCommentCount, 0) * 1.5) +
+        (COALESCE(pca.FavoriteCount, 0) * 3.0) +
+        (CASE WHEN pca.AcceptedAnswerId IS NOT NULL THEN 10 ELSE 0 END) +
+        (CASE WHEN phe.WasMigratedAway THEN -5 ELSE 0 END) +
+        (COALESCE(uas.Reputation, 0) * 0.0001) +
+        (CASE WHEN pca.LastEditDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 day') THEN 2.0 ELSE 0 END)
+    ) AS OverallImpactScore
+FROM PostContentAnalysis pca
+LEFT JOIN UserActivitySummary uas ON pca.OwnerUserId = uas.UserId
+LEFT JOIN PostHistoryEvents phe ON pca.PostId = phe.PostId
+LEFT JOIN PostContentAnalysis aa ON pca.AcceptedAnswerId = aa.PostId AND pca.PostTypeId = 1
+LEFT JOIN UserActivitySummary aa_owner ON aa.OwnerUserId = aa_owner.UserId
+LEFT JOIN TopCommentsPerPost tcp ON pca.PostId = tcp.PostId AND tcp.rn = 1
+WHERE
+    pca.PostCreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 year')
+    AND COALESCE(uas.TotalPosts, 0) > 5
+    AND (pca.PostTypeId = 1 OR (pca.PostTypeId = 2 AND pca.PostScore > 0))
+    AND pca.PostScore >= 5
+    AND NOT (pca.ClosedDate IS NOT NULL AND pca.PostScore < 10 AND COALESCE(pca.DirectCommentCount, 0) < 3)
+    AND (
+        EXISTS (SELECT 1 FROM unnest(pca.TagArray) AS t(tag) WHERE t.tag IN ('sql','postgresql','mysql','database','performance'))
+        OR pca.Title ILIKE '%database%'
+        OR pca.Body ILIKE '%sql%'
+    )
+    AND (EXTRACT(MONTH FROM pca.PostCreationDate) IN (6, 7, 8) OR MOD(CAST(EXTRACT(YEAR FROM pca.PostCreationDate) AS INTEGER), 2) = 0)
+ORDER BY
+    OverallImpactScore DESC,
+    pca.PostCreationDate DESC
+LIMIT 1000;

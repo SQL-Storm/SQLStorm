@@ -1,0 +1,167 @@
+WITH
+  RankedAnswers AS (
+    SELECT
+      p.Id AS PostId,
+      p.ParentId AS QuestionId,
+      p.OwnerUserId,
+      p.Score,
+      p.CreationDate AS AnswerCreationDate,
+      ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS RankNum,
+      CASE WHEN p.Id = (SELECT AcceptedAnswerId FROM Posts WHERE Id = p.ParentId) THEN 1 ELSE 0 END AS IsAcceptedAnswer
+    FROM Posts AS p
+    WHERE
+      p.PostTypeId = 2 AND p.ParentId IS NOT NULL
+  ),
+  QuestionEngagement AS (
+    SELECT
+      p.Id AS QuestionId,
+      p.OwnerUserId AS QuestionOwnerUserId,
+      p.Title AS QuestionTitle,
+      p.CreationDate AS QuestionCreationDate,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      p.ViewCount AS QuestionViewCount,
+      COUNT(DISTINCT c.Id) AS DistinctCommentCount,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotes,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotes,
+      COUNT(DISTINCT ph.Id) AS PostHistoryEvents
+    FROM Posts AS p
+    LEFT JOIN Comments AS c
+      ON p.Id = c.PostId
+    LEFT JOIN Votes AS v
+      ON p.Id = v.PostId
+    LEFT JOIN PostHistory AS ph
+      ON p.Id = ph.PostId
+    WHERE
+      p.PostTypeId = 1
+    GROUP BY
+      p.Id,
+      p.OwnerUserId,
+      p.Title,
+      p.CreationDate,
+      p.AnswerCount,
+      p.CommentCount,
+      p.FavoriteCount,
+      p.ViewCount
+  ),
+  TopAnswers AS (
+    SELECT
+      ra.QuestionId,
+      ra.PostId AS AnswerId,
+      ra.OwnerUserId AS AnswerOwnerUserId,
+      ra.Score AS AnswerScore,
+      ra.AnswerCreationDate,
+      ra.RankNum,
+      ra.IsAcceptedAnswer,
+      u.Reputation AS AnswererReputation,
+      u.CreationDate AS AnswererCreationDate
+    FROM RankedAnswers AS ra
+    JOIN Users AS u
+      ON ra.OwnerUserId = u.Id
+    WHERE
+      ra.RankNum <= 5
+  )
+SELECT
+  qe.QuestionId,
+  qe.QuestionTitle,
+  qe.QuestionOwnerUserId,
+  u_q.DisplayName AS QuestionOwnerDisplayName,
+  qe.QuestionCreationDate,
+  qe.QuestionViewCount,
+  qe.AnswerCount AS TotalAnswerCount,
+  qe.DistinctCommentCount,
+  qe.TotalUpVotes AS QuestionUpVotes,
+  qe.TotalDownVotes AS QuestionDownVotes,
+  qe.FavoriteCount AS QuestionFavorites,
+  qe.PostHistoryEvents,
+  ta.AnswerId,
+  ta.AnswerOwnerUserId,
+  u_a.DisplayName AS AnswerOwnerDisplayName,
+  ta.AnswerScore,
+  ta.AnswerCreationDate,
+  ta.RankNum AS AnswerRank,
+  ta.IsAcceptedAnswer,
+  ta.AnswererReputation,
+  ta.AnswererCreationDate,
+  COALESCE(pht.Name, 'N/A') AS LastPostHistoryType,
+  CASE
+    WHEN qe.QuestionCreationDate < (CAST('2024-10-01' AS date) - INTERVAL '365' DAY) THEN 'Old'
+    WHEN qe.QuestionCreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '365' DAY) AND qe.QuestionCreationDate < (CAST('2024-10-01' AS date) - INTERVAL '30' DAY) THEN 'Recent'
+    ELSE 'New'
+  END AS QuestionAgeCategory,
+  CHAR_LENGTH(qe.QuestionTitle) AS TitleLength,
+  CASE
+    WHEN ta.AnswerScore > 100 THEN 'HighScore'
+    WHEN ta.AnswerScore > 10 THEN 'MediumScore'
+    ELSE 'LowScore'
+  END AS AnswerScoreCategory,
+  CASE
+    WHEN u_a.Reputation IS NULL THEN 'UnknownRep'
+    WHEN u_a.Reputation > 50000 THEN 'Expert'
+    WHEN u_a.Reputation > 10000 THEN 'Experienced'
+    ELSE 'Novice'
+  END AS AnswererReputationCategory,
+  CASE
+    WHEN qe.QuestionOwnerUserId = ta.AnswerOwnerUserId THEN 'SelfAnswer'
+    ELSE 'OtherAnswer'
+  END AS AnswerRelationship,
+  CONCAT(COALESCE(u_q.DisplayName, ''), ' - ', COALESCE(u_a.DisplayName, '')) AS OwnerPair,
+  CASE
+    WHEN ta.AnswerCreationDate < qe.QuestionCreationDate THEN TRUE
+    ELSE FALSE
+  END AS AnswerBeforeQuestion,
+  (qe.QuestionViewCount * 1.0 / NULLIF(qe.AnswerCount, 0)) AS ViewsPerAnswer,
+  ROW_NUMBER() OVER (PARTITION BY qe.QuestionId ORDER BY ta.AnswerScore DESC) AS AnswerScoreRankForQuestion,
+  LAG(ta.AnswerScore, 1, 0) OVER (PARTITION BY qe.QuestionId ORDER BY ta.AnswerCreationDate) AS PreviousAnswerScore,
+  SUM(ta.AnswerScore) OVER (PARTITION BY qe.QuestionId) AS TotalAnswerScoreForQuestion,
+  AVG(ta.AnswerScore) OVER (PARTITION BY qe.QuestionId) AS AverageAnswerScoreForQuestion,
+  (
+    SELECT
+      COUNT(*)
+    FROM PostLinks AS pl
+    WHERE
+      pl.PostId = qe.QuestionId AND pl.LinkTypeId = 3
+  ) AS DuplicateLinks
+FROM QuestionEngagement AS qe
+LEFT JOIN Users AS u_q
+  ON qe.QuestionOwnerUserId = u_q.Id
+LEFT JOIN TopAnswers AS ta
+  ON qe.QuestionId = ta.QuestionId
+LEFT JOIN Users AS u_a
+  ON ta.AnswerOwnerUserId = u_a.Id
+LEFT JOIN PostHistory AS ph_last
+  ON qe.QuestionId = ph_last.PostId
+LEFT JOIN PostHistoryTypes AS pht
+  ON ph_last.PostHistoryTypeId = pht.Id
+WHERE
+  ta.RankNum IS NOT NULL AND ta.AnswerOwnerUserId IS NOT NULL
+GROUP BY
+  qe.QuestionId,
+  qe.QuestionTitle,
+  qe.QuestionOwnerUserId,
+  u_q.DisplayName,
+  qe.QuestionCreationDate,
+  qe.QuestionViewCount,
+  qe.AnswerCount,
+  qe.DistinctCommentCount,
+  qe.TotalUpVotes,
+  qe.TotalDownVotes,
+  qe.FavoriteCount,
+  qe.PostHistoryEvents,
+  ta.AnswerId,
+  ta.AnswerOwnerUserId,
+  u_a.DisplayName,
+  ta.AnswerScore,
+  ta.AnswerCreationDate,
+  ta.RankNum,
+  ta.IsAcceptedAnswer,
+  ta.AnswererReputation,
+  ta.AnswererCreationDate,
+  pht.Name
+HAVING
+  SUM(ta.AnswerScore) > 0
+ORDER BY
+  qe.QuestionCreationDate DESC,
+  qe.QuestionViewCount DESC
+LIMIT 100;

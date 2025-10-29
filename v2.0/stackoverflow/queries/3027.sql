@@ -1,0 +1,128 @@
+WITH
+    u_stats AS (
+        SELECT
+            u.Id AS user_id,
+            u.DisplayName,
+            u.Reputation,
+            COALESCE(SUM(vu.VoteCount), 0) AS total_answer_upvotes,
+            COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS gold_badge_cnt,
+            MAX(p.CreationDate) AS last_activity,
+            MIN(p.CreationDate) AS first_post_date
+        FROM Users u
+        LEFT JOIN Posts p
+            ON p.OwnerUserId = u.Id
+        LEFT JOIN (
+            SELECT pv.PostId, COUNT(*) AS VoteCount
+            FROM Votes pv
+            WHERE pv.VoteTypeId = 2
+            GROUP BY pv.PostId
+        ) vu
+            ON vu.PostId = p.Id
+            AND p.PostTypeId = 2
+        LEFT JOIN Badges b
+            ON b.UserId = u.Id
+        GROUP BY u.Id, u.DisplayName, u.Reputation
+    ),
+    user_latest_question AS (
+        SELECT
+            p.OwnerUserId AS user_id,
+            p.Id AS question_id,
+            p.Title,
+            p.CreationDate,
+            ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn,
+            COALESCE(NULLIF(array_length(string_to_array(p.Tags, '><'), 1), NULL), 0) AS tag_count,
+            CASE
+                WHEN POSITION('<' IN p.Tags) > 0
+                THEN REGEXP_REPLACE(SUBSTRING(p.Tags FROM '<([^>]+)>'), '^<|>$', '')
+                ELSE NULL
+            END AS first_tag,
+            p.Tags
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+          AND p.OwnerUserId IS NOT NULL
+    ),
+    user_expert_tags AS (
+        SELECT DISTINCT
+            ub.UserId AS user_id,
+            t.TagName
+        FROM Badges ub
+        JOIN Users u ON u.Id = ub.UserId
+        JOIN Tags t ON t.Id = (
+            SELECT pt.Id
+            FROM Tags pt
+            WHERE pt.TagName = ANY (
+                SELECT unnest(string_to_array(p.Tags, '><'))
+                FROM Posts p
+                WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1
+            )
+            LIMIT 1
+        )
+        WHERE ub.Class = 1
+    ),
+    main_query AS (
+        SELECT
+            us.user_id,
+            us.DisplayName,
+            us.Reputation,
+            us.total_answer_upvotes,
+            us.gold_badge_cnt,
+            us.last_activity,
+            q.question_id,
+            q.Title,
+            q.CreationDate AS question_date,
+            q.tag_count,
+            COALESCE(et.TagName, '<none>') AS expert_tag,
+            CASE
+                WHEN us.first_post_date IS NULL THEN 'NeverPosted'
+                WHEN us.first_post_date < CAST('2010-01-01' AS TIMESTAMP) THEN 'Veteran'
+                ELSE 'Newcomer'
+            END AS user_cohort,
+            CASE
+                WHEN q.Title IS NULL THEN 0
+                WHEN POSITION('java' IN LOWER(q.Title)) > 0 THEN 1
+                ELSE 0
+            END AS contains_java
+        FROM u_stats us
+        LEFT JOIN user_latest_question q
+            ON q.user_id = us.user_id AND q.rn = 1
+        LEFT JOIN user_expert_tags et
+            ON et.user_id = us.user_id
+        WHERE us.Reputation > 1000
+           OR us.gold_badge_cnt > 0
+    ),
+    secondary_query AS (
+        SELECT
+            u.Id AS user_id,
+            u.DisplayName,
+            u.Reputation,
+            0 AS total_answer_upvotes,
+            0 AS gold_badge_cnt,
+            CAST(NULL AS TIMESTAMP) AS last_activity,
+            CAST(NULL AS BIGINT) AS question_id,
+            CAST(NULL AS VARCHAR) AS Title,
+            CAST(NULL AS TIMESTAMP) AS question_date,
+            CAST(NULL AS INTEGER) AS tag_count,
+            '<none>' AS expert_tag,
+            CASE
+                WHEN u.CreationDate < CAST('2009-01-01' AS TIMESTAMP) THEN 'Veteran'
+                ELSE 'Newcomer'
+            END AS user_cohort,
+            0 AS contains_java
+        FROM Users u
+        WHERE NOT EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id)
+          AND u.Reputation > 500
+    )
+
+SELECT *
+FROM (
+    SELECT * FROM main_query
+    ORDER BY total_answer_upvotes DESC
+    LIMIT 20
+) t1
+UNION ALL
+SELECT *
+FROM (
+    SELECT * FROM secondary_query
+    ORDER BY Reputation DESC
+    LIMIT 5
+) t2;

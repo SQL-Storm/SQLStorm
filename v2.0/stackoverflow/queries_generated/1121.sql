@@ -1,0 +1,175 @@
+-- {"query": "1121.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2659} 
+
+WITH RecentUserActivity AS (
+    -- Summarizes user activity (posts, comments, edits) within the last year,
+    -- capturing counts and the very last content activity timestamp.
+    SELECT
+        u.Id AS UserId,
+        COUNT(DISTINCT p.Id) AS PostsCount,
+        COUNT(DISTINCT c.Id) AS CommentsCount,
+        COUNT(DISTINCT ph.Id) AS EditsCount,
+        MAX(GREATEST(
+            COALESCE(p.LastActivityDate, '1900-01-01'::timestamp),
+            COALESCE(c.CreationDate, '1900-01-01'::timestamp),
+            COALESCE(ph.CreationDate, '1900-01-01'::timestamp)
+        )) AS LastActivityDate_UserContent
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.CreationDate >= NOW() - INTERVAL '1 year'
+    LEFT JOIN Comments c ON u.Id = c.UserId AND c.CreationDate >= NOW() - INTERVAL '1 year'
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId AND ph.CreationDate >= NOW() - INTERVAL '1 year'
+    GROUP BY u.Id
+    HAVING COUNT(DISTINCT p.Id) + COUNT(DISTINCT c.Id) + COUNT(DISTINCT ph.Id) > 0
+),
+ClosedDuplicateQuestions AS (
+    -- Identifies questions that were closed as duplicates, along with their owner and closure date.
+    -- Uses PostHistoryTypeId 10 (Post Closed) and specific 'Duplicate' close reason comments (1 or 101).
+    -- Also checks for 'OriginalQuestionIds' in the Text field as a heuristic for duplicate closure details.
+    SELECT DISTINCT
+        p.OwnerUserId AS QuestionOwnerId,
+        ph.PostId AS ClosedQuestionId,
+        ph.CreationDate AS ClosureDate
+    FROM Posts p
+    JOIN PostHistory ph ON p.Id = ph.PostId
+    WHERE ph.PostHistoryTypeId = 10 -- Post Closed
+      AND (ph.Comment = '101' OR ph.Comment = '1') -- Modern 'Duplicate' or old 'Exact Duplicate'
+      AND p.PostTypeId = 1 -- Only questions
+      AND ph.Text IS NOT NULL -- Ensure Text field is populated for closed posts
+      AND ph.Text LIKE '%OriginalQuestionIds%' -- Heuristic for duplicate JSON content in Text
+),
+UserAnswerStats AS (
+    -- Calculates total answers, average score of answers, and count of accepted answers for each user.
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(p.Id) AS TotalAnswers,
+        AVG(p.Score) AS AverageAnswerScore,
+        SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS AcceptedAnswersCount
+    FROM Posts p
+    WHERE p.PostTypeId = 2 -- Answers
+      AND p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+UserBadgeSummary AS (
+    -- Aggregates the count of Gold, Silver, and Bronze badges for each user.
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserQuestionTagAnalysis AS (
+    -- Analyzes distinct tags used by users in their questions and provides a string aggregation of these tags.
+    -- Uses PostgreSQL's string_to_array and UNNEST for tag parsing.
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(DISTINCT tag_value) AS DistinctTagsUsedInQuestions,
+        STRING_AGG(DISTINCT tag_value, ', ' ORDER BY tag_value) AS TopTagsString
+    FROM Posts p, UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags)-2), '><')) AS tag_value
+    WHERE p.PostTypeId = 1 -- Questions
+      AND p.OwnerUserId IS NOT NULL
+      AND p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2 -- Ensure tags exist and are not empty
+    GROUP BY p.OwnerUserId
+),
+GlobalPostStats AS (
+    -- Calculates global average scores, view counts, and average age of posts for benchmarking.
+    SELECT
+        AVG(p.Score) AS AvgGlobalPostScore,
+        AVG(p.ViewCount) AS AvgGlobalPostViewCount,
+        AVG(EXTRACT(EPOCH FROM (NOW() - p.CreationDate)) / (60*60*24)) AS AvgPostAgeDays
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) -- Questions and Answers
+)
+SELECT
+    u.Id AS UserId,
+    COALESCE(u.DisplayName, 'Anonymous User') AS UserName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    COALESCE(SUBSTRING(u.Location FROM 1 FOR 50), 'Unknown Location') AS UserLocation,
+    COALESCE(u.WebsiteUrl, 'N/A') AS UserWebsite,
+    -- Truncated snippet of AboutMe, or empty string if NULL
+    SUBSTRING(COALESCE(u.AboutMe, ''), 1, 100) AS UserAboutMeSnippet,
+    ua.PostsCount AS RecentPostsCount,
+    ua.CommentsCount AS RecentCommentsCount,
+    ua.EditsCount AS RecentEditsCount,
+    -- Calculation of days since last access, with NULL handling.
+    EXTRACT(DAY FROM (NOW() - u.LastAccessDate)) AS DaysSinceLastAccess,
+    COALESCE(uas.TotalAnswers, 0) AS UserTotalAnswers,
+    COALESCE(uas.AverageAnswerScore, 0.0) AS UserAverageAnswerScore,
+    COALESCE(uas.AcceptedAnswersCount, 0) AS UserAcceptedAnswersCount,
+    COALESCE(ubs.GoldBadges, 0) AS UserGoldBadges,
+    COALESCE(ubs.SilverBadges, 0) AS UserSilverBadges,
+    COALESCE(ubs.BronzeBadges, 0) AS UserBronzeBadges,
+    COALESCE(uqta.DistinctTagsUsedInQuestions, 0) AS UserDistinctQuestionTags,
+    uqta.TopTagsString AS UserTopQuestionTagsSummary,
+    COUNT(DISTINCT cdq.ClosedQuestionId) AS QuestionsClosedAsDuplicateCount,
+    -- Correlated subquery: Count of user's questions performing above global average views
+    -- AND above the user's own average question score.
+    (
+        SELECT COUNT(p_sub.Id)
+        FROM Posts p_sub
+        WHERE p_sub.OwnerUserId = u.Id
+          AND p_sub.PostTypeId = 1 -- Questions
+          AND p_sub.ViewCount > gps.AvgGlobalPostViewCount
+          AND p_sub.Score > (
+                SELECT COALESCE(AVG(p_score_sub.Score), 0)
+                FROM Posts p_score_sub
+                WHERE p_score_sub.OwnerUserId = u.Id AND p_score_sub.PostTypeId = 1
+            )
+    ) AS HighPerformingQuestionsCount,
+    -- Another correlated subquery: Average answer score for answers posted in the last 6 months.
+    (
+        SELECT COALESCE(AVG(p_sub.Score), 0.0)
+        FROM Posts p_sub
+        WHERE p_sub.OwnerUserId = u.Id
+          AND p_sub.PostTypeId = 2 -- Answers
+          AND p_sub.CreationDate BETWEEN (NOW() - INTERVAL '6 months') AND NOW()
+    ) AS AverageAnswerScoreLast6Months,
+    gps.AvgGlobalPostScore,
+    gps.AvgGlobalPostViewCount,
+    gps.AvgPostAgeDays,
+    -- Complex CASE expression for user's geographical region categorization.
+    CASE
+        WHEN u.Location IS NULL OR TRIM(u.Location) = '' THEN 'No Location'
+        WHEN LOWER(u.Location) LIKE '%london%' OR LOWER(u.Location) LIKE '%uk%' OR LOWER(u.Location) LIKE '%england%' THEN 'UK Based'
+        WHEN LOWER(u.Location) LIKE '%usa%' OR LOWER(u.Location) LIKE '%united states%' OR LOWER(u.Location) LIKE '%america%' THEN 'US Based'
+        ELSE 'Other International'
+    END AS UserRegionCategory,
+    -- Length of AboutMe text, handling NULLs and empty strings.
+    COALESCE(NULLIF(LENGTH(TRIM(u.AboutMe)), 0), 0) AS AboutMeTextLength,
+    -- Net votes calculation.
+    (u.UpVotes - u.DownVotes) AS NetVotes,
+    -- View to contribution ratio, with division by zero protection using GREATEST and COALESCE.
+    (u.Views * 1.0 / GREATEST(1.0, COALESCE(uas.TotalAnswers, 0.0) + COALESCE(ua.PostsCount, 0.0))) AS ViewToContributionRatio,
+    -- Window function: Ranks users based on Reputation, Average Answer Score,
+    -- Count of Closed Duplicate Questions, and Gold Badges.
+    RANK() OVER (
+        ORDER BY
+            u.Reputation DESC,
+            COALESCE(uas.AverageAnswerScore, 0.0) DESC,
+            COUNT(DISTINCT cdq.ClosedQuestionId) DESC,
+            COALESCE(ubs.GoldBadges, 0) DESC
+    ) AS UserOverallRank
+FROM Users u
+INNER JOIN RecentUserActivity ua ON u.Id = ua.UserId -- Ensure user has recent activity
+LEFT JOIN UserAnswerStats uas ON u.Id = uas.UserId
+LEFT JOIN UserBadgeSummary ubs ON u.Id = ubs.UserId
+LEFT JOIN UserQuestionTagAnalysis uqta ON u.Id = uqta.UserId
+LEFT JOIN ClosedDuplicateQuestions cdq ON u.Id = cdq.QuestionOwnerId
+CROSS JOIN GlobalPostStats gps -- Global stats are constant for all users
+WHERE u.Reputation >= 5000 -- Primary filter: High-reputation users
+  AND u.LastAccessDate >= NOW() - INTERVAL '3 months' -- Recently accessed
+  AND u.DisplayName IS NOT NULL AND TRIM(u.DisplayName) != '' -- Has a non-empty display name
+  AND EXISTS (SELECT 1 FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) -- Must have at least one gold badge
+GROUP BY
+    u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Location, u.WebsiteUrl, u.AboutMe,
+    ua.PostsCount, ua.CommentsCount, ua.EditsCount,
+    uas.TotalAnswers, uas.AverageAnswerScore, uas.AcceptedAnswersCount,
+    ubs.GoldBadges, ubs.SilverBadges, ubs.BronzeBadges,
+    uqta.DistinctTagsUsedInQuestions, uqta.TopTagsString,
+    gps.AvgGlobalPostScore, gps.AvgGlobalPostViewCount, gps.AvgPostAgeDays,
+    u.UpVotes, u.DownVotes, u.Views
+HAVING COUNT(DISTINCT cdq.ClosedQuestionId) > 0 -- Only users with at least one question closed as duplicate
+ORDER BY UserOverallRank ASC, QuestionsClosedAsDuplicateCount DESC
+LIMIT 100;

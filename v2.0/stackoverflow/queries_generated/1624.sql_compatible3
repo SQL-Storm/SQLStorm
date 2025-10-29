@@ -1,0 +1,237 @@
+WITH UserEngagementSummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Views AS ProfileViews,
+        U.UpVotes AS UserUpVotesGiven,
+        U.DownVotes AS UserDownVotesGiven,
+        COUNT(DISTINCT P_Owned.Id) AS TotalPostsOwned,
+        COUNT(DISTINCT CASE WHEN P_Owned.PostTypeId = 1 THEN P_Owned.Id END) AS TotalQuestionsOwned,
+        COUNT(DISTINCT CASE WHEN P_Owned.PostTypeId = 2 THEN P_Owned.Id END) AS TotalAnswersOwned,
+        COUNT(DISTINCT C_Made.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COALESCE(SUM(P_Owned.Score), 0) AS InitialTotalPostScoreOwned,
+        COALESCE(SUM(P_Owned.ViewCount), 0) AS InitialTotalPostViewsOwned,
+        COALESCE(SUM(P_Owned.FavoriteCount), 0) AS InitialTotalPostFavoritesOwned,
+        MIN(COALESCE(P_Owned.CreationDate, C_Made.CreationDate, B.Date, CAST('9999-12-31' AS TIMESTAMP))) AS FirstEngagementDate,
+        MAX(COALESCE(P_Owned.CreationDate, C_Made.CreationDate, B.Date, CAST('0001-01-01' AS TIMESTAMP))) AS LastEngagementDate,
+        COUNT(DISTINCT lower(trim(tag))) FILTER (WHERE P_Owned.Tags IS NOT NULL) AS UniqueTagsContributedCount
+    FROM Users U
+    LEFT JOIN Posts P_Owned ON U.Id = P_Owned.OwnerUserId
+    LEFT JOIN Comments C_Made ON U.Id = C_Made.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN LATERAL (
+        SELECT unnest(string_to_array(substring(P_Owned.Tags FROM 2 FOR char_length(P_Owned.Tags) - 2), '><')) AS tag
+    ) tag_ex ON P_Owned.Tags IS NOT NULL
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Views, U.UpVotes, U.DownVotes
+),
+PostVoteAggregates AS (
+    SELECT
+        P.Id AS PostId,
+        SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS PostUpVotesReceived,
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS PostDownVotesReceived,
+        SUM(CASE WHEN V.VoteTypeId = 5 THEN 1 ELSE 0 END) AS PostFavoriteVotesReceived
+    FROM Posts P
+    JOIN Votes V ON P.Id = V.PostId
+    GROUP BY P.Id
+),
+PostDetailedMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.LastEditDate,
+        P.LastActivityDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount AS PostCommentCount,
+        P.FavoriteCount AS PostFavoriteCount,
+        P.ClosedDate,
+        P.CommunityOwnedDate,
+        P.Title,
+        P.Tags,
+        (SELECT U2.Reputation FROM Users U2 WHERE U2.Id = P.OwnerUserId) AS OwnerReputationAtPost,
+        EXISTS (
+            SELECT 1 FROM Badges B2
+            WHERE B2.UserId = P.OwnerUserId
+            AND B2.Class = 1
+            AND B2.Date <= P.CreationDate
+        ) AS OwnerHadGoldBadgeAtCreation,
+        (COALESCE(P.Score, 0) * 0.4) + (COALESCE(P.ViewCount, 0) * 0.01) + (COALESCE(P.AnswerCount, 0) * 0.3) + (COALESCE(P.FavoriteCount, 0) * 0.2) + (COALESCE(PVA.PostUpVotesReceived, 0) * 0.1) AS CalculatedPostInfluenceScore,
+        COALESCE(lower(substring(P.Tags FROM 2 FOR (CASE WHEN position('><' IN P.Tags) > 0 THEN position('><' IN P.Tags) - 2 ELSE char_length(P.Tags) - 2 END))), 'untagged') AS PrimaryTag,
+        COALESCE(P.Title, 'Untitled Post (' || P.Id || ')') AS DisplayTitle
+    FROM Posts P
+    JOIN PostTypes PT ON P.PostTypeId = PT.Id
+    LEFT JOIN PostVoteAggregates PVA ON P.Id = PVA.PostId
+    WHERE P.PostTypeId IN (1, 2)
+),
+PostHistoryWithLead AS (
+    -- compute lead per post/user ordering, then diff in seconds in a safe way (no aggregate over window)
+    SELECT
+        PH.*,
+        EXTRACT(EPOCH FROM (LEAD(PH.CreationDate) OVER (PARTITION BY PH.PostId, PH.UserId ORDER BY PH.CreationDate) - PH.CreationDate)) AS NextDiffSeconds
+    FROM PostHistory PH
+),
+PostHistoryAggregates AS (
+    SELECT
+        ph.PostId,
+        COUNT(ph.Id) AS TotalHistoryEvents,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.Id END) AS TotalEditEvents,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Id END) AS TotalCloseEvents,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.Id END) AS TotalReopenEvents,
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.CreationDate ELSE NULL END) AS LatestEditHistoryDate,
+        MIN(ph.CreationDate) AS EarliestHistoryDate,
+        AVG(ph.NextDiffSeconds) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6) AND ph.UserId IS NOT NULL AND ph.NextDiffSeconds IS NOT NULL) AS AvgTimeBetweenUserEditsSeconds,
+        STRING_AGG(DISTINCT CLR.Name, '; ') FILTER (WHERE ph.PostHistoryTypeId = 10 AND ph.Comment IS NOT NULL AND ph.Comment ~ '^[0-9]+$') AS DistinctCloseReasons
+    FROM PostHistoryWithLead ph
+    LEFT JOIN CloseReasonTypes CLR ON ph.PostHistoryTypeId = 10 AND ph.Comment ~ '^[0-9]+$' AND CLR.Id = CAST(ph.Comment AS SMALLINT)
+    GROUP BY ph.PostId
+),
+TagSpecificMetrics AS (
+    SELECT
+        PostId,
+        PostCreationDate,
+        CalculatedPostInfluenceScore,
+        PrimaryTag,
+        RANK() OVER (PARTITION BY PrimaryTag ORDER BY CalculatedPostInfluenceScore DESC, PostCreationDate DESC) AS RankInPrimaryTag,
+        AVG(CalculatedPostInfluenceScore) OVER (PARTITION BY PrimaryTag) AS AvgPrimaryTagInfluenceScore,
+        CUME_DIST() OVER (PARTITION BY PrimaryTag ORDER BY CalculatedPostInfluenceScore) AS InfluenceScoreCumeDist
+    FROM PostDetailedMetrics
+    WHERE PrimaryTag <> 'untagged'
+),
+CombinedActivityStream AS (
+    SELECT
+        OwnerUserId AS ActorId,
+        date_trunc('month', CreationDate) AS ActivityMonth,
+        'Post' AS ActivityType,
+        COUNT(Id) AS EventCount,
+        SUM(Score) AS TotalScoreImpact
+    FROM Posts
+    WHERE OwnerUserId IS NOT NULL
+    GROUP BY OwnerUserId, date_trunc('month', CreationDate)
+    UNION ALL
+    SELECT
+        UserId AS ActorId,
+        date_trunc('month', CreationDate) AS ActivityMonth,
+        'Comment' AS ActivityType,
+        COUNT(Id) AS EventCount,
+        SUM(Score) AS TotalScoreImpact
+    FROM Comments
+    WHERE UserId IS NOT NULL
+    GROUP BY UserId, date_trunc('month', CreationDate)
+)
+SELECT
+    UES.UserId,
+    UES.DisplayName,
+    UES.Reputation,
+    UES.UserCreationDate,
+    UES.LastAccessDate,
+    UES.ProfileViews,
+    UES.UserUpVotesGiven,
+    UES.UserDownVotesGiven,
+    UES.TotalPostsOwned,
+    UES.TotalQuestionsOwned,
+    UES.TotalAnswersOwned,
+    UES.TotalCommentsMade,
+    UES.TotalBadges,
+    UES.GoldBadges,
+    UES.SilverBadges,
+    UES.BronzeBadges,
+    UES.InitialTotalPostScoreOwned,
+    UES.InitialTotalPostViewsOwned,
+    UES.InitialTotalPostFavoritesOwned,
+    UES.UniqueTagsContributedCount,
+    COALESCE(SUM(PVA.PostUpVotesReceived), 0) AS TotalUpVotesReceivedOverall,
+    COALESCE(SUM(PVA.PostDownVotesReceived), 0) AS TotalDownVotesReceivedOverall,
+    COALESCE(SUM(PVA.PostFavoriteVotesReceived), 0) AS TotalFavoriteVotesReceivedOverall,
+    COUNT(DISTINCT PDM.PostId) AS TotalPostsWithDetailedMetrics,
+    SUM(PDM.CalculatedPostInfluenceScore) AS TotalCalculatedInfluenceScore,
+    AVG(PDM.CalculatedPostInfluenceScore) AS AvgCalculatedInfluenceScore,
+    MAX(PDM.CalculatedPostInfluenceScore) AS MaxCalculatedInfluenceScore,
+    COUNT(DISTINCT PH.PostId) FILTER (WHERE PH.TotalEditEvents > 0) AS PostsWithEdits,
+    COUNT(DISTINCT PH.PostId) FILTER (WHERE PH.TotalCloseEvents > 0 AND PH.TotalReopenEvents = 0) AS PostsClosedWithoutReopen,
+    COALESCE(AVG(CASE WHEN CAS.ActivityType = 'Post' THEN CAS.EventCount ELSE NULL END), 0) AS AvgMonthlyPosts,
+    COALESCE(AVG(CASE WHEN CAS.ActivityType = 'Comment' THEN CAS.EventCount ELSE NULL END), 0) AS AvgMonthlyComments,
+    COALESCE(SUM(CAS.TotalScoreImpact), 0) AS OverallMonthlyScoreImpact,
+    CASE
+        WHEN UES.TotalPostsOwned = 0 AND UES.TotalCommentsMade = 0 THEN 'Inactive User'
+        WHEN UES.Reputation < 100 AND UES.GoldBadges = 0 AND UES.TotalPostsOwned < 5 THEN 'Novice Contributor'
+        WHEN UES.TotalQuestionsOwned > UES.TotalAnswersOwned * 2 AND UES.TotalPostsOwned > 10 AND UES.InitialTotalPostScoreOwned > 500 THEN 'Question Maven'
+        WHEN UES.TotalAnswersOwned > UES.TotalQuestionsOwned * 2 AND UES.TotalPostsOwned > 10 AND UES.InitialTotalPostScoreOwned > 500 THEN 'Answer Expert'
+        WHEN UES.GoldBadges > 0 AND UES.Reputation >= 10000 THEN 'Influential Veteran'
+        ELSE COALESCE(UES.DisplayName, 'Anonymous User') || ' (' || UES.UserId || ')'
+    END AS UserCategory,
+    (
+        SELECT STRING_AGG(TSM_sub.PrimaryTag, ', ' ORDER BY TSM_sub.TagInfluence DESC)
+        FROM (
+            SELECT TSM.PrimaryTag, SUM(TSM.CalculatedPostInfluenceScore) AS TagInfluence
+            FROM TagSpecificMetrics TSM
+            WHERE TSM.PostId IN (SELECT PDM_sub.PostId FROM PostDetailedMetrics PDM_sub WHERE PDM_sub.OwnerUserId = UES.UserId)
+            GROUP BY TSM.PrimaryTag
+            ORDER BY TagInfluence DESC
+            LIMIT 3
+        ) AS TSM_sub
+    ) AS Top3InfluenceTags,
+    (
+        SELECT PDM_q.DisplayTitle
+        FROM PostDetailedMetrics PDM_q
+        WHERE PDM_q.OwnerUserId = UES.UserId
+        AND PDM_q.PostTypeId = 1
+        ORDER BY PDM_q.PostScore DESC, PDM_q.PostCreationDate DESC
+        LIMIT 1
+    ) AS HighestScoredQuestionTitle,
+    COALESCE(
+        (
+            SELECT STRING_AGG(summary_item, '; ' ORDER BY summary_item)
+            FROM (
+                SELECT DISTINCT
+                    CASE
+                        WHEN PDM.PostTypeId = 1 THEN 'Q: ' || COALESCE(PDM.DisplayTitle, 'Untitled')
+                        WHEN PDM.PostTypeId = 2 THEN 'A: ' || COALESCE(PDM.DisplayTitle, 'Untitled')
+                        ELSE COALESCE(PDM.DisplayTitle, 'Untitled')
+                    END AS summary_item,
+                    PDM.PostCreationDate
+                FROM PostDetailedMetrics PDM
+                WHERE PDM.OwnerUserId = UES.UserId
+                ORDER BY PDM.PostCreationDate DESC
+                LIMIT 10
+            ) AS t
+        ),
+        ''
+    ) AS RecentTopContributionsSummary
+FROM UserEngagementSummary UES
+LEFT JOIN Posts P ON UES.UserId = P.OwnerUserId
+LEFT JOIN PostVoteAggregates PVA ON P.Id = PVA.PostId
+LEFT JOIN PostDetailedMetrics PDM ON P.Id = PDM.PostId
+LEFT JOIN PostHistoryAggregates PH ON P.Id = PH.PostId
+LEFT JOIN CombinedActivityStream CAS ON CAS.ActorId = UES.UserId
+GROUP BY
+    UES.UserId,
+    UES.DisplayName,
+    UES.Reputation,
+    UES.UserCreationDate,
+    UES.LastAccessDate,
+    UES.ProfileViews,
+    UES.UserUpVotesGiven,
+    UES.UserDownVotesGiven,
+    UES.TotalPostsOwned,
+    UES.TotalQuestionsOwned,
+    UES.TotalAnswersOwned,
+    UES.TotalCommentsMade,
+    UES.TotalBadges,
+    UES.GoldBadges,
+    UES.SilverBadges,
+    UES.BronzeBadges,
+    UES.InitialTotalPostScoreOwned,
+    UES.InitialTotalPostViewsOwned,
+    UES.InitialTotalPostFavoritesOwned,
+    UES.UniqueTagsContributedCount;

@@ -1,0 +1,134 @@
+-- {"query": "2736.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1228} 
+with UserBadgeCounts as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    count(b.Id) filter (where b.Class = 1) as GoldBadges,
+    count(b.Id) filter (where b.Class = 2) as SilverBadges,
+    count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+    coalesce(sum(b.Class),0) as BadgeScore,
+    row_number() over (order by count(b.Id) desc, u.Reputation desc) as BadgeRank
+  from Users u
+  left join Badges b on b.UserId = u.Id
+  group by u.Id, u.DisplayName
+),
+RecentActivityPosts as (
+  select
+    p.Id as PostId,
+    p.PostTypeId,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.AcceptedAnswerId,
+    p.Tags,
+    coalesce(p.AnswerCount,0) as AnswerCount,
+    dense_rank() over (partition by p.PostTypeId order by p.Score desc nulls last, p.ViewCount desc nulls last) as ScoreRank
+  from Posts p
+  where p.CreationDate > current_date - interval '180 days'
+), 
+AcceptedAnswersStats as (
+  select 
+    a.Id as AnswerId,
+    a.ParentId as QuestionId,
+    a.Score as AnswerScore,
+    u.Reputation as AnswererReputation,
+    u.DisplayName as AnswererName
+  from Posts a
+  join Users u on u.Id = a.OwnerUserId
+  where a.PostTypeId = 2
+),
+QuestionCloseHistory as (
+  select distinct ph.PostId,
+    max(case when ph.PostHistoryTypeId = 10 then ph.CreationDate end) as ClosedDate,
+    max(case when ph.PostHistoryTypeId = 11 then ph.CreationDate end) as ReopenedDate,
+    array_agg(distinct crt.Name) filter (where ph.PostHistoryTypeId=10) as CloseReasons
+  from PostHistory ph
+  left join CloseReasonTypes crt on crt.Id::varchar = ph.Comment
+  group by ph.PostId
+),
+TopAnswerersWithBadge as (
+  select
+    r.PostId,
+    r.Title,
+    r.Score,
+    r.ViewCount,
+    ab.AnswerScore,
+    ab.AnswererReputation,
+    ab.AnswererName,
+    bc.GoldBadges,
+    bc.SilverBadges,
+    bc.BronzeBadges,
+    qch.ClosedDate,
+    qch.ReopenedDate,
+    qch.CloseReasons
+  from RecentActivityPosts r
+  left join AcceptedAnswersStats ab on r.AcceptedAnswerId = ab.AnswerId
+  left join UserBadgeCounts bc on r.OwnerUserId = bc.UserId
+  left join QuestionCloseHistory qch on qch.PostId = r.Id
+  where r.PostTypeId = 1
+),
+FilteredPosts as (
+  select *
+  from TopAnswerersWithBadge
+  where 
+    (ClosedDate is null or ReopenedDate is not null) -- only open or reopened questions
+    and Score > 5
+    and (GoldBadges + SilverBadges + BronzeBadges) > 0
+),
+AnswersWithRank as (
+  select
+    p.Id,
+    p.ParentId,
+    p.Score,
+    p.CreationDate,
+    p.OwnerUserId,
+    rank() over (partition by p.ParentId order by p.Score desc, p.CreationDate asc) as AnswerRank,
+    length(p.Body) as BodyLength,
+    (select count(*) from Comments c where c.PostId = p.Id and c.Score > 0) as UpvotedCommentsCount
+  from Posts p
+  where p.PostTypeId = 2
+)
+select 
+  fp.PostId as QuestionId,
+  fp.Title as QuestionTitle,
+  fp.Score as QuestionScore,
+  fp.ViewCount as QuestionViews,
+  fp.AnswerScore as AcceptedAnswerScore,
+  fp.AnswererName as AcceptedAnswerOwner,
+  fp.AnswererReputation as AcceptedAnswerOwnerRep,
+  fp.GoldBadges,
+  fp.SilverBadges,
+  fp.BronzeBadges,
+  fp.CloseReasons,
+  ans.Id as TopAnswerId,
+  ans.Score as TopAnswerScore,
+  ans.BodyLength as TopAnswerBodyLength,
+  ans.UpvotedCommentsCount as TopAnswerUpvotedComments,
+  ubc.BadgeScore as OwnerBadgeScore,
+  ubc.BadgeRank as OwnerBadgeRank,
+  coalesce(tl.LinkedCount,0) + coalesce(tl.DuplicateCount,0) as TotalLinks,
+  case when fp.Tags is null then '{}'::text[] 
+    else string_to_array(substring(fp.Tags from 2 for length(fp.Tags)-2), '><') end as TagList
+from FilteredPosts fp
+inner join AnswersWithRank ans on ans.ParentId = fp.PostId and ans.AnswerRank = 1
+left join UserBadgeCounts ubc on ubc.UserId = fp.OwnerUserId
+left join (
+  select 
+    pl.PostId,
+    sum(case when lt.Name = 'Linked' then 1 else 0 end) as LinkedCount,
+    sum(case when lt.Name = 'Duplicate' then 1 else 0 end) as DuplicateCount
+  from PostLinks pl
+  join LinkTypes lt on lt.Id = pl.LinkTypeId
+  group by pl.PostId
+) tl on tl.PostId = fp.PostId
+where 
+  fp.PostScoreRank <= 100
+order by 
+  fp.Score desc nulls last,
+  ans.Score desc nulls last,
+  fp.GoldBadges desc,
+  fp.SilverBadges desc,
+  fp.BronzeBadges desc
+limit 100;

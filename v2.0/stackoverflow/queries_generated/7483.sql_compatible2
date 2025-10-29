@@ -1,0 +1,284 @@
+WITH PostStats AS (
+    SELECT 
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.ParentId,
+        COALESCE(p.AcceptedAnswerId, 0) as AcceptedAnswerId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as PostType,
+        CASE 
+            WHEN p.Score > 100 THEN 'High'
+            WHEN p.Score > 50 THEN 'Medium'
+            ELSE 'Low'
+        END as ScoreCategory,
+        DENSE_RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) as ScoreRank,
+        ROW_NUMBER() OVER (ORDER BY p.CreationDate DESC) as RowNum,
+        LAG(p.Score, 1) OVER (ORDER BY p.CreationDate) as PrevScore,
+        LEAD(p.Score, 1) OVER (ORDER BY p.CreationDate) as NextScore,
+        SUM(p.Score) OVER (ORDER BY p.CreationDate) as CumulativeScore,
+        AVG(p.Score) OVER (PARTITION BY p.PostTypeId) as AvgScoreByType,
+        NTILE(4) OVER (ORDER BY p.ViewCount) as Quartile,
+        NTILE(10) OVER (ORDER BY p.Score) as Decile
+    FROM Posts p
+    WHERE p.CreationDate >= TIMESTAMP '2023-01-01'
+),
+AnswerStats AS (
+    SELECT 
+        a.Id as AnswerId,
+        a.PostTypeId as AnswerPostTypeId,
+        a.ParentId,
+        a.OwnerUserId as AnswerOwnerId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerDate,
+        RANK() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC) as AnswerRank,
+        CASE 
+            WHEN a.Score > 10 THEN 'Excellent'
+            WHEN a.Score > 5 THEN 'Good'
+            WHEN a.Score > 0 THEN 'Acceptable'
+            ELSE 'Poor'
+        END as AnswerQuality,
+        DENSE_RANK() OVER (ORDER BY a.Score DESC) as AnswerQualityRank,
+        PERCENT_RANK() OVER (ORDER BY a.Score) as ScorePercentile
+    FROM Posts a
+    WHERE a.PostTypeId = 2 
+),
+QuestionAnswers AS (
+    SELECT 
+        q.Id as QuestionId,
+        q.Title as QuestionTitle,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViews,
+        q.AnswerCount,
+        CASE 
+            WHEN q.AnswerCount > 0 THEN (q.AnswerCount * 100.0 / NULLIF(q.ViewCount, 0))
+            ELSE 0 
+        END as AnswerRatio,
+        q.OwnerUserId as QuestionOwnerId,
+        q.ParentId,
+        COALESCE(q.AcceptedAnswerId, 0) as AcceptedAnswerId
+    FROM Posts q
+    WHERE q.PostTypeId = 1
+),
+UserActivity AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.AccountId,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COUNT(DISTINCT v.Id) as VoteCount,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 100 THEN 'High'
+            WHEN COUNT(DISTINCT p.Id) > 50 THEN 'Medium'
+            WHEN COUNT(DISTINCT p.Id) > 10 THEN 'Low'
+            ELSE 'Very Low'
+        END as ActivityLevel
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.AccountId
+),
+TagAnalysis AS (
+    SELECT 
+        t.Id as TagId,
+        t.TagName,
+        t.Count as TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 500 THEN 'Moderate'
+            ELSE 'Niche'
+        END as PopularityLevel,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as PopularityRank,
+        LAG(t.Count, 1) OVER (ORDER BY t.Count DESC) as PrevTagCount,
+        LEAD(t.Count, 1) OVER (ORDER BY t.Count DESC) as NextTagCount,
+        ROUND(AVG(t.Count) OVER (), 2) as AvgTagCount,
+        STRING_AGG(t.TagName, ', ' ORDER BY t.Count DESC) as TopTags
+    FROM Tags t
+    WHERE t.Count > 0
+),
+PostHistoryAnalysis AS (
+    SELECT 
+        ph.Id as PostHistoryId,
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        ph.UserId,
+        ph.Comment,
+        ph.Text,
+        CASE 
+            WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN 1
+            WHEN ph.PostHistoryTypeId IN (14, 15, 19, 20) THEN 2
+            ELSE 3
+        END as ActionCategory,
+        CAST('2024-10-01 12:34:56' AS timestamp) - ph.CreationDate as DaysSinceAction_interval,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - ph.CreationDate))/86400 as DaysSinceAction,
+        COUNT(*) OVER (PARTITION BY ph.PostId) as TotalActionsPerPost
+    FROM PostHistory ph
+    WHERE ph.CreationDate >= TIMESTAMP '2023-01-01'
+),
+ComplexPostFilters AS (
+    SELECT 
+        ps.PostId,
+        ps.PostTypeId,
+        ps.Score,
+        ps.ViewCount,
+        ps.AnswerCount,
+        ps.CommentCount,
+        ps.FavoriteCount,
+        ps.CreationDate,
+        ps.OwnerUserId,
+        ps.PostType,
+        ps.ScoreCategory,
+        ps.ScoreRank,
+        ps.RowNum,
+        ps.PrevScore,
+        ps.NextScore,
+        ps.CumulativeScore,
+        ps.AvgScoreByType,
+        ps.Quartile,
+        ps.Decile,
+        CASE 
+            WHEN ps.Score > 50 AND ps.ViewCount > 1000 AND ps.AnswerCount > 5 THEN 'HighEngagement'
+            WHEN ps.Score > 20 AND ps.ViewCount > 500 THEN 'ModerateEngagement'
+            WHEN ps.Score < 0 THEN 'LowScore'
+            ELSE 'Neutral'
+        END as EngagementLevel,
+        CASE WHEN ps.Score > (SELECT AVG(p2.Score) FROM Posts p2 WHERE p2.PostTypeId = ps.PostTypeId) THEN 1 ELSE 0 END as AboveAverageScore,
+        ps.Title,
+        ps.Tags,
+        ps.AcceptedAnswerId
+    FROM PostStats ps
+    WHERE ps.Score IS NOT NULL
+)
+SELECT 
+    cp.PostId,
+    cp.PostTypeId,
+    cp.Score,
+    cp.ViewCount,
+    cp.AnswerCount,
+    cp.CommentCount,
+    cp.FavoriteCount,
+    cp.CreationDate,
+    cp.OwnerUserId,
+    cp.PostType,
+    cp.ScoreCategory,
+    cp.ScoreRank,
+    cp.RowNum,
+    cp.PrevScore,
+    cp.NextScore,
+    cp.CumulativeScore,
+    cp.AvgScoreByType,
+    cp.Quartile,
+    cp.Decile,
+    cp.EngagementLevel,
+    cp.AboveAverageScore,
+    CASE 
+        WHEN cp.AnswerCount > 0 THEN 
+            ROUND(CAST(cp.AnswerCount AS numeric) / NULLIF(cp.ViewCount, 0) * 100, 2)
+        ELSE 0 
+    END as AnswerConversionRate,
+    CASE 
+        WHEN cp.Score > 0 THEN 
+            ROUND(LOG(cp.Score + 1) * 10, 2)
+        ELSE 0 
+    END as LogScore,
+    CASE 
+        WHEN cp.PostTypeId = 1 AND cp.AnswerCount > 0 THEN 'Unanswered'
+        WHEN cp.AcceptedAnswerId > 0 THEN 'Answered'
+        ELSE 'AnsweredButNoAccept'
+    END as QuestionStatus,
+    STRING_AGG(
+        CASE 
+            WHEN cp.Score > 100 THEN 'HighScore_' || CAST(cp.Score AS text)
+            WHEN cp.Score > 50 THEN 'MediumScore_' || CAST(cp.Score AS text)
+            WHEN cp.Score > 0 THEN 'LowScore_' || CAST(cp.Score AS text)
+            ELSE 'NegativeScore'
+        END, '|' ORDER BY cp.CreationDate
+    ) OVER (ORDER BY cp.CreationDate ROWS BETWEEN 5 PRECEDING AND CURRENT ROW) as RecentScoreTrend,
+    EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - cp.CreationDate))/86400 as AgeInDays,
+    CASE 
+        WHEN cp.Score > (SELECT AVG(p3.Score) FROM Posts p3 WHERE p3.PostTypeId = 1) 
+             AND cp.ViewCount > 1000 
+             AND cp.AnswerCount > 3 THEN 'Trending'
+        WHEN cp.Score > 0 AND cp.ViewCount > 500 THEN 'Active'
+        ELSE 'Inactive'
+    END as PostStatus,
+    CASE 
+        WHEN cp.PostTypeId = 1 AND cp.AnswerCount > 0 THEN (
+            SELECT MAX(aa.AnswerScore)
+            FROM AnswerStats aa
+            WHERE aa.ParentId = cp.PostId
+              AND aa.AnswerScore > (
+                SELECT AVG(AnswerScore) 
+                FROM AnswerStats 
+                WHERE ParentId = cp.PostId
+              )
+        )
+        ELSE NULL
+    END as BestAnswerScore,
+    COALESCE(
+        (SELECT u.DisplayName 
+        FROM Users u 
+        WHERE u.Id = cp.OwnerUserId), 'Anonymous'
+    ) as OwnerDisplayName,
+    cp.Title,
+    cp.Tags,
+    cp.AcceptedAnswerId
+FROM ComplexPostFilters cp
+WHERE cp.Score IS NOT NULL
+    AND cp.OwnerUserId IS NOT NULL
+    AND (cp.PostTypeId = 1 OR cp.PostTypeId = 2)
+    AND cp.Score >= 0
+    AND cp.AnswerCount >= 0
+    AND cp.CommentCount >= 0
+    AND cp.FavoriteCount >= 0
+    AND cp.ViewCount >= 0
+    AND EXISTS (
+        SELECT 1 
+        FROM PostHistoryAnalysis pah 
+        WHERE pah.PostId = cp.PostId 
+        AND pah.CreationDate >= TIMESTAMP '2023-01-01'
+    )
+    AND EXISTS (
+        SELECT 1 
+        FROM UserActivity ua 
+        WHERE ua.UserId = cp.OwnerUserId
+        AND ua.PostCount > 5
+    )
+    AND (
+        (cp.PostTypeId = 1 AND cp.AnswerCount > 0 AND cp.AcceptedAnswerId > 0) 
+        OR (cp.PostTypeId = 2)
+        OR (cp.PostTypeId = 1 AND cp.AnswerCount = 0)
+    )
+    AND NOT EXISTS (
+        SELECT 1 
+        FROM Posts p 
+        WHERE p.Id = cp.PostId 
+        AND p.ContentLicense = 'CC BY-SA 4.0'
+    )
+    AND (cp.Score >= 0 OR cp.Score IS NULL)
+    AND COALESCE(cp.Title, '') <> ''
+    AND COALESCE(cp.Tags, '') <> ''
+ORDER BY cp.CreationDate DESC, cp.Score DESC
+LIMIT 10000;

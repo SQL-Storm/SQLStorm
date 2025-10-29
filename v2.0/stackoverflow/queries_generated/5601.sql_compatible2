@@ -1,0 +1,98 @@
+WITH recent_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.ViewCount,
+    p.Score,
+    p.AnswerCount,
+    p.CommentCount,
+    p.LastActivityDate,
+    p.FavoriteCount
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180' DAY
+),
+tag_popularity AS (
+  SELECT
+    unnest(string_to_array(substr(t.TagName, 2, length(t.TagName) - 2), '><')) AS tag,
+    count(*) AS tag_count
+  FROM Tags t
+  GROUP BY unnest(string_to_array(substr(t.TagName, 2, length(t.TagName) - 2), '><'))
+),
+question_tag_aggregate AS (
+  SELECT
+    r.PostId,
+    r.Title,
+    r.Tags,
+    r.CreationDate,
+    r.OwnerUserId,
+    r.ViewCount,
+    r.Score,
+    r.AnswerCount,
+    r.CommentCount,
+    r.LastActivityDate,
+    r.FavoriteCount,
+    ta.tag AS tag_name
+  FROM recent_questions r
+  LEFT JOIN LATERAL (
+    SELECT unnest(string_to_array(substr(r.Tags, 2, length(r.Tags) - 2), '><')) AS tag
+  ) AS ta ON TRUE
+  WHERE ta.tag IS NOT NULL
+),
+popular_tags AS (
+  SELECT tag_name, sum(tag_count) AS total_posts
+  FROM (
+    SELECT unnest(string_to_array(substr(p.Tags, 2, length(p.Tags) - 2), '><')) AS tag_name
+    FROM Posts p
+    -- Removed incorrect JOIN on Tags; assume Tags stored as text in Posts
+    WHERE p.PostTypeId = 1
+  ) s
+  GROUP BY tag_name
+),
+ranked AS (
+  SELECT
+    q.PostId,
+    q.Title,
+    q.OwnerUserId,
+    q.ViewCount,
+    q.Score,
+    q.AnswerCount,
+    q.CommentCount,
+    q.LastActivityDate,
+    q.FavoriteCount,
+    q.tag_name,
+    ROW_NUMBER() OVER (
+      PARTITION BY q.tag_name
+      ORDER BY q.Score DESC, q.ViewCount DESC, q.LastActivityDate DESC
+    ) AS rn
+  FROM question_tag_aggregate q
+  WHERE q.tag_name IS NOT NULL
+)
+SELECT
+  u.DisplayName AS author,
+  u.Reputation,
+  p.Id AS PostId,
+  p.Title,
+  p.Tags,
+  p.CreationDate,
+  p.ViewCount,
+  p.Score,
+  p.AnswerCount,
+  p.CommentCount,
+  p.LastActivityDate,
+  p.FavoriteCount,
+  ph.Name AS history_type,
+  v.CreationDate AS vote_date,
+  v.BountyAmount
+FROM ranked r
+JOIN Posts p ON p.Id = r.PostId
+LEFT JOIN Users u ON u.Id = p.OwnerUserId
+LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+LEFT JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId = 2
+WHERE r.rn = 1
+  AND (p.LastEditorUserId IS NULL OR p.LastEditorUserId <> p.OwnerUserId)
+ORDER BY r.tag_name, p.Score DESC, p.LastActivityDate DESC
+LIMIT 100;

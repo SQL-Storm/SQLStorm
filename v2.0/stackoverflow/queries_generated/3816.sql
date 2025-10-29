@@ -1,0 +1,106 @@
+-- {"query": "3816.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2046} 
+
+WITH
+    RecentQuestions AS (
+        SELECT p.Id AS QId,
+               p.OwnerUserId,
+               p.CreationDate,
+               p.Tags,
+               p.Score
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+          AND p.CreationDate >= CURRENT_DATE - INTERVAL '1 year'
+    ),
+    AnswersByTag AS (
+        SELECT t.TagName,
+               a.OwnerUserId,
+               a.Score,
+               a.CreationDate,
+               a.Id AS AnswerId,
+               q.QId,
+               q.Score AS QuestionScore,
+               ROW_NUMBER() OVER (PARTITION BY t.TagName, a.OwnerUserId ORDER BY a.Score DESC) AS rn
+        FROM RecentQuestions q
+        JOIN Posts a ON a.PostTypeId = 2 AND a.ParentId = q.QId
+        CROSS JOIN LATERAL (
+            SELECT regexp_split_to_table(trim(both '<>' FROM q.Tags), '><') AS tag
+        ) AS taglist
+        JOIN Tags t ON t.TagName = taglist.tag
+    ),
+    TopAnswers AS (
+        SELECT *
+        FROM AnswersByTag
+        WHERE rn = 1
+    ),
+    UserBadgeCounts AS (
+        SELECT u.Id AS UserId,
+               COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+               COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+               COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges
+        FROM Users u
+        LEFT JOIN Badges b ON b.UserId = u.Id
+        GROUP BY u.Id
+    ),
+    DuplicateLinkStats AS (
+        SELECT pl.PostId,
+               COUNT(*) AS DuplicateCount,
+               MAX(pl.CreationDate) AS LastDuplicateDate
+        FROM PostLinks pl
+        WHERE pl.LinkTypeId = 3   -- duplicate
+        GROUP BY pl.PostId
+    ),
+    UserActivity AS (
+        SELECT u.Id AS UserId,
+               MAX(p.LastActivityDate) AS LastPostActivity,
+               MAX(c.CreationDate) AS LastCommentActivity,
+               COALESCE(SUM(v.VoteTypeId = 2)::int,0) AS UpVoteCount,
+               COALESCE(SUM(v.VoteTypeId = 3)::int,0) AS DownVoteCount
+        FROM Users u
+        LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+        LEFT JOIN Comments c ON c.UserId = u.Id
+        LEFT JOIN Votes v ON v.UserId = u.Id AND v.VoteTypeId IN (2,3)
+        GROUP BY u.Id
+    )
+SELECT
+    t.TagName,
+    u.DisplayName,
+    u.Reputation,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ta.Score AS TopAnswerScore,
+    ta.QuestionScore,
+    ta.CreationDate AS AnswerCreated,
+    ua.UpVoteCount,
+    ua.DownVoteCount,
+    COALESCE(dls.DuplicateCount,0) AS QuestionDuplicateCount,
+    dls.LastDuplicateDate,
+    CASE
+        WHEN ua.LastPostActivity IS NULL THEN 'Never posted'
+        ELSE to_char(ua.LastPostActivity, 'YYYY-MM-DD')
+    END AS LastPostActivityDate,
+    CASE
+        WHEN u.Location IS NULL OR trim(u.Location) = '' THEN 'Unknown'
+        ELSE u.Location
+    END AS UserLocation,
+    EXISTS (
+        SELECT 1
+        FROM PostHistory ph
+        WHERE ph.PostId = ta.AnswerId
+          AND ph.PostHistoryTypeId = 10   -- Post Closed
+          AND ph.Comment IS NOT NULL
+          AND ph.Comment::int = 101      -- Duplicate close reason
+    ) AS AnswerEverClosedAsDuplicate
+FROM TopAnswers ta
+JOIN Users u ON u.Id = ta.OwnerUserId
+LEFT JOIN UserBadgeCounts ub ON ub.UserId = u.Id
+LEFT JOIN UserActivity ua ON ua.UserId = u.Id
+LEFT JOIN DuplicateLinkStats dls ON dls.PostId = ta.QId
+JOIN Tags t ON t.TagName = (
+        SELECT taglist.tag
+        FROM regexp_split_to_table(trim(both '<>' FROM (SELECT Tags FROM Posts WHERE Id = ta.QId)), '><') AS taglist(tag)
+        LIMIT 1
+    )
+WHERE u.Reputation > 1000
+ORDER BY t.TagName, ta.Score DESC
+LIMIT 100;

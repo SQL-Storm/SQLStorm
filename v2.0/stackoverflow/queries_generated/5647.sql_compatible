@@ -1,0 +1,108 @@
+WITH
+RecentQuestions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.PostTypeId,
+    u.DisplayName AS OwnerName,
+    u.Reputation,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn_owner
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180 days'
+),
+TopTags AS (
+  SELECT
+    t.TagName,
+    t.Count,
+    t.ExcerptPostId,
+    t.WikiPostId,
+    ROW_NUMBER() OVER (ORDER BY t.Count DESC, t.TagName) AS rn_tag
+  FROM Tags t
+  WHERE t.TagName IS NOT NULL
+),
+FlaggedPosts AS (
+  SELECT
+    v.PostId,
+    v.VoteTypeId,
+    v.UserId,
+    v.CreationDate,
+    v.BountyAmount,
+    u.DisplayName AS VoterName
+  FROM Votes v
+  LEFT JOIN Users u ON v.UserId = u.Id
+  WHERE v.VoteTypeId IN (6,10,11)
+),
+PostLinksCTE AS (
+  SELECT
+    pl.PostId,
+    pl.RelatedPostId,
+    pl.LinkTypeId,
+    l.Name AS LinkTypeName
+  FROM PostLinks pl
+  LEFT JOIN LinkTypes l ON pl.LinkTypeId = l.Id
+  WHERE pl.LinkTypeId IN (1,3)
+),
+WindowedActivity AS (
+  SELECT
+    pp.PostId,
+    pp.Title,
+    pp.CreationDate,
+    pp.LastActivityDate,
+    pp.Score,
+    pp.ViewCount,
+    pp.OwnerUserId,
+    pp.OwnerName,
+    ROW_NUMBER() OVER (
+      PARTITION BY pp.OwnerUserId
+      ORDER BY pp.LastActivityDate DESC, pp.Score DESC
+    ) AS owner_rank
+  FROM RecentQuestions pp
+)
+SELECT
+  wa.PostId,
+  wa.Title,
+  wa.CreationDate,
+  wa.LastActivityDate,
+  wa.Score,
+  wa.ViewCount,
+  wa.OwnerUserId,
+  wa.OwnerName,
+  wa.Reputation AS OwnerReputation,
+  COUNT(DISTINCT t.TagName) AS TagCount,
+  STRING_AGG(DISTINCT t.TagName, ',') AS TagsList,
+  ARRAY_AGG(DISTINCT f.PostId) FILTER (WHERE f.PostId IS NOT NULL) AS FlaggedByVotes,
+  STRING_AGG(DISTINCT cl.Name, '|') AS RelatedCloseReasons,
+  (SELECT COUNT(*) FROM PostLinks clp WHERE clp.PostId = wa.PostId) AS TotalLinks,
+  (SELECT COUNT(*) FROM Votes v WHERE v.PostId = wa.PostId AND v.VoteTypeId = 2) AS Upvotes,
+  (SELECT COUNT(*) FROM Votes v WHERE v.PostId = wa.PostId AND v.VoteTypeId = 3) AS Downvotes
+FROM WindowedActivity wa
+LEFT JOIN Tags t ON t.ExcerptPostId = wa.PostId
+LEFT JOIN Comments c ON c.PostId = wa.PostId
+LEFT JOIN FlaggedPosts f ON f.PostId = wa.PostId
+LEFT JOIN PostLinksCTE pl ON pl.PostId = wa.PostId
+LEFT JOIN CloseReasonTypes cl ON cl.Id = CAST(c.ContentLicense AS integer)
+GROUP BY
+  wa.PostId,
+  wa.Title,
+  wa.CreationDate,
+  wa.LastActivityDate,
+  wa.Score,
+  wa.ViewCount,
+  wa.OwnerUserId,
+  wa.OwnerName,
+  wa.Reputation
+HAVING
+  COUNT(DISTINCT t.TagName) > 0
+ORDER BY wa.LastActivityDate DESC, wa.Score DESC
+LIMIT 100;

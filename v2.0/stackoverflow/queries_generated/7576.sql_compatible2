@@ -1,0 +1,279 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.LastActivityDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS prev_score,
+        LEAD(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS next_score,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING) AS avg_score_5posts,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) AS score_rank,
+        NTILE(100) OVER (ORDER BY p.Score) AS score_quartile
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) 
+),
+PostStats AS (
+    SELECT 
+        r.Id,
+        r.Score,
+        r.ViewCount,
+        r.Title,
+        r.Tags,
+        r.OwnerUserId,
+        r.CreationDate,
+        r.AnswerCount,
+        r.CommentCount,
+        r.FavoriteCount,
+        r.LastActivityDate,
+        r.rn,
+        r.prev_score,
+        r.next_score,
+        r.avg_score_5posts,
+        r.score_rank,
+        r.score_quartile,
+        CASE 
+            WHEN r.Score > 100 THEN 'High'
+            WHEN r.Score > 10 THEN 'Medium'
+            WHEN r.Score > 0 THEN 'Low'
+            ELSE 'Zero'
+        END AS score_category,
+        CASE 
+            WHEN r.avg_score_5posts > 50 THEN 'Consistently High'
+            WHEN r.avg_score_5posts > 25 THEN 'Moderately High'
+            WHEN r.avg_score_5posts > 0 THEN 'Below Average'
+            ELSE 'Poor'
+        END AS consistency_level,
+        CAST((EXTRACT(EPOCH FROM (r.LastActivityDate - r.CreationDate)) / 86400) AS INTEGER) AS days_since_activity,
+        CASE 
+            WHEN r.AnswerCount > 0 THEN (CAST(r.AnswerCount AS DOUBLE PRECISION) / NULLIF(r.ViewCount, 0)) * 100
+            ELSE NULL
+        END AS answer_to_view_ratio,
+        CASE 
+            WHEN r.CommentCount > 0 THEN (CAST(r.CommentCount AS DOUBLE PRECISION) / NULLIF(r.ViewCount, 0)) * 100
+            ELSE NULL
+        END AS comment_to_view_ratio
+    FROM RankedPosts r
+),
+UserPerformance AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(p.Id) AS total_posts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS question_count,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS answer_count,
+        AVG(p.Score) AS avg_post_score,
+        MAX(p.Score) AS max_post_score,
+        MIN(p.Score) AS min_post_score,
+        SUM(p.ViewCount) AS total_views,
+        STRING_AGG(p.Title, ' | ') AS all_titles,
+        STRING_AGG(LEFT(p.Tags, 30), ', ') AS sample_tags,
+        CASE 
+            WHEN u.Views > 10000 THEN 'Popular'
+            WHEN u.Views > 5000 THEN 'Well Known'
+            WHEN u.Views > 1000 THEN 'Known'
+            ELSE 'Less Known'
+        END AS user_recognition_level,
+        CASE 
+            WHEN u.UpVotes > 1000 THEN 'Highly Upvoted'
+            WHEN u.UpVotes > 500 THEN 'Moderately Upvoted'
+            WHEN u.UpVotes > 100 THEN 'Some Upvotes'
+            ELSE 'Few Upvotes'
+        END AS voting_level
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        p.Title AS excerpt_title,
+        p.Body AS excerpt_body,
+        p.Score AS excerpt_score,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Trending'
+            WHEN t.Count > 100 THEN 'Popular'
+            WHEN t.Count > 10 THEN 'Moderate'
+            ELSE 'Niche'
+        END AS tag_popularity,
+        CASE 
+            WHEN t.Count > 5000 THEN 'Must Know'
+            WHEN t.Count > 1000 THEN 'Important'
+            WHEN t.Count > 100 THEN 'Useful'
+            ELSE 'Interesting'
+        END AS tag_importance
+    FROM Tags t
+    LEFT JOIN Posts p ON t.ExcerptPostId = p.Id
+),
+CommunityActivity AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.LastActivityDate,
+        u.DisplayName AS owner_name,
+        u.Reputation AS owner_rep,
+        p.Score - COALESCE((SELECT AVG(v.Score) FROM Votes v WHERE v.PostId = p.Id), 0) AS score_adjusted,
+        CAST((EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate)) / 86400) AS INTEGER) AS days_active,
+        p.ViewCount * COALESCE(NULLIF(p.CommentCount, 0), 1) AS view_comment_weighted,
+        CASE 
+            WHEN p.Score > (SELECT AVG(p2.Score) FROM Posts p2 WHERE p2.PostTypeId = 1) THEN 'Above Average'
+            ELSE 'Below Average'
+        END AS performance_rating,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags != '' THEN 
+                COALESCE(cardinality(string_to_array(p.Tags, '><')), 0)
+            ELSE 0
+        END AS tag_count,
+        LAG(p.Score) OVER (ORDER BY p.CreationDate) - p.Score AS score_change,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS comment_count,
+        COALESCE((SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2), 0) AS upvote_count,
+        COALESCE((SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3), 0) AS downvote_count,
+        CASE 
+            WHEN p.Score > 0 AND p.ViewCount > 0 THEN 
+                (CAST(p.Score AS DOUBLE PRECISION) / CAST(p.ViewCount AS DOUBLE PRECISION)) * 1000
+            ELSE NULL
+        END AS score_per_view,
+        CASE 
+            WHEN p.AnswerCount IS NOT NULL AND p.AnswerCount > 0 THEN TRUE
+            ELSE FALSE
+        END AS has_answers,
+        COALESCE(p.Title, 'No Title') AS formatted_title,
+        COALESCE(p.Tags, 'No Tags') AS formatted_tags,
+        COALESCE(p.OwnerDisplayName, 'Anonymous') AS formatted_owner_name
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1, 2)
+)
+SELECT 
+    pa.id,
+    pa.score,
+    pa.viewcount,
+    pa.title,
+    pa.tags,
+    pa.owneruserid,
+    pa.creationdate,
+    pa.answercount,
+    pa.commentcount,
+    pa.favoritecount,
+    pa.lastactivitydate,
+    pa.rn,
+    pa.prev_score,
+    pa.next_score,
+    pa.avg_score_5posts,
+    pa.score_rank,
+    pa.score_quartile,
+    pa.score_category,
+    pa.consistency_level,
+    pa.days_since_activity,
+    pa.answer_to_view_ratio,
+    pa.comment_to_view_ratio,
+    up.DisplayName AS user_name,
+    up.Reputation AS user_reputation,
+    up.Views AS user_views,
+    up.UpVotes AS user_upvotes,
+    up.DownVotes AS user_downvotes,
+    up.total_posts,
+    up.question_count,
+    up.answer_count,
+    up.avg_post_score,
+    up.max_post_score,
+    up.min_post_score,
+    up.total_views,
+    up.all_titles,
+    up.sample_tags,
+    up.user_recognition_level,
+    up.voting_level,
+    ta.TagName,
+    ta.Count AS tag_count,
+    ta.excerpt_title,
+    ta.excerpt_body,
+    ta.excerpt_score,
+    ta.tag_popularity,
+    ta.tag_importance,
+    ca.score_adjusted AS ScoreAdjusted,
+    ca.days_active AS DaysActive,
+    ca.view_comment_weighted AS ViewCommentWeighted,
+    ca.performance_rating AS PerformanceRating,
+    ca.tag_count AS post_tag_count,
+    ca.score_change AS ScoreChange,
+    ca.comment_count AS post_comment_count,
+    ca.upvote_count AS UpvoteCount,
+    ca.downvote_count AS DownvoteCount,
+    ca.score_per_view AS ScorePerView,
+    ca.has_answers AS HasAnswers,
+    ca.formatted_title AS FormattedTitle,
+    ca.formatted_tags AS FormattedTags,
+    ca.formatted_owner_name AS FormattedOwnerName,
+    CASE 
+        WHEN pa.score > (SELECT AVG(p3.Score) FROM Posts p3 WHERE p3.PostTypeId = 1) THEN 
+            'High Scoring Question'
+        WHEN pa.score > 0 THEN 
+            'Regular Question'
+        ELSE 
+            'Low Scoring Question'
+    END AS question_quality,
+    CASE 
+        WHEN pa.prev_score IS NOT NULL AND pa.next_score IS NOT NULL THEN 
+            CASE WHEN pa.next_score > pa.prev_score THEN 'Improving' ELSE 'Declining' END
+        WHEN pa.prev_score IS NOT NULL THEN 'Stable'
+        ELSE 'New'
+    END AS trend_status,
+    CASE 
+        WHEN pa.score >= 10 AND pa.answercount > 0 THEN 'Answered'
+        WHEN pa.score >= 10 THEN 'Well Rated'
+        WHEN pa.commentcount > 2 THEN 'Engaged'
+        ELSE 'Needs Attention'
+    END AS post_status,
+    CASE 
+        WHEN pa.score > 20 THEN 
+            (CAST(pa.score * 100.0 AS TEXT) || '%')
+        ELSE 
+            NULL
+    END AS percentage_of_max_score
+FROM PostStats pa
+LEFT JOIN UserPerformance up ON pa.OwnerUserId = up.UserId
+LEFT JOIN TagAnalysis ta ON pa.Tags LIKE '%' || ta.TagName || '%'
+LEFT JOIN CommunityActivity ca ON pa.Id = ca.Id
+WHERE pa.Score IS NOT NULL 
+  AND pa.OwnerUserId IN (
+    SELECT Id 
+    FROM Users 
+    WHERE Reputation > 1000 
+      AND LastAccessDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30 day')
+)
+  AND EXISTS (
+    SELECT 1 
+    FROM PostHistory ph 
+    WHERE ph.PostId = pa.Id 
+      AND ph.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6 month')
+      AND ph.PostHistoryTypeId IN (1, 4, 2, 5)
+  )
+  AND (pa.score_category = 'High' OR pa.consistency_level = 'Consistently High')
+  AND (pa.answer_to_view_ratio > 2 OR pa.comment_to_view_ratio > 5)
+ORDER BY pa.score DESC, pa.creationdate DESC
+LIMIT 1000;

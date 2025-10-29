@@ -1,0 +1,150 @@
+WITH RecursiveUserBadgeRanks AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        b.Name AS BadgeName,
+        b.Class,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY b.Date DESC, b.Class) AS BadgeRank
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE b.TagBased = FALSE OR b.TagBased IS NULL
+),
+LatestPostActivity AS (
+    SELECT 
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.AnswerCount,
+        ph.Comment AS CloseReason,
+        COALESCE(ph.CreationDate, p.LastActivityDate) AS LastActivity,
+        ROW_NUMBER() OVER (
+            PARTITION BY CASE WHEN p.PostTypeId = 2 THEN p.ParentId ELSE p.Id END
+            ORDER BY p.Score DESC, p.ViewCount DESC
+        ) AS RankInThread
+    FROM Posts p
+    LEFT JOIN (
+        SELECT PostId, Comment, CreationDate
+        FROM PostHistory
+        WHERE PostHistoryTypeId = 10
+    ) ph ON p.Id = ph.PostId
+    WHERE p.PostTypeId IN (1, 2)
+),
+TopTags AS (
+    SELECT 
+        TRIM(tag) AS Tag
+    FROM (
+        SELECT regexp_split_to_table(
+            SUBSTRING(Tags FROM 2 FOR LENGTH(Tags) - 2),
+            '><'
+        ) AS tag
+        FROM Posts
+        WHERE Tags IS NOT NULL
+    ) t
+),
+UserVoteAggregates AS (
+    SELECT 
+        v.UserId,
+        SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes,
+        SUM(CASE WHEN vt.Name = 'Favorite' THEN 1 ELSE 0 END) AS Favorites,
+        COUNT(*) AS TotalVotes
+    FROM Votes v
+    LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    GROUP BY v.UserId
+),
+CorrelatedAnswerScores AS (
+    SELECT DISTINCT
+        q.Id AS QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        (SELECT AVG(a.Score) 
+         FROM Posts a 
+         WHERE a.ParentId = q.Id AND a.PostTypeId = 2) AS AvgAnswerScore,
+        (SELECT MAX(a.Score) 
+         FROM Posts a 
+         WHERE a.ParentId = q.Id AND a.PostTypeId = 2) AS MaxAnswerScore,
+        (SELECT COUNT(*) 
+         FROM Posts a 
+         WHERE a.ParentId = q.Id AND a.PostTypeId = 2) AS AnswerCount
+    FROM Posts q
+    WHERE q.PostTypeId = 1
+),
+WindowedUserReps AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS RepRank,
+        RANK() OVER (ORDER BY (u.UpVotes - u.DownVotes) DESC NULLS LAST) AS VoteRank,
+        COUNT(b.Id) OVER (PARTITION BY u.Id) AS BadgeCount
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId AND b.Class = 1
+),
+PostsWithLinks AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.PostTypeId,
+        pl.LinkTypeId,
+        pl.RelatedPostId,
+        lt.Name AS LinkTypeName,
+        COALESCE(p.Score,0) + COALESCE(p.ViewCount,0)/100.0 AS PopularityScore,
+        CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS HasAcceptedAnswer
+    FROM Posts p
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+    LEFT JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+)
+SELECT
+    lpa.QuestionId,
+    lpa.Title,
+    wur.Reputation,
+    wur.RepRank,
+    wur.VoteRank,
+    wur.BadgeCount,
+    lpa.AvgAnswerScore,
+    lpa.MaxAnswerScore,
+    lpa.AnswerCount,
+    COALESCE(uv.UpVotes,0) AS UserUpVotes,
+    COALESCE(uv.DownVotes,0) AS UserDownVotes,
+    COALESCE(uv.Favorites,0) AS UserFavorites,
+    tu.Tag,
+    STRING_AGG(DISTINCT rb.BadgeName || ' (Class ' || CAST(rb.Class AS varchar) || ')', ', ') 
+        FILTER (WHERE rb.BadgeRank <= 3) AS TopBadges,
+    pwl.LinkTypeName,
+    pwl.PopularityScore,
+    pwl.HasAcceptedAnswer,
+    lp.CloseReason,
+    CASE 
+        WHEN lpa.AvgAnswerScore IS NOT NULL AND lpa.AvgAnswerScore > 5 THEN 'High Engagement'
+        WHEN lpa.AnswerCount IS NOT NULL AND lpa.AnswerCount = 0 THEN 'No Answers Yet'
+        ELSE 'Normal'
+    END AS EngagementStatus
+FROM CorrelatedAnswerScores lpa
+INNER JOIN WindowedUserReps wur ON lpa.OwnerUserId = wur.Id
+LEFT JOIN UserVoteAggregates uv ON wur.Id = uv.UserId
+LEFT JOIN TopTags tu ON tu.Tag IN (
+    SELECT regexp_split_to_table(
+        SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2),
+        '><'
+    )
+    FROM Posts p WHERE p.Id = lpa.QuestionId
+)
+LEFT JOIN RecursiveUserBadgeRanks rb ON rb.UserId = wur.Id AND rb.BadgeRank <= 3
+LEFT JOIN PostsWithLinks pwl ON pwl.Id = lpa.QuestionId
+LEFT JOIN LatestPostActivity lp ON lp.PostId = lpa.QuestionId
+WHERE wur.Reputation > 1000
+  AND (lpa.AnswerCount > 2 OR lpa.AvgAnswerScore > 3)
+GROUP BY
+    lpa.QuestionId, lpa.Title, lpa.OwnerUserId,
+    wur.Reputation, wur.RepRank, wur.VoteRank, wur.BadgeCount,
+    lpa.AvgAnswerScore, lpa.MaxAnswerScore, lpa.AnswerCount,
+    uv.UpVotes, uv.DownVotes, uv.Favorites,
+    tu.Tag, pwl.LinkTypeName, pwl.PopularityScore, pwl.HasAcceptedAnswer, lp.CloseReason
+ORDER BY wur.Reputation DESC, lpa.AnswerCount DESC, lpa.MaxAnswerScore DESC;

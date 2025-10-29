@@ -1,0 +1,134 @@
+-- {"query": "5427.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 895} 
+WITH recent_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.LastActivityDate,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.PostTypeId
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= NOW() - INTERVAL '90 days'
+),
+tag_stats AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS PostCount,
+    AVG(p.Score) AS AvgScore,
+    MAX(p.ViewCount) AS MaxViews,
+    SUM(p.AnswerCount) AS TotalAnswers,
+    SUM(p.CommentCount) AS TotalComments
+  FROM (
+    SELECT
+      unnest(string_to_array(TRIM(both ' ' FROM p.Tags), '><')) AS TagName,
+      p.Id,
+      p.Score,
+      p.ViewCount,
+      p.AnswerCount,
+      p.CommentCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= NOW() - INTERVAL '90 days'
+  ) s
+  JOIN Tags t ON t.TagName = s.TagName
+  GROUP BY t.TagName
+),
+top_contributors AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName AS UserName,
+    u.Reputation,
+    COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS AskedQuestions,
+    COUNT(v.Id) AS VoteCount
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  WHERE u.Reputation > 1000
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+activity_window AS (
+  SELECT
+    p.Id AS PostId,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Title,
+    p.Tags,
+    p.Score,
+    p.ViewCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    ROW_NUMBER() OVER (
+      PARTITION BY p.OwnerUserId
+      ORDER BY p.LastActivityDate DESC, p.Score DESC
+    ) AS rn
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.LastActivityDate >= NOW() - INTERVAL '30 days'
+),
+correlated_metrics AS (
+  SELECT
+    a.PostId,
+    a.OwnerUserId,
+    a.LastActivityDate,
+    a.Title,
+    a.Tags,
+    a.Score,
+    a.ViewCount,
+    a.CommentCount,
+    a.FavoriteCount,
+    CASE
+      WHEN a.ViewCount > 1000 THEN TRUE
+      ELSE FALSE
+    END AS HighlyViewed,
+    CASE
+      WHEN a.Score >= 10 THEN TRUE
+      ELSE FALSE
+    END AS Popular
+  FROM activity_window a
+  WHERE a.rn = 1
+)
+SELECT
+  rp.PostId,
+  rp.Title,
+  rp.Tags,
+  rp.CreationDate,
+  rp.Score,
+  rp.ViewCount,
+  rp.CommentCount,
+  rp.FavoriteCount,
+  rp.OwnerUserId,
+  u.DisplayName AS OwnerName,
+  u.Reputation,
+  ht.Name AS HistoryTypeSample,
+  ls.MaxViews AS HighestViewSpike,
+  ts.TagName,
+  ts.PostCount,
+  ts.AvgScore,
+  ts.TotalAnswers,
+  ca.UserId AS TopContributorUserId,
+  ca.UserName AS TopContributorName,
+  ca.Reputation AS TopContributorRep,
+  ca.AskedQuestions,
+  ca.VoteCount
+FROM correlated_metrics rp
+LEFT JOIN Users u ON rp.OwnerUserId = u.Id
+LEFT JOIN (SELECT Id, 'Selected' AS HistoryTypeSample FROM PostHistory) AS ht ON TRUE
+LEFT JOIN tag_stats ts ON TRUE
+LEFT JOIN top_contributors ca ON ca.UserId = rp.OwnerUserId
+LEFT JOIN (
+  SELECT
+    p.Id,
+    MAX(p.ViewCount) AS MaxViews
+  FROM Posts p
+  GROUP BY p.Id
+) ls ON ls.Id = rp.PostId
+ORDER BY rp.LastActivityDate DESC
+LIMIT 100;

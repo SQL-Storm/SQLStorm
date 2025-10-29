@@ -1,0 +1,153 @@
+WITH
+ActiveUsers AS (
+    SELECT Id, Reputation, CreationDate, LastAccessDate
+    FROM Users
+    WHERE CreationDate >= TIMESTAMP '2018-01-01' AND LastAccessDate >= TIMESTAMP '2024-01-01'
+),
+RecentPosts AS (
+    SELECT p.Id,
+           p.PostTypeId,
+           p.OwnerUserId,
+           p.Title,
+           p.CreationDate,
+           p.Score,
+           p.ViewCount,
+           p.AnswerCount,
+           p.CommentCount,
+           p.Tags,
+           p.LastActivityDate,
+           p.ParentId,
+           p.AcceptedAnswerId,
+           p.LastEditorUserId,
+           p.LastEditDate,
+           p.ContentLicense,
+           CASE WHEN p.OwnerUserId IS NULL THEN 0 ELSE 1 END AS HasOwner
+    FROM Posts p
+    WHERE p.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2' YEAR)
+),
+TagStats AS (
+    SELECT t.TagName,
+           t.Count,
+           t.IsModeratorOnly,
+           t.IsRequired
+    FROM Tags t
+),
+PostRelations AS (
+    SELECT pl.PostId,
+           pl.RelatedPostId,
+           pl.LinkTypeId,
+           ll.Name AS LinkTypeName
+    FROM PostLinks pl
+    JOIN LinkTypes ll ON pl.LinkTypeId = ll.Id
+    WHERE pl.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1' YEAR)
+),
+UserPostRank AS (
+    SELECT up.Id AS UserId,
+           p.Id AS PostId,
+           p.Title,
+           p.Score,
+           p.CreationDate,
+           ROW_NUMBER() OVER (PARTITION BY up.Id ORDER BY p.CreationDate DESC, p.Score DESC) AS PostRank
+    FROM ActiveUsers up
+    JOIN Posts p ON p.OwnerUserId = up.Id
+    WHERE p.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2' YEAR)
+),
+BenchMetrics AS (
+    SELECT
+        rp.Id AS PostId,
+        rp.PostTypeId,
+        rp.OwnerUserId,
+        rp.Title,
+        rp.CreationDate,
+        rp.ViewCount,
+        rp.Score,
+        rp.AnswerCount,
+        rp.CommentCount,
+        rp.Tags,
+        COALESCE(pv.Score, 0) AS PreviousScoreHint,
+        NULLIF(rp.ContentLicense, '') AS License,
+        CASE WHEN rp.AcceptedAnswerId IS NULL THEN 0 ELSE 1 END AS HasAccepted
+    FROM RecentPosts rp
+    LEFT JOIN Posts pv ON pv.Id = rp.ParentId
+),
+ComplexPredicate AS (
+    SELECT
+        bm.PostId,
+        bm.PostTypeId,
+        bm.OwnerUserId,
+        bm.Title,
+        bm.CreationDate,
+        bm.ViewCount,
+        bm.Score,
+        bm.AnswerCount,
+        bm.CommentCount,
+        bm.Tags,
+        bm.PreviousScoreHint,
+        bm.License,
+        bm.HasAccepted,
+        CASE
+            WHEN bm.Score > 0 AND bm.ViewCount > 100 THEN 'Hot'
+            WHEN COALESCE(bm.Score,0) = 0 AND bm.CommentCount > 20 THEN 'Buzz'
+            WHEN bm.Tags IS NOT NULL AND bm.Tags <> '' AND POSITION('<' IN bm.Tags) > 0 THEN 'Tagged'
+            ELSE 'Moderate'
+        END AS BenchmarkLabel,
+        CHAR_LENGTH(bm.Title) AS TitleLength,
+        (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = bm.PostId) AS LinkCount
+    FROM BenchMetrics bm
+),
+Final AS (
+    SELECT
+        cb.PostId,
+        cb.PostTypeId,
+        cb.OwnerUserId AS UserId,
+        u.DisplayName AS UserDisplayName,
+        u.Reputation,
+        u.LastAccessDate,
+        cb.Title,
+        cb.ViewCount,
+        cb.Score,
+        cb.AnswerCount,
+        cb.CommentCount,
+        cb.Tags,
+        cb.BenchmarkLabel,
+        cl.Name AS CloseReasonName,
+        cb.CreationDate
+    FROM ComplexPredicate cb
+    LEFT JOIN Users u ON cb.OwnerUserId = u.Id
+    LEFT JOIN PostHistory ph ON ph.PostId = cb.PostId AND ph.PostHistoryTypeId = 10
+    LEFT JOIN CloseReasonTypes cl ON CAST(JSON_VALUE(ph.Text, '$.CloseReasonId') AS INTEGER) = cl.Id
+)
+SELECT
+    PostId,
+    PostTypeId,
+    UserId,
+    UserDisplayName,
+    Reputation,
+    LastAccessDate,
+    Title,
+    ViewCount,
+    Score,
+    AnswerCount,
+    CommentCount,
+    Tags,
+    BenchmarkLabel,
+    CloseReasonName,
+    CreationDate
+FROM Final
+GROUP BY
+    PostId,
+    PostTypeId,
+    UserId,
+    UserDisplayName,
+    Reputation,
+    LastAccessDate,
+    Title,
+    ViewCount,
+    Score,
+    AnswerCount,
+    CommentCount,
+    Tags,
+    BenchmarkLabel,
+    CloseReasonName,
+    CreationDate
+ORDER BY BenchmarkLabel, Reputation DESC, CreationDate DESC;

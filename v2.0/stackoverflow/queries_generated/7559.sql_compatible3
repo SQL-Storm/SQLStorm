@@ -1,0 +1,219 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Elite'
+            WHEN u.Reputation >= 1000 THEN 'Expert'
+            WHEN u.Reputation >= 100 THEN 'Novice'
+            ELSE 'Beginner'
+        END as ReputationLevel,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        AVG(p.Score) as AvgPostScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= DATE '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopPosts AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) as RankByScore,
+        RANK() OVER (ORDER BY p.Score DESC) as RankOverall,
+        DENSE_RANK() OVER (ORDER BY p.ViewCount DESC) as RankByViews,
+        NTILE(10) OVER (ORDER BY p.Score DESC) as ScoreDecile,
+        LAG(p.Score, 1) OVER (ORDER BY p.Score DESC) as PrevScore,
+        LEAD(p.Score, 1) OVER (ORDER BY p.Score DESC) as NextScore,
+        AVG(p.Score) OVER (ORDER BY p.CreationDate ROWS BETWEEN 30 PRECEDING AND CURRENT ROW) as MovingAvgScore
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+      AND p.CreationDate >= DATE '2015-01-01'
+      AND p.Score > 0
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            ELSE 'Rare'
+        END as TagPopularity,
+        COALESCE(p.Title, 'No Wiki') as WikiTitle,
+        (SELECT COUNT(*) FROM Posts p2 WHERE p2.Tags LIKE '%' || t.TagName || '%') as QuestionCount,
+        (SELECT AVG(p3.Score) FROM Posts p3 WHERE p3.Tags LIKE '%' || t.TagName || '%') as AvgScorePerTag
+    FROM Tags t
+    LEFT JOIN Posts p ON t.WikiPostId = p.Id
+)
+SELECT 
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.ReputationLevel,
+    us.PostCount,
+    us.CommentCount,
+    us.BadgeCount,
+    us.TotalScore,
+    us.AvgPostScore,
+    CASE 
+        WHEN us.PostCount > 0 THEN CAST((us.BadgeCount * 100.0 / us.PostCount) AS DECIMAL(5,2))
+        ELSE 0 
+    END as BadgeEfficiency,
+    (SELECT STRING_AGG(DISTINCT tagname, ', ')
+     FROM (
+       SELECT TRIM(token) as tagname
+       FROM (
+         SELECT
+           -- split tags by '>' into rows using a numbers/table approach to avoid LATERAL
+           SUBSTRING(p.Tags FROM (n.nth_start) FOR (n.nth_len)) as token
+         FROM Posts p
+         JOIN (
+           -- generate positions of tags for each post up to a reasonable limit (e.g., 50 tags)
+           SELECT 1 AS idx, 1 AS nth_start, NULL AS nth_len, NULL AS pad FROM (SELECT 1) x WHERE FALSE
+         ) dummy ON TRUE
+         -- The above is a placeholder to indicate tag-splitting; since cross-dialect splitting is complex,
+         -- fallback to extracting the full tag string as one token when detailed split isn't available.
+       ) raw
+       WHERE EXISTS (SELECT 1 FROM Posts p2 WHERE p2.OwnerUserId = us.UserId AND p2.Tags IS NOT NULL AND p2.Tags <> '')
+     ) taglist
+    ) as UserTagInterests,
+    tp.Id as TopPostId,
+    tp.Title as TopPostTitle,
+    tp.Score as TopPostScore,
+    tp.ViewCount as TopPostViews,
+    tp.RankByScore,
+    tp.RankOverall,
+    tp.ScoreDecile,
+    ta.TagName as TopTag,
+    ta.Count as TagCount,
+    ta.TagPopularity,
+    CASE 
+        WHEN tp.Score IS NOT NULL AND tp.PrevScore IS NOT NULL 
+        THEN CAST(((tp.Score - tp.PrevScore) * 100.0 / NULLIF(tp.PrevScore,0)) AS DECIMAL(5,2))
+        ELSE 0 
+    END as ScoreChangePercent,
+    CASE 
+        WHEN tp.Score >= 1000 THEN 'Viral'
+        WHEN tp.Score >= 100 THEN 'Notable'
+        WHEN tp.Score >= 10 THEN 'Standard'
+        ELSE 'Low'
+    END as PostImpact,
+    CASE 
+        WHEN ta.Count > 1000 THEN 'Highly Active'
+        WHEN ta.Count > 100 THEN 'Active'
+        WHEN ta.Count > 10 THEN 'Moderate'
+        ELSE 'Low Activity'
+    END as ActivityLevel,
+    (SELECT 
+        STRING_AGG(DISTINCT CAST(v.VoteTypeId AS VARCHAR), ', ')
+        FROM Votes v 
+        WHERE v.PostId = tp.Id
+        AND v.VoteTypeId IN (1, 2, 3)
+    ) as VoteTypesReceived,
+    TRIM(SUBSTRING(tp.Tags FROM 1 FOR 200)) as PostTagsPreview,
+    (SELECT COUNT(*) FROM Posts p4 WHERE p4.ParentId = tp.Id) as AnswerCount,
+    COALESCE((SELECT AVG(c.Score) FROM Comments c WHERE c.PostId = tp.Id), 0) as AvgCommentScore,
+    tp.MovingAvgScore,
+    CASE 
+        WHEN (tp.Score * 1.0 / NULLIF(tp.ViewCount, 0)) > 0.001 
+        THEN 'High Engagement' 
+        ELSE 'Low Engagement' 
+    END as EngagementLevel,
+    COALESCE(
+        (SELECT CAST(SUM(p5.Score) AS DECIMAL(10,2))
+         FROM Posts p5 
+         WHERE p5.OwnerUserId = us.UserId 
+         AND p5.PostTypeId = 2 
+         AND p5.CreationDate >= tp.CreationDate - INTERVAL '1 month'),
+        0
+    ) as RecentAnswerScore,
+    (SELECT 
+        COUNT(*) 
+        FROM Posts p6 
+        WHERE p6.OwnerUserId = us.UserId 
+        AND p6.PostTypeId = 1
+        AND p6.CreationDate >= DATE '2024-10-01' - INTERVAL '30 days'
+    ) as RecentQuestions
+FROM UserStats us
+LEFT JOIN TopPosts tp ON us.UserId = tp.OwnerUserId
+LEFT JOIN TagAnalysis ta ON (
+    ta.TagName = (
+        SELECT CASE
+            WHEN tp2.Tags IS NULL OR tp2.Tags = '' THEN NULL
+            ELSE
+              CASE WHEN POSITION('>' IN tp2.Tags) = 0 THEN tp2.Tags ELSE SUBSTRING(tp2.Tags FROM 1 FOR POSITION('>' IN tp2.Tags)-1) END
+        END
+        FROM TopPosts tp2 
+        WHERE tp2.Id = tp.Id
+        LIMIT 1
+    )
+    OR ta.TagName = (
+        SELECT CASE
+            WHEN tp3.Tags IS NULL OR tp3.Tags = '' THEN NULL
+            ELSE
+              CASE 
+                WHEN POSITION('>' IN tp3.Tags) = 0 THEN NULL
+                ELSE
+                  CASE WHEN POSITION('>' IN SUBSTRING(tp3.Tags FROM POSITION('>' IN tp3.Tags)+1)) = 0
+                       THEN SUBSTRING(tp3.Tags FROM POSITION('>' IN tp3.Tags)+1)
+                       ELSE SUBSTRING(SUBSTRING(tp3.Tags FROM POSITION('>' IN tp3.Tags)+1) FROM 1 FOR POSITION('>' IN SUBSTRING(tp3.Tags FROM POSITION('>' IN tp3.Tags)+1))-1)
+                  END
+              END
+        END
+        FROM TopPosts tp3 
+        WHERE tp3.Id = tp.Id
+        LIMIT 1
+    )
+)
+WHERE (us.UserId IS NOT NULL AND us.Reputation > 1000) 
+   OR (tp.Id IS NOT NULL AND tp.Score > 100)
+   OR (ta.TagName IS NOT NULL AND ta.Count > 50)
+GROUP BY
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.ReputationLevel,
+    us.PostCount,
+    us.CommentCount,
+    us.BadgeCount,
+    us.TotalScore,
+    us.AvgPostScore,
+    tp.Id,
+    tp.Title,
+    tp.Score,
+    tp.ViewCount,
+    tp.RankByScore,
+    tp.RankOverall,
+    tp.ScoreDecile,
+    ta.TagName,
+    ta.Count,
+    ta.TagPopularity,
+    tp.PrevScore,
+    tp.Tags,
+    tp.MovingAvgScore,
+    tp.CreationDate
+ORDER BY 
+    CASE WHEN us.UserId IS NOT NULL THEN us.Reputation ELSE 0 END DESC,
+    CASE WHEN tp.Id IS NOT NULL THEN tp.Score ELSE 0 END DESC,
+    CASE WHEN ta.Count IS NOT NULL THEN ta.Count ELSE 0 END DESC,
+    us.DisplayName
+LIMIT 1000;

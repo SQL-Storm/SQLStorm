@@ -1,0 +1,292 @@
+-- {"query": "1766.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3816} 
+
+WITH QuestionDetails AS (
+    -- Base CTE: Selects core information for all 'Question' posts
+    -- Calculates initial metrics and categorizes post status
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId AS AuthorId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount, -- Denormalized count from Posts table
+        P.CommentCount AS PostsTableCommentCount, -- Denormalized count from Posts table
+        P.FavoriteCount,
+        P.Title,
+        P.Tags,
+        P.Body,
+        P.LastEditDate,
+        P.ClosedDate,
+        P.CommunityOwnedDate,
+        U.DisplayName AS AuthorDisplayName,
+        U.Reputation AS AuthorReputation,
+        U.CreationDate AS AuthorCreationDate,
+        U.Location AS AuthorLocation,
+        EXTRACT(EPOCH FROM (NOW() - P.CreationDate)) / 86400 AS PostAgeDays, -- Age of post in days
+        LENGTH(P.Body) AS BodyLength,
+        LENGTH(P.Title) AS TitleLength,
+        CASE
+            WHEN P.ClosedDate IS NOT NULL AND P.CommunityOwnedDate IS NULL THEN 'Closed'
+            WHEN P.CommunityOwnedDate IS NOT NULL THEN 'Community Wiki'
+            ELSE 'Open'
+        END AS PostStatusCategory
+    FROM Posts P
+    INNER JOIN Users U ON P.OwnerUserId = U.Id
+    WHERE P.PostTypeId = 1 -- Only questions
+),
+AnswerSummary AS (
+    -- CTE: Summarizes answers related to each question
+    -- Includes total answers, scores, and accepted answer count
+    SELECT
+        Q.PostId,
+        COUNT(A.Id) AS TotalAnswersActual, -- Actual count of answers from Posts (type 2)
+        SUM(A.Score) AS TotalAnswerScore,
+        AVG(A.Score) AS AverageAnswerScore,
+        SUM(CASE WHEN Q.AcceptedAnswerId = A.Id THEN 1 ELSE 0 END) AS AcceptedAnswerCount,
+        MAX(A.CreationDate) AS LatestAnswerDate
+    FROM QuestionDetails Q
+    LEFT JOIN Posts A ON A.ParentId = Q.PostId AND A.PostTypeId = 2 -- Answers linked to questions
+    GROUP BY Q.PostId
+),
+PostModerationHistory AS (
+    -- CTE: Aggregates moderation events for each post
+    -- Counts specific history types related to closing, reopening, deleting, protecting, and migration
+    SELECT
+        PH.PostId,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId = 10 THEN 'Closed' END) AS CloseEvents,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId = 11 THEN 'Reopened' END) AS ReopenEvents,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId = 12 THEN 'Deleted' END) AS DeleteEvents,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId = 19 THEN 'Protected' END) AS ProtectEvents,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (17, 35, 36) THEN 'Migrated' END) AS MigrationEvents,
+        MAX(PH.CreationDate) AS LastModerationActionDate
+    FROM PostHistory PH
+    WHERE PH.PostHistoryTypeId IN (10, 11, 12, 19, 17, 35, 36)
+    GROUP BY PH.PostId
+),
+UserBadgeAchievements AS (
+    -- CTE: Counts different classes of badges for each user
+    SELECT
+        B.UserId,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(B.Date) AS LatestBadgeDate
+    FROM Badges B
+    GROUP BY B.UserId
+),
+UserVoteBehavior AS (
+    -- CTE: Summarizes votes cast by each user
+    -- Distinguishes between UpVotes, DownVotes, and Favorites given
+    SELECT
+        U.Id AS UserId,
+        COUNT(V.Id) AS TotalVotesGiven,
+        COUNT(CASE WHEN V.VoteTypeId = 2 THEN V.Id END) AS UpVotesGiven,
+        COUNT(CASE WHEN V.VoteTypeId = 3 THEN V.Id END) AS DownVotesGiven,
+        COUNT(CASE WHEN V.VoteTypeId = 5 THEN V.Id END) AS FavoritesGiven
+    FROM Users U
+    LEFT JOIN Votes V ON U.Id = V.UserId
+    GROUP BY U.Id
+),
+QuestionCommentEngagement AS (
+    -- CTE: Aggregates actual comment data for questions
+    -- Includes total comments, average score, and distinct commenters
+    SELECT
+        C.PostId,
+        COUNT(C.Id) AS TotalCommentsActual, -- Actual count of comments from Comments table
+        AVG(C.Score) AS AvgCommentScore,
+        MAX(C.CreationDate) AS LatestCommentDate,
+        COUNT(DISTINCT C.UserId) AS DistinctCommenters
+    FROM Comments C
+    WHERE C.PostId IN (SELECT PostId FROM QuestionDetails) -- Optimize by only considering comments for questions
+    GROUP BY C.PostId
+),
+DerivedQuestionMetrics AS (
+    -- CTE: Joins all previous CTEs and calculates more complex derived metrics
+    -- Includes correlated subqueries for early vote scores and linked questions, and counts higher-rep users
+    SELECT
+        QD.PostId,
+        QD.AuthorId,
+        QD.PostCreationDate,
+        QD.PostScore,
+        QD.ViewCount,
+        QD.AnswerCount AS PostsTableAnswerCount,
+        QD.PostsTableCommentCount,
+        QD.FavoriteCount,
+        QD.Title,
+        QD.Tags,
+        QD.BodyLength,
+        QD.PostStatusCategory,
+        ASum.TotalAnswersActual,
+        ASum.TotalAnswerScore,
+        ASum.AverageAnswerScore,
+        ASum.AcceptedAnswerCount,
+        PMod.CloseEvents,
+        PMod.ReopenEvents,
+        PMod.DeleteEvents,
+        PMod.ProtectEvents,
+        PMod.MigrationEvents,
+        UB.GoldBadges,
+        UB.SilverBadges,
+        UB.BronzeBadges,
+        UV.TotalVotesGiven,
+        UV.UpVotesGiven,
+        UV.DownVotesGiven,
+        QCE.TotalCommentsActual,
+        QCE.AvgCommentScore,
+        QCE.DistinctCommenters,
+        QD.AuthorDisplayName,
+        QD.AuthorReputation,
+        QD.AuthorLocation,
+        QD.PostAgeDays,
+        (
+            -- Correlated subquery: Calculates average vote score within 7 days of post creation
+            SELECT AVG(V_inner.Score)
+            FROM Votes V_inner
+            WHERE V_inner.PostId = QD.PostId AND V_inner.VoteTypeId IN (2, 3) -- UpMod, DownMod
+            AND V_inner.CreationDate BETWEEN QD.PostCreationDate AND QD.PostCreationDate + INTERVAL '7 days'
+        ) AS AvgEarlyWeekVoteScore,
+        CASE
+            WHEN QD.Tags LIKE '%<sql>%' OR QD.Tags LIKE '%<database>%' OR QD.Tags LIKE '%<postgresql>%' OR QD.Tags LIKE '%<mysql>%' THEN 'SQL/DB Related'
+            WHEN QD.Tags LIKE '%<javascript>%' OR QD.Tags LIKE '%<python>%' OR QD.Tags LIKE '%<java>%' OR QD.Tags LIKE '%<c#>%<' THEN 'Programming Language'
+            WHEN QD.Tags LIKE '%<html>%' OR QD.Tags LIKE '%<css>%' OR QD.Tags LIKE '%<frontend>%' THEN 'Web Frontend'
+            ELSE 'Other Tech/General'
+        END AS TagCategory,
+        (
+            -- Correlated subquery: Counts linked questions created around the same time
+            SELECT COUNT(DISTINCT PL.RelatedPostId)
+            FROM PostLinks PL
+            WHERE PL.PostId = QD.PostId AND PL.LinkTypeId = 1 -- Linked (PostId contains link to RelatedPostId)
+            AND PL.CreationDate BETWEEN QD.PostCreationDate - INTERVAL '1 day' AND QD.PostCreationDate + INTERVAL '1 day'
+        ) AS LinkedQuestionCount,
+        (
+            -- Correlated subquery: Counts users in the same location with higher reputation who joined earlier
+            SELECT COUNT(DISTINCT U_inner.Id)
+            FROM Users U_inner
+            WHERE U_inner.Location = QD.AuthorLocation AND U_inner.Reputation > QD.AuthorReputation
+            AND U_inner.CreationDate < QD.AuthorCreationDate
+        ) AS HigherRepUsersInLocationEarlier
+    FROM QuestionDetails QD
+    LEFT JOIN AnswerSummary ASum ON QD.PostId = ASum.PostId
+    LEFT JOIN PostModerationHistory PMod ON QD.PostId = PMod.PostId
+    LEFT JOIN UserBadgeAchievements UB ON QD.AuthorId = UB.UserId
+    LEFT JOIN UserVoteBehavior UV ON QD.AuthorId = UV.UserId
+    LEFT JOIN QuestionCommentEngagement QCE ON QD.PostId = QCE.PostId
+),
+FinalMetrics AS (
+    -- CTE: Applies window functions and final complex calculations/predicates
+    SELECT
+        DQM.PostId,
+        DQM.AuthorId,
+        DQM.AuthorDisplayName,
+        DQM.AuthorReputation,
+        DQM.PostCreationDate,
+        DQM.Title,
+        COALESCE(DQM.Tags, '[no-tags]') AS Tags, -- NULL handling for tags
+        SUBSTRING(DQM.Title, 1, 75) || CASE WHEN LENGTH(DQM.Title) > 75 THEN '...' ELSE '' END AS ShortenedTitle, -- String expression
+        DQM.PostStatusCategory,
+        DQM.PostScore,
+        DQM.ViewCount,
+        DQM.FavoriteCount,
+        DQM.BodyLength,
+        COALESCE(DQM.TotalAnswersActual, 0) AS ActualTotalAnswers,
+        COALESCE(DQM.AverageAnswerScore, 0.0) AS ActualAverageAnswerScore,
+        COALESCE(DQM.TotalCommentsActual, 0) AS ActualTotalComments,
+        COALESCE(DQM.CloseEvents, 0) AS TotalCloseEvents,
+        COALESCE(DQM.ReopenEvents, 0) AS TotalReopenEvents,
+        COALESCE(DQM.MigrationEvents, 0) AS TotalMigrationEvents,
+        COALESCE(DQM.GoldBadges, 0) AS AuthorGoldBadges,
+        COALESCE(DQM.UpVotesGiven, 0) AS AuthorUpVotesGiven,
+        COALESCE(DQM.DownVotesGiven, 0) AS AuthorDownVotesGiven,
+        DQM.AvgEarlyWeekVoteScore,
+        DQM.TagCategory,
+        DQM.LinkedQuestionCount,
+        DQM.HigherRepUsersInLocationEarlier,
+        -- Complex calculation for post popularity index
+        (DQM.PostScore * 0.5 + DQM.ViewCount * 0.05 + COALESCE(DQM.FavoriteCount, 0) * 0.45 + COALESCE(DQM.TotalAnswersActual, 0) * 0.1) AS CalculatedPostPopularityIndex,
+        -- Window functions for ranking, rolling averages, and sequential analysis
+        RANK() OVER (PARTITION BY DQM.AuthorLocation ORDER BY DQM.AuthorReputation DESC, DQM.PostCreationDate ASC) AS AuthorReputationRankInLocation,
+        AVG(DQM.PostScore) OVER (PARTITION BY DQM.AuthorId ORDER BY DQM.PostCreationDate ASC RANGE BETWEEN INTERVAL '30 days' PRECEDING AND CURRENT ROW) AS AvgRollingAuthorScoreLast30Days,
+        FIRST_VALUE(DQM.Title) OVER (PARTITION BY DQM.AuthorId ORDER BY DQM.PostCreationDate ASC) AS FirstQuestionByAuthor,
+        COUNT(DQM.PostId) OVER (PARTITION BY DQM.AuthorId) AS TotalQuestionsByAuthor,
+        LAG(DQM.PostCreationDate, 1, DQM.AuthorCreationDate) OVER (PARTITION BY DQM.AuthorId ORDER BY DQM.PostCreationDate ASC) AS PreviousPostCreationDate,
+        LEAD(DQM.PostCreationDate, 1, DQM.PostCreationDate) OVER (PARTITION BY DQM.AuthorId ORDER BY DQM.PostCreationDate ASC) AS NextPostCreationDate,
+        -- Complex calculation using NULLs and division by zero prevention
+        COALESCE(CAST(DQM.UpVotesGiven AS NUMERIC) / NULLIF(DQM.TotalVotesGiven, 0), 0.0) AS AuthorUpVoteRatio,
+        COALESCE(CAST(DQM.TotalAnswersActual AS NUMERIC) / NULLIF(DQM.PostAgeDays, 0), 0.0) AS AnswersPerDayRatio,
+        CASE
+            WHEN DQM.PostStatusCategory = 'Closed' AND DQM.TotalReopenEvents > 0 THEN 'Closed & Reopened'
+            WHEN DQM.PostStatusCategory = 'Closed' THEN 'Closed'
+            WHEN DQM.PostStatusCategory = 'Community Wiki' THEN 'Community Wiki'
+            ELSE 'Active'
+        END AS RefinedPostLifecycleState
+    FROM DerivedQuestionMetrics DQM
+    WHERE DQM.PostAgeDays > 30 -- Filter for questions older than 30 days
+      AND DQM.AuthorReputation >= 500 -- Minimum author reputation
+      AND DQM.BodyLength BETWEEN 100 AND 5000 -- Reasonable body length
+)
+-- Main Query Part 1: Selects highly popular, active questions by high-reputation authors
+-- Uses a combination of filtering and sorting for specific insights
+SELECT
+    FM.PostId,
+    FM.AuthorId,
+    FM.AuthorDisplayName,
+    FM.AuthorReputation,
+    FM.PostCreationDate,
+    FM.ShortenedTitle,
+    FM.Tags,
+    FM.RefinedPostLifecycleState,
+    FM.CalculatedPostPopularityIndex,
+    FM.ActualTotalAnswers,
+    FM.AvgEarlyWeekVoteScore,
+    FM.TagCategory,
+    FM.AuthorReputationRankInLocation,
+    FM.AvgRollingAuthorScoreLast30Days,
+    FM.TotalQuestionsByAuthor,
+    FM.AuthorUpVoteRatio,
+    FM.AnswersPerDayRatio
+FROM FinalMetrics FM
+WHERE
+    FM.TagCategory IN ('SQL/DB Related', 'Programming Language') -- Focus on specific tech categories
+    AND FM.CalculatedPostPopularityIndex > 100 -- High popularity
+    AND FM.TotalCloseEvents = 0 -- Not closed
+    AND FM.AuthorUpVoteRatio > 0.7 -- Authors with high upvote ratio
+    AND FM.HigherRepUsersInLocationEarlier < 1000 -- Author is relatively high rep in their location compared to older users
+ORDER BY
+    FM.CalculatedPostPopularityIndex DESC,
+    FM.PostCreationDate DESC
+LIMIT 250
+
+UNION ALL -- Set operator: Combines results from two different analytical criteria
+
+-- Main Query Part 2: Selects older, initially problematic questions that were closed but later reopened
+-- Focuses on less common tag categories and low initial engagement
+SELECT
+    FM.PostId,
+    FM.AuthorId,
+    FM.AuthorDisplayName,
+    FM.AuthorReputation,
+    FM.PostCreationDate,
+    FM.ShortenedTitle,
+    FM.Tags,
+    FM.RefinedPostLifecycleState,
+    FM.CalculatedPostPopularityIndex,
+    FM.ActualTotalAnswers,
+    FM.AvgEarlyWeekVoteScore,
+    FM.TagCategory,
+    FM.AuthorReputationRankInLocation,
+    FM.AvgRollingAuthorScoreLast30Days,
+    FM.TotalQuestionsByAuthor,
+    FM.AuthorUpVoteRatio,
+    FM.AnswersPerDayRatio
+FROM FinalMetrics FM
+WHERE
+    FM.PostStatusCategory = 'Closed' -- Look at closed questions
+    AND FM.TotalReopenEvents > 0 -- ... that were subsequently reopened
+    AND FM.TagCategory = 'Other Tech/General' -- Less common tags
+    AND FM.AvgEarlyWeekVoteScore IS NOT NULL AND FM.AvgEarlyWeekVoteScore < 0 -- Questions that started badly (negative early votes)
+    AND FM.AnswersPerDayRatio < 0.1 -- Low answer activity
+    AND FM.PostAgeDays > 365 -- Older reopened questions
+ORDER BY
+    FM.TotalReopenEvents DESC,
+    FM.PostCreationDate ASC
+LIMIT 100;

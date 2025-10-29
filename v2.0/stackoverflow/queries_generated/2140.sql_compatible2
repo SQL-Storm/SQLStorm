@@ -1,0 +1,161 @@
+with recursive RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        array[array[t.Id]] as Path
+    from Tags t
+    union all
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        r.Path || t2.Id
+    from RecursiveTagHierarchy r
+    join Tags t2 on t2.Id = r.Id + 1
+    where not t2.Id = any(r.Path)
+), 
+QuestionsWithAcceptedAnswers as (
+    select
+        p.Id as QuestionId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.AcceptedAnswerId,
+        u.DisplayName as OwnerName,
+        u.Reputation as OwnerReputation,
+        coalesce(json_agg(
+            json_build_object(
+                'AnswerId', a.Id,
+                'Score', a.Score,
+                'OwnerName', au.DisplayName,
+                'OwnerReputation', au.Reputation,
+                'Rank', rn.AnsRank
+            ) order by rn.AnsRank
+        ) filter (where a.Id is not null), '[]') as AnswersData
+    from Posts p
+    left join Posts a on a.ParentId = p.Id and a.PostTypeId = 2
+    left join Users u on u.Id = p.OwnerUserId
+    left join Users au on au.Id = a.OwnerUserId
+    left join (
+        select
+            a2.ParentId as QuestionId,
+            a2.Id as AnswerId,
+            row_number() over (partition by a2.ParentId order by a2.Score desc) as AnsRank
+        from Posts a2
+        where a2.PostTypeId = 2
+    ) rn on rn.QuestionId = p.Id and rn.AnswerId = a.Id
+    where p.PostTypeId = 1
+    group by p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.Tags, p.AcceptedAnswerId, u.DisplayName, u.Reputation
+),
+UserBadgeCounts as (
+    select
+        UserId,
+        sum(case when Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when Class = 3 then 1 else 0 end) as BronzeBadges
+    from Badges
+    group by UserId
+),
+VotesSummary as (
+    select
+        v.PostId,
+        sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+        sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes,
+        sum(case when vt.Name = 'Favorite' then 1 else 0 end) as FavoriteVotes,
+        count(*) as TotalVotes
+    from Votes v
+    join VoteTypes vt on vt.Id = v.VoteTypeId
+    group by v.PostId
+),
+PostsWithVotes as (
+    select
+        p.*,
+        vs.UpVotes,
+        vs.DownVotes,
+        vs.FavoriteVotes,
+        vs.TotalVotes
+    from Posts p
+    left join VotesSummary vs on vs.PostId = p.Id
+),
+CommentsWindow as (
+    select
+        c.PostId,
+        c.Id as CommentId,
+        c.Score as CommentScore,
+        c.Text as CommentText,
+        c.UserId as CommentUserId,
+        c.CreationDate as CommentDate,
+        row_number() over (partition by c.PostId order by c.Score desc, c.CreationDate asc) as CommentRank
+    from Comments c
+),
+TopComments as (
+    select * from CommentsWindow where CommentRank <= 3
+),
+DuplicateLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        p.Title as RelatedTitle
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId and lt.Name = 'Duplicate'
+    join Posts p on p.Id = pl.RelatedPostId
+),
+PostCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReasonName,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    join PostHistoryTypes pht on pht.Id = ph.PostHistoryTypeId and pht.Name = 'Post Closed'
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+),
+FinalSelection as (
+    select
+        q.QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.Tags,
+        q.AcceptedAnswerId,
+        q.OwnerName,
+        coalesce(ub.GoldBadges, 0) as GoldBadges,
+        coalesce(ub.SilverBadges, 0) as SilverBadges,
+        coalesce(ub.BronzeBadges, 0) as BronzeBadges,
+        pwv.UpVotes,
+        pwv.DownVotes,
+        pwv.FavoriteVotes,
+        pwv.TotalVotes,
+        array_agg(distinct dl.RelatedTitle) filter (where dl.RelatedTitle is not null) as DuplicateTitles,
+        array_agg(json_build_object(
+            'CommentId', tc.CommentId,
+            'Score', tc.CommentScore,
+            'Text', tc.CommentText,
+            'UserId', tc.CommentUserId,
+            'Date', tc.CommentDate
+        )) filter (where tc.CommentId is not null) as TopComments,
+        pcr.CloseReasonName,
+        pcr.CloseDate,
+        array_length(string_to_array(trim(both '<>' from q.Tags), '><'), 1) as TagCount,
+        rank() over (partition by extract(year from q.CreationDate) order by q.Score desc) as YearlyScoreRank,
+        case when q.AcceptedAnswerId is null then 'No Accepted Answer' else 'Has Accepted Answer' end as AcceptedAnswerStatus
+    from QuestionsWithAcceptedAnswers q
+    left join Users u on u.DisplayName = q.OwnerName
+    left join UserBadgeCounts ub on ub.UserId = (select Id from Users where DisplayName = q.OwnerName limit 1)
+    left join PostsWithVotes pwv on pwv.Id = q.QuestionId
+    left join DuplicateLinks dl on dl.PostId = q.QuestionId
+    left join TopComments tc on tc.PostId = q.QuestionId
+    left join PostCloseReasons pcr on pcr.PostId = q.QuestionId
+    group by q.QuestionId, q.Title, q.CreationDate, q.Score, q.ViewCount, q.Tags, q.AcceptedAnswerId, q.OwnerName, ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges, pwv.UpVotes, pwv.DownVotes, pwv.FavoriteVotes, pwv.TotalVotes, pcr.CloseReasonName, pcr.CloseDate, q.Score, q.CreationDate, q.AcceptedAnswerId
+)
+select *
+from FinalSelection
+where 
+    (GoldBadges + SilverBadges + BronzeBadges) >= 2
+    and (CloseReasonName is null or CloseReasonName = 'Exact Duplicate' or CloseReasonName = 'Duplicate')
+    and TagCount >= 2
+order by YearlyScoreRank
+limit 50;

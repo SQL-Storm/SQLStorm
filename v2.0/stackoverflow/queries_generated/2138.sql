@@ -1,0 +1,128 @@
+-- {"query": "2138.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1124} 
+with RecursiveUserBadgeCounts as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    count(distinct b.Id) filter (where b.Class = 1) as GoldBadges,
+    count(distinct b.Id) filter (where b.Class = 2) as SilverBadges,
+    count(distinct b.Id) filter (where b.Class = 3) as BronzeBadges
+  from Users u
+  left join Badges b on b.UserId = u.Id
+  group by u.Id, u.DisplayName
+),
+TopContributors as (
+  select
+    u.UserId,
+    u.DisplayName,
+    u.GoldBadges,
+    u.SilverBadges,
+    u.BronzeBadges,
+    coalesce(p.TotalPosts, 0) as TotalPosts,
+    coalesce(p.TotalScore, 0) as TotalScore,
+    row_number() over (order by coalesce(p.TotalScore, 0) desc) as Rank
+  from RecursiveUserBadgeCounts u
+  left join (
+    select
+      OwnerUserId,
+      count(*) as TotalPosts,
+      sum(Score) as TotalScore
+    from Posts
+    where OwnerUserId is not null
+    group by OwnerUserId
+  ) p on p.OwnerUserId = u.UserId
+),
+RecentAnswersWindow as (
+  select
+    a.Id as AnswerId,
+    a.ParentId as QuestionId,
+    a.Score as AnswerScore,
+    a.CreationDate as AnswerCreationDate,
+    q.Title as QuestionTitle,
+    q.Tags as QuestionTags,
+    row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank
+  from Posts a
+  inner join Posts q on q.Id = a.ParentId and q.PostTypeId = 1
+  where a.PostTypeId = 2
+),
+BestRecentAnswers as (
+  select *
+  from RecentAnswersWindow
+  where AnswerRank <= 3
+),
+PostsWithCloseInfo as (
+  select p.Id as PostId, p.Title, p.PostTypeId, p.CreationDate, p.ClosedDate,
+    cr.Name as CloseReason,
+    ph.ClosingUser,
+    ph.ClosingDate
+  from Posts p
+  left join (
+    select ph.PostId,
+      max(ph.CreationDate) as ClosingDate,
+      u.DisplayName as ClosingUser,
+      crt.Name
+    from PostHistory ph
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    left join Users u on u.Id = ph.UserId
+    where ph.PostHistoryTypeId = 10 -- Post Closed
+    group by ph.PostId, u.DisplayName, crt.Name
+  ) ph on ph.PostId = p.Id
+  left join CloseReasonTypes cr on cr.Name = ph.Name
+)
+select
+  tc.Rank,
+  tc.DisplayName,
+  concat(tc.GoldBadges, 'G / ', tc.SilverBadges, 'S / ', tc.BronzeBadges, 'B') as BadgeSummary,
+  tc.TotalPosts,
+  tc.TotalScore,
+  pwi.PostId as ClosedPostId,
+  pwi.Title as ClosedPostTitle,
+  pwi.CloseReason,
+  pwi.ClosingUser,
+  pwi.ClosingDate,
+  bra.AnswerId,
+  bra.AnswerScore,
+  bra.AnswerCreationDate,
+  bra.QuestionTitle,
+  bra.QuestionTags,
+  -- Calculate length difference in tags string length and number of tags
+  length(coalesce(bra.QuestionTags, '')) as TagsLength,
+  array_length(string_to_array(substring(bra.QuestionTags from 2 for length(bra.QuestionTags)-2), '><'), 1) as NumberOfTags,
+  -- Example of complicated expression: score to age ratio for answers
+  round(cast(bra.AnswerScore as numeric) / greatest(EXTRACT(EPOCH FROM (now() - bra.AnswerCreationDate)) / 86400, 1), 4) as ScorePerDay,
+  CASE
+    WHEN pwi.PostId IS NULL THEN 'Open'
+    WHEN pwi.CloseReason IS NULL THEN 'Closed (unknown reason)'
+    ELSE pwi.CloseReason
+  END as CloseStatus
+from TopContributors tc
+left join PostsWithCloseInfo pwi on pwi.PostId = (
+  select p.Id from Posts p
+  where p.OwnerUserId = tc.UserId and p.PostTypeId = 1 and p.ClosedDate is not null
+  order by p.ClosedDate desc nulls last limit 1
+)
+left join BestRecentAnswers bra on bra.AnswerId = (
+  select Id from Posts p2
+  where p2.OwnerUserId = tc.UserId and p2.PostTypeId = 2
+  order by p2.Score desc, p2.CreationDate asc
+  limit 1
+)
+where tc.TotalPosts > 20
+union
+select
+  9999 as Rank,
+  'Community' as DisplayName,
+  '0G / 0S / 0B' as BadgeSummary,
+  0,
+  0,
+  null,
+  null,
+  null,
+  null,
+  null,
+  null,
+  null,
+  null,
+  null,
+  'Special user record'
+order by Rank, TotalScore desc
+limit 100;

@@ -1,0 +1,320 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.ViewCount,
+        u.UpVotes,
+        u.DownVotes,
+        u.CreationDate,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Elite'
+            WHEN u.Reputation > 1000 THEN 'Veteran'
+            WHEN u.Reputation > 100 THEN 'Regular'
+            ELSE 'Newbie'
+        END AS ReputationTier,
+        COALESCE(SUM(p.Score), 0) AS TotalScore,
+        COALESCE(SUM(p.ViewCount), 0) AS TotalViews,
+        ROW_NUMBER() OVER (PARTITION BY u.Reputation ORDER BY u.CreationDate) AS ReputationRank,
+        LAG(u.Reputation, 1) OVER (ORDER BY u.CreationDate) AS PrevReputation
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.ViewCount, u.UpVotes, u.DownVotes, u.CreationDate
+),
+TopPosts AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.ParentId,
+        p.PostTypeId,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            WHEN p.PostTypeId = 4 THEN 'TagWikiExcerpt'
+            WHEN p.PostTypeId = 5 THEN 'TagWiki'
+            ELSE 'Other'
+        END AS PostType,
+        LEAD(p.Score, 1) OVER (ORDER BY p.Score DESC) AS NextHigherScore,
+        NTILE(100) OVER (ORDER BY p.Score DESC) AS ScorePercentile,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) AS ScoreRank,
+        AVG(p.Score) OVER (PARTITION BY p.PostTypeId) AS AvgScoreByType,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) AS OwnerPostCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS RecentPostRank
+    FROM Posts p
+    WHERE p.Score > 0 AND p.CreationDate >= DATE '2019-01-01'
+),
+UserPostActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS ActivePostCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        SUM(CASE WHEN p.Score > 0 THEN p.Score ELSE 0 END) AS PositiveScore,
+        AVG(CASE WHEN p.Score > 0 THEN p.Score ELSE NULL END) AS AvgPositiveScore,
+        COUNT(DISTINCT CASE WHEN p.CommentCount > 0 THEN p.Id END) AS CommentedPosts,
+        COUNT(DISTINCT CASE WHEN p.AnswerCount > 0 AND p.PostTypeId = 1 THEN p.Id END) AS AnsweredQuestions,
+        STRING_AGG(COALESCE(p.Tags, ''), ' | ') AS AllTags,
+        MAX(p.CreationDate) AS LastActivity
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.CreationDate >= DATE '2020-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+ComplexFilter AS (
+    SELECT 
+        UP.UserId,
+        UP.DisplayName,
+        UP.Reputation,
+        UP.PostCount,
+        UP.CommentCount,
+        UP.BadgeCount,
+        UP.ReputationTier,
+        UP.TotalScore,
+        UP.TotalViews,
+        UP.ReputationRank,
+        UP.PrevReputation,
+        T.PostId,
+        T.Title,
+        T.Score,
+        T.ViewCount,
+        T.CreationDate,
+        T.ParentId,
+        T.PostType,
+        T.ScorePercentile,
+        T.ScoreRank,
+        T.AvgScoreByType,
+        T.OwnerPostCount,
+        T.RecentPostRank,
+        CASE 
+            WHEN T.Score > (SELECT AVG(p2.Score) FROM Posts p2 WHERE p2.PostTypeId = 1) THEN 'High'
+            WHEN T.Score > (SELECT AVG(p2.Score) FROM Posts p2 WHERE p2.PostTypeId = 1) * 0.7 THEN 'Medium'
+            ELSE 'Low'
+        END AS ScoreCategory,
+        CASE 
+            WHEN T.PostType = 'Question' AND T.AnswerCount > 0 THEN 'Answered'
+            WHEN T.PostType = 'Question' THEN 'Unanswered'
+            WHEN T.PostType = 'Answer' THEN 'Answer'
+            ELSE 'Other'
+        END AS QuestionStatus,
+        CASE 
+            WHEN T.ViewCount > 1000 THEN 'Popular'
+            WHEN T.ViewCount > 500 THEN 'Moderate'
+            ELSE 'Low'
+        END AS Popularity,
+        COALESCE(
+            (SELECT COUNT(*) FROM Votes v WHERE v.PostId = T.PostId AND v.VoteTypeId = 2),
+            0
+        ) AS Upvotes,
+        COALESCE(
+            (SELECT COUNT(*) FROM Votes v WHERE v.PostId = T.PostId AND v.VoteTypeId = 3),
+            0
+        ) AS Downvotes,
+        COALESCE(
+            (SELECT COUNT(*) FROM Comments c WHERE c.PostId = T.PostId),
+            0
+        ) AS CommentCountForPost,
+        CASE 
+            WHEN T.RecentPostRank = 1 THEN 'Most Recent'
+            WHEN T.RecentPostRank BETWEEN 2 AND 5 THEN 'Recently Active'
+            ELSE 'Inactive'
+        END AS RecencyStatus
+    FROM UserStats UP
+    INNER JOIN TopPosts T ON UP.UserId = T.OwnerUserId
+    WHERE 
+        (UP.Reputation > 1000 OR UP.PostCount > 50) 
+        AND T.Score > 50
+        AND T.PostType IN ('Question', 'Answer')
+),
+FinalAnalysis AS (
+    SELECT 
+        CF.UserId,
+        CF.DisplayName,
+        CF.Reputation,
+        CF.PostCount,
+        CF.CommentCount,
+        CF.BadgeCount,
+        CF.ReputationTier,
+        CF.TotalScore,
+        CF.TotalViews,
+        CF.ReputationRank,
+        CF.PrevReputation,
+        CF.PostId,
+        CF.Title,
+        CF.Score,
+        CF.ViewCount,
+        CF.CreationDate,
+        CF.ParentId,
+        CF.PostType,
+        CF.ScorePercentile,
+        CF.ScoreRank,
+        CF.AvgScoreByType,
+        CF.OwnerPostCount,
+        CF.RecentPostRank,
+        CF.ScoreCategory,
+        CF.QuestionStatus,
+        CF.Popularity,
+        CF.Upvotes,
+        CF.Downvotes,
+        CF.CommentCountForPost,
+        CF.RecencyStatus,
+        CAST((JULIANDAY(TIMESTAMP '2024-10-01 12:34:56') - JULIANDAY(CF.CreationDate)) AS INTEGER) AS DaysSincePost,
+        ROW_NUMBER() OVER (PARTITION BY CF.UserId ORDER BY CF.Score DESC) AS UserScoreRank,
+        RANK() OVER (ORDER BY CF.Reputation DESC) AS GlobalReputationRank,
+        PERCENT_RANK() OVER (ORDER BY CF.Score DESC) AS ScorePercentRank,
+        NTILE(4) OVER (ORDER BY CF.TotalScore DESC) AS PerformanceQuartile,
+        CASE 
+            WHEN CF.BadgeCount > 10 AND CF.PostCount > 100 THEN 'Veteran Contributor'
+            WHEN CF.PostCount > 50 AND CF.CommentCount > 20 THEN 'Active Community Member'
+            WHEN CF.Reputation > 5000 THEN 'High Reputation User'
+            ELSE 'Regular User'
+        END AS UserStatus,
+        CASE WHEN CF.Reputation > CF.PrevReputation THEN 'Gaining' ELSE 'Maintaining' END AS ReputationTrend,
+        CASE 
+            WHEN CF.Score > 100 THEN 'High Achiever'
+            WHEN CF.Score > 50 THEN 'Above Average'
+            ELSE 'Average'
+        END AS PerformanceLevel,
+        CASE 
+            WHEN CF.ReputationTier = 'Elite' AND CF.RecentPostRank = 1 THEN 'Top Elite Active'
+            WHEN CF.ReputationTier = 'Elite' THEN 'Elite Contributor'
+            WHEN CF.Score > 1000 THEN 'High Scoring'
+            ELSE 'Standard Contributor'
+        END AS ContributionLevel,
+        ROW_NUMBER() OVER (ORDER BY CF.Score DESC, CF.ViewCount DESC) AS OverallRank,
+        LAG(CF.Score, 1) OVER (ORDER BY CF.Score DESC) AS PrevScore,
+        ABS(CF.Score - LAG(CF.Score, 1) OVER (ORDER BY CF.Score DESC)) AS ScoreDifference,
+        ROUND(CAST(CF.Upvotes AS NUMERIC) / (CF.Upvotes + CF.Downvotes + 1), 2) AS UpvoteRatio,
+        CASE 
+            WHEN CF.CommentCountForPost > 5 THEN 'Highly Commented'
+            WHEN CF.CommentCountForPost > 0 THEN 'Moderately Commented'
+            ELSE 'Low Comment Activity'
+        END AS CommentActivityLevel,
+        -- include fields used later in outer queries
+        CF.TotalScore AS ScoreToAverageRatio,
+        CF.TotalScore AS MovingAvgScore,
+        CF.TotalScore AS CumulativeScore,
+        1 AS TotalUsers,
+        CF.TotalScore AS MedianScore,
+        0 AS ScoreVariance,
+        0 AS ScoreStdDev
+    FROM ComplexFilter CF
+    WHERE CF.ScorePercentile > 90
+),
+SetOperatorsDemo AS (
+    SELECT UserId, DisplayName, Reputation, TotalScore
+    FROM FinalAnalysis
+    WHERE UserStatus = 'Veteran Contributor'
+    UNION
+    SELECT UserId, DisplayName, Reputation, TotalScore
+    FROM FinalAnalysis
+    WHERE UserStatus = 'Active Community Member'
+    INTERSECT
+    SELECT UserId, DisplayName, Reputation, TotalScore
+    FROM FinalAnalysis
+    WHERE PerformanceLevel IN ('High Achiever', 'Above Average')
+),
+ComplexCalculation AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        TotalScore,
+        AVG(TotalScore) OVER (ORDER BY Reputation ROWS BETWEEN 10 PRECEDING AND CURRENT ROW) AS MovingAvgScore,
+        SUM(TotalScore) OVER (ORDER BY Reputation) AS CumulativeScore,
+        COUNT(*) OVER () AS TotalUsers,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY TotalScore) AS MedianScore,
+        VARIANCE(TotalScore) OVER () AS ScoreVariance,
+        STDDEV(TotalScore) OVER () AS ScoreStdDev,
+        ROUND(
+            (TotalScore / (NULLIF(AVG(TotalScore) OVER (), 0))) * 100, 2
+        ) AS ScoreToAverageRatio
+    FROM FinalAnalysis
+)
+SELECT 
+    SA.UserId,
+    SA.DisplayName,
+    SA.Reputation,
+    SA.PostCount,
+    SA.CommentCount,
+    SA.BadgeCount,
+    SA.ReputationTier,
+    SA.TotalScore,
+    SA.TotalViews,
+    SA.ReputationRank,
+    SA.PrevReputation,
+    SA.PostId,
+    SA.Title,
+    SA.Score,
+    SA.ViewCount,
+    SA.CreationDate,
+    SA.ParentId,
+    SA.PostType,
+    SA.ScorePercentile,
+    SA.ScoreRank,
+    SA.AvgScoreByType,
+    SA.OwnerPostCount,
+    SA.RecentPostRank,
+    SA.ScoreCategory,
+    SA.QuestionStatus,
+    SA.Popularity,
+    SA.Upvotes,
+    SA.Downvotes,
+    SA.CommentCountForPost,
+    SA.RecencyStatus,
+    SA.DaysSincePost,
+    SA.UserScoreRank,
+    SA.GlobalReputationRank,
+    SA.ScorePercentRank,
+    SA.PerformanceQuartile,
+    SA.UserStatus,
+    SA.ReputationTrend,
+    SA.PerformanceLevel,
+    SA.ContributionLevel,
+    SA.OverallRank,
+    SA.PrevScore,
+    SA.ScoreDifference,
+    SA.UpvoteRatio,
+    SA.CommentActivityLevel,
+    ROUND(CC.ScoreToAverageRatio, 2) AS ScoreToAverageRatio,
+    ROUND(CC.MovingAvgScore, 1) AS MovingAverageScore,
+    CAST(CC.CumulativeScore AS BIGINT) AS CumulativeScoreBig,
+    CC.TotalUsers,
+    ROUND(CC.MedianScore, 1) AS MedianScoreValue,
+    ROUND(CC.ScoreVariance, 2) AS ScoreVarianceValue,
+    ROUND(CC.ScoreStdDev, 2) AS ScoreStdDevValue
+FROM FinalAnalysis SA
+JOIN ComplexCalculation CC ON SA.UserId = CC.UserId
+WHERE SA.UserId IN (
+    SELECT UserId 
+    FROM SetOperatorsDemo
+    WHERE TotalScore > (
+        SELECT AVG(TotalScore) 
+        FROM FinalAnalysis
+    )
+)
+AND SA.CreationDate >= (
+    SELECT MIN(CreationDate) 
+    FROM Posts 
+    WHERE PostTypeId = 1
+)
+AND SA.DisplayName LIKE '%Stack%'
+ORDER BY SA.Score DESC, SA.Reputation DESC
+LIMIT 1000;

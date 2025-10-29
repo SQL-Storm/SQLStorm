@@ -1,0 +1,197 @@
+WITH UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COALESCE(u.Location, 'Unknown Location') AS UserLocation,
+        u.Views AS UserProfileViews,
+        u.UpVotes AS UserUpVotes,
+        u.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsOwned,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersOwned,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostScoreOwned,
+        SUM(COALESCE(p.ViewCount, 0)) AS TotalPostViewsOwned,
+        COUNT(DISTINCT c.Id) AS TotalCommentsMade,
+        SUM(COALESCE(c.Score, 0)) AS TotalCommentScoreMade,
+        (u.Reputation * 0.1) + (COUNT(DISTINCT p.Id) * 0.5) + (COUNT(DISTINCT c.Id) * 0.2) + (u.UpVotes - u.DownVotes) + (u.Views * 0.01) AS ActivityScore,
+        NTILE(4) OVER (ORDER BY u.Reputation DESC, u.CreationDate ASC) AS ReputationTier
+    FROM
+        Users AS u
+    LEFT JOIN
+        Posts AS p ON u.Id = p.OwnerUserId
+    LEFT JOIN
+        Comments AS c ON u.Id = c.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Location, u.Views, u.UpVotes, u.DownVotes
+),
+PostTagAnalysis AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.LastEditDate,
+        p.LastActivityDate,
+        p.AcceptedAnswerId,
+        p.ClosedDate,
+        p.Title,
+        TRIM(UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><'))) AS TagName,
+        (SELECT COUNT(DISTINCT ph.UserId)
+         FROM PostHistory AS ph
+         WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4, 5, 6) AND ph.UserId IS NOT NULL AND ph.UserId != p.OwnerUserId
+        ) AS DistinctNonOwnerEditorCount,
+        (SELECT COALESCE(MAX(c_inner.Score), 0)
+         FROM Comments AS c_inner
+         WHERE c_inner.PostId = p.Id
+         AND c_inner.CreationDate = (SELECT MAX(c_sub.CreationDate) FROM Comments AS c_sub WHERE c_sub.PostId = p.Id)
+        ) AS LatestCommentScore,
+        CAST(COALESCE(p.FavoriteCount, 0) + COALESCE(p.CommentCount, 0) AS NUMERIC) / NULLIF(p.ViewCount, 0) AS EngagementRatio
+    FROM
+        Posts AS p
+    WHERE
+        p.PostTypeId IN (1, 2)
+        AND p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2
+),
+RankedUserPosts AS (
+    SELECT
+        pta.PostId,
+        pta.PostTypeId,
+        pta.OwnerUserId,
+        pta.PostScore,
+        pta.ViewCount,
+        pta.TagName,
+        pta.LatestCommentScore,
+        pta.DistinctNonOwnerEditorCount,
+        ROW_NUMBER() OVER (PARTITION BY pta.OwnerUserId, pta.PostTypeId ORDER BY pta.PostScore DESC, pta.PostCreationDate DESC) AS rn_score,
+        DENSE_RANK() OVER (PARTITION BY pta.TagName ORDER BY pta.ViewCount DESC) AS TagViewRank
+    FROM
+        PostTagAnalysis AS pta
+),
+BadgeAwardsSummary AS (
+    SELECT
+        b.UserId,
+        COUNT(b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(CASE WHEN b.TagBased = TRUE THEN 1 ELSE 0 END) AS HasTagBadges,
+        MAX(CASE WHEN b.TagBased = FALSE THEN 1 ELSE 0 END) AS HasNamedBadges
+    FROM
+        Badges AS b
+    GROUP BY
+        b.UserId
+),
+QuestionAnswerAcceptedStatus AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.OwnerUserId AS QuestionOwnerId,
+        q.AcceptedAnswerId,
+        a.OwnerUserId AS AcceptedAnswerOwnerId,
+        a.Score AS AcceptedAnswerScore,
+        AGE(q.LastActivityDate, q.CreationDate) AS QuestionLifespan
+    FROM
+        Posts AS q
+    INNER JOIN
+        Posts AS a ON q.AcceptedAnswerId = a.Id
+    WHERE
+        q.PostTypeId = 1 AND a.PostTypeId = 2
+),
+ModeratorActionSummary AS (
+    SELECT
+        ph.PostId,
+        ph.UserId AS ModeratorActorId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate AS ModerationDate,
+        cr.Name AS CloseReasonName
+    FROM
+        PostHistory AS ph
+    LEFT JOIN
+        CloseReasonTypes AS cr ON ph.Comment = CAST(cr.Id AS TEXT)
+    WHERE
+        ph.PostHistoryTypeId IN (10, 12, 14, 19)
+)
+SELECT
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.TotalPostsOwned,
+    uas.TotalQuestionsOwned,
+    uas.TotalAnswersOwned,
+    uas.ActivityScore,
+    uas.ReputationTier,
+    COALESCE(bas.TotalBadges, 0) AS UserTotalBadges,
+    COALESCE(bas.GoldBadges, 0) AS UserGoldBadges,
+    CASE WHEN bas.HasTagBadges = 1 THEN 'Yes' ELSE 'No' END AS HasTagSpecificBadges,
+    COALESCE(hsq.PostId, -1) AS TopQuestionId,
+    COALESCE(hsq.PostScore, 0) AS TopQuestionScore,
+    COALESCE(hsq.TagName, 'No Top Q Tag') AS TopQuestionMainTag,
+    COALESCE(hsa.PostId, -1) AS TopAnswerId,
+    COALESCE(hsa.PostScore, 0) AS TopAnswerScore,
+    COUNT(DISTINCT qas_a.QuestionId) AS AcceptedAnswersProvidedCount,
+    COUNT(DISTINCT qas_q.QuestionId) AS QuestionsWithAcceptedAnswerCount,
+    CAST(AVG(COALESCE(qas_q.AcceptedAnswerScore, 0)) AS DECIMAL(10, 2)) AS AvgAcceptedAnswerScoreForOwnedQuestions,
+    CAST(uas.UserUpVotes AS NUMERIC) / NULLIF(uas.UserDownVotes, 0) AS UpvoteToDownvoteRatio,
+    CASE
+        WHEN uas.LastAccessDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '6 months' AND uas.UserCreationDate <= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 years' THEN 'Veteran_Highly_Active'
+        WHEN uas.LastAccessDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year' THEN 'Recently_Active'
+        WHEN uas.LastAccessDate < CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years' OR uas.LastAccessDate IS NULL THEN 'Dormant_Or_New'
+        ELSE 'Active'
+    END AS ActivityStatusCategory,
+    SUM(DISTINCT hsq.DistinctNonOwnerEditorCount) + SUM(DISTINCT hsa.DistinctNonOwnerEditorCount) AS TotalNonOwnerEdits,
+    MAX(rup.LatestCommentScore) AS MaxCommentScoreOnAnyOwnedPost,
+    (uas.Reputation / 1000.0) +
+    (uas.ActivityScore / 100.0) +
+    (COALESCE(bas.GoldBadges, 0) * 7.5) +
+    (COALESCE(hsq.PostScore, 0) / 15.0) +
+    (COALESCE(hsa.PostScore, 0) / 15.0) +
+    (COUNT(DISTINCT qas_a.QuestionId) * 3.0) +
+    (COUNT(DISTINCT qas_q.QuestionId) * 2.5) +
+    (COALESCE(SUM(DISTINCT hsq.DistinctNonOwnerEditorCount), 0) * 1.0) +
+    (COALESCE(SUM(DISTINCT hsa.DistinctNonOwnerEditorCount), 0) * 1.0) +
+    (COALESCE(MAX(rup.LatestCommentScore), 0) * 0.5)
+    AS OverallInfluenceScore
+FROM
+    UserActivitySummary AS uas
+LEFT JOIN
+    BadgeAwardsSummary AS bas ON uas.UserId = bas.UserId
+LEFT JOIN
+    RankedUserPosts AS hsq ON uas.UserId = hsq.OwnerUserId AND hsq.PostTypeId = 1 AND hsq.rn_score = 1
+LEFT JOIN
+    RankedUserPosts AS hsa ON uas.UserId = hsa.OwnerUserId AND hsa.PostTypeId = 2 AND hsa.rn_score = 1
+LEFT JOIN
+    QuestionAnswerAcceptedStatus AS qas_a ON uas.UserId = qas_a.AcceptedAnswerOwnerId
+LEFT JOIN
+    QuestionAnswerAcceptedStatus AS qas_q ON uas.UserId = qas_q.QuestionOwnerId
+LEFT JOIN
+    RankedUserPosts AS rup ON uas.UserId = rup.OwnerUserId
+WHERE
+    uas.Reputation >= 5000
+    AND uas.TotalPostsOwned > 10
+    AND (LOWER(uas.UserLocation) LIKE '%india%' OR LOWER(uas.UserLocation) LIKE '%usa%' OR uas.UserLocation = 'Unknown Location')
+    AND uas.LastAccessDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '6 months'
+    AND NOT EXISTS (
+        SELECT 1
+        FROM Posts p_moderated
+        JOIN ModeratorActionSummary mas ON p_moderated.Id = mas.PostId
+        WHERE p_moderated.OwnerUserId = uas.UserId
+          AND mas.ModerationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+          AND mas.PostHistoryTypeId IN (10, 12)
+    )
+GROUP BY
+    uas.UserId, uas.DisplayName, uas.Reputation, uas.TotalPostsOwned, uas.TotalQuestionsOwned, uas.TotalAnswersOwned,
+    uas.TotalPostScoreOwned, uas.ActivityScore, uas.ReputationTier, bas.TotalBadges, bas.GoldBadges, bas.HasTagBadges,
+    hsq.PostId, hsq.PostScore, hsq.TagName, hsa.PostId, hsa.PostScore,
+    uas.UserUpVotes, uas.UserDownVotes, uas.LastAccessDate, uas.UserCreationDate
+HAVING
+    (COUNT(DISTINCT qas_a.QuestionId) >= 2 OR COUNT(DISTINCT qas_q.QuestionId) >= 2)
+    AND MAX(COALESCE(rup.LatestCommentScore, 0)) > 0
+ORDER BY
+    OverallInfluenceScore DESC, uas.Reputation DESC, uas.LastAccessDate DESC
+LIMIT 50;

@@ -1,0 +1,332 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+                CASE 
+                    WHEN COUNT(DISTINCT p.Id) > 100 THEN 'Elite'
+                    WHEN COUNT(DISTINCT p.Id) > 50 THEN 'Veteran'
+                    WHEN COUNT(DISTINCT p.Id) > 25 THEN 'Experienced'
+                    ELSE 'Beginner'
+                END
+            ELSE 'Inactive'
+        END AS ExperienceLevel,
+        ROUND(
+            (COALESCE(SUM(p.Score), 0) * 100.0) / 
+            NULLIF(COUNT(DISTINCT p.Id), 0), 2
+        ) AS AvgScorePerPost,
+        CAST(
+            ROUND(
+                CASE 
+                    WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+                        (COUNT(DISTINCT p.Id) * 100.0) / 
+                        (EXTRACT(day FROM (TIMESTAMP '2024-10-01 12:34:56' - u.CreationDate)) + 1)
+                    ELSE 0 
+                END, 2
+            ) AS INTEGER
+        ) AS PostsPerDay
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate > TIMESTAMP '2010-01-01 00:00:00'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+TopTaggers AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(t.Id) AS TagCount,
+        -- Use dialect-agnostic STRING_AGG; some systems use LISTAGG or GROUP_CONCAT
+        STRING_AGG(t.TagName, ', ' ORDER BY t.Count DESC) AS TopTags,
+        MAX(t.Count) AS MaxTagCount,
+        ROW_NUMBER() OVER (ORDER BY COUNT(t.Id) DESC, u.Reputation DESC) AS TagRank
+    FROM Users u
+    INNER JOIN Posts p ON u.Id = p.OwnerUserId
+    INNER JOIN (
+        SELECT 
+            Id AS PostId,
+            -- emulate splitting tags like '<tag1><tag2>' into rows in a cross-dialect way
+            -- here we assume a function UNNEST_STRING is available; if not, replace with appropriate splitter for the target dialect
+            TRIM(BOTH '<>' FROM value) AS Tag
+        FROM Posts,
+        LATERAL (
+            SELECT value
+            FROM UNNEST(STRING_TO_ARRAY(Tags, '><')) AS t(value)
+        )
+        WHERE Tags IS NOT NULL AND Tags <> ''
+    ) pt ON p.Id = pt.PostId
+    INNER JOIN Tags t ON pt.Tag = t.TagName
+    WHERE p.PostTypeId = 1
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(t.Id) >= 5
+),
+PostComplexityAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        COALESCE(p.Body, '') AS BodyText,
+        LENGTH(COALESCE(p.Body, '')) AS BodyLength,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags <> '' THEN 
+                COALESCE(
+                    -- count elements of array produced by splitting tags
+                    CARDINALITY(STRING_TO_ARRAY(TRIM(BOTH '<>' FROM p.Tags), '><')),
+                    0
+                )
+            ELSE 0 
+        END AS TagCount,
+        CASE 
+            WHEN p.AnswerCount > 0 THEN 
+                ROUND(p.Score * 100.0 / NULLIF(p.AnswerCount, 0), 2)
+            ELSE NULL 
+        END AS ScorePerAnswer,
+        CASE 
+            WHEN p.CommentCount > 0 THEN 
+                ROUND(p.Score * 100.0 / NULLIF(p.CommentCount, 0), 2)
+            ELSE NULL 
+        END AS ScorePerComment,
+        CASE 
+            WHEN LENGTH(COALESCE(p.Body, '')) > 1000 THEN 'Long'
+            WHEN LENGTH(COALESCE(p.Body, '')) > 500 THEN 'Medium'
+            ELSE 'Short'
+        END AS ContentLengthCategory,
+        ROW_NUMBER() OVER (
+            PARTITION BY p.OwnerUserId 
+            ORDER BY p.Score DESC, p.CreationDate DESC
+        ) AS UserPostRank
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate > TIMESTAMP '2020-01-01 00:00:00'
+      AND p.ViewCount > 0
+),
+CombinedAnalysis AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.PostCount,
+        uas.CommentCount,
+        uas.BadgeCount,
+        uas.ExperienceLevel,
+        uas.AvgScorePerPost,
+        uas.PostsPerDay,
+        COALESCE(ta.TagCount, 0) AS TagCount,
+        ta.TopTags,
+        ta.MaxTagCount,
+        ROW_NUMBER() OVER (
+            ORDER BY 
+                uas.Reputation DESC,
+                uas.PostCount DESC,
+                uas.BadgeCount DESC
+        ) AS UserRank,
+        COUNT(*) OVER () AS TotalUsers,
+        AVG(uas.AvgScorePerPost) OVER () AS AvgUserScorePerPost,
+        STRING_AGG(
+            CASE 
+                WHEN pca.Score > 0 THEN 
+                    CONCAT(pca.Title, ' (', pca.Score, ')')
+                ELSE NULL 
+            END, 
+            ' | ' 
+            ORDER BY pca.Score DESC
+        ) AS TopScores
+    FROM UserActivityStats uas
+    FULL OUTER JOIN TopTaggers ta ON uas.UserId = ta.UserId
+    LEFT JOIN PostComplexityAnalysis pca ON pca.OwnerUserId = uas.UserId
+    WHERE uas.UserId IS NOT NULL OR ta.UserId IS NOT NULL
+    GROUP BY
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.PostCount,
+        uas.CommentCount,
+        uas.BadgeCount,
+        uas.ExperienceLevel,
+        uas.AvgScorePerPost,
+        uas.PostsPerDay,
+        ta.TagCount,
+        ta.TopTags,
+        ta.MaxTagCount
+),
+UserPostPerformance AS (
+    SELECT 
+        pca.PostId,
+        pca.Title,
+        pca.Score,
+        pca.ViewCount,
+        pca.AnswerCount,
+        pca.CommentCount,
+        pca.BodyLength,
+        pca.TagCount,
+        pca.ScorePerAnswer,
+        pca.ScorePerComment,
+        pca.ContentLengthCategory,
+        pca.UserPostRank,
+        u.DisplayName AS OwnerName,
+        u.Reputation AS OwnerReputation,
+        u.AccountId,
+        CASE 
+            WHEN pca.Score > (
+                SELECT AVG(Score) 
+                FROM Posts 
+                WHERE PostTypeId = 1 
+                AND CreationDate > TIMESTAMP '2020-01-01 00:00:00'
+            ) THEN 'Above Average'
+            WHEN pca.Score > (
+                SELECT AVG(Score) - 10
+                FROM Posts 
+                WHERE PostTypeId = 1 
+                AND CreationDate > TIMESTAMP '2020-01-01 00:00:00'
+            ) THEN 'Average'
+            ELSE 'Below Average'
+        END AS PerformanceCategory
+    FROM PostComplexityAnalysis pca
+    INNER JOIN Users u ON pca.OwnerUserId = u.Id
+    WHERE pca.UserPostRank <= 3
+),
+FinalAggregatedAnalysis AS (
+    SELECT 
+        ca.UserId,
+        ca.DisplayName,
+        ca.Reputation,
+        ca.PostCount,
+        ca.CommentCount,
+        ca.BadgeCount,
+        ca.ExperienceLevel,
+        ca.AvgScorePerPost,
+        ca.PostsPerDay,
+        ca.TagCount,
+        ca.TopTags,
+        ca.MaxTagCount,
+        ca.UserRank,
+        ca.TotalUsers,
+        ca.AvgUserScorePerPost,
+        ca.TopScores,
+        STRING_AGG(
+            CASE 
+                WHEN upp.Score > 0 THEN 
+                    CONCAT(upp.Title, ' (', upp.Score, ')')
+                ELSE NULL 
+            END, 
+            ' | ' 
+            ORDER BY upp.Score DESC
+        ) AS OwnerTopPosts,
+        STRING_AGG(
+            upp.ContentLengthCategory, 
+            ', ' 
+            ORDER BY upp.Score DESC
+        ) AS ContentCategories,
+        STRING_AGG(
+            CAST(upp.ScorePerAnswer AS VARCHAR), 
+            ', ' 
+            ORDER BY upp.Score DESC
+        ) AS AverageScoresPerAnswer,
+        STRING_AGG(
+            CAST(upp.ScorePerComment AS VARCHAR), 
+            ', ' 
+            ORDER BY upp.Score DESC
+        ) AS AverageScoresPerComment,
+        STRING_AGG(
+            CAST(upp.BodyLength AS VARCHAR), 
+            ', ' 
+            ORDER BY upp.Score DESC
+        ) AS BodyLengths
+    FROM CombinedAnalysis ca
+    LEFT JOIN UserPostPerformance upp ON ca.DisplayName = upp.OwnerName
+    GROUP BY 
+        ca.UserId,
+        ca.DisplayName,
+        ca.Reputation,
+        ca.PostCount,
+        ca.CommentCount,
+        ca.BadgeCount,
+        ca.ExperienceLevel,
+        ca.AvgScorePerPost,
+        ca.PostsPerDay,
+        ca.TagCount,
+        ca.TopTags,
+        ca.MaxTagCount,
+        ca.UserRank,
+        ca.TotalUsers,
+        ca.AvgUserScorePerPost,
+        ca.TopScores
+)
+SELECT 
+    FA.UserId,
+    FA.DisplayName,
+    FA.Reputation,
+    FA.PostCount,
+    FA.CommentCount,
+    FA.BadgeCount,
+    FA.ExperienceLevel,
+    FA.AvgScorePerPost,
+    FA.PostsPerDay,
+    FA.TagCount,
+    FA.TopTags,
+    FA.MaxTagCount,
+    FA.UserRank,
+    FA.TotalUsers,
+    FA.AvgUserScorePerPost,
+    FA.TopScores,
+    FA.OwnerTopPosts,
+    FA.ContentCategories,
+    FA.AverageScoresPerAnswer,
+    FA.AverageScoresPerComment,
+    FA.BodyLengths,
+    CASE 
+        WHEN FA.PostCount >= 50 THEN 'High Activity'
+        WHEN FA.PostCount >= 25 THEN 'Medium Activity'
+        ELSE 'Low Activity'
+    END AS PostActivityLevel,
+    CASE 
+        WHEN FA.Reputation > 10000 THEN 'Expert'
+        WHEN FA.Reputation > 5000 THEN 'Advanced'
+        WHEN FA.Reputation > 1000 THEN 'Intermediate'
+        ELSE 'Beginner'
+    END AS ReputationTier,
+    ROW_NUMBER() OVER (ORDER BY FA.Reputation DESC, FA.PostCount DESC) AS OverallRank,
+    CASE 
+        WHEN FA.AvgScorePerPost > (
+            SELECT AVG(AvgScorePerPost) 
+            FROM CombinedAnalysis
+        ) THEN 'Above Average'
+        WHEN FA.AvgScorePerPost > (
+            SELECT AVG(AvgScorePerPost) - 5
+            FROM CombinedAnalysis
+        ) THEN 'Average'
+        ELSE 'Below Average'
+    END AS ScorePerformance,
+    ROUND(
+        (COUNT(*) OVER () - FA.UserRank) * 100.0 / NULLIF(COUNT(*) OVER (), 0), 2
+    ) AS PercentileRank,
+    CONCAT(
+        'Rank: ', FA.UserRank, '/', FA.TotalUsers, 
+        ' (', ROUND(FA.UserRank * 100.0 / NULLIF(FA.TotalUsers, 0), 2), '%)'
+    ) AS RankDisplay,
+    CASE 
+        WHEN FA.TagCount > 10 THEN 'Multiple Specializations'
+        WHEN FA.TagCount > 5 THEN 'Specialized'
+        ELSE 'Generalist'
+    END AS TagSpecializationLevel
+FROM FinalAggregatedAnalysis FA
+WHERE FA.UserRank <= 20
+  AND FA.Reputation > 100
+  AND (FA.PostCount > 0 OR FA.CommentCount > 0)
+ORDER BY FA.UserRank ASC,
+         FA.Reputation DESC,
+         FA.PostCount DESC;

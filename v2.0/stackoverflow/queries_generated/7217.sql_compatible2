@@ -1,0 +1,240 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        COUNT(DISTINCT c.Id) AS Comments,
+        COUNT(DISTINCT b.Id) AS Badges,
+        COALESCE(SUM(p.Score), 0) AS TotalScore,
+        COALESCE(SUM(p.ViewCount), 0) AS TotalViews,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(u.LastAccessDate) AS LastActivityDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.AccountId IS NOT NULL
+    GROUP BY u.Id, u.Reputation, u.DisplayName
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        TotalPosts,
+        Questions,
+        Answers,
+        Comments,
+        Badges,
+        TotalScore,
+        TotalViews,
+        LastPostDate,
+        LastActivityDate,
+        ROW_NUMBER() OVER (ORDER BY TotalScore DESC) AS ScoreRank,
+        ROW_NUMBER() OVER (ORDER BY TotalPosts DESC) AS PostRank,
+        ROW_NUMBER() OVER (ORDER BY Badges DESC) AS BadgeRank
+    FROM UserActivityStats
+),
+UserPostAnalysis AS (
+    SELECT 
+        p.OwnerUserId,
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate)) / 86400 AS INTEGER) AS DaysSincePost,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NULL THEN 'Unanswered'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostCategory,
+        CASE 
+            WHEN p.ViewCount > 1000 THEN 'High View'
+            WHEN p.ViewCount > 100 THEN 'Medium View'
+            WHEN p.ViewCount > 10 THEN 'Low View'
+            ELSE 'Very Low View'
+        END AS ViewCategory,
+        (SELECT COUNT(*) 
+         FROM Posts p2 
+         WHERE p2.ParentId = p.Id 
+         AND p2.PostTypeId = 2 
+         AND p2.Score > 0) AS PositiveAnswers
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    AND p.PostTypeId IN (1, 2)
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        p.Title AS ExcerptTitle,
+        p.Body AS ExcerptBody,
+        CASE 
+            WHEN t.IsRequired = TRUE THEN 'Required Tag'
+            WHEN t.IsModeratorOnly = TRUE THEN 'Moderator Only'
+            ELSE 'Regular Tag'
+        END AS TagType,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank
+    FROM Tags t
+    LEFT JOIN Posts p ON t.ExcerptPostId = p.Id
+),
+CombinedAnalysis AS (
+    SELECT 
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.TotalPosts,
+        tu.Questions,
+        tu.Answers,
+        tu.Comments,
+        tu.Badges,
+        tu.TotalScore,
+        tu.TotalViews,
+        tu.LastPostDate,
+        tu.LastActivityDate,
+        tu.ScoreRank,
+        tu.PostRank,
+        tu.BadgeRank,
+        upa.PostId,
+        upa.Title,
+        upa.Score AS PostScore,
+        upa.ViewCount,
+        upa.CreationDate AS PostCreationDate,
+        upa.Tags,
+        upa.PostCategory,
+        upa.ViewCategory,
+        upa.DaysSincePost,
+        upa.PositiveAnswers,
+        ta.TagName,
+        ta.TagCount,
+        ta.TagType,
+        ta.TagRank,
+        CASE 
+            WHEN tu.ScoreRank <= 100 AND tu.PostRank <= 100 THEN 'Top Performer'
+            WHEN tu.ScoreRank <= 500 AND tu.PostRank <= 500 THEN 'High Performer'
+            WHEN tu.ScoreRank <= 1000 AND tu.PostRank <= 1000 THEN 'Regular Performer'
+            ELSE 'Newbie'
+        END AS PerformanceTier,
+        CASE 
+            WHEN ta.TagRank BETWEEN 1 AND 10 THEN 'Popular Tag'
+            WHEN ta.TagRank BETWEEN 11 AND 50 THEN 'Moderately Popular'
+            ELSE 'Less Popular'
+        END AS TagPopularity,
+        CASE 
+            WHEN upa.Score > 10 AND upa.ViewCount > 500 THEN 'High Impact'
+            WHEN upa.Score > 5 AND upa.ViewCount > 100 THEN 'Medium Impact'
+            ELSE 'Low Impact'
+        END AS ImpactLevel,
+        (SELECT COUNT(*) 
+         FROM Posts p3 
+         WHERE p3.OwnerUserId = tu.UserId 
+         AND p3.PostTypeId = 1) AS QuestionCount,
+        (SELECT COUNT(*) 
+         FROM Posts p4 
+         WHERE p4.OwnerUserId = tu.UserId 
+         AND p4.PostTypeId = 2 
+         AND p4.AcceptedAnswerId IS NOT NULL) AS AcceptedAnswerCount,
+        (SELECT COUNT(*) 
+         FROM Posts p5 
+         WHERE p5.OwnerUserId = tu.UserId 
+         AND p5.PostTypeId = 1 
+         AND p5.AnswerCount > 0) AS QuestionWithAnswers
+    FROM TopUsers tu
+    LEFT JOIN UserPostAnalysis upa ON tu.UserId = upa.OwnerUserId
+    LEFT JOIN TagAnalysis ta ON EXISTS (
+        SELECT 1 
+        FROM unnest(string_to_array(COALESCE(upa.Tags, ''), '><')) AS tag 
+        WHERE tag = ta.TagName
+    )
+)
+SELECT 
+    UserId,
+    DisplayName,
+    Reputation,
+    TotalPosts,
+    Questions,
+    Answers,
+    Comments,
+    Badges,
+    TotalScore,
+    TotalViews,
+    LastPostDate,
+    LastActivityDate,
+    ScoreRank,
+    PostRank,
+    BadgeRank,
+    PostId,
+    Title,
+    PostScore,
+    ViewCount,
+    PostCreationDate,
+    Tags,
+    PostCategory,
+    ViewCategory,
+    DaysSincePost,
+    PositiveAnswers,
+    TagName,
+    TagCount,
+    TagType,
+    TagRank,
+    PerformanceTier,
+    TagPopularity,
+    ImpactLevel,
+    QuestionCount,
+    AcceptedAnswerCount,
+    QuestionWithAnswers,
+    CASE 
+        WHEN TotalScore > 500 AND Badges > 50 THEN 'Elite Contributor'
+        WHEN TotalScore > 100 AND Badges > 20 THEN 'Active Contributor'
+        WHEN TotalScore > 50 AND Badges > 10 THEN 'Regular Contributor'
+        ELSE 'Occasional Contributor'
+    END AS ContributionLevel,
+    (SELECT COUNT(*) 
+     FROM PostHistory ph 
+     WHERE ph.UserId = CombinedAnalysis.UserId 
+     AND ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)
+     AND ph.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30 days')) AS RecentEdits,
+    COALESCE((SELECT AVG(p.Score) 
+              FROM Posts p 
+              WHERE p.OwnerUserId = CombinedAnalysis.UserId 
+              AND p.PostTypeId = 1), 0) AS AvgQuestionScore,
+    COALESCE((SELECT AVG(p.Score) 
+              FROM Posts p 
+              WHERE p.OwnerUserId = CombinedAnalysis.UserId 
+              AND p.PostTypeId = 2), 0) AS AvgAnswerScore,
+    CASE 
+        WHEN LastPostDate IS NULL THEN 'Never Active'
+        WHEN CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - LastPostDate)) / 86400 AS INTEGER) <= 30 THEN 'Recently Active'
+        WHEN CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - LastPostDate)) / 86400 AS INTEGER) <= 90 THEN 'Active Recently'
+        ELSE 'Inactive'
+    END AS ActivityStatus,
+    CASE 
+        WHEN TotalViews > 10000 THEN 'Viral Contributor'
+        WHEN TotalViews > 1000 THEN 'Popular Contributor'
+        WHEN TotalViews > 100 THEN 'Noticeable Contributor'
+        ELSE 'Moderate Contributor'
+    END AS VisibilityLevel
+FROM CombinedAnalysis
+WHERE UserId IS NOT NULL
+AND TotalPosts > 0
+AND (PostId IS NOT NULL OR TagName IS NOT NULL)
+ORDER BY 
+    CASE WHEN PerformanceTier = 'Elite Contributor' THEN 1
+         WHEN PerformanceTier = 'Active Contributor' THEN 2
+         WHEN PerformanceTier = 'Regular Contributor' THEN 3
+         ELSE 4 END,
+    TotalScore DESC,
+    TagCount DESC
+LIMIT 5000;

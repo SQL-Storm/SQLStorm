@@ -1,0 +1,226 @@
+WITH
+  RankedPostHistory AS (
+    SELECT
+      ph.PostId,
+      ph.PostHistoryTypeId,
+      ph.CreationDate,
+      ph.UserId,
+      ph.Comment,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory AS ph
+    WHERE
+      ph.PostHistoryTypeId IN (1, 4, 6, 10, 11, 12, 13, 14, 15, 16, 19, 20, 33, 34, 35, 36, 50)
+  ),
+  LatestPostStatus AS (
+    SELECT
+      rph.PostId,
+      CASE
+        WHEN rph.PostHistoryTypeId = 1 THEN 'Initial Title'
+        WHEN rph.PostHistoryTypeId = 4 THEN 'Edit Title'
+        WHEN rph.PostHistoryTypeId = 6 THEN 'Edit Tags'
+        WHEN rph.PostHistoryTypeId = 10 THEN 'Post Closed'
+        WHEN rph.PostHistoryTypeId = 11 THEN 'Post Reopened'
+        WHEN rph.PostHistoryTypeId = 12 THEN 'Post Deleted'
+        WHEN rph.PostHistoryTypeId = 13 THEN 'Post Undeleted'
+        WHEN rph.PostHistoryTypeId = 14 THEN 'Post Locked'
+        WHEN rph.PostHistoryTypeId = 15 THEN 'Post Unlocked'
+        WHEN rph.PostHistoryTypeId = 16 THEN 'Community Owned'
+        WHEN rph.PostHistoryTypeId = 19 THEN 'Question Protected'
+        WHEN rph.PostHistoryTypeId = 20 THEN 'Question Unprotected'
+        WHEN rph.PostHistoryTypeId = 33 THEN 'Post Notice Added'
+        WHEN rph.PostHistoryTypeId = 34 THEN 'Post Notice Removed'
+        WHEN rph.PostHistoryTypeId = 35 THEN 'Post Migrated Away'
+        WHEN rph.PostHistoryTypeId = 36 THEN 'Post Migrated Here'
+        WHEN rph.PostHistoryTypeId = 50 THEN 'Community Bump'
+        ELSE 'Other'
+      END AS LatestStatus,
+      rph.CreationDate AS StatusChangeDate,
+      rph.UserId AS StatusChangerUserId,
+      rph.Comment AS StatusComment
+    FROM RankedPostHistory AS rph
+    WHERE
+      rph.rn = 1
+  ),
+  UserPostActivity AS (
+    SELECT
+      p.OwnerUserId,
+      COUNT(DISTINCT p.Id) AS TotalPostsOwned,
+      SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsOwned,
+      SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersOwned,
+      AVG(p.Score) AS AverageScore,
+      MAX(p.ViewCount) AS MaxViewCount,
+      SUM(COALESCE(p.FavoriteCount,0)) AS TotalFavorites
+    FROM Posts AS p
+    WHERE
+      p.OwnerUserId IS NOT NULL
+    GROUP BY
+      p.OwnerUserId
+  ),
+  UserVoteSummary AS (
+    SELECT
+      v.UserId,
+      COUNT(CASE WHEN vt.Name = 'UpMod' THEN v.Id END) AS UpVotesReceived,
+      COUNT(CASE WHEN vt.Name = 'DownMod' THEN v.Id END) AS DownVotesReceived,
+      COUNT(CASE WHEN vt.Name = 'Favorite' THEN v.Id END) AS FavoritesReceived
+    FROM Votes AS v
+    JOIN VoteTypes AS vt
+      ON v.VoteTypeId = vt.Id
+    WHERE
+      vt.Name IN ('UpMod', 'DownMod', 'Favorite')
+    GROUP BY
+      v.UserId
+  )
+SELECT
+  u.Id AS UserId,
+  u.DisplayName,
+  u.Reputation,
+  u.CreationDate AS UserCreationDate,
+  u.Views AS UserViews,
+  u.UpVotes AS UserTotalUpVotes,
+  u.DownVotes AS UserTotalDownVotes,
+  COALESCE(ups.UpVotesReceived, 0) AS VotesUpReceived,
+  COALESCE(downs.DownVotesReceived, 0) AS VotesDownReceived,
+  COALESCE(favs.FavoritesReceived, 0) AS VotesFavoriteReceived,
+  COALESCE(upa.TotalPostsOwned, 0) AS TotalPostsOwned,
+  COALESCE(upa.QuestionsOwned, 0) AS QuestionsOwned,
+  COALESCE(upa.AnswersOwned, 0) AS AnswersOwned,
+  upa.AverageScore,
+  upa.MaxViewCount,
+  COALESCE(upa.TotalFavorites, 0) AS PostsFavoritedCount,
+  lps.LatestStatus,
+  lps.StatusChangeDate,
+  lps.StatusChangerUserId,
+  lps.StatusComment,
+  CASE
+    WHEN u.WebsiteUrl IS NULL THEN 'No Website'
+    WHEN u.WebsiteUrl LIKE '%stackoverflow%' THEN 'Stack Overflow Related Site'
+    ELSE 'External Website'
+  END AS WebsiteCategory,
+  CASE
+    WHEN u.AboutMe IS NULL OR LENGTH(u.AboutMe) = 0 THEN 'No Bio'
+    WHEN LENGTH(u.AboutMe) > 500 THEN 'Extensive Bio'
+    ELSE 'Standard Bio'
+  END AS BioLengthCategory,
+  COALESCE(gb.GoldBadges, 0) AS GoldBadges,
+  COALESCE(sb.SilverBadges, 0) AS SilverBadges,
+  COALESCE(bb.BronzeBadges, 0) AS BronzeBadges,
+  COALESCE(p.AnswerCount, 0) AS PostAnswerCount,
+  COALESCE(p.CommentCount, 0) AS PostCommentCount,
+  p.Title AS PostTitle,
+  p.Tags AS PostTags,
+  p.Score AS PostScore,
+  p.ViewCount AS PostViewCount,
+  p.CommunityOwnedDate,
+  CASE
+    WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+    ELSE 'Open'
+  END AS PostStatus,
+  CASE
+    WHEN EXISTS (
+      SELECT 1 FROM PostLinks AS pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3
+    ) THEN 'Is Duplicate Of'
+    WHEN EXISTS (
+      SELECT 1 FROM PostLinks AS pl WHERE pl.RelatedPostId = p.Id AND pl.LinkTypeId = 3
+    ) THEN 'Is Duplicate For'
+    ELSE 'Not a Duplicate'
+  END AS DuplicateStatus,
+  (u.DisplayName || ' (' || CAST(u.Id AS VARCHAR) || ')') AS UserIdentifier,
+  SUBSTRING(p.Body, 1, 200) AS PostBodySnippet,
+  CASE
+    WHEN EXTRACT(YEAR FROM u.CreationDate) = EXTRACT(YEAR FROM DATE '2024-10-01') THEN 'Created This Year'
+    ELSE 'Created Previous Years'
+  END AS UserCreationYearCategory
+FROM Users AS u
+LEFT JOIN LatestPostStatus AS lps
+  ON lps.StatusChangerUserId = u.Id
+LEFT JOIN UserPostActivity AS upa
+  ON u.Id = upa.OwnerUserId
+LEFT JOIN UserVoteSummary AS ups
+  ON u.Id = ups.UserId
+LEFT JOIN UserVoteSummary AS downs
+  ON u.Id = downs.UserId
+LEFT JOIN UserVoteSummary AS favs
+  ON u.Id = favs.UserId
+LEFT JOIN Posts AS p
+  ON u.Id = p.OwnerUserId AND p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL
+LEFT JOIN (
+  SELECT
+    b.UserId,
+    SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+    SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+    SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+  FROM Badges AS b
+  GROUP BY b.UserId
+) AS gb_all
+  ON gb_all.UserId = u.Id
+LEFT JOIN (
+  SELECT UserId, GoldBadges FROM (
+    SELECT b.UserId, SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges
+    FROM Badges b GROUP BY b.UserId
+  ) t
+) AS gb
+  ON gb.UserId = u.Id
+LEFT JOIN (
+  SELECT UserId, SilverBadges FROM (
+    SELECT b.UserId, SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges
+    FROM Badges b GROUP BY b.UserId
+  ) t
+) AS sb
+  ON sb.UserId = u.Id
+LEFT JOIN (
+  SELECT UserId, BronzeBadges FROM (
+    SELECT b.UserId, SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges b GROUP BY b.UserId
+  ) t
+) AS bb
+  ON bb.UserId = u.Id
+WHERE
+  u.Reputation > 1000
+  AND u.LastAccessDate > DATE '2023-01-01'
+  AND u.Location IS NOT NULL
+  AND u.DisplayName NOT LIKE '%[bot]%'
+  AND (
+    COALESCE(upa.TotalPostsOwned,0) > 5 OR u.Id IN (
+      SELECT UserId FROM Badges WHERE Name LIKE '%Master%'
+    )
+  )
+GROUP BY
+  u.Id,
+  u.DisplayName,
+  u.Reputation,
+  u.CreationDate,
+  u.Views,
+  u.UpVotes,
+  u.DownVotes,
+  ups.UpVotesReceived,
+  downs.DownVotesReceived,
+  favs.FavoritesReceived,
+  upa.TotalPostsOwned,
+  upa.QuestionsOwned,
+  upa.AnswersOwned,
+  upa.AverageScore,
+  upa.MaxViewCount,
+  upa.TotalFavorites,
+  lps.LatestStatus,
+  lps.StatusChangeDate,
+  lps.StatusChangerUserId,
+  lps.StatusComment,
+  u.WebsiteUrl,
+  u.AboutMe,
+  gb.GoldBadges,
+  sb.SilverBadges,
+  bb.BronzeBadges,
+  p.AnswerCount,
+  p.CommentCount,
+  p.Title,
+  p.Tags,
+  p.Score,
+  p.ViewCount,
+  p.CommunityOwnedDate,
+  p.ClosedDate,
+  p.Id,
+  p.Body
+ORDER BY
+  u.Reputation DESC,
+  u.CreationDate ASC
+LIMIT 100;

@@ -1,0 +1,303 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        AVG(p.Score) as AvgPostScore,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags)-2)), ', ') as AllTags,
+        CASE WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 0 THEN 
+            COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) 
+        ELSE 0 END as QuestionCount,
+        CASE WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) > 0 THEN 
+            COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) 
+        ELSE 0 END as AnswerCount,
+        CASE WHEN COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 0 THEN 
+            CAST(COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS DOUBLE PRECISION) / 
+            COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) 
+        ELSE 0 END as AnswerToQuestionRatio
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId OR u.Id = p.LastEditorUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes
+),
+TopPosts AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) as ScoreRank,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.ViewCount DESC) as ViewRank,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) as OverallScoreRank,
+        LAG(p.Score, 1) OVER (ORDER BY p.Score DESC) as PrevScore,
+        LEAD(p.Score, 1) OVER (ORDER BY p.Score DESC) as NextScore
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) AND p.Score > 0
+),
+UserActivity AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 1 THEN ph.PostId END) as TitleEdits,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 2 THEN ph.PostId END) as BodyEdits,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 3 THEN ph.PostId END) as TagEdits,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.PostId END) as CloseVotes,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.PostId END) as ReopenVotes,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 17 THEN ph.PostId END) as Migrations,
+        COUNT(*) as TotalEdits,
+        STRING_AGG(DISTINCT CAST(ph.PostHistoryTypeId AS VARCHAR), ', ') as EditTypes
+    FROM Users u
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    GROUP BY u.Id, u.DisplayName
+),
+UserPerformance AS (
+    SELECT 
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.PostCount,
+        us.CommentCount,
+        us.BadgeCount,
+        us.AvgPostScore,
+        us.QuestionCount,
+        us.AnswerCount,
+        us.AnswerToQuestionRatio,
+        us.AllTags,
+        CASE WHEN us.PostCount > 0 THEN 
+            CAST(us.QuestionCount AS DOUBLE PRECISION) / us.PostCount 
+        ELSE 0 END as QuestionPercentage,
+        CASE WHEN us.PostCount > 0 THEN 
+            CAST(us.AnswerCount AS DOUBLE PRECISION) / us.PostCount 
+        ELSE 0 END as AnswerPercentage,
+        CASE WHEN us.AnswerCount > 0 THEN 
+            CAST(us.QuestionCount AS DOUBLE PRECISION) / us.AnswerCount 
+        ELSE 0 END as QuestionToAnswerRatio,
+        CASE WHEN us.QuestionCount > 0 THEN 
+            CAST(us.AnswerCount AS DOUBLE PRECISION) / us.QuestionCount 
+        ELSE 0 END as QARatio,
+        CASE WHEN us.Reputation > 0 THEN 
+            us.PostCount * 100.0 / us.Reputation 
+        ELSE 0 END as ProductivityIndex,
+        CASE WHEN us.Reputation > 0 THEN 
+            us.BadgeCount * 1000.0 / us.Reputation 
+        ELSE 0 END as BadgeReputationRatio,
+        NULL::INTEGER as ScoreRank,
+        NULL::INTEGER as ViewRank,
+        CASE WHEN us.Reputation > 10000 AND us.QuestionCount > 100 THEN 'Top10Score' 
+             WHEN us.Reputation > 5000 AND us.QuestionCount > 50 THEN 'Top50Score'
+             ELSE 'Below50Score' 
+        END as ScoreTier,
+        CASE WHEN us.Reputation > 10000 AND us.QuestionCount > 100 THEN 'Top10View' 
+             WHEN us.Reputation > 5000 AND us.QuestionCount > 50 THEN 'Top50View'
+             ELSE 'Below50View' 
+        END as ViewTier
+    FROM UserStats us
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        CASE WHEN t.Count > 1000 THEN 'HighTrafficTag'
+             WHEN t.Count > 100 THEN 'MediumTrafficTag'
+             WHEN t.Count > 10 THEN 'LowTrafficTag'
+             ELSE 'VeryLowTrafficTag'
+        END as TrafficCategory,
+        CASE WHEN t.IsModeratorOnly = TRUE OR t.IsModeratorOnly = 1 THEN 'ModeratorOnlyTag'
+             ELSE 'PublicTag'
+        END as AccessLevel,
+        CASE WHEN t.IsRequired = TRUE OR t.IsRequired = 1 THEN 'RequiredTag'
+             ELSE 'OptionalTag'
+        END as RequiredLevel
+    FROM Tags t
+),
+CombinedAnalysis AS (
+    SELECT 
+        up.UserId,
+        up.DisplayName,
+        up.Reputation,
+        up.PostCount,
+        up.CommentCount,
+        up.BadgeCount,
+        up.QuestionCount,
+        up.AnswerCount,
+        up.AnswerToQuestionRatio,
+        up.QuestionPercentage,
+        up.AnswerPercentage,
+        up.QARatio,
+        up.ProductivityIndex,
+        up.BadgeReputationRatio,
+        up.ScoreTier,
+        up.ViewTier,
+        ta.TagName,
+        ta.Count as TagCount,
+        ta.TrafficCategory,
+        ta.AccessLevel,
+        ta.RequiredLevel,
+        CASE WHEN up.Reputation > 10000 AND up.QuestionCount > 100 THEN 'EliteAuthor'
+             WHEN up.Reputation > 5000 AND up.QuestionCount > 50 THEN 'ExperiencedAuthor'
+             WHEN up.Reputation > 1000 AND up.QuestionCount > 10 THEN 'RegularAuthor'
+             ELSE 'NewAuthor'
+        END as AuthorLevel,
+        CASE WHEN up.AnswerCount > 500 THEN 'ExpertAnswerer'
+             WHEN up.AnswerCount > 100 THEN 'ExperiencedAnswerer'
+             WHEN up.AnswerCount > 10 THEN 'RegularAnswerer'
+             ELSE 'NewAnswerer'
+        END as AnswererLevel,
+        CASE WHEN up.BadgeCount > 50 THEN 'BadgeCollector'
+             WHEN up.BadgeCount > 20 THEN 'ActiveBadgeUser'
+             WHEN up.BadgeCount > 5 THEN 'RegularBadgeUser'
+             ELSE 'NewBadgeUser'
+        END as BadgeLevel,
+        CASE WHEN up.AnswerToQuestionRatio > 2 THEN 'HighlyActiveAnswerer'
+             WHEN up.AnswerToQuestionRatio > 1 THEN 'ActiveAnswerer'
+             WHEN up.AnswerToQuestionRatio > 0.5 THEN 'ModerateAnswerer'
+             ELSE 'MinimalAnswerer'
+        END as AnswerActivityLevel,
+        CASE WHEN up.ProductivityIndex > 2 THEN 'HighlyProductive'
+             WHEN up.ProductivityIndex > 1 THEN 'Productive'
+             WHEN up.ProductivityIndex > 0.5 THEN 'ModeratelyProductive'
+             ELSE 'LowProductivity'
+        END as ProductivityLevel,
+        CASE WHEN up.BadgeReputationRatio > 0.1 THEN 'HighBadgeReputationRatio'
+             WHEN up.BadgeReputationRatio > 0.05 THEN 'ModerateBadgeReputationRatio'
+             WHEN up.BadgeReputationRatio > 0.01 THEN 'LowBadgeReputationRatio'
+             ELSE 'VeryLowBadgeReputationRatio'
+        END as BadgeReputationLevel,
+        ROW_NUMBER() OVER (ORDER BY up.Reputation DESC, up.QuestionCount DESC) as OverallRank,
+        CASE WHEN up.Reputation > (SELECT AVG(Reputation) FROM Users) THEN 'AboveAverage'
+             ELSE 'BelowAverage'
+        END as ReputationLevel
+    FROM UserPerformance up
+    CROSS JOIN TagAnalysis ta
+    WHERE up.Reputation > 1000 AND ta.Count > 10
+),
+FilteredCombined AS (
+    SELECT *
+    FROM (
+        SELECT 
+            ca.*,
+            ROW_NUMBER() OVER (PARTITION BY ca.UserId ORDER BY ca.TagCount DESC) AS rn
+        FROM CombinedAnalysis ca
+        WHERE ca.Reputation > 5000 AND ca.QuestionCount > 10
+    ) t
+    WHERE t.rn = 1
+)
+SELECT 
+    ca.UserId,
+    ca.DisplayName,
+    ca.Reputation,
+    ca.QuestionCount,
+    ca.AnswerCount,
+    ca.AnswerToQuestionRatio,
+    ca.QuestionPercentage,
+    ca.AnswerPercentage,
+    ca.QARatio,
+    ca.ProductivityIndex,
+    ca.BadgeReputationRatio,
+    ca.ScoreTier,
+    ca.ViewTier,
+    ca.TagName,
+    ca.TagCount,
+    ca.TrafficCategory,
+    ca.AccessLevel,
+    ca.RequiredLevel,
+    ca.AuthorLevel,
+    ca.AnswererLevel,
+    ca.BadgeLevel,
+    ca.AnswerActivityLevel,
+    ca.ProductivityLevel,
+    ca.BadgeReputationLevel,
+    ca.OverallRank,
+    ca.ReputationLevel,
+    CONCAT('User_', ca.UserId, '_Tag_', ca.TagName) as UserTagIdentifier,
+    CASE 
+        WHEN ca.Reputation > 100000 AND ca.BadgeCount > 100 THEN 'LegendaryUser'
+        WHEN ca.Reputation > 50000 AND ca.BadgeCount > 50 THEN 'VeteranUser'
+        WHEN ca.Reputation > 10000 AND ca.BadgeCount > 20 THEN 'ExperiencedUser'
+        ELSE 'RegularUser'
+    END as UserRanking,
+    DENSE_RANK() OVER (PARTITION BY ca.TrafficCategory ORDER BY ca.Reputation DESC) as TrafficCategoryRank,
+    PERCENT_RANK() OVER (ORDER BY ca.Reputation DESC) as ReputationPercentile,
+    NTILE(10) OVER (ORDER BY ca.Reputation DESC) as ReputationDecile,
+    CASE WHEN ca.Reputation < (SELECT AVG(Reputation) FROM Users) * 0.5 THEN 'LowReputationUser'
+         WHEN ca.Reputation < (SELECT AVG(Reputation) FROM Users) THEN 'BelowAverageReputationUser'
+         WHEN ca.Reputation > (SELECT AVG(Reputation) FROM Users) * 2 THEN 'HighReputationUser'
+         ELSE 'AverageReputationUser'
+    END as ReputationCategory,
+    COALESCE(
+        CASE WHEN ca.QuestionCount > 0 THEN 
+            CAST(ca.AnswerCount AS DOUBLE PRECISION) / ca.QuestionCount 
+        ELSE 0 END, 0) AS QuestionAnswerRatio,
+    COALESCE(
+        CASE WHEN ca.AnswerToQuestionRatio > 0 THEN 
+            100.0 * (ca.AnswerToQuestionRatio - 1) / ca.AnswerToQuestionRatio 
+        ELSE 0 END, 0) AS ActivityEfficiency,
+    CAST(100 * CASE 
+        WHEN ca.QuestionCount > 0 THEN 
+            CAST(ca.AnswerCount AS DOUBLE PRECISION) / ca.QuestionCount 
+        ELSE 0 
+    END AS INTEGER) AS AnswerPercentageValue,
+    CAST(100 * CASE 
+        WHEN ca.PostCount > 0 THEN 
+            CAST(ca.QuestionCount AS DOUBLE PRECISION) / ca.PostCount 
+        ELSE 0 
+    END AS INTEGER) AS QuestionPercentageValue,
+    CASE 
+        WHEN ca.Reputation > 100000 THEN 'VeryHigh'
+        WHEN ca.Reputation > 50000 THEN 'High'
+        WHEN ca.Reputation > 10000 THEN 'Medium'
+        WHEN ca.Reputation > 1000 THEN 'Low'
+        ELSE 'VeryLow'
+    END as ReputationLevelIndicator,
+    CASE 
+        WHEN ca.TagCount > 1000 THEN 'PopularTag'
+        WHEN ca.TagCount > 100 THEN 'CommonTag'
+        WHEN ca.TagCount > 10 THEN 'SpecificTag'
+        ELSE 'NicheTag'
+    END as TagPopularity,
+    CASE 
+        WHEN ca.BadgeCount > 100 THEN 'AwardWinning'
+        WHEN ca.BadgeCount > 50 THEN 'BadgeAchiever'
+        WHEN ca.BadgeCount > 10 THEN 'BadgeEnthusiast'
+        ELSE 'BadgeNewbie'
+    END as BadgeAchievement,
+    CASE 
+        WHEN ca.AnswerCount > 1000 THEN 'AnswerKing'
+        WHEN ca.AnswerCount > 500 THEN 'AnswerMaster'
+        WHEN ca.AnswerCount > 100 THEN 'AnswerExpert'
+        ELSE 'AnswerBeginner'
+    END as AnswerExpertise,
+    CASE 
+        WHEN ca.QuestionCount > 100 THEN 'QuestionKing'
+        WHEN ca.QuestionCount > 50 THEN 'QuestionMaster'
+        WHEN ca.QuestionCount > 10 THEN 'QuestionExpert'
+        ELSE 'QuestionBeginner'
+    END as QuestionExpertise,
+    CASE WHEN ca.ScoreTier = 'Top10Score' OR ca.ViewTier = 'Top10View' THEN 1 ELSE 0 END as TopPerformer,
+    CASE WHEN ca.ReputationLevel = 'AboveAverage' THEN 1 ELSE 0 END as AboveAverageReputation,
+    CASE WHEN ca.BadgeReputationRatio > 0.05 THEN 1 ELSE 0 END as ActiveBadgeUser,
+    CASE WHEN COALESCE(NULLIF(ca.QualityAdjustment, NULL), 0) > 0.8 THEN 1 ELSE 0 END as HighQualityContributor
+FROM FilteredCombined ca
+ORDER BY ca.Reputation DESC, ca.TagCount DESC
+LIMIT 1000 OFFSET 500;

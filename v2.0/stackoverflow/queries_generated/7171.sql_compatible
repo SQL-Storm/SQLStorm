@@ -1,0 +1,330 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        MAX(p.CreationDate) as LastPostDate,
+        AVG(CAST(p.ViewCount AS DOUBLE PRECISION)) as AvgViewCount,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags)-2)), ', ') as AllTags,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 AND COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) > 0 
+            THEN CAST(COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS DOUBLE PRECISION) / COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END)
+            ELSE 0 
+        END as AnswerQuestionRatio,
+        COUNT(DISTINCT CASE WHEN p.Score > 100 THEN p.Id END) as HighScorePosts,
+        COUNT(DISTINCT CASE WHEN p.Score < 0 THEN p.Id END) as NegativeScorePosts
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= DATE '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        PostCount,
+        CommentCount,
+        BadgeCount,
+        QuestionCount,
+        AnswerCount,
+        TotalScore,
+        LastPostDate,
+        AvgViewCount,
+        AllTags,
+        AnswerQuestionRatio,
+        HighScorePosts,
+        NegativeScorePosts,
+        ROW_NUMBER() OVER (ORDER BY TotalScore DESC, Reputation DESC) as RankByScore,
+        DENSE_RANK() OVER (ORDER BY Reputation DESC) as RankByReputation,
+        PERCENT_RANK() OVER (ORDER BY PostCount) as PercentilePostCount,
+        NTILE(10) OVER (ORDER BY CommentCount) as CommentQuartile
+    FROM UserStats
+),
+UserActivity AS (
+    SELECT 
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.PostCount,
+        tu.CommentCount,
+        tu.BadgeCount,
+        tu.QuestionCount,
+        tu.AnswerCount,
+        tu.TotalScore,
+        tu.LastPostDate,
+        tu.AvgViewCount,
+        tu.AllTags,
+        tu.AnswerQuestionRatio,
+        tu.HighScorePosts,
+        tu.NegativeScorePosts,
+        tu.RankByScore,
+        tu.RankByReputation,
+        tu.PercentilePostCount,
+        tu.CommentQuartile,
+        CASE 
+            WHEN tu.PostCount >= 100 AND tu.Reputation >= 10000 THEN 'Elite'
+            WHEN tu.PostCount >= 50 AND tu.Reputation >= 5000 THEN 'Veteran'
+            WHEN tu.PostCount >= 10 AND tu.Reputation >= 1000 THEN 'Regular'
+            WHEN tu.PostCount >= 1 THEN 'Newbie'
+            ELSE 'Inactive'
+        END as UserCategory,
+        CASE 
+            WHEN tu.LastPostDate >= DATE '2023-01-01' THEN 'Active'
+            WHEN tu.LastPostDate >= DATE '2022-01-01' THEN 'Moderately Active'
+            WHEN tu.LastPostDate >= DATE '2021-01-01' THEN 'Occasionally Active'
+            ELSE 'Inactive'
+        END as ActivityLevel,
+        CASE 
+            WHEN tu.QuestionCount * 2 <= tu.AnswerCount THEN 'More Answers'
+            WHEN tu.AnswerCount * 2 <= tu.QuestionCount THEN 'More Questions'
+            ELSE 'Balanced'
+        END as ContributionStyle,
+        COALESCE(tu.AllTags, '') <> '' as HasTags,
+        CASE 
+            WHEN tu.BadgeCount > 20 THEN 'Awarded'
+            WHEN tu.BadgeCount > 10 THEN 'Recognized'
+            WHEN tu.BadgeCount > 0 THEN 'Honored'
+            ELSE 'Unnoticed'
+        END as RecognitionLevel,
+        CASE 
+            WHEN tu.HighScorePosts > 5 AND tu.NegativeScorePosts = 0 THEN 'High Performer'
+            WHEN tu.HighScorePosts > 0 AND tu.NegativeScorePosts > 0 THEN 'Mixed Performance'
+            WHEN tu.HighScorePosts = 0 AND tu.NegativeScorePosts > 0 THEN 'Underperformer'
+            ELSE 'Neutral'
+        END as PerformanceCategory,
+        LAG(tu.Reputation, 1) OVER (ORDER BY tu.Reputation DESC) - tu.Reputation as ReputationDifference,
+        LEAD(tu.Reputation, 1) OVER (ORDER BY tu.Reputation DESC) - tu.Reputation as NextReputationDifference
+    FROM TopUsers tu
+),
+ComplexAnalysis AS (
+    SELECT 
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.PostCount,
+        ua.CommentCount,
+        ua.BadgeCount,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.TotalScore,
+        ua.LastPostDate,
+        ua.AvgViewCount,
+        ua.AllTags,
+        ua.AnswerQuestionRatio,
+        ua.HighScorePosts,
+        ua.NegativeScorePosts,
+        ua.RankByScore,
+        ua.RankByReputation,
+        ua.PercentilePostCount,
+        ua.CommentQuartile,
+        ua.UserCategory,
+        ua.ActivityLevel,
+        ua.ContributionStyle,
+        ua.HasTags,
+        ua.RecognitionLevel,
+        ua.PerformanceCategory,
+        ua.ReputationDifference,
+        ua.NextReputationDifference,
+        CASE 
+            WHEN ua.Reputation > 1000000 THEN 'Legendary'
+            WHEN ua.Reputation > 100000 THEN 'Master'
+            WHEN ua.Reputation > 10000 THEN 'Expert'
+            WHEN ua.Reputation > 1000 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as ReputationTier,
+        CASE 
+            WHEN ua.Reputation > 1000 AND ua.Reputation < 10000 THEN 
+                'This user has a significant presence but is not yet an established expert'
+            WHEN ua.Reputation >= 10000 THEN 
+                'This user has reached expert level with considerable reputation'
+            ELSE 
+                'This user is still building their reputation'
+        END as ReputationAssessment,
+        CASE 
+            WHEN ua.PostCount > 100 THEN 
+                ROUND((ua.QuestionCount * 100.0 / ua.PostCount), 2)
+            ELSE 
+                NULL 
+        END as QuestionPercentage,
+        CASE 
+            WHEN ua.AnswerCount > 100 THEN 
+                ROUND((ua.AnswerCount * 100.0 / ua.PostCount), 2)
+            ELSE 
+                NULL 
+        END as AnswerPercentage,
+        COALESCE(ua.AllTags, '') <> '' as HasAnyTags,
+        CASE 
+            WHEN (ua.QuestionCount + ua.AnswerCount) > 0 
+            THEN 
+                (ua.QuestionCount * 1.0) / (ua.QuestionCount + ua.AnswerCount)
+            ELSE 
+                NULL 
+        END as QuestionProportion,
+        CASE 
+            WHEN ua.Reputation IS NOT NULL AND ua.PostCount IS NOT NULL 
+            THEN 
+                ua.Reputation / NULLIF(ua.PostCount, 0)
+            ELSE 
+                NULL 
+        END as RepPerPost
+    FROM UserActivity ua
+)
+SELECT 
+    ca.UserId,
+    ca.DisplayName,
+    ca.Reputation,
+    ca.PostCount,
+    ca.CommentCount,
+    ca.BadgeCount,
+    ca.QuestionCount,
+    ca.AnswerCount,
+    ca.TotalScore,
+    ca.LastPostDate,
+    ca.AvgViewCount,
+    ca.AllTags,
+    ca.AnswerQuestionRatio,
+    ca.HighScorePosts,
+    ca.NegativeScorePosts,
+    ca.RankByScore,
+    ca.RankByReputation,
+    ca.PercentilePostCount,
+    ca.CommentQuartile,
+    ca.UserCategory,
+    ca.ActivityLevel,
+    ca.ContributionStyle,
+    ca.HasTags,
+    ca.RecognitionLevel,
+    ca.PerformanceCategory,
+    ca.ReputationDifference,
+    ca.NextReputationDifference,
+    ca.ReputationTier,
+    ca.ReputationAssessment,
+    ca.QuestionPercentage,
+    ca.AnswerPercentage,
+    ca.HasAnyTags,
+    ca.QuestionProportion,
+    ca.RepPerPost,
+    CASE 
+        WHEN ca.Reputation < 500 THEN 'Low'
+        WHEN ca.Reputation BETWEEN 500 AND 4999 THEN 'Medium'
+        WHEN ca.Reputation BETWEEN 5000 AND 9999 THEN 'High'
+        WHEN ca.Reputation BETWEEN 10000 AND 99999 THEN 'Very High'
+        ELSE 'Elite'
+    END as ReputationLevel,
+    CASE 
+        WHEN ca.PostCount > 0 THEN 
+            (ca.TotalScore * 100.0) / NULLIF(ca.PostCount, 0)
+        ELSE 
+            0 
+    END as AverageScorePerPost,
+    CASE 
+        WHEN ca.Reputation > 0 THEN 
+            (ca.Reputation * 1.0) / NULLIF(ca.BadgeCount, 0)
+        ELSE 
+            0 
+    END as ReputationPerBadge,
+    CASE 
+        WHEN ca.Reputation > 0 AND ca.AnswerCount > 0 THEN 
+            (ca.AnswerCount * 100.0) / NULLIF(ca.Reputation, 0)
+        ELSE 
+            0 
+    END as AnswersPerReputation,
+    CASE 
+        WHEN ca.Reputation > 0 THEN 
+            (ca.AnswerCount * 1.0) / NULLIF(ca.QuestionCount, 0)
+        ELSE 
+            NULL 
+    END as AnswerToQuestionRatio,
+    COALESCE(SUBSTRING(ca.AllTags FROM 1 FOR 50), '') as TagsPreview,
+    CASE 
+        WHEN (
+            ca.UserCategory = 'Elite' 
+            OR ca.ReputationTier = 'Legendary'
+            OR ca.RecognitionLevel = 'Awarded'
+        ) THEN 'High Achiever'
+        ELSE 'Ordinary User'
+    END as AchievementStatus,
+    CASE 
+        WHEN ca.Reputation > 5000 AND ca.PostCount > 200 THEN 'Power User'
+        WHEN ca.PostCount > 100 AND ca.AnswerCount > 50 THEN 'Active Contributor'
+        WHEN ca.QuestionCount > 50 OR ca.AnswerCount > 100 THEN 'Engaged Member'
+        ELSE 'Regular Participant'
+    END as UserClassification,
+    CASE 
+        WHEN ca.ActivityLevel = 'Active' AND ca.ContributionStyle = 'More Answers' THEN 'Active Answerer'
+        WHEN ca.ActivityLevel = 'Active' AND ca.ContributionStyle = 'More Questions' THEN 'Active Questioner'
+        WHEN ca.ActivityLevel = 'Moderately Active' THEN 'Moderate Contributor'
+        ELSE 'Passive Member'
+    END as ContributionPattern,
+    CASE 
+        WHEN ca.RepPerPost IS NOT NULL AND ca.RepPerPost > 1000 THEN 'High Value Contributor'
+        WHEN ca.RepPerPost IS NOT NULL AND ca.RepPerPost BETWEEN 10 AND 1000 THEN 'Standard Contributor'
+        WHEN ca.RepPerPost IS NOT NULL AND ca.RepPerPost < 10 THEN 'New Contributor'
+        ELSE 'None'
+    END as ValueClassification,
+    CASE 
+        WHEN ca.PerformanceCategory = 'High Performer' AND 
+             ca.Reputation > 5000 THEN 'Top Performer'
+        WHEN ca.PerformanceCategory = 'Mixed Performance' AND 
+             ca.Reputation > 5000 THEN 'Consistent Performer'
+        WHEN ca.PerformanceCategory = 'Underperformer' AND 
+             ca.Reputation > 5000 THEN 'Potential Performer'
+        ELSE 'Needs Improvement'
+    END as PerformanceAssessment,
+    CASE 
+        WHEN ca.ContributionStyle = 'More Answers' THEN 'Answer-focused'
+        WHEN ca.ContributionStyle = 'More Questions' THEN 'Question-focused'
+        WHEN ca.ContributionStyle = 'Balanced' THEN 'Balanced Contributor'
+        ELSE 'Unknown'
+    END as EngagementStyle,
+    CASE 
+        WHEN ca.Reputation > 1000 AND ca.BadgeCount > 10 THEN 'Awarded User'
+        WHEN ca.Reputation > 500 THEN 'Recognized User'
+        WHEN ca.BadgeCount > 5 THEN 'Badge Holder'
+        ELSE 'New User'
+    END as AwardStatus
+FROM ComplexAnalysis ca
+WHERE 
+    ca.UserId IN (
+        SELECT UserId FROM UserStats 
+        WHERE PostCount > 50 
+        ORDER BY Reputation DESC 
+        LIMIT 500
+    )
+    AND (
+        ca.UserCategory = 'Elite' 
+        OR ca.ReputationTier IN ('Master', 'Expert')
+        OR ca.RecognitionLevel IN ('Awarded', 'Recognized')
+    )
+    AND ca.TotalScore > (
+        SELECT AVG(TotalScore) 
+        FROM UserStats 
+        WHERE PostCount > 50
+    )
+    AND (
+        ca.QuestionCount > 10 
+        OR ca.AnswerCount > 10 
+        OR ca.BadgeCount > 5
+    )
+    OR (
+        ca.Reputation > 1000 
+        AND ca.PostCount > 20 
+        AND ca.CommentCount > 10
+    )
+ORDER BY 
+    ca.Reputation DESC,
+    ca.TotalScore DESC,
+    ca.PostCount DESC
+LIMIT 1000;

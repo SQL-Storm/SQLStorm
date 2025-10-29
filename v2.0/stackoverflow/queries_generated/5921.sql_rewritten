@@ -1,0 +1,72 @@
+-- {"query": "5921.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 627} 
+WITH recent_votes AS (
+  SELECT
+    v.PostId,
+    v.VoteTypeId,
+    v.UserId,
+    v.CreationDate,
+    u.Reputation,
+    u.DisplayName,
+    p.PostTypeId,
+    p.Title,
+    p.Tags,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate AS PostCreationDate,
+    -- window: running sum of UpMod (2) minus DownMod (3) per post
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1
+             WHEN v.VoteTypeId = 3 THEN -1
+             ELSE 0 END) OVER (PARTITION BY v.PostId ORDER BY v.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS net_votes_up_down
+  FROM Votes v
+  JOIN Posts p ON p.Id = v.PostId
+  LEFT JOIN Users u ON u.Id = v.UserId
+  WHERE v.VoteTypeId IN (2,3)
+),
+qualified_posts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate AS PostCreationDate,
+    rd.net_votes_up_down,
+    u.Reputation AS OwnerReputation,
+    u.DisplayName AS OwnerDisplayName,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCount,
+    (SELECT COUNT(*) FROM Votes vv WHERE vv.PostId = p.Id AND vv.VoteTypeId = 2) AS UpVotes
+  FROM Posts p
+  LEFT JOIN recent_votes rd ON rd.PostId = p.Id
+  LEFT JOIN Users u ON u.Id = p.OwnerUserId
+  WHERE p.PostTypeId = 1 -- questions
+    AND p.ViewCount > 100
+    AND p.Score > 0
+    AND p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '180 days'
+),
+segmented AS (
+  SELECT
+    qp.*,
+    CAST(EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - qp.PostCreationDate)) / 86400 AS int) AS age_days,
+    COALESCE(STRING_AGG(DISTINCT t.TagName, ',') OVER (PARTITION BY qp.PostId), '') AS tagstring
+  FROM qualified_posts qp
+  LEFT JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(qp.Tags, 2, length(qp.Tags)-2), '><')) AS TagName
+  ) t ON TRUE
+)
+SELECT
+  s.PostId,
+  s.Title,
+  s.OwnerDisplayName,
+  s.OwnerReputation,
+  s.ViewCount,
+  s.Score,
+  s.CommentCount,
+  s.UpVotes,
+  s.net_votes_up_down,
+  s.age_days,
+  s.tagstring
+FROM segmented s
+ORDER BY s.net_votes_up_down DESC, s.ViewCount DESC
+LIMIT 100;

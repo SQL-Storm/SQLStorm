@@ -1,0 +1,225 @@
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS UserUpVotes,
+        U.DownVotes AS UserDownVotes,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN P.Score ELSE 0 END) AS TotalQuestionScore,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN P.Score ELSE 0 END) AS TotalAnswerScore,
+        SUM(P.ViewCount) AS TotalPostViews,
+        COUNT(DISTINCT P.Id) AS TotalPostsAuthored,
+        AVG(CASE WHEN P.PostTypeId = 1 THEN P.Score ELSE NULL END) AS AvgQuestionScore,
+        AVG(CASE WHEN P.PostTypeId = 2 THEN P.Score ELSE NULL END) AS AvgAnswerScore
+    FROM Users AS U
+    LEFT JOIN Posts AS P ON U.Id = P.OwnerUserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.Views, U.UpVotes, U.DownVotes
+    HAVING SUM(CASE WHEN P.PostTypeId IN (1, 2) THEN 1 ELSE 0 END) > 5 OR U.Reputation > 1000
+),
+PostEditActivity AS (
+    SELECT
+        P.OwnerUserId AS UserId,
+        PH.PostId,
+        MAX(P.LastActivityDate) AS LastActivityDate,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (4, 7) THEN PH.RevisionGUID ELSE NULL END) AS TitleEditCount,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (5, 8) THEN PH.RevisionGUID ELSE NULL END) AS BodyEditCount,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (6, 9) THEN PH.RevisionGUID ELSE NULL END) AS TagsEditCount,
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE NULL END) AS ClosedCount,
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE NULL END) AS ReopenedCount,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN PH.CreationDate ELSE NULL END) AS LastClosedDate,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 11 THEN PH.CreationDate ELSE NULL END) AS LastReopenedDate
+    FROM Posts AS P
+    JOIN PostHistory AS PH ON P.Id = PH.PostId
+    WHERE P.OwnerUserId IS NOT NULL AND P.PostTypeId IN (1, 2)
+    GROUP BY P.OwnerUserId, PH.PostId
+),
+AggregatedPostEditActivity AS (
+    SELECT
+        UserId,
+        SUM(TitleEditCount) AS TotalTitleEdits,
+        SUM(BodyEditCount) AS TotalBodyEdits,
+        SUM(TagsEditCount) AS TotalTagsEdits,
+        SUM(ClosedCount) AS TotalClosedPosts,
+        SUM(ReopenedCount) AS TotalReopenedPosts,
+        MAX(LastClosedDate) AS LatestPostClosedDate,
+        MAX(LastReopenedDate) AS LatestPostReopenedDate,
+        COUNT(DISTINCT PostId) AS PostsWithEdits
+    FROM PostEditActivity
+    GROUP BY UserId
+),
+CommentSummary AS (
+    SELECT
+        C.UserId,
+        COUNT(C.Id) AS TotalCommentsMade,
+        SUM(C.Score) AS TotalCommentScore,
+        AVG(C.Score) AS AvgCommentScore,
+        COUNT(DISTINCT C.PostId) AS DistinctPostsCommentedOn
+    FROM Comments AS C
+    WHERE C.UserId IS NOT NULL
+    GROUP BY C.UserId
+),
+UserBadgeAwards AS (
+    SELECT
+        B.UserId,
+        COUNT(B.Id) AS TotalBadges,
+        COUNT(CASE WHEN B.Class = 1 THEN 1 ELSE NULL END) AS GoldBadges,
+        COUNT(CASE WHEN B.Class = 2 THEN 1 ELSE NULL END) AS SilverBadges,
+        COUNT(CASE WHEN B.Class = 3 THEN 1 ELSE NULL END) AS BronzeBadges,
+        COUNT(CASE WHEN B.TagBased = TRUE THEN 1 ELSE NULL END) AS TagBasedBadges,
+        MAX(B.Date) AS LatestBadgeDate
+    FROM Badges AS B
+    GROUP BY B.UserId
+),
+QuestionTagAnalysis AS (
+    SELECT
+        P.OwnerUserId AS UserId,
+        TRIM(unnest(string_to_array(substring(P.Tags, 2, length(P.Tags)-2), '><'))) AS TagName,
+        P.Id AS PostId
+    FROM Posts AS P
+    WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL AND P.OwnerUserId IS NOT NULL
+),
+AggregatedTagUsage AS (
+    SELECT
+        UserId,
+        TagName,
+        COUNT(DISTINCT PostId) AS TaggedQuestionCount,
+        ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY COUNT(DISTINCT PostId) DESC, TagName) AS TagRank
+    FROM QuestionTagAnalysis
+    GROUP BY UserId, TagName
+),
+TopTagsPerUser AS (
+    SELECT
+        UserId,
+        MAX(CASE WHEN TagRank = 1 THEN TagName || ' (' || TaggedQuestionCount || ')' ELSE NULL END) AS TopTag1,
+        MAX(CASE WHEN TagRank = 2 THEN TagName || ' (' || TaggedQuestionCount || ')' ELSE NULL END) AS TopTag2,
+        MAX(CASE WHEN TagRank = 3 THEN TagName || ' (' || TaggedQuestionCount || ')' ELSE NULL END) AS TopTag3
+    FROM AggregatedTagUsage
+    WHERE TagRank <= 3
+    GROUP BY UserId
+),
+PostLinkSummary AS (
+    SELECT
+        P.OwnerUserId AS UserId,
+        COUNT(CASE WHEN PL.LinkTypeId = 1 THEN 1 ELSE NULL END) AS LinkedFromCount,
+        COUNT(CASE WHEN PL.LinkTypeId = 3 THEN 1 ELSE NULL END) AS DuplicateOfCount
+    FROM Posts AS P
+    JOIN PostLinks AS PL ON P.Id = PL.RelatedPostId
+    WHERE P.OwnerUserId IS NOT NULL
+    GROUP BY P.OwnerUserId
+),
+PostPerformanceRanking AS (
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId AS UserId,
+        P.Score,
+        P.ViewCount,
+        P.CreationDate,
+        P.AcceptedAnswerId,
+        P.PostTypeId,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.Score DESC, P.ViewCount DESC, P.CreationDate DESC) AS RankByScoreViews,
+        NTILE(4) OVER (PARTITION BY P.OwnerUserId ORDER BY P.CreationDate) AS CreationDateQuartile
+    FROM Posts AS P
+    WHERE P.OwnerUserId IS NOT NULL AND P.PostTypeId IN (1, 2)
+),
+CriticalPostEvents AS (
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId AS UserId,
+        'Closed_As_Duplicate' AS EventType,
+        P.ClosedDate AS EventDate
+    FROM Posts AS P
+    JOIN PostHistory PH ON P.Id = PH.PostId
+    WHERE P.PostTypeId = 1
+      AND PH.PostHistoryTypeId = 10
+      AND PH.Comment IN ('101', '1')
+      AND P.OwnerUserId IS NOT NULL
+    UNION ALL
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId AS UserId,
+        'Accepted_Answer' AS EventType,
+        V.CreationDate AS EventDate
+    FROM Posts AS P
+    JOIN Votes AS V ON P.Id = V.PostId
+    WHERE P.PostTypeId = 2
+      AND V.VoteTypeId = 1
+      AND P.OwnerUserId IS NOT NULL
+),
+CriticalPostEventSummary AS (
+    SELECT
+        UserId,
+        COUNT(DISTINCT PostId) AS TotalCriticalPosts,
+        COUNT(DISTINCT CASE WHEN EventType = 'Closed_As_Duplicate' THEN PostId ELSE NULL END) AS ClosedAsDuplicateCount,
+        COUNT(DISTINCT CASE WHEN EventType = 'Accepted_Answer' THEN PostId ELSE NULL END) AS AcceptedAnswerCount,
+        MAX(EventDate) AS LatestCriticalEvent
+    FROM CriticalPostEvents
+    GROUP BY UserId
+)
+SELECT
+    UE.UserId,
+    UE.DisplayName,
+    UE.Reputation,
+    UE.UserCreationDate,
+    UE.LastAccessDate,
+    UE.UserProfileViews,
+    UE.UserUpVotes,
+    UE.UserDownVotes,
+    UE.TotalQuestions,
+    UE.TotalAnswers,
+    UE.TotalQuestionScore,
+    UE.TotalAnswerScore,
+    UE.TotalPostViews,
+    UE.TotalPostsAuthored,
+    COALESCE(UE.AvgQuestionScore, 0.0) AS AvgQuestionScore,
+    COALESCE(UE.AvgAnswerScore, 0.0) AS AvgAnswerScore,
+    COALESCE(APE.TotalTitleEdits, 0) AS TotalTitleEdits,
+    COALESCE(APE.TotalBodyEdits, 0) AS TotalBodyEdits,
+    COALESCE(APE.TotalTagsEdits, 0) AS TotalTagsEdits,
+    COALESCE(APE.TotalClosedPosts, 0) AS TotalClosedPosts,
+    COALESCE(APE.TotalReopenedPosts, 0) AS TotalReopenedPosts,
+    APE.LatestPostClosedDate,
+    APE.LatestPostReopenedDate,
+    COALESCE(CS.TotalCommentsMade, 0) AS TotalCommentsMade,
+    COALESCE(CS.TotalCommentScore, 0) AS TotalCommentScore,
+    COALESCE(CS.AvgCommentScore, 0.0) AS AvgCommentScore,
+    COALESCE(CS.DistinctPostsCommentedOn, 0) AS DistinctPostsCommentedOn,
+    COALESCE(UBA.TotalBadges, 0) AS TotalBadges,
+    COALESCE(UBA.GoldBadges, 0) AS GoldBadges,
+    COALESCE(UBA.SilverBadges, 0) AS SilverBadges,
+    COALESCE(UBA.BronzeBadges, 0) AS BronzeBadges,
+    COALESCE(UBA.TagBasedBadges, 0) AS TagBasedBadges,
+    UBA.LatestBadgeDate,
+    TTPU.TopTag1,
+    TTPU.TopTag2,
+    TTPU.TopTag3,
+    COALESCE(PLS.LinkedFromCount, 0) AS TotalLinkedFromPosts,
+    COALESCE(PLS.DuplicateOfCount, 0) AS TotalDuplicateOfPosts,
+    COALESCE(CPS.TotalCriticalPosts, 0) AS TotalCriticalPostsIdentified,
+    COALESCE(CPS.ClosedAsDuplicateCount, 0) AS UserClosedAsDuplicateCount,
+    COALESCE(CPS.AcceptedAnswerCount, 0) AS UserAcceptedAnswerCount,
+    CPS.LatestCriticalEvent,
+    (SELECT COUNT(DISTINCT PPR.PostId)
+     FROM PostPerformanceRanking AS PPR
+     WHERE PPR.UserId = UE.UserId AND PPR.RankByScoreViews = 1 AND PPR.Score > 0 AND PPR.PostTypeId = 1
+    ) AS TopScoringQuestionCount,
+    (SELECT AVG(PPR.Score)
+     FROM PostPerformanceRanking AS PPR
+     WHERE PPR.UserId = UE.UserId AND PPR.CreationDateQuartile = 1 AND PPR.PostTypeId = 1 AND PPR.AcceptedAnswerId IS NOT NULL
+    ) AS AvgScoreEarlyAcceptedQuestions,
+    RANK() OVER (ORDER BY (UE.TotalQuestionScore + UE.TotalAnswerScore) DESC, UE.Reputation DESC, UE.UserProfileViews DESC) AS GlobalActivityRank,
+    DENSE_RANK() OVER (ORDER BY UE.TotalPostsAuthored DESC, COALESCE(APE.PostsWithEdits, 0) DESC) AS ProlificAuthorRank,
+    (UE.Reputation * 0.4 + UE.UserProfileViews * 0.05 + COALESCE(CS.TotalCommentsMade, 0) * 0.15 + COALESCE(UBA.TotalBadges, 0) * 0.2 + COALESCE(CPS.TotalCriticalPosts, 0) * 0.2) AS CustomUserEngagementScore
+FROM UserEngagement AS UE
+LEFT JOIN AggregatedPostEditActivity AS APE ON UE.UserId = APE.UserId
+LEFT JOIN CommentSummary AS CS ON UE.UserId = CS.UserId
+LEFT JOIN UserBadgeAwards AS UBA ON UE.UserId = UBA.UserId
+LEFT JOIN TopTagsPerUser AS TTPU ON UE.UserId = TTPU.UserId
+LEFT JOIN PostLinkSummary AS PLS ON UE.UserId = PLS.UserId
+LEFT JOIN CriticalPostEventSummary AS CPS ON UE.UserId = CPS.UserId
+ORDER BY GlobalActivityRank ASC, CustomUserEngagementScore DESC
+LIMIT 100;

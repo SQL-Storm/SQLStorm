@@ -1,0 +1,240 @@
+-- {"query": "1813.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3675} 
+WITH TargetedUsers AS (
+    -- This CTE identifies two distinct segments of active users using UNION ALL:
+    -- 1. High-reputation authors with a strong positive vote ratio on their posts.
+    -- 2. Lower-reputation users who are very active in commenting and have a decent number of badges.
+    -- It demonstrates the use of complex predicates, correlated subqueries, and aggregation for initial user selection.
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.LastAccessDate,
+        'HighRep_PositiveVoteRatio' AS UserSegment
+    FROM Users AS u
+    LEFT JOIN (
+        -- Subquery to aggregate vote counts for posts
+        SELECT
+            p.OwnerUserId AS PostOwnerId,
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesOnPosts,
+            SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesOnPosts
+        FROM Posts AS p
+        INNER JOIN Votes AS v ON p.Id = v.PostId
+        WHERE p.OwnerUserId IS NOT NULL
+        GROUP BY p.OwnerUserId
+    ) AS PostVotesAgg ON u.Id = PostVotesAgg.PostOwnerId
+    WHERE u.Reputation > 5000
+      AND u.AccountID IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.LastAccessDate
+    HAVING COALESCE(SUM(PostVotesAgg.TotalUpVotesOnPosts), 0) > COALESCE(SUM(PostVotesAgg.TotalDownVotesOnPosts), 0) * 1.5
+       AND COUNT(DISTINCT (SELECT Id FROM Posts WHERE OwnerUserId = u.Id AND PostTypeId = 1)) > 5 -- At least 5 questions
+       AND COUNT(DISTINCT (SELECT Id FROM Posts WHERE OwnerUserId = u.Id AND PostTypeId = 2)) > 5 -- At least 5 answers
+
+    UNION ALL
+
+    -- Part 2: Low Reputation Commenters who are very active and have earned some badges
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.LastAccessDate,
+        'LowRep_ActiveCommenter' AS UserSegment
+    FROM Users AS u
+    LEFT JOIN Comments AS c ON u.Id = c.UserId
+    LEFT JOIN Badges AS b ON u.Id = b.UserId
+    WHERE u.Reputation <= 100
+      AND u.AccountID IS NOT NULL
+      AND c.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '6 months' -- Recent comments
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.LastAccessDate
+    HAVING COUNT(DISTINCT c.Id) > 100 -- More than 100 comments in total
+       AND COUNT(DISTINCT b.Id) > 10 -- Has at least 10 badges
+),
+UserActivityMetrics AS (
+    -- Aggregates comprehensive user-level activity and counts from various tables for the `TargetedUsers`.
+    -- Includes total posts, comments, badges, and initial post/comment activity dates.
+    SELECT
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.UserSegment,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        u.Views AS TotalProfileViews,
+        u.UpVotes AS TotalGivenUpVotes,
+        u.DownVotes AS TotalGivenDownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPostsCreated,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsAsked,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersProvided,
+        SUM(COALESCE(p.Score, 0)) AS SumOfPostScores,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 1) AS AvgQuestionScore,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 2) AS AvgAnswerScore,
+        COUNT(DISTINCT c.Id) AS TotalCommentsAuthored,
+        COUNT(DISTINCT b.Id) AS TotalBadgesReceived,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+        MAX(p.LastActivityDate) AS LastPostActivityDate,
+        MAX(c.CreationDate) AS LastCommentActivityDate,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL THEN p.Id END) AS ClosedQuestionsCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN p.Id END) AS QuestionsWithAcceptedAnswers,
+        SUM(COALESCE(p.FavoriteCount, 0)) AS TotalFavoriteCountsOnPosts
+    FROM TargetedUsers AS tu
+    INNER JOIN Users AS u ON tu.UserId = u.Id
+    LEFT JOIN Posts AS p ON tu.UserId = p.OwnerUserId
+    LEFT JOIN Comments AS c ON tu.UserId = c.UserId
+    LEFT JOIN Badges AS b ON tu.UserId = b.UserId
+    GROUP BY
+        tu.UserId, tu.DisplayName, tu.Reputation, tu.UserSegment, u.CreationDate, u.LastAccessDate,
+        u.Views, u.UpVotes, u.DownVotes
+),
+PostEditAndVoteAnalysis AS (
+    -- Analyzes post editing patterns and detailed vote counts received on posts owned by the targeted users.
+    -- Includes array aggregation of distinct close reasons and sums of various vote types.
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(ph.Id) AS TotalHistoryEvents,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.PostId END) AS UniquePostsEdited,
+        COUNT(ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (4, 5, 6)) AS TotalEditsMade,
+        MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId IN (4, 5, 6)) AS LastEditDate,
+        ARRAY_AGG(DISTINCT ph_close.Comment) FILTER (WHERE ph_close.PostHistoryTypeId = 10 AND ph_close.Comment IS NOT NULL) AS DistinctCloseReasons,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesReceived, -- UpMod
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesReceived, -- DownMod
+        SUM(CASE WHEN v.VoteTypeId = 1 THEN 1 ELSE 0 END) AS AcceptedAnswersReceived, -- AcceptedByOriginator
+        SUM(CASE WHEN v.VoteTypeId = 8 THEN v.BountyAmount ELSE 0 END) AS TotalBountyGiven, -- BountyStart
+        SUM(CASE WHEN v.VoteTypeId = 9 THEN v.BountyAmount ELSE 0 END) AS TotalBountyReceived -- BountyClose
+    FROM Posts AS p
+    LEFT JOIN PostHistory AS ph ON p.Id = ph.PostId
+    LEFT JOIN PostHistory AS ph_close ON p.Id = ph_close.PostId AND ph_close.PostHistoryTypeId = 10
+    LEFT JOIN Votes AS v ON p.Id = v.PostId
+    WHERE p.OwnerUserId IN (SELECT UserId FROM TargetedUsers) -- Filter for targeted users
+    GROUP BY p.OwnerUserId
+),
+UserTagComplexity AS (
+    -- Extracts, processes, and aggregates tag usage for targeted users.
+    -- Demonstrates string manipulation functions (`SUBSTRING`, `LENGTH`, `TRIM`, `string_to_array`, `unnest`)
+    SELECT
+        ut.UserId,
+        ARRAY_AGG(ut.TagName ORDER BY ut.TagCount DESC, ut.TagName LIMIT 3) AS Top3Tags,
+        AVG(LENGTH(ut.TagName)) AS AvgTagLength,
+        COUNT(DISTINCT ut.TagName) AS UniqueTagsUsed,
+        SUM(ut.TagCount) AS TotalTagUses
+    FROM (
+        SELECT
+            p.OwnerUserId AS UserId,
+            TRIM(unnest(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><'))) AS TagName,
+            COUNT(p.Id) AS TagCount
+        FROM Posts AS p
+        WHERE
+            p.OwnerUserId IN (SELECT UserId FROM TargetedUsers)
+            AND p.Tags IS NOT NULL
+            AND LENGTH(p.Tags) > 2
+            AND p.Tags LIKE '<%><%><%>' -- Ensures posts with at least 3 tags for complexity analysis
+        GROUP BY p.OwnerUserId, TRIM(unnest(string_to_array(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><')))
+    ) AS ut
+    GROUP BY ut.UserId
+),
+PostCommentSentiment AS (
+    -- Analyzes sentiment in comments for posts owned by targeted users using a correlated subquery.
+    -- Counts occurrences of 'great' and 'problem' keywords in comments.
+    SELECT
+        p.OwnerUserId AS UserId,
+        p.Id AS PostId,
+        (SELECT COUNT(c_sub.Id) FROM Comments AS c_sub WHERE c_sub.PostId = p.Id AND c_sub.Text ILIKE '%great%' ) AS GreatCommentCount,
+        (SELECT COUNT(c_sub.Id) FROM Comments AS c_sub WHERE c_sub.PostId = p.Id AND c_sub.Text ILIKE '%problem%' ) AS ProblemCommentCount
+    FROM Posts AS p
+    WHERE p.OwnerUserId IN (SELECT UserId FROM TargetedUsers)
+),
+AggregatedCommentSentiment AS (
+    -- Aggregates the sentiment analysis results per user and calculates a sentiment ratio.
+    SELECT
+        UserId,
+        SUM(GreatCommentCount) AS TotalGreatComments,
+        SUM(ProblemCommentCount) AS TotalProblemComments,
+        CAST(SUM(GreatCommentCount) AS NUMERIC) / NULLIF(SUM(GreatCommentCount) + SUM(ProblemCommentCount), 0) AS UserPostSentimentRatio
+    FROM PostCommentSentiment
+    GROUP BY UserId
+)
+-- Main query to combine all CTEs and apply complex filtering, window functions, and advanced expressions.
+SELECT
+    uam.UserId,
+    uam.DisplayName,
+    uam.Reputation,
+    uam.UserSegment,
+    uam.TotalProfileViews,
+    uam.QuestionsAsked,
+    uam.AnswersProvided,
+    uam.SumOfPostScores,
+    uam.TotalCommentsAuthored,
+    uam.GoldBadges,
+    uam.SilverBadges,
+    uam.BronzeBadges,
+    pea.TotalUpVotesReceived,
+    pea.TotalDownVotesReceived,
+    pea.AcceptedAnswersReceived,
+    pea.TotalBountyGiven,
+    pea.TotalBountyReceived,
+    utc.Top3Tags,
+    utc.AvgTagLength,
+    acs.TotalGreatComments,
+    acs.TotalProblemComments,
+    acs.UserPostSentimentRatio,
+    -- Window function: Ranks users by reputation within their assigned UserSegment and specific post activity category.
+    RANK() OVER (PARTITION BY uam.UserSegment,
+        CASE
+            WHEN uam.QuestionsAsked > 0 AND uam.AnswersProvided > 0 THEN 'Q&A User'
+            WHEN uam.QuestionsAsked > 0 THEN 'Questioner'
+            WHEN uam.AnswersProvided > 0 THEN 'Answerer'
+            ELSE 'Lurker' -- Should be rare due to TargetedUsers filter, but included for completeness
+        END
+        ORDER BY uam.Reputation DESC, uam.SumOfPostScores DESC
+    ) AS ReputationRankByCategory,
+    -- Complicated expression: A weighted score based on the count of different badge classes.
+    (uam.GoldBadges * 1000 + uam.SilverBadges * 100 + uam.BronzeBadges * 10) AS WeightedBadgeScore,
+    -- NULL logic and CASE statement: Determines a detailed activity status based on recent post, comment, or access dates.
+    CASE
+        WHEN uam.LastPostActivityDate IS NOT NULL AND uam.LastPostActivityDate > (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '6 months') THEN 'Highly Active Post'
+        WHEN uam.LastCommentActivityDate IS NOT NULL AND uam.LastCommentActivityDate > (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '6 months') THEN 'Highly Active Comment'
+        WHEN uam.LastAccessDate IS NOT NULL AND uam.LastAccessDate > (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year') THEN 'Recently Accessed'
+        ELSE 'Inactive'
+    END AS DetailedActivityStatus,
+    -- Complicated calculation: A weighted engagement ratio, handling potential division by zero.
+    (CAST(COALESCE(uam.SumOfPostScores, 0) AS NUMERIC) * 0.7
+        + COALESCE(uam.TotalCommentsAuthored, 0) * 0.1
+        + COALESCE(uam.TotalFavoriteCountsOnPosts, 0) * 0.2)
+    / NULLIF(uam.TotalPostsCreated + uam.TotalCommentsAuthored + COALESCE(uam.TotalFavoriteCountsOnPosts, 0), 0) AS WeightedEngagementRatio,
+    -- NULL logic and string expression: Determines user experience with specific close reasons.
+    ARRAY_LENGTH(pea.DistinctCloseReasons, 1) AS DistinctCloseReasonCount,
+    COALESCE(
+        CASE
+            WHEN ARRAY_TO_STRING(pea.DistinctCloseReasons, ', ') ILIKE '%duplicate%' THEN 'ExperiencedDuplicates'
+            WHEN ARRAY_TO_STRING(pea.DistinctCloseReasons, ', ') ILIKE '%off-topic%' THEN 'ExperiencedOffTopic'
+            ELSE NULL
+        END, 'NoSpecificCloseReasonExperience'
+    ) AS CloseReasonExperience,
+    -- String expression: Identifies a primary technology focus based on top used tags.
+    COALESCE(
+        CASE
+            WHEN ARRAY_TO_STRING(utc.Top3Tags, ', ') ILIKE '%javascript%' OR ARRAY_TO_STRING(utc.Top3Tags, ', ') ILIKE '%node%' THEN 'JS/Node Dev'
+            WHEN ARRAY_TO_STRING(utc.Top3Tags, ', ') ILIKE '%python%' OR ARRAY_TO_STRING(utc.Top3Tags, ', ') ILIKE '%django%' THEN 'Python Dev'
+            WHEN ARRAY_TO_STRING(utc.Top3Tags, ', ') ILIKE '%c#%' OR ARRAY_TO_STRING(utc.Top3Tags, ', ') ILIKE '%dotnet%' THEN 'C#/.NET Dev'
+            ELSE 'Other Tech'
+        END, 'Undefined Tech Focus'
+    ) AS PrimaryTechFocus
+FROM
+    UserActivityMetrics AS uam
+LEFT JOIN
+    PostEditAndVoteAnalysis AS pea ON uam.UserId = pea.UserId
+LEFT JOIN
+    UserTagComplexity AS utc ON uam.UserId = utc.UserId
+LEFT JOIN
+    AggregatedCommentSentiment AS acs ON uam.UserId = acs.UserId
+WHERE
+    uam.Reputation > 50 -- Minimum reputation for any targeted user
+    AND uam.TotalBadgesReceived > 0 -- Must have received at least one badge
+    AND (uam.QuestionsAsked > 0 OR uam.AnswersProvided > 0) -- Must have asked or answered something
+    AND (uam.TotalProfileViews IS NULL OR uam.TotalProfileViews > 100) -- Only users with >100 views or no view data
+    AND (uam.UserCreationDate < cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '2 years' OR uam.Reputation > 1000) -- Older users or high-rep newer users
+ORDER BY
+    uam.Reputation DESC,
+    WeightedEngagementRatio DESC,
+    ReputationRankByCategory
+LIMIT 500;

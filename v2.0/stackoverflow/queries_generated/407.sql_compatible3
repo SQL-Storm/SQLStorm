@@ -1,0 +1,308 @@
+with recent_users as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    coalesce(nullif(trim(split_part(coalesce(u.location,''), ',', 1)),''), 'Unknown') as region_hint,
+    date_trunc('month', u.creationdate) as cohort_month,
+    row_number() over (order by u.reputation desc, u.id) as rn_global
+  from users u
+  where u.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+),
+posts_enriched as (
+  select
+    p.id,
+    p.posttypeid,
+    p.owneruserid,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.answercount,
+    p.commentcount,
+    p.favoritecount,
+    p.tags,
+    p.acceptedanswerid,
+    p.parentid,
+    p.title,
+    case when p.tags is not null then cardinality(string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')) else 0 end as tag_count
+  from posts p
+  where p.creationdate is not null
+),
+user_activity as (
+  select
+    ru.user_id,
+    count(*) filter (where pe.posttypeid = 1) as q_count,
+    count(*) filter (where pe.posttypeid = 2) as a_count,
+    avg(nullif(pe.score,0)) filter (where pe.posttypeid = 1) as avg_q_score_nonzero,
+    avg(pe.score) filter (where pe.posttypeid = 2) as avg_a_score,
+    sum(coalesce(pe.viewcount,0)) as total_views,
+    max(pe.creationdate) as last_post_date
+  from recent_users ru
+  left join posts_enriched pe
+    on pe.owneruserid = ru.user_id
+  group by ru.user_id
+),
+votes_agg as (
+  select
+    v.postid,
+    sum(case when vt.name = 'UpMod' then 1 else 0 end) as upvotes,
+    sum(case when vt.name = 'DownMod' then 1 else 0 end) as downvotes,
+    sum(case when vt.name = 'Favorite' then 1 else 0 end) as favorites,
+    sum(case when vt.name like 'Bounty%' then coalesce(v.bountyamount,0) else 0 end) as bounty_total
+  from votes v
+  join votetypes vt on vt.id = v.votetypeid
+  where v.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+  group by v.postid
+),
+comments_agg as (
+  select
+    c.postid,
+    count(*) as comment_count,
+    avg(c.score) as avg_comment_score,
+    max(c.creationdate) as last_comment_date
+  from comments c
+  group by c.postid
+),
+answers_per_question as (
+  select
+    q.id as question_id,
+    count(a.id) as answers_count,
+    max(a.score) as max_answer_score,
+    sum(case when a.id = q.acceptedanswerid then 1 else 0 end) as has_accepted
+  from posts q
+  left join posts a
+    on a.parentid = q.id
+   and a.posttypeid = 2
+  where q.posttypeid = 1
+  group by q.id
+),
+tag_tokens as (
+  select
+    pe.id as post_id,
+    unnest(string_to_array(substring(pe.tags, 2, length(pe.tags)-2), '><')) as tag
+  from posts_enriched pe
+  where pe.tags is not null
+),
+top_tags as (
+  select
+    tt.tag,
+    count(*) as tag_use_count,
+    avg(pe.score) as avg_tag_score
+  from tag_tokens tt
+  join posts_enriched pe on pe.id = tt.post_id
+  group by tt.tag
+  having count(*) > 50
+),
+user_badges as (
+  select
+    b.userid,
+    sum(case when b.class = 1 then 1 else 0 end) as gold,
+    sum(case when b.class = 2 then 1 else 0 end) as silver,
+    sum(case when b.class = 3 then 1 else 0 end) as bronze,
+    count(*) as total_badges,
+    max(b.date) as last_badge_date
+  from badges b
+  where b.date >= cast('2024-10-01 12:34:56' as timestamp) - interval '7 years'
+  group by b.userid
+),
+closed_events as (
+  select
+    ph.postid,
+    count(*) filter (where ph.posthistorytypeid = 10) as close_votes,
+    max(ph.creationdate) filter (where ph.posthistorytypeid = 10) as last_close_vote,
+    max(case when ph.posthistorytypeid = 10 then ph.comment end) as last_close_reason_id
+  from posthistory ph
+  where ph.posthistorytypeid in (10,11,12,13,14,15,19,20,35)
+  group by ph.postid
+),
+link_graph as (
+  select
+    pl.postid,
+    sum(case when lt.name = 'Duplicate' then 1 else 0 end) as dup_links,
+    sum(case when lt.name = 'Linked' then 1 else 0 end) as related_links
+  from postlinks pl
+  join linktypes lt on lt.id = pl.linktypeid
+  group by pl.postid
+),
+user_post_rollup as (
+  select
+    pe.owneruserid as user_id,
+    count(*) as post_count,
+    sum(case when pe.posttypeid = 1 then 1 else 0 end) as question_count,
+    sum(case when pe.posttypeid = 2 then 1 else 0 end) as answer_count,
+    avg(coalesce(v.upvotes,0) - coalesce(v.downvotes,0)) as avg_net_votes,
+    avg(pe.tag_count) as avg_tag_count,
+    sum(coalesce(v.bounty_total,0)) as total_bounty_earned,
+    sum(coalesce(v.favorites,0)) as total_favorites
+  from posts_enriched pe
+  left join votes_agg v on v.postid = pe.id
+  group by pe.owneruserid
+),
+user_quality_rank as (
+  select
+    ru.user_id,
+    ru.displayname,
+    ru.reputation,
+    ua.q_count,
+    ua.a_count,
+    ua.avg_q_score_nonzero,
+    ua.avg_a_score,
+    ua.total_views,
+    ub.total_badges,
+    upr.post_count,
+    upr.avg_net_votes,
+    upr.total_bounty_earned,
+    coalesce(upr.total_favorites,0) as total_favorites,
+    dense_rank() over (
+      order by
+        coalesce(ua.a_count,0) desc,
+        coalesce(ua.avg_a_score,0) desc,
+        coalesce(ua.q_count,0) desc,
+        coalesce(upr.avg_net_votes,0) desc
+    ) as activity_rank
+  from recent_users ru
+  left join user_activity ua on ua.user_id = ru.user_id
+  left join user_badges ub on ub.userid = ru.user_id
+  left join user_post_rollup upr on upr.user_id = ru.user_id
+),
+question_health as (
+  select
+    q.id as question_id,
+    q.owneruserid as asker_id,
+    q.creationdate as asked_at,
+    q.score as q_score,
+    q.viewcount as q_views,
+    apq.answers_count,
+    apq.max_answer_score,
+    apq.has_accepted,
+    coalesce(v.upvotes,0) as upvotes,
+    coalesce(v.downvotes,0) as downvotes,
+    coalesce(v.favorites,0) as favorites,
+    coalesce(v.bounty_total,0) as bounty_total,
+    coalesce(ca.comment_count,0) as comments,
+    ca.avg_comment_score,
+    ce.close_votes,
+    ce.last_close_vote,
+    ce.last_close_reason_id,
+    lg.dup_links,
+    lg.related_links,
+    case
+      when apq.answers_count = 0 then 'Unanswered'
+      when apq.has_accepted > 0 then 'Accepted'
+      when apq.max_answer_score >= 5 then 'Highly Answered'
+      else 'Answered'
+    end as answer_status
+  from posts_enriched q
+  left join answers_per_question apq on apq.question_id = q.id
+  left join votes_agg v on v.postid = q.id
+  left join comments_agg ca on ca.postid = q.id
+  left join closed_events ce on ce.postid = q.id
+  left join link_graph lg on lg.postid = q.id
+  where q.posttypeid = 1
+),
+tag_quality as (
+  select
+    tt.tag,
+    count(distinct pe.id) as posts,
+    avg(qh.q_score) as avg_q_score,
+    avg((qh.upvotes - qh.downvotes)) as avg_net_votes,
+    avg(qh.answers_count) as avg_answers_per_q,
+    sum(case when qh.answer_status = 'Accepted' then 1 else 0 end) * 1.0 / nullif(count(*),0) as accepted_rate
+  from tag_tokens tt
+  join posts_enriched pe on pe.id = tt.post_id and pe.posttypeid = 1
+  left join question_health qh on qh.question_id = pe.id
+  group by tt.tag
+),
+cohort_engagement as (
+  select
+    ru.cohort_month,
+    count(distinct ru.user_id) as users_in_cohort,
+    avg(coalesce(ua.q_count,0) + coalesce(ua.a_count,0)) as avg_posts_per_user,
+    percentile_cont(0.9) within group (order by coalesce(upr.avg_net_votes,0)) as p90_avg_net_votes
+  from recent_users ru
+  left join user_activity ua on ua.user_id = ru.user_id
+  left join user_post_rollup upr on upr.user_id = ru.user_id
+  group by ru.cohort_month
+),
+top_user_tag as (
+  select
+    ru.user_id,
+    tt.tag,
+    count(*) as uses,
+    row_number() over (partition by ru.user_id order by count(*) desc, tt.tag) as rn
+  from recent_users ru
+  join posts_enriched pe on pe.owneruserid = ru.user_id and pe.posttypeid = 1 and pe.tags is not null
+  join tag_tokens tt on tt.post_id = pe.id
+  group by ru.user_id, tt.tag
+),
+final_scores as (
+  select
+    uqr.user_id,
+    uqr.displayname,
+    uqr.reputation,
+    uqr.activity_rank,
+    coalesce(upr.avg_net_votes,0) as avg_net_votes,
+    coalesce(upr.total_bounty_earned,0) as bounty_earned,
+    coalesce(upr.total_favorites,0) as favorites,
+    coalesce(ua.total_views,0) as views,
+    coalesce(ua.q_count,0) as questions,
+    coalesce(ua.a_count,0) as answers,
+    coalesce(ub.total_badges,0) as badges,
+    coalesce(ub.gold,0) as gold_badges,
+    coalesce(ub.silver,0) as silver_badges,
+    coalesce(ub.bronze,0) as bronze_badges,
+    tyt.tag as top_tag,
+    tq.avg_q_score as top_tag_avg_q_score,
+    tq.accepted_rate as top_tag_accept_rate,
+    row_number() over (
+      order by
+        greatest(
+          0,
+          coalesce(upr.avg_net_votes,0) * 0.4
+          + coalesce(upr.total_bounty_earned,0) * 0.001
+          + coalesce(ua.a_count,0) * 0.5
+          + coalesce(ua.q_count,0) * 0.2
+          + coalesce(ub.total_badges,0) * 0.1
+          + least(coalesce(ua.total_views,0)/1000.0, 50)
+        ) desc,
+        uqr.reputation desc
+    ) as perf_rank
+  from user_quality_rank uqr
+  left join user_activity ua on ua.user_id = uqr.user_id
+  left join user_badges ub on ub.userid = uqr.user_id
+  left join user_post_rollup upr on upr.user_id = uqr.user_id
+  left join top_user_tag tyt on tyt.user_id = uqr.user_id and tyt.rn = 1
+  left join tag_quality tq on tq.tag = tyt.tag
+)
+select
+  fs.user_id,
+  fs.displayname,
+  fs.reputation,
+  fs.activity_rank,
+  fs.perf_rank,
+  fs.avg_net_votes,
+  fs.bounty_earned,
+  fs.favorites,
+  fs.views,
+  fs.questions,
+  fs.answers,
+  fs.badges,
+  fs.gold_badges,
+  fs.silver_badges,
+  fs.bronze_badges,
+  coalesce(fs.top_tag, 'untagged') as top_tag,
+  round(coalesce(fs.top_tag_avg_q_score,0), 2) as top_tag_avg_q_score,
+  round(coalesce(fs.top_tag_accept_rate,0), 4) as top_tag_accept_rate,
+  ce.cohort_month,
+  ce.users_in_cohort,
+  ce.avg_posts_per_user,
+  ce.p90_avg_net_votes
+from final_scores fs
+left join recent_users ru on ru.user_id = fs.user_id
+left join cohort_engagement ce on ce.cohort_month = ru.cohort_month
+where
+  (fs.answers + fs.questions) > 0
+  and (fs.reputation > 100 or fs.badges >= 5 or fs.avg_net_votes > 0)
+order by fs.perf_rank, fs.user_id
+limit 500;

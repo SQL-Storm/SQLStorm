@@ -1,0 +1,218 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        COALESCE(SUM(p.Score), 0) as TotalScore,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2) || '>', ',') as AllTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= DATE '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        TotalScore,
+        PostCount,
+        QuestionCount,
+        AnswerCount,
+        BadgeCount,
+        LastPostDate,
+        RANK() OVER (ORDER BY TotalScore DESC) as ScoreRank,
+        RANK() OVER (ORDER BY PostCount DESC) as PostRank
+    FROM UserStats
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        COALESCE(SUM(p.Score), 0) as TagScore,
+        COUNT(DISTINCT p.Id) as TagPostCount,
+        AVG(p.Score) as AvgScorePerPost,
+        STRING_AGG(DISTINCT u.DisplayName, ', ') as TagContributors
+    FROM Tags t
+    LEFT JOIN Posts p ON (p.Tags LIKE '%' || t.TagName || '%')
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE t.TagName IS NOT NULL
+    GROUP BY t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        COALESCE(p.AcceptedAnswerId, 0) as HasAcceptedAnswer,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END as IsClosed,
+        CASE WHEN p.CommunityOwnedDate IS NOT NULL THEN 1 ELSE 0 END as IsCommunityOwned,
+        CASE WHEN COALESCE(p.FavoriteCount, 0) > 0 THEN 1 ELSE 0 END as HasFavorites,
+        COALESCE(p.AnswerCount, 0) * COALESCE(p.Score, 0) as AnswerScoreProduct,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as UserPostRank,
+        FIRST_VALUE(p.Id) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as FirstPostId,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PrevScore,
+        LEAD(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as NextScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as AvgUserScore,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) as TotalUserPosts,
+        CASE 
+            WHEN CHAR_LENGTH(COALESCE(p.Tags, '')) > 50 THEN 
+                SUBSTRING(p.Tags FROM 2 FOR 20) || '...' || SUBSTRING(p.Tags FROM GREATEST(CHAR_LENGTH(p.Tags)-19,2) FOR 20)
+            WHEN CHAR_LENGTH(COALESCE(p.Tags, '')) > 0 THEN 
+                SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2)
+            ELSE 
+                ''
+        END as DisplayTags,
+        SUM(CASE WHEN p.Score > 100 THEN 1 ELSE 0 END) OVER (PARTITION BY p.OwnerUserId) as HighScoringPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) OVER (PARTITION BY p.OwnerUserId) as Questions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY p.OwnerUserId) as Answers
+    FROM Posts p
+    WHERE p.CreationDate >= DATE '2011-01-01'
+),
+UserActivitySummary AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT v.Id) as VoteCount,
+        COUNT(DISTINCT ph.Id) as PostHistoryCount,
+        MAX(c.CreationDate) as LastCommentDate,
+        MAX(v.CreationDate) as LastVoteDate,
+        MAX(ph.CreationDate) as LastHistoryDate,
+        COALESCE(COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END), 0) as UpvoteCount,
+        COALESCE(COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END), 0) as DownvoteCount,
+        COALESCE(COUNT(DISTINCT CASE WHEN v.VoteTypeId = 5 THEN v.Id END), 0) as FavoriteCount,
+        CASE 
+            WHEN COUNT(DISTINCT v.Id) > 0 THEN 
+                (COALESCE(COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END), 0) * 100.0 / COUNT(DISTINCT v.Id))
+            ELSE 
+                0 
+        END as UpvotePercentage,
+        COALESCE(COUNT(DISTINCT v.Id), 0) - COALESCE(COUNT(DISTINCT CASE WHEN v.VoteTypeId IN (3, 10) THEN v.Id END), 0) as NetVotes
+    FROM Users u
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    WHERE u.CreationDate >= DATE '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+FinalAnalysis AS (
+    SELECT 
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.TotalScore,
+        tu.PostCount,
+        tu.QuestionCount,
+        tu.AnswerCount,
+        tu.BadgeCount,
+        tu.ScoreRank,
+        tu.PostRank,
+        COALESCE(ta.TagCount, 0) as PopularTagCount,
+        COALESCE(ta.TagScore, 0) as TagScore,
+        COALESCE(ta.TagPostCount, 0) as TagPostCount,
+        COALESCE(CHAR_LENGTH(COALESCE(ta.TagContributors, '')), 0) as ContributorCount,
+        COALESCE(ua.CommentCount, 0) as CommentCount,
+        COALESCE(ua.VoteCount, 0) as VoteCount,
+        COALESCE(ua.PostHistoryCount, 0) as HistoryCount,
+        COALESCE(ua.UpvoteCount, 0) as UpvoteCount,
+        COALESCE(ua.DownvoteCount, 0) as DownvoteCount,
+        COALESCE(ua.FavoriteCount, 0) as FavoriteCount,
+        COALESCE(ua.UpvotePercentage, 0) as UpvotePercentage,
+        COALESCE(ua.NetVotes, 0) as NetVotes,
+        CASE 
+            WHEN tu.TotalScore > 10000 AND tu.Reputation > 1000 AND tu.PostCount > 100 THEN 'Elite Contributor'
+            WHEN tu.TotalScore > 5000 AND tu.Reputation > 500 AND tu.PostCount > 50 THEN 'Active Contributor'
+            WHEN tu.TotalScore > 1000 AND tu.Reputation > 100 AND tu.PostCount > 10 THEN 'Regular Contributor'
+            ELSE 'New Contributor'
+        END as ContributorTier,
+        (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = tu.UserId AND p2.CreationDate >= DATE '2015-01-01') as RecentPostsCount,
+        1 as IsTopUser,
+        CASE 
+            WHEN NOT EXISTS (
+                SELECT 1 FROM Votes v2 
+                WHERE v2.UserId = tu.UserId 
+                AND v2.VoteTypeId = 10 
+                AND v2.CreationDate >= DATE '2020-01-01'
+            ) THEN 0 
+            ELSE 1 
+        END as HasRecentDeletionVotes
+    FROM TopUsers tu
+    LEFT JOIN TagAnalysis ta ON ta.TagName = (
+        SELECT SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2) 
+        FROM Posts p 
+        WHERE p.OwnerUserId = tu.UserId 
+        AND p.Tags IS NOT NULL 
+        AND CHAR_LENGTH(p.Tags) > 2
+        ORDER BY p.Score DESC 
+        LIMIT 1
+    )
+    LEFT JOIN UserActivitySummary ua ON ua.UserId = tu.UserId
+    WHERE tu.ScoreRank <= 500 OR tu.PostRank <= 500
+)
+SELECT 
+    fa.UserId,
+    fa.DisplayName,
+    fa.Reputation,
+    fa.TotalScore,
+    fa.PostCount,
+    fa.QuestionCount AS Questions,
+    fa.AnswerCount AS Answers,
+    fa.BadgeCount,
+    fa.ScoreRank,
+    fa.PostRank,
+    fa.PopularTagCount,
+    fa.TagScore,
+    fa.TagPostCount,
+    fa.ContributorCount,
+    fa.CommentCount,
+    fa.VoteCount,
+    fa.HistoryCount,
+    fa.UpvoteCount,
+    fa.DownvoteCount,
+    fa.FavoriteCount,
+    fa.UpvotePercentage,
+    fa.NetVotes,
+    fa.ContributorTier,
+    fa.RecentPostsCount,
+    fa.HasRecentDeletionVotes,
+    CASE 
+        WHEN fa.NetVotes > 0 AND fa.TotalScore > 0 THEN 
+            ROUND((fa.NetVotes * 100.0 / NULLIF(fa.TotalScore, 0)), 2)
+        ELSE 
+            0.00 
+    END as NetVoteToScoreRatio,
+    COALESCE(
+        CASE 
+            WHEN fa.PostCount > 0 THEN 
+                ROUND((fa.TotalScore * 1.0 / fa.PostCount), 2) 
+            ELSE 
+                0 
+        END, 0) as AvgScorePerPost,
+    ROW_NUMBER() OVER (ORDER BY fa.NetVotes DESC, fa.Reputation DESC) as OverallRank,
+    COALESCE(fa.DisplayName, 'Anonymous') || 
+    ' (Score: ' || COALESCE(CAST(fa.TotalScore AS VARCHAR), '0') || 
+    ', Posts: ' || COALESCE(CAST(fa.PostCount AS VARCHAR), '0') || 
+    ')' as UserSummary
+FROM FinalAnalysis fa
+WHERE fa.Reputation > 100
+ORDER BY fa.TotalScore DESC, fa.NetVotes DESC
+LIMIT 1000;

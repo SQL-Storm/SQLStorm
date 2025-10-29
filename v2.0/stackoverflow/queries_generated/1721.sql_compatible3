@@ -1,0 +1,242 @@
+WITH UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        MAX(p.LastActivityDate) AS LastPostActivityDate,
+        MAX(c.CreationDate) AS LastCommentActivityDate,
+        MAX(ph_edit_usr.CreationDate) AS LastEditDateByUser,
+        CAST(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - u.LastAccessDate)) / 3600 AS INTEGER) AS HoursSinceLastAccess,
+        u.Location
+    FROM
+        Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN PostHistory ph_edit_usr ON u.Id = ph_edit_usr.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Location
+),
+PostHistoricalMetrics AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.Body AS PostBody,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        MIN(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.CreationDate ELSE NULL END) AS FirstEditDate,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN ph.UserId ELSE NULL END) AS UniqueEditorsCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (10, 12) THEN 1 ELSE 0 END) AS CloseDeleteVotesHistoryCount,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS MajorEditCount,
+        AVG(LENGTH(p.Title)) OVER (PARTITION BY p.OwnerUserId) AS AvgTitleLengthForOwner
+    FROM
+        Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    GROUP BY
+        p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.Body, p.OwnerUserId, p.AcceptedAnswerId, p.Tags, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.Title
+),
+HotTagScores AS (
+    SELECT
+        t.TagName,
+        SUM(p.Score) AS TotalTagScore,
+        COUNT(DISTINCT p.Id) AS TagPostCount,
+        AVG(p.ViewCount) AS AvgTagViewCount
+    FROM
+        Posts p
+        CROSS JOIN LATERAL (
+            SELECT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS TagName
+        ) t
+    WHERE
+        p.Tags IS NOT NULL
+        AND p.CreationDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year'
+        AND p.PostTypeId = 1
+    GROUP BY
+        t.TagName
+    HAVING
+        COUNT(DISTINCT p.Id) >= 5
+),
+CombinedPostEngagement AS (
+    SELECT
+        phm.PostId,
+        phm.PostTypeId,
+        phm.PostCreationDate,
+        phm.PostScore,
+        phm.ViewCount,
+        phm.PostBody,
+        phm.OwnerUserId,
+        phm.AcceptedAnswerId,
+        phm.Tags,
+        phm.AnswerCount,
+        phm.CommentCount,
+        phm.FavoriteCount,
+        phm.FirstEditDate,
+        CASE WHEN phm.FirstEditDate IS NOT NULL THEN EXTRACT(EPOCH FROM (phm.FirstEditDate - phm.PostCreationDate)) / 3600 ELSE NULL END AS HoursToFirstEdit,
+        phm.UniqueEditorsCount AS TotalUniqueEditors,
+        phm.CloseDeleteVotesHistoryCount AS TotalCloseDeleteEvents,
+        phm.MajorEditCount AS TotalMajorEdits,
+        phm.AvgTitleLengthForOwner,
+        (
+            SELECT COALESCE(SUM(v.BountyAmount), 0)
+            FROM Votes v
+            WHERE v.PostId = phm.PostId AND v.VoteTypeId = 8
+        ) AS TotalBountyAmountOffered,
+        (
+            SELECT COUNT(DISTINCT pl.RelatedPostId)
+            FROM PostLinks pl
+            WHERE pl.PostId = phm.PostId AND pl.LinkTypeId = 1
+        ) AS LinkedPostsCount,
+        (
+            SELECT COUNT(DISTINCT pl_dup.RelatedPostId)
+            FROM PostLinks pl_dup
+            WHERE pl_dup.PostId = phm.PostId AND pl_dup.LinkTypeId = 3
+        ) AS DuplicatePostsCount,
+        (
+            SELECT COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE -1 END), 0)
+            FROM Votes v
+            WHERE v.PostId = phm.PostId AND v.VoteTypeId IN (2, 3)
+              AND v.CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '90 days'
+        ) AS RecentVoteNetScore,
+        CASE
+            WHEN phm.PostTypeId = 1 AND phm.AcceptedAnswerId IS NOT NULL THEN TRUE
+            ELSE FALSE
+        END AS HasAcceptedAnswer
+    FROM
+        PostHistoricalMetrics phm
+)
+SELECT
+    uas.UserId,
+    COALESCE(uas.DisplayName, 'Deleted User #' || uas.UserId) AS UserDisplayName,
+    uas.Reputation,
+    uas.UserCreationDate,
+    uas.TotalPosts,
+    uas.TotalQuestions,
+    uas.TotalAnswers,
+    uas.TotalPostScore,
+    uas.TotalComments,
+    uas.TotalBadges,
+    EXTRACT(DAY FROM (TIMESTAMP '2024-10-01 12:34:56' - GREATEST(uas.LastAccessDate, COALESCE(uas.LastPostActivityDate, uas.LastAccessDate), COALESCE(uas.LastCommentActivityDate, uas.LastAccessDate), COALESCE(uas.LastEditDateByUser, uas.LastAccessDate)))) AS DaysSinceLastInteraction,
+    cpe.PostId,
+    cpe.PostTypeId,
+    pt.Name AS PostTypeName,
+    cpe.PostCreationDate,
+    cpe.PostScore,
+    cpe.ViewCount,
+    cpe.AnswerCount,
+    cpe.CommentCount,
+    cpe.FavoriteCount,
+    cpe.HoursToFirstEdit,
+    cpe.TotalUniqueEditors,
+    cpe.TotalCloseDeleteEvents,
+    cpe.TotalMajorEdits,
+    cpe.TotalBountyAmountOffered,
+    cpe.LinkedPostsCount,
+    cpe.DuplicatePostsCount,
+    cpe.HasAcceptedAnswer,
+    cpe.AvgTitleLengthForOwner,
+    cpe.RecentVoteNetScore,
+    CASE
+        WHEN cpe.PostTypeId = 1 THEN 'Question'
+        WHEN cpe.PostTypeId = 2 THEN 'Answer'
+        ELSE 'Other'
+    END AS PostCategory,
+    COALESCE(hts.TotalTagScore, 0) AS PrimaryTagHotnessScore,
+    COALESCE(hts.TagPostCount, 0) AS PrimaryTagPostCount,
+    (cpe.PostScore * 0.5 + cpe.ViewCount * 0.05 + cpe.CommentCount * 0.2 + cpe.FavoriteCount * 0.5 + cpe.TotalBountyAmountOffered * 1.0 + cpe.RecentVoteNetScore * 0.75) AS DerivedPostEngagementScore,
+    ROW_NUMBER() OVER (PARTITION BY uas.UserId ORDER BY cpe.PostCreationDate DESC) AS UserPostRankByDate,
+    RANK() OVER (ORDER BY uas.Reputation DESC, uas.TotalPostScore DESC, cpe.PostScore DESC) AS GlobalUserPostRank,
+    LAG(cpe.PostScore, 1, 0) OVER (PARTITION BY uas.UserId ORDER BY cpe.PostCreationDate) AS PreviousPostScore,
+    (cpe.PostScore - LAG(cpe.PostScore, 1, 0) OVER (PARTITION BY uas.UserId ORDER BY cpe.PostCreationDate)) AS ScoreChangeFromPreviousPost,
+    NTILE(5) OVER (ORDER BY uas.Reputation DESC, uas.TotalPostScore DESC) AS ReputationQuintile,
+    EXISTS (
+        SELECT 1
+        FROM Posts p_prior_answer
+        INNER JOIN Posts q_parent ON p_prior_answer.ParentId = q_parent.Id
+        WHERE p_prior_answer.OwnerUserId = uas.UserId
+          AND p_prior_answer.PostTypeId = 2
+          AND q_parent.AcceptedAnswerId = p_prior_answer.Id
+          AND p_prior_answer.CreationDate < cpe.PostCreationDate
+        LIMIT 1
+    ) AS HasPriorAcceptedAnswer,
+    (
+        SELECT COALESCE(MAX(ht2.TotalTagScore), 0)
+        FROM HotTagScores ht2
+        WHERE cpe.Tags LIKE '%' || ht2.TagName || '%'
+          AND ht2.TagName IS NOT NULL
+    ) AS MaxContainedTagHotness,
+    (CASE
+        WHEN cpe.PostBody ILIKE '%performance%' OR cpe.PostBody ILIKE '%optimization%' OR cpe.PostBody ILIKE '%benchmark%' OR cpe.PostBody ILIKE '%latency%' THEN 'Performance Related'
+        WHEN cpe.PostBody ILIKE '%security%' OR cpe.PostBody ILIKE '%vulnerability%' THEN 'Security Related'
+        ELSE 'General Topic'
+    END) AS PostContentClassification,
+    EXISTS (
+        SELECT 1
+        FROM Comments cm
+        WHERE cm.PostId = cpe.PostId AND cm.UserId = uas.UserId
+        LIMIT 1
+    ) AS OwnerCommentedOnPost,
+    CASE
+        WHEN cpe.PostTypeId = 1 AND cpe.AcceptedAnswerId IS NOT NULL THEN
+            EXTRACT(DAY FROM (
+                (SELECT p_accepted.CreationDate FROM Posts p_accepted WHERE p_accepted.Id = cpe.AcceptedAnswerId)
+                 - cpe.PostCreationDate
+            ))
+        ELSE NULL
+    END AS DaysToAcceptedAnswer,
+    EXISTS (
+        SELECT 1
+        FROM Votes v_controversial
+        WHERE v_controversial.PostId = cpe.PostId AND v_controversial.VoteTypeId IN (2, 3)
+        GROUP BY v_controversial.PostId
+        HAVING SUM(CASE WHEN v_controversial.VoteTypeId = 2 THEN 1 ELSE 0 END) >= 10
+           AND SUM(CASE WHEN v_controversial.VoteTypeId = 3 THEN 1 ELSE 0 END) >= 10
+           AND ABS(SUM(CASE WHEN v_controversial.VoteTypeId = 2 THEN 1 ELSE 0 END) - SUM(CASE WHEN v_controversial.VoteTypeId = 3 THEN 1 ELSE 0 END)) <= 5
+    ) AS IsControversialPost,
+    (
+        SELECT COUNT(DISTINCT UserId)
+        FROM Comments
+        WHERE PostId = cpe.PostId
+          AND UserId IS NOT NULL
+    ) AS UniqueCommentersCount
+FROM
+    UserActivitySummary uas
+INNER JOIN
+    CombinedPostEngagement cpe ON uas.UserId = cpe.OwnerUserId
+LEFT JOIN
+    PostTypes pt ON cpe.PostTypeId = pt.Id
+LEFT JOIN LATERAL (
+    SELECT
+        (string_to_array(substring(cpe.Tags, 2, length(cpe.Tags)-2), '><'))[1] AS PrimaryTagName
+) tag_extract ON cpe.Tags IS NOT NULL AND tag_extract.PrimaryTagName IS NOT NULL
+LEFT JOIN HotTagScores hts ON tag_extract.PrimaryTagName = hts.TagName
+WHERE
+    uas.Reputation >= 1000
+    AND cpe.PostScore >= 5
+    AND cpe.PostCreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 year'
+    AND (uas.Location IS NOT NULL AND uas.Location <> '')
+    AND (
+        cpe.HasAcceptedAnswer IS TRUE
+        OR cpe.TotalBountyAmountOffered > 0
+        OR cpe.FavoriteCount > 0
+        OR cpe.CommentCount > 2
+        OR cpe.TotalCloseDeleteEvents > 0
+    )
+ORDER BY
+    GlobalUserPostRank ASC,
+    DerivedPostEngagementScore DESC,
+    cpe.PostCreationDate DESC
+LIMIT 500;

@@ -1,0 +1,118 @@
+WITH recent_posts AS (
+    SELECT p.id,
+           p.owneruserid,
+           p.score,
+           p.creationdate,
+           p.tags
+    FROM   posts p
+    WHERE  p.creationdate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days')
+           AND p.posttypeid = 1
+),
+user_badge_counts AS (
+    SELECT b.userid,
+           COUNT(*)                                               AS total_badges,
+           SUM(CASE WHEN b.class = 1 THEN 1 ELSE 0 END)          AS gold_badges
+    FROM   badges b
+    GROUP  BY b.userid
+),
+user_post_stats AS (
+    SELECT u.id                                 AS userid,
+           COALESCE(SUM(p.score),0)             AS total_score,
+           COUNT(p.id)                          AS post_count,
+           AVG(p.score)                         AS avg_score,
+           MAX(p.creationdate)                  AS last_post_date
+    FROM   users u
+    LEFT   JOIN posts p
+           ON p.owneruserid = u.id
+           AND p.posttypeid = 1
+    GROUP  BY u.id
+),
+user_activity AS (
+    SELECT u.id                                 AS userid,
+           MAX(v.creationdate)                 AS last_vote_date,
+           MAX(c.creationdate)                 AS last_comment_date
+    FROM   users u
+    LEFT   JOIN votes    v ON v.userid = u.id
+    LEFT   JOIN comments c ON c.userid = u.id
+    GROUP  BY u.id
+)
+SELECT
+    u.id,
+    u.displayname,
+    u.reputation,
+    COALESCE(ubc.total_badges,0)           AS badge_count,
+    COALESCE(ubc.gold_badges,0)            AS gold_badge_count,
+    ups.total_score,
+    ups.post_count,
+    ups.avg_score,
+    ups.last_post_date,
+    ua.last_vote_date,
+    ua.last_comment_date,
+    ROW_NUMBER() OVER (ORDER BY u.reputation DESC, ups.total_score DESC)
+                                           AS reputation_score_rank,
+    CASE
+        WHEN u.location IS NULL OR trim(u.location) = '' THEN 'Unknown'
+        ELSE u.location
+    END                                     AS normalized_location,
+    string_agg(DISTINCT COALESCE(pt.name,'Other'), ', ')
+                                           AS post_types_participated,
+    (SELECT COUNT(*)
+       FROM posts p2
+       WHERE p2.owneruserid = u.id
+         AND p2.tags LIKE '%<sql>%')       AS sql_tag_post_count,
+    (SELECT ph.comment
+       FROM posthistory ph
+       WHERE ph.postid = (
+                SELECT p3.id
+                FROM   posts p3
+                WHERE  p3.owneruserid = u.id
+                ORDER  BY p3.creationdate DESC
+                LIMIT  1)
+         AND ph.posthistorytypeid = 10
+       ORDER  BY ph.creationdate DESC
+       LIMIT  1)                           AS latest_close_reason_comment
+FROM   users u
+LEFT   JOIN user_badge_counts ubc ON ubc.userid = u.id
+JOIN   user_post_stats    ups   ON ups.userid = u.id
+LEFT   JOIN user_activity    ua   ON ua.userid = u.id
+LEFT   JOIN posts            p_outer ON p_outer.owneruserid = u.id
+LEFT   JOIN posttypes        pt   ON pt.id = p_outer.posttypeid
+WHERE  (u.reputation > 1000 OR ups.post_count >= 5)
+GROUP  BY u.id,
+          u.displayname,
+          u.reputation,
+          ubc.total_badges,
+          ubc.gold_badges,
+          ups.total_score,
+          ups.post_count,
+          ups.avg_score,
+          ups.last_post_date,
+          ua.last_vote_date,
+          ua.last_comment_date,
+          u.location
+HAVING COUNT(DISTINCT p_outer.id) > 0
+
+UNION ALL
+
+SELECT
+    NULL                                    AS id,
+    'TOTAL'                                 AS displayname,
+    NULL                                    AS reputation,
+    SUM(COALESCE(ubc.total_badges,0))       AS badge_count,
+    SUM(COALESCE(ubc.gold_badges,0))        AS gold_badge_count,
+    SUM(ups.total_score)                    AS total_score,
+    SUM(ups.post_count)                     AS post_count,
+    AVG(ups.avg_score)                      AS avg_score,
+    MAX(ups.last_post_date)                 AS last_post_date,
+    MAX(ua.last_vote_date)                  AS last_vote_date,
+    MAX(ua.last_comment_date)               AS last_comment_date,
+    NULL                                    AS reputation_score_rank,
+    NULL                                    AS normalized_location,
+    NULL                                    AS post_types_participated,
+    NULL                                    AS sql_tag_post_count,
+    NULL                                    AS latest_close_reason_comment
+FROM   users u
+LEFT   JOIN user_badge_counts ubc ON ubc.userid = u.id
+JOIN   user_post_stats    ups   ON ups.userid = u.id
+LEFT   JOIN user_activity    ua   ON ua.userid = u.id
+WHERE  (u.reputation > 1000 OR ups.post_count >= 5);

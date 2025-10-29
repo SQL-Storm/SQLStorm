@@ -1,0 +1,155 @@
+-- {"query": "3666.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2398} 
+
+/*  Complex performance‑benchmarking query for the StackOverflow schema  */
+WITH
+/* 1. Aggregate per‑user statistics */
+user_stats AS (
+    SELECT
+        u.id                                   AS user_id,
+        u.displayname,
+        u.reputation,
+        COALESCE(u.upvotes,0) - COALESCE(u.downvotes,0)        AS net_votes,
+        COUNT(p.id) FILTER (WHERE p.posttypeid = 1)           AS question_cnt,
+        COUNT(p.id) FILTER (WHERE p.posttypeid = 2)           AS answer_cnt,
+        AVG(p.score) FILTER (WHERE p.posttypeid = 2)          AS avg_answer_score,
+        MAX(p.creationdate)                                   AS last_post_dt,
+        /*  Correlated sub‑query: avg score of others' answers on same tags  */
+        (SELECT AVG(p2.score)
+         FROM posts p2
+         JOIN unnest(string_to_array(p.tags, '><')) AS t(tag) ON TRUE
+         WHERE p2.posttypeid = 2
+           AND p2.owneruserid <> u.id
+           AND EXISTS (
+               SELECT 1
+               FROM unnest(string_to_array(p2.tags, '><')) AS t2(tag)
+               WHERE t2.tag = t.tag
+           )
+        ) AS peer_avg_score_on_same_tags
+    FROM users u
+    LEFT JOIN posts p ON p.owneruserid = u.id
+    GROUP BY u.id, u.displayname, u.reputation, u.upvotes, u.downvotes
+),
+
+/* 2. Badge aggregation with string concatenation */
+badge_agg AS (
+    SELECT
+        b.userid,
+        STRING_AGG(b.name, ', ') FILTER (WHERE b.class = 1) AS gold_badges,
+        STRING_AGG(b.name, ', ') FILTER (WHERE b.class = 2) AS silver_badges,
+        STRING_AGG(b.name, ', ') FILTER (WHERE b.class = 3) AS bronze_badges,
+        COUNT(*)                                            AS total_badges
+    FROM badges b
+    GROUP BY b.userid
+),
+
+/* 3. Recent voting activity (last 30 days) */
+recent_votes AS (
+    SELECT
+        v.userid,
+        COUNT(*) FILTER (WHERE v.votetypeid = 2) AS up_votes_given,
+        COUNT(*) FILTER (WHERE v.votetypeid = 3) AS down_votes_given,
+        MAX(v.creationdate)                       AS last_vote_dt
+    FROM votes v
+    WHERE v.creationdate >= (CURRENT_DATE - INTERVAL '30 days')
+    GROUP BY v.userid
+),
+
+/* 4. Tag‑wise score ranking – uses window function */
+tag_score AS (
+    SELECT
+        t.tagname,
+        SUM(p.score)                     AS tag_score,
+        COUNT(p.id)                      AS tag_post_cnt,
+        ROW_NUMBER() OVER (ORDER BY SUM(p.score) DESC) AS rank_by_score
+    FROM tags t
+    JOIN postlinks pl ON pl.relatedpostid = t.wikepostid
+    JOIN posts p      ON p.id = pl.postid
+    WHERE p.posttypeid = 1
+    GROUP BY t.tagname
+),
+
+/* 5. Top tag for each user (correlated sub‑query) */
+user_top_tag AS (
+    SELECT
+        us.user_id,
+        (SELECT ts.tagname
+         FROM tag_score ts
+         JOIN posttags pt ON pt.tagid = ts.tagname::int   -- mock join, adjust to real schema
+         JOIN posts p ON p.id = pt.postid
+         WHERE p.owneruserid = us.user_id
+         ORDER BY ts.tag_score DESC
+         LIMIT 1) AS top_tag_name,
+        (SELECT ts.tag_score
+         FROM tag_score ts
+         JOIN posttags pt ON pt.tagid = ts.tagname::int
+         JOIN posts p ON p.id = pt.postid
+         WHERE p.owneruserid = us.user_id
+         ORDER BY ts.tag_score DESC
+         LIMIT 1) AS top_tag_score
+    FROM user_stats us
+),
+
+/* 6. Combine all pieces with UNION for a dummy “total” row (set operator) */
+combined AS (
+    SELECT
+        us.user_id,
+        us.displayname,
+        us.reputation,
+        us.net_votes,
+        us.question_cnt,
+        us.answer_cnt,
+        ROUND(us.answer_cnt::numeric / NULLIF(us.question_cnt,0), 2) AS ans_per_q,
+        us.avg_answer_score,
+        ba.gold_badges,
+        ba.silver_badges,
+        ba.bronze_badges,
+        ba.total_badges,
+        rv.up_votes_given,
+        rv.down_votes_given,
+        rv.last_vote_dt,
+        CASE
+            WHEN us.reputation >= 20000 THEN 'Legendary'
+            WHEN us.reputation >= 10000 THEN 'Expert'
+            WHEN us.reputation >= 5000  THEN 'Contributor'
+            ELSE 'Newbie'
+        END AS reputation_tier,
+        ut.top_tag_name,
+        ut.top_tag_score,
+        us.peer_avg_score_on_same_tags
+    FROM user_stats us
+    LEFT JOIN badge_agg ba   ON ba.userid = us.user_id
+    LEFT JOIN recent_votes rv ON rv.userid = us.user_id
+    LEFT JOIN user_top_tag ut ON ut.user_id = us.user_id
+)
+
+SELECT *
+FROM combined
+WHERE reputation IS NOT NULL
+ORDER BY reputation DESC
+LIMIT 100
+
+UNION ALL
+
+/* Dummy row to exercise set operator handling */
+SELECT
+    NULL AS user_id,
+    'TOTAL' AS displayname,
+    SUM(reputation) AS reputation,
+    SUM(net_votes) AS net_votes,
+    SUM(question_cnt) AS question_cnt,
+    SUM(answer_cnt) AS answer_cnt,
+    NULL AS ans_per_q,
+    NULL AS avg_answer_score,
+    NULL AS gold_badges,
+    NULL AS silver_badges,
+    NULL AS bronze_badges,
+    SUM(total_badges) AS total_badges,
+    SUM(up_votes_given) AS up_votes_given,
+    SUM(down_votes_given) AS down_votes_given,
+    NULL AS last_vote_dt,
+    NULL AS reputation_tier,
+    NULL AS top_tag_name,
+    NULL AS top_tag_score,
+    NULL AS peer_avg_score_on_same_tags
+FROM combined
+WHERE 1=0;  -- forces an empty aggregation row but keeps the UNION structure

@@ -1,0 +1,170 @@
+WITH RECURSIVE RecursiveCTE AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        CASE
+            WHEN p.Tags IS NOT NULL THEN string_to_array(substring(p.Tags FROM 2 FOR length(p.Tags) - 2), '><')
+            ELSE ARRAY[]::varchar[]
+        END AS TagArray,
+        1 AS Depth
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+
+    UNION ALL
+
+    SELECT
+        p2.Id,
+        p2.OwnerUserId,
+        p2.PostTypeId,
+        p2.Score,
+        p2.ViewCount,
+        p2.CreationDate,
+        CASE
+            WHEN p2.Tags IS NOT NULL THEN string_to_array(substring(p2.Tags FROM 2 FOR length(p2.Tags) - 2), '><')
+            ELSE ARRAY[]::varchar[]
+        END,
+        r.Depth + 1
+    FROM Posts p2
+    JOIN RecursiveCTE r ON p2.ParentId = r.PostId
+    WHERE r.Depth < 3
+),
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+PostVoteStats AS (
+    SELECT
+        v.PostId,
+        COUNT(*) FILTER (WHERE vt.Name = 'UpMod') AS UpVotes,
+        COUNT(*) FILTER (WHERE vt.Name = 'DownMod') AS DownVotes,
+        COUNT(*) FILTER (WHERE vt.Name = 'Favorite') AS Favorites,
+        COUNT(*) AS TotalVotes,
+        MAX(v.BountyAmount) AS MaxBounty
+    FROM Votes v
+    JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    GROUP BY v.PostId
+),
+UserActivityWindow AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        row_number() OVER (PARTITION BY u.Id ORDER BY p.CreationDate DESC NULLS LAST) AS PostRank,
+        count(*) OVER (PARTITION BY u.Id) AS TotalPosts,
+        sum(p.Score) OVER (PARTITION BY u.Id) AS TotalPostScore,
+        max(p.Score) OVER (PARTITION BY u.Id) AS MaxPostScore
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    WHERE u.Reputation > 1000
+),
+PostCloseReasons AS (
+    SELECT
+        ph.PostId,
+        crt.Name AS CloseReasonName,
+        max(ph.CreationDate) AS LastCloseDate
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON cast(ph.Comment AS integer) = crt.Id
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.PostId, crt.Name
+),
+QualifiedPosts AS (
+    SELECT
+        r.PostId,
+        r.OwnerUserId,
+        r.PostTypeId,
+        r.Score,
+        r.ViewCount,
+        r.CreationDate,
+        r.TagArray,
+        pvs.UpVotes,
+        pvs.DownVotes,
+        pvs.Favorites,
+        pvs.TotalVotes,
+        pvs.MaxBounty,
+        usb.GoldBadges,
+        usb.SilverBadges,
+        usb.BronzeBadges,
+        pac.CloseReasonName,
+        uact.PostRank,
+        uact.TotalPosts,
+        uact.TotalPostScore,
+        uact.MaxPostScore
+    FROM RecursiveCTE r
+    LEFT JOIN PostVoteStats pvs ON r.PostId = pvs.PostId
+    LEFT JOIN UserBadgeCounts usb ON r.OwnerUserId = usb.UserId
+    LEFT JOIN PostCloseReasons pac ON r.PostId = pac.PostId
+    LEFT JOIN UserActivityWindow uact ON r.OwnerUserId = uact.UserId AND uact.PostRank = 1
+    WHERE r.PostTypeId IN (1,2)
+)
+SELECT DISTINCT
+    qp.PostId,
+    qp.OwnerUserId,
+    COALESCE(u.DisplayName, CAST(qp.OwnerUserId AS varchar)) AS OwnerDisplayName,
+    qp.PostTypeId,
+    CASE qp.PostTypeId WHEN 1 THEN 'Question' WHEN 2 THEN 'Answer' ELSE 'Other' END AS PostTypeName,
+    qp.Score,
+    qp.ViewCount,
+    qp.CreationDate,
+    array_to_string(qp.TagArray, ', ') AS Tags,
+    qp.UpVotes,
+    qp.DownVotes,
+    qp.Favorites,
+    qp.TotalVotes,
+    qp.MaxBounty,
+    COALESCE(qp.GoldBadges,0) AS GoldBadges,
+    COALESCE(qp.SilverBadges,0) AS SilverBadges,
+    COALESCE(qp.BronzeBadges,0) AS BronzeBadges,
+    qp.CloseReasonName,
+    qp.PostRank,
+    qp.TotalPosts,
+    qp.TotalPostScore,
+    qp.MaxPostScore,
+    CASE
+        WHEN qp.UpVotes IS NULL OR qp.DownVotes IS NULL THEN 'Insufficient vote data'
+        WHEN qp.DownVotes = 0 THEN to_char(qp.UpVotes, 'FM999999')
+        ELSE to_char((CAST(qp.UpVotes AS double precision) / (qp.DownVotes + 1)), 'FM999999.00')
+    END AS UpDownRatio,
+    EXISTS (
+        SELECT 1
+        FROM Comments c
+        WHERE c.PostId = qp.PostId
+          AND c.Score > 5
+          AND (
+            lower(c.Text) LIKE '%performance%'
+            OR lower(c.Text) LIKE '%benchmark%'
+          )
+    ) AS HasHighScorePerformanceComments,
+    rank() OVER (
+        PARTITION BY t.tag
+        ORDER BY qp.Score DESC NULLS LAST
+    ) AS RankByTagScore,
+    COALESCE(u.DisplayName, 'Anonymous') || ' / ' || COALESCE(le.DisplayName, 'No Editor') AS Owner_Editor
+FROM QualifiedPosts qp
+LEFT JOIN Users u ON qp.OwnerUserId = u.Id
+LEFT JOIN LATERAL (
+    SELECT ph.LastEditorUserId
+    FROM Posts p2
+    JOIN PostHistory ph ON p2.Id = ph.PostId
+    WHERE p2.Id = qp.PostId
+    ORDER BY ph.CreationDate DESC
+    LIMIT 1
+) last_ed ON true
+LEFT JOIN Users le ON le.Id = last_ed.LastEditorUserId
+LEFT JOIN LATERAL (
+    SELECT unnest_elem AS tag
+    FROM unnest(qp.TagArray) AS unn(unnest_elem)
+) t ON true
+WHERE qp.Score > 10
+  AND qp.TotalPosts > 5
+  AND (qp.CloseReasonName IS NULL OR qp.CloseReasonName NOT IN ('Duplicate', 'Off-topic'))
+ORDER BY qp.Score DESC NULLS LAST, qp.ViewCount DESC NULLS LAST
+LIMIT 100;

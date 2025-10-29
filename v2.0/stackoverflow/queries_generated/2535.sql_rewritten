@@ -1,0 +1,174 @@
+-- {"query": "2535.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1631} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        array[t.TagName] as TagPath,
+        1 as Level
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+
+    union all
+
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.TagPath || t.TagName,
+        r.Level + 1
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id < r.Id and t.IsModeratorOnly = 0 and t.IsRequired = 0 and not t.TagName = any(r.TagPath)
+    where r.Level < 2
+),
+PostScoresByUser as (
+    select
+        p.OwnerUserId,
+        sum(
+            case when p.Score is null then 0 else p.Score end
+        ) as TotalScore,
+        count(*) as PostCount,
+        sum(case when p.PostTypeId = 1 then 1 else 0 end) as QuestionCount,
+        sum(case when p.PostTypeId = 2 then 1 else 0 end) as AnswerCount,
+        avg(p.ViewCount) as AvgViewCount
+    from Posts p
+    where p.OwnerUserId is not null and p.OwnerUserId > 0
+    group by p.OwnerUserId
+),
+UserBadgeSummary as (
+    select
+        b.UserId,
+        count(*) filter (where b.Class = 1) as GoldBadges,
+        count(*) filter (where b.Class = 2) as SilverBadges,
+        count(*) filter (where b.Class = 3) as BronzeBadges,
+        bool_or(b.TagBased = 1) as HasTagBasedBadge
+    from Badges b
+    group by b.UserId
+),
+PostWithComments as (
+    select
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.PostTypeId,
+        coalesce(count(c.Id), 0) as CommentCount,
+        string_agg(distinct u.DisplayName, ', ') as Commenters,
+        row_number() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC NULLS LAST) as PostRankDescScore,
+        rank() OVER (PARTITION BY p.OwnerUserId ORDER BY p.ViewCount DESC NULLS LAST) as PostRankDescViews
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+    left join Users u on u.Id = c.UserId
+    group by p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Tags, p.PostTypeId
+),
+AcceptedAnswerDetails as (
+    select
+        q.Id as QuestionId,
+        a.Id as AcceptedAnswerId,
+        a.OwnerUserId as AcceptedAnswerOwner,
+        a.Score as AcceptedAnswerScore,
+        a.CreationDate as AcceptedAnswerCreationDate,
+        (a.Score::float / nullif(extract(epoch from (a.CreationDate - q.CreationDate)),0)) as ScorePerSecond
+    from Posts q
+    join Posts a on q.AcceptedAnswerId = a.Id
+    where q.PostTypeId = 1 and a.PostTypeId = 2
+),
+ComplexUserStats as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        coalesce(ps.TotalScore, 0) as TotalPostScore,
+        coalesce(ps.PostCount, 0) as TotalPosts,
+        coalesce(badges.GoldBadges, 0) as GoldBadgeCount,
+        coalesce(badges.SilverBadges, 0) as SilverBadgeCount,
+        coalesce(badges.BronzeBadges, 0) as BronzeBadgeCount,
+        badges.HasTagBasedBadge,
+        u.CreationDate,
+        u.LastAccessDate,
+        case
+            when ps.PostCount > 0 then ps.TotalScore::float / ps.PostCount
+            else 0
+        end as AvgScorePerPost,
+        case
+            when u.Views is null then 0
+            else u.Views
+        end as Views,
+        (
+            select count(distinct pl.RelatedPostId)
+            from PostLinks pl
+            where pl.PostId in (select p.Id from Posts p where p.OwnerUserId = u.Id limit 10)
+        ) as DistinctLinkedPosts,
+        (
+            select count(*)
+            from Votes v
+            where v.UserId = u.Id and v.VoteTypeId = 2
+        ) as UpVotesGiven,
+        (
+            select count(*)
+            from Votes v
+            where v.UserId = u.Id and v.VoteTypeId = 3
+        ) as DownVotesGiven
+    from Users u
+    left join PostScoresByUser ps on ps.OwnerUserId = u.Id
+    left join UserBadgeSummary badges on badges.UserId = u.Id
+),
+DuplicatedQuestions as (
+    select distinct p.PostId as DuplicateQuestionId, pl.RelatedPostId as OriginalQuestionId
+    from PostLinks pl
+    join Posts p on p.Id = pl.PostId and p.PostTypeId = 1
+    where pl.LinkTypeId = 3
+),
+CloseVoteCounts as (
+    select
+        p.Id,
+        count(ph.Id) filter (where ph.PostHistoryTypeId = 10) as CloseVotes,
+        count(ph.Id) filter (where ph.PostHistoryTypeId = 11) as ReopenVotes
+    from Posts p
+    left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId in (10,11)
+    group by p.Id
+)
+
+select
+    cu.Id as UserId,
+    cu.DisplayName,
+    cu.Reputation,
+    cu.TotalPostScore,
+    cu.TotalPosts,
+    cu.GoldBadgeCount,
+    cu.SilverBadgeCount,
+    cu.BronzeBadgeCount,
+    cu.HasTagBasedBadge,
+    cu.Views,
+    cu.UpVotesGiven,
+    cu.DownVotesGiven,
+    coalesce(dq.DuplicateQuestionId, 0) as HasDuplicateQuestion,
+    ac.AcceptedAnswerId,
+    ac.AcceptedAnswerScore,
+    ac.ScorePerSecond,
+    pwc.Title as TopScoredPostTitle,
+    pwc.Score as TopScoredPostScore,
+    pwc.CommentCount as TopScoredPostCommentCount,
+    pwc.Commenters as TopScoredPostCommenters,
+    rh.TagName as SampleNonModTag,
+    count(distinct ph.Id) filter (where ph.PostHistoryTypeId = 14) as SuggestedEditAppliedCount,
+    coalesce(cv.CloseVotes,0) as CloseVotes,
+    coalesce(cv.ReopenVotes,0) as ReopenVotes
+from ComplexUserStats cu
+left join DuplicatedQuestions dq on dq.DuplicateQuestionId in (
+    select p.Id from Posts p where p.OwnerUserId = cu.Id and p.PostTypeId = 1 limit 1
+)
+left join AcceptedAnswerDetails ac on ac.AcceptedAnswerOwner = cu.Id
+left join PostWithComments pwc on pwc.OwnerUserId = cu.Id and pwc.PostRankDescScore = 1
+left join RecursiveTagHierarchy rh on rh.Level = 1
+left join PostHistory ph on ph.UserId = cu.Id
+left join CloseVoteCounts cv on cv.Id in (
+    select p.Id from Posts p where p.OwnerUserId = cu.Id and p.PostTypeId = 1 limit 1
+)
+where cu.TotalPosts > 20 and cu.Reputation > 1000
+and cu.LastAccessDate > cast('2024-10-01 12:34:56' as timestamp) - interval '1 year'
+order by cu.TotalPostScore desc
+limit 100;

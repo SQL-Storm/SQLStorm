@@ -1,0 +1,151 @@
+-- {"query": "2145.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1284} 
+with RecursiveHighScoreQuestions as (
+    select
+        p.Id,
+        p.Title,
+        p.Score,
+        p.CreationDate,
+        p.OwnerUserId,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.CreationDate asc) as rn
+    from
+        Posts p
+    where
+        p.PostTypeId = 1
+        and p.Score > 10
+        and p.OwnerUserId is not null
+), UserBadgeSummary as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(distinct b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(distinct b.Id) filter (where b.Class = 3) as BronzeBadges,
+        avg(v.Score) as AvgVoteScore,
+        max(v.CreationDate) as LastVoteDate
+    from
+        Users u
+        left join Badges b on u.Id = b.UserId
+        left join Posts p on p.OwnerUserId = u.Id
+        left join Votes v on v.PostId = p.Id and v.UserId = u.Id
+    group by
+        u.Id, u.DisplayName
+), PostActivityStats as (
+    select
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.OwnerUserId,
+        coalesce(cmt.CommentCount, 0) as TotalComments,
+        coalesce(ans.AnswerCount, 0) as TotalAnswers,
+        (case 
+            when p.ClosedDate is not null then 1
+            else 0
+         end) as IsClosed,
+        max(ph.CreationDate) filter (where ph.PostHistoryTypeId in (10,11)) as LastCloseReopenDate,
+        string_agg(distinct pt.Name, ', ') as PostTypesLinkedTo
+    from
+        Posts p
+        left join (
+            select
+                PostId,
+                count(*) as CommentCount
+            from Comments
+            group by PostId
+        ) cmt on p.Id = cmt.PostId
+        left join (
+            select
+                ParentId,
+                count(*) as AnswerCount
+            from Posts
+            where PostTypeId = 2
+            group by ParentId
+        ) ans on p.Id = ans.ParentId
+        left join PostHistory ph on ph.PostId = p.Id
+        left join PostLinks pl on pl.PostId = p.Id
+        left join PostTypes pt on pt.Id = pl.LinkTypeId
+    where
+        p.PostTypeId in (1,2)
+    group by
+        p.Id, p.Title, p.CreationDate, p.OwnerUserId, cmt.CommentCount, ans.AnswerCount, p.ClosedDate
+), RecursiveAnswerCounts as (
+    select
+        p.Id,
+        p.ParentId,
+        p.Score,
+        1 as Depth
+    from
+        Posts p
+    where
+        p.PostTypeId = 2
+        and p.ParentId is not null
+    union all
+    select
+        p2.Id,
+        p2.ParentId,
+        p2.Score,
+        rac.Depth + 1
+    from
+        Posts p2
+        join RecursiveAnswerCounts rac on p2.ParentId = rac.Id
+    where
+        p2.PostTypeId = 2
+), UserTopTagBadges as (
+    select
+        b.UserId,
+        t.TagName,
+        count(*) as TagBadgeCount,
+        row_number() over (partition by b.UserId order by count(*) desc) as rn
+    from
+        Badges b
+        join Tags t on b.Name = t.TagName
+    where
+        b.TagBased = 1
+    group by
+        b.UserId, t.TagName
+)
+select 
+    ubs.UserId,
+    ubs.DisplayName, 
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    ubs.AvgVoteScore,
+    coalesce(max(rhq.Title), 'No High Score Question') as TopQuestionTitle,
+    coalesce(max(rhq.Score), 0) as TopQuestionScore,
+    pas.TotalComments,
+    pas.TotalAnswers,
+    pas.IsClosed,
+    pas.LastCloseReopenDate,
+    case 
+        when utb.TagBadgeCount is not null then utb.TagName || ' (' || utb.TagBadgeCount || ' badges)'
+        else 'No Tag Badges'
+    end as FavoriteTagBadge,
+    (select
+        count(distinct ph.Id)
+        from PostHistory ph
+        where ph.UserId = ubs.UserId
+          and ph.PostHistoryTypeId in (10, 11)
+          and ph.CreationDate > now() - interval '1 year'
+    ) as CloseReopenActionsPastYear,
+    (select 
+        count(*)
+        from RecursiveAnswerCounts rac
+        join Posts p on p.Id = rac.Id
+        where p.OwnerUserId = ubs.UserId and rac.Depth > 1
+    ) as RecursiveAnswerCount,
+    (select string_agg(distinct substring(t.TagName from 1 for 10), ', ')
+     from Tags t
+     join Posts p on p.Tags like '%' || t.TagName || '%'
+     where p.OwnerUserId = ubs.UserId
+     limit 3
+    ) as FrequentTagsSample
+from
+    UserBadgeSummary ubs
+    left join RecursiveHighScoreQuestions rhq on rhq.OwnerUserId = ubs.UserId and rhq.rn = 1
+    left join PostActivityStats pas on pas.OwnerUserId = ubs.UserId
+    left join UserTopTagBadges utb on utb.UserId = ubs.UserId and utb.rn = 1
+where 
+    ubs.GoldBadges > 0 or ubs.SilverBadges > 0
+order by
+    ubs.GoldBadges desc, ubs.AvgVoteScore desc
+limit 100;

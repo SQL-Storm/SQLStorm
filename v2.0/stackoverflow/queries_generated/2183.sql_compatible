@@ -1,0 +1,150 @@
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.CreationDate,
+        u.Reputation,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p2.Id) filter (where p2.PostTypeId = 2) as AnswerCount,
+        count(distinct c.Id) as CommentCount,
+        coalesce(sum(case when vt.Name = 'UpMod' then 1 else 0 end), 0) as TotalUpVotes,
+        coalesce(sum(case when vt.Name = 'DownMod' then 1 else 0 end), 0) as TotalDownVotes
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Posts p2 on p2.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    left join VoteTypes vt on vt.Id = v.VoteTypeId
+    group by u.Id, u.DisplayName, u.CreationDate, u.Reputation
+),
+UserBadgeAggregate as (
+    select
+        b.UserId,
+        count(*) filter (where b.Class = 1) as GoldBadges,
+        count(*) filter (where b.Class = 2) as SilverBadges,
+        count(*) filter (where b.Class = 3) as BronzeBadges
+    from Badges b
+    group by b.UserId
+),
+QuestionAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.OwnerUserId as QuestionOwner,
+        q.Title,
+        q.CreationDate,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViews,
+        coalesce(a.AnswerCount, 0) as AnswerCount,
+        coalesce(a.AcceptedAnswerScore, 0) as AcceptedAnswerScore,
+        coalesce(a.LatestAnswerDate, q.CreationDate) as LatestAnswerDate,
+        case when q.AcceptedAnswerId is not null then 1 else 0 end as HasAcceptedAnswer,
+        q.Tags
+    from Posts q
+    left join lateral (
+        select
+            count(*) as AnswerCount,
+            max(a.CreationDate) as LatestAnswerDate,
+            max(case when a.Id = q.AcceptedAnswerId then a.Score else null end) as AcceptedAnswerScore
+        from Posts a
+        where a.ParentId = q.Id and a.PostTypeId = 2
+    ) a on true
+    where q.PostTypeId = 1
+),
+TagPopularity as (
+    select
+        unnest(string_to_array(substring(q.Tags from 2 for length(q.Tags)-2), '><')) as Tag,
+        count(q.Id) as QuestionsWithTag,
+        avg(q.Score) as AvgScore,
+        avg(q.ViewCount) as AvgViews,
+        max(q.CreationDate) as MostRecentQuestion
+    from Posts q
+    where q.PostTypeId = 1 and q.Tags is not null
+    group by Tag
+),
+DuplicateLinkInfo as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        count(*) over (partition by pl.PostId) as DuplicateCount
+    from PostLinks pl
+    where pl.LinkTypeId = 3
+),
+QuestionCloseHistory as (
+    select
+        ph.PostId,
+        min(ph.CreationDate) as FirstCloseDate,
+        max(ph.CreationDate) filter (where ph.PostHistoryTypeId = 11) as LastReopenDate,
+        count(*) filter (where ph.PostHistoryTypeId = 10) as CloseEvents,
+        count(*) filter (where ph.PostHistoryTypeId = 11) as ReopenEvents
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (10, 11)
+    group by ph.PostId
+)
+select
+    r.UserId,
+    r.DisplayName,
+    r.Reputation,
+    r.QuestionCount,
+    r.AnswerCount,
+    r.CommentCount,
+    r.TotalUpVotes - r.TotalDownVotes as NetVotes,
+    coalesce(b.GoldBadges,0) as GoldBadges,
+    coalesce(b.SilverBadges,0) as SilverBadges,
+    coalesce(b.BronzeBadges,0) as BronzeBadges,
+    q.QuestionId,
+    q.Title,
+    length(q.Tags) as TagStringLength,
+    q.AnswerCount as AnswersOnQuestion,
+    q.HasAcceptedAnswer,
+    q.QuestionScore,
+    q.QuestionViews,
+    q.AcceptedAnswerScore,
+    q.LatestAnswerDate,
+    d.DuplicateCount,
+    ch.CloseEvents,
+    ch.ReopenEvents,
+    ch.FirstCloseDate,
+    ch.LastReopenDate,
+    (select count(*) from Comments c where c.PostId = q.QuestionId and c.Score > 0) as CommentsWithPositiveScore,
+    rank() over (partition by r.UserId order by q.QuestionScore desc) as QuestionScoreRank,
+    dense_rank() over (order by r.Reputation desc) as UserReputationRank,
+    case
+        when r.Reputation >= 10000 then 'Expert'
+        when r.Reputation >= 1000 then 'Intermediate'
+        else 'Novice'
+    end as UserLevel,
+    coalesce(tp.QuestionsWithTag,0) as TagQuestionCount,
+    coalesce(tp.AvgScore,0) as TagAverageScore,
+    coalesce(tp.AvgViews,0) as TagAverageViews,
+    case 
+        when coalesce(ch.CloseEvents,0) > 0 then 'Closed Frequently'
+        else 'Stable'
+    end as QuestionStatus,
+    concat_ws(' | ',
+        substring(q.Title from 1 for 50),
+        coalesce(tp.Tag, 'NoTag'),
+        'Score: ' || q.QuestionScore,
+        'Views:' || q.QuestionViews,
+        'Answers:' || q.AnswerCount
+    ) as Summary
+from RecursiveUserActivity r
+inner join QuestionAnswerStats q on q.QuestionOwner = r.UserId
+left join UserBadgeAggregate b on b.UserId = r.UserId
+left join DuplicateLinkInfo d on d.PostId = q.QuestionId
+left join QuestionCloseHistory ch on ch.PostId = q.QuestionId
+left join LATERAL (
+    select 
+        tp.Tag,
+        tp.QuestionsWithTag,
+        tp.AvgScore,
+        tp.AvgViews
+    from TagPopularity tp
+    where tp.Tag = (
+        select unnest(string_to_array(substring(q.Tags from 2 for length(q.Tags)-2), '><')) 
+        order by 1 limit 1
+    )
+    limit 1
+) tp on true
+where r.Reputation > 500
+order by r.Reputation desc, q.QuestionScore desc
+limit 100;

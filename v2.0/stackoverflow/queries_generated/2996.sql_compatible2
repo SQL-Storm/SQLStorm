@@ -1,0 +1,150 @@
+WITH RECURSIVE RecursiveUserReputationIncrements AS (
+    select 
+        u.Id as UserId,
+        u.Reputation,
+        1 as Level
+    from Users u
+    where u.Reputation is not null
+
+    union all
+
+    select 
+        ru.UserId,
+        ru.Reputation + coalesce(sum(p.Score), 0) as Reputation,
+        ru.Level + 1
+    from RecursiveUserReputationIncrements ru
+    join Posts p on p.OwnerUserId = ru.UserId
+    where ru.Level < 3
+    group by ru.UserId, ru.Reputation, ru.Level
+),
+FilteredPosts as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.ClosedDate
+    from Posts p
+    where p.PostTypeId in (1,2)
+      and p.CreationDate >= DATE '2019-01-01' and p.CreationDate < DATE '2020-01-01'
+      and (p.Score > 10 or (p.ViewCount > 1000 and p.AnswerCount > 0))
+),
+RankedAnswers as (
+    select 
+        p.Id,
+        p.ParentId,
+        p.Score,
+        p.CreationDate,
+        row_number() over (partition by p.ParentId order by p.Score desc, p.CreationDate asc) as RankByScore
+    from Posts p
+    where p.PostTypeId = 2
+),
+QuestionStats as (
+    select 
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId as QuestionOwner,
+        q.AnswerCount,
+        q.ViewCount,
+        q.Score as QuestionScore,
+        count(distinct case when c.UserId is not null then c.Id end) as CommentCount,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpvotesCount,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownvotesCount,
+        case 
+            when q.ClosedDate is not null then 'Closed' 
+            else 'Open' 
+        end as Status,
+        row_number() over (partition by q.OwnerUserId order by q.ViewCount desc) as UserQuestionRank
+    from Posts q
+    left join Comments c on c.PostId = q.Id
+    left join Votes v on v.PostId = q.Id
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.OwnerUserId, q.AnswerCount, q.ViewCount, q.Score, q.ClosedDate
+),
+BadgeCountCTE as (
+    select 
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges
+    from Badges b
+    group by b.UserId
+),
+LatestPostHistoryPerPost as (
+    select ph.PostId,
+        ph.CreationDate as LastHistoryDate,
+        ph.PostHistoryTypeId,
+        ph.UserId as HistoryUserId,
+        ph.Comment as HistoryComment
+    from (
+        select ph.*,
+               row_number() over (partition by ph.PostId order by ph.CreationDate desc) as rn
+        from PostHistory ph
+    ) ph
+    where ph.rn = 1
+),
+DuplicateLinkStats as (
+    select 
+        pl.PostId,
+        count(distinct pl.RelatedPostId) as DuplicateLinks,
+        bool_or(pl.LinkTypeId = 3) as HasDuplicateLink
+    from PostLinks pl
+    group by pl.PostId
+),
+UserActivityWindow as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        max(p.CreationDate) over (partition by u.Id order by p.CreationDate rows between unbounded preceding and current row) as LastPostDate,
+        count(p.Id) over (partition by u.Id order by p.CreationDate rows between unbounded preceding and current row) as PostsSoFar
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+)
+select
+    qs.QuestionId,
+    qs.Title,
+    coalesce(u.DisplayName, 'Unknown') as OwnerDisplayName,
+    ru.Level as RecursionLevel,
+    ru.Reputation as ComputedReputation,
+    qs.AnswerCount,
+    qs.ViewCount,
+    qs.QuestionScore,
+    qs.CommentCount,
+    qs.UpvotesCount,
+    qs.DownvotesCount,
+    bc.GoldBadges,
+    bc.SilverBadges,
+    bc.BronzeBadges,
+    dl.DuplicateLinks,
+    dl.HasDuplicateLink,
+    lh.LastHistoryDate,
+    lh.PostHistoryTypeId,
+    lh.HistoryComment,
+    ua.PostsSoFar,
+    ua.LastPostDate,
+    case 
+        when qs.Status = 'Closed' and lh.PostHistoryTypeId in (10, 11) then 'RecentlyClosedOrReopened'
+        when qs.Status = 'Open' and lh.PostHistoryTypeId = 11 then 'RecentlyReopened'
+        else 'Normal'
+    end as PostState
+from QuestionStats qs
+left join Users u on u.Id = qs.QuestionOwner
+left join RecursiveUserReputationIncrements ru on ru.UserId = qs.QuestionOwner and ru.Level = 3
+left join BadgeCountCTE bc on bc.UserId = qs.QuestionOwner
+left join DuplicateLinkStats dl on dl.PostId = qs.QuestionId
+left join LatestPostHistoryPerPost lh on lh.PostId = qs.QuestionId
+left join UserActivityWindow ua on ua.UserId = qs.QuestionOwner
+where 
+    (qs.ViewCount > 500 or qs.AnswerCount > 2) 
+    and (ru.Reputation > 1000 or ru.Reputation is null)
+order by qs.ViewCount desc, qs.AnswerCount desc, ru.Reputation desc
+limit 50;

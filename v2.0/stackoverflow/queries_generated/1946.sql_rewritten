@@ -1,0 +1,168 @@
+-- {"query": "1946.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2563} 
+WITH UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.Views AS UserViews,
+        u.UpVotes AS UserUpVotes,
+        u.DownVotes AS UserDownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswers,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostScore,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        MAX(p.LastActivityDate) AS LastUserActivityDate,
+        DATE_PART('year', u.CreationDate) AS UserCreationYear,
+        (SELECT COUNT(DISTINCT ph.PostId) FROM PostHistory ph WHERE ph.UserId = u.Id AND ph.PostHistoryTypeId IN (4,5,6)) AS TotalPostsEditedByUser
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 5000
+      AND u.CreationDate BETWEEN '2012-01-01' AND '2020-12-31'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Views, u.UpVotes, u.DownVotes
+),
+PostDetail AS (
+    SELECT
+        qp.Id AS QuestionId,
+        qp.Title AS QuestionTitle,
+        qp.CreationDate AS QuestionCreationDate,
+        qp.ViewCount AS QuestionViewCount,
+        qp.Score AS QuestionScore,
+        qp.AnswerCount AS NumAnswers,
+        qp.OwnerUserId AS QuestionOwnerUserId,
+        qp.AcceptedAnswerId,
+        qp.Tags AS RawTags,
+        ap.Id AS AcceptedAnswerPostId,
+        ap.Score AS AcceptedAnswerScore,
+        ap.OwnerUserId AS AcceptedAnswerOwnerUserId,
+        (SELECT u_aa.Reputation FROM Users u_aa WHERE u_aa.Id = ap.OwnerUserId) AS AcceptedAnswerOwnerReputation,
+        DATE_PART('day', cast('2024-10-01 12:34:56' as timestamp) - qp.CreationDate) AS QuestionAgeDays,
+        (SELECT MAX(ph.CreationDate) FROM PostHistory ph WHERE ph.PostId = qp.Id AND ph.PostHistoryTypeId IN (4,5,6)) AS LatestQuestionEditDate
+    FROM Posts qp
+    LEFT JOIN Posts ap ON qp.AcceptedAnswerId = ap.Id AND qp.PostTypeId = 1
+    WHERE qp.PostTypeId = 1
+      AND qp.ViewCount > 1000
+      AND qp.Score > 10
+      AND qp.CreationDate BETWEEN '2015-01-01' AND '2023-12-31'
+),
+PostEditActivity AS (
+    SELECT
+        ph.PostId,
+        COUNT(ph.Id) AS TotalHistoryEntries,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6, 8, 9) THEN ph.Id END) AS EditCount,
+        MIN(ph.CreationDate) AS FirstHistoryDate,
+        MAX(ph.CreationDate) AS LastHistoryDate,
+        AVG(EXTRACT(EPOCH FROM (ph.CreationDate - LAG(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate))) / 60.0) FILTER (WHERE LAG(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) IS NOT NULL) AS AvgMinutesBetweenEdits
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16)
+    GROUP BY ph.PostId
+),
+ModeratorActionSummary AS (
+    SELECT
+        ph.PostId,
+        COUNT(*) AS TotalModeratorActions,
+        SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseCount,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN crt.Name ELSE NULL END) AS LastCloseReason,
+        AVG(EXTRACT(EPOCH FROM (ph.CreationDate - LAG(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate))) / 3600.0) FILTER (WHERE LAG(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) IS NOT NULL) AS AvgHoursBetweenModActions
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON ph.PostHistoryTypeId = 10 AND ph.Comment = crt.Id::VARCHAR(50)
+    WHERE ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15, 19, 20)
+    GROUP BY ph.PostId
+),
+QuestionTagAnalysis AS (
+    SELECT
+        pd.QuestionId,
+        LOWER(TRIM(unnest(string_to_array(SUBSTRING(pd.RawTags, 2, LENGTH(pd.RawTags) - 2), '><')))) AS TagName
+    FROM PostDetail pd
+    WHERE pd.RawTags IS NOT NULL AND LENGTH(pd.RawTags) > 2
+)
+SELECT
+    ue.UserId,
+    ue.DisplayName,
+    ue.Reputation,
+    ue.UserCreationDate,
+    ue.TotalPosts,
+    ue.TotalQuestions,
+    ue.TotalAnswers,
+    ue.TotalComments,
+    ue.TotalBadges,
+    ue.UserViews,
+    ue.TotalPostsEditedByUser,
+    RANK() OVER (ORDER BY ue.Reputation DESC, ue.TotalPosts DESC) AS UserReputationRank,
+    NTILE(5) OVER (ORDER BY ue.TotalQuestions DESC) AS QuestionProportionQuintile,
+    pd.QuestionId,
+    COALESCE(pd.QuestionTitle, 'Untitled Question') AS QuestionTitle,
+    pd.QuestionCreationDate,
+    pd.QuestionViewCount,
+    pd.QuestionScore,
+    pd.NumAnswers,
+    pd.QuestionAgeDays,
+    pd.LatestQuestionEditDate,
+    pd.AcceptedAnswerPostId,
+    pd.AcceptedAnswerScore,
+    COALESCE(u_aa.DisplayName, 'No Accepted Answer User') AS AcceptedAnswerOwnerDisplayName,
+    pd.AcceptedAnswerOwnerReputation,
+    CASE
+        WHEN pd.AcceptedAnswerPostId IS NOT NULL AND ue.UserId = pd.AcceptedAnswerOwnerUserId THEN 'Self-Accepted'
+        WHEN pd.AcceptedAnswerPostId IS NOT NULL THEN 'Accepted Other User'
+        ELSE 'No Accepted Answer'
+    END AS AcceptedAnswerStatus,
+    pa.EditCount AS QuestionEditCount,
+    pa.AvgMinutesBetweenEdits AS QuestionAvgMinutesBetweenEdits,
+    ms.TotalModeratorActions,
+    ms.CloseCount AS QuestionCloseCount,
+    ms.LastCloseReason AS LatestQuestionCloseReason,
+    ms.AvgHoursBetweenModActions,
+    STRING_AGG(DISTINCT qta.TagName, '; ') AS QuestionTagsSummary,
+    (
+        SELECT c.Text
+        FROM Comments c
+        WHERE c.PostId = pd.QuestionId
+          AND EXISTS (
+                SELECT 1
+                FROM PostHistory ph_sub
+                WHERE ph_sub.PostId = pd.QuestionId
+                  AND ph_sub.UserId = c.UserId
+                  AND ph_sub.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Body, Tags
+            )
+        ORDER BY c.Score DESC, c.CreationDate DESC
+        LIMIT 1
+    ) AS TopCommentByQuestionEditor,
+    (
+        SELECT STRING_AGG(vt.Name, ', ')
+        FROM Votes v
+        JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+        WHERE v.PostId = pd.QuestionId AND v.VoteTypeId IN (2, 3, 5, 12)
+        GROUP BY v.PostId
+    ) AS QuestionVoteTypeSummary,
+    AVG(pd.QuestionScore) OVER (PARTITION BY ue.UserCreationYear) AS AvgQuestionScoreForUsersInSameYear,
+    SUM(CASE WHEN pd.AcceptedAnswerPostId IS NOT NULL THEN 1 ELSE 0 END) OVER (PARTITION BY ue.UserId) AS UserAcceptedAnswerCount,
+    LENGTH(REPLACE(REPLACE(REPLACE(pd.QuestionTitle, ' ', ''), '.', ''), ',', '')) AS TitleAlphanumLength,
+    ABS(ue.UserUpVotes - ue.UserDownVotes) AS UserNetVotesAbsolute
+FROM UserEngagement ue
+INNER JOIN PostDetail pd ON ue.UserId = pd.QuestionOwnerUserId
+LEFT JOIN Users u_aa ON pd.AcceptedAnswerOwnerUserId = u_aa.Id
+LEFT JOIN PostEditActivity pa ON pd.QuestionId = pa.PostId
+LEFT JOIN ModeratorActionSummary ms ON pd.QuestionId = ms.PostId
+LEFT JOIN QuestionTagAnalysis qta ON pd.QuestionId = qta.QuestionId
+WHERE pd.QuestionViewCount > 5000
+  AND (pa.EditCount IS NULL OR pa.EditCount > 0)
+  AND (ms.CloseCount IS NULL OR ms.CloseCount = 0 OR ms.LastCloseReason LIKE '%duplicate%')
+  AND (ue.UserViews > 10000 OR ue.TotalPosts > 50)
+GROUP BY
+    ue.UserId, ue.DisplayName, ue.Reputation, ue.UserCreationDate, ue.TotalPosts, ue.TotalQuestions,
+    ue.TotalAnswers, ue.TotalComments, ue.TotalBadges, ue.UserViews, ue.TotalPostsEditedByUser,
+    ue.UserCreationYear, pd.QuestionId, pd.QuestionTitle, pd.QuestionCreationDate, pd.QuestionViewCount,
+    pd.QuestionScore, pd.NumAnswers, pd.QuestionAgeDays, pd.LatestQuestionEditDate, pd.AcceptedAnswerPostId,
+    pd.AcceptedAnswerScore, pd.AcceptedAnswerOwnerReputation, pa.EditCount, pa.AvgMinutesBetweenEdits,
+    ms.TotalModeratorActions, ms.CloseCount, ms.LastCloseReason, ms.AvgHoursBetweenModActions, u_aa.DisplayName,
+    ue.UserUpVotes, ue.UserDownVotes
+HAVING COUNT(DISTINCT pd.QuestionId) >= 1
+   AND SUM(CASE WHEN pd.AcceptedAnswerPostId IS NOT NULL THEN 1 ELSE 0 END) >= 1
+   AND MAX(LENGTH(REPLACE(REPLACE(REPLACE(pd.QuestionTitle, ' ', ''), '.', ''), ',', ''))) > 15
+ORDER BY UserReputationRank ASC, pd.QuestionScore DESC
+LIMIT 1000;

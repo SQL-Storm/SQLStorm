@@ -1,0 +1,35 @@
+SELECT 
+    u.DisplayName,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+    SUM(CASE WHEN p.ViewCount > 1000 THEN 1 ELSE 0 END) AS PopularPosts,
+    COUNT(DISTINCT v.PostId) AS TotalVotes,
+    COUNT(DISTINCT CASE WHEN b.TagBased = 0 THEN b.Id ELSE NULL END) AS NamedBadges,
+    COUNT(DISTINCT CASE WHEN b.TagBased = 1 THEN b.Id ELSE NULL END) AS TagBadges,
+    MAX(u.Reputation) AS MaxReputation,
+    AVG(u.Views) AS AvgViews,
+    MIN(p.LastActivityDate) AS FirstPostActivity,
+    AVG(DATEDIFF(day, p.CreationDate, p.LastActivityDate)) AS AvgDaysBetweenActivity
+FROM 
+    Users u
+LEFT JOIN 
+    Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN 
+    Votes v ON p.Id = v.PostId
+LEFT JOIN 
+    Badges b ON u.Id = b.UserId
+WHERE 
+    (p.PostTypeId IN (1, 2) OR p.PostTypeId IS NULL)
+    AND u.Reputation > 100 
+    AND (p.LastActivityDate IS NOT NULL OR p.CreationDate = p.LastActivityDate)
+GROUP BY 
+    u.DisplayName,
+    u.Reputation,
+    u.Views
+HAVING 
+    AVG(p.Score) > 0 
+    OR COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id ELSE NULL END) > 5
+ORDER BY 
+    TotalPosts DESC, 
+    TotalQuestions DESC;

@@ -1,0 +1,211 @@
+WITH UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.UpVotes AS TotalUpVotesGivenBySelf,
+        U.DownVotes AS TotalDownVotesGivenBySelf,
+        COUNT(DISTINCT P.Id) AS TotalPostsCreated,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS TotalQuestionsCreated,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS TotalAnswersCreated,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        SUM(COALESCE(P.Score, 0)) AS SumPostScores,
+        AVG(COALESCE(P.Score, 0)) AS AvgPostScore,
+        MAX(CASE WHEN P.PostTypeId = 1 THEN P.ViewCount ELSE 0 END) AS MaxQuestionViewCount,
+        MIN(P.CreationDate) AS FirstPostDate,
+        MAX(P.LastActivityDate) AS LastPostActivityDate,
+        COUNT(DISTINCT B.Id) AS TotalBadges
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.UpVotes, U.DownVotes
+),
+PostEditDetails AS (
+    SELECT
+        PH.PostId,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.Id END) AS EditCount,
+        MAX(PH.CreationDate) AS LastEditTimestamp,
+        MIN(PH.CreationDate) AS FirstEditTimestamp,
+        STRING_AGG(DISTINCT SUBSTRING(PH.Text FROM 1 FOR 50), ' | ') FILTER (WHERE PH.PostHistoryTypeId = 6 AND PH.Text IS NOT NULL) AS TagChangesSummary,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS WasClosedEver
+    FROM PostHistory PH
+    WHERE PH.PostHistoryTypeId IN (4, 5, 6, 10, 11, 12, 13)
+    GROUP BY PH.PostId
+),
+QuestionClosureDetails AS (
+    SELECT
+        Q.Id AS QuestionId,
+        CASE WHEN Q.ClosedDate IS NOT NULL THEN TRUE ELSE FALSE END AS IsPermanentlyClosed,
+        CR.Name AS ActualCloseReason,
+        COUNT(DISTINCT V.UserId) FILTER (WHERE V.VoteTypeId = 6) AS NumberOfCloseVotesRecorded,
+        AVG(EXTRACT(EPOCH FROM (V.CreationDate - Q.CreationDate)) / 3600) FILTER (WHERE V.VoteTypeId = 6) AS AvgCloseVoteLagHours
+    FROM Posts Q
+    LEFT JOIN (
+        SELECT PostId, MAX(CreationDate) AS LastCloseDate, MAX(Comment) AS LastCloseReasonComment
+        FROM PostHistory
+        WHERE PostHistoryTypeId = 10 AND Comment IS NOT NULL
+        GROUP BY PostId
+    ) AS LastClosePH ON Q.Id = LastClosePH.PostId
+    LEFT JOIN CloseReasonTypes CR ON CR.Id = CAST(LastClosePH.LastCloseReasonComment AS SMALLINT)
+    LEFT JOIN Votes V ON Q.Id = V.PostId AND V.VoteTypeId = 6
+    WHERE Q.PostTypeId = 1
+    GROUP BY Q.Id, Q.ClosedDate, CR.Name
+),
+TopTagsByPostCount AS (
+    SELECT
+        tag AS TagName,
+        COUNT(*) AS PostCount
+    FROM (
+        SELECT
+            P.Id,
+            TRIM(tag) AS tag
+        FROM Posts P,
+        LATERAL (
+            SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(P.Tags FROM 2 FOR CHAR_LENGTH(P.Tags) - 2), '><')) AS tag
+        ) AS t
+        WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL AND CHAR_LENGTH(P.Tags) > 2
+    ) AS exploded
+    GROUP BY tag
+    ORDER BY PostCount DESC
+    LIMIT 100
+)
+SELECT
+    UAS.UserId,
+    UAS.DisplayName,
+    UAS.Reputation,
+    UAS.TotalQuestionsCreated,
+    UAS.TotalAnswersCreated,
+    UAS.TotalCommentsMade,
+    UAS.SumPostScores,
+    UAS.AvgPostScore,
+    UAS.MaxQuestionViewCount,
+    UAS.TotalBadges,
+    P.Id AS PostId,
+    P.PostTypeId,
+    PT.Name AS PostTypeName,
+    P.CreationDate AS PostCreationDate,
+    P.LastActivityDate AS PostLastActivityDate,
+    P.Score AS PostScore,
+    P.ViewCount AS PostViewCount,
+    P.AnswerCount AS PostAnswerCount,
+    P.CommentCount AS PostCommentCount,
+    P.FavoriteCount AS PostFavoriteCount,
+    P.Title AS PostTitle,
+    TRIM(SUBSTRING(P.Tags FROM 2 FOR CHAR_LENGTH(P.Tags) - 2)) AS FormattedTags,
+    PED.EditCount,
+    PED.LastEditTimestamp,
+    PED.TagChangesSummary,
+    GCD.IsPermanentlyClosed,
+    GCD.ActualCloseReason,
+    GCD.NumberOfCloseVotesRecorded,
+    GCD.AvgCloseVoteLagHours,
+    (SELECT COUNT(DISTINCT C.Id) FROM Comments C WHERE C.PostId = P.Id AND C.CreationDate > P.LastEditDate AND C.Score >= 3) AS RecentHighScoreComments,
+    (SELECT AVG(CAST(V_inner.BountyAmount AS DOUBLE PRECISION)) FROM Votes V_inner WHERE V_inner.PostId = P.Id AND V_inner.VoteTypeId = 8) AS AvgBountyAmount,
+    CASE
+        WHEN P.ViewCount >= 10000 AND P.Score >= 50 THEN 'Highly Engaged'
+        WHEN P.ViewCount >= 1000 AND P.Score >= 10 THEN 'Moderately Engaged'
+        ELSE 'Low Engagement'
+    END AS EngagementLevel,
+    RANK() OVER (PARTITION BY UAS.UserId ORDER BY P.Score DESC, P.CreationDate DESC) AS PostScoreRankByUser,
+    LAG(P.CreationDate) OVER (PARTITION BY UAS.UserId ORDER BY P.CreationDate) AS PreviousPostCreationDate,
+    LEAD(P.CreationDate) OVER (PARTITION BY UAS.UserId ORDER BY P.CreationDate) AS NextPostCreationDate,
+    AVG(P.Score) OVER (PARTITION BY UAS.UserId ORDER BY P.CreationDate ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS RollingAvgScoreLast3Posts,
+    COUNT(CASE WHEN V.VoteTypeId = 2 THEN 1 END) OVER (PARTITION BY P.Id) AS TotalUpVotesOnPost,
+    COALESCE(PL_Dup.DuplicateLinkCount, 0) AS NumberOfDuplicatesReferencingThis,
+    CASE
+        WHEN EXISTS (
+            SELECT 1 FROM TopTagsByPostCount TPC
+            WHERE POSITION(TPC.TagName IN COALESCE(P.Tags, '')) > 0
+        ) THEN 'PopularTag'
+        ELSE 'NicheTag'
+    END AS TagPopularityStatus,
+    EXTRACT(EPOCH FROM (P.CreationDate - UAS.FirstPostDate)) AS TimeSinceUserFirstPostSeconds,
+    EXTRACT(EPOCH FROM (P.LastActivityDate - P.CreationDate)) AS PostAgeWithActivitySeconds
+FROM UserActivitySummary UAS
+INNER JOIN Posts P ON UAS.UserId = P.OwnerUserId
+INNER JOIN PostTypes PT ON P.PostTypeId = PT.Id
+LEFT JOIN PostEditDetails PED ON P.Id = PED.PostId
+LEFT JOIN QuestionClosureDetails GCD ON P.Id = GCD.QuestionId
+LEFT JOIN Votes V ON P.Id = V.PostId
+LEFT JOIN (SELECT RelatedPostId, COUNT(*) AS DuplicateLinkCount FROM PostLinks WHERE LinkTypeId = 3 GROUP BY RelatedPostId) PL_Dup ON P.Id = PL_Dup.RelatedPostId
+WHERE
+    UAS.Reputation >= 10000
+    AND P.PostTypeId IN (1, 2)
+    AND P.CreationDate BETWEEN TIMESTAMP '2022-01-01' AND TIMESTAMP '2023-12-31'
+    AND P.ViewCount > (
+        SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = P.PostTypeId AND CreationDate BETWEEN TIMESTAMP '2022-01-01' AND TIMESTAMP '2023-12-31'
+    ) * 0.5
+    AND (
+        P.Body LIKE '%performance%' OR P.Body LIKE '%optimization%' OR P.Body LIKE '%scalability%'
+        OR (P.Title IS NOT NULL AND LOWER(P.Title) LIKE '%index%' AND P.Score > 5)
+    )
+    AND (P.AcceptedAnswerId IS NOT NULL OR P.AnswerCount > 0 OR P.ClosedDate IS NOT NULL)
+    AND NOT EXISTS (
+        SELECT 1
+        FROM Comments C_corr
+        WHERE C_corr.PostId = P.Id
+        AND LOWER(C_corr.Text) LIKE '%spam%'
+        AND C_corr.CreationDate > P.CreationDate
+    )
+
+UNION ALL
+
+SELECT
+    U.Id AS UserId,
+    U.DisplayName,
+    U.Reputation,
+    CAST(NULL AS BIGINT) AS TotalQuestionsCreated,
+    CAST(NULL AS BIGINT) AS TotalAnswersCreated,
+    CAST(NULL AS BIGINT) AS TotalCommentsMade,
+    P.Score AS SumPostScores,
+    P.Score AS AvgPostScore,
+    P.ViewCount AS MaxQuestionViewCount,
+    (SELECT COUNT(B_sub.Id) FROM Badges B_sub WHERE B_sub.UserId = U.Id) AS TotalBadges,
+    P.Id AS PostId,
+    P.PostTypeId,
+    PT.Name AS PostTypeName,
+    P.CreationDate AS PostCreationDate,
+    P.LastActivityDate AS PostLastActivityDate,
+    P.Score AS PostScore,
+    P.ViewCount AS PostViewCount,
+    P.AnswerCount AS PostAnswerCount,
+    P.CommentCount AS PostCommentCount,
+    P.FavoriteCount AS PostFavoriteCount,
+    P.Title AS PostTitle,
+    TRIM(SUBSTRING(P.Tags FROM 2 FOR CHAR_LENGTH(P.Tags) - 2)) AS FormattedTags,
+    CAST(NULL AS BIGINT) AS EditCount,
+    CAST(NULL AS TIMESTAMP) AS LastEditTimestamp,
+    CAST(NULL AS VARCHAR(400)) AS TagChangesSummary,
+    CASE WHEN P.ClosedDate IS NOT NULL THEN TRUE ELSE FALSE END AS IsPermanentlyClosed,
+    CAST(NULL AS VARCHAR(50)) AS ActualCloseReason,
+    CAST(NULL AS BIGINT) AS NumberOfCloseVotesRecorded,
+    CAST(NULL AS DOUBLE PRECISION) AS AvgCloseVoteLagHours,
+    (SELECT COUNT(C_corr.Id) FROM Comments C_corr WHERE C_corr.PostId = P.Id AND C_corr.Score >= 5) AS RecentHighScoreComments,
+    (SELECT MAX(CAST(V_inner.BountyAmount AS DOUBLE PRECISION)) FROM Votes V_inner WHERE V_inner.PostId = P.Id AND V_inner.VoteTypeId = 8) AS AvgBountyAmount,
+    'High Impact Answer' AS EngagementLevel,
+    ROW_NUMBER() OVER (PARTITION BY U.Id ORDER BY P.Score DESC, P.CreationDate DESC) AS PostScoreRankByUser,
+    LAG(P.CreationDate) OVER (PARTITION BY U.Id ORDER BY P.CreationDate) AS PreviousPostCreationDate,
+    LEAD(P.CreationDate) OVER (PARTITION BY U.Id ORDER BY P.CreationDate) AS NextPostCreationDate,
+    CAST(NULL AS DOUBLE PRECISION) AS RollingAvgScoreLast3Posts,
+    COUNT(CASE WHEN V.VoteTypeId = 2 THEN 1 END) OVER (PARTITION BY P.Id) AS TotalUpVotesOnPost,
+    COALESCE(PL_Linked.LinkedPostCount, 0) AS NumberOfDuplicatesReferencingThis,
+    'FeaturedTag' AS TagPopularityStatus,
+    EXTRACT(EPOCH FROM (P.CreationDate - U.CreationDate)) AS TimeSinceUserFirstPostSeconds,
+    EXTRACT(EPOCH FROM (P.LastActivityDate - P.CreationDate)) AS PostAgeWithActivitySeconds
+FROM Users U
+INNER JOIN Posts P ON U.Id = P.OwnerUserId
+INNER JOIN PostTypes PT ON P.PostTypeId = PT.Id
+LEFT JOIN Votes V ON P.Id = V.PostId
+LEFT JOIN (SELECT PostId, COUNT(*) AS LinkedPostCount FROM PostLinks WHERE LinkTypeId = 1 GROUP BY PostId) PL_Linked ON P.Id = PL_Linked.PostId
+WHERE
+    P.PostTypeId = 2
+    AND P.Score > 100
+    AND P.CreationDate BETWEEN TIMESTAMP '2021-01-01' AND TIMESTAMP '2021-12-31'
+    AND P.ParentId IS NOT NULL
+    AND U.Reputation > 50000
+    AND LOWER(P.Body) LIKE '%example%' AND LOWER(P.Body) LIKE '%solution%'
+    AND NOT EXISTS (SELECT 1 FROM Badges B_corr WHERE B_corr.UserId = U.Id AND LOWER(B_corr.Name) LIKE '%critic%')
+ORDER BY
+    Reputation DESC, PostCreationDate DESC
+LIMIT 1000;

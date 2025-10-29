@@ -1,0 +1,219 @@
+-- {"query": "1683.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2991} 
+WITH UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsAsked,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersProvided,
+        COALESCE(SUM(P.Score), 0) AS TotalPostScore,
+        COALESCE(SUM(P.ViewCount), 0) AS TotalViewCount,
+        MAX(P.CreationDate) AS LatestPostDate,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        MAX(C.CreationDate) AS LatestCommentDate,
+        COUNT(DISTINCT B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate
+),
+BaseQuestionPerformance AS (
+    SELECT
+        Q.Id AS PostId,
+        Q.OwnerUserId,
+        Q.Title,
+        Q.CreationDate,
+        Q.Score,
+        Q.ViewCount,
+        Q.AnswerCount,
+        Q.FavoriteCount,
+        Q.Tags,
+        Q.ClosedDate,
+        Q.CommunityOwnedDate,
+        COALESCE(SUM(A.Score), 0) AS TotalAnswerScore,
+        AVG(A.Score) FILTER (WHERE A.Id IS NOT NULL) AS AvgAnswerScore,
+        MAX(A.CreationDate) AS LatestAnswerDate,
+        MAX(CASE WHEN A.Id = Q.AcceptedAnswerId THEN A.Score ELSE NULL END) AS AcceptedAnswerScore,
+        MAX(CASE WHEN A.Id = Q.AcceptedAnswerId THEN A.OwnerUserId ELSE NULL END) AS AcceptedAnswerOwnerId
+    FROM Posts Q
+    LEFT JOIN Posts A ON Q.Id = A.ParentId AND A.PostTypeId = 2
+    WHERE Q.PostTypeId = 1
+    GROUP BY Q.Id, Q.OwnerUserId, Q.Title, Q.CreationDate, Q.Score, Q.ViewCount, Q.AnswerCount, Q.FavoriteCount, Q.Tags, Q.ClosedDate, Q.CommunityOwnedDate
+),
+QuestionPerformance AS (
+    SELECT
+        BP.PostId AS QuestionId,
+        BP.OwnerUserId,
+        BP.Title AS QuestionTitle,
+        BP.CreationDate AS QuestionCreationDate,
+        BP.Score AS QuestionScore,
+        BP.ViewCount AS QuestionViewCount,
+        BP.AnswerCount AS QuestionAnswerCount,
+        BP.FavoriteCount AS QuestionFavoriteCount,
+        BP.Tags,
+        BP.ClosedDate,
+        BP.CommunityOwnedDate,
+        BP.TotalAnswerScore,
+        BP.AvgAnswerScore,
+        BP.LatestAnswerDate,
+        BP.AcceptedAnswerScore,
+        BP.AcceptedAnswerOwnerId,
+        (EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - BP.CreationDate)) / 3600 / 24)::int AS QuestionAgeDays,
+        'HighViewRecent' AS QuestionCategory
+    FROM BaseQuestionPerformance BP
+    WHERE BP.ViewCount > 5000 AND BP.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year'
+
+    UNION ALL
+
+    SELECT
+        BP.PostId AS QuestionId,
+        BP.OwnerUserId,
+        BP.Title AS QuestionTitle,
+        BP.CreationDate AS QuestionCreationDate,
+        BP.Score AS QuestionScore,
+        BP.ViewCount AS QuestionViewCount,
+        BP.AnswerCount AS QuestionAnswerCount,
+        BP.FavoriteCount AS QuestionFavoriteCount,
+        BP.Tags,
+        BP.ClosedDate,
+        BP.CommunityOwnedDate,
+        BP.TotalAnswerScore,
+        BP.AvgAnswerScore,
+        BP.LatestAnswerDate,
+        BP.AcceptedAnswerScore,
+        BP.AcceptedAnswerOwnerId,
+        (EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - BP.CreationDate)) / 3600 / 24)::int AS QuestionAgeDays,
+        'HighScoreEvergreen' AS QuestionCategory
+    FROM BaseQuestionPerformance BP
+    WHERE BP.Score > 50 AND BP.CreationDate <= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year'
+),
+PostEditActivity AS (
+    SELECT
+        PH.PostId,
+        MAX(PH.CreationDate) AS LastEditDate,
+        COUNT(DISTINCT PH.Id) AS TotalEdits,
+        COUNT(DISTINCT PH.UserId) AS UniqueEditors,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (5, 8) THEN LENGTH(PH.Text) ELSE 0 END) AS MaxBodyEditLength,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS MinorEdits,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (7, 8, 9) THEN 1 ELSE 0 END) AS Rollbacks
+    FROM PostHistory PH
+    WHERE PH.PostHistoryTypeId BETWEEN 1 AND 9
+    GROUP BY PH.PostId
+)
+SELECT
+    UE.UserId,
+    COALESCE(UE.DisplayName, 'User #' || UE.UserId || ' (Deleted)') AS UserDisplayName,
+    UE.Reputation,
+    UE.TotalPosts,
+    UE.QuestionsAsked,
+    UE.AnswersProvided,
+    UE.TotalPostScore,
+    UE.TotalViewCount,
+    UE.GoldBadges,
+    UE.SilverBadges,
+    UE.BronzeBadges,
+    UE.LatestPostDate,
+    UE.LatestCommentDate,
+    QP.QuestionId,
+    QP.QuestionTitle,
+    QP.QuestionCreationDate,
+    QP.QuestionScore,
+    QP.QuestionViewCount,
+    QP.QuestionAnswerCount,
+    QP.QuestionFavoriteCount,
+    QP.QuestionAgeDays,
+    QP.TotalAnswerScore,
+    QP.AvgAnswerScore,
+    QP.LatestAnswerDate,
+    QP.AcceptedAnswerScore,
+    COALESCE(U_Acc.DisplayName, 'N/A') AS AcceptedAnswerOwnerDisplayName,
+    QP.QuestionCategory,
+    string_agg(DISTINCT T.TagName, ', ') FILTER (WHERE T.TagName IS NOT NULL) AS QuestionTagsList,
+    MIN(EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - B.Date))) FILTER (WHERE B.Class = 1) AS TimeSinceFirstGoldBadgeSeconds,
+    DENSE_RANK() OVER (ORDER BY UE.Reputation DESC, UE.TotalPostScore DESC) AS UserReputationRank,
+    AVG(QP.QuestionScore) OVER (PARTITION BY UE.UserId) AS UserAvgQuestionScore,
+    SUM(QP.QuestionViewCount) OVER (PARTITION BY UE.UserId) AS UserTotalQuestionViews,
+    COUNT(C.Id) OVER (PARTITION BY QP.QuestionId) AS QuestionCommentCount,
+    COALESCE(PEA.TotalEdits, 0) AS PostTotalEdits,
+    PEA.UniqueEditors AS PostUniqueEditors,
+    PEA.MaxBodyEditLength AS PostMaxBodyEditLength,
+    PEA.LastEditDate AS PostLastEditDate,
+    (CASE
+        WHEN QP.ClosedDate IS NOT NULL AND QP.CommunityOwnedDate IS NULL THEN 'Closed'
+        WHEN QP.CommunityOwnedDate IS NOT NULL THEN 'Community Wiki'
+        WHEN QP.QuestionAnswerCount = 0 AND QP.QuestionAgeDays > 365 THEN 'Stale No Answers'
+        WHEN QP.QuestionScore < 0 THEN 'Poorly Received'
+        ELSE 'Active'
+    END) AS QuestionStatusCategory,
+    COALESCE(
+        (SELECT COUNT(DISTINCT V.UserId)
+         FROM Votes V
+         WHERE V.PostId = QP.QuestionId AND V.VoteTypeId = 5
+        ), 0) AS QuestionBookmarkCount_PreOctober2022,
+    (SELECT EXISTS (
+        SELECT 1
+        FROM Badges B_inner
+        WHERE B_inner.UserId = UE.UserId AND B_inner.Name = 'Disciplined' AND B_inner.Date < QP.QuestionCreationDate
+    )) AS UserHadDisciplinedBadgeBeforeQuestion,
+    (SELECT COUNT(DISTINCT V.UserId)
+     FROM Votes V
+     WHERE V.PostId = QP.QuestionId AND V.VoteTypeId = 2 AND V.CreationDate BETWEEN QP.QuestionCreationDate AND (QP.QuestionCreationDate + INTERVAL '7 days')
+    ) AS UpvotesInFirstWeek,
+    (SELECT COUNT(DISTINCT PL.RelatedPostId)
+     FROM PostLinks PL
+     WHERE PL.PostId = QP.QuestionId AND PL.LinkTypeId = 1) AS LinkedQuestionCount,
+    (SELECT COUNT(DISTINCT PL.RelatedPostId)
+     FROM PostLinks PL
+     WHERE PL.PostId = QP.QuestionId AND PL.LinkTypeId = 3) AS DuplicateQuestionCount,
+    CASE
+        WHEN QP.QuestionViewCount > 10000 AND QP.QuestionScore > 100 THEN 'Viral & Highly Rated'
+        WHEN QP.QuestionViewCount > 1000 AND QP.QuestionAnswerCount >= 5 THEN 'Popular & Answered'
+        WHEN QP.QuestionFavoriteCount IS NOT NULL AND QP.QuestionFavoriteCount > 50 THEN 'Highly Favorited'
+        WHEN QP.QuestionAgeDays > 730 THEN 'Very Old'
+        ELSE 'Standard'
+    END AS QuestionImpactCategory,
+    NULLIF(TRIM(REPLACE(REPLACE(REPLACE(REPLACE(LOWER(QP.QuestionTitle), 'how to', ''), 'what is', ''), 'can i', ''), 'a '))), '') AS SimplifiedTitleFragment,
+    LEFT(COALESCE(U_Acc.Location, 'Unknown'), 50) AS AcceptedAnswererLocationPrefix
+FROM UserEngagement UE
+INNER JOIN QuestionPerformance QP ON UE.UserId = QP.OwnerUserId
+LEFT JOIN Users U_Acc ON QP.AcceptedAnswerOwnerId = U_Acc.Id
+LEFT JOIN PostEditActivity PEA ON QP.QuestionId = PEA.PostId
+LEFT JOIN Comments C ON QP.QuestionId = C.PostId
+LEFT JOIN LATERAL (
+    SELECT
+        TRIM(unnest(string_to_array(SUBSTRING(QP.Tags, 2, LENGTH(QP.Tags) - 2), '><'))) AS TagName
+) AS T ON TRUE
+LEFT JOIN Badges B ON UE.UserId = B.UserId
+WHERE
+    UE.Reputation > 500
+    AND UE.TotalPosts > 10
+    AND QP.QuestionId IS NOT NULL
+    AND QP.QuestionViewCount > 50
+    AND (QP.QuestionScore > 0 OR QP.QuestionAnswerCount > 0)
+    AND (LOWER(T.TagName) LIKE '%sql%' OR LOWER(T.TagName) LIKE '%performance%' OR LOWER(T.TagName) LIKE '%index%')
+    AND NOT EXISTS (
+        SELECT 1
+        FROM PostHistory PH_Delete
+        WHERE PH_Delete.PostId = QP.QuestionId AND PH_Delete.PostHistoryTypeId = 12
+    )
+    AND (U_Acc.LastAccessDate IS NULL OR U_Acc.LastAccessDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '2 year')
+    AND LENGTH(QP.QuestionTitle) BETWEEN 10 AND 250
+GROUP BY
+    UE.UserId, UE.DisplayName, UE.Reputation, UE.TotalPosts, UE.QuestionsAsked, UE.AnswersProvided, UE.TotalPostScore,
+    UE.TotalViewCount, UE.GoldBadges, UE.SilverBadges, UE.BronzeBadges, UE.LatestPostDate, UE.LatestCommentDate,
+    QP.QuestionId, QP.QuestionTitle, QP.QuestionCreationDate, QP.QuestionScore, QP.QuestionViewCount, QP.QuestionAnswerCount,
+    QP.QuestionFavoriteCount, QP.QuestionAgeDays, QP.TotalAnswerScore, QP.AvgAnswerScore, QP.LatestAnswerDate,
+    QP.AcceptedAnswerScore, U_Acc.DisplayName, PEA.TotalEdits, PEA.UniqueEditors, PEA.MaxBodyEditLength, PEA.LastEditDate,
+    QP.ClosedDate, QP.CommunityOwnedDate, QP.QuestionCategory, U_Acc.Location
+HAVING
+    COUNT(DISTINCT C.Id) > 1 OR COALESCE(PEA.TotalEdits, 0) > 0
+ORDER BY
+    UserReputationRank ASC, QP.QuestionScore DESC, PostTotalEdits DESC
+LIMIT 1000;

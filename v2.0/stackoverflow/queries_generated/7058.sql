@@ -1,0 +1,205 @@
+-- {"query": "7058.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1752} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        DATEDIFF(CURRENT_TIMESTAMP, u.CreationDate) as AccountAgeDays,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Veteran'
+            WHEN u.Reputation >= 1000 THEN 'Experienced'
+            WHEN u.Reputation >= 100 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as ReputationTier
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            WHEN p.PostTypeId = 4 THEN 'TagWikiExcerpt'
+            WHEN p.PostTypeId = 5 THEN 'TagWiki'
+            ELSE 'Other'
+        END as PostType,
+        COALESCE(p.Tags, '') as Tags,
+        LENGTH(p.Body) as BodyLength,
+        DATEDIFF(CURRENT_TIMESTAMP, p.CreationDate) as AgeInDays,
+        CASE 
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 1
+            ELSE 0
+        END as HasAcceptedAnswer,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.CommunityOwnedDate IS NOT NULL THEN 'CommunityOwned'
+            ELSE 'Open'
+        END as PostStatus,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) as ScoreRank,
+        RANK() OVER (ORDER BY p.Score DESC) as GlobalScoreRank,
+        LAG(p.Score) OVER (ORDER BY p.Score DESC) as PreviousScore,
+        NTH_VALUE(p.Score, 3) OVER (ORDER BY p.Score DESC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) as ThirdHighestScore
+    FROM Posts p
+    WHERE p.Id IS NOT NULL
+),
+DetailedUserStats AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.PostCount,
+        uas.CommentCount,
+        uas.BadgeCount,
+        uas.LastPostDate,
+        uas.AccountAgeDays,
+        uas.ReputationTier,
+        COALESCE(pa.PostId, 0) as MostActivePostId,
+        COALESCE(pa.Title, 'No Posts') as MostActivePostTitle,
+        COALESCE(pa.Score, 0) as MostActivePostScore,
+        pa.PostType,
+        pa.Tags,
+        pa.CreationDate as MostActivePostDate,
+        CASE 
+            WHEN uas.PostCount > 0 THEN 
+                (uas.CommentCount * 100.0 / NULLIF(uas.PostCount, 0)) 
+            ELSE 0 
+        END as AvgCommentsPerPost,
+        CASE 
+            WHEN uas.BadgeCount > 0 AND uas.PostCount > 0 THEN 
+                (uas.BadgeCount * 1000.0 / NULLIF(uas.PostCount, 0)) 
+            ELSE 0 
+        END as BadgeScorePerPost,
+        CASE 
+            WHEN pa.Score > 0 AND pa.Score >= (
+                SELECT AVG(Score) 
+                FROM Posts 
+                WHERE OwnerUserId = uas.UserId
+            ) THEN 'Above Average'
+            WHEN pa.Score > 0 THEN 'Below Average'
+            ELSE 'No Posts'
+        END as PerformanceLevel
+    FROM UserActivityStats uas
+    LEFT JOIN PostAnalysis pa ON uas.UserId = pa.OwnerUserId AND pa.ScoreRank = 1
+    WHERE uas.UserId IS NOT NULL
+)
+SELECT 
+    dus.UserId,
+    dus.DisplayName,
+    dus.Reputation,
+    dus.PostCount,
+    dus.CommentCount,
+    dus.BadgeCount,
+    dus.LastPostDate,
+    dus.AccountAgeDays,
+    dus.ReputationTier,
+    dus.MostActivePostId,
+    dus.MostActivePostTitle,
+    dus.MostActivePostScore,
+    dus.PostType,
+    dus.Tags,
+    dus.MostActivePostDate,
+    dus.AvgCommentsPerPost,
+    dus.BadgeScorePerPost,
+    dus.PerformanceLevel,
+    CASE 
+        WHEN dus.BadgeCount >= 50 AND dus.Reputation >= 10000 THEN 'Excellent Contributor'
+        WHEN dus.BadgeCount >= 25 AND dus.Reputation >= 5000 THEN 'Good Contributor'
+        WHEN dus.BadgeCount >= 10 AND dus.Reputation >= 1000 THEN 'Active Contributor'
+        ELSE 'Regular Contributor'
+    END as ContributionLevel,
+    CASE 
+        WHEN dus.PostCount > 0 THEN 
+            PERCENT_RANK() OVER (ORDER BY dus.PostCount)
+        ELSE 0 
+    END as PostCountPercentile,
+    CASE 
+        WHEN dus.Reputation > 0 THEN 
+            CAST((dus.Reputation * 100.0 / (SELECT MAX(Reputation) FROM Users)) AS DECIMAL(5,2))
+        ELSE 0 
+    END as ReputationPercentile,
+    NULLIF(
+        CONCAT(
+            'User Profile: ',
+            dus.DisplayName,
+            ' | Rep: ',
+            dus.Reputation,
+            ' | Posts: ',
+            dus.PostCount,
+            ' | Badges: ',
+            dus.BadgeCount,
+            ' | Age: ',
+            dus.AccountAgeDays,
+            ' days'
+        ), 
+        'User Profile:  | Rep:  | Posts:  | Badges:  | Age:  days'
+    ) as UserProfileSummary,
+    CASE 
+        WHEN dus.ReputationTier = 'Veteran' AND dus.PostCount > 100 THEN 'Long Term Veteran'
+        WHEN dus.ReputationTier = 'Experienced' AND dus.PostCount > 50 THEN 'Experience Builder'  
+        WHEN dus.ReputationTier = 'Intermediate' AND dus.PostCount > 25 THEN 'Active Participant'
+        ELSE 'Newbie'
+    END as UserStatusIndicator
+FROM DetailedUserStats dus
+WHERE dus.UserId IS NOT NULL
+    AND (
+        dus.PostCount > 0 
+        OR dus.CommentCount > 0 
+        OR dus.BadgeCount > 0
+        OR dus.Reputation > 100
+    )
+    AND (
+        dus.MostActivePostScore > 10
+        OR dus.MostActivePostId = 0
+    )
+UNION ALL
+SELECT 
+    -1 as UserId,
+    'NULL_USER' as DisplayName,
+    0 as Reputation,
+    0 as PostCount,
+    0 as CommentCount,
+    0 as BadgeCount,
+    NULL as LastPostDate,
+    0 as AccountAgeDays,
+    'None' as ReputationTier,
+    0 as MostActivePostId,
+    'No Data' as MostActivePostTitle,
+    0 as MostActivePostScore,
+    'None' as PostType,
+    '' as Tags,
+    NULL as MostActivePostDate,
+    0.0 as AvgCommentsPerPost,
+    0.0 as BadgeScorePerPost,
+    'No Data' as PerformanceLevel,
+    'No Data' as ContributionLevel,
+    0.0 as PostCountPercentile,
+    0.0 as ReputationPercentile,
+    'No Data Available' as UserProfileSummary,
+    'No Data' as UserStatusIndicator
+WHERE NOT EXISTS (
+    SELECT 1 FROM DetailedUserStats 
+    WHERE UserId IS NOT NULL
+)
+ORDER BY 
+    Reputation DESC,
+    PostCount DESC,
+    BadgeCount DESC,
+    AccountAgeDays ASC
+LIMIT 100;

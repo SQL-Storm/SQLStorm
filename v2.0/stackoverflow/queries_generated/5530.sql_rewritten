@@ -1,0 +1,128 @@
+-- {"query": "5530.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 900} 
+WITH
+recent_hot AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    p.OwnerDisplayName,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.PostTypeId,
+    p.AcceptedAnswerId,
+    p.ParentId,
+    p.Body,
+    p.LastEditorUserId,
+    p.LastEditorDisplayName,
+    p.LastEditDate,
+    p.ContentLicense,
+    u.Reputation,
+    u.Location,
+    u.AccountId,
+    b.Name AS GoldBadge,
+    v.UpVotes AS UpVotesFromUsers,
+    v.DownVotes AS DownVotesFromUsers
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Badges b ON b.UserId = u.Id AND b.Class = 1 AND b.Date >= DATEADD(year, -1, cast('2024-10-01 12:34:56' as timestamp))
+  LEFT JOIN (
+    SELECT
+      PostId,
+      SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+      SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+    FROM Votes
+    GROUP BY PostId
+  ) v ON v.PostId = p.Id
+  WHERE p.PostTypeId = 1
+    AND p.LastActivityDate >= DATEADD(day, -7, cast('2024-10-01 12:34:56' as timestamp))
+    AND p.Tags LIKE '%<performance>%'
+),
+correlated_tags AS (
+  SELECT
+    rt.PostId,
+    rt.Title,
+    rt.Tags,
+    unnest := UNNEST(string_to_array(substring(rt.Tags, 2, length(rt.Tags)-2), '><')) AS Tag
+  FROM recent_hot rt
+),
+tag_summary AS (
+  SELECT
+    Tag,
+    COUNT(*) AS PostCount,
+    AVG(rt.Score) AS AvgScore,
+    AVG(rt.ViewCount) AS AvgViews
+  FROM correlated_tags ct
+  JOIN recent_hot rt ON rt.PostId = ct.PostId
+  GROUP BY Tag
+),
+complex_calc AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.ViewCount,
+    p.Score,
+    p.FavoriteCount,
+    p.CommentCount,
+    CASE
+      WHEN p.ViewCount > 1000 THEN p.ViewCount * 0.75
+      WHEN p.ViewCount BETWEEN 100 AND 1000 THEN p.ViewCount
+      ELSE p.ViewCount * 1.25
+    END AS AdjustedViews,
+    COALESCE(u.Reputation, 0) AS UserReputation,
+    CASE
+      WHEN u.Location IS NULL THEN 'Unknown'
+      WHEN CHAR_LENGTH(u.Location) > 20 THEN LEFT(u.Location, 20) || '...'
+      ELSE u.Location
+    END AS UserLocationSnippet
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId = 1
+),
+final_rows AS (
+  SELECT
+    c.PostId,
+    c.Title,
+    c.Tags,
+    c.CreationDate,
+    c.LastActivityDate,
+    c.Score,
+    c.ViewCount,
+    c.AdjustedViews,
+    c.UserReputation,
+    c.UserLocationSnippet,
+    t.PostCount AS TagPostCount,
+    t.AvgScore AS AvgTagScore,
+    t.AvgViews AS AvgTagViews
+  FROM complex_calc c
+  LEFT JOIN (
+    SELECT
+      Tag,
+      COUNT(*) AS PostCount,
+      AVG(Score) AS AvgScore,
+      AVG(ViewCount) AS AvgViews
+    FROM correlated_tags
+    GROUP BY Tag
+  ) t ON POSITION('<' || t.Tag || '>' IN c.Tags) > 0
+)
+SELECT
+  fr.PostId,
+  fr.Title,
+  fr.Tags,
+  fr.CreationDate,
+  fr.LastActivityDate,
+  fr.Score,
+  fr.ViewCount,
+  fr.AdjustedViews,
+  fr.UserReputation,
+  fr.UserLocationSnippet,
+  fr.TagPostCount,
+  fr.AvgTagScore,
+  fr.AvgTagViews
+FROM final_rows fr
+ORDER BY fr.LastActivityDate DESC, fr.Score DESC
+FETCH FIRST 100 ROWS ONLY;

@@ -1,0 +1,85 @@
+-- {"query": "5087.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 737} 
+WITH RecentActivePosts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.ViewCount,
+    p.Score,
+    p.OwnerUserId,
+    p.Tags,
+    p.LastActivityDate,
+    p.AcceptedAnswerId
+  FROM Posts p
+  WHERE p.PostTypeId = 1 -- Questions
+    AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '90 days'
+),
+TopTags AS (
+  SELECT
+    unnest(string_to_array(substr(p.Tags, 2, length(p.Tags)-2), '><')) AS TagName,
+    COUNT(*) AS TagCount
+  FROM Posts p
+  JOIN RecentActivePosts rap ON rap.PostId = p.Id
+  WHERE p.Tags IS NOT NULL
+  GROUP BY 1
+),
+TagWeights AS (
+  SELECT
+    TagName,
+    TagCount,
+    LOG(1 + TagCount) * 2.0 + CASE WHEN TagName IN ('sql','performance','database','optimization') THEN 5 ELSE 0 END AS Weight
+  FROM TopTags
+),
+AnswerStats AS (
+  SELECT
+    ph.PostId,
+    COUNT(*) FILTER (WHERE ph.PostHistoryTypeId = 3) AS InitialBodyEdits, -- rough proxy
+    MAX(ph.CreationDate) AS LastEditDate
+  FROM PostHistory ph
+  GROUP BY ph.PostId
+),
+Likes AS (
+  SELECT
+    v.PostId,
+    SUM(CASE WHEN v.VoteTypeId IN (2,14,16) THEN 1 ELSE 0 END) AS Upvotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS Downvotes,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN v.BountyAmount ELSE 0 END) AS UpModBonus
+  FROM Votes v
+  GROUP BY v.PostId
+),
+CorrelatedQueries AS (
+  SELECT
+    rap.PostId,
+    rap.Title,
+    rap.CreationDate,
+    rap.ViewCount,
+    rap.Score,
+    COALESCE(a.InitialBodyEdits, 0) AS InitEdits,
+    COALESCE(l.Upvotes, 0) AS Upvotes,
+    COALESCE(l.Downvotes, 0) AS Downvotes,
+    COALESCE(a.LastEditDate, rap.CreationDate) AS LastEditDate
+  FROM RecentActivePosts rap
+  LEFT JOIN AnswerStats a ON a.PostId = rap.PostId
+  LEFT JOIN Likes l ON l.PostId = rap.PostId
+)
+SELECT
+  cr PostId,
+  Title,
+  CreationDate,
+  ViewCount,
+  Score,
+  OwnerUserId,
+  LastActivityDate,
+  InitEdits,
+  Upvotes,
+  Downvotes,
+  LastEditDate,
+  (SELECT STRING_AGG(TagName, ',') FROM TopTags tt WHERE tt.TagCount > 0 AND tt.TagName IN (
+      SELECT unnest(string_to_array(substr(cr.Tags, 2, length(cr.Tags)-2), '><')) FROM Posts p WHERE p.Id = cr.PostId
+  )) AS TagSnapshot,
+  (SELECT Weight FROM TagWeights tw WHERE tw.TagName IN (
+      SELECT unnest(string_to_array(substr(cr.Tags, 2, length(cr.Tags)-2), '><')) FROM Posts p WHERE p.Id = cr.PostId
+  ) LIMIT 1) AS SampleTagWeight
+FROM CorrelatedQueries cr
+ORDER BY Score DESC, ViewCount DESC
+LIMIT 100;

@@ -1,0 +1,163 @@
+with recursive RecursiveTagHierarchy as (
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        0 as Level,
+        array[t.TagName] as Path
+    from Tags t
+    where t.IsRequired = true or t.Count > 1000
+    union all
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        r.Level + 1,
+        r.Path || t2.TagName
+    from Tags t2
+    join RecursiveTagHierarchy r on r.Path[array_length(r.Path, 1)] <> t2.TagName
+    where t2.Count > 1000 and r.Level < 2
+),
+UserBadgeAgg as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        count(distinct b.Name) as DiverseBadges,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PopularQuestions as (
+    select 
+        p.Id,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        rank() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc) as RankByUser
+    from Posts p
+    where p.PostTypeId = 1 
+      and p.Score > 50
+      and p.ViewCount > 1000
+      and p.FavoriteCount > 5
+),
+AnswerStats as (
+    select 
+        a.ParentId as QuestionId,
+        count(*) as AnswerCount,
+        sum(case when a.Score > 0 then 1 else 0 end) as PositiveScoreCount,
+        avg(a.Score) as AvgAnswerScore,
+        max(a.Score) as MaxAnswerScore,
+        bool_or(a.OwnerUserId is null) as AnyAnonymousAnswer
+    from Posts a
+    where a.PostTypeId = 2
+    group by a.ParentId
+),
+VotesWithUser as (
+    select 
+        v.Id,
+        v.PostId,
+        v.VoteTypeId,
+        v.UserId,
+        v.CreationDate,
+        u.Reputation,
+        u.DisplayName,
+        case when v.VoteTypeId in (2,5) then 1 else 0 end as PositiveVotes,
+        case when v.VoteTypeId = 3 then 1 else 0 end as NegativeVotes
+    from Votes v
+    left join Users u on u.Id = v.UserId
+),
+FinalAggregates as (
+    select 
+        pq.Id as QuestionId,
+        pq.Title,
+        pq.OwnerUserId,
+        u.DisplayName as OwnerName,
+        pq.CreationDate as QuestionDate,
+        pq.Score as QuestionScore,
+        pq.ViewCount,
+        pq.AnswerCount as AnswersDeclared,
+        ans.AnswerCount as ActualAnswerCount,
+        ans.PositiveScoreCount,
+        ans.AvgAnswerScore,
+        ans.MaxAnswerScore,
+        ans.AnyAnonymousAnswer,
+        uba.GoldBadges,
+        uba.SilverBadges,
+        uba.BronzeBadges,
+        uba.DiverseBadges,
+        uba.LastBadgeDate,
+        string_agg(distinct ph.Name, ', ') filter (where ph.Id is not null) as EditHistoryTypes,
+        string_agg(distinct lt.Name, ', ') filter (where lt.Id is not null) as LinkTypes,
+        concat('Tags: ', coalesce(pq.Tags, 'No tags')) as TagsDisplay,
+        row_number() over (partition by pq.OwnerUserId order by pq.Score desc) as UserRank,
+        case when pq.ClosedDate is null then 'Open' else 'Closed' end as PostStatus,
+        coalesce((select string_agg(distinct c.UserDisplayName || ':' || substring(c.Text from 1 for 20), '; ') 
+            from Comments c where c.PostId = pq.Id and c.Score > 5), 'No popular comments') as TopCommentsSnippet
+    from PopularQuestions pq
+    left join AnswerStats ans on pq.Id = ans.QuestionId
+    left join Users u on u.Id = pq.OwnerUserId
+    left join UserBadgeAgg uba on uba.UserId = pq.OwnerUserId
+    left join PostHistoryTypes ph on ph.Id in (
+        select distinct ph2.PostHistoryTypeId 
+        from PostHistory ph2 
+        where ph2.PostId = pq.Id
+        limit 5
+    )
+    left join PostLinks pl on pl.PostId = pq.Id
+    left join LinkTypes lt on lt.Id = pl.LinkTypeId
+    left join Posts postcheck on postcheck.Id = pq.Id
+),
+ComplexFilter as (
+    select 
+        fa.*,
+        length(fa.Title) as TitleLength,
+        avg(length(fa.Title)) over (partition by fa.OwnerUserId) as AverageLengthOfTitle
+    from FinalAggregates fa
+    where 
+        (fa.GoldBadges >= 1 or fa.SilverBadges >= 3)
+        and avg(length(fa.Title)) over (partition by fa.OwnerUserId) > 20
+        and fa.AnswersDeclared = fa.ActualAnswerCount
+        and fa.UserRank <= 3
+        and (fa.PostStatus = 'Open' or fa.AnswerCount > 5)
+)
+
+select 
+    cf.QuestionId,
+    cf.Title,
+    cf.OwnerName,
+    cf.QuestionDate,
+    cf.QuestionScore,
+    cf.ViewCount,
+    cf.AnswerCount,
+    cf.PositiveScoreCount,
+    cf.AvgAnswerScore,
+    cf.MaxAnswerScore,
+    cf.AnyAnonymousAnswer,
+    cf.GoldBadges,
+    cf.SilverBadges,
+    cf.BronzeBadges,
+    cf.DiverseBadges,
+    cf.LastBadgeDate,
+    cf.EditHistoryTypes,
+    cf.LinkTypes,
+    cf.TagsDisplay,
+    cf.UserRank,
+    cf.PostStatus,
+    cf.TopCommentsSnippet
+from ComplexFilter cf
+where 
+    cf.TitleLength > 10
+order by 
+    cf.GoldBadges desc nulls last,
+    cf.QuestionScore desc,
+    cf.AnswerCount desc
+limit 100;

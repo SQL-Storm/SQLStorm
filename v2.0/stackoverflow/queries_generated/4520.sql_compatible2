@@ -1,0 +1,153 @@
+WITH
+  RankedPostEdits AS (
+    SELECT
+      ph.PostId,
+      ph.UserId,
+      ph.CreationDate AS EditDate,
+      ph.PostHistoryTypeId,
+      ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    WHERE
+      ph.PostHistoryTypeId IN (4, 5, 6)
+  ),
+  PostEditSummary AS (
+    SELECT
+      rpe.PostId,
+      rpe.UserId,
+      COUNT(rpe.PostId) AS TotalEdits,
+      MAX(rpe.EditDate) AS LastEditDate,
+      LISTAGG(ph_t.Name || ' (' || CAST(rpe.PostHistoryTypeId AS VARCHAR(50)) || ')', ', ') WITHIN GROUP (ORDER BY ph_t.Name) AS EditedTypes
+    FROM RankedPostEdits rpe
+    JOIN PostHistoryTypes ph_t
+      ON rpe.PostHistoryTypeId = ph_t.Id
+    GROUP BY
+      rpe.PostId,
+      rpe.UserId
+  ),
+  UserQuestionActivity AS (
+    SELECT
+      p.OwnerUserId,
+      COUNT(p.Id) AS QuestionCount,
+      AVG(CAST(p.AnswerCount AS DECIMAL(10,2))) AS AvgAnswerCount,
+      SUM(p.ViewCount) AS TotalViews
+    FROM Posts p
+    WHERE
+      p.PostTypeId = 1 AND p.OwnerUserId IS NOT NULL
+    GROUP BY
+      p.OwnerUserId
+  ),
+  UserAnswerActivity AS (
+    SELECT
+      p.OwnerUserId,
+      COUNT(p.Id) AS AnswerCount,
+      AVG(CAST(p.Score AS DECIMAL(10,2))) AS AvgAnswerScore
+    FROM Posts p
+    WHERE
+      p.PostTypeId = 2 AND p.OwnerUserId IS NOT NULL
+    GROUP BY
+      p.OwnerUserId
+  ),
+  UserCommentActivity AS (
+    SELECT
+      c.UserId,
+      COUNT(c.Id) AS CommentCount,
+      AVG(CAST(c.Score AS DECIMAL(10,2))) AS AvgCommentScore
+    FROM Comments c
+    WHERE
+      c.UserId IS NOT NULL
+    GROUP BY
+      c.UserId
+  ),
+  MostRecentHotTag AS (
+    SELECT
+      t.TagName,
+      MAX(p.LastActivityDate) AS LastHotDate
+    FROM Tags t
+    JOIN Posts p
+      ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    WHERE
+      p.Id IN (
+        SELECT PostId FROM PostHistory WHERE PostHistoryTypeId = 52
+      )
+    GROUP BY
+      t.TagName
+  )
+SELECT
+  u.Id AS UserId,
+  u.DisplayName,
+  u.Reputation,
+  u.CreationDate AS UserCreationDate,
+  COALESCE(uqa.QuestionCount, 0) AS TotalQuestions,
+  COALESCE(uaa.AnswerCount, 0) AS TotalAnswers,
+  COALESCE(uca.CommentCount, 0) AS TotalComments,
+  COALESCE(pes.TotalEdits, 0) AS PostEditCount,
+  pes.LastEditDate,
+  pes.EditedTypes,
+  uqa.AvgAnswerCount,
+  uqa.TotalViews,
+  uaa.AvgAnswerScore,
+  uca.AvgCommentScore,
+  (
+    SELECT COUNT(*)
+    FROM Badges b
+    WHERE b.UserId = u.Id AND b.Class = 1
+  ) AS GoldBadges,
+  (
+    SELECT COUNT(*)
+    FROM Badges b
+    WHERE b.UserId = u.Id AND b.Class = 2
+  ) AS SilverBadges,
+  (
+    SELECT COUNT(*)
+    FROM Badges b
+    WHERE b.UserId = u.Id AND b.Class = 3
+  ) AS BronzeBadges,
+  CASE
+    WHEN u.WebsiteUrl IS NULL OR u.WebsiteUrl = '' THEN 'No Website'
+    WHEN u.WebsiteUrl LIKE '%stackoverflow.com%' THEN 'Stack Overflow Related'
+    ELSE 'External Website'
+  END AS WebsiteType,
+  COALESCE(p.AnswerCount, 0) AS DirectAnswerCountForExamplePost,
+  CASE
+    WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+    WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+    ELSE 'Active'
+  END AS PostStatus,
+  mhtt.LastHotDate AS LastHotTagActivityDate
+FROM Users u
+LEFT JOIN UserQuestionActivity uqa
+  ON u.Id = uqa.OwnerUserId
+LEFT JOIN UserAnswerActivity uaa
+  ON u.Id = uaa.OwnerUserId
+LEFT JOIN UserCommentActivity uca
+  ON u.Id = uca.UserId
+LEFT JOIN PostEditSummary pes
+  ON u.Id = pes.UserId
+LEFT JOIN Posts p
+  ON u.Id = p.OwnerUserId AND p.Id = 12345
+LEFT JOIN MostRecentHotTag mhtt
+  ON u.DisplayName = mhtt.TagName
+GROUP BY
+  u.Id,
+  u.DisplayName,
+  u.Reputation,
+  u.CreationDate,
+  uqa.QuestionCount,
+  uqa.AvgAnswerCount,
+  uqa.TotalViews,
+  uaa.AnswerCount,
+  uaa.AvgAnswerScore,
+  uca.CommentCount,
+  uca.AvgCommentScore,
+  pes.TotalEdits,
+  pes.LastEditDate,
+  pes.EditedTypes,
+  u.WebsiteUrl,
+  p.AnswerCount,
+  p.ClosedDate,
+  p.CommunityOwnedDate,
+  mhtt.LastHotDate
+ORDER BY
+  u.Reputation DESC,
+  UserCreationDate ASC
+FETCH FIRST 100 ROWS ONLY;

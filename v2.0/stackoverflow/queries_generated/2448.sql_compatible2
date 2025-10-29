@@ -1,0 +1,150 @@
+with recursive RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        p.Id as ExcerptPostId,
+        p.Title as ExcerptTitle,
+        1 as Level,
+        array[t.TagName] as Path
+    from Tags t
+    left join Posts p on p.Id = t.ExcerptPostId
+    where t.IsModeratorOnly = false and t.IsRequired = false
+
+    union all
+
+    select
+        child.Id,
+        child.TagName,
+        child.Count,
+        p.Id,
+        p.Title,
+        r.Level + 1,
+        r.Path || child.TagName
+    from Tags child
+    join PostLinks pl on pl.PostId = child.WikiPostId and pl.LinkTypeId = 1
+    join RecursiveTagHierarchy r on r.ExcerptPostId = pl.RelatedPostId
+    left join Posts p on p.Id = child.ExcerptPostId
+    where child.IsModeratorOnly = false and child.IsRequired = false
+),
+TopUsersWithBadges as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        count(b.Id) as TotalBadges,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+    having count(b.Id) > 5
+),
+PostScoresAndRanks as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        dense_rank() over (partition by p.PostTypeId order by p.Score desc) as ScoreRank,
+        row_number() over (partition by p.PostTypeId order by p.CreationDate desc) as RecentRank
+    from Posts p
+),
+UserActivityStats as (
+    select
+        u.Id as UserId,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as Questions,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as Answers,
+        count(distinct c.Id) as Comments,
+        count(distinct case when v.VoteTypeId = 2 then v.Id end) as UpVotesReceived,
+        count(distinct case when v.VoteTypeId = 3 then v.Id end) as DownVotesReceived,
+        case when u.LastAccessDate > (timestamp '2024-10-01 12:34:56' - interval '30 day') then 1 else 0 end as ActiveLast30Days
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.PostId = p.Id
+    group by u.Id
+),
+EligiblePosts as (
+    select
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        rsa.Rank as RelatedScoreRank
+    from Posts p
+    left join (
+        select
+            Id as PostId,
+            dense_rank() over (partition by Id order by Score desc) as Rank
+        from Posts
+    ) rsa on rsa.PostId = p.Id
+    where p.PostTypeId = 1
+),
+ClosedPostDetails as (
+    select
+        ph.PostId,
+        max(case when ph.PostHistoryTypeId = 10 then cast(ph.Comment as integer) else null end) as CloseReasonId,
+        max(ph.CreationDate) as CloseDate
+    from PostHistory ph
+    where ph.PostHistoryTypeId = 10
+    group by ph.PostId
+)
+select
+    p.Id as QuestionId,
+    coalesce(p.Title, '') as QuestionTitle,
+    u.DisplayName as OwnerName,
+    u.Reputation,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    coalesce(cpd.CloseReasonId, 0) as CloseReasonId,
+    crt.Name as CloseReason,
+    tsq.GoldBadges,
+    tsq.SilverBadges,
+    tsq.BronzeBadges,
+    ua.Questions,
+    ua.Answers,
+    ua.Comments,
+    ua.UpVotesReceived,
+    ua.DownVotesReceived,
+    ua.ActiveLast30Days,
+    string_agg(distinct rt.TagName, ', ') filter (where rt.TagName is not null) as RelatedTags,
+    max(case when ph.PostHistoryTypeId = 24 then ph.CreationDate end) as LastSuggestedEditApplied,
+    max(case when v.VoteTypeId = 8 then v.CreationDate end) as LatestBountyStart,
+    (select count(1) from Votes v2 where v2.PostId = p.Id and v2.VoteTypeId = 2) as UpVotes,
+    (select count(1) from Votes v3 where v3.PostId = p.Id and v3.VoteTypeId = 3) as DownVotes,
+    (case when p.AcceptedAnswerId is not null then 1 else 0 end) as HasAcceptedAnswer,
+    string_agg(distinct (lh.TagName || ' - ' || coalesce(lh.ExcerptTitle, '')), ',' order by lh.Level desc) as TagHierarchy
+from Posts p
+left join Users u on u.Id = p.OwnerUserId
+left join ClosedPostDetails cpd on cpd.PostId = p.Id
+left join CloseReasonTypes crt on crt.Id = cpd.CloseReasonId
+left join TopUsersWithBadges tsq on tsq.UserId = p.OwnerUserId
+left join UserActivityStats ua on ua.UserId = p.OwnerUserId
+left join RecursiveTagHierarchy rt on position(rt.TagName in replace(replace(p.Tags, '><', ','), '<', '')) > 0
+left join PostHistory ph on ph.PostId = p.Id
+left join Votes v on v.PostId = p.Id
+left join RecursiveTagHierarchy lh on lh.TagName = any(string_to_array(regexp_replace(trim(both '<>' from p.Tags), '><', ','), ','))
+where p.PostTypeId = 1
+and p.Score > (
+    select avg(Score) from Posts where PostTypeId = 1 and CreationDate > (timestamp '2024-10-01 12:34:56' - interval '90 day')
+)
+and (u.Reputation > 1000 or u.Id is null)
+group by
+    p.Id, p.Title, u.DisplayName, u.Reputation, p.Score, p.ViewCount, p.AnswerCount, cpd.CloseReasonId, crt.Name,
+    tsq.GoldBadges, tsq.SilverBadges, tsq.BronzeBadges, ua.Questions, ua.Answers, ua.Comments, ua.UpVotesReceived,
+    ua.DownVotesReceived, ua.ActiveLast30Days, p.AcceptedAnswerId
+order by p.Score desc, p.ViewCount desc
+limit 100;

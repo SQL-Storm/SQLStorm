@@ -1,0 +1,263 @@
+WITH UserEngagementSummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT P.Id) AS TotalPostsOwned,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestionsOwned,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswersOwned,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        COUNT(DISTINCT B.Id) AS TotalBadgesEarned,
+        SUM(P.Score) AS TotalPostScoreByOwner,
+        SUM(P.ViewCount) AS TotalPostViewsByOwner,
+        U.UpVotes AS UserUpVotesGivenCache,
+        U.DownVotes AS UserDownVotesGivenCache,
+        (SELECT COUNT(V.Id) FROM Votes V WHERE V.UserId = U.Id AND V.VoteTypeId = 2) AS ActualUpVotesGiven,
+        (SELECT COUNT(V.Id) FROM Votes V WHERE V.UserId = U.Id AND V.VoteTypeId = 3) AS ActualDownVotesGiven,
+        MAX(U.LastAccessDate) AS LastUserActivityDate,
+        AVG(EXTRACT(DAY FROM (P.CreationDate - U.CreationDate))) AS AvgDaysToFirstPost
+    FROM
+        Users U
+    LEFT JOIN
+        Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN
+        Comments C ON U.Id = C.UserId
+    LEFT JOIN
+        Badges B ON U.Id = B.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.UpVotes, U.DownVotes, U.LastAccessDate
+),
+PostCommentStats AS (
+    SELECT
+        PostId,
+        COUNT(Id) AS ActualCommentCount,
+        AVG(CAST(Score AS DECIMAL)) AS AvgCommentScore,
+        MAX(CreationDate) AS LatestCommentDate,
+        MIN(CreationDate) AS EarliestCommentDate
+    FROM Comments
+    GROUP BY PostId
+),
+PostDetailedPerformance AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount,
+        P.AnswerCount,
+        P.FavoriteCount,
+        P.Title,
+        P.Tags,
+        P.AcceptedAnswerId,
+        P.ParentId,
+        P.ClosedDate,
+        P.CommunityOwnedDate,
+        U_Owner.DisplayName AS OwnerDisplayName,
+        EXTRACT(EPOCH FROM (P.LastActivityDate - P.CreationDate)) / 3600 AS HoursToLastActivity,
+        NULLIF(CHAR_LENGTH(TRIM(P.Body)), 0) AS BodyCharCount,
+        (LENGTH(P.Body) - LENGTH(REPLACE(P.Body, '<code>', ''))) / NULLIF(LENGTH('<code>'),0) AS CodeBlockCount,
+        (SELECT COUNT(PH_Inner.Id)
+         FROM PostHistory PH_Inner
+         WHERE PH_Inner.PostId = P.Id
+           AND PH_Inner.PostHistoryTypeId IN (4, 5, 6, 7, 8, 9)
+        ) AS MajorEditCount,
+        (SELECT COUNT(DISTINCT PH_Close.Id)
+         FROM PostHistory PH_Close
+         WHERE PH_Close.PostId = P.Id
+           AND PH_Close.PostHistoryTypeId IN (10, 101, 102, 103, 104, 105)
+        ) AS PostCloseEvents,
+        (SELECT COUNT(DISTINCT PH_Reopen.Id)
+         FROM PostHistory PH_Reopen
+         WHERE PH_Reopen.PostId = P.Id
+           AND PH_Reopen.PostHistoryTypeId = 11
+        ) AS PostReopenEvents,
+        COALESCE(PCS.ActualCommentCount, 0) AS ActualCommentCount,
+        COALESCE(PCS.AvgCommentScore, 0.0) AS AvgCommentScore,
+        CASE WHEN P.PostTypeId = 1 THEN
+            RANK() OVER (PARTITION BY EXTRACT(YEAR FROM P.CreationDate) ORDER BY P.Score DESC, P.ViewCount DESC)
+        ELSE NULL END AS YearlyQuestionScoreRank,
+        CASE
+            WHEN P.ClosedDate IS NOT NULL AND P.CommunityOwnedDate IS NOT NULL THEN 'Closed & Community Owned'
+            WHEN P.ClosedDate IS NOT NULL THEN 'Closed Only'
+            WHEN P.CommunityOwnedDate IS NOT NULL THEN 'Community Owned Only'
+            ELSE 'Neither Closed Nor Community Owned'
+        END AS ClosureCommunityStatus,
+        CAST(COALESCE(P.Score + P.FavoriteCount + COALESCE(PCS.ActualCommentCount, 0) + COALESCE(P.AnswerCount, 0), 0) AS DECIMAL)
+        / NULLIF(P.ViewCount, 0) AS EngagementRatio,
+        CASE
+            WHEN P.Tags IS NOT NULL AND LENGTH(P.Tags) > 2 THEN
+                TRIM(SUBSTRING(P.Tags FROM 2 FOR (POSITION('><' IN (P.Tags || '><')) - 2)))
+            ELSE NULL
+        END AS PrimaryTag,
+        P.LastActivityDate
+    FROM
+        Posts P
+    INNER JOIN
+        PostTypes PT ON P.PostTypeId = PT.Id
+    LEFT JOIN
+        Users U_Owner ON P.OwnerUserId = U_Owner.Id
+    LEFT JOIN
+        PostCommentStats PCS ON P.Id = PCS.PostId
+    WHERE P.PostTypeId IN (1, 2)
+),
+TagGlobalMetrics AS (
+    SELECT
+        T.TagName,
+        T.Id AS TagId,
+        T.Count AS TagsTableEntryCount,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadgesForTag,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadgesForTag,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadgesForTag
+    FROM
+        Tags T
+    LEFT JOIN
+        Badges B ON B.TagBased = TRUE AND B.Name = T.TagName
+    GROUP BY
+        T.TagName, T.Id, T.Count
+),
+PrimaryTagPostAggregates AS (
+    SELECT
+        PDP.PrimaryTag AS TagName,
+        COUNT(PDP.PostId) AS NumberOfQuestionsWithPrimaryTag,
+        SUM(PDP.PostScore) AS TotalScoreForPrimaryTag,
+        AVG(CAST(PDP.ViewCount AS DECIMAL)) AS AvgViewsForPrimaryTag
+    FROM
+        PostDetailedPerformance PDP
+    WHERE
+        PDP.PostTypeId = 1 AND PDP.PrimaryTag IS NOT NULL
+    GROUP BY
+        PDP.PrimaryTag
+),
+PostNetworkMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        SUM(CASE WHEN PL.LinkTypeId = 1 THEN 1 ELSE 0 END) AS OutgoingLinksCount,
+        SUM(CASE WHEN PL.LinkTypeId = 3 THEN 1 ELSE 0 END) AS OutgoingDuplicateLinksCount,
+        (SELECT COUNT(PL_IN.Id) FROM PostLinks PL_IN WHERE PL_IN.RelatedPostId = P.Id AND PL_IN.LinkTypeId = 1) AS IncomingLinksCount,
+        (SELECT COUNT(PL_DUP_IN.Id) FROM PostLinks PL_DUP_IN WHERE PL_DUP_IN.RelatedPostId = P.Id AND PL_DUP_IN.LinkTypeId = 3) AS IncomingDuplicateLinksCount,
+        (SELECT MAX(U.Reputation)
+         FROM Posts P_Related
+         JOIN PostLinks PL_Related ON P_Related.Id = PL_Related.PostId AND PL_Related.RelatedPostId = P.Id
+         JOIN Users U ON P_Related.OwnerUserId = U.Id
+         WHERE PL_Related.LinkTypeId = 1 AND U.Reputation IS NOT NULL
+        ) AS MaxReputationOfLinkedPostOwner
+    FROM
+        Posts P
+    LEFT JOIN
+        PostLinks PL ON P.Id = PL.PostId
+    GROUP BY P.Id
+),
+ClosedPostReasons AS (
+    SELECT
+        PH.PostId,
+        MAX(CR_Lookup.Name) AS LastCloseReason,
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (10, 101, 102, 103, 104, 105) THEN PH.Id END) AS TotalCloseEvents,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 35 THEN 1 ELSE 0 END) AS WasMigratedAway,
+        MAX(CASE WHEN PH.PostHistoryTypeId = 36 THEN 1 ELSE 0 END) AS WasMigratedHere
+    FROM
+        PostHistory PH
+    LEFT JOIN
+        CloseReasonTypes CR_Lookup
+        ON (PH.PostHistoryTypeId = 10 AND PH.Comment = CAST(CR_Lookup.Id AS VARCHAR(50)))
+        OR (PH.PostHistoryTypeId IN (101, 102, 103, 104, 105) AND PH.PostHistoryTypeId = CR_Lookup.Id)
+    GROUP BY
+        PH.PostId
+),
+CombinedCriteriaPosts AS (
+    SELECT
+        PDP.PostId,
+        'HighlyEngagedAndVoted' AS Criteria_Type,
+        PDP.PostCreationDate,
+        PDP.OwnerUserId
+    FROM
+        PostDetailedPerformance PDP
+    WHERE
+        PDP.PostScore > 500
+        AND PDP.EngagementRatio > 0.1
+        AND PDP.PostTypeId = 1
+    UNION ALL
+    SELECT
+        PDP.PostId,
+        'RecentlyModifiedAndViewed' AS Criteria_Type,
+        PDP.PostCreationDate,
+        PDP.OwnerUserId
+    FROM
+        PostDetailedPerformance PDP
+    WHERE
+        PDP.LastActivityDate IS NOT NULL
+        AND EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - PDP.PostCreationDate))/3600 < 168
+        AND PDP.ViewCount > 1000
+        AND PDP.PostTypeId = 1
+)
+SELECT
+    UES.*,
+    PDP.PostId,
+    PDP.PostTypeId,
+    PDP.PostTypeName,
+    PDP.OwnerUserId,
+    PDP.PostCreationDate,
+    PDP.PostScore,
+    PDP.ViewCount,
+    PDP.AnswerCount,
+    PDP.FavoriteCount,
+    PDP.Title,
+    PDP.Tags,
+    PDP.AcceptedAnswerId,
+    PDP.ParentId,
+    PDP.ClosedDate,
+    PDP.CommunityOwnedDate,
+    PDP.OwnerDisplayName,
+    PDP.HoursToLastActivity,
+    PDP.BodyCharCount,
+    PDP.CodeBlockCount,
+    PDP.MajorEditCount,
+    PDP.PostCloseEvents,
+    PDP.PostReopenEvents,
+    PDP.ActualCommentCount AS PostActualCommentCount,
+    PDP.AvgCommentScore AS PostAvgCommentScore,
+    PDP.YearlyQuestionScoreRank,
+    PDP.ClosureCommunityStatus,
+    PDP.EngagementRatio,
+    PDP.PrimaryTag,
+    TGM.TagName AS TagGlobalName,
+    TGM.TagId,
+    TGM.TagsTableEntryCount,
+    TGM.GoldBadgesForTag,
+    TGM.SilverBadgesForTag,
+    TGM.BronzeBadgesForTag,
+    PTAG.NumberOfQuestionsWithPrimaryTag,
+    PTAG.TotalScoreForPrimaryTag,
+    PTAG.AvgViewsForPrimaryTag,
+    PNM.OutgoingLinksCount,
+    PNM.OutgoingDuplicateLinksCount,
+    PNM.IncomingLinksCount,
+    PNM.IncomingDuplicateLinksCount,
+    PNM.MaxReputationOfLinkedPostOwner,
+    CPR.LastCloseReason,
+    CPR.TotalCloseEvents,
+    CPR.WasMigratedAway,
+    CPR.WasMigratedHere,
+    CCP.Criteria_Type,
+    CCP.PostCreationDate AS CriteriaPostCreationDate,
+    CCP.OwnerUserId AS CriteriaOwnerUserId
+FROM
+    PostDetailedPerformance PDP
+LEFT JOIN
+    UserEngagementSummary UES ON PDP.OwnerUserId = UES.UserId
+LEFT JOIN
+    TagGlobalMetrics TGM ON PDP.PrimaryTag = TGM.TagName
+LEFT JOIN
+    PrimaryTagPostAggregates PTAG ON PDP.PrimaryTag = PTAG.TagName
+LEFT JOIN
+    PostNetworkMetrics PNM ON PDP.PostId = PNM.PostId
+LEFT JOIN
+    ClosedPostReasons CPR ON PDP.PostId = CPR.PostId
+LEFT JOIN
+    CombinedCriteriaPosts CCP ON PDP.PostId = CCP.PostId
+WHERE
+    PDP.PostTypeId IN (1,2)
+ORDER BY
+    PDP.PostCreationDate DESC;

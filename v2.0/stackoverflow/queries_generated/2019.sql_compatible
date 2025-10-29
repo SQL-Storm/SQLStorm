@@ -1,0 +1,140 @@
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        1 as level,
+        array[t.Id] as path
+    from Tags t
+    where t.IsModeratorOnly = false
+    union all
+    select
+        t2.Id,
+        t2.TagName,
+        rth.level + 1,
+        path || t2.Id
+    from RecursiveTagHierarchy rth
+    join Posts p on p.Tags like '%' || '<' || rth.TagName || '>' || '%'
+    join PostLinks pl on pl.PostId = p.Id
+    join Posts rp on rp.Id = pl.RelatedPostId
+    join Tags t2 on rp.Tags like '%' || '<' || t2.TagName || '>' || '%'
+    where rth.level < 3 and not t2.Id = any(path)
+),
+UserBadgeSummary as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct b.Id) as TotalBadges,
+        count(distinct case when b.Class = 1 then b.Id end) as GoldBadges,
+        count(distinct case when b.Class = 2 then b.Id end) as SilverBadges,
+        count(distinct case when b.Class = 3 then b.Id end) as BronzeBadges,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PopularQuestions as (
+    select
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.ViewCount,
+        p.Score,
+        p.AnswerCount,
+        u.DisplayName as OwnerName,
+        u.Reputation,
+        lead(p.ViewCount) over (order by p.ViewCount desc) as NextViewCount,
+        lag(p.Score) over (order by p.Score desc) as PrevScore,
+        p.Tags
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId = 1
+),
+TopCommenters as (
+    select
+        c.UserId,
+        u.DisplayName,
+        avg(c.Score) as AvgCommentScore,
+        count(c.Id) as CommentCount,
+        string_agg(distinct regexp_replace(tag, '^<|>$', ''), ',') as TagsInComments
+    from Comments c
+    join Posts p on p.Id = c.PostId and p.PostTypeId = 1
+    join Users u on c.UserId = u.Id
+    cross join lateral (
+      select regexp_matches(p.Tags, '<([^>]+)>', 'g') as m
+    ) m0
+    cross join lateral (
+      select m[1] as tag
+    ) t0
+    where c.UserId is not null
+      and c.Score is not null
+    group by c.UserId, u.DisplayName
+    having count(c.Id) > 10
+),
+RecentEditsWithCloseReason as (
+    select
+        ph.Id,
+        ph.PostId,
+        ph.CreationDate,
+        p.Title,
+        u.DisplayName as Editor,
+        ph.PostHistoryTypeId,
+        crt.Name as CloseReasonName,
+        ph.Comment as CloseReasonId,
+        ph.Text as EditText,
+        row_number() over (partition by ph.PostId order by ph.CreationDate desc) as rn
+    from PostHistory ph
+    left join CloseReasonTypes crt on crt.Id = ph.Comment
+    left join Users u on u.Id = ph.UserId
+    left join Posts p on p.Id = ph.PostId
+    where ph.PostHistoryTypeId in (10, 11)
+),
+AnswerStats as (
+    select
+        a.ParentId as QuestionId,
+        count(a.Id) as TotalAnswers,
+        avg(a.Score) as AvgAnswerScore,
+        max(a.Score) as MaxAnswerScore,
+        sum(case when a.Score < 0 then 1 else 0 end) as NegativeScoreAnswers
+    from Posts a
+    where a.PostTypeId = 2
+    group by a.ParentId
+)
+select distinct
+    pq.Id as QuestionId,
+    pq.Title,
+    pq.OwnerName,
+    pq.Reputation as OwnerReputation,
+    pq.ViewCount,
+    pq.Score as QuestionScore,
+    pq.AnswerCount,
+    coalesce(asv.TotalAnswers, 0) as TotalAnswers,
+    coalesce(asv.AvgAnswerScore, 0) as AvgAnswerScore,
+    coalesce(asv.MaxAnswerScore, 0) as MaxAnswerScore,
+    coalesce(asv.NegativeScoreAnswers, 0) as NegativeScoreAnswers,
+    ubs.TotalBadges,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    te.CloseReasonName,
+    te.Editor,
+    te.CreationDate as LastClosedOrReopenedDate,
+    (select string_agg(distinct rth.TagName, ',' order by rth.TagName)
+     from RecursiveTagHierarchy rth
+     where rth.TagName = any (string_to_array(replace(replace(coalesce(pq.Tags,''),'<',''),'>',','), ','))
+       and rth.level = 1
+    ) as RelatedTags,
+    tc.DisplayName as TopCommenterName,
+    tc.AvgCommentScore as TopCommenterAvgCommentScore,
+    tc.CommentCount as TopCommenterCommentCount,
+    ('ScoreDeltaPrev:' || (pq.Score - coalesce(pq.PrevScore, 0)) || ';ViewDeltaNext:' || (coalesce(pq.NextViewCount, 0) - pq.ViewCount)) as DynamicScoreViewChanges
+from PopularQuestions pq
+left join AnswerStats asv on asv.QuestionId = pq.Id
+left join Users u on u.DisplayName = pq.OwnerName
+left join UserBadgeSummary ubs on ubs.UserId = u.Id
+left join RecentEditsWithCloseReason te on te.PostId = pq.Id and te.rn = 1
+left join TopCommenters tc on tc.UserId = u.Id
+where pq.Score > 5
+  and (te.CloseReasonName is null or te.CloseReasonName not like '%Duplicate%')
+  and (tc.AvgCommentScore is null or tc.AvgCommentScore > 1.5)
+order by pq.ViewCount desc, pq.Score desc
+limit 50;

@@ -1,0 +1,115 @@
+-- {"query": "3819.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2114} 
+WITH 
+-- Aggregate basic statistics per tag
+tag_stats AS (
+    SELECT 
+        t.id                                        AS tag_id,
+        t.tagname                                   AS tag_name,
+        COUNT(DISTINCT p.id) FILTER (WHERE p.posttypeid = 1) AS question_cnt,
+        COUNT(DISTINCT p.id) FILTER (WHERE p.posttypeid = 2) AS answer_cnt,
+        AVG(p.score) FILTER (WHERE p.posttypeid = 1)         AS avg_q_score,
+        MAX(p.creationdate)                                 AS last_post_dt
+    FROM tags t
+    LEFT JOIN posts p
+           ON p.tags LIKE ('%<'||t.tagname||'>%')
+    GROUP BY t.id, t.tagname
+),
+
+-- Find the top gold‑badge holder per tag (badge name equals tag name)
+top_gold_per_tag AS (
+    SELECT 
+        b.name                                     AS tag_name,
+        u.id                                        AS user_id,
+        u.displayname                               AS user_name,
+        u.reputation,
+        ROW_NUMBER() OVER (PARTITION BY b.name 
+                           ORDER BY u.reputation DESC, u.id) AS rn
+    FROM badges b
+    JOIN users u ON u.id = b.userid
+    WHERE b.class = 1                -- gold
+      AND b.tagbased = 1
+      AND b.name = (SELECT tagname FROM tags WHERE id = b.id)   -- badge name matches a tag
+),
+gold_winners AS (
+    SELECT 
+        tag_name,
+        user_id,
+        user_name,
+        reputation
+    FROM top_gold_per_tag
+    WHERE rn = 1
+),
+
+-- Recent voting activity per user (last 30 days)
+recent_votes AS (
+    SELECT 
+        v.userid                       AS user_id,
+        COUNT(*)                       AS votes_last_30d
+    FROM votes v
+    WHERE v.creationdate >= cast('2024-10-01' as date) - INTERVAL '30 days'
+    GROUP BY v.userid
+),
+
+-- Correlated sub‑query helper: maximum reputation among users who ever posted in the tag
+max_rep_in_tag(tag_name) AS (
+    SELECT 
+        MAX(u.reputation)
+    FROM users u
+    WHERE EXISTS (
+        SELECT 1
+        FROM posts p
+        WHERE p.owneruserid = u.id
+          AND p.tags LIKE ('%<'||tag_name||'>%')
+    )
+),
+
+-- Combine everything, add window rank and a few calculated columns
+combined AS (
+    SELECT 
+        ts.tag_id,
+        ts.tag_name,
+        ts.question_cnt,
+        ts.answer_cnt,
+        ts.avg_q_score,
+        ts.last_post_dt,
+        g.user_name                               AS top_gold_user,
+        g.reputation                              AS top_gold_rep,
+        COALESCE(rv.votes_last_30d,0)              AS top_user_votes_30d,
+        COALESCE((SELECT max_rep_in_tag(ts.tag_name)),0) AS max_rep_any_user,
+        CASE 
+            WHEN g.reputation IS NULL THEN 'NoGold'
+            WHEN g.reputation < 10000   THEN 'LowGold'
+            ELSE 'HighGold'
+        END                                         AS gold_user_tier,
+        ROW_NUMBER() OVER (ORDER BY ts.question_cnt DESC, ts.last_post_dt DESC) AS tag_rank
+    FROM tag_stats ts
+    LEFT JOIN gold_winners g   ON g.tag_name = ts.tag_name
+    LEFT JOIN recent_votes rv  ON rv.user_id = g.user_id
+)
+
+SELECT 
+    tag_id,
+    tag_name,
+    question_cnt,
+    answer_cnt,
+    ROUND(avg_q_score,2)      AS avg_question_score,
+    last_post_dt,
+    top_gold_user,
+    top_gold_rep,
+    top_user_votes_30d,
+    max_rep_any_user,
+    gold_user_tier,
+    tag_rank
+FROM combined
+WHERE (question_cnt > 0 OR answer_cnt > 0)
+  AND (avg_q_score IS NULL OR avg_q_score > 0)
+  AND (top_user_votes_30d > 5 OR top_gold_user IS NULL)
+ORDER BY tag_rank
+LIMIT 100
+
+UNION ALL
+
+-- Guarantees at least one row to stress a UNION operator
+SELECT 
+    NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL
+WHERE NOT EXISTS (SELECT 1 FROM combined);

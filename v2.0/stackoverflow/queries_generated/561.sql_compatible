@@ -1,0 +1,272 @@
+with params as (
+  select
+    date_trunc('month', cast('2024-10-01 12:34:56' as timestamp)) - interval '24 months' as start_month,
+    date_trunc('month', cast('2024-10-01 12:34:56' as timestamp)) as end_month
+),
+months as (
+  select generate_series(start_month, end_month, interval '1 month') as month_start
+  from params
+),
+questions as (
+  select
+    p.Id as QuestionId,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.Score as QuestionScore,
+    p.ViewCount,
+    p.Tags,
+    p.Title,
+    p.AcceptedAnswerId,
+    coalesce(p.AnswerCount, 0) as AnswerCount,
+    date_trunc('month', p.CreationDate) as month_start
+  from Posts p
+  where p.PostTypeId = 1
+    and p.CreationDate >= (select start_month from params)
+),
+answers as (
+  select
+    a.Id as AnswerId,
+    a.ParentId as QuestionId,
+    a.OwnerUserId as AnswerUserId,
+    a.Score as AnswerScore,
+    a.CreationDate as AnswerCreationDate
+  from Posts a
+  where a.PostTypeId = 2
+),
+first_answer as (
+  select
+    a.QuestionId,
+    min(a.AnswerCreationDate) as FirstAnswerAt
+  from answers a
+  group by a.QuestionId
+),
+dupes as (
+  select
+    pl.PostId as QuestionId,
+    min(pl.CreationDate) as FirstDupMarkAt,
+    count(*) filter (where pl.LinkTypeId = 3) as DupLinkCount
+  from PostLinks pl
+  where pl.LinkTypeId = 3
+  group by pl.PostId
+),
+close_events as (
+  select
+    ph.PostId as QuestionId,
+    min(ph.CreationDate) filter (where ph.PostHistoryTypeId = 10) as FirstClosedAt,
+    max(ph.Comment) filter (where ph.PostHistoryTypeId = 10 and ph.Comment ~ '^[0-9]+$') as CloseReasonIdRaw
+  from PostHistory ph
+  where ph.PostHistoryTypeId in (10,11,12,13,35,36)
+  group by ph.PostId
+),
+votes_agg as (
+  select
+    v.PostId as QuestionId,
+    count(*) filter (where v.VoteTypeId = 2) as UpVotes,
+    count(*) filter (where v.VoteTypeId = 3) as DownVotes,
+    count(*) filter (where v.VoteTypeId = 5) as Favorites,
+    count(*) filter (where v.VoteTypeId in (8,9)) as BountyEvents,
+    sum(v.BountyAmount) filter (where v.VoteTypeId in (8,9)) as BountyTotal
+  from Votes v
+  group by v.PostId
+),
+comment_agg as (
+  select
+    c.PostId as QuestionId,
+    count(*) as CommentCount,
+    max(c.CreationDate) as LastCommentAt,
+    sum(case when length(c.Text) >= 300 then 1 else 0 end) as LongCommentCount
+  from Comments c
+  group by c.PostId
+),
+tag_unpivot as (
+  select
+    q.QuestionId,
+    lower(trim(tg)) as tag
+  from questions q
+  cross join lateral unnest(string_to_array(substring(coalesce(q.Tags,''), 2, greatest(length(coalesce(q.Tags,'')) - 2,0)), '><')) as tg
+),
+top_tags as (
+  select tag, count(*) as tag_q_count
+  from tag_unpivot
+  group by tag
+  having count(*) >= 50
+),
+owner_stats as (
+  select
+    u.Id as UserId,
+    u.Reputation,
+    u.CreationDate as UserCreated,
+    u.UpVotes as ProfileUpVotes,
+    u.DownVotes as ProfileDownVotes,
+    coalesce(u.Location, 'Unknown') as LocationNorm,
+    (coalesce(u.UpVotes,0) - coalesce(u.DownVotes,0)) as NetProfileVotes,
+    nt.total_badges,
+    nt.gold_badges,
+    nt.silver_badges,
+    nt.bronze_badges
+  from Users u
+  left join lateral (
+    select
+      count(*) as total_badges,
+      count(*) filter (where b.Class = 1) as gold_badges,
+      count(*) filter (where b.Class = 2) as silver_badges,
+      count(*) filter (where b.Class = 3) as bronze_badges
+    from Badges b
+    where b.UserId = u.Id
+  ) nt on true
+),
+q_enriched as (
+  select
+    q.*,
+    fa.FirstAnswerAt,
+    d.FirstDupMarkAt,
+    d.DupLinkCount,
+    ce.FirstClosedAt,
+    cast(nullif(ce.CloseReasonIdRaw, '') as int) as CloseReasonId,
+    va.UpVotes,
+    va.DownVotes,
+    va.Favorites,
+    va.BountyEvents,
+    va.BountyTotal,
+    ca.CommentCount,
+    ca.LastCommentAt,
+    ca.LongCommentCount,
+    os.Reputation as OwnerReputation,
+    os.NetProfileVotes as OwnerNetProfileVotes,
+    os.total_badges as OwnerTotalBadges,
+    os.gold_badges as OwnerGoldBadges,
+    os.silver_badges as OwnerSilverBadges,
+    os.bronze_badges as OwnerBronzeBadges
+  from questions q
+  left join first_answer fa on fa.QuestionId = q.QuestionId
+  left join dupes d on d.QuestionId = q.QuestionId
+  left join close_events ce on ce.QuestionId = q.QuestionId
+  left join votes_agg va on va.QuestionId = q.QuestionId
+  left join comment_agg ca on ca.QuestionId = q.QuestionId
+  left join owner_stats os on os.UserId = q.OwnerUserId
+),
+time_metrics as (
+  select
+    qe.*,
+    extract(epoch from (qe.FirstAnswerAt - qe.CreationDate)) as secs_to_first_answer,
+    extract(epoch from (qe.FirstClosedAt - qe.CreationDate)) as secs_to_close,
+    extract(epoch from (qe.LastCommentAt - qe.CreationDate)) as secs_to_last_comment
+  from q_enriched qe
+),
+title_quality as (
+  select
+    tm.QuestionId,
+    char_length(coalesce(tm.Title,'')) as title_len,
+    char_length(regexp_replace(coalesce(tm.Title,''), '[^aeiouAEIOU]', '', 'g')) as vowels_in_title,
+    char_length(regexp_replace(coalesce(tm.Title,''), '[^[:alnum:]]', '', 'g')) as alnum_in_title,
+    (regexp_matches(coalesce(tm.Title,''), '(?i)\b(how|why|what|where|when|can|does|is)\b')) is not null as is_interrogative
+  from time_metrics tm
+),
+q_by_tag as (
+  select
+    tm.*,
+    t.tag
+  from time_metrics tm
+  left join tag_unpivot t on t.QuestionId = tm.QuestionId
+),
+rolling_tag_stats as (
+  select
+    t.tag,
+    date_trunc('month', tm.CreationDate) as month_start,
+    count(*) as tag_q_count,
+    avg(coalesce(tm.secs_to_first_answer, 86400*30)) as avg_secs_to_first_answer_capped,
+    percentile_cont(0.5) within group (order by coalesce(tm.secs_to_first_answer, 86400*30)) as p50_secs_to_first_answer,
+    avg(coalesce(tm.QuestionScore,0)) as avg_q_score
+  from q_by_tag tm
+  join top_tags t on t.tag = tm.tag
+  group by t.tag, date_trunc('month', tm.CreationDate)
+),
+user_answer_activity as (
+  select
+    a.AnswerUserId as UserId,
+    date_trunc('month', a.AnswerCreationDate) as month_start,
+    count(*) as answers_in_month,
+    avg(a.AnswerScore) as avg_answer_score,
+    sum(case when a.AnswerScore >= 5 then 1 else 0 end) as high_score_answers
+  from answers a
+  where a.AnswerUserId is not null
+  group by a.AnswerUserId, date_trunc('month', a.AnswerCreationDate)
+),
+question_answerers as (
+  select
+    a.QuestionId,
+    a.AnswerUserId,
+    max(a.AnswerScore) as max_answer_score,
+    min(a.AnswerCreationDate) as first_answer_by_user
+  from answers a
+  where a.AnswerUserId is not null
+  group by a.QuestionId, a.AnswerUserId
+),
+best_contributor as (
+  select distinct on (qa.QuestionId)
+    qa.QuestionId,
+    qa.AnswerUserId as BestContributorUserId,
+    qa.max_answer_score
+  from question_answerers qa
+  order by qa.QuestionId, qa.max_answer_score desc nulls last, qa.first_answer_by_user asc
+),
+final as (
+  select
+    m.month_start,
+    coalesce(tt.tag, '(untagged)') as tag_group,
+    count(distinct q.QuestionId) as questions,
+    sum(case when q.AcceptedAnswerId is not null then 1 else 0 end) as with_accepted,
+    avg(coalesce(q.secs_to_first_answer, 86400*30)) as avg_secs_to_first_answer_capped,
+    percentile_cont(0.9) within group (order by coalesce(q.secs_to_first_answer, 86400*30)) as p90_secs_to_first_answer,
+    avg(coalesce(q.secs_to_close, 86400*30)) as avg_secs_to_close_capped,
+    avg(coalesce(q.QuestionScore,0)) as avg_q_score,
+    avg(coalesce(q.ViewCount,0)) as avg_views,
+    avg(coalesce(q.UpVotes,0) - coalesce(q.DownVotes,0)) as avg_net_votes,
+    sum(coalesce(q.BountyEvents,0)) as bounty_events,
+    sum(coalesce(q.BountyTotal,0)) as bounty_total,
+    sum(coalesce(q.CommentCount,0)) as total_comments,
+    avg(coalesce(q.LongCommentCount,0)) as avg_long_comments,
+    avg(coalesce(os.avg_answer_score,0)) as avg_best_contributor_answer_score,
+    count(*) filter (where q.CloseReasonId = 101) as close_duplicate_count,
+    count(*) filter (where q.CloseReasonId = 102) as close_offtopic_count,
+    count(*) filter (where q.DupLinkCount > 0) as dup_link_flagged
+  from months m
+  left join q_enriched q on q.month_start = m.month_start
+  left join tag_unpivot tu on tu.QuestionId = q.QuestionId
+  left join top_tags tt on tt.tag = tu.tag
+  left join best_contributor bc on bc.QuestionId = q.QuestionId
+  left join user_answer_activity os on os.UserId = bc.BestContributorUserId and os.month_start = m.month_start
+  group by m.month_start, coalesce(tt.tag, '(untagged)')
+),
+ranked as (
+  select
+    f.*,
+    row_number() over (partition by f.month_start order by f.questions desc nulls last, f.avg_q_score desc nulls last) as tag_rank_by_volume,
+    dense_rank() over (order by f.avg_secs_to_first_answer_capped asc nulls last) as rank_fastest_answers_overall
+  from final f
+)
+select
+  cast(r.month_start as date) as month_start,
+  r.tag_group,
+  r.questions,
+  r.with_accepted,
+  round(r.avg_secs_to_first_answer_capped/3600.0, 2) as avg_hours_to_first_answer,
+  round(r.p90_secs_to_first_answer/3600.0, 2) as p90_hours_to_first_answer,
+  round(r.avg_secs_to_close_capped/3600.0, 2) as avg_hours_to_close,
+  round(cast(r.avg_q_score as numeric), 2) as avg_q_score,
+  round(cast(r.avg_views as numeric), 2) as avg_views,
+  round(cast(r.avg_net_votes as numeric), 2) as avg_net_votes,
+  r.bounty_events,
+  r.bounty_total,
+  r.total_comments,
+  round(cast(r.avg_long_comments as numeric), 2) as avg_long_comments,
+  round(cast(r.avg_best_contributor_answer_score as numeric), 2) as avg_best_contributor_answer_score,
+  r.close_duplicate_count,
+  r.close_offtopic_count,
+  r.dup_link_flagged,
+  r.tag_rank_by_volume,
+  r.rank_fastest_answers_overall
+from ranked r
+where coalesce(r.tag_group, '(untagged)') is not null
+  and (r.questions > 0 or r.tag_rank_by_volume <= 10)
+order by r.month_start desc, r.tag_rank_by_volume asc nulls last, r.tag_group asc;

@@ -1,0 +1,229 @@
+WITH RECURSIVE PostHierarchy AS (
+    SELECT 
+        p.Id AS PostId,
+        p.ParentId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        0 AS Level,
+        CAST(p.Id AS VARCHAR(1000)) AS Path
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.ParentId IS NULL
+
+    UNION ALL
+
+    SELECT 
+        p.Id AS PostId,
+        p.ParentId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        ph.Level + 1 AS Level,
+        CAST(ph.Path || '->' || CAST(p.Id AS VARCHAR(1000)) AS VARCHAR(1000)) AS Path
+    FROM Posts p
+    INNER JOIN PostHierarchy ph ON p.ParentId = ph.PostId
+    WHERE ph.Level < 5
+),
+TagStats AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        AVG(p.Score) AS AvgScore,
+        MAX(p.ViewCount) AS MaxViews,
+        STRING_AGG(DISTINCT CAST(p.OwnerUserId AS VARCHAR(100)), ',') AS UserOwners
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    WHERE t.Count > 100
+    GROUP BY t.TagName, t.Count
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.ViewCount,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Expert'
+            WHEN u.Reputation > 5000 THEN 'Advanced'
+            WHEN u.Reputation > 1000 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END AS ReputationLevel,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RankByReputation,
+        RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS RankByPostCount,
+        DENSE_RANK() OVER (ORDER BY u.ViewCount DESC) AS RankByViews
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.CreationDate >= TIMESTAMP '2010-01-01 00:00:00'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.ViewCount, u.UpVotes, u.DownVotes
+),
+ComplexPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.AcceptedAnswerId,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Question with Accepted Answer'
+            WHEN p.PostTypeId = 1 THEN 'Question without Accepted Answer'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostCategory,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags <> '' THEN 
+                COALESCE(array_length(string_to_array(p.Tags, '><'), 1), 0)
+            ELSE 0
+        END AS TagCount,
+        COALESCE(
+            (SELECT AVG(v.Score) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId IN (2,3)),
+            0
+        ) AS AvgVoteScore,
+        COALESCE(
+            (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (1,2,3,4,5,6)),
+            0
+        ) AS EditCount,
+        CASE 
+            WHEN p.CreationDate >= DATE '2020-01-01' AND p.CreationDate < DATE '2021-01-01' THEN '2020'
+            WHEN p.CreationDate >= DATE '2019-01-01' AND p.CreationDate < DATE '2020-01-01' THEN '2019'
+            WHEN p.CreationDate >= DATE '2018-01-01' AND p.CreationDate < DATE '2019-01-01' THEN '2018'
+            ELSE 'Older'
+        END AS PostingYear
+    FROM Posts p
+    WHERE p.PostTypeId IN (1,2)
+),
+FinalAnalysis AS (
+    SELECT 
+        ca.Id,
+        ca.PostTypeId,
+        ca.ParentId,
+        ca.OwnerUserId,
+        ca.Score,
+        ca.ViewCount,
+        ca.Title,
+        ca.Tags,
+        ca.CreationDate,
+        ca.AnswerCount,
+        ca.CommentCount,
+        ca.FavoriteCount,
+        ca.AcceptedAnswerId,
+        ca.PostCategory,
+        ca.TagCount,
+        ca.AvgVoteScore,
+        ca.EditCount,
+        ca.PostingYear,
+        CASE 
+            WHEN ca.Score > (SELECT AVG(cp.Score) FROM ComplexPosts cp) THEN 'Above Average'
+            WHEN ca.Score > (SELECT AVG(cp.Score) FROM ComplexPosts cp) * 0.8 THEN 'Average'
+            ELSE 'Below Average'
+        END AS ScoreClassification,
+        CASE 
+            WHEN ca.ViewCount > (SELECT AVG(cp.ViewCount) FROM ComplexPosts cp) THEN 'Popular'
+            WHEN ca.ViewCount > (SELECT AVG(cp.ViewCount) FROM ComplexPosts cp) * 0.5 THEN 'Moderate'
+            ELSE 'Rare'
+        END AS ViewClassification,
+        ROW_NUMBER() OVER (PARTITION BY ca.PostTypeId ORDER BY ca.Score DESC) AS RankInType,
+        DENSE_RANK() OVER (ORDER BY ca.CreationDate DESC) AS RecentRank,
+        LAG(ca.Score, 1) OVER (ORDER BY ca.CreationDate) AS PrevScore,
+        LAG(ca.ViewCount, 1) OVER (ORDER BY ca.CreationDate) AS PrevViews
+    FROM ComplexPosts ca
+    WHERE ca.Score > 0
+)
+SELECT 
+    fa.Id,
+    fa.PostTypeId,
+    fa.ParentId,
+    fa.OwnerUserId,
+    fa.Score,
+    fa.ViewCount,
+    fa.Title,
+    fa.Tags,
+    fa.CreationDate,
+    fa.AnswerCount,
+    fa.CommentCount,
+    fa.FavoriteCount,
+    fa.AcceptedAnswerId,
+    fa.PostCategory,
+    fa.TagCount,
+    fa.AvgVoteScore,
+    fa.EditCount,
+    fa.PostingYear,
+    fa.ScoreClassification,
+    fa.ViewClassification,
+    fa.RankInType,
+    fa.RecentRank,
+    CASE 
+        WHEN fa.PrevScore IS NOT NULL THEN 
+            ROUND((fa.Score - fa.PrevScore) * 100.0 / NULLIF(fa.PrevScore, 0), 2)
+        ELSE 0
+    END AS ScoreChangePercentage,
+    CASE 
+        WHEN fa.PrevViews IS NOT NULL THEN 
+            ROUND((fa.ViewCount - fa.PrevViews) * 100.0 / NULLIF(fa.PrevViews, 0), 2)
+        ELSE 0
+    END AS ViewsChangePercentage,
+    ua.DisplayName AS OwnerName,
+    ua.Reputation AS OwnerReputation,
+    ua.PostCount AS OwnerPostCount,
+    ua.CommentCount AS OwnerCommentCount,
+    ua.BadgeCount AS OwnerBadgeCount,
+    ts.TagName AS MostPopularTag,
+    ts.Count AS TagCount,
+    ts.AvgScore AS TagAverageScore,
+    ph.Path AS ParentHierarchy,
+    ph.Level AS HierarchyLevel,
+    CASE 
+        WHEN ua.ReputationLevel = 'Expert' AND fa.ScoreClassification = 'Above Average' THEN 'High Performing Expert'
+        WHEN ua.ReputationLevel = 'Advanced' AND fa.ScoreClassification = 'Above Average' THEN 'High Performing Advanced'
+        WHEN ua.ReputationLevel = 'Intermediate' AND fa.ScoreClassification = 'Above Average' THEN 'High Performing Intermediate'
+        ELSE 'Standard Contributor'
+    END AS PerformanceCategory,
+    CASE 
+        WHEN fa.EditCount > 10 THEN 'Highly Edited'
+        WHEN fa.EditCount > 5 THEN 'Moderately Edited'
+        WHEN fa.EditCount > 0 THEN 'Slightly Edited'
+        ELSE 'Never Edited'
+    END AS EditingFrequency,
+    COALESCE(ROUND(AVG(fa.Score) OVER (ORDER BY fa.CreationDate ROWS BETWEEN 5 PRECEDING AND CURRENT ROW), 2), 0) AS MovingAverageScore,
+    COALESCE(ROUND(AVG(fa.ViewCount) OVER (ORDER BY fa.CreationDate ROWS BETWEEN 5 PRECEDING AND CURRENT ROW), 2), 0) AS MovingAverageViews
+FROM FinalAnalysis fa
+LEFT JOIN UserActivity ua ON ua.UserId = fa.OwnerUserId
+LEFT JOIN TagStats ts ON ts.TagName = (
+    SELECT tag
+    FROM (
+        SELECT UNNEST(string_to_array(fa.Tags, '><')) AS tag
+    ) AS derived
+    ORDER BY (SELECT COUNT(*) FROM Tags t2 WHERE t2.TagName = derived.tag) DESC
+    LIMIT 1
+)
+LEFT JOIN PostHierarchy ph ON ph.PostId = fa.Id
+WHERE 
+    (fa.Score > 10 OR fa.ViewCount > 100)
+    AND (fa.PostCategory <> 'Answer' OR fa.AcceptedAnswerId IS NOT NULL)
+    AND fa.CreationDate >= TIMESTAMP '2015-01-01 00:00:00'
+    AND (COALESCE(ua.Reputation, 0) >= 1000 OR fa.Score >= 50)
+ORDER BY fa.CreationDate DESC, fa.Score DESC
+LIMIT 1000;

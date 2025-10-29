@@ -1,0 +1,144 @@
+-- {"query": "3635.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2406} 
+WITH
+    -- Aggregate user activity and badge counts
+    user_stats AS (
+        SELECT
+            u.id                         AS user_id,
+            u.displayname                AS display_name,
+            u.reputation,
+            COALESCE(SUM(CASE WHEN v.votetypeid = 2 THEN 1 ELSE 0 END), 0) AS up_votes_given,
+            COALESCE(SUM(CASE WHEN v.votetypeid = 3 THEN 1 ELSE 0 END), 0) AS down_votes_given,
+            (SELECT COUNT(*) FROM badges b WHERE b.userid = u.id AND b.class = 1) AS gold_badges,
+            (SELECT COUNT(*) FROM badges b WHERE b.userid = u.id AND b.class = 2) AS silver_badges,
+            (SELECT COUNT(*) FROM badges b WHERE b.userid = u.id AND b.class = 3) AS bronze_badges
+        FROM users u
+        LEFT JOIN votes v ON v.userid = u.id
+        GROUP BY u.id, u.displayname, u.reputation
+    ),
+
+    -- Question‑level metrics with window functions
+    question_metrics AS (
+        SELECT
+            p.id                                 AS q_id,
+            p.owneruserid                        AS owner_user_id,
+            p.creationdate,
+            p.score,
+            p.viewcount,
+            p.answercount,
+            p.favoritecount,
+            COALESCE(p.tags, '')                 AS tags_raw,
+            ROW_NUMBER() OVER (PARTITION BY p.owneruserid ORDER BY p.score DESC) AS rank_by_score,
+            COUNT(*) OVER (PARTITION BY p.owneruserid)                         AS total_questions,
+            LAG(p.score) OVER (PARTITION BY p.owneruserid ORDER BY p.creationdate) AS prev_score,
+            LEAD(p.score) OVER (PARTITION BY p.owneruserid ORDER BY p.creationdate) AS next_score
+        FROM posts p
+        WHERE p.posttypeid = 1                     -- only questions
+          AND p.creationdate >= DATE '2020-01-01'
+    ),
+
+    -- Explode tag strings into one row per tag
+    tag_explode AS (
+        SELECT
+            qm.q_id,
+            UNNEST(STRING_TO_ARRAY(TRIM(BOTH '<>' FROM qm.tags_raw), '><')) AS tag
+        FROM question_metrics qm
+        WHERE qm.tags_raw <> ''
+    ),
+
+    -- Statistics per tag (only tags used on >10 questions)
+    tag_stats AS (
+        SELECT
+            te.tag,
+            COUNT(DISTINCT te.q_id)                           AS questions_with_tag,
+            SUM(qm.score)                                     AS total_tag_score,
+            ROUND(AVG(qm.viewcount)::numeric, 2)              AS avg_tag_views
+        FROM tag_explode te
+        JOIN question_metrics qm ON qm.q_id = te.q_id
+        GROUP BY te.tag
+        HAVING COUNT(DISTINCT te.q_id) > 10
+    ),
+
+    -- Most frequent tag pairs (co‑occurring tags)
+    top_tag_pairs AS (
+        SELECT
+            t1.tag AS tag_a,
+            t2.tag AS tag_b,
+            COUNT(*) AS pair_cnt
+        FROM tag_explode t1
+        JOIN tag_explode t2
+          ON t1.q_id = t2.q_id
+         AND t1.tag < t2.tag
+        GROUP BY t1.tag, t2.tag
+        ORDER BY pair_cnt DESC
+        LIMIT 20
+    )
+
+-- Final result set mixing all the pieces
+SELECT
+    u.user_id,
+    u.display_name,
+    u.reputation,
+    u.up_votes_given,
+    u.down_votes_given,
+    u.gold_badges,
+    u.silver_badges,
+    u.bronze_badges,
+    q.q_id,
+    q.score,
+    q.viewcount,
+    q.answercount,
+    q.favoritecount,
+    q.rank_by_score,
+    q.total_questions,
+    COALESCE(q.prev_score, 0)            AS prev_score,
+    COALESCE(q.next_score, 0)            AS next_score,
+
+    -- Simple tag category derived from the first tag string
+    CASE
+        WHEN q.tags_raw ILIKE '%<java>%'
+            THEN 'Java'
+        WHEN q.tags_raw ILIKE '%<c%>%'
+            THEN 'C-family'
+        ELSE 'Other'
+    END                                 AS primary_tag_category,
+
+    COALESCE(ts.questions_with_tag, 0)  AS tag_popularity,
+    COALESCE(ts.total_tag_score, 0)     AS tag_total_score,
+    COALESCE(ts.avg_tag_views, 0)       AS tag_avg_views
+
+FROM users u
+LEFT JOIN user_stats u ON u.user_id = u.id
+
+LEFT JOIN LATERAL (
+    SELECT *
+    FROM question_metrics qm
+    WHERE qm.owner_user_id = u.id
+    ORDER BY qm.score DESC
+    LIMIT 5
+) q ON TRUE
+
+LEFT JOIN LATERAL (
+    SELECT ts.questions_with_tag, ts.total_tag_score, ts.avg_tag_views
+    FROM tag_stats ts
+    WHERE ts.tag = (
+        SELECT UNNEST(STRING_TO_ARRAY(TRIM(BOTH '<>' FROM q.tags_raw), '><')) LIMIT 1
+    )
+) ts ON TRUE
+
+WHERE u.reputation > 5000
+  AND (u.gold_badges + u.silver_badges) > 10
+  AND EXISTS (
+        SELECT 1
+        FROM badges b
+        WHERE b.userid = u.id
+          AND b.name = 'Great Question'
+          AND b.class = 1
+      )
+
+UNION ALL
+
+SELECT
+    NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,
+    NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,
+    NULL,NULL,NULL,NULL,NULL,NULL
+FROM generate_series(1,1) gs;

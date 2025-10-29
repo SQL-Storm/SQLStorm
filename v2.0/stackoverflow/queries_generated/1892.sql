@@ -1,0 +1,203 @@
+-- {"query": "1892.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2825} 
+
+WITH RecentHighValuePosts AS (
+    -- CTE 1: Gathers recent high-value questions and answers, combining them with UNION ALL.
+    -- High-value is defined by creation date, score, or view count for questions, and score for answers.
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.Tags,
+        p.ClosedDate,
+        'Question' AS PostCategory,
+        NULL::INT AS RelatedPostScore, -- Placeholder for UNION ALL alignment
+        NULL::TIMESTAMP AS RelatedPostCreationDate -- Placeholder for UNION ALL alignment
+    FROM
+        Posts p
+    WHERE
+        p.PostTypeId = 1 -- Question
+        AND p.CreationDate >= NOW() - INTERVAL '2 years'
+        AND (p.Score >= 5 OR p.ViewCount >= 500)
+
+    UNION ALL
+
+    SELECT
+        a.Id AS PostId,
+        a.PostTypeId,
+        a.OwnerUserId,
+        q.Title AS Title, -- Use question title for context, simulating linked data
+        a.Body,
+        a.Score,
+        NULL AS ViewCount, -- Answers don't have direct view counts
+        NULL AS AnswerCount, -- Answers don't have answer counts
+        a.CommentCount,
+        NULL AS FavoriteCount, -- Answers typically don't have favorites directly
+        a.CreationDate,
+        a.LastActivityDate,
+        NULL AS AcceptedAnswerId, -- Not applicable for answers
+        a.ParentId,
+        q.Tags AS Tags, -- Inherit tags from parent question
+        NULL AS ClosedDate, -- Not applicable for answers
+        'Answer' AS PostCategory,
+        q.Score AS RelatedPostScore,
+        q.CreationDate AS RelatedPostCreationDate
+    FROM
+        Posts a
+    INNER JOIN -- INNER JOIN to ensure a parent question exists
+        Posts q ON a.ParentId = q.Id
+    WHERE
+        a.PostTypeId = 2 -- Answer
+        AND a.CreationDate >= NOW() - INTERVAL '2 years'
+        AND a.Score >= 3 -- Only consider relatively good answers
+        AND q.PostTypeId = 1 -- Ensure parent is a question
+        AND q.CreationDate >= NOW() - INTERVAL '2 years' -- Ensure parent question is also recent
+),
+AggregatedUserMetrics AS (
+    -- CTE 2: Summarizes user activity, reputation, and badge counts.
+    -- Includes total posts, comments, votes given, and badge statistics.
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT p_posts.Id) AS TotalPostsByAuthor,
+        COUNT(DISTINCT c.Id) AS TotalCommentsByAuthor,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotesGiven,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotesGiven,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        MAX(b.Date) AS LastBadgeAwardDate,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges
+    FROM
+        Users u
+    LEFT JOIN Posts p_posts ON u.Id = p_posts.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+    HAVING
+        u.Reputation > 1000 OR COUNT(DISTINCT p_posts.Id) > 5 OR COUNT(DISTINCT c.Id) > 10
+),
+PostHistoryDetails AS (
+    -- CTE 3: Analyzes post history, including edit counts and the most recent significant history event.
+    -- Uses a correlated subquery to determine the 'LastSignificantHistoryType'.
+    SELECT
+        ph.PostId,
+        MAX(ph.CreationDate) AS LatestHistoryDate,
+        COUNT(ph.Id) AS HistoryEntryCount,
+        ARRAY_AGG(DISTINCT pht.Name ORDER BY pht.Name) AS HistoryTypeNames,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditCount,
+        ( -- Correlated Subquery: Get the name of the most recent non-initial history type
+            SELECT pht_inner.Name
+            FROM PostHistory ph_inner
+            JOIN PostHistoryTypes pht_inner ON ph_inner.PostHistoryTypeId = pht_inner.Id
+            WHERE ph_inner.PostId = ph.PostId
+            AND ph_inner.PostHistoryTypeId > 3 -- Exclude Initial Title, Body, Tags
+            ORDER BY ph_inner.CreationDate DESC, ph_inner.Id DESC
+            LIMIT 1
+        ) AS LastSignificantHistoryType
+    FROM
+        PostHistory ph
+    JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    GROUP BY
+        ph.PostId
+),
+TagPerformanceMetrics AS (
+    -- CTE 4: Calculates average score and total posts for frequently used tags.
+    SELECT
+        t.TagName,
+        COUNT(DISTINCT p.Id) AS TotalTaggedPosts,
+        AVG(p.Score) AS AvgScoreForTag,
+        MAX(p.CreationDate) AS LastTagUsageDate
+    FROM
+        Tags t
+    JOIN Posts p ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%' -- String pattern matching for tags
+    WHERE
+        p.PostTypeId = 1 -- Only questions are considered for tag performance
+        AND p.CreationDate >= NOW() - INTERVAL '3 years'
+    GROUP BY
+        t.TagName
+    HAVING
+        COUNT(DISTINCT p.Id) > 10 -- Only consider tags with a reasonable number of questions
+)
+SELECT
+    rhvp.PostId,
+    rhvp.PostTypeId,
+    rhvp.PostCategory,
+    rhvp.Title,
+    COALESCE(aum_owner.DisplayName, 'Deleted User (' || rhvp.OwnerUserId || ')') AS OwnerDisplayName,
+    aum_owner.Reputation AS OwnerReputation,
+    rhvp.CreationDate,
+    rhvp.Score AS PostScore,
+    rhvp.ViewCount,
+    NULLIF(rhvp.AnswerCount, 0) AS NonZeroAnswerCount, -- NULLIF example: show NULL if AnswerCount is 0
+    rhvp.CommentCount,
+    rhvp.FavoriteCount,
+    rhvp.ClosedDate,
+    phd.LastSignificantHistoryType,
+    phd.EditCount AS TotalPostEdits,
+    -- Correlated Subquery: Check if the post has any answers with more than 5 upvotes
+    (SELECT EXISTS (SELECT 1 FROM Posts sub_a WHERE sub_a.ParentId = rhvp.PostId AND sub_a.PostTypeId = 2 AND sub_a.Score > 5)) AS HasHighlyRatedAnswer,
+    -- String expression: Extracts a snippet from the body, cleans HTML tags, and indicates code blocks.
+    SUBSTRING(REPLACE(REPLACE(REPLACE(SUBSTRING(rhvp.Body, 1, 200), '<code>', ''), '</code>', ''), '<p>', ''), 1, 100) ||
+        CASE WHEN POSITION('<pre><code>' IN rhvp.Body) > 0 THEN '... [Contains Code]' ELSE '' END AS BodySnippet,
+    -- NULL logic: Defaults to 'N/A' for missing owner last access date.
+    COALESCE(aum_owner.LastAccessDate::VARCHAR, 'N/A') AS OwnerLastAccessDate,
+    -- Window Function: Ranks posts by score within their creation year and post type.
+    RANK() OVER (PARTITION BY EXTRACT(YEAR FROM rhvp.CreationDate), rhvp.PostTypeId ORDER BY rhvp.Score DESC, rhvp.CreationDate DESC) AS RankInYearByType,
+    -- Window Function: Calculates a 3-period moving average of scores for posts by the same owner.
+    AVG(rhvp.Score) OVER (PARTITION BY rhvp.OwnerUserId ORDER BY rhvp.CreationDate ASC ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS OwnerScoreMovingAvg,
+    -- Complicated predicate: Checks for specific tags AND if the owner has Gold badges.
+    (rhvp.Tags LIKE '%<sql>%' OR rhvp.Tags LIKE '%<database>%') AND COALESCE(aum_owner.GoldBadges, 0) > 0 AS IsDatabaseGoldUserPost,
+    tpm.AvgScoreForTag,
+    tpm.TotalTaggedPosts,
+    -- String expression: Aggregates linked/duplicate post information.
+    STRING_AGG(DISTINCT lt.Name || ': ' || pl.RelatedPostId, '; ') FILTER (WHERE pl.Id IS NOT NULL) AS RelatedPostsInfo,
+    aum_owner.TotalPostsByAuthor,
+    aum_owner.TotalCommentsByAuthor,
+    aum_owner.TotalBadges AS OwnerTotalBadges
+FROM
+    RecentHighValuePosts rhvp
+LEFT JOIN AggregatedUserMetrics aum_owner ON rhvp.OwnerUserId = aum_owner.UserId
+LEFT JOIN PostHistoryDetails phd ON rhvp.PostId = phd.PostId
+LEFT JOIN PostLinks pl ON rhvp.PostId = pl.PostId -- Outer join to include posts without links
+LEFT JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+LEFT JOIN LATERAL ( -- LATERAL JOIN for dynamic join condition and tag parsing
+    SELECT
+        tpm_inner.AvgScoreForTag,
+        tpm_inner.TotalTaggedPosts
+    FROM
+        TagPerformanceMetrics tpm_inner
+    WHERE
+        rhvp.Tags IS NOT NULL AND rhvp.Tags != '><' AND -- Ensure tags exist
+        tpm_inner.TagName = (SELECT unnest_tag FROM unnest(string_to_array(SUBSTRING(rhvp.Tags, 2, LENGTH(rhvp.Tags) - 2), '><')) as unnest_tag ORDER BY 1 LIMIT 1) -- Selects the first tag alphabetically
+    LIMIT 1
+) tpm ON TRUE
+WHERE
+    rhvp.OwnerUserId IS NOT NULL -- Exclude community owned posts (OwnerUserId can be -1 or NULL for community)
+    AND rhvp.Score > 0 -- Focus on posts with positive score
+    AND ( -- Complicated predicate for filtering different types of interesting posts
+        (rhvp.PostTypeId = 1 AND rhvp.AnswerCount > 0 AND rhvp.AcceptedAnswerId IS NOT NULL) -- Questions with an accepted answer
+        OR
+        (rhvp.PostTypeId = 2 AND rhvp.Score >= 10) -- High scoring answers
+        OR
+        (rhvp.PostTypeId = 1 AND rhvp.ClosedDate IS NULL AND rhvp.ViewCount >= 1000 AND phd.LastSignificantHistoryType IS DISTINCT FROM 'Deleted') -- Highly viewed, open, non-deleted questions
+    )
+GROUP BY -- Required for STRING_AGG and all non-aggregated columns
+    rhvp.PostId, rhvp.PostTypeId, rhvp.PostCategory, rhvp.Title, aum_owner.DisplayName, aum_owner.Reputation, rhvp.CreationDate, rhvp.Score, rhvp.ViewCount, rhvp.AnswerCount, rhvp.CommentCount, rhvp.FavoriteCount, rhvp.ClosedDate, phd.LastSignificantHistoryType, phd.EditCount, rhvp.Body, aum_owner.LastAccessDate, rhvp.OwnerUserId, aum_owner.GoldBadges, tpm.AvgScoreForTag, tpm.TotalTaggedPosts
+ORDER BY
+    OwnerReputation DESC, RankInYearByType ASC
+LIMIT 5000;

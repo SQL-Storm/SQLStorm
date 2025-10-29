@@ -1,0 +1,113 @@
+WITH
+    UserStats AS (
+        SELECT
+            u.Id AS UserId,
+            u.DisplayName,
+            u.Reputation,
+            COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+            COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+            COUNT(b.Id) AS BadgeCount,
+            SUM(CASE b.Class WHEN 1 THEN 100 WHEN 2 THEN 50 ELSE 10 END) AS BadgeScore,
+            ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank
+        FROM Users u
+        LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+        LEFT JOIN Badges b ON b.UserId = u.Id
+        GROUP BY u.Id, u.DisplayName, u.Reputation
+    ),
+    TagUsage AS (
+        SELECT
+            t.TagName,
+            COUNT(pt.Id) AS QuestionUses,
+            COUNT(DISTINCT pt.OwnerUserId) AS DistinctAuthors,
+            STRING_AGG(DISTINCT pt.Title, '; ') FILTER (WHERE pt.Title IS NOT NULL) AS SampleTitles
+        FROM Tags t
+        JOIN Posts pt
+          ON pt.Tags LIKE ( '%' || '<' || t.TagName || '>' || '%' )
+         AND pt.PostTypeId = 1
+        GROUP BY t.TagName
+        HAVING COUNT(pt.Id) > 1000
+    ),
+    TopPosts AS (
+        SELECT
+            p.Id,
+            p.Title,
+            p.Score,
+            p.ViewCount,
+            p.CreationDate,
+            p.PostTypeId,
+            u.DisplayName AS OwnerName,
+            ROW_NUMBER() OVER (
+                PARTITION BY p.PostTypeId
+                ORDER BY p.Score DESC, p.ViewCount DESC
+            ) AS RankInType
+        FROM Posts p
+        LEFT JOIN Users u ON u.Id = p.OwnerUserId
+        WHERE p.PostTypeId IN (1, 2)
+    ),
+    RecentClosed AS (
+        SELECT
+            ph.PostId,
+            ph.CreationDate AS ClosedDate,
+            CAST(ph.Comment AS INTEGER) AS CloseReasonId,
+            ct.Name AS CloseReason,
+            COUNT(*) OVER (PARTITION BY ph.PostId) AS CloseVoteCount
+        FROM PostHistory ph
+        JOIN CloseReasonTypes ct ON ct.Id = CAST(ph.Comment AS INTEGER)
+        WHERE ph.PostHistoryTypeId = 10
+    ),
+    AggVotes AS (
+        SELECT
+            v.PostId,
+            SUM(CASE WHEN vt.Id = 2 THEN 1 WHEN vt.Id = 3 THEN -1 ELSE 0 END) AS NetScore,
+            COUNT(*) FILTER (WHERE vt.Id = 5) AS FavoriteCount,
+            MAX(v.CreationDate) AS LastVoteDate
+        FROM Votes v
+        JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+        GROUP BY v.PostId
+    )
+
+SELECT
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.QuestionCount,
+    us.AnswerCount,
+    us.BadgeCount,
+    us.BadgeScore,
+    us.RepRank,
+    tp.Title AS TopQuestionTitle,
+    tp.Score AS TopQuestionScore,
+    tp.ViewCount AS TopQuestionViews,
+    tp.CreationDate AS TopQuestionDate,
+    tu.TagName,
+    tu.QuestionUses,
+    tu.DistinctAuthors,
+    tu.SampleTitles,
+    CASE WHEN rc.ClosedDate IS NULL THEN 'Open' ELSE 'Closed' END AS PostStatus,
+    rc.CloseReason,
+    COALESCE(av.NetScore, 0) - COALESCE(tp.Score, 0) AS ScoreDelta,
+    av.LastVoteDate
+FROM UserStats us
+LEFT JOIN TopPosts tp
+       ON tp.OwnerName = us.DisplayName
+      AND tp.PostTypeId = 1
+      AND tp.RankInType = 1
+LEFT JOIN TagUsage tu
+       ON tu.DistinctAuthors > 10
+LEFT JOIN RecentClosed rc
+       ON rc.PostId = tp.Id
+LEFT JOIN AggVotes av
+       ON av.PostId = tp.Id
+WHERE us.RepRank <= 100
+  AND (us.BadgeScore > 200 OR us.QuestionCount > 50)
+ORDER BY us.Reputation DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+    NULL, NULL, NULL, NULL, NULL, NULL
+FROM (SELECT 1) AS dummy
+WHERE FALSE;

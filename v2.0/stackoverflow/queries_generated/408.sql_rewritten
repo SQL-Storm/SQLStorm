@@ -1,0 +1,320 @@
+-- {"query": "408.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 3076} 
+with params as (
+    select
+        date_trunc('month', cast('2024-10-01 12:34:56' as timestamp)) - interval '24 months' as start_month,
+        date_trunc('month', cast('2024-10-01 12:34:56' as timestamp)) as end_month
+),
+months as (
+    select generate_series(p.start_month, p.end_month, interval '1 month') as month_start
+    from params p
+),
+q_posts as (
+    select
+        p.Id,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        date_trunc('month', p.CreationDate) as month_start
+    from Posts p
+    where p.PostTypeId = 1
+      and p.CreationDate >= (select start_month from params)
+),
+a_posts as (
+    select
+        a.Id,
+        a.ParentId as QuestionId,
+        a.OwnerUserId,
+        a.CreationDate,
+        a.Score
+    from Posts a
+    where a.PostTypeId = 2
+),
+first_answers as (
+    select distinct on (ap.QuestionId)
+        ap.QuestionId,
+        ap.Id as AnswerId,
+        ap.OwnerUserId as AnswererId,
+        ap.CreationDate as AnswerCreationDate
+    from a_posts ap
+    join q_posts qp on qp.Id = ap.QuestionId
+    order by ap.QuestionId, ap.CreationDate asc, ap.Id asc
+),
+dup_links as (
+    select pl.PostId as DuplicateId, pl.RelatedPostId as CanonicalId, pl.CreationDate
+    from PostLinks pl
+    where pl.LinkTypeId = 3
+),
+close_events as (
+    select
+        ph.PostId,
+        ph.CreationDate as CloseDate,
+        try_cast(nullif(ph.Comment, '') as int) as CloseReasonId
+    from PostHistory ph
+    where ph.PostHistoryTypeId = 10
+),
+reopen_events as (
+    select
+        ph.PostId,
+        ph.CreationDate as ReopenDate
+    from PostHistory ph
+    where ph.PostHistoryTypeId = 11
+),
+latest_close as (
+    select
+        c.PostId,
+        max(c.CloseDate) as LastCloseDate
+    from close_events c
+    group by c.PostId
+),
+latest_reopen as (
+    select
+        r.PostId,
+        max(r.ReopenDate) as LastReopenDate
+    from reopen_events r
+    group by r.PostId
+),
+effective_closure as (
+    select
+        lc.PostId,
+        lc.LastCloseDate,
+        lr.LastReopenDate,
+        case
+            when lr.LastReopenDate is null then true
+            when lc.LastCloseDate > lr.LastReopenDate then true
+            else false
+        end as IsCurrentlyClosed
+    from latest_close lc
+    left join latest_reopen lr on lr.PostId = lc.PostId
+),
+votes_agg as (
+    select
+        v.PostId,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+        sum(case when v.VoteTypeId = 5 then 1 else 0 end) as Favorites,
+        sum(case when v.VoteTypeId = 8 then coalesce(v.BountyAmount,0) else 0 end) as BountyStarted,
+        sum(case when v.VoteTypeId = 9 then coalesce(v.BountyAmount,0) else 0 end) as BountyAwarded,
+        min(case when v.VoteTypeId in (8,9) then v.CreationDate end) as FirstBountyDate
+    from Votes v
+    group by v.PostId
+),
+commenters as (
+    select
+        c.PostId,
+        count(*) as CommentCount,
+        count(distinct c.UserId) filter (where c.UserId is not null) as DistinctCommenters,
+        max(c.CreationDate) as LastCommentDate
+    from Comments c
+    group by c.PostId
+),
+owner_activity as (
+    select
+        u.Id as UserId,
+        u.Reputation,
+        u.CreationDate as UserCreationDate,
+        coalesce(u.Location, 'Unknown') as LocationNorm,
+        coalesce(nullif(trim(u.DisplayName), ''), concat('user_', u.Id::varchar)) as DisplayNameNorm,
+        (u.UpVotes - u.DownVotes) as NetVotes,
+        case when u.WebsiteUrl ilike '%github%' then 1 else 0 end as HasGithub
+    from Users u
+),
+tag_expansion as (
+    select
+        qp.Id as PostId,
+        unnest(string_to_array(substring(qp.Tags, 2, length(qp.Tags)-2), '><')) as TagName
+    from q_posts qp
+    where qp.Tags is not null and qp.Tags like '<%>'
+),
+tag_stats as (
+    select
+        te.TagName,
+        count(*) as QuestionCount,
+        avg(qp.Score::numeric) as AvgQuestionScore,
+        percentile_cont(0.5) within group (order by qp.ViewCount) as MedianViews
+    from tag_expansion te
+    join q_posts qp on qp.Id = te.PostId
+    group by te.TagName
+),
+accepted_answer_latency as (
+    select
+        qp.Id as QuestionId,
+        qp.CreationDate as QuestionDate,
+        pa.CreationDate as AcceptedDate,
+        extract(epoch from (pa.CreationDate - qp.CreationDate)) / 3600.0 as HoursToAccept
+    from q_posts qp
+    join Posts pq on pq.Id = qp.Id
+    join Posts pa on pa.Id = pq.AcceptedAnswerId
+),
+answer_response_latency as (
+    select
+        fa.QuestionId,
+        extract(epoch from (fa.AnswerCreationDate - qp.CreationDate)) / 3600.0 as HoursToFirstAnswer
+    from first_answers fa
+    join q_posts qp on qp.Id = fa.QuestionId
+),
+quality_band as (
+    select
+        qp.Id as PostId,
+        case
+            when qp.Score >= 10 and coalesce(va.UpVotes,0) >= 15 then 'Excellent'
+            when qp.Score >= 3 and coalesce(va.UpVotes,0) >= 5 then 'Good'
+            when qp.Score <= 0 and coalesce(va.DownVotes,0) > coalesce(va.UpVotes,0) then 'Poor'
+            else 'Average'
+        end as QualityBand
+    from q_posts qp
+    left join votes_agg va on va.PostId = qp.Id
+),
+user_badges as (
+    select
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as Gold,
+        sum(case when b.Class = 2 then 1 else 0 end) as Silver,
+        sum(case when b.Class = 3 then 1 else 0 end) as Bronze,
+        count(*) as TotalBadges,
+        max(b.Date) as LastBadgeDate
+    from Badges b
+    group by b.UserId
+),
+question_core as (
+    select
+        qp.Id as QuestionId,
+        qp.OwnerUserId,
+        qp.month_start,
+        qp.CreationDate,
+        qp.Score,
+        qp.ViewCount,
+        lower(coalesce(qp.Title, '')) as TitleLower,
+        length(coalesce(qp.Title, '')) as TitleLen,
+        regexp_replace(coalesce(qp.Title,''), '\s+', ' ', 'g') as TitleNormalized
+    from q_posts qp
+),
+duplicate_map as (
+    select
+        d.DuplicateId as QuestionId,
+        d.CanonicalId,
+        row_number() over (partition by d.DuplicateId order by d.CreationDate desc, d.CanonicalId) as rn
+    from dup_links d
+),
+final_enriched as (
+    select
+        qc.QuestionId,
+        qc.OwnerUserId,
+        qc.month_start,
+        qc.CreationDate,
+        qc.Score,
+        qc.ViewCount,
+        qc.TitleLower,
+        qc.TitleLen,
+        qc.TitleNormalized,
+        oa.Reputation,
+        oa.LocationNorm,
+        oa.DisplayNameNorm,
+        oa.NetVotes as OwnerNetVotes,
+        coalesce(ub.TotalBadges,0) as OwnerBadges,
+        coalesce(va.UpVotes,0) as UpVotes,
+        coalesce(va.DownVotes,0) as DownVotes,
+        coalesce(va.Favorites,0) as Favorites,
+        coalesce(cm.CommentCount,0) as CommentCount,
+        coalesce(cm.DistinctCommenters,0) as DistinctCommenters,
+        ecl.IsCurrentlyClosed,
+        aal.HoursToAccept,
+        arl.HoursToFirstAnswer,
+        qb.QualityBand,
+        dm.CanonicalId as DuplicateOfId,
+        ts.TagName as TopTagByAvgScore,
+        ts.AvgQuestionScore as TopTagAvgScore,
+        count(te.TagName) as TagCount
+    from question_core qc
+    left join owner_activity oa on oa.UserId = qc.OwnerUserId
+    left join user_badges ub on ub.UserId = qc.OwnerUserId
+    left join votes_agg va on va.PostId = qc.QuestionId
+    left join commenters cm on cm.PostId = qc.QuestionId
+    left join effective_closure ecl on ecl.PostId = qc.QuestionId
+    left join accepted_answer_latency aal on aal.QuestionId = qc.QuestionId
+    left join answer_response_latency arl on arl.QuestionId = qc.QuestionId
+    left join quality_band qb on qb.PostId = qc.QuestionId
+    left join lateral (
+        select t.TagName
+        from tag_expansion t
+        join tag_stats s on s.TagName = t.TagName
+        where t.PostId = qc.QuestionId
+        order by s.AvgQuestionScore desc nulls last, s.QuestionCount desc nulls last, t.TagName
+        limit 1
+    ) ts on true
+    left join duplicate_map dm on dm.QuestionId = qc.QuestionId and dm.rn = 1
+    left join tag_expansion te on te.PostId = qc.QuestionId
+    group by
+        qc.QuestionId, qc.OwnerUserId, qc.month_start, qc.CreationDate, qc.Score, qc.ViewCount,
+        qc.TitleLower, qc.TitleLen, qc.TitleNormalized,
+        oa.Reputation, oa.LocationNorm, oa.DisplayNameNorm, oa.NetVotes, ub.TotalBadges,
+        va.UpVotes, va.DownVotes, va.Favorites, cm.CommentCount, cm.DistinctCommenters,
+        ecl.IsCurrentlyClosed, aal.HoursToAccept, arl.HoursToFirstAnswer, qb.QualityBand,
+        dm.CanonicalId, ts.TagName, ts.AvgQuestionScore
+),
+monthly_rollup as (
+    select
+        m.month_start,
+        count(fe.QuestionId) as Questions,
+        avg(fe.Score::numeric) as AvgScore,
+        percentile_cont(0.9) within group (order by fe.ViewCount) as P90Views,
+        avg(coalesce(fe.HoursToFirstAnswer, 24*30)::numeric) as AvgHoursToFirstAnswerCapped,
+        sum(case when fe.IsCurrentlyClosed then 1 else 0 end) as CurrentlyClosed,
+        sum(case when fe.DuplicateOfId is not null then 1 else 0 end) as Duplicates,
+        sum(case when fe.QualityBand = 'Excellent' then 1 else 0 end) as ExcellentCount,
+        sum(case when fe.QualityBand = 'Poor' then 1 else 0 end) as PoorCount
+    from months m
+    left join final_enriched fe on fe.month_start = m.month_start
+    group by m.month_start
+),
+ranked_questions as (
+    select
+        fe.*,
+        row_number() over (partition by date_trunc('month', fe.CreationDate) order by (fe.UpVotes - fe.DownVotes) desc, fe.ViewCount desc, fe.Favorites desc, fe.QuestionId) as MonthlyRankByScore,
+        row_number() over (order by (coalesce(fe.HoursToFirstAnswer, 1e9)) asc, fe.ViewCount desc) as FastestAnswerRank,
+        dense_rank() over (order by fe.OwnerBadges desc, fe.OwnerNetVotes desc) as OwnerReputationTier
+    from final_enriched fe
+),
+outliers as (
+    select
+        rq.QuestionId,
+        rq.CreationDate,
+        rq.Score,
+        rq.ViewCount,
+        rq.UpVotes,
+        rq.DownVotes,
+        rq.Favorites,
+        rq.HoursToFirstAnswer,
+        rq.HoursToAccept,
+        rq.MonthlyRankByScore,
+        rq.FastestAnswerRank,
+        rq.OwnerReputationTier,
+        case
+            when rq.ViewCount > (select P90Views from monthly_rollup mr where mr.month_start = rq.month_start) then 1 else 0
+        end as IsViewOutlier
+    from ranked_questions rq
+)
+select
+    mr.month_start,
+    mr.Questions,
+    mr.AvgScore,
+    mr.P90Views,
+    mr.AvgHoursToFirstAnswerCapped,
+    mr.CurrentlyClosed,
+    mr.Duplicates,
+    mr.ExcellentCount,
+    mr.PoorCount,
+    -- set operators style aggregation with correlated subqueries
+    (select count(*) from outliers o where date_trunc('month', o.CreationDate) = mr.month_start and o.IsViewOutlier = 1) as OutlierQuestions,
+    (select avg(o.Score::numeric) from outliers o where date_trunc('month', o.CreationDate) = mr.month_start) as OutlierAvgScore,
+    -- string expressions and null logic
+    coalesce(string_agg(distinct left(fe.LocationNorm, 20), ', ' order by left(fe.LocationNorm, 20)) filter (where fe.LocationNorm <> 'Unknown'), 'None') as TopLocationsSample
+from monthly_rollup mr
+left join ranked_questions fe on fe.month_start = mr.month_start and fe.MonthlyRankByScore <= 5
+where mr.month_start >= (select start_month from params)
+group by
+    mr.month_start, mr.Questions, mr.AvgScore, mr.P90Views, mr.AvgHoursToFirstAnswerCapped,
+    mr.CurrentlyClosed, mr.Duplicates, mr.ExcellentCount, mr.PoorCount
+order by mr.month_start;

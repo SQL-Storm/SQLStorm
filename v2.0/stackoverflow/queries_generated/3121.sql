@@ -1,0 +1,142 @@
+-- {"query": "3121.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2204} 
+
+WITH
+    /* Aggregate basic activity per user */
+    user_stats AS (
+        SELECT
+            u.Id,
+            u.DisplayName,
+            u.Reputation,
+            COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END)                     AS question_cnt,
+            COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END)                     AS answer_cnt,
+            COUNT(DISTINCT c.Id)                                                          AS comment_cnt,
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END)                            AS upvote_cnt,
+            SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END)                            AS downvote_cnt
+        FROM Users u
+        LEFT JOIN Posts       p ON p.OwnerUserId = u.Id
+        LEFT JOIN Comments    c ON c.UserId      = u.Id
+        LEFT JOIN Votes       v ON v.UserId      = u.Id
+        GROUP BY u.Id, u.DisplayName, u.Reputation
+    ),
+
+    /* Concatenate badge names and count by class */
+    badge_agg AS (
+        SELECT
+            b.UserId,
+            STRING_AGG(b.Name, ', ')                                           AS badge_list,
+            COUNT(*) FILTER (WHERE b.Class = 1)                               AS gold_cnt,
+            COUNT(*) FILTER (WHERE b.Class = 2)                               AS silver_cnt,
+            COUNT(*) FILTER (WHERE b.Class = 3)                               AS bronze_cnt
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+
+    /* Most recent question per user */
+    recent_q AS (
+        SELECT
+            p.OwnerUserId,
+            p.Title,
+            p.CreationDate,
+            ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+    ),
+
+    /* Tags that are used more than 1 000 times across the site */
+    popular_tags AS (
+        SELECT
+            t.TagName,
+            COUNT(*) AS tag_use_cnt
+        FROM Posts p
+        CROSS APPLY (
+            SELECT TRIM(value) AS value
+            FROM STRING_SPLIT(REPLACE(REPLACE(p.Tags, '<', ''), '>', ''), ' ')
+            WHERE TRIM(value) <> ''
+        ) AS s
+        JOIN Tags t ON t.TagName = s.value
+        GROUP BY t.TagName
+        HAVING COUNT(*) > 1000
+    ),
+
+    /* Per‑user tag activity limited to popular tags */
+    user_tag_activity AS (
+        SELECT
+            u.Id                                 AS user_id,
+            pt.TagName,
+            COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS q_cnt,
+            COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS a_cnt
+        FROM Users u
+        JOIN Posts p ON p.OwnerUserId = u.Id
+        CROSS APPLY (
+            SELECT TRIM(value) AS value
+            FROM STRING_SPLIT(REPLACE(REPLACE(p.Tags, '<', ''), '>', ''), ' ')
+            WHERE TRIM(value) <> ''
+        ) AS s
+        JOIN Tags t ON t.TagName = s.value
+        JOIN popular_tags pt ON pt.TagName = t.TagName
+        GROUP BY u.Id, pt.TagName
+    ),
+
+    /* Rank each user’s tags by combined activity */
+    user_top_tag AS (
+        SELECT
+            uta.user_id,
+            uta.TagName,
+            ROW_NUMBER() OVER (PARTITION BY uta.user_id ORDER BY (uta.q_cnt + uta.a_cnt) DESC) AS tag_rank
+        FROM user_tag_activity uta
+    ),
+
+    /* Composite score that mixes reputation, activity and badges */
+    scoring AS (
+        SELECT
+            us.Id,
+            us.DisplayName,
+            us.Reputation,
+            us.question_cnt,
+            us.answer_cnt,
+            us.comment_cnt,
+            us.upvote_cnt,
+            us.downvote_cnt,
+            COALESCE(ba.gold_cnt,0)   AS gold_cnt,
+            COALESCE(ba.silver_cnt,0) AS silver_cnt,
+            COALESCE(ba.bronze_cnt,0) AS bronze_cnt,
+            COALESCE(ba.badge_list,'') AS badge_list,
+            rq.Title   AS recent_question_title,
+            rq.CreationDate AS recent_question_date,
+            ( us.Reputation * 0.15
+              + us.answer_cnt   * 4
+              + us.question_cnt* 2
+              + gold_cnt   * 12
+              + silver_cnt * 6
+              + bronze_cnt * 2 )                              AS composite_score
+        FROM user_stats us
+        LEFT JOIN badge_agg   ba ON ba.UserId = us.Id
+        LEFT JOIN recent_q    rq ON rq.OwnerUserId = us.Id AND rq.rn = 1
+    )
+
+SELECT
+    s.Id,
+    s.DisplayName,
+    s.Reputation,
+    s.composite_score,
+    s.recent_question_title,
+    s.recent_question_date,
+    s.badge_list,
+    ut.TagName AS top_tag
+FROM scoring s
+LEFT JOIN user_top_tag ut
+       ON ut.user_id = s.Id AND ut.tag_rank = 1
+WHERE s.composite_score > (SELECT AVG(composite_score) FROM scoring)
+
+UNION ALL
+
+SELECT
+    NULL        AS Id,
+    'TOTAL_USERS' AS DisplayName,
+    COUNT(*)    AS Reputation,
+    NULL        AS composite_score,
+    NULL        AS recent_question_title,
+    NULL        AS recent_question_date,
+    NULL        AS badge_list,
+    NULL        AS top_tag
+FROM Users;

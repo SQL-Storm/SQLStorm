@@ -1,0 +1,154 @@
+with recursive RecursivePosts as (
+    select p.Id, p.PostTypeId, p.ParentId, p.AcceptedAnswerId, p.OwnerUserId, p.Score, p.CreationDate, p.Tags,
+           1 as Level,
+           cast(coalesce(p.Title, '') as varchar(300)) as PathTitle
+    from Posts p
+    where p.PostTypeId = 1
+
+    union all
+
+    select c.Id, c.PostTypeId, c.ParentId, c.AcceptedAnswerId, c.OwnerUserId, c.Score, c.CreationDate, c.Tags,
+           rp.Level + 1,
+           rp.PathTitle || ' -> ' || coalesce(c.Title, 'Answer#' || cast(c.Id as varchar))
+    from Posts c
+    inner join RecursivePosts rp on c.ParentId = rp.Id
+    where c.PostTypeId = 2
+),
+UserBadgeCounts as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(case when b.Class = 1 then 1 end) as GoldBadges,
+        count(case when b.Class = 2 then 1 end) as SilverBadges,
+        count(case when b.Class = 3 then 1 end) as BronzeBadges,
+        count(b.Id) as TotalBadges
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostVotesSummary as (
+    select 
+        p.Id as PostId,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+        sum(case when v.VoteTypeId = 5 then 1 else 0 end) as FavoriteVotes,
+        count(v.Id) as TotalVotes
+    from Posts p
+    left join Votes v on v.PostId = p.Id
+    group by p.Id
+),
+LatestCommentsPerPost as (
+    select distinct on (c.PostId)
+        c.PostId,
+        c.Id as CommentId,
+        c.Text as CommentText,
+        c.CreationDate as CommentDate,
+        c.UserId as CommentUserId,
+        u.DisplayName as CommentUserName
+    from Comments c
+    left join Users u on u.Id = c.UserId
+    order by c.PostId, c.CreationDate desc
+),
+QuestionsWithAnswerStats as (
+    select 
+        q.Id as QuestionId,
+        q.Title,
+        q.Tags,
+        q.OwnerUserId,
+        q.CreationDate as QuestionCreationDate,
+        coalesce(a.TotalAnswers, 0) as TotalAnswers,
+        coalesce(avgr.AvgAnswerScore, 0) as AvgAnswerScore,
+        ps.UpVotes as QuestionUpVotes,
+        ps.DownVotes as QuestionDownVotes,
+        ps.FavoriteVotes as QuestionFavoriteVotes,
+        ps.TotalVotes as QuestionTotalVotes,
+        lcp.CommentText as LatestCommentText,
+        lcp.CommentDate as LatestCommentDate,
+        lcp.CommentUserName as LatestCommentUser,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ub.TotalBadges
+    from Posts q
+    left join (
+        select ParentId, count(*) as TotalAnswers
+        from Posts
+        where PostTypeId = 2
+        group by ParentId
+    ) a on a.ParentId = q.Id
+    left join (
+        select ParentId, cast(avg(Score) as numeric(10,2)) as AvgAnswerScore
+        from Posts
+        where PostTypeId = 2
+        group by ParentId
+    ) avgr on avgr.ParentId = q.Id
+    left join PostVotesSummary ps on ps.PostId = q.Id
+    left join LatestCommentsPerPost lcp on lcp.PostId = q.Id
+    left join UserBadgeCounts ub on ub.UserId = q.OwnerUserId
+    where q.PostTypeId = 1
+),
+RankedQuestions as (
+    select 
+        qws.*,
+        row_number() over (
+            partition by qws.GoldBadges, qws.SilverBadges, qws.BronzeBadges
+            order by qws.AvgAnswerScore desc nulls last, qws.QuestionUpVotes desc nulls last, qws.TotalAnswers desc nulls last, qws.QuestionCreationDate
+        ) as RankInBadgeGroup
+    from QuestionsWithAnswerStats qws
+),
+DuplicateLinkedQuestions as (
+    select distinct pl.PostId as QuestionId, pl.RelatedPostId as DuplicateOfId
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId and lt.Name = 'Duplicate'
+    join Posts q on q.Id = pl.PostId and q.PostTypeId = 1
+    join Posts r on r.Id = pl.RelatedPostId and r.PostTypeId = 1
+),
+QuestionsWithDuplicatesFlagged as (
+    select rq.*, 
+           case when dlq.QuestionId is not null then true else false end as HasDuplicateFlag
+    from RankedQuestions rq
+    left join DuplicateLinkedQuestions dlq on dlq.QuestionId = rq.QuestionId
+)
+select
+    qwd.QuestionId,
+    qwd.Title,
+    qwd.Tags,
+    qwd.OwnerUserId,
+    coalesce(u.DisplayName, 'Community') as OwnerDisplayName,
+    qwd.QuestionCreationDate,
+    qwd.TotalAnswers,
+    qwd.AvgAnswerScore,
+    qwd.QuestionUpVotes,
+    qwd.QuestionDownVotes,
+    qwd.QuestionFavoriteVotes,
+    qwd.QuestionTotalVotes,
+    qwd.LatestCommentText,
+    qwd.LatestCommentDate,
+    qwd.LatestCommentUser,
+    qwd.GoldBadges,
+    qwd.SilverBadges,
+    qwd.BronzeBadges,
+    qwd.TotalBadges,
+    qwd.RankInBadgeGroup,
+    qwd.HasDuplicateFlag,
+    case 
+        when qwd.QuestionTotalVotes = 0 then 0
+        else round(
+            (
+                (qwd.TotalAnswers * 2) + 
+                (qwd.AvgAnswerScore * 1.5) + 
+                (qwd.QuestionUpVotes * 1.2) - 
+                (qwd.QuestionDownVotes * 1.5) + 
+                (qwd.QuestionFavoriteVotes * 3) + 
+                (qwd.GoldBadges * 5) + 
+                (qwd.SilverBadges * 2) + 
+                (qwd.BronzeBadges * 1)
+            ) / qwd.QuestionTotalVotes, 3)
+    end as EngagementScore,
+    split_part(split_part(qwd.Tags, '><', 1), '<', 2) as FirstTag,
+    coalesce(to_char(qwd.LatestCommentDate, 'YYYY-MM-DD HH24:MI'), to_char(u.CreationDate, 'YYYY-MM-DD')) as LastInteractionDate
+from QuestionsWithDuplicatesFlagged qwd
+left join Users u on u.Id = qwd.OwnerUserId
+where qwd.RankInBadgeGroup <= 10
+order by qwd.GoldBadges desc nulls last, qwd.AvgAnswerScore desc nulls last, EngagementScore desc nulls last
+limit 100;

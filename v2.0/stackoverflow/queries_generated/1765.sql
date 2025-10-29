@@ -1,0 +1,215 @@
+-- {"query": "1765.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 3434} 
+
+WITH UserActivitySummary AS (
+    -- Calculates various activity metrics for users, focusing on those with moderate engagement
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.CreationDate AS UserCreationDate,
+        U.Reputation,
+        COUNT(DISTINCT P.Id) AS TotalPostsCreated,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        SUM(CASE WHEN V.VoteTypeId IN (2, 8) THEN 1 ELSE 0 END) AS TotalUpVotesGiven, -- UpMod, BountyStart
+        SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesGiven, -- DownMod
+        COUNT(DISTINCT B.Id) AS TotalBadgesEarned,
+        MAX(P.Score) AS MaxPostScore,
+        AVG(CAST(P.Score AS NUMERIC)) FILTER (WHERE P.PostTypeId = 1) AS AvgQuestionScorePosted
+    FROM Users U
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    LEFT JOIN Votes V ON U.Id = V.UserId
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    GROUP BY U.Id, U.DisplayName, U.CreationDate, U.Reputation
+    HAVING COUNT(DISTINCT P.Id) > 5 AND COUNT(DISTINCT B.Id) > 2 AND U.Reputation > 100 -- Filter for moderately active users
+),
+PostEngagementMetrics AS (
+    -- Gathers detailed engagement metrics for individual posts, including aggregated votes and edit history
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CommentCount AS DirectCommentCountFromPostTable, -- Comment count directly from Posts table
+        COALESCE(SUM(CASE WHEN V.VoteTypeId IN (2, 3, 4, 10, 11, 12) THEN 1 ELSE 0 END), 0) AS TotalPostVotesReceived, -- UpMod, DownMod, Offensive, Deletion, Undeletion, Spam
+        COUNT(DISTINCT C.Id) AS ActualCommentCountFromCommentsTable, -- Count from Comments table (can differ from P.CommentCount due to deleted comments)
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN PH.CreationDate ELSE NULL END) AS LastEditDate, -- Last edit of title, body, or tags
+        COUNT(DISTINCT PH.UserId) AS UniqueEditorsCount,
+        -- Calculate the duration in hours from creation to closure, NULL if not closed
+        EXTRACT(EPOCH FROM (P.ClosedDate - P.CreationDate)) / 3600 AS HoursToClose,
+        -- Correlated subquery: Count distinct users who favorited this specific post
+        (SELECT COUNT(DISTINCT V_inner.UserId) FROM Votes V_inner WHERE V_inner.PostId = P.Id AND V_inner.VoteTypeId = 5) AS TotalFavoriteCountByUsers
+    FROM Posts P
+    LEFT JOIN Votes V ON P.Id = V.PostId
+    LEFT JOIN Comments C ON P.Id = C.PostId
+    LEFT JOIN PostHistory PH ON P.Id = PH.PostId
+    WHERE P.CreationDate >= '2020-01-01' AND P.PostTypeId IN (1, 2) -- Focus on recent questions/answers
+    GROUP BY P.Id, P.PostTypeId, P.OwnerUserId, P.CreationDate, P.Score, P.ViewCount, P.AnswerCount, P.CommentCount, P.ClosedDate
+),
+ParsedPostTags AS (
+    -- Extracts individual tags from the 'Tags' string in posts
+    SELECT
+        P.Id AS PostId,
+        TRIM(UNNEST(string_to_array(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags) - 2), '><'))) AS TagName,
+        P.PostTypeId,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.CreationDate
+    FROM Posts P
+    WHERE P.Tags IS NOT NULL AND P.Tags != '' AND P.PostTypeId = 1 -- Only questions with tags
+),
+AggregatedTagMetrics AS (
+    -- Aggregates metrics for each tag, including popularity quintile
+    SELECT
+        PPT.TagName,
+        COUNT(DISTINCT PPT.PostId) AS TaggedPostsCount,
+        AVG(CAST(PPT.Score AS NUMERIC)) AS AvgTagScore,
+        SUM(PPT.ViewCount) AS TotalTagViews,
+        MAX(PPT.CreationDate) AS LatestTagPostDate,
+        NTILE(5) OVER (ORDER BY COUNT(DISTINCT PPT.PostId) DESC, SUM(PPT.ViewCount) DESC) AS TagPopularityQuintile
+    FROM ParsedPostTags PPT
+    GROUP BY PPT.TagName
+    HAVING COUNT(DISTINCT PPT.PostId) > 10 -- Only consider tags with a reasonable number of posts
+)
+-- Main query: Combines data from multiple CTEs and tables, applying complex logic and window functions
+SELECT
+    P.Id AS QuestionId,
+    P.Title AS QuestionTitle,
+    PT.Name AS PostTypeName,
+    UAS.DisplayName AS QuestionOwnerDisplayName,
+    UAS.TotalPostsCreated AS OwnerTotalQuestions,
+    UAS.AvgQuestionScorePosted AS OwnerAvgQuestionScore,
+    PEM.TotalPostVotesReceived AS QuestionTotalVotes,
+    PEM.ActualCommentCountFromCommentsTable AS QuestionTotalComments,
+    PEM.HoursToClose AS QuestionClosureHours,
+    COALESCE(PEM.TotalFavoriteCountByUsers, 0) AS QuestionFavoritesByUsers,
+    COALESCE(PEM.UniqueEditorsCount, 0) AS NumUniqueEditors,
+    -- Window function: Rank questions by score within their owner's posted questions
+    RANK() OVER (PARTITION BY P.OwnerUserId ORDER BY P.Score DESC, P.ViewCount DESC) AS OwnerScoreRank,
+    -- Window function: Calculate average view count for questions created in the same calendar month
+    AVG(P.ViewCount) OVER (PARTITION BY DATE_TRUNC('month', P.CreationDate)) AS MonthlyAvgViewCount,
+    -- String expression: Analyze title length and extract a prefix
+    LENGTH(P.Title) AS TitleLength,
+    UPPER(SUBSTRING(P.Title, 1, 15)) AS TitlePrefixUpper, -- Get first 15 chars and make uppercase
+    -- Complicated predicate/expression with CASE WHEN for engagement categorization
+    CASE
+        WHEN P.ViewCount > 5000 AND P.AnswerCount >= 5 AND PEM.ActualCommentCountFromCommentsTable > 10 THEN 'HighlyEngaged'
+        WHEN P.ViewCount > 1000 AND P.AnswerCount >= 2 THEN 'ModeratelyEngaged'
+        WHEN P.ClosedDate IS NOT NULL AND PEM.HoursToClose < 24 * 7 THEN 'QuicklyClosed'
+        WHEN P.Score < 0 AND PEM.TotalPostVotesReceived > 5 THEN 'ControversialQuestion'
+        ELSE 'LowEngagementOrOther'
+    END AS EngagementCategory,
+    -- Join with aggregated tag metrics for the primary tag of the question
+    ATM.TaggedPostsCount AS PrimaryTagUsageCount,
+    ATM.AvgTagScore AS PrimaryTagAvgScore,
+    ATM.TagPopularityQuintile,
+    -- Correlated subquery: Calculate the average score of all answers associated with this question
+    (
+        SELECT AVG(A.Score)
+        FROM Posts A
+        WHERE A.ParentId = P.Id AND A.PostTypeId = 2
+    ) AS AvgAnswerScore,
+    -- Boolean check using EXISTS for duplicate links
+    EXISTS (
+        SELECT 1 FROM PostLinks PL WHERE PL.PostId = P.Id AND PL.LinkTypeId = 3
+    ) AS HasDuplicateLinks,
+    -- NULL logic: Combine FavoriteCount from Posts table with calculated favorite count
+    COALESCE(P.FavoriteCount, 0) + COALESCE(PEM.TotalFavoriteCountByUsers, 0) AS CombinedFavoriteMetric,
+    -- Correlated subquery: Calculate the average score of linked posts (LinkTypeId = 1)
+    (
+        SELECT AVG(PR.Score)
+        FROM PostLinks PL_inner
+        JOIN Posts PR ON PL_inner.RelatedPostId = PR.Id
+        WHERE PL_inner.PostId = P.Id AND PL_inner.LinkTypeId = 1
+          AND PR.Score IS NOT NULL AND PR.Score > -5
+    ) AS AvgScoreOfLinkedPosts,
+    -- String function and NULLIF to check for 'community' in OwnerDisplayName
+    NULLIF(LOWER(UAS.DisplayName), 'community') AS OwnerDisplayNameNormalized
+FROM Posts P
+INNER JOIN PostTypes PT ON P.PostTypeId = PT.Id -- Ensure PostType name is available
+LEFT JOIN UserActivitySummary UAS ON P.OwnerUserId = UAS.UserId
+LEFT JOIN PostEngagementMetrics PEM ON P.Id = PEM.PostId
+-- Join to get the first tag associated with the question
+LEFT JOIN (
+    SELECT
+        PPT.PostId,
+        PPT.TagName,
+        ROW_NUMBER() OVER (PARTITION BY PPT.PostId ORDER BY PPT.TagName) AS rn -- Pick one tag consistently
+    FROM ParsedPostTags PPT
+) AS FirstTag ON P.Id = FirstTag.PostId AND FirstTag.rn = 1
+LEFT JOIN AggregatedTagMetrics ATM ON FirstTag.TagName = ATM.TagName
+WHERE P.PostTypeId = 1 -- Only questions for the primary analysis
+  AND P.CreationDate >= '2021-01-01' -- Focus on more recent questions
+  AND P.OwnerUserId IS NOT NULL -- Exclude community-owned or deleted user questions initially
+  AND P.ViewCount > 50 -- Focus on questions with at least some visibility
+  AND (P.Tags IS NOT NULL OR P.ClosedDate IS NOT NULL) -- Complex predicate for filtering
+  AND NOT EXISTS (
+      SELECT 1 FROM Comments C_ex WHERE C_ex.PostId = P.Id AND C_ex.Text LIKE '%spam%'
+  ) -- Exclude questions with comments containing 'spam'
+-- Set operator: UNION ALL to combine with a second set of criteria
+UNION ALL
+-- This branch focuses on older, potentially "problematic" questions (low score, no accepted answer, owner without gold badge)
+SELECT
+    P_alt.Id AS QuestionId,
+    P_alt.Title AS QuestionTitle,
+    PT_alt.Name AS PostTypeName,
+    UAS_alt.DisplayName AS QuestionOwnerDisplayName,
+    UAS_alt.TotalPostsCreated AS OwnerTotalQuestions,
+    UAS_alt.AvgQuestionScorePosted AS OwnerAvgQuestionScore,
+    PEM_alt.TotalPostVotesReceived AS QuestionTotalVotes,
+    PEM_alt.ActualCommentCountFromCommentsTable AS QuestionTotalComments,
+    PEM_alt.HoursToClose AS QuestionClosureHours,
+    COALESCE(PEM_alt.TotalFavoriteCountByUsers, 0) AS QuestionFavoritesByUsers,
+    COALESCE(PEM_alt.UniqueEditorsCount, 0) AS NumUniqueEditors,
+    RANK() OVER (PARTITION BY P_alt.OwnerUserId ORDER BY P_alt.Score ASC, P_alt.CreationDate ASC) AS OwnerScoreRank, -- Rank by low score
+    AVG(P_alt.ViewCount) OVER (PARTITION BY DATE_TRUNC('quarter', P_alt.CreationDate)) AS QuarterlyAvgViewCount, -- Quarterly average
+    LENGTH(P_alt.Title) AS TitleLength,
+    LOWER(SUBSTRING(P_alt.Title, POSITION(' ' IN P_alt.Title) + 1, 15)) AS TitleSuffixLower, -- Get suffix and make lowercase
+    CASE
+        WHEN P_alt.Score <= 0 AND PEM_alt.ActualCommentCountFromCommentsTable = 0 THEN 'UnansweredLowScore'
+        WHEN P_alt.LastEditDate < P_alt.CreationDate + INTERVAL '1 year' AND P_alt.AnswerCount = 0 THEN 'StagnantQuestion'
+        ELSE 'OlderOther'
+    END AS EngagementCategory,
+    ATM_alt.TaggedPostsCount AS PrimaryTagUsageCount,
+    ATM_alt.AvgTagScore AS PrimaryTagAvgScore,
+    ATM_alt.TagPopularityQuintile,
+    (
+        SELECT AVG(A_alt.Score)
+        FROM Posts A_alt
+        WHERE A_alt.ParentId = P_alt.Id AND A_alt.PostTypeId = 2 AND A_alt.Score > -10
+    ) AS AvgAnswerScore,
+    EXISTS (
+        SELECT 1 FROM PostLinks PL_alt WHERE PL_alt.PostId = P_alt.Id AND PL_alt.LinkTypeId = 1
+    ) AS HasLinkedPosts, -- Check for linked posts instead of duplicates
+    COALESCE(P_alt.FavoriteCount, 0) + COALESCE(PEM_alt.TotalFavoriteCountByUsers, 0) AS CombinedFavoriteMetric,
+    (
+        SELECT AVG(PR_alt.Score)
+        FROM PostLinks PL_inner_alt
+        JOIN Posts PR_alt ON PL_inner_alt.RelatedPostId = PR_alt.Id
+        WHERE PL_inner_alt.PostId = P_alt.Id AND PL_inner_alt.LinkTypeId = 3 -- Average score of duplicated posts
+          AND PR_alt.Score IS NOT NULL AND PR_alt.ViewCount > 100
+    ) AS AvgScoreOfDuplicatedPosts,
+    NULLIF(UAS_alt.DisplayName, 'community wiki') AS OwnerDisplayNameNormalized
+FROM Posts P_alt
+INNER JOIN PostTypes PT_alt ON P_alt.PostTypeId = PT_alt.Id
+LEFT JOIN UserActivitySummary UAS_alt ON P_alt.OwnerUserId = UAS_alt.UserId
+LEFT JOIN PostEngagementMetrics PEM_alt ON P_alt.Id = PEM_alt.PostId
+LEFT JOIN (
+    SELECT
+        PPT.PostId,
+        PPT.TagName,
+        ROW_NUMBER() OVER (PARTITION BY PPT.PostId ORDER BY PPT.TagName) AS rn
+    FROM ParsedPostTags PPT
+) AS FirstTag_alt ON P_alt.Id = FirstTag_alt.PostId AND FirstTag_alt.rn = 1
+LEFT JOIN AggregatedTagMetrics ATM_alt ON FirstTag_alt.TagName = ATM_alt.TagName
+WHERE P_alt.PostTypeId = 1
+  AND P_alt.CreationDate BETWEEN '2015-01-01' AND '2020-12-31' -- Older questions
+  AND P_alt.Score <= 0
+  AND P_alt.AcceptedAnswerId IS NULL
+  AND NOT EXISTS (
+      SELECT 1 FROM Badges B_inner WHERE B_inner.UserId = P_alt.OwnerUserId AND B_inner.Class = 1
+  ) -- Owner does not have any gold badges
+ORDER BY QuestionId, QuestionTitle;

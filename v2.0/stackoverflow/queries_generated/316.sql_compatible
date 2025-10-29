@@ -1,0 +1,383 @@
+with recent_posts as (
+    select
+        p.id,
+        p.posttypeid,
+        cast(p.creationdate as date) as cdate,
+        p.owneruserid,
+        p.score,
+        p.viewcount,
+        p.title,
+        p.tags,
+        coalesce(p.answercount, 0) as answercount,
+        case when p.closeddate is not null then 1 else 0 end as is_closed
+    from posts p
+    where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+),
+user_activity as (
+    select
+        u.id as userid,
+        u.displayname,
+        u.reputation,
+        u.creationdate as user_created,
+        u.location,
+        u.websiteurl,
+        u.upvotes,
+        u.downvotes,
+        u.views,
+        coalesce(b.badge_gold, 0) as badge_gold,
+        coalesce(b.badge_silver, 0) as badge_silver,
+        coalesce(b.badge_bronze, 0) as badge_bronze
+    from users u
+    left join (
+        select
+            "userId" as userid,
+            count(*) filter (where "class" = 1) as badge_gold,
+            count(*) filter (where "class" = 2) as badge_silver,
+            count(*) filter (where "class" = 3) as badge_bronze
+        from badges
+        group by "userId"
+    ) b on b.userid = u.id
+),
+votes_agg as (
+    select
+        v.postid,
+        count(*) filter (where v.votetypeid = 2) as upvotes,
+        count(*) filter (where v.votetypeid = 3) as downvotes,
+        count(*) filter (where v.votetypeid = 1) as accepted_by_originator,
+        count(*) filter (where v.votetypeid = 9) as bounty_close,
+        sum(coalesce(v.bountyamount,0)) filter (where v.votetypeid in (8,9)) as bounty_total
+    from votes v
+    where v.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+    group by v.postid
+),
+comments_agg as (
+    select
+        c.postid,
+        count(*) as comment_count,
+        avg(c.score) as avg_comment_score,
+        max(c.creationdate) as last_comment_at
+    from comments c
+    where c.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+    group by c.postid
+),
+links_agg as (
+    select
+        pl.postid,
+        count(*) filter (where pl.linktypeid = 1) as links_linked,
+        count(*) filter (where pl.linktypeid = 3) as links_duplicates
+    from postlinks pl
+    where pl.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+    group by pl.postid
+),
+tag_expansion as (
+    select
+        rp.id as postid,
+        unnest(string_to_array(substring(rp.tags, 2, greatest(length(rp.tags)-2,0)), '><')) as tagname
+    from recent_posts rp
+    where rp.tags is not null and rp.posttypeid = 1
+),
+tag_rank as (
+    select
+        t.tagname,
+        count(*) as uses_last_year,
+        dense_rank() over (order by count(*) desc) as popularity_rank
+    from tag_expansion t
+    group by t.tagname
+),
+post_quality as (
+    select
+        rp.id,
+        rp.posttypeid,
+        rp.cdate,
+        rp.owneruserid,
+        rp.score,
+        rp.viewcount,
+        rp.title,
+        rp.answercount,
+        rp.is_closed,
+        coalesce(va.upvotes,0) as upvotes,
+        coalesce(va.downvotes,0) as downvotes,
+        coalesce(va.bounty_total,0) as bounty_total,
+        coalesce(ca.comment_count,0) as comment_count,
+        coalesce(ca.avg_comment_score,0) as avg_comment_score,
+        coalesce(la.links_linked,0) as links_linked,
+        coalesce(la.links_duplicates,0) as links_duplicates,
+        case
+            when rp.viewcount is null or rp.viewcount = 0 then null
+            else round((cast(rp.score as numeric) + coalesce(va.upvotes,0) - coalesce(va.downvotes,0) + least(coalesce(va.bounty_total,0)/50.0, 10)) / greatest(rp.viewcount,1), 6)
+        end as engagement_score
+    from recent_posts rp
+    left join votes_agg va on va.postid = rp.id
+    left join comments_agg ca on ca.postid = rp.id
+    left join links_agg la on la.postid = rp.id
+),
+accepted_answers as (
+    select
+        q.id as question_id,
+        q.acceptedanswerid as answer_id,
+        a.score as answer_score,
+        a.owneruserid as answer_owner
+    from posts q
+    join posts a on a.id = q.acceptedanswerid
+    where q.posttypeid = 1
+),
+edit_events as (
+    select
+        ph.postid,
+        count(*) filter (where ph.posthistorytypeid in (4,5,6,7,8,9,24)) as edit_count,
+        max(ph.creationdate) as last_edit_at,
+        count(*) filter (where ph.posthistorytypeid in (10)) as close_votes,
+        count(*) filter (where ph.posthistorytypeid in (11)) as reopen_votes
+    from posthistory ph
+    where ph.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+    group by ph.postid
+),
+user_contrib as (
+    select
+        ua.userid,
+        count(*) filter (where rp.posttypeid = 1) as questions_count,
+        count(*) filter (where rp.posttypeid = 2) as answers_count,
+        sum(coalesce(pq.upvotes,0)) as total_up_on_posts,
+        sum(coalesce(pq.downvotes,0)) as total_down_on_posts,
+        sum(coalesce(pq.bounty_total,0)) as total_bounty_on_posts,
+        avg(nullif(pq.engagement_score,0)) as avg_engagement_nonzero
+    from user_activity ua
+    left join recent_posts rp on rp.owneruserid = ua.userid
+    left join post_quality pq on pq.id = rp.id
+    group by ua.userid
+),
+question_tag_stats as (
+    select
+        te.postid,
+        string_agg(te.tagname, ',' order by tr.popularity_rank) as tags_by_popularity,
+        max(case when tr.popularity_rank <= 10 then 1 else 0 end) as has_top10_tag
+    from tag_expansion te
+    left join tag_rank tr on tr.tagname = te.tagname
+    group by te.postid
+),
+post_fact as (
+    select
+        pq.id as postid,
+        pq.posttypeid,
+        pq.cdate,
+        pq.title,
+        pq.score,
+        pq.viewcount,
+        pq.answercount,
+        pq.is_closed,
+        pq.upvotes,
+        pq.downvotes,
+        pq.bounty_total,
+        pq.comment_count,
+        pq.avg_comment_score,
+        pq.links_linked,
+        pq.links_duplicates,
+        pq.engagement_score,
+        coalesce(ee.edit_count,0) as edit_count,
+        ee.last_edit_at,
+        coalesce(ee.close_votes,0) as close_votes,
+        coalesce(ee.reopen_votes,0) as reopen_votes,
+        ua.userid,
+        ua.displayname,
+        ua.reputation,
+        ua.location,
+        ua.websiteurl,
+        ua.badge_gold,
+        ua.badge_silver,
+        ua.badge_bronze,
+        uc.questions_count,
+        uc.answers_count,
+        uc.total_up_on_posts,
+        uc.total_down_on_posts,
+        uc.total_bounty_on_posts,
+        uc.avg_engagement_nonzero,
+        qts.tags_by_popularity,
+        qts.has_top10_tag
+    from post_quality pq
+    left join edit_events ee on ee.postid = pq.id
+    left join user_activity ua on ua.userid = pq.owneruserid
+    left join user_contrib uc on uc.userid = pq.owneruserid
+    left join question_tag_stats qts on qts.postid = pq.id
+),
+rolling_user_stats as (
+    select
+        pf.userid,
+        pf.postid,
+        (
+            select avg(score) from post_fact pf2
+            where pf2.userid = pf.userid
+              and pf2.cdate between pf.cdate - interval '30 days' and pf.cdate
+        ) as user_avg_score_30d,
+        (
+            select sum(case when pf2.posttypeid = 2 then 1 else 0 end)
+            from post_fact pf2
+            where pf2.userid = pf.userid
+              and pf2.cdate between pf.cdate - interval '90 days' and pf.cdate
+        ) as user_answers_90d
+    from post_fact pf
+),
+post_windows as (
+    select
+        pf.postid,
+        pf.posttypeid,
+        pf.cdate,
+        pf.title,
+        pf.score,
+        pf.viewcount,
+        pf.answercount,
+        pf.is_closed,
+        pf.upvotes,
+        pf.downvotes,
+        pf.bounty_total,
+        pf.comment_count,
+        pf.avg_comment_score,
+        pf.links_linked,
+        pf.links_duplicates,
+        pf.engagement_score,
+        pf.edit_count,
+        pf.last_edit_at,
+        pf.close_votes,
+        pf.reopen_votes,
+        pf.userid,
+        pf.displayname,
+        pf.reputation,
+        pf.location,
+        pf.websiteurl,
+        pf.badge_gold,
+        pf.badge_silver,
+        pf.badge_bronze,
+        pf.questions_count,
+        pf.answers_count,
+        pf.total_up_on_posts,
+        pf.total_down_on_posts,
+        pf.total_bounty_on_posts,
+        pf.avg_engagement_nonzero,
+        pf.tags_by_popularity,
+        pf.has_top10_tag,
+        row_number() over (partition by coalesce(pf.userid, -1) order by pf.score desc NULLS LAST) as rn_byuser_score_desc,
+        rank() over (order by coalesce(pf.engagement_score, -1) desc NULLS LAST) as rnk_site_engagement,
+        avg(coalesce(pf.score,0)) over (partition by pf.posttypeid) as avg_score_by_type,
+        -- compute p90 without ordered-set aggregate by using percentile_cont as window over an aggregate subquery
+        nullif(percentile_cont(0.9) within group (order by coalesce(pf.viewcount,0)) over (), 0) as p90_views_sitewide
+    from post_fact pf
+),
+notable_posts as (
+    select postid from post_windows
+    where (rnk_site_engagement <= 100 or rn_byuser_score_desc <= 3)
+    union
+    select pf.postid
+    from post_windows pf
+    where pf.has_top10_tag = 1
+      and pf.score >= coalesce(pf.avg_score_by_type,0) + 2
+),
+close_reasons as (
+    select
+        ph.postid,
+        max(crt.name) as close_reason_name
+    from posthistory ph
+    left join closerreasontypes crt on crt.id = cast(nullif(ph.comment, '') as integer)
+    where ph.posthistorytypeid = 10
+    group by ph.postid
+),
+duplicate_map as (
+    select
+        pl.postid as dup_question_id,
+        pl.relatedpostid as canonical_id
+    from postlinks pl
+    where pl.linktypeid = 3
+),
+answer_owner_stats as (
+    select
+        aa.question_id,
+        ua.displayname as accepted_answer_owner,
+        ua.reputation as accepted_answer_owner_rep,
+        aa.answer_score
+    from accepted_answers aa
+    left join users ua on ua.id = aa.answer_owner
+)
+select
+    pf.postid,
+    pf.posttypeid,
+    pf.cdate,
+    pf.title,
+    pf.score,
+    pf.viewcount,
+    pf.answercount,
+    pf.is_closed,
+    pf.upvotes,
+    pf.downvotes,
+    pf.bounty_total,
+    pf.comment_count,
+    pf.avg_comment_score,
+    pf.links_linked,
+    pf.links_duplicates,
+    pf.engagement_score,
+    pf.edit_count,
+    pf.last_edit_at,
+    pf.close_votes,
+    pf.reopen_votes,
+    pf.userid,
+    pf.displayname,
+    pf.reputation,
+    pf.location,
+    pf.websiteurl,
+    pf.badge_gold,
+    pf.badge_silver,
+    pf.badge_bronze,
+    pf.questions_count,
+    pf.answers_count,
+    pf.total_up_on_posts,
+    pf.total_down_on_posts,
+    pf.total_bounty_on_posts,
+    pf.avg_engagement_nonzero,
+    pf.tags_by_popularity,
+    pf.has_top10_tag,
+    rus.user_avg_score_30d,
+    rus.user_answers_90d,
+    pw.rnk_site_engagement,
+    pw.rn_byuser_score_desc,
+    pw.avg_score_by_type,
+    pw.p90_views_sitewide,
+    case when np.postid is not null then 1 else 0 end as is_notable,
+    cr.close_reason_name,
+    dm.canonical_id as duplicate_of,
+    aos.accepted_answer_owner,
+    aos.accepted_answer_owner_rep,
+    aos.answer_score as accepted_answer_score,
+    case
+        when pf.is_closed = 1 and coalesce(pf.close_votes,0) > coalesce(pf.reopen_votes,0) then 'closed_majority'
+        when pf.is_closed = 1 then 'closed_other'
+        when pf.score >= 5 and coalesce(pf.engagement_score,0) > 0.01 then 'hot'
+        when pf.links_duplicates > 0 then 'duplicate_linked'
+        else 'regular'
+    end as post_status_bucket,
+    trim(both ' ' from coalesce(pf.displayname, '[unknown]')) || ' (#' || coalesce(cast(pf.userid as text), 'NA') || ')' as user_label,
+    nullif(split_part(coalesce(pf.location,''), ',', 1), '') as location_primary,
+    greatest(coalesce(pf.score, -1000000), coalesce(pf.upvotes - pf.downvotes, -1000000)) as score_like,
+    substring((
+        select string_agg(left(c.text, 50), ' | ' order by c.creationdate)
+        from comments c
+        where c.postid = pf.postid
+        limit 3
+    ), 1, 200) as first_comments_snippet
+from post_windows pw
+join post_fact pf on pf.postid = pw.postid
+left join rolling_user_stats rus on rus.postid = pf.postid
+left join notable_posts np on np.postid = pf.postid
+left join close_reasons cr on cr.postid = pf.postid
+left join duplicate_map dm on dm.dup_question_id = pf.postid
+left join answer_owner_stats aos on aos.question_id = pf.postid
+where
+    (
+        (pf.posttypeid in (1,2) and coalesce(pf.viewcount,0) >= pw.p90_views_sitewide)
+        or (pf.engagement_score is not null and pf.engagement_score > 0.02 and pf.comment_count >= 2)
+        or (pf.is_closed = 1 and pf.close_votes >= 1)
+    )
+    and not (pf.links_duplicates > 0 and pf.score < 0)
+    and (pf.title is null or char_length(pf.title) between 10 and 280)
+order by
+    is_notable desc,
+    pw.rnk_site_engagement NULLS LAST,
+    pf.score desc NULLS LAST,
+    pf.viewcount desc NULLS LAST
+limit 500;

@@ -1,0 +1,118 @@
+WITH RankedUserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        AVG(p.Score) AS AveragePostScore,
+        MAX(p.CreationDate) AS LatestPostDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, COUNT(DISTINCT p.Id) DESC) AS RankByReputationAndPostCount,
+        SUM(CASE WHEN c.Id IS NOT NULL THEN 1 ELSE 0 END) AS CommentCount,
+        AVG(c.Score) AS AverageCommentScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId AND p.Id = c.PostId
+    WHERE u.CreationDate >= DATE '2020-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(DISTINCT p.Id) > 10 OR COUNT(DISTINCT c.Id) > 50
+),
+TagPopularity AS (
+    SELECT
+        t.TagName,
+        COUNT(p.Id) AS TaggedPostCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TaggedQuestionCount,
+        AVG(p.Score) AS AverageTaggedQuestionScore,
+        ROW_NUMBER() OVER (ORDER BY COUNT(p.Id) DESC) AS TagRank
+    FROM Tags t
+    JOIN Posts p ON (',' || REPLACE(p.Tags, '><', ',') || ',') LIKE ('%,' || t.TagName || ',%')
+    WHERE p.PostTypeId = 1
+    GROUP BY t.TagName
+    HAVING COUNT(p.Id) > 1000
+),
+HighEngagementPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.AnswerCount,
+        p.CommentCount,
+        CASE
+            WHEN p.Score > 50 THEN 'Very High'
+            WHEN p.Score > 10 THEN 'High'
+            ELSE 'Medium'
+        END AS EngagementLevel,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate DESC) AS PostActivityRank
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.ClosedDate IS NULL AND p.CommunityOwnedDate IS NULL
+),
+UserPostSummary AS (
+    SELECT
+        rua.UserId,
+        rua.DisplayName,
+        rua.Reputation,
+        rua.PostCount,
+        rua.AveragePostScore,
+        COALESCE(hep.PostId, -1) AS TopPostId,
+        COALESCE(hep.Title, 'No High Engagement Posts') AS TopPostTitle,
+        COALESCE(hep.Score, 0) AS TopPostScore,
+        COALESCE(hep.EngagementLevel, 'N/A') AS TopPostEngagement
+    FROM RankedUserActivity rua
+    LEFT JOIN HighEngagementPosts hep ON rua.UserId = hep.OwnerUserId AND hep.PostActivityRank = 1
+    WHERE rua.RankByReputationAndPostCount <= 100
+),
+UserTagMatches AS (
+    -- derive explicit mapping of users to tags to allow join on tag rank
+    SELECT DISTINCT
+        p_inner.OwnerUserId AS UserId,
+        t_inner.TagName
+    FROM Posts p_inner
+    JOIN Tags t_inner ON (',' || REPLACE(p_inner.Tags, '><', ',') || ',') LIKE ('%,' || t_inner.TagName || ',%')
+)
+SELECT
+    ups.UserId,
+    ups.DisplayName,
+    ups.Reputation,
+    ups.PostCount,
+    ups.AveragePostScore,
+    ups.TopPostId,
+    ups.TopPostTitle,
+    ups.TopPostScore,
+    ups.TopPostEngagement,
+    tp.TagName,
+    tp.TaggedPostCount,
+    tp.AverageTaggedQuestionScore,
+    CASE
+        WHEN ups.Reputation >= 100000 AND tp.TagRank <= 5 THEN 'Elite User & Popular Tag'
+        WHEN ups.Reputation >= 50000 THEN 'High Reputation User'
+        WHEN tp.TagRank <= 10 THEN 'Popular Tag Contributor'
+        ELSE 'Standard User'
+    END AS UserCategory
+FROM UserPostSummary ups
+LEFT JOIN UserTagMatches utm ON utm.UserId = ups.UserId
+LEFT JOIN TagPopularity tp ON tp.TagName = utm.TagName
+WHERE ups.Reputation > 1000 OR ups.PostCount > 500
+
+UNION ALL
+
+SELECT
+    NULL::bigint AS UserId,
+    'Community User' AS DisplayName,
+    0 AS Reputation,
+    COUNT(p.Id) AS PostCount,
+    AVG(p.Score) AS AveragePostScore,
+    MAX(p.Id) AS TopPostId,
+    MAX(p.Title) AS TopPostTitle,
+    MAX(p.Score) AS TopPostScore,
+    'N/A' AS TopPostEngagement,
+    'N/A' AS TagName,
+    COUNT(p.Id) AS TaggedPostCount,
+    AVG(p.Score) AS AverageTaggedQuestionScore,
+    'Community Driven' AS UserCategory
+FROM Posts p
+WHERE p.OwnerUserId = -1 AND p.CreationDate BETWEEN DATE '2021-01-01' AND DATE '2023-12-31'
+
+ORDER BY Reputation DESC NULLS LAST, TagName NULLS LAST;

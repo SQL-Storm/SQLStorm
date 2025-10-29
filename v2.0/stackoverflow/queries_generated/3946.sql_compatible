@@ -1,0 +1,191 @@
+WITH
+UserActivity AS (
+    SELECT
+        u.Id                                           AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(pq.QuestionCnt,0)                      AS QuestionCount,
+        COALESCE(pq.AnswerCnt,0)                        AS AnswerCount,
+        COALESCE(bc.BadgeCnt,0)                         AS BadgeCount,
+        COALESCE(vc.VoteCnt,0)                          AS VoteCount,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank
+    FROM Users u
+    LEFT JOIN (
+        SELECT
+            OwnerUserId,
+            SUM(CASE WHEN PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCnt,
+            SUM(CASE WHEN PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCnt
+        FROM Posts
+        GROUP BY OwnerUserId
+    ) pq ON pq.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT UserId, COUNT(*) AS BadgeCnt
+        FROM Badges
+        GROUP BY UserId
+    ) bc ON bc.UserId = u.Id
+    LEFT JOIN (
+        SELECT p.OwnerUserId, COUNT(v.Id) AS VoteCnt
+        FROM Votes v
+        JOIN Posts p ON p.Id = v.PostId
+        WHERE v.VoteTypeId IN (2,3)
+        GROUP BY p.OwnerUserId
+    ) vc ON vc.OwnerUserId = u.Id
+),
+
+UserRecentActivity AS (
+    SELECT
+        u.Id                                               AS UserId,
+        (SELECT MAX(p.CreationDate)
+         FROM Posts p
+         WHERE p.OwnerUserId = u.Id)                       AS LastPostDate,
+        (SELECT MAX(c.CreationDate)
+         FROM Comments c
+         WHERE c.UserId = u.Id)                            AS LastCommentDate,
+        (SELECT MAX(v.CreationDate)
+         FROM Votes v
+         WHERE v.UserId = u.Id)                            AS LastVoteDate
+    FROM Users u
+),
+
+TopTags AS (
+    SELECT
+        t.TagName,
+        t.Count                                            AS TagUseCount,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC)         AS TagRank
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0
+    ORDER BY t.Count DESC
+    LIMIT 20
+),
+
+TagCoOccurrence AS (
+    SELECT
+        ta.Tag   AS TagA,
+        tb.Tag   AS TagB,
+        COUNT(*) AS CoCount
+    FROM Posts p
+    CROSS JOIN LATERAL (
+        SELECT UNNEST(string_to_array(substr(p.Tags,2,length(p.Tags)-2),'><')) AS Tag
+    ) ta
+    CROSS JOIN LATERAL (
+        SELECT UNNEST(string_to_array(substr(p.Tags,2,length(p.Tags)-2),'><')) AS Tag
+    ) tb
+    WHERE ta.Tag < tb.Tag
+    GROUP BY ta.Tag, tb.Tag
+    HAVING COUNT(*) > 10
+),
+
+RecentClosedDuplicates AS (
+    SELECT
+        ph.PostId,
+        ph.CreationDate                     AS CloseDate,
+        ph.Comment                          AS CloseReasonId,
+        ph.Text                             AS DuplicateInfo,
+        pl.RelatedPostId                    AS DuplicateOf,
+        pl.CreationDate                     AS DuplicateLinkDate
+    FROM PostHistory ph
+    JOIN PostLinks pl
+      ON pl.PostId = ph.PostId
+     AND pl.LinkTypeId = 3
+    WHERE ph.PostHistoryTypeId = 10
+      AND ph.Comment = '101'
+      AND ph.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days'
+),
+
+AggregatedScores AS (
+    SELECT
+        p.OwnerUserId,
+        SUM(COALESCE(p.Score,0))                 AS TotalScore,
+        ROUND(AVG(p.Score),2)                    AS AvgScore,
+        MAX(p.Score)                             AS MaxScore,
+        MIN(p.Score)                             AS MinScore
+    FROM Posts p
+    WHERE p.PostTypeId IN (1,2)
+    GROUP BY p.OwnerUserId
+)
+
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.RepRank,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.BadgeCount,
+    ua.VoteCount,
+    COALESCE(ascr.TotalScore,0)               AS TotalScore,
+    COALESCE(ascr.AvgScore,0)                 AS AvgScore,
+    ascr.MaxScore,
+    ascr.MinScore,
+    ur.LastPostDate,
+    ur.LastCommentDate,
+    ur.LastVoteDate,
+    CASE
+        WHEN ur.LastPostDate IS NULL
+         AND ur.LastCommentDate IS NULL
+         AND ur.LastVoteDate IS NULL                 THEN 'Never Active'
+        WHEN GREATEST(COALESCE(ur.LastPostDate, TIMESTAMP '1970-01-01'),
+                      COALESCE(ur.LastCommentDate, TIMESTAMP '1970-01-01'),
+                      COALESCE(ur.LastVoteDate, TIMESTAMP '1970-01-01')) > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days'
+                                                       THEN 'Active'
+        ELSE                                             'Dormant'
+    END                                          AS ActivityStatus,
+    tt.TagName,
+    tt.TagUseCount,
+    tt.TagRank
+FROM UserActivity ua
+LEFT JOIN AggregatedScores ascr
+       ON ascr.OwnerUserId = ua.UserId
+LEFT JOIN UserRecentActivity ur
+       ON ur.UserId = ua.UserId
+LEFT JOIN (
+    SELECT
+        p.OwnerUserId                AS UserId,
+        MIN(tt.TagName)              AS TagName,
+        MIN(tt.TagUseCount)          AS TagUseCount,
+        MIN(tt.TagRank)              AS TagRank
+    FROM Posts p
+    CROSS JOIN LATERAL (
+        SELECT UNNEST(string_to_array(substr(p.Tags,2,length(p.Tags)-2),'><')) AS Tag
+    ) pt
+    JOIN TopTags tt ON tt.TagName = pt.Tag
+    WHERE p.PostTypeId = 1
+    GROUP BY p.OwnerUserId
+) tt ON tt.UserId = ua.UserId
+WHERE ua.RepRank <= 1000
+ORDER BY ua.RepRank
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,
+    NULL,NULL,NULL,'--- Separator ---',NULL,NULL,NULL
+FROM (SELECT 1) s
+
+UNION ALL
+
+SELECT
+    rc.PostId            AS UserId,
+    NULL                AS DisplayName,
+    NULL                AS Reputation,
+    NULL                AS RepRank,
+    NULL                AS QuestionCount,
+    NULL                AS AnswerCount,
+    NULL                AS BadgeCount,
+    NULL                AS VoteCount,
+    NULL                AS TotalScore,
+    NULL                AS AvgScore,
+    NULL                AS MaxScore,
+    NULL                AS MinScore,
+    rc.CloseDate        AS LastPostDate,
+    rc.DuplicateLinkDate AS LastCommentDate,
+    NULL                AS LastVoteDate,
+    CASE WHEN rc.DuplicateOf IS NOT NULL THEN 'Duplicate' ELSE 'Closed' END
+                         AS ActivityStatus,
+    NULL                AS TagName,
+    NULL                AS TagUseCount,
+    NULL                AS TagRank
+FROM RecentClosedDuplicates rc
+ORDER BY RepRank NULLS LAST, CloseDate DESC
+LIMIT 200;

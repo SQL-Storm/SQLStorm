@@ -1,0 +1,261 @@
+-- {"query": "544.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2510} 
+with
+-- Recent questions with tag arrays
+recent_questions as (
+    select
+        p.Id as QuestionId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        coalesce(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'), array[]::varchar[]) as tag_arr,
+        p.Title
+    from Posts p
+    where p.PostTypeId = 1
+      and p.CreationDate >= now() - interval '365 days'
+),
+-- Answers to recent questions with answerer/user info
+answers as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId as AnswerOwnerId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerDate
+    from Posts a
+    where a.PostTypeId = 2
+),
+-- Per-question vote aggregates with NULL-safe handling
+question_votes as (
+    select
+        v.PostId as QuestionId,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+        sum(case when v.VoteTypeId = 5 then 1 else 0 end) as Favorites
+    from Votes v
+    group by v.PostId
+),
+-- Extract duplicates and linked relations
+links as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.LinkTypeId,
+        lt.Name as LinkTypeName,
+        pl.CreationDate
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+),
+-- Close reasons derived from PostHistory (latest per question)
+latest_close as (
+    select distinct on (ph.PostId)
+        ph.PostId as QuestionId,
+        ph.CreationDate as ClosedAt,
+        cast(nullif(ph.Comment, '') as int) as CloseReasonId
+    from PostHistory ph
+    where ph.PostHistoryTypeId = 10
+    order by ph.PostId, ph.CreationDate desc
+),
+close_reason_lu as (
+    select crt.Id, crt.Name
+    from CloseReasonTypes crt
+),
+-- User stats snapshot
+user_stats as (
+    select
+        u.Id as UserId,
+        u.Reputation,
+        u.UpVotes,
+        u.DownVotes,
+        u.Views as ProfileViews,
+        date_part('year', age(now(), u.CreationDate))::int as AccountAgeYears,
+        coalesce(nullif(trim(u.Location), ''), 'Unknown') as LocationNorm
+    from Users u
+),
+-- Badge density per user (window and conditional)
+badge_density as (
+    select
+        b.UserId,
+        count(*) as BadgeCount,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldCount,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverCount,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeCount,
+        min(b.Date) as FirstBadgeAt,
+        max(b.Date) as LastBadgeAt
+    from Badges b
+    group by b.UserId
+),
+-- Text features from titles (simple string ops)
+title_features as (
+    select
+        rq.QuestionId,
+        length(coalesce(rq.Title,'')) as TitleLen,
+        (regexp_count(coalesce(rq.Title,''), '\?')) as QuestionMarks,
+        (regexp_count(coalesce(rq.Title,''), '!')) as Exclamations,
+        (case when rq.Title ~* '\bhow to\b' then 1 else 0 end) as HasHowTo
+    from recent_questions rq
+),
+-- Answer metrics per question (windowed)
+answer_metrics as (
+    select
+        a.QuestionId,
+        count(*) as AnswerCount,
+        max(a.AnswerScore) as MaxAnswerScore,
+        sum(case when a.AnswerScore > 0 then 1 else 0 end) as PositiveAnswers,
+        min(a.AnswerDate) as FirstAnswerAt
+    from answers a
+    group by a.QuestionId
+),
+-- Compute tag popularity ranks (explode tags)
+tag_usage as (
+    select
+        unnest(rq.tag_arr) as tag_name,
+        count(*) as q_count
+    from recent_questions rq
+    group by 1
+),
+tag_ranks as (
+    select
+        tu.tag_name,
+        tu.q_count,
+        dense_rank() over (order by tu.q_count desc, tu.tag_name) as tag_pop_rank
+    from tag_usage tu
+),
+-- Cross join questions with exploded tags to get per-question tag rank signal
+question_tag_signal as (
+    select
+        rq.QuestionId,
+        avg(tr.tag_pop_rank)::numeric(10,2) as avg_tag_rank,
+        min(tr.tag_pop_rank) as best_tag_rank,
+        count(*) as tag_count
+    from recent_questions rq
+    left join lateral unnest(rq.tag_arr) t(tag_name) on true
+    left join tag_ranks tr on tr.tag_name = t.tag_name
+    group by rq.QuestionId
+),
+-- Combine everything for scoring
+base as (
+    select
+        rq.QuestionId,
+        rq.CreationDate,
+        rq.Score as QScore,
+        rq.ViewCount,
+        us.OwnerUserId,
+        coalesce(qv.UpVotes,0) as QUp,
+        coalesce(qv.DownVotes,0) as QDown,
+        coalesce(qv.Favorites,0) as QFav,
+        lm.ClosedAt,
+        cr.Name as CloseReason,
+        tf.TitleLen,
+        tf.QuestionMarks,
+        tf.Exclamations,
+        tf.HasHowTo,
+        am.AnswerCount,
+        coalesce(am.MaxAnswerScore, 0) as MaxAnswerScore,
+        coalesce(am.PositiveAnswers, 0) as PositiveAnswers,
+        am.FirstAnswerAt,
+        qts.avg_tag_rank,
+        qts.best_tag_rank,
+        qts.tag_count,
+        us2.Reputation as OwnerReputation,
+        us2.AccountAgeYears as OwnerAgeYears,
+        coalesce(bd.BadgeCount,0) as OwnerBadges,
+        coalesce(bd.GoldCount,0) as OwnerGold,
+        coalesce(bd.SilverCount,0) as OwnerSilver,
+        coalesce(bd.BronzeCount,0) as OwnerBronze,
+        us2.LocationNorm as OwnerLocation
+    from recent_questions rq
+    left join LATERAL (select rq.OwnerUserId) us on true
+    left join question_votes qv on qv.QuestionId = rq.QuestionId
+    left join latest_close lm on lm.QuestionId = rq.QuestionId
+    left join close_reason_lu cr on cr.Id = lm.CloseReasonId
+    left join title_features tf on tf.QuestionId = rq.QuestionId
+    left join answer_metrics am on am.QuestionId = rq.QuestionId
+    left join question_tag_signal qts on qts.QuestionId = rq.QuestionId
+    left join Users us2 on us2.Id = rq.OwnerUserId
+    left join badge_density bd on bd.UserId = rq.OwnerUserId
+),
+-- Enrich with linkage info: duplicates and general links
+link_agg as (
+    select
+        l.PostId as QuestionId,
+        sum(case when l.LinkTypeId = 3 then 1 else 0 end) as DupLinks,
+        sum(case when l.LinkTypeId = 1 then 1 else 0 end) as RefLinks,
+        max(case when l.LinkTypeId = 3 then l.CreationDate end) as LastDupLinkAt
+    from links l
+    group by l.PostId
+),
+-- Comment sentiment proxy via score and length
+comment_agg as (
+    select
+        c.PostId as QuestionId,
+        count(*) as CommentCount,
+        coalesce(sum(c.Score),0) as CommentScoreSum,
+        avg(length(c.Text))::int as AvgCommentLen
+    from Comments c
+    group by c.PostId
+),
+-- Time to first answer in hours (correlated to base)
+response_time as (
+    select
+        b.QuestionId,
+        extract(epoch from (coalesce(b.FirstAnswerAt, b.CreationDate) - b.CreationDate))/3600.0 as HoursToFirstAnswer
+    from base b
+),
+-- Final scoring with window functions and null logic
+scored as (
+    select
+        b.*,
+        coalesce(la.DupLinks,0) as DupLinks,
+        coalesce(la.RefLinks,0) as RefLinks,
+        la.LastDupLinkAt,
+        coalesce(ca.CommentCount,0) as CommentCount,
+        coalesce(ca.CommentScoreSum,0) as CommentScoreSum,
+        coalesce(ca.AvgCommentLen,0) as AvgCommentLen,
+        rt.HoursToFirstAnswer,
+        -- Composite score blending engagement and quality signals
+        (
+            0.30 * ln(1 + coalesce(b.ViewCount,0)) +
+            0.25 * coalesce(b.QUp - b.QDown,0) +
+            0.20 * coalesce(b.QFav,0) +
+            0.15 * coalesce(b.AnswerCount,0) +
+            0.10 * greatest(0, coalesce(b.MaxAnswerScore,0)) -
+            0.10 * coalesce(best_tag_rank, 100)::numeric +
+            0.05 * (case when b.HasHowTo = 1 then 3 else 0 end) -
+            0.05 * (case when b.ClosedAt is not null then 5 else 0 end) +
+            0.03 * coalesce(ca.CommentScoreSum,0) -
+            0.02 * coalesce(ca.AvgCommentLen,0)/100.0
+        )::numeric(12,4) as CompositeScore
+    from base b
+    left join link_agg la on la.QuestionId = b.QuestionId
+    left join comment_agg ca on ca.QuestionId = b.QuestionId
+    left join response_time rt on rt.QuestionId = b.QuestionId
+),
+-- Rank and bucket
+ranked as (
+    select
+        s.*,
+        row_number() over (order by s.CompositeScore desc nulls last, s.QuestionId) as rn,
+        dense_rank() over (order by s.CompositeScore desc nulls last) as dr,
+        ntile(10) over (order by s.CompositeScore desc nulls last) as decile
+    from scored s
+)
+select
+    r.QuestionId,
+    r.CompositeScore,
+    r.decile as ScoreDecile,
+    r.QScore,
+    r.ViewCount,
+    r.QUp, r.QDown, r.QFav,
+    r.AnswerCount, r.MaxAnswerScore, r.PositiveAnswers,
+    round(coalesce(r.HoursToFirstAnswer, 0)::numeric, 2) as HoursToFirstAnswer,
+    r.TitleLen, r.QuestionMarks, r.Exclamations, r.HasHowTo,
+    r.avg_tag_rank, r.best_tag_rank, r.tag_count,
+    r.DupLinks, r.RefLinks,
+    r.CommentCount, r.CommentScoreSum, r.AvgCommentLen,
+    r.ClosedAt, coalesce(r.CloseReason, 'N/A') as CloseReason,
+    r.OwnerUserId, r.OwnerReputation, r.OwnerAgeYears, r.OwnerBadges, r.OwnerGold, r.OwnerSilver, r.OwnerBronze, r.OwnerLocation
+from ranked r
+where r.decile in (1,2,3,4,5,6,7,8,9,10) -- keep all deciles to stress sorting/windowing, filter still applied
+order by r.CompositeScore desc nulls last, r.QuestionId
+limit 500;

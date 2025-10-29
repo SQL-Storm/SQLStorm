@@ -1,0 +1,227 @@
+WITH UserActivity AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY MAX(p.CreationDate) DESC) as RowNum,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+                CAST(SUM(p.Score) AS NUMERIC) / NULLIF(COUNT(DISTINCT p.Id), 0)
+            ELSE 0 
+        END as AvgPostScore,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags)-2)), ', ') as AllTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= TIMESTAMP '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        PostCount,
+        CommentCount,
+        BadgeCount,
+        LastPostDate,
+        LastCommentDate,
+        AvgPostScore,
+        AllTags,
+        RANK() OVER (ORDER BY Reputation DESC, PostCount DESC) as ReputationRank,
+        DENSE_RANK() OVER (ORDER BY AvgPostScore DESC) as ScoreRank
+    FROM UserActivity
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount as PostCommentCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        p.Tags,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END as PostType,
+        CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END as HasAcceptedAnswer,
+        CAST((EXTRACT(EPOCH FROM (COALESCE(p.ClosedDate, TIMESTAMP '2024-10-01 12:34:56') - p.CreationDate)) / 86400) AS INTEGER) as DaysSinceCreation,
+        CASE 
+            WHEN p.Score > 100 THEN 'Highly Voted'
+            WHEN p.Score > 50 THEN 'Moderately Voted'
+            WHEN p.Score > 0 THEN 'Low Voted'
+            ELSE 'No Votes'
+        END as VoteCategory,
+        CASE 
+            WHEN p.AnswerCount = 0 THEN 'No Answers'
+            WHEN p.AnswerCount < 3 THEN 'Few Answers'
+            WHEN p.AnswerCount < 10 THEN 'Moderate Answers'
+            ELSE 'Many Answers'
+        END as AnswerCategory,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as UserPostRank
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.CreationDate >= TIMESTAMP '2010-01-01'
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 500 THEN 'Moderate'
+            WHEN t.Count > 100 THEN 'Niche'
+            ELSE 'Rare'
+        END as PopularityCategory,
+        (CAST(t.Count AS NUMERIC) / NULLIF((SELECT MAX(tt.Count) FROM Tags tt), 0)) * 100 as PercentileRank
+    FROM Tags t
+),
+OverallStats AS (
+    SELECT 
+        'Overall Statistics' as Category,
+        COUNT(DISTINCT u.Id) as TotalUsers,
+        COUNT(DISTINCT p.Id) as TotalPosts,
+        COUNT(DISTINCT c.Id) as TotalComments,
+        COUNT(DISTINCT b.Id) as TotalBadges,
+        COUNT(DISTINCT t.Id) as TotalTags,
+        NULL::TEXT as UserId,
+        NULL::TEXT as DisplayName,
+        NULL::NUMERIC as Reputation,
+        1 as ord
+    FROM Users u
+    FULL JOIN Posts p ON 1=1
+    FULL JOIN Comments c ON 1=1
+    FULL JOIN Badges b ON 1=1
+    FULL JOIN Tags t ON 1=1
+),
+TopUsersOut AS (
+    SELECT 
+        'Top Performing Users' as Category,
+        NULL as TotalUsers,
+        NULL as TotalPosts,
+        NULL as TotalComments,
+        NULL as TotalBadges,
+        NULL as TotalTags,
+        CAST(tu.UserId AS TEXT) as UserId,
+        tu.DisplayName,
+        CAST(tu.Reputation AS NUMERIC) as Reputation,
+        2 as ord
+    FROM TopUsers tu
+    WHERE tu.ReputationRank <= 10
+),
+HighScorePostsOut AS (
+    SELECT 
+        'High Score Posts' as Category,
+        NULL as TotalUsers,
+        NULL as TotalPosts,
+        NULL as TotalComments,
+        NULL as TotalBadges,
+        NULL as TotalTags,
+        CAST(pa.PostId AS TEXT) as UserId,
+        pa.Title as DisplayName,
+        CAST(pa.Score AS NUMERIC) as Reputation,
+        3 as ord
+    FROM PostAnalysis pa
+    WHERE pa.VoteCategory = 'Highly Voted'
+    ORDER BY pa.Score DESC
+    LIMIT 10
+),
+PopularTagsOut AS (
+    SELECT 
+        'Popular Tags Analysis' as Category,
+        NULL as TotalUsers,
+        NULL as TotalPosts,
+        NULL as TotalComments,
+        NULL as TotalBadges,
+        NULL as TotalTags,
+        ta.TagName as UserId,
+        ta.TagName as DisplayName,
+        CAST(ta.Count AS NUMERIC) as Reputation,
+        4 as ord
+    FROM TagAnalysis ta
+    WHERE ta.PopularityCategory = 'Popular'
+    ORDER BY ta.Count DESC
+    LIMIT 15
+),
+UserActivityOut AS (
+    SELECT 
+        'User Activity Summary' as Category,
+        NULL as TotalUsers,
+        NULL as TotalPosts,
+        NULL as TotalComments,
+        NULL as TotalBadges,
+        NULL as TotalTags,
+        CAST(ua.UserId AS TEXT) as UserId,
+        ua.DisplayName,
+        CAST(ua.Reputation AS NUMERIC) as Reputation,
+        5 as ord
+    FROM UserActivity ua
+    WHERE ua.PostCount > 100 AND ua.CommentCount > 50
+    ORDER BY ua.Reputation DESC
+    LIMIT 5
+),
+QuestionAnalysisOut AS (
+    SELECT 
+        'Question Analysis' as Category,
+        NULL as TotalUsers,
+        NULL as TotalPosts,
+        NULL as TotalComments,
+        NULL as TotalBadges,
+        NULL as TotalTags,
+        CAST(pa.PostId AS TEXT) as UserId,
+        pa.Title as DisplayName,
+        CAST(pa.AnswerCount AS NUMERIC) as Reputation,
+        6 as ord
+    FROM PostAnalysis pa
+    WHERE pa.PostType = 'Question' AND pa.AnswerCategory IN ('Many Answers', 'Moderate Answers')
+    ORDER BY pa.AnswerCount DESC
+    LIMIT 10
+),
+RecentActivityOut AS (
+    SELECT 
+        'Recent Activity' as Category,
+        NULL as TotalUsers,
+        NULL as TotalPosts,
+        NULL as TotalComments,
+        NULL as TotalBadges,
+        NULL as TotalTags,
+        CAST(pa.PostId AS TEXT) as UserId,
+        pa.Title as DisplayName,
+        CAST(CAST((EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - pa.CreationDate)) / 86400) AS INTEGER) AS NUMERIC) as Reputation,
+        7 as ord
+    FROM PostAnalysis pa
+    WHERE pa.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 DAY')
+    ORDER BY pa.CreationDate DESC
+    LIMIT 20
+)
+SELECT Category, TotalUsers, TotalPosts, TotalComments, TotalBadges, TotalTags, UserId, DisplayName, Reputation
+FROM (
+    SELECT * FROM OverallStats
+    UNION ALL
+    SELECT * FROM TopUsersOut
+    UNION ALL
+    SELECT * FROM HighScorePostsOut
+    UNION ALL
+    SELECT * FROM PopularTagsOut
+    UNION ALL
+    SELECT * FROM UserActivityOut
+    UNION ALL
+    SELECT * FROM QuestionAnalysisOut
+    UNION ALL
+    SELECT * FROM RecentActivityOut
+) t
+ORDER BY ord NULLS LAST, Reputation DESC;

@@ -1,0 +1,132 @@
+-- {"query": "3402.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2361} 
+
+WITH
+    -- Basic per‑user aggregates
+    UserStats AS (
+        SELECT
+            u.Id,
+            u.DisplayName,
+            u.Reputation,
+            u.CreationDate,
+            COALESCE(u.Location, '[unknown]')               AS Location,
+            (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id)                      AS TotalPosts,
+            (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS QuestionCount,
+            (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS AnswerCount,
+            COALESCE((SELECT SUM(p.Score) FROM Posts p WHERE p.OwnerUserId = u.Id),0)    AS TotalScore,
+            (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1)        AS GoldBadges,
+            (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2)        AS SilverBadges,
+            (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3)        AS BronzeBadges
+        FROM Users u
+    ),
+
+    -- Most recent activity of each user (posts, comments, votes)
+    RecentActivity AS (
+        SELECT
+            u.Id                                                       AS UserId,
+            MAX(p.CreationDate)                                        AS LastPostDate,
+            MAX(c.CreationDate)                                        AS LastCommentDate,
+            MAX(v.CreationDate)                                        AS LastVoteDate
+        FROM Users u
+        LEFT JOIN Posts    p ON p.OwnerUserId = u.Id
+        LEFT JOIN Comments c ON c.UserId      = u.Id
+        LEFT JOIN Votes    v ON v.UserId      = u.Id
+        GROUP BY u.Id
+    ),
+
+    -- Tag usage per user (questions only, tags stored as "<tag1><tag2>")
+    TagUsage AS (
+        SELECT
+            pu.OwnerUserId                              AS UserId,
+            LOWER(TRIM(BOTH '><' FROM SUBSTRING(pu.Tags FROM 2 FOR CHAR_LENGTH(pu.Tags)-2))) AS Tag,
+            COUNT(*)                                    AS TagCount
+        FROM Posts pu
+        WHERE pu.PostTypeId = 1
+          AND pu.Tags IS NOT NULL
+        GROUP BY pu.OwnerUserId,
+                 LOWER(TRIM(BOTH '><' FROM SUBSTRING(pu.Tags FROM 2 FOR CHAR_LENGTH(pu.Tags)-2)))
+    ),
+
+    -- Concatenated top‑5 tags per user
+    TopTags AS (
+        SELECT
+            UserId,
+            STRING_AGG(Tag || ':' || TagCount, ', ') WITHIN GROUP (ORDER BY TagCount DESC) AS TopTags
+        FROM (
+            SELECT
+                tu.*,
+                ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY TagCount DESC) AS rn
+            FROM TagUsage tu
+        ) sub
+        WHERE rn <= 5
+        GROUP BY UserId
+    ),
+
+    -- Ranking and final shape
+    RankedUsers AS (
+        SELECT
+            us.Id,
+            us.DisplayName,
+            us.Reputation,
+            us.TotalPosts,
+            us.TotalScore,
+            us.GoldBadges,
+            us.SilverBadges,
+            us.BronzeBadges,
+            ra.LastPostDate,
+            ra.LastCommentDate,
+            ra.LastVoteDate,
+            COALESCE(tt.TopTags, '')                    AS TopTags,
+            ROW_NUMBER() OVER (ORDER BY us.Reputation DESC, us.TotalScore DESC) AS RepRank,
+            RANK()        OVER (ORDER BY (us.GoldBadges*3 + us.SilverBadges*2 + us.BronzeBadges) DESC) AS BadgeRank,
+            CASE
+                WHEN ra.LastPostDate    IS NOT NULL THEN 3
+                WHEN ra.LastCommentDate IS NOT NULL THEN 2
+                WHEN ra.LastVoteDate    IS NOT NULL THEN 1
+                ELSE 0
+            END                                          AS RecentActivityScore
+        FROM UserStats      us
+        LEFT JOIN RecentActivity ra ON ra.UserId = us.Id
+        LEFT JOIN TopTags        tt ON tt.UserId = us.Id
+    )
+
+SELECT
+    Id,
+    DisplayName,
+    Reputation,
+    TotalPosts,
+    TotalScore,
+    GoldBadges,
+    SilverBadges,
+    BronzeBadges,
+    LastPostDate,
+    LastCommentDate,
+    LastVoteDate,
+    TopTags,
+    RepRank,
+    BadgeRank,
+    RecentActivityScore
+FROM RankedUsers
+WHERE RepRank   <= 100
+   OR BadgeRank <= 50
+   OR COALESCE(LastPostDate, TIMESTAMP '1970-01-01') > (CURRENT_TIMESTAMP - INTERVAL '30 days')
+ORDER BY RepRank
+
+UNION ALL
+
+SELECT
+    NULL AS Id,
+    '[No more users matching criteria]' AS DisplayName,
+    NULL AS Reputation,
+    NULL AS TotalPosts,
+    NULL AS TotalScore,
+    NULL AS GoldBadges,
+    NULL AS SilverBadges,
+    NULL AS BronzeBadges,
+    NULL AS LastPostDate,
+    NULL AS LastCommentDate,
+    NULL AS LastVoteDate,
+    NULL AS TopTags,
+    NULL AS RepRank,
+    NULL AS BadgeRank,
+    NULL AS RecentActivityScore
+WHERE NOT EXISTS (SELECT 1 FROM RankedUsers WHERE RepRank <= 100 OR BadgeRank <= 50);

@@ -1,0 +1,111 @@
+-- {"query": "3944.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 1414} 
+WITH
+    /* 1️⃣ Top users by reputation (including ties) */
+    top_reps AS (
+        SELECT
+            u.Id                                   AS user_id,
+            u.DisplayName,
+            u.Reputation,
+            RANK() OVER (ORDER BY u.Reputation DESC) AS rep_rank
+        FROM Users u
+    ),
+    /* 2️⃣ Aggregate post statistics per user (questions & answers) */
+    user_posts AS (
+        SELECT
+            p.OwnerUserId                         AS user_id,
+            COUNT(*) FILTER (WHERE p.PostTypeId = 1) AS question_cnt,
+            COUNT(*) FILTER (WHERE p.PostTypeId = 2) AS answer_cnt,
+            COALESCE(SUM(p.Score),0)               AS total_score,
+            AVG(p.Score) FILTER (WHERE p.PostTypeId = 1) AS avg_question_score,
+            AVG(p.Score) FILTER (WHERE p.PostTypeId = 2) AS avg_answer_score,
+            MAX(p.CreationDate)                   AS last_post_date
+        FROM Posts p
+        WHERE p.OwnerUserId IS NOT NULL
+        GROUP BY p.OwnerUserId
+    ),
+    /* 3️⃣ Badge breakdown per user (gold, silver, bronze) */
+    user_badges AS (
+        SELECT
+            b.UserId                              AS user_id,
+            COUNT(*) FILTER (WHERE b.Class = 1)   AS gold_cnt,
+            COUNT(*) FILTER (WHERE b.Class = 2)   AS silver_cnt,
+            COUNT(*) FILTER (WHERE b.Class = 3)   AS bronze_cnt,
+            STRING_AGG(DISTINCT b.Name, ', ')     AS badge_list
+        FROM Badges b
+        GROUP BY b.UserId
+    ),
+    /* 4️⃣ Most recent vote per user (correlated sub‑query leads to a lateral join) */
+    recent_votes AS (
+        SELECT
+            v.UserId                              AS voter_id,
+            v.PostId,
+            vt.Name                               AS vote_type,
+            v.CreationDate                        AS vote_date,
+            ROW_NUMBER() OVER (PARTITION BY v.UserId ORDER BY v.CreationDate DESC) AS rn
+        FROM Votes v
+        JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    ),
+    /* 5️⃣ Tag usage per user: count distinct tags the user has ever used in a question */
+    user_tags AS (
+        SELECT
+            p.OwnerUserId                         AS user_id,
+            COUNT(DISTINCT UNNEST(string_to_array(
+                TRIM(BOTH '<>' FROM COALESCE(p.Tags, '')), '><'
+            )))                                   AS distinct_tag_cnt,
+            ARRAY_AGG(DISTINCT UNNEST(string_to_array(
+                TRIM(BOTH '<>' FROM COALESCE(p.Tags, '')), '><'
+            )) ORDER BY 1 LIMIT 5)              AS top_5_tags
+        FROM Posts p
+        WHERE p.PostTypeId = 1                -- only questions
+          AND p.OwnerUserId IS NOT NULL
+        GROUP BY p.OwnerUserId
+    ),
+    /* 6️⃣ Users with no posts but with badges (to test outer‑join handling) */
+    badge_only_users AS (
+        SELECT DISTINCT b.UserId AS user_id
+        FROM Badges b
+        LEFT JOIN Posts p ON p.OwnerUserId = b.UserId
+        WHERE p.Id IS NULL
+    )
+SELECT
+    tr.user_id,
+    tr.DisplayName,
+    tr.Reputation,
+    tr.rep_rank,
+    COALESCE(up.question_cnt,0)                AS questions_posted,
+    COALESCE(up.answer_cnt,0)                  AS answers_posted,
+    up.total_score,
+    ROUND(up.avg_question_score::numeric,2)   AS avg_q_score,
+    ROUND(up.avg_answer_score::numeric,2)     AS avg_a_score,
+    up.last_post_date,
+    ub.gold_cnt,
+    ub.silver_cnt,
+    ub.bronze_cnt,
+    ub.badge_list,
+    rv.vote_type                               AS last_vote_type,
+    rv.vote_date                               AS last_vote_date,
+    COALESCE(ut.distinct_tag_cnt,0)            AS distinct_tags_used,
+    CASE
+        WHEN ut.top_5_tags IS NOT NULL THEN array_to_string(ut.top_5_tags, ', ')
+        ELSE NULL
+    END                                        AS top_5_tags,
+    CASE
+        WHEN up.user_id IS NULL THEN 'Badge‑only user'
+        ELSE 'Active user'
+    END                                        AS user_category
+FROM top_reps tr
+LEFT JOIN user_posts up            ON up.user_id = tr.user_id
+LEFT JOIN user_badges ub           ON ub.user_id = tr.user_id
+LEFT JOIN (
+        SELECT voter_id, vote_type, vote_date
+        FROM recent_votes
+        WHERE rn = 1
+     ) rv                           ON rv.voter_id = tr.user_id
+LEFT JOIN user_tags ut            ON ut.user_id = tr.user_id
+/* Force a full outer join with badge‑only users to hit both sides of the outer‑join */
+FULL OUTER JOIN badge_only_users bo ON bo.user_id = tr.user_id
+WHERE tr.rep_rank <= 10
+   OR bo.user_id IS NOT NULL
+ORDER BY tr.rep_rank ASC NULLS LAST,
+         tr.Reputation DESC,
+         tr.DisplayName;

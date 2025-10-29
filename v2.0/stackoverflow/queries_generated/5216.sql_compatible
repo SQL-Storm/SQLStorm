@@ -1,0 +1,46 @@
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COALESCE(b.CountBadges, 0) AS BadgeCount,
+    u.CreationDate AS UserCreationDate,
+    u.LastAccessDate,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesGiven,
+    AVG(COALESCE(EXTRACT(EPOCH FROM (v2.CreationDate - u.CreationDate)) / 86400.0, 0)) AS AvgTimeToFirstPostDays,
+    COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+    COUNT(DISTINCT a.Id) FILTER (WHERE a.PostTypeId = 2) AS AnswerCount,
+    MAX(p.LastActivityDate) AS LastActivity,
+    STRING_AGG(DISTINCT t3.Title, ',') AS TopTagNames
+FROM
+    Users u
+LEFT JOIN (
+    SELECT UserId, COUNT(*) AS CountBadges
+    FROM Badges
+    GROUP BY UserId
+) b ON b.UserId = u.Id
+LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+LEFT JOIN Posts a ON a.OwnerUserId = u.Id
+LEFT JOIN Votes v ON v.UserId = u.Id
+LEFT JOIN Votes v2 ON v2.UserId = u.Id AND v2.VoteTypeId = 2
+LEFT JOIN LATERAL (
+    SELECT TRIM(BOTH '<>' FROM tag) AS tag
+    FROM UNNEST(string_to_array(p.Tags, '>')) AS t(tag)
+) tag_un ON true
+LEFT JOIN Tags t2 ON t2.TagName = tag_un.tag
+LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+LEFT JOIN Posts t3 ON t3.Id = pl.RelatedPostId
+WHERE
+    u.AccountId IS NOT NULL
+    AND u.Location IS NOT NULL
+GROUP BY
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    b.CountBadges
+ORDER BY
+    UpVotesReceived DESC,
+    u.Reputation DESC
+LIMIT 100;

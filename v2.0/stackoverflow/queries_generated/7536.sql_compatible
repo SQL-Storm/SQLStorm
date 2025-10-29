@@ -1,0 +1,243 @@
+WITH UserActivity AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        CAST(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - u.CreationDate)) / 86400 AS INTEGER) as AccountAgeDays,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Elite'
+            WHEN u.Reputation > 5000 THEN 'Veteran'
+            WHEN u.Reputation > 1000 THEN 'Regular'
+            ELSE 'Newbie'
+        END as ReputationTier
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate
+),
+PostStats AS (
+    SELECT 
+        p.Id as PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.Body,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            WHEN p.PostTypeId = 4 THEN 'TagWikiExcerpt'
+            ELSE 'Other'
+        END as PostType,
+        CASE 
+            WHEN p.Score > 100 THEN 'HighlyVoted'
+            WHEN p.Score > 50 THEN 'ModeratelyVoted'
+            WHEN p.Score > 0 THEN 'LowVoted'
+            ELSE 'Unvoted'
+        END as VoteStatus,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as PostRank,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) as ScoreRank,
+        NTILE(10) OVER (ORDER BY p.Score) as ScoreDecile,
+        LAG(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PreviousScore,
+        LEAD(p.Score, 1) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as NextScore
+    FROM Posts p
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            WHEN t.Count > 10 THEN 'Niche'
+            ELSE 'Obscure'
+        END as TagPopularity,
+        LAG(t.Count, 1) OVER (ORDER BY t.Count DESC) as PreviousCount,
+        LEAD(t.Count, 1) OVER (ORDER BY t.Count DESC) as NextCount,
+        AVG(t.Count) OVER () as AvgTagCount,
+        MAX(t.Count) OVER () as MaxTagCount
+    FROM Tags t
+),
+ComplexQueryBase AS (
+    SELECT 
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.Views,
+        ua.UpVotes,
+        ua.DownVotes,
+        ua.PostCount,
+        ua.CommentCount,
+        ua.BadgeCount,
+        ua.ReputationTier,
+        ps.PostId,
+        ps.PostTypeId,
+        ps.Score,
+        ps.ViewCount,
+        ps.AnswerCount,
+        ps.CommentCount as PostCommentCount,
+        ps.FavoriteCount,
+        ps.CreationDate as PostCreationDate,
+        ps.Title,
+        ps.Tags,
+        ps.PostType,
+        ps.VoteStatus,
+        ps.PostRank,
+        ps.ScoreRank,
+        CASE 
+            WHEN ps.PreviousScore IS NOT NULL AND ps.PreviousScore > 0 THEN 
+                CAST((ps.Score - ps.PreviousScore) AS DOUBLE PRECISION) / ps.PreviousScore * 100
+            ELSE 0.0
+        END as ScoreChangePercent,
+        CASE 
+            WHEN ps.NextScore IS NOT NULL AND ps.NextScore > 0 THEN 
+                CAST((ps.NextScore - ps.Score) AS DOUBLE PRECISION) / ps.NextScore * 100
+            ELSE 0.0
+        END as NextScoreChangePercent,
+        ta.TagName,
+        ta.TagCount,
+        CASE 
+            WHEN ta.TagCount > ta.AvgTagCount THEN 'AboveAverage'
+            WHEN ta.TagCount < ta.AvgTagCount THEN 'BelowAverage'
+            ELSE 'Average'
+        END as TagPerformance,
+        ROW_NUMBER() OVER (PARTITION BY ua.UserId ORDER BY ps.CreationDate DESC) as UserRecentPostRank
+    FROM UserActivity ua
+    LEFT JOIN PostStats ps ON ua.UserId = ps.OwnerUserId
+    LEFT JOIN (
+        SELECT DISTINCT p.Id, UNNEST(string_to_array(p.Tags, '<>')) as TagName
+        FROM Posts p
+        WHERE p.Tags IS NOT NULL AND p.Tags != ''
+    ) pt ON ps.PostId = pt.Id
+    LEFT JOIN TagAnalysis ta ON pt.TagName = ta.TagName
+    WHERE ps.PostId IS NOT NULL AND (ps.Score > 0 OR ps.ViewCount > 100)
+)
+SELECT 
+    cq.UserId,
+    cq.DisplayName,
+    cq.Reputation,
+    cq.Views,
+    cq.UpVotes,
+    cq.DownVotes,
+    cq.PostCount,
+    cq.CommentCount,
+    cq.BadgeCount,
+    cq.ReputationTier,
+    cq.PostId,
+    cq.PostTypeId,
+    cq.Score,
+    cq.ViewCount,
+    cq.AnswerCount,
+    cq.PostCommentCount,
+    cq.FavoriteCount,
+    cq.PostCreationDate,
+    cq.Title,
+    cq.Tags,
+    cq.PostType,
+    cq.VoteStatus,
+    cq.PostRank,
+    cq.ScoreRank,
+    cq.ScoreChangePercent,
+    cq.NextScoreChangePercent,
+    cq.TagName,
+    cq.TagCount,
+    cq.TagPerformance,
+    CASE 
+        WHEN cq.ScoreChangePercent > 20 THEN 'HighlyImproved'
+        WHEN cq.ScoreChangePercent > 5 THEN 'ModeratelyImproved'
+        WHEN cq.ScoreChangePercent > 0 THEN 'SlightlyImproved'
+        WHEN cq.ScoreChangePercent < -5 THEN 'SignificantlyWorsened'
+        WHEN cq.ScoreChangePercent < 0 THEN 'SlightlyWorsened'
+        ELSE 'Stable'
+    END as PerformanceTrend,
+    CASE 
+        WHEN cq.Views > 500 THEN 'HighTraffic'
+        WHEN cq.Views > 100 THEN 'ModerateTraffic'
+        WHEN cq.Views > 50 THEN 'LowTraffic'
+        ELSE 'MinimalTraffic'
+    END as TrafficStatus,
+    CASE 
+        WHEN cq.TagPerformance = 'AboveAverage' AND cq.Score > 50 THEN 'Success'
+        WHEN cq.TagPerformance = 'BelowAverage' AND cq.Score < 20 THEN 'Struggling'
+        WHEN cq.TagPerformance = 'Average' AND cq.Score BETWEEN 20 AND 50 THEN 'Stable'
+        ELSE 'Mixed'
+    END as PostEffectiveness,
+    CAST(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - cq.PostCreationDate)) / 86400 AS INTEGER) as DaysSincePost,
+    CASE 
+        WHEN cq.PostRank = 1 THEN 'MostRecent'
+        WHEN cq.PostRank = 2 THEN 'SecondRecent'
+        WHEN cq.PostRank = 3 THEN 'ThirdRecent'
+        ELSE 'Older'
+    END as PostRecency,
+    COALESCE(cq.TagCount, 0) - COALESCE((SELECT AVG(ta2.TagCount) FROM TagAnalysis ta2), 0) as TagCountDeviation,
+    (SELECT COUNT(*) FROM PostStats ps2 WHERE ps2.OwnerUserId = cq.UserId AND ps2.Score > (SELECT AVG(ps3.Score) FROM PostStats ps3 WHERE ps3.OwnerUserId = cq.UserId)) as HighScoringPosts,
+    (SELECT COUNT(*) FROM PostStats ps4 WHERE ps4.OwnerUserId = cq.UserId AND ps4.VoteStatus = 'HighlyVoted') as HighlyVotedPosts,
+    COUNT(*) OVER (PARTITION BY cq.UserId) as TotalUserPosts,
+    SUM(cq.Score) OVER (PARTITION BY cq.UserId ORDER BY cq.PostCreationDate) as CumulativeScore,
+    AVG(cq.Score) OVER (PARTITION BY cq.UserId) as AvgUserScore,
+    PERCENT_RANK() OVER (ORDER BY cq.Score) as ScorePercentile,
+    CUME_DIST() OVER (ORDER BY cq.Score) as ScoreDistribution,
+    RANK() OVER (ORDER BY cq.Views DESC) as ViewRank,
+    DENSE_RANK() OVER (ORDER BY cq.Score DESC) as ScoreDenseRank
+FROM ComplexQueryBase cq
+WHERE 
+    cq.PostCount > 0 
+    AND (cq.Reputation BETWEEN 1000 AND 100000 OR cq.ReputationTier IN ('Veteran', 'Elite'))
+    AND cq.PostTypeId IN (1, 2)
+    AND (cq.Score IS NULL OR cq.Score > 0)
+    AND (cq.Views IS NULL OR cq.Views > 0)
+    AND cq.UserRecentPostRank <= 5
+GROUP BY
+    cq.UserId,
+    cq.DisplayName,
+    cq.Reputation,
+    cq.Views,
+    cq.UpVotes,
+    cq.DownVotes,
+    cq.PostCount,
+    cq.CommentCount,
+    cq.BadgeCount,
+    cq.ReputationTier,
+    cq.PostId,
+    cq.PostTypeId,
+    cq.Score,
+    cq.ViewCount,
+    cq.AnswerCount,
+    cq.PostCommentCount,
+    cq.FavoriteCount,
+    cq.PostCreationDate,
+    cq.Title,
+    cq.Tags,
+    cq.PostType,
+    cq.VoteStatus,
+    cq.PostRank,
+    cq.ScoreRank,
+    cq.ScoreChangePercent,
+    cq.NextScoreChangePercent,
+    cq.TagName,
+    cq.TagCount,
+    cq.TagPerformance,
+    cq.UserRecentPostRank
+ORDER BY 
+    cq.Views DESC,
+    cq.Score DESC,
+    cq.PostRank ASC
+LIMIT 1000;

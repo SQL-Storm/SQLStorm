@@ -1,0 +1,153 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.Reputation,
+        u.DisplayName,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        STRING_AGG(DISTINCT SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags)-2)), ', ') as AllTags,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Expert'
+            WHEN u.Reputation > 1000 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as ReputationLevel,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) as RankByReputation,
+        RANK() OVER (PARTITION BY CASE WHEN u.Reputation > 1000 THEN 'Intermediate' ELSE 'Beginner' END ORDER BY u.Reputation DESC) as RankByLevel
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 0
+    GROUP BY u.Id, u.Reputation, u.DisplayName, u.Views, u.UpVotes, u.DownVotes
+),
+TopUsers AS (
+    SELECT UserId, DisplayName, Reputation, PostCount, CommentCount, BadgeCount
+    FROM UserStats
+    WHERE RankByReputation <= 100
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ParentId,
+        COALESCE(p.AcceptedAnswerId, -1) as AcceptableAnswer,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AnswerCount = 0 THEN 'Unanswered'
+            WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 AND p.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+            WHEN p.PostTypeId = 1 AND p.AnswerCount > 0 AND p.AcceptedAnswerId IS NULL THEN 'Answered - No Accept'
+            ELSE 'Other'
+        END as QuestionStatus,
+        CAST( (CAST('2024-10-01 12:34:56' AS timestamp) - p.CreationDate) AS INT ) as DaysSinceCreation,
+        CASE 
+            WHEN p.Score > 100 THEN 'Highly Voted'
+            WHEN p.Score > 10 THEN 'Moderately Voted'
+            ELSE 'Low Voted'
+        END as VoteLevel,
+        LAG(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as PrevPostScore,
+        LEAD(p.Score, 1, 0) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as NextPostScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as AvgScoreByUser
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count as TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 100 THEN 'Moderate'
+            ELSE 'Niche'
+        END as PopularityLevel,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as PopularityRank,
+        DENSE_RANK() OVER (ORDER BY t.Count DESC) as DensePopularityRank
+    FROM Tags t
+    WHERE t.Count > 50
+),
+CombinedAnalysis AS (
+    SELECT 
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.PostCount,
+        ua.CommentCount,
+        ua.BadgeCount,
+        COALESCE(pa.PostId, 0) as MostActivePostId,
+        COALESCE(pa.Title, 'No Post') as MostActivePostTitle,
+        COALESCE(pa.Score, 0) as MostActivePostScore,
+        pa.QuestionStatus,
+        pa.VoteLevel,
+        CASE 
+            WHEN ua.PostCount > 0 THEN (ua.CommentCount * 100.0 / ua.PostCount)
+            ELSE 0 
+        END as CommentPerPostRatio,
+        CASE 
+            WHEN ua.BadgeCount > 0 THEN (ua.Reputation * ua.BadgeCount) / 1000
+            ELSE 0
+        END as ReputationBadgeEffect,
+        CASE
+            WHEN pa.Score > 0 AND pa.PrevPostScore > 0 THEN 
+                ROUND((pa.Score - pa.PrevPostScore) * 100.0 / pa.PrevPostScore, 2)
+            ELSE 0 
+        END as ScoreImprovementPercent,
+        ROW_NUMBER() OVER (PARTITION BY ua.PostCount ORDER BY ua.Reputation DESC) as UserPostRank,
+        STRING_AGG(DISTINCT COALESCE(pa.Tags, 'No Tags'), '; ') as UserPostTags
+    FROM TopUsers ua
+    LEFT JOIN PostAnalysis pa ON ua.UserId = pa.OwnerUserId
+    GROUP BY ua.UserId, ua.DisplayName, ua.Reputation, ua.PostCount, ua.CommentCount, ua.BadgeCount, pa.PostId, pa.Title, pa.Score, pa.QuestionStatus, pa.VoteLevel, pa.PrevPostScore
+)
+SELECT
+    ca.UserId,
+    ca.DisplayName,
+    ca.Reputation,
+    ca.PostCount,
+    ca.CommentCount,
+    ca.BadgeCount,
+    ca.MostActivePostId,
+    ca.MostActivePostTitle,
+    ca.MostActivePostScore,
+    ca.QuestionStatus,
+    ca.VoteLevel,
+    ca.CommentPerPostRatio,
+    ca.ReputationBadgeEffect,
+    ca.ScoreImprovementPercent,
+    ca.UserPostRank,
+    ca.UserPostTags,
+    CASE 
+        WHEN ca.PostCount > 50 THEN 'Highly Active'
+        WHEN ca.PostCount > 10 THEN 'Active'
+        ELSE 'Regular'
+    END as ActivityLevel,
+    CASE 
+        WHEN ca.Reputation >= 10000 THEN 'Elite'
+        WHEN ca.Reputation >= 1000 THEN 'Pro'
+        WHEN ca.Reputation >= 100 THEN 'Regular'
+        ELSE 'Newbie'
+    END as UserLevel,
+    (SELECT COUNT(DISTINCT Id) FROM Posts WHERE OwnerUserId = ca.UserId AND PostTypeId = 1) as QuestionCount,
+    (SELECT COUNT(DISTINCT Id) FROM Posts WHERE OwnerUserId = ca.UserId AND PostTypeId = 2) as AnswerCount,
+    COALESCE((SELECT SUM(Score) FROM Posts WHERE OwnerUserId = ca.UserId AND PostTypeId = 1), 0) as TotalQuestionScore,
+    COALESCE((SELECT SUM(Score) FROM Posts WHERE OwnerUserId = ca.UserId AND PostTypeId = 2), 0) as TotalAnswerScore
+FROM CombinedAnalysis ca
+WHERE ca.ScoreImprovementPercent IS NOT NULL
+    AND ca.DisplayName IS NOT NULL
+    AND (ca.PostCount > 0 OR ca.CommentCount > 0 OR ca.BadgeCount > 0)
+    AND (ca.MostActivePostId IS NULL OR ca.MostActivePostId <> 0)
+ORDER BY ca.Reputation DESC, ca.PostCount DESC, ca.CommentCount DESC
+LIMIT 500;

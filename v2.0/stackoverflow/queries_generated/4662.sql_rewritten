@@ -1,0 +1,183 @@
+-- {"query": "4662.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1370} 
+WITH
+  QuestionStats AS (
+    SELECT
+      p.Id AS QuestionId,
+      p.OwnerUserId,
+      p.Title,
+      p.CreationDate AS QuestionCreationDate,
+      p.AnswerCount,
+      p.FavoriteCount,
+      p.ViewCount,
+      p.Score AS QuestionScore,
+      COALESCE(u.Reputation, 0) AS OwnerReputation,
+      COALESCE(
+        (
+          SELECT
+            COUNT(*)
+          FROM
+            Badges AS b
+          WHERE
+            b.UserId = p.OwnerUserId
+            AND b.Class = 1
+        ),
+        0
+      ) AS GoldBadges,
+      COALESCE(
+        (
+          SELECT
+            COUNT(*)
+          FROM
+            Comments AS c
+          WHERE
+            c.PostId = p.Id
+        ),
+        0
+      ) AS CommentCount,
+      p.AcceptedAnswerId,
+      COALESCE(
+        (
+          SELECT
+            SUM(Score)
+          FROM
+            Posts AS a
+          WHERE
+            a.ParentId = p.Id
+            AND a.PostTypeId = 2
+        ),
+        0
+      ) AS TotalAnswerScore,
+      RANK() OVER (
+        ORDER BY
+          p.ViewCount DESC
+      ) AS ViewRank,
+      ROW_NUMBER() OVER (
+        PARTITION BY
+          p.OwnerUserId
+        ORDER BY
+          p.CreationDate ASC
+      ) AS FirstQuestionOrder
+    FROM
+      Posts AS p
+      INNER JOIN PostTypes AS pt ON p.PostTypeId = pt.Id
+      LEFT JOIN Users AS u ON p.OwnerUserId = u.Id
+    WHERE
+      pt.Name = 'Question'
+      AND p.CreationDate >= DATE('now', '-365 day')
+  ),
+  AnswerStats AS (
+    SELECT
+      p.ParentId AS QuestionId,
+      COUNT(p.Id) AS AnswerCount,
+      SUM(p.Score) AS TotalAnswerScore,
+      AVG(p.Score) AS AverageAnswerScore,
+      MAX(p.Score) AS MaxAnswerScore,
+      SUM(
+        CASE
+          WHEN p.Id = q.AcceptedAnswerId THEN 1
+          ELSE 0
+        END
+      ) AS IsAcceptedAnswerCount
+    FROM
+      Posts AS p
+      INNER JOIN QuestionStats AS q ON p.ParentId = q.QuestionId
+    WHERE
+      p.PostTypeId = 2
+    GROUP BY
+      p.ParentId
+  ),
+  UserActivity AS (
+    SELECT
+      u.Id AS UserId,
+      COUNT(DISTINCT ph.PostId) AS PostsEdited,
+      SUM(
+        CASE
+          WHEN ph.PostHistoryTypeId IN (4, 5, 6) THEN 1
+          ELSE 0
+        END
+      ) AS Edits,
+      SUM(
+        CASE
+          WHEN ph.PostHistoryTypeId IN (1, 2, 3) THEN 1
+          ELSE 0
+        END
+      ) AS InitialPosts,
+      MAX(ph.CreationDate) AS LastEditDate
+    FROM
+      Users AS u
+      LEFT JOIN PostHistory AS ph ON u.Id = ph.UserId
+    WHERE
+      u.Id > 0
+    GROUP BY
+      u.Id
+  )
+SELECT
+  qs.Title AS QuestionTitle,
+  qs.QuestionCreationDate,
+  qs.OwnerReputation,
+  qs.GoldBadges,
+  qs.CommentCount,
+  qs.AnswerCount AS QuestionAnswerCount,
+  qs.FavoriteCount,
+  qs.ViewCount,
+  qs.ViewRank,
+  qs.FirstQuestionOrder,
+  COALESCE(a.AnswerCount, 0) AS ActualAnswerCount,
+  COALESCE(a.TotalAnswerScore, 0) AS TotalAnswerScore,
+  COALESCE(a.AverageAnswerScore, 0) AS AverageAnswerScore,
+  COALESCE(a.MaxAnswerScore, 0) AS MaxAnswerScore,
+  COALESCE(a.IsAcceptedAnswerCount, 0) AS AcceptedAnswers,
+  CASE
+    WHEN qs.AcceptedAnswerId IS NOT NULL THEN 'Accepted'
+    ELSE 'Not Accepted'
+  END AS AcceptanceStatus,
+  CASE
+    WHEN qs.QuestionScore > 100 THEN 'High Score'
+    WHEN qs.QuestionScore BETWEEN 10 AND 100 THEN 'Medium Score'
+    ELSE 'Low Score'
+  END AS ScoreCategory,
+  CASE
+    WHEN u.DisplayName IS NULL THEN 'Deleted User'
+    ELSE u.DisplayName
+  END AS OwnerDisplayName,
+  COALESCE(ua.PostsEdited, 0) AS UserPostsEdited,
+  COALESCE(ua.Edits, 0) AS UserEdits,
+  COALESCE(ua.InitialPosts, 0) AS UserInitialPosts,
+  COALESCE(
+    (
+      SELECT
+        COUNT(*)
+      FROM
+        PostLinks AS pl
+      WHERE
+        pl.PostId = qs.QuestionId
+        AND pl.LinkTypeId = 3
+    ),
+    0
+  ) AS DuplicateLinks,
+  COALESCE(
+    (
+      SELECT
+        COUNT(*)
+      FROM
+        PostLinks AS pl
+      WHERE
+        pl.PostId = qs.QuestionId
+        AND pl.LinkTypeId = 1
+    ),
+    0
+  ) AS LinkedPosts
+FROM
+  QuestionStats AS qs
+  LEFT JOIN AnswerStats AS a ON qs.QuestionId = a.QuestionId
+  LEFT JOIN Users AS u ON qs.OwnerUserId = u.Id
+  LEFT JOIN UserActivity AS ua ON qs.OwnerUserId = ua.UserId
+WHERE
+  qs.OwnerReputation > 10000
+  OR qs.GoldBadges > 5
+  OR qs.AnswerCount > 20
+  OR qs.FavoriteCount > 50
+  OR qs.ViewCount > 100000
+ORDER BY
+  qs.ViewRank,
+  qs.QuestionCreationDate DESC;

@@ -1,0 +1,309 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) as rn,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as prev_score,
+        LEAD(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as next_score,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) as avg_score_3days,
+        MAX(p.Score) OVER (PARTITION BY p.OwnerUserId) as max_score_user,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.Score > 100 THEN 'Highly_Voted_Question'
+            WHEN p.PostTypeId = 2 AND p.Score > 50 THEN 'Highly_Voted_Answer'
+            ELSE 'Normal_Post'
+        END as post_category
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) 
+      AND p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30' DAY)
+),
+UserActivitySummary AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as total_posts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as answers,
+        SUM(p.Score) as total_score,
+        AVG(p.Score) as avg_score,
+        MAX(p.Score) as max_score,
+        COUNT(DISTINCT c.Id) as total_comments,
+        COUNT(DISTINCT v.Id) as total_votes,
+        COUNT(DISTINCT b.Id) as total_badges,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Expert'
+            WHEN u.Reputation > 1000 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as reputation_level,
+        EXTRACT(DAY FROM (TIMESTAMP '2024-10-01 12:34:56' - u.CreationDate)) as days_as_member
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2' YEAR)
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.CreationDate
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE WHEN t.IsRequired = 1 THEN 'Required' ELSE 'Optional' END as tag_type,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as popularity_rank,
+        DENSE_RANK() OVER (ORDER BY t.Count DESC) as popularity_level,
+        AVG(t.Count) OVER () as avg_tag_count,
+        PERCENT_RANK() OVER (ORDER BY t.Count) as tag_percentile,
+        CASE 
+            WHEN t.Count > (SELECT AVG("Count") FROM Tags) * 2 THEN 'Very_Popular'
+            WHEN t.Count > (SELECT AVG("Count") FROM Tags) THEN 'Popular'
+            WHEN t.Count < (SELECT AVG("Count") FROM Tags) / 2 THEN 'Rare'
+            ELSE 'Moderate'
+        END as tag_category
+    FROM Tags t
+    WHERE t.TagName IS NOT NULL
+),
+PostWithComplexMetrics AS (
+    SELECT 
+        rp.Id,
+        rp.Title,
+        rp.Score,
+        rp.ViewCount,
+        rp.CreationDate,
+        rp.OwnerUserId,
+        rp.Tags,
+        rp.AnswerCount,
+        rp.CommentCount,
+        rp.FavoriteCount,
+        rp.post_category,
+        rp.prev_score,
+        rp.next_score,
+        rp.avg_score_3days,
+        rp.max_score_user,
+        CASE 
+            WHEN rp.prev_score IS NOT NULL AND rp.next_score IS NOT NULL AND 
+                 ABS(rp.Score - rp.prev_score) > 50 AND ABS(rp.Score - rp.next_score) > 50 
+            THEN 'Spike_Post'
+            WHEN rp.Score > rp.avg_score_3days AND rp.Score > rp.max_score_user * 0.8 
+            THEN 'High_Performance'
+            ELSE 'Regular'
+        END as performance_category,
+        CASE 
+            WHEN rp.AnswerCount > 5 AND rp.CommentCount > 10 THEN 'Highly_Active_Question'
+            WHEN rp.AnswerCount = 0 AND rp.CommentCount > 5 THEN 'Unanswered_Question'
+            WHEN rp.AnswerCount > 0 AND rp.CommentCount = 0 THEN 'Answered_Question'
+            ELSE 'Standard_Question'
+        END as engagement_type,
+        CASE 
+            WHEN rp.Tags IS NOT NULL AND CHAR_LENGTH(rp.Tags) > 0 THEN 
+                (SELECT COUNT(*) FROM UNNEST(string_to_array(rp.Tags, '>')) AS value WHERE btrim(value) <> '')
+            ELSE 0
+        END as tag_count,
+        CASE WHEN rp.Score IS NULL THEN 0 ELSE 1 END as has_score,
+        CASE WHEN rp.ViewCount IS NULL THEN 0 ELSE 1 END as has_views,
+        CASE WHEN rp.AnswerCount IS NULL THEN 0 ELSE 1 END as has_answers,
+        CASE WHEN rp.CommentCount IS NULL THEN 0 ELSE 1 END as has_comments,
+        CASE WHEN rp.FavoriteCount IS NULL THEN 0 ELSE 1 END as has_favorites
+    FROM RankedPosts rp
+),
+AggregatedPostData AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        pa.post_category,
+        pa.performance_category,
+        pa.engagement_type,
+        pa.tag_count,
+        pa.has_score,
+        pa.has_views,
+        pa.has_answers,
+        pa.has_comments,
+        pa.has_favorites,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.total_posts,
+        uas.questions,
+        uas.answers,
+        uas.total_score,
+        uas.total_comments,
+        uas.total_votes,
+        uas.total_badges,
+        uas.days_as_member,
+        CASE 
+            WHEN uas.total_posts > 100 THEN 'Heavy_User'
+            WHEN uas.total_posts > 50 THEN 'Moderate_User'
+            WHEN uas.total_posts > 10 THEN 'Light_User'
+            ELSE 'New_User'
+        END as user_activity_level,
+        ta.TagName,
+        ta.Count as tag_count_stat,
+        ta.tag_category,
+        CASE 
+            WHEN ta.Count > 500 THEN 'Trending_Tag'
+            WHEN ta.Count > 100 THEN 'Popular_Tag'
+            WHEN ta.Count > 50 THEN 'Moderate_Tag'
+            ELSE 'Niche_Tag'
+        END as tag_popularity,
+        EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate)) / 3600 as hours_since_creation,
+        (CASE WHEN p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '24' HOUR) THEN TRUE ELSE FALSE END) as is_recent_post,
+        (CASE WHEN p.CreationDate <= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '720' HOUR) THEN TRUE ELSE FALSE END) as is_old_post
+    FROM Posts p
+    INNER JOIN PostWithComplexMetrics pa ON p.Id = pa.Id
+    LEFT JOIN UserActivitySummary uas ON p.OwnerUserId = uas.UserId
+    LEFT JOIN Tags ta ON p.Tags LIKE '%' || ta.TagName || '%'
+    WHERE p.PostTypeId IN (1, 2)
+)
+
+SELECT 
+    a.Id,
+    a.Title,
+    a.Score,
+    a.ViewCount,
+    a.CreationDate,
+    a.OwnerUserId,
+    a.Tags,
+    a.AnswerCount,
+    a.CommentCount,
+    a.FavoriteCount,
+    a.post_category,
+    a.performance_category,
+    a.engagement_type,
+    a.tag_count,
+    a.has_score,
+    a.has_views,
+    a.has_answers,
+    a.has_comments,
+    a.has_favorites,
+    a.DisplayName,
+    a.Reputation,
+    a.total_posts,
+    a.questions,
+    a.answers,
+    a.total_score,
+    a.total_comments,
+    a.total_votes,
+    a.total_badges,
+    a.days_as_member,
+    a.user_activity_level,
+    a.TagName,
+    a.tag_count_stat,
+    a.tag_category,
+    a.tag_popularity,
+    a.hours_since_creation,
+    a.is_recent_post,
+    a.is_old_post,
+    CASE 
+        WHEN a.is_recent_post = TRUE AND a.Score > 100 THEN 'Hot_Recent_Question'
+        WHEN a.is_old_post = TRUE AND a.Score > 50 THEN 'Retrospective_High_Score'
+        WHEN a.Score IS NULL THEN 'No_Score'
+        ELSE 'Standard_Question'
+    END as scoring_status,
+    CASE 
+        WHEN a.Reputation > 10000 AND a.total_score > 1000 THEN 'Elite_Score_Sum'
+        WHEN a.Reputation > 5000 AND a.total_score > 500 THEN 'Veteran_Score_Sum'
+        WHEN a.Reputation > 1000 AND a.total_score > 100 THEN 'Regular_Score_Sum'
+        ELSE 'Beginner_Score_Sum'
+    END as score_status,
+    CASE 
+        WHEN a.tag_count > 3 THEN 'Tag_Rich'
+        WHEN a.tag_count = 0 THEN 'Tag_Less'
+        WHEN a.tag_count BETWEEN 1 AND 3 THEN 'Tag_Moderate'
+        ELSE 'Unknown'
+    END as tagging_status,
+    CASE 
+        WHEN a.engagement_type IN ('Highly_Active_Question', 'Answered_Question') 
+             AND a.has_answers = 1 AND a.has_comments = 1 THEN 'Engaged_Question'
+        WHEN a.engagement_type = 'Unanswered_Question' AND a.has_answers = 0 THEN 'Unanswered_Post'
+        ELSE 'Other_Post'
+    END as engagement_status,
+    CASE 
+        WHEN a.total_votes > 100 THEN 'Highly_Voted'
+        WHEN a.total_votes > 50 THEN 'Moderately_Voted'
+        WHEN a.total_votes > 10 THEN 'Low_Vote'
+        ELSE 'No_Vote'
+    END as vote_status,
+    CASE 
+        WHEN a.total_badges > 10 THEN 'Awarded_User'
+        WHEN a.total_badges > 5 THEN 'Badge_Holder'
+        WHEN a.total_badges > 0 THEN 'Badge_Earner'
+        ELSE 'No_Badge'
+    END as badge_status,
+    CASE 
+        WHEN a.TagName LIKE '%sql%' THEN 'SQL_Related'
+        WHEN a.TagName LIKE '%python%' THEN 'Python_Related'
+        WHEN a.TagName LIKE '%javascript%' THEN 'JavaScript_Related'
+        WHEN a.TagName LIKE '%c#%' THEN 'CSharp_Related'
+        ELSE 'Other_Topic'
+    END as topic_category,
+    CASE WHEN a.Title ~* '[Qq]uestion|[Aa]nswer' THEN 'Question_Or_Answer_Title' ELSE 'Normal_Title' END as title_category,
+    CASE WHEN CHAR_LENGTH(a.Title) > 200 AND POSITION('?' IN a.Title) > 0 THEN 'Long_Exploratory_Question' ELSE 'Short_Or_Non_Question' END as question_length_category,
+    CASE 
+        WHEN a.ViewCount > (SELECT AVG(ViewCount) FROM Posts) * 10 THEN 'Viral_View'
+        WHEN a.ViewCount > (SELECT AVG(ViewCount) FROM Posts) * 2 THEN 'Popular_View'
+        WHEN a.ViewCount > 100 THEN 'Moderate_View'
+        ELSE 'Low_View'
+    END as view_category,
+    CASE 
+        WHEN a.days_as_member > 365 THEN 'Long_Term_Member'
+        WHEN a.days_as_member > 180 THEN 'Medium_Term_Member'
+        WHEN a.days_as_member > 30 THEN 'Short_Term_Member'
+        ELSE 'New_Member'
+    END as membership_category,
+    a.total_score - COALESCE((SELECT AVG(total_score) FROM UserActivitySummary), 0) as score_deviation_from_avg,
+    (SELECT COUNT(*) FROM AggregatedPostData apd WHERE apd.OwnerUserId = a.OwnerUserId AND apd.CreationDate >= (a.CreationDate - INTERVAL '7' DAY)) as weekly_post_count,
+    (a.total_votes * 1.0 / NULLIF(a.total_posts, 0)) as vote_per_post_ratio,
+    (a.total_comments * 1.0 / NULLIF(a.questions, 0)) as comment_per_question_ratio,
+    (CASE WHEN a.questions > 0 THEN 
+        (SELECT COUNT(*) FROM Posts p2 WHERE p2.ParentId IN (SELECT Id FROM Posts WHERE PostTypeId = 2 AND OwnerUserId = a.OwnerUserId AND ParentId IS NOT NULL) AND p2.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30' DAY))
+     ELSE 0 END) as recent_answer_count_with_comments,
+    (SELECT SUM(CASE WHEN p3.PostTypeId = 1 THEN 1 ELSE 0 END) 
+     FROM Posts p3 
+     WHERE p3.OwnerUserId = a.OwnerUserId 
+       AND p3.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30' DAY)) as recent_question_count,
+    (SELECT COUNT(*) 
+     FROM Badges b2 
+     WHERE b2.UserId = a.OwnerUserId 
+       AND b2.Date >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6' MONTH)) as recent_badge_count,
+    CASE 
+        WHEN a.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) AND 
+             a.ViewCount > (SELECT AVG(ViewCount) FROM Posts WHERE PostTypeId = 1) 
+        THEN 'Top_Question'
+        WHEN a.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 2) AND 
+             a.CommentCount > 5 
+        THEN 'High_Quality_Answer'
+        ELSE 'Standard_Post'
+    END as quality_score
+FROM AggregatedPostData a
+WHERE a.Id IS NOT NULL
+  AND (a.Reputation > 100 OR a.total_votes > 5 OR a.total_badges > 0)
+  AND a.CreationDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1' YEAR) 
+  AND (a.Title IS NOT NULL OR a.Tags IS NOT NULL)
+  AND (a.Score IS NOT NULL OR a.ViewCount IS NOT NULL OR a.AnswerCount IS NOT NULL OR a.CommentCount IS NOT NULL)
+  AND a.engagement_type NOT IN ('Standard_Question')
+  AND a.post_category IN ('Highly_Voted_Question', 'Highly_Voted_Answer')
+  AND (a.TagName LIKE '%sql%' OR a.TagName LIKE '%python%' OR a.TagName LIKE '%javascript%' OR a.TagName LIKE '%c#%')
+  AND (a.is_recent_post = TRUE OR a.is_old_post = TRUE)
+ORDER BY a.CreationDate DESC, a.Score DESC, a.ViewCount DESC
+OFFSET 0
+LIMIT 1000;

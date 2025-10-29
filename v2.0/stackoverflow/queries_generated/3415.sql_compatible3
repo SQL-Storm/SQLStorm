@@ -1,0 +1,130 @@
+WITH
+    TagList AS (
+        SELECT t.Id   AS TagId,
+               t.TagName,
+               t.IsModeratorOnly
+        FROM   Tags t
+        WHERE  t.TagName IS NOT NULL
+    ),
+    QuestionPosts AS (
+        SELECT p.Id          AS QId,
+               p.Tags,
+               p.OwnerUserId,
+               p.CreationDate
+        FROM   Posts p
+        WHERE  p.PostTypeId = 1
+          AND  p.Tags IS NOT NULL
+    ),
+    ExplodedTags AS (
+        SELECT q.QId,
+               q.OwnerUserId,
+               q.CreationDate,
+               regexp_split_to_table(trim(both '<>' FROM q.Tags), '><') AS TagName
+        FROM   QuestionPosts q
+    ),
+    Answers AS (
+        SELECT a.Id         AS AId,
+               a.ParentId    AS QId,
+               a.OwnerUserId,
+               a.Score,
+               a.CreationDate
+        FROM   Posts a
+        WHERE  a.PostTypeId = 2
+    ),
+    UserStats AS (
+        SELECT u.Id                                 AS UserId,
+               u.Reputation,
+               COALESCE(u.UpVotes,0) - COALESCE(u.DownVotes,0) AS NetVotes,
+               (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+               (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadges,
+               (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadges
+        FROM   Users u
+    ),
+    TagAnswerStats AS (
+        SELECT et.TagName,
+               a.OwnerUserId,
+               COUNT(*)                           AS AnswerCount,
+               SUM(a.Score)                       AS TotalScore,
+               AVG(a.Score)                       AS AvgScore,
+               MAX(a.CreationDate)                AS LastAnswerDate
+        FROM   ExplodedTags et
+        JOIN   Answers a ON a.QId = et.QId
+        GROUP  BY et.TagName, a.OwnerUserId
+    ),
+    RankedTagAnswers AS (
+        SELECT tas.*,
+               ROW_NUMBER() OVER (PARTITION BY tas.TagName
+                                  ORDER BY tas.TotalScore DESC,
+                                           tas.AnswerCount DESC) AS RankInTag
+        FROM   TagAnswerStats tas
+    )
+
+SELECT
+    tl.TagName,
+    rta.RankInTag,
+    u.DisplayName,
+    u.Id                                   AS UserId,
+    rta.AnswerCount,
+    rta.TotalScore,
+    rta.AvgScore,
+    us.Reputation,
+    us.NetVotes,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    CASE
+        WHEN EXISTS (SELECT 1
+                     FROM   Votes v
+                     WHERE  v.PostId = (SELECT a2.AId
+                                        FROM   Answers a2
+                                        WHERE  a2.OwnerUserId = u.Id
+                                        LIMIT 1)
+                       AND  v.VoteTypeId = 2) THEN 'HasUpvote'
+        ELSE 'NoUpvote'
+    END                                     AS UpvoteFlag,
+    COALESCE(rta.LastAnswerDate, TIMESTAMP '1970-01-01') AS LastAnswerDate
+FROM   RankedTagAnswers rta
+LEFT   JOIN Users u          ON u.Id = rta.OwnerUserId
+LEFT   JOIN UserStats us     ON us.UserId = u.Id
+LEFT   JOIN TagList tl       ON tl.TagName = rta.TagName
+WHERE  rta.RankInTag <= 5
+  AND  (us.Reputation IS NOT NULL OR us.Reputation = 0)
+  AND  (tl.IsModeratorOnly = FALSE OR tl.IsModeratorOnly IS NULL)
+
+UNION ALL
+
+SELECT
+    'Overall'                               AS TagName,
+    NULL                                    AS RankInTag,
+    u.DisplayName,
+    u.Id                                    AS UserId,
+    NULL                                    AS AnswerCount,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score END) AS TotalScore,
+    AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) AS AvgScore,
+    us.Reputation,
+    us.NetVotes,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    CASE
+        WHEN EXISTS (SELECT 1
+                     FROM   Votes v
+                     WHERE  v.PostId = p.Id
+                       AND  v.VoteTypeId = 2) THEN 'HasUpvote'
+        ELSE 'NoUpvote'
+    END                                     AS UpvoteFlag,
+    MAX(p.CreationDate)                    AS LastAnswerDate
+FROM   Users u
+LEFT   JOIN UserStats us               ON us.UserId = u.Id
+LEFT   JOIN Posts p                    ON p.OwnerUserId = u.Id
+                                         AND p.PostTypeId = 2
+WHERE  u.Id NOT IN (SELECT OwnerUserId
+                    FROM   RankedTagAnswers
+                    WHERE  RankInTag = 1)
+GROUP  BY u.Id, u.DisplayName,
+          us.Reputation, us.NetVotes,
+          us.GoldBadges, us.SilverBadges, us.BronzeBadges
+HAVING COUNT(p.Id) > 0
+ORDER  BY TagName,
+          RankInTag NULLS LAST,
+          TotalScore DESC;

@@ -1,0 +1,251 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        COALESCE(SUM(p.Score), 0) AS TotalScore,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 0 THEN 
+                CAST(SUM(p.Score) AS DOUBLE PRECISION) / NULLIF(COUNT(DISTINCT p.Id), 0)
+            ELSE 0 
+        END AS AvgScorePerPost,
+        -- Build comma-separated tag list in a dialect-neutral way using STRING_AGG on distinct tags
+        (
+            SELECT STRING_AGG(DISTINCT t.TagName, ',')
+            FROM Posts p2
+            CROSS JOIN LATERAL (
+                -- split tags like '<tag1><tag2>' into rows; use regexp to extract tag names
+                SELECT regexp_matches(p2.Tags, '<([^>]+)>', 'g') AS m
+            ) AS tag_match(m)
+            JOIN Tags t ON t.TagName = tag_match.m[1]
+            WHERE p2.OwnerUserId = u.Id AND p2.PostTypeId = 1
+        ) AS UserTags,
+        CASE 
+            WHEN MAX(p.CreationDate) > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year') THEN 'Active'
+            ELSE 'Inactive'
+        END AS ActivityStatus
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id > 0
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopPostsByScore AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        p.CreationDate,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS ScoreRank,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) AS ScoreDensityRank,
+        NTILE(4) OVER (ORDER BY p.Score DESC) AS Quartile,
+        LAG(p.Score, 1) OVER (ORDER BY p.Score DESC) AS PreviousScore,
+        LEAD(p.Score, 1) OVER (ORDER BY p.Score DESC) AS NextScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS AvgScoreByUser,
+        MAX(p.Score) OVER (PARTITION BY p.OwnerUserId) AS MaxScoreByUser,
+        MIN(p.Score) OVER (PARTITION BY p.OwnerUserId) AS MinScoreByUser,
+        SUM(p.Score) OVER (PARTITION BY p.OwnerUserId) AS TotalScoreByUser,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) AS PostCountByUser,
+        CASE 
+            WHEN p.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'AboveAverage'
+            WHEN p.Score < (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) THEN 'BelowAverage'
+            ELSE 'Average'
+        END AS ScoreCategory,
+        CASE 
+            WHEN p.AnswerCount > 0 THEN 
+                CAST(p.Score AS DOUBLE PRECISION) / NULLIF(p.AnswerCount, 0)
+            ELSE NULL 
+        END AS ScorePerAnswer,
+        CASE 
+            WHEN p.ViewCount > 0 THEN 
+                CAST(p.Score AS DOUBLE PRECISION) / NULLIF(p.ViewCount, 0)
+            ELSE NULL 
+        END AS ScorePerView,
+        CONCAT('Q', p.Id, ': ', SUBSTRING(p.Title FROM 1 FOR 50), '...') AS PostSummary
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 years')
+),
+UserPostPerformance AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.PostCount,
+        uas.CommentCount,
+        uas.BadgeCount,
+        uas.AvgScorePerPost,
+        COALESCE(tps.Score, 0) AS HighestScorePost,
+        COALESCE(tps.Title, 'No Posts') AS HighestScoringPostTitle,
+        COALESCE(tps.ScorePerAnswer, 0) AS ScorePerAnswer,
+        COALESCE(tps.ScorePerView, 0) AS ScorePerView,
+        CASE 
+            WHEN uas.PostCount > 0 THEN 
+                CAST(uas.TotalScore AS DOUBLE PRECISION) / NULLIF(uas.PostCount, 0)
+            ELSE 0 
+        END AS OverallAvgScorePerPost,
+        CASE 
+            WHEN uas.BadgeCount > 0 THEN 
+                COALESCE(tps.Score, 0) / NULLIF(uas.BadgeCount, 0)
+            ELSE 0 
+        END AS ScorePerBadge,
+        CASE WHEN uas.Reputation > 10000 THEN 'Expert' ELSE 'Regular' END AS UserLevel,
+        COALESCE(tps.PostSummary, 'No relevant posts') AS HighestScorePostSummary
+    FROM UserActivityStats uas
+    LEFT JOIN TopPostsByScore tps ON uas.UserId = tps.OwnerUserId AND tps.ScoreRank = 1
+    WHERE uas.ActivityStatus = 'Active'
+),
+CombinedStats AS (
+    SELECT 
+        upp.UserId,
+        upp.DisplayName,
+        upp.Reputation,
+        upp.PostCount,
+        upp.CommentCount,
+        upp.BadgeCount,
+        upp.AvgScorePerPost,
+        upp.HighestScorePost,
+        upp.HighestScoringPostTitle,
+        upp.ScorePerAnswer,
+        upp.ScorePerView,
+        upp.OverallAvgScorePerPost,
+        upp.ScorePerBadge,
+        upp.UserLevel,
+        upp.HighestScorePostSummary,
+        CASE 
+            WHEN upp.Reputation >= 100000 THEN 'Veteran'
+            WHEN upp.Reputation >= 10000 THEN 'Experienced'
+            WHEN upp.Reputation >= 1000 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END AS ReputationLevel,
+        CASE 
+            WHEN upp.PostCount > 100 THEN 'HighlyActive'
+            WHEN upp.PostCount > 50 THEN 'Active'
+            WHEN upp.PostCount > 10 THEN 'Moderate'
+            ELSE 'Low'
+        END AS ActivityLevel,
+        CASE 
+            WHEN upp.BadgeCount > 50 THEN 'BadgeCollector'
+            WHEN upp.BadgeCount > 25 THEN 'RegularBadgeUser'
+            WHEN upp.BadgeCount > 5 THEN 'OccasionalBadgeUser'
+            ELSE 'NewBadgeUser'
+        END AS BadgeEngagement,
+        ROW_NUMBER() OVER (ORDER BY upp.Reputation DESC, upp.PostCount DESC) AS GlobalRank,
+        DENSE_RANK() OVER (ORDER BY upp.Reputation DESC) AS ReputationRank,
+        NTILE(10) OVER (ORDER BY upp.Reputation DESC) AS ReputationPercentile,
+        PERCENT_RANK() OVER (ORDER BY upp.Reputation DESC) AS ReputationPercentRank
+    FROM UserPostPerformance upp
+)
+SELECT 
+    cs.UserId AS "User ID",
+    cs.DisplayName AS "Display Name",
+    cs.Reputation AS "Reputation Points",
+    cs.PostCount AS "Number of Posts",
+    cs.CommentCount AS "Number of Comments",
+    cs.BadgeCount AS "Number of Badges",
+    ROUND(cs.AvgScorePerPost::numeric, 2) AS "Average Score per Post",
+    cs.HighestScorePost AS "Highest Scoring Post",
+    cs.HighestScoringPostTitle AS "Highest Scoring Post Title",
+    ROUND(cs.ScorePerAnswer::numeric, 2) AS "Score per Answer",
+    ROUND(cs.ScorePerView::numeric, 4) AS "Score per View",
+    ROUND(cs.OverallAvgScorePerPost::numeric, 2) AS "Overall Average Score",
+    ROUND(cs.ScorePerBadge::numeric, 2) AS "Score per Badge",
+    cs.UserLevel AS "User Level",
+    cs.HighestScorePostSummary AS "Post Summary",
+    cs.ReputationLevel AS "Reputation Level",
+    cs.ActivityLevel AS "Activity Level",
+    cs.BadgeEngagement AS "Badge Engagement",
+    cs.GlobalRank AS "Global Rank",
+    cs.ReputationRank AS "Reputation Rank",
+    cs.ReputationPercentile AS "Reputation Percentile",
+    ROUND(cs.ReputationPercentRank::numeric, 4) AS "Reputation Percent Rank",
+    CASE 
+        WHEN cs.Reputation > 100000 AND cs.PostCount > 50 THEN 'Top Performer'
+        WHEN cs.Reputation > 50000 AND cs.PostCount > 25 THEN 'High Performer'
+        WHEN cs.Reputation > 10000 AND cs.PostCount > 10 THEN 'Good Performer'
+        ELSE 'Standard Contributor'
+    END AS "Performance Category",
+    CONCAT('Rank #', cs.GlobalRank, ' - ', cs.DisplayName, ' - Rep:', cs.Reputation) AS "Ranking Summary",
+    CASE WHEN cs.GlobalRank <= 100 THEN 'Top 100' ELSE 'Below Top 100' END AS "TopRankingStatus",
+    CASE WHEN cs.Reputation > (SELECT AVG(Reputation) FROM Users) THEN 'AboveAverage' ELSE 'BelowAverage' END AS "RepVsAverage",
+    COALESCE(cs.ReputationLevel, 'Unknown') AS "RepLevelDetected"
+FROM CombinedStats cs
+WHERE cs.Reputation > 100
+  AND cs.PostCount > 0
+  AND cs.HighestScorePost > 50
+ORDER BY cs.Reputation DESC, cs.PostCount DESC
+OFFSET 100 ROWS
+FETCH NEXT 50 ROWS ONLY
+
+UNION ALL
+
+SELECT 
+    -1 AS "User ID",
+    'Aggregated Summary' AS "Display Name",
+    SUM(Reputation) AS "Reputation Points",
+    SUM(PostCount) AS "Number of Posts",
+    SUM(CommentCount) AS "Number of Comments",
+    SUM(BadgeCount) AS "Number of Badges",
+    AVG(AvgScorePerPost) AS "Average Score per Post",
+    MAX(HighestScorePost) AS "Highest Scoring Post",
+    NULL AS "Highest Scoring Post Title",
+    AVG(ScorePerAnswer) AS "Score per Answer",
+    AVG(ScorePerView) AS "Score per View",
+    AVG(OverallAvgScorePerPost) AS "Overall Average Score",
+    AVG(ScorePerBadge) AS "Score per Badge",
+    'Summary' AS "User Level",
+    'Total Statistics' AS "Post Summary",
+    'Summary' AS "Reputation Level",
+    'Summary' AS "Activity Level",
+    'Summary' AS "Badge Engagement",
+    0 AS "Global Rank",
+    0 AS "Reputation Rank",
+    100 AS "Reputation Percentile",
+    1.0 AS "Reputation Percent Rank",
+    'Aggregated' AS "Performance Category",
+    'Aggregated Data' AS "Ranking Summary",
+    'N/A' AS "TopRankingStatus",
+    'N/A' AS "RepVsAverage",
+    'N/A' AS "RepLevelDetected"
+FROM (
+    SELECT 
+        cs.UserId,
+        cs.DisplayName,
+        cs.Reputation,
+        cs.PostCount,
+        cs.CommentCount,
+        cs.BadgeCount,
+        cs.AvgScorePerPost,
+        cs.HighestScorePost,
+        cs.HighestScoringPostTitle,
+        cs.ScorePerAnswer,
+        cs.ScorePerView,
+        cs.OverallAvgScorePerPost,
+        cs.ScorePerBadge,
+        cs.UserLevel,
+        cs.HighestScorePostSummary,
+        cs.ReputationLevel,
+        cs.ActivityLevel,
+        cs.BadgeEngagement,
+        cs.GlobalRank,
+        cs.ReputationRank,
+        cs.ReputationPercentile,
+        cs.ReputationPercentRank
+    FROM CombinedStats cs
+    WHERE cs.Reputation > 10000
+) AS FilteredData
+GROUP BY 1,2
+HAVING COUNT(*) > 25;

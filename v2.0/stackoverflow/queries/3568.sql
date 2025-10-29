@@ -1,0 +1,105 @@
+WITH recent_questions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        COALESCE(u.Reputation, 0) AS OwnerReputation,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '30' DAY
+),
+top_recent_questions AS (
+    SELECT *
+    FROM recent_questions
+    WHERE rn = 1
+),
+user_badge_counts AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_badges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_badges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_badges,
+        SUM(CASE WHEN b.TagBased = TRUE THEN 1 ELSE 0 END) AS tag_based_badges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+close_reason_info AS (
+    SELECT
+        ph.PostId,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Comment END) AS close_reason_id,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.Comment END) AS reopen_reason_id
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (10, 11)
+    GROUP BY ph.PostId
+),
+tag_statistics AS (
+    SELECT
+        t.TagName,
+        t.Count                                   AS tag_total_posts,
+        SUM(CASE WHEN p.Score >= 0 THEN 1 ELSE 0 END) AS positive_score_posts,
+        SUM(CASE WHEN p.Score <  0 THEN 1 ELSE 0 END) AS negative_score_posts
+    FROM Tags t
+    LEFT JOIN Posts p
+      ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    GROUP BY t.TagName, t.Count
+)
+SELECT
+    q.Id                                    AS question_id,
+    q.Title,
+    q.CreationDate,
+    q.OwnerUserId,
+    u.DisplayName,
+    q.Score,
+    q.ViewCount,
+    COALESCE(bc.gold_badges,   0)           AS gold_badges,
+    COALESCE(bc.silver_badges, 0)           AS silver_badges,
+    COALESCE(bc.bronze_badges, 0)           AS bronze_badges,
+    COALESCE(bc.tag_based_badges, 0)        AS tag_based_badges,
+    cr.close_reason_id,
+    cr.reopen_reason_id,
+    STRING_AGG(DISTINCT tg.tag_name, ',')   AS tag_list,
+    COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS up_votes,
+    COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS down_votes,
+    AVG(COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END)) OVER (PARTITION BY q.OwnerUserId) AS avg_up_votes_per_user,
+    ROW_NUMBER() OVER (ORDER BY q.Score DESC, q.ViewCount DESC) AS rank_by_score,
+    (SELECT COUNT(*)
+       FROM Comments c
+      WHERE c.PostId = q.Id
+        AND c.Score > 0)                     AS positive_comment_count
+FROM top_recent_questions q
+LEFT JOIN Users u               ON q.OwnerUserId = u.Id
+LEFT JOIN user_badge_counts bc  ON u.Id = bc.UserId
+LEFT JOIN close_reason_info cr  ON q.Id = cr.PostId
+LEFT JOIN LATERAL (
+        SELECT UNNEST(STRING_TO_ARRAY(TRIM(BOTH '<>' FROM q.Tags), '><')) AS tag_name
+) tg ON TRUE
+LEFT JOIN tag_statistics ts     ON tg.tag_name = ts.TagName
+LEFT JOIN Votes v               ON v.PostId = q.Id
+GROUP BY
+    q.Id, q.Title, q.CreationDate, q.OwnerUserId, u.DisplayName,
+    q.Score, q.ViewCount,
+    bc.gold_badges, bc.silver_badges, bc.bronze_badges, bc.tag_based_badges,
+    cr.close_reason_id, cr.reopen_reason_id,
+    q.Tags, ts.TagName, q.OwnerUserId, u.DisplayName
+HAVING COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) > 5
+UNION ALL
+SELECT
+    NULL, '---', NULL, NULL, NULL,
+    NULL, NULL,
+    NULL, NULL, NULL, NULL,
+    NULL, NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL
+FROM (SELECT 1) AS dummy
+ORDER BY rank_by_score NULLS LAST
+LIMIT 100;

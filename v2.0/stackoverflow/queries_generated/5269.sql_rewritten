@@ -1,0 +1,123 @@
+-- {"query": "5269.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-5-nano", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 912} 
+WITH ranked_comments AS (
+  SELECT
+    c.Id AS CommentId,
+    c.PostId,
+    c.UserId,
+    c.Text,
+    c.CreationDate,
+    c.Score,
+    c.UserDisplayName,
+    ROW_NUMBER() OVER (PARTITION BY c.PostId ORDER BY c.Score DESC, c.CreationDate DESC) AS rn
+  FROM Comments c
+),
+top_posts AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.CommentCount,
+    p.AnswerCount,
+    p.Tags,
+    p.LastActivityDate,
+    p.PostTypeId,
+    u.Reputation AS OwnerReputation,
+    u.DisplayName AS OwnerDisplayName,
+    u.AccountId,
+    COALESCE(b.Class, 0) AS BadgeClass,
+    b.Name AS BadgeName,
+    b.Date AS BadgeDate
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Badges b ON b.UserId = u.Id
+    AND b.Date >= DATEADD(year, -1, cast('2024-10-01 12:34:56' as timestamp))
+  WHERE p.PostTypeId = 1 -- Questions
+    AND p.ViewCount > 0
+    AND p.Score > 0
+),
+correlated_votes AS (
+  SELECT
+    v.PostId,
+    SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
+    SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes,
+    MAX(v.CreationDate) AS LastVoteDate
+  FROM Votes v
+  JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+  GROUP BY v.PostId
+),
+linked_posts AS (
+  SELECT
+    pl.PostId,
+    pl.RelatedPostId,
+    lt.Name AS LinkTypeName,
+    pl.CreationDate
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+  WHERE lt.Name IN ('Linked', 'Duplicate')
+),
+recent_tag_mentions AS (
+  SELECT
+    t.Id,
+    t.TagName,
+    t.Count,
+    t.WikiPostId,
+    t.ExcerptPostId
+  FROM Tags t
+  WHERE t.IsModeratorOnly = 0
+),
+windowed_tags AS (
+  SELECT
+    t.TagName,
+    t.Count,
+    ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS rn
+  FROM recent_tag_mentions t
+)
+SELECT
+  tp.PostId,
+  tp.Title,
+  tp.CreationDate,
+  tp.OwnerUserId,
+  tp.OwnerDisplayName,
+  tp.OwnerReputation,
+  tp.ViewCount,
+  tp.CommentCount,
+  tp.AnswerCount,
+  tp.Tags,
+  tp.LastActivityDate,
+  tp.PostTypeId,
+  COALESCE(c.votes_agg, 0) AS NetVotes,
+  COALESCE(rn.rn, 0) AS TopTagRank,
+  ARRAY_AGG(DISTINCT cl.CommentId) FILTER (WHERE cl.rn = 1) AS TopCommentIds,
+  ARRAY_AGG(DISTINCT cl.Text) FILTER (WHERE cl.rn = 1) AS TopCommentTexts,
+  ro.LastVoteDate
+FROM top_posts tp
+LEFT JOIN correlated_votes c ON c.PostId = tp.PostId
+LEFT JOIN (SELECT 1 AS dummy) d ON TRUE
+LEFT JOIN ranked_comments cl ON cl.PostId = tp.PostId AND cl.rn = 1
+LEFT JOIN (
+  SELECT TagName, ROW_NUMBER() OVER (ORDER BY Count DESC) AS rn
+  FROM Tags
+  WHERE IsModeratorOnly = 0
+) rn ON 1=1
+LEFT JOIN correlated_votes ro ON ro.PostId = tp.PostId
+GROUP BY
+  tp.PostId,
+  tp.Title,
+  tp.CreationDate,
+  tp.OwnerUserId,
+  tp.OwnerDisplayName,
+  tp.OwnerReputation,
+  tp.ViewCount,
+  tp.CommentCount,
+  tp.AnswerCount,
+  tp.Tags,
+  tp.LastActivityDate,
+  tp.PostTypeId,
+  c.votes_agg,
+  rn.rn,
+  ro.LastVoteDate
+ORDER BY NetVotes DESC, tp.LastActivityDate DESC
+LIMIT 100;

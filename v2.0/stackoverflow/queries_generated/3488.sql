@@ -1,0 +1,128 @@
+-- {"query": "3488.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2728} 
+
+WITH UserStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.UpVotes,0) - COALESCE(u.DownVotes,0) AS NetVotes,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadges,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS QuestionCount,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS AnswerCount,
+        (SELECT AVG(p.Score) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId IN (1,2)) AS AvgPostScore,
+        MAX(p.LastActivityDate) AS LastActivity
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes
+),
+TagInfo AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        CASE WHEN t.IsModeratorOnly = 1 THEN 'Mod' ELSE 'User' END AS TagOwnerType,
+        COALESCE(e.Title, '') AS ExcerptTitle,
+        COALESCE(w.Title, '') AS WikiTitle
+    FROM Tags t
+    LEFT JOIN Posts e ON e.Id = t.ExcerptPostId
+    LEFT JOIN Posts w ON w.Id = t.WikiPostId
+),
+RecentVotes AS (
+    SELECT
+        v.UserId,
+        COUNT(*) FILTER (WHERE vt.Name = 'UpMod')      AS UpVotesRecent,
+        COUNT(*) FILTER (WHERE vt.Name = 'DownMod')    AS DownVotesRecent,
+        MAX(v.CreationDate)                           AS LastVoteDate
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE v.CreationDate >= CURRENT_DATE - INTERVAL '30 days'
+    GROUP BY v.UserId
+),
+ClosedQuestions AS (
+    SELECT
+        p.Id AS QuestionId,
+        ph.Comment::int                         AS CloseReasonId,
+        COALESCE(crt.Name, 'Unknown')           AS CloseReason,
+        ph.CreationDate                         AS ClosedDate
+    FROM Posts p
+    JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = ph.Comment::int
+    WHERE p.PostTypeId = 1
+)
+SELECT
+    us.Id,
+    us.DisplayName,
+    us.Reputation,
+    us.NetVotes,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    us.QuestionCount,
+    us.AnswerCount,
+    ROUND(us.AvgPostScore::numeric,2)          AS AvgPostScore,
+    us.LastActivity,
+    rv.UpVotesRecent,
+    rv.DownVotesRecent,
+    rv.LastVoteDate,
+    COALESCE(cq.CloseReason,'Open')            AS RecentCloseReason,
+    COALESCE(cq.ClosedDate::date,NULL)         AS RecentCloseDate,
+    STRING_AGG(DISTINCT ti.TagName, ', ') FILTER (WHERE ti.TagName IS NOT NULL) AS TopTags
+FROM UserStats us
+LEFT JOIN RecentVotes rv ON rv.UserId = us.Id
+LEFT JOIN (
+    SELECT
+        cq1.QuestionId,
+        cq1.CloseReason,
+        cq1.ClosedDate,
+        p.OwnerUserId
+    FROM ClosedQuestions cq1
+    JOIN Posts p ON p.Id = cq1.QuestionId
+    WHERE cq1.ClosedDate >= CURRENT_DATE - INTERVAL '7 days'
+) cq ON cq.OwnerUserId = us.Id
+LEFT JOIN (
+    SELECT
+        pt.OwnerUserId,
+        t.TagName,
+        ROW_NUMBER() OVER (PARTITION BY pt.OwnerUserId ORDER BY tg.Count DESC) AS rn
+    FROM Posts pt
+    CROSS JOIN LATERAL (
+        SELECT UNNEST(STRING_TO_ARRAY(TRIM(BOTH '<>' FROM pt.Tags), '><')) AS TagName
+    ) t
+    JOIN Tags tg ON tg.TagName = t.TagName
+    WHERE pt.PostTypeId = 1
+) ptags ON ptags.OwnerUserId = us.Id AND ptags.rn <= 5
+LEFT JOIN TagInfo ti ON ti.TagName = ptags.TagName
+GROUP BY
+    us.Id, us.DisplayName, us.Reputation, us.NetVotes,
+    us.GoldBadges, us.SilverBadges, us.BronzeBadges,
+    us.QuestionCount, us.AnswerCount, us.AvgPostScore,
+    us.LastActivity, rv.UpVotesRecent, rv.DownVotesRecent,
+    rv.LastVoteDate, cq.CloseReason, cq.ClosedDate
+HAVING COUNT(*) FILTER (WHERE ti.TagName IS NOT NULL) > 0
+
+UNION ALL
+
+SELECT
+    NULL                                   AS Id,
+    'Aggregate Summary'                    AS DisplayName,
+    NULL                                   AS Reputation,
+    NULL                                   AS NetVotes,
+    SUM(us.GoldBadges)                     AS GoldBadges,
+    SUM(us.SilverBadges)                   AS SilverBadges,
+    SUM(us.BronzeBadges)                   AS BronzeBadges,
+    SUM(us.QuestionCount)                  AS QuestionCount,
+    SUM(us.AnswerCount)                    AS AnswerCount,
+    ROUND(AVG(us.AvgPostScore)::numeric,2) AS AvgPostScore,
+    MAX(us.LastActivity)                   AS LastActivity,
+    SUM(rv.UpVotesRecent)                  AS UpVotesRecent,
+    SUM(rv.DownVotesRecent)                AS DownVotesRecent,
+    MAX(rv.LastVoteDate)                   AS LastVoteDate,
+    NULL                                   AS RecentCloseReason,
+    NULL                                   AS RecentCloseDate,
+    NULL                                   AS TopTags
+FROM UserStats us
+LEFT JOIN RecentVotes rv ON rv.UserId = us.Id
+WHERE us.Reputation > 10000
+ORDER BY Reputation DESC NULLS LAST
+LIMIT 100;

@@ -1,0 +1,153 @@
+with RecursiveTagCounts as (
+    select t.Id as TagId, t.TagName, t.Count,
+        coalesce(p.Score,0) as PostScore,
+        case when p.PostTypeId = 1 then 1 else 0 end as IsQuestion,
+        row_number() over (partition by t.Id order by p.CreationDate desc) as RN
+    from Tags t
+    left join Posts p
+        on p.Tags like '%' || '<' || t.TagName || '>' || '%'
+),
+FilteredTags as (
+    select TagId, TagName, Count, PostScore, IsQuestion
+    from RecursiveTagCounts 
+    where RN <= 5
+),
+UserStats as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Location,
+        u.CreationDate,
+        count(distinct b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(distinct b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(distinct b.Id) filter (where b.Class = 3) as BronzeBadges,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.Location, u.CreationDate
+),
+ActivePosts as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        count(c.Id) as CommentCount,
+        max(ph.CreationDate) as LastEditDate,
+        count(pl.Id) filter (where pl.LinkTypeId = 1) as LinkedPosts,
+        count(pl.Id) filter (where pl.LinkTypeId = 3) as DuplicatePosts
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+    left join PostHistory ph on ph.PostId = p.Id
+    left join PostLinks pl on pl.PostId = p.Id
+    where p.PostTypeId in (1,2)
+    group by p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Title
+),
+RankedAnswers as (
+    select 
+        a.Id,
+        a.ParentId as QuestionId,
+        a.Score,
+        a.CreationDate,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank,
+        count(*) over (partition by a.ParentId) as TotalAnswers
+    from Posts a
+    where a.PostTypeId = 2
+),
+ComplexAggregates as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.CreationDate as QuestionDate,
+        q.Score as QuestionScore,
+        coalesce(ra.AnswerRank,0) as AnswerRank,
+        ra.Id as AnswerId,
+        ra.Score as AnswerScore,
+        us.DisplayName as OwnerName,
+        us.Reputation as OwnerReputation,
+        us.GoldBadges,
+        us.SilverBadges,
+        us.BronzeBadges,
+        us.Location,
+        (select count(*) from Comments c where c.PostId = q.Id and c.CreationDate > q.CreationDate) as NewCommentsAfterQuestion,
+        (select count(*) from Votes v where v.PostId = q.Id and v.VoteTypeId = 2) as QuestionUpVotes,
+        (select count(*) from Votes v where v.PostId = ra.Id and v.VoteTypeId = 2) as AnswerUpVotes,
+        case when q.ClosedDate is null then 0 else 1 end as IsClosed,
+        case when q.AcceptedAnswerId = ra.Id then 1 else 0 end as IsAcceptedAnswer,
+        length(coalesce(q.Body, '')) - length(replace(coalesce(q.Body, ''), '<code>', '')) as CodeSnippetsInQuestion,
+        length(coalesce(cast(ra.Id as varchar), '')) as AnswerIdLength,
+        (ra.Score * (1 + coalesce(us.GoldBadges,0) * 0.1 + coalesce(us.SilverBadges,0) * 0.05)) as WeightedAnswerScore,
+        ra.TotalAnswers
+    from Posts q
+    left join RankedAnswers ra on ra.QuestionId = q.Id
+    left join UserStats us on us.UserId = q.OwnerUserId
+    where q.PostTypeId = 1
+)
+select 
+    ca.QuestionId,
+    ca.Title,
+    ca.OwnerName,
+    ca.OwnerReputation,
+    ca.GoldBadges,
+    ca.SilverBadges,
+    ca.BronzeBadges,
+    ca.Location,
+    ca.QuestionDate,
+    ca.QuestionScore,
+    ca.AnswerId,
+    ca.AnswerScore,
+    ca.AnswerRank,
+    ca.TotalAnswers,
+    ca.NewCommentsAfterQuestion,
+    ca.QuestionUpVotes,
+    ca.AnswerUpVotes,
+    ca.IsClosed,
+    ca.IsAcceptedAnswer,
+    ca.CodeSnippetsInQuestion,
+    ca.AnswerIdLength,
+    ca.WeightedAnswerScore,
+    t.TagName,
+    t.Count as TagCount,
+    t.PostScore as TagRelatedPostScore,
+    avg(vt.VoteTypeId) filter (where vt.VoteTypeId in (2,3)) over (partition by ca.OwnerName) as AvgVoteType
+from ComplexAggregates ca
+left join FilteredTags t on ('<' || t.TagName || '>') = any(string_to_array(ca.Title, ' '))
+left join Votes vt on vt.UserId = ca.OwnerUserId
+where ca.NewCommentsAfterQuestion > 2 and ca.QuestionScore > 5
+  and (ca.Location is null or ca.Location like '%United%')
+group by
+    ca.QuestionId,
+    ca.Title,
+    ca.OwnerName,
+    ca.OwnerReputation,
+    ca.GoldBadges,
+    ca.SilverBadges,
+    ca.BronzeBadges,
+    ca.Location,
+    ca.QuestionDate,
+    ca.QuestionScore,
+    ca.AnswerId,
+    ca.AnswerScore,
+    ca.AnswerRank,
+    ca.TotalAnswers,
+    ca.NewCommentsAfterQuestion,
+    ca.QuestionUpVotes,
+    ca.AnswerUpVotes,
+    ca.IsClosed,
+    ca.IsAcceptedAnswer,
+    ca.CodeSnippetsInQuestion,
+    ca.AnswerIdLength,
+    ca.WeightedAnswerScore,
+    t.TagName,
+    t.Count,
+    t.PostScore,
+    ca.OwnerUserId
+order by ca.WeightedAnswerScore desc, ca.QuestionDate desc
+limit 100;

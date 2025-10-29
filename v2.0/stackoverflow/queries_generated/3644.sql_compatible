@@ -1,0 +1,145 @@
+WITH UserStats AS (
+    SELECT 
+        u.Id                                 AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1)                         AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2)                         AS AnswerCount,
+        SUM(p.Score)                                                        AS TotalScore,
+        AVG(p.ViewCount)                                                    AS AvgViews,
+        MAX(u.LastAccessDate)                                               AS LastSeen,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1)                              AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2)                              AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3)                              AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Posts   p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges  b ON b.UserId      = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+TopTags AS (
+    SELECT 
+        us.UserId,
+        t.TagName,
+        COUNT(*)                                                   AS TagUseCount,
+        ROW_NUMBER() OVER (PARTITION BY us.UserId ORDER BY COUNT(*) DESC) AS rn
+    FROM UserStats us
+    JOIN Posts p                         ON p.OwnerUserId = us.UserId AND p.PostTypeId = 1
+    CROSS JOIN LATERAL (
+        SELECT unnest(string_to_array(trim(both '<>' FROM p.Tags), '><')) AS TagName
+    ) AS t
+    JOIN Tags tag                        ON tag.TagName = t.TagName
+    GROUP BY us.UserId, t.TagName
+),
+
+PostPerformance AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        COALESCE(p.FavoriteCount,0)                                    AS Favorites,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpVotes,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS DownVotes,
+        (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId = 10) AS CloseVotes,
+        CASE 
+            WHEN p.Score IS NULL THEN 0
+            ELSE p.Score
+        END
+        - NULLIF(
+            (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3),0
+          )                                                          AS NetScore,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC NULLS LAST) AS RankByScore
+    FROM Posts p
+    WHERE p.PostTypeId IN (1,2)
+),
+
+ClosedAndDuplicate AS (
+    SELECT 
+        ph.PostId,
+        ph.CreationDate,
+        CAST(ph.Comment AS INTEGER)                                AS CloseReasonId,
+        -- ensure ph.Text is treated as jsonb; if it's text, cast to jsonb first
+        CASE
+          WHEN pg_typeof(ph.Text) = 'jsonb'::text THEN ph.Text
+          ELSE NULL
+        END AS _maybe_jsonb_text,
+        -- extract JSON text using standard JSON functions; coerce ph.Text to jsonb when possible
+        CASE
+          WHEN (pg_typeof(ph.Text) = 'jsonb'::text) THEN (ph.Text ->> 'OriginalQuestionIds')
+          WHEN (pg_typeof(ph.Text) = 'text'::text) THEN (CAST(ph.Text AS jsonb) ->> 'OriginalQuestionIds')
+          ELSE NULL
+        END AS DuplicatesJson
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10
+),
+
+Aggregated AS (
+    SELECT 
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.QuestionCount,
+        us.AnswerCount,
+        us.TotalScore,
+        us.AvgViews,
+        us.GoldBadges,
+        us.SilverBadges,
+        us.BronzeBadges,
+        tt.TagName,
+        tt.TagUseCount,
+        pp.Title,
+        pp.Score,
+        pp.ViewCount,
+        pp.Favorites,
+        pp.UpVotes,
+        pp.DownVotes,
+        pp.NetScore,
+        pp.RankByScore,
+        COALESCE(cad.CloseReasonId,0)                              AS CloseReasonId,
+        COALESCE(cad.DuplicatesJson,'[]')                          AS DuplicateInfo
+    FROM UserStats us
+    LEFT JOIN TopTags tt            ON tt.UserId = us.UserId AND tt.rn = 1
+    LEFT JOIN Posts p               ON p.OwnerUserId = us.UserId AND p.PostTypeId = 1
+    LEFT JOIN PostPerformance pp   ON pp.Id = p.Id
+    LEFT JOIN ClosedAndDuplicate cad ON cad.PostId = p.Id
+    WHERE us.Reputation > 10000
+      AND (us.QuestionCount + us.AnswerCount) > 0
+      AND pp.RankByScore <= 5
+)
+
+SELECT *
+FROM Aggregated
+WHERE DuplicateInfo <> '[]' OR CloseReasonId <> 0
+
+UNION ALL
+
+SELECT
+    u.Id                                   AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    0                                      AS QuestionCount,
+    0                                      AS AnswerCount,
+    0                                      AS TotalScore,
+    0                                      AS AvgViews,
+    0                                      AS GoldBadges,
+    0                                      AS SilverBadges,
+    0                                      AS BronzeBadges,
+    NULL                                   AS TagName,
+    NULL                                   AS TagUseCount,
+    NULL                                   AS Title,
+    NULL                                   AS Score,
+    NULL                                   AS ViewCount,
+    NULL                                   AS Favorites,
+    NULL                                   AS UpVotes,
+    NULL                                   AS DownVotes,
+    NULL                                   AS NetScore,
+    NULL                                   AS RankByScore,
+    0                                      AS CloseReasonId,
+    '[]'                                   AS DuplicateInfo
+FROM Users u
+WHERE u.Reputation IS NULL OR u.Reputation < 10
+
+ORDER BY UserId, RankByScore NULLS LAST, CloseReasonId DESC;

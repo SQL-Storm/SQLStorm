@@ -1,0 +1,195 @@
+WITH UserActivity AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        MAX(b.Date) as LastBadgeDate,
+        STRING_AGG(DISTINCT p.Tags, ', ') FILTER (WHERE p.Tags IS NOT NULL) as AllTags,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) as ReputationRank,
+        RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) as PostRank
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.CreationDate >= '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopUsers AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        PostCount,
+        CommentCount,
+        BadgeCount,
+        QuestionCount,
+        AnswerCount,
+        REPUTATIONRANK,
+        POSTRANK,
+        CASE 
+            WHEN Reputation >= 100000 THEN 'Elite'
+            WHEN Reputation >= 10000 THEN 'Advanced'
+            WHEN Reputation >= 1000 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END as ReputationTier,
+        CASE 
+            WHEN PostCount >= 1000 THEN 'Veteran'
+            WHEN PostCount >= 100 THEN 'Experienced'
+            WHEN PostCount >= 10 THEN 'Regular'
+            ELSE 'Newbie'
+        END as PostingTier,
+        DENSE_RANK() OVER (ORDER BY PostCount DESC, CommentCount DESC) as ActivityRank,
+        AVG(Reputation) OVER (PARTITION BY 
+            CASE 
+                WHEN Reputation >= 100000 THEN 'Elite'
+                WHEN Reputation >= 10000 THEN 'Advanced'
+                WHEN Reputation >= 1000 THEN 'Intermediate'
+                ELSE 'Beginner'
+            END
+        ) as AvgReputationByTier
+    FROM UserActivity
+    WHERE PostCount > 0 OR CommentCount > 0 OR BadgeCount > 0
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count >= 1000 THEN 'Popular'
+            WHEN t.Count >= 100 THEN 'Moderate'
+            WHEN t.Count >= 10 THEN 'Niche'
+            ELSE 'Rare'
+        END as TagPopularity,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as PopularityRank,
+        LAG(t.Count, 1) OVER (ORDER BY t.Count DESC) - t.Count as PopularityDiff,
+        AVG(t.Count) OVER (ORDER BY t.Count DESC ROWS BETWEEN 4 PRECEDING AND 4 FOLLOWING) as MovingAvgCount
+    FROM Tags t
+    WHERE t.TagName IS NOT NULL AND t.Count > 0
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Title,
+        p.Tags,
+        CASE 
+            WHEN p.Score >= 100 THEN 'Hot'
+            WHEN p.Score >= 10 THEN 'Popular'
+            WHEN p.Score >= 0 THEN 'Average'
+            ELSE 'Low'
+        END as PopularityLevel,
+        CAST(p.LastActivityDate AS DATE) - CAST(p.CreationDate AS DATE) as AgeInDays,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NULL AND p.AnswerCount > 0 THEN 'Unanswered'
+            ELSE 'Not Question'
+        END as QuestionStatus,
+        SUM(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ROWS UNBOUNDED PRECEDING) as CumulativeScore,
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) as ScoreRank,
+        NTILE(10) OVER (ORDER BY p.ViewCount DESC) as ViewDecile,
+        MAX(p.ViewCount) OVER (PARTITION BY p.OwnerUserId) as MaxViewsPerUser
+    FROM Posts p
+    WHERE p.CreationDate >= '2020-01-01'
+),
+QuestionStats AS (
+    SELECT 
+        q.Id as QuestionId,
+        q.Title,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.CommentCount,
+        q.CreationDate,
+        q.LastActivityDate,
+        u.DisplayName as AuthorName,
+        u.Reputation as AuthorReputation,
+        COALESCE(u.Views, 0) as AuthorViews,
+        u.UpVotes as AuthorUpVotes,
+        u.DownVotes as AuthorDownVotes,
+        (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = q.Id) as AnswerCount,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = q.Id) as CommentCount,
+        STRING_AGG(DISTINCT SUBSTRING(q.Tags FROM 2 FOR (CHAR_LENGTH(q.Tags) - 2)), ', ') FILTER (WHERE q.Tags IS NOT NULL) as TagsList,
+        ROW_NUMBER() OVER (ORDER BY q.Score DESC) as ScoreRank,
+        DENSE_RANK() OVER (ORDER BY q.ViewCount DESC) as ViewRank,
+        AVG(q.Score) OVER (ORDER BY q.ViewCount DESC ROWS BETWEEN 9 PRECEDING AND 9 FOLLOWING) as AvgScoreByViews,
+        CASE 
+            WHEN q.AnswerCount > 0 THEN (SELECT AVG(p.Score) FROM Posts p WHERE p.ParentId = q.Id)
+            ELSE 0
+        END as AvgAnswerScore
+    FROM Posts q
+    LEFT JOIN Users u ON q.OwnerUserId = u.Id
+    WHERE q.PostTypeId = 1 
+    AND q.CreationDate >= '2020-01-01'
+    AND q.Score IS NOT NULL
+)
+SELECT 
+    'Performance Benchmark Report' as ReportTitle,
+    COUNT(*) as TotalUsers,
+    COUNT(DISTINCT CASE WHEN tu.ReputationTier = 'Elite' THEN tu.UserId END) as EliteUsers,
+    COUNT(DISTINCT CASE WHEN tu.PostingTier = 'Veteran' THEN tu.UserId END) as VeteranUsers,
+    COUNT(DISTINCT CASE WHEN ta.TagPopularity = 'Popular' THEN ta.TagName END) as PopularTags,
+    COUNT(DISTINCT CASE WHEN pa.PopularityLevel = 'Hot' THEN pa.Id END) as HotPosts,
+    COUNT(DISTINCT CASE WHEN qs.QuestionStatus = 'Answered' THEN qs.QuestionId END) as AnsweredQuestions,
+    (SELECT AVG(Reputation) FROM TopUsers) as AvgReputation,
+    (SELECT AVG(PostCount) FROM TopUsers) as AvgPostsPerUser,
+    (SELECT SUM(ViewCount) FROM Posts WHERE PostTypeId = 1 AND CreationDate >= '2020-01-01') as TotalViews,
+    (SELECT SUM(Score) FROM Posts WHERE PostTypeId = 1 AND CreationDate >= '2020-01-01') as TotalScore,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND CreationDate >= '2020-01-01') as TotalQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 2 AND CreationDate >= '2020-01-01') as TotalAnswers,
+    (SELECT COUNT(*) FROM Tags WHERE Count >= 100) as HighCountTags,
+    (SELECT COUNT(*) FROM Posts WHERE AnswerCount > 10 AND CreationDate >= '2020-01-01') as QuestionsWithManyAnswers,
+    (SELECT AVG(CAST(AnswerCount AS FLOAT)) FROM Posts WHERE PostTypeId = 1 AND CreationDate >= '2020-01-01') as AvgAnswersPerQuestion,
+    NULL as NullTest,
+    NULLIF('Test', 'Test') as NullIfTest,
+    CASE 
+        WHEN (SELECT COUNT(*) FROM Posts WHERE PostTypeId = 1 AND CreationDate >= '2020-01-01') > 0 
+        THEN (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1 AND CreationDate >= '2020-01-01')
+        ELSE 0
+    END as AverageQuestionScore,
+    (SELECT STRING_AGG(DisplayName, ', ') FROM TopUsers WHERE ReputationRank <= 10) as Top10UserNames,
+    (SELECT STRING_AGG(TagName, ', ') FROM TagAnalysis WHERE PopularityRank <= 5) as Top5PopularTags,
+    (SELECT STRING_AGG(Title, ', ') FROM QuestionStats WHERE ScoreRank <= 5) as Top5HighScoreQuestions,
+    (SELECT STRING_AGG(DisplayName, ', ') FROM Users WHERE Id IN (SELECT OwnerUserId FROM Posts WHERE PostTypeId = 1 AND Score >= 100)) as HighScoringQuestionAuthors,
+    (SELECT STRING_AGG(CONCAT(DisplayName, ': ', Score), '; ') FROM Users u JOIN Posts p ON u.Id = p.OwnerUserId WHERE p.PostTypeId = 1 AND p.CreationDate >= '2020-01-01' GROUP BY u.Id, u.DisplayName HAVING SUM(p.Score) >= 1000) as HighScoreEarners,
+    (SELECT COUNT(*) FROM Posts WHERE Score >= 50 AND PostTypeId = 1 AND CreationDate >= '2020-01-01') as HighScoreQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE Score >= 10 AND PostTypeId = 2 AND CreationDate >= '2020-01-01') as HighScoreAnswers,
+    (SELECT COUNT(*) FROM Posts WHERE ViewCount >= 5000 AND PostTypeId = 1 AND CreationDate >= '2020-01-01') as HighViewQuestions,
+    (SELECT COUNT(*) FROM Posts WHERE AnswerCount >= 10 AND PostTypeId = 1 AND CreationDate >= '2020-01-01') as QuestionsWithManyAnswers,
+    (SELECT COUNT(*) FROM Posts WHERE CommentCount >= 5 AND PostTypeId = 1 AND CreationDate >= '2020-01-01') as QuestionsWithManyComments,
+    (SELECT COUNT(*) FROM Posts WHERE FavoriteCount >= 5 AND PostTypeId = 1 AND CreationDate >= '2020-01-01') as QuestionsWithManyFavorites,
+    (SELECT COUNT(*) FROM Posts WHERE ParentId IS NOT NULL AND PostTypeId = 2 AND CreationDate >= '2020-01-01') as AnswerPostCount,
+    (SELECT COUNT(*) FROM Posts WHERE AcceptedAnswerId IS NOT NULL AND PostTypeId = 1 AND CreationDate >= '2020-01-01') as QuestionWithAcceptedAnswer,
+    (SELECT COUNT(*) FROM Posts WHERE Tags IS NOT NULL AND CHAR_LENGTH(Tags) > 5 AND PostTypeId = 1 AND CreationDate >= '2020-01-01') as QuestionWithTags,
+    (SELECT SUM(CAST(Score AS BIGINT)) FROM Posts WHERE PostTypeId = 1 AND CreationDate >= '2020-01-01') as TotalQuestionScore,
+    (SELECT SUM(CAST(ViewCount AS BIGINT)) FROM Posts WHERE PostTypeId = 1 AND CreationDate >= '2020-01-01') as TotalQuestionViews,
+    (SELECT SUM(CAST(AnswerCount AS BIGINT)) FROM Posts WHERE PostTypeId = 1 AND CreationDate >= '2020-01-01') as TotalAnswersCount,
+    (SELECT SUM(CAST(CommentCount AS BIGINT)) FROM Posts WHERE PostTypeId = 1 AND CreationDate >= '2020-01-01') as TotalCommentsCount
+FROM TopUsers tu
+CROSS JOIN TagAnalysis ta
+CROSS JOIN PostAnalysis pa
+CROSS JOIN QuestionStats qs
+WHERE EXISTS (SELECT 1 FROM Users u WHERE u.Id = tu.UserId)
+AND EXISTS (SELECT 1 FROM Tags t WHERE t.TagName = ta.TagName)
+AND EXISTS (SELECT 1 FROM Posts p WHERE p.Id = pa.Id)
+AND EXISTS (SELECT 1 FROM Posts q WHERE q.Id = qs.QuestionId);

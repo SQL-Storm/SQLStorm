@@ -1,0 +1,120 @@
+-- {"query": "3421.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2352} 
+WITH RecentPosts AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate > cast('2024-10-01' as date) - INTERVAL '30 days'
+),
+UserStats AS (
+    SELECT
+        u.Id               AS UserId,
+        u.DisplayName,
+        COALESCE(u.Reputation, 0)                     AS Reputation,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 2) AS SilverBadges,
+        (SELECT COUNT(*) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 3) AS BronzeBadges,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS QuestionCount,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS AnswerCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 2)     AS UpVoteGiven,
+        (SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 3)     AS DownVoteGiven
+    FROM Users u
+    WHERE u.Id IS NOT NULL
+),
+TagPopularity AS (
+    SELECT
+        t.TagName,
+        t.Count                     AS TagUseCount,
+        COALESCE(SUM(p.ViewCount),0) AS TotalViews,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank
+    FROM Tags t
+    LEFT JOIN Posts p
+           ON p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+          AND p.PostTypeId = 1
+    GROUP BY t.TagName, t.Count
+    HAVING t.Count > 1000
+),
+TopUsers AS (
+    SELECT
+        us.UserId,
+        us.DisplayName,
+        us.Reputation,
+        (us.GoldBadges * 3 + us.SilverBadges * 2 + us.BronzeBadges) AS BadgeScore,
+        us.QuestionCount,
+        us.AnswerCount,
+        RANK() OVER (ORDER BY us.Reputation DESC, BadgeScore DESC) AS ReputationRank
+    FROM UserStats us
+    WHERE us.Reputation > 50000
+)
+SELECT
+    tu.UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.BadgeScore,
+    tu.QuestionCount,
+    tu.AnswerCount,
+    tu.ReputationRank,
+    rp.Id                     AS RecentPostId,
+    rp.Title                  AS RecentPostTitle,
+    rp.Score                  AS RecentPostScore,
+    rp.ViewCount              AS RecentPostViews,
+    COALESCE(vc.UpVotes,0) - COALESCE(vc.DownVotes,0) AS NetVotes,
+    tp.TagName,
+    tp.TagUseCount,
+    tp.TotalViews,
+    tp.TagRank
+FROM TopUsers tu
+LEFT JOIN RecentPosts rp
+       ON rp.OwnerUserId = tu.UserId
+      AND rp.rn = 1
+LEFT JOIN (
+    SELECT
+        p.OwnerUserId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    GROUP BY p.OwnerUserId
+) vc ON vc.OwnerUserId = tu.UserId
+LEFT JOIN TagPopularity tp ON tp.TagRank <= 5
+WHERE (tu.AnswerCount > 0 OR tu.QuestionCount > 0)
+
+UNION ALL
+
+SELECT
+    NULL AS UserId,
+    NULL AS DisplayName,
+    NULL AS Reputation,
+    NULL AS BadgeScore,
+    NULL AS QuestionCount,
+    NULL AS AnswerCount,
+    NULL AS ReputationRank,
+    p.Id                     AS RecentPostId,
+    p.Title                  AS RecentPostTitle,
+    p.Score                  AS RecentPostScore,
+    p.ViewCount              AS RecentPostViews,
+    CAST(NULL AS INT)        AS NetVotes,
+    t.TagName,
+    t.TagUseCount,
+    t.TotalViews,
+    t.TagRank
+FROM Posts p
+CROSS APPLY (
+    SELECT UNNEST(string_to_array(TRIM(BOTH '<>' FROM p.Tags), '><')) AS Tag
+) AS taglist
+JOIN Tags t ON t.TagName = taglist.Tag
+WHERE p.PostTypeId = 1
+  AND p.CreationDate > cast('2024-10-01' as date) - INTERVAL '7 days'
+  AND t.TagRank <= 5
+
+ORDER BY
+    ReputationRank NULLS LAST,
+    TagRank        NULLS LAST,
+    RecentPostScore DESC
+LIMIT 100;

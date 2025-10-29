@@ -1,0 +1,503 @@
+-- {"query": "7372.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 4835} 
+WITH PostStats AS (
+    SELECT 
+        p.Id as PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Title,
+        p.Tags,
+        COALESCE(p.Body, '') as Body,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Question with Accepted Answer'
+            WHEN p.PostTypeId = 1 THEN 'Question without Accepted Answer'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END as PostTypeCategory,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) as UserPostRank,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) as ScoreRank,
+        NTILE(10) OVER (ORDER BY p.ViewCount DESC) as ViewDecile,
+        LAG(p.Score, 1) OVER (ORDER BY p.CreationDate) as PrevScore,
+        LEAD(p.Score, 1) OVER (ORDER BY p.CreationDate) as NextScore,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) as AvgUserScore,
+        MAX(p.Score) OVER (PARTITION BY p.OwnerUserId) as MaxUserScore,
+        MIN(p.Score) OVER (PARTITION BY p.OwnerUserId) as MinUserScore,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) as TotalUserPosts
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.AccountId,
+        COUNT(DISTINCT ps.PostId) as TotalPosts,
+        SUM(ps.Score) as TotalScore,
+        AVG(ps.Score) as AvgScore,
+        MAX(ps.Score) as MaxScore,
+        MIN(ps.Score) as MinScore,
+        SUM(ps.ViewCount) as TotalViews,
+        AVG(ps.ViewCount) as AvgViews,
+        COUNT(DISTINCT ps.AnswerCount) as AnswerCountVariance,
+        COUNT(DISTINCT ps.CommentCount) as CommentCountVariance,
+        CASE 
+            WHEN COUNT(DISTINCT ps.PostId) > 0 THEN (SUM(ps.Score) * 100.0) / COUNT(DISTINCT ps.PostId)
+            ELSE 0 
+        END as ScorePerPostRatio,
+        CASE 
+            WHEN MAX(ps.CreationDate) IS NOT NULL AND MIN(ps.CreationDate) IS NOT NULL THEN 
+                EXTRACT(DAY FROM (MAX(ps.CreationDate) - MIN(ps.CreationDate)))
+            ELSE 0 
+        END as ActivitySpanDays,
+        CASE 
+            WHEN COUNT(DISTINCT ps.PostId) > 0 THEN 
+                (COUNT(DISTINCT ps.PostId) * 100.0) / (SELECT COUNT(*) FROM Posts)
+            ELSE 0 
+        END as PostPercentageOfTotal,
+        STRING_AGG(ps.Title, ', ') as AllPostTitles
+    FROM Users u
+    LEFT JOIN PostStats ps ON u.Id = ps.OwnerUserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.AccountId
+),
+TagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 100 THEN 'High Popularity'
+            WHEN t.Count > 50 THEN 'Medium Popularity'
+            WHEN t.Count > 10 THEN 'Low Popularity'
+            ELSE 'Very Low Popularity'
+        END as PopularityLevel,
+        CASE 
+            WHEN t.IsRequired = 1 THEN 'Required Tag'
+            WHEN t.IsModeratorOnly = 1 THEN 'Moderator Only Tag'
+            ELSE 'Regular Tag'
+        END as TagType,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) as TagRank,
+        PERCENT_RANK() OVER (ORDER BY t.Count) as TagPercentile,
+        LAG(t.Count, 1) OVER (ORDER BY t.Count DESC) as PrevTagCount,
+        LEAD(t.Count, 1) OVER (ORDER BY t.Count DESC) as NextTagCount,
+        AVG(t.Count) OVER () as AvgTagCount,
+        MAX(t.Count) OVER () as MaxTagCount,
+        MIN(t.Count) OVER () as MinTagCount
+    FROM Tags t
+    WHERE t.TagName IS NOT NULL AND LENGTH(TRIM(t.TagName)) > 0
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        ps.PostId,
+        ps.PostTypeId,
+        ps.OwnerUserId,
+        ps.Score,
+        ps.ViewCount,
+        ps.AnswerCount,
+        ps.CommentCount,
+        ps.FavoriteCount,
+        ps.Title,
+        ps.Tags,
+        ps.Body,
+        ps.PostTypeCategory,
+        ps.UserPostRank,
+        ps.ScoreRank,
+        ps.ViewDecile,
+        ps.PrevScore,
+        ps.NextScore,
+        ps.AvgUserScore,
+        ps.MaxUserScore,
+        ps.MinUserScore,
+        ps.TotalUserPosts,
+        CASE 
+            WHEN ps.Score > 0 AND ps.Score >= ps.AvgUserScore THEN 'Above Average'
+            WHEN ps.Score > 0 AND ps.Score >= ps.AvgUserScore * 0.7 THEN 'Below Average but Positive'
+            WHEN ps.Score = 0 THEN 'Zero Score'
+            ELSE 'Negative Score'
+        END as ScoreCategory,
+        CASE 
+            WHEN ps.ViewCount > 0 AND ps.ViewCount >= (SELECT AVG(ViewCount) FROM Posts WHERE ViewCount IS NOT NULL) THEN 'Above Average Views'
+            WHEN ps.ViewCount > 0 AND ps.ViewCount >= (SELECT AVG(ViewCount) FROM Posts WHERE ViewCount IS NOT NULL) * 0.7 THEN 'Below Average Views'
+            WHEN ps.ViewCount = 0 THEN 'No Views'
+            ELSE 'Negative Views'
+        END as ViewCategory,
+        CASE 
+            WHEN ps.AnswerCount >= 10 THEN 'High Engagement'
+            WHEN ps.AnswerCount >= 5 THEN 'Medium Engagement'
+            WHEN ps.AnswerCount >= 1 THEN 'Low Engagement'
+            ELSE 'No Answers'
+        END as EngagementLevel,
+        CASE 
+            WHEN ps.CommentCount >= 10 THEN 'High Comments'
+            WHEN ps.CommentCount >= 5 THEN 'Medium Comments'
+            WHEN ps.CommentCount >= 1 THEN 'Low Comments'
+            ELSE 'No Comments'
+        END as CommentLevel,
+        CASE 
+            WHEN ps.FavoriteCount > 10 THEN 'High Favorites'
+            WHEN ps.FavoriteCount > 5 THEN 'Medium Favorites'
+            WHEN ps.FavoriteCount > 0 THEN 'Low Favorites'
+            ELSE 'No Favorites'
+        END as FavoriteLevel,
+        CASE 
+            WHEN ps.Tags IS NOT NULL AND LENGTH(TRIM(ps.Tags)) > 0 THEN
+                array_length(string_to_array(trim(ps.Tags, '<>'), '><'), 1)
+            ELSE 0
+        END as TagCount,
+        CASE 
+            WHEN ps.Body IS NOT NULL AND LENGTH(ps.Body) > 100 THEN 
+                LEFT(ps.Body, 100) || '...'
+            WHEN ps.Body IS NOT NULL THEN ps.Body
+            ELSE ''
+        END as BodyPreview,
+        -- Complex calculation for post complexity score
+        CAST(
+            (LENGTH(ps.Body) / 100.0) * 
+            (ps.AnswerCount * 0.5) * 
+            (ps.CommentCount * 0.3) * 
+            (ps.FavoriteCount * 0.7) * 
+            (ps.ViewCount / 1000.0) +
+            ps.Score * 0.1
+            AS NUMERIC(10,2)
+        ) as PostComplexityScore,
+        -- Calculating time-based metrics
+        EXTRACT(DAY FROM (ps.LastActivityDate - ps.CreationDate)) as ActivityDurationDays,
+        CASE 
+            WHEN ps.LastActivityDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '7 days' THEN 'Recently Active'
+            WHEN ps.LastActivityDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days' THEN 'Active Last Month'
+            WHEN ps.LastActivityDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '90 days' THEN 'Active Last Quarter'
+            ELSE 'Inactive'
+        END as ActivityStatus,
+        -- Calculating engagement ratio
+        CASE 
+            WHEN ps.ViewCount > 0 THEN ps.AnswerCount::NUMERIC / ps.ViewCount
+            WHEN ps.AnswerCount > 0 THEN ps.AnswerCount::NUMERIC
+            ELSE 0
+        END as AnswerPerViewRatio,
+        -- Correlated subquery for identifying posts with scores above user average
+        EXISTS(
+            SELECT 1 FROM PostStats ps2 
+            WHERE ps2.OwnerUserId = ps.OwnerUserId 
+            AND ps2.Score > (SELECT AVG(ps3.Score) FROM PostStats ps3 WHERE ps3.OwnerUserId = ps.OwnerUserId)
+        ) as HasAboveAverageScore,
+        -- Correlated subquery for finding related posts with similar tags
+        (
+            SELECT COUNT(*) FROM Posts p2
+            JOIN (
+                SELECT unnest(string_to_array(trim(t1.Tags, '<>'), '><')) as Tag
+                FROM Posts t1
+                WHERE t1.Id = ps.PostId
+            ) related_tags ON p2.Tags LIKE '%' || related_tags.Tag || '%'
+            WHERE p2.Id != ps.PostId 
+            AND p2.PostTypeId = ps.PostTypeId
+            AND p2.CreatedDate >= ps.CreatedDate - INTERVAL '30 days'
+        ) as RelatedPostCount
+    FROM PostStats ps
+),
+FinalPostAnalysis AS (
+    SELECT 
+        apa.PostId,
+        apa.PostTypeId,
+        apa.OwnerUserId,
+        apa.Score,
+        apa.ViewCount,
+        apa.AnswerCount,
+        apa.CommentCount,
+        apa.FavoriteCount,
+        apa.Title,
+        apa.Tags,
+        apa.BodyPreview,
+        apa.PostTypeCategory,
+        apa.UserPostRank,
+        apa.ScoreRank,
+        apa.ViewDecile,
+        apa.ScoreCategory,
+        apa.ViewCategory,
+        apa.EngagementLevel,
+        apa.CommentLevel,
+        apa.FavoriteLevel,
+        apa.TagCount,
+        apa.PostComplexityScore,
+        apa.ActivityDurationDays,
+        apa.ActivityStatus,
+        apa.AnswerPerViewRatio,
+        apa.HasAboveAverageScore,
+        apa.RelatedPostCount,
+        -- Calculating weighted score
+        (
+            apa.Score * 0.3 + 
+            apa.ViewCount * 0.2 + 
+            apa.AnswerCount * 0.2 + 
+            apa.CommentCount * 0.1 + 
+            apa.FavoriteCount * 0.2
+        ) AS WeightedScore,
+        -- Calculating normalized score
+        CASE 
+            WHEN apa.Score > 0 THEN 
+                (apa.Score - (SELECT AVG(Score) FROM Posts WHERE Score IS NOT NULL)) / 
+                (SELECT STDDEV(Score) FROM Posts WHERE Score IS NOT NULL)
+            ELSE 0 
+        END as NormalizedScore,
+        -- Checking if post is trending (based on view count)
+        CASE 
+            WHEN apa.ViewCount > 5000 THEN 'Trending'
+            WHEN apa.ViewCount > 1000 THEN 'Popular'
+            WHEN apa.ViewCount > 100 THEN 'Moderate'
+            ELSE 'Low Traffic'
+        END as TrendingCategory,
+        -- Identifying posts with high complexity
+        CASE 
+            WHEN apa.PostComplexityScore > 15 THEN 'High Complexity'
+            WHEN apa.PostComplexityScore > 10 THEN 'Medium Complexity'
+            WHEN apa.PostComplexityScore > 5 THEN 'Low Complexity'
+            ELSE 'Very Low Complexity'
+        END as ComplexityLevel,
+        -- Correlated subquery for finding most similar posts based on tag overlap
+        (
+            SELECT COUNT(*) FROM Posts p1
+            WHERE p1.Tags <> apa.Tags
+            AND EXISTS(
+                SELECT 1 FROM unnest(string_to_array(trim(apa.Tags, '<>'), '><')) t1
+                WHERE EXISTS(
+                    SELECT 1 FROM unnest(string_to_array(trim(p1.Tags, '<>'), '><')) t2
+                    WHERE t1 = t2
+                )
+            )
+        ) as TagOverlapCount
+    FROM ComplexPostAnalysis apa
+),
+UserAndPostCombined AS (
+    SELECT 
+        ups.UserId,
+        ups.DisplayName,
+        ups.Reputation,
+        ups.Views,
+        ups.UpVotes,
+        ups.DownVotes,
+        ups.AccountId,
+        ups.TotalPosts,
+        ups.TotalScore,
+        ups.AvgScore,
+        ups.MaxScore,
+        ups.MinScore,
+        ups.TotalViews,
+        ups.AvgViews,
+        ups.AnswerCountVariance,
+        ups.CommentCountVariance,
+        ups.ScorePerPostRatio,
+        ups.ActivitySpanDays,
+        ups.PostPercentageOfTotal,
+        ups.AllPostTitles,
+        COALESCE(fpa.PostId, 0) as PostId,
+        COALESCE(fpa.PostTypeId, 0) as PostTypeId,
+        COALESCE(fpa.Score, 0) as Score,
+        COALESCE(fpa.ViewCount, 0) as ViewCount,
+        COALESCE(fpa.AnswerCount, 0) as AnswerCount,
+        COALESCE(fpa.CommentCount, 0) as CommentCount,
+        COALESCE(fpa.FavoriteCount, 0) as FavoriteCount,
+        COALESCE(fpa.Title, 'No Title') as Title,
+        COALESCE(fpa.Tags, 'No Tags') as Tags,
+        COALESCE(fpa.BodyPreview, 'No Preview') as BodyPreview,
+        COALESCE(fpa.PostTypeCategory, 'Unknown') as PostTypeCategory,
+        COALESCE(fpa.UserPostRank, 0) as UserPostRank,
+        COALESCE(fpa.ScoreRank, 0) as ScoreRank,
+        COALESCE(fpa.ViewDecile, 0) as ViewDecile,
+        COALESCE(fpa.ScoreCategory, 'Unknown') as ScoreCategory,
+        COALESCE(fpa.ViewCategory, 'Unknown') as ViewCategory,
+        COALESCE(fpa.EngagementLevel, 'Unknown') as EngagementLevel,
+        COALESCE(fpa.CommentLevel, 'Unknown') as CommentLevel,
+        COALESCE(fpa.FavoriteLevel, 'Unknown') as FavoriteLevel,
+        COALESCE(fpa.TagCount, 0) as TagCount,
+        COALESCE(fpa.PostComplexityScore, 0) as PostComplexityScore,
+        COALESCE(fpa.ActivityDurationDays, 0) as ActivityDurationDays,
+        COALESCE(fpa.ActivityStatus, 'Unknown') as ActivityStatus,
+        COALESCE(fpa.AnswerPerViewRatio, 0) as AnswerPerViewRatio,
+        COALESCE(fpa.HasAboveAverageScore, false) as HasAboveAverageScore,
+        COALESCE(fpa.RelatedPostCount, 0) as RelatedPostCount,
+        COALESCE(fpa.WeightedScore, 0) as WeightedScore,
+        COALESCE(fpa.NormalizedScore, 0) as NormalizedScore,
+        COALESCE(fpa.TrendingCategory, 'Unknown') as TrendingCategory,
+        COALESCE(fpa.ComplexityLevel, 'Unknown') as ComplexityLevel,
+        COALESCE(fpa.TagOverlapCount, 0) as TagOverlapCount,
+        -- Advanced filtering for performance testing
+        CASE 
+            WHEN ups.TotalPosts > 0 AND ups.TotalScore > 0 AND ups.AvgScore > 0 THEN 
+                'High Activity'
+            WHEN ups.TotalPosts > 0 AND ups.TotalScore = 0 THEN 'Low Activity'
+            WHEN ups.TotalPosts > 0 AND ups.TotalScore < 0 THEN 'Negative Activity'
+            ELSE 'No Activity'
+        END as UserActivityLevel
+    FROM UserActivityStats ups
+    LEFT JOIN FinalPostAnalysis fpa ON ups.UserId = fpa.OwnerUserId
+)
+SELECT 
+    uap.UserId,
+    uap.DisplayName,
+    uap.Reputation,
+    uap.Views,
+    uap.UpVotes,
+    uap.DownVotes,
+    uap.AccountId,
+    uap.TotalPosts,
+    uap.TotalScore,
+    uap.AvgScore,
+    uap.MaxScore,
+    uap.MinScore,
+    uap.TotalViews,
+    uap.AvgViews,
+    uap.AnswerCountVariance,
+    uap.CommentCountVariance,
+    uap.ScorePerPostRatio,
+    uap.ActivitySpanDays,
+    uap.PostPercentageOfTotal,
+    uap.AllPostTitles,
+    uap.PostId,
+    uap.PostTypeId,
+    uap.Score,
+    uap.ViewCount,
+    uap.AnswerCount,
+    uap.CommentCount,
+    uap.FavoriteCount,
+    uap.Title,
+    uap.Tags,
+    uap.BodyPreview,
+    uap.PostTypeCategory,
+    uap.UserPostRank,
+    uap.ScoreRank,
+    uap.ViewDecile,
+    uap.ScoreCategory,
+    uap.ViewCategory,
+    uap.EngagementLevel,
+    uap.CommentLevel,
+    uap.FavoriteLevel,
+    uap.TagCount,
+    uap.PostComplexityScore,
+    uap.ActivityDurationDays,
+    uap.ActivityStatus,
+    uap.AnswerPerViewRatio,
+    uap.HasAboveAverageScore,
+    uap.RelatedPostCount,
+    uap.WeightedScore,
+    uap.NormalizedScore,
+    uap.TrendingCategory,
+    uap.ComplexityLevel,
+    uap.TagOverlapCount,
+    uap.UserActivityLevel,
+    -- Calculated derived columns for optimization benchmarking
+    CASE 
+        WHEN uap.TotalPosts > 0 THEN uap.WeightedScore / uap.TotalPosts
+        ELSE 0 
+    END as AverageWeightedScorePerPost,
+    CASE 
+        WHEN uap.Score > 0 THEN uap.Score * uap.ViewCount
+        ELSE 0 
+    END as ScoreViewProduct,
+    CASE 
+        WHEN uap.AvgScore > 0 THEN (uap.Score - uap.AvgScore) * 100 / uap.AvgScore
+        ELSE 0 
+    END as ScoreDeviationPercent,
+    CASE 
+        WHEN uap.ViewCount > 0 THEN uap.AnswerCount * 100.0 / uap.ViewCount
+        ELSE 0 
+    END as AnswerViewRatioPercent,
+    -- Complex expressions for performance testing
+    TRIM(UPPER(uap.Title)) as UpperTitle,
+    LEFT(LOWER(uap.AllPostTitles), 50) as ShortTitleList,
+    CASE 
+        WHEN uap.PostId IS NOT NULL THEN
+            ARRAY_TO_STRING(
+                ARRAY[
+                    CAST(uap.Score AS VARCHAR),
+                    CAST(uap.ViewCount AS VARCHAR),
+                    CAST(uap.AnswerCount AS VARCHAR)]
+                , ' | '
+            )
+        ELSE 'No Post Data'
+    END as PostMetricsString,
+    -- Set operators for performance benchmarking (UNION ALL - requires different columns)
+    CASE 
+        WHEN uap.Score > 0 AND uap.FavoriteCount > 0 THEN 'High Scoring Favorite'
+        WHEN uap.Score > 0 AND uap.ViewCount > 1000 THEN 'High Scoring High View'
+        WHEN uap.Score < 0 THEN 'Low Scoring'
+        ELSE 'Average'
+    END as ActivityClassification,
+    -- Advanced string operations
+    REGEXP_REPLACE(uap.Tags, '[^A-Za-z0-9_]', ' ', 'g') as CleanedTags,
+    LENGTH(COALESCE(uap.BodyPreview, '')) as BodyPreviewLength,
+    CASE 
+        WHEN uap.Tags IS NOT NULL AND POSITION('C#' IN uap.Tags) > 0 THEN 'ContainsCSharp'
+        WHEN uap.Tags IS NOT NULL AND POSITION('Python' IN uap.Tags) > 0 THEN 'ContainsPython'
+        WHEN uap.Tags IS NOT NULL AND POSITION('Java' IN uap.Tags) > 0 THEN 'ContainsJava'
+        ELSE 'OtherLanguage'
+    END as ProgrammingLanguageTag,
+    -- Null handling in calculations
+    COALESCE(uap.Score, 0) + COALESCE(uap.ViewCount, 0) as ScoreAndViewSum,
+    CASE 
+        WHEN uap.Score IS NOT NULL AND uap.ViewCount IS NOT NULL THEN
+            uap.Score + uap.ViewCount
+        ELSE NULL 
+    END as ScoreAndViewSumWithNullCheck,
+    -- Window function combinations
+    ROW_NUMBER() OVER (ORDER BY uap.WeightedScore DESC) as OverallWeightedRank,
+    DENSE_RANK() OVER (PARTITION BY uap.UserActivityLevel ORDER BY uap.WeightedScore DESC) as ActivityLevelRank,
+    -- Correlated subquery performance test
+    (
+        SELECT COUNT(*) 
+        FROM Comments c 
+        WHERE c.PostId = uap.PostId 
+        AND (
+            SELECT COUNT(*) 
+            FROM Posts p 
+            WHERE p.Id = c.PostId AND p.OwnerUserId = uap.UserId
+        ) > 0
+    ) as CommentPostMatchCount,
+    -- Complex boolean expressions
+    CASE 
+        WHEN uap.Score > 100 AND uap.ViewCount > 10000 AND uap.AnswerCount > 50 THEN 
+            'Elite Content Creator'
+        WHEN uap.Score > 50 AND uap.ViewCount > 5000 AND uap.AnswerCount > 20 THEN 
+            'Experienced Content Creator'
+        WHEN uap.Score > 10 AND uap.ViewCount > 1000 THEN 
+            'Beginner Content Creator'
+        ELSE 'New Content Creator'
+    END as CreatorTier,
+    -- Performance measurement column
+    cast('2024-10-01 12:34:56' as timestamp) as BenchmarkTimestamp
+FROM UserAndPostCombined uap
+WHERE 
+    uap.UserId IS NOT NULL 
+    AND (
+        uap.PostId IS NOT NULL 
+        OR uap.TotalPosts IS NOT NULL
+    )
+    AND uap.Score IS NOT NULL
+    AND uap.Reputation >= 0
+    AND (
+        uap.TrendingCategory IN ('Trending', 'Popular') 
+        OR uap.UserActivityLevel IN ('High Activity', 'Low Activity')
+    )
+    AND (
+        uap.PostComplexityScore IS NOT NULL 
+        AND uap.PostComplexityScore > 0
+    )
+    AND (
+        uap.ActivityDurationDays IS NOT NULL 
+        AND uap.ActivityDurationDays >= 0
+    )
+    AND (uap.Score > -50 OR uap.ViewCount > 5000)
+ORDER BY 
+    uap.WeightedScore DESC,
+    uap.Reputation DESC,
+    uap.TotalViews DESC
+LIMIT 1000;

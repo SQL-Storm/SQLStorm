@@ -1,0 +1,107 @@
+WITH
+RecentTagStats AS (
+  SELECT
+    t.TagName,
+    t.Id AS TagId,
+    COUNT(p.Id) AS PostCount,
+    SUM(p.Score) AS ScoreSum,
+    AVG(p.ViewCount) AS AvgViews,
+    ROW_NUMBER() OVER (ORDER BY COUNT(p.Id) DESC, SUM(p.Score) DESC) AS rn
+  FROM Posts p
+  -- expand tag list using a derived table of tag names
+  JOIN (
+    SELECT p2.Id AS PostId,
+           regexp_split_to_table(substring(p2.Tags FROM 2 FOR char_length(p2.Tags)-2), '><') AS tagname
+    FROM Posts p2
+    WHERE p2.PostTypeId = 1
+  ) ttags ON ttags.PostId = p.Id
+  JOIN Tags t ON t.TagName = ttags.tagname
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180 days'
+  GROUP BY t.TagName, t.Id
+),
+PostsWithLatestEdit AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastEditDate,
+    (
+      SELECT MAX(le.CreationDate)
+      FROM PostHistory le
+      WHERE le.PostId = p.Id
+        AND le.PostHistoryTypeId IN (4,5,6)
+    ) AS LatestEditDate
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+ClosedReopened AS (
+  SELECT
+    ph1.PostId,
+    ph1.CreationDate AS CloseDate,
+    MAX(ph2.CreationDate) AS ReopenDate,
+    CASE
+      WHEN MAX(ph2.CreationDate) IS NULL THEN false
+      ELSE MAX(ph2.CreationDate) > ph1.CreationDate
+    END AS ReopenAfterClose
+  FROM PostHistory ph1
+  LEFT JOIN PostHistory ph2
+    ON ph2.PostId = ph1.PostId
+   AND ph2.PostHistoryTypeId = 11
+  WHERE ph1.PostHistoryTypeId = 10
+  GROUP BY ph1.PostId, ph1.CreationDate
+),
+UserRanks AS (
+  SELECT
+    u.Id AS UserId,
+    u.Reputation,
+    u.CreationDate,
+    RANK() OVER (ORDER BY u.Reputation DESC, u.CreationDate) AS RepRank
+  FROM Users u
+  WHERE u.AccountId IS NOT NULL
+)
+SELECT
+  rts.TagName,
+  rts.TagId,
+  rts.PostCount,
+  rts.ScoreSum,
+  rts.AvgViews,
+
+  pwle.Id AS PostId,
+  pwle.Title,
+  pwle.OwnerUserId,
+  pwle.CreationDate AS PostCreationDate,
+  pwle.LastEditDate,
+
+  cr.PostId AS ClosedPostId,
+  cr.CloseDate,
+  cr.ReopenDate,
+  cr.ReopenAfterClose,
+
+  ur.UserId,
+  ur.Reputation,
+  ur.CreationDate AS UserCreationDate,
+  ur.RepRank,
+
+  CASE
+    WHEN pwle.OwnerUserId IS NULL THEN 'Anonymous'
+    ELSE COALESCE(u.DisplayName, 'Unknown')
+  END AS DisplayNameAlias,
+  CASE
+    WHEN b.Id IS NULL THEN 0
+    ELSE b.Class
+  END AS BadgedClass
+FROM RecentTagStats rts
+LEFT JOIN PostsWithLatestEdit pwle
+  ON pwle.OwnerUserId IS NOT NULL
+LEFT JOIN ClosedReopened cr
+  ON cr.PostId = pwle.Id
+LEFT JOIN Users u
+  ON u.Id = pwle.OwnerUserId
+LEFT JOIN Badges b
+  ON b.UserId = pwle.OwnerUserId
+LEFT JOIN UserRanks ur
+  ON ur.UserId = pwle.OwnerUserId
+ORDER BY rts.rn, pwle.LastEditDate DESC
+LIMIT 100;

@@ -1,0 +1,171 @@
+WITH RankedUserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN pt.Name = 'Question' THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN pt.Name = 'Answer' THEN 1 ELSE 0 END) AS AnswerCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.CreationDate ASC) AS ReputationRank,
+        LAG(u.Reputation, 1, 0) OVER (ORDER BY u.Reputation DESC) AS PreviousReputation,
+        LEAD(u.Reputation, 1, 0) OVER (ORDER BY u.Reputation DESC) AS NextReputation,
+        CASE
+            WHEN u.LastAccessDate < (CAST('2024-10-01' AS date) - INTERVAL '1 year') THEN 'Inactive'
+            WHEN u.LastAccessDate < (CAST('2024-10-01' AS date) - INTERVAL '90 days') THEN 'Stale'
+            ELSE 'Active'
+        END AS UserStatus,
+        u.LastAccessDate,
+        u.Views
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    WHERE u.DisplayName IS NOT NULL AND u.DisplayName NOT LIKE '%[bot]%' AND u.Views > 100
+    GROUP BY
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Views
+),
+TagPerformance AS (
+    SELECT
+        t.TagName,
+        COUNT(DISTINCT p.Id) AS TagPostCount,
+        AVG(p.Score) AS AvgTagScore,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TagQuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TagAnswerCount,
+        (
+            SELECT COUNT(*)
+            FROM Posts p2
+            WHERE p2.Tags LIKE '%' || t.TagName || '%' AND p2.PostTypeId = 1 AND p2.AcceptedAnswerId IS NOT NULL
+        ) AS TagAcceptedAnswers,
+        CASE
+            WHEN t.IsModeratorOnly = TRUE THEN 'ModeratorOnly'
+            WHEN t.IsRequired = TRUE THEN 'Required'
+            ELSE 'Standard'
+        END AS TagCategory,
+        t.IsModeratorOnly,
+        t.IsRequired
+    FROM Tags t
+    JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    WHERE t.TagName NOT LIKE '#%' AND t.TagName NOT LIKE '%-%' AND t.TagName NOT LIKE '%!%'
+    GROUP BY
+        t.TagName,
+        t.IsModeratorOnly,
+        t.IsRequired
+),
+HighReputationQuestions AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.CreationDate AS QuestionCreationDate,
+        p.Score AS QuestionScore,
+        u.DisplayName AS OwnerDisplayName,
+        p.AnswerCount,
+        p.FavoriteCount,
+        pt.Name AS PostTypeName,
+        p.OwnerUserId
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.PostTypeId = 1
+      AND u.Reputation >= 50000
+      AND p.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '1 year')
+      AND p.Score > 100
+      AND p.AnswerCount > 10
+),
+RecentHighScoreAnswers AS (
+    SELECT
+        p.Id AS AnswerId,
+        p.ParentId AS QuestionId,
+        p.Score AS AnswerScore,
+        p.CreationDate AS AnswerCreationDate,
+        u.DisplayName AS AnswererDisplayName,
+        ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS AnswerRankForQuestion,
+        p.OwnerUserId
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 2
+      AND p.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '7 days')
+      AND p.Score > 50
+),
+ClosedQuestionsWithSpecificReasons AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title AS QuestionTitle,
+        p.ClosedDate,
+        crt.Name AS CloseReason,
+        ph.Comment,
+        ph.CreationDate AS PHCreationDate,
+        p.OwnerUserId
+    FROM Posts p
+    JOIN PostHistory ph ON p.Id = ph.PostId
+    JOIN CloseReasonTypes crt ON TRY_CAST(NULLIF(ph.Comment, '') AS INTEGER) = crt.Id
+    WHERE p.PostTypeId = 1
+      AND p.ClosedDate IS NOT NULL
+      AND ph.PostHistoryTypeId = 10
+      AND crt.Name IN ('Off-topic', 'Subjective and argumentative', 'Not a real question')
+      AND ph.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '6 months')
+),
+UserPostCounts AS (
+    SELECT
+        COALESCE(OwnerUserId, UserId, 0) AS UserId,
+        COUNT(*) AS PostCount
+    FROM (
+        SELECT OwnerUserId, NULL AS UserId FROM Posts
+        UNION ALL
+        SELECT NULL AS OwnerUserId, UserId FROM Posts
+    ) sub
+    GROUP BY COALESCE(OwnerUserId, UserId, 0)
+)
+SELECT
+    rua.DisplayName,
+    rua.Reputation,
+    rua.UserStatus,
+    rua.TotalPosts,
+    rua.QuestionCount,
+    rua.AnswerCount,
+    rua.CommentCount,
+    rua.UpVoteCount,
+    rua.DownVoteCount,
+    CASE WHEN rua.PreviousReputation IS NULL THEN 'First User' ELSE CAST(rua.Reputation - rua.PreviousReputation AS VARCHAR) END AS ReputationGainedSincePrevious,
+    CASE WHEN rua.NextReputation IS NULL THEN 'Last User' ELSE CAST(rua.NextReputation - rua.Reputation AS VARCHAR) END AS ReputationLostToNext,
+    COALESCE(fp.TagName, 'NoFavTag') AS FavoriteTagName,
+    COALESCE(fp.TagPostCount, 0) AS FavoriteTagPostCount,
+    COALESCE(fp.AvgTagScore, 0.0) AS FavoriteTagAvgScore,
+    rhq.Title AS HighRepQuestionTitle,
+    rhq.OwnerDisplayName AS HighRepQuestionOwner,
+    rhq.QuestionScore AS HighRepQuestionScore,
+    rhq.AnswerCount AS HighRepQuestionAnswers,
+    COALESCE(rhq.FavoriteCount, 0) AS HighRepQuestionFavorites,
+    rhqa.AnswerScore AS TopAnswerScoreForHighRepQ,
+    rhqa.AnswererDisplayName AS TopAnswererForHighRepQ,
+    rhqa.AnswerRankForQuestion,
+    cqsr.QuestionTitle AS ClosedOffTopicQuestion,
+    cqsr.CloseReason AS SpecificCloseReason,
+    TO_CHAR(cqsr.ClosedDate, 'YYYY-MM-DD') AS QuestionClosedDate,
+    COALESCE(upc.PostCount, 0) AS UserTotalPostCountCheck,
+    rua.ReputationRank,
+    fp.AvgTagScore,
+    rhq.QuestionScore
+FROM RankedUserActivity rua
+LEFT JOIN (
+    SELECT TagName, TagPostCount, AvgTagScore
+    FROM TagPerformance
+    WHERE TagPostCount > 1000
+    ORDER BY AvgTagScore DESC
+    LIMIT 1
+) fp ON TRUE
+LEFT JOIN HighReputationQuestions rhq ON rua.UserId = rhq.OwnerUserId
+LEFT JOIN RecentHighScoreAnswers rhqa ON rhq.QuestionId = rhqa.QuestionId AND rhqa.AnswerRankForQuestion = 1
+LEFT JOIN ClosedQuestionsWithSpecificReasons cqsr ON rua.UserId = cqsr.OwnerUserId
+LEFT JOIN UserPostCounts upc ON rua.UserId = upc.UserId
+WHERE rua.Reputation > 10000
+ORDER BY rua.ReputationRank, fp.AvgTagScore DESC, rhq.QuestionScore DESC;

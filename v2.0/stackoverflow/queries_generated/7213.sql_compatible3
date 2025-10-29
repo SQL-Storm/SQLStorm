@@ -1,0 +1,182 @@
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(DISTINCT p.Id) AS TotalPosts,
+    COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS Questions,
+    COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS Answers,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END), 0) AS QuestionScore,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END), 0) AS AnswerScore,
+    AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS AvgQuestionScore,
+    AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) AS AvgAnswerScore,
+    MAX(p.CreationDate) AS LastPostDate,
+    MIN(p.CreationDate) AS FirstPostDate,
+    COUNT(DISTINCT b.Id) AS BadgesReceived,
+    COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+    COUNT(DISTINCT c.Id) AS CommentsMade,
+    COUNT(DISTINCT ph.Id) AS EditHistoryCount,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p2 
+        WHERE p2.OwnerUserId = u.Id 
+          AND p2.PostTypeId = 1 
+          AND p2.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6 months')
+    ) AS RecentQuestions,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p3 
+        WHERE p3.OwnerUserId = u.Id 
+          AND p3.PostTypeId = 2 
+          AND p3.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '6 months')
+    ) AS RecentAnswers,
+    (
+        SELECT p4.Title
+        FROM Posts p4 
+        WHERE p4.OwnerUserId = u.Id 
+          AND p4.PostTypeId = 1 
+        ORDER BY p4.Score DESC
+        LIMIT 1
+    ) AS HighestScoringQuestion,
+    (
+        SELECT p5.Title
+        FROM Posts p5 
+        WHERE p5.OwnerUserId = u.Id 
+          AND p5.PostTypeId = 2 
+        ORDER BY p5.Score DESC
+        LIMIT 1
+    ) AS HighestScoringAnswer,
+    COALESCE(
+        (
+            SELECT STRING_AGG(t.TagName, ', ') 
+            FROM Posts p6,
+                 LATERAL (
+                    SELECT regexp_split_to_table(
+                        trim(BOTH '<' FROM regexp_replace(p6.Tags, '><', '>,<', 'g')),
+                        ','
+                    ) AS value
+                 ) AS tagSplit
+            INNER JOIN Tags t ON t.TagName = trim(BOTH ' ' FROM tagSplit.value)
+            WHERE p6.OwnerUserId = u.Id 
+              AND p6.PostTypeId = 1
+        ), 
+        'No tags'
+    ) AS UserTags,
+    (
+        SELECT COUNT(*) 
+        FROM Votes v 
+        INNER JOIN Posts p7 ON v.PostId = p7.Id 
+        WHERE v.UserId = u.Id 
+          AND v.VoteTypeId IN (2, 3)
+          AND p7.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30 days')
+    ) AS RecentVotes,
+    (
+        SELECT COUNT(DISTINCT PostId) 
+        FROM PostLinks pl 
+        WHERE pl.PostId IN (
+            SELECT Id FROM Posts WHERE OwnerUserId = u.Id
+        ) 
+          AND pl.LinkTypeId = 3
+    ) AS DuplicateLinks,
+    (
+        SELECT COUNT(DISTINCT PostId) 
+        FROM PostLinks pl 
+        WHERE pl.RelatedPostId IN (
+            SELECT Id FROM Posts WHERE OwnerUserId = u.Id
+        ) 
+          AND pl.LinkTypeId = 1
+    ) AS LinkedPosts,
+    CASE 
+        WHEN COUNT(DISTINCT p.Id) > 10 AND COUNT(DISTINCT b.Id) > 5 THEN 'Active Contributor' 
+        WHEN COUNT(DISTINCT p.Id) > 5 AND COUNT(DISTINCT b.Id) > 2 THEN 'Regular Poster' 
+        ELSE 'Occasional User' 
+    END AS UserCategory,
+    FLOOR(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - u.CreationDate)) / 86400) * 1 AS AccountAgeDays,
+    (
+        SELECT COUNT(*) 
+        FROM PostHistory ph2 
+        WHERE ph2.UserId = u.Id 
+          AND ph2.PostHistoryTypeId IN (1, 2, 3, 4, 5, 6)
+          AND ph2.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '3 months')
+    ) AS RecentEdits,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p8 
+        WHERE p8.OwnerUserId = u.Id 
+          AND p8.PostTypeId = 1 
+          AND COALESCE(p8.AnswerCount, 0) > 0
+    ) AS QuestionsWithAnswers,
+    (
+        SELECT COUNT(*) 
+        FROM Posts p9 
+        WHERE p9.OwnerUserId = u.Id 
+          AND p9.PostTypeId = 2 
+          AND p9.ParentId IS NOT NULL
+    ) AS AnsweredPosts,
+    (
+        SELECT AVG(p10.Score) 
+        FROM Posts p10 
+        WHERE p10.OwnerUserId = u.Id 
+          AND p10.PostTypeId IN (1, 2)
+          AND p10.Score IS NOT NULL
+    ) AS AveragePostScore,
+    (
+        SELECT COUNT(DISTINCT pl2.Id) 
+        FROM PostLinks pl2 
+        INNER JOIN Posts p11 ON pl2.PostId = p11.Id
+        WHERE p11.OwnerUserId = u.Id 
+          AND pl2.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 month')
+          AND pl2.LinkTypeId = 1
+    ) AS RecentLinkPosts
+FROM Users u
+LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+LEFT JOIN Badges b ON u.Id = b.UserId
+LEFT JOIN Comments c ON u.Id = c.UserId
+LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+WHERE u.Id IN (
+    SELECT u2.Id 
+    FROM Users u2
+    INNER JOIN Posts p2 ON u2.Id = p2.OwnerUserId
+    INNER JOIN PostTypes pt ON p2.PostTypeId = pt.Id
+    WHERE pt.Name IN ('Question', 'Answer')
+    GROUP BY u2.Id
+    HAVING COUNT(*) >= 2
+)
+AND (
+    EXISTS (
+        SELECT 1 
+        FROM Posts p3 
+        WHERE p3.OwnerUserId = u.Id 
+          AND p3.PostTypeId = 1
+          AND COALESCE(p3.ViewCount, 0) > 100
+    ) OR EXISTS (
+        SELECT 1 
+        FROM Posts p4 
+        WHERE p4.OwnerUserId = u.Id 
+          AND p4.PostTypeId = 2
+          AND COALESCE(p4.Score, 0) > 5
+    )
+)
+GROUP BY 
+    u.Id, 
+    u.DisplayName, 
+    u.Reputation, 
+    u.CreationDate
+HAVING 
+    COUNT(DISTINCT p.Id) > 0
+    AND (
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) > 0 
+        OR COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) > 0
+    )
+    AND (
+        (COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) > 0 AND COUNT(DISTINCT b.Id) > 3)
+        OR (COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) > 0 AND COUNT(DISTINCT b.Id) > 3)
+        OR (COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) > 0 AND COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) > 0)
+    )
+ORDER BY 
+    GREATEST(COUNT(DISTINCT b.Id), COUNT(DISTINCT p.Id)) DESC,
+    u.Reputation DESC,
+    MAX(p.CreationDate) DESC
+OFFSET 10 ROWS
+FETCH NEXT 20 ROWS ONLY;

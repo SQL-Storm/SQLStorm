@@ -1,0 +1,289 @@
+-- {"query": "7084.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 3031} 
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        COUNT(DISTINCT p.Id) as PostCount,
+        COUNT(DISTINCT c.Id) as CommentCount,
+        COUNT(DISTINCT b.Id) as BadgeCount,
+        MAX(p.CreationDate) as LastPostDate,
+        MAX(c.CreationDate) as LastCommentDate,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) as QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) as AnswerCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN p.Id END) as QuestionWithAcceptedAnswer,
+        AVG(p.Score) as AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) as AvgAnswerScore,
+        SUM(p.ViewCount) as TotalViews,
+        STRING_AGG(DISTINCT p.Tags, '; ') as AllTagsUsed,
+        STRING_AGG(DISTINCT b.Name, ', ') as BadgeNames,
+        STRING_AGG(DISTINCT u.EmailHash, ', ') as EmailHashes
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views
+),
+TopUsersByActivity AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        PostCount,
+        CommentCount,
+        BadgeCount,
+        LastPostDate,
+        LastCommentDate,
+        QuestionCount,
+        AnswerCount,
+        QuestionWithAcceptedAnswer,
+        AvgQuestionScore,
+        AvgAnswerScore,
+        TotalViews,
+        AllTagsUsed,
+        BadgeNames,
+        EmailHashes,
+        ROW_NUMBER() OVER (ORDER BY PostCount DESC, Reputation DESC) as ActivityRank,
+        DENSE_RANK() OVER (ORDER BY Reputation DESC) as ReputationRank,
+        NTILE(10) OVER (ORDER BY Reputation DESC) as ReputationQuartile
+    FROM UserActivityStats
+),
+ComplexPostAnalysis AS (
+    SELECT 
+        p.Id as PostId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ParentId,
+        p.AcceptedAnswerId,
+        u.DisplayName as OwnerDisplayName,
+        CASE WHEN p.PostTypeId = 1 THEN 'Question' ELSE 'Answer' END as PostType,
+        CASE 
+            WHEN p.Score > 100 THEN 'Very Popular'
+            WHEN p.Score > 50 THEN 'Popular'
+            WHEN p.Score > 10 THEN 'Moderately Popular'
+            ELSE 'Low'
+        END as PopularityLevel,
+        LEN(p.Title) as TitleLength,
+        LEN(p.Body) as BodyLength,
+        CASE 
+            WHEN p.Tags IS NOT NULL AND p.Tags != '' THEN 
+                (SELECT COUNT(*) FROM STRING_SPLIT(SUBSTRING(p.Tags, 2, LEN(p.Tags) - 2), '><'))
+            ELSE 0
+        END as TagCount,
+        ISNULL(p.AnswerCount, 0) - ISNULL(p.CommentCount, 0) as NetActivity,
+        COALESCE(p.Score, 0) + COALESCE(p.ViewCount, 0) + COALESCE(p.FavoriteCount, 0) as CombinedScore,
+        DATEDIFF(DAY, p.CreationDate, GETDATE()) as AgeInDays,
+        CASE 
+            WHEN p.CreationDate > DATEADD(MONTH, -6, GETDATE()) THEN 'Recent'
+            WHEN p.CreationDate > DATEADD(MONTH, -12, GETDATE()) THEN 'Recent-Medium'
+            WHEN p.CreationDate > DATEADD(YEAR, -1, GETDATE()) THEN 'Medium'
+            ELSE 'Old'
+        END as AgeCategory,
+        CASE 
+            WHEN p.FavoriteCount > 50 THEN 'Highly Favorited'
+            WHEN p.FavoriteCount > 20 THEN 'Favorited'
+            WHEN p.FavoriteCount > 5 THEN 'Slightly Favorited'
+            ELSE 'Not Favorited'
+        END as FavoredStatus
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1, 2)
+    AND p.Score > 5
+    AND p.CreationDate > DATEADD(YEAR, -2, GETDATE())
+    AND (p.Tags IS NOT NULL AND p.Tags != '')
+),
+PostHistoryAnalysis AS (
+    SELECT 
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate as HistoryDate,
+        ph.UserId,
+        ph.UserDisplayName,
+        ph.Text,
+        ph.Comment,
+        ph.RevisionGUID,
+        CASE 
+            WHEN ph.PostHistoryTypeId IN (1, 4, 6) THEN 'Title/Tags/Body Change'
+            WHEN ph.PostHistoryTypeId IN (10, 11, 12, 13) THEN 'Status Change'
+            WHEN ph.PostHistoryTypeId IN (14, 15, 19, 20) THEN 'Moderator Action'
+            ELSE 'Other'
+        END as HistoryCategory,
+        DATEDIFF(MINUTE, LAG(ph.CreationDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate), ph.CreationDate) as MinutesSinceLastEdit,
+        COUNT(*) OVER (PARTITION BY ph.PostId) as TotalEditsPerPost
+    FROM PostHistory ph
+    WHERE ph.CreationDate > DATEADD(MONTH, -3, GETDATE())
+),
+CombinedAnalysis AS (
+    SELECT 
+        tua.UserId,
+        tua.DisplayName,
+        tua.Reputation,
+        tua.PostCount,
+        tua.CommentCount,
+        tua.QuestionCount,
+        tua.AnswerCount,
+        tua.QuestionWithAcceptedAnswer,
+        tua.AvgQuestionScore,
+        tua.AvgAnswerScore,
+        tua.TotalViews,
+        tua.ReputationRank,
+        tua.ReputationQuartile,
+        cap.PostId,
+        cap.Title,
+        cap.Body,
+        cap.Score,
+        cap.ViewCount,
+        cap.CreationDate,
+        cap.PostType,
+        cap.PopularityLevel,
+        cap.TitleLength,
+        cap.BodyLength,
+        cap.TagCount,
+        cap.NetActivity,
+        cap.CombinedScore,
+        cap.AgeInDays,
+        cap.AgeCategory,
+        cap.FavoredStatus,
+        pha.HistoryDate,
+        pha.HistoryCategory,
+        pha.MinutesSinceLastEdit,
+        pha.TotalEditsPerPost,
+        CASE 
+            WHEN pha.HistoryCategory = 'Title/Tags/Body Change' AND pha.MinutesSinceLastEdit < 30 THEN 'Very Active Editing'
+            WHEN pha.HistoryCategory = 'Title/Tags/Body Change' AND pha.MinutesSinceLastEdit BETWEEN 30 AND 120 THEN 'Active Editing'
+            WHEN pha.HistoryCategory = 'Status Change' AND pha.TotalEditsPerPost > 5 THEN 'Frequent Status Changes'
+            ELSE 'Normal Activity'
+        END as ActivityPattern,
+        CASE 
+            WHEN tua.Reputation > 10000 AND cap.Score > 50 AND cap.NetActivity > 10 THEN 'High Value Contributor'
+            WHEN tua.Reputation > 5000 AND cap.Score > 25 AND cap.ViewCount > 100 THEN 'Moderate Value Contributor'
+            WHEN tua.Reputation < 500 AND cap.Score < 10 THEN 'New Contributor'
+            ELSE 'Regular Contributor'
+        END as ContributorTier,
+        ROW_NUMBER() OVER (PARTITION BY tua.UserId ORDER BY cap.CreationDate DESC) as PostRankPerUser
+    FROM TopUsersByActivity tua
+    JOIN ComplexPostAnalysis cap ON tua.UserId = cap.OwnerUserId
+    LEFT JOIN PostHistoryAnalysis pha ON cap.PostId = pha.PostId
+    WHERE cap.CreationDate > DATEADD(WEEK, -4, GETDATE())
+),
+FinalAggregation AS (
+    SELECT 
+        UserId,
+        DisplayName,
+        Reputation,
+        PostCount,
+        CommentCount,
+        QuestionCount,
+        AnswerCount,
+        QuestionWithAcceptedAnswer,
+        AvgQuestionScore,
+        AvgAnswerScore,
+        TotalViews,
+        ReputationRank,
+        ReputationQuartile,
+        COUNT(DISTINCT PostId) as TotalPosts,
+        MAX(CreationDate) as MostRecentPost,
+        MIN(CreationDate) as OldestPost,
+        COUNT(DISTINCT CASE WHEN PopularityLevel = 'Very Popular' THEN PostId END) as VeryPopularPosts,
+        COUNT(DISTINCT CASE WHEN FavoredStatus = 'Highly Favorited' THEN PostId END) as HighlyFavoritedPosts,
+        SUM(CASE WHEN AgeCategory = 'Recent' THEN 1 ELSE 0 END) as RecentPosts,
+        SUM(CASE WHEN AgeCategory = 'Recent-Medium' THEN 1 ELSE 0 END) as RecentMediumPosts,
+        AVG(Score) as AvgPostScore,
+        AVG(ViewCount) as AvgPostViews,
+        AVG(CombinedScore) as AvgCombinedScore,
+        STRING_AGG(DISTINCT PostType, ', ') as PostTypes,
+        STRING_AGG(DISTINCT HistoryCategory, ', ') as HistoryCategories,
+        STRING_AGG(DISTINCT ActivityPattern, ', ') as ActivityPatterns,
+        STRING_AGG(DISTINCT ContributorTier, ', ') as ContributorTiers,
+        COUNT(*) as RecordCount,
+        COUNT(DISTINCT PostId) OVER (PARTITION BY UserId) as UserPostCount,
+        DENSE_RANK() OVER (ORDER BY AVG(Score) DESC, SUM(ViewCount) DESC) as PerformanceRank
+    FROM CombinedAnalysis
+    GROUP BY UserId, DisplayName, Reputation, PostCount, CommentCount, QuestionCount, AnswerCount, QuestionWithAcceptedAnswer, AvgQuestionScore, AvgAnswerScore, TotalViews, ReputationRank, ReputationQuartile
+)
+SELECT 
+    'Performance Benchmark Query Results' as ReportTitle,
+    COUNT(*) as TotalRecordsProcessed,
+    COUNT(DISTINCT UserId) as UniqueUsers,
+    COUNT(DISTINCT PostId) as UniquePosts,
+    MIN(MostRecentPost) as EarliestRecentPost,
+    MAX(MostRecentPost) as LatestRecentPost,
+    AVG(Reputation) as AvgReputation,
+    AVG(PostCount) as AvgPostsPerUser,
+    AVG(QuestionCount) as AvgQuestionsPerUser,
+    AVG(AnswerCount) as AvgAnswersPerUser,
+    AVG(AvgQuestionScore) as AvgQuestionScore,
+    AVG(AvgAnswerScore) as AvgAnswerScore,
+    AVG(TotalViews) as AvgTotalViews,
+    MIN(PerformanceRank) as BestPerformanceRank,
+    MAX(PerformanceRank) as WorstPerformanceRank,
+    STRING_AGG(DISTINCT PostTypes, '; ') as AllPostTypes,
+    STRING_AGG(DISTINCT HistoryCategories, '; ') as AllHistoryCategories,
+    STRING_AGG(DISTINCT ActivityPatterns, '; ') as AllActivityPatterns,
+    STRING_AGG(DISTINCT ContributorTiers, '; ') as AllContributorTiers,
+    'Generated on ' + CONVERT(VARCHAR, GETDATE(), 101) as ReportGenerationDate
+FROM FinalAggregation
+HAVING COUNT(*) > 0
+UNION ALL
+SELECT 
+    'Aggregated Summary' as ReportTitle,
+    COUNT(*) as TotalRecordsProcessed,
+    COUNT(DISTINCT UserId) as UniqueUsers,
+    COUNT(DISTINCT PostId) as UniquePosts,
+    MIN(MostRecentPost) as EarliestRecentPost,
+    MAX(MostRecentPost) as LatestRecentPost,
+    AVG(Reputation) as AvgReputation,
+    AVG(PostCount) as AvgPostsPerUser,
+    AVG(QuestionCount) as AvgQuestionsPerUser,
+    AVG(AnswerCount) as AvgAnswersPerUser,
+    AVG(AvgQuestionScore) as AvgQuestionScore,
+    AVG(AvgAnswerScore) as AvgAnswerScore,
+    AVG(TotalViews) as AvgTotalViews,
+    MIN(PerformanceRank) as BestPerformanceRank,
+    MAX(PerformanceRank) as WorstPerformanceRank,
+    STRING_AGG(DISTINCT PostTypes, '; ') as AllPostTypes,
+    STRING_AGG(DISTINCT HistoryCategories, '; ') as AllHistoryCategories,
+    STRING_AGG(DISTINCT ActivityPatterns, '; ') as AllActivityPatterns,
+    STRING_AGG(DISTINCT ContributorTiers, '; ') as AllContributorTiers,
+    'Generated on ' + CONVERT(VARCHAR, GETDATE(), 101) as ReportGenerationDate
+FROM FinalAggregation
+WHERE PerformanceRank < 100
+UNION ALL
+SELECT 
+    'Top Tier Contributors Analysis' as ReportTitle,
+    COUNT(*) as TotalRecordsProcessed,
+    COUNT(DISTINCT UserId) as UniqueUsers,
+    COUNT(DISTINCT PostId) as UniquePosts,
+    MIN(MostRecentPost) as EarliestRecentPost,
+    MAX(MostRecentPost) as LatestRecentPost,
+    AVG(Reputation) as AvgReputation,
+    AVG(PostCount) as AvgPostsPerUser,
+    AVG(QuestionCount) as AvgQuestionsPerUser,
+    AVG(AnswerCount) as AvgAnswersPerUser,
+    AVG(AvgQuestionScore) as AvgQuestionScore,
+    AVG(AvgAnswerScore) as AvgAnswerScore,
+    AVG(TotalViews) as AvgTotalViews,
+    MIN(PerformanceRank) as BestPerformanceRank,
+    MAX(PerformanceRank) as WorstPerformanceRank,
+    STRING_AGG(DISTINCT PostTypes, '; ') as AllPostTypes,
+    STRING_AGG(DISTINCT HistoryCategories, '; ') as AllHistoryCategories,
+    STRING_AGG(DISTINCT ActivityPatterns, '; ') as AllActivityPatterns,
+    STRING_AGG(DISTINCT ContributorTiers, '; ') as AllContributorTiers,
+    'Generated on ' + CONVERT(VARCHAR, GETDATE(), 101) as ReportGenerationDate
+FROM FinalAggregation
+WHERE ContributorTier LIKE '%High Value%'
+    AND Reputation > 10000
+    AND PostCount > 100
+    AND AvgQuestionScore > 20
+ORDER BY TotalRecordsProcessed DESC;

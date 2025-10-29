@@ -1,0 +1,285 @@
+with recent_users as (
+    select u.id as user_id,
+           u.displayname,
+           u.reputation,
+           u.creationdate,
+           u.location,
+           coalesce(nullif(trim(split_part(coalesce(u.websiteurl, ''), '/', 3)), ''), 'unknown') as domain,
+           row_number() over (order by u.creationdate desc, u.id desc) as rn
+    from users u
+    where u.creationdate >= (select date_trunc('year', max(creationdate)) - interval '1 year' from users)
+),
+tagged_questions as (
+    select p.id as question_id,
+           p.owneruserid,
+           p.creationdate,
+           p.score,
+           p.viewcount,
+           p.answercount,
+           p.title,
+           p.tags,
+           array_length(string_to_array(substring(p.tags, 2, length(p.tags)-2), '><'), 1) as tag_count
+    from posts p
+    where p.posttypeid = 1
+      and p.creationdate >= (select date_trunc('year', max(creationdate)) - interval '2 years' from posts)
+),
+answers as (
+    select a.id as answer_id,
+           a.parentid as question_id,
+           a.owneruserid as answerer_id,
+           a.creationdate as answer_date,
+           a.score as answer_score
+    from posts a
+    where a.posttypeid = 2
+),
+votes_agg as (
+    select v.postid,
+           sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+           sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+           sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+           count(*) filter (where v.votetypeid in (2,3)) as total_votes,
+           max(v.creationdate) as last_vote_at
+    from votes v
+    group by v.postid
+),
+comments_agg as (
+    select c.postid,
+           count(*) as comment_count,
+           max(c.creationdate) as last_comment_at,
+           sum(case when c.score > 0 then 1 else 0 end) as pos_comment_count
+    from comments c
+    group by c.postid
+),
+links_agg as (
+    select pl.postid,
+           count(*) filter (where pl.linktypeid = 1) as linked_count,
+           count(*) filter (where pl.linktypeid = 3) as dup_count,
+           max(case when pl.linktypeid = 3 then pl.relatedpostid end) as any_dup_target
+    from postlinks pl
+    group by pl.postid
+),
+closures as (
+    select ph.postid,
+           min(ph.creationdate) as first_closed_at,
+           max(case when ph.posthistorytypeid = 10 then ph.comment end) as any_close_reason_code,
+           bool_or(ph.posthistorytypeid = 11) as ever_reopened
+    from posthistory ph
+    where ph.posthistorytypeid in (10,11)
+    group by ph.postid
+),
+user_badges as (
+    select b.userid,
+           sum(case when b.class = 1 then 1 else 0 end) as gold_count,
+           sum(case when b.class = 2 then 1 else 0 end) as silver_count,
+           sum(case when b.class = 3 then 1 else 0 end) as bronze_count,
+           count(*) filter (where b.tagbased = true) as tag_badges
+    from badges b
+    group by b.userid
+),
+question_windows as (
+    select q.question_id,
+           q.owneruserid,
+           q.creationdate,
+           q.score,
+           q.viewcount,
+           q.answercount,
+           q.title,
+           q.tags,
+           q.tag_count,
+           coalesce(v.total_votes,0) as total_votes,
+           coalesce(v.upvotes,0) as upvotes,
+           coalesce(v.downvotes,0) as downvotes,
+           coalesce(v.favorites,0) as favorites,
+           coalesce(c.comment_count,0) as comment_count,
+           coalesce(l.linked_count,0) as linked_count,
+           coalesce(l.dup_count,0) as dup_count,
+           l.any_dup_target,
+           cl.first_closed_at,
+           cl.any_close_reason_code,
+           cl.ever_reopened,
+           sum(coalesce(v.upvotes,0)) over (partition by q.owneruserid) as user_upvotes_on_q,
+           avg(q.score) over (partition by date_trunc('month', q.creationdate)) as avg_score_by_month,
+           rank() over (partition by q.owneruserid order by coalesce(v.total_votes,0) desc, q.viewcount desc) as popularity_rank_for_user,
+           dense_rank() over (order by coalesce(v.favorites,0) desc) as global_fav_rank,
+           v.last_vote_at
+    from tagged_questions q
+    left join votes_agg v on v.postid = q.question_id
+    left join comments_agg c on c.postid = q.question_id
+    left join links_agg l on l.postid = q.question_id
+    left join closures cl on cl.postid = q.question_id
+),
+answerers as (
+    select a.question_id,
+           a.answerer_id,
+           count(*) as answers_count,
+           max(a.answer_score) as max_answer_score,
+           min(a.answer_date) as first_answer_at
+    from answers a
+    group by a.question_id, a.answerer_id
+),
+accepted_answers as (
+    select q.id as question_id,
+           q.owneruserid,
+           p2.owneruserid as accepted_answerer_id,
+           p2.score as accepted_answer_score,
+           p2.creationdate as accepted_answer_date
+    from posts q
+    join posts p2 on p2.id = q.acceptedanswerid
+    where q.posttypeid = 1 and q.acceptedanswerid is not null
+),
+tag_norm as (
+    select q.question_id,
+           unnest(string_to_array(substring(q.tags, 2, length(q.tags)-2), '><')) as tag
+    from tagged_questions q
+),
+top_tags as (
+    select t.tag,
+           count(*) as tag_q_count,
+           ntile(4) over (order by count(*) desc) as tag_pop_quartile
+    from tag_norm t
+    group by t.tag
+),
+user_activity as (
+    select u.id as user_id,
+           count(distinct case when p.posttypeid = 1 then p.id end) as q_count,
+           count(distinct case when p.posttypeid = 2 then p.id end) as a_count,
+           sum(coalesce(v2.upvotes,0)) as total_post_upvotes,
+           sum(coalesce(v2.downvotes,0)) as total_post_downvotes,
+           max(p.lastactivitydate) as last_post_activity
+    from users u
+    left join posts p on p.owneruserid = u.id
+    left join votes_agg v2 on v2.postid = p.id
+    group by u.id
+),
+question_scores as (
+    select qw.question_id,
+           qw.owneruserid,
+           qw.creationdate,
+           qw.score,
+           qw.viewcount,
+           qw.answercount,
+           qw.title,
+           qw.tags,
+           qw.tag_count,
+           qw.total_votes,
+           qw.upvotes,
+           qw.downvotes,
+           qw.favorites,
+           qw.comment_count,
+           qw.linked_count,
+           qw.dup_count,
+           qw.any_dup_target,
+           qw.first_closed_at,
+           qw.any_close_reason_code,
+           qw.ever_reopened,
+           qw.user_upvotes_on_q,
+           qw.avg_score_by_month,
+           qw.popularity_rank_for_user,
+           qw.global_fav_rank,
+           qw.last_vote_at,
+           case
+               when qw.score >= 10 then 'hot'
+               when qw.score between 0 and 9 then 'warm'
+               when qw.score is null then 'unknown'
+               else 'cold'
+           end as score_bucket,
+           cast(coalesce(qw.upvotes,0) - coalesce(qw.downvotes,0) as integer) as net_votes,
+           cast(coalesce(qw.viewcount,0) / nullif(greatest(qw.tag_count,1),0) as integer) as views_per_tag
+    from question_windows qw
+),
+dup_roots as (
+    select d.postid as dup_id,
+           d.relatedpostid as canonical_id
+    from postlinks d
+    where d.linktypeid = 3
+),
+dup_clusters as (
+    select qr.question_id,
+           coalesce(dr.canonical_id, qr.question_id) as cluster_root
+    from question_scores qr
+    left join dup_roots dr on dr.dup_id = qr.question_id
+),
+cluster_stats as (
+    select dc.cluster_root,
+           count(*) as cluster_size,
+           sum(case when qs.first_closed_at is not null then 1 else 0 end) as closed_in_cluster,
+           max(qs.viewcount) as max_views_in_cluster
+    from dup_clusters dc
+    join question_scores qs on qs.question_id = dc.question_id
+    group by dc.cluster_root
+),
+qualified_users as (
+    select ru.user_id,
+           ru.displayname,
+           ru.domain,
+           ua.q_count,
+           ua.a_count,
+           ua.total_post_upvotes,
+           ub.gold_count,
+           ub.silver_count,
+           ub.bronze_count,
+           row_number() over (order by coalesce(ua.total_post_upvotes,0) desc, coalesce(ua.q_count,0) desc, ru.user_id) as user_ord
+    from recent_users ru
+    left join user_activity ua on ua.user_id = ru.user_id
+    left join user_badges ub on ub.userid = ru.user_id
+    where coalesce(ua.q_count,0) + coalesce(ua.a_count,0) > 0
+)
+select
+    qs.question_id,
+    qs.title,
+    qs.owneruserid as asker_id,
+    qu.displayname as asker_name,
+    qu.domain as asker_domain,
+    coalesce(qs.viewcount,0) as views,
+    qs.score,
+    qs.score_bucket,
+    qs.net_votes,
+    qs.favorites,
+    qs.comment_count,
+    qs.linked_count,
+    qs.dup_count,
+    qs.any_dup_target,
+    topt.tag_pop_quartile,
+    cs.cluster_size,
+    cs.closed_in_cluster,
+    cs.max_views_in_cluster,
+    coalesce(aagg.answers_count,0) as answers_from_top_answerer,
+    aa.accepted_answerer_id,
+    aa.accepted_answer_score,
+    aa.accepted_answer_date,
+    ua.total_post_upvotes as asker_total_upvotes,
+    ub.tag_badges as asker_tag_badges,
+    qs.avg_score_by_month,
+    qs.popularity_rank_for_user,
+    qs.global_fav_rank,
+    greatest(
+        coalesce(qs.viewcount,0) / nullif(1 + extract(epoch from (timestamp '2024-10-01 12:34:56' - qs.creationdate)) / 86400, 0),
+        coalesce(qs.upvotes,0) / nullif(1 + extract(epoch from (timestamp '2024-10-01 12:34:56' - coalesce(qs.last_vote_at, qs.creationdate))) / 86400, 0)
+    ) as hotness_score,
+    case when qs.first_closed_at is not null and qs.ever_reopened then 1 else 0 end as was_reopened,
+    case when qs.any_close_reason_code ~ '^[0-9]+$' then cast(qs.any_close_reason_code as integer) else null end as close_reason_code_numeric
+from question_scores qs
+left join qualified_users qu on qu.user_id = qs.owneruserid and qu.user_ord <= 500
+left join user_activity ua on ua.user_id = qs.owneruserid
+left join user_badges ub on ub.userid = qs.owneruserid
+left join dup_clusters dc on dc.question_id = qs.question_id
+left join cluster_stats cs on cs.cluster_root = dc.cluster_root
+left join accepted_answers aa on aa.question_id = qs.question_id
+left join answerers aagg on aagg.question_id = qs.question_id and aagg.answerer_id = aa.accepted_answerer_id
+left join lateral (
+    select tt.tag_pop_quartile
+    from tag_norm tn
+    join top_tags tt on tt.tag = tn.tag
+    where tn.question_id = qs.question_id
+    order by tt.tag_q_count desc
+    limit 1
+) topt on true
+where (qs.viewcount > 100 or qs.favorites >= 5 or qs.net_votes > 10 or (qs.dup_count > 0 and cs.cluster_size >= 2))
+  and (qs.first_closed_at is null or qs.ever_reopened = true or (qs.any_close_reason_code is not null and qs.any_close_reason_code not in ('101','Duplicate')))
+  and (qu.user_id is not null or qs.popularity_rank_for_user <= 3 or qs.global_fav_rank <= 1000)
+order by
+    hotness_score desc,
+    qs.favorites desc,
+    qs.viewcount desc,
+    qs.question_id
+limit 500;

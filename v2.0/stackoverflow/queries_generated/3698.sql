@@ -1,0 +1,166 @@
+-- {"query": "3698.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-oss-120b", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2089, "output_tokens": 2404} 
+
+/*  Comprehensive performance‑benchmark query for the StackOverflow schema  */
+WITH RECURSIVE
+    /* 1️⃣ Aggregate user‑level statistics  */
+    user_stats AS (
+        SELECT
+            u.id                               AS user_id,
+            u.displayname                      AS display_name,
+            u.reputation,
+            COALESCE(u.location, 'Unknown')    AS location,
+            COUNT(DISTINCT b.id)               FILTER (WHERE b.class = 1) AS gold_badges,
+            COUNT(DISTINCT b.id)               FILTER (WHERE b.class = 2) AS silver_badges,
+            COUNT(DISTINCT b.id)               FILTER (WHERE b.class = 3) AS bronze_badges,
+            SUM(CASE v.votetypeid
+                    WHEN 2 THEN  1   -- upvote
+                    WHEN 3 THEN -1   -- downvote
+                    ELSE 0 END)               AS net_vote_score,
+            AVG(p.score) FILTER (WHERE p.posttypeid = 1)    AS avg_question_score,
+            MAX(p.creationdate)                AS last_post_date
+        FROM users u
+        LEFT JOIN badges b   ON b.userid   = u.id
+        LEFT JOIN votes  v   ON v.userid   = u.id
+        LEFT JOIN posts  p   ON p.owneruserid = u.id
+        GROUP BY u.id, u.displayname, u.reputation, u.location
+    ),
+
+    /* 2️⃣ Rank users by reputation & net score  */
+    ranked_users AS (
+        SELECT
+            *,
+            RANK() OVER (ORDER BY reputation DESC, net_vote_score DESC) AS rep_rank
+        FROM user_stats
+        WHERE reputation > 10000               -- focus on high‑rep users
+    ),
+
+    /* 3️⃣ Tag‑level activity derived from questions  */
+    tag_activity AS (
+        SELECT
+            t.tagname,
+            COUNT(p.id)                                     AS question_cnt,
+            AVG(p.score)                                    AS avg_score,
+            SUM(CASE WHEN ph.posthistorytypeid = 5 THEN 1 ELSE 0 END) AS edit_cnt
+        FROM tags t
+        JOIN posts p
+          ON p.tags IS NOT NULL
+         AND POSITION('<' || t.tagname || '>' IN p.tags) > 0
+         AND p.posttypeid = 1               -- only questions
+        LEFT JOIN posthistory ph
+          ON ph.postid = p.id
+         AND ph.posthistorytypeid = 5       -- edit‑body events
+        GROUP BY t.tagname
+        HAVING COUNT(p.id) > 100
+    ),
+
+    /* 4️⃣ Most recent closure information per question (correlated sub‑query) */
+    recent_closures AS (
+        SELECT
+            p.id                               AS post_id,
+            p.title,
+            ph.creationdate                    AS close_date,
+            CAST(ph.comment AS INT)            AS close_reason_id,
+            COALESCE(crt.name, 'Other')        AS close_reason,
+            ROW_NUMBER() OVER (PARTITION BY p.id ORDER BY ph.creationdate DESC) AS rn
+        FROM posts p
+        JOIN posthistory ph
+          ON ph.postid = p.id
+         AND ph.posthistorytypeid = 10         -- post closed
+        LEFT JOIN closereasontypes crt
+          ON crt.id = CAST(ph.comment AS INT)
+        WHERE p.posttypeid = 1                 -- only questions
+    ),
+
+    /* 5️⃣ For each high‑rank user, fetch their most used tag and latest closure */
+    user_enriched AS (
+        SELECT
+            ru.user_id,
+            ru.display_name,
+            ru.reputation,
+            ru.gold_badges,
+            ru.silver_badges,
+            ru.bronze_badges,
+            ru.net_vote_score,
+            ru.avg_question_score,
+            ru.last_post_date,
+            ru.rep_rank,
+
+            /* most used tag for this user (window function) */
+            lt.tagname,
+            lt.question_cnt,
+            lt.avg_score,
+
+            /* latest closed question belonging to the user */
+            rc.title               AS latest_closed_title,
+            rc.close_reason        AS latest_close_reason,
+            rc.close_date
+        FROM ranked_users ru
+
+        /* LATERAL: fetch the tag this user has used most in their questions */
+        LEFT JOIN LATERAL (
+            SELECT
+                t.tagname,
+                ta.question_cnt,
+                ta.avg_score,
+                ROW_NUMBER() OVER (ORDER BY ta.question_cnt DESC) AS tag_rn
+            FROM posts p
+            JOIN tags t
+              ON p.tags IS NOT NULL
+             AND POSITION('<' || t.tagname || '>' IN p.tags) > 0
+            JOIN tag_activity ta
+              ON ta.tagname = t.tagname
+            WHERE p.owneruserid = ru.user_id
+              AND p.posttypeid = 1
+            GROUP BY t.tagname, ta.question_cnt, ta.avg_score
+        ) lt ON lt.tag_rn = 1
+
+        /* LATERAL: fetch the most recent closed question of the user */
+        LEFT JOIN LATERAL (
+            SELECT
+                rc.title,
+                rc.close_reason,
+                rc.close_date
+            FROM recent_closures rc
+            WHERE rc.post_id IN (
+                SELECT p.id
+                FROM posts p
+                WHERE p.owneruserid = ru.user_id
+                  AND p.posttypeid = 1
+            )
+              AND rc.rn = 1
+            ORDER BY rc.close_date DESC
+            LIMIT 1
+        ) rc ON TRUE
+
+        WHERE ru.rep_rank <= 50                -- limit to top‑50 users
+    )
+
+/* 6️⃣ Final projection with assorted calculations, NULL handling, and set operator demo */
+SELECT
+    ue.user_id,
+    ue.display_name,
+    ue.reputation,
+    ue.rep_rank,
+    ue.gold_badges,
+    ue.silver_badges,
+    ue.bronze_badges,
+    ue.net_vote_score,
+    ue.avg_question_score,
+    COALESCE(ue.last_post_date, TIMESTAMP '1970-01-01') AS last_post_date,
+    ue.tagname                                   AS top_tag,
+    ue.question_cnt                              AS top_tag_question_cnt,
+    ROUND(ue.avg_score::numeric, 2)             AS top_tag_avg_score,
+    COALESCE(ue.latest_closed_title, 'No recent closure') AS recent_closed_title,
+    ue.latest_close_reason,
+    ue.close_date
+FROM user_enriched ue
+
+/* UNION with a “no‑data” placeholder to stress set‑operator handling */
+UNION ALL
+SELECT
+    NULL, 'Placeholder', NULL, NULL, NULL, NULL, NULL, NULL,
+    TIMESTAMP '1970-01-01', NULL, NULL, NULL, NULL, NULL, NULL, NULL
+WHERE NOT EXISTS (SELECT 1 FROM user_enriched)
+
+ORDER BY reputation DESC, net_vote_score DESC
+LIMIT 100;

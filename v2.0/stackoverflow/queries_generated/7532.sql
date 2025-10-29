@@ -1,0 +1,181 @@
+-- {"query": "7532.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "qwen3-coder", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2102, "output_tokens": 1769} 
+WITH UserActivitySummary AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        COUNT(DISTINCT b.Id) AS Badges,
+        COUNT(DISTINCT c.Id) AS Comments,
+        COUNT(DISTINCT v.Id) AS Votes,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        MAX(v.CreationDate) AS LastVoteDate,
+        CASE 
+            WHEN u.Reputation >= 10000 THEN 'Elite'
+            WHEN u.Reputation >= 5000 THEN 'Veteran'
+            WHEN u.Reputation >= 1000 THEN 'Regular'
+            ELSE 'Newbie'
+        END AS ReputationLevel,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 100 THEN 'Highly Active'
+            WHEN COUNT(DISTINCT p.Id) > 50 THEN 'Active'
+            WHEN COUNT(DISTINCT p.Id) > 10 THEN 'Moderate'
+            ELSE 'Casual'
+        END AS ActivityLevel
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    WHERE u.CreationDate >= '2010-01-01'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+),
+TopTags AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank,
+        AVG(t.Count) OVER () AS AvgTagCount,
+        PERCENT_RANK() OVER (ORDER BY t.Count) AS TagPercentile
+    FROM Tags t
+    WHERE t.Count > 0
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.OwnerUserId,
+        p.OwnerDisplayName,
+        CASE 
+            WHEN p.Score >= 100 THEN 'Gold'
+            WHEN p.Score >= 25 THEN 'Silver'
+            WHEN p.Score >= 1 THEN 'Bronze'
+            ELSE 'None'
+        END AS ScoreTier,
+        CASE 
+            WHEN p.ViewCount >= 1000 THEN 'Viral'
+            WHEN p.ViewCount >= 100 THEN 'Popular'
+            WHEN p.ViewCount >= 10 THEN 'Noticeable'
+            ELSE 'Underwater'
+        END AS Popularity,
+        COALESCE(p.Tags, '') AS TagsString,
+        STRING_TO_ARRAY(
+            CASE 
+                WHEN p.Tags IS NOT NULL AND LENGTH(p.Tags) > 2 
+                THEN SUBSTRING(p.Tags, 2, LENGTH(p.Tags) - 2) 
+                ELSE ''
+            END, 
+            '><'
+        ) AS TagArray,
+        DATEDIFF('day', p.CreationDate, CURRENT_TIMESTAMP) AS DaysSinceCreation,
+        DATEDIFF('day', p.LastActivityDate, CURRENT_TIMESTAMP) AS DaysSinceActivity,
+        CASE 
+            WHEN EXISTS (
+                SELECT 1 FROM Posts p2 
+                WHERE p2.ParentId = p.Id AND p2.PostTypeId = 2 AND p2.Score > 0
+            ) THEN 1 
+            ELSE 0 
+        END AS HasUpvotedAnswers,
+        LEAD(p.Score, 1) OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS NextHighScore
+    FROM Posts p
+    WHERE p.CreationDate >= '2020-01-01'
+),
+CombinedAnalysis AS (
+    SELECT 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.Views,
+        uas.UpVotes,
+        uas.DownVotes,
+        uas.TotalPosts,
+        uas.Questions,
+        uas.Answers,
+        uas.Badges,
+        uas.Comments,
+        uas.Votes,
+        uas.LastPostDate,
+        uas.LastCommentDate,
+        uas.LastVoteDate,
+        uas.ReputationLevel,
+        uas.ActivityLevel,
+        ta.TagName,
+        ta.Count AS TagCount,
+        ta.TagRank,
+        ta.AvgTagCount,
+        ta.TagPercentile,
+        pa.PostId,
+        pa.PostTypeId,
+        pa.Title,
+        pa.Score,
+        pa.ViewCount,
+        pa.AnswerCount,
+        pa.CommentCount,
+        pa.FavoriteCount,
+        pa.CreationDate AS PostCreationDate,
+        pa.ScoreTier,
+        pa.Popularity,
+        pa.DaysSinceCreation,
+        pa.DaysSinceActivity,
+        pa.HasUpvotedAnswers,
+        pa.NextHighScore
+    FROM UserActivitySummary uas
+    LEFT JOIN TopTags ta ON ta.TagRank <= 5
+    LEFT JOIN PostAnalysis pa ON pa.OwnerUserId = uas.UserId OR pa.OwnerUserId IS NULL
+    WHERE uas.Reputation >= 1000
+)
+SELECT 
+    COUNT(*) AS AnalysisRecordCount,
+    COUNT(DISTINCT UserId) AS UniqueUsers,
+    COUNT(DISTINCT PostId) AS UniquePosts,
+    AVG(Reputation) AS AvgReputation,
+    AVG(TotalPosts) AS AvgPostsPerUser,
+    AVG(Questions) AS AvgQuestionsPerUser,
+    AVG(Answers) AS AvgAnswersPerUser,
+    AVG(Badges) AS AvgBadgesPerUser,
+    AVG(Comments) AS AvgCommentsPerUser,
+    AVG(Votes) AS AvgVotesPerUser,
+    MEDIAN(Score) AS MedianPostScore,
+    MEDIAN(ViewCount) AS MedianViewCount,
+    PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY Score) AS Percentile95Score,
+    PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY ViewCount) AS Percentile95Views,
+    COUNT(CASE WHEN ScoreTier = 'Gold' THEN 1 END) AS GoldPosts,
+    COUNT(CASE WHEN ScoreTier = 'Silver' THEN 1 END) AS SilverPosts,
+    COUNT(CASE WHEN ScoreTier = 'Bronze' THEN 1 END) AS BronzePosts,
+    COUNT(CASE WHEN Popularity = 'Viral' THEN 1 END) AS ViralPosts,
+    COUNT(CASE WHEN Popularity = 'Popular' THEN 1 END) AS PopularPosts,
+    COUNT(CASE WHEN Popularity = 'Noticeable' THEN 1 END) AS NoticeablePosts,
+    COUNT(CASE WHEN Popularity = 'Underwater' THEN 1 END) AS UnderwaterPosts,
+    COUNT(DISTINCT CASE WHEN TagRank <= 3 THEN TagName END) AS Top3Tags,
+    AVG(CASE WHEN TagCount > AvgTagCount THEN 1 ELSE 0 END) AS AboveAvgTagPosts,
+    COUNT(DISTINCT CASE WHEN DaysSinceCreation < 30 THEN PostId END) AS NewPosts,
+    COUNT(DISTINCT CASE WHEN DaysSinceActivity < 7 THEN PostId END) AS RecentActivity,
+    COUNT(DISTINCT CASE WHEN HasUpvotedAnswers = 1 THEN PostId END) AS PostsWithUpvotedAnswers,
+    COUNT(DISTINCT CASE WHEN NextHighScore > 0 THEN PostId END) AS PostsWithNextHighScore,
+    STRING_AGG(DISTINCT ReputationLevel, ', ') AS AllReputationLevels,
+    STRING_AGG(DISTINCT ActivityLevel, ', ') AS AllActivityLevels,
+    STRING_AGG(DISTINCT ScoreTier, ', ') AS AllScoreTiers,
+    STRING_AGG(DISTINCT Popularity, ', ') AS AllPopularities
+FROM CombinedAnalysis
+HAVING COUNT(*) > 0
+ORDER BY AnalysisRecordCount DESC
+LIMIT 1000;

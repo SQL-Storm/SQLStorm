@@ -1,0 +1,212 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        COUNT(DISTINCT c.Id) AS Comments,
+        COUNT(DISTINCT b.Id) AS Badges,
+        MAX(p.CreationDate) AS LastPostDate,
+        CAST(EXTRACT(EPOCH FROM (COALESCE(MAX(p.CreationDate), u.CreationDate) - u.CreationDate)) / 86400 AS INTEGER) AS DaysSinceCreation,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'High'
+            WHEN u.Reputation > 5000 THEN 'Medium'
+            ELSE 'Low'
+        END AS ReputationLevel,
+        CASE 
+            WHEN COUNT(DISTINCT p.Id) > 100 THEN 'Active'
+            WHEN COUNT(DISTINCT p.Id) > 50 THEN 'Moderate'
+            ELSE 'Inactive'
+        END AS ActivityLevel,
+        COALESCE(SUM(p.Score), 0) AS TotalScore,
+        AVG(COALESCE(p.Score, 0)) AS AvgPostScore
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+PostAnalysis AS (
+    SELECT 
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.ParentId,
+        CASE 
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            WHEN p.PostTypeId = 3 THEN 'Wiki'
+            ELSE 'Other'
+        END AS PostType,
+        COALESCE(p.Tags, '') AS Tags,
+        CASE WHEN p.Tags IS NOT NULL AND p.Tags <> '' THEN array_length(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags)-2), '><'), 1) ELSE 0 END AS TagCount,
+        COALESCE(p.AnswerCount, 0) AS AnswerCountNorm,
+        COALESCE(p.CommentCount, 0) AS CommentCountNorm,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 1
+            ELSE 0
+        END AS HasAcceptedAnswer,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL THEN 1
+            ELSE 0
+        END AS IsClosed,
+        CASE 
+            WHEN p.PostTypeId = 1 AND p.CommunityOwnedDate IS NOT NULL THEN 1
+            ELSE 0
+        END AS IsCommunityOwned,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS PostRank,
+        LAG(p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PreviousPostDate,
+        CAST(EXTRACT(EPOCH FROM (p.CreationDate - LAG(p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate))) / 86400 AS INTEGER) AS DaysBetweenPosts,
+        DENSE_RANK() OVER (ORDER BY p.Score DESC) AS ScoreRank
+    FROM Posts p
+    WHERE p.Id IS NOT NULL
+),
+UserPostStats AS (
+    SELECT 
+        pa.OwnerUserId,
+        COUNT(*) AS TotalPosts,
+        SUM(CASE WHEN pa.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN pa.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        AVG(pa.Score) AS AvgScore,
+        AVG(pa.ViewCount) AS AvgViews,
+        MAX(pa.Score) AS MaxScore,
+        MAX(pa.ViewCount) AS MaxViews,
+        MIN(pa.CreationDate) AS FirstPostDate,
+        MAX(pa.CreationDate) AS LastPostDate,
+        CAST(EXTRACT(EPOCH FROM (MAX(pa.CreationDate) - MIN(pa.CreationDate))) / 86400 AS INTEGER) AS ActiveDays,
+        COUNT(DISTINCT pa.Tags) AS DistinctTagSetCount,
+        SUM(pa.CommentCountNorm) AS TotalComments,
+        SUM(pa.AnswerCountNorm) AS TotalAnswers
+    FROM PostAnalysis pa
+    GROUP BY pa.OwnerUserId
+),
+ComplexTagAnalysis AS (
+    SELECT 
+        t.TagName,
+        t.Count AS TagCount,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CASE 
+            WHEN t.Count > 1000 THEN 'Popular'
+            WHEN t.Count > 500 THEN 'Moderate'
+            WHEN t.Count > 100 THEN 'Common'
+            ELSE 'Rare'
+        END AS PopularityLevel,
+        COALESCE((SELECT COUNT(*) FROM Posts WHERE Tags LIKE '%' || t.TagName || '%'), 0) AS PostsUsingTag,
+        COALESCE((SELECT COUNT(DISTINCT OwnerUserId) FROM Posts WHERE Tags LIKE '%' || t.TagName || '%'), 0) AS UsersUsingTag,
+        CASE 
+            WHEN t.Count > 500 AND t.WikiPostId IS NOT NULL THEN 'HasWiki'
+            ELSE 'NoWiki'
+        END AS WikiStatus
+    FROM Tags t
+    WHERE t.TagName IS NOT NULL
+),
+ActivityTrends AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (1,2,3,4,5,6) THEN ph.PostId END) AS EditCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (10,11,12,13) THEN ph.PostId END) AS VoteActionCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (14,15,19,20) THEN ph.PostId END) AS ModerationActionCount,
+        CAST(EXTRACT(EPOCH FROM (MAX(ph.CreationDate) - MIN(ph.CreationDate))) / 86400 AS INTEGER) AS ActionDuration,
+        AVG(EXTRACT(EPOCH FROM (ph.CreationDate - LAG(ph.CreationDate) OVER (PARTITION BY u.Id ORDER BY ph.CreationDate))) / 3600) AS AvgHoursBetweenActions
+    FROM Users u
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.DisplayName
+)
+SELECT 
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.TotalPosts,
+    uas.Questions,
+    uas.Answers,
+    uas.Comments,
+    uas.Badges,
+    uas.LastPostDate,
+    uas.DaysSinceCreation,
+    uas.ReputationLevel,
+    uas.ActivityLevel,
+    uas.TotalScore,
+    uas.AvgPostScore,
+    ups.TotalPosts AS UserTotalPosts,
+    ups.QuestionCount,
+    ups.AnswerCount,
+    ups.AvgScore AS UserAvgScore,
+    ups.AvgViews AS UserAvgViews,
+    ups.MaxScore AS UserMaxScore,
+    ups.MaxViews AS UserMaxViews,
+    ups.FirstPostDate,
+    ups.LastPostDate AS UserLastPostDate,
+    ups.ActiveDays,
+    ups.DistinctTagSetCount,
+    ups.TotalComments,
+    ups.TotalAnswers,
+    COALESCE(cta.TagCount, 0) AS TagCount,
+    COALESCE(cta.PopularityLevel, 'Unknown') AS PopularityLevel,
+    COALESCE(cta.PostsUsingTag, 0) AS PostsUsingTag,
+    COALESCE(cta.UsersUsingTag, 0) AS UsersUsingTag,
+    COALESCE(cta.WikiStatus, 'NoWiki') AS WikiStatus,
+    COALESCE(at.EditCount, 0) AS EditCount,
+    COALESCE(at.VoteActionCount, 0) AS VoteActionCount,
+    COALESCE(at.ModerationActionCount, 0) AS ModerationActionCount,
+    COALESCE(at.ActionDuration, 0) AS ActionDuration,
+    COALESCE(at.AvgHoursBetweenActions, 0) AS AvgHoursBetweenActions,
+    CASE 
+        WHEN uas.TotalPosts > 0 AND ups.QuestionCount > 0 AND ups.AnswerCount > 0 THEN 'Active Contributor'
+        WHEN uas.TotalPosts > 0 AND ups.QuestionCount > 0 THEN 'Questioner'
+        WHEN uas.TotalPosts > 0 AND ups.AnswerCount > 0 THEN 'Answerer'
+        ELSE 'Viewer'
+    END AS ContributorType,
+    CASE 
+        WHEN uas.TotalPosts = 0 THEN 0
+        ELSE ROUND((CAST(ups.QuestionCount AS NUMERIC) / uas.TotalPosts) * 100, 2)
+    END AS QuestionPercentage,
+    CASE 
+        WHEN uas.TotalPosts = 0 THEN 0
+        ELSE ROUND((CAST(ups.AnswerCount AS NUMERIC) / uas.TotalPosts) * 100, 2)
+    END AS AnswerPercentage,
+    CASE 
+        WHEN ups.MaxScore > 0 THEN 'High Scorer'
+        WHEN ups.AvgScore > 0 THEN 'Moderate Scorer'
+        ELSE 'Low Scorer'
+    END AS ScoringTier,
+    CASE 
+        WHEN ups.ActiveDays > 30 THEN 'Frequent Contributor'
+        WHEN ups.ActiveDays > 7 THEN 'Regular Contributor'
+        ELSE 'Occasional Contributor'
+    END AS ActivityFrequency,
+    CASE 
+        WHEN uas.Reputation > 10000 AND ups.MaxScore > 50 THEN 'Elite Contributor'
+        WHEN uas.Reputation > 5000 AND ups.MaxScore > 25 THEN 'Experienced Contributor'
+        WHEN uas.Reputation > 1000 AND ups.MaxScore > 10 THEN 'Regular Contributor'
+        ELSE 'New Contributor'
+    END AS ContributorRank
+FROM UserActivityStats uas
+LEFT JOIN UserPostStats ups ON uas.UserId = ups.OwnerUserId
+LEFT JOIN ComplexTagAnalysis cta ON cta.TagName = (
+    SELECT tags.tag
+    FROM (
+        SELECT unnest(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags)-2), '><')) AS tag
+        FROM Posts p
+        WHERE p.OwnerUserId = uas.UserId AND p.Tags IS NOT NULL AND p.Tags <> ''
+    ) tags
+    ORDER BY tags.tag LIMIT 1
+)
+LEFT JOIN ActivityTrends at ON uas.UserId = at.UserId
+WHERE uas.UserId IS NOT NULL
+  AND (uas.TotalPosts > 0 OR uas.Badges > 0 OR uas.Comments > 0 OR COALESCE(ups.TotalPosts,0) > 0)
+  AND (cta.TagCount IS NULL OR cta.TagCount > 10)
+ORDER BY uas.TotalScore DESC, uas.Reputation DESC, uas.TotalPosts DESC
+LIMIT 1000;

@@ -1,0 +1,519 @@
+with recent_activity as (
+  select
+    p.id as post_id,
+    p.posttypeid,
+    p.owneruserid,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.title,
+    p.tags,
+    coalesce(p.answercount, 0) as answercount,
+    p.closeddate,
+    p.lastactivitydate,
+    u.reputation,
+    u.displayname,
+    date_trunc('month', p.creationdate) as create_month
+  from posts p
+  left join users u on u.id = p.owneruserid
+  where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+),
+comment_shards as (
+  select
+    c.postid,
+    count(*) filter (where c.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '1 year') as comments_1y,
+    count(*) as comments_all,
+    sum(c.score) as comment_score_sum,
+    max(c.creationdate) as last_comment_date
+  from comments c
+  group by c.postid
+),
+vote_agg as (
+  select
+    v.postid,
+    count(*) filter (where v.votetypeid = 2) as upvotes,
+    count(*) filter (where v.votetypeid = 3) as downvotes,
+    sum(case when v.votetypeid = 8 then coalesce(v.bountyamount, 0) else 0 end) as bounty_started,
+    sum(case when v.votetypeid = 9 then coalesce(v.bountyamount, 0) else 0 end) as bounty_awarded,
+    max(v.creationdate) as last_vote_date
+  from votes v
+  group by v.postid
+),
+link_stats as (
+  select
+    pl.postid,
+    count(*) filter (where pl.linktypeid = 1) as links_linked,
+    count(*) filter (where pl.linktypeid = 3) as links_duplicate,
+    count(distinct pl.relatedpostid) as related_distinct,
+    min(pl.creationdate) as first_link_date
+  from postlinks pl
+  group by pl.postid
+),
+history_flags as (
+  select
+    ph.postid,
+    bool_or(ph.posthistorytypeid in (10,35)) as ever_closed_or_migrated,
+    bool_or(ph.posthistorytypeid in (11)) as ever_reopened,
+    sum(case when ph.posthistorytypeid in (4,5,6,7,8,9,24) then 1 else 0 end) as edit_events,
+    max(ph.creationdate) as last_history_date
+  from posthistory ph
+  group by ph.postid
+),
+badge_rollup as (
+  select
+    b.userid,
+    sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+    sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+    sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+    count(*) as total_badges,
+    count(*) filter (where cast(b.tagbased as integer) = 1) as tag_badges
+  from badges b
+  group by b.userid
+),
+tag_explode as (
+  select
+    p.id as post_id,
+    unnest(
+      case
+        when p.tags is null then array[]::text[]
+        else string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')
+      end
+    ) as tagname
+  from posts p
+  where p.posttypeid = 1
+),
+tag_quality as (
+  select
+    te.post_id,
+    percentile_cont(0.5) within group (order by t.count) as tag_popularity_median,
+    avg(cast(t.count as numeric)) as tag_popularity_avg,
+    sum(case when t.ismoderatoronly = 1 then 1 else 0 end) as mod_only_tag_count,
+    count(*) as tag_count
+  from tag_explode te
+  left join tags t on lower(t.tagname) = lower(te.tagname)
+  group by te.post_id
+),
+answers_cte as (
+  select
+    a.parentid as question_id,
+    count(*) as answers_total,
+    sum(case when a.score > 0 then 1 else 0 end) as answers_positive,
+    max(a.score) as best_answer_score,
+    min(a.creationdate) as first_answer_date,
+    max(a.creationdate) as last_answer_date
+  from posts a
+  where a.posttypeid = 2
+  group by a.parentid
+),
+question_core as (
+  select
+    ra.post_id,
+    ra.posttypeid,
+    ra.owneruserid,
+    ra.creationdate,
+    ra.score,
+    ra.viewcount,
+    ra.title,
+    ra.tags,
+    ra.answercount,
+    ra.closeddate,
+    ra.lastactivitydate,
+    ra.reputation,
+    ra.displayname,
+    ra.create_month,
+    coalesce(ta.tag_popularity_median, 0) as tag_popularity_median,
+    coalesce(ta.tag_popularity_avg, 0) as tag_popularity_avg,
+    coalesce(ta.mod_only_tag_count, 0) as mod_only_tag_count,
+    coalesce(ta.tag_count, 0) as tag_count,
+    ac.answers_total,
+    ac.answers_positive,
+    ac.best_answer_score,
+    ac.first_answer_date,
+    ac.last_answer_date
+  from recent_activity ra
+  left join tag_quality ta on ta.post_id = ra.post_id
+  left join answers_cte ac on ac.question_id = ra.post_id
+  where ra.posttypeid = 1
+),
+engagement as (
+  select
+    qc.post_id,
+    qc.title,
+    qc.tags,
+    qc.creationdate,
+    coalesce(cs.comments_1y, 0) as comments_1y,
+    coalesce(cs.comments_all, 0) as comments_all,
+    coalesce(cs.comment_score_sum, 0) as comment_score_sum,
+    coalesce(va.upvotes, 0) as upvotes,
+    coalesce(va.downvotes, 0) as downvotes,
+    coalesce(va.bounty_started, 0) as bounty_started,
+    coalesce(va.bounty_awarded, 0) as bounty_awarded,
+    coalesce(ls.links_linked, 0) as links_linked,
+    coalesce(ls.links_duplicate, 0) as links_duplicate,
+    coalesce(ls.related_distinct, 0) as related_distinct,
+    qc.score,
+    qc.viewcount,
+    qc.answercount,
+    qc.answers_total,
+    qc.answers_positive,
+    qc.best_answer_score,
+    qc.first_answer_date,
+    qc.last_answer_date,
+    qc.tag_popularity_median,
+    qc.tag_popularity_avg,
+    qc.tag_count,
+    qc.mod_only_tag_count,
+    qc.closeddate,
+    qc.lastactivitydate,
+    qc.owneruserid,
+    qc.reputation,
+    qc.displayname,
+    qc.create_month,
+    coalesce(hf.ever_closed_or_migrated, false) as ever_closed_or_migrated,
+    coalesce(hf.ever_reopened, false) as ever_reopened,
+    coalesce(hf.edit_events, 0) as edit_events,
+    greatest(coalesce(hf.last_history_date, qc.creationdate),
+             coalesce(cs.last_comment_date, qc.creationdate),
+             coalesce(va.last_vote_date, qc.creationdate),
+             coalesce(ls.first_link_date, qc.creationdate)) as last_touch
+  from question_core qc
+  left join comment_shards cs on cs.postid = qc.post_id
+  left join vote_agg va on va.postid = qc.post_id
+  left join link_stats ls on ls.postid = qc.post_id
+  left join history_flags hf on hf.postid = qc.post_id
+),
+user_enrichment as (
+  select
+    e.post_id,
+    e.title,
+    e.tags,
+    e.creationdate,
+    e.comments_1y,
+    e.comments_all,
+    e.comment_score_sum,
+    e.upvotes,
+    e.downvotes,
+    e.bounty_started,
+    e.bounty_awarded,
+    e.links_linked,
+    e.links_duplicate,
+    e.related_distinct,
+    e.score,
+    e.viewcount,
+    e.answercount,
+    e.answers_total,
+    e.answers_positive,
+    e.best_answer_score,
+    e.first_answer_date,
+    e.last_answer_date,
+    e.tag_popularity_median,
+    e.tag_popularity_avg,
+    e.tag_count,
+    e.mod_only_tag_count,
+    e.closeddate,
+    e.lastactivitydate,
+    e.owneruserid,
+    e.reputation,
+    e.displayname,
+    e.create_month,
+    e.ever_closed_or_migrated,
+    e.ever_reopened,
+    e.edit_events,
+    e.last_touch,
+    coalesce(br.gold_badges, 0) as gold_badges,
+    coalesce(br.silver_badges, 0) as silver_badges,
+    coalesce(br.bronze_badges, 0) as bronze_badges,
+    coalesce(br.total_badges, 0) as total_badges,
+    coalesce(br.tag_badges, 0) as tag_badges
+  from engagement e
+  left join badge_rollup br on br.userid = e.owneruserid
+),
+scored as (
+  select
+    ue.post_id,
+    ue.title,
+    ue.tags,
+    ue.creationdate,
+    ue.comments_1y,
+    ue.comments_all,
+    ue.comment_score_sum,
+    ue.upvotes,
+    ue.downvotes,
+    ue.bounty_started,
+    ue.bounty_awarded,
+    ue.links_linked,
+    ue.links_duplicate,
+    ue.related_distinct,
+    ue.score,
+    ue.viewcount,
+    ue.answercount,
+    ue.answers_total,
+    ue.answers_positive,
+    ue.best_answer_score,
+    ue.first_answer_date,
+    ue.last_answer_date,
+    ue.tag_popularity_median,
+    ue.tag_popularity_avg,
+    ue.tag_count,
+    ue.mod_only_tag_count,
+    ue.closeddate,
+    ue.lastactivitydate,
+    ue.owneruserid,
+    ue.reputation,
+    ue.displayname,
+    ue.create_month,
+    ue.ever_closed_or_migrated,
+    ue.ever_reopened,
+    ue.edit_events,
+    ue.last_touch,
+    ue.gold_badges,
+    ue.silver_badges,
+    ue.bronze_badges,
+    ue.total_badges,
+    ue.tag_badges,
+    (
+      0.30 * ln(1 + ue.viewcount)
+      + 0.25 * greatest(ue.upvotes - ue.downvotes, 0)
+      + 0.20 * coalesce(ue.comments_all, 0)
+      + 0.10 * coalesce(ue.answers_positive, 0)
+      + 0.05 * coalesce(ue.edit_events, 0)
+      + 0.05 * case when ue.ever_closed_or_migrated then 0 else 5 end
+      + 0.05 * least(coalesce(ue.tag_count, 0), 5)
+    ) as engagement_score,
+    (
+      0.40 * ln(1 + coalesce(ue.reputation, 0))
+      + 0.30 * ln(1 + coalesce(ue.total_badges, 0))
+      + 0.20 * ln(1 + coalesce(ue.tag_badges, 0))
+      + 0.10 * case when ue.mod_only_tag_count > 0 then 1 else 0 end
+    ) as author_influence,
+    case
+      when ue.closeddate is not null then 'Closed'
+      when ue.links_duplicate > 0 then 'DuplicateFlagged'
+      when ue.score < 0 then 'Controversial'
+      when ue.answers_total is null or ue.answers_total = 0 then 'Unanswered'
+      else 'Active'
+    end as status_bucket
+  from user_enrichment ue
+),
+ranked as (
+  select
+    s.post_id,
+    s.title,
+    s.tags,
+    s.creationdate,
+    s.comments_1y,
+    s.comments_all,
+    s.comment_score_sum,
+    s.upvotes,
+    s.downvotes,
+    s.bounty_started,
+    s.bounty_awarded,
+    s.links_linked,
+    s.links_duplicate,
+    s.related_distinct,
+    s.score,
+    s.viewcount,
+    s.answercount,
+    s.answers_total,
+    s.answers_positive,
+    s.best_answer_score,
+    s.first_answer_date,
+    s.last_answer_date,
+    s.tag_popularity_median,
+    s.tag_popularity_avg,
+    s.tag_count,
+    s.mod_only_tag_count,
+    s.closeddate,
+    s.lastactivitydate,
+    s.owneruserid,
+    s.reputation,
+    s.displayname,
+    s.create_month,
+    s.ever_closed_or_migrated,
+    s.ever_reopened,
+    s.edit_events,
+    s.last_touch,
+    s.gold_badges,
+    s.silver_badges,
+    s.bronze_badges,
+    s.total_badges,
+    s.tag_badges,
+    s.engagement_score,
+    s.author_influence,
+    s.status_bucket,
+    row_number() over (partition by date_trunc('month', s.creationdate) order by s.engagement_score desc, s.viewcount desc) as rn_month,
+    dense_rank() over (order by s.engagement_score desc) as global_rank,
+    percentile_disc(0.5) within group (order by s.engagement_score) over () as median_engagement,
+    avg(s.engagement_score) over () as avg_engagement,
+    sum(case when s.status_bucket = 'Unanswered' then 1 else 0 end) over (partition by s.create_month) as unanswered_in_month
+  from scored s
+),
+anomalies as (
+  select
+    r.post_id,
+    r.title,
+    r.tags,
+    r.creationdate,
+    r.comments_1y,
+    r.comments_all,
+    r.comment_score_sum,
+    r.upvotes,
+    r.downvotes,
+    r.bounty_started,
+    r.bounty_awarded,
+    r.links_linked,
+    r.links_duplicate,
+    r.related_distinct,
+    r.score,
+    r.viewcount,
+    r.answercount,
+    r.answers_total,
+    r.answers_positive,
+    r.best_answer_score,
+    r.first_answer_date,
+    r.last_answer_date,
+    r.tag_popularity_median,
+    r.tag_popularity_avg,
+    r.tag_count,
+    r.mod_only_tag_count,
+    r.closeddate,
+    r.lastactivitydate,
+    r.owneruserid,
+    r.reputation,
+    r.displayname,
+    r.create_month,
+    r.ever_closed_or_migrated,
+    r.ever_reopened,
+    r.edit_events,
+    r.last_touch,
+    r.gold_badges,
+    r.silver_badges,
+    r.bronze_badges,
+    r.total_badges,
+    r.tag_badges,
+    r.engagement_score,
+    r.author_influence,
+    r.status_bucket,
+    r.rn_month,
+    r.global_rank,
+    r.median_engagement,
+    r.avg_engagement,
+    r.unanswered_in_month,
+    case
+      when r.engagement_score > 2 * r.avg_engagement then 'HighOutlier'
+      when r.engagement_score < 0.5 * r.median_engagement then 'LowOutlier'
+      else 'Normal'
+    end as engagement_outlier
+  from ranked r
+),
+recent_dupes as (
+  select distinct on (pl.postid)
+    pl.postid,
+    pl.relatedpostid,
+    pl.creationdate as dup_date
+  from postlinks pl
+  where pl.linktypeid = 3
+  order by pl.postid, pl.creationdate desc
+),
+final_set as (
+  select
+    a.post_id,
+    a.title,
+    a.tags,
+    a.displayname as owner_displayname,
+    a.reputation,
+    a.total_badges,
+    a.viewcount,
+    a.upvotes,
+    a.downvotes,
+    a.answercount,
+    a.answers_total,
+    a.comments_all,
+    a.score,
+    a.engagement_score,
+    a.author_influence,
+    a.status_bucket,
+    a.engagement_outlier,
+    a.global_rank,
+    a.rn_month,
+    a.create_month,
+    a.last_touch,
+    rd.relatedpostid as dupe_of,
+    rd.dup_date,
+    a.tag_count,
+    a.tag_popularity_avg,
+    a.ever_reopened,
+    a.ever_closed_or_migrated,
+    a.creationdate
+  from anomalies a
+  left join recent_dupes rd on rd.postid = a.post_id
+  where
+    (
+      (a.tags is not null
+      and position('java' in lower(coalesce(a.tags, ''))) > 0)
+      or (coalesce(a.tag_count,0) >= 3 and coalesce(a.tag_popularity_avg,0) > 1000)
+    )
+    and coalesce(a.reputation, 0) >= 50
+    and a.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '4 years'
+    and (coalesce(a.ever_reopened, false) or not coalesce(a.ever_closed_or_migrated, false))
+    and (coalesce(a.upvotes,0) - coalesce(a.downvotes,0)) >= -2
+),
+augmented as (
+  select
+    f.*,
+    (
+      select coalesce(percentile_cont(0.5) within group (order by p2.score), 0)
+      from posts p2
+      where p2.parentid = f.post_id and p2.posttypeid = 2
+    ) as median_answer_score,
+    exists (
+      select 1 from comments c
+      where c.postid = f.post_id and c.score > 10
+    ) as has_hot_comment,
+    exists (
+      select 1 from posthistory ph
+      where ph.postid = f.post_id and ph.posthistorytypeid in (24)
+    ) as has_suggested_edit
+  from final_set f
+),
+final_filtered as (
+  select *
+  from augmented a
+  where a.global_rank <= 500
+)
+select
+  a.post_id,
+  coalesce(nullif(trim(a.title), ''), '[no title]') as title,
+  a.tags,
+  a.owner_displayname,
+  a.reputation,
+  a.total_badges,
+  a.viewcount,
+  a.upvotes,
+  a.downvotes,
+  a.answercount,
+  a.answers_total,
+  a.comments_all,
+  a.score,
+  a.engagement_score,
+  a.author_influence,
+  a.status_bucket,
+  a.engagement_outlier,
+  a.global_rank,
+  a.rn_month,
+  a.create_month,
+  a.last_touch,
+  a.dupe_of,
+  a.dup_date,
+  coalesce(a.median_answer_score, 0) as median_answer_score,
+  a.has_hot_comment,
+  a.has_suggested_edit,
+  (
+    a.engagement_score
+    + case when a.status_bucket = 'Active' then 1.5 else 0 end
+    + case when a.has_hot_comment then 0.75 else 0 end
+    + case when a.has_suggested_edit then 0.25 else 0 end
+    + case when a.engagement_outlier = 'HighOutlier' then 0.5 when a.engagement_outlier = 'LowOutlier' then -0.5 else 0 end
+  ) as composite_score
+from final_filtered a
+order by composite_score desc, a.viewcount desc, a.upvotes desc, a.post_id asc;

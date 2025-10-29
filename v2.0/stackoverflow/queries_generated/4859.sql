@@ -1,0 +1,149 @@
+-- {"query": "4859.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1678} 
+
+WITH RankedPostEdits AS (
+    SELECT
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.UserId,
+        u.DisplayName AS EditorDisplayName,
+        ph.CreationDate AS EditDate,
+        ph.Comment,
+        ROW_NUMBER() OVER(PARTITION BY ph.PostId, ph.PostHistoryTypeId ORDER BY ph.CreationDate DESC) as rn
+    FROM PostHistory ph
+    JOIN Users u ON ph.UserId = u.Id
+    WHERE ph.PostHistoryTypeId IN (4, 5, 6) -- Edit Title, Edit Body, Edit Tags
+),
+LatestPostEdits AS (
+    SELECT
+        PostId,
+        STRING_AGG(DISTINCT CASE WHEN rn = 1 THEN EditorDisplayName ELSE NULL END, ', ') AS LastEditorDisplayName,
+        MAX(EditDate) AS LastEditDate
+    FROM RankedPostEdits
+    GROUP BY PostId
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadgeCount,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadgeCount,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadgeCount,
+        MAX(p.CreationDate) AS LastPostCreationDate,
+        MAX(u.LastAccessDate) AS LastAccessDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+PostDetails AS (
+    SELECT
+        p.Id AS PostId,
+        pt.Name AS PostType,
+        p.Title,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        u.DisplayName AS OwnerDisplayName,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS PostStatus,
+        DATEDIFF(day, p.CreationDate, p.ClosedDate) AS DaysToClose,
+        p.Tags,
+        lpe.LastEditDate,
+        lpe.LastEditorDisplayName,
+        crc.Name AS CloseReason,
+        CASE
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 'Accepted Answer Exists'
+            WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NULL THEN 'No Accepted Answer'
+            ELSE 'N/A'
+        END AS AcceptanceStatus
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN LatestPostEdits lpe ON p.Id = lpe.PostId
+    LEFT JOIN CloseReasonTypes crc ON p.ClosedDate IS NOT NULL AND crc.Id = CAST(REPLACE(REPLACE(SUBSTRING(SUBSTRING(
+        (
+            SELECT Comment FROM PostHistory
+            WHERE PostId = p.Id AND PostHistoryTypeId = 10 -- Post Closed
+            ORDER BY CreationDate DESC LIMIT 1
+        ), CHARINDEX(':', (
+            SELECT Comment FROM PostHistory
+            WHERE PostId = p.Id AND PostHistoryTypeId = 10 -- Post Closed
+            ORDER BY CreationDate DESC LIMIT 1
+        )) + 1, 100), '"', ''), '[', ''), ']' AS INT) -- Extracting CloseReasonId from JSON, simplistic approach
+    WHERE p.PostTypeId IN (1, 2) -- Questions and Answers
+),
+UserEngagement AS (
+    SELECT
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.TotalPosts,
+        ua.AnswerCount,
+        ua.CommentCount,
+        ua.GoldBadgeCount,
+        ua.SilverBadgeCount,
+        ua.BronzeBadgeCount,
+        CASE
+            WHEN ua.TotalPosts = 0 THEN 'No Posts'
+            WHEN ua.TotalPosts > 0 AND ua.AnswerCount / ua.TotalPosts > 0.5 THEN 'Answer Heavy'
+            ELSE 'Question Heavy or Balanced'
+        END AS PostingProfile,
+        CASE
+            WHEN ua.LastAccessDate < DATEADD(day, -365, GETDATE()) THEN 'Inactive (>1 Year)'
+            WHEN ua.LastAccessDate < DATEADD(day, -180, GETDATE()) THEN 'Moderately Active (6-12 Months)'
+            ELSE 'Active (<6 Months)'
+        END AS ActivityLevel,
+        pd.PostType,
+        pd.PostStatus,
+        pd.AcceptanceStatus,
+        pd.DaysToClose,
+        pd.Score,
+        pd.ViewCount,
+        pd.FavoriteCount,
+        CASE
+            WHEN pd.Tags LIKE '%<sql>%' THEN 'SQL Related'
+            ELSE 'Other'
+        END AS TagCategory
+    FROM UserActivity ua
+    LEFT JOIN PostDetails pd ON ua.UserId = pd.OwnerUserId
+)
+SELECT
+    ue.UserId,
+    ue.DisplayName,
+    ue.Reputation,
+    ue.PostingProfile,
+    ue.ActivityLevel,
+    ue.TagCategory,
+    COUNT(DISTINCT pd.PostId) AS PostsInvolvingUser,
+    SUM(CASE WHEN pd.PostType = 'Question' THEN 1 ELSE 0 END) AS Questions,
+    SUM(CASE WHEN pd.PostType = 'Answer' THEN 1 ELSE 0 END) AS Answers,
+    AVG(CAST(pd.Score AS DECIMAL(10, 2))) AS AverageScore,
+    SUM(pd.FavoriteCount) AS TotalFavorites,
+    COUNT(DISTINCT CASE WHEN pd.PostStatus = 'Closed' THEN pd.PostId ELSE NULL END) AS ClosedPosts,
+    AVG(CASE WHEN pd.PostStatus = 'Closed' THEN CAST(pd.DaysToClose AS DECIMAL(10, 2)) ELSE NULL END) AS AverageDaysToCloseForClosed,
+    MAX(CASE WHEN pd.AcceptanceStatus = 'Accepted Answer Exists' THEN 1 ELSE 0 END) AS HasAcceptedAnswer
+FROM UserEngagement ue
+LEFT JOIN PostDetails pd ON ue.UserId = pd.OwnerUserId
+WHERE ue.Reputation > 1000 -- Focus on more established users
+GROUP BY
+    ue.UserId,
+    ue.DisplayName,
+    ue.Reputation,
+    ue.PostingProfile,
+    ue.ActivityLevel,
+    ue.TagCategory
+HAVING COUNT(DISTINCT pd.PostId) > 5 -- Users with more than 5 posts in the dataset
+ORDER BY
+    ue.Reputation DESC,
+    ue.ActivityLevel,
+    ue.PostingProfile,
+    SUM(pd.Score) DESC;

@@ -1,0 +1,184 @@
+WITH UserPostSummary AS (
+    SELECT
+        OwnerUserId AS UserId,
+        COUNT(Id) AS TotalPosts,
+        COUNT(CASE WHEN PostTypeId = 1 THEN Id END) AS QuestionsPosted,
+        COUNT(CASE WHEN PostTypeId = 2 THEN Id END) AS AnswersPosted,
+        SUM(Score) AS TotalPostScore,
+        SUM(CASE WHEN PostTypeId = 1 THEN COALESCE(ViewCount,0) ELSE 0 END) AS TotalQuestionViews,
+        MAX(CreationDate) AS LastPostDate,
+        AVG(CASE WHEN PostTypeId = 1 THEN Score END) AS AvgQuestionScore,
+        AVG(CASE WHEN PostTypeId = 2 THEN Score END) AS AvgAnswerScore
+    FROM Posts
+    WHERE OwnerUserId IS NOT NULL AND OwnerUserId <> -1
+    GROUP BY OwnerUserId
+),
+UserCommentSummary AS (
+    SELECT
+        UserId,
+        COUNT(Id) AS CommentsMade
+    FROM Comments
+    WHERE UserId IS NOT NULL
+    GROUP BY UserId
+),
+UserEngagement AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate,
+        U.LastAccessDate,
+        U.Views AS UserViews,
+        U.UpVotes AS UserUpVotes,
+        U.DownVotes AS UserDownVotes,
+        COALESCE(UPS.TotalPosts, 0) AS TotalPosts,
+        COALESCE(UPS.QuestionsPosted, 0) AS QuestionsPosted,
+        COALESCE(UPS.AnswersPosted, 0) AS AnswersPosted,
+        COALESCE(UCS.CommentsMade, 0) AS CommentsMade,
+        COALESCE(UPS.TotalPostScore, 0) AS TotalPostScore,
+        COALESCE(UPS.TotalQuestionViews, 0) AS TotalQuestionViews,
+        UPS.LastPostDate,
+        UPS.AvgQuestionScore,
+        UPS.AvgAnswerScore
+    FROM Users U
+    LEFT JOIN UserPostSummary UPS ON U.Id = UPS.UserId
+    LEFT JOIN UserCommentSummary UCS ON U.Id = UCS.UserId
+),
+PostDetailsWithTags AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        PT.Name AS PostTypeName,
+        P.OwnerUserId,
+        P.LastEditorUserId,
+        P.CreationDate AS PostCreationDate,
+        P.Score AS PostScore,
+        P.ViewCount AS PostViewCount,
+        P.AnswerCount,
+        P.CommentCount AS PostCommentCount,
+        P.FavoriteCount AS PostFavoriteCount,
+        P.AcceptedAnswerId,
+        P.ClosedDate,
+        P.CommunityOwnedDate,
+        COALESCE(P.Title, SUBSTRING(P.Body FROM 1 FOR 100) || '...') AS PostTitleOrBodyExcerpt,
+        CASE
+            WHEN P.Tags IS NOT NULL AND LENGTH(TRIM(P.Tags)) > 2
+            THEN CARDINALITY(string_to_array(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags) - 2), '><'))
+            ELSE 0
+        END AS TagCount,
+        string_to_array(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags) - 2), '><') AS PostTagsArray,
+        EXTRACT(EPOCH FROM (P.LastActivityDate - P.CreationDate)) / 3600 AS HoursToLastActivity,
+        CASE WHEN P.PostTypeId = 1 AND P.AcceptedAnswerId IS NOT NULL THEN TRUE ELSE FALSE END AS HasAcceptedAnswer
+    FROM Posts P
+    INNER JOIN PostTypes PT ON P.PostTypeId = PT.Id
+    WHERE P.PostTypeId IN (1, 2)
+),
+PostHistoryAggregates AS (
+    SELECT
+        PH.PostId,
+        COUNT(PH.Id) AS TotalHistoryEntries,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS EditCount,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (10, 11) THEN 1 ELSE 0 END) AS CloseReopenCount,
+        MAX(PH.CreationDate) AS LastHistoryDate,
+        (SELECT PH2.UserId
+         FROM PostHistory PH2
+         WHERE PH2.PostId = PH.PostId
+           AND PH2.PostHistoryTypeId IN (4, 5, 6)
+         ORDER BY PH2.CreationDate DESC
+         FETCH FIRST 1 ROW ONLY) AS LastEditorIdByHistory
+    FROM PostHistory PH
+    GROUP BY PH.PostId
+),
+RankedUserMetrics AS (
+    SELECT
+        UE.UserId,
+        UE.DisplayName,
+        UE.Reputation,
+        UE.QuestionsPosted,
+        UE.AnswersPosted,
+        UE.TotalPosts,
+        UE.CommentsMade,
+        UE.TotalPostScore,
+        UE.TotalQuestionViews,
+        UE.AvgQuestionScore,
+        UE.AvgAnswerScore,
+        UE.LastPostDate,
+        UE.CreationDate,
+        UE.LastAccessDate,
+        RANK() OVER (ORDER BY UE.Reputation DESC, UE.LastAccessDate DESC) AS OverallReputationRank,
+        ROW_NUMBER() OVER (PARTITION BY EXTRACT(YEAR FROM UE.CreationDate) ORDER BY UE.QuestionsPosted DESC) AS QuestionsRankThisYear,
+        AVG(UE.TotalPostScore) OVER (PARTITION BY EXTRACT(MONTH FROM UE.CreationDate)) AS AvgMonthlyTotalScoreForJoiners
+    FROM UserEngagement UE
+    WHERE UE.Reputation > 0
+)
+SELECT
+    RUM.UserId,
+    RUM.DisplayName AS UserDisplayName,
+    RUM.Reputation,
+    RUM.OverallReputationRank,
+    RUM.QuestionsRankThisYear,
+    RUM.AvgMonthlyTotalScoreForJoiners,
+    P.PostId,
+    P.PostTypeName,
+    P.PostTitleOrBodyExcerpt,
+    P.PostScore,
+    P.PostViewCount,
+    P.PostFavoriteCount,
+    P.HasAcceptedAnswer,
+    P.TagCount,
+    P.HoursToLastActivity,
+    PHA.TotalHistoryEntries,
+    PHA.EditCount AS PostEditCount,
+    PHA.CloseReopenCount,
+    COALESCE(U_Owner.DisplayName, 'Community User') AS OwnerDisplayName,
+    COALESCE(U_PostEditor.DisplayName, U_HistoryEditor.DisplayName, 'System/Unknown Editor') AS LastKnownEditorDisplayName,
+    CASE
+        WHEN P.PostViewCount > 0 THEN (CAST((P.PostFavoriteCount + P.PostCommentCount + COALESCE(P.AnswerCount, 0) * 2) AS DECIMAL) / P.PostViewCount)
+        ELSE 0
+    END AS EngagementRatio,
+    EXISTS (
+        SELECT 1
+        FROM UNNEST(P.PostTagsArray) AS t(tag)
+        WHERE tag IN ('sql', 'performance', 'database', 'optimization')
+    ) AS ContainsRelevantTags,
+    CASE
+        WHEN P.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN P.CommunityOwnedDate IS NOT NULL THEN 'Community-Owned'
+        WHEN P.HasAcceptedAnswer THEN 'Answered & Accepted'
+        WHEN P.PostCommentCount > 5 OR P.PostFavoriteCount > 10 THEN 'Highly Engaged'
+        WHEN P.PostViewCount > 1000 AND P.PostScore > 5 THEN 'Popular'
+        ELSE 'Active'
+    END AS PostActivityStatus,
+    (SELECT COALESCE(A.Score, 0)
+     FROM Posts A
+     WHERE A.Id = P.AcceptedAnswerId AND P.HasAcceptedAnswer = TRUE
+     FETCH FIRST 1 ROW ONLY) AS AcceptedAnswerScore,
+    ABS(COALESCE(U_Owner.Reputation, 0) - COALESCE(U_PostEditor.Reputation, COALESCE(U_HistoryEditor.Reputation, 0))) AS OwnerEditorReputationDiff,
+    P.PostCreationDate
+FROM RankedUserMetrics RUM
+INNER JOIN PostDetailsWithTags P ON RUM.UserId = P.OwnerUserId
+LEFT JOIN PostHistoryAggregates PHA ON P.PostId = PHA.PostId
+LEFT JOIN Users U_Owner ON P.OwnerUserId = U_Owner.Id
+LEFT JOIN Users U_PostEditor ON P.LastEditorUserId = U_PostEditor.Id
+LEFT JOIN Users U_HistoryEditor ON PHA.LastEditorIdByHistory = U_HistoryEditor.Id
+WHERE
+    RUM.Reputation > 5000
+    AND P.PostCreationDate >= DATE '2021-01-01'
+    AND P.PostScore >= 0
+    AND P.PostTypeName = 'Question'
+    AND (
+        (P.PostViewCount > 1000 AND P.PostScore > 5 AND P.HasAcceptedAnswer = TRUE)
+        OR
+        (P.PostCommentCount > 10 AND P.PostFavoriteCount > 15)
+        OR
+        (P.TagCount >= 3 AND EXISTS (
+             SELECT 1 FROM UNNEST(P.PostTagsArray) AS t(tag)
+             WHERE tag IN ('api', 'json', 'data-structures')
+        ))
+    )
+ORDER BY
+    RUM.Reputation DESC,
+    EngagementRatio DESC,
+    P.PostCreationDate DESC,
+    PostActivityStatus
+FETCH FIRST 2500 ROWS ONLY;

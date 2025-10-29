@@ -1,0 +1,121 @@
+-- {"query": "4539.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash-lite", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 1496} 
+WITH RankedAnswers AS (
+    SELECT
+        ROW_NUMBER() OVER(PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) as rn,
+        p.Id AS AnswerId,
+        p.ParentId AS QuestionId,
+        p.OwnerUserId,
+        p.Score AS AnswerScore,
+        p.CreationDate AS AnswerCreationDate,
+        u.DisplayName AS AnswererDisplayName,
+        u.Reputation AS AnswererReputation,
+        -- Check if the answer is accepted and compare its score to the question's score
+        CASE
+            WHEN p.Id = q.AcceptedAnswerId THEN 1
+            ELSE 0
+        END AS IsAccepted,
+        CASE
+            WHEN p.Score > q.Score THEN 'Better than Question'
+            WHEN p.Score = q.Score THEN 'Equal to Question'
+            ELSE 'Worse than Question'
+        END AS ScoreComparisonToQuestion,
+        LAG(p.Score, 1, 0) OVER(PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS PreviousAnswerScore
+    FROM Posts p
+    JOIN Posts q ON p.ParentId = q.Id
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 2 -- Filter for answers
+      AND q.PostTypeId = 1 -- Filter for questions
+      AND q.ClosedDate IS NULL -- Exclude closed questions
+      AND p.OwnerUserId IS NOT NULL -- Exclude answers from deleted users
+),
+QuestionDetails AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.OwnerUserId AS QuestionOwnerUserId,
+        q.Title AS QuestionTitle,
+        q.Tags AS QuestionTags,
+        q.CreationDate AS QuestionCreationDate,
+        q.Score AS QuestionScore,
+        q.AnswerCount,
+        q.FavoriteCount,
+        u.DisplayName AS QuestionerDisplayName,
+        u.Reputation AS QuestionerReputation,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = q.Id AND c.UserId IS NOT NULL) AS CommentCountOnQuestion,
+        -- Calculate the difference in days between the question's creation and its last edit
+        JULIANDAY(q.LastEditDate) - JULIANDAY(q.CreationDate) AS QuestionEditLagDays,
+        -- Check if the question has any accepted answer
+        CASE WHEN q.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS HasAcceptedAnswer
+    FROM Posts q
+    LEFT JOIN Users u ON q.OwnerUserId = u.Id
+    WHERE q.PostTypeId = 1
+      AND q.ClosedDate IS NULL
+),
+UserActivity AS (
+    SELECT
+        UserId,
+        COUNT(CASE WHEN VoteTypeId = 2 THEN 1 END) AS TotalUpvotes,
+        COUNT(CASE WHEN VoteTypeId = 3 THEN 1 END) AS TotalDownvotes,
+        COUNT(DISTINCT PostId) AS PostsVotedOn,
+        MAX(CreationDate) AS LastVoteDate
+    FROM Votes
+    WHERE UserId IS NOT NULL
+    GROUP BY UserId
+)
+SELECT
+    qd.QuestionId,
+    qd.QuestionTitle,
+    qd.QuestionerDisplayName,
+    qd.QuestionerReputation,
+    qd.QuestionCreationDate,
+    qd.QuestionScore,
+    qd.FavoriteCount,
+    qd.CommentCountOnQuestion,
+    qd.QuestionEditLagDays,
+    qd.HasAcceptedAnswer,
+    -- Get the top 3 answers based on score, or fewer if not available
+    (SELECT GROUP_CONCAT(ra.AnswererDisplayName, '; ')
+     FROM RankedAnswers ra
+     WHERE ra.QuestionId = qd.QuestionId
+     AND ra.rn <= 3) AS Top3Answerers,
+    (SELECT GROUP_CONCAT(ra.AnswerScore, '; ')
+     FROM RankedAnswers ra
+     WHERE ra.QuestionId = qd.QuestionId
+     AND ra.rn <= 3) AS Top3AnswerScores,
+    -- Calculate the average score of the top 2 answers
+    (SELECT AVG(ra.AnswerScore)
+     FROM RankedAnswers ra
+     WHERE ra.QuestionId = qd.QuestionId
+     AND ra.rn <= 2) AS AvgTop2AnswerScore,
+    -- Count of answers that are better than or equal to the question score
+    (SELECT COUNT(*)
+     FROM RankedAnswers ra
+     WHERE ra.QuestionId = qd.QuestionId
+     AND ra.ScoreComparisonToQuestion IN ('Better than Question', 'Equal to Question')) AS AnswersBetterOrEqualQuestionScore,
+    -- Average reputation of answerers for this question
+    (SELECT AVG(ra.AnswererReputation)
+     FROM RankedAnswers ra
+     WHERE ra.QuestionId = qd.QuestionId
+     AND ra.AnswererReputation IS NOT NULL) AS AvgAnswererReputation,
+    -- Number of votes cast by the questioner on other posts
+    COALESCE(ua.TotalUpvotes, 0) AS QuestionerUpvotes,
+    COALESCE(ua.TotalDownvotes, 0) AS QuestionerDownvotes,
+    -- Concatenate tags with a pipe separator
+    REPLACE(qd.QuestionTags, '><', '|') AS FormattedQuestionTags,
+    -- Check if the question has been edited after its first 3 days
+    CASE WHEN qd.QuestionEditLagDays > 3 THEN 'Yes' ELSE 'No' END AS EditedAfter3Days,
+    -- NULL logic: Check if there are any comments from users with no display name
+    CASE WHEN EXISTS (SELECT 1 FROM Comments c WHERE c.PostId = qd.QuestionId AND c.UserDisplayName IS NULL) THEN 'HasAnonymousComments' ELSE 'NoAnonymousComments' END AS AnonymousCommentStatus,
+    -- Rank of the question's score among all questions
+    DENSE_RANK() OVER (ORDER BY qd.QuestionScore DESC) AS QuestionScoreRank,
+    -- Calculate the ratio of accepted answers to total answers for the question
+    CASE
+        WHEN qd.AnswerCount > 0 THEN CAST(qd.HasAcceptedAnswer AS REAL) / qd.AnswerCount
+        ELSE 0
+    END AS AcceptanceRatio
+FROM QuestionDetails qd
+LEFT JOIN UserActivity ua ON qd.QuestionOwnerUserId = ua.UserId
+WHERE qd.QuestionScore > 10 -- Filter for questions with a decent score
+  AND qd.AnswerCount BETWEEN 5 AND 50 -- Filter for questions with a moderate number of answers
+  AND qd.QuestionerReputation > 1000 -- Filter for more experienced questioners
+ORDER BY qd.QuestionCreationDate DESC
+LIMIT 100;

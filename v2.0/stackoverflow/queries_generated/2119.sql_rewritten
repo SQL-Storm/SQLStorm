@@ -1,0 +1,193 @@
+-- {"query": "2119.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1918} 
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        COALESCE(p.Id, 0) AS ExcerptPostId,
+        COALESCE(w.Id, 0) AS WikiPostId,
+        1 AS Level,
+        ARRAY[t.TagName] AS AncestryPath
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Id = t.ExcerptPostId
+    LEFT JOIN Posts w ON w.Id = t.WikiPostId
+
+    UNION ALL
+
+    SELECT 
+        t2.Id,
+        t2.TagName,
+        COALESCE(p2.Id, 0),
+        COALESCE(w2.Id, 0),
+        r.Level + 1,
+        r.AncestryPath || t2.TagName
+    FROM Tags t2
+    JOIN Posts p2 ON p2.Id = t2.ExcerptPostId
+    LEFT JOIN Posts w2 ON w2.Id = t2.WikiPostId
+    JOIN RecursiveTagHierarchy r ON r.Id <> t2.Id AND t2.Id > r.Id
+    WHERE r.Level < 3
+),
+UserBadgeAggregates AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        AVG(b.Date) OVER (PARTITION BY u.Id) AS AvgBadgeDateEpoch -- will be NULL if user has no badges
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+),
+PostAnswerStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.ViewCount,
+        q.Score AS QuestionScore,
+        q.AcceptedAnswerId,
+        COUNT(a.Id) AS AnswerCount,
+        COALESCE(AVG(a.Score), 0) AS AvgAnswerScore,
+        MAX(COALESCE(vt2.CountUpVotes,0) - COALESCE(vt2.CountDownVotes,0)) AS MaxAnswerNetVotes,
+        CASE
+            WHEN q.AcceptedAnswerId IS NOT NULL THEN 1
+            ELSE 0
+        END AS HasAcceptedAnswer
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    LEFT JOIN (
+        SELECT
+            v.PostId,
+            COUNT(CASE WHEN vt.Name = 'UpMod' THEN 1 END) AS CountUpVotes,
+            COUNT(CASE WHEN vt.Name = 'DownMod' THEN 1 END) AS CountDownVotes
+        FROM Votes v
+        JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+        GROUP BY v.PostId
+    ) vt2 ON vt2.PostId = a.Id
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id
+),
+RankedUserPosts AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC NULLS LAST, p.CreationDate ASC) AS PostRankByScore,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS RecentPostNum,
+        p.FavoriteCount,
+        -- Length of Title or fallback to '[No Title]'
+        COALESCE(LENGTH(p.Title), LENGTH('[No Title]')) AS TitleLength,
+        -- String manipulation: first 10 chars of Tags stripped of angle brackets
+        substring(REGEXP_REPLACE(COALESCE(p.Tags, ''), '[<>]', '', 'g') FROM 1 FOR 10) AS TagsSnippet
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+),
+ComplexUserMetrics AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ub.AvgBadgeDateEpoch,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+        MAX(COALESCE(p.ViewCount, 0)) AS MaxPostViewCount,
+        COUNT(DISTINCT CASE WHEN p.PostRankByScore = 1 THEN p.PostId END) AS TopRankedPostsCount,
+        COUNT(DISTINCT CASE WHEN p.RecentPostNum <= 3 THEN p.PostId END) AS PostsInLast3,
+        AVG(COALESCE(p.FavoriteCount,0)) AS AvgFavorites,
+        AVG(p.TitleLength) AS AvgTitleLength,
+        COUNT(CASE WHEN p.TagsSnippet LIKE '%sql%' THEN 1 END) AS PostsWithSQLTagSnippet,
+        MIN(p.CreationDate) AS FirstPostDate,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN UserBadgeAggregates ub ON ub.UserId = u.Id
+    LEFT JOIN RankedUserPosts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges, ub.AvgBadgeDateEpoch
+),
+LatestPostHistoryEdits AS (
+    SELECT DISTINCT ON (ph.PostId)
+        ph.PostId,
+        ph.UserId,
+        ph.UserDisplayName,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        ph.Comment
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4,5,6) -- Edit Title, Edit Body, Edit Tags
+    ORDER BY ph.PostId, ph.CreationDate DESC
+),
+TopQuestionsWithEdits AS (
+    SELECT
+        pas.QuestionId,
+        pas.Title,
+        pas.CreationDate AS QuestionCreationDate,
+        pas.AnswerCount,
+        pas.AvgAnswerScore,
+        pas.MaxAnswerNetVotes,
+        lph.CreationDate AS LastEditDate,
+        lph.UserDisplayName AS LastEditor,
+        lph.Comment AS LastEditComment
+    FROM PostAnswerStats pas
+    LEFT JOIN LatestPostHistoryEdits lph ON lph.PostId = pas.QuestionId AND lph.PostHistoryTypeId = 4
+    WHERE pas.AnswerCount > 5 AND pas.QuesTionScore >= 10
+),
+UserActivityWindow AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        COUNT(c.Id) OVER (PARTITION BY p.OwnerUserId ORDER BY c.CreationDate RANGE BETWEEN INTERVAL '30 days' PRECEDING AND CURRENT ROW) AS CommentsIn30d,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2) OVER (PARTITION BY p.OwnerUserId ORDER BY v.CreationDate RANGE BETWEEN INTERVAL '30 days' PRECEDING AND CURRENT ROW) AS UpVotesLast30d
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId = 2
+    WHERE u.Reputation > 500
+)
+SELECT 
+    cm.Id AS UserID,
+    cm.DisplayName,
+    cm.Reputation,
+    cm.GoldBadges, cm.SilverBadges, cm.BronzeBadges,
+    cm.AvgBadgeDateEpoch,
+    cm.TotalPostScore,
+    cm.MaxPostViewCount,
+    cm.TopRankedPostsCount,
+    cm.PostsInLast3,
+    cm.AvgFavorites,
+    cm.AvgTitleLength,
+    cm.PostsWithSQLTagSnippet,
+    cm.FirstPostDate,
+    cm.LastPostDate,
+    tq.QuestionId,
+    tq.Title AS TopQuestionTitle,
+    tq.AnswerCount,
+    tq.AvgAnswerScore,
+    tq.MaxAnswerNetVotes,
+    tq.LastEditDate,
+    tq.LastEditor,
+    tq.LastEditComment,
+    ua.CommentsIn30d,
+    ua.UpVotesLast30d
+FROM ComplexUserMetrics cm
+LEFT JOIN TopQuestionsWithEdits tq ON tq.QuestionId = (
+    SELECT q.Id
+    FROM Posts q
+    WHERE q.OwnerUserId = cm.Id AND q.PostTypeId = 1
+    ORDER BY q.Score DESC NULLS LAST
+    LIMIT 1
+)
+LEFT JOIN (
+    SELECT DISTINCT ON (ua.Id) ua.Id, ua.CommentsIn30d, ua.UpVotesLast30d
+    FROM UserActivityWindow ua
+    ORDER BY ua.Id, ua.CommentsIn30d DESC, ua.UpVotesLast30d DESC
+) ua ON ua.Id = cm.Id
+WHERE cm.Reputation >= 1000
+ORDER BY cm.Reputation DESC, cm.GoldBadges DESC, cm.TotalPostScore DESC
+LIMIT 100;

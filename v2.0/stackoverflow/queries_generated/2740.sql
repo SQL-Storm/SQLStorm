@@ -1,0 +1,127 @@
+-- {"query": "2740.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1275} 
+with UserBadgeStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        max(b.Date) as LastBadgeDate,
+        coalesce(sum(vt.UpVotes),0) as TotalUpVotes,
+        coalesce(sum(vt.DownVotes),0) as TotalDownVotes
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    left join (
+        select UserId,
+               sum(case when VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+               sum(case when VoteTypeId = 3 then 1 else 0 end) as DownVotes
+          from Votes v
+          join Posts p on p.Id = v.PostId
+          where p.OwnerUserId = v.UserId
+          group by UserId
+    ) vt on vt.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+QuestionAnswerStats as (
+    select
+        p.OwnerUserId,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionCount,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswerCount,
+        avg(case when p.PostTypeId = 1 then p.Score end) as AvgQuestionScore,
+        avg(case when p.PostTypeId = 2 then p.Score end) as AvgAnswerScore,
+        max(p.CreationDate) as LatestPostDate
+    from Posts p
+    where p.OwnerUserId is not null
+    group by p.OwnerUserId
+),
+PostWithCommentsRanks as (
+    select
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Tags,
+        count(c.Id) as CommentCount,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc) as PostRank
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+    where p.PostTypeId = 1
+    group by p.Id, p.Title, p.OwnerUserId, p.Score, p.ViewCount, p.CreationDate, p.Tags
+),
+TopPostsAndUsers as (
+    select
+        pwr.Id as PostId,
+        pwr.Title,
+        u.Id as UserId,
+        u.DisplayName,
+        pwr.Score,
+        pwr.ViewCount,
+        pwr.CommentCount,
+        pwr.CreationDate,
+        pwr.Tags
+    from PostWithCommentsRanks pwr
+    join Users u on u.Id = pwr.OwnerUserId
+    where pwr.PostRank <= 3
+),
+DuplicatesWithAnswers as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate,
+        p1.Title as OriginalTitle,
+        p2.Title as DuplicateTitle,
+        (select count(*) from Posts a where a.ParentId = pl.RelatedPostId) as AnswerCountOnOriginal,
+        (select count(*) from Posts a where a.ParentId = pl.PostId) as AnswerCountOnDuplicate
+    from PostLinks pl
+    join Posts p1 on p1.Id = pl.RelatedPostId
+    join Posts p2 on p2.Id = pl.PostId
+    where pl.LinkTypeId = 3 -- Duplicate
+),
+RecentCloseReasons as (
+    select
+        ph.PostId,
+        max(ph.CreationDate) as LastClosedDate,
+        max(cr.Name) as CloseReasonName
+    from PostHistory ph
+    join CloseReasonTypes cr on cr.Id = cast(ph.Comment as int)
+    where ph.PostHistoryTypeId = 10 -- Post Closed
+    group by ph.PostId
+)
+select
+    ubs.UserId,
+    ubs.DisplayName,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    ubs.LastBadgeDate,
+    coalesce(qas.QuestionCount,0) as QuestionCount,
+    coalesce(qas.AnswerCount,0) as AnswerCount,
+    coalesce(qas.AvgQuestionScore,0) as AvgQuestionScore,
+    coalesce(qas.AvgAnswerScore,0) as AvgAnswerScore,
+    tpu.PostId,
+    tpu.Title as TopPostTitle,
+    tpu.Score as TopPostScore,
+    tpu.ViewCount as TopPostViewCount,
+    tpu.CommentCount as TopPostCommentCount,
+    dup.DuplicateTitle,
+    dup.AnswerCountOnOriginal,
+    dup.AnswerCountOnDuplicate,
+    rcr.CloseReasonName,
+    rcr.LastClosedDate,
+    case
+        when qas.LatestPostDate is null then 'No Posts'
+        when qas.LatestPostDate > now() - interval '1 year' then 'Active'
+        else 'Inactive'
+    end as UserActivityStatus,
+    length(coalesce(tpu.Tags,'')) - length(replace(coalesce(tpu.Tags,''), '><', '')) + 1 as TagsCount
+from UserBadgeStats ubs
+left join QuestionAnswerStats qas on qas.OwnerUserId = ubs.UserId
+left join TopPostsAndUsers tpu on tpu.UserId = ubs.UserId
+left join DuplicatesWithAnswers dup on dup.PostId = tpu.PostId
+left join RecentCloseReasons rcr on rcr.PostId = tpu.PostId
+where ubs.GoldBadges + ubs.SilverBadges + ubs.BronzeBadges > 10
+  and (qas.QuestionCount > 5 or qas.AnswerCount > 20)
+order by ubs.GoldBadges desc nulls last, ubs.Reputation desc nulls last, tpu.Score desc nulls last
+limit 100;

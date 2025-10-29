@@ -1,0 +1,181 @@
+-- {"query": "1135.sql", "dataset": "stackoverflow", "version": "v2.0", "prompt": "p1", "model": "gemini-2.5-flash", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2111, "output_tokens": 2553} 
+
+WITH UserContributionSummary AS (
+    -- Summarizes user's post and comment activity, calculates average scores, and finds their most recent activity.
+    -- Incorporates NULL handling and conditional aggregations.
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        COUNT(DISTINCT P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsAsked,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersProvided,
+        COALESCE(SUM(P.Score), 0) AS TotalPostScore,
+        COALESCE(SUM(P.ViewCount), 0) AS TotalPostViews,
+        COALESCE(AVG(P.Score) FILTER (WHERE P.PostTypeId IN (1, 2)), 0) AS AvgQuestionAnswerScore,
+        COALESCE(SUM(C.Score), 0) AS TotalCommentScore,
+        COUNT(DISTINCT C.Id) AS TotalCommentsMade,
+        -- Uses COALESCE to find the latest activity from posts, comments, or user's last access.
+        MAX(COALESCE(P.LastActivityDate, C.CreationDate, U.LastAccessDate)) AS LastKnownActivity,
+        AVG(CASE WHEN P.PostTypeId = 1 AND P.AnswerCount IS NOT NULL THEN P.AnswerCount ELSE NULL END) AS AvgAnswersPerQuestion
+    FROM
+        Users AS U
+    LEFT JOIN
+        Posts AS P ON U.Id = P.OwnerUserId
+    LEFT JOIN
+        Comments AS C ON U.Id = C.UserId
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate
+),
+PostHistoricalRevisions AS (
+    -- Tracks the number of unique editors and significant revisions for each post,
+    -- and identifies the earliest content creation date based on history.
+    SELECT
+        PH.PostId,
+        COUNT(DISTINCT PH.UserId) AS UniqueEditors,
+        -- Counts revisions to body, tags, or close/reopen events as 'significant'.
+        COUNT(DISTINCT CASE WHEN PH.PostHistoryTypeId IN (5, 6, 10, 11) THEN PH.Id END) AS SignificantRevisionCount,
+        MAX(PH.CreationDate) AS LastRevisionDate,
+        -- Aggregates all history types for potential further analysis.
+        ARRAY_AGG(DISTINCT PH.PostHistoryTypeId) AS AllHistoryTypes,
+        -- Finds the earliest creation date from initial title/body history entries.
+        MIN(CASE WHEN PH.PostHistoryTypeId IN (1, 2) THEN PH.CreationDate ELSE NULL END) AS InitialContentCreationDate
+    FROM
+        PostHistory AS PH
+    GROUP BY
+        PH.PostId
+),
+TagUsageAndInfluence AS (
+    -- Parses tags from posts and associates them with post metrics.
+    -- This CTE acts as a bridge to aggregate tag-specific metrics later.
+    SELECT
+        TRIM(UNNEST(string_to_array(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags) - 2), '><'))) AS TagName,
+        P.Id AS PostId,
+        P.Score AS PostScore,
+        P.ViewCount AS PostViewCount,
+        P.CreationDate AS PostCreationDate
+    FROM
+        Posts AS P
+    WHERE
+        P.PostTypeId = 1 -- Only consider questions for tag analysis
+        AND P.Tags IS NOT NULL
+        AND LENGTH(P.Tags) > 2 -- Ensure tags string is not empty or just "<>"
+),
+AggregatedTagMetrics AS (
+    -- Aggregates influence metrics for each tag, including recent activity.
+    SELECT
+        TUI.TagName,
+        COUNT(TUI.PostId) AS TaggedPostsCount,
+        SUM(TUI.PostScore) AS TotalTagScore,
+        AVG(TUI.PostScore) AS AvgTagPostScore,
+        SUM(TUI.PostViewCount) AS TotalTagViewCount,
+        -- Counts posts tagged within the last year, demonstrating recency.
+        COUNT(DISTINCT TUI.PostId) FILTER (WHERE TUI.PostCreationDate >= (NOW() - INTERVAL '1 year')) AS RecentTaggedPostsCount
+    FROM
+        TagUsageAndInfluence AS TUI
+    GROUP BY
+        TUI.TagName
+)
+-- Main query to combine all information, deriving complex user and post engagement metrics.
+SELECT
+    U.UserId,
+    U.DisplayName,
+    U.Reputation,
+    U.TotalPosts,
+    U.QuestionsAsked,
+    U.AnswersProvided,
+    U.TotalPostScore,
+    U.TotalPostViews,
+    U.TotalCommentsMade,
+    U.LastKnownActivity,
+    U.AvgAnswersPerQuestion,
+    COALESCE(B.TotalBadges, 0) AS TotalBadgesAwarded,
+    COALESCE(B.GoldBadges, 0) AS GoldBadges,
+    COALESCE(B.SilverBadges, 0) AS SilverBadges,
+    COALESCE(B.BronzeBadges, 0) AS BronzeBadges,
+    P.Id AS QuestionId,
+    P.Title AS QuestionTitle,
+    P.Score AS QuestionScore,
+    P.ViewCount AS QuestionViewCount,
+    P.AnswerCount AS QuestionAnswerCount,
+    P.FavoriteCount AS QuestionFavoriteCount,
+    PR.SignificantRevisionCount,
+    PR.UniqueEditors,
+    PR.LastRevisionDate,
+    -- Calculates age of the question and its initial content.
+    AGE(NOW(), P.CreationDate) AS QuestionAge,
+    AGE(NOW(), PR.InitialContentCreationDate) AS ContentAgeFromFirstEdit,
+    -- Complex calculation for question engagement score.
+    (P.Score * 0.5 + P.ViewCount * 0.05 + COALESCE(P.FavoriteCount, 0) * 2 + COALESCE(P.AnswerCount, 0) * 1.5) AS QuestionEngagementScore,
+    -- Window function: LAG to get the score of the user's previous question.
+    LAG(P.Score, 1, 0) OVER (PARTITION BY U.UserId ORDER BY P.CreationDate) AS PreviousQuestionScore,
+    -- Window function: NTH_VALUE to find the title of the user's highest scoring question.
+    NTH_VALUE(P.Title, 1) OVER (PARTITION BY U.UserId ORDER BY P.Score DESC, P.CreationDate ASC) AS TopScoringQuestionTitle,
+    -- Correlated subqueries to count upvotes and downvotes for the specific question.
+    (SELECT COUNT(V.Id) FROM Votes AS V WHERE V.PostId = P.Id AND V.VoteTypeId = 2) AS QuestionUpvoteCount,
+    (SELECT COUNT(V.Id) FROM Votes AS V WHERE V.PostId = P.Id AND V.VoteTypeId = 3) AS QuestionDownvoteCount,
+    ATM.TaggedPostsCount AS MainTagUsageCount,
+    ATM.AvgTagPostScore AS MainTagAvgPostScore,
+    -- Complex calculation for overall user influence score.
+    (U.Reputation * 0.1 + U.TotalPostScore * 0.2 + U.TotalCommentsMade * 0.05 + COALESCE(B.TotalBadges, 0) * 1 + COALESCE(ATM.AvgTagPostScore, 0) * 0.1) AS UserInfluenceScore,
+    -- Conditional expression to categorize users based on their engagement.
+    CASE
+        WHEN U.Reputation > 10000 AND U.QuestionsAsked > 100 AND U.AnswersProvided > 200 THEN 'Veteran Expert'
+        WHEN U.Reputation > 5000 AND U.TotalPosts > 150 THEN 'Active Contributor'
+        WHEN U.Reputation > 1000 AND U.TotalPosts > 50 THEN 'Engaged Member'
+        ELSE 'Casual User'
+    END AS UserEngagementTier,
+    -- String manipulations for location and user display name.
+    COALESCE(LEFT(TRIM(U.Location), 20), 'Unknown Region') AS TrimmedLocation,
+    NULLIF(LOWER(SUBSTRING(U.DisplayName FROM POSITION(' ' IN U.DisplayName) + 1)), '') AS UserLastName,
+    -- Window function: RANK to global rank users based on a composite influence metric.
+    RANK() OVER (ORDER BY (U.Reputation + U.TotalPostScore * 2 + COALESCE(B.TotalBadges, 0) * 5 + U.TotalCommentsMade) DESC, U.LastKnownActivity DESC) AS GlobalUserRank
+FROM
+    UserContributionSummary AS U
+LEFT JOIN LATERAL ( -- Lateral join to get aggregated badge counts per user, improving flexibility.
+    SELECT
+        B.UserId,
+        COUNT(B.Id) AS TotalBadges,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM
+        Badges AS B
+    WHERE
+        B.UserId = U.UserId
+    GROUP BY
+        B.UserId
+) AS B ON TRUE
+LEFT JOIN
+    Posts AS P ON U.UserId = P.OwnerUserId AND P.PostTypeId = 1 -- Focus only on questions posted by the user
+LEFT JOIN
+    PostHistoricalRevisions AS PR ON P.Id = PR.PostId
+LEFT JOIN LATERAL ( -- Lateral join to fetch metrics for the most popular tag associated with the question.
+    SELECT
+        ATM_Inner.TagName,
+        ATM_Inner.TaggedPostsCount,
+        ATM_Inner.AvgTagPostScore
+    FROM
+        AggregatedTagMetrics AS ATM_Inner
+    WHERE
+        P.Tags IS NOT NULL
+        AND LENGTH(P.Tags) > 2
+        AND ATM_Inner.TagName = ANY(string_to_array(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags) - 2), '><')) -- Match any tag of the question
+    ORDER BY ATM_Inner.TaggedPostsCount DESC -- Prioritize the most popular tag if multiple tags exist
+    LIMIT 1
+) AS ATM ON TRUE
+WHERE
+    U.TotalPosts > 5 -- Filter for moderately active users
+    AND P.Score > 0 -- Focus on questions with positive scores
+    AND P.CreationDate >= (NOW() - INTERVAL '5 year') -- Questions within the last 5 years
+    AND (
+        P.ClosedDate IS NULL -- Include open questions
+        OR PR.SignificantRevisionCount > 3 -- Or closed questions that underwent significant revisions
+    )
+    AND U.DisplayName IS NOT NULL
+    AND U.DisplayName NOT LIKE '%Community%' -- Exclude community user posts
+    AND COALESCE(U.Location, '') <> '' -- Exclude users with no specified location
+ORDER BY
+    GlobalUserRank ASC, QuestionEngagementScore DESC, U.LastKnownActivity DESC
+LIMIT 1000;

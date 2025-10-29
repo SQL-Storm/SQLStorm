@@ -1,0 +1,161 @@
+WITH UserPostDetails AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate AS UserCreationDate,
+        U.LastAccessDate,
+        U.AboutMe,
+        U.Views AS UserProfileViews,
+        U.UpVotes AS UserUpVotesGiven,
+        U.DownVotes AS UserDownVotesGiven,
+        COUNT(P.Id) AS TotalPosts,
+        SUM(CASE WHEN P.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsAsked,
+        SUM(CASE WHEN P.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersProvided,
+        SUM(P.Score) AS TotalPostScoreReceived,
+        SUM(P.ViewCount) AS TotalQuestionViewCount,
+        SUM(P.FavoriteCount) AS TotalFavoriteCounts,
+        COALESCE(AVG(LENGTH(P.Body)), 0) AS AvgPostBodyLength,
+        (
+            SELECT STRING_AGG(DISTINCT t.tag_trunc, ';' ORDER BY t.tag_trunc)
+            FROM (
+                SELECT DISTINCT
+                    SUBSTRING(TRIM(tag) FROM 1 FOR 35) AS tag_trunc
+                FROM (
+                    SELECT UNNEST(string_to_array(SUBSTRING(P2.Tags FROM 2 FOR (char_length(P2.Tags) - 2)), '><')) AS tag
+                ) s
+                WHERE P2.Tags IS NOT NULL AND P2.Tags <> '' AND P2.PostTypeId = 1
+            ) t
+        ) AS DistinctTagsUsed,
+        (SELECT Title FROM Posts WHERE OwnerUserId = U.Id ORDER BY CreationDate DESC LIMIT 1) AS MostRecentPostTitle,
+        (SELECT CreationDate FROM Posts WHERE OwnerUserId = U.Id ORDER BY CreationDate DESC LIMIT 1) AS MostRecentPostDate
+    FROM
+        Users U
+    LEFT JOIN
+        Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN
+        Posts P2 ON P2.Id = P.Id
+    GROUP BY
+        U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.LastAccessDate, U.AboutMe, U.Views, U.UpVotes, U.DownVotes, P.Tags, P.PostTypeId
+),
+UserBadgeSummary AS (
+    SELECT
+        B.UserId,
+        SUM(CASE WHEN B.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN B.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN B.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(B.Id) AS TotalBadges
+    FROM
+        Badges B
+    GROUP BY
+        B.UserId
+),
+UserCommentMetrics AS (
+    SELECT
+        C.UserId,
+        COUNT(C.Id) AS TotalCommentsMade,
+        COALESCE(AVG(C.Score), 0) AS AvgCommentScore,
+        SUM(LENGTH(C.Text)) AS TotalCommentChars
+    FROM
+        Comments C
+    WHERE
+        C.UserId IS NOT NULL
+    GROUP BY
+        C.UserId
+),
+PostLifeCycleMetrics AS (
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        P.CreationDate AS PostCreationDate,
+        P.LastEditDate AS PostLastEditDate,
+        P.ClosedDate,
+        SUM(CASE WHEN PH.PostHistoryTypeId IN (4, 5, 6) THEN 1 ELSE 0 END) AS TotalEditEvents,
+        COUNT(DISTINCT PH.UserId) AS DistinctEditors,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS CloseHistoryEvents,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenHistoryEvents,
+        MAX(CASE WHEN PH.PostHistoryTypeId IN (4,5,6) THEN PH.CreationDate ELSE NULL END) AS LastActualEditDateFromHistory,
+        STRING_AGG(DISTINCT
+            SUBSTRING(PH.Comment FROM POSITION('CloseReasonId=' IN PH.Comment) + CHAR_LENGTH('CloseReasonId='))
+            , ',') FILTER (WHERE PH.PostHistoryTypeId = 10 AND PH.Comment LIKE 'CloseReasonId=%') AS AllCloseReasonIds
+    FROM
+        Posts P
+    LEFT JOIN
+        PostHistory PH ON P.Id = PH.PostId
+    GROUP BY
+        P.Id, P.OwnerUserId, P.CreationDate, P.LastEditDate, P.ClosedDate
+),
+UserVoteInfluence AS (
+    SELECT
+        PH.UserId AS VoterId,
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE NULL END) AS UserCloseVotesCast,
+        COUNT(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE NULL END) AS UserReopenVotesCast,
+        COUNT(DISTINCT PH.PostId) AS DistinctPostsVotedOnForModeration,
+        SUM(CASE WHEN PH.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) * 10 + SUM(CASE WHEN PH.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) * 5 AS ModerationActivityScore
+    FROM
+        PostHistory PH
+    WHERE
+        PH.UserId IS NOT NULL AND PH.PostHistoryTypeId IN (10, 11)
+    GROUP BY
+        PH.UserId
+),
+AvgOwnedPostMetrics AS (
+    SELECT
+        PLCM.OwnerUserId AS UserId,
+        COALESCE(AVG(PLCM.TotalEditEvents), 0) AS AvgEditsPerOwnedPost,
+        COALESCE(AVG(PLCM.DistinctEditors), 0) AS AvgDistinctEditorsPerOwnedPost,
+        COALESCE(SUM(PLCM.CloseHistoryEvents), 0) AS OwnedPostsClosedEvents,
+        COALESCE(SUM(PLCM.ReopenHistoryEvents), 0) AS OwnedPostsReopenedEvents,
+        COALESCE(AVG(EXTRACT(EPOCH FROM (PLCM.LastActualEditDateFromHistory - PLCM.PostCreationDate)) / (60 * 60 * 24)), 0) AS AvgDaysToLastEdit
+    FROM
+        PostLifeCycleMetrics PLCM
+    WHERE
+        PLCM.OwnerUserId IS NOT NULL
+    GROUP BY
+        PLCM.OwnerUserId
+),
+OverallInfluencers AS (
+    SELECT
+        'Overall Influencer' AS UserSegment,
+        U.Id AS UserId,
+        UPD.DisplayName,
+        UPD.Reputation,
+        UPD.UserCreationDate,
+        UPD.LastAccessDate,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - UPD.UserCreationDate)) / (60 * 60 * 24 * 365.25) AS AccountAgeYears,
+        UPD.TotalPosts,
+        UPD.QuestionsAsked,
+        UPD.AnswersProvided,
+        UPD.TotalPostScoreReceived,
+        UPD.TotalQuestionViewCount,
+        UPD.TotalFavoriteCounts,
+        UPD.AvgPostBodyLength,
+        UPD.DistinctTagsUsed,
+        COALESCE(UBS.GoldBadges, 0) AS GoldBadges,
+        COALESCE(UBS.SilverBadges, 0) AS SilverBadges,
+        COALESCE(UBS.BronzeBadges, 0) AS BronzeBadges,
+        COALESCE(UCM.TotalCommentsMade, 0) AS TotalCommentsMade,
+        COALESCE(UCM.AvgCommentScore, 0) AS AvgCommentScore,
+        COALESCE(UVI.UserCloseVotesCast, 0) AS UserCloseVotesCast,
+        COALESCE(UVI.UserReopenVotesCast, 0) AS UserReopenVotesCast,
+        COALESCE(AOPM.AvgEditsPerOwnedPost, 0) AS AvgEditsPerOwnedPost,
+        COALESCE(AOPM.AvgDistinctEditorsPerOwnedPost, 0) AS AvgDistinctEditorsPerOwnedPost,
+        COALESCE(AOPM.OwnedPostsClosedEvents, 0) AS OwnedPostsClosedEvents,
+        COALESCE(AOPM.OwnedPostsReopenedEvents, 0) AS OwnedPostsReopenedEvents
+    FROM
+        Users U
+    LEFT JOIN
+        UserPostDetails UPD ON U.Id = UPD.UserId
+    LEFT JOIN
+        UserBadgeSummary UBS ON U.Id = UBS.UserId
+    LEFT JOIN
+        UserCommentMetrics UCM ON U.Id = UCM.UserId
+    LEFT JOIN
+        UserVoteInfluence UVI ON U.Id = UVI.VoterId
+    LEFT JOIN
+        AvgOwnedPostMetrics AOPM ON U.Id = AOPM.UserId
+)
+SELECT
+    *
+FROM
+    OverallInfluencers;
